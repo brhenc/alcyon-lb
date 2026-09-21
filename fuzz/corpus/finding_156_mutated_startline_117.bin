@@ -1,3 +1,0 @@
-PROPFIND /index.html HTTP/1.2
-Host: example.com
-

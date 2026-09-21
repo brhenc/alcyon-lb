@@ -90,3 +90,61 @@ fn chunked_alone_is_still_honoured() {
     assert!(htx.get_header("transfer-encoding").is_some());
     assert!(!p.framing_conflict, "no conflict when only one is present");
 }
+
+// ---- invalid and conflicting Content-Length ----------------------------------------
+
+// Found by differential fuzzing and confirmed by hand: HAProxy 3.5 answers 400 Bad
+// Request to `Content-Length: -5`, while Ibex answered 200 and left the body bytes
+// unconsumed on the connection -- where they become the next request.
+
+fn rejects(input: &[u8]) -> bool {
+    let mut p = H1Parser::new(false);
+    let mut h = Htx::new();
+    p.parse(input, &mut h).is_err()
+}
+
+#[test]
+fn negative_content_length_is_rejected() {
+    assert!(
+        rejects(b"POST /x HTTP/1.1\r\nHost: h\r\nContent-Length: -5\r\n\r\nhello"),
+        "a negative Content-Length is unframeable; ignoring it leaves the body to be \
+         read as the next request"
+    );
+}
+
+#[test]
+fn signed_positive_content_length_is_rejected() {
+    // parse::<usize>() accepts a leading '+', so the obvious implementation lets this
+    // through while HAProxy does not.
+    assert!(rejects(b"POST /x HTTP/1.1\r\nHost: h\r\nContent-Length: +5\r\n\r\nhello"));
+}
+
+#[test]
+fn non_numeric_content_length_is_rejected() {
+    assert!(rejects(b"POST /x HTTP/1.1\r\nHost: h\r\nContent-Length: abc\r\n\r\nhello"));
+    assert!(rejects(b"POST /x HTTP/1.1\r\nHost: h\r\nContent-Length: \r\n\r\nhello"));
+    assert!(rejects(b"POST /x HTTP/1.1\r\nHost: h\r\nContent-Length: 5x\r\n\r\nhello"));
+}
+
+#[test]
+fn conflicting_duplicate_content_lengths_are_rejected() {
+    // Each hop may pick a different one: the other classic desync.
+    assert!(rejects(
+        b"POST /x HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello"
+    ));
+}
+
+#[test]
+fn agreeing_duplicate_content_lengths_are_accepted() {
+    // RFC 9112 permits identical duplicates.
+    assert!(!rejects(
+        b"POST /x HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello"
+    ));
+}
+
+#[test]
+fn ordinary_content_length_still_works() {
+    assert!(!rejects(b"POST /x HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\nhello"));
+    assert!(!rejects(b"GET /x HTTP/1.1\r\nHost: h\r\n\r\n"));
+    assert!(!rejects(b"POST /x HTTP/1.1\r\nHost: h\r\nContent-Length: 0\r\n\r\n"));
+}

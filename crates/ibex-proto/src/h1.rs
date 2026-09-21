@@ -199,7 +199,7 @@ impl H1Parser {
         if line_end == 0 {
             // Empty line -> End of headers
             htx.push(HtxBlock::Eoh);
-            self.on_headers_finished(htx);
+            self.on_headers_finished(htx)?;
             Ok(delim_len)
         } else {
             let header_bytes = &input[..line_end];
@@ -273,12 +273,52 @@ impl H1Parser {
         Ok((cursor, false))
     }
 
-    fn on_headers_finished(&mut self, htx: &mut Htx) {
-        if let Some(cl) = htx.get_header("content-length") {
-            if let Ok(len) = cl.trim().parse::<usize>() {
-                self.content_length = Some(len);
+    fn on_headers_finished(&mut self, htx: &mut Htx) -> io::Result<()> {
+        // A Content-Length we cannot parse is a protocol error, not something to
+        // shrug off. RFC 9112 6.3: a value that is not a valid decimal makes the
+        // message unframeable, and silently ignoring it is a smuggling primitive --
+        // we would treat the body as the start of the *next* request while the
+        // backend treats it as a body.
+        //
+        // Verified against HAProxy 3.5: `Content-Length: -5` gets 400 Bad Request,
+        // where Ibex previously answered 200 and left "hello" unconsumed on the
+        // connection to become the next request.
+        //
+        // Strict by construction: ASCII digits only. `parse::<usize>()` alone is not
+        // enough because it accepts a leading `+`, and it silently tolerates values
+        // that HAProxy rejects.
+        let mut seen_cl: Option<usize> = None;
+        for h in htx.headers() {
+            if !h.name.eq_ignore_ascii_case("content-length") {
+                continue;
             }
+            let raw = h.value.trim();
+            if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
+                self.phase = H1Phase::Error;
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid Content-Length value",
+                ));
+            }
+            let Ok(len) = raw.parse::<usize>() else {
+                self.phase = H1Phase::Error;
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Content-Length out of range",
+                ));
+            };
+            // Duplicate Content-Length headers must agree; conflicting values are the
+            // other classic desync, since each hop may pick a different one.
+            if seen_cl.is_some_and(|prev| prev != len) {
+                self.phase = H1Phase::Error;
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "conflicting Content-Length values",
+                ));
+            }
+            seen_cl = Some(len);
         }
+        self.content_length = seen_cl;
 
         if let Some(te) = htx.get_header("transfer-encoding") {
             if te.to_ascii_lowercase().contains("chunked") {
@@ -354,6 +394,8 @@ impl H1Parser {
             htx.push(HtxBlock::Eom);
             self.phase = H1Phase::Done;
         }
+    
+        Ok(())
     }
 
     fn parse_body_fixed(input: &[u8], htx: &mut Htx, remaining: &mut usize) -> usize {

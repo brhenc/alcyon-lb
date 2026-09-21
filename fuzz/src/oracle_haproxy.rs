@@ -2,10 +2,11 @@
 //! HAProxy 3.5 Differential Oracle.
 //!
 //! Spawns a real, isolated HAProxy 3.5 instance on dynamic ephemeral ports with a
-//! synthetic HTTP backend. Feeds test cases over a real TCP socket and inspects
-//! the exact normalized request and pipelining boundaries forwarded by HAProxy.
+//! concurrent synthetic HTTP backend. Feeds test cases over a real TCP socket and
+//! derives accepted/rejected status from client responses, and framing/smuggling from backend.
 
 #![forbid(unsafe_code)]
+#![allow(dead_code)]
 
 use std::collections::VecDeque;
 use std::fs;
@@ -47,7 +48,7 @@ pub struct HaproxyParseResult {
     pub error_message: Option<String>,
 }
 
-/// Manages a running HAProxy process and its backend HTTP echo server.
+/// Manages a running HAProxy process and its concurrent backend HTTP echo server.
 pub struct HaproxyOracle {
     haproxy_bin: PathBuf,
     fe_port: u16,
@@ -71,8 +72,8 @@ impl HaproxyOracle {
         let received_requests = Arc::new(Mutex::new(VecDeque::new()));
         let backend_running = Arc::new(AtomicBool::new(true));
 
-        // Start backend thread
-        start_backend_server(be_port, Arc::clone(&backend_running), Arc::clone(&received_requests))?;
+        // Start concurrent backend server
+        start_concurrent_backend(be_port, Arc::clone(&backend_running), Arc::clone(&received_requests))?;
 
         // Write HAProxy config
         let cfg_file = std::env::temp_dir().join(format!("ibex_fuzz_haproxy_{}_{}.cfg", std::process::id(), fe_port));
@@ -165,8 +166,8 @@ impl HaproxyOracle {
             }
         };
 
-        let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
-        let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(300)));
+        let _ = stream.set_write_timeout(Some(Duration::from_millis(300)));
 
         let mut wire_to_send = input.to_vec();
         if check_sentinel {
@@ -193,18 +194,34 @@ impl HaproxyOracle {
                 Ok(0) => break,
                 Ok(n) => {
                     client_response.extend_from_slice(&buf[..n]);
-                    // If we got responses, break once complete or timeout
+                    // If we received response headers:
                     if client_response.windows(4).any(|w| w == b"\r\n\r\n") {
-                        // Give backend a moment to process pipelined sentinel
-                        thread::sleep(Duration::from_millis(20));
-                        break;
+                        if let Some(status) = parse_response_status(&client_response) {
+                            if status >= 400 {
+                                // HAProxy rejected directly with 4xx error (e.g. 400 Bad Request)
+                                break;
+                            }
+                            if check_sentinel {
+                                // If sentinel was pipelined, check if we received second response
+                                let ok_count = client_response
+                                    .windows(15)
+                                    .filter(|w| *w == b"HTTP/1.1 200 OK")
+                                    .count();
+                                if ok_count >= 2 {
+                                    break;
+                                }
+                            } else {
+                                break;
+                            }
+                        }
                     }
                 }
                 Err(_) => break,
             }
         }
 
-        // Close stream
+        // Give backend a brief moment to finish any in-flight handling
+        thread::sleep(Duration::from_millis(15));
         drop(stream);
 
         // Fetch requests seen by backend
@@ -219,9 +236,10 @@ impl HaproxyOracle {
         let backend_request_count = be_reqs.len();
         let status_code = parse_response_status(&client_response);
 
-        let forwarded_req = be_reqs.first().cloned();
-        let accepted = forwarded_req.is_some() && status_code.map_or(false, |s| s < 400);
+        // Accepted is derived from the CLIENT-side response: 2xx or 3xx status
+        let accepted = status_code.map_or(false, |s| (200..400).contains(&s));
 
+        let forwarded_req = be_reqs.first().cloned();
         let mut saw_sentinel = false;
         let mut next_smuggled = false;
 
@@ -280,7 +298,7 @@ fn get_two_free_ports() -> Result<(u16, u16), String> {
     Ok((p1, p2))
 }
 
-fn start_backend_server(
+fn start_concurrent_backend(
     port: u16,
     running: Arc<AtomicBool>,
     queue: Arc<Mutex<VecDeque<ForwardedRequest>>>,
@@ -291,33 +309,12 @@ fn start_backend_server(
     thread::spawn(move || {
         while running.load(Ordering::SeqCst) {
             match listener.accept() {
-                Ok((mut stream, _)) => {
-                    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
-                    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
-
-                    let mut raw_buf = Vec::new();
-                    let mut chunk = [0u8; 4096];
-
-                    while running.load(Ordering::SeqCst) {
-                        match stream.read(&mut chunk) {
-                            Ok(0) => break,
-                            Ok(n) => {
-                                raw_buf.extend_from_slice(&chunk[..n]);
-
-                                // Parse HTTP requests out of raw_buf
-                                while let Some((req, consumed)) = try_parse_http_request(&raw_buf) {
-                                    if let Ok(mut q) = queue.lock() {
-                                        q.push_back(req);
-                                    }
-                                    raw_buf.drain(..consumed);
-
-                                    // Respond with 200 OK
-                                    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n");
-                                }
-                            }
-                            Err(_) => break,
-                        }
-                    }
+                Ok((stream, _)) => {
+                    let q = Arc::clone(&queue);
+                    let r = Arc::clone(&running);
+                    thread::spawn(move || {
+                        handle_backend_connection(stream, r, q);
+                    });
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(5));
@@ -328,6 +325,43 @@ fn start_backend_server(
     });
 
     Ok(())
+}
+
+fn handle_backend_connection(
+    mut stream: TcpStream,
+    running: Arc<AtomicBool>,
+    queue: Arc<Mutex<VecDeque<ForwardedRequest>>>,
+) {
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(1000)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(1000)));
+
+    let mut raw_buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+
+    while running.load(Ordering::SeqCst) {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                raw_buf.extend_from_slice(&chunk[..n]);
+
+                while let Some((req, consumed)) = try_parse_http_request(&raw_buf) {
+                    if let Ok(mut q) = queue.lock() {
+                        q.push_back(req);
+                    }
+                    raw_buf.drain(..consumed);
+
+                    // Respond with 200 OK
+                    if stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n")
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+    }
 }
 
 fn try_parse_http_request(buf: &[u8]) -> Option<(ForwardedRequest, usize)> {
@@ -365,11 +399,9 @@ fn try_parse_http_request(buf: &[u8]) -> Option<(ForwardedRequest, usize)> {
     let body_start = eoh + 4;
 
     if is_chunked {
-        // Find chunked terminator 0\r\n\r\n
         let body_slice = &buf[body_start..];
-        let term = body_slice.windows(5).position(|w| w == b"0\r\n\r\n")?;
-        let consumed = body_start + term + 5;
-        let body = body_slice[..term].to_vec();
+        let (decoded_body, chunked_bytes_consumed) = decode_chunked_body(body_slice)?;
+        let consumed = body_start + chunked_bytes_consumed;
         Some((
             ForwardedRequest {
                 raw: buf[..consumed].to_vec(),
@@ -378,8 +410,8 @@ fn try_parse_http_request(buf: &[u8]) -> Option<(ForwardedRequest, usize)> {
                 version,
                 headers,
                 header_count,
-                body: body.clone(),
-                body_len: body.len(),
+                body: decoded_body.clone(),
+                body_len: decoded_body.len(),
             },
             consumed,
         ))
@@ -419,6 +451,47 @@ fn try_parse_http_request(buf: &[u8]) -> Option<(ForwardedRequest, usize)> {
             },
             consumed,
         ))
+    }
+}
+
+fn decode_chunked_body(input: &[u8]) -> Option<(Vec<u8>, usize)> {
+    let mut cursor = 0;
+    let mut decoded = Vec::new();
+
+    loop {
+        if cursor >= input.len() {
+            return None;
+        }
+        let line_end = input[cursor..].windows(2).position(|w| w == b"\r\n")?;
+        let size_str = std::str::from_utf8(&input[cursor..cursor + line_end]).ok()?;
+        let size_part = size_str.split(';').next()?.trim();
+        let size = usize::from_str_radix(size_part, 16).ok()?;
+
+        cursor += line_end + 2;
+
+        if size == 0 {
+            if cursor + 2 <= input.len() && &input[cursor..cursor + 2] == b"\r\n" {
+                cursor += 2;
+                return Some((decoded, cursor));
+            }
+            let trailer_end = input[cursor..].windows(4).position(|w| w == b"\r\n\r\n")?;
+            cursor += trailer_end + 4;
+            return Some((decoded, cursor));
+        }
+
+        if cursor + size > input.len() {
+            return None;
+        }
+        decoded.extend_from_slice(&input[cursor..cursor + size]);
+        cursor += size;
+
+        if cursor + 2 <= input.len() && &input[cursor..cursor + 2] == b"\r\n" {
+            cursor += 2;
+        } else if cursor + 1 <= input.len() && input[cursor] == b'\n' {
+            cursor += 1;
+        } else {
+            return None;
+        }
     }
 }
 

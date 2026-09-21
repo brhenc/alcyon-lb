@@ -1,8 +1,0 @@
-POST /casing HTTP/1.1
-Host: example.com
-Transfer-Encoding: cHuNkEd
-
-5
-hello
-0
-

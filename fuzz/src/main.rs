@@ -107,6 +107,38 @@ fn parse_args() -> Config {
     }
 }
 
+/// Self-test validating that the oracle and harness correctly classify 5 known-good requests.
+fn run_self_test(haproxy: &mut HaproxyOracle) -> Result<(), String> {
+    let test_vectors: [(&'static str, &'static [u8]); 5] = [
+        ("Plain GET", b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"),
+        ("GET with query", b"GET /search?q=test HTTP/1.1\r\nHost: example.com\r\n\r\n"),
+        ("POST with Content-Length", b"POST /submit HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\n\r\nhello"),
+        ("POST chunked", b"POST /chunked HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n"),
+        ("Pipelined pair", b"GET /p1 HTTP/1.1\r\nHost: example.com\r\n\r\nGET /p2 HTTP/1.1\r\nHost: example.com\r\n\r\n"),
+    ];
+
+    for (name, raw) in test_vectors {
+        let ibex_res = parse_with_ibex(raw);
+        let hp_res = haproxy.test_input(raw, false);
+
+        if !ibex_res.accepted {
+            return Err(format!(
+                "Harness self-test FAILED on '{}': Ibex rejected a baseline valid request (phase={:?}, err={:?})",
+                name, ibex_res.phase, ibex_res.error_message
+            ));
+        }
+
+        if !hp_res.accepted {
+            return Err(format!(
+                "Harness self-test FAILED on '{}': HAProxy rejected a baseline valid request (status={:?}, err={:?}, raw_response={:?})",
+                name, hp_res.status_code, hp_res.error_message, String::from_utf8_lossy(&hp_res.client_response)
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 fn main() {
     let start_time = Instant::now();
     let config = parse_args();
@@ -131,25 +163,34 @@ fn main() {
             h
         }
         Err(e) => {
-            eprintln!("\n[-] Failed to initialize HAProxy Oracle: {e}");
+            eprintln!("\n[-] [FATAL] Failed to initialize HAProxy Oracle: {e}");
             std::process::exit(1);
         }
     };
 
-    // 2. Generate Structured Test Cases
+    // 2. Run Self-Test on 5 Known-Good Baseline Requests
+    print!("[+] Running harness self-test on 5 baseline valid requests... ");
+    if let Err(e) = run_self_test(&mut haproxy) {
+        eprintln!("\n[-] [FATAL] {e}");
+        eprintln!("[-] The harness cannot correctly classify known-valid HTTP/1 requests. Aborting.");
+        std::process::exit(1);
+    }
+    println!("PASSED (5/5 accepted by both parsers).");
+
+    // 3. Generate Structured Test Cases
     println!("[+] Generating structured test cases targeting framing ambiguity classes...");
     let mut test_cases = generate_structured_corpus();
     let structured_count = test_cases.len();
     println!("    Generated {structured_count} structured CVE-class test cases.");
 
-    // 3. Generate Combinatorial Mutation Cases
+    // 4. Generate Combinatorial Mutation Cases
     println!("[+] Generating {} combinatorial mutation test cases (seed: {})...", config.mutated_count, config.seed);
     let mutated_cases = generate_mutated_cases(config.seed, config.mutated_count);
     test_cases.extend(mutated_cases);
     let total_count = test_cases.len();
     println!("    Total test cases to evaluate: {total_count}");
 
-    // 4. Run Differential Testing Loop
+    // 5. Run Differential Testing Loop
     println!("\n[+] Running differential comparisons...");
     let mut findings = Vec::new();
     let mut accepted_both = 0;
@@ -186,7 +227,7 @@ fn main() {
     }
     println!("\n    Completed evaluation of {total_count} test cases in {:.2?}s.", start_time.elapsed());
 
-    // 5. Save Corpus Artifacts
+    // 6. Save Corpus Artifacts
     print!("[+] Saving discrepancy inputs to corpus directory... ");
     if let Err(e) = save_corpus(&config.corpus_dir, &findings) {
         eprintln!("\n[-] Warning: Failed to save corpus: {e}");
@@ -194,7 +235,7 @@ fn main() {
         println!("SAVED {} files.", findings.len());
     }
 
-    // 6. Generate and Write FINDINGS.md
+    // 7. Generate and Write FINDINGS.md
     print!("[+] Generating and writing {}... ", config.findings_file.display());
     let findings_md = generate_findings_markdown(total_count, accepted_both, rejected_both, &findings);
     if let Err(e) = fs::write(&config.findings_file, findings_md) {
@@ -203,7 +244,7 @@ fn main() {
         println!("DONE.");
     }
 
-    // 7. Print Final Summary Table
+    // 8. Print Final Summary Table
     let mut cat1 = 0;
     let mut cat2 = 0;
     let mut cat3 = 0;

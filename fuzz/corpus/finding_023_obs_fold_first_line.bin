@@ -1,4 +1,0 @@
-GET /obs-first HTTP/1.1
- folded-without-header: value
-Host: example.com
-

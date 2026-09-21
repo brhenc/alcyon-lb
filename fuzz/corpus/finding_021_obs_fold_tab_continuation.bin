@@ -1,5 +1,0 @@
-GET /obs-tab HTTP/1.1
-Host: example.com
-X-Header: first-line
-	second-line
-

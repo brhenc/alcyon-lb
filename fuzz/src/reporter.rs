@@ -54,6 +54,9 @@ pub fn format_hexdump(data: &[u8]) -> String {
 /// Saves all finding inputs to `corpus_dir` as verbatim binary files.
 pub fn save_corpus<P: AsRef<Path>>(corpus_dir: P, findings: &[DiscrepancyFinding]) -> Result<(), String> {
     let dir = corpus_dir.as_ref();
+    if dir.exists() {
+        let _ = fs::remove_dir_all(dir);
+    }
     fs::create_dir_all(dir).map_err(|e| format!("Failed to create corpus dir {}: {e}", dir.display()))?;
 
     for finding in findings {

@@ -1,3 +1,0 @@
-GET /deep/nested/path?q=1&v=2 HTTP/2.0
-Host: example.com
-

@@ -1,2 +1,0 @@
-DELETE /index.html HTTP/2.0Host: example.com
-

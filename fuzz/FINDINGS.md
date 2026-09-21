@@ -6,11 +6,11 @@ This report documents differential testing between the **Ibex HTTP/1 parser** (`
 
 - **Total Inputs Evaluated:** 295
 - **Accepted by Both Parsers:** 188
-- **Rejected by Both Parsers:** 13
-- **Total Disagreements Found:** 245
-- **Category 1 (Acceptance Disagreements):** 69
-- **Category 2 (Framing Disagreements):** 107
-- **Category 3 (Smuggling / Boundary Findings):** 44
+- **Rejected by Both Parsers:** 21
+- **Total Disagreements Found:** 127
+- **Category 1 (Acceptance Disagreements):** 61
+- **Category 2 (Framing Disagreements):** 0
+- **Category 3 (Smuggling / Boundary Findings):** 41
 - **Self-Differential (Streaming Consistency):** 25
 
 ## Discrepancy Classification Framework
@@ -24,222 +24,7 @@ This report documents differential testing between the **Ibex HTTP/1 parser** (`
 
 ## Detailed Findings
 
-### Finding 001: baseline_simple_get
-
-- **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
-- **Ambiguity Class:** Baseline Valid HTTP/1
-- **Description:** Standard HTTP/1.1 GET request with Host header
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 47 45 54 20 2f 69 6e 64  65 78 2e 68 74 6d 6c 20  |GET /index.html |
-00000010: 48 54 54 50 2f 31 2e 31  0d 0a 48 6f 73 74 3a 20  |HTTP/1.1..Host: |
-00000020: 65 78 61 6d 70 6c 65 2e  63 6f 6d 0d 0a 0d 0a     |example.com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `47 / 47`
-- **Parsed Method:** `GET`
-- **Parsed URI:** `/index.html`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `false`
-- **HTTP Status Code:** `None`
-- **Forwarded to Backend:** `No (connection dropped or rejected with 400)`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=None, err=None
-
----
-
-### Finding 002: baseline_chunked_body
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Baseline Valid HTTP/1
-- **Description:** Standard HTTP/1.1 POST request with Chunked body
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 61 70  69 2f 63 68 75 6e 6b 65  |POST /api/chunke|
-00000010: 64 20 48 54 54 50 2f 31  2e 31 0d 0a 48 6f 73 74  |d HTTP/1.1..Host|
-00000020: 3a 20 65 78 61 6d 70 6c  65 2e 63 6f 6d 0d 0a 54  |: example.com..T|
-00000030: 72 61 6e 73 66 65 72 2d  45 6e 63 6f 64 69 6e 67  |ransfer-Encoding|
-00000040: 3a 20 63 68 75 6e 6b 65  64 0d 0a 0d 0a 35 0d 0a  |: chunked....5..|
-00000050: 68 65 6c 6c 6f 0d 0a 36  0d 0a 20 77 6f 72 6c 64  |hello..6.. world|
-00000060: 0d 0a 30 0d 0a 0d 0a                              |..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `103 / 103`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/api/chunked`
-- **Body Length:** `11 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/api/chunked`
-- **Forwarded Body Length:** `16 bytes`
-- **Saw Sentinel Next Request:** `true`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 11 bytes, HAProxy: 16 bytes)
-
----
-
-### Finding 003: cl_te_both_present_cl_first
-
-- **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
-- **Ambiguity Class:** CL-TE / TE-CL Conflict
-- **Description:** Both Content-Length and Transfer-Encoding: chunked present (CL first). Body contains chunked 0 and smuggled prefix.
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 73 6d  75 67 67 6c 65 20 48 54  |POST /smuggle HT|
-00000010: 54 50 2f 31 2e 31 0d 0a  48 6f 73 74 3a 20 65 78  |TP/1.1..Host: ex|
-00000020: 61 6d 70 6c 65 2e 63 6f  6d 0d 0a 43 6f 6e 74 65  |ample.com..Conte|
-00000030: 6e 74 2d 4c 65 6e 67 74  68 3a 20 36 0d 0a 54 72  |nt-Length: 6..Tr|
-00000040: 61 6e 73 66 65 72 2d 45  6e 63 6f 64 69 6e 67 3a  |ansfer-Encoding:|
-00000050: 20 63 68 75 6e 6b 65 64  0d 0a 0d 0a 30 0d 0a 0d  | chunked....0...|
-00000060: 0a 58                                             |.X|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `97 / 98`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/smuggle`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/smuggle`
-- **Forwarded Body Length:** `0 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Ibex accepted ambiguous CL+TE without setting Connection: close, risking downstream pipelined request smuggling.
-
----
-
-### Finding 004: cl_te_both_present_te_first
-
-- **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
-- **Ambiguity Class:** CL-TE / TE-CL Conflict
-- **Description:** Both Transfer-Encoding: chunked and Content-Length present (TE first).
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 73 6d  75 67 67 6c 65 20 48 54  |POST /smuggle HT|
-00000010: 54 50 2f 31 2e 31 0d 0a  48 6f 73 74 3a 20 65 78  |TP/1.1..Host: ex|
-00000020: 61 6d 70 6c 65 2e 63 6f  6d 0d 0a 54 72 61 6e 73  |ample.com..Trans|
-00000030: 66 65 72 2d 45 6e 63 6f  64 69 6e 67 3a 20 63 68  |fer-Encoding: ch|
-00000040: 75 6e 6b 65 64 0d 0a 43  6f 6e 74 65 6e 74 2d 4c  |unked..Content-L|
-00000050: 65 6e 67 74 68 3a 20 36  0d 0a 0d 0a 30 0d 0a 0d  |ength: 6....0...|
-00000060: 0a 58                                             |.X|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `97 / 98`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/smuggle`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/smuggle`
-- **Forwarded Body Length:** `0 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Ibex accepted ambiguous CL+TE without setting Connection: close, risking downstream pipelined request smuggling.
-
----
-
-### Finding 005: cl_te_conflicting_lengths_te_cl_smuggle
-
-- **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
-- **Ambiguity Class:** CL-TE / TE-CL Conflict
-- **Description:** TE-CL smuggling payload: CL specifies 4 bytes, but TE chunked specifies 11 bytes + end chunk.
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 74 72  61 6e 73 66 65 72 20 48  |POST /transfer H|
-00000010: 54 54 50 2f 31 2e 31 0d  0a 48 6f 73 74 3a 20 65  |TTP/1.1..Host: e|
-00000020: 78 61 6d 70 6c 65 2e 63  6f 6d 0d 0a 43 6f 6e 74  |xample.com..Cont|
-00000030: 65 6e 74 2d 4c 65 6e 67  74 68 3a 20 34 0d 0a 54  |ent-Length: 4..T|
-00000040: 72 61 6e 73 66 65 72 2d  45 6e 63 6f 64 69 6e 67  |ransfer-Encoding|
-00000050: 3a 20 63 68 75 6e 6b 65  64 0d 0a 0d 0a 35 0d 0a  |: chunked....5..|
-00000060: 68 65 6c 6c 6f 0d 0a 36  0d 0a 20 77 6f 72 6c 64  |hello..6.. world|
-00000070: 0d 0a 30 0d 0a 0d 0a                              |..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `119 / 119`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/transfer`
-- **Body Length:** `11 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/transfer`
-- **Forwarded Body Length:** `16 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Ibex accepted ambiguous CL+TE without setting Connection: close, risking downstream pipelined request smuggling.
-
----
-
-### Finding 006: cl_te_multiple_te_headers
+### Finding 001: cl_te_multiple_te_headers
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** CL-TE / TE-CL Conflict
@@ -283,51 +68,9 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 007: duplicate_cl_conflicting_values
+### Finding 002: cl_comma_separated_values
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
-- **Ambiguity Class:** Duplicate / Conflicting Content-Length
-- **Description:** Conflicting Content-Length headers (5 and 10).
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6f  6e 66 6c 69 63 74 2d 63  |POST /conflict-c|
-00000010: 6c 20 48 54 54 50 2f 31  2e 31 0d 0a 48 6f 73 74  |l HTTP/1.1..Host|
-00000020: 3a 20 65 78 61 6d 70 6c  65 2e 63 6f 6d 0d 0a 43  |: example.com..C|
-00000030: 6f 6e 74 65 6e 74 2d 4c  65 6e 67 74 68 3a 20 35  |ontent-Length: 5|
-00000040: 0d 0a 43 6f 6e 74 65 6e  74 2d 4c 65 6e 67 74 68  |..Content-Length|
-00000050: 3a 20 31 30 0d 0a 0d 0a  68 65 6c 6c 6f 77 6f 72  |: 10....hellowor|
-00000060: 6c 64                                             |ld|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `93 / 98`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/conflict-cl`
-- **Body Length:** `5 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `false`
-- **HTTP Status Code:** `None`
-- **Forwarded to Backend:** `No (connection dropped or rejected with 400)`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=None, err=None
-
----
-
-### Finding 008: cl_comma_separated_values
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
 - **Ambiguity Class:** Duplicate / Conflicting Content-Length
 - **Description:** Content-Length with comma-separated values '5, 5'.
 
@@ -343,13 +86,14 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Non
 
 #### Ibex Behavior
 
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `68 / 73`
+- **Accepted:** `false`
+- **Phase:** `Error`
+- **Consumed Bytes:** `0 / 73`
 - **Parsed Method:** `POST`
 - **Parsed URI:** `/comma-cl`
 - **Body Length:** `0 bytes`
 - **Connection Close Set:** `false`
+- **Error Message:** `invalid Content-Length value`
 
 #### HAProxy Behavior
 
@@ -363,216 +107,11 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Non
 
 #### Security Analysis & Root Cause
 
-Body length mismatch (Ibex: 0 bytes, HAProxy: 5 bytes)
+Ibex: accepted=false, phase="Error", err=Some("invalid Content-Length value"). HAProxy: accepted=true, status=Some(200), err=None
 
 ---
 
-### Finding 009: cl_comma_separated_conflicting
-
-- **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
-- **Ambiguity Class:** Duplicate / Conflicting Content-Length
-- **Description:** Content-Length with comma-separated conflicting values '5, 10'.
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6f  6d 6d 61 2d 63 6f 6e 66  |POST /comma-conf|
-00000010: 6c 69 63 74 20 48 54 54  50 2f 31 2e 31 0d 0a 48  |lict HTTP/1.1..H|
-00000020: 6f 73 74 3a 20 65 78 61  6d 70 6c 65 2e 63 6f 6d  |ost: example.com|
-00000030: 0d 0a 43 6f 6e 74 65 6e  74 2d 4c 65 6e 67 74 68  |..Content-Length|
-00000040: 3a 20 35 2c 20 31 30 0d  0a 0d 0a 68 65 6c 6c 6f  |: 5, 10....hello|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `75 / 80`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/comma-conflict`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `false`
-- **HTTP Status Code:** `Some(400)`
-- **Forwarded to Backend:** `No (connection dropped or rejected with 400)`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Some(400), err=None
-
----
-
-### Finding 010: cl_signed_positive
-
-- **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
-- **Ambiguity Class:** Duplicate / Conflicting Content-Length
-- **Description:** Content-Length with leading '+' sign (+5).
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 73 69  67 6e 65 64 2d 63 6c 20  |POST /signed-cl |
-00000010: 48 54 54 50 2f 31 2e 31  0d 0a 48 6f 73 74 3a 20  |HTTP/1.1..Host: |
-00000020: 65 78 61 6d 70 6c 65 2e  63 6f 6d 0d 0a 43 6f 6e  |example.com..Con|
-00000030: 74 65 6e 74 2d 4c 65 6e  67 74 68 3a 20 2b 35 0d  |tent-Length: +5.|
-00000040: 0a 0d 0a 68 65 6c 6c 6f                           |...hello|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `72 / 72`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/signed-cl`
-- **Body Length:** `5 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `false`
-- **HTTP Status Code:** `Some(400)`
-- **Forwarded to Backend:** `No (connection dropped or rejected with 400)`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Some(400), err=None
-
----
-
-### Finding 011: cl_signed_negative
-
-- **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
-- **Ambiguity Class:** Duplicate / Conflicting Content-Length
-- **Description:** Content-Length with negative sign (-5).
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 73 69  67 6e 65 64 2d 6e 65 67  |POST /signed-neg|
-00000010: 2d 63 6c 20 48 54 54 50  2f 31 2e 31 0d 0a 48 6f  |-cl HTTP/1.1..Ho|
-00000020: 73 74 3a 20 65 78 61 6d  70 6c 65 2e 63 6f 6d 0d  |st: example.com.|
-00000030: 0a 43 6f 6e 74 65 6e 74  2d 4c 65 6e 67 74 68 3a  |.Content-Length:|
-00000040: 20 2d 35 0d 0a 0d 0a 68  65 6c 6c 6f              | -5....hello|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `71 / 76`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/signed-neg-cl`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `false`
-- **HTTP Status Code:** `Some(400)`
-- **Forwarded to Backend:** `No (connection dropped or rejected with 400)`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Some(400), err=None
-
----
-
-### Finding 012: cl_overflow_u64
-
-- **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
-- **Ambiguity Class:** Duplicate / Conflicting Content-Length
-- **Description:** Content-Length with massive integer overflowing 64-bit integer.
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 6f 76  65 72 66 6c 6f 77 2d 63  |POST /overflow-c|
-00000010: 6c 20 48 54 54 50 2f 31  2e 31 0d 0a 48 6f 73 74  |l HTTP/1.1..Host|
-00000020: 3a 20 65 78 61 6d 70 6c  65 2e 63 6f 6d 0d 0a 43  |: example.com..C|
-00000030: 6f 6e 74 65 6e 74 2d 4c  65 6e 67 74 68 3a 20 39  |ontent-Length: 9|
-00000040: 39 39 39 39 39 39 39 39  39 39 39 39 39 39 39 39  |9999999999999999|
-00000050: 39 39 39 39 39 39 39 39  39 39 39 39 39 39 39 0d  |999999999999999.|
-00000060: 0a 0d 0a 68 65 6c 6c 6f                           |...hello|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `99 / 104`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/overflow-cl`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `false`
-- **HTTP Status Code:** `Some(400)`
-- **Forwarded to Backend:** `No (connection dropped or rejected with 400)`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Some(400), err=None
-
----
-
-### Finding 013: te_mixed_case
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Transfer-Encoding Formatting & Casing
-- **Description:** Transfer-Encoding with mixed casing: 'cHuNkEd'.
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 61  73 69 6e 67 20 48 54 54  |POST /casing HTT|
-00000010: 50 2f 31 2e 31 0d 0a 48  6f 73 74 3a 20 65 78 61  |P/1.1..Host: exa|
-00000020: 6d 70 6c 65 2e 63 6f 6d  0d 0a 54 72 61 6e 73 66  |mple.com..Transf|
-00000030: 65 72 2d 45 6e 63 6f 64  69 6e 67 3a 20 63 48 75  |er-Encoding: cHu|
-00000040: 4e 6b 45 64 0d 0a 0d 0a  35 0d 0a 68 65 6c 6c 6f  |NkEd....5..hello|
-00000050: 0d 0a 30 0d 0a 0d 0a                              |..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `87 / 87`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/casing`
-- **Body Length:** `5 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/casing`
-- **Forwarded Body Length:** `10 bytes`
-- **Saw Sentinel Next Request:** `true`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 5 bytes, HAProxy: 10 bytes)
-
----
-
-### Finding 014: te_trailing_identity
+### Finding 003: te_trailing_identity
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Transfer-Encoding Formatting & Casing
@@ -614,7 +153,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 015: te_leading_identity
+### Finding 004: te_leading_identity
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Transfer-Encoding Formatting & Casing
@@ -656,50 +195,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 016: te_tab_whitespace
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Transfer-Encoding Formatting & Casing
-- **Description:** Transfer-Encoding with tab separator: 'Transfer-Encoding:	chunked'.
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 74 65  2d 74 61 62 20 48 54 54  |POST /te-tab HTT|
-00000010: 50 2f 31 2e 31 0d 0a 48  6f 73 74 3a 20 65 78 61  |P/1.1..Host: exa|
-00000020: 6d 70 6c 65 2e 63 6f 6d  0d 0a 54 72 61 6e 73 66  |mple.com..Transf|
-00000030: 65 72 2d 45 6e 63 6f 64  69 6e 67 3a 09 63 68 75  |er-Encoding:.chu|
-00000040: 6e 6b 65 64 0d 0a 0d 0a  35 0d 0a 68 65 6c 6c 6f  |nked....5..hello|
-00000050: 0d 0a 30 0d 0a 0d 0a                              |..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `87 / 87`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/te-tab`
-- **Body Length:** `5 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/te-tab`
-- **Forwarded Body Length:** `10 bytes`
-- **Saw Sentinel Next Request:** `true`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 5 bytes, HAProxy: 10 bytes)
-
----
-
-### Finding 017: te_prefix_unknown_encoding
+### Finding 005: te_prefix_unknown_encoding
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Transfer-Encoding Formatting & Casing
@@ -740,50 +236,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 018: obs_fold_transfer_encoding
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Obs-Fold Continuation Lines
-- **Description:** Obs-fold on Transfer-Encoding header line itself.
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 6f 62  73 2d 74 65 20 48 54 54  |POST /obs-te HTT|
-00000010: 50 2f 31 2e 31 0d 0a 48  6f 73 74 3a 20 65 78 61  |P/1.1..Host: exa|
-00000020: 6d 70 6c 65 2e 63 6f 6d  0d 0a 54 72 61 6e 73 66  |mple.com..Transf|
-00000030: 65 72 2d 45 6e 63 6f 64  69 6e 67 3a 0d 0a 20 63  |er-Encoding:.. c|
-00000040: 68 75 6e 6b 65 64 0d 0a  0d 0a 35 0d 0a 68 65 6c  |hunked....5..hel|
-00000050: 6c 6f 0d 0a 30 0d 0a 0d  0a                       |lo..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `89 / 89`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/obs-te`
-- **Body Length:** `5 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/obs-te`
-- **Forwarded Body Length:** `10 bytes`
-- **Saw Sentinel Next Request:** `true`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 5 bytes, HAProxy: 10 bytes)
-
----
-
-### Finding 019: obs_fold_first_line
+### Finding 006: obs_fold_first_line
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Obs-Fold Continuation Lines
@@ -823,7 +276,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 020: line_term_cr_only
+### Finding 007: line_term_cr_only
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Line Terminator Variations (CR/LF)
@@ -862,50 +315,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 021: chunk_leading_zeros
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Chunk Size & Extensions
-- **Description:** Chunk size formatted with leading zeros (00005).
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 68  75 6e 6b 2d 7a 65 72 6f  |POST /chunk-zero|
-00000010: 73 20 48 54 54 50 2f 31  2e 31 0d 0a 48 6f 73 74  |s HTTP/1.1..Host|
-00000020: 3a 20 65 78 61 6d 70 6c  65 2e 63 6f 6d 0d 0a 54  |: example.com..T|
-00000030: 72 61 6e 73 66 65 72 2d  45 6e 63 6f 64 69 6e 67  |ransfer-Encoding|
-00000040: 3a 20 63 68 75 6e 6b 65  64 0d 0a 0d 0a 30 30 30  |: chunked....000|
-00000050: 30 35 0d 0a 68 65 6c 6c  6f 0d 0a 30 0d 0a 0d 0a  |05..hello..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `96 / 96`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/chunk-zeros`
-- **Body Length:** `5 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/chunk-zeros`
-- **Forwarded Body Length:** `10 bytes`
-- **Saw Sentinel Next Request:** `true`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 5 bytes, HAProxy: 10 bytes)
-
----
-
-### Finding 022: chunk_signed_plus
+### Finding 008: chunk_signed_plus
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Chunk Size & Extensions
@@ -946,97 +356,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 023: chunk_extension_standard
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Chunk Size & Extensions
-- **Description:** Chunk extension with key-value parameters: '5;ext=foo;bar=123'.
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 68  75 6e 6b 2d 65 78 74 20  |POST /chunk-ext |
-00000010: 48 54 54 50 2f 31 2e 31  0d 0a 48 6f 73 74 3a 20  |HTTP/1.1..Host: |
-00000020: 65 78 61 6d 70 6c 65 2e  63 6f 6d 0d 0a 54 72 61  |example.com..Tra|
-00000030: 6e 73 66 65 72 2d 45 6e  63 6f 64 69 6e 67 3a 20  |nsfer-Encoding: |
-00000040: 63 68 75 6e 6b 65 64 0d  0a 0d 0a 35 3b 65 78 74  |chunked....5;ext|
-00000050: 3d 66 6f 6f 3b 62 61 72  3d 31 32 33 0d 0a 68 65  |=foo;bar=123..he|
-00000060: 6c 6c 6f 0d 0a 30 3b 66  69 6e 61 6c 3d 74 72 75  |llo..0;final=tru|
-00000070: 65 0d 0a 0d 0a                                    |e....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `117 / 117`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/chunk-ext`
-- **Body Length:** `5 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/chunk-ext`
-- **Forwarded Body Length:** `10 bytes`
-- **Saw Sentinel Next Request:** `true`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 5 bytes, HAProxy: 10 bytes)
-
----
-
-### Finding 024: chunk_extension_quoted_semicolon
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Chunk Size & Extensions
-- **Description:** Chunk extension with quoted string containing semicolons.
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 68  75 6e 6b 2d 71 75 6f 74  |POST /chunk-quot|
-00000010: 65 64 20 48 54 54 50 2f  31 2e 31 0d 0a 48 6f 73  |ed HTTP/1.1..Hos|
-00000020: 74 3a 20 65 78 61 6d 70  6c 65 2e 63 6f 6d 0d 0a  |t: example.com..|
-00000030: 54 72 61 6e 73 66 65 72  2d 45 6e 63 6f 64 69 6e  |Transfer-Encodin|
-00000040: 67 3a 20 63 68 75 6e 6b  65 64 0d 0a 0d 0a 35 3b  |g: chunked....5;|
-00000050: 65 78 74 3d 22 71 75 6f  74 65 64 3b 77 69 74 68  |ext="quoted;with|
-00000060: 3b 73 65 6d 69 73 22 0d  0a 68 65 6c 6c 6f 0d 0a  |;semis"..hello..|
-00000070: 30 0d 0a 0d 0a                                    |0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `117 / 117`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/chunk-quoted`
-- **Body Length:** `5 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/chunk-quoted`
-- **Forwarded Body Length:** `10 bytes`
-- **Saw Sentinel Next Request:** `true`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 5 bytes, HAProxy: 10 bytes)
-
----
-
-### Finding 025: chunk_whitespace_around_size
+### Finding 009: chunk_whitespace_around_size
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Chunk Size & Extensions
@@ -1077,7 +397,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 026: header_space_before_colon
+### Finding 010: header_space_before_colon
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Header Name Malformations
@@ -1117,7 +437,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 027: header_tab_before_colon
+### Finding 011: header_tab_before_colon
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Header Name Malformations
@@ -1157,7 +477,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 028: header_nul_in_name
+### Finding 012: header_nul_in_name
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Header Name Malformations
@@ -1197,7 +517,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 029: header_nul_in_value
+### Finding 013: header_nul_in_value
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Header Name Malformations
@@ -1237,7 +557,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 030: header_empty_name
+### Finding 014: header_empty_name
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Header Name Malformations
@@ -1277,7 +597,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 031: pipelined_standard_two_requests
+### Finding 015: pipelined_standard_two_requests
 
 - **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Pipelined Request Boundaries
@@ -1319,7 +639,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 ---
 
-### Finding 032: pipelined_body_underflow_smuggle
+### Finding 016: pipelined_body_underflow_smuggle
 
 - **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Pipelined Request Boundaries
@@ -1363,7 +683,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 ---
 
-### Finding 033: pipelined_chunked_premature_end
+### Finding 017: pipelined_chunked_premature_end
 
 - **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Pipelined Request Boundaries
@@ -1398,7 +718,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 - **HTTP Status Code:** `Some(200)`
 - **Forwarded Method:** `POST`
 - **Forwarded URI:** `/p-chunk`
-- **Forwarded Body Length:** `9 bytes`
+- **Forwarded Body Length:** `4 bytes`
 - **Saw Sentinel Next Request:** `false`
 - **Next Request Smuggled / Desynced:** `true`
 
@@ -1408,7 +728,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 ---
 
-### Finding 034: oversized_header_count_120
+### Finding 018: oversized_header_count_120
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Oversized Headers & Limits
@@ -1680,7 +1000,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 035: oversized_header_name_300b
+### Finding 019: oversized_header_name_300b
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Oversized Headers & Limits
@@ -1738,96 +1058,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 036: mutated_cl_te_rand_0
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Combinatorial CL (11) vs TE with payload len (14)
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
-00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 31 31  |ntent-Length: 11|
-00000040: 0d 0a 54 72 61 6e 73 66  65 72 2d 45 6e 63 6f 64  |..Transfer-Encod|
-00000050: 69 6e 67 3a 20 63 68 75  6e 6b 65 64 0d 0a 0d 0a  |ing: chunked....|
-00000060: 65 0d 0a 30 31 32 33 34  35 36 37 38 39 30 31 32  |e..0123456789012|
-00000070: 33 0d 0a 30 0d 0a 0d 0a                           |3..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `120 / 120`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/cl-te-rand`
-- **Body Length:** `14 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/cl-te-rand`
-- **Forwarded Body Length:** `19 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 14 bytes, HAProxy: 19 bytes)
-
----
-
-### Finding 037: mutated_cl_te_rand_1
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Combinatorial CL (2) vs TE with payload len (7)
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
-00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 32 0d  |ntent-Length: 2.|
-00000040: 0a 54 72 61 6e 73 66 65  72 2d 45 6e 63 6f 64 69  |.Transfer-Encodi|
-00000050: 6e 67 3a 20 63 68 75 6e  6b 65 64 0d 0a 0d 0a 37  |ng: chunked....7|
-00000060: 0d 0a 30 31 32 33 34 35  36 0d 0a 30 0d 0a 0d 0a  |..0123456..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `112 / 112`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/cl-te-rand`
-- **Body Length:** `7 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/cl-te-rand`
-- **Forwarded Body Length:** `12 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 7 bytes, HAProxy: 12 bytes)
-
----
-
-### Finding 038: mutated_startline_2
+### Finding 020: mutated_startline_2
 
 - **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -1864,7 +1095,7 @@ Full-buffer parse succeeded/failed differently than byte-by-byte incremental str
 
 ---
 
-### Finding 039: mutated_base_3_oversized_header_count_120
+### Finding 021: mutated_base_3_oversized_header_count_120
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -2136,7 +1367,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 040: mutated_pipelined_pair_4
+### Finding 022: mutated_pipelined_pair_4
 
 - **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Pipelined Request Boundaries
@@ -2178,47 +1409,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 ---
 
-### Finding 041: mutated_base_5_cl_signed_negative
-
-- **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Mutated byte in cl_signed_negative
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 73 69  67 6e 65 64 2d 6e 65 67  |POST /signed-neg|
-00000010: 2d 63 6c 20 48 54 54 50  2f 31 2e 31 0d 0a 48 6f  |-cl HTTP/1.1..Ho|
-00000020: 73 74 3a 20 65 78 61 6d  70 6c 65 2e 63 6f 6d 0d  |st: example.com.|
-00000030: 0a 43 6f 6e 74 65 6e 74  2d 4c 65 6e 67 74 68 3a  |.Content-Length:|
-00000040: 20 2d 35 0d 0a 0d 0a 00  65 6c 6c 6f              | -5.....ello|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `71 / 76`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/signed-neg-cl`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `false`
-- **HTTP Status Code:** `Some(400)`
-- **Forwarded to Backend:** `No (connection dropped or rejected with 400)`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Some(400), err=None
-
----
-
-### Finding 042: mutated_startline_6
+### Finding 023: mutated_startline_6
 
 - **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -2257,52 +1448,7 @@ Full-buffer parse succeeded/failed differently than byte-by-byte incremental str
 
 ---
 
-### Finding 043: mutated_cl_te_rand_8
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Combinatorial CL (7) vs TE with payload len (17)
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
-00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 37 0d  |ntent-Length: 7.|
-00000040: 0a 54 72 61 6e 73 66 65  72 2d 45 6e 63 6f 64 69  |.Transfer-Encodi|
-00000050: 6e 67 3a 20 63 68 75 6e  6b 65 64 0d 0a 0d 0a 31  |ng: chunked....1|
-00000060: 31 0d 0a 30 31 32 33 34  35 36 37 38 39 30 31 32  |1..0123456789012|
-00000070: 33 34 35 36 0d 0a 30 0d  0a 0d 0a                 |3456..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `123 / 123`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/cl-te-rand`
-- **Body Length:** `17 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/cl-te-rand`
-- **Forwarded Body Length:** `23 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 17 bytes, HAProxy: 23 bytes)
-
----
-
-### Finding 044: mutated_headers_ws_9
+### Finding 024: mutated_headers_ws_9
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -2350,7 +1496,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 045: mutated_base_10_cl_te_conflicting_lengths_te_cl_smuggle
+### Finding 025: mutated_base_10_cl_te_conflicting_lengths_te_cl_smuggle
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -2393,7 +1539,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 046: mutated_startline_11
+### Finding 026: mutated_startline_11
 
 - **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -2432,97 +1578,7 @@ Full-buffer parse succeeded/failed differently than byte-by-byte incremental str
 
 ---
 
-### Finding 047: mutated_cl_te_rand_13
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Combinatorial CL (0) vs TE with payload len (12)
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
-00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 30 0d  |ntent-Length: 0.|
-00000040: 0a 54 72 61 6e 73 66 65  72 2d 45 6e 63 6f 64 69  |.Transfer-Encodi|
-00000050: 6e 67 3a 20 63 68 75 6e  6b 65 64 0d 0a 0d 0a 63  |ng: chunked....c|
-00000060: 0d 0a 30 31 32 33 34 35  36 37 38 39 30 31 0d 0a  |..012345678901..|
-00000070: 30 0d 0a 0d 0a                                    |0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `117 / 117`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/cl-te-rand`
-- **Body Length:** `12 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/cl-te-rand`
-- **Forwarded Body Length:** `17 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 12 bytes, HAProxy: 17 bytes)
-
----
-
-### Finding 048: mutated_cl_te_rand_14
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Combinatorial CL (13) vs TE with payload len (9)
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
-00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 31 33  |ntent-Length: 13|
-00000040: 0d 0a 54 72 61 6e 73 66  65 72 2d 45 6e 63 6f 64  |..Transfer-Encod|
-00000050: 69 6e 67 3a 20 63 68 75  6e 6b 65 64 0d 0a 0d 0a  |ing: chunked....|
-00000060: 39 0d 0a 30 31 32 33 34  35 36 37 38 0d 0a 30 0d  |9..012345678..0.|
-00000070: 0a 0d 0a                                          |...|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `115 / 115`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/cl-te-rand`
-- **Body Length:** `9 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/cl-te-rand`
-- **Forwarded Body Length:** `14 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 9 bytes, HAProxy: 14 bytes)
-
----
-
-### Finding 049: mutated_pipelined_pair_15
+### Finding 027: mutated_pipelined_pair_15
 
 - **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Pipelined Request Boundaries
@@ -2564,7 +1620,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 ---
 
-### Finding 050: mutated_base_16_te_leading_identity
+### Finding 028: mutated_base_16_te_leading_identity
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -2606,7 +1662,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 051: mutated_headers_ws_17
+### Finding 029: mutated_headers_ws_17
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -2651,7 +1707,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 052: mutated_pipelined_pair_18
+### Finding 030: mutated_pipelined_pair_18
 
 - **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Pipelined Request Boundaries
@@ -2693,49 +1749,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 ---
 
-### Finding 053: mutated_base_19_duplicate_cl_conflicting_values
-
-- **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Mutated byte in duplicate_cl_conflicting_values
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 3a 2f 63 6f  6e 66 6c 69 63 74 2d 63  |POST:/conflict-c|
-00000010: 6c 20 48 54 54 50 2f 31  2e 31 0d 0a 48 6f 73 74  |l HTTP/1.1..Host|
-00000020: 3a 20 65 78 61 6d 70 6c  65 2e 63 6f 6d 0d 0a 43  |: example.com..C|
-00000030: 6f 6e 74 65 6e 74 2d 4c  65 6e 67 74 68 3a 20 35  |ontent-Length: 5|
-00000040: 0d 0a 43 6f 6e 74 65 6e  74 2d 4c 65 6e 67 74 68  |..Content-Length|
-00000050: 3a 20 31 30 0d 0a 0d 0a  68 65 6c 6c 6f 77 6f 72  |: 10....hellowor|
-00000060: 6c 64                                             |ld|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `93 / 98`
-- **Parsed Method:** `POST:/conflict-cl`
-- **Parsed URI:** `HTTP/1.1`
-- **Body Length:** `5 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `false`
-- **HTTP Status Code:** `Some(400)`
-- **Forwarded to Backend:** `No (connection dropped or rejected with 400)`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Some(400), err=None
-
----
-
-### Finding 054: mutated_headers_ws_20
+### Finding 031: mutated_headers_ws_20
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -2776,7 +1790,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 055: mutated_headers_ws_21
+### Finding 032: mutated_headers_ws_21
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -2821,95 +1835,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 056: mutated_chunked_22
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized chunked sequence of 1 chunks
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 6d 75  74 2d 63 68 75 6e 6b 20  |POST /mut-chunk |
-00000010: 48 54 54 50 2f 31 2e 31  0d 0a 48 6f 73 74 3a 20  |HTTP/1.1..Host: |
-00000020: 65 78 61 6d 70 6c 65 2e  63 6f 6d 0d 0a 54 72 61  |example.com..Tra|
-00000030: 6e 73 66 65 72 2d 45 6e  63 6f 64 69 6e 67 3a 20  |nsfer-Encoding: |
-00000040: 63 68 75 6e 6b 65 64 0d  0a 0d 0a 31 30 0d 0a 61  |chunked....10..a|
-00000050: 62 63 64 65 66 67 68 69  6a 6b 6c 6d 6e 6f 70 0d  |bcdefghijklmnop.|
-00000060: 0a 30 0d 0a 0d 0a                                 |.0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `102 / 102`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/mut-chunk`
-- **Body Length:** `16 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/mut-chunk`
-- **Forwarded Body Length:** `22 bytes`
-- **Saw Sentinel Next Request:** `true`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 16 bytes, HAProxy: 22 bytes)
-
----
-
-### Finding 057: mutated_chunked_23
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized chunked sequence of 2 chunks
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 6d 75  74 2d 63 68 75 6e 6b 20  |POST /mut-chunk |
-00000010: 48 54 54 50 2f 31 2e 31  0d 0a 48 6f 73 74 3a 20  |HTTP/1.1..Host: |
-00000020: 65 78 61 6d 70 6c 65 2e  63 6f 6d 0d 0a 54 72 61  |example.com..Tra|
-00000030: 6e 73 66 65 72 2d 45 6e  63 6f 64 69 6e 67 3a 20  |nsfer-Encoding: |
-00000040: 63 68 75 6e 6b 65 64 0d  0a 0d 0a 43 0d 0a 61 62  |chunked....C..ab|
-00000050: 63 64 65 66 67 68 69 6a  6b 6c 0d 0a 35 0d 0a 61  |cdefghijkl..5..a|
-00000060: 62 63 64 65 0d 0a 30 0d  0a 0d 0a                 |bcde..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `107 / 107`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/mut-chunk`
-- **Body Length:** `17 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/mut-chunk`
-- **Forwarded Body Length:** `23 bytes`
-- **Saw Sentinel Next Request:** `true`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 17 bytes, HAProxy: 23 bytes)
-
----
-
-### Finding 058: mutated_pipelined_pair_24
+### Finding 033: mutated_pipelined_pair_24
 
 - **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Pipelined Request Boundaries
@@ -2951,97 +1877,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 ---
 
-### Finding 059: mutated_chunked_25
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized chunked sequence of 5 chunks
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 6d 75  74 2d 63 68 75 6e 6b 20  |POST /mut-chunk |
-00000010: 48 54 54 50 2f 31 2e 31  0d 0a 48 6f 73 74 3a 20  |HTTP/1.1..Host: |
-00000020: 65 78 61 6d 70 6c 65 2e  63 6f 6d 0d 0a 54 72 61  |example.com..Tra|
-00000030: 6e 73 66 65 72 2d 45 6e  63 6f 64 69 6e 67 3a 20  |nsfer-Encoding: |
-00000040: 63 68 75 6e 6b 65 64 0d  0a 0d 0a 31 0d 0a 61 0d  |chunked....1..a.|
-00000050: 0a 32 0d 0a 61 62 0d 0a  61 0d 0a 61 62 63 64 65  |.2..ab..a..abcde|
-00000060: 66 67 68 69 6a 0d 0a 37  0d 0a 61 62 63 64 65 66  |fghij..7..abcdef|
-00000070: 67 0d 0a 62 0d 0a 61 62  63 64 65 66 67 68 69 6a  |g..b..abcdefghij|
-00000080: 6b 0d 0a 30 0d 0a 0d 0a                           |k..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `136 / 136`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/mut-chunk`
-- **Body Length:** `31 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/mut-chunk`
-- **Forwarded Body Length:** `37 bytes`
-- **Saw Sentinel Next Request:** `true`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 31 bytes, HAProxy: 37 bytes)
-
----
-
-### Finding 060: mutated_cl_te_rand_26
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Combinatorial CL (5) vs TE with payload len (3)
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
-00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 35 0d  |ntent-Length: 5.|
-00000040: 0a 54 72 61 6e 73 66 65  72 2d 45 6e 63 6f 64 69  |.Transfer-Encodi|
-00000050: 6e 67 3a 20 63 68 75 6e  6b 65 64 0d 0a 0d 0a 33  |ng: chunked....3|
-00000060: 0d 0a 30 31 32 0d 0a 30  0d 0a 0d 0a              |..012..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `108 / 108`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/cl-te-rand`
-- **Body Length:** `3 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/cl-te-rand`
-- **Forwarded Body Length:** `8 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 3 bytes, HAProxy: 8 bytes)
-
----
-
-### Finding 061: mutated_headers_ws_27
+### Finding 034: mutated_headers_ws_27
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -3088,7 +1924,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 062: mutated_startline_28
+### Finding 035: mutated_startline_28
 
 - **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -3126,7 +1962,7 @@ Full-buffer parse succeeded/failed differently than byte-by-byte incremental str
 
 ---
 
-### Finding 063: mutated_headers_ws_29
+### Finding 036: mutated_headers_ws_29
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -3170,98 +2006,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 064: mutated_chunked_31
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized chunked sequence of 5 chunks
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 6d 75  74 2d 63 68 75 6e 6b 20  |POST /mut-chunk |
-00000010: 48 54 54 50 2f 31 2e 31  0d 0a 48 6f 73 74 3a 20  |HTTP/1.1..Host: |
-00000020: 65 78 61 6d 70 6c 65 2e  63 6f 6d 0d 0a 54 72 61  |example.com..Tra|
-00000030: 6e 73 66 65 72 2d 45 6e  63 6f 64 69 6e 67 3a 20  |nsfer-Encoding: |
-00000040: 63 68 75 6e 6b 65 64 0d  0a 0d 0a 38 0d 0a 61 62  |chunked....8..ab|
-00000050: 63 64 65 66 67 68 0d 0a  32 0d 0a 61 62 0d 0a 61  |cdefgh..2..ab..a|
-00000060: 0d 0a 61 62 63 64 65 66  67 68 69 6a 0d 0a 36 0d  |..abcdefghij..6.|
-00000070: 0a 61 62 63 64 65 66 0d  0a 42 0d 0a 61 62 63 64  |.abcdef..B..abcd|
-00000080: 65 66 67 68 69 6a 6b 0d  0a 30 0d 0a 0d 0a        |efghijk..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `142 / 142`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/mut-chunk`
-- **Body Length:** `37 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/mut-chunk`
-- **Forwarded Body Length:** `43 bytes`
-- **Saw Sentinel Next Request:** `true`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 37 bytes, HAProxy: 43 bytes)
-
----
-
-### Finding 065: mutated_cl_te_rand_32
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Combinatorial CL (1) vs TE with payload len (16)
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
-00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 31 0d  |ntent-Length: 1.|
-00000040: 0a 54 72 61 6e 73 66 65  72 2d 45 6e 63 6f 64 69  |.Transfer-Encodi|
-00000050: 6e 67 3a 20 63 68 75 6e  6b 65 64 0d 0a 0d 0a 31  |ng: chunked....1|
-00000060: 30 0d 0a 30 31 32 33 34  35 36 37 38 39 30 31 32  |0..0123456789012|
-00000070: 33 34 35 0d 0a 30 0d 0a  0d 0a                    |345..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `122 / 122`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/cl-te-rand`
-- **Body Length:** `16 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/cl-te-rand`
-- **Forwarded Body Length:** `22 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 16 bytes, HAProxy: 22 bytes)
-
----
-
-### Finding 066: mutated_pipelined_pair_34
+### Finding 037: mutated_pipelined_pair_34
 
 - **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Pipelined Request Boundaries
@@ -3303,7 +2048,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 ---
 
-### Finding 067: mutated_pipelined_pair_37
+### Finding 038: mutated_pipelined_pair_37
 
 - **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Pipelined Request Boundaries
@@ -3345,7 +2090,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 ---
 
-### Finding 068: mutated_pipelined_pair_40
+### Finding 039: mutated_pipelined_pair_40
 
 - **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Pipelined Request Boundaries
@@ -3387,7 +2132,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 ---
 
-### Finding 069: mutated_headers_ws_42
+### Finding 040: mutated_headers_ws_42
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -3430,7 +2175,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 070: mutated_headers_ws_43
+### Finding 041: mutated_headers_ws_43
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -3475,7 +2220,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 071: mutated_pipelined_pair_44
+### Finding 042: mutated_pipelined_pair_44
 
 - **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Pipelined Request Boundaries
@@ -3517,7 +2262,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 ---
 
-### Finding 072: mutated_headers_ws_45
+### Finding 043: mutated_headers_ws_45
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -3564,96 +2309,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 073: mutated_chunked_47
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized chunked sequence of 5 chunks
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 6d 75  74 2d 63 68 75 6e 6b 20  |POST /mut-chunk |
-00000010: 48 54 54 50 2f 31 2e 31  0d 0a 48 6f 73 74 3a 20  |HTTP/1.1..Host: |
-00000020: 65 78 61 6d 70 6c 65 2e  63 6f 6d 0d 0a 54 72 61  |example.com..Tra|
-00000030: 6e 73 66 65 72 2d 45 6e  63 6f 64 69 6e 67 3a 20  |nsfer-Encoding: |
-00000040: 63 68 75 6e 6b 65 64 0d  0a 0d 0a 31 0d 0a 61 0d  |chunked....1..a.|
-00000050: 0a 34 0d 0a 61 62 63 64  0d 0a 39 0d 0a 61 62 63  |.4..abcd..9..abc|
-00000060: 64 65 66 67 68 69 0d 0a  34 0d 0a 61 62 63 64 0d  |defghi..4..abcd.|
-00000070: 0a 32 0d 0a 61 62 0d 0a  30 0d 0a 0d 0a           |.2..ab..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `125 / 125`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/mut-chunk`
-- **Body Length:** `20 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/mut-chunk`
-- **Forwarded Body Length:** `26 bytes`
-- **Saw Sentinel Next Request:** `true`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 20 bytes, HAProxy: 26 bytes)
-
----
-
-### Finding 074: mutated_cl_te_rand_49
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Combinatorial CL (0) vs TE with payload len (5)
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
-00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 30 0d  |ntent-Length: 0.|
-00000040: 0a 54 72 61 6e 73 66 65  72 2d 45 6e 63 6f 64 69  |.Transfer-Encodi|
-00000050: 6e 67 3a 20 63 68 75 6e  6b 65 64 0d 0a 0d 0a 35  |ng: chunked....5|
-00000060: 0d 0a 30 31 32 33 34 0d  0a 30 0d 0a 0d 0a        |..01234..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `110 / 110`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/cl-te-rand`
-- **Body Length:** `5 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/cl-te-rand`
-- **Forwarded Body Length:** `10 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 5 bytes, HAProxy: 10 bytes)
-
----
-
-### Finding 075: mutated_base_50_chunk_signed_plus
+### Finding 044: mutated_base_50_chunk_signed_plus
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -3694,52 +2350,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 076: mutated_cl_te_rand_51
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Combinatorial CL (16) vs TE with payload len (17)
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
-00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 31 36  |ntent-Length: 16|
-00000040: 0d 0a 54 72 61 6e 73 66  65 72 2d 45 6e 63 6f 64  |..Transfer-Encod|
-00000050: 69 6e 67 3a 20 63 68 75  6e 6b 65 64 0d 0a 0d 0a  |ing: chunked....|
-00000060: 31 31 0d 0a 30 31 32 33  34 35 36 37 38 39 30 31  |11..012345678901|
-00000070: 32 33 34 35 36 0d 0a 30  0d 0a 0d 0a              |23456..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `124 / 124`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/cl-te-rand`
-- **Body Length:** `17 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/cl-te-rand`
-- **Forwarded Body Length:** `23 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 17 bytes, HAProxy: 23 bytes)
-
----
-
-### Finding 077: mutated_startline_52
+### Finding 045: mutated_startline_52
 
 - **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -3777,7 +2388,7 @@ Full-buffer parse succeeded/failed differently than byte-by-byte incremental str
 
 ---
 
-### Finding 078: mutated_startline_53
+### Finding 046: mutated_startline_53
 
 - **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -3815,319 +2426,7 @@ Full-buffer parse succeeded/failed differently than byte-by-byte incremental str
 
 ---
 
-### Finding 079: mutated_chunked_54
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized chunked sequence of 2 chunks
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 6d 75  74 2d 63 68 75 6e 6b 20  |POST /mut-chunk |
-00000010: 48 54 54 50 2f 31 2e 31  0d 0a 48 6f 73 74 3a 20  |HTTP/1.1..Host: |
-00000020: 65 78 61 6d 70 6c 65 2e  63 6f 6d 0d 0a 54 72 61  |example.com..Tra|
-00000030: 6e 73 66 65 72 2d 45 6e  63 6f 64 69 6e 67 3a 20  |nsfer-Encoding: |
-00000040: 63 68 75 6e 6b 65 64 0d  0a 0d 0a 46 0d 0a 61 62  |chunked....F..ab|
-00000050: 63 64 65 66 67 68 69 6a  6b 6c 6d 6e 6f 0d 0a 66  |cdefghijklmno..f|
-00000060: 0d 0a 61 62 63 64 65 66  67 68 69 6a 6b 6c 6d 6e  |..abcdefghijklmn|
-00000070: 6f 0d 0a 30 0d 0a 0d 0a                           |o..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `120 / 120`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/mut-chunk`
-- **Body Length:** `30 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/mut-chunk`
-- **Forwarded Body Length:** `36 bytes`
-- **Saw Sentinel Next Request:** `true`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 30 bytes, HAProxy: 36 bytes)
-
----
-
-### Finding 080: mutated_chunked_55
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized chunked sequence of 2 chunks
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 6d 75  74 2d 63 68 75 6e 6b 20  |POST /mut-chunk |
-00000010: 48 54 54 50 2f 31 2e 31  0d 0a 48 6f 73 74 3a 20  |HTTP/1.1..Host: |
-00000020: 65 78 61 6d 70 6c 65 2e  63 6f 6d 0d 0a 54 72 61  |example.com..Tra|
-00000030: 6e 73 66 65 72 2d 45 6e  63 6f 64 69 6e 67 3a 20  |nsfer-Encoding: |
-00000040: 63 68 75 6e 6b 65 64 0d  0a 0d 0a 32 0d 0a 61 62  |chunked....2..ab|
-00000050: 0d 0a 46 0d 0a 61 62 63  64 65 66 67 68 69 6a 6b  |..F..abcdefghijk|
-00000060: 6c 6d 6e 6f 0d 0a 30 0d  0a 0d 0a                 |lmno..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `107 / 107`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/mut-chunk`
-- **Body Length:** `17 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/mut-chunk`
-- **Forwarded Body Length:** `23 bytes`
-- **Saw Sentinel Next Request:** `true`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 17 bytes, HAProxy: 23 bytes)
-
----
-
-### Finding 081: mutated_chunked_56
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized chunked sequence of 3 chunks
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 6d 75  74 2d 63 68 75 6e 6b 20  |POST /mut-chunk |
-00000010: 48 54 54 50 2f 31 2e 31  0d 0a 48 6f 73 74 3a 20  |HTTP/1.1..Host: |
-00000020: 65 78 61 6d 70 6c 65 2e  63 6f 6d 0d 0a 54 72 61  |example.com..Tra|
-00000030: 6e 73 66 65 72 2d 45 6e  63 6f 64 69 6e 67 3a 20  |nsfer-Encoding: |
-00000040: 63 68 75 6e 6b 65 64 0d  0a 0d 0a 31 30 0d 0a 61  |chunked....10..a|
-00000050: 62 63 64 65 66 67 68 69  6a 6b 6c 6d 6e 6f 70 0d  |bcdefghijklmnop.|
-00000060: 0a 43 0d 0a 61 62 63 64  65 66 67 68 69 6a 6b 6c  |.C..abcdefghijkl|
-00000070: 0d 0a 45 0d 0a 61 62 63  64 65 66 67 68 69 6a 6b  |..E..abcdefghijk|
-00000080: 6c 6d 6e 0d 0a 30 0d 0a  0d 0a                    |lmn..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `138 / 138`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/mut-chunk`
-- **Body Length:** `42 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/mut-chunk`
-- **Forwarded Body Length:** `48 bytes`
-- **Saw Sentinel Next Request:** `true`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 42 bytes, HAProxy: 48 bytes)
-
----
-
-### Finding 082: mutated_cl_te_rand_57
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Combinatorial CL (6) vs TE with payload len (2)
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
-00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 36 0d  |ntent-Length: 6.|
-00000040: 0a 54 72 61 6e 73 66 65  72 2d 45 6e 63 6f 64 69  |.Transfer-Encodi|
-00000050: 6e 67 3a 20 63 68 75 6e  6b 65 64 0d 0a 0d 0a 32  |ng: chunked....2|
-00000060: 0d 0a 30 31 0d 0a 30 0d  0a 0d 0a                 |..01..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `107 / 107`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/cl-te-rand`
-- **Body Length:** `2 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/cl-te-rand`
-- **Forwarded Body Length:** `7 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 2 bytes, HAProxy: 7 bytes)
-
----
-
-### Finding 083: mutated_chunked_59
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized chunked sequence of 2 chunks
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 6d 75  74 2d 63 68 75 6e 6b 20  |POST /mut-chunk |
-00000010: 48 54 54 50 2f 31 2e 31  0d 0a 48 6f 73 74 3a 20  |HTTP/1.1..Host: |
-00000020: 65 78 61 6d 70 6c 65 2e  63 6f 6d 0d 0a 54 72 61  |example.com..Tra|
-00000030: 6e 73 66 65 72 2d 45 6e  63 6f 64 69 6e 67 3a 20  |nsfer-Encoding: |
-00000040: 63 68 75 6e 6b 65 64 0d  0a 0d 0a 45 0d 0a 61 62  |chunked....E..ab|
-00000050: 63 64 65 66 67 68 69 6a  6b 6c 6d 6e 0d 0a 32 0d  |cdefghijklmn..2.|
-00000060: 0a 61 62 0d 0a 30 0d 0a  0d 0a                    |.ab..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `106 / 106`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/mut-chunk`
-- **Body Length:** `16 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/mut-chunk`
-- **Forwarded Body Length:** `22 bytes`
-- **Saw Sentinel Next Request:** `true`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 16 bytes, HAProxy: 22 bytes)
-
----
-
-### Finding 084: mutated_chunked_61
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized chunked sequence of 5 chunks
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 6d 75  74 2d 63 68 75 6e 6b 20  |POST /mut-chunk |
-00000010: 48 54 54 50 2f 31 2e 31  0d 0a 48 6f 73 74 3a 20  |HTTP/1.1..Host: |
-00000020: 65 78 61 6d 70 6c 65 2e  63 6f 6d 0d 0a 54 72 61  |example.com..Tra|
-00000030: 6e 73 66 65 72 2d 45 6e  63 6f 64 69 6e 67 3a 20  |nsfer-Encoding: |
-00000040: 63 68 75 6e 6b 65 64 0d  0a 0d 0a 34 0d 0a 61 62  |chunked....4..ab|
-00000050: 63 64 0d 0a 34 0d 0a 61  62 63 64 0d 0a 32 0d 0a  |cd..4..abcd..2..|
-00000060: 61 62 0d 0a 64 0d 0a 61  62 63 64 65 66 67 68 69  |ab..d..abcdefghi|
-00000070: 6a 6b 6c 6d 0d 0a 37 0d  0a 61 62 63 64 65 66 67  |jklm..7..abcdefg|
-00000080: 0d 0a 30 0d 0a 0d 0a                              |..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `135 / 135`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/mut-chunk`
-- **Body Length:** `30 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/mut-chunk`
-- **Forwarded Body Length:** `36 bytes`
-- **Saw Sentinel Next Request:** `true`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 30 bytes, HAProxy: 36 bytes)
-
----
-
-### Finding 085: mutated_base_62_te_tab_whitespace
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Mutated byte in te_tab_whitespace
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 74 65  2d 74 61 62 20 48 54 54  |POST /te-tab HTT|
-00000010: 50 2f 31 2e 31 0d 0a 48  6f 73 74 3a 20 65 78 61  |P/1.1..Host: exa|
-00000020: 6d 70 6c 65 2e 63 6f 6d  0d 0a 54 72 61 6e 73 66  |mple.com..Transf|
-00000030: 65 72 2d 45 6e 63 6f 64  69 6e 67 3a 09 63 68 75  |er-Encoding:.chu|
-00000040: 6e 6b 65 64 0d 0a 0d 0a  35 0d 0a 68 65 6c 6c 20  |nked....5..hell |
-00000050: 0d 0a 30 0d 0a 0d 0a                              |..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `87 / 87`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/te-tab`
-- **Body Length:** `5 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/te-tab`
-- **Forwarded Body Length:** `10 bytes`
-- **Saw Sentinel Next Request:** `true`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 5 bytes, HAProxy: 10 bytes)
-
----
-
-### Finding 086: mutated_pipelined_pair_63
+### Finding 047: mutated_pipelined_pair_63
 
 - **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Pipelined Request Boundaries
@@ -4169,7 +2468,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 ---
 
-### Finding 087: mutated_pipelined_pair_64
+### Finding 048: mutated_pipelined_pair_64
 
 - **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Pipelined Request Boundaries
@@ -4211,96 +2510,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 ---
 
-### Finding 088: mutated_cl_te_rand_65
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Combinatorial CL (1) vs TE with payload len (4)
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
-00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 31 0d  |ntent-Length: 1.|
-00000040: 0a 54 72 61 6e 73 66 65  72 2d 45 6e 63 6f 64 69  |.Transfer-Encodi|
-00000050: 6e 67 3a 20 63 68 75 6e  6b 65 64 0d 0a 0d 0a 34  |ng: chunked....4|
-00000060: 0d 0a 30 31 32 33 0d 0a  30 0d 0a 0d 0a           |..0123..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `109 / 109`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/cl-te-rand`
-- **Body Length:** `4 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/cl-te-rand`
-- **Forwarded Body Length:** `9 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 4 bytes, HAProxy: 9 bytes)
-
----
-
-### Finding 089: mutated_chunked_66
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized chunked sequence of 4 chunks
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 6d 75  74 2d 63 68 75 6e 6b 20  |POST /mut-chunk |
-00000010: 48 54 54 50 2f 31 2e 31  0d 0a 48 6f 73 74 3a 20  |HTTP/1.1..Host: |
-00000020: 65 78 61 6d 70 6c 65 2e  63 6f 6d 0d 0a 54 72 61  |example.com..Tra|
-00000030: 6e 73 66 65 72 2d 45 6e  63 6f 64 69 6e 67 3a 20  |nsfer-Encoding: |
-00000040: 63 68 75 6e 6b 65 64 0d  0a 0d 0a 36 0d 0a 61 62  |chunked....6..ab|
-00000050: 63 64 65 66 0d 0a 31 0d  0a 61 0d 0a 43 0d 0a 61  |cdef..1..a..C..a|
-00000060: 62 63 64 65 66 67 68 69  6a 6b 6c 0d 0a 33 0d 0a  |bcdefghijkl..3..|
-00000070: 61 62 63 0d 0a 30 0d 0a  0d 0a                    |abc..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `122 / 122`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/mut-chunk`
-- **Body Length:** `22 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/mut-chunk`
-- **Forwarded Body Length:** `28 bytes`
-- **Saw Sentinel Next Request:** `true`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 22 bytes, HAProxy: 28 bytes)
-
----
-
-### Finding 090: mutated_headers_ws_67
+### Finding 049: mutated_headers_ws_67
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -4341,7 +2551,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 091: mutated_headers_ws_68
+### Finding 050: mutated_headers_ws_68
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -4384,7 +2594,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 092: mutated_startline_69
+### Finding 051: mutated_startline_69
 
 - **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -4423,144 +2633,7 @@ Full-buffer parse succeeded/failed differently than byte-by-byte incremental str
 
 ---
 
-### Finding 093: mutated_chunked_70
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized chunked sequence of 4 chunks
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 6d 75  74 2d 63 68 75 6e 6b 20  |POST /mut-chunk |
-00000010: 48 54 54 50 2f 31 2e 31  0d 0a 48 6f 73 74 3a 20  |HTTP/1.1..Host: |
-00000020: 65 78 61 6d 70 6c 65 2e  63 6f 6d 0d 0a 54 72 61  |example.com..Tra|
-00000030: 6e 73 66 65 72 2d 45 6e  63 6f 64 69 6e 67 3a 20  |nsfer-Encoding: |
-00000040: 63 68 75 6e 6b 65 64 0d  0a 0d 0a 35 0d 0a 61 62  |chunked....5..ab|
-00000050: 63 64 65 0d 0a 42 0d 0a  61 62 63 64 65 66 67 68  |cde..B..abcdefgh|
-00000060: 69 6a 6b 0d 0a 64 0d 0a  61 62 63 64 65 66 67 68  |ijk..d..abcdefgh|
-00000070: 69 6a 6b 6c 6d 0d 0a 36  0d 0a 61 62 63 64 65 66  |ijklm..6..abcdef|
-00000080: 0d 0a 30 0d 0a 0d 0a                              |..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `135 / 135`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/mut-chunk`
-- **Body Length:** `35 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/mut-chunk`
-- **Forwarded Body Length:** `41 bytes`
-- **Saw Sentinel Next Request:** `true`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 35 bytes, HAProxy: 41 bytes)
-
----
-
-### Finding 094: mutated_base_71_chunk_extension_quoted_semicolon
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Mutated byte in chunk_extension_quoted_semicolon
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 68  75 6e 6b 2d 71 75 6f 74  |POST /chunk-quot|
-00000010: 65 64 20 48 54 54 50 2f  31 2e 31 0d 0a 48 6f 73  |ed HTTP/1.1..Hos|
-00000020: 74 3a 20 65 78 61 6d 70  6c 65 2e 63 6f 6d 0d 0a  |t: example.com..|
-00000030: 54 72 61 6e 73 66 65 72  2d 45 6e 63 6f 64 69 6e  |Transfer-Encodin|
-00000040: 67 3a 20 63 68 75 6e 6b  65 64 0d 0a 0d 0a 35 3b  |g: chunked....5;|
-00000050: 65 78 74 3d 22 71 75 6f  74 65 64 3b 77 69 74 68  |ext="quoted;with|
-00000060: 3b 73 65 6d 69 73 22 0d  0a 68 65 6c 6c 20 0d 0a  |;semis"..hell ..|
-00000070: 30 0d 0a 0d 0a                                    |0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `117 / 117`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/chunk-quoted`
-- **Body Length:** `5 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/chunk-quoted`
-- **Forwarded Body Length:** `10 bytes`
-- **Saw Sentinel Next Request:** `true`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 5 bytes, HAProxy: 10 bytes)
-
----
-
-### Finding 095: mutated_chunked_73
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized chunked sequence of 4 chunks
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 6d 75  74 2d 63 68 75 6e 6b 20  |POST /mut-chunk |
-00000010: 48 54 54 50 2f 31 2e 31  0d 0a 48 6f 73 74 3a 20  |HTTP/1.1..Host: |
-00000020: 65 78 61 6d 70 6c 65 2e  63 6f 6d 0d 0a 54 72 61  |example.com..Tra|
-00000030: 6e 73 66 65 72 2d 45 6e  63 6f 64 69 6e 67 3a 20  |nsfer-Encoding: |
-00000040: 63 68 75 6e 6b 65 64 0d  0a 0d 0a 38 0d 0a 61 62  |chunked....8..ab|
-00000050: 63 64 65 66 67 68 0d 0a  31 0d 0a 61 0d 0a 38 0d  |cdefgh..1..a..8.|
-00000060: 0a 61 62 63 64 65 66 67  68 0d 0a 46 0d 0a 61 62  |.abcdefgh..F..ab|
-00000070: 63 64 65 66 67 68 69 6a  6b 6c 6d 6e 6f 0d 0a 30  |cdefghijklmno..0|
-00000080: 0d 0a 0d 0a                                       |....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `132 / 132`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/mut-chunk`
-- **Body Length:** `32 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/mut-chunk`
-- **Forwarded Body Length:** `38 bytes`
-- **Saw Sentinel Next Request:** `true`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 32 bytes, HAProxy: 38 bytes)
-
----
-
-### Finding 096: mutated_headers_ws_74
+### Finding 052: mutated_headers_ws_74
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -4605,54 +2678,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 097: mutated_chunked_75
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized chunked sequence of 4 chunks
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 6d 75  74 2d 63 68 75 6e 6b 20  |POST /mut-chunk |
-00000010: 48 54 54 50 2f 31 2e 31  0d 0a 48 6f 73 74 3a 20  |HTTP/1.1..Host: |
-00000020: 65 78 61 6d 70 6c 65 2e  63 6f 6d 0d 0a 54 72 61  |example.com..Tra|
-00000030: 6e 73 66 65 72 2d 45 6e  63 6f 64 69 6e 67 3a 20  |nsfer-Encoding: |
-00000040: 63 68 75 6e 6b 65 64 0d  0a 0d 0a 66 0d 0a 61 62  |chunked....f..ab|
-00000050: 63 64 65 66 67 68 69 6a  6b 6c 6d 6e 6f 0d 0a 44  |cdefghijklmno..D|
-00000060: 0d 0a 61 62 63 64 65 66  67 68 69 6a 6b 6c 6d 0d  |..abcdefghijklm.|
-00000070: 0a 62 0d 0a 61 62 63 64  65 66 67 68 69 6a 6b 0d  |.b..abcdefghijk.|
-00000080: 0a 37 0d 0a 61 62 63 64  65 66 67 0d 0a 30 0d 0a  |.7..abcdefg..0..|
-00000090: 0d 0a                                             |..|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `146 / 146`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/mut-chunk`
-- **Body Length:** `46 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/mut-chunk`
-- **Forwarded Body Length:** `52 bytes`
-- **Saw Sentinel Next Request:** `true`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 46 bytes, HAProxy: 52 bytes)
-
----
-
-### Finding 098: mutated_base_76_oversized_uri_4k
+### Finding 053: mutated_base_76_oversized_uri_4k
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -4946,7 +2972,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 099: mutated_pipelined_pair_78
+### Finding 054: mutated_pipelined_pair_78
 
 - **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Pipelined Request Boundaries
@@ -4988,142 +3014,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 ---
 
-### Finding 100: mutated_chunked_79
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized chunked sequence of 4 chunks
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 6d 75  74 2d 63 68 75 6e 6b 20  |POST /mut-chunk |
-00000010: 48 54 54 50 2f 31 2e 31  0d 0a 48 6f 73 74 3a 20  |HTTP/1.1..Host: |
-00000020: 65 78 61 6d 70 6c 65 2e  63 6f 6d 0d 0a 54 72 61  |example.com..Tra|
-00000030: 6e 73 66 65 72 2d 45 6e  63 6f 64 69 6e 67 3a 20  |nsfer-Encoding: |
-00000040: 63 68 75 6e 6b 65 64 0d  0a 0d 0a 36 0d 0a 61 62  |chunked....6..ab|
-00000050: 63 64 65 66 0d 0a 66 0d  0a 61 62 63 64 65 66 67  |cdef..f..abcdefg|
-00000060: 68 69 6a 6b 6c 6d 6e 6f  0d 0a 31 0d 0a 61 0d 0a  |hijklmno..1..a..|
-00000070: 31 0d 0a 61 0d 0a 30 0d  0a 0d 0a                 |1..a..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `123 / 123`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/mut-chunk`
-- **Body Length:** `23 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/mut-chunk`
-- **Forwarded Body Length:** `29 bytes`
-- **Saw Sentinel Next Request:** `true`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 23 bytes, HAProxy: 29 bytes)
-
----
-
-### Finding 101: mutated_cl_te_rand_80
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Combinatorial CL (11) vs TE with payload len (11)
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
-00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 31 31  |ntent-Length: 11|
-00000040: 0d 0a 54 72 61 6e 73 66  65 72 2d 45 6e 63 6f 64  |..Transfer-Encod|
-00000050: 69 6e 67 3a 20 63 68 75  6e 6b 65 64 0d 0a 0d 0a  |ing: chunked....|
-00000060: 62 0d 0a 30 31 32 33 34  35 36 37 38 39 30 0d 0a  |b..01234567890..|
-00000070: 30 0d 0a 0d 0a                                    |0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `117 / 117`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/cl-te-rand`
-- **Body Length:** `11 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/cl-te-rand`
-- **Forwarded Body Length:** `16 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 11 bytes, HAProxy: 16 bytes)
-
----
-
-### Finding 102: mutated_cl_te_rand_81
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Combinatorial CL (10) vs TE with payload len (15)
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
-00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 31 30  |ntent-Length: 10|
-00000040: 0d 0a 54 72 61 6e 73 66  65 72 2d 45 6e 63 6f 64  |..Transfer-Encod|
-00000050: 69 6e 67 3a 20 63 68 75  6e 6b 65 64 0d 0a 0d 0a  |ing: chunked....|
-00000060: 66 0d 0a 30 31 32 33 34  35 36 37 38 39 30 31 32  |f..0123456789012|
-00000070: 33 34 0d 0a 30 0d 0a 0d  0a                       |34..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `121 / 121`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/cl-te-rand`
-- **Body Length:** `15 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/cl-te-rand`
-- **Forwarded Body Length:** `20 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 15 bytes, HAProxy: 20 bytes)
-
----
-
-### Finding 103: mutated_startline_82
+### Finding 055: mutated_startline_82
 
 - **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -5162,139 +3053,7 @@ Full-buffer parse succeeded/failed differently than byte-by-byte incremental str
 
 ---
 
-### Finding 104: mutated_chunked_83
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized chunked sequence of 3 chunks
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 6d 75  74 2d 63 68 75 6e 6b 20  |POST /mut-chunk |
-00000010: 48 54 54 50 2f 31 2e 31  0d 0a 48 6f 73 74 3a 20  |HTTP/1.1..Host: |
-00000020: 65 78 61 6d 70 6c 65 2e  63 6f 6d 0d 0a 54 72 61  |example.com..Tra|
-00000030: 6e 73 66 65 72 2d 45 6e  63 6f 64 69 6e 67 3a 20  |nsfer-Encoding: |
-00000040: 63 68 75 6e 6b 65 64 0d  0a 0d 0a 32 0d 0a 61 62  |chunked....2..ab|
-00000050: 0d 0a 31 0d 0a 61 0d 0a  65 0d 0a 61 62 63 64 65  |..1..a..e..abcde|
-00000060: 66 67 68 69 6a 6b 6c 6d  6e 0d 0a 30 0d 0a 0d 0a  |fghijklmn..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `112 / 112`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/mut-chunk`
-- **Body Length:** `17 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/mut-chunk`
-- **Forwarded Body Length:** `23 bytes`
-- **Saw Sentinel Next Request:** `true`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 17 bytes, HAProxy: 23 bytes)
-
----
-
-### Finding 105: mutated_cl_te_rand_84
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Combinatorial CL (14) vs TE with payload len (3)
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
-00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 31 34  |ntent-Length: 14|
-00000040: 0d 0a 54 72 61 6e 73 66  65 72 2d 45 6e 63 6f 64  |..Transfer-Encod|
-00000050: 69 6e 67 3a 20 63 68 75  6e 6b 65 64 0d 0a 0d 0a  |ing: chunked....|
-00000060: 33 0d 0a 30 31 32 0d 0a  30 0d 0a 0d 0a           |3..012..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `109 / 109`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/cl-te-rand`
-- **Body Length:** `3 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/cl-te-rand`
-- **Forwarded Body Length:** `8 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 3 bytes, HAProxy: 8 bytes)
-
----
-
-### Finding 106: mutated_cl_te_rand_85
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Combinatorial CL (13) vs TE with payload len (5)
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
-00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 31 33  |ntent-Length: 13|
-00000040: 0d 0a 54 72 61 6e 73 66  65 72 2d 45 6e 63 6f 64  |..Transfer-Encod|
-00000050: 69 6e 67 3a 20 63 68 75  6e 6b 65 64 0d 0a 0d 0a  |ing: chunked....|
-00000060: 35 0d 0a 30 31 32 33 34  0d 0a 30 0d 0a 0d 0a     |5..01234..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `111 / 111`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/cl-te-rand`
-- **Body Length:** `5 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/cl-te-rand`
-- **Forwarded Body Length:** `10 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 5 bytes, HAProxy: 10 bytes)
-
----
-
-### Finding 107: mutated_pipelined_pair_86
+### Finding 056: mutated_pipelined_pair_86
 
 - **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Pipelined Request Boundaries
@@ -5336,7 +3095,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 ---
 
-### Finding 108: mutated_startline_87
+### Finding 057: mutated_startline_87
 
 - **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -5375,7 +3134,7 @@ Full-buffer parse succeeded/failed differently than byte-by-byte incremental str
 
 ---
 
-### Finding 109: mutated_base_88_te_prefix_unknown_encoding
+### Finding 058: mutated_base_88_te_prefix_unknown_encoding
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -5416,7 +3175,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 110: mutated_pipelined_pair_89
+### Finding 059: mutated_pipelined_pair_89
 
 - **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Pipelined Request Boundaries
@@ -5458,141 +3217,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 ---
 
-### Finding 111: mutated_chunked_90
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized chunked sequence of 1 chunks
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 6d 75  74 2d 63 68 75 6e 6b 20  |POST /mut-chunk |
-00000010: 48 54 54 50 2f 31 2e 31  0d 0a 48 6f 73 74 3a 20  |HTTP/1.1..Host: |
-00000020: 65 78 61 6d 70 6c 65 2e  63 6f 6d 0d 0a 54 72 61  |example.com..Tra|
-00000030: 6e 73 66 65 72 2d 45 6e  63 6f 64 69 6e 67 3a 20  |nsfer-Encoding: |
-00000040: 63 68 75 6e 6b 65 64 0d  0a 0d 0a 64 0d 0a 61 62  |chunked....d..ab|
-00000050: 63 64 65 66 67 68 69 6a  6b 6c 6d 0d 0a 30 0d 0a  |cdefghijklm..0..|
-00000060: 0d 0a                                             |..|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `98 / 98`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/mut-chunk`
-- **Body Length:** `13 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/mut-chunk`
-- **Forwarded Body Length:** `18 bytes`
-- **Saw Sentinel Next Request:** `true`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 13 bytes, HAProxy: 18 bytes)
-
----
-
-### Finding 112: mutated_cl_te_rand_91
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Combinatorial CL (6) vs TE with payload len (9)
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
-00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 36 0d  |ntent-Length: 6.|
-00000040: 0a 54 72 61 6e 73 66 65  72 2d 45 6e 63 6f 64 69  |.Transfer-Encodi|
-00000050: 6e 67 3a 20 63 68 75 6e  6b 65 64 0d 0a 0d 0a 39  |ng: chunked....9|
-00000060: 0d 0a 30 31 32 33 34 35  36 37 38 0d 0a 30 0d 0a  |..012345678..0..|
-00000070: 0d 0a                                             |..|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `114 / 114`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/cl-te-rand`
-- **Body Length:** `9 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/cl-te-rand`
-- **Forwarded Body Length:** `14 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 9 bytes, HAProxy: 14 bytes)
-
----
-
-### Finding 113: mutated_cl_te_rand_92
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Combinatorial CL (7) vs TE with payload len (16)
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
-00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 37 0d  |ntent-Length: 7.|
-00000040: 0a 54 72 61 6e 73 66 65  72 2d 45 6e 63 6f 64 69  |.Transfer-Encodi|
-00000050: 6e 67 3a 20 63 68 75 6e  6b 65 64 0d 0a 0d 0a 31  |ng: chunked....1|
-00000060: 30 0d 0a 30 31 32 33 34  35 36 37 38 39 30 31 32  |0..0123456789012|
-00000070: 33 34 35 0d 0a 30 0d 0a  0d 0a                    |345..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `122 / 122`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/cl-te-rand`
-- **Body Length:** `16 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/cl-te-rand`
-- **Forwarded Body Length:** `22 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 16 bytes, HAProxy: 22 bytes)
-
----
-
-### Finding 114: mutated_pipelined_pair_93
+### Finding 060: mutated_pipelined_pair_93
 
 - **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Pipelined Request Boundaries
@@ -5634,7 +3259,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 ---
 
-### Finding 115: mutated_pipelined_pair_94
+### Finding 061: mutated_pipelined_pair_94
 
 - **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Pipelined Request Boundaries
@@ -5676,7 +3301,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 ---
 
-### Finding 116: mutated_startline_95
+### Finding 062: mutated_startline_95
 
 - **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -5714,187 +3339,7 @@ Full-buffer parse succeeded/failed differently than byte-by-byte incremental str
 
 ---
 
-### Finding 117: mutated_cl_te_rand_98
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Combinatorial CL (2) vs TE with payload len (6)
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
-00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 32 0d  |ntent-Length: 2.|
-00000040: 0a 54 72 61 6e 73 66 65  72 2d 45 6e 63 6f 64 69  |.Transfer-Encodi|
-00000050: 6e 67 3a 20 63 68 75 6e  6b 65 64 0d 0a 0d 0a 36  |ng: chunked....6|
-00000060: 0d 0a 30 31 32 33 34 35  0d 0a 30 0d 0a 0d 0a     |..012345..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `111 / 111`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/cl-te-rand`
-- **Body Length:** `6 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/cl-te-rand`
-- **Forwarded Body Length:** `11 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 6 bytes, HAProxy: 11 bytes)
-
----
-
-### Finding 118: mutated_chunked_99
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized chunked sequence of 5 chunks
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 6d 75  74 2d 63 68 75 6e 6b 20  |POST /mut-chunk |
-00000010: 48 54 54 50 2f 31 2e 31  0d 0a 48 6f 73 74 3a 20  |HTTP/1.1..Host: |
-00000020: 65 78 61 6d 70 6c 65 2e  63 6f 6d 0d 0a 54 72 61  |example.com..Tra|
-00000030: 6e 73 66 65 72 2d 45 6e  63 6f 64 69 6e 67 3a 20  |nsfer-Encoding: |
-00000040: 63 68 75 6e 6b 65 64 0d  0a 0d 0a 33 0d 0a 61 62  |chunked....3..ab|
-00000050: 63 0d 0a 31 30 0d 0a 61  62 63 64 65 66 67 68 69  |c..10..abcdefghi|
-00000060: 6a 6b 6c 6d 6e 6f 70 0d  0a 63 0d 0a 61 62 63 64  |jklmnop..c..abcd|
-00000070: 65 66 67 68 69 6a 6b 6c  0d 0a 32 0d 0a 61 62 0d  |efghijkl..2..ab.|
-00000080: 0a 31 0d 0a 61 0d 0a 30  0d 0a 0d 0a              |.1..a..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `140 / 140`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/mut-chunk`
-- **Body Length:** `34 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/mut-chunk`
-- **Forwarded Body Length:** `40 bytes`
-- **Saw Sentinel Next Request:** `true`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 34 bytes, HAProxy: 40 bytes)
-
----
-
-### Finding 119: mutated_chunked_100
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized chunked sequence of 3 chunks
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 6d 75  74 2d 63 68 75 6e 6b 20  |POST /mut-chunk |
-00000010: 48 54 54 50 2f 31 2e 31  0d 0a 48 6f 73 74 3a 20  |HTTP/1.1..Host: |
-00000020: 65 78 61 6d 70 6c 65 2e  63 6f 6d 0d 0a 54 72 61  |example.com..Tra|
-00000030: 6e 73 66 65 72 2d 45 6e  63 6f 64 69 6e 67 3a 20  |nsfer-Encoding: |
-00000040: 63 68 75 6e 6b 65 64 0d  0a 0d 0a 31 30 0d 0a 61  |chunked....10..a|
-00000050: 62 63 64 65 66 67 68 69  6a 6b 6c 6d 6e 6f 70 0d  |bcdefghijklmnop.|
-00000060: 0a 38 0d 0a 61 62 63 64  65 66 67 68 0d 0a 31 30  |.8..abcdefgh..10|
-00000070: 0d 0a 61 62 63 64 65 66  67 68 69 6a 6b 6c 6d 6e  |..abcdefghijklmn|
-00000080: 6f 70 0d 0a 30 0d 0a 0d  0a                       |op..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `137 / 137`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/mut-chunk`
-- **Body Length:** `40 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/mut-chunk`
-- **Forwarded Body Length:** `46 bytes`
-- **Saw Sentinel Next Request:** `true`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 40 bytes, HAProxy: 46 bytes)
-
----
-
-### Finding 120: mutated_cl_te_rand_101
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Combinatorial CL (15) vs TE with payload len (1)
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
-00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 31 35  |ntent-Length: 15|
-00000040: 0d 0a 54 72 61 6e 73 66  65 72 2d 45 6e 63 6f 64  |..Transfer-Encod|
-00000050: 69 6e 67 3a 20 63 68 75  6e 6b 65 64 0d 0a 0d 0a  |ing: chunked....|
-00000060: 31 0d 0a 30 0d 0a 30 0d  0a 0d 0a                 |1..0..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `107 / 107`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/cl-te-rand`
-- **Body Length:** `1 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/cl-te-rand`
-- **Forwarded Body Length:** `6 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 1 bytes, HAProxy: 6 bytes)
-
----
-
-### Finding 121: mutated_base_102_line_term_lf_only
+### Finding 063: mutated_base_102_line_term_lf_only
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -5933,7 +3378,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 122: mutated_pipelined_pair_103
+### Finding 064: mutated_pipelined_pair_103
 
 - **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Pipelined Request Boundaries
@@ -5975,7 +3420,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 ---
 
-### Finding 123: mutated_pipelined_pair_104
+### Finding 065: mutated_pipelined_pair_104
 
 - **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Pipelined Request Boundaries
@@ -6017,7 +3462,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 ---
 
-### Finding 124: mutated_headers_ws_105
+### Finding 066: mutated_headers_ws_105
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -6058,52 +3503,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 125: mutated_cl_te_rand_106
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Combinatorial CL (7) vs TE with payload len (15)
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
-00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 37 0d  |ntent-Length: 7.|
-00000040: 0a 54 72 61 6e 73 66 65  72 2d 45 6e 63 6f 64 69  |.Transfer-Encodi|
-00000050: 6e 67 3a 20 63 68 75 6e  6b 65 64 0d 0a 0d 0a 66  |ng: chunked....f|
-00000060: 0d 0a 30 31 32 33 34 35  36 37 38 39 30 31 32 33  |..01234567890123|
-00000070: 34 0d 0a 30 0d 0a 0d 0a                           |4..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `120 / 120`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/cl-te-rand`
-- **Body Length:** `15 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/cl-te-rand`
-- **Forwarded Body Length:** `20 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 15 bytes, HAProxy: 20 bytes)
-
----
-
-### Finding 126: mutated_base_107_line_term_doubled_crlf_before_headers
+### Finding 067: mutated_base_107_line_term_doubled_crlf_before_headers
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -6141,7 +3541,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 127: mutated_headers_ws_108
+### Finding 068: mutated_headers_ws_108
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -6189,7 +3589,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 128: mutated_startline_109
+### Finding 069: mutated_startline_109
 
 - **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -6227,7 +3627,7 @@ Full-buffer parse succeeded/failed differently than byte-by-byte incremental str
 
 ---
 
-### Finding 129: mutated_startline_110
+### Finding 070: mutated_startline_110
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -6265,7 +3665,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 130: mutated_headers_ws_112
+### Finding 071: mutated_headers_ws_112
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -6310,96 +3710,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 131: mutated_cl_te_rand_113
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Combinatorial CL (12) vs TE with payload len (5)
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
-00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 31 32  |ntent-Length: 12|
-00000040: 0d 0a 54 72 61 6e 73 66  65 72 2d 45 6e 63 6f 64  |..Transfer-Encod|
-00000050: 69 6e 67 3a 20 63 68 75  6e 6b 65 64 0d 0a 0d 0a  |ing: chunked....|
-00000060: 35 0d 0a 30 31 32 33 34  0d 0a 30 0d 0a 0d 0a     |5..01234..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `111 / 111`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/cl-te-rand`
-- **Body Length:** `5 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/cl-te-rand`
-- **Forwarded Body Length:** `10 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 5 bytes, HAProxy: 10 bytes)
-
----
-
-### Finding 132: mutated_cl_te_rand_114
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Combinatorial CL (1) vs TE with payload len (9)
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
-00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 31 0d  |ntent-Length: 1.|
-00000040: 0a 54 72 61 6e 73 66 65  72 2d 45 6e 63 6f 64 69  |.Transfer-Encodi|
-00000050: 6e 67 3a 20 63 68 75 6e  6b 65 64 0d 0a 0d 0a 39  |ng: chunked....9|
-00000060: 0d 0a 30 31 32 33 34 35  36 37 38 0d 0a 30 0d 0a  |..012345678..0..|
-00000070: 0d 0a                                             |..|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `114 / 114`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/cl-te-rand`
-- **Body Length:** `9 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/cl-te-rand`
-- **Forwarded Body Length:** `14 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 9 bytes, HAProxy: 14 bytes)
-
----
-
-### Finding 133: mutated_base_115_baseline_simple_get
+### Finding 072: mutated_base_115_baseline_simple_get
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -6437,54 +3748,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 134: mutated_chunked_116
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized chunked sequence of 5 chunks
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 6d 75  74 2d 63 68 75 6e 6b 20  |POST /mut-chunk |
-00000010: 48 54 54 50 2f 31 2e 31  0d 0a 48 6f 73 74 3a 20  |HTTP/1.1..Host: |
-00000020: 65 78 61 6d 70 6c 65 2e  63 6f 6d 0d 0a 54 72 61  |example.com..Tra|
-00000030: 6e 73 66 65 72 2d 45 6e  63 6f 64 69 6e 67 3a 20  |nsfer-Encoding: |
-00000040: 63 68 75 6e 6b 65 64 0d  0a 0d 0a 62 0d 0a 61 62  |chunked....b..ab|
-00000050: 63 64 65 66 67 68 69 6a  6b 0d 0a 33 0d 0a 61 62  |cdefghijk..3..ab|
-00000060: 63 0d 0a 63 0d 0a 61 62  63 64 65 66 67 68 69 6a  |c..c..abcdefghij|
-00000070: 6b 6c 0d 0a 44 0d 0a 61  62 63 64 65 66 67 68 69  |kl..D..abcdefghi|
-00000080: 6a 6b 6c 6d 0d 0a 35 0d  0a 61 62 63 64 65 0d 0a  |jklm..5..abcde..|
-00000090: 30 0d 0a 0d 0a                                    |0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `149 / 149`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/mut-chunk`
-- **Body Length:** `44 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/mut-chunk`
-- **Forwarded Body Length:** `50 bytes`
-- **Saw Sentinel Next Request:** `true`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 44 bytes, HAProxy: 50 bytes)
-
----
-
-### Finding 135: mutated_startline_117
+### Finding 073: mutated_startline_117
 
 - **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -6523,7 +3787,7 @@ Full-buffer parse succeeded/failed differently than byte-by-byte incremental str
 
 ---
 
-### Finding 136: mutated_headers_ws_118
+### Finding 074: mutated_headers_ws_118
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -6564,7 +3828,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 137: mutated_pipelined_pair_119
+### Finding 075: mutated_pipelined_pair_119
 
 - **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Pipelined Request Boundaries
@@ -6606,141 +3870,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 ---
 
-### Finding 138: mutated_chunked_120
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized chunked sequence of 4 chunks
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 6d 75  74 2d 63 68 75 6e 6b 20  |POST /mut-chunk |
-00000010: 48 54 54 50 2f 31 2e 31  0d 0a 48 6f 73 74 3a 20  |HTTP/1.1..Host: |
-00000020: 65 78 61 6d 70 6c 65 2e  63 6f 6d 0d 0a 54 72 61  |example.com..Tra|
-00000030: 6e 73 66 65 72 2d 45 6e  63 6f 64 69 6e 67 3a 20  |nsfer-Encoding: |
-00000040: 63 68 75 6e 6b 65 64 0d  0a 0d 0a 62 0d 0a 61 62  |chunked....b..ab|
-00000050: 63 64 65 66 67 68 69 6a  6b 0d 0a 41 0d 0a 61 62  |cdefghijk..A..ab|
-00000060: 63 64 65 66 67 68 69 6a  0d 0a 36 0d 0a 61 62 63  |cdefghij..6..abc|
-00000070: 64 65 66 0d 0a 36 0d 0a  61 62 63 64 65 66 0d 0a  |def..6..abcdef..|
-00000080: 30 0d 0a 0d 0a                                    |0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `133 / 133`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/mut-chunk`
-- **Body Length:** `33 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/mut-chunk`
-- **Forwarded Body Length:** `39 bytes`
-- **Saw Sentinel Next Request:** `true`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 33 bytes, HAProxy: 39 bytes)
-
----
-
-### Finding 139: mutated_chunked_121
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized chunked sequence of 2 chunks
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 6d 75  74 2d 63 68 75 6e 6b 20  |POST /mut-chunk |
-00000010: 48 54 54 50 2f 31 2e 31  0d 0a 48 6f 73 74 3a 20  |HTTP/1.1..Host: |
-00000020: 65 78 61 6d 70 6c 65 2e  63 6f 6d 0d 0a 54 72 61  |example.com..Tra|
-00000030: 6e 73 66 65 72 2d 45 6e  63 6f 64 69 6e 67 3a 20  |nsfer-Encoding: |
-00000040: 63 68 75 6e 6b 65 64 0d  0a 0d 0a 31 0d 0a 61 0d  |chunked....1..a.|
-00000050: 0a 34 0d 0a 61 62 63 64  0d 0a 30 0d 0a 0d 0a     |.4..abcd..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `95 / 95`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/mut-chunk`
-- **Body Length:** `5 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/mut-chunk`
-- **Forwarded Body Length:** `10 bytes`
-- **Saw Sentinel Next Request:** `true`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 5 bytes, HAProxy: 10 bytes)
-
----
-
-### Finding 140: mutated_chunked_122
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized chunked sequence of 3 chunks
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 6d 75  74 2d 63 68 75 6e 6b 20  |POST /mut-chunk |
-00000010: 48 54 54 50 2f 31 2e 31  0d 0a 48 6f 73 74 3a 20  |HTTP/1.1..Host: |
-00000020: 65 78 61 6d 70 6c 65 2e  63 6f 6d 0d 0a 54 72 61  |example.com..Tra|
-00000030: 6e 73 66 65 72 2d 45 6e  63 6f 64 69 6e 67 3a 20  |nsfer-Encoding: |
-00000040: 63 68 75 6e 6b 65 64 0d  0a 0d 0a 61 0d 0a 61 62  |chunked....a..ab|
-00000050: 63 64 65 66 67 68 69 6a  0d 0a 34 0d 0a 61 62 63  |cdefghij..4..abc|
-00000060: 64 0d 0a 36 0d 0a 61 62  63 64 65 66 0d 0a 30 0d  |d..6..abcdef..0.|
-00000070: 0a 0d 0a                                          |...|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `115 / 115`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/mut-chunk`
-- **Body Length:** `20 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/mut-chunk`
-- **Forwarded Body Length:** `26 bytes`
-- **Saw Sentinel Next Request:** `true`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 20 bytes, HAProxy: 26 bytes)
-
----
-
-### Finding 141: mutated_startline_123
+### Finding 076: mutated_startline_123
 
 - **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -6778,52 +3908,7 @@ Full-buffer parse succeeded/failed differently than byte-by-byte incremental str
 
 ---
 
-### Finding 142: mutated_cl_te_rand_124
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Combinatorial CL (11) vs TE with payload len (18)
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
-00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 31 31  |ntent-Length: 11|
-00000040: 0d 0a 54 72 61 6e 73 66  65 72 2d 45 6e 63 6f 64  |..Transfer-Encod|
-00000050: 69 6e 67 3a 20 63 68 75  6e 6b 65 64 0d 0a 0d 0a  |ing: chunked....|
-00000060: 31 32 0d 0a 30 31 32 33  34 35 36 37 38 39 30 31  |12..012345678901|
-00000070: 32 33 34 35 36 37 0d 0a  30 0d 0a 0d 0a           |234567..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `125 / 125`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/cl-te-rand`
-- **Body Length:** `18 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/cl-te-rand`
-- **Forwarded Body Length:** `24 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 18 bytes, HAProxy: 24 bytes)
-
----
-
-### Finding 143: mutated_base_126_header_tab_before_colon
+### Finding 077: mutated_base_126_header_tab_before_colon
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -6863,52 +3948,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 144: mutated_cl_te_rand_128
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Combinatorial CL (3) vs TE with payload len (14)
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
-00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 33 0d  |ntent-Length: 3.|
-00000040: 0a 54 72 61 6e 73 66 65  72 2d 45 6e 63 6f 64 69  |.Transfer-Encodi|
-00000050: 6e 67 3a 20 63 68 75 6e  6b 65 64 0d 0a 0d 0a 65  |ng: chunked....e|
-00000060: 0d 0a 30 31 32 33 34 35  36 37 38 39 30 31 32 33  |..01234567890123|
-00000070: 0d 0a 30 0d 0a 0d 0a                              |..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `119 / 119`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/cl-te-rand`
-- **Body Length:** `14 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/cl-te-rand`
-- **Forwarded Body Length:** `19 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 14 bytes, HAProxy: 19 bytes)
-
----
-
-### Finding 145: mutated_pipelined_pair_129
+### Finding 078: mutated_pipelined_pair_129
 
 - **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Pipelined Request Boundaries
@@ -6950,143 +3990,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 ---
 
-### Finding 146: mutated_chunked_130
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized chunked sequence of 5 chunks
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 6d 75  74 2d 63 68 75 6e 6b 20  |POST /mut-chunk |
-00000010: 48 54 54 50 2f 31 2e 31  0d 0a 48 6f 73 74 3a 20  |HTTP/1.1..Host: |
-00000020: 65 78 61 6d 70 6c 65 2e  63 6f 6d 0d 0a 54 72 61  |example.com..Tra|
-00000030: 6e 73 66 65 72 2d 45 6e  63 6f 64 69 6e 67 3a 20  |nsfer-Encoding: |
-00000040: 63 68 75 6e 6b 65 64 0d  0a 0d 0a 37 0d 0a 61 62  |chunked....7..ab|
-00000050: 63 64 65 66 67 0d 0a 32  0d 0a 61 62 0d 0a 41 0d  |cdefg..2..ab..A.|
-00000060: 0a 61 62 63 64 65 66 67  68 69 6a 0d 0a 31 0d 0a  |.abcdefghij..1..|
-00000070: 61 0d 0a 43 0d 0a 61 62  63 64 65 66 67 68 69 6a  |a..C..abcdefghij|
-00000080: 6b 6c 0d 0a 30 0d 0a 0d  0a                       |kl..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `137 / 137`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/mut-chunk`
-- **Body Length:** `32 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/mut-chunk`
-- **Forwarded Body Length:** `38 bytes`
-- **Saw Sentinel Next Request:** `true`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 32 bytes, HAProxy: 38 bytes)
-
----
-
-### Finding 147: mutated_cl_te_rand_131
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Combinatorial CL (9) vs TE with payload len (10)
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
-00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 39 0d  |ntent-Length: 9.|
-00000040: 0a 54 72 61 6e 73 66 65  72 2d 45 6e 63 6f 64 69  |.Transfer-Encodi|
-00000050: 6e 67 3a 20 63 68 75 6e  6b 65 64 0d 0a 0d 0a 61  |ng: chunked....a|
-00000060: 0d 0a 30 31 32 33 34 35  36 37 38 39 0d 0a 30 0d  |..0123456789..0.|
-00000070: 0a 0d 0a                                          |...|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `115 / 115`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/cl-te-rand`
-- **Body Length:** `10 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/cl-te-rand`
-- **Forwarded Body Length:** `15 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 10 bytes, HAProxy: 15 bytes)
-
----
-
-### Finding 148: mutated_cl_te_rand_132
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Combinatorial CL (11) vs TE with payload len (14)
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
-00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 31 31  |ntent-Length: 11|
-00000040: 0d 0a 54 72 61 6e 73 66  65 72 2d 45 6e 63 6f 64  |..Transfer-Encod|
-00000050: 69 6e 67 3a 20 63 68 75  6e 6b 65 64 0d 0a 0d 0a  |ing: chunked....|
-00000060: 65 0d 0a 30 31 32 33 34  35 36 37 38 39 30 31 32  |e..0123456789012|
-00000070: 33 0d 0a 30 0d 0a 0d 0a                           |3..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `120 / 120`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/cl-te-rand`
-- **Body Length:** `14 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/cl-te-rand`
-- **Forwarded Body Length:** `19 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 14 bytes, HAProxy: 19 bytes)
-
----
-
-### Finding 149: mutated_pipelined_pair_133
+### Finding 079: mutated_pipelined_pair_133
 
 - **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Pipelined Request Boundaries
@@ -7128,7 +4032,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 ---
 
-### Finding 150: mutated_base_134_header_nul_in_value
+### Finding 080: mutated_base_134_header_nul_in_value
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -7168,140 +4072,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 151: mutated_chunked_135
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized chunked sequence of 1 chunks
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 6d 75  74 2d 63 68 75 6e 6b 20  |POST /mut-chunk |
-00000010: 48 54 54 50 2f 31 2e 31  0d 0a 48 6f 73 74 3a 20  |HTTP/1.1..Host: |
-00000020: 65 78 61 6d 70 6c 65 2e  63 6f 6d 0d 0a 54 72 61  |example.com..Tra|
-00000030: 6e 73 66 65 72 2d 45 6e  63 6f 64 69 6e 67 3a 20  |nsfer-Encoding: |
-00000040: 63 68 75 6e 6b 65 64 0d  0a 0d 0a 35 0d 0a 61 62  |chunked....5..ab|
-00000050: 63 64 65 0d 0a 30 0d 0a  0d 0a                    |cde..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `90 / 90`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/mut-chunk`
-- **Body Length:** `5 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/mut-chunk`
-- **Forwarded Body Length:** `10 bytes`
-- **Saw Sentinel Next Request:** `true`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 5 bytes, HAProxy: 10 bytes)
-
----
-
-### Finding 152: mutated_cl_te_rand_136
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Combinatorial CL (2) vs TE with payload len (5)
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
-00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 32 0d  |ntent-Length: 2.|
-00000040: 0a 54 72 61 6e 73 66 65  72 2d 45 6e 63 6f 64 69  |.Transfer-Encodi|
-00000050: 6e 67 3a 20 63 68 75 6e  6b 65 64 0d 0a 0d 0a 35  |ng: chunked....5|
-00000060: 0d 0a 30 31 32 33 34 0d  0a 30 0d 0a 0d 0a        |..01234..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `110 / 110`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/cl-te-rand`
-- **Body Length:** `5 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/cl-te-rand`
-- **Forwarded Body Length:** `10 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 5 bytes, HAProxy: 10 bytes)
-
----
-
-### Finding 153: mutated_chunked_137
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized chunked sequence of 4 chunks
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 6d 75  74 2d 63 68 75 6e 6b 20  |POST /mut-chunk |
-00000010: 48 54 54 50 2f 31 2e 31  0d 0a 48 6f 73 74 3a 20  |HTTP/1.1..Host: |
-00000020: 65 78 61 6d 70 6c 65 2e  63 6f 6d 0d 0a 54 72 61  |example.com..Tra|
-00000030: 6e 73 66 65 72 2d 45 6e  63 6f 64 69 6e 67 3a 20  |nsfer-Encoding: |
-00000040: 63 68 75 6e 6b 65 64 0d  0a 0d 0a 32 0d 0a 61 62  |chunked....2..ab|
-00000050: 0d 0a 44 0d 0a 61 62 63  64 65 66 67 68 69 6a 6b  |..D..abcdefghijk|
-00000060: 6c 6d 0d 0a 41 0d 0a 61  62 63 64 65 66 67 68 69  |lm..A..abcdefghi|
-00000070: 6a 0d 0a 35 0d 0a 61 62  63 64 65 0d 0a 30 0d 0a  |j..5..abcde..0..|
-00000080: 0d 0a                                             |..|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `130 / 130`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/mut-chunk`
-- **Body Length:** `30 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/mut-chunk`
-- **Forwarded Body Length:** `36 bytes`
-- **Saw Sentinel Next Request:** `true`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 30 bytes, HAProxy: 36 bytes)
-
----
-
-### Finding 154: mutated_startline_139
+### Finding 081: mutated_startline_139
 
 - **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -7340,7 +4111,7 @@ Full-buffer parse succeeded/failed differently than byte-by-byte incremental str
 
 ---
 
-### Finding 155: mutated_pipelined_pair_140
+### Finding 082: mutated_pipelined_pair_140
 
 - **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Pipelined Request Boundaries
@@ -7382,7 +4153,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 ---
 
-### Finding 156: mutated_startline_141
+### Finding 083: mutated_startline_141
 
 - **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -7420,100 +4191,7 @@ Full-buffer parse succeeded/failed differently than byte-by-byte incremental str
 
 ---
 
-### Finding 157: mutated_chunked_142
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized chunked sequence of 5 chunks
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 6d 75  74 2d 63 68 75 6e 6b 20  |POST /mut-chunk |
-00000010: 48 54 54 50 2f 31 2e 31  0d 0a 48 6f 73 74 3a 20  |HTTP/1.1..Host: |
-00000020: 65 78 61 6d 70 6c 65 2e  63 6f 6d 0d 0a 54 72 61  |example.com..Tra|
-00000030: 6e 73 66 65 72 2d 45 6e  63 6f 64 69 6e 67 3a 20  |nsfer-Encoding: |
-00000040: 63 68 75 6e 6b 65 64 0d  0a 0d 0a 34 0d 0a 61 62  |chunked....4..ab|
-00000050: 63 64 0d 0a 62 0d 0a 61  62 63 64 65 66 67 68 69  |cd..b..abcdefghi|
-00000060: 6a 6b 0d 0a 32 0d 0a 61  62 0d 0a 46 0d 0a 61 62  |jk..2..ab..F..ab|
-00000070: 63 64 65 66 67 68 69 6a  6b 6c 6d 6e 6f 0d 0a 32  |cdefghijklmno..2|
-00000080: 0d 0a 61 62 0d 0a 30 0d  0a 0d 0a                 |..ab..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `139 / 139`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/mut-chunk`
-- **Body Length:** `34 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/mut-chunk`
-- **Forwarded Body Length:** `40 bytes`
-- **Saw Sentinel Next Request:** `true`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 34 bytes, HAProxy: 40 bytes)
-
----
-
-### Finding 158: mutated_chunked_143
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized chunked sequence of 5 chunks
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 6d 75  74 2d 63 68 75 6e 6b 20  |POST /mut-chunk |
-00000010: 48 54 54 50 2f 31 2e 31  0d 0a 48 6f 73 74 3a 20  |HTTP/1.1..Host: |
-00000020: 65 78 61 6d 70 6c 65 2e  63 6f 6d 0d 0a 54 72 61  |example.com..Tra|
-00000030: 6e 73 66 65 72 2d 45 6e  63 6f 64 69 6e 67 3a 20  |nsfer-Encoding: |
-00000040: 63 68 75 6e 6b 65 64 0d  0a 0d 0a 64 0d 0a 61 62  |chunked....d..ab|
-00000050: 63 64 65 66 67 68 69 6a  6b 6c 6d 0d 0a 35 0d 0a  |cdefghijklm..5..|
-00000060: 61 62 63 64 65 0d 0a 63  0d 0a 61 62 63 64 65 66  |abcde..c..abcdef|
-00000070: 67 68 69 6a 6b 6c 0d 0a  62 0d 0a 61 62 63 64 65  |ghijkl..b..abcde|
-00000080: 66 67 68 69 6a 6b 0d 0a  43 0d 0a 61 62 63 64 65  |fghijk..C..abcde|
-00000090: 66 67 68 69 6a 6b 6c 0d  0a 30 0d 0a 0d 0a        |fghijkl..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `158 / 158`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/mut-chunk`
-- **Body Length:** `53 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/mut-chunk`
-- **Forwarded Body Length:** `59 bytes`
-- **Saw Sentinel Next Request:** `true`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 53 bytes, HAProxy: 59 bytes)
-
----
-
-### Finding 159: mutated_headers_ws_144
+### Finding 084: mutated_headers_ws_144
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -7558,227 +4236,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 160: mutated_chunked_145
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized chunked sequence of 2 chunks
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 6d 75  74 2d 63 68 75 6e 6b 20  |POST /mut-chunk |
-00000010: 48 54 54 50 2f 31 2e 31  0d 0a 48 6f 73 74 3a 20  |HTTP/1.1..Host: |
-00000020: 65 78 61 6d 70 6c 65 2e  63 6f 6d 0d 0a 54 72 61  |example.com..Tra|
-00000030: 6e 73 66 65 72 2d 45 6e  63 6f 64 69 6e 67 3a 20  |nsfer-Encoding: |
-00000040: 63 68 75 6e 6b 65 64 0d  0a 0d 0a 35 0d 0a 61 62  |chunked....5..ab|
-00000050: 63 64 65 0d 0a 64 0d 0a  61 62 63 64 65 66 67 68  |cde..d..abcdefgh|
-00000060: 69 6a 6b 6c 6d 0d 0a 30  0d 0a 0d 0a              |ijklm..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `108 / 108`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/mut-chunk`
-- **Body Length:** `18 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/mut-chunk`
-- **Forwarded Body Length:** `24 bytes`
-- **Saw Sentinel Next Request:** `true`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 18 bytes, HAProxy: 24 bytes)
-
----
-
-### Finding 161: mutated_base_147_duplicate_cl_identical
-
-- **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Mutated byte in duplicate_cl_identical
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 64 75  70 2d 63 6c 20 48 54 54  |POST /dup-cl HTT|
-00000010: 50 2f 31 2e 31 0d 0a 48  6f 73 74 3a 20 65 78 61  |P/1.1..Host: exa|
-00000020: 6d 70 6c 65 2e 63 6f 6d  0d 0a 43 6f 6e 74 65 6e  |mple.com..Conten|
-00000030: 74 2d 4c 65 6e 67 74 68  3a 20 35 3a 0a 43 6f 6e  |t-Length: 5:.Con|
-00000040: 74 65 6e 74 2d 4c 65 6e  67 74 68 3a 20 35 0d 0a  |tent-Length: 5..|
-00000050: 0d 0a 68 65 6c 6c 6f                              |..hello|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `82 / 87`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/dup-cl`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `false`
-- **HTTP Status Code:** `Some(400)`
-- **Forwarded to Backend:** `No (connection dropped or rejected with 400)`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Some(400), err=None
-
----
-
-### Finding 162: mutated_cl_te_rand_149
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Combinatorial CL (5) vs TE with payload len (3)
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
-00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 35 0d  |ntent-Length: 5.|
-00000040: 0a 54 72 61 6e 73 66 65  72 2d 45 6e 63 6f 64 69  |.Transfer-Encodi|
-00000050: 6e 67 3a 20 63 68 75 6e  6b 65 64 0d 0a 0d 0a 33  |ng: chunked....3|
-00000060: 0d 0a 30 31 32 0d 0a 30  0d 0a 0d 0a              |..012..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `108 / 108`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/cl-te-rand`
-- **Body Length:** `3 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/cl-te-rand`
-- **Forwarded Body Length:** `8 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 3 bytes, HAProxy: 8 bytes)
-
----
-
-### Finding 163: mutated_cl_te_rand_150
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Combinatorial CL (14) vs TE with payload len (6)
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
-00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 31 34  |ntent-Length: 14|
-00000040: 0d 0a 54 72 61 6e 73 66  65 72 2d 45 6e 63 6f 64  |..Transfer-Encod|
-00000050: 69 6e 67 3a 20 63 68 75  6e 6b 65 64 0d 0a 0d 0a  |ing: chunked....|
-00000060: 36 0d 0a 30 31 32 33 34  35 0d 0a 30 0d 0a 0d 0a  |6..012345..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `112 / 112`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/cl-te-rand`
-- **Body Length:** `6 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/cl-te-rand`
-- **Forwarded Body Length:** `11 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 6 bytes, HAProxy: 11 bytes)
-
----
-
-### Finding 164: mutated_chunked_151
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized chunked sequence of 5 chunks
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 6d 75  74 2d 63 68 75 6e 6b 20  |POST /mut-chunk |
-00000010: 48 54 54 50 2f 31 2e 31  0d 0a 48 6f 73 74 3a 20  |HTTP/1.1..Host: |
-00000020: 65 78 61 6d 70 6c 65 2e  63 6f 6d 0d 0a 54 72 61  |example.com..Tra|
-00000030: 6e 73 66 65 72 2d 45 6e  63 6f 64 69 6e 67 3a 20  |nsfer-Encoding: |
-00000040: 63 68 75 6e 6b 65 64 0d  0a 0d 0a 37 0d 0a 61 62  |chunked....7..ab|
-00000050: 63 64 65 66 67 0d 0a 43  0d 0a 61 62 63 64 65 66  |cdefg..C..abcdef|
-00000060: 67 68 69 6a 6b 6c 0d 0a  33 0d 0a 61 62 63 0d 0a  |ghijkl..3..abc..|
-00000070: 33 0d 0a 61 62 63 0d 0a  31 30 0d 0a 61 62 63 64  |3..abc..10..abcd|
-00000080: 65 66 67 68 69 6a 6b 6c  6d 6e 6f 70 0d 0a 30 0d  |efghijklmnop..0.|
-00000090: 0a 0d 0a                                          |...|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `147 / 147`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/mut-chunk`
-- **Body Length:** `41 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/mut-chunk`
-- **Forwarded Body Length:** `47 bytes`
-- **Saw Sentinel Next Request:** `true`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 41 bytes, HAProxy: 47 bytes)
-
----
-
-### Finding 165: mutated_pipelined_pair_153
+### Finding 085: mutated_pipelined_pair_153
 
 - **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Pipelined Request Boundaries
@@ -7820,96 +4278,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 ---
 
-### Finding 166: mutated_cl_te_rand_155
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Combinatorial CL (13) vs TE with payload len (4)
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
-00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 31 33  |ntent-Length: 13|
-00000040: 0d 0a 54 72 61 6e 73 66  65 72 2d 45 6e 63 6f 64  |..Transfer-Encod|
-00000050: 69 6e 67 3a 20 63 68 75  6e 6b 65 64 0d 0a 0d 0a  |ing: chunked....|
-00000060: 34 0d 0a 30 31 32 33 0d  0a 30 0d 0a 0d 0a        |4..0123..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `110 / 110`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/cl-te-rand`
-- **Body Length:** `4 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/cl-te-rand`
-- **Forwarded Body Length:** `9 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 4 bytes, HAProxy: 9 bytes)
-
----
-
-### Finding 167: mutated_cl_te_rand_156
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Combinatorial CL (11) vs TE with payload len (9)
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
-00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 31 31  |ntent-Length: 11|
-00000040: 0d 0a 54 72 61 6e 73 66  65 72 2d 45 6e 63 6f 64  |..Transfer-Encod|
-00000050: 69 6e 67 3a 20 63 68 75  6e 6b 65 64 0d 0a 0d 0a  |ing: chunked....|
-00000060: 39 0d 0a 30 31 32 33 34  35 36 37 38 0d 0a 30 0d  |9..012345678..0.|
-00000070: 0a 0d 0a                                          |...|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `115 / 115`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/cl-te-rand`
-- **Body Length:** `9 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/cl-te-rand`
-- **Forwarded Body Length:** `14 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 9 bytes, HAProxy: 14 bytes)
-
----
-
-### Finding 168: mutated_pipelined_pair_158
+### Finding 086: mutated_pipelined_pair_158
 
 - **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Pipelined Request Boundaries
@@ -7951,52 +4320,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 ---
 
-### Finding 169: mutated_cl_te_rand_159
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Combinatorial CL (12) vs TE with payload len (19)
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
-00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 31 32  |ntent-Length: 12|
-00000040: 0d 0a 54 72 61 6e 73 66  65 72 2d 45 6e 63 6f 64  |..Transfer-Encod|
-00000050: 69 6e 67 3a 20 63 68 75  6e 6b 65 64 0d 0a 0d 0a  |ing: chunked....|
-00000060: 31 33 0d 0a 30 31 32 33  34 35 36 37 38 39 30 31  |13..012345678901|
-00000070: 32 33 34 35 36 37 38 0d  0a 30 0d 0a 0d 0a        |2345678..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `126 / 126`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/cl-te-rand`
-- **Body Length:** `19 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/cl-te-rand`
-- **Forwarded Body Length:** `25 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 19 bytes, HAProxy: 25 bytes)
-
----
-
-### Finding 170: mutated_base_160_pipelined_chunked_premature_end
+### Finding 087: mutated_base_160_pipelined_chunked_premature_end
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -8039,98 +4363,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 171: mutated_cl_te_rand_161
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Combinatorial CL (11) vs TE with payload len (10)
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
-00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 31 31  |ntent-Length: 11|
-00000040: 0d 0a 54 72 61 6e 73 66  65 72 2d 45 6e 63 6f 64  |..Transfer-Encod|
-00000050: 69 6e 67 3a 20 63 68 75  6e 6b 65 64 0d 0a 0d 0a  |ing: chunked....|
-00000060: 61 0d 0a 30 31 32 33 34  35 36 37 38 39 0d 0a 30  |a..0123456789..0|
-00000070: 0d 0a 0d 0a                                       |....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `116 / 116`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/cl-te-rand`
-- **Body Length:** `10 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/cl-te-rand`
-- **Forwarded Body Length:** `15 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 10 bytes, HAProxy: 15 bytes)
-
----
-
-### Finding 172: mutated_chunked_162
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized chunked sequence of 5 chunks
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 6d 75  74 2d 63 68 75 6e 6b 20  |POST /mut-chunk |
-00000010: 48 54 54 50 2f 31 2e 31  0d 0a 48 6f 73 74 3a 20  |HTTP/1.1..Host: |
-00000020: 65 78 61 6d 70 6c 65 2e  63 6f 6d 0d 0a 54 72 61  |example.com..Tra|
-00000030: 6e 73 66 65 72 2d 45 6e  63 6f 64 69 6e 67 3a 20  |nsfer-Encoding: |
-00000040: 63 68 75 6e 6b 65 64 0d  0a 0d 0a 33 0d 0a 61 62  |chunked....3..ab|
-00000050: 63 0d 0a 33 0d 0a 61 62  63 0d 0a 31 0d 0a 61 0d  |c..3..abc..1..a.|
-00000060: 0a 37 0d 0a 61 62 63 64  65 66 67 0d 0a 63 0d 0a  |.7..abcdefg..c..|
-00000070: 61 62 63 64 65 66 67 68  69 6a 6b 6c 0d 0a 30 0d  |abcdefghijkl..0.|
-00000080: 0a 0d 0a                                          |...|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `131 / 131`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/mut-chunk`
-- **Body Length:** `26 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/mut-chunk`
-- **Forwarded Body Length:** `32 bytes`
-- **Saw Sentinel Next Request:** `true`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 26 bytes, HAProxy: 32 bytes)
-
----
-
-### Finding 173: mutated_startline_163
+### Finding 088: mutated_startline_163
 
 - **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -8169,7 +4402,7 @@ Full-buffer parse succeeded/failed differently than byte-by-byte incremental str
 
 ---
 
-### Finding 174: mutated_base_164_chunk_signed_plus
+### Finding 089: mutated_base_164_chunk_signed_plus
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -8210,96 +4443,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 175: mutated_cl_te_rand_165
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Combinatorial CL (17) vs TE with payload len (3)
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
-00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 31 37  |ntent-Length: 17|
-00000040: 0d 0a 54 72 61 6e 73 66  65 72 2d 45 6e 63 6f 64  |..Transfer-Encod|
-00000050: 69 6e 67 3a 20 63 68 75  6e 6b 65 64 0d 0a 0d 0a  |ing: chunked....|
-00000060: 33 0d 0a 30 31 32 0d 0a  30 0d 0a 0d 0a           |3..012..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `109 / 109`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/cl-te-rand`
-- **Body Length:** `3 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/cl-te-rand`
-- **Forwarded Body Length:** `8 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 3 bytes, HAProxy: 8 bytes)
-
----
-
-### Finding 176: mutated_cl_te_rand_166
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Combinatorial CL (15) vs TE with payload len (18)
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
-00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 31 35  |ntent-Length: 15|
-00000040: 0d 0a 54 72 61 6e 73 66  65 72 2d 45 6e 63 6f 64  |..Transfer-Encod|
-00000050: 69 6e 67 3a 20 63 68 75  6e 6b 65 64 0d 0a 0d 0a  |ing: chunked....|
-00000060: 31 32 0d 0a 30 31 32 33  34 35 36 37 38 39 30 31  |12..012345678901|
-00000070: 32 33 34 35 36 37 0d 0a  30 0d 0a 0d 0a           |234567..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `125 / 125`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/cl-te-rand`
-- **Body Length:** `18 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/cl-te-rand`
-- **Forwarded Body Length:** `24 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 18 bytes, HAProxy: 24 bytes)
-
----
-
-### Finding 177: mutated_startline_167
+### Finding 090: mutated_startline_167
 
 - **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -8338,52 +4482,7 @@ Full-buffer parse succeeded/failed differently than byte-by-byte incremental str
 
 ---
 
-### Finding 178: mutated_cl_te_rand_168
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Combinatorial CL (2) vs TE with payload len (9)
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
-00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 32 0d  |ntent-Length: 2.|
-00000040: 0a 54 72 61 6e 73 66 65  72 2d 45 6e 63 6f 64 69  |.Transfer-Encodi|
-00000050: 6e 67 3a 20 63 68 75 6e  6b 65 64 0d 0a 0d 0a 39  |ng: chunked....9|
-00000060: 0d 0a 30 31 32 33 34 35  36 37 38 0d 0a 30 0d 0a  |..012345678..0..|
-00000070: 0d 0a                                             |..|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `114 / 114`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/cl-te-rand`
-- **Body Length:** `9 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/cl-te-rand`
-- **Forwarded Body Length:** `14 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 9 bytes, HAProxy: 14 bytes)
-
----
-
-### Finding 179: mutated_pipelined_pair_169
+### Finding 091: mutated_pipelined_pair_169
 
 - **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Pipelined Request Boundaries
@@ -8425,7 +4524,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 ---
 
-### Finding 180: mutated_startline_171
+### Finding 092: mutated_startline_171
 
 - **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -8464,52 +4563,7 @@ Full-buffer parse succeeded/failed differently than byte-by-byte incremental str
 
 ---
 
-### Finding 181: mutated_chunked_172
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized chunked sequence of 3 chunks
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 6d 75  74 2d 63 68 75 6e 6b 20  |POST /mut-chunk |
-00000010: 48 54 54 50 2f 31 2e 31  0d 0a 48 6f 73 74 3a 20  |HTTP/1.1..Host: |
-00000020: 65 78 61 6d 70 6c 65 2e  63 6f 6d 0d 0a 54 72 61  |example.com..Tra|
-00000030: 6e 73 66 65 72 2d 45 6e  63 6f 64 69 6e 67 3a 20  |nsfer-Encoding: |
-00000040: 63 68 75 6e 6b 65 64 0d  0a 0d 0a 31 0d 0a 61 0d  |chunked....1..a.|
-00000050: 0a 66 0d 0a 61 62 63 64  65 66 67 68 69 6a 6b 6c  |.f..abcdefghijkl|
-00000060: 6d 6e 6f 0d 0a 37 0d 0a  61 62 63 64 65 66 67 0d  |mno..7..abcdefg.|
-00000070: 0a 30 0d 0a 0d 0a                                 |.0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `118 / 118`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/mut-chunk`
-- **Body Length:** `23 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/mut-chunk`
-- **Forwarded Body Length:** `29 bytes`
-- **Saw Sentinel Next Request:** `true`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 23 bytes, HAProxy: 29 bytes)
-
----
-
-### Finding 182: mutated_base_173_cl_te_conflicting_lengths_te_cl_smuggle
+### Finding 093: mutated_base_173_cl_te_conflicting_lengths_te_cl_smuggle
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -8552,96 +4606,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Non
 
 ---
 
-### Finding 183: mutated_cl_te_rand_174
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Combinatorial CL (1) vs TE with payload len (5)
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
-00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 31 0d  |ntent-Length: 1.|
-00000040: 0a 54 72 61 6e 73 66 65  72 2d 45 6e 63 6f 64 69  |.Transfer-Encodi|
-00000050: 6e 67 3a 20 63 68 75 6e  6b 65 64 0d 0a 0d 0a 35  |ng: chunked....5|
-00000060: 0d 0a 30 31 32 33 34 0d  0a 30 0d 0a 0d 0a        |..01234..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `110 / 110`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/cl-te-rand`
-- **Body Length:** `5 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/cl-te-rand`
-- **Forwarded Body Length:** `10 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 5 bytes, HAProxy: 10 bytes)
-
----
-
-### Finding 184: mutated_cl_te_rand_175
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Combinatorial CL (14) vs TE with payload len (18)
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
-00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 31 34  |ntent-Length: 14|
-00000040: 0d 0a 54 72 61 6e 73 66  65 72 2d 45 6e 63 6f 64  |..Transfer-Encod|
-00000050: 69 6e 67 3a 20 63 68 75  6e 6b 65 64 0d 0a 0d 0a  |ing: chunked....|
-00000060: 31 32 0d 0a 30 31 32 33  34 35 36 37 38 39 30 31  |12..012345678901|
-00000070: 32 33 34 35 36 37 0d 0a  30 0d 0a 0d 0a           |234567..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `125 / 125`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/cl-te-rand`
-- **Body Length:** `18 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/cl-te-rand`
-- **Forwarded Body Length:** `24 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 18 bytes, HAProxy: 24 bytes)
-
----
-
-### Finding 185: mutated_pipelined_pair_176
+### Finding 094: mutated_pipelined_pair_176
 
 - **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Pipelined Request Boundaries
@@ -8683,142 +4648,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 ---
 
-### Finding 186: mutated_cl_te_rand_177
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Combinatorial CL (17) vs TE with payload len (10)
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
-00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 31 37  |ntent-Length: 17|
-00000040: 0d 0a 54 72 61 6e 73 66  65 72 2d 45 6e 63 6f 64  |..Transfer-Encod|
-00000050: 69 6e 67 3a 20 63 68 75  6e 6b 65 64 0d 0a 0d 0a  |ing: chunked....|
-00000060: 61 0d 0a 30 31 32 33 34  35 36 37 38 39 0d 0a 30  |a..0123456789..0|
-00000070: 0d 0a 0d 0a                                       |....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `116 / 116`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/cl-te-rand`
-- **Body Length:** `10 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/cl-te-rand`
-- **Forwarded Body Length:** `15 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 10 bytes, HAProxy: 15 bytes)
-
----
-
-### Finding 187: mutated_chunked_178
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized chunked sequence of 3 chunks
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 6d 75  74 2d 63 68 75 6e 6b 20  |POST /mut-chunk |
-00000010: 48 54 54 50 2f 31 2e 31  0d 0a 48 6f 73 74 3a 20  |HTTP/1.1..Host: |
-00000020: 65 78 61 6d 70 6c 65 2e  63 6f 6d 0d 0a 54 72 61  |example.com..Tra|
-00000030: 6e 73 66 65 72 2d 45 6e  63 6f 64 69 6e 67 3a 20  |nsfer-Encoding: |
-00000040: 63 68 75 6e 6b 65 64 0d  0a 0d 0a 32 0d 0a 61 62  |chunked....2..ab|
-00000050: 0d 0a 31 30 0d 0a 61 62  63 64 65 66 67 68 69 6a  |..10..abcdefghij|
-00000060: 6b 6c 6d 6e 6f 70 0d 0a  45 0d 0a 61 62 63 64 65  |klmnop..E..abcde|
-00000070: 66 67 68 69 6a 6b 6c 6d  6e 0d 0a 30 0d 0a 0d 0a  |fghijklmn..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `128 / 128`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/mut-chunk`
-- **Body Length:** `32 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/mut-chunk`
-- **Forwarded Body Length:** `38 bytes`
-- **Saw Sentinel Next Request:** `true`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 32 bytes, HAProxy: 38 bytes)
-
----
-
-### Finding 188: mutated_chunked_179
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized chunked sequence of 3 chunks
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 6d 75  74 2d 63 68 75 6e 6b 20  |POST /mut-chunk |
-00000010: 48 54 54 50 2f 31 2e 31  0d 0a 48 6f 73 74 3a 20  |HTTP/1.1..Host: |
-00000020: 65 78 61 6d 70 6c 65 2e  63 6f 6d 0d 0a 54 72 61  |example.com..Tra|
-00000030: 6e 73 66 65 72 2d 45 6e  63 6f 64 69 6e 67 3a 20  |nsfer-Encoding: |
-00000040: 63 68 75 6e 6b 65 64 0d  0a 0d 0a 37 0d 0a 61 62  |chunked....7..ab|
-00000050: 63 64 65 66 67 0d 0a 38  0d 0a 61 62 63 64 65 66  |cdefg..8..abcdef|
-00000060: 67 68 0d 0a 61 0d 0a 61  62 63 64 65 66 67 68 69  |gh..a..abcdefghi|
-00000070: 6a 0d 0a 30 0d 0a 0d 0a                           |j..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `120 / 120`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/mut-chunk`
-- **Body Length:** `25 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/mut-chunk`
-- **Forwarded Body Length:** `31 bytes`
-- **Saw Sentinel Next Request:** `true`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 25 bytes, HAProxy: 31 bytes)
-
----
-
-### Finding 189: mutated_pipelined_pair_180
+### Finding 095: mutated_pipelined_pair_180
 
 - **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Pipelined Request Boundaries
@@ -8860,142 +4690,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 ---
 
-### Finding 190: mutated_chunked_181
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized chunked sequence of 2 chunks
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 6d 75  74 2d 63 68 75 6e 6b 20  |POST /mut-chunk |
-00000010: 48 54 54 50 2f 31 2e 31  0d 0a 48 6f 73 74 3a 20  |HTTP/1.1..Host: |
-00000020: 65 78 61 6d 70 6c 65 2e  63 6f 6d 0d 0a 54 72 61  |example.com..Tra|
-00000030: 6e 73 66 65 72 2d 45 6e  63 6f 64 69 6e 67 3a 20  |nsfer-Encoding: |
-00000040: 63 68 75 6e 6b 65 64 0d  0a 0d 0a 38 0d 0a 61 62  |chunked....8..ab|
-00000050: 63 64 65 66 67 68 0d 0a  39 0d 0a 61 62 63 64 65  |cdefgh..9..abcde|
-00000060: 66 67 68 69 0d 0a 30 0d  0a 0d 0a                 |fghi..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `107 / 107`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/mut-chunk`
-- **Body Length:** `17 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/mut-chunk`
-- **Forwarded Body Length:** `23 bytes`
-- **Saw Sentinel Next Request:** `true`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 17 bytes, HAProxy: 23 bytes)
-
----
-
-### Finding 191: mutated_cl_te_rand_182
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Combinatorial CL (13) vs TE with payload len (17)
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
-00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 31 33  |ntent-Length: 13|
-00000040: 0d 0a 54 72 61 6e 73 66  65 72 2d 45 6e 63 6f 64  |..Transfer-Encod|
-00000050: 69 6e 67 3a 20 63 68 75  6e 6b 65 64 0d 0a 0d 0a  |ing: chunked....|
-00000060: 31 31 0d 0a 30 31 32 33  34 35 36 37 38 39 30 31  |11..012345678901|
-00000070: 32 33 34 35 36 0d 0a 30  0d 0a 0d 0a              |23456..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `124 / 124`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/cl-te-rand`
-- **Body Length:** `17 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/cl-te-rand`
-- **Forwarded Body Length:** `23 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 17 bytes, HAProxy: 23 bytes)
-
----
-
-### Finding 192: mutated_chunked_183
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized chunked sequence of 5 chunks
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 6d 75  74 2d 63 68 75 6e 6b 20  |POST /mut-chunk |
-00000010: 48 54 54 50 2f 31 2e 31  0d 0a 48 6f 73 74 3a 20  |HTTP/1.1..Host: |
-00000020: 65 78 61 6d 70 6c 65 2e  63 6f 6d 0d 0a 54 72 61  |example.com..Tra|
-00000030: 6e 73 66 65 72 2d 45 6e  63 6f 64 69 6e 67 3a 20  |nsfer-Encoding: |
-00000040: 63 68 75 6e 6b 65 64 0d  0a 0d 0a 44 0d 0a 61 62  |chunked....D..ab|
-00000050: 63 64 65 66 67 68 69 6a  6b 6c 6d 0d 0a 39 0d 0a  |cdefghijklm..9..|
-00000060: 61 62 63 64 65 66 67 68  69 0d 0a 61 0d 0a 61 62  |abcdefghi..a..ab|
-00000070: 63 64 65 66 67 68 69 6a  0d 0a 36 0d 0a 61 62 63  |cdefghij..6..abc|
-00000080: 64 65 66 0d 0a 31 0d 0a  61 0d 0a 30 0d 0a 0d 0a  |def..1..a..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `144 / 144`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/mut-chunk`
-- **Body Length:** `39 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/mut-chunk`
-- **Forwarded Body Length:** `45 bytes`
-- **Saw Sentinel Next Request:** `true`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 39 bytes, HAProxy: 45 bytes)
-
----
-
-### Finding 193: mutated_pipelined_pair_184
+### Finding 096: mutated_pipelined_pair_184
 
 - **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Pipelined Request Boundaries
@@ -9037,7 +4732,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 ---
 
-### Finding 194: mutated_startline_185
+### Finding 097: mutated_startline_185
 
 - **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -9076,141 +4771,7 @@ Full-buffer parse succeeded/failed differently than byte-by-byte incremental str
 
 ---
 
-### Finding 195: mutated_cl_te_rand_186
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Combinatorial CL (5) vs TE with payload len (2)
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
-00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 35 0d  |ntent-Length: 5.|
-00000040: 0a 54 72 61 6e 73 66 65  72 2d 45 6e 63 6f 64 69  |.Transfer-Encodi|
-00000050: 6e 67 3a 20 63 68 75 6e  6b 65 64 0d 0a 0d 0a 32  |ng: chunked....2|
-00000060: 0d 0a 30 31 0d 0a 30 0d  0a 0d 0a                 |..01..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `107 / 107`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/cl-te-rand`
-- **Body Length:** `2 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/cl-te-rand`
-- **Forwarded Body Length:** `7 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 2 bytes, HAProxy: 7 bytes)
-
----
-
-### Finding 196: mutated_cl_te_rand_187
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Combinatorial CL (1) vs TE with payload len (14)
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
-00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 31 0d  |ntent-Length: 1.|
-00000040: 0a 54 72 61 6e 73 66 65  72 2d 45 6e 63 6f 64 69  |.Transfer-Encodi|
-00000050: 6e 67 3a 20 63 68 75 6e  6b 65 64 0d 0a 0d 0a 65  |ng: chunked....e|
-00000060: 0d 0a 30 31 32 33 34 35  36 37 38 39 30 31 32 33  |..01234567890123|
-00000070: 0d 0a 30 0d 0a 0d 0a                              |..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `119 / 119`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/cl-te-rand`
-- **Body Length:** `14 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/cl-te-rand`
-- **Forwarded Body Length:** `19 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 14 bytes, HAProxy: 19 bytes)
-
----
-
-### Finding 197: mutated_cl_te_rand_188
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Combinatorial CL (18) vs TE with payload len (14)
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
-00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 31 38  |ntent-Length: 18|
-00000040: 0d 0a 54 72 61 6e 73 66  65 72 2d 45 6e 63 6f 64  |..Transfer-Encod|
-00000050: 69 6e 67 3a 20 63 68 75  6e 6b 65 64 0d 0a 0d 0a  |ing: chunked....|
-00000060: 65 0d 0a 30 31 32 33 34  35 36 37 38 39 30 31 32  |e..0123456789012|
-00000070: 33 0d 0a 30 0d 0a 0d 0a                           |3..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `120 / 120`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/cl-te-rand`
-- **Body Length:** `14 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/cl-te-rand`
-- **Forwarded Body Length:** `19 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 14 bytes, HAProxy: 19 bytes)
-
----
-
-### Finding 198: mutated_pipelined_pair_189
+### Finding 098: mutated_pipelined_pair_189
 
 - **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Pipelined Request Boundaries
@@ -9252,7 +4813,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 ---
 
-### Finding 199: mutated_base_190_obs_fold_first_line
+### Finding 099: mutated_base_190_obs_fold_first_line
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -9292,7 +4853,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 200: mutated_base_191_cl_te_multiple_te_headers
+### Finding 100: mutated_base_191_cl_te_multiple_te_headers
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -9336,232 +4897,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 201: mutated_cl_te_rand_192
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Combinatorial CL (16) vs TE with payload len (15)
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
-00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 31 36  |ntent-Length: 16|
-00000040: 0d 0a 54 72 61 6e 73 66  65 72 2d 45 6e 63 6f 64  |..Transfer-Encod|
-00000050: 69 6e 67 3a 20 63 68 75  6e 6b 65 64 0d 0a 0d 0a  |ing: chunked....|
-00000060: 66 0d 0a 30 31 32 33 34  35 36 37 38 39 30 31 32  |f..0123456789012|
-00000070: 33 34 0d 0a 30 0d 0a 0d  0a                       |34..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `121 / 121`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/cl-te-rand`
-- **Body Length:** `15 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/cl-te-rand`
-- **Forwarded Body Length:** `20 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 15 bytes, HAProxy: 20 bytes)
-
----
-
-### Finding 202: mutated_cl_te_rand_193
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Combinatorial CL (19) vs TE with payload len (4)
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
-00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 31 39  |ntent-Length: 19|
-00000040: 0d 0a 54 72 61 6e 73 66  65 72 2d 45 6e 63 6f 64  |..Transfer-Encod|
-00000050: 69 6e 67 3a 20 63 68 75  6e 6b 65 64 0d 0a 0d 0a  |ing: chunked....|
-00000060: 34 0d 0a 30 31 32 33 0d  0a 30 0d 0a 0d 0a        |4..0123..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `110 / 110`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/cl-te-rand`
-- **Body Length:** `4 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/cl-te-rand`
-- **Forwarded Body Length:** `9 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 4 bytes, HAProxy: 9 bytes)
-
----
-
-### Finding 203: mutated_chunked_194
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized chunked sequence of 4 chunks
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 6d 75  74 2d 63 68 75 6e 6b 20  |POST /mut-chunk |
-00000010: 48 54 54 50 2f 31 2e 31  0d 0a 48 6f 73 74 3a 20  |HTTP/1.1..Host: |
-00000020: 65 78 61 6d 70 6c 65 2e  63 6f 6d 0d 0a 54 72 61  |example.com..Tra|
-00000030: 6e 73 66 65 72 2d 45 6e  63 6f 64 69 6e 67 3a 20  |nsfer-Encoding: |
-00000040: 63 68 75 6e 6b 65 64 0d  0a 0d 0a 32 0d 0a 61 62  |chunked....2..ab|
-00000050: 0d 0a 63 0d 0a 61 62 63  64 65 66 67 68 69 6a 6b  |..c..abcdefghijk|
-00000060: 6c 0d 0a 45 0d 0a 61 62  63 64 65 66 67 68 69 6a  |l..E..abcdefghij|
-00000070: 6b 6c 6d 6e 0d 0a 31 0d  0a 61 0d 0a 30 0d 0a 0d  |klmn..1..a..0...|
-00000080: 0a                                                |.|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `129 / 129`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/mut-chunk`
-- **Body Length:** `29 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/mut-chunk`
-- **Forwarded Body Length:** `35 bytes`
-- **Saw Sentinel Next Request:** `true`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 29 bytes, HAProxy: 35 bytes)
-
----
-
-### Finding 204: mutated_chunked_195
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized chunked sequence of 4 chunks
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 6d 75  74 2d 63 68 75 6e 6b 20  |POST /mut-chunk |
-00000010: 48 54 54 50 2f 31 2e 31  0d 0a 48 6f 73 74 3a 20  |HTTP/1.1..Host: |
-00000020: 65 78 61 6d 70 6c 65 2e  63 6f 6d 0d 0a 54 72 61  |example.com..Tra|
-00000030: 6e 73 66 65 72 2d 45 6e  63 6f 64 69 6e 67 3a 20  |nsfer-Encoding: |
-00000040: 63 68 75 6e 6b 65 64 0d  0a 0d 0a 64 0d 0a 61 62  |chunked....d..ab|
-00000050: 63 64 65 66 67 68 69 6a  6b 6c 6d 0d 0a 39 0d 0a  |cdefghijklm..9..|
-00000060: 61 62 63 64 65 66 67 68  69 0d 0a 35 0d 0a 61 62  |abcdefghi..5..ab|
-00000070: 63 64 65 0d 0a 36 0d 0a  61 62 63 64 65 66 0d 0a  |cde..6..abcdef..|
-00000080: 30 0d 0a 0d 0a                                    |0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `133 / 133`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/mut-chunk`
-- **Body Length:** `33 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/mut-chunk`
-- **Forwarded Body Length:** `39 bytes`
-- **Saw Sentinel Next Request:** `true`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 33 bytes, HAProxy: 39 bytes)
-
----
-
-### Finding 205: mutated_cl_te_rand_197
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Combinatorial CL (2) vs TE with payload len (4)
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
-00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 32 0d  |ntent-Length: 2.|
-00000040: 0a 54 72 61 6e 73 66 65  72 2d 45 6e 63 6f 64 69  |.Transfer-Encodi|
-00000050: 6e 67 3a 20 63 68 75 6e  6b 65 64 0d 0a 0d 0a 34  |ng: chunked....4|
-00000060: 0d 0a 30 31 32 33 0d 0a  30 0d 0a 0d 0a           |..0123..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `109 / 109`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/cl-te-rand`
-- **Body Length:** `4 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/cl-te-rand`
-- **Forwarded Body Length:** `9 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 4 bytes, HAProxy: 9 bytes)
-
----
-
-### Finding 206: mutated_base_198_header_nul_in_name
+### Finding 101: mutated_base_198_header_nul_in_name
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -9601,7 +4937,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 207: mutated_startline_200
+### Finding 102: mutated_startline_200
 
 - **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -9640,7 +4976,7 @@ Full-buffer parse succeeded/failed differently than byte-by-byte incremental str
 
 ---
 
-### Finding 208: mutated_pipelined_pair_201
+### Finding 103: mutated_pipelined_pair_201
 
 - **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Pipelined Request Boundaries
@@ -9682,52 +5018,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 ---
 
-### Finding 209: mutated_cl_te_rand_203
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Combinatorial CL (18) vs TE with payload len (15)
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
-00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 31 38  |ntent-Length: 18|
-00000040: 0d 0a 54 72 61 6e 73 66  65 72 2d 45 6e 63 6f 64  |..Transfer-Encod|
-00000050: 69 6e 67 3a 20 63 68 75  6e 6b 65 64 0d 0a 0d 0a  |ing: chunked....|
-00000060: 66 0d 0a 30 31 32 33 34  35 36 37 38 39 30 31 32  |f..0123456789012|
-00000070: 33 34 0d 0a 30 0d 0a 0d  0a                       |34..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `121 / 121`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/cl-te-rand`
-- **Body Length:** `15 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/cl-te-rand`
-- **Forwarded Body Length:** `20 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 15 bytes, HAProxy: 20 bytes)
-
----
-
-### Finding 210: mutated_pipelined_pair_204
+### Finding 104: mutated_pipelined_pair_204
 
 - **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Pipelined Request Boundaries
@@ -9769,7 +5060,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 ---
 
-### Finding 211: mutated_pipelined_pair_205
+### Finding 105: mutated_pipelined_pair_205
 
 - **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Pipelined Request Boundaries
@@ -9811,7 +5102,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 ---
 
-### Finding 212: mutated_base_206_line_term_doubled_crlf_before_headers
+### Finding 106: mutated_base_206_line_term_doubled_crlf_before_headers
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -9849,7 +5140,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 213: mutated_pipelined_pair_207
+### Finding 107: mutated_pipelined_pair_207
 
 - **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Pipelined Request Boundaries
@@ -9891,7 +5182,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 ---
 
-### Finding 214: mutated_base_208_obs_fold_tab_continuation
+### Finding 108: mutated_base_208_obs_fold_tab_continuation
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -9931,7 +5222,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 215: mutated_base_209_oversized_header_count_120
+### Finding 109: mutated_base_209_oversized_header_count_120
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -10203,7 +5494,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 216: mutated_base_211_duplicate_cl_identical
+### Finding 110: mutated_base_211_duplicate_cl_identical
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -10244,99 +5535,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Non
 
 ---
 
-### Finding 217: mutated_chunked_212
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized chunked sequence of 5 chunks
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 6d 75  74 2d 63 68 75 6e 6b 20  |POST /mut-chunk |
-00000010: 48 54 54 50 2f 31 2e 31  0d 0a 48 6f 73 74 3a 20  |HTTP/1.1..Host: |
-00000020: 65 78 61 6d 70 6c 65 2e  63 6f 6d 0d 0a 54 72 61  |example.com..Tra|
-00000030: 6e 73 66 65 72 2d 45 6e  63 6f 64 69 6e 67 3a 20  |nsfer-Encoding: |
-00000040: 63 68 75 6e 6b 65 64 0d  0a 0d 0a 66 0d 0a 61 62  |chunked....f..ab|
-00000050: 63 64 65 66 67 68 69 6a  6b 6c 6d 6e 6f 0d 0a 31  |cdefghijklmno..1|
-00000060: 30 0d 0a 61 62 63 64 65  66 67 68 69 6a 6b 6c 6d  |0..abcdefghijklm|
-00000070: 6e 6f 70 0d 0a 31 30 0d  0a 61 62 63 64 65 66 67  |nop..10..abcdefg|
-00000080: 68 69 6a 6b 6c 6d 6e 6f  70 0d 0a 33 0d 0a 61 62  |hijklmnop..3..ab|
-00000090: 63 0d 0a 33 0d 0a 61 62  63 0d 0a 30 0d 0a 0d 0a  |c..3..abc..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `160 / 160`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/mut-chunk`
-- **Body Length:** `53 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/mut-chunk`
-- **Forwarded Body Length:** `59 bytes`
-- **Saw Sentinel Next Request:** `true`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 53 bytes, HAProxy: 59 bytes)
-
----
-
-### Finding 218: mutated_cl_te_rand_213
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Combinatorial CL (14) vs TE with payload len (19)
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
-00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 31 34  |ntent-Length: 14|
-00000040: 0d 0a 54 72 61 6e 73 66  65 72 2d 45 6e 63 6f 64  |..Transfer-Encod|
-00000050: 69 6e 67 3a 20 63 68 75  6e 6b 65 64 0d 0a 0d 0a  |ing: chunked....|
-00000060: 31 33 0d 0a 30 31 32 33  34 35 36 37 38 39 30 31  |13..012345678901|
-00000070: 32 33 34 35 36 37 38 0d  0a 30 0d 0a 0d 0a        |2345678..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `126 / 126`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/cl-te-rand`
-- **Body Length:** `19 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/cl-te-rand`
-- **Forwarded Body Length:** `25 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 19 bytes, HAProxy: 25 bytes)
-
----
-
-### Finding 219: mutated_pipelined_pair_214
+### Finding 111: mutated_pipelined_pair_214
 
 - **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Pipelined Request Boundaries
@@ -10378,7 +5577,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 ---
 
-### Finding 220: mutated_headers_ws_215
+### Finding 112: mutated_headers_ws_215
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -10422,52 +5621,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 221: mutated_cl_te_rand_216
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Combinatorial CL (19) vs TE with payload len (19)
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
-00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 31 39  |ntent-Length: 19|
-00000040: 0d 0a 54 72 61 6e 73 66  65 72 2d 45 6e 63 6f 64  |..Transfer-Encod|
-00000050: 69 6e 67 3a 20 63 68 75  6e 6b 65 64 0d 0a 0d 0a  |ing: chunked....|
-00000060: 31 33 0d 0a 30 31 32 33  34 35 36 37 38 39 30 31  |13..012345678901|
-00000070: 32 33 34 35 36 37 38 0d  0a 30 0d 0a 0d 0a        |2345678..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `126 / 126`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/cl-te-rand`
-- **Body Length:** `19 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/cl-te-rand`
-- **Forwarded Body Length:** `25 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 19 bytes, HAProxy: 25 bytes)
-
----
-
-### Finding 222: mutated_startline_217
+### Finding 113: mutated_startline_217
 
 - **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -10506,7 +5660,7 @@ Full-buffer parse succeeded/failed differently than byte-by-byte incremental str
 
 ---
 
-### Finding 223: mutated_startline_218
+### Finding 114: mutated_startline_218
 
 - **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -10545,50 +5699,7 @@ Full-buffer parse succeeded/failed differently than byte-by-byte incremental str
 
 ---
 
-### Finding 224: mutated_chunked_219
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized chunked sequence of 1 chunks
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 6d 75  74 2d 63 68 75 6e 6b 20  |POST /mut-chunk |
-00000010: 48 54 54 50 2f 31 2e 31  0d 0a 48 6f 73 74 3a 20  |HTTP/1.1..Host: |
-00000020: 65 78 61 6d 70 6c 65 2e  63 6f 6d 0d 0a 54 72 61  |example.com..Tra|
-00000030: 6e 73 66 65 72 2d 45 6e  63 6f 64 69 6e 67 3a 20  |nsfer-Encoding: |
-00000040: 63 68 75 6e 6b 65 64 0d  0a 0d 0a 38 0d 0a 61 62  |chunked....8..ab|
-00000050: 63 64 65 66 67 68 0d 0a  30 0d 0a 0d 0a           |cdefgh..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `93 / 93`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/mut-chunk`
-- **Body Length:** `8 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/mut-chunk`
-- **Forwarded Body Length:** `13 bytes`
-- **Saw Sentinel Next Request:** `true`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 8 bytes, HAProxy: 13 bytes)
-
----
-
-### Finding 225: mutated_startline_220
+### Finding 115: mutated_startline_220
 
 - **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -10626,7 +5737,7 @@ Full-buffer parse succeeded/failed differently than byte-by-byte incremental str
 
 ---
 
-### Finding 226: mutated_base_221_cl_te_both_present_te_first
+### Finding 116: mutated_base_221_cl_te_both_present_te_first
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -10668,51 +5779,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 227: mutated_chunked_222
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized chunked sequence of 2 chunks
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 6d 75  74 2d 63 68 75 6e 6b 20  |POST /mut-chunk |
-00000010: 48 54 54 50 2f 31 2e 31  0d 0a 48 6f 73 74 3a 20  |HTTP/1.1..Host: |
-00000020: 65 78 61 6d 70 6c 65 2e  63 6f 6d 0d 0a 54 72 61  |example.com..Tra|
-00000030: 6e 73 66 65 72 2d 45 6e  63 6f 64 69 6e 67 3a 20  |nsfer-Encoding: |
-00000040: 63 68 75 6e 6b 65 64 0d  0a 0d 0a 33 0d 0a 61 62  |chunked....3..ab|
-00000050: 63 0d 0a 39 0d 0a 61 62  63 64 65 66 67 68 69 0d  |c..9..abcdefghi.|
-00000060: 0a 30 0d 0a 0d 0a                                 |.0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `102 / 102`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/mut-chunk`
-- **Body Length:** `12 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/mut-chunk`
-- **Forwarded Body Length:** `17 bytes`
-- **Saw Sentinel Next Request:** `true`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 12 bytes, HAProxy: 17 bytes)
-
----
-
-### Finding 228: mutated_pipelined_pair_223
+### Finding 117: mutated_pipelined_pair_223
 
 - **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Pipelined Request Boundaries
@@ -10754,97 +5821,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 ---
 
-### Finding 229: mutated_cl_te_rand_224
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Combinatorial CL (10) vs TE with payload len (13)
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
-00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 31 30  |ntent-Length: 10|
-00000040: 0d 0a 54 72 61 6e 73 66  65 72 2d 45 6e 63 6f 64  |..Transfer-Encod|
-00000050: 69 6e 67 3a 20 63 68 75  6e 6b 65 64 0d 0a 0d 0a  |ing: chunked....|
-00000060: 64 0d 0a 30 31 32 33 34  35 36 37 38 39 30 31 32  |d..0123456789012|
-00000070: 0d 0a 30 0d 0a 0d 0a                              |..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `119 / 119`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/cl-te-rand`
-- **Body Length:** `13 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/cl-te-rand`
-- **Forwarded Body Length:** `18 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 13 bytes, HAProxy: 18 bytes)
-
----
-
-### Finding 230: mutated_cl_te_rand_225
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Combinatorial CL (7) vs TE with payload len (19)
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
-00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 37 0d  |ntent-Length: 7.|
-00000040: 0a 54 72 61 6e 73 66 65  72 2d 45 6e 63 6f 64 69  |.Transfer-Encodi|
-00000050: 6e 67 3a 20 63 68 75 6e  6b 65 64 0d 0a 0d 0a 31  |ng: chunked....1|
-00000060: 33 0d 0a 30 31 32 33 34  35 36 37 38 39 30 31 32  |3..0123456789012|
-00000070: 33 34 35 36 37 38 0d 0a  30 0d 0a 0d 0a           |345678..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `125 / 125`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/cl-te-rand`
-- **Body Length:** `19 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/cl-te-rand`
-- **Forwarded Body Length:** `25 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 19 bytes, HAProxy: 25 bytes)
-
----
-
-### Finding 231: mutated_base_226_duplicate_cl_identical
+### Finding 118: mutated_base_226_duplicate_cl_identical
 
 - **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -10885,7 +5862,7 @@ Full-buffer parse succeeded/failed differently than byte-by-byte incremental str
 
 ---
 
-### Finding 232: mutated_base_227_te_prefix_unknown_encoding
+### Finding 119: mutated_base_227_te_prefix_unknown_encoding
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -10926,7 +5903,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 233: mutated_pipelined_pair_229
+### Finding 120: mutated_pipelined_pair_229
 
 - **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Pipelined Request Boundaries
@@ -10968,7 +5945,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 ---
 
-### Finding 234: mutated_headers_ws_230
+### Finding 121: mutated_headers_ws_230
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -11016,7 +5993,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 235: mutated_pipelined_pair_231
+### Finding 122: mutated_pipelined_pair_231
 
 - **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Pipelined Request Boundaries
@@ -11058,7 +6035,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 ---
 
-### Finding 236: mutated_headers_ws_233
+### Finding 123: mutated_headers_ws_233
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -11103,97 +6080,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 237: mutated_cl_te_rand_235
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Combinatorial CL (6) vs TE with payload len (14)
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
-00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 36 0d  |ntent-Length: 6.|
-00000040: 0a 54 72 61 6e 73 66 65  72 2d 45 6e 63 6f 64 69  |.Transfer-Encodi|
-00000050: 6e 67 3a 20 63 68 75 6e  6b 65 64 0d 0a 0d 0a 65  |ng: chunked....e|
-00000060: 0d 0a 30 31 32 33 34 35  36 37 38 39 30 31 32 33  |..01234567890123|
-00000070: 0d 0a 30 0d 0a 0d 0a                              |..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `119 / 119`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/cl-te-rand`
-- **Body Length:** `14 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/cl-te-rand`
-- **Forwarded Body Length:** `19 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 14 bytes, HAProxy: 19 bytes)
-
----
-
-### Finding 238: mutated_cl_te_rand_236
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Combinatorial CL (10) vs TE with payload len (11)
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
-00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 31 30  |ntent-Length: 10|
-00000040: 0d 0a 54 72 61 6e 73 66  65 72 2d 45 6e 63 6f 64  |..Transfer-Encod|
-00000050: 69 6e 67 3a 20 63 68 75  6e 6b 65 64 0d 0a 0d 0a  |ing: chunked....|
-00000060: 62 0d 0a 30 31 32 33 34  35 36 37 38 39 30 0d 0a  |b..01234567890..|
-00000070: 30 0d 0a 0d 0a                                    |0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `117 / 117`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/cl-te-rand`
-- **Body Length:** `11 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/cl-te-rand`
-- **Forwarded Body Length:** `16 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 11 bytes, HAProxy: 16 bytes)
-
----
-
-### Finding 239: mutated_pipelined_pair_237
+### Finding 124: mutated_pipelined_pair_237
 
 - **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Pipelined Request Boundaries
@@ -11235,7 +6122,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 ---
 
-### Finding 240: mutated_startline_240
+### Finding 125: mutated_startline_240
 
 - **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -11274,94 +6161,7 @@ Full-buffer parse succeeded/failed differently than byte-by-byte incremental str
 
 ---
 
-### Finding 241: mutated_chunked_241
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized chunked sequence of 2 chunks
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 6d 75  74 2d 63 68 75 6e 6b 20  |POST /mut-chunk |
-00000010: 48 54 54 50 2f 31 2e 31  0d 0a 48 6f 73 74 3a 20  |HTTP/1.1..Host: |
-00000020: 65 78 61 6d 70 6c 65 2e  63 6f 6d 0d 0a 54 72 61  |example.com..Tra|
-00000030: 6e 73 66 65 72 2d 45 6e  63 6f 64 69 6e 67 3a 20  |nsfer-Encoding: |
-00000040: 63 68 75 6e 6b 65 64 0d  0a 0d 0a 37 0d 0a 61 62  |chunked....7..ab|
-00000050: 63 64 65 66 67 0d 0a 35  0d 0a 61 62 63 64 65 0d  |cdefg..5..abcde.|
-00000060: 0a 30 0d 0a 0d 0a                                 |.0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `102 / 102`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/mut-chunk`
-- **Body Length:** `12 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/mut-chunk`
-- **Forwarded Body Length:** `17 bytes`
-- **Saw Sentinel Next Request:** `true`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 12 bytes, HAProxy: 17 bytes)
-
----
-
-### Finding 242: mutated_chunked_243
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized chunked sequence of 1 chunks
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 6d 75  74 2d 63 68 75 6e 6b 20  |POST /mut-chunk |
-00000010: 48 54 54 50 2f 31 2e 31  0d 0a 48 6f 73 74 3a 20  |HTTP/1.1..Host: |
-00000020: 65 78 61 6d 70 6c 65 2e  63 6f 6d 0d 0a 54 72 61  |example.com..Tra|
-00000030: 6e 73 66 65 72 2d 45 6e  63 6f 64 69 6e 67 3a 20  |nsfer-Encoding: |
-00000040: 63 68 75 6e 6b 65 64 0d  0a 0d 0a 38 0d 0a 61 62  |chunked....8..ab|
-00000050: 63 64 65 66 67 68 0d 0a  30 0d 0a 0d 0a           |cdefgh..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `93 / 93`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/mut-chunk`
-- **Body Length:** `8 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/mut-chunk`
-- **Forwarded Body Length:** `13 bytes`
-- **Saw Sentinel Next Request:** `true`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 8 bytes, HAProxy: 13 bytes)
-
----
-
-### Finding 243: mutated_headers_ws_245
+### Finding 126: mutated_headers_ws_245
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -11408,7 +6208,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 244: mutated_base_247_pipelined_standard_two_requests
+### Finding 127: mutated_base_247_pipelined_standard_two_requests
 
 - **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -11447,50 +6247,6 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 #### Security Analysis & Root Cause
 
 HAProxy detected trailing data as part of request body or corrupted the subsequent pipelined request boundary.
-
----
-
-### Finding 245: mutated_cl_te_rand_249
-
-- **Category:** Category 2: Request Framing Disagreement (Method/Path/Headers/Body)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Combinatorial CL (13) vs TE with payload len (4)
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
-00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 31 33  |ntent-Length: 13|
-00000040: 0d 0a 54 72 61 6e 73 66  65 72 2d 45 6e 63 6f 64  |..Transfer-Encod|
-00000050: 69 6e 67 3a 20 63 68 75  6e 6b 65 64 0d 0a 0d 0a  |ing: chunked....|
-00000060: 34 0d 0a 30 31 32 33 0d  0a 30 0d 0a 0d 0a        |4..0123..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `110 / 110`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/cl-te-rand`
-- **Body Length:** `4 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/cl-te-rand`
-- **Forwarded Body Length:** `9 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Body length mismatch (Ibex: 4 bytes, HAProxy: 9 bytes)
 
 ---
 
