@@ -549,7 +549,10 @@ impl H1Parser {
             };
             let len_str = std::str::from_utf8(&input[cursor..cursor + line_end])
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid chunk len"))?;
-            let len_part = len_str.split(';').next().unwrap_or("").trim();
+            // No trimming: RFC 9112 7.1 allows no whitespace around a chunk size, and
+            // ` 5 ` is read as 5 by a lenient hop and rejected by a strict one.
+            // HAProxy 3.5 answers 400.
+            let len_part = len_str.split(';').next().unwrap_or("");
             // Hex digits only. `from_str_radix` accepts a leading '+' or '-', so
             // `+5\r\n` would parse as chunk size 5 -- HAProxy 3.5 answers 400 to that,
             // and a size a peer reads differently is a desync primitive.
@@ -633,13 +636,53 @@ fn parse_response_line(line: &str) -> io::Result<ResponseLine> {
     })
 }
 
+/// True for RFC 9110 `tchar`, the only octets allowed in a header field name.
+const fn is_tchar(b: u8) -> bool {
+    matches!(b,
+        b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.'
+        | b'^' | b'_' | b'`' | b'|' | b'~'
+        | b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z')
+}
+
 fn parse_header_field(line: &str) -> io::Result<HeaderField> {
     let (name, val) = line
         .split_once(':')
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Header missing colon"))?;
+
+    // RFC 9112 5.1 is unusually blunt here: a server MUST reject, with 400, any
+    // request containing whitespace between the field name and the colon. The reason
+    // is concrete -- `Content-Length : 5` is ignored by a hop that requires a strict
+    // token and honoured by one that trims, and those two hops then disagree about
+    // the body length. Trimming the name, as this did, is the permissive side of that
+    // split.
+    //
+    // Verified against HAProxy 3.5: `X-Header : value` and `X-Header\t: value` both
+    // get 400 Bad request.
+    if name.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "empty header field name",
+        ));
+    }
+    if !name.bytes().all(is_tchar) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid character in header field name",
+        ));
+    }
+
+    // Field values may not carry NUL, CR or LF. A NUL is treated as a terminator by
+    // some downstream consumers, which truncates the value differently per hop.
+    if val.bytes().any(|b| b == 0 || b == b'\r' || b == b'\n') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid character in header field value",
+        ));
+    }
+
     Ok(HeaderField {
-        name: name.trim().to_string(),
-        value: val.trim().to_string(),
+        name: name.to_string(),
+        value: val.trim_matches(|c| c == ' ' || c == '\t').to_string(),
     })
 }
 

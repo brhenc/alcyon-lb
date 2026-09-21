@@ -129,3 +129,49 @@ fn obs_fold_after_a_header_still_works() {
         b"GET /x HTTP/1.1\r\nHost: h\r\nX-Long: one\r\n  two\r\n\r\n"
     ));
 }
+
+// ---- header field validation --------------------------------------------------------
+
+#[test]
+fn whitespace_before_colon_is_rejected() {
+    // RFC 9112 5.1: a server MUST reject this with 400, and `HAProxy` 3.5 does. The
+    // concrete hazard is `Content-Length : 5`, which a strict hop ignores and a
+    // trimming hop honours -- so the two disagree on body length.
+    assert!(rejects(b"GET /x HTTP/1.1\r\nHost: h\r\nX-Header : value\r\n\r\n"));
+    assert!(rejects(b"GET /x HTTP/1.1\r\nHost: h\r\nX-Header\t: value\r\n\r\n"));
+}
+
+#[test]
+fn nul_in_header_name_or_value_is_rejected() {
+    // A NUL truncates the value for any downstream consumer that treats it as a
+    // terminator, which is a per-hop difference.
+    assert!(rejects(b"GET /x HTTP/1.1\r\nHost: h\r\nX-Foo\x00Bar: value\r\n\r\n"));
+    assert!(rejects(b"GET /x HTTP/1.1\r\nHost: h\r\nX-Header: val\x00ue\r\n\r\n"));
+}
+
+#[test]
+fn empty_header_name_is_rejected() {
+    assert!(rejects(b"GET /x HTTP/1.1\r\nHost: h\r\n: value\r\n\r\n"));
+}
+
+#[test]
+fn non_token_characters_in_header_name_are_rejected() {
+    assert!(rejects(b"GET /x HTTP/1.1\r\nHost: h\r\nX Header: value\r\n\r\n"));
+    assert!(rejects(b"GET /x HTTP/1.1\r\nHost: h\r\nX(Header): value\r\n\r\n"));
+}
+
+#[test]
+fn ordinary_header_names_still_parse() {
+    // The tchar set includes these, and rejecting them would break real traffic.
+    assert!(accepts(
+        b"GET /x HTTP/1.1\r\nHost: h\r\nX-Custom_Header.v2: value\r\nA1!#$%&'*+-.^_`|~: v\r\n\r\n"
+    ));
+}
+
+#[test]
+fn whitespace_around_chunk_size_is_rejected() {
+    // RFC 9112 7.1 allows none, and ` 5 ` reads as 5 to a lenient hop.
+    assert!(rejects(
+        b"POST /x HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n 5 \r\nhello\r\n0\r\n\r\n"
+    ));
+}

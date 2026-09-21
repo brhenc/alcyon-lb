@@ -557,9 +557,10 @@ fn test_header_multiline_obs_fold_spaces_and_tabs() {
 
 #[test]
 fn test_header_whitespace_and_case_insensitivity() {
+    // Whitespace *around the value* is trimmed and lookups are case-insensitive.
     let wire = b"GET /ws HTTP/1.1\r\n\
                  CoNtEnT-TyPe:    application/json ; charset=utf-8   \r\n\
-                 X-Spaced :   padded_value   \r\n\
+                 X-Padded:   padded_value   \r\n\
                  \r\n";
 
     let mut parser = H1Parser::new(false);
@@ -574,5 +575,19 @@ fn test_header_whitespace_and_case_insensitivity() {
         htx.get_header("CONTENT-TYPE"),
         Some("application/json ; charset=utf-8")
     );
-    assert_eq!(htx.get_header("x-spaced"), Some("padded_value"));
+    assert_eq!(htx.get_header("x-padded"), Some("padded_value"));
+}
+
+#[test]
+fn test_whitespace_before_colon_is_rejected() {
+    // Whitespace *before the colon* is a different matter. RFC 9112 5.1 requires a
+    // server to reject it with 400, and HAProxy 3.5 does. This previously parsed as a
+    // trimmed "X-Spaced" header.
+    //
+    // It matters because `Content-Length : 5` is ignored by a hop demanding a strict
+    // token and honoured by one that trims, and the two then disagree on body length.
+    let wire = b"GET /ws HTTP/1.1\r\nHost: h\r\nX-Spaced :   padded_value\r\n\r\n";
+    let mut parser = H1Parser::new(false);
+    let mut htx = Htx::new();
+    assert!(parser.parse(wire, &mut htx).is_err());
 }
