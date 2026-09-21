@@ -88,6 +88,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ibex-proto"
+version = "0.1.0"
+dependencies = [
+ "ibex-sched",
+]
+
+[[package]]
 name = "ibex-sched"
 version = "0.1.0"
 dependencies = [

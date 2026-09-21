@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/ebtree",
     "crates/ibex-sched",
+    "crates/ibex-proto",
 ]
 
 # The ibex-* scaffold crates below are superseded by design/ and are excluded from the
