@@ -1,0 +1,15 @@
+[package]
+name = "ibex-stick-table"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+ibex-core.workspace = true
+ibex-ebtree.workspace = true
+tracing.workspace = true
+crossbeam-epoch.workspace = true
+
+[lints]
+workspace = true

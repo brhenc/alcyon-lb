@@ -1,0 +1,26 @@
+vtest "Test basic HTTP routing and stick table sync"
+
+server s1 {
+    rxreq
+    txresp -status 200 -body "Ibex Upstream Response"
+} -start
+
+haproxy h1 -conf {
+    global
+        maxconn 10000
+
+    frontend fe_http
+        bind :8080
+        mode http
+        default_backend be_servers
+
+    backend be_servers
+        mode http
+        server s1 127.0.0.1:8001 check
+} -start
+
+client c1 -connect ${h1_fe_http_addr} {
+    txreq -url "/test"
+    rxresp
+    expect resp.status == 200
+} -run

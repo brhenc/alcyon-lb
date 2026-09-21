@@ -1,0 +1,77 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ibex-core",
+    "crates/ibex-ebtree",
+    "crates/ibex-stick-table",
+    "crates/ibex-peers",
+    "crates/ibex-parser",
+    "crates/ibex-tls",
+    "crates/ibex-config",
+    "crates/ibex-vtest",
+    "crates/ibex-runtime",
+    "crates/ibex-lb",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Ibex Team <engineering@project-ibex.internal>"]
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/project-ibex/ibex"
+rust-version = "1.80.0"
+
+[workspace.dependencies]
+# Internal workspace crates
+ibex-core = { path = "crates/ibex-core" }
+ibex-ebtree = { path = "crates/ibex-ebtree" }
+ibex-stick-table = { path = "crates/ibex-stick-table" }
+ibex-peers = { path = "crates/ibex-peers" }
+ibex-parser = { path = "crates/ibex-parser" }
+ibex-tls = { path = "crates/ibex-tls" }
+ibex-config = { path = "crates/ibex-config" }
+ibex-vtest = { path = "crates/ibex-vtest" }
+ibex-runtime = { path = "crates/ibex-runtime" }
+
+# Async & Networking
+tokio = { version = "1.40", features = ["full"] }
+async-trait = "0.1"
+bytes = "1.7"
+memchr = "2.7"
+arc-swap = "1.7"
+crossbeam-epoch = "0.9"
+crossbeam-utils = "0.8"
+
+# Parsing & Serialization
+nom = "7.1"
+thiserror = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# TLS & Cryptography
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+tokio-rustls = "0.26"
+
+# CLI & Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4.5", features = ["derive"] }
+
+# Testing & Verification
+proptest = "1.5"
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+missing_docs = "allow"
+dead_code = "allow"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Soft-realtime & NASA safety rules
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+similar_names = "allow"

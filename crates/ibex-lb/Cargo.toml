@@ -1,0 +1,28 @@
+[package]
+name = "ibex-lb"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ibex"
+path = "src/main.rs"
+
+[dependencies]
+ibex-core.workspace = true
+ibex-ebtree.workspace = true
+ibex-stick-table.workspace = true
+ibex-peers.workspace = true
+ibex-parser.workspace = true
+ibex-tls.workspace = true
+ibex-config.workspace = true
+ibex-vtest.workspace = true
+ibex-runtime.workspace = true
+tokio.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

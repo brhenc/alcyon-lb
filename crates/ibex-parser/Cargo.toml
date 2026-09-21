@@ -1,0 +1,15 @@
+[package]
+name = "ibex-parser"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+ibex-core.workspace = true
+bytes.workspace = true
+memchr.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true
