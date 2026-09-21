@@ -82,3 +82,69 @@ fn plaintext_bind_still_starts() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+// ---- connect retry turn-around delay ------------------------------------------------
+
+// HAProxy waits `MIN(1s, timeout connect)` before retrying the *same* server after an
+// asynchronous connect failure (`src/backend.c:2890`), because an instant retry almost
+// always reproduces the same error and burns the retry budget for nothing.
+// // The differential harness caught this: against HAProxy 3.5 the `server_refused`
+// scenario took ~2000ms across its retries while Ibex gave up in 152ms.
+
+use ibex_rt::proxy::{TcpSession, Timeouts};
+use ibex_sched::Tick;
+
+fn session_with(timeouts: Timeouts, retries: u16) -> TcpSession {
+    // A pipe gives us an owned fd without needing a socket peer.
+    // Any owned fd will do; the retry logic never touches the client socket.
+    let f = std::fs::File::open("/dev/null").expect("open /dev/null");
+    TcpSession::new(std::os::fd::OwnedFd::from(f), timeouts, retries, Tick(1000))
+}
+
+#[test]
+fn same_server_retry_waits_one_second_by_default() {
+    let mut s = session_with(Timeouts::default(), 3);
+    assert!(s.server_failed_at(Tick(1000), true), "a retry should remain");
+    assert_eq!(s.retry_delay_ms(), 1000, "default turn-around is 1s");
+    assert!(s.retry_pending(Tick(1500)), "must still be waiting mid-delay");
+    assert!(!s.retry_pending(Tick(2001)), "must be clear once the delay elapses");
+}
+
+#[test]
+fn turn_around_is_capped_by_a_shorter_connect_timeout() {
+    // MIN(1s, timeout connect). A 200ms connect timeout must not wait 1s to retry.
+    let t = Timeouts { client: 0, server: 0, connect: 200 };
+    let mut s = session_with(t, 3);
+    assert_eq!(s.retry_delay_ms(), 200);
+    assert!(s.server_failed_at(Tick(1000), true));
+    assert!(s.retry_pending(Tick(1100)));
+    assert!(!s.retry_pending(Tick(1201)), "capped delay must expire at 200ms");
+}
+
+#[test]
+fn a_longer_connect_timeout_does_not_extend_the_delay() {
+    let t = Timeouts { client: 0, server: 0, connect: 30_000 };
+    let s = session_with(t, 3);
+    assert_eq!(s.retry_delay_ms(), 1000, "1s is a ceiling, not a floor");
+}
+
+#[test]
+fn redispatch_to_a_different_server_retries_immediately() {
+    // The delay exists because retrying the same endpoint reproduces the same error.
+    // A different server has no such implication, so waiting would be pure latency.
+    let mut s = session_with(Timeouts::default(), 3);
+    assert!(s.server_failed_at(Tick(1000), false));
+    assert!(!s.retry_pending(Tick(1000)), "redispatch must not wait");
+}
+
+#[test]
+fn exhausting_retries_clears_the_delay() {
+    let mut s = session_with(Timeouts::default(), 1);
+    assert!(s.server_failed_at(Tick(1000), true), "one retry available");
+    assert!(!s.server_failed_at(Tick(1000), true), "now exhausted");
+    assert!(
+        !s.retry_pending(Tick(1000)),
+        "a session that has given up must not report a pending retry, or the caller \
+         will wait forever for a retry that will never happen"
+    );
+}

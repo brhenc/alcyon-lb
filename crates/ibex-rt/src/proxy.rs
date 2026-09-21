@@ -102,6 +102,13 @@ pub struct TcpSession {
     pub cli_exp: Tick,
     pub srv_exp: Tick,
     pub conn_exp: Tick,
+    /// Earliest tick at which a failed connect may be retried.
+    ///
+    /// HAProxy calls this the turn-around state (`SC_ST_TAR`). After an asynchronous
+    /// connect failure it waits `MIN(1s, timeout connect)` before retrying the *same*
+    /// server, because an instant retry almost always reproduces the same error and
+    /// just burns the retry budget. See `src/backend.c:2890`.
+    pub retry_after: Tick,
     pub bytes_in: u64,
     pub bytes_out: u64,
     pub ending: Option<Ending>,
@@ -169,6 +176,7 @@ impl TcpSession {
             rep: Buf::with_capacity(BUFSIZE),
             timeouts,
             conn_retries: retries,
+            retry_after: Tick::ETERNITY,
             cli_exp: Tick::ETERNITY,
             srv_exp: Tick::ETERNITY,
             conn_exp: Tick::ETERNITY,
@@ -238,18 +246,56 @@ impl TcpSession {
     }
 
     /// The server connection failed. Returns `true` if a retry remains.
-    pub fn server_failed(&mut self) -> bool {
+    ///
+    /// `same_server` says whether the next attempt will target the server that just
+    /// failed. When it does, a turn-around delay is armed; on redispatch to a different
+    /// server there is nothing to wait for, so the retry is immediate.
+    pub fn server_failed_at(&mut self, now: Tick, same_server: bool) -> bool {
         self.srv = None;
         self.conn_exp = Tick::ETERNITY;
         if self.conn_retries > 0 {
             self.conn_retries -= 1;
             self.srv_state = ScState::Init;
+            self.retry_after = if same_server {
+                now.add(self.retry_delay_ms())
+            } else {
+                Tick::ETERNITY
+            };
             true
         } else {
             self.srv_state = ScState::Error;
+            self.retry_after = Tick::ETERNITY;
             self.ending.get_or_insert(Ending::ConnectFailed);
             false
         }
+    }
+
+    /// Turn-around delay: `MIN(1s, timeout connect)`, matching `src/backend.c:2898`.
+    #[must_use]
+    pub fn retry_delay_ms(&self) -> u32 {
+        const DEFAULT_TURNAROUND_MS: u32 = 1000;
+        if self.timeouts.connect != 0 && self.timeouts.connect < DEFAULT_TURNAROUND_MS {
+            self.timeouts.connect
+        } else {
+            DEFAULT_TURNAROUND_MS
+        }
+    }
+
+    /// Whether a retry is still waiting out its turn-around delay.
+    ///
+    /// The caller must not open a new server connection while this is true; doing so
+    /// is exactly the back-to-back retry storm the delay exists to prevent.
+    #[must_use]
+    pub fn retry_pending(&self, now: Tick) -> bool {
+        self.retry_after.is_set() && !self.retry_after.is_expired(now)
+    }
+
+    /// Backwards-compatible immediate-retry form. Prefer [`Self::server_failed_at`],
+    /// which can arm the turn-around delay.
+    pub fn server_failed(&mut self) -> bool {
+        let now = Tick::ETERNITY;
+        let _ = now;
+        self.server_failed_at(Tick(1), false)
     }
 
     /// Injects or updates an HTTP header in the request buffer.
