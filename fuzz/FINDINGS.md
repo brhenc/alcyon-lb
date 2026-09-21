@@ -6,12 +6,12 @@ This report documents differential testing between the **Ibex HTTP/1 parser** (`
 
 - **Total Inputs Evaluated:** 295
 - **Accepted by Both Parsers:** 189
-- **Rejected by Both Parsers:** 21
-- **Total Disagreements Found:** 92
-- **Category 1 (Acceptance Disagreements):** 54
+- **Rejected by Both Parsers:** 61
+- **Total Disagreements Found:** 52
+- **Category 1 (Acceptance Disagreements):** 41
 - **Category 2 (Framing Disagreements):** 0
-- **Category 3 (Smuggling / Boundary Findings):** 13
-- **Self-Differential (Streaming Consistency):** 25
+- **Category 3 (Smuggling / Boundary Findings):** 11
+- **Self-Differential (Streaming Consistency):** 0
 
 ## Discrepancy Classification Framework
 
@@ -112,255 +112,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 ---
 
-### Finding 003: cl_te_multiple_te_headers
-
-- **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
-- **Ambiguity Class:** CL-TE / TE-CL Conflict
-- **Description:** Multiple Transfer-Encoding headers: first 'identity', second 'chunked' alongside Content-Length.
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 64 61  74 61 20 48 54 54 50 2f  |POST /data HTTP/|
-00000010: 31 2e 31 0d 0a 48 6f 73  74 3a 20 65 78 61 6d 70  |1.1..Host: examp|
-00000020: 6c 65 2e 63 6f 6d 0d 0a  43 6f 6e 74 65 6e 74 2d  |le.com..Content-|
-00000030: 4c 65 6e 67 74 68 3a 20  31 30 0d 0a 54 72 61 6e  |Length: 10..Tran|
-00000040: 73 66 65 72 2d 45 6e 63  6f 64 69 6e 67 3a 20 69  |sfer-Encoding: i|
-00000050: 64 65 6e 74 69 74 79 0d  0a 54 72 61 6e 73 66 65  |dentity..Transfe|
-00000060: 72 2d 45 6e 63 6f 64 69  6e 67 3a 20 63 68 75 6e  |r-Encoding: chun|
-00000070: 6b 65 64 0d 0a 0d 0a 35  0d 0a 68 65 6c 6c 6f 0d  |ked....5..hello.|
-00000080: 0a 30 0d 0a 0d 0a                                 |.0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `129 / 134`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/data`
-- **Body Length:** `10 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `false`
-- **HTTP Status Code:** `Some(422)`
-- **Forwarded to Backend:** `No (connection dropped or rejected with 400)`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-HAProxy detected trailing data as part of request body or corrupted the subsequent pipelined request boundary.
-
----
-
-### Finding 004: te_trailing_identity
-
-- **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
-- **Ambiguity Class:** Transfer-Encoding Formatting & Casing
-- **Description:** Transfer-Encoding: chunked, identity (RFC 9112 §6.1 invalid final encoding).
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 74 72  61 69 6c 69 6e 67 2d 69  |POST /trailing-i|
-00000010: 64 20 48 54 54 50 2f 31  2e 31 0d 0a 48 6f 73 74  |d HTTP/1.1..Host|
-00000020: 3a 20 65 78 61 6d 70 6c  65 2e 63 6f 6d 0d 0a 54  |: example.com..T|
-00000030: 72 61 6e 73 66 65 72 2d  45 6e 63 6f 64 69 6e 67  |ransfer-Encoding|
-00000040: 3a 20 63 68 75 6e 6b 65  64 2c 20 69 64 65 6e 74  |: chunked, ident|
-00000050: 69 74 79 0d 0a 0d 0a 35  0d 0a 68 65 6c 6c 6f 0d  |ity....5..hello.|
-00000060: 0a 30 0d 0a 0d 0a                                 |.0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `102 / 102`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/trailing-id`
-- **Body Length:** `5 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `false`
-- **HTTP Status Code:** `Some(400)`
-- **Forwarded to Backend:** `No (connection dropped or rejected with 400)`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Some(400), err=None
-
----
-
-### Finding 005: te_leading_identity
-
-- **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
-- **Ambiguity Class:** Transfer-Encoding Formatting & Casing
-- **Description:** Transfer-Encoding: identity, chunked.
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 6c 65  61 64 69 6e 67 2d 69 64  |POST /leading-id|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 54 72  | example.com..Tr|
-00000030: 61 6e 73 66 65 72 2d 45  6e 63 6f 64 69 6e 67 3a  |ansfer-Encoding:|
-00000040: 20 69 64 65 6e 74 69 74  79 2c 20 63 68 75 6e 6b  | identity, chunk|
-00000050: 65 64 0d 0a 0d 0a 35 0d  0a 68 65 6c 6c 6f 0d 0a  |ed....5..hello..|
-00000060: 30 0d 0a 0d 0a                                    |0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `101 / 101`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/leading-id`
-- **Body Length:** `5 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `false`
-- **HTTP Status Code:** `Some(422)`
-- **Forwarded to Backend:** `No (connection dropped or rejected with 400)`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Some(422), err=None
-
----
-
-### Finding 006: te_prefix_unknown_encoding
-
-- **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
-- **Ambiguity Class:** Transfer-Encoding Formatting & Casing
-- **Description:** Transfer-Encoding containing chunked substring in unrecognized token: 'not-chunked'.
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 74 65  2d 75 6e 6b 6e 6f 77 6e  |POST /te-unknown|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 54 72  | example.com..Tr|
-00000030: 61 6e 73 66 65 72 2d 45  6e 63 6f 64 69 6e 67 3a  |ansfer-Encoding:|
-00000040: 20 6e 6f 74 2d 63 68 75  6e 6b 65 64 0d 0a 0d 0a  | not-chunked....|
-00000050: 35 0d 0a 68 65 6c 6c 6f  0d 0a 30 0d 0a 0d 0a     |5..hello..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `95 / 95`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/te-unknown`
-- **Body Length:** `5 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `false`
-- **HTTP Status Code:** `Some(400)`
-- **Forwarded to Backend:** `No (connection dropped or rejected with 400)`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Some(400), err=None
-
----
-
-### Finding 007: obs_fold_first_line
-
-- **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
-- **Ambiguity Class:** Obs-Fold Continuation Lines
-- **Description:** Obs-fold immediately after request line (no preceding header).
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 47 45 54 20 2f 6f 62 73  2d 66 69 72 73 74 20 48  |GET /obs-first H|
-00000010: 54 54 50 2f 31 2e 31 0d  0a 20 66 6f 6c 64 65 64  |TTP/1.1.. folded|
-00000020: 2d 77 69 74 68 6f 75 74  2d 68 65 61 64 65 72 3a  |-without-header:|
-00000030: 20 76 61 6c 75 65 0d 0a  48 6f 73 74 3a 20 65 78  | value..Host: ex|
-00000040: 61 6d 70 6c 65 2e 63 6f  6d 0d 0a 0d 0a           |ample.com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `77 / 77`
-- **Parsed Method:** `GET`
-- **Parsed URI:** `/obs-first`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `false`
-- **HTTP Status Code:** `Some(400)`
-- **Forwarded to Backend:** `No (connection dropped or rejected with 400)`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Some(400), err=None
-
----
-
-### Finding 008: line_term_cr_only
-
-- **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
-- **Ambiguity Class:** Line Terminator Variations (CR/LF)
-- **Description:** HTTP request using CR-only (\r) line endings throughout.
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 47 45 54 20 2f 63 72 2d  6f 6e 6c 79 20 48 54 54  |GET /cr-only HTT|
-00000010: 50 2f 31 2e 31 0d 48 6f  73 74 3a 20 65 78 61 6d  |P/1.1.Host: exam|
-00000020: 70 6c 65 2e 63 6f 6d 0d  58 2d 48 65 61 64 65 72  |ple.com.X-Header|
-00000030: 3a 20 76 61 6c 75 65 0d  0d                       |: value..|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `57 / 57`
-- **Parsed Method:** `GET`
-- **Parsed URI:** `/cr-only`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `false`
-- **HTTP Status Code:** `Some(400)`
-- **Forwarded to Backend:** `No (connection dropped or rejected with 400)`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Some(400), err=None
-
----
-
-### Finding 009: line_term_doubled_crlf_before_headers
+### Finding 003: line_term_doubled_crlf_before_headers
 
 - **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Line Terminator Variations (CR/LF)
@@ -400,48 +152,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 ---
 
-### Finding 010: chunk_signed_plus
-
-- **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
-- **Ambiguity Class:** Chunk Size & Extensions
-- **Description:** Chunk size formatted with leading '+' sign (+5).
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 68  75 6e 6b 2d 70 6c 75 73  |POST /chunk-plus|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 54 72  | example.com..Tr|
-00000030: 61 6e 73 66 65 72 2d 45  6e 63 6f 64 69 6e 67 3a  |ansfer-Encoding:|
-00000040: 20 63 68 75 6e 6b 65 64  0d 0a 0d 0a 2b 35 0d 0a  | chunked....+5..|
-00000050: 68 65 6c 6c 6f 0d 0a 30  0d 0a 0d 0a              |hello..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `92 / 92`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/chunk-plus`
-- **Body Length:** `5 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `false`
-- **HTTP Status Code:** `Some(400)`
-- **Forwarded to Backend:** `No (connection dropped or rejected with 400)`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Some(400), err=None
-
----
-
-### Finding 011: chunk_whitespace_around_size
+### Finding 004: chunk_whitespace_around_size
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Chunk Size & Extensions
@@ -482,7 +193,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 012: header_space_before_colon
+### Finding 005: header_space_before_colon
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Header Name Malformations
@@ -522,7 +233,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 013: header_tab_before_colon
+### Finding 006: header_tab_before_colon
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Header Name Malformations
@@ -562,7 +273,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 014: header_nul_in_name
+### Finding 007: header_nul_in_name
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Header Name Malformations
@@ -602,7 +313,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 015: header_nul_in_value
+### Finding 008: header_nul_in_value
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Header Name Malformations
@@ -642,7 +353,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 016: header_empty_name
+### Finding 009: header_empty_name
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Header Name Malformations
@@ -682,7 +393,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 017: oversized_header_count_120
+### Finding 010: oversized_header_count_120
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Oversized Headers & Limits
@@ -954,7 +665,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 018: oversized_header_name_300b
+### Finding 011: oversized_header_name_300b
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Oversized Headers & Limits
@@ -1012,44 +723,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 019: mutated_startline_2
-
-- **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized start-line DELETE / 
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 44 45 4c 45 54 45 20 2f  0d 0d 0a 48 6f 73 74 3a  |DELETE /...Host:|
-00000010: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 0d 0a  | example.com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `11 / 32`
-- **Parsed Method:** `DELETE`
-- **Parsed URI:** `/`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `false`
-- **HTTP Status Code:** `Some(400)`
-- **Forwarded to Backend:** `No (connection dropped or rejected with 400)`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Full-buffer parse succeeded/failed differently than byte-by-byte incremental stream.
-
----
-
-### Finding 020: mutated_base_3_oversized_header_count_120
+### Finding 012: mutated_base_3_oversized_header_count_120
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -1321,46 +995,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 021: mutated_startline_6
-
-- **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized start-line PROPFIND /api/v1/resource HTTP/9.9
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 52 4f 50 46 49 4e 44  20 2f 61 70 69 2f 76 31  |PROPFIND /api/v1|
-00000010: 2f 72 65 73 6f 75 72 63  65 20 48 54 54 50 2f 39  |/resource HTTP/9|
-00000020: 2e 39 0d 0d 0a 48 6f 73  74 3a 20 65 78 61 6d 70  |.9...Host: examp|
-00000030: 6c 65 2e 63 6f 6d 0d 0a  0d 0a                    |le.com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `37 / 58`
-- **Parsed Method:** `PROPFIND`
-- **Parsed URI:** `/api/v1/resource`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `false`
-- **HTTP Status Code:** `Some(400)`
-- **Forwarded to Backend:** `No (connection dropped or rejected with 400)`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Full-buffer parse succeeded/failed differently than byte-by-byte incremental stream.
-
----
-
-### Finding 022: mutated_headers_ws_9
+### Finding 013: mutated_headers_ws_9
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -1408,7 +1043,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 023: mutated_base_10_cl_te_conflicting_lengths_te_cl_smuggle
+### Finding 014: mutated_base_10_cl_te_conflicting_lengths_te_cl_smuggle
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -1451,88 +1086,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 024: mutated_startline_11
-
-- **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized start-line PUT /%20encoded%20 HTTP/1.2
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 55 54 20 2f 25 32 30  65 6e 63 6f 64 65 64 25  |PUT /%20encoded%|
-00000010: 32 30 20 48 54 54 50 2f  31 2e 32 0d 0d 0a 48 6f  |20 HTTP/1.2...Ho|
-00000020: 73 74 3a 20 65 78 61 6d  70 6c 65 2e 63 6f 6d 0d  |st: example.com.|
-00000030: 0a 0d 0a                                          |...|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `30 / 51`
-- **Parsed Method:** `PUT`
-- **Parsed URI:** `/%20encoded%20`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `false`
-- **HTTP Status Code:** `Some(400)`
-- **Forwarded to Backend:** `No (connection dropped or rejected with 400)`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Full-buffer parse succeeded/failed differently than byte-by-byte incremental stream.
-
----
-
-### Finding 025: mutated_base_16_te_leading_identity
-
-- **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Mutated byte in te_leading_identity
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 20 65  61 64 69 6e 67 2d 69 64  |POST / eading-id|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 54 72  | example.com..Tr|
-00000030: 61 6e 73 66 65 72 2d 45  6e 63 6f 64 69 6e 67 3a  |ansfer-Encoding:|
-00000040: 20 69 64 65 6e 74 69 74  79 2c 20 63 68 75 6e 6b  | identity, chunk|
-00000050: 65 64 0d 0a 0d 0a 35 0d  0a 68 65 6c 6c 6f 0d 0a  |ed....5..hello..|
-00000060: 30 0d 0a 0d 0a                                    |0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `101 / 101`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/`
-- **Body Length:** `5 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `false`
-- **HTTP Status Code:** `Some(400)`
-- **Forwarded to Backend:** `No (connection dropped or rejected with 400)`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Some(400), err=None
-
----
-
-### Finding 026: mutated_headers_ws_17
+### Finding 015: mutated_headers_ws_17
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -1577,7 +1131,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 027: mutated_headers_ws_20
+### Finding 016: mutated_headers_ws_20
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -1618,7 +1172,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 028: mutated_headers_ws_21
+### Finding 017: mutated_headers_ws_21
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -1663,7 +1217,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 029: mutated_headers_ws_27
+### Finding 018: mutated_headers_ws_27
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -1710,45 +1264,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 030: mutated_startline_28
-
-- **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized start-line GET /%20encoded%20 
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 47 45 54 20 2f 25 32 30  65 6e 63 6f 64 65 64 25  |GET /%20encoded%|
-00000010: 32 30 0d 0d 0a 48 6f 73  74 3a 20 65 78 61 6d 70  |20...Host: examp|
-00000020: 6c 65 2e 63 6f 6d 0d 0a  0d 0a                    |le.com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `21 / 42`
-- **Parsed Method:** `GET`
-- **Parsed URI:** `/%20encoded%20`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `false`
-- **HTTP Status Code:** `Some(400)`
-- **Forwarded to Backend:** `No (connection dropped or rejected with 400)`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Full-buffer parse succeeded/failed differently than byte-by-byte incremental stream.
-
----
-
-### Finding 031: mutated_headers_ws_29
+### Finding 019: mutated_headers_ws_29
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -1792,7 +1308,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 032: mutated_base_35_pipelined_body_underflow_smuggle
+### Finding 020: mutated_base_35_pipelined_body_underflow_smuggle
 
 - **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -1836,7 +1352,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 ---
 
-### Finding 033: mutated_headers_ws_42
+### Finding 021: mutated_headers_ws_42
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -1879,7 +1395,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 034: mutated_headers_ws_43
+### Finding 022: mutated_headers_ws_43
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -1924,7 +1440,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 035: mutated_headers_ws_45
+### Finding 023: mutated_headers_ws_45
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -1971,124 +1487,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 036: mutated_base_50_chunk_signed_plus
-
-- **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Mutated byte in chunk_signed_plus
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 68  75 6e 6b 2d 70 6c 75 73  |POST /chunk-plus|
-00000010: 20 48 54 54 50 2f 31 2e  3a 0d 0a 48 6f 73 74 3a  | HTTP/1.:..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 54 72  | example.com..Tr|
-00000030: 61 6e 73 66 65 72 2d 45  6e 63 6f 64 69 6e 67 3a  |ansfer-Encoding:|
-00000040: 20 63 68 75 6e 6b 65 64  0d 0a 0d 0a 2b 35 0d 0a  | chunked....+5..|
-00000050: 68 65 6c 6c 6f 0d 0a 30  0d 0a 0d 0a              |hello..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `92 / 92`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/chunk-plus`
-- **Body Length:** `5 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `false`
-- **HTTP Status Code:** `Some(400)`
-- **Forwarded to Backend:** `No (connection dropped or rejected with 400)`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Some(400), err=None
-
----
-
-### Finding 037: mutated_startline_52
-
-- **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized start-line POST / HTTP/0.9
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 20 48  54 54 50 2f 30 2e 39 0d  |POST / HTTP/0.9.|
-00000010: 0d 0a 48 6f 73 74 3a 20  65 78 61 6d 70 6c 65 2e  |..Host: example.|
-00000020: 63 6f 6d 0d 0a 0d 0a                              |com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `18 / 39`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `false`
-- **HTTP Status Code:** `Some(400)`
-- **Forwarded to Backend:** `No (connection dropped or rejected with 400)`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Full-buffer parse succeeded/failed differently than byte-by-byte incremental stream.
-
----
-
-### Finding 038: mutated_startline_53
-
-- **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized start-line PUT /index.html HTTP/1.1
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 55 54 20 2f 69 6e 64  65 78 2e 68 74 6d 6c 20  |PUT /index.html |
-00000010: 48 54 54 50 2f 31 2e 31  0d 0d 0a 48 6f 73 74 3a  |HTTP/1.1...Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 0d 0a  | example.com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `27 / 48`
-- **Parsed Method:** `PUT`
-- **Parsed URI:** `/index.html`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `false`
-- **HTTP Status Code:** `Some(400)`
-- **Forwarded to Backend:** `No (connection dropped or rejected with 400)`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Full-buffer parse succeeded/failed differently than byte-by-byte incremental stream.
-
----
-
-### Finding 039: mutated_headers_ws_67
+### Finding 024: mutated_headers_ws_67
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -2129,7 +1528,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 040: mutated_headers_ws_68
+### Finding 025: mutated_headers_ws_68
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -2172,46 +1571,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 041: mutated_startline_69
-
-- **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized start-line GET /api/v1/resource HTTP/1.2
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 47 45 54 20 2f 61 70 69  2f 76 31 2f 72 65 73 6f  |GET /api/v1/reso|
-00000010: 75 72 63 65 20 48 54 54  50 2f 31 2e 32 0d 0d 0a  |urce HTTP/1.2...|
-00000020: 48 6f 73 74 3a 20 65 78  61 6d 70 6c 65 2e 63 6f  |Host: example.co|
-00000030: 6d 0d 0a 0d 0a                                    |m....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `32 / 53`
-- **Parsed Method:** `GET`
-- **Parsed URI:** `/api/v1/resource`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `false`
-- **HTTP Status Code:** `Some(400)`
-- **Forwarded to Backend:** `No (connection dropped or rejected with 400)`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Full-buffer parse succeeded/failed differently than byte-by-byte incremental stream.
-
----
-
-### Finding 042: mutated_headers_ws_74
+### Finding 026: mutated_headers_ws_74
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -2256,7 +1616,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 043: mutated_base_76_oversized_uri_4k
+### Finding 027: mutated_base_76_oversized_uri_4k
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -2550,164 +1910,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 044: mutated_startline_82
-
-- **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized start-line INVALID_METHOD / bad HTTP/9.9
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 49 4e 56 41 4c 49 44 5f  4d 45 54 48 4f 44 20 2f  |INVALID_METHOD /|
-00000010: 00 62 61 64 20 48 54 54  50 2f 39 2e 39 0d 0d 0a  |.bad HTTP/9.9...|
-00000020: 48 6f 73 74 3a 20 65 78  61 6d 70 6c 65 2e 63 6f  |Host: example.co|
-00000030: 6d 0d 0a 0d 0a                                    |m....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `32 / 53`
-- **Parsed Method:** `INVALID_METHOD`
-- **Parsed URI:** `/ bad`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `false`
-- **HTTP Status Code:** `Some(400)`
-- **Forwarded to Backend:** `No (connection dropped or rejected with 400)`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Full-buffer parse succeeded/failed differently than byte-by-byte incremental stream.
-
----
-
-### Finding 045: mutated_startline_87
-
-- **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized start-line DELETE /index.html HTTP/2.0
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 44 45 4c 45 54 45 20 2f  69 6e 64 65 78 2e 68 74  |DELETE /index.ht|
-00000010: 6d 6c 20 48 54 54 50 2f  32 2e 30 0d 48 6f 73 74  |ml HTTP/2.0.Host|
-00000020: 3a 20 65 78 61 6d 70 6c  65 2e 63 6f 6d 0d 0a 0d  |: example.com...|
-00000030: 0a                                                |.|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `49 / 49`
-- **Parsed Method:** `DELETE`
-- **Parsed URI:** `/index.html`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `false`
-- **HTTP Status Code:** `Some(400)`
-- **Forwarded to Backend:** `No (connection dropped or rejected with 400)`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Full-buffer parse succeeded/failed differently than byte-by-byte incremental stream.
-
----
-
-### Finding 046: mutated_base_88_te_prefix_unknown_encoding
-
-- **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Mutated byte in te_prefix_unknown_encoding
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 74 65  2d 75 6e 6b 6e 6f 77 6e  |POST /te-unknown|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 54 72  | example.com..Tr|
-00000030: 61 6e 73 66 65 72 2d 45  6e 63 6f 64 69 6e 67 3a  |ansfer-Encoding:|
-00000040: 20 6e 6f 74 00 63 68 75  6e 6b 65 64 0d 0a 0d 0a  | not.chunked....|
-00000050: 35 0d 0a 68 65 6c 6c 6f  0d 0a 30 0d 0a 0d 0a     |5..hello..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `95 / 95`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/te-unknown`
-- **Body Length:** `5 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `false`
-- **HTTP Status Code:** `Some(400)`
-- **Forwarded to Backend:** `No (connection dropped or rejected with 400)`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Some(400), err=None
-
----
-
-### Finding 047: mutated_startline_95
-
-- **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized start-line PUT / bad HTTP/1.2
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 55 54 20 2f 00 62 61  64 20 48 54 54 50 2f 31  |PUT /.bad HTTP/1|
-00000010: 2e 32 0d 0d 0a 48 6f 73  74 3a 20 65 78 61 6d 70  |.2...Host: examp|
-00000020: 6c 65 2e 63 6f 6d 0d 0a  0d 0a                    |le.com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `21 / 42`
-- **Parsed Method:** `PUT`
-- **Parsed URI:** `/ bad`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `false`
-- **HTTP Status Code:** `Some(400)`
-- **Forwarded to Backend:** `No (connection dropped or rejected with 400)`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Full-buffer parse succeeded/failed differently than byte-by-byte incremental stream.
-
----
-
-### Finding 048: mutated_base_102_line_term_lf_only
+### Finding 028: mutated_base_102_line_term_lf_only
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -2746,7 +1949,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 049: mutated_headers_ws_105
+### Finding 029: mutated_headers_ws_105
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -2787,7 +1990,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 050: mutated_base_107_line_term_doubled_crlf_before_headers
+### Finding 030: mutated_base_107_line_term_doubled_crlf_before_headers
 
 - **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -2825,7 +2028,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 ---
 
-### Finding 051: mutated_headers_ws_108
+### Finding 031: mutated_headers_ws_108
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -2873,45 +2076,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 052: mutated_startline_109
-
-- **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized start-line POST /index.html 
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 69 6e  64 65 78 2e 68 74 6d 6c  |POST /index.html|
-00000010: 0d 0d 0a 48 6f 73 74 3a  20 65 78 61 6d 70 6c 65  |...Host: example|
-00000020: 2e 63 6f 6d 0d 0a 0d 0a                           |.com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `19 / 40`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/index.html`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `false`
-- **HTTP Status Code:** `Some(400)`
-- **Forwarded to Backend:** `No (connection dropped or rejected with 400)`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Full-buffer parse succeeded/failed differently than byte-by-byte incremental stream.
-
----
-
-### Finding 053: mutated_startline_110
+### Finding 032: mutated_startline_110
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -2949,7 +2114,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 054: mutated_headers_ws_112
+### Finding 033: mutated_headers_ws_112
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -2994,7 +2159,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 055: mutated_base_115_baseline_simple_get
+### Finding 034: mutated_base_115_baseline_simple_get
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -3032,46 +2197,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 056: mutated_startline_117
-
-- **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized start-line PROPFIND /index.html HTTP/1.2
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 52 4f 50 46 49 4e 44  20 2f 69 6e 64 65 78 2e  |PROPFIND /index.|
-00000010: 68 74 6d 6c 20 48 54 54  50 2f 31 2e 32 0d 0d 0a  |html HTTP/1.2...|
-00000020: 48 6f 73 74 3a 20 65 78  61 6d 70 6c 65 2e 63 6f  |Host: example.co|
-00000030: 6d 0d 0a 0d 0a                                    |m....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `32 / 53`
-- **Parsed Method:** `PROPFIND`
-- **Parsed URI:** `/index.html`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `false`
-- **HTTP Status Code:** `Some(400)`
-- **Forwarded to Backend:** `No (connection dropped or rejected with 400)`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Full-buffer parse succeeded/failed differently than byte-by-byte incremental stream.
-
----
-
-### Finding 057: mutated_headers_ws_118
+### Finding 035: mutated_headers_ws_118
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -3112,45 +2238,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 058: mutated_startline_123
-
-- **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized start-line HEAD /%20encoded%20 
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 48 45 41 44 20 2f 25 32  30 65 6e 63 6f 64 65 64  |HEAD /%20encoded|
-00000010: 25 32 30 0d 0d 0a 48 6f  73 74 3a 20 65 78 61 6d  |%20...Host: exam|
-00000020: 70 6c 65 2e 63 6f 6d 0d  0a 0d 0a                 |ple.com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `22 / 43`
-- **Parsed Method:** `HEAD`
-- **Parsed URI:** `/%20encoded%20`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `false`
-- **HTTP Status Code:** `Some(400)`
-- **Forwarded to Backend:** `No (connection dropped or rejected with 400)`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Full-buffer parse succeeded/failed differently than byte-by-byte incremental stream.
-
----
-
-### Finding 059: mutated_base_126_header_tab_before_colon
+### Finding 036: mutated_base_126_header_tab_before_colon
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -3190,7 +2278,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 060: mutated_base_134_header_nul_in_value
+### Finding 037: mutated_base_134_header_nul_in_value
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -3230,7 +2318,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 061: mutated_cl_te_rand_138
+### Finding 038: mutated_cl_te_rand_138
 
 - **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -3274,84 +2362,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 ---
 
-### Finding 062: mutated_startline_139
-
-- **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized start-line DELETE /index.html HTTP/9.9
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 44 45 4c 45 54 45 20 2f  69 6e 64 65 78 2e 68 74  |DELETE /index.ht|
-00000010: 6d 6c 20 48 54 54 50 2f  39 2e 39 0d 0d 0a 48 6f  |ml HTTP/9.9...Ho|
-00000020: 73 74 3a 20 65 78 61 6d  70 6c 65 2e 63 6f 6d 0d  |st: example.com.|
-00000030: 0a 0d 0a                                          |...|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `30 / 51`
-- **Parsed Method:** `DELETE`
-- **Parsed URI:** `/index.html`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `false`
-- **HTTP Status Code:** `Some(400)`
-- **Forwarded to Backend:** `No (connection dropped or rejected with 400)`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Full-buffer parse succeeded/failed differently than byte-by-byte incremental stream.
-
----
-
-### Finding 063: mutated_startline_141
-
-- **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized start-line HEAD /index.html HTTP/0.9
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 48 45 41 44 20 2f 69 6e  64 65 78 2e 68 74 6d 6c  |HEAD /index.html|
-00000010: 20 48 54 54 50 2f 30 2e  39 0d 48 6f 73 74 3a 20  | HTTP/0.9.Host: |
-00000020: 65 78 61 6d 70 6c 65 2e  63 6f 6d 0d 0a 0d 0a     |example.com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `47 / 47`
-- **Parsed Method:** `HEAD`
-- **Parsed URI:** `/index.html`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `false`
-- **HTTP Status Code:** `Some(400)`
-- **Forwarded to Backend:** `No (connection dropped or rejected with 400)`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Full-buffer parse succeeded/failed differently than byte-by-byte incremental stream.
-
----
-
-### Finding 064: mutated_headers_ws_144
+### Finding 039: mutated_headers_ws_144
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -3396,7 +2407,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 065: mutated_base_160_pipelined_chunked_premature_end
+### Finding 040: mutated_base_160_pipelined_chunked_premature_end
 
 - **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -3439,165 +2450,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 ---
 
-### Finding 066: mutated_startline_163
-
-- **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized start-line GET /deep/nested/path?q=1&v=2 HTTP/1.1
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 47 45 54 20 2f 64 65 65  70 2f 6e 65 73 74 65 64  |GET /deep/nested|
-00000010: 2f 70 61 74 68 3f 71 3d  31 26 76 3d 32 20 48 54  |/path?q=1&v=2 HT|
-00000020: 54 50 2f 31 2e 31 0d 48  6f 73 74 3a 20 65 78 61  |TP/1.1.Host: exa|
-00000030: 6d 70 6c 65 2e 63 6f 6d  0d 0a 0d 0a              |mple.com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `60 / 60`
-- **Parsed Method:** `GET`
-- **Parsed URI:** `/deep/nested/path?q=1&v=2`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `false`
-- **HTTP Status Code:** `Some(400)`
-- **Forwarded to Backend:** `No (connection dropped or rejected with 400)`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Full-buffer parse succeeded/failed differently than byte-by-byte incremental stream.
-
----
-
-### Finding 067: mutated_base_164_chunk_signed_plus
-
-- **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Mutated byte in chunk_signed_plus
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 3a 2f 63 68  75 6e 6b 2d 70 6c 75 73  |POST:/chunk-plus|
-00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 54 72  | example.com..Tr|
-00000030: 61 6e 73 66 65 72 2d 45  6e 63 6f 64 69 6e 67 3a  |ansfer-Encoding:|
-00000040: 20 63 68 75 6e 6b 65 64  0d 0a 0d 0a 2b 35 0d 0a  | chunked....+5..|
-00000050: 68 65 6c 6c 6f 0d 0a 30  0d 0a 0d 0a              |hello..0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `92 / 92`
-- **Parsed Method:** `POST:/chunk-plus`
-- **Parsed URI:** `HTTP/1.1`
-- **Body Length:** `5 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `false`
-- **HTTP Status Code:** `Some(400)`
-- **Forwarded to Backend:** `No (connection dropped or rejected with 400)`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Some(400), err=None
-
----
-
-### Finding 068: mutated_startline_167
-
-- **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized start-line HEAD /deep/nested/path?q=1&v=2 HTTP/9.9
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 48 45 41 44 20 2f 64 65  65 70 2f 6e 65 73 74 65  |HEAD /deep/neste|
-00000010: 64 2f 70 61 74 68 3f 71  3d 31 26 76 3d 32 20 48  |d/path?q=1&v=2 H|
-00000020: 54 54 50 2f 39 2e 39 0d  0d 0a 48 6f 73 74 3a 20  |TTP/9.9...Host: |
-00000030: 65 78 61 6d 70 6c 65 2e  63 6f 6d 0d 0a 0d 0a     |example.com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `42 / 63`
-- **Parsed Method:** `HEAD`
-- **Parsed URI:** `/deep/nested/path?q=1&v=2`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `false`
-- **HTTP Status Code:** `Some(400)`
-- **Forwarded to Backend:** `No (connection dropped or rejected with 400)`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Full-buffer parse succeeded/failed differently than byte-by-byte incremental stream.
-
----
-
-### Finding 069: mutated_startline_171
-
-- **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized start-line INVALID_METHOD /index.html HTTP/1.0
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 49 4e 56 41 4c 49 44 5f  4d 45 54 48 4f 44 20 2f  |INVALID_METHOD /|
-00000010: 69 6e 64 65 78 2e 68 74  6d 6c 20 48 54 54 50 2f  |index.html HTTP/|
-00000020: 31 2e 30 0d 48 6f 73 74  3a 20 65 78 61 6d 70 6c  |1.0.Host: exampl|
-00000030: 65 2e 63 6f 6d 0d 0a 0d  0a                       |e.com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `57 / 57`
-- **Parsed Method:** `INVALID_METHOD`
-- **Parsed URI:** `/index.html`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `true`
-
-#### HAProxy Behavior
-
-- **Accepted:** `false`
-- **HTTP Status Code:** `Some(400)`
-- **Forwarded to Backend:** `No (connection dropped or rejected with 400)`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Full-buffer parse succeeded/failed differently than byte-by-byte incremental stream.
-
----
-
-### Finding 070: mutated_base_173_cl_te_conflicting_lengths_te_cl_smuggle
+### Finding 041: mutated_base_173_cl_te_conflicting_lengths_te_cl_smuggle
 
 - **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -3640,130 +2493,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 ---
 
-### Finding 071: mutated_startline_185
-
-- **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized start-line PUT /%20encoded%20 HTTP/2.0
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 55 54 20 2f 25 32 30  65 6e 63 6f 64 65 64 25  |PUT /%20encoded%|
-00000010: 32 30 20 48 54 54 50 2f  32 2e 30 0d 0d 0a 48 6f  |20 HTTP/2.0...Ho|
-00000020: 73 74 3a 20 65 78 61 6d  70 6c 65 2e 63 6f 6d 0d  |st: example.com.|
-00000030: 0a 0d 0a                                          |...|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `30 / 51`
-- **Parsed Method:** `PUT`
-- **Parsed URI:** `/%20encoded%20`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `false`
-- **HTTP Status Code:** `Some(400)`
-- **Forwarded to Backend:** `No (connection dropped or rejected with 400)`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Full-buffer parse succeeded/failed differently than byte-by-byte incremental stream.
-
----
-
-### Finding 072: mutated_base_190_obs_fold_first_line
-
-- **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Mutated byte in obs_fold_first_line
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 47 45 54 20 2f 6f 62 73  2d 66 69 72 73 74 20 48  |GET /obs-first H|
-00000010: 54 54 50 2f 31 2e 31 0d  0a 20 66 6f 6c 64 65 64  |TTP/1.1.. folded|
-00000020: 2d 77 69 20 68 6f 75 74  2d 68 65 61 64 65 72 3a  |-wi hout-header:|
-00000030: 20 76 61 6c 75 65 0d 0a  48 6f 73 74 3a 20 65 78  | value..Host: ex|
-00000040: 61 6d 70 6c 65 2e 63 6f  6d 0d 0a 0d 0a           |ample.com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `77 / 77`
-- **Parsed Method:** `GET`
-- **Parsed URI:** `/obs-first`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `false`
-- **HTTP Status Code:** `Some(400)`
-- **Forwarded to Backend:** `No (connection dropped or rejected with 400)`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Some(400), err=None
-
----
-
-### Finding 073: mutated_base_191_cl_te_multiple_te_headers
-
-- **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Mutated byte in cl_te_multiple_te_headers
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 64 61  74 61 20 48 54 54 50 2f  |POST /data HTTP/|
-00000010: 31 2e 31 0d 0a 48 6f 73  74 3a 20 65 78 61 6d 70  |1.1..Host: examp|
-00000020: 6c 65 2e 63 6f 6d 0d 0a  43 6f 6e 74 65 6e 74 2d  |le.com..Content-|
-00000030: 4c 65 6e 67 74 68 3a 20  31 30 0d 0a 54 72 61 6e  |Length: 10..Tran|
-00000040: 73 66 65 72 2d 45 6e 63  6f 64 69 6e 67 3a 20 69  |sfer-Encoding: i|
-00000050: 64 65 6e 74 69 74 79 0d  0a 54 72 61 6e 73 66 65  |dentity..Transfe|
-00000060: 72 2d 45 6e 63 6f 64 69  6e 67 3a 20 63 68 75 6e  |r-Encoding: chun|
-00000070: 6b 65 64 0d 0a 0d 0a 35  0d 0a 68 00 6c 6c 6f 0d  |ked....5..h.llo.|
-00000080: 0a 30 0d 0a 0d 0a                                 |.0....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `129 / 134`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/data`
-- **Body Length:** `10 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `false`
-- **HTTP Status Code:** `Some(422)`
-- **Forwarded to Backend:** `No (connection dropped or rejected with 400)`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-HAProxy detected trailing data as part of request body or corrupted the subsequent pipelined request boundary.
-
----
-
-### Finding 074: mutated_base_198_header_nul_in_name
+### Finding 042: mutated_base_198_header_nul_in_name
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -3803,84 +2533,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 075: mutated_startline_200
-
-- **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized start-line DELETE /api/v1/resource HTTP/1.1
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 44 45 4c 45 54 45 20 2f  61 70 69 2f 76 31 2f 72  |DELETE /api/v1/r|
-00000010: 65 73 6f 75 72 63 65 20  48 54 54 50 2f 31 2e 31  |esource HTTP/1.1|
-00000020: 0d 48 6f 73 74 3a 20 65  78 61 6d 70 6c 65 2e 63  |.Host: example.c|
-00000030: 6f 6d 0d 0a 0d 0a                                 |om....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `54 / 54`
-- **Parsed Method:** `DELETE`
-- **Parsed URI:** `/api/v1/resource`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `false`
-- **HTTP Status Code:** `Some(400)`
-- **Forwarded to Backend:** `No (connection dropped or rejected with 400)`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Full-buffer parse succeeded/failed differently than byte-by-byte incremental stream.
-
----
-
-### Finding 076: mutated_base_206_line_term_doubled_crlf_before_headers
-
-- **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Mutated byte in line_term_doubled_crlf_before_headers
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 47 45 54 20 2f 64 6f 75  62 6c 65 64 20 48 54 54  |GET /doubled HTT|
-00000010: 50 2f 31 2e 31 0d 0a 20  0a 48 6f 73 74 3a 20 65  |P/1.1.. .Host: e|
-00000020: 78 61 6d 70 6c 65 2e 63  6f 6d 0d 0a 0d 0a        |xample.com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `46 / 46`
-- **Parsed Method:** `GET`
-- **Parsed URI:** `/doubled`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `false`
-- **HTTP Status Code:** `Some(400)`
-- **Forwarded to Backend:** `No (connection dropped or rejected with 400)`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Some(400), err=None
-
----
-
-### Finding 077: mutated_base_208_obs_fold_tab_continuation
+### Finding 043: mutated_base_208_obs_fold_tab_continuation
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -3920,7 +2573,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 078: mutated_base_209_oversized_header_count_120
+### Finding 044: mutated_base_209_oversized_header_count_120
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -4192,7 +2845,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 079: mutated_base_211_duplicate_cl_identical
+### Finding 045: mutated_base_211_duplicate_cl_identical
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -4233,7 +2886,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Non
 
 ---
 
-### Finding 080: mutated_headers_ws_215
+### Finding 046: mutated_headers_ws_215
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -4277,206 +2930,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 081: mutated_startline_217
-
-- **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized start-line PATCH /api/v1/resource HTTP/1.1
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 41 54 43 48 20 2f 61  70 69 2f 76 31 2f 72 65  |PATCH /api/v1/re|
-00000010: 73 6f 75 72 63 65 20 48  54 54 50 2f 31 2e 31 0d  |source HTTP/1.1.|
-00000020: 48 6f 73 74 3a 20 65 78  61 6d 70 6c 65 2e 63 6f  |Host: example.co|
-00000030: 6d 0d 0a 0d 0a                                    |m....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `53 / 53`
-- **Parsed Method:** `PATCH`
-- **Parsed URI:** `/api/v1/resource`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `false`
-- **HTTP Status Code:** `Some(400)`
-- **Forwarded to Backend:** `No (connection dropped or rejected with 400)`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Full-buffer parse succeeded/failed differently than byte-by-byte incremental stream.
-
----
-
-### Finding 082: mutated_startline_218
-
-- **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized start-line DELETE /index.html HTTP/1.0
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 44 45 4c 45 54 45 20 2f  69 6e 64 65 78 2e 68 74  |DELETE /index.ht|
-00000010: 6d 6c 20 48 54 54 50 2f  31 2e 30 0d 0d 0a 48 6f  |ml HTTP/1.0...Ho|
-00000020: 73 74 3a 20 65 78 61 6d  70 6c 65 2e 63 6f 6d 0d  |st: example.com.|
-00000030: 0a 0d 0a                                          |...|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `30 / 51`
-- **Parsed Method:** `DELETE`
-- **Parsed URI:** `/index.html`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `true`
-
-#### HAProxy Behavior
-
-- **Accepted:** `false`
-- **HTTP Status Code:** `Some(400)`
-- **Forwarded to Backend:** `No (connection dropped or rejected with 400)`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Full-buffer parse succeeded/failed differently than byte-by-byte incremental stream.
-
----
-
-### Finding 083: mutated_startline_220
-
-- **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized start-line DELETE / HTTP/9.9
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 44 45 4c 45 54 45 20 2f  20 48 54 54 50 2f 39 2e  |DELETE / HTTP/9.|
-00000010: 39 0d 48 6f 73 74 3a 20  65 78 61 6d 70 6c 65 2e  |9.Host: example.|
-00000020: 63 6f 6d 0d 0a 0d 0a                              |com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `39 / 39`
-- **Parsed Method:** `DELETE`
-- **Parsed URI:** `/`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `false`
-- **HTTP Status Code:** `Some(400)`
-- **Forwarded to Backend:** `No (connection dropped or rejected with 400)`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Full-buffer parse succeeded/failed differently than byte-by-byte incremental stream.
-
----
-
-### Finding 084: mutated_base_221_cl_te_both_present_te_first
-
-- **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Mutated byte in cl_te_both_present_te_first
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 73 6d  75 67 67 6c 65 20 48 54  |POST /smuggle HT|
-00000010: 54 50 2f 31 2e 31 0d 0a  48 6f 73 74 3a 20 65 78  |TP/1.1..Host: ex|
-00000020: 61 6d 70 6c 65 2e 63 6f  6d 0d 0a 54 72 61 6e 73  |ample.com..Trans|
-00000030: 66 65 72 2d 45 6e 63 6f  64 69 6e 67 3a 20 63 68  |fer-Encoding: ch|
-00000040: 75 6e 6b 00 64 0d 0a 43  6f 6e 74 65 6e 74 2d 4c  |unk.d..Content-L|
-00000050: 65 6e 67 74 68 3a 20 36  0d 0a 0d 0a 30 0d 0a 0d  |ength: 6....0...|
-00000060: 0a 58                                             |.X|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `98 / 98`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/smuggle`
-- **Body Length:** `6 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `false`
-- **HTTP Status Code:** `Some(400)`
-- **Forwarded to Backend:** `No (connection dropped or rejected with 400)`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Some(400), err=None
-
----
-
-### Finding 085: mutated_base_226_duplicate_cl_identical
-
-- **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Mutated byte in duplicate_cl_identical
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 64 75  70 2d 63 6c 20 48 54 54  |POST /dup-cl HTT|
-00000010: 50 2f 31 2e 31 0d 0a 48  6f 73 74 3a 20 65 78 61  |P/1.1..Host: exa|
-00000020: 6d 70 6c 65 2e 63 6f 6d  0d 00 43 6f 6e 74 65 6e  |mple.com..Conten|
-00000030: 74 2d 4c 65 6e 67 74 68  3a 20 35 0d 0a 43 6f 6e  |t-Length: 5..Con|
-00000040: 74 65 6e 74 2d 4c 65 6e  67 74 68 3a 20 35 0d 0a  |tent-Length: 5..|
-00000050: 0d 0a 68 65 6c 6c 6f                              |..hello|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `87 / 87`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/dup-cl`
-- **Body Length:** `5 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `false`
-- **HTTP Status Code:** `Some(400)`
-- **Forwarded to Backend:** `No (connection dropped or rejected with 400)`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Full-buffer parse succeeded/failed differently than byte-by-byte incremental stream.
-
----
-
-### Finding 086: mutated_base_227_te_prefix_unknown_encoding
+### Finding 047: mutated_base_227_te_prefix_unknown_encoding
 
 - **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -4517,7 +2971,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 ---
 
-### Finding 087: mutated_headers_ws_230
+### Finding 048: mutated_headers_ws_230
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -4565,7 +3019,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 088: mutated_headers_ws_233
+### Finding 049: mutated_headers_ws_233
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -4610,46 +3064,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 089: mutated_startline_240
-
-- **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
-- **Ambiguity Class:** Combinatorial Mutations
-- **Description:** Randomized start-line DELETE /deep/nested/path?q=1&v=2 HTTP/0.9
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 44 45 4c 45 54 45 20 2f  64 65 65 70 2f 6e 65 73  |DELETE /deep/nes|
-00000010: 74 65 64 2f 70 61 74 68  3f 71 3d 31 26 76 3d 32  |ted/path?q=1&v=2|
-00000020: 20 48 54 54 50 2f 30 2e  39 0d 48 6f 73 74 3a 20  | HTTP/0.9.Host: |
-00000030: 65 78 61 6d 70 6c 65 2e  63 6f 6d 0d 0a 0d 0a     |example.com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `63 / 63`
-- **Parsed Method:** `DELETE`
-- **Parsed URI:** `/deep/nested/path?q=1&v=2`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `false`
-- **HTTP Status Code:** `Some(400)`
-- **Forwarded to Backend:** `No (connection dropped or rejected with 400)`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Full-buffer parse succeeded/failed differently than byte-by-byte incremental stream.
-
----
-
-### Finding 090: mutated_headers_ws_245
+### Finding 050: mutated_headers_ws_245
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -4696,7 +3111,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 091: mutated_base_247_pipelined_standard_two_requests
+### Finding 051: mutated_base_247_pipelined_standard_two_requests
 
 - **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -4738,7 +3153,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 ---
 
-### Finding 092: mutated_base_248_cl_comma_separated_conflicting
+### Finding 052: mutated_base_248_cl_comma_separated_conflicting
 
 - **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Combinatorial Mutations

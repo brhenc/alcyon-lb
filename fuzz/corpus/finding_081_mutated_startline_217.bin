@@ -1,2 +1,0 @@
-PATCH /api/v1/resource HTTP/1.1Host: example.com
-

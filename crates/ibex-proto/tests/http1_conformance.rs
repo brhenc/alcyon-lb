@@ -499,17 +499,32 @@ fn test_header_lf_only() {
 }
 
 #[test]
-fn test_header_cr_only() {
+fn test_header_cr_only_is_rejected() {
+    // A CR not followed by LF is not a line terminator. This test previously asserted
+    // that Ibex accepted CR-only framing and normalised it to CRLF; verified against a
+    // live HAProxy 3.5, that input gets 400 Bad request.
+    //
+    // Accepting it is worse than merely lenient: a hop that disagrees about where lines
+    // end disagrees about where the message ends, which is a desync primitive.
     let wire = b"GET /cr-only HTTP/1.1\rHost: example.net\rX-Header: cr_val\r\r";
     let mut parser = H1Parser::new(false);
     let mut htx = Htx::new();
 
-    let consumed = parser.parse(wire, &mut htx).expect("parse cr only");
+    assert!(
+        parser.parse(wire, &mut htx).is_err(),
+        "bare-CR framing must be rejected, as HAProxy 3.5 does"
+    );
+}
+
+#[test]
+fn test_header_crlf_still_normalizes() {
+    let wire = b"GET /cr-only HTTP/1.1\r\nHost: example.net\r\nX-Header: cr_val\r\n\r\n";
+    let mut parser = H1Parser::new(false);
+    let mut htx = Htx::new();
+    let consumed = parser.parse(wire, &mut htx).expect("parse crlf");
     assert_eq!(consumed, wire.len());
     assert_eq!(parser.phase, H1Phase::Done);
-    assert_eq!(htx.req_line().unwrap().uri, "/cr-only");
     assert_eq!(htx.get_header("host"), Some("example.net"));
-    assert_eq!(htx.get_header("x-header"), Some("cr_val"));
 
     // Verify wire serialization normalizes to canonical CRLF
     let wire_out = htx.to_h1_wire();

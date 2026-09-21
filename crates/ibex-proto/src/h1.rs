@@ -154,6 +154,10 @@ impl H1Parser {
                     if buf[i + 1] == b'\n' {
                         return Some((i, 2));
                     }
+                    // A CR not followed by LF is not a line terminator. Recognising it
+                    // as one lets `GET / HTTP/1.1\rHost: h\r\r` parse, which HAProxy 3.5
+                    // answers 400 to -- and a hop that disagrees about where lines end
+                    // disagrees about where the message ends.
                     self.saw_bare_cr = true;
                     return Some((i, 1));
                 }
@@ -196,6 +200,14 @@ impl H1Parser {
             return Ok(0);
         };
 
+        if self.saw_bare_cr {
+            self.phase = H1Phase::Error;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bare CR is not a line terminator",
+            ));
+        }
+
         if line_end == 0 {
             // Empty line -> End of headers
             htx.push(HtxBlock::Eoh);
@@ -210,15 +222,24 @@ impl H1Parser {
                         io::Error::new(io::ErrorKind::InvalidData, "Invalid folded header")
                     })?
                     .trim();
-                if let Some(HtxBlock::Header(prev)) = htx
+                // A continuation line must continue something. An obs-fold as the
+                // first header line has no preceding field to attach to, and silently
+                // dropping it means a hop that *does* attach it sees a different
+                // message. HAProxy 3.5 answers 400 to this.
+                let Some(HtxBlock::Header(prev)) = htx
                     .blocks_mut()
                     .iter_mut()
                     .rev()
                     .find(|b| matches!(b, HtxBlock::Header(_)))
-                {
-                    prev.value.push(' ');
-                    prev.value.push_str(folded_val);
-                }
+                else {
+                    self.phase = H1Phase::Error;
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "obs-fold continuation with no preceding header",
+                    ));
+                };
+                prev.value.push(' ');
+                prev.value.push_str(folded_val);
                 return Ok(line_end + delim_len);
             }
 
@@ -357,7 +378,29 @@ impl H1Parser {
         self.content_length = seen_cl;
 
         if let Some(te) = htx.get_header("transfer-encoding") {
-            if te.to_ascii_lowercase().contains("chunked") {
+            // RFC 9112 6.1: every transfer-coding must be one we understand, and
+            // `chunked` must come last. Anything else is unframeable and must be
+            // refused rather than guessed at.
+            //
+            // Verified against HAProxy 3.5, which answers 400 to
+            // "chunked, identity" and to an unknown coding, and 422 to
+            // "identity, chunked". `identity` is not a transfer-coding in HTTP/1.1.
+            let lower = te.to_ascii_lowercase();
+            let codings: Vec<&str> = lower.split(',').map(str::trim).collect();
+            let unknown = codings
+                .iter()
+                .any(|c| !matches!(*c, "chunked" | "gzip" | "deflate" | "compress" | ""));
+            let chunked_last = codings.last().is_some_and(|c| *c == "chunked");
+            let chunked_count = codings.iter().filter(|c| **c == "chunked").count();
+
+            if unknown || chunked_count > 1 || (chunked_count == 1 && !chunked_last) {
+                self.phase = H1Phase::Error;
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid Transfer-Encoding",
+                ));
+            }
+            if chunked_last {
                 self.is_chunked = true;
             }
         }
@@ -507,6 +550,16 @@ impl H1Parser {
             let len_str = std::str::from_utf8(&input[cursor..cursor + line_end])
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid chunk len"))?;
             let len_part = len_str.split(';').next().unwrap_or("").trim();
+            // Hex digits only. `from_str_radix` accepts a leading '+' or '-', so
+            // `+5\r\n` would parse as chunk size 5 -- HAProxy 3.5 answers 400 to that,
+            // and a size a peer reads differently is a desync primitive.
+            if len_part.is_empty() || !len_part.bytes().all(|b| b.is_ascii_hexdigit()) {
+                self.phase = H1Phase::Error;
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid chunk size",
+                ));
+            }
             let chunk_size = usize::from_str_radix(len_part, 16).map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidData, "Invalid hex chunk size")
             })?;
