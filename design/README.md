@@ -17,7 +17,8 @@ read from that tree. When a claim here is about HAProxy, it has a file:line behi
 | 004 | [Elastic binary trees](004-ebtree.md) — design, and the arena/tagged-index translation | analysed, **to build** |
 | 005 | [Sprint plan and delegation contract](005-sprint-plan.md) | active |
 | 006 | [Data layout and observability tiers](006-data-layout.md) — measured sizes, why an enum beats a function pointer, debug/production tiering | analysed |
-| 007 | Sample / converter / matcher lattice | after the scheduler |
+| 007 | [Sample / converter / matcher lattice](007-sample-lattice.md) — three registries, and why 3 of HAProxy's 10 types are not types | designed |
+| 008 | [TCP first](008-tcp-first.md) — HAProxy 1.0 (3047 lines) as scope anchor and live test oracle | **next** |
 
 ## Decisions taken
 
@@ -46,6 +47,12 @@ read from that tree. When a claim here is about HAProxy, it has a file:line behi
   and a stats page that works with (a lightly modified) hatop.
 
 ## Build order
+
+**Milestone 0 is `mode tcp` at HAProxy 1.0 feature parity** — see [008](008-tcp-first.md).
+A TCP proxy exercises every layer without a line of HTTP parsing, and 1.0 is small
+enough (3047 lines, one file) to serve as a behavioural oracle rather than just a
+reference.
+
 
 1. ebtree (004) — everything else sits on it
 2. scheduler (003) — task/tasklet, run queue, wait queue, class budgets
