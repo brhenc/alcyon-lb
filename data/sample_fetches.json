@@ -1,0 +1,5132 @@
+[
+  {
+    "keyword": "51d.all",
+    "process": "_51d_fetch",
+    "arg_mask": "ARG5(1,STR,STR,STR,STR,STR)",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_HRQHV",
+    "file": "addons/51degrees/51d.c",
+    "line": 1172
+  },
+  {
+    "keyword": "da-csv-fetch",
+    "process": "da_haproxy_fetch",
+    "arg_mask": "ARG12(1,STR,STR,STR,STR,STR,STR,STR,STR,STR,STR,STR,STR)",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_HRQHV",
+    "file": "addons/deviceatlas/da.c",
+    "line": 559
+  },
+  {
+    "keyword": "wurfl-get-all",
+    "process": "ha_wurfl_get_all",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_HRQHV",
+    "file": "addons/wurfl/wurfl.c",
+    "line": 632
+  },
+  {
+    "keyword": "wurfl-get",
+    "process": "ha_wurfl_get",
+    "arg_mask": "ARG12(1,STR,STR,STR,STR,STR,STR,STR,STR,STR,STR,STR,STR)",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_HRQHV",
+    "file": "addons/wurfl/wurfl.c",
+    "line": 633
+  },
+  {
+    "keyword": "acl",
+    "process": "smp_fetch_acl",
+    "arg_mask": "ARG12(1,STR,STR,STR,STR,STR,STR,STR,STR,STR,STR,STR,STR)",
+    "out_type": "SMP_T_BOOL",
+    "valid_where": "SMP_USE_CONST",
+    "file": "src/acl.c",
+    "line": 1411
+  },
+  {
+    "keyword": "avg_queue",
+    "process": "smp_fetch_avg_queue_size",
+    "arg_mask": "ARG1(1,BE)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/backend.c",
+    "line": 3956
+  },
+  {
+    "keyword": "be_conn",
+    "process": "smp_fetch_be_conn",
+    "arg_mask": "ARG1(1,BE)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/backend.c",
+    "line": 3957
+  },
+  {
+    "keyword": "be_conn_free",
+    "process": "smp_fetch_be_conn_free",
+    "arg_mask": "ARG1(1,BE)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/backend.c",
+    "line": 3958
+  },
+  {
+    "keyword": "be_id",
+    "process": "smp_fetch_be_id",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_BKEND",
+    "file": "src/backend.c",
+    "line": 3959
+  },
+  {
+    "keyword": "be_name",
+    "process": "smp_fetch_be_name",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_BKEND",
+    "file": "src/backend.c",
+    "line": 3960
+  },
+  {
+    "keyword": "be_connect_timeout",
+    "process": "smp_fetch_be_connect_timeout",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_BKEND",
+    "file": "src/backend.c",
+    "line": 3961
+  },
+  {
+    "keyword": "be_max_retries",
+    "process": "smp_fetch_be_max_retries",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_BKEND",
+    "file": "src/backend.c",
+    "line": 3962
+  },
+  {
+    "keyword": "be_queue_timeout",
+    "process": "smp_fetch_be_queue_timeout",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_BKEND",
+    "file": "src/backend.c",
+    "line": 3963
+  },
+  {
+    "keyword": "be_server_timeout",
+    "process": "smp_fetch_be_server_timeout",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_BKEND",
+    "file": "src/backend.c",
+    "line": 3964
+  },
+  {
+    "keyword": "be_sess_rate",
+    "process": "smp_fetch_be_sess_rate",
+    "arg_mask": "ARG1(1,BE)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/backend.c",
+    "line": 3965
+  },
+  {
+    "keyword": "be_tarpit_timeout",
+    "process": "smp_fetch_be_tarpit_timeout",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_BKEND",
+    "file": "src/backend.c",
+    "line": 3966
+  },
+  {
+    "keyword": "be_tunnel_timeout",
+    "process": "smp_fetch_be_tunnel_timeout",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_BKEND",
+    "file": "src/backend.c",
+    "line": 3967
+  },
+  {
+    "keyword": "connslots",
+    "process": "smp_fetch_connslots",
+    "arg_mask": "ARG1(1,BE)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/backend.c",
+    "line": 3968
+  },
+  {
+    "keyword": "nbsrv",
+    "process": "smp_fetch_nbsrv",
+    "arg_mask": "ARG1(1,BE)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/backend.c",
+    "line": 3969
+  },
+  {
+    "keyword": "queue",
+    "process": "smp_fetch_queue_size",
+    "arg_mask": "ARG1(1,BE)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/backend.c",
+    "line": 3970
+  },
+  {
+    "keyword": "srv_conn",
+    "process": "smp_fetch_srv_conn",
+    "arg_mask": "ARG1(1,SRV)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/backend.c",
+    "line": 3971
+  },
+  {
+    "keyword": "srv_conn_free",
+    "process": "smp_fetch_srv_conn_free",
+    "arg_mask": "ARG1(1,SRV)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/backend.c",
+    "line": 3972
+  },
+  {
+    "keyword": "srv_id",
+    "process": "smp_fetch_srv_id",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_SERVR",
+    "file": "src/backend.c",
+    "line": 3973
+  },
+  {
+    "keyword": "srv_is_up",
+    "process": "smp_fetch_srv_is_up",
+    "arg_mask": "ARG1(1,SRV)",
+    "out_type": "SMP_T_BOOL",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/backend.c",
+    "line": 3974
+  },
+  {
+    "keyword": "srv_name",
+    "process": "smp_fetch_srv_name",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_SERVR",
+    "file": "src/backend.c",
+    "line": 3975
+  },
+  {
+    "keyword": "srv_queue",
+    "process": "smp_fetch_srv_queue",
+    "arg_mask": "ARG1(1,SRV)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/backend.c",
+    "line": 3976
+  },
+  {
+    "keyword": "srv_sess_rate",
+    "process": "smp_fetch_srv_sess_rate",
+    "arg_mask": "ARG1(1,SRV)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/backend.c",
+    "line": 3977
+  },
+  {
+    "keyword": "srv_weight",
+    "process": "smp_fetch_srv_weight",
+    "arg_mask": "ARG1(1,SRV)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/backend.c",
+    "line": 3978
+  },
+  {
+    "keyword": "srv_iweight",
+    "process": "smp_fetch_srv_iweight",
+    "arg_mask": "ARG1(1,SRV)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/backend.c",
+    "line": 3979
+  },
+  {
+    "keyword": "srv_uweight",
+    "process": "smp_fetch_srv_uweight",
+    "arg_mask": "ARG1(1,SRV)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/backend.c",
+    "line": 3980
+  },
+  {
+    "keyword": "res.cache_hit",
+    "process": "smp_fetch_res_cache_hit",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BOOL",
+    "valid_where": "SMP_USE_HRSHP, SMP_VAL_RESPONSE",
+    "file": "src/cache.c",
+    "line": 3803
+  },
+  {
+    "keyword": "res.cache_name",
+    "process": "smp_fetch_res_cache_name",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_HRSHP, SMP_VAL_RESPONSE",
+    "file": "src/cache.c",
+    "line": 3804
+  },
+  {
+    "keyword": "bc_err",
+    "process": "smp_fetch_fc_err",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4SRV",
+    "file": "src/connection.c",
+    "line": 2901
+  },
+  {
+    "keyword": "bc_err_name",
+    "process": "smp_fetch_fc_err_str",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L4SRV",
+    "file": "src/connection.c",
+    "line": 2902
+  },
+  {
+    "keyword": "bc_err_str",
+    "process": "smp_fetch_fc_err_str",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L4SRV",
+    "file": "src/connection.c",
+    "line": 2903
+  },
+  {
+    "keyword": "bc_glitches",
+    "process": "smp_fetch_fc_glitches",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4SRV",
+    "file": "src/connection.c",
+    "line": 2904
+  },
+  {
+    "keyword": "bc_http_major",
+    "process": "smp_fetch_fc_http_major",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4SRV",
+    "file": "src/connection.c",
+    "line": 2905
+  },
+  {
+    "keyword": "bc_nb_streams",
+    "process": "smp_fetch_fc_nb_streams",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L5SRV",
+    "file": "src/connection.c",
+    "line": 2906
+  },
+  {
+    "keyword": "bc_settings_streams_limit",
+    "process": "smp_fetch_fc_streams_limit",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L5SRV",
+    "file": "src/connection.c",
+    "line": 2907
+  },
+  {
+    "keyword": "fc_err",
+    "process": "smp_fetch_fc_err",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/connection.c",
+    "line": 2908
+  },
+  {
+    "keyword": "fc_err_name",
+    "process": "smp_fetch_fc_err_str",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/connection.c",
+    "line": 2909
+  },
+  {
+    "keyword": "fc_err_str",
+    "process": "smp_fetch_fc_err_str",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/connection.c",
+    "line": 2910
+  },
+  {
+    "keyword": "fc_glitches",
+    "process": "smp_fetch_fc_glitches",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/connection.c",
+    "line": 2911
+  },
+  {
+    "keyword": "fc_http_major",
+    "process": "smp_fetch_fc_http_major",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/connection.c",
+    "line": 2912
+  },
+  {
+    "keyword": "fc_rcvd_proxy",
+    "process": "smp_fetch_fc_rcvd_proxy",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BOOL",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/connection.c",
+    "line": 2913
+  },
+  {
+    "keyword": "fc_nb_streams",
+    "process": "smp_fetch_fc_nb_streams",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/connection.c",
+    "line": 2914
+  },
+  {
+    "keyword": "fc_pp_authority",
+    "process": "smp_fetch_fc_pp_authority",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/connection.c",
+    "line": 2915
+  },
+  {
+    "keyword": "fc_pp_unique_id",
+    "process": "smp_fetch_fc_pp_unique_id",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/connection.c",
+    "line": 2916
+  },
+  {
+    "keyword": "fc_pp_tlv",
+    "process": "smp_fetch_fc_pp_tlv",
+    "arg_mask": "ARG1(1, STR)",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/connection.c",
+    "line": 2917
+  },
+  {
+    "keyword": "fc_settings_streams_limit",
+    "process": "smp_fetch_fc_streams_limit",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/connection.c",
+    "line": 2918
+  },
+  {
+    "keyword": "fcgi.docroot",
+    "process": "smp_fetch_fcgi_docroot",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_HRQHV",
+    "file": "src/fcgi-app.c",
+    "line": 1094
+  },
+  {
+    "keyword": "fcgi.index",
+    "process": "smp_fetch_fcgi_index",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_HRQHV",
+    "file": "src/fcgi-app.c",
+    "line": 1095
+  },
+  {
+    "keyword": "res.comp",
+    "process": "smp_fetch_res_comp",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BOOL",
+    "valid_where": "SMP_USE_HRSHP",
+    "file": "src/flt_http_comp.c",
+    "line": 1268
+  },
+  {
+    "keyword": "res.comp_algo",
+    "process": "smp_fetch_res_comp_algo",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_HRSHP",
+    "file": "src/flt_http_comp.c",
+    "line": 1269
+  },
+  {
+    "keyword": "spoe.engine-id",
+    "process": "smp_fetch_spoe_engine_id",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/flt_spoe.c",
+    "line": 2951
+  },
+  {
+    "keyword": "fe_client_timeout",
+    "process": "smp_fetch_fe_client_timeout",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_FTEND",
+    "file": "src/frontend.c",
+    "line": 344
+  },
+  {
+    "keyword": "fe_tarpit_timeout",
+    "process": "smp_fetch_fe_tarpit_timeout",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_FTEND",
+    "file": "src/frontend.c",
+    "line": 345
+  },
+  {
+    "keyword": "fe_conn",
+    "process": "smp_fetch_fe_conn",
+    "arg_mask": "ARG1(1,FE)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/frontend.c",
+    "line": 346
+  },
+  {
+    "keyword": "fe_defbe",
+    "process": "smp_fetch_fe_defbe",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_FTEND",
+    "file": "src/frontend.c",
+    "line": 347
+  },
+  {
+    "keyword": "fe_id",
+    "process": "smp_fetch_fe_id",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_FTEND",
+    "file": "src/frontend.c",
+    "line": 348
+  },
+  {
+    "keyword": "fe_name",
+    "process": "smp_fetch_fe_name",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_FTEND",
+    "file": "src/frontend.c",
+    "line": 349
+  },
+  {
+    "keyword": "fe_req_rate",
+    "process": "smp_fetch_fe_req_rate",
+    "arg_mask": "ARG1(1,FE)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/frontend.c",
+    "line": 350
+  },
+  {
+    "keyword": "fe_sess_rate",
+    "process": "smp_fetch_fe_sess_rate",
+    "arg_mask": "ARG1(1,FE)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/frontend.c",
+    "line": 351
+  },
+  {
+    "keyword": "base",
+    "process": "smp_fetch_base",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_HRQHV",
+    "file": "src/http_fetch.c",
+    "line": 2338
+  },
+  {
+    "keyword": "base32",
+    "process": "smp_fetch_base32",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_HRQHV",
+    "file": "src/http_fetch.c",
+    "line": 2339
+  },
+  {
+    "keyword": "base32+src",
+    "process": "smp_fetch_base32_src",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BIN",
+    "valid_where": "SMP_USE_HRQHV",
+    "file": "src/http_fetch.c",
+    "line": 2340
+  },
+  {
+    "keyword": "baseq",
+    "process": "smp_fetch_base",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_HRQHV",
+    "file": "src/http_fetch.c",
+    "line": 2341
+  },
+  {
+    "keyword": "capture.req.hdr",
+    "process": "smp_fetch_capture_req_hdr",
+    "arg_mask": "ARG1(1,SINT)",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_HRQHP",
+    "file": "src/http_fetch.c",
+    "line": 2344
+  },
+  {
+    "keyword": "capture.req.method",
+    "process": "smp_fetch_capture_req_method",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_HRQHP",
+    "file": "src/http_fetch.c",
+    "line": 2347
+  },
+  {
+    "keyword": "capture.req.uri",
+    "process": "smp_fetch_capture_req_uri",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_HRQHP",
+    "file": "src/http_fetch.c",
+    "line": 2348
+  },
+  {
+    "keyword": "capture.req.ver",
+    "process": "smp_fetch_capture_req_ver",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_HRQHP",
+    "file": "src/http_fetch.c",
+    "line": 2349
+  },
+  {
+    "keyword": "capture.res.hdr",
+    "process": "smp_fetch_capture_res_hdr",
+    "arg_mask": "ARG1(1,SINT)",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_HRSHP",
+    "file": "src/http_fetch.c",
+    "line": 2351
+  },
+  {
+    "keyword": "capture.res.ver",
+    "process": "smp_fetch_capture_res_ver",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_HRQHP",
+    "file": "src/http_fetch.c",
+    "line": 2352
+  },
+  {
+    "keyword": "cook",
+    "process": "smp_fetch_cookie",
+    "arg_mask": "ARG1(0,STR)",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_HRQHV",
+    "file": "src/http_fetch.c",
+    "line": 2358
+  },
+  {
+    "keyword": "cookie",
+    "process": "smp_fetch_chn_cookie",
+    "arg_mask": "ARG1(0,STR)",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_HRQHV|SMP_USE_HRSHV",
+    "file": "src/http_fetch.c",
+    "line": 2359
+  },
+  {
+    "keyword": "cook_cnt",
+    "process": "smp_fetch_cookie_cnt",
+    "arg_mask": "ARG1(0,STR)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_HRQHV",
+    "file": "src/http_fetch.c",
+    "line": 2360
+  },
+  {
+    "keyword": "cook_val",
+    "process": "smp_fetch_cookie_val",
+    "arg_mask": "ARG1(0,STR)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_HRQHV",
+    "file": "src/http_fetch.c",
+    "line": 2361
+  },
+  {
+    "keyword": "hdr",
+    "process": "smp_fetch_chn_hdr",
+    "arg_mask": "ARG2(0,STR,SINT)",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_HRQHV|SMP_USE_HRSHV",
+    "file": "src/http_fetch.c",
+    "line": 2367
+  },
+  {
+    "keyword": "hdr_cnt",
+    "process": "smp_fetch_hdr_cnt",
+    "arg_mask": "ARG1(0,STR)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_HRQHV",
+    "file": "src/http_fetch.c",
+    "line": 2368
+  },
+  {
+    "keyword": "hdr_ip",
+    "process": "smp_fetch_hdr_ip",
+    "arg_mask": "ARG2(0,STR,SINT)",
+    "out_type": "SMP_T_ADDR",
+    "valid_where": "SMP_USE_HRQHV",
+    "file": "src/http_fetch.c",
+    "line": 2369
+  },
+  {
+    "keyword": "hdr_val",
+    "process": "smp_fetch_hdr_val",
+    "arg_mask": "ARG2(0,STR,SINT)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_HRQHV",
+    "file": "src/http_fetch.c",
+    "line": 2370
+  },
+  {
+    "keyword": "http_auth_type",
+    "process": "smp_fetch_http_auth_type",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_HRQHV",
+    "file": "src/http_fetch.c",
+    "line": 2372
+  },
+  {
+    "keyword": "http_auth_user",
+    "process": "smp_fetch_http_auth_user",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_HRQHV",
+    "file": "src/http_fetch.c",
+    "line": 2373
+  },
+  {
+    "keyword": "http_auth_pass",
+    "process": "smp_fetch_http_auth_pass",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_HRQHV",
+    "file": "src/http_fetch.c",
+    "line": 2374
+  },
+  {
+    "keyword": "http_auth_bearer",
+    "process": "smp_fetch_http_auth_bearer",
+    "arg_mask": "ARG1(0,STR)",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_HRQHV",
+    "file": "src/http_fetch.c",
+    "line": 2375
+  },
+  {
+    "keyword": "http_auth",
+    "process": "smp_fetch_http_auth",
+    "arg_mask": "ARG1(1,USR)",
+    "out_type": "SMP_T_BOOL",
+    "valid_where": "SMP_USE_HRQHV",
+    "file": "src/http_fetch.c",
+    "line": 2376
+  },
+  {
+    "keyword": "http_auth_group",
+    "process": "smp_fetch_http_auth_grp",
+    "arg_mask": "ARG1(1,USR)",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_HRQHV",
+    "file": "src/http_fetch.c",
+    "line": 2377
+  },
+  {
+    "keyword": "http_first_req",
+    "process": "smp_fetch_http_first_req",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BOOL",
+    "valid_where": "SMP_USE_HRQHP",
+    "file": "src/http_fetch.c",
+    "line": 2378
+  },
+  {
+    "keyword": "method",
+    "process": "smp_fetch_meth",
+    "arg_mask": "0",
+    "out_type": "SMP_T_METH",
+    "valid_where": "SMP_USE_HRQHP",
+    "file": "src/http_fetch.c",
+    "line": 2379
+  },
+  {
+    "keyword": "path",
+    "process": "smp_fetch_path",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_HRQHV",
+    "file": "src/http_fetch.c",
+    "line": 2380
+  },
+  {
+    "keyword": "pathq",
+    "process": "smp_fetch_path",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_HRQHV",
+    "file": "src/http_fetch.c",
+    "line": 2381
+  },
+  {
+    "keyword": "query",
+    "process": "smp_fetch_query",
+    "arg_mask": "ARG1(0,STR)",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_HRQHV",
+    "file": "src/http_fetch.c",
+    "line": 2382
+  },
+  {
+    "keyword": "req.proto_http",
+    "process": "smp_fetch_proto_http",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BOOL",
+    "valid_where": "SMP_USE_HRQHP",
+    "file": "src/http_fetch.c",
+    "line": 2385
+  },
+  {
+    "keyword": "req_proto_http",
+    "process": "smp_fetch_proto_http",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BOOL",
+    "valid_where": "SMP_USE_HRQHP",
+    "file": "src/http_fetch.c",
+    "line": 2386
+  },
+  {
+    "keyword": "req.ver",
+    "process": "smp_fetch_rqver",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_HRQHP",
+    "file": "src/http_fetch.c",
+    "line": 2389
+  },
+  {
+    "keyword": "req_ver",
+    "process": "smp_fetch_rqver",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_HRQHP",
+    "file": "src/http_fetch.c",
+    "line": 2390
+  },
+  {
+    "keyword": "req.body",
+    "process": "smp_fetch_body",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BIN",
+    "valid_where": "SMP_USE_HRQHV",
+    "file": "src/http_fetch.c",
+    "line": 2392
+  },
+  {
+    "keyword": "req.body_len",
+    "process": "smp_fetch_body_len",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_HRQHV",
+    "file": "src/http_fetch.c",
+    "line": 2393
+  },
+  {
+    "keyword": "req.body_size",
+    "process": "smp_fetch_body_size",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_HRQHV",
+    "file": "src/http_fetch.c",
+    "line": 2394
+  },
+  {
+    "keyword": "req.body_param",
+    "process": "smp_fetch_body_param",
+    "arg_mask": "ARG2(0,STR,STR)",
+    "out_type": "SMP_T_BIN",
+    "valid_where": "SMP_USE_HRQHV",
+    "file": "src/http_fetch.c",
+    "line": 2395
+  },
+  {
+    "keyword": "req.hdrs",
+    "process": "smp_fetch_hdrs",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BIN",
+    "valid_where": "SMP_USE_HRQHV",
+    "file": "src/http_fetch.c",
+    "line": 2397
+  },
+  {
+    "keyword": "req.hdrs_bin",
+    "process": "smp_fetch_hdrs_bin",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BIN",
+    "valid_where": "SMP_USE_HRQHV",
+    "file": "src/http_fetch.c",
+    "line": 2398
+  },
+  {
+    "keyword": "res.ver",
+    "process": "smp_fetch_stver",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_HRSHP",
+    "file": "src/http_fetch.c",
+    "line": 2401
+  },
+  {
+    "keyword": "resp_ver",
+    "process": "smp_fetch_stver",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_HRSHP",
+    "file": "src/http_fetch.c",
+    "line": 2402
+  },
+  {
+    "keyword": "res.body",
+    "process": "smp_fetch_body",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BIN",
+    "valid_where": "SMP_USE_HRSHV",
+    "file": "src/http_fetch.c",
+    "line": 2404
+  },
+  {
+    "keyword": "res.body_len",
+    "process": "smp_fetch_body_len",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_HRSHV",
+    "file": "src/http_fetch.c",
+    "line": 2405
+  },
+  {
+    "keyword": "res.body_size",
+    "process": "smp_fetch_body_size",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_HRSHV",
+    "file": "src/http_fetch.c",
+    "line": 2406
+  },
+  {
+    "keyword": "res.hdrs",
+    "process": "smp_fetch_hdrs",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BIN",
+    "valid_where": "SMP_USE_HRSHV",
+    "file": "src/http_fetch.c",
+    "line": 2408
+  },
+  {
+    "keyword": "res.hdrs_bin",
+    "process": "smp_fetch_hdrs_bin",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BIN",
+    "valid_where": "SMP_USE_HRSHV",
+    "file": "src/http_fetch.c",
+    "line": 2409
+  },
+  {
+    "keyword": "req.cook",
+    "process": "smp_fetch_cookie",
+    "arg_mask": "ARG1(0,STR)",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_HRQHV",
+    "file": "src/http_fetch.c",
+    "line": 2412
+  },
+  {
+    "keyword": "req.cook_cnt",
+    "process": "smp_fetch_cookie_cnt",
+    "arg_mask": "ARG1(0,STR)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_HRQHV",
+    "file": "src/http_fetch.c",
+    "line": 2413
+  },
+  {
+    "keyword": "req.cook_val",
+    "process": "smp_fetch_cookie_val",
+    "arg_mask": "ARG1(0,STR)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_HRQHV",
+    "file": "src/http_fetch.c",
+    "line": 2414
+  },
+  {
+    "keyword": "req.cook_names",
+    "process": "smp_fetch_cookie_names",
+    "arg_mask": "ARG1(0,STR)",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_HRQHV",
+    "file": "src/http_fetch.c",
+    "line": 2415
+  },
+  {
+    "keyword": "req.fhdr",
+    "process": "smp_fetch_fhdr",
+    "arg_mask": "ARG2(0,STR,SINT)",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_HRQHV",
+    "file": "src/http_fetch.c",
+    "line": 2417
+  },
+  {
+    "keyword": "req.fhdr_cnt",
+    "process": "smp_fetch_fhdr_cnt",
+    "arg_mask": "ARG1(0,STR)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_HRQHV",
+    "file": "src/http_fetch.c",
+    "line": 2418
+  },
+  {
+    "keyword": "req.hdr",
+    "process": "smp_fetch_hdr",
+    "arg_mask": "ARG2(0,STR,SINT)",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_HRQHV",
+    "file": "src/http_fetch.c",
+    "line": 2419
+  },
+  {
+    "keyword": "req.hdr_cnt",
+    "process": "smp_fetch_hdr_cnt",
+    "arg_mask": "ARG1(0,STR)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_HRQHV",
+    "file": "src/http_fetch.c",
+    "line": 2420
+  },
+  {
+    "keyword": "req.hdr_ip",
+    "process": "smp_fetch_hdr_ip",
+    "arg_mask": "ARG2(0,STR,SINT)",
+    "out_type": "SMP_T_ADDR",
+    "valid_where": "SMP_USE_HRQHV",
+    "file": "src/http_fetch.c",
+    "line": 2421
+  },
+  {
+    "keyword": "req.hdr_names",
+    "process": "smp_fetch_hdr_names",
+    "arg_mask": "ARG1(0,STR)",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_HRQHV",
+    "file": "src/http_fetch.c",
+    "line": 2422
+  },
+  {
+    "keyword": "req.hdr_val",
+    "process": "smp_fetch_hdr_val",
+    "arg_mask": "ARG2(0,STR,SINT)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_HRQHV",
+    "file": "src/http_fetch.c",
+    "line": 2423
+  },
+  {
+    "keyword": "res.cook",
+    "process": "smp_fetch_cookie",
+    "arg_mask": "ARG1(0,STR)",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_HRSHV",
+    "file": "src/http_fetch.c",
+    "line": 2426
+  },
+  {
+    "keyword": "res.cook_cnt",
+    "process": "smp_fetch_cookie_cnt",
+    "arg_mask": "ARG1(0,STR)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_HRSHV",
+    "file": "src/http_fetch.c",
+    "line": 2427
+  },
+  {
+    "keyword": "res.cook_val",
+    "process": "smp_fetch_cookie_val",
+    "arg_mask": "ARG1(0,STR)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_HRSHV",
+    "file": "src/http_fetch.c",
+    "line": 2428
+  },
+  {
+    "keyword": "res.cook_names",
+    "process": "smp_fetch_cookie_names",
+    "arg_mask": "ARG1(0,STR)",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_HRSHV",
+    "file": "src/http_fetch.c",
+    "line": 2429
+  },
+  {
+    "keyword": "res.fhdr",
+    "process": "smp_fetch_fhdr",
+    "arg_mask": "ARG2(0,STR,SINT)",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_HRSHV",
+    "file": "src/http_fetch.c",
+    "line": 2431
+  },
+  {
+    "keyword": "res.fhdr_cnt",
+    "process": "smp_fetch_fhdr_cnt",
+    "arg_mask": "ARG1(0,STR)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_HRSHV",
+    "file": "src/http_fetch.c",
+    "line": 2432
+  },
+  {
+    "keyword": "res.hdr",
+    "process": "smp_fetch_hdr",
+    "arg_mask": "ARG2(0,STR,SINT)",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_HRSHV",
+    "file": "src/http_fetch.c",
+    "line": 2433
+  },
+  {
+    "keyword": "res.hdr_cnt",
+    "process": "smp_fetch_hdr_cnt",
+    "arg_mask": "ARG1(0,STR)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_HRSHV",
+    "file": "src/http_fetch.c",
+    "line": 2434
+  },
+  {
+    "keyword": "res.hdr_ip",
+    "process": "smp_fetch_hdr_ip",
+    "arg_mask": "ARG2(0,STR,SINT)",
+    "out_type": "SMP_T_ADDR",
+    "valid_where": "SMP_USE_HRSHV",
+    "file": "src/http_fetch.c",
+    "line": 2435
+  },
+  {
+    "keyword": "res.hdr_names",
+    "process": "smp_fetch_hdr_names",
+    "arg_mask": "ARG1(0,STR)",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_HRSHV",
+    "file": "src/http_fetch.c",
+    "line": 2436
+  },
+  {
+    "keyword": "res.hdr_val",
+    "process": "smp_fetch_hdr_val",
+    "arg_mask": "ARG2(0,STR,SINT)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_HRSHV",
+    "file": "src/http_fetch.c",
+    "line": 2437
+  },
+  {
+    "keyword": "server_status",
+    "process": "smp_fetch_srv_status",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_HRSHP",
+    "file": "src/http_fetch.c",
+    "line": 2439
+  },
+  {
+    "keyword": "scook",
+    "process": "smp_fetch_cookie",
+    "arg_mask": "ARG1(0,STR)",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_HRSHV",
+    "file": "src/http_fetch.c",
+    "line": 2442
+  },
+  {
+    "keyword": "scook_cnt",
+    "process": "smp_fetch_cookie_cnt",
+    "arg_mask": "ARG1(0,STR)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_HRSHV",
+    "file": "src/http_fetch.c",
+    "line": 2443
+  },
+  {
+    "keyword": "scook_val",
+    "process": "smp_fetch_cookie_val",
+    "arg_mask": "ARG1(0,STR)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_HRSHV",
+    "file": "src/http_fetch.c",
+    "line": 2444
+  },
+  {
+    "keyword": "shdr",
+    "process": "smp_fetch_hdr",
+    "arg_mask": "ARG2(0,STR,SINT)",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_HRSHV",
+    "file": "src/http_fetch.c",
+    "line": 2447
+  },
+  {
+    "keyword": "shdr_cnt",
+    "process": "smp_fetch_hdr_cnt",
+    "arg_mask": "ARG1(0,STR)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_HRSHV",
+    "file": "src/http_fetch.c",
+    "line": 2448
+  },
+  {
+    "keyword": "shdr_ip",
+    "process": "smp_fetch_hdr_ip",
+    "arg_mask": "ARG2(0,STR,SINT)",
+    "out_type": "SMP_T_ADDR",
+    "valid_where": "SMP_USE_HRSHV",
+    "file": "src/http_fetch.c",
+    "line": 2449
+  },
+  {
+    "keyword": "shdr_val",
+    "process": "smp_fetch_hdr_val",
+    "arg_mask": "ARG2(0,STR,SINT)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_HRSHV",
+    "file": "src/http_fetch.c",
+    "line": 2450
+  },
+  {
+    "keyword": "status",
+    "process": "smp_fetch_stcode",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_HRSHP",
+    "file": "src/http_fetch.c",
+    "line": 2452
+  },
+  {
+    "keyword": "txn.status",
+    "process": "smp_fetch_srv_status",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_HRSHP",
+    "file": "src/http_fetch.c",
+    "line": 2453
+  },
+  {
+    "keyword": "unique-id",
+    "process": "smp_fetch_uniqueid",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_SRC_L4SRV",
+    "file": "src/http_fetch.c",
+    "line": 2454
+  },
+  {
+    "keyword": "url",
+    "process": "smp_fetch_url",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_HRQHV",
+    "file": "src/http_fetch.c",
+    "line": 2455
+  },
+  {
+    "keyword": "url32",
+    "process": "smp_fetch_url32",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_HRQHV",
+    "file": "src/http_fetch.c",
+    "line": 2456
+  },
+  {
+    "keyword": "url32+src",
+    "process": "smp_fetch_url32_src",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BIN",
+    "valid_where": "SMP_USE_HRQHV",
+    "file": "src/http_fetch.c",
+    "line": 2457
+  },
+  {
+    "keyword": "url_ip",
+    "process": "smp_fetch_url_ip",
+    "arg_mask": "0",
+    "out_type": "SMP_T_IPV4",
+    "valid_where": "SMP_USE_HRQHV",
+    "file": "src/http_fetch.c",
+    "line": 2458
+  },
+  {
+    "keyword": "url_port",
+    "process": "smp_fetch_url_port",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_HRQHV",
+    "file": "src/http_fetch.c",
+    "line": 2459
+  },
+  {
+    "keyword": "url_param",
+    "process": "smp_fetch_url_param",
+    "arg_mask": "ARG3(0,STR,STR,STR)",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_HRQHV",
+    "file": "src/http_fetch.c",
+    "line": 2460
+  },
+  {
+    "keyword": "urlp",
+    "process": "smp_fetch_url_param",
+    "arg_mask": "ARG3(0,STR,STR,STR)",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_HRQHV",
+    "file": "src/http_fetch.c",
+    "line": 2461
+  },
+  {
+    "keyword": "urlp_val",
+    "process": "smp_fetch_url_param_val",
+    "arg_mask": "ARG3(0,STR,STR,STR)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_HRQHV",
+    "file": "src/http_fetch.c",
+    "line": 2462
+  },
+  {
+    "keyword": "internal.strm.is_htx",
+    "process": "smp_fetch_is_htx",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BOOL",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/http_htx.c",
+    "line": 3171
+  },
+  {
+    "keyword": "internal.htx.nbblks",
+    "process": "smp_fetch_htx_nbblks",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_HRQHV|SMP_USE_HRSHV",
+    "file": "src/http_htx.c",
+    "line": 3173
+  },
+  {
+    "keyword": "internal.htx.size",
+    "process": "smp_fetch_htx_size",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_HRQHV|SMP_USE_HRSHV",
+    "file": "src/http_htx.c",
+    "line": 3174
+  },
+  {
+    "keyword": "internal.htx.data",
+    "process": "smp_fetch_htx_data",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_HRQHV|SMP_USE_HRSHV",
+    "file": "src/http_htx.c",
+    "line": 3175
+  },
+  {
+    "keyword": "internal.htx.used",
+    "process": "smp_fetch_htx_used",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_HRQHV|SMP_USE_HRSHV",
+    "file": "src/http_htx.c",
+    "line": 3176
+  },
+  {
+    "keyword": "internal.htx.free",
+    "process": "smp_fetch_htx_free",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_HRQHV|SMP_USE_HRSHV",
+    "file": "src/http_htx.c",
+    "line": 3177
+  },
+  {
+    "keyword": "internal.htx.free_data",
+    "process": "smp_fetch_htx_free_data",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_HRQHV|SMP_USE_HRSHV",
+    "file": "src/http_htx.c",
+    "line": 3178
+  },
+  {
+    "keyword": "internal.htx.has_eom",
+    "process": "smp_fetch_htx_has_eom",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BOOL",
+    "valid_where": "SMP_USE_HRQHV|SMP_USE_HRSHV",
+    "file": "src/http_htx.c",
+    "line": 3179
+  },
+  {
+    "keyword": "internal.htx_blk.type",
+    "process": "smp_fetch_htx_blk_type",
+    "arg_mask": "ARG1(1,STR)",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_HRQHV|SMP_USE_HRSHV",
+    "file": "src/http_htx.c",
+    "line": 3181
+  },
+  {
+    "keyword": "internal.htx_blk.size",
+    "process": "smp_fetch_htx_blk_size",
+    "arg_mask": "ARG1(1,STR)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_HRQHV|SMP_USE_HRSHV",
+    "file": "src/http_htx.c",
+    "line": 3182
+  },
+  {
+    "keyword": "internal.htx_blk.start_line",
+    "process": "smp_fetch_htx_blk_stline",
+    "arg_mask": "ARG1(1,STR)",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_HRQHV|SMP_USE_HRSHV",
+    "file": "src/http_htx.c",
+    "line": 3183
+  },
+  {
+    "keyword": "internal.htx_blk.hdrname",
+    "process": "smp_fetch_htx_blk_hdrname",
+    "arg_mask": "ARG1(1,STR)",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_HRQHV|SMP_USE_HRSHV",
+    "file": "src/http_htx.c",
+    "line": 3184
+  },
+  {
+    "keyword": "internal.htx_blk.hdrval",
+    "process": "smp_fetch_htx_blk_hdrval",
+    "arg_mask": "ARG1(1,STR)",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_HRQHV|SMP_USE_HRSHV",
+    "file": "src/http_htx.c",
+    "line": 3185
+  },
+  {
+    "keyword": "internal.htx_blk.data",
+    "process": "smp_fetch_htx_blk_data",
+    "arg_mask": "ARG1(1,STR)",
+    "out_type": "SMP_T_BIN",
+    "valid_where": "SMP_USE_HRQHV|SMP_USE_HRSHV",
+    "file": "src/http_htx.c",
+    "line": 3186
+  },
+  {
+    "keyword": "dst_conn",
+    "process": "smp_fetch_dconn",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_FTEND",
+    "file": "src/listener.c",
+    "line": 3032
+  },
+  {
+    "keyword": "so_id",
+    "process": "smp_fetch_so_id",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_FTEND",
+    "file": "src/listener.c",
+    "line": 3033
+  },
+  {
+    "keyword": "so_name",
+    "process": "smp_fetch_so_name",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_FTEND",
+    "file": "src/listener.c",
+    "line": 3034
+  },
+  {
+    "keyword": "distcc_body",
+    "process": "smp_fetch_distcc_body",
+    "arg_mask": "ARG2(1,STR,SINT)",
+    "out_type": "SMP_T_BIN",
+    "valid_where": "SMP_USE_L6REQ|SMP_USE_L6RES",
+    "file": "src/payload.c",
+    "line": 1455
+  },
+  {
+    "keyword": "distcc_param",
+    "process": "smp_fetch_distcc_param",
+    "arg_mask": "ARG2(1,STR,SINT)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L6REQ|SMP_USE_L6RES",
+    "file": "src/payload.c",
+    "line": 1456
+  },
+  {
+    "keyword": "payload",
+    "process": "smp_fetch_payload",
+    "arg_mask": "ARG2(2,SINT,SINT)",
+    "out_type": "SMP_T_BIN",
+    "valid_where": "SMP_USE_L6REQ|SMP_USE_L6RES",
+    "file": "src/payload.c",
+    "line": 1457
+  },
+  {
+    "keyword": "payload_lv",
+    "process": "smp_fetch_payload_lv",
+    "arg_mask": "ARG3(2,SINT,SINT,STR)",
+    "out_type": "SMP_T_BIN",
+    "valid_where": "SMP_USE_L6REQ|SMP_USE_L6RES",
+    "file": "src/payload.c",
+    "line": 1458
+  },
+  {
+    "keyword": "rdp_cookie",
+    "process": "smp_fetch_rdp_cookie",
+    "arg_mask": "ARG1(0,STR)",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L6REQ",
+    "file": "src/payload.c",
+    "line": 1459
+  },
+  {
+    "keyword": "rdp_cookie_cnt",
+    "process": "smp_fetch_rdp_cookie_cnt",
+    "arg_mask": "ARG1(0,STR)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L6REQ",
+    "file": "src/payload.c",
+    "line": 1460
+  },
+  {
+    "keyword": "rep_ssl_hello_type",
+    "process": "smp_fetch_ssl_hello_type",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L6RES",
+    "file": "src/payload.c",
+    "line": 1461
+  },
+  {
+    "keyword": "req_len",
+    "process": "smp_fetch_len",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L6REQ",
+    "file": "src/payload.c",
+    "line": 1462
+  },
+  {
+    "keyword": "req_ssl_hello_type",
+    "process": "smp_fetch_ssl_hello_type",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L6REQ",
+    "file": "src/payload.c",
+    "line": 1463
+  },
+  {
+    "keyword": "req_ssl_sni",
+    "process": "smp_fetch_ssl_hello_sni",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L6REQ",
+    "file": "src/payload.c",
+    "line": 1464
+  },
+  {
+    "keyword": "req_ssl_ver",
+    "process": "smp_fetch_req_ssl_ver",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L6REQ",
+    "file": "src/payload.c",
+    "line": 1465
+  },
+  {
+    "keyword": "req.len",
+    "process": "smp_fetch_len",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L6REQ",
+    "file": "src/payload.c",
+    "line": 1467
+  },
+  {
+    "keyword": "req.payload",
+    "process": "smp_fetch_payload",
+    "arg_mask": "ARG2(2,SINT,SINT)",
+    "out_type": "SMP_T_BIN",
+    "valid_where": "SMP_USE_L6REQ",
+    "file": "src/payload.c",
+    "line": 1468
+  },
+  {
+    "keyword": "req.payload_lv",
+    "process": "smp_fetch_payload_lv",
+    "arg_mask": "ARG3(2,SINT,SINT,STR)",
+    "out_type": "SMP_T_BIN",
+    "valid_where": "SMP_USE_L6REQ",
+    "file": "src/payload.c",
+    "line": 1469
+  },
+  {
+    "keyword": "req.rdp_cookie",
+    "process": "smp_fetch_rdp_cookie",
+    "arg_mask": "ARG1(0,STR)",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L6REQ",
+    "file": "src/payload.c",
+    "line": 1470
+  },
+  {
+    "keyword": "req.rdp_cookie_cnt",
+    "process": "smp_fetch_rdp_cookie_cnt",
+    "arg_mask": "ARG1(0,STR)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L6REQ",
+    "file": "src/payload.c",
+    "line": 1471
+  },
+  {
+    "keyword": "req.ssl_ec_ext",
+    "process": "smp_fetch_req_ssl_ec_ext",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BOOL",
+    "valid_where": "SMP_USE_L6REQ",
+    "file": "src/payload.c",
+    "line": 1472
+  },
+  {
+    "keyword": "req.ssl_st_ext",
+    "process": "smp_fetch_req_ssl_st_ext",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L6REQ",
+    "file": "src/payload.c",
+    "line": 1473
+  },
+  {
+    "keyword": "req.ssl_hello_type",
+    "process": "smp_fetch_ssl_hello_type",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L6REQ",
+    "file": "src/payload.c",
+    "line": 1474
+  },
+  {
+    "keyword": "req.ssl_sni",
+    "process": "smp_fetch_ssl_hello_sni",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L6REQ",
+    "file": "src/payload.c",
+    "line": 1475
+  },
+  {
+    "keyword": "req.ssl_cipherlist",
+    "process": "smp_fetch_ssl_cipherlist",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BIN",
+    "valid_where": "SMP_USE_L6REQ|SMP_USE_L4CLI|SMP_USE_L5CLI|SMP_USE_FTEND",
+    "file": "src/payload.c",
+    "line": 1476
+  },
+  {
+    "keyword": "req.ssl_supported_groups",
+    "process": "smp_fetch_ssl_supported_groups",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BIN",
+    "valid_where": "SMP_USE_L6REQ|SMP_USE_L4CLI|SMP_USE_L5CLI|SMP_USE_FTEND",
+    "file": "src/payload.c",
+    "line": 1477
+  },
+  {
+    "keyword": "req.ssl_sigalgs",
+    "process": "smp_fetch_ssl_sigalgs",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BIN",
+    "valid_where": "SMP_USE_L6REQ|SMP_USE_L4CLI|SMP_USE_L5CLI|SMP_USE_FTEND",
+    "file": "src/payload.c",
+    "line": 1478
+  },
+  {
+    "keyword": "req.ssl_keyshare_groups",
+    "process": "smp_fetch_ssl_keyshare_groups",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BIN",
+    "valid_where": "SMP_USE_L6REQ|SMP_USE_L4CLI|SMP_USE_L5CLI|SMP_USE_FTEND",
+    "file": "src/payload.c",
+    "line": 1479
+  },
+  {
+    "keyword": "req.ssl_alpn",
+    "process": "smp_fetch_ssl_hello_alpn",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L6REQ",
+    "file": "src/payload.c",
+    "line": 1480
+  },
+  {
+    "keyword": "req.ssl_ver",
+    "process": "smp_fetch_req_ssl_ver",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L6REQ",
+    "file": "src/payload.c",
+    "line": 1481
+  },
+  {
+    "keyword": "res.len",
+    "process": "smp_fetch_len",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L6RES",
+    "file": "src/payload.c",
+    "line": 1482
+  },
+  {
+    "keyword": "res.payload",
+    "process": "smp_fetch_payload",
+    "arg_mask": "ARG2(2,SINT,SINT)",
+    "out_type": "SMP_T_BIN",
+    "valid_where": "SMP_USE_L6RES",
+    "file": "src/payload.c",
+    "line": 1483
+  },
+  {
+    "keyword": "res.payload_lv",
+    "process": "smp_fetch_payload_lv",
+    "arg_mask": "ARG3(2,SINT,SINT,STR)",
+    "out_type": "SMP_T_BIN",
+    "valid_where": "SMP_USE_L6RES",
+    "file": "src/payload.c",
+    "line": 1484
+  },
+  {
+    "keyword": "res.ssl_hello_type",
+    "process": "smp_fetch_ssl_hello_type",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L6RES",
+    "file": "src/payload.c",
+    "line": 1485
+  },
+  {
+    "keyword": "wait_end",
+    "process": "smp_fetch_wait_end",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BOOL",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/payload.c",
+    "line": 1486
+  },
+  {
+    "keyword": "prio_class",
+    "process": "smp_fetch_priority_class",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/queue.c",
+    "line": 897
+  },
+  {
+    "keyword": "prio_offset",
+    "process": "smp_fetch_priority_offset",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/queue.c",
+    "line": 898
+  },
+  {
+    "keyword": "bytes_in",
+    "process": "smp_fetch_bytes",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_RQFIN",
+    "file": "src/sample.c",
+    "line": 5914
+  },
+  {
+    "keyword": "bytes_out",
+    "process": "smp_fetch_bytes",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_RSFIN",
+    "file": "src/sample.c",
+    "line": 5915
+  },
+  {
+    "keyword": "txn.timer.total",
+    "process": "smp_fetch_txn_timers",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_TXFIN",
+    "file": "src/sample.c",
+    "line": 5917
+  },
+  {
+    "keyword": "txn.timer.user",
+    "process": "smp_fetch_txn_timers",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_TXFIN",
+    "file": "src/sample.c",
+    "line": 5918
+  },
+  {
+    "keyword": "bc.timer.connect",
+    "process": "smp_fetch_conn_timers",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4SRV",
+    "file": "src/sample.c",
+    "line": 5920
+  },
+  {
+    "keyword": "bc_be_queue",
+    "process": "smp_fetch_conn_queues",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4SRV",
+    "file": "src/sample.c",
+    "line": 5921
+  },
+  {
+    "keyword": "bc_srv_queue",
+    "process": "smp_fetch_conn_queues",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4SRV",
+    "file": "src/sample.c",
+    "line": 5922
+  },
+  {
+    "keyword": "fc.timer.handshake",
+    "process": "smp_fetch_conn_timers",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/sample.c",
+    "line": 5924
+  },
+  {
+    "keyword": "fc.timer.total",
+    "process": "smp_fetch_conn_timers",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_SSFIN",
+    "file": "src/sample.c",
+    "line": 5925
+  },
+  {
+    "keyword": "req.bytes_in",
+    "process": "smp_fetch_bytes",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_RQFIN",
+    "file": "src/sample.c",
+    "line": 5927
+  },
+  {
+    "keyword": "req.bytes_out",
+    "process": "smp_fetch_bytes",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_RQFIN",
+    "file": "src/sample.c",
+    "line": 5928
+  },
+  {
+    "keyword": "req.timer.idle",
+    "process": "smp_fetch_reX_timers",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_HRQHV",
+    "file": "src/sample.c",
+    "line": 5929
+  },
+  {
+    "keyword": "req.timer.tq",
+    "process": "smp_fetch_reX_timers",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_HRQHV",
+    "file": "src/sample.c",
+    "line": 5930
+  },
+  {
+    "keyword": "req.timer.hdr",
+    "process": "smp_fetch_reX_timers",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_HRQHV",
+    "file": "src/sample.c",
+    "line": 5931
+  },
+  {
+    "keyword": "req.timer.queue",
+    "process": "smp_fetch_reX_timers",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4SRV",
+    "file": "src/sample.c",
+    "line": 5932
+  },
+  {
+    "keyword": "res.bytes_in",
+    "process": "smp_fetch_bytes",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_RSFIN",
+    "file": "src/sample.c",
+    "line": 5933
+  },
+  {
+    "keyword": "res.bytes_out",
+    "process": "smp_fetch_bytes",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_RSFIN",
+    "file": "src/sample.c",
+    "line": 5934
+  },
+  {
+    "keyword": "res.timer.data",
+    "process": "smp_fetch_reX_timers",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_RSFIN",
+    "file": "src/sample.c",
+    "line": 5935
+  },
+  {
+    "keyword": "res.timer.hdr",
+    "process": "smp_fetch_reX_timers",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_HRSHV",
+    "file": "src/sample.c",
+    "line": 5936
+  },
+  {
+    "keyword": "act_conn",
+    "process": "smp_fetch_actconn",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_CONST",
+    "file": "src/sample.c",
+    "line": 5948
+  },
+  {
+    "keyword": "always_false",
+    "process": "smp_fetch_false",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BOOL",
+    "valid_where": "SMP_USE_CONST",
+    "file": "src/sample.c",
+    "line": 5949
+  },
+  {
+    "keyword": "always_true",
+    "process": "smp_fetch_true",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BOOL",
+    "valid_where": "SMP_USE_CONST",
+    "file": "src/sample.c",
+    "line": 5950
+  },
+  {
+    "keyword": "env",
+    "process": "smp_fetch_env",
+    "arg_mask": "ARG1(1,STR)",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_CONST",
+    "file": "src/sample.c",
+    "line": 5951
+  },
+  {
+    "keyword": "date",
+    "process": "smp_fetch_date",
+    "arg_mask": "ARG2(0,SINT,STR)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_CONST",
+    "file": "src/sample.c",
+    "line": 5952
+  },
+  {
+    "keyword": "date_us",
+    "process": "smp_fetch_date_us",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_CONST",
+    "file": "src/sample.c",
+    "line": 5953
+  },
+  {
+    "keyword": "hostname",
+    "process": "smp_fetch_hostname",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_CONST",
+    "file": "src/sample.c",
+    "line": 5954
+  },
+  {
+    "keyword": "master_id",
+    "process": "smp_fetch_master_id",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_CONST",
+    "file": "src/sample.c",
+    "line": 5955
+  },
+  {
+    "keyword": "nbproc",
+    "process": "smp_fetch_nbproc",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_CONST",
+    "file": "src/sample.c",
+    "line": 5956
+  },
+  {
+    "keyword": "pid",
+    "process": "smp_fetch_pid",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_CONST",
+    "file": "src/sample.c",
+    "line": 5957
+  },
+  {
+    "keyword": "proc",
+    "process": "smp_fetch_proc",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_CONST",
+    "file": "src/sample.c",
+    "line": 5958
+  },
+  {
+    "keyword": "quic_enabled",
+    "process": "smp_fetch_quic_enabled",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BOOL",
+    "valid_where": "SMP_USE_CONST",
+    "file": "src/sample.c",
+    "line": 5959
+  },
+  {
+    "keyword": "thread",
+    "process": "smp_fetch_thread",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_CONST",
+    "file": "src/sample.c",
+    "line": 5960
+  },
+  {
+    "keyword": "tgroup",
+    "process": "smp_fetch_tgroup",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_CONST",
+    "file": "src/sample.c",
+    "line": 5961
+  },
+  {
+    "keyword": "rand",
+    "process": "smp_fetch_rand",
+    "arg_mask": "ARG1(0,SINT)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_CONST",
+    "file": "src/sample.c",
+    "line": 5962
+  },
+  {
+    "keyword": "stopping",
+    "process": "smp_fetch_stopping",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BOOL",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/sample.c",
+    "line": 5963
+  },
+  {
+    "keyword": "uptime",
+    "process": "smp_fetch_uptime",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_CONST",
+    "file": "src/sample.c",
+    "line": 5964
+  },
+  {
+    "keyword": "uuid",
+    "process": "smp_fetch_uuid",
+    "arg_mask": "ARG1(0, SINT)",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_CONST",
+    "file": "src/sample.c",
+    "line": 5965
+  },
+  {
+    "keyword": "worker_id",
+    "process": "smp_fetch_worker_id",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_CONST",
+    "file": "src/sample.c",
+    "line": 5966
+  },
+  {
+    "keyword": "cpu_calls",
+    "process": "smp_fetch_cpu_calls",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/sample.c",
+    "line": 5968
+  },
+  {
+    "keyword": "cpu_ns_avg",
+    "process": "smp_fetch_cpu_ns_avg",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/sample.c",
+    "line": 5969
+  },
+  {
+    "keyword": "cpu_ns_tot",
+    "process": "smp_fetch_cpu_ns_tot",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/sample.c",
+    "line": 5970
+  },
+  {
+    "keyword": "cpu_usage_grp",
+    "process": "smp_fetch_cpu_usage_grp",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/sample.c",
+    "line": 5971
+  },
+  {
+    "keyword": "cpu_usage_proc",
+    "process": "smp_fetch_cpu_usage_proc",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/sample.c",
+    "line": 5972
+  },
+  {
+    "keyword": "cpu_usage_thr",
+    "process": "smp_fetch_cpu_usage_thr",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/sample.c",
+    "line": 5973
+  },
+  {
+    "keyword": "lat_ns_avg",
+    "process": "smp_fetch_lat_ns_avg",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/sample.c",
+    "line": 5974
+  },
+  {
+    "keyword": "lat_ns_tot",
+    "process": "smp_fetch_lat_ns_tot",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/sample.c",
+    "line": 5975
+  },
+  {
+    "keyword": "str",
+    "process": "smp_fetch_const_str",
+    "arg_mask": "ARG1(1,STR)",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_CONST",
+    "file": "src/sample.c",
+    "line": 5977
+  },
+  {
+    "keyword": "bool",
+    "process": "smp_fetch_const_bool",
+    "arg_mask": "ARG1(1,STR)",
+    "out_type": "SMP_T_BOOL",
+    "valid_where": "SMP_USE_CONST",
+    "file": "src/sample.c",
+    "line": 5978
+  },
+  {
+    "keyword": "int",
+    "process": "smp_fetch_const_int",
+    "arg_mask": "ARG1(1,SINT)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_CONST",
+    "file": "src/sample.c",
+    "line": 5979
+  },
+  {
+    "keyword": "ipv4",
+    "process": "smp_fetch_const_ipv4",
+    "arg_mask": "ARG1(1,IPV4)",
+    "out_type": "SMP_T_IPV4",
+    "valid_where": "SMP_USE_CONST",
+    "file": "src/sample.c",
+    "line": 5980
+  },
+  {
+    "keyword": "ipv6",
+    "process": "smp_fetch_const_ipv6",
+    "arg_mask": "ARG1(1,IPV6)",
+    "out_type": "SMP_T_IPV6",
+    "valid_where": "SMP_USE_CONST",
+    "file": "src/sample.c",
+    "line": 5981
+  },
+  {
+    "keyword": "bin",
+    "process": "smp_fetch_const_bin",
+    "arg_mask": "ARG1(1,STR)",
+    "out_type": "SMP_T_BIN",
+    "valid_where": "SMP_USE_CONST",
+    "file": "src/sample.c",
+    "line": 5982
+  },
+  {
+    "keyword": "meth",
+    "process": "smp_fetch_const_meth",
+    "arg_mask": "ARG1(1,STR)",
+    "out_type": "SMP_T_METH",
+    "valid_where": "SMP_USE_CONST",
+    "file": "src/sample.c",
+    "line": 5983
+  },
+  {
+    "keyword": "ssl_bc",
+    "process": "smp_fetch_ssl_fc",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BOOL",
+    "valid_where": "SMP_USE_L5SRV",
+    "file": "src/ssl_sample.c",
+    "line": 2805
+  },
+  {
+    "keyword": "ssl_bc_alg_keysize",
+    "process": "smp_fetch_ssl_fc_alg_keysize",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L5SRV",
+    "file": "src/ssl_sample.c",
+    "line": 2806
+  },
+  {
+    "keyword": "ssl_bc_alpn",
+    "process": "smp_fetch_ssl_fc_alpn",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5SRV",
+    "file": "src/ssl_sample.c",
+    "line": 2808
+  },
+  {
+    "keyword": "ssl_bc_cipher",
+    "process": "smp_fetch_ssl_fc_cipher",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5SRV",
+    "file": "src/ssl_sample.c",
+    "line": 2810
+  },
+  {
+    "keyword": "ssl_bc_curve",
+    "process": "smp_fetch_ssl_fc_ec",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5SRV",
+    "file": "src/ssl_sample.c",
+    "line": 2812
+  },
+  {
+    "keyword": "ssl_bc_npn",
+    "process": "smp_fetch_ssl_fc_npn",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5SRV",
+    "file": "src/ssl_sample.c",
+    "line": 2815
+  },
+  {
+    "keyword": "ssl_bc_is_resumed",
+    "process": "smp_fetch_ssl_fc_is_resumed",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BOOL",
+    "valid_where": "SMP_USE_L5SRV",
+    "file": "src/ssl_sample.c",
+    "line": 2817
+  },
+  {
+    "keyword": "ssl_bc_protocol",
+    "process": "smp_fetch_ssl_fc_protocol",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5SRV",
+    "file": "src/ssl_sample.c",
+    "line": 2818
+  },
+  {
+    "keyword": "ssl_bc_unique_id",
+    "process": "smp_fetch_ssl_fc_unique_id",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BIN",
+    "valid_where": "SMP_USE_L5SRV",
+    "file": "src/ssl_sample.c",
+    "line": 2819
+  },
+  {
+    "keyword": "ssl_bc_use_keysize",
+    "process": "smp_fetch_ssl_fc_use_keysize",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L5SRV",
+    "file": "src/ssl_sample.c",
+    "line": 2820
+  },
+  {
+    "keyword": "ssl_bc_session_id",
+    "process": "smp_fetch_ssl_fc_session_id",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BIN",
+    "valid_where": "SMP_USE_L5SRV",
+    "file": "src/ssl_sample.c",
+    "line": 2822
+  },
+  {
+    "keyword": "ssl_bc_client_random",
+    "process": "smp_fetch_ssl_fc_random",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BIN",
+    "valid_where": "SMP_USE_L5SRV",
+    "file": "src/ssl_sample.c",
+    "line": 2825
+  },
+  {
+    "keyword": "ssl_bc_server_random",
+    "process": "smp_fetch_ssl_fc_random",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BIN",
+    "valid_where": "SMP_USE_L5SRV",
+    "file": "src/ssl_sample.c",
+    "line": 2826
+  },
+  {
+    "keyword": "ssl_bc_session_key",
+    "process": "smp_fetch_ssl_fc_session_key",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BIN",
+    "valid_where": "SMP_USE_L5SRV",
+    "file": "src/ssl_sample.c",
+    "line": 2827
+  },
+  {
+    "keyword": "ssl_bc_client_early_traffic_secret",
+    "process": "smp_fetch_ssl_x_keylog",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2830
+  },
+  {
+    "keyword": "ssl_bc_client_handshake_traffic_secret",
+    "process": "smp_fetch_ssl_x_keylog",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2831
+  },
+  {
+    "keyword": "ssl_bc_server_handshake_traffic_secret",
+    "process": "smp_fetch_ssl_x_keylog",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2832
+  },
+  {
+    "keyword": "ssl_bc_client_traffic_secret_0",
+    "process": "smp_fetch_ssl_x_keylog",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2833
+  },
+  {
+    "keyword": "ssl_bc_server_traffic_secret_0",
+    "process": "smp_fetch_ssl_x_keylog",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2834
+  },
+  {
+    "keyword": "ssl_bc_exporter_secret",
+    "process": "smp_fetch_ssl_x_keylog",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2835
+  },
+  {
+    "keyword": "ssl_bc_early_exporter_secret",
+    "process": "smp_fetch_ssl_x_keylog",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2836
+  },
+  {
+    "keyword": "ssl_bc_err",
+    "process": "smp_fetch_ssl_fc_err",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L5SRV",
+    "file": "src/ssl_sample.c",
+    "line": 2838
+  },
+  {
+    "keyword": "ssl_bc_err_str",
+    "process": "smp_fetch_ssl_fc_err_str",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5SRV",
+    "file": "src/ssl_sample.c",
+    "line": 2839
+  },
+  {
+    "keyword": "ssl_bc_sni",
+    "process": "smp_fetch_ssl_fc_sni",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5SRV",
+    "file": "src/ssl_sample.c",
+    "line": 2840
+  },
+  {
+    "keyword": "ssl_c_ca_err",
+    "process": "smp_fetch_ssl_c_ca_err",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2841
+  },
+  {
+    "keyword": "ssl_c_ca_err_depth",
+    "process": "smp_fetch_ssl_c_ca_err_depth",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2842
+  },
+  {
+    "keyword": "ssl_c_der",
+    "process": "smp_fetch_ssl_x_der",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BIN",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2843
+  },
+  {
+    "keyword": "ssl_c_chain_der",
+    "process": "smp_fetch_ssl_x_chain_der",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BIN",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2844
+  },
+  {
+    "keyword": "ssl_c_err",
+    "process": "smp_fetch_ssl_c_err",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2845
+  },
+  {
+    "keyword": "ssl_c_i_dn",
+    "process": "smp_fetch_ssl_x_i_dn",
+    "arg_mask": "ARG3(0,STR,SINT,STR)",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2846
+  },
+  {
+    "keyword": "ssl_c_key_alg",
+    "process": "smp_fetch_ssl_x_key_alg",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2847
+  },
+  {
+    "keyword": "ssl_c_notafter",
+    "process": "smp_fetch_ssl_x_notafter",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2848
+  },
+  {
+    "keyword": "ssl_c_notbefore",
+    "process": "smp_fetch_ssl_x_notbefore",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2849
+  },
+  {
+    "keyword": "ssl_c_policies",
+    "process": "smp_fetch_ssl_c_policies",
+    "arg_mask": "ARG1(0,STR)",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2851
+  },
+  {
+    "keyword": "ssl_c_r_dn",
+    "process": "smp_fetch_ssl_r_dn",
+    "arg_mask": "ARG3(0,STR,SINT,STR)",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2854
+  },
+  {
+    "keyword": "ssl_c_sig_alg",
+    "process": "smp_fetch_ssl_x_sig_alg",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2856
+  },
+  {
+    "keyword": "ssl_c_san",
+    "process": "smp_fetch_ssl_x_san",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2857
+  },
+  {
+    "keyword": "ssl_c_s_dn",
+    "process": "smp_fetch_ssl_x_s_dn",
+    "arg_mask": "ARG3(0,STR,SINT,STR)",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2858
+  },
+  {
+    "keyword": "ssl_c_serial",
+    "process": "smp_fetch_ssl_x_serial",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BIN",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2859
+  },
+  {
+    "keyword": "ssl_c_sha1",
+    "process": "smp_fetch_ssl_x_sha1",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BIN",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2860
+  },
+  {
+    "keyword": "ssl_c_used",
+    "process": "smp_fetch_ssl_c_used",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BOOL",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2861
+  },
+  {
+    "keyword": "ssl_c_verify",
+    "process": "smp_fetch_ssl_c_verify",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2862
+  },
+  {
+    "keyword": "ssl_c_version",
+    "process": "smp_fetch_ssl_x_version",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2863
+  },
+  {
+    "keyword": "ssl_f_der",
+    "process": "smp_fetch_ssl_x_der",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BIN",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2864
+  },
+  {
+    "keyword": "ssl_f_i_dn",
+    "process": "smp_fetch_ssl_x_i_dn",
+    "arg_mask": "ARG3(0,STR,SINT,STR)",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2865
+  },
+  {
+    "keyword": "ssl_f_key_alg",
+    "process": "smp_fetch_ssl_x_key_alg",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2866
+  },
+  {
+    "keyword": "ssl_f_notafter",
+    "process": "smp_fetch_ssl_x_notafter",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2867
+  },
+  {
+    "keyword": "ssl_f_notbefore",
+    "process": "smp_fetch_ssl_x_notbefore",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2868
+  },
+  {
+    "keyword": "ssl_f_sig_alg",
+    "process": "smp_fetch_ssl_x_sig_alg",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2869
+  },
+  {
+    "keyword": "ssl_f_s_dn",
+    "process": "smp_fetch_ssl_x_s_dn",
+    "arg_mask": "ARG3(0,STR,SINT,STR)",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2870
+  },
+  {
+    "keyword": "ssl_f_serial",
+    "process": "smp_fetch_ssl_x_serial",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BIN",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2871
+  },
+  {
+    "keyword": "ssl_f_sha1",
+    "process": "smp_fetch_ssl_x_sha1",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BIN",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2872
+  },
+  {
+    "keyword": "ssl_f_version",
+    "process": "smp_fetch_ssl_x_version",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2873
+  },
+  {
+    "keyword": "ssl_fc",
+    "process": "smp_fetch_ssl_fc",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BOOL",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2874
+  },
+  {
+    "keyword": "ssl_fc_alg_keysize",
+    "process": "smp_fetch_ssl_fc_alg_keysize",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2875
+  },
+  {
+    "keyword": "ssl_fc_cipher",
+    "process": "smp_fetch_ssl_fc_cipher",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2876
+  },
+  {
+    "keyword": "ssl_fc_curve",
+    "process": "smp_fetch_ssl_fc_ec",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2878
+  },
+  {
+    "keyword": "ssl_fc_early_rcvd",
+    "process": "smp_fetch_ssl_fc_early_rcvd",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BOOL",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2880
+  },
+  {
+    "keyword": "ssl_fc_has_crt",
+    "process": "smp_fetch_ssl_fc_has_crt",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BOOL",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2881
+  },
+  {
+    "keyword": "ssl_fc_has_early",
+    "process": "smp_fetch_ssl_fc_has_early",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BOOL",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2882
+  },
+  {
+    "keyword": "ssl_fc_has_sni",
+    "process": "smp_fetch_ssl_fc_has_sni",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BOOL",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2883
+  },
+  {
+    "keyword": "ssl_fc_is_resumed",
+    "process": "smp_fetch_ssl_fc_is_resumed",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BOOL",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2884
+  },
+  {
+    "keyword": "ssl_fc_npn",
+    "process": "smp_fetch_ssl_fc_npn",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2886
+  },
+  {
+    "keyword": "ssl_fc_alpn",
+    "process": "smp_fetch_ssl_fc_alpn",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2889
+  },
+  {
+    "keyword": "ssl_fc_protocol",
+    "process": "smp_fetch_ssl_fc_protocol",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2891
+  },
+  {
+    "keyword": "ssl_fc_unique_id",
+    "process": "smp_fetch_ssl_fc_unique_id",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BIN",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2893
+  },
+  {
+    "keyword": "ssl_fc_use_keysize",
+    "process": "smp_fetch_ssl_fc_use_keysize",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2895
+  },
+  {
+    "keyword": "ssl_fc_session_id",
+    "process": "smp_fetch_ssl_fc_session_id",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BIN",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2897
+  },
+  {
+    "keyword": "ssl_fc_client_random",
+    "process": "smp_fetch_ssl_fc_random",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BIN",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2900
+  },
+  {
+    "keyword": "ssl_fc_server_random",
+    "process": "smp_fetch_ssl_fc_random",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BIN",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2901
+  },
+  {
+    "keyword": "ssl_fc_session_key",
+    "process": "smp_fetch_ssl_fc_session_key",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BIN",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2902
+  },
+  {
+    "keyword": "ssl_fc_client_early_traffic_secret",
+    "process": "smp_fetch_ssl_x_keylog",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2906
+  },
+  {
+    "keyword": "ssl_fc_client_handshake_traffic_secret",
+    "process": "smp_fetch_ssl_x_keylog",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2907
+  },
+  {
+    "keyword": "ssl_fc_server_handshake_traffic_secret",
+    "process": "smp_fetch_ssl_x_keylog",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2908
+  },
+  {
+    "keyword": "ssl_fc_client_traffic_secret_0",
+    "process": "smp_fetch_ssl_x_keylog",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2909
+  },
+  {
+    "keyword": "ssl_fc_server_traffic_secret_0",
+    "process": "smp_fetch_ssl_x_keylog",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2910
+  },
+  {
+    "keyword": "ssl_fc_exporter_secret",
+    "process": "smp_fetch_ssl_x_keylog",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2911
+  },
+  {
+    "keyword": "ssl_fc_early_exporter_secret",
+    "process": "smp_fetch_ssl_x_keylog",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2912
+  },
+  {
+    "keyword": "ssl_fc_sni",
+    "process": "smp_fetch_ssl_fc_sni",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2915
+  },
+  {
+    "keyword": "ssl_fc_crtname",
+    "process": "smp_fetch_ssl_fc_crtname",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2916
+  },
+  {
+    "keyword": "ssl_fc_ech_status",
+    "process": "smp_fetch_ssl_fc_ech_status",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2918
+  },
+  {
+    "keyword": "ssl_fc_ech_outer_sni",
+    "process": "smp_fetch_ssl_fc_ech_outer_sni",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2919
+  },
+  {
+    "keyword": "ssl_fc_cipherlist_bin",
+    "process": "smp_fetch_ssl_fc_cl_bin",
+    "arg_mask": "ARG1(0,SINT)",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2921
+  },
+  {
+    "keyword": "ssl_fc_cipherlist_hex",
+    "process": "smp_fetch_ssl_fc_cl_hex",
+    "arg_mask": "ARG1(0,SINT)",
+    "out_type": "SMP_T_BIN",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2922
+  },
+  {
+    "keyword": "ssl_fc_cipherlist_str",
+    "process": "smp_fetch_ssl_fc_cl_str",
+    "arg_mask": "ARG1(0,SINT)",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2923
+  },
+  {
+    "keyword": "ssl_fc_cipherlist_xxh",
+    "process": "smp_fetch_ssl_fc_cl_xxh64",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2924
+  },
+  {
+    "keyword": "ssl_fc_err",
+    "process": "smp_fetch_ssl_fc_err",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2925
+  },
+  {
+    "keyword": "ssl_fc_err_str",
+    "process": "smp_fetch_ssl_fc_err_str",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2926
+  },
+  {
+    "keyword": "ssl_fc_protocol_hello_id",
+    "process": "smp_fetch_ssl_fc_protocol_hello_id",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2927
+  },
+  {
+    "keyword": "ssl_fc_extlist_bin",
+    "process": "smp_fetch_ssl_fc_ext_bin",
+    "arg_mask": "ARG1(0,SINT)",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2928
+  },
+  {
+    "keyword": "ssl_fc_eclist_bin",
+    "process": "smp_fetch_ssl_fc_ecl_bin",
+    "arg_mask": "ARG1(0,SINT)",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2929
+  },
+  {
+    "keyword": "ssl_fc_ecformats_bin",
+    "process": "smp_fetch_ssl_fc_ecf_bin",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2930
+  },
+  {
+    "keyword": "ssl_fc_supported_versions_bin",
+    "process": "smp_fetch_ssl_fc_supver_bin",
+    "arg_mask": "ARG1(0,SINT)",
+    "out_type": "SMP_T_BIN",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2931
+  },
+  {
+    "keyword": "ssl_fc_sigalgs_bin",
+    "process": "smp_fetch_ssl_fc_sigalgs_bin",
+    "arg_mask": "ARG1(0,SINT)",
+    "out_type": "SMP_T_BIN",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2932
+  },
+  {
+    "keyword": "ssl_s_der",
+    "process": "smp_fetch_ssl_x_der",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BIN",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2935
+  },
+  {
+    "keyword": "ssl_s_chain_der",
+    "process": "smp_fetch_ssl_x_chain_der",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BIN",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2936
+  },
+  {
+    "keyword": "ssl_s_key_alg",
+    "process": "smp_fetch_ssl_x_key_alg",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2937
+  },
+  {
+    "keyword": "ssl_s_notafter",
+    "process": "smp_fetch_ssl_x_notafter",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2938
+  },
+  {
+    "keyword": "ssl_s_notbefore",
+    "process": "smp_fetch_ssl_x_notbefore",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2939
+  },
+  {
+    "keyword": "ssl_s_sig_alg",
+    "process": "smp_fetch_ssl_x_sig_alg",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2940
+  },
+  {
+    "keyword": "ssl_s_s_dn",
+    "process": "smp_fetch_ssl_x_s_dn",
+    "arg_mask": "ARG3(0,STR,SINT,STR)",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2941
+  },
+  {
+    "keyword": "ssl_s_i_dn",
+    "process": "smp_fetch_ssl_x_i_dn",
+    "arg_mask": "ARG3(0,STR,SINT,STR)",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2942
+  },
+  {
+    "keyword": "ssl_s_serial",
+    "process": "smp_fetch_ssl_x_serial",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BIN",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2943
+  },
+  {
+    "keyword": "ssl_s_sha1",
+    "process": "smp_fetch_ssl_x_sha1",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BIN",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2944
+  },
+  {
+    "keyword": "ssl_s_version",
+    "process": "smp_fetch_ssl_x_version",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/ssl_sample.c",
+    "line": 2945
+  },
+  {
+    "keyword": "bs.debug_str",
+    "process": "smp_fetch_debug_str",
+    "arg_mask": "ARG1(0,SINT)",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5SRV",
+    "file": "src/stconn.c",
+    "line": 2381
+  },
+  {
+    "keyword": "bs.id",
+    "process": "smp_fetch_sid",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L5SRV",
+    "file": "src/stconn.c",
+    "line": 2382
+  },
+  {
+    "keyword": "bs.aborted",
+    "process": "smp_fetch_strm_aborted",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L5SRV",
+    "file": "src/stconn.c",
+    "line": 2383
+  },
+  {
+    "keyword": "bs.rst_code",
+    "process": "smp_fetch_strm_rst_code",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L5SRV",
+    "file": "src/stconn.c",
+    "line": 2384
+  },
+  {
+    "keyword": "fs.debug_str",
+    "process": "smp_fetch_debug_str",
+    "arg_mask": "ARG1(0,SINT)",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/stconn.c",
+    "line": 2385
+  },
+  {
+    "keyword": "fs.id",
+    "process": "smp_fetch_sid",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/stconn.c",
+    "line": 2386
+  },
+  {
+    "keyword": "fs.aborted",
+    "process": "smp_fetch_strm_aborted",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/stconn.c",
+    "line": 2387
+  },
+  {
+    "keyword": "fs.rst_code",
+    "process": "smp_fetch_strm_rst_code",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L5CLI",
+    "file": "src/stconn.c",
+    "line": 2388
+  },
+  {
+    "keyword": "sc_bytes_in_rate",
+    "process": "smp_fetch_sc_bytes_in_rate",
+    "arg_mask": "ARG2(1,SINT,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6125
+  },
+  {
+    "keyword": "sc_bytes_out_rate",
+    "process": "smp_fetch_sc_bytes_out_rate",
+    "arg_mask": "ARG2(1,SINT,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6126
+  },
+  {
+    "keyword": "sc_clr_gpc",
+    "process": "smp_fetch_sc_clr_gpc",
+    "arg_mask": "ARG3(2,SINT,SINT,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6127
+  },
+  {
+    "keyword": "sc_clr_gpc0",
+    "process": "smp_fetch_sc_clr_gpc0",
+    "arg_mask": "ARG2(1,SINT,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6128
+  },
+  {
+    "keyword": "sc_clr_gpc1",
+    "process": "smp_fetch_sc_clr_gpc1",
+    "arg_mask": "ARG2(1,SINT,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6129
+  },
+  {
+    "keyword": "sc_conn_cnt",
+    "process": "smp_fetch_sc_conn_cnt",
+    "arg_mask": "ARG2(1,SINT,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6130
+  },
+  {
+    "keyword": "sc_conn_cur",
+    "process": "smp_fetch_sc_conn_cur",
+    "arg_mask": "ARG2(1,SINT,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6131
+  },
+  {
+    "keyword": "sc_conn_rate",
+    "process": "smp_fetch_sc_conn_rate",
+    "arg_mask": "ARG2(1,SINT,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6132
+  },
+  {
+    "keyword": "sc_get_gpt",
+    "process": "smp_fetch_sc_get_gpt",
+    "arg_mask": "ARG3(2,SINT,SINT,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6133
+  },
+  {
+    "keyword": "sc_get_gpt0",
+    "process": "smp_fetch_sc_get_gpt0",
+    "arg_mask": "ARG2(1,SINT,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6134
+  },
+  {
+    "keyword": "sc_get_gpc",
+    "process": "smp_fetch_sc_get_gpc",
+    "arg_mask": "ARG3(2,SINT,SINT,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6135
+  },
+  {
+    "keyword": "sc_get_gpc0",
+    "process": "smp_fetch_sc_get_gpc0",
+    "arg_mask": "ARG2(1,SINT,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6136
+  },
+  {
+    "keyword": "sc_get_gpc1",
+    "process": "smp_fetch_sc_get_gpc1",
+    "arg_mask": "ARG2(1,SINT,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6137
+  },
+  {
+    "keyword": "sc_glitch_cnt",
+    "process": "smp_fetch_sc_glitch_cnt",
+    "arg_mask": "ARG2(1,SINT,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6138
+  },
+  {
+    "keyword": "sc_glitch_rate",
+    "process": "smp_fetch_sc_glitch_rate",
+    "arg_mask": "ARG2(1,SINT,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6139
+  },
+  {
+    "keyword": "sc_gpc_rate",
+    "process": "smp_fetch_sc_gpc_rate",
+    "arg_mask": "ARG3(2,SINT,SINT,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6140
+  },
+  {
+    "keyword": "sc_gpc0_rate",
+    "process": "smp_fetch_sc_gpc0_rate",
+    "arg_mask": "ARG2(1,SINT,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6141
+  },
+  {
+    "keyword": "sc_gpc1_rate",
+    "process": "smp_fetch_sc_gpc1_rate",
+    "arg_mask": "ARG2(1,SINT,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6142
+  },
+  {
+    "keyword": "sc_http_err_cnt",
+    "process": "smp_fetch_sc_http_err_cnt",
+    "arg_mask": "ARG2(1,SINT,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6143
+  },
+  {
+    "keyword": "sc_http_err_rate",
+    "process": "smp_fetch_sc_http_err_rate",
+    "arg_mask": "ARG2(1,SINT,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6144
+  },
+  {
+    "keyword": "sc_http_fail_cnt",
+    "process": "smp_fetch_sc_http_fail_cnt",
+    "arg_mask": "ARG2(1,SINT,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6145
+  },
+  {
+    "keyword": "sc_http_fail_rate",
+    "process": "smp_fetch_sc_http_fail_rate",
+    "arg_mask": "ARG2(1,SINT,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6146
+  },
+  {
+    "keyword": "sc_http_req_cnt",
+    "process": "smp_fetch_sc_http_req_cnt",
+    "arg_mask": "ARG2(1,SINT,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6147
+  },
+  {
+    "keyword": "sc_http_req_rate",
+    "process": "smp_fetch_sc_http_req_rate",
+    "arg_mask": "ARG2(1,SINT,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6148
+  },
+  {
+    "keyword": "sc_inc_gpc",
+    "process": "smp_fetch_sc_inc_gpc",
+    "arg_mask": "ARG3(2,SINT,SINT,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6149
+  },
+  {
+    "keyword": "sc_inc_gpc0",
+    "process": "smp_fetch_sc_inc_gpc0",
+    "arg_mask": "ARG2(1,SINT,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6150
+  },
+  {
+    "keyword": "sc_inc_gpc1",
+    "process": "smp_fetch_sc_inc_gpc1",
+    "arg_mask": "ARG2(1,SINT,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6151
+  },
+  {
+    "keyword": "sc_kbytes_in",
+    "process": "smp_fetch_sc_kbytes_in",
+    "arg_mask": "ARG2(1,SINT,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/stick_table.c",
+    "line": 6152
+  },
+  {
+    "keyword": "sc_kbytes_out",
+    "process": "smp_fetch_sc_kbytes_out",
+    "arg_mask": "ARG2(1,SINT,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/stick_table.c",
+    "line": 6153
+  },
+  {
+    "keyword": "sc_key",
+    "process": "smp_fetch_sc_key",
+    "arg_mask": "ARG1(1,SINT)",
+    "out_type": "SMP_T_ANY",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6154
+  },
+  {
+    "keyword": "sc_sess_cnt",
+    "process": "smp_fetch_sc_sess_cnt",
+    "arg_mask": "ARG2(1,SINT,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6155
+  },
+  {
+    "keyword": "sc_sess_rate",
+    "process": "smp_fetch_sc_sess_rate",
+    "arg_mask": "ARG2(1,SINT,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6156
+  },
+  {
+    "keyword": "sc_tracked",
+    "process": "smp_fetch_sc_tracked",
+    "arg_mask": "ARG2(1,SINT,TAB)",
+    "out_type": "SMP_T_BOOL",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6157
+  },
+  {
+    "keyword": "sc_trackers",
+    "process": "smp_fetch_sc_trackers",
+    "arg_mask": "ARG2(1,SINT,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6158
+  },
+  {
+    "keyword": "sc0_bytes_in_rate",
+    "process": "smp_fetch_sc_bytes_in_rate",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6159
+  },
+  {
+    "keyword": "sc0_bytes_out_rate",
+    "process": "smp_fetch_sc_bytes_out_rate",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6160
+  },
+  {
+    "keyword": "sc0_clr_gpc0",
+    "process": "smp_fetch_sc_clr_gpc0",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6161
+  },
+  {
+    "keyword": "sc0_clr_gpc1",
+    "process": "smp_fetch_sc_clr_gpc1",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6162
+  },
+  {
+    "keyword": "sc0_conn_cnt",
+    "process": "smp_fetch_sc_conn_cnt",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6163
+  },
+  {
+    "keyword": "sc0_conn_cur",
+    "process": "smp_fetch_sc_conn_cur",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6164
+  },
+  {
+    "keyword": "sc0_conn_rate",
+    "process": "smp_fetch_sc_conn_rate",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6165
+  },
+  {
+    "keyword": "sc0_get_gpt0",
+    "process": "smp_fetch_sc_get_gpt0",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6166
+  },
+  {
+    "keyword": "sc0_get_gpc0",
+    "process": "smp_fetch_sc_get_gpc0",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6167
+  },
+  {
+    "keyword": "sc0_get_gpc1",
+    "process": "smp_fetch_sc_get_gpc1",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6168
+  },
+  {
+    "keyword": "sc0_glitch_cnt",
+    "process": "smp_fetch_sc_glitch_cnt",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6169
+  },
+  {
+    "keyword": "sc0_glitch_rate",
+    "process": "smp_fetch_sc_glitch_rate",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6170
+  },
+  {
+    "keyword": "sc0_gpc0_rate",
+    "process": "smp_fetch_sc_gpc0_rate",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6171
+  },
+  {
+    "keyword": "sc0_gpc1_rate",
+    "process": "smp_fetch_sc_gpc1_rate",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6172
+  },
+  {
+    "keyword": "sc0_http_err_cnt",
+    "process": "smp_fetch_sc_http_err_cnt",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6173
+  },
+  {
+    "keyword": "sc0_http_err_rate",
+    "process": "smp_fetch_sc_http_err_rate",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6174
+  },
+  {
+    "keyword": "sc0_http_fail_cnt",
+    "process": "smp_fetch_sc_http_fail_cnt",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6175
+  },
+  {
+    "keyword": "sc0_http_fail_rate",
+    "process": "smp_fetch_sc_http_fail_rate",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6176
+  },
+  {
+    "keyword": "sc0_http_req_cnt",
+    "process": "smp_fetch_sc_http_req_cnt",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6177
+  },
+  {
+    "keyword": "sc0_http_req_rate",
+    "process": "smp_fetch_sc_http_req_rate",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6178
+  },
+  {
+    "keyword": "sc0_inc_gpc0",
+    "process": "smp_fetch_sc_inc_gpc0",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6179
+  },
+  {
+    "keyword": "sc0_inc_gpc1",
+    "process": "smp_fetch_sc_inc_gpc1",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6180
+  },
+  {
+    "keyword": "sc0_kbytes_in",
+    "process": "smp_fetch_sc_kbytes_in",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/stick_table.c",
+    "line": 6181
+  },
+  {
+    "keyword": "sc0_kbytes_out",
+    "process": "smp_fetch_sc_kbytes_out",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/stick_table.c",
+    "line": 6182
+  },
+  {
+    "keyword": "sc0_key",
+    "process": "smp_fetch_sc_key",
+    "arg_mask": "0",
+    "out_type": "SMP_T_ANY",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6183
+  },
+  {
+    "keyword": "sc0_sess_cnt",
+    "process": "smp_fetch_sc_sess_cnt",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6184
+  },
+  {
+    "keyword": "sc0_sess_rate",
+    "process": "smp_fetch_sc_sess_rate",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6185
+  },
+  {
+    "keyword": "sc0_tracked",
+    "process": "smp_fetch_sc_tracked",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_BOOL",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6186
+  },
+  {
+    "keyword": "sc0_trackers",
+    "process": "smp_fetch_sc_trackers",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6187
+  },
+  {
+    "keyword": "sc1_bytes_in_rate",
+    "process": "smp_fetch_sc_bytes_in_rate",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6188
+  },
+  {
+    "keyword": "sc1_bytes_out_rate",
+    "process": "smp_fetch_sc_bytes_out_rate",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6189
+  },
+  {
+    "keyword": "sc1_clr_gpc",
+    "process": "smp_fetch_sc_clr_gpc",
+    "arg_mask": "ARG2(1,SINT,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6190
+  },
+  {
+    "keyword": "sc1_clr_gpc0",
+    "process": "smp_fetch_sc_clr_gpc0",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6191
+  },
+  {
+    "keyword": "sc1_clr_gpc1",
+    "process": "smp_fetch_sc_clr_gpc1",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6192
+  },
+  {
+    "keyword": "sc1_conn_cnt",
+    "process": "smp_fetch_sc_conn_cnt",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6193
+  },
+  {
+    "keyword": "sc1_conn_cur",
+    "process": "smp_fetch_sc_conn_cur",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6194
+  },
+  {
+    "keyword": "sc1_conn_rate",
+    "process": "smp_fetch_sc_conn_rate",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6195
+  },
+  {
+    "keyword": "sc1_get_gpt0",
+    "process": "smp_fetch_sc_get_gpt0",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6196
+  },
+  {
+    "keyword": "sc1_get_gpc0",
+    "process": "smp_fetch_sc_get_gpc0",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6197
+  },
+  {
+    "keyword": "sc1_get_gpc1",
+    "process": "smp_fetch_sc_get_gpc1",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6198
+  },
+  {
+    "keyword": "sc1_glitch_cnt",
+    "process": "smp_fetch_sc_glitch_cnt",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6199
+  },
+  {
+    "keyword": "sc1_glitch_rate",
+    "process": "smp_fetch_sc_glitch_rate",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6200
+  },
+  {
+    "keyword": "sc1_gpc0_rate",
+    "process": "smp_fetch_sc_gpc0_rate",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6201
+  },
+  {
+    "keyword": "sc1_gpc1_rate",
+    "process": "smp_fetch_sc_gpc1_rate",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6202
+  },
+  {
+    "keyword": "sc1_http_err_cnt",
+    "process": "smp_fetch_sc_http_err_cnt",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6203
+  },
+  {
+    "keyword": "sc1_http_err_rate",
+    "process": "smp_fetch_sc_http_err_rate",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6204
+  },
+  {
+    "keyword": "sc1_http_fail_cnt",
+    "process": "smp_fetch_sc_http_fail_cnt",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6205
+  },
+  {
+    "keyword": "sc1_http_fail_rate",
+    "process": "smp_fetch_sc_http_fail_rate",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6206
+  },
+  {
+    "keyword": "sc1_http_req_cnt",
+    "process": "smp_fetch_sc_http_req_cnt",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6207
+  },
+  {
+    "keyword": "sc1_http_req_rate",
+    "process": "smp_fetch_sc_http_req_rate",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6208
+  },
+  {
+    "keyword": "sc1_inc_gpc0",
+    "process": "smp_fetch_sc_inc_gpc0",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6209
+  },
+  {
+    "keyword": "sc1_inc_gpc1",
+    "process": "smp_fetch_sc_inc_gpc1",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6210
+  },
+  {
+    "keyword": "sc1_kbytes_in",
+    "process": "smp_fetch_sc_kbytes_in",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/stick_table.c",
+    "line": 6211
+  },
+  {
+    "keyword": "sc1_kbytes_out",
+    "process": "smp_fetch_sc_kbytes_out",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/stick_table.c",
+    "line": 6212
+  },
+  {
+    "keyword": "sc1_key",
+    "process": "smp_fetch_sc_key",
+    "arg_mask": "0",
+    "out_type": "SMP_T_ANY",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6213
+  },
+  {
+    "keyword": "sc1_sess_cnt",
+    "process": "smp_fetch_sc_sess_cnt",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6214
+  },
+  {
+    "keyword": "sc1_sess_rate",
+    "process": "smp_fetch_sc_sess_rate",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6215
+  },
+  {
+    "keyword": "sc1_tracked",
+    "process": "smp_fetch_sc_tracked",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_BOOL",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6216
+  },
+  {
+    "keyword": "sc1_trackers",
+    "process": "smp_fetch_sc_trackers",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6217
+  },
+  {
+    "keyword": "sc2_bytes_in_rate",
+    "process": "smp_fetch_sc_bytes_in_rate",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6218
+  },
+  {
+    "keyword": "sc2_bytes_out_rate",
+    "process": "smp_fetch_sc_bytes_out_rate",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6219
+  },
+  {
+    "keyword": "sc2_clr_gpc0",
+    "process": "smp_fetch_sc_clr_gpc0",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6220
+  },
+  {
+    "keyword": "sc2_clr_gpc1",
+    "process": "smp_fetch_sc_clr_gpc1",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6221
+  },
+  {
+    "keyword": "sc2_conn_cnt",
+    "process": "smp_fetch_sc_conn_cnt",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6222
+  },
+  {
+    "keyword": "sc2_conn_cur",
+    "process": "smp_fetch_sc_conn_cur",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6223
+  },
+  {
+    "keyword": "sc2_conn_rate",
+    "process": "smp_fetch_sc_conn_rate",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6224
+  },
+  {
+    "keyword": "sc2_get_gpt0",
+    "process": "smp_fetch_sc_get_gpt0",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6225
+  },
+  {
+    "keyword": "sc2_get_gpc0",
+    "process": "smp_fetch_sc_get_gpc0",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6226
+  },
+  {
+    "keyword": "sc2_get_gpc1",
+    "process": "smp_fetch_sc_get_gpc1",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6227
+  },
+  {
+    "keyword": "sc2_glitch_cnt",
+    "process": "smp_fetch_sc_glitch_cnt",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6228
+  },
+  {
+    "keyword": "sc2_glitch_rate",
+    "process": "smp_fetch_sc_glitch_rate",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6229
+  },
+  {
+    "keyword": "sc2_gpc0_rate",
+    "process": "smp_fetch_sc_gpc0_rate",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6230
+  },
+  {
+    "keyword": "sc2_gpc1_rate",
+    "process": "smp_fetch_sc_gpc1_rate",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6231
+  },
+  {
+    "keyword": "sc2_http_err_cnt",
+    "process": "smp_fetch_sc_http_err_cnt",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6232
+  },
+  {
+    "keyword": "sc2_http_err_rate",
+    "process": "smp_fetch_sc_http_err_rate",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6233
+  },
+  {
+    "keyword": "sc2_http_fail_cnt",
+    "process": "smp_fetch_sc_http_fail_cnt",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6234
+  },
+  {
+    "keyword": "sc2_http_fail_rate",
+    "process": "smp_fetch_sc_http_fail_rate",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6235
+  },
+  {
+    "keyword": "sc2_http_req_cnt",
+    "process": "smp_fetch_sc_http_req_cnt",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6236
+  },
+  {
+    "keyword": "sc2_http_req_rate",
+    "process": "smp_fetch_sc_http_req_rate",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6237
+  },
+  {
+    "keyword": "sc2_inc_gpc0",
+    "process": "smp_fetch_sc_inc_gpc0",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6238
+  },
+  {
+    "keyword": "sc2_inc_gpc1",
+    "process": "smp_fetch_sc_inc_gpc1",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6239
+  },
+  {
+    "keyword": "sc2_kbytes_in",
+    "process": "smp_fetch_sc_kbytes_in",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/stick_table.c",
+    "line": 6240
+  },
+  {
+    "keyword": "sc2_kbytes_out",
+    "process": "smp_fetch_sc_kbytes_out",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/stick_table.c",
+    "line": 6241
+  },
+  {
+    "keyword": "sc2_key",
+    "process": "smp_fetch_sc_key",
+    "arg_mask": "0",
+    "out_type": "SMP_T_ANY",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6242
+  },
+  {
+    "keyword": "sc2_sess_cnt",
+    "process": "smp_fetch_sc_sess_cnt",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6243
+  },
+  {
+    "keyword": "sc2_sess_rate",
+    "process": "smp_fetch_sc_sess_rate",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6244
+  },
+  {
+    "keyword": "sc2_tracked",
+    "process": "smp_fetch_sc_tracked",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_BOOL",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6245
+  },
+  {
+    "keyword": "sc2_trackers",
+    "process": "smp_fetch_sc_trackers",
+    "arg_mask": "ARG1(0,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6246
+  },
+  {
+    "keyword": "src_bytes_in_rate",
+    "process": "smp_fetch_sc_bytes_in_rate",
+    "arg_mask": "ARG1(1,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/stick_table.c",
+    "line": 6247
+  },
+  {
+    "keyword": "src_bytes_out_rate",
+    "process": "smp_fetch_sc_bytes_out_rate",
+    "arg_mask": "ARG1(1,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/stick_table.c",
+    "line": 6248
+  },
+  {
+    "keyword": "src_clr_gpc",
+    "process": "smp_fetch_sc_clr_gpc",
+    "arg_mask": "ARG2(2,SINT,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/stick_table.c",
+    "line": 6249
+  },
+  {
+    "keyword": "src_clr_gpc0",
+    "process": "smp_fetch_sc_clr_gpc0",
+    "arg_mask": "ARG1(1,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/stick_table.c",
+    "line": 6250
+  },
+  {
+    "keyword": "src_clr_gpc1",
+    "process": "smp_fetch_sc_clr_gpc1",
+    "arg_mask": "ARG1(1,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/stick_table.c",
+    "line": 6251
+  },
+  {
+    "keyword": "src_conn_cnt",
+    "process": "smp_fetch_sc_conn_cnt",
+    "arg_mask": "ARG1(1,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/stick_table.c",
+    "line": 6252
+  },
+  {
+    "keyword": "src_conn_cur",
+    "process": "smp_fetch_sc_conn_cur",
+    "arg_mask": "ARG1(1,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/stick_table.c",
+    "line": 6253
+  },
+  {
+    "keyword": "src_conn_rate",
+    "process": "smp_fetch_sc_conn_rate",
+    "arg_mask": "ARG1(1,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/stick_table.c",
+    "line": 6254
+  },
+  {
+    "keyword": "src_get_gpt",
+    "process": "smp_fetch_sc_get_gpt",
+    "arg_mask": "ARG2(2,SINT,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/stick_table.c",
+    "line": 6255
+  },
+  {
+    "keyword": "src_get_gpt0",
+    "process": "smp_fetch_sc_get_gpt0",
+    "arg_mask": "ARG1(1,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/stick_table.c",
+    "line": 6256
+  },
+  {
+    "keyword": "src_get_gpc",
+    "process": "smp_fetch_sc_get_gpc",
+    "arg_mask": "ARG2(2,SINT,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/stick_table.c",
+    "line": 6257
+  },
+  {
+    "keyword": "src_get_gpc0",
+    "process": "smp_fetch_sc_get_gpc0",
+    "arg_mask": "ARG1(1,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/stick_table.c",
+    "line": 6258
+  },
+  {
+    "keyword": "src_get_gpc1",
+    "process": "smp_fetch_sc_get_gpc1",
+    "arg_mask": "ARG1(1,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/stick_table.c",
+    "line": 6259
+  },
+  {
+    "keyword": "src_glitch_cnt",
+    "process": "smp_fetch_sc_glitch_cnt",
+    "arg_mask": "ARG1(1,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/stick_table.c",
+    "line": 6260
+  },
+  {
+    "keyword": "src_glitch_rate",
+    "process": "smp_fetch_sc_glitch_rate",
+    "arg_mask": "ARG1(1,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/stick_table.c",
+    "line": 6261
+  },
+  {
+    "keyword": "src_gpc_rate",
+    "process": "smp_fetch_sc_gpc_rate",
+    "arg_mask": "ARG2(2,SINT,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/stick_table.c",
+    "line": 6262
+  },
+  {
+    "keyword": "src_gpc0_rate",
+    "process": "smp_fetch_sc_gpc0_rate",
+    "arg_mask": "ARG1(1,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/stick_table.c",
+    "line": 6263
+  },
+  {
+    "keyword": "src_gpc1_rate",
+    "process": "smp_fetch_sc_gpc1_rate",
+    "arg_mask": "ARG1(1,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/stick_table.c",
+    "line": 6264
+  },
+  {
+    "keyword": "src_http_err_cnt",
+    "process": "smp_fetch_sc_http_err_cnt",
+    "arg_mask": "ARG1(1,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/stick_table.c",
+    "line": 6265
+  },
+  {
+    "keyword": "src_http_err_rate",
+    "process": "smp_fetch_sc_http_err_rate",
+    "arg_mask": "ARG1(1,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/stick_table.c",
+    "line": 6266
+  },
+  {
+    "keyword": "src_http_fail_cnt",
+    "process": "smp_fetch_sc_http_fail_cnt",
+    "arg_mask": "ARG1(1,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/stick_table.c",
+    "line": 6267
+  },
+  {
+    "keyword": "src_http_fail_rate",
+    "process": "smp_fetch_sc_http_fail_rate",
+    "arg_mask": "ARG1(1,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/stick_table.c",
+    "line": 6268
+  },
+  {
+    "keyword": "src_http_req_cnt",
+    "process": "smp_fetch_sc_http_req_cnt",
+    "arg_mask": "ARG1(1,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/stick_table.c",
+    "line": 6269
+  },
+  {
+    "keyword": "src_http_req_rate",
+    "process": "smp_fetch_sc_http_req_rate",
+    "arg_mask": "ARG1(1,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/stick_table.c",
+    "line": 6270
+  },
+  {
+    "keyword": "src_inc_gpc",
+    "process": "smp_fetch_sc_inc_gpc",
+    "arg_mask": "ARG2(2,SINT,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/stick_table.c",
+    "line": 6271
+  },
+  {
+    "keyword": "src_inc_gpc0",
+    "process": "smp_fetch_sc_inc_gpc0",
+    "arg_mask": "ARG1(1,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/stick_table.c",
+    "line": 6272
+  },
+  {
+    "keyword": "src_inc_gpc1",
+    "process": "smp_fetch_sc_inc_gpc1",
+    "arg_mask": "ARG1(1,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/stick_table.c",
+    "line": 6273
+  },
+  {
+    "keyword": "src_kbytes_in",
+    "process": "smp_fetch_sc_kbytes_in",
+    "arg_mask": "ARG1(1,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/stick_table.c",
+    "line": 6274
+  },
+  {
+    "keyword": "src_kbytes_out",
+    "process": "smp_fetch_sc_kbytes_out",
+    "arg_mask": "ARG1(1,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/stick_table.c",
+    "line": 6275
+  },
+  {
+    "keyword": "src_sess_cnt",
+    "process": "smp_fetch_sc_sess_cnt",
+    "arg_mask": "ARG1(1,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/stick_table.c",
+    "line": 6276
+  },
+  {
+    "keyword": "src_sess_rate",
+    "process": "smp_fetch_sc_sess_rate",
+    "arg_mask": "ARG1(1,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/stick_table.c",
+    "line": 6277
+  },
+  {
+    "keyword": "src_updt_conn_cnt",
+    "process": "smp_fetch_src_updt_conn_cnt",
+    "arg_mask": "ARG1(1,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/stick_table.c",
+    "line": 6278
+  },
+  {
+    "keyword": "table_avl",
+    "process": "smp_fetch_table_avl",
+    "arg_mask": "ARG1(1,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6279
+  },
+  {
+    "keyword": "table_cnt",
+    "process": "smp_fetch_table_cnt",
+    "arg_mask": "ARG1(1,TAB)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stick_table.c",
+    "line": 6280
+  },
+  {
+    "keyword": "cur_connect_timeout",
+    "process": "smp_fetch_cur_connect_timeout",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_BKEND",
+    "file": "src/stream.c",
+    "line": 4879
+  },
+  {
+    "keyword": "cur_client_timeout",
+    "process": "smp_fetch_cur_client_timeout",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_FTEND",
+    "file": "src/stream.c",
+    "line": 4880
+  },
+  {
+    "keyword": "cur_max_retries",
+    "process": "smp_fetch_cur_max_retries",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_BKEND",
+    "file": "src/stream.c",
+    "line": 4881
+  },
+  {
+    "keyword": "cur_server_timeout",
+    "process": "smp_fetch_cur_server_timeout",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_BKEND",
+    "file": "src/stream.c",
+    "line": 4882
+  },
+  {
+    "keyword": "cur_queue_timeout",
+    "process": "smp_fetch_cur_queue_timeout",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_BKEND",
+    "file": "src/stream.c",
+    "line": 4883
+  },
+  {
+    "keyword": "cur_tarpit_timeout",
+    "process": "smp_fetch_cur_tarpit_timeout",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_FTEND | SMP_USE_BKEND",
+    "file": "src/stream.c",
+    "line": 4884
+  },
+  {
+    "keyword": "cur_tunnel_timeout",
+    "process": "smp_fetch_cur_tunnel_timeout",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_BKEND",
+    "file": "src/stream.c",
+    "line": 4885
+  },
+  {
+    "keyword": "last_entity",
+    "process": "smp_fetch_last_entity",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stream.c",
+    "line": 4886
+  },
+  {
+    "keyword": "last_rule_file",
+    "process": "smp_fetch_last_rule_file",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stream.c",
+    "line": 4887
+  },
+  {
+    "keyword": "last_rule_line",
+    "process": "smp_fetch_last_rule_line",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stream.c",
+    "line": 4888
+  },
+  {
+    "keyword": "term_events",
+    "process": "smp_fetch_tevts",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stream.c",
+    "line": 4889
+  },
+  {
+    "keyword": "txn.conn_retries",
+    "process": "smp_fetch_conn_retries",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4SRV",
+    "file": "src/stream.c",
+    "line": 4890
+  },
+  {
+    "keyword": "txn.id32",
+    "process": "smp_fetch_id32",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stream.c",
+    "line": 4891
+  },
+  {
+    "keyword": "txn.redispatched",
+    "process": "smp_fetch_redispatched",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BOOL",
+    "valid_where": "SMP_USE_L4SRV",
+    "file": "src/stream.c",
+    "line": 4892
+  },
+  {
+    "keyword": "txn.sess_term_state",
+    "process": "smp_fetch_sess_term_state",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stream.c",
+    "line": 4893
+  },
+  {
+    "keyword": "waiting_entity",
+    "process": "smp_fetch_waiting_entity",
+    "arg_mask": "0",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_INTRN",
+    "file": "src/stream.c",
+    "line": 4894
+  },
+  {
+    "keyword": "accept_date",
+    "process": "smp_fetch_accept_date",
+    "arg_mask": "ARG1(0,STR)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/tcp_sample.c",
+    "line": 582
+  },
+  {
+    "keyword": "request_date",
+    "process": "smp_fetch_accept_date",
+    "arg_mask": "ARG1(0,STR)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_HRQHP",
+    "file": "src/tcp_sample.c",
+    "line": 583
+  },
+  {
+    "keyword": "bc_dst",
+    "process": "smp_fetch_dst",
+    "arg_mask": "0",
+    "out_type": "SMP_T_ADDR",
+    "valid_where": "SMP_USE_L4SRV",
+    "file": "src/tcp_sample.c",
+    "line": 585
+  },
+  {
+    "keyword": "bc_dst_port",
+    "process": "smp_fetch_dport",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4SRV",
+    "file": "src/tcp_sample.c",
+    "line": 586
+  },
+  {
+    "keyword": "bc_src",
+    "process": "smp_fetch_src",
+    "arg_mask": "0",
+    "out_type": "SMP_T_ADDR",
+    "valid_where": "SMP_USE_L4SRV",
+    "file": "src/tcp_sample.c",
+    "line": 587
+  },
+  {
+    "keyword": "bc_src_port",
+    "process": "smp_fetch_sport",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4SRV",
+    "file": "src/tcp_sample.c",
+    "line": 588
+  },
+  {
+    "keyword": "bc_reused",
+    "process": "smp_fetch_reused",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BOOL",
+    "valid_where": "SMP_USE_L4SRV",
+    "file": "src/tcp_sample.c",
+    "line": 589
+  },
+  {
+    "keyword": "dst",
+    "process": "smp_fetch_dst",
+    "arg_mask": "0",
+    "out_type": "SMP_T_ADDR",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/tcp_sample.c",
+    "line": 591
+  },
+  {
+    "keyword": "dst_is_local",
+    "process": "smp_fetch_dst_is_local",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BOOL",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/tcp_sample.c",
+    "line": 592
+  },
+  {
+    "keyword": "dst_port",
+    "process": "smp_fetch_dport",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/tcp_sample.c",
+    "line": 593
+  },
+  {
+    "keyword": "fc_dst",
+    "process": "smp_fetch_dst",
+    "arg_mask": "0",
+    "out_type": "SMP_T_ADDR",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/tcp_sample.c",
+    "line": 595
+  },
+  {
+    "keyword": "fc_dst_is_local",
+    "process": "smp_fetch_dst_is_local",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BOOL",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/tcp_sample.c",
+    "line": 596
+  },
+  {
+    "keyword": "fc_dst_port",
+    "process": "smp_fetch_dport",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/tcp_sample.c",
+    "line": 597
+  },
+  {
+    "keyword": "fc_src",
+    "process": "smp_fetch_src",
+    "arg_mask": "0",
+    "out_type": "SMP_T_ADDR",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/tcp_sample.c",
+    "line": 599
+  },
+  {
+    "keyword": "fc_src_is_local",
+    "process": "smp_fetch_src_is_local",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BOOL",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/tcp_sample.c",
+    "line": 600
+  },
+  {
+    "keyword": "fc_src_port",
+    "process": "smp_fetch_sport",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/tcp_sample.c",
+    "line": 601
+  },
+  {
+    "keyword": "src",
+    "process": "smp_fetch_src",
+    "arg_mask": "0",
+    "out_type": "SMP_T_ADDR",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/tcp_sample.c",
+    "line": 603
+  },
+  {
+    "keyword": "src_is_local",
+    "process": "smp_fetch_src_is_local",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BOOL",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/tcp_sample.c",
+    "line": 604
+  },
+  {
+    "keyword": "src_port",
+    "process": "smp_fetch_sport",
+    "arg_mask": "0",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/tcp_sample.c",
+    "line": 605
+  },
+  {
+    "keyword": "fc_saved_syn",
+    "process": "smp_fetch_fc_saved_syn",
+    "arg_mask": "0",
+    "out_type": "SMP_T_BIN",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/tcp_sample.c",
+    "line": 607
+  },
+  {
+    "keyword": "fc_rtt",
+    "process": "smp_fetch_fc_rtt",
+    "arg_mask": "ARG1(0,STR)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/tcp_sample.c",
+    "line": 610
+  },
+  {
+    "keyword": "fc_rttvar",
+    "process": "smp_fetch_fc_rttvar",
+    "arg_mask": "ARG1(0,STR)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/tcp_sample.c",
+    "line": 611
+  },
+  {
+    "keyword": "bc_rtt",
+    "process": "smp_fetch_bc_rtt",
+    "arg_mask": "ARG1(0,STR)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/tcp_sample.c",
+    "line": 612
+  },
+  {
+    "keyword": "bc_rttvar",
+    "process": "smp_fetch_bc_rttvar",
+    "arg_mask": "ARG1(0,STR)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/tcp_sample.c",
+    "line": 613
+  },
+  {
+    "keyword": "fc_unacked",
+    "process": "smp_fetch_fc_unacked",
+    "arg_mask": "ARG1(0,STR)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/tcp_sample.c",
+    "line": 616
+  },
+  {
+    "keyword": "fc_sacked",
+    "process": "smp_fetch_fc_sacked",
+    "arg_mask": "ARG1(0,STR)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/tcp_sample.c",
+    "line": 619
+  },
+  {
+    "keyword": "fc_retrans",
+    "process": "smp_fetch_fc_retrans",
+    "arg_mask": "ARG1(0,STR)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/tcp_sample.c",
+    "line": 622
+  },
+  {
+    "keyword": "fc_fackets",
+    "process": "smp_fetch_fc_fackets",
+    "arg_mask": "ARG1(0,STR)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/tcp_sample.c",
+    "line": 625
+  },
+  {
+    "keyword": "fc_lost",
+    "process": "smp_fetch_fc_lost",
+    "arg_mask": "ARG1(0,STR)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/tcp_sample.c",
+    "line": 628
+  },
+  {
+    "keyword": "fc_reordering",
+    "process": "smp_fetch_fc_reordering",
+    "arg_mask": "ARG1(0,STR)",
+    "out_type": "SMP_T_SINT",
+    "valid_where": "SMP_USE_L4CLI",
+    "file": "src/tcp_sample.c",
+    "line": 631
+  },
+  {
+    "keyword": "dump_all_vars",
+    "process": "smp_fetch_dump_all_vars",
+    "arg_mask": "ARG3(0,STR,STR,STR)",
+    "out_type": "SMP_T_STR",
+    "valid_where": "SMP_USE_CONST",
+    "file": "src/vars.c",
+    "line": 1663
+  },
+  {
+    "keyword": "var",
+    "process": "smp_fetch_var",
+    "arg_mask": "ARG2(1,STR,STR)",
+    "out_type": "SMP_T_ANY",
+    "valid_where": "SMP_USE_CONST",
+    "file": "src/vars.c",
+    "line": 1664
+  }
+]

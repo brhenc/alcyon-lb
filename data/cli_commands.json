@@ -1,0 +1,2294 @@
+[
+  {
+    "keywords": [
+      "acme",
+      "renew"
+    ],
+    "usage": "acme renew <certfile>                   : renew a certificate using the ACME protocol",
+    "parse_fn": "cli_acme_renew_parse",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/acme.c",
+    "line": 3751
+  },
+  {
+    "keywords": [
+      "acme",
+      "status"
+    ],
+    "usage": "acme status                             : show status of certificates configured with ACME",
+    "parse_fn": "cli_acme_parse_status",
+    "io_handler": "cli_acme_status_io_handler",
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/acme.c",
+    "line": 3752
+  },
+  {
+    "keywords": [
+      "acme",
+      "challenge_ready"
+    ],
+    "usage": "acme challenge_ready <certfile> domain <domain> : notify HAProxy that the ACME challenge is ready",
+    "parse_fn": "cli_acme_chall_ready_parse",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/acme.c",
+    "line": 3753
+  },
+  {
+    "keywords": [
+      "set",
+      "profiling"
+    ],
+    "usage": "set profiling <what> {auto|on|off}      : enable/disable resource profiling (tasks,memory)",
+    "parse_fn": "cli_parse_set_profiling",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/activity.c",
+    "line": 1871
+  },
+  {
+    "keywords": [
+      "show",
+      "activity"
+    ],
+    "usage": "show activity [-1|0|thread_num]         : show per-thread activity stats (for support/developers)",
+    "parse_fn": "cli_parse_show_activity",
+    "io_handler": "cli_io_handler_show_activity",
+    "release_fn": null,
+    "level": "ACCESS_LVL_OPER",
+    "file": "src/activity.c",
+    "line": 1872
+  },
+  {
+    "keywords": [
+      "show",
+      "profiling"
+    ],
+    "usage": "show profiling [<what>|<#lines>|<opts>]*: show profiling state (all,status,tasks,memory)",
+    "parse_fn": "cli_parse_show_profiling",
+    "io_handler": "cli_io_handler_show_profiling",
+    "release_fn": "cli_release_show_profiling",
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/activity.c",
+    "line": 1873
+  },
+  {
+    "keywords": [
+      "show",
+      "tasks"
+    ],
+    "usage": "show tasks                              : show running tasks",
+    "parse_fn": null,
+    "io_handler": "cli_io_handler_show_tasks",
+    "release_fn": null,
+    "level": "ACCESS_LVL_NONE",
+    "file": "src/activity.c",
+    "line": 1874
+  },
+  {
+    "keywords": [
+      "show",
+      "cache"
+    ],
+    "usage": "show cache                              : show cache status",
+    "parse_fn": "cli_parse_show_cache",
+    "io_handler": "cli_io_handler_show_cache",
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/cache.c",
+    "line": 3760
+  },
+  {
+    "keywords": [
+      "help"
+    ],
+    "usage": null,
+    "parse_fn": "cli_parse_simple",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_MASTER",
+    "file": "src/cli.c",
+    "line": 4460
+  },
+  {
+    "keywords": [
+      "echo"
+    ],
+    "usage": "echo <text>                             : print text to the output",
+    "parse_fn": "cli_parse_echo",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_MASTER",
+    "file": "src/cli.c",
+    "line": 4461
+  },
+  {
+    "keywords": [
+      "prompt"
+    ],
+    "usage": null,
+    "parse_fn": "cli_parse_simple",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_MASTER",
+    "file": "src/cli.c",
+    "line": 4462
+  },
+  {
+    "keywords": [
+      "quit"
+    ],
+    "usage": null,
+    "parse_fn": "cli_parse_simple",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_MASTER",
+    "file": "src/cli.c",
+    "line": 4463
+  },
+  {
+    "keywords": [
+      "_getsocks"
+    ],
+    "usage": null,
+    "parse_fn": "_getsocks",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_NONE",
+    "file": "src/cli.c",
+    "line": 4464
+  },
+  {
+    "keywords": [
+      "expert-mode"
+    ],
+    "usage": null,
+    "parse_fn": "cli_parse_expert_experimental_mode",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN | ACCESS_MASTER",
+    "file": "src/cli.c",
+    "line": 4465
+  },
+  {
+    "keywords": [
+      "experimental-mode"
+    ],
+    "usage": null,
+    "parse_fn": "cli_parse_expert_experimental_mode",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN | ACCESS_MASTER",
+    "file": "src/cli.c",
+    "line": 4466
+  },
+  {
+    "keywords": [
+      "mcli-debug-mode"
+    ],
+    "usage": null,
+    "parse_fn": "cli_parse_expert_experimental_mode",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN | ACCESS_MASTER_ONLY",
+    "file": "src/cli.c",
+    "line": 4467
+  },
+  {
+    "keywords": [
+      "set",
+      "anon",
+      "on"
+    ],
+    "usage": "set anon on [value]                     : activate the anonymized mode",
+    "parse_fn": "cli_parse_set_anon",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_NONE",
+    "file": "src/cli.c",
+    "line": 4468
+  },
+  {
+    "keywords": [
+      "set",
+      "anon",
+      "off"
+    ],
+    "usage": "set anon off                            : deactivate the anonymized mode",
+    "parse_fn": "cli_parse_set_anon",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_NONE",
+    "file": "src/cli.c",
+    "line": 4469
+  },
+  {
+    "keywords": [
+      "set",
+      "anon",
+      "global-key"
+    ],
+    "usage": "set anon global-key <value>             : change the global anonymizing key",
+    "parse_fn": "cli_parse_set_global_key",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/cli.c",
+    "line": 4470
+  },
+  {
+    "keywords": [
+      "set",
+      "maxconn",
+      "global"
+    ],
+    "usage": "set maxconn global <value>              : change the per-process maxconn setting",
+    "parse_fn": "cli_parse_set_maxconn_global",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/cli.c",
+    "line": 4471
+  },
+  {
+    "keywords": [
+      "set",
+      "rate-limit"
+    ],
+    "usage": "set rate-limit <setting> <value>        : change a rate limiting value",
+    "parse_fn": "cli_parse_set_ratelimit",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/cli.c",
+    "line": 4472
+  },
+  {
+    "keywords": [
+      "set",
+      "severity-output"
+    ],
+    "usage": "set severity-output [none|number|string]: set presence of severity level in feedback information",
+    "parse_fn": "cli_parse_set_severity_output",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_NONE",
+    "file": "src/cli.c",
+    "line": 4473
+  },
+  {
+    "keywords": [
+      "set",
+      "timeout"
+    ],
+    "usage": "set timeout [cli] <delay>               : change a timeout setting",
+    "parse_fn": "cli_parse_set_timeout",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_NONE",
+    "file": "src/cli.c",
+    "line": 4474
+  },
+  {
+    "keywords": [
+      "show",
+      "anon"
+    ],
+    "usage": "show anon                               : display the current state of anonymized mode",
+    "parse_fn": "cli_parse_show_anon",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_OPER",
+    "file": "src/cli.c",
+    "line": 4475
+  },
+  {
+    "keywords": [
+      "show",
+      "env"
+    ],
+    "usage": "show env [var]                          : dump environment variables known to the process",
+    "parse_fn": "cli_parse_show_env",
+    "io_handler": "cli_io_handler_show_env",
+    "release_fn": null,
+    "level": "ACCESS_LVL_OPER | ACCESS_MASTER",
+    "file": "src/cli.c",
+    "line": 4476
+  },
+  {
+    "keywords": [
+      "show",
+      "cli",
+      "sockets"
+    ],
+    "usage": "show cli sockets                        : dump list of cli sockets",
+    "parse_fn": "cli_parse_default",
+    "io_handler": "cli_io_handler_show_cli_sock",
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN | ACCESS_MASTER",
+    "file": "src/cli.c",
+    "line": 4477
+  },
+  {
+    "keywords": [
+      "show",
+      "cli",
+      "level"
+    ],
+    "usage": "show cli level                          : display the level of the current CLI session",
+    "parse_fn": "cli_parse_show_lvl",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN | ACCESS_MASTER",
+    "file": "src/cli.c",
+    "line": 4478
+  },
+  {
+    "keywords": [
+      "show",
+      "fd"
+    ],
+    "usage": "show fd [-!plcfbs]* [num]               : dump list of file descriptors in use or a specific one",
+    "parse_fn": "cli_parse_show_fd",
+    "io_handler": "cli_io_handler_show_fd",
+    "release_fn": "cli_release_show_fd",
+    "level": "ACCESS_LVL_OPER",
+    "file": "src/cli.c",
+    "line": 4479
+  },
+  {
+    "keywords": [
+      "show",
+      "version"
+    ],
+    "usage": "show version                            : show version of the current process",
+    "parse_fn": "cli_parse_show_version",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_MASTER",
+    "file": "src/cli.c",
+    "line": 4480
+  },
+  {
+    "keywords": [
+      "operator"
+    ],
+    "usage": "operator                                : lower the level of the current CLI session to operator",
+    "parse_fn": "cli_parse_set_lvl",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_OPER | ACCESS_MASTER",
+    "file": "src/cli.c",
+    "line": 4481
+  },
+  {
+    "keywords": [
+      "user"
+    ],
+    "usage": "user                                    : lower the level of the current CLI session to user",
+    "parse_fn": "cli_parse_set_lvl",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_OPER | ACCESS_MASTER",
+    "file": "src/cli.c",
+    "line": 4482
+  },
+  {
+    "keywords": [
+      "wait"
+    ],
+    "usage": "wait {-h|<delay_ms>} cond [args...]     : wait the specified delay or condition (-h to see list)",
+    "parse_fn": "cli_parse_wait",
+    "io_handler": "cli_io_handler_wait",
+    "release_fn": "cli_release_wait",
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/cli.c",
+    "line": 4483
+  },
+  {
+    "keywords": [
+      "_send_status"
+    ],
+    "usage": null,
+    "parse_fn": "_send_status",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_MASTER_ONLY",
+    "file": "src/cli.c",
+    "line": 4484
+  },
+  {
+    "keywords": [
+      "debug",
+      "counters"
+    ],
+    "usage": "debug counters [?|all|bug|cnt|chk|glt]* : dump/reset rare event counters",
+    "parse_fn": "debug_parse_cli_counters",
+    "io_handler": "debug_iohandler_counters",
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/debug.c",
+    "line": 3261
+  },
+  {
+    "keywords": [
+      "debug",
+      "dev",
+      "abort"
+    ],
+    "usage": "debug dev abort                         : call ABORT_NOW() and possibly crash",
+    "parse_fn": "debug_parse_cli_abort",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN | ACCESS_EXPERT",
+    "file": "src/debug.c",
+    "line": 3263
+  },
+  {
+    "keywords": [
+      "debug",
+      "dev",
+      "bug"
+    ],
+    "usage": "debug dev bug                           : call BUG_ON() and crash",
+    "parse_fn": "debug_parse_cli_bug",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN | ACCESS_EXPERT",
+    "file": "src/debug.c",
+    "line": 3264
+  },
+  {
+    "keywords": [
+      "debug",
+      "dev",
+      "check"
+    ],
+    "usage": "debug dev check                         : call CHECK_IF() and possibly crash",
+    "parse_fn": "debug_parse_cli_check",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN | ACCESS_EXPERT",
+    "file": "src/debug.c",
+    "line": 3265
+  },
+  {
+    "keywords": [
+      "debug",
+      "dev",
+      "close"
+    ],
+    "usage": "debug dev close  <fd> [hard]            : close this file descriptor",
+    "parse_fn": "debug_parse_cli_close",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN | ACCESS_EXPERT",
+    "file": "src/debug.c",
+    "line": 3266
+  },
+  {
+    "keywords": [
+      "debug",
+      "dev",
+      "deadlock"
+    ],
+    "usage": "debug dev deadlock [nbtask]             : deadlock between this number of tasks",
+    "parse_fn": "debug_parse_cli_deadlock",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN | ACCESS_EXPERT",
+    "file": "src/debug.c",
+    "line": 3267
+  },
+  {
+    "keywords": [
+      "debug",
+      "dev",
+      "delay"
+    ],
+    "usage": "debug dev delay  [ms]                   : sleep this long",
+    "parse_fn": "debug_parse_cli_delay",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN | ACCESS_EXPERT",
+    "file": "src/debug.c",
+    "line": 3268
+  },
+  {
+    "keywords": [
+      "debug",
+      "dev",
+      "delay-inj"
+    ],
+    "usage": "debug dev delay-inj <inter> <count>     : inject random delays into threads",
+    "parse_fn": "debug_parse_delay_inj",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN | ACCESS_EXPERT",
+    "file": "src/debug.c",
+    "line": 3270
+  },
+  {
+    "keywords": [
+      "debug",
+      "dev",
+      "exec"
+    ],
+    "usage": "debug dev exec   [cmd] ...              : show this command's output",
+    "parse_fn": "debug_parse_cli_exec",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN | ACCESS_EXPERT",
+    "file": "src/debug.c",
+    "line": 3271
+  },
+  {
+    "keywords": [
+      "debug",
+      "dev",
+      "fd"
+    ],
+    "usage": "debug dev fd                            : scan for rogue/unhandled FDs",
+    "parse_fn": "debug_parse_cli_fd",
+    "io_handler": "debug_iohandler_fd",
+    "release_fn": null,
+    "level": "ACCESS_LVL_OPER | ACCESS_EXPERT",
+    "file": "src/debug.c",
+    "line": 3273
+  },
+  {
+    "keywords": [
+      "debug",
+      "dev",
+      "exit"
+    ],
+    "usage": "debug dev exit   [code]                 : immediately exit the process",
+    "parse_fn": "debug_parse_cli_exit",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN | ACCESS_EXPERT",
+    "file": "src/debug.c",
+    "line": 3274
+  },
+  {
+    "keywords": [
+      "debug",
+      "dev",
+      "hash"
+    ],
+    "usage": "debug dev hash   [msg]                  : return msg hashed if anon is set",
+    "parse_fn": "debug_parse_cli_hash",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_NONE",
+    "file": "src/debug.c",
+    "line": 3275
+  },
+  {
+    "keywords": [
+      "debug",
+      "dev",
+      "hex"
+    ],
+    "usage": "debug dev hex    <addr> [len]           : dump a memory area",
+    "parse_fn": "debug_parse_cli_hex",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN | ACCESS_EXPERT",
+    "file": "src/debug.c",
+    "line": 3276
+  },
+  {
+    "keywords": [
+      "debug",
+      "dev",
+      "log"
+    ],
+    "usage": "debug dev log    [msg] ...              : send this msg to global logs",
+    "parse_fn": "debug_parse_cli_log",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN | ACCESS_EXPERT",
+    "file": "src/debug.c",
+    "line": 3277
+  },
+  {
+    "keywords": [
+      "debug",
+      "dev",
+      "loop"
+    ],
+    "usage": "debug dev loop   <ms> [isolated|warn]   : loop this long, possibly isolated",
+    "parse_fn": "debug_parse_cli_loop",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN | ACCESS_EXPERT",
+    "file": "src/debug.c",
+    "line": 3278
+  },
+  {
+    "keywords": [
+      "debug",
+      "dev",
+      "memstats"
+    ],
+    "usage": "debug dev memstats [reset|all|match ...]: dump/reset memory statistics",
+    "parse_fn": "debug_parse_cli_memstats",
+    "io_handler": "debug_iohandler_memstats",
+    "release_fn": "debug_release_memstats",
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/debug.c",
+    "line": 3280
+  },
+  {
+    "keywords": [
+      "debug",
+      "dev",
+      "panic"
+    ],
+    "usage": "debug dev panic                         : immediately trigger a panic",
+    "parse_fn": "debug_parse_cli_panic",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN | ACCESS_EXPERT",
+    "file": "src/debug.c",
+    "line": 3282
+  },
+  {
+    "keywords": [
+      "debug",
+      "dev",
+      "sched"
+    ],
+    "usage": "debug dev sched  {task|tasklet} [k=v]*  : stress the scheduler",
+    "parse_fn": "debug_parse_cli_sched",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN | ACCESS_EXPERT",
+    "file": "src/debug.c",
+    "line": 3283
+  },
+  {
+    "keywords": [
+      "debug",
+      "dev",
+      "stream"
+    ],
+    "usage": "debug dev stream [k=v]*                 : show/manipulate stream flags",
+    "parse_fn": "debug_parse_cli_stream",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN | ACCESS_EXPERT",
+    "file": "src/debug.c",
+    "line": 3284
+  },
+  {
+    "keywords": [
+      "debug",
+      "dev",
+      "sym"
+    ],
+    "usage": "debug dev sym    <addr>                 : resolve symbol address",
+    "parse_fn": "debug_parse_cli_sym",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN | ACCESS_EXPERT",
+    "file": "src/debug.c",
+    "line": 3285
+  },
+  {
+    "keywords": [
+      "debug",
+      "dev",
+      "task"
+    ],
+    "usage": "debug dev task <ptr> [wake|expire|kill] : show/wake/expire/kill task/tasklet",
+    "parse_fn": "debug_parse_cli_task",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN | ACCESS_EXPERT",
+    "file": "src/debug.c",
+    "line": 3286
+  },
+  {
+    "keywords": [
+      "debug",
+      "dev",
+      "tkill"
+    ],
+    "usage": "debug dev tkill  [thr] [sig]            : send signal to thread",
+    "parse_fn": "debug_parse_cli_tkill",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN | ACCESS_EXPERT",
+    "file": "src/debug.c",
+    "line": 3287
+  },
+  {
+    "keywords": [
+      "debug",
+      "dev",
+      "trace"
+    ],
+    "usage": "debug dev trace [nbthr]                 : flood traces from that many threads",
+    "parse_fn": "debug_parse_cli_trace",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN | ACCESS_EXPERT",
+    "file": "src/debug.c",
+    "line": 3289
+  },
+  {
+    "keywords": [
+      "debug",
+      "dev",
+      "warn"
+    ],
+    "usage": "debug dev warn                          : call WARN_ON() and possibly crash",
+    "parse_fn": "debug_parse_cli_warn",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN | ACCESS_EXPERT",
+    "file": "src/debug.c",
+    "line": 3291
+  },
+  {
+    "keywords": [
+      "debug",
+      "dev",
+      "write"
+    ],
+    "usage": "debug dev write  [size]                 : write that many bytes in return",
+    "parse_fn": "debug_parse_cli_write",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_EXPERT",
+    "file": "src/debug.c",
+    "line": 3292
+  },
+  {
+    "keywords": [
+      "show",
+      "dev"
+    ],
+    "usage": "show dev                                : show debug info for developers",
+    "parse_fn": "debug_parse_cli_show_dev",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_NONE",
+    "file": "src/debug.c",
+    "line": 3294
+  },
+  {
+    "keywords": [
+      "show",
+      "libs"
+    ],
+    "usage": "show libs                               : show loaded object files and libraries",
+    "parse_fn": "debug_parse_cli_show_libs",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_OPER",
+    "file": "src/debug.c",
+    "line": 3296
+  },
+  {
+    "keywords": [
+      "show",
+      "threads"
+    ],
+    "usage": "show threads                            : show some threads debugging information",
+    "parse_fn": null,
+    "io_handler": "cli_io_handler_show_threads",
+    "release_fn": null,
+    "level": "ACCESS_LVL_NONE",
+    "file": "src/debug.c",
+    "line": 3298
+  },
+  {
+    "keywords": [
+      "show",
+      "ssl",
+      "ech"
+    ],
+    "usage": "show ssl ech [<name>]                   : display a named ECH configuration or all",
+    "parse_fn": "cli_parse_show_ech",
+    "io_handler": "cli_io_handler_ech_details",
+    "release_fn": "cli_release_ech",
+    "level": "ACCESS_LVL_ADMIN | ACCESS_EXPERIMENTAL",
+    "file": "src/ech.c",
+    "line": 628
+  },
+  {
+    "keywords": [
+      "add",
+      "ssl",
+      "ech"
+    ],
+    "usage": "add ssl ech <name> <payload>            : add a new PEM-formatted ECH config and key ",
+    "parse_fn": "cli_parse_add_ech",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN | ACCESS_EXPERIMENTAL",
+    "file": "src/ech.c",
+    "line": 629
+  },
+  {
+    "keywords": [
+      "set",
+      "ssl",
+      "ech"
+    ],
+    "usage": "set ssl ech <name> <payload>            : replace all ECH configs with that provided",
+    "parse_fn": "cli_parse_set_ech",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN | ACCESS_EXPERIMENTAL",
+    "file": "src/ech.c",
+    "line": 630
+  },
+  {
+    "keywords": [
+      "del",
+      "ssl",
+      "ech"
+    ],
+    "usage": "del ssl ech <name> [<age-in-secs>]      : delete ECH configs",
+    "parse_fn": "cli_parse_del_ech",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN | ACCESS_EXPERIMENTAL",
+    "file": "src/ech.c",
+    "line": 631
+  },
+  {
+    "keywords": [
+      "show",
+      "startup-logs"
+    ],
+    "usage": "show startup-logs                       : report logs emitted during HAProxy startup",
+    "parse_fn": "cli_parse_show_startup_logs",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_OPER | ACCESS_MASTER",
+    "file": "src/errors.c",
+    "line": 449
+  },
+  {
+    "keywords": [
+      "httpclient"
+    ],
+    "usage": "httpclient <method> <URI>               : launch an HTTP request",
+    "parse_fn": "hc_cli_parse",
+    "io_handler": "hc_cli_io_handler",
+    "release_fn": "hc_cli_release",
+    "level": "ACCESS_LVL_ADMIN | ACCESS_EXPERT",
+    "file": "src/httpclient_cli.c",
+    "line": 269
+  },
+  {
+    "keywords": [
+      "add",
+      "acl"
+    ],
+    "usage": "add acl [@<ver>] <acl> <pattern>        : add an acl entry",
+    "parse_fn": "cli_parse_add_map",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/map.c",
+    "line": 1207
+  },
+  {
+    "keywords": [
+      "clear",
+      "acl"
+    ],
+    "usage": "clear acl [@<ver>] <acl>                : clear the contents of this acl",
+    "parse_fn": "cli_parse_clear_map",
+    "io_handler": "cli_io_handler_clear_map",
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/map.c",
+    "line": 1208
+  },
+  {
+    "keywords": [
+      "commit",
+      "acl"
+    ],
+    "usage": "commit acl @<ver> <acl>                 : commit the ACL at this version",
+    "parse_fn": "cli_parse_commit_map",
+    "io_handler": "cli_io_handler_clear_map",
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/map.c",
+    "line": 1209
+  },
+  {
+    "keywords": [
+      "del",
+      "acl"
+    ],
+    "usage": "del acl <acl> [<key>|#<ref>]            : delete acl entries matching <key>",
+    "parse_fn": "cli_parse_del_map",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/map.c",
+    "line": 1210
+  },
+  {
+    "keywords": [
+      "get",
+      "acl"
+    ],
+    "usage": "get acl <acl> <value>                   : report the patterns matching a sample for an ACL",
+    "parse_fn": "cli_parse_get_map",
+    "io_handler": "cli_io_handler_map_lookup",
+    "release_fn": "cli_release_mlook",
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/map.c",
+    "line": 1211
+  },
+  {
+    "keywords": [
+      "prepare",
+      "acl"
+    ],
+    "usage": "prepare acl <acl>                       : prepare a new version for atomic ACL replacement",
+    "parse_fn": "cli_parse_prepare_map",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/map.c",
+    "line": 1212
+  },
+  {
+    "keywords": [
+      "show",
+      "acl"
+    ],
+    "usage": "show acl [@<ver>] <acl>                 : report available acls or dump an acl's contents",
+    "parse_fn": "cli_parse_show_map",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/map.c",
+    "line": 1213
+  },
+  {
+    "keywords": [
+      "add",
+      "map"
+    ],
+    "usage": "add map [@<ver>] <map> <key> <val>      : add a map entry (payload supported instead of key/val)",
+    "parse_fn": "cli_parse_add_map",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/map.c",
+    "line": 1214
+  },
+  {
+    "keywords": [
+      "clear",
+      "map"
+    ],
+    "usage": "clear map [@<ver>] <map>                : clear the contents of this map",
+    "parse_fn": "cli_parse_clear_map",
+    "io_handler": "cli_io_handler_clear_map",
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/map.c",
+    "line": 1215
+  },
+  {
+    "keywords": [
+      "commit",
+      "map"
+    ],
+    "usage": "commit map @<ver> <map>                 : commit the map at this version",
+    "parse_fn": "cli_parse_commit_map",
+    "io_handler": "cli_io_handler_clear_map",
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/map.c",
+    "line": 1216
+  },
+  {
+    "keywords": [
+      "del",
+      "map"
+    ],
+    "usage": "del map <map> [<key>|#<ref>]            : delete map entries matching <key>",
+    "parse_fn": "cli_parse_del_map",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/map.c",
+    "line": 1217
+  },
+  {
+    "keywords": [
+      "get",
+      "map"
+    ],
+    "usage": "get map <map> <value>                   : report the keys and values matching a sample for a map",
+    "parse_fn": "cli_parse_get_map",
+    "io_handler": "cli_io_handler_map_lookup",
+    "release_fn": "cli_release_mlook",
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/map.c",
+    "line": 1218
+  },
+  {
+    "keywords": [
+      "prepare",
+      "map"
+    ],
+    "usage": "prepare map <map>                       : prepare a new version for atomic map replacement",
+    "parse_fn": "cli_parse_prepare_map",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/map.c",
+    "line": 1219
+  },
+  {
+    "keywords": [
+      "set",
+      "map"
+    ],
+    "usage": "set map <map> [<key>|#<ref>] <value>    : modify a map entry",
+    "parse_fn": "cli_parse_set_map",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/map.c",
+    "line": 1220
+  },
+  {
+    "keywords": [
+      "show",
+      "map"
+    ],
+    "usage": "show map [@<ver>] [map]                 : report available maps or dump a map's contents",
+    "parse_fn": "cli_parse_show_map",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/map.c",
+    "line": 1221
+  },
+  {
+    "keywords": [
+      "@<relative pid>"
+    ],
+    "usage": "@<relative pid>                         : send a command to the <relative pid> process",
+    "parse_fn": null,
+    "io_handler": "cli_io_handler_show_proc",
+    "release_fn": null,
+    "level": "ACCESS_MASTER_ONLY",
+    "file": "src/mworker.c",
+    "line": 1428
+  },
+  {
+    "keywords": [
+      "@!<pid>"
+    ],
+    "usage": "@!<pid>                                 : send a command to the <pid> process",
+    "parse_fn": "cli_parse_default",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_MASTER_ONLY",
+    "file": "src/mworker.c",
+    "line": 1429
+  },
+  {
+    "keywords": [
+      "@master"
+    ],
+    "usage": "@master                                 : send a command to the master process",
+    "parse_fn": "cli_parse_default",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_MASTER_ONLY",
+    "file": "src/mworker.c",
+    "line": 1430
+  },
+  {
+    "keywords": [
+      "show",
+      "proc"
+    ],
+    "usage": "show proc                               : show processes status",
+    "parse_fn": "cli_parse_show_proc",
+    "io_handler": "cli_io_handler_show_proc",
+    "release_fn": null,
+    "level": "ACCESS_LVL_OPER | ACCESS_MASTER_ONLY",
+    "file": "src/mworker.c",
+    "line": 1431
+  },
+  {
+    "keywords": [
+      "reload"
+    ],
+    "usage": "reload                                  : achieve a soft-reload (-sf) of haproxy",
+    "parse_fn": "cli_parse_reload",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_OPER | ACCESS_MASTER_ONLY",
+    "file": "src/mworker.c",
+    "line": 1432
+  },
+  {
+    "keywords": [
+      "hard-reload"
+    ],
+    "usage": "hard-reload                             : achieve a hard-reload (-st) of haproxy",
+    "parse_fn": "cli_parse_reload",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_OPER | ACCESS_MASTER_ONLY",
+    "file": "src/mworker.c",
+    "line": 1433
+  },
+  {
+    "keywords": [
+      "_loadstatus"
+    ],
+    "usage": null,
+    "parse_fn": "cli_parse_default",
+    "io_handler": "cli_io_handler_show_loadstatus",
+    "release_fn": null,
+    "level": "ACCESS_LVL_OPER | ACCESS_MASTER_ONLY",
+    "file": "src/mworker.c",
+    "line": 1434
+  },
+  {
+    "keywords": [
+      "show",
+      "peers"
+    ],
+    "usage": "show peers [dict|-] [section]           : dump some information about all the peers or this peers section",
+    "parse_fn": "cli_parse_show_peers",
+    "io_handler": "cli_io_handler_show_peers",
+    "release_fn": null,
+    "level": "ACCESS_LVL_NONE",
+    "file": "src/peers.c",
+    "line": 4502
+  },
+  {
+    "keywords": [
+      "show",
+      "pools"
+    ],
+    "usage": "show pools [by*] [match <pfx>] [nb]     : report information about the memory pools usage",
+    "parse_fn": "cli_parse_show_pools",
+    "io_handler": "cli_io_handler_dump_pools",
+    "release_fn": "cli_release_show_pools",
+    "level": "ACCESS_LVL_NONE",
+    "file": "src/pool.c",
+    "line": 1710
+  },
+  {
+    "keywords": [
+      "add",
+      "backend"
+    ],
+    "usage": "add backend <backend>                   : add a new backend",
+    "parse_fn": "cli_parse_add_backend",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/proxy.c",
+    "line": 5601
+  },
+  {
+    "keywords": [
+      "del",
+      "backend"
+    ],
+    "usage": "del backend <backend>                   : delete a backend",
+    "parse_fn": "cli_parse_delete_backend",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/proxy.c",
+    "line": 5602
+  },
+  {
+    "keywords": [
+      "disable",
+      "frontend"
+    ],
+    "usage": "disable frontend <frontend>             : temporarily disable specific frontend",
+    "parse_fn": "cli_parse_disable_frontend",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/proxy.c",
+    "line": 5603
+  },
+  {
+    "keywords": [
+      "enable",
+      "frontend"
+    ],
+    "usage": "enable frontend <frontend>              : re-enable specific frontend",
+    "parse_fn": "cli_parse_enable_frontend",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/proxy.c",
+    "line": 5604
+  },
+  {
+    "keywords": [
+      "publish",
+      "backend"
+    ],
+    "usage": "publish backend <backend>               : mark backend as ready for traffic",
+    "parse_fn": "cli_parse_publish_backend",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/proxy.c",
+    "line": 5605
+  },
+  {
+    "keywords": [
+      "set",
+      "maxconn",
+      "frontend"
+    ],
+    "usage": "set maxconn frontend <frontend> <value> : change a frontend's maxconn setting",
+    "parse_fn": "cli_parse_set_maxconn_frontend",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/proxy.c",
+    "line": 5606
+  },
+  {
+    "keywords": [
+      "show",
+      "default-server"
+    ],
+    "usage": "show default-server [<backend>]         : list default-server instances in all or a single backend",
+    "parse_fn": "cli_parse_show_default_server",
+    "io_handler": "cli_io_handler_show_default_server",
+    "release_fn": "cli_io_release_show_default_server",
+    "level": "ACCESS_LVL_NONE",
+    "file": "src/proxy.c",
+    "line": 5607
+  },
+  {
+    "keywords": [
+      "show",
+      "defaults"
+    ],
+    "usage": "show defaults                           : list all proxies defaults sections",
+    "parse_fn": null,
+    "io_handler": "cli_io_handler_show_defaults",
+    "release_fn": null,
+    "level": "ACCESS_LVL_NONE",
+    "file": "src/proxy.c",
+    "line": 5608
+  },
+  {
+    "keywords": [
+      "show",
+      "servers",
+      "conn"
+    ],
+    "usage": "show servers conn [<backend>]           : dump server connections status (all or for a single backend)",
+    "parse_fn": "cli_parse_show_servers",
+    "io_handler": "cli_io_handler_servers_state",
+    "release_fn": "cli_io_release_show_servers",
+    "level": "ACCESS_LVL_NONE",
+    "file": "src/proxy.c",
+    "line": 5609
+  },
+  {
+    "keywords": [
+      "show",
+      "servers",
+      "state"
+    ],
+    "usage": "show servers state [<backend>]          : dump volatile server information (all or for a single backend)",
+    "parse_fn": "cli_parse_show_servers",
+    "io_handler": "cli_io_handler_servers_state",
+    "release_fn": "cli_io_release_show_servers",
+    "level": "ACCESS_LVL_NONE",
+    "file": "src/proxy.c",
+    "line": 5610
+  },
+  {
+    "keywords": [
+      "show",
+      "backend"
+    ],
+    "usage": "show backend                            : list backends in the current running config",
+    "parse_fn": null,
+    "io_handler": "cli_io_handler_show_backend",
+    "release_fn": "cli_io_release_show_backend",
+    "level": "ACCESS_LVL_NONE",
+    "file": "src/proxy.c",
+    "line": 5611
+  },
+  {
+    "keywords": [
+      "shutdown",
+      "frontend"
+    ],
+    "usage": "shutdown frontend <frontend>            : stop a specific frontend",
+    "parse_fn": "cli_parse_shutdown_frontend",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/proxy.c",
+    "line": 5612
+  },
+  {
+    "keywords": [
+      "set",
+      "dynamic-cookie-key",
+      "backend"
+    ],
+    "usage": "set dynamic-cookie-key backend <bk> <k> : change a backend secret key for dynamic cookies",
+    "parse_fn": "cli_parse_set_dyncookie_key_backend",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/proxy.c",
+    "line": 5613
+  },
+  {
+    "keywords": [
+      "unpublish",
+      "backend"
+    ],
+    "usage": "unpublish backend <backend>             : remove backend for traffic processing",
+    "parse_fn": "cli_parse_unpublish_backend",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/proxy.c",
+    "line": 5614
+  },
+  {
+    "keywords": [
+      "enable",
+      "dynamic-cookie",
+      "backend"
+    ],
+    "usage": "enable dynamic-cookie backend <bk>      : enable dynamic cookies on a specific backend",
+    "parse_fn": "cli_parse_enable_dyncookie_backend",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/proxy.c",
+    "line": 5615
+  },
+  {
+    "keywords": [
+      "disable",
+      "dynamic-cookie",
+      "backend"
+    ],
+    "usage": "disable dynamic-cookie backend <bk>     : disable dynamic cookies on a specific backend",
+    "parse_fn": "cli_parse_disable_dyncookie_backend",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/proxy.c",
+    "line": 5616
+  },
+  {
+    "keywords": [
+      "show",
+      "errors"
+    ],
+    "usage": "show errors [<px>] [request|response]   : report last request and/or response errors for each proxy",
+    "parse_fn": "cli_parse_show_errors",
+    "io_handler": "cli_io_handler_show_errors",
+    "release_fn": "cli_io_release_show_errors",
+    "level": "ACCESS_LVL_OPER",
+    "file": "src/proxy.c",
+    "line": 5617
+  },
+  {
+    "keywords": [
+      "show",
+      "quic"
+    ],
+    "usage": "show quic [help|<format>] [<filter>]    : display quic connections status",
+    "parse_fn": "cli_parse_show_quic",
+    "io_handler": "cli_io_handler_dump_quic",
+    "release_fn": "cli_release_show_quic",
+    "level": "ACCESS_LVL_OPER",
+    "file": "src/quic_cli.c",
+    "line": 594
+  },
+  {
+    "keywords": [
+      "show",
+      "resolvers"
+    ],
+    "usage": "show resolvers [id]                     : dumps counters from all resolvers section and associated name servers",
+    "parse_fn": "cli_parse_stat_resolvers",
+    "io_handler": "cli_io_handler_dump_resolvers_to_buffer",
+    "release_fn": null,
+    "level": "ACCESS_LVL_NONE",
+    "file": "src/resolvers.c",
+    "line": 3211
+  },
+  {
+    "keywords": [
+      "disable",
+      "agent"
+    ],
+    "usage": "disable agent                           : disable agent checks",
+    "parse_fn": "cli_parse_disable_agent",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/server.c",
+    "line": 7088
+  },
+  {
+    "keywords": [
+      "disable",
+      "health"
+    ],
+    "usage": "disable health                          : disable health checks",
+    "parse_fn": "cli_parse_disable_health",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/server.c",
+    "line": 7089
+  },
+  {
+    "keywords": [
+      "disable",
+      "server"
+    ],
+    "usage": "disable server (DEPRECATED)             : disable a server for maintenance (use 'set server' instead)",
+    "parse_fn": "cli_parse_disable_server",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/server.c",
+    "line": 7090
+  },
+  {
+    "keywords": [
+      "enable",
+      "agent"
+    ],
+    "usage": "enable agent                            : enable agent checks",
+    "parse_fn": "cli_parse_enable_agent",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/server.c",
+    "line": 7091
+  },
+  {
+    "keywords": [
+      "enable",
+      "health"
+    ],
+    "usage": "enable health                           : enable health checks",
+    "parse_fn": "cli_parse_enable_health",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/server.c",
+    "line": 7092
+  },
+  {
+    "keywords": [
+      "enable",
+      "server"
+    ],
+    "usage": "enable server  (DEPRECATED)             : enable a disabled server (use 'set server' instead)",
+    "parse_fn": "cli_parse_enable_server",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/server.c",
+    "line": 7093
+  },
+  {
+    "keywords": [
+      "set",
+      "maxconn",
+      "server"
+    ],
+    "usage": "set maxconn server <bk>/<srv>           : change a server's maxconn setting",
+    "parse_fn": "cli_parse_set_maxconn_server",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/server.c",
+    "line": 7094
+  },
+  {
+    "keywords": [
+      "set",
+      "server"
+    ],
+    "usage": "set server <bk>/<srv> [opts]            : change a server's state, weight, address, name or ssl",
+    "parse_fn": "cli_parse_set_server",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/server.c",
+    "line": 7095
+  },
+  {
+    "keywords": [
+      "get",
+      "weight"
+    ],
+    "usage": "get weight <bk>/<srv>                   : report a server's current weight",
+    "parse_fn": "cli_parse_get_weight",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_NONE",
+    "file": "src/server.c",
+    "line": 7096
+  },
+  {
+    "keywords": [
+      "set",
+      "weight"
+    ],
+    "usage": "set weight <bk>/<srv>  (DEPRECATED)     : change a server's weight (use 'set server' instead)",
+    "parse_fn": "cli_parse_set_weight",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/server.c",
+    "line": 7097
+  },
+  {
+    "keywords": [
+      "add",
+      "server"
+    ],
+    "usage": "add server <bk>/<srv>                   : create a new server",
+    "parse_fn": "cli_parse_add_server",
+    "io_handler": "cli_io_handler_add_server",
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/server.c",
+    "line": 7098
+  },
+  {
+    "keywords": [
+      "del",
+      "server"
+    ],
+    "usage": "del server <bk>/<srv>                   : remove a dynamically added server",
+    "parse_fn": "cli_parse_delete_server",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/server.c",
+    "line": 7099
+  },
+  {
+    "keywords": [
+      "show",
+      "events"
+    ],
+    "usage": "show events [-0hnrsw]* [<sink>]         : show event sink state",
+    "parse_fn": "cli_parse_show_events",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_OPER",
+    "file": "src/sink.c",
+    "line": 1508
+  },
+  {
+    "keywords": [
+      "show",
+      "ssl",
+      "sni"
+    ],
+    "usage": "show ssl sni [-f <frontend>] [-A]       : display the list of SNI and their corresponding filename",
+    "parse_fn": "cli_parse_show_sni",
+    "io_handler": "cli_io_handler_show_sni",
+    "release_fn": "cli_release_show_sni",
+    "level": "ACCESS_LVL_NONE",
+    "file": "src/ssl_ckch.c",
+    "line": 4891
+  },
+  {
+    "keywords": [
+      "new",
+      "ssl",
+      "cert"
+    ],
+    "usage": "new ssl cert <certfile>                 : create a new certificate file to be used in a crt-list or a directory",
+    "parse_fn": "cli_parse_new_cert",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/ssl_ckch.c",
+    "line": 4893
+  },
+  {
+    "keywords": [
+      "set",
+      "ssl",
+      "cert"
+    ],
+    "usage": "set ssl cert <certfile> <payload>       : replace a certificate file",
+    "parse_fn": "cli_parse_set_cert",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/ssl_ckch.c",
+    "line": 4894
+  },
+  {
+    "keywords": [
+      "commit",
+      "ssl",
+      "cert"
+    ],
+    "usage": "commit ssl cert <certfile>              : commit a certificate file",
+    "parse_fn": "cli_parse_commit_cert",
+    "io_handler": "cli_io_handler_commit_cert",
+    "release_fn": "cli_release_commit_cert",
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/ssl_ckch.c",
+    "line": 4895
+  },
+  {
+    "keywords": [
+      "abort",
+      "ssl",
+      "cert"
+    ],
+    "usage": "abort ssl cert <certfile>               : abort a transaction for a certificate file",
+    "parse_fn": "cli_parse_abort_cert",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/ssl_ckch.c",
+    "line": 4896
+  },
+  {
+    "keywords": [
+      "del",
+      "ssl",
+      "cert"
+    ],
+    "usage": "del ssl cert <certfile>                 : delete an unused certificate file",
+    "parse_fn": "cli_parse_del_cert",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/ssl_ckch.c",
+    "line": 4897
+  },
+  {
+    "keywords": [
+      "show",
+      "ssl",
+      "cert"
+    ],
+    "usage": "show ssl cert [<certfile>]              : display the SSL certificates used in memory, or the details of a file",
+    "parse_fn": "cli_parse_show_cert",
+    "io_handler": "cli_io_handler_show_cert",
+    "release_fn": "cli_release_show_cert",
+    "level": "ACCESS_LVL_OPER",
+    "file": "src/ssl_ckch.c",
+    "line": 4898
+  },
+  {
+    "keywords": [
+      "dump",
+      "ssl",
+      "cert"
+    ],
+    "usage": "dump ssl cert <certfile>                : dump the SSL certificates in PEM format",
+    "parse_fn": "cli_parse_dump_cert",
+    "io_handler": "cli_io_handler_dump_cert",
+    "release_fn": "cli_release_dump_cert",
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/ssl_ckch.c",
+    "line": 4899
+  },
+  {
+    "keywords": [
+      "add",
+      "ssl",
+      "jwt"
+    ],
+    "usage": "add ssl jwt <certfile>                  : add certificate to list of certificates used for JWT validation",
+    "parse_fn": "cli_parse_add_jwt",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/ssl_ckch.c",
+    "line": 4901
+  },
+  {
+    "keywords": [
+      "del",
+      "ssl",
+      "jwt"
+    ],
+    "usage": "del ssl jwt <certfile>                  : remove certificate from list of certificates used for JWT validation",
+    "parse_fn": "cli_parse_del_jwt",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/ssl_ckch.c",
+    "line": 4902
+  },
+  {
+    "keywords": [
+      "show",
+      "ssl",
+      "jwt"
+    ],
+    "usage": "show ssl jwt                            : show list of certificates used for JWT validation",
+    "parse_fn": "cli_parse_show_jwt",
+    "io_handler": "cli_io_handler_show_jwt",
+    "release_fn": "cli_release_show_jwt",
+    "level": "ACCESS_LVL_OPER",
+    "file": "src/ssl_ckch.c",
+    "line": 4903
+  },
+  {
+    "keywords": [
+      "new",
+      "ssl",
+      "ca-file"
+    ],
+    "usage": "new ssl ca-file <cafile>                : create a new CA file to be used in a crt-list",
+    "parse_fn": "cli_parse_new_cafile",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/ssl_ckch.c",
+    "line": 4906
+  },
+  {
+    "keywords": [
+      "add",
+      "ssl",
+      "ca-file"
+    ],
+    "usage": "add ssl ca-file <cafile> <payload>      : add a certificate into the CA file",
+    "parse_fn": "cli_parse_set_cafile",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/ssl_ckch.c",
+    "line": 4907
+  },
+  {
+    "keywords": [
+      "set",
+      "ssl",
+      "ca-file"
+    ],
+    "usage": "set ssl ca-file <cafile> <payload>      : replace a CA file",
+    "parse_fn": "cli_parse_set_cafile",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/ssl_ckch.c",
+    "line": 4908
+  },
+  {
+    "keywords": [
+      "commit",
+      "ssl",
+      "ca-file"
+    ],
+    "usage": "commit ssl ca-file <cafile>             : commit a CA file",
+    "parse_fn": "cli_parse_commit_cafile",
+    "io_handler": "cli_io_handler_commit_cafile_crlfile",
+    "release_fn": "cli_release_commit_cafile",
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/ssl_ckch.c",
+    "line": 4909
+  },
+  {
+    "keywords": [
+      "abort",
+      "ssl",
+      "ca-file"
+    ],
+    "usage": "abort ssl ca-file <cafile>              : abort a transaction for a CA file",
+    "parse_fn": "cli_parse_abort_cafile",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/ssl_ckch.c",
+    "line": 4910
+  },
+  {
+    "keywords": [
+      "del",
+      "ssl",
+      "ca-file"
+    ],
+    "usage": "del ssl ca-file <cafile>                : delete an unused CA file",
+    "parse_fn": "cli_parse_del_cafile",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/ssl_ckch.c",
+    "line": 4911
+  },
+  {
+    "keywords": [
+      "show",
+      "ssl",
+      "ca-file"
+    ],
+    "usage": "show ssl ca-file [<cafile>[:<index>]]   : display the SSL CA files used in memory, or the details of a <cafile>, or a single certificate of index <index> of a CA file <cafile>",
+    "parse_fn": "cli_parse_show_cafile",
+    "io_handler": "cli_io_handler_show_cafile",
+    "release_fn": "cli_release_show_cafile",
+    "level": "ACCESS_LVL_OPER",
+    "file": "src/ssl_ckch.c",
+    "line": 4912
+  },
+  {
+    "keywords": [
+      "new",
+      "ssl",
+      "crl-file"
+    ],
+    "usage": "new ssl crl-file <crlfile>               : create a new CRL file to be used in a crt-list",
+    "parse_fn": "cli_parse_new_crlfile",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/ssl_ckch.c",
+    "line": 4914
+  },
+  {
+    "keywords": [
+      "set",
+      "ssl",
+      "crl-file"
+    ],
+    "usage": "set ssl crl-file <crlfile> <payload>    : replace a CRL file",
+    "parse_fn": "cli_parse_set_crlfile",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/ssl_ckch.c",
+    "line": 4915
+  },
+  {
+    "keywords": [
+      "commit",
+      "ssl",
+      "crl-file"
+    ],
+    "usage": "commit ssl crl-file <crlfile>           : commit a CRL file",
+    "parse_fn": "cli_parse_commit_crlfile",
+    "io_handler": "cli_io_handler_commit_cafile_crlfile",
+    "release_fn": "cli_release_commit_crlfile",
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/ssl_ckch.c",
+    "line": 4916
+  },
+  {
+    "keywords": [
+      "abort",
+      "ssl",
+      "crl-file"
+    ],
+    "usage": "abort ssl crl-file <crlfile>            : abort a transaction for a CRL file",
+    "parse_fn": "cli_parse_abort_crlfile",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/ssl_ckch.c",
+    "line": 4917
+  },
+  {
+    "keywords": [
+      "del",
+      "ssl",
+      "crl-file"
+    ],
+    "usage": "del ssl crl-file <crlfile>              : delete an unused CRL file",
+    "parse_fn": "cli_parse_del_crlfile",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/ssl_ckch.c",
+    "line": 4918
+  },
+  {
+    "keywords": [
+      "show",
+      "ssl",
+      "crl-file"
+    ],
+    "usage": "show ssl crl-file [<crlfile[:<index>>]] : display the SSL CRL files used in memory, or the details of a <crlfile>, or a single CRL of index <index> of CRL file <crlfile>",
+    "parse_fn": "cli_parse_show_crlfile",
+    "io_handler": "cli_io_handler_show_crlfile",
+    "release_fn": "cli_release_show_crlfile",
+    "level": "ACCESS_LVL_OPER",
+    "file": "src/ssl_ckch.c",
+    "line": 4919
+  },
+  {
+    "keywords": [
+      "add",
+      "ssl",
+      "crt-list"
+    ],
+    "usage": "add ssl crt-list <list> <cert> [opts]*  : add to crt-list file <list> a line <cert> or a payload",
+    "parse_fn": "cli_parse_add_crtlist",
+    "io_handler": "cli_io_handler_add_crtlist",
+    "release_fn": "cli_release_add_crtlist",
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/ssl_crtlist.c",
+    "line": 1634
+  },
+  {
+    "keywords": [
+      "del",
+      "ssl",
+      "crt-list"
+    ],
+    "usage": "del ssl crt-list <list> <cert[:line]>   : delete a line <cert> from crt-list file <list>",
+    "parse_fn": "cli_parse_del_crtlist",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/ssl_crtlist.c",
+    "line": 1635
+  },
+  {
+    "keywords": [
+      "show",
+      "ssl",
+      "crt-list"
+    ],
+    "usage": "show ssl crt-list [-n] [<list>]         : show the list of crt-lists or the content of a crt-list file <list>",
+    "parse_fn": "cli_parse_dump_crtlist",
+    "io_handler": "cli_io_handler_dump_crtlist",
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/ssl_crtlist.c",
+    "line": 1636
+  },
+  {
+    "keywords": [
+      "set",
+      "ssl",
+      "ocsp-response"
+    ],
+    "usage": "set ssl ocsp-response <resp|payload>       : update a certificate's OCSP Response from a base64-encode DER",
+    "parse_fn": "cli_parse_set_ocspresponse",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/ssl_ocsp.c",
+    "line": 2197
+  },
+  {
+    "keywords": [
+      "show",
+      "ssl",
+      "ocsp-response"
+    ],
+    "usage": "show ssl ocsp-response [[text|base64] id]  : display the IDs of the OCSP responses used in memory, or the details of a single OCSP response (in text or base64 format)",
+    "parse_fn": "cli_parse_show_ocspresponse",
+    "io_handler": "cli_io_handler_show_ocspresponse",
+    "release_fn": "cli_release_show_ocspresponse",
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/ssl_ocsp.c",
+    "line": 2199
+  },
+  {
+    "keywords": [
+      "show",
+      "ssl",
+      "ocsp-updates"
+    ],
+    "usage": "show ssl ocsp-updates                      : display information about the next 'nb' ocsp responses that will be updated automatically",
+    "parse_fn": "cli_parse_show_ocsp_updates",
+    "io_handler": "cli_io_handler_show_ocsp_updates",
+    "release_fn": "cli_release_show_ocsp_updates",
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/ssl_ocsp.c",
+    "line": 2200
+  },
+  {
+    "keywords": [
+      "update",
+      "ssl",
+      "ocsp-response"
+    ],
+    "usage": "update ssl ocsp-response <certfile>     : send ocsp request and update stored ocsp response",
+    "parse_fn": "cli_parse_update_ocsp_response",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/ssl_ocsp.c",
+    "line": 2202
+  },
+  {
+    "keywords": [
+      "show",
+      "tls-keys"
+    ],
+    "usage": "show tls-keys [id|*]                    : show tls keys references or dump tls ticket keys when id specified",
+    "parse_fn": "cli_parse_show_tlskeys",
+    "io_handler": "cli_io_handler_tlskeys_files",
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/ssl_sock.c",
+    "line": 8740
+  },
+  {
+    "keywords": [
+      "set",
+      "ssl",
+      "tls-key"
+    ],
+    "usage": "set ssl tls-key [id|file] <key>         : set the next TLS key for the <id> or <file> listener to <key>",
+    "parse_fn": "cli_parse_set_tlskeys",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/ssl_sock.c",
+    "line": 8741
+  },
+  {
+    "keywords": [
+      "show",
+      "ssl",
+      "providers"
+    ],
+    "usage": "show ssl providers                      : show loaded SSL providers",
+    "parse_fn": null,
+    "io_handler": "cli_io_handler_show_providers",
+    "release_fn": null,
+    "level": "ACCESS_LVL_NONE",
+    "file": "src/ssl_sock.c",
+    "line": 8744
+  },
+  {
+    "keywords": [
+      "clear",
+      "counters"
+    ],
+    "usage": "clear counters [all|server <bk>/<srv> [force]] : clear max statistics counters (or all, or one server's)",
+    "parse_fn": "cli_parse_clear_counters",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/stats.c",
+    "line": 1379
+  },
+  {
+    "keywords": [
+      "show",
+      "info"
+    ],
+    "usage": "show info [desc|json|typed|float]*      : report information about the running process",
+    "parse_fn": "cli_parse_show_info",
+    "io_handler": "cli_io_handler_dump_info",
+    "release_fn": null,
+    "level": "ACCESS_LVL_NONE",
+    "file": "src/stats.c",
+    "line": 1380
+  },
+  {
+    "keywords": [
+      "show",
+      "stat"
+    ],
+    "usage": "show stat [desc|json|no-maint|typed|up]*: report counters for each proxy and server",
+    "parse_fn": "cli_parse_show_stat",
+    "io_handler": "cli_io_handler_dump_stat",
+    "release_fn": "cli_io_handler_release_stat",
+    "level": "ACCESS_LVL_OPER",
+    "file": "src/stats.c",
+    "line": 1381
+  },
+  {
+    "keywords": [
+      "show",
+      "schema",
+      "json"
+    ],
+    "usage": "show schema json                        : report schema used for stats",
+    "parse_fn": "cli_parse_show_schema_json",
+    "io_handler": "cli_io_handler_dump_json_schema",
+    "release_fn": null,
+    "level": "ACCESS_LVL_NONE",
+    "file": "src/stats.c",
+    "line": 1382
+  },
+  {
+    "keywords": [
+      "dump",
+      "stats-file"
+    ],
+    "usage": "dump stats-file                         : dump stats for restore",
+    "parse_fn": "cli_parse_dump_stat_file",
+    "io_handler": "cli_io_handler_dump_stat_file",
+    "release_fn": "cli_io_handler_release_dump_stat_file",
+    "level": "ACCESS_LVL_NONE",
+    "file": "src/stats.c",
+    "line": 1383
+  },
+  {
+    "keywords": [
+      "clear",
+      "table"
+    ],
+    "usage": "clear table <table> [<filter>]*         : remove an entry from a table (filter: data/key)",
+    "parse_fn": "cli_parse_table_req",
+    "io_handler": "cli_io_handler_table",
+    "release_fn": "cli_release_show_table",
+    "level": "ACCESS_LVL_OPER",
+    "file": "src/stick_table.c",
+    "line": 6029
+  },
+  {
+    "keywords": [
+      "set",
+      "table"
+    ],
+    "usage": "set table <table> key <k> [data.* <v>]* : update or create a table entry's data",
+    "parse_fn": "cli_parse_table_req",
+    "io_handler": "cli_io_handler_table",
+    "release_fn": null,
+    "level": "ACCESS_LVL_OPER",
+    "file": "src/stick_table.c",
+    "line": 6030
+  },
+  {
+    "keywords": [
+      "show",
+      "table"
+    ],
+    "usage": "show table [<table> [<filter>]*]        : report table usage stats or dump this table's contents (filter: data/key)",
+    "parse_fn": "cli_parse_table_req",
+    "io_handler": "cli_io_handler_table",
+    "release_fn": "cli_release_show_table",
+    "level": "ACCESS_LVL_OPER",
+    "file": "src/stick_table.c",
+    "line": 6031
+  },
+  {
+    "keywords": [
+      "show",
+      "sess"
+    ],
+    "usage": "show sess [help|<id>|all] [opts...]     : report the list of current streams or dump this exact stream",
+    "parse_fn": "cli_parse_show_sess",
+    "io_handler": "cli_io_handler_dump_sess",
+    "release_fn": "cli_release_show_sess",
+    "level": "ACCESS_LVL_OPER",
+    "file": "src/stream.c",
+    "line": 4549
+  },
+  {
+    "keywords": [
+      "shutdown",
+      "session"
+    ],
+    "usage": "shutdown session [id]                   : kill a specific session",
+    "parse_fn": "cli_parse_shutdown_session",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/stream.c",
+    "line": 4550
+  },
+  {
+    "keywords": [
+      "shutdown",
+      "sessions",
+      "server"
+    ],
+    "usage": "shutdown sessions server <bk>/<srv>     : kill sessions on a server",
+    "parse_fn": "cli_parse_shutdown_sessions_server",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_ADMIN",
+    "file": "src/stream.c",
+    "line": 4551
+  },
+  {
+    "keywords": [
+      "trace"
+    ],
+    "usage": "trace [<module>|0] [cmd [args...]]      : manage live tracing (empty to list, 0 to stop all)",
+    "parse_fn": "cli_parse_trace",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_OPER",
+    "file": "src/trace.c",
+    "line": 1352
+  },
+  {
+    "keywords": [
+      "show",
+      "trace"
+    ],
+    "usage": "show trace [<module>]                   : show live tracing state",
+    "parse_fn": "cli_parse_show_trace",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_OPER",
+    "file": "src/trace.c",
+    "line": 1353
+  },
+  {
+    "keywords": [
+      "get",
+      "var"
+    ],
+    "usage": "get var <name>                          : retrieve contents of a process-wide variable",
+    "parse_fn": "vars_parse_cli_get_var",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_OPER",
+    "file": "src/vars.c",
+    "line": 1767
+  },
+  {
+    "keywords": [
+      "set",
+      "var"
+    ],
+    "usage": "set var <name> [fmt|expr] {<fmt>|<expr>}: set variable from an expression or a format",
+    "parse_fn": "vars_parse_cli_set_var",
+    "io_handler": null,
+    "release_fn": null,
+    "level": "ACCESS_LVL_OPER | ACCESS_EXPERIMENTAL",
+    "file": "src/vars.c",
+    "line": 1768
+  }
+]

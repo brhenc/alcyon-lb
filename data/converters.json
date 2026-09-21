@@ -1,0 +1,1901 @@
+[
+  {
+    "keyword": "nbsrv",
+    "process": "sample_conv_nbsrv",
+    "arg_mask": "0",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_SINT",
+    "file": "src/backend.c",
+    "line": 3988
+  },
+  {
+    "keyword": "srv_is_up",
+    "process": "sample_conv_srv_is_up",
+    "arg_mask": "0",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_BOOL",
+    "file": "src/backend.c",
+    "line": 3989
+  },
+  {
+    "keyword": "srv_queue",
+    "process": "sample_conv_srv_queue",
+    "arg_mask": "0",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_SINT",
+    "file": "src/backend.c",
+    "line": 3990
+  },
+  {
+    "keyword": "fe_exists",
+    "process": "sample_conv_fe_exists",
+    "arg_mask": "0",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_BOOL",
+    "file": "src/frontend.c",
+    "line": 361
+  },
+  {
+    "keyword": "http_date",
+    "process": "sample_conv_http_date",
+    "arg_mask": "ARG2(0,SINT,STR)",
+    "in_type": "SMP_T_SINT",
+    "out_type": "SMP_T_STR",
+    "file": "src/http_conv.c",
+    "line": 468
+  },
+  {
+    "keyword": "date",
+    "process": "sample_conv_http2epoch",
+    "arg_mask": "0",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_SINT",
+    "file": "src/http_conv.c",
+    "line": 469
+  },
+  {
+    "keyword": "language",
+    "process": "sample_conv_q_preferred",
+    "arg_mask": "ARG2(1,STR,STR)",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_STR",
+    "file": "src/http_conv.c",
+    "line": 470
+  },
+  {
+    "keyword": "capture-req",
+    "process": "smp_conv_req_capture",
+    "arg_mask": "ARG1(1,SINT)",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_STR",
+    "file": "src/http_conv.c",
+    "line": 471
+  },
+  {
+    "keyword": "capture-res",
+    "process": "smp_conv_res_capture",
+    "arg_mask": "ARG1(1,SINT)",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_STR",
+    "file": "src/http_conv.c",
+    "line": 472
+  },
+  {
+    "keyword": "url_dec",
+    "process": "sample_conv_url_dec",
+    "arg_mask": "ARG1(0,SINT)",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_STR",
+    "file": "src/http_conv.c",
+    "line": 473
+  },
+  {
+    "keyword": "url_enc",
+    "process": "sample_conv_url_enc",
+    "arg_mask": "ARG1(1,STR)",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_STR",
+    "file": "src/http_conv.c",
+    "line": 474
+  },
+  {
+    "keyword": "rfc7239_is_valid",
+    "process": "sample_conv_7239_valid",
+    "arg_mask": "0",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_BOOL",
+    "file": "src/http_ext.c",
+    "line": 1989
+  },
+  {
+    "keyword": "rfc7239_field",
+    "process": "sample_conv_7239_field",
+    "arg_mask": "ARG1(1,STR)",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_STR",
+    "file": "src/http_ext.c",
+    "line": 1990
+  },
+  {
+    "keyword": "rfc7239_n2nn",
+    "process": "sample_conv_7239_n2nn",
+    "arg_mask": "0",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_ANY",
+    "file": "src/http_ext.c",
+    "line": 1991
+  },
+  {
+    "keyword": "rfc7239_n2np",
+    "process": "sample_conv_7239_n2np",
+    "arg_mask": "0",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_ANY",
+    "file": "src/http_ext.c",
+    "line": 1992
+  },
+  {
+    "keyword": "rfc7239_nn",
+    "process": "sample_conv_7239_nn",
+    "arg_mask": "0",
+    "in_type": "SMP_T_ANY",
+    "out_type": "SMP_T_STR",
+    "file": "src/http_ext.c",
+    "line": 1993
+  },
+  {
+    "keyword": "rfc7239_np",
+    "process": "sample_conv_7239_np",
+    "arg_mask": "0",
+    "in_type": "SMP_T_ANY",
+    "out_type": "SMP_T_STR",
+    "file": "src/http_ext.c",
+    "line": 1994
+  },
+  {
+    "keyword": "jwt_decrypt_secret",
+    "process": "sample_conv_jwt_decrypt_secret",
+    "arg_mask": "ARG1(1,STR)",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_BIN",
+    "file": "src/jwe.c",
+    "line": 2285
+  },
+  {
+    "keyword": "jwt_decrypt_cert",
+    "process": "sample_conv_jwt_decrypt_cert",
+    "arg_mask": "ARG1(1,STR)",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_BIN",
+    "file": "src/jwe.c",
+    "line": 2286
+  },
+  {
+    "keyword": "jwt_decrypt_jwk",
+    "process": "sample_conv_jwt_decrypt_jwk",
+    "arg_mask": "ARG1(1,STR)",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_BIN",
+    "file": "src/jwe.c",
+    "line": 2287
+  },
+  {
+    "keyword": "map",
+    "process": "sample_conv_map",
+    "arg_mask": "ARG2(1,STR,STR)",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_STR",
+    "file": "src/map.c",
+    "line": 1244
+  },
+  {
+    "keyword": "map_str",
+    "process": "sample_conv_map",
+    "arg_mask": "ARG2(1,STR,STR)",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_STR",
+    "file": "src/map.c",
+    "line": 1245
+  },
+  {
+    "keyword": "map_beg",
+    "process": "sample_conv_map",
+    "arg_mask": "ARG2(1,STR,STR)",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_STR",
+    "file": "src/map.c",
+    "line": 1246
+  },
+  {
+    "keyword": "map_sub",
+    "process": "sample_conv_map",
+    "arg_mask": "ARG2(1,STR,STR)",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_STR",
+    "file": "src/map.c",
+    "line": 1247
+  },
+  {
+    "keyword": "map_dir",
+    "process": "sample_conv_map",
+    "arg_mask": "ARG2(1,STR,STR)",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_STR",
+    "file": "src/map.c",
+    "line": 1248
+  },
+  {
+    "keyword": "map_dom",
+    "process": "sample_conv_map",
+    "arg_mask": "ARG2(1,STR,STR)",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_STR",
+    "file": "src/map.c",
+    "line": 1249
+  },
+  {
+    "keyword": "map_end",
+    "process": "sample_conv_map",
+    "arg_mask": "ARG2(1,STR,STR)",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_STR",
+    "file": "src/map.c",
+    "line": 1250
+  },
+  {
+    "keyword": "map_reg",
+    "process": "sample_conv_map",
+    "arg_mask": "ARG2(1,STR,STR)",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_STR",
+    "file": "src/map.c",
+    "line": 1251
+  },
+  {
+    "keyword": "map_regm",
+    "process": "sample_conv_map",
+    "arg_mask": "ARG2(1,STR,STR)",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_STR",
+    "file": "src/map.c",
+    "line": 1252
+  },
+  {
+    "keyword": "map_int",
+    "process": "sample_conv_map",
+    "arg_mask": "ARG2(1,STR,STR)",
+    "in_type": "SMP_T_SINT",
+    "out_type": "SMP_T_STR",
+    "file": "src/map.c",
+    "line": 1253
+  },
+  {
+    "keyword": "map_ip",
+    "process": "sample_conv_map",
+    "arg_mask": "ARG2(1,STR,STR)",
+    "in_type": "SMP_T_ADDR",
+    "out_type": "SMP_T_STR",
+    "file": "src/map.c",
+    "line": 1254
+  },
+  {
+    "keyword": "map_str_int",
+    "process": "sample_conv_map",
+    "arg_mask": "ARG2(1,STR,SINT)",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_SINT",
+    "file": "src/map.c",
+    "line": 1256
+  },
+  {
+    "keyword": "map_beg_int",
+    "process": "sample_conv_map",
+    "arg_mask": "ARG2(1,STR,SINT)",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_SINT",
+    "file": "src/map.c",
+    "line": 1257
+  },
+  {
+    "keyword": "map_sub_int",
+    "process": "sample_conv_map",
+    "arg_mask": "ARG2(1,STR,SINT)",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_SINT",
+    "file": "src/map.c",
+    "line": 1258
+  },
+  {
+    "keyword": "map_dir_int",
+    "process": "sample_conv_map",
+    "arg_mask": "ARG2(1,STR,SINT)",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_SINT",
+    "file": "src/map.c",
+    "line": 1259
+  },
+  {
+    "keyword": "map_dom_int",
+    "process": "sample_conv_map",
+    "arg_mask": "ARG2(1,STR,SINT)",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_SINT",
+    "file": "src/map.c",
+    "line": 1260
+  },
+  {
+    "keyword": "map_end_int",
+    "process": "sample_conv_map",
+    "arg_mask": "ARG2(1,STR,SINT)",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_SINT",
+    "file": "src/map.c",
+    "line": 1261
+  },
+  {
+    "keyword": "map_reg_int",
+    "process": "sample_conv_map",
+    "arg_mask": "ARG2(1,STR,SINT)",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_SINT",
+    "file": "src/map.c",
+    "line": 1262
+  },
+  {
+    "keyword": "map_int_int",
+    "process": "sample_conv_map",
+    "arg_mask": "ARG2(1,STR,SINT)",
+    "in_type": "SMP_T_SINT",
+    "out_type": "SMP_T_SINT",
+    "file": "src/map.c",
+    "line": 1263
+  },
+  {
+    "keyword": "map_ip_int",
+    "process": "sample_conv_map",
+    "arg_mask": "ARG2(1,STR,SINT)",
+    "in_type": "SMP_T_ADDR",
+    "out_type": "SMP_T_SINT",
+    "file": "src/map.c",
+    "line": 1264
+  },
+  {
+    "keyword": "map_str_ip",
+    "process": "sample_conv_map",
+    "arg_mask": "ARG2(1,STR,STR)",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_ADDR",
+    "file": "src/map.c",
+    "line": 1266
+  },
+  {
+    "keyword": "map_beg_ip",
+    "process": "sample_conv_map",
+    "arg_mask": "ARG2(1,STR,STR)",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_ADDR",
+    "file": "src/map.c",
+    "line": 1267
+  },
+  {
+    "keyword": "map_sub_ip",
+    "process": "sample_conv_map",
+    "arg_mask": "ARG2(1,STR,STR)",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_ADDR",
+    "file": "src/map.c",
+    "line": 1268
+  },
+  {
+    "keyword": "map_dir_ip",
+    "process": "sample_conv_map",
+    "arg_mask": "ARG2(1,STR,STR)",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_ADDR",
+    "file": "src/map.c",
+    "line": 1269
+  },
+  {
+    "keyword": "map_dom_ip",
+    "process": "sample_conv_map",
+    "arg_mask": "ARG2(1,STR,STR)",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_ADDR",
+    "file": "src/map.c",
+    "line": 1270
+  },
+  {
+    "keyword": "map_end_ip",
+    "process": "sample_conv_map",
+    "arg_mask": "ARG2(1,STR,STR)",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_ADDR",
+    "file": "src/map.c",
+    "line": 1271
+  },
+  {
+    "keyword": "map_reg_ip",
+    "process": "sample_conv_map",
+    "arg_mask": "ARG2(1,STR,STR)",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_ADDR",
+    "file": "src/map.c",
+    "line": 1272
+  },
+  {
+    "keyword": "map_int_ip",
+    "process": "sample_conv_map",
+    "arg_mask": "ARG2(1,STR,STR)",
+    "in_type": "SMP_T_SINT",
+    "out_type": "SMP_T_ADDR",
+    "file": "src/map.c",
+    "line": 1273
+  },
+  {
+    "keyword": "map_ip_ip",
+    "process": "sample_conv_map",
+    "arg_mask": "ARG2(1,STR,STR)",
+    "in_type": "SMP_T_ADDR",
+    "out_type": "SMP_T_ADDR",
+    "file": "src/map.c",
+    "line": 1274
+  },
+  {
+    "keyword": "map_str_key",
+    "process": "sample_conv_map_key",
+    "arg_mask": "ARG1(1,STR)",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_STR",
+    "file": "src/map.c",
+    "line": 1276
+  },
+  {
+    "keyword": "map_beg_key",
+    "process": "sample_conv_map_key",
+    "arg_mask": "ARG1(1,STR)",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_STR",
+    "file": "src/map.c",
+    "line": 1277
+  },
+  {
+    "keyword": "map_sub_key",
+    "process": "sample_conv_map_key",
+    "arg_mask": "ARG1(1,STR)",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_STR",
+    "file": "src/map.c",
+    "line": 1278
+  },
+  {
+    "keyword": "map_dir_key",
+    "process": "sample_conv_map_key",
+    "arg_mask": "ARG1(1,STR)",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_STR",
+    "file": "src/map.c",
+    "line": 1279
+  },
+  {
+    "keyword": "map_dom_key",
+    "process": "sample_conv_map_key",
+    "arg_mask": "ARG1(1,STR)",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_STR",
+    "file": "src/map.c",
+    "line": 1280
+  },
+  {
+    "keyword": "map_end_key",
+    "process": "sample_conv_map_key",
+    "arg_mask": "ARG1(1,STR)",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_STR",
+    "file": "src/map.c",
+    "line": 1281
+  },
+  {
+    "keyword": "map_reg_key",
+    "process": "sample_conv_map_key",
+    "arg_mask": "ARG1(1,STR)",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_STR",
+    "file": "src/map.c",
+    "line": 1282
+  },
+  {
+    "keyword": "map_int_key",
+    "process": "sample_conv_map_key",
+    "arg_mask": "ARG1(1,STR)",
+    "in_type": "SMP_T_SINT",
+    "out_type": "SMP_T_STR",
+    "file": "src/map.c",
+    "line": 1283
+  },
+  {
+    "keyword": "map_ip_key",
+    "process": "sample_conv_map_key",
+    "arg_mask": "ARG1(1,STR)",
+    "in_type": "SMP_T_ADDR",
+    "out_type": "SMP_T_STR",
+    "file": "src/map.c",
+    "line": 1284
+  },
+  {
+    "keyword": "eth.data",
+    "process": "sample_conv_eth_data",
+    "arg_mask": "0",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_BIN",
+    "file": "src/net_helper.c",
+    "line": 844
+  },
+  {
+    "keyword": "eth.dst",
+    "process": "sample_conv_eth_dst",
+    "arg_mask": "0",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_BIN",
+    "file": "src/net_helper.c",
+    "line": 845
+  },
+  {
+    "keyword": "eth.hdr",
+    "process": "sample_conv_eth_hdr",
+    "arg_mask": "0",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_BIN",
+    "file": "src/net_helper.c",
+    "line": 846
+  },
+  {
+    "keyword": "eth.proto",
+    "process": "sample_conv_eth_proto",
+    "arg_mask": "0",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_SINT",
+    "file": "src/net_helper.c",
+    "line": 847
+  },
+  {
+    "keyword": "eth.src",
+    "process": "sample_conv_eth_src",
+    "arg_mask": "0",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_BIN",
+    "file": "src/net_helper.c",
+    "line": 848
+  },
+  {
+    "keyword": "eth.vlan",
+    "process": "sample_conv_eth_vlan",
+    "arg_mask": "0",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_SINT",
+    "file": "src/net_helper.c",
+    "line": 849
+  },
+  {
+    "keyword": "ip.data",
+    "process": "sample_conv_ip_data",
+    "arg_mask": "0",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_BIN",
+    "file": "src/net_helper.c",
+    "line": 851
+  },
+  {
+    "keyword": "ip.df",
+    "process": "sample_conv_ip_df",
+    "arg_mask": "0",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_SINT",
+    "file": "src/net_helper.c",
+    "line": 852
+  },
+  {
+    "keyword": "ip.dst",
+    "process": "sample_conv_ip_dst",
+    "arg_mask": "0",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_ADDR",
+    "file": "src/net_helper.c",
+    "line": 853
+  },
+  {
+    "keyword": "ip.fp",
+    "process": "sample_conv_ip_fp",
+    "arg_mask": "ARG1(0,SINT)",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_BIN",
+    "file": "src/net_helper.c",
+    "line": 854
+  },
+  {
+    "keyword": "ip.hdr",
+    "process": "sample_conv_ip_hdr",
+    "arg_mask": "0",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_BIN",
+    "file": "src/net_helper.c",
+    "line": 855
+  },
+  {
+    "keyword": "ip.proto",
+    "process": "sample_conv_ip_proto",
+    "arg_mask": "0",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_SINT",
+    "file": "src/net_helper.c",
+    "line": 856
+  },
+  {
+    "keyword": "ip.src",
+    "process": "sample_conv_ip_src",
+    "arg_mask": "0",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_ADDR",
+    "file": "src/net_helper.c",
+    "line": 857
+  },
+  {
+    "keyword": "ip.tos",
+    "process": "sample_conv_ip_tos",
+    "arg_mask": "0",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_SINT",
+    "file": "src/net_helper.c",
+    "line": 858
+  },
+  {
+    "keyword": "ip.ttl",
+    "process": "sample_conv_ip_ttl",
+    "arg_mask": "0",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_SINT",
+    "file": "src/net_helper.c",
+    "line": 859
+  },
+  {
+    "keyword": "ip.ver",
+    "process": "sample_conv_ip_ver",
+    "arg_mask": "0",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_SINT",
+    "file": "src/net_helper.c",
+    "line": 860
+  },
+  {
+    "keyword": "tcp.dst",
+    "process": "sample_conv_tcp_dst",
+    "arg_mask": "0",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_SINT",
+    "file": "src/net_helper.c",
+    "line": 862
+  },
+  {
+    "keyword": "tcp.flags",
+    "process": "sample_conv_tcp_flags",
+    "arg_mask": "0",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_SINT",
+    "file": "src/net_helper.c",
+    "line": 863
+  },
+  {
+    "keyword": "tcp.options.mss",
+    "process": "sample_conv_tcp_options_mss",
+    "arg_mask": "0",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_SINT",
+    "file": "src/net_helper.c",
+    "line": 864
+  },
+  {
+    "keyword": "tcp.options.sack",
+    "process": "sample_conv_tcp_options_sack",
+    "arg_mask": "0",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_SINT",
+    "file": "src/net_helper.c",
+    "line": 865
+  },
+  {
+    "keyword": "tcp.options.tsopt",
+    "process": "sample_conv_tcp_options_tsopt",
+    "arg_mask": "0",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_SINT",
+    "file": "src/net_helper.c",
+    "line": 866
+  },
+  {
+    "keyword": "tcp.options.tsval",
+    "process": "sample_conv_tcp_options_tsval",
+    "arg_mask": "0",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_SINT",
+    "file": "src/net_helper.c",
+    "line": 867
+  },
+  {
+    "keyword": "tcp.options.wscale",
+    "process": "sample_conv_tcp_options_wscale",
+    "arg_mask": "0",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_SINT",
+    "file": "src/net_helper.c",
+    "line": 868
+  },
+  {
+    "keyword": "tcp.options.wsopt",
+    "process": "sample_conv_tcp_options_wsopt",
+    "arg_mask": "0",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_SINT",
+    "file": "src/net_helper.c",
+    "line": 869
+  },
+  {
+    "keyword": "tcp.options_list",
+    "process": "sample_conv_tcp_options_list",
+    "arg_mask": "0",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_BIN",
+    "file": "src/net_helper.c",
+    "line": 870
+  },
+  {
+    "keyword": "tcp.seq",
+    "process": "sample_conv_tcp_seq",
+    "arg_mask": "0",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_SINT",
+    "file": "src/net_helper.c",
+    "line": 871
+  },
+  {
+    "keyword": "tcp.src",
+    "process": "sample_conv_tcp_src",
+    "arg_mask": "0",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_SINT",
+    "file": "src/net_helper.c",
+    "line": 872
+  },
+  {
+    "keyword": "tcp.win",
+    "process": "sample_conv_tcp_win",
+    "arg_mask": "0",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_SINT",
+    "file": "src/net_helper.c",
+    "line": 873
+  },
+  {
+    "keyword": "add_item",
+    "process": "sample_conv_add_item",
+    "arg_mask": "ARG3(2,STR,STR,STR)",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_STR",
+    "file": "src/sample.c",
+    "line": 5992
+  },
+  {
+    "keyword": "debug",
+    "process": "sample_conv_debug",
+    "arg_mask": "ARG2(0,STR,STR)",
+    "in_type": "SMP_T_ANY",
+    "out_type": "SMP_T_SAME",
+    "file": "src/sample.c",
+    "line": 5993
+  },
+  {
+    "keyword": "b64dec",
+    "process": "sample_conv_base642bin",
+    "arg_mask": "0",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_BIN",
+    "file": "src/sample.c",
+    "line": 5994
+  },
+  {
+    "keyword": "base64",
+    "process": "sample_conv_bin2base64",
+    "arg_mask": "0",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_STR",
+    "file": "src/sample.c",
+    "line": 5995
+  },
+  {
+    "keyword": "concat",
+    "process": "sample_conv_concat",
+    "arg_mask": "ARG3(1,STR,STR,STR)",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_STR",
+    "file": "src/sample.c",
+    "line": 5996
+  },
+  {
+    "keyword": "ub64enc",
+    "process": "sample_conv_bin2base64url",
+    "arg_mask": "0",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_STR",
+    "file": "src/sample.c",
+    "line": 5997
+  },
+  {
+    "keyword": "ub64dec",
+    "process": "sample_conv_base64url2bin",
+    "arg_mask": "0",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_BIN",
+    "file": "src/sample.c",
+    "line": 5998
+  },
+  {
+    "keyword": "upper",
+    "process": "sample_conv_str2upper",
+    "arg_mask": "0",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_STR",
+    "file": "src/sample.c",
+    "line": 5999
+  },
+  {
+    "keyword": "lower",
+    "process": "sample_conv_str2lower",
+    "arg_mask": "0",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_STR",
+    "file": "src/sample.c",
+    "line": 6000
+  },
+  {
+    "keyword": "length",
+    "process": "sample_conv_length",
+    "arg_mask": "0",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_SINT",
+    "file": "src/sample.c",
+    "line": 6001
+  },
+  {
+    "keyword": "base2",
+    "process": "sample_conv_bin2base2",
+    "arg_mask": "0",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_STR",
+    "file": "src/sample.c",
+    "line": 6002
+  },
+  {
+    "keyword": "be2dec",
+    "process": "sample_conv_be2dec",
+    "arg_mask": "ARG3(1,STR,SINT,SINT)",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_STR",
+    "file": "src/sample.c",
+    "line": 6003
+  },
+  {
+    "keyword": "le2dec",
+    "process": "sample_conv_le2dec",
+    "arg_mask": "ARG3(1,STR,SINT,SINT)",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_STR",
+    "file": "src/sample.c",
+    "line": 6004
+  },
+  {
+    "keyword": "be2hex",
+    "process": "sample_conv_be2hex",
+    "arg_mask": "ARG3(1,STR,SINT,SINT)",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_STR",
+    "file": "src/sample.c",
+    "line": 6005
+  },
+  {
+    "keyword": "be_sort",
+    "process": "sample_conv_be_sort",
+    "arg_mask": "ARG1(1,SINT)",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_BIN",
+    "file": "src/sample.c",
+    "line": 6006
+  },
+  {
+    "keyword": "has_ctl",
+    "process": "sample_conv_hasctl",
+    "arg_mask": "ARG1(0,STR)",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_BOOL",
+    "file": "src/sample.c",
+    "line": 6007
+  },
+  {
+    "keyword": "hex",
+    "process": "sample_conv_bin2hex",
+    "arg_mask": "0",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_STR",
+    "file": "src/sample.c",
+    "line": 6008
+  },
+  {
+    "keyword": "hex2i",
+    "process": "sample_conv_hex2int",
+    "arg_mask": "0",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_SINT",
+    "file": "src/sample.c",
+    "line": 6009
+  },
+  {
+    "keyword": "ipmask",
+    "process": "sample_conv_ipmask",
+    "arg_mask": "ARG2(1,MSK4,MSK6)",
+    "in_type": "SMP_T_ADDR",
+    "out_type": "SMP_T_ADDR",
+    "file": "src/sample.c",
+    "line": 6010
+  },
+  {
+    "keyword": "ltime",
+    "process": "sample_conv_ltime",
+    "arg_mask": "ARG2(1,STR,SINT)",
+    "in_type": "SMP_T_SINT",
+    "out_type": "SMP_T_STR",
+    "file": "src/sample.c",
+    "line": 6011
+  },
+  {
+    "keyword": "ms_ltime",
+    "process": "sample_conv_ms_ltime",
+    "arg_mask": "ARG2(1,STR,SINT)",
+    "in_type": "SMP_T_SINT",
+    "out_type": "SMP_T_STR",
+    "file": "src/sample.c",
+    "line": 6012
+  },
+  {
+    "keyword": "us_ltime",
+    "process": "sample_conv_us_ltime",
+    "arg_mask": "ARG2(1,STR,SINT)",
+    "in_type": "SMP_T_SINT",
+    "out_type": "SMP_T_STR",
+    "file": "src/sample.c",
+    "line": 6013
+  },
+  {
+    "keyword": "utime",
+    "process": "sample_conv_utime",
+    "arg_mask": "ARG2(1,STR,SINT)",
+    "in_type": "SMP_T_SINT",
+    "out_type": "SMP_T_STR",
+    "file": "src/sample.c",
+    "line": 6014
+  },
+  {
+    "keyword": "ms_utime",
+    "process": "sample_conv_ms_utime",
+    "arg_mask": "ARG2(1,STR,SINT)",
+    "in_type": "SMP_T_SINT",
+    "out_type": "SMP_T_STR",
+    "file": "src/sample.c",
+    "line": 6015
+  },
+  {
+    "keyword": "us_utime",
+    "process": "sample_conv_us_utime",
+    "arg_mask": "ARG2(1,STR,SINT)",
+    "in_type": "SMP_T_SINT",
+    "out_type": "SMP_T_STR",
+    "file": "src/sample.c",
+    "line": 6016
+  },
+  {
+    "keyword": "crc32",
+    "process": "sample_conv_crc32",
+    "arg_mask": "ARG1(0,SINT)",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_SINT",
+    "file": "src/sample.c",
+    "line": 6017
+  },
+  {
+    "keyword": "crc32c",
+    "process": "sample_conv_crc32c",
+    "arg_mask": "ARG1(0,SINT)",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_SINT",
+    "file": "src/sample.c",
+    "line": 6018
+  },
+  {
+    "keyword": "djb2",
+    "process": "sample_conv_djb2",
+    "arg_mask": "ARG1(0,SINT)",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_SINT",
+    "file": "src/sample.c",
+    "line": 6019
+  },
+  {
+    "keyword": "sdbm",
+    "process": "sample_conv_sdbm",
+    "arg_mask": "ARG1(0,SINT)",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_SINT",
+    "file": "src/sample.c",
+    "line": 6020
+  },
+  {
+    "keyword": "wt6",
+    "process": "sample_conv_wt6",
+    "arg_mask": "ARG1(0,SINT)",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_SINT",
+    "file": "src/sample.c",
+    "line": 6021
+  },
+  {
+    "keyword": "xxh3",
+    "process": "sample_conv_xxh3",
+    "arg_mask": "ARG1(0,SINT)",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_SINT",
+    "file": "src/sample.c",
+    "line": 6022
+  },
+  {
+    "keyword": "xxh32",
+    "process": "sample_conv_xxh32",
+    "arg_mask": "ARG1(0,SINT)",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_SINT",
+    "file": "src/sample.c",
+    "line": 6023
+  },
+  {
+    "keyword": "xxh64",
+    "process": "sample_conv_xxh64",
+    "arg_mask": "ARG1(0,SINT)",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_SINT",
+    "file": "src/sample.c",
+    "line": 6024
+  },
+  {
+    "keyword": "json",
+    "process": "sample_conv_json",
+    "arg_mask": "ARG1(1,STR)",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_STR",
+    "file": "src/sample.c",
+    "line": 6025
+  },
+  {
+    "keyword": "bytes",
+    "process": "sample_conv_bytes",
+    "arg_mask": "ARG2(1,STR,STR)",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_BIN",
+    "file": "src/sample.c",
+    "line": 6026
+  },
+  {
+    "keyword": "field",
+    "process": "sample_conv_field",
+    "arg_mask": "ARG3(2,SINT,STR,SINT)",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_STR",
+    "file": "src/sample.c",
+    "line": 6027
+  },
+  {
+    "keyword": "word",
+    "process": "sample_conv_word",
+    "arg_mask": "ARG3(2,SINT,STR,SINT)",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_STR",
+    "file": "src/sample.c",
+    "line": 6028
+  },
+  {
+    "keyword": "param",
+    "process": "sample_conv_param",
+    "arg_mask": "ARG2(1,STR,STR)",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_STR",
+    "file": "src/sample.c",
+    "line": 6029
+  },
+  {
+    "keyword": "regsub",
+    "process": "sample_conv_regsub",
+    "arg_mask": "ARG3(2,REG,STR,STR)",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_STR",
+    "file": "src/sample.c",
+    "line": 6030
+  },
+  {
+    "keyword": "sha1",
+    "process": "sample_conv_sha1",
+    "arg_mask": "0",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_BIN",
+    "file": "src/sample.c",
+    "line": 6031
+  },
+  {
+    "keyword": "strcmp",
+    "process": "sample_conv_strcmp",
+    "arg_mask": "ARG1(1,STR)",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_SINT",
+    "file": "src/sample.c",
+    "line": 6032
+  },
+  {
+    "keyword": "host_only",
+    "process": "sample_conv_host_only",
+    "arg_mask": "0",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_STR",
+    "file": "src/sample.c",
+    "line": 6033
+  },
+  {
+    "keyword": "port_only",
+    "process": "sample_conv_port_only",
+    "arg_mask": "0",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_SINT",
+    "file": "src/sample.c",
+    "line": 6034
+  },
+  {
+    "keyword": "reverse",
+    "process": "sample_conv_reverse",
+    "arg_mask": "0",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_STR",
+    "file": "src/sample.c",
+    "line": 6035
+  },
+  {
+    "keyword": "reverse_dom",
+    "process": "sample_conv_reverse_dom",
+    "arg_mask": "0",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_STR",
+    "file": "src/sample.c",
+    "line": 6036
+  },
+  {
+    "keyword": "ungrpc",
+    "process": "sample_conv_ungrpc",
+    "arg_mask": "ARG2(1,PBUF_FNUM,STR)",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_BIN",
+    "file": "src/sample.c",
+    "line": 6039
+  },
+  {
+    "keyword": "protobuf",
+    "process": "sample_conv_protobuf",
+    "arg_mask": "ARG2(1,PBUF_FNUM,STR)",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_BIN",
+    "file": "src/sample.c",
+    "line": 6040
+  },
+  {
+    "keyword": "fix_is_valid",
+    "process": "sample_conv_fix_is_valid",
+    "arg_mask": "0",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_BOOL",
+    "file": "src/sample.c",
+    "line": 6043
+  },
+  {
+    "keyword": "fix_tag_value",
+    "process": "sample_conv_fix_tag_value",
+    "arg_mask": "ARG1(1,STR)",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_BIN",
+    "file": "src/sample.c",
+    "line": 6044
+  },
+  {
+    "keyword": "mqtt_is_valid",
+    "process": "sample_conv_mqtt_is_valid",
+    "arg_mask": "0",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_BOOL",
+    "file": "src/sample.c",
+    "line": 6047
+  },
+  {
+    "keyword": "mqtt_field_value",
+    "process": "sample_conv_mqtt_field_value",
+    "arg_mask": "ARG2(2,STR,STR)",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_STR",
+    "file": "src/sample.c",
+    "line": 6048
+  },
+  {
+    "keyword": "iif",
+    "process": "sample_conv_iif",
+    "arg_mask": "ARG2(2, STR, STR)",
+    "in_type": "SMP_T_BOOL",
+    "out_type": "SMP_T_STR",
+    "file": "src/sample.c",
+    "line": 6050
+  },
+  {
+    "keyword": "and",
+    "process": "sample_conv_binary_and",
+    "arg_mask": "ARG1(1,STR)",
+    "in_type": "SMP_T_SINT",
+    "out_type": "SMP_T_SINT",
+    "file": "src/sample.c",
+    "line": 6052
+  },
+  {
+    "keyword": "or",
+    "process": "sample_conv_binary_or",
+    "arg_mask": "ARG1(1,STR)",
+    "in_type": "SMP_T_SINT",
+    "out_type": "SMP_T_SINT",
+    "file": "src/sample.c",
+    "line": 6053
+  },
+  {
+    "keyword": "xor",
+    "process": "sample_conv_binary_xor",
+    "arg_mask": "ARG1(1,STR)",
+    "in_type": "SMP_T_SINT",
+    "out_type": "SMP_T_SINT",
+    "file": "src/sample.c",
+    "line": 6054
+  },
+  {
+    "keyword": "cpl",
+    "process": "sample_conv_binary_cpl",
+    "arg_mask": "0",
+    "in_type": "SMP_T_SINT",
+    "out_type": "SMP_T_SINT",
+    "file": "src/sample.c",
+    "line": 6055
+  },
+  {
+    "keyword": "bool",
+    "process": "sample_conv_arith_bool",
+    "arg_mask": "0",
+    "in_type": "SMP_T_SINT",
+    "out_type": "SMP_T_BOOL",
+    "file": "src/sample.c",
+    "line": 6056
+  },
+  {
+    "keyword": "not",
+    "process": "sample_conv_arith_not",
+    "arg_mask": "0",
+    "in_type": "SMP_T_SINT",
+    "out_type": "SMP_T_BOOL",
+    "file": "src/sample.c",
+    "line": 6057
+  },
+  {
+    "keyword": "odd",
+    "process": "sample_conv_arith_odd",
+    "arg_mask": "0",
+    "in_type": "SMP_T_SINT",
+    "out_type": "SMP_T_BOOL",
+    "file": "src/sample.c",
+    "line": 6058
+  },
+  {
+    "keyword": "even",
+    "process": "sample_conv_arith_even",
+    "arg_mask": "0",
+    "in_type": "SMP_T_SINT",
+    "out_type": "SMP_T_BOOL",
+    "file": "src/sample.c",
+    "line": 6059
+  },
+  {
+    "keyword": "add",
+    "process": "sample_conv_arith_add",
+    "arg_mask": "ARG1(1,STR)",
+    "in_type": "SMP_T_SINT",
+    "out_type": "SMP_T_SINT",
+    "file": "src/sample.c",
+    "line": 6060
+  },
+  {
+    "keyword": "sub",
+    "process": "sample_conv_arith_sub",
+    "arg_mask": "ARG1(1,STR)",
+    "in_type": "SMP_T_SINT",
+    "out_type": "SMP_T_SINT",
+    "file": "src/sample.c",
+    "line": 6061
+  },
+  {
+    "keyword": "mul",
+    "process": "sample_conv_arith_mul",
+    "arg_mask": "ARG1(1,STR)",
+    "in_type": "SMP_T_SINT",
+    "out_type": "SMP_T_SINT",
+    "file": "src/sample.c",
+    "line": 6062
+  },
+  {
+    "keyword": "div",
+    "process": "sample_conv_arith_div",
+    "arg_mask": "ARG1(1,STR)",
+    "in_type": "SMP_T_SINT",
+    "out_type": "SMP_T_SINT",
+    "file": "src/sample.c",
+    "line": 6063
+  },
+  {
+    "keyword": "mod",
+    "process": "sample_conv_arith_mod",
+    "arg_mask": "ARG1(1,STR)",
+    "in_type": "SMP_T_SINT",
+    "out_type": "SMP_T_SINT",
+    "file": "src/sample.c",
+    "line": 6064
+  },
+  {
+    "keyword": "neg",
+    "process": "sample_conv_arith_neg",
+    "arg_mask": "0",
+    "in_type": "SMP_T_SINT",
+    "out_type": "SMP_T_SINT",
+    "file": "src/sample.c",
+    "line": 6065
+  },
+  {
+    "keyword": "htonl",
+    "process": "sample_conv_htonl",
+    "arg_mask": "0",
+    "in_type": "SMP_T_SINT",
+    "out_type": "SMP_T_BIN",
+    "file": "src/sample.c",
+    "line": 6067
+  },
+  {
+    "keyword": "cut_crlf",
+    "process": "sample_conv_cut_crlf",
+    "arg_mask": "0",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_STR",
+    "file": "src/sample.c",
+    "line": 6068
+  },
+  {
+    "keyword": "ltrim",
+    "process": "sample_conv_ltrim",
+    "arg_mask": "ARG1(1,STR)",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_STR",
+    "file": "src/sample.c",
+    "line": 6069
+  },
+  {
+    "keyword": "rtrim",
+    "process": "sample_conv_rtrim",
+    "arg_mask": "ARG1(1,STR)",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_STR",
+    "file": "src/sample.c",
+    "line": 6070
+  },
+  {
+    "keyword": "json_query",
+    "process": "sample_conv_json_query",
+    "arg_mask": "ARG2(1,STR,STR)",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_ANY",
+    "file": "src/sample.c",
+    "line": 6071
+  },
+  {
+    "keyword": "jwt_header_query",
+    "process": "sample_conv_jwt_header_query",
+    "arg_mask": "ARG2(0,STR,STR)",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_ANY",
+    "file": "src/sample.c",
+    "line": 6075
+  },
+  {
+    "keyword": "jwt_payload_query",
+    "process": "sample_conv_jwt_payload_query",
+    "arg_mask": "ARG2(0,STR,STR)",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_ANY",
+    "file": "src/sample.c",
+    "line": 6076
+  },
+  {
+    "keyword": "jwt_verify",
+    "process": "sample_conv_jwt_verify",
+    "arg_mask": "ARG2(2,STR,STR)",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_SINT",
+    "file": "src/sample.c",
+    "line": 6077
+  },
+  {
+    "keyword": "jwt_verify_cert",
+    "process": "sample_conv_jwt_verify_cert",
+    "arg_mask": "ARG2(2,STR,STR)",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_SINT",
+    "file": "src/sample.c",
+    "line": 6078
+  },
+  {
+    "keyword": "when",
+    "process": "sample_conv_when",
+    "arg_mask": "ARG3(1,STR,STR,STR)",
+    "in_type": "SMP_T_ANY",
+    "out_type": "SMP_T_ANY",
+    "file": "src/sample.c",
+    "line": 6080
+  },
+  {
+    "keyword": "sha2",
+    "process": "sample_conv_sha2",
+    "arg_mask": "ARG1(0, SINT)",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_BIN",
+    "file": "src/ssl_sample.c",
+    "line": 2953
+  },
+  {
+    "keyword": "aes_gcm_enc",
+    "process": "sample_conv_aes",
+    "arg_mask": "ARG5(4,SINT,STR,STR,STR,STR)",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_BIN",
+    "file": "src/ssl_sample.c",
+    "line": 2955
+  },
+  {
+    "keyword": "aes_gcm_dec",
+    "process": "sample_conv_aes",
+    "arg_mask": "ARG5(4,SINT,STR,STR,STR,STR)",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_BIN",
+    "file": "src/ssl_sample.c",
+    "line": 2956
+  },
+  {
+    "keyword": "aes_cbc_enc",
+    "process": "sample_conv_aes",
+    "arg_mask": "ARG4(3,SINT,STR,STR,STR)",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_BIN",
+    "file": "src/ssl_sample.c",
+    "line": 2959
+  },
+  {
+    "keyword": "aes_cbc_dec",
+    "process": "sample_conv_aes",
+    "arg_mask": "ARG4(3,SINT,STR,STR,STR)",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_BIN",
+    "file": "src/ssl_sample.c",
+    "line": 2960
+  },
+  {
+    "keyword": "x509_v_err_str",
+    "process": "sample_conv_x509_v_err",
+    "arg_mask": "0",
+    "in_type": "SMP_T_SINT",
+    "out_type": "SMP_T_STR",
+    "file": "src/ssl_sample.c",
+    "line": 2962
+  },
+  {
+    "keyword": "digest",
+    "process": "sample_conv_crypto_digest",
+    "arg_mask": "ARG1(1,STR)",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_BIN",
+    "file": "src/ssl_sample.c",
+    "line": 2963
+  },
+  {
+    "keyword": "hmac",
+    "process": "sample_conv_crypto_hmac",
+    "arg_mask": "ARG2(2,STR,STR)",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_BIN",
+    "file": "src/ssl_sample.c",
+    "line": 2964
+  },
+  {
+    "keyword": "secure_memcmp",
+    "process": "sample_conv_secure_memcmp",
+    "arg_mask": "ARG1(1,STR)",
+    "in_type": "SMP_T_BIN",
+    "out_type": "SMP_T_BOOL",
+    "file": "src/ssl_sample.c",
+    "line": 2966
+  },
+  {
+    "keyword": "in_table",
+    "process": "sample_conv_in_table",
+    "arg_mask": "ARG1(1,TAB)",
+    "in_type": "SMP_T_ANY",
+    "out_type": "SMP_T_BOOL",
+    "file": "src/stick_table.c",
+    "line": 6288
+  },
+  {
+    "keyword": "table_bytes_in_rate",
+    "process": "sample_conv_table_bytes_in_rate",
+    "arg_mask": "ARG1(1,TAB)",
+    "in_type": "SMP_T_ANY",
+    "out_type": "SMP_T_SINT",
+    "file": "src/stick_table.c",
+    "line": 6289
+  },
+  {
+    "keyword": "table_bytes_out_rate",
+    "process": "sample_conv_table_bytes_out_rate",
+    "arg_mask": "ARG1(1,TAB)",
+    "in_type": "SMP_T_ANY",
+    "out_type": "SMP_T_SINT",
+    "file": "src/stick_table.c",
+    "line": 6290
+  },
+  {
+    "keyword": "table_clr_gpc",
+    "process": "sample_conv_table_clr_gpc",
+    "arg_mask": "ARG2(2,SINT,TAB)",
+    "in_type": "SMP_T_ANY",
+    "out_type": "SMP_T_SINT",
+    "file": "src/stick_table.c",
+    "line": 6291
+  },
+  {
+    "keyword": "table_clr_gpc0",
+    "process": "sample_conv_table_clr_gpc0",
+    "arg_mask": "ARG1(1,TAB)",
+    "in_type": "SMP_T_ANY",
+    "out_type": "SMP_T_SINT",
+    "file": "src/stick_table.c",
+    "line": 6292
+  },
+  {
+    "keyword": "table_clr_gpc1",
+    "process": "sample_conv_table_clr_gpc1",
+    "arg_mask": "ARG1(1,TAB)",
+    "in_type": "SMP_T_ANY",
+    "out_type": "SMP_T_SINT",
+    "file": "src/stick_table.c",
+    "line": 6293
+  },
+  {
+    "keyword": "table_conn_cnt",
+    "process": "sample_conv_table_conn_cnt",
+    "arg_mask": "ARG1(1,TAB)",
+    "in_type": "SMP_T_ANY",
+    "out_type": "SMP_T_SINT",
+    "file": "src/stick_table.c",
+    "line": 6294
+  },
+  {
+    "keyword": "table_conn_cur",
+    "process": "sample_conv_table_conn_cur",
+    "arg_mask": "ARG1(1,TAB)",
+    "in_type": "SMP_T_ANY",
+    "out_type": "SMP_T_SINT",
+    "file": "src/stick_table.c",
+    "line": 6295
+  },
+  {
+    "keyword": "table_conn_rate",
+    "process": "sample_conv_table_conn_rate",
+    "arg_mask": "ARG1(1,TAB)",
+    "in_type": "SMP_T_ANY",
+    "out_type": "SMP_T_SINT",
+    "file": "src/stick_table.c",
+    "line": 6296
+  },
+  {
+    "keyword": "table_expire",
+    "process": "sample_conv_table_expire",
+    "arg_mask": "ARG2(1,TAB,SINT)",
+    "in_type": "SMP_T_ANY",
+    "out_type": "SMP_T_SINT",
+    "file": "src/stick_table.c",
+    "line": 6297
+  },
+  {
+    "keyword": "table_gpt",
+    "process": "sample_conv_table_gpt",
+    "arg_mask": "ARG2(2,SINT,TAB)",
+    "in_type": "SMP_T_ANY",
+    "out_type": "SMP_T_SINT",
+    "file": "src/stick_table.c",
+    "line": 6298
+  },
+  {
+    "keyword": "table_gpt0",
+    "process": "sample_conv_table_gpt0",
+    "arg_mask": "ARG1(1,TAB)",
+    "in_type": "SMP_T_ANY",
+    "out_type": "SMP_T_SINT",
+    "file": "src/stick_table.c",
+    "line": 6299
+  },
+  {
+    "keyword": "table_gpc",
+    "process": "sample_conv_table_gpc",
+    "arg_mask": "ARG2(2,SINT,TAB)",
+    "in_type": "SMP_T_ANY",
+    "out_type": "SMP_T_SINT",
+    "file": "src/stick_table.c",
+    "line": 6300
+  },
+  {
+    "keyword": "table_gpc0",
+    "process": "sample_conv_table_gpc0",
+    "arg_mask": "ARG1(1,TAB)",
+    "in_type": "SMP_T_ANY",
+    "out_type": "SMP_T_SINT",
+    "file": "src/stick_table.c",
+    "line": 6301
+  },
+  {
+    "keyword": "table_gpc1",
+    "process": "sample_conv_table_gpc1",
+    "arg_mask": "ARG1(1,TAB)",
+    "in_type": "SMP_T_ANY",
+    "out_type": "SMP_T_SINT",
+    "file": "src/stick_table.c",
+    "line": 6302
+  },
+  {
+    "keyword": "table_gpc_rate",
+    "process": "sample_conv_table_gpc_rate",
+    "arg_mask": "ARG2(2,SINT,TAB)",
+    "in_type": "SMP_T_ANY",
+    "out_type": "SMP_T_SINT",
+    "file": "src/stick_table.c",
+    "line": 6303
+  },
+  {
+    "keyword": "table_gpc0_rate",
+    "process": "sample_conv_table_gpc0_rate",
+    "arg_mask": "ARG1(1,TAB)",
+    "in_type": "SMP_T_ANY",
+    "out_type": "SMP_T_SINT",
+    "file": "src/stick_table.c",
+    "line": 6304
+  },
+  {
+    "keyword": "table_gpc1_rate",
+    "process": "sample_conv_table_gpc1_rate",
+    "arg_mask": "ARG1(1,TAB)",
+    "in_type": "SMP_T_ANY",
+    "out_type": "SMP_T_SINT",
+    "file": "src/stick_table.c",
+    "line": 6305
+  },
+  {
+    "keyword": "table_glitch_cnt",
+    "process": "sample_conv_table_glitch_cnt",
+    "arg_mask": "ARG1(1,TAB)",
+    "in_type": "SMP_T_ANY",
+    "out_type": "SMP_T_SINT",
+    "file": "src/stick_table.c",
+    "line": 6306
+  },
+  {
+    "keyword": "table_glitch_rate",
+    "process": "sample_conv_table_glitch_rate",
+    "arg_mask": "ARG1(1,TAB)",
+    "in_type": "SMP_T_ANY",
+    "out_type": "SMP_T_SINT",
+    "file": "src/stick_table.c",
+    "line": 6307
+  },
+  {
+    "keyword": "table_http_err_cnt",
+    "process": "sample_conv_table_http_err_cnt",
+    "arg_mask": "ARG1(1,TAB)",
+    "in_type": "SMP_T_ANY",
+    "out_type": "SMP_T_SINT",
+    "file": "src/stick_table.c",
+    "line": 6308
+  },
+  {
+    "keyword": "table_http_err_rate",
+    "process": "sample_conv_table_http_err_rate",
+    "arg_mask": "ARG1(1,TAB)",
+    "in_type": "SMP_T_ANY",
+    "out_type": "SMP_T_SINT",
+    "file": "src/stick_table.c",
+    "line": 6309
+  },
+  {
+    "keyword": "table_http_fail_cnt",
+    "process": "sample_conv_table_http_fail_cnt",
+    "arg_mask": "ARG1(1,TAB)",
+    "in_type": "SMP_T_ANY",
+    "out_type": "SMP_T_SINT",
+    "file": "src/stick_table.c",
+    "line": 6310
+  },
+  {
+    "keyword": "table_http_fail_rate",
+    "process": "sample_conv_table_http_fail_rate",
+    "arg_mask": "ARG1(1,TAB)",
+    "in_type": "SMP_T_ANY",
+    "out_type": "SMP_T_SINT",
+    "file": "src/stick_table.c",
+    "line": 6311
+  },
+  {
+    "keyword": "table_http_req_cnt",
+    "process": "sample_conv_table_http_req_cnt",
+    "arg_mask": "ARG1(1,TAB)",
+    "in_type": "SMP_T_ANY",
+    "out_type": "SMP_T_SINT",
+    "file": "src/stick_table.c",
+    "line": 6312
+  },
+  {
+    "keyword": "table_http_req_rate",
+    "process": "sample_conv_table_http_req_rate",
+    "arg_mask": "ARG1(1,TAB)",
+    "in_type": "SMP_T_ANY",
+    "out_type": "SMP_T_SINT",
+    "file": "src/stick_table.c",
+    "line": 6313
+  },
+  {
+    "keyword": "table_idle",
+    "process": "sample_conv_table_idle",
+    "arg_mask": "ARG2(1,TAB,SINT)",
+    "in_type": "SMP_T_ANY",
+    "out_type": "SMP_T_SINT",
+    "file": "src/stick_table.c",
+    "line": 6314
+  },
+  {
+    "keyword": "table_inc_gpc",
+    "process": "sample_conv_table_inc_gpc",
+    "arg_mask": "ARG2(2,SINT,TAB)",
+    "in_type": "SMP_T_ANY",
+    "out_type": "SMP_T_SINT",
+    "file": "src/stick_table.c",
+    "line": 6315
+  },
+  {
+    "keyword": "table_inc_gpc0",
+    "process": "sample_conv_table_inc_gpc0",
+    "arg_mask": "ARG1(1,TAB)",
+    "in_type": "SMP_T_ANY",
+    "out_type": "SMP_T_SINT",
+    "file": "src/stick_table.c",
+    "line": 6316
+  },
+  {
+    "keyword": "table_inc_gpc1",
+    "process": "sample_conv_table_inc_gpc1",
+    "arg_mask": "ARG1(1,TAB)",
+    "in_type": "SMP_T_ANY",
+    "out_type": "SMP_T_SINT",
+    "file": "src/stick_table.c",
+    "line": 6317
+  },
+  {
+    "keyword": "table_kbytes_in",
+    "process": "sample_conv_table_kbytes_in",
+    "arg_mask": "ARG1(1,TAB)",
+    "in_type": "SMP_T_ANY",
+    "out_type": "SMP_T_SINT",
+    "file": "src/stick_table.c",
+    "line": 6318
+  },
+  {
+    "keyword": "table_kbytes_out",
+    "process": "sample_conv_table_kbytes_out",
+    "arg_mask": "ARG1(1,TAB)",
+    "in_type": "SMP_T_ANY",
+    "out_type": "SMP_T_SINT",
+    "file": "src/stick_table.c",
+    "line": 6319
+  },
+  {
+    "keyword": "table_server_id",
+    "process": "sample_conv_table_server_id",
+    "arg_mask": "ARG1(1,TAB)",
+    "in_type": "SMP_T_ANY",
+    "out_type": "SMP_T_SINT",
+    "file": "src/stick_table.c",
+    "line": 6320
+  },
+  {
+    "keyword": "table_sess_cnt",
+    "process": "sample_conv_table_sess_cnt",
+    "arg_mask": "ARG1(1,TAB)",
+    "in_type": "SMP_T_ANY",
+    "out_type": "SMP_T_SINT",
+    "file": "src/stick_table.c",
+    "line": 6321
+  },
+  {
+    "keyword": "table_sess_rate",
+    "process": "sample_conv_table_sess_rate",
+    "arg_mask": "ARG1(1,TAB)",
+    "in_type": "SMP_T_ANY",
+    "out_type": "SMP_T_SINT",
+    "file": "src/stick_table.c",
+    "line": 6322
+  },
+  {
+    "keyword": "table_trackers",
+    "process": "sample_conv_table_trackers",
+    "arg_mask": "ARG1(1,TAB)",
+    "in_type": "SMP_T_ANY",
+    "out_type": "SMP_T_SINT",
+    "file": "src/stick_table.c",
+    "line": 6323
+  },
+  {
+    "keyword": "set-var",
+    "process": "smp_conv_store",
+    "arg_mask": "ARG5(1,STR,STR,STR,STR,STR)",
+    "in_type": "SMP_T_ANY",
+    "out_type": "SMP_T_ANY",
+    "file": "src/vars.c",
+    "line": 1671
+  },
+  {
+    "keyword": "unset-var",
+    "process": "smp_conv_clear",
+    "arg_mask": "ARG1(1,STR)",
+    "in_type": "SMP_T_ANY",
+    "out_type": "SMP_T_ANY",
+    "file": "src/vars.c",
+    "line": 1672
+  },
+  {
+    "keyword": "51d.single",
+    "process": "_51d_conv",
+    "arg_mask": "ARG5(1,STR,STR,STR,STR,STR)",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_STR",
+    "file": "addons/51degrees/51d.c",
+    "line": 1180
+  },
+  {
+    "keyword": "da-csv-conv",
+    "process": "da_haproxy_conv",
+    "arg_mask": "ARG12(1,STR,STR,STR,STR,STR,STR,STR,STR,STR,STR,STR,STR)",
+    "in_type": "SMP_T_STR",
+    "out_type": "SMP_T_STR",
+    "file": "addons/deviceatlas/da.c",
+    "line": 567
+  }
+]

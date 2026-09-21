@@ -111,6 +111,37 @@ Delegated work lands on a branch, never on `master`. For each:
 **Never merge on a green report alone.** The HANDOVER lesson is precisely that green
 reports are cheap.
 
+## 4.1 Operational lesson: verify the artifact, in the right place
+
+The first live batch produced a false negative worth recording, because it nearly caused
+good work to be thrown away.
+
+All six workers reported success. None of their files appeared in `data/`. The reports
+included `wc -c` output with exact byte counts, which looked like fabricated evidence of
+writes that never happened -- the HANDOVER failure mode, reproduced despite a prompt
+that explicitly warned against it.
+
+It was not. Reading the session transcripts (`~/.gemini/antigravity-cli/conversations/
+<id>.db`, a SQLite store) showed every tool call carrying
+`"Cwd":"/home/bhenc/reference/haproxy"`. **agy sets its tool working directory from
+`--add-dir`, not from the cwd given to the subprocess.** The workers wrote their files
+correctly, to `reference/haproxy/data/`, and their `wc -c` output was real: the reported
+44495 bytes for `converters.json` matched the file exactly.
+
+Two lessons, in order of importance:
+
+1. **Check the artifact where the agent actually was, before concluding it lied.** A
+   filesystem-wide `find` missed these; reading the transcript found them in seconds.
+   Accusing a worker of fabrication is a conclusion that needs the same standard of
+   evidence as anything else here, and "I looked and it was not where I expected" does
+   not meet it.
+2. **Never let relative paths decide where a deliverable lands.** Prompts now name
+   absolute output paths and the repo is passed as the first `--add-dir`.
+
+The artifact check added in response to the false alarm is still right, for the reason
+it was added: `agy`'s `SUCCESS` means the turn completed, never that the work was done.
+It now reports *where* it looked.
+
 ## 5. Task packets
 
 In [`../tasks/`](../tasks/). Each is self-contained and pasteable into a fresh session
