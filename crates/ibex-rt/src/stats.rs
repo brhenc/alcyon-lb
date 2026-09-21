@@ -4,19 +4,223 @@
 
 //! Statistics reporting for Ibex.
 //!
-//! Generates HAProxy-compatible telemetry:
+//! Generates `HAProxy`-compatible telemetry:
 //! - `show info`: 14 mandatory fields for monitoring clients (e.g. `hatop`).
 //! - `show stat`: 146-column CSV telemetry output matching `data/stats_csv_header.txt`.
 
 use crate::check::{ServerCheckState, ServerStatus};
 use crate::engine::Proxy;
 pub use crate::stats_html::render_stats_html;
-use std::fmt::Write;
 use std::time::Instant;
 
-/// Header for HAProxy-compatible CSV statistics.
-pub const STATS_CSV_HEADER: &str =
-    "# pxname,svname,qcur,qmax,scur,smax,slim,stot,bin,bout,dreq,dresp,ereq,econ,eresp,wretr,wredis,status,weight,act,bck,chkfail,chkdown,lastchg,downtime,qlimit,pid,iid,sid,throttle,lbtot,tracked,type,rate,rate_lim,rate_max,check_status,check_code,check_duration,hrsp_1xx,hrsp_2xx,hrsp_3xx,hrsp_4xx,hrsp_5xx,hrsp_other,hanafail,req_rate,req_rate_max,req_tot,cli_abrt,srv_abrt,comp_in,comp_out,comp_byp,comp_rsp,lastsess,last_chk,last_agt,qtime,ctime,rtime,ttime,agent_status,agent_code,agent_duration,check_desc,agent_desc,check_rise,check_fall,check_health,agent_rise,agent_fall,agent_health,addr,cookie,mode,algo,conn_rate,conn_rate_max,conn_tot,intercepted,dcon,dses,wrew,connect,reuse,cache_lookups,cache_hits,srv_icur,src_ilim,qtime_max,ctime_max,rtime_max,ttime_max,eint,idle_conn_cur,safe_conn_cur,used_conn_cur,need_conn_est,uweight,agg_server_status,agg_server_check_status,agg_check_status,srid,sess_other,h1sess,h2sess,h3sess,req_other,h1req,h2req,h3req,proto,priv_idle_cur,reqbin,reqbout,resbin,resbout,cache_hint_hits,\n";
+/// Number of columns `HAProxy` 3.5 emits in `show stat`.
+///
+/// `hatop` parses this CSV **positionally**, so a row of the wrong width silently
+/// misaligns every column past the divergence -- which reads as corrupt data rather
+/// than a missing feature. Asserted by test against `data/stats_csv_header.txt`.
+pub const STAT_FIELD_COUNT: usize = 146;
+
+/// Column names in emission order, captured from a live `HAProxy` 3.5 `show stat`.
+///
+/// Index 119 is a literal `-` separator, after which come the per-module `h2_*`,
+/// `ssl_*` and `h1_*` columns registered outside the main stat table.
+pub static STAT_FIELDS: [&str; STAT_FIELD_COUNT] = [
+    "pxname",
+    "svname",
+    "qcur",
+    "qmax",
+    "scur",
+    "smax",
+    "slim",
+    "stot",
+    "bin",
+    "bout",
+    "dreq",
+    "dresp",
+    "ereq",
+    "econ",
+    "eresp",
+    "wretr",
+    "wredis",
+    "status",
+    "weight",
+    "act",
+    "bck",
+    "chkfail",
+    "chkdown",
+    "lastchg",
+    "downtime",
+    "qlimit",
+    "pid",
+    "iid",
+    "sid",
+    "throttle",
+    "lbtot",
+    "tracked",
+    "type",
+    "rate",
+    "rate_lim",
+    "rate_max",
+    "check_status",
+    "check_code",
+    "check_duration",
+    "hrsp_1xx",
+    "hrsp_2xx",
+    "hrsp_3xx",
+    "hrsp_4xx",
+    "hrsp_5xx",
+    "hrsp_other",
+    "hanafail",
+    "req_rate",
+    "req_rate_max",
+    "req_tot",
+    "cli_abrt",
+    "srv_abrt",
+    "comp_in",
+    "comp_out",
+    "comp_byp",
+    "comp_rsp",
+    "lastsess",
+    "last_chk",
+    "last_agt",
+    "qtime",
+    "ctime",
+    "rtime",
+    "ttime",
+    "agent_status",
+    "agent_code",
+    "agent_duration",
+    "check_desc",
+    "agent_desc",
+    "check_rise",
+    "check_fall",
+    "check_health",
+    "agent_rise",
+    "agent_fall",
+    "agent_health",
+    "addr",
+    "cookie",
+    "mode",
+    "algo",
+    "conn_rate",
+    "conn_rate_max",
+    "conn_tot",
+    "intercepted",
+    "dcon",
+    "dses",
+    "wrew",
+    "connect",
+    "reuse",
+    "cache_lookups",
+    "cache_hits",
+    "srv_icur",
+    "src_ilim",
+    "qtime_max",
+    "ctime_max",
+    "rtime_max",
+    "ttime_max",
+    "eint",
+    "idle_conn_cur",
+    "safe_conn_cur",
+    "used_conn_cur",
+    "need_conn_est",
+    "uweight",
+    "agg_server_status",
+    "agg_server_check_status",
+    "agg_check_status",
+    "srid",
+    "sess_other",
+    "h1sess",
+    "h2sess",
+    "h3sess",
+    "req_other",
+    "h1req",
+    "h2req",
+    "h3req",
+    "proto",
+    "priv_idle_cur",
+    "reqbin",
+    "reqbout",
+    "resbin",
+    "resbout",
+    "cache_hint_hits",
+    "-",
+    "h2_headers_rcvd",
+    "h2_data_rcvd",
+    "h2_settings_rcvd",
+    "h2_rst_stream_rcvd",
+    "h2_goaway_rcvd",
+    "h2_detected_conn_protocol_errors",
+    "h2_detected_strm_protocol_errors",
+    "h2_rst_stream_resp",
+    "h2_goaway_resp",
+    "h2_open_connections",
+    "h2_backend_open_streams",
+    "h2_total_connections",
+    "h2_backend_total_streams",
+    "ssl_sess",
+    "ssl_reused_sess",
+    "ssl_failed_handshake",
+    "ssl_ocsp_staple",
+    "ssl_failed_ocsp_staple",
+    "h1_open_connections",
+    "h1_open_streams",
+    "h1_total_connections",
+    "h1_total_streams",
+    "h1_bytes_in",
+    "h1_bytes_out",
+    "h1_spliced_bytes_in",
+    "h1_spliced_bytes_out",
+];
+
+/// The `show stat` CSV header line, including `HAProxy`'s leading `# `.
+#[must_use]
+pub fn stats_csv_header() -> String {
+    let mut s = String::with_capacity(2048);
+    s.push_str("# ");
+    s.push_str(&STAT_FIELDS.join(","));
+    s.push('\n');
+    s
+}
+
+/// One `show stat` row, built by column name so the width cannot drift.
+///
+/// Every column starts empty. Empty and `0` mean different things to a stats consumer
+/// -- empty is "not applicable", zero is a measurement -- so unknown columns are left
+/// empty rather than zero-filled.
+pub struct StatRow {
+    fields: Vec<String>,
+}
+
+impl Default for StatRow {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StatRow {
+    #[must_use]
+    pub fn new() -> Self {
+        let mut fields = vec![String::new(); STAT_FIELD_COUNT];
+        fields[119] = "-".to_string();
+        StatRow { fields }
+    }
+
+    /// Sets a column by name. An unknown name is ignored rather than panicking: a typo
+    /// must not take down a proxy that was only asked for statistics.
+    pub fn set(&mut self, name: &str, value: impl std::fmt::Display) {
+        if let Some(i) = STAT_FIELDS.iter().position(|f| *f == name) {
+            self.fields[i] = value.to_string();
+        }
+    }
+
+    #[must_use]
+    pub fn finish(&self) -> String {
+        let mut s = self.fields.join(",");
+        s.push('\n');
+        s
+    }
+}
 
 /// Formats the `show info` output for `HATop` and CLI consumers.
 #[must_use]
@@ -61,19 +265,26 @@ pub fn format_show_stat(proxies: &[Proxy], checks: &[ServerCheckState], pid: u32
 }
 
 fn write_frontend_row(out: &mut String, proxy: &Proxy, pid: u32, iid: usize) {
-    let _ = writeln!(
-        out,
-        "{},FRONTEND,0,0,{},{},{},{},{},{},0,0,0,0,0,0,0,OPEN,,1,0,0,0,0,0,,{},{},0,,0,,0,0,0,0,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,",
-        proxy.name,
-        proxy.stats.act_conn,
-        proxy.stats.max_conn,
-        proxy.maxconn,
-        proxy.stats.cum_conn,
-        proxy.stats.bytes_in,
-        proxy.stats.bytes_out,
-        pid,
-        iid,
-    );
+    let mut r = StatRow::new();
+    r.set("pxname", &proxy.name);
+    r.set("svname", "FRONTEND");
+    r.set("qcur", 0);
+    r.set("qmax", 0);
+    r.set("scur", proxy.stats.act_conn);
+    r.set("smax", proxy.stats.max_conn);
+    r.set("slim", proxy.maxconn);
+    r.set("stot", proxy.stats.cum_conn);
+    r.set("bin", proxy.stats.bytes_in);
+    r.set("bout", proxy.stats.bytes_out);
+    r.set("dreq", 0);
+    r.set("dresp", 0);
+    r.set("ereq", 0);
+    r.set("status", "OPEN");
+    r.set("act", 1);
+    r.set("pid", pid);
+    r.set("iid", iid);
+    r.set("type", 0);
+    out.push_str(&r.finish());
 }
 
 fn write_server_row(
@@ -127,45 +338,51 @@ fn write_server_row(
         .flatten()
         .map_or(String::new(), |m| m.to_string());
 
-    let _ = writeln!(
-        out,
-        "{},{},0,0,{},0,{},0,0,0,0,0,0,0,0,0,0,{},{weight},{},{},{},{},0,0,,{},{},{},,0,,2,0,0,0,{},{},{},,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,{},,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,",
-        proxy.name,
-        srv_name,
-        scur,
-        slim,
-        status_str,
-        act,
-        bck,
-        chkfail,
-        chkdown,
-        pid,
-        iid,
-        sid,
-        check_status,
-        check_code,
-        check_duration,
-        srv_addr,
-    );
+    let mut r = StatRow::new();
+    r.set("pxname", &proxy.name);
+    r.set("svname", srv_name);
+    r.set("qcur", 0);
+    r.set("qmax", 0);
+    r.set("scur", scur);
+    r.set("smax", 0);
+    r.set("slim", &slim);
+    r.set("stot", 0);
+    r.set("status", status_str);
+    r.set("weight", weight);
+    r.set("act", act);
+    r.set("bck", bck);
+    r.set("chkfail", chkfail);
+    r.set("chkdown", chkdown);
+    r.set("pid", pid);
+    r.set("iid", iid);
+    r.set("sid", sid);
+    r.set("type", 2);
+    r.set("check_status", check_status);
+    r.set("check_code", check_code);
+    r.set("check_duration", check_duration);
+    r.set("addr", srv_addr);
+    out.push_str(&r.finish());
 }
 
 fn write_backend_row(out: &mut String, proxy: &Proxy, pid: u32, iid: usize) {
-    let _ = writeln!(
-        out,
-        "{},BACKEND,0,0,{},{},{},{},{},{},0,0,0,{},0,{},{},UP,1,1,0,0,0,0,0,,{},{},0,,0,,1,0,0,0,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,",
-        proxy.name,
-        proxy.stats.act_conn,
-        proxy.stats.max_conn,
-        proxy.maxconn,
-        proxy.stats.cum_conn,
-        proxy.stats.bytes_in,
-        proxy.stats.bytes_out,
-        proxy.stats.failed_conn,
-        proxy.stats.retries_count,
-        proxy.stats.redispatches,
-        pid,
-        iid,
-    );
+    let mut r = StatRow::new();
+    r.set("pxname", &proxy.name);
+    r.set("svname", "BACKEND");
+    r.set("qcur", 0);
+    r.set("qmax", 0);
+    r.set("scur", proxy.stats.act_conn);
+    r.set("smax", proxy.stats.max_conn);
+    r.set("slim", proxy.maxconn);
+    r.set("stot", proxy.stats.cum_conn);
+    r.set("bin", proxy.stats.bytes_in);
+    r.set("bout", proxy.stats.bytes_out);
+    r.set("status", "UP");
+    r.set("weight", 1);
+    r.set("act", 1);
+    r.set("pid", pid);
+    r.set("iid", iid);
+    r.set("type", 1);
+    out.push_str(&r.finish());
 }
 
 /// Generates `show stat` CSV text with optional filtering by proxy iid, type bitmask, and server sid.
@@ -179,7 +396,7 @@ pub fn format_show_stat_filtered(
     sid_filter: Option<i32>,
 ) -> String {
     let mut out = String::with_capacity(4096);
-    out.push_str(STATS_CSV_HEADER);
+    out.push_str(&stats_csv_header());
 
     let match_type = |type_val: i32| -> bool {
         match type_filter {

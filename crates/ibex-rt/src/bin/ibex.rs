@@ -658,13 +658,43 @@ fn main() {
         }
     };
 
-    if let Some(ref sock_path) = opts.stats_socket {
+    // The runtime socket may come from `-S <path>` or, as HAProxy and every hatop
+    // tutorial do it, from `global stats socket <path>` in the config file. The config
+    // fields were parsed and then never read, so a config-only setup silently produced
+    // no socket at all and hatop had nothing to connect to. The flag wins when both
+    // are given.
+    let cli_socket: Option<PathBuf> = opts.stats_socket.clone().or_else(|| {
+        config
+            .global
+            .as_ref()
+            .and_then(|g| g.stats_socket.as_ref())
+            .map(PathBuf::from)
+    });
+
+    if let Some(ref sock_path) = cli_socket {
         if let Err(err) = engine.bind_cli_socket(sock_path) {
             eprintln!(
                 "Failed to bind CLI / stats socket '{}': {err}",
                 sock_path.display()
             );
             process::exit(1);
+        }
+
+        // `stats socket <path> mode <octal>` sets the socket's permissions. It matters:
+        // this socket can disable servers and change weights, so a world-writable one
+        // is a privilege escalation waiting to happen.
+        if opts.stats_socket.is_none() {
+            if let Some(mode) = config.global.as_ref().and_then(|g| g.stats_socket_mode) {
+                use std::os::unix::fs::PermissionsExt;
+                if let Err(err) =
+                    std::fs::set_permissions(sock_path, std::fs::Permissions::from_mode(mode))
+                {
+                    eprintln!(
+                        "Warning: could not set mode {mode:o} on '{}': {err}",
+                        sock_path.display()
+                    );
+                }
+            }
         }
     }
 
