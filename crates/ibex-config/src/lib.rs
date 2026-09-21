@@ -23,10 +23,12 @@ pub use ast::{
     HeaderExp, HttpAfterResAction, HttpAfterResRule, HttpReqAction, HttpReqRule, HttpResAction,
     HttpResRule, ListenSection, LogConfig, LogFacility, LogLevel, Mode, Server, StatsConfig,
     StickRule, StickRuleType, StickTableConfigAst, TcpReqConnAction, TcpReqConnRule,
-    UseBackendRule,
+    TimeoutConfig, UseBackendRule,
 };
 pub use error::ConfigError;
 pub use parser::parse_str;
+pub use regex;
+
 
 /// Parses an `HAProxy` 1.0 configuration file from disk.
 ///

@@ -3,9 +3,9 @@
 //! RFC 7230 §3.3.3: `Transfer-Encoding` overrides `Content-Length`, and the
 //! `Content-Length` must be removed before forwarding.
 //!
-//! Found by differential fuzzing against HAProxy 3.5 and confirmed by hand. Before this
+//! Found by differential fuzzing against `HAProxy` 3.5 and confirmed by hand. Before this
 //! fix Ibex forwarded **both** framing headers plus the trailing smuggled byte, while
-//! HAProxy stripped `Content-Length`, dropped the byte, and refused connection reuse.
+//! `HAProxy` stripped `Content-Length`, dropped the byte, and refused connection reuse.
 //! Forwarding both headers is the canonical CL.TE desync: we frame by chunked encoding,
 //! a backend honouring `Content-Length` frames differently, and the disagreement is the
 //! attack.
@@ -13,7 +13,7 @@
 use ibex_proto::h1::H1Parser;
 use ibex_proto::htx::Htx;
 
-/// The exact vector verified against HAProxy 3.5.
+/// The exact vector verified against `HAProxy` 3.5.
 const CL_TE: &[u8] = b"POST /smuggle HTTP/1.1\r\nHost: example.com\r\n\
 Content-Length: 6\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\nX";
 
@@ -65,7 +65,7 @@ fn a_framing_conflict_forbids_connection_reuse() {
     assert!(
         p.connection_close,
         "trailing bytes after a framing conflict are of ambiguous ownership, so the \
-         next request on this connection could be prefixed by them. HAProxy sets \
+         next request on this connection could be prefixed by them. `HAProxy` sets \
          'connection: close' here for exactly that reason"
     );
 }
@@ -93,7 +93,7 @@ fn chunked_alone_is_still_honoured() {
 
 // ---- invalid and conflicting Content-Length ----------------------------------------
 
-// Found by differential fuzzing and confirmed by hand: HAProxy 3.5 answers 400 Bad
+// Found by differential fuzzing and confirmed by hand: `HAProxy` 3.5 answers 400 Bad
 // Request to `Content-Length: -5`, while Ibex answered 200 and left the body bytes
 // unconsumed on the connection -- where they become the next request.
 
@@ -115,7 +115,7 @@ fn negative_content_length_is_rejected() {
 #[test]
 fn signed_positive_content_length_is_rejected() {
     // parse::<usize>() accepts a leading '+', so the obvious implementation lets this
-    // through while HAProxy does not.
+    // through while `HAProxy` does not.
     assert!(rejects(b"POST /x HTTP/1.1\r\nHost: h\r\nContent-Length: +5\r\n\r\nhello"));
 }
 

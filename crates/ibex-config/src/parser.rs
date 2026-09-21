@@ -3,6 +3,7 @@
 // HAProxy configuration parser, ported to Rust.
 // Derived from HAProxy 1.0 - 3.5 by Willy Tarreau <willy@meta-x.org>.
 
+use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
@@ -33,10 +34,8 @@ enum CurrentSection {
 /// contains syntax errors, invalid values, or structural inconsistencies.
 #[allow(clippy::too_many_lines)]
 pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
+    // An empty config is valid: HAProxy 3.5 accepts it and exits 0 under `-c`.
     let lines = lex(input);
-    if lines.is_empty() {
-        return Err(ConfigError::new(1, 1, "no <listen> line. Nothing to do !"));
-    }
 
     let mut global: Option<GlobalSection> = None;
     let mut defaults: Option<DefaultsSection> = None;
@@ -138,13 +137,25 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
         &mut backends,
     );
 
-    if global.is_none()
-        && defaults.is_none()
-        && listens.is_empty()
-        && frontends.is_empty()
-        && backends.is_empty()
-    {
-        return Err(ConfigError::new(1, 1, "no <listen> line. Nothing to do !"));
+    // HAProxy 3.5 accepts a config with no proxy sections -- including a completely
+    // empty file -- and exits 0 under `-c`. Verified directly against the oracle for
+    // both an empty file and a `global`-only config. Rejecting it makes Ibex refuse
+    // configurations the reference accepts, which is the wrong direction for a
+    // compatibility target: `-c` is used in CI and deployment gates, so a spurious
+    // failure there blocks a rollout that HAProxy would have allowed.
+    //
+    // The old "no <listen> line. Nothing to do !" error is HAProxy 1.x wording that
+    // modern HAProxy no longer emits.
+
+    let maxrewrite = global.as_ref().and_then(|g| g.maxrewrite);
+    for l in &mut listens {
+        l.stats.maxrewrite = maxrewrite;
+    }
+    for f in &mut frontends {
+        f.stats.maxrewrite = maxrewrite;
+    }
+    for b in &mut backends {
+        b.stats.maxrewrite = maxrewrite;
     }
 
     validate_config(&listens, &frontends, &backends)?;
@@ -191,11 +202,22 @@ fn parse_listen_header(
     }
 
     let id = tokens[1].text.clone();
-    let addr = if tokens.len() >= 3 && !tokens[2].text.is_empty() {
-        parse_socket_addr(&tokens[2], None)?
-    } else {
-        SocketAddr::from(([0, 0, 0, 0], 0))
-    };
+
+    // Modern HAProxy requires a `bind` line and rejects an inline listening address on
+    // the section header. Verified against 3.5-dev7, which answers:
+    //   "please use the 'bind' keyword for listening addresses."
+    //
+    // Accepting the 1.0 form here would make Ibex take configs that the oracle refuses,
+    // which is the wrong direction for a compatibility target: a config that works on
+    // Ibex and fails on HAProxy is a migration trap.
+    if tokens.len() >= 3 && !tokens[2].text.is_empty() {
+        return Err(ConfigError::new(
+            tokens[2].line,
+            tokens[2].col,
+            "please use the 'bind' keyword for listening addresses",
+        ));
+    }
+    let addr = SocketAddr::from(([0, 0, 0, 0], 0));
     let mut accept_proxy = false;
     let mut accept_proxy_v2 = false;
 
@@ -245,6 +267,8 @@ fn parse_listen_header(
         http_after_res_rules: Vec::new(),
         accept_proxy,
         accept_proxy_v2,
+        forwardfor: None,
+        originalto: None,
         stats: StatsConfig::default(),
     })
 }
@@ -318,6 +342,8 @@ fn parse_frontend_header(
         http_after_res_rules: Vec::new(),
         accept_proxy,
         accept_proxy_v2,
+        forwardfor: None,
+        originalto: None,
         stats: StatsConfig::default(),
     })
 }
@@ -360,6 +386,8 @@ fn parse_backend_header(
         http_req_rules: Vec::new(),
         http_res_rules: Vec::new(),
         http_after_res_rules: Vec::new(),
+        forwardfor: None,
+        originalto: None,
         stats: StatsConfig::default(),
     })
 }
@@ -425,6 +453,18 @@ fn parse_global_directive(
             }
             Ok(())
         }
+        "tune.maxrewrite" => {
+            if tokens.len() >= 2 {
+                global.maxrewrite = tokens[1].text.parse::<usize>().ok();
+            }
+            Ok(())
+        }
+        "tune.bufsize" => {
+            if tokens.len() >= 2 {
+                global.bufsize = tokens[1].text.parse::<usize>().ok();
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
@@ -448,6 +488,9 @@ fn parse_defaults_directive(
             }
             Ok(())
         }
+        "option" => parse_option_defaults(defaults, tokens, kw),
+        "no" => parse_no_directive(tokens, kw),
+        "declare" => parse_declare(tokens, kw),
         "contimeout" => parse_contimeout(kw),
         "clitimeout" => parse_clitimeout(kw),
         "srvtimeout" => parse_srvtimeout(kw),
@@ -496,6 +539,9 @@ fn parse_listen_directive(
         "acl" => parse_acl(&mut proxy.acls, tokens, kw),
         "use_backend" => parse_use_backend(&mut proxy.use_backends, tokens, kw),
         "default_backend" => parse_default_backend(&mut proxy.default_backend, tokens, kw),
+        "option" => parse_option_listen(proxy, tokens, kw),
+        "no" => parse_no_directive(tokens, kw),
+        "declare" => parse_declare(tokens, kw),
         "bind" => {
             if tokens.len() < 2 || tokens[1].text.is_empty() {
                 return Err(ConfigError::new(
@@ -571,6 +617,9 @@ fn parse_frontend_directive(
             fe.disabled = true;
             Ok(())
         }
+        "option" => parse_option_frontend(fe, tokens, kw),
+        "no" => parse_no_directive(tokens, kw),
+        "declare" => parse_declare(tokens, kw),
         "clitimeout" => parse_clitimeout(kw),
         "contimeout" => parse_contimeout(kw),
         "srvtimeout" => parse_srvtimeout(kw),
@@ -695,6 +744,9 @@ fn parse_backend_directive(
         "http-after-response" => {
             parse_http_after_res_rule(&mut be.http_after_res_rules, tokens, kw)
         }
+        "option" => parse_option_backend(be, tokens, kw),
+        "no" => parse_no_directive(tokens, kw),
+        "declare" => parse_declare(tokens, kw),
         "cliexp" => parse_cliexp(kw),
         "srvexp" => parse_srvexp(kw),
         "acl" => parse_acl(&mut be.acls, tokens, kw),
@@ -710,6 +762,136 @@ fn parse_backend_directive(
             format!("unknown keyword <{other}>"),
         )),
     }
+}
+
+#[allow(clippy::unnecessary_wraps)]
+fn parse_option_listen(
+    proxy: &mut ListenSection,
+    tokens: &[Token],
+    _kw: &Token,
+) -> Result<(), ConfigError> {
+    if tokens.len() >= 2 {
+        match tokens[1].text.as_str() {
+            "forwardfor" => {
+                let except = if tokens.len() >= 4 && tokens[2].text == "except" {
+                    tokens[3].text.clone()
+                } else {
+                    String::new()
+                };
+                proxy.forwardfor = Some(except);
+            }
+            "originalto" => {
+                let except = if tokens.len() >= 4 && tokens[2].text == "except" {
+                    tokens[3].text.clone()
+                } else {
+                    String::new()
+                };
+                proxy.originalto = Some(except);
+            }
+            "redispatch" => {
+                proxy.redisp = true;
+            }
+            other => {
+                eprintln!("[ibex] warning: ignored option '{other}'");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::unnecessary_wraps)]
+fn parse_option_frontend(
+    fe: &mut FrontendSection,
+    tokens: &[Token],
+    _kw: &Token,
+) -> Result<(), ConfigError> {
+    if tokens.len() >= 2 {
+        match tokens[1].text.as_str() {
+            "forwardfor" => {
+                let except = if tokens.len() >= 4 && tokens[2].text == "except" {
+                    tokens[3].text.clone()
+                } else {
+                    String::new()
+                };
+                fe.forwardfor = Some(except);
+            }
+            "originalto" => {
+                let except = if tokens.len() >= 4 && tokens[2].text == "except" {
+                    tokens[3].text.clone()
+                } else {
+                    String::new()
+                };
+                fe.originalto = Some(except);
+            }
+            other => {
+                eprintln!("[ibex] warning: ignored option '{other}'");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::unnecessary_wraps)]
+fn parse_option_backend(
+    be: &mut BackendSection,
+    tokens: &[Token],
+    _kw: &Token,
+) -> Result<(), ConfigError> {
+    if tokens.len() >= 2 {
+        match tokens[1].text.as_str() {
+            "forwardfor" => {
+                let except = if tokens.len() >= 4 && tokens[2].text == "except" {
+                    tokens[3].text.clone()
+                } else {
+                    String::new()
+                };
+                be.forwardfor = Some(except);
+            }
+            "originalto" => {
+                let except = if tokens.len() >= 4 && tokens[2].text == "except" {
+                    tokens[3].text.clone()
+                } else {
+                    String::new()
+                };
+                be.originalto = Some(except);
+            }
+            "redispatch" => {
+                be.redisp = true;
+            }
+            other => {
+                eprintln!("[ibex] warning: ignored option '{other}'");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::unnecessary_wraps)]
+fn parse_option_defaults(
+    _defaults: &mut DefaultsSection,
+    tokens: &[Token],
+    _kw: &Token,
+) -> Result<(), ConfigError> {
+    if tokens.len() >= 2 {
+        eprintln!("[ibex] warning: ignored option '{}'", tokens[1].text);
+    }
+    Ok(())
+}
+
+#[allow(clippy::unnecessary_wraps)]
+fn parse_no_directive(tokens: &[Token], _kw: &Token) -> Result<(), ConfigError> {
+    if tokens.len() >= 2 {
+        eprintln!("[ibex] warning: ignored 'no {}'", tokens[1].text);
+    }
+    Ok(())
+}
+
+#[allow(clippy::unnecessary_wraps)]
+fn parse_declare(tokens: &[Token], _kw: &Token) -> Result<(), ConfigError> {
+    if tokens.len() >= 2 {
+        eprintln!("[ibex] warning: ignored declare directive '{}'", tokens[1].text);
+    }
+    Ok(())
 }
 
 fn parse_default_server(
@@ -1430,8 +1612,6 @@ fn parse_http_req_rule(
                     let path = &tokens[i + 1].text;
                     if let Ok(c) = std::fs::read_to_string(path) {
                         lf_string = Some(c);
-                    } else if path == "/dev/null" {
-                        lf_string = Some(String::new());
                     } else {
                         lf_string = Some(String::new());
                     }
@@ -1440,9 +1620,6 @@ fn parse_http_req_rule(
                 "hdr" if i + 2 < limit => {
                     custom_headers.push((tokens[i + 1].text.clone(), tokens[i + 2].text.clone()));
                     i += 3;
-                }
-                "default-errorfiles" => {
-                    i += 1;
                 }
                 "errorfile" if i + 2 < limit => {
                     i += 3;
@@ -1460,17 +1637,17 @@ fn parse_http_req_rule(
         } else {
             None
         };
-        let final_lf_string = if !custom_headers.is_empty() {
+        let final_lf_string = if custom_headers.is_empty() {
+            lf_string
+        } else {
             let mut enc = String::new();
             for (k, v) in custom_headers {
-                enc.push_str(&format!("\0HDR:{k}:{v}\n"));
+                let _ = writeln!(enc, "\0HDR:{k}:{v}");
             }
             if let Some(s) = lf_string {
-                enc.push_str(&format!("\0BODY:{s}"));
+                let _ = write!(enc, "\0BODY:{s}");
             }
             Some(enc)
-        } else {
-            lf_string
         };
         rules.push(HttpReqRule {
             action: HttpReqAction::Return {
@@ -1562,10 +1739,9 @@ fn parse_http_req_rule(
         } else {
             None
         };
-        let encoded_name = if let Some(m) = method {
-            format!("\0m:{m}:{name}")
-        } else {
-            name
+        let encoded_name = match method.as_deref() {
+            Some("str") | None => name,
+            Some(m) => format!("\0m:{m}:{name}"),
         };
         rules.push(HttpReqRule {
             action: HttpReqAction::DelHeader { name: encoded_name },
@@ -1800,9 +1976,6 @@ fn parse_http_req_rule(
                     code = Some(parse_u16(&tokens[i + 1], "code")?);
                     i += 2;
                 }
-                "ignore-empty" => {
-                    i += 1;
-                }
                 _ => {
                     i += 1;
                 }
@@ -1823,7 +1996,7 @@ fn parse_http_req_rule(
             cond,
         });
     } else if act_str == "strict-mode" {
-        let on = tokens.get(2).map_or(true, |t| t.text == "on");
+        let on = tokens.get(2).is_none_or(|t| t.text == "on");
         let cond_idx = find_cond_idx(tokens, 2);
         let cond = if let Some(idx) = cond_idx {
             parse_acl_condition_from_tokens(&tokens[idx..])?
@@ -1974,6 +2147,7 @@ fn parse_http_req_rule(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn parse_http_res_rule(
     rules: &mut Vec<HttpResRule>,
     tokens: &[Token],
@@ -2038,10 +2212,9 @@ fn parse_http_res_rule(
         } else {
             None
         };
-        let encoded_name = if let Some(m) = method {
-            format!("\0m:{m}:{name}")
-        } else {
-            name
+        let encoded_name = match method.as_deref() {
+            Some("str") | None => name,
+            Some(m) => format!("\0m:{m}:{name}"),
         };
         rules.push(HttpResRule {
             action: HttpResAction::DelHeader { name: encoded_name },
@@ -2155,7 +2328,7 @@ fn parse_http_res_rule(
             cond,
         });
     } else if act_str == "strict-mode" {
-        let on = tokens.get(2).map_or(true, |t| t.text == "on");
+        let on = tokens.get(2).is_none_or(|t| t.text == "on");
         let cond_idx = find_cond_idx(tokens, 2);
         let cond = if let Some(idx) = cond_idx {
             parse_acl_condition_from_tokens(&tokens[idx..])?
@@ -2218,6 +2391,7 @@ fn parse_http_res_rule(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn parse_http_after_res_rule(
     rules: &mut Vec<HttpAfterResRule>,
     tokens: &[Token],
@@ -2282,10 +2456,9 @@ fn parse_http_after_res_rule(
         } else {
             None
         };
-        let encoded_name = if let Some(m) = method {
-            format!("\0m:{m}:{name}")
-        } else {
-            name
+        let encoded_name = match method.as_deref() {
+            Some("str") | None => name,
+            Some(m) => format!("\0m:{m}:{name}"),
         };
         rules.push(HttpAfterResRule {
             action: HttpAfterResAction::DelHeader { name: encoded_name },
@@ -2402,7 +2575,7 @@ fn parse_http_after_res_rule(
             cond,
         });
     } else if act_str == "strict-mode" {
-        let on = tokens.get(2).map_or(true, |t| t.text == "on");
+        let on = tokens.get(2).is_none_or(|t| t.text == "on");
         let cond_idx = find_cond_idx(tokens, 2);
         let cond = if let Some(idx) = cond_idx {
             parse_acl_condition_from_tokens(&tokens[idx..])?
@@ -2982,7 +3155,7 @@ frontend fe_rate
 
     #[test]
     fn test_parse_http_cookie_without_servers_error() {
-        let sample = "listen proxy1 0.0.0.0:3128\nmode http\ncookie SERVERID\n";
+        let sample = "listen proxy1\n    bind 0.0.0.0:3128\nmode http\ncookie SERVERID\n";
         let err = parse_str(sample).unwrap_err();
         assert!(err.message.contains("has a cookie but no server list"));
     }
@@ -3007,7 +3180,8 @@ frontend fe_v2
     mode tcp
     default_backend be_out
 
-listen li_proxy 0.0.0.0:82 accept-proxy
+listen li_proxy
+    bind 0.0.0.0:82 accept-proxy
     mode tcp
     server s_v1 127.0.0.1:8081 send-proxy
     server s_v2 127.0.0.1:8082 send-proxy-v2

@@ -74,7 +74,12 @@ fn lex_line(raw_line: &str, line_number: usize) -> Vec<Token> {
             }
         } else if ch == '"' || ch == '\'' {
             in_quote = Some(ch);
-        } else if ch == '#' || ch == ';' || ch == '\r' || ch == '\n' {
+        // Only '#' starts a comment. HAProxy does **not** treat ';' as one -- verified
+        // against 3.5-dev7, which rejects a ';' line with
+        //   "unknown keyword ';' out of section."
+        // Silently swallowing it would let a config that HAProxy refuses run on Ibex,
+        // and a line the operator believed was a comment would simply vanish.
+        } else if ch == '#' || ch == '\r' || ch == '\n' {
             end_idx = i;
             break;
         }
@@ -179,13 +184,23 @@ mod tests {
 
     #[test]
     fn test_lex_comments_and_blank_lines() {
-        let input = "\n# Full comment line\n; Semicolon comment\n  listen p1 127.0.0.1:80 # inline comment\n\n";
+        let input = "\n# Full comment line\n  listen p1 # inline comment\n\n";
         let lines = lex(input);
         assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0].line_number, 4);
-        assert_eq!(lines[0].tokens.len(), 3);
+        assert_eq!(lines[0].line_number, 3);
+        assert_eq!(lines[0].tokens.len(), 2);
         assert_eq!(lines[0].tokens[0].text, "listen");
         assert_eq!(lines[0].tokens[0].col, 3);
+    }
+
+    #[test]
+    fn semicolon_is_not_a_comment() {
+        // HAProxy 3.5 rejects a ';' line with "unknown keyword ';' out of section."
+        // Treating it as a comment would accept configs the reference refuses, and a
+        // line the operator believed was commented out would silently disappear.
+        let lines = lex("; not a comment\n");
+        assert_eq!(lines.len(), 1, "';' must produce a token line, not be skipped");
+        assert_eq!(lines[0].tokens[0].text, ";");
     }
 
     #[test]

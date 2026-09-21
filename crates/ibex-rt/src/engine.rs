@@ -8,6 +8,12 @@
 //! Connects [`Listener`], [`Poller`], [`FdTab`], [`Scheduler`], and [`TcpSession`]
 //! into the single-threaded soft-realtime execution loop described in `design/008-tcp-first.md`.
 
+// `assigning_clones` fires on the CURRENT_RES_HEADERS thread-local writes below.
+// Those sites mix owned and borrowed `hdrs`, so a uniform `clone_from()` does not
+// typecheck, and varying it per-site is churn for no measurable gain.
+#![allow(clippy::assigning_clones)]
+#![allow(clippy::wildcard_enum_match_arm)]
+
 use crate::applet::{AppletArena, AppletContext, CliApplet};
 use crate::check::{self, ServerCheckConfig, ServerCheckState, ServerStatus};
 use crate::fdtab::{FdState, FdTab, Interest};
@@ -15,12 +21,13 @@ use crate::listener::Listener;
 use crate::poller::Poller;
 use crate::proxy::{TcpSession, Timeouts};
 use crate::raw;
-use ibex_config::{BalanceAlgorithm, Config, Mode, StickRule, UseBackendRule};
+use ibex_config::{regex, BalanceAlgorithm, Config, Mode, StickRule, UseBackendRule};
 use ibex_proto::endpoint::ScState;
-use ibex_sample::{Expr, Registry, SampleContext};
+use ibex_sample::{ConvDesc, Expr, FetchDesc, Registry, Sample, SampleContext, SampleType, TypeSpec};
 use ibex_sched::task::{state, Kind, TaskRef, WorkKind};
 use ibex_sched::{Class, Dispatch, Outcome, Scheduler, Tick};
 use ibex_stick_table::{KeyType, StickKey, StickTable, StickTableConfig};
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io;
@@ -30,6 +37,16 @@ use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+thread_local! {
+    static CURRENT_VARS: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+    static CURRENT_TIMEOUTS: RefCell<HashMap<String, u32>> = RefCell::new(HashMap::new());
+    static CURRENT_RES_HEADERS: RefCell<Vec<(String, String)>> = const { RefCell::new(Vec::new()) };
+    static CURRENT_RES_STATUS: Cell<u16> = const { Cell::new(200) };
+    static STRICT_MODE: Cell<bool> = const { Cell::new(true) };
+    static REWRITE_ADDED_BYTES: Cell<usize> = const { Cell::new(0) };
+    static MAX_REWRITE_LIMIT: Cell<usize> = const { Cell::new(8192) };
+}
 
 /// Accumulated statistics per proxy.
 #[derive(Debug, Clone, Default)]
@@ -241,6 +258,7 @@ pub struct SessionEntry {
     pub cli_interest: Interest,
     pub srv_interest: Interest,
     pub actconn_reclaimed: bool,
+    pub response_rules_applied: bool,
 }
 
 /// Per-thread storage for active sessions.
@@ -469,7 +487,13 @@ fn init_proxy_from_listen(proxy_idx: usize, listen: &ibex_config::ListenSection)
             .collect(),
         next_server_idx: 0,
         stats: ProxyStats::default(),
-        stats_config: listen.stats.clone(),
+        stats_config: {
+            let mut sc = listen.stats.clone();
+            sc.raw_timeouts = listen.timeouts;
+            sc.forwardfor.clone_from(&listen.forwardfor);
+            sc.originalto.clone_from(&listen.originalto);
+            sc
+        },
         default_backend: listen.default_backend.clone(),
         use_backends: listen.use_backends.clone(),
         acls: compile_acls(&listen.acls),
@@ -483,10 +507,10 @@ fn init_proxy_from_listen(proxy_idx: usize, listen: &ibex_config::ListenSection)
         server_maxconn: listen.servers.iter().map(|s| s.maxconn).collect(),
         server_actconn: vec![0; server_count],
         server_check_configs,
-        tcp_req_conn_rules: Vec::new(),
-        http_req_rules: Vec::new(),
-        http_res_rules: Vec::new(),
-        http_after_res_rules: Vec::new(),
+        tcp_req_conn_rules: listen.tcp_req_conn_rules.clone(),
+        http_req_rules: listen.http_req_rules.clone(),
+        http_res_rules: listen.http_res_rules.clone(),
+        http_after_res_rules: listen.http_after_res_rules.clone(),
     }
 }
 
@@ -539,7 +563,13 @@ fn init_proxy_from_frontend(proxy_idx: usize, fe: &ibex_config::FrontendSection)
         server_weights: Vec::new(),
         next_server_idx: 0,
         stats: ProxyStats::default(),
-        stats_config: fe.stats.clone(),
+        stats_config: {
+            let mut sc = fe.stats.clone();
+            sc.raw_timeouts = fe.timeouts;
+            sc.forwardfor.clone_from(&fe.forwardfor);
+            sc.originalto.clone_from(&fe.originalto);
+            sc
+        },
         default_backend: fe.default_backend.clone(),
         use_backends: fe.use_backends.clone(),
         acls: compile_acls(&fe.acls),
@@ -555,7 +585,7 @@ fn init_proxy_from_frontend(proxy_idx: usize, fe: &ibex_config::FrontendSection)
         server_check_configs: Vec::new(),
         tcp_req_conn_rules: fe.tcp_req_conn_rules.clone(),
         http_req_rules: fe.http_req_rules.clone(),
-        http_res_rules: Vec::new(),
+        http_res_rules: fe.http_res_rules.clone(),
         http_after_res_rules: fe.http_after_res_rules.clone(),
     }
 }
@@ -632,7 +662,13 @@ fn init_proxy_from_backend(proxy_idx: usize, be: &ibex_config::BackendSection) -
         server_weights: be.servers.iter().map(|s| s.weight.unwrap_or(1)).collect(),
         next_server_idx: 0,
         stats: ProxyStats::default(),
-        stats_config: be.stats.clone(),
+        stats_config: {
+            let mut sc = be.stats.clone();
+            sc.raw_timeouts = be.timeouts;
+            sc.forwardfor.clone_from(&be.forwardfor);
+            sc.originalto.clone_from(&be.originalto);
+            sc
+        },
         default_backend: None,
         use_backends: Vec::new(),
         acls: compile_acls(&be.acls),
@@ -1349,6 +1385,7 @@ fn register_new_session(
         cli_interest,
         srv_interest: Interest::NONE,
         actconn_reclaimed: false,
+        response_rules_applied: false,
     }) else {
         if let Some(idx) = target_server_idx {
             if idx < proxy.server_actconn.len() {
@@ -1997,6 +2034,7 @@ impl EngineDispatcher<'_> {
         proxy_idx
     }
 
+    #[allow(clippy::too_many_lines)] // one dispatch chain; splitting it would obscure the order
     fn step_stream(&mut self, session_idx: u32) -> Outcome {
         let now = self.now;
         let (is_done, pending_admin) = {
@@ -2009,6 +2047,32 @@ impl EngineDispatcher<'_> {
 
             // Step 2: Check timeouts
             let _ = entry.sess.check_timeouts(now);
+
+            // Step 2.5: In HTTP mode, if server is Ready to read response headers, read and apply rules before client writes
+            if entry.sess.mode == Mode::Http
+                && entry.sess.srv_state == ScState::Ready
+                && !entry.response_rules_applied
+            {
+                if let Some(ref srv_fd) = entry.sess.srv {
+                    if entry.sess.rep.writable().is_empty() && entry.sess.rep.len() < entry.sess.rep.capacity() {
+                        entry.sess.rep.compact();
+                    }
+                    let w = entry.sess.rep.writable();
+                    if !w.is_empty() {
+                        match raw::recv(srv_fd.as_fd(), w) {
+                            Ok(raw::Io::Done(n)) if n > 0 => {
+                                entry.sess.rep.commit(n);
+                                entry.sess.bytes_in += n as u64;
+                                Self::apply_http_response_rules(entry, self.proxies, now);
+                            }
+                            Ok(raw::Io::Closed) => {
+                                entry.sess.srv_state = ScState::ShutR;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
 
             // Step 3: Stream engine process pass
             if !entry.sess.is_done() {
@@ -2044,10 +2108,52 @@ impl EngineDispatcher<'_> {
 
             // Step 3.7: If in HTTP mode and response headers are ready in rep, apply response rules
             if entry.sess.mode == Mode::Http
-                && !entry.sess.resp_headers_processed
+                && !entry.response_rules_applied
                 && !entry.sess.rep.is_empty()
             {
                 Self::apply_http_response_rules(entry, self.proxies, now);
+            }
+
+            // Step 3.8: In HTTP mode, if a transaction has finished (response completely sent to client)
+            if entry.sess.mode == Mode::Http
+                && entry.response_rules_applied
+                && entry.sess.rep.is_empty()
+                && entry.sess.pending_resp.is_none()
+                && entry.sess.cli_state.can_read()
+            {
+                // Keep the backend connection for the next request on this session.
+                //
+                // Tearing it down after every transaction meant each keep-alive request
+                // opened a fresh upstream connection, which is both a large performance
+                // regression and a behavioural one: a backend that accepts once and
+                // serves many requests on that stream never sees request two. HAProxy
+                // reuses backend connections by default (`http-reuse safe`).
+                //
+                // It is only closed when the far end is actually finished with it --
+                // the server closed its read side, or the connection errored.
+                let backend_finished = matches!(
+                    entry.sess.srv_state,
+                    ScState::Closed | ScState::Error
+                );
+                if backend_finished {
+                    if let Some(srv_fd) = entry.sess.srv.take() {
+                        let sfd = srv_fd.as_raw_fd();
+                        self.fdtab.remove(sfd);
+                        let _ = self.poller.delete(srv_fd.as_fd());
+                        entry.srv_raw_fd = None;
+                    }
+                    entry.target_addr = None;
+                    entry.target_server_idx = None;
+                }
+                entry.response_rules_applied = false;
+                entry.sess.resp_headers_processed = false;
+                if backend_finished {
+                    entry.sess.srv_state = ScState::Init;
+                }
+                entry.sess.req_method = None;
+                entry.sess.req_uri = None;
+                entry.sess.req_headers = None;
+                entry.sess.cli_state = ScState::Ready;
             }
 
             // Step 4: Update interests
@@ -2098,6 +2204,7 @@ impl EngineDispatcher<'_> {
         let Some((hdr_len, eoh_len)) = crate::proxy::find_eoh(entry.sess.rep.readable()) else {
             return;
         };
+        entry.response_rules_applied = true;
         let be_idx = Self::resolve_backend(entry, proxies);
         let fe_idx = entry.proxy_idx;
 
@@ -2109,6 +2216,20 @@ impl EngineDispatcher<'_> {
             return;
         };
 
+        let mut status: u16 = 200;
+        let mut proto_version = "HTTP/1.1".to_string();
+        let mut status_msg = "OK".to_string();
+        let parts: Vec<&str> = first_line.split_whitespace().collect();
+        if parts.len() >= 2 {
+            proto_version = parts[0].to_string();
+            if let Ok(st) = parts[1].parse::<u16>() {
+                status = st;
+            }
+            if parts.len() >= 3 {
+                status_msg = parts[2..].join(" ");
+            }
+        }
+
         let mut hdrs: Vec<(String, String)> = Vec::new();
         for line in rest_headers.lines() {
             if line.is_empty() {
@@ -2119,86 +2240,359 @@ impl EngineDispatcher<'_> {
             }
         }
 
-        // Apply be.http_res_rules
+        CURRENT_RES_STATUS.set(status);
+        CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = hdrs.clone());
+        REWRITE_ADDED_BYTES.set(0);
+        let max_rw = proxies[fe_idx].stats_config.maxrewrite.unwrap_or(8192);
+        MAX_REWRITE_LIMIT.set(max_rw);
+
+        let registry = build_sample_registry();
+
+        let req_uri_clone = entry.sess.req_uri.clone();
+        let req_method_clone = entry.sess.req_method.clone();
+        let req_headers_clone = entry.sess.req_headers.clone();
+
+        let ctx = SampleContext {
+            client_addr: entry.sess.client_addr,
+            server_addr: entry.target_addr,
+            htx: None,
+            req_uri: req_uri_clone.as_deref(),
+            req_method: req_method_clone.as_deref(),
+            req_headers: req_headers_clone.as_deref(),
+            ..Default::default()
+        };
+
+        let eval_res_action = |act_name: &str, act_fmt: &str, hdrs: &mut Vec<(String, String)>, status: &mut u16, status_msg: &mut String| -> Result<bool, u16> {
+            if act_name == "\0allow" {
+                return Ok(false);
+            }
+            if act_name == "\0deny" {
+                let deny_st = act_fmt.parse::<u16>().unwrap_or(403);
+                return Err(deny_st);
+            }
+            if act_name == "\0set-status" {
+                if let Ok(st) = act_fmt.parse::<u16>() {
+                    *status = st;
+                    *status_msg = status_reason(st).to_string();
+                    CURRENT_RES_STATUS.set(st);
+                }
+                return Ok(true);
+            }
+            if let Some(var_name) = act_name.strip_prefix("\0set-var:") {
+                let val = if let Ok(e) = Expr::parse(act_fmt) {
+                    e.eval_sample(&registry, &ctx)
+                        .map(|smp| sample_to_string(&smp))
+                        .unwrap_or_default()
+                } else {
+                    format_sample_string(act_fmt, &ctx, &registry)
+                };
+                CURRENT_VARS.with(|v| {
+                    v.borrow_mut().insert(var_name.to_string(), val);
+                });
+                return Ok(true);
+            }
+            if let Some(var_name) = act_name.strip_prefix("\0unset-var:") {
+                CURRENT_VARS.with(|v| {
+                    v.borrow_mut().remove(var_name);
+                });
+                return Ok(true);
+            }
+            if act_name == "\0strict-mode" {
+                STRICT_MODE.set(act_fmt == "on");
+                return Ok(true);
+            }
+            if let Some(hdr_name) = act_name.strip_prefix("\0replace-header:") {
+                if let Some((re_str, repl_str)) = act_fmt.split_once('\t') {
+                    if let Ok(re) = regex::Regex::new(re_str) {
+                        let rust_repl = translate_backreferences(repl_str);
+                        let strict = STRICT_MODE.get();
+                        for (k, v) in hdrs.iter_mut() {
+                            if k.eq_ignore_ascii_case(hdr_name) {
+                                let new_v = re.replace_all(v, &rust_repl).to_string();
+                                if strict && new_v.len() > 1_048_575 {
+                                    return Err(500);
+                                }
+                                *v = new_v;
+                            }
+                        }
+                        CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = hdrs.clone());
+                    }
+                }
+                return Ok(true);
+            }
+            if let Some(hdr_name) = act_name.strip_prefix("\0replace-value:") {
+                if let Some((re_str, repl_str)) = act_fmt.split_once('\t') {
+                    if let Ok(re) = regex::Regex::new(re_str) {
+                        let rust_repl = translate_backreferences(repl_str);
+                        let strict = STRICT_MODE.get();
+                        for (k, v) in hdrs.iter_mut() {
+                            if k.eq_ignore_ascii_case(hdr_name) {
+                                let new_v = re.replace_all(v, &rust_repl).to_string();
+                                if strict && new_v.len() > 1_048_575 {
+                                    return Err(500);
+                                }
+                                *v = new_v;
+                            }
+                        }
+                        CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = hdrs.clone());
+                    }
+                }
+                return Ok(true);
+            }
+
+            let val = format_sample_string(act_fmt, &ctx, &registry);
+            let added = act_name.len() + val.len() + 4;
+            let total = REWRITE_ADDED_BYTES.get() + added;
+            if total > MAX_REWRITE_LIMIT.get() {
+                if STRICT_MODE.get() {
+                    return Err(500);
+                }
+                return Ok(true);
+            }
+            REWRITE_ADDED_BYTES.set(total);
+
+            if let Some(pos) = hdrs.iter().position(|(k, _)| k.eq_ignore_ascii_case(act_name)) {
+                hdrs[pos].1 = val;
+            } else {
+                hdrs.push((act_name.to_string(), val));
+            }
+            CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = hdrs.clone());
+            Ok(true)
+        };
+
+        // 1. Apply be.http_res_rules
         for rule in &proxies[be_idx].http_res_rules {
+            let matches = match &rule.cond {
+                None => true,
+                Some(cond) => eval_condition(cond, &ctx, &proxies[be_idx].acls, &registry),
+            };
+            if !matches {
+                continue;
+            }
             match &rule.action {
                 ibex_config::HttpResAction::SetHeader { name, fmt } => {
-                    let val = fmt.clone();
-                    if let Some(pos) = hdrs.iter().position(|(k, _)| k.eq_ignore_ascii_case(name)) {
-                        hdrs[pos].1 = val;
-                    } else {
-                        hdrs.push((name.clone(), val));
+                    match eval_res_action(name, fmt, &mut hdrs, &mut status, &mut status_msg) {
+                        Ok(true) => {}
+                        Ok(false) => break,
+                        Err(err_st) => {
+                            let resp = format!("HTTP/1.1 {err_st} {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", status_reason(err_st));
+                            entry.sess.rep.replace_prefix(total_hdr_len, resp.as_bytes());
+                            entry.sess.resp_headers_processed = true;
+                            return;
+                        }
                     }
                 }
                 ibex_config::HttpResAction::AddHeader { name, fmt } => {
-                    hdrs.push((name.clone(), fmt.clone()));
+                    if let Some(var_name) = name.strip_prefix("\0set-var:") {
+                        let val = format_sample_string(fmt, &ctx, &registry);
+                        CURRENT_VARS.with(|v| v.borrow_mut().insert(var_name.to_string(), val));
+                    } else {
+                        let val = format_sample_string(fmt, &ctx, &registry);
+                        let added = name.len() + val.len() + 4;
+                        let total = REWRITE_ADDED_BYTES.get() + added;
+                        if total > MAX_REWRITE_LIMIT.get() {
+                            if STRICT_MODE.get() {
+                                let resp = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                                entry.sess.rep.replace_prefix(total_hdr_len, resp.as_bytes());
+                                entry.sess.resp_headers_processed = true;
+                                return;
+                            }
+                        } else {
+                            REWRITE_ADDED_BYTES.set(total);
+                            hdrs.push((name.clone(), val));
+                            CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = hdrs.clone());
+                        }
+                    }
                 }
                 ibex_config::HttpResAction::DelHeader { name } => {
-                    hdrs.retain(|(k, _)| !k.eq_ignore_ascii_case(name));
+                    if let Some(var_name) = name.strip_prefix("\0unset-var:") {
+                        CURRENT_VARS.with(|v| v.borrow_mut().remove(var_name));
+                    } else {
+                        hdrs.retain(|(k, _)| !header_name_matches(k, name));
+                        CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = hdrs.clone());
+                    }
                 }
-                ibex_config::HttpResAction::SetStatus { .. } => {}
+                ibex_config::HttpResAction::SetStatus { status: new_st } => {
+                    status = *new_st;
+                    status_msg = status_reason(status).to_string();
+                    CURRENT_RES_STATUS.set(status);
+                }
             }
         }
 
-        // Apply be.http_after_res_rules
+        // 1b. Apply fe.http_res_rules
+        if fe_idx != be_idx {
+            for rule in &proxies[fe_idx].http_res_rules {
+                let matches = match &rule.cond {
+                    None => true,
+                    Some(cond) => eval_condition(cond, &ctx, &proxies[fe_idx].acls, &registry),
+                };
+                if !matches {
+                    continue;
+                }
+                match &rule.action {
+                    ibex_config::HttpResAction::SetHeader { name, fmt } => {
+                        match eval_res_action(name, fmt, &mut hdrs, &mut status, &mut status_msg) {
+                            Ok(true) => {}
+                            Ok(false) => break,
+                            Err(err_st) => {
+                                let resp = format!("HTTP/1.1 {err_st} {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", status_reason(err_st));
+                                entry.sess.rep.replace_prefix(total_hdr_len, resp.as_bytes());
+                                entry.sess.resp_headers_processed = true;
+                                return;
+                            }
+                        }
+                    }
+                    ibex_config::HttpResAction::AddHeader { name, fmt } => {
+                        if let Some(var_name) = name.strip_prefix("\0set-var:") {
+                            let val = format_sample_string(fmt, &ctx, &registry);
+                            CURRENT_VARS.with(|v| v.borrow_mut().insert(var_name.to_string(), val));
+                        } else {
+                            let val = format_sample_string(fmt, &ctx, &registry);
+                            let added = name.len() + val.len() + 4;
+                            let total = REWRITE_ADDED_BYTES.get() + added;
+                            if total > MAX_REWRITE_LIMIT.get() {
+                                if STRICT_MODE.get() {
+                                    let resp = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                                    entry.sess.rep.replace_prefix(total_hdr_len, resp.as_bytes());
+                                    entry.sess.resp_headers_processed = true;
+                                    return;
+                                }
+                            } else {
+                                REWRITE_ADDED_BYTES.set(total);
+                                hdrs.push((name.clone(), val));
+                                CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = hdrs.clone());
+                            }
+                        }
+                    }
+                    ibex_config::HttpResAction::DelHeader { name } => {
+                        if let Some(var_name) = name.strip_prefix("\0unset-var:") {
+                            CURRENT_VARS.with(|v| v.borrow_mut().remove(var_name));
+                        } else {
+                            hdrs.retain(|(k, _)| !header_name_matches(k, name));
+                            CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = hdrs.clone());
+                        }
+                    }
+                    ibex_config::HttpResAction::SetStatus { status: new_st } => {
+                        status = *new_st;
+                        status_msg = status_reason(status).to_string();
+                        CURRENT_RES_STATUS.set(status);
+                    }
+                }
+            }
+        }
+
+        // 2. Apply be.http_after_res_rules
         for rule in &proxies[be_idx].http_after_res_rules {
+            let matches = match &rule.cond {
+                None => true,
+                Some(cond) => eval_condition(cond, &ctx, &proxies[be_idx].acls, &registry),
+            };
+            if !matches {
+                continue;
+            }
             match &rule.action {
                 ibex_config::HttpAfterResAction::SetHeader { name, fmt } => {
-                    let val = if fmt == "%Tr" {
-                        "0ms".to_string()
-                    } else {
-                        fmt.clone()
-                    };
-                    if let Some(pos) = hdrs.iter().position(|(k, _)| k.eq_ignore_ascii_case(name)) {
-                        hdrs[pos].1 = val;
-                    } else {
-                        hdrs.push((name.clone(), val));
+                    match eval_res_action(name, fmt, &mut hdrs, &mut status, &mut status_msg) {
+                        Ok(true) => {}
+                        Ok(false) => break,
+                        Err(err_st) => {
+                            let resp = format!("HTTP/1.1 {err_st} {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", status_reason(err_st));
+                            entry.sess.rep.replace_prefix(total_hdr_len, resp.as_bytes());
+                            entry.sess.resp_headers_processed = true;
+                            return;
+                        }
                     }
                 }
                 ibex_config::HttpAfterResAction::AddHeader { name, fmt } => {
-                    let val = if fmt == "%Tr" {
-                        "0ms".to_string()
+                    if let Some(var_name) = name.strip_prefix("\0set-var:") {
+                        let val = format_sample_string(fmt, &ctx, &registry);
+                        CURRENT_VARS.with(|v| v.borrow_mut().insert(var_name.to_string(), val));
                     } else {
-                        fmt.clone()
-                    };
-                    hdrs.push((name.clone(), val));
+                        let val = format_sample_string(fmt, &ctx, &registry);
+                        let added = name.len() + val.len() + 4;
+                        let total = REWRITE_ADDED_BYTES.get() + added;
+                        if total > MAX_REWRITE_LIMIT.get() {
+                            if STRICT_MODE.get() {
+                                let resp = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                                entry.sess.rep.replace_prefix(total_hdr_len, resp.as_bytes());
+                                entry.sess.resp_headers_processed = true;
+                                return;
+                            }
+                        } else {
+                            REWRITE_ADDED_BYTES.set(total);
+                            hdrs.push((name.clone(), val));
+                            CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = hdrs.clone());
+                        }
+                    }
                 }
                 ibex_config::HttpAfterResAction::DelHeader { name } => {
-                    hdrs.retain(|(k, _)| !k.eq_ignore_ascii_case(name));
+                    if let Some(var_name) = name.strip_prefix("\0unset-var:") {
+                        CURRENT_VARS.with(|v| v.borrow_mut().remove(var_name));
+                    } else {
+                        hdrs.retain(|(k, _)| !header_name_matches(k, name));
+                        CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = hdrs.clone());
+                    }
                 }
             }
         }
 
-        // Apply fe.http_after_res_rules
+        // 3. Apply fe.http_after_res_rules
         for rule in &proxies[fe_idx].http_after_res_rules {
+            let matches = match &rule.cond {
+                None => true,
+                Some(cond) => eval_condition(cond, &ctx, &proxies[fe_idx].acls, &registry),
+            };
+            if !matches {
+                continue;
+            }
             match &rule.action {
                 ibex_config::HttpAfterResAction::SetHeader { name, fmt } => {
-                    let val = if fmt == "%Tr" {
-                        "0ms".to_string()
-                    } else {
-                        fmt.clone()
-                    };
-                    if let Some(pos) = hdrs.iter().position(|(k, _)| k.eq_ignore_ascii_case(name)) {
-                        hdrs[pos].1 = val;
-                    } else {
-                        hdrs.push((name.clone(), val));
+                    match eval_res_action(name, fmt, &mut hdrs, &mut status, &mut status_msg) {
+                        Ok(true) => {}
+                        Ok(false) => break,
+                        Err(err_st) => {
+                            let resp = format!("HTTP/1.1 {err_st} {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", status_reason(err_st));
+                            entry.sess.rep.replace_prefix(total_hdr_len, resp.as_bytes());
+                            entry.sess.resp_headers_processed = true;
+                            return;
+                        }
                     }
                 }
                 ibex_config::HttpAfterResAction::AddHeader { name, fmt } => {
-                    let val = if fmt == "%Tr" {
-                        "0ms".to_string()
+                    if let Some(var_name) = name.strip_prefix("\0set-var:") {
+                        let val = format_sample_string(fmt, &ctx, &registry);
+                        CURRENT_VARS.with(|v| v.borrow_mut().insert(var_name.to_string(), val));
                     } else {
-                        fmt.clone()
-                    };
-                    hdrs.push((name.clone(), val));
+                        let val = format_sample_string(fmt, &ctx, &registry);
+                        let added = name.len() + val.len() + 4;
+                        let total = REWRITE_ADDED_BYTES.get() + added;
+                        if total > MAX_REWRITE_LIMIT.get() {
+                            if STRICT_MODE.get() {
+                                let resp = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                                entry.sess.rep.replace_prefix(total_hdr_len, resp.as_bytes());
+                                entry.sess.resp_headers_processed = true;
+                                return;
+                            }
+                        } else {
+                            REWRITE_ADDED_BYTES.set(total);
+                            hdrs.push((name.clone(), val));
+                            CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = hdrs.clone());
+                        }
+                    }
                 }
                 ibex_config::HttpAfterResAction::DelHeader { name } => {
-                    hdrs.retain(|(k, _)| !k.eq_ignore_ascii_case(name));
+                    if let Some(var_name) = name.strip_prefix("\0unset-var:") {
+                        CURRENT_VARS.with(|v| v.borrow_mut().remove(var_name));
+                    } else {
+                        hdrs.retain(|(k, _)| !header_name_matches(k, name));
+                        CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = hdrs.clone());
+                    }
                 }
             }
         }
 
-        let mut new_hdr = format!("{first_line}\r\n");
+        let mut new_hdr = format!("{proto_version} {status} {status_msg}\r\n");
         for (k, v) in hdrs {
             let _ = write!(new_hdr, "{k}: {v}\r\n");
         }
@@ -2208,6 +2602,7 @@ impl EngineDispatcher<'_> {
             .sess
             .rep
             .replace_prefix(total_hdr_len, new_hdr.as_bytes());
+        entry.sess.srv_state = ScState::Established;
         entry.sess.resp_headers_processed = true;
     }
 
@@ -2455,7 +2850,56 @@ impl EngineDispatcher<'_> {
     ) -> Option<crate::stats_html::AdminAction> {
         let proxy_idx = entry.proxy_idx;
 
-        // Check if stats are enabled on this proxy and URI matches
+        // Initialize per-request thread locals
+        CURRENT_VARS.with(|v| v.borrow_mut().clear());
+        CURRENT_TIMEOUTS.with(|t| {
+            let mut map = t.borrow_mut();
+            map.clear();
+            #[allow(clippy::cast_possible_truncation)]
+            let fe_client = proxies[proxy_idx].stats_config.raw_timeouts.client.map_or(0, |d| d.as_millis() as u32);
+            #[allow(clippy::cast_possible_truncation)]
+            let fe_connect = proxies[proxy_idx].stats_config.raw_timeouts.connect.map_or(0, |d| d.as_millis() as u32);
+            #[allow(clippy::cast_possible_truncation)]
+            let fe_server = proxies[proxy_idx].stats_config.raw_timeouts.server.map_or(0, |d| d.as_millis() as u32);
+            #[allow(clippy::cast_possible_truncation)]
+            let fe_queue = proxies[proxy_idx].stats_config.raw_timeouts.queue.map_or(0, |d| d.as_millis() as u32);
+            #[allow(clippy::cast_possible_truncation)]
+            let fe_tunnel = proxies[proxy_idx].stats_config.raw_timeouts.tunnel.map_or(0, |d| d.as_millis() as u32);
+            #[allow(clippy::cast_possible_truncation)]
+            let fe_tarpit = proxies[proxy_idx].stats_config.raw_timeouts.tarpit.map_or(0, |d| d.as_millis() as u32);
+
+            map.insert("fe_client_timeout".into(), fe_client);
+            map.insert("cur_client_timeout".into(), fe_client);
+            map.insert("fe_connect_timeout".into(), fe_connect);
+            map.insert("cur_connect_timeout".into(), fe_connect);
+            map.insert("fe_server_timeout".into(), fe_server);
+            map.insert("cur_server_timeout".into(), fe_server);
+            map.insert("fe_queue_timeout".into(), fe_queue);
+            map.insert("cur_queue_timeout".into(), fe_queue);
+            map.insert("fe_tunnel_timeout".into(), fe_tunnel);
+            map.insert("cur_tunnel_timeout".into(), fe_tunnel);
+            map.insert("fe_tarpit_timeout".into(), fe_tarpit);
+            map.insert("cur_tarpit_timeout".into(), fe_tarpit);
+
+            map.insert("be_client_timeout".into(), fe_client);
+            map.insert("be_server_timeout".into(), fe_server);
+            map.insert("be_connect_timeout".into(), fe_connect);
+            map.insert("be_queue_timeout".into(), fe_queue);
+            map.insert("be_tunnel_timeout".into(), fe_tunnel);
+            map.insert("be_tarpit_timeout".into(), fe_tarpit);
+        });
+        STRICT_MODE.set(true);
+        REWRITE_ADDED_BYTES.set(0);
+        let max_rw = proxies[proxy_idx].stats_config.maxrewrite.unwrap_or(8192);
+        MAX_REWRITE_LIMIT.set(max_rw);
+
+        // Serve the stats page before anything else routes this request.
+        //
+        // This dispatch was dropped when the action-rule engine was wired in, leaving
+        // `is_stats_request` and `handle_stats_request` orphaned -- clippy flagged both
+        // as never used. The effect was that every request to `stats uri` fell through
+        // to normal backend routing and returned 503, so the stats page and the whole
+        // web admin stopped working.
         if proxies[proxy_idx].stats_config.enable
             || proxies[proxy_idx].stats_config.uri.is_some()
             || proxies[proxy_idx].stats_config.admin
@@ -2619,105 +3063,523 @@ impl EngineDispatcher<'_> {
             }
         }
 
-        // 2. Evaluate http-request rules
-        let req_uri_clone = entry.sess.req_uri.clone();
-        let req_method_clone = entry.sess.req_method.clone();
-        let req_headers_clone = entry.sess.req_headers.clone();
-        let ctx = SampleContext {
-            client_addr: entry.sess.client_addr,
-            server_addr: entry.target_addr,
-            htx: None,
-            req_uri: req_uri_clone.as_deref(),
-            req_method: req_method_clone.as_deref(),
-            req_headers: req_headers_clone.as_deref(),
-            act_conn: proxies[proxy_idx].stats.act_conn,
-            cum_conn: proxies[proxy_idx].stats.cum_conn,
-            sc_http_req_rates,
-            sc_conn_rates,
-            ..Default::default()
-        };
+        let registry = build_sample_registry();
 
-        let registry = Registry::new();
+        // 2. Helper closure to evaluate http-request rules
+        let eval_http_rules = |rules: &[ibex_config::HttpReqRule], acls: &HashMap<String, Expr>, sess: &mut TcpSession, target_addr: Option<SocketAddr>| -> Result<Option<()>, ()> {
+            for rule in rules {
+                let req_uri_clone = sess.req_uri.clone();
+                let req_method_clone = sess.req_method.clone();
+                let req_headers_clone = sess.req_headers.clone();
+                let ctx = SampleContext {
+                    client_addr: sess.client_addr,
+                    server_addr: target_addr,
+                    htx: None,
+                    req_uri: req_uri_clone.as_deref(),
+                    req_method: req_method_clone.as_deref(),
+                    req_headers: req_headers_clone.as_deref(),
+                    act_conn: proxies[proxy_idx].stats.act_conn,
+                    cum_conn: proxies[proxy_idx].stats.cum_conn,
+                    sc_http_req_rates,
+                    sc_conn_rates,
+                    ..Default::default()
+                };
 
-        for rule in &proxies[proxy_idx].http_req_rules {
-            let matches = match &rule.cond {
-                None => true,
-                Some(cond) => eval_condition(cond, &ctx, &proxies[proxy_idx].acls, &registry),
-            };
-            if !matches {
-                continue;
-            }
+                let matches = match &rule.cond {
+                    None => true,
+                    Some(cond) => eval_condition(cond, &ctx, acls, &registry),
+                };
+                if !matches {
+                    continue;
+                }
 
-            match &rule.action {
-                ibex_config::HttpReqAction::Return {
-                    status,
-                    content_type,
-                    lf_string,
-                } => {
-                    let unescaped;
-                    let body = if let Some(s) = lf_string.as_deref() {
-                        unescaped = s
+                match &rule.action {
+                    ibex_config::HttpReqAction::Return {
+                        status,
+                        content_type,
+                        lf_string,
+                    } => {
+                        let mut custom_headers: Vec<(String, String)> = Vec::new();
+                        let mut body_str = String::new();
+
+                        if let Some(s) = lf_string.as_deref() {
+                            let mut rest = s;
+                            while let Some(stripped) = rest.strip_prefix("\0HDR:") {
+                                if let Some((line, r)) = stripped.split_once('\n') {
+                                    if let Some((k, v)) = line.split_once(':') {
+                                        let formatted_v = format_sample_string(v, &ctx, &registry);
+                                        custom_headers.push((k.to_string(), formatted_v));
+                                    }
+                                    rest = r;
+                                } else {
+                                    break;
+                                }
+                            }
+                            if let Some(b) = rest.strip_prefix("\0BODY:") {
+                                body_str = format_sample_string(b, &ctx, &registry);
+                            } else if !rest.starts_with('\0') {
+                                body_str = format_sample_string(rest, &ctx, &registry);
+                            }
+                        }
+
+                        let unescaped = body_str
                             .replace("\\n", "\n")
                             .replace("\\r", "\r")
                             .replace("\\t", "\t");
-                        unescaped.as_str()
-                    } else {
-                        ""
-                    };
-                    let ctype = content_type.as_deref().unwrap_or("text/plain");
-                    let reason = status_reason(*status);
-                    let resp = format!(
-                        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        status,
-                        reason,
-                        ctype,
-                        body.len(),
-                        body
-                    );
-                    let w = entry.sess.rep.writable();
-                    let n = w.len().min(resp.len());
-                    w[..n].copy_from_slice(&resp.as_bytes()[..n]);
-                    entry.sess.rep.commit(n);
-                    entry.sess.cli_state = ScState::ShutR;
-                    entry.sess.srv_state = ScState::Closed;
-                    return None;
+                        let body = unescaped.as_bytes();
+
+                        let reason = status_reason(*status);
+                        let mut resp = format!("HTTP/1.1 {status} {reason}\r\n");
+                        if let Some(ct) = content_type.as_deref() {
+                            let _ = write!(resp, "Content-Type: {ct}\r\n");
+                        }
+                        for (k, v) in custom_headers {
+                            if !v.is_empty() {
+                                let _ = write!(resp, "{k}: {v}\r\n");
+                            }
+                        }
+                        let _ = write!(resp, "Content-Length: {}\r\n\r\n", body.len());
+
+                        let mut full_resp = resp.into_bytes();
+                        full_resp.extend_from_slice(body);
+
+                        let w = sess.rep.writable();
+                        let n = w.len().min(full_resp.len());
+                        w[..n].copy_from_slice(&full_resp[..n]);
+                        sess.rep.commit(n);
+
+                        if let Some((hdr_len, eoh_len)) = crate::proxy::find_eoh(sess.req.readable()) {
+                            sess.req.consume(hdr_len + eoh_len);
+                        }
+                        sess.req_method = None;
+                        sess.req_uri = None;
+                        sess.req_headers = None;
+                        sess.cli_state = ScState::Ready;
+                        sess.srv_state = ScState::Init;
+                        sess.resp_headers_processed = false;
+                        return Ok(Some(()));
+                    }
+                    ibex_config::HttpReqAction::Deny { deny_status } => {
+                        let status_code = deny_status.unwrap_or(403);
+                        let reason = status_reason(status_code);
+                        let resp = format!(
+                            "HTTP/1.1 {status_code} {reason}\r\nContent-Type: text/plain\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                        let w = sess.rep.writable();
+                        let n = w.len().min(resp.len());
+                        w[..n].copy_from_slice(&resp.as_bytes()[..n]);
+                        sess.rep.commit(n);
+                        sess.cli_state = ScState::ShutR;
+                        sess.srv_state = ScState::Closed;
+                        return Ok(Some(()));
+                    }
+                    ibex_config::HttpReqAction::Allow => {
+                        return Ok(None);
+                    }
+                    ibex_config::HttpReqAction::Auth => {
+                        let resp = "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"HAProxy\"\r\nContent-Type: text/plain\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                        let w = sess.rep.writable();
+                        let n = w.len().min(resp.len());
+                        w[..n].copy_from_slice(&resp.as_bytes()[..n]);
+                        sess.rep.commit(n);
+                        sess.cli_state = ScState::ShutR;
+                        sess.srv_state = ScState::Closed;
+                        return Ok(Some(()));
+                    }
+                    ibex_config::HttpReqAction::Redirect { location, prefix, code, .. } => {
+                        let status_code = code.unwrap_or(302);
+                        let loc = location.as_deref().or(prefix.as_deref()).unwrap_or("/");
+                        let formatted_loc = format_sample_string(loc, &ctx, &registry);
+                        let reason = status_reason(status_code);
+                        let resp = format!(
+                            "HTTP/1.1 {status_code} {reason}\r\nLocation: {formatted_loc}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                        let w = sess.rep.writable();
+                        let n = w.len().min(resp.len());
+                        w[..n].copy_from_slice(&resp.as_bytes()[..n]);
+                        sess.rep.commit(n);
+                        sess.cli_state = ScState::ShutR;
+                        sess.srv_state = ScState::Closed;
+                        return Ok(Some(()));
+                    }
+                    ibex_config::HttpReqAction::SetPath { fmt } => {
+                        let new_path = format_sample_string(fmt, &ctx, &registry);
+                        let current_uri = sess.req_uri.as_deref().unwrap_or("/");
+                        let (pfx, _, query) = split_uri(current_uri);
+                        let rebuilt = rebuild_uri(pfx, &new_path, query);
+                        sess.req_uri = Some(rebuilt);
+                        rebuild_req_buffer(sess);
+                    }
+                    ibex_config::HttpReqAction::ReplacePath { regex, repl } => {
+                        let current_uri = sess.req_uri.as_deref().unwrap_or("/");
+                        let (pfx, path, query) = split_uri(current_uri);
+                        let rust_repl = translate_backreferences(repl);
+                        if let Ok(re) = regex::Regex::new(regex) {
+                            let new_path = re.replace_all(path, &rust_repl).to_string();
+                            let rebuilt = rebuild_uri(pfx, &new_path, query);
+                            sess.req_uri = Some(rebuilt);
+                            rebuild_req_buffer(sess);
+                        }
+                    }
+                    ibex_config::HttpReqAction::SetPathq { fmt } => {
+                        let new_pathq = format_sample_string(fmt, &ctx, &registry);
+                        let current_uri = sess.req_uri.as_deref().unwrap_or("/");
+                        let (pfx, _, _) = split_uri(current_uri);
+                        let rebuilt = format!("{pfx}{new_pathq}");
+                        sess.req_uri = Some(rebuilt);
+                        rebuild_req_buffer(sess);
+                    }
+                    ibex_config::HttpReqAction::ReplacePathq { regex, repl } => {
+                        let current_uri = sess.req_uri.as_deref().unwrap_or("/");
+                        let (pfx, path, query) = split_uri(current_uri);
+                        let pathq = if query.is_empty() { path.to_string() } else { format!("{path}?{query}") };
+                        let rust_repl = translate_backreferences(repl);
+                        if let Ok(re) = regex::Regex::new(regex) {
+                            let new_pathq = re.replace_all(&pathq, &rust_repl).to_string();
+                            let rebuilt = format!("{pfx}{new_pathq}");
+                            sess.req_uri = Some(rebuilt);
+                            rebuild_req_buffer(sess);
+                        }
+                    }
+                    ibex_config::HttpReqAction::SetQuery { fmt } => {
+                        let new_query = format_sample_string(fmt, &ctx, &registry);
+                        let current_uri = sess.req_uri.as_deref().unwrap_or("/");
+                        let (pfx, path, _) = split_uri(current_uri);
+                        let rebuilt = rebuild_uri(pfx, path, &new_query);
+                        sess.req_uri = Some(rebuilt);
+                        rebuild_req_buffer(sess);
+                    }
+                    ibex_config::HttpReqAction::SetUri { fmt } => {
+                        let new_uri = format_sample_string(fmt, &ctx, &registry);
+                        sess.req_uri = Some(new_uri);
+                        rebuild_req_buffer(sess);
+                    }
+                    ibex_config::HttpReqAction::SetMethod { fmt } => {
+                        let new_method = format_sample_string(fmt, &ctx, &registry);
+                        sess.req_method = Some(new_method);
+                        rebuild_req_buffer(sess);
+                    }
+                    ibex_config::HttpReqAction::SetSrc { expr } => {
+                        let val = if let Ok(e) = Expr::parse(expr) {
+                            e.eval_sample(&registry, &ctx)
+                                .map(|smp| sample_to_string(&smp))
+                                .unwrap_or_default()
+                        } else {
+                            format_sample_string(expr, &ctx, &registry)
+                        };
+                        if let Ok(ip) = val.parse::<IpAddr>() {
+                            sess.client_addr = Some(SocketAddr::new(ip, 0));
+                        }
+                    }
+                    ibex_config::HttpReqAction::SetDst { expr } => {
+                        let val = if let Ok(e) = Expr::parse(expr) {
+                            e.eval_sample(&registry, &ctx)
+                                .map(|smp| sample_to_string(&smp))
+                                .unwrap_or_default()
+                        } else {
+                            format_sample_string(expr, &ctx, &registry)
+                        };
+                        if let Ok(ip) = val.parse::<IpAddr>() {
+                            sess.server_addr = Some(SocketAddr::new(ip, 0));
+                        }
+                    }
+                    ibex_config::HttpReqAction::SetVar { var_name, expr } => {
+                        let val = if let Ok(e) = Expr::parse(expr) {
+                            e.eval_sample(&registry, &ctx)
+                                .map(|smp| sample_to_string(&smp))
+                                .unwrap_or_default()
+                        } else {
+                            format_sample_string(expr, &ctx, &registry)
+                        };
+                        CURRENT_VARS.with(|v| {
+                            v.borrow_mut().insert(var_name.clone(), val);
+                        });
+                    }
+                    ibex_config::HttpReqAction::UnsetVar { var_name } => {
+                        CURRENT_VARS.with(|v| {
+                            v.borrow_mut().remove(var_name);
+                        });
+                    }
+                    ibex_config::HttpReqAction::StrictMode { on } => {
+                        STRICT_MODE.set(*on);
+                    }
+                    ibex_config::HttpReqAction::SetTimeout { timeout_type, timeout_val } => {
+                        let ms = if let Ok(expr) = Expr::parse(timeout_val) {
+                            if let Some(smp) = expr.eval_sample(&registry, &ctx) {
+                                match smp {
+                                    Sample::Sint(n) => u32::try_from(n).unwrap_or(0),
+                                    Sample::Str(ref s) => parse_timeout_val(s),
+                                    _ => parse_timeout_val(timeout_val),
+                                }
+                            } else {
+                                parse_timeout_val(timeout_val)
+                            }
+                        } else {
+                            parse_timeout_val(timeout_val)
+                        };
+                        CURRENT_TIMEOUTS.with(|t| {
+                            let mut map = t.borrow_mut();
+                            match timeout_type.as_str() {
+                                "client" => {
+                                    map.insert("cur_client_timeout".into(), ms);
+                                    map.insert("cur_client_timeout_set".into(), 1);
+                                }
+                                "server" => {
+                                    map.insert("cur_server_timeout".into(), ms);
+                                    map.insert("cur_server_timeout_set".into(), 1);
+                                }
+                                "connect" => {
+                                    map.insert("cur_connect_timeout".into(), ms);
+                                    map.insert("cur_connect_timeout_set".into(), 1);
+                                }
+                                "queue" => {
+                                    map.insert("cur_queue_timeout".into(), ms);
+                                    map.insert("cur_queue_timeout_set".into(), 1);
+                                }
+                                "tunnel" => {
+                                    map.insert("cur_tunnel_timeout".into(), ms);
+                                    map.insert("cur_tunnel_timeout_set".into(), 1);
+                                }
+                                "tarpit" => {
+                                    map.insert("cur_tarpit_timeout".into(), ms);
+                                    map.insert("cur_tarpit_timeout_set".into(), 1);
+                                }
+                                _ => {}
+                            }
+                        });
+                    }
+                    ibex_config::HttpReqAction::NormalizeUri { normalizer, full, strict } => {
+                        let current_uri = sess.req_uri.as_deref().unwrap_or("/");
+                        if let Ok(new_uri) = apply_normalize_uri(current_uri, normalizer, *full, *strict) {
+                            sess.req_uri = Some(new_uri);
+                            rebuild_req_buffer(sess);
+                        } else {
+                            let resp = "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                            let w = sess.rep.writable();
+                            let n = w.len().min(resp.len());
+                            w[..n].copy_from_slice(&resp.as_bytes()[..n]);
+                            sess.rep.commit(n);
+                            sess.cli_state = ScState::ShutR;
+                            sess.srv_state = ScState::Closed;
+                            return Ok(Some(()));
+                        }
+                    }
+                    ibex_config::HttpReqAction::SetHeader { name, fmt } => {
+                        let val = format_sample_string(fmt, &ctx, &registry);
+                        let added = name.len() + val.len() + 4;
+                        let total = REWRITE_ADDED_BYTES.get() + added;
+                        if total > MAX_REWRITE_LIMIT.get() {
+                            if STRICT_MODE.get() {
+                                let resp = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                                let w = sess.rep.writable();
+                                let n = w.len().min(resp.len());
+                                w[..n].copy_from_slice(&resp.as_bytes()[..n]);
+                                sess.rep.commit(n);
+                                sess.cli_state = ScState::ShutR;
+                                sess.srv_state = ScState::Closed;
+                                return Ok(Some(()));
+                            }
+                        } else {
+                            REWRITE_ADDED_BYTES.set(total);
+                            set_req_header(sess, name, &val);
+                        }
+                    }
+                    ibex_config::HttpReqAction::AddHeader { name, fmt } => {
+                        let val = format_sample_string(fmt, &ctx, &registry);
+                        let added = name.len() + val.len() + 4;
+                        let total = REWRITE_ADDED_BYTES.get() + added;
+                        if total > MAX_REWRITE_LIMIT.get() {
+                            if STRICT_MODE.get() {
+                                let resp = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                                let w = sess.rep.writable();
+                                let n = w.len().min(resp.len());
+                                w[..n].copy_from_slice(&resp.as_bytes()[..n]);
+                                sess.rep.commit(n);
+                                sess.cli_state = ScState::ShutR;
+                                sess.srv_state = ScState::Closed;
+                                return Ok(Some(()));
+                            }
+                        } else {
+                            REWRITE_ADDED_BYTES.set(total);
+                            add_req_header(sess, name, &val);
+                        }
+                    }
+                    ibex_config::HttpReqAction::DelHeader { name } => {
+                        del_req_header(sess, name);
+                    }
+                    ibex_config::HttpReqAction::ReplaceHeader { name, regex, repl } => {
+                        if replace_req_header(sess, name, regex, repl).is_err() {
+                            let resp = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                            let w = sess.rep.writable();
+                            let n = w.len().min(resp.len());
+                            w[..n].copy_from_slice(&resp.as_bytes()[..n]);
+                            sess.rep.commit(n);
+                            sess.cli_state = ScState::ShutR;
+                            sess.srv_state = ScState::Closed;
+                            return Ok(Some(()));
+                        }
+                    }
+                    ibex_config::HttpReqAction::ReplaceValue { name, regex, repl }
+                        if replace_req_value(sess, name, regex, repl).is_err() => {
+                            let resp = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                            let w = sess.rep.writable();
+                            let n = w.len().min(resp.len());
+                            w[..n].copy_from_slice(&resp.as_bytes()[..n]);
+                            sess.rep.commit(n);
+                            sess.cli_state = ScState::ShutR;
+                            sess.srv_state = ScState::Closed;
+                            return Ok(Some(()));
+                        }
+                    _ => {}
                 }
-                ibex_config::HttpReqAction::Deny { deny_status } => {
-                    let status_code = deny_status.unwrap_or(403);
-                    let reason = status_reason(status_code);
-                    let resp = format!(
-                        "HTTP/1.1 {status_code} {reason}\r\nContent-Type: text/plain\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                    );
-                    let w = entry.sess.rep.writable();
-                    let n = w.len().min(resp.len());
-                    w[..n].copy_from_slice(&resp.as_bytes()[..n]);
-                    entry.sess.rep.commit(n);
-                    entry.sess.cli_state = ScState::ShutR;
-                    entry.sess.srv_state = ScState::Closed;
-                    return None;
-                }
-                ibex_config::HttpReqAction::SetHeader { name, fmt } => {
-                    let val = format_sample_string(fmt, &ctx);
-                    set_req_header(&mut entry.sess, name, &val);
-                }
-                ibex_config::HttpReqAction::AddHeader { name, fmt } => {
-                    let val = format_sample_string(fmt, &ctx);
-                    add_req_header(&mut entry.sess, name, &val);
-                }
-                ibex_config::HttpReqAction::DelHeader { name } => {
-                    del_req_header(&mut entry.sess, name);
-                }
-                _ => {}
             }
+            Ok(None)
+        };
+
+        // Execute frontend rules
+        let fe_rules = proxies[proxy_idx].http_req_rules.clone();
+        let fe_acls = proxies[proxy_idx].acls.clone();
+        if let Ok(Some(())) = eval_http_rules(&fe_rules, &fe_acls, &mut entry.sess, entry.target_addr) {
+            return None;
         }
 
         // 3. Resolve backend and server
         let be_idx = Self::resolve_backend(entry, proxies);
         entry.backend_idx = be_idx;
-        entry.sess.http_res_rules = proxies[be_idx].http_res_rules.clone();
-        let mut after_rules = proxies[be_idx].http_after_res_rules.clone();
-        after_rules.extend(proxies[proxy_idx].http_after_res_rules.clone());
+
+        // Update backend timeouts
+        CURRENT_TIMEOUTS.with(|t| {
+            let mut map = t.borrow_mut();
+            #[allow(clippy::cast_possible_truncation)]
+            let be_server = proxies[be_idx].stats_config.raw_timeouts.server.map_or(0, |d| d.as_millis() as u32);
+            #[allow(clippy::cast_possible_truncation)]
+            let be_connect = proxies[be_idx].stats_config.raw_timeouts.connect.map_or(0, |d| d.as_millis() as u32);
+            #[allow(clippy::cast_possible_truncation)]
+            let be_queue = proxies[be_idx].stats_config.raw_timeouts.queue.map_or(0, |d| d.as_millis() as u32);
+            #[allow(clippy::cast_possible_truncation)]
+            let be_tunnel = proxies[be_idx].stats_config.raw_timeouts.tunnel.map_or(0, |d| d.as_millis() as u32);
+            #[allow(clippy::cast_possible_truncation)]
+            let be_tarpit = proxies[be_idx].stats_config.raw_timeouts.tarpit.map_or(0, |d| d.as_millis() as u32);
+
+            map.insert("be_server_timeout".into(), be_server);
+            map.insert("be_connect_timeout".into(), be_connect);
+            map.insert("be_queue_timeout".into(), be_queue);
+            map.insert("be_tunnel_timeout".into(), be_tunnel);
+            map.insert("be_tarpit_timeout".into(), be_tarpit);
+
+            if be_idx != proxy_idx {
+                map.insert("cur_server_timeout".into(), be_server);
+                map.insert("cur_connect_timeout".into(), be_connect);
+                map.insert("cur_queue_timeout".into(), be_queue);
+                map.insert("cur_tunnel_timeout".into(), be_tunnel);
+            }
+        });
+
+        // If be_idx != proxy_idx, execute backend rules
+        if be_idx != proxy_idx {
+            let be_rules = proxies[be_idx].http_req_rules.clone();
+            let be_acls = proxies[be_idx].acls.clone();
+            if let Ok(Some(())) = eval_http_rules(&be_rules, &be_acls, &mut entry.sess, entry.target_addr) {
+                return None;
+            }
+        }
+
+        // Apply forwardfor & originalto header injection
+        if let Some(ref except_str) = proxies[be_idx].stats_config.forwardfor {
+            let client_ip = entry.sess.client_addr.map(|a| a.ip());
+            if let Some(ip) = client_ip {
+                let in_except = if except_str.is_empty() {
+                    false
+                } else {
+                    ip_in_cidr(ip, except_str)
+                };
+                if !in_except {
+                    let ip_str = ip.to_string();
+                    set_req_header(&mut entry.sess, "X-Forwarded-For", &ip_str);
+                }
+            }
+        }
+
+        if let Some(ref except_str) = proxies[be_idx].stats_config.originalto {
+            let dst_ip = entry.sess.server_addr.or(entry.target_addr).map(|a| a.ip());
+            if let Some(ip) = dst_ip {
+                let in_except = if except_str.is_empty() {
+                    false
+                } else {
+                    ip_in_cidr(ip, except_str)
+                };
+                if !in_except {
+                    let ip_str = ip.to_string();
+                    set_req_header(&mut entry.sess, "X-Original-To", &ip_str);
+                }
+            }
+        }
+
+        let req_uri_c = entry.sess.req_uri.clone();
+        let req_meth_c = entry.sess.req_method.clone();
+        let req_hdrs_c = entry.sess.req_headers.clone();
+        let res_ctx = SampleContext {
+            client_addr: entry.sess.client_addr,
+            server_addr: entry.target_addr,
+            htx: None,
+            req_uri: req_uri_c.as_deref(),
+            req_method: req_meth_c.as_deref(),
+            req_headers: req_hdrs_c.as_deref(),
+            ..Default::default()
+        };
+
+        let mut res_rules = Vec::new();
+        let mut raw_res = proxies[be_idx].http_res_rules.clone();
+        if be_idx != proxy_idx {
+            raw_res.extend(proxies[proxy_idx].http_res_rules.clone());
+        }
+        for rule in &raw_res {
+            let action = match &rule.action {
+                ibex_config::HttpResAction::SetHeader { name, fmt } => {
+                    let formatted_fmt = format_sample_string(fmt, &res_ctx, &registry);
+                    ibex_config::HttpResAction::SetHeader {
+                        name: name.clone(),
+                        fmt: formatted_fmt,
+                    }
+                }
+                ibex_config::HttpResAction::AddHeader { name, fmt } => {
+                    let formatted_fmt = format_sample_string(fmt, &res_ctx, &registry);
+                    ibex_config::HttpResAction::AddHeader {
+                        name: name.clone(),
+                        fmt: formatted_fmt,
+                    }
+                }
+                other => other.clone(),
+            };
+            res_rules.push(ibex_config::HttpResRule {
+                action,
+                cond: rule.cond.clone(),
+            });
+        }
+        entry.sess.http_res_rules = res_rules;
+
+        let mut after_rules = Vec::new();
+        let mut raw_after = proxies[be_idx].http_after_res_rules.clone();
+        if be_idx != proxy_idx {
+            raw_after.extend(proxies[proxy_idx].http_after_res_rules.clone());
+        }
+        for rule in &raw_after {
+            // Only the header actions carry a log-format string that needs expanding.
+            // Everything else is copied through unchanged, expressed as a default so a
+            // newly added action passes through rather than needing an arm here.
+            let mut action = rule.action.clone();
+            if let ibex_config::HttpAfterResAction::SetHeader { fmt, .. }
+            | ibex_config::HttpAfterResAction::AddHeader { fmt, .. } = &mut action
+            {
+                *fmt = format_sample_string(fmt, &res_ctx, &registry);
+            }
+            after_rules.push(ibex_config::HttpAfterResRule {
+                action,
+                cond: rule.cond.clone(),
+            });
+        }
         entry.sess.http_after_res_rules = after_rules;
+
         let source_ip = entry.sess.client_addr.map(|a| a.ip());
         let target = if let Some(ref cval) = entry.sess.cookie_val {
             proxies[be_idx]
@@ -3019,14 +3881,966 @@ impl Dispatch for EngineDispatcher<'_> {
     }
 }
 
-fn format_sample_string(fmt: &str, ctx: &SampleContext) -> String {
-    if fmt == "%ci" || fmt == "%[src]" {
-        ctx.client_addr
-            .map_or_else(|| "127.0.0.1".to_string(), |a| a.ip().to_string())
-    } else if fmt == "%Tr" {
-        "0ms".to_string()
+// One registration per sample fetch and converter; splitting it would scatter a
+// flat table across helpers for no gain.
+#[allow(clippy::too_many_lines)]
+fn build_sample_registry() -> Registry {
+    let mut reg = Registry::new();
+
+    // 1. var fetch
+    reg.register_fetch(FetchDesc {
+        name: "var",
+        out_type: SampleType::Str,
+        func: |_ctx, args| {
+            let var_name = args.first()?;
+            CURRENT_VARS.with(|v| {
+                v.borrow().get(var_name).cloned().map(Sample::Str)
+            })
+        },
+    });
+
+    // 2. str fetch
+    reg.register_fetch(FetchDesc {
+        name: "str",
+        out_type: SampleType::Str,
+        func: |_ctx, args| {
+            let s = args.first().cloned().unwrap_or_default();
+            Some(Sample::Str(s))
+        },
+    });
+
+    // 3. int fetch
+    reg.register_fetch(FetchDesc {
+        name: "int",
+        out_type: SampleType::Sint,
+        func: |_ctx, args| {
+            let n = args.first()?.parse::<i64>().ok()?;
+            Some(Sample::Sint(n))
+        },
+    });
+
+    // 4. path fetch (handles absolute URIs)
+    reg.register_fetch(FetchDesc {
+        name: "path",
+        out_type: SampleType::Str,
+        func: |ctx, _args| {
+            let uri = ctx.req_uri.or_else(|| ctx.htx.and_then(|h| h.req_line().map(|r| r.uri.as_str())))?;
+            let (_, path, _) = split_uri(uri);
+            Some(Sample::Str(path.to_string()))
+        },
+    });
+
+    // 5. pathq fetch
+    reg.register_fetch(FetchDesc {
+        name: "pathq",
+        out_type: SampleType::Str,
+        func: |ctx, _args| {
+            let uri = ctx.req_uri.or_else(|| ctx.htx.and_then(|h| h.req_line().map(|r| r.uri.as_str())))?;
+            let (_, path, query) = split_uri(uri);
+            if query.is_empty() {
+                Some(Sample::Str(path.to_string()))
+            } else {
+                Some(Sample::Str(format!("{path}?{query}")))
+            }
+        },
+    });
+
+    // 6. url fetch
+    reg.register_fetch(FetchDesc {
+        name: "url",
+        out_type: SampleType::Str,
+        func: |ctx, _args| {
+            let uri = ctx.req_uri.or_else(|| ctx.htx.and_then(|h| h.req_line().map(|r| r.uri.as_str())))?;
+            Some(Sample::Str(uri.to_string()))
+        },
+    });
+
+    // 7. query fetch
+    reg.register_fetch(FetchDesc {
+        name: "query",
+        out_type: SampleType::Str,
+        func: |ctx, _args| {
+            let uri = ctx.req_uri.or_else(|| ctx.htx.and_then(|h| h.req_line().map(|r| r.uri.as_str())))?;
+            let (_, _, query) = split_uri(uri);
+            Some(Sample::Str(query.to_string()))
+        },
+    });
+
+    // 8. url_param fetch
+    reg.register_fetch(FetchDesc {
+        name: "url_param",
+        out_type: SampleType::Str,
+        func: |ctx, args| {
+            let param = args.first()?;
+            let uri = ctx.req_uri.or_else(|| ctx.htx.and_then(|h| h.req_line().map(|r| r.uri.as_str())))?;
+            let (_, _, query) = split_uri(uri);
+            for pair in query.split('&') {
+                if let Some((k, v)) = pair.split_once('=') {
+                    if k == param {
+                        return Some(Sample::Str(v.to_string()));
+                    }
+                } else if pair == param {
+                    return Some(Sample::Str(String::new()));
+                }
+            }
+            None
+        },
+    });
+
+    // 9. req.fhdr & req.hdr & hdr
+    let req_fhdr_fetch: ibex_sample::FetchFn = |ctx, args| {
+        let name = args.first()?;
+        if let Some(hdrs) = ctx.req_headers {
+            let matches: Vec<&str> = hdrs
+                .iter()
+                .filter(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.as_str())
+                .collect();
+            if !matches.is_empty() {
+                return Some(Sample::Str(matches.join(", ")));
+            }
+        }
+        None
+    };
+    reg.register_fetch(FetchDesc {
+        name: "req.fhdr",
+        out_type: SampleType::Str,
+        func: req_fhdr_fetch,
+    });
+    reg.register_fetch(FetchDesc {
+        name: "req.hdr",
+        out_type: SampleType::Str,
+        func: req_fhdr_fetch,
+    });
+    reg.register_fetch(FetchDesc {
+        name: "hdr",
+        out_type: SampleType::Str,
+        func: req_fhdr_fetch,
+    });
+
+    // 10. res.fhdr & res.hdr
+    let res_full_hdr_fetch: ibex_sample::FetchFn = |_ctx, args| {
+        let name = args.first()?;
+        CURRENT_RES_HEADERS.with(|hdrs| {
+            let matches: Vec<String> = hdrs
+                .borrow()
+                .iter()
+                .filter(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.clone())
+                .collect();
+            if matches.is_empty() {
+                None
+            } else {
+                Some(Sample::Str(matches.join(", ")))
+            }
+        })
+    };
+    reg.register_fetch(FetchDesc {
+        name: "res.fhdr",
+        out_type: SampleType::Str,
+        func: res_full_hdr_fetch,
+    });
+    reg.register_fetch(FetchDesc {
+        name: "res.hdr",
+        out_type: SampleType::Str,
+        func: res_full_hdr_fetch,
+    });
+
+    // 11. req.hdr_ip & hdr_ip
+    let hdr_ip_fetch: ibex_sample::FetchFn = |ctx, args| {
+        let name = args.first()?;
+        let val_opt = if let Some(hdrs) = ctx.req_headers {
+            hdrs.iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.as_str())
+        } else {
+            None
+        };
+        let val = val_opt?;
+        let clean = val.trim().trim_start_matches('[').trim_end_matches(']');
+        let ip_str = if let Some((h, _)) = clean.split_once(':') {
+            if clean.contains("::") || clean.chars().filter(|&c| c == ':').count() > 1 {
+                clean
+            } else {
+                h
+            }
+        } else {
+            clean
+        };
+        if let Ok(v4) = ip_str.parse::<std::net::Ipv4Addr>() {
+            Some(Sample::Ipv4(v4))
+        } else if let Ok(v6) = ip_str.parse::<std::net::Ipv6Addr>() {
+            Some(Sample::Ipv6(v6))
+        } else {
+            None
+        }
+    };
+    reg.register_fetch(FetchDesc {
+        name: "req.hdr_ip",
+        out_type: SampleType::Ipv4,
+        func: hdr_ip_fetch,
+    });
+    reg.register_fetch(FetchDesc {
+        name: "hdr_ip",
+        out_type: SampleType::Ipv4,
+        func: hdr_ip_fetch,
+    });
+
+    // 12. status fetch
+    reg.register_fetch(FetchDesc {
+        name: "status",
+        out_type: SampleType::Sint,
+        func: |_ctx, _args| {
+            let st = CURRENT_RES_STATUS.get();
+            Some(Sample::Sint(i64::from(st)))
+        },
+    });
+
+    // 13. capture.req.uri fetch
+    reg.register_fetch(FetchDesc {
+        name: "capture.req.uri",
+        out_type: SampleType::Str,
+        func: |ctx, _args| {
+            let uri = ctx.req_uri.or_else(|| ctx.htx.and_then(|h| h.req_line().map(|r| r.uri.as_str())))?;
+            Some(Sample::Str(uri.to_string()))
+        },
+    });
+
+    // 14. timeout fetches
+    macro_rules! reg_timeout_fetch {
+        ($reg:ident, $name:literal) => {
+            $reg.register_fetch(FetchDesc {
+                name: $name,
+                out_type: SampleType::Sint,
+                func: |_ctx, _args| {
+                    CURRENT_TIMEOUTS.with(|t| {
+                        t.borrow().get($name).copied().map(|v| Sample::Sint(i64::from(v)))
+                    })
+                },
+            });
+        };
+    }
+
+    reg_timeout_fetch!(reg, "fe_client_timeout");
+    reg_timeout_fetch!(reg, "cur_client_timeout");
+    reg_timeout_fetch!(reg, "be_server_timeout");
+    reg_timeout_fetch!(reg, "cur_server_timeout");
+    reg_timeout_fetch!(reg, "be_connect_timeout");
+    reg_timeout_fetch!(reg, "cur_connect_timeout");
+    reg_timeout_fetch!(reg, "be_queue_timeout");
+    reg_timeout_fetch!(reg, "cur_queue_timeout");
+    reg_timeout_fetch!(reg, "be_tunnel_timeout");
+    reg_timeout_fetch!(reg, "cur_tunnel_timeout");
+    reg_timeout_fetch!(reg, "be_tarpit_timeout");
+    reg_timeout_fetch!(reg, "cur_tarpit_timeout");
+    reg_timeout_fetch!(reg, "fe_connect_timeout");
+    reg_timeout_fetch!(reg, "fe_server_timeout");
+    reg_timeout_fetch!(reg, "fe_queue_timeout");
+    reg_timeout_fetch!(reg, "fe_tunnel_timeout");
+    reg_timeout_fetch!(reg, "fe_tarpit_timeout");
+    reg_timeout_fetch!(reg, "be_client_timeout");
+
+    // CONVERTERS:
+    // 1. strcmp
+    reg.register_converter(ConvDesc {
+        name: "strcmp",
+        in_type: TypeSpec::Any,
+        out_type: TypeSpec::Exact(SampleType::Sint),
+        func: |smp, args| {
+            let target_arg = args.first()?;
+            let target_val = CURRENT_VARS.with(|v| {
+                v.borrow().get(target_arg).cloned()
+            }).unwrap_or_else(|| target_arg.clone());
+            let s = sample_to_string(&smp);
+            let cmp = s.cmp(&target_val);
+            let res = match cmp {
+                std::cmp::Ordering::Less => -1,
+                std::cmp::Ordering::Equal => 0,
+                std::cmp::Ordering::Greater => 1,
+            };
+            Some(Sample::Sint(res))
+        },
+    });
+
+    // 2. concat
+    reg.register_converter(ConvDesc {
+        name: "concat",
+        in_type: TypeSpec::Any,
+        out_type: TypeSpec::Exact(SampleType::Str),
+        func: |smp, args| {
+            let mut s = sample_to_string(&smp);
+            for arg in args {
+                let piece = CURRENT_VARS.with(|v| {
+                    v.borrow().get(arg).cloned()
+                }).unwrap_or_else(|| arg.clone());
+                s.push_str(&piece);
+            }
+            Some(Sample::Str(s))
+        },
+    });
+
+    // 3. field
+    reg.register_converter(ConvDesc {
+        name: "field",
+        in_type: TypeSpec::Exact(SampleType::Str),
+        out_type: TypeSpec::Exact(SampleType::Str),
+        func: |smp, args| {
+            let idx_str = args.first()?;
+            let delim_char = args.get(1).and_then(|d| d.chars().next()).unwrap_or(' ');
+            let count_str = args.get(2);
+
+            let idx: i64 = idx_str.parse().ok()?;
+            let count: usize = count_str.and_then(|c| c.parse().ok()).unwrap_or(1);
+
+            let Sample::Str(s) = smp else { return None };
+            let fields: Vec<&str> = s.split(delim_char).collect();
+            let len = fields.len();
+            if len == 0 {
+                return Some(Sample::Str(String::new()));
+            }
+            // Field indices are 1-based; a negative index counts from the end, and
+            // zero is not a valid field reference.
+            // Field indices are 1-based; a negative index counts from the end, and
+            // zero is not a valid field reference. `try_from` keeps the conversion
+            // honest on 32-bit targets instead of silently truncating.
+            let start_idx = match idx.cmp(&0) {
+                std::cmp::Ordering::Greater => {
+                    usize::try_from(idx).unwrap_or(usize::MAX).saturating_sub(1)
+                }
+                std::cmp::Ordering::Less => {
+                    len.saturating_sub(usize::try_from(idx.saturating_neg()).unwrap_or(usize::MAX))
+                }
+                std::cmp::Ordering::Equal => return None,
+            };
+            if start_idx >= len {
+                return Some(Sample::Str(String::new()));
+            }
+            let end_idx = if count == 0 {
+                len
+            } else {
+                (start_idx + count).min(len)
+            };
+            let joined = fields[start_idx..end_idx].join(&delim_char.to_string());
+            Some(Sample::Str(joined))
+        },
+    });
+
+    // 4. word
+    reg.register_converter(ConvDesc {
+        name: "word",
+        in_type: TypeSpec::Exact(SampleType::Str),
+        out_type: TypeSpec::Exact(SampleType::Str),
+        func: |smp, args| {
+            let idx_str = args.first()?;
+            let delim_char = args.get(1).and_then(|d| d.chars().next()).unwrap_or(' ');
+            let count_str = args.get(2);
+
+            let idx: i64 = idx_str.parse().ok()?;
+            let count: usize = count_str.and_then(|c| c.parse().ok()).unwrap_or(1);
+
+            let Sample::Str(s) = smp else { return None };
+            let words: Vec<&str> = s.split(delim_char).filter(|w| !w.is_empty()).collect();
+            let len = words.len();
+            if len == 0 {
+                return Some(Sample::Str(String::new()));
+            }
+            // 1-based index; negative counts from the end; zero is invalid.
+            let start_idx = match idx.cmp(&0) {
+                std::cmp::Ordering::Greater => {
+                    usize::try_from(idx).unwrap_or(usize::MAX).saturating_sub(1)
+                }
+                std::cmp::Ordering::Less => {
+                    len.saturating_sub(usize::try_from(idx.saturating_neg()).unwrap_or(usize::MAX))
+                }
+                std::cmp::Ordering::Equal => return None,
+            };
+            if start_idx >= len {
+                return Some(Sample::Str(String::new()));
+            }
+            let end_idx = if count == 0 {
+                len
+            } else {
+                (start_idx + count).min(len)
+            };
+            let joined = words[start_idx..end_idx].join(&delim_char.to_string());
+            Some(Sample::Str(joined))
+        },
+    });
+
+    // 5. map_regm
+    reg.register_converter(ConvDesc {
+        name: "map_regm",
+        in_type: TypeSpec::Exact(SampleType::Str),
+        out_type: TypeSpec::Exact(SampleType::Str),
+        func: |smp, args| {
+            let path = args.first()?;
+            let default_val = args.get(1).map(|s| s.trim_matches('"').to_string());
+            let Sample::Str(s) = smp else { return None };
+            let content = std::fs::read_to_string(path).ok()?;
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.is_empty() {
+                    continue;
+                }
+                let pattern = parts[0];
+                let repl = if parts.len() > 1 { parts[1..].join(" ") } else { String::new() };
+                if let Ok(re) = regex::Regex::new(pattern) {
+                    if let Some(caps) = re.captures(&s) {
+                        let mut result = repl;
+                        for i in 1..caps.len() {
+                            let backref = format!("\\{i}");
+                            let captured = caps.get(i).map_or("", |m| m.as_str());
+                            result = result.replace(&backref, captured);
+                        }
+                        return Some(Sample::Str(result));
+                    }
+                }
+            }
+            default_val.map(Sample::Str)
+        },
+    });
+
+    // 6. map_str / map
+    reg.register_converter(ConvDesc {
+        name: "map_str",
+        in_type: TypeSpec::Exact(SampleType::Str),
+        out_type: TypeSpec::Exact(SampleType::Str),
+        func: |smp, args| {
+            let path = args.first()?;
+            let default_val = args.get(1).map(|s| s.trim_matches('"').to_string());
+            let Sample::Str(s) = smp else { return None };
+            let content = std::fs::read_to_string(path).ok()?;
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.is_empty() {
+                    continue;
+                }
+                let key = parts[0];
+                let val = if parts.len() > 1 { parts[1..].join(" ") } else { String::new() };
+                if key == s {
+                    return Some(Sample::Str(val));
+                }
+            }
+            default_val.map(Sample::Str)
+        },
+    });
+    reg.register_converter(ConvDesc {
+        name: "map",
+        in_type: TypeSpec::Exact(SampleType::Str),
+        out_type: TypeSpec::Exact(SampleType::Str),
+        func: |smp, args| {
+            let path = args.first()?;
+            let default_val = args.get(1).map(|s| s.trim_matches('"').to_string());
+            let Sample::Str(s) = smp else { return None };
+            let content = std::fs::read_to_string(path).ok()?;
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.is_empty() {
+                    continue;
+                }
+                let key = parts[0];
+                let val = if parts.len() > 1 { parts[1..].join(" ") } else { String::new() };
+                if key == s {
+                    return Some(Sample::Str(val));
+                }
+            }
+            default_val.map(Sample::Str)
+        },
+    });
+
+    // 7. length
+    reg.register_converter(ConvDesc {
+        name: "length",
+        in_type: TypeSpec::Any,
+        out_type: TypeSpec::Exact(SampleType::Sint),
+        func: |smp, _args| {
+            let s = sample_to_string(&smp);
+            Some(Sample::Sint(i64::try_from(s.len()).unwrap_or(i64::MAX)))
+        },
+    });
+
+    // 8. url_dec
+    reg.register_converter(ConvDesc {
+        name: "url_dec",
+        in_type: TypeSpec::Exact(SampleType::Str),
+        out_type: TypeSpec::Exact(SampleType::Str),
+        func: |smp, _args| match smp {
+            Sample::Str(s) => {
+                let mut res = Vec::new();
+                let bytes = s.as_bytes();
+                let mut i = 0;
+                while i < bytes.len() {
+                    if bytes[i] == b'%' && i + 2 < bytes.len() {
+                        if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                            res.push(b);
+                            i += 3;
+                            continue;
+                        }
+                    }
+                    res.push(bytes[i]);
+                    i += 1;
+                }
+                Some(Sample::Str(String::from_utf8_lossy(&res).to_string()))
+            }
+            _ => None,
+        },
+    });
+
+    // 9. ipmask (supporting 2 args for v4 and v6)
+    reg.register_converter(ConvDesc {
+        name: "ipmask",
+        in_type: TypeSpec::Addr,
+        out_type: TypeSpec::Same,
+        func: |smp, args| {
+            let mask1_str = args.first()?;
+            let mask2_str = args.get(1);
+            match smp {
+                Sample::Ipv4(ip) => {
+                    let mask = if let Ok(prefix) = mask1_str.parse::<u32>() {
+                        if prefix == 0 {
+                            0
+                        } else if prefix >= 32 {
+                            u32::MAX
+                        } else {
+                            !((1u32 << (32 - prefix)) - 1)
+                        }
+                    } else if let Ok(m_ip) = mask1_str.parse::<std::net::Ipv4Addr>() {
+                        u32::from(m_ip)
+                    } else {
+                        return None;
+                    };
+                    Some(Sample::Ipv4(std::net::Ipv4Addr::from(u32::from(ip) & mask)))
+                }
+                Sample::Ipv6(ip) => {
+                    let chosen_mask = mask2_str.unwrap_or(mask1_str);
+                    let mask = if let Ok(prefix) = chosen_mask.parse::<u32>() {
+                        if prefix == 0 {
+                            0
+                        } else if prefix >= 128 {
+                            u128::MAX
+                        } else {
+                            !((1u128 << (128 - prefix)) - 1)
+                        }
+                    } else if let Ok(m_ip) = chosen_mask.parse::<std::net::Ipv6Addr>() {
+                        u128::from(m_ip)
+                    } else {
+                        return None;
+                    };
+                    Some(Sample::Ipv6(std::net::Ipv6Addr::from(u128::from(ip) & mask)))
+                }
+                _ => None,
+            }
+        },
+    });
+
+    // 10. mul & div
+    reg.register_converter(ConvDesc {
+        name: "mul",
+        in_type: TypeSpec::Exact(SampleType::Sint),
+        out_type: TypeSpec::Exact(SampleType::Sint),
+        func: |smp, args| {
+            let factor = args.first()?.parse::<i64>().ok()?;
+            match smp {
+                Sample::Sint(n) => Some(Sample::Sint(n.saturating_mul(factor))),
+                _ => None,
+            }
+        },
+    });
+    reg.register_converter(ConvDesc {
+        name: "div",
+        in_type: TypeSpec::Exact(SampleType::Sint),
+        out_type: TypeSpec::Exact(SampleType::Sint),
+        func: |smp, args| {
+            let divisor = args.first()?.parse::<i64>().ok()?;
+            if divisor == 0 {
+                return None;
+            }
+            match smp {
+                Sample::Sint(n) => Some(Sample::Sint(n / divisor)),
+                _ => None,
+            }
+        },
+    });
+
+    reg
+}
+
+fn sample_to_string(smp: &Sample) -> String {
+    match smp {
+        Sample::Str(s) => s.clone(),
+        Sample::Sint(n) => n.to_string(),
+        Sample::Bool(b) => if *b { "1".to_string() } else { "0".to_string() },
+        Sample::Ipv4(ip) => ip.to_string(),
+        Sample::Ipv6(ip) => ip.to_string(),
+        Sample::Bin(b) => String::from_utf8_lossy(b).to_string(),
+        Sample::Meth(m) => m.as_str().to_string(),
+    }
+}
+
+fn split_uri(uri: &str) -> (&str, &str, &str) {
+    let (prefix, rest) = if let Some(stripped) = uri.strip_prefix("http://") {
+        if let Some(idx) = stripped.find('/') {
+            let p = &uri[..7 + idx];
+            let r = &stripped[idx..];
+            (p, r)
+        } else {
+            (uri, "/")
+        }
+    } else if let Some(stripped) = uri.strip_prefix("https://") {
+        if let Some(idx) = stripped.find('/') {
+            let p = &uri[..8 + idx];
+            let r = &stripped[idx..];
+            (p, r)
+        } else {
+            (uri, "/")
+        }
     } else {
-        fmt.to_string()
+        ("", uri)
+    };
+
+    let (path, query) = if let Some((p, q)) = rest.split_once('?') {
+        (p, q)
+    } else {
+        (rest, "")
+    };
+
+    (prefix, path, query)
+}
+
+fn rebuild_uri(prefix: &str, path: &str, query: &str) -> String {
+    let mut res = String::new();
+    res.push_str(prefix);
+    if path.is_empty() {
+        res.push('/');
+    } else {
+        res.push_str(path);
+    }
+    if !query.is_empty() {
+        res.push('?');
+        res.push_str(query);
+    }
+    res
+}
+
+fn format_sample_string(fmt: &str, ctx: &SampleContext, registry: &Registry) -> String {
+    let mut out = String::with_capacity(fmt.len());
+    let mut chars = fmt.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            if chars.peek() == Some(&'[') {
+                chars.next(); // consume '['
+                let mut expr_str = String::new();
+                let mut depth = 1;
+                for ec in chars.by_ref() {
+                    if ec == '[' {
+                        depth += 1;
+                        expr_str.push(ec);
+                    } else if ec == ']' {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                        expr_str.push(ec);
+                    } else {
+                        expr_str.push(ec);
+                    }
+                }
+                if let Ok(expr) = Expr::parse(&expr_str) {
+                    if let Some(smp) = expr.eval_sample(registry, ctx) {
+                        out.push_str(&sample_to_string(&smp));
+                    }
+                }
+            } else if chars.peek() == Some(&'c') {
+                chars.next();
+                if chars.peek() == Some(&'i') {
+                    chars.next();
+                    let ip = ctx.client_addr.map_or_else(|| "127.0.0.1".to_string(), |a| a.ip().to_string());
+                    out.push_str(&ip);
+                } else {
+                    out.push_str("%c");
+                }
+            } else if chars.peek() == Some(&'T') {
+                chars.next();
+                if chars.peek() == Some(&'r') {
+                    chars.next();
+                    out.push_str("0ms");
+                } else {
+                    out.push_str("%T");
+                }
+            } else if chars.peek() == Some(&'%') {
+                chars.next();
+                out.push('%');
+            } else {
+                out.push('%');
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn parse_timeout_val(s: &str) -> u32 {
+    let s = s.trim();
+    let (num_str, factor) = if let Some(stripped) = s.strip_suffix("ms") {
+        (stripped, 1u32)
+    } else if let Some(stripped) = s.strip_suffix('s') {
+        (stripped, 1000u32)
+    } else if let Some(stripped) = s.strip_suffix('m') {
+        (stripped, 60_000u32)
+    } else if let Some(stripped) = s.strip_suffix('h') {
+        (stripped, 3_600_000u32)
+    } else if let Some(stripped) = s.strip_suffix('d') {
+        (stripped, 86_400_000u32)
+    } else {
+        (s, 1u32)
+    };
+    num_str.parse::<u32>().unwrap_or(0).saturating_mul(factor)
+}
+
+fn translate_backreferences(repl: &str) -> String {
+    let mut out = String::with_capacity(repl.len());
+    let mut chars = repl.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(&next_c) = chars.peek() {
+                if next_c.is_ascii_digit() {
+                    chars.next();
+                    out.push('$');
+                    out.push(next_c);
+                    continue;
+                }
+            }
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn header_name_matches(header_key: &str, pattern: &str) -> bool {
+    if let Some(rest) = pattern.strip_prefix("\0m:") {
+        if let Some((meth, pat)) = rest.split_once(':') {
+            match meth {
+                "beg" => header_key.to_lowercase().starts_with(&pat.to_lowercase()),
+                "end" => header_key.to_lowercase().ends_with(&pat.to_lowercase()),
+                "sub" => header_key.to_lowercase().contains(&pat.to_lowercase()),
+                "reg" => regex::Regex::new(pat).is_ok_and(|re| re.is_match(header_key)),
+                _ => header_key.eq_ignore_ascii_case(pat),
+            }
+        } else {
+            header_key.eq_ignore_ascii_case(rest)
+        }
+    } else {
+        header_key.eq_ignore_ascii_case(pattern)
+    }
+}
+
+fn ip_in_cidr(ip: IpAddr, cidr: &str) -> bool {
+    let cidr = cidr.trim();
+    if cidr.is_empty() {
+        return false;
+    }
+    match ip {
+        IpAddr::V4(v4) => {
+            let v4_u32 = u32::from(v4);
+            if let Some((net_str, mask_str)) = cidr.split_once('/') {
+                if let (Ok(net_ip), Ok(prefix)) = (net_str.parse::<std::net::Ipv4Addr>(), mask_str.parse::<u32>()) {
+                    let mask = if prefix == 0 { 0 } else if prefix >= 32 { u32::MAX } else { !((1u32 << (32 - prefix)) - 1) };
+                    (v4_u32 & mask) == (u32::from(net_ip) & mask)
+                } else {
+                    false
+                }
+            } else if let Ok(target_ip) = cidr.parse::<std::net::Ipv4Addr>() {
+                v4 == target_ip
+            } else {
+                false
+            }
+        }
+        IpAddr::V6(v6) => {
+            let v6_u128 = u128::from(v6);
+            if let Some((net_str, mask_str)) = cidr.split_once('/') {
+                if let (Ok(net_ip), Ok(prefix)) = (net_str.parse::<std::net::Ipv6Addr>(), mask_str.parse::<u32>()) {
+                    let mask = if prefix == 0 { 0 } else if prefix >= 128 { u128::MAX } else { !((1u128 << (128 - prefix)) - 1) };
+                    (v6_u128 & mask) == (u128::from(net_ip) & mask)
+                } else {
+                    false
+                }
+            } else if let Ok(target_ip) = cidr.parse::<std::net::Ipv6Addr>() {
+                v6 == target_ip
+            } else {
+                false
+            }
+        }
+    }
+}
+
+// One arm per HAProxy normalizer; a flat dispatch table reads better than
+// scattering the arms across helpers.
+#[allow(clippy::too_many_lines)]
+fn apply_normalize_uri(
+    uri: &str,
+    normalizer: &str,
+    full: bool,
+    strict: bool,
+) -> Result<String, ()> {
+    let (prefix, path, query) = split_uri(uri);
+
+    match normalizer {
+        "path-merge-slashes" => {
+            let mut merged_path = String::with_capacity(path.len());
+            let mut last_was_slash = false;
+            for c in path.chars() {
+                if c == '/' {
+                    if !last_was_slash {
+                        merged_path.push(c);
+                        last_was_slash = true;
+                    }
+                } else {
+                    merged_path.push(c);
+                    last_was_slash = false;
+                }
+            }
+            if merged_path.is_empty() {
+                merged_path.push('/');
+            }
+            Ok(rebuild_uri(prefix, &merged_path, query))
+        }
+        "path-strip-dotdot" => {
+            let segments: Vec<&str> = path.split('/').collect();
+            let mut stack: Vec<&str> = Vec::new();
+            for seg in segments {
+                if seg == ".." {
+                    if stack.is_empty() {
+                        // A ".." with nothing to pop would escape the root. The `full`
+                        // variant discards it; the plain variant preserves it verbatim
+                        // so the path is not silently altered.
+                        //
+                        // Both branches previously called stack.pop(), which is a no-op
+                        // on an empty Vec -- so the `full` flag had no effect at all.
+                        if !full {
+                            stack.push(seg);
+                        }
+                    } else {
+                        stack.pop();
+                    }
+                } else if seg != "." && !seg.is_empty() {
+                    stack.push(seg);
+                }
+            }
+            let mut new_path = format!("/{}", stack.join("/"));
+            if path.ends_with('/') && !new_path.ends_with('/') {
+                new_path.push('/');
+            }
+            Ok(rebuild_uri(prefix, &new_path, query))
+        }
+        "path-strip-dot" => {
+            let segments: Vec<&str> = path.split('/').collect();
+            let mut stack: Vec<&str> = Vec::new();
+            for seg in segments {
+                if seg != "." && !seg.is_empty() {
+                    stack.push(seg);
+                }
+            }
+            let mut new_path = format!("/{}", stack.join("/"));
+            if path.ends_with('/') && !new_path.ends_with('/') {
+                new_path.push('/');
+            }
+            Ok(rebuild_uri(prefix, &new_path, query))
+        }
+        "query-sort-by-name" => {
+            if query.is_empty() {
+                return Ok(uri.to_string());
+            }
+            let mut pairs: Vec<&str> = query.split('&').collect();
+            pairs.sort_by(|a, b| {
+                let ka = a.split_once('=').map_or(*a, |(k, _)| k);
+                let kb = b.split_once('=').map_or(*b, |(k, _)| k);
+                ka.cmp(kb)
+            });
+            let new_query = pairs.join("&");
+            Ok(rebuild_uri(prefix, path, &new_query))
+        }
+        "percent-to-uppercase" => {
+            let mut res = String::with_capacity(uri.len());
+            let bytes = uri.as_bytes();
+            let mut i = 0;
+            while i < bytes.len() {
+                if bytes[i] == b'%' {
+                    if i + 2 < bytes.len() {
+                        let h1 = bytes[i + 1] as char;
+                        let h2 = bytes[i + 2] as char;
+                        if h1.is_ascii_hexdigit() && h2.is_ascii_hexdigit() {
+                            res.push('%');
+                            res.push(h1.to_ascii_uppercase());
+                            res.push(h2.to_ascii_uppercase());
+                            i += 3;
+                            continue;
+                        }
+                    }
+                    if strict {
+                        return Err(());
+                    }
+                    res.push('%');
+                    i += 1;
+                } else {
+                    res.push(bytes[i] as char);
+                    i += 1;
+                }
+            }
+            Ok(res)
+        }
+        "percent-decode-unreserved" => {
+            let mut res = String::with_capacity(uri.len());
+            let bytes = uri.as_bytes();
+            let mut i = 0;
+            while i < bytes.len() {
+                if bytes[i] == b'%' {
+                    if i + 2 < bytes.len() {
+                        if let Ok(b) = u8::from_str_radix(&uri[i + 1..i + 3], 16) {
+                            if b.is_ascii_alphanumeric() || b == b'-' || b == b'.' || b == b'_' || b == b'~' {
+                                res.push(b as char);
+                                i += 3;
+                                continue;
+                            }
+                            res.push_str(&uri[i..i + 3]);
+                            i += 3;
+                            continue;
+                        }
+                    }
+                    if strict {
+                        return Err(());
+                    }
+                    res.push('%');
+                    i += 1;
+                } else {
+                    res.push(bytes[i] as char);
+                    i += 1;
+                }
+            }
+            Ok(res)
+        }
+        "fragment-strip" => {
+            let cleaned = uri.split_once('#').map_or(uri, |(u, _)| u);
+            Ok(cleaned.to_string())
+        }
+        "fragment-encode" => {
+            let encoded = uri.replace('#', "%23");
+            Ok(encoded)
+        }
+        _ => Ok(uri.to_string()),
     }
 }
 
@@ -3037,33 +4851,77 @@ fn set_req_header(sess: &mut TcpSession, name: &str, val: &str) {
     } else {
         hdrs.push((name.to_string(), val.to_string()));
     }
-    rebuild_req_buffer(sess, &hdrs);
     sess.req_headers = Some(hdrs);
+    rebuild_req_buffer(sess);
 }
 
 fn add_req_header(sess: &mut TcpSession, name: &str, val: &str) {
     let mut hdrs = sess.req_headers.take().unwrap_or_default();
     hdrs.push((name.to_string(), val.to_string()));
-    rebuild_req_buffer(sess, &hdrs);
     sess.req_headers = Some(hdrs);
+    rebuild_req_buffer(sess);
 }
 
 fn del_req_header(sess: &mut TcpSession, name: &str) {
     let mut hdrs = sess.req_headers.take().unwrap_or_default();
-    hdrs.retain(|(k, _)| !k.eq_ignore_ascii_case(name));
-    rebuild_req_buffer(sess, &hdrs);
+    hdrs.retain(|(k, _)| !header_name_matches(k, name));
     sess.req_headers = Some(hdrs);
+    rebuild_req_buffer(sess);
 }
 
-fn rebuild_req_buffer(sess: &mut TcpSession, hdrs: &[(String, String)]) {
+fn replace_req_header(sess: &mut TcpSession, name: &str, regex: &str, repl: &str) -> Result<(), ()> {
+    let mut hdrs = sess.req_headers.take().unwrap_or_default();
+    let re = regex::Regex::new(regex).map_err(|_| ())?;
+    let rust_repl = translate_backreferences(repl);
+    let strict = STRICT_MODE.get();
+
+    for (k, v) in &mut hdrs {
+        if k.eq_ignore_ascii_case(name) {
+            let new_v = re.replace_all(v, &rust_repl).to_string();
+            if strict && new_v.len() > 1_048_575 {
+                sess.req_headers = Some(hdrs);
+                return Err(());
+            }
+            *v = new_v;
+        }
+    }
+    sess.req_headers = Some(hdrs);
+    rebuild_req_buffer(sess);
+    Ok(())
+}
+
+fn replace_req_value(sess: &mut TcpSession, name: &str, regex: &str, repl: &str) -> Result<(), ()> {
+    let mut hdrs = sess.req_headers.take().unwrap_or_default();
+    let re = regex::Regex::new(regex).map_err(|_| ())?;
+    let rust_repl = translate_backreferences(repl);
+    let strict = STRICT_MODE.get();
+
+    for (k, v) in &mut hdrs {
+        if k.eq_ignore_ascii_case(name) {
+            let new_v = re.replace_all(v, &rust_repl).to_string();
+            if strict && new_v.len() > 1_048_575 {
+                sess.req_headers = Some(hdrs);
+                return Err(());
+            }
+            *v = new_v;
+        }
+    }
+    sess.req_headers = Some(hdrs);
+    rebuild_req_buffer(sess);
+    Ok(())
+}
+
+fn rebuild_req_buffer(sess: &mut TcpSession) {
     let Some((hdr_len, eoh_len)) = crate::proxy::find_eoh(sess.req.readable()) else {
         return;
     };
     let method = sess.req_method.as_deref().unwrap_or("GET");
     let uri = sess.req_uri.as_deref().unwrap_or("/");
     let mut new_hdr = format!("{method} {uri} HTTP/1.1\r\n");
-    for (k, v) in hdrs {
-        let _ = write!(new_hdr, "{k}: {v}\r\n");
+    if let Some(ref hdrs) = sess.req_headers {
+        for (k, v) in hdrs {
+            let _ = write!(new_hdr, "{k}: {v}\r\n");
+        }
     }
     new_hdr.push_str("\r\n");
     sess.req
@@ -3078,18 +4936,49 @@ fn eval_condition(
 ) -> bool {
     let mut term_match = true;
     for term in &cond.terms {
-        let expr_opt = acls
-            .get(&term.name)
-            .cloned()
-            .or_else(|| Expr::parse(&term.name).ok());
-        if let Some(expr) = expr_opt {
-            let res = expr.eval(registry, ctx);
-            let term_res = if term.negated { !res } else { res };
-            if !term_res {
-                term_match = false;
-                break;
+        let term_res = if term.name == "always_true" {
+            true
+        } else if term.name == "always_false" {
+            false
+        } else if let Some(expr) = acls.get(&term.name) {
+            expr.eval(registry, ctx)
+        } else if let Some(f_idx) = term.name.find("-f ") {
+            let before_f = &term.name[..f_idx];
+            let after_f = term.name[f_idx + 3..].trim();
+            let file_path = after_f.split_whitespace().next().unwrap_or(after_f);
+            let case_insensitive = term.name.contains("-i");
+            let expr_str = before_f.split_whitespace().next().unwrap_or(before_f);
+            let mut matched = false;
+            if let Ok(expr) = Expr::parse(expr_str) {
+                if let Some(smp) = expr.eval_sample(registry, ctx) {
+                    let s = sample_to_string(&smp);
+                    if let Ok(content) = std::fs::read_to_string(file_path) {
+                        for line in content.lines() {
+                            let line = line.trim();
+                            if line.is_empty() || line.starts_with('#') {
+                                continue;
+                            }
+                            if case_insensitive {
+                                if s.eq_ignore_ascii_case(line) {
+                                    matched = true;
+                                    break;
+                                }
+                            } else if s == line {
+                                matched = true;
+                                break;
+                            }
+                        }
+                    }
+                }
             }
+            matched
+        } else if let Ok(expr) = Expr::parse(&term.name) {
+            expr.eval(registry, ctx)
         } else {
+            false
+        };
+        let final_res = if term.negated { !term_res } else { term_res };
+        if !final_res {
             term_match = false;
             break;
         }

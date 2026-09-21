@@ -287,8 +287,18 @@ impl H1Parser {
         // Strict by construction: ASCII digits only. `parse::<usize>()` alone is not
         // enough because it accepts a leading `+`, and it silently tolerates values
         // that HAProxy rejects.
+        // Scan only the headers of the *current* message. An `Htx` is reused across
+        // keep-alive requests, so iterating every header would compare request N's
+        // Content-Length against request N-1's and report a bogus conflict.
+        let start = htx
+            .blocks()
+            .iter()
+            .rposition(|b| matches!(b, HtxBlock::ReqLine(_) | HtxBlock::ResLine(_)))
+            .map_or(0, |i| i + 1);
+
         let mut seen_cl: Option<usize> = None;
-        for h in htx.headers() {
+        for block in &htx.blocks()[start..] {
+            let HtxBlock::Header(h) = block else { continue };
             if !h.name.eq_ignore_ascii_case("content-length") {
                 continue;
             }

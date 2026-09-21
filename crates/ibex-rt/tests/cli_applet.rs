@@ -11,7 +11,8 @@ use std::path::PathBuf;
 
 fn create_test_engine(socket_path: &PathBuf) -> Engine {
     let cfg_str = r"
-listen test_proxy 127.0.0.1:28080
+listen test_proxy
+    bind 127.0.0.1:28080
     mode tcp
     server srv1 127.0.0.1:29091
     server srv2 127.0.0.1:29092

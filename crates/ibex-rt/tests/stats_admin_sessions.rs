@@ -190,7 +190,8 @@ fn test_kill_sessions_cli_socket_and_direct_engine() {
         std::process::id()
     ));
     let cfg_str = r"
-listen test_proxy 127.0.0.1:0
+listen test_proxy
+    bind 127.0.0.1:0
     mode tcp
     server srv1 127.0.0.1:0
 ";
@@ -252,7 +253,8 @@ fn test_clear_counters_web_admin_and_cli() {
     let proxy_addr = free_addr();
     let cfg_str = format!(
         r"
-listen stats_proxy {proxy_addr}
+listen stats_proxy
+    bind {proxy_addr}
     mode http
     stats enable
     stats uri /stats

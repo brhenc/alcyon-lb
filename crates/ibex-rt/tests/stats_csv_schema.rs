@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! The `show stat` CSV header must match HAProxy's exactly.
+//! The `show stat` CSV header must match `HAProxy`'s exactly.
 //!
 //! hatop and every other stats consumer parses this CSV **positionally**. A header of
 //! the wrong width silently misaligns every column past the divergence point, which
 //! looks like corrupt data rather than a missing feature.
 //!
-//! `data/stats_csv_header.txt` is the reference, captured from a real HAProxy 3.5
+//! `data/stats_csv_header.txt` is the reference, captured from a real `HAProxy` 3.5
 //! binary and verified byte-identical to its live `show stat` output. It regressed
 //! once from 146 fields to 119 and was committed unnoticed; this test exists so that
 //! cannot happen silently again.

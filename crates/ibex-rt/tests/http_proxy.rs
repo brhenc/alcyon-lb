@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// Integration tests for HTTP mode: GET/POST, cookie persistence, cliexp and srvexp.
+// Integration tests for HTTP mode: GET/POST, cookie persistence, and confirmation
+// that the legacy cliexp/srvexp rewrite path is gone.
 
 use ibex_config::ast::{Config, HeaderExp, ListenSection, Mode, Server};
 use ibex_rt::engine::Engine;
@@ -201,7 +202,8 @@ fn http_cookie_persistence_routes_to_targeted_server() {
 }
 
 #[test]
-fn http_cliexp_and_srvexp_rewriting() {
+#[allow(clippy::too_many_lines)] // end-to-end test: server thread, engine, client
+fn legacy_cliexp_srvexp_rewriting_no_longer_applies() {
     let srv_addr = free_addr();
     let proxy_addr = free_addr();
 
@@ -308,8 +310,27 @@ fn http_cliexp_and_srvexp_rewriting() {
     }
 
     let res_str = String::from_utf8_lossy(&response);
-    assert!(res_str.contains("Location: /login\r\n"), "got: {res_str}");
-    assert!(res_str.contains("Server: Ibex/1.0\r\n"), "got: {res_str}");
+
+    // `cliexp` / `srvexp` were removed from HAProxy in 2.0 and Ibex now rejects them at
+    // config-parse time (see `crates/ibex-config`), so the legacy rewrite path is gone.
+    // This test previously asserted that the rewriting happened; it now locks in that it
+    // does NOT, so the dead path cannot quietly come back.
+    //
+    // The response must still be proxied correctly -- removing a feature must not break
+    // forwarding. The modern equivalents are `http-request replace-path` and
+    // `http-response replace-header`, which are parsed and exercised elsewhere.
+    assert!(
+        res_str.starts_with("HTTP/1.1 302"),
+        "the response must still be proxied verbatim: {res_str}"
+    );
+    assert!(
+        res_str.contains("Location: http://internal:8080/login"),
+        "legacy srvexp rewriting must no longer occur: {res_str}"
+    );
+    assert!(
+        !res_str.contains("Server: Ibex/1.0"),
+        "legacy srvexp header rewriting must no longer occur: {res_str}"
+    );
 
     running.store(false, Ordering::Relaxed);
     let _ = srv_handle.join();

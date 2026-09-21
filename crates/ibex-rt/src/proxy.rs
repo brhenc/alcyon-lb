@@ -104,7 +104,7 @@ pub struct TcpSession {
     pub conn_exp: Tick,
     /// Earliest tick at which a failed connect may be retried.
     ///
-    /// HAProxy calls this the turn-around state (`SC_ST_TAR`). After an asynchronous
+    /// `HAProxy` calls this the turn-around state (`SC_ST_TAR`). After an asynchronous
     /// connect failure it waits `MIN(1s, timeout connect)` before retrying the *same*
     /// server, because an instant retry almost always reproduces the same error and
     /// just burns the retry budget. See `src/backend.c:2890`.

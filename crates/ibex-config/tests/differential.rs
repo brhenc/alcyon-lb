@@ -6,9 +6,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
 
-const ORACLE_BIN: &str = "/home/bhenc/reference/haproxy-1.0.2/haproxy102";
+const ORACLE_BIN: &str = "/home/bhenc/reference/haproxy/haproxy";
 
 #[derive(Debug, PartialEq, Eq)]
 enum Verdict {
@@ -17,42 +16,20 @@ enum Verdict {
 }
 
 fn run_oracle(config_path: &Path) -> (Verdict, String) {
-    let mut child = match Command::new(ORACLE_BIN)
+    let output = match Command::new(ORACLE_BIN)
+        .arg("-c")
         .arg("-f")
         .arg(config_path)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
+        .output()
     {
-        Ok(c) => c,
+        Ok(out) => out,
         Err(e) => panic!("Failed to execute oracle binary at {ORACLE_BIN}: {e}"),
     };
-
-    // Wait briefly to check if it exits on config error or stays running
-    let wait_duration = Duration::from_millis(150);
-    let start = std::time::Instant::now();
-
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let output = child.wait_with_output().unwrap();
-                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                if status.success() {
-                    return (Verdict::Accept, stderr);
-                }
-                return (Verdict::Reject, stderr);
-            }
-            Ok(None) => {
-                if start.elapsed() >= wait_duration {
-                    let _ = child.kill();
-                    let output = child.wait_with_output().unwrap();
-                    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                    return (Verdict::Accept, stderr);
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Err(e) => panic!("Error waiting for oracle process: {e}"),
-        }
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    if output.status.success() {
+        (Verdict::Accept, stderr)
+    } else {
+        (Verdict::Reject, stderr)
     }
 }
 
@@ -73,12 +50,12 @@ fn test_corpus_differential() {
         entries.len()
     );
 
-    let known_disagreements = [
-        "34_non_numeric_retries.cfg",
-        "35_negative_retries.cfg",
-        "36_non_numeric_contimeout.cfg",
-        "37_out_of_range_port.cfg",
-    ];
+    // Previously these four were expected to disagree, because HAProxy 1.0.2's C
+    // `atol()` silently accepted non-numeric and out-of-range values where Ibex
+    // rejected them. The oracle is now HAProxy 3.5, which validates properly and
+    // rejects all four -- so they agree, and carrying the exception list would assert
+    // a disagreement that no longer exists.
+    let known_disagreements: [&str; 0] = [];
 
     let mut agreed_count = 0;
     let mut disagreement_count = 0;

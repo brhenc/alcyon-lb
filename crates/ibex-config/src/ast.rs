@@ -34,6 +34,10 @@ pub struct GlobalSection {
     pub stats_socket_mode: Option<u32>,
     /// Privilege level for admin socket.
     pub stats_socket_level: Option<String>,
+    /// Maximum rewrite size in bytes.
+    pub maxrewrite: Option<usize>,
+    /// Buffer size in bytes.
+    pub bufsize: Option<usize>,
 }
 
 /// Defaults section configuration.
@@ -311,6 +315,10 @@ pub struct ListenSection {
     pub accept_proxy: bool,
     /// Whether this listen section strictly requires PROXY protocol v2.
     pub accept_proxy_v2: bool,
+    /// Forwardfor header options.
+    pub forwardfor: Option<String>,
+    /// Originalto header options.
+    pub originalto: Option<String>,
     /// Default server options applied to all servers in this listen section.
     pub default_server: Option<DefaultServerConfig>,
     /// Stats applet and dashboard configuration.
@@ -328,6 +336,10 @@ pub struct StatsConfig {
     pub show_legends: bool,
     pub show_desc: Option<String>,
     pub show_node: Option<String>,
+    pub raw_timeouts: TimeoutConfig,
+    pub forwardfor: Option<String>,
+    pub originalto: Option<String>,
+    pub maxrewrite: Option<usize>,
 }
 
 impl Default for ListenSection {
@@ -364,6 +376,8 @@ impl Default for ListenSection {
             http_after_res_rules: Vec::new(),
             accept_proxy: false,
             accept_proxy_v2: false,
+            forwardfor: None,
+            originalto: None,
             stats: StatsConfig::default(),
         }
     }
@@ -415,6 +429,10 @@ pub struct FrontendSection {
     pub accept_proxy: bool,
     /// Whether this frontend strictly requires PROXY protocol v2.
     pub accept_proxy_v2: bool,
+    /// Forwardfor header options.
+    pub forwardfor: Option<String>,
+    /// Originalto header options.
+    pub originalto: Option<String>,
     /// Stats applet and dashboard configuration.
     pub stats: StatsConfig,
 }
@@ -443,6 +461,8 @@ impl Default for FrontendSection {
             http_after_res_rules: Vec::new(),
             accept_proxy: false,
             accept_proxy_v2: false,
+            forwardfor: None,
+            originalto: None,
             stats: StatsConfig::default(),
         }
     }
@@ -491,6 +511,10 @@ pub struct BackendSection {
     pub http_res_rules: Vec<HttpResRule>,
     /// Modern HTTP-after-response rules.
     pub http_after_res_rules: Vec<HttpAfterResRule>,
+    /// Forwardfor header options.
+    pub forwardfor: Option<String>,
+    /// Originalto header options.
+    pub originalto: Option<String>,
     /// Stats applet and dashboard configuration.
     pub stats: StatsConfig,
 }
@@ -518,6 +542,8 @@ impl Default for BackendSection {
             http_req_rules: Vec::new(),
             http_res_rules: Vec::new(),
             http_after_res_rules: Vec::new(),
+            forwardfor: None,
+            originalto: None,
             stats: StatsConfig::default(),
         }
     }

@@ -145,7 +145,8 @@ async fn test_e2e_haproxy_cfg_tls_frontend_proxy_to_nginx_with_curl() {
     // 4. Parse HAProxy configuration referencing the frontend and backend server
     let haproxy_cfg_text = format!(
         r"
-listen nginx_https_proxy 127.0.0.1:{frontend_port}
+listen nginx_https_proxy
+    bind 127.0.0.1:{frontend_port}
     mode http
     timeout client 5000
     timeout server 5000
