@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-difftest.py — Differential Proxy Test Harness for Ibex vs HAProxy 1.0.2 Oracle.
+difftest.py — Differential Proxy Test Harness for Ibex vs HAProxy 3.5 Oracle.
 
-Runs scenarios against a reference proxy binary (HAProxy 1.0.2) and optionally a
-candidate proxy binary (Ibex), capturing observable behavior and reporting parity.
+Runs scenarios against a reference proxy binary (HAProxy 3.5-dev7 by default) and
+optionally a candidate proxy binary (Ibex), capturing observable behavior and
+reporting parity.
 
 Python 3 standard library only.
 """
@@ -39,9 +40,8 @@ def get_free_port() -> int:
 def bucket_duration_ms(ms: float) -> str:
     """
     Bucket millisecond durations to tolerate timing jitter across systems.
-    HAProxy 1.0.2 uses select timeout of STATTIME (2000ms) for idle expiration,
-    so buckets are sized to distinguish immediate responses (<500ms) from 1-tick
-    (~2000ms), 2-tick (~4000ms), etc.
+    Timeouts are categorized into duration buckets (<500ms, ~1000ms, ~2000ms,
+    ~3000ms, ~4000ms, ~5000ms, etc.).
     """
     if ms < 500:
         return "<500ms"
@@ -111,7 +111,7 @@ class ProxyInstance:
             stderr=subprocess.PIPE
         )
         # Give the proxy a brief moment to bind its listen port
-        time.sleep(0.06)
+        time.sleep(0.15)
         if self.proc.poll() is not None:
             stdout, stderr = self.proc.communicate()
             raise RuntimeError(
@@ -149,22 +149,29 @@ class ProxyInstance:
 def make_tcp_config(
     proxy_port: int,
     backend_addr: str,
-    contimeout: int = 3000,
-    clitimeout: int = 5000,
-    srvtimeout: int = 5000,
+    timeout_connect: int = 3000,
+    timeout_client: int = 5000,
+    timeout_server: int = 5000,
     maxconn: int = 100,
-    retries: int = 2
+    retries: int = 2,
+    **kwargs
 ) -> str:
-    """Generate a standard HAProxy 1.0 tab-indented mode tcp config."""
+    """Generate a standard modern HAProxy 3.5 mode tcp config."""
+    tc = kwargs.get("contimeout", timeout_connect)
+    tcl = kwargs.get("clitimeout", timeout_client)
+    ts = kwargs.get("srvtimeout", timeout_server)
     return (
-        f"listen tcptest 127.0.0.1:{proxy_port}\n"
-        f"\tmode\ttcp\n"
-        f"\tdispatch {backend_addr}\n"
-        f"\tcontimeout\t{contimeout}\n"
-        f"\tclitimeout\t{clitimeout}\n"
-        f"\tsrvtimeout\t{srvtimeout}\n"
+        f"global\n"
+        f"defaults\n"
+        f"\tmode tcp\n"
+        f"\ttimeout connect {tc}ms\n"
+        f"\ttimeout client {tcl}ms\n"
+        f"\ttimeout server {ts}ms\n\n"
+        f"listen tcptest\n"
+        f"\tbind 127.0.0.1:{proxy_port}\n"
+        f"\tserver srv1 {backend_addr}\n"
         f"\tmaxconn {maxconn}\n"
-        f"\tretries\t{retries}\n"
+        f"\tretries {retries}\n"
     )
 
 
@@ -354,7 +361,7 @@ def run_echo(binary_path: str) -> ObservableRecord:
     backend = EchoBackend(backend_port)
     backend.start()
 
-    cfg = make_tcp_config(proxy_port, f"127.0.0.1:{backend_port}", contimeout=3000, clitimeout=10000, srvtimeout=10000)
+    cfg = make_tcp_config(proxy_port, f"127.0.0.1:{backend_port}", timeout_connect=3000, timeout_client=10000, timeout_server=10000)
     proxy = ProxyInstance(binary_path, cfg)
 
     # 1 MiB binary data including NUL bytes and all byte values 0x00-0xFF
@@ -431,7 +438,7 @@ def run_client_close(binary_path: str) -> ObservableRecord:
     backend = ClientCloseBackend(backend_port)
     backend.start()
 
-    cfg = make_tcp_config(proxy_port, f"127.0.0.1:{backend_port}", contimeout=3000, clitimeout=5000, srvtimeout=5000)
+    cfg = make_tcp_config(proxy_port, f"127.0.0.1:{backend_port}", timeout_connect=3000, timeout_client=5000, timeout_server=5000)
     proxy = ProxyInstance(binary_path, cfg)
 
     payload = os.urandom(8192)
@@ -490,7 +497,7 @@ def run_server_close(binary_path: str) -> ObservableRecord:
     backend = ServerCloseBackend(backend_port, server_payload)
     backend.start()
 
-    cfg = make_tcp_config(proxy_port, f"127.0.0.1:{backend_port}", contimeout=3000, clitimeout=5000, srvtimeout=5000)
+    cfg = make_tcp_config(proxy_port, f"127.0.0.1:{backend_port}", timeout_connect=3000, timeout_client=5000, timeout_server=5000)
     proxy = ProxyInstance(binary_path, cfg)
 
     received_data = bytearray()
@@ -554,9 +561,9 @@ def run_server_refused(binary_path: str) -> ObservableRecord:
     cfg = make_tcp_config(
         proxy_port,
         f"127.0.0.1:{backend_port}",
-        contimeout=1000,
-        clitimeout=3000,
-        srvtimeout=3000,
+        timeout_connect=1000,
+        timeout_client=3000,
+        timeout_server=3000,
         retries=retries_configured
     )
     proxy = ProxyInstance(binary_path, cfg)
@@ -567,8 +574,8 @@ def run_server_refused(binary_path: str) -> ObservableRecord:
     t0 = time.time()
     try:
         proxy.start()
-        with socket.create_connection(("127.0.0.1", proxy_port), timeout=3.0) as client_sock:
-            client_sock.settimeout(3.0)
+        with socket.create_connection(("127.0.0.1", proxy_port), timeout=5.0) as client_sock:
+            client_sock.settimeout(5.0)
             # Send trigger byte to prompt proxy connect & retry logic
             client_sock.sendall(b"trigger_connect\n")
             data = client_sock.recv(1024)
@@ -582,7 +589,6 @@ def run_server_refused(binary_path: str) -> ObservableRecord:
         elapsed = (time.time() - t0) * 1000.0
         proxy.stop()
 
-    # HAProxy 1.0.2 executes (1 + retries) attempts immediately on connect error and closes client fd
     status = "PASS" if ("clean_close" in client_outcome or "closed" in client_outcome) else "FAIL"
 
     return ObservableRecord(
@@ -597,7 +603,7 @@ def run_server_refused(binary_path: str) -> ObservableRecord:
         elapsed_ms=elapsed,
         elapsed_bucket=bucket_duration_ms(elapsed),
         retry_count=1 + retries_configured,
-        retry_spacing_ms=[0] * retries_configured,
+        retry_spacing_ms=[1000] * retries_configured,
         details={"retries_configured": retries_configured},
         error_message=error_msg
     )
@@ -607,7 +613,7 @@ def run_connect_timeout(binary_path: str) -> ObservableRecord:
     """
     5. connect_timeout:
        Backend address that blackholes SYN (192.0.2.1 RFC 5737).
-       Verify contimeout is honored and measure elapsed time.
+       Verify timeout connect is honored and measure elapsed time.
     """
     proxy_port = get_free_port()
     blackhole_addr = "192.0.2.1:80"
@@ -616,9 +622,9 @@ def run_connect_timeout(binary_path: str) -> ObservableRecord:
     cfg = make_tcp_config(
         proxy_port,
         blackhole_addr,
-        contimeout=contimeout_ms,
-        clitimeout=6000,
-        srvtimeout=6000,
+        timeout_connect=contimeout_ms,
+        timeout_client=6000,
+        timeout_server=6000,
         retries=0
     )
     proxy = ProxyInstance(binary_path, cfg)
@@ -643,8 +649,6 @@ def run_connect_timeout(binary_path: str) -> ObservableRecord:
         elapsed = (time.time() - t0) * 1000.0
         proxy.stop()
 
-    # HAProxy select loop checks timers at STATTIME intervals (2000ms),
-    # so contimeout <= 2000ms fires at ~2000ms tick.
     timeout_fired = elapsed >= contimeout_ms * 0.8
     status = "PASS" if timeout_fired else "FAIL"
 
@@ -659,7 +663,7 @@ def run_connect_timeout(binary_path: str) -> ObservableRecord:
         server_outcome="timeout",
         elapsed_ms=elapsed,
         elapsed_bucket=bucket_duration_ms(elapsed),
-        details={"contimeout_configured_ms": contimeout_ms, "timeout_fired": timeout_fired},
+        details={"timeout_connect_configured_ms": contimeout_ms, "timeout_fired": timeout_fired},
         error_message=error_msg
     )
 
@@ -667,7 +671,7 @@ def run_connect_timeout(binary_path: str) -> ObservableRecord:
 def run_client_timeout(binary_path: str) -> ObservableRecord:
     """
     6. client_timeout:
-       Client connects, then goes silent. Verify clitimeout fires and closes client.
+       Client connects, then goes silent. Verify timeout client fires and closes client.
     """
     proxy_port = get_free_port()
     backend_port = get_free_port()
@@ -678,9 +682,9 @@ def run_client_timeout(binary_path: str) -> ObservableRecord:
     cfg = make_tcp_config(
         proxy_port,
         f"127.0.0.1:{backend_port}",
-        contimeout=2000,
-        clitimeout=clitimeout_ms,
-        srvtimeout=2000,
+        timeout_connect=2000,
+        timeout_client=clitimeout_ms,
+        timeout_server=2000,
         retries=0
     )
     proxy = ProxyInstance(binary_path, cfg)
@@ -720,7 +724,7 @@ def run_client_timeout(binary_path: str) -> ObservableRecord:
         server_outcome="clean_close",
         elapsed_ms=elapsed,
         elapsed_bucket=bucket_duration_ms(elapsed),
-        details={"clitimeout_configured_ms": clitimeout_ms, "timeout_fired": timeout_fired},
+        details={"timeout_client_configured_ms": clitimeout_ms, "timeout_fired": timeout_fired},
         error_message=error_msg
     )
 
@@ -728,7 +732,7 @@ def run_client_timeout(binary_path: str) -> ObservableRecord:
 def run_server_timeout(binary_path: str) -> ObservableRecord:
     """
     7. server_timeout:
-       Backend accepts but never replies. Verify srvtimeout fires and closes connection.
+       Backend accepts but never replies. Verify timeout server fires and closes connection.
     """
     proxy_port = get_free_port()
     backend_port = get_free_port()
@@ -739,9 +743,9 @@ def run_server_timeout(binary_path: str) -> ObservableRecord:
     cfg = make_tcp_config(
         proxy_port,
         f"127.0.0.1:{backend_port}",
-        contimeout=2000,
-        clitimeout=6000,
-        srvtimeout=srvtimeout_ms,
+        timeout_connect=2000,
+        timeout_client=6000,
+        timeout_server=srvtimeout_ms,
         retries=0
     )
     proxy = ProxyInstance(binary_path, cfg)
@@ -781,7 +785,7 @@ def run_server_timeout(binary_path: str) -> ObservableRecord:
         server_outcome="timeout",
         elapsed_ms=elapsed,
         elapsed_bucket=bucket_duration_ms(elapsed),
-        details={"srvtimeout_configured_ms": srvtimeout_ms, "timeout_fired": timeout_fired},
+        details={"timeout_server_configured_ms": srvtimeout_ms, "timeout_fired": timeout_fired},
         error_message=error_msg
     )
 
@@ -800,9 +804,9 @@ def run_maxconn(binary_path: str) -> ObservableRecord:
     cfg = make_tcp_config(
         proxy_port,
         f"127.0.0.1:{backend_port}",
-        contimeout=3000,
-        clitimeout=5000,
-        srvtimeout=5000,
+        timeout_connect=3000,
+        timeout_client=5000,
+        timeout_server=5000,
         maxconn=2,
         retries=0
     )
@@ -883,9 +887,9 @@ def run_concurrent(binary_path: str) -> ObservableRecord:
     cfg = make_tcp_config(
         proxy_port,
         f"127.0.0.1:{backend_port}",
-        contimeout=5000,
-        clitimeout=10000,
-        srvtimeout=10000,
+        timeout_connect=5000,
+        timeout_client=10000,
+        timeout_server=10000,
         maxconn=100,
         retries=2
     )
@@ -974,9 +978,9 @@ def run_half_close(binary_path: str) -> ObservableRecord:
     cfg = make_tcp_config(
         proxy_port,
         f"127.0.0.1:{backend_port}",
-        contimeout=3000,
-        clitimeout=5000,
-        srvtimeout=5000,
+        timeout_connect=3000,
+        timeout_client=5000,
+        timeout_server=5000,
         maxconn=100,
         retries=2
     )
@@ -1055,12 +1059,15 @@ def run_http_get(binary_path: str) -> ObservableRecord:
     backend.start()
 
     cfg = (
-        f"listen httpproxy 127.0.0.1:{proxy_port}\n"
-        f"\tmode\thttp\n"
-        f"\tdispatch 127.0.0.1:{backend_port}\n"
-        f"\tcontimeout\t3000\n"
-        f"\tclitimeout\t5000\n"
-        f"\tsrvtimeout\t5000\n"
+        f"global\n"
+        f"defaults\n"
+        f"\tmode http\n"
+        f"\ttimeout connect 3000ms\n"
+        f"\ttimeout client 5000ms\n"
+        f"\ttimeout server 5000ms\n\n"
+        f"listen httpproxy\n"
+        f"\tbind 127.0.0.1:{proxy_port}\n"
+        f"\tserver srv1 127.0.0.1:{backend_port}\n"
     )
     proxy = ProxyInstance(binary_path, cfg)
 
@@ -1124,14 +1131,17 @@ def run_http_cookie(binary_path: str) -> ObservableRecord:
     srv2.start()
 
     cfg = (
-        f"listen cookieproxy 127.0.0.1:{proxy_port}\n"
-        f"\tmode\thttp\n"
+        f"global\n"
+        f"defaults\n"
+        f"\tmode http\n"
+        f"\ttimeout connect 3000ms\n"
+        f"\ttimeout client 5000ms\n"
+        f"\ttimeout server 5000ms\n\n"
+        f"listen cookieproxy\n"
+        f"\tbind 127.0.0.1:{proxy_port}\n"
         f"\tcookie SERVERID\n"
-        f"\tserver srv1 127.0.0.1:{s1_port}\n"
-        f"\tserver srv2 127.0.0.1:{s2_port}\n"
-        f"\tcontimeout\t3000\n"
-        f"\tclitimeout\t5000\n"
-        f"\tsrvtimeout\t5000\n"
+        f"\tserver srv1 127.0.0.1:{s1_port} cookie srv1\n"
+        f"\tserver srv2 127.0.0.1:{s2_port} cookie srv2\n"
     )
     proxy = ProxyInstance(binary_path, cfg)
 
@@ -1182,7 +1192,7 @@ def run_http_cookie(binary_path: str) -> ObservableRecord:
 def run_http_cliexp(binary_path: str) -> ObservableRecord:
     """
     13. http_cliexp:
-        Request line & header rewriting via cliexp regex rules in mode http.
+        Request path rewriting via modern 'http-request replace-path' rules in mode http.
     """
     proxy_port = get_free_port()
     backend_port = get_free_port()
@@ -1197,7 +1207,7 @@ def run_http_cliexp(binary_path: str) -> ObservableRecord:
                 conn.settimeout(5.0)
                 data = conn.recv(4096)
                 text = data.decode("latin1", errors="replace")
-                if "GET /new-api/users HTTP/1.0" in text:
+                if "GET /new-api/users" in text:
                     self.rewritten_ok = True
                 res = b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nOK"
                 conn.sendall(res)
@@ -1209,13 +1219,16 @@ def run_http_cliexp(binary_path: str) -> ObservableRecord:
     backend.start()
 
     cfg = (
-        f"listen cliexpproxy 127.0.0.1:{proxy_port}\n"
-        f"\tmode\thttp\n"
-        f"\tdispatch 127.0.0.1:{backend_port}\n"
-        f"\tcliexp\t^(GET.*)(/old-api/)(.*)\t\\1/new-api/\\3\n"
-        f"\tcontimeout\t3000\n"
-        f"\tclitimeout\t5000\n"
-        f"\tsrvtimeout\t5000\n"
+        f"global\n"
+        f"defaults\n"
+        f"\tmode http\n"
+        f"\ttimeout connect 3000ms\n"
+        f"\ttimeout client 5000ms\n"
+        f"\ttimeout server 5000ms\n\n"
+        f"listen cliexpproxy\n"
+        f"\tbind 127.0.0.1:{proxy_port}\n"
+        f"\tserver srv1 127.0.0.1:{backend_port}\n"
+        f"\thttp-request replace-path ^/old-api/(.*) /new-api/\\1\n"
     )
     proxy = ProxyInstance(binary_path, cfg)
 
@@ -1265,7 +1278,7 @@ def run_http_cliexp(binary_path: str) -> ObservableRecord:
 def run_http_srvexp(binary_path: str) -> ObservableRecord:
     """
     14. http_srvexp:
-        Response header rewriting via srvexp regex rules in mode http.
+        Response header rewriting via modern 'http-response replace-header' rules in mode http.
     """
     proxy_port = get_free_port()
     backend_port = get_free_port()
@@ -1275,13 +1288,16 @@ def run_http_srvexp(binary_path: str) -> ObservableRecord:
     backend.start()
 
     cfg = (
-        f"listen srvexpproxy 127.0.0.1:{proxy_port}\n"
-        f"\tmode\thttp\n"
-        f"\tdispatch 127.0.0.1:{backend_port}\n"
-        f"\tsrvexp\t^(Location:\\ )([^:]*://[^/]*)(.*)\t\\1\\3\n"
-        f"\tcontimeout\t3000\n"
-        f"\tclitimeout\t5000\n"
-        f"\tsrvtimeout\t5000\n"
+        f"global\n"
+        f"defaults\n"
+        f"\tmode http\n"
+        f"\ttimeout connect 3000ms\n"
+        f"\ttimeout client 5000ms\n"
+        f"\ttimeout server 5000ms\n\n"
+        f"listen srvexpproxy\n"
+        f"\tbind 127.0.0.1:{proxy_port}\n"
+        f"\tserver srv1 127.0.0.1:{backend_port}\n"
+        f"\thttp-response replace-header Location ^https?://[^/]+(.*) \\1\n"
     )
     proxy = ProxyInstance(binary_path, cfg)
 
@@ -1310,7 +1326,7 @@ def run_http_srvexp(binary_path: str) -> ObservableRecord:
         backend.stop()
 
     recvd = bytes(client_response)
-    header_rewritten = (b"Location: /target\r\n" in recvd)
+    header_rewritten = (b"Location: /target" in recvd or b"location: /target" in recvd)
     status = "PASS" if header_rewritten else "FAIL"
 
     return ObservableRecord(
@@ -1438,8 +1454,12 @@ def format_differential_table(comparisons: List[Tuple[ObservableRecord, Observab
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Differential Proxy Test Harness (HAProxy 1.0.2 vs Ibex)")
-    parser.add_argument("--reference", required=True, help="Path to reference proxy binary (HAProxy 1.0.2)")
+    parser = argparse.ArgumentParser(description="Differential Proxy Test Harness (HAProxy 3.5 vs Ibex)")
+    parser.add_argument(
+        "--reference",
+        default="/home/bhenc/reference/haproxy/haproxy",
+        help="Path to reference proxy binary (defaults to /home/bhenc/reference/haproxy/haproxy)"
+    )
     parser.add_argument("--candidate", default=None, help="Path to candidate proxy binary (optional)")
     parser.add_argument("--scenario", default="all", help="Scenario to run ('all' or specific name)")
     parser.add_argument("--json", action="store_true", dest="json_output", help="Emit output as JSON")

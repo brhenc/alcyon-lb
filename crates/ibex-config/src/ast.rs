@@ -57,6 +57,8 @@ pub struct TimeoutConfig {
     pub http_keep_alive: Option<Duration>,
     pub check: Option<Duration>,
     pub queue: Option<Duration>,
+    pub tunnel: Option<Duration>,
+    pub tarpit: Option<Duration>,
 }
 
 /// Bind configuration for frontend listeners.
@@ -139,6 +141,71 @@ pub enum HttpReqAction {
         name: String,
         regex: String,
         repl: String,
+    },
+    ReplaceValue {
+        name: String,
+        regex: String,
+        repl: String,
+    },
+    SetPath {
+        fmt: String,
+    },
+    ReplacePath {
+        regex: String,
+        repl: String,
+    },
+    SetPathq {
+        fmt: String,
+    },
+    ReplacePathq {
+        regex: String,
+        repl: String,
+    },
+    SetQuery {
+        fmt: String,
+    },
+    SetUri {
+        fmt: String,
+    },
+    SetMethod {
+        fmt: String,
+    },
+    SetSrc {
+        expr: String,
+    },
+    SetDst {
+        expr: String,
+    },
+    Redirect {
+        location: Option<String>,
+        scheme: Option<String>,
+        prefix: Option<String>,
+        code: Option<u16>,
+    },
+    StrictMode {
+        on: bool,
+    },
+    SetVar {
+        var_name: String,
+        expr: String,
+    },
+    UnsetVar {
+        var_name: String,
+    },
+    NormalizeUri {
+        normalizer: String,
+        full: bool,
+        strict: bool,
+    },
+    SetTimeout {
+        timeout_type: String,
+        timeout_val: String,
+    },
+    Auth,
+    Capture {
+        expr: String,
+        len: Option<usize>,
+        id: Option<usize>,
     },
 }
 
@@ -232,6 +299,14 @@ pub struct ListenSection {
     pub stick_table: Option<StickTableConfigAst>,
     /// Stick rules.
     pub stick_rules: Vec<StickRule>,
+    /// Modern TCP-request connection rules.
+    pub tcp_req_conn_rules: Vec<TcpReqConnRule>,
+    /// Modern HTTP-request rules.
+    pub http_req_rules: Vec<HttpReqRule>,
+    /// Modern HTTP-response rules.
+    pub http_res_rules: Vec<HttpResRule>,
+    /// Modern HTTP-after-response rules.
+    pub http_after_res_rules: Vec<HttpAfterResRule>,
     /// Whether this listen section accepts PROXY protocol (v1 or v2).
     pub accept_proxy: bool,
     /// Whether this listen section strictly requires PROXY protocol v2.
@@ -283,6 +358,10 @@ impl Default for ListenSection {
             balance: BalanceAlgorithm::RoundRobin,
             stick_table: None,
             stick_rules: Vec::new(),
+            tcp_req_conn_rules: Vec::new(),
+            http_req_rules: Vec::new(),
+            http_res_rules: Vec::new(),
+            http_after_res_rules: Vec::new(),
             accept_proxy: false,
             accept_proxy_v2: false,
             stats: StatsConfig::default(),
@@ -328,6 +407,8 @@ pub struct FrontendSection {
     pub tcp_req_conn_rules: Vec<TcpReqConnRule>,
     /// Modern HTTP-request rules.
     pub http_req_rules: Vec<HttpReqRule>,
+    /// Modern HTTP-response rules.
+    pub http_res_rules: Vec<HttpResRule>,
     /// Modern HTTP-after-response rules.
     pub http_after_res_rules: Vec<HttpAfterResRule>,
     /// Whether this frontend accepts PROXY protocol (v1 or v2).
@@ -358,6 +439,7 @@ impl Default for FrontendSection {
             stick_rules: Vec::new(),
             tcp_req_conn_rules: Vec::new(),
             http_req_rules: Vec::new(),
+            http_res_rules: Vec::new(),
             http_after_res_rules: Vec::new(),
             accept_proxy: false,
             accept_proxy_v2: false,
