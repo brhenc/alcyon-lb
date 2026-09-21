@@ -7,7 +7,7 @@ license.workspace = true
 
 [dependencies]
 ibex-core.workspace = true
-ibex-ebtree.workspace = true
+ebtree.workspace = true
 tracing.workspace = true
 crossbeam-epoch.workspace = true
 

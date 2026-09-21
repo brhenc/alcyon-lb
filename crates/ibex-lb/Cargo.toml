@@ -11,7 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 ibex-core.workspace = true
-ibex-ebtree.workspace = true
+ebtree.workspace = true
 ibex-stick-table.workspace = true
 ibex-peers.workspace = true
 ibex-parser.workspace = true

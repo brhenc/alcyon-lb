@@ -1,8 +1,14 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/ebtree",
+]
+
+# The ibex-* scaffold crates below are superseded by design/ and are excluded from the
+# build until rewritten against the new architecture. Files are retained on disk.
+# Build order: design/README.md.
+exclude = [
     "crates/ibex-core",
-    "crates/ibex-ebtree",
     "crates/ibex-stick-table",
     "crates/ibex-peers",
     "crates/ibex-parser",
@@ -24,7 +30,7 @@ rust-version = "1.80.0"
 [workspace.dependencies]
 # Internal workspace crates
 ibex-core = { path = "crates/ibex-core" }
-ibex-ebtree = { path = "crates/ibex-ebtree" }
+ebtree = { path = "crates/ebtree" }
 ibex-stick-table = { path = "crates/ibex-stick-table" }
 ibex-peers = { path = "crates/ibex-peers" }
 ibex-parser = { path = "crates/ibex-parser" }
