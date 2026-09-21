@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: LGPL-2.1-only
+// Derived from HAProxy include/import/ebtree-t.h (eb_troot_t tagging scheme).
+// Copyright (C) 2002-2011 Willy Tarreau <w@1wt.eu>. See LICENSE.
+
 //! Tagged references into the node arena.
 //!
 //! `HAProxy`'s ebtree stores a one-bit tag in the low bit of every pointer

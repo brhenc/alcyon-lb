@@ -1,0 +1,355 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Derived from HAProxy include/haproxy/task-t.h and task.h.
+// Copyright (C) 2000-2026 Willy Tarreau <w@1wt.eu> and HAProxy contributors.
+// See LICENSE in the repository root.
+
+//! Tasks, and the arena they live in.
+//!
+//! See `design/006-data-layout.md`. The headline constraint is that a task occupies
+//! **32 bytes — two per cache line** — against `HAProxy`'s 128 (two cache lines *per*
+//! task). At 60,000 backends that difference shows up less in total bytes than in the
+//! working set of a timer-tree walk.
+
+use crate::tick::Tick;
+
+/// Index into the per-thread [`TaskArena`].
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct TaskRef(pub u32);
+
+impl TaskRef {
+    pub const NONE: TaskRef = TaskRef(u32::MAX);
+    #[must_use]
+    #[inline]
+    pub const fn is_none(self) -> bool {
+        self.0 == u32::MAX
+    }
+}
+
+/// Index of a node inside one of the scheduler's ebtree arenas.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct NodeRef(pub u32);
+
+impl NodeRef {
+    pub const NONE: NodeRef = NodeRef(u32::MAX);
+    #[must_use]
+    #[inline]
+    pub const fn is_none(self) -> bool {
+        self.0 == u32::MAX
+    }
+}
+
+/// Index into a static registry of wakeup call sites.
+///
+/// `HAProxy` carries an 8-byte `const struct ha_caller *` in **every** task,
+/// unconditionally and not behind `DEBUG_TASK` — someone decided that diagnosing a
+/// stuck task in production is worth the space on every task in existence. That
+/// judgement is worth keeping; at 4 bytes it also fits inside the 32-byte budget.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct CallSite(pub u32);
+
+impl CallSite {
+    pub const UNKNOWN: CallSite = CallSite(u32::MAX);
+}
+
+/// What kind of work a task represents, packed into 4 bytes.
+///
+/// Replaces C's `process` function pointer plus `void *context` (16 bytes and an
+/// indirect call) with an 8-bit tag and a 24-bit index — 16.7M objects per kind, against
+/// a 60k target. Unpacking is a shift and a mask; the C form risks a branch
+/// mispredict on an indirect call and erases the type entirely, which is why `HAProxy` has
+/// to reconstruct "what is this task" separately in `show sess` and `show fd`.
+///
+/// Here the tag *is* the answer, so introspection is free.
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub struct WorkKind(u32);
+
+/// Discriminants for [`WorkKind`].
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum Kind {
+    /// A stream (one HTTP transaction) being processed.
+    Stream = 0,
+    /// Mux-level I/O on a connection.
+    MuxIo = 1,
+    /// An applet: the CLI, the stats page, peers.
+    Applet = 2,
+    /// A health check.
+    Check = 3,
+    /// Listener-level work, e.g. resuming after `maxconn`.
+    Listener = 4,
+    /// Synthetic work used by tests and benchmarks.
+    Synthetic = 5,
+}
+
+impl Kind {
+    #[must_use]
+    #[inline]
+    const fn from_tag(t: u8) -> Option<Kind> {
+        match t {
+            0 => Some(Kind::Stream),
+            1 => Some(Kind::MuxIo),
+            2 => Some(Kind::Applet),
+            3 => Some(Kind::Check),
+            4 => Some(Kind::Listener),
+            5 => Some(Kind::Synthetic),
+            _ => None,
+        }
+    }
+}
+
+/// Largest index a [`WorkKind`] can address.
+pub const MAX_KIND_INDEX: u32 = (1 << 24) - 1;
+
+impl WorkKind {
+    /// # Panics
+    /// If `index` exceeds [`MAX_KIND_INDEX`].
+    #[must_use]
+    #[inline]
+    pub const fn new(kind: Kind, index: u32) -> Self {
+        assert!(index <= MAX_KIND_INDEX, "WorkKind index out of range");
+        WorkKind(((kind as u32) << 24) | index)
+    }
+
+    /// The discriminant. `None` only if the tag was never written.
+    #[must_use]
+    #[inline]
+    pub const fn kind(self) -> Option<Kind> {
+        #[allow(clippy::cast_possible_truncation)]
+        Kind::from_tag((self.0 >> 24) as u8)
+    }
+
+    /// The subsystem-owned index this task refers to.
+    #[must_use]
+    #[inline]
+    pub const fn index(self) -> u32 {
+        self.0 & MAX_KIND_INDEX
+    }
+}
+
+impl core::fmt::Debug for WorkKind {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.kind() {
+            Some(k) => write!(f, "{k:?}#{}", self.index()),
+            None => write!(f, "WorkKind(invalid:{:#x})", self.0),
+        }
+    }
+}
+
+/// Task state bits. Mirrors `HAProxy`'s `TASK_*`.
+pub mod state {
+    /// Currently executing.
+    pub const RUNNING: u32 = 1 << 0;
+    /// In the run queue or a tasklet list, awaiting execution.
+    pub const QUEUED: u32 = 1 << 1;
+    /// Present in the wait queue (has a pending timer).
+    pub const IN_WQ: u32 = 1 << 2;
+    /// Scheduled for destruction; skipped when dequeued.
+    ///
+    /// Tasklet lists are singly linked, so removal from the middle is done by setting
+    /// this bit rather than by unlinking. See [`super::Task`].
+    pub const KILLED: u32 = 1 << 3;
+    /// Re-woke itself while running: classified into `Bulk` to cap its bandwidth.
+    pub const SELF_WAKING: u32 = 1 << 4;
+    /// Computationally expensive (e.g. a TLS handshake): classified into `Heavy`,
+    /// of which at most one runs per pass.
+    pub const HEAVY: u32 = 1 << 5;
+
+    /// Woken because its timer expired.
+    pub const WOKEN_TIMER: u32 = 1 << 8;
+    /// Woken by I/O readiness.
+    pub const WOKEN_IO: u32 = 1 << 9;
+    /// Woken by another task or thread.
+    pub const WOKEN_MSG: u32 = 1 << 10;
+    /// Woken for any reason.
+    pub const WOKEN_ANY: u32 = WOKEN_TIMER | WOKEN_IO | WOKEN_MSG;
+}
+
+/// A unit of schedulable work. Exactly 32 bytes.
+///
+/// Note what is *not* here: a thread id. `HAProxy` needs `int tid` because its tasks are
+/// pool-allocated from a shared heap, so a task does not know its own thread. Under
+/// thread-per-core with an arena per thread, **the arena a task lives in is its thread**,
+/// and cross-thread wakeups name the target in the message rather than in the task. The
+/// affinity decision pays for itself in the layout.
+#[repr(C)]
+#[derive(Clone, Debug)]
+pub struct Task {
+    /// `state::*` bits.
+    pub state: u32,
+    /// What to run.
+    pub kind: WorkKind,
+    /// Next expiry, or [`Tick::ETERNITY`].
+    pub expire: Tick,
+    /// Run-queue ebtree node, or `NONE`.
+    pub rq_ref: NodeRef,
+    /// Wait-queue ebtree node, or `NONE`.
+    pub wq_ref: NodeRef,
+    /// Next task in a tasklet list, or `NONE`.
+    pub tl_next: TaskRef,
+    /// Where the last wakeup came from.
+    pub caller: CallSite,
+    /// Priority offset, -1024..=1024. Negative runs earlier.
+    pub nice: i16,
+    /// Poll-loop counter at last execution.
+    ///
+    /// Not accounting: `src/task.c:543` compares this against the loop counter to stop
+    /// a task running twice in one pass, which is an anti-starvation guard.
+    pub last_run: u16,
+}
+
+const _: () = assert!(
+    core::mem::size_of::<Task>() == 32,
+    "Task must stay at 32 bytes: two per cache line, against HAProxy's 128"
+);
+
+impl Task {
+    #[must_use]
+    pub const fn new(kind: WorkKind) -> Self {
+        Task {
+            state: 0,
+            kind,
+            expire: Tick::ETERNITY,
+            rq_ref: NodeRef::NONE,
+            wq_ref: NodeRef::NONE,
+            tl_next: TaskRef::NONE,
+            caller: CallSite::UNKNOWN,
+            nice: 0,
+            last_run: 0,
+        }
+    }
+
+    #[must_use]
+    #[inline]
+    pub const fn in_wq(&self) -> bool {
+        self.state & state::IN_WQ != 0
+    }
+
+    #[must_use]
+    #[inline]
+    pub const fn queued(&self) -> bool {
+        self.state & state::QUEUED != 0
+    }
+
+    #[must_use]
+    #[inline]
+    pub const fn killed(&self) -> bool {
+        self.state & state::KILLED != 0
+    }
+}
+
+/// Per-thread task storage.
+///
+/// Sized at boot and never grown on the data path; exhaustion is an error rather than a
+/// reallocation, because a `realloc` under load is exactly the latency spike the design
+/// exists to avoid.
+#[derive(Debug)]
+pub struct TaskArena {
+    tasks: Vec<Task>,
+    free: Vec<u32>,
+    live: usize,
+}
+
+impl TaskArena {
+    #[must_use]
+    pub fn with_capacity(cap: usize) -> Self {
+        TaskArena {
+            tasks: Vec::with_capacity(cap),
+            free: Vec::new(),
+            live: 0,
+        }
+    }
+
+    #[must_use]
+    #[inline]
+    pub const fn live(&self) -> usize {
+        self.live
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.tasks.capacity()
+    }
+
+    /// Allocates a task. Returns `None` if the arena is exhausted.
+    pub fn alloc(&mut self, kind: WorkKind) -> Option<TaskRef> {
+        self.live += 1;
+        if let Some(i) = self.free.pop() {
+            self.tasks[i as usize] = Task::new(kind);
+            return Some(TaskRef(i));
+        }
+        let i = u32::try_from(self.tasks.len()).ok()?;
+        if i == u32::MAX {
+            self.live -= 1;
+            return None;
+        }
+        self.tasks.push(Task::new(kind));
+        Some(TaskRef(i))
+    }
+
+    /// Returns a slot to the free list. The caller must have unlinked it from every
+    /// queue first.
+    pub fn free(&mut self, r: TaskRef) {
+        debug_assert!(!r.is_none());
+        let t = &mut self.tasks[r.0 as usize];
+        debug_assert!(t.rq_ref.is_none(), "freeing a task still in the run queue");
+        debug_assert!(t.wq_ref.is_none(), "freeing a task still in the wait queue");
+        t.state = 0;
+        t.tl_next = TaskRef::NONE;
+        self.free.push(r.0);
+        self.live -= 1;
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn get(&self, r: TaskRef) -> &Task {
+        &self.tasks[r.0 as usize]
+    }
+
+    #[inline]
+    pub fn get_mut(&mut self, r: TaskRef) -> &mut Task {
+        &mut self.tasks[r.0 as usize]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn task_is_two_per_cache_line() {
+        assert_eq!(core::mem::size_of::<Task>(), 32);
+        assert_eq!(64 / core::mem::size_of::<Task>(), 2);
+    }
+
+    #[test]
+    fn workkind_roundtrips() {
+        for (k, i) in [
+            (Kind::Stream, 0),
+            (Kind::Check, 60_000),
+            (Kind::Applet, MAX_KIND_INDEX),
+            (Kind::Synthetic, 1),
+        ] {
+            let w = WorkKind::new(k, i);
+            assert_eq!(w.kind(), Some(k), "tag lost for {k:?}");
+            assert_eq!(w.index(), i, "index lost for {k:?}");
+        }
+    }
+
+    #[test]
+    fn workkind_spans_the_sixty_thousand_backend_target() {
+        const { assert!(MAX_KIND_INDEX > 60_000 * 100) };
+    }
+
+    #[test]
+    fn arena_reuses_freed_slots() {
+        let mut a = TaskArena::with_capacity(4);
+        let t1 = a.alloc(WorkKind::new(Kind::Synthetic, 1)).expect("alloc");
+        assert_eq!(a.live(), 1);
+        a.free(t1);
+        assert_eq!(a.live(), 0);
+        let t2 = a.alloc(WorkKind::new(Kind::Synthetic, 2)).expect("alloc");
+        assert_eq!(t1, t2, "freed slot should be reused");
+        assert_eq!(a.get(t2).kind.index(), 2, "reused slot must be reinitialised");
+    }
+}

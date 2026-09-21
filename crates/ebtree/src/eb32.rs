@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: LGPL-2.1-only
+// Derived from HAProxy include/import/eb32tree.h and src/eb32tree.c.
+// Copyright (C) 2002-2011 Willy Tarreau <w@1wt.eu>. See LICENSE.
+
 //! 32-bit-keyed elastic binary tree.
 //!
 //! Port of `HAProxy`'s `eb32tree` (`include/import/eb32tree.h`, `src/eb32tree.c`,

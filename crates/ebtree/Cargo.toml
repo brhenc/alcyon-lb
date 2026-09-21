@@ -2,8 +2,8 @@
 name = "ebtree"
 version = "0.1.0"
 edition = "2021"
-license = "MIT OR Apache-2.0"
-description = "Elastic binary trees: intrusive, allocation-free, O(key-width) ordered trees"
+license = "LGPL-2.1-only"
+description = "Elastic binary trees: allocation-free, O(key-width) ordered trees. Port of Willy Tarreau's ebtree."
 keywords = ["ebtree", "radix", "trie", "scheduler", "timer"]
 categories = ["data-structures", "no-std"]
 

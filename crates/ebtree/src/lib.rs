@@ -1,3 +1,25 @@
+// SPDX-License-Identifier: LGPL-2.1-only
+//
+// Elastic binary trees, ported to Rust.
+//
+// Derived from HAProxy's ebtree (version 6.0.6):
+//   include/import/ebtree.h, ebtree-t.h, eb32tree.h
+//   src/ebtree.c, src/eb32tree.c
+// Copyright (C) 2002-2011 Willy Tarreau <w@1wt.eu>
+//
+// The upstream headers grant the LGPL "version 2.1 exclusively" -- version 2.1
+// only, with no "or later" option -- so this crate is LGPL-2.1-only and may not
+// be relicensed to LGPL-3.0. See LICENSE in the repository root.
+//
+// This library is free software; you can redistribute it and/or modify it under
+// the terms of the GNU Lesser General Public License as published by the Free
+// Software Foundation, version 2.1 exclusively.
+//
+// This library is distributed in the hope that it will be useful, but WITHOUT
+// ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+// FOR A PARTICULAR PURPOSE. See the GNU Lesser General Public License for more
+// details.
+
 //! Elastic binary trees.
 //!
 //! A Rust implementation of Willy Tarreau's ebtree (as used throughout `HAProxy` for the
