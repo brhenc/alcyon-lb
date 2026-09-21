@@ -1,7 +1,0 @@
-POST /p1 HTTP/1.1
-Host: a.com
-Content-Length: 4
-
-1234EXTRA_BYTESGET /p2 HTTP/1.1
-Host: b.com
-

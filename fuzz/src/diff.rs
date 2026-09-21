@@ -69,9 +69,20 @@ pub fn compare_results(
         });
     }
 
-    // 1. Check Category 3: Smuggling / Next Request Boundary Discrepancies
-    // Check if HAProxy saw sentinel desync or smuggling
-    if haproxy.next_request_smuggled {
+    // 1. Category 3: smuggling / next-request boundary.
+    //
+    // This must be DIFFERENTIAL. Firing on `haproxy.next_request_smuggled` alone
+    // reported HAProxy's own behaviour as an Ibex finding without ever consulting
+    // Ibex, which is not a comparison. It is only interesting when the two disagree
+    // about where the message ended.
+    // A pipelined case legitimately leaves bytes unconsumed after the first message;
+    // that is streaming, not desync. Only a genuine boundary disagreement counts.
+    // A rejected input cannot desync anything: nothing was forwarded. Without this,
+    // every case both parsers reject was reported as a boundary disagreement, because
+    // a rejection consumes 0 bytes and therefore "left trailing data".
+    let ibex_left_trailing = ibex.consumed_bytes < test_case.raw_bytes.len();
+    let ibex_desynced = ibex.accepted && ibex_left_trailing && !test_case.is_pipelined;
+    if haproxy.next_request_smuggled != ibex_desynced {
         return Some(DiscrepancyFinding {
             id,
             test_case: test_case.clone(),

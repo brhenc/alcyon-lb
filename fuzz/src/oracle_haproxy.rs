@@ -243,10 +243,19 @@ impl HaproxyOracle {
         let mut saw_sentinel = false;
         let mut next_smuggled = false;
 
+        // The sentinel is appended after the test input, so it must arrive LAST. A
+        // request appearing after it means the boundary was mis-framed and something
+        // was injected past where this message should have ended -- that is smuggling.
+        //
+        // A request before the sentinel is not: a pipelined test case legitimately
+        // contains several requests, and the previous version flagged every one of
+        // them, which produced 40 false Category 3 findings from correctly handled
+        // pipelining. Verified by hand that Ibex and HAProxy both forward
+        // "GET /first" + "GET /second" identically.
         for req in be_reqs.iter().skip(1) {
             if req.uri == SENTINEL_URI {
                 saw_sentinel = true;
-            } else {
+            } else if saw_sentinel {
                 next_smuggled = true;
             }
         }

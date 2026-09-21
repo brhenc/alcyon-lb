@@ -5,12 +5,12 @@
 This report documents differential testing between the **Ibex HTTP/1 parser** (`crates/ibex-proto`) and the reference **HAProxy 3.5-dev7** oracle (`/home/bhenc/reference/haproxy/haproxy`).
 
 - **Total Inputs Evaluated:** 295
-- **Accepted by Both Parsers:** 188
+- **Accepted by Both Parsers:** 189
 - **Rejected by Both Parsers:** 21
-- **Total Disagreements Found:** 127
-- **Category 1 (Acceptance Disagreements):** 61
+- **Total Disagreements Found:** 92
+- **Category 1 (Acceptance Disagreements):** 54
 - **Category 2 (Framing Disagreements):** 0
-- **Category 3 (Smuggling / Boundary Findings):** 41
+- **Category 3 (Smuggling / Boundary Findings):** 13
 - **Self-Differential (Streaming Consistency):** 25
 
 ## Discrepancy Classification Framework
@@ -24,9 +24,97 @@ This report documents differential testing between the **Ibex HTTP/1 parser** (`
 
 ## Detailed Findings
 
-### Finding 001: cl_te_multiple_te_headers
+### Finding 001: cl_te_both_present_cl_first
 
-- **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
+- **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
+- **Ambiguity Class:** CL-TE / TE-CL Conflict
+- **Description:** Both Content-Length and Transfer-Encoding: chunked present (CL first). Body contains chunked 0 and smuggled prefix.
+
+#### Raw Input Hex Dump
+
+```text
+00000000: 50 4f 53 54 20 2f 73 6d  75 67 67 6c 65 20 48 54  |POST /smuggle HT|
+00000010: 54 50 2f 31 2e 31 0d 0a  48 6f 73 74 3a 20 65 78  |TP/1.1..Host: ex|
+00000020: 61 6d 70 6c 65 2e 63 6f  6d 0d 0a 43 6f 6e 74 65  |ample.com..Conte|
+00000030: 6e 74 2d 4c 65 6e 67 74  68 3a 20 36 0d 0a 54 72  |nt-Length: 6..Tr|
+00000040: 61 6e 73 66 65 72 2d 45  6e 63 6f 64 69 6e 67 3a  |ansfer-Encoding:|
+00000050: 20 63 68 75 6e 6b 65 64  0d 0a 0d 0a 30 0d 0a 0d  | chunked....0...|
+00000060: 0a 58                                             |.X|
+```
+
+#### Ibex Behavior
+
+- **Accepted:** `true`
+- **Phase:** `Done`
+- **Consumed Bytes:** `97 / 98`
+- **Parsed Method:** `POST`
+- **Parsed URI:** `/smuggle`
+- **Body Length:** `0 bytes`
+- **Connection Close Set:** `true`
+
+#### HAProxy Behavior
+
+- **Accepted:** `true`
+- **HTTP Status Code:** `Some(200)`
+- **Forwarded Method:** `POST`
+- **Forwarded URI:** `/smuggle`
+- **Forwarded Body Length:** `0 bytes`
+- **Saw Sentinel Next Request:** `false`
+- **Next Request Smuggled / Desynced:** `false`
+
+#### Security Analysis & Root Cause
+
+HAProxy detected trailing data as part of request body or corrupted the subsequent pipelined request boundary.
+
+---
+
+### Finding 002: cl_te_both_present_te_first
+
+- **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
+- **Ambiguity Class:** CL-TE / TE-CL Conflict
+- **Description:** Both Transfer-Encoding: chunked and Content-Length present (TE first).
+
+#### Raw Input Hex Dump
+
+```text
+00000000: 50 4f 53 54 20 2f 73 6d  75 67 67 6c 65 20 48 54  |POST /smuggle HT|
+00000010: 54 50 2f 31 2e 31 0d 0a  48 6f 73 74 3a 20 65 78  |TP/1.1..Host: ex|
+00000020: 61 6d 70 6c 65 2e 63 6f  6d 0d 0a 54 72 61 6e 73  |ample.com..Trans|
+00000030: 66 65 72 2d 45 6e 63 6f  64 69 6e 67 3a 20 63 68  |fer-Encoding: ch|
+00000040: 75 6e 6b 65 64 0d 0a 43  6f 6e 74 65 6e 74 2d 4c  |unked..Content-L|
+00000050: 65 6e 67 74 68 3a 20 36  0d 0a 0d 0a 30 0d 0a 0d  |ength: 6....0...|
+00000060: 0a 58                                             |.X|
+```
+
+#### Ibex Behavior
+
+- **Accepted:** `true`
+- **Phase:** `Done`
+- **Consumed Bytes:** `97 / 98`
+- **Parsed Method:** `POST`
+- **Parsed URI:** `/smuggle`
+- **Body Length:** `0 bytes`
+- **Connection Close Set:** `true`
+
+#### HAProxy Behavior
+
+- **Accepted:** `true`
+- **HTTP Status Code:** `Some(200)`
+- **Forwarded Method:** `POST`
+- **Forwarded URI:** `/smuggle`
+- **Forwarded Body Length:** `0 bytes`
+- **Saw Sentinel Next Request:** `false`
+- **Next Request Smuggled / Desynced:** `false`
+
+#### Security Analysis & Root Cause
+
+HAProxy detected trailing data as part of request body or corrupted the subsequent pipelined request boundary.
+
+---
+
+### Finding 003: cl_te_multiple_te_headers
+
+- **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** CL-TE / TE-CL Conflict
 - **Description:** Multiple Transfer-Encoding headers: first 'identity', second 'chunked' alongside Content-Length.
 
@@ -64,54 +152,11 @@ This report documents differential testing between the **Ibex HTTP/1 parser** (`
 
 #### Security Analysis & Root Cause
 
-Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Some(422), err=None
+HAProxy detected trailing data as part of request body or corrupted the subsequent pipelined request boundary.
 
 ---
 
-### Finding 002: cl_comma_separated_values
-
-- **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
-- **Ambiguity Class:** Duplicate / Conflicting Content-Length
-- **Description:** Content-Length with comma-separated values '5, 5'.
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 63 6f  6d 6d 61 2d 63 6c 20 48  |POST /comma-cl H|
-00000010: 54 54 50 2f 31 2e 31 0d  0a 48 6f 73 74 3a 20 65  |TTP/1.1..Host: e|
-00000020: 78 61 6d 70 6c 65 2e 63  6f 6d 0d 0a 43 6f 6e 74  |xample.com..Cont|
-00000030: 65 6e 74 2d 4c 65 6e 67  74 68 3a 20 35 2c 20 35  |ent-Length: 5, 5|
-00000040: 0d 0a 0d 0a 68 65 6c 6c  6f                       |....hello|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `false`
-- **Phase:** `Error`
-- **Consumed Bytes:** `0 / 73`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/comma-cl`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-- **Error Message:** `invalid Content-Length value`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/comma-cl`
-- **Forwarded Body Length:** `5 bytes`
-- **Saw Sentinel Next Request:** `true`
-- **Next Request Smuggled / Desynced:** `false`
-
-#### Security Analysis & Root Cause
-
-Ibex: accepted=false, phase="Error", err=Some("invalid Content-Length value"). HAProxy: accepted=true, status=Some(200), err=None
-
----
-
-### Finding 003: te_trailing_identity
+### Finding 004: te_trailing_identity
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Transfer-Encoding Formatting & Casing
@@ -153,7 +198,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 004: te_leading_identity
+### Finding 005: te_leading_identity
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Transfer-Encoding Formatting & Casing
@@ -195,7 +240,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 005: te_prefix_unknown_encoding
+### Finding 006: te_prefix_unknown_encoding
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Transfer-Encoding Formatting & Casing
@@ -236,7 +281,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 006: obs_fold_first_line
+### Finding 007: obs_fold_first_line
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Obs-Fold Continuation Lines
@@ -276,7 +321,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 007: line_term_cr_only
+### Finding 008: line_term_cr_only
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Line Terminator Variations (CR/LF)
@@ -315,7 +360,47 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 008: chunk_signed_plus
+### Finding 009: line_term_doubled_crlf_before_headers
+
+- **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
+- **Ambiguity Class:** Line Terminator Variations (CR/LF)
+- **Description:** Doubled CRLF immediately following request line.
+
+#### Raw Input Hex Dump
+
+```text
+00000000: 47 45 54 20 2f 64 6f 75  62 6c 65 64 20 48 54 54  |GET /doubled HTT|
+00000010: 50 2f 31 2e 31 0d 0a 0d  0a 48 6f 73 74 3a 20 65  |P/1.1....Host: e|
+00000020: 78 61 6d 70 6c 65 2e 63  6f 6d 0d 0a 0d 0a        |xample.com....|
+```
+
+#### Ibex Behavior
+
+- **Accepted:** `true`
+- **Phase:** `Done`
+- **Consumed Bytes:** `25 / 46`
+- **Parsed Method:** `GET`
+- **Parsed URI:** `/doubled`
+- **Body Length:** `0 bytes`
+- **Connection Close Set:** `false`
+
+#### HAProxy Behavior
+
+- **Accepted:** `true`
+- **HTTP Status Code:** `Some(200)`
+- **Forwarded Method:** `GET`
+- **Forwarded URI:** `/doubled`
+- **Forwarded Body Length:** `0 bytes`
+- **Saw Sentinel Next Request:** `false`
+- **Next Request Smuggled / Desynced:** `false`
+
+#### Security Analysis & Root Cause
+
+HAProxy detected trailing data as part of request body or corrupted the subsequent pipelined request boundary.
+
+---
+
+### Finding 010: chunk_signed_plus
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Chunk Size & Extensions
@@ -356,7 +441,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 009: chunk_whitespace_around_size
+### Finding 011: chunk_whitespace_around_size
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Chunk Size & Extensions
@@ -397,7 +482,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 010: header_space_before_colon
+### Finding 012: header_space_before_colon
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Header Name Malformations
@@ -437,7 +522,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 011: header_tab_before_colon
+### Finding 013: header_tab_before_colon
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Header Name Malformations
@@ -477,7 +562,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 012: header_nul_in_name
+### Finding 014: header_nul_in_name
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Header Name Malformations
@@ -517,7 +602,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 013: header_nul_in_value
+### Finding 015: header_nul_in_value
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Header Name Malformations
@@ -557,7 +642,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 014: header_empty_name
+### Finding 016: header_empty_name
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Header Name Malformations
@@ -597,138 +682,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 015: pipelined_standard_two_requests
-
-- **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
-- **Ambiguity Class:** Pipelined Request Boundaries
-- **Description:** Two back-to-back pipelined GET requests on the same connection.
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 47 45 54 20 2f 66 69 72  73 74 20 48 54 54 50 2f  |GET /first HTTP/|
-00000010: 31 2e 31 0d 0a 48 6f 73  74 3a 20 61 2e 63 6f 6d  |1.1..Host: a.com|
-00000020: 0d 0a 0d 0a 47 45 54 20  2f 73 65 63 6f 6e 64 20  |....GET /second |
-00000030: 48 54 54 50 2f 31 2e 31  0d 0a 48 6f 73 74 3a 20  |HTTP/1.1..Host: |
-00000040: 62 2e 63 6f 6d 0d 0a 0d  0a                       |b.com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `36 / 73`
-- **Parsed Method:** `GET`
-- **Parsed URI:** `/first`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `GET`
-- **Forwarded URI:** `/first`
-- **Forwarded Body Length:** `0 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `true`
-
-#### Security Analysis & Root Cause
-
-HAProxy detected trailing data as part of request body or corrupted the subsequent pipelined request boundary.
-
----
-
-### Finding 016: pipelined_body_underflow_smuggle
-
-- **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
-- **Ambiguity Class:** Pipelined Request Boundaries
-- **Description:** Request 1 specifies CL: 4, but body is 8 bytes before Request 2 start line.
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 70 31  20 48 54 54 50 2f 31 2e  |POST /p1 HTTP/1.|
-00000010: 31 0d 0a 48 6f 73 74 3a  20 61 2e 63 6f 6d 0d 0a  |1..Host: a.com..|
-00000020: 43 6f 6e 74 65 6e 74 2d  4c 65 6e 67 74 68 3a 20  |Content-Length: |
-00000030: 34 0d 0a 0d 0a 31 32 33  34 45 58 54 52 41 5f 42  |4....1234EXTRA_B|
-00000040: 59 54 45 53 47 45 54 20  2f 70 32 20 48 54 54 50  |YTESGET /p2 HTTP|
-00000050: 2f 31 2e 31 0d 0a 48 6f  73 74 3a 20 62 2e 63 6f  |/1.1..Host: b.co|
-00000060: 6d 0d 0a 0d 0a                                    |m....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `57 / 101`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/p1`
-- **Body Length:** `4 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/p1`
-- **Forwarded Body Length:** `4 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `true`
-
-#### Security Analysis & Root Cause
-
-HAProxy detected trailing data as part of request body or corrupted the subsequent pipelined request boundary.
-
----
-
-### Finding 017: pipelined_chunked_premature_end
-
-- **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
-- **Ambiguity Class:** Pipelined Request Boundaries
-- **Description:** Request 1 terminates chunked stream early with 0\r\n\r\n, followed by second request.
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 50 4f 53 54 20 2f 70 2d  63 68 75 6e 6b 20 48 54  |POST /p-chunk HT|
-00000010: 54 50 2f 31 2e 31 0d 0a  48 6f 73 74 3a 20 61 2e  |TP/1.1..Host: a.|
-00000020: 63 6f 6d 0d 0a 54 72 61  6e 73 66 65 72 2d 45 6e  |com..Transfer-En|
-00000030: 63 6f 64 69 6e 67 3a 20  63 68 75 6e 6b 65 64 0d  |coding: chunked.|
-00000040: 0a 0d 0a 34 0d 0a 74 65  73 74 0d 0a 30 0d 0a 0d  |...4..test..0...|
-00000050: 0a 47 45 54 20 2f 70 2d  61 66 74 65 72 20 48 54  |.GET /p-after HT|
-00000060: 54 50 2f 31 2e 31 0d 0a  48 6f 73 74 3a 20 62 2e  |TP/1.1..Host: b.|
-00000070: 63 6f 6d 0d 0a 0d 0a                              |com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `81 / 119`
-- **Parsed Method:** `POST`
-- **Parsed URI:** `/p-chunk`
-- **Body Length:** `4 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `POST`
-- **Forwarded URI:** `/p-chunk`
-- **Forwarded Body Length:** `4 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `true`
-
-#### Security Analysis & Root Cause
-
-HAProxy detected trailing data as part of request body or corrupted the subsequent pipelined request boundary.
-
----
-
-### Finding 018: oversized_header_count_120
+### Finding 017: oversized_header_count_120
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Oversized Headers & Limits
@@ -1000,7 +954,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 019: oversized_header_name_300b
+### Finding 018: oversized_header_name_300b
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Oversized Headers & Limits
@@ -1058,7 +1012,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 020: mutated_startline_2
+### Finding 019: mutated_startline_2
 
 - **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -1095,7 +1049,7 @@ Full-buffer parse succeeded/failed differently than byte-by-byte incremental str
 
 ---
 
-### Finding 021: mutated_base_3_oversized_header_count_120
+### Finding 020: mutated_base_3_oversized_header_count_120
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -1367,49 +1321,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 022: mutated_pipelined_pair_4
-
-- **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
-- **Ambiguity Class:** Pipelined Request Boundaries
-- **Description:** Randomized pipelined pair
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 47 45 54 20 2f 70 31 5f  34 20 48 54 54 50 2f 31  |GET /p1_4 HTTP/1|
-00000010: 2e 31 0d 0a 48 6f 73 74  3a 20 61 2e 63 6f 6d 0d  |.1..Host: a.com.|
-00000020: 0a 0d 0a 47 45 54 20 2f  70 32 5f 34 20 48 54 54  |...GET /p2_4 HTT|
-00000030: 50 2f 31 2e 31 0d 0a 48  6f 73 74 3a 20 62 2e 63  |P/1.1..Host: b.c|
-00000040: 6f 6d 0d 0a 0d 0a                                 |om....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `35 / 70`
-- **Parsed Method:** `GET`
-- **Parsed URI:** `/p1_4`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `GET`
-- **Forwarded URI:** `/p1_4`
-- **Forwarded Body Length:** `0 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `true`
-
-#### Security Analysis & Root Cause
-
-HAProxy detected trailing data as part of request body or corrupted the subsequent pipelined request boundary.
-
----
-
-### Finding 023: mutated_startline_6
+### Finding 021: mutated_startline_6
 
 - **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -1448,7 +1360,7 @@ Full-buffer parse succeeded/failed differently than byte-by-byte incremental str
 
 ---
 
-### Finding 024: mutated_headers_ws_9
+### Finding 022: mutated_headers_ws_9
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -1496,7 +1408,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 025: mutated_base_10_cl_te_conflicting_lengths_te_cl_smuggle
+### Finding 023: mutated_base_10_cl_te_conflicting_lengths_te_cl_smuggle
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -1539,7 +1451,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 026: mutated_startline_11
+### Finding 024: mutated_startline_11
 
 - **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -1578,49 +1490,7 @@ Full-buffer parse succeeded/failed differently than byte-by-byte incremental str
 
 ---
 
-### Finding 027: mutated_pipelined_pair_15
-
-- **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
-- **Ambiguity Class:** Pipelined Request Boundaries
-- **Description:** Randomized pipelined pair
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 47 45 54 20 2f 70 31 5f  31 35 20 48 54 54 50 2f  |GET /p1_15 HTTP/|
-00000010: 31 2e 31 0d 0a 48 6f 73  74 3a 20 61 2e 63 6f 6d  |1.1..Host: a.com|
-00000020: 0d 0a 0d 0a 47 45 54 20  2f 70 32 5f 31 35 20 48  |....GET /p2_15 H|
-00000030: 54 54 50 2f 31 2e 31 0d  0a 48 6f 73 74 3a 20 62  |TTP/1.1..Host: b|
-00000040: 2e 63 6f 6d 0d 0a 0d 0a                           |.com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `36 / 72`
-- **Parsed Method:** `GET`
-- **Parsed URI:** `/p1_15`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `GET`
-- **Forwarded URI:** `/p1_15`
-- **Forwarded Body Length:** `0 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `true`
-
-#### Security Analysis & Root Cause
-
-HAProxy detected trailing data as part of request body or corrupted the subsequent pipelined request boundary.
-
----
-
-### Finding 028: mutated_base_16_te_leading_identity
+### Finding 025: mutated_base_16_te_leading_identity
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -1662,7 +1532,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 029: mutated_headers_ws_17
+### Finding 026: mutated_headers_ws_17
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -1707,49 +1577,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 030: mutated_pipelined_pair_18
-
-- **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
-- **Ambiguity Class:** Pipelined Request Boundaries
-- **Description:** Randomized pipelined pair
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 47 45 54 20 2f 70 31 5f  31 38 20 48 54 54 50 2f  |GET /p1_18 HTTP/|
-00000010: 31 2e 31 0d 0a 48 6f 73  74 3a 20 61 2e 63 6f 6d  |1.1..Host: a.com|
-00000020: 0d 0a 0d 0a 47 45 54 20  2f 70 32 5f 31 38 20 48  |....GET /p2_18 H|
-00000030: 54 54 50 2f 31 2e 31 0d  0a 48 6f 73 74 3a 20 62  |TTP/1.1..Host: b|
-00000040: 2e 63 6f 6d 0d 0a 0d 0a                           |.com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `36 / 72`
-- **Parsed Method:** `GET`
-- **Parsed URI:** `/p1_18`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `GET`
-- **Forwarded URI:** `/p1_18`
-- **Forwarded Body Length:** `0 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `true`
-
-#### Security Analysis & Root Cause
-
-HAProxy detected trailing data as part of request body or corrupted the subsequent pipelined request boundary.
-
----
-
-### Finding 031: mutated_headers_ws_20
+### Finding 027: mutated_headers_ws_20
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -1790,7 +1618,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 032: mutated_headers_ws_21
+### Finding 028: mutated_headers_ws_21
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -1835,49 +1663,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 033: mutated_pipelined_pair_24
-
-- **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
-- **Ambiguity Class:** Pipelined Request Boundaries
-- **Description:** Randomized pipelined pair
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 47 45 54 20 2f 70 31 5f  32 34 20 48 54 54 50 2f  |GET /p1_24 HTTP/|
-00000010: 31 2e 31 0d 0a 48 6f 73  74 3a 20 61 2e 63 6f 6d  |1.1..Host: a.com|
-00000020: 0d 0a 0d 0a 47 45 54 20  2f 70 32 5f 32 34 20 48  |....GET /p2_24 H|
-00000030: 54 54 50 2f 31 2e 31 0d  0a 48 6f 73 74 3a 20 62  |TTP/1.1..Host: b|
-00000040: 2e 63 6f 6d 0d 0a 0d 0a                           |.com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `36 / 72`
-- **Parsed Method:** `GET`
-- **Parsed URI:** `/p1_24`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `GET`
-- **Forwarded URI:** `/p1_24`
-- **Forwarded Body Length:** `0 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `true`
-
-#### Security Analysis & Root Cause
-
-HAProxy detected trailing data as part of request body or corrupted the subsequent pipelined request boundary.
-
----
-
-### Finding 034: mutated_headers_ws_27
+### Finding 029: mutated_headers_ws_27
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -1924,7 +1710,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 035: mutated_startline_28
+### Finding 030: mutated_startline_28
 
 - **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -1962,7 +1748,7 @@ Full-buffer parse succeeded/failed differently than byte-by-byte incremental str
 
 ---
 
-### Finding 036: mutated_headers_ws_29
+### Finding 031: mutated_headers_ws_29
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -2006,41 +1792,43 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 037: mutated_pipelined_pair_34
+### Finding 032: mutated_base_35_pipelined_body_underflow_smuggle
 
 - **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
-- **Ambiguity Class:** Pipelined Request Boundaries
-- **Description:** Randomized pipelined pair
+- **Ambiguity Class:** Combinatorial Mutations
+- **Description:** Mutated byte in pipelined_body_underflow_smuggle
 
 #### Raw Input Hex Dump
 
 ```text
-00000000: 47 45 54 20 2f 70 31 5f  33 34 20 48 54 54 50 2f  |GET /p1_34 HTTP/|
-00000010: 31 2e 31 0d 0a 48 6f 73  74 3a 20 61 2e 63 6f 6d  |1.1..Host: a.com|
-00000020: 0d 0a 0d 0a 47 45 54 20  2f 70 32 5f 33 34 20 48  |....GET /p2_34 H|
-00000030: 54 54 50 2f 31 2e 31 0d  0a 48 6f 73 74 3a 20 62  |TTP/1.1..Host: b|
-00000040: 2e 63 6f 6d 0d 0a 0d 0a                           |.com....|
+00000000: 50 4f 53 54 20 2f 70 31  20 48 54 54 50 2f 31 2e  |POST /p1 HTTP/1.|
+00000010: 31 0d 0a 48 6f 73 74 3a  20 61 2e 63 6f 6d 0d 0a  |1..Host: a.com..|
+00000020: 43 6f 6e 74 65 6e 74 2d  4c 65 6e 67 74 68 3a 20  |Content-Length: |
+00000030: 34 0d 0a 0d 0a 31 32 33  34 45 58 54 00 41 5f 42  |4....1234EXT.A_B|
+00000040: 59 54 45 53 47 45 54 20  2f 70 32 20 48 54 54 50  |YTESGET /p2 HTTP|
+00000050: 2f 31 2e 31 0d 0a 48 6f  73 74 3a 20 62 2e 63 6f  |/1.1..Host: b.co|
+00000060: 6d 0d 0a 0d 0a                                    |m....|
 ```
 
 #### Ibex Behavior
 
 - **Accepted:** `true`
 - **Phase:** `Done`
-- **Consumed Bytes:** `36 / 72`
-- **Parsed Method:** `GET`
-- **Parsed URI:** `/p1_34`
-- **Body Length:** `0 bytes`
+- **Consumed Bytes:** `57 / 101`
+- **Parsed Method:** `POST`
+- **Parsed URI:** `/p1`
+- **Body Length:** `4 bytes`
 - **Connection Close Set:** `false`
 
 #### HAProxy Behavior
 
 - **Accepted:** `true`
 - **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `GET`
-- **Forwarded URI:** `/p1_34`
-- **Forwarded Body Length:** `0 bytes`
+- **Forwarded Method:** `POST`
+- **Forwarded URI:** `/p1`
+- **Forwarded Body Length:** `4 bytes`
 - **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `true`
+- **Next Request Smuggled / Desynced:** `false`
 
 #### Security Analysis & Root Cause
 
@@ -2048,91 +1836,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 ---
 
-### Finding 038: mutated_pipelined_pair_37
-
-- **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
-- **Ambiguity Class:** Pipelined Request Boundaries
-- **Description:** Randomized pipelined pair
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 47 45 54 20 2f 70 31 5f  33 37 20 48 54 54 50 2f  |GET /p1_37 HTTP/|
-00000010: 31 2e 31 0d 0a 48 6f 73  74 3a 20 61 2e 63 6f 6d  |1.1..Host: a.com|
-00000020: 0d 0a 0d 0a 47 45 54 20  2f 70 32 5f 33 37 20 48  |....GET /p2_37 H|
-00000030: 54 54 50 2f 31 2e 31 0d  0a 48 6f 73 74 3a 20 62  |TTP/1.1..Host: b|
-00000040: 2e 63 6f 6d 0d 0a 0d 0a                           |.com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `36 / 72`
-- **Parsed Method:** `GET`
-- **Parsed URI:** `/p1_37`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `GET`
-- **Forwarded URI:** `/p1_37`
-- **Forwarded Body Length:** `0 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `true`
-
-#### Security Analysis & Root Cause
-
-HAProxy detected trailing data as part of request body or corrupted the subsequent pipelined request boundary.
-
----
-
-### Finding 039: mutated_pipelined_pair_40
-
-- **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
-- **Ambiguity Class:** Pipelined Request Boundaries
-- **Description:** Randomized pipelined pair
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 47 45 54 20 2f 70 31 5f  34 30 20 48 54 54 50 2f  |GET /p1_40 HTTP/|
-00000010: 31 2e 31 0d 0a 48 6f 73  74 3a 20 61 2e 63 6f 6d  |1.1..Host: a.com|
-00000020: 0d 0a 0d 0a 47 45 54 20  2f 70 32 5f 34 30 20 48  |....GET /p2_40 H|
-00000030: 54 54 50 2f 31 2e 31 0d  0a 48 6f 73 74 3a 20 62  |TTP/1.1..Host: b|
-00000040: 2e 63 6f 6d 0d 0a 0d 0a                           |.com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `36 / 72`
-- **Parsed Method:** `GET`
-- **Parsed URI:** `/p1_40`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `GET`
-- **Forwarded URI:** `/p1_40`
-- **Forwarded Body Length:** `0 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `true`
-
-#### Security Analysis & Root Cause
-
-HAProxy detected trailing data as part of request body or corrupted the subsequent pipelined request boundary.
-
----
-
-### Finding 040: mutated_headers_ws_42
+### Finding 033: mutated_headers_ws_42
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -2175,7 +1879,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 041: mutated_headers_ws_43
+### Finding 034: mutated_headers_ws_43
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -2220,49 +1924,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 042: mutated_pipelined_pair_44
-
-- **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
-- **Ambiguity Class:** Pipelined Request Boundaries
-- **Description:** Randomized pipelined pair
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 47 45 54 20 2f 70 31 5f  34 34 20 48 54 54 50 2f  |GET /p1_44 HTTP/|
-00000010: 31 2e 31 0d 0a 48 6f 73  74 3a 20 61 2e 63 6f 6d  |1.1..Host: a.com|
-00000020: 0d 0a 0d 0a 47 45 54 20  2f 70 32 5f 34 34 20 48  |....GET /p2_44 H|
-00000030: 54 54 50 2f 31 2e 31 0d  0a 48 6f 73 74 3a 20 62  |TTP/1.1..Host: b|
-00000040: 2e 63 6f 6d 0d 0a 0d 0a                           |.com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `36 / 72`
-- **Parsed Method:** `GET`
-- **Parsed URI:** `/p1_44`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `GET`
-- **Forwarded URI:** `/p1_44`
-- **Forwarded Body Length:** `0 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `true`
-
-#### Security Analysis & Root Cause
-
-HAProxy detected trailing data as part of request body or corrupted the subsequent pipelined request boundary.
-
----
-
-### Finding 043: mutated_headers_ws_45
+### Finding 035: mutated_headers_ws_45
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -2309,7 +1971,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 044: mutated_base_50_chunk_signed_plus
+### Finding 036: mutated_base_50_chunk_signed_plus
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -2350,7 +2012,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 045: mutated_startline_52
+### Finding 037: mutated_startline_52
 
 - **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -2388,7 +2050,7 @@ Full-buffer parse succeeded/failed differently than byte-by-byte incremental str
 
 ---
 
-### Finding 046: mutated_startline_53
+### Finding 038: mutated_startline_53
 
 - **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -2426,91 +2088,7 @@ Full-buffer parse succeeded/failed differently than byte-by-byte incremental str
 
 ---
 
-### Finding 047: mutated_pipelined_pair_63
-
-- **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
-- **Ambiguity Class:** Pipelined Request Boundaries
-- **Description:** Randomized pipelined pair
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 47 45 54 20 2f 70 31 5f  36 33 20 48 54 54 50 2f  |GET /p1_63 HTTP/|
-00000010: 31 2e 31 0d 0a 48 6f 73  74 3a 20 61 2e 63 6f 6d  |1.1..Host: a.com|
-00000020: 0d 0a 0d 0a 47 45 54 20  2f 70 32 5f 36 33 20 48  |....GET /p2_63 H|
-00000030: 54 54 50 2f 31 2e 31 0d  0a 48 6f 73 74 3a 20 62  |TTP/1.1..Host: b|
-00000040: 2e 63 6f 6d 0d 0a 0d 0a                           |.com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `36 / 72`
-- **Parsed Method:** `GET`
-- **Parsed URI:** `/p1_63`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `GET`
-- **Forwarded URI:** `/p1_63`
-- **Forwarded Body Length:** `0 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `true`
-
-#### Security Analysis & Root Cause
-
-HAProxy detected trailing data as part of request body or corrupted the subsequent pipelined request boundary.
-
----
-
-### Finding 048: mutated_pipelined_pair_64
-
-- **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
-- **Ambiguity Class:** Pipelined Request Boundaries
-- **Description:** Randomized pipelined pair
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 47 45 54 20 2f 70 31 5f  36 34 20 48 54 54 50 2f  |GET /p1_64 HTTP/|
-00000010: 31 2e 31 0d 0a 48 6f 73  74 3a 20 61 2e 63 6f 6d  |1.1..Host: a.com|
-00000020: 0d 0a 0d 0a 47 45 54 20  2f 70 32 5f 36 34 20 48  |....GET /p2_64 H|
-00000030: 54 54 50 2f 31 2e 31 0d  0a 48 6f 73 74 3a 20 62  |TTP/1.1..Host: b|
-00000040: 2e 63 6f 6d 0d 0a 0d 0a                           |.com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `36 / 72`
-- **Parsed Method:** `GET`
-- **Parsed URI:** `/p1_64`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `GET`
-- **Forwarded URI:** `/p1_64`
-- **Forwarded Body Length:** `0 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `true`
-
-#### Security Analysis & Root Cause
-
-HAProxy detected trailing data as part of request body or corrupted the subsequent pipelined request boundary.
-
----
-
-### Finding 049: mutated_headers_ws_67
+### Finding 039: mutated_headers_ws_67
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -2551,7 +2129,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 050: mutated_headers_ws_68
+### Finding 040: mutated_headers_ws_68
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -2594,7 +2172,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 051: mutated_startline_69
+### Finding 041: mutated_startline_69
 
 - **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -2633,7 +2211,7 @@ Full-buffer parse succeeded/failed differently than byte-by-byte incremental str
 
 ---
 
-### Finding 052: mutated_headers_ws_74
+### Finding 042: mutated_headers_ws_74
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -2678,7 +2256,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 053: mutated_base_76_oversized_uri_4k
+### Finding 043: mutated_base_76_oversized_uri_4k
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -2972,49 +2550,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 054: mutated_pipelined_pair_78
-
-- **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
-- **Ambiguity Class:** Pipelined Request Boundaries
-- **Description:** Randomized pipelined pair
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 47 45 54 20 2f 70 31 5f  37 38 20 48 54 54 50 2f  |GET /p1_78 HTTP/|
-00000010: 31 2e 31 0d 0a 48 6f 73  74 3a 20 61 2e 63 6f 6d  |1.1..Host: a.com|
-00000020: 0d 0a 0d 0a 47 45 54 20  2f 70 32 5f 37 38 20 48  |....GET /p2_78 H|
-00000030: 54 54 50 2f 31 2e 31 0d  0a 48 6f 73 74 3a 20 62  |TTP/1.1..Host: b|
-00000040: 2e 63 6f 6d 0d 0a 0d 0a                           |.com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `36 / 72`
-- **Parsed Method:** `GET`
-- **Parsed URI:** `/p1_78`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `GET`
-- **Forwarded URI:** `/p1_78`
-- **Forwarded Body Length:** `0 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `true`
-
-#### Security Analysis & Root Cause
-
-HAProxy detected trailing data as part of request body or corrupted the subsequent pipelined request boundary.
-
----
-
-### Finding 055: mutated_startline_82
+### Finding 044: mutated_startline_82
 
 - **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -3053,49 +2589,7 @@ Full-buffer parse succeeded/failed differently than byte-by-byte incremental str
 
 ---
 
-### Finding 056: mutated_pipelined_pair_86
-
-- **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
-- **Ambiguity Class:** Pipelined Request Boundaries
-- **Description:** Randomized pipelined pair
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 47 45 54 20 2f 70 31 5f  38 36 20 48 54 54 50 2f  |GET /p1_86 HTTP/|
-00000010: 31 2e 31 0d 0a 48 6f 73  74 3a 20 61 2e 63 6f 6d  |1.1..Host: a.com|
-00000020: 0d 0a 0d 0a 47 45 54 20  2f 70 32 5f 38 36 20 48  |....GET /p2_86 H|
-00000030: 54 54 50 2f 31 2e 31 0d  0a 48 6f 73 74 3a 20 62  |TTP/1.1..Host: b|
-00000040: 2e 63 6f 6d 0d 0a 0d 0a                           |.com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `36 / 72`
-- **Parsed Method:** `GET`
-- **Parsed URI:** `/p1_86`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `GET`
-- **Forwarded URI:** `/p1_86`
-- **Forwarded Body Length:** `0 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `true`
-
-#### Security Analysis & Root Cause
-
-HAProxy detected trailing data as part of request body or corrupted the subsequent pipelined request boundary.
-
----
-
-### Finding 057: mutated_startline_87
+### Finding 045: mutated_startline_87
 
 - **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -3134,7 +2628,7 @@ Full-buffer parse succeeded/failed differently than byte-by-byte incremental str
 
 ---
 
-### Finding 058: mutated_base_88_te_prefix_unknown_encoding
+### Finding 046: mutated_base_88_te_prefix_unknown_encoding
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -3175,133 +2669,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 059: mutated_pipelined_pair_89
-
-- **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
-- **Ambiguity Class:** Pipelined Request Boundaries
-- **Description:** Randomized pipelined pair
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 47 45 54 20 2f 70 31 5f  38 39 20 48 54 54 50 2f  |GET /p1_89 HTTP/|
-00000010: 31 2e 31 0d 0a 48 6f 73  74 3a 20 61 2e 63 6f 6d  |1.1..Host: a.com|
-00000020: 0d 0a 0d 0a 47 45 54 20  2f 70 32 5f 38 39 20 48  |....GET /p2_89 H|
-00000030: 54 54 50 2f 31 2e 31 0d  0a 48 6f 73 74 3a 20 62  |TTP/1.1..Host: b|
-00000040: 2e 63 6f 6d 0d 0a 0d 0a                           |.com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `36 / 72`
-- **Parsed Method:** `GET`
-- **Parsed URI:** `/p1_89`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `GET`
-- **Forwarded URI:** `/p1_89`
-- **Forwarded Body Length:** `0 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `true`
-
-#### Security Analysis & Root Cause
-
-HAProxy detected trailing data as part of request body or corrupted the subsequent pipelined request boundary.
-
----
-
-### Finding 060: mutated_pipelined_pair_93
-
-- **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
-- **Ambiguity Class:** Pipelined Request Boundaries
-- **Description:** Randomized pipelined pair
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 47 45 54 20 2f 70 31 5f  39 33 20 48 54 54 50 2f  |GET /p1_93 HTTP/|
-00000010: 31 2e 31 0d 0a 48 6f 73  74 3a 20 61 2e 63 6f 6d  |1.1..Host: a.com|
-00000020: 0d 0a 0d 0a 47 45 54 20  2f 70 32 5f 39 33 20 48  |....GET /p2_93 H|
-00000030: 54 54 50 2f 31 2e 31 0d  0a 48 6f 73 74 3a 20 62  |TTP/1.1..Host: b|
-00000040: 2e 63 6f 6d 0d 0a 0d 0a                           |.com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `36 / 72`
-- **Parsed Method:** `GET`
-- **Parsed URI:** `/p1_93`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `GET`
-- **Forwarded URI:** `/p1_93`
-- **Forwarded Body Length:** `0 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `true`
-
-#### Security Analysis & Root Cause
-
-HAProxy detected trailing data as part of request body or corrupted the subsequent pipelined request boundary.
-
----
-
-### Finding 061: mutated_pipelined_pair_94
-
-- **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
-- **Ambiguity Class:** Pipelined Request Boundaries
-- **Description:** Randomized pipelined pair
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 47 45 54 20 2f 70 31 5f  39 34 20 48 54 54 50 2f  |GET /p1_94 HTTP/|
-00000010: 31 2e 31 0d 0a 48 6f 73  74 3a 20 61 2e 63 6f 6d  |1.1..Host: a.com|
-00000020: 0d 0a 0d 0a 47 45 54 20  2f 70 32 5f 39 34 20 48  |....GET /p2_94 H|
-00000030: 54 54 50 2f 31 2e 31 0d  0a 48 6f 73 74 3a 20 62  |TTP/1.1..Host: b|
-00000040: 2e 63 6f 6d 0d 0a 0d 0a                           |.com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `36 / 72`
-- **Parsed Method:** `GET`
-- **Parsed URI:** `/p1_94`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `GET`
-- **Forwarded URI:** `/p1_94`
-- **Forwarded Body Length:** `0 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `true`
-
-#### Security Analysis & Root Cause
-
-HAProxy detected trailing data as part of request body or corrupted the subsequent pipelined request boundary.
-
----
-
-### Finding 062: mutated_startline_95
+### Finding 047: mutated_startline_95
 
 - **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -3339,7 +2707,7 @@ Full-buffer parse succeeded/failed differently than byte-by-byte incremental str
 
 ---
 
-### Finding 063: mutated_base_102_line_term_lf_only
+### Finding 048: mutated_base_102_line_term_lf_only
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -3378,91 +2746,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 064: mutated_pipelined_pair_103
-
-- **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
-- **Ambiguity Class:** Pipelined Request Boundaries
-- **Description:** Randomized pipelined pair
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 47 45 54 20 2f 70 31 5f  31 30 33 20 48 54 54 50  |GET /p1_103 HTTP|
-00000010: 2f 31 2e 31 0d 0a 48 6f  73 74 3a 20 61 2e 63 6f  |/1.1..Host: a.co|
-00000020: 6d 0d 0a 0d 0a 47 45 54  20 2f 70 32 5f 31 30 33  |m....GET /p2_103|
-00000030: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000040: 20 62 2e 63 6f 6d 0d 0a  0d 0a                    | b.com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `37 / 74`
-- **Parsed Method:** `GET`
-- **Parsed URI:** `/p1_103`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `GET`
-- **Forwarded URI:** `/p1_103`
-- **Forwarded Body Length:** `0 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `true`
-
-#### Security Analysis & Root Cause
-
-HAProxy detected trailing data as part of request body or corrupted the subsequent pipelined request boundary.
-
----
-
-### Finding 065: mutated_pipelined_pair_104
-
-- **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
-- **Ambiguity Class:** Pipelined Request Boundaries
-- **Description:** Randomized pipelined pair
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 47 45 54 20 2f 70 31 5f  31 30 34 20 48 54 54 50  |GET /p1_104 HTTP|
-00000010: 2f 31 2e 31 0d 0a 48 6f  73 74 3a 20 61 2e 63 6f  |/1.1..Host: a.co|
-00000020: 6d 0d 0a 0d 0a 47 45 54  20 2f 70 32 5f 31 30 34  |m....GET /p2_104|
-00000030: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000040: 20 62 2e 63 6f 6d 0d 0a  0d 0a                    | b.com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `37 / 74`
-- **Parsed Method:** `GET`
-- **Parsed URI:** `/p1_104`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `GET`
-- **Forwarded URI:** `/p1_104`
-- **Forwarded Body Length:** `0 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `true`
-
-#### Security Analysis & Root Cause
-
-HAProxy detected trailing data as part of request body or corrupted the subsequent pipelined request boundary.
-
----
-
-### Finding 066: mutated_headers_ws_105
+### Finding 049: mutated_headers_ws_105
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -3503,9 +2787,9 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 067: mutated_base_107_line_term_doubled_crlf_before_headers
+### Finding 050: mutated_base_107_line_term_doubled_crlf_before_headers
 
-- **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
+- **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Combinatorial Mutations
 - **Description:** Mutated byte in line_term_doubled_crlf_before_headers
 
@@ -3537,11 +2821,11 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 #### Security Analysis & Root Cause
 
-Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Some(400), err=None
+HAProxy detected trailing data as part of request body or corrupted the subsequent pipelined request boundary.
 
 ---
 
-### Finding 068: mutated_headers_ws_108
+### Finding 051: mutated_headers_ws_108
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -3589,7 +2873,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 069: mutated_startline_109
+### Finding 052: mutated_startline_109
 
 - **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -3627,7 +2911,7 @@ Full-buffer parse succeeded/failed differently than byte-by-byte incremental str
 
 ---
 
-### Finding 070: mutated_startline_110
+### Finding 053: mutated_startline_110
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -3665,7 +2949,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 071: mutated_headers_ws_112
+### Finding 054: mutated_headers_ws_112
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -3710,7 +2994,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 072: mutated_base_115_baseline_simple_get
+### Finding 055: mutated_base_115_baseline_simple_get
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -3748,7 +3032,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 073: mutated_startline_117
+### Finding 056: mutated_startline_117
 
 - **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -3787,7 +3071,7 @@ Full-buffer parse succeeded/failed differently than byte-by-byte incremental str
 
 ---
 
-### Finding 074: mutated_headers_ws_118
+### Finding 057: mutated_headers_ws_118
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -3828,49 +3112,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 075: mutated_pipelined_pair_119
-
-- **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
-- **Ambiguity Class:** Pipelined Request Boundaries
-- **Description:** Randomized pipelined pair
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 47 45 54 20 2f 70 31 5f  31 31 39 20 48 54 54 50  |GET /p1_119 HTTP|
-00000010: 2f 31 2e 31 0d 0a 48 6f  73 74 3a 20 61 2e 63 6f  |/1.1..Host: a.co|
-00000020: 6d 0d 0a 0d 0a 47 45 54  20 2f 70 32 5f 31 31 39  |m....GET /p2_119|
-00000030: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000040: 20 62 2e 63 6f 6d 0d 0a  0d 0a                    | b.com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `37 / 74`
-- **Parsed Method:** `GET`
-- **Parsed URI:** `/p1_119`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `GET`
-- **Forwarded URI:** `/p1_119`
-- **Forwarded Body Length:** `0 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `true`
-
-#### Security Analysis & Root Cause
-
-HAProxy detected trailing data as part of request body or corrupted the subsequent pipelined request boundary.
-
----
-
-### Finding 076: mutated_startline_123
+### Finding 058: mutated_startline_123
 
 - **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -3908,7 +3150,7 @@ Full-buffer parse succeeded/failed differently than byte-by-byte incremental str
 
 ---
 
-### Finding 077: mutated_base_126_header_tab_before_colon
+### Finding 059: mutated_base_126_header_tab_before_colon
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -3948,91 +3190,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 078: mutated_pipelined_pair_129
-
-- **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
-- **Ambiguity Class:** Pipelined Request Boundaries
-- **Description:** Randomized pipelined pair
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 47 45 54 20 2f 70 31 5f  31 32 39 20 48 54 54 50  |GET /p1_129 HTTP|
-00000010: 2f 31 2e 31 0d 0a 48 6f  73 74 3a 20 61 2e 63 6f  |/1.1..Host: a.co|
-00000020: 6d 0d 0a 0d 0a 47 45 54  20 2f 70 32 5f 31 32 39  |m....GET /p2_129|
-00000030: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000040: 20 62 2e 63 6f 6d 0d 0a  0d 0a                    | b.com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `37 / 74`
-- **Parsed Method:** `GET`
-- **Parsed URI:** `/p1_129`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `GET`
-- **Forwarded URI:** `/p1_129`
-- **Forwarded Body Length:** `0 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `true`
-
-#### Security Analysis & Root Cause
-
-HAProxy detected trailing data as part of request body or corrupted the subsequent pipelined request boundary.
-
----
-
-### Finding 079: mutated_pipelined_pair_133
-
-- **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
-- **Ambiguity Class:** Pipelined Request Boundaries
-- **Description:** Randomized pipelined pair
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 47 45 54 20 2f 70 31 5f  31 33 33 20 48 54 54 50  |GET /p1_133 HTTP|
-00000010: 2f 31 2e 31 0d 0a 48 6f  73 74 3a 20 61 2e 63 6f  |/1.1..Host: a.co|
-00000020: 6d 0d 0a 0d 0a 47 45 54  20 2f 70 32 5f 31 33 33  |m....GET /p2_133|
-00000030: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000040: 20 62 2e 63 6f 6d 0d 0a  0d 0a                    | b.com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `37 / 74`
-- **Parsed Method:** `GET`
-- **Parsed URI:** `/p1_133`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `GET`
-- **Forwarded URI:** `/p1_133`
-- **Forwarded Body Length:** `0 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `true`
-
-#### Security Analysis & Root Cause
-
-HAProxy detected trailing data as part of request body or corrupted the subsequent pipelined request boundary.
-
----
-
-### Finding 080: mutated_base_134_header_nul_in_value
+### Finding 060: mutated_base_134_header_nul_in_value
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -4072,7 +3230,51 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 081: mutated_startline_139
+### Finding 061: mutated_cl_te_rand_138
+
+- **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
+- **Ambiguity Class:** Combinatorial Mutations
+- **Description:** Combinatorial CL (19) vs TE with payload len (0)
+
+#### Raw Input Hex Dump
+
+```text
+00000000: 50 4f 53 54 20 2f 63 6c  2d 74 65 2d 72 61 6e 64  |POST /cl-te-rand|
+00000010: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
+00000020: 20 65 78 61 6d 70 6c 65  2e 63 6f 6d 0d 0a 43 6f  | example.com..Co|
+00000030: 6e 74 65 6e 74 2d 4c 65  6e 67 74 68 3a 20 31 39  |ntent-Length: 19|
+00000040: 0d 0a 54 72 61 6e 73 66  65 72 2d 45 6e 63 6f 64  |..Transfer-Encod|
+00000050: 69 6e 67 3a 20 63 68 75  6e 6b 65 64 0d 0a 0d 0a  |ing: chunked....|
+00000060: 30 0d 0a 0d 0a 30 0d 0a  0d 0a                    |0....0....|
+```
+
+#### Ibex Behavior
+
+- **Accepted:** `true`
+- **Phase:** `Done`
+- **Consumed Bytes:** `101 / 106`
+- **Parsed Method:** `POST`
+- **Parsed URI:** `/cl-te-rand`
+- **Body Length:** `0 bytes`
+- **Connection Close Set:** `true`
+
+#### HAProxy Behavior
+
+- **Accepted:** `true`
+- **HTTP Status Code:** `Some(200)`
+- **Forwarded Method:** `POST`
+- **Forwarded URI:** `/cl-te-rand`
+- **Forwarded Body Length:** `0 bytes`
+- **Saw Sentinel Next Request:** `false`
+- **Next Request Smuggled / Desynced:** `false`
+
+#### Security Analysis & Root Cause
+
+HAProxy detected trailing data as part of request body or corrupted the subsequent pipelined request boundary.
+
+---
+
+### Finding 062: mutated_startline_139
 
 - **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -4111,49 +3313,7 @@ Full-buffer parse succeeded/failed differently than byte-by-byte incremental str
 
 ---
 
-### Finding 082: mutated_pipelined_pair_140
-
-- **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
-- **Ambiguity Class:** Pipelined Request Boundaries
-- **Description:** Randomized pipelined pair
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 47 45 54 20 2f 70 31 5f  31 34 30 20 48 54 54 50  |GET /p1_140 HTTP|
-00000010: 2f 31 2e 31 0d 0a 48 6f  73 74 3a 20 61 2e 63 6f  |/1.1..Host: a.co|
-00000020: 6d 0d 0a 0d 0a 47 45 54  20 2f 70 32 5f 31 34 30  |m....GET /p2_140|
-00000030: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000040: 20 62 2e 63 6f 6d 0d 0a  0d 0a                    | b.com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `37 / 74`
-- **Parsed Method:** `GET`
-- **Parsed URI:** `/p1_140`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `GET`
-- **Forwarded URI:** `/p1_140`
-- **Forwarded Body Length:** `0 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `true`
-
-#### Security Analysis & Root Cause
-
-HAProxy detected trailing data as part of request body or corrupted the subsequent pipelined request boundary.
-
----
-
-### Finding 083: mutated_startline_141
+### Finding 063: mutated_startline_141
 
 - **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -4191,7 +3351,7 @@ Full-buffer parse succeeded/failed differently than byte-by-byte incremental str
 
 ---
 
-### Finding 084: mutated_headers_ws_144
+### Finding 064: mutated_headers_ws_144
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -4236,93 +3396,9 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 085: mutated_pipelined_pair_153
+### Finding 065: mutated_base_160_pipelined_chunked_premature_end
 
 - **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
-- **Ambiguity Class:** Pipelined Request Boundaries
-- **Description:** Randomized pipelined pair
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 47 45 54 20 2f 70 31 5f  31 35 33 20 48 54 54 50  |GET /p1_153 HTTP|
-00000010: 2f 31 2e 31 0d 0a 48 6f  73 74 3a 20 61 2e 63 6f  |/1.1..Host: a.co|
-00000020: 6d 0d 0a 0d 0a 47 45 54  20 2f 70 32 5f 31 35 33  |m....GET /p2_153|
-00000030: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000040: 20 62 2e 63 6f 6d 0d 0a  0d 0a                    | b.com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `37 / 74`
-- **Parsed Method:** `GET`
-- **Parsed URI:** `/p1_153`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `GET`
-- **Forwarded URI:** `/p1_153`
-- **Forwarded Body Length:** `0 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `true`
-
-#### Security Analysis & Root Cause
-
-HAProxy detected trailing data as part of request body or corrupted the subsequent pipelined request boundary.
-
----
-
-### Finding 086: mutated_pipelined_pair_158
-
-- **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
-- **Ambiguity Class:** Pipelined Request Boundaries
-- **Description:** Randomized pipelined pair
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 47 45 54 20 2f 70 31 5f  31 35 38 20 48 54 54 50  |GET /p1_158 HTTP|
-00000010: 2f 31 2e 31 0d 0a 48 6f  73 74 3a 20 61 2e 63 6f  |/1.1..Host: a.co|
-00000020: 6d 0d 0a 0d 0a 47 45 54  20 2f 70 32 5f 31 35 38  |m....GET /p2_158|
-00000030: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000040: 20 62 2e 63 6f 6d 0d 0a  0d 0a                    | b.com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `37 / 74`
-- **Parsed Method:** `GET`
-- **Parsed URI:** `/p1_158`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `GET`
-- **Forwarded URI:** `/p1_158`
-- **Forwarded Body Length:** `0 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `true`
-
-#### Security Analysis & Root Cause
-
-HAProxy detected trailing data as part of request body or corrupted the subsequent pipelined request boundary.
-
----
-
-### Finding 087: mutated_base_160_pipelined_chunked_premature_end
-
-- **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
 - **Description:** Mutated byte in pipelined_chunked_premature_end
 
@@ -4359,11 +3435,11 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 #### Security Analysis & Root Cause
 
-Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Some(400), err=None
+HAProxy detected trailing data as part of request body or corrupted the subsequent pipelined request boundary.
 
 ---
 
-### Finding 088: mutated_startline_163
+### Finding 066: mutated_startline_163
 
 - **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -4402,7 +3478,7 @@ Full-buffer parse succeeded/failed differently than byte-by-byte incremental str
 
 ---
 
-### Finding 089: mutated_base_164_chunk_signed_plus
+### Finding 067: mutated_base_164_chunk_signed_plus
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -4443,7 +3519,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 090: mutated_startline_167
+### Finding 068: mutated_startline_167
 
 - **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -4482,49 +3558,7 @@ Full-buffer parse succeeded/failed differently than byte-by-byte incremental str
 
 ---
 
-### Finding 091: mutated_pipelined_pair_169
-
-- **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
-- **Ambiguity Class:** Pipelined Request Boundaries
-- **Description:** Randomized pipelined pair
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 47 45 54 20 2f 70 31 5f  31 36 39 20 48 54 54 50  |GET /p1_169 HTTP|
-00000010: 2f 31 2e 31 0d 0a 48 6f  73 74 3a 20 61 2e 63 6f  |/1.1..Host: a.co|
-00000020: 6d 0d 0a 0d 0a 47 45 54  20 2f 70 32 5f 31 36 39  |m....GET /p2_169|
-00000030: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000040: 20 62 2e 63 6f 6d 0d 0a  0d 0a                    | b.com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `37 / 74`
-- **Parsed Method:** `GET`
-- **Parsed URI:** `/p1_169`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `GET`
-- **Forwarded URI:** `/p1_169`
-- **Forwarded Body Length:** `0 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `true`
-
-#### Security Analysis & Root Cause
-
-HAProxy detected trailing data as part of request body or corrupted the subsequent pipelined request boundary.
-
----
-
-### Finding 092: mutated_startline_171
+### Finding 069: mutated_startline_171
 
 - **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -4563,9 +3597,9 @@ Full-buffer parse succeeded/failed differently than byte-by-byte incremental str
 
 ---
 
-### Finding 093: mutated_base_173_cl_te_conflicting_lengths_te_cl_smuggle
+### Finding 070: mutated_base_173_cl_te_conflicting_lengths_te_cl_smuggle
 
-- **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
+- **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Combinatorial Mutations
 - **Description:** Mutated byte in cl_te_conflicting_lengths_te_cl_smuggle
 
@@ -4602,137 +3636,11 @@ Full-buffer parse succeeded/failed differently than byte-by-byte incremental str
 
 #### Security Analysis & Root Cause
 
-Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=None, err=None
-
----
-
-### Finding 094: mutated_pipelined_pair_176
-
-- **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
-- **Ambiguity Class:** Pipelined Request Boundaries
-- **Description:** Randomized pipelined pair
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 47 45 54 20 2f 70 31 5f  31 37 36 20 48 54 54 50  |GET /p1_176 HTTP|
-00000010: 2f 31 2e 31 0d 0a 48 6f  73 74 3a 20 61 2e 63 6f  |/1.1..Host: a.co|
-00000020: 6d 0d 0a 0d 0a 47 45 54  20 2f 70 32 5f 31 37 36  |m....GET /p2_176|
-00000030: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000040: 20 62 2e 63 6f 6d 0d 0a  0d 0a                    | b.com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `37 / 74`
-- **Parsed Method:** `GET`
-- **Parsed URI:** `/p1_176`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `GET`
-- **Forwarded URI:** `/p1_176`
-- **Forwarded Body Length:** `0 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `true`
-
-#### Security Analysis & Root Cause
-
 HAProxy detected trailing data as part of request body or corrupted the subsequent pipelined request boundary.
 
 ---
 
-### Finding 095: mutated_pipelined_pair_180
-
-- **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
-- **Ambiguity Class:** Pipelined Request Boundaries
-- **Description:** Randomized pipelined pair
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 47 45 54 20 2f 70 31 5f  31 38 30 20 48 54 54 50  |GET /p1_180 HTTP|
-00000010: 2f 31 2e 31 0d 0a 48 6f  73 74 3a 20 61 2e 63 6f  |/1.1..Host: a.co|
-00000020: 6d 0d 0a 0d 0a 47 45 54  20 2f 70 32 5f 31 38 30  |m....GET /p2_180|
-00000030: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000040: 20 62 2e 63 6f 6d 0d 0a  0d 0a                    | b.com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `37 / 74`
-- **Parsed Method:** `GET`
-- **Parsed URI:** `/p1_180`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `GET`
-- **Forwarded URI:** `/p1_180`
-- **Forwarded Body Length:** `0 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `true`
-
-#### Security Analysis & Root Cause
-
-HAProxy detected trailing data as part of request body or corrupted the subsequent pipelined request boundary.
-
----
-
-### Finding 096: mutated_pipelined_pair_184
-
-- **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
-- **Ambiguity Class:** Pipelined Request Boundaries
-- **Description:** Randomized pipelined pair
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 47 45 54 20 2f 70 31 5f  31 38 34 20 48 54 54 50  |GET /p1_184 HTTP|
-00000010: 2f 31 2e 31 0d 0a 48 6f  73 74 3a 20 61 2e 63 6f  |/1.1..Host: a.co|
-00000020: 6d 0d 0a 0d 0a 47 45 54  20 2f 70 32 5f 31 38 34  |m....GET /p2_184|
-00000030: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000040: 20 62 2e 63 6f 6d 0d 0a  0d 0a                    | b.com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `37 / 74`
-- **Parsed Method:** `GET`
-- **Parsed URI:** `/p1_184`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `GET`
-- **Forwarded URI:** `/p1_184`
-- **Forwarded Body Length:** `0 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `true`
-
-#### Security Analysis & Root Cause
-
-HAProxy detected trailing data as part of request body or corrupted the subsequent pipelined request boundary.
-
----
-
-### Finding 097: mutated_startline_185
+### Finding 071: mutated_startline_185
 
 - **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -4771,49 +3679,7 @@ Full-buffer parse succeeded/failed differently than byte-by-byte incremental str
 
 ---
 
-### Finding 098: mutated_pipelined_pair_189
-
-- **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
-- **Ambiguity Class:** Pipelined Request Boundaries
-- **Description:** Randomized pipelined pair
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 47 45 54 20 2f 70 31 5f  31 38 39 20 48 54 54 50  |GET /p1_189 HTTP|
-00000010: 2f 31 2e 31 0d 0a 48 6f  73 74 3a 20 61 2e 63 6f  |/1.1..Host: a.co|
-00000020: 6d 0d 0a 0d 0a 47 45 54  20 2f 70 32 5f 31 38 39  |m....GET /p2_189|
-00000030: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000040: 20 62 2e 63 6f 6d 0d 0a  0d 0a                    | b.com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `37 / 74`
-- **Parsed Method:** `GET`
-- **Parsed URI:** `/p1_189`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `GET`
-- **Forwarded URI:** `/p1_189`
-- **Forwarded Body Length:** `0 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `true`
-
-#### Security Analysis & Root Cause
-
-HAProxy detected trailing data as part of request body or corrupted the subsequent pipelined request boundary.
-
----
-
-### Finding 099: mutated_base_190_obs_fold_first_line
+### Finding 072: mutated_base_190_obs_fold_first_line
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -4853,9 +3719,9 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 100: mutated_base_191_cl_te_multiple_te_headers
+### Finding 073: mutated_base_191_cl_te_multiple_te_headers
 
-- **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
+- **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Combinatorial Mutations
 - **Description:** Mutated byte in cl_te_multiple_te_headers
 
@@ -4893,11 +3759,11 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 #### Security Analysis & Root Cause
 
-Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Some(422), err=None
+HAProxy detected trailing data as part of request body or corrupted the subsequent pipelined request boundary.
 
 ---
 
-### Finding 101: mutated_base_198_header_nul_in_name
+### Finding 074: mutated_base_198_header_nul_in_name
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -4937,7 +3803,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 102: mutated_startline_200
+### Finding 075: mutated_startline_200
 
 - **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -4976,133 +3842,7 @@ Full-buffer parse succeeded/failed differently than byte-by-byte incremental str
 
 ---
 
-### Finding 103: mutated_pipelined_pair_201
-
-- **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
-- **Ambiguity Class:** Pipelined Request Boundaries
-- **Description:** Randomized pipelined pair
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 47 45 54 20 2f 70 31 5f  32 30 31 20 48 54 54 50  |GET /p1_201 HTTP|
-00000010: 2f 31 2e 31 0d 0a 48 6f  73 74 3a 20 61 2e 63 6f  |/1.1..Host: a.co|
-00000020: 6d 0d 0a 0d 0a 47 45 54  20 2f 70 32 5f 32 30 31  |m....GET /p2_201|
-00000030: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000040: 20 62 2e 63 6f 6d 0d 0a  0d 0a                    | b.com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `37 / 74`
-- **Parsed Method:** `GET`
-- **Parsed URI:** `/p1_201`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `GET`
-- **Forwarded URI:** `/p1_201`
-- **Forwarded Body Length:** `0 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `true`
-
-#### Security Analysis & Root Cause
-
-HAProxy detected trailing data as part of request body or corrupted the subsequent pipelined request boundary.
-
----
-
-### Finding 104: mutated_pipelined_pair_204
-
-- **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
-- **Ambiguity Class:** Pipelined Request Boundaries
-- **Description:** Randomized pipelined pair
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 47 45 54 20 2f 70 31 5f  32 30 34 20 48 54 54 50  |GET /p1_204 HTTP|
-00000010: 2f 31 2e 31 0d 0a 48 6f  73 74 3a 20 61 2e 63 6f  |/1.1..Host: a.co|
-00000020: 6d 0d 0a 0d 0a 47 45 54  20 2f 70 32 5f 32 30 34  |m....GET /p2_204|
-00000030: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000040: 20 62 2e 63 6f 6d 0d 0a  0d 0a                    | b.com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `37 / 74`
-- **Parsed Method:** `GET`
-- **Parsed URI:** `/p1_204`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `GET`
-- **Forwarded URI:** `/p1_204`
-- **Forwarded Body Length:** `0 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `true`
-
-#### Security Analysis & Root Cause
-
-HAProxy detected trailing data as part of request body or corrupted the subsequent pipelined request boundary.
-
----
-
-### Finding 105: mutated_pipelined_pair_205
-
-- **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
-- **Ambiguity Class:** Pipelined Request Boundaries
-- **Description:** Randomized pipelined pair
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 47 45 54 20 2f 70 31 5f  32 30 35 20 48 54 54 50  |GET /p1_205 HTTP|
-00000010: 2f 31 2e 31 0d 0a 48 6f  73 74 3a 20 61 2e 63 6f  |/1.1..Host: a.co|
-00000020: 6d 0d 0a 0d 0a 47 45 54  20 2f 70 32 5f 32 30 35  |m....GET /p2_205|
-00000030: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000040: 20 62 2e 63 6f 6d 0d 0a  0d 0a                    | b.com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `37 / 74`
-- **Parsed Method:** `GET`
-- **Parsed URI:** `/p1_205`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `GET`
-- **Forwarded URI:** `/p1_205`
-- **Forwarded Body Length:** `0 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `true`
-
-#### Security Analysis & Root Cause
-
-HAProxy detected trailing data as part of request body or corrupted the subsequent pipelined request boundary.
-
----
-
-### Finding 106: mutated_base_206_line_term_doubled_crlf_before_headers
+### Finding 076: mutated_base_206_line_term_doubled_crlf_before_headers
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -5140,49 +3880,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 107: mutated_pipelined_pair_207
-
-- **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
-- **Ambiguity Class:** Pipelined Request Boundaries
-- **Description:** Randomized pipelined pair
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 47 45 54 20 2f 70 31 5f  32 30 37 20 48 54 54 50  |GET /p1_207 HTTP|
-00000010: 2f 31 2e 31 0d 0a 48 6f  73 74 3a 20 61 2e 63 6f  |/1.1..Host: a.co|
-00000020: 6d 0d 0a 0d 0a 47 45 54  20 2f 70 32 5f 32 30 37  |m....GET /p2_207|
-00000030: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000040: 20 62 2e 63 6f 6d 0d 0a  0d 0a                    | b.com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `37 / 74`
-- **Parsed Method:** `GET`
-- **Parsed URI:** `/p1_207`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `GET`
-- **Forwarded URI:** `/p1_207`
-- **Forwarded Body Length:** `0 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `true`
-
-#### Security Analysis & Root Cause
-
-HAProxy detected trailing data as part of request body or corrupted the subsequent pipelined request boundary.
-
----
-
-### Finding 108: mutated_base_208_obs_fold_tab_continuation
+### Finding 077: mutated_base_208_obs_fold_tab_continuation
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -5222,7 +3920,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 109: mutated_base_209_oversized_header_count_120
+### Finding 078: mutated_base_209_oversized_header_count_120
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -5494,7 +4192,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 110: mutated_base_211_duplicate_cl_identical
+### Finding 079: mutated_base_211_duplicate_cl_identical
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -5535,49 +4233,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Non
 
 ---
 
-### Finding 111: mutated_pipelined_pair_214
-
-- **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
-- **Ambiguity Class:** Pipelined Request Boundaries
-- **Description:** Randomized pipelined pair
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 47 45 54 20 2f 70 31 5f  32 31 34 20 48 54 54 50  |GET /p1_214 HTTP|
-00000010: 2f 31 2e 31 0d 0a 48 6f  73 74 3a 20 61 2e 63 6f  |/1.1..Host: a.co|
-00000020: 6d 0d 0a 0d 0a 47 45 54  20 2f 70 32 5f 32 31 34  |m....GET /p2_214|
-00000030: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000040: 20 62 2e 63 6f 6d 0d 0a  0d 0a                    | b.com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `37 / 74`
-- **Parsed Method:** `GET`
-- **Parsed URI:** `/p1_214`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `GET`
-- **Forwarded URI:** `/p1_214`
-- **Forwarded Body Length:** `0 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `true`
-
-#### Security Analysis & Root Cause
-
-HAProxy detected trailing data as part of request body or corrupted the subsequent pipelined request boundary.
-
----
-
-### Finding 112: mutated_headers_ws_215
+### Finding 080: mutated_headers_ws_215
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -5621,7 +4277,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 113: mutated_startline_217
+### Finding 081: mutated_startline_217
 
 - **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -5660,7 +4316,7 @@ Full-buffer parse succeeded/failed differently than byte-by-byte incremental str
 
 ---
 
-### Finding 114: mutated_startline_218
+### Finding 082: mutated_startline_218
 
 - **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -5699,7 +4355,7 @@ Full-buffer parse succeeded/failed differently than byte-by-byte incremental str
 
 ---
 
-### Finding 115: mutated_startline_220
+### Finding 083: mutated_startline_220
 
 - **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -5737,7 +4393,7 @@ Full-buffer parse succeeded/failed differently than byte-by-byte incremental str
 
 ---
 
-### Finding 116: mutated_base_221_cl_te_both_present_te_first
+### Finding 084: mutated_base_221_cl_te_both_present_te_first
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -5779,49 +4435,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 117: mutated_pipelined_pair_223
-
-- **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
-- **Ambiguity Class:** Pipelined Request Boundaries
-- **Description:** Randomized pipelined pair
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 47 45 54 20 2f 70 31 5f  32 32 33 20 48 54 54 50  |GET /p1_223 HTTP|
-00000010: 2f 31 2e 31 0d 0a 48 6f  73 74 3a 20 61 2e 63 6f  |/1.1..Host: a.co|
-00000020: 6d 0d 0a 0d 0a 47 45 54  20 2f 70 32 5f 32 32 33  |m....GET /p2_223|
-00000030: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000040: 20 62 2e 63 6f 6d 0d 0a  0d 0a                    | b.com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `37 / 74`
-- **Parsed Method:** `GET`
-- **Parsed URI:** `/p1_223`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `GET`
-- **Forwarded URI:** `/p1_223`
-- **Forwarded Body Length:** `0 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `true`
-
-#### Security Analysis & Root Cause
-
-HAProxy detected trailing data as part of request body or corrupted the subsequent pipelined request boundary.
-
----
-
-### Finding 118: mutated_base_226_duplicate_cl_identical
+### Finding 085: mutated_base_226_duplicate_cl_identical
 
 - **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -5862,9 +4476,9 @@ Full-buffer parse succeeded/failed differently than byte-by-byte incremental str
 
 ---
 
-### Finding 119: mutated_base_227_te_prefix_unknown_encoding
+### Finding 086: mutated_base_227_te_prefix_unknown_encoding
 
-- **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
+- **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Combinatorial Mutations
 - **Description:** Mutated byte in te_prefix_unknown_encoding
 
@@ -5899,53 +4513,11 @@ Full-buffer parse succeeded/failed differently than byte-by-byte incremental str
 
 #### Security Analysis & Root Cause
 
-Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Some(400), err=None
-
----
-
-### Finding 120: mutated_pipelined_pair_229
-
-- **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
-- **Ambiguity Class:** Pipelined Request Boundaries
-- **Description:** Randomized pipelined pair
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 47 45 54 20 2f 70 31 5f  32 32 39 20 48 54 54 50  |GET /p1_229 HTTP|
-00000010: 2f 31 2e 31 0d 0a 48 6f  73 74 3a 20 61 2e 63 6f  |/1.1..Host: a.co|
-00000020: 6d 0d 0a 0d 0a 47 45 54  20 2f 70 32 5f 32 32 39  |m....GET /p2_229|
-00000030: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000040: 20 62 2e 63 6f 6d 0d 0a  0d 0a                    | b.com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `37 / 74`
-- **Parsed Method:** `GET`
-- **Parsed URI:** `/p1_229`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `GET`
-- **Forwarded URI:** `/p1_229`
-- **Forwarded Body Length:** `0 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `true`
-
-#### Security Analysis & Root Cause
-
 HAProxy detected trailing data as part of request body or corrupted the subsequent pipelined request boundary.
 
 ---
 
-### Finding 121: mutated_headers_ws_230
+### Finding 087: mutated_headers_ws_230
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -5993,49 +4565,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 122: mutated_pipelined_pair_231
-
-- **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
-- **Ambiguity Class:** Pipelined Request Boundaries
-- **Description:** Randomized pipelined pair
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 47 45 54 20 2f 70 31 5f  32 33 31 20 48 54 54 50  |GET /p1_231 HTTP|
-00000010: 2f 31 2e 31 0d 0a 48 6f  73 74 3a 20 61 2e 63 6f  |/1.1..Host: a.co|
-00000020: 6d 0d 0a 0d 0a 47 45 54  20 2f 70 32 5f 32 33 31  |m....GET /p2_231|
-00000030: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000040: 20 62 2e 63 6f 6d 0d 0a  0d 0a                    | b.com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `37 / 74`
-- **Parsed Method:** `GET`
-- **Parsed URI:** `/p1_231`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `GET`
-- **Forwarded URI:** `/p1_231`
-- **Forwarded Body Length:** `0 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `true`
-
-#### Security Analysis & Root Cause
-
-HAProxy detected trailing data as part of request body or corrupted the subsequent pipelined request boundary.
-
----
-
-### Finding 123: mutated_headers_ws_233
+### Finding 088: mutated_headers_ws_233
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -6080,49 +4610,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 124: mutated_pipelined_pair_237
-
-- **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
-- **Ambiguity Class:** Pipelined Request Boundaries
-- **Description:** Randomized pipelined pair
-
-#### Raw Input Hex Dump
-
-```text
-00000000: 47 45 54 20 2f 70 31 5f  32 33 37 20 48 54 54 50  |GET /p1_237 HTTP|
-00000010: 2f 31 2e 31 0d 0a 48 6f  73 74 3a 20 61 2e 63 6f  |/1.1..Host: a.co|
-00000020: 6d 0d 0a 0d 0a 47 45 54  20 2f 70 32 5f 32 33 37  |m....GET /p2_237|
-00000030: 20 48 54 54 50 2f 31 2e  31 0d 0a 48 6f 73 74 3a  | HTTP/1.1..Host:|
-00000040: 20 62 2e 63 6f 6d 0d 0a  0d 0a                    | b.com....|
-```
-
-#### Ibex Behavior
-
-- **Accepted:** `true`
-- **Phase:** `Done`
-- **Consumed Bytes:** `37 / 74`
-- **Parsed Method:** `GET`
-- **Parsed URI:** `/p1_237`
-- **Body Length:** `0 bytes`
-- **Connection Close Set:** `false`
-
-#### HAProxy Behavior
-
-- **Accepted:** `true`
-- **HTTP Status Code:** `Some(200)`
-- **Forwarded Method:** `GET`
-- **Forwarded URI:** `/p1_237`
-- **Forwarded Body Length:** `0 bytes`
-- **Saw Sentinel Next Request:** `false`
-- **Next Request Smuggled / Desynced:** `true`
-
-#### Security Analysis & Root Cause
-
-HAProxy detected trailing data as part of request body or corrupted the subsequent pipelined request boundary.
-
----
-
-### Finding 125: mutated_startline_240
+### Finding 089: mutated_startline_240
 
 - **Category:** Self-Differential Disagreement (Ibex Inconsistent Across Streaming Modes)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -6161,7 +4649,7 @@ Full-buffer parse succeeded/failed differently than byte-by-byte incremental str
 
 ---
 
-### Finding 126: mutated_headers_ws_245
+### Finding 090: mutated_headers_ws_245
 
 - **Category:** Category 1: Acceptance Disagreement (Accepted vs Rejected)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -6208,7 +4696,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 ---
 
-### Finding 127: mutated_base_247_pipelined_standard_two_requests
+### Finding 091: mutated_base_247_pipelined_standard_two_requests
 
 - **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
 - **Ambiguity Class:** Combinatorial Mutations
@@ -6242,7 +4730,49 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 - **Forwarded URI:** `/first`
 - **Forwarded Body Length:** `0 bytes`
 - **Saw Sentinel Next Request:** `true`
-- **Next Request Smuggled / Desynced:** `true`
+- **Next Request Smuggled / Desynced:** `false`
+
+#### Security Analysis & Root Cause
+
+HAProxy detected trailing data as part of request body or corrupted the subsequent pipelined request boundary.
+
+---
+
+### Finding 092: mutated_base_248_cl_comma_separated_conflicting
+
+- **Category:** Category 3: Request Smuggling Boundary Finding (Next Request Desync)
+- **Ambiguity Class:** Combinatorial Mutations
+- **Description:** Mutated byte in cl_comma_separated_conflicting
+
+#### Raw Input Hex Dump
+
+```text
+00000000: 50 4f 53 54 20 2f 63 6f  6d 6d 61 2d 63 6f 6e 66  |POST /comma-conf|
+00000010: 6c 69 63 74 20 48 54 54  50 2f 31 2e 31 0d 0a 48  |lict HTTP/1.1..H|
+00000020: 6f 73 74 3a 20 65 78 61  6d 70 6c 65 2e 63 6f 6d  |ost: example.com|
+00000030: 0d 0a 43 6f 6e 74 65 6e  74 2d 4c 65 6e 3a 74 68  |..Content-Len:th|
+00000040: 3a 20 35 2c 20 31 30 0d  0a 0d 0a 68 65 6c 6c 6f  |: 5, 10....hello|
+```
+
+#### Ibex Behavior
+
+- **Accepted:** `true`
+- **Phase:** `Done`
+- **Consumed Bytes:** `75 / 80`
+- **Parsed Method:** `POST`
+- **Parsed URI:** `/comma-conflict`
+- **Body Length:** `0 bytes`
+- **Connection Close Set:** `false`
+
+#### HAProxy Behavior
+
+- **Accepted:** `true`
+- **HTTP Status Code:** `Some(200)`
+- **Forwarded Method:** `POST`
+- **Forwarded URI:** `/comma-conflict`
+- **Forwarded Body Length:** `0 bytes`
+- **Saw Sentinel Next Request:** `true`
+- **Next Request Smuggled / Desynced:** `false`
 
 #### Security Analysis & Root Cause
 

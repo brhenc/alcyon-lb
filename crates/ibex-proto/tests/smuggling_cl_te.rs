@@ -148,3 +148,20 @@ fn ordinary_content_length_still_works() {
     assert!(!rejects(b"GET /x HTTP/1.1\r\nHost: h\r\n\r\n"));
     assert!(!rejects(b"POST /x HTTP/1.1\r\nHost: h\r\nContent-Length: 0\r\n\r\n"));
 }
+
+#[test]
+fn identical_comma_separated_content_lengths_are_accepted() {
+    // RFC 9112 6.3: a list of identical values may be treated as that single value.
+    // HAProxy 3.5 accepts `Content-Length: 5, 5` and forwards a 5-byte body.
+    assert!(!rejects(
+        b"POST /x HTTP/1.1\r\nHost: h\r\nContent-Length: 5, 5\r\n\r\nhello"
+    ));
+}
+
+#[test]
+fn differing_comma_separated_content_lengths_are_rejected() {
+    // Same desync as two conflicting headers, just spelled differently.
+    assert!(rejects(
+        b"POST /x HTTP/1.1\r\nHost: h\r\nContent-Length: 5, 6\r\n\r\nhello"
+    ));
+}

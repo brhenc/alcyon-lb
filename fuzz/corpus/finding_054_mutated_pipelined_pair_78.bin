@@ -1,6 +1,0 @@
-GET /p1_78 HTTP/1.1
-Host: a.com
-
-GET /p2_78 HTTP/1.1
-Host: b.com
-

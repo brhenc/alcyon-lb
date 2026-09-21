@@ -303,14 +303,40 @@ impl H1Parser {
                 continue;
             }
             let raw = h.value.trim();
-            if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
+
+            // RFC 9112 6.3 permits a Content-Length whose field-value is a
+            // comma-separated list, provided every element is the same decimal value;
+            // the recipient may then treat it as that single value. HAProxy 3.5 accepts
+            // `Content-Length: 5, 5` and forwards a 5-byte body, so rejecting it would
+            // refuse traffic the reference serves.
+            //
+            // Differing values in the list are still fatal: that is the same desync as
+            // two conflicting Content-Length headers.
+            let mut parts = raw.split(',').map(str::trim);
+            let Some(first) = parts.next() else {
+                self.phase = H1Phase::Error;
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "empty Content-Length",
+                ));
+            };
+            if first.is_empty() || !first.bytes().all(|b| b.is_ascii_digit()) {
                 self.phase = H1Phase::Error;
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "invalid Content-Length value",
                 ));
             }
-            let Ok(len) = raw.parse::<usize>() else {
+            for p in parts {
+                if p != first {
+                    self.phase = H1Phase::Error;
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "conflicting Content-Length list values",
+                    ));
+                }
+            }
+            let Ok(len) = first.parse::<usize>() else {
                 self.phase = H1Phase::Error;
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
