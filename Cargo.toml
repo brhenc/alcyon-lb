@@ -4,6 +4,7 @@ members = [
     "crates/ebtree",
     "crates/ibex-sched",
     "crates/ibex-proto",
+    "crates/ibex-rt",
 ]
 
 # The ibex-* scaffold crates below are superseded by design/ and are excluded from the

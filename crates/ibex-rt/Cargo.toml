@@ -1,0 +1,18 @@
+[package]
+name = "ibex-rt"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+description = "Ibex runtime: thread-per-core poller, listeners, and the accept path"
+
+[dependencies]
+ibex-sched = { path = "../ibex-sched" }
+ibex-proto = { path = "../ibex-proto" }
+rustix = { version = "0.38", features = ["event", "net", "fs", "process", "std"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
