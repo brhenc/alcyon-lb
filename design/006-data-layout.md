@@ -23,6 +23,48 @@ both.
 
 128 and 64 are not coincidences. HAProxy sized these deliberately.
 
+Confirmed against the running binary (3.5-dev7, built locally, `show pools`):
+
+```
+- Pool task       (128 bytes/64)
+- Pool tasklet     (64 bytes/64)
+- Pool session    (184 bytes/8)
+- Pool connection (264 bytes/64)
+- Pool stream    (1056 bytes/8)
+```
+
+And via `gdb -ex "print sizeof(...)"` for the non-pooled objects:
+
+| Structure | Size |
+|---|---|
+| `struct server` | **3456 B** |
+| `struct proxy` | **2560 B** |
+| `struct check` | 664 B (two are embedded per server) |
+
+## 1.1 The 60k-backend budget
+
+Operators run tens of thousands of backends per process, and this is the arithmetic that
+decides whether that is possible:
+
+| At 60,000 servers | HAProxy |
+|---|---|
+| `struct server` | 60k x 3456 = **207 MB** |
+| check tasks | 60k x 128 = 7.7 MB |
+| **dominant cost** | **`struct server`, by ~27x over its tasks** |
+
+The scheduler is *not* where this budget goes. Shrinking the task from 128 B to 32 B
+saves ~6 MB at 60k — worth having, not decisive. **`struct server` is the battleground**,
+and roughly 1328 of its 3456 bytes are two embedded `struct check` (most servers never
+use an agent check), with more going to inline name/cookie arrays, per-server counters,
+and SSL fields present whether or not SSL is configured.
+
+The Rust moves are available and ordinary: `Option<Box<Check>>` for the agent check,
+interned strings as `u32` indices, counters in a side array (which also makes stats
+sweeps sequential instead of pointer-chasing), TLS state behind an `Option`. A 512-byte
+server would put 60k at **31 MB against HAProxy's 207 MB**. That is the single largest
+measured win available in the whole project, and it is a data-structure decision, not a
+code one. Deferred to its own document once the server model exists.
+
 ## 2. Why HAProxy uses a function pointer, and why we should not
 
 `TASK_COMMON` carries:
@@ -180,7 +222,60 @@ the disabled path out of the hot instruction cache.
 Tier 4 is the per-connection idea, implemented so that unmarked connections pay one
 predicted branch rather than a permanent layout tax.
 
-## 6. Consequences for the scheduler
+## 6. The production task: 32 bytes
+
+HAProxy's `struct task` is 128 B because it embeds both `eb32_node`s (40 B each),
+allocated whether or not the task is queued. Ours references the ebtree arenas instead,
+and packs the work kind:
+
+```rust
+#[repr(C)]
+pub struct Task {
+    state:    u32,      // 4   TASK_* flags
+    kind:     WorkKind, // 4   packed: 8-bit tag + 24-bit index
+    expire:   Tick,     // 4   wrapping 32-bit ms
+    rq_ref:   NodeRef,  // 4   run-queue arena index; NONE = not queued
+    wq_ref:   NodeRef,  // 4   wait-queue arena index; NONE = not queued
+    caller:   CallSite, // 4   index into a static call-site registry
+    nice:     i16,      // 2
+    last_run: u16,      // 2   anti-double-run guard (src/task.c:543)
+    tid:      i16,      // 2
+    _pad:     u16,      // 2
+}                       // = 32 bytes exactly
+```
+
+**32 bytes: two tasks per cache line, against HAProxy's two cache lines per task — 4x.**
+
+Three decisions inside that:
+
+- **`WorkKind` is packed into 4 bytes**, an 8-bit tag plus a 24-bit index (16.7M objects
+  per kind, against a 60k target). Unpacking costs a shift and a mask, roughly one cycle,
+  set against a potential cache miss of two hundred. The same tagged-index technique as
+  `Branch`/`Parent` in the ebtree.
+- **`last_run` is kept**, because it is not accounting. `src/task.c:543` compares it
+  against the poll-loop counter to stop a task running twice in one pass — an
+  anti-starvation guard. `calls` sits beside it in the same dispatch path and *is* pure
+  accounting, so that one is gated.
+- **`caller` is kept and always on**, as a 4-byte registry index rather than C's 8-byte
+  pointer. HAProxy spends 8 bytes per task unconditionally to record the last wakeup's
+  call site; at half the cost it fits inside the 32-byte budget, so diagnosing a stuck
+  task in production stays possible without a debug build.
+
+Queued cost, for comparison — HAProxy pays 128 B whether queued or not, while ours pays
+only for the queues actually joined:
+
+| State | HAProxy | Ibex |
+|---|---|---|
+| Not queued | 128 B | **32 B** |
+| In run queue | 128 B | 32 + 28 = **60 B** |
+| In both queues | 128 B | 32 + 28 + 28 = **88 B** |
+
+The second-order effect matters more than the bytes. At 60k health-check tasks waiting on
+timers, HAProxy's wait-queue walk traverses 60k `eb32_node`s scattered across 7.7 MB of
+independently pooled tasks. Ours traverses a dense 1.68 MB arena. **Same traversal, a
+4.6x smaller working set** — and the timer tree is the hot structure at that scale.
+
+## 7. Consequences for the scheduler
 
 - Work kind is an **enum with a `u32` payload** (8 B), not a function pointer, not a
   boxed trait object. Smaller and faster than the C it replaces.
