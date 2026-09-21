@@ -551,6 +551,44 @@ fn main() {
         }
     };
 
+    // 5b. Refuse a config that asks for TLS we cannot provide.
+    //
+    // `ibex-config` parses `bind ... ssl crt <file>`, but `ibex-rt` does not yet depend
+    // on `ibex-tls`, so the flag reaches no transport. Starting anyway would bind :443,
+    // report success, and serve **plaintext** to clients that believe they negotiated
+    // TLS -- silently downgrading every connection on that listener.
+    //
+    // Failing closed is the only safe behaviour while the wiring is missing. Delete this
+    // guard in the same change that makes `ibex-rt` actually use `ibex-tls`.
+    //
+    // Only `frontend` sections can carry bind options; `listen` has no `ssl` field.
+    {
+        let tls_binds: Vec<String> = config
+            .frontends
+            .iter()
+            .flat_map(|f| {
+                f.binds
+                    .iter()
+                    .filter(|b| b.ssl)
+                    .map(move |b| format!("frontend '{}': bind {} ssl", f.name, b.addr))
+            })
+            .collect();
+
+        if !tls_binds.is_empty() {
+            eprintln!("Configuration error: TLS is configured but not supported by this build.");
+            for b in &tls_binds {
+                eprintln!("  {b}");
+            }
+            eprintln!(
+                "\nThe 'ssl' bind option is parsed but no TLS transport is wired into the \
+                 runtime,\nso these listeners would accept connections and serve plaintext. \
+                 Refusing to\nstart rather than silently downgrading them.\n\n\
+                 Remove 'ssl' from the bind line(s) to run without encryption."
+            );
+            process::exit(1);
+        }
+    }
+
     // 6. Apply command-line maxconn override (-n <maxconn>)
     if let Some(mc) = opts.maxconn {
         for listen in &mut config.listens {
