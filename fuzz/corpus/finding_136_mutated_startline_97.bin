@@ -1,0 +1,3 @@
+PROPFIND /index.html HTTP/0.9
+Host: example.com
+

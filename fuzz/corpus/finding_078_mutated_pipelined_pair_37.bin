@@ -1,0 +1,6 @@
+GET /p1_37 HTTP/1.1
+Host: a.com
+
+GET /p2_37 HTTP/1.1
+Host: b.com
+

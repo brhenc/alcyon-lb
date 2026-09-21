@@ -1,0 +1,16 @@
+POST /mut-chunk HTTP/1.1
+Host: example.com
+Transfer-Encoding: chunked
+
+7
+abcdefg
+C
+abcdefghijkl
+3
+abc
+3
+abc
+10
+abcdefghijklmnop
+0
+

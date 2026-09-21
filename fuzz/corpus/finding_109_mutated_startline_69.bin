@@ -1,0 +1,3 @@
+GET /api/v1/resource HTTP/1.2
+Host: example.com
+

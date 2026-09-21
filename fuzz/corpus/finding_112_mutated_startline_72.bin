@@ -1,0 +1,3 @@
+DELETE /api/v1/resource HTTP/0.9
+Host: example.com
+

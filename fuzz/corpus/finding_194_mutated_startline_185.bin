@@ -1,0 +1,3 @@
+PUT /%20encoded%20 HTTP/2.0
+Host: example.com
+

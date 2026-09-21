@@ -1,0 +1,234 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+//! Ibex HTTP/1 Parser Differential Fuzzing Harness.
+//!
+//! Compares Ibex's HTTP/1 parser (`crates/ibex-proto`) against HAProxy 3.5 (`/home/bhenc/reference/haproxy/haproxy`)
+//! and against itself across equivalent streaming inputs.
+
+#![forbid(unsafe_code)]
+
+mod diff;
+mod generator;
+mod oracle_haproxy;
+mod oracle_ibex;
+mod reporter;
+
+use diff::compare_results;
+use generator::{generate_mutated_cases, generate_structured_corpus};
+use oracle_haproxy::HaproxyOracle;
+use oracle_ibex::parse_with_ibex;
+use reporter::{generate_findings_markdown, save_corpus};
+use std::env;
+use std::fs;
+use std::path::PathBuf;
+use std::time::Instant;
+
+struct Config {
+    haproxy_bin: PathBuf,
+    corpus_dir: PathBuf,
+    findings_file: PathBuf,
+    mutated_count: usize,
+    seed: u64,
+    soak: bool,
+}
+
+fn parse_args() -> Config {
+    let args: Vec<String> = env::args().collect();
+    let mut haproxy_bin = PathBuf::from("/home/bhenc/reference/haproxy/haproxy");
+    let mut corpus_dir = PathBuf::from("/home/bhenc/project-ibex/fuzz/corpus");
+    let mut findings_file = PathBuf::from("/home/bhenc/project-ibex/fuzz/FINDINGS.md");
+    let mut mutated_count = 250;
+    let mut seed = 42;
+    let mut soak = false;
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--haproxy" => {
+                if i + 1 < args.len() {
+                    haproxy_bin = PathBuf::from(&args[i + 1]);
+                    i += 1;
+                }
+            }
+            "--corpus-dir" => {
+                if i + 1 < args.len() {
+                    corpus_dir = PathBuf::from(&args[i + 1]);
+                    i += 1;
+                }
+            }
+            "--findings-file" => {
+                if i + 1 < args.len() {
+                    findings_file = PathBuf::from(&args[i + 1]);
+                    i += 1;
+                }
+            }
+            "--iters" => {
+                if i + 1 < args.len() {
+                    if let Ok(val) = args[i + 1].parse::<usize>() {
+                        mutated_count = val;
+                    }
+                    i += 1;
+                }
+            }
+            "--seed" => {
+                if i + 1 < args.len() {
+                    if let Ok(val) = args[i + 1].parse::<u64>() {
+                        seed = val;
+                    }
+                    i += 1;
+                }
+            }
+            "--soak" => {
+                soak = true;
+                mutated_count = 2500;
+            }
+            "--help" | "-h" => {
+                println!("Usage: ibex-fuzz [OPTIONS]");
+                println!("Options:");
+                println!("  --haproxy <PATH>        Path to HAProxy binary (default: /home/bhenc/reference/haproxy/haproxy)");
+                println!("  --corpus-dir <PATH>     Directory to save discrepancy inputs (default: /home/bhenc/project-ibex/fuzz/corpus)");
+                println!("  --findings-file <PATH>  Output markdown report (default: /home/bhenc/project-ibex/fuzz/FINDINGS.md)");
+                println!("  --iters <N>             Number of mutated cases to generate (default: 250)");
+                println!("  --seed <U64>            Random seed for deterministic generation (default: 42)");
+                println!("  --soak                  Run soak test with 2500+ iterations");
+                std::process::exit(0);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    Config {
+        haproxy_bin,
+        corpus_dir,
+        findings_file,
+        mutated_count,
+        seed,
+        soak,
+    }
+}
+
+fn main() {
+    let start_time = Instant::now();
+    let config = parse_args();
+
+    println!("================================================================================");
+    println!("  Ibex HTTP/1 Parser Differential Fuzzing Harness");
+    println!("================================================================================");
+    println!("  Architecture: Hand-rolled Structured & Combinatorial Property Generator");
+    println!("  Rationale:    Strict `#![forbid(unsafe_code)]` in Safe Stable Rust");
+    println!("  Oracle:       HAProxy 3.5 ({})", config.haproxy_bin.display());
+    println!("  Corpus Dir:   {}", config.corpus_dir.display());
+    println!("  Findings Doc: {}", config.findings_file.display());
+    println!("  Mode:         {}", if config.soak { "SOAK TEST (extended)" } else { "CI DEFAULT (under 2 min)" });
+    println!("  Random Seed:  {}", config.seed);
+    println!("================================================================================\n");
+
+    // 1. Initialize HAProxy Oracle on dynamic ephemeral ports
+    print!("[+] Initializing HAProxy 3.5 Oracle on dynamic ephemeral ports... ");
+    let mut haproxy = match HaproxyOracle::new(&config.haproxy_bin) {
+        Ok(h) => {
+            println!("READY.");
+            h
+        }
+        Err(e) => {
+            eprintln!("\n[-] Failed to initialize HAProxy Oracle: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    // 2. Generate Structured Test Cases
+    println!("[+] Generating structured test cases targeting framing ambiguity classes...");
+    let mut test_cases = generate_structured_corpus();
+    let structured_count = test_cases.len();
+    println!("    Generated {structured_count} structured CVE-class test cases.");
+
+    // 3. Generate Combinatorial Mutation Cases
+    println!("[+] Generating {} combinatorial mutation test cases (seed: {})...", config.mutated_count, config.seed);
+    let mutated_cases = generate_mutated_cases(config.seed, config.mutated_count);
+    test_cases.extend(mutated_cases);
+    let total_count = test_cases.len();
+    println!("    Total test cases to evaluate: {total_count}");
+
+    // 4. Run Differential Testing Loop
+    println!("\n[+] Running differential comparisons...");
+    let mut findings = Vec::new();
+    let mut accepted_both = 0;
+    let mut rejected_both = 0;
+    let mut finding_id_seq = 1;
+
+    for (idx, tc) in test_cases.iter().enumerate() {
+        // Evaluate with Ibex
+        let ibex_res = parse_with_ibex(&tc.raw_bytes);
+
+        // Evaluate with HAProxy (and sentinel request boundary check)
+        let haproxy_res = haproxy.test_input(&tc.raw_bytes, !tc.is_pipelined);
+
+        if ibex_res.accepted && haproxy_res.accepted {
+            accepted_both += 1;
+        } else if !ibex_res.accepted && !haproxy_res.accepted {
+            rejected_both += 1;
+        }
+
+        // Compare results
+        if let Some(finding) = compare_results(finding_id_seq, tc, &ibex_res, &haproxy_res) {
+            println!(
+                "  [!] Discrepancy #{:03} found on '{}': {}",
+                finding.id, tc.name, finding.category.as_str()
+            );
+            findings.push(finding);
+            finding_id_seq += 1;
+        }
+
+        if (idx + 1) % 50 == 0 || idx + 1 == total_count {
+            print!("    Processed {} / {} cases...\r", idx + 1, total_count);
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        }
+    }
+    println!("\n    Completed evaluation of {total_count} test cases in {:.2?}s.", start_time.elapsed());
+
+    // 5. Save Corpus Artifacts
+    print!("[+] Saving discrepancy inputs to corpus directory... ");
+    if let Err(e) = save_corpus(&config.corpus_dir, &findings) {
+        eprintln!("\n[-] Warning: Failed to save corpus: {e}");
+    } else {
+        println!("SAVED {} files.", findings.len());
+    }
+
+    // 6. Generate and Write FINDINGS.md
+    print!("[+] Generating and writing {}... ", config.findings_file.display());
+    let findings_md = generate_findings_markdown(total_count, accepted_both, rejected_both, &findings);
+    if let Err(e) = fs::write(&config.findings_file, findings_md) {
+        eprintln!("\n[-] Warning: Failed to write findings markdown: {e}");
+    } else {
+        println!("DONE.");
+    }
+
+    // 7. Print Final Summary Table
+    let mut cat1 = 0;
+    let mut cat2 = 0;
+    let mut cat3 = 0;
+    let mut self_diff = 0;
+
+    for f in &findings {
+        match f.category {
+            diff::DiscrepancyCategory::Category1Acceptance => cat1 += 1,
+            diff::DiscrepancyCategory::Category2Framing => cat2 += 1,
+            diff::DiscrepancyCategory::Category3SmugglingBoundary => cat3 += 1,
+            diff::DiscrepancyCategory::SelfDifferential => self_diff += 1,
+        }
+    }
+
+    println!("\n================================================================================");
+    println!("  DIFFERENTIAL FUZZING RESULTS SUMMARY");
+    println!("================================================================================");
+    println!("  Total Cases Evaluated:       {total_count}");
+    println!("  Accepted by Both:            {accepted_both}");
+    println!("  Rejected by Both:            {rejected_both}");
+    println!("  Total Disagreements:         {}", findings.len());
+    println!("    - Category 1 (Acceptance): {cat1}");
+    println!("    - Category 2 (Framing):    {cat2}");
+    println!("    - Category 3 (Smuggling):  {cat3}");
+    println!("    - Self-Differential:       {self_diff}");
+    println!("  Elapsed Duration:            {:.2?}", start_time.elapsed());
+    println!("================================================================================\n");
+}

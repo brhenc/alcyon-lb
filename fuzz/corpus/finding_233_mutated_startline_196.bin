@@ -1,0 +1,3 @@
+PATCH /api/v1/resource HTTP/1.0
+Host: example.com
+

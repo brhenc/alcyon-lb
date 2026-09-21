@@ -1,0 +1,4 @@
+GET /empty-name HTTP/1.1
+Host: example.com
+: empty-name-value
+
