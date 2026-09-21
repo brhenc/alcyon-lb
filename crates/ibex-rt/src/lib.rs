@@ -11,10 +11,16 @@
 
 #![forbid(unsafe_code)]
 
+pub mod buf;
 pub mod fdtab;
 pub mod listener;
 pub mod poller;
+pub mod proxy;
+pub mod raw;
 
 pub use fdtab::{FdTab, FdState, Interest};
 pub use listener::Listener;
+pub use buf::Buf;
 pub use poller::{Event, Poller};
+pub use proxy::{Ending, TcpSession, Timeouts, Want, Which};
+pub use raw::Io;

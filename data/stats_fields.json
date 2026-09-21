@@ -1,2374 +1,1910 @@
-{
-  "static_fields": [
-    {
-      "index": 0,
-      "enum_name": "ST_I_PX_PXNAME",
-      "name": "pxname",
-      "alt_name": null,
-      "desc": "Proxy name",
-      "type": "str",
-      "scopes": [
-        "frontend",
-        "backend",
-        "server",
-        "listener"
-      ],
-      "cap": null,
-      "file": "src/stats-proxy.c",
-      "line": 80,
-      "citation": "src/stats-proxy.c:80"
-    },
-    {
-      "index": 1,
-      "enum_name": "ST_I_PX_SVNAME",
-      "name": "svname",
-      "alt_name": null,
-      "desc": "Server name",
-      "type": "str",
-      "scopes": [
-        "frontend",
-        "backend",
-        "server",
-        "listener"
-      ],
-      "cap": null,
-      "file": "src/stats-proxy.c",
-      "line": 81,
-      "citation": "src/stats-proxy.c:81"
-    },
-    {
-      "index": 2,
-      "enum_name": "ST_I_PX_QCUR",
-      "name": "qcur",
-      "alt_name": "current_queue",
-      "desc": "Number of current queued connections",
-      "type": "u32",
-      "scopes": [
-        "backend",
-        "server"
-      ],
-      "cap": "STATS_PX_CAP___BS",
-      "file": "src/stats-proxy.c",
-      "line": 82,
-      "citation": "src/stats-proxy.c:82"
-    },
-    {
-      "index": 3,
-      "enum_name": "ST_I_PX_QMAX",
-      "name": "qmax",
-      "alt_name": "max_queue",
-      "desc": "Highest value of queued connections encountered since process started",
-      "type": "u32",
-      "scopes": [
-        "backend",
-        "server"
-      ],
-      "cap": "STATS_PX_CAP___BS",
-      "file": "src/stats-proxy.c",
-      "line": 83,
-      "citation": "src/stats-proxy.c:83"
-    },
-    {
-      "index": 4,
-      "enum_name": "ST_I_PX_SCUR",
-      "name": "scur",
-      "alt_name": "current_sessions",
-      "desc": "Number of current sessions on the frontend, backend or server",
-      "type": "u32",
-      "scopes": [
-        "frontend",
-        "backend",
-        "server",
-        "listener"
-      ],
-      "cap": "STATS_PX_CAP_LFBS",
-      "file": "src/stats-proxy.c",
-      "line": 84,
-      "citation": "src/stats-proxy.c:84"
-    },
-    {
-      "index": 5,
-      "enum_name": "ST_I_PX_SMAX",
-      "name": "smax",
-      "alt_name": "max_sessions",
-      "desc": "Highest value of current sessions encountered since process started",
-      "type": "u32",
-      "scopes": [
-        "frontend",
-        "backend",
-        "server",
-        "listener"
-      ],
-      "cap": "STATS_PX_CAP_LFBS",
-      "file": "src/stats-proxy.c",
-      "line": 85,
-      "citation": "src/stats-proxy.c:85"
-    },
-    {
-      "index": 6,
-      "enum_name": "ST_I_PX_SLIM",
-      "name": "slim",
-      "alt_name": "limit_sessions",
-      "desc": "Frontend/listener/server's maxconn, backend's fullconn",
-      "type": "u32",
-      "scopes": [
-        "frontend",
-        "backend",
-        "server",
-        "listener"
-      ],
-      "cap": "STATS_PX_CAP_LFBS",
-      "file": "src/stats-proxy.c",
-      "line": 86,
-      "citation": "src/stats-proxy.c:86"
-    },
-    {
-      "index": 7,
-      "enum_name": "ST_I_PX_STOT",
-      "name": "stot",
-      "alt_name": "sessions_total",
-      "desc": "Total number of sessions since process started",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "backend",
-        "server",
-        "listener"
-      ],
-      "cap": "STATS_PX_CAP_LFBS",
-      "file": "src/stats-proxy.c",
-      "line": 87,
-      "citation": "src/stats-proxy.c:87"
-    },
-    {
-      "index": 8,
-      "enum_name": "ST_I_PX_BIN",
-      "name": "bin",
-      "alt_name": "bytes_in_total",
-      "desc": "Total number of request bytes since process started",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "backend",
-        "server",
-        "listener"
-      ],
-      "cap": "STATS_PX_CAP_LFBS",
-      "file": "src/stats-proxy.c",
-      "line": 88,
-      "citation": "src/stats-proxy.c:88"
-    },
-    {
-      "index": 9,
-      "enum_name": "ST_I_PX_BOUT",
-      "name": "bout",
-      "alt_name": "bytes_out_total",
-      "desc": "Total number of response bytes since process started",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "backend",
-        "server",
-        "listener"
-      ],
-      "cap": "STATS_PX_CAP_LFBS",
-      "file": "src/stats-proxy.c",
-      "line": 89,
-      "citation": "src/stats-proxy.c:89"
-    },
-    {
-      "index": 10,
-      "enum_name": "ST_I_PX_DREQ",
-      "name": "dreq",
-      "alt_name": "requests_denied_total",
-      "desc": "Total number of denied requests since process started",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "backend",
-        "listener"
-      ],
-      "cap": "STATS_PX_CAP_LFB_",
-      "file": "src/stats-proxy.c",
-      "line": 90,
-      "citation": "src/stats-proxy.c:90"
-    },
-    {
-      "index": 11,
-      "enum_name": "ST_I_PX_DRESP",
-      "name": "dresp",
-      "alt_name": "responses_denied_total",
-      "desc": "Total number of denied responses since process started",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "backend",
-        "server",
-        "listener"
-      ],
-      "cap": "STATS_PX_CAP_LFBS",
-      "file": "src/stats-proxy.c",
-      "line": 91,
-      "citation": "src/stats-proxy.c:91"
-    },
-    {
-      "index": 12,
-      "enum_name": "ST_I_PX_EREQ",
-      "name": "ereq",
-      "alt_name": "request_errors_total",
-      "desc": "Total number of invalid requests since process started",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "listener"
-      ],
-      "cap": "STATS_PX_CAP_LF__",
-      "file": "src/stats-proxy.c",
-      "line": 92,
-      "citation": "src/stats-proxy.c:92"
-    },
-    {
-      "index": 13,
-      "enum_name": "ST_I_PX_ECON",
-      "name": "econ",
-      "alt_name": "connection_errors_total",
-      "desc": "Total number of failed connections to server since the worker process started",
-      "type": "u64",
-      "scopes": [
-        "backend",
-        "server"
-      ],
-      "cap": "STATS_PX_CAP___BS",
-      "file": "src/stats-proxy.c",
-      "line": 93,
-      "citation": "src/stats-proxy.c:93"
-    },
-    {
-      "index": 14,
-      "enum_name": "ST_I_PX_ERESP",
-      "name": "eresp",
-      "alt_name": "response_errors_total",
-      "desc": "Total number of invalid responses since the worker process started",
-      "type": "u64",
-      "scopes": [
-        "backend",
-        "server"
-      ],
-      "cap": "STATS_PX_CAP___BS",
-      "file": "src/stats-proxy.c",
-      "line": 94,
-      "citation": "src/stats-proxy.c:94"
-    },
-    {
-      "index": 15,
-      "enum_name": "ST_I_PX_WRETR",
-      "name": "wretr",
-      "alt_name": "retry_warnings_total",
-      "desc": "Total number of server connection retries since the worker process started",
-      "type": "u64",
-      "scopes": [
-        "backend",
-        "server"
-      ],
-      "cap": "STATS_PX_CAP___BS",
-      "file": "src/stats-proxy.c",
-      "line": 95,
-      "citation": "src/stats-proxy.c:95"
-    },
-    {
-      "index": 16,
-      "enum_name": "ST_I_PX_WREDIS",
-      "name": "wredis",
-      "alt_name": "redispatch_warnings_total",
-      "desc": "Total number of server redispatches due to connection failures since the worker process started",
-      "type": "u64",
-      "scopes": [
-        "backend",
-        "server"
-      ],
-      "cap": "STATS_PX_CAP___BS",
-      "file": "src/stats-proxy.c",
-      "line": 96,
-      "citation": "src/stats-proxy.c:96"
-    },
-    {
-      "index": 17,
-      "enum_name": "ST_I_PX_STATUS",
-      "name": "status",
-      "alt_name": "status",
-      "desc": "Frontend/listen status: OPEN/WAITING/FULL/STOP; backend: UP/DOWN; server: last check status",
-      "type": "str",
-      "scopes": [
-        "frontend",
-        "backend",
-        "server",
-        "listener"
-      ],
-      "cap": "STATS_PX_CAP_LFBS",
-      "file": "src/stats-proxy.c",
-      "line": 97,
-      "citation": "src/stats-proxy.c:97"
-    },
-    {
-      "index": 18,
-      "enum_name": "ST_I_PX_WEIGHT",
-      "name": "weight",
-      "alt_name": "weight",
-      "desc": "Server's effective weight, or sum of active servers' effective weights for a backend",
-      "type": "u32",
-      "scopes": [
-        "backend",
-        "server"
-      ],
-      "cap": "STATS_PX_CAP___BS",
-      "file": "src/stats-proxy.c",
-      "line": 98,
-      "citation": "src/stats-proxy.c:98"
-    },
-    {
-      "index": 19,
-      "enum_name": "ST_I_PX_ACT",
-      "name": "act",
-      "alt_name": "active_servers",
-      "desc": "Total number of active UP servers with a non-zero weight",
-      "type": "u32",
-      "scopes": [
-        "backend",
-        "server"
-      ],
-      "cap": "STATS_PX_CAP___BS",
-      "file": "src/stats-proxy.c",
-      "line": 99,
-      "citation": "src/stats-proxy.c:99"
-    },
-    {
-      "index": 20,
-      "enum_name": "ST_I_PX_BCK",
-      "name": "bck",
-      "alt_name": "backup_servers",
-      "desc": "Total number of backup UP servers with a non-zero weight",
-      "type": "u32",
-      "scopes": [
-        "backend",
-        "server"
-      ],
-      "cap": "STATS_PX_CAP___BS",
-      "file": "src/stats-proxy.c",
-      "line": 100,
-      "citation": "src/stats-proxy.c:100"
-    },
-    {
-      "index": 21,
-      "enum_name": "ST_I_PX_CHKFAIL",
-      "name": "chkfail",
-      "alt_name": "check_failures_total",
-      "desc": "Total number of failed individual health checks per server/backend, since the worker process started",
-      "type": "u64",
-      "scopes": [
-        "server"
-      ],
-      "cap": "STATS_PX_CAP____S",
-      "file": "src/stats-proxy.c",
-      "line": 101,
-      "citation": "src/stats-proxy.c:101"
-    },
-    {
-      "index": 22,
-      "enum_name": "ST_I_PX_CHKDOWN",
-      "name": "chkdown",
-      "alt_name": "check_up_down_total",
-      "desc": "Total number of failed checks causing UP to DOWN server transitions, per server/backend, since the worker process started",
-      "type": "u64",
-      "scopes": [
-        "backend",
-        "server"
-      ],
-      "cap": "STATS_PX_CAP___BS",
-      "file": "src/stats-proxy.c",
-      "line": 102,
-      "citation": "src/stats-proxy.c:102"
-    },
-    {
-      "index": 23,
-      "enum_name": "ST_I_PX_LASTCHG",
-      "name": "lastchg",
-      "alt_name": "check_last_change_seconds",
-      "desc": "How long ago the last server state changed, in seconds",
-      "type": "u32",
-      "scopes": [
-        "backend",
-        "server"
-      ],
-      "cap": "STATS_PX_CAP___BS",
-      "file": "src/stats-proxy.c",
-      "line": 103,
-      "citation": "src/stats-proxy.c:103"
-    },
-    {
-      "index": 24,
-      "enum_name": "ST_I_PX_DOWNTIME",
-      "name": "downtime",
-      "alt_name": "downtime_seconds_total",
-      "desc": "Total time spent in DOWN state, for server or backend",
-      "type": "u32",
-      "scopes": [
-        "backend",
-        "server"
-      ],
-      "cap": "STATS_PX_CAP___BS",
-      "file": "src/stats-proxy.c",
-      "line": 104,
-      "citation": "src/stats-proxy.c:104"
-    },
-    {
-      "index": 25,
-      "enum_name": "ST_I_PX_QLIMIT",
-      "name": "qlimit",
-      "alt_name": "queue_limit",
-      "desc": "Limit on the number of connections in queue, for servers only (maxqueue argument)",
-      "type": "u32",
-      "scopes": [
-        "server"
-      ],
-      "cap": "STATS_PX_CAP____S",
-      "file": "src/stats-proxy.c",
-      "line": 105,
-      "citation": "src/stats-proxy.c:105"
-    },
-    {
-      "index": 26,
-      "enum_name": "ST_I_PX_PID",
-      "name": "pid",
-      "alt_name": null,
-      "desc": "Relative worker process number (1)",
-      "type": "u32",
-      "scopes": [
-        "frontend",
-        "backend",
-        "server",
-        "listener"
-      ],
-      "cap": null,
-      "file": "src/stats-proxy.c",
-      "line": 106,
-      "citation": "src/stats-proxy.c:106"
-    },
-    {
-      "index": 27,
-      "enum_name": "ST_I_PX_IID",
-      "name": "iid",
-      "alt_name": null,
-      "desc": "Frontend or Backend numeric identifier ('id' setting)",
-      "type": "u32",
-      "scopes": [
-        "frontend",
-        "backend",
-        "server",
-        "listener"
-      ],
-      "cap": null,
-      "file": "src/stats-proxy.c",
-      "line": 107,
-      "citation": "src/stats-proxy.c:107"
-    },
-    {
-      "index": 28,
-      "enum_name": "ST_I_PX_SID",
-      "name": "sid",
-      "alt_name": null,
-      "desc": "Server numeric identifier ('id' setting)",
-      "type": "u32",
-      "scopes": [
-        "frontend",
-        "backend",
-        "server",
-        "listener"
-      ],
-      "cap": null,
-      "file": "src/stats-proxy.c",
-      "line": 108,
-      "citation": "src/stats-proxy.c:108"
-    },
-    {
-      "index": 29,
-      "enum_name": "ST_I_PX_THROTTLE",
-      "name": "throttle",
-      "alt_name": "current_throttle",
-      "desc": "Throttling ratio applied to a server's maxconn and weight during the slowstart period (0 to 100%)",
-      "type": "u32",
-      "scopes": [
-        "server"
-      ],
-      "cap": "STATS_PX_CAP____S",
-      "file": "src/stats-proxy.c",
-      "line": 109,
-      "citation": "src/stats-proxy.c:109"
-    },
-    {
-      "index": 30,
-      "enum_name": "ST_I_PX_LBTOT",
-      "name": "lbtot",
-      "alt_name": "loadbalanced_total",
-      "desc": "Total number of requests routed by load balancing since the worker process started (ignores queue pop and stickiness)",
-      "type": "u64",
-      "scopes": [
-        "backend",
-        "server"
-      ],
-      "cap": "STATS_PX_CAP___BS",
-      "file": "src/stats-proxy.c",
-      "line": 110,
-      "citation": "src/stats-proxy.c:110"
-    },
-    {
-      "index": 31,
-      "enum_name": "ST_I_PX_TRACKED",
-      "name": "tracked",
-      "alt_name": null,
-      "desc": "Name of the other server this server tracks for its state",
-      "type": "str",
-      "scopes": [
-        "server"
-      ],
-      "cap": null,
-      "file": "src/stats-proxy.c",
-      "line": 111,
-      "citation": "src/stats-proxy.c:111"
-    },
-    {
-      "index": 32,
-      "enum_name": "ST_I_PX_TYPE",
-      "name": "type",
-      "alt_name": null,
-      "desc": "Type of the object (Listener, Frontend, Backend, Server)",
-      "type": "u32",
-      "scopes": [
-        "frontend",
-        "backend",
-        "server",
-        "listener"
-      ],
-      "cap": null,
-      "file": "src/stats-proxy.c",
-      "line": 112,
-      "citation": "src/stats-proxy.c:112"
-    },
-    {
-      "index": 33,
-      "enum_name": "ST_I_PX_RATE",
-      "name": "rate",
-      "alt_name": "current_session_rate",
-      "desc": "Total number of sessions processed by this object over the last second (sessions for listeners/frontends, requests for backends/servers)",
-      "type": "u32",
-      "scopes": [
-        "frontend",
-        "backend",
-        "server"
-      ],
-      "cap": "STATS_PX_CAP__FBS",
-      "file": "src/stats-proxy.c",
-      "line": 113,
-      "citation": "src/stats-proxy.c:113"
-    },
-    {
-      "index": 34,
-      "enum_name": "ST_I_PX_RATE_LIM",
-      "name": "rate_lim",
-      "alt_name": "limit_session_rate",
-      "desc": "Limit on the number of sessions accepted in a second (frontend only, 'rate-limit sessions' setting)",
-      "type": "u32",
-      "scopes": [
-        "frontend"
-      ],
-      "cap": "STATS_PX_CAP__F__",
-      "file": "src/stats-proxy.c",
-      "line": 114,
-      "citation": "src/stats-proxy.c:114"
-    },
-    {
-      "index": 35,
-      "enum_name": "ST_I_PX_RATE_MAX",
-      "name": "rate_max",
-      "alt_name": "max_session_rate",
-      "desc": "Highest value of sessions per second observed since the worker process started",
-      "type": "u32",
-      "scopes": [
-        "frontend",
-        "backend",
-        "server"
-      ],
-      "cap": "STATS_PX_CAP__FBS",
-      "file": "src/stats-proxy.c",
-      "line": 115,
-      "citation": "src/stats-proxy.c:115"
-    },
-    {
-      "index": 36,
-      "enum_name": "ST_I_PX_CHECK_STATUS",
-      "name": "check_status",
-      "alt_name": "check_status",
-      "desc": "Status report of the server's latest health check, prefixed with '*' if a check is currently in progress",
-      "type": "str",
-      "scopes": [
-        "server"
-      ],
-      "cap": "STATS_PX_CAP____S",
-      "file": "src/stats-proxy.c",
-      "line": 116,
-      "citation": "src/stats-proxy.c:116"
-    },
-    {
-      "index": 37,
-      "enum_name": "ST_I_PX_CHECK_CODE",
-      "name": "check_code",
-      "alt_name": "check_code",
-      "desc": "HTTP/SMTP/LDAP status code reported by the latest server health check",
-      "type": "u32",
-      "scopes": [
-        "server"
-      ],
-      "cap": "STATS_PX_CAP____S",
-      "file": "src/stats-proxy.c",
-      "line": 117,
-      "citation": "src/stats-proxy.c:117"
-    },
-    {
-      "index": 38,
-      "enum_name": "ST_I_PX_CHECK_DURATION",
-      "name": "check_duration",
-      "alt_name": "check_duration_seconds",
-      "desc": "Total duration of the latest server health check, in milliseconds",
-      "type": "u64",
-      "scopes": [
-        "server"
-      ],
-      "cap": "STATS_PX_CAP____S",
-      "file": "src/stats-proxy.c",
-      "line": 118,
-      "citation": "src/stats-proxy.c:118"
-    },
-    {
-      "index": 39,
-      "enum_name": "ST_I_PX_HRSP_1XX",
-      "name": "hrsp_1xx",
-      "alt_name": "http_responses_total",
-      "desc": "Total number of HTTP responses with status 100-199 returned by this object since the worker process started",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "backend",
-        "server"
-      ],
-      "cap": "STATS_PX_CAP__FBS",
-      "file": "src/stats-proxy.c",
-      "line": 119,
-      "citation": "src/stats-proxy.c:119"
-    },
-    {
-      "index": 40,
-      "enum_name": "ST_I_PX_HRSP_2XX",
-      "name": "hrsp_2xx",
-      "alt_name": "http_responses_total",
-      "desc": "Total number of HTTP responses with status 200-299 returned by this object since the worker process started",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "backend",
-        "server"
-      ],
-      "cap": "STATS_PX_CAP__FBS",
-      "file": "src/stats-proxy.c",
-      "line": 120,
-      "citation": "src/stats-proxy.c:120"
-    },
-    {
-      "index": 41,
-      "enum_name": "ST_I_PX_HRSP_3XX",
-      "name": "hrsp_3xx",
-      "alt_name": "http_responses_total",
-      "desc": "Total number of HTTP responses with status 300-399 returned by this object since the worker process started",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "backend",
-        "server"
-      ],
-      "cap": "STATS_PX_CAP__FBS",
-      "file": "src/stats-proxy.c",
-      "line": 121,
-      "citation": "src/stats-proxy.c:121"
-    },
-    {
-      "index": 42,
-      "enum_name": "ST_I_PX_HRSP_4XX",
-      "name": "hrsp_4xx",
-      "alt_name": "http_responses_total",
-      "desc": "Total number of HTTP responses with status 400-499 returned by this object since the worker process started",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "backend",
-        "server"
-      ],
-      "cap": "STATS_PX_CAP__FBS",
-      "file": "src/stats-proxy.c",
-      "line": 122,
-      "citation": "src/stats-proxy.c:122"
-    },
-    {
-      "index": 43,
-      "enum_name": "ST_I_PX_HRSP_5XX",
-      "name": "hrsp_5xx",
-      "alt_name": "http_responses_total",
-      "desc": "Total number of HTTP responses with status 500-599 returned by this object since the worker process started",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "backend",
-        "server"
-      ],
-      "cap": "STATS_PX_CAP__FBS",
-      "file": "src/stats-proxy.c",
-      "line": 123,
-      "citation": "src/stats-proxy.c:123"
-    },
-    {
-      "index": 44,
-      "enum_name": "ST_I_PX_HRSP_OTHER",
-      "name": "hrsp_other",
-      "alt_name": "http_responses_total",
-      "desc": "Total number of HTTP responses with status <100, >599 returned by this object since the worker process started (error -1 included)",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "backend",
-        "server"
-      ],
-      "cap": "STATS_PX_CAP__FBS",
-      "file": "src/stats-proxy.c",
-      "line": 124,
-      "citation": "src/stats-proxy.c:124"
-    },
-    {
-      "index": 45,
-      "enum_name": "ST_I_PX_HANAFAIL",
-      "name": "hanafail",
-      "alt_name": null,
-      "desc": "Total number of failed checks caused by an 'on-error' directive after an 'observe' condition matched",
-      "type": "u64",
-      "scopes": [
-        "server"
-      ],
-      "cap": "STATS_PX_CAP____S",
-      "file": "src/stats-proxy.c",
-      "line": 125,
-      "citation": "src/stats-proxy.c:125"
-    },
-    {
-      "index": 46,
-      "enum_name": "ST_I_PX_REQ_RATE",
-      "name": "req_rate",
-      "alt_name": null,
-      "desc": "Number of HTTP requests processed over the last second on this object",
-      "type": "u32",
-      "scopes": [
-        "frontend"
-      ],
-      "cap": "STATS_PX_CAP__F__",
-      "file": "src/stats-proxy.c",
-      "line": 126,
-      "citation": "src/stats-proxy.c:126"
-    },
-    {
-      "index": 47,
-      "enum_name": "ST_I_PX_REQ_RATE_MAX",
-      "name": "req_rate_max",
-      "alt_name": "http_requests_rate_max",
-      "desc": "Highest value of http requests observed since the worker process started",
-      "type": "u32",
-      "scopes": [
-        "frontend"
-      ],
-      "cap": "STATS_PX_CAP__F__",
-      "file": "src/stats-proxy.c",
-      "line": 127,
-      "citation": "src/stats-proxy.c:127"
-    },
-    {
-      "index": 48,
-      "enum_name": "ST_I_PX_REQ_TOT",
-      "name": "req_tot",
-      "alt_name": "http_requests_total",
-      "desc": "Total number of HTTP requests processed by this object since the worker process started",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "backend",
-        "server"
-      ],
-      "cap": "STATS_PX_CAP__FBS",
-      "file": "src/stats-proxy.c",
-      "line": 129,
-      "citation": "src/stats-proxy.c:129"
-    },
-    {
-      "index": 49,
-      "enum_name": "ST_I_PX_CLI_ABRT",
-      "name": "cli_abrt",
-      "alt_name": "client_aborts_total",
-      "desc": "Total number of requests or connections aborted by the client since the worker process started",
-      "type": "u64",
-      "scopes": [
-        "backend",
-        "server"
-      ],
-      "cap": "STATS_PX_CAP___BS",
-      "file": "src/stats-proxy.c",
-      "line": 130,
-      "citation": "src/stats-proxy.c:130"
-    },
-    {
-      "index": 50,
-      "enum_name": "ST_I_PX_SRV_ABRT",
-      "name": "srv_abrt",
-      "alt_name": "server_aborts_total",
-      "desc": "Total number of requests or connections aborted by the server since the worker process started",
-      "type": "u64",
-      "scopes": [
-        "backend",
-        "server"
-      ],
-      "cap": "STATS_PX_CAP___BS",
-      "file": "src/stats-proxy.c",
-      "line": 131,
-      "citation": "src/stats-proxy.c:131"
-    },
-    {
-      "index": 51,
-      "enum_name": "ST_I_PX_COMP_IN",
-      "name": "comp_in",
-      "alt_name": "http_comp_bytes_in_total",
-      "desc": "Total number of bytes submitted to the HTTP compressor for this object since the worker process started",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "backend"
-      ],
-      "cap": "STATS_PX_CAP__FB_",
-      "file": "src/stats-proxy.c",
-      "line": 132,
-      "citation": "src/stats-proxy.c:132"
-    },
-    {
-      "index": 52,
-      "enum_name": "ST_I_PX_COMP_OUT",
-      "name": "comp_out",
-      "alt_name": "http_comp_bytes_out_total",
-      "desc": "Total number of bytes emitted by the HTTP compressor for this object since the worker process started",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "backend"
-      ],
-      "cap": "STATS_PX_CAP__FB_",
-      "file": "src/stats-proxy.c",
-      "line": 133,
-      "citation": "src/stats-proxy.c:133"
-    },
-    {
-      "index": 53,
-      "enum_name": "ST_I_PX_COMP_BYP",
-      "name": "comp_byp",
-      "alt_name": "http_comp_bytes_bypassed_total",
-      "desc": "Total number of bytes that bypassed HTTP compression for this object since the worker process started (CPU/memory/bandwidth limitation)",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "backend"
-      ],
-      "cap": "STATS_PX_CAP__FB_",
-      "file": "src/stats-proxy.c",
-      "line": 134,
-      "citation": "src/stats-proxy.c:134"
-    },
-    {
-      "index": 54,
-      "enum_name": "ST_I_PX_COMP_RSP",
-      "name": "comp_rsp",
-      "alt_name": "http_comp_responses_total",
-      "desc": "Total number of HTTP responses that were compressed for this object since the worker process started",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "backend"
-      ],
-      "cap": "STATS_PX_CAP__FB_",
-      "file": "src/stats-proxy.c",
-      "line": 135,
-      "citation": "src/stats-proxy.c:135"
-    },
-    {
-      "index": 55,
-      "enum_name": "ST_I_PX_LASTSESS",
-      "name": "lastsess",
-      "alt_name": "last_session_seconds",
-      "desc": "How long ago some traffic was seen on this object on this worker process, in seconds",
-      "type": "s32",
-      "scopes": [
-        "backend",
-        "server"
-      ],
-      "cap": "STATS_PX_CAP___BS",
-      "file": "src/stats-proxy.c",
-      "line": 136,
-      "citation": "src/stats-proxy.c:136"
-    },
-    {
-      "index": 56,
-      "enum_name": "ST_I_PX_LAST_CHK",
-      "name": "last_chk",
-      "alt_name": null,
-      "desc": "Short description of the latest health check report for this server (see also check_desc)",
-      "type": "str",
-      "scopes": [
-        "server"
-      ],
-      "cap": null,
-      "file": "src/stats-proxy.c",
-      "line": 137,
-      "citation": "src/stats-proxy.c:137"
-    },
-    {
-      "index": 57,
-      "enum_name": "ST_I_PX_LAST_AGT",
-      "name": "last_agt",
-      "alt_name": null,
-      "desc": "Short description of the latest agent check report for this server (see also agent_desc)",
-      "type": "str",
-      "scopes": [
-        "server"
-      ],
-      "cap": null,
-      "file": "src/stats-proxy.c",
-      "line": 138,
-      "citation": "src/stats-proxy.c:138"
-    },
-    {
-      "index": 58,
-      "enum_name": "ST_I_PX_QTIME",
-      "name": "qtime",
-      "alt_name": "queue_time_average_seconds",
-      "desc": "Time spent in the queue, in milliseconds, averaged over the 1024 last requests (backend/server)",
-      "type": "u32",
-      "scopes": [
-        "backend",
-        "server"
-      ],
-      "cap": "STATS_PX_CAP___BS",
-      "file": "src/stats-proxy.c",
-      "line": 139,
-      "citation": "src/stats-proxy.c:139"
-    },
-    {
-      "index": 59,
-      "enum_name": "ST_I_PX_CTIME",
-      "name": "ctime",
-      "alt_name": "connect_time_average_seconds",
-      "desc": "Time spent waiting for a connection to complete, in milliseconds, averaged over the 1024 last requests (backend/server)",
-      "type": "u32",
-      "scopes": [
-        "backend",
-        "server"
-      ],
-      "cap": "STATS_PX_CAP___BS",
-      "file": "src/stats-proxy.c",
-      "line": 140,
-      "citation": "src/stats-proxy.c:140"
-    },
-    {
-      "index": 60,
-      "enum_name": "ST_I_PX_RTIME",
-      "name": "rtime",
-      "alt_name": "response_time_average_seconds",
-      "desc": "Time spent waiting for a server response, in milliseconds, averaged over the 1024 last requests (backend/server)",
-      "type": "u32",
-      "scopes": [
-        "backend",
-        "server"
-      ],
-      "cap": "STATS_PX_CAP___BS",
-      "file": "src/stats-proxy.c",
-      "line": 141,
-      "citation": "src/stats-proxy.c:141"
-    },
-    {
-      "index": 61,
-      "enum_name": "ST_I_PX_TTIME",
-      "name": "ttime",
-      "alt_name": "total_time_average_seconds",
-      "desc": "Total request+response time (request+queue+connect+response+processing), in milliseconds, averaged over the 1024 last requests (backend/server)",
-      "type": "u32",
-      "scopes": [
-        "backend",
-        "server"
-      ],
-      "cap": "STATS_PX_CAP___BS",
-      "file": "src/stats-proxy.c",
-      "line": 142,
-      "citation": "src/stats-proxy.c:142"
-    },
-    {
-      "index": 62,
-      "enum_name": "ST_I_PX_AGENT_STATUS",
-      "name": "agent_status",
-      "alt_name": "agent_status",
-      "desc": "Status report of the server's latest agent check, prefixed with '*' if a check is currently in progress",
-      "type": "str",
-      "scopes": [
-        "server"
-      ],
-      "cap": "STATS_PX_CAP____S",
-      "file": "src/stats-proxy.c",
-      "line": 143,
-      "citation": "src/stats-proxy.c:143"
-    },
-    {
-      "index": 63,
-      "enum_name": "ST_I_PX_AGENT_CODE",
-      "name": "agent_code",
-      "alt_name": "agent_code",
-      "desc": "Status code reported by the latest server agent check",
-      "type": "u32",
-      "scopes": [
-        "server"
-      ],
-      "cap": "STATS_PX_CAP____S",
-      "file": "src/stats-proxy.c",
-      "line": 144,
-      "citation": "src/stats-proxy.c:144"
-    },
-    {
-      "index": 64,
-      "enum_name": "ST_I_PX_AGENT_DURATION",
-      "name": "agent_duration",
-      "alt_name": "agent_duration_seconds",
-      "desc": "Total duration of the latest server agent check, in milliseconds",
-      "type": "u64",
-      "scopes": [
-        "server"
-      ],
-      "cap": "STATS_PX_CAP____S",
-      "file": "src/stats-proxy.c",
-      "line": 145,
-      "citation": "src/stats-proxy.c:145"
-    },
-    {
-      "index": 65,
-      "enum_name": "ST_I_PX_CHECK_DESC",
-      "name": "check_desc",
-      "alt_name": null,
-      "desc": "Textual description of the latest health check report for this server",
-      "type": "str",
-      "scopes": [
-        "server"
-      ],
-      "cap": null,
-      "file": "src/stats-proxy.c",
-      "line": 146,
-      "citation": "src/stats-proxy.c:146"
-    },
-    {
-      "index": 66,
-      "enum_name": "ST_I_PX_AGENT_DESC",
-      "name": "agent_desc",
-      "alt_name": null,
-      "desc": "Textual description of the latest agent check report for this server",
-      "type": "str",
-      "scopes": [
-        "server"
-      ],
-      "cap": null,
-      "file": "src/stats-proxy.c",
-      "line": 147,
-      "citation": "src/stats-proxy.c:147"
-    },
-    {
-      "index": 67,
-      "enum_name": "ST_I_PX_CHECK_RISE",
-      "name": "check_rise",
-      "alt_name": null,
-      "desc": "Number of successful health checks before declaring a server UP (server 'rise' setting)",
-      "type": "u32",
-      "scopes": [
-        "server"
-      ],
-      "cap": null,
-      "file": "src/stats-proxy.c",
-      "line": 148,
-      "citation": "src/stats-proxy.c:148"
-    },
-    {
-      "index": 68,
-      "enum_name": "ST_I_PX_CHECK_FALL",
-      "name": "check_fall",
-      "alt_name": null,
-      "desc": "Number of failed health checks before declaring a server DOWN (server 'fall' setting)",
-      "type": "u32",
-      "scopes": [
-        "server"
-      ],
-      "cap": null,
-      "file": "src/stats-proxy.c",
-      "line": 149,
-      "citation": "src/stats-proxy.c:149"
-    },
-    {
-      "index": 69,
-      "enum_name": "ST_I_PX_CHECK_HEALTH",
-      "name": "check_health",
-      "alt_name": null,
-      "desc": "Current server health check level (0..fall-1=DOWN, fall..rise-1=UP)",
-      "type": "u32",
-      "scopes": [
-        "server"
-      ],
-      "cap": null,
-      "file": "src/stats-proxy.c",
-      "line": 150,
-      "citation": "src/stats-proxy.c:150"
-    },
-    {
-      "index": 70,
-      "enum_name": "ST_I_PX_AGENT_RISE",
-      "name": "agent_rise",
-      "alt_name": null,
-      "desc": "Number of successful agent checks before declaring a server UP (server 'rise' setting)",
-      "type": "u32",
-      "scopes": [
-        "server"
-      ],
-      "cap": null,
-      "file": "src/stats-proxy.c",
-      "line": 151,
-      "citation": "src/stats-proxy.c:151"
-    },
-    {
-      "index": 71,
-      "enum_name": "ST_I_PX_AGENT_FALL",
-      "name": "agent_fall",
-      "alt_name": null,
-      "desc": "Number of failed agent checks before declaring a server DOWN (server 'fall' setting)",
-      "type": "u32",
-      "scopes": [
-        "server"
-      ],
-      "cap": null,
-      "file": "src/stats-proxy.c",
-      "line": 152,
-      "citation": "src/stats-proxy.c:152"
-    },
-    {
-      "index": 72,
-      "enum_name": "ST_I_PX_AGENT_HEALTH",
-      "name": "agent_health",
-      "alt_name": null,
-      "desc": "Current server agent check level (0..fall-1=DOWN, fall..rise-1=UP)",
-      "type": "u32",
-      "scopes": [
-        "server"
-      ],
-      "cap": null,
-      "file": "src/stats-proxy.c",
-      "line": 153,
-      "citation": "src/stats-proxy.c:153"
-    },
-    {
-      "index": 73,
-      "enum_name": "ST_I_PX_ADDR",
-      "name": "addr",
-      "alt_name": null,
-      "desc": "Server's address:port, shown only if show-legends is set, or at levels oper/admin for the CLI",
-      "type": "str",
-      "scopes": [
-        "server",
-        "listener"
-      ],
-      "cap": null,
-      "file": "src/stats-proxy.c",
-      "line": 154,
-      "citation": "src/stats-proxy.c:154"
-    },
-    {
-      "index": 74,
-      "enum_name": "ST_I_PX_COOKIE",
-      "name": "cookie",
-      "alt_name": null,
-      "desc": "Backend's cookie name or Server's cookie value, shown only if show-legends is set, or at levels oper/admin for the CLI",
-      "type": "str",
-      "scopes": [
-        "backend",
-        "server"
-      ],
-      "cap": null,
-      "file": "src/stats-proxy.c",
-      "line": 155,
-      "citation": "src/stats-proxy.c:155"
-    },
-    {
-      "index": 75,
-      "enum_name": "ST_I_PX_MODE",
-      "name": "mode",
-      "alt_name": null,
-      "desc": "'mode' setting (tcp/http/health/cli/spop)",
-      "type": "str",
-      "scopes": [
-        "frontend",
-        "backend",
-        "server",
-        "listener"
-      ],
-      "cap": null,
-      "file": "src/stats-proxy.c",
-      "line": 156,
-      "citation": "src/stats-proxy.c:156"
-    },
-    {
-      "index": 76,
-      "enum_name": "ST_I_PX_ALGO",
-      "name": "algo",
-      "alt_name": null,
-      "desc": "Backend's load balancing algorithm, shown only if show-legends is set, or at levels oper/admin for the CLI",
-      "type": "str",
-      "scopes": [
-        "backend"
-      ],
-      "cap": null,
-      "file": "src/stats-proxy.c",
-      "line": 157,
-      "citation": "src/stats-proxy.c:157"
-    },
-    {
-      "index": 77,
-      "enum_name": "ST_I_PX_CONN_RATE",
-      "name": "conn_rate",
-      "alt_name": null,
-      "desc": "Number of new connections accepted over the last second on the frontend for this worker process",
-      "type": "u32",
-      "scopes": [
-        "frontend"
-      ],
-      "cap": "STATS_PX_CAP__F__",
-      "file": "src/stats-proxy.c",
-      "line": 158,
-      "citation": "src/stats-proxy.c:158"
-    },
-    {
-      "index": 78,
-      "enum_name": "ST_I_PX_CONN_RATE_MAX",
-      "name": "conn_rate_max",
-      "alt_name": "connections_rate_max",
-      "desc": "Highest value of connections per second observed since the worker process started",
-      "type": "u32",
-      "scopes": [
-        "frontend"
-      ],
-      "cap": "STATS_PX_CAP__F__",
-      "file": "src/stats-proxy.c",
-      "line": 159,
-      "citation": "src/stats-proxy.c:159"
-    },
-    {
-      "index": 79,
-      "enum_name": "ST_I_PX_CONN_TOT",
-      "name": "conn_tot",
-      "alt_name": "connections_total",
-      "desc": "Total number of new connections accepted on this frontend since the worker process started",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "listener"
-      ],
-      "cap": "STATS_PX_CAP_LF__",
-      "file": "src/stats-proxy.c",
-      "line": 160,
-      "citation": "src/stats-proxy.c:160"
-    },
-    {
-      "index": 80,
-      "enum_name": "ST_I_PX_INTERCEPTED",
-      "name": "intercepted",
-      "alt_name": "intercepted_requests_total",
-      "desc": "Total number of HTTP requests intercepted on the frontend (redirects/stats/services) since the worker process started",
-      "type": "u64",
-      "scopes": [
-        "frontend"
-      ],
-      "cap": "STATS_PX_CAP__F__",
-      "file": "src/stats-proxy.c",
-      "line": 161,
-      "citation": "src/stats-proxy.c:161"
-    },
-    {
-      "index": 81,
-      "enum_name": "ST_I_PX_DCON",
-      "name": "dcon",
-      "alt_name": "denied_connections_total",
-      "desc": "Total number of incoming connections blocked on a listener/frontend by a tcp-request connection rule since the worker process started",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "listener"
-      ],
-      "cap": "STATS_PX_CAP_LF__",
-      "file": "src/stats-proxy.c",
-      "line": 162,
-      "citation": "src/stats-proxy.c:162"
-    },
-    {
-      "index": 82,
-      "enum_name": "ST_I_PX_DSES",
-      "name": "dses",
-      "alt_name": "denied_sessions_total",
-      "desc": "Total number of incoming sessions blocked on a listener/frontend by a tcp-request connection rule since the worker process started",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "listener"
-      ],
-      "cap": "STATS_PX_CAP_LF__",
-      "file": "src/stats-proxy.c",
-      "line": 163,
-      "citation": "src/stats-proxy.c:163"
-    },
-    {
-      "index": 83,
-      "enum_name": "ST_I_PX_WREW",
-      "name": "wrew",
-      "alt_name": "failed_header_rewriting_total",
-      "desc": "Total number of failed HTTP header rewrites since the worker process started",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "backend",
-        "server",
-        "listener"
-      ],
-      "cap": "STATS_PX_CAP_LFBS",
-      "file": "src/stats-proxy.c",
-      "line": 164,
-      "citation": "src/stats-proxy.c:164"
-    },
-    {
-      "index": 84,
-      "enum_name": "ST_I_PX_CONNECT",
-      "name": "connect",
-      "alt_name": "connection_attempts_total",
-      "desc": "Total number of outgoing connection attempts on this backend/server since the worker process started",
-      "type": "u64",
-      "scopes": [
-        "backend",
-        "server"
-      ],
-      "cap": "STATS_PX_CAP___BS",
-      "file": "src/stats-proxy.c",
-      "line": 165,
-      "citation": "src/stats-proxy.c:165"
-    },
-    {
-      "index": 85,
-      "enum_name": "ST_I_PX_REUSE",
-      "name": "reuse",
-      "alt_name": "connection_reuses_total",
-      "desc": "Total number of reused connection on this backend/server since the worker process started",
-      "type": "u64",
-      "scopes": [
-        "backend",
-        "server"
-      ],
-      "cap": "STATS_PX_CAP___BS",
-      "file": "src/stats-proxy.c",
-      "line": 166,
-      "citation": "src/stats-proxy.c:166"
-    },
-    {
-      "index": 86,
-      "enum_name": "ST_I_PX_CACHE_LOOKUPS",
-      "name": "cache_lookups",
-      "alt_name": "http_cache_lookups_total",
-      "desc": "Total number of HTTP requests looked up in the cache on this frontend/backend since the worker process started",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "backend"
-      ],
-      "cap": "STATS_PX_CAP__FB_",
-      "file": "src/stats-proxy.c",
-      "line": 167,
-      "citation": "src/stats-proxy.c:167"
-    },
-    {
-      "index": 87,
-      "enum_name": "ST_I_PX_CACHE_HITS",
-      "name": "cache_hits",
-      "alt_name": "http_cache_hits_total",
-      "desc": "Total number of HTTP requests not found in the cache on this frontend/backend since the worker process started",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "backend"
-      ],
-      "cap": "STATS_PX_CAP__FB_",
-      "file": "src/stats-proxy.c",
-      "line": 168,
-      "citation": "src/stats-proxy.c:168"
-    },
-    {
-      "index": 88,
-      "enum_name": "ST_I_PX_SRV_ICUR",
-      "name": "srv_icur",
-      "alt_name": "idle_connections_current",
-      "desc": "Current number of idle connections available for reuse on this server",
-      "type": "u32",
-      "scopes": [
-        "server"
-      ],
-      "cap": "STATS_PX_CAP____S",
-      "file": "src/stats-proxy.c",
-      "line": 169,
-      "citation": "src/stats-proxy.c:169"
-    },
-    {
-      "index": 89,
-      "enum_name": "ST_I_PX_SRV_ILIM",
-      "name": "src_ilim",
-      "alt_name": "idle_connections_limit",
-      "desc": "Limit on the number of available idle connections on this server (server 'pool_max_conn' directive)",
-      "type": "u32",
-      "scopes": [
-        "server"
-      ],
-      "cap": "STATS_PX_CAP____S",
-      "file": "src/stats-proxy.c",
-      "line": 170,
-      "citation": "src/stats-proxy.c:170"
-    },
-    {
-      "index": 90,
-      "enum_name": "ST_I_PX_QT_MAX",
-      "name": "qtime_max",
-      "alt_name": "max_queue_time_seconds",
-      "desc": "Maximum observed time spent in the queue, in milliseconds (backend/server)",
-      "type": "u32",
-      "scopes": [
-        "backend",
-        "server"
-      ],
-      "cap": "STATS_PX_CAP___BS",
-      "file": "src/stats-proxy.c",
-      "line": 171,
-      "citation": "src/stats-proxy.c:171"
-    },
-    {
-      "index": 91,
-      "enum_name": "ST_I_PX_CT_MAX",
-      "name": "ctime_max",
-      "alt_name": "max_connect_time_seconds",
-      "desc": "Maximum observed time spent waiting for a connection to complete, in milliseconds (backend/server)",
-      "type": "u32",
-      "scopes": [
-        "backend",
-        "server"
-      ],
-      "cap": "STATS_PX_CAP___BS",
-      "file": "src/stats-proxy.c",
-      "line": 172,
-      "citation": "src/stats-proxy.c:172"
-    },
-    {
-      "index": 92,
-      "enum_name": "ST_I_PX_RT_MAX",
-      "name": "rtime_max",
-      "alt_name": "max_response_time_seconds",
-      "desc": "Maximum observed time spent waiting for a server response, in milliseconds (backend/server)",
-      "type": "u32",
-      "scopes": [
-        "backend",
-        "server"
-      ],
-      "cap": "STATS_PX_CAP___BS",
-      "file": "src/stats-proxy.c",
-      "line": 173,
-      "citation": "src/stats-proxy.c:173"
-    },
-    {
-      "index": 93,
-      "enum_name": "ST_I_PX_TT_MAX",
-      "name": "ttime_max",
-      "alt_name": "max_total_time_seconds",
-      "desc": "Maximum observed total request+response time (request+queue+connect+response+processing), in milliseconds (backend/server)",
-      "type": "u32",
-      "scopes": [
-        "backend",
-        "server"
-      ],
-      "cap": "STATS_PX_CAP___BS",
-      "file": "src/stats-proxy.c",
-      "line": 174,
-      "citation": "src/stats-proxy.c:174"
-    },
-    {
-      "index": 94,
-      "enum_name": "ST_I_PX_EINT",
-      "name": "eint",
-      "alt_name": "internal_errors_total",
-      "desc": "Total number of internal errors since process started",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "backend",
-        "server",
-        "listener"
-      ],
-      "cap": "STATS_PX_CAP_LFBS",
-      "file": "src/stats-proxy.c",
-      "line": 175,
-      "citation": "src/stats-proxy.c:175"
-    },
-    {
-      "index": 95,
-      "enum_name": "ST_I_PX_IDLE_CONN_CUR",
-      "name": "idle_conn_cur",
-      "alt_name": "unsafe_idle_connections_current",
-      "desc": "Current number of unsafe idle connections",
-      "type": "u32",
-      "scopes": [
-        "server"
-      ],
-      "cap": "STATS_PX_CAP____S",
-      "file": "src/stats-proxy.c",
-      "line": 176,
-      "citation": "src/stats-proxy.c:176"
-    },
-    {
-      "index": 96,
-      "enum_name": "ST_I_PX_SAFE_CONN_CUR",
-      "name": "safe_conn_cur",
-      "alt_name": "safe_idle_connections_current",
-      "desc": "Current number of safe idle connections",
-      "type": "u32",
-      "scopes": [
-        "server"
-      ],
-      "cap": "STATS_PX_CAP____S",
-      "file": "src/stats-proxy.c",
-      "line": 177,
-      "citation": "src/stats-proxy.c:177"
-    },
-    {
-      "index": 97,
-      "enum_name": "ST_I_PX_USED_CONN_CUR",
-      "name": "used_conn_cur",
-      "alt_name": "used_connections_current",
-      "desc": "Current number of connections in use",
-      "type": "u32",
-      "scopes": [
-        "server"
-      ],
-      "cap": "STATS_PX_CAP____S",
-      "file": "src/stats-proxy.c",
-      "line": 178,
-      "citation": "src/stats-proxy.c:178"
-    },
-    {
-      "index": 98,
-      "enum_name": "ST_I_PX_NEED_CONN_EST",
-      "name": "need_conn_est",
-      "alt_name": "need_connections_current",
-      "desc": "Estimated needed number of connections",
-      "type": "u32",
-      "scopes": [
-        "server"
-      ],
-      "cap": "STATS_PX_CAP____S",
-      "file": "src/stats-proxy.c",
-      "line": 179,
-      "citation": "src/stats-proxy.c:179"
-    },
-    {
-      "index": 99,
-      "enum_name": "ST_I_PX_UWEIGHT",
-      "name": "uweight",
-      "alt_name": "uweight",
-      "desc": "Server's user weight, or sum of active servers' user weights for a backend",
-      "type": "u32",
-      "scopes": [
-        "backend",
-        "server"
-      ],
-      "cap": "STATS_PX_CAP___BS",
-      "file": "src/stats-proxy.c",
-      "line": 180,
-      "citation": "src/stats-proxy.c:180"
-    },
-    {
-      "index": 100,
-      "enum_name": "ST_I_PX_AGG_SRV_STATUS",
-      "name": "agg_server_status",
-      "alt_name": "agg_server_status",
-      "desc": "Backend's aggregated gauge of servers' status",
-      "type": "u32",
-      "scopes": [
-        "backend"
-      ],
-      "cap": "STATS_PX_CAP___B_",
-      "file": "src/stats-proxy.c",
-      "line": 182,
-      "citation": "src/stats-proxy.c:182"
-    },
-    {
-      "index": 101,
-      "enum_name": "ST_I_PX_AGG_SRV_CHECK_STATUS",
-      "name": "agg_server_check_status",
-      "alt_name": "agg_server_check_status",
-      "desc": "[DEPRECATED] Backend's aggregated gauge of servers' status",
-      "type": "u32",
-      "scopes": [
-        "backend"
-      ],
-      "cap": "STATS_PX_CAP___B_",
-      "file": "src/stats-proxy.c",
-      "line": 181,
-      "citation": "src/stats-proxy.c:181"
-    },
-    {
-      "index": 102,
-      "enum_name": "ST_I_PX_AGG_CHECK_STATUS",
-      "name": "agg_check_status",
-      "alt_name": "agg_check_status",
-      "desc": "Backend's aggregated gauge of servers' state check status",
-      "type": "u32",
-      "scopes": [
-        "backend"
-      ],
-      "cap": "STATS_PX_CAP___B_",
-      "file": "src/stats-proxy.c",
-      "line": 183,
-      "citation": "src/stats-proxy.c:183"
-    },
-    {
-      "index": 103,
-      "enum_name": "ST_I_PX_SRID",
-      "name": "srid",
-      "alt_name": null,
-      "desc": "Server id revision, to prevent server id reuse mixups",
-      "type": "u32",
-      "scopes": [
-        "server"
-      ],
-      "cap": null,
-      "file": "src/stats-proxy.c",
-      "line": 184,
-      "citation": "src/stats-proxy.c:184"
-    },
-    {
-      "index": 104,
-      "enum_name": "ST_I_PX_SESS_OTHER",
-      "name": "sess_other",
-      "alt_name": null,
-      "desc": "Total number of sessions other than HTTP since process started",
-      "type": "u64",
-      "scopes": [
-        "frontend"
-      ],
-      "cap": null,
-      "file": "src/stats-proxy.c",
-      "line": 185,
-      "citation": "src/stats-proxy.c:185"
-    },
-    {
-      "index": 105,
-      "enum_name": "ST_I_PX_H1SESS",
-      "name": "h1sess",
-      "alt_name": null,
-      "desc": "Total number of HTTP/1 sessions since process started",
-      "type": "u64",
-      "scopes": [
-        "frontend"
-      ],
-      "cap": "STATS_PX_CAP__F__",
-      "file": "src/stats-proxy.c",
-      "line": 186,
-      "citation": "src/stats-proxy.c:186"
-    },
-    {
-      "index": 106,
-      "enum_name": "ST_I_PX_H2SESS",
-      "name": "h2sess",
-      "alt_name": null,
-      "desc": "Total number of HTTP/2 sessions since process started",
-      "type": "u64",
-      "scopes": [
-        "frontend"
-      ],
-      "cap": "STATS_PX_CAP__F__",
-      "file": "src/stats-proxy.c",
-      "line": 187,
-      "citation": "src/stats-proxy.c:187"
-    },
-    {
-      "index": 107,
-      "enum_name": "ST_I_PX_H3SESS",
-      "name": "h3sess",
-      "alt_name": null,
-      "desc": "Total number of HTTP/3 sessions since process started",
-      "type": "u64",
-      "scopes": [
-        "frontend"
-      ],
-      "cap": "STATS_PX_CAP__F__",
-      "file": "src/stats-proxy.c",
-      "line": 188,
-      "citation": "src/stats-proxy.c:188"
-    },
-    {
-      "index": 108,
-      "enum_name": "ST_I_PX_REQ_OTHER",
-      "name": "req_other",
-      "alt_name": null,
-      "desc": "Total number of sessions other than HTTP processed by this object since the worker process started",
-      "type": "u64",
-      "scopes": [
-        "frontend"
-      ],
-      "cap": "STATS_PX_CAP__F__",
-      "file": "src/stats-proxy.c",
-      "line": 189,
-      "citation": "src/stats-proxy.c:189"
-    },
-    {
-      "index": 109,
-      "enum_name": "ST_I_PX_H1REQ",
-      "name": "h1req",
-      "alt_name": null,
-      "desc": "Total number of HTTP/1 sessions processed by this object since the worker process started",
-      "type": "u64",
-      "scopes": [
-        "frontend"
-      ],
-      "cap": "STATS_PX_CAP__F__",
-      "file": "src/stats-proxy.c",
-      "line": 190,
-      "citation": "src/stats-proxy.c:190"
-    },
-    {
-      "index": 110,
-      "enum_name": "ST_I_PX_H2REQ",
-      "name": "h2req",
-      "alt_name": null,
-      "desc": "Total number of hTTP/2 sessions processed by this object since the worker process started",
-      "type": "u64",
-      "scopes": [
-        "frontend"
-      ],
-      "cap": "STATS_PX_CAP__F__",
-      "file": "src/stats-proxy.c",
-      "line": 191,
-      "citation": "src/stats-proxy.c:191"
-    },
-    {
-      "index": 111,
-      "enum_name": "ST_I_PX_H3REQ",
-      "name": "h3req",
-      "alt_name": null,
-      "desc": "Total number of HTTP/3 sessions processed by this object since the worker process started",
-      "type": "u64",
-      "scopes": [
-        "frontend"
-      ],
-      "cap": "STATS_PX_CAP__F__",
-      "file": "src/stats-proxy.c",
-      "line": 192,
-      "citation": "src/stats-proxy.c:192"
-    },
-    {
-      "index": 112,
-      "enum_name": "ST_I_PX_PROTO",
-      "name": "proto",
-      "alt_name": null,
-      "desc": "Protocol",
-      "type": "str",
-      "scopes": [
-        "listener"
-      ],
-      "cap": null,
-      "file": "src/stats-proxy.c",
-      "line": 193,
-      "citation": "src/stats-proxy.c:193"
-    },
-    {
-      "index": 113,
-      "enum_name": "ST_I_PX_PRIV_IDLE_CUR",
-      "name": "priv_idle_cur",
-      "alt_name": "private_idle_connections_current",
-      "desc": "Current number of private idle connections",
-      "type": "u32",
-      "scopes": [
-        "server"
-      ],
-      "cap": "STATS_PX_CAP____S",
-      "file": "src/stats-proxy.c",
-      "line": 194,
-      "citation": "src/stats-proxy.c:194"
-    },
-    {
-      "index": 114,
-      "enum_name": "ST_I_PX_REQ_IN",
-      "name": "reqbin",
-      "alt_name": "req_bytes_in_total",
-      "desc": "Total number of request bytes received since process started",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "backend",
-        "server",
-        "listener"
-      ],
-      "cap": "STATS_PX_CAP_LFBS",
-      "file": "src/stats-proxy.c",
-      "line": 195,
-      "citation": "src/stats-proxy.c:195"
-    },
-    {
-      "index": 115,
-      "enum_name": "ST_I_PX_REQ_OUT",
-      "name": "reqbout",
-      "alt_name": "req_bytes_out_total",
-      "desc": "Total number of request bytes sent since process started",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "backend",
-        "server",
-        "listener"
-      ],
-      "cap": "STATS_PX_CAP_LFBS",
-      "file": "src/stats-proxy.c",
-      "line": 196,
-      "citation": "src/stats-proxy.c:196"
-    },
-    {
-      "index": 116,
-      "enum_name": "ST_I_PX_RES_IN",
-      "name": "resbin",
-      "alt_name": "res_bytes_in_total",
-      "desc": "Total number of response bytes received since process started",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "backend",
-        "server",
-        "listener"
-      ],
-      "cap": "STATS_PX_CAP_LFBS",
-      "file": "src/stats-proxy.c",
-      "line": 197,
-      "citation": "src/stats-proxy.c:197"
-    },
-    {
-      "index": 117,
-      "enum_name": "ST_I_PX_RES_OUT",
-      "name": "resbout",
-      "alt_name": "res_bytes_out_total",
-      "desc": "Total number of response bytes sent since process started",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "backend",
-        "server",
-        "listener"
-      ],
-      "cap": "STATS_PX_CAP_LFBS",
-      "file": "src/stats-proxy.c",
-      "line": 198,
-      "citation": "src/stats-proxy.c:198"
-    },
-    {
-      "index": 118,
-      "enum_name": "ST_I_PX_CACHE_HINT_HITS",
-      "name": "cache_hint_hits",
-      "alt_name": "http_cache_hint_hits_total",
-      "desc": "Total number of HTTP requests for which a 103 Early Hints response was emitted from the cache on this frontend/backend since the worker process started",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "backend"
-      ],
-      "cap": "STATS_PX_CAP__FB_",
-      "file": "src/stats-proxy.c",
-      "line": 199,
-      "citation": "src/stats-proxy.c:199"
-    }
-  ],
-  "delimiter": {
-    "index": 119,
-    "name": "-",
-    "desc": "Delimiter marking transition from static ST_I_PX_* fields to dynamic module extension fields",
-    "file": "src/stats.c",
-    "line": 344,
-    "citation": "src/stats.c:344"
+[
+  {
+    "index": 0,
+    "enum_name": "ST_I_PX_PXNAME",
+    "name": "pxname",
+    "alt_name": null,
+    "desc": "Proxy name",
+    "type": "str",
+    "scopes": [
+      "frontend",
+      "backend",
+      "server",
+      "listener"
+    ],
+    "cap": null,
+    "file": "src/stats-proxy.c",
+    "line": 80,
+    "citation": "src/stats-proxy.c:80"
   },
-  "module_fields": [
-    {
-      "index": 120,
-      "module": "mux_h2",
-      "module_registration": "src/mux_h2.c:460",
-      "enum_name": "H2_ST_HEADERS_RCVD",
-      "name": "h2_headers_rcvd",
-      "alt_name": null,
-      "desc": "Total number of received HEADERS frames",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "backend"
-      ],
-      "file": "src/mux_h2.c",
-      "line": 331,
-      "citation": "src/mux_h2.c:331"
-    },
-    {
-      "index": 121,
-      "module": "mux_h2",
-      "module_registration": "src/mux_h2.c:460",
-      "enum_name": "H2_ST_DATA_RCVD",
-      "name": "h2_data_rcvd",
-      "alt_name": null,
-      "desc": "Total number of received DATA frames",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "backend"
-      ],
-      "file": "src/mux_h2.c",
-      "line": 333,
-      "citation": "src/mux_h2.c:333"
-    },
-    {
-      "index": 122,
-      "module": "mux_h2",
-      "module_registration": "src/mux_h2.c:460",
-      "enum_name": "H2_ST_SETTINGS_RCVD",
-      "name": "h2_settings_rcvd",
-      "alt_name": null,
-      "desc": "Total number of received SETTINGS frames",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "backend"
-      ],
-      "file": "src/mux_h2.c",
-      "line": 335,
-      "citation": "src/mux_h2.c:335"
-    },
-    {
-      "index": 123,
-      "module": "mux_h2",
-      "module_registration": "src/mux_h2.c:460",
-      "enum_name": "H2_ST_RST_STREAM_RCVD",
-      "name": "h2_rst_stream_rcvd",
-      "alt_name": null,
-      "desc": "Total number of received RST_STREAM frames",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "backend"
-      ],
-      "file": "src/mux_h2.c",
-      "line": 337,
-      "citation": "src/mux_h2.c:337"
-    },
-    {
-      "index": 124,
-      "module": "mux_h2",
-      "module_registration": "src/mux_h2.c:460",
-      "enum_name": "H2_ST_GOAWAY_RCVD",
-      "name": "h2_goaway_rcvd",
-      "alt_name": null,
-      "desc": "Total number of received GOAWAY frames",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "backend"
-      ],
-      "file": "src/mux_h2.c",
-      "line": 339,
-      "citation": "src/mux_h2.c:339"
-    },
-    {
-      "index": 125,
-      "module": "mux_h2",
-      "module_registration": "src/mux_h2.c:460",
-      "enum_name": "H2_ST_CONN_PROTO_ERR",
-      "name": "h2_detected_conn_protocol_errors",
-      "alt_name": null,
-      "desc": "Total number of connection protocol errors",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "backend"
-      ],
-      "file": "src/mux_h2.c",
-      "line": 342,
-      "citation": "src/mux_h2.c:342"
-    },
-    {
-      "index": 126,
-      "module": "mux_h2",
-      "module_registration": "src/mux_h2.c:460",
-      "enum_name": "H2_ST_STRM_PROTO_ERR",
-      "name": "h2_detected_strm_protocol_errors",
-      "alt_name": null,
-      "desc": "Total number of stream protocol errors",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "backend"
-      ],
-      "file": "src/mux_h2.c",
-      "line": 344,
-      "citation": "src/mux_h2.c:344"
-    },
-    {
-      "index": 127,
-      "module": "mux_h2",
-      "module_registration": "src/mux_h2.c:460",
-      "enum_name": "H2_ST_RST_STREAM_RESP",
-      "name": "h2_rst_stream_resp",
-      "alt_name": null,
-      "desc": "Total number of RST_STREAM sent on detected error",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "backend"
-      ],
-      "file": "src/mux_h2.c",
-      "line": 346,
-      "citation": "src/mux_h2.c:346"
-    },
-    {
-      "index": 128,
-      "module": "mux_h2",
-      "module_registration": "src/mux_h2.c:460",
-      "enum_name": "H2_ST_GOAWAY_RESP",
-      "name": "h2_goaway_resp",
-      "alt_name": null,
-      "desc": "Total number of GOAWAY sent on detected error",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "backend"
-      ],
-      "file": "src/mux_h2.c",
-      "line": 348,
-      "citation": "src/mux_h2.c:348"
-    },
-    {
-      "index": 129,
-      "module": "mux_h2",
-      "module_registration": "src/mux_h2.c:460",
-      "enum_name": "H2_ST_OPEN_CONN",
-      "name": "h2_open_connections",
-      "alt_name": null,
-      "desc": "Count of currently open connections",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "backend"
-      ],
-      "file": "src/mux_h2.c",
-      "line": 351,
-      "citation": "src/mux_h2.c:351"
-    },
-    {
-      "index": 130,
-      "module": "mux_h2",
-      "module_registration": "src/mux_h2.c:460",
-      "enum_name": "H2_ST_OPEN_STREAM",
-      "name": "h2_backend_open_streams",
-      "alt_name": null,
-      "desc": "Count of currently open streams",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "backend"
-      ],
-      "file": "src/mux_h2.c",
-      "line": 353,
-      "citation": "src/mux_h2.c:353"
-    },
-    {
-      "index": 131,
-      "module": "mux_h2",
-      "module_registration": "src/mux_h2.c:460",
-      "enum_name": "H2_ST_TOTAL_CONN",
-      "name": "h2_total_connections",
-      "alt_name": null,
-      "desc": "Total number of connections",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "backend"
-      ],
-      "file": "src/mux_h2.c",
-      "line": 355,
-      "citation": "src/mux_h2.c:355"
-    },
-    {
-      "index": 132,
-      "module": "mux_h2",
-      "module_registration": "src/mux_h2.c:460",
-      "enum_name": "H2_ST_TOTAL_STREAM",
-      "name": "h2_backend_total_streams",
-      "alt_name": null,
-      "desc": "Total number of streams",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "backend"
-      ],
-      "file": "src/mux_h2.c",
-      "line": 357,
-      "citation": "src/mux_h2.c:357"
-    },
-    {
-      "index": 133,
-      "module": "ssl_sock",
-      "module_registration": "src/ssl_sock.c:259",
-      "enum_name": "SSL_ST_SESS",
-      "name": "ssl_sess",
-      "alt_name": null,
-      "desc": "Total number of ssl sessions established",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "listener",
-        "backend",
-        "server"
-      ],
-      "file": "src/ssl_sock.c",
-      "line": 187,
-      "citation": "src/ssl_sock.c:187"
-    },
-    {
-      "index": 134,
-      "module": "ssl_sock",
-      "module_registration": "src/ssl_sock.c:259",
-      "enum_name": "SSL_ST_REUSED_SESS",
-      "name": "ssl_reused_sess",
-      "alt_name": null,
-      "desc": "Total number of ssl sessions reused",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "listener",
-        "backend",
-        "server"
-      ],
-      "file": "src/ssl_sock.c",
-      "line": 189,
-      "citation": "src/ssl_sock.c:189"
-    },
-    {
-      "index": 135,
-      "module": "ssl_sock",
-      "module_registration": "src/ssl_sock.c:259",
-      "enum_name": "SSL_ST_FAILED_HANDSHAKE",
-      "name": "ssl_failed_handshake",
-      "alt_name": null,
-      "desc": "Total number of failed handshake",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "listener",
-        "backend",
-        "server"
-      ],
-      "file": "src/ssl_sock.c",
-      "line": 191,
-      "citation": "src/ssl_sock.c:191"
-    },
-    {
-      "index": 136,
-      "module": "ssl_sock",
-      "module_registration": "src/ssl_sock.c:259",
-      "enum_name": "SSL_ST_OCSP_STAPLE",
-      "name": "ssl_ocsp_staple",
-      "alt_name": null,
-      "desc": "Total number of stapled OCSP responses",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "listener",
-        "backend",
-        "server"
-      ],
-      "file": "src/ssl_sock.c",
-      "line": 193,
-      "citation": "src/ssl_sock.c:193"
-    },
-    {
-      "index": 137,
-      "module": "ssl_sock",
-      "module_registration": "src/ssl_sock.c:259",
-      "enum_name": "SSL_ST_FAILED_OCSP_STAPLE",
-      "name": "ssl_failed_ocsp_staple",
-      "alt_name": null,
-      "desc": "Total number of failed OCSP stapling (expired or error)",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "listener",
-        "backend",
-        "server"
-      ],
-      "file": "src/ssl_sock.c",
-      "line": 195,
-      "citation": "src/ssl_sock.c:195"
-    },
-    {
-      "index": 138,
-      "module": "mux_h1",
-      "module_registration": "src/mux_h1.c:334",
-      "enum_name": "H1_ST_OPEN_CONN",
-      "name": "h1_open_connections",
-      "alt_name": null,
-      "desc": "Count of currently open connections",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "backend"
-      ],
-      "file": "src/mux_h1.c",
-      "line": 230,
-      "citation": "src/mux_h1.c:230"
-    },
-    {
-      "index": 139,
-      "module": "mux_h1",
-      "module_registration": "src/mux_h1.c:334",
-      "enum_name": "H1_ST_OPEN_STREAM",
-      "name": "h1_open_streams",
-      "alt_name": null,
-      "desc": "Count of currently open streams",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "backend"
-      ],
-      "file": "src/mux_h1.c",
-      "line": 232,
-      "citation": "src/mux_h1.c:232"
-    },
-    {
-      "index": 140,
-      "module": "mux_h1",
-      "module_registration": "src/mux_h1.c:334",
-      "enum_name": "H1_ST_TOTAL_CONN",
-      "name": "h1_total_connections",
-      "alt_name": null,
-      "desc": "Total number of connections",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "backend"
-      ],
-      "file": "src/mux_h1.c",
-      "line": 234,
-      "citation": "src/mux_h1.c:234"
-    },
-    {
-      "index": 141,
-      "module": "mux_h1",
-      "module_registration": "src/mux_h1.c:334",
-      "enum_name": "H1_ST_TOTAL_STREAM",
-      "name": "h1_total_streams",
-      "alt_name": null,
-      "desc": "Total number of streams",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "backend"
-      ],
-      "file": "src/mux_h1.c",
-      "line": 236,
-      "citation": "src/mux_h1.c:236"
-    },
-    {
-      "index": 142,
-      "module": "mux_h1",
-      "module_registration": "src/mux_h1.c:334",
-      "enum_name": "H1_ST_BYTES_IN",
-      "name": "h1_bytes_in",
-      "alt_name": null,
-      "desc": "Total number of bytes received",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "backend"
-      ],
-      "file": "src/mux_h1.c",
-      "line": 239,
-      "citation": "src/mux_h1.c:239"
-    },
-    {
-      "index": 143,
-      "module": "mux_h1",
-      "module_registration": "src/mux_h1.c:334",
-      "enum_name": "H1_ST_BYTES_OUT",
-      "name": "h1_bytes_out",
-      "alt_name": null,
-      "desc": "Total number of bytes send",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "backend"
-      ],
-      "file": "src/mux_h1.c",
-      "line": 241,
-      "citation": "src/mux_h1.c:241"
-    },
-    {
-      "index": 144,
-      "module": "mux_h1",
-      "module_registration": "src/mux_h1.c:334",
-      "enum_name": "H1_ST_SPLICED_BYTES_IN",
-      "name": "h1_spliced_bytes_in",
-      "alt_name": null,
-      "desc": "Total number of bytes received using kernel splicing",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "backend"
-      ],
-      "file": "src/mux_h1.c",
-      "line": 244,
-      "citation": "src/mux_h1.c:244"
-    },
-    {
-      "index": 145,
-      "module": "mux_h1",
-      "module_registration": "src/mux_h1.c:334",
-      "enum_name": "H1_ST_SPLICED_BYTES_OUT",
-      "name": "h1_spliced_bytes_out",
-      "alt_name": null,
-      "desc": "Total number of bytes sendusing kernel splicing",
-      "type": "u64",
-      "scopes": [
-        "frontend",
-        "backend"
-      ],
-      "file": "src/mux_h1.c",
-      "line": 246,
-      "citation": "src/mux_h1.c:246"
-    }
-  ]
-}
+  {
+    "index": 1,
+    "enum_name": "ST_I_PX_SVNAME",
+    "name": "svname",
+    "alt_name": null,
+    "desc": "Server name",
+    "type": "str",
+    "scopes": [
+      "frontend",
+      "backend",
+      "server",
+      "listener"
+    ],
+    "cap": null,
+    "file": "src/stats-proxy.c",
+    "line": 81,
+    "citation": "src/stats-proxy.c:81"
+  },
+  {
+    "index": 2,
+    "enum_name": "ST_I_PX_QCUR",
+    "name": "qcur",
+    "alt_name": "current_queue",
+    "desc": "Number of current queued connections",
+    "type": "u32",
+    "scopes": [
+      "backend",
+      "server"
+    ],
+    "cap": "STATS_PX_CAP___BS",
+    "file": "src/stats-proxy.c",
+    "line": 82,
+    "citation": "src/stats-proxy.c:82"
+  },
+  {
+    "index": 3,
+    "enum_name": "ST_I_PX_QMAX",
+    "name": "qmax",
+    "alt_name": "max_queue",
+    "desc": "Highest value of queued connections encountered since process started",
+    "type": "u32",
+    "scopes": [
+      "backend",
+      "server"
+    ],
+    "cap": "STATS_PX_CAP___BS",
+    "file": "src/stats-proxy.c",
+    "line": 83,
+    "citation": "src/stats-proxy.c:83"
+  },
+  {
+    "index": 4,
+    "enum_name": "ST_I_PX_SCUR",
+    "name": "scur",
+    "alt_name": "current_sessions",
+    "desc": "Number of current sessions on the frontend, backend or server",
+    "type": "u32",
+    "scopes": [
+      "frontend",
+      "backend",
+      "server",
+      "listener"
+    ],
+    "cap": "STATS_PX_CAP_LFBS",
+    "file": "src/stats-proxy.c",
+    "line": 84,
+    "citation": "src/stats-proxy.c:84"
+  },
+  {
+    "index": 5,
+    "enum_name": "ST_I_PX_SMAX",
+    "name": "smax",
+    "alt_name": "max_sessions",
+    "desc": "Highest value of current sessions encountered since process started",
+    "type": "u32",
+    "scopes": [
+      "frontend",
+      "backend",
+      "server",
+      "listener"
+    ],
+    "cap": "STATS_PX_CAP_LFBS",
+    "file": "src/stats-proxy.c",
+    "line": 85,
+    "citation": "src/stats-proxy.c:85"
+  },
+  {
+    "index": 6,
+    "enum_name": "ST_I_PX_SLIM",
+    "name": "slim",
+    "alt_name": "limit_sessions",
+    "desc": "Frontend/listener/server's maxconn, backend's fullconn",
+    "type": "u32",
+    "scopes": [
+      "frontend",
+      "backend",
+      "server",
+      "listener"
+    ],
+    "cap": "STATS_PX_CAP_LFBS",
+    "file": "src/stats-proxy.c",
+    "line": 86,
+    "citation": "src/stats-proxy.c:86"
+  },
+  {
+    "index": 7,
+    "enum_name": "ST_I_PX_STOT",
+    "name": "stot",
+    "alt_name": "sessions_total",
+    "desc": "Total number of sessions since process started",
+    "type": "u64",
+    "scopes": [
+      "frontend",
+      "backend",
+      "server",
+      "listener"
+    ],
+    "cap": "STATS_PX_CAP_LFBS",
+    "file": "src/stats-proxy.c",
+    "line": 87,
+    "citation": "src/stats-proxy.c:87"
+  },
+  {
+    "index": 8,
+    "enum_name": "ST_I_PX_BIN",
+    "name": "bin",
+    "alt_name": "bytes_in_total",
+    "desc": "Total number of request bytes since process started",
+    "type": "u64",
+    "scopes": [
+      "frontend",
+      "backend",
+      "server",
+      "listener"
+    ],
+    "cap": "STATS_PX_CAP_LFBS",
+    "file": "src/stats-proxy.c",
+    "line": 88,
+    "citation": "src/stats-proxy.c:88"
+  },
+  {
+    "index": 9,
+    "enum_name": "ST_I_PX_BOUT",
+    "name": "bout",
+    "alt_name": "bytes_out_total",
+    "desc": "Total number of response bytes since process started",
+    "type": "u64",
+    "scopes": [
+      "frontend",
+      "backend",
+      "server",
+      "listener"
+    ],
+    "cap": "STATS_PX_CAP_LFBS",
+    "file": "src/stats-proxy.c",
+    "line": 89,
+    "citation": "src/stats-proxy.c:89"
+  },
+  {
+    "index": 10,
+    "enum_name": "ST_I_PX_DREQ",
+    "name": "dreq",
+    "alt_name": "requests_denied_total",
+    "desc": "Total number of denied requests since process started",
+    "type": "u64",
+    "scopes": [
+      "frontend",
+      "backend",
+      "listener"
+    ],
+    "cap": "STATS_PX_CAP_LFB_",
+    "file": "src/stats-proxy.c",
+    "line": 90,
+    "citation": "src/stats-proxy.c:90"
+  },
+  {
+    "index": 11,
+    "enum_name": "ST_I_PX_DRESP",
+    "name": "dresp",
+    "alt_name": "responses_denied_total",
+    "desc": "Total number of denied responses since process started",
+    "type": "u64",
+    "scopes": [
+      "frontend",
+      "backend",
+      "server",
+      "listener"
+    ],
+    "cap": "STATS_PX_CAP_LFBS",
+    "file": "src/stats-proxy.c",
+    "line": 91,
+    "citation": "src/stats-proxy.c:91"
+  },
+  {
+    "index": 12,
+    "enum_name": "ST_I_PX_EREQ",
+    "name": "ereq",
+    "alt_name": "request_errors_total",
+    "desc": "Total number of invalid requests since process started",
+    "type": "u64",
+    "scopes": [
+      "frontend",
+      "listener"
+    ],
+    "cap": "STATS_PX_CAP_LF__",
+    "file": "src/stats-proxy.c",
+    "line": 92,
+    "citation": "src/stats-proxy.c:92"
+  },
+  {
+    "index": 13,
+    "enum_name": "ST_I_PX_ECON",
+    "name": "econ",
+    "alt_name": "connection_errors_total",
+    "desc": "Total number of failed connections to server since the worker process started",
+    "type": "u64",
+    "scopes": [
+      "backend",
+      "server"
+    ],
+    "cap": "STATS_PX_CAP___BS",
+    "file": "src/stats-proxy.c",
+    "line": 93,
+    "citation": "src/stats-proxy.c:93"
+  },
+  {
+    "index": 14,
+    "enum_name": "ST_I_PX_ERESP",
+    "name": "eresp",
+    "alt_name": "response_errors_total",
+    "desc": "Total number of invalid responses since the worker process started",
+    "type": "u64",
+    "scopes": [
+      "backend",
+      "server"
+    ],
+    "cap": "STATS_PX_CAP___BS",
+    "file": "src/stats-proxy.c",
+    "line": 94,
+    "citation": "src/stats-proxy.c:94"
+  },
+  {
+    "index": 15,
+    "enum_name": "ST_I_PX_WRETR",
+    "name": "wretr",
+    "alt_name": "retry_warnings_total",
+    "desc": "Total number of server connection retries since the worker process started",
+    "type": "u64",
+    "scopes": [
+      "backend",
+      "server"
+    ],
+    "cap": "STATS_PX_CAP___BS",
+    "file": "src/stats-proxy.c",
+    "line": 95,
+    "citation": "src/stats-proxy.c:95"
+  },
+  {
+    "index": 16,
+    "enum_name": "ST_I_PX_WREDIS",
+    "name": "wredis",
+    "alt_name": "redispatch_warnings_total",
+    "desc": "Total number of server redispatches due to connection failures since the worker process started",
+    "type": "u64",
+    "scopes": [
+      "backend",
+      "server"
+    ],
+    "cap": "STATS_PX_CAP___BS",
+    "file": "src/stats-proxy.c",
+    "line": 96,
+    "citation": "src/stats-proxy.c:96"
+  },
+  {
+    "index": 17,
+    "enum_name": "ST_I_PX_STATUS",
+    "name": "status",
+    "alt_name": "status",
+    "desc": "Frontend/listen status: OPEN/WAITING/FULL/STOP; backend: UP/DOWN; server: last check status",
+    "type": "str",
+    "scopes": [
+      "frontend",
+      "backend",
+      "server",
+      "listener"
+    ],
+    "cap": "STATS_PX_CAP_LFBS",
+    "file": "src/stats-proxy.c",
+    "line": 97,
+    "citation": "src/stats-proxy.c:97"
+  },
+  {
+    "index": 18,
+    "enum_name": "ST_I_PX_WEIGHT",
+    "name": "weight",
+    "alt_name": "weight",
+    "desc": "Server's effective weight, or sum of active servers' effective weights for a backend",
+    "type": "u32",
+    "scopes": [
+      "backend",
+      "server"
+    ],
+    "cap": "STATS_PX_CAP___BS",
+    "file": "src/stats-proxy.c",
+    "line": 98,
+    "citation": "src/stats-proxy.c:98"
+  },
+  {
+    "index": 19,
+    "enum_name": "ST_I_PX_ACT",
+    "name": "act",
+    "alt_name": "active_servers",
+    "desc": "Total number of active UP servers with a non-zero weight",
+    "type": "u32",
+    "scopes": [
+      "backend",
+      "server"
+    ],
+    "cap": "STATS_PX_CAP___BS",
+    "file": "src/stats-proxy.c",
+    "line": 99,
+    "citation": "src/stats-proxy.c:99"
+  },
+  {
+    "index": 20,
+    "enum_name": "ST_I_PX_BCK",
+    "name": "bck",
+    "alt_name": "backup_servers",
+    "desc": "Total number of backup UP servers with a non-zero weight",
+    "type": "u32",
+    "scopes": [
+      "backend",
+      "server"
+    ],
+    "cap": "STATS_PX_CAP___BS",
+    "file": "src/stats-proxy.c",
+    "line": 100,
+    "citation": "src/stats-proxy.c:100"
+  },
+  {
+    "index": 21,
+    "enum_name": "ST_I_PX_CHKFAIL",
+    "name": "chkfail",
+    "alt_name": "check_failures_total",
+    "desc": "Total number of failed individual health checks per server/backend, since the worker process started",
+    "type": "u64",
+    "scopes": [
+      "server"
+    ],
+    "cap": "STATS_PX_CAP____S",
+    "file": "src/stats-proxy.c",
+    "line": 101,
+    "citation": "src/stats-proxy.c:101"
+  },
+  {
+    "index": 22,
+    "enum_name": "ST_I_PX_CHKDOWN",
+    "name": "chkdown",
+    "alt_name": "check_up_down_total",
+    "desc": "Total number of failed checks causing UP to DOWN server transitions, per server/backend, since the worker process started",
+    "type": "u64",
+    "scopes": [
+      "backend",
+      "server"
+    ],
+    "cap": "STATS_PX_CAP___BS",
+    "file": "src/stats-proxy.c",
+    "line": 102,
+    "citation": "src/stats-proxy.c:102"
+  },
+  {
+    "index": 23,
+    "enum_name": "ST_I_PX_LASTCHG",
+    "name": "lastchg",
+    "alt_name": "check_last_change_seconds",
+    "desc": "How long ago the last server state changed, in seconds",
+    "type": "u32",
+    "scopes": [
+      "backend",
+      "server"
+    ],
+    "cap": "STATS_PX_CAP___BS",
+    "file": "src/stats-proxy.c",
+    "line": 103,
+    "citation": "src/stats-proxy.c:103"
+  },
+  {
+    "index": 24,
+    "enum_name": "ST_I_PX_DOWNTIME",
+    "name": "downtime",
+    "alt_name": "downtime_seconds_total",
+    "desc": "Total time spent in DOWN state, for server or backend",
+    "type": "u32",
+    "scopes": [
+      "backend",
+      "server"
+    ],
+    "cap": "STATS_PX_CAP___BS",
+    "file": "src/stats-proxy.c",
+    "line": 104,
+    "citation": "src/stats-proxy.c:104"
+  },
+  {
+    "index": 25,
+    "enum_name": "ST_I_PX_QLIMIT",
+    "name": "qlimit",
+    "alt_name": "queue_limit",
+    "desc": "Limit on the number of connections in queue, for servers only (maxqueue argument)",
+    "type": "u32",
+    "scopes": [
+      "server"
+    ],
+    "cap": "STATS_PX_CAP____S",
+    "file": "src/stats-proxy.c",
+    "line": 105,
+    "citation": "src/stats-proxy.c:105"
+  },
+  {
+    "index": 26,
+    "enum_name": "ST_I_PX_PID",
+    "name": "pid",
+    "alt_name": null,
+    "desc": "Relative worker process number (1)",
+    "type": "u32",
+    "scopes": [
+      "frontend",
+      "backend",
+      "server",
+      "listener"
+    ],
+    "cap": null,
+    "file": "src/stats-proxy.c",
+    "line": 106,
+    "citation": "src/stats-proxy.c:106"
+  },
+  {
+    "index": 27,
+    "enum_name": "ST_I_PX_IID",
+    "name": "iid",
+    "alt_name": null,
+    "desc": "Frontend or Backend numeric identifier ('id' setting)",
+    "type": "u32",
+    "scopes": [
+      "frontend",
+      "backend",
+      "server",
+      "listener"
+    ],
+    "cap": null,
+    "file": "src/stats-proxy.c",
+    "line": 107,
+    "citation": "src/stats-proxy.c:107"
+  },
+  {
+    "index": 28,
+    "enum_name": "ST_I_PX_SID",
+    "name": "sid",
+    "alt_name": null,
+    "desc": "Server numeric identifier ('id' setting)",
+    "type": "u32",
+    "scopes": [
+      "frontend",
+      "backend",
+      "server",
+      "listener"
+    ],
+    "cap": null,
+    "file": "src/stats-proxy.c",
+    "line": 108,
+    "citation": "src/stats-proxy.c:108"
+  },
+  {
+    "index": 29,
+    "enum_name": "ST_I_PX_THROTTLE",
+    "name": "throttle",
+    "alt_name": "current_throttle",
+    "desc": "Throttling ratio applied to a server's maxconn and weight during the slowstart period (0 to 100%)",
+    "type": "u32",
+    "scopes": [
+      "server"
+    ],
+    "cap": "STATS_PX_CAP____S",
+    "file": "src/stats-proxy.c",
+    "line": 109,
+    "citation": "src/stats-proxy.c:109"
+  },
+  {
+    "index": 30,
+    "enum_name": "ST_I_PX_LBTOT",
+    "name": "lbtot",
+    "alt_name": "loadbalanced_total",
+    "desc": "Total number of requests routed by load balancing since the worker process started (ignores queue pop and stickiness)",
+    "type": "u64",
+    "scopes": [
+      "backend",
+      "server"
+    ],
+    "cap": "STATS_PX_CAP___BS",
+    "file": "src/stats-proxy.c",
+    "line": 110,
+    "citation": "src/stats-proxy.c:110"
+  },
+  {
+    "index": 31,
+    "enum_name": "ST_I_PX_TRACKED",
+    "name": "tracked",
+    "alt_name": null,
+    "desc": "Name of the other server this server tracks for its state",
+    "type": "str",
+    "scopes": [
+      "server"
+    ],
+    "cap": null,
+    "file": "src/stats-proxy.c",
+    "line": 111,
+    "citation": "src/stats-proxy.c:111"
+  },
+  {
+    "index": 32,
+    "enum_name": "ST_I_PX_TYPE",
+    "name": "type",
+    "alt_name": null,
+    "desc": "Type of the object (Listener, Frontend, Backend, Server)",
+    "type": "u32",
+    "scopes": [
+      "frontend",
+      "backend",
+      "server",
+      "listener"
+    ],
+    "cap": null,
+    "file": "src/stats-proxy.c",
+    "line": 112,
+    "citation": "src/stats-proxy.c:112"
+  },
+  {
+    "index": 33,
+    "enum_name": "ST_I_PX_RATE",
+    "name": "rate",
+    "alt_name": "current_session_rate",
+    "desc": "Total number of sessions processed by this object over the last second (sessions for listeners/frontends, requests for backends/servers)",
+    "type": "u32",
+    "scopes": [
+      "frontend",
+      "backend",
+      "server"
+    ],
+    "cap": "STATS_PX_CAP__FBS",
+    "file": "src/stats-proxy.c",
+    "line": 113,
+    "citation": "src/stats-proxy.c:113"
+  },
+  {
+    "index": 34,
+    "enum_name": "ST_I_PX_RATE_LIM",
+    "name": "rate_lim",
+    "alt_name": "limit_session_rate",
+    "desc": "Limit on the number of sessions accepted in a second (frontend only, 'rate-limit sessions' setting)",
+    "type": "u32",
+    "scopes": [
+      "frontend"
+    ],
+    "cap": "STATS_PX_CAP__F__",
+    "file": "src/stats-proxy.c",
+    "line": 114,
+    "citation": "src/stats-proxy.c:114"
+  },
+  {
+    "index": 35,
+    "enum_name": "ST_I_PX_RATE_MAX",
+    "name": "rate_max",
+    "alt_name": "max_session_rate",
+    "desc": "Highest value of sessions per second observed since the worker process started",
+    "type": "u32",
+    "scopes": [
+      "frontend",
+      "backend",
+      "server"
+    ],
+    "cap": "STATS_PX_CAP__FBS",
+    "file": "src/stats-proxy.c",
+    "line": 115,
+    "citation": "src/stats-proxy.c:115"
+  },
+  {
+    "index": 36,
+    "enum_name": "ST_I_PX_CHECK_STATUS",
+    "name": "check_status",
+    "alt_name": "check_status",
+    "desc": "Status report of the server's latest health check, prefixed with '*' if a check is currently in progress",
+    "type": "str",
+    "scopes": [
+      "server"
+    ],
+    "cap": "STATS_PX_CAP____S",
+    "file": "src/stats-proxy.c",
+    "line": 116,
+    "citation": "src/stats-proxy.c:116"
+  },
+  {
+    "index": 37,
+    "enum_name": "ST_I_PX_CHECK_CODE",
+    "name": "check_code",
+    "alt_name": "check_code",
+    "desc": "HTTP/SMTP/LDAP status code reported by the latest server health check",
+    "type": "u32",
+    "scopes": [
+      "server"
+    ],
+    "cap": "STATS_PX_CAP____S",
+    "file": "src/stats-proxy.c",
+    "line": 117,
+    "citation": "src/stats-proxy.c:117"
+  },
+  {
+    "index": 38,
+    "enum_name": "ST_I_PX_CHECK_DURATION",
+    "name": "check_duration",
+    "alt_name": "check_duration_seconds",
+    "desc": "Total duration of the latest server health check, in milliseconds",
+    "type": "u64",
+    "scopes": [
+      "server"
+    ],
+    "cap": "STATS_PX_CAP____S",
+    "file": "src/stats-proxy.c",
+    "line": 118,
+    "citation": "src/stats-proxy.c:118"
+  },
+  {
+    "index": 39,
+    "enum_name": "ST_I_PX_HRSP_1XX",
+    "name": "hrsp_1xx",
+    "alt_name": "http_responses_total",
+    "desc": "Total number of HTTP responses with status 100-199 returned by this object since the worker process started",
+    "type": "u64",
+    "scopes": [
+      "frontend",
+      "backend",
+      "server"
+    ],
+    "cap": "STATS_PX_CAP__FBS",
+    "file": "src/stats-proxy.c",
+    "line": 119,
+    "citation": "src/stats-proxy.c:119"
+  },
+  {
+    "index": 40,
+    "enum_name": "ST_I_PX_HRSP_2XX",
+    "name": "hrsp_2xx",
+    "alt_name": "http_responses_total",
+    "desc": "Total number of HTTP responses with status 200-299 returned by this object since the worker process started",
+    "type": "u64",
+    "scopes": [
+      "frontend",
+      "backend",
+      "server"
+    ],
+    "cap": "STATS_PX_CAP__FBS",
+    "file": "src/stats-proxy.c",
+    "line": 120,
+    "citation": "src/stats-proxy.c:120"
+  },
+  {
+    "index": 41,
+    "enum_name": "ST_I_PX_HRSP_3XX",
+    "name": "hrsp_3xx",
+    "alt_name": "http_responses_total",
+    "desc": "Total number of HTTP responses with status 300-399 returned by this object since the worker process started",
+    "type": "u64",
+    "scopes": [
+      "frontend",
+      "backend",
+      "server"
+    ],
+    "cap": "STATS_PX_CAP__FBS",
+    "file": "src/stats-proxy.c",
+    "line": 121,
+    "citation": "src/stats-proxy.c:121"
+  },
+  {
+    "index": 42,
+    "enum_name": "ST_I_PX_HRSP_4XX",
+    "name": "hrsp_4xx",
+    "alt_name": "http_responses_total",
+    "desc": "Total number of HTTP responses with status 400-499 returned by this object since the worker process started",
+    "type": "u64",
+    "scopes": [
+      "frontend",
+      "backend",
+      "server"
+    ],
+    "cap": "STATS_PX_CAP__FBS",
+    "file": "src/stats-proxy.c",
+    "line": 122,
+    "citation": "src/stats-proxy.c:122"
+  },
+  {
+    "index": 43,
+    "enum_name": "ST_I_PX_HRSP_5XX",
+    "name": "hrsp_5xx",
+    "alt_name": "http_responses_total",
+    "desc": "Total number of HTTP responses with status 500-599 returned by this object since the worker process started",
+    "type": "u64",
+    "scopes": [
+      "frontend",
+      "backend",
+      "server"
+    ],
+    "cap": "STATS_PX_CAP__FBS",
+    "file": "src/stats-proxy.c",
+    "line": 123,
+    "citation": "src/stats-proxy.c:123"
+  },
+  {
+    "index": 44,
+    "enum_name": "ST_I_PX_HRSP_OTHER",
+    "name": "hrsp_other",
+    "alt_name": "http_responses_total",
+    "desc": "Total number of HTTP responses with status <100, >599 returned by this object since the worker process started (error -1 included)",
+    "type": "u64",
+    "scopes": [
+      "frontend",
+      "backend",
+      "server"
+    ],
+    "cap": "STATS_PX_CAP__FBS",
+    "file": "src/stats-proxy.c",
+    "line": 124,
+    "citation": "src/stats-proxy.c:124"
+  },
+  {
+    "index": 45,
+    "enum_name": "ST_I_PX_HANAFAIL",
+    "name": "hanafail",
+    "alt_name": null,
+    "desc": "Total number of failed checks caused by an 'on-error' directive after an 'observe' condition matched",
+    "type": "u64",
+    "scopes": [
+      "server"
+    ],
+    "cap": "STATS_PX_CAP____S",
+    "file": "src/stats-proxy.c",
+    "line": 125,
+    "citation": "src/stats-proxy.c:125"
+  },
+  {
+    "index": 46,
+    "enum_name": "ST_I_PX_REQ_RATE",
+    "name": "req_rate",
+    "alt_name": null,
+    "desc": "Number of HTTP requests processed over the last second on this object",
+    "type": "u32",
+    "scopes": [
+      "frontend"
+    ],
+    "cap": "STATS_PX_CAP__F__",
+    "file": "src/stats-proxy.c",
+    "line": 126,
+    "citation": "src/stats-proxy.c:126"
+  },
+  {
+    "index": 47,
+    "enum_name": "ST_I_PX_REQ_RATE_MAX",
+    "name": "req_rate_max",
+    "alt_name": "http_requests_rate_max",
+    "desc": "Highest value of http requests observed since the worker process started",
+    "type": "u32",
+    "scopes": [
+      "frontend"
+    ],
+    "cap": "STATS_PX_CAP__F__",
+    "file": "src/stats-proxy.c",
+    "line": 127,
+    "citation": "src/stats-proxy.c:127"
+  },
+  {
+    "index": 48,
+    "enum_name": "ST_I_PX_REQ_TOT",
+    "name": "req_tot",
+    "alt_name": "http_requests_total",
+    "desc": "Total number of HTTP requests processed by this object since the worker process started",
+    "type": "u64",
+    "scopes": [
+      "frontend",
+      "backend",
+      "server"
+    ],
+    "cap": "STATS_PX_CAP__FBS",
+    "file": "src/stats-proxy.c",
+    "line": 129,
+    "citation": "src/stats-proxy.c:129"
+  },
+  {
+    "index": 49,
+    "enum_name": "ST_I_PX_CLI_ABRT",
+    "name": "cli_abrt",
+    "alt_name": "client_aborts_total",
+    "desc": "Total number of requests or connections aborted by the client since the worker process started",
+    "type": "u64",
+    "scopes": [
+      "backend",
+      "server"
+    ],
+    "cap": "STATS_PX_CAP___BS",
+    "file": "src/stats-proxy.c",
+    "line": 130,
+    "citation": "src/stats-proxy.c:130"
+  },
+  {
+    "index": 50,
+    "enum_name": "ST_I_PX_SRV_ABRT",
+    "name": "srv_abrt",
+    "alt_name": "server_aborts_total",
+    "desc": "Total number of requests or connections aborted by the server since the worker process started",
+    "type": "u64",
+    "scopes": [
+      "backend",
+      "server"
+    ],
+    "cap": "STATS_PX_CAP___BS",
+    "file": "src/stats-proxy.c",
+    "line": 131,
+    "citation": "src/stats-proxy.c:131"
+  },
+  {
+    "index": 51,
+    "enum_name": "ST_I_PX_COMP_IN",
+    "name": "comp_in",
+    "alt_name": "http_comp_bytes_in_total",
+    "desc": "Total number of bytes submitted to the HTTP compressor for this object since the worker process started",
+    "type": "u64",
+    "scopes": [
+      "frontend",
+      "backend"
+    ],
+    "cap": "STATS_PX_CAP__FB_",
+    "file": "src/stats-proxy.c",
+    "line": 132,
+    "citation": "src/stats-proxy.c:132"
+  },
+  {
+    "index": 52,
+    "enum_name": "ST_I_PX_COMP_OUT",
+    "name": "comp_out",
+    "alt_name": "http_comp_bytes_out_total",
+    "desc": "Total number of bytes emitted by the HTTP compressor for this object since the worker process started",
+    "type": "u64",
+    "scopes": [
+      "frontend",
+      "backend"
+    ],
+    "cap": "STATS_PX_CAP__FB_",
+    "file": "src/stats-proxy.c",
+    "line": 133,
+    "citation": "src/stats-proxy.c:133"
+  },
+  {
+    "index": 53,
+    "enum_name": "ST_I_PX_COMP_BYP",
+    "name": "comp_byp",
+    "alt_name": "http_comp_bytes_bypassed_total",
+    "desc": "Total number of bytes that bypassed HTTP compression for this object since the worker process started (CPU/memory/bandwidth limitation)",
+    "type": "u64",
+    "scopes": [
+      "frontend",
+      "backend"
+    ],
+    "cap": "STATS_PX_CAP__FB_",
+    "file": "src/stats-proxy.c",
+    "line": 134,
+    "citation": "src/stats-proxy.c:134"
+  },
+  {
+    "index": 54,
+    "enum_name": "ST_I_PX_COMP_RSP",
+    "name": "comp_rsp",
+    "alt_name": "http_comp_responses_total",
+    "desc": "Total number of HTTP responses that were compressed for this object since the worker process started",
+    "type": "u64",
+    "scopes": [
+      "frontend",
+      "backend"
+    ],
+    "cap": "STATS_PX_CAP__FB_",
+    "file": "src/stats-proxy.c",
+    "line": 135,
+    "citation": "src/stats-proxy.c:135"
+  },
+  {
+    "index": 55,
+    "enum_name": "ST_I_PX_LASTSESS",
+    "name": "lastsess",
+    "alt_name": "last_session_seconds",
+    "desc": "How long ago some traffic was seen on this object on this worker process, in seconds",
+    "type": "s32",
+    "scopes": [
+      "backend",
+      "server"
+    ],
+    "cap": "STATS_PX_CAP___BS",
+    "file": "src/stats-proxy.c",
+    "line": 136,
+    "citation": "src/stats-proxy.c:136"
+  },
+  {
+    "index": 56,
+    "enum_name": "ST_I_PX_LAST_CHK",
+    "name": "last_chk",
+    "alt_name": null,
+    "desc": "Short description of the latest health check report for this server (see also check_desc)",
+    "type": "str",
+    "scopes": [
+      "server"
+    ],
+    "cap": null,
+    "file": "src/stats-proxy.c",
+    "line": 137,
+    "citation": "src/stats-proxy.c:137"
+  },
+  {
+    "index": 57,
+    "enum_name": "ST_I_PX_LAST_AGT",
+    "name": "last_agt",
+    "alt_name": null,
+    "desc": "Short description of the latest agent check report for this server (see also agent_desc)",
+    "type": "str",
+    "scopes": [
+      "server"
+    ],
+    "cap": null,
+    "file": "src/stats-proxy.c",
+    "line": 138,
+    "citation": "src/stats-proxy.c:138"
+  },
+  {
+    "index": 58,
+    "enum_name": "ST_I_PX_QTIME",
+    "name": "qtime",
+    "alt_name": "queue_time_average_seconds",
+    "desc": "Time spent in the queue, in milliseconds, averaged over the 1024 last requests (backend/server)",
+    "type": "u32",
+    "scopes": [
+      "backend",
+      "server"
+    ],
+    "cap": "STATS_PX_CAP___BS",
+    "file": "src/stats-proxy.c",
+    "line": 139,
+    "citation": "src/stats-proxy.c:139"
+  },
+  {
+    "index": 59,
+    "enum_name": "ST_I_PX_CTIME",
+    "name": "ctime",
+    "alt_name": "connect_time_average_seconds",
+    "desc": "Time spent waiting for a connection to complete, in milliseconds, averaged over the 1024 last requests (backend/server)",
+    "type": "u32",
+    "scopes": [
+      "backend",
+      "server"
+    ],
+    "cap": "STATS_PX_CAP___BS",
+    "file": "src/stats-proxy.c",
+    "line": 140,
+    "citation": "src/stats-proxy.c:140"
+  },
+  {
+    "index": 60,
+    "enum_name": "ST_I_PX_RTIME",
+    "name": "rtime",
+    "alt_name": "response_time_average_seconds",
+    "desc": "Time spent waiting for a server response, in milliseconds, averaged over the 1024 last requests (backend/server)",
+    "type": "u32",
+    "scopes": [
+      "backend",
+      "server"
+    ],
+    "cap": "STATS_PX_CAP___BS",
+    "file": "src/stats-proxy.c",
+    "line": 141,
+    "citation": "src/stats-proxy.c:141"
+  },
+  {
+    "index": 61,
+    "enum_name": "ST_I_PX_TTIME",
+    "name": "ttime",
+    "alt_name": "total_time_average_seconds",
+    "desc": "Total request+response time (request+queue+connect+response+processing), in milliseconds, averaged over the 1024 last requests (backend/server)",
+    "type": "u32",
+    "scopes": [
+      "backend",
+      "server"
+    ],
+    "cap": "STATS_PX_CAP___BS",
+    "file": "src/stats-proxy.c",
+    "line": 142,
+    "citation": "src/stats-proxy.c:142"
+  },
+  {
+    "index": 62,
+    "enum_name": "ST_I_PX_AGENT_STATUS",
+    "name": "agent_status",
+    "alt_name": "agent_status",
+    "desc": "Status report of the server's latest agent check, prefixed with '*' if a check is currently in progress",
+    "type": "str",
+    "scopes": [
+      "server"
+    ],
+    "cap": "STATS_PX_CAP____S",
+    "file": "src/stats-proxy.c",
+    "line": 143,
+    "citation": "src/stats-proxy.c:143"
+  },
+  {
+    "index": 63,
+    "enum_name": "ST_I_PX_AGENT_CODE",
+    "name": "agent_code",
+    "alt_name": "agent_code",
+    "desc": "Status code reported by the latest server agent check",
+    "type": "u32",
+    "scopes": [
+      "server"
+    ],
+    "cap": "STATS_PX_CAP____S",
+    "file": "src/stats-proxy.c",
+    "line": 144,
+    "citation": "src/stats-proxy.c:144"
+  },
+  {
+    "index": 64,
+    "enum_name": "ST_I_PX_AGENT_DURATION",
+    "name": "agent_duration",
+    "alt_name": "agent_duration_seconds",
+    "desc": "Total duration of the latest server agent check, in milliseconds",
+    "type": "u64",
+    "scopes": [
+      "server"
+    ],
+    "cap": "STATS_PX_CAP____S",
+    "file": "src/stats-proxy.c",
+    "line": 145,
+    "citation": "src/stats-proxy.c:145"
+  },
+  {
+    "index": 65,
+    "enum_name": "ST_I_PX_CHECK_DESC",
+    "name": "check_desc",
+    "alt_name": null,
+    "desc": "Textual description of the latest health check report for this server",
+    "type": "str",
+    "scopes": [
+      "server"
+    ],
+    "cap": null,
+    "file": "src/stats-proxy.c",
+    "line": 146,
+    "citation": "src/stats-proxy.c:146"
+  },
+  {
+    "index": 66,
+    "enum_name": "ST_I_PX_AGENT_DESC",
+    "name": "agent_desc",
+    "alt_name": null,
+    "desc": "Textual description of the latest agent check report for this server",
+    "type": "str",
+    "scopes": [
+      "server"
+    ],
+    "cap": null,
+    "file": "src/stats-proxy.c",
+    "line": 147,
+    "citation": "src/stats-proxy.c:147"
+  },
+  {
+    "index": 67,
+    "enum_name": "ST_I_PX_CHECK_RISE",
+    "name": "check_rise",
+    "alt_name": null,
+    "desc": "Number of successful health checks before declaring a server UP (server 'rise' setting)",
+    "type": "u32",
+    "scopes": [
+      "server"
+    ],
+    "cap": null,
+    "file": "src/stats-proxy.c",
+    "line": 148,
+    "citation": "src/stats-proxy.c:148"
+  },
+  {
+    "index": 68,
+    "enum_name": "ST_I_PX_CHECK_FALL",
+    "name": "check_fall",
+    "alt_name": null,
+    "desc": "Number of failed health checks before declaring a server DOWN (server 'fall' setting)",
+    "type": "u32",
+    "scopes": [
+      "server"
+    ],
+    "cap": null,
+    "file": "src/stats-proxy.c",
+    "line": 149,
+    "citation": "src/stats-proxy.c:149"
+  },
+  {
+    "index": 69,
+    "enum_name": "ST_I_PX_CHECK_HEALTH",
+    "name": "check_health",
+    "alt_name": null,
+    "desc": "Current server health check level (0..fall-1=DOWN, fall..rise-1=UP)",
+    "type": "u32",
+    "scopes": [
+      "server"
+    ],
+    "cap": null,
+    "file": "src/stats-proxy.c",
+    "line": 150,
+    "citation": "src/stats-proxy.c:150"
+  },
+  {
+    "index": 70,
+    "enum_name": "ST_I_PX_AGENT_RISE",
+    "name": "agent_rise",
+    "alt_name": null,
+    "desc": "Number of successful agent checks before declaring a server UP (server 'rise' setting)",
+    "type": "u32",
+    "scopes": [
+      "server"
+    ],
+    "cap": null,
+    "file": "src/stats-proxy.c",
+    "line": 151,
+    "citation": "src/stats-proxy.c:151"
+  },
+  {
+    "index": 71,
+    "enum_name": "ST_I_PX_AGENT_FALL",
+    "name": "agent_fall",
+    "alt_name": null,
+    "desc": "Number of failed agent checks before declaring a server DOWN (server 'fall' setting)",
+    "type": "u32",
+    "scopes": [
+      "server"
+    ],
+    "cap": null,
+    "file": "src/stats-proxy.c",
+    "line": 152,
+    "citation": "src/stats-proxy.c:152"
+  },
+  {
+    "index": 72,
+    "enum_name": "ST_I_PX_AGENT_HEALTH",
+    "name": "agent_health",
+    "alt_name": null,
+    "desc": "Current server agent check level (0..fall-1=DOWN, fall..rise-1=UP)",
+    "type": "u32",
+    "scopes": [
+      "server"
+    ],
+    "cap": null,
+    "file": "src/stats-proxy.c",
+    "line": 153,
+    "citation": "src/stats-proxy.c:153"
+  },
+  {
+    "index": 73,
+    "enum_name": "ST_I_PX_ADDR",
+    "name": "addr",
+    "alt_name": null,
+    "desc": "Server's address:port, shown only if show-legends is set, or at levels oper/admin for the CLI",
+    "type": "str",
+    "scopes": [
+      "server",
+      "listener"
+    ],
+    "cap": null,
+    "file": "src/stats-proxy.c",
+    "line": 154,
+    "citation": "src/stats-proxy.c:154"
+  },
+  {
+    "index": 74,
+    "enum_name": "ST_I_PX_COOKIE",
+    "name": "cookie",
+    "alt_name": null,
+    "desc": "Backend's cookie name or Server's cookie value, shown only if show-legends is set, or at levels oper/admin for the CLI",
+    "type": "str",
+    "scopes": [
+      "backend",
+      "server"
+    ],
+    "cap": null,
+    "file": "src/stats-proxy.c",
+    "line": 155,
+    "citation": "src/stats-proxy.c:155"
+  },
+  {
+    "index": 75,
+    "enum_name": "ST_I_PX_MODE",
+    "name": "mode",
+    "alt_name": null,
+    "desc": "'mode' setting (tcp/http/health/cli/spop)",
+    "type": "str",
+    "scopes": [
+      "frontend",
+      "backend",
+      "server",
+      "listener"
+    ],
+    "cap": null,
+    "file": "src/stats-proxy.c",
+    "line": 156,
+    "citation": "src/stats-proxy.c:156"
+  },
+  {
+    "index": 76,
+    "enum_name": "ST_I_PX_ALGO",
+    "name": "algo",
+    "alt_name": null,
+    "desc": "Backend's load balancing algorithm, shown only if show-legends is set, or at levels oper/admin for the CLI",
+    "type": "str",
+    "scopes": [
+      "backend"
+    ],
+    "cap": null,
+    "file": "src/stats-proxy.c",
+    "line": 157,
+    "citation": "src/stats-proxy.c:157"
+  },
+  {
+    "index": 77,
+    "enum_name": "ST_I_PX_CONN_RATE",
+    "name": "conn_rate",
+    "alt_name": null,
+    "desc": "Number of new connections accepted over the last second on the frontend for this worker process",
+    "type": "u32",
+    "scopes": [
+      "frontend"
+    ],
+    "cap": "STATS_PX_CAP__F__",
+    "file": "src/stats-proxy.c",
+    "line": 158,
+    "citation": "src/stats-proxy.c:158"
+  },
+  {
+    "index": 78,
+    "enum_name": "ST_I_PX_CONN_RATE_MAX",
+    "name": "conn_rate_max",
+    "alt_name": "connections_rate_max",
+    "desc": "Highest value of connections per second observed since the worker process started",
+    "type": "u32",
+    "scopes": [
+      "frontend"
+    ],
+    "cap": "STATS_PX_CAP__F__",
+    "file": "src/stats-proxy.c",
+    "line": 159,
+    "citation": "src/stats-proxy.c:159"
+  },
+  {
+    "index": 79,
+    "enum_name": "ST_I_PX_CONN_TOT",
+    "name": "conn_tot",
+    "alt_name": "connections_total",
+    "desc": "Total number of new connections accepted on this frontend since the worker process started",
+    "type": "u64",
+    "scopes": [
+      "frontend",
+      "listener"
+    ],
+    "cap": "STATS_PX_CAP_LF__",
+    "file": "src/stats-proxy.c",
+    "line": 160,
+    "citation": "src/stats-proxy.c:160"
+  },
+  {
+    "index": 80,
+    "enum_name": "ST_I_PX_INTERCEPTED",
+    "name": "intercepted",
+    "alt_name": "intercepted_requests_total",
+    "desc": "Total number of HTTP requests intercepted on the frontend (redirects/stats/services) since the worker process started",
+    "type": "u64",
+    "scopes": [
+      "frontend"
+    ],
+    "cap": "STATS_PX_CAP__F__",
+    "file": "src/stats-proxy.c",
+    "line": 161,
+    "citation": "src/stats-proxy.c:161"
+  },
+  {
+    "index": 81,
+    "enum_name": "ST_I_PX_DCON",
+    "name": "dcon",
+    "alt_name": "denied_connections_total",
+    "desc": "Total number of incoming connections blocked on a listener/frontend by a tcp-request connection rule since the worker process started",
+    "type": "u64",
+    "scopes": [
+      "frontend",
+      "listener"
+    ],
+    "cap": "STATS_PX_CAP_LF__",
+    "file": "src/stats-proxy.c",
+    "line": 162,
+    "citation": "src/stats-proxy.c:162"
+  },
+  {
+    "index": 82,
+    "enum_name": "ST_I_PX_DSES",
+    "name": "dses",
+    "alt_name": "denied_sessions_total",
+    "desc": "Total number of incoming sessions blocked on a listener/frontend by a tcp-request connection rule since the worker process started",
+    "type": "u64",
+    "scopes": [
+      "frontend",
+      "listener"
+    ],
+    "cap": "STATS_PX_CAP_LF__",
+    "file": "src/stats-proxy.c",
+    "line": 163,
+    "citation": "src/stats-proxy.c:163"
+  },
+  {
+    "index": 83,
+    "enum_name": "ST_I_PX_WREW",
+    "name": "wrew",
+    "alt_name": "failed_header_rewriting_total",
+    "desc": "Total number of failed HTTP header rewrites since the worker process started",
+    "type": "u64",
+    "scopes": [
+      "frontend",
+      "backend",
+      "server",
+      "listener"
+    ],
+    "cap": "STATS_PX_CAP_LFBS",
+    "file": "src/stats-proxy.c",
+    "line": 164,
+    "citation": "src/stats-proxy.c:164"
+  },
+  {
+    "index": 84,
+    "enum_name": "ST_I_PX_CONNECT",
+    "name": "connect",
+    "alt_name": "connection_attempts_total",
+    "desc": "Total number of outgoing connection attempts on this backend/server since the worker process started",
+    "type": "u64",
+    "scopes": [
+      "backend",
+      "server"
+    ],
+    "cap": "STATS_PX_CAP___BS",
+    "file": "src/stats-proxy.c",
+    "line": 165,
+    "citation": "src/stats-proxy.c:165"
+  },
+  {
+    "index": 85,
+    "enum_name": "ST_I_PX_REUSE",
+    "name": "reuse",
+    "alt_name": "connection_reuses_total",
+    "desc": "Total number of reused connection on this backend/server since the worker process started",
+    "type": "u64",
+    "scopes": [
+      "backend",
+      "server"
+    ],
+    "cap": "STATS_PX_CAP___BS",
+    "file": "src/stats-proxy.c",
+    "line": 166,
+    "citation": "src/stats-proxy.c:166"
+  },
+  {
+    "index": 86,
+    "enum_name": "ST_I_PX_CACHE_LOOKUPS",
+    "name": "cache_lookups",
+    "alt_name": "http_cache_lookups_total",
+    "desc": "Total number of HTTP requests looked up in the cache on this frontend/backend since the worker process started",
+    "type": "u64",
+    "scopes": [
+      "frontend",
+      "backend"
+    ],
+    "cap": "STATS_PX_CAP__FB_",
+    "file": "src/stats-proxy.c",
+    "line": 167,
+    "citation": "src/stats-proxy.c:167"
+  },
+  {
+    "index": 87,
+    "enum_name": "ST_I_PX_CACHE_HITS",
+    "name": "cache_hits",
+    "alt_name": "http_cache_hits_total",
+    "desc": "Total number of HTTP requests not found in the cache on this frontend/backend since the worker process started",
+    "type": "u64",
+    "scopes": [
+      "frontend",
+      "backend"
+    ],
+    "cap": "STATS_PX_CAP__FB_",
+    "file": "src/stats-proxy.c",
+    "line": 168,
+    "citation": "src/stats-proxy.c:168"
+  },
+  {
+    "index": 88,
+    "enum_name": "ST_I_PX_SRV_ICUR",
+    "name": "srv_icur",
+    "alt_name": "idle_connections_current",
+    "desc": "Current number of idle connections available for reuse on this server",
+    "type": "u32",
+    "scopes": [
+      "server"
+    ],
+    "cap": "STATS_PX_CAP____S",
+    "file": "src/stats-proxy.c",
+    "line": 169,
+    "citation": "src/stats-proxy.c:169"
+  },
+  {
+    "index": 89,
+    "enum_name": "ST_I_PX_SRV_ILIM",
+    "name": "src_ilim",
+    "alt_name": "idle_connections_limit",
+    "desc": "Limit on the number of available idle connections on this server (server 'pool_max_conn' directive)",
+    "type": "u32",
+    "scopes": [
+      "server"
+    ],
+    "cap": "STATS_PX_CAP____S",
+    "file": "src/stats-proxy.c",
+    "line": 170,
+    "citation": "src/stats-proxy.c:170"
+  },
+  {
+    "index": 90,
+    "enum_name": "ST_I_PX_QT_MAX",
+    "name": "qtime_max",
+    "alt_name": "max_queue_time_seconds",
+    "desc": "Maximum observed time spent in the queue, in milliseconds (backend/server)",
+    "type": "u32",
+    "scopes": [
+      "backend",
+      "server"
+    ],
+    "cap": "STATS_PX_CAP___BS",
+    "file": "src/stats-proxy.c",
+    "line": 171,
+    "citation": "src/stats-proxy.c:171"
+  },
+  {
+    "index": 91,
+    "enum_name": "ST_I_PX_CT_MAX",
+    "name": "ctime_max",
+    "alt_name": "max_connect_time_seconds",
+    "desc": "Maximum observed time spent waiting for a connection to complete, in milliseconds (backend/server)",
+    "type": "u32",
+    "scopes": [
+      "backend",
+      "server"
+    ],
+    "cap": "STATS_PX_CAP___BS",
+    "file": "src/stats-proxy.c",
+    "line": 172,
+    "citation": "src/stats-proxy.c:172"
+  },
+  {
+    "index": 92,
+    "enum_name": "ST_I_PX_RT_MAX",
+    "name": "rtime_max",
+    "alt_name": "max_response_time_seconds",
+    "desc": "Maximum observed time spent waiting for a server response, in milliseconds (backend/server)",
+    "type": "u32",
+    "scopes": [
+      "backend",
+      "server"
+    ],
+    "cap": "STATS_PX_CAP___BS",
+    "file": "src/stats-proxy.c",
+    "line": 173,
+    "citation": "src/stats-proxy.c:173"
+  },
+  {
+    "index": 93,
+    "enum_name": "ST_I_PX_TT_MAX",
+    "name": "ttime_max",
+    "alt_name": "max_total_time_seconds",
+    "desc": "Maximum observed total request+response time (request+queue+connect+response+processing), in milliseconds (backend/server)",
+    "type": "u32",
+    "scopes": [
+      "backend",
+      "server"
+    ],
+    "cap": "STATS_PX_CAP___BS",
+    "file": "src/stats-proxy.c",
+    "line": 174,
+    "citation": "src/stats-proxy.c:174"
+  },
+  {
+    "index": 94,
+    "enum_name": "ST_I_PX_EINT",
+    "name": "eint",
+    "alt_name": "internal_errors_total",
+    "desc": "Total number of internal errors since process started",
+    "type": "u64",
+    "scopes": [
+      "frontend",
+      "backend",
+      "server",
+      "listener"
+    ],
+    "cap": "STATS_PX_CAP_LFBS",
+    "file": "src/stats-proxy.c",
+    "line": 175,
+    "citation": "src/stats-proxy.c:175"
+  },
+  {
+    "index": 95,
+    "enum_name": "ST_I_PX_IDLE_CONN_CUR",
+    "name": "idle_conn_cur",
+    "alt_name": "unsafe_idle_connections_current",
+    "desc": "Current number of unsafe idle connections",
+    "type": "u32",
+    "scopes": [
+      "server"
+    ],
+    "cap": "STATS_PX_CAP____S",
+    "file": "src/stats-proxy.c",
+    "line": 176,
+    "citation": "src/stats-proxy.c:176"
+  },
+  {
+    "index": 96,
+    "enum_name": "ST_I_PX_SAFE_CONN_CUR",
+    "name": "safe_conn_cur",
+    "alt_name": "safe_idle_connections_current",
+    "desc": "Current number of safe idle connections",
+    "type": "u32",
+    "scopes": [
+      "server"
+    ],
+    "cap": "STATS_PX_CAP____S",
+    "file": "src/stats-proxy.c",
+    "line": 177,
+    "citation": "src/stats-proxy.c:177"
+  },
+  {
+    "index": 97,
+    "enum_name": "ST_I_PX_USED_CONN_CUR",
+    "name": "used_conn_cur",
+    "alt_name": "used_connections_current",
+    "desc": "Current number of connections in use",
+    "type": "u32",
+    "scopes": [
+      "server"
+    ],
+    "cap": "STATS_PX_CAP____S",
+    "file": "src/stats-proxy.c",
+    "line": 178,
+    "citation": "src/stats-proxy.c:178"
+  },
+  {
+    "index": 98,
+    "enum_name": "ST_I_PX_NEED_CONN_EST",
+    "name": "need_conn_est",
+    "alt_name": "need_connections_current",
+    "desc": "Estimated needed number of connections",
+    "type": "u32",
+    "scopes": [
+      "server"
+    ],
+    "cap": "STATS_PX_CAP____S",
+    "file": "src/stats-proxy.c",
+    "line": 179,
+    "citation": "src/stats-proxy.c:179"
+  },
+  {
+    "index": 99,
+    "enum_name": "ST_I_PX_UWEIGHT",
+    "name": "uweight",
+    "alt_name": "uweight",
+    "desc": "Server's user weight, or sum of active servers' user weights for a backend",
+    "type": "u32",
+    "scopes": [
+      "backend",
+      "server"
+    ],
+    "cap": "STATS_PX_CAP___BS",
+    "file": "src/stats-proxy.c",
+    "line": 180,
+    "citation": "src/stats-proxy.c:180"
+  },
+  {
+    "index": 100,
+    "enum_name": "ST_I_PX_AGG_SRV_STATUS",
+    "name": "agg_server_status",
+    "alt_name": "agg_server_status",
+    "desc": "Backend's aggregated gauge of servers' status",
+    "type": "u32",
+    "scopes": [
+      "backend"
+    ],
+    "cap": "STATS_PX_CAP___B_",
+    "file": "src/stats-proxy.c",
+    "line": 182,
+    "citation": "src/stats-proxy.c:182"
+  },
+  {
+    "index": 101,
+    "enum_name": "ST_I_PX_AGG_SRV_CHECK_STATUS",
+    "name": "agg_server_check_status",
+    "alt_name": "agg_server_check_status",
+    "desc": "[DEPRECATED] Backend's aggregated gauge of servers' status",
+    "type": "u32",
+    "scopes": [
+      "backend"
+    ],
+    "cap": "STATS_PX_CAP___B_",
+    "file": "src/stats-proxy.c",
+    "line": 181,
+    "citation": "src/stats-proxy.c:181"
+  },
+  {
+    "index": 102,
+    "enum_name": "ST_I_PX_AGG_CHECK_STATUS",
+    "name": "agg_check_status",
+    "alt_name": "agg_check_status",
+    "desc": "Backend's aggregated gauge of servers' state check status",
+    "type": "u32",
+    "scopes": [
+      "backend"
+    ],
+    "cap": "STATS_PX_CAP___B_",
+    "file": "src/stats-proxy.c",
+    "line": 183,
+    "citation": "src/stats-proxy.c:183"
+  },
+  {
+    "index": 103,
+    "enum_name": "ST_I_PX_SRID",
+    "name": "srid",
+    "alt_name": null,
+    "desc": "Server id revision, to prevent server id reuse mixups",
+    "type": "u32",
+    "scopes": [
+      "server"
+    ],
+    "cap": null,
+    "file": "src/stats-proxy.c",
+    "line": 184,
+    "citation": "src/stats-proxy.c:184"
+  },
+  {
+    "index": 104,
+    "enum_name": "ST_I_PX_SESS_OTHER",
+    "name": "sess_other",
+    "alt_name": null,
+    "desc": "Total number of sessions other than HTTP since process started",
+    "type": "u64",
+    "scopes": [
+      "frontend"
+    ],
+    "cap": null,
+    "file": "src/stats-proxy.c",
+    "line": 185,
+    "citation": "src/stats-proxy.c:185"
+  },
+  {
+    "index": 105,
+    "enum_name": "ST_I_PX_H1SESS",
+    "name": "h1sess",
+    "alt_name": null,
+    "desc": "Total number of HTTP/1 sessions since process started",
+    "type": "u64",
+    "scopes": [
+      "frontend"
+    ],
+    "cap": "STATS_PX_CAP__F__",
+    "file": "src/stats-proxy.c",
+    "line": 186,
+    "citation": "src/stats-proxy.c:186"
+  },
+  {
+    "index": 106,
+    "enum_name": "ST_I_PX_H2SESS",
+    "name": "h2sess",
+    "alt_name": null,
+    "desc": "Total number of HTTP/2 sessions since process started",
+    "type": "u64",
+    "scopes": [
+      "frontend"
+    ],
+    "cap": "STATS_PX_CAP__F__",
+    "file": "src/stats-proxy.c",
+    "line": 187,
+    "citation": "src/stats-proxy.c:187"
+  },
+  {
+    "index": 107,
+    "enum_name": "ST_I_PX_H3SESS",
+    "name": "h3sess",
+    "alt_name": null,
+    "desc": "Total number of HTTP/3 sessions since process started",
+    "type": "u64",
+    "scopes": [
+      "frontend"
+    ],
+    "cap": "STATS_PX_CAP__F__",
+    "file": "src/stats-proxy.c",
+    "line": 188,
+    "citation": "src/stats-proxy.c:188"
+  },
+  {
+    "index": 108,
+    "enum_name": "ST_I_PX_REQ_OTHER",
+    "name": "req_other",
+    "alt_name": null,
+    "desc": "Total number of sessions other than HTTP processed by this object since the worker process started",
+    "type": "u64",
+    "scopes": [
+      "frontend"
+    ],
+    "cap": "STATS_PX_CAP__F__",
+    "file": "src/stats-proxy.c",
+    "line": 189,
+    "citation": "src/stats-proxy.c:189"
+  },
+  {
+    "index": 109,
+    "enum_name": "ST_I_PX_H1REQ",
+    "name": "h1req",
+    "alt_name": null,
+    "desc": "Total number of HTTP/1 sessions processed by this object since the worker process started",
+    "type": "u64",
+    "scopes": [
+      "frontend"
+    ],
+    "cap": "STATS_PX_CAP__F__",
+    "file": "src/stats-proxy.c",
+    "line": 190,
+    "citation": "src/stats-proxy.c:190"
+  },
+  {
+    "index": 110,
+    "enum_name": "ST_I_PX_H2REQ",
+    "name": "h2req",
+    "alt_name": null,
+    "desc": "Total number of hTTP/2 sessions processed by this object since the worker process started",
+    "type": "u64",
+    "scopes": [
+      "frontend"
+    ],
+    "cap": "STATS_PX_CAP__F__",
+    "file": "src/stats-proxy.c",
+    "line": 191,
+    "citation": "src/stats-proxy.c:191"
+  },
+  {
+    "index": 111,
+    "enum_name": "ST_I_PX_H3REQ",
+    "name": "h3req",
+    "alt_name": null,
+    "desc": "Total number of HTTP/3 sessions processed by this object since the worker process started",
+    "type": "u64",
+    "scopes": [
+      "frontend"
+    ],
+    "cap": "STATS_PX_CAP__F__",
+    "file": "src/stats-proxy.c",
+    "line": 192,
+    "citation": "src/stats-proxy.c:192"
+  },
+  {
+    "index": 112,
+    "enum_name": "ST_I_PX_PROTO",
+    "name": "proto",
+    "alt_name": null,
+    "desc": "Protocol",
+    "type": "str",
+    "scopes": [
+      "listener"
+    ],
+    "cap": null,
+    "file": "src/stats-proxy.c",
+    "line": 193,
+    "citation": "src/stats-proxy.c:193"
+  },
+  {
+    "index": 113,
+    "enum_name": "ST_I_PX_PRIV_IDLE_CUR",
+    "name": "priv_idle_cur",
+    "alt_name": "private_idle_connections_current",
+    "desc": "Current number of private idle connections",
+    "type": "u32",
+    "scopes": [
+      "server"
+    ],
+    "cap": "STATS_PX_CAP____S",
+    "file": "src/stats-proxy.c",
+    "line": 194,
+    "citation": "src/stats-proxy.c:194"
+  },
+  {
+    "index": 114,
+    "enum_name": "ST_I_PX_REQ_IN",
+    "name": "reqbin",
+    "alt_name": "req_bytes_in_total",
+    "desc": "Total number of request bytes received since process started",
+    "type": "u64",
+    "scopes": [
+      "frontend",
+      "backend",
+      "server",
+      "listener"
+    ],
+    "cap": "STATS_PX_CAP_LFBS",
+    "file": "src/stats-proxy.c",
+    "line": 195,
+    "citation": "src/stats-proxy.c:195"
+  },
+  {
+    "index": 115,
+    "enum_name": "ST_I_PX_REQ_OUT",
+    "name": "reqbout",
+    "alt_name": "req_bytes_out_total",
+    "desc": "Total number of request bytes sent since process started",
+    "type": "u64",
+    "scopes": [
+      "frontend",
+      "backend",
+      "server",
+      "listener"
+    ],
+    "cap": "STATS_PX_CAP_LFBS",
+    "file": "src/stats-proxy.c",
+    "line": 196,
+    "citation": "src/stats-proxy.c:196"
+  },
+  {
+    "index": 116,
+    "enum_name": "ST_I_PX_RES_IN",
+    "name": "resbin",
+    "alt_name": "res_bytes_in_total",
+    "desc": "Total number of response bytes received since process started",
+    "type": "u64",
+    "scopes": [
+      "frontend",
+      "backend",
+      "server",
+      "listener"
+    ],
+    "cap": "STATS_PX_CAP_LFBS",
+    "file": "src/stats-proxy.c",
+    "line": 197,
+    "citation": "src/stats-proxy.c:197"
+  },
+  {
+    "index": 117,
+    "enum_name": "ST_I_PX_RES_OUT",
+    "name": "resbout",
+    "alt_name": "res_bytes_out_total",
+    "desc": "Total number of response bytes sent since process started",
+    "type": "u64",
+    "scopes": [
+      "frontend",
+      "backend",
+      "server",
+      "listener"
+    ],
+    "cap": "STATS_PX_CAP_LFBS",
+    "file": "src/stats-proxy.c",
+    "line": 198,
+    "citation": "src/stats-proxy.c:198"
+  },
+  {
+    "index": 118,
+    "enum_name": "ST_I_PX_CACHE_HINT_HITS",
+    "name": "cache_hint_hits",
+    "alt_name": "http_cache_hint_hits_total",
+    "desc": "Total number of HTTP requests for which a 103 Early Hints response was emitted from the cache on this frontend/backend since the worker process started",
+    "type": "u64",
+    "scopes": [
+      "frontend",
+      "backend"
+    ],
+    "cap": "STATS_PX_CAP__FB_",
+    "file": "src/stats-proxy.c",
+    "line": 199,
+    "citation": "src/stats-proxy.c:199"
+  }
+]
