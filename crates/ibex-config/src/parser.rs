@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use crate::ast::{
     AclCondition, AclRule, AclTerm, BackendSection, BalanceAlgorithm, BindConfig, Config,
-    DefaultServerConfig, DefaultsSection, FrontendSection, GlobalSection, HeaderExp,
+    DefaultServerConfig, DefaultsSection, FrontendSection, GlobalSection,
     HttpAfterResAction, HttpAfterResRule, HttpReqAction, HttpReqRule, HttpResAction, HttpResRule,
     ListenSection, LogConfig, LogFacility, LogLevel, Mode, Server, StatsConfig, StickRule,
     StickRuleType, StickTableConfigAst, TcpReqConnAction, TcpReqConnRule, TimeoutConfig,
@@ -448,6 +448,12 @@ fn parse_defaults_directive(
             }
             Ok(())
         }
+        "contimeout" => parse_contimeout(kw),
+        "clitimeout" => parse_clitimeout(kw),
+        "srvtimeout" => parse_srvtimeout(kw),
+        "dispatch" => parse_dispatch(kw),
+        "cliexp" => parse_cliexp(kw),
+        "srvexp" => parse_srvexp(kw),
         _ => Ok(()),
     }
 }
@@ -464,19 +470,10 @@ fn parse_listen_directive(
             Ok(())
         }
         "cookie" => parse_cookie(&mut proxy.cookie, tokens, kw),
-        "contimeout" => parse_contimeout(&mut proxy.contimeout, tokens, kw),
-        "clitimeout" => parse_clitimeout(&mut proxy.clitimeout, tokens, kw),
-        "srvtimeout" => parse_srvtimeout(&mut proxy.srvtimeout, tokens, kw),
-        "timeout" => {
-            parse_generic_timeout(
-                &mut proxy.contimeout,
-                &mut proxy.clitimeout,
-                &mut proxy.srvtimeout,
-                tokens,
-                kw,
-            )?;
-            parse_timeout_directive(&mut proxy.timeouts, tokens, kw)
-        }
+        "contimeout" => parse_contimeout(kw),
+        "clitimeout" => parse_clitimeout(kw),
+        "srvtimeout" => parse_srvtimeout(kw),
+        "timeout" => parse_timeout_directive(&mut proxy.timeouts, tokens, kw),
         "retries" => parse_retries(&mut proxy.retries, tokens, kw),
         "redisp" => {
             proxy.redisp = true;
@@ -484,7 +481,7 @@ fn parse_listen_directive(
         }
         "maxconn" => parse_maxconn(&mut proxy.maxconn, tokens, kw),
         "grace" => parse_grace(&mut proxy.grace, tokens, kw),
-        "dispatch" => parse_dispatch(&mut proxy.dispatch, tokens, kw),
+        "dispatch" => parse_dispatch(kw),
         "default-server" => parse_default_server(&mut proxy.default_server, tokens, kw),
         "server" => parse_server(
             &mut proxy.servers,
@@ -493,8 +490,8 @@ fn parse_listen_directive(
             kw,
         ),
         "log" => parse_log(&mut proxy.logs, tokens, kw),
-        "cliexp" => parse_cliexp(&mut proxy.cliexp, tokens, kw),
-        "srvexp" => parse_srvexp(&mut proxy.srvexp, tokens, kw),
+        "cliexp" => parse_cliexp(kw),
+        "srvexp" => parse_srvexp(kw),
         "balance" => parse_balance(&mut proxy.balance, tokens, kw),
         "acl" => parse_acl(&mut proxy.acls, tokens, kw),
         "use_backend" => parse_use_backend(&mut proxy.use_backends, tokens, kw),
@@ -532,6 +529,12 @@ fn parse_listen_directive(
         "track-sc0" | "track-sc1" | "track-sc2" => {
             parse_track_rule(&mut proxy.stick_rules, tokens, kw)
         }
+        "tcp-request" => parse_tcp_req_conn_rule(&mut proxy.tcp_req_conn_rules, tokens, kw),
+        "http-request" => parse_http_req_rule(&mut proxy.http_req_rules, tokens, kw),
+        "http-response" => parse_http_res_rule(&mut proxy.http_res_rules, tokens, kw),
+        "http-after-response" => {
+            parse_http_after_res_rule(&mut proxy.http_after_res_rules, tokens, kw)
+        }
         "stats" => parse_stats_directive(&mut proxy.stats, tokens, kw),
         other => Err(ConfigError::new(
             kw.line,
@@ -559,6 +562,7 @@ fn parse_frontend_directive(
         }
         "tcp-request" => parse_tcp_req_conn_rule(&mut fe.tcp_req_conn_rules, tokens, kw),
         "http-request" => parse_http_req_rule(&mut fe.http_req_rules, tokens, kw),
+        "http-response" => parse_http_res_rule(&mut fe.http_res_rules, tokens, kw),
         "http-after-response" => {
             parse_http_after_res_rule(&mut fe.http_after_res_rules, tokens, kw)
         }
@@ -567,16 +571,15 @@ fn parse_frontend_directive(
             fe.disabled = true;
             Ok(())
         }
-        "clitimeout" => parse_clitimeout(&mut fe.clitimeout, tokens, kw),
-        "timeout" => {
-            let mut dummy1 = None;
-            let mut dummy2 = None;
-            parse_generic_timeout(&mut dummy1, &mut fe.clitimeout, &mut dummy2, tokens, kw)?;
-            parse_timeout_directive(&mut fe.timeouts, tokens, kw)
-        }
+        "clitimeout" => parse_clitimeout(kw),
+        "contimeout" => parse_contimeout(kw),
+        "srvtimeout" => parse_srvtimeout(kw),
+        "dispatch" => parse_dispatch(kw),
+        "cliexp" => parse_cliexp(kw),
+        "srvexp" => parse_srvexp(kw),
+        "timeout" => parse_timeout_directive(&mut fe.timeouts, tokens, kw),
         "maxconn" => parse_maxconn(&mut fe.maxconn, tokens, kw),
         "log" => parse_log(&mut fe.logs, tokens, kw),
-        "cliexp" => parse_cliexp(&mut fe.cliexp, tokens, kw),
         "acl" => parse_acl(&mut fe.acls, tokens, kw),
         "use_backend" => parse_use_backend(&mut fe.use_backends, tokens, kw),
         "default_backend" => parse_default_backend(&mut fe.default_backend, tokens, kw),
@@ -675,25 +678,16 @@ fn parse_backend_directive(
         }
         "balance" => parse_balance(&mut be.balance, tokens, kw),
         "cookie" => parse_cookie(&mut be.cookie, tokens, kw),
-        "contimeout" => parse_contimeout(&mut be.contimeout, tokens, kw),
-        "srvtimeout" => parse_srvtimeout(&mut be.srvtimeout, tokens, kw),
-        "timeout" => {
-            let mut dummy = None;
-            parse_generic_timeout(
-                &mut be.contimeout,
-                &mut dummy,
-                &mut be.srvtimeout,
-                tokens,
-                kw,
-            )?;
-            parse_timeout_directive(&mut be.timeouts, tokens, kw)
-        }
+        "contimeout" => parse_contimeout(kw),
+        "clitimeout" => parse_clitimeout(kw),
+        "srvtimeout" => parse_srvtimeout(kw),
+        "timeout" => parse_timeout_directive(&mut be.timeouts, tokens, kw),
         "retries" => parse_retries(&mut be.retries, tokens, kw),
         "redisp" => {
             be.redisp = true;
             Ok(())
         }
-        "dispatch" => parse_dispatch(&mut be.dispatch, tokens, kw),
+        "dispatch" => parse_dispatch(kw),
         "default-server" => parse_default_server(&mut be.default_server, tokens, kw),
         "server" => parse_server(&mut be.servers, be.default_server.as_ref(), tokens, kw),
         "http-request" => parse_http_req_rule(&mut be.http_req_rules, tokens, kw),
@@ -701,7 +695,8 @@ fn parse_backend_directive(
         "http-after-response" => {
             parse_http_after_res_rule(&mut be.http_after_res_rules, tokens, kw)
         }
-        "srvexp" => parse_srvexp(&mut be.srvexp, tokens, kw),
+        "cliexp" => parse_cliexp(kw),
+        "srvexp" => parse_srvexp(kw),
         "acl" => parse_acl(&mut be.acls, tokens, kw),
         "stick-table" => parse_stick_table(&mut be.stick_table, tokens, kw),
         "stick" => parse_stick_rule(&mut be.stick_rules, tokens, kw),
@@ -869,92 +864,28 @@ fn parse_cookie(
     Ok(())
 }
 
-fn parse_contimeout(
-    contimeout: &mut Option<Duration>,
-    tokens: &[Token],
-    kw: &Token,
-) -> Result<(), ConfigError> {
-    if tokens.len() < 2 || tokens[1].text.is_empty() {
-        return Err(ConfigError::new(
-            kw.line,
-            kw.col,
-            "<contimeout> expects an integer <time_in_ms> as argument.",
-        ));
-    }
-    let dur = parse_timeout(&tokens[1], "contimeout")?;
-    if contimeout.is_none() {
-        *contimeout = Some(dur);
-    }
-    Ok(())
+fn parse_contimeout(kw: &Token) -> Result<(), ConfigError> {
+    Err(ConfigError::new(
+        kw.line,
+        kw.col,
+        "'contimeout' was removed in HAProxy 2.1; use 'timeout connect' instead",
+    ))
 }
 
-fn parse_clitimeout(
-    clitimeout: &mut Option<Duration>,
-    tokens: &[Token],
-    kw: &Token,
-) -> Result<(), ConfigError> {
-    if tokens.len() < 2 || tokens[1].text.is_empty() {
-        return Err(ConfigError::new(
-            kw.line,
-            kw.col,
-            "<clitimeout> expects an integer <time_in_ms> as argument.",
-        ));
-    }
-    let dur = parse_timeout(&tokens[1], "clitimeout")?;
-    if clitimeout.is_none() {
-        *clitimeout = Some(dur);
-    }
-    Ok(())
+fn parse_clitimeout(kw: &Token) -> Result<(), ConfigError> {
+    Err(ConfigError::new(
+        kw.line,
+        kw.col,
+        "'clitimeout' was removed in HAProxy 2.1; use 'timeout client' instead",
+    ))
 }
 
-fn parse_srvtimeout(
-    srvtimeout: &mut Option<Duration>,
-    tokens: &[Token],
-    kw: &Token,
-) -> Result<(), ConfigError> {
-    if tokens.len() < 2 || tokens[1].text.is_empty() {
-        return Err(ConfigError::new(
-            kw.line,
-            kw.col,
-            "<srvtimeout> expects an integer <time_in_ms> as argument.",
-        ));
-    }
-    let dur = parse_timeout(&tokens[1], "srvtimeout")?;
-    if srvtimeout.is_none() {
-        *srvtimeout = Some(dur);
-    }
-    Ok(())
-}
-
-fn parse_generic_timeout(
-    contimeout: &mut Option<Duration>,
-    clitimeout: &mut Option<Duration>,
-    srvtimeout: &mut Option<Duration>,
-    tokens: &[Token],
-    kw: &Token,
-) -> Result<(), ConfigError> {
-    if tokens.len() < 3 || tokens[1].text.is_empty() || tokens[2].text.is_empty() {
-        return Err(ConfigError::new(
-            kw.line,
-            kw.col,
-            "<timeout> expects <target> and <time_in_ms> as arguments.",
-        ));
-    }
-    let target = &tokens[1].text;
-    let dur = parse_timeout(&tokens[2], "timeout")?;
-    match target.as_str() {
-        "connect" if contimeout.is_none() => {
-            *contimeout = Some(dur);
-        }
-        "client" if clitimeout.is_none() => {
-            *clitimeout = Some(dur);
-        }
-        "server" if srvtimeout.is_none() => {
-            *srvtimeout = Some(dur);
-        }
-        _ => {}
-    }
-    Ok(())
+fn parse_srvtimeout(kw: &Token) -> Result<(), ConfigError> {
+    Err(ConfigError::new(
+        kw.line,
+        kw.col,
+        "'srvtimeout' was removed in HAProxy 2.1; use 'timeout server' instead",
+    ))
 }
 
 fn parse_timeout_directive(
@@ -979,6 +910,8 @@ fn parse_timeout_directive(
         "http-keep-alive" => timeouts.http_keep_alive = Some(dur),
         "check" => timeouts.check = Some(dur),
         "queue" => timeouts.queue = Some(dur),
+        "tunnel" => timeouts.tunnel = Some(dur),
+        "tarpit" => timeouts.tarpit = Some(dur),
         _ => {}
     }
     Ok(())
@@ -1054,21 +987,12 @@ fn parse_grace(
     Ok(())
 }
 
-fn parse_dispatch(
-    dispatch: &mut Option<SocketAddr>,
-    tokens: &[Token],
-    kw: &Token,
-) -> Result<(), ConfigError> {
-    if tokens.len() < 2 || tokens[1].text.is_empty() {
-        return Err(ConfigError::new(
-            kw.line,
-            kw.col,
-            "<dispatch> expects <addr:port> as argument.",
-        ));
-    }
-    let addr = parse_socket_addr(&tokens[1], None)?;
-    *dispatch = Some(addr);
-    Ok(())
+fn parse_dispatch(kw: &Token) -> Result<(), ConfigError> {
+    Err(ConfigError::new(
+        kw.line,
+        kw.col,
+        "'dispatch' was removed in HAProxy 3.5; use 'server' or 'default_backend' instead",
+    ))
 }
 
 fn parse_server(
@@ -1179,48 +1103,20 @@ fn parse_log(logs: &mut Vec<LogConfig>, tokens: &[Token], kw: &Token) -> Result<
     Ok(())
 }
 
-fn parse_cliexp(
-    cliexp: &mut Vec<HeaderExp>,
-    tokens: &[Token],
-    kw: &Token,
-) -> Result<(), ConfigError> {
-    if tokens.len() < 3 || tokens[1].text.is_empty() || tokens[2].text.is_empty() {
-        return Err(ConfigError::new(
-            kw.line,
-            kw.col,
-            "<cliexp> expects <search> and <replace> as arguments.",
-        ));
-    }
-    validate_regex(&tokens[1])?;
-    if cliexp.len() < 10 {
-        cliexp.push(HeaderExp {
-            regex: tokens[1].text.clone(),
-            replacement: tokens[2].text.clone(),
-        });
-    }
-    Ok(())
+fn parse_cliexp(kw: &Token) -> Result<(), ConfigError> {
+    Err(ConfigError::new(
+        kw.line,
+        kw.col,
+        "'cliexp' was removed in HAProxy 2.0; use 'http-request replace-path' or 'http-request replace-header' instead",
+    ))
 }
 
-fn parse_srvexp(
-    srvexp: &mut Vec<HeaderExp>,
-    tokens: &[Token],
-    kw: &Token,
-) -> Result<(), ConfigError> {
-    if tokens.len() < 3 || tokens[1].text.is_empty() || tokens[2].text.is_empty() {
-        return Err(ConfigError::new(
-            kw.line,
-            kw.col,
-            "<srvexp> expects <search> and <replace> as arguments.",
-        ));
-    }
-    validate_regex(&tokens[1])?;
-    if srvexp.len() < 10 {
-        srvexp.push(HeaderExp {
-            regex: tokens[1].text.clone(),
-            replacement: tokens[2].text.clone(),
-        });
-    }
-    Ok(())
+fn parse_srvexp(kw: &Token) -> Result<(), ConfigError> {
+    Err(ConfigError::new(
+        kw.line,
+        kw.col,
+        "'srvexp' was removed in HAProxy 2.0; use 'http-response replace-header' instead",
+    ))
 }
 
 fn parse_acl(acls: &mut Vec<AclRule>, tokens: &[Token], kw: &Token) -> Result<(), ConfigError> {
@@ -1448,6 +1344,15 @@ fn parse_tcp_req_conn_rule(
     Ok(())
 }
 
+fn find_cond_idx(tokens: &[Token], start: usize) -> Option<usize> {
+    for (idx, tok) in tokens.iter().enumerate().skip(start) {
+        if tok.text == "if" || tok.text == "unless" {
+            return Some(idx);
+        }
+    }
+    None
+}
+
 #[allow(clippy::too_many_lines)]
 fn parse_http_req_rule(
     rules: &mut Vec<HttpReqRule>,
@@ -1463,194 +1368,608 @@ fn parse_http_req_rule(
     }
 
     let act_token = &tokens[1];
-    match act_token.text.as_str() {
-        "track-sc0" | "track-sc1" | "track-sc2" => {
-            if tokens.len() < 3 {
-                return Err(ConfigError::new(
-                    kw.line,
-                    kw.col,
-                    "<http-request track-sc*> expects sample expression.",
-                ));
+    let act_str = act_token.text.as_str();
+
+    if act_str == "track-sc0" || act_str == "track-sc1" || act_str == "track-sc2" {
+        if tokens.len() < 3 {
+            return Err(ConfigError::new(
+                kw.line,
+                kw.col,
+                "<http-request track-sc*> expects sample expression.",
+            ));
+        }
+        let expr = tokens[2].text.clone();
+        let mut table = None;
+        let mut cond_start = None;
+        let mut i = 3;
+        while i < tokens.len() {
+            if tokens[i].text == "table" && i + 1 < tokens.len() {
+                table = Some(tokens[i + 1].text.clone());
+                i += 2;
+            } else if tokens[i].text == "if" || tokens[i].text == "unless" {
+                cond_start = Some(i);
+                break;
+            } else {
+                i += 1;
             }
-            let expr = tokens[2].text.clone();
-            let mut table = None;
-            let mut cond_start = None;
-            let mut i = 3;
-            while i < tokens.len() {
-                if tokens[i].text == "table" && i + 1 < tokens.len() {
-                    table = Some(tokens[i + 1].text.clone());
+        }
+        let cond = if let Some(idx) = cond_start {
+            parse_acl_condition_from_tokens(&tokens[idx..])?
+        } else {
+            None
+        };
+        let action = match act_str {
+            "track-sc1" => HttpReqAction::TrackSc1 { expr, table },
+            "track-sc2" => HttpReqAction::TrackSc2 { expr, table },
+            _ => HttpReqAction::TrackSc0 { expr, table },
+        };
+        rules.push(HttpReqRule { action, cond });
+    } else if act_str == "return" {
+        let mut status = 200u16;
+        let mut content_type = None;
+        let mut lf_string = None;
+        let mut custom_headers = Vec::new();
+        let cond_idx = find_cond_idx(tokens, 2);
+        let limit = cond_idx.unwrap_or(tokens.len());
+        let mut i = 2;
+        while i < limit {
+            match tokens[i].text.as_str() {
+                "status" if i + 1 < limit => {
+                    status = parse_u16(&tokens[i + 1], "status")?;
                     i += 2;
-                } else if tokens[i].text == "if" || tokens[i].text == "unless" {
-                    cond_start = Some(i);
-                    break;
-                } else {
+                }
+                "content-type" if i + 1 < limit => {
+                    content_type = Some(tokens[i + 1].text.clone());
+                    i += 2;
+                }
+                "lf-string" | "string" if i + 1 < limit => {
+                    lf_string = Some(tokens[i + 1].text.clone());
+                    i += 2;
+                }
+                "file" | "lf-file" if i + 1 < limit => {
+                    let path = &tokens[i + 1].text;
+                    if let Ok(c) = std::fs::read_to_string(path) {
+                        lf_string = Some(c);
+                    } else if path == "/dev/null" {
+                        lf_string = Some(String::new());
+                    } else {
+                        lf_string = Some(String::new());
+                    }
+                    i += 2;
+                }
+                "hdr" if i + 2 < limit => {
+                    custom_headers.push((tokens[i + 1].text.clone(), tokens[i + 2].text.clone()));
+                    i += 3;
+                }
+                "default-errorfiles" => {
+                    i += 1;
+                }
+                "errorfile" if i + 2 < limit => {
+                    i += 3;
+                }
+                "errorfiles" if i + 1 < limit => {
+                    i += 2;
+                }
+                _ => {
                     i += 1;
                 }
             }
-            let cond = if let Some(idx) = cond_start {
-                parse_acl_condition_from_tokens(&tokens[idx..])?
-            } else {
-                None
-            };
-            let action = match act_token.text.as_str() {
-                "track-sc1" => HttpReqAction::TrackSc1 { expr, table },
-                "track-sc2" => HttpReqAction::TrackSc2 { expr, table },
-                _ => HttpReqAction::TrackSc0 { expr, table },
-            };
-            rules.push(HttpReqRule { action, cond });
         }
-        "return" => {
-            let mut status = 200u16;
-            let mut content_type = None;
-            let mut lf_string = None;
-            let mut cond_start = None;
-            let mut i = 2;
-            while i < tokens.len() {
-                match tokens[i].text.as_str() {
-                    "status" if i + 1 < tokens.len() => {
-                        status = parse_u16(&tokens[i + 1], "status")?;
-                        i += 2;
-                    }
-                    "content-type" if i + 1 < tokens.len() => {
-                        content_type = Some(tokens[i + 1].text.clone());
-                        i += 2;
-                    }
-                    "lf-string" | "string" | "file" | "lf-file" if i + 1 < tokens.len() => {
-                        lf_string = Some(tokens[i + 1].text.clone());
-                        i += 2;
-                    }
-                    "if" | "unless" => {
-                        cond_start = Some(i);
-                        break;
-                    }
-                    _ => {
-                        i += 1;
-                    }
-                }
+        let cond = if let Some(idx) = cond_idx {
+            parse_acl_condition_from_tokens(&tokens[idx..])?
+        } else {
+            None
+        };
+        let final_lf_string = if !custom_headers.is_empty() {
+            let mut enc = String::new();
+            for (k, v) in custom_headers {
+                enc.push_str(&format!("\0HDR:{k}:{v}\n"));
             }
-            let cond = if let Some(idx) = cond_start {
-                parse_acl_condition_from_tokens(&tokens[idx..])?
-            } else {
-                None
-            };
-            rules.push(HttpReqRule {
-                action: HttpReqAction::Return {
-                    status,
-                    content_type,
-                    lf_string,
-                },
-                cond,
-            });
-        }
-        "deny" => {
-            let mut deny_status = None;
-            let mut cond_start = None;
-            let mut i = 2;
-            while i < tokens.len() {
-                match tokens[i].text.as_str() {
-                    "deny_status" if i + 1 < tokens.len() => {
-                        deny_status = Some(parse_u16(&tokens[i + 1], "deny_status")?);
-                        i += 2;
-                    }
-                    "if" | "unless" => {
-                        cond_start = Some(i);
-                        break;
-                    }
-                    _ => {
-                        i += 1;
-                    }
-                }
+            if let Some(s) = lf_string {
+                enc.push_str(&format!("\0BODY:{s}"));
             }
-            let cond = if let Some(idx) = cond_start {
-                parse_acl_condition_from_tokens(&tokens[idx..])?
+            Some(enc)
+        } else {
+            lf_string
+        };
+        rules.push(HttpReqRule {
+            action: HttpReqAction::Return {
+                status,
+                content_type,
+                lf_string: final_lf_string,
+            },
+            cond,
+        });
+    } else if act_str == "deny" {
+        let mut deny_status = None;
+        let cond_idx = find_cond_idx(tokens, 2);
+        let limit = cond_idx.unwrap_or(tokens.len());
+        let mut i = 2;
+        while i < limit {
+            if (tokens[i].text == "status" || tokens[i].text == "deny_status") && i + 1 < limit {
+                deny_status = Some(parse_u16(&tokens[i + 1], "deny_status")?);
+                i += 2;
             } else {
-                None
-            };
-            rules.push(HttpReqRule {
-                action: HttpReqAction::Deny { deny_status },
-                cond,
-            });
-        }
-        "allow" => {
-            let cond = if tokens.len() > 2 {
-                parse_acl_condition_from_tokens(&tokens[2..])?
-            } else {
-                None
-            };
-            rules.push(HttpReqRule {
-                action: HttpReqAction::Allow,
-                cond,
-            });
-        }
-        "set-header" | "add-header" => {
-            if tokens.len() < 4 {
-                return Err(ConfigError::new(
-                    kw.line,
-                    kw.col,
-                    "<http-request set-header|add-header> expects <name> and <fmt>.",
-                ));
+                i += 1;
             }
-            let name = tokens[2].text.clone();
-            let fmt = tokens[3].text.clone();
-            let cond = if tokens.len() > 4 {
-                parse_acl_condition_from_tokens(&tokens[4..])?
-            } else {
-                None
-            };
-            let action = if act_token.text == "set-header" {
-                HttpReqAction::SetHeader { name, fmt }
-            } else {
-                HttpReqAction::AddHeader { name, fmt }
-            };
-            rules.push(HttpReqRule { action, cond });
         }
-        "del-header" => {
-            if tokens.len() < 3 {
-                return Err(ConfigError::new(
-                    kw.line,
-                    kw.col,
-                    "<http-request del-header> expects <name>.",
-                ));
-            }
-            let name = tokens[2].text.clone();
-            let cond = if tokens.len() > 3 {
-                parse_acl_condition_from_tokens(&tokens[3..])?
-            } else {
-                None
-            };
-            rules.push(HttpReqRule {
-                action: HttpReqAction::DelHeader { name },
-                cond,
-            });
-        }
-        "replace-header" => {
-            if tokens.len() < 5 {
-                return Err(ConfigError::new(
-                    kw.line,
-                    kw.col,
-                    "<http-request replace-header> expects <name>, <regex>, <replace>.",
-                ));
-            }
-            let name = tokens[2].text.clone();
-            let regex = tokens[3].text.clone();
-            let repl = tokens[4].text.clone();
-            let cond = if tokens.len() > 5 {
-                parse_acl_condition_from_tokens(&tokens[5..])?
-            } else {
-                None
-            };
-            rules.push(HttpReqRule {
-                action: HttpReqAction::ReplaceHeader { name, regex, repl },
-                cond,
-            });
-        }
-        other => {
+        let cond = if let Some(idx) = cond_idx {
+            parse_acl_condition_from_tokens(&tokens[idx..])?
+        } else {
+            None
+        };
+        rules.push(HttpReqRule {
+            action: HttpReqAction::Deny { deny_status },
+            cond,
+        });
+    } else if act_str == "allow" {
+        let cond_idx = find_cond_idx(tokens, 2);
+        let cond = if let Some(idx) = cond_idx {
+            parse_acl_condition_from_tokens(&tokens[idx..])?
+        } else {
+            None
+        };
+        rules.push(HttpReqRule {
+            action: HttpReqAction::Allow,
+            cond,
+        });
+    } else if act_str == "set-header" || act_str == "add-header" {
+        if tokens.len() < 4 {
             return Err(ConfigError::new(
-                act_token.line,
-                act_token.col,
-                format!("unknown http-request action <{other}>"),
+                kw.line,
+                kw.col,
+                "<http-request set-header|add-header> expects <name> and <fmt>.",
             ));
         }
+        let name = tokens[2].text.clone();
+        let fmt = tokens[3].text.clone();
+        let cond_idx = find_cond_idx(tokens, 4);
+        let cond = if let Some(idx) = cond_idx {
+            parse_acl_condition_from_tokens(&tokens[idx..])?
+        } else {
+            None
+        };
+        let action = if act_str == "set-header" {
+            HttpReqAction::SetHeader { name, fmt }
+        } else {
+            HttpReqAction::AddHeader { name, fmt }
+        };
+        rules.push(HttpReqRule { action, cond });
+    } else if act_str == "del-header" {
+        if tokens.len() < 3 {
+            return Err(ConfigError::new(
+                kw.line,
+                kw.col,
+                "<http-request del-header> expects <name>.",
+            ));
+        }
+        let name = tokens[2].text.clone();
+        let mut method = None;
+        let mut i = 3;
+        while i < tokens.len() {
+            if tokens[i].text == "-m" && i + 1 < tokens.len() {
+                method = Some(tokens[i + 1].text.clone());
+                i += 2;
+            } else if tokens[i].text == "if" || tokens[i].text == "unless" {
+                break;
+            } else {
+                i += 1;
+            }
+        }
+        let cond_idx = find_cond_idx(tokens, 2);
+        let cond = if let Some(idx) = cond_idx {
+            parse_acl_condition_from_tokens(&tokens[idx..])?
+        } else {
+            None
+        };
+        let encoded_name = if let Some(m) = method {
+            format!("\0m:{m}:{name}")
+        } else {
+            name
+        };
+        rules.push(HttpReqRule {
+            action: HttpReqAction::DelHeader { name: encoded_name },
+            cond,
+        });
+    } else if act_str == "replace-header" {
+        if tokens.len() < 5 {
+            return Err(ConfigError::new(
+                kw.line,
+                kw.col,
+                "<http-request replace-header> expects <name>, <regex>, <replace>.",
+            ));
+        }
+        let name = tokens[2].text.clone();
+        let regex = tokens[3].text.clone();
+        let repl = tokens[4].text.clone();
+        let cond_idx = find_cond_idx(tokens, 5);
+        let cond = if let Some(idx) = cond_idx {
+            parse_acl_condition_from_tokens(&tokens[idx..])?
+        } else {
+            None
+        };
+        rules.push(HttpReqRule {
+            action: HttpReqAction::ReplaceHeader { name, regex, repl },
+            cond,
+        });
+    } else if act_str == "replace-value" {
+        if tokens.len() < 5 {
+            return Err(ConfigError::new(
+                kw.line,
+                kw.col,
+                "<http-request replace-value> expects <name>, <regex>, <replace>.",
+            ));
+        }
+        let name = tokens[2].text.clone();
+        let regex = tokens[3].text.clone();
+        let repl = tokens[4].text.clone();
+        let cond_idx = find_cond_idx(tokens, 5);
+        let cond = if let Some(idx) = cond_idx {
+            parse_acl_condition_from_tokens(&tokens[idx..])?
+        } else {
+            None
+        };
+        rules.push(HttpReqRule {
+            action: HttpReqAction::ReplaceValue { name, regex, repl },
+            cond,
+        });
+    } else if act_str == "set-path" {
+        if tokens.len() < 3 {
+            return Err(ConfigError::new(
+                kw.line,
+                kw.col,
+                "<http-request set-path> expects <fmt>.",
+            ));
+        }
+        let fmt = tokens[2].text.clone();
+        let cond_idx = find_cond_idx(tokens, 3);
+        let cond = if let Some(idx) = cond_idx {
+            parse_acl_condition_from_tokens(&tokens[idx..])?
+        } else {
+            None
+        };
+        rules.push(HttpReqRule {
+            action: HttpReqAction::SetPath { fmt },
+            cond,
+        });
+    } else if act_str == "replace-path" {
+        if tokens.len() < 4 {
+            return Err(ConfigError::new(
+                kw.line,
+                kw.col,
+                "<http-request replace-path> expects <regex> and <replace>.",
+            ));
+        }
+        let regex = tokens[2].text.clone();
+        let repl = tokens[3].text.clone();
+        let cond_idx = find_cond_idx(tokens, 4);
+        let cond = if let Some(idx) = cond_idx {
+            parse_acl_condition_from_tokens(&tokens[idx..])?
+        } else {
+            None
+        };
+        rules.push(HttpReqRule {
+            action: HttpReqAction::ReplacePath { regex, repl },
+            cond,
+        });
+    } else if act_str == "set-pathq" {
+        if tokens.len() < 3 {
+            return Err(ConfigError::new(
+                kw.line,
+                kw.col,
+                "<http-request set-pathq> expects <fmt>.",
+            ));
+        }
+        let fmt = tokens[2].text.clone();
+        let cond_idx = find_cond_idx(tokens, 3);
+        let cond = if let Some(idx) = cond_idx {
+            parse_acl_condition_from_tokens(&tokens[idx..])?
+        } else {
+            None
+        };
+        rules.push(HttpReqRule {
+            action: HttpReqAction::SetPathq { fmt },
+            cond,
+        });
+    } else if act_str == "replace-pathq" {
+        if tokens.len() < 4 {
+            return Err(ConfigError::new(
+                kw.line,
+                kw.col,
+                "<http-request replace-pathq> expects <regex> and <replace>.",
+            ));
+        }
+        let regex = tokens[2].text.clone();
+        let repl = tokens[3].text.clone();
+        let cond_idx = find_cond_idx(tokens, 4);
+        let cond = if let Some(idx) = cond_idx {
+            parse_acl_condition_from_tokens(&tokens[idx..])?
+        } else {
+            None
+        };
+        rules.push(HttpReqRule {
+            action: HttpReqAction::ReplacePathq { regex, repl },
+            cond,
+        });
+    } else if act_str == "set-query" {
+        if tokens.len() < 3 {
+            return Err(ConfigError::new(
+                kw.line,
+                kw.col,
+                "<http-request set-query> expects <fmt>.",
+            ));
+        }
+        let fmt = tokens[2].text.clone();
+        let cond_idx = find_cond_idx(tokens, 3);
+        let cond = if let Some(idx) = cond_idx {
+            parse_acl_condition_from_tokens(&tokens[idx..])?
+        } else {
+            None
+        };
+        rules.push(HttpReqRule {
+            action: HttpReqAction::SetQuery { fmt },
+            cond,
+        });
+    } else if act_str == "set-uri" {
+        if tokens.len() < 3 {
+            return Err(ConfigError::new(
+                kw.line,
+                kw.col,
+                "<http-request set-uri> expects <fmt>.",
+            ));
+        }
+        let fmt = tokens[2].text.clone();
+        let cond_idx = find_cond_idx(tokens, 3);
+        let cond = if let Some(idx) = cond_idx {
+            parse_acl_condition_from_tokens(&tokens[idx..])?
+        } else {
+            None
+        };
+        rules.push(HttpReqRule {
+            action: HttpReqAction::SetUri { fmt },
+            cond,
+        });
+    } else if act_str == "set-method" {
+        if tokens.len() < 3 {
+            return Err(ConfigError::new(
+                kw.line,
+                kw.col,
+                "<http-request set-method> expects <fmt>.",
+            ));
+        }
+        let fmt = tokens[2].text.clone();
+        let cond_idx = find_cond_idx(tokens, 3);
+        let cond = if let Some(idx) = cond_idx {
+            parse_acl_condition_from_tokens(&tokens[idx..])?
+        } else {
+            None
+        };
+        rules.push(HttpReqRule {
+            action: HttpReqAction::SetMethod { fmt },
+            cond,
+        });
+    } else if act_str == "set-src" {
+        let cond_idx = find_cond_idx(tokens, 2);
+        let limit = cond_idx.unwrap_or(tokens.len());
+        let expr = tokens[2..limit].iter().map(|t| t.text.as_str()).collect::<Vec<_>>().join(" ");
+        let cond = if let Some(idx) = cond_idx {
+            parse_acl_condition_from_tokens(&tokens[idx..])?
+        } else {
+            None
+        };
+        rules.push(HttpReqRule {
+            action: HttpReqAction::SetSrc { expr },
+            cond,
+        });
+    } else if act_str == "set-dst" {
+        let cond_idx = find_cond_idx(tokens, 2);
+        let limit = cond_idx.unwrap_or(tokens.len());
+        let expr = tokens[2..limit].iter().map(|t| t.text.as_str()).collect::<Vec<_>>().join(" ");
+        let cond = if let Some(idx) = cond_idx {
+            parse_acl_condition_from_tokens(&tokens[idx..])?
+        } else {
+            None
+        };
+        rules.push(HttpReqRule {
+            action: HttpReqAction::SetDst { expr },
+            cond,
+        });
+    } else if act_str == "redirect" {
+        let mut location = None;
+        let mut scheme = None;
+        let mut prefix = None;
+        let mut code = None;
+        let cond_idx = find_cond_idx(tokens, 2);
+        let limit = cond_idx.unwrap_or(tokens.len());
+        let mut i = 2;
+        while i < limit {
+            match tokens[i].text.as_str() {
+                "location" if i + 1 < limit => {
+                    location = Some(tokens[i + 1].text.clone());
+                    i += 2;
+                }
+                "scheme" if i + 1 < limit => {
+                    scheme = Some(tokens[i + 1].text.clone());
+                    i += 2;
+                }
+                "prefix" if i + 1 < limit => {
+                    prefix = Some(tokens[i + 1].text.clone());
+                    i += 2;
+                }
+                "code" if i + 1 < limit => {
+                    code = Some(parse_u16(&tokens[i + 1], "code")?);
+                    i += 2;
+                }
+                "ignore-empty" => {
+                    i += 1;
+                }
+                _ => {
+                    i += 1;
+                }
+            }
+        }
+        let cond = if let Some(idx) = cond_idx {
+            parse_acl_condition_from_tokens(&tokens[idx..])?
+        } else {
+            None
+        };
+        rules.push(HttpReqRule {
+            action: HttpReqAction::Redirect {
+                location,
+                scheme,
+                prefix,
+                code,
+            },
+            cond,
+        });
+    } else if act_str == "strict-mode" {
+        let on = tokens.get(2).map_or(true, |t| t.text == "on");
+        let cond_idx = find_cond_idx(tokens, 2);
+        let cond = if let Some(idx) = cond_idx {
+            parse_acl_condition_from_tokens(&tokens[idx..])?
+        } else {
+            None
+        };
+        rules.push(HttpReqRule {
+            action: HttpReqAction::StrictMode { on },
+            cond,
+        });
+    } else if act_str.starts_with("set-var(") || act_str.starts_with("set-var-fmt(") {
+        let var_name = act_token
+            .text
+            .trim_start_matches("set-var(")
+            .trim_start_matches("set-var-fmt(")
+            .trim_end_matches(')')
+            .to_string();
+        let cond_idx = find_cond_idx(tokens, 2);
+        let limit = cond_idx.unwrap_or(tokens.len());
+        let expr = tokens[2..limit].iter().map(|t| t.text.as_str()).collect::<Vec<_>>().join(" ");
+        let cond = if let Some(idx) = cond_idx {
+            parse_acl_condition_from_tokens(&tokens[idx..])?
+        } else {
+            None
+        };
+        rules.push(HttpReqRule {
+            action: HttpReqAction::SetVar { var_name, expr },
+            cond,
+        });
+    } else if act_str.starts_with("unset-var(") {
+        let var_name = act_token
+            .text
+            .trim_start_matches("unset-var(")
+            .trim_end_matches(')')
+            .to_string();
+        let cond_idx = find_cond_idx(tokens, 2);
+        let cond = if let Some(idx) = cond_idx {
+            parse_acl_condition_from_tokens(&tokens[idx..])?
+        } else {
+            None
+        };
+        rules.push(HttpReqRule {
+            action: HttpReqAction::UnsetVar { var_name },
+            cond,
+        });
+    } else if act_str == "normalize-uri" {
+        if tokens.len() < 3 {
+            return Err(ConfigError::new(
+                kw.line,
+                kw.col,
+                "<http-request normalize-uri> expects a normalizer.",
+            ));
+        }
+        let normalizer = tokens[2].text.clone();
+        let mut full = false;
+        let mut strict = false;
+        let cond_idx = find_cond_idx(tokens, 3);
+        let limit = cond_idx.unwrap_or(tokens.len());
+        for tok in &tokens[3..limit] {
+            if tok.text == "full" {
+                full = true;
+            } else if tok.text == "strict" {
+                strict = true;
+            }
+        }
+        let cond = if let Some(idx) = cond_idx {
+            parse_acl_condition_from_tokens(&tokens[idx..])?
+        } else {
+            None
+        };
+        rules.push(HttpReqRule {
+            action: HttpReqAction::NormalizeUri {
+                normalizer,
+                full,
+                strict,
+            },
+            cond,
+        });
+    } else if act_str == "set-timeout" {
+        if tokens.len() < 4 {
+            return Err(ConfigError::new(
+                kw.line,
+                kw.col,
+                "<http-request set-timeout> expects <type> and <value>.",
+            ));
+        }
+        let timeout_type = tokens[2].text.clone();
+        let cond_idx = find_cond_idx(tokens, 3);
+        let limit = cond_idx.unwrap_or(tokens.len());
+        let timeout_val = tokens[3..limit].iter().map(|t| t.text.as_str()).collect::<Vec<_>>().join(" ");
+        let cond = if let Some(idx) = cond_idx {
+            parse_acl_condition_from_tokens(&tokens[idx..])?
+        } else {
+            None
+        };
+        rules.push(HttpReqRule {
+            action: HttpReqAction::SetTimeout {
+                timeout_type,
+                timeout_val,
+            },
+            cond,
+        });
+    } else if act_str == "auth" {
+        let cond_idx = find_cond_idx(tokens, 2);
+        let cond = if let Some(idx) = cond_idx {
+            parse_acl_condition_from_tokens(&tokens[idx..])?
+        } else {
+            None
+        };
+        rules.push(HttpReqRule {
+            action: HttpReqAction::Auth,
+            cond,
+        });
+    } else if act_str == "capture" {
+        let cond_idx = find_cond_idx(tokens, 2);
+        let limit = cond_idx.unwrap_or(tokens.len());
+        let expr = if limit > 2 { tokens[2].text.clone() } else { String::new() };
+        let mut len = None;
+        let mut id = None;
+        let mut i = 3;
+        while i < limit {
+            if tokens[i].text == "len" && i + 1 < limit {
+                len = Some(tokens[i + 1].text.parse::<usize>().unwrap_or(64));
+                i += 2;
+            } else if tokens[i].text == "id" && i + 1 < limit {
+                id = Some(tokens[i + 1].text.parse::<usize>().unwrap_or(0));
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        let cond = if let Some(idx) = cond_idx {
+            parse_acl_condition_from_tokens(&tokens[idx..])?
+        } else {
+            None
+        };
+        rules.push(HttpReqRule {
+            action: HttpReqAction::Capture { expr, len, id },
+            cond,
+        });
+    } else {
+        return Err(ConfigError::new(
+            act_token.line,
+            act_token.col,
+            format!("unknown http-request action <{act_str}>"),
+        ));
     }
     Ok(())
 }
@@ -1668,74 +1987,233 @@ fn parse_http_res_rule(
         ));
     }
     let act_token = &tokens[1];
-    match act_token.text.as_str() {
-        "set-header" | "add-header" => {
-            if tokens.len() < 4 {
-                return Err(ConfigError::new(
-                    kw.line,
-                    kw.col,
-                    "<http-response set-header|add-header> expects <name> and <fmt>.",
-                ));
-            }
-            let name = tokens[2].text.clone();
-            let fmt = tokens[3].text.clone();
-            let cond = if tokens.len() > 4 {
-                parse_acl_condition_from_tokens(&tokens[4..])?
-            } else {
-                None
-            };
-            let action = if act_token.text == "set-header" {
-                HttpResAction::SetHeader { name, fmt }
-            } else {
-                HttpResAction::AddHeader { name, fmt }
-            };
-            rules.push(HttpResRule { action, cond });
-        }
-        "del-header" => {
-            if tokens.len() < 3 {
-                return Err(ConfigError::new(
-                    kw.line,
-                    kw.col,
-                    "<http-response del-header> expects <name>.",
-                ));
-            }
-            let name = tokens[2].text.clone();
-            let cond = if tokens.len() > 3 {
-                parse_acl_condition_from_tokens(&tokens[3..])?
-            } else {
-                None
-            };
-            rules.push(HttpResRule {
-                action: HttpResAction::DelHeader { name },
-                cond,
-            });
-        }
-        "set-status" => {
-            if tokens.len() < 3 {
-                return Err(ConfigError::new(
-                    kw.line,
-                    kw.col,
-                    "<http-response set-status> expects <status>.",
-                ));
-            }
-            let status = parse_u16(&tokens[2], "set-status")?;
-            let cond = if tokens.len() > 3 {
-                parse_acl_condition_from_tokens(&tokens[3..])?
-            } else {
-                None
-            };
-            rules.push(HttpResRule {
-                action: HttpResAction::SetStatus { status },
-                cond,
-            });
-        }
-        other => {
+    let act_str = act_token.text.as_str();
+
+    if act_str == "set-header" || act_str == "add-header" {
+        if tokens.len() < 4 {
             return Err(ConfigError::new(
-                act_token.line,
-                act_token.col,
-                format!("unknown http-response action <{other}>"),
+                kw.line,
+                kw.col,
+                "<http-response set-header|add-header> expects <name> and <fmt>.",
             ));
         }
+        let name = tokens[2].text.clone();
+        let fmt = tokens[3].text.clone();
+        let cond_idx = find_cond_idx(tokens, 4);
+        let cond = if let Some(idx) = cond_idx {
+            parse_acl_condition_from_tokens(&tokens[idx..])?
+        } else {
+            None
+        };
+        let action = if act_str == "set-header" {
+            HttpResAction::SetHeader { name, fmt }
+        } else {
+            HttpResAction::AddHeader { name, fmt }
+        };
+        rules.push(HttpResRule { action, cond });
+    } else if act_str == "del-header" {
+        if tokens.len() < 3 {
+            return Err(ConfigError::new(
+                kw.line,
+                kw.col,
+                "<http-response del-header> expects <name>.",
+            ));
+        }
+        let name = tokens[2].text.clone();
+        let mut method = None;
+        let mut i = 3;
+        while i < tokens.len() {
+            if tokens[i].text == "-m" && i + 1 < tokens.len() {
+                method = Some(tokens[i + 1].text.clone());
+                i += 2;
+            } else if tokens[i].text == "if" || tokens[i].text == "unless" {
+                break;
+            } else {
+                i += 1;
+            }
+        }
+        let cond_idx = find_cond_idx(tokens, 2);
+        let cond = if let Some(idx) = cond_idx {
+            parse_acl_condition_from_tokens(&tokens[idx..])?
+        } else {
+            None
+        };
+        let encoded_name = if let Some(m) = method {
+            format!("\0m:{m}:{name}")
+        } else {
+            name
+        };
+        rules.push(HttpResRule {
+            action: HttpResAction::DelHeader { name: encoded_name },
+            cond,
+        });
+    } else if act_str == "set-status" {
+        if tokens.len() < 3 {
+            return Err(ConfigError::new(
+                kw.line,
+                kw.col,
+                "<http-response set-status> expects <status>.",
+            ));
+        }
+        let status = parse_u16(&tokens[2], "set-status")?;
+        let cond_idx = find_cond_idx(tokens, 3);
+        let cond = if let Some(idx) = cond_idx {
+            parse_acl_condition_from_tokens(&tokens[idx..])?
+        } else {
+            None
+        };
+        rules.push(HttpResRule {
+            action: HttpResAction::SetStatus { status },
+            cond,
+        });
+    } else if act_str == "replace-header" {
+        if tokens.len() < 5 {
+            return Err(ConfigError::new(
+                kw.line,
+                kw.col,
+                "<http-response replace-header> expects <name>, <regex>, <replace>.",
+            ));
+        }
+        let name = tokens[2].text.clone();
+        let regex = tokens[3].text.clone();
+        let repl = tokens[4].text.clone();
+        let cond_idx = find_cond_idx(tokens, 5);
+        let cond = if let Some(idx) = cond_idx {
+            parse_acl_condition_from_tokens(&tokens[idx..])?
+        } else {
+            None
+        };
+        rules.push(HttpResRule {
+            action: HttpResAction::SetHeader {
+                name: format!("\0replace-header:{name}"),
+                fmt: format!("{regex}\t{repl}"),
+            },
+            cond,
+        });
+    } else if act_str == "replace-value" {
+        if tokens.len() < 5 {
+            return Err(ConfigError::new(
+                kw.line,
+                kw.col,
+                "<http-response replace-value> expects <name>, <regex>, <replace>.",
+            ));
+        }
+        let name = tokens[2].text.clone();
+        let regex = tokens[3].text.clone();
+        let repl = tokens[4].text.clone();
+        let cond_idx = find_cond_idx(tokens, 5);
+        let cond = if let Some(idx) = cond_idx {
+            parse_acl_condition_from_tokens(&tokens[idx..])?
+        } else {
+            None
+        };
+        rules.push(HttpResRule {
+            action: HttpResAction::SetHeader {
+                name: format!("\0replace-value:{name}"),
+                fmt: format!("{regex}\t{repl}"),
+            },
+            cond,
+        });
+    } else if act_str.starts_with("set-var(") || act_str.starts_with("set-var-fmt(") {
+        let var_name = act_token
+            .text
+            .trim_start_matches("set-var(")
+            .trim_start_matches("set-var-fmt(")
+            .trim_end_matches(')')
+            .to_string();
+        let cond_idx = find_cond_idx(tokens, 2);
+        let limit = cond_idx.unwrap_or(tokens.len());
+        let expr = tokens[2..limit].iter().map(|t| t.text.as_str()).collect::<Vec<_>>().join(" ");
+        let cond = if let Some(idx) = cond_idx {
+            parse_acl_condition_from_tokens(&tokens[idx..])?
+        } else {
+            None
+        };
+        rules.push(HttpResRule {
+            action: HttpResAction::SetHeader {
+                name: format!("\0set-var:{var_name}"),
+                fmt: expr,
+            },
+            cond,
+        });
+    } else if act_str.starts_with("unset-var(") {
+        let var_name = act_token
+            .text
+            .trim_start_matches("unset-var(")
+            .trim_end_matches(')')
+            .to_string();
+        let cond_idx = find_cond_idx(tokens, 2);
+        let cond = if let Some(idx) = cond_idx {
+            parse_acl_condition_from_tokens(&tokens[idx..])?
+        } else {
+            None
+        };
+        rules.push(HttpResRule {
+            action: HttpResAction::DelHeader {
+                name: format!("\0unset-var:{var_name}"),
+            },
+            cond,
+        });
+    } else if act_str == "strict-mode" {
+        let on = tokens.get(2).map_or(true, |t| t.text == "on");
+        let cond_idx = find_cond_idx(tokens, 2);
+        let cond = if let Some(idx) = cond_idx {
+            parse_acl_condition_from_tokens(&tokens[idx..])?
+        } else {
+            None
+        };
+        rules.push(HttpResRule {
+            action: HttpResAction::SetHeader {
+                name: "\0strict-mode".to_string(),
+                fmt: if on { "on".into() } else { "off".into() },
+            },
+            cond,
+        });
+    } else if act_str == "allow" {
+        let cond_idx = find_cond_idx(tokens, 2);
+        let cond = if let Some(idx) = cond_idx {
+            parse_acl_condition_from_tokens(&tokens[idx..])?
+        } else {
+            None
+        };
+        rules.push(HttpResRule {
+            action: HttpResAction::SetHeader {
+                name: "\0allow".to_string(),
+                fmt: String::new(),
+            },
+            cond,
+        });
+    } else if act_str == "deny" {
+        let mut status = None;
+        let cond_idx = find_cond_idx(tokens, 2);
+        let limit = cond_idx.unwrap_or(tokens.len());
+        let mut i = 2;
+        while i < limit {
+            if (tokens[i].text == "status" || tokens[i].text == "deny_status") && i + 1 < limit {
+                status = Some(parse_u16(&tokens[i + 1], "status")?);
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        let cond = if let Some(idx) = cond_idx {
+            parse_acl_condition_from_tokens(&tokens[idx..])?
+        } else {
+            None
+        };
+        rules.push(HttpResRule {
+            action: HttpResAction::SetHeader {
+                name: "\0deny".to_string(),
+                fmt: status.map_or_else(String::new, |s| s.to_string()),
+            },
+            cond,
+        });
+    } else {
+        return Err(ConfigError::new(
+            act_token.line,
+            act_token.col,
+            format!("unknown http-response action <{act_str}>"),
+        ));
     }
     Ok(())
 }
@@ -1753,55 +2231,236 @@ fn parse_http_after_res_rule(
         ));
     }
     let act_token = &tokens[1];
-    match act_token.text.as_str() {
-        "set-header" | "add-header" => {
-            if tokens.len() < 4 {
-                return Err(ConfigError::new(
-                    kw.line,
-                    kw.col,
-                    "<http-after-response set-header|add-header> expects <name> and <fmt>.",
-                ));
-            }
-            let name = tokens[2].text.clone();
-            let fmt = tokens[3].text.clone();
-            let cond = if tokens.len() > 4 {
-                parse_acl_condition_from_tokens(&tokens[4..])?
-            } else {
-                None
-            };
-            let action = if act_token.text == "set-header" {
-                HttpAfterResAction::SetHeader { name, fmt }
-            } else {
-                HttpAfterResAction::AddHeader { name, fmt }
-            };
-            rules.push(HttpAfterResRule { action, cond });
-        }
-        "del-header" => {
-            if tokens.len() < 3 {
-                return Err(ConfigError::new(
-                    kw.line,
-                    kw.col,
-                    "<http-after-response del-header> expects <name>.",
-                ));
-            }
-            let name = tokens[2].text.clone();
-            let cond = if tokens.len() > 3 {
-                parse_acl_condition_from_tokens(&tokens[3..])?
-            } else {
-                None
-            };
-            rules.push(HttpAfterResRule {
-                action: HttpAfterResAction::DelHeader { name },
-                cond,
-            });
-        }
-        other => {
+    let act_str = act_token.text.as_str();
+
+    if act_str == "set-header" || act_str == "add-header" {
+        if tokens.len() < 4 {
             return Err(ConfigError::new(
-                act_token.line,
-                act_token.col,
-                format!("unknown http-after-response action <{other}>"),
+                kw.line,
+                kw.col,
+                "<http-after-response set-header|add-header> expects <name> and <fmt>.",
             ));
         }
+        let name = tokens[2].text.clone();
+        let fmt = tokens[3].text.clone();
+        let cond_idx = find_cond_idx(tokens, 4);
+        let cond = if let Some(idx) = cond_idx {
+            parse_acl_condition_from_tokens(&tokens[idx..])?
+        } else {
+            None
+        };
+        let action = if act_str == "set-header" {
+            HttpAfterResAction::SetHeader { name, fmt }
+        } else {
+            HttpAfterResAction::AddHeader { name, fmt }
+        };
+        rules.push(HttpAfterResRule { action, cond });
+    } else if act_str == "del-header" {
+        if tokens.len() < 3 {
+            return Err(ConfigError::new(
+                kw.line,
+                kw.col,
+                "<http-after-response del-header> expects <name>.",
+            ));
+        }
+        let name = tokens[2].text.clone();
+        let mut method = None;
+        let mut i = 3;
+        while i < tokens.len() {
+            if tokens[i].text == "-m" && i + 1 < tokens.len() {
+                method = Some(tokens[i + 1].text.clone());
+                i += 2;
+            } else if tokens[i].text == "if" || tokens[i].text == "unless" {
+                break;
+            } else {
+                i += 1;
+            }
+        }
+        let cond_idx = find_cond_idx(tokens, 2);
+        let cond = if let Some(idx) = cond_idx {
+            parse_acl_condition_from_tokens(&tokens[idx..])?
+        } else {
+            None
+        };
+        let encoded_name = if let Some(m) = method {
+            format!("\0m:{m}:{name}")
+        } else {
+            name
+        };
+        rules.push(HttpAfterResRule {
+            action: HttpAfterResAction::DelHeader { name: encoded_name },
+            cond,
+        });
+    } else if act_str == "set-status" {
+        if tokens.len() < 3 {
+            return Err(ConfigError::new(
+                kw.line,
+                kw.col,
+                "<http-after-response set-status> expects <status>.",
+            ));
+        }
+        let status = parse_u16(&tokens[2], "set-status")?;
+        let cond_idx = find_cond_idx(tokens, 3);
+        let cond = if let Some(idx) = cond_idx {
+            parse_acl_condition_from_tokens(&tokens[idx..])?
+        } else {
+            None
+        };
+        rules.push(HttpAfterResRule {
+            action: HttpAfterResAction::SetHeader {
+                name: "\0set-status".to_string(),
+                fmt: status.to_string(),
+            },
+            cond,
+        });
+    } else if act_str == "replace-header" {
+        if tokens.len() < 5 {
+            return Err(ConfigError::new(
+                kw.line,
+                kw.col,
+                "<http-after-response replace-header> expects <name>, <regex>, <replace>.",
+            ));
+        }
+        let name = tokens[2].text.clone();
+        let regex = tokens[3].text.clone();
+        let repl = tokens[4].text.clone();
+        let cond_idx = find_cond_idx(tokens, 5);
+        let cond = if let Some(idx) = cond_idx {
+            parse_acl_condition_from_tokens(&tokens[idx..])?
+        } else {
+            None
+        };
+        rules.push(HttpAfterResRule {
+            action: HttpAfterResAction::SetHeader {
+                name: format!("\0replace-header:{name}"),
+                fmt: format!("{regex}\t{repl}"),
+            },
+            cond,
+        });
+    } else if act_str == "replace-value" {
+        if tokens.len() < 5 {
+            return Err(ConfigError::new(
+                kw.line,
+                kw.col,
+                "<http-after-response replace-value> expects <name>, <regex>, <replace>.",
+            ));
+        }
+        let name = tokens[2].text.clone();
+        let regex = tokens[3].text.clone();
+        let repl = tokens[4].text.clone();
+        let cond_idx = find_cond_idx(tokens, 5);
+        let cond = if let Some(idx) = cond_idx {
+            parse_acl_condition_from_tokens(&tokens[idx..])?
+        } else {
+            None
+        };
+        rules.push(HttpAfterResRule {
+            action: HttpAfterResAction::SetHeader {
+                name: format!("\0replace-value:{name}"),
+                fmt: format!("{regex}\t{repl}"),
+            },
+            cond,
+        });
+    } else if act_str.starts_with("set-var(") || act_str.starts_with("set-var-fmt(") {
+        let var_name = act_token
+            .text
+            .trim_start_matches("set-var(")
+            .trim_start_matches("set-var-fmt(")
+            .trim_end_matches(')')
+            .to_string();
+        let cond_idx = find_cond_idx(tokens, 2);
+        let limit = cond_idx.unwrap_or(tokens.len());
+        let expr = tokens[2..limit].iter().map(|t| t.text.as_str()).collect::<Vec<_>>().join(" ");
+        let cond = if let Some(idx) = cond_idx {
+            parse_acl_condition_from_tokens(&tokens[idx..])?
+        } else {
+            None
+        };
+        rules.push(HttpAfterResRule {
+            action: HttpAfterResAction::SetHeader {
+                name: format!("\0set-var:{var_name}"),
+                fmt: expr,
+            },
+            cond,
+        });
+    } else if act_str.starts_with("unset-var(") {
+        let var_name = act_token
+            .text
+            .trim_start_matches("unset-var(")
+            .trim_end_matches(')')
+            .to_string();
+        let cond_idx = find_cond_idx(tokens, 2);
+        let cond = if let Some(idx) = cond_idx {
+            parse_acl_condition_from_tokens(&tokens[idx..])?
+        } else {
+            None
+        };
+        rules.push(HttpAfterResRule {
+            action: HttpAfterResAction::DelHeader {
+                name: format!("\0unset-var:{var_name}"),
+            },
+            cond,
+        });
+    } else if act_str == "strict-mode" {
+        let on = tokens.get(2).map_or(true, |t| t.text == "on");
+        let cond_idx = find_cond_idx(tokens, 2);
+        let cond = if let Some(idx) = cond_idx {
+            parse_acl_condition_from_tokens(&tokens[idx..])?
+        } else {
+            None
+        };
+        rules.push(HttpAfterResRule {
+            action: HttpAfterResAction::SetHeader {
+                name: "\0strict-mode".to_string(),
+                fmt: if on { "on".into() } else { "off".into() },
+            },
+            cond,
+        });
+    } else if act_str == "allow" {
+        let cond_idx = find_cond_idx(tokens, 2);
+        let cond = if let Some(idx) = cond_idx {
+            parse_acl_condition_from_tokens(&tokens[idx..])?
+        } else {
+            None
+        };
+        rules.push(HttpAfterResRule {
+            action: HttpAfterResAction::SetHeader {
+                name: "\0allow".to_string(),
+                fmt: String::new(),
+            },
+            cond,
+        });
+    } else if act_str == "deny" {
+        let mut status = None;
+        let cond_idx = find_cond_idx(tokens, 2);
+        let limit = cond_idx.unwrap_or(tokens.len());
+        let mut i = 2;
+        while i < limit {
+            if (tokens[i].text == "status" || tokens[i].text == "deny_status") && i + 1 < limit {
+                status = Some(parse_u16(&tokens[i + 1], "status")?);
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        let cond = if let Some(idx) = cond_idx {
+            parse_acl_condition_from_tokens(&tokens[idx..])?
+        } else {
+            None
+        };
+        rules.push(HttpAfterResRule {
+            action: HttpAfterResAction::SetHeader {
+                name: "\0deny".to_string(),
+                fmt: status.map_or_else(String::new, |s| s.to_string()),
+            },
+            cond,
+        });
+    } else {
+        return Err(ConfigError::new(
+            act_token.line,
+            act_token.col,
+            format!("unknown http-after-response action <{act_str}>"),
+        ));
     }
     Ok(())
 }
@@ -2139,6 +2798,7 @@ fn parse_level(token: &Token) -> Result<LogLevel, ConfigError> {
     }
 }
 
+#[allow(dead_code)]
 fn validate_regex(token: &Token) -> Result<(), ConfigError> {
     regex::Regex::new(&token.text).map_err(|e| {
         ConfigError::new(
@@ -2157,34 +2817,35 @@ mod tests {
     #[test]
     fn test_parse_example_cfg() {
         let sample = r"
-listen proxy1 0.0.0.0:3128
+listen proxy1
+	bind 0.0.0.0:3128
 	mode	http
-        cookie SERVERID
-	dispatch 192.168.12.1:80
+	cookie SERVERID
  	server srv1 192.168.12.2:8080
  	server srv2 192.168.12.3:8080
-	contimeout	3000
-	clitimeout	150000
-	srvtimeout	150000
+	timeout connect	3000
+	timeout client	150000
+	timeout server	150000
 	maxconn 60000
 	redisp
 	retries	3
 	grace 3000
 
-listen proxy2 0.0.0.0:3129
+listen proxy2
+	bind 0.0.0.0:3129
 	mode	http
-	dispatch 127.0.0.1:80
-	contimeout	3000
-	clitimeout	150000
-	srvtimeout	150000
+	timeout connect	3000
+	timeout client	150000
+	timeout server	150000
 	maxconn 60000
 	retries	3
 	grace 3000
 
-listen health 0.0.0.0:3130
+listen health
+	bind 0.0.0.0:3130
 	mode	health
-	clitimeout	1500
-	srvtimeout	1500
+	timeout client	1500
+	timeout server	1500
 	maxconn 4
 	grace 0
 ";
@@ -2198,7 +2859,7 @@ listen health 0.0.0.0:3130
         assert!(config.listens[0].redisp);
         assert_eq!(config.listens[0].maxconn, 60000);
         assert_eq!(
-            config.listens[0].contimeout,
+            config.listens[0].timeouts.connect,
             Some(Duration::from_millis(3000))
         );
 
@@ -2216,7 +2877,7 @@ listen health 0.0.0.0:3130
 frontend web
     bind 0.0.0.0:80
     mode http
-    clitimeout 10000
+    timeout client 10000
     acl is_static path_beg /static
     acl is_api path_beg /api
     use_backend static_be if is_static
@@ -2255,6 +2916,45 @@ backend app_be
         assert_eq!(be_app.name, "app_be");
         assert_eq!(be_app.balance, BalanceAlgorithm::RoundRobin);
         assert_eq!(be_app.servers.len(), 2);
+    }
+
+    #[test]
+    fn test_rejected_directives() {
+        let dispatch_err = parse_str("listen p\n dispatch 127.0.0.1:80\n").unwrap_err();
+        assert_eq!(
+            dispatch_err.message,
+            "'dispatch' was removed in HAProxy 3.5; use 'server' or 'default_backend' instead"
+        );
+
+        let cliexp_err = parse_str("frontend f\n cliexp ^x y\n").unwrap_err();
+        assert_eq!(
+            cliexp_err.message,
+            "'cliexp' was removed in HAProxy 2.0; use 'http-request replace-path' or 'http-request replace-header' instead"
+        );
+
+        let srvexp_err = parse_str("backend b\n srvexp ^x y\n").unwrap_err();
+        assert_eq!(
+            srvexp_err.message,
+            "'srvexp' was removed in HAProxy 2.0; use 'http-response replace-header' instead"
+        );
+
+        let contimeout_err = parse_str("defaults\n contimeout 5000\n").unwrap_err();
+        assert_eq!(
+            contimeout_err.message,
+            "'contimeout' was removed in HAProxy 2.1; use 'timeout connect' instead"
+        );
+
+        let clitimeout_err = parse_str("frontend f\n clitimeout 5000\n").unwrap_err();
+        assert_eq!(
+            clitimeout_err.message,
+            "'clitimeout' was removed in HAProxy 2.1; use 'timeout client' instead"
+        );
+
+        let srvtimeout_err = parse_str("backend b\n srvtimeout 5000\n").unwrap_err();
+        assert_eq!(
+            srvtimeout_err.message,
+            "'srvtimeout' was removed in HAProxy 2.1; use 'timeout server' instead"
+        );
     }
 
     #[test]

@@ -11,12 +11,13 @@ ibex-proto = { path = "../ibex-proto" }
 ibex-sched = { path = "../ibex-sched" }
 ebtree = { path = "../ebtree" }
 rustls = { workspace = true }
-tokio-rustls = { workspace = true }
-tokio = { workspace = true, features = ["net", "io-util", "sync", "rt", "macros"] }
 tracing = { workspace = true }
 rustix = { version = "0.38", features = ["event", "net", "std"] }
 
 [dev-dependencies]
+# Test-only: the e2e harness drives a reference TLS endpoint. Nothing in src/ uses
+# tokio, and it must not become a real dependency -- see design/README.md D1.
+tokio-rustls = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 rcgen = "0.13"
 ibex-config = { path = "../ibex-config" }
