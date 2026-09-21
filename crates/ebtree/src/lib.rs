@@ -62,6 +62,8 @@
 mod tref;
 
 pub mod eb32;
+pub mod ebmb;
 
 pub use eb32::{Eb32Tree, MAX_NODES};
+pub use ebmb::EbMbTree;
 pub use tref::{Half, Side};

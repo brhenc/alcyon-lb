@@ -205,6 +205,19 @@ impl Scheduler {
         self.rq_total > 0 || self.tasklets.iter().any(|l| !l.is_empty())
     }
 
+    /// Total number of currently allocated tasks in the arena.
+    #[must_use]
+    #[inline]
+    pub const fn live_tasks(&self) -> usize {
+        self.tasks.live()
+    }
+
+    /// Total number of tasks currently in the run queue and tasklet lists.
+    #[must_use]
+    pub fn run_queue_len(&self) -> usize {
+        self.rq_total as usize + self.tasklets.iter().map(|l| l.len as usize).sum::<usize>()
+    }
+
     // ---- queue membership --------------------------------------------------------
 
     fn push_tasklet(&mut self, class: Class, r: TaskRef) {
@@ -301,6 +314,9 @@ impl Scheduler {
 
     /// Destroys a task, unlinking it from every queue first.
     pub fn destroy(&mut self, r: TaskRef) {
+        if r.is_none() {
+            return;
+        }
         self.unlink_rq(r);
         self.unlink_wq(r);
         if self.tasks.get(r).queued() {
@@ -335,9 +351,8 @@ impl Scheduler {
 
         let nice = self.tasks.get(r).nice;
         if nice != 0 {
-            let offset = i32::from(nice).saturating_mul(
-                i32::try_from(RUNQUEUE_DEPTH).unwrap_or(i32::MAX),
-            );
+            let offset =
+                i32::from(nice).saturating_mul(i32::try_from(RUNQUEUE_DEPTH).unwrap_or(i32::MAX));
             #[allow(clippy::cast_sign_loss)]
             {
                 key = key.wrapping_add(offset as u32);

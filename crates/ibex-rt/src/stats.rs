@@ -1,0 +1,327 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Derived from HAProxy src/stats.c, src/stats-proxy.c and include/haproxy/stats-proxy.h.
+// Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
+
+//! Statistics reporting for Ibex.
+//!
+//! Generates HAProxy-compatible telemetry:
+//! - `show info`: 14 mandatory fields for monitoring clients (e.g. `hatop`).
+//! - `show stat`: 146-column CSV telemetry output matching `data/stats_csv_header.txt`.
+
+use crate::check::{ServerCheckState, ServerStatus};
+use crate::engine::Proxy;
+pub use crate::stats_html::render_stats_html;
+use std::fmt::Write;
+use std::time::Instant;
+
+/// Header for HAProxy-compatible CSV statistics.
+pub const STATS_CSV_HEADER: &str =
+    "# pxname,svname,qcur,qmax,scur,smax,slim,stot,bin,bout,dreq,dresp,ereq,econ,eresp,wretr,wredis,status,weight,act,bck,chkfail,chkdown,lastchg,downtime,qlimit,pid,iid,sid,throttle,lbtot,tracked,type,rate,rate_lim,rate_max,check_status,check_code,check_duration,hrsp_1xx,hrsp_2xx,hrsp_3xx,hrsp_4xx,hrsp_5xx,hrsp_other,hanafail,req_rate,req_rate_max,req_tot,cli_abrt,srv_abrt,comp_in,comp_out,comp_byp,comp_rsp,lastsess,last_chk,last_agt,qtime,ctime,rtime,ttime,agent_status,agent_code,agent_duration,check_desc,agent_desc,check_rise,check_fall,check_health,agent_rise,agent_fall,agent_health,addr,cookie,mode,algo,conn_rate,conn_rate_max,conn_tot,intercepted,dcon,dses,wrew,connect,reuse,cache_lookups,cache_hits,srv_icur,src_ilim,qtime_max,ctime_max,rtime_max,ttime_max,eint,idle_conn_cur,safe_conn_cur,used_conn_cur,need_conn_est,uweight,agg_server_status,agg_server_check_status,agg_check_status,srid,sess_other,h1sess,h2sess,h3sess,req_other,h1req,h2req,h3req,proto,priv_idle_cur,reqbin,reqbout,resbin,resbout,cache_hint_hits,\n";
+
+/// Formats the `show info` output for `HATop` and CLI consumers.
+#[must_use]
+pub fn format_show_info(
+    start_time: Instant,
+    pid: u32,
+    total_tasks: usize,
+    run_queue_len: usize,
+    active_conns: u32,
+    max_conns: u32,
+) -> String {
+    let elapsed = start_time.elapsed();
+    let total_secs = elapsed.as_secs();
+    let days = total_secs / 86400;
+    let hours = (total_secs % 86400) / 3600;
+    let mins = (total_secs % 3600) / 60;
+    let secs = total_secs % 60;
+
+    format!(
+        "Name: Ibex\n\
+         Version: 0.1.0\n\
+         Release_date: 2026/09/21\n\
+         Nbproc: 1\n\
+         Process_num: 1\n\
+         Pid: {pid}\n\
+         Uptime: {days}d {hours:02}h{mins:02}m{secs:02}s\n\
+         Uptime_sec: {total_secs}\n\
+         Maxconn: {max_conns}\n\
+         CurrConns: {active_conns}\n\
+         Maxpipes: 0\n\
+         PipesUsed: 0\n\
+         Tasks: {total_tasks}\n\
+         Run_queue: {run_queue_len}\n\
+         node: ibex\n"
+    )
+}
+
+/// Generates the full `show stat` CSV text for all configured proxies and servers.
+#[must_use]
+pub fn format_show_stat(proxies: &[Proxy], checks: &[ServerCheckState], pid: u32) -> String {
+    format_show_stat_filtered(proxies, checks, pid, None, None, None)
+}
+
+fn write_frontend_row(out: &mut String, proxy: &Proxy, pid: u32, iid: usize) {
+    let _ = writeln!(
+        out,
+        "{},FRONTEND,0,0,{},{},{},{},{},{},0,0,0,0,0,0,0,OPEN,,1,0,0,0,0,0,,{},{},0,,0,,0,0,0,0,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,",
+        proxy.name,
+        proxy.stats.act_conn,
+        proxy.stats.max_conn,
+        proxy.maxconn,
+        proxy.stats.cum_conn,
+        proxy.stats.bytes_in,
+        proxy.stats.bytes_out,
+        pid,
+        iid,
+    );
+}
+
+fn write_server_row(
+    out: &mut String,
+    proxy: &Proxy,
+    s_idx: usize,
+    check_state: Option<&ServerCheckState>,
+    pid: u32,
+    iid: usize,
+    sid: usize,
+) {
+    let srv_name = if s_idx < proxy.server_ids.len() {
+        &proxy.server_ids[s_idx]
+    } else {
+        "srv"
+    };
+    let srv_addr = proxy.servers[s_idx];
+    let (status_str, chkfail, chkdown, check_status, check_code, check_duration) =
+        if let Some(c) = check_state {
+            (
+                c.status.as_str(),
+                c.failed_checks,
+                c.down_transitions,
+                c.last_status_code,
+                if c.status == ServerStatus::Up { 200 } else { 0 },
+                c.check_duration_ms,
+            )
+        } else {
+            let s = proxy
+                .server_statuses
+                .get(s_idx)
+                .copied()
+                .unwrap_or(ServerStatus::Up);
+            let s_str = match s {
+                ServerStatus::Up => "no check",
+                ServerStatus::Down => "DOWN",
+                ServerStatus::Drain => "DRAIN",
+                ServerStatus::Maint => "MAINT",
+            };
+            (s_str, 0, 0, "", 0, 0)
+        };
+
+    let is_backup = proxy.server_backups.get(s_idx).copied().unwrap_or(false);
+    let (act, bck) = if is_backup { (0, 1) } else { (1, 0) };
+    let scur = proxy.server_actconn.get(s_idx).copied().unwrap_or(0);
+    let weight = proxy.server_weights.get(s_idx).copied().unwrap_or(1);
+    let slim = proxy
+        .server_maxconn
+        .get(s_idx)
+        .copied()
+        .flatten()
+        .map_or(String::new(), |m| m.to_string());
+
+    let _ = writeln!(
+        out,
+        "{},{},0,0,{},0,{},0,0,0,0,0,0,0,0,0,0,{},{weight},{},{},{},{},0,0,,{},{},{},,0,,2,0,0,0,{},{},{},,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,{},,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,",
+        proxy.name,
+        srv_name,
+        scur,
+        slim,
+        status_str,
+        act,
+        bck,
+        chkfail,
+        chkdown,
+        pid,
+        iid,
+        sid,
+        check_status,
+        check_code,
+        check_duration,
+        srv_addr,
+    );
+}
+
+fn write_backend_row(out: &mut String, proxy: &Proxy, pid: u32, iid: usize) {
+    let _ = writeln!(
+        out,
+        "{},BACKEND,0,0,{},{},{},{},{},{},0,0,0,{},0,{},{},UP,1,1,0,0,0,0,0,,{},{},0,,0,,1,0,0,0,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,",
+        proxy.name,
+        proxy.stats.act_conn,
+        proxy.stats.max_conn,
+        proxy.maxconn,
+        proxy.stats.cum_conn,
+        proxy.stats.bytes_in,
+        proxy.stats.bytes_out,
+        proxy.stats.failed_conn,
+        proxy.stats.retries_count,
+        proxy.stats.redispatches,
+        pid,
+        iid,
+    );
+}
+
+/// Generates `show stat` CSV text with optional filtering by proxy iid, type bitmask, and server sid.
+#[must_use]
+pub fn format_show_stat_filtered(
+    proxies: &[Proxy],
+    checks: &[ServerCheckState],
+    pid: u32,
+    iid_filter: Option<i32>,
+    type_filter: Option<i32>,
+    sid_filter: Option<i32>,
+) -> String {
+    let mut out = String::with_capacity(4096);
+    out.push_str(STATS_CSV_HEADER);
+
+    let match_type = |type_val: i32| -> bool {
+        match type_filter {
+            None | Some(-1 | 33_554_431 | 0x00FF_FFFF) => true,
+            Some(t) => t == type_val || (t & (1 << type_val)) != 0,
+        }
+    };
+
+    for (p_idx, proxy) in proxies.iter().enumerate() {
+        let iid = p_idx + 1;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        if let Some(f_iid) = iid_filter {
+            if f_iid != -1 && f_iid != iid as i32 {
+                continue;
+            }
+        }
+
+        if match_type(0)
+            && (sid_filter.is_none() || sid_filter == Some(-1) || sid_filter == Some(0))
+        {
+            write_frontend_row(&mut out, proxy, pid, iid);
+        }
+
+        if match_type(2) {
+            for (s_idx, _) in proxy.servers.iter().enumerate() {
+                let sid = s_idx + 1;
+                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                if let Some(f_sid) = sid_filter {
+                    if f_sid != -1 && f_sid != sid as i32 {
+                        continue;
+                    }
+                }
+                let check_state = checks
+                    .iter()
+                    .find(|c| c.proxy_idx == p_idx && c.server_idx == s_idx);
+                write_server_row(&mut out, proxy, s_idx, check_state, pid, iid, sid);
+            }
+        }
+
+        if match_type(1)
+            && (sid_filter.is_none() || sid_filter == Some(-1) || sid_filter == Some(0))
+        {
+            write_backend_row(&mut out, proxy, pid, iid);
+        }
+    }
+
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proxy::Timeouts;
+    use ibex_config::Mode;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    #[test]
+    fn show_info_contains_all_fourteen_mandatory_hatop_keys() {
+        let out = format_show_info(Instant::now(), 1234, 10, 2, 5, 1000);
+        let mandatory = [
+            "Name:",
+            "Version:",
+            "Release_date:",
+            "Nbproc:",
+            "Process_num:",
+            "Pid:",
+            "Uptime:",
+            "Maxconn:",
+            "CurrConns:",
+            "Maxpipes:",
+            "PipesUsed:",
+            "Tasks:",
+            "Run_queue:",
+            "node:",
+        ];
+        for key in mandatory {
+            assert!(
+                out.lines().any(|l| l.starts_with(key)),
+                "missing mandatory key {key} in show info output"
+            );
+        }
+    }
+
+    #[test]
+    fn show_stat_csv_has_at_least_fifty_one_commas_per_line() {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
+        let proxy = Proxy {
+            id: 0,
+            name: "test_proxy".into(),
+            addr,
+            mode: Mode::Tcp,
+            timeouts: Timeouts::default(),
+            retries: 3,
+            redisp: false,
+            maxconn: 1000,
+            dispatch: None,
+            cookie_name: None,
+            cliexp: Vec::new(),
+            srvexp: Vec::new(),
+            servers: vec![addr],
+            server_ids: vec!["srv1".into()],
+            server_statuses: vec![ServerStatus::Up],
+            server_weights: vec![1],
+            next_server_idx: 0,
+            stats: crate::engine::ProxyStats::default(),
+            stats_config: ibex_config::StatsConfig::default(),
+            balance: ibex_config::BalanceAlgorithm::RoundRobin,
+            default_backend: None,
+            use_backends: Vec::new(),
+            acls: std::collections::HashMap::new(),
+            stick_table: None,
+            stick_rules: Vec::new(),
+            accept_proxy: false,
+            accept_proxy_v2: false,
+            server_send_proxy: vec![false],
+            server_send_proxy_v2: vec![false],
+            server_backups: vec![false],
+            server_maxconn: vec![None],
+            server_actconn: vec![0],
+            server_check_configs: vec![None],
+            tcp_req_conn_rules: Vec::new(),
+            http_req_rules: Vec::new(),
+            http_res_rules: Vec::new(),
+            http_after_res_rules: Vec::new(),
+        };
+
+        let csv = format_show_stat(&[proxy], &[], 9999);
+        let lines: Vec<&str> = csv.lines().collect();
+        assert!(
+            lines.len() >= 4,
+            "expected header + frontend + server + backend"
+        );
+
+        for (i, line) in lines.iter().enumerate() {
+            if line.starts_with('#') || line.is_empty() {
+                continue;
+            }
+            let comma_count = line.matches(',').count();
+            assert!(
+                comma_count >= 51,
+                "line {i} has {comma_count} commas (< 51): {line}"
+            );
+        }
+    }
+}

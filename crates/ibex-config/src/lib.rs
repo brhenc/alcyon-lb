@@ -18,7 +18,13 @@ pub mod parser;
 use std::fs;
 use std::path::Path;
 
-pub use ast::{Config, HeaderExp, ListenSection, LogConfig, LogFacility, LogLevel, Mode, Server};
+pub use ast::{
+    AclCondition, AclRule, AclTerm, BackendSection, BalanceAlgorithm, Config, FrontendSection,
+    HeaderExp, HttpAfterResAction, HttpAfterResRule, HttpReqAction, HttpReqRule, HttpResAction,
+    HttpResRule, ListenSection, LogConfig, LogFacility, LogLevel, Mode, Server, StatsConfig,
+    StickRule, StickRuleType, StickTableConfigAst, TcpReqConnAction, TcpReqConnRule,
+    UseBackendRule,
+};
 pub use error::ConfigError;
 pub use parser::parse_str;
 
@@ -33,7 +39,10 @@ pub fn parse_file(path: impl AsRef<Path>) -> Result<Config, ConfigError> {
         ConfigError::new(
             1,
             1,
-            format!("Error reading configuration file '{}': {e}", path_ref.display()),
+            format!(
+                "Error reading configuration file '{}': {e}",
+                path_ref.display()
+            ),
         )
     })?;
     parse_str(&content)

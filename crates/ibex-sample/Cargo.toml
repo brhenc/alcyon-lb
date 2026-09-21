@@ -1,0 +1,21 @@
+[package]
+name = "ibex-sample"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+description = "Ibex Sample / Converter / Matcher lattice (design/007-sample-lattice.md)"
+
+[dependencies]
+ibex-proto = { path = "../ibex-proto" }
+regex = { workspace = true }
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+

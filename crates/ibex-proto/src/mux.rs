@@ -91,15 +91,13 @@ pub trait Mux {
     ///
     /// # Errors
     /// Propagates mux-level failures.
-    fn rcv_buf(&self, ctx: &mut Self::Ctx, sd: &mut SeDesc, out: &mut [u8])
-        -> io::Result<usize>;
+    fn rcv_buf(&self, ctx: &mut Self::Ctx, sd: &mut SeDesc, out: &mut [u8]) -> io::Result<usize>;
 
     /// Takes data from the stream and frames it for the wire.
     ///
     /// # Errors
     /// Propagates mux-level failures.
-    fn snd_buf(&self, ctx: &mut Self::Ctx, sd: &mut SeDesc, input: &[u8])
-        -> io::Result<usize>;
+    fn snd_buf(&self, ctx: &mut Self::Ctx, sd: &mut SeDesc, input: &[u8]) -> io::Result<usize>;
 
     /// Bytes the mux wants written to the transport.
     fn pending_output<'a>(&self, ctx: &'a Self::Ctx) -> &'a [u8];

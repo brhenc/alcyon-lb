@@ -1,0 +1,207 @@
+{
+  "total": 22,
+  "passed": 0,
+  "failed": 15,
+  "skipped": 7,
+  "duration": 1.5514172950024658,
+  "results": [
+    {
+      "test_name": "haproxy ACL, CLI and mCLI spaces",
+      "file_path": "/home/bhenc/reference/haproxy/reg-tests/http-rules/acl_cli_spaces.vtc",
+      "status": "FAIL",
+      "elapsed_sec": 0.06446880699877511,
+      "error_message": "Client c1 assertion failed on line 4:\n  \u001b[31mFAIL: Expectation failed:\u001b[0m expect resp.status == 403\n    Target:   \u001b[36mresp.status\u001b[0m\n    Operator: ==\n    \u001b[32mExpected:\u001b[0m '403'\n    \u001b[31mActual:  \u001b[0m '200'",
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "test_name": "exact string match on a sample with an embedded NUL",
+      "file_path": "/home/bhenc/reference/haproxy/reg-tests/http-rules/acl_str_embedded_nul.vtc",
+      "status": "FAIL",
+      "elapsed_sec": 0.0626885419987957,
+      "error_message": "Client c1 assertion failed on line 4:\n  \u001b[31mFAIL: Expectation failed:\u001b[0m expect resp.status == 200\n    Target:   \u001b[36mresp.status\u001b[0m\n    Operator: ==\n    \u001b[32mExpected:\u001b[0m '200'\n    \u001b[31mActual:  \u001b[0m '403'",
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "test_name": "Minimal tests for 1.9 converters: ipmask,concat,strcmp,field,word",
+      "file_path": "/home/bhenc/reference/haproxy/reg-tests/http-rules/converters_ipmask_concat_strcmp_field_word.vtc",
+      "status": "FAIL",
+      "elapsed_sec": 0.12520674700135714,
+      "error_message": "Proxy h2 exited prematurely with code 1:\nConfiguration parsing error: line 15, col 18: unknown http-request action <set-var(sess.field1)>\n",
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "test_name": "Test declaration of HTTP rules in default sections",
+      "file_path": "/home/bhenc/reference/haproxy/reg-tests/http-rules/default_rules.vtc",
+      "status": "SKIP",
+      "elapsed_sec": 0.004381837999972049,
+      "error_message": "Feature condition unsatisfied: $HAPROXY_PROGRAM -cc 'version_atleast(2.5-dev0)'",
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "test_name": "del-header tests",
+      "file_path": "/home/bhenc/reference/haproxy/reg-tests/http-rules/del_header.vtc",
+      "status": "FAIL",
+      "elapsed_sec": 0.06276387600155431,
+      "error_message": "Proxy h1 exited prematurely with code 1:\nConfiguration parsing error: line 15, col 40: expected 'if' or 'unless', got <-m>\n",
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "test_name": "Test IPv4/IPv6 except param for the forwardfor and originalto options",
+      "file_path": "/home/bhenc/reference/haproxy/reg-tests/http-rules/except-forwardfor-originalto.vtc",
+      "status": "FAIL",
+      "elapsed_sec": 0.06174573799944483,
+      "error_message": "Proxy h1 exited prematurely with code 1:\nConfiguration parsing error: line 18, col 22: unknown http-request action <set-src>\n",
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "test_name": "Test RFC 7239 forwarded header support (forwarded option and related converters)",
+      "file_path": "/home/bhenc/reference/haproxy/reg-tests/http-rules/forwarded-header-7239.vtc",
+      "status": "SKIP",
+      "elapsed_sec": 0.004747455001052003,
+      "error_message": "Feature condition unsatisfied: $HAPROXY_PROGRAM -cc 'version_atleast(2.8-dev0)'",
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "test_name": "Composite HTTP manipulation test (H1 and H2 clear to H1 clear)",
+      "file_path": "/home/bhenc/reference/haproxy/reg-tests/http-rules/h1or2_to_h1c.vtc",
+      "status": "FAIL",
+      "elapsed_sec": 0.06240341899683699,
+      "error_message": "Proxy h1 exited prematurely with code 1:\nConfiguration parsing error: line 16, col 15: unknown http-request action <set-var(req.method)>\n",
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "test_name": "test for http-err-codes/http-fail-codes redefinitions",
+      "file_path": "/home/bhenc/reference/haproxy/reg-tests/http-rules/http-err-fail.vtc",
+      "status": "SKIP",
+      "elapsed_sec": 0.0038867839975864626,
+      "error_message": "Feature condition unsatisfied: $HAPROXY_PROGRAM -cc 'version_atleast(3.0-dev1)'",
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "test_name": "Test HTTP response manipulation under the http-after-response rulesets",
+      "file_path": "/home/bhenc/reference/haproxy/reg-tests/http-rules/http_after_response.vtc",
+      "status": "FAIL",
+      "elapsed_sec": 0.061974748998181894,
+      "error_message": "Proxy h1 exited prematurely with code 1:\nConfiguration parsing error: line 15, col 22: unknown http-request action <redirect>\n",
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "test_name": "Test the HTTP return action",
+      "file_path": "/home/bhenc/reference/haproxy/reg-tests/http-rules/http_return.vtc",
+      "status": "FAIL",
+      "elapsed_sec": 0.06405425699995249,
+      "error_message": "Client c1 assertion failed on line 6:\n  \u001b[31mFAIL: Expectation failed:\u001b[0m expect resp.http.content-type == <undef>\n    Target:   \u001b[36mresp.http.content-type\u001b[0m\n    Operator: ==\n    \u001b[32mExpected:\u001b[0m '<undef>'\n    \u001b[31mActual:  \u001b[0m 'text/plain'",
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "test_name": "Test if-none param for the forwardfor option",
+      "file_path": "/home/bhenc/reference/haproxy/reg-tests/http-rules/ifnone-forwardfor.vtc",
+      "status": "SKIP",
+      "elapsed_sec": 0.004948903999320464,
+      "error_message": "Feature condition unsatisfied: $HAPROXY_PROGRAM -cc 'version_atleast(2.6-dev0)'",
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "test_name": "Ensure mapfile ordering is preserved when loading the file",
+      "file_path": "/home/bhenc/reference/haproxy/reg-tests/http-rules/map_ordering.vtc",
+      "status": "SKIP",
+      "elapsed_sec": 0.004420539000420831,
+      "error_message": "Feature condition unsatisfied: $HAPROXY_PROGRAM -cc 'version_atleast(2.5-dev0)'",
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "test_name": "haproxy host header: map / redirect tests",
+      "file_path": "/home/bhenc/reference/haproxy/reg-tests/http-rules/map_redirect.vtc",
+      "status": "SKIP",
+      "elapsed_sec": 0.004519493999396218,
+      "error_message": "Feature condition unsatisfied: $HAPROXY_PROGRAM -cc 'version_atleast(2.5-dev5) && (feature(PCRE) || feature(PCRE2))'",
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "test_name": "map_regm inside an ACL over an iterating fetch",
+      "file_path": "/home/bhenc/reference/haproxy/reg-tests/http-rules/map_regm_in_acl.vtc",
+      "status": "FAIL",
+      "elapsed_sec": 0.06291147299998556,
+      "error_message": "Client c1 assertion failed on line 7:\n  \u001b[31mFAIL: Expectation failed:\u001b[0m expect resp.http.x-mapped == browser\n    Target:   \u001b[36mresp.http.x-mapped\u001b[0m\n    Operator: ==\n    \u001b[32mExpected:\u001b[0m 'browser'\n    \u001b[31mActual:  \u001b[0m '<undef>'",
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "test_name": "map_regm get_trash_chunk test",
+      "file_path": "/home/bhenc/reference/haproxy/reg-tests/http-rules/map_regm_with_backref.vtc",
+      "status": "FAIL",
+      "elapsed_sec": 0.06237098799829255,
+      "error_message": "Proxy h1 exited prematurely with code 1:\nConfiguration parsing error: line 18, col 18: unknown http-request action <replace-value>\n",
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "test_name": "normalize-uri tests",
+      "file_path": "/home/bhenc/reference/haproxy/reg-tests/http-rules/normalize_uri.vtc",
+      "status": "FAIL",
+      "elapsed_sec": 0.061967067998921266,
+      "error_message": "Proxy h1 exited prematurely with code 1:\nConfiguration parsing error: line 20, col 22: unknown http-request action <set-var(txn.before)>\n",
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "test_name": "path vs pathq tests",
+      "file_path": "/home/bhenc/reference/haproxy/reg-tests/http-rules/path_and_pathq.vtc",
+      "status": "FAIL",
+      "elapsed_sec": 0.061246133998793084,
+      "error_message": "Proxy h1 exited prematurely with code 1:\nConfiguration parsing error: line 19, col 22: unknown http-request action <set-path>\n",
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "test_name": "replace-header/replace-value length limits",
+      "file_path": "/home/bhenc/reference/haproxy/reg-tests/http-rules/replace_header_limits.vtc",
+      "status": "FAIL",
+      "elapsed_sec": 0.06096818100195378,
+      "error_message": "Proxy h1 exited prematurely with code 1:\nConfiguration parsing error: line 18, col 22: unknown http-request action <replace-value>\n",
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "test_name": "http-restrict-req-hdr-names option tests",
+      "file_path": "/home/bhenc/reference/haproxy/reg-tests/http-rules/restrict_req_hdr_names.vtc",
+      "status": "SKIP",
+      "elapsed_sec": 0.0040695030002098065,
+      "error_message": "Feature condition unsatisfied: $HAPROXY_PROGRAM -cc 'version_atleast(2.0-dev0)'",
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "test_name": "http-request set-timeout test",
+      "file_path": "/home/bhenc/reference/haproxy/reg-tests/http-rules/set_timeout.vtc",
+      "status": "FAIL",
+      "elapsed_sec": 0.06173439700069139,
+      "error_message": "Proxy hap exited prematurely with code 1:\nConfiguration parsing error: line 17, col 9: unknown keyword <http-after-response>\n",
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "test_name": "Test the strict rewriting mode",
+      "file_path": "/home/bhenc/reference/haproxy/reg-tests/http-rules/strict_rw_mode.vtc",
+      "status": "FAIL",
+      "elapsed_sec": 0.061761968998325756,
+      "error_message": "Proxy h1 exited prematurely with code 1:\nConfiguration parsing error: line 19, col 22: unknown http-request action <strict-mode>\n",
+      "stdout": "",
+      "stderr": ""
+    }
+  ]
+}

@@ -11,16 +11,31 @@
 
 #![forbid(unsafe_code)]
 
+pub mod applet;
 pub mod buf;
+pub mod check;
+pub mod engine;
 pub mod fdtab;
 pub mod listener;
 pub mod poller;
 pub mod proxy;
 pub mod raw;
+pub mod stats;
+pub mod stats_html;
 
-pub use fdtab::{FdTab, FdState, Interest};
-pub use listener::Listener;
+pub use applet::{AppletArena, AppletContext, CliApplet};
 pub use buf::Buf;
+pub use check::{ServerCheckConfig, ServerCheckState, ServerStatus};
+pub use engine::{Engine, Proxy, ProxyStats, SessionArena, SessionEntry};
+pub use fdtab::{FdState, FdTab, Interest};
+pub use ibex_proto::{
+    build_synthetic_response, default_body_for_status, format_log_format_string,
+    inject_http_header, inject_http_header_with_len, remove_http_header,
+    remove_http_header_with_len, status_reason_phrase,
+};
+pub use listener::Listener;
 pub use poller::{Event, Poller};
-pub use proxy::{Ending, TcpSession, Timeouts, Want, Which};
+pub use proxy::{find_eoh, Ending, TcpSession, Timeouts, Want, Which};
 pub use raw::Io;
+pub use stats::{format_show_info, format_show_stat, format_show_stat_filtered, STATS_CSV_HEADER};
+pub use stats_html::{parse_admin_action, render_stats_html, render_stats_json, AdminAction};

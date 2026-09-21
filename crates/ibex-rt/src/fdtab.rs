@@ -19,10 +19,22 @@ pub struct Interest {
 }
 
 impl Interest {
-    pub const NONE: Interest = Interest { readable: false, writable: false };
-    pub const READ: Interest = Interest { readable: true, writable: false };
-    pub const WRITE: Interest = Interest { readable: false, writable: true };
-    pub const BOTH: Interest = Interest { readable: true, writable: true };
+    pub const NONE: Interest = Interest {
+        readable: false,
+        writable: false,
+    };
+    pub const READ: Interest = Interest {
+        readable: true,
+        writable: false,
+    };
+    pub const WRITE: Interest = Interest {
+        readable: false,
+        writable: true,
+    };
+    pub const BOTH: Interest = Interest {
+        readable: true,
+        writable: true,
+    };
 
     #[must_use]
     pub const fn is_none(self) -> bool {
@@ -37,6 +49,8 @@ pub enum FdState {
     Closed,
     /// A listening socket. Readiness means a connection is waiting to be accepted.
     Listener { listener: u32 },
+    /// A listening socket for CLI / stats. Readiness means a CLI client is waiting.
+    CliListener,
     /// A connection. Readiness wakes the owning task.
     Conn { task: TaskRef, conn: u32 },
 }
@@ -189,9 +203,21 @@ mod tests {
     #[test]
     fn table_grows_past_initial_capacity() {
         let mut t = FdTab::with_capacity(4);
-        t.insert(1000, FdState::Conn { task: ibex_sched::TaskRef(7), conn: 2 },
-                 Interest::BOTH);
-        assert_eq!(t.state(1000), FdState::Conn { task: ibex_sched::TaskRef(7), conn: 2 });
+        t.insert(
+            1000,
+            FdState::Conn {
+                task: ibex_sched::TaskRef(7),
+                conn: 2,
+            },
+            Interest::BOTH,
+        );
+        assert_eq!(
+            t.state(1000),
+            FdState::Conn {
+                task: ibex_sched::TaskRef(7),
+                conn: 2
+            }
+        );
         assert_eq!(t.live(), 1);
     }
 

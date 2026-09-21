@@ -423,7 +423,6 @@ impl Eb32Tree {
         }
     }
 
-
     // ---- invariant checking --------------------------------------------------------
 
     /// Verifies every structural invariant, returning `Err` with a description of the
@@ -746,8 +745,10 @@ impl Eb32Tree {
                 // Top of a duplicate subtree: every leaf below shares one key, so
                 // either the whole subtree qualifies or none of it does.
                 if y >= x {
-                    return self
-                        .walk_down(self.nodes[n as usize].branches[Side::Left.idx()], Side::Left);
+                    return self.walk_down(
+                        self.nodes[n as usize].branches[Side::Left.idx()],
+                        Side::Left,
+                    );
                 }
                 up = self.nodes[n as usize].node_p;
                 break;
@@ -760,8 +761,10 @@ impl Eb32Tree {
                 let shift = bit as u32;
                 if (y >> shift) > (x >> shift) {
                     // Whole subtree exceeds x: its minimum is the answer.
-                    return self
-                        .walk_down(self.nodes[n as usize].branches[Side::Left.idx()], Side::Left);
+                    return self.walk_down(
+                        self.nodes[n as usize].branches[Side::Left.idx()],
+                        Side::Left,
+                    );
                 }
                 // Whole subtree is below x: continue after it.
                 up = self.nodes[n as usize].node_p;
@@ -777,7 +780,6 @@ impl Eb32Tree {
 
         self.next_from_parent(up)
     }
-
 }
 
 impl<'a> IntoIterator for &'a Eb32Tree {

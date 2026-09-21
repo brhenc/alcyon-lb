@@ -13,11 +13,23 @@ pub struct SlidingRate {
 
 impl SlidingRate {
     /// Creates a sliding rate calculator for the given period in milliseconds.
+    #[must_use]
     pub fn new(period_millis: u64) -> Self {
         Self {
-            period_millis: period_millis.max(1000),
+            period_millis: period_millis.max(1),
             current_count: 0,
             previous_count: 0,
+            window_start: Instant::now(),
+        }
+    }
+
+    /// Creates a sliding rate calculator with explicit initial counts (for testing and simulation).
+    #[must_use]
+    pub fn with_counts(period_millis: u64, current_count: u64, previous_count: u64) -> Self {
+        Self {
+            period_millis: period_millis.max(1),
+            current_count,
+            previous_count,
             window_start: Instant::now(),
         }
     }
@@ -28,24 +40,48 @@ impl SlidingRate {
         self.current_count = self.current_count.saturating_add(n);
     }
 
+    /// Records `n` events at an explicit elapsed time offset from window start (useful for deterministic tests).
+    pub fn tick_at_elapsed(&mut self, n: u64, elapsed_ms: u64) {
+        self.advance_by_millis(elapsed_ms);
+        self.current_count = self.current_count.saturating_add(n);
+    }
+
     /// Computes the current rate (events per period) using weighted sliding window.
+    #[must_use]
     pub fn rate(&self) -> u64 {
-        let elapsed_ms = self.window_start.elapsed().as_millis() as u64;
-        if elapsed_ms >= self.period_millis * 2 {
+        let elapsed_ms = u64::try_from(self.window_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.rate_at_elapsed(elapsed_ms)
+    }
+
+    /// Computes the sliding window rate at a specific elapsed duration (in milliseconds).
+    ///
+    /// Uses 128-bit intermediate arithmetic to guarantee zero overflow even under extreme
+    /// counter magnitudes and wrap-around test conditions.
+    #[must_use]
+    pub fn rate_at_elapsed(&self, elapsed_ms: u64) -> u64 {
+        if self.period_millis == 0 {
+            return 0;
+        }
+        let two_periods = self.period_millis.saturating_mul(2);
+        if elapsed_ms >= two_periods {
             0
         } else if elapsed_ms >= self.period_millis {
-            let weight = (self.period_millis * 2 - elapsed_ms) as f64 / self.period_millis as f64;
-            (self.current_count as f64 * weight) as u64
+            let remaining = two_periods.saturating_sub(elapsed_ms);
+            let num = u128::from(self.current_count) * u128::from(remaining);
+            u64::try_from(num / u128::from(self.period_millis)).unwrap_or(u64::MAX)
         } else {
-            let weight = (self.period_millis - elapsed_ms) as f64 / self.period_millis as f64;
-            let prev_weighted = (self.previous_count as f64 * weight) as u64;
+            let remaining = self.period_millis.saturating_sub(elapsed_ms);
+            let num = u128::from(self.previous_count) * u128::from(remaining);
+            let prev_weighted =
+                u64::try_from(num / u128::from(self.period_millis)).unwrap_or(u64::MAX);
             self.current_count.saturating_add(prev_weighted)
         }
     }
 
-    fn advance_window(&mut self) {
-        let elapsed_ms = self.window_start.elapsed().as_millis() as u64;
-        if elapsed_ms >= self.period_millis * 2 {
+    /// Advances the window given elapsed milliseconds since `window_start`.
+    pub fn advance_by_millis(&mut self, elapsed_ms: u64) {
+        let two_periods = self.period_millis.saturating_mul(2);
+        if elapsed_ms >= two_periods {
             self.previous_count = 0;
             self.current_count = 0;
             self.window_start = Instant::now();
@@ -54,6 +90,29 @@ impl SlidingRate {
             self.current_count = 0;
             self.window_start = Instant::now();
         }
+    }
+
+    fn advance_window(&mut self) {
+        let elapsed_ms = u64::try_from(self.window_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.advance_by_millis(elapsed_ms);
+    }
+
+    /// Returns the period in milliseconds.
+    #[must_use]
+    pub const fn period_millis(&self) -> u64 {
+        self.period_millis
+    }
+
+    /// Returns the current count.
+    #[must_use]
+    pub const fn current_count(&self) -> u64 {
+        self.current_count
+    }
+
+    /// Returns the previous count.
+    #[must_use]
+    pub const fn previous_count(&self) -> u64 {
+        self.previous_count
     }
 }
 

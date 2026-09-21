@@ -90,7 +90,11 @@ fn a_session_can_carry_several_streams() {
 
     assert_eq!(a.session, b.session, "both streams share one session");
     assert_eq!(sess.stream_count, 2);
-    assert_eq!(sess.origin, ConnId(2), "the connection belongs to the session");
+    assert_eq!(
+        sess.origin,
+        ConnId(2),
+        "the connection belongs to the session"
+    );
 }
 
 // ---- connection --------------------------------------------------------------------
@@ -102,7 +106,10 @@ fn a_connection_is_unusable_until_handshaking_completes() {
 
     c.flags.set(conn_flags::CONNECTED);
     c.flags.set(conn_flags::HANDSHAKE);
-    assert!(!c.usable(), "connected but mid-handshake is still not usable");
+    assert!(
+        !c.usable(),
+        "connected but mid-handshake is still not usable"
+    );
     assert!(c.handshake_pending());
 
     c.flags.clear(conn_flags::HANDSHAKE);

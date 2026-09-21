@@ -126,3 +126,29 @@ python3 harness/difftest.py \
 3. **Select Loop & Timeout Resolution (`connect_timeout`, `client_timeout`, `server_timeout`)**: In HAProxy 1.0.2, task timer expirations are evaluated in the main `select()` event loop. When no network I/O occurs, `select()` blocks up to `STATTIME` (2000 ms). Idle timeouts configured below 2000 ms fire on the first 2-second tick.
 4. **Connection Retries (`server_refused`)**: Retries configured via `retries N` are executed immediately during the initial `SV_STCONN` state if `connect()` fails with `ECONNREFUSED`. After exhausting retries, HAProxy closes the client socket.
 5. **Backlog Queuing (`maxconn`)**: When `nbconn >= maxconn`, HAProxy removes the listening socket from the `select()` read set. Additional client connections complete the TCP 3-way handshake in the kernel listen backlog and are accepted once active sessions close.
+
+---
+
+## Standalone VTC Regression Test Runner (`vtc_runner.py`)
+
+`harness/vtc_runner.py` is a standalone, dependency-free Varnish Test Case (`.vtc`) runner designed to execute HAProxy regression test suites directly against Ibex (or any HAProxy-compatible proxy binary).
+
+### Capabilities:
+- **Grammar & Directive Parsing**: Parses `vtest`/`varnishtest`, `feature`, `server sN { ... }`, `haproxy hN -conf { ... }`, `client cN -connect ... { ... }`, `barrier`, `delay`, `shell`, and `setenv`.
+- **Inner Actions**: Supports `rxreq`, `rxreqhdrs`, `txreq`, `rxresp`, `rxresphdrs`, `txresp`, `expect`, `send`, `sendhex`, `recv`, `barrier <id> sync`, `delay`, and `close`.
+- **Dynamic Macro Expansion**: Evaluates `${sN_addr}`, `${sN_port}`, `${sN_sock}`, `${hN_fe_addr}`, `${hN_fe_port}`, `${hN_fe_sock}`, `${testdir}`, `${tmpdir}`, and fallback syntax `${VAR-default}` / `${VAR:-default}`.
+- **Config Rewriting & Socket Port Allocation**: Intercepts `bind "fd@${fe}"` and `listen <id>` configurations, allocating ephemeral ports and adapting the config for Ibex.
+- **Detailed Assertions & Diff Reporting**: Formats assertion failures with ANSI colored diffs showing target, operator, expected, and actual values.
+- **JSON Suite Reporting**: Generates machine-readable test summaries via `--json <file>`.
+
+### Usage:
+```bash
+# Run a single VTC test:
+./harness/vtc_runner.py /home/bhenc/reference/haproxy/reg-tests/balance/balance-rr.vtc
+
+# Run an entire test directory with JSON output:
+./harness/vtc_runner.py /home/bhenc/reference/haproxy/reg-tests/http-rules/ --json harness/http_rules_results.json
+
+# Enable verbose execution trace:
+./harness/vtc_runner.py -v /home/bhenc/reference/haproxy/reg-tests/balance/balance-rr.vtc
+```

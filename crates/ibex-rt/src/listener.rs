@@ -5,10 +5,7 @@
 //! Listening sockets, one per thread via `SO_REUSEPORT`.
 
 use rustix::io::Errno;
-use rustix::net::{
-    self, AddressFamily, Ipv4Addr, Ipv6Addr, SocketAddrAny, SocketAddrV4, SocketAddrV6,
-    SocketFlags, SocketType,
-};
+use rustix::net::{self, AddressFamily, SocketFlags, SocketType};
 use std::io;
 use std::net::SocketAddr;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
@@ -111,11 +108,15 @@ impl Listener {
     /// # Errors
     /// Propagates non-transient accept failures.
     pub fn accept(&self) -> io::Result<Option<(OwnedFd, SocketAddr)>> {
-        match net::acceptfrom_with(self.fd.as_fd(), SocketFlags::CLOEXEC | SocketFlags::NONBLOCK) {
+        match net::acceptfrom_with(
+            self.fd.as_fd(),
+            SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
+        ) {
             Ok((fd, addr)) => {
-                let peer = addr.as_ref().and_then(from_any).unwrap_or_else(|| {
-                    SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0)
-                });
+                let peer = addr
+                    .as_ref()
+                    .and_then(from_any)
+                    .unwrap_or_else(|| SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0));
                 Ok(Some((fd, peer)))
             }
             // Two distinct meanings, one response.
@@ -146,34 +147,7 @@ impl Listener {
     }
 }
 
-fn to_any(addr: SocketAddr) -> SocketAddrAny {
-    match addr {
-        SocketAddr::V4(v4) => SocketAddrAny::V4(SocketAddrV4::new(
-            Ipv4Addr::from(v4.ip().octets()),
-            v4.port(),
-        )),
-        SocketAddr::V6(v6) => SocketAddrAny::V6(SocketAddrV6::new(
-            Ipv6Addr::from(v6.ip().octets()),
-            v6.port(),
-            v6.flowinfo(),
-            v6.scope_id(),
-        )),
-    }
-}
-
-fn from_any(a: &SocketAddrAny) -> Option<SocketAddr> {
-    match a {
-        SocketAddrAny::V4(v4) => Some(SocketAddr::new(
-            std::net::Ipv4Addr::from(v4.ip().octets()).into(),
-            v4.port(),
-        )),
-        SocketAddrAny::V6(v6) => Some(SocketAddr::new(
-            std::net::Ipv6Addr::from(v6.ip().octets()).into(),
-            v6.port(),
-        )),
-        _ => None,
-    }
-}
+use crate::raw::{from_any, to_any};
 
 #[cfg(test)]
 mod tests {

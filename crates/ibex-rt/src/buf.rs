@@ -11,7 +11,7 @@
 /// A fixed-capacity FIFO of bytes.
 ///
 /// Data lives in `[head, head+len)`. Rather than a true ring, the buffer compacts when
-/// the tail runs out of room, exactly as HAProxy's does: a proxy's access pattern is
+/// the tail runs out of room, exactly as `HAProxy`'s does: a proxy's access pattern is
 /// fill-then-drain, so a compaction is rare and a wrap check on every byte is not.
 #[derive(Debug)]
 pub struct Buf {
@@ -61,11 +61,20 @@ impl Buf {
         &self.data[self.head..self.head + self.len]
     }
 
+    /// Moves readable data to index 0 so full remaining capacity is contiguous at the tail.
+    pub fn compact(&mut self) {
+        if self.head > 0 {
+            if self.len > 0 {
+                self.data.copy_within(self.head..self.head + self.len, 0);
+            }
+            self.head = 0;
+        }
+    }
+
     /// Contiguous space available to write into, compacting first if that helps.
     pub fn writable(&mut self) -> &mut [u8] {
-        if self.head + self.len == self.data.len() && self.head > 0 {
-            self.data.copy_within(self.head..self.head + self.len, 0);
-            self.head = 0;
+        if self.head > 0 && self.head + self.len == self.data.len() {
+            self.compact();
         }
         let start = self.head + self.len;
         &mut self.data[start..]
@@ -96,6 +105,64 @@ impl Buf {
     pub fn clear(&mut self) {
         self.head = 0;
         self.len = 0;
+    }
+
+    /// Replaces the leading `old_len` bytes in the readable portion of the buffer
+    /// with `new_data`.
+    pub fn replace_prefix(&mut self, old_len: usize, new_data: &[u8]) {
+        let old_len = old_len.min(self.len);
+        let rem_len = self.len - old_len;
+        let new_total = (new_data.len() + rem_len).min(self.data.len());
+        let rem_dest = new_data.len();
+        let rem_take = (new_total - rem_dest).min(rem_len);
+
+        if self.head + old_len != rem_dest && rem_take > 0 {
+            let src_start = self.head + old_len;
+            self.data
+                .copy_within(src_start..src_start + rem_take, rem_dest);
+        }
+        let write_len = new_data.len().min(self.data.len());
+        self.data[..write_len].copy_from_slice(&new_data[..write_len]);
+        self.head = 0;
+        self.len = new_total;
+    }
+
+    /// Injects or updates an HTTP header in the readable portion of the buffer.
+    ///
+    /// Compacts the buffer if necessary so readable data starts at index 0 and maximum
+    /// tail capacity is available.
+    /// Returns `true` if successful, or `false` if buffer capacity was exceeded or malformed.
+    pub fn inject_http_header(&mut self, name: &str, value: &str) -> bool {
+        if self.head > 0 {
+            self.data.copy_within(self.head..self.head + self.len, 0);
+            self.head = 0;
+        }
+        if let Some(new_len) =
+            ibex_proto::inject_http_header_with_len(&mut self.data, self.len, name, value)
+        {
+            self.len = new_len;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Removes all occurrences of an HTTP header from the readable portion of the buffer.
+    ///
+    /// Returns `true` if successful, or `false` if the buffer is malformed.
+    pub fn remove_http_header(&mut self, name: &str) -> bool {
+        if self.head > 0 {
+            self.data.copy_within(self.head..self.head + self.len, 0);
+            self.head = 0;
+        }
+        if let Some(new_len) =
+            ibex_proto::remove_http_header_with_len(&mut self.data, self.len, name)
+        {
+            self.len = new_len;
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -154,5 +221,50 @@ mod tests {
         b.commit(2);
         b.consume(999);
         assert!(b.is_empty());
+    }
+
+    #[test]
+    fn replace_prefix_shrink_and_grow() {
+        let mut b = Buf::with_capacity(32);
+        b.writable()[..7].copy_from_slice(b"1234rem");
+        b.commit(7);
+        assert_eq!(b.readable(), b"1234rem");
+
+        // Grow prefix
+        b.replace_prefix(4, b"ABCDE");
+        assert_eq!(b.readable(), b"ABCDErem");
+
+        // Shrink prefix
+        b.replace_prefix(5, b"XYZ");
+        assert_eq!(b.readable(), b"XYZrem");
+    }
+
+    #[test]
+    fn buf_http_header_injection_and_removal() {
+        let mut b = Buf::with_capacity(256);
+        let req = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        b.writable()[..req.len()].copy_from_slice(req);
+        b.commit(req.len());
+
+        // Inject new header
+        assert!(b.inject_http_header("X-Forwarded-Proto", "https"));
+        let readable_str = std::str::from_utf8(b.readable()).unwrap();
+        assert!(readable_str.contains("X-Forwarded-Proto: https\r\n"));
+        assert!(readable_str.ends_with("\r\n\r\n"));
+
+        // Update existing header
+        assert!(b.inject_http_header("Host", "api.example.com"));
+        let updated_str = std::str::from_utf8(b.readable()).unwrap();
+        assert!(updated_str.contains("Host: api.example.com\r\n"));
+        assert!(!updated_str.contains("Host: example.com\r\n"));
+
+        // Remove header
+        assert!(b.remove_http_header("X-Forwarded-Proto"));
+        let removed_str = std::str::from_utf8(b.readable()).unwrap();
+        assert!(!removed_str.contains("X-Forwarded-Proto"));
+        assert_eq!(
+            removed_str,
+            "GET / HTTP/1.1\r\nHost: api.example.com\r\n\r\n"
+        );
     }
 }

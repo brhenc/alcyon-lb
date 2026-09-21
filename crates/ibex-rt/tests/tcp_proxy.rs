@@ -2,7 +2,7 @@
 
 //! End-to-end `mode tcp` proxying, driven by the poller.
 //!
-//! These assert the behaviours HAProxy 1.0.2's `process_cli`/`process_srv` produce:
+//! These assert the behaviours `HAProxy` 1.0.2's `process_cli`/`process_srv` produce:
 //! byte-exact forwarding in both directions, half-close preserving in-flight data,
 //! shutdown propagation, and backpressure via buffer occupancy.
 
@@ -58,7 +58,6 @@ fn echo_backend() -> (SocketAddr, std::thread::JoinHandle<()>) {
     (addr, h)
 }
 
-#[ignore = "HANGS -- data forwarding loop never reaches is_done(). See HANDOVER.md \"Known broken\". The state-machine tests (timeouts, retries, backpressure) all pass; only the two forwarding tests hang, so the defect is in the process_cli/process_srv drain sequence or in the test's drive() helper, not in the state model."]
 #[test]
 fn forwards_bytes_in_both_directions() {
     let (backend, bh) = echo_backend();
@@ -66,9 +65,10 @@ fn forwards_bytes_in_both_directions() {
     let faddr = {
         let a = rustix::net::getsockname(front.borrowed_fd()).expect("getsockname");
         match a {
-            rustix::net::SocketAddrAny::V4(v4) => {
-                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(v4.ip().octets()), v4.port()))
-            }
+            rustix::net::SocketAddrAny::V4(v4) => SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::from(v4.ip().octets()),
+                v4.port(),
+            )),
             _ => panic!("v4"),
         }
     };
@@ -99,14 +99,16 @@ fn forwards_bytes_in_both_directions() {
 
     drive(&mut sess, 3000);
 
-    assert_eq!(client.join().expect("client"), b"HELLO_IBEX".to_vec(),
-               "payload must round-trip byte-exact through the proxy");
+    assert_eq!(
+        client.join().expect("client"),
+        b"HELLO_IBEX".to_vec(),
+        "payload must round-trip byte-exact through the proxy"
+    );
     assert_eq!(sess.bytes_in, 10);
     assert_eq!(sess.bytes_out, 10);
     bh.join().ok();
 }
 
-#[ignore = "HANGS -- data forwarding loop never reaches is_done(). See HANDOVER.md \"Known broken\". The state-machine tests (timeouts, retries, backpressure) all pass; only the two forwarding tests hang, so the defect is in the process_cli/process_srv drain sequence or in the test's drive() helper, not in the state model."]
 #[test]
 fn large_payload_survives_a_buffer_smaller_than_it() {
     // 1 MiB through a 16 KiB buffer: the whole point of the fill/drain loop. If
@@ -116,14 +118,15 @@ fn large_payload_survives_a_buffer_smaller_than_it() {
     let faddr = {
         let a = rustix::net::getsockname(front.borrowed_fd()).expect("getsockname");
         match a {
-            rustix::net::SocketAddrAny::V4(v4) => {
-                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(v4.ip().octets()), v4.port()))
-            }
+            rustix::net::SocketAddrAny::V4(v4) => SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::from(v4.ip().octets()),
+                v4.port(),
+            )),
             _ => panic!("v4"),
         }
     };
 
-    let payload: Vec<u8> = (0..1024 * 1024).map(|i| (i % 251) as u8).collect();
+    let payload: Vec<u8> = (0u32..1024 * 1024).map(|i| (i % 251) as u8).collect();
     let expect = payload.clone();
 
     let client = std::thread::spawn(move || {
@@ -157,7 +160,10 @@ fn large_payload_survives_a_buffer_smaller_than_it() {
 
     let got = client.join().expect("client");
     assert_eq!(got.len(), expect.len(), "1 MiB must arrive complete");
-    assert_eq!(got, expect, "and byte-exact, with no reordering or duplication");
+    assert_eq!(
+        got, expect,
+        "and byte-exact, with no reordering or duplication"
+    );
     bh.join().ok();
 }
 
@@ -167,9 +173,10 @@ fn client_timeout_fires_and_is_reported() {
     let faddr = {
         let a = rustix::net::getsockname(front.borrowed_fd()).expect("getsockname");
         match a {
-            rustix::net::SocketAddrAny::V4(v4) => {
-                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(v4.ip().octets()), v4.port()))
-            }
+            rustix::net::SocketAddrAny::V4(v4) => SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::from(v4.ip().octets()),
+                v4.port(),
+            )),
             _ => panic!("v4"),
         }
     };
@@ -185,7 +192,11 @@ fn client_timeout_fires_and_is_reported() {
         std::thread::sleep(Duration::from_millis(2));
     };
 
-    let t = Timeouts { client: 100, server: 0, connect: 0 };
+    let t = Timeouts {
+        client: 100,
+        server: 0,
+        connect: 0,
+    };
     let mut sess = TcpSession::new(cli_fd, t, 3, Tick(1000));
     assert!(!sess.check_timeouts(Tick(1050)), "must not fire early");
     assert!(sess.check_timeouts(Tick(1101)), "must fire at the deadline");
@@ -202,9 +213,10 @@ fn connect_retries_are_counted_then_exhausted() {
     let cli = TcpStream::connect({
         let a = rustix::net::getsockname(front.borrowed_fd()).expect("getsockname");
         match a {
-            rustix::net::SocketAddrAny::V4(v4) => {
-                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(v4.ip().octets()), v4.port()))
-            }
+            rustix::net::SocketAddrAny::V4(v4) => SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::from(v4.ip().octets()),
+                v4.port(),
+            )),
             _ => panic!("v4"),
         }
     });
@@ -229,13 +241,16 @@ fn interests_express_backpressure() {
     let faddr = {
         let a = rustix::net::getsockname(front.borrowed_fd()).expect("getsockname");
         match a {
-            rustix::net::SocketAddrAny::V4(v4) => {
-                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(v4.ip().octets()), v4.port()))
-            }
+            rustix::net::SocketAddrAny::V4(v4) => SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::from(v4.ip().octets()),
+                v4.port(),
+            )),
             _ => panic!("v4"),
         }
     };
-    let _c = std::thread::spawn(move || TcpStream::connect(faddr).map(|s| std::thread::sleep(Duration::from_millis(200))));
+    let _c = std::thread::spawn(move || {
+        TcpStream::connect(faddr).map(|_s| std::thread::sleep(Duration::from_millis(200)))
+    });
     let cli_fd = loop {
         if let Some((fd, _)) = front.accept().expect("accept") {
             break fd;
@@ -246,7 +261,10 @@ fn interests_express_backpressure() {
 
     let (cli, _srv) = sess.interests();
     assert!(cli.read, "an empty request buffer means we want to read");
-    assert!(!cli.write, "an empty response buffer means nothing to write");
+    assert!(
+        !cli.write,
+        "an empty response buffer means nothing to write"
+    );
 
     // Fill the request buffer: we must stop asking to read, so TCP slows the client.
     let cap = sess.req.capacity();
@@ -257,19 +275,27 @@ fn interests_express_backpressure() {
     }
     sess.req.commit(n);
     let (cli, _srv) = sess.interests();
-    assert!(!cli.read, "a full request buffer must stop client reads: backpressure");
+    assert!(
+        !cli.read,
+        "a full request buffer must stop client reads: backpressure"
+    );
 }
 
 #[test]
 fn poller_and_fdtab_integrate_with_a_session() {
     // The wiring the real accept path uses.
     let front = Listener::bind(loopback0(), 128, 0).expect("bind");
-    let mut poller = Poller::new(64).expect("epoll");
+    let poller = Poller::new(64).expect("epoll");
     let mut fds = FdTab::with_capacity(256);
     let lfd = front.raw_fd();
     fds.insert(lfd, FdState::Listener { listener: 0 }, Interest::READ);
     poller
-        .add(front.borrowed_fd(), u64::try_from(lfd).expect("fd"), true, false)
+        .add(
+            front.borrowed_fd(),
+            u64::try_from(lfd).expect("fd"),
+            true,
+            false,
+        )
         .expect("add");
     assert_eq!(fds.state(lfd), FdState::Listener { listener: 0 });
     assert_eq!(fds.live(), 1);

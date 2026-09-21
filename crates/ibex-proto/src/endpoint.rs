@@ -132,12 +132,39 @@ pub enum ScState {
     Connecting,
     /// Connected, still completing a handshake.
     Ready,
-    /// Established and usable.
+    /// Established and usable (both read and write open).
     Established,
+    /// Read side is closed; write side remains open to drain data.
+    ShutR,
+    /// Write side is closed; read side remains open.
+    ShutW,
     /// Closed cleanly.
     Closed,
     /// Failed.
     Error,
+}
+
+impl ScState {
+    /// Whether this state allows reading data from the endpoint.
+    #[must_use]
+    #[inline]
+    pub const fn can_read(self) -> bool {
+        matches!(self, ScState::Ready | ScState::Established | ScState::ShutW)
+    }
+
+    /// Whether this state allows writing data to the endpoint.
+    #[must_use]
+    #[inline]
+    pub const fn can_write(self) -> bool {
+        matches!(self, ScState::Ready | ScState::Established | ScState::ShutR)
+    }
+
+    /// Whether the endpoint is fully closed or errored.
+    #[must_use]
+    #[inline]
+    pub const fn is_closed(self) -> bool {
+        matches!(self, ScState::Closed | ScState::Error)
+    }
 }
 
 /// Flags on a stream connector. `HAProxy`'s `SC_FL_*`.

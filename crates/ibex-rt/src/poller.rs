@@ -62,8 +62,13 @@ impl Poller {
     ///
     /// # Errors
     /// Propagates `epoll_ctl` failure.
-    pub fn add(&self, fd: BorrowedFd<'_>, data: u64, readable: bool, writable: bool)
-        -> io::Result<()> {
+    pub fn add(
+        &self,
+        fd: BorrowedFd<'_>,
+        data: u64,
+        readable: bool,
+        writable: bool,
+    ) -> io::Result<()> {
         epoll::add(
             self.epfd.as_fd(),
             fd,
@@ -77,8 +82,13 @@ impl Poller {
     ///
     /// # Errors
     /// Propagates `epoll_ctl` failure.
-    pub fn modify(&self, fd: BorrowedFd<'_>, data: u64, readable: bool, writable: bool)
-        -> io::Result<()> {
+    pub fn modify(
+        &self,
+        fd: BorrowedFd<'_>,
+        data: u64,
+        readable: bool,
+        writable: bool,
+    ) -> io::Result<()> {
         epoll::modify(
             self.epfd.as_fd(),
             fd,
@@ -106,8 +116,11 @@ impl Poller {
     /// # Errors
     /// Propagates `epoll_wait` failure. `EINTR` is reported as zero events rather than
     /// an error, since a signal is not a failure.
-    pub fn poll<F: FnMut(Event)>(&mut self, timeout: Option<Duration>, mut f: F)
-        -> io::Result<usize> {
+    pub fn poll<F: FnMut(Event)>(
+        &mut self,
+        timeout: Option<Duration>,
+        mut f: F,
+    ) -> io::Result<usize> {
         self.events.clear();
         self.events.reserve(self.capacity);
 
@@ -133,9 +146,7 @@ impl Poller {
                 readable: fl.contains(epoll::EventFlags::IN),
                 writable: fl.contains(epoll::EventFlags::OUT),
                 closed: fl.intersects(
-                    epoll::EventFlags::HUP
-                        | epoll::EventFlags::ERR
-                        | epoll::EventFlags::RDHUP,
+                    epoll::EventFlags::HUP | epoll::EventFlags::ERR | epoll::EventFlags::RDHUP,
                 ),
             });
             n += 1;

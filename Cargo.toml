@@ -5,18 +5,20 @@ members = [
     "crates/ibex-sched",
     "crates/ibex-proto",
     "crates/ibex-rt",
+    "crates/ibex-config",
+    "crates/ibex-sample",
+    "crates/ibex-stick-table",
+    "crates/ibex-tls",
 ]
+
 
 # The ibex-* scaffold crates below are superseded by design/ and are excluded from the
 # build until rewritten against the new architecture. Files are retained on disk.
 # Build order: design/README.md.
 exclude = [
     "crates/ibex-core",
-    "crates/ibex-stick-table",
     "crates/ibex-peers",
     "crates/ibex-parser",
-    "crates/ibex-tls",
-    "crates/ibex-config",
     "crates/ibex-vtest",
     "crates/ibex-runtime",
     "crates/ibex-lb",
@@ -56,6 +58,8 @@ nom = "7.1"
 thiserror = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+regex = "1.10"
+
 
 # TLS & Cryptography
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }

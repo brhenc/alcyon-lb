@@ -58,25 +58,67 @@ project-ibex/
 
 ---
 
-## Quick Start
+## Quick Start & Build Automation
 
-### 1. Build and Check Syntax
+Project Ibex provides a production-grade, standardized Unix `Makefile` adhering to standard packaging conventions (`PREFIX ?= /usr/local`, `DESTDIR ?=`, `CARGO ?= cargo`, `CARGO_FLAGS ?= --release`).
+
+### 1. Self-Documenting Help
 ```bash
-cargo build --workspace
-cargo run --bin ibex -- -f examples/haproxy.cfg -c
+make help
+```
+Displays an aligned, ANSI-colored summary of all build targets, verification workflows, and overrideable configuration variables.
+
+### 2. Compilation & Execution
+```bash
+# Build optimized release binary (target/release/ibex)
+make build
+
+# Build debug binary (target/debug/ibex)
+make debug
+
+# Run Ibex with the canonical HAProxy 3.5 configuration
+make run
+
+# Launch Ibex with the dedicated single-page Web Stats Dashboard on port 8404
+make run-stats
 ```
 
-### 2. Run Test Suite
+### 3. Testing & Verification
 ```bash
-cargo test --workspace
+# Run all workspace unit, integration, and proptest suites
+make test
+
+# Run strict Clippy linter (-D warnings) across all targets
+make lint
+
+# Verify code formatting conformance
+make fmt-check
+
+# Run differential test harness against reference HAProxy 1.0.2
+make difftest
+
+# Run differential comparison (reference HAProxy vs candidate Ibex)
+make difftest-candidate
+
+# Run standalone VTC test runner against HAProxy regression tests
+make vtc
+
+# Run all compatible VTC regression tests
+make vtc-all
 ```
 
-### 3. Execute VTC Regression Test
+### 4. Installation & Packaging
 ```bash
-cargo run --bin ibex -- -t examples/regression.vtc
+# Install ibex binary with mode 755
+sudo make install
+
+# Install to custom staging directory for packaging
+make install DESTDIR=/tmp/ibex-pkg PREFIX=/usr
+
+# Remove installed binary
+sudo make uninstall
+
+# Clean build artifacts and temporary files
+make clean
 ```
 
-### 4. MC/DC & Coverage Verification
-```bash
-./scripts/coverage_mcdc.sh
-```

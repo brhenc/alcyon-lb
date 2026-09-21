@@ -13,6 +13,12 @@ pub enum StickKey {
     Binary(Vec<u8>),
 }
 
+impl From<IpAddr> for StickKey {
+    fn from(ip: IpAddr) -> Self {
+        StickKey::Ip(ip)
+    }
+}
+
 impl From<Ipv4Addr> for StickKey {
     fn from(ip: Ipv4Addr) -> Self {
         StickKey::Ip(IpAddr::V4(ip))
@@ -34,6 +40,45 @@ impl From<u64> for StickKey {
 impl From<&str> for StickKey {
     fn from(s: &str) -> Self {
         StickKey::String(s.to_string())
+    }
+}
+
+impl StickKey {
+    /// Encodes key into bytes for indexing in `EbMbTree`.
+    #[must_use]
+    pub fn encode_bytes(&self) -> Vec<u8> {
+        match self {
+            StickKey::Ip(IpAddr::V4(v4)) => {
+                let mut buf = Vec::with_capacity(5);
+                buf.push(0x01);
+                buf.extend_from_slice(&v4.octets());
+                buf
+            }
+            StickKey::Ip(IpAddr::V6(v6)) => {
+                let mut buf = Vec::with_capacity(17);
+                buf.push(0x02);
+                buf.extend_from_slice(&v6.octets());
+                buf
+            }
+            StickKey::Integer(v) => {
+                let mut buf = Vec::with_capacity(9);
+                buf.push(0x03);
+                buf.extend_from_slice(&v.to_be_bytes());
+                buf
+            }
+            StickKey::String(s) => {
+                let mut buf = Vec::with_capacity(1 + s.len());
+                buf.push(0x04);
+                buf.extend_from_slice(s.as_bytes());
+                buf
+            }
+            StickKey::Binary(b) => {
+                let mut buf = Vec::with_capacity(1 + b.len());
+                buf.push(0x05);
+                buf.extend_from_slice(b);
+                buf
+            }
+        }
     }
 }
 

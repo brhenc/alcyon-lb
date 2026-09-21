@@ -87,7 +87,20 @@ fn epoll_reports_a_pending_connection_and_bytes_flow() {
     assert_eq!(peer.ip(), Ipv4Addr::LOCALHOST, "peer address is recorded");
 
     let mut buf = [0u8; 64];
-    let got = rustix::io::read(conn.as_fd(), &mut buf).expect("read");
+    let mut got = 0;
+    for _ in 0..100 {
+        match rustix::io::read(conn.as_fd(), &mut buf) {
+            Ok(n) if n > 0 => {
+                got = n;
+                break;
+            }
+            Ok(_) => break,
+            Err(rustix::io::Errno::WOULDBLOCK) => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(e) => panic!("read: {e}"),
+        }
+    }
     assert_eq!(&buf[..got], b"PING");
     rustix::io::write(conn.as_fd(), b"PONG").expect("write");
     drop(conn);

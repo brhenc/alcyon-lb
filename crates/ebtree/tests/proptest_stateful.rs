@@ -48,7 +48,12 @@ fn run(ops: &[Op]) -> Result<(), TestCaseError> {
                 }
                 let pos = n % live.len();
                 let (idx, k) = live.swap_remove(pos);
-                prop_assert!(t.delete(idx), "step {}: delete({}) returned false", step, idx);
+                prop_assert!(
+                    t.delete(idx),
+                    "step {}: delete({}) returned false",
+                    step,
+                    idx
+                );
                 let v = model.get_mut(&k).expect("model must have the key");
                 v.pop();
                 if v.is_empty() {

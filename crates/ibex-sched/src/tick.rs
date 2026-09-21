@@ -123,7 +123,10 @@ mod tests {
         // than one just before it, even though its integer value is smaller.
         let before = Tick(u32::MAX - 10);
         let after = before.add(20); // wraps through zero
-        assert!(before.is_before(after), "{before:?} should precede {after:?}");
+        assert!(
+            before.is_before(after),
+            "{before:?} should precede {after:?}"
+        );
         assert!(!after.is_before(before));
         assert!(after.is_expired(after));
         assert!(!after.is_expired(before));

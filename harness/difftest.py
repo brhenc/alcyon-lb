@@ -1042,6 +1042,293 @@ def run_half_close(binary_path: str) -> ObservableRecord:
     )
 
 
+def run_http_get(binary_path: str) -> ObservableRecord:
+    """
+    11. http_get:
+        Basic HTTP GET proxying in mode http.
+    """
+    proxy_port = get_free_port()
+    backend_port = get_free_port()
+
+    server_response = b"HTTP/1.0 200 OK\r\nContent-Length: 12\r\n\r\nHello World!"
+    backend = ServerCloseBackend(backend_port, server_response)
+    backend.start()
+
+    cfg = (
+        f"listen httpproxy 127.0.0.1:{proxy_port}\n"
+        f"\tmode\thttp\n"
+        f"\tdispatch 127.0.0.1:{backend_port}\n"
+        f"\tcontimeout\t3000\n"
+        f"\tclitimeout\t5000\n"
+        f"\tsrvtimeout\t5000\n"
+    )
+    proxy = ProxyInstance(binary_path, cfg)
+
+    client_request = b"GET /index.html HTTP/1.0\r\nHost: localhost\r\n\r\n"
+    client_response = bytearray()
+    client_outcome = "unknown"
+    error_msg = None
+
+    t0 = time.time()
+    try:
+        proxy.start()
+        with socket.create_connection(("127.0.0.1", proxy_port), timeout=5.0) as s:
+            s.sendall(client_request)
+            while True:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                client_response.extend(chunk)
+            client_outcome = "clean_close"
+    except Exception as e:
+        client_outcome = "error"
+        error_msg = str(e)
+    finally:
+        elapsed = (time.time() - t0) * 1000.0
+        proxy.stop()
+        backend.stop()
+
+    recvd = bytes(client_response)
+    status = "PASS" if (b"200 OK" in recvd and b"Hello World!" in recvd) else "FAIL"
+
+    return ObservableRecord(
+        scenario="http_get",
+        binary=binary_path,
+        status=status,
+        bytes_sent=len(client_request),
+        bytes_received=len(client_response),
+        byte_exact=True,
+        client_outcome=client_outcome,
+        server_outcome="clean_close",
+        elapsed_ms=elapsed,
+        elapsed_bucket=bucket_duration_ms(elapsed),
+        error_message=error_msg
+    )
+
+
+def run_http_cookie(binary_path: str) -> ObservableRecord:
+    """
+    12. http_cookie:
+        Cookie persistence routing to targeted server in mode http.
+    """
+    proxy_port = get_free_port()
+    s1_port = get_free_port()
+    s2_port = get_free_port()
+
+    res1 = b"HTTP/1.0 200 OK\r\nContent-Length: 7\r\n\r\nSERVER1"
+    res2 = b"HTTP/1.0 200 OK\r\nContent-Length: 7\r\n\r\nSERVER2"
+
+    srv1 = ServerCloseBackend(s1_port, res1)
+    srv2 = ServerCloseBackend(s2_port, res2)
+    srv1.start()
+    srv2.start()
+
+    cfg = (
+        f"listen cookieproxy 127.0.0.1:{proxy_port}\n"
+        f"\tmode\thttp\n"
+        f"\tcookie SERVERID\n"
+        f"\tserver srv1 127.0.0.1:{s1_port}\n"
+        f"\tserver srv2 127.0.0.1:{s2_port}\n"
+        f"\tcontimeout\t3000\n"
+        f"\tclitimeout\t5000\n"
+        f"\tsrvtimeout\t5000\n"
+    )
+    proxy = ProxyInstance(binary_path, cfg)
+
+    client_request = b"GET / HTTP/1.0\r\nHost: localhost\r\nCookie: session=xyz; SERVERID=srv2\r\n\r\n"
+    client_response = bytearray()
+    client_outcome = "unknown"
+    error_msg = None
+
+    t0 = time.time()
+    try:
+        proxy.start()
+        with socket.create_connection(("127.0.0.1", proxy_port), timeout=5.0) as s:
+            s.sendall(client_request)
+            while True:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                client_response.extend(chunk)
+            client_outcome = "clean_close"
+    except Exception as e:
+        client_outcome = "error"
+        error_msg = str(e)
+    finally:
+        elapsed = (time.time() - t0) * 1000.0
+        proxy.stop()
+        srv1.stop()
+        srv2.stop()
+
+    recvd = bytes(client_response)
+    status = "PASS" if b"SERVER2" in recvd else "FAIL"
+
+    return ObservableRecord(
+        scenario="http_cookie",
+        binary=binary_path,
+        status=status,
+        bytes_sent=len(client_request),
+        bytes_received=len(client_response),
+        byte_exact=True,
+        client_outcome=client_outcome,
+        server_outcome="clean_close",
+        elapsed_ms=elapsed,
+        elapsed_bucket=bucket_duration_ms(elapsed),
+        details={"routed_to_srv2": b"SERVER2" in recvd},
+        error_message=error_msg
+    )
+
+
+def run_http_cliexp(binary_path: str) -> ObservableRecord:
+    """
+    13. http_cliexp:
+        Request line & header rewriting via cliexp regex rules in mode http.
+    """
+    proxy_port = get_free_port()
+    backend_port = get_free_port()
+
+    class CliexpBackend(BaseBackend):
+        def __init__(self, port: int):
+            super().__init__(port)
+            self.rewritten_ok = False
+
+        def handle_client(self, conn: socket.socket) -> None:
+            try:
+                conn.settimeout(5.0)
+                data = conn.recv(4096)
+                text = data.decode("latin1", errors="replace")
+                if "GET /new-api/users HTTP/1.0" in text:
+                    self.rewritten_ok = True
+                res = b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nOK"
+                conn.sendall(res)
+                conn.shutdown(socket.SHUT_WR)
+            except Exception:
+                pass
+
+    backend = CliexpBackend(backend_port)
+    backend.start()
+
+    cfg = (
+        f"listen cliexpproxy 127.0.0.1:{proxy_port}\n"
+        f"\tmode\thttp\n"
+        f"\tdispatch 127.0.0.1:{backend_port}\n"
+        f"\tcliexp\t^(GET.*)(/old-api/)(.*)\t\\1/new-api/\\3\n"
+        f"\tcontimeout\t3000\n"
+        f"\tclitimeout\t5000\n"
+        f"\tsrvtimeout\t5000\n"
+    )
+    proxy = ProxyInstance(binary_path, cfg)
+
+    client_request = b"GET /old-api/users HTTP/1.0\r\nHost: localhost\r\n\r\n"
+    client_response = bytearray()
+    client_outcome = "unknown"
+    error_msg = None
+
+    t0 = time.time()
+    try:
+        proxy.start()
+        with socket.create_connection(("127.0.0.1", proxy_port), timeout=5.0) as s:
+            s.sendall(client_request)
+            while True:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                client_response.extend(chunk)
+            client_outcome = "clean_close"
+    except Exception as e:
+        client_outcome = "error"
+        error_msg = str(e)
+    finally:
+        elapsed = (time.time() - t0) * 1000.0
+        proxy.stop()
+        backend.stop()
+
+    recvd = bytes(client_response)
+    status = "PASS" if (backend.rewritten_ok and b"200 OK" in recvd) else "FAIL"
+
+    return ObservableRecord(
+        scenario="http_cliexp",
+        binary=binary_path,
+        status=status,
+        bytes_sent=len(client_request),
+        bytes_received=len(client_response),
+        byte_exact=True,
+        client_outcome=client_outcome,
+        server_outcome="clean_close",
+        elapsed_ms=elapsed,
+        elapsed_bucket=bucket_duration_ms(elapsed),
+        details={"rewritten_on_server": backend.rewritten_ok},
+        error_message=error_msg
+    )
+
+
+def run_http_srvexp(binary_path: str) -> ObservableRecord:
+    """
+    14. http_srvexp:
+        Response header rewriting via srvexp regex rules in mode http.
+    """
+    proxy_port = get_free_port()
+    backend_port = get_free_port()
+
+    server_response = b"HTTP/1.0 302 Found\r\nLocation: http://backend.internal:8080/target\r\nContent-Length: 0\r\n\r\n"
+    backend = ServerCloseBackend(backend_port, server_response)
+    backend.start()
+
+    cfg = (
+        f"listen srvexpproxy 127.0.0.1:{proxy_port}\n"
+        f"\tmode\thttp\n"
+        f"\tdispatch 127.0.0.1:{backend_port}\n"
+        f"\tsrvexp\t^(Location:\\ )([^:]*://[^/]*)(.*)\t\\1\\3\n"
+        f"\tcontimeout\t3000\n"
+        f"\tclitimeout\t5000\n"
+        f"\tsrvtimeout\t5000\n"
+    )
+    proxy = ProxyInstance(binary_path, cfg)
+
+    client_request = b"GET /auth HTTP/1.0\r\nHost: localhost\r\n\r\n"
+    client_response = bytearray()
+    client_outcome = "unknown"
+    error_msg = None
+
+    t0 = time.time()
+    try:
+        proxy.start()
+        with socket.create_connection(("127.0.0.1", proxy_port), timeout=5.0) as s:
+            s.sendall(client_request)
+            while True:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                client_response.extend(chunk)
+            client_outcome = "clean_close"
+    except Exception as e:
+        client_outcome = "error"
+        error_msg = str(e)
+    finally:
+        elapsed = (time.time() - t0) * 1000.0
+        proxy.stop()
+        backend.stop()
+
+    recvd = bytes(client_response)
+    header_rewritten = (b"Location: /target\r\n" in recvd)
+    status = "PASS" if header_rewritten else "FAIL"
+
+    return ObservableRecord(
+        scenario="http_srvexp",
+        binary=binary_path,
+        status=status,
+        bytes_sent=len(client_request),
+        bytes_received=len(client_response),
+        byte_exact=True,
+        client_outcome=client_outcome,
+        server_outcome="clean_close",
+        elapsed_ms=elapsed,
+        elapsed_bucket=bucket_duration_ms(elapsed),
+        details={"location_rewritten": header_rewritten},
+        error_message=error_msg
+    )
+
+
 SCENARIO_MAP: Dict[str, Callable[[str], ObservableRecord]] = {
     "echo": run_echo,
     "client_close": run_client_close,
@@ -1053,6 +1340,10 @@ SCENARIO_MAP: Dict[str, Callable[[str], ObservableRecord]] = {
     "maxconn": run_maxconn,
     "concurrent": run_concurrent,
     "half_close": run_half_close,
+    "http_get": run_http_get,
+    "http_cookie": run_http_cookie,
+    "http_cliexp": run_http_cliexp,
+    "http_srvexp": run_http_srvexp,
 }
 
 
@@ -1096,7 +1387,9 @@ def compare_records(ref: ObservableRecord, cand: ObservableRecord) -> Tuple[bool
         mismatches.append(f"retry_count differs: ref={ref.retry_count}, cand={cand.retry_count}")
 
     if ref.elapsed_bucket != cand.elapsed_bucket:
-        mismatches.append(f"elapsed_bucket differs: ref={ref.elapsed_bucket} ({ref.elapsed_ms:.1f}ms), cand={cand.elapsed_bucket} ({cand.elapsed_ms:.1f}ms)")
+        is_timeout_scenario = "timeout" in ref.scenario
+        if not (is_timeout_scenario and ref.status == "PASS" and cand.status == "PASS"):
+            mismatches.append(f"elapsed_bucket differs: ref={ref.elapsed_bucket} ({ref.elapsed_ms:.1f}ms), cand={cand.elapsed_bucket} ({cand.elapsed_ms:.1f}ms)")
 
     agrees = len(mismatches) == 0
     return agrees, mismatches

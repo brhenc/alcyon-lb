@@ -79,6 +79,8 @@ pub struct Stream {
     pub stick_counters: [u32; 3],
     pub bytes_in: u64,
     pub bytes_out: u64,
+    pub client_addr: Option<std::net::SocketAddr>,
+    pub proxy_info: Option<crate::proxy_protocol::ProxyInfo>,
 }
 
 impl Stream {
@@ -102,6 +104,8 @@ impl Stream {
             stick_counters: [u32::MAX; 3],
             bytes_in: 0,
             bytes_out: 0,
+            client_addr: None,
+            proxy_info: None,
         }
     }
 

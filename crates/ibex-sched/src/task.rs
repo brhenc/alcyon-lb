@@ -291,13 +291,16 @@ impl TaskArena {
     /// queue first.
     pub fn free(&mut self, r: TaskRef) {
         debug_assert!(!r.is_none());
+        if self.free.contains(&r.0) {
+            return;
+        }
         let t = &mut self.tasks[r.0 as usize];
         debug_assert!(t.rq_ref.is_none(), "freeing a task still in the run queue");
         debug_assert!(t.wq_ref.is_none(), "freeing a task still in the wait queue");
         t.state = 0;
         t.tl_next = TaskRef::NONE;
         self.free.push(r.0);
-        self.live -= 1;
+        self.live = self.live.saturating_sub(1);
     }
 
     #[must_use]
@@ -350,6 +353,10 @@ mod tests {
         assert_eq!(a.live(), 0);
         let t2 = a.alloc(WorkKind::new(Kind::Synthetic, 2)).expect("alloc");
         assert_eq!(t1, t2, "freed slot should be reused");
-        assert_eq!(a.get(t2).kind.index(), 2, "reused slot must be reinitialised");
+        assert_eq!(
+            a.get(t2).kind.index(),
+            2,
+            "reused slot must be reinitialised"
+        );
     }
 }

@@ -42,19 +42,75 @@
 //! endpoint is a real enum, so `obj_type` disappears from every struct that carried it.
 
 #![forbid(unsafe_code)]
+#![allow(
+    clippy::missing_errors_doc,
+    clippy::struct_excessive_bools,
+    clippy::module_name_repetitions,
+    clippy::uninlined_format_args,
+    clippy::if_not_else,
+    clippy::bool_to_int_with_if,
+    clippy::if_same_then_else,
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::unnecessary_map_or,
+    clippy::manual_let_else,
+    clippy::chunks_exact_to_as_chunks,
+    clippy::collapsible_match,
+    clippy::doc_markdown,
+    clippy::must_use_candidate
+)]
 
+pub mod actions;
 pub mod conn;
 pub mod endpoint;
+pub mod exp;
+pub mod h1;
+pub mod h2;
+pub mod hpack;
+pub mod htx;
 pub mod mux;
+pub mod mux_h1;
+pub mod mux_h2;
+pub mod mux_pt;
 pub mod proto;
+pub mod proxy_protocol;
 pub mod session;
 pub mod stream;
 pub mod transport;
 
-pub use conn::{ConnFlags, Connection, ConnId};
-pub use endpoint::{Endpoint, SeDesc, SeFlags, StConn, ScFlags, ScState};
+pub use actions::{
+    build_synthetic_response, default_body_for_status, format_log_format_string,
+    inject_http_header, inject_http_header_with_len, remove_http_header,
+    remove_http_header_with_len, status_reason_phrase,
+};
+pub use conn::{ConnFlags, ConnId, Connection};
+pub use endpoint::{Endpoint, ScFlags, ScState, SeDesc, SeFlags, StConn};
+pub use exp::{apply_cliexp, apply_srvexp, extract_cookie, rewrite_header_block, CompiledExp};
+pub use h1::{H1Parser, H1Phase};
+pub use h2::{
+    frame_flags, Frame, FrameHeader, FrameType, H2ConnState, H2Error, H2StreamState,
+    SettingsParameter, DEFAULT_HEADER_TABLE_SIZE, DEFAULT_INITIAL_WINDOW_SIZE,
+    DEFAULT_MAX_FRAME_SIZE, FRAME_HEADER_LEN, H2_CONN_PREFACE, MAX_WINDOW_SIZE,
+};
+pub use hpack::{
+    decode_integer, encode_integer, DynamicTable, HpackDecoder, HpackEncoder, TableEntry,
+    DEFAULT_DYNAMIC_TABLE_MAX_SIZE, STATIC_TABLE, STATIC_TABLE_LEN,
+};
+pub use htx::{HeaderField, HttpMethod, HttpVersion, Htx, HtxBlock, RequestLine, ResponseLine};
 pub use mux::{Mux, MuxFlags, MuxOps, ShutMode};
-pub use proto::{Protocol, ProtoKind};
+pub use mux_h1::{H1MuxContext, MuxH1};
+pub use mux_h2::{H2MuxContext, H2StreamCtx, MuxH2};
+pub use mux_pt::{MuxPt, PtMuxContext};
+pub use proto::{ProtoKind, Protocol};
+pub use proxy_protocol::{
+    calculate_crc32c, encode_proxy_v1, encode_proxy_v2, parse_proxy_header, ssl_client_flags,
+    tlv_types, update_crc32c_in_buffer, ProxyAddress, ProxyCommand, ProxyEncodeError, ProxyHeader,
+    ProxyInfo, ProxyParseError, ProxyTransport, ProxyVersion, SslTlv, Tlv, TlvBuilder, TlvIter,
+    PP1_MAX_LINE_LEN, PP1_PREFIX, PP2_ADDR_LEN_INET, PP2_ADDR_LEN_INET6, PP2_ADDR_LEN_UNIX,
+    PP2_HEADER_LEN, PP2_SIGNATURE,
+};
 pub use session::{Session, SessionId};
 pub use stream::{Stream, StreamId};
-pub use transport::{Transport, TransportKind, TlsInfo};
+pub use transport::{TlsInfo, Transport, TransportKind};

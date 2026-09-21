@@ -6,10 +6,13 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
-ibex-core.workspace = true
 ebtree.workspace = true
 tracing.workspace = true
-crossbeam-epoch.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
 
 [lints]
 workspace = true
+
