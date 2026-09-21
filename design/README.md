@@ -15,7 +15,9 @@ read from that tree. When a claim here is about HAProxy, it has a file:line behi
 | 002 | [Threading and affinity](002-threading-and-affinity.md) — thread-per-core, accept distribution, takeover | analysed |
 | 003 | [Scheduler](003-scheduler.md) — run queue, timers, class budgets, and why not tokio | analysed, **to build** |
 | 004 | [Elastic binary trees](004-ebtree.md) — design, and the arena/tagged-index translation | analysed, **to build** |
-| 005 | Sample / converter / matcher lattice | **next, on paper** |
+| 005 | [Sprint plan and delegation contract](005-sprint-plan.md) | active |
+| 006 | [Data layout and observability tiers](006-data-layout.md) — measured sizes, why an enum beats a function pointer, debug/production tiering | analysed |
+| 007 | Sample / converter / matcher lattice | after the scheduler |
 
 ## Decisions taken
 
@@ -31,6 +33,14 @@ read from that tree. When a claim here is about HAProxy, it has a file:line behi
 - **D3 — ebtree as the core ordered structure**, implemented over an index arena with
   tagged `u32` references rather than tagged pointers. Same asymptotics and better cache
   density than the C original, with no `unsafe`. See [004](004-ebtree.md).
+- **D5 — Representations are chosen by measured layout, not idiom.** Work kind is an
+  8-byte enum rather than C's 16-byte function pointer + `void *`: smaller, no indirect
+  call, and introspection comes free. `Box<dyn Task>` is rejected for its per-task
+  allocation. See [006](006-data-layout.md).
+- **D6 — Observability is tiered, never a per-connection layout tax.** Compile-time
+  fields, runtime-gated writes, on-demand walking, and per-connection side tables behind
+  a cold branch. Alternate structures per connection would make every connection pay for
+  the few being debugged. See [006](006-data-layout.md) §5.
 - **D4 — Scope cuts.** No Lua, no filters, no SPOE, no QUIC/H3, no FCGI. Target is a
   small-to-medium-site HTTPS load balancer with HAProxy config syntax, the runtime socket,
   and a stats page that works with (a lightly modified) hatop.

@@ -799,3 +799,15 @@ impl Iterator for Iter<'_> {
         Some(cur)
     }
 }
+
+#[cfg(test)]
+mod layout {
+    #[test]
+    fn node_size_is_compact() {
+        // C: eb32_node is 40 bytes and carries no payload; the payload lives in the
+        // enclosing struct. Ours carries key AND payload in less space.
+        let sz = core::mem::size_of::<super::Node>();
+        println!("ebtree::Node = {sz} bytes");
+        assert!(sz <= 28, "Node grew to {sz} bytes");
+    }
+}
