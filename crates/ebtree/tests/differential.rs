@@ -21,7 +21,7 @@ fn model_order(keys: &[u32]) -> Vec<u32> {
         *m.entry(k).or_insert(0) += 1;
     }
     m.into_iter()
-        .flat_map(|(k, n)| std::iter::repeat(k).take(n))
+        .flat_map(|(k, n)| std::iter::repeat_n(k, n))
         .collect()
 }
 

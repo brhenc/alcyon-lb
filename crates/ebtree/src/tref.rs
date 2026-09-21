@@ -1,6 +1,6 @@
 //! Tagged references into the node arena.
 //!
-//! HAProxy's ebtree stores a one-bit tag in the low bit of every pointer
+//! `HAProxy`'s ebtree stores a one-bit tag in the low bit of every pointer
 //! (`eb_troot_t`), and that single tag namespace carries **two unrelated meanings**
 //! depending on which field holds it:
 //!

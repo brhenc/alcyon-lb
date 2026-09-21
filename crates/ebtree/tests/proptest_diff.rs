@@ -12,7 +12,7 @@ fn model_order(keys: &[u32]) -> Vec<u32> {
         *m.entry(k).or_insert(0) += 1;
     }
     m.into_iter()
-        .flat_map(|(k, n)| std::iter::repeat(k).take(n))
+        .flat_map(|(k, n)| std::iter::repeat_n(k, n))
         .collect()
 }
 
@@ -97,7 +97,7 @@ proptest! {
         let mut s = seed | 1;
         for i in (1..keys.len()).rev() {
             s ^= s << 13; s ^= s >> 7; s ^= s << 17;
-            keys.swap(i, (s as usize) % (i + 1));
+            keys.swap(i, usize::try_from(s % (i as u64 + 1)).unwrap_or(0));
         }
 
         let b = build(&keys);

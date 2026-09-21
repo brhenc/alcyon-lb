@@ -1,6 +1,6 @@
 //! Elastic binary trees.
 //!
-//! A Rust implementation of Willy Tarreau's ebtree (as used throughout HAProxy for the
+//! A Rust implementation of Willy Tarreau's ebtree (as used throughout `HAProxy` for the
 //! scheduler run queue, timer wait queue, stick tables and server queues), built on an
 //! index arena with tagged `u32` references instead of tagged pointers.
 //!

@@ -1,6 +1,6 @@
 //! 32-bit-keyed elastic binary tree.
 //!
-//! Port of HAProxy's `eb32tree` (`include/import/eb32tree.h`, `src/eb32tree.c`,
+//! Port of `HAProxy`'s `eb32tree` (`include/import/eb32tree.h`, `src/eb32tree.c`,
 //! ebtree 6.0.6 by Willy Tarreau) onto an index arena. See `design/004-ebtree.md`.
 
 use crate::tref::{Branch, Half, Parent, Side, ROOT};
@@ -11,6 +11,10 @@ pub const MAX_NODES: u32 = ROOT - 1;
 /// Sentinel `bit` value marking the head of a duplicate subtree.
 const DUP: i16 = -1;
 
+// `node_p` / `leaf_p` keep the names they have in the C original so the port can be
+// cross-referenced against `include/import/ebtree-t.h` line for line. That is worth more
+// than satisfying the struct_field_names heuristic.
+#[allow(clippy::struct_field_names)]
 #[derive(Clone, Debug)]
 struct Node {
     /// Branches of this node's *link* half.
@@ -253,7 +257,7 @@ impl Eb32Tree {
             // flsnz(x) - 1: index of the highest bit where the keys differ.
             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
             {
-                (31 - (key ^ okey).leading_zeros()) as i16
+                (key ^ okey).ilog2() as i16
             }
         };
 
@@ -351,12 +355,17 @@ impl Eb32Tree {
         self.walk_down(self.root[0], Side::Right)
     }
 
-    /// Next node in key order. Mirrors `eb_next()`.
-    #[must_use]
-    pub fn next(&self, idx: u32) -> Option<u32> {
-        let mut t = self.nodes[idx as usize].leaf_p;
-        // Walk up while we are a right child. Terminates because the root's own
-        // parent link is never a right child.
+    /// The next node in key order, starting from a *parent link* rather than a node.
+    ///
+    /// Shared by [`Self::next`] and [`Self::lookup_ge`]. In C these are the same code
+    /// because `leaf_p` and `node_p` are both `eb_troot_t`; here they are the same
+    /// type (`Parent`) but reached from different fields, so the sharing is explicit.
+    fn next_from_parent(&self, mut t: Parent) -> Option<u32> {
+        if t.is_none() {
+            return None;
+        }
+        // Walk up while we are a right child. Terminates at the root, whose own
+        // parent link is a left link by construction.
         while t.side() == Side::Right {
             t = self.nodes[t.owner() as usize].node_p;
             if t.is_none() {
@@ -364,14 +373,20 @@ impl Eb32Tree {
             }
         }
         // We are a left child: the answer is the leftmost leaf of our right sibling.
-        // At the root this reads `root[1]`, which is always NONE — that is precisely
-        // how C detects the end of the tree.
+        // At the root this reads `root[1]`, which is always NONE — precisely how C
+        // detects the end of the tree.
         let sibling = if t.is_root() {
             self.root[Side::Right.idx()]
         } else {
             self.nodes[t.owner() as usize].branches[Side::Right.idx()]
         };
         self.walk_down(sibling, Side::Left)
+    }
+
+    /// Next node in key order. Mirrors `eb_next()`.
+    #[must_use]
+    pub fn next(&self, idx: u32) -> Option<u32> {
+        self.next_from_parent(self.nodes[idx as usize].leaf_p)
     }
 
     /// Previous node in key order. Mirrors `eb_prev()`.
@@ -396,11 +411,255 @@ impl Eb32Tree {
     }
 
     /// Iterates node indices in ascending key order.
+    #[must_use]
     pub fn iter(&self) -> Iter<'_> {
         Iter {
-            tree: self,
+            inner: self,
             cur: self.first(),
         }
+    }
+
+
+    // ---- invariant checking --------------------------------------------------------
+
+    /// Verifies every structural invariant, returning `Err` with a description of the
+    /// first violation. Intended for tests and fuzzing.
+    ///
+    /// Traversal can look correct while the tree is internally malformed in a way that
+    /// only surfaces several deletions later, so this checks the structure directly
+    /// rather than inferring health from observable behaviour.
+    ///
+    /// # Errors
+    /// Returns a description of the first invariant violated.
+    pub fn check_invariants(&self) -> Result<(), String> {
+        if self.root[Side::Right.idx()] != Branch::NONE {
+            return Err("root right branch must always be NONE".into());
+        }
+        if self.root[0].is_none() {
+            return if self.len == 0 {
+                Ok(())
+            } else {
+                Err(format!("empty root but len={}", self.len))
+            };
+        }
+
+        let mut seen_leaves = 0usize;
+        let mut stack = vec![(self.root[0], Parent::root(Side::Left), i32::MAX)];
+
+        while let Some((branch, expect_parent, parent_bit)) = stack.pop() {
+            if branch.is_none() {
+                return Err(format!("NONE branch reachable from {expect_parent:?}"));
+            }
+            let n = branch.index() as usize;
+            if n >= self.nodes.len() {
+                return Err(format!("index {n} out of arena bounds"));
+            }
+
+            match branch.half() {
+                Half::Leaf => {
+                    if self.nodes[n].leaf_p != expect_parent {
+                        return Err(format!(
+                            "leaf {n}: leaf_p is {:?}, parent says {expect_parent:?}",
+                            self.nodes[n].leaf_p
+                        ));
+                    }
+                    seen_leaves += 1;
+                }
+                Half::Link => {
+                    if self.nodes[n].node_p != expect_parent {
+                        return Err(format!(
+                            "link {n}: node_p is {:?}, parent says {expect_parent:?}",
+                            self.nodes[n].node_p
+                        ));
+                    }
+                    let bit = i32::from(self.nodes[n].bit);
+                    // Bit ordering runs in opposite directions in the two regions of
+                    // the tree, which is easy to get wrong:
+                    //
+                    // * Main tree (parent bit >= 0): bits strictly *decrease* going
+                    //   down. This is what bounds depth by key width.
+                    // * Duplicate subtree (parent bit < 0): bits strictly *increase*
+                    //   going down, normally by exactly one, toward -1 at the bottom.
+                    //   `__eb_insert_dup` detects a reusable "hole" precisely as a
+                    //   gap in that sequence (`head->bit > last->bit + 1`).
+                    //
+                    // Entry into a duplicate subtree still satisfies the main-tree
+                    // rule, since any negative bit is below any non-negative one.
+                    if parent_bit >= 0 {
+                        if bit >= parent_bit {
+                            return Err(format!(
+                                "link {n}: main-tree bit {bit} must be below parent bit {parent_bit}"
+                            ));
+                        }
+                    } else {
+                        if bit >= 0 {
+                            return Err(format!(
+                                "link {n}: bit {bit} must stay negative inside a duplicate subtree (parent {parent_bit})"
+                            ));
+                        }
+                        if bit <= parent_bit {
+                            return Err(format!(
+                                "link {n}: duplicate-subtree bit {bit} must be above parent bit {parent_bit}"
+                            ));
+                        }
+                    }
+                    stack.push((
+                        self.nodes[n].branches[Side::Right.idx()],
+                        Parent::new(branch.index(), Side::Right),
+                        bit,
+                    ));
+                    stack.push((
+                        self.nodes[n].branches[Side::Left.idx()],
+                        Parent::new(branch.index(), Side::Left),
+                        bit,
+                    ));
+                }
+            }
+        }
+
+        if seen_leaves != self.len {
+            return Err(format!(
+                "reachable leaves {seen_leaves} != len {}",
+                self.len
+            ));
+        }
+
+        // Keys must be non-decreasing in traversal order, and traversal must visit
+        // exactly the reachable leaves.
+        let mut count = 0usize;
+        let mut prev: Option<u32> = None;
+        for i in self {
+            let k = self.key_of(i);
+            if let Some(pk) = prev {
+                if k < pk {
+                    return Err(format!("traversal out of order: {pk} then {k}"));
+                }
+            }
+            prev = Some(k);
+            count += 1;
+            if count > self.len {
+                return Err("traversal exceeded len (cycle?)".into());
+            }
+        }
+        if count != self.len {
+            return Err(format!("traversal visited {count}, len is {}", self.len));
+        }
+
+        Ok(())
+    }
+
+    /// Maximum leaf depth. Must stay bounded by key width regardless of input.
+    #[must_use]
+    pub fn max_depth(&self) -> usize {
+        if self.root[0].is_none() {
+            return 0;
+        }
+        let mut max = 0usize;
+        let mut stack = vec![(self.root[0], 1usize)];
+        while let Some((b, d)) = stack.pop() {
+            if b.is_none() {
+                continue;
+            }
+            match b.half() {
+                Half::Leaf => max = max.max(d),
+                Half::Link => {
+                    let n = b.index() as usize;
+                    stack.push((self.nodes[n].branches[0], d + 1));
+                    stack.push((self.nodes[n].branches[1], d + 1));
+                }
+            }
+        }
+        max
+    }
+
+    // ---- delete ------------------------------------------------------------------
+
+    /// Removes the node at `idx` from the tree and returns its arena slot to the free
+    /// list. Returns `false` if the node was not linked.
+    ///
+    /// Mirrors `__eb_delete()`. The interesting part is that removing a node's *leaf*
+    /// half may leave its *link* half still structurally in use. The resolution is
+    /// that our parent's link half becomes free at exactly the same moment, so the
+    /// parent is recycled in place to take over our link role. Note also that a node
+    /// is frequently its own parent — `insert` attaches a new node's leaf to its own
+    /// link half — and that case falls out of the same code rather than needing a
+    /// branch.
+    pub fn delete(&mut self, idx: u32) -> bool {
+        if self.nodes[idx as usize].leaf_p.is_none() {
+            return false;
+        }
+
+        let leaf_p = self.nodes[idx as usize].leaf_p;
+        let pside = leaf_p.side();
+
+        // Attached directly to the tree root. C detects this by testing whether the
+        // parent's right branch is NULL, which is true only for the root; here the
+        // root is named, so the test is direct.
+        if leaf_p.is_root() {
+            self.root[Side::Left.idx()] = Branch::NONE;
+            self.unlink_and_recycle(idx);
+            return true;
+        }
+
+        let parent = leaf_p.owner();
+
+        // Reparent our sibling directly onto the grandparent, cutting `parent`'s link
+        // half out of the tree. Read the grandparent link before it is cleared.
+        let gp = self.nodes[parent as usize].node_p;
+        let sibling = self.nodes[parent as usize].branches[1 - pside.idx()];
+        self.set_slot(gp, sibling);
+        self.set_back_link(sibling, gp);
+
+        // `parent`'s link half is now unused. If `parent == idx` this also clears our
+        // own `node_p`, which makes the check below take the early exit — exactly the
+        // behaviour C relies on without special-casing it.
+        self.nodes[parent as usize].node_p = Parent::NONE;
+
+        if !self.nodes[idx as usize].node_p.is_none() {
+            // Our link half is still in use. Move it wholesale onto `parent`, whose
+            // link half just became free. `parent` sits below us in the tree, so its
+            // key shares every bit above `bit` and remains a valid representative for
+            // the branch test.
+            let node_p = self.nodes[idx as usize].node_p;
+            let branches = self.nodes[idx as usize].branches;
+            let bit = self.nodes[idx as usize].bit;
+
+            self.nodes[parent as usize].node_p = node_p;
+            self.nodes[parent as usize].branches = branches;
+            self.nodes[parent as usize].bit = bit;
+
+            self.set_slot(node_p, Branch::new(parent, Half::Link));
+
+            for side in [Side::Left, Side::Right] {
+                let child = self.nodes[parent as usize].branches[side.idx()];
+                self.set_back_link(child, Parent::new(parent, side));
+            }
+        }
+
+        self.unlink_and_recycle(idx);
+        true
+    }
+
+    /// Points a child's upward link at `p`, choosing `leaf_p` or `node_p` according to
+    /// which half of the child is attached.
+    #[inline]
+    fn set_back_link(&mut self, child: Branch, p: Parent) {
+        if child.is_none() {
+            return;
+        }
+        match child.half() {
+            Half::Leaf => self.nodes[child.index() as usize].leaf_p = p,
+            Half::Link => self.nodes[child.index() as usize].node_p = p,
+        }
+    }
+
+    fn unlink_and_recycle(&mut self, idx: u32) {
+        let n = &mut self.nodes[idx as usize];
+        n.leaf_p = Parent::NONE;
+        n.node_p = Parent::NONE;
+        n.branches = [Branch::NONE; 2];
+        self.free.push(idx);
+        self.len -= 1;
     }
 
     // ---- lookup ------------------------------------------------------------------
@@ -441,11 +700,93 @@ impl Eb32Tree {
             }
         }
     }
+    /// Smallest node whose key is `>= x`, or `None` if every key is smaller.
+    ///
+    /// Mirrors `eb32_lookup_ge()`. This is the operation the timer wait queue is built
+    /// on. Note that `HAProxy`'s *wrapping* tick search is caller-level logic, not a
+    /// property of the tree: it calls `lookup_ge(now - TIMER_LOOK_BACK)` and, on
+    /// `None`, wraps to `first()`, which treats the key space as a circle. See
+    /// `design/003-scheduler.md` §4.
+    #[must_use]
+    pub fn lookup_ge(&self, x: u32) -> Option<u32> {
+        let mut troot = self.root[0];
+        if troot.is_none() {
+            return None;
+        }
+
+        // On leaving this loop, `up` names the parent link from which to continue
+        // searching rightwards.
+        let up: Parent;
+
+        loop {
+            if troot.half() == Half::Leaf {
+                // All upper bits were common. Take this leaf if it is large enough,
+                // otherwise continue from its parent.
+                let n = troot.index();
+                if self.nodes[n as usize].key >= x {
+                    return Some(n);
+                }
+                up = self.nodes[n as usize].leaf_p;
+                break;
+            }
+
+            let n = troot.index();
+            let y = self.nodes[n as usize].key;
+            let bit = self.nodes[n as usize].bit;
+
+            // `bit & 31` matches C's masking, which maps the negative duplicate-tree
+            // marker onto bit 31.
+            let z = 1u32 << (bit & 31);
+
+            if bit < 0 {
+                // Top of a duplicate subtree: every leaf below shares one key, so
+                // either the whole subtree qualifies or none of it does.
+                if y >= x {
+                    return self
+                        .walk_down(self.nodes[n as usize].branches[Side::Left.idx()], Side::Left);
+                }
+                up = self.nodes[n as usize].node_p;
+                break;
+            }
+
+            // Any differing bit *above* this node's bit means the entire subtree is
+            // uniformly on one side of `x`.
+            if (x ^ y) & z.wrapping_shl(1).wrapping_neg() != 0 {
+                #[allow(clippy::cast_sign_loss)]
+                let shift = bit as u32;
+                if (y >> shift) > (x >> shift) {
+                    // Whole subtree exceeds x: its minimum is the answer.
+                    return self
+                        .walk_down(self.nodes[n as usize].branches[Side::Left.idx()], Side::Left);
+                }
+                // Whole subtree is below x: continue after it.
+                up = self.nodes[n as usize].node_p;
+                break;
+            }
+
+            let side = if x & z == 0 { Side::Left } else { Side::Right };
+            troot = self.nodes[n as usize].branches[side.idx()];
+            if troot.is_none() {
+                return None;
+            }
+        }
+
+        self.next_from_parent(up)
+    }
+
+}
+
+impl<'a> IntoIterator for &'a Eb32Tree {
+    type Item = u32;
+    type IntoIter = Iter<'a>;
+    fn into_iter(self) -> Iter<'a> {
+        self.iter()
+    }
 }
 
 /// Ascending iterator over node indices.
 pub struct Iter<'a> {
-    tree: &'a Eb32Tree,
+    inner: &'a Eb32Tree,
     cur: Option<u32>,
 }
 
@@ -454,7 +795,7 @@ impl Iterator for Iter<'_> {
 
     fn next(&mut self) -> Option<u32> {
         let cur = self.cur?;
-        self.cur = self.tree.next(cur);
+        self.cur = self.inner.next(cur);
         Some(cur)
     }
 }
