@@ -36,6 +36,10 @@ pub struct H1Parser {
     pub is_chunked: bool,
     pub is_upgrade: bool,
     pub connection_close: bool,
+    /// Set when the message carried both `Content-Length` and `Transfer-Encoding`.
+    /// The Content-Length was dropped per RFC 7230 §3.3.3 and the connection must not
+    /// be reused.
+    pub framing_conflict: bool,
     pub saw_bare_cr: bool,
 }
 
@@ -49,6 +53,7 @@ impl H1Parser {
             is_chunked: false,
             is_upgrade: false,
             connection_close: false,
+            framing_conflict: false,
             saw_bare_cr: false,
         }
     }
@@ -279,6 +284,28 @@ impl H1Parser {
             if te.to_ascii_lowercase().contains("chunked") {
                 self.is_chunked = true;
             }
+        }
+
+        // RFC 7230 §3.3.3 rule 3: when a message carries both Transfer-Encoding and
+        // Content-Length, the Transfer-Encoding wins and the Content-Length **must be
+        // removed before forwarding**. Leaving both in place is the canonical CL.TE
+        // request-smuggling desync: we frame the message by chunked encoding while a
+        // backend honouring Content-Length frames it differently, so bytes we treat as
+        // the start of the *next* request are read by the backend as body -- or worse,
+        // bytes we forward as body are read by the backend as a new request.
+        //
+        // Verified against HAProxy 3.5 on
+        //   POST /smuggle ... Content-Length: 6, Transfer-Encoding: chunked, "0\r\n\r\nX"
+        // HAProxy strips Content-Length, forwards only chunked framing, drops the
+        // trailing X, and marks the connection non-reusable. We now do the same.
+        if self.is_chunked && self.content_length.is_some() {
+            self.content_length = None;
+            htx.remove_header("content-length");
+            self.framing_conflict = true;
+            // The connection cannot be safely reused: any trailing bytes are of
+            // ambiguous ownership, so a later request on this connection could be
+            // prefixed by them.
+            self.connection_close = true;
         }
 
         let is_http10 = htx

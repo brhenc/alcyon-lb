@@ -1300,6 +1300,20 @@ impl Htx {
             .map(|h| h.value.as_str())
     }
 
+    /// Removes every header matching `name` (case-insensitive). Returns how many were
+    /// removed.
+    ///
+    /// Needed for RFC 7230 §3.3.3: a message carrying both `Transfer-Encoding` and
+    /// `Content-Length` must have the `Content-Length` **removed before forwarding**,
+    /// or the next hop may frame the message differently than we did.
+    pub fn remove_header(&mut self, name: &str) -> usize {
+        let before = self.blocks.len();
+        self.blocks.retain(|b| {
+            !matches!(b, HtxBlock::Header(h) if h.name.eq_ignore_ascii_case(name))
+        });
+        before - self.blocks.len()
+    }
+
     /// Sets or updates a header (case-insensitive replacement).
     pub fn set_header(&mut self, name: &str, value: &str) {
         let mut found = false;
