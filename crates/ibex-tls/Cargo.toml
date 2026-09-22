@@ -13,6 +13,8 @@ ebtree = { path = "../ebtree" }
 rustls = { workspace = true }
 tracing = { workspace = true }
 rustix = { version = "0.38", features = ["event", "net", "std"] }
+rustls-pemfile = "2.2.0"
+ibex-config = { path = "../ibex-config" }
 
 [dev-dependencies]
 # Test-only: the e2e harness drives a reference TLS endpoint. Nothing in src/ uses
@@ -20,7 +22,6 @@ rustix = { version = "0.38", features = ["event", "net", "std"] }
 tokio-rustls = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 rcgen = "0.13"
-ibex-config = { path = "../ibex-config" }
 tempfile = "3"
 
 [lints.rust]
