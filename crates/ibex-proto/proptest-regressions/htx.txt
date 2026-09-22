@@ -1,8 +1,0 @@
-# Seeds for failure cases proptest has generated in the past. It is
-# automatically read and these particular cases re-run before any
-# novel cases are generated.
-#
-# It is recommended to check this file in to source control so that
-# everyone who runs the test benefits from these saved cases.
-cc 1b7dfc3815b3f2ad1966a5886330c93ae74cc6afd81af19c1b2ef93ae2d59590 # shrinks to ops = [PushHeader("", ""), PushEom, ReplaceValue(1, " ")]
-cc c2e4632fb0205d8d09348788c3ecc72e9b4fe6d93ee3fea423f3d63b8e1c23be # shrinks to ops = [PushHeader("", ""), PushHeader("", ""), PushHeader("", ""), PushHeader("", ""), PushHeader("", ""), PushData([]), PushHeader("", ""), PushHeader("", ""), PushHeader("", ""), ReplaceValue(0, "0 "), Defrag]

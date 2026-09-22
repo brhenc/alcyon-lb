@@ -103,7 +103,10 @@ pub use hpack::{
     decode_integer, encode_integer, DynamicTable, HpackDecoder, HpackEncoder, TableEntry,
     DEFAULT_DYNAMIC_TABLE_MAX_SIZE, STATIC_TABLE, STATIC_TABLE_LEN,
 };
-pub use htx::{HeaderField, HttpMethod, HttpVersion, Htx, HtxBlock, RequestLine, ResponseLine};
+pub use htx::{
+    HeaderField, HttpMethod, HttpVersion, Htx, HtxBlock, HtxBlockDesc, HtxBlockType, HtxBuffer,
+    HtxError, RequestLine, ResponseLine,
+};
 pub use mux::{Mux, MuxFlags, MuxOps, ShutMode};
 pub use mux_h1::{H1MuxContext, MuxH1};
 pub use mux_h2::{H2MuxContext, H2StreamCtx, MuxH2};
