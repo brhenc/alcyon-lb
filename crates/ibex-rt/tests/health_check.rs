@@ -3,7 +3,7 @@
 use ibex_config::{Config, ListenSection, Mode, Server};
 use ibex_rt::{Engine, ServerStatus};
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -128,4 +128,144 @@ fn health_check_detects_down_server_and_routes_to_live_server() {
     live_running.store(false, Ordering::Relaxed);
     let _ = TcpStream::connect(live_addr); // wake accept loop
     let _ = server_thread.join();
+}
+
+/// A server going down must reach a syslog collector.
+///
+/// `check::step_check` called `on_success`/`on_failure` and dropped the `CheckEvent` they
+/// return, so nothing downstream ever learned a server had changed state and no datagram
+/// was sent. `SyslogTarget` and `LogFormat` were both complete and unit-tested at the
+/// time; neither was reachable from the engine. This drives the real path end to end --
+/// config, check, event, target, socket -- because that is the only part that was missing.
+#[test]
+fn a_server_going_down_emits_a_syslog_datagram() {
+    use ibex_config::{GlobalSection, LogConfig, LogFacility};
+    use std::net::UdpSocket;
+
+    // A collector on a random port, and a backend address nothing is listening on.
+    let collector = UdpSocket::bind("127.0.0.1:0").expect("bind collector");
+    // Short, so the poll loop below keeps driving the engine between reads. A timeout as
+    // long as the overall budget would block the first recv for the whole test and give
+    // the engine exactly one pass to work with.
+    collector
+        .set_read_timeout(Some(Duration::from_millis(20)))
+        .expect("read timeout");
+    let collector_addr = collector.local_addr().expect("collector addr");
+
+    let dead_listener = TcpListener::bind("127.0.0.1:0").expect("bind for a free port");
+    let dead_addr = dead_listener.local_addr().expect("local_addr");
+    drop(dead_listener);
+
+    let config = Config {
+        global: Some(GlobalSection {
+            logs: vec![LogConfig {
+                addr: collector_addr,
+                facility: LogFacility::Local0,
+                level: None,
+            }],
+            ..Default::default()
+        }),
+        listens: vec![ListenSection {
+            name: "be_log".into(),
+            addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            mode: Mode::Tcp,
+            // `log global` is the form every real config uses. It was rejected outright
+            // before this change: "expects <address> and <facility> as arguments".
+            log_global: true,
+            servers: vec![Server {
+                check: true,
+                ..Server::new("dead_srv", dead_addr)
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let mut engine = Engine::new(&config, 1024).expect("Engine::new");
+    for check in &mut engine.checks {
+        check.config.inter = Duration::from_millis(20);
+        check.config.timeout = Duration::from_millis(50);
+        check.config.fall = 1;
+        check.config.rise = 1;
+    }
+
+    let start = std::time::Instant::now();
+    let mut buf = [0u8; 1024];
+    let mut got: Option<String> = None;
+    while start.elapsed() < Duration::from_millis(1500) && got.is_none() {
+        let _ = engine.run_once().expect("engine run_once");
+        if let Ok(n) = collector.recv(&mut buf) {
+            got = Some(String::from_utf8_lossy(&buf[..n]).into_owned());
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+
+    let line = got.expect("no syslog datagram arrived for the server going DOWN");
+
+    // PRI = facility 16 (local0) * 8 + severity 5 (notice) = 133. HAProxy logs check
+    // transitions at LOG_NOTICE (src/check.c).
+    assert!(
+        line.starts_with("<133>"),
+        "wrong facility/severity in {line:?}"
+    );
+    assert!(
+        line.contains("Health check for server be_log/dead_srv failed"),
+        "unexpected message body: {line:?}"
+    );
+    // health has hit its floor, so the numerator is 0 and the denominator is `rise`.
+    assert!(
+        line.contains("status: 0/1 DOWN."),
+        "missing or malformed status field: {line:?}"
+    );
+}
+
+/// Without a `log` directive nothing is sent, however many checks run.
+///
+/// The gate matters: a proxy with no target must not be paying to format a message, and
+/// an operator who configured no logging must not receive any.
+#[test]
+fn no_log_directive_means_no_datagrams() {
+    use std::net::UdpSocket;
+
+    let collector = UdpSocket::bind("127.0.0.1:0").expect("bind collector");
+    collector
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .expect("read timeout");
+
+    let dead_listener = TcpListener::bind("127.0.0.1:0").expect("bind for a free port");
+    let dead_addr = dead_listener.local_addr().expect("local_addr");
+    drop(dead_listener);
+
+    let config = Config {
+        listens: vec![ListenSection {
+            name: "be_quiet".into(),
+            addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            mode: Mode::Tcp,
+            servers: vec![Server {
+                check: true,
+                ..Server::new("dead_srv", dead_addr)
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let mut engine = Engine::new(&config, 1024).expect("Engine::new");
+    for check in &mut engine.checks {
+        check.config.inter = Duration::from_millis(20);
+        check.config.timeout = Duration::from_millis(50);
+        check.config.fall = 1;
+    }
+
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_millis(300) {
+        let _ = engine.run_once().expect("engine run_once");
+        thread::sleep(Duration::from_millis(5));
+    }
+
+    let mut buf = [0u8; 1024];
+    assert!(
+        collector.recv(&mut buf).is_err(),
+        "a proxy with no log directive sent a datagram"
+    );
 }

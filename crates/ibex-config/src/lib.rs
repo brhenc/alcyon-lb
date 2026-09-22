@@ -19,7 +19,8 @@ use std::fs;
 use std::path::Path;
 
 pub use ast::{
-    AclCondition, AclRule, AclTerm, BackendSection, BalanceAlgorithm, Config, FrontendSection,
+    AclCondition, AclRule, AclTerm, BackendSection, BalanceAlgorithm, Config, DefaultsSection,
+    FrontendSection, GlobalSection,
     HeaderExp, HttpAfterResAction, HttpAfterResRule, HttpReqAction, HttpReqRule, HttpResAction,
     HttpResRule, ListenSection, LogConfig, LogFacility, LogLevel, Mode, Server, StatsConfig,
     StickRule, StickRuleType, StickTableConfigAst, TcpReqConnAction, TcpReqConnRule,

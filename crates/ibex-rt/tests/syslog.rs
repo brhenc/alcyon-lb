@@ -125,31 +125,74 @@ fn state(rise: u32, fall: u32) -> ServerCheckState {
     )
 }
 
+/// A healthy server passing another check reports nothing.
+///
+/// `HAProxy` calls this `report` and it is false once the health counter saturates
+/// (`src/check.c`). Without it a dead or healthy server produces a log line on every
+/// check: at a 100ms interval that is ten datagrams a second, per server, forever.
 #[test]
-fn a_successful_check_reports_success_not_a_transition() {
+fn a_check_that_changes_nothing_is_not_reported() {
+    // rise 1, fall 1 -> full health is 1, and a server starts at `rise`, so it is
+    // already saturated.
     let mut s = state(1, 1);
-    assert_eq!(s.on_success(3), CheckEvent::Succeeded);
-    assert!(!CheckEvent::Succeeded.is_transition());
+    assert_eq!(s.on_success(3), None, "an already-healthy server has nothing to report");
+    assert_eq!(s.on_success(3), None);
+
+    // Likewise at the floor: down and staying down.
+    assert_eq!(
+        s.on_failure("L4CON", "Connection refused", 1),
+        Some(CheckEvent::WentDown)
+    );
+    assert_eq!(s.on_failure("L4CON", "Connection refused", 1), None);
+    assert_eq!(s.on_failure("L4CON", "Connection refused", 1), None);
 }
 
+/// A freshly configured server goes DOWN on its first failure, whatever `fall` says.
+///
+/// Health starts at `rise`, not at full health (`src/server.c`), so the first decrement
+/// puts it below the rise threshold and clamps to zero. `fall` only buys the documented
+/// number of failures once a server has actually reached full health.
 #[test]
-fn crossing_the_fall_threshold_reports_a_transition() {
-    // A status change is news whether or not per-check logging is on, which is why the
-    // caller needs to tell the two apart.
-    let mut s = state(1, 2);
-    assert_eq!(s.on_failure("L4CON", "Connection refused", 1), CheckEvent::Failed);
-    assert_eq!(s.on_failure("L4CON", "Connection refused", 1), CheckEvent::WentDown);
+fn a_new_server_falls_on_the_first_failure_then_fall_applies() {
+    let mut s = state(1, 3);
+    assert_eq!(
+        s.on_failure("L4CON", "Connection refused", 1),
+        Some(CheckEvent::WentDown)
+    );
+    assert_eq!(s.status, ServerStatus::Down);
     assert!(CheckEvent::WentDown.is_transition());
+
+    // Recover to full health: rise 1 means one success is enough.
+    assert_eq!(s.on_success(1), Some(CheckEvent::WentUp));
+    assert_eq!(s.status, ServerStatus::Up);
+
+    // Now `fall` failures are needed, and only the last one is the transition.
+    assert_eq!(
+        s.on_failure("L4CON", "Connection refused", 1),
+        Some(CheckEvent::Failed)
+    );
+    assert_eq!(
+        s.on_failure("L4CON", "Connection refused", 1),
+        Some(CheckEvent::Failed)
+    );
+    assert_eq!(
+        s.on_failure("L4CON", "Connection refused", 1),
+        Some(CheckEvent::WentDown)
+    );
     assert_eq!(s.status, ServerStatus::Down);
 }
 
 #[test]
-fn recovering_reports_went_up() {
+fn recovering_reports_went_up_only_at_the_rise_threshold() {
     let mut s = state(2, 1);
     s.on_failure("L4CON", "Connection refused", 1);
     assert_eq!(s.status, ServerStatus::Down);
-    assert_eq!(s.on_success(2), CheckEvent::Succeeded, "below the rise threshold");
-    assert_eq!(s.on_success(2), CheckEvent::WentUp);
+    assert_eq!(
+        s.on_success(2),
+        Some(CheckEvent::Succeeded),
+        "below the rise threshold"
+    );
+    assert_eq!(s.on_success(2), Some(CheckEvent::WentUp));
     assert!(CheckEvent::WentUp.is_transition());
 }
 
@@ -157,23 +200,62 @@ fn recovering_reports_went_up() {
 fn the_log_line_matches_the_shape_reg_tests_assert_on() {
     // reg-tests/checks/*.vtc match this with regexes, so the wording and field order
     // are part of the contract, not cosmetic.
-    let mut s = state(1, 1);
-    let ev = s.on_success(0);
+    let mut s = state(2, 1);
+    s.on_failure("L4CON", "Connection refused", 1);
+    // rise 2: the first success climbs but stays DOWN, the second crosses the threshold.
+    s.on_success(0).expect("first success reports");
+    let ev = s.on_success(0).expect("recovery reports");
     let line = s.log_line("be1", "srv1", ev);
 
-    assert!(line.starts_with("Health check for server be1/srv1 succeeded"), "{line}");
+    assert!(
+        line.starts_with("Health check for server be1/srv1 succeeded"),
+        "{line}"
+    );
     assert!(line.contains("reason: Layer4 check passed"), "{line}");
     assert!(line.contains("check duration: 0ms"), "{line}");
-    assert!(line.contains("status: 1/1 UP"), "{line}");
+    assert!(line.contains("status: 1/1 UP."), "{line}");
 }
 
 #[test]
 fn a_failed_check_line_says_failed_and_reports_down() {
     let mut s = state(1, 1);
-    let ev = s.on_failure("L4CON", "Connection refused", 7);
+    let ev = s
+        .on_failure("L4CON", "Connection refused", 7)
+        .expect("the first failure reports");
     let line = s.log_line("be1", "srv2", ev);
     assert!(line.contains("srv2 failed"), "{line}");
     assert!(line.contains("reason: Connection refused"), "{line}");
     assert!(line.contains("check duration: 7ms"), "{line}");
-    assert!(line.contains("DOWN"), "{line}");
+    assert!(line.contains("DOWN."), "{line}");
+}
+
+/// The status field can never exceed its own denominator.
+///
+/// With two free-running counters it did: a server that had been down for four checks
+/// logged "status: 4/1 DOWN", which is not a state any threshold describes.
+#[test]
+fn the_status_field_stays_within_its_threshold() {
+    /// Pulls `<count>/<threshold>` out of the rendered line.
+    fn counts(line: &str) -> (u32, u32) {
+        let tail = line.rsplit("status: ").next().expect("a status field");
+        let frac = tail.split(' ').next().expect("count/threshold");
+        let (a, b) = frac.split_once('/').expect("a fraction");
+        (a.parse().expect("count"), b.parse().expect("threshold"))
+    }
+
+    let mut s = state(2, 3);
+    for i in 0..40 {
+        // Alternate long runs of each so the counter hits both stops.
+        let event = if i % 20 < 10 {
+            s.on_failure("L4CON", "Connection refused", 0)
+        } else {
+            s.on_success(0)
+        };
+        let line = s.log_line("be", "srv", event.unwrap_or(CheckEvent::Succeeded));
+        let (count, threshold) = counts(&line);
+        assert!(
+            count <= threshold,
+            "status count ran past its own threshold: {line}"
+        );
+    }
 }

@@ -485,6 +485,8 @@ mod tests {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
         let proxy = Proxy {
             id: 0,
+            log_target_idx: Vec::new(),
+            log_health_checks: false,
             name: "test_proxy".into(),
             addr,
             mode: Mode::Tcp,

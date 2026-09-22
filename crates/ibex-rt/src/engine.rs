@@ -19,6 +19,8 @@ use crate::check::{self, ServerCheckConfig, ServerCheckState, ServerStatus};
 use crate::fdtab::{FdState, FdTab, Interest};
 use crate::listener::Listener;
 use crate::poller::Poller;
+use crate::syslog::SyslogTarget;
+use ibex_config::LogLevel;
 use crate::proxy::{TcpSession, Timeouts};
 use crate::raw;
 use ibex_config::{regex, BalanceAlgorithm, Config, Mode, StickRule, UseBackendRule};
@@ -88,6 +90,10 @@ impl ProxyStats {
 
 /// A configured proxy instance.
 #[derive(Debug, Clone)]
+// More than three bools, and they are genuinely independent switches rather than a state
+// machine: PROXY protocol on accept, v2 on accept, and the two logging options. Grouping
+// them into an enum would model a relationship that does not exist.
+#[allow(clippy::struct_excessive_bools)]
 pub struct Proxy {
     pub id: u32,
     pub name: String,
@@ -126,6 +132,13 @@ pub struct Proxy {
     pub http_req_rules: Vec<ibex_config::HttpReqRule>,
     pub http_res_rules: Vec<ibex_config::HttpResRule>,
     pub http_after_res_rules: Vec<ibex_config::HttpAfterResRule>,
+    /// Indices into [`Engine::log_targets`]. Held as indices rather than targets because
+    /// `Proxy` is `Clone` and a `SyslogTarget` owns a socket; the sockets live once, on
+    /// the engine, and every proxy points at the ones its section resolved to.
+    pub log_target_idx: Vec<usize>,
+    /// `option log-health-checks`: log every check whose health counter moved, not only
+    /// the UP/DOWN transitions.
+    pub log_health_checks: bool,
 }
 
 impl Proxy {
@@ -354,6 +367,13 @@ pub struct Engine {
     pub is_running: bool,
     events: Vec<crate::poller::Event>,
     timer_updates: Vec<(TaskRef, Tick)>,
+    /// Every syslog target the config declared, global and per-proxy. Proxies reference
+    /// these by index through `Proxy::log_target_idx`.
+    log_targets: Vec<SyslogTarget>,
+    /// Value for the syslog TAG field. `HAProxy` uses the program name.
+    log_tag: String,
+    /// Value for the syslog HOSTNAME field.
+    log_hostname: String,
 }
 
 impl Drop for Engine {
@@ -419,6 +439,107 @@ fn init_stick_table(ast: &ibex_config::StickTableConfigAst, name: &str) -> Stick
     StickTable::new(config)
 }
 
+
+/// The local hostname for the syslog HOSTNAME field.
+///
+/// Read once at startup. RFC 3164 wants a hostname with no domain part and no spaces;
+/// anything unreadable becomes "-", which is what a collector expects for "unknown"
+/// rather than an empty field that would shift every following token.
+fn hostname() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .map(|h| h.trim().to_string())
+        .filter(|h| !h.is_empty() && !h.contains(' '))
+        .map_or_else(|| "-".to_string(), |h| {
+            h.split('.').next().unwrap_or("-").to_string()
+        })
+}
+
+/// Builds the syslog targets and points every proxy at the ones its section resolved to.
+///
+/// `HAProxy` resolves logging per proxy: a section's own `log <addr>` lines apply, `log
+/// global` adds whatever the `global` section declared, and a section that says nothing
+/// inherits `defaults`. Resolution has to happen after every section is parsed, because
+/// `log global` names a section that may be read later, which is why the proxy
+/// constructors leave `log_target_idx` empty.
+///
+/// Targets are deduplicated by address and facility so two sections pointing at the same
+/// collector share one socket rather than opening one each -- at 60k backends that
+/// distinction is the difference between one fd and thousands.
+fn resolve_log_targets(config: &Config, proxies: &mut [Proxy]) -> Vec<SyslogTarget> {
+    let mut targets: Vec<SyslogTarget> = Vec::new();
+    let intern = |cfg: &ibex_config::LogConfig, targets: &mut Vec<SyslogTarget>| -> usize {
+        if let Some(i) = targets
+            .iter()
+            .position(|t| t.addr() == cfg.addr && t.facility() == cfg.facility)
+        {
+            return i;
+        }
+        targets.push(SyslogTarget::new(cfg));
+        targets.len() - 1
+    };
+
+    let global: Vec<usize> = config
+        .global
+        .iter()
+        .flat_map(|g| g.logs.iter())
+        .map(|c| intern(c, &mut targets))
+        .collect();
+    let defaults: Vec<usize> = config
+        .defaults
+        .iter()
+        .flat_map(|d| d.logs.iter())
+        .map(|c| intern(c, &mut targets))
+        .collect();
+    let defaults_log_global = config.defaults.as_ref().is_some_and(|d| d.log_global);
+    let defaults_log_health = config
+        .defaults
+        .as_ref()
+        .is_some_and(|d| d.log_health_checks);
+
+    // A section's own directives, in config order.
+    let mut own: Vec<(String, Vec<usize>, bool)> = Vec::new();
+    for l in &config.listens {
+        let idx = l.logs.iter().map(|c| intern(c, &mut targets)).collect();
+        own.push((l.name.clone(), idx, l.log_global));
+    }
+    for f in &config.frontends {
+        let idx = f.logs.iter().map(|c| intern(c, &mut targets)).collect();
+        own.push((f.name.clone(), idx, f.log_global));
+    }
+    for b in &config.backends {
+        let idx = b.logs.iter().map(|c| intern(c, &mut targets)).collect();
+        own.push((b.name.clone(), idx, b.log_global));
+    }
+
+    for proxy in proxies.iter_mut() {
+        let Some((_, idx, log_global)) = own.iter().find(|(n, _, _)| *n == proxy.name) else {
+            continue;
+        };
+        let mut resolved = idx.clone();
+        if *log_global {
+            resolved.extend_from_slice(&global);
+        }
+        // `defaults` applies only where the section declared nothing of its own, which
+        // is how every other defaults-inherited setting behaves.
+        if resolved.is_empty() && defaults_log_global {
+            resolved.extend_from_slice(&global);
+        }
+        if resolved.is_empty() {
+            resolved.extend_from_slice(&defaults);
+        }
+        resolved.sort_unstable();
+        resolved.dedup();
+        proxy.log_target_idx = resolved;
+
+        if defaults_log_health {
+            proxy.log_health_checks = true;
+        }
+    }
+
+    targets
+}
+
 fn init_proxy_from_listen(proxy_idx: usize, listen: &ibex_config::ListenSection) -> Proxy {
     let timeouts = Timeouts {
         #[allow(clippy::cast_possible_truncation)]
@@ -474,6 +595,8 @@ fn init_proxy_from_listen(proxy_idx: usize, listen: &ibex_config::ListenSection)
         #[allow(clippy::cast_possible_truncation)]
         id: proxy_idx as u32,
         name: listen.name.clone(),
+        log_target_idx: Vec::new(),
+        log_health_checks: listen.log_health_checks,
         addr: listen.addr,
         mode: listen.mode,
         balance: listen.balance,
@@ -551,6 +674,8 @@ fn init_proxy_from_frontend(proxy_idx: usize, fe: &ibex_config::FrontendSection)
         #[allow(clippy::cast_possible_truncation)]
         id: proxy_idx as u32,
         name: fe.name.clone(),
+        log_target_idx: Vec::new(),
+        log_health_checks: fe.log_health_checks,
         addr: fe.bind.unwrap_or(SocketAddr::new(
             IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
             0,
@@ -653,6 +778,8 @@ fn init_proxy_from_backend(proxy_idx: usize, be: &ibex_config::BackendSection) -
         #[allow(clippy::cast_possible_truncation)]
         id: proxy_idx as u32,
         name: be.name.clone(),
+        log_target_idx: Vec::new(),
+        log_health_checks: be.log_health_checks,
         addr: SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0),
         mode: be.mode,
         balance: be.balance,
@@ -817,6 +944,8 @@ impl Engine {
             proxies.push(proxy);
         }
 
+        let log_targets = resolve_log_targets(config, &mut proxies);
+
         let start_time = Instant::now();
         let now = Tick(1);
         let checks = init_checks(&proxies, &mut scheduler, now);
@@ -837,6 +966,9 @@ impl Engine {
             is_running: true,
             events: Vec::with_capacity(capacity * 2),
             timer_updates: Vec::with_capacity(capacity * 2),
+            log_targets,
+            log_tag: "haproxy".to_string(),
+            log_hostname: hostname(),
         })
     }
 
@@ -980,6 +1112,9 @@ impl Engine {
             now,
             timer_updates,
             wake_queue: Vec::new(),
+            log_targets: &self.log_targets,
+            log_tag: &self.log_tag,
+            log_hostname: &self.log_hostname,
         };
 
         let tasks_run = self.scheduler.process_runnable_tasks(&mut dispatcher);
@@ -1738,6 +1873,10 @@ struct EngineDispatcher<'a> {
     now: Tick,
     timer_updates: Vec<(TaskRef, Tick)>,
     wake_queue: Vec<TaskRef>,
+    /// Shared read-only: the sockets live on the `Engine`, proxies index into this.
+    log_targets: &'a [SyslogTarget],
+    log_tag: &'a str,
+    log_hostname: &'a str,
 }
 
 fn retry_server_connect(
@@ -3773,7 +3912,7 @@ impl EngineDispatcher<'_> {
         if check_idx < self.checks.len() {
             let check = &mut self.checks[check_idx];
             let now = self.now;
-            let _ = check::step_check(check, self.fdtab, self.poller, now);
+            let step = check::step_check(check, self.fdtab, self.poller, now);
 
             let proxy_idx = check.proxy_idx;
             let server_idx = check.server_idx;
@@ -3784,10 +3923,50 @@ impl EngineDispatcher<'_> {
                 self.proxies[proxy_idx].server_statuses[server_idx] = check.status;
             }
 
-            self.timer_updates.push((check.task, check.next_check));
+            // The message is built while `check` is still borrowed, then the borrow ends
+            // so the targets (which live behind `&self`) can be read to send it.
+            let pending = (check.task, check.next_check);
+            let log = step.ok().and_then(|s| s.event).and_then(|event| {
+                let proxy = self.proxies.get(proxy_idx)?;
+                // HAProxy logs an UP/DOWN transition always, and every other check result
+                // only under `option log-health-checks` (src/check.c, PR_O2_LOGHCHKS).
+                // Without that gate a one-second check interval fills a collector with a
+                // line per server per second.
+                if !event.is_transition() && !proxy.log_health_checks {
+                    return None;
+                }
+                let server = proxy
+                    .server_ids
+                    .get(server_idx)
+                    .map_or("?", String::as_str);
+                Some(check.log_line(&proxy.name, server, event))
+            });
+
+            if let Some(msg) = log {
+                self.send_log(proxy_idx, LogLevel::Notice, &msg);
+            }
+
+            self.timer_updates.push(pending);
             Outcome::Keep
         } else {
             Outcome::Done
+        }
+    }
+
+    /// Emits one line to every syslog target the given proxy resolved to.
+    ///
+    /// Silent when the proxy has no targets, which is the common case: `HAProxy` logs
+    /// nothing unless a `log` directive says where to.
+    fn send_log(&self, proxy_idx: usize, level: LogLevel, msg: &str) {
+        let Some(proxy) = self.proxies.get(proxy_idx) else {
+            return;
+        };
+        for &i in &proxy.log_target_idx {
+            if let Some(target) = self.log_targets.get(i) {
+                // Discarded deliberately: syslog over UDP is fire-and-forget, and a
+                // collector that is down must not slow or fail the data path.
+                let _ = target.send(level, self.log_tag, self.log_hostname, msg);
+            }
         }
     }
 

@@ -77,8 +77,21 @@ pub struct ServerCheckState {
     pub config: ServerCheckConfig,
     pub status: ServerStatus,
     pub enabled: bool,
+    /// Consecutive successes and failures, kept for the stats page's "pass N"/"fails N".
     pub rise_count: u32,
     pub fall_count: u32,
+    /// `HAProxy`'s single health counter, in `0 ..= rise + fall - 1` (`src/check.c`).
+    ///
+    /// A failure decrements it and a success increments it, and it saturates at both
+    /// ends: at `0` the server is DOWN, at `rise + fall - 1` it is fully UP. Saturation
+    /// is what stops a permanently dead server from reporting a result on every check --
+    /// with two separate counters that only ever climbed, a 100ms interval logged ten
+    /// lines a second per server, forever.
+    ///
+    /// `health >= rise` means UP. It starts at `rise` (`src/server.c:937`), so a server
+    /// that has only just been configured goes DOWN on its first failed check, while one
+    /// that has reached full health takes `fall` of them.
+    pub health: u32,
     pub in_progress: bool,
     pub sock: Option<OwnedFd>,
     pub check_fd: Option<RawFd>,
@@ -130,6 +143,7 @@ impl ServerCheckState {
         config: ServerCheckConfig,
         now: Tick,
     ) -> Self {
+        let config_rise = config.rise;
         ServerCheckState {
             proxy_idx,
             server_idx,
@@ -139,6 +153,7 @@ impl ServerCheckState {
             enabled: true,
             rise_count: 0,
             fall_count: 0,
+            health: config_rise,
             in_progress: false,
             sock: None,
             check_fd: None,
@@ -155,8 +170,17 @@ impl ServerCheckState {
         }
     }
 
+    /// The ceiling of the health counter: fully healthy.
+    const fn full_health(&self) -> u32 {
+        self.config.rise + self.config.fall - 1
+    }
+
     /// Handles a health check success.
-    pub fn on_success(&mut self, duration_ms: u32) -> CheckEvent {
+    ///
+    /// Returns `None` when the result changed nothing -- an already-healthy server
+    /// passing another check. `HAProxy` calls this `report`, and uses it to decide
+    /// whether the check is worth logging at all.
+    pub fn on_success(&mut self, duration_ms: u32) -> Option<CheckEvent> {
         self.total_checks += 1;
         self.fall_count = 0;
         self.rise_count += 1;
@@ -164,11 +188,18 @@ impl ServerCheckState {
         self.last_status_code = "L4OK";
         self.check_duration_ms = duration_ms;
 
-        if self.status == ServerStatus::Down && self.rise_count >= self.config.rise {
-            self.status = ServerStatus::Up;
-            return CheckEvent::WentUp;
+        if self.health >= self.full_health() {
+            return None;
         }
-        CheckEvent::Succeeded
+        self.health += 1;
+        if self.health >= self.config.rise {
+            self.health = self.full_health();
+            if self.status == ServerStatus::Down {
+                self.status = ServerStatus::Up;
+                return Some(CheckEvent::WentUp);
+            }
+        }
+        Some(CheckEvent::Succeeded)
     }
 
     /// Handles a health check failure.
@@ -177,7 +208,7 @@ impl ServerCheckState {
         code: &'static str,
         desc: &'static str,
         duration_ms: u32,
-    ) -> CheckEvent {
+    ) -> Option<CheckEvent> {
         self.total_checks += 1;
         self.failed_checks += 1;
         self.rise_count = 0;
@@ -186,12 +217,21 @@ impl ServerCheckState {
         self.last_status_desc = desc;
         self.check_duration_ms = duration_ms;
 
-        if self.status == ServerStatus::Up && self.fall_count >= self.config.fall {
-            self.status = ServerStatus::Down;
-            self.down_transitions += 1;
-            return CheckEvent::WentDown;
+        // Already at the floor: the server is down and staying down, and repeating that
+        // on every check is what floods a collector.
+        if self.health == 0 {
+            return None;
         }
-        CheckEvent::Failed
+        self.health -= 1;
+        if self.health < self.config.rise {
+            self.health = 0;
+            if self.status == ServerStatus::Up {
+                self.status = ServerStatus::Down;
+                self.down_transitions += 1;
+                return Some(CheckEvent::WentDown);
+            }
+        }
+        Some(CheckEvent::Failed)
     }
 
     /// Formats the check result as `HAProxy` does.
@@ -201,7 +241,7 @@ impl ServerCheckState {
     ///
     /// ```text
     /// Health check for server be1/srv1 succeeded, reason: Layer4 check passed,
-    /// check duration: 0ms, status: 1/1 UP
+    /// check duration: 0ms, status: 1/1 UP.
     /// ```
     ///
     /// The `status:` field is `<successful checks>/<threshold> <state>`, which is how
@@ -212,14 +252,21 @@ impl ServerCheckState {
             CheckEvent::Succeeded | CheckEvent::WentUp => "succeeded",
             CheckEvent::Failed | CheckEvent::WentDown => "failed",
         };
-        let (count, threshold) = if self.status == ServerStatus::Up {
-            (self.rise_count.max(1), self.config.rise)
+        // src/check.c: the numerator counts up from the rise threshold while healthy,
+        // and is the raw health while not. Both are bounded by the counter, so neither
+        // can run away past its own denominator the way two free counters did.
+        let (count, threshold) = if self.health >= self.config.rise {
+            (self.health - self.config.rise + 1, self.config.fall)
         } else {
-            (self.fall_count.max(1), self.config.fall)
+            (self.health, self.config.rise)
         };
         format!(
+            // The trailing period is HAProxy's: src/check.c sends this through
+            // `send_log(s->proxy, LOG_NOTICE, "%s.\n", trash.area)`. Operators grep
+            // these lines and reg-tests match them, so the punctuation is part of the
+            // interface, not decoration.
             "Health check for server {backend}/{server} {verb}, reason: {}, \
-             check duration: {}ms, status: {}/{} {}",
+             check duration: {}ms, status: {}/{} {}.",
             self.last_status_desc,
             self.check_duration_ms,
             count,
@@ -237,6 +284,24 @@ impl ServerCheckState {
     }
 }
 
+/// The outcome of one step: when to run next, and what happened if anything did.
+///
+/// The event used to be discarded here -- `on_success`/`on_failure` return a
+/// [`CheckEvent`] and the call sites below dropped it -- so nothing downstream could
+/// know a server had gone down, and no check was ever logged.
+pub struct CheckStep {
+    /// When this check should next run, if it should.
+    pub next: Option<Tick>,
+    /// Set when this step produced a result. `None` while a check is still in flight.
+    pub event: Option<CheckEvent>,
+}
+
+impl CheckStep {
+    const fn pending(next: Option<Tick>) -> Self {
+        Self { next, event: None }
+    }
+}
+
 /// Executes or progresses a health check.
 ///
 /// # Errors
@@ -247,14 +312,14 @@ pub fn step_check(
     fdtab: &mut FdTab,
     poller: &mut Poller,
     now: Tick,
-) -> io::Result<Option<Tick>> {
+) -> io::Result<CheckStep> {
     if !check.enabled {
         if check.in_progress {
             cleanup_check_socket(check, fdtab, poller);
         }
         let next = check.schedule_next(now);
         check.next_check = next;
-        return Ok(Some(next));
+        return Ok(CheckStep::pending(Some(next)));
     }
 
     if check.in_progress {
@@ -264,22 +329,25 @@ pub fn step_check(
 
         if timed_out {
             cleanup_check_socket(check, fdtab, poller);
-            check.on_failure("L4TOUT", "Connection timed out", duration);
+            let event = check.on_failure("L4TOUT", "Connection timed out", duration);
             let next = check.schedule_next(now);
             check.next_check = next;
-            return Ok(Some(next));
+            return Ok(CheckStep {
+                next: Some(next),
+                event,
+            });
         }
 
         let Some(raw_fd) = check.check_fd else {
             cleanup_check_socket(check, fdtab, poller);
             let next = check.schedule_next(now);
-            return Ok(Some(next));
+            return Ok(CheckStep::pending(Some(next)));
         };
 
         let ready = fdtab.ready(raw_fd);
         if !ready.writable && !ready.readable {
             // Still waiting for connect completion
-            return Ok(Some(check.exp));
+            return Ok(CheckStep::pending(Some(check.exp)));
         }
 
         fdtab.clear_ready(raw_fd, true, true);
@@ -291,27 +359,31 @@ pub fn step_check(
 
         cleanup_check_socket(check, fdtab, poller);
 
-        match connect_res {
-            Ok(None) => {
-                check.on_success(duration);
-            }
+        let event = match connect_res {
+            Ok(None) => check.on_success(duration),
             Ok(Some(_)) | Err(_) => {
-                check.on_failure("L4CON", "Connection refused / error", duration);
+                check.on_failure("L4CON", "Connection refused / error", duration)
             }
-        }
+        };
 
         let next = check.schedule_next(now);
         check.next_check = next;
-        Ok(Some(next))
+        Ok(CheckStep {
+            next: Some(next),
+            event,
+        })
     } else {
         // Start new check
         check.check_start_tick = now;
         if let Ok((sock, immediate)) = raw::connect(check.addr) {
             if immediate {
-                check.on_success(0);
+                let event = check.on_success(0);
                 let next = check.schedule_next(now);
                 check.next_check = next;
-                return Ok(Some(next));
+                return Ok(CheckStep {
+                    next: Some(next),
+                    event,
+                });
             }
             let raw_fd = sock.as_raw_fd();
             check.check_fd = Some(raw_fd);
@@ -331,12 +403,15 @@ pub fn step_check(
             #[allow(clippy::cast_sign_loss)]
             let _ = poller.add(sock.as_fd(), raw_fd as u64, false, true);
             check.sock = Some(sock);
-            Ok(Some(check.exp))
+            Ok(CheckStep::pending(Some(check.exp)))
         } else {
-            check.on_failure("L4CON", "Connection refused / error", 0);
+            let event = check.on_failure("L4CON", "Connection refused / error", 0);
             let next = check.schedule_next(now);
             check.next_check = next;
-            Ok(Some(next))
+            Ok(CheckStep {
+                next: Some(next),
+                event,
+            })
         }
     }
 }

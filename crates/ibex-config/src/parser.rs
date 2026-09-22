@@ -253,6 +253,8 @@ fn parse_listen_header(
         default_server: None,
         servers: Vec::new(),
         logs: Vec::new(),
+        log_global: false,
+        log_health_checks: false,
         cliexp: Vec::new(),
         srvexp: Vec::new(),
         acls: Vec::new(),
@@ -334,6 +336,8 @@ fn parse_frontend_header(
         acls: Vec::new(),
         cliexp: Vec::new(),
         logs: Vec::new(),
+        log_global: false,
+        log_health_checks: false,
         stick_table: None,
         stick_rules: Vec::new(),
         tcp_req_conn_rules: Vec::new(),
@@ -368,6 +372,8 @@ fn parse_backend_header(
     Ok(BackendSection {
         name: id,
         logs: Vec::new(),
+        log_global: false,
+        log_health_checks: false,
         mode,
         disabled: false,
         balance: BalanceAlgorithm::RoundRobin,
@@ -422,6 +428,18 @@ fn parse_global_directive(
                 ));
             }
             global.nbthread = Some(parse_u32(&tokens[1], "nbthread")?);
+            Ok(())
+        }
+        "log" => {
+            // `log global` is meaningless here -- this *is* global -- and HAProxy
+            // rejects it, so parse_log's inherit form is treated as an error.
+            if parse_log(&mut global.logs, tokens, kw)? {
+                return Err(ConfigError::new(
+                    kw.line,
+                    kw.col,
+                    "'log global' is not valid in the global section",
+                ));
+            }
             Ok(())
         }
         "stats" => {
@@ -484,9 +502,7 @@ fn parse_defaults_directive(
         }
         "timeout" => parse_timeout_directive(&mut defaults.timeouts, tokens, kw),
         "log" => {
-            if tokens.len() >= 2 && tokens[1].text == "global" {
-                defaults.log_global = true;
-            }
+            defaults.log_global |= parse_log(&mut defaults.logs, tokens, kw)?;
             Ok(())
         }
         "option" => parse_option_defaults(defaults, tokens, kw),
@@ -533,7 +549,10 @@ fn parse_listen_directive(
             tokens,
             kw,
         ),
-        "log" => parse_log(&mut proxy.logs, tokens, kw),
+        "log" => {
+            proxy.log_global |= parse_log(&mut proxy.logs, tokens, kw)?;
+            Ok(())
+        }
         "cliexp" => parse_cliexp(kw),
         "srvexp" => parse_srvexp(kw),
         "balance" => parse_balance(&mut proxy.balance, tokens, kw),
@@ -629,7 +648,10 @@ fn parse_frontend_directive(
         "srvexp" => parse_srvexp(kw),
         "timeout" => parse_timeout_directive(&mut fe.timeouts, tokens, kw),
         "maxconn" => parse_maxconn(&mut fe.maxconn, tokens, kw),
-        "log" => parse_log(&mut fe.logs, tokens, kw),
+        "log" => {
+            fe.log_global |= parse_log(&mut fe.logs, tokens, kw)?;
+            Ok(())
+        }
         "acl" => parse_acl(&mut fe.acls, tokens, kw),
         "use_backend" => parse_use_backend(&mut fe.use_backends, tokens, kw),
         "default_backend" => parse_default_backend(&mut fe.default_backend, tokens, kw),
@@ -760,7 +782,10 @@ fn parse_backend_directive(
         // `log` is valid in every proxy section, backends included. It was wired for
         // global, listen and frontend but not here, which alone blocked 19 reg-tests
         // -- the health-check suites all declare their syslog target on the backend.
-        "log" => parse_log(&mut be.logs, tokens, kw),
+        "log" => {
+            be.log_global |= parse_log(&mut be.logs, tokens, kw)?;
+            Ok(())
+        }
         other => Err(ConfigError::new(
             kw.line,
             kw.col,
@@ -796,6 +821,9 @@ fn parse_option_listen(
             "redispatch" => {
                 proxy.redisp = true;
             }
+            "log-health-checks" => {
+                proxy.log_health_checks = true;
+            }
             other => {
                 eprintln!("[ibex] warning: ignored option '{other}'");
             }
@@ -827,6 +855,9 @@ fn parse_option_frontend(
                     String::new()
                 };
                 fe.originalto = Some(except);
+            }
+            "log-health-checks" => {
+                fe.log_health_checks = true;
             }
             other => {
                 eprintln!("[ibex] warning: ignored option '{other}'");
@@ -863,6 +894,9 @@ fn parse_option_backend(
             "redispatch" => {
                 be.redisp = true;
             }
+            "log-health-checks" => {
+                be.log_health_checks = true;
+            }
             other => {
                 eprintln!("[ibex] warning: ignored option '{other}'");
             }
@@ -873,12 +907,16 @@ fn parse_option_backend(
 
 #[allow(clippy::unnecessary_wraps)]
 fn parse_option_defaults(
-    _defaults: &mut DefaultsSection,
+    defaults: &mut DefaultsSection,
     tokens: &[Token],
     _kw: &Token,
 ) -> Result<(), ConfigError> {
     if tokens.len() >= 2 {
-        eprintln!("[ibex] warning: ignored option '{}'", tokens[1].text);
+        if tokens[1].text == "log-health-checks" {
+            defaults.log_health_checks = true;
+        } else {
+            eprintln!("[ibex] warning: ignored option '{}'", tokens[1].text);
+        }
     }
     Ok(())
 }
@@ -1264,7 +1302,20 @@ fn parse_server(
     Ok(())
 }
 
-fn parse_log(logs: &mut Vec<LogConfig>, tokens: &[Token], kw: &Token) -> Result<(), ConfigError> {
+/// Parses a `log` directive into `logs`, returning true for the `log global` form.
+///
+/// `log global` inherits whatever the `global` section declared, and is how essentially
+/// every real `HAProxy` configuration turns logging on for a proxy. It used to fall into
+/// the argument check below and be rejected as "expects <address> and <facility>", so a
+/// canonical config did not load at all.
+fn parse_log(
+    logs: &mut Vec<LogConfig>,
+    tokens: &[Token],
+    kw: &Token,
+) -> Result<bool, ConfigError> {
+    if tokens.len() >= 2 && tokens[1].text == "global" {
+        return Ok(true);
+    }
     if tokens.len() < 3 || tokens[1].text.is_empty() || tokens[2].text.is_empty() {
         return Err(ConfigError::new(
             kw.line,
@@ -1287,7 +1338,7 @@ fn parse_log(logs: &mut Vec<LogConfig>, tokens: &[Token], kw: &Token) -> Result<
         facility,
         level,
     });
-    Ok(())
+    Ok(false)
 }
 
 fn parse_cliexp(kw: &Token) -> Result<(), ConfigError> {

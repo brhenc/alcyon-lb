@@ -38,6 +38,9 @@ pub struct GlobalSection {
     pub maxrewrite: Option<usize>,
     /// Buffer size in bytes.
     pub bufsize: Option<usize>,
+    /// Syslog targets declared here. Proxy sections inherit these with `log global`,
+    /// which is how the canonical `HAProxy` configuration declares logging.
+    pub logs: Vec<LogConfig>,
 }
 
 /// Defaults section configuration.
@@ -49,6 +52,10 @@ pub struct DefaultsSection {
     pub timeouts: TimeoutConfig,
     /// Whether syslog logging is forwarded to global targets.
     pub log_global: bool,
+    /// Syslog targets declared in `defaults`, inherited by every proxy that declares none.
+    pub logs: Vec<LogConfig>,
+    /// `option log-health-checks` in `defaults`.
+    pub log_health_checks: bool,
 }
 
 /// Unified timeouts configuration.
@@ -287,6 +294,11 @@ pub struct ListenSection {
     pub servers: Vec<Server>,
     /// Syslog logging destinations (up to 2).
     pub logs: Vec<LogConfig>,
+    /// `log global`: inherit the targets declared in the `global` section.
+    pub log_global: bool,
+    /// `option log-health-checks`: log every check whose health counter moved, not only
+    /// the transitions between UP and DOWN.
+    pub log_health_checks: bool,
     /// Client header regex rewrite rules (up to 10).
     pub cliexp: Vec<HeaderExp>,
     /// Server header regex rewrite rules (up to 10).
@@ -362,6 +374,8 @@ impl Default for ListenSection {
             default_server: None,
             servers: Vec::new(),
             logs: Vec::new(),
+            log_global: false,
+            log_health_checks: false,
             cliexp: Vec::new(),
             srvexp: Vec::new(),
             acls: Vec::new(),
@@ -413,6 +427,11 @@ pub struct FrontendSection {
     pub cliexp: Vec<HeaderExp>,
     /// Syslog logging destinations.
     pub logs: Vec<LogConfig>,
+    /// `log global`: inherit the targets declared in the `global` section.
+    pub log_global: bool,
+    /// `option log-health-checks`: log every check whose health counter moved, not only
+    /// the transitions between UP and DOWN.
+    pub log_health_checks: bool,
     /// Stick table configuration.
     pub stick_table: Option<StickTableConfigAst>,
     /// Stick rules.
@@ -453,6 +472,8 @@ impl Default for FrontendSection {
             acls: Vec::new(),
             cliexp: Vec::new(),
             logs: Vec::new(),
+            log_global: false,
+            log_health_checks: false,
             stick_table: None,
             stick_rules: Vec::new(),
             tcp_req_conn_rules: Vec::new(),
@@ -475,6 +496,11 @@ pub struct BackendSection {
     pub name: String,
     /// Syslog targets. `log` is valid in every proxy section, backends included.
     pub logs: Vec<LogConfig>,
+    /// `log global`: inherit the targets declared in the `global` section.
+    pub log_global: bool,
+    /// `option log-health-checks`: log every check whose health counter moved, not only
+    /// the transitions between UP and DOWN.
+    pub log_health_checks: bool,
     /// Operating mode (tcp, http, health).
     pub mode: Mode,
     /// Whether this backend is disabled.
@@ -526,6 +552,8 @@ impl Default for BackendSection {
         Self {
             name: String::new(),
             logs: Vec::new(),
+            log_global: false,
+            log_health_checks: false,
             mode: Mode::Tcp,
             disabled: false,
             balance: BalanceAlgorithm::RoundRobin,

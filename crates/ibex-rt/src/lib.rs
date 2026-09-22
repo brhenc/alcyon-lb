@@ -27,7 +27,7 @@ pub mod stats_html;
 
 pub use applet::{AppletArena, AppletContext, CliApplet};
 pub use buf::Buf;
-pub use check::{ServerCheckConfig, ServerCheckState, ServerStatus};
+pub use check::{CheckEvent, CheckStep, ServerCheckConfig, ServerCheckState, ServerStatus};
 pub use engine::{Engine, Proxy, ProxyStats, SessionArena, SessionEntry};
 pub use fdtab::{FdState, FdTab, Interest};
 pub use ibex_proto::{

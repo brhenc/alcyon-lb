@@ -138,6 +138,15 @@ impl SyslogTarget {
         self.send(self.default_level, tag, hostname, msg)
     }
 
+    /// The facility this target stamps into each message's PRI.
+    ///
+    /// Exposed so the engine can recognise two configured targets as the same collector
+    /// and share one socket between them.
+    #[must_use]
+    pub const fn facility(&self) -> LogFacility {
+        self.facility
+    }
+
     #[must_use]
     pub const fn addr(&self) -> SocketAddr {
         self.addr
