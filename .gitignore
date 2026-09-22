@@ -13,6 +13,7 @@ __pycache__/
 /insert_*.py
 /*_fix.py
 /clippy_output.json
+/out.json
 # Agent probe files: throwaway crates/**/scratch*.rs used to test whether a dependency
 # resolves. They also block the next launch, because agy treats any uncommitted path as
 # the supervisor's and refuses to claim it.
