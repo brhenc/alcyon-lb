@@ -257,6 +257,29 @@ fn parse_cli_args(args: &[String]) -> (String, CliOptions) {
                     opts.config_paths.push(PathBuf::from(&args[i]));
                 }
             }
+            // `-cc <expr>` evaluates a build condition and exits: 0 for true, 1 for
+            // false. The reg-tests gate themselves on it, and a binary that does not
+            // implement it fails every gate, so every gated test skips -- which a
+            // scoreboard cannot tell apart from "not applicable".
+            //
+            // Matched before "-c" because a prefix match would swallow it.
+            "-cc" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Option -cc expects a condition expression.");
+                    process::exit(1);
+                }
+                match ibex_rt::cond::eval(&args[i]) {
+                    Some(true) => process::exit(0),
+                    Some(false) => process::exit(1),
+                    None => {
+                        // Distinguished from false: a condition nobody can parse is a
+                        // mistake to fix, not a feature we lack.
+                        eprintln!("Unparseable condition: {}", args[i]);
+                        process::exit(2);
+                    }
+                }
+            }
             "-c" => {
                 opts.check_only = true;
             }

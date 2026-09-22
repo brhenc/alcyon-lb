@@ -416,7 +416,42 @@ class VtcParser:
         self.features: List[List[str]] = []
         self.directives: List[TopDirective] = []
 
+    def _splice_includes(self, content: str, seen: set) -> str:
+        """Replaces each `include <path>` line with the contents of that file.
+
+        `${testdir}` resolves to the directory of the file doing the including, which is
+        how vtest defines it. A file already spliced on this path is not spliced again,
+        so a cycle terminates instead of exhausting memory.
+        """
+        out = []
+        testdir = os.path.dirname(os.path.abspath(self.filepath))
+        for line in content.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("include "):
+                out.append(line)
+                continue
+            target = stripped[len("include "):].strip().strip('"')
+            target = target.replace("${testdir}", testdir)
+            path = target if os.path.isabs(target) else os.path.join(testdir, target)
+            real = os.path.realpath(path)
+            if real in seen or not os.path.isfile(real):
+                # A missing include is left as-is so the directive surfaces as an
+                # unknown command rather than vanishing into a silent pass.
+                out.append(line)
+                continue
+            seen.add(real)
+            with open(real, "r", encoding="utf-8", errors="replace") as f:
+                out.append(self._splice_includes(f.read(), seen))
+        return "\n".join(out)
+
     def parse(self) -> None:
+        # 0. Splice in `include ${testdir}/x.vtci` before anything else.
+        #
+        # vtest reads the included file in place, so the directives inside it belong to
+        # this test. Skipping the line left those tests with nothing to run, and a test
+        # that runs nothing used to be reported as a pass.
+        self.raw_content = self._splice_includes(self.raw_content, set())
+
         # 1. Handle backslash line continuations
         lines = self.raw_content.splitlines()
         normalized_lines: List[Tuple[int, str]] = []
@@ -1434,6 +1469,28 @@ class VtcExecutor:
             for cid, cli in self.clients.items():
                 if cli.error is not None:
                     raise cli.error
+
+            # A test that drove nothing has not passed.
+            #
+            # Every .vtc that is just `include ${testdir}/x.vtci` ran zero directives and
+            # was reported PASS -- 18 of them in reg-tests/ssl alone, each in 0.01s, which
+            # is a scoreboard saying TLS works when nothing had been asked. A pass has to
+            # mean an assertion was made and held.
+            exercised = {d.cmd for d in self.parser.directives} & {
+                "client",
+                "server",
+                "haproxy",
+                "syslog",
+                "shell",
+            }
+            if not exercised:
+                return TestResult(
+                    test_name=test_title,
+                    file_path=self.parser.filepath,
+                    status="SKIP",
+                    elapsed_sec=time.monotonic() - start_time,
+                    error_message="no directives were executed; nothing was asserted",
+                )
 
             elapsed = time.monotonic() - start_time
             return TestResult(
