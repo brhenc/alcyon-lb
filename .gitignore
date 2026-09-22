@@ -4,3 +4,12 @@
 *.profdata
 .DS_Store
 .agy/
+__pycache__/
+
+# Agent scratch. Background agents write throwaway fix-up scripts into the repo root;
+# these patterns keep them out of commits rather than relying on staging discipline.
+/fix_*.py
+/add_*.py
+/insert_*.py
+/*_fix.py
+/clippy_output.json

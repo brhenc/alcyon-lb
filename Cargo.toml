@@ -12,18 +12,6 @@ members = [
 ]
 
 
-# The ibex-* scaffold crates below are superseded by design/ and are excluded from the
-# build until rewritten against the new architecture. Files are retained on disk.
-# Build order: design/README.md.
-exclude = [
-    "crates/ibex-core",
-    "crates/ibex-peers",
-    "crates/ibex-parser",
-    "crates/ibex-vtest",
-    "crates/ibex-runtime",
-    "crates/ibex-lb",
-]
-
 [workspace.package]
 version = "0.1.0"
 edition = "2021"

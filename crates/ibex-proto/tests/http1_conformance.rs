@@ -2,7 +2,6 @@
 // Ibex HTTP/1.1 Protocol Conformance & Stress Test Harness
 
 #![forbid(unsafe_code)]
-#![allow(clippy::all)]
 
 use ibex_proto::h1::{H1Parser, H1Phase};
 use ibex_proto::htx::{HttpMethod, HttpVersion, Htx};

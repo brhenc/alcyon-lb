@@ -12,7 +12,6 @@
 //! 5. Stream reset (`RST_STREAM`) handling and graceful connection shutdown (`GOAWAY`).
 
 #![forbid(unsafe_code)]
-#![allow(clippy::all)]
 
 use ibex_proto::conn::ConnId;
 use ibex_proto::endpoint::{Endpoint, SeDesc};
@@ -97,15 +96,12 @@ fn test_rt_http2_socket_preface_and_settings_exchange() {
         let end = off + FRAME_HEADER_LEN + hdr.length as usize;
         let frame =
             Frame::decode(&hdr, &client_rx[off + FRAME_HEADER_LEN..end]).expect("decode frame");
-        match frame {
-            Frame::Settings { flags, .. } => {
-                if (flags & frame_flags::ACK) != 0 {
-                    saw_ack = true;
-                } else {
-                    saw_settings = true;
-                }
+        if let Frame::Settings { flags, .. } = frame {
+            if (flags & frame_flags::ACK) != 0 {
+                saw_ack = true;
+            } else {
+                saw_settings = true;
             }
-            _ => {}
         }
         off = end;
     }

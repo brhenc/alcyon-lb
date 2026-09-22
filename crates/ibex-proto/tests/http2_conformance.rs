@@ -12,7 +12,6 @@
 //! 5. Stream reset (`RST_STREAM`) handling and graceful connection shutdown (`GOAWAY`).
 
 #![forbid(unsafe_code)]
-#![allow(clippy::all)]
 
 use ibex_proto::conn::ConnId;
 use ibex_proto::endpoint::{Endpoint, SeDesc};
