@@ -20,6 +20,7 @@ fn default_bind() -> BindConfig {
         ssl: true,
         crt: vec![],
         alpn: vec![],
+        proto: None,
         accept_proxy: false,
         accept_proxy_v2: false,
     }
@@ -264,6 +265,7 @@ mod alpn {
             ssl: true,
             crt: vec![crt],
             alpn,
+            proto: None,
             accept_proxy: false,
             accept_proxy_v2: false,
         }

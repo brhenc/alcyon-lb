@@ -158,3 +158,19 @@ pub fn check_connect_error(fd: BorrowedFd<'_>) -> io::Result<Option<io::Error>> 
         Err(e) => Err(e.into()),
     }
 }
+
+/// Resets the connection immediately with an active TCP RST by configuring `SO_LINGER` 0.
+pub fn abort_with_rst(fd: BorrowedFd<'_>) {
+    let _ = net::sockopt::set_socket_linger(fd, Some(std::time::Duration::ZERO));
+}
+
+/// Discards the connection quietly: sets TTL to 1 (so emitted RST packets expire
+/// at the first hop and do not reach the client) and linger 0.
+pub fn silent_drop(fd: BorrowedFd<'_>, is_ipv6: bool) {
+    if is_ipv6 {
+        let _ = net::sockopt::set_ipv6_unicast_hops(fd, Some(1));
+    } else {
+        let _ = net::sockopt::set_ip_ttl(fd, 1);
+    }
+    let _ = net::sockopt::set_socket_linger(fd, Some(std::time::Duration::ZERO));
+}

@@ -1,0 +1,123 @@
+# Ibex Capability Matrix
+
+Audit conducted: 2026-09-22  
+Oracle: HAProxy reference binary (`haproxy` 3.5-dev7 @ `e6f616a`) and Project Ibex codebase.  
+Governing specification: `nudge-agy-4.md` (Item 4).
+
+---
+
+## 1. Overview & Evaluation Methodology
+
+This capability matrix records what Project Ibex can actually perform end to end. As identified in `nudge-agy-4.md`, static line counts and isolated unit tests can be deceptive: thousands of lines of protocol implementation may exist in library crates without being reachable from the runtime data path.
+
+### Evaluation Criteria
+
+- **Implemented**: The code exists in the repository, compiles, and passes unit/module-level tests.
+- **Reachable from the daemon**: A client connecting to a configured listener (or an operator interacting with the configured CLI / admin endpoints) can exercise the capability through the live runtime engine (`ibex-rt`). Code that exists solely as an internal library or is unwired from `ibex-rt` is marked **No**.
+- **Tested end to end**: Automated integration tests exercise the full path from listener accept through protocol handling/routing to backend response or administrative completion.
+- **Declined (out of scope)**: Features explicitly excluded by architectural decision (`tradeoff.md` §4.2) to maintain project focus and tractability, rather than being missing or incomplete.
+
+---
+
+## 2. Capability Matrix
+
+| Capability | Implemented | Reachable from the daemon | Tested end to end | Notes |
+|---|---|---|---|---|
+| **HTTP/2 Core & Multiplexing** (`h2.rs`, `mux_h2.rs`) | Yes | No | No | 2,482 lines in `ibex-proto` (preface, HPACK dynamic table, flow control, `RST_STREAM`, `GOAWAY`). Unreferenced in `ibex-rt/src`. Removed `+H2` from `-vv` banner (now `-H2`); unwired from listeners. |
+| **HTX Stream Representation** (`htx.rs`) | Yes | No | No | 1,991 lines in `ibex-proto` (flat circular buffer, defragmentation, differential proptests). Data path pinned to `ParserKind::H1`; `SampleContext` passes `htx: None`. Deferred on purpose. |
+| **HTTP/1.1 Reverse Proxying** | Yes | Yes | Yes | Keep-alive reuse (50+ sequential requests), pipelining, chunked transfer encoding, method dispatch, and RFC 9112 framing conflict enforcement. Verified in `http1_conformance.rs` and `http_proxy.rs`. |
+| **HTTP/1.0 Fallback** | Yes | Yes | Yes | Close-delimited framing and HTTP/1.0 connection header defaults. Tested in `http1_conformance.rs`. |
+| **L4 TCP Proxying (Non-splice)** | Yes | Yes | Yes | Safe user-space buffer proxying (`Buf`). Half-close propagation (`shutdown(Write)`), backpressure signalling via epoll interests, inspect-delay, connect retries, and timeouts. Tested in `tcp_proxy.rs`. |
+| **L4 TCP Zero-Copy Splicing (`splice`)** | No | No | No | Linux `splice(2)` pipe zero-copy proxying is not implemented; proxying operates via user-space ring buffers under `#![forbid(unsafe_code)]`. Spliced byte counters exist for CSV schema parity only. |
+| **TCP Request Rules (`tcp-request`)** | Yes | Yes | Yes | Connection, session, and content-level inspection rules with `inspect-delay`. Distinct handling of `reject` (active TCP RST via `SO_LINGER 0`) versus `silent-drop` (quiet drop via `IP_TTL = 1` / `SO_LINGER 0`). Verified in `tcp_request_rules.rs`, `tcp_request_tracking.rs`, and `tcp_proxy.rs`. |
+| **Content Switching (`use_backend`, `default_backend`)** | Yes | Yes | Yes | Dynamic backend routing based on ACL condition evaluation (`if` / `unless`) and default fallbacks. Tested in `content_switching.rs` and `canonical_haproxy_35_e2e.rs`. |
+| **Load Balancing: Round-Robin** | Yes | Yes | Yes | Cyclic distribution across active, healthy servers. Respects server state and backup failover. Tested in `content_switching.rs` and `canonical_haproxy_35_e2e.rs`. |
+| **Load Balancing: Source IP Hash** | Yes | Yes | Yes | Consistent IPv4/IPv6 hashing (`balance source`). Integrates with PROXY protocol parsed client address (`src`). Tested in `content_switching.rs` and `proxy_protocol.rs`. |
+| **Load Balancing: URI Hash** | Partial | Yes | No | Parsed by `ibex-config`, but `engine.rs:select_server_with_key` falls through to round-robin (`_ => self.select_server()`). No sticky URI hashing test exists. |
+| **Load Balancing: `static-rr`, `first`, `leastconn`** | No | No | No | Unimplemented algorithms are rejected at configuration parse time (`unknown balance algorithm <algo>` in `ibex-config/src/parser.rs:1228`) adhering to Rule 5. |
+| **Backup Server Failover (`backup`)** | Yes | Yes | Yes | Primary servers prioritized when available; automatic failover to `backup` servers when all active primaries are down or in maintenance. Tested in `canonical_haproxy_35_e2e.rs`. |
+| **Stick Table Engine** (`ibex-stick-table`) | Yes | Yes | Yes | `EbMbTree`-indexed memory tables supporting IPv4/IPv6 (`ip`), integer (`integer`), string (`string`), and binary (`binary`) keys with TTL expiration. Tested in `stick_table.rs`. |
+| **Stick Table Counters & Metrics** | Yes | Yes | Yes | Tracks `conn_cnt`, `conn_cur`, `conn_rate`, `sess_cnt`, `sess_rate`, `http_req_cnt`, `http_req_rate`, `http_err_cnt`, `http_err_rate`, `bytes_in/out_cnt/rate`, `gpc0`, `gpc1`, `gpt0`, `server_id`. |
+| **Stick Actions (`track-sc*`, `sc-inc-gpc*`, `sc-set-gpt0`)** | Yes | Yes | Yes | Rule actions evaluated across connection, session, content, and HTTP scopes. Verified in `canonical_haproxy_35_e2e.rs`, `tcp_proxy.rs`, and `tcp_request_tracking.rs`. |
+| **Stick Table CLI Dumps (`show table`)** | Yes | Yes | Yes | UNIX socket CLI inspection with table name arguments and data filters (`data.gpc0 gt 0`, `data.conn_cnt`, etc.). Tested in `stick_table.rs` and `tcp_proxy.rs`. |
+| **ACL Evaluation & Matchers** | Yes | Yes | Yes | Path matchers (`path`, `path_beg`, `path_end`, `path_sub`, `path_reg`, `path_dir`), IP matchers (`src`, `dst`, `fc_src`, `fc_dst`), headers (`hdr(...)`), payload byte inspection (`req.payload`). Tested in `sample_semantics.rs` and `tcp_request_rules.rs`. |
+| **Sample Fetches & Converters** | Yes | Yes | Yes | Over 570 sample fetches registered (`ibex-sample`). String, hex, base64, and arithmetic converters. `match_map` caching (`CachedMapTable`) implemented to eliminate per-request disk I/O and heap re-parsing (`tradeoff.md` §6.6). Tested in `sample_semantics.rs`, `proptest_expr.rs`, and `logfmt.rs`. |
+| **TLS Termination via Rustls** | Yes | Yes | Yes | Modern TLS 1.2 and TLS 1.3 server-side termination using Rustls under `#![forbid(unsafe_code)]`. SNI resolution, ALPN (`http/1.1`), PEM bundle loading. Tested in `tls_e2e.rs` and `tls_xprt.rs`. Fails closed if certificates are invalid or missing. |
+| **Backend Outbound TLS** | Partial | No | No | Inbound termination is complete; outbound client TLS to backend servers (`server ... ssl`) is not wired in the runtime connection pool. |
+| **PROXY Protocol v1 (Receive & Send)** | Yes | Yes | Yes | Parses inbound `PROXY TCP4/TCP6` lines (`accept-proxy`) and generates outbound v1 headers (`send-proxy`). Tested in `proxy_protocol.rs`. |
+| **PROXY Protocol v2 (Receive & Send)** | Yes | Yes | Yes | 16-byte binary header parsing (`accept-proxy`) and generation (`send-proxy-v2`), IPv4/IPv6/UNIX addresses, CRC32c wire validation, and TLV forwarding. Tested in `proxy_protocol.rs` and `canonical_haproxy_35_e2e.rs`. |
+| **Health Checking: TCP Check** | Yes | Yes | Yes | Non-blocking periodic TCP probes executed in scheduler. Rise/fall counter state machine (`0..=rise+fall-1`) matching HAProxy `src/check.c`. Tested in `health_check.rs` and `stats_admin_sessions.rs`. |
+| **Health Checking: HTTP Check** | Partial | Yes | Yes | Client-facing synthetic health responder (`monitor-uri` / synthetic health responses returning HTTP 200 `OK\n`) tested in `canonical_haproxy_35_e2e.rs`. Outbound active HTTP probe (`option httpchk`) is not implemented. |
+| **Server Admin States (READY, DRAIN, MAINT)** | Yes | Yes | Yes | Dynamic operational state transitions via CLI and Web UI. Tested in `stats_admin_sessions.rs` and `stats_web_admin.rs`. |
+| **Dynamic Server Weight & Session Shutdown** | Yes | Yes | Yes | Live weight adjustment (`set server ... weight <N>`) and connection termination (`shutdown sessions server ...`). Tested in `stats_admin_sessions.rs` and `stats_web_admin.rs`. |
+| **Stats CSV Engine (`/stats;csv`, `show stat`)** | Yes | Yes | Yes | Byte-for-byte structural parity with HAProxy 3.5 reference binary: exactly 146 positional CSV fields (including `h2_*`, `ssl_*`, `h1_*` columns). Tested in `hatop_compat.rs` and `stats_csv_schema.rs`. |
+| **Web Admin UI (`/stats`)** | Yes | Yes | Yes | Embedded dark-mode HTML dashboard with live metrics, health status badges, and interactive admin control forms. Tested in `stats_web_admin.rs`. |
+| **Runtime CLI Socket & Hatop Compatibility** | Yes | Yes | Yes | UNIX domain socket supporting interactive mode (`prompt`), `show info` (all 14 mandatory regex keys required by Hatop 0.8.3), `show stat`, `show table`, `set server ...`, `clear counters all`. Tested in `hatop_compat.rs` and `cli_applet.rs`. |
+| **Syslog Logging & Log Formatting** | Yes | Yes | Yes | UDP and UNIX datagram emission. RFC 5424 and RFC 3164 (space-padded days, facility*8 + severity priority calculation). Unified `log-format` engine with `%[...]` sample expansion. Tested in `syslog.rs` and `logfmt.rs`. |
+| **Pool Allocator & Scratch Buffers** | Yes | Yes | Yes | Fixed-size 16KB buffer pool with free-list recycling, synchronized with `PoolRegistry` in `crates/ibex-alloc`. Reusable scratch formatting in `logfmt.rs` (`write!` into string without intermediate heap allocations). `show pools` CLI command implemented matching HAProxy format. Tested in `cli_applet.rs` and `request_allocations.rs`. |
+| **Allocation Oracle & Hot-Path Bounds** | Yes | Yes | Yes | Global `CountingAllocator` and snapshot diff API in `crates/ibex-alloc`. Pinned bounds for steady-state HTTP request (<= 95 allocs), TCP connection (<= 35 allocs), and request with ACL + log format (<= 105 allocs). Buffer pooling verified to drop HTTP request allocation churn by 80% (from 41,130 bytes to 8,386 bytes). Pinned in `crates/ibex-rt/tests/request_allocations.rs`. |
+| **QUIC / HTTP/3** | Declined (out of scope) | No | No | Explicitly excluded by design decision (`tradeoff.md` §4.2). Marked permanently `OUT_OF_SCOPE` in reg-test triage (`data/regtests.json`). |
+| **Generic Filters (FLT)** | Declined (out of scope) | No | No | Explicitly excluded by design decision (`tradeoff.md` §4.2). |
+| **Lua Scripting Engine (`hlua`)** | Declined (out of scope) | No | No | Explicitly excluded by design decision (`tradeoff.md` §4.2) to maintain a tractable, high-assurance codebase. |
+| **Stream Processing Offload Engine (SPOE)** | Declined (out of scope) | No | No | Explicitly excluded by design decision (`tradeoff.md` §4.2). |
+| **FastCGI (FCGI)** | Declined (out of scope) | No | No | Explicitly excluded by design decision (`tradeoff.md` §4.2). |
+| **HTTP Cache Applet / Subsystem** | Declined (out of scope) | No | No | Explicitly excluded by design decision (`tradeoff.md` §4.2). |
+
+---
+
+## 3. Detailed Audit Findings & Citations
+
+### 3.1 HTTP/2 & Multiplexing (`h2.rs` + `mux_h2.rs`)
+- **Codebase Inventory**: `crates/ibex-proto/src/h2.rs` (1,734 lines) and `crates/ibex-proto/src/mux_h2.rs` (748 lines), totalling **2,482 lines**.
+- **Implementation Scope**: Full connection preface detection (`H2_CONN_PREFACE`), SETTINGS frame negotiation, HPACK dynamic table encoder/decoder, frame parser for DATA, HEADERS, PRIORITY, RST_STREAM, SETTINGS, PING, GOAWAY, and WINDOW_UPDATE, plus stream-level and connection-level flow control.
+- **Reachability Defect**: `grep -rn "mux_h2\|proto::h2" crates/ibex-rt/src` returns zero matches. The runtime poller and accept loops in `ibex-rt` have no code paths that construct or step an H2 multiplexer. While `crates/ibex-rt/src/bin/ibex.rs` prints `+H2` in its `-vv` feature string, no client connecting to an Ibex listener can negotiate or speak HTTP/2.
+- **Test Coverage**: Tested exclusively at the unit/socket layer in `crates/ibex-rt/tests/http2_conformance.rs` using raw TCP socket pairs (`setup_tcp_pair()`). Zero end-to-end daemon tests exist.
+
+### 3.2 HTX Intermediate Representation (`htx.rs`)
+- **Codebase Inventory**: `crates/ibex-proto/src/htx.rs` (1,991 lines).
+- **Implementation Scope**: Pure safe Rust implementation of HAProxy's flat circular HTX buffer with header/data block indexing, message defragmentation (`defrag`), and proptest-based differential fuzzing against simulated payloads.
+- **Reachability Defect**: In `crates/ibex-rt/src/proxy.rs:184`, the proxy session initializes with `parser_kind: ParserKind::H1`. While `validate_request_head` instantiates a temporary `Htx::new()` to validate headers, the actual streaming data path forwards raw byte slices (`self.req.readable()`). In `crates/ibex-rt/src/engine.rs` (lines 2896, 3185, 4011, 4538), every `SampleContext` passed to rule evaluators explicitly sets `htx: None`.
+- **Architectural Status**: Formally deferred per `nudge-agy-4.md` until the data path allocation profile is stabilized.
+
+### 3.3 Memory Allocation & Soft-Realtime Discipline
+- **Status**: Implemented, reachable, and tested under Nudge 4 Items 1, 2, and 3.
+- **Current State**:
+  - Global `CountingAllocator` and snapshot diff API implemented in `crates/ibex-alloc` (isolated safe interface wrapping `System` under `#![allow(unsafe_code)]` solely for the `GlobalAlloc` trait).
+  - Pinned allocation ceiling tests (`a_steady_state_http_request_allocates_no_more_than_N_times`) implemented in `crates/ibex-rt/tests/request_allocations.rs`.
+  - 16KB `Buf` buffer pool (`BUFFER_POOL`) with free-list recycling implemented and registered in `global_pool_registry()`. Eliminates 32KB of buffer reallocations per connection.
+  - Scratch-buffer string formatting implemented in `logfmt.rs` (`render_into`, `write_alias`) eliminating per-log heap churn.
+  - `match_map` caching (`CachedMapTable`) implemented in `ibex-sample/src/registry.rs`, completely eliminating per-request file reads and string re-parsing.
+  - `show pools` CLI command wired to `dump_pools_info()` in `crates/ibex-rt/src/applet.rs` for live HAProxy-compatible memory pool inspection.
+
+### 3.4 Explicitly Declined Subsystems (`tradeoff.md` §4.2)
+Per project architectural records, the following HAProxy subsystems have been formally declined:
+1. **QUIC / HTTP/3**: Excluded due to kernel UDP scaling requirements and complexity.
+2. **Filters (FLT)**: Excluded to eliminate indirect function pointer loops (NASA JPL Rule 1).
+3. **Lua Scripting (`hlua`)**: Excluded (~14,000 lines of C runtime) to avoid non-deterministic garbage collection and unbounded execution times.
+4. **SPOE**: Excluded in favor of direct proxy pipelines.
+5. **FCGI**: Excluded; backend communication standardized on HTTP and TCP.
+6. **HTTP Cache**: Excluded to maintain stateless soft-realtime proxying invariants.
+
+In `data/regtests.json`, all HAProxy regression tests targeting these subsystems are categorized as `OUT_OF_SCOPE`.
+
+### 3.5 Audited Production Capabilities
+1. **L4 TCP Proxying**: Buffer-based user-space copy. Splice is not implemented. Half-close, inspect-delay deadlines, early wakeups, and poller backpressure are verified in `crates/ibex-rt/tests/tcp_proxy.rs`.
+2. **HTTP/1.1 Reverse Proxying**: RFC 9112 conformance, chunked streaming, keep-alive reuse, and pipelining verified in `crates/ibex-rt/tests/http1_conformance.rs` and `canonical_haproxy_35_e2e.rs`.
+3. **Content Switching**: `use_backend` with ACL conditions (`if`/`unless`) and `default_backend` verified in `crates/ibex-rt/tests/content_switching.rs`.
+4. **Load Balancing**: `roundrobin` and `source` hash algorithms fully implemented and verified in `crates/ibex-rt/tests/content_switching.rs`. `uri` is accepted by parser but falls back to round-robin. Other algorithms (`static-rr`, `first`, `leastconn`) are safely rejected by the parser adhering to Rule 5.
+5. **Stick Tables & Metrics**: Full metric suite (`conn_*`, `http_req_*`, `gpc0`, `gpt0`) with sliding-window rate tracking and `show table` CLI filters verified in `crates/ibex-rt/tests/stick_table.rs` and `tcp_request_tracking.rs`.
+6. **ACL Evaluation**: Matchers (`path_beg/end/sub/reg`, `src`, `fc_src`, `hdr`, `req.payload`) and 570+ fetches verified in `crates/ibex-rt/tests/tcp_request_rules.rs` and `crates/ibex-sample/tests/sample_semantics.rs`.
+7. **TLS Termination**: Rustls-backed server termination with fail-closed certificate verification and ALPN negotiation verified in `crates/ibex-rt/tests/tls_e2e.rs` and `tls_xprt.rs`.
+8. **PROXY Protocol**: Text v1 and binary v2 reception and outbound generation, with CRC32c checksum validation, verified in `crates/ibex-rt/tests/proxy_protocol.rs`.
+9. **Health Checking**: TCP connect health checking with rise/fall counter state machine matching HAProxy `src/check.c` verified in `crates/ibex-rt/tests/health_check.rs`. Synthetic HTTP health responder verified in `canonical_haproxy_35_e2e.rs`. Outbound `option httpchk` is not implemented.
+10. **Server Admin States**: READY, DRAIN, MAINT states, dynamic weight changes, and session shutdown verified in `crates/ibex-rt/tests/stats_admin_sessions.rs`.
+11. **Web Admin UI & Stats CSV**: Embedded HTML dashboard and exact 146-field CSV output matching live HAProxy binary verified in `crates/ibex-rt/tests/stats_web_admin.rs` and `hatop_compat.rs`.
+12. **CLI Socket & Hatop Compatibility**: Interactive UNIX socket CLI matching all Hatop 0.8.3 required regexes verified in `crates/ibex-rt/tests/hatop_compat.rs` and `cli_applet.rs`.
+13. **Syslog Engine**: RFC 5424 / RFC 3164 datagram formatting with unified sample-based `log-format` verified in `crates/ibex-rt/tests/syslog.rs` and `logfmt.rs`.
+
+---
+
+## 4. Maintenance Rule
+
+Per `nudge-agy-4.md`: **A row in this matrix must change in the same commit as the behaviour it describes.**  
+Any capability marked "Reachable from the daemon: Yes" must be accompanied by an end-to-end integration test exercising the feature through a configured listener or control endpoint.

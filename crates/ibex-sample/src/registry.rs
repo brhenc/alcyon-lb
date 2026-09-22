@@ -19,7 +19,7 @@ use regex::RegexBuilder;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::{LazyLock, RwLock};
+use std::sync::{Arc, LazyLock, RwLock};
 
 thread_local! {
     pub static CURRENT_VARS: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
@@ -3261,47 +3261,141 @@ pub enum MapMatchType {
     Ip,
 }
 
-#[must_use]
-pub fn match_map(path: &str, input: &str, match_type: MapMatchType) -> Option<(String, String)> {
-    let content = std::fs::read_to_string(path).ok()?;
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.is_empty() {
-            continue;
-        }
-        let key = parts[0];
-        let val = if parts.len() > 1 {
-            parts[1..].join(" ")
-        } else {
-            String::new()
-        };
+#[derive(Debug, Clone)]
+pub struct CachedMapEntry {
+    pub key: String,
+    pub val: String,
+    pub regex: Option<regex::Regex>,
+    pub int_val: Option<i64>,
+}
 
-        match match_type {
-            MapMatchType::Str => {
-                if key == input {
-                    return Some((val, key.to_string()));
+#[derive(Debug, Clone)]
+pub struct CachedMapTable {
+    pub entries: Vec<CachedMapEntry>,
+    pub exact_str: HashMap<String, String>,
+    pub exact_int: HashMap<i64, (String, String)>,
+}
+
+impl CachedMapTable {
+    #[must_use]
+    pub fn parse(content: &str) -> Self {
+        let mut entries = Vec::new();
+        let mut exact_str = HashMap::new();
+        let mut exact_int = HashMap::new();
+
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.is_empty() {
+                continue;
+            }
+            let key = parts[0].to_string();
+            let val = if parts.len() > 1 {
+                parts[1..].join(" ")
+            } else {
+                String::new()
+            };
+
+            let int_val = key.parse::<i64>().ok();
+            let regex = regex::Regex::new(&key).ok();
+
+            if let Some(n) = int_val {
+                exact_int.entry(n).or_insert_with(|| (val.clone(), key.clone()));
+            }
+            exact_str.entry(key.clone()).or_insert_with(|| val.clone());
+
+            entries.push(CachedMapEntry {
+                key,
+                val,
+                regex,
+                int_val,
+            });
+        }
+
+        Self {
+            entries,
+            exact_str,
+            exact_int,
+        }
+    }
+}
+
+static MAP_CACHE: RwLock<Option<HashMap<String, Arc<CachedMapTable>>>> = RwLock::new(None);
+
+#[must_use]
+pub fn get_or_load_map_table(path: &str) -> Option<Arc<CachedMapTable>> {
+    // Fast path: read lock
+    if let Ok(guard) = MAP_CACHE.read() {
+        if let Some(ref map) = *guard {
+            if let Some(table) = map.get(path) {
+                return Some(Arc::clone(table));
+            }
+        }
+    }
+
+    // Disk read performed once
+    let content = std::fs::read_to_string(path).ok()?;
+    let table = Arc::new(CachedMapTable::parse(&content));
+
+    // Slow path: insert into cache
+    if let Ok(mut guard) = MAP_CACHE.write() {
+        let map = guard.get_or_insert_with(HashMap::new);
+        map.insert(path.to_string(), Arc::clone(&table));
+    }
+
+    Some(table)
+}
+
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn match_map(path: &str, input: &str, match_type: MapMatchType) -> Option<(String, String)> {
+    let table = get_or_load_map_table(path)?;
+
+    match match_type {
+        MapMatchType::Str => {
+            if let Some(val) = table.exact_str.get(input) {
+                return Some((val.clone(), input.to_string()));
+            }
+            None
+        }
+        MapMatchType::Int => {
+            if let Ok(n) = input.parse::<i64>() {
+                if let Some(res) = table.exact_int.get(&n) {
+                    return Some(res.clone());
                 }
             }
-            MapMatchType::Beg => {
-                if input.starts_with(key) {
-                    return Some((val, key.to_string()));
+            None
+        }
+        MapMatchType::Beg => {
+            for entry in &table.entries {
+                if input.starts_with(&entry.key) {
+                    return Some((entry.val.clone(), entry.key.clone()));
                 }
             }
-            MapMatchType::End => {
-                if input.ends_with(key) {
-                    return Some((val, key.to_string()));
+            None
+        }
+        MapMatchType::End => {
+            for entry in &table.entries {
+                if input.ends_with(&entry.key) {
+                    return Some((entry.val.clone(), entry.key.clone()));
                 }
             }
-            MapMatchType::Sub => {
-                if input.contains(key) {
-                    return Some((val, key.to_string()));
+            None
+        }
+        MapMatchType::Sub => {
+            for entry in &table.entries {
+                if input.contains(&entry.key) {
+                    return Some((entry.val.clone(), entry.key.clone()));
                 }
             }
-            MapMatchType::Dir => {
+            None
+        }
+        MapMatchType::Dir => {
+            for entry in &table.entries {
+                let key = &entry.key;
                 if input == key
                     || (input.starts_with(key)
                         && (key.ends_with('/')
@@ -3309,52 +3403,58 @@ pub fn match_map(path: &str, input: &str, match_type: MapMatchType) -> Option<(S
                                 .get(key.len()..)
                                 .is_some_and(|rest| rest.starts_with('/'))))
                 {
-                    return Some((val, key.to_string()));
+                    return Some((entry.val.clone(), key.clone()));
                 }
             }
-            MapMatchType::Dom => {
+            None
+        }
+        MapMatchType::Dom => {
+            for entry in &table.entries {
+                let key = &entry.key;
                 if input == key
                     || (key.starts_with('.') && input.ends_with(key))
                     || input.ends_with(&format!(".{key}"))
                 {
-                    return Some((val, key.to_string()));
+                    return Some((entry.val.clone(), key.clone()));
                 }
             }
-            MapMatchType::Reg => {
-                if let Ok(re) = regex::Regex::new(key) {
+            None
+        }
+        MapMatchType::Reg => {
+            for entry in &table.entries {
+                if let Some(re) = &entry.regex {
                     if re.is_match(input) {
-                        return Some((val, key.to_string()));
+                        return Some((entry.val.clone(), entry.key.clone()));
                     }
                 }
             }
-            MapMatchType::Regm => {
-                if let Ok(re) = regex::Regex::new(key) {
+            None
+        }
+        MapMatchType::Regm => {
+            for entry in &table.entries {
+                if let Some(re) = &entry.regex {
                     if let Some(caps) = re.captures(input) {
-                        let mut result = val;
+                        let mut result = entry.val.clone();
                         for i in 1..caps.len() {
                             let backref = format!("\\{i}");
                             let captured = caps.get(i).map_or("", |m| m.as_str());
                             result = result.replace(&backref, captured);
                         }
-                        return Some((result, key.to_string()));
+                        return Some((result, entry.key.clone()));
                     }
                 }
             }
-            MapMatchType::Int => {
-                if let (Ok(k_int), Ok(in_int)) = (key.parse::<i64>(), input.parse::<i64>()) {
-                    if k_int == in_int {
-                        return Some((val, key.to_string()));
-                    }
+            None
+        }
+        MapMatchType::Ip => {
+            for entry in &table.entries {
+                if check_ip_cidr(input, &entry.key) {
+                    return Some((entry.val.clone(), entry.key.clone()));
                 }
             }
-            MapMatchType::Ip => {
-                if check_ip_cidr(input, key) {
-                    return Some((val, key.to_string()));
-                }
-            }
+            None
         }
     }
-    None
 }
 
 fn check_ip_cidr(ip_str: &str, cidr_str: &str) -> bool {

@@ -286,3 +286,123 @@ fn cli_applet_one_shot_non_interactive_command() {
         "one-shot mode should not include prompt delimiter"
     );
 }
+
+#[test]
+fn cli_applet_show_pools() {
+    let socket_path = PathBuf::from(format!(
+        "/tmp/ibex_test_pools_{}.sock",
+        std::process::id()
+    ));
+    let mut engine = create_test_engine(&socket_path);
+
+    // Warm-up a buffer so Pool buffer has non-zero stats. Take the size from the
+    // configured standard rather than the BUFSIZE constant: the two are separate (a
+    // const and an AtomicUsize) and only the configured one selects a pool class.
+    let _buf = ibex_rt::buf::Buf::with_capacity(ibex_rt::buf::get_bufsize());
+
+    let mut client = UnixStream::connect(&socket_path).expect("failed to connect to cli socket");
+    client
+        .set_nonblocking(true)
+        .expect("failed to set nonblocking");
+    engine.step(Tick(100)).expect("engine step failed");
+
+    client.write_all(b"show pools\n").expect("write failed");
+
+    let mut resp = Vec::new();
+    let mut tick = Tick(110);
+    for _ in 0..20 {
+        let _ = engine.step(tick);
+        let mut buf = [0u8; 1024];
+        if let Ok(n) = client.read(&mut buf) {
+            if n > 0 {
+                resp.extend_from_slice(&buf[..n]);
+            }
+        }
+        if engine.applets.live() == 0 && !resp.is_empty() {
+            break;
+        }
+        tick = tick.add(10);
+    }
+
+    let text = String::from_utf8_lossy(&resp);
+    assert!(
+        text.contains("Dumping pools usage. Use SIGQUIT to flush them.\n"),
+        "expected HAProxy header in show pools: {text}"
+    );
+    // Assert the *configured* size, not a literal. `tune.bufsize` is process-global
+    // mutable state, so a sibling test that configures 32768 changes what this one sees
+    // when the two run in the same binary. Asserting what is configured is both
+    // order-independent and the contract that actually matters here; the sibling test
+    // below covers the specific values.
+    let expected = format!("- Pool buffer ({} bytes)", ibex_rt::buf::get_bufsize());
+    assert!(
+        text.contains(&expected),
+        "expected buffer pool entry for the configured size in show pools: {text}"
+    );
+    assert!(
+        text.contains("Total:"),
+        "expected total summary in show pools: {text}"
+    );
+}
+
+#[test]
+fn cli_applet_show_pools_configured_sizes() {
+    let socket_path = PathBuf::from(format!(
+        "/tmp/ibex_test_pools_cfg_{}.sock",
+        std::process::id()
+    ));
+    let cfg_str = r"
+global
+    tune.bufsize 32768
+    tune.bufsize.small 2048
+    tune.bufsize.large 65536
+
+listen test_proxy
+    bind 127.0.0.1:28082
+    mode tcp
+    server srv1 127.0.0.1:29093
+";
+    let config = parse_str(cfg_str).expect("failed to parse test config");
+    let mut engine = Engine::new(&config, 1024).expect("failed to create engine");
+    engine
+        .bind_cli_socket(&socket_path)
+        .expect("failed to bind stats socket");
+
+    let mut client = UnixStream::connect(&socket_path).expect("failed to connect to cli socket");
+    client
+        .set_nonblocking(true)
+        .expect("failed to set nonblocking");
+    engine.step(Tick(100)).expect("engine step failed");
+
+    client.write_all(b"show pools\n").expect("write failed");
+
+    let mut resp = Vec::new();
+    let mut tick = Tick(110);
+    for _ in 0..20 {
+        let _ = engine.step(tick);
+        let mut buf = [0u8; 1024];
+        if let Ok(n) = client.read(&mut buf) {
+            if n > 0 {
+                resp.extend_from_slice(&buf[..n]);
+            }
+        }
+        if engine.applets.live() == 0 && !resp.is_empty() {
+            break;
+        }
+        tick = tick.add(10);
+    }
+
+    let text = String::from_utf8_lossy(&resp);
+    assert!(
+        text.contains("- Pool buffer (32768 bytes)"),
+        "show pools must report configured tune.bufsize 32768: {text}"
+    );
+    assert!(
+        text.contains("- Pool small_buffer (2048 bytes)"),
+        "show pools must report configured tune.bufsize.small 2048: {text}"
+    );
+    assert!(
+        text.contains("- Pool large_buffer (65536 bytes)"),
+        "show pools must report configured tune.bufsize.large 65536: {text}"
+    );
+}

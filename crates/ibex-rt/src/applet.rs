@@ -185,6 +185,14 @@ impl CliApplet {
             self.handle_show_stat(cmd, ctx);
         } else if cmd == "show table" || cmd.starts_with("show table ") {
             self.handle_show_table(cmd, ctx);
+        } else if cmd == "show pools" || cmd.starts_with("show pools") {
+            let output = ibex_alloc::global_pool_registry().dump_pools_info();
+            self.out_buf.extend_from_slice(output.as_bytes());
+            if self.interactive {
+                self.out_buf.extend_from_slice(b"\n> ");
+            } else {
+                self.is_done = true;
+            }
         } else if let Some(target) = cmd.strip_prefix("shutdown sessions server ")
             .or_else(|| cmd.strip_prefix("shutdown session server "))
         {
@@ -700,6 +708,7 @@ impl CliApplet {
                       quit                                       : Disconnect CLI session\n\
                       set timeout cli <sec>                      : Set CLI session idle timeout\n\
                       show info                                  : Dump system statistics\n\
+                      show pools                                 : Report information about the memory pools usage\n\
                       show stat [<iid> <type> <sid>]             : Dump CSV proxies and servers statistics\n\
                       show table [<name>]                        : Dump stick table contents\n\
                       shutdown sessions server <backend>/<server>: Terminate active sessions on server\n\

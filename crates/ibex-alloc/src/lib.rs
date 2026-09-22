@@ -1,0 +1,396 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Project Ibex Contributors. See LICENSE.
+
+//! Allocation counting oracle and fixed-size object memory pools for Project Ibex.
+//!
+//! Provides:
+//! - [`CountingAllocator`]: A global allocator wrapping [`std::alloc::System`] that
+//!   tracks allocations, reallocations, frees, and byte volumes for regression pinning.
+//! - [`alloc_counters`]: Snapshots allocation counters before and after request processing.
+//! - [`Pool`]: Fixed-size object pools with free lists based on index handles (derived from
+//!   `ebtree`'s index arena precedent) under `#![forbid(unsafe_code)]`.
+//! - [`PoolRegistry`]: Registry for pool tracking and `HAProxy`-compatible `show pools` CLI dumps.
+
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::fmt::Write;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::RwLock;
+
+// -----------------------------------------------------------------------------
+// Allocation Counters & Oracle (Item 1)
+// -----------------------------------------------------------------------------
+
+/// Allocation counters snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AllocCounters {
+    pub alloc_count: usize,
+    pub realloc_count: usize,
+    pub dealloc_count: usize,
+    pub bytes_allocated: usize,
+    pub bytes_deallocated: usize,
+}
+
+impl AllocCounters {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            alloc_count: 0,
+            realloc_count: 0,
+            dealloc_count: 0,
+            bytes_allocated: 0,
+            bytes_deallocated: 0,
+        }
+    }
+
+    #[must_use]
+    pub fn bytes_live(&self) -> usize {
+        self.bytes_allocated.saturating_sub(self.bytes_deallocated)
+    }
+
+    #[must_use]
+    pub fn live_allocations(&self) -> usize {
+        self.alloc_count.saturating_sub(self.dealloc_count)
+    }
+
+    #[must_use]
+    pub fn diff(&self, after: &AllocCounters) -> AllocDiff {
+        AllocDiff {
+            alloc_count: after.alloc_count.saturating_sub(self.alloc_count),
+            realloc_count: after.realloc_count.saturating_sub(self.realloc_count),
+            dealloc_count: after.dealloc_count.saturating_sub(self.dealloc_count),
+            bytes_allocated: after.bytes_allocated.saturating_sub(self.bytes_allocated),
+            bytes_deallocated: after.bytes_deallocated.saturating_sub(self.bytes_deallocated),
+        }
+    }
+}
+
+/// Difference between two [`AllocCounters`] snapshots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AllocDiff {
+    pub alloc_count: usize,
+    pub realloc_count: usize,
+    pub dealloc_count: usize,
+    pub bytes_allocated: usize,
+    pub bytes_deallocated: usize,
+}
+
+impl AllocDiff {
+    #[must_use]
+    pub fn net_bytes(&self) -> isize {
+        let alloc = isize::try_from(self.bytes_allocated).unwrap_or(isize::MAX);
+        let dealloc = isize::try_from(self.bytes_deallocated).unwrap_or(isize::MAX);
+        alloc.saturating_sub(dealloc)
+    }
+}
+
+static GLOBAL_ALLOCS: AtomicUsize = AtomicUsize::new(0);
+static GLOBAL_REALLOCS: AtomicUsize = AtomicUsize::new(0);
+static GLOBAL_DEALLOCS: AtomicUsize = AtomicUsize::new(0);
+static GLOBAL_BYTES_ALLOC: AtomicUsize = AtomicUsize::new(0);
+static GLOBAL_BYTES_DEALLOC: AtomicUsize = AtomicUsize::new(0);
+
+/// Global counting allocator wrapping `std::alloc::System`.
+pub struct CountingAllocator {
+    allocs: AtomicUsize,
+    reallocs: AtomicUsize,
+    deallocs: AtomicUsize,
+    bytes_alloc: AtomicUsize,
+    bytes_dealloc: AtomicUsize,
+}
+
+impl Default for CountingAllocator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CountingAllocator {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            allocs: AtomicUsize::new(0),
+            reallocs: AtomicUsize::new(0),
+            deallocs: AtomicUsize::new(0),
+            bytes_alloc: AtomicUsize::new(0),
+            bytes_dealloc: AtomicUsize::new(0),
+        }
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> AllocCounters {
+        AllocCounters {
+            alloc_count: self.allocs.load(Ordering::SeqCst),
+            realloc_count: self.reallocs.load(Ordering::SeqCst),
+            dealloc_count: self.deallocs.load(Ordering::SeqCst),
+            bytes_allocated: self.bytes_alloc.load(Ordering::SeqCst),
+            bytes_deallocated: self.bytes_dealloc.load(Ordering::SeqCst),
+        }
+    }
+
+    pub fn reset(&self) {
+        self.allocs.store(0, Ordering::SeqCst);
+        self.reallocs.store(0, Ordering::SeqCst);
+        self.deallocs.store(0, Ordering::SeqCst);
+        self.bytes_alloc.store(0, Ordering::SeqCst);
+        self.bytes_dealloc.store(0, Ordering::SeqCst);
+    }
+}
+
+#[allow(unsafe_code)]
+unsafe impl GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let ptr = System.alloc(layout);
+        if !ptr.is_null() {
+            let sz = layout.size();
+            self.allocs.fetch_add(1, Ordering::SeqCst);
+            self.bytes_alloc.fetch_add(sz, Ordering::SeqCst);
+            GLOBAL_ALLOCS.fetch_add(1, Ordering::SeqCst);
+            GLOBAL_BYTES_ALLOC.fetch_add(sz, Ordering::SeqCst);
+        }
+        ptr
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        System.dealloc(ptr, layout);
+        let sz = layout.size();
+        self.deallocs.fetch_add(1, Ordering::SeqCst);
+        self.bytes_dealloc.fetch_add(sz, Ordering::SeqCst);
+        GLOBAL_DEALLOCS.fetch_add(1, Ordering::SeqCst);
+        GLOBAL_BYTES_DEALLOC.fetch_add(sz, Ordering::SeqCst);
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let new_ptr = System.realloc(ptr, layout, new_size);
+        if !new_ptr.is_null() {
+            let old_size = layout.size();
+            self.reallocs.fetch_add(1, Ordering::SeqCst);
+            GLOBAL_REALLOCS.fetch_add(1, Ordering::SeqCst);
+            if new_size > old_size {
+                let diff = new_size - old_size;
+                self.bytes_alloc.fetch_add(diff, Ordering::SeqCst);
+                GLOBAL_BYTES_ALLOC.fetch_add(diff, Ordering::SeqCst);
+            } else {
+                let diff = old_size - new_size;
+                self.bytes_dealloc.fetch_add(diff, Ordering::SeqCst);
+                GLOBAL_BYTES_DEALLOC.fetch_add(diff, Ordering::SeqCst);
+            }
+        }
+        new_ptr
+    }
+}
+
+/// Takes a snapshot of the global allocation counters.
+#[must_use]
+pub fn alloc_counters() -> AllocCounters {
+    AllocCounters {
+        alloc_count: GLOBAL_ALLOCS.load(Ordering::SeqCst),
+        realloc_count: GLOBAL_REALLOCS.load(Ordering::SeqCst),
+        dealloc_count: GLOBAL_DEALLOCS.load(Ordering::SeqCst),
+        bytes_allocated: GLOBAL_BYTES_ALLOC.load(Ordering::SeqCst),
+        bytes_deallocated: GLOBAL_BYTES_DEALLOC.load(Ordering::SeqCst),
+    }
+}
+
+/// Resets the global allocation counters.
+pub fn reset_alloc_counters() {
+    GLOBAL_ALLOCS.store(0, Ordering::SeqCst);
+    GLOBAL_REALLOCS.store(0, Ordering::SeqCst);
+    GLOBAL_DEALLOCS.store(0, Ordering::SeqCst);
+    GLOBAL_BYTES_ALLOC.store(0, Ordering::SeqCst);
+    GLOBAL_BYTES_DEALLOC.store(0, Ordering::SeqCst);
+}
+
+// -----------------------------------------------------------------------------
+// Fixed-Size Object Pools (Item 2)
+// -----------------------------------------------------------------------------
+
+/// Metadata and runtime usage statistics for a memory pool.
+///
+/// Matches the fields displayed by `HAProxy`'s `show pools`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolHead {
+    pub name: &'static str,
+    pub size: usize,
+    pub align: usize,
+    pub allocated: usize,
+    pub alloc_bytes: usize,
+    pub used: usize,
+    pub cached: usize,
+    pub needed_avg: usize,
+    pub failures: usize,
+    pub users: usize,
+}
+
+/// Provider function returning current [`PoolHead`] stats for a pool.
+pub type PoolStatsFn = fn() -> Option<PoolHead>;
+
+/// Registry of active memory pools in the runtime.
+///
+/// Decoupled from the data path: does not perform lock acquisitions or heap allocations
+/// during buffer take or return. Pools register atomic stats providers, and [`dump_pools_info`]
+/// queries them on-demand when `show pools` is invoked.
+pub struct PoolRegistry {
+    providers: RwLock<Vec<(&'static str, PoolStatsFn)>>,
+}
+
+impl Default for PoolRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PoolRegistry {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            providers: RwLock::new(Vec::new()),
+        }
+    }
+
+    /// Registers a pool stats provider.
+    pub fn register_provider(&self, name: &'static str, provider: PoolStatsFn) {
+        if let Ok(mut list) = self.providers.write() {
+            if let Some(pos) = list.iter().position(|(n, _)| *n == name) {
+                list[pos] = (name, provider);
+            } else {
+                list.push((name, provider));
+            }
+        }
+    }
+
+    /// Unregisters a pool stats provider.
+    pub fn unregister_provider(&self, name: &'static str) {
+        if let Ok(mut list) = self.providers.write() {
+            list.retain(|(n, _)| *n != name);
+        }
+    }
+
+    /// Clears all registered providers.
+    pub fn clear(&self) {
+        if let Ok(mut list) = self.providers.write() {
+            list.clear();
+        }
+    }
+
+    /// Dumps all pools in `HAProxy`-compatible `show pools` format.
+    #[must_use]
+    pub fn dump_pools_info(&self) -> String {
+        let providers: Vec<PoolStatsFn> = self
+            .providers
+            .read()
+            .map(|list| list.iter().map(|(_, f)| *f).collect())
+            .unwrap_or_default();
+
+        let mut out = String::new();
+        out.push_str("Dumping pools usage. Use SIGQUIT to flush them.\n");
+
+        let mut total_alloc_bytes: u64 = 0;
+        let mut total_used_bytes: u64 = 0;
+        let mut total_cached_bytes: u64 = 0;
+        let mut count = 0;
+
+        for provider in providers {
+            let Some(p) = provider() else {
+                continue;
+            };
+            count += 1;
+            let alloc_bytes = p.alloc_bytes as u64;
+            let used_bytes = (p.used * p.size) as u64;
+            let cached_bytes = (p.cached * p.size) as u64;
+            total_alloc_bytes += alloc_bytes;
+            total_used_bytes += used_bytes;
+            total_cached_bytes += cached_bytes;
+
+            let ptr_val = p.name.as_ptr() as usize;
+            let _ = writeln!(
+                out,
+                "  - Pool {} ({} bytes) : {} allocated ({} bytes), {} used (~{} by thread caches), needed_avg {}, {} failures, {} users, @0x{:x} [SHARED]",
+                p.name,
+                p.size,
+                p.allocated,
+                alloc_bytes,
+                p.used,
+                p.cached,
+                p.needed_avg,
+                p.failures,
+                p.users,
+                ptr_val,
+            );
+        }
+
+        let _ = writeln!(
+            out,
+            "Total: {count} pools, {total_alloc_bytes} bytes allocated, \
+             {total_used_bytes} used (~{total_cached_bytes} by thread caches)."
+        );
+
+        out
+    }
+}
+
+static GLOBAL_REGISTRY: PoolRegistry = PoolRegistry::new();
+
+/// Returns a reference to the global pool registry.
+#[must_use]
+pub fn global_pool_registry() -> &'static PoolRegistry {
+    &GLOBAL_REGISTRY
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_alloc_counters_snapshot_and_diff() {
+        let before = AllocCounters {
+            alloc_count: 10,
+            realloc_count: 2,
+            dealloc_count: 5,
+            bytes_allocated: 1000,
+            bytes_deallocated: 400,
+        };
+        let after = AllocCounters {
+            alloc_count: 15,
+            realloc_count: 3,
+            dealloc_count: 9,
+            bytes_allocated: 1600,
+            bytes_deallocated: 800,
+        };
+        let diff = before.diff(&after);
+        assert_eq!(diff.alloc_count, 5);
+        assert_eq!(diff.realloc_count, 1);
+        assert_eq!(diff.dealloc_count, 4);
+        assert_eq!(diff.bytes_allocated, 600);
+        assert_eq!(diff.bytes_deallocated, 400);
+        assert_eq!(diff.net_bytes(), 200);
+    }
+
+    // Signature is fixed by `register_provider`, which takes a provider that may report
+    // nothing; this one always can, hence the lint.
+    #[allow(clippy::unnecessary_wraps)]
+    fn sample_buffer_stats() -> Option<PoolHead> {
+        Some(PoolHead {
+            name: "buffer",
+            size: 16384,
+            align: 8,
+            allocated: 67,
+            alloc_bytes: 1_097_728,
+            used: 67,
+            cached: 0,
+            needed_avg: 12,
+            failures: 0,
+            users: 1,
+        })
+    }
+
+    #[test]
+    fn test_pool_registry_and_show_pools_output() {
+        let registry = PoolRegistry::new();
+        registry.register_provider("buffer", sample_buffer_stats);
+
+        let dump = registry.dump_pools_info();
+        assert!(dump.starts_with("Dumping pools usage. Use SIGQUIT to flush them.\n"));
+        assert!(dump.contains("- Pool buffer (16384 bytes) : 67 allocated (1097728 bytes), 67 used"));
+        assert!(dump.contains("Total: 1 pools, 1097728 bytes allocated, 1097728 used"));
+    }
+}

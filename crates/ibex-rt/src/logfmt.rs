@@ -195,6 +195,7 @@ impl LogFormat {
     /// A field with no value becomes `-`, as `HAProxy` does. An empty string and a
     /// missing value are different things to a log parser, and collapsing them loses
     /// the distinction.
+    /// Renders the line into a newly-allocated `String`.
     #[must_use]
     pub fn render(
         &self,
@@ -204,21 +205,33 @@ impl LogFormat {
         names: &LogNames,
     ) -> String {
         let mut out = String::with_capacity(160);
+        self.render_into(&mut out, registry, ctx, vars, names);
+        out
+    }
+
+    /// Renders the line into an existing scratch buffer without intermediate allocations.
+    pub fn render_into(
+        &self,
+        out: &mut String,
+        registry: &Registry,
+        ctx: &SampleContext,
+        vars: &LogVars,
+        names: &LogNames,
+    ) {
         for seg in &self.segments {
             match seg {
                 Segment::Literal(s) => out.push_str(s),
-                Segment::Alias(a) => out.push_str(&render_alias(*a, ctx, vars, names)),
+                Segment::Alias(a) => write_alias(out, *a, ctx, vars, names),
                 Segment::Expr(e) => match e.eval_sample(registry, ctx) {
-                    Some(s) => out.push_str(&sample_to_log_string(&s)),
+                    Some(s) => write_sample_to_log(out, &s),
                     None => out.push('-'),
                 },
             }
         }
-        out
     }
 
     /// Number of compiled segments. Useful in tests to confirm a format actually
-    /// parsed into expressions rather than collapsing to one literal.
+    /// parsed rather than falling through to a literal.
     #[must_use]
     pub fn segment_count(&self) -> usize {
         self.segments.len()
@@ -274,45 +287,90 @@ fn match_alias(rest: &str) -> Option<(Alias, usize)> {
     None
 }
 
-fn render_alias(a: Alias, ctx: &SampleContext, v: &LogVars, n: &LogNames) -> String {
-    let dash = || "-".to_string();
+fn write_alias(out: &mut String, a: Alias, ctx: &SampleContext, v: &LogVars, n: &LogNames) {
+    use std::fmt::Write;
     match a {
-        Alias::ClientIp => ctx.client_addr.map_or_else(dash, |s| s.ip().to_string()),
-        Alias::ClientPort => ctx.client_addr.map_or_else(dash, |s| s.port().to_string()),
-        Alias::FrontendName => n.frontend.map_or_else(dash, ToString::to_string),
-        Alias::BackendName => n.backend.map_or_else(dash, ToString::to_string),
-        Alias::ServerName => n.server.map_or_else(dash, ToString::to_string),
-        Alias::Status => v.status.to_string(),
-        Alias::BytesOut => v.bytes_out.to_string(),
-        Alias::BytesIn => v.bytes_in.to_string(),
-        Alias::TotalMs => v.total_ms.to_string(),
-        Alias::ActiveMs => v.active_ms.to_string(),
-        Alias::ResponseMs => v.response_ms.to_string(),
-        Alias::QueueMs => v.queue_ms.to_string(),
-        Alias::ConnectMs => v.connect_ms.to_string(),
-        Alias::ActConn => v.act_conn.to_string(),
-        Alias::Retries => v.retries.to_string(),
-        Alias::Method => ctx.req_method.map_or_else(dash, ToString::to_string),
-        Alias::Path => ctx.req_uri.map_or_else(dash, ToString::to_string),
-        Alias::Version => "HTTP/1.1".to_string(),
+        Alias::ClientIp => {
+            if let Some(s) = ctx.client_addr {
+                let _ = write!(out, "{}", s.ip());
+            } else {
+                out.push('-');
+            }
+        }
+        Alias::ClientPort => {
+            if let Some(s) = ctx.client_addr {
+                let _ = write!(out, "{}", s.port());
+            } else {
+                out.push('-');
+            }
+        }
+        Alias::FrontendName => out.push_str(n.frontend.unwrap_or("-")),
+        Alias::BackendName => out.push_str(n.backend.unwrap_or("-")),
+        Alias::ServerName => out.push_str(n.server.unwrap_or("-")),
+        Alias::Status => {
+            let _ = write!(out, "{}", v.status);
+        }
+        Alias::BytesOut => {
+            let _ = write!(out, "{}", v.bytes_out);
+        }
+        Alias::BytesIn => {
+            let _ = write!(out, "{}", v.bytes_in);
+        }
+        Alias::TotalMs => {
+            let _ = write!(out, "{}", v.total_ms);
+        }
+        Alias::ActiveMs => {
+            let _ = write!(out, "{}", v.active_ms);
+        }
+        Alias::ResponseMs => {
+            let _ = write!(out, "{}", v.response_ms);
+        }
+        Alias::QueueMs => {
+            let _ = write!(out, "{}", v.queue_ms);
+        }
+        Alias::ConnectMs => {
+            let _ = write!(out, "{}", v.connect_ms);
+        }
+        Alias::ActConn => {
+            let _ = write!(out, "{}", v.act_conn);
+        }
+        Alias::Retries => {
+            let _ = write!(out, "{}", v.retries);
+        }
+        Alias::Method => out.push_str(ctx.req_method.unwrap_or("-")),
+        Alias::Path => out.push_str(ctx.req_uri.unwrap_or("-")),
+        Alias::Version => out.push_str("HTTP/1.1"),
     }
 }
 
-fn sample_to_log_string(s: &ibex_sample::Sample) -> String {
+fn write_sample_to_log(out: &mut String, s: &ibex_sample::Sample) {
+    use std::fmt::Write;
     use ibex_sample::Sample;
     match s {
         Sample::Str(v) => {
             if v.is_empty() {
-                "-".to_string()
+                out.push('-');
             } else {
-                v.clone()
+                out.push_str(v);
             }
         }
-        Sample::Sint(v) => v.to_string(),
-        Sample::Bool(v) => i32::from(*v).to_string(),
-        Sample::Ipv4(v) => v.to_string(),
-        Sample::Ipv6(v) => v.to_string(),
-        Sample::Bin(v) => format!("{}", v.len()),
-        Sample::Meth(v) => format!("{v:?}"),
+        Sample::Sint(v) => {
+            let _ = write!(out, "{v}");
+        }
+        Sample::Bool(v) => {
+            let _ = write!(out, "{}", i32::from(*v));
+        }
+        Sample::Ipv4(v) => {
+            let _ = write!(out, "{v}");
+        }
+        Sample::Ipv6(v) => {
+            let _ = write!(out, "{v}");
+        }
+        Sample::Bin(v) => {
+            let _ = write!(out, "{}", v.len());
+        }
+        Sample::Meth(v) => {
+            let _ = write!(out, "{v:?}");
+        }
     }
 }

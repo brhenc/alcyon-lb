@@ -11,6 +11,7 @@ ibex-proto = { path = "../ibex-proto" }
 ibex-config = { path = "../ibex-config" }
 ibex-sample = { path = "../ibex-sample" }
 ibex-tls = { path = "../ibex-tls" }
+ibex-alloc = { workspace = true }
 rustls = { workspace = true }
 ibex-stick-table = { path = "../ibex-stick-table" }
 rustix = { version = "0.38", features = ["event", "net", "fs", "process", "std"] }

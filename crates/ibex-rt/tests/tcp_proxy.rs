@@ -8,7 +8,8 @@
 
 use ibex_config::ast::{
     BackendSection, Config, FrontendSection, Mode, Server, StickTableConfigAst,
-    TcpReqContentAction, TcpReqContentRule, TcpReqSessionAction, TcpReqSessionRule,
+    TcpReqConnAction, TcpReqConnRule, TcpReqContentAction, TcpReqContentRule,
+    TcpReqSessionAction, TcpReqSessionRule,
 };
 use ibex_rt::engine::Engine;
 use ibex_rt::proxy::{Ending, TcpSession, Timeouts};
@@ -797,5 +798,374 @@ fn test_threshold_padding_lengths_around_pattern_size() {
         be.requests()
     );
     let _ = std::fs::remove_file(&cfg);
+}
+
+#[test]
+fn test_tcp_request_connection_reject_and_silent_drop() {
+    // 1. Connection reject
+    let fe_addr1 = free_addr();
+    let config_reject = Config {
+        frontends: vec![FrontendSection {
+            name: "fe_conn_reject".into(),
+            bind: Some(fe_addr1),
+            mode: Mode::Tcp,
+            clitimeout: Some(Duration::from_secs(3)),
+            tcp_req_conn_rules: vec![TcpReqConnRule {
+                action: TcpReqConnAction::Reject,
+                cond: None,
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let mut engine = Engine::new(&config_reject, 64).expect("Engine::new");
+    let client = TcpStream::connect(fe_addr1).expect("connect");
+    drop(client);
+    for _ in 0..5 {
+        let _ = engine.run_once();
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        engine.proxies[0].stats.denied_conn, 1,
+        "tcp-request connection reject must increment denied_conn"
+    );
+
+    // 2. Connection silent-drop
+    let fe_addr2 = free_addr();
+    let config_drop = Config {
+        frontends: vec![FrontendSection {
+            name: "fe_conn_drop".into(),
+            bind: Some(fe_addr2),
+            mode: Mode::Tcp,
+            clitimeout: Some(Duration::from_secs(3)),
+            tcp_req_conn_rules: vec![TcpReqConnRule {
+                action: TcpReqConnAction::SilentDrop,
+                cond: None,
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let mut engine2 = Engine::new(&config_drop, 64).expect("Engine::new");
+    let client2 = TcpStream::connect(fe_addr2).expect("connect");
+    drop(client2);
+    for _ in 0..5 {
+        let _ = engine2.run_once();
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        engine2.proxies[0].stats.denied_conn, 1,
+        "tcp-request connection silent-drop must increment denied_conn"
+    );
+}
+
+#[test]
+fn test_tcp_request_session_reject_and_silent_drop() {
+    // 1. Session reject
+    let fe_addr1 = free_addr();
+    let config_reject = Config {
+        frontends: vec![FrontendSection {
+            name: "fe_sess_reject".into(),
+            bind: Some(fe_addr1),
+            mode: Mode::Tcp,
+            clitimeout: Some(Duration::from_secs(3)),
+            tcp_req_session_rules: vec![TcpReqSessionRule {
+                action: TcpReqSessionAction::Reject,
+                cond: None,
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let mut engine = Engine::new(&config_reject, 64).expect("Engine::new");
+    let client = TcpStream::connect(fe_addr1).expect("connect");
+    drop(client);
+    for _ in 0..5 {
+        let _ = engine.run_once();
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        engine.proxies[0].stats.denied_req, 1,
+        "tcp-request session reject must increment denied_req"
+    );
+
+    // 2. Session silent-drop
+    let fe_addr2 = free_addr();
+    let config_drop = Config {
+        frontends: vec![FrontendSection {
+            name: "fe_sess_drop".into(),
+            bind: Some(fe_addr2),
+            mode: Mode::Tcp,
+            clitimeout: Some(Duration::from_secs(3)),
+            tcp_req_session_rules: vec![TcpReqSessionRule {
+                action: TcpReqSessionAction::SilentDrop,
+                cond: None,
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let mut engine2 = Engine::new(&config_drop, 64).expect("Engine::new");
+    let client2 = TcpStream::connect(fe_addr2).expect("connect");
+    drop(client2);
+    for _ in 0..5 {
+        let _ = engine2.run_once();
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        engine2.proxies[0].stats.denied_req, 1,
+        "tcp-request session silent-drop must increment denied_req"
+    );
+}
+
+#[test]
+fn test_tcp_request_content_reject_and_silent_drop() {
+    // 1. Content reject
+    let fe_addr1 = free_addr();
+    let config_reject = Config {
+        frontends: vec![FrontendSection {
+            name: "fe_cnt_reject".into(),
+            bind: Some(fe_addr1),
+            mode: Mode::Tcp,
+            clitimeout: Some(Duration::from_secs(3)),
+            tcp_req_inspect_delay: Some(Duration::from_millis(500)),
+            tcp_req_content_rules: vec![TcpReqContentRule {
+                action: TcpReqContentAction::Reject,
+                cond: None,
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let mut engine = Engine::new(&config_reject, 64).expect("Engine::new");
+    let mut client = TcpStream::connect(fe_addr1).expect("connect");
+    let _ = client.write_all(b"HELLO");
+    for _ in 0..5 {
+        let _ = engine.run_once();
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        engine.proxies[0].stats.denied_req, 1,
+        "tcp-request content reject must increment denied_req"
+    );
+
+    // 2. Content silent-drop
+    let fe_addr2 = free_addr();
+    let config_drop = Config {
+        frontends: vec![FrontendSection {
+            name: "fe_cnt_drop".into(),
+            bind: Some(fe_addr2),
+            mode: Mode::Tcp,
+            clitimeout: Some(Duration::from_secs(3)),
+            tcp_req_inspect_delay: Some(Duration::from_millis(500)),
+            tcp_req_content_rules: vec![TcpReqContentRule {
+                action: TcpReqContentAction::SilentDrop,
+                cond: None,
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let mut engine2 = Engine::new(&config_drop, 64).expect("Engine::new");
+    let mut client2 = TcpStream::connect(fe_addr2).expect("connect");
+    let _ = client2.write_all(b"HELLO");
+    for _ in 0..5 {
+        let _ = engine2.run_once();
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        engine2.proxies[0].stats.denied_req, 1,
+        "tcp-request content silent-drop must increment denied_req"
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn test_header_size_boundary_against_bufsize_minus_maxrewrite() {
+    let (srv_listener, srv_addr) = {
+        let l = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let a = l.local_addr().expect("local_addr");
+        (l, a)
+    };
+    let fe_addr = free_addr();
+
+    let backend_seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let backend_seen_clone = Arc::clone(&backend_seen);
+    let response_mode = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let response_mode_clone = Arc::clone(&response_mode);
+    let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let running_clone = Arc::clone(&running);
+
+    let _srv_thread = thread::spawn(move || {
+        srv_listener.set_nonblocking(true).ok();
+        while running_clone.load(std::sync::atomic::Ordering::Relaxed) {
+            if let Ok((mut stream, _)) = srv_listener.accept() {
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 1024];
+                while let Ok(n) = stream.read(&mut tmp) {
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                backend_seen_clone.lock().unwrap().push(buf);
+
+                let mode = response_mode_clone.load(std::sync::atomic::Ordering::Relaxed);
+                let resp_body = match mode {
+                    1 => {
+                        // Response below threshold: 3071 bytes header
+                        let pad_len = 3071 - 19 - 11;
+                        let pad = "X".repeat(pad_len);
+                        format!("HTTP/1.1 200 OK\r\nX-Padding: {pad}\r\n\r\nOK").into_bytes()
+                    }
+                    2 => {
+                        // Response at threshold: 3072 bytes header
+                        let pad_len = 3072 - 19 - 11;
+                        let pad = "X".repeat(pad_len);
+                        format!("HTTP/1.1 200 OK\r\nX-Padding: {pad}\r\n\r\nOK").into_bytes()
+                    }
+                    3 => {
+                        // Response above threshold: 3073 bytes header
+                        let pad_len = 3073 - 19 - 11;
+                        let pad = "X".repeat(pad_len);
+                        format!("HTTP/1.1 200 OK\r\nX-Padding: {pad}\r\n\r\nOK").into_bytes()
+                    }
+                    _ => b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK".to_vec(),
+                };
+                let _ = stream.write_all(&resp_body);
+                let _ = stream.flush();
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    });
+
+    let config = Config {
+        global: Some(ibex_config::ast::GlobalSection {
+            bufsize: Some(4096),
+            maxrewrite: Some(1024),
+            ..Default::default()
+        }),
+        frontends: vec![FrontendSection {
+            name: "fe_thresh".into(),
+            bind: Some(fe_addr),
+            mode: Mode::Http,
+            default_backend: Some("be_thresh".into()),
+            clitimeout: Some(Duration::from_secs(5)),
+            ..Default::default()
+        }],
+        backends: vec![BackendSection {
+            name: "be_thresh".into(),
+            mode: Mode::Http,
+            contimeout: Some(Duration::from_secs(5)),
+            srvtimeout: Some(Duration::from_secs(5)),
+            servers: vec![Server::new("s1", srv_addr)],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let mut engine = Engine::new(&config, 64).expect("Engine::new");
+
+    let drive_req = |eng: &mut Engine, req: &[u8]| -> String {
+        let mut client = TcpStream::connect(fe_addr).expect("connect to fe");
+        client.set_nonblocking(true).expect("set_nonblocking");
+        client.write_all(req).expect("write req");
+
+        let start = Instant::now();
+        let mut response = Vec::new();
+        let mut tmp = [0u8; 1024];
+        while start.elapsed() < Duration::from_secs(2) {
+            let _ = eng.run_once();
+            if let Ok(n) = client.read(&mut tmp) {
+                if n > 0 {
+                    response.extend_from_slice(&tmp[..n]);
+                    if response.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        for _ in 0..5 {
+            let _ = eng.run_once();
+            thread::sleep(Duration::from_millis(1));
+        }
+        String::from_utf8_lossy(&response).into_owned()
+    };
+
+    // 1. Request below threshold: 3071 bytes
+    // Fixed: GET / HTTP/1.1\r\n (16) + X-Padding:  (11) + \r\n\r\n (4) = 31 bytes
+    let pad_below = "A".repeat(3071 - 31);
+    let req_below = format!("GET / HTTP/1.1\r\nX-Padding: {pad_below}\r\n\r\n").into_bytes();
+    assert_eq!(req_below.len(), 3071);
+    let resp1 = drive_req(&mut engine, &req_below);
+    assert!(
+        resp1.starts_with("HTTP/1.1 200 OK"),
+        "below threshold must succeed with 200 OK, got: {resp1}"
+    );
+    assert_eq!(
+        backend_seen.lock().unwrap().len(),
+        1,
+        "backend must have received below-threshold request"
+    );
+
+    // 2. Request at threshold: 3072 bytes
+    let pad_at = "B".repeat(3072 - 31);
+    let req_at = format!("GET / HTTP/1.1\r\nX-Padding: {pad_at}\r\n\r\n").into_bytes();
+    assert_eq!(req_at.len(), 3072);
+    let resp2 = drive_req(&mut engine, &req_at);
+    assert!(
+        resp2.starts_with("HTTP/1.1 200 OK"),
+        "at threshold must succeed with 200 OK, got: {resp2}"
+    );
+    assert_eq!(
+        backend_seen.lock().unwrap().len(),
+        2,
+        "backend must have received at-threshold request"
+    );
+
+    // 3. Request above threshold: 3073 bytes
+    let pad_above = "C".repeat(3073 - 31);
+    let req_above = format!("GET / HTTP/1.1\r\nX-Padding: {pad_above}\r\n\r\n").into_bytes();
+    assert_eq!(req_above.len(), 3073);
+    let resp3 = drive_req(&mut engine, &req_above);
+    assert!(
+        resp3.starts_with("HTTP/1.1 400 Bad Request"),
+        "above threshold must produce 400 Bad Request, got: {resp3}"
+    );
+    assert_eq!(
+        backend_seen.lock().unwrap().len(),
+        2,
+        "backend must NOT receive above-threshold request"
+    );
+
+    // 4. Response below threshold (3071 bytes header)
+    response_mode.store(1, std::sync::atomic::Ordering::Relaxed);
+    let resp4 = drive_req(&mut engine, b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    assert!(
+        resp4.starts_with("HTTP/1.1 200 OK"),
+        "response below threshold must succeed, got: {resp4}"
+    );
+
+    // 5. Response at threshold (3072 bytes header)
+    response_mode.store(2, std::sync::atomic::Ordering::Relaxed);
+    let resp5 = drive_req(&mut engine, b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    assert!(
+        resp5.starts_with("HTTP/1.1 200 OK"),
+        "response at threshold must succeed, got: {resp5}"
+    );
+
+    // 6. Response above threshold (3073 bytes header) -> 502 Bad Gateway
+    response_mode.store(3, std::sync::atomic::Ordering::Relaxed);
+    let resp6 = drive_req(&mut engine, b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    assert!(
+        resp6.starts_with("HTTP/1.1 502 Bad Gateway"),
+        "response above threshold must produce 502 Bad Gateway, got: {resp6}"
+    );
+
+    running.store(false, std::sync::atomic::Ordering::Relaxed);
 }
 

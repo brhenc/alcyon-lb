@@ -713,3 +713,35 @@ fn test_unsupported_actions_refusal() {
     }
 }
 
+#[test]
+fn test_tune_bufsize_validation() {
+    // 1. tune.bufsize >= 256 MB (268435456) must be refused
+    let cfg_too_large = "global\n    tune.bufsize 268435456\n";
+    let res = parse_config(cfg_too_large);
+    assert!(res.is_err(), "tune.bufsize >= 256MB must be refused");
+    assert!(
+        res.unwrap_err().message.contains("268435456"),
+        "error must name the 268435456 limit"
+    );
+
+    // 2. tune.bufsize below 16384 with HTTP/2 configured must be refused
+    let cfg_h2_small_buf = "global\n    tune.bufsize 8192\nfrontend fe\n    bind :8080 proto h2\n";
+    let res_h2 = parse_config(cfg_h2_small_buf);
+    assert!(
+        res_h2.is_err(),
+        "tune.bufsize < 16384 with HTTP/2 must be refused"
+    );
+    assert!(
+        res_h2.unwrap_err().message.contains("16384"),
+        "error must name 16384 minimum limit when HTTP/2 is configured"
+    );
+
+    // 3. Rounding is applied: 16385 rounds up to next multiple of 16 (16400)
+    let cfg_rounding = "global\n    tune.bufsize 16385\n    tune.bufsize.small 1025\n    tune.bufsize.large 65537\n";
+    let parsed = parse_config(cfg_rounding).expect("parse valid tune.bufsize with rounding");
+    let g = parsed.global.expect("global section present");
+    assert_eq!(g.bufsize, Some(16400), "tune.bufsize must be rounded up to multiple of 16");
+    assert_eq!(g.bufsize_small, Some(1040), "tune.bufsize.small must be rounded up to multiple of 16");
+    assert_eq!(g.bufsize_large, Some(65552), "tune.bufsize.large must be rounded up to multiple of 16");
+}
+

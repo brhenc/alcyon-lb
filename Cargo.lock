@@ -142,6 +142,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ibex-alloc"
+version = "0.1.0"
+
+[[package]]
 name = "ibex-config"
 version = "0.1.0"
 dependencies = [
@@ -162,6 +166,7 @@ dependencies = [
 name = "ibex-rt"
 version = "0.1.0"
 dependencies = [
+ "ibex-alloc",
  "ibex-config",
  "ibex-proto",
  "ibex-sample",

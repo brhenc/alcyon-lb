@@ -276,8 +276,9 @@ fn write_frontend_row(out: &mut String, proxy: &Proxy, pid: u32, iid: usize) {
     r.set("stot", proxy.stats.cum_conn);
     r.set("bin", proxy.stats.bytes_in);
     r.set("bout", proxy.stats.bytes_out);
-    r.set("dreq", 0);
-    r.set("dresp", 0);
+    r.set("dreq", proxy.stats.denied_req);
+    r.set("dresp", proxy.stats.denied_resp);
+    r.set("dcon", proxy.stats.denied_conn);
     r.set("ereq", 0);
     r.set("status", "OPEN");
     r.set("act", 1);
@@ -376,6 +377,8 @@ fn write_backend_row(out: &mut String, proxy: &Proxy, pid: u32, iid: usize) {
     r.set("stot", proxy.stats.cum_conn);
     r.set("bin", proxy.stats.bytes_in);
     r.set("bout", proxy.stats.bytes_out);
+    r.set("dreq", proxy.stats.denied_req);
+    r.set("dresp", proxy.stats.denied_resp);
     r.set("status", "UP");
     r.set("weight", 1);
     r.set("act", 1);

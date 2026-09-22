@@ -35,9 +35,6 @@ use std::net::SocketAddr;
 use std::os::fd::{AsFd, OwnedFd};
 use std::time::Instant;
 
-/// Default per-direction buffer. `HAProxy` 1.0 used `BUFSIZE` 8192.
-pub const BUFSIZE: usize = 16 * 1024;
-
 /// Why a session ended. Reported to logs and to `show sess`.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Ending {
@@ -145,6 +142,8 @@ pub struct TcpSession {
     pub sess_vars: HashMap<String, String>,
     pub req_vars: HashMap<String, String>,
     pub tracked_sc: [Option<(usize, StickKey)>; 3],
+    pub bufsize: usize,
+    pub maxrewrite: usize,
 }
 
 impl TcpSession {
@@ -195,8 +194,8 @@ impl TcpSession {
             req_headers: None,
             cli_state,
             srv_state: ScState::Init,
-            req: Buf::with_capacity(BUFSIZE),
-            rep: Buf::with_capacity(BUFSIZE),
+            req: Buf::standard(),
+            rep: Buf::standard(),
             timeouts,
             conn_retries: retries,
             retry_after: Tick::ETERNITY,
@@ -214,6 +213,8 @@ impl TcpSession {
             send_proxy_prepended: false,
             resp_headers_processed: false,
             created_at: Instant::now(),
+            bufsize: crate::buf::get_bufsize(),
+            maxrewrite: 1024,
             http_res_rules: Vec::new(),
             http_after_res_rules: Vec::new(),
             acls: HashMap::new(),
@@ -492,8 +493,17 @@ impl TcpSession {
 
         // Parse HTTP request headers if in Ready state
         if self.cli_state == ScState::Ready {
+            let threshold = self.bufsize.saturating_sub(self.maxrewrite);
             if let Some((hdr_len, eoh_len)) = find_eoh(self.req.readable()) {
                 let total_hdr_len = hdr_len + eoh_len;
+
+                // Enforce tune.bufsize - tune.maxrewrite limit: headers exceeding threshold produce 400
+                if total_hdr_len > threshold {
+                    self.send_synthetic_response(400, Some("text/html"), None);
+                    self.cli_state = ScState::ShutR;
+                    self.ending.get_or_insert(Ending::Error);
+                    return Ok(true);
+                }
 
                 // Validate the head through the selected parser before anything below
                 // reads it.
@@ -567,6 +577,11 @@ impl TcpSession {
 
                 self.cli_state = ScState::Established;
                 changed = true;
+            } else if self.req.readable().len() > threshold {
+                self.send_synthetic_response(400, Some("text/html"), None);
+                self.cli_state = ScState::ShutR;
+                self.ending.get_or_insert(Ending::Error);
+                return Ok(true);
             }
         }
 
@@ -708,8 +723,20 @@ impl TcpSession {
 
         // Parse HTTP response headers if in Ready state
         if self.srv_state == ScState::Ready {
+            let threshold = self.bufsize.saturating_sub(self.maxrewrite);
             if let Some((hdr_len, eoh_len)) = find_eoh(self.rep.readable()) {
                 let total_hdr_len = hdr_len + eoh_len;
+
+                // Enforce tune.bufsize - tune.maxrewrite limit: headers exceeding threshold produce 502
+                if total_hdr_len > threshold {
+                    self.rep.clear();
+                    self.send_synthetic_response(502, Some("text/html"), None);
+                    self.srv_state = ScState::Closed;
+                    self.cli_state = ScState::Established;
+                    self.ending.get_or_insert(Ending::Error);
+                    return Ok(true);
+                }
+
                 let hdr_bytes = &self.rep.readable()[..total_hdr_len];
                 let mut hdr_str = String::from_utf8_lossy(hdr_bytes).to_string();
 
@@ -725,6 +752,13 @@ impl TcpSession {
                 self.srv_state = ScState::Established;
                 self.resp_headers_processed = true;
                 changed_io = true;
+            } else if self.rep.readable().len() > threshold {
+                self.rep.clear();
+                self.send_synthetic_response(502, Some("text/html"), None);
+                self.srv_state = ScState::Closed;
+                self.cli_state = ScState::Established;
+                self.ending.get_or_insert(Ending::Error);
+                return Ok(true);
             }
         }
 

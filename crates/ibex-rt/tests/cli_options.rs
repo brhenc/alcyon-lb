@@ -530,3 +530,25 @@ frontend fe
         );
     }
 }
+
+#[test]
+fn test_extended_version_does_not_advertise_unreachable_h2() {
+    let out_vv = Command::new(IBEX_BIN)
+        .arg("-vv")
+        .output()
+        .expect("Failed to execute ibex -vv");
+    assert!(out_vv.status.success(), "-vv should exit with code 0");
+    let stdout_vv = String::from_utf8_lossy(&out_vv.stdout);
+    assert!(
+        !stdout_vv.contains("+H2"),
+        "-vv must not advertise +H2 while H2 is unreachable from daemon"
+    );
+    assert!(
+        stdout_vv.contains("-H2"),
+        "-vv should explicitly state -H2"
+    );
+    assert!(
+        !stdout_vv.contains("mux=H2"),
+        "-vv must not list H2 in available multiplexers while unreachable"
+    );
+}

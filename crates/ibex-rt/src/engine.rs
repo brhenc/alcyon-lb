@@ -87,6 +87,7 @@ pub struct ProxyStats {
     pub srv_err: u64,
     pub cli_err: u64,
     pub denied_conn: u64,
+    pub denied_req: u64,
     pub denied_resp: u64,
 }
 
@@ -103,6 +104,7 @@ impl ProxyStats {
         self.srv_err = 0;
         self.cli_err = 0;
         self.denied_conn = 0;
+        self.denied_req = 0;
         self.denied_resp = 0;
     }
 }
@@ -400,6 +402,11 @@ pub struct Engine {
     log_tag: String,
     /// Value for the syslog HOSTNAME field.
     log_hostname: String,
+    /// Global `tune.bufsize` value, stored per-engine to avoid races in tests that run
+    /// multiple engines in the same process against the global `BUFSIZE_STANDARD` atomic.
+    global_bufsize: usize,
+    /// Global `tune.maxrewrite` value, stored per-engine for the same reason.
+    global_maxrewrite: usize,
 }
 
 impl Drop for Engine {
@@ -966,6 +973,7 @@ impl Engine {
     ///
     /// # Errors
     /// Returns an error if epoll creation or binding any listener fails.
+    #[allow(clippy::too_many_lines)]
     pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         let poller = Poller::new(capacity)?;
         let mut scheduler = Scheduler::with_capacity(capacity);
@@ -974,6 +982,13 @@ impl Engine {
         let applets = AppletArena::with_capacity(capacity);
 
         init_global_vars(config.global.as_ref());
+        let bufsize = config.global.as_ref().and_then(|g| g.bufsize).unwrap_or(16384);
+        let bufsize_small = config.global.as_ref().and_then(|g| g.bufsize_small).unwrap_or(1024);
+        let bufsize_large = config.global.as_ref().and_then(|g| g.bufsize_large);
+        crate::buf::init_buffer_sizes(bufsize, bufsize_small, bufsize_large);
+        if bufsize_large.is_some() {
+            crate::buf::preallocate_large_buffers();
+        }
 
         let mut listeners = Vec::new();
         let mut proxies = Vec::new();
@@ -1084,6 +1099,12 @@ impl Engine {
             log_targets,
             log_tag: "haproxy".to_string(),
             log_hostname: hostname(),
+            global_bufsize: bufsize,
+            global_maxrewrite: config
+                .global
+                .as_ref()
+                .and_then(|g| g.maxrewrite)
+                .unwrap_or(1024),
         })
     }
 
@@ -1456,23 +1477,40 @@ impl Engine {
             let listener_addr = self.listeners[l_idx].addr();
             let local_addr = listener_addr;
 
-            let Some((client_addr, server_addr, fc_src, fc_dst)) = eval_tcp_req_conn_rules(
+            let (client_addr, server_addr, fc_src, fc_dst) = match eval_tcp_req_conn_rules(
                 &self.proxies[proxy_idx],
                 sample_registry(),
                 peer_addr,
                 local_addr,
                 sc_conn_rates,
-            ) else {
-                self.proxies[proxy_idx].stats.denied_conn += 1;
-                for (t_idx, ref key) in tracked_sc.iter().flatten() {
-                    if let Some(ref tbl) = self.proxies[*t_idx].stick_table {
-                        let _ = tbl.update_entry(key, |data| {
-                            data.conn_cur = data.conn_cur.saturating_sub(1);
-                        });
+            ) {
+                ConnEvalOutcome::Accept(c, s, fs, fd) => (c, s, fs, fd),
+                ConnEvalOutcome::Reject => {
+                    raw::abort_with_rst(cli_fd.as_fd());
+                    self.proxies[proxy_idx].stats.denied_conn += 1;
+                    for (t_idx, ref key) in tracked_sc.iter().flatten() {
+                        if let Some(ref tbl) = self.proxies[*t_idx].stick_table {
+                            let _ = tbl.update_entry(key, |data| {
+                                data.conn_cur = data.conn_cur.saturating_sub(1);
+                            });
+                        }
                     }
+                    drop(cli_fd);
+                    continue;
                 }
-                drop(cli_fd);
-                continue;
+                ConnEvalOutcome::SilentDrop => {
+                    raw::silent_drop(cli_fd.as_fd(), peer_addr.is_ipv6());
+                    self.proxies[proxy_idx].stats.denied_conn += 1;
+                    for (t_idx, ref key) in tracked_sc.iter().flatten() {
+                        if let Some(ref tbl) = self.proxies[*t_idx].stick_table {
+                            let _ = tbl.update_entry(key, |data| {
+                                data.conn_cur = data.conn_cur.saturating_sub(1);
+                            });
+                        }
+                    }
+                    drop(cli_fd);
+                    continue;
+                }
             };
 
             self.listeners[l_idx].nbconn += 1;
@@ -1582,6 +1620,20 @@ impl Engine {
     }
 }
 
+#[derive(Debug)]
+enum ConnEvalOutcome {
+    Accept(SocketAddr, SocketAddr, SocketAddr, SocketAddr),
+    Reject,
+    SilentDrop,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SessionEvalOutcome {
+    Accept,
+    Reject,
+    SilentDrop,
+}
+
 #[allow(clippy::too_many_lines)]
 fn eval_tcp_req_conn_rules(
     proxy: &Proxy,
@@ -1589,7 +1641,7 @@ fn eval_tcp_req_conn_rules(
     peer_addr: SocketAddr,
     local_addr: SocketAddr,
     sc_conn_rates: [u64; 3],
-) -> Option<(SocketAddr, SocketAddr, SocketAddr, SocketAddr)> {
+) -> ConnEvalOutcome {
     let mut client_addr = peer_addr;
     let mut server_addr = local_addr;
     let fc_src = peer_addr;
@@ -1620,9 +1672,11 @@ fn eval_tcp_req_conn_rules(
             continue;
         }
         match &rule.action {
-            ibex_config::TcpReqConnAction::SilentDrop
-            | ibex_config::TcpReqConnAction::Reject => {
-                return None;
+            ibex_config::TcpReqConnAction::SilentDrop => {
+                return ConnEvalOutcome::SilentDrop;
+            }
+            ibex_config::TcpReqConnAction::Reject => {
+                return ConnEvalOutcome::Reject;
             }
             ibex_config::TcpReqConnAction::Accept => {
                 break;
@@ -1662,7 +1716,7 @@ fn eval_tcp_req_conn_rules(
             _ => {}
         }
     }
-    Some((client_addr, server_addr, fc_src, fc_dst))
+    ConnEvalOutcome::Accept(client_addr, server_addr, fc_src, fc_dst)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1671,7 +1725,7 @@ fn eval_tcp_req_session_rules(
     proxies: &[Proxy],
     registry: &Registry,
     sess: &mut TcpSession,
-) -> bool {
+) -> SessionEvalOutcome {
     let mut ctx = SampleContext {
         client_addr: sess.client_addr,
         server_addr: sess.server_addr,
@@ -1708,9 +1762,11 @@ fn eval_tcp_req_session_rules(
             continue;
         }
         match &rule.action {
-            ibex_config::TcpReqSessionAction::SilentDrop
-            | ibex_config::TcpReqSessionAction::Reject => {
-                return false;
+            ibex_config::TcpReqSessionAction::SilentDrop => {
+                return SessionEvalOutcome::SilentDrop;
+            }
+            ibex_config::TcpReqSessionAction::Reject => {
+                return SessionEvalOutcome::Reject;
             }
             ibex_config::TcpReqSessionAction::Accept => {
                 break;
@@ -1889,7 +1945,7 @@ fn eval_tcp_req_session_rules(
             _ => {}
         }
     }
-    true
+    SessionEvalOutcome::Accept
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1897,6 +1953,7 @@ enum ContentEvalResult {
     Done,
     Waiting,
     Reject,
+    SilentDrop,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1968,8 +2025,10 @@ fn eval_tcp_req_content_rules(
             crate::proxy::AclEvalResult::Matched => {}
         }
         match &rule.action {
-            ibex_config::TcpReqContentAction::SilentDrop
-            | ibex_config::TcpReqContentAction::Reject => {
+            ibex_config::TcpReqContentAction::SilentDrop => {
+                return ContentEvalResult::SilentDrop;
+            }
+            ibex_config::TcpReqContentAction::Reject => {
                 return ContentEvalResult::Reject;
             }
             ibex_config::TcpReqContentAction::Accept => {
@@ -2193,6 +2252,8 @@ fn register_new_session(
         fc_dst,
         tls.as_ref(),
         tracked_sc,
+        engine.global_bufsize,
+        engine.global_maxrewrite,
     ) else {
         // TLS setup failed; the fd is dropped with the session and the connection closes.
         return;
@@ -2352,6 +2413,8 @@ fn init_client_session(
     fc_dst: SocketAddr,
     tls: Option<&Arc<rustls::ServerConfig>>,
     tracked_sc: [Option<(usize, StickKey)>; 3],
+    global_bufsize: usize,
+    global_maxrewrite: usize,
 ) -> Option<(TcpSession, Option<SocketAddr>, Option<RawFd>)> {
     let mode = proxies[proxy_idx].mode;
     let timeouts = proxies[proxy_idx].timeouts;
@@ -2375,6 +2438,14 @@ fn init_client_session(
     sess.fc_src = Some(fc_src);
     sess.fc_dst = Some(fc_dst);
     sess.tracked_sc = tracked_sc;
+    // Use per-engine values rather than the global `BUFSIZE_STANDARD` atomic so that
+    // multiple Engine instances running in the same process (e.g. parallel tests) do not
+    // race each other's configuration.
+    sess.bufsize = global_bufsize;
+    sess.maxrewrite = proxies[proxy_idx]
+        .stats_config
+        .maxrewrite
+        .unwrap_or(global_maxrewrite);
 
     if let Some(cfg) = tls {
         // The connection is dropped rather than continued in the clear. Falling back to
@@ -2398,8 +2469,19 @@ fn init_client_session(
     }
 
     let registry = sample_registry();
-    if !eval_tcp_req_session_rules(&proxies[proxy_idx], proxies, registry, &mut sess) {
-        return None;
+    match eval_tcp_req_session_rules(&proxies[proxy_idx], proxies, registry, &mut sess) {
+        SessionEvalOutcome::Accept => {}
+        SessionEvalOutcome::Reject => {
+            raw::abort_with_rst(sess.cli.as_fd());
+            proxies[proxy_idx].stats.denied_req += 1;
+            return None;
+        }
+        SessionEvalOutcome::SilentDrop => {
+            let is_ipv6 = peer_addr.is_ipv6();
+            raw::silent_drop(sess.cli.as_fd(), is_ipv6);
+            proxies[proxy_idx].stats.denied_req += 1;
+            return None;
+        }
     }
 
     let proxy = &mut proxies[proxy_idx];
@@ -2985,6 +3067,15 @@ impl EngineDispatcher<'_> {
                         entry.sess.inspect_exp = None;
                     }
                     ContentEvalResult::Reject => {
+                        raw::abort_with_rst(entry.sess.cli.as_fd());
+                        self.proxies[proxy_idx].stats.denied_req += 1;
+                        entry.sess.cli_state = ScState::Closed;
+                        entry.sess.srv_state = ScState::Closed;
+                    }
+                    ContentEvalResult::SilentDrop => {
+                        let is_ipv6 = entry.sess.client_addr.is_some_and(|a| a.is_ipv6());
+                        raw::silent_drop(entry.sess.cli.as_fd(), is_ipv6);
+                        self.proxies[proxy_idx].stats.denied_req += 1;
                         entry.sess.cli_state = ScState::Closed;
                         entry.sess.srv_state = ScState::Closed;
                     }
@@ -4459,10 +4550,23 @@ impl EngineDispatcher<'_> {
                 &mut entry.sess,
                 now,
             );
-            if res == ContentEvalResult::Reject {
-                entry.sess.cli_state = ScState::Closed;
-                entry.sess.srv_state = ScState::Closed;
-                return None;
+            match res {
+                ContentEvalResult::Reject => {
+                    raw::abort_with_rst(entry.sess.cli.as_fd());
+                    proxies[be_idx].stats.denied_req += 1;
+                    entry.sess.cli_state = ScState::Closed;
+                    entry.sess.srv_state = ScState::Closed;
+                    return None;
+                }
+                ContentEvalResult::SilentDrop => {
+                    let is_ipv6 = entry.sess.client_addr.is_some_and(|a| a.is_ipv6());
+                    raw::silent_drop(entry.sess.cli.as_fd(), is_ipv6);
+                    proxies[be_idx].stats.denied_req += 1;
+                    entry.sess.cli_state = ScState::Closed;
+                    entry.sess.srv_state = ScState::Closed;
+                    return None;
+                }
+                ContentEvalResult::Done | ContentEvalResult::Waiting => {}
             }
         }
 
@@ -4695,10 +4799,23 @@ impl EngineDispatcher<'_> {
                 &mut entry.sess,
                 now,
             );
-            if res == ContentEvalResult::Reject {
-                entry.sess.cli_state = ScState::Closed;
-                entry.sess.srv_state = ScState::Closed;
-                return;
+            match res {
+                ContentEvalResult::Reject => {
+                    raw::abort_with_rst(entry.sess.cli.as_fd());
+                    proxies[be_idx].stats.denied_req += 1;
+                    entry.sess.cli_state = ScState::Closed;
+                    entry.sess.srv_state = ScState::Closed;
+                    return;
+                }
+                ContentEvalResult::SilentDrop => {
+                    let is_ipv6 = entry.sess.client_addr.is_some_and(|a| a.is_ipv6());
+                    raw::silent_drop(entry.sess.cli.as_fd(), is_ipv6);
+                    proxies[be_idx].stats.denied_req += 1;
+                    entry.sess.cli_state = ScState::Closed;
+                    entry.sess.srv_state = ScState::Closed;
+                    return;
+                }
+                ContentEvalResult::Done | ContentEvalResult::Waiting => {}
             }
         }
 

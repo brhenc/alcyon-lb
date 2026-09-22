@@ -9,6 +9,7 @@ members = [
     "crates/ibex-sample",
     "crates/ibex-stick-table",
     "crates/ibex-tls",
+    "crates/ibex-alloc",
 ]
 
 
@@ -22,6 +23,7 @@ rust-version = "1.80.0"
 
 [workspace.dependencies]
 # Internal workspace crates
+ibex-alloc = { path = "crates/ibex-alloc" }
 ibex-core = { path = "crates/ibex-core" }
 ebtree = { path = "crates/ebtree" }
 ibex-stick-table = { path = "crates/ibex-stick-table" }

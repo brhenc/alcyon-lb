@@ -36,8 +36,12 @@ pub struct GlobalSection {
     pub stats_socket_level: Option<String>,
     /// Maximum rewrite size in bytes.
     pub maxrewrite: Option<usize>,
-    /// Buffer size in bytes.
+    /// Buffer size in bytes (`tune.bufsize`).
     pub bufsize: Option<usize>,
+    /// Small buffer size in bytes (`tune.bufsize.small`).
+    pub bufsize_small: Option<usize>,
+    /// Large buffer size in bytes (`tune.bufsize.large`).
+    pub bufsize_large: Option<usize>,
     /// Syslog targets declared here. Proxy sections inherit these with `log global`,
     /// which is how the canonical `HAProxy` configuration declares logging.
     pub logs: Vec<LogConfig>,
@@ -94,6 +98,7 @@ pub struct BindConfig {
     pub ssl: bool,
     pub crt: Vec<String>,
     pub alpn: Vec<String>,
+    pub proto: Option<String>,
     pub accept_proxy: bool,
     pub accept_proxy_v2: bool,
 }

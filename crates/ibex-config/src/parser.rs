@@ -159,7 +159,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
         b.stats.maxrewrite = maxrewrite;
     }
 
-    validate_config(&listens, &frontends, &backends)?;
+    validate_config(global.as_ref(), &listens, &frontends, &backends)?;
 
     Ok(Config {
         global,
@@ -318,6 +318,7 @@ fn parse_frontend_header(
             ssl: false,
             crt: Vec::new(),
             alpn: Vec::new(),
+            proto: None,
             accept_proxy,
             accept_proxy_v2,
         });
@@ -422,6 +423,7 @@ fn parse_section_directive(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn parse_global_directive(
     global: &mut GlobalSection,
     tokens: &[Token],
@@ -482,15 +484,64 @@ fn parse_global_directive(
             Ok(())
         }
         "tune.maxrewrite" => {
-            if tokens.len() >= 2 {
-                global.maxrewrite = tokens[1].text.parse::<usize>().ok();
+            if tokens.len() < 2 {
+                return Err(ConfigError::new(kw.line, kw.col, "'tune.maxrewrite' expects an integer argument."));
             }
+            let raw_val = tokens[1].text.parse::<usize>().map_err(|_| {
+                ConfigError::new(tokens[1].line, tokens[1].col, format!("'tune.maxrewrite' expects an integer argument, got '{}'", tokens[1].text))
+            })?;
+            global.maxrewrite = Some(raw_val);
             Ok(())
         }
         "tune.bufsize" => {
-            if tokens.len() >= 2 {
-                global.bufsize = tokens[1].text.parse::<usize>().ok();
+            if tokens.len() < 2 {
+                return Err(ConfigError::new(kw.line, kw.col, "'tune.bufsize' expects an integer argument."));
             }
+            let raw_size = tokens[1].text.parse::<usize>().map_err(|_| {
+                ConfigError::new(tokens[1].line, tokens[1].col, format!("'tune.bufsize' expects an integer argument, got '{}'", tokens[1].text))
+            })?;
+            if raw_size == 0 {
+                return Err(ConfigError::new(tokens[1].line, tokens[1].col, "'tune.bufsize' expects a positive integer argument."));
+            }
+            if raw_size >= 268_435_456 {
+                return Err(ConfigError::new(tokens[1].line, tokens[1].col, format!("'tune.bufsize' must be less than 268435456 bytes (256 MB), got {raw_size}")));
+            }
+            let rounded = (raw_size + 15) & !15;
+            global.bufsize = Some(rounded);
+            Ok(())
+        }
+        "tune.bufsize.small" => {
+            if tokens.len() < 2 {
+                return Err(ConfigError::new(kw.line, kw.col, "'tune.bufsize.small' expects an integer argument."));
+            }
+            let raw_size = tokens[1].text.parse::<usize>().map_err(|_| {
+                ConfigError::new(tokens[1].line, tokens[1].col, format!("'tune.bufsize.small' expects an integer argument, got '{}'", tokens[1].text))
+            })?;
+            if raw_size == 0 {
+                return Err(ConfigError::new(tokens[1].line, tokens[1].col, "'tune.bufsize.small' expects a positive integer argument."));
+            }
+            if raw_size >= 268_435_456 {
+                return Err(ConfigError::new(tokens[1].line, tokens[1].col, format!("'tune.bufsize.small' must be less than 268435456 bytes (256 MB), got {raw_size}")));
+            }
+            let rounded = (raw_size + 15) & !15;
+            global.bufsize_small = Some(rounded);
+            Ok(())
+        }
+        "tune.bufsize.large" => {
+            if tokens.len() < 2 {
+                return Err(ConfigError::new(kw.line, kw.col, "'tune.bufsize.large' expects an integer argument."));
+            }
+            let raw_size = tokens[1].text.parse::<usize>().map_err(|_| {
+                ConfigError::new(tokens[1].line, tokens[1].col, format!("'tune.bufsize.large' expects an integer argument, got '{}'", tokens[1].text))
+            })?;
+            if raw_size == 0 {
+                return Err(ConfigError::new(tokens[1].line, tokens[1].col, "'tune.bufsize.large' expects a positive integer argument."));
+            }
+            if raw_size >= 268_435_456 {
+                return Err(ConfigError::new(tokens[1].line, tokens[1].col, format!("'tune.bufsize.large' must be less than 268435456 bytes (256 MB), got {raw_size}")));
+            }
+            let rounded = (raw_size + 15) & !15;
+            global.bufsize_large = Some(rounded);
             Ok(())
         }
         "set-var" => {
@@ -724,6 +775,7 @@ fn parse_frontend_bind(
     let mut ssl = false;
     let mut crt = Vec::new();
     let mut alpn = Vec::new();
+    let mut proto = None;
     let mut accept_proxy = false;
     let mut accept_proxy_v2 = false;
 
@@ -744,6 +796,10 @@ fn parse_frontend_bind(
                     .filter(|s| !s.is_empty())
                     .collect();
                 alpn = protos;
+            }
+            "proto" if i + 1 < tokens.len() => {
+                i += 1;
+                proto = Some(tokens[i].text.clone());
             }
             "accept-proxy" => accept_proxy = true,
             "accept-proxy-v2" => {
@@ -770,6 +826,7 @@ fn parse_frontend_bind(
         ssl,
         crt,
         alpn,
+        proto,
         accept_proxy,
         accept_proxy_v2,
     });
@@ -3449,10 +3506,47 @@ fn parse_track_rule(
 }
 
 fn validate_config(
+    global: Option<&GlobalSection>,
     listens: &[ListenSection],
-    _frontends: &[FrontendSection],
+    frontends: &[FrontendSection],
     backends: &[BackendSection],
 ) -> Result<(), ConfigError> {
+    let bufsize = global.and_then(|g| g.bufsize).unwrap_or(16384);
+    let mut h2_configured = false;
+    for l in listens {
+        if l.tcp_req_content_rules.iter().any(|r| {
+            matches!(
+                &r.action,
+                TcpReqContentAction::SwitchModeHttp { proto: Some(p) } if p == "h2"
+            )
+        }) {
+            h2_configured = true;
+        }
+    }
+    for f in frontends {
+        for b in &f.binds {
+            if b.alpn.iter().any(|a| a == "h2") || b.proto.as_deref() == Some("h2") {
+                h2_configured = true;
+                break;
+            }
+        }
+        if f.tcp_req_content_rules.iter().any(|r| {
+            matches!(
+                &r.action,
+                TcpReqContentAction::SwitchModeHttp { proto: Some(p) } if p == "h2"
+            )
+        }) {
+            h2_configured = true;
+        }
+    }
+    if h2_configured && bufsize < 16384 {
+        return Err(ConfigError::new(
+            1,
+            1,
+            format!("'tune.bufsize' must be at least 16384 bytes when HTTP/2 is configured (got {bufsize})"),
+        ));
+    }
+
     for proxy in listens {
         if proxy.mode == Mode::Http && proxy.cookie.is_some() && proxy.servers.is_empty() {
             return Err(ConfigError::new(
