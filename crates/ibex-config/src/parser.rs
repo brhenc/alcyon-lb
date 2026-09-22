@@ -367,6 +367,7 @@ fn parse_backend_header(
 
     Ok(BackendSection {
         name: id,
+        logs: Vec::new(),
         mode,
         disabled: false,
         balance: BalanceAlgorithm::RoundRobin,
@@ -756,6 +757,10 @@ fn parse_backend_directive(
             parse_track_rule(&mut be.stick_rules, tokens, kw)
         }
         "stats" => parse_stats_directive(&mut be.stats, tokens, kw),
+        // `log` is valid in every proxy section, backends included. It was wired for
+        // global, listen and frontend but not here, which alone blocked 19 reg-tests
+        // -- the health-check suites all declare their syslog target on the backend.
+        "log" => parse_log(&mut be.logs, tokens, kw),
         other => Err(ConfigError::new(
             kw.line,
             kw.col,

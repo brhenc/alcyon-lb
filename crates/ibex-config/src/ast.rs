@@ -473,6 +473,8 @@ impl Default for FrontendSection {
 pub struct BackendSection {
     /// Backend name / identifier.
     pub name: String,
+    /// Syslog targets. `log` is valid in every proxy section, backends included.
+    pub logs: Vec<LogConfig>,
     /// Operating mode (tcp, http, health).
     pub mode: Mode,
     /// Whether this backend is disabled.
@@ -523,6 +525,7 @@ impl Default for BackendSection {
     fn default() -> Self {
         Self {
             name: String::new(),
+            logs: Vec::new(),
             mode: Mode::Tcp,
             disabled: false,
             balance: BalanceAlgorithm::RoundRobin,
