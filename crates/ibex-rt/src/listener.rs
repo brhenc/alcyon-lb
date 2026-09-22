@@ -66,6 +66,9 @@ impl Listener {
         // The whole point: every thread binds the same address, and the kernel
         // distributes connections across them.
         net::sockopt::set_socket_reuseport(&fd, true)?;
+        if family == AddressFamily::INET6 {
+            let _ = net::sockopt::set_ipv6_v6only(&fd, true);
+        }
 
         let any = to_any(addr);
         net::bind_any(&fd, &any)?;

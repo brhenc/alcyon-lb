@@ -108,6 +108,10 @@ run-stats: debug ## Run ibex with modern Web Stats Dashboard on port 8404
 	@echo -e "$(GREEN)Starting Ibex Stats Dashboard on http://127.0.0.1:8404/stats ...$(RESET)"
 	./$(TARGET_DEBUG) -f $(STATS_CONFIG) $(RUN_FLAGS)
 
+smoke: debug ## Run end-to-end HTTPS/TLS smoke test with curl and Nginx on port 8443
+	@echo -e "$(GREEN)Running end-to-end TLS smoke test on https://localhost:8443/ ...$(RESET)"
+	$(PYTHON) harness/smoke_nginx_8443.py
+
 ##@ Installation & Packaging
 
 install: build ## Install ibex binary into $(DESTDIR)$(PREFIX)/bin/ibex (mode 755)
