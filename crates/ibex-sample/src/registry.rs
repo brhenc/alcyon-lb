@@ -144,11 +144,38 @@ impl Registry {
         r
     }
 
+    /// Registers a sample fetch. Panics if `desc.name` is already registered.
+    ///
+    /// This used to be a bare `HashMap::insert`, so a second registration of the same
+    /// name silently replaced the first and the loser became unreachable -- code that
+    /// still compiled, still had passing tests, and never ran. It happened twice: once
+    /// across crates, where `ibex-rt` shadowed 29 of these, and once inside this file,
+    /// where four `None` stubs were appended after the working `map_beg`/`map_sub`/
+    /// `map_dir`/`map_dom` and silently won.
+    ///
+    /// Neither was detectable by building, testing or linting, which is why this is a
+    /// panic and not a lint: the registry is built by every test that evaluates a
+    /// sample, so a duplicate now fails loudly the first time anything touches it.
     pub fn register_fetch(&mut self, desc: FetchDesc) {
+        assert!(
+            !self.fetches.contains_key(desc.name),
+            "sample fetch '{}' registered twice; the later registration would silently \
+             shadow the earlier one",
+            desc.name
+        );
         self.fetches.insert(desc.name, desc);
     }
 
+    /// Registers a converter. Panics if `desc.name` is already registered.
+    ///
+    /// See [`Registry::register_fetch`] for why this is a panic.
     pub fn register_converter(&mut self, desc: ConvDesc) {
+        assert!(
+            !self.converters.contains_key(desc.name),
+            "converter '{}' registered twice; the later registration would silently \
+             shadow the earlier one",
+            desc.name
+        );
         self.converters.insert(desc.name, desc);
     }
 
@@ -2537,7 +2564,18 @@ impl Registry {
         });
 
         // --- 5. Map Converters ---
-        macro_rules! reg_map {
+        // HAProxy names these `map_<match>` and `map_<match>_<output>`, where the
+        // match method decides how the key is compared and the output type decides how
+        // the value is returned (src/map.c). Two of them take no output variants:
+        // `map` is a bare alias for `map_str`, and `map_regm` always returns the
+        // substituted string. Generating variants for those two is not merely extra --
+        // `map` + `_int` produces `map_int`, which is a *different, real* converter
+        // (integer key matching), and the collision silently replaced one with the
+        // other. Hence the two arms: `base` alone, or `base + variants`.
+        //
+        // The full set is 38 names, checked against data/converters.json in
+        // `map_converter_names_match_haproxy` below.
+        macro_rules! reg_map_base {
             ($base:literal, $mt:expr, $in_spec:expr) => {
                 self.register_converter(ConvDesc {
                     name: $base,
@@ -2552,6 +2590,12 @@ impl Registry {
                             .or_else(|| default_val.map(Sample::Str))
                     },
                 });
+            };
+        }
+
+        macro_rules! reg_map {
+            ($base:literal, $mt:expr, $in_spec:expr) => {
+                reg_map_base!($base, $mt, $in_spec);
 
                 self.register_converter(ConvDesc {
                     name: concat!($base, "_int"),
@@ -2604,7 +2648,11 @@ impl Registry {
             };
         }
 
-        reg_map!("map", MapMatchType::Str, TypeSpec::Exact(SampleType::Str));
+        // `map` is an alias for `map_str` and `map_regm` returns a substitution, so
+        // neither takes `_int`/`_ip`/`_key` variants -- see the comment on reg_map!.
+        reg_map_base!("map", MapMatchType::Str, TypeSpec::Exact(SampleType::Str));
+        reg_map_base!("map_regm", MapMatchType::Regm, TypeSpec::Exact(SampleType::Str));
+
         reg_map!("map_str", MapMatchType::Str, TypeSpec::Exact(SampleType::Str));
         reg_map!("map_beg", MapMatchType::Beg, TypeSpec::Exact(SampleType::Str));
         reg_map!("map_sub", MapMatchType::Sub, TypeSpec::Exact(SampleType::Str));
@@ -2612,7 +2660,6 @@ impl Registry {
         reg_map!("map_dom", MapMatchType::Dom, TypeSpec::Exact(SampleType::Str));
         reg_map!("map_end", MapMatchType::End, TypeSpec::Exact(SampleType::Str));
         reg_map!("map_reg", MapMatchType::Reg, TypeSpec::Exact(SampleType::Str));
-        reg_map!("map_regm", MapMatchType::Regm, TypeSpec::Exact(SampleType::Str));
         reg_map!("map_int", MapMatchType::Int, TypeSpec::Exact(SampleType::Sint));
         reg_map!("map_ip", MapMatchType::Ip, TypeSpec::Addr);
 
@@ -3701,5 +3748,182 @@ mod tests {
             &ctx,
         );
         assert_eq!(res_json, Some(Sample::Str("bob".to_string())));
+    }
+}
+
+#[cfg(test)]
+mod map_name_tests {
+    use super::Registry;
+
+    /// The map converter names must be exactly HAProxy's, no more and no fewer.
+    ///
+    /// Extracted from HAProxy 3.5 into `data/converters.json`. The generated names came
+    /// from one macro applied to every match method, which invented `map_key` and
+    /// `map_regm_int`/`_ip`/`_key`, and produced `map_int` and `map_ip` twice -- once as
+    /// the output variants of the bare `map` alias and once as the real integer- and
+    /// address-matching converters. Registration was a `HashMap` insert, so one silently
+    /// replaced the other and which one survived depended on declaration order.
+    ///
+    /// A missing name makes a valid config fail; an invented one makes a config Ibex
+    /// accepts and HAProxy rejects, which is the direction that actually hurts, since it
+    /// means a config that cannot be migrated back.
+    #[test]
+    fn map_converter_names_match_haproxy() {
+        let reg = Registry::new();
+        let mut got: Vec<&str> = reg
+            .converter_names()
+            .into_iter()
+            .filter(|n| n.starts_with("map"))
+            .collect();
+        got.sort_unstable();
+
+        let want: [&str; 38] = [
+            "map",
+            "map_beg",
+            "map_beg_int",
+            "map_beg_ip",
+            "map_beg_key",
+            "map_dir",
+            "map_dir_int",
+            "map_dir_ip",
+            "map_dir_key",
+            "map_dom",
+            "map_dom_int",
+            "map_dom_ip",
+            "map_dom_key",
+            "map_end",
+            "map_end_int",
+            "map_end_ip",
+            "map_end_key",
+            "map_int",
+            "map_int_int",
+            "map_int_ip",
+            "map_int_key",
+            "map_ip",
+            "map_ip_int",
+            "map_ip_ip",
+            "map_ip_key",
+            "map_reg",
+            "map_reg_int",
+            "map_reg_ip",
+            "map_reg_key",
+            "map_regm",
+            "map_str",
+            "map_str_int",
+            "map_str_ip",
+            "map_str_key",
+            "map_sub",
+            "map_sub_int",
+            "map_sub_ip",
+            "map_sub_key",
+        ];
+
+        let missing: Vec<&&str> = want.iter().filter(|n| !got.contains(n)).collect();
+        let extra: Vec<&&str> = got.iter().filter(|n| !want.contains(n)).collect();
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "map converter names drifted from HAProxy 3.5\n  missing: {missing:?}\n  \
+             invented: {extra:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod oracle_tests {
+    use super::Registry;
+    use std::collections::HashSet;
+
+    fn oracle(file: &str) -> HashSet<String> {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/").to_string() + file;
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read the oracle at {path}: {e}"));
+        let v: serde_json::Value = serde_json::from_str(&raw).expect("oracle is not JSON");
+        v.as_array()
+            .expect("oracle is not an array")
+            .iter()
+            .filter_map(|e| e.get("keyword")?.as_str().map(str::to_owned))
+            .collect()
+    }
+
+    /// Names Ibex registers that HAProxy 3.5 does not have. This list may only shrink.
+    ///
+    /// A name we are missing makes a valid config fail, which is visible immediately. A
+    /// name we invent is worse and quieter: the config loads on Ibex and is rejected by
+    /// HAProxy, so it cannot be migrated back, and an operator who writes `res.status`
+    /// or `hex2bin` gets no warning that they have written something only Ibex
+    /// understands. Several here are near-misses for a real fetch -- `res_ver` for
+    /// `res.ver`, `ssl_fc_version` for `ssl_fc_protocol`, `sc0_bytes_in_cnt` for
+    /// `sc0_bytes_in_rate` -- which is exactly the kind of typo that looks like it works.
+    ///
+    /// Verified absent two ways: against `data/sample_fetches.json` (extracted from 3.5
+    /// with file:line citations) and by grepping the `smp_fetch` registration tables in
+    /// the reference tree directly.
+    const NOT_IN_HAPROXY_FETCHES: &[&str] = &[
+        "be_client_timeout", "conn_cnt", "conn_rate", "cum_conn", "epoch", "err_cnt",
+        "err_rate", "fe_connect_timeout", "fe_queue_timeout", "fe_server_timeout",
+        "fe_tunnel_timeout", "req.uri", "req_cnt", "req_rate", "res.proto_http", "res.status",
+        "res_ver", "sc0_bytes_in_cnt", "sc0_bytes_out_cnt", "sc1_bytes_in_cnt",
+        "sc1_bytes_out_cnt", "sc2_bytes_in_cnt", "sc2_bytes_out_cnt", "sc_bytes_in_cnt",
+        "sc_bytes_out_cnt", "sc_gpc0", "sc_gpc1", "sc_gpt0", "sess_cnt", "sess_rate",
+        "src_bytes_in_cnt", "src_bytes_out_cnt", "src_gpc0", "src_gpc1", "src_gpt0",
+        "src_in_table", "src_trackers", "ssl_fc_version",
+    ];
+
+    const NOT_IN_HAPROXY_CONVERTERS: &[&str] = &[
+        "hex2bin", "len",
+    ];
+
+    /// The registry must not grow names HAProxy does not have.
+    ///
+    /// This is a ratchet, not a clean bill of health: the allowlists above record what
+    /// was already wrong when the check was added. Adding to them is the thing this test
+    /// exists to make someone argue for.
+    #[test]
+    fn registers_no_new_names_haproxy_lacks() {
+        let reg = Registry::new();
+
+        let fetches = oracle("sample_fetches.json");
+        let new_f: Vec<&str> = reg
+            .fetch_names()
+            .into_iter()
+            .filter(|n| !fetches.contains(*n) && !NOT_IN_HAPROXY_FETCHES.contains(n))
+            .collect();
+
+        let convs = oracle("converters.json");
+        let new_c: Vec<&str> = reg
+            .converter_names()
+            .into_iter()
+            .filter(|n| !convs.contains(*n) && !NOT_IN_HAPROXY_CONVERTERS.contains(n))
+            .collect();
+
+        assert!(
+            new_f.is_empty() && new_c.is_empty(),
+            "registered names HAProxy 3.5 does not have\n  fetches: {new_f:?}\n  \
+             converters: {new_c:?}\nIf one of these is real, the oracle in data/ is \
+             missing it and should be re-extracted; if it is a guess, it will silently \
+             accept configs HAProxy rejects."
+        );
+    }
+
+    /// The allowlists must not outlive what they describe.
+    ///
+    /// Without this, deleting an invented name leaves a stale entry behind and the next
+    /// person cannot tell which of them are still real.
+    #[test]
+    fn the_allowlists_have_no_stale_entries() {
+        let reg = Registry::new();
+        let f = reg.fetch_names();
+        let c = reg.converter_names();
+
+        let stale_f: Vec<&&str> =
+            NOT_IN_HAPROXY_FETCHES.iter().filter(|n| !f.contains(n)).collect();
+        let stale_c: Vec<&&str> =
+            NOT_IN_HAPROXY_CONVERTERS.iter().filter(|n| !c.contains(n)).collect();
+
+        assert!(
+            stale_f.is_empty() && stale_c.is_empty(),
+            "allowlist entries no longer registered -- remove them\n  fetches: \
+             {stale_f:?}\n  converters: {stale_c:?}"
+        );
     }
 }

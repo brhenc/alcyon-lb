@@ -2,6 +2,24 @@
 // Derived from HAProxy src/hash.c, src/sample.c, include/import/xxhash.h.
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
+// These are allowed for this module only. Hash functions are transcribed from published
+// pseudocode, and renaming to satisfy a lint makes them harder to check against the
+// specification than the lint is worth. They are not a licence to silence lints
+// elsewhere: each one below names the construct it covers.
+
+// The working variables in SHA and MD5 are a, b, c, d, e in every published description.
+#![allow(clippy::many_single_char_names)]
+// SHA round constants are conventionally written in groups of four hex digits.
+#![allow(clippy::unusual_byte_groupings)]
+// The lint suggests `as_chunks`, which is still nightly-only.
+#![allow(clippy::chunks_exact_to_as_chunks)]
+// Message-schedule windowing reads more directly as an indexed loop than as an iterator
+// chain, because the index arithmetic is what the specification states.
+#![allow(clippy::needless_range_loop)]
+// Round constants are declared next to the round that uses them.
+#![allow(clippy::items_after_statements)]
+
+
 //! Hash algorithms used by sample fetches and converters.
 //!
 //! Includes DJB2, SDBM, WT6, `full_hash`, CRC32, `CRC32c`, XXH32, XXH64,
