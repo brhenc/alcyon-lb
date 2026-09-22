@@ -114,8 +114,7 @@ impl WorkKind {
     #[must_use]
     #[inline]
     pub const fn kind(self) -> Option<Kind> {
-        #[allow(clippy::cast_possible_truncation)]
-        Kind::from_tag((self.0 >> 24) as u8)
+        Kind::from_tag(self.0.to_be_bytes()[0])
     }
 
     /// The subsystem-owned index this task refers to.

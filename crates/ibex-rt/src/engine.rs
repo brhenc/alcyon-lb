@@ -58,6 +58,21 @@ thread_local! {
     static MAX_REWRITE_LIMIT: Cell<usize> = const { Cell::new(8192) };
 }
 
+#[inline]
+fn millis_to_u32(d: Duration) -> u32 {
+    u32::try_from(d.as_millis()).unwrap_or(u32::MAX)
+}
+
+#[inline]
+fn usize_to_u32(idx: usize) -> u32 {
+    u32::try_from(idx).unwrap_or(u32::MAX)
+}
+
+#[inline]
+fn raw_fd_to_u64(fd: RawFd) -> u64 {
+    u64::try_from(fd).unwrap_or(0)
+}
+
 /// Accumulated statistics per proxy.
 #[derive(Debug, Clone, Default)]
 pub struct ProxyStats {
@@ -334,20 +349,24 @@ impl SessionArena {
         self.live
     }
 
-    #[allow(clippy::cast_possible_truncation)]
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (u32, &mut SessionEntry)> {
         self.entries
             .iter_mut()
             .enumerate()
-            .filter_map(|(idx, opt)| opt.as_mut().map(|entry| (idx as u32, entry)))
+            .filter_map(|(idx, opt)| {
+                let id = u32::try_from(idx).ok()?;
+                opt.as_mut().map(|entry| (id, entry))
+            })
     }
 
-    #[allow(clippy::cast_possible_truncation)]
     pub fn iter(&self) -> impl Iterator<Item = (u32, &SessionEntry)> {
         self.entries
             .iter()
             .enumerate()
-            .filter_map(|(idx, opt)| opt.as_ref().map(|entry| (idx as u32, entry)))
+            .filter_map(|(idx, opt)| {
+                let id = u32::try_from(idx).ok()?;
+                opt.as_ref().map(|entry| (id, entry))
+            })
     }
 }
 
@@ -616,16 +635,12 @@ fn bind_tls(
 
 fn init_proxy_from_listen(proxy_idx: usize, listen: &ibex_config::ListenSection) -> Proxy {
     let timeouts = Timeouts {
-        #[allow(clippy::cast_possible_truncation)]
-        client: listen.clitimeout.map_or(0, |d| d.as_millis() as u32),
-        #[allow(clippy::cast_possible_truncation)]
-        server: listen.srvtimeout.map_or(0, |d| d.as_millis() as u32),
-        #[allow(clippy::cast_possible_truncation)]
-        connect: listen.contimeout.map_or(0, |d| d.as_millis() as u32),
+        client: listen.clitimeout.map_or(0, millis_to_u32),
+        server: listen.srvtimeout.map_or(0, millis_to_u32),
+        connect: listen.contimeout.map_or(0, millis_to_u32),
     };
 
-    #[allow(clippy::cast_possible_truncation)]
-    let retries = listen.retries.min(u32::from(u16::MAX)) as u16;
+    let retries = u16::try_from(listen.retries).unwrap_or(u16::MAX);
 
     let mut cliexp = Vec::new();
     for exp in &listen.cliexp {
@@ -666,8 +681,7 @@ fn init_proxy_from_listen(proxy_idx: usize, listen: &ibex_config::ListenSection)
     }
 
     Proxy {
-        #[allow(clippy::cast_possible_truncation)]
-        id: proxy_idx as u32,
+        id: usize_to_u32(proxy_idx),
         name: listen.name.clone(),
         log_target_idx: Vec::new(),
         log_health_checks: listen.log_health_checks,
@@ -721,15 +735,12 @@ fn init_proxy_from_listen(proxy_idx: usize, listen: &ibex_config::ListenSection)
 
 fn init_proxy_from_frontend(proxy_idx: usize, fe: &ibex_config::FrontendSection) -> Proxy {
     let timeouts = Timeouts {
-        #[allow(clippy::cast_possible_truncation)]
         client: fe
             .clitimeout
             .or(fe.timeouts.client)
-            .map_or(0, |d| d.as_millis() as u32),
-        #[allow(clippy::cast_possible_truncation)]
-        server: fe.timeouts.server.map_or(0, |d| d.as_millis() as u32),
-        #[allow(clippy::cast_possible_truncation)]
-        connect: fe.timeouts.connect.map_or(0, |d| d.as_millis() as u32),
+            .map_or(0, millis_to_u32),
+        server: fe.timeouts.server.map_or(0, millis_to_u32),
+        connect: fe.timeouts.connect.map_or(0, millis_to_u32),
     };
 
     let mut cliexp = Vec::new();
@@ -745,8 +756,7 @@ fn init_proxy_from_frontend(proxy_idx: usize, fe: &ibex_config::FrontendSection)
         .map(|ast| Arc::new(init_stick_table(ast, &fe.name)));
 
     Proxy {
-        #[allow(clippy::cast_possible_truncation)]
-        id: proxy_idx as u32,
+        id: usize_to_u32(proxy_idx),
         name: fe.name.clone(),
         log_target_idx: Vec::new(),
         log_health_checks: fe.log_health_checks,
@@ -799,22 +809,18 @@ fn init_proxy_from_frontend(proxy_idx: usize, fe: &ibex_config::FrontendSection)
 
 fn init_proxy_from_backend(proxy_idx: usize, be: &ibex_config::BackendSection) -> Proxy {
     let timeouts = Timeouts {
-        #[allow(clippy::cast_possible_truncation)]
-        client: be.timeouts.client.map_or(0, |d| d.as_millis() as u32),
-        #[allow(clippy::cast_possible_truncation)]
+        client: be.timeouts.client.map_or(0, millis_to_u32),
         server: be
             .srvtimeout
             .or(be.timeouts.server)
-            .map_or(0, |d| d.as_millis() as u32),
-        #[allow(clippy::cast_possible_truncation)]
+            .map_or(0, millis_to_u32),
         connect: be
             .contimeout
             .or(be.timeouts.connect)
-            .map_or(0, |d| d.as_millis() as u32),
+            .map_or(0, millis_to_u32),
     };
 
-    #[allow(clippy::cast_possible_truncation)]
-    let retries = be.retries.min(u32::from(u16::MAX)) as u16;
+    let retries = u16::try_from(be.retries).unwrap_or(u16::MAX);
 
     let mut srvexp = Vec::new();
     for exp in &be.srvexp {
@@ -849,8 +855,7 @@ fn init_proxy_from_backend(proxy_idx: usize, be: &ibex_config::BackendSection) -
     }
 
     Proxy {
-        #[allow(clippy::cast_possible_truncation)]
-        id: proxy_idx as u32,
+        id: usize_to_u32(proxy_idx),
         name: be.name.clone(),
         log_target_idx: Vec::new(),
         log_health_checks: be.log_health_checks,
@@ -910,12 +915,10 @@ fn init_checks(proxies: &[Proxy], scheduler: &mut Scheduler, now: Tick) -> Vec<S
                 continue;
             };
             let mut check = ServerCheckState::new(proxy_idx, server_idx, srv_addr, check_cfg, now);
-            #[allow(clippy::cast_possible_truncation)]
-            let check_idx = checks.len() as u32;
+            let check_idx = usize_to_u32(checks.len());
             if let Some(task_ref) = scheduler.create(WorkKind::new(Kind::Check, check_idx)) {
                 check.task = task_ref;
-                #[allow(clippy::cast_possible_truncation)]
-                let initial_delay = 50 + (check_idx * 50);
+                let initial_delay = 50u32.saturating_add(check_idx.saturating_mul(50));
                 scheduler.queue_timer(task_ref, now.add(initial_delay));
             }
             checks.push(check);
@@ -948,8 +951,7 @@ impl Engine {
             let proxy_idx = proxies.len();
             let proxy = init_proxy_from_listen(proxy_idx, listen);
 
-            #[allow(clippy::cast_possible_truncation)]
-            let mut listener = Listener::bind(listen.addr, 128, proxy_idx as u32)?;
+            let mut listener = Listener::bind(listen.addr, 128, usize_to_u32(proxy_idx))?;
             listener.maxconn = listen.maxconn;
 
             // Keyed by the listener, not the proxy. A proxy may own several listeners
@@ -959,16 +961,14 @@ impl Engine {
             // accounting and, once TLS is per-bind, the wrong transport.
             let l_idx = listeners.len();
             let lfd = listener.raw_fd();
-            #[allow(clippy::cast_possible_truncation)]
             fdtab.insert(
                 lfd,
                 FdState::Listener {
-                    listener: l_idx as u32,
+                    listener: usize_to_u32(l_idx),
                 },
                 Interest::READ,
             );
-            #[allow(clippy::cast_sign_loss)]
-            poller.add(listener.borrowed_fd(), lfd as u64, true, false)?;
+            poller.add(listener.borrowed_fd(), raw_fd_to_u64(lfd), true, false)?;
 
             listeners.push(listener);
             proxies.push(proxy);
@@ -1003,23 +1003,20 @@ impl Engine {
             }
 
             for bind_addr in bind_addrs {
-                #[allow(clippy::cast_possible_truncation)]
-                let mut listener = Listener::bind(bind_addr, 128, proxy_idx as u32)?;
+                let mut listener = Listener::bind(bind_addr, 128, usize_to_u32(proxy_idx))?;
                 listener.maxconn = frontend.maxconn;
                 listener.tls = bind_tls(frontend, bind_addr)?;
 
                 let l_idx = listeners.len();
                 let lfd = listener.raw_fd();
-                #[allow(clippy::cast_possible_truncation)]
                 fdtab.insert(
                     lfd,
                     FdState::Listener {
-                        listener: l_idx as u32,
+                        listener: usize_to_u32(l_idx),
                     },
                     Interest::READ,
                 );
-                #[allow(clippy::cast_sign_loss)]
-                poller.add(listener.borrowed_fd(), lfd as u64, true, false)?;
+                poller.add(listener.borrowed_fd(), raw_fd_to_u64(lfd), true, false)?;
 
                 listeners.push(listener);
             }
@@ -1066,9 +1063,8 @@ impl Engine {
         let raw_fd = listener.as_raw_fd();
         self.fdtab
             .insert(raw_fd, FdState::CliListener, Interest::READ);
-        #[allow(clippy::cast_sign_loss)]
         self.poller
-            .add(listener.as_fd(), raw_fd as u64, true, false)?;
+            .add(listener.as_fd(), raw_fd_to_u64(raw_fd), true, false)?;
         self.cli_listener = Some(listener);
         self.cli_socket_path = Some(path_buf);
         Ok(())
@@ -1078,8 +1074,7 @@ impl Engine {
     #[must_use]
     pub fn current_tick(&self) -> Tick {
         let elapsed = self.start_time.elapsed();
-        #[allow(clippy::cast_possible_truncation)]
-        let ms = (elapsed.as_millis() & 0xFFFF_FFFF) as u32;
+        let ms = u32::try_from(elapsed.as_millis() & 0xFFFF_FFFF).unwrap_or(u32::MAX);
         Tick(if ms == 0 { 1 } else { ms })
     }
 
@@ -1240,7 +1235,6 @@ impl Engine {
                     };
                     entry.task = task_ref;
 
-                    #[allow(clippy::cast_sign_loss)]
                     {
                         self.fdtab.insert(
                             raw_fd,
@@ -1251,7 +1245,7 @@ impl Engine {
                             Interest::READ,
                         );
                         if let Some(ref stream) = entry.stream {
-                            let _ = self.poller.add(stream.as_fd(), raw_fd as u64, true, false);
+                            let _ = self.poller.add(stream.as_fd(), raw_fd_to_u64(raw_fd), true, false);
                         }
                     }
 
@@ -1278,10 +1272,9 @@ impl Engine {
 
         let lfd = self.listeners[l_idx].raw_fd();
         if self.listeners[l_idx].is_full() {
-            #[allow(clippy::cast_sign_loss)]
             let _ = self.poller.modify(
                 self.listeners[l_idx].borrowed_fd(),
-                lfd as u64,
+                raw_fd_to_u64(lfd),
                 false,
                 false,
             );
@@ -1480,10 +1473,9 @@ impl Engine {
             }
 
             if self.listeners[l_idx].is_full() {
-                #[allow(clippy::cast_sign_loss)]
                 let _ = self.poller.modify(
                     self.listeners[l_idx].borrowed_fd(),
-                    lfd as u64,
+                    raw_fd_to_u64(lfd),
                     false,
                     false,
                 );
@@ -1645,7 +1637,6 @@ fn register_new_session(
     };
     entry.task = task_ref;
 
-    #[allow(clippy::cast_sign_loss)]
     {
         engine.fdtab.insert(
             cli_raw_fd,
@@ -1657,7 +1648,7 @@ fn register_new_session(
         );
         let _ = engine.poller.add(
             entry.sess.cli.as_fd(),
-            cli_raw_fd as u64,
+            raw_fd_to_u64(cli_raw_fd),
             cli_interest.readable,
             cli_interest.writable,
         );
@@ -1673,7 +1664,6 @@ fn register_new_session(
             }
         };
         entry.srv_interest = init_srv_interest;
-        #[allow(clippy::cast_sign_loss)]
         {
             engine.fdtab.insert(
                 sfd,
@@ -1685,7 +1675,7 @@ fn register_new_session(
             );
             let _ = engine.poller.add(
                 srv_fd.as_fd(),
-                sfd as u64,
+                raw_fd_to_u64(sfd),
                 init_srv_interest.readable,
                 init_srv_interest.writable,
             );
@@ -2058,10 +2048,9 @@ fn retry_server_connect(
                 new_interest,
             );
             if let Some(ref srv) = entry.sess.srv {
-                #[allow(clippy::cast_sign_loss)]
                 let _ = poller.add(
                     srv.as_fd(),
-                    sfd as u64,
+                    raw_fd_to_u64(sfd),
                     new_interest.readable,
                     new_interest.writable,
                 );
@@ -2077,8 +2066,7 @@ fn retry_server_connect(
                 Interest::WRITE,
             );
             if let Some(ref srv) = entry.sess.srv {
-                #[allow(clippy::cast_sign_loss)]
-                let _ = poller.add(srv.as_fd(), sfd as u64, false, true);
+                let _ = poller.add(srv.as_fd(), raw_fd_to_u64(sfd), false, true);
             }
         }
     } else {
@@ -2120,10 +2108,9 @@ fn check_srv_connect(
                     };
                     if new_interest != entry.srv_interest {
                         if let Some(srv_fd) = entry.sess.srv.as_ref() {
-                            #[allow(clippy::cast_sign_loss)]
                             let _ = poller.modify(
                                 srv_fd.as_fd(),
-                                sfd as u64,
+                                raw_fd_to_u64(sfd),
                                 new_interest.readable,
                                 new_interest.writable,
                             );
@@ -2159,10 +2146,9 @@ fn update_interests(entry: &mut SessionEntry, fdtab: &mut FdTab, poller: &mut Po
         writable: cli_want.write,
     };
     if new_cli_interest != entry.cli_interest {
-        #[allow(clippy::cast_sign_loss)]
         let _ = poller.modify(
             entry.sess.cli.as_fd(),
-            entry.cli_raw_fd as u64,
+            raw_fd_to_u64(entry.cli_raw_fd),
             new_cli_interest.readable,
             new_cli_interest.writable,
         );
@@ -2177,10 +2163,9 @@ fn update_interests(entry: &mut SessionEntry, fdtab: &mut FdTab, poller: &mut Po
                 writable: srv_want.write,
             };
             if new_srv_interest != entry.srv_interest {
-                #[allow(clippy::cast_sign_loss)]
                 let _ = poller.modify(
                     srv_fd.as_fd(),
-                    sfd as u64,
+                    raw_fd_to_u64(sfd),
                     new_srv_interest.readable,
                     new_srv_interest.writable,
                 );
@@ -2232,13 +2217,11 @@ fn cleanup_done(
         }
     }
 
-    #[allow(clippy::cast_possible_truncation)]
-    if let Some(l) = listeners.iter_mut().find(|l| l.proxy == proxy_idx as u32) {
+    if let Some(l) = listeners.iter_mut().find(|l| l.proxy == usize_to_u32(proxy_idx)) {
         l.nbconn = l.nbconn.saturating_sub(1);
         let lfd = l.raw_fd();
         if !l.is_full() && fdtab.interest(lfd).is_none() {
-            #[allow(clippy::cast_sign_loss)]
-            let _ = poller.modify(l.borrowed_fd(), lfd as u64, true, false);
+            let _ = poller.modify(l.borrowed_fd(), raw_fd_to_u64(lfd), true, false);
             fdtab.set_interest(lfd, Interest::READ);
         }
     }
@@ -3109,18 +3092,12 @@ impl EngineDispatcher<'_> {
         CURRENT_TIMEOUTS.with(|t| {
             let mut map = t.borrow_mut();
             map.clear();
-            #[allow(clippy::cast_possible_truncation)]
-            let fe_client = proxies[proxy_idx].stats_config.raw_timeouts.client.map_or(0, |d| d.as_millis() as u32);
-            #[allow(clippy::cast_possible_truncation)]
-            let fe_connect = proxies[proxy_idx].stats_config.raw_timeouts.connect.map_or(0, |d| d.as_millis() as u32);
-            #[allow(clippy::cast_possible_truncation)]
-            let fe_server = proxies[proxy_idx].stats_config.raw_timeouts.server.map_or(0, |d| d.as_millis() as u32);
-            #[allow(clippy::cast_possible_truncation)]
-            let fe_queue = proxies[proxy_idx].stats_config.raw_timeouts.queue.map_or(0, |d| d.as_millis() as u32);
-            #[allow(clippy::cast_possible_truncation)]
-            let fe_tunnel = proxies[proxy_idx].stats_config.raw_timeouts.tunnel.map_or(0, |d| d.as_millis() as u32);
-            #[allow(clippy::cast_possible_truncation)]
-            let fe_tarpit = proxies[proxy_idx].stats_config.raw_timeouts.tarpit.map_or(0, |d| d.as_millis() as u32);
+            let fe_client = proxies[proxy_idx].stats_config.raw_timeouts.client.map_or(0, millis_to_u32);
+            let fe_connect = proxies[proxy_idx].stats_config.raw_timeouts.connect.map_or(0, millis_to_u32);
+            let fe_server = proxies[proxy_idx].stats_config.raw_timeouts.server.map_or(0, millis_to_u32);
+            let fe_queue = proxies[proxy_idx].stats_config.raw_timeouts.queue.map_or(0, millis_to_u32);
+            let fe_tunnel = proxies[proxy_idx].stats_config.raw_timeouts.tunnel.map_or(0, millis_to_u32);
+            let fe_tarpit = proxies[proxy_idx].stats_config.raw_timeouts.tarpit.map_or(0, millis_to_u32);
 
             map.insert("fe_client_timeout".into(), fe_client);
             map.insert("cur_client_timeout".into(), fe_client);
@@ -3704,16 +3681,11 @@ impl EngineDispatcher<'_> {
         // Update backend timeouts
         CURRENT_TIMEOUTS.with(|t| {
             let mut map = t.borrow_mut();
-            #[allow(clippy::cast_possible_truncation)]
-            let be_server = proxies[be_idx].stats_config.raw_timeouts.server.map_or(0, |d| d.as_millis() as u32);
-            #[allow(clippy::cast_possible_truncation)]
-            let be_connect = proxies[be_idx].stats_config.raw_timeouts.connect.map_or(0, |d| d.as_millis() as u32);
-            #[allow(clippy::cast_possible_truncation)]
-            let be_queue = proxies[be_idx].stats_config.raw_timeouts.queue.map_or(0, |d| d.as_millis() as u32);
-            #[allow(clippy::cast_possible_truncation)]
-            let be_tunnel = proxies[be_idx].stats_config.raw_timeouts.tunnel.map_or(0, |d| d.as_millis() as u32);
-            #[allow(clippy::cast_possible_truncation)]
-            let be_tarpit = proxies[be_idx].stats_config.raw_timeouts.tarpit.map_or(0, |d| d.as_millis() as u32);
+            let be_server = proxies[be_idx].stats_config.raw_timeouts.server.map_or(0, millis_to_u32);
+            let be_connect = proxies[be_idx].stats_config.raw_timeouts.connect.map_or(0, millis_to_u32);
+            let be_queue = proxies[be_idx].stats_config.raw_timeouts.queue.map_or(0, millis_to_u32);
+            let be_tunnel = proxies[be_idx].stats_config.raw_timeouts.tunnel.map_or(0, millis_to_u32);
+            let be_tarpit = proxies[be_idx].stats_config.raw_timeouts.tarpit.map_or(0, millis_to_u32);
 
             map.insert("be_server_timeout".into(), be_server);
             map.insert("be_connect_timeout".into(), be_connect);
@@ -3889,10 +3861,9 @@ impl EngineDispatcher<'_> {
                     new_interest,
                 );
                 if let Some(ref srv) = entry.sess.srv {
-                    #[allow(clippy::cast_sign_loss)]
                     let _ = poller.add(
                         srv.as_fd(),
-                        sfd as u64,
+                        raw_fd_to_u64(sfd),
                         new_interest.readable,
                         new_interest.writable,
                     );
@@ -3908,8 +3879,7 @@ impl EngineDispatcher<'_> {
                     Interest::WRITE,
                 );
                 if let Some(ref srv) = entry.sess.srv {
-                    #[allow(clippy::cast_sign_loss)]
-                    let _ = poller.add(srv.as_fd(), sfd as u64, false, true);
+                    let _ = poller.add(srv.as_fd(), raw_fd_to_u64(sfd), false, true);
                 }
             }
         } else {
@@ -3986,10 +3956,9 @@ impl EngineDispatcher<'_> {
                     new_interest,
                 );
                 if let Some(ref srv) = entry.sess.srv {
-                    #[allow(clippy::cast_sign_loss)]
                     let _ = poller.add(
                         srv.as_fd(),
-                        sfd as u64,
+                        raw_fd_to_u64(sfd),
                         new_interest.readable,
                         new_interest.writable,
                     );
@@ -4005,8 +3974,7 @@ impl EngineDispatcher<'_> {
                     Interest::WRITE,
                 );
                 if let Some(ref srv) = entry.sess.srv {
-                    #[allow(clippy::cast_sign_loss)]
-                    let _ = poller.add(srv.as_fd(), sfd as u64, false, true);
+                    let _ = poller.add(srv.as_fd(), raw_fd_to_u64(sfd), false, true);
                 }
             }
         } else {
@@ -4077,14 +4045,14 @@ impl EngineDispatcher<'_> {
         }
     }
 
-    #[allow(clippy::cast_possible_truncation)]
     fn step_applet(&mut self, applet_idx: usize) -> Outcome {
-        let Some(applet) = self.applets.get_mut(applet_idx as u32) else {
+        let applet_id = usize_to_u32(applet_idx);
+        let Some(applet) = self.applets.get_mut(applet_id) else {
             return Outcome::Done;
         };
 
         if applet.is_done {
-            if let Some(applet) = self.applets.free(applet_idx as u32) {
+            if let Some(applet) = self.applets.free(applet_id) {
                 if let Some(ref stream) = applet.stream {
                     let _ = self.poller.delete(stream.as_fd());
                 }
@@ -4117,7 +4085,7 @@ impl EngineDispatcher<'_> {
         }
 
         if applet.is_done {
-            if let Some(applet) = self.applets.free(applet_idx as u32) {
+            if let Some(applet) = self.applets.free(applet_id) {
                 if let Some(ref stream) = applet.stream {
                     let _ = self.poller.delete(stream.as_fd());
                 }
@@ -4139,10 +4107,9 @@ impl EngineDispatcher<'_> {
             applet.interest = new_interest;
             self.fdtab.set_interest(applet.raw_fd, new_interest);
             if let Some(ref stream) = applet.stream {
-                #[allow(clippy::cast_sign_loss)]
                 let _ = self.poller.modify(
                     stream.as_fd(),
-                    applet.raw_fd as u64,
+                    raw_fd_to_u64(applet.raw_fd),
                     new_interest.readable,
                     new_interest.writable,
                 );

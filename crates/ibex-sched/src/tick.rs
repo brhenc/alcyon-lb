@@ -44,10 +44,7 @@ impl Tick {
         if !self.is_set() {
             return false;
         }
-        #[allow(clippy::cast_possible_wrap)]
-        {
-            (self.0.wrapping_sub(now.0) as i32) <= 0
-        }
+        i32::from_ne_bytes(self.0.wrapping_sub(now.0).to_ne_bytes()) <= 0
     }
 
     /// `true` if `self` is strictly earlier than `other`, accounting for wrap.
@@ -61,10 +58,7 @@ impl Tick {
         if !other.is_set() {
             return true;
         }
-        #[allow(clippy::cast_possible_wrap)]
-        {
-            (self.0.wrapping_sub(other.0) as i32) < 0
-        }
+        i32::from_ne_bytes(self.0.wrapping_sub(other.0).to_ne_bytes()) < 0
     }
 
     /// Adds a millisecond delay, skipping the reserved zero value.

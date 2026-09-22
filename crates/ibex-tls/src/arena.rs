@@ -103,8 +103,7 @@ impl TlsArena {
         let mut free_list = Vec::with_capacity(capacity);
 
         for i in 0..capacity {
-            #[allow(clippy::cast_possible_truncation)]
-            let id = i as u32;
+            let id = u32::try_from(i).unwrap_or(0);
             slots.push(TlsSlot::new(id, buf_capacity));
             free_list.push(id);
         }

@@ -10,18 +10,23 @@ use std::fmt::Write;
 
 /// Formats a byte count into a human-readable string (B, KB, MB, GB).
 #[must_use]
-#[allow(clippy::cast_precision_loss)]
 pub fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = 1024 * 1024;
     const GB: u64 = 1024 * 1024 * 1024;
 
     if bytes >= GB {
-        format!("{:.2} GB", bytes as f64 / GB as f64)
+        let whole = bytes / GB;
+        let frac = ((bytes % GB) * 100) / GB;
+        format!("{whole}.{frac:02} GB")
     } else if bytes >= MB {
-        format!("{:.2} MB", bytes as f64 / MB as f64)
+        let whole = bytes / MB;
+        let frac = ((bytes % MB) * 100) / MB;
+        format!("{whole}.{frac:02} MB")
     } else if bytes >= KB {
-        format!("{:.2} KB", bytes as f64 / KB as f64)
+        let whole = bytes / KB;
+        let frac = ((bytes % KB) * 100) / KB;
+        format!("{whole}.{frac:02} KB")
     } else {
         format!("{bytes} B")
     }

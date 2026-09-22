@@ -259,10 +259,7 @@ impl Eb32Tree {
             DUP
         } else {
             // flsnz(x) - 1: index of the highest bit where the keys differ.
-            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-            {
-                (key ^ okey).ilog2() as i16
-            }
+            i16::try_from((key ^ okey).ilog2()).unwrap_or(0)
         };
 
         let new_leaf = Branch::new(new, Half::Leaf);
@@ -695,7 +692,6 @@ impl Eb32Tree {
                     None
                 };
             }
-            #[allow(clippy::cast_sign_loss)]
             let side = Side::from_bit(key >> bit);
             t = self.nodes[n as usize].branches[side.idx()];
             if t.is_none() {
@@ -757,8 +753,7 @@ impl Eb32Tree {
             // Any differing bit *above* this node's bit means the entire subtree is
             // uniformly on one side of `x`.
             if (x ^ y) & z.wrapping_shl(1).wrapping_neg() != 0 {
-                #[allow(clippy::cast_sign_loss)]
-                let shift = bit as u32;
+                let shift = u32::try_from(bit).unwrap_or(0);
                 if (y >> shift) > (x >> shift) {
                     // Whole subtree exceeds x: its minimum is the answer.
                     return self.walk_down(

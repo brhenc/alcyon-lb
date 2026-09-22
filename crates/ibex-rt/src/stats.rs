@@ -407,9 +407,8 @@ pub fn format_show_stat_filtered(
 
     for (p_idx, proxy) in proxies.iter().enumerate() {
         let iid = p_idx + 1;
-        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         if let Some(f_iid) = iid_filter {
-            if f_iid != -1 && f_iid != iid as i32 {
+            if f_iid != -1 && usize::try_from(f_iid).ok() != Some(iid) {
                 continue;
             }
         }
@@ -423,9 +422,8 @@ pub fn format_show_stat_filtered(
         if match_type(2) {
             for (s_idx, _) in proxy.servers.iter().enumerate() {
                 let sid = s_idx + 1;
-                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
                 if let Some(f_sid) = sid_filter {
-                    if f_sid != -1 && f_sid != sid as i32 {
+                    if f_sid != -1 && usize::try_from(f_sid).ok() != Some(sid) {
                         continue;
                     }
                 }

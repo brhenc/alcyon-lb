@@ -141,8 +141,7 @@ impl Poller {
         for ev in &buf {
             let fl = ev.flags;
             f(Event {
-                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-                fd: ev.data.u64() as RawFd,
+                fd: RawFd::try_from(ev.data.u64()).unwrap_or(-1),
                 readable: fl.contains(epoll::EventFlags::IN),
                 writable: fl.contains(epoll::EventFlags::OUT),
                 closed: fl.intersects(

@@ -379,17 +379,16 @@ pub struct HuffmanNode {
 
 /// Builds the Huffman decoding binary tree at compile time.
 #[must_use]
-#[allow(clippy::cast_possible_truncation)]
 pub const fn build_huffman_tree() -> [HuffmanNode; 513] {
     let mut tree = [HuffmanNode {
         left: 0,
         right: 0,
         sym: 0xFFFF,
     }; 513];
-    let mut next_node = 1;
-    let mut sym = 0;
+    let mut next_node: u16 = 1;
+    let mut sym: u16 = 0;
     while sym < 257 {
-        let (code, len) = HUFFMAN_CODES[sym];
+        let (code, len) = HUFFMAN_CODES[sym as usize];
         let mut curr = 0;
         let mut bit_idx = 0;
         while bit_idx < len {
@@ -397,8 +396,8 @@ pub const fn build_huffman_tree() -> [HuffmanNode; 513] {
             if bit == 0 {
                 let left = tree[curr].left;
                 if left == 0 {
-                    tree[curr].left = next_node as u16;
-                    curr = next_node;
+                    tree[curr].left = next_node;
+                    curr = next_node as usize;
                     next_node += 1;
                 } else {
                     curr = left as usize;
@@ -406,8 +405,8 @@ pub const fn build_huffman_tree() -> [HuffmanNode; 513] {
             } else {
                 let right = tree[curr].right;
                 if right == 0 {
-                    tree[curr].right = next_node as u16;
-                    curr = next_node;
+                    tree[curr].right = next_node;
+                    curr = next_node as usize;
                     next_node += 1;
                 } else {
                     curr = right as usize;
@@ -415,7 +414,7 @@ pub const fn build_huffman_tree() -> [HuffmanNode; 513] {
             }
             bit_idx += 1;
         }
-        tree[curr].sym = sym as u16;
+        tree[curr].sym = sym;
         sym += 1;
     }
     tree
@@ -429,7 +428,6 @@ pub static HUFFMAN_TREE: [HuffmanNode; 513] = build_huffman_tree();
 /// # Errors
 /// Returns `H2Error::CompressionError` if bitstream contains invalid prefixes, the EOS symbol,
 /// or padding longer than 7 bits or not composed entirely of 1s.
-#[allow(clippy::cast_possible_truncation)]
 pub fn decode_huffman(data: &[u8]) -> Result<String, H2Error> {
     let mut node_idx = 0usize;
     let mut out = Vec::with_capacity(data.len());
@@ -455,7 +453,7 @@ pub fn decode_huffman(data: &[u8]) -> Result<String, H2Error> {
                     // MUST be treated as a decoding error.
                     return Err(H2Error::CompressionError);
                 }
-                out.push((sym & 0xFF) as u8);
+                out.push(sym.to_le_bytes()[0]);
                 node_idx = 0;
                 rem_bits = 0;
             } else {
@@ -649,19 +647,18 @@ pub fn find_table_entry(name: &str, value: &str, dynamic: &DynamicTable) -> Opti
 }
 
 /// Encodes an HPACK integer with an N-bit prefix (RFC 7541 §5.1).
-#[allow(clippy::cast_possible_truncation)]
 pub fn encode_integer(val: usize, prefix_bits: u8, prefix_mask: u8, dst: &mut Vec<u8>) {
     let max_prefix = (1usize << prefix_bits) - 1;
     if val < max_prefix {
-        dst.push(prefix_mask | (val as u8));
+        dst.push(prefix_mask | val.to_le_bytes()[0]);
     } else {
-        dst.push(prefix_mask | (max_prefix as u8));
+        dst.push(prefix_mask | max_prefix.to_le_bytes()[0]);
         let mut rem = val - max_prefix;
         while rem >= 128 {
-            dst.push(((rem % 128) as u8) | 0x80);
+            dst.push(u8::try_from(rem % 128).unwrap_or(0) | 0x80);
             rem /= 128;
         }
-        dst.push(rem as u8);
+        dst.push(u8::try_from(rem % 128).unwrap_or(0));
     }
 }
 

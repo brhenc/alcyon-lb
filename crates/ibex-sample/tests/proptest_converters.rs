@@ -62,8 +62,7 @@ proptest! {
             ..Default::default()
         };
         let result = reg.eval("url", &[], &convs, &ctx).expect("eval len");
-        #[allow(clippy::cast_possible_wrap)]
-        let expected_len = s.len() as i64;
+        let expected_len = i64::try_from(s.len()).unwrap_or(i64::MAX);
         prop_assert_eq!(result, Sample::Sint(expected_len));
     }
 

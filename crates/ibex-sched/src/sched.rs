@@ -353,10 +353,7 @@ impl Scheduler {
         if nice != 0 {
             let offset =
                 i32::from(nice).saturating_mul(i32::try_from(RUNQUEUE_DEPTH).unwrap_or(i32::MAX));
-            #[allow(clippy::cast_sign_loss)]
-            {
-                key = key.wrapping_add(offset as u32);
-            }
+            key = key.wrapping_add(u32::from_ne_bytes(offset.to_ne_bytes()));
             self.niced_tasks += 1;
         }
 

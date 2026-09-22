@@ -301,8 +301,7 @@ impl Transport for RustlsTransport {
                 if !ctx.rx_raw.is_empty() {
                     let mut cursor = Cursor::new(&ctx.rx_raw);
                     let _ = conn.read_tls(&mut cursor);
-                    #[allow(clippy::cast_possible_truncation)]
-                    let consumed = cursor.position() as usize;
+                    let consumed = usize::try_from(cursor.position()).unwrap_or(0);
                     ctx.rx_raw.drain(..consumed);
                     let _ = conn
                         .process_new_packets()
@@ -321,8 +320,7 @@ impl Transport for RustlsTransport {
                 if !ctx.rx_raw.is_empty() {
                     let mut cursor = Cursor::new(&ctx.rx_raw);
                     let _ = conn.read_tls(&mut cursor);
-                    #[allow(clippy::cast_possible_truncation)]
-                    let consumed = cursor.position() as usize;
+                    let consumed = usize::try_from(cursor.position()).unwrap_or(0);
                     ctx.rx_raw.drain(..consumed);
                     let _ = conn
                         .process_new_packets()
@@ -368,8 +366,7 @@ impl Transport for RustlsTransport {
                 if !ctx.rx_raw.is_empty() {
                     let mut cursor = Cursor::new(&ctx.rx_raw);
                     let _ = conn.read_tls(&mut cursor);
-                    #[allow(clippy::cast_possible_truncation)]
-                    let consumed = cursor.position() as usize;
+                    let consumed = usize::try_from(cursor.position()).unwrap_or(0);
                     ctx.rx_raw.drain(..consumed);
                     let _ = conn
                         .process_new_packets()
@@ -385,8 +382,7 @@ impl Transport for RustlsTransport {
                 if !ctx.rx_raw.is_empty() {
                     let mut cursor = Cursor::new(&ctx.rx_raw);
                     let _ = conn.read_tls(&mut cursor);
-                    #[allow(clippy::cast_possible_truncation)]
-                    let consumed = cursor.position() as usize;
+                    let consumed = usize::try_from(cursor.position()).unwrap_or(0);
                     ctx.rx_raw.drain(..consumed);
                     let _ = conn
                         .process_new_packets()

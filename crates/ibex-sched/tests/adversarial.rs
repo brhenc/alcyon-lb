@@ -254,11 +254,10 @@ fn extending_a_timeout_touches_no_tree_node() {
     let deletes_after_setup = s.stats().timer_deletes;
     assert_eq!(inserts_after_setup, 1000);
 
-    // Each "byte received" pushes the timeout further out.
     for round in 1..=100u32 {
         for (n, &t) in conns.iter().enumerate() {
-            #[allow(clippy::cast_possible_truncation)]
-            s.queue_timer(t, Tick(20_000 + round * 10 + n as u32 % 7));
+            let offset = u32::try_from(n).unwrap_or(0) % 7;
+            s.queue_timer(t, Tick(20_000 + round * 10 + offset));
         }
     }
 

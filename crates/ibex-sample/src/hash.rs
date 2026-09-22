@@ -224,8 +224,7 @@ pub fn hash_xxh32(input: &[u8], seed: u32) -> u32 {
         }
     }
 
-    #[allow(clippy::cast_possible_truncation)]
-    let len_u32 = len as u32;
+    let len_u32 = u32::try_from(len & 0xFFFF_FFFF).unwrap_or(0);
     h32 = h32.wrapping_add(len_u32);
 
     h32 ^= h32 >> 15;
@@ -319,8 +318,7 @@ pub fn hash_xxh64(input: &[u8], seed: u64) -> u64 {
         }
     }
 
-    #[allow(clippy::cast_possible_truncation)]
-    let len_u64 = len as u64;
+    let len_u64 = u64::try_from(len).unwrap_or(u64::MAX);
     h64 = h64.wrapping_add(len_u64);
 
     h64 ^= h64 >> 33;

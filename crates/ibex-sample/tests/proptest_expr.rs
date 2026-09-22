@@ -72,8 +72,8 @@ proptest! {
             ..Default::default()
         };
 
-        #[allow(clippy::cast_possible_wrap)]
-        let expected = uri.len() as i64 + delta;
+        let uri_len = i64::try_from(uri.len()).unwrap_or(i64::MAX);
+        let expected = uri_len + delta;
         let expr_str = format!("url,len,add({delta}) -m eq {expected}");
         let expr = Expr::parse(&expr_str).unwrap();
         prop_assert!(expr.eval(&registry, &ctx));

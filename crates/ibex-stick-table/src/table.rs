@@ -196,7 +196,6 @@ impl StickTable {
     ///
     /// Returns [`StickTableError::LockPoisoned`] if lock acquisition fails, or
     /// [`StickTableError::CapacityExceeded`] if max size is exceeded and no entries can be evicted.
-    #[allow(clippy::cast_possible_truncation)]
     pub fn update_entry<F>(&self, key: &StickKey, mut f: F) -> Result<(), StickTableError>
     where
         F: FnMut(&mut StickEntryData),
@@ -239,7 +238,8 @@ impl StickTable {
         let slot_idx = if let Some(idx) = inner.free_slots.pop() {
             idx
         } else {
-            let idx = inner.slots.len() as u32;
+            let idx = u32::try_from(inner.slots.len())
+                .map_err(|_| StickTableError::CapacityExceeded(self.config.max_size))?;
             inner.slots.push(None);
             idx
         };

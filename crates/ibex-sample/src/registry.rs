@@ -48,6 +48,16 @@ pub fn set_current_res_status(status: u16) {
     CURRENT_RES_STATUS.set(status);
 }
 
+#[inline]
+fn u64_to_sint(v: u64) -> i64 {
+    i64::try_from(v).unwrap_or(i64::MAX)
+}
+
+#[inline]
+fn len_to_sint(len: usize) -> i64 {
+    i64::try_from(len).unwrap_or(i64::MAX)
+}
+
 /// Runtime context passed into sample fetch functions during evaluation.
 #[derive(Debug, Clone, Default)]
 pub struct SampleContext<'a> {
@@ -625,8 +635,7 @@ impl Registry {
         let req_hdr_cnt_fetch: FetchFn = |ctx, args| {
             let name = args.first()?;
             let count = get_all_req_headers(ctx, name).len();
-            #[allow(clippy::cast_possible_wrap)]
-            Some(Sample::Sint(count as i64))
+            Some(Sample::Sint(len_to_sint(count)))
         };
         self.register_fetch(FetchDesc {
             name: "req.hdr_cnt",
@@ -645,8 +654,7 @@ impl Registry {
             func: |ctx, args| {
                 let name = args.first()?;
                 let count = get_all_res_headers(ctx, name).len();
-                #[allow(clippy::cast_possible_wrap)]
-                Some(Sample::Sint(count as i64))
+                Some(Sample::Sint(len_to_sint(count)))
             },
         });
 
@@ -833,8 +841,7 @@ impl Registry {
 
         let request_body_len_fetch: FetchFn = |ctx, _args| {
             if let Some(b) = ctx.req_body {
-                #[allow(clippy::cast_possible_wrap)]
-                return Some(Sample::Sint(b.len() as i64));
+                return Some(Sample::Sint(len_to_sint(b.len())));
             }
             if let Some(cl) = get_req_header(ctx, "content-length") {
                 return cl.trim().parse::<i64>().ok().map(Sample::Sint);
@@ -859,8 +866,7 @@ impl Registry {
 
         let response_body_len_fetch: FetchFn = |ctx, _args| {
             if let Some(b) = ctx.res_body {
-                #[allow(clippy::cast_possible_wrap)]
-                return Some(Sample::Sint(b.len() as i64));
+                return Some(Sample::Sint(len_to_sint(b.len())));
             }
             if let Some(cl) = get_res_header(ctx, "content-length") {
                 return cl.trim().parse::<i64>().ok().map(Sample::Sint);
@@ -1050,80 +1056,67 @@ impl Registry {
         self.register_fetch(FetchDesc {
             name: "conn_cnt",
             out_type: SampleType::Sint,
-            #[allow(clippy::cast_possible_wrap)]
-            func: |ctx, _args| Some(Sample::Sint(ctx.conn_cnt as i64)),
+            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.conn_cnt))),
         });
         self.register_fetch(FetchDesc {
             name: "cum_conn",
             out_type: SampleType::Sint,
-            #[allow(clippy::cast_possible_wrap)]
-            func: |ctx, _args| Some(Sample::Sint(ctx.cum_conn as i64)),
+            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.cum_conn))),
         });
         self.register_fetch(FetchDesc {
             name: "conn_rate",
             out_type: SampleType::Sint,
-            #[allow(clippy::cast_possible_wrap)]
-            func: |ctx, _args| Some(Sample::Sint(ctx.conn_rate as i64)),
+            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.conn_rate))),
         });
         self.register_fetch(FetchDesc {
             name: "sess_rate",
             out_type: SampleType::Sint,
-            #[allow(clippy::cast_possible_wrap)]
-            func: |ctx, _args| Some(Sample::Sint(ctx.conn_rate as i64)),
+            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.conn_rate))),
         });
         self.register_fetch(FetchDesc {
             name: "fe_sess_rate",
             out_type: SampleType::Sint,
-            #[allow(clippy::cast_possible_wrap)]
-            func: |ctx, _args| Some(Sample::Sint(ctx.conn_rate as i64)),
+            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.conn_rate))),
         });
         self.register_fetch(FetchDesc {
             name: "be_sess_rate",
             out_type: SampleType::Sint,
-            #[allow(clippy::cast_possible_wrap)]
-            func: |ctx, _args| Some(Sample::Sint(ctx.conn_rate as i64)),
+            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.conn_rate))),
         });
         self.register_fetch(FetchDesc {
             name: "srv_sess_rate",
             out_type: SampleType::Sint,
-            #[allow(clippy::cast_possible_wrap)]
-            func: |ctx, _args| Some(Sample::Sint(ctx.conn_rate as i64)),
+            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.conn_rate))),
         });
         self.register_fetch(FetchDesc {
             name: "sess_cnt",
             out_type: SampleType::Sint,
-            #[allow(clippy::cast_possible_wrap)]
-            func: |ctx, _args| Some(Sample::Sint(ctx.conn_cnt as i64)),
+            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.conn_cnt))),
         });
         self.register_fetch(FetchDesc {
             name: "req_rate",
             out_type: SampleType::Sint,
-            #[allow(clippy::cast_possible_wrap)]
-            func: |ctx, _args| Some(Sample::Sint(ctx.http_req_rate as i64)),
+            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.http_req_rate))),
         });
         self.register_fetch(FetchDesc {
             name: "fe_req_rate",
             out_type: SampleType::Sint,
-            #[allow(clippy::cast_possible_wrap)]
-            func: |ctx, _args| Some(Sample::Sint(ctx.http_req_rate as i64)),
+            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.http_req_rate))),
         });
         self.register_fetch(FetchDesc {
             name: "req_cnt",
             out_type: SampleType::Sint,
-            #[allow(clippy::cast_possible_wrap)]
-            func: |ctx, _args| Some(Sample::Sint(ctx.http_req_cnt as i64)),
+            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.http_req_cnt))),
         });
         self.register_fetch(FetchDesc {
             name: "err_rate",
             out_type: SampleType::Sint,
-            #[allow(clippy::cast_possible_wrap)]
-            func: |ctx, _args| Some(Sample::Sint(ctx.http_err_rate as i64)),
+            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.http_err_rate))),
         });
         self.register_fetch(FetchDesc {
             name: "err_cnt",
             out_type: SampleType::Sint,
-            #[allow(clippy::cast_possible_wrap)]
-            func: |ctx, _args| Some(Sample::Sint(ctx.http_err_rate as i64)),
+            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.http_err_rate))),
         });
 
         // --- 10. Stick Table Trackers Fetches ---
@@ -1132,16 +1125,15 @@ impl Registry {
                 self.register_fetch(FetchDesc {
                     name: $name,
                     out_type: SampleType::Sint,
-                    #[allow(clippy::cast_possible_wrap)]
                     func: |ctx, args| {
                         let slot = args
                             .first()
                             .and_then(|s| s.parse::<usize>().ok())
                             .unwrap_or(0);
                         if slot < 3 && ctx.$arr[slot] > 0 {
-                            Some(Sample::Sint(ctx.$arr[slot] as i64))
+                            Some(Sample::Sint(u64_to_sint(ctx.$arr[slot])))
                         } else {
-                            Some(Sample::Sint(ctx.$field as i64))
+                            Some(Sample::Sint(u64_to_sint(ctx.$field)))
                         }
                     },
                 });
@@ -1164,44 +1156,37 @@ impl Registry {
         self.register_fetch(FetchDesc {
             name: "sc_sess_cnt",
             out_type: SampleType::Sint,
-            #[allow(clippy::cast_possible_wrap)]
-            func: |ctx, _args| Some(Sample::Sint(ctx.conn_cnt as i64)),
+            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.conn_cnt))),
         });
         self.register_fetch(FetchDesc {
             name: "sc_sess_rate",
             out_type: SampleType::Sint,
-            #[allow(clippy::cast_possible_wrap)]
-            func: |ctx, _args| Some(Sample::Sint(ctx.conn_rate as i64)),
+            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.conn_rate))),
         });
         self.register_fetch(FetchDesc {
             name: "sc_http_err_cnt",
             out_type: SampleType::Sint,
-            #[allow(clippy::cast_possible_wrap)]
-            func: |ctx, _args| Some(Sample::Sint(ctx.http_err_rate as i64)),
+            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.http_err_rate))),
         });
         self.register_fetch(FetchDesc {
             name: "sc_bytes_in_rate",
             out_type: SampleType::Sint,
-            #[allow(clippy::cast_possible_wrap)]
-            func: |ctx, _args| Some(Sample::Sint(ctx.bytes_in_cnt as i64)),
+            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.bytes_in_cnt))),
         });
         self.register_fetch(FetchDesc {
             name: "sc_bytes_out_rate",
             out_type: SampleType::Sint,
-            #[allow(clippy::cast_possible_wrap)]
-            func: |ctx, _args| Some(Sample::Sint(ctx.bytes_out_cnt as i64)),
+            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.bytes_out_cnt))),
         });
         self.register_fetch(FetchDesc {
             name: "sc_kbytes_in",
             out_type: SampleType::Sint,
-            #[allow(clippy::cast_possible_wrap)]
-            func: |ctx, _args| Some(Sample::Sint((ctx.bytes_in_cnt / 1024) as i64)),
+            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.bytes_in_cnt / 1024))),
         });
         self.register_fetch(FetchDesc {
             name: "sc_kbytes_out",
             out_type: SampleType::Sint,
-            #[allow(clippy::cast_possible_wrap)]
-            func: |ctx, _args| Some(Sample::Sint((ctx.bytes_out_cnt / 1024) as i64)),
+            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.bytes_out_cnt / 1024))),
         });
         self.register_fetch(FetchDesc {
             name: "sc_trackers",
@@ -1211,32 +1196,27 @@ impl Registry {
         self.register_fetch(FetchDesc {
             name: "sc_gpc0",
             out_type: SampleType::Sint,
-            #[allow(clippy::cast_possible_wrap)]
-            func: |ctx, _args| Some(Sample::Sint(ctx.gpc0 as i64)),
+            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.gpc0))),
         });
         self.register_fetch(FetchDesc {
             name: "sc_gpc1",
             out_type: SampleType::Sint,
-            #[allow(clippy::cast_possible_wrap)]
-            func: |ctx, _args| Some(Sample::Sint(ctx.gpc1 as i64)),
+            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.gpc1))),
         });
         self.register_fetch(FetchDesc {
             name: "sc_gpc0_rate",
             out_type: SampleType::Sint,
-            #[allow(clippy::cast_possible_wrap)]
-            func: |ctx, _args| Some(Sample::Sint(ctx.gpc0 as i64)),
+            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.gpc0))),
         });
         self.register_fetch(FetchDesc {
             name: "sc_gpc1_rate",
             out_type: SampleType::Sint,
-            #[allow(clippy::cast_possible_wrap)]
-            func: |ctx, _args| Some(Sample::Sint(ctx.gpc1 as i64)),
+            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.gpc1))),
         });
         self.register_fetch(FetchDesc {
             name: "sc_gpt0",
             out_type: SampleType::Sint,
-            #[allow(clippy::cast_possible_wrap)]
-            func: |ctx, _args| Some(Sample::Sint(ctx.gpt0 as i64)),
+            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.gpt0))),
         });
 
         // sc0_*, sc1_*, sc2_* aliases
@@ -1245,84 +1225,77 @@ impl Registry {
                 self.register_fetch(FetchDesc {
                     name: concat!($prefix, "conn_cnt"),
                     out_type: SampleType::Sint,
-                    #[allow(clippy::cast_possible_wrap)]
                     func: |ctx, _args| {
                         if ctx.sc_conn_cnts[$slot] > 0 {
-                            Some(Sample::Sint(ctx.sc_conn_cnts[$slot] as i64))
+                            Some(Sample::Sint(u64_to_sint(ctx.sc_conn_cnts[$slot])))
                         } else {
-                            Some(Sample::Sint(ctx.conn_cnt as i64))
+                            Some(Sample::Sint(u64_to_sint(ctx.conn_cnt)))
                         }
                     },
                 });
                 self.register_fetch(FetchDesc {
                     name: concat!($prefix, "conn_rate"),
                     out_type: SampleType::Sint,
-                    #[allow(clippy::cast_possible_wrap)]
                     func: |ctx, _args| {
                         if ctx.sc_conn_rates[$slot] > 0 {
-                            Some(Sample::Sint(ctx.sc_conn_rates[$slot] as i64))
+                            Some(Sample::Sint(u64_to_sint(ctx.sc_conn_rates[$slot])))
                         } else {
-                            Some(Sample::Sint(ctx.conn_rate as i64))
+                            Some(Sample::Sint(u64_to_sint(ctx.conn_rate)))
                         }
                     },
                 });
                 self.register_fetch(FetchDesc {
                     name: concat!($prefix, "http_req_rate"),
                     out_type: SampleType::Sint,
-                    #[allow(clippy::cast_possible_wrap)]
                     func: |ctx, _args| {
                         if ctx.sc_http_req_rates[$slot] > 0 {
-                            Some(Sample::Sint(ctx.sc_http_req_rates[$slot] as i64))
+                            Some(Sample::Sint(u64_to_sint(ctx.sc_http_req_rates[$slot])))
                         } else {
-                            Some(Sample::Sint(ctx.http_req_rate as i64))
+                            Some(Sample::Sint(u64_to_sint(ctx.http_req_rate)))
                         }
                     },
                 });
                 self.register_fetch(FetchDesc {
                     name: concat!($prefix, "http_err_rate"),
                     out_type: SampleType::Sint,
-                    #[allow(clippy::cast_possible_wrap)]
                     func: |ctx, _args| {
                         if ctx.sc_http_err_rates[$slot] > 0 {
-                            Some(Sample::Sint(ctx.sc_http_err_rates[$slot] as i64))
+                            Some(Sample::Sint(u64_to_sint(ctx.sc_http_err_rates[$slot])))
                         } else {
-                            Some(Sample::Sint(ctx.http_err_rate as i64))
+                            Some(Sample::Sint(u64_to_sint(ctx.http_err_rate)))
                         }
                     },
                 });
                 self.register_fetch(FetchDesc {
                     name: concat!($prefix, "http_req_cnt"),
                     out_type: SampleType::Sint,
-                    #[allow(clippy::cast_possible_wrap)]
                     func: |ctx, _args| {
                         if ctx.sc_http_req_cnts[$slot] > 0 {
-                            Some(Sample::Sint(ctx.sc_http_req_cnts[$slot] as i64))
+                            Some(Sample::Sint(u64_to_sint(ctx.sc_http_req_cnts[$slot])))
                         } else {
-                            Some(Sample::Sint(ctx.http_req_cnt as i64))
+                            Some(Sample::Sint(u64_to_sint(ctx.http_req_cnt)))
                         }
                     },
                 });
                 self.register_fetch(FetchDesc {
                     name: concat!($prefix, "bytes_in_cnt"),
                     out_type: SampleType::Sint,
-                    #[allow(clippy::cast_possible_wrap)]
                     func: |ctx, _args| {
                         if ctx.sc_bytes_in_cnts[$slot] > 0 {
-                            Some(Sample::Sint(ctx.sc_bytes_in_cnts[$slot] as i64))
+                            Some(Sample::Sint(u64_to_sint(ctx.sc_bytes_in_cnts[$slot])))
                         } else {
-                            Some(Sample::Sint(ctx.bytes_in_cnt as i64))
+                            Some(Sample::Sint(u64_to_sint(ctx.bytes_in_cnt)))
                         }
                     },
                 });
                 self.register_fetch(FetchDesc {
                     name: concat!($prefix, "bytes_out_cnt"),
                     out_type: SampleType::Sint,
-                    #[allow(clippy::cast_possible_wrap)]
                     func: |ctx, _args| {
                         if ctx.sc_bytes_out_cnts[$slot] > 0 {
-                            Some(Sample::Sint(ctx.sc_bytes_out_cnts[$slot] as i64))
+                            Some(Sample::Sint(u64_to_sint(ctx.sc_bytes_out_cnts[$slot])))
                         } else {
-                            Some(Sample::Sint(ctx.bytes_out_cnt as i64))
+                            Some(Sample::Sint(u64_to_sint(ctx.bytes_out_cnt)))
                         }
                     },
                 });
@@ -1337,8 +1310,7 @@ impl Registry {
         self.register_fetch(FetchDesc {
             name: "src_conn_cnt",
             out_type: SampleType::Sint,
-            #[allow(clippy::cast_possible_wrap)]
-            func: |ctx, _args| Some(Sample::Sint(ctx.conn_cnt as i64)),
+            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.conn_cnt))),
         });
         self.register_fetch(FetchDesc {
             name: "src_conn_cur",
@@ -1348,80 +1320,67 @@ impl Registry {
         self.register_fetch(FetchDesc {
             name: "src_conn_rate",
             out_type: SampleType::Sint,
-            #[allow(clippy::cast_possible_wrap)]
-            func: |ctx, _args| Some(Sample::Sint(ctx.conn_rate as i64)),
+            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.conn_rate))),
         });
         self.register_fetch(FetchDesc {
             name: "src_sess_cnt",
             out_type: SampleType::Sint,
-            #[allow(clippy::cast_possible_wrap)]
-            func: |ctx, _args| Some(Sample::Sint(ctx.conn_cnt as i64)),
+            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.conn_cnt))),
         });
         self.register_fetch(FetchDesc {
             name: "src_sess_rate",
             out_type: SampleType::Sint,
-            #[allow(clippy::cast_possible_wrap)]
-            func: |ctx, _args| Some(Sample::Sint(ctx.conn_rate as i64)),
+            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.conn_rate))),
         });
         self.register_fetch(FetchDesc {
             name: "src_http_req_cnt",
             out_type: SampleType::Sint,
-            #[allow(clippy::cast_possible_wrap)]
-            func: |ctx, _args| Some(Sample::Sint(ctx.http_req_cnt as i64)),
+            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.http_req_cnt))),
         });
         self.register_fetch(FetchDesc {
             name: "src_http_req_rate",
             out_type: SampleType::Sint,
-            #[allow(clippy::cast_possible_wrap)]
-            func: |ctx, _args| Some(Sample::Sint(ctx.http_req_rate as i64)),
+            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.http_req_rate))),
         });
         self.register_fetch(FetchDesc {
             name: "src_http_err_cnt",
             out_type: SampleType::Sint,
-            #[allow(clippy::cast_possible_wrap)]
-            func: |ctx, _args| Some(Sample::Sint(ctx.http_err_rate as i64)),
+            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.http_err_rate))),
         });
         self.register_fetch(FetchDesc {
             name: "src_http_err_rate",
             out_type: SampleType::Sint,
-            #[allow(clippy::cast_possible_wrap)]
-            func: |ctx, _args| Some(Sample::Sint(ctx.http_err_rate as i64)),
+            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.http_err_rate))),
         });
         self.register_fetch(FetchDesc {
             name: "src_bytes_in_cnt",
             out_type: SampleType::Sint,
-            #[allow(clippy::cast_possible_wrap)]
-            func: |ctx, _args| Some(Sample::Sint(ctx.bytes_in_cnt as i64)),
+            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.bytes_in_cnt))),
         });
         self.register_fetch(FetchDesc {
             name: "src_bytes_in_rate",
             out_type: SampleType::Sint,
-            #[allow(clippy::cast_possible_wrap)]
-            func: |ctx, _args| Some(Sample::Sint(ctx.bytes_in_cnt as i64)),
+            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.bytes_in_cnt))),
         });
         self.register_fetch(FetchDesc {
             name: "src_bytes_out_cnt",
             out_type: SampleType::Sint,
-            #[allow(clippy::cast_possible_wrap)]
-            func: |ctx, _args| Some(Sample::Sint(ctx.bytes_out_cnt as i64)),
+            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.bytes_out_cnt))),
         });
         self.register_fetch(FetchDesc {
             name: "src_bytes_out_rate",
             out_type: SampleType::Sint,
-            #[allow(clippy::cast_possible_wrap)]
-            func: |ctx, _args| Some(Sample::Sint(ctx.bytes_out_cnt as i64)),
+            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.bytes_out_cnt))),
         });
         self.register_fetch(FetchDesc {
             name: "src_kbytes_in",
             out_type: SampleType::Sint,
-            #[allow(clippy::cast_possible_wrap)]
-            func: |ctx, _args| Some(Sample::Sint((ctx.bytes_in_cnt / 1024) as i64)),
+            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.bytes_in_cnt / 1024))),
         });
         self.register_fetch(FetchDesc {
             name: "src_kbytes_out",
             out_type: SampleType::Sint,
-            #[allow(clippy::cast_possible_wrap)]
-            func: |ctx, _args| Some(Sample::Sint((ctx.bytes_out_cnt / 1024) as i64)),
+            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.bytes_out_cnt / 1024))),
         });
         self.register_fetch(FetchDesc {
             name: "src_trackers",
@@ -1431,32 +1390,27 @@ impl Registry {
         self.register_fetch(FetchDesc {
             name: "src_gpc0",
             out_type: SampleType::Sint,
-            #[allow(clippy::cast_possible_wrap)]
-            func: |ctx, _args| Some(Sample::Sint(ctx.gpc0 as i64)),
+            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.gpc0))),
         });
         self.register_fetch(FetchDesc {
             name: "src_gpc1",
             out_type: SampleType::Sint,
-            #[allow(clippy::cast_possible_wrap)]
-            func: |ctx, _args| Some(Sample::Sint(ctx.gpc1 as i64)),
+            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.gpc1))),
         });
         self.register_fetch(FetchDesc {
             name: "src_gpc0_rate",
             out_type: SampleType::Sint,
-            #[allow(clippy::cast_possible_wrap)]
-            func: |ctx, _args| Some(Sample::Sint(ctx.gpc0 as i64)),
+            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.gpc0))),
         });
         self.register_fetch(FetchDesc {
             name: "src_gpc1_rate",
             out_type: SampleType::Sint,
-            #[allow(clippy::cast_possible_wrap)]
-            func: |ctx, _args| Some(Sample::Sint(ctx.gpc1 as i64)),
+            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.gpc1))),
         });
         self.register_fetch(FetchDesc {
             name: "src_gpt0",
             out_type: SampleType::Sint,
-            #[allow(clippy::cast_possible_wrap)]
-            func: |ctx, _args| Some(Sample::Sint(ctx.gpt0 as i64)),
+            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.gpt0))),
         });
         self.register_fetch(FetchDesc {
             name: "src_in_table",
@@ -1602,8 +1556,7 @@ impl Registry {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default();
-            #[allow(clippy::cast_possible_wrap)]
-            Some(Sample::Sint(now.as_secs() as i64))
+            Some(Sample::Sint(u64_to_sint(now.as_secs())))
         };
         self.register_fetch(FetchDesc {
             name: "date",
@@ -1642,8 +1595,8 @@ impl Registry {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_nanos();
-                #[allow(clippy::cast_possible_truncation)]
-                let r = i64::from(full_hash(seed as u32) % max.max(1));
+                let seed_u32 = u32::from_ne_bytes(seed.to_ne_bytes()[..4].try_into().unwrap());
+                let r = i64::from(full_hash(seed_u32) % max.max(1));
                 Some(Sample::Sint(r))
             },
         });
@@ -2399,8 +2352,7 @@ impl Registry {
             in_type: TypeSpec::Exact(SampleType::Sint),
             out_type: TypeSpec::Exact(SampleType::Bin),
             func: |smp, _args| match smp {
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                Sample::Sint(n) => Some(Sample::Bin((n as u32).to_be_bytes().to_vec())),
+                Sample::Sint(n) => Some(Sample::Bin(n.to_be_bytes()[4..8].to_vec())),
                 _ => None,
             },
         });
@@ -2522,8 +2474,10 @@ impl Registry {
             func: |smp, args| {
                 let seed = args.first().and_then(|s| s.parse().ok()).unwrap_or(0);
                 match smp {
-                    #[allow(clippy::cast_possible_wrap)]
-                    Sample::Bin(b) => Some(Sample::Sint(hash_xxh64(&b, seed) as i64)),
+                    Sample::Bin(b) => {
+                        let h = hash_xxh64(&b, seed);
+                        Some(Sample::Sint(i64::from_ne_bytes(h.to_ne_bytes())))
+                    }
                     _ => None,
                 }
             },
@@ -2536,8 +2490,10 @@ impl Registry {
             func: |smp, args| {
                 let seed = args.first().and_then(|s| s.parse().ok()).unwrap_or(0);
                 match smp {
-                    #[allow(clippy::cast_possible_wrap)]
-                    Sample::Bin(b) => Some(Sample::Sint(hash_xxh3(&b, seed) as i64)),
+                    Sample::Bin(b) => {
+                        let h = hash_xxh3(&b, seed);
+                        Some(Sample::Sint(i64::from_ne_bytes(h.to_ne_bytes())))
+                    }
                     _ => None,
                 }
             },

@@ -44,28 +44,30 @@ fn get_bit(key: &[u8], bit: u32) -> u32 {
     }
 }
 
-#[allow(clippy::cast_possible_truncation)]
 #[inline]
 fn diverge_bit(a: &[u8], b: &[u8]) -> Option<u32> {
     if a == b {
         return None;
     }
     let min_len = a.len().min(b.len());
-    for i in 0..min_len {
-        if a[i] != b[i] {
-            let diff = a[i] ^ b[i];
+    for (i, (&byte_a, &byte_b)) in a.iter().zip(b.iter()).enumerate() {
+        if byte_a != byte_b {
+            let diff = byte_a ^ byte_b;
             let bit_in_byte = diff.leading_zeros();
-            return Some(((i as u32) * 8) + bit_in_byte);
+            let byte_offset = u32::try_from(i).ok()?.checked_mul(8)?;
+            return Some(byte_offset + bit_in_byte);
         }
     }
     let longer = if a.len() > b.len() { a } else { b };
     for (i, &byte) in longer.iter().enumerate().skip(min_len) {
         if byte != 0 {
             let bit_in_byte = byte.leading_zeros();
-            return Some(((i as u32) * 8) + bit_in_byte);
+            let byte_offset = u32::try_from(i).ok()?.checked_mul(8)?;
+            return Some(byte_offset + bit_in_byte);
         }
     }
-    Some((min_len as u32) * 8)
+    let min_len_u32 = u32::try_from(min_len).ok()?;
+    min_len_u32.checked_mul(8)
 }
 
 /// An elastic binary tree over variable-length byte keys (`&[u8]`).
@@ -182,11 +184,6 @@ impl EbMbTree {
     }
 
     /// Inserts `key`. Returns the arena index of the inserted node, or the existing node index if unique.
-    #[allow(
-        clippy::cast_possible_wrap,
-        clippy::cast_sign_loss,
-        clippy::cast_possible_truncation
-    )]
     pub fn insert(&mut self, key: &[u8], data: u32) -> u32 {
         if self.root[0].is_none() {
             let new = self.alloc(key, data);
@@ -220,7 +217,8 @@ impl EbMbTree {
             }
 
             if let Some(div_bit) = diverge_bit(key, okey) {
-                if (div_bit as i32) < old_bit {
+                let div_bit_i32 = i32::try_from(div_bit).unwrap_or(i32::MAX);
+                if div_bit_i32 < old_bit {
                     old = o;
                     up = Up::Link(o);
                     break;
@@ -231,7 +229,8 @@ impl EbMbTree {
                 break;
             }
 
-            let side = get_bit(key, old_bit as u32) as usize;
+            let old_bit_u32 = u32::try_from(old_bit).unwrap_or(0);
+            let side = usize::from(get_bit(key, old_bit_u32) != 0);
             slot = Parent::new(o, if side == 0 { Side::Left } else { Side::Right });
             troot = self.nodes[o as usize].branches[side];
         }
@@ -258,7 +257,7 @@ impl EbMbTree {
         let bit = if is_equal {
             DUP
         } else if let Some(div_bit) = diverge_bit(key, &self.nodes[old as usize].key) {
-            div_bit as i32
+            i32::try_from(div_bit).unwrap_or(i32::MAX)
         } else {
             DUP
         };
@@ -268,7 +267,8 @@ impl EbMbTree {
         let new_is_right = if is_equal {
             true
         } else if bit >= 0 {
-            get_bit(key, bit as u32) == 1
+            let bit_u32 = u32::try_from(bit).unwrap_or(0);
+            get_bit(key, bit_u32) == 1
         } else {
             true
         };
@@ -411,7 +411,6 @@ impl EbMbTree {
     }
 
     /// Exact key lookup, returning the arena node index.
-    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
     #[must_use]
     pub fn lookup_node(&self, key: &[u8]) -> Option<u32> {
         let mut troot = self.root[0];
@@ -420,26 +419,31 @@ impl EbMbTree {
         }
 
         while troot.half() == Half::Link {
-            let o = troot.index() as usize;
-            let node = &self.nodes[o];
+            let idx = troot.index();
+            let node = &self.nodes[idx as usize];
             if node.bit < 0 {
                 if &*node.key == key {
-                    return Some(o as u32);
+                    return Some(idx);
                 }
                 troot = node.branches[Side::Left.idx()];
                 continue;
             }
 
-            let side = get_bit(key, node.bit as u32) as usize;
+            let bit_u32 = u32::try_from(node.bit).unwrap_or(0);
+            let side = if get_bit(key, bit_u32) == 0 {
+                Side::Left.idx()
+            } else {
+                Side::Right.idx()
+            };
             troot = node.branches[side];
             if troot.is_none() {
                 return None;
             }
         }
 
-        let leaf_idx = troot.index() as usize;
-        if &*self.nodes[leaf_idx].key == key {
-            Some(leaf_idx as u32)
+        let leaf_idx = troot.index();
+        if &*self.nodes[leaf_idx as usize].key == key {
+            Some(leaf_idx)
         } else {
             None
         }

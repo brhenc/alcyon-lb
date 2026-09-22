@@ -749,8 +749,8 @@ impl TcpSession {
         };
 
         let registry = Registry::new();
-        #[allow(clippy::cast_possible_truncation)]
-        let elapsed_ms = self.created_at.elapsed().as_millis() as u64;
+        let elapsed_ms =
+            u64::try_from(self.created_at.elapsed().as_millis()).unwrap_or(u64::MAX);
 
         for rule in &self.http_res_rules {
             let matches = if let Some(ref cond) = rule.cond {

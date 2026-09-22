@@ -50,18 +50,16 @@ impl IbexCertResolver {
     }
 
     /// Adds a certificate for an exact domain name (e.g. `"example.com"`, `"api.example.com"`).
-    #[allow(clippy::cast_possible_truncation)]
     pub fn add_exact(&mut self, domain: &str, cert: Arc<CertifiedKey>) {
-        let cert_idx = self.certs.len() as u32;
+        let cert_idx = u32::try_from(self.certs.len()).unwrap_or(u32::MAX);
         self.certs.push(cert);
         let domain_lower = domain.to_ascii_lowercase();
         self.exact_tree.insert(domain_lower.as_bytes(), cert_idx);
     }
 
     /// Adds a certificate for a wildcard domain pattern (e.g. `"*.example.com"` or `"example.com"`).
-    #[allow(clippy::cast_possible_truncation)]
     pub fn add_wildcard(&mut self, wildcard_domain: &str, cert: Arc<CertifiedKey>) {
-        let cert_idx = self.certs.len() as u32;
+        let cert_idx = u32::try_from(self.certs.len()).unwrap_or(u32::MAX);
         self.certs.push(cert);
         let domain_lower = wildcard_domain.to_ascii_lowercase();
         let suffix = domain_lower.strip_prefix("*.").unwrap_or(&domain_lower);

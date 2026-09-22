@@ -318,7 +318,7 @@ pub enum Frame {
 impl Frame {
     /// Encodes the complete frame (header + payload) into wire bytes.
     #[must_use]
-    #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines)]
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         match self {
@@ -328,7 +328,7 @@ impl Frame {
                 data,
             } => {
                 let hdr = FrameHeader {
-                    length: data.len() as u32,
+                    length: u32::try_from(data.len()).unwrap_or(u32::MAX),
                     frame_type: FrameType::Data,
                     flags: *flags,
                     stream_id: *stream_id,
@@ -342,7 +342,7 @@ impl Frame {
                 header_block,
             } => {
                 let hdr = FrameHeader {
-                    length: header_block.len() as u32,
+                    length: u32::try_from(header_block.len()).unwrap_or(u32::MAX),
                     frame_type: FrameType::Headers,
                     flags: *flags,
                     stream_id: *stream_id,
@@ -386,7 +386,7 @@ impl Frame {
                 out.extend_from_slice(&err_num.to_be_bytes());
             }
             Frame::Settings { flags, settings } => {
-                let payload_len = (settings.len() * 6) as u32;
+                let payload_len = u32::try_from(settings.len().saturating_mul(6)).unwrap_or(u32::MAX);
                 let hdr = FrameHeader {
                     length: payload_len,
                     frame_type: FrameType::Settings,
@@ -406,7 +406,7 @@ impl Frame {
                 promised_stream_id,
                 header_block,
             } => {
-                let payload_len = (4 + header_block.len()) as u32;
+                let payload_len = u32::try_from(4usize.saturating_add(header_block.len())).unwrap_or(u32::MAX);
                 let hdr = FrameHeader {
                     length: payload_len,
                     frame_type: FrameType::PushPromise,
@@ -432,7 +432,7 @@ impl Frame {
                 error_code,
                 debug_data,
             } => {
-                let payload_len = (8 + debug_data.len()) as u32;
+                let payload_len = u32::try_from(8usize.saturating_add(debug_data.len())).unwrap_or(u32::MAX);
                 let hdr = FrameHeader {
                     length: payload_len,
                     frame_type: FrameType::GoAway,
@@ -464,7 +464,7 @@ impl Frame {
                 header_block,
             } => {
                 let hdr = FrameHeader {
-                    length: header_block.len() as u32,
+                    length: u32::try_from(header_block.len()).unwrap_or(u32::MAX),
                     frame_type: FrameType::Continuation,
                     flags: *flags,
                     stream_id: *stream_id,

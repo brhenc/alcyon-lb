@@ -278,8 +278,7 @@ impl ServerCheckState {
     /// Computes the interval until the next check as a [`Tick`].
     #[must_use]
     pub fn schedule_next(&self, now: Tick) -> Tick {
-        #[allow(clippy::cast_possible_truncation)]
-        let ms = self.config.inter.as_millis().min(u128::from(u32::MAX)) as u32;
+        let ms = u32::try_from(self.config.inter.as_millis()).unwrap_or(u32::MAX);
         now.add(ms)
     }
 }
@@ -387,8 +386,7 @@ pub fn step_check(
             }
             let raw_fd = sock.as_raw_fd();
             check.check_fd = Some(raw_fd);
-            #[allow(clippy::cast_possible_truncation)]
-            let timeout_ms = check.config.timeout.as_millis().min(u128::from(u32::MAX)) as u32;
+            let timeout_ms = u32::try_from(check.config.timeout.as_millis()).unwrap_or(u32::MAX);
             check.exp = now.add(timeout_ms);
             check.in_progress = true;
 
@@ -400,8 +398,7 @@ pub fn step_check(
                 },
                 Interest::WRITE,
             );
-            #[allow(clippy::cast_sign_loss)]
-            let _ = poller.add(sock.as_fd(), raw_fd as u64, false, true);
+            let _ = poller.add(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), false, true);
             check.sock = Some(sock);
             Ok(CheckStep::pending(Some(check.exp)))
         } else {

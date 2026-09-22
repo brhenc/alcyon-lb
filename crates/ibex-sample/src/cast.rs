@@ -148,16 +148,22 @@ fn c_sint2bool(smp: Sample) -> Option<Sample> {
 
 fn c_sint2ip(smp: Sample) -> Option<Sample> {
     match smp {
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        Sample::Sint(i) => Some(Sample::Ipv4(Ipv4Addr::from(i as u32))),
+        Sample::Sint(i) => {
+            let bytes = i.to_be_bytes();
+            let u = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+            Some(Sample::Ipv4(Ipv4Addr::from(u)))
+        }
         _ => None,
     }
 }
 
 fn c_sint2ipv6(smp: Sample) -> Option<Sample> {
     match smp {
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        Sample::Sint(i) => Some(Sample::Ipv6(Ipv6Addr::from(i as u128))),
+        Sample::Sint(i) => {
+            let bytes = i.to_be_bytes();
+            let u = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+            Some(Sample::Ipv6(Ipv4Addr::from(u).to_ipv6_mapped()))
+        }
         _ => None,
     }
 }
