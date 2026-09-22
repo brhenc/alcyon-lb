@@ -10,6 +10,8 @@ ibex-sched = { path = "../ibex-sched" }
 ibex-proto = { path = "../ibex-proto" }
 ibex-config = { path = "../ibex-config" }
 ibex-sample = { path = "../ibex-sample" }
+ibex-tls = { path = "../ibex-tls" }
+rustls = { workspace = true }
 ibex-stick-table = { path = "../ibex-stick-table" }
 rustix = { version = "0.38", features = ["event", "net", "fs", "process", "std"] }
 
@@ -22,3 +24,4 @@ pedantic = { level = "warn", priority = -1 }
 
 [dev-dependencies]
 tempfile = "3"
+rcgen = "0.13"

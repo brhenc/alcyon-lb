@@ -23,6 +23,7 @@ pub mod poller;
 pub mod proxy;
 pub mod raw;
 pub mod stats;
+pub mod xprt;
 pub mod stats_html;
 
 pub use applet::{AppletArena, AppletContext, CliApplet};
@@ -41,6 +42,7 @@ pub use syslog::{format_rfc3164, priority, SyslogTarget};
 pub use poller::{Event, Poller};
 pub use proxy::{find_eoh, Ending, TcpSession, Timeouts, Want, Which};
 pub use raw::Io;
+pub use xprt::{accept_tls, ClientXprt, TlsConn};
 pub use stats::{
     format_show_info, format_show_stat, format_show_stat_filtered, stats_csv_header, StatRow,
     STAT_FIELDS, STAT_FIELD_COUNT,

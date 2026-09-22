@@ -20,6 +20,7 @@
 
 use crate::buf::Buf;
 use crate::raw::{self, Io};
+use crate::xprt::ClientXprt;
 use ibex_config::{HttpAfterResAction, HttpResAction, Mode};
 use ibex_proto::endpoint::ScState;
 use ibex_proto::htx::{HttpVersion, Htx, HtxBlock, ResponseLine};
@@ -79,6 +80,11 @@ pub struct Timeouts {
 #[allow(clippy::struct_excessive_bools)]
 pub struct TcpSession {
     pub cli: OwnedFd,
+    /// The transport under the client socket: plaintext, or TLS over the same fd.
+    ///
+    /// `ClientXprt::Plain` is what every session had implicitly before this existed and
+    /// compiles to the same `raw::recv`/`raw::send` calls.
+    pub cli_xprt: ClientXprt,
     pub srv: Option<OwnedFd>,
     pub mode: Mode,
     pub client_addr: Option<SocketAddr>,
@@ -160,6 +166,7 @@ impl TcpSession {
         };
         let mut s = TcpSession {
             cli,
+            cli_xprt: ClientXprt::Plain,
             srv: None,
             mode,
             client_addr: None,
@@ -368,7 +375,7 @@ impl TcpSession {
         // and buffer space exists. Backpressure stops reads when full.
         if self.cli_state.can_read() && !self.req.is_full() {
             let dst = self.req.writable();
-            match raw::recv(self.cli.as_fd(), dst)? {
+            match self.cli_xprt.recv(self.cli.as_fd(), dst)? {
                 Io::Eof => {
                     raw::shutdown_read(self.cli.as_fd());
                     self.cli_state = match self.cli_state {
@@ -510,7 +517,7 @@ impl TcpSession {
 
         // Write any response data back to the client while writing is permitted.
         if self.cli_state.can_write() && !self.rep.is_empty() {
-            match raw::send(self.cli.as_fd(), self.rep.readable())? {
+            match self.cli_xprt.send(self.cli.as_fd(), self.rep.readable())? {
                 Io::Done(n) if n > 0 => {
                     self.rep.consume(n);
                     self.bytes_out += n as u64;
@@ -993,9 +1000,14 @@ impl TcpSession {
             .pending_resp
             .as_ref()
             .is_some_and(|(d, o)| *o < d.len());
+        // `cli_xprt.wants_write()` is the TLS term. A handshake is mostly the server
+        // talking, and the condition below it -- "we have a response queued" -- is false
+        // throughout one, so without this the connection is never polled for writability
+        // and the handshake never finishes. It is always false for a plaintext session.
         let cli = Want {
             read: self.cli_state.can_read() && !self.req.is_full(),
-            write: self.cli_state.can_write() && (!self.rep.is_empty() || has_pending),
+            write: self.cli_state.can_write()
+                && (!self.rep.is_empty() || has_pending || self.cli_xprt.wants_write()),
         };
         let srv = match self.srv_state {
             ScState::Connecting => Want {

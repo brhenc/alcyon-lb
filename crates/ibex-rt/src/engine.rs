@@ -139,6 +139,13 @@ pub struct Proxy {
     /// `option log-health-checks`: log every check whose health counter moved, not only
     /// the UP/DOWN transitions.
     pub log_health_checks: bool,
+    /// Server-side TLS for this proxy's bind, when `bind ... ssl crt <file>` supplied one.
+    ///
+    /// `None` means plaintext, which is the state every proxy is in until the certificate
+    /// loading in `ibex-tls` populates this. It is an `Arc` because rustls shares one
+    /// config across every connection a listener accepts -- the certificates and the
+    /// session cache are per-bind, not per-connection.
+    pub tls_config: Option<Arc<rustls::ServerConfig>>,
 }
 
 impl Proxy {
@@ -595,6 +602,7 @@ fn init_proxy_from_listen(proxy_idx: usize, listen: &ibex_config::ListenSection)
         #[allow(clippy::cast_possible_truncation)]
         id: proxy_idx as u32,
         name: listen.name.clone(),
+        tls_config: None,
         log_target_idx: Vec::new(),
         log_health_checks: listen.log_health_checks,
         addr: listen.addr,
@@ -674,6 +682,7 @@ fn init_proxy_from_frontend(proxy_idx: usize, fe: &ibex_config::FrontendSection)
         #[allow(clippy::cast_possible_truncation)]
         id: proxy_idx as u32,
         name: fe.name.clone(),
+        tls_config: None,
         log_target_idx: Vec::new(),
         log_health_checks: fe.log_health_checks,
         addr: fe.bind.unwrap_or(SocketAddr::new(
@@ -778,6 +787,7 @@ fn init_proxy_from_backend(proxy_idx: usize, be: &ibex_config::BackendSection) -
         #[allow(clippy::cast_possible_truncation)]
         id: proxy_idx as u32,
         name: be.name.clone(),
+        tls_config: None,
         log_target_idx: Vec::new(),
         log_health_checks: be.log_health_checks,
         addr: SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0),
@@ -1668,6 +1678,18 @@ fn init_client_session(
         now,
     );
     sess.client_addr = Some(peer_addr);
+    if let Some(cfg) = proxy.tls_config.as_ref() {
+        // A failure here is a broken rustls config, not a client problem: the session
+        // stays plaintext and the connection will fail on the first byte rather than
+        // being silently served unencrypted. `bind ... ssl` refusing to start (see
+        // bin/ibex.rs) is what keeps that from being reachable in practice.
+        match crate::xprt::accept_tls(&sess.cli, Arc::clone(cfg)) {
+            Ok(xprt) => sess.cli_xprt = xprt,
+            Err(e) => {
+                eprintln!("[ibex] TLS session setup failed on {}: {e}", proxy.name);
+            }
+        }
+    }
     if proxy.accept_proxy || proxy.accept_proxy_v2 {
         sess.enable_accept_proxy(proxy.accept_proxy_v2);
     }

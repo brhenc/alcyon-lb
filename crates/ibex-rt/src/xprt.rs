@@ -1,0 +1,407 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Derived from HAProxy src/xprt_handshake.c and src/ssl_sock.c.
+// Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
+
+//! The client-side transport: plaintext, or TLS over the same socket.
+//!
+//! `HAProxy` stacks transports (`xprt_ops`) so the layer above does not know whether
+//! bytes were encrypted. [`ClientXprt`] is that seam, and it deliberately mirrors
+//! [`crate::raw`]'s signatures so a call site reads the same either way -- the plaintext
+//! arm is a direct call to `raw::recv`/`raw::send` with nothing in between.
+//!
+//! ## Why this drives rustls directly
+//!
+//! `ibex-tls` exposes `RustlsTransport::recv`/`send`, and they look like socket calls but
+//! are not: they move bytes between `ctx.rx_raw`/`ctx.tx_raw` and the caller's buffer,
+//! leaving the caller to do the syscalls and to copy through those two `Vec`s. That costs
+//! an allocation and a `drain` memmove on every read and write, on the data path.
+//!
+//! So this holds a `RustlsContext` for ownership and introspection -- it is the
+//! `Transport::Ctx`, so the layering is unchanged -- but performs the socket I/O with
+//! rustls's own non-blocking API, `read_tls`/`write_tls` against the fd. That is what
+//! that API is for, and it copies once instead of three times.
+
+use crate::raw::{self, Io};
+use ibex_tls::TlsSession;
+use ibex_tls::RustlsContext;
+use std::io::{self, Read, Write};
+use std::os::fd::{AsRawFd, BorrowedFd};
+
+/// Adapts a raw fd to `io::Read`/`io::Write` for rustls's `read_tls`/`write_tls`.
+///
+/// rustls needs `WouldBlock` reported as an error of that kind, which is the one place
+/// the project wants the errno rather than [`Io`].
+struct Sock<'a>(BorrowedFd<'a>);
+
+impl Read for Sock<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match raw::recv(self.0, buf)? {
+            Io::Done(n) => Ok(n),
+            Io::Eof => Ok(0),
+            Io::WouldBlock => Err(io::ErrorKind::WouldBlock.into()),
+            Io::Closed => Err(io::ErrorKind::ConnectionReset.into()),
+        }
+    }
+}
+
+impl Write for Sock<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match raw::send(self.0, buf)? {
+            Io::Done(n) => Ok(n),
+            Io::WouldBlock => Err(io::ErrorKind::WouldBlock.into()),
+            Io::Closed | Io::Eof => Err(io::ErrorKind::ConnectionReset.into()),
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Per-connection TLS state.
+pub struct TlsConn {
+    ctx: RustlsContext,
+    /// The peer sent `close_notify`: the stream ended where it said it would.
+    peer_closed: bool,
+    /// The socket hit EOF while the TLS stream was still open.
+    ///
+    /// This is a truncation attack unless `close_notify` arrived first: an attacker who
+    /// can inject a TCP FIN ends the stream early, and a proxy that reports it as a clean
+    /// end will forward a partial body as though it were complete.
+    truncated: bool,
+}
+
+impl TlsConn {
+    #[must_use]
+    pub fn new(ctx: RustlsContext) -> Self {
+        Self {
+            ctx,
+            peer_closed: false,
+            truncated: false,
+        }
+    }
+
+    fn session(&mut self) -> Option<&mut TlsSession> {
+        self.ctx.session.as_mut()
+    }
+
+    /// True while rustls has bytes it needs to put on the wire.
+    ///
+    /// The caller must poll for writability whenever this holds, even with no application
+    /// data queued: a handshake is mostly the server talking, and the plaintext path only
+    /// asks to write when its response buffer is non-empty.
+    #[must_use]
+    pub fn wants_write(&self) -> bool {
+        match &self.ctx.session {
+            Some(TlsSession::Server(c)) => c.wants_write(),
+            Some(TlsSession::Client(c)) => c.wants_write(),
+            None => false,
+        }
+    }
+
+    #[must_use]
+    pub const fn handshake_done(&self) -> bool {
+        self.ctx.handshake_done
+    }
+
+    #[must_use]
+    pub const fn was_truncated(&self) -> bool {
+        self.truncated
+    }
+
+    /// Pushes everything rustls has queued onto the socket.
+    ///
+    /// Called from both directions. A partial write is not an error: rustls keeps the
+    /// remainder and [`Self::wants_write`] stays true, so the poller brings us back.
+    fn flush(&mut self, fd: BorrowedFd<'_>) -> io::Result<()> {
+        let mut sock = Sock(fd);
+        loop {
+            let wants = match self.ctx.session.as_ref() {
+                Some(TlsSession::Server(c)) => c.wants_write(),
+                Some(TlsSession::Client(c)) => c.wants_write(),
+                None => false,
+            };
+            if !wants {
+                return Ok(());
+            }
+            let res = match self.ctx.session.as_mut() {
+                Some(TlsSession::Server(c)) => c.write_tls(&mut sock),
+                Some(TlsSession::Client(c)) => c.write_tls(&mut sock),
+                None => return Ok(()),
+            };
+            match res {
+                Ok(0) => return Ok(()),
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                // Nothing left to write to. The read side reports how the stream ended;
+                // failing here would mask a truncation behind a write error.
+                Err(e) if e.kind() == io::ErrorKind::ConnectionReset => return Ok(()),
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Reads ciphertext off the socket and hands it to rustls.
+    ///
+    /// Returns `Ok(false)` at end of stream.
+    fn fill(&mut self, fd: BorrowedFd<'_>) -> io::Result<bool> {
+        let mut sock = Sock(fd);
+        loop {
+            let wants = match self.ctx.session.as_ref() {
+                Some(TlsSession::Server(c)) => c.wants_read(),
+                Some(TlsSession::Client(c)) => c.wants_read(),
+                None => false,
+            };
+            if !wants {
+                return Ok(true);
+            }
+            let res = match self.ctx.session.as_mut() {
+                Some(TlsSession::Server(c)) => c.read_tls(&mut sock),
+                Some(TlsSession::Client(c)) => c.read_tls(&mut sock),
+                None => return Ok(true),
+            };
+            match res {
+                Ok(0) => return Ok(false),
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(true),
+                // A reset peer is an end of stream, not a failure. `raw::recv` already
+                // maps ECONNRESET to `Io::Closed` and the plaintext path treats that as
+                // an ordinary close; propagating an error here instead would turn every
+                // abruptly-dropped TLS connection into a logged failure.
+                Err(e) if e.kind() == io::ErrorKind::ConnectionReset => return Ok(false),
+                Err(e) => return Err(e),
+            }
+            // Process after every read: a record may complete mid-buffer, and an alert
+            // must be acted on before more bytes are pulled in behind it.
+            let state = match self.ctx.session.as_mut() {
+                Some(TlsSession::Server(c)) => c.process_new_packets(),
+                Some(TlsSession::Client(c)) => c.process_new_packets(),
+                None => return Ok(true),
+            };
+            match state {
+                Ok(st) => {
+                    if st.peer_has_closed() {
+                        self.peer_closed = true;
+                    }
+                    if st.plaintext_bytes_to_read() > 0 {
+                        return Ok(true);
+                    }
+                }
+                Err(e) => {
+                    // A rustls error carries an alert that the peer is owed. Flush it
+                    // before the socket goes away, then report.
+                    let _ = self.flush(fd);
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, e));
+                }
+            }
+        }
+    }
+
+    /// Drives the handshake. `Ok(true)` once it is complete.
+    fn handshake(&mut self, fd: BorrowedFd<'_>) -> io::Result<bool> {
+        if self.ctx.handshake_done {
+            return Ok(true);
+        }
+        // Flush first: the very first thing a server does is answer a ClientHello it has
+        // already been given, and there may be nothing to read yet.
+        self.flush(fd)?;
+
+        let open = self.fill(fd)?;
+        self.flush(fd)?;
+
+        let handshaking = match self.ctx.session.as_ref() {
+            Some(TlsSession::Server(c)) => c.is_handshaking(),
+            Some(TlsSession::Client(c)) => c.is_handshaking(),
+            None => false,
+        };
+        if !handshaking {
+            self.ctx.handshake_done = true;
+            self.ctx.update_tls_info();
+            return Ok(true);
+        }
+        if !open {
+            // The peer went away mid-handshake. Not a truncation of application data --
+            // there is none yet -- but it is not a completed connection either.
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+        Ok(false)
+    }
+}
+
+/// The transport under a client connection.
+///
+/// `Plain` costs nothing: the arms below compile to the same `raw::recv`/`raw::send` the
+/// call sites used before this existed. `Tls` is boxed because a rustls session is several
+/// kilobytes and most sessions in a mixed deployment are not encrypted -- an unboxed
+/// variant would put that on every [`crate::proxy::TcpSession`] whether used or not.
+pub enum ClientXprt {
+    Plain,
+    Tls(Box<TlsConn>),
+}
+
+impl ClientXprt {
+    #[must_use]
+    pub const fn is_tls(&self) -> bool {
+        matches!(self, ClientXprt::Tls(_))
+    }
+
+    /// True when the transport itself needs the socket to be writable.
+    ///
+    /// The plaintext path never does -- it writes only what the stream layer hands it.
+    #[must_use]
+    pub fn wants_write(&self) -> bool {
+        match self {
+            ClientXprt::Plain => false,
+            ClientXprt::Tls(t) => t.wants_write(),
+        }
+    }
+
+    /// True once bytes may flow. Plaintext is ready immediately.
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        match self {
+            ClientXprt::Plain => true,
+            ClientXprt::Tls(t) => t.handshake_done(),
+        }
+    }
+
+    /// True when the stream ended without `close_notify`.
+    #[must_use]
+    pub fn was_truncated(&self) -> bool {
+        match self {
+            ClientXprt::Plain => false,
+            ClientXprt::Tls(t) => t.was_truncated(),
+        }
+    }
+
+    /// Drives any pending handshake. `Ok(true)` when the transport is ready.
+    ///
+    /// # Errors
+    /// Propagates a failed handshake or a peer that vanished during one.
+    pub fn handshake(&mut self, fd: BorrowedFd<'_>) -> io::Result<bool> {
+        match self {
+            ClientXprt::Plain => Ok(true),
+            ClientXprt::Tls(t) => t.handshake(fd),
+        }
+    }
+
+    /// Reads plaintext, mirroring [`raw::recv`].
+    ///
+    /// # Errors
+    /// Propagates socket failures and TLS protocol errors.
+    pub fn recv(&mut self, fd: BorrowedFd<'_>, dst: &mut [u8]) -> io::Result<Io> {
+        match self {
+            ClientXprt::Plain => raw::recv(fd, dst),
+            ClientXprt::Tls(t) => {
+                if !t.handshake(fd)? {
+                    return Ok(Io::WouldBlock);
+                }
+                let open = t.fill(fd)?;
+                // Always flush: processing a record can queue a key update, a session
+                // ticket or an alert, none of which the stream layer knows to ask for.
+                t.flush(fd)?;
+
+                let n = match t.session() {
+                    Some(TlsSession::Server(c)) => c.reader().read(dst),
+                    Some(TlsSession::Client(c)) => c.reader().read(dst),
+                    None => return Ok(Io::Closed),
+                };
+                match n {
+                    Ok(n) if n > 0 => Ok(Io::Done(n)),
+                    // No plaintext available. What that means depends on how the stream
+                    // ended, and the order matters.
+                    //
+                    // `close_notify` is the TLS peer saying "that was all of it", and it
+                    // arrives while the socket is still open -- so this has to be checked
+                    // before the socket state, or a cleanly-closed stream spins on
+                    // WouldBlock forever waiting for an EOF that has already been
+                    // superseded.
+                    //
+                    // A socket that ended without it is a truncation: an attacker who can
+                    // inject a FIN cuts the stream short, and answering `Eof` would hand
+                    // a partial body upstream as a complete one.
+                    Ok(_) | Err(_) if t.peer_closed => Ok(Io::Eof),
+                    Ok(_) | Err(_) if !open => {
+                        t.truncated = true;
+                        Ok(Io::Closed)
+                    }
+                    Ok(_) => Ok(Io::WouldBlock),
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(Io::WouldBlock),
+                    Err(e) => Err(e),
+                }
+            }
+        }
+    }
+
+    /// Writes plaintext, mirroring [`raw::send`].
+    ///
+    /// # Errors
+    /// Propagates socket failures.
+    pub fn send(&mut self, fd: BorrowedFd<'_>, src: &[u8]) -> io::Result<Io> {
+        match self {
+            ClientXprt::Plain => raw::send(fd, src),
+            ClientXprt::Tls(t) => {
+                if !t.handshake(fd)? {
+                    return Ok(Io::WouldBlock);
+                }
+                let n = match t.session() {
+                    Some(TlsSession::Server(c)) => c.writer().write(src),
+                    Some(TlsSession::Client(c)) => c.writer().write(src),
+                    None => return Ok(Io::Closed),
+                };
+                let taken = match n {
+                    Ok(n) => n,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => 0,
+                    Err(e) => return Err(e),
+                };
+                t.flush(fd)?;
+                if taken == 0 {
+                    Ok(Io::WouldBlock)
+                } else {
+                    // Accepted into the TLS session, not yet necessarily on the wire.
+                    // The stream layer may drop its copy: rustls owns the remainder and
+                    // `wants_write` keeps the poller coming back until it is flushed.
+                    Ok(Io::Done(taken))
+                }
+            }
+        }
+    }
+
+    /// Sends `close_notify` so the peer can tell a finished stream from a cut one.
+    pub fn send_close_notify(&mut self, fd: BorrowedFd<'_>) {
+        if let ClientXprt::Tls(t) = self {
+            match t.session() {
+                Some(TlsSession::Server(c)) => c.send_close_notify(),
+                Some(TlsSession::Client(c)) => c.send_close_notify(),
+                None => return,
+            }
+            let _ = t.flush(fd);
+        }
+    }
+}
+
+impl std::fmt::Debug for ClientXprt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ClientXprt::Plain => f.write_str("ClientXprt::Plain"),
+            ClientXprt::Tls(t) => f
+                .debug_struct("ClientXprt::Tls")
+                .field("handshake_done", &t.handshake_done())
+                .field("truncated", &t.was_truncated())
+                .finish(),
+        }
+    }
+}
+
+/// Builds a server-side TLS transport for an accepted connection.
+///
+/// # Errors
+/// Propagates rustls session setup failure.
+pub fn accept_tls(
+    fd: &impl AsRawFd,
+    config: std::sync::Arc<rustls::ServerConfig>,
+) -> io::Result<ClientXprt> {
+    let conn = rustls::ServerConnection::new(config).map_err(io::Error::other)?;
+    Ok(ClientXprt::Tls(Box::new(TlsConn::new(
+        RustlsContext::new_server(fd.as_raw_fd(), conn),
+    ))))
+}
