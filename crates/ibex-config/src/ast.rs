@@ -77,7 +77,7 @@ pub struct TimeoutConfig {
 pub struct BindConfig {
     pub addr: SocketAddr,
     pub ssl: bool,
-    pub crt: Option<String>,
+    pub crt: Vec<String>,
     pub alpn: Vec<String>,
     pub accept_proxy: bool,
     pub accept_proxy_v2: bool,

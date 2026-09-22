@@ -312,7 +312,7 @@ fn parse_frontend_header(
         binds.push(BindConfig {
             addr: b_addr,
             ssl: false,
-            crt: None,
+            crt: Vec::new(),
             alpn: Vec::new(),
             accept_proxy,
             accept_proxy_v2,
@@ -683,7 +683,7 @@ fn parse_frontend_bind(
     }
     let addr = parse_socket_addr(&tokens[1], None)?;
     let mut ssl = false;
-    let mut crt = None;
+    let mut crt = Vec::new();
     let mut alpn = Vec::new();
     let mut accept_proxy = false;
     let mut accept_proxy_v2 = false;
@@ -694,7 +694,7 @@ fn parse_frontend_bind(
             "ssl" => ssl = true,
             "crt" if i + 1 < tokens.len() => {
                 i += 1;
-                crt = Some(tokens[i].text.clone());
+                crt.push(tokens[i].text.clone());
             }
             "alpn" if i + 1 < tokens.len() => {
                 i += 1;
@@ -3327,13 +3327,13 @@ backend be_out
         assert_eq!(fe.binds.len(), 2);
         assert_eq!(fe.binds[0].addr, "0.0.0.0:8443".parse().unwrap());
         assert!(fe.binds[0].ssl);
-        assert_eq!(fe.binds[0].crt.as_deref(), Some("/etc/ibex/certs/"));
+        assert_eq!(fe.binds[0].crt, vec!["/etc/ibex/certs/".to_string()]);
         assert_eq!(fe.binds[0].alpn, vec!["h2", "http/1.1"]);
         assert!(fe.binds[0].accept_proxy);
 
         assert_eq!(fe.binds[1].addr, "[::]:8443".parse().unwrap());
         assert!(fe.binds[1].ssl);
-        assert_eq!(fe.binds[1].crt.as_deref(), Some("/etc/ibex/certs/"));
+        assert_eq!(fe.binds[1].crt, vec!["/etc/ibex/certs/".to_string()]);
         assert!(fe.binds[1].accept_proxy);
 
         // Verify Frontend TCP & HTTP Rules
