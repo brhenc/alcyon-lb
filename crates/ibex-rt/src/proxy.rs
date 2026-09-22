@@ -21,6 +21,7 @@
 use crate::buf::Buf;
 use crate::raw::{self, Io};
 use crate::xprt::ClientXprt;
+use ibex_proto::parser::ParserKind;
 use ibex_config::{HttpAfterResAction, HttpResAction, Mode};
 use ibex_proto::endpoint::ScState;
 use ibex_proto::htx::{HttpVersion, Htx, HtxBlock, ResponseLine};
@@ -80,6 +81,12 @@ pub struct Timeouts {
 #[allow(clippy::struct_excessive_bools)]
 pub struct TcpSession {
     pub cli: OwnedFd,
+    /// Which HTTP parser validates this connection's request heads.
+    ///
+    /// A `ParserKind` rather than a `Box<dyn HttpStream>`: it is `Copy`, so the session
+    /// carries two bytes instead of a trait object, and the stream is built only when
+    /// there is a head to check.
+    pub parser_kind: ParserKind,
     /// The transport under the client socket: plaintext, or TLS over the same fd.
     ///
     /// `ClientXprt::Plain` is what every session had implicitly before this existed and
@@ -166,6 +173,7 @@ impl TcpSession {
         };
         let mut s = TcpSession {
             cli,
+            parser_kind: ParserKind::H1,
             cli_xprt: ClientXprt::Plain,
             srv: None,
             mode,
@@ -352,6 +360,32 @@ impl TcpSession {
         self.send_synthetic_bytes(&resp);
     }
 
+    /// Runs the configured parser over a complete request head.
+    ///
+    /// # Errors
+    /// A framing violation: conflicting or malformed `Content-Length` /
+    /// `Transfer-Encoding`, a bare CR as a line terminator, an invalid header name, or a
+    /// malformed chunk size. Each of these is a way for two intermediaries to read the
+    /// same bytes as different requests.
+    fn validate_request_head(&mut self, head_len: usize) -> io::Result<()> {
+        let parser = ibex_proto::parser::build(self.parser_kind)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let mut stream = parser.stream(false);
+        let mut htx = Htx::new();
+        stream.parse(&self.req.readable()[..head_len], &mut htx)?;
+        if stream.framing_conflict() {
+            // RFC 9112: Transfer-Encoding wins and the connection must not be reused.
+            // The message is parseable, so this is not an error -- but forwarding it to a
+            // backend that might resolve the conflict the other way is the whole attack.
+            self.ending.get_or_insert(Ending::Error);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "conflicting Content-Length and Transfer-Encoding",
+            ));
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub fn is_done(&self) -> bool {
         matches!(self.cli_state, ScState::Closed | ScState::Error)
@@ -445,6 +479,30 @@ impl TcpSession {
         if self.cli_state == ScState::Ready {
             if let Some((hdr_len, eoh_len)) = find_eoh(self.req.readable()) {
                 let total_hdr_len = hdr_len + eoh_len;
+
+                // Validate the head through the selected parser before anything below
+                // reads it.
+                //
+                // What follows is a `from_utf8_lossy` and a `split_whitespace`, which
+                // will parse almost anything and forwards the headers verbatim. That is
+                // how a request carrying both `Content-Length` and `Transfer-Encoding`
+                // reached a backend with both headers intact and a second request behind
+                // them -- textbook CL.TE smuggling, which HAProxy answers with a 400.
+                // `h1.rs` has rejected that since the strict-framing work; nothing on
+                // this path was asking it.
+                //
+                // The head is already buffered, so this is a complete message and the
+                // stream needs no state across calls. One allocation per request head
+                // for the trait object; it buys the framing rules and the seam that lets
+                // the parser be swapped.
+                if let Err(e) = self.validate_request_head(total_hdr_len) {
+                    let _ = e;
+                    self.send_synthetic_response(400, Some("text/html"), None);
+                    self.cli_state = ScState::ShutR;
+                    self.ending.get_or_insert(Ending::Error);
+                    return Ok(true);
+                }
+
                 let hdr_bytes = &self.req.readable()[..total_hdr_len];
                 let hdr_str = String::from_utf8_lossy(hdr_bytes);
 

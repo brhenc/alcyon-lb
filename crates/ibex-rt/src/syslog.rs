@@ -251,7 +251,7 @@ impl SyslogTarget {
     pub const fn addr(&self) -> Option<SocketAddr> {
         match &self.sink {
             Sink::Udp(a, _) => Some(*a),
-            _ => None,
+            Sink::Stdout | Sink::Stderr | Sink::Discard => None,
         }
     }
 }
