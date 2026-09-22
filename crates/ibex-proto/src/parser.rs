@@ -80,8 +80,11 @@ impl ParserKind {
     }
 
     /// Parses a name, for config and the runtime socket.
+    ///
+    /// Not `FromStr`: that returns a `Result` whose error type would have to be invented
+    /// for a lookup whose only failure is "no such name".
     #[must_use]
-    pub fn from_str(name: &str) -> Option<Self> {
+    pub fn parse(name: &str) -> Option<Self> {
         match name {
             "h1" => Some(ParserKind::H1),
             "htx-flat" => Some(ParserKind::HtxFlat),
@@ -276,11 +279,11 @@ impl DifferentialStream {
         &self.mismatches
     }
 
-    fn record(&mut self, detail: String) -> io::Result<()> {
+    fn record(&mut self, detail: &str) -> io::Result<()> {
         self.mismatches.push(Mismatch {
             primary: self.primary_name,
             candidate: self.candidate_name,
-            detail: detail.clone(),
+            detail: detail.to_string(),
         });
         match self.on_mismatch {
             OnMismatch::Observe => Ok(()),
@@ -313,13 +316,13 @@ impl HttpStream for DifferentialStream {
         // Compare before returning, so a disagreement is recorded even when both fail.
         match (&primary_res, &candidate_res) {
             (Ok(a), Ok(b)) if a != b => {
-                self.record(format!("consumed {a} vs {b} bytes"))?;
+                self.record(&format!("consumed {a} vs {b} bytes"))?;
             }
             (Ok(a), Err(e)) => {
-                self.record(format!("primary consumed {a}, candidate errored: {e}"))?;
+                self.record(&format!("primary consumed {a}, candidate errored: {e}"))?;
             }
             (Err(e), Ok(b)) => {
-                self.record(format!("primary errored: {e}, candidate consumed {b}"))?;
+                self.record(&format!("primary errored: {e}, candidate consumed {b}"))?;
             }
             // Both errored. The messages may differ without the framing differing, and a
             // rejected message is rejected either way, so this is not a disagreement.
@@ -327,7 +330,7 @@ impl HttpStream for DifferentialStream {
         }
 
         if primary_res.is_ok() && candidate_res.is_ok() && primary_htx != candidate_htx {
-            self.record(format!(
+            self.record(&format!(
                 "different blocks: {} produced {:?}, {} produced {:?}",
                 self.primary_name,
                 primary_htx.blocks(),

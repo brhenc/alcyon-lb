@@ -187,7 +187,9 @@ impl SyslogTarget {
         }
         match &self.sink {
             Sink::Udp(addr, Some(sock)) => sock.send_to(line.as_bytes(), *addr).is_ok(),
-            Sink::Udp(_, None) => false,
+            // A UDP target whose socket would not bind, and anything configured but
+            // unwritable. Both drop the line; neither is worth a separate arm.
+            Sink::Udp(_, None) | Sink::Discard => false,
             // A newline terminates the record: a descriptor is a stream, so unlike a
             // datagram there is no frame boundary to mark the end of the line.
             // Flushed on every line. Rust's stdout is block-buffered when it is a pipe,
@@ -210,7 +212,6 @@ impl SyslogTarget {
                 std::io::Write::write_all(&mut out, line.as_bytes()).is_ok()
                     && std::io::Write::flush(&mut out).is_ok()
             }
-            Sink::Discard => false,
         }
     }
 
@@ -251,7 +252,9 @@ impl SyslogTarget {
     pub const fn addr(&self) -> Option<SocketAddr> {
         match &self.sink {
             Sink::Udp(a, _) => Some(*a),
-            Sink::Stdout | Sink::Stderr | Sink::Discard => None,
+            // Not a network target: stdout, stderr, and anything configured but
+            // unwritable.
+            _ => None,
         }
     }
 }

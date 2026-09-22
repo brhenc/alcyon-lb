@@ -24,9 +24,9 @@ fn the_builtin_parser_works_through_the_seam() {
 #[test]
 fn every_parser_has_a_name_that_round_trips() {
     for k in ParserKind::all() {
-        assert_eq!(ParserKind::from_str(k.as_str()), Some(*k), "{}", k.as_str());
+        assert_eq!(ParserKind::parse(k.as_str()), Some(*k), "{}", k.as_str());
     }
-    assert_eq!(ParserKind::from_str("nonsense"), None);
+    assert_eq!(ParserKind::parse("nonsense"), None);
     assert_eq!(ParserKind::all().len(), 4, "h1, htx-flat, pingora, haproxy-ffi");
 }
 
@@ -145,8 +145,8 @@ fn the_parsers_do_not_share_an_output_buffer() {
                 "the candidate was shown the primary's output: {:?}",
                 htx.blocks()
             );
-            let mut h = H1Parserish;
-            h.parse(input, htx)
+            let mut inner = H1.stream(false);
+            inner.parse(input, htx)
         }
         fn reset(&mut self, _r: bool) {}
         fn finish(&mut self, _h: &mut Htx) {}
@@ -157,15 +157,6 @@ fn the_parsers_do_not_share_an_output_buffer() {
             false
         }
     }
-    /// A thin stand-in so the candidate produces the same blocks as the primary.
-    struct H1Parserish;
-    impl H1Parserish {
-        fn parse(&mut self, input: &[u8], htx: &mut Htx) -> io::Result<usize> {
-            let mut s = H1.stream(false);
-            s.parse(input, htx)
-        }
-    }
-
     let d = Differential::new(Box::new(H1), Box::new(Checking), OnMismatch::Reject);
     let mut s = d.stream(false);
     let mut htx = Htx::new();
