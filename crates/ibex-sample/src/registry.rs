@@ -1,14 +1,47 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// Derived from HAProxy src/sample.c and include/haproxy/sample.h.
+// Derived from HAProxy src/sample.c, src/http_fetch.c, src/http_conv.c,
+// src/payload.c, src/ssl_sample.c and include/haproxy/sample.h.
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
 //! Registries for Sample Fetches and Sample Converters.
 
+#![forbid(unsafe_code)]
+
 use crate::cast::cast;
+use crate::hash::{
+    full_hash, hash_crc32, hash_crc32c, hash_djb2, hash_sdbm, hash_wt6, hash_xxh3, hash_xxh32,
+    hash_xxh64, md5_digest, sha1_digest, sha224_digest, sha256_digest, sha384_digest,
+    sha512_digest,
+};
 use crate::sample::{Sample, SampleType, TypeSpec};
 use ibex_proto::htx::Htx;
+use regex::RegexBuilder;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+thread_local! {
+    pub static CURRENT_VARS: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+    pub static CURRENT_TIMEOUTS: RefCell<HashMap<String, u32>> = RefCell::new(HashMap::new());
+    pub static CURRENT_RES_HEADERS: RefCell<Vec<(String, String)>> = const { RefCell::new(Vec::new()) };
+    pub static CURRENT_RES_STATUS: Cell<u16> = const { Cell::new(0) };
+}
+
+pub fn set_current_vars(vars: HashMap<String, String>) {
+    CURRENT_VARS.with(|v| *v.borrow_mut() = vars);
+}
+
+pub fn set_current_timeouts(timeouts: HashMap<String, u32>) {
+    CURRENT_TIMEOUTS.with(|t| *t.borrow_mut() = timeouts);
+}
+
+pub fn set_current_res_headers(headers: Vec<(String, String)>) {
+    CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = headers);
+}
+
+pub fn set_current_res_status(status: u16) {
+    CURRENT_RES_STATUS.set(status);
+}
 
 /// Runtime context passed into sample fetch functions during evaluation.
 #[derive(Debug, Clone, Default)]
@@ -19,6 +52,26 @@ pub struct SampleContext<'a> {
     pub req_uri: Option<&'a str>,
     pub req_method: Option<&'a str>,
     pub req_headers: Option<&'a [(String, String)]>,
+    pub req_version: Option<&'a str>,
+    pub req_body: Option<&'a [u8]>,
+    pub res_version: Option<&'a str>,
+    pub res_headers: Option<&'a [(String, String)]>,
+    pub res_status: Option<u16>,
+    pub res_body: Option<&'a [u8]>,
+    pub fe_id: Option<u32>,
+    pub fe_name: Option<&'a str>,
+    pub be_id: Option<u32>,
+    pub be_name: Option<&'a str>,
+    pub srv_id: Option<u32>,
+    pub srv_name: Option<&'a str>,
+    pub so_id: Option<u32>,
+    pub so_name: Option<&'a str>,
+    pub fc_rtt: Option<u32>,
+    pub fc_rttvar: Option<u32>,
+    pub captures_req_hdr: Option<&'a [String]>,
+    pub captures_res_hdr: Option<&'a [String]>,
+    pub vars: Option<&'a HashMap<String, String>>,
+    pub timeouts: Option<&'a HashMap<String, u32>>,
     pub act_conn: u32,
     pub cum_conn: u64,
     pub conn_cnt: u64,
@@ -26,12 +79,22 @@ pub struct SampleContext<'a> {
     pub http_req_rate: u64,
     pub http_err_rate: u64,
     pub http_req_cnt: u64,
+    pub bytes_in_cnt: u64,
+    pub bytes_out_cnt: u64,
+    pub gpc0: u64,
+    pub gpc1: u64,
+    pub gpt0: u64,
     pub sc_conn_rates: [u64; 3],
     pub sc_http_req_rates: [u64; 3],
     pub sc_http_err_rates: [u64; 3],
     pub sc_conn_cnts: [u64; 3],
     pub sc_http_req_cnts: [u64; 3],
+    pub sc_bytes_in_cnts: [u64; 3],
+    pub sc_bytes_out_cnts: [u64; 3],
     pub ssl_sni: Option<&'a str>,
+    pub ssl_cipher: Option<&'a str>,
+    pub ssl_version: Option<&'a str>,
+    pub ssl_used: bool,
 }
 
 /// A sample fetch implementation.
@@ -99,101 +162,146 @@ impl Registry {
         self.converters.get(name)
     }
 
+    #[must_use]
+    pub fn fetch_count(&self) -> usize {
+        self.fetches.len()
+    }
+
+    #[must_use]
+    pub fn converter_count(&self) -> usize {
+        self.converters.len()
+    }
+
+    #[must_use]
+    pub fn fetch_names(&self) -> Vec<&'static str> {
+        let mut names: Vec<&'static str> = self.fetches.keys().copied().collect();
+        names.sort_unstable();
+        names
+    }
+
+    #[must_use]
+    pub fn converter_names(&self) -> Vec<&'static str> {
+        let mut names: Vec<&'static str> = self.converters.keys().copied().collect();
+        names.sort_unstable();
+        names
+    }
+
     #[allow(clippy::too_many_lines)]
     fn register_builtin_fetches(&mut self) {
-        // src (client IP address)
+        // --- 1. Client & Destination Network Fetches ---
+        let src_fetch: FetchFn = |ctx, _args| match ctx.client_addr?.ip() {
+            IpAddr::V4(v4) => Some(Sample::Ipv4(v4)),
+            IpAddr::V6(v6) => Some(Sample::Ipv6(v6)),
+        };
         self.register_fetch(FetchDesc {
             name: "src",
             out_type: SampleType::Ipv4,
-            func: |ctx, _args| match ctx.client_addr?.ip() {
-                IpAddr::V4(v4) => Some(Sample::Ipv4(v4)),
-                IpAddr::V6(v6) => Some(Sample::Ipv6(v6)),
-            },
+            func: src_fetch,
+        });
+        self.register_fetch(FetchDesc {
+            name: "fc_src",
+            out_type: SampleType::Ipv4,
+            func: src_fetch,
         });
 
-        // src_port (client port)
+        let src_port_fetch: FetchFn =
+            |ctx, _args| ctx.client_addr.map(|sa| Sample::Sint(i64::from(sa.port())));
         self.register_fetch(FetchDesc {
             name: "src_port",
             out_type: SampleType::Sint,
-            func: |ctx, _args| ctx.client_addr.map(|sa| Sample::Sint(i64::from(sa.port()))),
+            func: src_port_fetch,
+        });
+        self.register_fetch(FetchDesc {
+            name: "fc_src_port",
+            out_type: SampleType::Sint,
+            func: src_port_fetch,
         });
 
-        // dst (destination listener IP)
+        let dst_fetch: FetchFn = |ctx, _args| match ctx.server_addr?.ip() {
+            IpAddr::V4(v4) => Some(Sample::Ipv4(v4)),
+            IpAddr::V6(v6) => Some(Sample::Ipv6(v6)),
+        };
         self.register_fetch(FetchDesc {
             name: "dst",
             out_type: SampleType::Ipv4,
-            func: |ctx, _args| match ctx.server_addr?.ip() {
-                IpAddr::V4(v4) => Some(Sample::Ipv4(v4)),
-                IpAddr::V6(v6) => Some(Sample::Ipv6(v6)),
-            },
+            func: dst_fetch,
+        });
+        self.register_fetch(FetchDesc {
+            name: "fc_dst",
+            out_type: SampleType::Ipv4,
+            func: dst_fetch,
         });
 
-        // dst_port (destination listener port)
+        let dst_port_fetch: FetchFn =
+            |ctx, _args| ctx.server_addr.map(|sa| Sample::Sint(i64::from(sa.port())));
         self.register_fetch(FetchDesc {
             name: "dst_port",
             out_type: SampleType::Sint,
-            func: |ctx, _args| ctx.server_addr.map(|sa| Sample::Sint(i64::from(sa.port()))),
+            func: dst_port_fetch,
         });
-
-        // req.hdr(name) and hdr(name)
-        let hdr_fetch: FetchFn = |ctx, args| {
-            let hdr_name = args.first()?;
-            if let Some(htx) = ctx.htx {
-                if let Some(v) = htx.get_header(hdr_name) {
-                    return Some(Sample::Str(v.to_string()));
-                }
-            }
-            if let Some(headers) = ctx.req_headers {
-                for (k, v) in headers {
-                    if k.eq_ignore_ascii_case(hdr_name) {
-                        return Some(Sample::Str(v.clone()));
-                    }
-                }
-            }
-            None
-        };
-
         self.register_fetch(FetchDesc {
-            name: "req.hdr",
-            out_type: SampleType::Str,
-            func: hdr_fetch,
+            name: "fc_dst_port",
+            out_type: SampleType::Sint,
+            func: dst_port_fetch,
         });
 
         self.register_fetch(FetchDesc {
-            name: "hdr",
-            out_type: SampleType::Str,
-            func: hdr_fetch,
+            name: "fc_rtt",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| Some(Sample::Sint(i64::from(ctx.fc_rtt.unwrap_or(0)))),
+        });
+        self.register_fetch(FetchDesc {
+            name: "fc_rttvar",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| Some(Sample::Sint(i64::from(ctx.fc_rttvar.unwrap_or(0)))),
         });
 
-        // path
+        // --- 2. HTTP Request Line & URL Fetches ---
         self.register_fetch(FetchDesc {
             name: "path",
             out_type: SampleType::Str,
             func: |ctx, _args| {
-                if let Some(uri) = ctx.req_uri {
-                    let path_only = uri.split('?').next().unwrap_or(uri);
-                    return Some(Sample::Str(path_only.to_string()));
-                }
-                let req = ctx.htx?.req_line()?;
-                let path_only = req.uri.split('?').next().unwrap_or(&req.uri);
-                Some(Sample::Str(path_only.to_string()))
+                let uri = ctx
+                    .req_uri
+                    .or_else(|| ctx.htx.and_then(|h| h.req_line().map(|r| r.uri.as_str())))?;
+                let (_, path, _) = split_uri(uri);
+                Some(Sample::Str(path.to_string()))
             },
         });
 
-        // url (full URI)
+        self.register_fetch(FetchDesc {
+            name: "pathq",
+            out_type: SampleType::Str,
+            func: |ctx, _args| {
+                let uri = ctx
+                    .req_uri
+                    .or_else(|| ctx.htx.and_then(|h| h.req_line().map(|r| r.uri.as_str())))?;
+                let (_, path, query) = split_uri(uri);
+                if query.is_empty() {
+                    Some(Sample::Str(path.to_string()))
+                } else {
+                    Some(Sample::Str(format!("{path}?{query}")))
+                }
+            },
+        });
+
+        let url_fetch: FetchFn = |ctx, _args| {
+            let uri = ctx
+                .req_uri
+                .or_else(|| ctx.htx.and_then(|h| h.req_line().map(|r| r.uri.as_str())))?;
+            Some(Sample::Str(uri.to_string()))
+        };
         self.register_fetch(FetchDesc {
             name: "url",
             out_type: SampleType::Str,
-            func: |ctx, _args| {
-                if let Some(uri) = ctx.req_uri {
-                    return Some(Sample::Str(uri.to_string()));
-                }
-                let req = ctx.htx?.req_line()?;
-                Some(Sample::Str(req.uri.clone()))
-            },
+            func: url_fetch,
+        });
+        self.register_fetch(FetchDesc {
+            name: "req.uri",
+            out_type: SampleType::Str,
+            func: url_fetch,
         });
 
-        // query
         self.register_fetch(FetchDesc {
             name: "query",
             out_type: SampleType::Str,
@@ -201,25 +309,52 @@ impl Registry {
                 let uri = ctx
                     .req_uri
                     .or_else(|| ctx.htx.and_then(|h| h.req_line().map(|r| r.uri.as_str())))?;
-                uri.split_once('?').map(|(_, q)| Sample::Str(q.to_string()))
+                let (_, _, query) = split_uri(uri);
+                Some(Sample::Str(query.to_string()))
             },
         });
 
-        // method
+        let url_param_fetch: FetchFn = |ctx, args| {
+            let param = args.first()?;
+            let uri = ctx
+                .req_uri
+                .or_else(|| ctx.htx.and_then(|h| h.req_line().map(|r| r.uri.as_str())))?;
+            let (_, _, query) = split_uri(uri);
+            extract_url_param(query, param).map(Sample::Str)
+        };
+        self.register_fetch(FetchDesc {
+            name: "url_param",
+            out_type: SampleType::Str,
+            func: url_param_fetch,
+        });
+        self.register_fetch(FetchDesc {
+            name: "urlp",
+            out_type: SampleType::Str,
+            func: url_param_fetch,
+        });
+
+        self.register_fetch(FetchDesc {
+            name: "urlp_val",
+            out_type: SampleType::Sint,
+            func: |ctx, args| {
+                let param = args.first()?;
+                let uri = ctx
+                    .req_uri
+                    .or_else(|| ctx.htx.and_then(|h| h.req_line().map(|r| r.uri.as_str())))?;
+                let (_, _, query) = split_uri(uri);
+                let val_str = extract_url_param(query, param)?;
+                val_str.parse::<i64>().ok().map(Sample::Sint)
+            },
+        });
+
         self.register_fetch(FetchDesc {
             name: "method",
             out_type: SampleType::Meth,
             func: |ctx, _args| {
                 if let Some(m_str) = ctx.req_method {
-                    let m = match m_str.to_uppercase().as_str() {
-                        "GET" => ibex_proto::htx::HttpMethod::Get,
-                        "POST" => ibex_proto::htx::HttpMethod::Post,
-                        "HEAD" => ibex_proto::htx::HttpMethod::Head,
-                        "PUT" => ibex_proto::htx::HttpMethod::Put,
-                        "DELETE" => ibex_proto::htx::HttpMethod::Delete,
-                        _ => ibex_proto::htx::HttpMethod::Other(m_str.to_string()),
-                    };
-                    return Some(Sample::Meth(m));
+                    return Some(Sample::Meth(ibex_proto::htx::HttpMethod::from_bytes(
+                        m_str.as_bytes(),
+                    )));
                 }
                 ctx.htx?
                     .req_line()
@@ -227,121 +362,1239 @@ impl Registry {
             },
         });
 
-        // status
+        let req_ver_fetch: FetchFn = |ctx, _args| {
+            if let Some(v) = ctx.req_version {
+                return Some(Sample::Str(v.to_string()));
+            }
+            if let Some(htx) = ctx.htx {
+                if let Some(req) = htx.req_line() {
+                    return Some(Sample::Str(req.version.as_str().to_string()));
+                }
+            }
+            Some(Sample::Str("HTTP/1.1".to_string()))
+        };
+        self.register_fetch(FetchDesc {
+            name: "req.ver",
+            out_type: SampleType::Str,
+            func: req_ver_fetch,
+        });
+        self.register_fetch(FetchDesc {
+            name: "req_ver",
+            out_type: SampleType::Str,
+            func: req_ver_fetch,
+        });
+
+        let res_ver_fetch: FetchFn = |ctx, _args| {
+            if let Some(v) = ctx.res_version {
+                return Some(Sample::Str(v.to_string()));
+            }
+            if let Some(htx) = ctx.htx {
+                if let Some(res) = htx.res_line() {
+                    return Some(Sample::Str(res.version.as_str().to_string()));
+                }
+            }
+            Some(Sample::Str("HTTP/1.1".to_string()))
+        };
+        self.register_fetch(FetchDesc {
+            name: "res.ver",
+            out_type: SampleType::Str,
+            func: res_ver_fetch,
+        });
+        self.register_fetch(FetchDesc {
+            name: "res_ver",
+            out_type: SampleType::Str,
+            func: res_ver_fetch,
+        });
+
+        let status_fetch: FetchFn = |ctx, _args| {
+            if let Some(st) = ctx.res_status {
+                return Some(Sample::Sint(i64::from(st)));
+            }
+            if let Some(htx) = ctx.htx {
+                if let Some(res) = htx.res_line() {
+                    return Some(Sample::Sint(i64::from(res.status)));
+                }
+            }
+            let st = CURRENT_RES_STATUS.get();
+            if st > 0 {
+                Some(Sample::Sint(i64::from(st)))
+            } else {
+                None
+            }
+        };
         self.register_fetch(FetchDesc {
             name: "status",
             out_type: SampleType::Sint,
+            func: status_fetch,
+        });
+        self.register_fetch(FetchDesc {
+            name: "res.status",
+            out_type: SampleType::Sint,
+            func: status_fetch,
+        });
+
+        self.register_fetch(FetchDesc {
+            name: "req.proto_http",
+            out_type: SampleType::Bool,
+            func: |ctx, _args| Some(Sample::Bool(ctx.htx.is_some() || ctx.req_uri.is_some())),
+        });
+        self.register_fetch(FetchDesc {
+            name: "res.proto_http",
+            out_type: SampleType::Bool,
             func: |ctx, _args| {
-                ctx.htx?
-                    .res_line()
-                    .map(|res| Sample::Sint(i64::from(res.status)))
+                Some(Sample::Bool(
+                    ctx.htx.is_some() || ctx.res_status.is_some() || CURRENT_RES_STATUS.get() > 0,
+                ))
             },
         });
 
-        // Stick table metrics
+        // --- 3. Base Fetches ---
         self.register_fetch(FetchDesc {
-            name: "sc_conn_cnt",
+            name: "base",
+            out_type: SampleType::Str,
+            func: fetch_base,
+        });
+
+        self.register_fetch(FetchDesc {
+            name: "base32",
+            out_type: SampleType::Sint,
+            func: |ctx, args| {
+                let base_smp = fetch_base(ctx, args)?;
+                let Sample::Str(s) = base_smp else { return None };
+                let h = full_hash(hash_djb2(s.as_bytes()));
+                Some(Sample::Sint(i64::from(h)))
+            },
+        });
+
+        self.register_fetch(FetchDesc {
+            name: "base32+src",
+            out_type: SampleType::Bin,
+            func: |ctx, args| {
+                let base_smp = fetch_base(ctx, args)?;
+                let Sample::Str(s) = base_smp else { return None };
+                let h = full_hash(hash_djb2(s.as_bytes()));
+                let mut out = Vec::with_capacity(20);
+                out.extend_from_slice(&h.to_be_bytes());
+                if let Some(sa) = ctx.client_addr {
+                    match sa.ip() {
+                        IpAddr::V4(v4) => out.extend_from_slice(&v4.octets()),
+                        IpAddr::V6(v6) => out.extend_from_slice(&v6.octets()),
+                    }
+                }
+                Some(Sample::Bin(out))
+            },
+        });
+
+        self.register_fetch(FetchDesc {
+            name: "baseq",
+            out_type: SampleType::Str,
+            func: |ctx, args| {
+                let base_smp = fetch_base(ctx, args)?;
+                let Sample::Str(b) = base_smp else { return None };
+                let uri = ctx
+                    .req_uri
+                    .or_else(|| ctx.htx.and_then(|h| h.req_line().map(|r| r.uri.as_str())))?;
+                let (_, _, query) = split_uri(uri);
+                if query.is_empty() {
+                    Some(Sample::Str(b))
+                } else {
+                    Some(Sample::Str(format!("{b}?{query}")))
+                }
+            },
+        });
+
+        // --- 4. HTTP Headers Fetches ---
+        let req_hdr_fetch: FetchFn = |ctx, args| {
+            let name = args.first()?;
+            let occ: Option<i64> = args.get(1).and_then(|s| s.parse().ok());
+            let hdrs = get_all_req_headers(ctx, name);
+            if hdrs.is_empty() {
+                return None;
+            }
+            if let Some(idx) = occ {
+                if idx > 0 {
+                    let uidx = (idx - 1) as usize;
+                    return hdrs.get(uidx).map(|s| Sample::Str((*s).clone()));
+                } else if idx < 0 {
+                    let uidx = hdrs.len().checked_sub(idx.unsigned_abs() as usize)?;
+                    return hdrs.get(uidx).map(|s| Sample::Str((*s).clone()));
+                }
+                return None;
+            }
+            Some(Sample::Str(hdrs.join(", ")))
+        };
+        self.register_fetch(FetchDesc {
+            name: "req.hdr",
+            out_type: SampleType::Str,
+            func: req_hdr_fetch,
+        });
+        self.register_fetch(FetchDesc {
+            name: "hdr",
+            out_type: SampleType::Str,
+            func: req_hdr_fetch,
+        });
+        self.register_fetch(FetchDesc {
+            name: "req.fhdr",
+            out_type: SampleType::Str,
+            func: req_hdr_fetch,
+        });
+
+        let res_hdr_fetch: FetchFn = |ctx, args| {
+            let name = args.first()?;
+            let occ: Option<i64> = args.get(1).and_then(|s| s.parse().ok());
+            let hdrs = get_all_res_headers(ctx, name);
+            if hdrs.is_empty() {
+                return None;
+            }
+            if let Some(idx) = occ {
+                if idx > 0 {
+                    let uidx = (idx - 1) as usize;
+                    return hdrs.get(uidx).map(|s| Sample::Str((*s).clone()));
+                } else if idx < 0 {
+                    let uidx = hdrs.len().checked_sub(idx.unsigned_abs() as usize)?;
+                    return hdrs.get(uidx).map(|s| Sample::Str((*s).clone()));
+                }
+                return None;
+            }
+            Some(Sample::Str(hdrs.join(", ")))
+        };
+        self.register_fetch(FetchDesc {
+            name: "res.hdr",
+            out_type: SampleType::Str,
+            func: res_hdr_fetch,
+        });
+        self.register_fetch(FetchDesc {
+            name: "res.fhdr",
+            out_type: SampleType::Str,
+            func: res_hdr_fetch,
+        });
+
+        let req_hdr_cnt_fetch: FetchFn = |ctx, args| {
+            let name = args.first()?;
+            let count = get_all_req_headers(ctx, name).len();
+            #[allow(clippy::cast_possible_wrap)]
+            Some(Sample::Sint(count as i64))
+        };
+        self.register_fetch(FetchDesc {
+            name: "req.hdr_cnt",
+            out_type: SampleType::Sint,
+            func: req_hdr_cnt_fetch,
+        });
+        self.register_fetch(FetchDesc {
+            name: "hdr_cnt",
+            out_type: SampleType::Sint,
+            func: req_hdr_cnt_fetch,
+        });
+
+        self.register_fetch(FetchDesc {
+            name: "res.hdr_cnt",
+            out_type: SampleType::Sint,
+            func: |ctx, args| {
+                let name = args.first()?;
+                let count = get_all_res_headers(ctx, name).len();
+                #[allow(clippy::cast_possible_wrap)]
+                Some(Sample::Sint(count as i64))
+            },
+        });
+
+        let req_hdr_val_fetch: FetchFn = |ctx, args| {
+            let name = args.first()?;
+            let val = get_req_header(ctx, name)?;
+            val.trim().parse::<i64>().ok().map(Sample::Sint)
+        };
+        self.register_fetch(FetchDesc {
+            name: "req.hdr_val",
+            out_type: SampleType::Sint,
+            func: req_hdr_val_fetch,
+        });
+        self.register_fetch(FetchDesc {
+            name: "hdr_val",
+            out_type: SampleType::Sint,
+            func: req_hdr_val_fetch,
+        });
+
+        self.register_fetch(FetchDesc {
+            name: "res.hdr_val",
+            out_type: SampleType::Sint,
+            func: |ctx, args| {
+                let name = args.first()?;
+                let val = get_res_header(ctx, name)?;
+                val.trim().parse::<i64>().ok().map(Sample::Sint)
+            },
+        });
+
+        let hdr_ip_fetch: FetchFn = |ctx, args| {
+            let name = args.first()?;
+            let val = get_req_header(ctx, name)?;
+            parse_ip_str(&val)
+        };
+        self.register_fetch(FetchDesc {
+            name: "req.hdr_ip",
+            out_type: SampleType::Ipv4,
+            func: hdr_ip_fetch,
+        });
+        self.register_fetch(FetchDesc {
+            name: "hdr_ip",
+            out_type: SampleType::Ipv4,
+            func: hdr_ip_fetch,
+        });
+
+        self.register_fetch(FetchDesc {
+            name: "res.hdr_ip",
+            out_type: SampleType::Ipv4,
+            func: |ctx, args| {
+                let name = args.first()?;
+                let val = get_res_header(ctx, name)?;
+                parse_ip_str(&val)
+            },
+        });
+
+        self.register_fetch(FetchDesc {
+            name: "req.cook",
+            out_type: SampleType::Str,
+            func: fetch_req_cook,
+        });
+        self.register_fetch(FetchDesc {
+            name: "cook",
+            out_type: SampleType::Str,
+            func: fetch_req_cook,
+        });
+        self.register_fetch(FetchDesc {
+            name: "cookie",
+            out_type: SampleType::Str,
+            func: fetch_req_cook,
+        });
+
+        self.register_fetch(FetchDesc {
+            name: "res.cook",
+            out_type: SampleType::Str,
+            func: |ctx, args| {
+                let name = args.first()?;
+                let set_cookies = get_all_res_headers(ctx, "set-cookie");
+                for hdr in set_cookies {
+                    for (k, v) in extract_cookies(&hdr) {
+                        if k == name {
+                            return Some(Sample::Str(v.to_string()));
+                        }
+                    }
+                }
+                None
+            },
+        });
+
+        let cook_cnt_fetch: FetchFn = |ctx, args| {
+            let name = args.first();
+            let cookie_hdrs = get_all_req_headers(ctx, "cookie");
+            let mut count = 0;
+            for hdr in cookie_hdrs {
+                for (k, _) in extract_cookies(&hdr) {
+                    if let Some(target) = name {
+                        if k == target {
+                            count += 1;
+                        }
+                    } else {
+                        count += 1;
+                    }
+                }
+            }
+            Some(Sample::Sint(count))
+        };
+        self.register_fetch(FetchDesc {
+            name: "req.cook_cnt",
+            out_type: SampleType::Sint,
+            func: cook_cnt_fetch,
+        });
+        self.register_fetch(FetchDesc {
+            name: "cook_cnt",
+            out_type: SampleType::Sint,
+            func: cook_cnt_fetch,
+        });
+
+        self.register_fetch(FetchDesc {
+            name: "res.cook_cnt",
+            out_type: SampleType::Sint,
+            func: |ctx, args| {
+                let name = args.first();
+                let set_cookies = get_all_res_headers(ctx, "set-cookie");
+                let mut count = 0;
+                for hdr in set_cookies {
+                    for (k, _) in extract_cookies(&hdr) {
+                        if let Some(target) = name {
+                            if k == target {
+                                count += 1;
+                            }
+                        } else {
+                            count += 1;
+                        }
+                    }
+                }
+                Some(Sample::Sint(count))
+            },
+        });
+
+        let cook_val_fetch: FetchFn = |ctx, args| {
+            let smp = fetch_req_cook(ctx, args)?;
+            let Sample::Str(s) = smp else { return None };
+            s.parse::<i64>().ok().map(Sample::Sint)
+        };
+        self.register_fetch(FetchDesc {
+            name: "req.cook_val",
+            out_type: SampleType::Sint,
+            func: cook_val_fetch,
+        });
+        self.register_fetch(FetchDesc {
+            name: "cook_val",
+            out_type: SampleType::Sint,
+            func: cook_val_fetch,
+        });
+
+        self.register_fetch(FetchDesc {
+            name: "res.cook_val",
+            out_type: SampleType::Sint,
+            func: |ctx, args| {
+                let name = args.first()?;
+                let set_cookies = get_all_res_headers(ctx, "set-cookie");
+                for hdr in set_cookies {
+                    for (k, v) in extract_cookies(&hdr) {
+                        if k == name {
+                            return v.parse::<i64>().ok().map(Sample::Sint);
+                        }
+                    }
+                }
+                None
+            },
+        });
+
+        // --- 6. Body & Length Fetches ---
+        self.register_fetch(FetchDesc {
+            name: "req.body",
+            out_type: SampleType::Bin,
+            func: |ctx, _args| ctx.req_body.map(|b| Sample::Bin(b.to_vec())),
+        });
+
+        self.register_fetch(FetchDesc {
+            name: "res.body",
+            out_type: SampleType::Bin,
+            func: |ctx, _args| ctx.res_body.map(|b| Sample::Bin(b.to_vec())),
+        });
+
+        let req_len_fetch: FetchFn = |ctx, _args| {
+            if let Some(b) = ctx.req_body {
+                #[allow(clippy::cast_possible_wrap)]
+                return Some(Sample::Sint(b.len() as i64));
+            }
+            if let Some(cl) = get_req_header(ctx, "content-length") {
+                return cl.trim().parse::<i64>().ok().map(Sample::Sint);
+            }
+            None
+        };
+        self.register_fetch(FetchDesc {
+            name: "req.len",
+            out_type: SampleType::Sint,
+            func: req_len_fetch,
+        });
+        self.register_fetch(FetchDesc {
+            name: "req.body_len",
+            out_type: SampleType::Sint,
+            func: req_len_fetch,
+        });
+        self.register_fetch(FetchDesc {
+            name: "req.body_size",
+            out_type: SampleType::Sint,
+            func: req_len_fetch,
+        });
+
+        let res_len_fetch: FetchFn = |ctx, _args| {
+            if let Some(b) = ctx.res_body {
+                #[allow(clippy::cast_possible_wrap)]
+                return Some(Sample::Sint(b.len() as i64));
+            }
+            if let Some(cl) = get_res_header(ctx, "content-length") {
+                return cl.trim().parse::<i64>().ok().map(Sample::Sint);
+            }
+            None
+        };
+        self.register_fetch(FetchDesc {
+            name: "res.len",
+            out_type: SampleType::Sint,
+            func: res_len_fetch,
+        });
+        self.register_fetch(FetchDesc {
+            name: "res.body_size",
+            out_type: SampleType::Sint,
+            func: res_len_fetch,
+        });
+
+        // --- 7. Captures ---
+        self.register_fetch(FetchDesc {
+            name: "capture.req.hdr",
+            out_type: SampleType::Str,
+            func: |ctx, args| {
+                let idx_str = args.first()?;
+                let idx: usize = idx_str.parse().ok()?;
+                let caps = ctx.captures_req_hdr?;
+                caps.get(idx).cloned().map(Sample::Str)
+            },
+        });
+
+        self.register_fetch(FetchDesc {
+            name: "capture.res.hdr",
+            out_type: SampleType::Str,
+            func: |ctx, args| {
+                let idx_str = args.first()?;
+                let idx: usize = idx_str.parse().ok()?;
+                let caps = ctx.captures_res_hdr?;
+                caps.get(idx).cloned().map(Sample::Str)
+            },
+        });
+
+        self.register_fetch(FetchDesc {
+            name: "capture.req.method",
+            out_type: SampleType::Str,
+            func: |ctx, _args| {
+                let m = ctx
+                    .req_method
+                    .map(ToString::to_string)
+                    .or_else(|| ctx.htx.and_then(|h| h.req_line().map(|r| r.method.as_str().to_string())))?;
+                Some(Sample::Str(m))
+            },
+        });
+
+        self.register_fetch(FetchDesc {
+            name: "capture.req.uri",
+            out_type: SampleType::Str,
+            func: |ctx, _args| {
+                let uri = ctx
+                    .req_uri
+                    .or_else(|| ctx.htx.and_then(|h| h.req_line().map(|r| r.uri.as_str())))?;
+                Some(Sample::Str(uri.to_string()))
+            },
+        });
+
+        self.register_fetch(FetchDesc {
+            name: "capture.req.ver",
+            out_type: SampleType::Str,
+            func: req_ver_fetch,
+        });
+
+        self.register_fetch(FetchDesc {
+            name: "capture.res.ver",
+            out_type: SampleType::Str,
+            func: res_ver_fetch,
+        });
+
+        // --- 8. Frontend / Backend / Server Fetches ---
+        self.register_fetch(FetchDesc {
+            name: "fe_id",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| ctx.fe_id.map(|id| Sample::Sint(i64::from(id))),
+        });
+        self.register_fetch(FetchDesc {
+            name: "fe_name",
+            out_type: SampleType::Str,
+            func: |ctx, _args| ctx.fe_name.map(|n| Sample::Str(n.to_string())),
+        });
+        self.register_fetch(FetchDesc {
+            name: "fe_defbe",
+            out_type: SampleType::Str,
+            func: |ctx, _args| ctx.be_name.map(|n| Sample::Str(n.to_string())),
+        });
+
+        self.register_fetch(FetchDesc {
+            name: "be_id",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| ctx.be_id.map(|id| Sample::Sint(i64::from(id))),
+        });
+        self.register_fetch(FetchDesc {
+            name: "be_name",
+            out_type: SampleType::Str,
+            func: |ctx, _args| ctx.be_name.map(|n| Sample::Str(n.to_string())),
+        });
+
+        self.register_fetch(FetchDesc {
+            name: "srv_id",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| ctx.srv_id.map(|id| Sample::Sint(i64::from(id))),
+        });
+        self.register_fetch(FetchDesc {
+            name: "srv_name",
+            out_type: SampleType::Str,
+            func: |ctx, _args| ctx.srv_name.map(|n| Sample::Str(n.to_string())),
+        });
+        self.register_fetch(FetchDesc {
+            name: "srv_is_up",
+            out_type: SampleType::Bool,
+            func: |_ctx, _args| Some(Sample::Bool(true)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "nbsrv",
+            out_type: SampleType::Sint,
+            func: |_ctx, _args| Some(Sample::Sint(1)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "srv_queue",
+            out_type: SampleType::Sint,
+            func: |_ctx, _args| Some(Sample::Sint(0)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "avg_queue",
+            out_type: SampleType::Sint,
+            func: |_ctx, _args| Some(Sample::Sint(0)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "queue",
+            out_type: SampleType::Sint,
+            func: |_ctx, _args| Some(Sample::Sint(0)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "srv_conn",
+            out_type: SampleType::Sint,
+            func: |_ctx, _args| Some(Sample::Sint(0)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "srv_conn_free",
+            out_type: SampleType::Sint,
+            func: |_ctx, _args| Some(Sample::Sint(100)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "be_conn",
+            out_type: SampleType::Sint,
+            func: |_ctx, _args| Some(Sample::Sint(0)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "be_conn_free",
+            out_type: SampleType::Sint,
+            func: |_ctx, _args| Some(Sample::Sint(100)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "fe_conn",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| Some(Sample::Sint(i64::from(ctx.act_conn))),
+        });
+
+        self.register_fetch(FetchDesc {
+            name: "so_id",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| ctx.so_id.map(|id| Sample::Sint(i64::from(id))),
+        });
+        self.register_fetch(FetchDesc {
+            name: "so_name",
+            out_type: SampleType::Str,
+            func: |ctx, _args| ctx.so_name.map(|n| Sample::Str(n.to_string())),
+        });
+
+        // --- 9. Connection & Rate Fetches ---
+        self.register_fetch(FetchDesc {
+            name: "act_conn",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| Some(Sample::Sint(i64::from(ctx.act_conn))),
+        });
+        self.register_fetch(FetchDesc {
+            name: "dst_conn",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| Some(Sample::Sint(i64::from(ctx.act_conn))),
+        });
+        self.register_fetch(FetchDesc {
+            name: "conn_cnt",
             out_type: SampleType::Sint,
             #[allow(clippy::cast_possible_wrap)]
             func: |ctx, _args| Some(Sample::Sint(ctx.conn_cnt as i64)),
         });
-
         self.register_fetch(FetchDesc {
-            name: "sc_conn_rate",
+            name: "cum_conn",
             out_type: SampleType::Sint,
             #[allow(clippy::cast_possible_wrap)]
-            func: |ctx, args| {
-                let slot = args
-                    .first()
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0);
-                if slot < 3 && ctx.sc_conn_rates[slot] > 0 {
-                    Some(Sample::Sint(ctx.sc_conn_rates[slot] as i64))
-                } else {
-                    Some(Sample::Sint(ctx.conn_rate as i64))
-                }
-            },
+            func: |ctx, _args| Some(Sample::Sint(ctx.cum_conn as i64)),
         });
-
         self.register_fetch(FetchDesc {
-            name: "sc_http_req_rate",
+            name: "conn_rate",
             out_type: SampleType::Sint,
             #[allow(clippy::cast_possible_wrap)]
-            func: |ctx, args| {
-                let slot = args
-                    .first()
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0);
-                if slot < 3 && ctx.sc_http_req_rates[slot] > 0 {
-                    Some(Sample::Sint(ctx.sc_http_req_rates[slot] as i64))
-                } else {
-                    Some(Sample::Sint(ctx.http_req_rate as i64))
-                }
-            },
+            func: |ctx, _args| Some(Sample::Sint(ctx.conn_rate as i64)),
         });
-
         self.register_fetch(FetchDesc {
-            name: "sc_http_err_rate",
+            name: "sess_rate",
             out_type: SampleType::Sint,
             #[allow(clippy::cast_possible_wrap)]
-            func: |ctx, args| {
-                let slot = args
-                    .first()
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0);
-                if slot < 3 && ctx.sc_http_err_rates[slot] > 0 {
-                    Some(Sample::Sint(ctx.sc_http_err_rates[slot] as i64))
-                } else {
-                    Some(Sample::Sint(ctx.http_err_rate as i64))
-                }
-            },
+            func: |ctx, _args| Some(Sample::Sint(ctx.conn_rate as i64)),
         });
-
         self.register_fetch(FetchDesc {
-            name: "sc_conn_cnt",
+            name: "fe_sess_rate",
             out_type: SampleType::Sint,
             #[allow(clippy::cast_possible_wrap)]
-            func: |ctx, args| {
-                let slot = args
-                    .first()
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0);
-                if slot < 3 && ctx.sc_conn_cnts[slot] > 0 {
-                    Some(Sample::Sint(ctx.sc_conn_cnts[slot] as i64))
-                } else {
-                    Some(Sample::Sint(ctx.conn_cnt as i64))
-                }
-            },
+            func: |ctx, _args| Some(Sample::Sint(ctx.conn_rate as i64)),
         });
-
         self.register_fetch(FetchDesc {
-            name: "sc_http_req_cnt",
+            name: "be_sess_rate",
             out_type: SampleType::Sint,
             #[allow(clippy::cast_possible_wrap)]
-            func: |ctx, args| {
-                let slot = args
-                    .first()
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0);
-                if slot < 3 && ctx.sc_http_req_cnts[slot] > 0 {
-                    Some(Sample::Sint(ctx.sc_http_req_cnts[slot] as i64))
-                } else {
-                    Some(Sample::Sint(ctx.http_req_cnt as i64))
-                }
-            },
+            func: |ctx, _args| Some(Sample::Sint(ctx.conn_rate as i64)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "srv_sess_rate",
+            out_type: SampleType::Sint,
+            #[allow(clippy::cast_possible_wrap)]
+            func: |ctx, _args| Some(Sample::Sint(ctx.conn_rate as i64)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "sess_cnt",
+            out_type: SampleType::Sint,
+            #[allow(clippy::cast_possible_wrap)]
+            func: |ctx, _args| Some(Sample::Sint(ctx.conn_cnt as i64)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "req_rate",
+            out_type: SampleType::Sint,
+            #[allow(clippy::cast_possible_wrap)]
+            func: |ctx, _args| Some(Sample::Sint(ctx.http_req_rate as i64)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "fe_req_rate",
+            out_type: SampleType::Sint,
+            #[allow(clippy::cast_possible_wrap)]
+            func: |ctx, _args| Some(Sample::Sint(ctx.http_req_rate as i64)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "req_cnt",
+            out_type: SampleType::Sint,
+            #[allow(clippy::cast_possible_wrap)]
+            func: |ctx, _args| Some(Sample::Sint(ctx.http_req_cnt as i64)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "err_rate",
+            out_type: SampleType::Sint,
+            #[allow(clippy::cast_possible_wrap)]
+            func: |ctx, _args| Some(Sample::Sint(ctx.http_err_rate as i64)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "err_cnt",
+            out_type: SampleType::Sint,
+            #[allow(clippy::cast_possible_wrap)]
+            func: |ctx, _args| Some(Sample::Sint(ctx.http_err_rate as i64)),
         });
 
-        // SSL SNI
+        // --- 10. Stick Table Trackers Fetches ---
+        macro_rules! reg_sc_fetches {
+            ($name:literal, $field:ident, $arr:ident) => {
+                self.register_fetch(FetchDesc {
+                    name: $name,
+                    out_type: SampleType::Sint,
+                    #[allow(clippy::cast_possible_wrap)]
+                    func: |ctx, args| {
+                        let slot = args
+                            .first()
+                            .and_then(|s| s.parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if slot < 3 && ctx.$arr[slot] > 0 {
+                            Some(Sample::Sint(ctx.$arr[slot] as i64))
+                        } else {
+                            Some(Sample::Sint(ctx.$field as i64))
+                        }
+                    },
+                });
+            };
+        }
+
+        reg_sc_fetches!("sc_conn_cnt", conn_cnt, sc_conn_cnts);
+        reg_sc_fetches!("sc_conn_rate", conn_rate, sc_conn_rates);
+        reg_sc_fetches!("sc_http_req_rate", http_req_rate, sc_http_req_rates);
+        reg_sc_fetches!("sc_http_err_rate", http_err_rate, sc_http_err_rates);
+        reg_sc_fetches!("sc_http_req_cnt", http_req_cnt, sc_http_req_cnts);
+        reg_sc_fetches!("sc_bytes_in_cnt", bytes_in_cnt, sc_bytes_in_cnts);
+        reg_sc_fetches!("sc_bytes_out_cnt", bytes_out_cnt, sc_bytes_out_cnts);
+
+        self.register_fetch(FetchDesc {
+            name: "sc_conn_cur",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| Some(Sample::Sint(i64::from(ctx.act_conn))),
+        });
+        self.register_fetch(FetchDesc {
+            name: "sc_sess_cnt",
+            out_type: SampleType::Sint,
+            #[allow(clippy::cast_possible_wrap)]
+            func: |ctx, _args| Some(Sample::Sint(ctx.conn_cnt as i64)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "sc_sess_rate",
+            out_type: SampleType::Sint,
+            #[allow(clippy::cast_possible_wrap)]
+            func: |ctx, _args| Some(Sample::Sint(ctx.conn_rate as i64)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "sc_http_err_cnt",
+            out_type: SampleType::Sint,
+            #[allow(clippy::cast_possible_wrap)]
+            func: |ctx, _args| Some(Sample::Sint(ctx.http_err_rate as i64)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "sc_bytes_in_rate",
+            out_type: SampleType::Sint,
+            #[allow(clippy::cast_possible_wrap)]
+            func: |ctx, _args| Some(Sample::Sint(ctx.bytes_in_cnt as i64)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "sc_bytes_out_rate",
+            out_type: SampleType::Sint,
+            #[allow(clippy::cast_possible_wrap)]
+            func: |ctx, _args| Some(Sample::Sint(ctx.bytes_out_cnt as i64)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "sc_kbytes_in",
+            out_type: SampleType::Sint,
+            #[allow(clippy::cast_possible_wrap)]
+            func: |ctx, _args| Some(Sample::Sint((ctx.bytes_in_cnt / 1024) as i64)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "sc_kbytes_out",
+            out_type: SampleType::Sint,
+            #[allow(clippy::cast_possible_wrap)]
+            func: |ctx, _args| Some(Sample::Sint((ctx.bytes_out_cnt / 1024) as i64)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "sc_trackers",
+            out_type: SampleType::Sint,
+            func: |_ctx, _args| Some(Sample::Sint(1)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "sc_gpc0",
+            out_type: SampleType::Sint,
+            #[allow(clippy::cast_possible_wrap)]
+            func: |ctx, _args| Some(Sample::Sint(ctx.gpc0 as i64)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "sc_gpc1",
+            out_type: SampleType::Sint,
+            #[allow(clippy::cast_possible_wrap)]
+            func: |ctx, _args| Some(Sample::Sint(ctx.gpc1 as i64)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "sc_gpc0_rate",
+            out_type: SampleType::Sint,
+            #[allow(clippy::cast_possible_wrap)]
+            func: |ctx, _args| Some(Sample::Sint(ctx.gpc0 as i64)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "sc_gpc1_rate",
+            out_type: SampleType::Sint,
+            #[allow(clippy::cast_possible_wrap)]
+            func: |ctx, _args| Some(Sample::Sint(ctx.gpc1 as i64)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "sc_gpt0",
+            out_type: SampleType::Sint,
+            #[allow(clippy::cast_possible_wrap)]
+            func: |ctx, _args| Some(Sample::Sint(ctx.gpt0 as i64)),
+        });
+
+        // sc0_*, sc1_*, sc2_* aliases
+        macro_rules! reg_sc_slot {
+            ($slot:expr, $prefix:literal) => {
+                self.register_fetch(FetchDesc {
+                    name: concat!($prefix, "conn_cnt"),
+                    out_type: SampleType::Sint,
+                    #[allow(clippy::cast_possible_wrap)]
+                    func: |ctx, _args| {
+                        if ctx.sc_conn_cnts[$slot] > 0 {
+                            Some(Sample::Sint(ctx.sc_conn_cnts[$slot] as i64))
+                        } else {
+                            Some(Sample::Sint(ctx.conn_cnt as i64))
+                        }
+                    },
+                });
+                self.register_fetch(FetchDesc {
+                    name: concat!($prefix, "conn_rate"),
+                    out_type: SampleType::Sint,
+                    #[allow(clippy::cast_possible_wrap)]
+                    func: |ctx, _args| {
+                        if ctx.sc_conn_rates[$slot] > 0 {
+                            Some(Sample::Sint(ctx.sc_conn_rates[$slot] as i64))
+                        } else {
+                            Some(Sample::Sint(ctx.conn_rate as i64))
+                        }
+                    },
+                });
+                self.register_fetch(FetchDesc {
+                    name: concat!($prefix, "http_req_rate"),
+                    out_type: SampleType::Sint,
+                    #[allow(clippy::cast_possible_wrap)]
+                    func: |ctx, _args| {
+                        if ctx.sc_http_req_rates[$slot] > 0 {
+                            Some(Sample::Sint(ctx.sc_http_req_rates[$slot] as i64))
+                        } else {
+                            Some(Sample::Sint(ctx.http_req_rate as i64))
+                        }
+                    },
+                });
+                self.register_fetch(FetchDesc {
+                    name: concat!($prefix, "http_err_rate"),
+                    out_type: SampleType::Sint,
+                    #[allow(clippy::cast_possible_wrap)]
+                    func: |ctx, _args| {
+                        if ctx.sc_http_err_rates[$slot] > 0 {
+                            Some(Sample::Sint(ctx.sc_http_err_rates[$slot] as i64))
+                        } else {
+                            Some(Sample::Sint(ctx.http_err_rate as i64))
+                        }
+                    },
+                });
+                self.register_fetch(FetchDesc {
+                    name: concat!($prefix, "http_req_cnt"),
+                    out_type: SampleType::Sint,
+                    #[allow(clippy::cast_possible_wrap)]
+                    func: |ctx, _args| {
+                        if ctx.sc_http_req_cnts[$slot] > 0 {
+                            Some(Sample::Sint(ctx.sc_http_req_cnts[$slot] as i64))
+                        } else {
+                            Some(Sample::Sint(ctx.http_req_cnt as i64))
+                        }
+                    },
+                });
+                self.register_fetch(FetchDesc {
+                    name: concat!($prefix, "bytes_in_cnt"),
+                    out_type: SampleType::Sint,
+                    #[allow(clippy::cast_possible_wrap)]
+                    func: |ctx, _args| {
+                        if ctx.sc_bytes_in_cnts[$slot] > 0 {
+                            Some(Sample::Sint(ctx.sc_bytes_in_cnts[$slot] as i64))
+                        } else {
+                            Some(Sample::Sint(ctx.bytes_in_cnt as i64))
+                        }
+                    },
+                });
+                self.register_fetch(FetchDesc {
+                    name: concat!($prefix, "bytes_out_cnt"),
+                    out_type: SampleType::Sint,
+                    #[allow(clippy::cast_possible_wrap)]
+                    func: |ctx, _args| {
+                        if ctx.sc_bytes_out_cnts[$slot] > 0 {
+                            Some(Sample::Sint(ctx.sc_bytes_out_cnts[$slot] as i64))
+                        } else {
+                            Some(Sample::Sint(ctx.bytes_out_cnt as i64))
+                        }
+                    },
+                });
+            };
+        }
+
+        reg_sc_slot!(0, "sc0_");
+        reg_sc_slot!(1, "sc1_");
+        reg_sc_slot!(2, "sc2_");
+
+        // src_* stick table metrics
+        self.register_fetch(FetchDesc {
+            name: "src_conn_cnt",
+            out_type: SampleType::Sint,
+            #[allow(clippy::cast_possible_wrap)]
+            func: |ctx, _args| Some(Sample::Sint(ctx.conn_cnt as i64)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "src_conn_cur",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| Some(Sample::Sint(i64::from(ctx.act_conn))),
+        });
+        self.register_fetch(FetchDesc {
+            name: "src_conn_rate",
+            out_type: SampleType::Sint,
+            #[allow(clippy::cast_possible_wrap)]
+            func: |ctx, _args| Some(Sample::Sint(ctx.conn_rate as i64)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "src_sess_cnt",
+            out_type: SampleType::Sint,
+            #[allow(clippy::cast_possible_wrap)]
+            func: |ctx, _args| Some(Sample::Sint(ctx.conn_cnt as i64)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "src_sess_rate",
+            out_type: SampleType::Sint,
+            #[allow(clippy::cast_possible_wrap)]
+            func: |ctx, _args| Some(Sample::Sint(ctx.conn_rate as i64)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "src_http_req_cnt",
+            out_type: SampleType::Sint,
+            #[allow(clippy::cast_possible_wrap)]
+            func: |ctx, _args| Some(Sample::Sint(ctx.http_req_cnt as i64)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "src_http_req_rate",
+            out_type: SampleType::Sint,
+            #[allow(clippy::cast_possible_wrap)]
+            func: |ctx, _args| Some(Sample::Sint(ctx.http_req_rate as i64)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "src_http_err_cnt",
+            out_type: SampleType::Sint,
+            #[allow(clippy::cast_possible_wrap)]
+            func: |ctx, _args| Some(Sample::Sint(ctx.http_err_rate as i64)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "src_http_err_rate",
+            out_type: SampleType::Sint,
+            #[allow(clippy::cast_possible_wrap)]
+            func: |ctx, _args| Some(Sample::Sint(ctx.http_err_rate as i64)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "src_bytes_in_cnt",
+            out_type: SampleType::Sint,
+            #[allow(clippy::cast_possible_wrap)]
+            func: |ctx, _args| Some(Sample::Sint(ctx.bytes_in_cnt as i64)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "src_bytes_in_rate",
+            out_type: SampleType::Sint,
+            #[allow(clippy::cast_possible_wrap)]
+            func: |ctx, _args| Some(Sample::Sint(ctx.bytes_in_cnt as i64)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "src_bytes_out_cnt",
+            out_type: SampleType::Sint,
+            #[allow(clippy::cast_possible_wrap)]
+            func: |ctx, _args| Some(Sample::Sint(ctx.bytes_out_cnt as i64)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "src_bytes_out_rate",
+            out_type: SampleType::Sint,
+            #[allow(clippy::cast_possible_wrap)]
+            func: |ctx, _args| Some(Sample::Sint(ctx.bytes_out_cnt as i64)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "src_kbytes_in",
+            out_type: SampleType::Sint,
+            #[allow(clippy::cast_possible_wrap)]
+            func: |ctx, _args| Some(Sample::Sint((ctx.bytes_in_cnt / 1024) as i64)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "src_kbytes_out",
+            out_type: SampleType::Sint,
+            #[allow(clippy::cast_possible_wrap)]
+            func: |ctx, _args| Some(Sample::Sint((ctx.bytes_out_cnt / 1024) as i64)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "src_trackers",
+            out_type: SampleType::Sint,
+            func: |_ctx, _args| Some(Sample::Sint(1)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "src_gpc0",
+            out_type: SampleType::Sint,
+            #[allow(clippy::cast_possible_wrap)]
+            func: |ctx, _args| Some(Sample::Sint(ctx.gpc0 as i64)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "src_gpc1",
+            out_type: SampleType::Sint,
+            #[allow(clippy::cast_possible_wrap)]
+            func: |ctx, _args| Some(Sample::Sint(ctx.gpc1 as i64)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "src_gpc0_rate",
+            out_type: SampleType::Sint,
+            #[allow(clippy::cast_possible_wrap)]
+            func: |ctx, _args| Some(Sample::Sint(ctx.gpc0 as i64)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "src_gpc1_rate",
+            out_type: SampleType::Sint,
+            #[allow(clippy::cast_possible_wrap)]
+            func: |ctx, _args| Some(Sample::Sint(ctx.gpc1 as i64)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "src_gpt0",
+            out_type: SampleType::Sint,
+            #[allow(clippy::cast_possible_wrap)]
+            func: |ctx, _args| Some(Sample::Sint(ctx.gpt0 as i64)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "src_in_table",
+            out_type: SampleType::Bool,
+            func: |_ctx, _args| Some(Sample::Bool(true)),
+        });
+
+        // --- 11. Timeout Fetches ---
+        macro_rules! reg_timeout_fetch {
+            ($name:literal) => {
+                self.register_fetch(FetchDesc {
+                    name: $name,
+                    out_type: SampleType::Sint,
+                    func: |ctx, _args| {
+                        if let Some(t_map) = ctx.timeouts {
+                            if let Some(&v) = t_map.get($name) {
+                                return Some(Sample::Sint(i64::from(v)));
+                            }
+                        }
+                        CURRENT_TIMEOUTS.with(|t| {
+                            t.borrow()
+                                .get($name)
+                                .copied()
+                                .map(|v| Sample::Sint(i64::from(v)))
+                        })
+                    },
+                });
+            };
+        }
+
+        reg_timeout_fetch!("fe_client_timeout");
+        reg_timeout_fetch!("cur_client_timeout");
+        reg_timeout_fetch!("be_server_timeout");
+        reg_timeout_fetch!("cur_server_timeout");
+        reg_timeout_fetch!("be_connect_timeout");
+        reg_timeout_fetch!("cur_connect_timeout");
+        reg_timeout_fetch!("be_queue_timeout");
+        reg_timeout_fetch!("cur_queue_timeout");
+        reg_timeout_fetch!("be_tunnel_timeout");
+        reg_timeout_fetch!("cur_tunnel_timeout");
+        reg_timeout_fetch!("be_tarpit_timeout");
+        reg_timeout_fetch!("cur_tarpit_timeout");
+        reg_timeout_fetch!("fe_connect_timeout");
+        reg_timeout_fetch!("fe_server_timeout");
+        reg_timeout_fetch!("fe_queue_timeout");
+        reg_timeout_fetch!("fe_tunnel_timeout");
+        reg_timeout_fetch!("fe_tarpit_timeout");
+        reg_timeout_fetch!("be_client_timeout");
+
+        // --- 12. SSL Fetches ---
         self.register_fetch(FetchDesc {
             name: "ssl_fc_sni",
             out_type: SampleType::Str,
             func: |ctx, _args| ctx.ssl_sni.map(|sni| Sample::Str(sni.to_string())),
         });
+        self.register_fetch(FetchDesc {
+            name: "ssl_fc",
+            out_type: SampleType::Bool,
+            func: |ctx, _args| Some(Sample::Bool(ctx.ssl_used || ctx.ssl_sni.is_some())),
+        });
+        self.register_fetch(FetchDesc {
+            name: "ssl_c_used",
+            out_type: SampleType::Bool,
+            func: |ctx, _args| Some(Sample::Bool(ctx.ssl_used || ctx.ssl_sni.is_some())),
+        });
+        self.register_fetch(FetchDesc {
+            name: "ssl_fc_cipher",
+            out_type: SampleType::Str,
+            func: |ctx, _args| ctx.ssl_cipher.map(|c| Sample::Str(c.to_string())),
+        });
+        self.register_fetch(FetchDesc {
+            name: "ssl_fc_protocol",
+            out_type: SampleType::Str,
+            func: |ctx, _args| ctx.ssl_version.map(|v| Sample::Str(v.to_string())),
+        });
+        self.register_fetch(FetchDesc {
+            name: "ssl_fc_version",
+            out_type: SampleType::Str,
+            func: |ctx, _args| ctx.ssl_version.map(|v| Sample::Str(v.to_string())),
+        });
+
+        // --- 13. System, Primitive & Time Fetches ---
+        self.register_fetch(FetchDesc {
+            name: "always_true",
+            out_type: SampleType::Bool,
+            func: |_ctx, _args| Some(Sample::Bool(true)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "always_false",
+            out_type: SampleType::Bool,
+            func: |_ctx, _args| Some(Sample::Bool(false)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "bool",
+            out_type: SampleType::Bool,
+            func: |_ctx, args| {
+                let s = args.first()?;
+                match s.as_str() {
+                    "1" | "true" | "TRUE" | "yes" | "YES" => Some(Sample::Bool(true)),
+                    "0" | "false" | "FALSE" | "no" | "NO" => Some(Sample::Bool(false)),
+                    _ => None,
+                }
+            },
+        });
+        self.register_fetch(FetchDesc {
+            name: "str",
+            out_type: SampleType::Str,
+            func: |_ctx, args| {
+                let s = args.first().cloned().unwrap_or_default();
+                Some(Sample::Str(s))
+            },
+        });
+        self.register_fetch(FetchDesc {
+            name: "int",
+            out_type: SampleType::Sint,
+            func: |_ctx, args| {
+                let n = args.first()?.parse::<i64>().ok()?;
+                Some(Sample::Sint(n))
+            },
+        });
+        self.register_fetch(FetchDesc {
+            name: "var",
+            out_type: SampleType::Str,
+            func: |ctx, args| {
+                let var_name = args.first()?;
+                if let Some(v_map) = ctx.vars {
+                    if let Some(val) = v_map.get(var_name) {
+                        return Some(Sample::Str(val.clone()));
+                    }
+                }
+                CURRENT_VARS.with(|v| v.borrow().get(var_name).cloned().map(Sample::Str))
+            },
+        });
+        self.register_fetch(FetchDesc {
+            name: "env",
+            out_type: SampleType::Str,
+            func: |_ctx, args| {
+                let var_name = args.first()?;
+                std::env::var(var_name).ok().map(Sample::Str)
+            },
+        });
+        let date_fetch: FetchFn = |_ctx, _args| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            #[allow(clippy::cast_possible_wrap)]
+            Some(Sample::Sint(now.as_secs() as i64))
+        };
+        self.register_fetch(FetchDesc {
+            name: "date",
+            out_type: SampleType::Sint,
+            func: date_fetch,
+        });
+        self.register_fetch(FetchDesc {
+            name: "epoch",
+            out_type: SampleType::Sint,
+            func: date_fetch,
+        });
+        self.register_fetch(FetchDesc {
+            name: "date_us",
+            out_type: SampleType::Sint,
+            func: |_ctx, _args| {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default();
+                #[allow(clippy::cast_possible_wrap)]
+                Some(Sample::Sint(now.as_micros() as i64))
+            },
+        });
+        self.register_fetch(FetchDesc {
+            name: "rand",
+            out_type: SampleType::Sint,
+            func: |_ctx, args| {
+                let max = args
+                    .first()
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .unwrap_or(u32::MAX);
+                let seed = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos();
+                #[allow(clippy::cast_possible_truncation)]
+                let r = i64::from(full_hash(seed as u32) % max.max(1));
+                Some(Sample::Sint(r))
+            },
+        });
     }
 
     #[allow(clippy::too_many_lines)]
     fn register_builtin_converters(&mut self) {
-        // lower: string to lowercase
+        // --- 1. String Transforms ---
         self.register_converter(ConvDesc {
             name: "lower",
             in_type: TypeSpec::Exact(SampleType::Str),
@@ -352,7 +1605,6 @@ impl Registry {
             },
         });
 
-        // upper: string to uppercase
         self.register_converter(ConvDesc {
             name: "upper",
             in_type: TypeSpec::Exact(SampleType::Str),
@@ -363,19 +1615,316 @@ impl Registry {
             },
         });
 
-        // len: string length
+        let len_conv: ConvFn = |smp, _args| match smp {
+            #[allow(clippy::cast_possible_wrap)]
+            Sample::Str(s) => Some(Sample::Sint(s.len() as i64)),
+            Sample::Bin(b) => Some(Sample::Sint(b.len() as i64)),
+            _ => None,
+        };
         self.register_converter(ConvDesc {
             name: "len",
             in_type: TypeSpec::Exact(SampleType::Str),
             out_type: TypeSpec::Exact(SampleType::Sint),
-            func: |smp, _args| match smp {
-                #[allow(clippy::cast_possible_wrap)]
-                Sample::Str(s) => Some(Sample::Sint(s.len() as i64)),
+            func: len_conv,
+        });
+        self.register_converter(ConvDesc {
+            name: "length",
+            in_type: TypeSpec::Exact(SampleType::Str),
+            out_type: TypeSpec::Exact(SampleType::Sint),
+            func: len_conv,
+        });
+
+        self.register_converter(ConvDesc {
+            name: "concat",
+            in_type: TypeSpec::Exact(SampleType::Str),
+            out_type: TypeSpec::Exact(SampleType::Str),
+            func: |smp, args| match smp {
+                Sample::Str(mut s) => {
+                    for arg in args {
+                        let piece = CURRENT_VARS
+                            .with(|v| v.borrow().get(arg).cloned())
+                            .unwrap_or_else(|| arg.clone());
+                        s.push_str(&piece);
+                    }
+                    Some(Sample::Str(s))
+                }
                 _ => None,
             },
         });
 
-        // add(n): integer addition
+        self.register_converter(ConvDesc {
+            name: "strcmp",
+            in_type: TypeSpec::Exact(SampleType::Str),
+            out_type: TypeSpec::Exact(SampleType::Sint),
+            func: |smp, args| {
+                let target_arg = args.first()?;
+                let target_val = CURRENT_VARS
+                    .with(|v| v.borrow().get(target_arg).cloned())
+                    .unwrap_or_else(|| target_arg.clone());
+                let Sample::Str(s) = smp else { return None };
+                let cmp = s.cmp(&target_val);
+                let res = match cmp {
+                    std::cmp::Ordering::Less => -1,
+                    std::cmp::Ordering::Equal => 0,
+                    std::cmp::Ordering::Greater => 1,
+                };
+                Some(Sample::Sint(res))
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "field",
+            in_type: TypeSpec::Exact(SampleType::Str),
+            out_type: TypeSpec::Exact(SampleType::Str),
+            func: |smp, args| {
+                let idx_str = args.first()?;
+                let delim_char = args.get(1).and_then(|d| d.chars().next()).unwrap_or(' ');
+                let count_str = args.get(2);
+
+                let idx: i64 = idx_str.parse().ok()?;
+                let count: usize = count_str.and_then(|c| c.parse().ok()).unwrap_or(1);
+
+                let Sample::Str(s) = smp else { return None };
+                let fields: Vec<&str> = s.split(delim_char).collect();
+                let len = fields.len();
+                if len == 0 {
+                    return Some(Sample::Str(String::new()));
+                }
+                let start_idx = match idx.cmp(&0) {
+                    std::cmp::Ordering::Greater => {
+                        usize::try_from(idx).unwrap_or(usize::MAX).saturating_sub(1)
+                    }
+                    std::cmp::Ordering::Less => len.saturating_sub(
+                        usize::try_from(idx.saturating_neg()).unwrap_or(usize::MAX),
+                    ),
+                    std::cmp::Ordering::Equal => return None,
+                };
+                if start_idx >= len {
+                    return Some(Sample::Str(String::new()));
+                }
+                let end_idx = if count == 0 {
+                    len
+                } else {
+                    (start_idx + count).min(len)
+                };
+                let joined = fields[start_idx..end_idx].join(&delim_char.to_string());
+                Some(Sample::Str(joined))
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "word",
+            in_type: TypeSpec::Exact(SampleType::Str),
+            out_type: TypeSpec::Exact(SampleType::Str),
+            func: |smp, args| {
+                let idx_str = args.first()?;
+                let delim_char = args.get(1).and_then(|d| d.chars().next()).unwrap_or(' ');
+                let count_str = args.get(2);
+
+                let idx: i64 = idx_str.parse().ok()?;
+                let count: usize = count_str.and_then(|c| c.parse().ok()).unwrap_or(1);
+
+                let Sample::Str(s) = smp else { return None };
+                let words: Vec<&str> = s.split(delim_char).filter(|w| !w.is_empty()).collect();
+                let len = words.len();
+                if len == 0 {
+                    return Some(Sample::Str(String::new()));
+                }
+                let start_idx = match idx.cmp(&0) {
+                    std::cmp::Ordering::Greater => {
+                        usize::try_from(idx).unwrap_or(usize::MAX).saturating_sub(1)
+                    }
+                    std::cmp::Ordering::Less => len.saturating_sub(
+                        usize::try_from(idx.saturating_neg()).unwrap_or(usize::MAX),
+                    ),
+                    std::cmp::Ordering::Equal => return None,
+                };
+                if start_idx >= len {
+                    return Some(Sample::Str(String::new()));
+                }
+                let end_idx = if count == 0 {
+                    len
+                } else {
+                    (start_idx + count).min(len)
+                };
+                let joined = words[start_idx..end_idx].join(&delim_char.to_string());
+                Some(Sample::Str(joined))
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "param",
+            in_type: TypeSpec::Exact(SampleType::Str),
+            out_type: TypeSpec::Exact(SampleType::Str),
+            func: |smp, args| {
+                let param_name = args.first()?;
+                let delim = args.get(1).map_or("&", String::as_str);
+                let Sample::Str(s) = smp else { return None };
+                for pair in s.split(delim) {
+                    if let Some((k, v)) = pair.split_once('=') {
+                        if k == param_name {
+                            return Some(Sample::Str(v.to_string()));
+                        }
+                    } else if pair == param_name {
+                        return Some(Sample::Str(String::new()));
+                    }
+                }
+                None
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "add_item",
+            in_type: TypeSpec::Exact(SampleType::Str),
+            out_type: TypeSpec::Exact(SampleType::Str),
+            func: |smp, args| {
+                let item = args.first()?;
+                let delim = args.get(1).map_or(",", String::as_str);
+                let Sample::Str(s) = smp else { return None };
+                if s.is_empty() {
+                    Some(Sample::Str(item.clone()))
+                } else {
+                    Some(Sample::Str(format!("{s}{delim}{item}")))
+                }
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "cut_crlf",
+            in_type: TypeSpec::Exact(SampleType::Str),
+            out_type: TypeSpec::Exact(SampleType::Str),
+            func: |smp, _args| match smp {
+                Sample::Str(s) => Some(Sample::Str(s.trim_end_matches(['\r', '\n']).to_string())),
+                _ => None,
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "ltrim",
+            in_type: TypeSpec::Exact(SampleType::Str),
+            out_type: TypeSpec::Exact(SampleType::Str),
+            func: |smp, args| {
+                let chars: &[char] = &[' ', '\t', '\r', '\n'];
+                let pat: Vec<char> = args
+                    .first()
+                    .map_or_else(|| chars.to_vec(), |s| s.chars().collect());
+                match smp {
+                    Sample::Str(s) => Some(Sample::Str(s.trim_start_matches(&pat[..]).to_string())),
+                    _ => None,
+                }
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "rtrim",
+            in_type: TypeSpec::Exact(SampleType::Str),
+            out_type: TypeSpec::Exact(SampleType::Str),
+            func: |smp, args| {
+                let chars: &[char] = &[' ', '\t', '\r', '\n'];
+                let pat: Vec<char> = args
+                    .first()
+                    .map_or_else(|| chars.to_vec(), |s| s.chars().collect());
+                match smp {
+                    Sample::Str(s) => Some(Sample::Str(s.trim_end_matches(&pat[..]).to_string())),
+                    _ => None,
+                }
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "reverse",
+            in_type: TypeSpec::Exact(SampleType::Str),
+            out_type: TypeSpec::Exact(SampleType::Str),
+            func: |smp, _args| match smp {
+                Sample::Str(s) => Some(Sample::Str(s.chars().rev().collect())),
+                _ => None,
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "reverse_dom",
+            in_type: TypeSpec::Exact(SampleType::Str),
+            out_type: TypeSpec::Exact(SampleType::Str),
+            func: |smp, _args| match smp {
+                Sample::Str(s) => {
+                    let parts: Vec<&str> = s.split('.').collect();
+                    let reversed = parts.into_iter().rev().collect::<Vec<_>>().join(".");
+                    Some(Sample::Str(reversed))
+                }
+                _ => None,
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "host_only",
+            in_type: TypeSpec::Exact(SampleType::Str),
+            out_type: TypeSpec::Exact(SampleType::Str),
+            func: |smp, _args| match smp {
+                Sample::Str(s) => {
+                    let host = if let Some(stripped) = s.strip_prefix('[') {
+                        stripped.split(']').next().unwrap_or(&s)
+                    } else if let Some((h, _)) = s.split_once(':') {
+                        h
+                    } else {
+                        &s
+                    };
+                    Some(Sample::Str(host.to_string()))
+                }
+                _ => None,
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "port_only",
+            in_type: TypeSpec::Exact(SampleType::Str),
+            out_type: TypeSpec::Exact(SampleType::Sint),
+            func: |smp, _args| match smp {
+                Sample::Str(s) => {
+                    let port_str = if s.starts_with('[') {
+                        s.split("]:").nth(1)
+                    } else {
+                        s.split_once(':').map(|(_, p)| p)
+                    }?;
+                    port_str.parse::<i64>().ok().map(Sample::Sint)
+                }
+                _ => None,
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "regsub",
+            in_type: TypeSpec::Exact(SampleType::Str),
+            out_type: TypeSpec::Exact(SampleType::Str),
+            func: |smp, args| {
+                let pattern = args.first()?;
+                let repl = args.get(1)?;
+                let flags = args.get(2).map_or("", String::as_str);
+                let Sample::Str(s) = smp else { return None };
+                regsub_eval(&s, pattern, repl, flags).map(Sample::Str)
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "url_dec",
+            in_type: TypeSpec::Exact(SampleType::Str),
+            out_type: TypeSpec::Exact(SampleType::Str),
+            func: |smp, _args| match smp {
+                Sample::Str(s) => url_decode(&s).map(Sample::Str),
+                _ => None,
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "url_enc",
+            in_type: TypeSpec::Exact(SampleType::Str),
+            out_type: TypeSpec::Exact(SampleType::Str),
+            func: |smp, _args| match smp {
+                Sample::Str(s) => Some(Sample::Str(url_encode(&s))),
+                _ => None,
+            },
+        });
+
+        // --- 2. Arithmetic & Bitwise Logic ---
         self.register_converter(ConvDesc {
             name: "add",
             in_type: TypeSpec::Exact(SampleType::Sint),
@@ -389,7 +1938,6 @@ impl Registry {
             },
         });
 
-        // sub(n): integer subtraction
         self.register_converter(ConvDesc {
             name: "sub",
             in_type: TypeSpec::Exact(SampleType::Sint),
@@ -403,7 +1951,212 @@ impl Registry {
             },
         });
 
-        // hex: binary to hexadecimal string
+        self.register_converter(ConvDesc {
+            name: "mul",
+            in_type: TypeSpec::Exact(SampleType::Sint),
+            out_type: TypeSpec::Exact(SampleType::Sint),
+            func: |smp, args| {
+                let factor = args.first()?.parse::<i64>().ok()?;
+                match smp {
+                    Sample::Sint(n) => Some(Sample::Sint(n.saturating_mul(factor))),
+                    _ => None,
+                }
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "div",
+            in_type: TypeSpec::Exact(SampleType::Sint),
+            out_type: TypeSpec::Exact(SampleType::Sint),
+            func: |smp, args| {
+                let divisor = args.first()?.parse::<i64>().ok()?;
+                if divisor == 0 {
+                    return None;
+                }
+                match smp {
+                    Sample::Sint(n) => Some(Sample::Sint(n / divisor)),
+                    _ => None,
+                }
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "mod",
+            in_type: TypeSpec::Exact(SampleType::Sint),
+            out_type: TypeSpec::Exact(SampleType::Sint),
+            func: |smp, args| {
+                let divisor = args.first()?.parse::<i64>().ok()?;
+                if divisor == 0 {
+                    return None;
+                }
+                match smp {
+                    Sample::Sint(n) => Some(Sample::Sint(n % divisor)),
+                    _ => None,
+                }
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "neg",
+            in_type: TypeSpec::Exact(SampleType::Sint),
+            out_type: TypeSpec::Exact(SampleType::Sint),
+            func: |smp, _args| match smp {
+                Sample::Sint(n) => Some(Sample::Sint(n.saturating_neg())),
+                _ => None,
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "and",
+            in_type: TypeSpec::Exact(SampleType::Sint),
+            out_type: TypeSpec::Exact(SampleType::Sint),
+            func: |smp, args| {
+                let mask = args.first()?.parse::<i64>().ok()?;
+                match smp {
+                    Sample::Sint(n) => Some(Sample::Sint(n & mask)),
+                    _ => None,
+                }
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "or",
+            in_type: TypeSpec::Exact(SampleType::Sint),
+            out_type: TypeSpec::Exact(SampleType::Sint),
+            func: |smp, args| {
+                let mask = args.first()?.parse::<i64>().ok()?;
+                match smp {
+                    Sample::Sint(n) => Some(Sample::Sint(n | mask)),
+                    _ => None,
+                }
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "xor",
+            in_type: TypeSpec::Exact(SampleType::Sint),
+            out_type: TypeSpec::Exact(SampleType::Sint),
+            func: |smp, args| {
+                let mask = args.first()?.parse::<i64>().ok()?;
+                match smp {
+                    Sample::Sint(n) => Some(Sample::Sint(n ^ mask)),
+                    _ => None,
+                }
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "cpl",
+            in_type: TypeSpec::Exact(SampleType::Sint),
+            out_type: TypeSpec::Exact(SampleType::Sint),
+            func: |smp, _args| match smp {
+                Sample::Sint(n) => Some(Sample::Sint(!n)),
+                _ => None,
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "bool",
+            in_type: TypeSpec::Exact(SampleType::Sint),
+            out_type: TypeSpec::Exact(SampleType::Bool),
+            func: |smp, _args| match smp {
+                Sample::Sint(n) => Some(Sample::Bool(n != 0)),
+                Sample::Bool(b) => Some(Sample::Bool(b)),
+                _ => None,
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "not",
+            in_type: TypeSpec::Exact(SampleType::Sint),
+            out_type: TypeSpec::Exact(SampleType::Bool),
+            func: |smp, _args| match smp {
+                Sample::Sint(n) => Some(Sample::Bool(n == 0)),
+                Sample::Bool(b) => Some(Sample::Bool(!b)),
+                _ => None,
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "odd",
+            in_type: TypeSpec::Exact(SampleType::Sint),
+            out_type: TypeSpec::Exact(SampleType::Bool),
+            func: |smp, _args| match smp {
+                Sample::Sint(n) => Some(Sample::Bool((n & 1) != 0)),
+                _ => None,
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "even",
+            in_type: TypeSpec::Exact(SampleType::Sint),
+            out_type: TypeSpec::Exact(SampleType::Bool),
+            func: |smp, _args| match smp {
+                Sample::Sint(n) => Some(Sample::Bool((n & 1) == 0)),
+                _ => None,
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "iif",
+            in_type: TypeSpec::Exact(SampleType::Bool),
+            out_type: TypeSpec::Exact(SampleType::Str),
+            func: |smp, args| {
+                let true_val = args.first().cloned().unwrap_or_default();
+                let false_val = args.get(1).cloned().unwrap_or_default();
+                match smp {
+                    Sample::Bool(true) => Some(Sample::Str(true_val)),
+                    Sample::Bool(false) => Some(Sample::Str(false_val)),
+                    _ => None,
+                }
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "when",
+            in_type: TypeSpec::Any,
+            out_type: TypeSpec::Same,
+            func: |smp, args| {
+                let op = args.first()?;
+                let val = args.get(1)?;
+                let matches = match op.as_str() {
+                    "eq" => sample_to_string(&smp) == *val,
+                    "ne" => sample_to_string(&smp) != *val,
+                    "gt" => {
+                        let a: i64 = sample_to_string(&smp).parse().ok()?;
+                        let b: i64 = val.parse().ok()?;
+                        a > b
+                    }
+                    "ge" => {
+                        let a: i64 = sample_to_string(&smp).parse().ok()?;
+                        let b: i64 = val.parse().ok()?;
+                        a >= b
+                    }
+                    "lt" => {
+                        let a: i64 = sample_to_string(&smp).parse().ok()?;
+                        let b: i64 = val.parse().ok()?;
+                        a < b
+                    }
+                    "le" => {
+                        let a: i64 = sample_to_string(&smp).parse().ok()?;
+                        let b: i64 = val.parse().ok()?;
+                        a <= b
+                    }
+                    _ => false,
+                };
+                if matches {
+                    if let Some(res) = args.get(2) {
+                        Some(Sample::Str(res.clone()))
+                    } else {
+                        Some(smp)
+                    }
+                } else {
+                    None
+                }
+            },
+        });
+
+        // --- 3. Encoding & Binary Converters ---
         self.register_converter(ConvDesc {
             name: "hex",
             in_type: TypeSpec::Exact(SampleType::Bin),
@@ -414,7 +2167,6 @@ impl Registry {
             },
         });
 
-        // hex2bin: hexadecimal string to binary
         self.register_converter(ConvDesc {
             name: "hex2bin",
             in_type: TypeSpec::Exact(SampleType::Str),
@@ -425,18 +2177,29 @@ impl Registry {
             },
         });
 
-        // base64: binary to base64 string
+        self.register_converter(ConvDesc {
+            name: "hex2i",
+            in_type: TypeSpec::Exact(SampleType::Str),
+            out_type: TypeSpec::Exact(SampleType::Sint),
+            func: |smp, _args| match smp {
+                Sample::Str(s) => {
+                    let clean = s.trim().trim_start_matches("0x").trim_start_matches("0X");
+                    i64::from_str_radix(clean, 16).ok().map(Sample::Sint)
+                }
+                _ => None,
+            },
+        });
+
         self.register_converter(ConvDesc {
             name: "base64",
             in_type: TypeSpec::Exact(SampleType::Bin),
             out_type: TypeSpec::Exact(SampleType::Str),
             func: |smp, _args| match smp {
-                Sample::Bin(b) => Some(Sample::Str(base64_encode(&b))),
+                Sample::Bin(b) => Some(Sample::Str(base64_encode(&b, false))),
                 _ => None,
             },
         });
 
-        // b64dec: base64 string to binary
         self.register_converter(ConvDesc {
             name: "b64dec",
             in_type: TypeSpec::Exact(SampleType::Str),
@@ -447,15 +2210,36 @@ impl Registry {
             },
         });
 
-        // concat(args...): string concatenation
         self.register_converter(ConvDesc {
-            name: "concat",
-            in_type: TypeSpec::Exact(SampleType::Str),
+            name: "ub64enc",
+            in_type: TypeSpec::Exact(SampleType::Bin),
             out_type: TypeSpec::Exact(SampleType::Str),
-            func: |smp, args| match smp {
-                Sample::Str(mut s) => {
-                    for arg in args {
-                        s.push_str(arg);
+            func: |smp, _args| match smp {
+                Sample::Bin(b) => Some(Sample::Str(base64_encode(&b, true))),
+                _ => None,
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "ub64dec",
+            in_type: TypeSpec::Exact(SampleType::Str),
+            out_type: TypeSpec::Exact(SampleType::Bin),
+            func: |smp, _args| match smp {
+                Sample::Str(s) => base64_decode(&s).map(Sample::Bin),
+                _ => None,
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "base2",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Str),
+            func: |smp, _args| match smp {
+                Sample::Bin(b) => {
+                    let mut s = String::with_capacity(b.len() * 8);
+                    for byte in b {
+                        use std::fmt::Write;
+                        let _ = write!(s, "{byte:08b}");
                     }
                     Some(Sample::Str(s))
                 }
@@ -463,7 +2247,76 @@ impl Registry {
             },
         });
 
-        // bytes(offset, len): binary slice
+        self.register_converter(ConvDesc {
+            name: "be2dec",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Str),
+            func: |smp, _args| match smp {
+                Sample::Bin(b) => {
+                    let mut n: u64 = 0;
+                    for byte in b.iter().take(8) {
+                        n = (n << 8) | u64::from(*byte);
+                    }
+                    Some(Sample::Str(n.to_string()))
+                }
+                _ => None,
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "le2dec",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Str),
+            func: |smp, _args| match smp {
+                Sample::Bin(b) => {
+                    let mut n: u64 = 0;
+                    for (i, byte) in b.iter().take(8).enumerate() {
+                        n |= u64::from(*byte) << (i * 8);
+                    }
+                    Some(Sample::Str(n.to_string()))
+                }
+                _ => None,
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "be2hex",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Str),
+            func: |smp, _args| match smp {
+                Sample::Bin(b) => Some(Sample::Str(hex_encode(&b))),
+                _ => None,
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "be_sort",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Bin),
+            func: |smp, _args| match smp {
+                Sample::Bin(mut b) => {
+                    b.sort_unstable();
+                    Some(Sample::Bin(b))
+                }
+                _ => None,
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "has_ctl",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Bool),
+            func: |smp, _args| match smp {
+                Sample::Bin(b) => {
+                    let has = b
+                        .iter()
+                        .any(|&c| c < 32 && c != b'\t' && c != b'\r' && c != b'\n');
+                    Some(Sample::Bool(has))
+                }
+                _ => None,
+            },
+        });
+
         self.register_converter(ConvDesc {
             name: "bytes",
             in_type: TypeSpec::Exact(SampleType::Bin),
@@ -483,50 +2336,515 @@ impl Registry {
             },
         });
 
-        // ipmask(mask_or_prefix): IP masking
+        self.register_converter(ConvDesc {
+            name: "htonl",
+            in_type: TypeSpec::Exact(SampleType::Sint),
+            out_type: TypeSpec::Exact(SampleType::Bin),
+            func: |smp, _args| match smp {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                Sample::Sint(n) => Some(Sample::Bin((n as u32).to_be_bytes().to_vec())),
+                _ => None,
+            },
+        });
+
         self.register_converter(ConvDesc {
             name: "ipmask",
             in_type: TypeSpec::Addr,
             out_type: TypeSpec::Same,
             func: |smp, args| {
-                let mask_str = args.first()?;
+                let mask1_str = args.first()?;
+                let mask2_str = args.get(1);
                 match smp {
                     Sample::Ipv4(ip) => {
-                        let mask = if let Ok(prefix) = mask_str.parse::<u32>() {
-                            if prefix > 32 {
-                                return None;
+                        let mask = if let Ok(prefix) = mask1_str.parse::<u32>() {
+                            if prefix == 0 {
+                                0
+                            } else if prefix >= 32 {
+                                u32::MAX
+                            } else {
+                                !((1u32 << (32 - prefix)) - 1)
                             }
-                            u32::MAX.checked_shl(32 - prefix).unwrap_or(0)
-                        } else if let Ok(m_ip) = mask_str.parse::<std::net::Ipv4Addr>() {
+                        } else if let Ok(m_ip) = mask1_str.parse::<Ipv4Addr>() {
                             u32::from(m_ip)
                         } else {
                             return None;
                         };
-                        Some(Sample::Ipv4(std::net::Ipv4Addr::from(u32::from(ip) & mask)))
+                        Some(Sample::Ipv4(Ipv4Addr::from(u32::from(ip) & mask)))
                     }
                     Sample::Ipv6(ip) => {
-                        let prefix = mask_str.parse::<u32>().ok()?;
-                        if prefix > 128 {
+                        let chosen_mask = mask2_str.unwrap_or(mask1_str);
+                        let mask = if let Ok(prefix) = chosen_mask.parse::<u32>() {
+                            if prefix == 0 {
+                                0
+                            } else if prefix >= 128 {
+                                u128::MAX
+                            } else {
+                                !((1u128 << (128 - prefix)) - 1)
+                            }
+                        } else if let Ok(m_ip) = chosen_mask.parse::<Ipv6Addr>() {
+                            u128::from(m_ip)
+                        } else {
                             return None;
-                        }
-                        let mask = u128::MAX.checked_shl(128 - prefix).unwrap_or(0);
-                        Some(Sample::Ipv6(std::net::Ipv6Addr::from(
-                            u128::from(ip) & mask,
-                        )))
+                        };
+                        Some(Sample::Ipv6(Ipv6Addr::from(u128::from(ip) & mask)))
                     }
                     _ => None,
                 }
             },
         });
 
-        // crc32: CRC32 checksum
+        // --- 4. Hash Algorithms ---
         self.register_converter(ConvDesc {
             name: "crc32",
             in_type: TypeSpec::Exact(SampleType::Bin),
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: |smp, _args| match smp {
-                Sample::Bin(b) => Some(Sample::Sint(i64::from(crc32_compute(&b)))),
+                Sample::Bin(b) => Some(Sample::Sint(i64::from(hash_crc32(&b)))),
                 _ => None,
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "crc32c",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Sint),
+            func: |smp, _args| match smp {
+                Sample::Bin(b) => Some(Sample::Sint(i64::from(hash_crc32c(&b)))),
+                _ => None,
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "djb2",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Sint),
+            func: |smp, _args| match smp {
+                Sample::Bin(b) => Some(Sample::Sint(i64::from(hash_djb2(&b)))),
+                _ => None,
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "sdbm",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Sint),
+            func: |smp, _args| match smp {
+                Sample::Bin(b) => Some(Sample::Sint(i64::from(hash_sdbm(&b)))),
+                _ => None,
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "wt6",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Sint),
+            func: |smp, _args| match smp {
+                Sample::Bin(b) => Some(Sample::Sint(i64::from(hash_wt6(&b)))),
+                _ => None,
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "xxh32",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Sint),
+            func: |smp, args| {
+                let seed = args.first().and_then(|s| s.parse().ok()).unwrap_or(0);
+                match smp {
+                    Sample::Bin(b) => Some(Sample::Sint(i64::from(hash_xxh32(&b, seed)))),
+                    _ => None,
+                }
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "xxh64",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Sint),
+            func: |smp, args| {
+                let seed = args.first().and_then(|s| s.parse().ok()).unwrap_or(0);
+                match smp {
+                    #[allow(clippy::cast_possible_wrap)]
+                    Sample::Bin(b) => Some(Sample::Sint(hash_xxh64(&b, seed) as i64)),
+                    _ => None,
+                }
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "xxh3",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Sint),
+            func: |smp, args| {
+                let seed = args.first().and_then(|s| s.parse().ok()).unwrap_or(0);
+                match smp {
+                    #[allow(clippy::cast_possible_wrap)]
+                    Sample::Bin(b) => Some(Sample::Sint(hash_xxh3(&b, seed) as i64)),
+                    _ => None,
+                }
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "sha1",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Bin),
+            func: |smp, _args| match smp {
+                Sample::Bin(b) => Some(Sample::Bin(sha1_digest(&b).to_vec())),
+                _ => None,
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "sha2",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Bin),
+            func: |smp, args| {
+                let bits = args.first().map_or("256", String::as_str);
+                let Sample::Bin(b) = smp else { return None };
+                let out = match bits {
+                    "224" => sha224_digest(&b).to_vec(),
+                    "384" => sha384_digest(&b).to_vec(),
+                    "512" => sha512_digest(&b).to_vec(),
+                    _ => sha256_digest(&b).to_vec(),
+                };
+                Some(Sample::Bin(out))
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "digest",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Bin),
+            func: |smp, args| {
+                let algo = args.first().map_or("sha256", String::as_str);
+                let Sample::Bin(b) = smp else { return None };
+                let out = match algo.to_lowercase().as_str() {
+                    "sha1" => sha1_digest(&b).to_vec(),
+                    "sha224" => sha224_digest(&b).to_vec(),
+                    "sha384" => sha384_digest(&b).to_vec(),
+                    "sha512" => sha512_digest(&b).to_vec(),
+                    "md5" => md5_digest(&b).to_vec(),
+                    "crc32" => hash_crc32(&b).to_be_bytes().to_vec(),
+                    "crc32c" => hash_crc32c(&b).to_be_bytes().to_vec(),
+                    "djb2" => hash_djb2(&b).to_be_bytes().to_vec(),
+                    "sdbm" => hash_sdbm(&b).to_be_bytes().to_vec(),
+                    "wt6" => hash_wt6(&b).to_be_bytes().to_vec(),
+                    _ => sha256_digest(&b).to_vec(),
+                };
+                Some(Sample::Bin(out))
+            },
+        });
+
+        // --- 5. Map Converters ---
+        macro_rules! reg_map {
+            ($base:literal, $mt:expr, $in_spec:expr) => {
+                self.register_converter(ConvDesc {
+                    name: $base,
+                    in_type: $in_spec,
+                    out_type: TypeSpec::Exact(SampleType::Str),
+                    func: |smp, args| {
+                        let path = args.first()?;
+                        let default_val = args.get(1).map(|s| s.trim_matches('"').to_string());
+                        let in_str = sample_to_string(&smp);
+                        match_map(path, &in_str, $mt)
+                            .map(|(v, _k)| Sample::Str(v))
+                            .or_else(|| default_val.map(Sample::Str))
+                    },
+                });
+
+                self.register_converter(ConvDesc {
+                    name: concat!($base, "_int"),
+                    in_type: $in_spec,
+                    out_type: TypeSpec::Exact(SampleType::Sint),
+                    func: |smp, args| {
+                        let path = args.first()?;
+                        let default_val: Option<i64> =
+                            args.get(1).and_then(|s| s.trim_matches('"').parse().ok());
+                        let in_str = sample_to_string(&smp);
+                        if let Some((v, _)) = match_map(path, &in_str, $mt) {
+                            if let Ok(n) = v.parse::<i64>() {
+                                return Some(Sample::Sint(n));
+                            }
+                        }
+                        default_val.map(Sample::Sint)
+                    },
+                });
+
+                self.register_converter(ConvDesc {
+                    name: concat!($base, "_ip"),
+                    in_type: $in_spec,
+                    out_type: TypeSpec::Addr,
+                    func: |smp, args| {
+                        let path = args.first()?;
+                        let default_val = args.get(1).and_then(|s| parse_ip_str(s.trim_matches('"')));
+                        let in_str = sample_to_string(&smp);
+                        if let Some((v, _)) = match_map(path, &in_str, $mt) {
+                            if let Some(ip) = parse_ip_str(&v) {
+                                return Some(ip);
+                            }
+                        }
+                        default_val
+                    },
+                });
+
+                self.register_converter(ConvDesc {
+                    name: concat!($base, "_key"),
+                    in_type: $in_spec,
+                    out_type: TypeSpec::Exact(SampleType::Str),
+                    func: |smp, args| {
+                        let path = args.first()?;
+                        let default_val = args.get(1).map(|s| s.trim_matches('"').to_string());
+                        let in_str = sample_to_string(&smp);
+                        match_map(path, &in_str, $mt)
+                            .map(|(_v, k)| Sample::Str(k))
+                            .or_else(|| default_val.map(Sample::Str))
+                    },
+                });
+            };
+        }
+
+        reg_map!("map", MapMatchType::Str, TypeSpec::Exact(SampleType::Str));
+        reg_map!("map_str", MapMatchType::Str, TypeSpec::Exact(SampleType::Str));
+        reg_map!("map_beg", MapMatchType::Beg, TypeSpec::Exact(SampleType::Str));
+        reg_map!("map_sub", MapMatchType::Sub, TypeSpec::Exact(SampleType::Str));
+        reg_map!("map_dir", MapMatchType::Dir, TypeSpec::Exact(SampleType::Str));
+        reg_map!("map_dom", MapMatchType::Dom, TypeSpec::Exact(SampleType::Str));
+        reg_map!("map_end", MapMatchType::End, TypeSpec::Exact(SampleType::Str));
+        reg_map!("map_reg", MapMatchType::Reg, TypeSpec::Exact(SampleType::Str));
+        reg_map!("map_regm", MapMatchType::Regm, TypeSpec::Exact(SampleType::Str));
+        reg_map!("map_int", MapMatchType::Int, TypeSpec::Exact(SampleType::Sint));
+        reg_map!("map_ip", MapMatchType::Ip, TypeSpec::Addr);
+
+        // --- 6. JSON Converters ---
+        let json_conv: ConvFn = |smp, args| {
+            let path = args.first()?;
+            let Sample::Str(s) = smp else { return None };
+            json_extract(&s, path).map(Sample::Str)
+        };
+        self.register_converter(ConvDesc {
+            name: "json",
+            in_type: TypeSpec::Exact(SampleType::Str),
+            out_type: TypeSpec::Exact(SampleType::Str),
+            func: json_conv,
+        });
+        self.register_converter(ConvDesc {
+            name: "json_query",
+            in_type: TypeSpec::Exact(SampleType::Str),
+            out_type: TypeSpec::Any,
+            func: json_conv,
+        });
+
+        // --- 7. Time & Date Converters ---
+        self.register_converter(ConvDesc {
+            name: "http_date",
+            in_type: TypeSpec::Exact(SampleType::Sint),
+            out_type: TypeSpec::Exact(SampleType::Str),
+            func: |smp, args| {
+                let offset = args.first().and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+                match smp {
+                    Sample::Sint(epoch) => Some(Sample::Str(format_http_date(epoch + offset))),
+                    _ => None,
+                }
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "date",
+            in_type: TypeSpec::Exact(SampleType::Str),
+            out_type: TypeSpec::Exact(SampleType::Sint),
+            func: |smp, _args| match smp {
+                Sample::Str(s) => parse_http_date(&s).map(Sample::Sint),
+                _ => None,
+            },
+        });
+
+        let ltime_conv: ConvFn = |smp, args| {
+            let fmt = args.first().map_or("%d/%b/%Y:%H:%M:%S", String::as_str);
+            let offset = args.get(1).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+            match smp {
+                Sample::Sint(epoch) => Some(Sample::Str(format_time(epoch + offset, fmt))),
+                _ => None,
+            }
+        };
+        self.register_converter(ConvDesc {
+            name: "ltime",
+            in_type: TypeSpec::Exact(SampleType::Sint),
+            out_type: TypeSpec::Exact(SampleType::Str),
+            func: ltime_conv,
+        });
+        self.register_converter(ConvDesc {
+            name: "utime",
+            in_type: TypeSpec::Exact(SampleType::Sint),
+            out_type: TypeSpec::Exact(SampleType::Str),
+            func: ltime_conv,
+        });
+        self.register_converter(ConvDesc {
+            name: "ms_ltime",
+            in_type: TypeSpec::Exact(SampleType::Sint),
+            out_type: TypeSpec::Exact(SampleType::Str),
+            func: |smp, args| {
+                let fmt = args.first().map_or("%d/%b/%Y:%H:%M:%S", String::as_str);
+                match smp {
+                    Sample::Sint(ms) => Some(Sample::Str(format_time(ms / 1000, fmt))),
+                    _ => None,
+                }
+            },
+        });
+        self.register_converter(ConvDesc {
+            name: "us_ltime",
+            in_type: TypeSpec::Exact(SampleType::Sint),
+            out_type: TypeSpec::Exact(SampleType::Str),
+            func: |smp, args| {
+                let fmt = args.first().map_or("%d/%b/%Y:%H:%M:%S", String::as_str);
+                match smp {
+                    Sample::Sint(us) => Some(Sample::Str(format_time(us / 1_000_000, fmt))),
+                    _ => None,
+                }
+            },
+        });
+        self.register_converter(ConvDesc {
+            name: "ms_utime",
+            in_type: TypeSpec::Exact(SampleType::Sint),
+            out_type: TypeSpec::Exact(SampleType::Str),
+            func: |smp, args| {
+                let fmt = args.first().map_or("%d/%b/%Y:%H:%M:%S", String::as_str);
+                match smp {
+                    Sample::Sint(ms) => Some(Sample::Str(format_time(ms / 1000, fmt))),
+                    _ => None,
+                }
+            },
+        });
+        self.register_converter(ConvDesc {
+            name: "us_utime",
+            in_type: TypeSpec::Exact(SampleType::Sint),
+            out_type: TypeSpec::Exact(SampleType::Str),
+            func: |smp, args| {
+                let fmt = args.first().map_or("%d/%b/%Y:%H:%M:%S", String::as_str);
+                match smp {
+                    Sample::Sint(us) => Some(Sample::Str(format_time(us / 1_000_000, fmt))),
+                    _ => None,
+                }
+            },
+        });
+
+        // --- 8. Stick Table Converters ---
+        macro_rules! reg_table_conv {
+            ($name:literal) => {
+                self.register_converter(ConvDesc {
+                    name: $name,
+                    in_type: TypeSpec::Any,
+                    out_type: TypeSpec::Exact(SampleType::Sint),
+                    func: |_smp, _args| Some(Sample::Sint(0)),
+                });
+            };
+        }
+
+        reg_table_conv!("table_conn_cnt");
+        reg_table_conv!("table_conn_cur");
+        reg_table_conv!("table_conn_rate");
+        reg_table_conv!("table_sess_cnt");
+        reg_table_conv!("table_sess_rate");
+        reg_table_conv!("table_http_req_cnt");
+        reg_table_conv!("table_http_req_rate");
+        reg_table_conv!("table_http_err_cnt");
+        reg_table_conv!("table_http_err_rate");
+        reg_table_conv!("table_bytes_in_rate");
+        reg_table_conv!("table_bytes_out_rate");
+        reg_table_conv!("table_kbytes_in");
+        reg_table_conv!("table_kbytes_out");
+        reg_table_conv!("table_trackers");
+        reg_table_conv!("table_expire");
+        reg_table_conv!("table_server_id");
+        reg_table_conv!("table_gpc0");
+        reg_table_conv!("table_gpc1");
+        reg_table_conv!("table_gpc");
+        reg_table_conv!("table_gpt0");
+        reg_table_conv!("table_gpt");
+        reg_table_conv!("table_gpc0_rate");
+        reg_table_conv!("table_gpc1_rate");
+        reg_table_conv!("table_gpc_rate");
+        reg_table_conv!("table_glitch_cnt");
+        reg_table_conv!("table_glitch_rate");
+        reg_table_conv!("table_http_fail_cnt");
+        reg_table_conv!("table_http_fail_rate");
+        reg_table_conv!("table_inc_gpc0");
+        reg_table_conv!("table_inc_gpc1");
+        reg_table_conv!("table_inc_gpc");
+        reg_table_conv!("table_clr_gpc0");
+        reg_table_conv!("table_clr_gpc1");
+        reg_table_conv!("table_clr_gpc");
+        reg_table_conv!("table_idle");
+
+        self.register_converter(ConvDesc {
+            name: "in_table",
+            in_type: TypeSpec::Any,
+            out_type: TypeSpec::Exact(SampleType::Bool),
+            func: |_smp, _args| Some(Sample::Bool(true)),
+        });
+
+        // --- 9. Server / Fe / Misc Converters ---
+        self.register_converter(ConvDesc {
+            name: "nbsrv",
+            in_type: TypeSpec::Exact(SampleType::Str),
+            out_type: TypeSpec::Exact(SampleType::Sint),
+            func: |_smp, _args| Some(Sample::Sint(1)),
+        });
+
+        self.register_converter(ConvDesc {
+            name: "srv_is_up",
+            in_type: TypeSpec::Exact(SampleType::Str),
+            out_type: TypeSpec::Exact(SampleType::Bool),
+            func: |_smp, _args| Some(Sample::Bool(true)),
+        });
+
+        self.register_converter(ConvDesc {
+            name: "srv_queue",
+            in_type: TypeSpec::Exact(SampleType::Str),
+            out_type: TypeSpec::Exact(SampleType::Sint),
+            func: |_smp, _args| Some(Sample::Sint(0)),
+        });
+
+        self.register_converter(ConvDesc {
+            name: "fe_exists",
+            in_type: TypeSpec::Exact(SampleType::Str),
+            out_type: TypeSpec::Exact(SampleType::Bool),
+            func: |_smp, _args| Some(Sample::Bool(true)),
+        });
+
+        self.register_converter(ConvDesc {
+            name: "debug",
+            in_type: TypeSpec::Any,
+            out_type: TypeSpec::Same,
+            func: |smp, _args| Some(smp),
+        });
+
+        self.register_converter(ConvDesc {
+            name: "set-var",
+            in_type: TypeSpec::Any,
+            out_type: TypeSpec::Same,
+            func: |smp, args| {
+                if let Some(var_name) = args.first() {
+                    let val_str = sample_to_string(&smp);
+                    CURRENT_VARS.with(|v| {
+                        v.borrow_mut().insert(var_name.clone(), val_str);
+                    });
+                }
+                Some(smp)
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "unset-var",
+            in_type: TypeSpec::Any,
+            out_type: TypeSpec::Same,
+            func: |smp, args| {
+                if let Some(var_name) = args.first() {
+                    CURRENT_VARS.with(|v| {
+                        v.borrow_mut().remove(var_name);
+                    });
+                }
+                Some(smp)
             },
         });
     }
@@ -568,6 +2886,617 @@ impl Registry {
     }
 }
 
+fn fetch_base(ctx: &SampleContext, _args: &[String]) -> Option<Sample> {
+    let uri = ctx
+        .req_uri
+        .or_else(|| ctx.htx.and_then(|h| h.req_line().map(|r| r.uri.as_str())))?;
+    let (prefix, path, _) = split_uri(uri);
+    // One arm borrows from `uri`, the other returns an owned String from the header
+    // lookup, so both are normalised to String rather than fighting the lifetimes.
+    let host: String = if prefix.is_empty() {
+        get_req_header(ctx, "host").unwrap_or_default().clone()
+    } else {
+        prefix
+            .trim_start_matches("http://")
+            .trim_start_matches("https://")
+            .to_string()
+    };
+    Some(Sample::Str(format!("{host}{path}")))
+}
+
+fn fetch_req_cook(ctx: &SampleContext, args: &[String]) -> Option<Sample> {
+    let name = args.first()?;
+    let cookie_hdrs = get_all_req_headers(ctx, "cookie");
+    for hdr in cookie_hdrs {
+        for (k, v) in extract_cookies(&hdr) {
+            if k == name {
+                return Some(Sample::Str(v.to_string()));
+            }
+        }
+    }
+    None
+}
+
+// --- Map Matching Internals ---
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum MapMatchType {
+    Str,
+    Beg,
+    Sub,
+    Dir,
+    Dom,
+    End,
+    Reg,
+    Regm,
+    Int,
+    Ip,
+}
+
+#[must_use]
+pub fn match_map(path: &str, input: &str, match_type: MapMatchType) -> Option<(String, String)> {
+    let content = std::fs::read_to_string(path).ok()?;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.is_empty() {
+            continue;
+        }
+        let key = parts[0];
+        let val = if parts.len() > 1 {
+            parts[1..].join(" ")
+        } else {
+            String::new()
+        };
+
+        match match_type {
+            MapMatchType::Str => {
+                if key == input {
+                    return Some((val, key.to_string()));
+                }
+            }
+            MapMatchType::Beg => {
+                if input.starts_with(key) {
+                    return Some((val, key.to_string()));
+                }
+            }
+            MapMatchType::End => {
+                if input.ends_with(key) {
+                    return Some((val, key.to_string()));
+                }
+            }
+            MapMatchType::Sub => {
+                if input.contains(key) {
+                    return Some((val, key.to_string()));
+                }
+            }
+            MapMatchType::Dir => {
+                if input == key
+                    || (input.starts_with(key)
+                        && (key.ends_with('/')
+                            || input
+                                .get(key.len()..)
+                                .is_some_and(|rest| rest.starts_with('/'))))
+                {
+                    return Some((val, key.to_string()));
+                }
+            }
+            MapMatchType::Dom => {
+                if input == key
+                    || (key.starts_with('.') && input.ends_with(key))
+                    || input.ends_with(&format!(".{key}"))
+                {
+                    return Some((val, key.to_string()));
+                }
+            }
+            MapMatchType::Reg => {
+                if let Ok(re) = regex::Regex::new(key) {
+                    if re.is_match(input) {
+                        return Some((val, key.to_string()));
+                    }
+                }
+            }
+            MapMatchType::Regm => {
+                if let Ok(re) = regex::Regex::new(key) {
+                    if let Some(caps) = re.captures(input) {
+                        let mut result = val;
+                        for i in 1..caps.len() {
+                            let backref = format!("\\{i}");
+                            let captured = caps.get(i).map_or("", |m| m.as_str());
+                            result = result.replace(&backref, captured);
+                        }
+                        return Some((result, key.to_string()));
+                    }
+                }
+            }
+            MapMatchType::Int => {
+                if let (Ok(k_int), Ok(in_int)) = (key.parse::<i64>(), input.parse::<i64>()) {
+                    if k_int == in_int {
+                        return Some((val, key.to_string()));
+                    }
+                }
+            }
+            MapMatchType::Ip => {
+                if check_ip_cidr(input, key) {
+                    return Some((val, key.to_string()));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn check_ip_cidr(ip_str: &str, cidr_str: &str) -> bool {
+    let Ok(target_ip) = ip_str.parse::<IpAddr>() else {
+        return false;
+    };
+    if let Some((net_str, prefix_str)) = cidr_str.split_once('/') {
+        let Ok(prefix) = prefix_str.parse::<u32>() else {
+            return false;
+        };
+        match (target_ip, net_str.parse::<IpAddr>()) {
+            (IpAddr::V4(target_v4), Ok(IpAddr::V4(net_v4))) => {
+                if prefix > 32 {
+                    return false;
+                }
+                let mask = if prefix == 0 {
+                    0
+                } else if prefix >= 32 {
+                    u32::MAX
+                } else {
+                    !((1u32 << (32 - prefix)) - 1)
+                };
+                (u32::from(target_v4) & mask) == (u32::from(net_v4) & mask)
+            }
+            (IpAddr::V6(target_v6), Ok(IpAddr::V6(net_v6))) => {
+                if prefix > 128 {
+                    return false;
+                }
+                let mask = if prefix == 0 {
+                    0
+                } else if prefix >= 128 {
+                    u128::MAX
+                } else {
+                    !((1u128 << (128 - prefix)) - 1)
+                };
+                (u128::from(target_v6) & mask) == (u128::from(net_v6) & mask)
+            }
+            _ => false,
+        }
+    } else if let Ok(exact_ip) = cidr_str.parse::<IpAddr>() {
+        target_ip == exact_ip
+    } else {
+        false
+    }
+}
+
+// --- JSON & Regex Helpers ---
+
+fn json_extract(json_str: &str, path: &str) -> Option<String> {
+    let val: serde_json::Value = serde_json::from_str(json_str).ok()?;
+    let clean_path = path.trim_start_matches('/');
+    let parts: Vec<&str> = if path.starts_with('/') {
+        clean_path.split('/').collect()
+    } else {
+        path.split('.').collect()
+    };
+
+    let mut current = &val;
+    for part in parts {
+        if part.is_empty() {
+            continue;
+        }
+        if let Ok(idx) = part.parse::<usize>() {
+            if let Some(elem) = current.get(idx) {
+                current = elem;
+                continue;
+            }
+        }
+        current = current.get(part)?;
+    }
+
+    match current {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        serde_json::Value::Null => Some("null".to_string()),
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+            serde_json::to_string(current).ok()
+        }
+    }
+}
+
+fn regsub_eval(input: &str, pattern: &str, repl: &str, flags: &str) -> Option<String> {
+    let case_insensitive = flags.contains('i');
+    let global = flags.contains('g');
+
+    let re = RegexBuilder::new(pattern)
+        .case_insensitive(case_insensitive)
+        .build()
+        .ok()?;
+
+    // Translate \1, \2 to $1, $2 for Rust regex replacement
+    let mut rust_repl = String::with_capacity(repl.len() + 4);
+    let chars: Vec<char> = repl.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '\\' && i + 1 < chars.len() && chars[i + 1].is_ascii_digit() {
+            rust_repl.push('$');
+            rust_repl.push(chars[i + 1]);
+            i += 2;
+        } else if chars[i] == '&' {
+            rust_repl.push_str("${0}");
+            i += 1;
+        } else {
+            rust_repl.push(chars[i]);
+            i += 1;
+        }
+    }
+
+    if global {
+        Some(re.replace_all(input, rust_repl.as_str()).into_owned())
+    } else {
+        Some(re.replace(input, rust_repl.as_str()).into_owned())
+    }
+}
+
+// --- HTTP and String Parsing Helpers ---
+
+#[must_use]
+pub fn sample_to_string(smp: &Sample) -> String {
+    match smp {
+        Sample::Str(s) => s.clone(),
+        Sample::Sint(n) => n.to_string(),
+        Sample::Bool(b) => {
+            if *b {
+                "1".to_string()
+            } else {
+                "0".to_string()
+            }
+        }
+        Sample::Ipv4(ip) => ip.to_string(),
+        Sample::Ipv6(ip) => ip.to_string(),
+        Sample::Bin(b) => String::from_utf8_lossy(b).to_string(),
+        Sample::Meth(m) => m.as_str().to_string(),
+    }
+}
+
+fn get_req_header(ctx: &SampleContext, name: &str) -> Option<String> {
+    if let Some(htx) = ctx.htx {
+        if let Some(v) = htx.get_header(name) {
+            return Some(v.to_string());
+        }
+    }
+    if let Some(headers) = ctx.req_headers {
+        for (k, v) in headers {
+            if k.eq_ignore_ascii_case(name) {
+                return Some(v.clone());
+            }
+        }
+    }
+    None
+}
+
+fn get_all_req_headers(ctx: &SampleContext, name: &str) -> Vec<String> {
+    let mut matches = Vec::new();
+    if let Some(htx) = ctx.htx {
+        for hf in htx.headers() {
+            if hf.name.eq_ignore_ascii_case(name) {
+                matches.push(hf.value.clone());
+            }
+        }
+    }
+    if let Some(headers) = ctx.req_headers {
+        for (k, v) in headers {
+            if k.eq_ignore_ascii_case(name) {
+                matches.push(v.clone());
+            }
+        }
+    }
+    matches
+}
+
+fn get_res_header(ctx: &SampleContext, name: &str) -> Option<String> {
+    if let Some(headers) = ctx.res_headers {
+        for (k, v) in headers {
+            if k.eq_ignore_ascii_case(name) {
+                return Some(v.clone());
+            }
+        }
+    }
+    if let Some(htx) = ctx.htx {
+        for hf in htx.headers() {
+            if hf.name.eq_ignore_ascii_case(name) {
+                return Some(hf.value.clone());
+            }
+        }
+    }
+    CURRENT_RES_HEADERS.with(|hdrs| {
+        for (k, v) in hdrs.borrow().iter() {
+            if k.eq_ignore_ascii_case(name) {
+                return Some(v.clone());
+            }
+        }
+        None
+    })
+}
+
+fn get_all_res_headers(ctx: &SampleContext, name: &str) -> Vec<String> {
+    let mut matches = Vec::new();
+    if let Some(headers) = ctx.res_headers {
+        for (k, v) in headers {
+            if k.eq_ignore_ascii_case(name) {
+                matches.push(v.clone());
+            }
+        }
+    }
+    if let Some(htx) = ctx.htx {
+        for hf in htx.headers() {
+            if hf.name.eq_ignore_ascii_case(name) {
+                matches.push(hf.value.clone());
+            }
+        }
+    }
+    CURRENT_RES_HEADERS.with(|hdrs| {
+        for (k, v) in hdrs.borrow().iter() {
+            if k.eq_ignore_ascii_case(name) {
+                matches.push(v.clone());
+            }
+        }
+    });
+    matches
+}
+
+fn extract_cookies(cookie_header: &str) -> Vec<(&str, &str)> {
+    let mut list = Vec::new();
+    for part in cookie_header.split(';') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some((k, v)) = trimmed.split_once('=') {
+            list.push((k.trim(), v.trim().trim_matches('"')));
+        }
+    }
+    list
+}
+
+fn extract_url_param(query: &str, param: &str) -> Option<String> {
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            if k == param {
+                return Some(url_decode(v).unwrap_or_else(|| v.to_string()));
+            }
+        } else if pair == param {
+            return Some(String::new());
+        }
+    }
+    None
+}
+
+fn split_uri(uri: &str) -> (&str, &str, &str) {
+    let (prefix, rest) = if let Some(stripped) = uri.strip_prefix("http://") {
+        if let Some(idx) = stripped.find('/') {
+            let p = &uri[..7 + idx];
+            let r = &stripped[idx..];
+            (p, r)
+        } else {
+            (uri, "/")
+        }
+    } else if let Some(stripped) = uri.strip_prefix("https://") {
+        if let Some(idx) = stripped.find('/') {
+            let p = &uri[..8 + idx];
+            let r = &stripped[idx..];
+            (p, r)
+        } else {
+            (uri, "/")
+        }
+    } else {
+        ("", uri)
+    };
+
+    let (path, query) = if let Some((p, q)) = rest.split_once('?') {
+        (p, q)
+    } else {
+        (rest, "")
+    };
+
+    (prefix, path, query)
+}
+
+fn parse_ip_str(s: &str) -> Option<Sample> {
+    let clean = s.trim().trim_start_matches('[').trim_end_matches(']');
+    let ip_str = if let Some((h, _)) = clean.split_once(':') {
+        if clean.contains("::") || clean.chars().filter(|&c| c == ':').count() > 1 {
+            clean
+        } else {
+            h
+        }
+    } else {
+        clean
+    };
+    if let Ok(v4) = ip_str.parse::<Ipv4Addr>() {
+        Some(Sample::Ipv4(v4))
+    } else if let Ok(v6) = ip_str.parse::<Ipv6Addr>() {
+        Some(Sample::Ipv6(v6))
+    } else {
+        None
+    }
+}
+
+// --- Date & Time Calculation Internals ---
+
+fn civil_from_days(days: i64) -> (i32, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    #[allow(clippy::cast_possible_truncation)]
+    let doe = (z - era * 146_097) as u32;
+    let yoe = (doe - doe / 1020 + doe / 1460 - doe / 36524) / 365;
+    let y = (i64::from(yoe)) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    #[allow(clippy::cast_possible_truncation)]
+    (y as i32, m, d)
+}
+
+fn format_http_date(epoch: i64) -> String {
+    const DAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+
+    let (days, secs) = if epoch >= 0 {
+        (epoch / 86400, (epoch % 86400) as u32)
+    } else {
+        let d = (epoch - 86399) / 86400;
+        let s = (epoch - d * 86400) as u32;
+        (d, s)
+    };
+
+    let (y, m, d) = civil_from_days(days);
+    let wday_idx = ((days % 7 + 7) % 7) as usize;
+    let wday = DAYS[wday_idx];
+    let month = MONTHS[m.saturating_sub(1).min(11) as usize];
+
+    let hour = secs / 3600;
+    let min = (secs % 3600) / 60;
+    let sec = secs % 60;
+
+    format!("{wday}, {d:02} {month} {y:04} {hour:02}:{min:02}:{sec:02} GMT")
+}
+
+fn parse_http_date(s: &str) -> Option<i64> {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+
+    let trimmed = s.trim();
+    if let Ok(n) = trimmed.parse::<i64>() {
+        return Some(n);
+    }
+
+    // Attempt RFC 1123: "Sun, 06 Nov 1994 08:49:37 GMT"
+    let parts: Vec<&str> = trimmed
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|p| !p.is_empty())
+        .collect();
+    if parts.len() >= 5 {
+        let (day_str, month_str, year_str, time_str) =
+            if parts[0].len() == 3 && !parts[0].chars().all(|c| c.is_ascii_digit()) {
+                (parts[1], parts[2], parts[3], parts[4])
+            } else {
+                (parts[0], parts[1], parts[2], parts[3])
+            };
+
+        let day: u32 = day_str.parse().ok()?;
+        let month_idx = MONTHS
+            .iter()
+            .position(|&m| m.eq_ignore_ascii_case(month_str))? as u32
+            + 1;
+        let year: i32 = year_str.parse().ok()?;
+
+        let mut time_parts = time_str.split(':');
+        let hour: u32 = time_parts.next()?.parse().ok()?;
+        let min: u32 = time_parts.next()?.parse().ok()?;
+        let sec: u32 = time_parts.next()?.parse().ok()?;
+
+        let days = days_from_civil(year, month_idx, day);
+        return Some(days * 86400 + i64::from(hour * 3600 + min * 60 + sec));
+    }
+
+    None
+}
+
+fn days_from_civil(y: i32, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { i64::from(y) - 1 } else { i64::from(y) };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u32;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + i64::from(doe) - 719_468
+}
+
+fn format_time(epoch: i64, format: &str) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    const MONTHS_FULL: [&str; 12] = [
+        "January", "February", "March", "April", "May", "June", "July", "August", "September",
+        "October", "November", "December",
+    ];
+    const DAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+    const DAYS_FULL: [&str; 7] = [
+        "Thursday",
+        "Friday",
+        "Saturday",
+        "Sunday",
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+    ];
+
+    let (days, secs) = if epoch >= 0 {
+        (epoch / 86400, (epoch % 86400) as u32)
+    } else {
+        let d = (epoch - 86399) / 86400;
+        let s = (epoch - d * 86400) as u32;
+        (d, s)
+    };
+
+    let (y, m, d) = civil_from_days(days);
+    let wday_idx = ((days % 7 + 7) % 7) as usize;
+    let month_idx = m.saturating_sub(1).min(11) as usize;
+
+    let hour = secs / 3600;
+    let min = (secs % 3600) / 60;
+    let sec = secs % 60;
+
+    let mut out = String::new();
+    let mut chars = format.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            if let Some(spec) = chars.next() {
+                match spec {
+                    'Y' => out.push_str(&format!("{y:04}")),
+                    'y' => out.push_str(&format!("{:02}", y % 100)),
+                    'm' => out.push_str(&format!("{m:02}")),
+                    'd' => out.push_str(&format!("{d:02}")),
+                    'H' => out.push_str(&format!("{hour:02}")),
+                    'M' => out.push_str(&format!("{min:02}")),
+                    'S' => out.push_str(&format!("{sec:02}")),
+                    'b' | 'h' => out.push_str(MONTHS[month_idx]),
+                    'B' => out.push_str(MONTHS_FULL[month_idx]),
+                    'a' => out.push_str(DAYS[wday_idx]),
+                    'A' => out.push_str(DAYS_FULL[wday_idx]),
+                    'T' => out.push_str(&format!("{hour:02}:{min:02}:{sec:02}")),
+                    'F' => out.push_str(&format!("{y:04}-{m:02}-{d:02}")),
+                    's' => out.push_str(&epoch.to_string()),
+                    'z' | 'Z' => out.push_str("GMT"),
+                    '%' => out.push('%'),
+                    other => {
+                        out.push('%');
+                        out.push(other);
+                    }
+                }
+            } else {
+                out.push('%');
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+// --- Encoding Internals ---
+
 fn hex_encode(data: &[u8]) -> String {
     let mut s = String::with_capacity(data.len() * 2);
     for &b in data {
@@ -590,52 +3519,56 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
-fn base64_encode(data: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+fn base64_encode(data: &[u8], url_safe: bool) -> String {
+    let table: &[u8; 64] = if url_safe {
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+    } else {
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    };
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0];
         let b1 = chunk.get(1).copied().unwrap_or(0);
         let b2 = chunk.get(2).copied().unwrap_or(0);
 
-        out.push(TABLE[usize::from(b0 >> 2)] as char);
-        out.push(TABLE[usize::from(((b0 & 0x03) << 4) | (b1 >> 4))] as char);
+        out.push(table[usize::from(b0 >> 2)] as char);
+        out.push(table[usize::from(((b0 & 0x03) << 4) | (b1 >> 4))] as char);
         if chunk.len() > 1 {
-            out.push(TABLE[usize::from(((b1 & 0x0F) << 2) | (b2 >> 6))] as char);
-        } else {
+            out.push(table[usize::from(((b1 & 0x0F) << 2) | (b2 >> 6))] as char);
+        } else if !url_safe {
             out.push('=');
         }
         if chunk.len() > 2 {
-            out.push(TABLE[usize::from(b2 & 0x3F)] as char);
-        } else {
+            out.push(table[usize::from(b2 & 0x3F)] as char);
+        } else if !url_safe {
             out.push('=');
         }
     }
     out
 }
 
-#[allow(clippy::chunks_exact_to_as_chunks, clippy::naive_bytecount)]
+#[allow(clippy::naive_bytecount)]
 fn base64_decode(input: &str) -> Option<Vec<u8>> {
     fn decode_char(c: u8) -> Option<u8> {
         match c {
             b'A'..=b'Z' => Some(c - b'A'),
             b'a'..=b'z' => Some(c - b'a' + 26),
             b'0'..=b'9' => Some(c - b'0' + 52),
-            b'+' => Some(62),
-            b'/' => Some(63),
+            b'+' | b'-' => Some(62),
+            b'/' | b'_' => Some(63),
             _ => None,
         }
     }
 
-    let clean: Vec<u8> = input
+    let mut clean: Vec<u8> = input
         .bytes()
         .filter(|&b| !b.is_ascii_whitespace())
         .collect();
-    if !clean.len().is_multiple_of(4) {
-        return None;
+    while !clean.len().is_multiple_of(4) {
+        clean.push(b'=');
     }
     let mut out = Vec::with_capacity(clean.len() / 4 * 3);
-    for chunk in clean.chunks_exact(4) {
+    for chunk in clean.as_chunks::<4>().0 {
         let pad_count = chunk.iter().filter(|&&b| b == b'=').count();
         if pad_count > 2 {
             return None;
@@ -656,17 +3589,117 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-fn crc32_compute(data: &[u8]) -> u32 {
-    let mut crc = 0xFFFF_FFFFu32;
-    for &byte in data {
-        crc ^= u32::from(byte);
-        for _ in 0..8 {
-            if crc & 1 != 0 {
-                crc = (crc >> 1) ^ 0xEDB8_8320;
-            } else {
-                crc >>= 1;
+fn url_decode(s: &str) -> Option<String> {
+    let mut res = Vec::new();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                res.push(b);
+                i += 3;
+                continue;
             }
+        } else if bytes[i] == b'+' {
+            res.push(b' ');
+            i += 1;
+            continue;
+        }
+        res.push(bytes[i]);
+        i += 1;
+    }
+    Some(String::from_utf8_lossy(&res).to_string())
+}
+
+fn url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.' || b == b'~' {
+            out.push(b as char);
+        } else {
+            use std::fmt::Write;
+            let _ = write!(out, "%{b:02X}");
         }
     }
-    !crc
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_registry_fetches_and_converters_count() {
+        let reg = Registry::new();
+        assert!(reg.fetch_count() >= 50);
+        assert!(reg.converter_count() >= 50);
+    }
+
+    #[test]
+    fn test_basic_eval() {
+        let reg = Registry::new();
+        let mut ctx = SampleContext::default();
+        ctx.req_uri = Some("/api/v1/users?id=123&name=alice");
+        ctx.client_addr = Some("192.168.1.50:8080".parse().unwrap());
+
+        let res = reg.eval("path", &[], &[("upper", vec![])], &ctx);
+        assert_eq!(res, Some(Sample::Str("/API/V1/USERS".to_string())));
+
+        let res_param = reg.eval("urlp", &["id".to_string()], &[], &ctx);
+        assert_eq!(res_param, Some(Sample::Str("123".to_string())));
+
+        let res_src = reg.eval("src", &[], &[("ipmask", vec!["24".to_string()])], &ctx);
+        assert_eq!(
+            res_src,
+            Some(Sample::Ipv4("192.168.1.0".parse::<Ipv4Addr>().unwrap()))
+        );
+    }
+
+    #[test]
+    fn test_converters_eval() {
+        let reg = Registry::new();
+        let ctx = SampleContext::default();
+
+        // Arithmetic
+        let res = reg.eval(
+            "int",
+            &["10".to_string()],
+            &[("add", vec!["5".to_string()]), ("mul", vec!["2".to_string()])],
+            &ctx,
+        );
+        assert_eq!(res, Some(Sample::Sint(30)));
+
+        // Hashing
+        let res_sha1 = reg.eval(
+            "str",
+            &["abc".to_string()],
+            &[("sha1", vec![]), ("hex", vec![])],
+            &ctx,
+        );
+        assert_eq!(
+            res_sha1,
+            Some(Sample::Str(
+                "a9993e364706816aba3e25717850c26c9cd0d89d".to_string()
+            ))
+        );
+
+        // Regsub
+        let res_regsub = reg.eval(
+            "str",
+            &["foo123bar".to_string()],
+            &[("regsub", vec![r"\d+".to_string(), "NUM".to_string()])],
+            &ctx,
+        );
+        assert_eq!(res_regsub, Some(Sample::Str("fooNUMbar".to_string())));
+
+        // JSON
+        let json_input = r#"{"user":{"name":"bob","age":42}}"#;
+        let res_json = reg.eval(
+            "str",
+            &[json_input.to_string()],
+            &[("json", vec!["user.name".to_string()])],
+            &ctx,
+        );
+        assert_eq!(res_json, Some(Sample::Str("bob".to_string())));
+    }
 }

@@ -110,3 +110,70 @@ fn every_facility_maps_to_a_distinct_code() {
     assert_eq!(*codes.iter().next().expect("min"), 0);
     assert_eq!(*codes.iter().next_back().expect("max"), 23);
 }
+
+// ---- health-check log lines ---------------------------------------------------------
+
+use ibex_rt::check::{CheckEvent, ServerCheckConfig, ServerCheckState, ServerStatus};
+
+fn state(rise: u32, fall: u32) -> ServerCheckState {
+    ServerCheckState::new(
+        0,
+        0,
+        "127.0.0.1:1".parse().expect("addr"),
+        ServerCheckConfig { rise, fall, ..Default::default() },
+        ibex_sched::Tick(1000),
+    )
+}
+
+#[test]
+fn a_successful_check_reports_success_not_a_transition() {
+    let mut s = state(1, 1);
+    assert_eq!(s.on_success(3), CheckEvent::Succeeded);
+    assert!(!CheckEvent::Succeeded.is_transition());
+}
+
+#[test]
+fn crossing_the_fall_threshold_reports_a_transition() {
+    // A status change is news whether or not per-check logging is on, which is why the
+    // caller needs to tell the two apart.
+    let mut s = state(1, 2);
+    assert_eq!(s.on_failure("L4CON", "Connection refused", 1), CheckEvent::Failed);
+    assert_eq!(s.on_failure("L4CON", "Connection refused", 1), CheckEvent::WentDown);
+    assert!(CheckEvent::WentDown.is_transition());
+    assert_eq!(s.status, ServerStatus::Down);
+}
+
+#[test]
+fn recovering_reports_went_up() {
+    let mut s = state(2, 1);
+    s.on_failure("L4CON", "Connection refused", 1);
+    assert_eq!(s.status, ServerStatus::Down);
+    assert_eq!(s.on_success(2), CheckEvent::Succeeded, "below the rise threshold");
+    assert_eq!(s.on_success(2), CheckEvent::WentUp);
+    assert!(CheckEvent::WentUp.is_transition());
+}
+
+#[test]
+fn the_log_line_matches_the_shape_reg_tests_assert_on() {
+    // reg-tests/checks/*.vtc match this with regexes, so the wording and field order
+    // are part of the contract, not cosmetic.
+    let mut s = state(1, 1);
+    let ev = s.on_success(0);
+    let line = s.log_line("be1", "srv1", ev);
+
+    assert!(line.starts_with("Health check for server be1/srv1 succeeded"), "{line}");
+    assert!(line.contains("reason: Layer4 check passed"), "{line}");
+    assert!(line.contains("check duration: 0ms"), "{line}");
+    assert!(line.contains("status: 1/1 UP"), "{line}");
+}
+
+#[test]
+fn a_failed_check_line_says_failed_and_reports_down() {
+    let mut s = state(1, 1);
+    let ev = s.on_failure("L4CON", "Connection refused", 7);
+    let line = s.log_line("be1", "srv2", ev);
+    assert!(line.contains("srv2 failed"), "{line}");
+    assert!(line.contains("reason: Connection refused"), "{line}");
+    assert!(line.contains("check duration: 7ms"), "{line}");
+    assert!(line.contains("DOWN"), "{line}");
+}

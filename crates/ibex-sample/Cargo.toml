@@ -8,9 +8,12 @@ description = "Ibex Sample / Converter / Matcher lattice (design/007-sample-latt
 [dependencies]
 ibex-proto = { path = "../ibex-proto" }
 regex = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 proptest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [lints.rust]
 unsafe_code = "forbid"

@@ -94,6 +94,32 @@ pub struct ServerCheckState {
     pub task: TaskRef,
 }
 
+/// What a completed health check means for logging.
+///
+/// `HAProxy` logs every check when `option log-health-checks` is set, but logs a status
+/// *transition* unconditionally -- a server going down is news whether or not per-check
+/// logging is on.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum CheckEvent {
+    /// Check passed, server already up.
+    Succeeded,
+    /// Check failed, server still up (below the fall threshold).
+    Failed,
+    /// Server transitioned Down -> Up.
+    WentUp,
+    /// Server transitioned Up -> Down.
+    WentDown,
+}
+
+impl CheckEvent {
+    /// True for events that are logged regardless of `option log-health-checks`.
+    #[must_use]
+    pub const fn is_transition(self) -> bool {
+        matches!(self, CheckEvent::WentUp | CheckEvent::WentDown)
+    }
+}
+
+
 impl ServerCheckState {
     /// Creates a new health check state for a server.
     #[must_use]
@@ -130,7 +156,7 @@ impl ServerCheckState {
     }
 
     /// Handles a health check success.
-    pub fn on_success(&mut self, duration_ms: u32) {
+    pub fn on_success(&mut self, duration_ms: u32) -> CheckEvent {
         self.total_checks += 1;
         self.fall_count = 0;
         self.rise_count += 1;
@@ -140,11 +166,18 @@ impl ServerCheckState {
 
         if self.status == ServerStatus::Down && self.rise_count >= self.config.rise {
             self.status = ServerStatus::Up;
+            return CheckEvent::WentUp;
         }
+        CheckEvent::Succeeded
     }
 
     /// Handles a health check failure.
-    pub fn on_failure(&mut self, code: &'static str, desc: &'static str, duration_ms: u32) {
+    pub fn on_failure(
+        &mut self,
+        code: &'static str,
+        desc: &'static str,
+        duration_ms: u32,
+    ) -> CheckEvent {
         self.total_checks += 1;
         self.failed_checks += 1;
         self.rise_count = 0;
@@ -156,7 +189,43 @@ impl ServerCheckState {
         if self.status == ServerStatus::Up && self.fall_count >= self.config.fall {
             self.status = ServerStatus::Down;
             self.down_transitions += 1;
+            return CheckEvent::WentDown;
         }
+        CheckEvent::Failed
+    }
+
+    /// Formats the check result as `HAProxy` does.
+    ///
+    /// The shape is fixed by what consumers match on -- the reg-tests assert against it
+    /// with regexes, and operators grep it:
+    ///
+    /// ```text
+    /// Health check for server be1/srv1 succeeded, reason: Layer4 check passed,
+    /// check duration: 0ms, status: 1/1 UP
+    /// ```
+    ///
+    /// The `status:` field is `<successful checks>/<threshold> <state>`, which is how
+    /// an operator sees a flapping server climbing toward its rise threshold.
+    #[must_use]
+    pub fn log_line(&self, backend: &str, server: &str, event: CheckEvent) -> String {
+        let verb = match event {
+            CheckEvent::Succeeded | CheckEvent::WentUp => "succeeded",
+            CheckEvent::Failed | CheckEvent::WentDown => "failed",
+        };
+        let (count, threshold) = if self.status == ServerStatus::Up {
+            (self.rise_count.max(1), self.config.rise)
+        } else {
+            (self.fall_count.max(1), self.config.fall)
+        };
+        format!(
+            "Health check for server {backend}/{server} {verb}, reason: {}, \
+             check duration: {}ms, status: {}/{} {}",
+            self.last_status_desc,
+            self.check_duration_ms,
+            count,
+            threshold,
+            self.status.as_str()
+        )
     }
 
     /// Computes the interval until the next check as a [`Tick`].

@@ -6,12 +6,12 @@
 //!
 //! # Why UDP and why never fail
 //!
-//! HAProxy logs over UDP by default and treats logging as strictly best-effort: a
+//! `HAProxy` logs over UDP by default and treats logging as strictly best-effort: a
 //! syslog collector that is slow, full or gone must not slow down or stall traffic.
 //! Every send here is non-blocking and every error is discarded, deliberately. The one
 //! thing a proxy must not do is block a request on a log write.
 //!
-//! The format is RFC 3164, which HAProxy emits by default:
+//! The format is RFC 3164, which `HAProxy` emits by default:
 //!
 //! ```text
 //! <PRI>MMM DD HH:MM:SS HOSTNAME TAG: MESSAGE
@@ -83,7 +83,7 @@ pub struct SyslogTarget {
     default_level: LogLevel,
     /// Minimum severity to emit. Messages less severe are dropped.
     ///
-    /// `log <addr> <facility> <level>` in HAProxy sets a *maximum level* filter: only
+    /// `log <addr> <facility> <level>` in `HAProxy` sets a *maximum level* filter: only
     /// messages at that level or more severe are sent. Severity counts downward, so
     /// "more severe" means a smaller code.
     max_level: LogLevel,
@@ -122,6 +122,7 @@ impl SyslogTarget {
     ///
     /// Returns whether the datagram was handed to the kernel, which is useful in tests
     /// but is not a delivery guarantee -- UDP never gives one.
+    #[must_use]
     pub fn send(&self, level: LogLevel, tag: &str, hostname: &str, msg: &str) -> bool {
         if !self.accepts(level) {
             return false;
@@ -132,6 +133,7 @@ impl SyslogTarget {
     }
 
     /// Sends at this target's configured default level.
+    #[must_use]
     pub fn send_default(&self, tag: &str, hostname: &str, msg: &str) -> bool {
         self.send(self.default_level, tag, hostname, msg)
     }
