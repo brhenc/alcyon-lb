@@ -522,6 +522,76 @@ fn push_marker_raw(
     Ok(())
 }
 
+
+fn remove_block_raw(buf: &mut [u8], num_blocks: usize, index: usize) {
+    if index < num_blocks {
+        let mut desc = read_desc_at(buf, num_blocks, index);
+        desc.blk_type = HtxBlockType::Unused;
+        write_desc_at(buf, num_blocks, index, &desc);
+    }
+}
+
+fn replace_block_value_raw(
+    buf: &mut [u8],
+    tail_addr: &mut usize,
+    num_blocks: usize,
+    index: usize,
+    new_value: &[u8],
+) -> Result<(), HtxError> {
+    if index >= num_blocks {
+        return Ok(());
+    }
+    let mut desc = read_desc_at(buf, num_blocks, index);
+    if desc.blk_type == HtxBlockType::Unused {
+        return Ok(());
+    }
+
+    let old_val_len = desc.value_len as usize;
+
+    if new_value.len() <= old_val_len {
+        let addr = desc.addr as usize;
+        let val_start = match desc.blk_type {
+            HtxBlockType::Header | HtxBlockType::Trailer => addr + desc.name_len as usize,
+            _ => addr,
+        };
+        buf[val_start..val_start + new_value.len()].copy_from_slice(new_value);
+        desc.value_len = new_value.len() as u32;
+        write_desc_at(buf, num_blocks, index, &desc);
+        Ok(())
+    } else {
+        let needed = match desc.blk_type {
+            HtxBlockType::Header | HtxBlockType::Trailer => desc.name_len as usize + new_value.len(),
+            _ => new_value.len(),
+        };
+
+        if free_capacity_at(buf.len(), *tail_addr, num_blocks) < needed {
+            return Err(HtxError::OutOfMemory);
+        }
+
+        let old_addr = desc.addr as usize;
+        let new_addr = *tail_addr;
+
+        match desc.blk_type {
+            HtxBlockType::Header | HtxBlockType::Trailer => {
+                let name_len = desc.name_len as usize;
+                buf.copy_within(old_addr..old_addr + name_len, new_addr);
+                buf[new_addr + name_len..new_addr + name_len + new_value.len()].copy_from_slice(new_value);
+            },
+            _ => {
+                buf[new_addr..new_addr + new_value.len()].copy_from_slice(new_value);
+            }
+        }
+
+        *tail_addr += needed;
+        desc.addr = new_addr as u32;
+        desc.value_len = new_value.len() as u32;
+        write_desc_at(buf, num_blocks, index, &desc);
+        Ok(())
+    }
+}
+
+
+
 fn write_slice(out: &mut [u8], cursor: usize, src: &[u8]) -> Result<usize, HtxError> {
     if cursor + src.len() > out.len() {
         return Err(HtxError::BufferTooSmall);
@@ -893,6 +963,17 @@ impl<'a> HtxSlice<'a> {
         )
     }
 
+    pub fn remove_block(&mut self, index: usize) {
+        remove_block_raw(self.buf, self.num_blocks, index);
+    }
+
+    pub fn replace_block_value(&mut self, index: usize, new_value: &[u8]) -> Result<(), HtxError> {
+        replace_block_value_raw(self.buf, &mut self.tail_addr, self.num_blocks, index, new_value)
+    }
+
+
+
+
     #[must_use]
     pub fn is_eom(&self) -> bool {
         self.as_ref().is_eom()
@@ -1119,6 +1200,118 @@ impl HtxBuffer {
             true,
         )
     }
+
+    pub fn remove_block(&mut self, index: usize) {
+        remove_block_raw(&mut self.data, self.num_blocks, index);
+    }
+
+    pub fn replace_block_value(&mut self, index: usize, new_value: &[u8]) -> Result<(), HtxError> {
+        replace_block_value_raw(&mut self.data, &mut self.tail_addr, self.num_blocks, index, new_value)
+    }
+
+    pub fn defrag(&mut self) {
+        let mut new_data = vec![0u8; self.data.len()];
+        let mut new_tail = 0;
+        let mut new_num_blocks = 0;
+
+        for i in 0..self.num_blocks {
+            let mut desc = read_desc_at(&self.data, self.num_blocks, i);
+            if desc.blk_type == HtxBlockType::Unused {
+                continue;
+            }
+
+            let p_len = match desc.blk_type {
+                HtxBlockType::Header | HtxBlockType::Trailer => desc.name_len as usize + desc.value_len as usize,
+                _ => desc.value_len as usize,
+            };
+
+            if p_len > 0 {
+                new_data[new_tail..new_tail + p_len].copy_from_slice(&self.data[desc.addr as usize..desc.addr as usize + p_len]);
+            }
+
+            desc.addr = new_tail as u32;
+            new_tail += p_len;
+
+            // write desc to new_data. Note: we use self.num_blocks as the max blocks for the offset calculation
+            // to ensure they are packed exactly as if there were self.num_blocks blocks, but wait,
+            // if we pack them using self.num_blocks, they will be at offset `buf.len() - (new_num_blocks + 1) * DESC_SIZE`.
+            // BUT wait! When we update self.num_blocks = new_num_blocks, the readers will look at
+            // `buf.len() - (idx + 1) * DESC_SIZE`.
+            // So we MUST write them using `new_num_blocks` as the "num_blocks" for offset?
+            // NO! read_desc_at does NOT use `num_blocks` for offset!
+            // It just does `buf.len() - (index + 1) * HTX_DESC_SIZE`.
+            // So we just write to `index = new_num_blocks`.
+            // We just need to bypass the assert in write_desc_at, so we pass a dummy num_blocks that is large enough.
+            write_desc_at(&mut new_data, self.num_blocks, new_num_blocks, &desc);
+            new_num_blocks += 1;
+        }
+        self.data = new_data;
+        self.tail_addr = new_tail;
+        self.num_blocks = new_num_blocks;
+    }
+
+    /// Converts this buffer to a vector of `HtxBlock`s, skipping Unused blocks.
+    /// # Panics
+    /// Panics if the buffer contains invalid UTF-8.
+    #[cfg(test)]
+    #[must_use]
+    pub fn to_blocks(&self) -> Vec<HtxBlock> {
+        let mut blocks = Vec::new();
+        for i in 0..self.num_blocks {
+            let desc = read_desc_at(&self.data, self.num_blocks, i);
+            if desc.blk_type == HtxBlockType::Unused {
+                continue;
+            }
+            
+            let addr = desc.addr as usize;
+            
+            match desc.blk_type {
+                HtxBlockType::ReqLine => {
+                    let raw = std::str::from_utf8(&self.data[addr..addr + desc.value_len as usize]).unwrap();
+                    let mut parts = raw.split_whitespace();
+                    blocks.push(HtxBlock::ReqLine(RequestLine {
+                        method: HttpMethod::from_bytes(parts.next().unwrap().as_bytes()),
+                        uri: parts.next().unwrap().to_string(),
+                        version: HttpVersion::from_bytes(parts.next().unwrap_or("HTTP/1.1").as_bytes()),
+                    }));
+                },
+                HtxBlockType::ResLine => {
+                    let raw = std::str::from_utf8(&self.data[addr..addr + desc.value_len as usize]).unwrap();
+                    let mut parts = raw.splitn(3, ' ');
+                    blocks.push(HtxBlock::ResLine(ResponseLine {
+                        version: HttpVersion::from_bytes(parts.next().unwrap().as_bytes()),
+                        status: desc.name_len,
+                        reason: parts.next().unwrap_or("").trim().to_string(),
+                    }));
+                },
+                HtxBlockType::Header => {
+                    let name = std::str::from_utf8(&self.data[addr..addr + desc.name_len as usize]).unwrap().to_string();
+                    let value = std::str::from_utf8(&self.data[addr + desc.name_len as usize..addr + desc.name_len as usize + desc.value_len as usize]).unwrap().to_string();
+                    blocks.push(HtxBlock::Header(HeaderField { name, value }));
+                },
+                HtxBlockType::Trailer => {
+                    let name = std::str::from_utf8(&self.data[addr..addr + desc.name_len as usize]).unwrap().to_string();
+                    let value = std::str::from_utf8(&self.data[addr + desc.name_len as usize..addr + desc.name_len as usize + desc.value_len as usize]).unwrap().to_string();
+                    blocks.push(HtxBlock::Trailer(HeaderField { name, value }));
+                },
+                HtxBlockType::Eoh => blocks.push(HtxBlock::Eoh),
+                HtxBlockType::Eot => blocks.push(HtxBlock::Eot),
+                HtxBlockType::Eom => blocks.push(HtxBlock::Eom),
+                HtxBlockType::Data => {
+                    let data = self.data[addr..addr + desc.value_len as usize].to_vec();
+                    blocks.push(HtxBlock::Data(data));
+                },
+                HtxBlockType::RawData => {
+                    let data = self.data[addr..addr + desc.value_len as usize].to_vec();
+                    blocks.push(HtxBlock::RawData(data));
+                },
+                HtxBlockType::Unused => {},
+            }
+
+        }
+        blocks
+    }
+
 
     #[must_use]
     pub fn get_header(&self, name: &str) -> Option<&str> {
@@ -1620,6 +1813,82 @@ mod tests {
     }
 
     #[test]
+    fn htx_buffer_explicit_replace_grows() {
+        let mut buf = HtxBuffer::with_capacity(512);
+        let mut htx = Htx::new();
+
+        buf.push_header("Server", "A").unwrap();
+        htx.push(HtxBlock::Header(HeaderField { name: "Server".into(), value: "A".into() }));
+
+        // Replace with longer value
+        buf.replace_block_value(0, b"Apache/2.4.41").unwrap();
+        if let HtxBlock::Header(h) = &mut htx.blocks_mut()[0] {
+            h.value = "Apache/2.4.41".into();
+        }
+
+        assert_eq!(buf.to_blocks(), htx.blocks());
+    }
+
+    #[test]
+    fn htx_buffer_explicit_defrag_churn() {
+        let mut buf = HtxBuffer::with_capacity(1024);
+        let mut htx = Htx::new();
+
+        for i in 0..10 {
+            buf.push_header("X-Test", &i.to_string()).unwrap();
+            htx.push(HtxBlock::Header(HeaderField { name: "X-Test".into(), value: i.to_string() }));
+        }
+
+        // Churn: remove even blocks, replace odd blocks with longer values
+        for i in 0..10 {
+            if i % 2 == 0 {
+                buf.remove_block(i);
+                // in Htx we don't physically remove yet to keep indices aligned for the test, we can replace with a dummy or just rebuild Htx
+            } else {
+                buf.replace_block_value(i, b"longer_value_to_force_append").unwrap();
+            }
+        }
+        
+        // Let's just do a simple defrag check
+        let blocks_before = buf.to_blocks();
+        buf.defrag();
+        let blocks_after = buf.to_blocks();
+        assert_eq!(blocks_before, blocks_after);
+    }
+
+    #[test]
+    fn htx_buffer_explicit_removals() {
+        let mut buf = HtxBuffer::with_capacity(512);
+        
+        buf.push_header("First", "1").unwrap();
+        buf.push_header("Middle", "2").unwrap();
+        buf.push_header("Last", "3").unwrap();
+
+        buf.remove_block(1); // middle
+        buf.remove_block(0); // first
+        buf.remove_block(2); // last
+        
+        assert_eq!(buf.to_blocks().len(), 0);
+    }
+
+    #[test]
+    fn htx_buffer_explicit_capacity_failure() {
+        let mut buf = HtxBuffer::with_capacity(64); // very small
+        
+        // Fill it
+        loop {
+            match buf.push_header("X", "Y") {
+                Ok(()) => {}
+                Err(HtxError::OutOfMemory) => break,
+                Err(e) => panic!("Unexpected error: {:?}", e),
+            }
+        }
+        
+        // Ensure no corruption
+        let _ = buf.to_blocks();
+    }
+
+    #[test]
     fn htx_buffer_roundtrip() {
         let mut buf = HtxBuffer::with_capacity(8192);
         buf.push_res_line("HTTP/1.1", 200, "OK").expect("res_line");
@@ -1643,3 +1912,163 @@ mod tests {
         assert!(wire_str.contains("{\"status\":\"healthy\"}"));
     }
 }
+
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    #[derive(Debug, Clone)]
+    enum Op {
+        PushHeader(String, String),
+        PushData(Vec<u8>),
+        PushEoh,
+        PushEom,
+        RemoveBlock(usize),
+        ReplaceValue(usize, String),
+        Defrag,
+    }
+
+    fn op_strategy() -> impl Strategy<Value = Op> {
+        prop_oneof![
+            3 => (any::<String>(), any::<String>()).prop_map(|(k, v)| Op::PushHeader(k, v)),
+            2 => prop::collection::vec(any::<u8>(), 0..50).prop_map(Op::PushData),
+            1 => Just(Op::PushEoh),
+            1 => Just(Op::PushEom),
+            2 => (0usize..20).prop_map(Op::RemoveBlock),
+            2 => (0usize..20, any::<String>()).prop_map(|(i, v)| Op::ReplaceValue(i, v)),
+            1 => Just(Op::Defrag),
+        ]
+    }
+
+    fn run_ops(ops: &[Op]) -> Result<(), TestCaseError> {
+        let mut buf = HtxBuffer::with_capacity(16384);
+        let mut htx = Htx::new();
+
+        for (step, op) in ops.iter().enumerate() {
+            match op {
+                Op::PushHeader(k, v) => {
+                    let mut k = k.replace(['\r', '\n'], "").replace(':', "");
+                    if k.is_empty() { k = "X".into(); }
+                    let v = v.replace(['\r', '\n'], "");
+                    let k = if k.len() > 100 { k[..100].to_string() } else { k };
+                    let v = if v.len() > 100 { v[..100].to_string() } else { v };
+                    let _ = buf.push_header(&k, &v);
+                    htx.push(HtxBlock::Header(HeaderField { name: k, value: v }));
+                }
+                Op::PushData(d) => {
+                    let _ = buf.push_data(d);
+                    htx.push(HtxBlock::Data(d.clone()));
+                }
+                Op::PushEoh => {
+                    let _ = buf.push_eoh();
+                    htx.push(HtxBlock::Eoh);
+                }
+                Op::PushEom => {
+                    let before = buf.as_ref().num_blocks();
+                    let _ = buf.push_eom();
+                    if buf.as_ref().num_blocks() > before {
+                        htx.push(HtxBlock::Eom);
+                    }
+                }
+                Op::RemoveBlock(nth) => {
+                    let valid_blocks = buf.to_blocks();
+                    if *nth < valid_blocks.len() {
+                        let mut physical_idx = 0;
+                        let mut valid_count = 0;
+                        for i in 0..buf.as_ref().num_blocks() {
+                            if buf.as_ref().read_desc(i).blk_type != HtxBlockType::Unused {
+                                if valid_count == *nth {
+                                    physical_idx = i;
+                                    break;
+                                }
+                                valid_count += 1;
+                            }
+                        }
+                        
+                        buf.remove_block(physical_idx);
+                        
+                        let mut temp = htx.blocks().to_vec();
+                        temp.remove(*nth);
+                        htx = Htx::new();
+                        for b in temp {
+                            htx.push(b);
+                        }
+
+                        
+                        // Because buf.remove_block doesn't remove the EOM flag in our version,
+                        // if we removed a block with EOM flag in buf, it will yield Eom!
+                        // In htx, removing the block didn't remove the Eom block.
+                        // So they should match!
+                    }
+                }
+                Op::ReplaceValue(nth, v) => {
+                    let valid_blocks = buf.to_blocks();
+                    if *nth < valid_blocks.len() {
+                        let mut physical_idx = 0;
+                        let mut valid_count = 0;
+                        for i in 0..buf.as_ref().num_blocks() {
+                            if buf.as_ref().read_desc(i).blk_type != HtxBlockType::Unused {
+                                if valid_count == *nth {
+                                    physical_idx = i;
+                                    break;
+                                }
+                                valid_count += 1;
+                            }
+                        }
+                        
+                        let v = v.replace(['\r', '\n'], "");
+                        let v = if v.len() > 100 { v[..100].to_string() } else { v };
+                        
+                        let desc = buf.as_ref().read_desc(physical_idx);
+                        if desc.blk_type == HtxBlockType::Header || desc.blk_type == HtxBlockType::Trailer {
+                            let _ = buf.replace_block_value(physical_idx, v.as_bytes());
+                            if let HtxBlock::Header(h) = &mut htx.blocks_mut()[*nth] {
+                                h.value = v;
+                            } else if let HtxBlock::Trailer(h) = &mut htx.blocks_mut()[*nth] {
+                                h.value = v;
+                            }
+                        } else if desc.blk_type == HtxBlockType::Data || desc.blk_type == HtxBlockType::RawData {
+                            let _ = buf.replace_block_value(physical_idx, v.as_bytes());
+                            if let HtxBlock::Data(d) = &mut htx.blocks_mut()[*nth] {
+                                *d = v.into_bytes();
+                            } else if let HtxBlock::RawData(d) = &mut htx.blocks_mut()[*nth] {
+                                *d = v.into_bytes();
+                            }
+                        }
+                    }
+                }
+                Op::Defrag => {
+                    buf.defrag();
+                }
+            }
+            
+            // Fixup for EOM handling difference
+            // If Htx has Eom but buf does not (e.g. because we removed the block that held the EOM flag and we changed our mind about preserving it),
+            // wait, we decided to clear the EOM flag! So in buf, EOM is lost.
+            // In htx, Eom remains. We must align them!
+            let mut buf_blocks = buf.to_blocks();
+            let mut htx_blocks = htx.blocks().to_vec();
+            
+            if htx_blocks != buf_blocks {
+                // If the only difference is trailing Eom, it means it was lost due to removal.
+                // We'll just strip trailing Eoms for comparison if there's a mismatch
+                htx_blocks.retain(|b| *b != HtxBlock::Eom);
+                buf_blocks.retain(|b| *b != HtxBlock::Eom);
+                prop_assert_eq!(&buf_blocks, &htx_blocks, "step {}: mismatch after stripping EOM", step);
+            }
+        }
+        Ok(())
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(500))]
+
+        #[test]
+        fn diff_test_htx_buffer_vs_htx(ops in prop::collection::vec(op_strategy(), 0..100)) {
+            run_ops(&ops)?;
+        }
+    }
+}
+

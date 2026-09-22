@@ -20,7 +20,7 @@
 //! `PRI` is `facility * 8 + severity`, which is why both are carried per target rather
 //! than being a single number.
 
-use ibex_config::{LogConfig, LogFacility, LogLevel};
+use ibex_config::{LogConfig, LogFacility, LogLevel, LogTarget};
 use std::net::{SocketAddr, UdpSocket};
 
 /// Numeric facility code, as RFC 3164 defines them.
@@ -76,8 +76,32 @@ pub const fn priority(f: LogFacility, l: LogLevel) -> u8 {
 }
 
 /// One configured syslog destination.
+/// Where a target writes.
+///
+/// `HAProxy` supports both a syslog server and an already-open descriptor, and the second
+/// is what a container or systemd unit uses -- there is no syslog daemon to talk to, and
+/// the supervisor collects stdout. Sending those lines to 127.0.0.1:514 instead means
+/// they go nowhere at all.
+enum Sink {
+    /// A syslog server over UDP.
+    Udp(SocketAddr, Option<UdpSocket>),
+    /// The process's own standard output.
+    Stdout,
+    /// The process's own standard error.
+    Stderr,
+    /// Configured but unwritable: `fd@<n>` for some other descriptor, or a unix socket
+    /// path. Lines are dropped rather than sent somewhere they were not addressed to.
+    ///
+    /// Writing to an arbitrary inherited descriptor needs `BorrowedFd::borrow_raw`, which
+    /// is unsafe, and this crate forbids unsafe. `stdout` and `stderr` are the cases that
+    /// matter -- they are how a container or systemd unit collects logs -- and they have
+    /// safe accessors. Supporting the rest means either inheriting the descriptor through
+    /// a typed owner at startup or relaxing the crate's rule, and neither is worth doing
+    /// speculatively.
+    Discard,
+}
+
 pub struct SyslogTarget {
-    addr: SocketAddr,
     facility: LogFacility,
     /// Level used when a message does not carry its own.
     default_level: LogLevel,
@@ -87,7 +111,10 @@ pub struct SyslogTarget {
     /// messages at that level or more severe are sent. Severity counts downward, so
     /// "more severe" means a smaller code.
     max_level: LogLevel,
-    sock: Option<UdpSocket>,
+    /// `len <n>`: lines longer than this are truncated, not split. A syslog datagram has
+    /// no continuation, so a split line is two malformed records rather than one long one.
+    max_len: usize,
+    sink: Sink,
 }
 
 impl SyslogTarget {
@@ -98,17 +125,38 @@ impl SyslogTarget {
     /// take down the proxy, which is the opposite of best-effort.
     #[must_use]
     pub fn new(cfg: &LogConfig) -> Self {
-        let bind_addr = if cfg.addr.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
-        let sock = UdpSocket::bind(bind_addr).ok().and_then(|s| {
-            s.set_nonblocking(true).ok()?;
-            Some(s)
-        });
+        let sink = match &cfg.target {
+            LogTarget::Udp(addr) => {
+                let bind_addr = if addr.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+                let sock = UdpSocket::bind(bind_addr).ok().and_then(|s| {
+                    s.set_nonblocking(true).ok()?;
+                    Some(s)
+                });
+                Sink::Udp(*addr, sock)
+            }
+            LogTarget::Fd(1) => Sink::Stdout,
+            LogTarget::Fd(2) => Sink::Stderr,
+            LogTarget::Fd(other) => {
+                eprintln!(
+                    "[ibex] warning: log target fd@{other} is not supported; only \
+                     stdout (fd@1), stderr (fd@2) and a syslog address are written"
+                );
+                Sink::Discard
+            }
+            LogTarget::Unix(path) => {
+                eprintln!(
+                    "[ibex] warning: log target '{path}' is a unix socket, which is not \
+                     implemented; these lines are dropped"
+                );
+                Sink::Discard
+            }
+        };
         SyslogTarget {
-            addr: cfg.addr,
             facility: cfg.facility,
             default_level: cfg.level.unwrap_or(LogLevel::Info),
             max_level: cfg.level.unwrap_or(LogLevel::Debug),
-            sock,
+            max_len: cfg.max_len,
+            sink,
         }
     }
 
@@ -127,9 +175,43 @@ impl SyslogTarget {
         if !self.accepts(level) {
             return false;
         }
-        let Some(ref sock) = self.sock else { return false };
-        let line = format_rfc3164(priority(self.facility, level), tag, hostname, msg);
-        sock.send_to(line.as_bytes(), self.addr).is_ok()
+        let mut line = format_rfc3164(priority(self.facility, level), tag, hostname, msg);
+        if line.len() > self.max_len {
+            // On a char boundary, so the result is still a valid line rather than a
+            // partial UTF-8 sequence a collector will reject.
+            let mut cut = self.max_len;
+            while cut > 0 && !line.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            line.truncate(cut);
+        }
+        match &self.sink {
+            Sink::Udp(addr, Some(sock)) => sock.send_to(line.as_bytes(), *addr).is_ok(),
+            Sink::Udp(_, None) => false,
+            // A newline terminates the record: a descriptor is a stream, so unlike a
+            // datagram there is no frame boundary to mark the end of the line.
+            // Flushed on every line. Rust's stdout is block-buffered when it is a pipe,
+            // which is exactly how a supervisor or container runtime collects it, so
+            // without this the logs appear in 8 KiB bursts or not at all before a
+            // restart. A log nobody sees until the buffer fills is not a log.
+            //
+            // One `write` per line either way: the flush pushes the same bytes the
+            // write_all just buffered, and a syslog line is far below any coalescing
+            // worth having.
+            Sink::Stdout => {
+                line.push('\n');
+                let mut out = std::io::stdout().lock();
+                std::io::Write::write_all(&mut out, line.as_bytes()).is_ok()
+                    && std::io::Write::flush(&mut out).is_ok()
+            }
+            Sink::Stderr => {
+                line.push('\n');
+                let mut out = std::io::stderr().lock();
+                std::io::Write::write_all(&mut out, line.as_bytes()).is_ok()
+                    && std::io::Write::flush(&mut out).is_ok()
+            }
+            Sink::Discard => false,
+        }
     }
 
     /// Sends at this target's configured default level.
@@ -142,14 +224,35 @@ impl SyslogTarget {
     ///
     /// Exposed so the engine can recognise two configured targets as the same collector
     /// and share one socket between them.
+    /// True when two configured targets would write to the same place.
+    ///
+    /// Used to intern targets so one collector gets one socket, and so `stdout` named by
+    /// two sections is written through one sink rather than two interleaving partial
+    /// lines into the same descriptor.
+    #[must_use]
+    pub fn same_destination(&self, cfg: &LogConfig) -> bool {
+        if self.facility != cfg.facility {
+            return false;
+        }
+        match (&self.sink, &cfg.target) {
+            (Sink::Udp(a, _), LogTarget::Udp(b)) => a == b,
+            (Sink::Stdout, LogTarget::Fd(1)) | (Sink::Stderr, LogTarget::Fd(2)) => true,
+            _ => false,
+        }
+    }
+
     #[must_use]
     pub const fn facility(&self) -> LogFacility {
         self.facility
     }
 
+    /// The UDP address, for targets that have one.
     #[must_use]
-    pub const fn addr(&self) -> SocketAddr {
-        self.addr
+    pub const fn addr(&self) -> Option<SocketAddr> {
+        match &self.sink {
+            Sink::Udp(a, _) => Some(*a),
+            _ => None,
+        }
     }
 }
 

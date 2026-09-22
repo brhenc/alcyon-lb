@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-use ibex_config::{Config, ListenSection, Mode, Server};
+use ibex_config::{Config, ListenSection, Mode, Server, LogTarget};
 use ibex_rt::{Engine, ServerStatus};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -159,7 +159,9 @@ fn a_server_going_down_emits_a_syslog_datagram() {
     let config = Config {
         global: Some(GlobalSection {
             logs: vec![LogConfig {
-                addr: collector_addr,
+                target: LogTarget::Udp(collector_addr),
+                max_len: 1024,
+                format: None,
                 facility: LogFacility::Local0,
                 level: None,
             }],

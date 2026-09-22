@@ -5,7 +5,7 @@
 //! The reg-tests these unblock assert on syslog output with varnishtest `syslog` blocks,
 //! so the wire format has to be right rather than merely plausible.
 
-use ibex_config::{LogConfig, LogFacility, LogLevel};
+use ibex_config::{LogConfig, LogFacility, LogLevel, LogTarget};
 use ibex_rt::{format_rfc3164, priority, SyslogTarget};
 use std::net::{SocketAddr, UdpSocket};
 use std::time::Duration;
@@ -45,7 +45,7 @@ fn rfc3164_day_is_space_padded_not_zero_padded() {
 #[test]
 fn a_datagram_actually_arrives_and_is_well_formed() {
     let (rx, addr) = receiver();
-    let cfg = LogConfig { addr, facility: LogFacility::Local0, level: Some(LogLevel::Notice) };
+    let cfg = LogConfig { target: LogTarget::Udp(addr), max_len: 1024, format: None, facility: LogFacility::Local0, level: Some(LogLevel::Notice) };
     let t = SyslogTarget::new(&cfg);
 
     assert!(t.send(LogLevel::Notice, "ibex", "testhost", "a message"));
@@ -64,7 +64,7 @@ fn level_filtering_drops_less_severe_messages() {
     // level or more severe are emitted. Severity counts downward, so "more severe"
     // means a numerically smaller code -- easy to invert by accident.
     let (rx, addr) = receiver();
-    let cfg = LogConfig { addr, facility: LogFacility::Local0, level: Some(LogLevel::Warning) };
+    let cfg = LogConfig { target: LogTarget::Udp(addr), max_len: 1024, format: None, facility: LogFacility::Local0, level: Some(LogLevel::Warning) };
     let t = SyslogTarget::new(&cfg);
 
     assert!(t.accepts(LogLevel::Emerg), "more severe than the filter must pass");
@@ -83,7 +83,9 @@ fn sending_to_an_unreachable_collector_never_fails_the_caller() {
     // crash the proxy. This is the property that matters most in production.
     let cfg = LogConfig {
         // TEST-NET-1, guaranteed not to route anywhere.
-        addr: "192.0.2.1:514".parse::<SocketAddr>().expect("addr"),
+        target: LogTarget::Udp("192.0.2.1:514".parse::<SocketAddr>().expect("addr")),
+        max_len: 1024,
+        format: None,
         facility: LogFacility::Local0,
         level: Some(LogLevel::Info),
     };

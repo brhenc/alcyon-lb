@@ -469,9 +469,12 @@ fn hostname() -> String {
 fn resolve_log_targets(config: &Config, proxies: &mut [Proxy]) -> Vec<SyslogTarget> {
     let mut targets: Vec<SyslogTarget> = Vec::new();
     let intern = |cfg: &ibex_config::LogConfig, targets: &mut Vec<SyslogTarget>| -> usize {
+        // Interned by target and facility, so two sections naming the same collector
+        // share one socket. `stdout` and `stderr` intern too: a descriptor written from
+        // two places interleaves partial lines.
         if let Some(i) = targets
             .iter()
-            .position(|t| t.addr() == cfg.addr && t.facility() == cfg.facility)
+            .position(|t| t.same_destination(cfg))
         {
             return i;
         }
