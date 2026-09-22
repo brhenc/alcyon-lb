@@ -16,6 +16,7 @@ use std::os::fd::{AsFd, AsRawFd};
 use std::sync::Arc;
 
 fn test_certs() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
         .expect("generate cert");
     let der = CertificateDer::from(cert.cert.der().to_vec());

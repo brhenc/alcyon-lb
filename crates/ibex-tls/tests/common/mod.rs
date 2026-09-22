@@ -16,6 +16,16 @@ pub fn generate_test_cert(sans: Vec<String>) -> (Arc<CertifiedKey>, CertificateD
     (key, der)
 }
 
+/// A PEM bundle holding the certificate and its key, as a `crt` file must.
+///
+/// `HAProxy` reads one file per `crt` entry and expects the key concatenated with the
+/// chain. A helper that returns the certificate alone produces a file that cannot be
+/// loaded, which is what `test_sni_name_mismatch_filename` was doing.
+pub fn generate_test_cert_bundle_pem(sans: Vec<String>) -> String {
+    let cert_key = generate_simple_self_signed(sans).expect("Failed to generate test certificate");
+    format!("{}{}", cert_key.cert.pem(), cert_key.key_pair.serialize_pem())
+}
+
 /// Generates a self-signed certificate and private key with PEM encoding.
 pub fn generate_test_cert_with_pem(
     sans: Vec<String>,
