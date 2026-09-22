@@ -1,7 +1,7 @@
 /target
 **/*.rs.bk
-*.profraw
-*.profdata
+**/*.profraw
+**/*.profdata
 .DS_Store
 .agy/
 __pycache__/
