@@ -208,7 +208,7 @@ impl Matcher {
             } => {
                 if let Some(Sample::Str(s)) = cast(sample.clone(), SampleType::Str) {
                     if *case_insensitive {
-                        s.to_lowercase() == *target
+                        s.eq_ignore_ascii_case(target)
                     } else {
                         s == *target
                     }

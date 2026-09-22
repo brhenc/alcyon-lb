@@ -1432,6 +1432,59 @@ class VtcExecutor:
             except Exception:
                 pass
 
+    async def _execute_haproxy_cli(self, haproxy_id: str, block: str) -> None:
+        cli_sock = os.path.join(self.tmpdir, f"{haproxy_id}.sock")
+        reader, writer = None, None
+        for _ in range(50):
+            if os.path.exists(cli_sock):
+                try:
+                    reader, writer = await asyncio.open_unix_connection(cli_sock)
+                    break
+                except Exception:
+                    pass
+            await asyncio.sleep(0.05)
+        if not writer or not reader:
+            raise RuntimeError(f"Could not connect to HAProxy CLI socket {cli_sock}")
+
+        lines = block.splitlines()
+        last_resp = ""
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("send "):
+                cmd = line[5:].strip()
+                if (cmd.startswith('"') and cmd.endswith('"')) or (cmd.startswith("'") and cmd.endswith("'")):
+                    cmd = cmd[1:-1]
+                writer.write((cmd + "\n").encode("utf-8"))
+                await writer.drain()
+                await asyncio.sleep(0.05)
+                resp_bytes = bytearray()
+                while True:
+                    try:
+                        chunk = await asyncio.wait_for(reader.read(4096), timeout=0.1)
+                        if not chunk:
+                            break
+                        resp_bytes.extend(chunk)
+                        if len(chunk) < 4096:
+                            break
+                    except asyncio.TimeoutError:
+                        break
+                last_resp = resp_bytes.decode("utf-8", errors="replace")
+            elif line.startswith("expect "):
+                rest = line[7:].strip()
+                if rest.startswith("~"):
+                    pat = rest[1:].strip()
+                    if (pat.startswith('"') and pat.endswith('"')) or (pat.startswith("'") and pat.endswith("'")):
+                        pat = pat[1:-1]
+                    if not re.search(pat, last_resp, re.MULTILINE):
+                        raise AssertionError(f"CLI expect pattern {pat!r} failed to match: {last_resp!r}")
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+
     async def execute(self) -> TestResult:
         start_time = time.monotonic()
         test_title = self.parser.title
@@ -1512,6 +1565,17 @@ class VtcExecutor:
         except Exception as ex:
             elapsed = time.monotonic() - start_time
             err_msg = str(ex) if str(ex) else traceback.format_exc()
+            for pid_name, p in self.proxies.items():
+                try:
+                    if p.poll() is not None:
+                        out, err = p.communicate()
+                        err_msg += f"\nProxy {pid_name} stderr:\n" + err.decode("utf-8", errors="replace")
+                    else:
+                        p.terminate()
+                        out, err = p.communicate(timeout=0.2)
+                        err_msg += f"\nProxy {pid_name} stderr:\n" + err.decode("utf-8", errors="replace")
+                except Exception:
+                    pass
             return TestResult(
                 test_name=test_title,
                 file_path=self.parser.filepath,
@@ -1651,7 +1715,9 @@ class VtcExecutor:
             elif cmd == "haproxy":
                 haproxy_id = args[0]
                 opts = args[1:]
-                if block is not None:
+                if "-cli" in opts:
+                    await self._execute_haproxy_cli(haproxy_id, block or "")
+                elif block is not None:
                     conf_type = "-conf"
                     start_imm = False
                     idx = 0
@@ -1689,8 +1755,9 @@ class VtcExecutor:
                             raise AssertionError("Config check unexpectedly succeeded (-conf-BAD)")
                     else:
                         if start_imm:
+                            cli_sock = os.path.join(self.tmpdir, f"{haproxy_id}.sock")
                             proc = subprocess.Popen(
-                                [self.target_binary, "-f", cfg_path, "-d"],
+                                [self.target_binary, "-f", cfg_path, "-S", cli_sock, "-d"],
                                 stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE,
                             )

@@ -41,6 +41,19 @@ pub struct GlobalSection {
     /// Syslog targets declared here. Proxy sections inherit these with `log global`,
     /// which is how the canonical `HAProxy` configuration declares logging.
     pub logs: Vec<LogConfig>,
+    /// Global variables initialized at startup via `set-var` and `set-var-fmt`.
+    pub set_vars: Vec<GlobalSetVar>,
+}
+
+/// Global variable initialized at startup via `set-var` or `set-var-fmt`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlobalSetVar {
+    /// Variable name (e.g. `proc.foo`).
+    pub name: String,
+    /// Expression or format string.
+    pub expr: String,
+    /// Whether this variable uses format-string interpolation (`set-var-fmt`).
+    pub is_fmt: bool,
 }
 
 /// Defaults section configuration.
@@ -56,6 +69,8 @@ pub struct DefaultsSection {
     pub logs: Vec<LogConfig>,
     /// `option log-health-checks` in `defaults`.
     pub log_health_checks: bool,
+    /// Default TCP request inspection delay.
+    pub tcp_req_inspect_delay: Option<Duration>,
 }
 
 /// Unified timeouts configuration.
@@ -104,12 +119,73 @@ pub enum TcpReqConnAction {
     SilentDrop,
     Reject,
     Accept,
+    SetSrc { expr: String },
+    SetDst { expr: String },
+    DoLog,
 }
 
 /// Rule pairing a TCP-request connection action with an optional condition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TcpReqConnRule {
     pub action: TcpReqConnAction,
+    pub cond: Option<AclCondition>,
+}
+
+/// Modern TCP-request session action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TcpReqSessionAction {
+    TrackSc0 { expr: String, table: Option<String> },
+    TrackSc1 { expr: String, table: Option<String> },
+    TrackSc2 { expr: String, table: Option<String> },
+    SetVar { var_name: String, expr: String },
+    SetVarFmt { var_name: String, fmt: String },
+    UnsetVar { var_name: String },
+    SetSrc { expr: String },
+    SetDst { expr: String },
+    SilentDrop,
+    Reject,
+    Accept,
+    AttachSrv { name: String },
+    DoLog,
+    ScIncGpc0 { sc: u8 },
+    ScIncGpc1 { sc: u8 },
+    ScSetGpt0 { sc: u8, expr: String },
+}
+
+/// Rule pairing a TCP-request session action with an optional condition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TcpReqSessionRule {
+    pub action: TcpReqSessionAction,
+    pub cond: Option<AclCondition>,
+}
+
+/// Modern TCP-request content action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TcpReqContentAction {
+    TrackSc0 { expr: String, table: Option<String> },
+    TrackSc1 { expr: String, table: Option<String> },
+    TrackSc2 { expr: String, table: Option<String> },
+    SetVar { var_name: String, expr: String },
+    SetVarFmt { var_name: String, fmt: String },
+    UnsetVar { var_name: String },
+    SetSrc { expr: String },
+    SetDst { expr: String },
+    SilentDrop,
+    Reject,
+    Accept,
+    SwitchModeHttp { proto: Option<String> },
+    ScIncGpc0 { sc: u8 },
+    ScIncGpc1 { sc: u8 },
+    ScSetGpt0 { sc: u8, expr: String },
+    DoLog,
+    UseService { service: String },
+    Lua { name: String },
+}
+
+/// Rule pairing a TCP-request content action with an optional condition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TcpReqContentRule {
+    pub action: TcpReqContentAction,
     pub cond: Option<AclCondition>,
 }
 
@@ -200,6 +276,10 @@ pub enum HttpReqAction {
         var_name: String,
         expr: String,
     },
+    SetVarFmt {
+        var_name: String,
+        fmt: String,
+    },
     UnsetVar {
         var_name: String,
     },
@@ -217,6 +297,16 @@ pub enum HttpReqAction {
         expr: String,
         len: Option<usize>,
         id: Option<usize>,
+    },
+    ScIncGpc0 {
+        sc: u8,
+    },
+    ScIncGpc1 {
+        sc: u8,
+    },
+    ScSetGpt0 {
+        sc: u8,
+        expr: String,
     },
 }
 
@@ -315,8 +405,14 @@ pub struct ListenSection {
     pub stick_table: Option<StickTableConfigAst>,
     /// Stick rules.
     pub stick_rules: Vec<StickRule>,
+    /// TCP-request inspect delay.
+    pub tcp_req_inspect_delay: Option<Duration>,
     /// Modern TCP-request connection rules.
     pub tcp_req_conn_rules: Vec<TcpReqConnRule>,
+    /// Modern TCP-request session rules.
+    pub tcp_req_session_rules: Vec<TcpReqSessionRule>,
+    /// Modern TCP-request content rules.
+    pub tcp_req_content_rules: Vec<TcpReqContentRule>,
     /// Modern HTTP-request rules.
     pub http_req_rules: Vec<HttpReqRule>,
     /// Modern HTTP-response rules.
@@ -384,7 +480,10 @@ impl Default for ListenSection {
             balance: BalanceAlgorithm::RoundRobin,
             stick_table: None,
             stick_rules: Vec::new(),
+            tcp_req_inspect_delay: None,
             tcp_req_conn_rules: Vec::new(),
+            tcp_req_session_rules: Vec::new(),
+            tcp_req_content_rules: Vec::new(),
             http_req_rules: Vec::new(),
             http_res_rules: Vec::new(),
             http_after_res_rules: Vec::new(),
@@ -436,8 +535,14 @@ pub struct FrontendSection {
     pub stick_table: Option<StickTableConfigAst>,
     /// Stick rules.
     pub stick_rules: Vec<StickRule>,
+    /// TCP-request inspect delay.
+    pub tcp_req_inspect_delay: Option<Duration>,
     /// Modern TCP-request connection rules.
     pub tcp_req_conn_rules: Vec<TcpReqConnRule>,
+    /// Modern TCP-request session rules.
+    pub tcp_req_session_rules: Vec<TcpReqSessionRule>,
+    /// Modern TCP-request content rules.
+    pub tcp_req_content_rules: Vec<TcpReqContentRule>,
     /// Modern HTTP-request rules.
     pub http_req_rules: Vec<HttpReqRule>,
     /// Modern HTTP-response rules.
@@ -476,7 +581,10 @@ impl Default for FrontendSection {
             log_health_checks: false,
             stick_table: None,
             stick_rules: Vec::new(),
+            tcp_req_inspect_delay: None,
             tcp_req_conn_rules: Vec::new(),
+            tcp_req_session_rules: Vec::new(),
+            tcp_req_content_rules: Vec::new(),
             http_req_rules: Vec::new(),
             http_res_rules: Vec::new(),
             http_after_res_rules: Vec::new(),
@@ -533,6 +641,10 @@ pub struct BackendSection {
     pub stick_table: Option<StickTableConfigAst>,
     /// Stick rules.
     pub stick_rules: Vec<StickRule>,
+    /// TCP-request inspect delay.
+    pub tcp_req_inspect_delay: Option<Duration>,
+    /// Modern TCP-request content rules.
+    pub tcp_req_content_rules: Vec<TcpReqContentRule>,
     /// Modern HTTP-request rules.
     pub http_req_rules: Vec<HttpReqRule>,
     /// Modern HTTP-response rules.
@@ -570,6 +682,8 @@ impl Default for BackendSection {
             acls: Vec::new(),
             stick_table: None,
             stick_rules: Vec::new(),
+            tcp_req_inspect_delay: None,
+            tcp_req_content_rules: Vec::new(),
             http_req_rules: Vec::new(),
             http_res_rules: Vec::new(),
             http_after_res_rules: Vec::new(),

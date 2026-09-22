@@ -19,6 +19,7 @@ use regex::RegexBuilder;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::{LazyLock, RwLock};
 
 thread_local! {
     pub static CURRENT_VARS: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
@@ -26,6 +27,28 @@ thread_local! {
     pub static CURRENT_RES_HEADERS: RefCell<Vec<(String, String)>> = const { RefCell::new(Vec::new()) };
     pub static CURRENT_RES_STATUS: Cell<u16> = const { Cell::new(0) };
 }
+
+pub static GLOBAL_PROC_VARS: LazyLock<RwLock<HashMap<String, String>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+pub static SAMPLE_REGISTRY: LazyLock<Registry> = LazyLock::new(Registry::new);
+
+#[must_use]
+pub fn sample_registry() -> &'static Registry {
+    &SAMPLE_REGISTRY
+}
+
+#[must_use]
+pub fn get_proc_var(name: &str) -> Option<String> {
+    GLOBAL_PROC_VARS.read().ok()?.get(name).cloned()
+}
+
+pub fn set_proc_var(name: &str, val: String) {
+    if let Ok(mut lock) = GLOBAL_PROC_VARS.write() {
+        lock.insert(name.to_string(), val);
+    }
+}
+
 
 // Not generalised over the hasher: these write straight into a thread-local declared as
 // `HashMap<String, String>` with the default hasher, so a generic `S` could not be stored
@@ -63,6 +86,9 @@ fn len_to_sint(len: usize) -> i64 {
 pub struct SampleContext<'a> {
     pub client_addr: Option<SocketAddr>,
     pub server_addr: Option<SocketAddr>,
+    pub fc_src: Option<SocketAddr>,
+    pub fc_dst: Option<SocketAddr>,
+    pub proxy_tlvs: Option<&'a [u8]>,
     pub htx: Option<&'a Htx>,
     pub req_uri: Option<&'a str>,
     pub req_method: Option<&'a str>,
@@ -135,10 +161,43 @@ pub struct ConvDesc {
     pub func: ConvFn,
 }
 
+pub type MultiFetchFn = fn(&SampleContext, &[String]) -> Vec<Sample>;
+
 /// Central registry of sample fetches and converters.
 pub struct Registry {
     fetches: HashMap<&'static str, FetchDesc>,
     converters: HashMap<&'static str, ConvDesc>,
+    multi_fetches: HashMap<&'static str, MultiFetchFn>,
+}
+
+fn resolve_int_arg(arg: &str) -> Option<i64> {
+    let trimmed = arg.trim().trim_matches('"').trim_matches('\'');
+    if let Ok(n) = trimmed.parse::<i64>() {
+        return Some(n);
+    }
+    if let Some(hex) = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {
+        if let Ok(n) = i64::from_str_radix(hex, 16) {
+            return Some(n);
+        }
+    }
+    let var_name = if trimmed.starts_with("var(") && trimmed.ends_with(')') {
+        &trimmed[4..trimmed.len() - 1]
+    } else {
+        trimmed
+    };
+    if var_name.starts_with("proc.") {
+        get_proc_var(var_name).and_then(|s| s.parse::<i64>().ok())
+    } else if var_name.starts_with("sess.")
+        || var_name.starts_with("req.")
+        || var_name.starts_with("txn.")
+        || var_name.starts_with("res.")
+    {
+        CURRENT_VARS.with(|v| {
+            v.borrow().get(var_name).and_then(|s| s.parse::<i64>().ok())
+        })
+    } else {
+        None
+    }
 }
 
 impl Default for Registry {
@@ -153,10 +212,15 @@ impl Registry {
         let mut r = Registry {
             fetches: HashMap::new(),
             converters: HashMap::new(),
+            multi_fetches: HashMap::new(),
         };
         r.register_builtin_fetches();
         r.register_builtin_converters();
         r
+    }
+
+    pub fn register_multi_fetch(&mut self, name: &'static str, func: MultiFetchFn) {
+        self.multi_fetches.insert(name, func);
     }
 
     /// Registers a sample fetch. Panics if `desc.name` is already registered.
@@ -244,6 +308,10 @@ impl Registry {
             IpAddr::V4(v4) => Some(Sample::Ipv4(v4)),
             IpAddr::V6(v6) => Some(Sample::Ipv6(v6)),
         };
+        let fc_src_fetch: FetchFn = |ctx, _args| match ctx.fc_src.or(ctx.client_addr)?.ip() {
+            IpAddr::V4(v4) => Some(Sample::Ipv4(v4)),
+            IpAddr::V6(v6) => Some(Sample::Ipv6(v6)),
+        };
         self.register_fetch(FetchDesc {
             name: "src",
             out_type: SampleType::Ipv4,
@@ -252,11 +320,13 @@ impl Registry {
         self.register_fetch(FetchDesc {
             name: "fc_src",
             out_type: SampleType::Ipv4,
-            func: src_fetch,
+            func: fc_src_fetch,
         });
 
         let src_port_fetch: FetchFn =
             |ctx, _args| ctx.client_addr.map(|sa| Sample::Sint(i64::from(sa.port())));
+        let fc_src_port_fetch: FetchFn =
+            |ctx, _args| ctx.fc_src.or(ctx.client_addr).map(|sa| Sample::Sint(i64::from(sa.port())));
         self.register_fetch(FetchDesc {
             name: "src_port",
             out_type: SampleType::Sint,
@@ -265,10 +335,14 @@ impl Registry {
         self.register_fetch(FetchDesc {
             name: "fc_src_port",
             out_type: SampleType::Sint,
-            func: src_port_fetch,
+            func: fc_src_port_fetch,
         });
 
         let dst_fetch: FetchFn = |ctx, _args| match ctx.server_addr?.ip() {
+            IpAddr::V4(v4) => Some(Sample::Ipv4(v4)),
+            IpAddr::V6(v6) => Some(Sample::Ipv6(v6)),
+        };
+        let fc_dst_fetch: FetchFn = |ctx, _args| match ctx.fc_dst.or(ctx.server_addr)?.ip() {
             IpAddr::V4(v4) => Some(Sample::Ipv4(v4)),
             IpAddr::V6(v6) => Some(Sample::Ipv6(v6)),
         };
@@ -280,11 +354,13 @@ impl Registry {
         self.register_fetch(FetchDesc {
             name: "fc_dst",
             out_type: SampleType::Ipv4,
-            func: dst_fetch,
+            func: fc_dst_fetch,
         });
 
         let dst_port_fetch: FetchFn =
             |ctx, _args| ctx.server_addr.map(|sa| Sample::Sint(i64::from(sa.port())));
+        let fc_dst_port_fetch: FetchFn =
+            |ctx, _args| ctx.fc_dst.or(ctx.server_addr).map(|sa| Sample::Sint(i64::from(sa.port())));
         self.register_fetch(FetchDesc {
             name: "dst_port",
             out_type: SampleType::Sint,
@@ -293,7 +369,7 @@ impl Registry {
         self.register_fetch(FetchDesc {
             name: "fc_dst_port",
             out_type: SampleType::Sint,
-            func: dst_port_fetch,
+            func: fc_dst_port_fetch,
         });
 
         self.register_fetch(FetchDesc {
@@ -882,6 +958,51 @@ impl Registry {
             name: "res.body_size",
             out_type: SampleType::Sint,
             func: response_body_len_fetch,
+        });
+
+        let request_payload_fetch: FetchFn = |ctx, args| {
+            let body = ctx.req_body?;
+            let offset = args.first().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+            if offset >= body.len() {
+                return None;
+            }
+            let len = args.get(1).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+            let slice = if len == 0 || offset.saturating_add(len) > body.len() {
+                &body[offset..]
+            } else {
+                &body[offset..offset + len]
+            };
+            Some(Sample::Bin(slice.to_vec()))
+        };
+        self.register_fetch(FetchDesc {
+            name: "req.payload",
+            out_type: SampleType::Bin,
+            func: request_payload_fetch,
+        });
+        self.register_fetch(FetchDesc {
+            name: "payload",
+            out_type: SampleType::Bin,
+            func: request_payload_fetch,
+        });
+
+        let response_payload_fetch: FetchFn = |ctx, args| {
+            let body = ctx.res_body?;
+            let offset = args.first().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+            if offset >= body.len() {
+                return None;
+            }
+            let len = args.get(1).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+            let slice = if len == 0 || offset.saturating_add(len) > body.len() {
+                &body[offset..]
+            } else {
+                &body[offset..offset + len]
+            };
+            Some(Sample::Bin(slice.to_vec()))
+        };
+        self.register_fetch(FetchDesc {
+            name: "res.payload",
+            out_type: SampleType::Bin,
+            func: response_payload_fetch,
         });
 
         // --- 7. Captures ---
@@ -1519,8 +1640,8 @@ impl Registry {
             name: "str",
             out_type: SampleType::Str,
             func: |_ctx, args| {
-                let s = args.first().cloned().unwrap_or_default();
-                Some(Sample::Str(s))
+                let s = args.first().map_or("", |s| s.as_str());
+                Some(Sample::Str(s.to_string()))
             },
         });
         self.register_fetch(FetchDesc {
@@ -1532,16 +1653,155 @@ impl Registry {
             },
         });
         self.register_fetch(FetchDesc {
+            name: "ipv4",
+            out_type: SampleType::Ipv4,
+            func: |_ctx, args| {
+                let s = args.first()?;
+                let ip = s.parse::<std::net::Ipv4Addr>().ok()?;
+                Some(Sample::Ipv4(ip))
+            },
+        });
+        self.register_fetch(FetchDesc {
+            name: "ipv6",
+            out_type: SampleType::Ipv6,
+            func: |_ctx, args| {
+                let s = args.first()?;
+                let ip = s.parse::<std::net::Ipv6Addr>().ok()?;
+                Some(Sample::Ipv6(ip))
+            },
+        });
+        self.register_fetch(FetchDesc {
+            name: "bin",
+            out_type: SampleType::Bin,
+            func: |_ctx, args| {
+                let s = args.first()?;
+                if let Some(b) = hex_decode(s) {
+                    Some(Sample::Bin(b))
+                } else {
+                    Some(Sample::Bin(s.as_bytes().to_vec()))
+                }
+            },
+        });
+        self.register_fetch(FetchDesc {
+            name: "uuid",
+            out_type: SampleType::Str,
+            func: |_ctx, _args| {
+                let mut b = [0u8; 16];
+                let _ = getrandom::getrandom(&mut b);
+                b[6] = (b[6] & 0x0f) | 0x40; // version 4
+                b[8] = (b[8] & 0x3f) | 0x80; // variant 1
+                let s = format!(
+                    "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                    b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]
+                );
+                Some(Sample::Str(s))
+            },
+        });
+        self.register_fetch(FetchDesc {
+            name: "fc_pp_tlv",
+            out_type: SampleType::Bin,
+            func: |ctx, args| {
+                let target_type_str = args.first()?;
+                let target_type = if let Some(hex) = target_type_str.strip_prefix("0x").or_else(|| target_type_str.strip_prefix("0X")) {
+                    u8::from_str_radix(hex, 16).ok()?
+                } else {
+                    target_type_str.parse::<u8>().ok()?
+                };
+                let tlvs_data = ctx.proxy_tlvs?;
+                let mut matches = Vec::new();
+                let mut idx = 0;
+                while idx + 3 <= tlvs_data.len() {
+                    let tlv_type = tlvs_data[idx];
+                    let tlv_len = usize::from(u16::from_be_bytes([tlvs_data[idx + 1], tlvs_data[idx + 2]]));
+                    let val_start = idx + 3;
+                    let val_end = val_start + tlv_len;
+                    if val_end > tlvs_data.len() {
+                        break;
+                    }
+                    if tlv_type == target_type {
+                        matches.push(&tlvs_data[val_start..val_end]);
+                    }
+                    idx = val_end;
+                }
+                if matches.is_empty() {
+                    return None;
+                }
+                if let Some(occ) = args.get(1).and_then(|s| s.parse::<i64>().ok()) {
+                    if occ > 0 {
+                        let uidx = usize::try_from(occ - 1).ok()?;
+                        return matches.get(uidx).map(|s| Sample::Bin((*s).to_vec()));
+                    } else if occ < 0 {
+                        let back = usize::try_from(occ.unsigned_abs()).ok()?;
+                        let uidx = matches.len().checked_sub(back)?;
+                        return matches.get(uidx).map(|s| Sample::Bin((*s).to_vec()));
+                    }
+                }
+                matches.first().map(|s| Sample::Bin((*s).to_vec()))
+            },
+        });
+        self.register_multi_fetch("fc_pp_tlv", |ctx, args| {
+            let Some(target_type_str) = args.first() else {
+                return Vec::new();
+            };
+            let Some(target_type) = (if let Some(hex) = target_type_str.strip_prefix("0x").or_else(|| target_type_str.strip_prefix("0X")) {
+                u8::from_str_radix(hex, 16).ok()
+            } else {
+                target_type_str.parse::<u8>().ok()
+            }) else {
+                return Vec::new();
+            };
+            let Some(tlvs_data) = ctx.proxy_tlvs else {
+                return Vec::new();
+            };
+            let mut matches = Vec::new();
+            let mut idx = 0;
+            while idx + 3 <= tlvs_data.len() {
+                let tlv_type = tlvs_data[idx];
+                let tlv_len = usize::from(u16::from_be_bytes([tlvs_data[idx + 1], tlvs_data[idx + 2]]));
+                let val_start = idx + 3;
+                let val_end = val_start + tlv_len;
+                if val_end > tlvs_data.len() {
+                    break;
+                }
+                if tlv_type == target_type {
+                    matches.push(&tlvs_data[val_start..val_end]);
+                }
+                idx = val_end;
+            }
+            if matches.is_empty() {
+                return Vec::new();
+            }
+            if let Some(occ) = args.get(1).and_then(|s| s.parse::<i64>().ok()) {
+                if occ > 0 {
+                    if let Ok(uidx) = usize::try_from(occ - 1) {
+                        return matches.get(uidx).map(|s| Sample::Bin((*s).to_vec())).into_iter().collect();
+                    }
+                } else if occ < 0 {
+                    if let Ok(back) = usize::try_from(occ.unsigned_abs()) {
+                        if let Some(uidx) = matches.len().checked_sub(back) {
+                            return matches.get(uidx).map(|s| Sample::Bin((*s).to_vec())).into_iter().collect();
+                        }
+                    }
+                }
+            }
+            matches.into_iter().map(|m| Sample::Bin(m.to_vec())).collect()
+        });
+        self.register_fetch(FetchDesc {
             name: "var",
             out_type: SampleType::Str,
             func: |ctx, args| {
                 let var_name = args.first()?;
+                if var_name.starts_with("proc.") {
+                    return get_proc_var(var_name).map(Sample::Str)
+                        .or_else(|| args.get(1).cloned().map(Sample::Str));
+                }
                 if let Some(v_map) = ctx.vars {
                     if let Some(val) = v_map.get(var_name) {
                         return Some(Sample::Str(val.clone()));
                     }
                 }
                 CURRENT_VARS.with(|v| v.borrow().get(var_name).cloned().map(Sample::Str))
+                    .or_else(|| args.get(1).cloned().map(Sample::Str))
             },
         });
         self.register_fetch(FetchDesc {
@@ -1936,12 +2196,13 @@ impl Registry {
         });
 
         // --- 2. Arithmetic & Bitwise Logic ---
+
         self.register_converter(ConvDesc {
             name: "add",
             in_type: TypeSpec::Exact(SampleType::Sint),
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: |smp, args| {
-                let n = args.first()?.parse::<i64>().ok()?;
+                let n = resolve_int_arg(args.first()?)?;
                 match smp {
                     Sample::Sint(val) => Some(Sample::Sint(val.saturating_add(n))),
                     _ => None,
@@ -1954,7 +2215,7 @@ impl Registry {
             in_type: TypeSpec::Exact(SampleType::Sint),
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: |smp, args| {
-                let n = args.first()?.parse::<i64>().ok()?;
+                let n = resolve_int_arg(args.first()?)?;
                 match smp {
                     Sample::Sint(val) => Some(Sample::Sint(val.saturating_sub(n))),
                     _ => None,
@@ -1967,7 +2228,7 @@ impl Registry {
             in_type: TypeSpec::Exact(SampleType::Sint),
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: |smp, args| {
-                let factor = args.first()?.parse::<i64>().ok()?;
+                let factor = resolve_int_arg(args.first()?)?;
                 match smp {
                     Sample::Sint(n) => Some(Sample::Sint(n.saturating_mul(factor))),
                     _ => None,
@@ -1980,7 +2241,7 @@ impl Registry {
             in_type: TypeSpec::Exact(SampleType::Sint),
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: |smp, args| {
-                let divisor = args.first()?.parse::<i64>().ok()?;
+                let divisor = resolve_int_arg(args.first()?)?;
                 if divisor == 0 {
                     return None;
                 }
@@ -1996,7 +2257,7 @@ impl Registry {
             in_type: TypeSpec::Exact(SampleType::Sint),
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: |smp, args| {
-                let divisor = args.first()?.parse::<i64>().ok()?;
+                let divisor = resolve_int_arg(args.first()?)?;
                 if divisor == 0 {
                     return None;
                 }
@@ -2022,7 +2283,7 @@ impl Registry {
             in_type: TypeSpec::Exact(SampleType::Sint),
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: |smp, args| {
-                let mask = args.first()?.parse::<i64>().ok()?;
+                let mask = resolve_int_arg(args.first()?)?;
                 match smp {
                     Sample::Sint(n) => Some(Sample::Sint(n & mask)),
                     _ => None,
@@ -2035,7 +2296,7 @@ impl Registry {
             in_type: TypeSpec::Exact(SampleType::Sint),
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: |smp, args| {
-                let mask = args.first()?.parse::<i64>().ok()?;
+                let mask = resolve_int_arg(args.first()?)?;
                 match smp {
                     Sample::Sint(n) => Some(Sample::Sint(n | mask)),
                     _ => None,
@@ -2048,7 +2309,7 @@ impl Registry {
             in_type: TypeSpec::Exact(SampleType::Sint),
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: |smp, args| {
-                let mask = args.first()?.parse::<i64>().ok()?;
+                let mask = resolve_int_arg(args.first()?)?;
                 match smp {
                     Sample::Sint(n) => Some(Sample::Sint(n ^ mask)),
                     _ => None,
@@ -2883,18 +3144,13 @@ impl Registry {
         });
     }
 
-    /// Evaluates a fetch and a chain of converters against the given context.
+    /// Applies a chain of converters to a sample value.
     #[must_use]
-    pub fn eval(
+    pub fn apply_converters(
         &self,
-        fetch_name: &str,
-        fetch_args: &[String],
+        mut smp: Sample,
         converters: &[(&str, Vec<String>)],
-        ctx: &SampleContext,
     ) -> Option<Sample> {
-        let f_desc = self.get_fetch(fetch_name)?;
-        let mut smp = (f_desc.func)(ctx, fetch_args)?;
-
         for (c_name, c_args) in converters {
             let c_desc = self.get_converter(c_name)?;
 
@@ -2917,6 +3173,44 @@ impl Registry {
         }
 
         Some(smp)
+    }
+
+    /// Evaluates a fetch and a chain of converters against the given context, returning all matching sample values.
+    #[must_use]
+    pub fn eval_all(
+        &self,
+        fetch_name: &str,
+        fetch_args: &[String],
+        converters: &[(&str, Vec<String>)],
+        ctx: &SampleContext,
+    ) -> Vec<Sample> {
+        let initial_samples = if let Some(mf) = self.multi_fetches.get(fetch_name) {
+            mf(ctx, fetch_args)
+        } else if let Some(f_desc) = self.get_fetch(fetch_name) {
+            (f_desc.func)(ctx, fetch_args).into_iter().collect()
+        } else {
+            return Vec::new();
+        };
+
+        let mut out = Vec::with_capacity(initial_samples.len());
+        for smp in initial_samples {
+            if let Some(res) = self.apply_converters(smp, converters) {
+                out.push(res);
+            }
+        }
+        out
+    }
+
+    /// Evaluates a fetch and a chain of converters against the given context.
+    #[must_use]
+    pub fn eval(
+        &self,
+        fetch_name: &str,
+        fetch_args: &[String],
+        converters: &[(&str, Vec<String>)],
+        ctx: &SampleContext,
+    ) -> Option<Sample> {
+        self.eval_all(fetch_name, fetch_args, converters, ctx).into_iter().next()
     }
 }
 

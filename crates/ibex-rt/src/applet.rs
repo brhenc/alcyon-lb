@@ -211,6 +211,16 @@ impl CliApplet {
             self.handle_set_weight(rest.trim(), ctx);
         } else if let Some(rest) = cmd.strip_prefix("set maxconn ") {
             self.handle_set_maxconn(rest.trim(), ctx);
+        } else if cmd == "experimental-mode on" || cmd == "experimental-mode off" {
+            if self.interactive {
+                self.out_buf.extend_from_slice(b"\n> ");
+            } else {
+                self.is_done = true;
+            }
+        } else if let Some(target) = cmd.strip_prefix("get var ") {
+            self.handle_get_var(target.trim());
+        } else if let Some(target) = cmd.strip_prefix("set var ") {
+            self.handle_set_var(target.trim());
         } else if cmd == "help" {
             self.handle_help();
         } else {
@@ -222,6 +232,69 @@ impl CliApplet {
             } else {
                 self.is_done = true;
             }
+        }
+    }
+
+    fn handle_get_var(&mut self, var_name: &str) {
+        let val_opt = if var_name.starts_with("proc.") {
+            ibex_sample::get_proc_var(var_name)
+        } else {
+            ibex_sample::CURRENT_VARS.with(|v| v.borrow().get(var_name).cloned())
+        };
+        if let Some(val) = val_opt {
+            let typ = if val.parse::<i64>().is_ok() {
+                "sint"
+            } else if val == "true" || val == "false" {
+                "bool"
+            } else if val.parse::<std::net::IpAddr>().is_ok() {
+                "ip"
+            } else {
+                "str"
+            };
+            let resp = format!("{var_name}: type={typ} value=<{val}>\n");
+            self.out_buf.extend_from_slice(resp.as_bytes());
+        } else {
+            self.out_buf.extend_from_slice(b"Variable not found.\n");
+        }
+        if self.interactive {
+            self.out_buf.extend_from_slice(b"\n> ");
+        } else {
+            self.is_done = true;
+        }
+    }
+
+    fn handle_set_var(&mut self, rest: &str) {
+        let mut parts = rest.splitn(2, |c: char| c.is_whitespace());
+        let var_name = parts.next().unwrap_or("").trim();
+        let expr_part = parts.next().unwrap_or("").trim();
+        if var_name.is_empty() || expr_part.is_empty() {
+            self.out_buf.extend_from_slice(b"Missing variable or expression.\n");
+        } else if !var_name.starts_with("proc.") {
+            self.out_buf.extend_from_slice(b"Only scope 'proc' is permitted here.\n");
+        } else {
+            let (is_fmt, expr) = if let Some(fmt_str) = expr_part.strip_prefix("fmt ") {
+                (true, fmt_str.trim())
+            } else if let Some(expr_str) = expr_part.strip_prefix("expr ") {
+                (false, expr_str.trim())
+            } else {
+                (false, expr_part)
+            };
+            let registry = crate::engine::sample_registry();
+            let ctx = ibex_sample::SampleContext::default();
+            let val = if is_fmt {
+                crate::engine::format_sample_string(expr, &ctx, registry)
+            } else if let Ok(e) = ibex_sample::Expr::parse(expr) {
+                e.eval_sample(registry, &ctx)
+                    .map_or_else(|| expr.to_string(), |smp| crate::engine::sample_to_string(&smp))
+            } else {
+                expr.to_string()
+            };
+            ibex_sample::set_proc_var(var_name, val);
+        }
+        if self.interactive {
+            self.out_buf.extend_from_slice(b"\n> ");
+        } else {
+            self.is_done = true;
         }
     }
 
@@ -301,6 +374,15 @@ impl CliApplet {
                             "0x0: key={:?} use=0 conn_cnt={} conn_cur={}",
                             k, v.conn_cnt, v.conn_cur
                         );
+                        if v.gpc0 > 0 {
+                            let _ = write!(out, " gpc0={}", v.gpc0);
+                        }
+                        if v.gpc1 > 0 {
+                            let _ = write!(out, " gpc1={}", v.gpc1);
+                        }
+                        if v.gpt0 > 0 {
+                            let _ = write!(out, " gpt0={}", v.gpt0);
+                        }
                         if let Some(ref r) = v.conn_rate {
                             let _ = write!(out, " conn_rate(10000)={}", r.rate());
                         }

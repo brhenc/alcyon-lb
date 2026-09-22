@@ -19,5 +19,8 @@ pub mod sample;
 pub use cast::{can_cast, cast};
 pub use expr::Expr;
 pub use matcher::{IntOp, Matcher};
-pub use registry::{ConvDesc, ConvFn, FetchDesc, FetchFn, Registry, SampleContext};
+pub use registry::{
+    get_proc_var, sample_registry, set_proc_var, ConvDesc, ConvFn, FetchDesc, FetchFn, Registry,
+    SampleContext, CURRENT_VARS, GLOBAL_PROC_VARS, SAMPLE_REGISTRY,
+};
 pub use sample::{Sample, SampleType, TypeSpec, SAMPLE_TYPES_COUNT};

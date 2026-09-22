@@ -49,7 +49,7 @@ use std::time::{Duration, Instant};
 // yet" and renders `-`, where the old engine-local default reported a 200 that had
 // never been sent.
 use ibex_sample::registry::{
-    CURRENT_RES_HEADERS, CURRENT_RES_STATUS, CURRENT_TIMEOUTS, CURRENT_VARS,
+    set_proc_var, CURRENT_RES_HEADERS, CURRENT_RES_STATUS, CURRENT_TIMEOUTS, CURRENT_VARS,
 };
 
 thread_local! {
@@ -86,6 +86,8 @@ pub struct ProxyStats {
     pub failed_conn: u64,
     pub srv_err: u64,
     pub cli_err: u64,
+    pub denied_conn: u64,
+    pub denied_resp: u64,
 }
 
 impl ProxyStats {
@@ -100,6 +102,8 @@ impl ProxyStats {
         self.failed_conn = 0;
         self.srv_err = 0;
         self.cli_err = 0;
+        self.denied_conn = 0;
+        self.denied_resp = 0;
     }
 }
 
@@ -144,6 +148,9 @@ pub struct Proxy {
     pub server_actconn: Vec<u32>,
     pub server_check_configs: Vec<Option<ServerCheckConfig>>,
     pub tcp_req_conn_rules: Vec<ibex_config::TcpReqConnRule>,
+    pub tcp_req_session_rules: Vec<ibex_config::TcpReqSessionRule>,
+    pub tcp_req_content_rules: Vec<ibex_config::TcpReqContentRule>,
+    pub tcp_req_inspect_delay: Option<Duration>,
     pub http_req_rules: Vec<ibex_config::HttpReqRule>,
     pub http_res_rules: Vec<ibex_config::HttpResRule>,
     pub http_after_res_rules: Vec<ibex_config::HttpAfterResRule>,
@@ -727,6 +734,9 @@ fn init_proxy_from_listen(proxy_idx: usize, listen: &ibex_config::ListenSection)
         server_actconn: vec![0; server_count],
         server_check_configs,
         tcp_req_conn_rules: listen.tcp_req_conn_rules.clone(),
+        tcp_req_session_rules: listen.tcp_req_session_rules.clone(),
+        tcp_req_content_rules: listen.tcp_req_content_rules.clone(),
+        tcp_req_inspect_delay: listen.tcp_req_inspect_delay,
         http_req_rules: listen.http_req_rules.clone(),
         http_res_rules: listen.http_res_rules.clone(),
         http_after_res_rules: listen.http_after_res_rules.clone(),
@@ -801,6 +811,9 @@ fn init_proxy_from_frontend(proxy_idx: usize, fe: &ibex_config::FrontendSection)
         server_actconn: Vec::new(),
         server_check_configs: Vec::new(),
         tcp_req_conn_rules: fe.tcp_req_conn_rules.clone(),
+        tcp_req_session_rules: fe.tcp_req_session_rules.clone(),
+        tcp_req_content_rules: fe.tcp_req_content_rules.clone(),
+        tcp_req_inspect_delay: fe.tcp_req_inspect_delay,
         http_req_rules: fe.http_req_rules.clone(),
         http_res_rules: fe.http_res_rules.clone(),
         http_after_res_rules: fe.http_after_res_rules.clone(),
@@ -897,6 +910,9 @@ fn init_proxy_from_backend(proxy_idx: usize, be: &ibex_config::BackendSection) -
         server_actconn: vec![0; server_count],
         server_check_configs,
         tcp_req_conn_rules: Vec::new(),
+        tcp_req_session_rules: Vec::new(),
+        tcp_req_content_rules: be.tcp_req_content_rules.clone(),
+        tcp_req_inspect_delay: be.tcp_req_inspect_delay,
         http_req_rules: be.http_req_rules.clone(),
         http_res_rules: be.http_res_rules.clone(),
         http_after_res_rules: be.http_after_res_rules.clone(),
@@ -927,6 +943,24 @@ fn init_checks(proxies: &[Proxy], scheduler: &mut Scheduler, now: Tick) -> Vec<S
     checks
 }
 
+fn init_global_vars(global: Option<&ibex_config::GlobalSection>) {
+    if let Some(global) = global {
+        let sample_reg = sample_registry();
+        let sample_ctx = SampleContext::default();
+        for set_var in &global.set_vars {
+            let val = if set_var.is_fmt {
+                format_sample_string(&set_var.expr, &sample_ctx, sample_reg)
+            } else if let Ok(e) = Expr::parse(&set_var.expr) {
+                e.eval_sample(sample_reg, &sample_ctx)
+                    .map_or_else(|| set_var.expr.clone(), |smp| sample_to_string(&smp))
+            } else {
+                set_var.expr.clone()
+            };
+            set_proc_var(&set_var.name, val);
+        }
+    }
+}
+
 impl Engine {
     /// Constructs an `Engine` configured from the given parsed config.
     ///
@@ -938,6 +972,8 @@ impl Engine {
         let mut fdtab = FdTab::with_capacity(capacity * 2);
         let sessions = SessionArena::with_capacity(capacity);
         let applets = AppletArena::with_capacity(capacity);
+
+        init_global_vars(config.global.as_ref());
 
         let mut listeners = Vec::new();
         let mut proxies = Vec::new();
@@ -1282,8 +1318,6 @@ impl Engine {
             return;
         }
 
-        let registry = Registry::new();
-
         while !self.listeners[l_idx].is_full() {
             let accept_res = self.listeners[l_idx].accept();
             let Some((cli_fd, peer_addr)) = (match accept_res {
@@ -1293,176 +1327,153 @@ impl Engine {
                 break;
             };
 
-            let mut silent_dropped = false;
             let mut sc_conn_rates = [0u64; 3];
-            let key = StickKey::Ip(peer_addr.ip());
+            let mut tracked_sc: [Option<(usize, StickKey)>; 3] = [None, None, None];
 
-            for rule in &self.proxies[proxy_idx].tcp_req_conn_rules {
-                match &rule.action {
-                    ibex_config::TcpReqConnAction::TrackSc0 { table, .. } => {
-                        let target_table = if let Some(ref tname) = table {
-                            self.proxies
-                                .iter()
-                                .find(|p| p.name == *tname)
-                                .and_then(|p| p.stick_table.as_ref())
-                        } else {
-                            self.proxies[proxy_idx].stick_table.as_ref()
-                        };
-                        if let Some(tbl) = target_table {
-                            let _ = tbl.update_entry(&key, |data| {
-                                data.conn_cnt += 1;
-                                data.conn_cur += 1;
-                                if let Some(ref mut r) = data.conn_rate {
-                                    r.tick(1);
-                                }
-                            });
-                        }
-                    }
-                    ibex_config::TcpReqConnAction::TrackSc1 { table, .. } => {
-                        let target_table = if let Some(ref tname) = table {
-                            self.proxies
-                                .iter()
-                                .find(|p| p.name == *tname)
-                                .and_then(|p| p.stick_table.as_ref())
-                        } else {
-                            self.proxies[proxy_idx].stick_table.as_ref()
-                        };
-                        if let Some(tbl) = target_table {
-                            let _ = tbl.update_entry(&key, |data| {
-                                data.conn_cnt += 1;
-                                data.conn_cur += 1;
-                                if let Some(ref mut r) = data.conn_rate {
-                                    r.tick(1);
-                                }
-                            });
-                        }
-                    }
-                    ibex_config::TcpReqConnAction::TrackSc2 { table, .. } => {
-                        let target_table = if let Some(ref tname) = table {
-                            self.proxies
-                                .iter()
-                                .find(|p| p.name == *tname)
-                                .and_then(|p| p.stick_table.as_ref())
-                        } else {
-                            self.proxies[proxy_idx].stick_table.as_ref()
-                        };
-                        if let Some(tbl) = target_table {
-                            let _ = tbl.update_entry(&key, |data| {
-                                data.conn_cnt += 1;
-                                data.conn_cur += 1;
-                                if let Some(ref mut r) = data.conn_rate {
-                                    r.tick(1);
-                                }
-                            });
-                        }
-                    }
-                    _ => {}
-                }
-            }
-
-            for rule in &self.proxies[proxy_idx].tcp_req_conn_rules {
-                match &rule.action {
-                    ibex_config::TcpReqConnAction::TrackSc0 { table, .. } => {
-                        let target_table = if let Some(ref tname) = table {
-                            self.proxies
-                                .iter()
-                                .find(|p| p.name == *tname)
-                                .and_then(|p| p.stick_table.as_ref())
-                        } else {
-                            self.proxies[proxy_idx].stick_table.as_ref()
-                        };
-                        if let Some(tbl) = target_table {
-                            if let Ok(Some(data)) = tbl.get_entry(&key) {
-                                if let Some(ref r) = data.conn_rate {
-                                    sc_conn_rates[0] = r.rate();
-                                }
-                            }
-                        }
-                    }
-                    ibex_config::TcpReqConnAction::TrackSc1 { table, .. } => {
-                        let target_table = if let Some(ref tname) = table {
-                            self.proxies
-                                .iter()
-                                .find(|p| p.name == *tname)
-                                .and_then(|p| p.stick_table.as_ref())
-                        } else {
-                            self.proxies[proxy_idx].stick_table.as_ref()
-                        };
-                        if let Some(tbl) = target_table {
-                            if let Ok(Some(data)) = tbl.get_entry(&key) {
-                                if let Some(ref r) = data.conn_rate {
-                                    sc_conn_rates[1] = r.rate();
-                                }
-                            }
-                        }
-                    }
-                    ibex_config::TcpReqConnAction::TrackSc2 { table, .. } => {
-                        let target_table = if let Some(ref tname) = table {
-                            self.proxies
-                                .iter()
-                                .find(|p| p.name == *tname)
-                                .and_then(|p| p.stick_table.as_ref())
-                        } else {
-                            self.proxies[proxy_idx].stick_table.as_ref()
-                        };
-                        if let Some(tbl) = target_table {
-                            if let Ok(Some(data)) = tbl.get_entry(&key) {
-                                if let Some(ref r) = data.conn_rate {
-                                    sc_conn_rates[2] = r.rate();
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-
-            if self.proxies[proxy_idx].tcp_req_conn_rules.is_empty() {
-                if let Some(ref table) = self.proxies[proxy_idx].stick_table {
-                    let _ = table.update_entry(&key, |data| {
-                        data.conn_cnt += 1;
-                        data.conn_cur += 1;
-                        if let Some(ref mut rate) = data.conn_rate {
-                            rate.tick(1);
-                        }
-                    });
-                }
-            }
-
-            let ctx = SampleContext {
+            let sample_ctx = SampleContext {
                 client_addr: Some(peer_addr),
-                sc_conn_rates,
+                server_addr: Some(self.listeners[l_idx].addr()),
+                fc_src: Some(peer_addr),
+                fc_dst: Some(self.listeners[l_idx].addr()),
                 act_conn: self.proxies[proxy_idx].stats.act_conn,
                 cum_conn: self.proxies[proxy_idx].stats.cum_conn,
                 ..Default::default()
             };
 
+            // 1. Process stick_rules (e.g. `track-sc0 src` from frontend/listen)
+            for srule in &self.proxies[proxy_idx].stick_rules {
+                let slot = match srule.rule_type {
+                    ibex_config::StickRuleType::TrackSc0 => Some(0),
+                    ibex_config::StickRuleType::TrackSc1 => Some(1),
+                    ibex_config::StickRuleType::TrackSc2 => Some(2),
+                    _ => None,
+                };
+                if let Some(slot) = slot {
+                    if let Some(key) = resolve_sample_stick_key(&srule.expr, sample_registry(), &sample_ctx) {
+                        if let Some(ref tbl) = self.proxies[proxy_idx].stick_table {
+                            let _ = tbl.update_entry(&key, |data| {
+                                data.conn_cnt += 1;
+                                data.conn_cur += 1;
+                                if let Some(ref mut r) = data.conn_rate {
+                                    r.tick(1);
+                                }
+                            });
+                            tracked_sc[slot] = Some((proxy_idx, key));
+                        }
+                    }
+                }
+            }
+
+            // 2. Process tcp_req_conn_rules (e.g. `tcp-request connection track-sc0 ...`)
             for rule in &self.proxies[proxy_idx].tcp_req_conn_rules {
+                let matches = match &rule.cond {
+                    None => true,
+                    Some(cond) => crate::proxy::eval_acl_condition(
+                        cond,
+                        &self.proxies[proxy_idx].acls,
+                        sample_registry(),
+                        &sample_ctx,
+                    ),
+                };
+                if !matches {
+                    continue;
+                }
                 match &rule.action {
-                    ibex_config::TcpReqConnAction::SilentDrop
-                    | ibex_config::TcpReqConnAction::Reject => {
-                        let matches = match &rule.cond {
-                            None => true,
-                            Some(cond) => crate::proxy::eval_acl_condition(
-                                cond,
-                                &self.proxies[proxy_idx].acls,
-                                &registry,
-                                &ctx,
-                            ),
+                    ibex_config::TcpReqConnAction::TrackSc0 { table, expr } => {
+                        let t_idx = if let Some(ref tname) = table {
+                            self.proxies.iter().position(|p| p.name == *tname).unwrap_or(proxy_idx)
+                        } else {
+                            proxy_idx
                         };
-                        if matches {
-                            silent_dropped = true;
-                            break;
+                        if let Some(key) = resolve_sample_stick_key(expr, sample_registry(), &sample_ctx) {
+                            if let Some(ref tbl) = self.proxies[t_idx].stick_table {
+                                let _ = tbl.update_entry(&key, |data| {
+                                    data.conn_cnt += 1;
+                                    data.conn_cur += 1;
+                                    if let Some(ref mut r) = data.conn_rate {
+                                        r.tick(1);
+                                    }
+                                });
+                                tracked_sc[0] = Some((t_idx, key));
+                            }
+                        }
+                    }
+                    ibex_config::TcpReqConnAction::TrackSc1 { table, expr } => {
+                        let t_idx = if let Some(ref tname) = table {
+                            self.proxies.iter().position(|p| p.name == *tname).unwrap_or(proxy_idx)
+                        } else {
+                            proxy_idx
+                        };
+                        if let Some(key) = resolve_sample_stick_key(expr, sample_registry(), &sample_ctx) {
+                            if let Some(ref tbl) = self.proxies[t_idx].stick_table {
+                                let _ = tbl.update_entry(&key, |data| {
+                                    data.conn_cnt += 1;
+                                    data.conn_cur += 1;
+                                    if let Some(ref mut r) = data.conn_rate {
+                                        r.tick(1);
+                                    }
+                                });
+                                tracked_sc[1] = Some((t_idx, key));
+                            }
+                        }
+                    }
+                    ibex_config::TcpReqConnAction::TrackSc2 { table, expr } => {
+                        let t_idx = if let Some(ref tname) = table {
+                            self.proxies.iter().position(|p| p.name == *tname).unwrap_or(proxy_idx)
+                        } else {
+                            proxy_idx
+                        };
+                        if let Some(key) = resolve_sample_stick_key(expr, sample_registry(), &sample_ctx) {
+                            if let Some(ref tbl) = self.proxies[t_idx].stick_table {
+                                let _ = tbl.update_entry(&key, |data| {
+                                    data.conn_cnt += 1;
+                                    data.conn_cur += 1;
+                                    if let Some(ref mut r) = data.conn_rate {
+                                        r.tick(1);
+                                    }
+                                });
+                                tracked_sc[2] = Some((t_idx, key));
+                            }
                         }
                     }
                     _ => {}
                 }
             }
 
-            if silent_dropped {
+            // Read conn_rates from tracked slots
+            for (i, opt) in tracked_sc.iter().enumerate() {
+                if let Some((t_idx, ref key)) = opt {
+                    if let Some(ref tbl) = self.proxies[*t_idx].stick_table {
+                        if let Ok(Some(data)) = tbl.get_entry(key) {
+                            if let Some(ref r) = data.conn_rate {
+                                sc_conn_rates[i] = r.rate();
+                            }
+                        }
+                    }
+                }
+            }
+
+            let listener_addr = self.listeners[l_idx].addr();
+            let local_addr = listener_addr;
+
+            let Some((client_addr, server_addr, fc_src, fc_dst)) = eval_tcp_req_conn_rules(
+                &self.proxies[proxy_idx],
+                sample_registry(),
+                peer_addr,
+                local_addr,
+                sc_conn_rates,
+            ) else {
+                self.proxies[proxy_idx].stats.denied_conn += 1;
+                for (t_idx, ref key) in tracked_sc.iter().flatten() {
+                    if let Some(ref tbl) = self.proxies[*t_idx].stick_table {
+                        let _ = tbl.update_entry(key, |data| {
+                            data.conn_cur = data.conn_cur.saturating_sub(1);
+                        });
+                    }
+                }
                 drop(cli_fd);
                 continue;
-            }
+            };
 
             self.listeners[l_idx].nbconn += 1;
             let proxy = &mut self.proxies[proxy_idx];
@@ -1482,7 +1493,18 @@ impl Engine {
                 self.fdtab.set_interest(lfd, Interest::NONE);
             }
 
-            register_new_session(self, proxy_idx, l_idx, cli_fd, peer_addr);
+            register_new_session(
+                self,
+                proxy_idx,
+                l_idx,
+                cli_fd,
+                peer_addr,
+                client_addr,
+                server_addr,
+                fc_src,
+                fc_dst,
+                tracked_sc,
+            );
         }
     }
 
@@ -1561,12 +1583,596 @@ impl Engine {
 }
 
 #[allow(clippy::too_many_lines)]
+fn eval_tcp_req_conn_rules(
+    proxy: &Proxy,
+    registry: &Registry,
+    peer_addr: SocketAddr,
+    local_addr: SocketAddr,
+    sc_conn_rates: [u64; 3],
+) -> Option<(SocketAddr, SocketAddr, SocketAddr, SocketAddr)> {
+    let mut client_addr = peer_addr;
+    let mut server_addr = local_addr;
+    let fc_src = peer_addr;
+    let fc_dst = local_addr;
+
+    let mut ctx = SampleContext {
+        client_addr: Some(client_addr),
+        server_addr: Some(server_addr),
+        fc_src: Some(fc_src),
+        fc_dst: Some(fc_dst),
+        sc_conn_rates,
+        act_conn: proxy.stats.act_conn,
+        cum_conn: proxy.stats.cum_conn,
+        ..Default::default()
+    };
+
+    for rule in &proxy.tcp_req_conn_rules {
+        let matches = match &rule.cond {
+            None => true,
+            Some(cond) => crate::proxy::eval_acl_condition(
+                cond,
+                &proxy.acls,
+                registry,
+                &ctx,
+            ),
+        };
+        if !matches {
+            continue;
+        }
+        match &rule.action {
+            ibex_config::TcpReqConnAction::SilentDrop
+            | ibex_config::TcpReqConnAction::Reject => {
+                return None;
+            }
+            ibex_config::TcpReqConnAction::Accept => {
+                break;
+            }
+            ibex_config::TcpReqConnAction::SetSrc { expr } => {
+                let val = if let Ok(e) = Expr::parse(expr) {
+                    e.eval_sample(registry, &ctx)
+                        .map(|smp| sample_to_string(&smp))
+                        .unwrap_or_default()
+                } else {
+                    format_sample_string(expr, &ctx, registry)
+                };
+                if let Ok(ip) = val.parse::<IpAddr>() {
+                    client_addr = SocketAddr::new(ip, client_addr.port());
+                    ctx.client_addr = Some(client_addr);
+                } else if let Ok(sa) = val.parse::<SocketAddr>() {
+                    client_addr = sa;
+                    ctx.client_addr = Some(client_addr);
+                }
+            }
+            ibex_config::TcpReqConnAction::SetDst { expr } => {
+                let val = if let Ok(e) = Expr::parse(expr) {
+                    e.eval_sample(registry, &ctx)
+                        .map(|smp| sample_to_string(&smp))
+                        .unwrap_or_default()
+                } else {
+                    format_sample_string(expr, &ctx, registry)
+                };
+                if let Ok(ip) = val.parse::<IpAddr>() {
+                    server_addr = SocketAddr::new(ip, server_addr.port());
+                    ctx.server_addr = Some(server_addr);
+                } else if let Ok(sa) = val.parse::<SocketAddr>() {
+                    server_addr = sa;
+                    ctx.server_addr = Some(server_addr);
+                }
+            }
+            _ => {}
+        }
+    }
+    Some((client_addr, server_addr, fc_src, fc_dst))
+}
+
+#[allow(clippy::too_many_lines)]
+fn eval_tcp_req_session_rules(
+    proxy: &Proxy,
+    proxies: &[Proxy],
+    registry: &Registry,
+    sess: &mut TcpSession,
+) -> bool {
+    let mut ctx = SampleContext {
+        client_addr: sess.client_addr,
+        server_addr: sess.server_addr,
+        fc_src: sess.fc_src,
+        fc_dst: sess.fc_dst,
+        proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
+        act_conn: proxy.stats.act_conn,
+        cum_conn: proxy.stats.cum_conn,
+        ..Default::default()
+    };
+
+    ibex_sample::CURRENT_VARS.with(|v| {
+        let mut map = v.borrow_mut();
+        map.clear();
+        for (k, val) in &sess.sess_vars {
+            map.insert(k.clone(), val.clone());
+        }
+        for (k, val) in &sess.req_vars {
+            map.insert(k.clone(), val.clone());
+        }
+    });
+
+    for rule in &proxy.tcp_req_session_rules {
+        let matches = match &rule.cond {
+            None => true,
+            Some(cond) => crate::proxy::eval_acl_condition(
+                cond,
+                &proxy.acls,
+                registry,
+                &ctx,
+            ),
+        };
+        if !matches {
+            continue;
+        }
+        match &rule.action {
+            ibex_config::TcpReqSessionAction::SilentDrop
+            | ibex_config::TcpReqSessionAction::Reject => {
+                return false;
+            }
+            ibex_config::TcpReqSessionAction::Accept => {
+                break;
+            }
+            ibex_config::TcpReqSessionAction::TrackSc0 { table, expr } => {
+                let t_idx = if let Some(ref tname) = table {
+                    proxies.iter().position(|p| p.name == *tname).unwrap_or(proxy.id as usize)
+                } else {
+                    proxy.id as usize
+                };
+                if let Some(key) = resolve_sample_stick_key(expr, registry, &ctx) {
+                    if let Some(tbl) = proxies.get(t_idx).and_then(|p| p.stick_table.as_ref()) {
+                        let _ = tbl.update_entry(&key, |data| {
+                            data.conn_cnt += 1;
+                            data.conn_cur += 1;
+                            if let Some(ref mut r) = data.conn_rate {
+                                r.tick(1);
+                            }
+                        });
+                        sess.tracked_sc[0] = Some((t_idx, key));
+                    }
+                }
+            }
+            ibex_config::TcpReqSessionAction::TrackSc1 { table, expr } => {
+                let t_idx = if let Some(ref tname) = table {
+                    proxies.iter().position(|p| p.name == *tname).unwrap_or(proxy.id as usize)
+                } else {
+                    proxy.id as usize
+                };
+                if let Some(key) = resolve_sample_stick_key(expr, registry, &ctx) {
+                    if let Some(tbl) = proxies.get(t_idx).and_then(|p| p.stick_table.as_ref()) {
+                        let _ = tbl.update_entry(&key, |data| {
+                            data.conn_cnt += 1;
+                            data.conn_cur += 1;
+                            if let Some(ref mut r) = data.conn_rate {
+                                r.tick(1);
+                            }
+                        });
+                        sess.tracked_sc[1] = Some((t_idx, key));
+                    }
+                }
+            }
+            ibex_config::TcpReqSessionAction::TrackSc2 { table, expr } => {
+                let t_idx = if let Some(ref tname) = table {
+                    proxies.iter().position(|p| p.name == *tname).unwrap_or(proxy.id as usize)
+                } else {
+                    proxy.id as usize
+                };
+                if let Some(key) = resolve_sample_stick_key(expr, registry, &ctx) {
+                    if let Some(tbl) = proxies.get(t_idx).and_then(|p| p.stick_table.as_ref()) {
+                        let _ = tbl.update_entry(&key, |data| {
+                            data.conn_cnt += 1;
+                            data.conn_cur += 1;
+                            if let Some(ref mut r) = data.conn_rate {
+                                r.tick(1);
+                            }
+                        });
+                        sess.tracked_sc[2] = Some((t_idx, key));
+                    }
+                }
+            }
+            ibex_config::TcpReqSessionAction::SetSrc { expr } => {
+                let val = if let Ok(e) = Expr::parse(expr) {
+                    e.eval_sample(registry, &ctx)
+                        .map(|smp| sample_to_string(&smp))
+                        .unwrap_or_default()
+                } else {
+                    format_sample_string(expr, &ctx, registry)
+                };
+                if let Ok(ip) = val.parse::<IpAddr>() {
+                    let port = sess.client_addr.map_or(0, |a| a.port());
+                    let new_addr = SocketAddr::new(ip, port);
+                    sess.client_addr = Some(new_addr);
+                    ctx.client_addr = Some(new_addr);
+                } else if let Ok(sa) = val.parse::<SocketAddr>() {
+                    sess.client_addr = Some(sa);
+                    ctx.client_addr = Some(sa);
+                }
+            }
+            ibex_config::TcpReqSessionAction::SetDst { expr } => {
+                let val = if let Ok(e) = Expr::parse(expr) {
+                    e.eval_sample(registry, &ctx)
+                        .map(|smp| sample_to_string(&smp))
+                        .unwrap_or_default()
+                } else {
+                    format_sample_string(expr, &ctx, registry)
+                };
+                if let Ok(ip) = val.parse::<IpAddr>() {
+                    let port = sess.server_addr.map_or(0, |a| a.port());
+                    let new_addr = SocketAddr::new(ip, port);
+                    sess.server_addr = Some(new_addr);
+                    ctx.server_addr = Some(new_addr);
+                } else if let Ok(sa) = val.parse::<SocketAddr>() {
+                    sess.server_addr = Some(sa);
+                    ctx.server_addr = Some(sa);
+                }
+            }
+            ibex_config::TcpReqSessionAction::SetVar { var_name, expr } => {
+                let val = if let Ok(e) = Expr::parse(expr) {
+                    e.eval_sample(registry, &ctx)
+                        .map(|smp| sample_to_string(&smp))
+                        .unwrap_or_default()
+                } else {
+                    format_sample_string(expr, &ctx, registry)
+                };
+                if var_name.starts_with("proc.") {
+                    ibex_sample::set_proc_var(var_name, val);
+                } else if var_name.starts_with("sess.") {
+                    sess.sess_vars.insert(var_name.clone(), val.clone());
+                    ibex_sample::CURRENT_VARS.with(|v| v.borrow_mut().insert(var_name.clone(), val));
+                } else {
+                    sess.req_vars.insert(var_name.clone(), val.clone());
+                    ibex_sample::CURRENT_VARS.with(|v| v.borrow_mut().insert(var_name.clone(), val));
+                }
+            }
+            ibex_config::TcpReqSessionAction::SetVarFmt { var_name, fmt } => {
+                let val = format_sample_string(fmt, &ctx, registry);
+                if var_name.starts_with("proc.") {
+                    ibex_sample::set_proc_var(var_name, val);
+                } else if var_name.starts_with("sess.") {
+                    sess.sess_vars.insert(var_name.clone(), val.clone());
+                    ibex_sample::CURRENT_VARS.with(|v| v.borrow_mut().insert(var_name.clone(), val));
+                } else {
+                    sess.req_vars.insert(var_name.clone(), val.clone());
+                    ibex_sample::CURRENT_VARS.with(|v| v.borrow_mut().insert(var_name.clone(), val));
+                }
+            }
+            ibex_config::TcpReqSessionAction::UnsetVar { var_name } => {
+                if var_name.starts_with("sess.") {
+                    sess.sess_vars.remove(var_name);
+                } else {
+                    sess.req_vars.remove(var_name);
+                }
+                ibex_sample::CURRENT_VARS.with(|v| v.borrow_mut().remove(var_name));
+            }
+            ibex_config::TcpReqSessionAction::ScIncGpc0 { sc } => {
+                let sc_idx = *sc as usize;
+                if sc_idx < 3 {
+                    if let Some((t_idx, ref key)) = sess.tracked_sc[sc_idx] {
+                        if let Some(tbl) = proxies.get(t_idx).and_then(|p| p.stick_table.as_ref()) {
+                            let _ = tbl.update_entry(key, |data| {
+                                data.gpc0 = data.gpc0.saturating_add(1);
+                                data.last_updated = std::time::Instant::now();
+                            });
+                        }
+                    }
+                }
+            }
+            ibex_config::TcpReqSessionAction::ScIncGpc1 { sc } => {
+                let sc_idx = *sc as usize;
+                if sc_idx < 3 {
+                    if let Some((t_idx, ref key)) = sess.tracked_sc[sc_idx] {
+                        if let Some(tbl) = proxies.get(t_idx).and_then(|p| p.stick_table.as_ref()) {
+                            let _ = tbl.update_entry(key, |data| {
+                                data.gpc1 = data.gpc1.saturating_add(1);
+                                data.last_updated = std::time::Instant::now();
+                            });
+                        }
+                    }
+                }
+            }
+            ibex_config::TcpReqSessionAction::ScSetGpt0 { sc, expr } => {
+                let sc_idx = *sc as usize;
+                if sc_idx < 3 {
+                    if let Some((t_idx, ref key)) = sess.tracked_sc[sc_idx] {
+                        let val = resolve_gpt0_val(expr, registry, &ctx);
+                        if let Some(tbl) = proxies.get(t_idx).and_then(|p| p.stick_table.as_ref()) {
+                            let _ = tbl.update_entry(key, |data| {
+                                data.gpt0 = val;
+                                data.last_updated = std::time::Instant::now();
+                            });
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ContentEvalResult {
+    Done,
+    Waiting,
+    Reject,
+}
+
+#[allow(clippy::too_many_lines)]
+fn eval_tcp_req_content_rules(
+    proxy: &Proxy,
+    proxies: &[Proxy],
+    registry: &Registry,
+    sess: &mut TcpSession,
+    now: Tick,
+) -> ContentEvalResult {
+    if proxy.tcp_req_content_rules.is_empty() {
+        return ContentEvalResult::Done;
+    }
+
+    let req_bytes = sess.req.readable();
+    let has_content = !req_bytes.is_empty();
+    let expired = sess.inspect_exp.is_some_and(|exp| exp.is_expired(now));
+    let client_closed = sess.cli_state == ScState::ShutR || sess.cli_state == ScState::Closed;
+    let can_wait = sess.inspect_exp.is_some() && !expired && !client_closed;
+
+    if !has_content && (can_wait || (sess.mode == Mode::Http && !client_closed)) {
+        return ContentEvalResult::Waiting;
+    }
+
+    let mut ctx = SampleContext {
+        client_addr: sess.client_addr,
+        server_addr: sess.server_addr,
+        fc_src: sess.fc_src,
+        fc_dst: sess.fc_dst,
+        proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
+        req_body: if has_content { Some(req_bytes) } else { None },
+        act_conn: proxy.stats.act_conn,
+        cum_conn: proxy.stats.cum_conn,
+        ..Default::default()
+    };
+
+    ibex_sample::CURRENT_VARS.with(|v| {
+        let mut map = v.borrow_mut();
+        map.clear();
+        for (k, val) in &sess.sess_vars {
+            map.insert(k.clone(), val.clone());
+        }
+        for (k, val) in &sess.req_vars {
+            map.insert(k.clone(), val.clone());
+        }
+    });
+
+    let mut has_missing_data = false;
+    for rule in &proxy.tcp_req_content_rules {
+        let cond_res = match &rule.cond {
+            None => crate::proxy::AclEvalResult::Matched,
+            Some(cond) => crate::proxy::eval_acl_condition_extended(
+                cond,
+                &proxy.acls,
+                registry,
+                &ctx,
+                req_bytes,
+                can_wait,
+            ),
+        };
+        match cond_res {
+            crate::proxy::AclEvalResult::MissingData => {
+                has_missing_data = true;
+                break;
+            }
+            crate::proxy::AclEvalResult::NotMatched => {
+                continue;
+            }
+            crate::proxy::AclEvalResult::Matched => {}
+        }
+        match &rule.action {
+            ibex_config::TcpReqContentAction::SilentDrop
+            | ibex_config::TcpReqContentAction::Reject => {
+                return ContentEvalResult::Reject;
+            }
+            ibex_config::TcpReqContentAction::Accept => {
+                return ContentEvalResult::Done;
+            }
+            ibex_config::TcpReqContentAction::TrackSc0 { table, expr } => {
+                let t_idx = if let Some(ref tname) = table {
+                    proxies.iter().position(|p| p.name == *tname).unwrap_or(proxy.id as usize)
+                } else {
+                    proxy.id as usize
+                };
+                if let Some(key) = resolve_sample_stick_key(expr, registry, &ctx) {
+                    if let Some(tbl) = proxies.get(t_idx).and_then(|p| p.stick_table.as_ref()) {
+                        let _ = tbl.update_entry(&key, |data| {
+                            data.conn_cnt += 1;
+                            data.conn_cur += 1;
+                            if let Some(ref mut r) = data.conn_rate {
+                                r.tick(1);
+                            }
+                        });
+                        sess.tracked_sc[0] = Some((t_idx, key));
+                    }
+                }
+            }
+            ibex_config::TcpReqContentAction::TrackSc1 { table, expr } => {
+                let t_idx = if let Some(ref tname) = table {
+                    proxies.iter().position(|p| p.name == *tname).unwrap_or(proxy.id as usize)
+                } else {
+                    proxy.id as usize
+                };
+                if let Some(key) = resolve_sample_stick_key(expr, registry, &ctx) {
+                    if let Some(tbl) = proxies.get(t_idx).and_then(|p| p.stick_table.as_ref()) {
+                        let _ = tbl.update_entry(&key, |data| {
+                            data.conn_cnt += 1;
+                            data.conn_cur += 1;
+                            if let Some(ref mut r) = data.conn_rate {
+                                r.tick(1);
+                            }
+                        });
+                        sess.tracked_sc[1] = Some((t_idx, key));
+                    }
+                }
+            }
+            ibex_config::TcpReqContentAction::TrackSc2 { table, expr } => {
+                let t_idx = if let Some(ref tname) = table {
+                    proxies.iter().position(|p| p.name == *tname).unwrap_or(proxy.id as usize)
+                } else {
+                    proxy.id as usize
+                };
+                if let Some(key) = resolve_sample_stick_key(expr, registry, &ctx) {
+                    if let Some(tbl) = proxies.get(t_idx).and_then(|p| p.stick_table.as_ref()) {
+                        let _ = tbl.update_entry(&key, |data| {
+                            data.conn_cnt += 1;
+                            data.conn_cur += 1;
+                            if let Some(ref mut r) = data.conn_rate {
+                                r.tick(1);
+                            }
+                        });
+                        sess.tracked_sc[2] = Some((t_idx, key));
+                    }
+                }
+            }
+            ibex_config::TcpReqContentAction::SetSrc { expr } => {
+                let val = if let Ok(e) = Expr::parse(expr) {
+                    e.eval_sample(registry, &ctx)
+                        .map(|smp| sample_to_string(&smp))
+                        .unwrap_or_default()
+                } else {
+                    format_sample_string(expr, &ctx, registry)
+                };
+                if let Ok(ip) = val.parse::<IpAddr>() {
+                    let port = sess.client_addr.map_or(0, |a| a.port());
+                    let new_addr = SocketAddr::new(ip, port);
+                    sess.client_addr = Some(new_addr);
+                    ctx.client_addr = Some(new_addr);
+                } else if let Ok(sa) = val.parse::<SocketAddr>() {
+                    sess.client_addr = Some(sa);
+                    ctx.client_addr = Some(sa);
+                }
+            }
+            ibex_config::TcpReqContentAction::SetDst { expr } => {
+                let val = if let Ok(e) = Expr::parse(expr) {
+                    e.eval_sample(registry, &ctx)
+                        .map(|smp| sample_to_string(&smp))
+                        .unwrap_or_default()
+                } else {
+                    format_sample_string(expr, &ctx, registry)
+                };
+                if let Ok(ip) = val.parse::<IpAddr>() {
+                    let port = sess.server_addr.map_or(0, |a| a.port());
+                    let new_addr = SocketAddr::new(ip, port);
+                    sess.server_addr = Some(new_addr);
+                    ctx.server_addr = Some(new_addr);
+                } else if let Ok(sa) = val.parse::<SocketAddr>() {
+                    sess.server_addr = Some(sa);
+                    ctx.server_addr = Some(sa);
+                }
+            }
+            ibex_config::TcpReqContentAction::SetVar { var_name, expr } => {
+                let val = if let Ok(e) = Expr::parse(expr) {
+                    e.eval_sample(registry, &ctx)
+                        .map(|smp| sample_to_string(&smp))
+                        .unwrap_or_default()
+                } else {
+                    format_sample_string(expr, &ctx, registry)
+                };
+                if var_name.starts_with("proc.") {
+                    ibex_sample::set_proc_var(var_name, val);
+                } else if var_name.starts_with("sess.") {
+                    sess.sess_vars.insert(var_name.clone(), val.clone());
+                    ibex_sample::CURRENT_VARS.with(|v| v.borrow_mut().insert(var_name.clone(), val));
+                } else {
+                    sess.req_vars.insert(var_name.clone(), val.clone());
+                    ibex_sample::CURRENT_VARS.with(|v| v.borrow_mut().insert(var_name.clone(), val));
+                }
+            }
+            ibex_config::TcpReqContentAction::SetVarFmt { var_name, fmt } => {
+                let val = format_sample_string(fmt, &ctx, registry);
+                if var_name.starts_with("proc.") {
+                    ibex_sample::set_proc_var(var_name, val);
+                } else if var_name.starts_with("sess.") {
+                    sess.sess_vars.insert(var_name.clone(), val.clone());
+                    ibex_sample::CURRENT_VARS.with(|v| v.borrow_mut().insert(var_name.clone(), val));
+                } else {
+                    sess.req_vars.insert(var_name.clone(), val.clone());
+                    ibex_sample::CURRENT_VARS.with(|v| v.borrow_mut().insert(var_name.clone(), val));
+                }
+            }
+            ibex_config::TcpReqContentAction::UnsetVar { var_name } => {
+                if var_name.starts_with("sess.") {
+                    sess.sess_vars.remove(var_name);
+                } else {
+                    sess.req_vars.remove(var_name);
+                }
+                ibex_sample::CURRENT_VARS.with(|v| v.borrow_mut().remove(var_name));
+            }
+            ibex_config::TcpReqContentAction::ScIncGpc0 { sc } => {
+                let sc_idx = *sc as usize;
+                if sc_idx < 3 {
+                    if let Some((t_idx, ref key)) = sess.tracked_sc[sc_idx] {
+                        if let Some(tbl) = proxies.get(t_idx).and_then(|p| p.stick_table.as_ref()) {
+                            let _ = tbl.update_entry(key, |data| {
+                                data.gpc0 = data.gpc0.saturating_add(1);
+                                data.last_updated = std::time::Instant::now();
+                            });
+                        }
+                    }
+                }
+            }
+            ibex_config::TcpReqContentAction::ScIncGpc1 { sc } => {
+                let sc_idx = *sc as usize;
+                if sc_idx < 3 {
+                    if let Some((t_idx, ref key)) = sess.tracked_sc[sc_idx] {
+                        if let Some(tbl) = proxies.get(t_idx).and_then(|p| p.stick_table.as_ref()) {
+                            let _ = tbl.update_entry(key, |data| {
+                                data.gpc1 = data.gpc1.saturating_add(1);
+                                data.last_updated = std::time::Instant::now();
+                            });
+                        }
+                    }
+                }
+            }
+            ibex_config::TcpReqContentAction::ScSetGpt0 { sc, expr } => {
+                let sc_idx = *sc as usize;
+                if sc_idx < 3 {
+                    if let Some((t_idx, ref key)) = sess.tracked_sc[sc_idx] {
+                        let val = resolve_gpt0_val(expr, registry, &ctx);
+                        if let Some(tbl) = proxies.get(t_idx).and_then(|p| p.stick_table.as_ref()) {
+                            let _ = tbl.update_entry(key, |data| {
+                                data.gpt0 = val;
+                                data.last_updated = std::time::Instant::now();
+                            });
+                        }
+                    }
+                }
+            }
+            ibex_config::TcpReqContentAction::SwitchModeHttp { .. } => {
+                sess.mode = Mode::Http;
+                sess.cli_state = ScState::Ready;
+            }
+            _ => {}
+        }
+    }
+
+    if has_missing_data {
+        ContentEvalResult::Waiting
+    } else {
+        ContentEvalResult::Done
+    }
+}
+
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn register_new_session(
     engine: &mut Engine,
     proxy_idx: usize,
     listener_idx: usize,
     cli_fd: std::os::fd::OwnedFd,
     peer_addr: SocketAddr,
+    client_addr: SocketAddr,
+    server_addr: SocketAddr,
+    fc_src: SocketAddr,
+    fc_dst: SocketAddr,
+    tracked_sc: [Option<(usize, StickKey)>; 3],
 ) {
     // Cloned out before `proxies` is borrowed mutably. TLS belongs to the bind that
     // accepted, not to the proxy, so it is read from the listener.
@@ -1574,15 +2180,25 @@ fn register_new_session(
         .listeners
         .get(listener_idx)
         .and_then(|l| l.tls.clone());
-    let proxy = &mut engine.proxies[proxy_idx];
     let cli_raw_fd = cli_fd.as_raw_fd();
-    let Some((mut sess, target_addr, srv_raw_fd)) =
-        init_client_session(proxy, cli_fd, engine.now, peer_addr, tls.as_ref())
-    else {
+    let Some((sess, target_addr, srv_raw_fd)) = init_client_session(
+        &mut engine.proxies,
+        proxy_idx,
+        cli_fd,
+        engine.now,
+        peer_addr,
+        client_addr,
+        server_addr,
+        fc_src,
+        fc_dst,
+        tls.as_ref(),
+        tracked_sc,
+    ) else {
         // TLS setup failed; the fd is dropped with the session and the connection closes.
         return;
     };
-    sess.client_addr = Some(peer_addr);
+
+    let proxy = &mut engine.proxies[proxy_idx];
 
     let target_server_idx = target_addr.and_then(|t| proxy.servers.iter().position(|&s| s == t));
     if let Some(idx) = target_server_idx {
@@ -1723,19 +2339,26 @@ fn maybe_prepend_send_proxy(proxy: &Proxy, sess: &mut TcpSession, target_addr: S
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn init_client_session(
-    proxy: &mut Proxy,
+    proxies: &mut [Proxy],
+    proxy_idx: usize,
     cli_fd: std::os::fd::OwnedFd,
     now: Tick,
     peer_addr: SocketAddr,
+    client_addr: SocketAddr,
+    server_addr: SocketAddr,
+    fc_src: SocketAddr,
+    fc_dst: SocketAddr,
     tls: Option<&Arc<rustls::ServerConfig>>,
+    tracked_sc: [Option<(usize, StickKey)>; 3],
 ) -> Option<(TcpSession, Option<SocketAddr>, Option<RawFd>)> {
-    let mode = proxy.mode;
-    let timeouts = proxy.timeouts;
-    let retries = proxy.retries;
-    let cookie_name = proxy.cookie_name.clone();
-    let cliexp = proxy.cliexp.clone();
-    let srvexp = proxy.srvexp.clone();
+    let mode = proxies[proxy_idx].mode;
+    let timeouts = proxies[proxy_idx].timeouts;
+    let retries = proxies[proxy_idx].retries;
+    let cookie_name = proxies[proxy_idx].cookie_name.clone();
+    let cliexp = proxies[proxy_idx].cliexp.clone();
+    let srvexp = proxies[proxy_idx].srvexp.clone();
 
     let mut sess = TcpSession::new_with_mode(
         cli_fd,
@@ -1747,7 +2370,12 @@ fn init_client_session(
         retries,
         now,
     );
-    sess.client_addr = Some(peer_addr);
+    sess.client_addr = Some(client_addr);
+    sess.server_addr = Some(server_addr);
+    sess.fc_src = Some(fc_src);
+    sess.fc_dst = Some(fc_dst);
+    sess.tracked_sc = tracked_sc;
+
     if let Some(cfg) = tls {
         // The connection is dropped rather than continued in the clear. Falling back to
         // plaintext here would hand an unencrypted session to a client that opened :443
@@ -1759,15 +2387,32 @@ fn init_client_session(
             Err(e) => {
                 eprintln!(
                     "[ibex] {}: dropping connection from {peer_addr}, TLS setup failed: {e}",
-                    proxy.name
+                    proxies[proxy_idx].name
                 );
                 return None;
             }
         }
     }
-    if proxy.accept_proxy || proxy.accept_proxy_v2 {
-        sess.enable_accept_proxy(proxy.accept_proxy_v2);
+    if proxies[proxy_idx].accept_proxy || proxies[proxy_idx].accept_proxy_v2 {
+        sess.enable_accept_proxy(proxies[proxy_idx].accept_proxy_v2);
     }
+
+    let registry = sample_registry();
+    if !eval_tcp_req_session_rules(&proxies[proxy_idx], proxies, registry, &mut sess) {
+        return None;
+    }
+
+    let proxy = &mut proxies[proxy_idx];
+
+    let has_inspect = proxy.tcp_req_inspect_delay.is_some() || !proxy.tcp_req_content_rules.is_empty();
+    if has_inspect {
+        sess.tcp_inspect_done = false;
+        if let Some(delay) = proxy.tcp_req_inspect_delay {
+            let ms = u32::try_from(delay.as_millis()).unwrap_or(u32::MAX);
+            sess.inspect_exp = Some(now.add(ms));
+        }
+    }
+
     let mut target_addr = None;
     let mut srv_raw_fd = None;
 
@@ -1779,8 +2424,8 @@ fn init_client_session(
         sess.rep.commit(n);
         sess.cli_state = ScState::ShutR;
         sess.srv_state = ScState::Closed;
-    } else if mode == Mode::Tcp && !proxy.accept_proxy && !proxy.accept_proxy_v2 {
-        target_addr = proxy.select_server_with_key(Some(peer_addr.ip()));
+    } else if mode == Mode::Tcp && !proxy.accept_proxy && !proxy.accept_proxy_v2 && sess.tcp_inspect_done {
+        target_addr = proxy.select_server_with_key(sess.client_addr.map(|a| a.ip()));
         if let Some(target) = target_addr {
             maybe_prepend_send_proxy(proxy, &mut sess, target);
 
@@ -1801,7 +2446,7 @@ fn init_client_session(
             sess.srv_state = ScState::Error;
         }
     }
-    // In Mode::Http (or Mode::Tcp when accept_proxy is true), target connect is deferred
+    // In Mode::Http (or Mode::Tcp when accept_proxy is true or has_inspect is true), target connect is deferred
     Some((sess, target_addr, srv_raw_fd))
 }
 
@@ -2206,14 +2851,15 @@ fn cleanup_done(
         }
     }
 
-    if let Some(ref table) = proxies[proxy_idx].stick_table {
-        if let Some(cli_addr) = entry.sess.client_addr {
-            let key = StickKey::Ip(cli_addr.ip());
-            let _ = table.update_entry(&key, |data| {
-                data.conn_cur = data.conn_cur.saturating_sub(1);
-                data.bytes_in_cnt += entry.sess.bytes_in;
-                data.bytes_out_cnt += entry.sess.bytes_out;
-            });
+    for (tbl_idx, ref key) in entry.sess.tracked_sc.iter().flatten() {
+        if *tbl_idx < proxies.len() {
+            if let Some(ref table) = proxies[*tbl_idx].stick_table {
+                let _ = table.update_entry(key, |data| {
+                    data.conn_cur = data.conn_cur.saturating_sub(1);
+                    data.bytes_in_cnt += entry.sess.bytes_in;
+                    data.bytes_out_cnt += entry.sess.bytes_out;
+                });
+            }
         }
     }
 
@@ -2239,6 +2885,14 @@ impl EngineDispatcher<'_> {
         let ctx = SampleContext {
             client_addr: entry.sess.client_addr,
             server_addr: entry.target_addr,
+            fc_src: entry.sess.fc_src,
+            fc_dst: entry.sess.fc_dst,
+            proxy_tlvs: entry.sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
+            req_body: if entry.sess.req.readable().is_empty() {
+                None
+            } else {
+                Some(entry.sess.req.readable())
+            },
             htx: None,
             req_uri: entry.sess.req_uri.as_deref(),
             req_method: entry.sess.req_method.as_deref(),
@@ -2248,12 +2902,12 @@ impl EngineDispatcher<'_> {
             ..Default::default()
         };
 
-        let registry = Registry::new();
+        let registry = sample_registry();
 
         for rule in &proxy.use_backends {
             let mut matches = true;
             if let Some(ref cond) = rule.cond {
-                matches = crate::proxy::eval_acl_condition(cond, &proxy.acls, &registry, &ctx);
+                matches = crate::proxy::eval_acl_condition(cond, &proxy.acls, registry, &ctx);
             }
             if matches {
                 if let Some(idx) = proxies.iter().position(|p| p.name == rule.backend) {
@@ -2316,11 +2970,34 @@ impl EngineDispatcher<'_> {
                 let _ = entry.sess.process(now);
             }
 
+            // Step 3.4: Content inspection for TCP rules (or before HTTP request parsing)
+            if !entry.sess.tcp_inspect_done && !entry.sess.is_done() {
+                let proxy_idx = entry.proxy_idx;
+                match eval_tcp_req_content_rules(
+                    &self.proxies[proxy_idx],
+                    self.proxies,
+                    sample_registry(),
+                    &mut entry.sess,
+                    now,
+                ) {
+                    ContentEvalResult::Done => {
+                        entry.sess.tcp_inspect_done = true;
+                        entry.sess.inspect_exp = None;
+                    }
+                    ContentEvalResult::Reject => {
+                        entry.sess.cli_state = ScState::Closed;
+                        entry.sess.srv_state = ScState::Closed;
+                    }
+                    ContentEvalResult::Waiting => {}
+                }
+            }
+
             // Step 3.5: If in HTTP mode and request headers are parsed, initiate backend connect
             let mut pending_admin = None;
             if entry.sess.mode == Mode::Http
                 && entry.sess.srv_state == ScState::Init
                 && entry.sess.cli_state != ScState::Ready
+                && entry.sess.tcp_inspect_done
                 && !entry.sess.is_done()
             {
                 pending_admin = Self::connect_http_backend(
@@ -2334,10 +3011,11 @@ impl EngineDispatcher<'_> {
                 );
             }
 
-            // Step 3.6: If in TCP mode and server not yet connected (e.g. deferred on accept-proxy), connect once handshake is done
+            // Step 3.6: If in TCP mode and server not yet connected (e.g. deferred on accept-proxy or inspect), connect once ready
             if entry.sess.mode == Mode::Tcp
                 && entry.sess.srv_state == ScState::Init
                 && (!entry.sess.accept_proxy || entry.sess.proxy_handshake_done)
+                && entry.sess.tcp_inspect_done
                 && !entry.sess.is_done()
             {
                 Self::connect_tcp_backend(entry, self.proxies, self.fdtab, self.poller, now);
@@ -2368,10 +3046,11 @@ impl EngineDispatcher<'_> {
                 //
                 // It is only closed when the far end is actually finished with it --
                 // the server closed its read side, or the connection errored.
-                let backend_finished = matches!(
-                    entry.sess.srv_state,
-                    ScState::Closed | ScState::Error
-                );
+                let backend_finished = entry.sess.srv.is_none()
+                    || matches!(
+                        entry.sess.srv_state,
+                        ScState::Closed | ScState::Error
+                    );
                 if backend_finished {
                     if let Some(srv_fd) = entry.sess.srv.take() {
                         let sfd = srv_fd.as_raw_fd();
@@ -2391,6 +3070,14 @@ impl EngineDispatcher<'_> {
                 entry.sess.req_uri = None;
                 entry.sess.req_headers = None;
                 entry.sess.cli_state = ScState::Ready;
+                entry.sess.req_vars.clear();
+                if !self.proxies[entry.proxy_idx].tcp_req_content_rules.is_empty() {
+                    entry.sess.tcp_inspect_done = false;
+                    if let Some(delay) = self.proxies[entry.proxy_idx].tcp_req_inspect_delay {
+                        let ms = u32::try_from(delay.as_millis()).unwrap_or(u32::MAX);
+                        entry.sess.inspect_exp = Some(now.add(ms));
+                    }
+                }
             }
 
             // Step 4: Update interests
@@ -2483,7 +3170,7 @@ impl EngineDispatcher<'_> {
         let max_rw = proxies[fe_idx].stats_config.maxrewrite.unwrap_or(8192);
         MAX_REWRITE_LIMIT.set(max_rw);
 
-        let registry = build_sample_registry();
+        let registry = sample_registry();
 
         let req_uri_clone = entry.sess.req_uri.clone();
         let req_method_clone = entry.sess.req_method.clone();
@@ -2492,6 +3179,9 @@ impl EngineDispatcher<'_> {
         let ctx = SampleContext {
             client_addr: entry.sess.client_addr,
             server_addr: entry.target_addr,
+            fc_src: entry.sess.fc_src,
+            fc_dst: entry.sess.fc_dst,
+            proxy_tlvs: entry.sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
             htx: None,
             req_uri: req_uri_clone.as_deref(),
             req_method: req_method_clone.as_deref(),
@@ -2499,7 +3189,7 @@ impl EngineDispatcher<'_> {
             ..Default::default()
         };
 
-        let eval_res_action = |act_name: &str, act_fmt: &str, hdrs: &mut Vec<(String, String)>, status: &mut u16, status_msg: &mut String| -> Result<bool, u16> {
+        let mut eval_res_action = |act_name: &str, act_fmt: &str, hdrs: &mut Vec<(String, String)>, status: &mut u16, status_msg: &mut String| -> Result<bool, u16> {
             if act_name == "\0allow" {
                 return Ok(false);
             }
@@ -2517,18 +3207,32 @@ impl EngineDispatcher<'_> {
             }
             if let Some(var_name) = act_name.strip_prefix("\0set-var:") {
                 let val = if let Ok(e) = Expr::parse(act_fmt) {
-                    e.eval_sample(&registry, &ctx)
+                    e.eval_sample(registry, &ctx)
                         .map(|smp| sample_to_string(&smp))
                         .unwrap_or_default()
                 } else {
-                    format_sample_string(act_fmt, &ctx, &registry)
+                    format_sample_string(act_fmt, &ctx, registry)
                 };
-                CURRENT_VARS.with(|v| {
-                    v.borrow_mut().insert(var_name.to_string(), val);
-                });
+                if var_name.starts_with("proc.") {
+                    ibex_sample::set_proc_var(var_name, val);
+                } else {
+                    if var_name.starts_with("sess.") {
+                        entry.sess.sess_vars.insert(var_name.to_string(), val.clone());
+                    } else {
+                        entry.sess.req_vars.insert(var_name.to_string(), val.clone());
+                    }
+                    CURRENT_VARS.with(|v| {
+                        v.borrow_mut().insert(var_name.to_string(), val);
+                    });
+                }
                 return Ok(true);
             }
             if let Some(var_name) = act_name.strip_prefix("\0unset-var:") {
+                if var_name.starts_with("sess.") {
+                    entry.sess.sess_vars.remove(var_name);
+                } else {
+                    entry.sess.req_vars.remove(var_name);
+                }
                 CURRENT_VARS.with(|v| {
                     v.borrow_mut().remove(var_name);
                 });
@@ -2577,7 +3281,7 @@ impl EngineDispatcher<'_> {
                 return Ok(true);
             }
 
-            let val = format_sample_string(act_fmt, &ctx, &registry);
+            let val = format_sample_string(act_fmt, &ctx, registry);
             let added = act_name.len() + val.len() + 4;
             let total = REWRITE_ADDED_BYTES.get() + added;
             if total > MAX_REWRITE_LIMIT.get() {
@@ -2601,7 +3305,7 @@ impl EngineDispatcher<'_> {
         for rule in &proxies[be_idx].http_res_rules {
             let matches = match &rule.cond {
                 None => true,
-                Some(cond) => eval_condition(cond, &ctx, &proxies[be_idx].acls, &registry),
+                Some(cond) => eval_condition(cond, &ctx, &proxies[be_idx].acls, registry),
             };
             if !matches {
                 continue;
@@ -2621,10 +3325,10 @@ impl EngineDispatcher<'_> {
                 }
                 ibex_config::HttpResAction::AddHeader { name, fmt } => {
                     if let Some(var_name) = name.strip_prefix("\0set-var:") {
-                        let val = format_sample_string(fmt, &ctx, &registry);
+                        let val = format_sample_string(fmt, &ctx, registry);
                         CURRENT_VARS.with(|v| v.borrow_mut().insert(var_name.to_string(), val));
                     } else {
-                        let val = format_sample_string(fmt, &ctx, &registry);
+                        let val = format_sample_string(fmt, &ctx, registry);
                         let added = name.len() + val.len() + 4;
                         let total = REWRITE_ADDED_BYTES.get() + added;
                         if total > MAX_REWRITE_LIMIT.get() {
@@ -2662,7 +3366,7 @@ impl EngineDispatcher<'_> {
             for rule in &proxies[fe_idx].http_res_rules {
                 let matches = match &rule.cond {
                     None => true,
-                    Some(cond) => eval_condition(cond, &ctx, &proxies[fe_idx].acls, &registry),
+                    Some(cond) => eval_condition(cond, &ctx, &proxies[fe_idx].acls, registry),
                 };
                 if !matches {
                     continue;
@@ -2682,10 +3386,10 @@ impl EngineDispatcher<'_> {
                     }
                     ibex_config::HttpResAction::AddHeader { name, fmt } => {
                         if let Some(var_name) = name.strip_prefix("\0set-var:") {
-                            let val = format_sample_string(fmt, &ctx, &registry);
+                            let val = format_sample_string(fmt, &ctx, registry);
                             CURRENT_VARS.with(|v| v.borrow_mut().insert(var_name.to_string(), val));
                         } else {
-                            let val = format_sample_string(fmt, &ctx, &registry);
+                            let val = format_sample_string(fmt, &ctx, registry);
                             let added = name.len() + val.len() + 4;
                             let total = REWRITE_ADDED_BYTES.get() + added;
                             if total > MAX_REWRITE_LIMIT.get() {
@@ -2723,7 +3427,7 @@ impl EngineDispatcher<'_> {
         for rule in &proxies[be_idx].http_after_res_rules {
             let matches = match &rule.cond {
                 None => true,
-                Some(cond) => eval_condition(cond, &ctx, &proxies[be_idx].acls, &registry),
+                Some(cond) => eval_condition(cond, &ctx, &proxies[be_idx].acls, registry),
             };
             if !matches {
                 continue;
@@ -2743,10 +3447,10 @@ impl EngineDispatcher<'_> {
                 }
                 ibex_config::HttpAfterResAction::AddHeader { name, fmt } => {
                     if let Some(var_name) = name.strip_prefix("\0set-var:") {
-                        let val = format_sample_string(fmt, &ctx, &registry);
+                        let val = format_sample_string(fmt, &ctx, registry);
                         CURRENT_VARS.with(|v| v.borrow_mut().insert(var_name.to_string(), val));
                     } else {
-                        let val = format_sample_string(fmt, &ctx, &registry);
+                        let val = format_sample_string(fmt, &ctx, registry);
                         let added = name.len() + val.len() + 4;
                         let total = REWRITE_ADDED_BYTES.get() + added;
                         if total > MAX_REWRITE_LIMIT.get() {
@@ -2778,7 +3482,7 @@ impl EngineDispatcher<'_> {
         for rule in &proxies[fe_idx].http_after_res_rules {
             let matches = match &rule.cond {
                 None => true,
-                Some(cond) => eval_condition(cond, &ctx, &proxies[fe_idx].acls, &registry),
+                Some(cond) => eval_condition(cond, &ctx, &proxies[fe_idx].acls, registry),
             };
             if !matches {
                 continue;
@@ -2798,10 +3502,10 @@ impl EngineDispatcher<'_> {
                 }
                 ibex_config::HttpAfterResAction::AddHeader { name, fmt } => {
                     if let Some(var_name) = name.strip_prefix("\0set-var:") {
-                        let val = format_sample_string(fmt, &ctx, &registry);
+                        let val = format_sample_string(fmt, &ctx, registry);
                         CURRENT_VARS.with(|v| v.borrow_mut().insert(var_name.to_string(), val));
                     } else {
-                        let val = format_sample_string(fmt, &ctx, &registry);
+                        let val = format_sample_string(fmt, &ctx, registry);
                         let added = name.len() + val.len() + 4;
                         let total = REWRITE_ADDED_BYTES.get() + added;
                         if total > MAX_REWRITE_LIMIT.get() {
@@ -2839,7 +3543,9 @@ impl EngineDispatcher<'_> {
             .sess
             .rep
             .replace_prefix(total_hdr_len, new_hdr.as_bytes());
-        entry.sess.srv_state = ScState::Established;
+        if entry.sess.srv.is_some() {
+            entry.sess.srv_state = ScState::Established;
+        }
         entry.sess.resp_headers_processed = true;
     }
 
@@ -3088,7 +3794,16 @@ impl EngineDispatcher<'_> {
         let proxy_idx = entry.proxy_idx;
 
         // Initialize per-request thread locals
-        CURRENT_VARS.with(|v| v.borrow_mut().clear());
+        CURRENT_VARS.with(|v| {
+            let mut map = v.borrow_mut();
+            map.clear();
+            for (k, val) in &entry.sess.sess_vars {
+                map.insert(k.clone(), val.clone());
+            }
+            for (k, val) in &entry.sess.req_vars {
+                map.insert(k.clone(), val.clone());
+            }
+        });
         CURRENT_TIMEOUTS.with(|t| {
             let mut map = t.borrow_mut();
             map.clear();
@@ -3146,155 +3861,139 @@ impl EngineDispatcher<'_> {
             }
         }
 
+        let registry = sample_registry();
+
         // 1. Stick table tracking from http_req_rules
-        let key_opt = entry.sess.client_addr.map(|a| StickKey::Ip(a.ip()));
         let mut sc_http_req_rates = [0u64; 3];
         let mut sc_conn_rates = [0u64; 3];
 
+        let req_uri_clone = entry.sess.req_uri.clone();
+        let req_method_clone = entry.sess.req_method.clone();
+        let req_headers_clone = entry.sess.req_headers.clone();
+        let http_sample_ctx = SampleContext {
+            client_addr: entry.sess.client_addr,
+            server_addr: entry.target_addr,
+            fc_src: entry.sess.fc_src,
+            fc_dst: entry.sess.fc_dst,
+            proxy_tlvs: entry.sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
+            req_uri: req_uri_clone.as_deref(),
+            req_method: req_method_clone.as_deref(),
+            req_headers: req_headers_clone.as_deref(),
+            act_conn: proxies[proxy_idx].stats.act_conn,
+            cum_conn: proxies[proxy_idx].stats.cum_conn,
+            ..Default::default()
+        };
+
         for rule in &proxies[proxy_idx].http_req_rules {
+            let matches = match &rule.cond {
+                None => true,
+                Some(cond) => eval_condition(cond, &http_sample_ctx, &proxies[proxy_idx].acls, registry),
+            };
+            if !matches {
+                continue;
+            }
             match &rule.action {
-                ibex_config::HttpReqAction::TrackSc0 { table, .. } => {
-                    let target_table = if let Some(ref tname) = table {
-                        proxies
-                            .iter()
-                            .find(|p| p.name == *tname)
-                            .and_then(|p| p.stick_table.as_ref())
+                ibex_config::HttpReqAction::TrackSc0 { table, expr } => {
+                    let t_idx = if let Some(ref tname) = table {
+                        proxies.iter().position(|p| p.name == *tname).unwrap_or(proxy_idx)
                     } else {
-                        proxies[proxy_idx].stick_table.as_ref()
+                        proxy_idx
                     };
-                    if let (Some(tbl), Some(k)) = (target_table, key_opt.as_ref()) {
-                        let _ = tbl.update_entry(k, |data| {
-                            data.http_req_cnt += 1;
-                            if let Some(ref mut r) = data.http_req_rate {
-                                r.tick(1);
+                    if let Some(k) = resolve_sample_stick_key(expr, registry, &http_sample_ctx) {
+                        let is_new = entry.sess.tracked_sc[0].as_ref().is_none_or(|(old_idx, old_k)| *old_idx != t_idx || old_k != &k);
+                        if is_new {
+                            if let Some(ref tbl) = proxies[t_idx].stick_table {
+                                let _ = tbl.update_entry(&k, |data| {
+                                    data.conn_cnt += 1;
+                                    data.conn_cur += 1;
+                                    if let Some(ref mut r) = data.conn_rate {
+                                        r.tick(1);
+                                    }
+                                });
                             }
-                        });
+                            entry.sess.tracked_sc[0] = Some((t_idx, k));
+                        }
                     }
                 }
-                ibex_config::HttpReqAction::TrackSc1 { table, .. } => {
-                    let target_table = if let Some(ref tname) = table {
-                        proxies
-                            .iter()
-                            .find(|p| p.name == *tname)
-                            .and_then(|p| p.stick_table.as_ref())
+                ibex_config::HttpReqAction::TrackSc1 { table, expr } => {
+                    let t_idx = if let Some(ref tname) = table {
+                        proxies.iter().position(|p| p.name == *tname).unwrap_or(proxy_idx)
                     } else {
-                        proxies[proxy_idx].stick_table.as_ref()
+                        proxy_idx
                     };
-                    if let (Some(tbl), Some(k)) = (target_table, key_opt.as_ref()) {
-                        let _ = tbl.update_entry(k, |data| {
-                            data.http_req_cnt += 1;
-                            if let Some(ref mut r) = data.http_req_rate {
-                                r.tick(1);
+                    if let Some(k) = resolve_sample_stick_key(expr, registry, &http_sample_ctx) {
+                        let is_new = entry.sess.tracked_sc[1].as_ref().is_none_or(|(old_idx, old_k)| *old_idx != t_idx || old_k != &k);
+                        if is_new {
+                            if let Some(ref tbl) = proxies[t_idx].stick_table {
+                                let _ = tbl.update_entry(&k, |data| {
+                                    data.conn_cnt += 1;
+                                    data.conn_cur += 1;
+                                    if let Some(ref mut r) = data.conn_rate {
+                                        r.tick(1);
+                                    }
+                                });
                             }
-                        });
+                            entry.sess.tracked_sc[1] = Some((t_idx, k));
+                        }
                     }
                 }
-                ibex_config::HttpReqAction::TrackSc2 { table, .. } => {
-                    let target_table = if let Some(ref tname) = table {
-                        proxies
-                            .iter()
-                            .find(|p| p.name == *tname)
-                            .and_then(|p| p.stick_table.as_ref())
+                ibex_config::HttpReqAction::TrackSc2 { table, expr } => {
+                    let t_idx = if let Some(ref tname) = table {
+                        proxies.iter().position(|p| p.name == *tname).unwrap_or(proxy_idx)
                     } else {
-                        proxies[proxy_idx].stick_table.as_ref()
+                        proxy_idx
                     };
-                    if let (Some(tbl), Some(k)) = (target_table, key_opt.as_ref()) {
-                        let _ = tbl.update_entry(k, |data| {
-                            data.http_req_cnt += 1;
-                            if let Some(ref mut r) = data.http_req_rate {
-                                r.tick(1);
+                    if let Some(k) = resolve_sample_stick_key(expr, registry, &http_sample_ctx) {
+                        let is_new = entry.sess.tracked_sc[2].as_ref().is_none_or(|(old_idx, old_k)| *old_idx != t_idx || old_k != &k);
+                        if is_new {
+                            if let Some(ref tbl) = proxies[t_idx].stick_table {
+                                let _ = tbl.update_entry(&k, |data| {
+                                    data.conn_cnt += 1;
+                                    data.conn_cur += 1;
+                                    if let Some(ref mut r) = data.conn_rate {
+                                        r.tick(1);
+                                    }
+                                });
                             }
-                        });
+                            entry.sess.tracked_sc[2] = Some((t_idx, k));
+                        }
                     }
                 }
                 _ => {}
             }
         }
 
-        // Query rates from stick tables
-        if let Some(ref k) = key_opt {
-            for rule in &proxies[proxy_idx].http_req_rules {
-                match &rule.action {
-                    ibex_config::HttpReqAction::TrackSc0 { table, .. } => {
-                        let target_table = if let Some(ref tname) = table {
-                            proxies
-                                .iter()
-                                .find(|p| p.name == *tname)
-                                .and_then(|p| p.stick_table.as_ref())
-                        } else {
-                            proxies[proxy_idx].stick_table.as_ref()
-                        };
-                        if let Some(tbl) = target_table {
-                            if let Ok(Some(data)) = tbl.get_entry(k) {
-                                if let Some(ref r) = data.http_req_rate {
-                                    sc_http_req_rates[0] = r.rate();
-                                }
-                                if let Some(ref r) = data.conn_rate {
-                                    sc_conn_rates[0] = r.rate();
-                                }
-                            }
-                        }
-                    }
-                    ibex_config::HttpReqAction::TrackSc1 { table, .. } => {
-                        let target_table = if let Some(ref tname) = table {
-                            proxies
-                                .iter()
-                                .find(|p| p.name == *tname)
-                                .and_then(|p| p.stick_table.as_ref())
-                        } else {
-                            proxies[proxy_idx].stick_table.as_ref()
-                        };
-                        if let Some(tbl) = target_table {
-                            if let Ok(Some(data)) = tbl.get_entry(k) {
-                                if let Some(ref r) = data.http_req_rate {
-                                    sc_http_req_rates[1] = r.rate();
-                                }
-                                if let Some(ref r) = data.conn_rate {
-                                    sc_conn_rates[1] = r.rate();
-                                }
-                            }
-                        }
-                    }
-                    ibex_config::HttpReqAction::TrackSc2 { table, .. } => {
-                        let target_table = if let Some(ref tname) = table {
-                            proxies
-                                .iter()
-                                .find(|p| p.name == *tname)
-                                .and_then(|p| p.stick_table.as_ref())
-                        } else {
-                            proxies[proxy_idx].stick_table.as_ref()
-                        };
-                        if let Some(tbl) = target_table {
-                            if let Ok(Some(data)) = tbl.get_entry(k) {
-                                if let Some(ref r) = data.http_req_rate {
-                                    sc_http_req_rates[2] = r.rate();
-                                }
-                                if let Some(ref r) = data.conn_rate {
-                                    sc_conn_rates[2] = r.rate();
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        // Fallback default tracking if no http_req_rules track
-        if proxies[proxy_idx].http_req_rules.is_empty() {
-            if let Some(ref table) = proxies[proxy_idx].stick_table {
-                if let Some(ref k) = key_opt {
-                    let _ = table.update_entry(k, |data| {
+        // Count HTTP request into all active tracked slots
+        for (t_idx, ref k) in entry.sess.tracked_sc.iter().flatten() {
+            if *t_idx < proxies.len() {
+                if let Some(ref tbl) = proxies[*t_idx].stick_table {
+                    let _ = tbl.update_entry(k, |data| {
                         data.http_req_cnt += 1;
-                        if let Some(ref mut rate) = data.http_req_rate {
-                            rate.tick(1);
+                        if let Some(ref mut r) = data.http_req_rate {
+                            r.tick(1);
                         }
                     });
                 }
             }
         }
 
-        let registry = build_sample_registry();
+        // Query rates for use by subsequent rules
+        for (i, opt) in entry.sess.tracked_sc.iter().enumerate() {
+            if let Some((t_idx, ref k)) = opt {
+                if *t_idx < proxies.len() {
+                    if let Some(ref tbl) = proxies[*t_idx].stick_table {
+                        if let Ok(Some(data)) = tbl.get_entry(k) {
+                            if let Some(ref r) = data.http_req_rate {
+                                sc_http_req_rates[i] = r.rate();
+                            }
+                            if let Some(ref r) = data.conn_rate {
+                                sc_conn_rates[i] = r.rate();
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // 2. Helper closure to evaluate http-request rules
         let eval_http_rules = |rules: &[ibex_config::HttpReqRule], acls: &HashMap<String, Expr>, sess: &mut TcpSession, target_addr: Option<SocketAddr>| -> Result<Option<()>, ()> {
@@ -3302,9 +4001,13 @@ impl EngineDispatcher<'_> {
                 let req_uri_clone = sess.req_uri.clone();
                 let req_method_clone = sess.req_method.clone();
                 let req_headers_clone = sess.req_headers.clone();
+                let proxy_tlvs_buf = sess.proxy_info.as_ref().map(|p| p.tlv_data.clone());
                 let ctx = SampleContext {
                     client_addr: sess.client_addr,
                     server_addr: target_addr,
+                    fc_src: sess.fc_src,
+                    fc_dst: sess.fc_dst,
+                    proxy_tlvs: proxy_tlvs_buf.as_deref(),
                     htx: None,
                     req_uri: req_uri_clone.as_deref(),
                     req_method: req_method_clone.as_deref(),
@@ -3318,7 +4021,7 @@ impl EngineDispatcher<'_> {
 
                 let matches = match &rule.cond {
                     None => true,
-                    Some(cond) => eval_condition(cond, &ctx, acls, &registry),
+                    Some(cond) => eval_condition(cond, &ctx, acls, registry),
                 };
                 if !matches {
                     continue;
@@ -3338,7 +4041,7 @@ impl EngineDispatcher<'_> {
                             while let Some(stripped) = rest.strip_prefix("\0HDR:") {
                                 if let Some((line, r)) = stripped.split_once('\n') {
                                     if let Some((k, v)) = line.split_once(':') {
-                                        let formatted_v = format_sample_string(v, &ctx, &registry);
+                                        let formatted_v = format_sample_string(v, &ctx, registry);
                                         custom_headers.push((k.to_string(), formatted_v));
                                     }
                                     rest = r;
@@ -3347,9 +4050,9 @@ impl EngineDispatcher<'_> {
                                 }
                             }
                             if let Some(b) = rest.strip_prefix("\0BODY:") {
-                                body_str = format_sample_string(b, &ctx, &registry);
+                                body_str = format_sample_string(b, &ctx, registry);
                             } else if !rest.starts_with('\0') {
-                                body_str = format_sample_string(rest, &ctx, &registry);
+                                body_str = format_sample_string(rest, &ctx, registry);
                             }
                         }
 
@@ -3420,7 +4123,7 @@ impl EngineDispatcher<'_> {
                     ibex_config::HttpReqAction::Redirect { location, prefix, code, .. } => {
                         let status_code = code.unwrap_or(302);
                         let loc = location.as_deref().or(prefix.as_deref()).unwrap_or("/");
-                        let formatted_loc = format_sample_string(loc, &ctx, &registry);
+                        let formatted_loc = format_sample_string(loc, &ctx, registry);
                         let reason = status_reason(status_code);
                         let resp = format!(
                             "HTTP/1.1 {status_code} {reason}\r\nLocation: {formatted_loc}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -3434,7 +4137,7 @@ impl EngineDispatcher<'_> {
                         return Ok(Some(()));
                     }
                     ibex_config::HttpReqAction::SetPath { fmt } => {
-                        let new_path = format_sample_string(fmt, &ctx, &registry);
+                        let new_path = format_sample_string(fmt, &ctx, registry);
                         let current_uri = sess.req_uri.as_deref().unwrap_or("/");
                         let (pfx, _, query) = split_uri(current_uri);
                         let rebuilt = rebuild_uri(pfx, &new_path, query);
@@ -3453,7 +4156,7 @@ impl EngineDispatcher<'_> {
                         }
                     }
                     ibex_config::HttpReqAction::SetPathq { fmt } => {
-                        let new_pathq = format_sample_string(fmt, &ctx, &registry);
+                        let new_pathq = format_sample_string(fmt, &ctx, registry);
                         let current_uri = sess.req_uri.as_deref().unwrap_or("/");
                         let (pfx, _, _) = split_uri(current_uri);
                         let rebuilt = format!("{pfx}{new_pathq}");
@@ -3473,7 +4176,7 @@ impl EngineDispatcher<'_> {
                         }
                     }
                     ibex_config::HttpReqAction::SetQuery { fmt } => {
-                        let new_query = format_sample_string(fmt, &ctx, &registry);
+                        let new_query = format_sample_string(fmt, &ctx, registry);
                         let current_uri = sess.req_uri.as_deref().unwrap_or("/");
                         let (pfx, path, _) = split_uri(current_uri);
                         let rebuilt = rebuild_uri(pfx, path, &new_query);
@@ -3481,22 +4184,22 @@ impl EngineDispatcher<'_> {
                         rebuild_req_buffer(sess);
                     }
                     ibex_config::HttpReqAction::SetUri { fmt } => {
-                        let new_uri = format_sample_string(fmt, &ctx, &registry);
+                        let new_uri = format_sample_string(fmt, &ctx, registry);
                         sess.req_uri = Some(new_uri);
                         rebuild_req_buffer(sess);
                     }
                     ibex_config::HttpReqAction::SetMethod { fmt } => {
-                        let new_method = format_sample_string(fmt, &ctx, &registry);
+                        let new_method = format_sample_string(fmt, &ctx, registry);
                         sess.req_method = Some(new_method);
                         rebuild_req_buffer(sess);
                     }
                     ibex_config::HttpReqAction::SetSrc { expr } => {
                         let val = if let Ok(e) = Expr::parse(expr) {
-                            e.eval_sample(&registry, &ctx)
+                            e.eval_sample(registry, &ctx)
                                 .map(|smp| sample_to_string(&smp))
                                 .unwrap_or_default()
                         } else {
-                            format_sample_string(expr, &ctx, &registry)
+                            format_sample_string(expr, &ctx, registry)
                         };
                         if let Ok(ip) = val.parse::<IpAddr>() {
                             sess.client_addr = Some(SocketAddr::new(ip, 0));
@@ -3504,11 +4207,11 @@ impl EngineDispatcher<'_> {
                     }
                     ibex_config::HttpReqAction::SetDst { expr } => {
                         let val = if let Ok(e) = Expr::parse(expr) {
-                            e.eval_sample(&registry, &ctx)
+                            e.eval_sample(registry, &ctx)
                                 .map(|smp| sample_to_string(&smp))
                                 .unwrap_or_default()
                         } else {
-                            format_sample_string(expr, &ctx, &registry)
+                            format_sample_string(expr, &ctx, registry)
                         };
                         if let Ok(ip) = val.parse::<IpAddr>() {
                             sess.server_addr = Some(SocketAddr::new(ip, 0));
@@ -3516,17 +4219,46 @@ impl EngineDispatcher<'_> {
                     }
                     ibex_config::HttpReqAction::SetVar { var_name, expr } => {
                         let val = if let Ok(e) = Expr::parse(expr) {
-                            e.eval_sample(&registry, &ctx)
+                            e.eval_sample(registry, &ctx)
                                 .map(|smp| sample_to_string(&smp))
                                 .unwrap_or_default()
                         } else {
-                            format_sample_string(expr, &ctx, &registry)
+                            format_sample_string(expr, &ctx, registry)
                         };
-                        CURRENT_VARS.with(|v| {
-                            v.borrow_mut().insert(var_name.clone(), val);
-                        });
+                        if var_name.starts_with("proc.") {
+                            ibex_sample::set_proc_var(var_name, val);
+                        } else {
+                            if var_name.starts_with("sess.") {
+                                sess.sess_vars.insert(var_name.clone(), val.clone());
+                            } else {
+                                sess.req_vars.insert(var_name.clone(), val.clone());
+                            }
+                            CURRENT_VARS.with(|v| {
+                                v.borrow_mut().insert(var_name.clone(), val);
+                            });
+                        }
+                    }
+                    ibex_config::HttpReqAction::SetVarFmt { var_name, fmt } => {
+                        let val = format_sample_string(fmt, &ctx, registry);
+                        if var_name.starts_with("proc.") {
+                            ibex_sample::set_proc_var(var_name, val);
+                        } else {
+                            if var_name.starts_with("sess.") {
+                                sess.sess_vars.insert(var_name.clone(), val.clone());
+                            } else {
+                                sess.req_vars.insert(var_name.clone(), val.clone());
+                            }
+                            CURRENT_VARS.with(|v| {
+                                v.borrow_mut().insert(var_name.clone(), val);
+                            });
+                        }
                     }
                     ibex_config::HttpReqAction::UnsetVar { var_name } => {
+                        if var_name.starts_with("sess.") {
+                            sess.sess_vars.remove(var_name);
+                        } else {
+                            sess.req_vars.remove(var_name);
+                        }
                         CURRENT_VARS.with(|v| {
                             v.borrow_mut().remove(var_name);
                         });
@@ -3536,7 +4268,7 @@ impl EngineDispatcher<'_> {
                     }
                     ibex_config::HttpReqAction::SetTimeout { timeout_type, timeout_val } => {
                         let ms = if let Ok(expr) = Expr::parse(timeout_val) {
-                            if let Some(smp) = expr.eval_sample(&registry, &ctx) {
+                            if let Some(smp) = expr.eval_sample(registry, &ctx) {
                                 match smp {
                                     Sample::Sint(n) => u32::try_from(n).unwrap_or(0),
                                     Sample::Str(ref s) => parse_timeout_val(s),
@@ -3596,7 +4328,7 @@ impl EngineDispatcher<'_> {
                         }
                     }
                     ibex_config::HttpReqAction::SetHeader { name, fmt } => {
-                        let val = format_sample_string(fmt, &ctx, &registry);
+                        let val = format_sample_string(fmt, &ctx, registry);
                         let added = name.len() + val.len() + 4;
                         let total = REWRITE_ADDED_BYTES.get() + added;
                         if total > MAX_REWRITE_LIMIT.get() {
@@ -3616,7 +4348,7 @@ impl EngineDispatcher<'_> {
                         }
                     }
                     ibex_config::HttpReqAction::AddHeader { name, fmt } => {
-                        let val = format_sample_string(fmt, &ctx, &registry);
+                        let val = format_sample_string(fmt, &ctx, registry);
                         let added = name.len() + val.len() + 4;
                         let total = REWRITE_ADDED_BYTES.get() + added;
                         if total > MAX_REWRITE_LIMIT.get() {
@@ -3661,6 +4393,46 @@ impl EngineDispatcher<'_> {
                             sess.srv_state = ScState::Closed;
                             return Ok(Some(()));
                         }
+                    ibex_config::HttpReqAction::ScIncGpc0 { sc } => {
+                        let sc_idx = *sc as usize;
+                        if sc_idx < 3 {
+                            if let Some((t_idx, ref key)) = sess.tracked_sc[sc_idx] {
+                                if let Some(tbl) = proxies.get(t_idx).and_then(|p| p.stick_table.as_ref()) {
+                                    let _ = tbl.update_entry(key, |data| {
+                                        data.gpc0 = data.gpc0.saturating_add(1);
+                                        data.last_updated = std::time::Instant::now();
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    ibex_config::HttpReqAction::ScIncGpc1 { sc } => {
+                        let sc_idx = *sc as usize;
+                        if sc_idx < 3 {
+                            if let Some((t_idx, ref key)) = sess.tracked_sc[sc_idx] {
+                                if let Some(tbl) = proxies.get(t_idx).and_then(|p| p.stick_table.as_ref()) {
+                                    let _ = tbl.update_entry(key, |data| {
+                                        data.gpc1 = data.gpc1.saturating_add(1);
+                                        data.last_updated = std::time::Instant::now();
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    ibex_config::HttpReqAction::ScSetGpt0 { sc, expr } => {
+                        let sc_idx = *sc as usize;
+                        if sc_idx < 3 {
+                            if let Some((t_idx, ref key)) = sess.tracked_sc[sc_idx] {
+                                let val = resolve_gpt0_val(expr, registry, &ctx);
+                                if let Some(tbl) = proxies.get(t_idx).and_then(|p| p.stick_table.as_ref()) {
+                                    let _ = tbl.update_entry(key, |data| {
+                                        data.gpt0 = val;
+                                        data.last_updated = std::time::Instant::now();
+                                    });
+                                }
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -3677,6 +4449,22 @@ impl EngineDispatcher<'_> {
         // 3. Resolve backend and server
         let be_idx = Self::resolve_backend(entry, proxies);
         entry.backend_idx = be_idx;
+
+        // Evaluate backend tcp-request content rules
+        if !proxies[be_idx].tcp_req_content_rules.is_empty() {
+            let res = eval_tcp_req_content_rules(
+                &proxies[be_idx],
+                proxies,
+                sample_registry(),
+                &mut entry.sess,
+                now,
+            );
+            if res == ContentEvalResult::Reject {
+                entry.sess.cli_state = ScState::Closed;
+                entry.sess.srv_state = ScState::Closed;
+                return None;
+            }
+        }
 
         // Update backend timeouts
         CURRENT_TIMEOUTS.with(|t| {
@@ -3762,14 +4550,14 @@ impl EngineDispatcher<'_> {
         for rule in &raw_res {
             let action = match &rule.action {
                 ibex_config::HttpResAction::SetHeader { name, fmt } => {
-                    let formatted_fmt = format_sample_string(fmt, &res_ctx, &registry);
+                    let formatted_fmt = format_sample_string(fmt, &res_ctx, registry);
                     ibex_config::HttpResAction::SetHeader {
                         name: name.clone(),
                         fmt: formatted_fmt,
                     }
                 }
                 ibex_config::HttpResAction::AddHeader { name, fmt } => {
-                    let formatted_fmt = format_sample_string(fmt, &res_ctx, &registry);
+                    let formatted_fmt = format_sample_string(fmt, &res_ctx, registry);
                     ibex_config::HttpResAction::AddHeader {
                         name: name.clone(),
                         fmt: formatted_fmt,
@@ -3797,7 +4585,7 @@ impl EngineDispatcher<'_> {
             if let ibex_config::HttpAfterResAction::SetHeader { fmt, .. }
             | ibex_config::HttpAfterResAction::AddHeader { fmt, .. } = &mut action
             {
-                *fmt = format_sample_string(fmt, &res_ctx, &registry);
+                *fmt = format_sample_string(fmt, &res_ctx, registry);
             }
             after_rules.push(ibex_config::HttpAfterResRule {
                 action,
@@ -3896,20 +4684,21 @@ impl EngineDispatcher<'_> {
         poller: &mut Poller,
         now: Tick,
     ) {
-        let proxy_idx = entry.proxy_idx;
         let be_idx = Self::resolve_backend(entry, proxies);
         entry.backend_idx = be_idx;
 
-        if let Some(ref table) = proxies[proxy_idx].stick_table {
-            if let Some(cli_addr) = entry.sess.client_addr {
-                let key = StickKey::Ip(cli_addr.ip());
-                let _ = table.update_entry(&key, |data| {
-                    data.conn_cnt += 1;
-                    data.conn_cur += 1;
-                    if let Some(ref mut rate) = data.conn_rate {
-                        rate.tick(1);
-                    }
-                });
+        if !proxies[be_idx].tcp_req_content_rules.is_empty() {
+            let res = eval_tcp_req_content_rules(
+                &proxies[be_idx],
+                proxies,
+                sample_registry(),
+                &mut entry.sess,
+                now,
+            );
+            if res == ContentEvalResult::Reject {
+                entry.sess.cli_state = ScState::Closed;
+                entry.sess.srv_state = ScState::Closed;
+                return;
             }
         }
 
@@ -4154,11 +4943,18 @@ impl Dispatch for EngineDispatcher<'_> {
 /// Nothing is registered here now. The function stays because it is the one place the
 /// engine builds a registry: if map files ever need preloading from the parsed config,
 /// that belongs here, and `registry_tests` asserts nothing else creeps back in.
-fn build_sample_registry() -> Registry {
+static SAMPLE_REGISTRY: std::sync::LazyLock<Registry> = std::sync::LazyLock::new(Registry::new);
+
+pub(crate) fn sample_registry() -> &'static Registry {
+    &SAMPLE_REGISTRY
+}
+
+#[cfg(test)]
+pub(crate) fn build_sample_registry() -> Registry {
     Registry::new()
 }
 
-fn sample_to_string(smp: &Sample) -> String {
+pub(crate) fn sample_to_string(smp: &Sample) -> String {
     match smp {
         Sample::Str(s) => s.clone(),
         Sample::Sint(n) => n.to_string(),
@@ -4168,6 +4964,62 @@ fn sample_to_string(smp: &Sample) -> String {
         Sample::Bin(b) => String::from_utf8_lossy(b).to_string(),
         Sample::Meth(m) => m.as_str().to_string(),
     }
+}
+
+pub(crate) fn resolve_gpt0_val(
+    expr_str: &str,
+    registry: &Registry,
+    ctx: &SampleContext,
+) -> u32 {
+    let trimmed = expr_str.trim().trim_matches('"').trim_matches('\'');
+    if let Ok(n) = trimmed.parse::<u32>() {
+        return n;
+    }
+    if let Some(hex) = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {
+        if let Ok(n) = u32::from_str_radix(hex, 16) {
+            return n;
+        }
+    }
+    if let Ok(e) = Expr::parse(expr_str) {
+        if let Some(smp) = e.eval_sample(registry, ctx) {
+            return match smp {
+                Sample::Sint(n) => u32::try_from(n).unwrap_or(0),
+                Sample::Str(ref s) => s.parse::<u32>().unwrap_or(0),
+                _ => 0,
+            };
+        }
+    }
+    0
+}
+
+pub(crate) fn resolve_sample_stick_key(
+    expr_str: &str,
+    registry: &Registry,
+    ctx: &SampleContext,
+) -> Option<StickKey> {
+    if expr_str == "src" {
+        return ctx.client_addr.map(|a| StickKey::Ip(a.ip()));
+    }
+    if let Ok(expr) = Expr::parse(expr_str) {
+        if let Some(smp) = expr.eval_sample(registry, ctx) {
+            return match smp {
+                Sample::Ipv4(ip) => Some(StickKey::Ip(std::net::IpAddr::V4(ip))),
+                Sample::Ipv6(ip) => Some(StickKey::Ip(std::net::IpAddr::V6(ip))),
+                Sample::Sint(i) => Some(StickKey::Integer(i.cast_unsigned())),
+                Sample::Str(s) => {
+                    if let Ok(ip) = s.parse::<std::net::IpAddr>() {
+                        Some(StickKey::Ip(ip))
+                    } else {
+                        Some(StickKey::String(s))
+                    }
+                }
+                Sample::Bin(b) => Some(StickKey::Binary(b)),
+                Sample::Bool(b) => Some(StickKey::Integer(u64::from(b))),
+                Sample::Meth(m) => Some(StickKey::String(m.as_str().to_string())),
+            };
+        }
+    }
+    ctx.client_addr.map(|a| StickKey::Ip(a.ip()))
 }
 
 fn split_uri(uri: &str) -> (&str, &str, &str) {
@@ -4215,7 +5067,7 @@ fn rebuild_uri(prefix: &str, path: &str, query: &str) -> String {
     res
 }
 
-fn format_sample_string(fmt: &str, ctx: &SampleContext, registry: &Registry) -> String {
+pub(crate) fn format_sample_string(fmt: &str, ctx: &SampleContext, registry: &Registry) -> String {
     let mut out = String::with_capacity(fmt.len());
     let mut chars = fmt.chars().peekable();
 

@@ -74,9 +74,30 @@ impl Listener {
         net::bind_any(&fd, &any)?;
         net::listen(&fd, backlog)?;
 
+        let bound_addr = if addr.port() == 0 {
+            net::getsockname(&fd)
+                .ok()
+                .and_then(|sa| match sa {
+                    rustix::net::SocketAddrAny::V4(v4) => Some(SocketAddr::V4(std::net::SocketAddrV4::new(
+                        *v4.ip(),
+                        v4.port(),
+                    ))),
+                    rustix::net::SocketAddrAny::V6(v6) => Some(SocketAddr::V6(std::net::SocketAddrV6::new(
+                        *v6.ip(),
+                        v6.port(),
+                        v6.flowinfo(),
+                        v6.scope_id(),
+                    ))),
+                    _ => None,
+                })
+                .unwrap_or(addr)
+        } else {
+            addr
+        };
+
         Ok(Listener {
             fd,
-            addr,
+            addr: bound_addr,
             proxy,
             maxconn: 0,
             nbconn: 0,

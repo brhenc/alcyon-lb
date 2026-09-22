@@ -7,12 +7,13 @@ use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
-use crate::ast::{LogTarget, 
+use crate::ast::{
     AclCondition, AclRule, AclTerm, BackendSection, BalanceAlgorithm, BindConfig, Config,
-    DefaultServerConfig, DefaultsSection, FrontendSection, GlobalSection,
+    DefaultServerConfig, DefaultsSection, FrontendSection, GlobalSection, GlobalSetVar,
     HttpAfterResAction, HttpAfterResRule, HttpReqAction, HttpReqRule, HttpResAction, HttpResRule,
-    ListenSection, LogConfig, LogFacility, LogLevel, Mode, Server, StatsConfig, StickRule,
-    StickRuleType, StickTableConfigAst, TcpReqConnAction, TcpReqConnRule, TimeoutConfig,
+    ListenSection, LogConfig, LogFacility, LogLevel, LogTarget, Mode, Server, StatsConfig,
+    StickRule, StickRuleType, StickTableConfigAst, TcpReqConnAction, TcpReqConnRule,
+    TcpReqContentAction, TcpReqContentRule, TcpReqSessionAction, TcpReqSessionRule, TimeoutConfig,
     UseBackendRule,
 };
 use crate::error::ConfigError;
@@ -263,7 +264,10 @@ fn parse_listen_header(
         balance: BalanceAlgorithm::RoundRobin,
         stick_table: None,
         stick_rules: Vec::new(),
+        tcp_req_inspect_delay: defaults.and_then(|d| d.tcp_req_inspect_delay),
         tcp_req_conn_rules: Vec::new(),
+        tcp_req_session_rules: Vec::new(),
+        tcp_req_content_rules: Vec::new(),
         http_req_rules: Vec::new(),
         http_res_rules: Vec::new(),
         http_after_res_rules: Vec::new(),
@@ -340,7 +344,10 @@ fn parse_frontend_header(
         log_health_checks: false,
         stick_table: None,
         stick_rules: Vec::new(),
+        tcp_req_inspect_delay: defaults.and_then(|d| d.tcp_req_inspect_delay),
         tcp_req_conn_rules: Vec::new(),
+        tcp_req_session_rules: Vec::new(),
+        tcp_req_content_rules: Vec::new(),
         http_req_rules: Vec::new(),
         http_res_rules: Vec::new(),
         http_after_res_rules: Vec::new(),
@@ -390,6 +397,8 @@ fn parse_backend_header(
         acls: Vec::new(),
         stick_table: None,
         stick_rules: Vec::new(),
+        tcp_req_inspect_delay: defaults.and_then(|d| d.tcp_req_inspect_delay),
+        tcp_req_content_rules: Vec::new(),
         http_req_rules: Vec::new(),
         http_res_rules: Vec::new(),
         http_after_res_rules: Vec::new(),
@@ -484,6 +493,30 @@ fn parse_global_directive(
             }
             Ok(())
         }
+        "set-var" => {
+            if tokens.len() >= 3 {
+                let var_name = tokens[1].text.clone();
+                let expr = tokens[2..].iter().map(|t| t.text.as_str()).collect::<Vec<_>>().join(" ");
+                global.set_vars.push(GlobalSetVar {
+                    name: var_name,
+                    expr,
+                    is_fmt: false,
+                });
+            }
+            Ok(())
+        }
+        "set-var-fmt" => {
+            if tokens.len() >= 3 {
+                let var_name = tokens[1].text.clone();
+                let expr = tokens[2..].iter().map(|t| t.text.as_str()).collect::<Vec<_>>().join(" ");
+                global.set_vars.push(GlobalSetVar {
+                    name: var_name,
+                    expr,
+                    is_fmt: true,
+                });
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
@@ -501,6 +534,12 @@ fn parse_defaults_directive(
             Ok(())
         }
         "timeout" => parse_timeout_directive(&mut defaults.timeouts, tokens, kw),
+        "tcp-request" => {
+            if tokens.len() >= 3 && tokens[1].text == "inspect-delay" {
+                defaults.tcp_req_inspect_delay = Some(parse_timeout(&tokens[2], "tcp-request inspect-delay")?);
+            }
+            Ok(())
+        }
         "log" => {
             defaults.log_global |= parse_log(&mut defaults.logs, tokens, kw)?;
             Ok(())
@@ -595,7 +634,7 @@ fn parse_listen_directive(
         "track-sc0" | "track-sc1" | "track-sc2" => {
             parse_track_rule(&mut proxy.stick_rules, tokens, kw)
         }
-        "tcp-request" => parse_tcp_req_conn_rule(&mut proxy.tcp_req_conn_rules, tokens, kw),
+        "tcp-request" => parse_listen_tcp_request(proxy, tokens, kw),
         "http-request" => parse_http_req_rule(&mut proxy.http_req_rules, tokens, kw),
         "http-response" => parse_http_res_rule(&mut proxy.http_res_rules, tokens, kw),
         "http-after-response" => {
@@ -626,7 +665,7 @@ fn parse_frontend_directive(
             fe.accept_proxy_v2 = true;
             Ok(())
         }
-        "tcp-request" => parse_tcp_req_conn_rule(&mut fe.tcp_req_conn_rules, tokens, kw),
+        "tcp-request" => parse_frontend_tcp_request(fe, tokens, kw),
         "http-request" => parse_http_req_rule(&mut fe.http_req_rules, tokens, kw),
         "http-response" => parse_http_res_rule(&mut fe.http_res_rules, tokens, kw),
         "http-after-response" => {
@@ -762,6 +801,7 @@ fn parse_backend_directive(
         "dispatch" => parse_dispatch(kw),
         "default-server" => parse_default_server(&mut be.default_server, tokens, kw),
         "server" => parse_server(&mut be.servers, be.default_server.as_ref(), tokens, kw),
+        "tcp-request" => parse_backend_tcp_request(be, tokens, kw),
         "http-request" => parse_http_req_rule(&mut be.http_req_rules, tokens, kw),
         "http-response" => parse_http_res_rule(&mut be.http_res_rules, tokens, kw),
         "http-after-response" => {
@@ -1578,47 +1618,119 @@ fn parse_default_backend(
     Ok(())
 }
 
-fn parse_tcp_req_conn_rule(
+fn parse_track_sc_args(
+    tokens: &[Token],
+    start: usize,
+) -> Result<(String, Option<String>, Option<usize>), ConfigError> {
+    if tokens.len() <= start {
+        return Err(ConfigError::new(
+            tokens.get(start - 1).map_or(0, |t| t.line),
+            tokens.get(start - 1).map_or(0, |t| t.col),
+            "track-sc* expects sample expression",
+        ));
+    }
+    let expr = tokens[start].text.clone();
+    let mut table = None;
+    let mut cond_start = None;
+    let mut i = start + 1;
+    while i < tokens.len() {
+        if tokens[i].text == "table" && i + 1 < tokens.len() {
+            table = Some(tokens[i + 1].text.clone());
+            i += 2;
+        } else if tokens[i].text == "if" || tokens[i].text == "unless" {
+            cond_start = Some(i);
+            break;
+        } else {
+            i += 1;
+        }
+    }
+    Ok((expr, table, cond_start))
+}
+
+fn parse_rule_condition(
+    tokens: &[Token],
+    start: usize,
+) -> Result<(Option<usize>, Option<AclCondition>), ConfigError> {
+    let cond_idx = find_cond_idx(tokens, start);
+    let cond = match cond_idx {
+        Some(idx) => parse_acl_condition_from_tokens(&tokens[idx..])?,
+        None => None,
+    };
+    Ok((cond_idx, cond))
+}
+
+fn join_tokens_until(tokens: &[Token], start: usize, cond_idx: Option<usize>) -> String {
+    let limit = cond_idx.unwrap_or(tokens.len());
+    tokens[start..limit]
+        .iter()
+        .map(|t| t.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn parse_sc_counter_action(
+    act_str: &str,
+    prefix: &str,
+    act_tok: &Token,
+) -> Result<Option<u8>, ConfigError> {
+    if act_str == prefix {
+        return Ok(Some(0));
+    }
+    if let Some(rest) = act_str.strip_prefix(prefix) {
+        if !rest.starts_with('(') {
+            return Err(ConfigError::new(
+                act_tok.line,
+                act_tok.col,
+                format!("invalid stick table track ID. Expects {prefix}(<Track ID>)"),
+            ));
+        }
+        if !rest.ends_with(')') {
+            return Err(ConfigError::new(
+                act_tok.line,
+                act_tok.col,
+                format!("missing closing parenthesis in <{act_str}>"),
+            ));
+        }
+        let inner = &rest[1..rest.len() - 1];
+        let val = inner.parse::<u8>().map_err(|_| {
+            ConfigError::new(
+                act_tok.line,
+                act_tok.col,
+                format!("invalid stick counter index in <{act_str}>"),
+            )
+        })?;
+        if val > 2 {
+            return Err(ConfigError::new(
+                act_tok.line,
+                act_tok.col,
+                format!("stick counter index must be 0, 1, or 2 in <{act_str}>"),
+            ));
+        }
+        return Ok(Some(val));
+    }
+    Ok(None)
+}
+
+
+fn parse_tcp_req_connection(
     rules: &mut Vec<TcpReqConnRule>,
     tokens: &[Token],
     kw: &Token,
 ) -> Result<(), ConfigError> {
-    if tokens.len() < 3 || tokens[1].text != "connection" {
+    if tokens.len() < 3 {
         return Err(ConfigError::new(
             kw.line,
             kw.col,
-            "<tcp-request> expects 'connection <action>'",
+            "<tcp-request connection> expects <action>",
         ));
     }
     let act_tok = &tokens[2];
     match act_tok.text.as_str() {
         "track-sc0" | "track-sc1" | "track-sc2" => {
-            if tokens.len() < 4 {
-                return Err(ConfigError::new(
-                    kw.line,
-                    kw.col,
-                    "<tcp-request connection track-sc*> expects sample expression.",
-                ));
-            }
-            let expr = tokens[3].text.clone();
-            let mut table = None;
-            let mut cond_start = None;
-            let mut i = 4;
-            while i < tokens.len() {
-                if tokens[i].text == "table" && i + 1 < tokens.len() {
-                    table = Some(tokens[i + 1].text.clone());
-                    i += 2;
-                } else if tokens[i].text == "if" || tokens[i].text == "unless" {
-                    cond_start = Some(i);
-                    break;
-                } else {
-                    i += 1;
-                }
-            }
-            let cond = if let Some(idx) = cond_start {
-                parse_acl_condition_from_tokens(&tokens[idx..])?
-            } else {
-                None
+            let (expr, table, cond_start) = parse_track_sc_args(tokens, 3)?;
+            let cond = match cond_start {
+                Some(idx) => parse_acl_condition_from_tokens(&tokens[idx..])?,
+                None => None,
             };
             let action = match act_tok.text.as_str() {
                 "track-sc1" => TcpReqConnAction::TrackSc1 { expr, table },
@@ -1628,39 +1740,42 @@ fn parse_tcp_req_conn_rule(
             rules.push(TcpReqConnRule { action, cond });
         }
         "silent-drop" => {
-            let cond = if tokens.len() > 3 {
-                parse_acl_condition_from_tokens(&tokens[3..])?
-            } else {
-                None
-            };
-            rules.push(TcpReqConnRule {
-                action: TcpReqConnAction::SilentDrop,
-                cond,
-            });
+            let (_, cond) = parse_rule_condition(tokens, 3)?;
+            rules.push(TcpReqConnRule { action: TcpReqConnAction::SilentDrop, cond });
         }
         "reject" => {
-            let cond = if tokens.len() > 3 {
-                parse_acl_condition_from_tokens(&tokens[3..])?
-            } else {
-                None
-            };
-            rules.push(TcpReqConnRule {
-                action: TcpReqConnAction::Reject,
-                cond,
-            });
+            let (_, cond) = parse_rule_condition(tokens, 3)?;
+            rules.push(TcpReqConnRule { action: TcpReqConnAction::Reject, cond });
         }
         "accept" => {
-            let cond = if tokens.len() > 3 {
-                parse_acl_condition_from_tokens(&tokens[3..])?
-            } else {
-                None
-            };
-            rules.push(TcpReqConnRule {
-                action: TcpReqConnAction::Accept,
-                cond,
-            });
+            let (_, cond) = parse_rule_condition(tokens, 3)?;
+            rules.push(TcpReqConnRule { action: TcpReqConnAction::Accept, cond });
+        }
+        "set-src" => {
+            let (cond_idx, cond) = parse_rule_condition(tokens, 3)?;
+            let expr = join_tokens_until(tokens, 3, cond_idx);
+            rules.push(TcpReqConnRule { action: TcpReqConnAction::SetSrc { expr }, cond });
+        }
+        "set-dst" => {
+            let (cond_idx, cond) = parse_rule_condition(tokens, 3)?;
+            let expr = join_tokens_until(tokens, 3, cond_idx);
+            rules.push(TcpReqConnRule { action: TcpReqConnAction::SetDst { expr }, cond });
+        }
+        "do-log" => {
+            return Err(ConfigError::new(
+                act_tok.line,
+                act_tok.col,
+                "action do-log is not supported in this build",
+            ));
         }
         other => {
+            if other.starts_with("lua.") {
+                return Err(ConfigError::new(
+                    act_tok.line,
+                    act_tok.col,
+                    format!("lua actions require Lua support, which this build does not have: <{other}>"),
+                ));
+            }
             return Err(ConfigError::new(
                 act_tok.line,
                 act_tok.col,
@@ -1669,6 +1784,399 @@ fn parse_tcp_req_conn_rule(
         }
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn parse_tcp_req_session(
+    rules: &mut Vec<TcpReqSessionRule>,
+    tokens: &[Token],
+    kw: &Token,
+) -> Result<(), ConfigError> {
+    if tokens.len() < 3 {
+        return Err(ConfigError::new(
+            kw.line,
+            kw.col,
+            "<tcp-request session> expects <action>",
+        ));
+    }
+    let act_tok = &tokens[2];
+    let act_str = &act_tok.text;
+    if act_str.starts_with("set-var(") || act_str.starts_with("set-var-fmt(") {
+        let is_fmt = act_str.starts_with("set-var-fmt(");
+        let var_name = act_str
+            .trim_start_matches("set-var(")
+            .trim_start_matches("set-var-fmt(")
+            .trim_end_matches(')')
+            .to_string();
+        let (cond_idx, cond) = parse_rule_condition(tokens, 3)?;
+        let expr = join_tokens_until(tokens, 3, cond_idx);
+        let action = if is_fmt {
+            TcpReqSessionAction::SetVarFmt { var_name, fmt: expr }
+        } else {
+            TcpReqSessionAction::SetVar { var_name, expr }
+        };
+        rules.push(TcpReqSessionRule { action, cond });
+    } else if act_str.starts_with("unset-var(") {
+        let var_name = act_str
+            .trim_start_matches("unset-var(")
+            .trim_end_matches(')')
+            .to_string();
+        let (_, cond) = parse_rule_condition(tokens, 3)?;
+        rules.push(TcpReqSessionRule { action: TcpReqSessionAction::UnsetVar { var_name }, cond });
+    } else if let Some(sc) = parse_sc_counter_action(act_str, "sc-inc-gpc0", act_tok)? {
+        let (_, cond) = parse_rule_condition(tokens, 3)?;
+        rules.push(TcpReqSessionRule { action: TcpReqSessionAction::ScIncGpc0 { sc }, cond });
+    } else if let Some(sc) = parse_sc_counter_action(act_str, "sc-inc-gpc1", act_tok)? {
+        let (_, cond) = parse_rule_condition(tokens, 3)?;
+        rules.push(TcpReqSessionRule { action: TcpReqSessionAction::ScIncGpc1 { sc }, cond });
+    } else if let Some(sc) = parse_sc_counter_action(act_str, "sc-set-gpt0", act_tok)? {
+        let (cond_idx, cond) = parse_rule_condition(tokens, 4)?;
+        let expr = join_tokens_until(tokens, 3, cond_idx);
+        if expr.is_empty() {
+            return Err(ConfigError::new(
+                act_tok.line,
+                act_tok.col,
+                "<tcp-request session sc-set-gpt0> expects value or expression",
+            ));
+        }
+        rules.push(TcpReqSessionRule { action: TcpReqSessionAction::ScSetGpt0 { sc, expr }, cond });
+    } else {
+        match act_str.as_str() {
+            "track-sc0" | "track-sc1" | "track-sc2" => {
+                let (expr, table, cond_start) = parse_track_sc_args(tokens, 3)?;
+                let cond = match cond_start {
+                    Some(idx) => parse_acl_condition_from_tokens(&tokens[idx..])?,
+                    None => None,
+                };
+                let action = match act_str.as_str() {
+                    "track-sc1" => TcpReqSessionAction::TrackSc1 { expr, table },
+                    "track-sc2" => TcpReqSessionAction::TrackSc2 { expr, table },
+                    _ => TcpReqSessionAction::TrackSc0 { expr, table },
+                };
+                rules.push(TcpReqSessionRule { action, cond });
+            }
+            "silent-drop" => {
+                let (_, cond) = parse_rule_condition(tokens, 3)?;
+                rules.push(TcpReqSessionRule { action: TcpReqSessionAction::SilentDrop, cond });
+            }
+            "reject" => {
+                let (_, cond) = parse_rule_condition(tokens, 3)?;
+                rules.push(TcpReqSessionRule { action: TcpReqSessionAction::Reject, cond });
+            }
+            "accept" => {
+                let (_, cond) = parse_rule_condition(tokens, 3)?;
+                rules.push(TcpReqSessionRule { action: TcpReqSessionAction::Accept, cond });
+            }
+            "set-src" => {
+                let (cond_idx, cond) = parse_rule_condition(tokens, 3)?;
+                let expr = join_tokens_until(tokens, 3, cond_idx);
+                rules.push(TcpReqSessionRule { action: TcpReqSessionAction::SetSrc { expr }, cond });
+            }
+            "set-dst" => {
+                let (cond_idx, cond) = parse_rule_condition(tokens, 3)?;
+                let expr = join_tokens_until(tokens, 3, cond_idx);
+                rules.push(TcpReqSessionRule { action: TcpReqSessionAction::SetDst { expr }, cond });
+            }
+            "attach-srv" => {
+                return Err(ConfigError::new(
+                    act_tok.line,
+                    act_tok.col,
+                    "action attach-srv is not supported in this build",
+                ));
+            }
+            "do-log" => {
+                return Err(ConfigError::new(
+                    act_tok.line,
+                    act_tok.col,
+                    "action do-log is not supported in this build",
+                ));
+            }
+            other => {
+                if other.starts_with("lua.") {
+                    return Err(ConfigError::new(
+                        act_tok.line,
+                        act_tok.col,
+                        format!("lua actions require Lua support, which this build does not have: <{other}>"),
+                    ));
+                }
+                return Err(ConfigError::new(
+                    act_tok.line,
+                    act_tok.col,
+                    format!("unknown tcp-request session action <{other}>"),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_tcp_content_var(
+    tokens: &[Token],
+    act_str: &str,
+) -> Result<Option<TcpReqContentRule>, ConfigError> {
+    if act_str.starts_with("set-var(") || act_str.starts_with("set-var-fmt(") {
+        let is_fmt = act_str.starts_with("set-var-fmt(");
+        let var_name = act_str
+            .trim_start_matches("set-var(")
+            .trim_start_matches("set-var-fmt(")
+            .trim_end_matches(')')
+            .to_string();
+        let (cond_idx, cond) = parse_rule_condition(tokens, 3)?;
+        let expr = join_tokens_until(tokens, 3, cond_idx);
+        let action = if is_fmt {
+            TcpReqContentAction::SetVarFmt { var_name, fmt: expr }
+        } else {
+            TcpReqContentAction::SetVar { var_name, expr }
+        };
+        Ok(Some(TcpReqContentRule { action, cond }))
+    } else if act_str.starts_with("unset-var(") {
+        let var_name = act_str
+            .trim_start_matches("unset-var(")
+            .trim_end_matches(')')
+            .to_string();
+        let (_, cond) = parse_rule_condition(tokens, 3)?;
+        Ok(Some(TcpReqContentRule {
+            action: TcpReqContentAction::UnsetVar { var_name },
+            cond,
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
+fn parse_tcp_content_switch_mode(
+    tokens: &[Token],
+) -> Result<TcpReqContentRule, ConfigError> {
+    let mut proto = None;
+    let (cond_idx, cond) = parse_rule_condition(tokens, 4)?;
+    let limit = cond_idx.unwrap_or(tokens.len());
+    let mut i = 4;
+    while i < limit {
+        if tokens[i].text == "proto" && i + 1 < limit {
+            proto = Some(tokens[i + 1].text.clone());
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    Ok(TcpReqContentRule {
+        action: TcpReqContentAction::SwitchModeHttp { proto },
+        cond,
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+fn parse_tcp_req_content(
+    rules: &mut Vec<TcpReqContentRule>,
+    tokens: &[Token],
+    kw: &Token,
+) -> Result<(), ConfigError> {
+    if tokens.len() < 3 {
+        return Err(ConfigError::new(
+            kw.line,
+            kw.col,
+            "<tcp-request content> expects <action>",
+        ));
+    }
+    let act_tok = &tokens[2];
+    let act_str = &act_tok.text;
+    if let Some(rule) = parse_tcp_content_var(tokens, act_str)? {
+        rules.push(rule);
+    } else if let Some(sc) = parse_sc_counter_action(act_str, "sc-inc-gpc0", act_tok)? {
+        let (_, cond) = parse_rule_condition(tokens, 3)?;
+        rules.push(TcpReqContentRule { action: TcpReqContentAction::ScIncGpc0 { sc }, cond });
+    } else if let Some(sc) = parse_sc_counter_action(act_str, "sc-inc-gpc1", act_tok)? {
+        let (_, cond) = parse_rule_condition(tokens, 3)?;
+        rules.push(TcpReqContentRule { action: TcpReqContentAction::ScIncGpc1 { sc }, cond });
+    } else if let Some(sc) = parse_sc_counter_action(act_str, "sc-set-gpt0", act_tok)? {
+        let (cond_idx, cond) = parse_rule_condition(tokens, 4)?;
+        let expr = join_tokens_until(tokens, 3, cond_idx);
+        if expr.is_empty() {
+            return Err(ConfigError::new(
+                act_tok.line,
+                act_tok.col,
+                "<tcp-request content sc-set-gpt0> expects value or expression",
+            ));
+        }
+        rules.push(TcpReqContentRule { action: TcpReqContentAction::ScSetGpt0 { sc, expr }, cond });
+    } else if act_str.starts_with("lua.") {
+        return Err(ConfigError::new(
+            act_tok.line,
+            act_tok.col,
+            format!("lua actions require Lua support, which this build does not have: <{act_str}>"),
+        ));
+    } else {
+        match act_str.as_str() {
+            "track-sc0" | "track-sc1" | "track-sc2" => {
+                let (expr, table, cond_start) = parse_track_sc_args(tokens, 3)?;
+                let cond = match cond_start {
+                    Some(idx) => parse_acl_condition_from_tokens(&tokens[idx..])?,
+                    None => None,
+                };
+                let action = match act_str.as_str() {
+                    "track-sc1" => TcpReqContentAction::TrackSc1 { expr, table },
+                    "track-sc2" => TcpReqContentAction::TrackSc2 { expr, table },
+                    _ => TcpReqContentAction::TrackSc0 { expr, table },
+                };
+                rules.push(TcpReqContentRule { action, cond });
+            }
+            "silent-drop" => {
+                let (_, cond) = parse_rule_condition(tokens, 3)?;
+                rules.push(TcpReqContentRule { action: TcpReqContentAction::SilentDrop, cond });
+            }
+            "reject" => {
+                let (_, cond) = parse_rule_condition(tokens, 3)?;
+                rules.push(TcpReqContentRule { action: TcpReqContentAction::Reject, cond });
+            }
+            "accept" => {
+                let (_, cond) = parse_rule_condition(tokens, 3)?;
+                rules.push(TcpReqContentRule { action: TcpReqContentAction::Accept, cond });
+            }
+            "set-src" => {
+                let (cond_idx, cond) = parse_rule_condition(tokens, 3)?;
+                let expr = join_tokens_until(tokens, 3, cond_idx);
+                rules.push(TcpReqContentRule { action: TcpReqContentAction::SetSrc { expr }, cond });
+            }
+            "set-dst" => {
+                let (cond_idx, cond) = parse_rule_condition(tokens, 3)?;
+                let expr = join_tokens_until(tokens, 3, cond_idx);
+                rules.push(TcpReqContentRule { action: TcpReqContentAction::SetDst { expr }, cond });
+            }
+            "switch-mode" => {
+                rules.push(parse_tcp_content_switch_mode(tokens)?);
+            }
+            "use-service" => {
+                return Err(ConfigError::new(
+                    act_tok.line,
+                    act_tok.col,
+                    "action use-service is not supported in this build",
+                ));
+            }
+            "do-log" => {
+                return Err(ConfigError::new(
+                    act_tok.line,
+                    act_tok.col,
+                    "action do-log is not supported in this build",
+                ));
+            }
+            other => {
+                return Err(ConfigError::new(
+                    act_tok.line,
+                    act_tok.col,
+                    format!("unknown tcp-request content action <{other}>"),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_listen_tcp_request(
+    listen: &mut ListenSection,
+    tokens: &[Token],
+    kw: &Token,
+) -> Result<(), ConfigError> {
+    if tokens.len() < 2 {
+        return Err(ConfigError::new(
+            kw.line,
+            kw.col,
+            "missing argument for 'tcp-request'",
+        ));
+    }
+    match tokens[1].text.as_str() {
+        "inspect-delay" => {
+            if tokens.len() < 3 {
+                return Err(ConfigError::new(
+                    kw.line,
+                    kw.col,
+                    "<tcp-request inspect-delay> expects delay timeout",
+                ));
+            }
+            listen.tcp_req_inspect_delay = Some(parse_timeout(&tokens[2], "tcp-request inspect-delay")?);
+            Ok(())
+        }
+        "connection" => parse_tcp_req_connection(&mut listen.tcp_req_conn_rules, tokens, kw),
+        "session" => parse_tcp_req_session(&mut listen.tcp_req_session_rules, tokens, kw),
+        "content" => parse_tcp_req_content(&mut listen.tcp_req_content_rules, tokens, kw),
+        other => Err(ConfigError::new(
+            tokens[1].line,
+            tokens[1].col,
+            format!("unknown tcp-request subcommand <{other}>, expects 'inspect-delay', 'connection', 'session', or 'content'"),
+        )),
+    }
+}
+
+fn parse_frontend_tcp_request(
+    fe: &mut FrontendSection,
+    tokens: &[Token],
+    kw: &Token,
+) -> Result<(), ConfigError> {
+    if tokens.len() < 2 {
+        return Err(ConfigError::new(
+            kw.line,
+            kw.col,
+            "missing argument for 'tcp-request'",
+        ));
+    }
+    match tokens[1].text.as_str() {
+        "inspect-delay" => {
+            if tokens.len() < 3 {
+                return Err(ConfigError::new(
+                    kw.line,
+                    kw.col,
+                    "<tcp-request inspect-delay> expects delay timeout",
+                ));
+            }
+            fe.tcp_req_inspect_delay = Some(parse_timeout(&tokens[2], "tcp-request inspect-delay")?);
+            Ok(())
+        }
+        "connection" => parse_tcp_req_connection(&mut fe.tcp_req_conn_rules, tokens, kw),
+        "session" => parse_tcp_req_session(&mut fe.tcp_req_session_rules, tokens, kw),
+        "content" => parse_tcp_req_content(&mut fe.tcp_req_content_rules, tokens, kw),
+        other => Err(ConfigError::new(
+            tokens[1].line,
+            tokens[1].col,
+            format!("unknown tcp-request subcommand <{other}>, expects 'inspect-delay', 'connection', 'session', or 'content'"),
+        )),
+    }
+}
+
+fn parse_backend_tcp_request(
+    be: &mut BackendSection,
+    tokens: &[Token],
+    kw: &Token,
+) -> Result<(), ConfigError> {
+    if tokens.len() < 2 {
+        return Err(ConfigError::new(
+            kw.line,
+            kw.col,
+            "missing argument for 'tcp-request'",
+        ));
+    }
+    match tokens[1].text.as_str() {
+        "inspect-delay" => {
+            if tokens.len() < 3 {
+                return Err(ConfigError::new(
+                    kw.line,
+                    kw.col,
+                    "<tcp-request inspect-delay> expects delay timeout",
+                ));
+            }
+            be.tcp_req_inspect_delay = Some(parse_timeout(&tokens[2], "tcp-request inspect-delay")?);
+            Ok(())
+        }
+        "content" => parse_tcp_req_content(&mut be.tcp_req_content_rules, tokens, kw),
+        "connection" | "session" => Err(ConfigError::new(
+            tokens[1].line,
+            tokens[1].col,
+            format!("'tcp-request {}' is not allowed in a backend", tokens[1].text),
+        )),
+        other => Err(ConfigError::new(
+            tokens[1].line,
+            tokens[1].col,
+            format!("unknown tcp-request subcommand <{other}>, expects 'inspect-delay' or 'content'"),
+        )),
+    }
 }
 
 fn find_cond_idx(tokens: &[Token], start: usize) -> Option<usize> {
@@ -1731,6 +2239,23 @@ fn parse_http_req_rule(
             _ => HttpReqAction::TrackSc0 { expr, table },
         };
         rules.push(HttpReqRule { action, cond });
+    } else if let Some(sc) = parse_sc_counter_action(act_str, "sc-inc-gpc0", act_token)? {
+        let (_, cond) = parse_rule_condition(tokens, 2)?;
+        rules.push(HttpReqRule { action: HttpReqAction::ScIncGpc0 { sc }, cond });
+    } else if let Some(sc) = parse_sc_counter_action(act_str, "sc-inc-gpc1", act_token)? {
+        let (_, cond) = parse_rule_condition(tokens, 2)?;
+        rules.push(HttpReqRule { action: HttpReqAction::ScIncGpc1 { sc }, cond });
+    } else if let Some(sc) = parse_sc_counter_action(act_str, "sc-set-gpt0", act_token)? {
+        let (cond_idx, cond) = parse_rule_condition(tokens, 3)?;
+        let expr = join_tokens_until(tokens, 2, cond_idx);
+        if expr.is_empty() {
+            return Err(ConfigError::new(
+                act_token.line,
+                act_token.col,
+                "<http-request sc-set-gpt0> expects value or expression",
+            ));
+        }
+        rules.push(HttpReqRule { action: HttpReqAction::ScSetGpt0 { sc, expr }, cond });
     } else if act_str == "return" {
         let mut status = 200u16;
         let mut content_type = None;
@@ -2153,6 +2678,7 @@ fn parse_http_req_rule(
             cond,
         });
     } else if act_str.starts_with("set-var(") || act_str.starts_with("set-var-fmt(") {
+        let is_fmt = act_str.starts_with("set-var-fmt(");
         let var_name = act_token
             .text
             .trim_start_matches("set-var(")
@@ -2167,10 +2693,15 @@ fn parse_http_req_rule(
         } else {
             None
         };
-        rules.push(HttpReqRule {
-            action: HttpReqAction::SetVar { var_name, expr },
-            cond,
-        });
+        let action = if is_fmt {
+            HttpReqAction::SetVarFmt {
+                var_name,
+                fmt: expr,
+            }
+        } else {
+            HttpReqAction::SetVar { var_name, expr }
+        };
+        rules.push(HttpReqRule { action, cond });
     } else if act_str.starts_with("unset-var(") {
         let var_name = act_token
             .text

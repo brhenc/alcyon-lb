@@ -24,6 +24,7 @@ impl Expr {
     ///
     /// # Errors
     /// Returns an error if the expression syntax or matcher compilation fails.
+    #[allow(clippy::too_many_lines)]
     pub fn parse(input: &str) -> Result<Self, String> {
         let mut input = input.trim();
         if input.starts_with('{') && input.ends_with('}') {
@@ -33,18 +34,61 @@ impl Expr {
             return Err("Empty sample expression".to_string());
         }
 
-        let mut parts = input.split_whitespace();
-        let expr_part = parts
-            .next()
-            .ok_or_else(|| "Missing expression".to_string())?;
+        let (expr_part, matcher_part) = split_expr_and_matcher(input);
+        let chain = split_call_chain(expr_part);
+        if chain.is_empty() {
+            return Err("Missing expression".to_string());
+        }
 
-        // Parse fetch and converter chain: e.g. "fetch(arg),conv1(arg),conv2"
-        let chain: Vec<&str> = expr_part.split(',').collect();
         let (mut fetch_name, fetch_args) = parse_call(chain[0]);
+        if fetch_name.is_empty()
+            || !fetch_name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
+        {
+            return Err(format!("Invalid sample fetch name '{fetch_name}'"));
+        }
 
         let mut converters = Vec::new();
         for conv_str in &chain[1..] {
             let (c_name, c_args) = parse_call(conv_str);
+            if c_name.is_empty()
+                || !c_name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
+            {
+                return Err(format!("Invalid converter name '{c_name}'"));
+            }
+            if matches!(
+                c_name.as_str(),
+                "add" | "sub" | "mul" | "div" | "mod" | "and" | "or" | "xor"
+            ) {
+                if let Some(arg) = c_args.first() {
+                    let trimmed = arg.trim().trim_matches('"').trim_matches('\'');
+                    let is_int = trimmed.parse::<i64>().is_ok()
+                        || trimmed
+                            .strip_prefix("0x")
+                            .or_else(|| trimmed.strip_prefix("0X"))
+                            .is_some_and(|hex| i64::from_str_radix(hex, 16).is_ok());
+                    let var_name = if trimmed.starts_with("var(") && trimmed.ends_with(')') {
+                        &trimmed[4..trimmed.len() - 1]
+                    } else {
+                        trimmed
+                    };
+                    let is_var = var_name.starts_with("proc.")
+                        || var_name.starts_with("sess.")
+                        || var_name.starts_with("req.")
+                        || var_name.starts_with("txn.")
+                        || var_name.starts_with("res.");
+                    if !is_int && !is_var {
+                        return Err(format!(
+                            "invalid integer argument '{arg}' for converter '{c_name}'"
+                        ));
+                    }
+                } else {
+                    return Err(format!("missing argument for converter '{c_name}'"));
+                }
+            }
             converters.push((c_name, c_args));
         }
 
@@ -79,22 +123,25 @@ impl Expr {
         let mut pattern = String::new();
         let mut case_insensitive = false;
 
-        while let Some(arg) = parts.next() {
-            if arg == "-m" {
-                match_method = parts
-                    .next()
-                    .ok_or_else(|| "Missing matcher method after -m".to_string())?;
-            } else if arg == "-i" {
-                case_insensitive = true;
-            } else if arg == "-n" {
-                // Negative / no-op flag
-            } else if matches!(arg, "gt" | "ge" | "lt" | "le" | "eq" | "ne") {
-                match_method = arg;
-                if let Some(next_tok) = parts.next() {
-                    pattern = next_tok.to_string();
+        if let Some(m_str) = matcher_part {
+            let mut parts = m_str.split_whitespace();
+            while let Some(arg) = parts.next() {
+                if arg == "-m" {
+                    match_method = parts
+                        .next()
+                        .ok_or_else(|| "Missing matcher method after -m".to_string())?;
+                } else if arg == "-i" {
+                    case_insensitive = true;
+                } else if arg == "-n" {
+                    // Negative / no-op flag
+                } else if matches!(arg, "gt" | "ge" | "lt" | "le" | "eq" | "ne") {
+                    match_method = arg;
+                    if let Some(next_tok) = parts.next() {
+                        pattern = next_tok.to_string();
+                    }
+                } else if pattern.is_empty() {
+                    pattern = arg.to_string();
                 }
-            } else if pattern.is_empty() {
-                pattern = arg.to_string();
             }
         }
 
@@ -144,32 +191,143 @@ impl Expr {
         registry.eval(&self.fetch_name, &self.fetch_args, &conv_refs, ctx)
     }
 
+    /// Evaluates the expression against the sample context to produce all sample values.
+    #[must_use]
+    pub fn eval_all_samples(&self, registry: &Registry, ctx: &SampleContext) -> Vec<Sample> {
+        let conv_refs: Vec<(&str, Vec<String>)> = self
+            .converters
+            .iter()
+            .map(|(name, args)| (name.as_str(), args.clone()))
+            .collect();
+
+        registry.eval_all(&self.fetch_name, &self.fetch_args, &conv_refs, ctx)
+    }
+
     /// Evaluates the expression condition, returning `true` if the condition matches.
     #[must_use]
     pub fn eval(&self, registry: &Registry, ctx: &SampleContext) -> bool {
-        let sample = self.eval_sample(registry, ctx);
-        match (&self.matcher, sample) {
-            (Some(matcher), Some(smp)) => matcher.matches(&smp),
-            (None, Some(smp)) => match smp {
-                Sample::Bool(b) => b,
-                Sample::Sint(i) => i != 0,
-                _ => true,
-            },
-            _ => false,
+        let samples = self.eval_all_samples(registry, ctx);
+        if samples.is_empty() {
+            return false;
         }
+        if let Some(ref matcher) = self.matcher {
+            samples.iter().any(|smp| matcher.matches(smp))
+        } else {
+            samples.iter().any(|smp| match smp {
+                Sample::Bool(b) => *b,
+                Sample::Sint(i) => *i != 0,
+                _ => true,
+            })
+        }
+    }
+}
+
+fn split_expr_and_matcher(input: &str) -> (&str, Option<&str>) {
+    let mut paren_depth = 0usize;
+    let mut in_quote = None;
+    let mut split_pos = None;
+
+    for (i, ch) in input.char_indices() {
+        if let Some(q) = in_quote {
+            if ch == q {
+                in_quote = None;
+            }
+        } else if ch == '"' || ch == '\'' {
+            in_quote = Some(ch);
+        } else if ch == '(' {
+            paren_depth += 1;
+        } else if ch == ')' {
+            paren_depth = paren_depth.saturating_sub(1);
+        } else if paren_depth == 0 && (ch == ' ' || ch == '\t') {
+            split_pos = Some(i);
+            break;
+        }
+    }
+
+    if let Some(pos) = split_pos {
+        (&input[..pos], Some(input[pos..].trim_start()))
+    } else {
+        (input, None)
+    }
+}
+
+fn split_call_chain(expr_part: &str) -> Vec<&str> {
+    let mut calls = Vec::new();
+    let mut paren_depth = 0usize;
+    let mut in_quote = None;
+    let mut start = 0;
+
+    for (i, ch) in expr_part.char_indices() {
+        if let Some(q) = in_quote {
+            if ch == q {
+                in_quote = None;
+            }
+        } else if ch == '"' || ch == '\'' {
+            in_quote = Some(ch);
+        } else if ch == '(' {
+            paren_depth += 1;
+        } else if ch == ')' {
+            paren_depth = paren_depth.saturating_sub(1);
+        } else if ch == ',' && paren_depth == 0 {
+            calls.push(&expr_part[start..i]);
+            start = i + 1;
+        }
+    }
+    if start < expr_part.len() {
+        calls.push(&expr_part[start..]);
+    }
+    calls
+}
+
+fn unquote_arg(arg: &str) -> &str {
+    if (arg.starts_with('"') && arg.ends_with('"') && arg.len() >= 2)
+        || (arg.starts_with('\'') && arg.ends_with('\'') && arg.len() >= 2)
+    {
+        &arg[1..arg.len() - 1]
+    } else {
+        arg
     }
 }
 
 fn parse_call(input: &str) -> (String, Vec<String>) {
     let input = input.trim();
-    if let Some((name, rest)) = input.split_once('(') {
-        let args_str = rest.strip_suffix(')').unwrap_or(rest);
-        let args: Vec<String> = args_str
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        (name.trim().to_string(), args)
+    if let Some(open_idx) = input.find('(') {
+        let name = input[..open_idx].trim().to_string();
+        let rest = &input[open_idx + 1..];
+        let args_str = rest.rfind(')').map_or(rest, |close_idx| &rest[..close_idx]);
+
+        let mut args = Vec::new();
+        let mut paren_depth = 0usize;
+        let mut in_quote = None;
+        let mut start = 0;
+
+        for (i, ch) in args_str.char_indices() {
+            if let Some(q) = in_quote {
+                if ch == q {
+                    in_quote = None;
+                }
+            } else if ch == '"' || ch == '\'' {
+                in_quote = Some(ch);
+            } else if ch == '(' {
+                paren_depth += 1;
+            } else if ch == ')' {
+                paren_depth = paren_depth.saturating_sub(1);
+            } else if ch == ',' && paren_depth == 0 {
+                let arg = args_str[start..i].trim();
+                let unquoted = unquote_arg(arg);
+                args.push(unquoted.to_string());
+                start = i + 1;
+            }
+        }
+        if start <= args_str.len() {
+            let arg = args_str[start..].trim();
+            if !arg.is_empty() || !args.is_empty() {
+                let unquoted = unquote_arg(arg);
+                args.push(unquoted.to_string());
+            }
+        }
+
+        (name, args)
     } else {
         (input.to_string(), Vec::new())
     }
@@ -251,5 +409,14 @@ mod tests {
         // Shorthand 2: hdr(Host) -i example.com
         let expr_shorthand2 = Expr::parse("hdr(Host) -i example.com").unwrap();
         assert!(expr_shorthand2.eval(&registry, &ctx));
+
+        // Test var with regsub
+        crate::CURRENT_VARS.with(|v| {
+            v.borrow_mut().insert("sess.str3".to_string(), "this is a string".to_string());
+        });
+        let expr_var = Expr::parse("var(sess.str3),regsub(is a,is also a)").unwrap();
+        let val = expr_var.eval_sample(&registry, &ctx);
+        assert_eq!(val, Some(Sample::Str("this is also a string".to_string())));
     }
 }
+

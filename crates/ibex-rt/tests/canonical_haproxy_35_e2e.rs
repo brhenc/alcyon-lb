@@ -622,3 +622,233 @@ fn test_canonical_haproxy_35_backup_server_failover() {
         "app-backup must receive PROXY v2 header"
     );
 }
+
+#[test]
+fn test_stick_counter_actions_execution_across_scopes() {
+    let mock_be = MockServer::start("be_mock");
+    let be_addr = mock_be.addr;
+
+    let cfg_str = format!(
+        r"
+global
+    maxconn 100
+
+defaults
+    mode http
+    timeout client 5s
+    timeout server 5s
+    timeout connect 5s
+
+frontend fe_tcp_content
+    bind 127.0.0.1:0
+    stick-table type ip size 100 store gpc0,gpc1,gpt0
+    tcp-request content track-sc0 src
+    tcp-request content sc-inc-gpc0
+    tcp-request content sc-inc-gpc1
+    tcp-request content sc-set-gpt0 42
+    default_backend be_test
+
+frontend fe_tcp_session
+    bind 127.0.0.1:0
+    stick-table type ip size 100 store gpc0,gpc1,gpt0
+    tcp-request session track-sc0 src
+    tcp-request session sc-inc-gpc0
+    tcp-request session sc-inc-gpc1
+    tcp-request session sc-set-gpt0 99
+    default_backend be_test
+
+frontend fe_http_req
+    bind 127.0.0.1:0
+    stick-table type ip size 100 store gpc0,gpc1,gpt0
+    http-request track-sc0 src
+    http-request sc-inc-gpc0
+    http-request sc-inc-gpc1
+    http-request sc-set-gpt0 123
+    default_backend be_test
+
+frontend fe_control
+    bind 127.0.0.1:0
+    stick-table type ip size 100 store gpc0,gpc1,gpt0
+    tcp-request content track-sc0 src
+    default_backend be_test
+
+backend be_test
+    server s1 {be_addr}
+"
+    );
+
+    let config = ibex_config::parse_str(&cfg_str).expect("parse test config");
+    let mut engine = Engine::new(&config, 1024).expect("create test engine");
+    let cli_path = format!(
+        "/tmp/ibex_cli_{}_{}.sock",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros()
+    );
+    engine
+        .bind_cli_socket(&cli_path)
+        .expect("bind cli socket");
+
+    let key = StickKey::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST));
+
+    let p_content = engine.proxies.iter().position(|p| p.name == "fe_tcp_content").unwrap();
+    let fe_content_addr = engine.listeners.iter().find(|l| l.proxy == u32::try_from(p_content).unwrap()).unwrap().addr();
+
+    let p_session = engine.proxies.iter().position(|p| p.name == "fe_tcp_session").unwrap();
+    let fe_session_addr = engine.listeners.iter().find(|l| l.proxy == u32::try_from(p_session).unwrap()).unwrap().addr();
+
+    let p_http = engine.proxies.iter().position(|p| p.name == "fe_http_req").unwrap();
+    let fe_http_addr = engine.listeners.iter().find(|l| l.proxy == u32::try_from(p_http).unwrap()).unwrap().addr();
+
+    let p_ctrl = engine.proxies.iter().position(|p| p.name == "fe_control").unwrap();
+    let fe_ctrl_addr = engine.listeners.iter().find(|l| l.proxy == u32::try_from(p_ctrl).unwrap()).unwrap().addr();
+
+    // 1. Test fe_tcp_content
+    let mut client = TcpStream::connect(fe_content_addr).expect("connect to fe_tcp_content");
+    client
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .expect("write request");
+    for _ in 0..30 {
+        let _ = engine.step(ibex_sched::Tick(100));
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let entry_content = engine.proxies[p_content]
+        .stick_table
+        .as_ref()
+        .unwrap()
+        .get_entry(&key)
+        .expect("lookup key")
+        .expect("entry exists");
+    assert_eq!(
+        entry_content.gpc0, 1,
+        "tcp-request content sc-inc-gpc0 failed"
+    );
+    assert_eq!(
+        entry_content.gpc1, 1,
+        "tcp-request content sc-inc-gpc1 failed"
+    );
+    assert_eq!(
+        entry_content.gpt0, 42,
+        "tcp-request content sc-set-gpt0 failed"
+    );
+
+    // 2. Test fe_tcp_session
+    let mut client2 = TcpStream::connect(fe_session_addr).expect("connect to fe_tcp_session");
+    client2
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .expect("write request");
+    for _ in 0..30 {
+        let _ = engine.step(ibex_sched::Tick(100));
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let entry_session = engine.proxies[p_session]
+        .stick_table
+        .as_ref()
+        .unwrap()
+        .get_entry(&key)
+        .expect("lookup key")
+        .expect("entry exists");
+    assert_eq!(
+        entry_session.gpc0, 1,
+        "tcp-request session sc-inc-gpc0 failed"
+    );
+    assert_eq!(
+        entry_session.gpc1, 1,
+        "tcp-request session sc-inc-gpc1 failed"
+    );
+    assert_eq!(
+        entry_session.gpt0, 99,
+        "tcp-request session sc-set-gpt0 failed"
+    );
+
+    // 3. Test fe_http_req
+    let mut client3 = TcpStream::connect(fe_http_addr).expect("connect to fe_http_req");
+    client3
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .expect("write request");
+    for _ in 0..30 {
+        let _ = engine.step(ibex_sched::Tick(100));
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let entry_http = engine.proxies[p_http]
+        .stick_table
+        .as_ref()
+        .unwrap()
+        .get_entry(&key)
+        .expect("lookup key")
+        .expect("entry exists");
+    assert_eq!(entry_http.gpc0, 1, "http-request sc-inc-gpc0 failed");
+    assert_eq!(entry_http.gpc1, 1, "http-request sc-inc-gpc1 failed");
+    assert_eq!(entry_http.gpt0, 123, "http-request sc-set-gpt0 failed");
+
+    // 4. Test fe_control (control: without sc-inc or sc-set actions)
+    let mut client4 = TcpStream::connect(fe_ctrl_addr).expect("connect to fe_control");
+    client4
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .expect("write request");
+    for _ in 0..30 {
+        let _ = engine.step(ibex_sched::Tick(100));
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let entry_ctrl = engine.proxies[p_ctrl]
+        .stick_table
+        .as_ref()
+        .unwrap()
+        .get_entry(&key)
+        .expect("lookup key")
+        .expect("entry exists");
+    assert_eq!(entry_ctrl.gpc0, 0, "control frontend should have gpc0=0");
+    assert_eq!(entry_ctrl.gpc1, 0, "control frontend should have gpc1=0");
+    assert_eq!(entry_ctrl.gpt0, 0, "control frontend should have gpt0=0");
+
+    // 5. Test CLI socket `show table` dump formatting
+    let mut cli_client =
+        std::os::unix::net::UnixStream::connect(&cli_path).expect("connect cli");
+    cli_client
+        .write_all(b"show table fe_tcp_content\n")
+        .expect("write show table");
+    for _ in 0..10 {
+        let _ = engine.step(ibex_sched::Tick(100));
+    }
+    let mut dump = String::new();
+    cli_client.read_to_string(&mut dump).expect("read dump");
+    assert!(
+        dump.contains("gpc0=1"),
+        "show table should output gpc0=1: {dump}"
+    );
+    assert!(
+        dump.contains("gpc1=1"),
+        "show table should output gpc1=1: {dump}"
+    );
+    assert!(
+        dump.contains("gpt0=42"),
+        "show table should output gpt0=42: {dump}"
+    );
+
+    let mut cli_ctrl = std::os::unix::net::UnixStream::connect(&cli_path).expect("connect cli");
+    cli_ctrl
+        .write_all(b"show table fe_control\n")
+        .expect("write show table");
+    for _ in 0..10 {
+        let _ = engine.step(ibex_sched::Tick(100));
+    }
+    let mut ctrl_dump = String::new();
+    cli_ctrl.read_to_string(&mut ctrl_dump).expect("read dump");
+    assert!(
+        !ctrl_dump.contains("gpc0="),
+        "control dump must not contain gpc0=: {ctrl_dump}"
+    );
+    assert!(
+        !ctrl_dump.contains("gpc1="),
+        "control dump must not contain gpc1=: {ctrl_dump}"
+    );
+    assert!(
+        !ctrl_dump.contains("gpt0="),
+        "control dump must not contain gpt0=: {ctrl_dump}"
+    );
+
+    let _ = std::fs::remove_file(&cli_path);
+}
+

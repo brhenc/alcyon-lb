@@ -28,6 +28,7 @@ use ibex_proto::htx::{HttpVersion, Htx, HtxBlock, ResponseLine};
 use ibex_proto::{extract_cookie, rewrite_header_block, CompiledExp};
 use ibex_sample::{Expr, Registry, SampleContext};
 use ibex_sched::Tick;
+use ibex_stick_table::StickKey;
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
@@ -137,6 +138,13 @@ pub struct TcpSession {
     pub http_after_res_rules: Vec<ibex_config::HttpAfterResRule>,
     pub acls: HashMap<String, Expr>,
     pub pending_resp: Option<(Vec<u8>, usize)>,
+    pub fc_src: Option<SocketAddr>,
+    pub fc_dst: Option<SocketAddr>,
+    pub tcp_inspect_done: bool,
+    pub inspect_exp: Option<Tick>,
+    pub sess_vars: HashMap<String, String>,
+    pub req_vars: HashMap<String, String>,
+    pub tracked_sc: [Option<(usize, StickKey)>; 3],
 }
 
 impl TcpSession {
@@ -210,6 +218,13 @@ impl TcpSession {
             http_after_res_rules: Vec::new(),
             acls: HashMap::new(),
             pending_resp: None,
+            fc_src: None,
+            fc_dst: None,
+            tcp_inspect_done: true,
+            inspect_exp: None,
+            sess_vars: HashMap::new(),
+            req_vars: HashMap::new(),
+            tracked_sc: [None, None, None],
         };
         s.arm_client(now);
         s
@@ -1044,7 +1059,13 @@ impl TcpSession {
     /// The earliest deadline across both sides, for the scheduler's wait queue.
     #[must_use]
     pub fn next_expiry(&self) -> Tick {
-        self.cli_exp.earliest(self.srv_exp).earliest(self.conn_exp)
+        let mut exp = self.cli_exp.earliest(self.srv_exp).earliest(self.conn_exp);
+        if let Some(i_exp) = self.inspect_exp {
+            if !self.tcp_inspect_done {
+                exp = exp.earliest(i_exp);
+            }
+        }
+        exp
     }
 
     /// What each side needs from the poller.
@@ -1276,6 +1297,138 @@ pub fn eval_acl_term<S: ::std::hash::BuildHasher>(
         !res
     } else {
         res
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AclEvalResult {
+    Matched,
+    NotMatched,
+    MissingData,
+}
+
+#[must_use]
+pub fn eval_acl_term_extended<S: ::std::hash::BuildHasher>(
+    term: &ibex_config::AclTerm,
+    acls: &HashMap<String, Expr, S>,
+    registry: &Registry,
+    ctx: &SampleContext,
+    req_bytes: &[u8],
+    can_wait: bool,
+) -> AclEvalResult {
+    let expr_opt = acls.get(&term.name);
+    let parsed_expr;
+    let expr = if let Some(e) = expr_opt {
+        e
+    } else if let Ok(e) = Expr::parse(&term.name) {
+        parsed_expr = e;
+        &parsed_expr
+    } else {
+        return if term.negated {
+            AclEvalResult::Matched
+        } else {
+            AclEvalResult::NotMatched
+        };
+    };
+
+    if can_wait {
+        if expr.fetch_name == "req.payload" || expr.fetch_name == "payload" {
+            let offset = expr
+                .fetch_args
+                .first()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(0);
+            let len = expr
+                .fetch_args
+                .get(1)
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(0);
+            let min_needed = if len > 0 {
+                offset.saturating_add(len)
+            } else {
+                let pat_len = match &expr.matcher {
+                    Some(ibex_sample::Matcher::Str { target, .. }) => target.len(),
+                    Some(ibex_sample::Matcher::Beg { prefix, .. }) => prefix.len(),
+                    Some(ibex_sample::Matcher::End { suffix, .. }) => suffix.len(),
+                    Some(ibex_sample::Matcher::Sub { sub, .. }) => sub.len(),
+                    _ => 1,
+                };
+                offset.saturating_add(pat_len)
+            };
+            if req_bytes.len() < min_needed {
+                return AclEvalResult::MissingData;
+            }
+        } else if expr.fetch_name == "req.len" {
+            if req_bytes.is_empty() {
+                return AclEvalResult::MissingData;
+            }
+        } else if expr.fetch_name.starts_with("req.ssl_") && req_bytes.len() < 5 {
+            return AclEvalResult::MissingData;
+        }
+    }
+
+    let is_match = expr.eval(registry, ctx);
+    if can_wait && !is_match && (expr.fetch_name == "req.payload" || expr.fetch_name == "payload") {
+        let len = expr
+            .fetch_args
+            .get(1)
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0);
+        if len == 0 {
+            match &expr.matcher {
+                Some(ibex_sample::Matcher::Sub { .. }) => {
+                    // An unanchored substring non-match is not final while the payload can still grow,
+                    // unless a line delimiter indicates the write/message boundary has ended.
+                    if !req_bytes.ends_with(b"\n") {
+                        return AclEvalResult::MissingData;
+                    }
+                }
+                Some(ibex_sample::Matcher::End { .. } | ibex_sample::Matcher::Reg { .. }) => {
+                    return AclEvalResult::MissingData;
+                }
+                _ => {}
+            }
+        }
+    }
+    let effective = if term.negated { !is_match } else { is_match };
+    if effective {
+        AclEvalResult::Matched
+    } else {
+        AclEvalResult::NotMatched
+    }
+}
+
+#[must_use]
+pub fn eval_acl_condition_extended<S: ::std::hash::BuildHasher>(
+    cond: &ibex_config::AclCondition,
+    acls: &HashMap<String, Expr, S>,
+    registry: &Registry,
+    ctx: &SampleContext,
+    req_bytes: &[u8],
+    can_wait: bool,
+) -> AclEvalResult {
+    let mut has_missing = false;
+    for term in &cond.terms {
+        match eval_acl_term_extended(term, acls, registry, ctx, req_bytes, can_wait) {
+            AclEvalResult::NotMatched => {
+                return if cond.is_if {
+                    AclEvalResult::NotMatched
+                } else {
+                    AclEvalResult::Matched
+                };
+            }
+            AclEvalResult::MissingData => {
+                has_missing = true;
+            }
+            AclEvalResult::Matched => {}
+        }
+    }
+    if has_missing {
+        AclEvalResult::MissingData
+    } else if cond.is_if {
+        AclEvalResult::Matched
+    } else {
+        AclEvalResult::NotMatched
     }
 }
 

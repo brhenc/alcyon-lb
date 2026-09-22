@@ -411,3 +411,122 @@ fn test_diagnostic_flags() {
         "-dL should list loaded dynamic shared objects"
     );
 }
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn test_unsupported_tcp_request_actions_are_refused() {
+    // Valid control configuration should succeed
+    let valid_cases = [
+        "tcp-request content sc-inc-gpc0",
+        "tcp-request content sc-inc-gpc0(0)",
+        "tcp-request content sc-inc-gpc0(1)",
+        "tcp-request content sc-inc-gpc0(2)",
+        "tcp-request content sc-inc-gpc1",
+        "tcp-request content sc-inc-gpc1(1)",
+        "tcp-request content sc-set-gpt0 42",
+        "tcp-request content sc-set-gpt0(1) 99",
+        "tcp-request session sc-inc-gpc0",
+        "tcp-request session sc-inc-gpc0(1)",
+        "tcp-request session sc-inc-gpc1",
+        "tcp-request session sc-set-gpt0 10",
+        "http-request sc-inc-gpc0",
+        "http-request sc-inc-gpc0(2)",
+        "http-request sc-inc-gpc1",
+        "http-request sc-set-gpt0 55",
+    ];
+    for valid_line in valid_cases {
+        let dir = tempdir().expect("create tempdir");
+        let cfg_path = dir.path().join("test.cfg");
+        let cfg = format!(
+            r"
+global
+    maxconn 100
+
+defaults
+    mode http
+    timeout client 10s
+    timeout server 10s
+    timeout connect 10s
+
+frontend fe
+    bind 127.0.0.1:58080
+    stick-table type ip size 100 store gpc0,gpc1,gpt0
+    tcp-request content track-sc0 src
+    {valid_line}
+"
+        );
+        fs::write(&cfg_path, &cfg).expect("write test.cfg");
+        let out = Command::new(IBEX_BIN)
+            .arg("-f")
+            .arg(&cfg_path)
+            .arg("-c")
+            .output()
+            .expect("Failed to execute ibex -c");
+        assert!(
+            out.status.success(),
+            "ibex -c should succeed for valid line '{valid_line}', got stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // Invalid / unsupported actions must be refused with descriptive messages naming the action
+    let refused_cases = [
+        ("tcp-request content lua.handler", "lua actions require Lua support"),
+        ("tcp-request content use-service s1", "use-service"),
+        ("tcp-request session attach-srv s1", "attach-srv"),
+        ("tcp-request content do-log", "do-log"),
+        ("tcp-request session do-log", "do-log"),
+        ("tcp-request connection do-log", "do-log"),
+        ("tcp-request content sc-inc-gpc0(99)", "stick counter index must be 0, 1, or 2"),
+        ("tcp-request content sc-inc-gpc0(abc)", "invalid stick counter index"),
+        ("tcp-request content sc-inc-gpc0(0", "missing closing parenthesis"),
+        ("tcp-request content sc-inc-gpc0foo", "invalid stick table track ID"),
+        ("tcp-request session sc-inc-gpc0(99)", "stick counter index must be 0, 1, or 2"),
+        ("tcp-request session sc-inc-gpc0foo", "invalid stick table track ID"),
+        ("http-request sc-inc-gpc0(99)", "stick counter index must be 0, 1, or 2"),
+        ("http-request sc-inc-gpc0foo", "invalid stick table track ID"),
+    ];
+
+    for (line, expected_msg) in refused_cases {
+        let dir = tempdir().expect("create tempdir");
+        let cfg_path = dir.path().join("test.cfg");
+        let cfg = format!(
+            r"
+global
+    maxconn 100
+
+defaults
+    mode tcp
+    timeout client 10s
+    timeout server 10s
+    timeout connect 10s
+
+frontend fe
+    bind 127.0.0.1:58080
+    stick-table type ip size 100 store gpc0
+    tcp-request content track-sc0 src
+    {line}
+"
+        );
+        fs::write(&cfg_path, &cfg).expect("write test.cfg");
+        let out = Command::new(IBEX_BIN)
+            .arg("-f")
+            .arg(&cfg_path)
+            .arg("-c")
+            .output()
+            .expect("Failed to execute ibex -c");
+        assert!(
+            !out.status.success(),
+            "ibex -c should fail for refused/invalid action: {line}"
+        );
+        let err_output = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            err_output.contains(expected_msg),
+            "Expected '{expected_msg}' in error output for '{line}', got:\n{err_output}"
+        );
+    }
+}
