@@ -34,19 +34,15 @@ pub const REPORTED_VERSION: &str = "3.5.0";
 
 /// Answers one `feature(X)` predicate.
 fn feature(name: &str) -> bool {
-    match name {
-        // TLS termination exists. See the module comment for why this is true while
-        // `ssllib_name_startswith(OpenSSL)` is not.
-        "OPENSSL" => true,
-        // The TLS backend, reported under its own name so a condition can ask directly.
-        "RUSTLS" => true,
-        _ => false,
-    }
+    // OPENSSL is answered true because the suite uses it to mean "this build terminates
+    // TLS", not "OpenSSL is linked in" -- see the module comment. RUSTLS names the
+    // backend so a condition can ask which one directly.
+    matches!(name, "OPENSSL" | "RUSTLS")
 }
 
 /// Compares dotted version strings, ignoring any `-dev`/`-rc` suffix.
 ///
-/// `2.5-dev0` is treated as `2.5`: the suffix orders *below* the release in HAProxy, and
+/// `2.5-dev0` is treated as `2.5`: the suffix orders *below* the release in `HAProxy`, and
 /// since Ibex reports a version well above every gate in the suite, resolving it either
 /// way gives the same answer. Being explicit about the simplification beats a comparison
 /// that looks exact and is not.
@@ -78,11 +74,13 @@ fn predicate(name: &str, arg: &str) -> bool {
         "version_atleast" => version_atleast(arg),
         // Which library, not whether TLS exists. Ibex is not OpenSSL, AWS-LC or wolfSSL.
         "ssllib_name_startswith" => arg.eq_ignore_ascii_case("rustls"),
-        // Versions of a library that is not linked in.
-        "openssl_version_atleast" | "awslc_api_atleast" => false,
+        // Every version of a library that is not linked in is "before" and never
+        // "at least".
         "openssl_version_before" => true,
-        // No FIPS mode, and no build-time toggles are exposed yet.
-        "fips_mode" | "enabled" | "defined" => false,
+        // Versions of a library that is not linked in; no FIPS mode; no build-time
+        // toggles exposed yet. An unknown predicate lands here too: false means the
+        // gated test skips, which is the right answer for a feature we do not have and
+        // for one upstream added that we have not seen.
         "streq" => {
             let (a, b) = arg.split_once(',').unwrap_or((arg, ""));
             a.trim() == b.trim()
