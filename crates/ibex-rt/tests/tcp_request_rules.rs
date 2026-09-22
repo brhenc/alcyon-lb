@@ -491,3 +491,56 @@ fn inspect_delay_is_a_maximum_not_a_fixed_wait() {
     );
     let _ = std::fs::remove_file(&cfg);
 }
+
+/// A substring match that has not matched yet is never final until the data is.
+///
+/// `eval_acl_term_extended` decides a payload fetch has enough data by computing
+/// `min_needed` -- the offset plus the length of the pattern when no explicit length was
+/// given -- and evaluating once that many bytes have arrived. For an anchored match that
+/// is right: `-m str` with an explicit length, or `-m beg`, is decided by the bytes at a
+/// known position, and once they are present a non-match is final.
+///
+/// For `-m sub` it is not. A substring may appear at any offset, so "the pattern did not
+/// appear in the first `pat_len` bytes" says nothing about whether it appears at all. The
+/// same holds for `-m end`, which cannot be decided until the stream is.
+///
+/// Measured against the current build, with `inspect-delay 3s` and `-m sub FORBIDDEN`:
+///
+/// ```text
+///  1 byte of padding, then the payload -> correctly rejected
+///  9 bytes ( == len("FORBIDDEN"))      -> forwarded to the backend
+/// 40 bytes                             -> forwarded to the backend
+/// ```
+///
+/// So the bypass this file already tests for survives; it just costs the client nine
+/// bytes of padding instead of one. The sibling test above passes only because it happens
+/// to send a single byte first.
+///
+/// The rule: a non-match on an unanchored matcher is not a final answer while the client
+/// is open and the delay has not expired. Only a match is final early.
+#[test]
+fn an_unanchored_payload_match_is_not_decided_by_pattern_length_alone() {
+    let be = Backend::spawn(1, HTTP_OK);
+    let port = free_port();
+    let cfg = write_cfg("inspect_padded.cfg", &tcp_inspect_cfg(port, be.port));
+    let _d = start(&cfg);
+    assert!(wait_for_port(port), "the daemon never listened on {port}");
+
+    let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    // Longer than the pattern, so a byte-count heuristic believes it can decide.
+    s.write_all(&[b'X'; 40]).expect("write padding");
+    s.flush().ok();
+    thread::sleep(Duration::from_millis(250));
+    s.write_all(b"FORBIDDEN-PAYLOAD").expect("write payload");
+    s.flush().ok();
+    thread::sleep(Duration::from_millis(600));
+
+    assert!(
+        be.requests().is_empty(),
+        "40 bytes of padding ahead of the payload bypassed `tcp-request content reject`; \
+         the backend received {:?}. A `-m sub` non-match was treated as final once \
+         pattern-length bytes had arrived, but a substring can appear at any offset.",
+        be.requests()
+    );
+    let _ = std::fs::remove_file(&cfg);
+}
