@@ -23,7 +23,7 @@ use crate::proxy::{TcpSession, Timeouts};
 use crate::raw;
 use ibex_config::{regex, BalanceAlgorithm, Config, Mode, StickRule, UseBackendRule};
 use ibex_proto::endpoint::ScState;
-use ibex_sample::{ConvDesc, Expr, Registry, Sample, SampleContext, SampleType, TypeSpec};
+use ibex_sample::{Expr, Registry, Sample, SampleContext};
 use ibex_sched::task::{state, Kind, TaskRef, WorkKind};
 use ibex_sched::{Class, Dispatch, Outcome, Scheduler, Tick};
 use ibex_stick_table::{KeyType, StickKey, StickTable, StickTableConfig};

@@ -151,12 +151,16 @@ impl SyslogTarget {
 /// is a common and quietly incompatible mistake.
 #[must_use]
 pub fn format_rfc3164(pri: u8, tag: &str, hostname: &str, msg: &str) -> String {
-    let (mon, day, h, m, s) = local_timestamp();
     const MONTHS: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
-    let mon_name = MONTHS[(mon as usize).saturating_sub(1).min(11)];
-    format!("<{pri}>{mon_name} {day:>2} {h:02}:{m:02}:{s:02} {hostname} {tag}: {msg}")
+
+    let (month, day, hour, minute, second) = local_timestamp();
+    let month_name = MONTHS[(month as usize).saturating_sub(1).min(11)];
+    format!(
+        "<{pri}>{month_name} {day:>2} {hour:02}:{minute:02}:{second:02} \
+         {hostname} {tag}: {msg}"
+    )
 }
 
 /// Civil time from the system clock: (month, day, hour, minute, second).
@@ -170,11 +174,9 @@ fn local_timestamp() -> (u32, u32, u32, u32, u32) {
         .as_secs();
     let days = now / 86_400;
     let secs = now % 86_400;
-    let (h, m, s) = (
-        u32::try_from(secs / 3600).unwrap_or(0),
-        u32::try_from((secs % 3600) / 60).unwrap_or(0),
-        u32::try_from(secs % 60).unwrap_or(0),
-    );
+    let hour = u32::try_from(secs / 3600).unwrap_or(0);
+    let minute = u32::try_from((secs % 3600) / 60).unwrap_or(0);
+    let second = u32::try_from(secs % 60).unwrap_or(0);
 
     // Civil-from-days, Howard Hinnant's algorithm, shifted to a March-based year so
     // the leap day lands at the end and needs no special case.
@@ -184,14 +186,14 @@ fn local_timestamp() -> (u32, u32, u32, u32, u32) {
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let mth = if mp < 10 { mp + 3 } else { mp - 9 };
-    let _ = era;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let _ = era; // the year is not part of an RFC 3164 timestamp
     (
-        u32::try_from(mth).unwrap_or(1),
-        u32::try_from(d).unwrap_or(1),
-        h,
-        m,
-        s,
+        u32::try_from(month).unwrap_or(1),
+        u32::try_from(day).unwrap_or(1),
+        hour,
+        minute,
+        second,
     )
 }

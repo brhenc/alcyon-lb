@@ -27,10 +27,15 @@ thread_local! {
     pub static CURRENT_RES_STATUS: Cell<u16> = const { Cell::new(0) };
 }
 
+// Not generalised over the hasher: these write straight into a thread-local declared as
+// `HashMap<String, String>` with the default hasher, so a generic `S` could not be stored
+// without converting the map anyway.
+#[allow(clippy::implicit_hasher)]
 pub fn set_current_vars(vars: HashMap<String, String>) {
     CURRENT_VARS.with(|v| *v.borrow_mut() = vars);
 }
 
+#[allow(clippy::implicit_hasher)]
 pub fn set_current_timeouts(timeouts: HashMap<String, u32>) {
     CURRENT_TIMEOUTS.with(|t| *t.borrow_mut() = timeouts);
 }
@@ -156,6 +161,11 @@ impl Registry {
     /// Neither was detectable by building, testing or linting, which is why this is a
     /// panic and not a lint: the registry is built by every test that evaluates a
     /// sample, so a duplicate now fails loudly the first time anything touches it.
+    ///
+    /// # Panics
+    ///
+    /// If a fetch with this name is already registered. Registration happens once at
+    /// startup from a fixed table, so this fires during development, never on a request.
     pub fn register_fetch(&mut self, desc: FetchDesc) {
         assert!(
             !self.fetches.contains_key(desc.name),
@@ -169,6 +179,10 @@ impl Registry {
     /// Registers a converter. Panics if `desc.name` is already registered.
     ///
     /// See [`Registry::register_fetch`] for why this is a panic.
+    ///
+    /// # Panics
+    ///
+    /// If a converter with this name is already registered.
     pub fn register_converter(&mut self, desc: ConvDesc) {
         assert!(
             !self.converters.contains_key(desc.name),
@@ -389,7 +403,7 @@ impl Registry {
             },
         });
 
-        let req_ver_fetch: FetchFn = |ctx, _args| {
+        let request_version_fetch: FetchFn = |ctx, _args| {
             if let Some(v) = ctx.req_version {
                 return Some(Sample::Str(v.to_string()));
             }
@@ -403,15 +417,15 @@ impl Registry {
         self.register_fetch(FetchDesc {
             name: "req.ver",
             out_type: SampleType::Str,
-            func: req_ver_fetch,
+            func: request_version_fetch,
         });
         self.register_fetch(FetchDesc {
             name: "req_ver",
             out_type: SampleType::Str,
-            func: req_ver_fetch,
+            func: request_version_fetch,
         });
 
-        let res_ver_fetch: FetchFn = |ctx, _args| {
+        let response_version_fetch: FetchFn = |ctx, _args| {
             if let Some(v) = ctx.res_version {
                 return Some(Sample::Str(v.to_string()));
             }
@@ -425,12 +439,12 @@ impl Registry {
         self.register_fetch(FetchDesc {
             name: "res.ver",
             out_type: SampleType::Str,
-            func: res_ver_fetch,
+            func: response_version_fetch,
         });
         self.register_fetch(FetchDesc {
             name: "res_ver",
             out_type: SampleType::Str,
-            func: res_ver_fetch,
+            func: response_version_fetch,
         });
 
         let status_fetch: FetchFn = |ctx, _args| {
@@ -531,7 +545,7 @@ impl Registry {
         });
 
         // --- 4. HTTP Headers Fetches ---
-        let req_hdr_fetch: FetchFn = |ctx, args| {
+        let request_header_fetch: FetchFn = |ctx, args| {
             let name = args.first()?;
             let occ: Option<i64> = args.get(1).and_then(|s| s.parse().ok());
             let hdrs = get_all_req_headers(ctx, name);
@@ -539,11 +553,17 @@ impl Registry {
                 return None;
             }
             if let Some(idx) = occ {
+                // HAProxy counts occurrences from 1, and from the end when negative, so
+                // -1 is the last header. Both conversions are fallible rather than `as`:
+                // the index comes from the config as an i64, and a truncating cast would
+                // turn an out-of-range occurrence into a valid index for a *different*
+                // header instead of no match at all.
                 if idx > 0 {
-                    let uidx = (idx - 1) as usize;
+                    let uidx = usize::try_from(idx - 1).ok()?;
                     return hdrs.get(uidx).map(|s| Sample::Str((*s).clone()));
                 } else if idx < 0 {
-                    let uidx = hdrs.len().checked_sub(idx.unsigned_abs() as usize)?;
+                    let back = usize::try_from(idx.unsigned_abs()).ok()?;
+                    let uidx = hdrs.len().checked_sub(back)?;
                     return hdrs.get(uidx).map(|s| Sample::Str((*s).clone()));
                 }
                 return None;
@@ -553,20 +573,20 @@ impl Registry {
         self.register_fetch(FetchDesc {
             name: "req.hdr",
             out_type: SampleType::Str,
-            func: req_hdr_fetch,
+            func: request_header_fetch,
         });
         self.register_fetch(FetchDesc {
             name: "hdr",
             out_type: SampleType::Str,
-            func: req_hdr_fetch,
+            func: request_header_fetch,
         });
         self.register_fetch(FetchDesc {
             name: "req.fhdr",
             out_type: SampleType::Str,
-            func: req_hdr_fetch,
+            func: request_header_fetch,
         });
 
-        let res_hdr_fetch: FetchFn = |ctx, args| {
+        let response_header_fetch: FetchFn = |ctx, args| {
             let name = args.first()?;
             let occ: Option<i64> = args.get(1).and_then(|s| s.parse().ok());
             let hdrs = get_all_res_headers(ctx, name);
@@ -574,11 +594,17 @@ impl Registry {
                 return None;
             }
             if let Some(idx) = occ {
+                // HAProxy counts occurrences from 1, and from the end when negative, so
+                // -1 is the last header. Both conversions are fallible rather than `as`:
+                // the index comes from the config as an i64, and a truncating cast would
+                // turn an out-of-range occurrence into a valid index for a *different*
+                // header instead of no match at all.
                 if idx > 0 {
-                    let uidx = (idx - 1) as usize;
+                    let uidx = usize::try_from(idx - 1).ok()?;
                     return hdrs.get(uidx).map(|s| Sample::Str((*s).clone()));
                 } else if idx < 0 {
-                    let uidx = hdrs.len().checked_sub(idx.unsigned_abs() as usize)?;
+                    let back = usize::try_from(idx.unsigned_abs()).ok()?;
+                    let uidx = hdrs.len().checked_sub(back)?;
                     return hdrs.get(uidx).map(|s| Sample::Str((*s).clone()));
                 }
                 return None;
@@ -588,12 +614,12 @@ impl Registry {
         self.register_fetch(FetchDesc {
             name: "res.hdr",
             out_type: SampleType::Str,
-            func: res_hdr_fetch,
+            func: response_header_fetch,
         });
         self.register_fetch(FetchDesc {
             name: "res.fhdr",
             out_type: SampleType::Str,
-            func: res_hdr_fetch,
+            func: response_header_fetch,
         });
 
         let req_hdr_cnt_fetch: FetchFn = |ctx, args| {
@@ -805,7 +831,7 @@ impl Registry {
             func: |ctx, _args| ctx.res_body.map(|b| Sample::Bin(b.to_vec())),
         });
 
-        let req_len_fetch: FetchFn = |ctx, _args| {
+        let request_body_len_fetch: FetchFn = |ctx, _args| {
             if let Some(b) = ctx.req_body {
                 #[allow(clippy::cast_possible_wrap)]
                 return Some(Sample::Sint(b.len() as i64));
@@ -818,20 +844,20 @@ impl Registry {
         self.register_fetch(FetchDesc {
             name: "req.len",
             out_type: SampleType::Sint,
-            func: req_len_fetch,
+            func: request_body_len_fetch,
         });
         self.register_fetch(FetchDesc {
             name: "req.body_len",
             out_type: SampleType::Sint,
-            func: req_len_fetch,
+            func: request_body_len_fetch,
         });
         self.register_fetch(FetchDesc {
             name: "req.body_size",
             out_type: SampleType::Sint,
-            func: req_len_fetch,
+            func: request_body_len_fetch,
         });
 
-        let res_len_fetch: FetchFn = |ctx, _args| {
+        let response_body_len_fetch: FetchFn = |ctx, _args| {
             if let Some(b) = ctx.res_body {
                 #[allow(clippy::cast_possible_wrap)]
                 return Some(Sample::Sint(b.len() as i64));
@@ -844,12 +870,12 @@ impl Registry {
         self.register_fetch(FetchDesc {
             name: "res.len",
             out_type: SampleType::Sint,
-            func: res_len_fetch,
+            func: response_body_len_fetch,
         });
         self.register_fetch(FetchDesc {
             name: "res.body_size",
             out_type: SampleType::Sint,
-            func: res_len_fetch,
+            func: response_body_len_fetch,
         });
 
         // --- 7. Captures ---
@@ -901,13 +927,13 @@ impl Registry {
         self.register_fetch(FetchDesc {
             name: "capture.req.ver",
             out_type: SampleType::Str,
-            func: req_ver_fetch,
+            func: request_version_fetch,
         });
 
         self.register_fetch(FetchDesc {
             name: "capture.res.ver",
             out_type: SampleType::Str,
-            func: res_ver_fetch,
+            func: response_version_fetch,
         });
 
         // --- 8. Frontend / Backend / Server Fetches ---
@@ -1596,8 +1622,12 @@ impl Registry {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default();
-                #[allow(clippy::cast_possible_wrap)]
-                Some(Sample::Sint(now.as_micros() as i64))
+                // Saturating rather than wrapping: microseconds since the epoch exceed
+                // i64 only past the year 294247, so this is unreachable, but a wrap
+                // would hand out a negative timestamp instead of an obviously clamped one.
+                Some(Sample::Sint(
+                    i64::try_from(now.as_micros()).unwrap_or(i64::MAX),
+                ))
             },
         });
         self.register_fetch(FetchDesc {
@@ -1642,10 +1672,11 @@ impl Registry {
             },
         });
 
+        // A sample longer than i64::MAX bytes cannot exist, so the conversion never
+        // fails; it is fallible here so that a length can never arrive as a negative.
         let len_conv: ConvFn = |smp, _args| match smp {
-            #[allow(clippy::cast_possible_wrap)]
-            Sample::Str(s) => Some(Sample::Sint(s.len() as i64)),
-            Sample::Bin(b) => Some(Sample::Sint(b.len() as i64)),
+            Sample::Str(s) => Some(Sample::Sint(i64::try_from(s.len()).unwrap_or(i64::MAX))),
+            Sample::Bin(b) => Some(Sample::Sint(i64::try_from(b.len()).unwrap_or(i64::MAX))),
             _ => None,
         };
         self.register_converter(ConvDesc {
@@ -1936,7 +1967,7 @@ impl Registry {
             in_type: TypeSpec::Exact(SampleType::Str),
             out_type: TypeSpec::Exact(SampleType::Str),
             func: |smp, _args| match smp {
-                Sample::Str(s) => url_decode(&s).map(Sample::Str),
+                Sample::Str(s) => Some(Sample::Str(url_decode(&s))),
                 _ => None,
             },
         });
@@ -3315,7 +3346,7 @@ fn extract_url_param(query: &str, param: &str) -> Option<String> {
     for pair in query.split('&') {
         if let Some((k, v)) = pair.split_once('=') {
             if k == param {
-                return Some(url_decode(v).unwrap_or_else(|| v.to_string()));
+                return Some(url_decode(v));
             }
         } else if pair == param {
             return Some(String::new());
@@ -3376,20 +3407,52 @@ fn parse_ip_str(s: &str) -> Option<Sample> {
 
 // --- Date & Time Calculation Internals ---
 
-fn civil_from_days(days: i64) -> (i32, u32, u32) {
+/// Splits a Unix epoch into whole days and the seconds within that day.
+///
+/// `div_euclid`/`rem_euclid` floor towards negative infinity, so a pre-1970 epoch yields
+/// a seconds-of-day in `0..86400` like any other rather than a negative remainder.
+fn split_epoch(epoch: i64) -> (i64, i64) {
+    (epoch.div_euclid(86_400), epoch.rem_euclid(86_400))
+}
+
+/// Civil date from a day count relative to 1970-01-01, after Howard Hinnant's
+/// `civil_from_days`. Returns `(year, month 1..=12, day 1..=31)`.
+///
+/// This was previously computed in `u32` with `doe - doe / 1020 + doe / 1460 -
+/// doe / 36524`, two terms of which are wrong: the published algorithm is
+/// `doe - doe / 1460 + doe / 36524 - doe / 146_096`. It agreed with the correct
+/// result on most dates, which is why it survived, and disagreed on leap days:
+/// 2000-02-29 came back as 2000-03-01, and 2024-02-29 made the `u32` subtraction for
+/// `doy` underflow, producing 2024-28071672-3435973857 in release and a panic in debug.
+/// Since the epoch can come from a `Date` header by way of the `date` converter, that
+/// panic was reachable from a request.
+///
+/// All of it is `i64` now. The intermediate values are small and every subtraction here
+/// is only non-negative because of the algorithm's invariants, which is exactly the
+/// property an unsigned type turns into a wrap instead of a visible negative.
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    #[allow(clippy::cast_possible_truncation)]
-    let doe = (z - era * 146_097) as u32;
-    let yoe = (doe - doe / 1020 + doe / 1460 - doe / 36524) / 365;
-    let y = (i64::from(yoe)) + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    #[allow(clippy::cast_possible_truncation)]
-    (y as i32, m, d)
+    let doe = z - era * 146_097; // 0..=146_096
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // 0..=399
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // 0..=365
+    let mp = (5 * doy + 2) / 153; // 0..=11
+    let d = doy - (153 * mp + 2) / 5 + 1; // 1..=31
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // 1..=12
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// Index into a 7-element weekday table, where day 0 (1970-01-01) is a Thursday.
+fn weekday_index(days: i64) -> usize {
+    // `rem_euclid` keeps this in 0..=6 for negative day counts too, so the conversion
+    // cannot fail; `unwrap_or(0)` is unreachable rather than a fallback.
+    usize::try_from(days.rem_euclid(7)).unwrap_or(0)
+}
+
+/// Index into a 12-element month table from a 1..=12 month number.
+fn month_index(month: i64) -> usize {
+    usize::try_from(month.clamp(1, 12) - 1).unwrap_or(0)
 }
 
 fn format_http_date(epoch: i64) -> String {
@@ -3398,18 +3461,11 @@ fn format_http_date(epoch: i64) -> String {
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
 
-    let (days, secs) = if epoch >= 0 {
-        (epoch / 86400, (epoch % 86400) as u32)
-    } else {
-        let d = (epoch - 86399) / 86400;
-        let s = (epoch - d * 86400) as u32;
-        (d, s)
-    };
+    let (days, secs) = split_epoch(epoch);
 
     let (y, m, d) = civil_from_days(days);
-    let wday_idx = ((days % 7 + 7) % 7) as usize;
-    let wday = DAYS[wday_idx];
-    let month = MONTHS[m.saturating_sub(1).min(11) as usize];
+    let wday = DAYS[weekday_index(days)];
+    let month = MONTHS[month_index(m)];
 
     let hour = secs / 3600;
     let min = (secs % 3600) / 60;
@@ -3441,36 +3497,67 @@ fn parse_http_date(s: &str) -> Option<i64> {
                 (parts[0], parts[1], parts[2], parts[3])
             };
 
-        let day: u32 = day_str.parse().ok()?;
-        let month_idx = MONTHS
-            .iter()
-            .position(|&m| m.eq_ignore_ascii_case(month_str))? as u32
+        // Every component is range-checked before it is used. RFC 9110 5.6.7 fixes these
+        // ranges, so anything outside them is not an HTTP-date and returning None is
+        // both correct and what keeps the arithmetic below in bounds.
+        //
+        // This used to parse into `u32` and compute `hour * 3600 + min * 60 + sec`
+        // unchecked. The string comes from a header -- `req.hdr(Date),date` reaches
+        // here -- so `Date: Sun, 06 Nov 1994 9999999:00:00 GMT` overflowed the
+        // multiply: a panic in a debug build, and in release a wrapped value that
+        // silently became a plausible-looking timestamp.
+        let day: i64 = day_str.parse().ok()?;
+        if !(1..=31).contains(&day) {
+            return None;
+        }
+        let month = i64::try_from(
+            MONTHS
+                .iter()
+                .position(|&m| m.eq_ignore_ascii_case(month_str))?,
+        )
+        .ok()?
             + 1;
-        let year: i32 = year_str.parse().ok()?;
+        let year: i64 = year_str.parse().ok()?;
+        // Bounded so `days_from_civil` cannot overflow; far wider than any real date.
+        if !(-9999..=9999).contains(&year) {
+            return None;
+        }
 
         let mut time_parts = time_str.split(':');
-        let hour: u32 = time_parts.next()?.parse().ok()?;
-        let min: u32 = time_parts.next()?.parse().ok()?;
-        let sec: u32 = time_parts.next()?.parse().ok()?;
+        let hour: i64 = time_parts.next()?.parse().ok()?;
+        let min: i64 = time_parts.next()?.parse().ok()?;
+        let sec: i64 = time_parts.next()?.parse().ok()?;
+        // 60 is allowed for a leap second, as RFC 9110 5.6.7 permits.
+        if !(0..=23).contains(&hour) || !(0..=59).contains(&min) || !(0..=60).contains(&sec) {
+            return None;
+        }
 
-        let days = days_from_civil(year, month_idx, day);
-        return Some(days * 86400 + i64::from(hour * 3600 + min * 60 + sec));
+        let days = days_from_civil(year, month, day);
+        return Some(days * 86400 + hour * 3600 + min * 60 + sec);
     }
 
     None
 }
 
-fn days_from_civil(y: i32, m: u32, d: u32) -> i64 {
-    let y = if m <= 2 { i64::from(y) - 1 } else { i64::from(y) };
+/// Inverse of [`civil_from_days`]. Expects a month in `1..=12` and a day in `1..=31`;
+/// `parse_http_date` is the only caller and rejects anything else first.
+///
+/// `i64` throughout for the same reason: `yoe` and `doy` are non-negative only by the
+/// algorithm's construction, and the previous `u32` version turned a violation of that
+/// into a wrapped value rather than an obviously wrong one.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
     let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = (y - era * 400) as u32;
-    let mp = if m > 2 { m - 3 } else { m + 9 };
-    let doy = (153 * mp + 2) / 5 + d - 1;
+    let yoe = y - era * 400; // 0..=399
+    let mp = if m > 2 { m - 3 } else { m + 9 }; // 0..=11
+    let doy = (153 * mp + 2) / 5 + d - 1; // 0..=365
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + i64::from(doe) - 719_468
+    era * 146_097 + doe - 719_468
 }
 
 fn format_time(epoch: i64, format: &str) -> String {
+    use std::fmt::Write;
+
     const MONTHS: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
@@ -3489,17 +3576,11 @@ fn format_time(epoch: i64, format: &str) -> String {
         "Wednesday",
     ];
 
-    let (days, secs) = if epoch >= 0 {
-        (epoch / 86400, (epoch % 86400) as u32)
-    } else {
-        let d = (epoch - 86399) / 86400;
-        let s = (epoch - d * 86400) as u32;
-        (d, s)
-    };
+    let (days, secs) = split_epoch(epoch);
 
     let (y, m, d) = civil_from_days(days);
-    let wday_idx = ((days % 7 + 7) % 7) as usize;
-    let month_idx = m.saturating_sub(1).min(11) as usize;
+    let wday_idx = weekday_index(days);
+    let month_idx = month_index(m);
 
     let hour = secs / 3600;
     let min = (secs % 3600) / 60;
@@ -3511,19 +3592,22 @@ fn format_time(epoch: i64, format: &str) -> String {
         if c == '%' {
             if let Some(spec) = chars.next() {
                 match spec {
-                    'Y' => out.push_str(&format!("{y:04}")),
-                    'y' => out.push_str(&format!("{:02}", y % 100)),
-                    'm' => out.push_str(&format!("{m:02}")),
-                    'd' => out.push_str(&format!("{d:02}")),
-                    'H' => out.push_str(&format!("{hour:02}")),
-                    'M' => out.push_str(&format!("{min:02}")),
-                    'S' => out.push_str(&format!("{sec:02}")),
+                    // `write!` into the buffer rather than `push_str(&format!(..))`:
+                    // the latter allocates a String per conversion specifier and throws
+                    // it away. Writing to a String cannot fail, so the Result is dropped.
+                    'Y' => { let _ = write!(out, "{y:04}"); }
+                    'y' => { let _ = write!(out, "{:02}", y % 100); }
+                    'm' => { let _ = write!(out, "{m:02}"); }
+                    'd' => { let _ = write!(out, "{d:02}"); }
+                    'H' => { let _ = write!(out, "{hour:02}"); }
+                    'M' => { let _ = write!(out, "{min:02}"); }
+                    'S' => { let _ = write!(out, "{sec:02}"); }
                     'b' | 'h' => out.push_str(MONTHS[month_idx]),
                     'B' => out.push_str(MONTHS_FULL[month_idx]),
                     'a' => out.push_str(DAYS[wday_idx]),
                     'A' => out.push_str(DAYS_FULL[wday_idx]),
-                    'T' => out.push_str(&format!("{hour:02}:{min:02}:{sec:02}")),
-                    'F' => out.push_str(&format!("{y:04}-{m:02}-{d:02}")),
+                    'T' => { let _ = write!(out, "{hour:02}:{min:02}:{sec:02}"); }
+                    'F' => { let _ = write!(out, "{y:04}-{m:02}-{d:02}"); }
                     's' => out.push_str(&epoch.to_string()),
                     'z' | 'Z' => out.push_str("GMT"),
                     '%' => out.push('%'),
@@ -3636,7 +3720,11 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-fn url_decode(s: &str) -> Option<String> {
+/// Percent-decodes a string, also mapping `+` to a space.
+///
+/// Infallible: invalid escapes are left as written and invalid UTF-8 is replaced, so the
+/// return type is a `String` rather than an `Option` that was always `Some`.
+fn url_decode(s: &str) -> String {
     let mut res = Vec::new();
     let bytes = s.as_bytes();
     let mut i = 0;
@@ -3655,7 +3743,7 @@ fn url_decode(s: &str) -> Option<String> {
         res.push(bytes[i]);
         i += 1;
     }
-    Some(String::from_utf8_lossy(&res).to_string())
+    String::from_utf8_lossy(&res).to_string()
 }
 
 fn url_encode(s: &str) -> String {
@@ -3685,9 +3773,11 @@ mod tests {
     #[test]
     fn test_basic_eval() {
         let reg = Registry::new();
-        let mut ctx = SampleContext::default();
-        ctx.req_uri = Some("/api/v1/users?id=123&name=alice");
-        ctx.client_addr = Some("192.168.1.50:8080".parse().unwrap());
+        let ctx = SampleContext {
+            req_uri: Some("/api/v1/users?id=123&name=alice"),
+            client_addr: Some("192.168.1.50:8080".parse().unwrap()),
+            ..Default::default()
+        };
 
         let res = reg.eval("path", &[], &[("upper", vec![])], &ctx);
         assert_eq!(res, Some(Sample::Str("/API/V1/USERS".to_string())));
@@ -3755,9 +3845,9 @@ mod tests {
 mod map_name_tests {
     use super::Registry;
 
-    /// The map converter names must be exactly HAProxy's, no more and no fewer.
+    /// The map converter names must be exactly `HAProxy`'s, no more and no fewer.
     ///
-    /// Extracted from HAProxy 3.5 into `data/converters.json`. The generated names came
+    /// Extracted from `HAProxy` 3.5 into `data/converters.json`. The generated names came
     /// from one macro applied to every match method, which invented `map_key` and
     /// `map_regm_int`/`_ip`/`_key`, and produced `map_int` and `map_ip` twice -- once as
     /// the output variants of the bare `map` alias and once as the real integer- and
@@ -3765,7 +3855,7 @@ mod map_name_tests {
     /// replaced the other and which one survived depended on declaration order.
     ///
     /// A missing name makes a valid config fail; an invented one makes a config Ibex
-    /// accepts and HAProxy rejects, which is the direction that actually hurts, since it
+    /// accepts and `HAProxy` rejects, which is the direction that actually hurts, since it
     /// means a config that cannot be migrated back.
     #[test]
     fn map_converter_names_match_haproxy() {
@@ -3845,18 +3935,18 @@ mod oracle_tests {
             .collect()
     }
 
-    /// Names Ibex registers that HAProxy 3.5 does not have. This list may only shrink.
+    /// Names Ibex registers that `HAProxy` 3.5 does not have. This list may only shrink.
     ///
     /// A name we are missing makes a valid config fail, which is visible immediately. A
     /// name we invent is worse and quieter: the config loads on Ibex and is rejected by
-    /// HAProxy, so it cannot be migrated back, and an operator who writes `res.status`
+    /// `HAProxy`, so it cannot be migrated back, and an operator who writes `res.status`
     /// or `hex2bin` gets no warning that they have written something only Ibex
     /// understands. Several here are near-misses for a real fetch -- `res_ver` for
     /// `res.ver`, `ssl_fc_version` for `ssl_fc_protocol`, `sc0_bytes_in_cnt` for
     /// `sc0_bytes_in_rate` -- which is exactly the kind of typo that looks like it works.
     ///
     /// Verified absent two ways: against `data/sample_fetches.json` (extracted from 3.5
-    /// with file:line citations) and by grepping the `smp_fetch` registration tables in
+    /// with `file:line` citations) and by grepping the `smp_fetch` registration tables in
     /// the reference tree directly.
     const NOT_IN_HAPROXY_FETCHES: &[&str] = &[
         "be_client_timeout", "conn_cnt", "conn_rate", "cum_conn", "epoch", "err_cnt",
@@ -3873,7 +3963,7 @@ mod oracle_tests {
         "hex2bin", "len",
     ];
 
-    /// The registry must not grow names HAProxy does not have.
+    /// The registry must not grow names `HAProxy` does not have.
     ///
     /// This is a ratchet, not a clean bill of health: the allowlists above record what
     /// was already wrong when the check was added. Adding to them is the thing this test
@@ -3925,5 +4015,103 @@ mod oracle_tests {
             "allowlist entries no longer registered -- remove them\n  fetches: \
              {stale_f:?}\n  converters: {stale_c:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod date_tests {
+    use super::{civil_from_days, days_from_civil, format_http_date, parse_http_date, split_epoch};
+
+    /// Leap days, which is where the previous `civil_from_days` was wrong.
+    ///
+    /// It used `doe - doe / 1020 + doe / 1460 - doe / 36524` where the published
+    /// algorithm uses `doe - doe / 1460 + doe / 36524 - doe / 146_096`. That agrees on
+    /// most dates, so ordinary spot checks passed; it disagreed on 29 February.
+    #[test]
+    fn civil_from_days_is_right_on_leap_days() {
+        let cases: &[(i64, (i64, i64, i64))] = &[
+            (0, (1970, 1, 1)),
+            (784_111_777, (1994, 11, 6)),
+            (1_000_000_000, (2001, 9, 9)),
+            (2_147_483_647, (2038, 1, 19)),
+            // 2000 is a leap year (divisible by 400); the old code returned 2000-03-01.
+            (951_782_400, (2000, 2, 29)),
+            // The old code underflowed its u32 here and produced 2024-28071672-3435973857.
+            (1_709_164_800, (2024, 2, 29)),
+            // 1900 is not a leap year (divisible by 100, not 400).
+            (-2_203_977_600, (1900, 2, 28)),
+            (-1, (1969, 12, 31)),
+            (4_102_444_800, (2100, 1, 1)),
+        ];
+        for &(epoch, want) in cases {
+            let (days, _) = split_epoch(epoch);
+            assert_eq!(civil_from_days(days), want, "epoch {epoch}");
+        }
+    }
+
+    /// `days_from_civil` must invert `civil_from_days` across every day for 30 years,
+    /// including all the leap days in that span.
+    #[test]
+    fn days_from_civil_inverts_civil_from_days() {
+        for days in -20_000..20_000 {
+            let (y, m, d) = civil_from_days(days);
+            assert_eq!(days_from_civil(y, m, d), days, "round trip at day {days}");
+        }
+    }
+
+    /// Seconds-of-day stays in `0..86400` on both sides of the epoch.
+    ///
+    /// The previous code special-cased negative epochs by hand; `rem_euclid` makes the
+    /// two branches one expression.
+    #[test]
+    fn split_epoch_handles_dates_before_1970() {
+        assert_eq!(split_epoch(0), (0, 0));
+        assert_eq!(split_epoch(86_399), (0, 86_399));
+        assert_eq!(split_epoch(86_400), (1, 0));
+        assert_eq!(split_epoch(-1), (-1, 86_399));
+        assert_eq!(split_epoch(-86_400), (-1, 0));
+        assert_eq!(split_epoch(-86_401), (-2, 86_399));
+    }
+
+    /// A `Date` header reaches this through the `date` converter, so it is untrusted.
+    ///
+    /// The out-of-range hour is the one that mattered: parsed as `u32`, `hour * 3600`
+    /// overflowed, which panics in a debug build and silently wraps to a plausible
+    /// timestamp in release. Every one of these must return `None`, not a number.
+    #[test]
+    fn parse_http_date_rejects_out_of_range_components() {
+        let bad = [
+            "Sun, 06 Nov 1994 9999999:00:00 GMT",
+            "Sun, 06 Nov 1994 4294967296:00:00 GMT",
+            "Sun, 06 Nov 1994 24:00:00 GMT",
+            "Sun, 06 Nov 1994 08:60:00 GMT",
+            "Sun, 06 Nov 1994 08:49:61 GMT",
+            "Sun, 32 Nov 1994 08:49:37 GMT",
+            "Sun, 00 Nov 1994 08:49:37 GMT",
+            "Sun, 06 Nov 999999999 08:49:37 GMT",
+            "Sun, 06 Xxx 1994 08:49:37 GMT",
+        ];
+        for s in bad {
+            assert_eq!(parse_http_date(s), None, "should have been rejected: {s}");
+        }
+    }
+
+    #[test]
+    fn parse_http_date_accepts_the_rfc_example() {
+        // RFC 9110 5.6.7's own example, and its leap second allowance.
+        assert_eq!(parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT"), Some(784_111_777));
+        assert_eq!(parse_http_date("Sun, 06 Nov 1994 08:49:60 GMT"), Some(784_111_800));
+        // A bare epoch stays accepted; the `date` converter relies on it.
+        assert_eq!(parse_http_date("784111777"), Some(784_111_777));
+    }
+
+    #[test]
+    fn format_http_date_round_trips_through_parse() {
+        for epoch in [0, 784_111_777, 951_782_400, 1_709_164_800, 2_147_483_647] {
+            let formatted = format_http_date(epoch);
+            assert_eq!(parse_http_date(&formatted), Some(epoch), "{formatted}");
+        }
+        assert_eq!(format_http_date(784_111_777), "Sun, 06 Nov 1994 08:49:37 GMT");
+        assert_eq!(format_http_date(1_709_164_800), "Thu, 29 Feb 2024 00:00:00 GMT");
     }
 }
