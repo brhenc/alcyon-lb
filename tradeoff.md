@@ -238,3 +238,24 @@ against 7.7 MB for their tasks, a 27× ratio. About 1328 of those bytes are two 
 strings, side-array counters and optional TLS state would put a 512-byte server at 31 MB.
 **This is the single largest measured win available in the project and nothing has been
 built for it yet.**
+
+### 6.6 Map converters re-read the file on every evaluation
+
+`match_map` in `crates/ibex-sample/src/registry.rs` calls `std::fs::read_to_string` and
+then scans the file linearly for each sample evaluation, so a config with `map_beg` in a
+request rule does a blocking `read(2)` plus a full parse per request; `map_reg`/`map_regm`
+also compile a regex per line examined. HAProxy loads each map once into a pattern tree
+(`src/map.c`, `pat_ref` + `pattern_expr`) and does a tree lookup per request.
+
+Gained: a map converter works with no config-time plumbing — the path in the converter
+argument is all it needs, and files edited on disk take effect immediately.
+Gave up: the data path touches the filesystem. This is squarely against the rule that the
+data path gets no syscalls it does not need, and under load it is the kind of thing an
+attacker can amplify by choosing a URL that hits a map rule.
+Status: **reasoned, not measured** — no benchmark yet on how much a map rule costs per
+request, and the page cache absorbs the read, so the cost is parse and scan rather than
+I/O.
+Revisit if: any map converter is used on a hot path. The fix is to load maps at config
+parse time into a cached structure keyed by path, with the runtime API (`add map`,
+`del map`, `clear map`) mutating that cache — which is also what makes those CLI commands
+implementable at all, so this is owed regardless of performance.

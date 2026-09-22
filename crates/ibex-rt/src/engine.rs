@@ -23,11 +23,11 @@ use crate::proxy::{TcpSession, Timeouts};
 use crate::raw;
 use ibex_config::{regex, BalanceAlgorithm, Config, Mode, StickRule, UseBackendRule};
 use ibex_proto::endpoint::ScState;
-use ibex_sample::{ConvDesc, Expr, FetchDesc, Registry, Sample, SampleContext, SampleType, TypeSpec};
+use ibex_sample::{ConvDesc, Expr, Registry, Sample, SampleContext, SampleType, TypeSpec};
 use ibex_sched::task::{state, Kind, TaskRef, WorkKind};
 use ibex_sched::{Class, Dispatch, Outcome, Scheduler, Tick};
 use ibex_stick_table::{KeyType, StickKey, StickTable, StickTableConfig};
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io;
@@ -38,11 +38,19 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+// These four are the *same* thread-locals the sample fetches read. They used to be
+// declared again here, so `set-var` wrote one map and `var` read another; the only
+// reason it worked was that engine re-registered `var` against its own copy. Sharing
+// them makes the split impossible to reintroduce by accident.
+//
+// Note `CURRENT_RES_STATUS` starts at 0, not 200: ibex-sample treats 0 as "no response
+// yet" and renders `-`, where the old engine-local default reported a 200 that had
+// never been sent.
+use ibex_sample::registry::{
+    CURRENT_RES_HEADERS, CURRENT_RES_STATUS, CURRENT_TIMEOUTS, CURRENT_VARS,
+};
+
 thread_local! {
-    static CURRENT_VARS: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
-    static CURRENT_TIMEOUTS: RefCell<HashMap<String, u32>> = RefCell::new(HashMap::new());
-    static CURRENT_RES_HEADERS: RefCell<Vec<(String, String)>> = const { RefCell::new(Vec::new()) };
-    static CURRENT_RES_STATUS: Cell<u16> = const { Cell::new(200) };
     static STRICT_MODE: Cell<bool> = const { Cell::new(true) };
     static REWRITE_ADDED_BYTES: Cell<usize> = const { Cell::new(0) };
     static MAX_REWRITE_LIMIT: Cell<usize> = const { Cell::new(8192) };
@@ -3881,600 +3889,20 @@ impl Dispatch for EngineDispatcher<'_> {
     }
 }
 
-// One registration per sample fetch and converter; splitting it would scatter a
-// flat table across helpers for no gain.
-#[allow(clippy::too_many_lines)]
+/// The engine's sample registry. Every fetch and converter lives in `ibex-sample`.
+///
+/// This used to re-register 29 of them here, and because `Registry::register_*` is a
+/// `HashMap` insert, the copies silently won: the `ibex-sample` implementations were
+/// unreachable, testable in their own crate but never actually run. They had also
+/// drifted -- engine's `map` handled one match type where `ibex-sample` handles eleven,
+/// and engine's `var` read an engine-local `CURRENT_VARS`, so anything added to
+/// `ibex-sample` that touched vars read a map that was permanently empty.
+///
+/// Nothing is registered here now. The function stays because it is the one place the
+/// engine builds a registry: if map files ever need preloading from the parsed config,
+/// that belongs here, and `registry_tests` asserts nothing else creeps back in.
 fn build_sample_registry() -> Registry {
-    let mut reg = Registry::new();
-
-    // 1. var fetch
-    reg.register_fetch(FetchDesc {
-        name: "var",
-        out_type: SampleType::Str,
-        func: |_ctx, args| {
-            let var_name = args.first()?;
-            CURRENT_VARS.with(|v| {
-                v.borrow().get(var_name).cloned().map(Sample::Str)
-            })
-        },
-    });
-
-    // 2. str fetch
-    reg.register_fetch(FetchDesc {
-        name: "str",
-        out_type: SampleType::Str,
-        func: |_ctx, args| {
-            let s = args.first().cloned().unwrap_or_default();
-            Some(Sample::Str(s))
-        },
-    });
-
-    // 3. int fetch
-    reg.register_fetch(FetchDesc {
-        name: "int",
-        out_type: SampleType::Sint,
-        func: |_ctx, args| {
-            let n = args.first()?.parse::<i64>().ok()?;
-            Some(Sample::Sint(n))
-        },
-    });
-
-    // 4. path fetch (handles absolute URIs)
-    reg.register_fetch(FetchDesc {
-        name: "path",
-        out_type: SampleType::Str,
-        func: |ctx, _args| {
-            let uri = ctx.req_uri.or_else(|| ctx.htx.and_then(|h| h.req_line().map(|r| r.uri.as_str())))?;
-            let (_, path, _) = split_uri(uri);
-            Some(Sample::Str(path.to_string()))
-        },
-    });
-
-    // 5. pathq fetch
-    reg.register_fetch(FetchDesc {
-        name: "pathq",
-        out_type: SampleType::Str,
-        func: |ctx, _args| {
-            let uri = ctx.req_uri.or_else(|| ctx.htx.and_then(|h| h.req_line().map(|r| r.uri.as_str())))?;
-            let (_, path, query) = split_uri(uri);
-            if query.is_empty() {
-                Some(Sample::Str(path.to_string()))
-            } else {
-                Some(Sample::Str(format!("{path}?{query}")))
-            }
-        },
-    });
-
-    // 6. url fetch
-    reg.register_fetch(FetchDesc {
-        name: "url",
-        out_type: SampleType::Str,
-        func: |ctx, _args| {
-            let uri = ctx.req_uri.or_else(|| ctx.htx.and_then(|h| h.req_line().map(|r| r.uri.as_str())))?;
-            Some(Sample::Str(uri.to_string()))
-        },
-    });
-
-    // 7. query fetch
-    reg.register_fetch(FetchDesc {
-        name: "query",
-        out_type: SampleType::Str,
-        func: |ctx, _args| {
-            let uri = ctx.req_uri.or_else(|| ctx.htx.and_then(|h| h.req_line().map(|r| r.uri.as_str())))?;
-            let (_, _, query) = split_uri(uri);
-            Some(Sample::Str(query.to_string()))
-        },
-    });
-
-    // 8. url_param fetch
-    reg.register_fetch(FetchDesc {
-        name: "url_param",
-        out_type: SampleType::Str,
-        func: |ctx, args| {
-            let param = args.first()?;
-            let uri = ctx.req_uri.or_else(|| ctx.htx.and_then(|h| h.req_line().map(|r| r.uri.as_str())))?;
-            let (_, _, query) = split_uri(uri);
-            for pair in query.split('&') {
-                if let Some((k, v)) = pair.split_once('=') {
-                    if k == param {
-                        return Some(Sample::Str(v.to_string()));
-                    }
-                } else if pair == param {
-                    return Some(Sample::Str(String::new()));
-                }
-            }
-            None
-        },
-    });
-
-    // 9. req.fhdr & req.hdr & hdr
-    let req_fhdr_fetch: ibex_sample::FetchFn = |ctx, args| {
-        let name = args.first()?;
-        if let Some(hdrs) = ctx.req_headers {
-            let matches: Vec<&str> = hdrs
-                .iter()
-                .filter(|(k, _)| k.eq_ignore_ascii_case(name))
-                .map(|(_, v)| v.as_str())
-                .collect();
-            if !matches.is_empty() {
-                return Some(Sample::Str(matches.join(", ")));
-            }
-        }
-        None
-    };
-    reg.register_fetch(FetchDesc {
-        name: "req.fhdr",
-        out_type: SampleType::Str,
-        func: req_fhdr_fetch,
-    });
-    reg.register_fetch(FetchDesc {
-        name: "req.hdr",
-        out_type: SampleType::Str,
-        func: req_fhdr_fetch,
-    });
-    reg.register_fetch(FetchDesc {
-        name: "hdr",
-        out_type: SampleType::Str,
-        func: req_fhdr_fetch,
-    });
-
-    // 10. res.fhdr & res.hdr
-    let res_full_hdr_fetch: ibex_sample::FetchFn = |_ctx, args| {
-        let name = args.first()?;
-        CURRENT_RES_HEADERS.with(|hdrs| {
-            let matches: Vec<String> = hdrs
-                .borrow()
-                .iter()
-                .filter(|(k, _)| k.eq_ignore_ascii_case(name))
-                .map(|(_, v)| v.clone())
-                .collect();
-            if matches.is_empty() {
-                None
-            } else {
-                Some(Sample::Str(matches.join(", ")))
-            }
-        })
-    };
-    reg.register_fetch(FetchDesc {
-        name: "res.fhdr",
-        out_type: SampleType::Str,
-        func: res_full_hdr_fetch,
-    });
-    reg.register_fetch(FetchDesc {
-        name: "res.hdr",
-        out_type: SampleType::Str,
-        func: res_full_hdr_fetch,
-    });
-
-    // 11. req.hdr_ip & hdr_ip
-    let hdr_ip_fetch: ibex_sample::FetchFn = |ctx, args| {
-        let name = args.first()?;
-        let val_opt = if let Some(hdrs) = ctx.req_headers {
-            hdrs.iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case(name))
-                .map(|(_, v)| v.as_str())
-        } else {
-            None
-        };
-        let val = val_opt?;
-        let clean = val.trim().trim_start_matches('[').trim_end_matches(']');
-        let ip_str = if let Some((h, _)) = clean.split_once(':') {
-            if clean.contains("::") || clean.chars().filter(|&c| c == ':').count() > 1 {
-                clean
-            } else {
-                h
-            }
-        } else {
-            clean
-        };
-        if let Ok(v4) = ip_str.parse::<std::net::Ipv4Addr>() {
-            Some(Sample::Ipv4(v4))
-        } else if let Ok(v6) = ip_str.parse::<std::net::Ipv6Addr>() {
-            Some(Sample::Ipv6(v6))
-        } else {
-            None
-        }
-    };
-    reg.register_fetch(FetchDesc {
-        name: "req.hdr_ip",
-        out_type: SampleType::Ipv4,
-        func: hdr_ip_fetch,
-    });
-    reg.register_fetch(FetchDesc {
-        name: "hdr_ip",
-        out_type: SampleType::Ipv4,
-        func: hdr_ip_fetch,
-    });
-
-    // 12. status fetch
-    reg.register_fetch(FetchDesc {
-        name: "status",
-        out_type: SampleType::Sint,
-        func: |_ctx, _args| {
-            let st = CURRENT_RES_STATUS.get();
-            Some(Sample::Sint(i64::from(st)))
-        },
-    });
-
-    // 13. capture.req.uri fetch
-    reg.register_fetch(FetchDesc {
-        name: "capture.req.uri",
-        out_type: SampleType::Str,
-        func: |ctx, _args| {
-            let uri = ctx.req_uri.or_else(|| ctx.htx.and_then(|h| h.req_line().map(|r| r.uri.as_str())))?;
-            Some(Sample::Str(uri.to_string()))
-        },
-    });
-
-    // 14. timeout fetches
-    macro_rules! reg_timeout_fetch {
-        ($reg:ident, $name:literal) => {
-            $reg.register_fetch(FetchDesc {
-                name: $name,
-                out_type: SampleType::Sint,
-                func: |_ctx, _args| {
-                    CURRENT_TIMEOUTS.with(|t| {
-                        t.borrow().get($name).copied().map(|v| Sample::Sint(i64::from(v)))
-                    })
-                },
-            });
-        };
-    }
-
-    reg_timeout_fetch!(reg, "fe_client_timeout");
-    reg_timeout_fetch!(reg, "cur_client_timeout");
-    reg_timeout_fetch!(reg, "be_server_timeout");
-    reg_timeout_fetch!(reg, "cur_server_timeout");
-    reg_timeout_fetch!(reg, "be_connect_timeout");
-    reg_timeout_fetch!(reg, "cur_connect_timeout");
-    reg_timeout_fetch!(reg, "be_queue_timeout");
-    reg_timeout_fetch!(reg, "cur_queue_timeout");
-    reg_timeout_fetch!(reg, "be_tunnel_timeout");
-    reg_timeout_fetch!(reg, "cur_tunnel_timeout");
-    reg_timeout_fetch!(reg, "be_tarpit_timeout");
-    reg_timeout_fetch!(reg, "cur_tarpit_timeout");
-    reg_timeout_fetch!(reg, "fe_connect_timeout");
-    reg_timeout_fetch!(reg, "fe_server_timeout");
-    reg_timeout_fetch!(reg, "fe_queue_timeout");
-    reg_timeout_fetch!(reg, "fe_tunnel_timeout");
-    reg_timeout_fetch!(reg, "fe_tarpit_timeout");
-    reg_timeout_fetch!(reg, "be_client_timeout");
-
-    // CONVERTERS:
-    // 1. strcmp
-    reg.register_converter(ConvDesc {
-        name: "strcmp",
-        in_type: TypeSpec::Any,
-        out_type: TypeSpec::Exact(SampleType::Sint),
-        func: |smp, args| {
-            let target_arg = args.first()?;
-            let target_val = CURRENT_VARS.with(|v| {
-                v.borrow().get(target_arg).cloned()
-            }).unwrap_or_else(|| target_arg.clone());
-            let s = sample_to_string(&smp);
-            let cmp = s.cmp(&target_val);
-            let res = match cmp {
-                std::cmp::Ordering::Less => -1,
-                std::cmp::Ordering::Equal => 0,
-                std::cmp::Ordering::Greater => 1,
-            };
-            Some(Sample::Sint(res))
-        },
-    });
-
-    // 2. concat
-    reg.register_converter(ConvDesc {
-        name: "concat",
-        in_type: TypeSpec::Any,
-        out_type: TypeSpec::Exact(SampleType::Str),
-        func: |smp, args| {
-            let mut s = sample_to_string(&smp);
-            for arg in args {
-                let piece = CURRENT_VARS.with(|v| {
-                    v.borrow().get(arg).cloned()
-                }).unwrap_or_else(|| arg.clone());
-                s.push_str(&piece);
-            }
-            Some(Sample::Str(s))
-        },
-    });
-
-    // 3. field
-    reg.register_converter(ConvDesc {
-        name: "field",
-        in_type: TypeSpec::Exact(SampleType::Str),
-        out_type: TypeSpec::Exact(SampleType::Str),
-        func: |smp, args| {
-            let idx_str = args.first()?;
-            let delim_char = args.get(1).and_then(|d| d.chars().next()).unwrap_or(' ');
-            let count_str = args.get(2);
-
-            let idx: i64 = idx_str.parse().ok()?;
-            let count: usize = count_str.and_then(|c| c.parse().ok()).unwrap_or(1);
-
-            let Sample::Str(s) = smp else { return None };
-            let fields: Vec<&str> = s.split(delim_char).collect();
-            let len = fields.len();
-            if len == 0 {
-                return Some(Sample::Str(String::new()));
-            }
-            // Field indices are 1-based; a negative index counts from the end, and
-            // zero is not a valid field reference.
-            // Field indices are 1-based; a negative index counts from the end, and
-            // zero is not a valid field reference. `try_from` keeps the conversion
-            // honest on 32-bit targets instead of silently truncating.
-            let start_idx = match idx.cmp(&0) {
-                std::cmp::Ordering::Greater => {
-                    usize::try_from(idx).unwrap_or(usize::MAX).saturating_sub(1)
-                }
-                std::cmp::Ordering::Less => {
-                    len.saturating_sub(usize::try_from(idx.saturating_neg()).unwrap_or(usize::MAX))
-                }
-                std::cmp::Ordering::Equal => return None,
-            };
-            if start_idx >= len {
-                return Some(Sample::Str(String::new()));
-            }
-            let end_idx = if count == 0 {
-                len
-            } else {
-                (start_idx + count).min(len)
-            };
-            let joined = fields[start_idx..end_idx].join(&delim_char.to_string());
-            Some(Sample::Str(joined))
-        },
-    });
-
-    // 4. word
-    reg.register_converter(ConvDesc {
-        name: "word",
-        in_type: TypeSpec::Exact(SampleType::Str),
-        out_type: TypeSpec::Exact(SampleType::Str),
-        func: |smp, args| {
-            let idx_str = args.first()?;
-            let delim_char = args.get(1).and_then(|d| d.chars().next()).unwrap_or(' ');
-            let count_str = args.get(2);
-
-            let idx: i64 = idx_str.parse().ok()?;
-            let count: usize = count_str.and_then(|c| c.parse().ok()).unwrap_or(1);
-
-            let Sample::Str(s) = smp else { return None };
-            let words: Vec<&str> = s.split(delim_char).filter(|w| !w.is_empty()).collect();
-            let len = words.len();
-            if len == 0 {
-                return Some(Sample::Str(String::new()));
-            }
-            // 1-based index; negative counts from the end; zero is invalid.
-            let start_idx = match idx.cmp(&0) {
-                std::cmp::Ordering::Greater => {
-                    usize::try_from(idx).unwrap_or(usize::MAX).saturating_sub(1)
-                }
-                std::cmp::Ordering::Less => {
-                    len.saturating_sub(usize::try_from(idx.saturating_neg()).unwrap_or(usize::MAX))
-                }
-                std::cmp::Ordering::Equal => return None,
-            };
-            if start_idx >= len {
-                return Some(Sample::Str(String::new()));
-            }
-            let end_idx = if count == 0 {
-                len
-            } else {
-                (start_idx + count).min(len)
-            };
-            let joined = words[start_idx..end_idx].join(&delim_char.to_string());
-            Some(Sample::Str(joined))
-        },
-    });
-
-    // 5. map_regm
-    reg.register_converter(ConvDesc {
-        name: "map_regm",
-        in_type: TypeSpec::Exact(SampleType::Str),
-        out_type: TypeSpec::Exact(SampleType::Str),
-        func: |smp, args| {
-            let path = args.first()?;
-            let default_val = args.get(1).map(|s| s.trim_matches('"').to_string());
-            let Sample::Str(s) = smp else { return None };
-            let content = std::fs::read_to_string(path).ok()?;
-            for line in content.lines() {
-                let line = line.trim();
-                if line.is_empty() || line.starts_with('#') {
-                    continue;
-                }
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.is_empty() {
-                    continue;
-                }
-                let pattern = parts[0];
-                let repl = if parts.len() > 1 { parts[1..].join(" ") } else { String::new() };
-                if let Ok(re) = regex::Regex::new(pattern) {
-                    if let Some(caps) = re.captures(&s) {
-                        let mut result = repl;
-                        for i in 1..caps.len() {
-                            let backref = format!("\\{i}");
-                            let captured = caps.get(i).map_or("", |m| m.as_str());
-                            result = result.replace(&backref, captured);
-                        }
-                        return Some(Sample::Str(result));
-                    }
-                }
-            }
-            default_val.map(Sample::Str)
-        },
-    });
-
-    // 6. map_str / map
-    reg.register_converter(ConvDesc {
-        name: "map_str",
-        in_type: TypeSpec::Exact(SampleType::Str),
-        out_type: TypeSpec::Exact(SampleType::Str),
-        func: |smp, args| {
-            let path = args.first()?;
-            let default_val = args.get(1).map(|s| s.trim_matches('"').to_string());
-            let Sample::Str(s) = smp else { return None };
-            let content = std::fs::read_to_string(path).ok()?;
-            for line in content.lines() {
-                let line = line.trim();
-                if line.is_empty() || line.starts_with('#') {
-                    continue;
-                }
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.is_empty() {
-                    continue;
-                }
-                let key = parts[0];
-                let val = if parts.len() > 1 { parts[1..].join(" ") } else { String::new() };
-                if key == s {
-                    return Some(Sample::Str(val));
-                }
-            }
-            default_val.map(Sample::Str)
-        },
-    });
-    reg.register_converter(ConvDesc {
-        name: "map",
-        in_type: TypeSpec::Exact(SampleType::Str),
-        out_type: TypeSpec::Exact(SampleType::Str),
-        func: |smp, args| {
-            let path = args.first()?;
-            let default_val = args.get(1).map(|s| s.trim_matches('"').to_string());
-            let Sample::Str(s) = smp else { return None };
-            let content = std::fs::read_to_string(path).ok()?;
-            for line in content.lines() {
-                let line = line.trim();
-                if line.is_empty() || line.starts_with('#') {
-                    continue;
-                }
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.is_empty() {
-                    continue;
-                }
-                let key = parts[0];
-                let val = if parts.len() > 1 { parts[1..].join(" ") } else { String::new() };
-                if key == s {
-                    return Some(Sample::Str(val));
-                }
-            }
-            default_val.map(Sample::Str)
-        },
-    });
-
-    // 7. length
-    reg.register_converter(ConvDesc {
-        name: "length",
-        in_type: TypeSpec::Any,
-        out_type: TypeSpec::Exact(SampleType::Sint),
-        func: |smp, _args| {
-            let s = sample_to_string(&smp);
-            Some(Sample::Sint(i64::try_from(s.len()).unwrap_or(i64::MAX)))
-        },
-    });
-
-    // 8. url_dec
-    reg.register_converter(ConvDesc {
-        name: "url_dec",
-        in_type: TypeSpec::Exact(SampleType::Str),
-        out_type: TypeSpec::Exact(SampleType::Str),
-        func: |smp, _args| match smp {
-            Sample::Str(s) => {
-                let mut res = Vec::new();
-                let bytes = s.as_bytes();
-                let mut i = 0;
-                while i < bytes.len() {
-                    if bytes[i] == b'%' && i + 2 < bytes.len() {
-                        if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                            res.push(b);
-                            i += 3;
-                            continue;
-                        }
-                    }
-                    res.push(bytes[i]);
-                    i += 1;
-                }
-                Some(Sample::Str(String::from_utf8_lossy(&res).to_string()))
-            }
-            _ => None,
-        },
-    });
-
-    // 9. ipmask (supporting 2 args for v4 and v6)
-    reg.register_converter(ConvDesc {
-        name: "ipmask",
-        in_type: TypeSpec::Addr,
-        out_type: TypeSpec::Same,
-        func: |smp, args| {
-            let mask1_str = args.first()?;
-            let mask2_str = args.get(1);
-            match smp {
-                Sample::Ipv4(ip) => {
-                    let mask = if let Ok(prefix) = mask1_str.parse::<u32>() {
-                        if prefix == 0 {
-                            0
-                        } else if prefix >= 32 {
-                            u32::MAX
-                        } else {
-                            !((1u32 << (32 - prefix)) - 1)
-                        }
-                    } else if let Ok(m_ip) = mask1_str.parse::<std::net::Ipv4Addr>() {
-                        u32::from(m_ip)
-                    } else {
-                        return None;
-                    };
-                    Some(Sample::Ipv4(std::net::Ipv4Addr::from(u32::from(ip) & mask)))
-                }
-                Sample::Ipv6(ip) => {
-                    let chosen_mask = mask2_str.unwrap_or(mask1_str);
-                    let mask = if let Ok(prefix) = chosen_mask.parse::<u32>() {
-                        if prefix == 0 {
-                            0
-                        } else if prefix >= 128 {
-                            u128::MAX
-                        } else {
-                            !((1u128 << (128 - prefix)) - 1)
-                        }
-                    } else if let Ok(m_ip) = chosen_mask.parse::<std::net::Ipv6Addr>() {
-                        u128::from(m_ip)
-                    } else {
-                        return None;
-                    };
-                    Some(Sample::Ipv6(std::net::Ipv6Addr::from(u128::from(ip) & mask)))
-                }
-                _ => None,
-            }
-        },
-    });
-
-    // 10. mul & div
-    reg.register_converter(ConvDesc {
-        name: "mul",
-        in_type: TypeSpec::Exact(SampleType::Sint),
-        out_type: TypeSpec::Exact(SampleType::Sint),
-        func: |smp, args| {
-            let factor = args.first()?.parse::<i64>().ok()?;
-            match smp {
-                Sample::Sint(n) => Some(Sample::Sint(n.saturating_mul(factor))),
-                _ => None,
-            }
-        },
-    });
-    reg.register_converter(ConvDesc {
-        name: "div",
-        in_type: TypeSpec::Exact(SampleType::Sint),
-        out_type: TypeSpec::Exact(SampleType::Sint),
-        func: |smp, args| {
-            let divisor = args.first()?.parse::<i64>().ok()?;
-            if divisor == 0 {
-                return None;
-            }
-            match smp {
-                Sample::Sint(n) => Some(Sample::Sint(n / divisor)),
-                _ => None,
-            }
-        },
-    });
-
-    reg
+    Registry::new()
 }
 
 fn sample_to_string(smp: &Sample) -> String {
@@ -5007,5 +4435,85 @@ const fn status_reason(status: u16) -> &'static str {
         503 => "Service Unavailable",
         504 => "Gateway Timeout",
         _ => "OK",
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::{build_sample_registry, CURRENT_RES_STATUS, CURRENT_VARS};
+    use ibex_sample::{Expr, Sample, SampleContext};
+
+    /// The engine's registry must read the *same* thread-locals the engine writes.
+    ///
+    /// This is the regression test for the two-registry bug. `engine.rs` declared its own
+    /// `CURRENT_VARS` and re-registered `var` against it, while `ibex-sample` had a second
+    /// one that its own `var` read. Both halves worked in isolation and the whole thing
+    /// looked fine, because the engine's registration shadowed ibex-sample's in the
+    /// `HashMap`. Anything added to ibex-sample that touched vars read an empty map.
+    ///
+    /// So this writes through the engine's handle and reads through the registry: before
+    /// the merge it returned `None`, because those were two different maps.
+    #[test]
+    fn engine_var_writes_are_visible_to_the_sample_registry() {
+        CURRENT_VARS.with(|v| {
+            v.borrow_mut().insert("txn.probe".to_string(), "seen".to_string())
+        });
+
+        let reg = build_sample_registry();
+        let ctx = SampleContext::default();
+        let expr = Expr::parse("var(txn.probe)").expect("var() must parse");
+
+        assert_eq!(
+            expr.eval_sample(&reg, &ctx),
+            Some(Sample::Str("seen".to_string())),
+            "the engine wrote a var the sample registry could not see -- the two \
+             CURRENT_VARS thread-locals have diverged again"
+        );
+
+        CURRENT_VARS.with(|v| v.borrow_mut().clear());
+    }
+
+    /// `build_sample_registry` must not re-register what `ibex-sample` already provides.
+    ///
+    /// `register_fetch` is a `HashMap` insert, so a duplicate here silently wins and the
+    /// ibex-sample implementation becomes unreachable -- testable in its own crate, but
+    /// never actually run. That is how engine's single-match-type `map` came to shadow
+    /// ibex-sample's eleven.
+    #[test]
+    fn engine_registers_only_what_ibex_sample_cannot() {
+        let base = ibex_sample::Registry::new();
+        let engine = build_sample_registry();
+
+        let base_convs = base.converter_names();
+        let added: Vec<&str> = engine
+            .converter_names()
+            .into_iter()
+            .filter(|n| !base_convs.contains(n))
+            .collect();
+
+        assert!(
+            added.is_empty(),
+            "engine.rs registered converters of its own: {added:?} -- these shadow \
+             ibex-sample by HashMap insert, so its versions become dead code that \
+             still passes its own tests"
+        );
+        assert_eq!(
+            engine.fetch_names().len(),
+            base.fetch_names().len(),
+            "engine.rs must add no fetches of its own"
+        );
+    }
+
+    /// The shared `CURRENT_RES_STATUS` starts at 0, meaning "no response yet".
+    ///
+    /// The engine's old private copy defaulted to 200, so `status` reported a response
+    /// that had never been sent. ibex-sample treats 0 as absent and renders `-`.
+    #[test]
+    fn status_is_absent_before_a_response_exists() {
+        CURRENT_RES_STATUS.set(0);
+        let reg = build_sample_registry();
+        let ctx = SampleContext::default();
+        let expr = Expr::parse("status").expect("status must parse");
+        assert_eq!(expr.eval_sample(&reg, &ctx), None);
     }
 }
