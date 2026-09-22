@@ -836,10 +836,14 @@ def preprocess_haproxy_config(
                 macro_engine.set(f"{haproxy_id}_{cur_section_name}_port", str(port))
                 macro_engine.set(f"{haproxy_id}_{cur_section_name}_sock", f"127.0.0.1 {port}")
 
-            if cur_section_type == "listen":
-                out_lines.append(f"    # {trimmed} (bound on listen line)")
-            else:
-                out_lines.append(f"    bind 127.0.0.1:{port}{rest_opts}")
+            # A `bind` becomes a `bind`, in every section type. This used to comment the
+            # line out inside a `listen` and fold the address into the section header
+            # instead -- the HAProxy 1.x `listen <name> <addr>:<port>` form, which
+            # HAProxy has not accepted for years and which Ibex rejects with "please use
+            # the 'bind' keyword". That single rewrite accounted for 36 of 133 reg-test
+            # failures, all of them the harness generating a config style neither proxy
+            # would load.
+            out_lines.append(f"    bind 127.0.0.1:{port}{rest_opts}")
             continue
 
         # Check if line is 'listen <name>' without address
@@ -856,7 +860,10 @@ def preprocess_haproxy_config(
             macro_engine.set(f"{haproxy_id}_{l_name}_port", str(port))
             macro_engine.set(f"{haproxy_id}_{l_name}_sock", f"127.0.0.1 {port}")
 
-            out_lines.append(f"listen {l_name} 127.0.0.1:{port}")
+            # Same reason: a bare `listen <name>` keeps its own line and gets a `bind`
+            # underneath, rather than an address folded into the header.
+            out_lines.append(f"listen {l_name}")
+            out_lines.append(f"    bind 127.0.0.1:{port}")
             continue
 
         out_lines.append(line)
