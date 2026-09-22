@@ -18,6 +18,7 @@ pub mod engine;
 pub mod fdtab;
 pub mod listener;
 pub mod logfmt;
+pub mod syslog;
 pub mod poller;
 pub mod proxy;
 pub mod raw;
@@ -36,6 +37,7 @@ pub use ibex_proto::{
 };
 pub use listener::Listener;
 pub use logfmt::{LogFormat, LogNames, LogVars};
+pub use syslog::{format_rfc3164, priority, SyslogTarget};
 pub use poller::{Event, Poller};
 pub use proxy::{find_eoh, Ending, TcpSession, Timeouts, Want, Which};
 pub use raw::Io;

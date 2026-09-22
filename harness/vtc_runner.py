@@ -13,6 +13,7 @@ import dataclasses
 import glob
 import json
 import os
+import threading
 import re
 import shlex
 import shutil
@@ -869,6 +870,91 @@ def preprocess_haproxy_config(
 # Mock Server & Mock Client Asynchronous Runners
 # ---------------------------------------------------------------------------
 
+
+class SyslogRunner:
+    """A varnishtest `syslog` block: a UDP collector that records datagrams.
+
+    HAProxy's health-check and logging reg-tests assert on syslog output, so the
+    harness has to be a real collector rather than a stub. Capital-letter ids are
+    syslog servers in varnishtest (`syslog S ...`), which is why they need their own
+    macros -- `${S_addr}` and `${S_port}` -- alongside the lowercase server ones.
+    """
+
+    def __init__(self, syslog_id: str, macro_engine, expectations, repeat: int = 1,
+                 level: Optional[str] = None, verbose: bool = False):
+        self.syslog_id = syslog_id
+        self.macro_engine = macro_engine
+        self.expectations = expectations      # list of regex strings to match
+        self.repeat = repeat
+        self.level = level
+        self.verbose = verbose
+        self.sock: Optional[socket.socket] = None
+        self.port = 0
+        self.received: List[str] = []
+        self._thread: Optional[threading.Thread] = None
+        self._stop = threading.Event()
+
+    def initialize_socket(self) -> None:
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.settimeout(0.2)
+        self.port = self.sock.getsockname()[1]
+        self.macro_engine.set(f"{self.syslog_id}_addr", "127.0.0.1")
+        self.macro_engine.set(f"{self.syslog_id}_port", str(self.port))
+        self.macro_engine.set(f"{self.syslog_id}_sock", f"127.0.0.1 {self.port}")
+
+    def start(self) -> None:
+        def loop():
+            while not self._stop.is_set():
+                try:
+                    data, _ = self.sock.recvfrom(65535)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+                self.received.append(data.decode("utf-8", "replace"))
+        self._thread = threading.Thread(target=loop, daemon=True)
+        self._thread.start()
+
+    def wait(self, timeout: float = 5.0) -> None:
+        """Waits until every expectation has matched, or the timeout expires.
+
+        Returns rather than raising on timeout; the caller reports the mismatch so the
+        failure names which pattern never arrived.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.unmatched() == []:
+                return
+            time.sleep(0.05)
+
+    def unmatched(self) -> List[str]:
+        """Expectations with no matching datagram, in order."""
+        missing = []
+        for pat in self.expectations:
+            try:
+                rx = re.compile(pat)
+            except re.error:
+                rx = None
+            if rx is None:
+                if not any(pat in line for line in self.received):
+                    missing.append(pat)
+            elif not any(rx.search(line) for line in self.received):
+                missing.append(pat)
+        return missing
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self.sock:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+        if self._thread:
+            self._thread.join(timeout=1.0)
+
+
 class MockServerRunner:
     """Manages an asynchronous mock HTTP/TCP server defined by VTC script."""
 
@@ -1276,6 +1362,7 @@ class VtcExecutor:
 
         self.barriers: Dict[str, asyncio.Barrier] = {}
         self.servers: Dict[str, MockServerRunner] = {}
+        self.syslogs: Dict[str, SyslogRunner] = {}
         self.clients: Dict[str, MockClientRunner] = {}
         self.proxies: Dict[str, subprocess.Popen] = {}
         self.temp_cfgs: List[str] = []
@@ -1294,6 +1381,8 @@ class VtcExecutor:
 
         for s in self.servers.values():
             s.stop()
+        for sl in self.syslogs.values():
+            sl.stop()
 
         if os.path.exists(self.tmpdir):
             try:
@@ -1403,6 +1492,57 @@ class VtcExecutor:
                     v = self.macro_engine.expand(args[1])
                     os.environ[k] = v
                     self.macro_engine.set(k, v)
+
+            elif cmd == "syslog":
+                # `syslog S -level notice { expect ~ "pattern" ... }`
+                syslog_id = args[0]
+                opts = args[1:]
+                if block is not None:
+                    repeat = 1
+                    level = None
+                    start_imm = False
+                    idx = 0
+                    while idx < len(opts):
+                        if opts[idx] == "-repeat" and idx + 1 < len(opts):
+                            repeat = int(opts[idx + 1]); idx += 1
+                        elif opts[idx] == "-level" and idx + 1 < len(opts):
+                            level = opts[idx + 1]; idx += 1
+                        elif opts[idx] == "-start":
+                            start_imm = True
+                        idx += 1
+
+                    # Collect `expect ~ <pattern>` lines from the block.
+                    expectations = []
+                    for raw in block.splitlines():
+                        line = raw.strip()
+                        m = re.match(r'^expect\s+~\s+(.*)$', line)
+                        if m:
+                            pat = m.group(1).strip()
+                            if len(pat) >= 2 and pat[0] == pat[-1] and pat[0] in "\"'":
+                                pat = pat[1:-1]
+                            expectations.append(self.macro_engine.expand(pat))
+
+                    runner = SyslogRunner(syslog_id, self.macro_engine, expectations,
+                                          repeat=repeat, level=level, verbose=self.verbose)
+                    runner.initialize_socket()
+                    self.syslogs[syslog_id] = runner
+                    runner.start()
+                    if self.verbose:
+                        print(f"     {Color.DIM}[syslog {syslog_id}] listening on "
+                              f"127.0.0.1:{runner.port}{Color.RESET}")
+                else:
+                    runner = self.syslogs.get(syslog_id)
+                    if not runner:
+                        raise KeyError(f"Unknown syslog {syslog_id}")
+                    if "-wait" in opts:
+                        runner.wait()
+                        missing = runner.unmatched()
+                        if missing:
+                            raise RuntimeError(
+                                f"syslog {syslog_id}: {len(missing)} expectation(s) never "
+                                f"matched. First: {missing[0]!r}. "
+                                f"Received {len(runner.received)} datagram(s)."
+                            )
 
             elif cmd == "server":
                 server_id = args[0]
