@@ -17,3 +17,6 @@ __pycache__/
 # resolves. They also block the next launch, because agy treats any uncommitted path as
 # the supervisor's and refuses to claim it.
 **/scratch*.rs
+/modify*.py
+/size_measure.rs
+/test_*.rs
