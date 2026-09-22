@@ -67,6 +67,7 @@ pub mod conn;
 pub mod endpoint;
 pub mod exp;
 pub mod h1;
+pub mod parser;
 pub mod h2;
 pub mod hpack;
 pub mod htx;
@@ -89,6 +90,10 @@ pub use conn::{ConnFlags, ConnId, Connection};
 pub use endpoint::{Endpoint, ScFlags, ScState, SeDesc, SeFlags, StConn};
 pub use exp::{apply_cliexp, apply_srvexp, extract_cookie, rewrite_header_block, CompiledExp};
 pub use h1::{H1Parser, H1Phase};
+pub use parser::{
+    available, build, Differential, DifferentialStream, HttpParser, HttpStream, Mismatch,
+    OnMismatch, ParserKind,
+};
 pub use h2::{
     frame_flags, Frame, FrameHeader, FrameType, H2ConnState, H2Error, H2StreamState,
     SettingsParameter, DEFAULT_HEADER_TABLE_SIZE, DEFAULT_INITIAL_WINDOW_SIZE,
