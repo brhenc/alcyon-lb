@@ -19,7 +19,10 @@ ibex-config = { path = "../ibex-config" }
 [dev-dependencies]
 # Test-only: the e2e harness drives a reference TLS endpoint. Nothing in src/ uses
 # tokio, and it must not become a real dependency -- see design/README.md D1.
-tokio-rustls = { workspace = true }
+# Pinned to the same provider as `rustls` above. With default features it
+# enables aws-lc-rs, which makes the process-level provider ambiguous for
+# every crate in the graph, not just this one.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
 tokio = { workspace = true, features = ["full"] }
 rcgen = "0.13"
 tempfile = "3"

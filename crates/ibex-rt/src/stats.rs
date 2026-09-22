@@ -486,7 +486,6 @@ mod tests {
         let proxy = Proxy {
             id: 0,
             log_target_idx: Vec::new(),
-            tls_config: None,
             log_health_checks: false,
             name: "test_proxy".into(),
             addr,

@@ -139,10 +139,42 @@ impl TlsConfig {
     pub fn from_bind_config(bind: &BindConfig) -> Result<Arc<ServerConfig>, String> {
         let mut config = TlsConfig::new();
 
-        if !bind.alpn.is_empty() {
-            let alpn = bind.alpn.iter().map(|s| s.as_bytes().to_vec()).collect();
-            config = config.with_alpn(alpn);
+        // Advertise only what the runtime can actually serve.
+        //
+        // `TlsConfig::default` offers `h2, http/1.1`, and curl duly negotiated h2 against
+        // a listener whose stream layer speaks HTTP/1 only -- the handshake succeeded,
+        // the certificate verified, and then the connection died with a TLS decode error
+        // because neither side was speaking what the other sent. Offering a protocol we
+        // cannot serve breaks every client that prefers it, which today is most of them.
+        //
+        // `h2` is filtered out rather than rejected: an operator copying a working
+        // HAProxy config should not be stopped by it, and dropping it from the offer
+        // degrades to HTTP/1.1 instead of failing. Remove the filter when the h2 mux in
+        // `ibex-proto` is wired into the engine.
+        let requested: Vec<String> = if bind.alpn.is_empty() {
+            vec!["http/1.1".to_string()]
+        } else {
+            bind.alpn.clone()
+        };
+        let (supported, unsupported): (Vec<String>, Vec<String>) = requested
+            .into_iter()
+            .partition(|p| p == "http/1.1" || p == "http/1.0");
+        for p in &unsupported {
+            eprintln!(
+                "[ibex] warning: bind {}: ALPN '{p}' is not served by this build and was \
+                 not advertised",
+                bind.addr
+            );
         }
+        if supported.is_empty() {
+            return Err(format!(
+                "bind {}: none of the requested ALPN protocols ({}) are served by this \
+                 build; a client offering only those would have nothing to negotiate",
+                bind.addr,
+                unsupported.join(", ")
+            ));
+        }
+        config = config.with_alpn(supported.iter().map(|s| s.as_bytes().to_vec()).collect());
 
         let mut resolver = IbexCertResolver::new();
         let mut is_first = true;

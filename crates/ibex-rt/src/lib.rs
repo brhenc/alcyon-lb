@@ -29,7 +29,7 @@ pub mod stats_html;
 pub use applet::{AppletArena, AppletContext, CliApplet};
 pub use buf::Buf;
 pub use check::{CheckEvent, CheckStep, ServerCheckConfig, ServerCheckState, ServerStatus};
-pub use engine::{Engine, Proxy, ProxyStats, SessionArena, SessionEntry};
+pub use engine::{validate_tls, Engine, Proxy, ProxyStats, SessionArena, SessionEntry};
 pub use fdtab::{FdState, FdTab, Interest};
 pub use ibex_proto::{
     build_synthetic_response, default_body_for_status, format_log_format_string,

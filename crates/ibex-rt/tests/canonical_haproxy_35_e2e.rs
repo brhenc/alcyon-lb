@@ -157,12 +157,23 @@ impl CanonicalHarness {
         drop(fe_l);
 
         let raw_cfg = include_str!("../../../examples/canonical_haproxy_35.cfg");
+        // The canonical config terminates TLS, and these tests speak plaintext to the
+        // frontend -- they are about content switching, header injection and rate
+        // limiting. The TLS options are stripped rather than pointed at a generated
+        // certificate so the subject of each test stays what it says it is; TLS has its
+        // own end-to-end coverage in tls_e2e.rs.
+        //
+        // Before certificates were actually loaded, `ssl crt /etc/ibex/certs/` was
+        // accepted and ignored, and these tests ran against a listener that silently
+        // served plaintext. That is precisely the downgrade `bind_tls` now refuses, so
+        // the option has to go rather than be tolerated.
         let adapted = raw_cfg
             .replace("0.0.0.0:8443", &fe_addr.to_string())
             .replace(
                 "bind [::]:8443 ssl crt /etc/ibex/certs/ alpn h2,http/1.1 accept-proxy\n",
                 "",
             )
+            .replace(" ssl crt /etc/ibex/certs/ alpn h2,http/1.1", "")
             .replace("10.0.1.10:8080", &app01.addr.to_string())
             .replace("10.0.1.11:8080", &app02.addr.to_string())
             .replace("10.0.1.99:8080", &app_backup.addr.to_string())

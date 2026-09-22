@@ -8,6 +8,7 @@ use rustix::io::Errno;
 use rustix::net::{self, AddressFamily, SocketFlags, SocketType};
 use std::io;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 
 /// A listening socket owned by one thread.
@@ -36,6 +37,12 @@ pub struct Listener {
     pub maxconn: u32,
     /// Connections currently alive on this listener.
     pub nbconn: u32,
+    /// Server-side TLS for this bind, from `bind ... ssl crt <file>`.
+    ///
+    /// Per listener rather than per proxy because that is how `HAProxy` scopes it: one
+    /// frontend commonly carries `bind :80` beside `bind :443 ssl crt`, and the two must
+    /// not share a transport. `None` is plaintext.
+    pub tls: Option<Arc<rustls::ServerConfig>>,
 }
 
 impl Listener {
@@ -70,6 +77,7 @@ impl Listener {
             proxy,
             maxconn: 0,
             nbconn: 0,
+            tls: None,
         })
     }
 

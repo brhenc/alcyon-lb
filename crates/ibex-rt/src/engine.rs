@@ -139,13 +139,6 @@ pub struct Proxy {
     /// `option log-health-checks`: log every check whose health counter moved, not only
     /// the UP/DOWN transitions.
     pub log_health_checks: bool,
-    /// Server-side TLS for this proxy's bind, when `bind ... ssl crt <file>` supplied one.
-    ///
-    /// `None` means plaintext, which is the state every proxy is in until the certificate
-    /// loading in `ibex-tls` populates this. It is an `Arc` because rustls shares one
-    /// config across every connection a listener accepts -- the certificates and the
-    /// session cache are per-bind, not per-connection.
-    pub tls_config: Option<Arc<rustls::ServerConfig>>,
 }
 
 impl Proxy {
@@ -547,6 +540,77 @@ fn resolve_log_targets(config: &Config, proxies: &mut [Proxy]) -> Vec<SyslogTarg
     targets
 }
 
+/// Loads every TLS bind in the config without binding a port.
+///
+/// `-c` used to return "Configuration file is valid" without ever touching the
+/// certificates, because it exits before `Engine::new`. A missing or unreadable `crt`
+/// then passed validation in CI and failed at startup in production, which is the worst
+/// place to find out. `HAProxy`'s `-c` loads them, so this does too.
+///
+/// # Errors
+///
+/// The first bind whose certificates cannot be loaded, with the frontend and address
+/// named.
+pub fn validate_tls(config: &Config) -> io::Result<()> {
+    for fe in &config.frontends {
+        if fe.disabled {
+            continue;
+        }
+        for bind in fe.binds.iter().filter(|b| b.ssl) {
+            bind_tls(fe, bind.addr)?;
+        }
+    }
+    Ok(())
+}
+
+/// Builds the TLS configuration for one bind, or `None` when it is plaintext.
+///
+/// # Errors
+///
+/// Every failure here is fatal by design, and the reason is the whole point of this
+/// function: an operator who wrote `ssl` on a bind believes that port is encrypted. If a
+/// certificate is missing, unreadable, or has no key, the only two things we can do are
+/// refuse to start or listen on :443 and serve cleartext to clients that think they
+/// negotiated TLS. The second is worse than being down -- it is being down while looking
+/// fine, with credentials going over the wire in the clear -- so this returns an error
+/// and `Engine::new` propagates it.
+///
+/// `ssl` with no `crt` is the same class of mistake and is refused for the same reason.
+fn bind_tls(
+    fe: &ibex_config::FrontendSection,
+    addr: SocketAddr,
+) -> io::Result<Option<Arc<rustls::ServerConfig>>> {
+    let Some(bind) = fe.binds.iter().find(|b| b.addr == addr && b.ssl) else {
+        return Ok(None);
+    };
+
+    // Chosen explicitly rather than inferred from crate features. rustls picks a default
+    // provider only when exactly one of `ring` and `aws-lc-rs` is enabled, and any
+    // dependency anywhere in the graph that turns on the other makes that ambiguous --
+    // at which point `ServerConfig::builder()` panics. It panicked here under
+    // `cargo test --workspace`, where a dev-dependency pulled the second provider in.
+    // Relying on feature arithmetic to decide whether the proxy can start is not a
+    // property worth having; this is idempotent and costs one atomic on the first bind.
+    ibex_tls::install_default_crypto_provider();
+    if bind.crt.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "frontend '{}': bind {addr} has 'ssl' but no 'crt'; refusing to start \
+                 rather than serve cleartext on a port configured for TLS",
+                fe.name
+            ),
+        ));
+    }
+    let cfg = ibex_tls::TlsConfig::from_bind_config(bind).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("frontend '{}': bind {addr} ssl: {e}", fe.name),
+        )
+    })?;
+    Ok(Some(cfg))
+}
+
 fn init_proxy_from_listen(proxy_idx: usize, listen: &ibex_config::ListenSection) -> Proxy {
     let timeouts = Timeouts {
         #[allow(clippy::cast_possible_truncation)]
@@ -602,7 +666,6 @@ fn init_proxy_from_listen(proxy_idx: usize, listen: &ibex_config::ListenSection)
         #[allow(clippy::cast_possible_truncation)]
         id: proxy_idx as u32,
         name: listen.name.clone(),
-        tls_config: None,
         log_target_idx: Vec::new(),
         log_health_checks: listen.log_health_checks,
         addr: listen.addr,
@@ -682,7 +745,6 @@ fn init_proxy_from_frontend(proxy_idx: usize, fe: &ibex_config::FrontendSection)
         #[allow(clippy::cast_possible_truncation)]
         id: proxy_idx as u32,
         name: fe.name.clone(),
-        tls_config: None,
         log_target_idx: Vec::new(),
         log_health_checks: fe.log_health_checks,
         addr: fe.bind.unwrap_or(SocketAddr::new(
@@ -787,7 +849,6 @@ fn init_proxy_from_backend(proxy_idx: usize, be: &ibex_config::BackendSection) -
         #[allow(clippy::cast_possible_truncation)]
         id: proxy_idx as u32,
         name: be.name.clone(),
-        tls_config: None,
         log_target_idx: Vec::new(),
         log_health_checks: be.log_health_checks,
         addr: SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0),
@@ -888,12 +949,18 @@ impl Engine {
             let mut listener = Listener::bind(listen.addr, 128, proxy_idx as u32)?;
             listener.maxconn = listen.maxconn;
 
+            // Keyed by the listener, not the proxy. A proxy may own several listeners
+            // -- `bind :80` beside `bind :443 ssl` is the ordinary HTTP-to-HTTPS setup --
+            // and storing the proxy here meant an event on the second was served by
+            // looking up the first, which is the wrong socket, the wrong connection
+            // accounting and, once TLS is per-bind, the wrong transport.
+            let l_idx = listeners.len();
             let lfd = listener.raw_fd();
             #[allow(clippy::cast_possible_truncation)]
             fdtab.insert(
                 lfd,
                 FdState::Listener {
-                    listener: proxy_idx as u32,
+                    listener: l_idx as u32,
                 },
                 Interest::READ,
             );
@@ -936,13 +1003,15 @@ impl Engine {
                 #[allow(clippy::cast_possible_truncation)]
                 let mut listener = Listener::bind(bind_addr, 128, proxy_idx as u32)?;
                 listener.maxconn = frontend.maxconn;
+                listener.tls = bind_tls(frontend, bind_addr)?;
 
+                let l_idx = listeners.len();
                 let lfd = listener.raw_fd();
                 #[allow(clippy::cast_possible_truncation)]
                 fdtab.insert(
                     lfd,
                     FdState::Listener {
-                        listener: proxy_idx as u32,
+                        listener: l_idx as u32,
                     },
                     Interest::READ,
                 );
@@ -1081,9 +1150,9 @@ impl Engine {
         for &ev in &events {
             match self.fdtab.state(ev.fd) {
                 FdState::Listener { listener: l_idx } => {
-                    let proxy_idx = l_idx as usize;
-                    if proxy_idx < self.proxies.len() {
-                        self.accept_from_listener(proxy_idx);
+                    let l_idx = l_idx as usize;
+                    if l_idx < self.listeners.len() {
+                        self.accept_from_listener(l_idx);
                     }
                 }
                 FdState::CliListener => {
@@ -1198,15 +1267,11 @@ impl Engine {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn accept_from_listener(&mut self, proxy_idx: usize) {
-        #[allow(clippy::cast_possible_truncation)]
-        let Some(l_idx) = self
-            .listeners
-            .iter()
-            .position(|l| l.proxy == proxy_idx as u32)
-        else {
+    fn accept_from_listener(&mut self, l_idx: usize) {
+        let proxy_idx = self.listeners[l_idx].proxy as usize;
+        if proxy_idx >= self.proxies.len() {
             return;
-        };
+        }
 
         let lfd = self.listeners[l_idx].raw_fd();
         if self.listeners[l_idx].is_full() {
@@ -1422,7 +1487,7 @@ impl Engine {
                 self.fdtab.set_interest(lfd, Interest::NONE);
             }
 
-            register_new_session(self, proxy_idx, cli_fd, peer_addr);
+            register_new_session(self, proxy_idx, l_idx, cli_fd, peer_addr);
         }
     }
 
@@ -1504,13 +1569,24 @@ impl Engine {
 fn register_new_session(
     engine: &mut Engine,
     proxy_idx: usize,
+    listener_idx: usize,
     cli_fd: std::os::fd::OwnedFd,
     peer_addr: SocketAddr,
 ) {
+    // Cloned out before `proxies` is borrowed mutably. TLS belongs to the bind that
+    // accepted, not to the proxy, so it is read from the listener.
+    let tls = engine
+        .listeners
+        .get(listener_idx)
+        .and_then(|l| l.tls.clone());
     let proxy = &mut engine.proxies[proxy_idx];
     let cli_raw_fd = cli_fd.as_raw_fd();
-    let (mut sess, target_addr, srv_raw_fd) =
-        init_client_session(proxy, cli_fd, engine.now, peer_addr);
+    let Some((mut sess, target_addr, srv_raw_fd)) =
+        init_client_session(proxy, cli_fd, engine.now, peer_addr, tls.as_ref())
+    else {
+        // TLS setup failed; the fd is dropped with the session and the connection closes.
+        return;
+    };
     sess.client_addr = Some(peer_addr);
 
     let target_server_idx = target_addr.and_then(|t| proxy.servers.iter().position(|&s| s == t));
@@ -1659,7 +1735,8 @@ fn init_client_session(
     cli_fd: std::os::fd::OwnedFd,
     now: Tick,
     peer_addr: SocketAddr,
-) -> (TcpSession, Option<SocketAddr>, Option<RawFd>) {
+    tls: Option<&Arc<rustls::ServerConfig>>,
+) -> Option<(TcpSession, Option<SocketAddr>, Option<RawFd>)> {
     let mode = proxy.mode;
     let timeouts = proxy.timeouts;
     let retries = proxy.retries;
@@ -1678,15 +1755,20 @@ fn init_client_session(
         now,
     );
     sess.client_addr = Some(peer_addr);
-    if let Some(cfg) = proxy.tls_config.as_ref() {
-        // A failure here is a broken rustls config, not a client problem: the session
-        // stays plaintext and the connection will fail on the first byte rather than
-        // being silently served unencrypted. `bind ... ssl` refusing to start (see
-        // bin/ibex.rs) is what keeps that from being reachable in practice.
+    if let Some(cfg) = tls {
+        // The connection is dropped rather than continued in the clear. Falling back to
+        // plaintext here would hand an unencrypted session to a client that opened :443
+        // expecting TLS -- the same downgrade `bind_tls` refuses to start with, arriving
+        // one connection at a time instead of all at once. Closing is visible; serving
+        // cleartext is not.
         match crate::xprt::accept_tls(&sess.cli, Arc::clone(cfg)) {
             Ok(xprt) => sess.cli_xprt = xprt,
             Err(e) => {
-                eprintln!("[ibex] TLS session setup failed on {}: {e}", proxy.name);
+                eprintln!(
+                    "[ibex] {}: dropping connection from {peer_addr}, TLS setup failed: {e}",
+                    proxy.name
+                );
+                return None;
             }
         }
     }
@@ -1727,7 +1809,7 @@ fn init_client_session(
         }
     }
     // In Mode::Http (or Mode::Tcp when accept_proxy is true), target connect is deferred
-    (sess, target_addr, srv_raw_fd)
+    Some((sess, target_addr, srv_raw_fd))
 }
 
 /// Gracefully shuts down a session entry, closing its sockets, reclaiming active connection counters,

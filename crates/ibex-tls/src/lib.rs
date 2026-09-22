@@ -22,6 +22,9 @@ pub mod transport;
 pub use arena::{
     TlsArena, TlsArenaError, TlsSession, TlsSlot, DEFAULT_TLS_BUF_CAPACITY, MAX_TLS_SLOTS,
 };
-pub use config::{create_certified_key, TlsConfig, TlsEngineKind};
+pub use config::{
+    create_certified_key, extract_dns_sans, install_default_crypto_provider, TlsConfig,
+    TlsEngineKind,
+};
 pub use resolver::IbexCertResolver;
 pub use transport::{RustlsContext, RustlsTlsInfo, RustlsTransport};

@@ -252,3 +252,69 @@ mod san_extraction {
         assert_eq!(names, vec!["mixed.example.com".to_string()]);
     }
 }
+
+/// ALPN must offer only what the runtime can serve.
+mod alpn {
+    use ibex_config::ast::BindConfig;
+    use ibex_tls::TlsConfig;
+
+    fn bind_with(alpn: Vec<String>, crt: String) -> BindConfig {
+        BindConfig {
+            addr: "127.0.0.1:8443".parse().expect("addr"),
+            ssl: true,
+            crt: vec![crt],
+            alpn,
+            accept_proxy: false,
+            accept_proxy_v2: false,
+        }
+    }
+
+    fn a_cert() -> (tempfile::TempDir, String) {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("c.pem");
+        std::fs::write(&path, super::common::generate_test_cert_bundle_pem(vec![
+            "localhost".to_string(),
+        ]))
+        .expect("write");
+        let p = path.to_string_lossy().to_string();
+        (dir, p)
+    }
+
+    /// The default offer is HTTP/1.1 alone.
+    ///
+    /// It used to be `h2, http/1.1`, inherited from `TlsConfig::default`. curl negotiated
+    /// h2 against a listener whose stream layer speaks HTTP/1 only: the handshake
+    /// succeeded, the certificate verified, and the connection then died with a TLS
+    /// decode error because each side was reading the other's protocol as its own.
+    #[test]
+    fn h2_is_not_advertised_while_it_cannot_be_served() {
+        let (_dir, crt) = a_cert();
+        let cfg = TlsConfig::from_bind_config(&bind_with(Vec::new(), crt)).expect("build");
+        assert_eq!(
+            cfg.alpn_protocols,
+            vec![b"http/1.1".to_vec()],
+            "only protocols the runtime serves may be offered"
+        );
+    }
+
+    /// An operator asking for h2 gets HTTP/1.1 rather than a broken connection.
+    #[test]
+    fn a_requested_h2_is_dropped_not_honoured() {
+        let (_dir, crt) = a_cert();
+        let bind = bind_with(vec!["h2".to_string(), "http/1.1".to_string()], crt);
+        let cfg = TlsConfig::from_bind_config(&bind).expect("build");
+        assert_eq!(cfg.alpn_protocols, vec![b"http/1.1".to_vec()]);
+    }
+
+    /// Asking for nothing servable is an error, not an empty offer.
+    ///
+    /// An empty ALPN list means "no preference", so a client offering only h2 would be
+    /// given a connection and then find nothing on the other end.
+    #[test]
+    fn requesting_only_unservable_protocols_is_refused() {
+        let (_dir, crt) = a_cert();
+        let bind = bind_with(vec!["h2".to_string()], crt);
+        let err = TlsConfig::from_bind_config(&bind).expect_err("must refuse");
+        assert!(err.contains("ALPN"), "{err}");
+    }
+}
