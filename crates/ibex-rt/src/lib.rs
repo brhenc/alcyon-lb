@@ -17,6 +17,7 @@ pub mod check;
 pub mod engine;
 pub mod fdtab;
 pub mod listener;
+pub mod logfmt;
 pub mod poller;
 pub mod proxy;
 pub mod raw;
@@ -34,6 +35,7 @@ pub use ibex_proto::{
     remove_http_header_with_len, status_reason_phrase,
 };
 pub use listener::Listener;
+pub use logfmt::{LogFormat, LogNames, LogVars};
 pub use poller::{Event, Poller};
 pub use proxy::{find_eoh, Ending, TcpSession, Timeouts, Want, Which};
 pub use raw::Io;
