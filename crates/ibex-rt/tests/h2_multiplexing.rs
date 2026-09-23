@@ -88,9 +88,10 @@ fn spawn_backend() -> (u16, Arc<Mutex<Vec<String>>>) {
 
 /// One HTTP/2 frame: 24-bit length, type, flags, 31-bit stream id, payload.
 fn frame(ftype: u8, flags: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
-    let len = payload.len();
-    let mut v = Vec::with_capacity(9 + len);
-    v.extend_from_slice(&[(len >> 16) as u8, (len >> 8) as u8, len as u8]);
+    let len = u32::try_from(payload.len()).expect("frame payload fits in 24 bits");
+    let mut v = Vec::with_capacity(9 + payload.len());
+    // 24-bit big-endian length: the top byte of the u32 is always zero here.
+    v.extend_from_slice(&len.to_be_bytes()[1..]);
     v.push(ftype);
     v.push(flags);
     v.extend_from_slice(&stream_id.to_be_bytes());
