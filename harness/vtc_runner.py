@@ -666,7 +666,34 @@ def decode_escapes(s: str) -> str:
     return s.replace("\\n", "\n").replace("\\r", "\r").replace("\\t", "\t")
 
 
-def evaluate_expectation(
+# Assertions actually evaluated, process-wide. A pass has to mean an assertion was made
+# and held; counting declared directives instead let `cache/caching_rules.vtc` -- 93
+# `expect` statements, two mock servers started, no proxy launched, no client run -- be
+# reported PASS in 0.00s.
+_assertion_total = 0
+
+
+def assertions_evaluated() -> int:
+    return _assertion_total
+
+
+def _note_assertion() -> None:
+    global _assertion_total
+    _assertion_total += 1
+
+
+def reset_assertion_counter() -> None:
+    global _assertion_total
+    _assertion_total = 0
+
+
+def evaluate_expectation(*args, **kwargs) -> "ExpectationResult":
+    """Counting front door for `_evaluate_expectation`."""
+    _note_assertion()
+    return _evaluate_expectation(*args, **kwargs)
+
+
+def _evaluate_expectation(
     expr: str,
     op: str,
     expected_val: str,
@@ -1490,6 +1517,7 @@ class VtcExecutor:
     async def execute(self) -> TestResult:
         start_time = time.monotonic()
         test_title = self.parser.title
+        reset_assertion_counter()
 
         try:
             # Check feature prerequisites
@@ -1525,26 +1553,22 @@ class VtcExecutor:
                 if cli.error is not None:
                     raise cli.error
 
-            # A test that drove nothing has not passed.
+            # A test that asserted nothing has not passed.
             #
-            # Every .vtc that is just `include ${testdir}/x.vtci` ran zero directives and
-            # was reported PASS -- 18 of them in reg-tests/ssl alone, each in 0.01s, which
-            # is a scoreboard saying TLS works when nothing had been asked. A pass has to
-            # mean an assertion was made and held.
-            exercised = {d.cmd for d in self.parser.directives} & {
-                "client",
-                "server",
-                "haproxy",
-                "syslog",
-                "shell",
-            }
-            if not exercised:
+            # This used to check which directives the file *declared*, which is not the
+            # same question. `cache/caching_rules.vtc` declares 93 `expect` statements;
+            # the run started two mock servers, never launched the proxy, never ran a
+            # client, evaluated nothing, and was reported PASS in 0.00s. Declaring a
+            # `server` block was enough to satisfy the old guard.
+            #
+            # The honest test is how many assertions were actually evaluated.
+            if assertions_evaluated() == 0:
                 return TestResult(
                     test_name=test_title,
                     file_path=self.parser.filepath,
                     status="SKIP",
                     elapsed_sec=time.monotonic() - start_time,
-                    error_message="no directives were executed; nothing was asserted",
+                    error_message="no assertions were evaluated; nothing was tested",
                 )
 
             elapsed = time.monotonic() - start_time

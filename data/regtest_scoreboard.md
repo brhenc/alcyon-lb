@@ -2,12 +2,23 @@
 
 Generated 2026-09-23 against HAProxy 3.5-dev7 reg-tests.
 
-**10 of 174 in-scope tests passing** — 164 failing, 86 skipped, 52 out of scope.
+**7 of 171 in-scope tests passing** — 164 failing, 89 skipped, 52 out of scope.
 
-The raw figure is 10 of 312. The denominator that means something is 174: the suite
-contains 114 tests for features declined in `tradeoff.md` §4.2, and 86 more gated off by
-`.if feature()` conditions this build does not satisfy. Counting either as debt measures a
-decision rather than a gap.
+The raw figure is 7 of 312. The denominator that means something is 171: the suite contains
+114 tests for features declined in `tradeoff.md` §4.2, and 89 more gated off or asserting
+nothing. Counting either as debt measures a decision rather than a gap.
+
+**Three of the ten previously-reported passes were vacuous** and are now skips —
+`cache/caching_rules.vtc`, `mcli/mcli_show_info.vtc` and
+`webstats/missing-stats-fields.vtc`. The worst of them declares 93 `expect` statements;
+the run started two mock servers, never launched the proxy, never ran a client, evaluated
+nothing, and finished PASS in 0.00 s.
+
+The cause was the guard that was supposed to prevent exactly this. It checked which
+directives the file *declared* rather than what ran, so declaring a `server` block was
+enough. It now requires that at least one assertion was actually evaluated. Two of the
+three were found by spot-checking the out-of-scope passes; the third the guard found on its
+own.
 
 Previous run, 2026-09-22: **14 / 212 / 86**.
 
