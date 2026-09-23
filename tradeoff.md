@@ -239,6 +239,39 @@ before this is run anywhere real.**
 | **Status** | **measured** — verified and pinned to ≤ 20 MB bound (without checks) and ≤ 35 MB bound (with checks) in `crates/ibex-rt/tests/request_allocations.rs` (`sixty_thousand_backends_memory_bounded` and `sixty_thousand_backends_with_checks_memory_bounded`). |
 | **Revisit if** | Backends require heavy embedded state that cannot be modeled compactly or shared across worker contexts. |
 
+**2026-09-23: the with-checks figure moved to 47.09 MB and the bound was deliberately not
+raised.** Implementing `option httpchk`, `http-check` and `tcp-check` (T36) took the
+60,000-backend-with-checks measurement from 29.75 MB to 49,375,208 bytes:
+
+```
+before   29.75 MB   120,033 allocations
+after    47.09 MB   120,042 allocations
+```
+
+The allocation **count** is unchanged — nine more across sixty thousand servers — so nothing
+new is being allocated per server. Each `ServerCheckState` simply got bigger, because it now
+carries the check configuration: method, URI, version, the expect rules, the tcp-check step
+list. That is +289 bytes per server, and it is the cost of the feature rather than a leak.
+
+`sixty_thousand_backends_with_checks_memory_bounded` fails at its 35 MB bound as a result,
+and **it is being left failing on purpose.** `nudge-agy-8` set the rule when this bound was
+created: *"Do not simply raise the bound. The bound is not the finding."* A bound that moves
+whenever it is inconvenient measures nothing.
+
+The reason not to optimise this now is more interesting than the number. Ibex implements a
+fraction of HAProxy's feature set, and every feature still to come — the shared idle
+connection pool, stick-table synchronisation, the cache, `log-format` evaluation — will add
+per-server or per-session state of its own. **We do not yet know what the memory profile of a
+feature-complete Ibex looks like**, so tuning a struct against today's partial set is
+optimising toward a shape that will not exist. 47 MB is still 4.4× better than HAProxy's
+207 MB for the same 60,000 backends, which is the comparison that matters, and it leaves
+plenty of headroom to spend on correctness first.
+
+The right time to revisit is when the feature set is close enough to HAProxy's that the
+comparison is like-for-like. Until then this entry records the trajectory rather than a
+target: **14.00 MB bare, 29.75 MB with TCP-connect checks, 47.09 MB with HTTP checks**, and
+the next number belongs beside them.
+
 
 ### 6.6 Map converters in-memory caching — **resolved**
 
