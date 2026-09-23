@@ -23,7 +23,7 @@ use std::sync::{Arc, LazyLock, RwLock};
 
 thread_local! {
     pub static CURRENT_VARS: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
-    pub static CURRENT_TIMEOUTS: RefCell<HashMap<String, u32>> = RefCell::new(HashMap::new());
+    pub static CURRENT_TIMEOUTS: RefCell<HashMap<&'static str, u32>> = RefCell::new(HashMap::new());
     pub static CURRENT_RES_HEADERS: RefCell<Vec<(String, String)>> = const { RefCell::new(Vec::new()) };
     pub static CURRENT_RES_STATUS: Cell<u16> = const { Cell::new(0) };
 }
@@ -59,7 +59,7 @@ pub fn set_current_vars(vars: HashMap<String, String>) {
 }
 
 #[allow(clippy::implicit_hasher)]
-pub fn set_current_timeouts(timeouts: HashMap<String, u32>) {
+pub fn set_current_timeouts(timeouts: HashMap<&'static str, u32>) {
     CURRENT_TIMEOUTS.with(|t| *t.borrow_mut() = timeouts);
 }
 

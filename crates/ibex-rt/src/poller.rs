@@ -29,8 +29,7 @@ pub struct Event {
 /// and let other work run.
 pub struct Poller {
     epfd: OwnedFd,
-    events: Vec<epoll::Event>,
-    capacity: usize,
+    event_buf: epoll::EventVec,
 }
 
 impl Poller {
@@ -40,8 +39,7 @@ impl Poller {
         let epfd = epoll::create(epoll::CreateFlags::CLOEXEC)?;
         Ok(Poller {
             epfd,
-            events: Vec::with_capacity(capacity),
-            capacity,
+            event_buf: epoll::EventVec::with_capacity(capacity),
         })
     }
 
@@ -121,8 +119,7 @@ impl Poller {
         timeout: Option<Duration>,
         mut f: F,
     ) -> io::Result<usize> {
-        self.events.clear();
-        self.events.reserve(self.capacity);
+        self.event_buf.clear();
 
         // rustix 0.38 takes a millisecond timeout, with -1 meaning "block".
         let ms: i32 = match timeout {
@@ -130,15 +127,14 @@ impl Poller {
             Some(d) => i32::try_from(d.as_millis()).unwrap_or(i32::MAX),
         };
 
-        let mut buf = epoll::EventVec::with_capacity(self.capacity);
-        match epoll::wait(self.epfd.as_fd(), &mut buf, ms) {
+        match epoll::wait(self.epfd.as_fd(), &mut self.event_buf, ms) {
             Ok(()) => {}
             Err(Errno::INTR) => return Ok(0),
             Err(e) => return Err(e.into()),
         }
 
         let mut n = 0;
-        for ev in &buf {
+        for ev in &self.event_buf {
             let fl = ev.flags;
             f(Event {
                 fd: RawFd::try_from(ev.data.u64()).unwrap_or(-1),

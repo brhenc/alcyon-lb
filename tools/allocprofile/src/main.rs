@@ -70,6 +70,9 @@ fn backend(l: TcpListener, run: Arc<AtomicBool>) -> thread::JoinHandle<()> {
         }
     })
 }
+/// Drives one request and **asserts it succeeded**. A profiler that silently measures a
+/// request the daemon failed to serve reports a wonderful number for the wrong reason;
+/// this is the control that stops that.
 fn drive(fe: SocketAddr, e: &mut Engine) {
     let mut c = TcpStream::connect(fe).unwrap();
     c.set_nonblocking(true).unwrap();
@@ -82,6 +85,12 @@ fn drive(fe: SocketAddr, e: &mut Engine) {
         thread::sleep(Duration::from_millis(1));
     }
     for _ in 0..5 { let _ = e.run_once(); thread::sleep(Duration::from_millis(1)); }
+    let text = String::from_utf8_lossy(&r);
+    assert!(
+        text.starts_with("HTTP/1.1 200"),
+        "the profiled request did not succeed, so the allocation count below is \
+         meaningless. Got: {text:?}"
+    );
 }
 
 fn main() {

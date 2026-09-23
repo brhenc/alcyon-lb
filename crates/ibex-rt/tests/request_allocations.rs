@@ -189,13 +189,17 @@ fn a_steady_state_http_request_allocates_no_more_than_n_times() {
 
     let diff = before.diff(&after);
     println!(
-        "[MEASUREMENT 2026-09-22] HTTP request allocations: {} allocs, {} bytes",
+        "[MEASUREMENT 2026-09-23] HTTP request allocations: {} allocs, {} bytes",
         diff.alloc_count, diff.bytes_allocated
     );
 
     // Initial baseline recorded: 89 allocs, pinned to <= 95.
     // 2026-09-22: Measured 90 allocs with decoupled pool; bound lowered to <= 93.
-    let max_allowed_allocs: usize = 93;
+    // 2026-09-23 (Nudge 6): Measured 17 allocs, 891 bytes (down from 90 allocs, 41,194 bytes).
+    // Eliminated buf::alloc_standard (was 32 KB), Poller::poll (was 6 KB),
+    // connect_http_backend (was 41 allocs), and apply_http_response_rules (was 22 allocs).
+    // Bound lowered from 93 to <= 25.
+    let max_allowed_allocs: usize = 25;
     assert!(
         diff.alloc_count <= max_allowed_allocs,
         "a steady state HTTP request allocated {} times (> {}); diff: {:?}",
@@ -257,14 +261,16 @@ fn a_steady_state_tcp_connection_allocates_no_more_than_n_times() {
 
     let diff = before.diff(&after);
     println!(
-        "[MEASUREMENT 2026-09-22] TCP connection allocations: {} allocs, {} bytes",
+        "[MEASUREMENT 2026-09-23] TCP connection allocations: {} allocs, {} bytes",
         diff.alloc_count, diff.bytes_allocated
     );
 
     // Initial baseline recorded: 28 allocs, 52,736 bytes, pinned to <= 35.
     // 2026-09-22: Measured 26 allocs, 19,968 bytes (-2 allocs, -32,768 bytes allocated).
     // Bound lowered from 35 to <= 30.
-    let max_allowed_allocs: usize = 30;
+    // 2026-09-23 (Nudge 6): Measured 0 allocs, 0 bytes. Buffer reuse and poller event buffer reuse.
+    // Bound lowered from 30 to <= 5.
+    let max_allowed_allocs: usize = 5;
     assert!(
         diff.alloc_count <= max_allowed_allocs,
         "a steady state TCP connection allocated {} times (> {}); diff: {:?}",
@@ -342,13 +348,15 @@ fn a_request_with_acl_and_log_format_allocates_no_more_than_n_times() {
 
     let diff = before.diff(&after);
     println!(
-        "[MEASUREMENT 2026-09-22] ACL + log-format request allocations: {} allocs, {} bytes",
+        "[MEASUREMENT 2026-09-23] ACL + log-format request allocations: {} allocs, {} bytes",
         diff.alloc_count, diff.bytes_allocated
     );
 
     // Initial baseline recorded: 93 allocs, pinned to <= 105.
     // 2026-09-22: Measured 94 allocs with decoupled pool; bound lowered from 105 to <= 98.
-    let max_allowed_allocs: usize = 98;
+    // 2026-09-23 (Nudge 6): Measured 17 allocs, 891 bytes (down from 94 allocs, 41,804 bytes).
+    // Bound lowered from 98 to <= 25.
+    let max_allowed_allocs: usize = 25;
     assert!(
         diff.alloc_count <= max_allowed_allocs,
         "an ACL + log-format request allocated {} times (> {}); diff: {:?}",

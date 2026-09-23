@@ -312,10 +312,18 @@ fn poller_and_fdtab_integrate_with_a_session() {
 }
 
 fn free_addr() -> SocketAddr {
-    let l = TcpListener::bind(loopback0()).expect("bind");
-    let addr = l.local_addr().expect("addr");
-    drop(l);
-    addr
+    static NEXT_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+    let pid_offset = u16::try_from(std::process::id() % 10000).unwrap_or(0);
+    let base = 30000 + pid_offset;
+    loop {
+        let offset = NEXT_PORT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let port = base + (offset % 20000);
+        let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
+        if let Ok(l) = TcpListener::bind(addr) {
+            drop(l);
+            return addr;
+        }
+    }
 }
 
 fn start_dummy_backend(

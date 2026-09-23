@@ -144,6 +144,7 @@ pub struct TcpSession {
     pub tracked_sc: [Option<(usize, StickKey)>; 3],
     pub bufsize: usize,
     pub maxrewrite: usize,
+    pub connection_close: bool,
 }
 
 impl TcpSession {
@@ -226,6 +227,7 @@ impl TcpSession {
             sess_vars: HashMap::new(),
             req_vars: HashMap::new(),
             tracked_sc: [None, None, None],
+            connection_close: false,
         };
         s.arm_client(now);
         s
@@ -389,6 +391,9 @@ impl TcpSession {
         let mut stream = parser.stream(false);
         let mut htx = Htx::new();
         stream.parse(&self.req.readable()[..head_len], &mut htx)?;
+        if stream.connection_close() {
+            self.connection_close = true;
+        }
         if stream.framing_conflict() {
             // RFC 9112: Transfer-Encoding wins and the connection must not be reused.
             // The message is parseable, so this is not an error -- but forwarding it to a
@@ -564,6 +569,12 @@ impl TcpSession {
                         hdrs.push((k.trim().to_string(), v.trim().to_string()));
                     }
                 }
+                if hdrs.iter().any(|(k, v)| k.eq_ignore_ascii_case("connection") && v.eq_ignore_ascii_case("close")) {
+                    self.connection_close = true;
+                }
+                if first_line.contains("HTTP/1.0") && !hdrs.iter().any(|(k, v)| k.eq_ignore_ascii_case("connection") && v.eq_ignore_ascii_case("keep-alive")) {
+                    self.connection_close = true;
+                }
                 self.req_headers = Some(hdrs);
 
                 if let Some(ref cname) = self.cookie_name {
@@ -635,6 +646,14 @@ impl TcpSession {
                 if srv_done_sending && self.rep.is_empty() && self.pending_resp.is_none() {
                     raw::shutdown_write(self.cli.as_fd());
                     self.cli_state = ScState::ShutW;
+                    if self.connection_close {
+                        raw::shutdown_read(self.cli.as_fd());
+                        self.cli_state = ScState::Closed;
+                        if let Some(sfd) = self.srv.as_ref().map(AsFd::as_fd) {
+                            raw::shutdown_write(sfd);
+                        }
+                        self.srv_state = ScState::Closed;
+                    }
                     self.ending
                         .get_or_insert(if self.srv_state == ScState::Error {
                             Ending::ServerAbort
@@ -662,6 +681,7 @@ impl TcpSession {
                 if srv_done_sending && self.rep.is_empty() && self.pending_resp.is_none() {
                     raw::shutdown_write(self.cli.as_fd());
                     self.cli_state = ScState::Closed;
+                    self.srv_state = ScState::Closed;
                     self.ending
                         .get_or_insert(if self.srv_state == ScState::Error {
                             Ending::ServerAbort

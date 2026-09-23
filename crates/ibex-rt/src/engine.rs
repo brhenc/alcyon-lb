@@ -318,7 +318,7 @@ impl SessionArena {
     pub fn with_capacity(cap: usize) -> Self {
         SessionArena {
             entries: Vec::with_capacity(cap),
-            free: Vec::new(),
+            free: Vec::with_capacity(cap),
             live: 0,
         }
     }
@@ -3071,6 +3071,7 @@ impl EngineDispatcher<'_> {
                         self.proxies[proxy_idx].stats.denied_req += 1;
                         entry.sess.cli_state = ScState::Closed;
                         entry.sess.srv_state = ScState::Closed;
+                        entry.sess.tcp_inspect_done = true;
                     }
                     ContentEvalResult::SilentDrop => {
                         let is_ipv6 = entry.sess.client_addr.is_some_and(|a| a.is_ipv6());
@@ -3078,6 +3079,7 @@ impl EngineDispatcher<'_> {
                         self.proxies[proxy_idx].stats.denied_req += 1;
                         entry.sess.cli_state = ScState::Closed;
                         entry.sess.srv_state = ScState::Closed;
+                        entry.sess.tcp_inspect_done = true;
                     }
                     ContentEvalResult::Waiting => {}
                 }
@@ -3125,48 +3127,64 @@ impl EngineDispatcher<'_> {
                 && entry.response_rules_applied
                 && entry.sess.rep.is_empty()
                 && entry.sess.pending_resp.is_none()
-                && entry.sess.cli_state.can_read()
             {
-                // Keep the backend connection for the next request on this session.
-                //
-                // Tearing it down after every transaction meant each keep-alive request
-                // opened a fresh upstream connection, which is both a large performance
-                // regression and a behavioural one: a backend that accepts once and
-                // serves many requests on that stream never sees request two. HAProxy
-                // reuses backend connections by default (`http-reuse safe`).
-                //
-                // It is only closed when the far end is actually finished with it --
-                // the server closed its read side, or the connection errored.
-                let backend_finished = entry.sess.srv.is_none()
+                let close_requested = entry.sess.connection_close
+                    || matches!(
+                        entry.sess.cli_state,
+                        ScState::ShutW | ScState::ShutR | ScState::Closed | ScState::Error
+                    )
                     || matches!(
                         entry.sess.srv_state,
-                        ScState::Closed | ScState::Error
+                        ScState::ShutR | ScState::Closed | ScState::Error
                     );
-                if backend_finished {
-                    if let Some(srv_fd) = entry.sess.srv.take() {
-                        let sfd = srv_fd.as_raw_fd();
-                        self.fdtab.remove(sfd);
-                        let _ = self.poller.delete(srv_fd.as_fd());
-                        entry.srv_raw_fd = None;
+                if close_requested {
+                    entry.sess.cli_state = ScState::Closed;
+                    entry.sess.srv_state = ScState::Closed;
+                    entry.sess.ending.get_or_insert(crate::proxy::Ending::Complete);
+                } else if entry.sess.cli_state.can_read() && entry.sess.cli_state.can_write() {
+                    // Keep the backend connection for the next request on this session.
+                    //
+                    // Tearing it down after every transaction meant each keep-alive request
+                    // opened a fresh upstream connection, which is both a large performance
+                    // regression and a behavioural one: a backend that accepts once and
+                    // serves many requests on that stream never sees request two. HAProxy
+                    // reuses backend connections by default (`http-reuse safe`).
+                    //
+                    // It is only closed when the far end is actually finished with it --
+                    // the server closed its read side, or the connection errored.
+                    let backend_finished = entry.sess.srv.is_none()
+                        || matches!(
+                            entry.sess.srv_state,
+                            ScState::Closed | ScState::Error
+                        );
+                    if backend_finished {
+                        if let Some(srv_fd) = entry.sess.srv.take() {
+                            let sfd = srv_fd.as_raw_fd();
+                            self.fdtab.remove(sfd);
+                            let _ = self.poller.delete(srv_fd.as_fd());
+                            entry.srv_raw_fd = None;
+                        }
+                        entry.target_addr = None;
+                        entry.target_server_idx = None;
                     }
-                    entry.target_addr = None;
-                    entry.target_server_idx = None;
-                }
-                entry.response_rules_applied = false;
-                entry.sess.resp_headers_processed = false;
-                if backend_finished {
-                    entry.sess.srv_state = ScState::Init;
-                }
-                entry.sess.req_method = None;
-                entry.sess.req_uri = None;
-                entry.sess.req_headers = None;
-                entry.sess.cli_state = ScState::Ready;
-                entry.sess.req_vars.clear();
-                if !self.proxies[entry.proxy_idx].tcp_req_content_rules.is_empty() {
-                    entry.sess.tcp_inspect_done = false;
-                    if let Some(delay) = self.proxies[entry.proxy_idx].tcp_req_inspect_delay {
-                        let ms = u32::try_from(delay.as_millis()).unwrap_or(u32::MAX);
-                        entry.sess.inspect_exp = Some(now.add(ms));
+                    entry.response_rules_applied = false;
+                    entry.sess.resp_headers_processed = false;
+                    if backend_finished {
+                        entry.sess.srv_state = ScState::Init;
+                    }
+                    entry.sess.req_method = None;
+                    entry.sess.req_uri = None;
+                    entry.sess.req_headers = None;
+                    entry.sess.cli_state = ScState::Ready;
+                    entry.sess.req_vars.clear();
+                    if !self.proxies[entry.proxy_idx].tcp_req_content_rules.is_empty() {
+                        let _ = eval_tcp_req_content_rules(
+                            &self.proxies[entry.proxy_idx],
+                            self.proxies,
+                            sample_registry(),
+                            &mut entry.sess,
+                            now,
+                        );
                     }
                 }
             }
@@ -3243,7 +3261,32 @@ impl EngineDispatcher<'_> {
             entry.sess.resp_headers_processed = true;
             return;
         }
+
         let hdr_bytes = &entry.sess.rep.readable()[..total_hdr_len];
+        if let Ok(s) = std::str::from_utf8(hdr_bytes) {
+            for line in s.lines() {
+                if let Some((k, v)) = line.split_once(':') {
+                    if k.trim().eq_ignore_ascii_case("connection") && v.trim().eq_ignore_ascii_case("close") {
+                        entry.sess.connection_close = true;
+                    }
+                }
+            }
+        }
+
+        let has_rules = !proxies[be_idx].http_res_rules.is_empty()
+            || !proxies[be_idx].http_after_res_rules.is_empty()
+            || !proxies[fe_idx].http_res_rules.is_empty()
+            || !proxies[fe_idx].http_after_res_rules.is_empty()
+            || !proxies[be_idx].srvexp.is_empty();
+
+        if !has_rules {
+            if entry.sess.srv.is_some() {
+                entry.sess.srv_state = ScState::Established;
+            }
+            entry.sess.resp_headers_processed = true;
+            return;
+        }
+
         let hdr_str = String::from_utf8_lossy(hdr_bytes);
 
         let Some((first_line, rest_headers)) = hdr_str.split_once("\r\n") else {
@@ -3924,25 +3967,25 @@ impl EngineDispatcher<'_> {
             let fe_tunnel = proxies[proxy_idx].stats_config.raw_timeouts.tunnel.map_or(0, millis_to_u32);
             let fe_tarpit = proxies[proxy_idx].stats_config.raw_timeouts.tarpit.map_or(0, millis_to_u32);
 
-            map.insert("fe_client_timeout".into(), fe_client);
-            map.insert("cur_client_timeout".into(), fe_client);
-            map.insert("fe_connect_timeout".into(), fe_connect);
-            map.insert("cur_connect_timeout".into(), fe_connect);
-            map.insert("fe_server_timeout".into(), fe_server);
-            map.insert("cur_server_timeout".into(), fe_server);
-            map.insert("fe_queue_timeout".into(), fe_queue);
-            map.insert("cur_queue_timeout".into(), fe_queue);
-            map.insert("fe_tunnel_timeout".into(), fe_tunnel);
-            map.insert("cur_tunnel_timeout".into(), fe_tunnel);
-            map.insert("fe_tarpit_timeout".into(), fe_tarpit);
-            map.insert("cur_tarpit_timeout".into(), fe_tarpit);
+            map.insert("fe_client_timeout", fe_client);
+            map.insert("cur_client_timeout", fe_client);
+            map.insert("fe_connect_timeout", fe_connect);
+            map.insert("cur_connect_timeout", fe_connect);
+            map.insert("fe_server_timeout", fe_server);
+            map.insert("cur_server_timeout", fe_server);
+            map.insert("fe_queue_timeout", fe_queue);
+            map.insert("cur_queue_timeout", fe_queue);
+            map.insert("fe_tunnel_timeout", fe_tunnel);
+            map.insert("cur_tunnel_timeout", fe_tunnel);
+            map.insert("fe_tarpit_timeout", fe_tarpit);
+            map.insert("cur_tarpit_timeout", fe_tarpit);
 
-            map.insert("be_client_timeout".into(), fe_client);
-            map.insert("be_server_timeout".into(), fe_server);
-            map.insert("be_connect_timeout".into(), fe_connect);
-            map.insert("be_queue_timeout".into(), fe_queue);
-            map.insert("be_tunnel_timeout".into(), fe_tunnel);
-            map.insert("be_tarpit_timeout".into(), fe_tarpit);
+            map.insert("be_client_timeout", fe_client);
+            map.insert("be_server_timeout", fe_server);
+            map.insert("be_connect_timeout", fe_connect);
+            map.insert("be_queue_timeout", fe_queue);
+            map.insert("be_tunnel_timeout", fe_tunnel);
+            map.insert("be_tarpit_timeout", fe_tarpit);
         });
         STRICT_MODE.set(true);
         REWRITE_ADDED_BYTES.set(0);
@@ -3977,18 +4020,15 @@ impl EngineDispatcher<'_> {
         let mut sc_http_req_rates = [0u64; 3];
         let mut sc_conn_rates = [0u64; 3];
 
-        let req_uri_clone = entry.sess.req_uri.clone();
-        let req_method_clone = entry.sess.req_method.clone();
-        let req_headers_clone = entry.sess.req_headers.clone();
         let http_sample_ctx = SampleContext {
             client_addr: entry.sess.client_addr,
             server_addr: entry.target_addr,
             fc_src: entry.sess.fc_src,
             fc_dst: entry.sess.fc_dst,
             proxy_tlvs: entry.sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
-            req_uri: req_uri_clone.as_deref(),
-            req_method: req_method_clone.as_deref(),
-            req_headers: req_headers_clone.as_deref(),
+            req_uri: entry.sess.req_uri.as_deref(),
+            req_method: entry.sess.req_method.as_deref(),
+            req_headers: entry.sess.req_headers.as_deref(),
             act_conn: proxies[proxy_idx].stats.act_conn,
             cum_conn: proxies[proxy_idx].stats.cum_conn,
             ..Default::default()
@@ -4394,28 +4434,28 @@ impl EngineDispatcher<'_> {
                             let mut map = t.borrow_mut();
                             match timeout_type.as_str() {
                                 "client" => {
-                                    map.insert("cur_client_timeout".into(), ms);
-                                    map.insert("cur_client_timeout_set".into(), 1);
+                                    map.insert("cur_client_timeout", ms);
+                                    map.insert("cur_client_timeout_set", 1);
                                 }
                                 "server" => {
-                                    map.insert("cur_server_timeout".into(), ms);
-                                    map.insert("cur_server_timeout_set".into(), 1);
+                                    map.insert("cur_server_timeout", ms);
+                                    map.insert("cur_server_timeout_set", 1);
                                 }
                                 "connect" => {
-                                    map.insert("cur_connect_timeout".into(), ms);
-                                    map.insert("cur_connect_timeout_set".into(), 1);
+                                    map.insert("cur_connect_timeout", ms);
+                                    map.insert("cur_connect_timeout_set", 1);
                                 }
                                 "queue" => {
-                                    map.insert("cur_queue_timeout".into(), ms);
-                                    map.insert("cur_queue_timeout_set".into(), 1);
+                                    map.insert("cur_queue_timeout", ms);
+                                    map.insert("cur_queue_timeout_set", 1);
                                 }
                                 "tunnel" => {
-                                    map.insert("cur_tunnel_timeout".into(), ms);
-                                    map.insert("cur_tunnel_timeout_set".into(), 1);
+                                    map.insert("cur_tunnel_timeout", ms);
+                                    map.insert("cur_tunnel_timeout_set", 1);
                                 }
                                 "tarpit" => {
-                                    map.insert("cur_tarpit_timeout".into(), ms);
-                                    map.insert("cur_tarpit_timeout_set".into(), 1);
+                                    map.insert("cur_tarpit_timeout", ms);
+                                    map.insert("cur_tarpit_timeout_set", 1);
                                 }
                                 _ => {}
                             }
@@ -4550,10 +4590,12 @@ impl EngineDispatcher<'_> {
         };
 
         // Execute frontend rules
-        let fe_rules = proxies[proxy_idx].http_req_rules.clone();
-        let fe_acls = proxies[proxy_idx].acls.clone();
-        if let Ok(Some(())) = eval_http_rules(&fe_rules, &fe_acls, &mut entry.sess, entry.target_addr) {
-            return None;
+        if !proxies[proxy_idx].http_req_rules.is_empty() {
+            let fe_rules = &proxies[proxy_idx].http_req_rules;
+            let fe_acls = &proxies[proxy_idx].acls;
+            if let Ok(Some(())) = eval_http_rules(fe_rules, fe_acls, &mut entry.sess, entry.target_addr) {
+                return None;
+            }
         }
 
         // 3. Resolve backend and server
@@ -4598,25 +4640,25 @@ impl EngineDispatcher<'_> {
             let be_tunnel = proxies[be_idx].stats_config.raw_timeouts.tunnel.map_or(0, millis_to_u32);
             let be_tarpit = proxies[be_idx].stats_config.raw_timeouts.tarpit.map_or(0, millis_to_u32);
 
-            map.insert("be_server_timeout".into(), be_server);
-            map.insert("be_connect_timeout".into(), be_connect);
-            map.insert("be_queue_timeout".into(), be_queue);
-            map.insert("be_tunnel_timeout".into(), be_tunnel);
-            map.insert("be_tarpit_timeout".into(), be_tarpit);
+            map.insert("be_server_timeout", be_server);
+            map.insert("be_connect_timeout", be_connect);
+            map.insert("be_queue_timeout", be_queue);
+            map.insert("be_tunnel_timeout", be_tunnel);
+            map.insert("be_tarpit_timeout", be_tarpit);
 
             if be_idx != proxy_idx {
-                map.insert("cur_server_timeout".into(), be_server);
-                map.insert("cur_connect_timeout".into(), be_connect);
-                map.insert("cur_queue_timeout".into(), be_queue);
-                map.insert("cur_tunnel_timeout".into(), be_tunnel);
+                map.insert("cur_server_timeout", be_server);
+                map.insert("cur_connect_timeout", be_connect);
+                map.insert("cur_queue_timeout", be_queue);
+                map.insert("cur_tunnel_timeout", be_tunnel);
             }
         });
 
         // If be_idx != proxy_idx, execute backend rules
-        if be_idx != proxy_idx {
-            let be_rules = proxies[be_idx].http_req_rules.clone();
-            let be_acls = proxies[be_idx].acls.clone();
-            if let Ok(Some(())) = eval_http_rules(&be_rules, &be_acls, &mut entry.sess, entry.target_addr) {
+        if be_idx != proxy_idx && !proxies[be_idx].http_req_rules.is_empty() {
+            let be_rules = &proxies[be_idx].http_req_rules;
+            let be_acls = &proxies[be_idx].acls;
+            if let Ok(Some(())) = eval_http_rules(be_rules, be_acls, &mut entry.sess, entry.target_addr) {
                 return None;
             }
         }
@@ -4652,70 +4694,74 @@ impl EngineDispatcher<'_> {
             }
         }
 
-        let req_uri_c = entry.sess.req_uri.clone();
-        let req_meth_c = entry.sess.req_method.clone();
-        let req_hdrs_c = entry.sess.req_headers.clone();
-        let res_ctx = SampleContext {
-            client_addr: entry.sess.client_addr,
-            server_addr: entry.target_addr,
-            htx: None,
-            req_uri: req_uri_c.as_deref(),
-            req_method: req_meth_c.as_deref(),
-            req_headers: req_hdrs_c.as_deref(),
-            ..Default::default()
-        };
-
-        let mut res_rules = Vec::new();
-        let mut raw_res = proxies[be_idx].http_res_rules.clone();
-        if be_idx != proxy_idx {
-            raw_res.extend(proxies[proxy_idx].http_res_rules.clone());
-        }
-        for rule in &raw_res {
-            let action = match &rule.action {
-                ibex_config::HttpResAction::SetHeader { name, fmt } => {
-                    let formatted_fmt = format_sample_string(fmt, &res_ctx, registry);
-                    ibex_config::HttpResAction::SetHeader {
-                        name: name.clone(),
-                        fmt: formatted_fmt,
-                    }
-                }
-                ibex_config::HttpResAction::AddHeader { name, fmt } => {
-                    let formatted_fmt = format_sample_string(fmt, &res_ctx, registry);
-                    ibex_config::HttpResAction::AddHeader {
-                        name: name.clone(),
-                        fmt: formatted_fmt,
-                    }
-                }
-                other => other.clone(),
+        let has_res_rules = !proxies[be_idx].http_res_rules.is_empty()
+            || !proxies[be_idx].http_after_res_rules.is_empty()
+            || (be_idx != proxy_idx
+                && (!proxies[proxy_idx].http_res_rules.is_empty()
+                    || !proxies[proxy_idx].http_after_res_rules.is_empty()));
+        if has_res_rules {
+            let res_ctx = SampleContext {
+                client_addr: entry.sess.client_addr,
+                server_addr: entry.target_addr,
+                htx: None,
+                req_uri: entry.sess.req_uri.as_deref(),
+                req_method: entry.sess.req_method.as_deref(),
+                req_headers: entry.sess.req_headers.as_deref(),
+                ..Default::default()
             };
-            res_rules.push(ibex_config::HttpResRule {
-                action,
-                cond: rule.cond.clone(),
-            });
-        }
-        entry.sess.http_res_rules = res_rules;
 
-        let mut after_rules = Vec::new();
-        let mut raw_after = proxies[be_idx].http_after_res_rules.clone();
-        if be_idx != proxy_idx {
-            raw_after.extend(proxies[proxy_idx].http_after_res_rules.clone());
-        }
-        for rule in &raw_after {
-            // Only the header actions carry a log-format string that needs expanding.
-            // Everything else is copied through unchanged, expressed as a default so a
-            // newly added action passes through rather than needing an arm here.
-            let mut action = rule.action.clone();
-            if let ibex_config::HttpAfterResAction::SetHeader { fmt, .. }
-            | ibex_config::HttpAfterResAction::AddHeader { fmt, .. } = &mut action
-            {
-                *fmt = format_sample_string(fmt, &res_ctx, registry);
+            let mut res_rules = Vec::new();
+            let mut raw_res = proxies[be_idx].http_res_rules.clone();
+            if be_idx != proxy_idx {
+                raw_res.extend(proxies[proxy_idx].http_res_rules.clone());
             }
-            after_rules.push(ibex_config::HttpAfterResRule {
-                action,
-                cond: rule.cond.clone(),
-            });
+            for rule in &raw_res {
+                let action = match &rule.action {
+                    ibex_config::HttpResAction::SetHeader { name, fmt } => {
+                        let formatted_fmt = format_sample_string(fmt, &res_ctx, registry);
+                        ibex_config::HttpResAction::SetHeader {
+                            name: name.clone(),
+                            fmt: formatted_fmt,
+                        }
+                    }
+                    ibex_config::HttpResAction::AddHeader { name, fmt } => {
+                        let formatted_fmt = format_sample_string(fmt, &res_ctx, registry);
+                        ibex_config::HttpResAction::AddHeader {
+                            name: name.clone(),
+                            fmt: formatted_fmt,
+                        }
+                    }
+                    other => other.clone(),
+                };
+                res_rules.push(ibex_config::HttpResRule {
+                    action,
+                    cond: rule.cond.clone(),
+                });
+            }
+            entry.sess.http_res_rules = res_rules;
+
+            let mut after_rules = Vec::new();
+            let mut raw_after = proxies[be_idx].http_after_res_rules.clone();
+            if be_idx != proxy_idx {
+                raw_after.extend(proxies[proxy_idx].http_after_res_rules.clone());
+            }
+            for rule in &raw_after {
+                let mut action = rule.action.clone();
+                if let ibex_config::HttpAfterResAction::SetHeader { fmt, .. }
+                | ibex_config::HttpAfterResAction::AddHeader { fmt, .. } = &mut action
+                {
+                    *fmt = format_sample_string(fmt, &res_ctx, registry);
+                }
+                after_rules.push(ibex_config::HttpAfterResRule {
+                    action,
+                    cond: rule.cond.clone(),
+                });
+            }
+            entry.sess.http_after_res_rules = after_rules;
+        } else {
+            entry.sess.http_res_rules.clear();
+            entry.sess.http_after_res_rules.clear();
         }
-        entry.sess.http_after_res_rules = after_rules;
 
         let source_ip = entry.sess.client_addr.map(|a| a.ip());
         let target = if let Some(ref cval) = entry.sess.cookie_val {

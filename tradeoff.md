@@ -259,3 +259,13 @@ Revisit if: any map converter is used on a hot path. The fix is to load maps at 
 parse time into a cached structure keyed by path, with the runtime API (`add map`,
 `del map`, `clear map`) mutating that cache — which is also what makes those CLI commands
 implementable at all, so this is owed regardless of performance.
+
+### 6.7 Request header size limit differs from HAProxy (3072 vs 2997 bytes)
+
+| | |
+|---|---|
+| **Gained** | Literal implementation of documented formula `tune.bufsize - tune.maxrewrite` (3072 bytes with bufsize 4096 and maxrewrite 1024) with zero artificial magic numbers. Simple bounds checking on H1 data path |
+| **Gave up** | 75-byte divergence against HAProxy 3.5 (2997 bytes) and 68-byte divergence against HAProxy 3.0.23 (3004 bytes) |
+| **Status** | **measured** — with identical binary search and config (`tune.bufsize 4096`, `tune.maxrewrite 1024`): HAProxy 3.5-dev accepts max 2997 bytes, HAProxy 3.0.23 accepts max 3004 bytes, Ibex accepts 3072 bytes |
+| **Revisit if** | HTX lands on the data path. HAProxy loses ~68–75 bytes because it stores the message in HTX, where per-block descriptors (`struct htx_blk`) and the start-line block consume buffer space before the wire header block can use it. The divergence is a natural property of the buffer representation and must not be hardcoded. |
+
