@@ -27,3 +27,6 @@ __pycache__/
 # allocprofile is standalone (outside the workspace), so it has its own lockfile/target
 /tools/allocprofile/target
 /tools/allocprofile/Cargo.lock
+
+# Stray build artefacts: agent sessions have dropped .rlib files in the repo root.
+*.rlib
