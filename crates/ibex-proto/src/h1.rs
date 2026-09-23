@@ -313,6 +313,10 @@ impl H1Parser {
             .map_or(0, |i| i + 1);
 
         let mut seen_cl: Option<usize> = None;
+        let mut first_cl_idx: Option<usize> = None;
+        let mut duplicate_cl = false;
+        let mut comma_cl = false;
+
         let sref = htx.as_ref();
         for i in last_start_line..sref.num_blocks() {
             if sref.block_type(i) != Some(HtxBlockType::Header) {
@@ -326,6 +330,12 @@ impl H1Parser {
             if !h_name.eq_ignore_ascii_case("content-length") {
                 continue;
             }
+            if first_cl_idx.is_none() {
+                first_cl_idx = Some(i);
+            } else {
+                duplicate_cl = true;
+            }
+            
             let Ok(h_val) = std::str::from_utf8(&sref.buf()[s + nl..s + nl + vl]) else { continue };
             let raw = h_val.trim();
 
@@ -352,6 +362,7 @@ impl H1Parser {
                         "conflicting Content-Length list values",
                     ));
                 }
+                comma_cl = true;
             }
             let Ok(len) = first.parse::<usize>() else {
                 self.phase = H1Phase::Error;
@@ -370,6 +381,37 @@ impl H1Parser {
             seen_cl = Some(len);
         }
         self.content_length = seen_cl;
+
+
+
+        if duplicate_cl || comma_cl {
+            let first_idx = first_cl_idx.unwrap();
+            let mut val_buf = [0u8; 20];
+            let val_bytes = {
+                use std::io::Write;
+                let mut slice = &mut val_buf[..];
+                write!(slice, "{}", seen_cl.unwrap()).unwrap();
+                let len = 20 - slice.len();
+                &val_buf[..len]
+            };
+            
+            htx.replace_block_value(first_idx, val_bytes)
+                .map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
+            
+            let num_blocks = htx.as_ref().num_blocks();
+            for i in (first_idx + 1..num_blocks).rev() {
+                if htx.as_ref().block_type(i) == Some(HtxBlockType::Header) {
+                    let desc = htx.as_ref().read_desc(i);
+                    let s = desc.addr as usize;
+                    let nl = desc.name_len as usize;
+                    if let Ok(name) = std::str::from_utf8(&htx.as_ref().buf()[s..s+nl]) {
+                        if name.eq_ignore_ascii_case("content-length") {
+                            htx.remove_block(i);
+                        }
+                    }
+                }
+            }
+        }
 
         if let Some(te) = htx.get_header("transfer-encoding") {
             let mut unknown = false;
@@ -714,5 +756,43 @@ mod tests {
         assert_eq!(htx.as_ref().res_line().unwrap().status, 200);
         assert_eq!(htx.as_ref().body_bytes(), b"hello world");
         assert!(htx.as_ref().is_eom());
+    }
+
+    #[test]
+    fn parse_http_post_with_duplicate_cl_agreeing() {
+        let req =
+            b"POST /submit HTTP/1.1\r\nHost: example.com\r\nContent-Length: 11\r\nContent-Length: 11\r\n\r\nhello worldExtra";
+        let mut parser = H1Parser::new(false);
+        let mut buf = [0u8; 4096];
+        let mut htx = HtxSlice::new(&mut buf);
+
+        let consumed = parser.parse(req, &mut htx).expect("parse");
+        // We should consume exactly up to the end of "hello world", leaving "Extra"
+        assert_eq!(consumed, req.len() - 5);
+        assert_eq!(parser.phase, H1Phase::Done);
+        assert_eq!(htx.as_ref().body_bytes(), b"hello world");
+        assert!(htx.as_ref().is_eom());
+        // Verify headers are collapsed
+        let hdrs: Vec<_> = htx.as_ref().headers().filter(|(k, _)| k.eq_ignore_ascii_case("content-length")).collect();
+        assert_eq!(hdrs.len(), 1);
+        assert_eq!(hdrs[0].1, "11");
+    }
+
+    #[test]
+    fn parse_http_post_with_comma_cl_agreeing() {
+        let req =
+            b"POST /submit HTTP/1.1\r\nHost: example.com\r\nContent-Length: 11, 11\r\n\r\nhello worldExtra";
+        let mut parser = H1Parser::new(false);
+        let mut buf = [0u8; 4096];
+        let mut htx = HtxSlice::new(&mut buf);
+
+        let consumed = parser.parse(req, &mut htx).expect("parse");
+        assert_eq!(consumed, req.len() - 5);
+        assert_eq!(parser.phase, H1Phase::Done);
+        assert_eq!(htx.as_ref().body_bytes(), b"hello world");
+        assert!(htx.as_ref().is_eom());
+        let hdrs: Vec<_> = htx.as_ref().headers().filter(|(k, _)| k.eq_ignore_ascii_case("content-length")).collect();
+        assert_eq!(hdrs.len(), 1);
+        assert_eq!(hdrs[0].1, "11");
     }
 }

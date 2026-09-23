@@ -46,8 +46,6 @@ pub struct GlobalSection {
     pub h2_max_total_streams: Option<usize>,
     /// Glitches threshold before graceful GOAWAY and hard close (`tune.h2.fe.glitches-threshold`). Default: 0 (disabled).
     pub h2_glitches_threshold: Option<usize>,
-    /// Maximum reset stream frames allowed in a burst before deprioritizing connection (`tune.h2.fe.max-rst-at-once`). Default: 0 (disabled).
-    pub h2_max_rst_at_once: Option<usize>,
     /// Global maximum connection limit.
     pub maxconn: Option<u32>,
     /// Background daemon mode.

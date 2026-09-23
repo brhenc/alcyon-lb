@@ -262,3 +262,19 @@ fn whitespace_around_chunk_size_is_rejected() {
         b"POST /x HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n 5 \r\nhello\r\n0\r\n\r\n"
     ));
 }
+
+// ---- Content-Length validation ------------------------------------------------------
+
+#[test]
+fn conflicting_duplicate_content_length_is_rejected() {
+    assert!(rejects(
+        b"POST /x HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello"
+    ));
+}
+
+#[test]
+fn conflicting_comma_content_length_is_rejected() {
+    assert!(rejects(
+        b"POST /x HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5, 6\r\n\r\nhello"
+    ));
+}

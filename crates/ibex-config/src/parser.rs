@@ -19,12 +19,65 @@ use crate::ast::{
 use crate::error::ConfigError;
 use crate::lexer::{lex, Token};
 
+/// `HAProxy` keywords in `global` section that are deliberately inert or accepted
+/// because their absence changes nothing observable in Ibex's runtime model.
+/// Each entry documents why ignoring the keyword preserves compatibility and correctness.
+const IGNORED_GLOBAL_KEYWORDS: &[(&str, &str)] = &[
+    (
+        "expose-experimental-directives",
+        "Directive enabling experimental features in HAProxy; inert in Ibex where supported features are parsed directly",
+    ),
+    (
+        "insecure-fork-wanted",
+        "Directive allowing daemon fork under systemd; inert in Ibex single-process runtime",
+    ),
+    (
+        "tune.idle-pool.shared",
+        "Connection idle pool sharing across threads; inert in Ibex single-process runtime",
+    ),
+    (
+        "tune.ssl.capture-buffer-size",
+        "SSL capture buffer size tuning; inert in Ibex Rustls-based TLS subsystem",
+    ),
+    (
+        "tune.ssl.default-dh-param",
+        "SSL DH parameter size; inert in Ibex Rustls-based TLS subsystem",
+    ),
+    (
+        "ssl-server-verify",
+        "SSL server certificate verification mode default",
+    ),
+    (
+        "crt-base",
+        "SSL certificate directory path prefix",
+    ),
+];
+
+/// `HAProxy` keywords in `defaults` section that are deliberately inert or accepted.
+const IGNORED_DEFAULTS_KEYWORDS: &[(&str, &str)] = &[
+    (
+        "resolvers",
+        "Default resolvers directive; inert when dynamic DNS resolution is inactive",
+    ),
+];
+
+/// `HAProxy` keywords in `resolvers` section that are deliberately inert.
+const IGNORED_RESOLVERS_KEYWORDS: &[(&str, &str)] = &[
+    ("nameserver", "DNS nameserver definition"),
+    ("timeout", "DNS resolver timeout"),
+    ("resolve_retries", "DNS resolver retry count"),
+    ("hold", "DNS cache hold timers"),
+    ("accepted_payload_size", "DNS UDP payload size"),
+    ("parse-resolv-conf", "System resolv.conf parser flag"),
+];
+
 enum CurrentSection {
     Global(GlobalSection),
     Defaults(DefaultsSection),
     Listen(ListenSection),
     Frontend(FrontendSection),
     Backend(BackendSection),
+    Resolvers,
 }
 
 /// Parses `HAProxy` configuration text into a typed `Config` AST.
@@ -123,6 +176,17 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     defaults.as_ref(),
                 )?));
             }
+            "resolvers" => {
+                flush_current_section(
+                    &mut cur_section,
+                    &mut global,
+                    &mut defaults,
+                    &mut listens,
+                    &mut frontends,
+                    &mut backends,
+                );
+                cur_section = Some(CurrentSection::Resolvers);
+            }
             _ => {
                 let section = cur_section
                     .as_mut()
@@ -188,6 +252,7 @@ fn flush_current_section(
             CurrentSection::Listen(l) => listens.push(l),
             CurrentSection::Frontend(f) => frontends.push(f),
             CurrentSection::Backend(b) => backends.push(b),
+            CurrentSection::Resolvers => {}
         }
     }
 }
@@ -437,6 +502,19 @@ fn parse_section_directive(
         CurrentSection::Listen(l) => parse_listen_directive(l, tokens, kw),
         CurrentSection::Frontend(f) => parse_frontend_directive(f, tokens, kw),
         CurrentSection::Backend(b) => parse_backend_directive(b, tokens, kw),
+        CurrentSection::Resolvers => parse_resolvers_directive(tokens, kw),
+    }
+}
+
+fn parse_resolvers_directive(tokens: &[Token], kw: &Token) -> Result<(), ConfigError> {
+    let _ = tokens;
+    match kw.text.as_str() {
+        other if IGNORED_RESOLVERS_KEYWORDS.iter().any(|(k, _)| *k == other) => Ok(()),
+        other => Err(ConfigError::new(
+            kw.line,
+            kw.col,
+            format!("unknown keyword '{other}' in 'resolvers' section"),
+        )),
     }
 }
 
@@ -603,32 +681,74 @@ fn parse_global_directive(
             global.h2_glitches_threshold = Some(val);
             Ok(())
         }
-        "tune.h2.fe.max-rst-at-once" => {
-            if tokens.len() < 2 {
-                return Err(ConfigError::new(
-                    kw.line,
-                    kw.col,
-                    "'tune.h2.fe.max-rst-at-once' expects an integer argument.",
-                ));
-            }
-            let val = tokens[1].text.parse::<usize>().map_err(|_| {
-                ConfigError::new(
-                    tokens[1].line,
-                    tokens[1].col,
-                    format!(
-                        "'tune.h2.fe.max-rst-at-once' expects an integer argument, got '{}'",
-                        tokens[1].text
-                    ),
-                )
-            })?;
-            global.h2_max_rst_at_once = Some(val);
-            Ok(())
-        }
         "tune.glitches.kill.cpu-usage" => {
             Err(ConfigError::new(
                 kw.line,
                 kw.col,
                 "'tune.glitches.kill.cpu-usage' is not supported (no CPU measurement subsystem in tree)",
+            ))
+        }
+        "tune.h2.fe.max-rst-at-once" => {
+            Err(ConfigError::new(
+                kw.line,
+                kw.col,
+                "'tune.h2.fe.max-rst-at-once' is not supported (resets-burst deprioritization is not implemented)",
+            ))
+        }
+        "thread-groups" => {
+            if tokens.len() < 2 {
+                return Err(ConfigError::new(
+                    kw.line,
+                    kw.col,
+                    "'thread-groups' expects an integer argument.",
+                ));
+            }
+            let val = tokens[1].text.parse::<u32>().map_err(|_| {
+                ConfigError::new(
+                    tokens[1].line,
+                    tokens[1].col,
+                    format!(
+                        "'thread-groups' expects an integer argument, got '{}'",
+                        tokens[1].text
+                    ),
+                )
+            })?;
+            if val == 0 {
+                return Err(ConfigError::new(
+                    tokens[1].line,
+                    tokens[1].col,
+                    "'thread-groups' value must be between 1 and 32 (was 0)",
+                ));
+            }
+            if val > 1 {
+                return Err(ConfigError::new(
+                    tokens[1].line,
+                    tokens[1].col,
+                    format!("'thread-groups' > 1 is not supported (got {val})"),
+                ));
+            }
+            // val == 1: accepted as inert default (Ibex single thread group runtime model)
+            Ok(())
+        }
+        "external-check" => {
+            Err(ConfigError::new(
+                kw.line,
+                kw.col,
+                "'external-check' is not supported (external health checks are not implemented)",
+            ))
+        }
+        "lua-load" | "lua-load-per-thread" => {
+            Err(ConfigError::new(
+                kw.line,
+                kw.col,
+                format!("'{}' is not supported (embedded Lua runtime is not implemented)", kw.text),
+            ))
+        }
+        "httpclient.resolvers.disabled" | "httpclient.resolvers.prefer" => {
+            Err(ConfigError::new(
+                kw.line,
+                kw.col,
+                format!("'{}' is not supported (HTTP client resolvers are not implemented)", kw.text),
             ))
         }
         "maxconn" => {
@@ -741,6 +861,7 @@ fn parse_global_directive(
             }
             Ok(())
         }
+        other if IGNORED_GLOBAL_KEYWORDS.iter().any(|(k, _)| *k == other) => Ok(()),
         _ => Err(ConfigError::new(
             kw.line,
             kw.col,
@@ -829,6 +950,21 @@ fn parse_defaults_directive(
                 format!("directive '{}' is not supported in defaults", kw.text),
             ))
         }
+        "http-check" => {
+            Err(ConfigError::new(
+                kw.line,
+                kw.col,
+                "'http-check' is not supported (custom HTTP health checks are not implemented)",
+            ))
+        }
+        "log-format" | "log-format-sd" => {
+            Err(ConfigError::new(
+                kw.line,
+                kw.col,
+                format!("'{}' is not supported", kw.text),
+            ))
+        }
+        other if IGNORED_DEFAULTS_KEYWORDS.iter().any(|(k, _)| *k == other) => Ok(()),
         _ => Err(ConfigError::new(
             kw.line,
             kw.col,
@@ -922,10 +1058,24 @@ fn parse_listen_directive(
             parse_http_after_res_rule(&mut proxy.http_after_res_rules, tokens, kw)
         }
         "stats" => parse_stats_directive(&mut proxy.stats, tokens, kw),
+        "http-check" => {
+            Err(ConfigError::new(
+                kw.line,
+                kw.col,
+                "'http-check' is not supported (custom HTTP health checks are not implemented)",
+            ))
+        }
+        "log-format" | "log-format-sd" => {
+            Err(ConfigError::new(
+                kw.line,
+                kw.col,
+                format!("'{}' is not supported", kw.text),
+            ))
+        }
         other => Err(ConfigError::new(
             kw.line,
             kw.col,
-            format!("unknown keyword <{other}>"),
+            format!("unknown keyword '{other}' in 'listen' section"),
         )),
     }
 }
@@ -981,10 +1131,24 @@ fn parse_frontend_directive(
             parse_track_rule(&mut fe.stick_rules, tokens, kw)
         }
         "stats" => parse_stats_directive(&mut fe.stats, tokens, kw),
+        "http-check" => {
+            Err(ConfigError::new(
+                kw.line,
+                kw.col,
+                "'http-check' is not supported (custom HTTP health checks are not implemented)",
+            ))
+        }
+        "log-format" | "log-format-sd" => {
+            Err(ConfigError::new(
+                kw.line,
+                kw.col,
+                format!("'{}' is not supported", kw.text),
+            ))
+        }
         other => Err(ConfigError::new(
             kw.line,
             kw.col,
-            format!("unknown keyword <{other}>"),
+            format!("unknown keyword '{other}' in 'frontend' section"),
         )),
     }
 }
@@ -1114,10 +1278,24 @@ fn parse_backend_directive(
             be.log_global |= parse_log(&mut be.logs, tokens, kw)?;
             Ok(())
         }
+        "http-check" => {
+            Err(ConfigError::new(
+                kw.line,
+                kw.col,
+                "'http-check' is not supported (custom HTTP health checks are not implemented)",
+            ))
+        }
+        "log-format" | "log-format-sd" => {
+            Err(ConfigError::new(
+                kw.line,
+                kw.col,
+                format!("'{}' is not supported", kw.text),
+            ))
+        }
         other => Err(ConfigError::new(
             kw.line,
             kw.col,
-            format!("unknown keyword <{other}>"),
+            format!("unknown keyword '{other}' in 'backend' section"),
         )),
     }
 }

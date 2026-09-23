@@ -207,7 +207,7 @@ fn test_haproxy_ffi_differential_corpus() {
     let divergence_names: Vec<&str> = disagreements.iter().map(|(n, _)| *n).collect();
     assert_eq!(
         divergence_names,
-        vec!["duplicate_cl_agreeing", "comma_cl_agreeing"],
+        Vec::<&str>::new(),
         "unexpected divergences between Ibex H1 and HAProxy FFI: {disagreements:?}"
     );
 }

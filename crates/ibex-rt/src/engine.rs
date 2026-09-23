@@ -1125,11 +1125,6 @@ impl Engine {
                     .as_ref()
                     .and_then(|g| g.h2_glitches_threshold)
                     .unwrap_or(0),
-                max_rst_at_once: config
-                    .global
-                    .as_ref()
-                    .and_then(|g| g.h2_max_rst_at_once)
-                    .unwrap_or(0),
             },
             idle_backend_pool: HashMap::new(),
         })

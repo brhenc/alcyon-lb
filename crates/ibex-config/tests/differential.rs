@@ -835,7 +835,6 @@ fn test_tune_h2_flood_knobs_parsing() {
 global
     tune.h2.fe.max-total-streams 50
     tune.h2.fe.glitches-threshold 100
-    tune.h2.fe.max-rst-at-once 20
 
 frontend fe
     bind 127.0.0.1:8080
@@ -844,7 +843,6 @@ frontend fe
     let global = cfg.global.as_ref().unwrap();
     assert_eq!(global.h2_max_total_streams, Some(50));
     assert_eq!(global.h2_glitches_threshold, Some(100));
-    assert_eq!(global.h2_max_rst_at_once, Some(20));
 
     let unsupp_cpu = "global\n\ttune.glitches.kill.cpu-usage 80\n";
     let err_cpu = parse_config(unsupp_cpu).unwrap_err();
@@ -853,6 +851,90 @@ frontend fe
         "expected cpu-usage refusal, got: {}",
         err_cpu.message
     );
+
+    let unsupp_rst = "global\n\ttune.h2.fe.max-rst-at-once 20\n";
+    let err_rst = parse_config(unsupp_rst).unwrap_err();
+    assert!(
+        err_rst.message.contains("tune.h2.fe.max-rst-at-once"),
+        "expected max-rst-at-once refusal, got: {}",
+        err_rst.message
+    );
 }
+
+#[test]
+fn test_thread_groups_semantics() {
+    let ok_tg = "global\n\tthread-groups 1\n";
+    assert!(
+        parse_config(ok_tg).is_ok(),
+        "thread-groups 1 must be accepted as inert (Ibex single-group runtime)"
+    );
+
+    let err_zero = parse_config("global\n\tthread-groups 0\n").unwrap_err();
+    assert!(
+        err_zero.message.contains("between 1 and 32") || err_zero.message.contains("thread-groups"),
+        "expected error for thread-groups 0, got: {}",
+        err_zero.message
+    );
+
+    let err_multi = parse_config("global\n\tthread-groups 2\n").unwrap_err();
+    assert!(
+        err_multi.message.contains("thread-groups") && (err_multi.message.contains("> 1 is not supported") || err_multi.message.contains("not supported")),
+        "expected refusal for thread-groups > 1, got: {}",
+        err_multi.message
+    );
+
+    let err_missing = parse_config("global\n\tthread-groups\n").unwrap_err();
+    assert!(
+        err_missing.message.contains("thread-groups"),
+        "expected error for missing thread-groups arg, got: {}",
+        err_missing.message
+    );
+
+    let err_invalid = parse_config("global\n\tthread-groups abc\n").unwrap_err();
+    assert!(
+        err_invalid.message.contains("thread-groups"),
+        "expected error for unparsable thread-groups arg, got: {}",
+        err_invalid.message
+    );
+}
+
+#[test]
+fn test_keyword_buckets_classification() {
+    // Bucket 1: Non-existent keywords are refused with section name
+    let bad_g = parse_config("global\n\tthis-global-keyword-does-not-exist 42\n").unwrap_err();
+    assert!(bad_g.message.contains("unknown keyword 'this-global-keyword-does-not-exist' in 'global' section"));
+
+    let bad_d = parse_config("defaults\n\tthis-keyword-does-not-exist 42\n").unwrap_err();
+    assert!(bad_d.message.contains("unknown keyword 'this-keyword-does-not-exist' in 'defaults' section"));
+
+    // Bucket 2: Inert HAProxy keywords recorded in IGNORED tables are accepted
+    let inert_cfg = r"
+global
+    thread-groups 1
+    expose-experimental-directives
+    insecure-fork-wanted
+
+defaults
+    resolvers mydns
+";
+    assert!(
+        parse_config(inert_cfg).is_ok(),
+        "inert keywords in Bucket 2 must parse successfully"
+    );
+
+    // Bucket 3: Semantically load-bearing unimplemented keywords are refused by name
+    let unsupp_cpu = parse_config("global\n\ttune.glitches.kill.cpu-usage 80\n").unwrap_err();
+    assert!(unsupp_cpu.message.contains("tune.glitches.kill.cpu-usage"));
+
+    let unsupp_rst = parse_config("global\n\ttune.h2.fe.max-rst-at-once 20\n").unwrap_err();
+    assert!(unsupp_rst.message.contains("tune.h2.fe.max-rst-at-once"));
+
+    let unsupp_http_check = parse_config("backend be\n\thttp-check send meth GET\n").unwrap_err();
+    assert!(unsupp_http_check.message.contains("http-check"));
+
+    let unsupp_log_fmt = parse_config("frontend fe\n\tbind 127.0.0.1:80\n\tlog-format %ci:%cp\n").unwrap_err();
+    assert!(unsupp_log_fmt.message.contains("log-format"));
+}
+
 
 
