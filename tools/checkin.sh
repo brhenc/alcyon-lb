@@ -51,6 +51,15 @@ echo "=== the oracles that measure a port against the real thing ==="
 cargo test -p slz --test test_slz -- --nocapture 2>&1 | grep -E "EXACT MATCHES|ROUND TRIPS|test result"
 
 echo
+echo "=== the regressions no unit test can see ==="
+# A daemon that will not start is invisible to `cargo test`. Making the `global` section
+# strict about unknown keywords took the reg-test board from 7 passing to 1 -- `thread-groups`
+# appears in nearly every HAProxy reg-test -- and it survived two hours because every unit
+# test stayed green. This runs in about two seconds.
+cargo build -q --bin ibex 2>/dev/null
+python3 harness/smoke.py 2>&1 | grep -vE "^$"
+
+echo
 echo "=== does the rest still build and lint ==="
 cargo clippy -q --workspace --all-targets 2>&1 | grep -E "^(warning|error)" | grep -v generated | sort | uniq -c
 echo "clippy exit: ${PIPESTATUS[0]}"

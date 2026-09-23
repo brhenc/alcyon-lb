@@ -1,0 +1,13 @@
+{
+ "configs_parsed": 108,
+ "configs_total": 449,
+ "passing": [
+  "balance/balance-rr.vtc",
+  "converter/reverse.vtc",
+  "http-messaging/http-ntlm.vtc",
+  "http-messaging/http_bodyless_response.vtc",
+  "http-rules/http_return.vtc",
+  "http-rules/set_timeout.vtc",
+  "sample_fetches/ubase64.vtc"
+ ]
+}
