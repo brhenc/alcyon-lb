@@ -82,5 +82,4 @@ similar_names = "allow"
 
 [profile.livepatch]
 inherits = "release"
-codegen-units = 1
-lto = "fat"
+lto = "off"
