@@ -1017,19 +1017,20 @@ fn test_header_size_boundary_against_bufsize_minus_maxrewrite() {
                 let resp_body = match mode {
                     1 => {
                         // Response below threshold: 3071 bytes header
-                        let pad_len = 3071 - 19 - 11;
+                        // HTTP/1.1 200 OK\r\n (17) + X-Padding:  (11) + \r\n\r\n (4) = 32 bytes
+                        let pad_len = 3071 - 32;
                         let pad = "X".repeat(pad_len);
                         format!("HTTP/1.1 200 OK\r\nX-Padding: {pad}\r\n\r\nOK").into_bytes()
                     }
                     2 => {
                         // Response at threshold: 3072 bytes header
-                        let pad_len = 3072 - 19 - 11;
+                        let pad_len = 3072 - 32;
                         let pad = "X".repeat(pad_len);
                         format!("HTTP/1.1 200 OK\r\nX-Padding: {pad}\r\n\r\nOK").into_bytes()
                     }
                     3 => {
                         // Response above threshold: 3073 bytes header
-                        let pad_len = 3073 - 19 - 11;
+                        let pad_len = 3073 - 32;
                         let pad = "X".repeat(pad_len);
                         format!("HTTP/1.1 200 OK\r\nX-Padding: {pad}\r\n\r\nOK").into_bytes()
                     }

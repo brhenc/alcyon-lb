@@ -3216,7 +3216,17 @@ impl EngineDispatcher<'_> {
 
     #[allow(clippy::too_many_lines)]
     fn apply_http_response_rules(entry: &mut SessionEntry, proxies: &[Proxy], _now: Tick) {
+        let threshold = entry.sess.bufsize.saturating_sub(entry.sess.maxrewrite);
         let Some((hdr_len, eoh_len)) = crate::proxy::find_eoh(entry.sess.rep.readable()) else {
+            if entry.sess.rep.readable().len() > threshold {
+                entry.response_rules_applied = true;
+                entry.sess.rep.clear();
+                entry.sess.send_synthetic_response(502, Some("text/html"), None);
+                entry.sess.srv_state = ScState::Closed;
+                entry.sess.cli_state = ScState::Established;
+                entry.sess.ending.get_or_insert(crate::proxy::Ending::Error);
+                entry.sess.resp_headers_processed = true;
+            }
             return;
         };
         entry.response_rules_applied = true;
@@ -3224,6 +3234,15 @@ impl EngineDispatcher<'_> {
         let fe_idx = entry.proxy_idx;
 
         let total_hdr_len = hdr_len + eoh_len;
+        if total_hdr_len > threshold {
+            entry.sess.rep.clear();
+            entry.sess.send_synthetic_response(502, Some("text/html"), None);
+            entry.sess.srv_state = ScState::Closed;
+            entry.sess.cli_state = ScState::Established;
+            entry.sess.ending.get_or_insert(crate::proxy::Ending::Error);
+            entry.sess.resp_headers_processed = true;
+            return;
+        }
         let hdr_bytes = &entry.sess.rep.readable()[..total_hdr_len];
         let hdr_str = String::from_utf8_lossy(hdr_bytes);
 

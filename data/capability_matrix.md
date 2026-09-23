@@ -54,8 +54,8 @@ This capability matrix records what Project Ibex can actually perform end to end
 | **Web Admin UI (`/stats`)** | Yes | Yes | Yes | Embedded dark-mode HTML dashboard with live metrics, health status badges, and interactive admin control forms. Tested in `stats_web_admin.rs`. |
 | **Runtime CLI Socket & Hatop Compatibility** | Yes | Yes | Yes | UNIX domain socket supporting interactive mode (`prompt`), `show info` (all 14 mandatory regex keys required by Hatop 0.8.3), `show stat`, `show table`, `set server ...`, `clear counters all`. Tested in `hatop_compat.rs` and `cli_applet.rs`. |
 | **Syslog Logging & Log Formatting** | Yes | Yes | Yes | UDP and UNIX datagram emission. RFC 5424 and RFC 3164 (space-padded days, facility*8 + severity priority calculation). Unified `log-format` engine with `%[...]` sample expansion. Tested in `syslog.rs` and `logfmt.rs`. |
-| **Pool Allocator & Scratch Buffers** | Yes | Yes | Yes | Fixed-size 16KB buffer pool with free-list recycling, synchronized with `PoolRegistry` in `crates/ibex-alloc`. Reusable scratch formatting in `logfmt.rs` (`write!` into string without intermediate heap allocations). `show pools` CLI command implemented matching HAProxy format. Tested in `cli_applet.rs` and `request_allocations.rs`. |
-| **Allocation Oracle & Hot-Path Bounds** | Yes | Yes | Yes | Global `CountingAllocator` and snapshot diff API in `crates/ibex-alloc`. Pinned bounds for steady-state HTTP request (<= 95 allocs), TCP connection (<= 35 allocs), and request with ACL + log format (<= 105 allocs). Buffer pooling verified to drop HTTP request allocation churn by 80% (from 41,130 bytes to 8,386 bytes). Pinned in `crates/ibex-rt/tests/request_allocations.rs`. |
+| **Pool Allocator & Size Classes** | Yes | Yes | Yes | Thread-local size-class pool (`tune.bufsize.small`: 1024, `tune.bufsize`: 16384, `tune.bufsize.large`: opt-in 3 preallocated/thread). Automatic small-to-standard buffer promotion on overflow without truncation. Unified architecture in `buf.rs` backed by decoupled `ibex-alloc` registry with compile-time `&'static str` names; zero locks or allocations on the hot path. Tested in `cli_applet.rs`, `buf.rs`, and `request_allocations.rs`. |
+| **Allocation Oracle & Hot-Path Bounds** | Yes | Yes | Yes | Global `CountingAllocator` and snapshot diff API in `crates/ibex-alloc`. Pooled `Buf` lifecycle verified at **0 allocations, 0 deallocations**. Pinned bounds lowered: steady-state TCP connection (26 allocs, down from 28/35 bound lowered to <= 30), HTTP request (90 allocs, bound lowered to <= 93), and ACL + log format (94 allocs, bound lowered to <= 98). Enforced `tune.bufsize - tune.maxrewrite` boundary (400 on request, 502 on response). Tested in `tcp_proxy.rs` and `request_allocations.rs`. |
 | **QUIC / HTTP/3** | Declined (out of scope) | No | No | Explicitly excluded by design decision (`tradeoff.md` §4.2). Marked permanently `OUT_OF_SCOPE` in reg-test triage (`data/regtests.json`). |
 | **Generic Filters (FLT)** | Declined (out of scope) | No | No | Explicitly excluded by design decision (`tradeoff.md` §4.2). |
 | **Lua Scripting Engine (`hlua`)** | Declined (out of scope) | No | No | Explicitly excluded by design decision (`tradeoff.md` §4.2) to maintain a tractable, high-assurance codebase. |
@@ -79,15 +79,23 @@ This capability matrix records what Project Ibex can actually perform end to end
 - **Reachability Defect**: In `crates/ibex-rt/src/proxy.rs:184`, the proxy session initializes with `parser_kind: ParserKind::H1`. While `validate_request_head` instantiates a temporary `Htx::new()` to validate headers, the actual streaming data path forwards raw byte slices (`self.req.readable()`). In `crates/ibex-rt/src/engine.rs` (lines 2896, 3185, 4011, 4538), every `SampleContext` passed to rule evaluators explicitly sets `htx: None`.
 - **Architectural Status**: Formally deferred per `nudge-agy-4.md` until the data path allocation profile is stabilized.
 
-### 3.3 Memory Allocation & Soft-Realtime Discipline
-- **Status**: Implemented, reachable, and tested under Nudge 4 Items 1, 2, and 3.
+### 3.3 Memory Allocation, Size Classes & Soft-Realtime Discipline
+- **Status**: Implemented, reachable, and tested under Nudge 4 and Nudge 5.
 - **Current State**:
   - Global `CountingAllocator` and snapshot diff API implemented in `crates/ibex-alloc` (isolated safe interface wrapping `System` under `#![allow(unsafe_code)]` solely for the `GlobalAlloc` trait).
-  - Pinned allocation ceiling tests (`a_steady_state_http_request_allocates_no_more_than_N_times`) implemented in `crates/ibex-rt/tests/request_allocations.rs`.
-  - 16KB `Buf` buffer pool (`BUFFER_POOL`) with free-list recycling implemented and registered in `global_pool_registry()`. Eliminates 32KB of buffer reallocations per connection.
+  - Pinned allocation ceiling tests (`a_steady_state_http_request_allocates_no_more_than_N_times`) implemented in `crates/ibex-rt/tests/request_allocations.rs`. Bounds lowered to HTTP <= 93, TCP <= 30, ACL + log <= 98.
+  - Zero-allocation pooled buffer lifecycle: `alloc_count` and `dealloc_count` reduced to **0** for warm `Buf::with_capacity(BUFSIZE)`.
+  - Lock-free, zero-contention data path: freelists backed by `thread_local!` caches per thread rather than global mutex locks.
+  - Decoupled `PoolRegistry`: `PoolHead.name: &'static str`, registry accessed only when querying statistics via `show pools` or diagnostics rather than on stream buffer acquisition or release.
+  - Three configurable size classes implemented per HAProxy 3.5:
+    - `tune.bufsize` (default 16384): rounded up to multiple of 16, must be >= 16384 if HTTP/2 configured, < 256MB.
+    - `tune.bufsize.small` (default 1024): automatic promotion path to standard buffer on overflow without truncation.
+    - `tune.bufsize.large` (off by default): preallocates 3 large buffers per thread when configured.
+  - Boundary enforcement: HTTP header block exceeding `tune.bufsize - tune.maxrewrite` produces HTTP 400 on request and HTTP 502 on response. Tested below, at, and above threshold in `crates/ibex-rt/tests/tcp_proxy.rs`.
+  - Single unified pool architecture: dead `Pool<T>` index arena removed from `ibex-alloc`, single implementation in `crates/ibex-rt/src/buf.rs`.
   - Scratch-buffer string formatting implemented in `logfmt.rs` (`render_into`, `write_alias`) eliminating per-log heap churn.
   - `match_map` caching (`CachedMapTable`) implemented in `ibex-sample/src/registry.rs`, completely eliminating per-request file reads and string re-parsing.
-  - `show pools` CLI command wired to `dump_pools_info()` in `crates/ibex-rt/src/applet.rs` for live HAProxy-compatible memory pool inspection.
+  - `show pools` CLI command wired to `dump_pools_info()` in `crates/ibex-rt/src/applet.rs` for live HAProxy-compatible memory pool inspection with configured size classes.
 
 ### 3.4 Explicitly Declined Subsystems (`tradeoff.md` §4.2)
 Per project architectural records, the following HAProxy subsystems have been formally declined:

@@ -193,8 +193,9 @@ fn a_steady_state_http_request_allocates_no_more_than_n_times() {
         diff.alloc_count, diff.bytes_allocated
     );
 
-    // Initial baseline recorded: 89 allocs, pinned to <= 95
-    let max_allowed_allocs: usize = 95;
+    // Initial baseline recorded: 89 allocs, pinned to <= 95.
+    // 2026-09-22: Measured 90 allocs with decoupled pool; bound lowered to <= 93.
+    let max_allowed_allocs: usize = 93;
     assert!(
         diff.alloc_count <= max_allowed_allocs,
         "a steady state HTTP request allocated {} times (> {}); diff: {:?}",
@@ -260,8 +261,10 @@ fn a_steady_state_tcp_connection_allocates_no_more_than_n_times() {
         diff.alloc_count, diff.bytes_allocated
     );
 
-    // Initial baseline recorded: 28 allocs, pinned to <= 35
-    let max_allowed_allocs: usize = 35;
+    // Initial baseline recorded: 28 allocs, 52,736 bytes, pinned to <= 35.
+    // 2026-09-22: Measured 26 allocs, 19,968 bytes (-2 allocs, -32,768 bytes allocated).
+    // Bound lowered from 35 to <= 30.
+    let max_allowed_allocs: usize = 30;
     assert!(
         diff.alloc_count <= max_allowed_allocs,
         "a steady state TCP connection allocated {} times (> {}); diff: {:?}",
@@ -343,8 +346,9 @@ fn a_request_with_acl_and_log_format_allocates_no_more_than_n_times() {
         diff.alloc_count, diff.bytes_allocated
     );
 
-    // Initial baseline recorded: 93 allocs, pinned to <= 105
-    let max_allowed_allocs: usize = 105;
+    // Initial baseline recorded: 93 allocs, pinned to <= 105.
+    // 2026-09-22: Measured 94 allocs with decoupled pool; bound lowered from 105 to <= 98.
+    let max_allowed_allocs: usize = 98;
     assert!(
         diff.alloc_count <= max_allowed_allocs,
         "an ACL + log-format request allocated {} times (> {}); diff: {:?}",
