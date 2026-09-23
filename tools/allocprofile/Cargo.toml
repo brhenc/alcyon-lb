@@ -1,0 +1,15 @@
+# Standalone on purpose: it installs a #[global_allocator] that captures a backtrace per
+# allocation, which needs `unsafe`, and every crate in the main workspace forbids it. Kept
+# out of the workspace so that rule stays absolute.
+[package]
+name = "allocprofile"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+
+[dependencies]
+ibex-rt = { path = "../../crates/ibex-rt" }
+ibex-config = { path = "../../crates/ibex-config" }
+ibex-alloc = { path = "../../crates/ibex-alloc" }
+
+[workspace]

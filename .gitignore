@@ -21,3 +21,6 @@ __pycache__/
 /modify*.py
 /size_measure.rs
 /test_*.rs
+# allocprofile is standalone (outside the workspace), so it has its own lockfile/target
+/tools/allocprofile/target
+/tools/allocprofile/Cargo.lock
