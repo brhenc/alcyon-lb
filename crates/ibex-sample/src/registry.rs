@@ -1897,6 +1897,7 @@ impl Registry {
 
     #[allow(clippy::too_many_lines)]
     fn register_builtin_converters(&mut self) {
+                
         // --- 1. String Transforms ---
         self.register_converter(ConvDesc {
             name: "lower",
@@ -2023,36 +2024,22 @@ impl Registry {
             func: |smp, args| {
                 let idx_str = args.first()?;
                 let delim_char = args.get(1).and_then(|d| d.chars().next()).unwrap_or(' ');
-                let count_str = args.get(2);
-
                 let idx: i64 = idx_str.parse().ok()?;
-                let count: usize = count_str.and_then(|c| c.parse().ok()).unwrap_or(1);
-
-                let Sample::Str(s) = smp else { return None };
-                let words: Vec<&str> = s.split(delim_char).filter(|w| !w.is_empty()).collect();
-                let len = words.len();
-                if len == 0 {
-                    return Some(Sample::Str(String::new()));
+                if idx <= 0 {
+                    return None;
                 }
-                let start_idx = match idx.cmp(&0) {
-                    std::cmp::Ordering::Greater => {
-                        usize::try_from(idx).unwrap_or(usize::MAX).saturating_sub(1)
+                let uidx = usize::try_from(idx - 1).ok()?;
+                match smp {
+                    Sample::Str(s) => {
+                        let mut words = s.split(delim_char).filter(|w| !w.is_empty());
+                        if let Some(w) = words.nth(uidx) {
+                            Some(Sample::Str(w.to_string()))
+                        } else {
+                            Some(Sample::Str(String::new()))
+                        }
                     }
-                    std::cmp::Ordering::Less => len.saturating_sub(
-                        usize::try_from(idx.saturating_neg()).unwrap_or(usize::MAX),
-                    ),
-                    std::cmp::Ordering::Equal => return None,
-                };
-                if start_idx >= len {
-                    return Some(Sample::Str(String::new()));
+                    _ => None,
                 }
-                let end_idx = if count == 0 {
-                    len
-                } else {
-                    (start_idx + count).min(len)
-                };
-                let joined = words[start_idx..end_idx].join(&delim_char.to_string());
-                Some(Sample::Str(joined))
             },
         });
 
@@ -2276,10 +2263,10 @@ impl Registry {
             func: |smp, args| {
                 let divisor = resolve_int_arg(args.first()?)?;
                 if divisor == 0 {
-                    return None;
+                    return Some(Sample::Sint(i64::MAX));
                 }
                 match smp {
-                    Sample::Sint(n) => Some(Sample::Sint(n / divisor)),
+                    Sample::Sint(n) => Some(Sample::Sint(n.checked_div(divisor).unwrap_or(i64::MAX))),
                     _ => None,
                 }
             },
@@ -2292,10 +2279,10 @@ impl Registry {
             func: |smp, args| {
                 let divisor = resolve_int_arg(args.first()?)?;
                 if divisor == 0 {
-                    return None;
+                    return Some(Sample::Sint(0));
                 }
                 match smp {
-                    Sample::Sint(n) => Some(Sample::Sint(n % divisor)),
+                    Sample::Sint(n) => Some(Sample::Sint(n.checked_rem(divisor).unwrap_or(0))),
                     _ => None,
                 }
             },
@@ -2488,7 +2475,7 @@ impl Registry {
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: |smp, _args| match smp {
                 Sample::Str(s) => {
-                    let clean = s.trim().trim_start_matches("0x").trim_start_matches("0X");
+                    let clean = s.trim();
                     i64::from_str_radix(clean, 16).ok().map(Sample::Sint)
                 }
                 _ => None,
@@ -2628,12 +2615,12 @@ impl Registry {
             out_type: TypeSpec::Exact(SampleType::Bin),
             func: |smp, args| match smp {
                 Sample::Bin(b) => {
-                    let offset = args.first()?.parse::<usize>().ok()?;
-                    let len = args.get(1)?.parse::<usize>().ok()?;
+                    let offset = args.first().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+                    let len = args.get(1).and_then(|s| s.parse::<usize>().ok()).unwrap_or(usize::MAX);
                     if offset >= b.len() {
                         Some(Sample::Bin(Vec::new()))
                     } else {
-                        let end = (offset + len).min(b.len());
+                        let end = b.len().min(offset.saturating_add(len));
                         Some(Sample::Bin(b[offset..end].to_vec()))
                     }
                 }
