@@ -163,3 +163,60 @@ This project has already been bitten once by reasoning from an RFC — `GOAWAY
 ENHANCE_YOUR_CALM` was inferred from RFC 9113 and stated as HAProxy's behaviour when
 HAProxy's real answer was four configuration knobs, all off by default. QUIC has far more
 surface for that mistake.
+
+---
+
+## On depending on `quinn-proto` at all
+
+The concern is fair: a third-party transport is one thing in Ibex that is not a faithful
+HAProxy port, and it may have to be replaced. Three things make that a manageable bet rather
+than a trap.
+
+### 1. Most of what diverges is not quinn-proto's to diverge on
+
+HAProxy exposes **31** `tune.quic.*` knobs. Mapped against `quinn-proto`'s `TransportConfig`:
+
+| HAProxy knob | `quinn-proto` |
+|---|---|
+| `fe.max-idle-timeout` | `max_idle_timeout` |
+| `fe.stream.max-concurrent` | `max_concurrent_bidi_streams` / `_uni_streams` |
+| `fe.stream.rxbuf` | `stream_receive_window` |
+| `fe.cc.max-win-size` | `send_window` / `receive_window` |
+| `fe.cc.max-frame-loss`, `cc.reorder-ratio` | `packet_threshold`, `reordering_threshold` |
+| `fe.tx.udp-gso` | `enable_segmentation_offload` |
+| congestion controller | `congestion_controller_factory` (Cubic, NewReno, BBR) |
+
+**Not expressible, and mostly not wanted from a library anyway:**
+
+```
+fe.sec.retry-threshold      fe.sec.glitches-threshold    sec.stateless-reset-rate
+fe.stream.max-total         fe.stream.data-ratio         fe.sock-per-conn
+mem.tx-max                  zero-copy-fwd-send
+```
+
+Every one of those is a **policy or buffer decision that is Ibex's regardless of which
+transport it drives** — the same shape as `tune.h2.fe.glitches-threshold`, which Ibex already
+implements itself. Using `quinn-proto` does not take a single DoS control away.
+
+What it *does* own is congestion-control internals — `cc.hystart`, `cc.cubic-min-losses`,
+pacing. Those are where a faithful port would be a research project in itself, and where
+"different from HAProxy" is least likely to be a security problem and most likely to be a
+throughput difference. Which is exactly the thing to measure rather than argue about.
+
+### 2. The seam is designed in, not discovered later
+
+`quinn-proto` is sans-IO, so the boundary is already narrow: datagrams and a clock in,
+datagrams and stream events out. T24 is required to put a trait at that boundary so the
+transport is one implementation of an interface rather than a dependency woven through the
+runtime. If it is ever replaced by a hand-written port, the datagram path (T23), the
+connection table, the HTTP/3 layer (T25) and the HTX conversion all survive unchanged.
+
+That is the difference between a bet you can unwind and one you cannot, and it costs one
+trait definition now.
+
+### 3. The decision gets made on evidence
+
+T26 answers it: run the same load against Ibex and against
+`/home/bhenc/reference/haproxy-quic/haproxy`, and record where they differ under duress.
+Until that exists, "quinn-proto is fine" and "quinn-proto must go" are both guesses, and this
+project has a rule about those.
