@@ -51,7 +51,11 @@ fn extract_dst_addr(hdr: &libc::msghdr) -> Option<IpAddr> {
                 let pktinfo = libc::CMSG_DATA(cmsg) as *const libc::in_pktinfo;
                 let ip = Ipv4Addr::from(u32::from_be((*pktinfo).ipi_addr.s_addr));
                 return Some(IpAddr::V4(ip));
-            } else if (*cmsg).cmsg_level == libc::IPPROTO_IPV6 && (*cmsg).cmsg_type == libc::IPV6_RECVPKTINFO { // actually it's IPV6_PKTINFO on receive as well! Wait, setsockopt is IPV6_RECVPKTINFO, cmsg type is IPV6_PKTINFO
+            // IPV6_RECVPKTINFO (49) is what setsockopt takes; the kernel tags the
+            // control message it then sends with IPV6_PKTINFO (50). Checking for the
+            // former here meant this branch never fired and dst_addr was always None
+            // on IPv6.
+            } else if (*cmsg).cmsg_level == libc::IPPROTO_IPV6 && (*cmsg).cmsg_type == libc::IPV6_PKTINFO {
                 let pktinfo = libc::CMSG_DATA(cmsg) as *const libc::in6_pktinfo;
                 let ip = Ipv6Addr::from((*pktinfo).ipi6_addr.s6_addr);
                 return Some(IpAddr::V6(ip));
