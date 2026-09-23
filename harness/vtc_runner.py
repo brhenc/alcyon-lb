@@ -1690,6 +1690,12 @@ class VtcExecutor:
                         raise KeyError(f"Unknown syslog {syslog_id}")
                     if "-wait" in opts:
                         runner.wait()
+                        # Syslog expectations are matched by SyslogRunner's own regex path rather than
+                        # through `evaluate_expectation`, so they must be counted here. Without this a
+                        # test whose only assertions are syslog ones would be scored SKIP by the
+                        # assertions-evaluated gate despite having asserted and held.
+                        for _ in runner.expectations:
+                            _note_assertion()
                         missing = runner.unmatched()
                         if missing:
                             raise RuntimeError(
@@ -1777,8 +1783,9 @@ class VtcExecutor:
                             capture_output=True,
                             text=True,
                         )
+                        print(f"h1 debug: {res.returncode} {res.stdout} {res.stderr}")
                         if res.returncode == 0:
-                            raise AssertionError("Config check unexpectedly succeeded (-conf-BAD)")
+                            raise AssertionError(f"Config check unexpectedly succeeded (-conf-BAD) for {haproxy_id}")
                     else:
                         if start_imm:
                             cli_sock = os.path.join(self.tmpdir, f"{haproxy_id}.sock")
