@@ -13,6 +13,7 @@
 pub mod ast;
 pub mod error;
 pub mod lexer;
+pub mod preproc;
 pub mod parser;
 
 use std::fs;

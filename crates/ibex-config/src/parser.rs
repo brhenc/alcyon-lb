@@ -92,7 +92,13 @@ enum CurrentSection {
 #[allow(clippy::too_many_lines)]
 pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
     // An empty config is valid: HAProxy 3.5 accepts it and exits 0 under `-c`.
-    let lines = lex(input);
+    //
+    // `.if` / `.elif` / `.else` / `.endif` are resolved here, before section parsing, the
+    // way HAProxy does it. 269 of the 312 reg-tests use them; without this call the
+    // preprocessor module existed, was unit-tested, and was reached by nothing, so `.if`
+    // still failed with "unknown keyword" and the harness went on stripping the blocks
+    // itself.
+    let lines = crate::preproc::preprocess(lex(input))?;
 
     let mut global: Option<GlobalSection> = None;
     let mut defaults: Option<DefaultsSection> = None;

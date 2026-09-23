@@ -845,25 +845,13 @@ def preprocess_haproxy_config(
     cur_section_type = ""
     cur_section_name = ""
 
-    # Check for conditional preprocessor blocks: .if feature(THREAD) ... .endif
-    cleaned_lines: List[str] = []
-    skip_depth = 0
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith(".if"):
-            if "feature(THREAD)" in stripped or "feature" in stripped:
-                # Keep block contents
-                continue
-            else:
-                skip_depth += 1
-                continue
-        elif stripped.startswith(".endif"):
-            if skip_depth > 0:
-                skip_depth -= 1
-            continue
-
-        if skip_depth == 0:
-            cleaned_lines.append(line)
+    # .if / .elif / .else / .endif are Ibex's job now (crates/ibex-config/src/preproc.rs,
+    # called from parse_str). This used to strip them, with a rule that kept any block whose
+    # condition mentioned "feature" and dropped every other block wholesale -- so 46 tests
+    # silently lost configuration HAProxy would have kept, .else fell through as a directive,
+    # and the harness rather than the daemon decided which branch was taken. Every reg-test
+    # number this project quoted was measured through that filter.
+    cleaned_lines: List[str] = list(lines)
 
     for line in cleaned_lines:
         trimmed = line.strip()
