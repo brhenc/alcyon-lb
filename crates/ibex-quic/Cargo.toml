@@ -1,0 +1,25 @@
+[package]
+name = "ibex-quic"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+quinn-proto = { version = "0.11", default-features = false, features = ["rustls-ring"] }
+rustls = { workspace = true }
+rustls-pemfile = "2.2.0"
+ibex-tls = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+
+
+[dev-dependencies]
+rcgen = "0.13"
+rustix = { version = "0.38", features = ["event", "net", "std"] }
+
+[lints]
+workspace = true
+
