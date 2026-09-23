@@ -1,0 +1,98 @@
+[
+ {
+  "dir": "c2s",
+  "t": 1.9947,
+  "len": 1200,
+  "hex": "c700000001143a10af5b1db4c8a18cecf0a4cbadcde4aac77a821442b088923dbe98ccbcc821de38fbfb5efade090e008000047c8b0fc04c64ef5c784d005c71"
+ },
+ {
+  "dir": "c2s",
+  "t": 1.995,
+  "len": 1200,
+  "hex": "c000000001143a10af5b1db4c8a18cecf0a4cbadcde4aac77a821442b088923dbe98ccbcc821de38fbfb5efade090e008000047cc297751a07a390a2e8e77e8b"
+ },
+ {
+  "dir": "s2c",
+  "t": 1.9977,
+  "len": 1252,
+  "hex": "c2000000011442b088923dbe98ccbcc821de38fbfb5efade090e086d04d9e6be64e39000407508b528ecb5b55866de26e1fb4f1be6855755c87ed69607cd8325"
+ },
+ {
+  "dir": "s2c",
+  "t": 1.9978,
+  "len": 291,
+  "hex": "e2000000011442b088923dbe98ccbcc821de38fbfb5efade090e086d04d9e6be64e39040fe3e85eb1de2a6e3cc0b1e11adea308406f1bfa930a836e9838c8f83"
+ },
+ {
+  "dir": "c2s",
+  "t": 1.9994,
+  "len": 1200,
+  "hex": "c200000001086d04d9e6be64e3901442b088923dbe98ccbcc821de38fbfb5efade090e00800000166a09563d55e29037d95ce986615ca4dc36362db5594ae300"
+ },
+ {
+  "dir": "c2s",
+  "t": 1.9998,
+  "len": 1406,
+  "hex": "446d04d9e6be64e390779ca7d81df36ca47a58b3f824e2e2816601e4277fd63f3f961a7c66e795f6f3623659278bf302a8ba8a715a964029d911e791d136b055"
+ },
+ {
+  "dir": "s2c",
+  "t": 1.9999,
+  "len": 662,
+  "hex": "eb000000011442b088923dbe98ccbcc821de38fbfb5efade090e086d04d9e6be64e39016fbfad58635cf77577a19d078075fe55d01ec5b77234d4442b088923d"
+ },
+ {
+  "dir": "c2s",
+  "t": 2.0,
+  "len": 73,
+  "hex": "4a6d04d9e6be64e390ced1cf9886de144f9d380398163bf6d65b105f5034d11a07d939cd80452a2ce188afc4d02ef0b6af015241332b8dae58499b791437380e"
+ },
+ {
+  "dir": "s2c",
+  "t": 2.0002,
+  "len": 111,
+  "hex": "5242b088923dbe98ccbcc821de38fbfb5efade090ee695dc33a3977594cf903c22326f60dd3dff576ef86bf037791a00eb2cd03d0459d9563213958d4338c445"
+ },
+ {
+  "dir": "s2c",
+  "t": 2.0002,
+  "len": 58,
+  "hex": "5242b088923dbe98ccbcc821de38fbfb5efade090e3c7495793f3174a36e4231e7219127d571f22a02942db41cfea274a072c82ea6ac84c155c2"
+ },
+ {
+  "dir": "c2s",
+  "t": 2.0003,
+  "len": 1444,
+  "hex": "446d04d9e6be64e39066659d01cc2911bb59822bc287684aa9ffec337e362e993b6cbaba3ed5613bbb0e89aedfc9f58f0b0d969b03fff7776ca4612e7314e255"
+ },
+ {
+  "dir": "s2c",
+  "t": 2.0005,
+  "len": 43,
+  "hex": "4242b088923dbe98ccbcc821de38fbfb5efade090e904460b54818a2334048a44e13989260faa6cbb20984"
+ },
+ {
+  "dir": "c2s",
+  "t": 2.0006,
+  "len": 42,
+  "hex": "4d6d04d9e6be64e390f6e59825661697a770f1ef3cf69f8f77d3bda3123eafe7df40111be29c3fc24543"
+ },
+ {
+  "dir": "s2c",
+  "t": 2.0009,
+  "len": 80,
+  "hex": "4f42b088923dbe98ccbcc821de38fbfb5efade090eaff7687e183a61dfd4f06f87dd221b65dfe0fdb61500f88f0ece329e5aac27db92ee31ac3421576dc25900"
+ },
+ {
+  "dir": "c2s",
+  "t": 2.0011,
+  "len": 42,
+  "hex": "556d04d9e6be64e39037357b2de00b54c52aab38457057f9a8e15f66894ce98527f4eacbe6d873665078"
+ },
+ {
+  "dir": "c2s",
+  "t": 2.0013,
+  "len": 42,
+  "hex": "466d04d9e6be64e390c7c23f692caff905551e46792f19e4762271b42535747c9ccd61becd022906bd41"
+ }
+]
