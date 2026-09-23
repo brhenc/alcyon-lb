@@ -1553,6 +1553,20 @@ class VtcExecutor:
                 if cli.error is not None:
                     raise cli.error
 
+            # Settle every client that was started before judging the count.
+            #
+            # `cleanup()` runs in a `finally`, which is *after* this gate, so a client
+            # started without an explicit `-wait` could still be running when the
+            # assertion count was read. Today those clients never get to run at all and
+            # the result is deterministic, but that is luck rather than design: the count
+            # has to be final before it is the basis of a verdict.
+            for cli in self.clients.values():
+                if cli.task is not None and not cli.task.done():
+                    try:
+                        await asyncio.wait_for(cli.wait(), timeout=self.timeout)
+                    except asyncio.TimeoutError:
+                        pass
+
             # A test that asserted nothing has not passed.
             #
             # This used to check which directives the file *declared*, which is not the
