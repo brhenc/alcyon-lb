@@ -1378,11 +1378,13 @@ class MockClientRunner:
 class TestResult:
     test_name: str
     file_path: str
-    status: str  # PASS, FAIL, SKIP
+    status: str  # PASS, FAIL, SKIP, OUT_OF_SCOPE
     elapsed_sec: float
     error_message: Optional[str] = None
     stdout: str = ""
     stderr: str = ""
+    triage: str = "UNTRIAGED"   # from data/regtests.json
+    unexpected_pass: bool = False
 
 
 class VtcExecutor:
@@ -1856,14 +1858,55 @@ def find_vtc_files(paths: List[str]) -> List[str]:
     return sorted(list(set(vtc_files)))
 
 
+class TriageIndex:
+    """Maps a .vtc path to its bucket in `data/regtests.json`.
+
+    The suite contains 114 tests for features this project declined in `tradeoff.md` 4.2 --
+    Lua, QUIC, filters, the cache, SPOE, FCGI. Counting those as failures measures a
+    decision as debt: thirteen `cache-use` failures said nothing about Ibex except that it
+    does not have a cache, which was already written down.
+
+    Out-of-scope tests are still **run**, not skipped. This project has already been bitten
+    once by a status that meant "nobody asked", when 84 tests hid behind a skip and the
+    board read better than the truth. Running them costs a second and buys two things: a
+    declined feature that unexpectedly works is reported rather than hidden, and the
+    failure text stays available for anyone who wants to look.
+    """
+
+    def __init__(self, triage_file: Optional[str] = None):
+        self.by_suffix: Dict[str, str] = {}
+        if triage_file is None:
+            here = os.path.dirname(os.path.abspath(__file__))
+            triage_file = os.path.join(here, "..", "data", "regtests.json")
+        try:
+            with open(triage_file, "r", encoding="utf-8") as f:
+                rows = json.load(f)
+        except Exception:
+            return
+        for row in rows:
+            path = (row.get("path") or "").replace("\\", "/")
+            bucket = row.get("triage_bucket") or "UNTRIAGED"
+            if path:
+                self.by_suffix[path] = bucket
+
+    def bucket_for(self, vtc_path: str) -> str:
+        norm = os.path.abspath(vtc_path).replace("\\", "/")
+        for suffix, bucket in self.by_suffix.items():
+            if norm.endswith("/" + suffix) or norm.endswith(suffix):
+                return bucket
+        return "UNTRIAGED"
+
+
 async def run_suite(
     vtc_files: List[str],
     binary_path: str,
     timeout: float,
     verbose: bool,
     fail_fast: bool = False,
+    triage: Optional["TriageIndex"] = None,
 ) -> List[TestResult]:
     results: List[TestResult] = []
+    triage = triage or TriageIndex()
 
     for vtc_file in vtc_files:
         try:
@@ -1904,10 +1947,16 @@ async def run_suite(
         )
 
         res = await executor.execute()
+        classify(res, triage)
         results.append(res)
 
         rel_path = os.path.relpath(vtc_file, os.getcwd())
-        if res.status == "PASS":
+        if res.status == "OUT_OF_SCOPE":
+            print(f" {Color.yellow('[SCOPE]')} {rel_path} - {res.test_name}")
+            if verbose and res.error_message:
+                print(f"        {Color.DIM}declined in tradeoff.md 4.2:{Color.RESET} "
+                      f"{res.error_message.splitlines()[0]}")
+        elif res.status == "PASS":
             status_badge = Color.green("[PASS]")
             print(f" {status_badge} {rel_path} ({res.elapsed_sec:.2f}s) - {res.test_name}")
         elif res.status == "SKIP":
@@ -1928,12 +1977,35 @@ async def run_suite(
     return results
 
 
+def classify(r: TestResult, triage: "TriageIndex") -> None:
+    """Reclassify one result against the declared scope, in place.
+
+    A failure in a declined area becomes `OUT_OF_SCOPE`: it is still recorded, with its
+    error text, but it is not debt. A **pass** in a declined area keeps its `PASS` and is
+    flagged, because a feature we decided not to build and which works anyway is either
+    good news or a wrong triage entry, and both are worth surfacing.
+    """
+    r.triage = triage.bucket_for(r.file_path)
+    if r.triage != "OUT_OF_SCOPE":
+        return
+    if r.status == "FAIL":
+        r.status = "OUT_OF_SCOPE"
+    elif r.status == "PASS":
+        r.unexpected_pass = True
+
+
 def print_summary(results: List[TestResult], total_elapsed: float) -> int:
     """Print clean summary report and return process exit code."""
     passed = sum(1 for r in results if r.status == "PASS")
     failed = sum(1 for r in results if r.status == "FAIL")
     skipped = sum(1 for r in results if r.status == "SKIP")
+    out_of_scope = sum(1 for r in results if r.status == "OUT_OF_SCOPE")
+    unexpected = [r for r in results if r.unexpected_pass]
     total = len(results)
+    # In scope *and actually run*: a skip is gated off by an `.if feature()` the build does
+    # not satisfy, which is no more debt than a declined feature is. Counting either in the
+    # denominator makes the board look worse than the position warrants.
+    in_scope_run = total - out_of_scope - skipped
 
     print("\n" + Color.bold("=" * 72))
     print(Color.bold(" Ibex VTC Regression Test Suite Execution Summary"))
@@ -1942,7 +2014,16 @@ def print_summary(results: List[TestResult], total_elapsed: float) -> int:
     print(f" {Color.green('Passed:')}        {passed}")
     print(f" {Color.red('Failed:')}        {failed}")
     print(f" {Color.yellow('Skipped:')}       {skipped}")
+    print(f" Out of scope:  {out_of_scope}   (declined in tradeoff.md 4.2; run, not counted)")
     print(f" Duration:      {total_elapsed:.2f}s")
+    if in_scope_run:
+        print(f" In scope, run: {passed}/{in_scope_run} passing"
+              f"  ({100.0 * passed / in_scope_run:.1f}%)")
+    if unexpected:
+        print(Color.bold(f"\n Passing although declared out of scope ({len(unexpected)}) --"
+                         " good news, or a stale triage entry:"))
+        for r in unexpected:
+            print(f"   {r.file_path}")
     print(Color.bold("=" * 72))
 
     if failed > 0:
@@ -2005,6 +2086,10 @@ def main() -> None:
             "passed": sum(1 for r in results if r.status == "PASS"),
             "failed": sum(1 for r in results if r.status == "FAIL"),
             "skipped": sum(1 for r in results if r.status == "SKIP"),
+            "out_of_scope": sum(1 for r in results if r.status == "OUT_OF_SCOPE"),
+            "in_scope_run": sum(
+                1 for r in results if r.status not in ("OUT_OF_SCOPE", "SKIP")
+            ),
             "duration": total_elapsed,
             "results": [dataclasses.asdict(r) for r in results],
         }

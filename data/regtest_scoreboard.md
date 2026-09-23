@@ -2,7 +2,12 @@
 
 Generated 2026-09-23 against HAProxy 3.5-dev7 reg-tests.
 
-**10 of 312 passing** (216 failing, 86 skipped).
+**10 of 174 in-scope tests passing** — 164 failing, 86 skipped, 52 out of scope.
+
+The raw figure is 10 of 312. The denominator that means something is 174: the suite
+contains 114 tests for features declined in `tradeoff.md` §4.2, and 86 more gated off by
+`.if feature()` conditions this build does not satisfy. Counting either as debt measures a
+decision rather than a gap.
 
 Previous run, 2026-09-22: **14 / 212 / 86**.
 
@@ -63,11 +68,19 @@ So the split is close to even: **roughly half the board never reaches Ibex's beh
 and the other half is genuine behavioural debt. That is a better position than the raw
 10/312 suggests, and a worse one than "it is all parser stubs" would.
 
-**Thirteen of those failures are `cache-use`**, and the cache is declined in `tradeoff.md`
-§4.2. They are being counted as failures when they should be skips — the harness honours
-`.if feature(...)` gates but does not consult the `OUT_OF_SCOPE` triage in
-`data/regtests.json`. Same for several others. The failure count is inflated by an unknown
-amount for that reason, which is a harness defect, not an Ibex one.
+**That inflation is now fixed.** The harness consults the `OUT_OF_SCOPE` triage in
+`data/regtests.json` and reports a fourth status, `[SCOPE]`, for the 52 failures that were
+only measuring declined features — 13 of them `cache-use`. Failures fall 216 → 164.
+
+Out-of-scope tests are still **run**, not skipped. This project has been bitten once by a
+status meaning "nobody asked", when 84 tests hid behind a skip and the board read better
+than the truth. Running them costs a second and buys two things: the failure text stays
+available, and a declined feature that passes anyway gets reported instead of hidden.
+
+Three do pass and are flagged: `cache/caching_rules.vtc`,
+`http-messaging/http_bodyless_response.vtc` and `mcli/mcli_show_info.vtc`. A cache test
+passing against a daemon with no cache is more likely vacuous than good news, and is worth
+a look.
 
 ## The honest denominator
 
