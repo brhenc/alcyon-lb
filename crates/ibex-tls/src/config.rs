@@ -147,18 +147,16 @@ impl TlsConfig {
         // because neither side was speaking what the other sent. Offering a protocol we
         // cannot serve breaks every client that prefers it, which today is most of them.
         //
-        // `h2` is filtered out rather than rejected: an operator copying a working
-        // HAProxy config should not be stopped by it, and dropping it from the offer
-        // degrades to HTTP/1.1 instead of failing. Remove the filter when the h2 mux in
-        // `ibex-proto` is wired into the engine.
+        // The h2 mux in `ibex-proto` is wired into the engine, so `h2` is supported
+        // alongside `http/1.1` and `http/1.0`.
         let requested: Vec<String> = if bind.alpn.is_empty() {
-            vec!["http/1.1".to_string()]
+            vec!["h2".to_string(), "http/1.1".to_string()]
         } else {
             bind.alpn.clone()
         };
         let (supported, unsupported): (Vec<String>, Vec<String>) = requested
             .into_iter()
-            .partition(|p| p == "http/1.1" || p == "http/1.0");
+            .partition(|p| p == "h2" || p == "http/1.1" || p == "http/1.0");
         for p in &unsupported {
             eprintln!(
                 "[ibex] warning: bind {}: ALPN '{p}' is not served by this build and was \

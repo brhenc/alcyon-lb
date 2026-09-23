@@ -108,6 +108,11 @@ impl TlsConn {
         self.truncated
     }
 
+    #[must_use]
+    pub fn alpn(&self) -> Option<&[u8]> {
+        self.ctx.tls_info.alpn.as_deref()
+    }
+
     /// Pushes everything rustls has queued onto the socket.
     ///
     /// Called from both directions. A partial write is not an error: rustls keeps the
@@ -242,6 +247,14 @@ impl ClientXprt {
     #[must_use]
     pub const fn is_tls(&self) -> bool {
         matches!(self, ClientXprt::Tls(_))
+    }
+
+    #[must_use]
+    pub fn alpn(&self) -> Option<&[u8]> {
+        match self {
+            ClientXprt::Plain => None,
+            ClientXprt::Tls(t) => t.alpn(),
+        }
     }
 
     /// True when the transport itself needs the socket to be writable.

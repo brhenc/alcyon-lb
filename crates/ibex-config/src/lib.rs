@@ -22,7 +22,7 @@ pub use ast::{
     AclCondition, AclRule, AclTerm, BackendSection, BalanceAlgorithm, Config, DefaultsSection,
     FrontendSection, GlobalSection, GlobalSetVar,
     HeaderExp, HttpAfterResAction, HttpAfterResRule, HttpReqAction, HttpReqRule, HttpResAction,
-    HttpResRule, ListenSection, LogConfig, LogFacility, LogLevel, LogTarget, Mode, Server, StatsConfig,
+    HttpResRule, HttpReuse, ListenSection, LogConfig, LogFacility, LogLevel, LogTarget, Mode, Server, StatsConfig,
     StickRule, StickRuleType, StickTableConfigAst, TcpReqConnAction, TcpReqConnRule,
     TcpReqContentAction, TcpReqContentRule, TcpReqSessionAction, TcpReqSessionRule,
     TimeoutConfig, UseBackendRule,

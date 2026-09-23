@@ -8,11 +8,12 @@
 //! backend would never have seen, and any framing it guesses at is a desync primitive.
 
 use ibex_proto::h1::H1Parser;
-use ibex_proto::htx::Htx;
+use ibex_proto::htx::HtxSlice;
 
 fn rejects(input: &[u8]) -> bool {
     let mut p = H1Parser::new(false);
-    let mut h = Htx::new();
+    let mut buf = [0u8; 4096];
+    let mut h = HtxSlice::new(&mut buf);
     p.parse(input, &mut h).is_err()
 }
 

@@ -153,10 +153,10 @@ one expensive computation is one unit of its budget.
 
 | | |
 |---|---|
-| **Gained** | A tractable project. `src/hlua.c` alone is ~14k lines |
+| **Gained** | A tractable, focused codebase. `src/hlua.c` alone is ~14k lines. For QUIC/H3, the architectural objection is structural: **Ibex has no datagram I/O at all** (UDP surface is three lines in `syslog.rs`). QUIC demuxes by CID from datagrams on a shared socket rather than 1 fd per connection; throughput requires `recvmmsg`/`sendmmsg`/GSO/GRO; TLS moves inside the packet layer; and loss recovery/congestion control are an entire stateful subsystem on a scheduler built for stream epoll. Connections are not file descriptors |
 | **Gave up** | Every reg-test needing them is permanently `OUT_OF_SCOPE`, capping the scoreboard below 312 |
 | **Status** | **measured** — triage in `data/regtests.json` |
-| **Revisit if** | The core is finished and complete, which is a good problem to have |
+| **Revisit if** | For Lua/filters: the core is finished and complete. For QUIC/H3: h2 is reachable and measured, a datagram I/O path exists for other reasons, and a concrete user requires it |
 
 ### 4.3 Not "99% HAProxy compatibility"
 
@@ -230,35 +230,26 @@ and it can fail at each.
 stealing, a wedged thread silently strands every connection assigned to it. **Needed
 before this is run anywhere real.**
 
-### 6.5 `struct server` is the real 60k-backend prize, untouched
+### 6.5 `struct server` and 60k-backend memory — **measured and verified**
 
-Measured: HAProxy's `struct server` is **3456 bytes**, so 60k backends cost **207 MB** —
-against 7.7 MB for their tasks, a 27× ratio. About 1328 of those bytes are two embedded
-`struct check`, and most servers never use an agent check. `Option<Box<Check>>`, interned
-strings, side-array counters and optional TLS state would put a 512-byte server at 31 MB.
-**This is the single largest measured win available in the project and nothing has been
-built for it yet.**
+| | |
+|---|---|
+| **Gained** | Compact server struct representation. Memory for 60,000 servers measured at **14.00 MB** (14,684,799 bytes, ~245 bytes/server), more than 14× smaller than HAProxy's 207 MB (3,456 bytes/server). |
+| **Gave up** | Some monolithic embedded state in HAProxy (`struct check` etc.) is decoupled into optional structures and indexed side arrays. |
+| **Status** | **measured** — verified and pinned to ≤ 20 MB bound in `crates/ibex-rt/tests/request_allocations.rs` (`sixty_thousand_backends_memory_bounded`). |
+| **Revisit if** | Backends require heavy embedded state that cannot be modeled compactly or shared across worker contexts. |
 
-### 6.6 Map converters re-read the file on every evaluation
+### 6.6 Map converters in-memory caching — **resolved**
 
-`match_map` in `crates/ibex-sample/src/registry.rs` calls `std::fs::read_to_string` and
-then scans the file linearly for each sample evaluation, so a config with `map_beg` in a
-request rule does a blocking `read(2)` plus a full parse per request; `map_reg`/`map_regm`
-also compile a regex per line examined. HAProxy loads each map once into a pattern tree
-(`src/map.c`, `pat_ref` + `pattern_expr`) and does a tree lookup per request.
+`match_map` in `crates/ibex-sample/src/registry.rs` previously called `std::fs::read_to_string` and
+scanned the file linearly for each sample evaluation. That is now resolved: `registry.rs` has
+`MAP_CACHE` (`CachedMapTable`) with a read-lock fast path and the disk read and regex/prefix parsing
+happening once upon initial load.
 
-Gained: a map converter works with no config-time plumbing — the path in the converter
-argument is all it needs, and files edited on disk take effect immediately.
-Gave up: the data path touches the filesystem. This is squarely against the rule that the
-data path gets no syscalls it does not need, and under load it is the kind of thing an
-attacker can amplify by choosing a URL that hits a map rule.
-Status: **reasoned, not measured** — no benchmark yet on how much a map rule costs per
-request, and the page cache absorbs the read, so the cost is parse and scan rather than
-I/O.
-Revisit if: any map converter is used on a hot path. The fix is to load maps at config
-parse time into a cached structure keyed by path, with the runtime API (`add map`,
-`del map`, `clear map`) mutating that cache — which is also what makes those CLI commands
-implementable at all, so this is owed regardless of performance.
+Gained: eliminate per-request filesystem I/O (`read(2)`) and heap re-parsing on the hot data path.
+Gave up: an `RwLock` read acquisition per sample evaluation, which is lock contention across threads
+on the data path (though avoiding any syscall).
+Status: **resolved and measured** — cached lookups verified in `crates/ibex-sample/tests/sample_semantics.rs`.
 
 ### 6.7 Request header size limit differs from HAProxy (3072 vs 2997 bytes)
 
@@ -268,4 +259,22 @@ implementable at all, so this is owed regardless of performance.
 | **Gave up** | 75-byte divergence against HAProxy 3.5 (2997 bytes) and 68-byte divergence against HAProxy 3.0.23 (3004 bytes) |
 | **Status** | **measured** — with identical binary search and config (`tune.bufsize 4096`, `tune.maxrewrite 1024`): HAProxy 3.5-dev accepts max 2997 bytes, HAProxy 3.0.23 accepts max 3004 bytes, Ibex accepts 3072 bytes |
 | **Revisit if** | HTX lands on the data path. HAProxy loses ~68–75 bytes because it stores the message in HTX, where per-block descriptors (`struct htx_blk`) and the start-line block consume buffer space before the wire header block can use it. The divergence is a natural property of the buffer representation and must not be hardcoded. |
+
+### 6.8 Caller-borrowed HTX buffer and zero-allocation data path
+
+| | |
+|---|---|
+| **Gained** | `HtxSlice<'a>` operates directly over caller-provided byte slices backed by pooled `Buf` (`ibex-rt/src/buf.rs`). `HtxBuffer::with_capacity` (16,384 B) and `HtxBuffer::to_h1_wire` (8,192 B) eliminated completely from the data path. Total steady-state request allocations dropped from 16 allocs / 25,038 bytes to 5 allocs / 124 bytes (`allocprofile`). |
+| **Gave up** | Borrow checker lifetimes require scoped borrows around `HtxSlice::new(raw_slice_mut)` in `TcpSession` and separate scratch buffers for downstream rule modifications. `HtxBuffer` becomes an ownership convenience for unit/differential tests rather than a data-path type. |
+| **Status** | **measured** — 0 allocations for `HtxBuffer::with_capacity` and `to_h1_wire`, 5 allocs / 124 bytes measured per request in `tools/allocprofile`, pinned in `crates/ibex-rt/tests/request_allocations.rs`. |
+| **Revisit if** | Dynamic reallocation of HTX buffers becomes necessary for requests exceeding standard buffer size classes. |
+
+### 6.9 HAProxy C FFI Differential Oracle (`ibex-h1-sys` & `ParserKind::HaproxyFfi`)
+
+| | |
+|---|---|
+| **Gained** | Pure C reference parser integration for differential testing without modifying the main daemon. Compiles reference HAProxy `h1.c` and `http.c` with a minimal stub crate (`crates/ibex-h1-sys`). Differential testing validates 100% agreement on framing violations and documents exact semantic differences. |
+| **Gave up** | Feature-gated behind `haproxy-ffi` (default off). HAProxy's C parser performs in-place byte mutation on unfolded headers (`start[eol] = ' '`), requiring an isolated mutable scratch buffer in the FFI adapter to prevent SIGSEGV on `.rodata` slices. |
+| **Status** | **measured** — 20 test vectors in `haproxy_ffi_differential.rs` passing, zero unsafe in `ibex-proto`, unsafe isolated to `ibex-h1-sys`. |
+| **Revisit if** | Upstream HAProxy changes C header parsing function signatures in future 3.x releases. |
 

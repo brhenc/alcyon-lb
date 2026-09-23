@@ -4,9 +4,11 @@
 #![forbid(unsafe_code)]
 
 use ibex_proto::h1::{H1Parser, H1Phase};
-use ibex_proto::htx::{HttpMethod, HttpVersion, Htx};
+use ibex_proto::htx::{
+    HeaderField, HttpMethod, HttpVersion, HtxBlock, HtxBlockType, HtxSlice, RequestLine,
+};
 use ibex_proto::mux::Mux;
-use ibex_proto::mux_h1::MuxH1;
+use ibex_proto::mux_h1::{H1StreamState, MuxH1};
 use ibex_proto::ConnId;
 
 // ============================================================================
@@ -25,12 +27,13 @@ fn test_chunked_single_chunk() {
                  \r\n";
 
     let mut parser = H1Parser::new(false);
-    let mut htx = Htx::new();
+    let mut buf = [0u8; 8192];
+    let mut htx = HtxSlice::new(&mut buf);
 
     let consumed = parser.parse(wire, &mut htx).expect("parse chunked");
     assert_eq!(consumed, wire.len());
     assert_eq!(parser.phase, H1Phase::Done);
-    assert_eq!(htx.req_line().unwrap().method, HttpMethod::Post);
+    assert_eq!(htx.req_line().unwrap().method, "POST");
     assert_eq!(htx.body_bytes(), b"hello world");
     assert!(htx.is_eom());
     assert_eq!(htx.trailers().count(), 0);
@@ -64,7 +67,8 @@ fn test_chunked_multiple_varying_sizes() {
     );
 
     let mut parser = H1Parser::new(true);
-    let mut htx = Htx::new();
+    let mut buf = [0u8; 8192];
+    let mut htx = HtxSlice::new(&mut buf);
 
     let consumed = parser
         .parse(wire.as_bytes(), &mut htx)
@@ -98,7 +102,8 @@ fn test_chunked_with_extensions() {
                  \r\n";
 
     let mut parser = H1Parser::new(true);
-    let mut htx = Htx::new();
+    let mut buf = [0u8; 8192];
+    let mut htx = HtxSlice::new(&mut buf);
 
     let consumed = parser
         .parse(wire, &mut htx)
@@ -124,7 +129,8 @@ fn test_chunked_trailer_headers() {
                  \r\n";
 
     let mut parser = H1Parser::new(false);
-    let mut htx = Htx::new();
+    let mut buf = [0u8; 8192];
+    let mut htx = HtxSlice::new(&mut buf);
 
     let consumed = parser
         .parse(wire, &mut htx)
@@ -159,7 +165,8 @@ fn test_chunked_trailers_with_multiline_obs_fold() {
                  \r\n";
 
     let mut parser = H1Parser::new(true);
-    let mut htx = Htx::new();
+    let mut buf = [0u8; 8192];
+    let mut htx = HtxSlice::new(&mut buf);
 
     let consumed = parser
         .parse(wire, &mut htx)
@@ -178,7 +185,8 @@ fn test_chunked_streaming_incremental_bytes() {
     let wire = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n";
 
     let mut parser = H1Parser::new(true);
-    let mut htx = Htx::new();
+    let mut buf = [0u8; 8192];
+    let mut htx = HtxSlice::new(&mut buf);
 
     let mut feed_pos = 0;
     let mut buffer = Vec::new();
@@ -228,11 +236,11 @@ fn test_keep_alive_55_sequential_requests() {
         assert_eq!(consumed, req.len());
         assert_eq!(ctx.parser.phase, H1Phase::Done);
 
-        let req_line = ctx.rx_htx.req_line().expect("req_line");
-        assert_eq!(req_line.method, HttpMethod::Get);
+        let req_line = ctx.rx_htx_buf.req_line().expect("req_line");
+        assert_eq!(req_line.method, "GET");
         assert_eq!(req_line.uri, format!("/resource/{i}"));
         assert_eq!(
-            ctx.rx_htx.get_header("x-seq-id"),
+            ctx.rx_htx_buf.get_header("x-seq-id"),
             Some(i.to_string().as_str())
         );
         assert!(!ctx.parser.connection_close);
@@ -274,10 +282,10 @@ fn test_keep_alive_60_pipelined_requests() {
         if ctx.parser.phase == H1Phase::Done {
             requests_handled += 1;
             let expected_uri = format!("/pipeline/{requests_handled}");
-            assert_eq!(ctx.rx_htx.req_line().unwrap().uri, expected_uri);
+            assert_eq!(ctx.rx_htx_buf.req_line().unwrap().uri, expected_uri);
 
             let expected_body = format!("P{requests_handled:03}");
-            assert_eq!(ctx.rx_htx.body_bytes(), expected_body.as_bytes());
+            assert_eq!(ctx.rx_htx_buf.body_bytes(), expected_body.as_bytes());
 
             // Release stream for next pipelined request on the same connection
             ctx.release_stream();
@@ -292,7 +300,8 @@ fn test_keep_alive_60_pipelined_requests() {
 fn test_keep_alive_connection_close_semantics() {
     let req = b"GET /close HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n";
     let mut parser = H1Parser::new(false);
-    let mut htx = Htx::new();
+    let mut buf = [0u8; 8192];
+    let mut htx = HtxSlice::new(&mut buf);
 
     parser.parse(req, &mut htx).expect("parse close");
     assert_eq!(parser.phase, H1Phase::Done);
@@ -322,7 +331,8 @@ fn test_http10_fallback_without_content_length_close_delimiter() {
     let wire_body = b"<html><body>Legacy payload without Content-Length delimiter</body></html>";
 
     let mut parser = H1Parser::new(true);
-    let mut htx = Htx::new();
+    let mut buf = [0u8; 8192];
+    let mut htx = HtxSlice::new(&mut buf);
 
     let n1 = parser.parse(wire_headers, &mut htx).expect("parse headers");
     assert_eq!(n1, wire_headers.len());
@@ -350,7 +360,7 @@ fn test_http10_fallback_without_content_length_close_delimiter() {
     assert_eq!(parser.phase, H1Phase::Done);
     assert!(htx.is_eom());
     assert_eq!(htx.body_bytes(), wire_body);
-    assert_eq!(htx.res_line().unwrap().version, HttpVersion::Http10);
+    assert_eq!(htx.res_line().unwrap().version, "HTTP/1.0");
     assert!(
         parser.connection_close,
         "HTTP/1.0 defaults to connection close"
@@ -365,13 +375,14 @@ fn test_http10_with_explicit_keep_alive() {
                 \r\n";
 
     let mut parser = H1Parser::new(false);
-    let mut htx = Htx::new();
+    let mut buf = [0u8; 8192];
+    let mut htx = HtxSlice::new(&mut buf);
 
     parser
         .parse(req, &mut htx)
         .expect("parse http10 keep-alive");
     assert_eq!(parser.phase, H1Phase::Done);
-    assert_eq!(htx.req_line().unwrap().version, HttpVersion::Http10);
+    assert_eq!(htx.req_line().unwrap().version, "HTTP/1.0");
     assert!(
         !parser.connection_close,
         "HTTP/1.0 with Connection: keep-alive should not force close"
@@ -386,7 +397,7 @@ fn test_http10_with_explicit_keep_alive() {
 fn test_http_methods_suite() {
     struct TestCase {
         raw: &'static [u8],
-        expected_method: HttpMethod,
+        expected_method: &'static str,
         expected_uri: &'static str,
         expected_body: &'static [u8],
     }
@@ -394,43 +405,43 @@ fn test_http_methods_suite() {
     let cases = vec![
         TestCase {
             raw: b"GET /items HTTP/1.1\r\nHost: api.io\r\n\r\n",
-            expected_method: HttpMethod::Get,
+            expected_method: "GET",
             expected_uri: "/items",
             expected_body: b"",
         },
         TestCase {
             raw: b"POST /items HTTP/1.1\r\nHost: api.io\r\nContent-Length: 9\r\n\r\n{\"id\": 1}",
-            expected_method: HttpMethod::Post,
+            expected_method: "POST",
             expected_uri: "/items",
             expected_body: b"{\"id\": 1}",
         },
         TestCase {
             raw: b"PUT /items/1 HTTP/1.1\r\nHost: api.io\r\nContent-Length: 13\r\n\r\n{\"name\": \"b\"}",
-            expected_method: HttpMethod::Put,
+            expected_method: "PUT",
             expected_uri: "/items/1",
             expected_body: b"{\"name\": \"b\"}",
         },
         TestCase {
             raw: b"DELETE /items/1 HTTP/1.1\r\nHost: api.io\r\n\r\n",
-            expected_method: HttpMethod::Delete,
+            expected_method: "DELETE",
             expected_uri: "/items/1",
             expected_body: b"",
         },
         TestCase {
             raw: b"HEAD /items HTTP/1.1\r\nHost: api.io\r\n\r\n",
-            expected_method: HttpMethod::Head,
+            expected_method: "HEAD",
             expected_uri: "/items",
             expected_body: b"",
         },
         TestCase {
             raw: b"OPTIONS * HTTP/1.1\r\nHost: api.io\r\n\r\n",
-            expected_method: HttpMethod::Options,
+            expected_method: "OPTIONS",
             expected_uri: "*",
             expected_body: b"",
         },
         TestCase {
             raw: b"PATCH /items/1 HTTP/1.1\r\nHost: api.io\r\nContent-Length: 17\r\n\r\n{\"status\": \"act\"}",
-            expected_method: HttpMethod::Patch,
+            expected_method: "PATCH",
             expected_uri: "/items/1",
             expected_body: b"{\"status\": \"act\"}",
         },
@@ -438,7 +449,8 @@ fn test_http_methods_suite() {
 
     for tc in cases {
         let mut parser = H1Parser::new(false);
-        let mut htx = Htx::new();
+        let mut buf = [0u8; 8192];
+        let mut htx = HtxSlice::new(&mut buf);
 
         let consumed = parser.parse(tc.raw, &mut htx).expect("parse method");
         assert_eq!(consumed, tc.raw.len());
@@ -452,7 +464,7 @@ fn test_http_methods_suite() {
         // Verify HTX wire serialization roundtrip preserves method
         let wire = htx.to_h1_wire();
         let wire_str = String::from_utf8(wire).expect("utf8");
-        assert!(wire_str.starts_with(tc.expected_method.as_str()));
+        assert!(wire_str.starts_with(tc.expected_method));
     }
 }
 
@@ -464,7 +476,8 @@ fn test_http_methods_suite() {
 fn test_header_crlf_standard() {
     let wire = b"GET /crlf HTTP/1.1\r\nHost: example.com\r\nX-Custom: value\r\n\r\n";
     let mut parser = H1Parser::new(false);
-    let mut htx = Htx::new();
+    let mut buf = [0u8; 8192];
+    let mut htx = HtxSlice::new(&mut buf);
 
     let consumed = parser.parse(wire, &mut htx).expect("parse crlf");
     assert_eq!(consumed, wire.len());
@@ -477,7 +490,8 @@ fn test_header_crlf_standard() {
 fn test_header_lf_only() {
     let wire = b"GET /lf-only HTTP/1.1\nHost: example.org\nX-Single-Line: ok\n\n";
     let mut parser = H1Parser::new(false);
-    let mut htx = Htx::new();
+    let mut buf = [0u8; 8192];
+    let mut htx = HtxSlice::new(&mut buf);
 
     let consumed = parser.parse(wire, &mut htx).expect("parse lf only");
     assert_eq!(consumed, wire.len());
@@ -507,7 +521,8 @@ fn test_header_cr_only_is_rejected() {
     // end disagrees about where the message ends, which is a desync primitive.
     let wire = b"GET /cr-only HTTP/1.1\rHost: example.net\rX-Header: cr_val\r\r";
     let mut parser = H1Parser::new(false);
-    let mut htx = Htx::new();
+    let mut buf = [0u8; 8192];
+    let mut htx = HtxSlice::new(&mut buf);
 
     assert!(
         parser.parse(wire, &mut htx).is_err(),
@@ -519,7 +534,8 @@ fn test_header_cr_only_is_rejected() {
 fn test_header_crlf_still_normalizes() {
     let wire = b"GET /cr-only HTTP/1.1\r\nHost: example.net\r\nX-Header: cr_val\r\n\r\n";
     let mut parser = H1Parser::new(false);
-    let mut htx = Htx::new();
+    let mut buf = [0u8; 8192];
+    let mut htx = HtxSlice::new(&mut buf);
     let consumed = parser.parse(wire, &mut htx).expect("parse crlf");
     assert_eq!(consumed, wire.len());
     assert_eq!(parser.phase, H1Phase::Done);
@@ -536,7 +552,8 @@ fn test_header_multiline_obs_fold_spaces_and_tabs() {
     let wire = b"GET /obs-fold HTTP/1.1\r\nHost: example.com\r\nSubject: This is a test of\r\n folded header fields using\r\n\tRFC7230 obs-fold rules\r\nAccept: */*\r\n\r\n";
 
     let mut parser = H1Parser::new(false);
-    let mut htx = Htx::new();
+    let mut buf = [0u8; 8192];
+    let mut htx = HtxSlice::new(&mut buf);
 
     let consumed = parser.parse(wire, &mut htx).expect("parse obs fold");
     assert_eq!(consumed, wire.len());
@@ -563,7 +580,8 @@ fn test_header_whitespace_and_case_insensitivity() {
                  \r\n";
 
     let mut parser = H1Parser::new(false);
-    let mut htx = Htx::new();
+    let mut buf = [0u8; 8192];
+    let mut htx = HtxSlice::new(&mut buf);
 
     parser.parse(wire, &mut htx).expect("parse whitespace");
     assert_eq!(
@@ -587,6 +605,420 @@ fn test_whitespace_before_colon_is_rejected() {
     // token and honoured by one that trims, and the two then disagree on body length.
     let wire = b"GET /ws HTTP/1.1\r\nHost: h\r\nX-Spaced :   padded_value\r\n\r\n";
     let mut parser = H1Parser::new(false);
-    let mut htx = Htx::new();
+    let mut buf = [0u8; 8192];
+    let mut htx = HtxSlice::new(&mut buf);
     assert!(parser.parse(wire, &mut htx).is_err());
 }
+
+// ============================================================================
+// Stage 1: MuxH1 Receive Path HTX Block Sequence Tests
+// ============================================================================
+
+#[test]
+fn test_stage1_mux_h1_block_sequence_content_length() {
+    let wire = b"POST /submit HTTP/1.1\r\nHost: example.com\r\nContent-Length: 11\r\n\r\nhello world";
+    let mux = MuxH1;
+    let mut ctx = mux.init(ConnId(101), false).expect("init mux");
+
+    let consumed = mux.parse(&mut ctx, wire).expect("parse content-length");
+    assert_eq!(consumed, wire.len());
+    assert_eq!(ctx.stream_state, H1StreamState::ReqDone);
+    assert!(ctx.rx_htx_buf.is_eom());
+    assert_eq!(ctx.rx_htx_buf.body_bytes(), b"hello world");
+
+    // Block-by-block sequence verification
+    assert_eq!(
+        ctx.rx_htx_buf.active_block_types(),
+        vec![
+            HtxBlockType::ReqLine,
+            HtxBlockType::Header,
+            HtxBlockType::Header,
+            HtxBlockType::Eoh,
+            HtxBlockType::Data,
+            HtxBlockType::Eom,
+        ]
+    );
+
+    let blocks = ctx.rx_htx_buf.to_blocks();
+    assert_eq!(
+        blocks[0],
+        HtxBlock::ReqLine(RequestLine {
+            method: HttpMethod::Post,
+            uri: "/submit".into(),
+            version: HttpVersion::Http11,
+        })
+    );
+    assert_eq!(
+        blocks[1],
+        HtxBlock::Header(HeaderField {
+            name: "Host".into(),
+            value: "example.com".into(),
+        })
+    );
+    assert_eq!(
+        blocks[2],
+        HtxBlock::Header(HeaderField {
+            name: "Content-Length".into(),
+            value: "11".into(),
+        })
+    );
+    assert_eq!(blocks[3], HtxBlock::Eoh);
+    assert_eq!(blocks[4], HtxBlock::Data(b"hello world".to_vec()));
+    assert_eq!(blocks[5], HtxBlock::Eom);
+}
+
+#[test]
+fn test_stage1_mux_h1_block_sequence_chunked() {
+    let wire = b"POST /chunked HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+    let mux = MuxH1;
+    let mut ctx = mux.init(ConnId(102), false).expect("init mux");
+
+    let consumed = mux.parse(&mut ctx, wire).expect("parse chunked");
+    assert_eq!(consumed, wire.len());
+    assert_eq!(ctx.stream_state, H1StreamState::ReqDone);
+    assert!(ctx.rx_htx_buf.is_eom());
+    assert_eq!(ctx.rx_htx_buf.body_bytes(), b"hello world");
+
+    assert_eq!(
+        ctx.rx_htx_buf.active_block_types(),
+        vec![
+            HtxBlockType::ReqLine,
+            HtxBlockType::Header,
+            HtxBlockType::Header,
+            HtxBlockType::Eoh,
+            HtxBlockType::Data,
+            HtxBlockType::Data,
+            HtxBlockType::Eot,
+            HtxBlockType::Eom,
+        ]
+    );
+
+    let blocks = ctx.rx_htx_buf.to_blocks();
+    assert_eq!(
+        blocks[0],
+        HtxBlock::ReqLine(RequestLine {
+            method: HttpMethod::Post,
+            uri: "/chunked".into(),
+            version: HttpVersion::Http11,
+        })
+    );
+    assert_eq!(
+        blocks[1],
+        HtxBlock::Header(HeaderField {
+            name: "Host".into(),
+            value: "example.com".into(),
+        })
+    );
+    assert_eq!(
+        blocks[2],
+        HtxBlock::Header(HeaderField {
+            name: "Transfer-Encoding".into(),
+            value: "chunked".into(),
+        })
+    );
+    assert_eq!(blocks[3], HtxBlock::Eoh);
+    assert_eq!(blocks[4], HtxBlock::Data(b"hello".to_vec()));
+    assert_eq!(blocks[5], HtxBlock::Data(b" world".to_vec()));
+    assert_eq!(blocks[6], HtxBlock::Eot);
+    assert_eq!(blocks[7], HtxBlock::Eom);
+}
+
+#[test]
+fn test_stage1_mux_h1_block_sequence_chunked_with_trailers() {
+    let wire = b"POST /trailers HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nExpires: never\r\nChecksum: abc123\r\n\r\n";
+    let mux = MuxH1;
+    let mut ctx = mux.init(ConnId(103), false).expect("init mux");
+
+    let consumed = mux.parse(&mut ctx, wire).expect("parse chunked with trailers");
+    assert_eq!(consumed, wire.len());
+    assert_eq!(ctx.stream_state, H1StreamState::ReqDone);
+    assert!(ctx.rx_htx_buf.is_eom());
+    assert_eq!(ctx.rx_htx_buf.body_bytes(), b"hello");
+
+    assert_eq!(
+        ctx.rx_htx_buf.active_block_types(),
+        vec![
+            HtxBlockType::ReqLine,
+            HtxBlockType::Header,
+            HtxBlockType::Header,
+            HtxBlockType::Eoh,
+            HtxBlockType::Data,
+            HtxBlockType::Trailer,
+            HtxBlockType::Trailer,
+            HtxBlockType::Eot,
+            HtxBlockType::Eom,
+        ]
+    );
+
+    let blocks = ctx.rx_htx_buf.to_blocks();
+    assert_eq!(
+        blocks[0],
+        HtxBlock::ReqLine(RequestLine {
+            method: HttpMethod::Post,
+            uri: "/trailers".into(),
+            version: HttpVersion::Http11,
+        })
+    );
+    assert_eq!(
+        blocks[1],
+        HtxBlock::Header(HeaderField {
+            name: "Host".into(),
+            value: "example.com".into(),
+        })
+    );
+    assert_eq!(
+        blocks[2],
+        HtxBlock::Header(HeaderField {
+            name: "Transfer-Encoding".into(),
+            value: "chunked".into(),
+        })
+    );
+    assert_eq!(blocks[3], HtxBlock::Eoh);
+    assert_eq!(blocks[4], HtxBlock::Data(b"hello".to_vec()));
+    assert_eq!(
+        blocks[5],
+        HtxBlock::Trailer(HeaderField {
+            name: "Expires".into(),
+            value: "never".into(),
+        })
+    );
+    assert_eq!(
+        blocks[6],
+        HtxBlock::Trailer(HeaderField {
+            name: "Checksum".into(),
+            value: "abc123".into(),
+        })
+    );
+    assert_eq!(blocks[7], HtxBlock::Eot);
+    assert_eq!(blocks[8], HtxBlock::Eom);
+}
+
+#[test]
+fn test_stage1_mux_h1_block_sequence_no_body() {
+    let wire = b"GET /no-body HTTP/1.1\r\nHost: example.com\r\nAccept: */*\r\n\r\n";
+    let mux = MuxH1;
+    let mut ctx = mux.init(ConnId(104), false).expect("init mux");
+
+    let consumed = mux.parse(&mut ctx, wire).expect("parse no body");
+    assert_eq!(consumed, wire.len());
+    assert_eq!(ctx.stream_state, H1StreamState::ReqDone);
+    assert!(ctx.rx_htx_buf.is_eom());
+    assert_eq!(ctx.rx_htx_buf.body_len(), 0);
+
+    assert_eq!(
+        ctx.rx_htx_buf.active_block_types(),
+        vec![
+            HtxBlockType::ReqLine,
+            HtxBlockType::Header,
+            HtxBlockType::Header,
+            HtxBlockType::Eoh,
+            HtxBlockType::Eom,
+        ]
+    );
+
+    let blocks = ctx.rx_htx_buf.to_blocks();
+    assert_eq!(
+        blocks[0],
+        HtxBlock::ReqLine(RequestLine {
+            method: HttpMethod::Get,
+            uri: "/no-body".into(),
+            version: HttpVersion::Http11,
+        })
+    );
+    assert_eq!(
+        blocks[1],
+        HtxBlock::Header(HeaderField {
+            name: "Host".into(),
+            value: "example.com".into(),
+        })
+    );
+    assert_eq!(
+        blocks[2],
+        HtxBlock::Header(HeaderField {
+            name: "Accept".into(),
+            value: "*/*".into(),
+        })
+    );
+    assert_eq!(blocks[3], HtxBlock::Eoh);
+    assert_eq!(blocks[4], HtxBlock::Eom);
+}
+
+#[test]
+fn test_stage1_mux_h1_block_sequence_cl_te_conflict() {
+    let wire = b"POST /conflict HTTP/1.1\r\nHost: example.com\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+    let mux = MuxH1;
+    let mut ctx = mux.init(ConnId(105), false).expect("init mux");
+
+    let consumed = mux.parse(&mut ctx, wire).expect("parse cl-te conflict");
+    assert_eq!(consumed, wire.len());
+    assert_eq!(ctx.stream_state, H1StreamState::ReqDone);
+    assert!(ctx.rx_htx_buf.is_eom());
+    assert!(ctx.conn_close, "CL+TE conflict must force connection: close");
+    assert!(ctx.parser.framing_conflict, "Framing conflict flag must be set");
+    assert_eq!(
+        ctx.rx_htx_buf.get_header("content-length"),
+        None,
+        "Content-Length must be removed per RFC 7230 §3.3.3"
+    );
+
+    // Active block types omit tombstoned Content-Length block
+    assert_eq!(
+        ctx.rx_htx_buf.active_block_types(),
+        vec![
+            HtxBlockType::ReqLine,
+            HtxBlockType::Header,
+            HtxBlockType::Header,
+            HtxBlockType::Eoh,
+            HtxBlockType::Data,
+            HtxBlockType::Eot,
+            HtxBlockType::Eom,
+        ]
+    );
+
+    let blocks = ctx.rx_htx_buf.to_blocks();
+    assert_eq!(
+        blocks[0],
+        HtxBlock::ReqLine(RequestLine {
+            method: HttpMethod::Post,
+            uri: "/conflict".into(),
+            version: HttpVersion::Http11,
+        })
+    );
+    assert_eq!(
+        blocks[1],
+        HtxBlock::Header(HeaderField {
+            name: "Host".into(),
+            value: "example.com".into(),
+        })
+    );
+    assert_eq!(
+        blocks[2],
+        HtxBlock::Header(HeaderField {
+            name: "Transfer-Encoding".into(),
+            value: "chunked".into(),
+        })
+    );
+    assert_eq!(blocks[3], HtxBlock::Eoh);
+    assert_eq!(blocks[4], HtxBlock::Data(b"hello".to_vec()));
+    assert_eq!(blocks[5], HtxBlock::Eot);
+    assert_eq!(blocks[6], HtxBlock::Eom);
+
+    // Verify defrag removes the Unused tombstone in-place and invariants hold
+    ctx.rx_htx_buf.defrag();
+    assert_eq!(ctx.rx_htx_buf.block_types(), ctx.rx_htx_buf.active_block_types());
+    ctx.rx_htx_buf
+        .check_invariants()
+        .expect("invariants must hold after defrag");
+}
+
+#[test]
+fn test_stage3_htx_ruleset_mutation_parity() {
+    let wire = b"GET /v1/users?page=1 HTTP/1.1\r\nHost: example.com\r\nX-Foo: bar\r\nX-Remove-Me: gone\r\nUser-Agent: test\r\n\r\n";
+    let mux = MuxH1;
+    let mut ctx = mux.init(ConnId(106), false).expect("init mux");
+
+    let consumed = mux.parse(&mut ctx, wire).expect("parse base request");
+    assert_eq!(consumed, wire.len());
+
+    // Apply rule mutations directly via HTX block ops
+    // 1. set-path to /v2/users
+    ctx.rx_htx_buf.set_path("/v2/users").expect("set_path");
+    // 2. del-header on X-Remove-Me
+    ctx.rx_htx_buf.remove_header("X-Remove-Me");
+    // 3. replace-header User-Agent -> ibex/1.0
+    ctx.rx_htx_buf
+        .replace_header("User-Agent", "test", "ibex/1.0")
+        .expect("replace_header");
+    // 4. set-header X-Foo -> baz (updates existing)
+    ctx.rx_htx_buf.set_header("X-Foo", "baz").expect("set_header");
+    // 5. add-header X-Added: yes (appends new header)
+    ctx.rx_htx_buf.add_header("X-Added", "yes").expect("add_header");
+
+    let wire_out = ctx.rx_htx_buf.to_h1_wire();
+    let expected = b"GET /v2/users?page=1 HTTP/1.1\r\nHost: example.com\r\nX-Foo: baz\r\nUser-Agent: ibex/1.0\r\nX-Added: yes\r\n\r\n";
+    assert_eq!(
+        std::str::from_utf8(&wire_out).unwrap(),
+        std::str::from_utf8(expected).unwrap(),
+        "HTX mutation ruleset must match expected normalized wire form"
+    );
+
+    ctx.rx_htx_buf
+        .check_invariants()
+        .expect("invariants must hold after mutation ruleset");
+}
+
+#[test]
+fn test_stage3_htx_defrag_threshold_below_at_above() {
+    use ibex_proto::htx::{HtxBuffer, HTX_DEFRAG_THRESHOLD_BYTES};
+
+    // 1. Below threshold: 511 fragmented bytes
+    let mut buf = HtxBuffer::new();
+    buf.push_req_line("GET", "/test", "HTTP/1.1").expect("req line");
+    // Push header with 511 bytes value
+    let pad511 = "a".repeat(511);
+    buf.push_header("X-Pad", &pad511).expect("pad header");
+    buf.push_header("Host", "example.com").expect("host");
+    buf.push_eoh().expect("eoh");
+
+    // Remove pad header, creating 511+name bytes of fragmentation
+    buf.remove_header("X-Pad");
+    let frag_before = buf.fragmented_bytes();
+    assert!(frag_before >= 511, "must have at least 511 fragmented bytes, got {frag_before}");
+
+    // Test below threshold: set threshold to frag_before + 1
+    let triggered_below = buf.maybe_defrag_threshold(frag_before + 1);
+    assert!(
+        !triggered_below,
+        "maybe_defrag below threshold must NOT trigger defrag"
+    );
+    assert_eq!(buf.fragmented_bytes(), frag_before);
+
+    // 2. Exactly at threshold: set threshold to frag_before
+    let triggered_at = buf.maybe_defrag_threshold(frag_before);
+    assert!(
+        triggered_at,
+        "maybe_defrag exactly at threshold MUST trigger defrag"
+    );
+    assert_eq!(
+        buf.fragmented_bytes(),
+        0,
+        "fragmented bytes must drop to 0 after defrag at threshold"
+    );
+    buf.check_invariants().expect("invariants must hold after defrag at threshold");
+
+    // Assert block sequence survives intact
+    assert_eq!(buf.get_header("Host"), Some("example.com"));
+    assert_eq!(buf.get_header("X-Pad"), None);
+
+    // 3. Above threshold: create 1024 fragmented bytes and test against HTX_DEFRAG_THRESHOLD_BYTES (512)
+    let pad1024 = "b".repeat(1024);
+    buf.push_header("X-Pad-Big", &pad1024).expect("big pad");
+    buf.push_header("X-Keep", "alive").expect("keep header");
+    buf.remove_header("X-Pad-Big");
+    let frag_big = buf.fragmented_bytes();
+    assert!(
+        frag_big >= 1024,
+        "must have at least 1024 fragmented bytes, got {frag_big}"
+    );
+    assert!(
+        frag_big > HTX_DEFRAG_THRESHOLD_BYTES,
+        "frag_big ({frag_big}) must be above default threshold ({HTX_DEFRAG_THRESHOLD_BYTES})"
+    );
+
+    let triggered_above = buf.maybe_defrag();
+    assert!(
+        triggered_above,
+        "maybe_defrag above threshold MUST trigger defrag"
+    );
+    assert_eq!(
+        buf.fragmented_bytes(),
+        0,
+        "fragmented bytes must drop to 0 after defrag above threshold"
+    );
+    buf.check_invariants().expect("invariants must hold after defrag above threshold");
+
+    assert_eq!(buf.get_header("X-Keep"), Some("alive"));
+    assert_eq!(buf.get_header("Host"), Some("example.com"));
+}
+
+

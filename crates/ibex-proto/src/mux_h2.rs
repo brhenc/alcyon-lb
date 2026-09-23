@@ -25,7 +25,7 @@ use crate::h2::{
     DEFAULT_INITIAL_WINDOW_SIZE, DEFAULT_MAX_FRAME_SIZE, FRAME_HEADER_LEN, H2_CONN_PREFACE,
 };
 use crate::hpack::{HpackDecoder, HpackEncoder};
-use crate::htx::{HttpMethod, HttpVersion, Htx, HtxBlock, RequestLine, ResponseLine};
+use crate::htx::{HeaderField, HttpMethod, HttpVersion, Htx, HtxBlock, RequestLine, ResponseLine};
 use crate::mux::{mux_flags, Mux, MuxFlags, MuxOps, ShutMode};
 use std::collections::HashMap;
 use std::io;
@@ -171,6 +171,107 @@ impl H2MuxContext {
             stream.reset_reason = Some(error_code);
             stream.is_shut = true;
         }
+    }
+
+    /// Sends an HTTP/2 response on the given stream ID with status and headers.
+    pub fn send_response(
+        &mut self,
+        stream_id: u32,
+        status: u16,
+        headers: &[(String, String)],
+        body: &[u8],
+    ) {
+        let mut hpack_headers = vec![HeaderField {
+            name: ":status".to_string(),
+            value: status.to_string(),
+        }];
+        for (name, val) in headers {
+            let lower = name.to_ascii_lowercase();
+            // RFC 7540 §8.1.2.2: connection-specific headers must not be sent in HTTP/2
+            if lower == "connection"
+                || lower == "keep-alive"
+                || lower == "proxy-connection"
+                || lower == "transfer-encoding"
+                || lower == "upgrade"
+            {
+                continue;
+            }
+            hpack_headers.push(HeaderField {
+                name: lower,
+                value: val.clone(),
+            });
+        }
+        let header_block = self.encoder.encode(&hpack_headers);
+        let end_stream = body.is_empty();
+        let flags = if end_stream {
+            frame_flags::END_HEADERS | frame_flags::END_STREAM
+        } else {
+            frame_flags::END_HEADERS
+        };
+        self.enqueue_frame(&Frame::Headers {
+            flags,
+            stream_id,
+            header_block,
+        });
+
+        if !body.is_empty() {
+            let max_chunk = self.max_frame_size as usize;
+            let mut offset = 0;
+            while offset < body.len() {
+                let chunk_len = (body.len() - offset).min(max_chunk);
+                let is_last = offset + chunk_len >= body.len();
+                let flags = if is_last { frame_flags::END_STREAM } else { 0 };
+                self.enqueue_frame(&Frame::Data {
+                    flags,
+                    stream_id,
+                    data: body[offset..offset + chunk_len].to_vec(),
+                });
+                offset += chunk_len;
+            }
+        }
+
+        if let Some(stream) = self.streams.get_mut(&stream_id) {
+            stream.state = match stream.state {
+                H2StreamState::HalfClosedRemote => H2StreamState::Closed,
+                _ => H2StreamState::HalfClosedLocal,
+            };
+        }
+    }
+
+    /// Parses an HTTP/1 response buffer and encodes it as HTTP/2 HEADERS/DATA frames.
+    pub fn send_h1_response(&mut self, stream_id: u32, h1_bytes: &[u8]) -> bool {
+        let (head, body) = if let Some(pos) = h1_bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+            (&h1_bytes[..pos], &h1_bytes[pos + 4..])
+        } else if let Some(pos) = h1_bytes.windows(2).position(|w| w == b"\n\n") {
+            (&h1_bytes[..pos], &h1_bytes[pos + 2..])
+        } else {
+            return false;
+        };
+
+        let head_str = String::from_utf8_lossy(head);
+        let mut lines = head_str.lines();
+        let status_line = match lines.next() {
+            Some(l) => l,
+            None => return false,
+        };
+        let parts: Vec<&str> = status_line.split_whitespace().collect();
+        if parts.len() < 2 {
+            return false;
+        }
+        let status: u16 = match parts[1].parse() {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+
+        let mut headers = Vec::new();
+        for line in lines {
+            if let Some((name, val)) = line.split_once(':') {
+                headers.push((name.trim().to_string(), val.trim().to_string()));
+            }
+        }
+
+        self.send_response(stream_id, status, &headers, body);
+        true
     }
 }
 

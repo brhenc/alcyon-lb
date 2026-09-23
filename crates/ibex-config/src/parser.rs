@@ -11,7 +11,7 @@ use crate::ast::{
     AclCondition, AclRule, AclTerm, BackendSection, BalanceAlgorithm, BindConfig, Config,
     DefaultServerConfig, DefaultsSection, FrontendSection, GlobalSection, GlobalSetVar,
     HttpAfterResAction, HttpAfterResRule, HttpReqAction, HttpReqRule, HttpResAction, HttpResRule,
-    ListenSection, LogConfig, LogFacility, LogLevel, LogTarget, Mode, Server, StatsConfig,
+    HttpReuse, ListenSection, LogConfig, LogFacility, LogLevel, LogTarget, Mode, Server, StatsConfig,
     StickRule, StickRuleType, StickTableConfigAst, TcpReqConnAction, TcpReqConnRule,
     TcpReqContentAction, TcpReqContentRule, TcpReqSessionAction, TcpReqSessionRule, TimeoutConfig,
     UseBackendRule,
@@ -273,6 +273,7 @@ fn parse_listen_header(
         http_after_res_rules: Vec::new(),
         accept_proxy,
         accept_proxy_v2,
+        http_reuse: defaults.and_then(|d| d.http_reuse),
         forwardfor: None,
         originalto: None,
         stats: StatsConfig::default(),
@@ -403,6 +404,7 @@ fn parse_backend_header(
         http_req_rules: Vec::new(),
         http_res_rules: Vec::new(),
         http_after_res_rules: Vec::new(),
+        http_reuse: defaults.and_then(|d| d.http_reuse),
         forwardfor: None,
         originalto: None,
         stats: StatsConfig::default(),
@@ -602,6 +604,7 @@ fn parse_defaults_directive(
         "clitimeout" => parse_clitimeout(kw),
         "srvtimeout" => parse_srvtimeout(kw),
         "dispatch" => parse_dispatch(kw),
+        "http-reuse" => parse_http_reuse(&mut defaults.http_reuse, tokens, kw),
         "cliexp" => parse_cliexp(kw),
         "srvexp" => parse_srvexp(kw),
         _ => Ok(()),
@@ -646,6 +649,7 @@ fn parse_listen_directive(
         "cliexp" => parse_cliexp(kw),
         "srvexp" => parse_srvexp(kw),
         "balance" => parse_balance(&mut proxy.balance, tokens, kw),
+        "http-reuse" => parse_http_reuse(&mut proxy.http_reuse, tokens, kw),
         "acl" => parse_acl(&mut proxy.acls, tokens, kw),
         "use_backend" => parse_use_backend(&mut proxy.use_backends, tokens, kw),
         "default_backend" => parse_default_backend(&mut proxy.default_backend, tokens, kw),
@@ -845,6 +849,7 @@ fn parse_backend_directive(
             Ok(())
         }
         "balance" => parse_balance(&mut be.balance, tokens, kw),
+        "http-reuse" => parse_http_reuse(&mut be.http_reuse, tokens, kw),
         "cookie" => parse_cookie(&mut be.cookie, tokens, kw),
         "contimeout" => parse_contimeout(kw),
         "clitimeout" => parse_clitimeout(kw),
@@ -1286,6 +1291,34 @@ fn parse_balance(
                 tokens[1].line,
                 tokens[1].col,
                 format!("unknown balance algorithm <{other}>"),
+            ));
+        }
+    };
+    Ok(())
+}
+
+fn parse_http_reuse(
+    reuse: &mut Option<HttpReuse>,
+    tokens: &[Token],
+    kw: &Token,
+) -> Result<(), ConfigError> {
+    if tokens.len() < 2 || tokens[1].text.is_empty() {
+        return Err(ConfigError::new(
+            kw.line,
+            kw.col,
+            "<http-reuse> expects a strategy ('never', 'safe', 'aggressive', 'always') as argument.",
+        ));
+    }
+    *reuse = match tokens[1].text.as_str() {
+        "never" => Some(HttpReuse::Never),
+        "safe" => Some(HttpReuse::Safe),
+        "aggressive" => Some(HttpReuse::Aggressive),
+        "always" => Some(HttpReuse::Always),
+        other => {
+            return Err(ConfigError::new(
+                tokens[1].line,
+                tokens[1].col,
+                format!("unknown http-reuse strategy <{other}>, expected 'never', 'safe', 'aggressive', or 'always'"),
             ));
         }
     };

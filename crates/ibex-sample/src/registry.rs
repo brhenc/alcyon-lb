@@ -14,7 +14,7 @@ use crate::hash::{
     sha512_digest,
 };
 use crate::sample::{Sample, SampleType, TypeSpec};
-use ibex_proto::htx::Htx;
+use ibex_proto::htx::{Htx, HtxSliceRef};
 use regex::RegexBuilder;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -90,6 +90,7 @@ pub struct SampleContext<'a> {
     pub fc_dst: Option<SocketAddr>,
     pub proxy_tlvs: Option<&'a [u8]>,
     pub htx: Option<&'a Htx>,
+    pub htx_slice: Option<HtxSliceRef<'a>>,
     pub req_uri: Option<&'a str>,
     pub req_method: Option<&'a str>,
     pub req_headers: Option<&'a [(String, String)]>,
@@ -388,9 +389,7 @@ impl Registry {
             name: "path",
             out_type: SampleType::Str,
             func: |ctx, _args| {
-                let uri = ctx
-                    .req_uri
-                    .or_else(|| ctx.htx.and_then(|h| h.req_line().map(|r| r.uri.as_str())))?;
+                let uri = get_context_uri(ctx)?;
                 let (_, path, _) = split_uri(uri);
                 Some(Sample::Str(path.to_string()))
             },
@@ -400,9 +399,7 @@ impl Registry {
             name: "pathq",
             out_type: SampleType::Str,
             func: |ctx, _args| {
-                let uri = ctx
-                    .req_uri
-                    .or_else(|| ctx.htx.and_then(|h| h.req_line().map(|r| r.uri.as_str())))?;
+                let uri = get_context_uri(ctx)?;
                 let (_, path, query) = split_uri(uri);
                 if query.is_empty() {
                     Some(Sample::Str(path.to_string()))
@@ -413,9 +410,7 @@ impl Registry {
         });
 
         let url_fetch: FetchFn = |ctx, _args| {
-            let uri = ctx
-                .req_uri
-                .or_else(|| ctx.htx.and_then(|h| h.req_line().map(|r| r.uri.as_str())))?;
+            let uri = get_context_uri(ctx)?;
             Some(Sample::Str(uri.to_string()))
         };
         self.register_fetch(FetchDesc {
@@ -433,9 +428,7 @@ impl Registry {
             name: "query",
             out_type: SampleType::Str,
             func: |ctx, _args| {
-                let uri = ctx
-                    .req_uri
-                    .or_else(|| ctx.htx.and_then(|h| h.req_line().map(|r| r.uri.as_str())))?;
+                let uri = get_context_uri(ctx)?;
                 let (_, _, query) = split_uri(uri);
                 Some(Sample::Str(query.to_string()))
             },
@@ -443,9 +436,7 @@ impl Registry {
 
         let url_param_fetch: FetchFn = |ctx, args| {
             let param = args.first()?;
-            let uri = ctx
-                .req_uri
-                .or_else(|| ctx.htx.and_then(|h| h.req_line().map(|r| r.uri.as_str())))?;
+            let uri = get_context_uri(ctx)?;
             let (_, _, query) = split_uri(uri);
             extract_url_param(query, param).map(Sample::Str)
         };
@@ -465,9 +456,7 @@ impl Registry {
             out_type: SampleType::Sint,
             func: |ctx, args| {
                 let param = args.first()?;
-                let uri = ctx
-                    .req_uri
-                    .or_else(|| ctx.htx.and_then(|h| h.req_line().map(|r| r.uri.as_str())))?;
+                let uri = get_context_uri(ctx)?;
                 let (_, _, query) = split_uri(uri);
                 let val_str = extract_url_param(query, param)?;
                 val_str.parse::<i64>().ok().map(Sample::Sint)
@@ -478,7 +467,7 @@ impl Registry {
             name: "method",
             out_type: SampleType::Meth,
             func: |ctx, _args| {
-                if let Some(m_str) = ctx.req_method {
+                if let Some(m_str) = get_context_method(ctx) {
                     return Some(Sample::Meth(ibex_proto::htx::HttpMethod::from_bytes(
                         m_str.as_bytes(),
                     )));
@@ -490,7 +479,7 @@ impl Registry {
         });
 
         let request_version_fetch: FetchFn = |ctx, _args| {
-            if let Some(v) = ctx.req_version {
+            if let Some(v) = get_context_req_version(ctx) {
                 return Some(Sample::Str(v.to_string()));
             }
             if let Some(htx) = ctx.htx {
@@ -512,7 +501,7 @@ impl Registry {
         });
 
         let response_version_fetch: FetchFn = |ctx, _args| {
-            if let Some(v) = ctx.res_version {
+            if let Some(v) = get_context_res_version(ctx) {
                 return Some(Sample::Str(v.to_string()));
             }
             if let Some(htx) = ctx.htx {
@@ -534,6 +523,11 @@ impl Registry {
         });
 
         let status_fetch: FetchFn = |ctx, _args| {
+            if let Some(h) = ctx.htx_slice {
+                if let Some(res) = h.res_line() {
+                    return Some(Sample::Sint(i64::from(res.status)));
+                }
+            }
             if let Some(st) = ctx.res_status {
                 return Some(Sample::Sint(i64::from(st)));
             }
@@ -563,14 +557,21 @@ impl Registry {
         self.register_fetch(FetchDesc {
             name: "req.proto_http",
             out_type: SampleType::Bool,
-            func: |ctx, _args| Some(Sample::Bool(ctx.htx.is_some() || ctx.req_uri.is_some())),
+            func: |ctx, _args| {
+                Some(Sample::Bool(
+                    ctx.htx_slice.is_some() || ctx.htx.is_some() || ctx.req_uri.is_some(),
+                ))
+            },
         });
         self.register_fetch(FetchDesc {
             name: "res.proto_http",
             out_type: SampleType::Bool,
             func: |ctx, _args| {
                 Some(Sample::Bool(
-                    ctx.htx.is_some() || ctx.res_status.is_some() || CURRENT_RES_STATUS.get() > 0,
+                    ctx.htx_slice.is_some()
+                        || ctx.htx.is_some()
+                        || ctx.res_status.is_some()
+                        || CURRENT_RES_STATUS.get() > 0,
                 ))
             },
         });
@@ -618,9 +619,7 @@ impl Registry {
             func: |ctx, args| {
                 let base_smp = fetch_base(ctx, args)?;
                 let Sample::Str(b) = base_smp else { return None };
-                let uri = ctx
-                    .req_uri
-                    .or_else(|| ctx.htx.and_then(|h| h.req_line().map(|r| r.uri.as_str())))?;
+                let uri = get_context_uri(ctx)?;
                 let (_, _, query) = split_uri(uri);
                 if query.is_empty() {
                     Some(Sample::Str(b))
@@ -906,16 +905,32 @@ impl Registry {
         self.register_fetch(FetchDesc {
             name: "req.body",
             out_type: SampleType::Bin,
-            func: |ctx, _args| ctx.req_body.map(|b| Sample::Bin(b.to_vec())),
+            func: |ctx, _args| {
+                if let Some(b) = ctx.req_body {
+                    return Some(Sample::Bin(b.to_vec()));
+                }
+                ctx.htx_slice.map(|h| Sample::Bin(h.body_bytes()))
+            },
         });
 
         self.register_fetch(FetchDesc {
             name: "res.body",
             out_type: SampleType::Bin,
-            func: |ctx, _args| ctx.res_body.map(|b| Sample::Bin(b.to_vec())),
+            func: |ctx, _args| {
+                if let Some(b) = ctx.res_body {
+                    return Some(Sample::Bin(b.to_vec()));
+                }
+                ctx.htx_slice.map(|h| Sample::Bin(h.body_bytes()))
+            },
         });
 
         let request_body_len_fetch: FetchFn = |ctx, _args| {
+            if let Some(h) = ctx.htx_slice {
+                let bl = h.body_len();
+                if bl > 0 {
+                    return Some(Sample::Sint(len_to_sint(bl)));
+                }
+            }
             if let Some(b) = ctx.req_body {
                 return Some(Sample::Sint(len_to_sint(b.len())));
             }
@@ -941,6 +956,12 @@ impl Registry {
         });
 
         let response_body_len_fetch: FetchFn = |ctx, _args| {
+            if let Some(h) = ctx.htx_slice {
+                let bl = h.body_len();
+                if bl > 0 {
+                    return Some(Sample::Sint(len_to_sint(bl)));
+                }
+            }
             if let Some(b) = ctx.res_body {
                 return Some(Sample::Sint(len_to_sint(b.len())));
             }
@@ -961,18 +982,35 @@ impl Registry {
         });
 
         let request_payload_fetch: FetchFn = |ctx, args| {
-            let body = ctx.req_body?;
             let offset = args.first().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
-            if offset >= body.len() {
-                return None;
-            }
             let len = args.get(1).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
-            let slice = if len == 0 || offset.saturating_add(len) > body.len() {
-                &body[offset..]
-            } else {
-                &body[offset..offset + len]
-            };
-            Some(Sample::Bin(slice.to_vec()))
+
+            if let Some(body) = ctx.req_body {
+                if offset >= body.len() {
+                    return None;
+                }
+                let slice = if len == 0 || offset.saturating_add(len) > body.len() {
+                    &body[offset..]
+                } else {
+                    &body[offset..offset + len]
+                };
+                return Some(Sample::Bin(slice.to_vec()));
+            }
+
+            if let Some(h) = ctx.htx_slice {
+                let body = h.body_bytes();
+                if offset >= body.len() {
+                    return None;
+                }
+                let slice = if len == 0 || offset.saturating_add(len) > body.len() {
+                    &body[offset..]
+                } else {
+                    &body[offset..offset + len]
+                };
+                return Some(Sample::Bin(slice.to_vec()));
+            }
+
+            None
         };
         self.register_fetch(FetchDesc {
             name: "req.payload",
@@ -1032,11 +1070,8 @@ impl Registry {
             name: "capture.req.method",
             out_type: SampleType::Str,
             func: |ctx, _args| {
-                let m = ctx
-                    .req_method
-                    .map(ToString::to_string)
-                    .or_else(|| ctx.htx.and_then(|h| h.req_line().map(|r| r.method.as_str().to_string())))?;
-                Some(Sample::Str(m))
+                let m = get_context_method(ctx)?;
+                Some(Sample::Str(m.to_string()))
             },
         });
 
@@ -1044,9 +1079,7 @@ impl Registry {
             name: "capture.req.uri",
             out_type: SampleType::Str,
             func: |ctx, _args| {
-                let uri = ctx
-                    .req_uri
-                    .or_else(|| ctx.htx.and_then(|h| h.req_line().map(|r| r.uri.as_str())))?;
+                let uri = get_context_uri(ctx)?;
                 Some(Sample::Str(uri.to_string()))
             },
         });
@@ -3142,6 +3175,156 @@ impl Registry {
                 Some(smp)
             },
         });
+
+        self.register_converter(ConvDesc {
+            name: "ip.ver",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Sint),
+            func: |smp, _args| match smp {
+                Sample::Bin(b) => {
+                    let first = b.first()?;
+                    Some(Sample::Sint(i64::from(first >> 4)))
+                }
+                _ => None,
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "ip.ttl",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Sint),
+            func: |smp, _args| match smp {
+                Sample::Bin(b) => {
+                    let ver = b.first()? >> 4;
+                    match ver {
+                        4 => {
+                            if b.len() < 20 {
+                                return None;
+                            }
+                            Some(Sample::Sint(i64::from(*b.get(8)?)))
+                        }
+                        6 => {
+                            if b.len() < 40 {
+                                return None;
+                            }
+                            Some(Sample::Sint(i64::from(*b.get(7)?)))
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "ip.proto",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Sint),
+            func: |smp, _args| match smp {
+                Sample::Bin(b) => {
+                    let ver = b.first()? >> 4;
+                    match ver {
+                        4 => {
+                            if b.len() < 10 {
+                                return None;
+                            }
+                            Some(Sample::Sint(i64::from(*b.get(9)?)))
+                        }
+                        6 => {
+                            if b.len() < 40 {
+                                return None;
+                            }
+                            let mut next = *b.get(6)?;
+                            let mut len = 40usize;
+                            while next != 6 && next != 17 {
+                                if b.len() < len + 2 {
+                                    return None;
+                                }
+                                let ext_len = usize::from(*b.get(len + 1)?) * 8 + 8;
+                                next = *b.get(len)?;
+                                len += ext_len;
+                            }
+                            if b.len() < len {
+                                return None;
+                            }
+                            Some(Sample::Sint(i64::from(next)))
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "ip.tos",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Sint),
+            func: |smp, _args| match smp {
+                Sample::Bin(b) => {
+                    if b.len() < 2 {
+                        return None;
+                    }
+                    let ver = b[0] >> 4;
+                    match ver {
+                        4 => Some(Sample::Sint(i64::from(b[1]))),
+                        6 => {
+                            let tc = ((b[0] & 0x0f) << 4) | (b[1] >> 4);
+                            Some(Sample::Sint(i64::from(tc)))
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "ip.df",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Sint),
+            func: |smp, _args| match smp {
+                Sample::Bin(b) => {
+                    let ver = b.first()? >> 4;
+                    match ver {
+                        4 => {
+                            if b.len() < 6 {
+                                return None;
+                            }
+                            let df = i64::from((b[6] & 0x40) != 0);
+                            Some(Sample::Sint(df))
+                        }
+                        6 => Some(Sample::Sint(1)),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "secure_memcmp",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Bool),
+            func: |smp, args| match smp {
+                Sample::Bin(b) => {
+                    let arg = args.first()?;
+                    let target_bytes = CURRENT_VARS.with(|v| v.borrow().get(arg).cloned())
+                        .or_else(|| get_proc_var(arg))
+                        .map_or_else(|| arg.as_bytes().to_vec(), String::into_bytes);
+
+                    if b.len() != target_bytes.len() {
+                        return Some(Sample::Bool(false));
+                    }
+                    let mut diff = 0u8;
+                    for (x, y) in b.iter().zip(target_bytes.iter()) {
+                        diff |= x ^ y;
+                    }
+                    Some(Sample::Bool(diff == 0))
+                }
+                _ => None,
+            },
+        });
     }
 
     /// Applies a chain of converters to a sample value.
@@ -3214,10 +3397,36 @@ impl Registry {
     }
 }
 
+fn get_context_uri<'a>(ctx: &'a SampleContext) -> Option<&'a str> {
+    ctx.htx_slice
+        .and_then(|h| h.req_line().map(|r| r.uri))
+        .or(ctx.req_uri)
+        .or_else(|| ctx.htx.and_then(|h| h.req_line().map(|r| r.uri.as_str())))
+}
+
+fn get_context_method<'a>(ctx: &'a SampleContext) -> Option<&'a str> {
+    ctx.htx_slice
+        .and_then(|h| h.req_line().map(|r| r.method))
+        .or(ctx.req_method)
+        .or_else(|| ctx.htx.and_then(|h| h.req_line().map(|r| r.method.as_str())))
+}
+
+fn get_context_req_version<'a>(ctx: &'a SampleContext) -> Option<&'a str> {
+    ctx.htx_slice
+        .and_then(|h| h.req_line().map(|r| r.version))
+        .or(ctx.req_version)
+        .or_else(|| ctx.htx.and_then(|h| h.req_line().map(|r| r.version.as_str())))
+}
+
+fn get_context_res_version<'a>(ctx: &'a SampleContext) -> Option<&'a str> {
+    ctx.htx_slice
+        .and_then(|h| h.res_line().map(|r| r.version))
+        .or(ctx.res_version)
+        .or_else(|| ctx.htx.and_then(|h| h.res_line().map(|r| r.version.as_str())))
+}
+
 fn fetch_base(ctx: &SampleContext, _args: &[String]) -> Option<Sample> {
-    let uri = ctx
-        .req_uri
-        .or_else(|| ctx.htx.and_then(|h| h.req_line().map(|r| r.uri.as_str())))?;
+    let uri = get_context_uri(ctx)?;
     let (prefix, path, _) = split_uri(uri);
     // One arm borrows from `uri`, the other returns an owned String from the header
     // lookup, so both are normalised to String rather than fighting the lifetimes.
@@ -3593,6 +3802,11 @@ pub fn sample_to_string(smp: &Sample) -> String {
 }
 
 fn get_req_header(ctx: &SampleContext, name: &str) -> Option<String> {
+    if let Some(htx) = ctx.htx_slice {
+        if let Some(v) = htx.get_header(name) {
+            return Some(v.to_string());
+        }
+    }
     if let Some(htx) = ctx.htx {
         if let Some(v) = htx.get_header(name) {
             return Some(v.to_string());
@@ -3610,6 +3824,16 @@ fn get_req_header(ctx: &SampleContext, name: &str) -> Option<String> {
 
 fn get_all_req_headers(ctx: &SampleContext, name: &str) -> Vec<String> {
     let mut matches = Vec::new();
+    if let Some(htx) = ctx.htx_slice {
+        for (hn, hv) in htx.headers() {
+            if hn.eq_ignore_ascii_case(name) {
+                matches.push(hv.to_string());
+            }
+        }
+        if !matches.is_empty() {
+            return matches;
+        }
+    }
     if let Some(htx) = ctx.htx {
         for hf in htx.headers() {
             if hf.name.eq_ignore_ascii_case(name) {
@@ -3628,6 +3852,11 @@ fn get_all_req_headers(ctx: &SampleContext, name: &str) -> Vec<String> {
 }
 
 fn get_res_header(ctx: &SampleContext, name: &str) -> Option<String> {
+    if let Some(htx) = ctx.htx_slice {
+        if let Some(v) = htx.get_header(name) {
+            return Some(v.to_string());
+        }
+    }
     if let Some(headers) = ctx.res_headers {
         for (k, v) in headers {
             if k.eq_ignore_ascii_case(name) {
@@ -3654,6 +3883,16 @@ fn get_res_header(ctx: &SampleContext, name: &str) -> Option<String> {
 
 fn get_all_res_headers(ctx: &SampleContext, name: &str) -> Vec<String> {
     let mut matches = Vec::new();
+    if let Some(htx) = ctx.htx_slice {
+        for (hn, hv) in htx.headers() {
+            if hn.eq_ignore_ascii_case(name) {
+                matches.push(hv.to_string());
+            }
+        }
+        if !matches.is_empty() {
+            return matches;
+        }
+    }
     if let Some(headers) = ctx.res_headers {
         for (k, v) in headers {
             if k.eq_ignore_ascii_case(name) {
@@ -3668,13 +3907,15 @@ fn get_all_res_headers(ctx: &SampleContext, name: &str) -> Vec<String> {
             }
         }
     }
-    CURRENT_RES_HEADERS.with(|hdrs| {
-        for (k, v) in hdrs.borrow().iter() {
-            if k.eq_ignore_ascii_case(name) {
-                matches.push(v.clone());
+    if matches.is_empty() {
+        CURRENT_RES_HEADERS.with(|hdrs| {
+            for (k, v) in hdrs.borrow().iter() {
+                if k.eq_ignore_ascii_case(name) {
+                    matches.push(v.clone());
+                }
             }
-        }
-    });
+        });
+    }
     matches
 }
 
@@ -4118,6 +4359,129 @@ mod tests {
         let reg = Registry::new();
         assert!(reg.fetch_count() >= 50);
         assert!(reg.converter_count() >= 50);
+    }
+
+    #[test]
+    fn ip_ver_reads_the_high_nibble_of_the_first_byte() {
+        let reg = Registry::new();
+        let conv = reg.get_converter("ip.ver").expect("ip.ver is registered");
+
+        // IPv4: starts with 0x45 (version 4)
+        let v4 = Sample::Bin(vec![0x45, 0x00, 0x00, 0x3c]);
+        assert_eq!((conv.func)(v4, &[]), Some(Sample::Sint(4)));
+
+        // IPv6: starts with 0x60 (version 6)
+        let v6 = Sample::Bin(vec![0x60, 0x00, 0x00, 0x00]);
+        assert_eq!((conv.func)(v6, &[]), Some(Sample::Sint(6)));
+
+        // Empty input fails
+        assert_eq!((conv.func)(Sample::Bin(vec![]), &[]), None);
+    }
+
+    #[test]
+    fn ip_ttl_reads_ttl_from_ipv4_and_ipv6_headers() {
+        let reg = Registry::new();
+        let conv = reg.get_converter("ip.ttl").expect("ip.ttl is registered");
+
+        // IPv4 header (20 bytes), byte 8 is TTL (e.g. 64)
+        let mut v4 = vec![0u8; 20];
+        v4[0] = 0x45;
+        v4[8] = 64;
+        assert_eq!((conv.func)(Sample::Bin(v4), &[]), Some(Sample::Sint(64)));
+
+        // Truncated IPv4 header (<20 bytes) fails
+        let v4_trunc = vec![0x45, 0, 0, 0, 0];
+        assert_eq!((conv.func)(Sample::Bin(v4_trunc), &[]), None);
+
+        // IPv6 header (40 bytes), byte 7 is Hop Limit (e.g. 128)
+        let mut v6 = vec![0u8; 40];
+        v6[0] = 0x60;
+        v6[7] = 128;
+        assert_eq!((conv.func)(Sample::Bin(v6), &[]), Some(Sample::Sint(128)));
+    }
+
+    #[test]
+    fn ip_proto_reads_protocol_number_from_headers() {
+        let reg = Registry::new();
+        let conv = reg.get_converter("ip.proto").expect("ip.proto is registered");
+
+        // IPv4 header (20 bytes), byte 9 is proto: TCP = 6
+        let mut v4 = vec![0u8; 20];
+        v4[0] = 0x45;
+        v4[9] = 6;
+        assert_eq!((conv.func)(Sample::Bin(v4), &[]), Some(Sample::Sint(6)));
+
+        // IPv6 header (40 bytes), byte 6 is Next Header: UDP = 17
+        let mut v6 = vec![0u8; 40];
+        v6[0] = 0x60;
+        v6[6] = 17;
+        assert_eq!((conv.func)(Sample::Bin(v6), &[]), Some(Sample::Sint(17)));
+    }
+
+    #[test]
+    fn ip_tos_reads_tos_or_traffic_class() {
+        let reg = Registry::new();
+        let conv = reg.get_converter("ip.tos").expect("ip.tos is registered");
+
+        // IPv4 header: byte 1 is TOS
+        let mut v4 = vec![0u8; 20];
+        v4[0] = 0x45;
+        v4[1] = 0x10;
+        assert_eq!((conv.func)(Sample::Bin(v4), &[]), Some(Sample::Sint(0x10)));
+
+        // IPv6 header: traffic class in first 2 bytes
+        // 0x60 0xa0 -> version 6, traffic class 0x0a
+        let v6 = vec![0x60, 0xa0, 0x00, 0x00];
+        assert_eq!((conv.func)(Sample::Bin(v6), &[]), Some(Sample::Sint(0x0a)));
+    }
+
+    #[test]
+    fn ip_df_reads_dont_fragment_flag() {
+        let reg = Registry::new();
+        let conv = reg.get_converter("ip.df").expect("ip.df is registered");
+
+        // IPv4 with DF set: byte 6 has 0x40
+        let mut v4_df = vec![0u8; 20];
+        v4_df[0] = 0x45;
+        v4_df[6] = 0x40;
+        assert_eq!((conv.func)(Sample::Bin(v4_df), &[]), Some(Sample::Sint(1)));
+
+        // IPv4 without DF
+        let mut v4_nodf = vec![0u8; 20];
+        v4_nodf[0] = 0x45;
+        assert_eq!((conv.func)(Sample::Bin(v4_nodf), &[]), Some(Sample::Sint(0)));
+
+        // IPv6 always returns 1
+        let mut v6 = vec![0u8; 40];
+        v6[0] = 0x60;
+        assert_eq!((conv.func)(Sample::Bin(v6), &[]), Some(Sample::Sint(1)));
+    }
+
+    #[test]
+    fn secure_memcmp_performs_constant_time_comparison() {
+        let reg = Registry::new();
+        let conv = reg.get_converter("secure_memcmp").expect("secure_memcmp is registered");
+
+        let secret = b"my_secret_token";
+        let target = Sample::Bin(secret.to_vec());
+
+        // Equal match
+        assert_eq!(
+            (conv.func)(target.clone(), &["my_secret_token".to_string()]),
+            Some(Sample::Bool(true))
+        );
+
+        // Same length, differing byte
+        assert_eq!(
+            (conv.func)(target.clone(), &["my_secret_tokeX".to_string()]),
+            Some(Sample::Bool(false))
+        );
+
+        // Different length
+        assert_eq!(
+            (conv.func)(target, &["short".to_string()]),
+            Some(Sample::Bool(false))
+        );
     }
 
     #[test]

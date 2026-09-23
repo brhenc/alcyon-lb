@@ -25,6 +25,9 @@ use ibex_proto::parser::ParserKind;
 use ibex_config::{HttpAfterResAction, HttpResAction, Mode};
 use ibex_proto::endpoint::ScState;
 use ibex_proto::htx::{HttpVersion, Htx, HtxBlock, ResponseLine};
+use ibex_proto::h2::H2_CONN_PREFACE;
+use ibex_proto::mux::Mux;
+use ibex_proto::mux_h2::{H2MuxContext, MuxH2};
 use ibex_proto::{extract_cookie, rewrite_header_block, CompiledExp};
 use ibex_sample::{Expr, Registry, SampleContext};
 use ibex_sched::Tick;
@@ -100,6 +103,11 @@ pub struct TcpSession {
     pub req_uri: Option<String>,
     pub req_method: Option<String>,
     pub req_headers: Option<Vec<(String, String)>>,
+    pub htx_buf: Buf,
+    pub htx_tail: usize,
+    pub htx_blocks: usize,
+    pub has_htx: bool,
+    pub htx_modified: bool,
     pub cli_state: ScState,
     pub srv_state: ScState,
     /// Client to server.
@@ -130,6 +138,7 @@ pub struct TcpSession {
     pub server_addr: Option<SocketAddr>,
     pub send_proxy_prepended: bool,
     pub resp_headers_processed: bool,
+    pub srv_connection_close: bool,
     pub created_at: Instant,
     pub http_res_rules: Vec<ibex_config::HttpResRule>,
     pub http_after_res_rules: Vec<ibex_config::HttpAfterResRule>,
@@ -145,6 +154,8 @@ pub struct TcpSession {
     pub bufsize: usize,
     pub maxrewrite: usize,
     pub connection_close: bool,
+    pub h2_ctx: Option<H2MuxContext>,
+    pub h2_active_stream_id: Option<u32>,
 }
 
 impl TcpSession {
@@ -193,6 +204,11 @@ impl TcpSession {
             req_uri: None,
             req_method: None,
             req_headers: None,
+            htx_buf: Buf::standard(),
+            htx_tail: 0,
+            htx_blocks: 0,
+            has_htx: false,
+            htx_modified: false,
             cli_state,
             srv_state: ScState::Init,
             req: Buf::standard(),
@@ -213,6 +229,7 @@ impl TcpSession {
             server_addr: None,
             send_proxy_prepended: false,
             resp_headers_processed: false,
+            srv_connection_close: false,
             created_at: Instant::now(),
             bufsize: crate::buf::get_bufsize(),
             maxrewrite: 1024,
@@ -228,9 +245,58 @@ impl TcpSession {
             req_vars: HashMap::new(),
             tracked_sc: [None, None, None],
             connection_close: false,
+            h2_ctx: None,
+            h2_active_stream_id: None,
         };
         s.arm_client(now);
         s
+    }
+
+    #[must_use]
+    pub fn htx_slice(&self) -> Option<ibex_proto::htx::HtxSliceRef<'_>> {
+        if self.has_htx {
+            Some(ibex_proto::htx::HtxSliceRef::new(
+                self.htx_buf.raw_slice(),
+                self.htx_blocks,
+            ))
+        } else {
+            None
+        }
+    }
+
+    pub fn with_htx_mut<F, R>(&mut self, f: F) -> Option<R>
+    where
+        F: FnOnce(&mut ibex_proto::htx::HtxSlice<'_>) -> R,
+    {
+        if !self.has_htx {
+            return None;
+        }
+        let tail = self.htx_tail;
+        let blocks = self.htx_blocks;
+        let mut slice = ibex_proto::htx::HtxSlice::with_offsets(
+            self.htx_buf.raw_slice_mut(),
+            tail,
+            blocks,
+        );
+        let res = f(&mut slice);
+        self.htx_tail = slice.tail_addr();
+        self.htx_blocks = slice.num_blocks();
+        self.htx_modified = true;
+        Some(res)
+    }
+
+    pub fn clear_htx(&mut self) {
+        self.has_htx = false;
+        self.htx_tail = 0;
+        self.htx_blocks = 0;
+        self.htx_modified = false;
+    }
+
+    #[must_use]
+    pub fn has_pending_output(&self) -> bool {
+        !self.rep.is_empty()
+            || self.pending_resp.as_ref().is_some_and(|(d, o)| *o < d.len())
+            || self.h2_ctx.as_ref().is_some_and(|h| h.tx_consumed < h.tx_buf.len())
     }
 
     pub fn enable_accept_proxy(&mut self, require_v2: bool) {
@@ -389,8 +455,9 @@ impl TcpSession {
         let parser = ibex_proto::parser::build(self.parser_kind)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         let mut stream = parser.stream(false);
-        let mut htx = Htx::new();
-        stream.parse(&self.req.readable()[..head_len], &mut htx)?;
+        let raw = self.htx_buf.raw_slice_mut();
+        let mut slice = ibex_proto::htx::HtxSlice::new(raw);
+        stream.parse(&self.req.readable()[..head_len], &mut slice)?;
         if stream.connection_close() {
             self.connection_close = true;
         }
@@ -404,6 +471,10 @@ impl TcpSession {
                 "conflicting Content-Length and Transfer-Encoding",
             ));
         }
+        self.htx_tail = slice.tail_addr();
+        self.htx_blocks = slice.num_blocks();
+        self.has_htx = true;
+        self.htx_modified = false;
         Ok(())
     }
 
@@ -426,31 +497,78 @@ impl TcpSession {
     fn process_cli_io(&mut self) -> io::Result<bool> {
         let mut changed = false;
 
-        // Read from the client into the request buffer while reading is permitted
-        // and buffer space exists. Backpressure stops reads when full.
-        if self.cli_state.can_read() && !self.req.is_full() {
-            let dst = self.req.writable();
-            match self.cli_xprt.recv(self.cli.as_fd(), dst)? {
-                Io::Eof => {
-                    raw::shutdown_read(self.cli.as_fd());
-                    self.cli_state = match self.cli_state {
-                        ScState::Ready | ScState::Established => ScState::ShutR,
-                        ScState::ShutW => ScState::Closed,
-                        other => other,
-                    };
-                    changed = true;
+        // Read from the client.
+        // For H2 connections (negotiated via ALPN or active H2 context), decrypted bytes
+        // are fed directly into the H2 mux so they do not contaminate `self.req` (which
+        // holds the HTTP/1 wire request forwarded to the backend server).
+        let is_h2 = self.h2_ctx.is_some() || self.cli_xprt.alpn() == Some(b"h2");
+        if is_h2 {
+            if self.h2_ctx.is_none() {
+                self.h2_ctx = Some(H2MuxContext::new(ibex_proto::conn::ConnId(0), true));
+            }
+            if self.cli_state.can_read() {
+                let mut raw_buf = [0u8; 16384];
+                match self.cli_xprt.recv(self.cli.as_fd(), &mut raw_buf)? {
+                    Io::Eof => {
+                        raw::shutdown_read(self.cli.as_fd());
+                        self.cli_state = match self.cli_state {
+                            ScState::Ready | ScState::Established => ScState::ShutR,
+                            ScState::ShutW => ScState::Closed,
+                            other => other,
+                        };
+                        changed = true;
+                    }
+                    Io::Closed => {
+                        self.cli_state = ScState::Closed;
+                        self.ending.get_or_insert(Ending::ClientAbort);
+                        changed = true;
+                    }
+                    Io::Done(n) if n > 0 => {
+                        let h2 = self.h2_ctx.as_mut().unwrap();
+                        let _ = MuxH2.parse(h2, &raw_buf[..n])?;
+                        self.bytes_in += n as u64;
+                        changed = true;
+                    }
+                    Io::Done(_) | Io::WouldBlock => {}
                 }
-                Io::Closed => {
-                    self.cli_state = ScState::Closed;
-                    self.ending.get_or_insert(Ending::ClientAbort);
-                    changed = true;
+            }
+        } else {
+            // Read from the client into the request buffer while reading is permitted
+            // and buffer space exists. Backpressure stops reads when full.
+            if self.cli_state.can_read() && !self.req.is_full() {
+                let dst = self.req.writable();
+                match self.cli_xprt.recv(self.cli.as_fd(), dst)? {
+                    Io::Eof => {
+                        raw::shutdown_read(self.cli.as_fd());
+                        self.cli_state = match self.cli_state {
+                            ScState::Ready | ScState::Established => ScState::ShutR,
+                            ScState::ShutW => ScState::Closed,
+                            other => other,
+                        };
+                        changed = true;
+                    }
+                    Io::Closed => {
+                        self.cli_state = ScState::Closed;
+                        self.ending.get_or_insert(Ending::ClientAbort);
+                        changed = true;
+                    }
+                    Io::Done(n) if n > 0 => {
+                        self.req.commit(n);
+                        self.bytes_in += n as u64;
+                        changed = true;
+                    }
+                    Io::Done(_) | Io::WouldBlock => {}
                 }
-                Io::Done(n) if n > 0 => {
-                    self.req.commit(n);
-                    self.bytes_in += n as u64;
-                    changed = true;
-                }
-                Io::Done(_) | Io::WouldBlock => {}
+            }
+
+            // Check for cleartext H2 preface in self.req
+            if self.req.readable().starts_with(H2_CONN_PREFACE) {
+                let mut h2 = H2MuxContext::new(ibex_proto::conn::ConnId(0), true);
+                let to_parse = self.req.readable().to_vec();
+                let _ = MuxH2.parse(&mut h2, &to_parse)?;
+                self.req.clear();
+                self.h2_ctx = Some(h2);
+                changed = true;
             }
         }
 
@@ -496,8 +614,73 @@ impl TcpSession {
             }
         }
 
+        if let Some(ref mut h2) = self.h2_ctx {
+            // Check if any stream has arrived with a complete request
+            if self.cli_state == ScState::Ready || self.cli_state == ScState::Established {
+                if let Some(&stream_id) = h2.streams.keys().find(|&&id| {
+                    if let Some(st) = h2.streams.get(&id) {
+                        st.rx_htx.blocks().iter().any(|b| matches!(b, HtxBlock::Eoh))
+                    } else {
+                        false
+                    }
+                }) {
+                    if (self.h2_active_stream_id.is_none() || self.h2_active_stream_id == Some(stream_id))
+                        && self.req_headers.is_none()
+                        && !self.has_htx
+                        && self.req.is_empty()
+                    {
+                        self.h2_active_stream_id = Some(stream_id);
+                        if let Some(stream) = h2.streams.get(&stream_id) {
+                            let wire_req = stream.rx_htx.to_h1_wire();
+                            if let Ok(parser) = ibex_proto::parser::build(ibex_proto::parser::ParserKind::H1) {
+                                let mut p_stream = parser.stream(false);
+                                let raw = self.htx_buf.raw_slice_mut();
+                                let mut slice = ibex_proto::htx::HtxSlice::new(raw);
+                                if p_stream.parse(&wire_req, &mut slice).is_ok() {
+                                    self.htx_tail = slice.tail_addr();
+                                    self.htx_blocks = slice.num_blocks();
+                                    self.has_htx = true;
+                                    self.htx_modified = false;
+                                }
+                            }
+                            self.req_method = stream.rx_htx.req_line().map(|r| r.method.as_str().to_string());
+                            self.req_uri = stream.rx_htx.req_line().map(|r| r.uri.clone());
+                            self.req_headers = Some(
+                                stream.rx_htx.headers().map(|h| (h.name.clone(), h.value.clone())).collect(),
+                            );
+                            self.req.clear();
+                            let w = self.req.writable();
+                            let n = wire_req.len().min(w.len());
+                            w[..n].copy_from_slice(&wire_req[..n]);
+                            self.req.commit(n);
+                            self.cli_state = ScState::Established;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+
+            // Flush pending frames to client socket
+            let pending = h2.tx_buf.len() - h2.tx_consumed;
+            if pending > 0 {
+                match self.cli_xprt.send(self.cli.as_fd(), &h2.tx_buf[h2.tx_consumed..])? {
+                    Io::Done(n) if n > 0 => {
+                        MuxH2.consume_output(h2, n);
+                        self.bytes_out += n as u64;
+                        changed = true;
+                    }
+                    Io::Closed => {
+                        self.cli_state = ScState::Closed;
+                        self.ending.get_or_insert(Ending::ClientAbort);
+                        changed = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         // Parse HTTP request headers if in Ready state
-        if self.cli_state == ScState::Ready {
+        if self.h2_ctx.is_none() && self.cli_state == ScState::Ready {
             let threshold = self.bufsize.saturating_sub(self.maxrewrite);
             if let Some((hdr_len, eoh_len)) = find_eoh(self.req.readable()) {
                 let total_hdr_len = hdr_len + eoh_len;
@@ -533,57 +716,107 @@ impl TcpSession {
                     return Ok(true);
                 }
 
-                let hdr_bytes = &self.req.readable()[..total_hdr_len];
-                let hdr_str = String::from_utf8_lossy(hdr_bytes);
-
-                let (first_line, rest_headers) =
-                    if let Some((fl, rest)) = hdr_str.split_once("\r\n") {
-                        (fl, rest)
-                    } else if let Some((fl, rest)) = hdr_str.split_once('\n') {
-                        (fl, rest)
-                    } else if let Some((fl, rest)) = hdr_str.split_once('\r') {
-                        (fl, rest)
-                    } else {
-                        (hdr_str.as_ref(), "")
-                    };
-
-                let mut parts = first_line.split_whitespace();
-                if let Some(m) = parts.next() {
-                    self.req_method = Some(m.to_string());
-                }
-                if let Some(u) = parts.next() {
-                    self.req_uri = Some(u.to_string());
-                }
-                let mut hdrs: Vec<(String, String)> = Vec::new();
-                for line in rest_headers.lines() {
-                    let trimmed = line.trim_end_matches(['\r', '\n']);
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-                    if trimmed.starts_with(' ') || trimmed.starts_with('\t') {
-                        if let Some(last) = hdrs.last_mut() {
-                            last.1.push(' ');
-                            last.1.push_str(trimmed.trim());
+                if self.has_htx {
+                    let (req_m, req_u, conn_close, wire_replacement) = {
+                        let htx = ibex_proto::htx::HtxSliceRef::new(
+                            self.htx_buf.raw_slice(),
+                            self.htx_blocks,
+                        );
+                        let mut req_m = None;
+                        let mut req_u = None;
+                        let mut conn_close = false;
+                        if let Some(req) = htx.req_line() {
+                            req_m = Some(req.method.to_string());
+                            req_u = Some(req.uri.to_string());
+                            if req.version == "HTTP/1.0"
+                                && !htx.headers().any(|(k, v)| k.eq_ignore_ascii_case("connection") && v.eq_ignore_ascii_case("keep-alive"))
+                            {
+                                conn_close = true;
+                            }
                         }
-                    } else if let Some((k, v)) = trimmed.split_once(':') {
-                        hdrs.push((k.trim().to_string(), v.trim().to_string()));
+                        if htx.headers().any(|(k, v)| k.eq_ignore_ascii_case("connection") && v.eq_ignore_ascii_case("close")) {
+                            conn_close = true;
+                        }
+                        let wire_replacement = if self.htx_modified {
+                            let mut wire_buf = [0u8; 8192];
+                            if let Ok(n) = htx.write_h1_wire(&mut wire_buf) {
+                                Some((wire_buf, n))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        (req_m, req_u, conn_close, wire_replacement)
+                    };
+                    if let Some(m) = req_m {
+                        self.req_method = Some(m);
                     }
-                }
-                if hdrs.iter().any(|(k, v)| k.eq_ignore_ascii_case("connection") && v.eq_ignore_ascii_case("close")) {
-                    self.connection_close = true;
-                }
-                if first_line.contains("HTTP/1.0") && !hdrs.iter().any(|(k, v)| k.eq_ignore_ascii_case("connection") && v.eq_ignore_ascii_case("keep-alive")) {
-                    self.connection_close = true;
-                }
-                self.req_headers = Some(hdrs);
+                    if let Some(u) = req_u {
+                        self.req_uri = Some(u);
+                    }
+                    if conn_close {
+                        self.connection_close = true;
+                    }
+                    // Only regenerate wire buffer if HTX was actually modified
+                    if let Some((wire_buf, n)) = wire_replacement {
+                        self.req.replace_prefix(total_hdr_len, &wire_buf[..n]);
+                    }
+                } else {
+                    let hdr_bytes = &self.req.readable()[..total_hdr_len];
+                    let hdr_str = String::from_utf8_lossy(hdr_bytes).to_string();
+                    let (first_line, rest_headers) =
+                        if let Some((fl, rest)) = hdr_str.split_once("\r\n") {
+                            (fl, rest)
+                        } else if let Some((fl, rest)) = hdr_str.split_once('\n') {
+                            (fl, rest)
+                        } else if let Some((fl, rest)) = hdr_str.split_once('\r') {
+                            (fl, rest)
+                        } else {
+                            (hdr_str.as_ref(), "")
+                        };
 
-                if let Some(ref cname) = self.cookie_name {
-                    self.cookie_val = extract_cookie(&hdr_str, cname);
+                    let mut parts = first_line.split_whitespace();
+                    if let Some(m) = parts.next() {
+                        self.req_method = Some(m.to_string());
+                    }
+                    if let Some(u) = parts.next() {
+                        self.req_uri = Some(u.to_string());
+                    }
+                    let mut hdrs: Vec<(String, String)> = Vec::new();
+                    for line in rest_headers.lines() {
+                        let trimmed = line.trim_end_matches(['\r', '\n']);
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        if trimmed.starts_with(' ') || trimmed.starts_with('\t') {
+                            if let Some(last) = hdrs.last_mut() {
+                                last.1.push(' ');
+                                last.1.push_str(trimmed.trim());
+                            }
+                        } else if let Some((k, v)) = trimmed.split_once(':') {
+                            hdrs.push((k.trim().to_string(), v.trim().to_string()));
+                        }
+                    }
+                    if hdrs.iter().any(|(k, v)| k.eq_ignore_ascii_case("connection") && v.eq_ignore_ascii_case("close")) {
+                        self.connection_close = true;
+                    }
+                    if first_line.contains("HTTP/1.0") && !hdrs.iter().any(|(k, v)| k.eq_ignore_ascii_case("connection") && v.eq_ignore_ascii_case("keep-alive")) {
+                        self.connection_close = true;
+                    }
+                    self.req_headers = Some(hdrs);
                 }
 
-                if !self.cliexp.is_empty() {
-                    let rewritten = rewrite_header_block(&hdr_str, &self.cliexp);
-                    self.req.replace_prefix(total_hdr_len, rewritten.as_bytes());
+                if self.cookie_name.is_some() || !self.cliexp.is_empty() {
+                    let hdr_bytes = &self.req.readable()[..total_hdr_len];
+                    let hdr_str = String::from_utf8_lossy(hdr_bytes);
+                    if let Some(ref cname) = self.cookie_name {
+                        self.cookie_val = extract_cookie(&hdr_str, cname);
+                    }
+                    if !self.cliexp.is_empty() {
+                        let rewritten = rewrite_header_block(&hdr_str, &self.cliexp);
+                        self.req.replace_prefix(total_hdr_len, rewritten.as_bytes());
+                    }
                 }
 
                 self.cli_state = ScState::Established;
@@ -615,7 +848,7 @@ impl TcpSession {
         }
 
         // Write any response data back to the client while writing is permitted.
-        if self.cli_state.can_write() && !self.rep.is_empty() {
+        if self.h2_ctx.is_none() && self.cli_state.can_write() && !self.rep.is_empty() {
             match self.cli_xprt.send(self.cli.as_fd(), self.rep.readable())? {
                 Io::Done(n) if n > 0 => {
                     self.rep.consume(n);
@@ -635,6 +868,10 @@ impl TcpSession {
     }
 
     fn process_cli_transitions(&mut self) -> bool {
+        if self.h2_ctx.is_some() {
+            return false;
+        }
+
         let mut changed = false;
 
         match self.cli_state {
@@ -768,6 +1005,25 @@ impl TcpSession {
                     hdr_str = self.apply_response_rules(&hdr_str);
                 }
 
+                let is_http_10 = hdr_str.split_once("\r\n").is_some_and(|(fl, _)| fl.contains("HTTP/1.0"));
+                let has_close = hdr_str.lines().any(|l| {
+                    if let Some((k, v)) = l.split_once(':') {
+                        k.trim().eq_ignore_ascii_case("connection") && v.to_ascii_lowercase().contains("close")
+                    } else {
+                        false
+                    }
+                });
+                let has_keep_alive = hdr_str.lines().any(|l| {
+                    if let Some((k, v)) = l.split_once(':') {
+                        k.trim().eq_ignore_ascii_case("connection") && v.to_ascii_lowercase().contains("keep-alive")
+                    } else {
+                        false
+                    }
+                });
+                if has_close || (is_http_10 && !has_keep_alive) {
+                    self.srv_connection_close = true;
+                }
+
                 self.rep.replace_prefix(total_hdr_len, hdr_str.as_bytes());
                 self.srv_state = ScState::Established;
                 self.resp_headers_processed = true;
@@ -811,6 +1067,7 @@ impl TcpSession {
             client_addr: self.client_addr,
             server_addr: self.server_addr,
             htx: Some(&htx),
+            htx_slice: self.htx_slice(),
             req_uri: self.req_uri.as_deref(),
             req_method: self.req_method.as_deref(),
             req_headers: self.req_headers.as_deref(),
@@ -990,6 +1247,9 @@ impl TcpSession {
     }
 
     fn process_srv_transitions(&mut self) -> bool {
+        if self.mode == Mode::Http {
+            return false;
+        }
         let mut changed = false;
 
         match self.srv_state {
@@ -1129,18 +1389,14 @@ impl TcpSession {
     /// buffer fills, and TCP slows the sender.
     #[must_use]
     pub fn interests(&self) -> (Want, Want) {
-        let has_pending = self
-            .pending_resp
-            .as_ref()
-            .is_some_and(|(d, o)| *o < d.len());
+        let has_pending = self.has_pending_output();
         // `cli_xprt.wants_write()` is the TLS term. A handshake is mostly the server
         // talking, and the condition below it -- "we have a response queued" -- is false
         // throughout one, so without this the connection is never polled for writability
         // and the handshake never finishes. It is always false for a plaintext session.
         let cli = Want {
             read: self.cli_state.can_read() && !self.req.is_full(),
-            write: self.cli_state.can_write()
-                && (!self.rep.is_empty() || has_pending || self.cli_xprt.wants_write()),
+            write: self.cli_state.can_write() && (has_pending || self.cli_xprt.wants_write()),
         };
         let srv = match self.srv_state {
             ScState::Connecting => Want {

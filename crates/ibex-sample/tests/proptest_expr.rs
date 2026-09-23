@@ -84,6 +84,84 @@ proptest! {
         let expr = Expr::parse(&expr_str).unwrap();
         prop_assert!(expr.eval(&registry, &ctx));
     }
+
+    /// Differential test: sample fetches reading request data produce identical results
+    /// whether evaluating against HTX (HtxSliceRef) or against legacy SampleContext fields.
+    #[test]
+    fn prop_differential_htx_sample_fetches(
+        method in "(GET|POST|PUT|DELETE)",
+        path_seg in "[a-z]{1,8}",
+        query_param in "[a-z]{1,6}",
+        query_val in "[a-z0-9]{1,8}",
+        host_val in "[a-z]{1,8}\\.example\\.com",
+        body_content in "[a-z0-9]{0,32}"
+    ) {
+        let registry = Registry::new();
+        let uri = format!("/{path_seg}?{query_param}={query_val}");
+        let wire = format!(
+            "{method} {uri} HTTP/1.1\r\nHost: {host_val}\r\nContent-Length: {}\r\n\r\n{body_content}",
+            body_content.len()
+        );
+
+        let mut parser = ibex_proto::h1::H1Parser::new(false);
+        let mut buf = [0u8; 8192];
+        let mut htx = ibex_proto::htx::HtxSlice::new(&mut buf);
+        parser.parse(wire.as_bytes(), &mut htx).unwrap();
+
+        let ctx_htx = SampleContext {
+            htx_slice: Some(htx.as_ref()),
+            ..Default::default()
+        };
+
+        let headers = vec![
+            ("host".to_string(), host_val.clone()),
+            ("content-length".to_string(), body_content.len().to_string()),
+        ];
+        let ctx_current = SampleContext {
+            req_uri: Some(&uri),
+            req_method: Some(&method),
+            req_headers: Some(&headers),
+            req_version: Some("HTTP/1.1"),
+            req_body: if body_content.is_empty() { None } else { Some(body_content.as_bytes()) },
+            ..Default::default()
+        };
+
+        let expressions = [
+            "path",
+            "pathq",
+            "url",
+            "req.uri",
+            "query",
+            "method",
+            "req.ver",
+            "req.hdr(host)",
+            "req.hdr_cnt(host)",
+            "req.hdr_val(content-length)",
+            "req.len",
+            "base",
+            "baseq",
+        ];
+
+        for expr_str in expressions {
+            let expr = Expr::parse(expr_str).unwrap();
+            let smp_htx = expr.eval_sample(&registry, &ctx_htx);
+            let smp_curr = expr.eval_sample(&registry, &ctx_current);
+            prop_assert_eq!(
+                &smp_htx,
+                &smp_curr,
+                "Fetch '{}' diverged between HTX and legacy path",
+                expr_str
+            );
+        }
+
+        // Test parameterized url_param
+        let url_param_expr = Expr::parse(&format!("url_param({query_param})")).unwrap();
+        prop_assert_eq!(
+            url_param_expr.eval_sample(&registry, &ctx_htx),
+            url_param_expr.eval_sample(&registry, &ctx_current),
+            "url_param diverged"
+        );
+    }
 }
 
 /// Concurrent writes and reads to distinct `proc.*` variables across 8 worker threads.

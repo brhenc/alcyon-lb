@@ -14,7 +14,7 @@
 use crate::conn::ConnId;
 use crate::endpoint::SeDesc;
 use crate::h1::{H1Parser, H1Phase};
-use crate::htx::{Htx, HtxBlock, HtxBuffer};
+use crate::htx::HtxBuffer;
 use crate::mux::{mux_flags, Mux, MuxFlags, MuxOps, ShutMode};
 use std::io;
 
@@ -82,7 +82,6 @@ pub struct H1MuxContext {
     pub state: H1ConnState,
     pub stream_state: H1StreamState,
     pub parser: H1Parser,
-    pub rx_htx: Htx,
     pub rx_htx_buf: HtxBuffer,
     pub tx_buf: Vec<u8>,
     pub tx_consumed: usize,
@@ -111,7 +110,6 @@ impl H1MuxContext {
             state: H1ConnState::Idle,
             stream_state: H1StreamState::Idle,
             parser: H1Parser::new(is_server),
-            rx_htx: Htx::new(),
             rx_htx_buf: HtxBuffer::new(),
             tx_buf: Vec::with_capacity(4096),
             tx_consumed: 0,
@@ -138,7 +136,6 @@ impl H1MuxContext {
     /// Resets stream state for the next request/response on this keep-alive connection.
     pub fn reset_for_next_stream(&mut self) {
         self.parser.reset(self.is_server);
-        self.rx_htx = Htx::new();
         self.rx_htx_buf.clear();
         self.rx_wire_buf.clear();
         self.rx_wire_consumed = 0;
@@ -266,7 +263,6 @@ impl Mux for MuxH1 {
         // In tunnel mode, pass all raw bytes directly to the tunnel buffer
         if ctx.is_tunnel {
             ctx.tunnel_rx_buf.extend_from_slice(input);
-            ctx.rx_htx.push(HtxBlock::RawData(input.to_vec()));
             let _ = ctx.rx_htx_buf.push_raw_data(input);
             return Ok(input.len());
         }
@@ -284,7 +280,7 @@ impl Mux for MuxH1 {
             &ctx.raw_rx_buf[..]
         };
 
-        let consumed = match ctx.parser.parse(to_parse, &mut ctx.rx_htx) {
+        let consumed = match ctx.rx_htx_buf.with_slice_mut(|s| ctx.parser.parse(to_parse, s)) {
             Ok(c) => c,
             Err(e) => {
                 ctx.has_error = true;
@@ -301,14 +297,17 @@ impl Mux for MuxH1 {
             ctx.is_upgrade = true;
         }
 
+        // Track stream phase transitions
+        if matches!(
+            ctx.parser.phase,
+            H1Phase::BodyFixed { .. } | H1Phase::BodyChunked { .. } | H1Phase::Trailers
+        ) {
+            ctx.stream_state = H1StreamState::ReqBody;
+        }
+
         // Check if parsing finished
         if ctx.parser.phase == H1Phase::Done {
             ctx.stream_state = H1StreamState::ReqDone;
-            // Synchronize into preallocated zero-allocation HtxBuffer
-            let _ = ctx.rx_htx_buf.push_data(&ctx.rx_htx.body_bytes());
-            if ctx.rx_htx.is_eom() {
-                let _ = ctx.rx_htx_buf.push_eom();
-            }
 
             // If raw_rx_buf had bytes, drain consumed
             if !ctx.raw_rx_buf.is_empty() {
@@ -352,7 +351,7 @@ impl Mux for MuxH1 {
         }
 
         if ctx.rx_wire_buf.is_empty() {
-            ctx.rx_wire_buf = ctx.rx_htx.to_h1_wire();
+            ctx.rx_wire_buf = ctx.rx_htx_buf.to_h1_wire();
             ctx.rx_wire_consumed = 0;
         }
 
@@ -508,7 +507,6 @@ impl Mux for MuxH1 {
 mod tests {
     use super::*;
     use crate::endpoint::Endpoint;
-    use crate::htx::HttpMethod;
 
     #[test]
     fn h1_mux_parses_request_and_generates_output() {
@@ -553,7 +551,7 @@ mod tests {
         let req1 = b"GET /first HTTP/1.1\r\nHost: example.com\r\n\r\n";
         mux.parse(&mut ctx, req1).expect("parse req1");
         assert_eq!(ctx.streams_used, 1);
-        assert_eq!(ctx.rx_htx.req_line().unwrap().uri, "/first");
+        assert_eq!(ctx.rx_htx_buf.req_line().unwrap().uri, "/first");
 
         let mut out = [0u8; 256];
         mux.rcv_buf(&mut ctx, &mut sd, &mut out).expect("rcv1");
@@ -574,8 +572,8 @@ mod tests {
         let req2 = b"POST /second HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\n\r\nhello";
         mux.parse(&mut ctx, req2).expect("parse req2");
         assert_eq!(ctx.streams_used, 1);
-        assert_eq!(ctx.rx_htx.req_line().unwrap().method, HttpMethod::Post);
-        assert_eq!(ctx.rx_htx.body_bytes(), b"hello");
+        assert_eq!(ctx.rx_htx_buf.req_line().unwrap().method, "POST");
+        assert_eq!(ctx.rx_htx_buf.body_bytes(), b"hello");
 
         mux.rcv_buf(&mut ctx, &mut sd, &mut out).expect("rcv2");
         mux.snd_buf(
@@ -647,13 +645,13 @@ mod tests {
         let raw = b"POST /upload HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\nExpires: Wed, 21 Oct 2026 07:28:00 GMT\r\nChecksum: abcd1234\r\n\r\n";
         let consumed = mux.parse(&mut ctx, raw).expect("parse chunked");
         assert_eq!(consumed, raw.len());
-        assert!(ctx.rx_htx.is_eom());
-        assert_eq!(ctx.rx_htx.body_bytes(), b"hello world");
+        assert!(ctx.rx_htx_buf.is_eom());
+        assert_eq!(ctx.rx_htx_buf.body_bytes(), b"hello world");
         assert_eq!(
-            ctx.rx_htx.get_trailer("expires"),
+            ctx.rx_htx_buf.get_trailer("expires"),
             Some("Wed, 21 Oct 2026 07:28:00 GMT")
         );
-        assert_eq!(ctx.rx_htx.get_trailer("checksum"), Some("abcd1234"));
+        assert_eq!(ctx.rx_htx_buf.get_trailer("checksum"), Some("abcd1234"));
     }
 
     #[test]
@@ -761,7 +759,7 @@ mod tests {
         assert_eq!(consumed1, 36);
 
         // First transaction
-        assert_eq!(ctx.rx_htx.req_line().unwrap().uri, "/first");
+        assert_eq!(ctx.rx_htx_buf.req_line().unwrap().uri, "/first");
         let mut out = [0u8; 128];
         mux.rcv_buf(&mut ctx, &mut sd, &mut out).expect("rcv1");
         mux.snd_buf(
@@ -779,7 +777,7 @@ mod tests {
             .parse(&mut ctx, &pipelined[consumed1..])
             .expect("parse second");
         assert_eq!(consumed1 + consumed2, pipelined.len());
-        assert_eq!(ctx.rx_htx.req_line().unwrap().uri, "/second");
+        assert_eq!(ctx.rx_htx_buf.req_line().unwrap().uri, "/second");
     }
 
     #[test]

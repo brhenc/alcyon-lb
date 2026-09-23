@@ -335,3 +335,326 @@ fn legacy_cliexp_srvexp_rewriting_no_longer_applies() {
     running.store(false, Ordering::Relaxed);
     let _ = srv_handle.join();
 }
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn http_reuse_shares_backend_connection_across_sessions() {
+    use std::sync::atomic::AtomicUsize;
+
+    let srv_addr = free_addr();
+    let proxy_addr = free_addr();
+
+    let accept_count = Arc::new(AtomicUsize::new(0));
+    let ac_clone = Arc::clone(&accept_count);
+    let running = Arc::new(AtomicBool::new(true));
+    let r_clone = Arc::clone(&running);
+
+    let srv_handle = thread::spawn(move || {
+        let listener = TcpListener::bind(srv_addr).expect("bind srv");
+        listener.set_nonblocking(true).expect("nonblocking");
+        while r_clone.load(Ordering::Relaxed) {
+            if let Ok((mut stream, _)) = listener.accept() {
+                ac_clone.fetch_add(1, Ordering::SeqCst);
+                stream.set_nonblocking(false).expect("blocking stream");
+                stream
+                    .set_read_timeout(Some(Duration::from_millis(500)))
+                    .ok();
+
+                let mut req_buf = Vec::new();
+                let mut chunk = [0u8; 1024];
+
+                // Handle requests on this keep-alive connection
+                while r_clone.load(Ordering::Relaxed) {
+                    req_buf.clear();
+                    loop {
+                        match stream.read(&mut chunk) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                req_buf.extend_from_slice(&chunk[..n]);
+                                if req_buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                            Err(ref e)
+                                if e.kind() == std::io::ErrorKind::WouldBlock
+                                    || e.kind() == std::io::ErrorKind::TimedOut =>
+                            {
+                                if !r_clone.load(Ordering::Relaxed) {
+                                    break;
+                                }
+                                thread::sleep(Duration::from_millis(5));
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    if req_buf.is_empty() {
+                        break;
+                    }
+                    let req_str = String::from_utf8_lossy(&req_buf);
+                    let body = if req_str.contains("/first") {
+                        "first"
+                    } else if req_str.contains("/second") {
+                        "second"
+                    } else {
+                        "unknown"
+                    };
+
+                    let res = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    if stream.write_all(res.as_bytes()).is_err() || stream.flush().is_err() {
+                        break;
+                    }
+                }
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+    });
+
+    let config = Config {
+        listens: vec![ListenSection {
+            name: "test_reuse".into(),
+            addr: proxy_addr,
+            mode: Mode::Http,
+            clitimeout: Some(Duration::from_secs(5)),
+            srvtimeout: Some(Duration::from_secs(5)),
+            contimeout: Some(Duration::from_secs(5)),
+            servers: vec![Server::new("s1", srv_addr)],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let mut engine = Engine::new(&config, 64).expect("Engine::new");
+
+    // Client 1 sends /first with Connection: close
+    let mut client1 = TcpStream::connect(proxy_addr).expect("connect client 1");
+    client1.set_nonblocking(true).expect("nonblocking");
+    client1
+        .write_all(b"GET /first HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .expect("write client 1");
+    client1.flush().expect("flush client 1");
+
+    let deadline1 = Instant::now() + Duration::from_secs(3);
+    let mut resp1 = Vec::new();
+    let mut buf = [0u8; 1024];
+    while Instant::now() < deadline1 {
+        let _ = engine.run_once();
+        if let Ok(n) = client1.read(&mut buf) {
+            if n > 0 {
+                resp1.extend_from_slice(&buf[..n]);
+                if resp1.windows(4).any(|w| w == b"\r\n\r\n") && resp1.ends_with(b"first") {
+                    break;
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert!(String::from_utf8_lossy(&resp1).contains("first"), "client 1 got: {:?}", String::from_utf8_lossy(&resp1));
+    drop(client1);
+
+    // Run engine ticks to let client 1 disconnect cleanly and return backend conn to idle pool
+    for _ in 0..10 {
+        let _ = engine.run_once();
+        thread::sleep(Duration::from_millis(2));
+    }
+
+    // Client 2 connects on a completely new session and sends /second
+    let mut client2 = TcpStream::connect(proxy_addr).expect("connect client 2");
+    client2.set_nonblocking(true).expect("nonblocking");
+    client2
+        .write_all(b"GET /second HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .expect("write client 2");
+    client2.flush().expect("flush client 2");
+
+    let deadline2 = Instant::now() + Duration::from_secs(3);
+    let mut resp2 = Vec::new();
+    while Instant::now() < deadline2 {
+        let _ = engine.run_once();
+        if let Ok(n) = client2.read(&mut buf) {
+            if n > 0 {
+                resp2.extend_from_slice(&buf[..n]);
+                if resp2.windows(4).any(|w| w == b"\r\n\r\n") && resp2.ends_with(b"second") {
+                    break;
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert!(String::from_utf8_lossy(&resp2).contains("second"), "client 2 got: {:?}", String::from_utf8_lossy(&resp2));
+    drop(client2);
+
+    running.store(false, Ordering::Relaxed);
+    let _ = srv_handle.join();
+
+    // Verify connection reuse across sessions: backend should have accepted only ONCE!
+    let accepts = accept_count.load(Ordering::SeqCst);
+    assert_eq!(
+        accepts, 1,
+        "backend should have accepted 1 connection (shared idle pool), but accepted {accepts}"
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn http_reuse_never_does_not_share_backend_connection() {
+    let srv_listener = TcpListener::bind("127.0.0.1:0").expect("bind srv");
+    let srv_addr = srv_listener.local_addr().expect("srv addr");
+    let accept_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let ac_clone = accept_count.clone();
+    let running = Arc::new(AtomicBool::new(true));
+    let r_clone = running.clone();
+
+    let srv_handle = thread::spawn(move || {
+        srv_listener
+            .set_nonblocking(true)
+            .expect("set nonblocking listener");
+        while r_clone.load(Ordering::Relaxed) {
+            if let Ok((mut stream, _)) = srv_listener.accept() {
+                ac_clone.fetch_add(1, Ordering::SeqCst);
+                stream.set_nonblocking(false).expect("blocking stream");
+                stream
+                    .set_read_timeout(Some(Duration::from_millis(500)))
+                    .ok();
+
+                let mut req_buf = Vec::new();
+                let mut chunk = [0u8; 1024];
+
+                while r_clone.load(Ordering::Relaxed) {
+                    req_buf.clear();
+                    loop {
+                        match stream.read(&mut chunk) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                req_buf.extend_from_slice(&chunk[..n]);
+                                if req_buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                            Err(ref e)
+                                if e.kind() == std::io::ErrorKind::WouldBlock
+                                    || e.kind() == std::io::ErrorKind::TimedOut =>
+                            {
+                                if !r_clone.load(Ordering::Relaxed) {
+                                    break;
+                                }
+                                thread::sleep(Duration::from_millis(5));
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    if req_buf.is_empty() {
+                        break;
+                    }
+                    let req_str = String::from_utf8_lossy(&req_buf);
+                    let body = if req_str.contains("/first") {
+                        "first"
+                    } else if req_str.contains("/second") {
+                        "second"
+                    } else {
+                        "unknown"
+                    };
+
+                    let res = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    if stream.write_all(res.as_bytes()).is_err() || stream.flush().is_err() {
+                        break;
+                    }
+                }
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+    });
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    let proxy_addr = proxy_listener.local_addr().expect("proxy addr");
+    drop(proxy_listener);
+
+    let config = Config {
+        listens: vec![ListenSection {
+            name: "test_reuse_never".into(),
+            addr: proxy_addr,
+            mode: Mode::Http,
+            clitimeout: Some(Duration::from_secs(5)),
+            srvtimeout: Some(Duration::from_secs(5)),
+            contimeout: Some(Duration::from_secs(5)),
+            http_reuse: Some(ibex_config::HttpReuse::Never),
+            servers: vec![Server::new("s1", srv_addr)],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let mut engine = Engine::new(&config, 64).expect("Engine::new");
+
+    // Client 1 sends /first
+    let mut client1 = TcpStream::connect(proxy_addr).expect("connect client 1");
+    client1.set_nonblocking(true).expect("nonblocking");
+    client1
+        .write_all(b"GET /first HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .expect("write client 1");
+    client1.flush().expect("flush client 1");
+
+    let deadline1 = Instant::now() + Duration::from_secs(3);
+    let mut resp1 = Vec::new();
+    let mut buf = [0u8; 1024];
+    while Instant::now() < deadline1 {
+        let _ = engine.run_once();
+        if let Ok(n) = client1.read(&mut buf) {
+            if n > 0 {
+                resp1.extend_from_slice(&buf[..n]);
+                if resp1.windows(4).any(|w| w == b"\r\n\r\n") && resp1.ends_with(b"first") {
+                    break;
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert!(String::from_utf8_lossy(&resp1).contains("first"));
+    drop(client1);
+
+    for _ in 0..10 {
+        let _ = engine.run_once();
+        thread::sleep(Duration::from_millis(2));
+    }
+
+    // Client 2 sends /second
+    let mut client2 = TcpStream::connect(proxy_addr).expect("connect client 2");
+    client2.set_nonblocking(true).expect("nonblocking");
+    client2
+        .write_all(b"GET /second HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .expect("write client 2");
+    client2.flush().expect("flush client 2");
+
+    let deadline2 = Instant::now() + Duration::from_secs(3);
+    let mut resp2 = Vec::new();
+    while Instant::now() < deadline2 {
+        let _ = engine.run_once();
+        if let Ok(n) = client2.read(&mut buf) {
+            if n > 0 {
+                resp2.extend_from_slice(&buf[..n]);
+                if resp2.windows(4).any(|w| w == b"\r\n\r\n") && resp2.ends_with(b"second") {
+                    break;
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert!(String::from_utf8_lossy(&resp2).contains("second"));
+    drop(client2);
+
+    running.store(false, Ordering::Relaxed);
+    let _ = srv_handle.join();
+
+    // With http-reuse never, backend MUST accept twice (separate connections)
+    let accepts = accept_count.load(Ordering::SeqCst);
+    assert_eq!(
+        accepts, 2,
+        "with http-reuse never, backend should have accepted 2 connections, but accepted {accepts}"
+    );
+}

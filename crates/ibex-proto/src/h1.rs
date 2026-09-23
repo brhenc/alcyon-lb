@@ -6,7 +6,7 @@
 //!
 //! Converts raw HTTP/1.1 and HTTP/1.0 wire streams into [`Htx`] blocks.
 
-use crate::htx::{HeaderField, HttpMethod, HttpVersion, Htx, HtxBlock, RequestLine, ResponseLine};
+use crate::htx::{HtxBlockType, HtxSlice};
 use std::io;
 
 /// Current parser phase.
@@ -70,24 +70,24 @@ impl H1Parser {
     }
 
     /// Finalizes parsing on connection close / EOF (for HTTP/1.0 close delimiter fallback).
-    pub fn finish(&mut self, htx: &mut Htx) {
+    pub fn finish(&mut self, htx: &mut HtxSlice<'_>) {
         if matches!(
             self.phase,
             H1Phase::BodyFixed {
                 remaining: usize::MAX
             }
         ) {
-            htx.push(HtxBlock::Eom);
+            let _ = htx.push_eom();
             self.phase = H1Phase::Done;
         }
     }
 
-    /// Parses wire bytes into an [`Htx`] transaction.
+    /// Parses wire bytes into an [`HtxSlice`] transaction.
     /// Returns the number of consumed bytes.
     ///
     /// # Errors
     /// Returns an error if the HTTP stream contains framing syntax violations.
-    pub fn parse(&mut self, input: &[u8], htx: &mut Htx) -> io::Result<usize> {
+    pub fn parse(&mut self, input: &[u8], htx: &mut HtxSlice<'_>) -> io::Result<usize> {
         let mut cursor = 0;
 
         while cursor < input.len() && self.phase != H1Phase::Done && self.phase != H1Phase::Error {
@@ -107,13 +107,14 @@ impl H1Parser {
                     cursor += consumed;
                 }
                 H1Phase::BodyFixed { ref mut remaining } => {
-                    let consumed = Self::parse_body_fixed(&input[cursor..], htx, remaining);
+                    let consumed = Self::parse_body_fixed(&input[cursor..], htx, remaining)?;
                     if consumed == 0 {
                         break;
                     }
                     cursor += consumed;
                     if *remaining == 0 {
-                        htx.push(HtxBlock::Eom);
+                        htx.push_eom()
+                            .map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
                         self.phase = H1Phase::Done;
                     }
                 }
@@ -132,7 +133,8 @@ impl H1Parser {
                     let (consumed, is_done) = self.parse_trailers(&input[cursor..], htx)?;
                     cursor += consumed;
                     if is_done {
-                        htx.push(HtxBlock::Eom);
+                        htx.push_eom()
+                            .map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
                         self.phase = H1Phase::Done;
                         break;
                     }
@@ -174,7 +176,7 @@ impl H1Parser {
         None
     }
 
-    fn parse_start_line(&mut self, input: &[u8], htx: &mut Htx) -> io::Result<usize> {
+    fn parse_start_line(&mut self, input: &[u8], htx: &mut HtxSlice<'_>) -> io::Result<usize> {
         let Some((line_end, delim_len)) = self.find_line_end(input) else {
             return Ok(0);
         };
@@ -184,18 +186,20 @@ impl H1Parser {
         })?;
 
         if self.is_response {
-            let res = parse_response_line(line_str)?;
-            htx.push(HtxBlock::ResLine(res));
+            let (version, status, reason) = parse_response_line_borrowed(line_str)?;
+            htx.push_res_line(version, status, reason)
+                .map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
         } else {
-            let req = parse_request_line(line_str)?;
-            htx.push(HtxBlock::ReqLine(req));
+            let (method, uri, version) = parse_request_line_borrowed(line_str)?;
+            htx.push_req_line(method, uri, version)
+                .map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
         }
 
         self.phase = H1Phase::Headers;
         Ok(line_end + delim_len)
     }
 
-    fn parse_headers(&mut self, input: &[u8], htx: &mut Htx) -> io::Result<usize> {
+    fn parse_headers(&mut self, input: &[u8], htx: &mut HtxSlice<'_>) -> io::Result<usize> {
         let Some((line_end, delim_len)) = self.find_line_end(input) else {
             return Ok(0);
         };
@@ -210,7 +214,8 @@ impl H1Parser {
 
         if line_end == 0 {
             // Empty line -> End of headers
-            htx.push(HtxBlock::Eoh);
+            htx.push_eoh()
+                .map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
             self.on_headers_finished(htx)?;
             Ok(delim_len)
         } else {
@@ -222,37 +227,27 @@ impl H1Parser {
                         io::Error::new(io::ErrorKind::InvalidData, "Invalid folded header")
                     })?
                     .trim();
-                // A continuation line must continue something. An obs-fold as the
-                // first header line has no preceding field to attach to, and silently
-                // dropping it means a hop that *does* attach it sees a different
-                // message. HAProxy 3.5 answers 400 to this.
-                let Some(HtxBlock::Header(prev)) = htx
-                    .blocks_mut()
-                    .iter_mut()
-                    .rev()
-                    .find(|b| matches!(b, HtxBlock::Header(_)))
-                else {
+                htx.append_to_last_header(folded_val).map_err(|_| {
                     self.phase = H1Phase::Error;
-                    return Err(io::Error::new(
+                    io::Error::new(
                         io::ErrorKind::InvalidData,
                         "obs-fold continuation with no preceding header",
-                    ));
-                };
-                prev.value.push(' ');
-                prev.value.push_str(folded_val);
+                    )
+                })?;
                 return Ok(line_end + delim_len);
             }
 
             let header_str = std::str::from_utf8(header_bytes)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid header string"))?;
 
-            let header = parse_header_field(header_str)?;
-            htx.push(HtxBlock::Header(header));
+            let (name, value) = parse_header_field_borrowed(header_str)?;
+            htx.push_header(name, value)
+                .map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
             Ok(line_end + delim_len)
         }
     }
 
-    fn parse_trailers(&mut self, input: &[u8], htx: &mut Htx) -> io::Result<(usize, bool)> {
+    fn parse_trailers(&mut self, input: &[u8], htx: &mut HtxSlice<'_>) -> io::Result<(usize, bool)> {
         let mut cursor = 0;
         while cursor < input.len() {
             let Some((line_end, delim_len)) = self.find_line_end(&input[cursor..]) else {
@@ -261,6 +256,8 @@ impl H1Parser {
 
             if line_end == 0 {
                 // Empty line -> End of trailers
+                htx.push_eot()
+                    .map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
                 return Ok((cursor + delim_len, true));
             }
 
@@ -272,21 +269,14 @@ impl H1Parser {
                         io::Error::new(io::ErrorKind::InvalidData, "Invalid folded trailer")
                     })?
                     .trim();
-                if let Some(HtxBlock::Trailer(prev)) = htx
-                    .blocks_mut()
-                    .iter_mut()
-                    .rev()
-                    .find(|b| matches!(b, HtxBlock::Trailer(_)))
-                {
-                    prev.value.push(' ');
-                    prev.value.push_str(folded_val);
-                }
+                let _ = htx.append_to_last_trailer(folded_val);
             } else {
                 let trailer_str = std::str::from_utf8(trailer_bytes).map_err(|_| {
                     io::Error::new(io::ErrorKind::InvalidData, "Invalid trailer string")
                 })?;
-                let trailer = parse_header_field(trailer_str)?;
-                htx.push(HtxBlock::Trailer(trailer));
+                let (name, value) = parse_header_field_borrowed(trailer_str)?;
+                htx.push_trailer(name, value)
+                    .map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
             }
 
             cursor += line_end + delim_len;
@@ -294,45 +284,29 @@ impl H1Parser {
         Ok((cursor, false))
     }
 
-    fn on_headers_finished(&mut self, htx: &mut Htx) -> io::Result<()> {
-        // A Content-Length we cannot parse is a protocol error, not something to
-        // shrug off. RFC 9112 6.3: a value that is not a valid decimal makes the
-        // message unframeable, and silently ignoring it is a smuggling primitive --
-        // we would treat the body as the start of the *next* request while the
-        // backend treats it as a body.
-        //
-        // Verified against HAProxy 3.5: `Content-Length: -5` gets 400 Bad Request,
-        // where Ibex previously answered 200 and left "hello" unconsumed on the
-        // connection to become the next request.
-        //
-        // Strict by construction: ASCII digits only. `parse::<usize>()` alone is not
-        // enough because it accepts a leading `+`, and it silently tolerates values
-        // that HAProxy rejects.
-        // Scan only the headers of the *current* message. An `Htx` is reused across
-        // keep-alive requests, so iterating every header would compare request N's
-        // Content-Length against request N-1's and report a bogus conflict.
-        let start = htx
-            .blocks()
-            .iter()
-            .rposition(|b| matches!(b, HtxBlock::ReqLine(_) | HtxBlock::ResLine(_)))
+    fn on_headers_finished(&mut self, htx: &mut HtxSlice<'_>) -> io::Result<()> {
+        let last_start_line = (0..htx.num_blocks())
+            .rev()
+            .find(|&i| matches!(htx.block_type(i), Some(HtxBlockType::ReqLine | HtxBlockType::ResLine)))
             .map_or(0, |i| i + 1);
 
         let mut seen_cl: Option<usize> = None;
-        for block in &htx.blocks()[start..] {
-            let HtxBlock::Header(h) = block else { continue };
-            if !h.name.eq_ignore_ascii_case("content-length") {
+        let sref = htx.as_ref();
+        for i in last_start_line..sref.num_blocks() {
+            if sref.block_type(i) != Some(HtxBlockType::Header) {
                 continue;
             }
-            let raw = h.value.trim();
+            let desc = sref.read_desc(i);
+            let s = desc.addr as usize;
+            let nl = desc.name_len as usize;
+            let vl = desc.value_len as usize;
+            let Ok(h_name) = std::str::from_utf8(&sref.buf()[s..s + nl]) else { continue };
+            if !h_name.eq_ignore_ascii_case("content-length") {
+                continue;
+            }
+            let Ok(h_val) = std::str::from_utf8(&sref.buf()[s + nl..s + nl + vl]) else { continue };
+            let raw = h_val.trim();
 
-            // RFC 9112 6.3 permits a Content-Length whose field-value is a
-            // comma-separated list, provided every element is the same decimal value;
-            // the recipient may then treat it as that single value. HAProxy 3.5 accepts
-            // `Content-Length: 5, 5` and forwards a 5-byte body, so rejecting it would
-            // refuse traffic the reference serves.
-            //
-            // Differing values in the list are still fatal: that is the same desync as
-            // two conflicting Content-Length headers.
             let mut parts = raw.split(',').map(str::trim);
             let Some(first) = parts.next() else {
                 self.phase = H1Phase::Error;
@@ -364,8 +338,6 @@ impl H1Parser {
                     "Content-Length out of range",
                 ));
             };
-            // Duplicate Content-Length headers must agree; conflicting values are the
-            // other classic desync, since each hop may pick a different one.
             if seen_cl.is_some_and(|prev| prev != len) {
                 self.phase = H1Phase::Error;
                 return Err(io::Error::new(
@@ -378,20 +350,26 @@ impl H1Parser {
         self.content_length = seen_cl;
 
         if let Some(te) = htx.get_header("transfer-encoding") {
-            // RFC 9112 6.1: every transfer-coding must be one we understand, and
-            // `chunked` must come last. Anything else is unframeable and must be
-            // refused rather than guessed at.
-            //
-            // Verified against HAProxy 3.5, which answers 400 to
-            // "chunked, identity" and to an unknown coding, and 422 to
-            // "identity, chunked". `identity` is not a transfer-coding in HTTP/1.1.
-            let lower = te.to_ascii_lowercase();
-            let codings: Vec<&str> = lower.split(',').map(str::trim).collect();
-            let unknown = codings
-                .iter()
-                .any(|c| !matches!(*c, "chunked" | "gzip" | "deflate" | "compress" | ""));
-            let chunked_last = codings.last().is_some_and(|c| *c == "chunked");
-            let chunked_count = codings.iter().filter(|c| **c == "chunked").count();
+            let mut unknown = false;
+            let mut chunked_count = 0;
+            let mut last_coding: Option<&str> = None;
+
+            for coding in te.split(',').map(str::trim) {
+                if coding.is_empty() {
+                    continue;
+                }
+                last_coding = Some(coding);
+                if coding.eq_ignore_ascii_case("chunked") {
+                    chunked_count += 1;
+                } else if !coding.eq_ignore_ascii_case("gzip")
+                    && !coding.eq_ignore_ascii_case("deflate")
+                    && !coding.eq_ignore_ascii_case("compress")
+                {
+                    unknown = true;
+                }
+            }
+
+            let chunked_last = last_coding.is_some_and(|c| c.eq_ignore_ascii_case("chunked"));
 
             if unknown || chunked_count > 1 || (chunked_count == 1 && !chunked_last) {
                 self.phase = H1Phase::Error;
@@ -405,34 +383,19 @@ impl H1Parser {
             }
         }
 
-        // RFC 7230 §3.3.3 rule 3: when a message carries both Transfer-Encoding and
-        // Content-Length, the Transfer-Encoding wins and the Content-Length **must be
-        // removed before forwarding**. Leaving both in place is the canonical CL.TE
-        // request-smuggling desync: we frame the message by chunked encoding while a
-        // backend honouring Content-Length frames it differently, so bytes we treat as
-        // the start of the *next* request are read by the backend as body -- or worse,
-        // bytes we forward as body are read by the backend as a new request.
-        //
-        // Verified against HAProxy 3.5 on
-        //   POST /smuggle ... Content-Length: 6, Transfer-Encoding: chunked, "0\r\n\r\nX"
-        // HAProxy strips Content-Length, forwards only chunked framing, drops the
-        // trailing X, and marks the connection non-reusable. We now do the same.
         if self.is_chunked && self.content_length.is_some() {
             self.content_length = None;
             htx.remove_header("content-length");
             self.framing_conflict = true;
-            // The connection cannot be safely reused: any trailing bytes are of
-            // ambiguous ownership, so a later request on this connection could be
-            // prefixed by them.
             self.connection_close = true;
         }
 
         let is_http10 = htx
             .req_line()
-            .map_or(false, |r| r.version == HttpVersion::Http10)
+            .map_or(false, |r| r.version == "HTTP/1.0")
             || htx
                 .res_line()
-                .map_or(false, |r| r.version == HttpVersion::Http10);
+                .map_or(false, |r| r.version == "HTTP/1.0");
 
         if let Some(conn) = htx.get_header("connection") {
             if conn.eq_ignore_ascii_case("close") {
@@ -444,8 +407,8 @@ impl H1Parser {
             self.connection_close = true;
         }
 
-        if let Some(meth) = htx.req_line().map(|r| &r.method) {
-            if matches!(meth, HttpMethod::Connect) {
+        if let Some(meth) = htx.req_line().map(|r| r.method) {
+            if meth.eq_ignore_ascii_case("CONNECT") {
                 self.is_upgrade = true;
             }
         }
@@ -460,7 +423,8 @@ impl H1Parser {
             };
         } else if let Some(len) = self.content_length {
             if len == 0 {
-                htx.push(HtxBlock::Eom);
+                htx.push_eom()
+                    .map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
                 self.phase = H1Phase::Done;
             } else {
                 self.phase = H1Phase::BodyFixed { remaining: len };
@@ -470,17 +434,22 @@ impl H1Parser {
                 remaining: usize::MAX,
             };
         } else {
-            htx.push(HtxBlock::Eom);
+            htx.push_eom()
+                .map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
             self.phase = H1Phase::Done;
         }
-    
+
         Ok(())
     }
 
-    fn parse_body_fixed(input: &[u8], htx: &mut Htx, remaining: &mut usize) -> usize {
+    fn parse_body_fixed(
+        input: &[u8],
+        htx: &mut HtxSlice<'_>,
+        remaining: &mut usize,
+    ) -> io::Result<usize> {
         let available = input.len();
         if available == 0 {
-            return 0;
+            return Ok(0);
         }
 
         let take = if *remaining == usize::MAX {
@@ -489,14 +458,19 @@ impl H1Parser {
             available.min(*remaining)
         };
 
-        htx.push(HtxBlock::Data(input[..take].to_vec()));
+        htx.push_data(&input[..take])
+            .map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
         if *remaining != usize::MAX {
             *remaining -= take;
         }
-        take
+        Ok(take)
     }
 
-    fn parse_body_chunked(&mut self, input: &[u8], htx: &mut Htx) -> io::Result<(usize, bool)> {
+    fn parse_body_chunked(
+        &mut self,
+        input: &[u8],
+        htx: &mut HtxSlice<'_>,
+    ) -> io::Result<(usize, bool)> {
         let (mut chunk_rem, mut waiting_crlf) = match self.phase {
             H1Phase::BodyChunked {
                 chunk_rem,
@@ -580,7 +554,8 @@ impl H1Parser {
             let available = input.len() - cursor;
             if available > 0 {
                 let take = available.min(chunk_rem);
-                htx.push(HtxBlock::Data(input[cursor..cursor + take].to_vec()));
+                htx.push_data(&input[cursor..cursor + take])
+                    .map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
                 cursor += take;
                 chunk_rem -= take;
                 if chunk_rem == 0 {
@@ -597,25 +572,20 @@ impl H1Parser {
     }
 }
 
-fn parse_request_line(line: &str) -> io::Result<RequestLine> {
+fn parse_request_line_borrowed(line: &str) -> io::Result<(&str, &str, &str)> {
     let mut parts = line.split_whitespace();
     let method_str = parts
         .next()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Missing HTTP method"))?;
     let uri = parts
         .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Missing HTTP URI"))?
-        .to_string();
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Missing HTTP URI"))?;
     let version_str = parts.next().unwrap_or("HTTP/1.1");
 
-    Ok(RequestLine {
-        method: HttpMethod::from_bytes(method_str.as_bytes()),
-        uri,
-        version: HttpVersion::from_bytes(version_str.as_bytes()),
-    })
+    Ok((method_str, uri, version_str))
 }
 
-fn parse_response_line(line: &str) -> io::Result<ResponseLine> {
+fn parse_response_line_borrowed(line: &str) -> io::Result<(&str, u16, &str)> {
     let mut parts = line.splitn(3, ' ');
     let version_str = parts
         .next()
@@ -623,17 +593,13 @@ fn parse_response_line(line: &str) -> io::Result<ResponseLine> {
     let status_str = parts
         .next()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Missing HTTP status"))?;
-    let reason = parts.next().unwrap_or("").trim().to_string();
+    let reason = parts.next().unwrap_or("").trim();
 
     let status = status_str
         .parse::<u16>()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid HTTP status code"))?;
 
-    Ok(ResponseLine {
-        version: HttpVersion::from_bytes(version_str.as_bytes()),
-        status,
-        reason,
-    })
+    Ok((version_str, status, reason))
 }
 
 /// True for RFC 9110 `tchar`, the only octets allowed in a header field name.
@@ -644,20 +610,13 @@ const fn is_tchar(b: u8) -> bool {
         | b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z')
 }
 
-fn parse_header_field(line: &str) -> io::Result<HeaderField> {
+fn parse_header_field_borrowed(line: &str) -> io::Result<(&str, &str)> {
     let (name, val) = line
         .split_once(':')
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Header missing colon"))?;
 
     // RFC 9112 5.1 is unusually blunt here: a server MUST reject, with 400, any
-    // request containing whitespace between the field name and the colon. The reason
-    // is concrete -- `Content-Length : 5` is ignored by a hop that requires a strict
-    // token and honoured by one that trims, and those two hops then disagree about
-    // the body length. Trimming the name, as this did, is the permissive side of that
-    // split.
-    //
-    // Verified against HAProxy 3.5: `X-Header : value` and `X-Header\t: value` both
-    // get 400 Bad request.
+    // request containing whitespace between the field name and the colon.
     if name.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -671,8 +630,7 @@ fn parse_header_field(line: &str) -> io::Result<HeaderField> {
         ));
     }
 
-    // Field values may not carry NUL, CR or LF. A NUL is treated as a terminator by
-    // some downstream consumers, which truncates the value differently per hop.
+    // Field values may not carry NUL, CR or LF.
     if val.bytes().any(|b| b == 0 || b == b'\r' || b == b'\n') {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -680,10 +638,7 @@ fn parse_header_field(line: &str) -> io::Result<HeaderField> {
         ));
     }
 
-    Ok(HeaderField {
-        name: name.to_string(),
-        value: val.trim_matches(|c| c == ' ' || c == '\t').to_string(),
-    })
+    Ok((name, val.trim_matches(|c| c == ' ' || c == '\t')))
 }
 
 #[cfg(test)]
@@ -695,16 +650,18 @@ mod tests {
         let req =
             b"GET /index.html HTTP/1.1\r\nHost: example.com\r\nUser-Agent: curl/7.68.0\r\n\r\n";
         let mut parser = H1Parser::new(false);
-        let mut htx = Htx::new();
+        let mut buf = [0u8; 4096];
+        let mut htx = HtxSlice::new(&mut buf);
 
         let consumed = parser.parse(req, &mut htx).expect("parse");
         assert_eq!(consumed, req.len());
         assert_eq!(parser.phase, H1Phase::Done);
 
-        assert_eq!(htx.req_line().unwrap().method, HttpMethod::Get);
-        assert_eq!(htx.req_line().unwrap().uri, "/index.html");
-        assert_eq!(htx.get_header("host"), Some("example.com"));
-        assert!(htx.is_eom());
+        let sref = htx.as_ref();
+        assert_eq!(sref.req_line().unwrap().method, "GET");
+        assert_eq!(sref.req_line().unwrap().uri, "/index.html");
+        assert_eq!(sref.get_header("host"), Some("example.com"));
+        assert!(sref.is_eom());
     }
 
     #[test]
@@ -712,26 +669,28 @@ mod tests {
         let req =
             b"POST /submit HTTP/1.1\r\nHost: example.com\r\nContent-Length: 11\r\n\r\nhello world";
         let mut parser = H1Parser::new(false);
-        let mut htx = Htx::new();
+        let mut buf = [0u8; 4096];
+        let mut htx = HtxSlice::new(&mut buf);
 
         let consumed = parser.parse(req, &mut htx).expect("parse");
         assert_eq!(consumed, req.len());
         assert_eq!(parser.phase, H1Phase::Done);
-        assert_eq!(htx.body_bytes(), b"hello world");
-        assert!(htx.is_eom());
+        assert_eq!(htx.as_ref().body_bytes(), b"hello world");
+        assert!(htx.as_ref().is_eom());
     }
 
     #[test]
     fn parse_http_chunked_response() {
         let res = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
         let mut parser = H1Parser::new(true);
-        let mut htx = Htx::new();
+        let mut buf = [0u8; 4096];
+        let mut htx = HtxSlice::new(&mut buf);
 
         let consumed = parser.parse(res, &mut htx).expect("parse");
         assert_eq!(consumed, res.len());
         assert_eq!(parser.phase, H1Phase::Done);
-        assert_eq!(htx.res_line().unwrap().status, 200);
-        assert_eq!(htx.body_bytes(), b"hello world");
-        assert!(htx.is_eom());
+        assert_eq!(htx.as_ref().res_line().unwrap().status, 200);
+        assert_eq!(htx.as_ref().body_bytes(), b"hello world");
+        assert!(htx.as_ref().is_eom());
     }
 }

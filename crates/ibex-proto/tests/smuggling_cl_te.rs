@@ -11,7 +11,7 @@
 //! attack.
 
 use ibex_proto::h1::H1Parser;
-use ibex_proto::htx::Htx;
+use ibex_proto::htx::{HtxBuffer, HtxSlice};
 
 /// The exact vector verified against `HAProxy` 3.5.
 const CL_TE: &[u8] = b"POST /smuggle HTTP/1.1\r\nHost: example.com\r\n\
@@ -20,10 +20,10 @@ Content-Length: 6\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\nX";
 const TE_CL: &[u8] = b"POST /smuggle HTTP/1.1\r\nHost: example.com\r\n\
 Transfer-Encoding: chunked\r\nContent-Length: 6\r\n\r\n0\r\n\r\nX";
 
-fn parse(input: &[u8]) -> (H1Parser, Htx) {
+fn parse(input: &[u8]) -> (H1Parser, HtxBuffer) {
     let mut p = H1Parser::new(false);
-    let mut h = Htx::new();
-    let _ = p.parse(input, &mut h);
+    let mut h = HtxBuffer::new();
+    let _ = h.with_slice_mut(|s| p.parse(input, s));
     (p, h)
 }
 
@@ -99,7 +99,8 @@ fn chunked_alone_is_still_honoured() {
 
 fn rejects(input: &[u8]) -> bool {
     let mut p = H1Parser::new(false);
-    let mut h = Htx::new();
+    let mut buf = [0u8; 4096];
+    let mut h = HtxSlice::new(&mut buf);
     p.parse(input, &mut h).is_err()
 }
 

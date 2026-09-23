@@ -174,3 +174,16 @@ pub fn silent_drop(fd: BorrowedFd<'_>, is_ipv6: bool) {
     }
     let _ = net::sockopt::set_socket_linger(fd, Some(std::time::Duration::ZERO));
 }
+
+/// Checks if an idle connection is still clean and open.
+///
+/// Returns `true` if the socket is alive, open, and has no pending unread bytes.
+/// Returns `false` if the socket has received FIN/EOF, RST, error, or unexpected bytes.
+#[must_use]
+pub fn is_idle_conn_alive(fd: BorrowedFd<'_>) -> bool {
+    let mut buf = [0u8; 1];
+    matches!(
+        net::recv(fd, &mut buf, net::RecvFlags::PEEK | net::RecvFlags::DONTWAIT),
+        Err(Errno::AGAIN)
+    )
+}

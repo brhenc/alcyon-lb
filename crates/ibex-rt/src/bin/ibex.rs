@@ -99,7 +99,7 @@ fn print_extended_version() {
     println!("  CC      = rustc (cargo)");
     println!("  OPTIONS = STRICT_FORBID_UNSAFE=1 USE_EPOLL=1 USE_POLL=1 USE_RUSTLS=1 USE_HTX=1");
     println!();
-    println!("Feature list : +EPOLL +POLL -KQUEUE -EVPORTS +H1 -H2 -HTX +PROXY_V1 +PROXY_V2 +STICK_TABLES +CRDT +APPLET +CLI +HEALTH_CHECKS +CONTENT_SWITCHING +FORBID_UNSAFE_CODE");
+    println!("Feature list : +EPOLL +POLL -KQUEUE -EVPORTS +H1 +H2 +HTX +PROXY_V1 +PROXY_V2 +STICK_TABLES +CRDT +APPLET +CLI +HEALTH_CHECKS +CONTENT_SWITCHING +FORBID_UNSAFE_CODE");
     println!();
     println!("Default settings :");
     println!("  bufsize = 16384, maxconn = 65536, maxpollevents = 200");
@@ -110,6 +110,7 @@ fn print_extended_version() {
     println!("Total: 2 (2 usable), will use epoll.");
     println!();
     println!("Available multiplexer protocols :");
+    println!("         h2 : mode=HTTP  side=FE|BE  mux=H2    flags=");
     println!("         h1 : mode=HTTP  side=FE|BE  mux=H1    flags=");
     println!("       none : mode=TCP   side=FE|BE  mux=PASS  flags=");
     println!();

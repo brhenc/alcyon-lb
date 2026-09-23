@@ -282,40 +282,32 @@ mod alpn {
         (dir, p)
     }
 
-    /// The default offer is HTTP/1.1 alone.
-    ///
-    /// It used to be `h2, http/1.1`, inherited from `TlsConfig::default`. curl negotiated
-    /// h2 against a listener whose stream layer speaks HTTP/1 only: the handshake
-    /// succeeded, the certificate verified, and the connection then died with a TLS
-    /// decode error because each side was reading the other's protocol as its own.
+    /// The default offer is h2 and HTTP/1.1.
     #[test]
-    fn h2_is_not_advertised_while_it_cannot_be_served() {
+    fn h2_is_advertised_by_default() {
         let (_dir, crt) = a_cert();
         let cfg = TlsConfig::from_bind_config(&bind_with(Vec::new(), crt)).expect("build");
         assert_eq!(
             cfg.alpn_protocols,
-            vec![b"http/1.1".to_vec()],
-            "only protocols the runtime serves may be offered"
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+            "both h2 and http/1.1 are offered by default"
         );
     }
 
-    /// An operator asking for h2 gets HTTP/1.1 rather than a broken connection.
+    /// An operator asking for h2 gets h2 honoured.
     #[test]
-    fn a_requested_h2_is_dropped_not_honoured() {
+    fn a_requested_h2_is_honoured() {
         let (_dir, crt) = a_cert();
         let bind = bind_with(vec!["h2".to_string(), "http/1.1".to_string()], crt);
         let cfg = TlsConfig::from_bind_config(&bind).expect("build");
-        assert_eq!(cfg.alpn_protocols, vec![b"http/1.1".to_vec()]);
+        assert_eq!(cfg.alpn_protocols, vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
     }
 
     /// Asking for nothing servable is an error, not an empty offer.
-    ///
-    /// An empty ALPN list means "no preference", so a client offering only h2 would be
-    /// given a connection and then find nothing on the other end.
     #[test]
     fn requesting_only_unservable_protocols_is_refused() {
         let (_dir, crt) = a_cert();
-        let bind = bind_with(vec!["h2".to_string()], crt);
+        let bind = bind_with(vec!["spdy/3".to_string()], crt);
         let err = TlsConfig::from_bind_config(&bind).expect_err("must refuse");
         assert!(err.contains("ALPN"), "{err}");
     }

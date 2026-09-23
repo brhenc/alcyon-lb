@@ -75,6 +75,8 @@ pub struct DefaultsSection {
     pub log_health_checks: bool,
     /// Default TCP request inspection delay.
     pub tcp_req_inspect_delay: Option<Duration>,
+    /// Default HTTP connection reuse strategy (`http-reuse`).
+    pub http_reuse: Option<HttpReuse>,
 }
 
 /// Unified timeouts configuration.
@@ -434,6 +436,8 @@ pub struct ListenSection {
     pub originalto: Option<String>,
     /// Default server options applied to all servers in this listen section.
     pub default_server: Option<DefaultServerConfig>,
+    /// HTTP connection reuse strategy (`http-reuse`).
+    pub http_reuse: Option<HttpReuse>,
     /// Stats applet and dashboard configuration.
     pub stats: StatsConfig,
 }
@@ -494,6 +498,7 @@ impl Default for ListenSection {
             http_after_res_rules: Vec::new(),
             accept_proxy: false,
             accept_proxy_v2: false,
+            http_reuse: None,
             forwardfor: None,
             originalto: None,
             stats: StatsConfig::default(),
@@ -660,6 +665,8 @@ pub struct BackendSection {
     pub forwardfor: Option<String>,
     /// Originalto header options.
     pub originalto: Option<String>,
+    /// HTTP connection reuse strategy (`http-reuse`).
+    pub http_reuse: Option<HttpReuse>,
     /// Stats applet and dashboard configuration.
     pub stats: StatsConfig,
 }
@@ -694,9 +701,20 @@ impl Default for BackendSection {
             http_after_res_rules: Vec::new(),
             forwardfor: None,
             originalto: None,
+            http_reuse: None,
             stats: StatsConfig::default(),
         }
     }
+}
+
+/// Connection reuse mode for backends (`http-reuse`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HttpReuse {
+    Never,
+    #[default]
+    Safe,
+    Aggressive,
+    Always,
 }
 
 /// Operating mode for a proxy listener.

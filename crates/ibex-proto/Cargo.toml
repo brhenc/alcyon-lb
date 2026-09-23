@@ -8,10 +8,14 @@ description = "Ibex layer model: protocol / transport / mux vtables and the stre
 [dependencies]
 ibex-sched = { path = "../ibex-sched" }
 regex = { workspace = true }
+ibex-h1-sys = { path = "../ibex-h1-sys", optional = true }
 
+[features]
+haproxy-ffi = ["dep:ibex-h1-sys"]
 
 [dev-dependencies]
 proptest = { workspace = true }
+ibex-alloc = { path = "../ibex-alloc" }
 
 [lints.rust]
 unsafe_code = "forbid"

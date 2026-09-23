@@ -146,14 +146,14 @@ fn drive_single_tcp_connection(fe_addr: SocketAddr, engine: &mut Engine) {
 /// Subsequent pool and scratch buffer optimizations should drive this number down.
 #[test]
 fn a_steady_state_http_request_allocates_no_more_than_n_times() {
-    let _lock = TEST_MUTEX.lock().unwrap();
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let (srv_listener, srv_addr) = loopback0();
     let (fe_listener, fe_addr) = loopback0();
     drop(fe_listener);
 
     let running = Arc::new(AtomicBool::new(true));
-    let _be = start_dummy_http_backend(srv_listener, Arc::clone(&running));
+    let be = start_dummy_http_backend(srv_listener, Arc::clone(&running));
 
     let fe = FrontendSection {
         name: "fe_http".into(),
@@ -196,10 +196,10 @@ fn a_steady_state_http_request_allocates_no_more_than_n_times() {
     // Initial baseline recorded: 89 allocs, pinned to <= 95.
     // 2026-09-22: Measured 90 allocs with decoupled pool; bound lowered to <= 93.
     // 2026-09-23 (Nudge 6): Measured 17 allocs, 891 bytes (down from 90 allocs, 41,194 bytes).
-    // Eliminated buf::alloc_standard (was 32 KB), Poller::poll (was 6 KB),
-    // connect_http_backend (was 41 allocs), and apply_http_response_rules (was 22 allocs).
-    // Bound lowered from 93 to <= 25.
-    let max_allowed_allocs: usize = 25;
+    // 2026-09-23 (Nudge 7): HTX buffer pooling & zero-alloc fast path: measured 6 allocs, 186 bytes
+    // (allocprofile: 5 allocs, 124 bytes). Zero allocs in HtxBuffer::with_capacity and to_h1_wire.
+    // Bound lowered from 25 to <= 10, bytes from 2000 to <= 500.
+    let max_allowed_allocs: usize = 10;
     assert!(
         diff.alloc_count <= max_allowed_allocs,
         "a steady state HTTP request allocated {} times (> {}); diff: {:?}",
@@ -207,8 +207,17 @@ fn a_steady_state_http_request_allocates_no_more_than_n_times() {
         max_allowed_allocs,
         diff
     );
+    let max_allowed_bytes: usize = 500;
+    assert!(
+        diff.bytes_allocated <= max_allowed_bytes,
+        "a steady state HTTP request allocated {} bytes (> {}); diff: {:?}",
+        diff.bytes_allocated,
+        max_allowed_bytes,
+        diff
+    );
 
     running.store(false, Ordering::Relaxed);
+    let _ = be.join();
 }
 
 /// Baseline TCP connection allocation test.
@@ -218,14 +227,14 @@ fn a_steady_state_http_request_allocates_no_more_than_n_times() {
 /// **Pinned Bound**: N = 35 allocations.
 #[test]
 fn a_steady_state_tcp_connection_allocates_no_more_than_n_times() {
-    let _lock = TEST_MUTEX.lock().unwrap();
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let (srv_listener, srv_addr) = loopback0();
     let (fe_listener, fe_addr) = loopback0();
     drop(fe_listener);
 
     let running = Arc::new(AtomicBool::new(true));
-    let _be = start_dummy_tcp_backend(srv_listener, Arc::clone(&running));
+    let be = start_dummy_tcp_backend(srv_listener, Arc::clone(&running));
 
     let fe = FrontendSection {
         name: "fe_tcp".into(),
@@ -278,8 +287,17 @@ fn a_steady_state_tcp_connection_allocates_no_more_than_n_times() {
         max_allowed_allocs,
         diff
     );
+    let max_allowed_bytes: usize = 500;
+    assert!(
+        diff.bytes_allocated <= max_allowed_bytes,
+        "a steady state TCP connection allocated {} bytes (> {}); diff: {:?}",
+        diff.bytes_allocated,
+        max_allowed_bytes,
+        diff
+    );
 
     running.store(false, Ordering::Relaxed);
+    let _ = be.join();
 }
 
 /// Baseline ACL evaluation & log formatting request allocation test.
@@ -289,14 +307,14 @@ fn a_steady_state_tcp_connection_allocates_no_more_than_n_times() {
 /// **Pinned Bound**: N = 105 allocations.
 #[test]
 fn a_request_with_acl_and_log_format_allocates_no_more_than_n_times() {
-    let _lock = TEST_MUTEX.lock().unwrap();
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let (srv_listener, srv_addr) = loopback0();
     let (fe_listener, fe_addr) = loopback0();
     drop(fe_listener);
 
     let running = Arc::new(AtomicBool::new(true));
-    let _be = start_dummy_http_backend(srv_listener, Arc::clone(&running));
+    let be = start_dummy_http_backend(srv_listener, Arc::clone(&running));
 
     let mut fe = FrontendSection {
         name: "fe_acl_log".into(),
@@ -355,8 +373,9 @@ fn a_request_with_acl_and_log_format_allocates_no_more_than_n_times() {
     // Initial baseline recorded: 93 allocs, pinned to <= 105.
     // 2026-09-22: Measured 94 allocs with decoupled pool; bound lowered from 105 to <= 98.
     // 2026-09-23 (Nudge 6): Measured 17 allocs, 891 bytes (down from 94 allocs, 41,804 bytes).
-    // Bound lowered from 98 to <= 25.
-    let max_allowed_allocs: usize = 25;
+    // 2026-09-23 (Nudge 7): HTX buffer pooling & zero-alloc fast path: measured 6 allocs, 186 bytes.
+    // Bound lowered from 25 to <= 10, bytes from 2000 to <= 500.
+    let max_allowed_allocs: usize = 10;
     assert!(
         diff.alloc_count <= max_allowed_allocs,
         "an ACL + log-format request allocated {} times (> {}); diff: {:?}",
@@ -364,13 +383,22 @@ fn a_request_with_acl_and_log_format_allocates_no_more_than_n_times() {
         max_allowed_allocs,
         diff
     );
+    let max_allowed_bytes: usize = 500;
+    assert!(
+        diff.bytes_allocated <= max_allowed_bytes,
+        "an ACL + log-format request allocated {} bytes (> {}); diff: {:?}",
+        diff.bytes_allocated,
+        max_allowed_bytes,
+        diff
+    );
 
     running.store(false, Ordering::Relaxed);
+    let _ = be.join();
 }
 
 #[test]
 fn pooled_buf_lifecycle_has_zero_allocations() {
-    let _lock = TEST_MUTEX.lock().unwrap();
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
     // 1. Warm-up buffer pool
     {
@@ -396,4 +424,55 @@ fn pooled_buf_lifecycle_has_zero_allocations() {
         diff.dealloc_count, 0,
         "a pooled Buf lifecycle must have 0 deallocations, got: {diff:?}"
     );
+}
+
+#[test]
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+fn sixty_thousand_backends_memory_bounded() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let before = ibex_alloc::alloc_counters();
+    let mut servers = Vec::with_capacity(60_000);
+    for i in 0..60_000u32 {
+        let port = (1024 + (i % 60000)) as u16;
+        let addr = SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, (i / 256) as u8, (i % 256) as u8)),
+            port,
+        );
+        servers.push(Server::new(format!("s_{i}"), addr));
+    }
+
+    let config = Config {
+        backends: vec![BackendSection {
+            name: "be_60k".into(),
+            mode: Mode::Http,
+            servers,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let engine = Engine::new(&config, 64).expect("Engine::new 60k backends");
+    let after = ibex_alloc::alloc_counters();
+
+    let diff = before.diff(&after);
+    println!(
+        "[MEASUREMENT] 60,000 backends: {} allocs, {} bytes ({:.2} MB)",
+        diff.alloc_count,
+        diff.bytes_allocated,
+        diff.bytes_allocated as f64 / (1024.0 * 1024.0)
+    );
+
+    // HAProxy baseline for 60,000 backends: 3,456 bytes/server = 207 MB.
+    // Ibex measured: 14.00 MB (14,684,199 bytes, ~245 bytes/server).
+    // Bound pinned to <= 20 MB (over 10x smaller than HAProxy).
+    let max_bound_bytes: usize = 20 * 1024 * 1024;
+    assert!(
+        diff.bytes_allocated <= max_bound_bytes,
+        "60,000 backends allocated {} bytes (> {} bytes / 20 MB)",
+        diff.bytes_allocated,
+        max_bound_bytes
+    );
+
+    drop(engine);
 }

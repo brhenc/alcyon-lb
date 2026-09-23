@@ -154,9 +154,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ibex-h1-sys"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "libc",
+]
+
+[[package]]
 name = "ibex-proto"
 version = "0.1.0"
 dependencies = [
+ "ibex-alloc",
+ "ibex-h1-sys",
  "ibex-sched",
  "proptest",
  "regex",

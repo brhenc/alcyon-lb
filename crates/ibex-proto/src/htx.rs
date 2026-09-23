@@ -27,6 +27,8 @@ pub const HTX_HDR_VALUE_MAX_LEN: usize = 1_048_575;
 pub const HTX_BUFFER_DEFAULT_CAPACITY: usize = 16384;
 /// Size in bytes of each block descriptor stored at the end of the buffer.
 pub const HTX_DESC_SIZE: usize = 16;
+/// Default fragmentation threshold (in bytes) before defragmentation is triggered.
+pub const HTX_DEFRAG_THRESHOLD_BYTES: usize = 512;
 
 /// HTX block flag: None.
 pub const HTX_BLK_FL_NONE: u8 = 0x00;
@@ -426,6 +428,48 @@ fn push_header_raw(
     Ok(())
 }
 
+fn insert_header_raw(
+    buf: &mut [u8],
+    tail_addr: &mut usize,
+    num_blocks: &mut usize,
+    insert_idx: usize,
+    name: &str,
+    value: &str,
+) -> Result<(), HtxError> {
+    if name.len() > HTX_HDR_NAME_MAX_LEN || value.len() > HTX_HDR_VALUE_MAX_LEN {
+        return Err(HtxError::LimitExceeded);
+    }
+    let needed = name.len() + value.len() + HTX_DESC_SIZE;
+    if free_capacity_at(buf.len(), *tail_addr, *num_blocks) < needed {
+        return Err(HtxError::OutOfMemory);
+    }
+
+    let addr = *tail_addr as u32;
+    buf[*tail_addr..*tail_addr + name.len()].copy_from_slice(name.as_bytes());
+    *tail_addr += name.len();
+    buf[*tail_addr..*tail_addr + value.len()].copy_from_slice(value.as_bytes());
+    *tail_addr += value.len();
+
+    let desc = HtxBlockDesc {
+        blk_type: HtxBlockType::Header,
+        flags: HTX_BLK_FL_NONE,
+        name_len: name.len() as u16,
+        addr,
+        value_len: value.len() as u32,
+        aux: 0,
+    };
+
+    let idx = insert_idx.min(*num_blocks);
+    let old_num = *num_blocks;
+    *num_blocks += 1;
+    for j in (idx..old_num).rev() {
+        let d = read_desc_at(buf, *num_blocks, j);
+        write_desc_at(buf, *num_blocks, j + 1, &d);
+    }
+    write_desc_at(buf, *num_blocks, idx, &desc);
+    Ok(())
+}
+
 fn push_trailer_raw(
     buf: &mut [u8],
     tail_addr: &mut usize,
@@ -604,8 +648,22 @@ fn write_slice(out: &mut [u8], cursor: usize, src: &[u8]) -> Result<usize, HtxEr
 // Immutable slice view
 // ---------------------------------------------------------------------------
 
+fn format_u16_into(mut val: u16, buf: &mut [u8; 10]) -> &[u8] {
+    if val == 0 {
+        buf[0] = b'0';
+        return &buf[..1];
+    }
+    let mut i = 10;
+    while val > 0 && i > 0 {
+        i -= 1;
+        buf[i] = b'0' + (val % 10) as u8;
+        val /= 10;
+    }
+    &buf[i..]
+}
+
 /// Immutable borrowed view over a contiguous HTX buffer.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct HtxSliceRef<'a> {
     buf: &'a [u8],
     num_blocks: usize,
@@ -622,7 +680,13 @@ impl<'a> HtxSliceRef<'a> {
         self.num_blocks
     }
 
-    fn read_desc(&self, index: usize) -> HtxBlockDesc {
+    #[must_use]
+    pub fn buf(&self) -> &'a [u8] {
+        self.buf
+    }
+
+    #[must_use]
+    pub fn read_desc(&self, index: usize) -> HtxBlockDesc {
         read_desc_at(self.buf, self.num_blocks, index)
     }
 
@@ -747,17 +811,21 @@ impl<'a> HtxSliceRef<'a> {
         let mut cursor = 0;
 
         if let Some(req) = self.req_line() {
-            cursor = write_slice(
-                out,
-                cursor,
-                format!("{} {} {}\r\n", req.method, req.uri, req.version).as_bytes(),
-            )?;
+            cursor = write_slice(out, cursor, req.method.as_bytes())?;
+            cursor = write_slice(out, cursor, b" ")?;
+            cursor = write_slice(out, cursor, req.uri.as_bytes())?;
+            cursor = write_slice(out, cursor, b" ")?;
+            cursor = write_slice(out, cursor, req.version.as_bytes())?;
+            cursor = write_slice(out, cursor, b"\r\n")?;
         } else if let Some(res) = self.res_line() {
-            cursor = write_slice(
-                out,
-                cursor,
-                format!("{} {} {}\r\n", res.version, res.status, res.reason).as_bytes(),
-            )?;
+            cursor = write_slice(out, cursor, res.version.as_bytes())?;
+            cursor = write_slice(out, cursor, b" ")?;
+            let mut status_buf = [0u8; 10];
+            let status_bytes = format_u16_into(res.status, &mut status_buf);
+            cursor = write_slice(out, cursor, status_bytes)?;
+            cursor = write_slice(out, cursor, b" ")?;
+            cursor = write_slice(out, cursor, res.reason.as_bytes())?;
+            cursor = write_slice(out, cursor, b"\r\n")?;
         }
 
         for i in 0..self.num_blocks {
@@ -805,6 +873,311 @@ impl<'a> HtxSliceRef<'a> {
 
         Ok(cursor)
     }
+
+    #[must_use]
+    pub fn to_h1_wire(&self) -> Vec<u8> {
+        let mut out = vec![0u8; 8192];
+        let n = self.write_h1_wire(&mut out).unwrap_or(0);
+        out.truncate(n);
+        out
+    }
+
+    #[must_use]
+    pub fn body_bytes(&self) -> Vec<u8> {
+        let mut b = Vec::with_capacity(self.body_len());
+        for i in 0..self.num_blocks {
+            let desc = self.read_desc(i);
+            if matches!(desc.blk_type, HtxBlockType::Data | HtxBlockType::RawData) {
+                let start = desc.addr as usize;
+                let end = start + desc.value_len as usize;
+                b.extend_from_slice(&self.buf[start..end]);
+            }
+        }
+        b
+    }
+
+    #[must_use]
+    pub fn fragmented_bytes(&self) -> usize {
+        let mut max_end = 0;
+        let mut active = 0;
+        for i in 0..self.num_blocks {
+            let desc = self.read_desc(i);
+            if desc.blk_type != HtxBlockType::Unused {
+                let p_len = match desc.blk_type {
+                    HtxBlockType::Header | HtxBlockType::Trailer => {
+                        desc.name_len as usize + desc.value_len as usize
+                    }
+                    _ => desc.value_len as usize,
+                };
+                let end = desc.addr as usize + p_len;
+                if end > max_end {
+                    max_end = end;
+                }
+                active += p_len;
+            }
+        }
+        max_end.saturating_sub(active)
+    }
+
+    #[must_use]
+    pub fn block_type(&self, index: usize) -> Option<HtxBlockType> {
+        if index < self.num_blocks {
+            Some(self.read_desc(index).blk_type)
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub fn block_types(&self) -> Vec<HtxBlockType> {
+        (0..self.num_blocks)
+            .filter_map(|i| self.block_type(i))
+            .collect()
+    }
+
+    #[must_use]
+    pub fn active_block_types(&self) -> Vec<HtxBlockType> {
+        (0..self.num_blocks)
+            .filter_map(|i| self.block_type(i))
+            .filter(|&t| t != HtxBlockType::Unused)
+            .collect()
+    }
+
+    pub fn headers(self) -> impl Iterator<Item = (&'a str, &'a str)> + 'a {
+        (0..self.num_blocks).filter_map(move |i| {
+            let desc = self.read_desc(i);
+            if desc.blk_type == HtxBlockType::Header {
+                let name_start = desc.addr as usize;
+                let name_end = name_start + desc.name_len as usize;
+                let val_start = name_end;
+                let val_end = val_start + desc.value_len as usize;
+                let name = std::str::from_utf8(&self.buf[name_start..name_end]).ok()?;
+                let val = std::str::from_utf8(&self.buf[val_start..val_end]).ok()?;
+                Some((name, val))
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn trailers(self) -> impl Iterator<Item = (&'a str, &'a str)> + 'a {
+        (0..self.num_blocks).filter_map(move |i| {
+            let desc = self.read_desc(i);
+            if desc.blk_type == HtxBlockType::Trailer {
+                let name_start = desc.addr as usize;
+                let name_end = name_start + desc.name_len as usize;
+                let val_start = name_end;
+                let val_end = val_start + desc.value_len as usize;
+                let name = std::str::from_utf8(&self.buf[name_start..name_end]).ok()?;
+                let val = std::str::from_utf8(&self.buf[val_start..val_end]).ok()?;
+                Some((name, val))
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn check_invariants(&self, tail_addr: usize) -> Result<(), String> {
+        let cap = self.buf.len();
+        let desc_table_size = self.num_blocks * HTX_DESC_SIZE;
+        if desc_table_size > cap {
+            return Err(format!(
+                "desc table size {desc_table_size} exceeds capacity {cap}"
+            ));
+        }
+        let desc_start = cap - desc_table_size;
+        if tail_addr > desc_start {
+            return Err(format!(
+                "tail_addr {} intrudes into descriptor table at {}",
+                tail_addr, desc_start
+            ));
+        }
+
+        let free = free_capacity_at(cap, tail_addr, self.num_blocks);
+        if tail_addr + free + desc_table_size != cap {
+            return Err(format!(
+                "accounting mismatch: tail {} + free {} + desc {} != cap {}",
+                tail_addr, free, desc_table_size, cap
+            ));
+        }
+
+        let mut active_ranges: Vec<(usize, usize, usize)> = Vec::new();
+        for i in 0..self.num_blocks {
+            let desc = self.read_desc(i);
+            if desc.blk_type == HtxBlockType::Unused {
+                continue;
+            }
+            let p_len = match desc.blk_type {
+                HtxBlockType::Header | HtxBlockType::Trailer => {
+                    (desc.name_len as usize) + (desc.value_len as usize)
+                }
+                _ => desc.value_len as usize,
+            };
+            let start = desc.addr as usize;
+            let end = start + p_len;
+            if end > tail_addr {
+                return Err(format!(
+                    "block {i} [{start}..{end}) extends past tail_addr {}",
+                    tail_addr
+                ));
+            }
+            if p_len > 0 {
+                active_ranges.push((start, end, i));
+            }
+        }
+
+        active_ranges.sort_by_key(|&(s, _, _)| s);
+        for w in active_ranges.windows(2) {
+            let (s1, e1, idx1) = w[0];
+            let (s2, _e2, idx2) = w[1];
+            if e1 > s2 {
+                return Err(format!(
+                    "active block {idx1} [{s1}..{e1}) overlaps with block {idx2} starting at {s2}"
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn to_blocks(&self) -> Vec<HtxBlock> {
+        let mut blocks = Vec::new();
+        for i in 0..self.num_blocks {
+            let desc = self.read_desc(i);
+            if desc.blk_type == HtxBlockType::Unused {
+                continue;
+            }
+            let addr = desc.addr as usize;
+            match desc.blk_type {
+                HtxBlockType::ReqLine => {
+                    let raw = std::str::from_utf8(&self.buf[addr..addr + desc.value_len as usize]).unwrap_or("");
+                    let mut parts = raw.split_whitespace();
+                    blocks.push(HtxBlock::ReqLine(RequestLine {
+                        method: HttpMethod::from_bytes(parts.next().unwrap_or("GET").as_bytes()),
+                        uri: parts.next().unwrap_or("/").to_string(),
+                        version: HttpVersion::from_bytes(parts.next().unwrap_or("HTTP/1.1").as_bytes()),
+                    }));
+                }
+                HtxBlockType::ResLine => {
+                    let raw = std::str::from_utf8(&self.buf[addr..addr + desc.value_len as usize]).unwrap_or("");
+                    let mut parts = raw.splitn(3, ' ');
+                    blocks.push(HtxBlock::ResLine(ResponseLine {
+                        version: HttpVersion::from_bytes(parts.next().unwrap_or("HTTP/1.1").as_bytes()),
+                        status: desc.name_len,
+                        reason: parts.next().unwrap_or("").trim().to_string(),
+                    }));
+                }
+                HtxBlockType::Header => {
+                    let name = std::str::from_utf8(&self.buf[addr..addr + desc.name_len as usize]).unwrap_or("").to_string();
+                    let value = std::str::from_utf8(&self.buf[addr + desc.name_len as usize..addr + desc.name_len as usize + desc.value_len as usize]).unwrap_or("").to_string();
+                    blocks.push(HtxBlock::Header(HeaderField { name, value }));
+                }
+                HtxBlockType::Trailer => {
+                    let name = std::str::from_utf8(&self.buf[addr..addr + desc.name_len as usize]).unwrap_or("").to_string();
+                    let value = std::str::from_utf8(&self.buf[addr + desc.name_len as usize..addr + desc.name_len as usize + desc.value_len as usize]).unwrap_or("").to_string();
+                    blocks.push(HtxBlock::Trailer(HeaderField { name, value }));
+                }
+                HtxBlockType::Eoh => blocks.push(HtxBlock::Eoh),
+                HtxBlockType::Eot => blocks.push(HtxBlock::Eot),
+                HtxBlockType::Eom => blocks.push(HtxBlock::Eom),
+                HtxBlockType::Data => {
+                    let data = self.buf[addr..addr + desc.value_len as usize].to_vec();
+                    blocks.push(HtxBlock::Data(data));
+                }
+                HtxBlockType::RawData => {
+                    let data = self.buf[addr..addr + desc.value_len as usize].to_vec();
+                    blocks.push(HtxBlock::RawData(data));
+                }
+                HtxBlockType::Unused => {}
+            }
+        }
+        blocks
+    }
+
+    #[must_use]
+    pub fn to_htx(&self) -> Htx {
+        Htx {
+            blocks: self.to_blocks(),
+        }
+    }
+}
+
+impl<'b> PartialEq<HtxSliceRef<'b>> for HtxSliceRef<'_> {
+    fn eq(&self, other: &HtxSliceRef<'b>) -> bool {
+        if self.num_blocks != other.num_blocks {
+            return false;
+        }
+        for i in 0..self.num_blocks {
+            let d1 = self.read_desc(i);
+            let d2 = other.read_desc(i);
+            if d1.blk_type != d2.blk_type || d1.flags != d2.flags || d1.name_len != d2.name_len || d1.value_len != d2.value_len {
+                return false;
+            }
+            let s1 = d1.addr as usize;
+            let total1 = match d1.blk_type {
+                HtxBlockType::Header | HtxBlockType::Trailer => d1.name_len as usize + d1.value_len as usize,
+                _ => d1.value_len as usize,
+            };
+            let s2 = d2.addr as usize;
+            if self.buf[s1..s1 + total1] != other.buf[s2..s2 + total1] {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+impl std::fmt::Debug for HtxSliceRef<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut list = f.debug_list();
+        for i in 0..self.num_blocks {
+            let desc = self.read_desc(i);
+            match desc.blk_type {
+                HtxBlockType::ReqLine => {
+                    list.entry(&self.req_line());
+                }
+                HtxBlockType::ResLine => {
+                    list.entry(&self.res_line());
+                }
+                HtxBlockType::Header => {
+                    let s = desc.addr as usize;
+                    let nl = desc.name_len as usize;
+                    let vl = desc.value_len as usize;
+                    let n = std::str::from_utf8(&self.buf[s..s + nl]).unwrap_or("");
+                    let v = std::str::from_utf8(&self.buf[s + nl..s + nl + vl]).unwrap_or("");
+                    list.entry(&(n, v));
+                }
+                HtxBlockType::Data => {
+                    list.entry(&format_args!("Data({} bytes)", desc.value_len));
+                }
+                HtxBlockType::Eoh => {
+                    list.entry(&"Eoh");
+                }
+                HtxBlockType::Eom => {
+                    list.entry(&"Eom");
+                }
+                HtxBlockType::Eot => {
+                    list.entry(&"Eot");
+                }
+                HtxBlockType::Trailer => {
+                    let s = desc.addr as usize;
+                    let nl = desc.name_len as usize;
+                    let vl = desc.value_len as usize;
+                    let n = std::str::from_utf8(&self.buf[s..s + nl]).unwrap_or("");
+                    let v = std::str::from_utf8(&self.buf[s + nl..s + nl + vl]).unwrap_or("");
+                    list.entry(&("Trailer", n, v));
+                }
+                HtxBlockType::RawData => {
+                    list.entry(&format_args!("RawData({} bytes)", desc.value_len));
+                }
+                HtxBlockType::Unused => {
+                    list.entry(&"Unused");
+                }
+            }
+        }
+        list.finish()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -828,6 +1201,15 @@ impl<'a> HtxSlice<'a> {
         }
     }
 
+    #[must_use]
+    pub fn with_offsets(buf: &'a mut [u8], tail_addr: usize, num_blocks: usize) -> Self {
+        Self {
+            buf,
+            tail_addr,
+            num_blocks,
+        }
+    }
+
     pub fn clear(&mut self) {
         self.tail_addr = 0;
         self.num_blocks = 0;
@@ -844,6 +1226,11 @@ impl<'a> HtxSlice<'a> {
     }
 
     #[must_use]
+    pub fn tail_addr(&self) -> usize {
+        self.tail_addr
+    }
+
+    #[must_use]
     pub fn payload_bytes(&self) -> usize {
         self.tail_addr
     }
@@ -851,6 +1238,10 @@ impl<'a> HtxSlice<'a> {
     #[must_use]
     pub fn free_capacity(&self) -> usize {
         free_capacity_at(self.buf.len(), self.tail_addr, self.num_blocks)
+    }
+
+    pub fn into_parts(self) -> (&'a mut [u8], usize, usize) {
+        (self.buf, self.tail_addr, self.num_blocks)
     }
 
     pub fn push_req_line(
@@ -963,8 +1354,403 @@ impl<'a> HtxSlice<'a> {
         replace_block_value_raw(self.buf, &mut self.tail_addr, self.num_blocks, index, new_value)
     }
 
+    pub fn append_to_last_header(&mut self, text: &str) -> Result<(), HtxError> {
+        let last_hdr_idx = (0..self.num_blocks)
+            .rev()
+            .find(|&i| read_desc_at(self.buf, self.num_blocks, i).blk_type == HtxBlockType::Header);
 
+        let Some(idx) = last_hdr_idx else {
+            return Err(HtxError::InvalidData);
+        };
 
+        let mut desc = read_desc_at(self.buf, self.num_blocks, idx);
+        let old_addr = desc.addr as usize;
+        let old_val_len = desc.value_len as usize;
+        let name_len = desc.name_len as usize;
+        let added_len = 1 + text.len();
+        let new_val_len = old_val_len + added_len;
+        if new_val_len > HTX_HDR_VALUE_MAX_LEN {
+            return Err(HtxError::LimitExceeded);
+        }
+
+        let is_at_tail = old_addr + name_len + old_val_len == self.tail_addr;
+        if is_at_tail {
+            if free_capacity_at(self.buf.len(), self.tail_addr, self.num_blocks) < added_len {
+                return Err(HtxError::OutOfMemory);
+            }
+            self.buf[self.tail_addr] = b' ';
+            self.tail_addr += 1;
+            self.buf[self.tail_addr..self.tail_addr + text.len()].copy_from_slice(text.as_bytes());
+            self.tail_addr += text.len();
+            desc.value_len = new_val_len as u32;
+            write_desc_at(self.buf, self.num_blocks, idx, &desc);
+            Ok(())
+        } else {
+            let total_new = name_len + new_val_len;
+            if free_capacity_at(self.buf.len(), self.tail_addr, self.num_blocks) < total_new {
+                return Err(HtxError::OutOfMemory);
+            }
+            let new_addr = self.tail_addr;
+            self.buf.copy_within(old_addr..old_addr + name_len + old_val_len, new_addr);
+            self.buf[new_addr + name_len + old_val_len] = b' ';
+            self.buf[new_addr + name_len + old_val_len + 1..new_addr + total_new].copy_from_slice(text.as_bytes());
+            self.tail_addr += total_new;
+            desc.addr = new_addr as u32;
+            desc.value_len = new_val_len as u32;
+            write_desc_at(self.buf, self.num_blocks, idx, &desc);
+            Ok(())
+        }
+    }
+
+    pub fn append_to_last_trailer(&mut self, text: &str) -> Result<(), HtxError> {
+        let last_trl_idx = (0..self.num_blocks)
+            .rev()
+            .find(|&i| read_desc_at(self.buf, self.num_blocks, i).blk_type == HtxBlockType::Trailer);
+
+        let Some(idx) = last_trl_idx else {
+            return Err(HtxError::InvalidData);
+        };
+
+        let mut desc = read_desc_at(self.buf, self.num_blocks, idx);
+        let old_addr = desc.addr as usize;
+        let old_val_len = desc.value_len as usize;
+        let name_len = desc.name_len as usize;
+        let added_len = 1 + text.len();
+        let new_val_len = old_val_len + added_len;
+        if new_val_len > HTX_HDR_VALUE_MAX_LEN {
+            return Err(HtxError::LimitExceeded);
+        }
+
+        let is_at_tail = old_addr + name_len + old_val_len == self.tail_addr;
+        if is_at_tail {
+            if free_capacity_at(self.buf.len(), self.tail_addr, self.num_blocks) < added_len {
+                return Err(HtxError::OutOfMemory);
+            }
+            self.buf[self.tail_addr] = b' ';
+            self.tail_addr += 1;
+            self.buf[self.tail_addr..self.tail_addr + text.len()].copy_from_slice(text.as_bytes());
+            self.tail_addr += text.len();
+            desc.value_len = new_val_len as u32;
+            write_desc_at(self.buf, self.num_blocks, idx, &desc);
+            Ok(())
+        } else {
+            let total_new = name_len + new_val_len;
+            if free_capacity_at(self.buf.len(), self.tail_addr, self.num_blocks) < total_new {
+                return Err(HtxError::OutOfMemory);
+            }
+            let new_addr = self.tail_addr;
+            self.buf.copy_within(old_addr..old_addr + name_len + old_val_len, new_addr);
+            self.buf[new_addr + name_len + old_val_len] = b' ';
+            self.buf[new_addr + name_len + old_val_len + 1..new_addr + total_new].copy_from_slice(text.as_bytes());
+            self.tail_addr += total_new;
+            desc.addr = new_addr as u32;
+            desc.value_len = new_val_len as u32;
+            write_desc_at(self.buf, self.num_blocks, idx, &desc);
+            Ok(())
+        }
+    }
+
+    pub fn insert_header(&mut self, index: usize, name: &str, value: &str) -> Result<(), HtxError> {
+        insert_header_raw(self.buf, &mut self.tail_addr, &mut self.num_blocks, index, name, value)
+    }
+
+    pub fn add_header(&mut self, name: &str, value: &str) -> Result<(), HtxError> {
+        let insert_idx = (0..self.num_blocks)
+            .find(|&i| matches!(read_desc_at(self.buf, self.num_blocks, i).blk_type, HtxBlockType::Eoh | HtxBlockType::Eot | HtxBlockType::Eom))
+            .unwrap_or(self.num_blocks);
+
+        insert_header_raw(
+            self.buf,
+            &mut self.tail_addr,
+            &mut self.num_blocks,
+            insert_idx,
+            name,
+            value,
+        )
+    }
+
+    pub fn set_header(&mut self, name: &str, value: &str) -> Result<(), HtxError> {
+        let mut first_match = None;
+        let mut subsequent_matches = Vec::new();
+
+        for i in 0..self.num_blocks {
+            let desc = read_desc_at(self.buf, self.num_blocks, i);
+            if desc.blk_type == HtxBlockType::Header {
+                let s = desc.addr as usize;
+                let nl = desc.name_len as usize;
+                if let Ok(hdr_name) = std::str::from_utf8(&self.buf[s..s + nl]) {
+                    if hdr_name.eq_ignore_ascii_case(name) {
+                        if first_match.is_none() {
+                            first_match = Some(i);
+                        } else {
+                            subsequent_matches.push(i);
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(idx) = first_match {
+            self.replace_block_value(idx, value.as_bytes())?;
+            for sub_idx in subsequent_matches {
+                self.remove_block(sub_idx);
+            }
+            Ok(())
+        } else {
+            self.add_header(name, value)
+        }
+    }
+
+    pub fn replace_header(&mut self, name: &str, regex: &str, repl: &str) -> Result<usize, HtxError> {
+        let re = regex::Regex::new(regex).map_err(|_| HtxError::InvalidData)?;
+        let mut count = 0;
+
+        for i in 0..self.num_blocks {
+            let desc = read_desc_at(self.buf, self.num_blocks, i);
+            if desc.blk_type == HtxBlockType::Header {
+                let s = desc.addr as usize;
+                let nl = desc.name_len as usize;
+                let vl = desc.value_len as usize;
+                if let Ok(hdr_name) = std::str::from_utf8(&self.buf[s..s + nl]) {
+                    if hdr_name.eq_ignore_ascii_case(name) {
+                        if let Ok(hdr_val) = std::str::from_utf8(&self.buf[s + nl..s + nl + vl]) {
+                            let new_val = re.replace_all(hdr_val, repl).to_string();
+                            if new_val != hdr_val {
+                                self.replace_block_value(i, new_val.as_bytes())?;
+                                count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(count)
+    }
+
+    pub fn set_uri(&mut self, new_uri: &str) -> Result<(), HtxError> {
+        let req_idx = (0..self.num_blocks)
+            .find(|&i| read_desc_at(self.buf, self.num_blocks, i).blk_type == HtxBlockType::ReqLine)
+            .ok_or(HtxError::InvalidData)?;
+
+        let (method, version) = {
+            let view = self.as_ref().req_line().ok_or(HtxError::InvalidData)?;
+            (view.method.to_string(), view.version.to_string())
+        };
+
+        let new_line = format!("{method} {new_uri} {version}");
+        self.replace_block_value(req_idx, new_line.as_bytes())?;
+
+        let mut desc = read_desc_at(self.buf, self.num_blocks, req_idx);
+        desc.name_len = method.len() as u16;
+        desc.aux = new_uri.len() as u32;
+        write_desc_at(self.buf, self.num_blocks, req_idx, &desc);
+        Ok(())
+    }
+
+    pub fn set_path(&mut self, new_path: &str) -> Result<(), HtxError> {
+        let (pfx, _, query) = {
+            let view = self.as_ref().req_line().ok_or(HtxError::InvalidData)?;
+            let current_uri = view.uri;
+            if let Some(idx) = current_uri.find("://") {
+                let rest = &current_uri[idx + 3..];
+                if let Some(slash) = rest.find('/') {
+                    let pfx = &current_uri[..idx + 3 + slash];
+                    let pathq = &current_uri[idx + 3 + slash..];
+                    let (p, q) = pathq.split_once('?').unwrap_or((pathq, ""));
+                    (pfx.to_string(), p.to_string(), q.to_string())
+                } else {
+                    (current_uri.to_string(), String::new(), String::new())
+                }
+            } else {
+                let (p, q) = current_uri.split_once('?').unwrap_or((current_uri, ""));
+                (String::new(), p.to_string(), q.to_string())
+            }
+        };
+
+        let rebuilt_uri = if query.is_empty() {
+            format!("{pfx}{new_path}")
+        } else {
+            format!("{pfx}{new_path}?{query}")
+        };
+
+        self.set_uri(&rebuilt_uri)
+    }
+
+    pub fn set_method(&mut self, new_method: &str) -> Result<(), HtxError> {
+        let req_idx = (0..self.num_blocks)
+            .find(|&i| read_desc_at(self.buf, self.num_blocks, i).blk_type == HtxBlockType::ReqLine)
+            .ok_or(HtxError::InvalidData)?;
+
+        let (uri, version) = {
+            let view = self.as_ref().req_line().ok_or(HtxError::InvalidData)?;
+            (view.uri.to_string(), view.version.to_string())
+        };
+
+        let new_line = format!("{new_method} {uri} {version}");
+        self.replace_block_value(req_idx, new_line.as_bytes())?;
+
+        let mut desc = read_desc_at(self.buf, self.num_blocks, req_idx);
+        desc.name_len = new_method.len() as u16;
+        desc.aux = uri.len() as u32;
+        write_desc_at(self.buf, self.num_blocks, req_idx, &desc);
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn fragmented_bytes(&self) -> usize {
+        let mut active = 0;
+        for i in 0..self.num_blocks {
+            let desc = read_desc_at(self.buf, self.num_blocks, i);
+            if desc.blk_type != HtxBlockType::Unused {
+                let p_len = match desc.blk_type {
+                    HtxBlockType::Header | HtxBlockType::Trailer => {
+                        desc.name_len as usize + desc.value_len as usize
+                    }
+                    _ => desc.value_len as usize,
+                };
+                active += p_len;
+            }
+        }
+        self.tail_addr.saturating_sub(active)
+    }
+
+    pub fn maybe_defrag_threshold(&mut self, threshold: usize) -> bool {
+        if self.fragmented_bytes() >= threshold && self.fragmented_bytes() > 0 {
+            self.defrag();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn maybe_defrag(&mut self) -> bool {
+        self.maybe_defrag_threshold(HTX_DEFRAG_THRESHOLD_BYTES)
+    }
+
+    pub fn remove_header(&mut self, name: &str) -> usize {
+        let mut count = 0;
+        for i in 0..self.num_blocks {
+            let mut desc = read_desc_at(self.buf, self.num_blocks, i);
+            if desc.blk_type == HtxBlockType::Header {
+                let s = desc.addr as usize;
+                let nl = desc.name_len as usize;
+                if let Ok(hdr_name) = std::str::from_utf8(&self.buf[s..s + nl]) {
+                    if hdr_name.eq_ignore_ascii_case(name) {
+                        desc.blk_type = HtxBlockType::Unused;
+                        write_desc_at(self.buf, self.num_blocks, i, &desc);
+                        count += 1;
+                    }
+                }
+            }
+        }
+        count
+    }
+
+    pub fn defrag(&mut self) {
+        if self.num_blocks == 0 {
+            self.tail_addr = 0;
+            return;
+        }
+
+        // 1 & 2. Collect and sort active block indices by physical address
+        // Fast path: use stack buffer if num_blocks <= 64 to avoid allocation
+        let mut stack_indices = [0usize; 64];
+        let mut heap_indices;
+        let active: &mut [usize] = if self.num_blocks <= 64 {
+            let mut count = 0;
+            for i in 0..self.num_blocks {
+                if read_desc_at(self.buf, self.num_blocks, i).blk_type != HtxBlockType::Unused {
+                    stack_indices[count] = i;
+                    count += 1;
+                }
+            }
+            &mut stack_indices[..count]
+        } else {
+            heap_indices = (0..self.num_blocks)
+                .filter(|&i| read_desc_at(self.buf, self.num_blocks, i).blk_type != HtxBlockType::Unused)
+                .collect::<Vec<_>>();
+            &mut heap_indices[..]
+        };
+
+        // Sort active blocks by physical address so new_tail <= old_addr always holds
+        active.sort_by_key(|&i| read_desc_at(self.buf, self.num_blocks, i).addr);
+
+        // 3. Compact payloads in physical order
+        let mut new_tail = 0;
+        for &idx in active.iter() {
+            let mut desc = read_desc_at(self.buf, self.num_blocks, idx);
+            let p_len = match desc.blk_type {
+                HtxBlockType::Header | HtxBlockType::Trailer => {
+                    desc.name_len as usize + desc.value_len as usize
+                }
+                _ => desc.value_len as usize,
+            };
+
+            let old_addr = desc.addr as usize;
+            if p_len > 0 {
+                self.buf.copy_within(old_addr..old_addr + p_len, new_tail);
+            }
+            desc.addr = new_tail as u32;
+            new_tail += p_len;
+            write_desc_at(self.buf, self.num_blocks, idx, &desc);
+        }
+
+        // 4. Compact descriptors in original logical order (skipping Unused)
+        let mut new_num_blocks = 0;
+        for i in 0..self.num_blocks {
+            let desc = read_desc_at(self.buf, self.num_blocks, i);
+            if desc.blk_type == HtxBlockType::Unused {
+                continue;
+            }
+            write_desc_at(self.buf, self.num_blocks, new_num_blocks, &desc);
+            new_num_blocks += 1;
+        }
+
+        self.tail_addr = new_tail;
+        self.num_blocks = new_num_blocks;
+    }
+
+    pub fn check_invariants(&self) -> Result<(), String> {
+        self.as_ref().check_invariants(self.tail_addr)
+    }
+
+    #[must_use]
+    pub fn to_blocks(&self) -> Vec<HtxBlock> {
+        self.as_ref().to_blocks()
+    }
+
+    #[must_use]
+    pub fn to_htx(&self) -> Htx {
+        self.as_ref().to_htx()
+    }
+
+    #[must_use]
+    pub fn body_bytes(&self) -> Vec<u8> {
+        self.as_ref().body_bytes()
+    }
+
+    pub fn headers(&self) -> impl Iterator<Item = (&str, &str)> + '_ {
+        self.as_ref().headers()
+    }
+
+    pub fn trailers(&self) -> impl Iterator<Item = (&str, &str)> + '_ {
+        self.as_ref().trailers()
+    }
+
+    #[must_use]
+    pub fn block_type(&self, index: usize) -> Option<HtxBlockType> {
+        self.as_ref().block_type(index)
+    }
+
+    #[must_use]
+    pub fn block_types(&self) -> Vec<HtxBlockType> {
+        self.as_ref().block_types()
+    }
+
+    #[must_use]
+    pub fn active_block_types(&self) -> Vec<HtxBlockType> {
+        self.as_ref().active_block_types()
+    }
 
     #[must_use]
     pub fn is_eom(&self) -> bool {
@@ -1034,6 +1820,23 @@ impl<'a> HtxSlice<'a> {
     pub fn write_h1_wire(&self, out: &mut [u8]) -> Result<usize, HtxError> {
         self.as_ref().write_h1_wire(out)
     }
+
+    #[must_use]
+    pub fn to_h1_wire(&self) -> Vec<u8> {
+        self.as_ref().to_h1_wire()
+    }
+}
+
+impl std::fmt::Debug for HtxSlice<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.as_ref().fmt(f)
+    }
+}
+
+impl<'b> PartialEq<HtxSlice<'b>> for HtxSlice<'_> {
+    fn eq(&self, other: &HtxSlice<'b>) -> bool {
+        self.as_ref() == other.as_ref()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1055,6 +1858,7 @@ impl Default for HtxBuffer {
     }
 }
 
+#[allow(clippy::redundant_closure_for_method_calls)]
 impl HtxBuffer {
     #[must_use]
     pub fn new() -> Self {
@@ -1079,8 +1883,21 @@ impl HtxBuffer {
     }
 
     #[must_use]
-    pub fn as_ref(&self) -> HtxSliceRef<'_> {
+    pub fn as_slice(&self) -> HtxSliceRef<'_> {
         HtxSliceRef::new(&self.data, self.num_blocks)
+    }
+
+    pub fn as_slice_mut(&mut self) -> HtxSlice<'_> {
+        HtxSlice::with_offsets(&mut self.data, self.tail_addr, self.num_blocks)
+    }
+
+    pub fn with_slice_mut<R>(&mut self, f: impl FnOnce(&mut HtxSlice<'_>) -> R) -> R {
+        let mut s = HtxSlice::with_offsets(&mut self.data, self.tail_addr, self.num_blocks);
+        let res = f(&mut s);
+        let (_, tail, num) = s.into_parts();
+        self.tail_addr = tail;
+        self.num_blocks = num;
+        res
     }
 
     pub fn push_req_line(
@@ -1089,14 +1906,7 @@ impl HtxBuffer {
         uri: &str,
         version: &str,
     ) -> Result<(), HtxError> {
-        push_req_line_raw(
-            &mut self.data,
-            &mut self.tail_addr,
-            &mut self.num_blocks,
-            method,
-            uri,
-            version,
-        )
+        self.with_slice_mut(|s| s.push_req_line(method, uri, version))
     }
 
     pub fn push_res_line(
@@ -1105,347 +1915,190 @@ impl HtxBuffer {
         status: u16,
         reason: &str,
     ) -> Result<(), HtxError> {
-        push_res_line_raw(
-            &mut self.data,
-            &mut self.tail_addr,
-            &mut self.num_blocks,
-            version,
-            status,
-            reason,
-        )
+        self.with_slice_mut(|s| s.push_res_line(version, status, reason))
     }
 
     pub fn push_header(&mut self, name: &str, value: &str) -> Result<(), HtxError> {
-        push_header_raw(
-            &mut self.data,
-            &mut self.tail_addr,
-            &mut self.num_blocks,
-            name,
-            value,
-        )
+        self.with_slice_mut(|s| s.push_header(name, value))
     }
 
     pub fn push_eoh(&mut self) -> Result<(), HtxError> {
-        push_marker_raw(
-            &mut self.data,
-            self.tail_addr,
-            &mut self.num_blocks,
-            HtxBlockType::Eoh,
-            HTX_BLK_FL_NONE,
-        )
+        self.with_slice_mut(|s| s.push_eoh())
     }
 
     pub fn push_data(&mut self, data: &[u8]) -> Result<(), HtxError> {
-        push_data_raw(
-            &mut self.data,
-            &mut self.tail_addr,
-            &mut self.num_blocks,
-            data,
-            false,
-        )
+        self.with_slice_mut(|s| s.push_data(data))
     }
 
     pub fn push_trailer(&mut self, name: &str, value: &str) -> Result<(), HtxError> {
-        push_trailer_raw(
-            &mut self.data,
-            &mut self.tail_addr,
-            &mut self.num_blocks,
-            name,
-            value,
-        )
+        self.with_slice_mut(|s| s.push_trailer(name, value))
     }
 
     pub fn push_eot(&mut self) -> Result<(), HtxError> {
-        push_marker_raw(
-            &mut self.data,
-            self.tail_addr,
-            &mut self.num_blocks,
-            HtxBlockType::Eot,
-            HTX_BLK_FL_NONE,
-        )
+        self.with_slice_mut(|s| s.push_eot())
     }
 
     pub fn push_eom(&mut self) -> Result<(), HtxError> {
-        push_marker_raw(
-            &mut self.data,
-            self.tail_addr,
-            &mut self.num_blocks,
-            HtxBlockType::Eom,
-            HTX_BLK_FL_EOM,
-        )
+        self.with_slice_mut(|s| s.push_eom())
     }
 
     pub fn push_raw_data(&mut self, data: &[u8]) -> Result<(), HtxError> {
-        push_data_raw(
-            &mut self.data,
-            &mut self.tail_addr,
-            &mut self.num_blocks,
-            data,
-            true,
-        )
+        self.with_slice_mut(|s| s.push_raw_data(data))
     }
 
     pub fn remove_block(&mut self, index: usize) {
-        remove_block_raw(&mut self.data, self.num_blocks, index);
+        self.with_slice_mut(|s| s.remove_block(index));
     }
 
     pub fn replace_block_value(&mut self, index: usize, new_value: &[u8]) -> Result<(), HtxError> {
-        replace_block_value_raw(&mut self.data, &mut self.tail_addr, self.num_blocks, index, new_value)
+        self.with_slice_mut(|s| s.replace_block_value(index, new_value))
     }
 
     pub fn defrag(&mut self) {
-        let mut new_data = vec![0u8; self.data.len()];
-        let mut new_tail = 0;
-        let mut new_num_blocks = 0;
-
-        for i in 0..self.num_blocks {
-            let mut desc = read_desc_at(&self.data, self.num_blocks, i);
-            if desc.blk_type == HtxBlockType::Unused {
-                continue;
-            }
-
-            let p_len = match desc.blk_type {
-                HtxBlockType::Header | HtxBlockType::Trailer => desc.name_len as usize + desc.value_len as usize,
-                _ => desc.value_len as usize,
-            };
-
-            if p_len > 0 {
-                new_data[new_tail..new_tail + p_len].copy_from_slice(&self.data[desc.addr as usize..desc.addr as usize + p_len]);
-            }
-
-            desc.addr = new_tail as u32;
-            new_tail += p_len;
-
-            // write desc to new_data. Note: we use self.num_blocks as the max blocks for the offset calculation
-            // to ensure they are packed exactly as if there were self.num_blocks blocks, but wait,
-            // if we pack them using self.num_blocks, they will be at offset `buf.len() - (new_num_blocks + 1) * DESC_SIZE`.
-            // BUT wait! When we update self.num_blocks = new_num_blocks, the readers will look at
-            // `buf.len() - (idx + 1) * DESC_SIZE`.
-            // So we MUST write them using `new_num_blocks` as the "num_blocks" for offset?
-            // NO! read_desc_at does NOT use `num_blocks` for offset!
-            // It just does `buf.len() - (index + 1) * HTX_DESC_SIZE`.
-            // So we just write to `index = new_num_blocks`.
-            // We just need to bypass the assert in write_desc_at, so we pass a dummy num_blocks that is large enough.
-            write_desc_at(&mut new_data, self.num_blocks, new_num_blocks, &desc);
-            new_num_blocks += 1;
-        }
-        self.data = new_data;
-        self.tail_addr = new_tail;
-        self.num_blocks = new_num_blocks;
+        self.with_slice_mut(|s| s.defrag());
     }
 
-    /// Returns the total number of descriptor slots (including Unused/tombstoned ones).
+    pub fn insert_header(&mut self, index: usize, name: &str, value: &str) -> Result<(), HtxError> {
+        self.with_slice_mut(|s| s.insert_header(index, name, value))
+    }
+
+    pub fn add_header(&mut self, name: &str, value: &str) -> Result<(), HtxError> {
+        self.with_slice_mut(|s| s.add_header(name, value))
+    }
+
+    pub fn set_header(&mut self, name: &str, value: &str) -> Result<(), HtxError> {
+        self.with_slice_mut(|s| s.set_header(name, value))
+    }
+
+    pub fn remove_header(&mut self, name: &str) -> usize {
+        self.with_slice_mut(|s| s.remove_header(name))
+    }
+
+    pub fn replace_header(&mut self, name: &str, regex: &str, repl: &str) -> Result<usize, HtxError> {
+        self.with_slice_mut(|s| s.replace_header(name, regex, repl))
+    }
+
+    pub fn set_uri(&mut self, new_uri: &str) -> Result<(), HtxError> {
+        self.with_slice_mut(|s| s.set_uri(new_uri))
+    }
+
+    pub fn set_path(&mut self, new_path: &str) -> Result<(), HtxError> {
+        self.with_slice_mut(|s| s.set_path(new_path))
+    }
+
+    pub fn set_method(&mut self, new_method: &str) -> Result<(), HtxError> {
+        self.with_slice_mut(|s| s.set_method(new_method))
+    }
+
+    #[must_use]
+    pub fn fragmented_bytes(&self) -> usize {
+        self.as_slice().fragmented_bytes()
+    }
+
+    pub fn maybe_defrag_threshold(&mut self, threshold: usize) -> bool {
+        self.with_slice_mut(|s| s.maybe_defrag_threshold(threshold))
+    }
+
+    pub fn maybe_defrag(&mut self) -> bool {
+        self.with_slice_mut(|s| s.maybe_defrag())
+    }
+
     #[must_use]
     pub fn num_blocks(&self) -> usize {
         self.num_blocks
     }
 
-    /// Returns the block type of the descriptor at `index`, or `None` if out of bounds.
     #[must_use]
     pub fn block_type(&self, index: usize) -> Option<HtxBlockType> {
-        if index < self.num_blocks {
-            Some(read_desc_at(&self.data, self.num_blocks, index).blk_type)
-        } else {
-            None
-        }
+        self.as_slice().block_type(index)
     }
 
-    /// Checks the structural invariants of the flat buffer:
-    /// - Descriptor table does not exceed buffer capacity.
-    /// - Tail address does not intrude into the descriptor table.
-    /// - Exact byte accounting: `tail_addr + free_capacity + desc_table == capacity`.
-    /// - Every active block payload lies strictly within `[0, tail_addr)`.
-    /// - No two active blocks overlap in payload memory.
+    #[must_use]
+    pub fn block_types(&self) -> Vec<HtxBlockType> {
+        self.as_slice().block_types()
+    }
+
+    #[must_use]
+    pub fn active_block_types(&self) -> Vec<HtxBlockType> {
+        self.as_slice().active_block_types()
+    }
+
     pub fn check_invariants(&self) -> Result<(), String> {
-        let cap = self.data.len();
-        let desc_table_size = self.num_blocks * HTX_DESC_SIZE;
-        if desc_table_size > cap {
-            return Err(format!(
-                "desc table size {desc_table_size} exceeds capacity {cap}"
-            ));
-        }
-        let desc_start = cap - desc_table_size;
-        if self.tail_addr > desc_start {
-            return Err(format!(
-                "tail_addr {} intrudes into descriptor table at {}",
-                self.tail_addr, desc_start
-            ));
-        }
-
-        let free = free_capacity_at(cap, self.tail_addr, self.num_blocks);
-        if self.tail_addr + free + desc_table_size != cap {
-            return Err(format!(
-                "accounting mismatch: tail {} + free {} + desc {} != cap {}",
-                self.tail_addr, free, desc_table_size, cap
-            ));
-        }
-
-        // Verify active blocks do not overlap and lie within [0, tail_addr)
-        let mut active_ranges: Vec<(usize, usize, usize)> = Vec::new();
-        for i in 0..self.num_blocks {
-            let desc = read_desc_at(&self.data, self.num_blocks, i);
-            if desc.blk_type == HtxBlockType::Unused {
-                continue;
-            }
-            let p_len = match desc.blk_type {
-                HtxBlockType::Header | HtxBlockType::Trailer => {
-                    (desc.name_len as usize) + (desc.value_len as usize)
-                }
-                _ => desc.value_len as usize,
-            };
-            let start = desc.addr as usize;
-            let end = start + p_len;
-            if end > self.tail_addr {
-                return Err(format!(
-                    "block {i} [{start}..{end}) extends past tail_addr {}",
-                    self.tail_addr
-                ));
-            }
-            if p_len > 0 {
-                active_ranges.push((start, end, i));
-            }
-        }
-
-        active_ranges.sort_by_key(|&(s, _, _)| s);
-        for w in active_ranges.windows(2) {
-            let (s1, e1, idx1) = w[0];
-            let (s2, _e2, idx2) = w[1];
-            if e1 > s2 {
-                return Err(format!(
-                    "active block {idx1} [{s1}..{e1}) overlaps with block {idx2} starting at {s2}"
-                ));
-            }
-        }
-
-        Ok(())
+        self.as_slice().check_invariants(self.tail_addr)
     }
 
-    /// Converts this buffer to a vector of `HtxBlock`s, skipping Unused blocks.
     #[must_use]
     pub fn to_blocks(&self) -> Vec<HtxBlock> {
-        let mut blocks = Vec::new();
-        for i in 0..self.num_blocks {
-            let desc = read_desc_at(&self.data, self.num_blocks, i);
-            if desc.blk_type == HtxBlockType::Unused {
-                continue;
-            }
-
-            let addr = desc.addr as usize;
-
-            match desc.blk_type {
-                HtxBlockType::ReqLine => {
-                    let raw = std::str::from_utf8(&self.data[addr..addr + desc.value_len as usize]).unwrap_or("");
-                    let mut parts = raw.split_whitespace();
-                    blocks.push(HtxBlock::ReqLine(RequestLine {
-                        method: HttpMethod::from_bytes(parts.next().unwrap_or("GET").as_bytes()),
-                        uri: parts.next().unwrap_or("/").to_string(),
-                        version: HttpVersion::from_bytes(parts.next().unwrap_or("HTTP/1.1").as_bytes()),
-                    }));
-                }
-                HtxBlockType::ResLine => {
-                    let raw = std::str::from_utf8(&self.data[addr..addr + desc.value_len as usize]).unwrap_or("");
-                    let mut parts = raw.splitn(3, ' ');
-                    blocks.push(HtxBlock::ResLine(ResponseLine {
-                        version: HttpVersion::from_bytes(parts.next().unwrap_or("HTTP/1.1").as_bytes()),
-                        status: desc.name_len,
-                        reason: parts.next().unwrap_or("").trim().to_string(),
-                    }));
-                }
-                HtxBlockType::Header => {
-                    let name = std::str::from_utf8(&self.data[addr..addr + desc.name_len as usize]).unwrap_or("").to_string();
-                    let value = std::str::from_utf8(&self.data[addr + desc.name_len as usize..addr + desc.name_len as usize + desc.value_len as usize]).unwrap_or("").to_string();
-                    blocks.push(HtxBlock::Header(HeaderField { name, value }));
-                }
-                HtxBlockType::Trailer => {
-                    let name = std::str::from_utf8(&self.data[addr..addr + desc.name_len as usize]).unwrap_or("").to_string();
-                    let value = std::str::from_utf8(&self.data[addr + desc.name_len as usize..addr + desc.name_len as usize + desc.value_len as usize]).unwrap_or("").to_string();
-                    blocks.push(HtxBlock::Trailer(HeaderField { name, value }));
-                }
-                HtxBlockType::Eoh => blocks.push(HtxBlock::Eoh),
-                HtxBlockType::Eot => blocks.push(HtxBlock::Eot),
-                HtxBlockType::Eom => blocks.push(HtxBlock::Eom),
-                HtxBlockType::Data => {
-                    let data = self.data[addr..addr + desc.value_len as usize].to_vec();
-                    blocks.push(HtxBlock::Data(data));
-                }
-                HtxBlockType::RawData => {
-                    let data = self.data[addr..addr + desc.value_len as usize].to_vec();
-                    blocks.push(HtxBlock::RawData(data));
-                }
-                HtxBlockType::Unused => {}
-            }
-        }
-        blocks
+        self.as_slice().to_blocks()
     }
 
+    #[must_use]
+    pub fn to_htx(&self) -> Htx {
+        self.as_slice().to_htx()
+    }
 
     #[must_use]
     pub fn get_header(&self, name: &str) -> Option<&str> {
-        self.as_ref().get_header(name)
+        self.as_slice().get_header(name)
+    }
+
+    pub fn headers(&self) -> impl Iterator<Item = (&str, &str)> + '_ {
+        self.as_slice().headers()
     }
 
     #[must_use]
     pub fn get_trailer(&self, name: &str) -> Option<&str> {
-        self.as_ref().get_trailer(name)
+        self.as_slice().get_trailer(name)
+    }
+
+    pub fn trailers(&self) -> impl Iterator<Item = (&str, &str)> + '_ {
+        self.as_slice().trailers()
     }
 
     #[must_use]
     pub fn is_eom(&self) -> bool {
-        self.as_ref().is_eom()
+        self.as_slice().is_eom()
     }
 
     #[must_use]
     pub fn is_eoh(&self) -> bool {
-        self.as_ref().is_eoh()
+        self.as_slice().is_eoh()
     }
 
     #[must_use]
     pub fn req_line(&self) -> Option<RequestLineView<'_>> {
-        self.as_ref().req_line()
+        self.as_slice().req_line()
     }
 
     #[must_use]
     pub fn res_line(&self) -> Option<ResponseLineView<'_>> {
-        self.as_ref().res_line()
+        self.as_slice().res_line()
     }
 
     #[must_use]
     pub fn body_len(&self) -> usize {
-        self.as_ref().body_len()
+        self.as_slice().body_len()
+    }
+
+    #[must_use]
+    pub fn body_bytes(&self) -> Vec<u8> {
+        self.as_slice().body_bytes()
     }
 
     pub fn merge_contiguous_data(&mut self) {
-        if self.num_blocks < 2 {
-            return;
-        }
-
-        let mut i = 1;
-        while i < self.num_blocks {
-            let prev = read_desc_at(&self.data, self.num_blocks, i - 1);
-            let curr = read_desc_at(&self.data, self.num_blocks, i);
-
-            if prev.blk_type == HtxBlockType::Data
-                && curr.blk_type == HtxBlockType::Data
-                && (prev.addr as usize + prev.value_len as usize == curr.addr as usize)
-            {
-                let mut merged = prev;
-                merged.value_len += curr.value_len;
-                merged.flags |= curr.flags;
-                write_desc_at(&mut self.data, self.num_blocks, i - 1, &merged);
-
-                for j in i..self.num_blocks - 1 {
-                    let d = read_desc_at(&self.data, self.num_blocks, j + 1);
-                    write_desc_at(&mut self.data, self.num_blocks, j, &d);
-                }
-                self.num_blocks -= 1;
-            } else {
-                i += 1;
-            }
-        }
+        self.with_slice_mut(|s| s.merge_contiguous_data());
     }
 
     pub fn write_h1_wire(&self, out: &mut [u8]) -> Result<usize, HtxError> {
-        self.as_ref().write_h1_wire(out)
+        self.as_slice().write_h1_wire(out)
+    }
+
+    #[must_use]
+    pub fn to_h1_wire(&self) -> Vec<u8> {
+        let mut out = vec![0u8; 8192];
+        let n = self.as_slice().write_h1_wire(&mut out).unwrap_or(0);
+        out.truncate(n);
+        out
     }
 }
 

@@ -36,7 +36,7 @@
 //! rather than the seam being invented later around whichever one arrives first.
 
 use crate::h1::H1Parser;
-use crate::htx::Htx;
+use crate::htx::HtxSlice;
 use std::io;
 
 /// Which implementation. Names are what a config or the runtime socket accepts.
@@ -118,13 +118,13 @@ pub trait HttpStream: Send {
     /// A framing violation. The caller must treat the message as unparseable rather than
     /// forwarding what was read so far -- a partially parsed request is how a desync
     /// starts.
-    fn parse(&mut self, input: &[u8], htx: &mut Htx) -> io::Result<usize>;
+    fn parse(&mut self, input: &[u8], htx: &mut HtxSlice<'_>) -> io::Result<usize>;
 
     /// Prepares for the next message on a kept-alive connection.
     fn reset(&mut self, is_response: bool);
 
     /// Called at EOF, for messages delimited by connection close.
-    fn finish(&mut self, htx: &mut Htx);
+    fn finish(&mut self, htx: &mut HtxSlice<'_>);
 
     /// True once the peer must not send another message on this connection.
     fn connection_close(&self) -> bool;
@@ -165,7 +165,7 @@ impl HttpParser for H1 {
 }
 
 impl HttpStream for H1Parser {
-    fn parse(&mut self, input: &[u8], htx: &mut Htx) -> io::Result<usize> {
+    fn parse(&mut self, input: &[u8], htx: &mut HtxSlice<'_>) -> io::Result<usize> {
         H1Parser::parse(self, input, htx)
     }
 
@@ -173,7 +173,7 @@ impl HttpStream for H1Parser {
         H1Parser::reset(self, is_response);
     }
 
-    fn finish(&mut self, htx: &mut Htx) {
+    fn finish(&mut self, htx: &mut HtxSlice<'_>) {
         H1Parser::finish(self, htx);
     }
 
@@ -299,18 +299,12 @@ impl DifferentialStream {
 }
 
 impl HttpStream for DifferentialStream {
-    fn parse(&mut self, input: &[u8], htx: &mut Htx) -> io::Result<usize> {
-        // Each parser gets its own output buffer. Handing them the same one would let the
-        // first to run change what the second sees, and then agreement would prove
-        // nothing.
-        let mut primary_htx = std::mem::take(htx);
-        let before = primary_htx.blocks().len();
-        let primary_res = self.primary.parse(input, &mut primary_htx);
+    fn parse(&mut self, input: &[u8], htx: &mut HtxSlice<'_>) -> io::Result<usize> {
+        // Primary parses directly into the caller's htx slice.
+        let primary_res = self.primary.parse(input, htx);
 
-        let mut candidate_htx = Htx::new();
-        for blk in &primary_htx.blocks()[..before] {
-            candidate_htx.push(blk.clone());
-        }
+        let mut candidate_buf = [0u8; 16384];
+        let mut candidate_htx = HtxSlice::new(&mut candidate_buf);
         let candidate_res = self.candidate.parse(input, &mut candidate_htx);
 
         // Compare before returning, so a disagreement is recorded even when both fail.
@@ -329,17 +323,20 @@ impl HttpStream for DifferentialStream {
             (Err(_), Err(_)) | (Ok(_), Ok(_)) => {}
         }
 
-        if primary_res.is_ok() && candidate_res.is_ok() && primary_htx != candidate_htx {
-            self.record(&format!(
-                "different blocks: {} produced {:?}, {} produced {:?}",
-                self.primary_name,
-                primary_htx.blocks(),
-                self.candidate_name,
-                candidate_htx.blocks()
-            ))?;
+        if primary_res.is_ok() && candidate_res.is_ok() {
+            let p_ref = htx.as_ref();
+            let c_ref = candidate_htx.as_ref();
+            if p_ref != c_ref {
+                self.record(&format!(
+                    "different blocks: {} produced {:?}, {} produced {:?}",
+                    self.primary_name,
+                    p_ref,
+                    self.candidate_name,
+                    c_ref
+                ))?;
+            }
         }
 
-        *htx = primary_htx;
         primary_res
     }
 
@@ -349,11 +346,12 @@ impl HttpStream for DifferentialStream {
         self.mismatches.clear();
     }
 
-    fn finish(&mut self, htx: &mut Htx) {
+    fn finish(&mut self, htx: &mut HtxSlice<'_>) {
         self.primary.finish(htx);
         // Deliberately given a throwaway buffer: `finish` appends an end-of-message to
         // whatever it is handed, and running both over one buffer would append it twice.
-        let mut scratch = Htx::new();
+        let mut scratch_buf = [0u8; 1024];
+        let mut scratch = HtxSlice::new(&mut scratch_buf);
         self.candidate.finish(&mut scratch);
     }
 
@@ -392,6 +390,9 @@ pub fn build(kind: ParserKind) -> Result<Box<dyn HttpParser>, String> {
              feature"
                 .to_string(),
         ),
+        #[cfg(feature = "haproxy-ffi")]
+        ParserKind::HaproxyFfi => Ok(Box::new(crate::ffi_h1::HaproxyFfiParser)),
+        #[cfg(not(feature = "haproxy-ffi"))]
         ParserKind::HaproxyFfi => Err(
             "parser 'haproxy-ffi' is not built into this binary: it needs the \
              `haproxy-ffi` feature and a build linked against the reference tree"

@@ -527,6 +527,7 @@ mod tests {
             http_req_rules: Vec::new(),
             http_res_rules: Vec::new(),
             http_after_res_rules: Vec::new(),
+            http_reuse: ibex_config::HttpReuse::default(),
         };
 
         let csv = format_show_stat(&[proxy], &[], 9999);

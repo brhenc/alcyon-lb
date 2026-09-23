@@ -66,6 +66,7 @@ pub mod actions;
 pub mod conn;
 pub mod endpoint;
 pub mod exp;
+pub mod ffi_h1;
 pub mod h1;
 pub mod parser;
 pub mod h2;

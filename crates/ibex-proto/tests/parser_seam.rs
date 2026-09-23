@@ -2,7 +2,7 @@
 
 //! The swappable-parser seam, and the differential that compares two of them.
 
-use ibex_proto::htx::{Htx, HtxBlock};
+use ibex_proto::htx::HtxSlice;
 use ibex_proto::parser::{self, Differential, HttpParser, HttpStream, OnMismatch, ParserKind, H1};
 use std::io;
 
@@ -14,10 +14,11 @@ fn the_builtin_parser_works_through_the_seam() {
     let p = parser::build(ParserKind::H1).expect("h1 must be built in");
     assert_eq!(p.name(), "h1");
     let mut s = p.stream(false);
-    let mut htx = Htx::new();
+    let mut buf = [0u8; 4096];
+    let mut htx = HtxSlice::new(&mut buf);
     let n = s.parse(GET, &mut htx).expect("parse");
     assert_eq!(n, GET.len());
-    assert!(matches!(htx.blocks().first(), Some(HtxBlock::ReqLine(_))));
+    assert!(htx.as_ref().req_line().is_some());
 }
 
 /// Names round-trip, and every name is listed whether or not it is built in.
@@ -36,7 +37,14 @@ fn every_parser_has_a_name_that_round_trips() {
 /// to reproduce a bug, or to A/B a candidate -- gets a different one and is told nothing.
 #[test]
 fn an_unavailable_parser_says_why() {
-    for k in [ParserKind::HtxFlat, ParserKind::Pingora, ParserKind::HaproxyFfi] {
+    let unavailable = vec![
+        ParserKind::HtxFlat,
+        ParserKind::Pingora,
+        #[cfg(not(feature = "haproxy-ffi"))]
+        ParserKind::HaproxyFfi,
+    ];
+    
+    for k in unavailable {
         let Err(err) = parser::build(k) else {
             panic!("{} must not be built in yet", k.as_str())
         };
@@ -46,7 +54,10 @@ fn an_unavailable_parser_says_why() {
             "the reason must distinguish unimplemented from not-compiled-in: {err}"
         );
     }
+    #[cfg(not(feature = "haproxy-ffi"))]
     assert_eq!(parser::available(), vec!["h1"]);
+    #[cfg(feature = "haproxy-ffi")]
+    assert_eq!(parser::available(), vec!["h1", "haproxy-ffi"]);
 }
 
 /// Two identical parsers agree on everything, and the result is unchanged.
@@ -54,14 +65,16 @@ fn an_unavailable_parser_says_why() {
 fn a_differential_of_two_identical_parsers_never_disagrees() {
     let d = Differential::new(Box::new(H1), Box::new(H1), OnMismatch::Reject);
     let mut s = d.stream(false);
-    let mut htx = Htx::new();
+    let mut buf = [0u8; 4096];
+    let mut htx = HtxSlice::new(&mut buf);
     let n = s.parse(GET, &mut htx).expect("identical parsers cannot disagree");
     assert_eq!(n, GET.len());
 
-    let mut direct = Htx::new();
+    let mut direct_buf = [0u8; 4096];
+    let mut direct = HtxSlice::new(&mut direct_buf);
     let mut plain = H1.stream(false);
     plain.parse(GET, &mut direct).expect("parse");
-    assert_eq!(htx, direct, "the differential must not alter the result");
+    assert_eq!(htx.as_ref(), direct.as_ref(), "the differential must not alter the result");
 }
 
 /// A parser that lies is caught, and `Reject` fails the message.
@@ -85,11 +98,11 @@ fn a_disagreement_is_detected_and_can_fail_the_message() {
         }
     }
     impl HttpStream for TruncatingStream {
-        fn parse(&mut self, input: &[u8], _htx: &mut Htx) -> io::Result<usize> {
+        fn parse(&mut self, input: &[u8], _htx: &mut HtxSlice<'_>) -> io::Result<usize> {
             Ok(input.len().saturating_sub(2))
         }
         fn reset(&mut self, _is_response: bool) {}
-        fn finish(&mut self, _htx: &mut Htx) {}
+        fn finish(&mut self, _htx: &mut HtxSlice<'_>) {}
         fn connection_close(&self) -> bool {
             false
         }
@@ -101,7 +114,8 @@ fn a_disagreement_is_detected_and_can_fail_the_message() {
     // Reject: the message fails.
     let d = Differential::new(Box::new(H1), Box::new(Truncating), OnMismatch::Reject);
     let mut s = d.stream(false);
-    let mut htx = Htx::new();
+    let mut buf = [0u8; 4096];
+    let mut htx = HtxSlice::new(&mut buf);
     let err = s
         .parse(GET, &mut htx)
         .expect_err("a disagreement must fail the message under Reject");
@@ -111,11 +125,12 @@ fn a_disagreement_is_detected_and_can_fail_the_message() {
     // recorded rather than acted on.
     let d = Differential::new(Box::new(H1), Box::new(Truncating), OnMismatch::Observe);
     let mut s = d.stream(false);
-    let mut htx = Htx::new();
+    let mut buf = [0u8; 4096];
+    let mut htx = HtxSlice::new(&mut buf);
     let n = s.parse(GET, &mut htx).expect("Observe must not fail the message");
     assert_eq!(n, GET.len(), "the primary's answer is the one used");
     assert!(
-        matches!(htx.blocks().first(), Some(HtxBlock::ReqLine(_))),
+        htx.as_ref().req_line().is_some(),
         "the primary's blocks are the ones kept"
     );
 }
@@ -139,17 +154,16 @@ fn the_parsers_do_not_share_an_output_buffer() {
         }
     }
     impl HttpStream for CheckingStream {
-        fn parse(&mut self, input: &[u8], htx: &mut Htx) -> io::Result<usize> {
+        fn parse(&mut self, input: &[u8], htx: &mut HtxSlice<'_>) -> io::Result<usize> {
             assert!(
-                htx.blocks().is_empty(),
-                "the candidate was shown the primary's output: {:?}",
-                htx.blocks()
+                htx.num_blocks() == 0,
+                "the candidate was shown the primary's output"
             );
             let mut inner = H1.stream(false);
             inner.parse(input, htx)
         }
         fn reset(&mut self, _r: bool) {}
-        fn finish(&mut self, _h: &mut Htx) {}
+        fn finish(&mut self, _h: &mut HtxSlice<'_>) {}
         fn connection_close(&self) -> bool {
             false
         }
@@ -159,7 +173,8 @@ fn the_parsers_do_not_share_an_output_buffer() {
     }
     let d = Differential::new(Box::new(H1), Box::new(Checking), OnMismatch::Reject);
     let mut s = d.stream(false);
-    let mut htx = Htx::new();
+    let mut buf = [0u8; 4096];
+    let mut htx = HtxSlice::new(&mut buf);
     s.parse(GET, &mut htx).expect("identical output must agree");
 }
 
@@ -180,12 +195,12 @@ fn connection_close_is_the_union_of_both() {
         }
     }
     impl HttpStream for AlwaysCloseStream {
-        fn parse(&mut self, input: &[u8], htx: &mut Htx) -> io::Result<usize> {
+        fn parse(&mut self, input: &[u8], htx: &mut HtxSlice<'_>) -> io::Result<usize> {
             let mut s = H1.stream(false);
             s.parse(input, htx)
         }
         fn reset(&mut self, _r: bool) {}
-        fn finish(&mut self, _h: &mut Htx) {}
+        fn finish(&mut self, _h: &mut HtxSlice<'_>) {}
         fn connection_close(&self) -> bool {
             true
         }
@@ -196,7 +211,8 @@ fn connection_close_is_the_union_of_both() {
 
     let d = Differential::new(Box::new(H1), Box::new(AlwaysClose), OnMismatch::Observe);
     let mut s = d.stream(false);
-    let mut htx = Htx::new();
+    let mut buf = [0u8; 4096];
+    let mut htx = HtxSlice::new(&mut buf);
     let _ = s.parse(GET, &mut htx);
     assert!(
         s.connection_close(),
@@ -210,7 +226,8 @@ fn reset_advances_both_parsers() {
     let d = Differential::new(Box::new(H1), Box::new(H1), OnMismatch::Reject);
     let mut s = d.stream(false);
     for _ in 0..3 {
-        let mut htx = Htx::new();
+        let mut buf = [0u8; 4096];
+        let mut htx = HtxSlice::new(&mut buf);
         let n = s.parse(GET, &mut htx).expect("parse");
         assert_eq!(n, GET.len());
         s.reset(false);

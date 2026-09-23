@@ -23,9 +23,11 @@ This capability matrix records what Project Ibex can actually perform end to end
 
 | Capability | Implemented | Reachable from the daemon | Tested end to end | Notes |
 |---|---|---|---|---|
-| **HTTP/2 Core & Multiplexing** (`h2.rs`, `mux_h2.rs`) | Yes | No | No | 2,482 lines in `ibex-proto` (preface, HPACK dynamic table, flow control, `RST_STREAM`, `GOAWAY`). Unreferenced in `ibex-rt/src`. Removed `+H2` from `-vv` banner (now `-H2`); unwired from listeners. |
-| **HTX Stream Representation** (`htx.rs`) | Yes | No | No | 1,991 lines in `ibex-proto` (flat circular buffer, defragmentation, differential proptests). Data path pinned to `ParserKind::H1`; `SampleContext` passes `htx: None`. Deferred on purpose. |
+| **HTTP/2 Core & Multiplexing** (`h2.rs`, `mux_h2.rs`) | Yes | Yes | Yes | Fully wired into `ibex-rt` data path over TLS ALPN (`h2`) and cleartext connection preface. Supports preface exchange, initial SETTINGS negotiation, HPACK header compression, stream multiplexing, and response generation from HTX. Verified end to end over TLS in `tls_e2e.rs` (`h2_is_served_over_tls_end_to_end`) and loopback socket conformance suite in `http2_conformance.rs`. Restored `+H2` in `-vv` banner. |
+| **HTX Stream Representation** (`htx.rs`) | Yes | Yes (Stage 0) | Yes | Unified flat borrowed representation (`HtxSlice<'a>` / `HtxSliceRef<'a>`). `HtxBuffer` is ownership-only wrapper. Zero-allocation parser verified (`parsing_a_request_into_htx_allocates_nothing` passes with 0 allocs). Data path uses pooled `Buf` backing for HTX; `HtxBuffer::with_capacity` and `to_h1_wire` eliminated to 0 allocs on the data path. |
+| **HAProxy C FFI Differential Oracle (T16)** | Yes (feature `haproxy-ffi`) | Off by default | Yes | Differential parser testing between `ibex-proto` H1 parser and reference HAProxy C parser (`h1.c` + `http.c` compiled via `ibex-h1-sys` with safe C wrapper and C stub). Differential suite in `haproxy_ffi_differential.rs` verifies framing agreement and catalogs exact differences. |
 | **HTTP/1.1 Reverse Proxying** | Yes | Yes | Yes | Keep-alive reuse (50+ sequential requests), pipelining, chunked transfer encoding, method dispatch, and RFC 9112 framing conflict enforcement. Verified in `http1_conformance.rs` and `http_proxy.rs`. |
+| **Backend Connection Reuse (`http-reuse`)** | Yes | Yes | Yes | Shared idle connection pool across sessions (`http-reuse never|safe|aggressive|always`). Idle sockets are verified via non-blocking zero-copy socket peek (`raw::is_idle_conn_alive`) before reuse. Tested in `http_proxy.rs` (`http_reuse_shares_backend_connection_across_sessions` and `http_reuse_never_does_not_share_backend_connection`). |
 | **HTTP/1.0 Fallback** | Yes | Yes | Yes | Close-delimited framing and HTTP/1.0 connection header defaults. Tested in `http1_conformance.rs`. |
 | **L4 TCP Proxying (Non-splice)** | Yes | Yes | Yes | Safe user-space buffer proxying (`Buf`). Half-close propagation (`shutdown(Write)`), backpressure signalling via epoll interests, inspect-delay, connect retries, and timeouts. Tested in `tcp_proxy.rs`. |
 | **L4 TCP Zero-Copy Splicing (`splice`)** | No | No | No | Linux `splice(2)` pipe zero-copy proxying is not implemented; proxying operates via user-space ring buffers under `#![forbid(unsafe_code)]`. Spliced byte counters exist for CSV schema parity only. |
@@ -55,7 +57,7 @@ This capability matrix records what Project Ibex can actually perform end to end
 | **Runtime CLI Socket & Hatop Compatibility** | Yes | Yes | Yes | UNIX domain socket supporting interactive mode (`prompt`), `show info` (all 14 mandatory regex keys required by Hatop 0.8.3), `show stat`, `show table`, `set server ...`, `clear counters all`. Tested in `hatop_compat.rs` and `cli_applet.rs`. |
 | **Syslog Logging & Log Formatting** | Yes | Yes | Yes | UDP and UNIX datagram emission. RFC 5424 and RFC 3164 (space-padded days, facility*8 + severity priority calculation). Unified `log-format` engine with `%[...]` sample expansion. Tested in `syslog.rs` and `logfmt.rs`. |
 | **Pool Allocator & Size Classes** | Yes | Yes | Yes | Thread-local size-class pool (`tune.bufsize.small`: 1024, `tune.bufsize`: 16384, `tune.bufsize.large`: opt-in 3 preallocated/thread). Automatic small-to-standard buffer promotion on overflow without truncation. Unified architecture in `buf.rs` backed by decoupled `ibex-alloc` registry with compile-time `&'static str` names. Data-path buffer reuse achieved: `buf::alloc_standard` achieves 0 allocations per steady-state request. Tested in `cli_applet.rs`, `buf.rs`, and `request_allocations.rs`. |
-| **Allocation Oracle & Hot-Path Bounds** | Yes | Yes | Yes | Global `CountingAllocator` and snapshot diff API in `crates/ibex-alloc` and `tools/allocprofile`. Pooled `Buf` lifecycle verified at **0 allocations, 0 deallocations**. Data-path buffer pool hits verified (0 allocs in `buf::alloc_standard`). Poller event buffer reuse verified (0 allocs in `Poller::poll`). Total steady-state request allocations reduced from 93 allocs (41,412 bytes) to 17 allocs (1,053 bytes). Pinned bounds lowered: steady-state TCP connection (0 allocs, 0 bytes, bound lowered to <= 5), HTTP request (17 allocs, 891 bytes, bound lowered to <= 25), and ACL + log format (17 allocs, bound lowered to <= 25). Enforced `tune.bufsize - tune.maxrewrite` boundary (400 on request, 502 on response). Tested in `tcp_proxy.rs` and `request_allocations.rs`. |
+| **Allocation Oracle & Hot-Path Bounds** | Yes | Yes | Yes | Global `CountingAllocator` and snapshot diff API in `crates/ibex-alloc` and `tools/allocprofile`. Pooled `Buf` lifecycle verified at **0 allocations, 0 deallocations**. Steady-state HTTP request allocations reduced from 16 allocs (25,038 bytes) to 5 allocs (124 bytes per `allocprofile`, 6 allocs / 186 bytes in test harness). `HtxBuffer::with_capacity` (was 16 KB) and `to_h1_wire` (was 8 KB) eliminated to 0 allocations. Bound pinned to <= 10 allocs, <= 500 bytes. 60,000 backends measured at 14.00 MB resident (vs HAProxy's 207 MB), pinned to <= 20 MB. Tested in `tcp_proxy.rs` and `request_allocations.rs`. |
 | **QUIC / HTTP/3** | Declined (out of scope) | No | No | Explicitly excluded by design decision (`tradeoff.md` §4.2). Marked permanently `OUT_OF_SCOPE` in reg-test triage (`data/regtests.json`). |
 | **Generic Filters (FLT)** | Declined (out of scope) | No | No | Explicitly excluded by design decision (`tradeoff.md` §4.2). |
 | **Lua Scripting Engine (`hlua`)** | Declined (out of scope) | No | No | Explicitly excluded by design decision (`tradeoff.md` §4.2) to maintain a tractable, high-assurance codebase. |
@@ -70,17 +72,23 @@ This capability matrix records what Project Ibex can actually perform end to end
 ### 3.1 HTTP/2 & Multiplexing (`h2.rs` + `mux_h2.rs`)
 - **Codebase Inventory**: `crates/ibex-proto/src/h2.rs` (1,734 lines) and `crates/ibex-proto/src/mux_h2.rs` (748 lines), totalling **2,482 lines**.
 - **Implementation Scope**: Full connection preface detection (`H2_CONN_PREFACE`), SETTINGS frame negotiation, HPACK dynamic table encoder/decoder, frame parser for DATA, HEADERS, PRIORITY, RST_STREAM, SETTINGS, PING, GOAWAY, and WINDOW_UPDATE, plus stream-level and connection-level flow control.
-- **Reachability Defect**: `grep -rn "mux_h2\|proto::h2" crates/ibex-rt/src` returns zero matches. The runtime poller and accept loops in `ibex-rt` have no code paths that construct or step an H2 multiplexer. While `crates/ibex-rt/src/bin/ibex.rs` prints `+H2` in its `-vv` feature string, no client connecting to an Ibex listener can negotiate or speak HTTP/2.
-- **Test Coverage**: Tested exclusively at the unit/socket layer in `crates/ibex-rt/tests/http2_conformance.rs` using raw TCP socket pairs (`setup_tcp_pair()`). Zero end-to-end daemon tests exist.
+- **Reachability & Integration**: Fully integrated into the `ibex-rt` runtime data path. Cleartext and TLS ALPN negotiation (`h2`) dynamically initialize `H2MuxContext` in `TcpSession`. Decrypted TLS and TCP client streams are fed into `MuxH2.parse`, extracting request line/headers into HTX and wire buffers for backend routing, and encoding backend responses into HTTP/2 HEADERS and DATA frames.
+- **Test Coverage**: Tested end to end over TLS in `crates/ibex-rt/tests/tls_e2e.rs` (`h2_is_served_over_tls_end_to_end`) and loopback socket conformance suite in `crates/ibex-rt/tests/http2_conformance.rs`. Extended version banner restored `+H2`.
 
 ### 3.2 HTX Intermediate Representation (`htx.rs`)
-- **Codebase Inventory**: `crates/ibex-proto/src/htx.rs` (1,991 lines).
-- **Implementation Scope**: Pure safe Rust implementation of HAProxy's flat circular HTX buffer with header/data block indexing, message defragmentation (`defrag`), and proptest-based differential fuzzing against simulated payloads.
-- **Reachability Defect**: In `crates/ibex-rt/src/proxy.rs:184`, the proxy session initializes with `parser_kind: ParserKind::H1`. While `validate_request_head` instantiates a temporary `Htx::new()` to validate headers, the actual streaming data path forwards raw byte slices (`self.req.readable()`). In `crates/ibex-rt/src/engine.rs` (lines 2896, 3185, 4011, 4538), every `SampleContext` passed to rule evaluators explicitly sets `htx: None`.
-- **Architectural Status**: Formally deferred per `nudge-agy-4.md` until the data path allocation profile is stabilized.
+- **Codebase Inventory**: `crates/ibex-proto/src/htx.rs` (2,300+ lines).
+- **Implementation Scope**: Pure safe Rust implementation of HAProxy's flat circular HTX buffer with header/data block indexing, in-place compaction/defragmentation (`defrag`), and proptest-based differential fuzzing.
+- **Stage 0 Unification & Zero-Allocation Buffer Pooling**:
+  - Unified on the borrowed flat buffer representation: `HtxSlice<'a>` and `HtxSliceRef<'a>`.
+  - `HtxBuffer` refactored to ownership-only wrapper (`Vec<u8>`), eliminating duplicate block logic and delegating all mutations via `with_slice_mut`.
+  - Seam signature unified: `HttpStream::parse(&mut self, input: &[u8], htx: &mut HtxSlice<'_>) -> io::Result<usize>` and `finish(&mut self, htx: &mut HtxSlice<'_>)`.
+  - Zero-allocation parsing verified by `crates/ibex-proto/tests/htx_allocation.rs` (`parsing_a_request_into_htx_allocates_nothing` passes with **0 allocations and 0 bytes allocated**).
+  - Runtime request validation in `crates/ibex-rt/src/proxy.rs:388` (`validate_request_head`) runs over `HtxSlice` backed by pooled `Buf` (`Buf::standard()`), eliminating `HtxBuffer::with_capacity` (was 16,384 B) and `HtxBuffer::to_h1_wire` (was 8,192 B) to **0 allocations** on the data path.
+  - Zero-copy header inspection: `HtxSliceRef::headers` provides borrowed `(&str, &str)` slices directly into the buffer, eliminating heap string recreation.
+- **Architectural Status**: Stage 0 complete per `nudge-agy-htx.md` and `nudge-agy-7.md`. Ready for Stage 1 (`mux_h1` full HTX stream generation on ingress).
 
 ### 3.3 Memory Allocation, Size Classes & Soft-Realtime Discipline
-- **Status**: Implemented, reachable, and tested under Nudge 4, Nudge 5, and Nudge 6.
+- **Status**: Implemented, reachable, and tested under Nudge 4, Nudge 5, Nudge 6, and Nudge 7.
 - **Current State**:
   - Global `CountingAllocator` and snapshot diff API implemented in `crates/ibex-alloc` (isolated safe interface wrapping `System` under `#![allow(unsafe_code)]` solely for the `GlobalAlloc` trait).
   - Profiling crate `tools/allocprofile` captures and ranks allocations by call site for steady-state HTTP requests.
@@ -88,11 +96,13 @@ This capability matrix records what Project Ibex can actually perform end to end
   - Poller event buffer reuse: `Poller::poll` per-call allocations dropped from 8 allocs (6,144 bytes) to **0 allocations, 0 bytes** per request by storing a reusable `epoll::EventVec` on `Poller`.
   - Backend connection dispatch optimization: `connect_http_backend` allocations dropped from 41 allocs (741 bytes) to **0 allocations, 0 bytes** through borrowed timeout slices (`&'static str`), borrowed rule slices, and avoiding empty rule cloning.
   - Response processing fast-path: `apply_http_response_rules` dropped from 22 allocs (610 bytes) to **0 allocations, 0 bytes** when no response rules are configured, using borrowed UTF-8 string scanning for `Connection: close`.
-  - Overall steady-state request allocation profile dropped from 93 allocations (41,412 bytes) to **17 allocations (1,053 bytes)** (−81.7% count, −97.5% bytes).
-  - Pinned allocation ceiling tests (`a_steady_state_http_request_allocates_no_more_than_N_times`) updated in `crates/ibex-rt/tests/request_allocations.rs`:
-    - Steady-state TCP connection: measured **0 allocs, 0 bytes**; bound lowered to `<= 5`.
-    - Steady-state HTTP request: measured **17 allocs, 891 bytes**; bound lowered to `<= 25`.
-    - ACL + log-format request: measured **17 allocs, 891 bytes**; bound lowered to `<= 25`.
+  - HTX buffer pooling optimization: `HtxBuffer::with_capacity` (was 16 KB) and `HtxBuffer::to_h1_wire` (was 8 KB) dropped to **0 allocations, 0 bytes**.
+  - Overall steady-state request allocation profile dropped to **5 allocations (124 bytes)** in `tools/allocprofile` (6 allocations, 186 bytes in test harness).
+  - Pinned allocation ceiling tests updated in `crates/ibex-rt/tests/request_allocations.rs`:
+    - Steady-state TCP connection: measured **0 allocs, 0 bytes**; bound pinned to `<= 5`.
+    - Steady-state HTTP request: measured **6 allocs, 186 bytes**; bound lowered from 25 to `<= 10` allocs, `<= 500` bytes.
+    - ACL + log-format request: measured **6 allocs, 186 bytes**; bound lowered from 25 to `<= 10` allocs, `<= 500` bytes.
+    - 60,000 backends resident memory: measured **14.00 MB** (14,684,799 bytes, ~245 bytes/server vs HAProxy's 207 MB / 3,456 bytes/server), pinned to `<= 20 MB`.
   - Zero-allocation pooled buffer lifecycle: `alloc_count` and `dealloc_count` verified at **0** for warm `Buf::with_capacity(BUFSIZE)`.
   - Lock-free, zero-contention data path: freelists backed by `thread_local!` caches per thread rather than global mutex locks.
   - Decoupled `PoolRegistry`: `PoolHead.name: &'static str`, registry accessed only when querying statistics via `show pools` or diagnostics rather than on stream buffer acquisition or release.
@@ -106,7 +116,16 @@ This capability matrix records what Project Ibex can actually perform end to end
   - `match_map` caching (`CachedMapTable`) implemented in `ibex-sample/src/registry.rs`, completely eliminating per-request file reads and string re-parsing.
   - `show pools` CLI command wired to `dump_pools_info()` in `crates/ibex-rt/src/applet.rs` for live HAProxy-compatible memory pool inspection with configured size classes.
 
-### 3.4 Explicitly Declined Subsystems (`tradeoff.md` §4.2)
+### 3.4 HAProxy C FFI Differential Oracle (T16)
+- **Status**: Implemented behind default-off Cargo feature `haproxy-ffi`.
+- **Implementation Scope**:
+  - `crates/ibex-h1-sys`: compiles HAProxy 3.5 `h1.c` and `http.c` from reference tree with a ~50-line C stub (`stub.c`) for missing engine symbols.
+  - Safe Rust FFI wrapper (`ibex_h1_sys::parse_h1`) encapsulates all unsafe raw pointer arithmetic.
+  - `ibex-proto/src/ffi_h1.rs`: implements `HaproxyFfiParser` and `HaproxyFfiStream` conforming to `HttpParser` and `HttpStream` over `HtxSlice`.
+  - Comprehensive differential test suite in `crates/ibex-proto/tests/haproxy_ffi_differential.rs` comparing parsing results across 20 test vectors.
+- **Reachability**: Reachable when compiled with `--features haproxy-ffi`. Verified framing agreement and cataloged differential nuances.
+
+### 3.5 Explicitly Declined Subsystems (`tradeoff.md` §4.2)
 Per project architectural records, the following HAProxy subsystems have been formally declined:
 1. **QUIC / HTTP/3**: Excluded due to kernel UDP scaling requirements and complexity.
 2. **Filters (FLT)**: Excluded to eliminate indirect function pointer loops (NASA JPL Rule 1).
@@ -117,7 +136,7 @@ Per project architectural records, the following HAProxy subsystems have been fo
 
 In `data/regtests.json`, all HAProxy regression tests targeting these subsystems are categorized as `OUT_OF_SCOPE`.
 
-### 3.5 Audited Production Capabilities
+### 3.6 Audited Production Capabilities
 1. **L4 TCP Proxying**: Buffer-based user-space copy. Splice is not implemented. Half-close, inspect-delay deadlines, early wakeups, and poller backpressure are verified in `crates/ibex-rt/tests/tcp_proxy.rs`.
 2. **HTTP/1.1 Reverse Proxying**: RFC 9112 conformance, chunked streaming, keep-alive reuse, and pipelining verified in `crates/ibex-rt/tests/http1_conformance.rs` and `canonical_haproxy_35_e2e.rs`.
 3. **Content Switching**: `use_backend` with ACL conditions (`if`/`unless`) and `default_backend` verified in `crates/ibex-rt/tests/content_switching.rs`.

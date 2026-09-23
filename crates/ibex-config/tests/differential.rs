@@ -745,3 +745,55 @@ fn test_tune_bufsize_validation() {
     assert_eq!(g.bufsize_large, Some(65552), "tune.bufsize.large must be rounded up to multiple of 16");
 }
 
+#[test]
+fn test_http_reuse_parsing() {
+    use ibex_config::HttpReuse;
+
+    let cfg_str = r"
+defaults
+    http-reuse safe
+
+backend be_inherited
+    server s1 127.0.0.1:8080
+
+backend be_override
+    http-reuse never
+    server s1 127.0.0.1:8080
+
+backend be_aggressive
+    http-reuse aggressive
+    server s1 127.0.0.1:8080
+
+backend be_always
+    http-reuse always
+    server s1 127.0.0.1:8080
+
+listen li_custom
+    bind :8081
+    http-reuse never
+    server s1 127.0.0.1:8080
+";
+
+    let cfg = parse_config(cfg_str).expect("Valid config with http-reuse must parse");
+    assert_eq!(
+        cfg.defaults.as_ref().unwrap().http_reuse,
+        Some(HttpReuse::Safe)
+    );
+    assert_eq!(cfg.backends[0].http_reuse, Some(HttpReuse::Safe));
+    assert_eq!(cfg.backends[1].http_reuse, Some(HttpReuse::Never));
+    assert_eq!(cfg.backends[2].http_reuse, Some(HttpReuse::Aggressive));
+    assert_eq!(cfg.backends[3].http_reuse, Some(HttpReuse::Always));
+    assert_eq!(cfg.listens[0].http_reuse, Some(HttpReuse::Never));
+
+    // Invalid strategy rejected
+    let invalid_cfg = "backend be\n    http-reuse invalid_strategy\n";
+    let res = parse_config(invalid_cfg);
+    assert!(res.is_err(), "Invalid http-reuse strategy must be rejected");
+    assert!(res.unwrap_err().message.contains("unknown http-reuse strategy"));
+
+    // Missing argument rejected
+    let missing_arg_cfg = "backend be\n    http-reuse\n";
+    let res2 = parse_config(missing_arg_cfg);
+    assert!(res2.is_err(), "Missing http-reuse argument must be rejected");
+}
+

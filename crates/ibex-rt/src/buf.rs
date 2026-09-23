@@ -505,6 +505,20 @@ impl Buf {
         self.len == self.data.len()
     }
 
+    /// Returns a shared slice of the entire underlying buffer allocation.
+    #[must_use]
+    #[inline]
+    pub fn raw_slice(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// Returns a mutable slice of the entire underlying buffer allocation.
+    #[must_use]
+    #[inline]
+    pub fn raw_slice_mut(&mut self) -> &mut [u8] {
+        &mut self.data
+    }
+
     /// Bytes available to read.
     #[must_use]
     #[inline]
