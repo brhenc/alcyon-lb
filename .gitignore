@@ -1,38 +1,82 @@
-# Cargo output. Not anchored: stray target/ dirs have been created by running
-# cargo inside crates/ibex-config and fuzz, and 79 MB of them reached the index.
+# ---------------------------------------------------------------------------
+# Build output
+# ---------------------------------------------------------------------------
+# Unanchored on purpose. `/target` only matched the workspace root, so stray
+# target/ dirs created by running cargo inside crates/ibex-config and fuzz put
+# 79 MB into the index before anyone noticed.
 target/
 **/*.rs.bk
+**/*.rmeta
+# agent sessions have dropped libshared_*.rlib in the repo root
+**/*.rlib
 **/*.profraw
 **/*.profdata
-.DS_Store
-.agy/
-__pycache__/
-*.pyc
 
-# Agent scratch. Background agents write throwaway fix-up scripts into the repo root;
-# these patterns keep them out of commits rather than relying on staging discipline.
-/fix_*.py
-/add_*.py
-/insert_*.py
-/*_fix.py
-/clippy_output.json
-/out.json
-# Agent probe files: throwaway crates/**/scratch*.rs used to test whether a dependency
-# resolves. They also block the next launch, because agy treats any uncommitted path as
-# the supervisor's and refuses to claim it.
-**/scratch*.rs
-/modify*.py
-/size_measure.rs
-/test_*.rs
-# allocprofile is standalone (outside the workspace), so it has its own lockfile/target
-/tools/allocprofile/target
-/tools/allocprofile/Cargo.lock
+# A workspace member must not carry its own Cargo.lock -- it is a sign someone
+# ran cargo inside the crate directory rather than at the root, which is also
+# how the stray target/ dirs appeared.
+crates/*/Cargo.lock
 
-# Stray build artefacts: agent sessions have dropped .rlib files in the repo root.
-*.rlib
-
-# perf(1) output: T39 leaves perf.data in the repo root. 107 MB, and GitLab refuses
-# blobs over 100 MB, so this one rejected a push of 49 other files.
+# ---------------------------------------------------------------------------
+# Profiling and capture artefacts
+# ---------------------------------------------------------------------------
+# `perf record` writes perf.data into the working directory. T39 left a 107 MB
+# one in the repo root and it rejected a push of 49 unrelated files, because
+# GitLab refuses blobs over 100 MB.
 perf.data
 perf.data.old
 *.perf
+# cargo-flamegraph's default output path
+/flamegraph.svg
+/perf.svg
+*.pcap
+*.pcapng
+core
+core.[0-9]*
+vgcore.*
+massif.out.*
+*.heaptrace
+
+# Checked-in flamegraphs under tools/ are deliverables and stay tracked; these
+# patterns only catch the ones that land wherever a tool happened to run.
+
+# ---------------------------------------------------------------------------
+# Agent scratch
+# ---------------------------------------------------------------------------
+# AGENTS.md rule 4 says temporary files go to /tmp. These patterns are the
+# backstop for when that is not followed, which so far is most rounds.
+/fix_*.py
+/add_*.py
+/insert_*.py
+/modify*.py
+/*_fix.py
+/patch.py
+/measure_*.sh
+/run_*.sh
+/clippy_output.json
+/out.json
+/results.json
+/strace_*.txt
+/*_build_time.txt
+/size_measure.rs
+/test_*.rs
+# throwaway crates/**/scratch*.rs used to probe a dependency
+**/scratch*.rs
+# agy session registry and logs; machine state, not source
+.agy/
+
+# ---------------------------------------------------------------------------
+# Standalone tool crates (outside the workspace, so they carry their own state)
+# ---------------------------------------------------------------------------
+/tools/allocprofile/target
+/tools/allocprofile/Cargo.lock
+
+# ---------------------------------------------------------------------------
+# Editors and platform noise
+# ---------------------------------------------------------------------------
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+*.swp
+*~
