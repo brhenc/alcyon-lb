@@ -42,6 +42,15 @@ cargo test -p ibex-rt --test tcp_request_rules 2>&1 | grep -E "^test |test resul
 cargo test -p ibex-rt --test tcp_request_tracking 2>&1 | grep -E "^test |test result"
 
 echo
+echo "=== the oracles that measure a port against the real thing ==="
+# A crate whose correctness is defined by a reference must be checked against it here,
+# not only in its own task. crates/slz was landed reporting SUCCESS while its only test
+# panicked on `serde_json::from_str` before comparing a single vector -- the struct named
+# `_in_len` where data/slz_vectors.json has `in_len`. It had never been run against the
+# oracle it exists for. A test nobody runs is a test nobody has.
+cargo test -p slz --test test_slz -- --nocapture 2>&1 | grep -E "EXACT MATCHES|ROUND TRIPS|test result"
+
+echo
 echo "=== does the rest still build and lint ==="
 cargo clippy -q --workspace --all-targets 2>&1 | grep -E "^(warning|error)" | grep -v generated | sort | uniq -c
 echo "clippy exit: ${PIPESTATUS[0]}"
