@@ -1233,6 +1233,125 @@ pub enum ResolvedTcpExpectPattern {
     RString(String),
 }
 
+impl ResolvedHttpExpectRule {
+    #[must_use]
+    pub fn matches(&self, status: u16, headers: &[(String, String)], body: &[u8]) -> bool {
+        let pattern_matched = match &self.pattern {
+            ResolvedHttpExpectPattern::Status(codes) => codes.contains(&status),
+            ResolvedHttpExpectPattern::StatusRange(low, high) => status >= *low && status <= *high,
+            ResolvedHttpExpectPattern::RStatus(pattern) => {
+                let status_str = status.to_string();
+                regex::Regex::new(pattern)
+                    .map(|re| re.is_match(&status_str))
+                    .unwrap_or(false)
+            }
+            ResolvedHttpExpectPattern::String(s) => {
+                let body_str = String::from_utf8_lossy(body);
+                body_str.contains(s.as_str())
+            }
+            ResolvedHttpExpectPattern::RString(pattern) => {
+                let body_str = String::from_utf8_lossy(body);
+                regex::Regex::new(pattern)
+                    .map(|re| re.is_match(&body_str))
+                    .unwrap_or(false)
+            }
+            ResolvedHttpExpectPattern::Hdr {
+                name,
+                match_type,
+                value,
+                value_match_type,
+            }
+            | ResolvedHttpExpectPattern::Fhdr {
+                name,
+                match_type,
+                value,
+                value_match_type,
+            } => {
+                let name_matches = |hname: &str| -> bool {
+                    match match_type {
+                        MatchType::Str => hname.eq_ignore_ascii_case(name),
+                        MatchType::Beg => {
+                            hname.to_ascii_lowercase().starts_with(&name.to_ascii_lowercase())
+                        }
+                        MatchType::End => {
+                            hname.to_ascii_lowercase().ends_with(&name.to_ascii_lowercase())
+                        }
+                        MatchType::Sub => {
+                            hname.to_ascii_lowercase().contains(&name.to_ascii_lowercase())
+                        }
+                        MatchType::Reg => regex::Regex::new(name)
+                            .map(|re| re.is_match(hname))
+                            .unwrap_or(false),
+                    }
+                };
+
+                let val_matches = |hval: &str, target_val: &str| -> bool {
+                    match value_match_type {
+                        MatchType::Str => {
+                            hval.split(',').any(|part| part.trim().eq_ignore_ascii_case(target_val))
+                                || hval.eq_ignore_ascii_case(target_val)
+                                || hval.contains(target_val)
+                        }
+                        MatchType::Beg => hval.split(',').any(|part| part.trim().starts_with(target_val)) || hval.starts_with(target_val),
+                        MatchType::End => hval.split(',').any(|part| part.trim().ends_with(target_val)) || hval.ends_with(target_val),
+                        MatchType::Sub => hval.contains(target_val),
+                        MatchType::Reg => regex::Regex::new(target_val)
+                            .map(|re| re.is_match(hval))
+                            .unwrap_or(false),
+                    }
+                };
+
+                headers.iter().any(|(hname, hval)| {
+                    if name_matches(hname) {
+                        if let Some(target_val) = value {
+                            val_matches(hval, target_val)
+                        } else {
+                            true
+                        }
+                    } else {
+                        false
+                    }
+                })
+            }
+        };
+
+        if self.negate {
+            !pattern_matched
+        } else {
+            pattern_matched
+        }
+    }
+}
+
+impl ResolvedTcpExpectPattern {
+    #[must_use]
+    pub fn matches(&self, data: &[u8]) -> bool {
+        match self {
+            ResolvedTcpExpectPattern::String(s) => {
+                let needle = s.as_bytes();
+                if needle.is_empty() {
+                    true
+                } else {
+                    data.windows(needle.len()).any(|w| w == needle)
+                }
+            }
+            ResolvedTcpExpectPattern::Binary(b) => {
+                if b.is_empty() {
+                    true
+                } else {
+                    data.windows(b.len()).any(|w| w == b.as_slice())
+                }
+            }
+            ResolvedTcpExpectPattern::RString(pattern) => {
+                let data_str = String::from_utf8_lossy(data);
+                regex::Regex::new(pattern)
+                    .map(|re| re.is_match(&data_str))
+                    .unwrap_or(false)
+            }
+        }
+    }
+}
+
 static RESOLVED_CHECKS: LazyLock<RwLock<HashMap<(usize, usize), ResolvedCheckConfig>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
