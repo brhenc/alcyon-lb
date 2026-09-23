@@ -308,6 +308,10 @@ fn parse_listen_header(
     let timeouts = defaults.map_or_else(TimeoutConfig::default, |d| d.timeouts);
 
     Ok(ListenSection {
+        httpchk: None,
+        http_checks: Vec::new(),
+        tcp_checks: Vec::new(),
+        tcp_check: false,
         name: id,
         addr,
         mode,
@@ -459,6 +463,10 @@ fn parse_backend_header(
     let timeouts = defaults.map_or_else(TimeoutConfig::default, |d| d.timeouts);
 
     Ok(BackendSection {
+        httpchk: None,
+        http_checks: Vec::new(),
+        tcp_checks: Vec::new(),
+        tcp_check: false,
         name: id,
         logs: Vec::new(),
         log_global: false,
@@ -1821,6 +1829,9 @@ fn parse_server(
     }
 
     servers.push(Server {
+        check_port: None,
+        check_proto: None,
+        check_ssl: false,
         id: tokens[1].text.clone(),
         addr,
         check,
