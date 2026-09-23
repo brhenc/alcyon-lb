@@ -33,21 +33,41 @@ being a measurement.
 
 ## Why the 216 fail
 
-| Cause | Count | Nature |
+Categorised from each result's `error_message`, not by pattern-matching the whole record.
+An earlier revision of this file reported 142 behavioural and ~70 config-surface; those
+numbers came from a categoriser that searched the serialised row and mis-attributed
+several buckets. These are the corrected counts.
+
+| Cause | Count |
+|---|---:|
+| **Behavioural**: parses, runs, wrong answer | **107** |
+| Config surface, total | **103** |
+| CLI: `Unknown command` from the runtime socket | 6 |
+
+Breaking the 103 down:
+
+| Config-surface cause | Count | Example |
 |---|---:|---|
-| Behavioural: parses, runs, wrong answer | **142** | the genuine debt |
-| Address forms: `fd@`, `unix@`, ABNS | 31 | config surface, mechanical |
-| Unknown keyword, ~18 distinct directives | ~40 | config surface, mechanical |
-| vtest `${PORT}` not substituted | 2 | harness |
+| `unknown http-request action <cache-use>` | 13 | `cache/basic.vtc` |
+| address form `stream+${h1_ssl_sock}` | 14 | `ssl/add_ssl_crt-list.vtc` |
+| `unknown keyword <log-format>` | 8 | `http-messaging/h1_authority_fragment_char.vtc` |
+| `unknown keyword <http-check>` | 5 | `checks/4be_1srv_smtpchk_httpchk_layer47errors.vtc` |
+| `invalid IP address` | 5 | `log/log_backend.vtc` |
+| `unknown keyword <tcp-check>` | 3 | `checks/tcp-check-ssl.vtc` |
+| `unknown keyword <capture>` | 3 | `http-capture/multiple_headers.vtc` |
+| address form `from` | 3 | `http-rules/default_rules.vtc` |
+| `unknown balance algorithm` | 3 | `server/cli_add_server.vtc` |
+| ~14 further keywords and actions | 1–2 each | `hash-preserve-affinity`, `unique-id-format`, `wait-for-body`, `set-retries`, `set-dst-port`, `do-resolve`, `reject`, … |
 
-The unknown keywords, by how many tests each blocks: `log-format` 8, `http-check` 5,
-`tcp-check` 3, `capture` 3, then `use-server`, `unique-id-format`, `tcp-response`,
-`errorfile`, `ring`, `guid`, `hash-preserve-affinity`, `force-be-switch`, `monitor-uri`,
-`http-error`, `external-check`, `unique-id-header` at one or two apiece.
+So the split is close to even: **roughly half the board never reaches Ibex's behaviour**,
+and the other half is genuine behavioural debt. That is a better position than the raw
+10/312 suggests, and a worse one than "it is all parser stubs" would.
 
-So roughly **70 of the 216 never reach Ibex's behaviour at all** — they die at the config
-parser or on an address form. That part is mechanical and unblocks a third of the board.
-The remaining 142 are real.
+**Thirteen of those failures are `cache-use`**, and the cache is declined in `tradeoff.md`
+§4.2. They are being counted as failures when they should be skips — the harness honours
+`.if feature(...)` gates but does not consult the `OUT_OF_SCOPE` triage in
+`data/regtests.json`. Same for several others. The failure count is inflated by an unknown
+amount for that reason, which is a harness defect, not an Ibex one.
 
 ## The honest denominator
 
