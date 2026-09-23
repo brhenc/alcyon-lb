@@ -5,15 +5,16 @@ use std::io::Read;
 use flate2::bufread::{DeflateDecoder, GzDecoder, ZlibDecoder};
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct Vector {
     name: String,
     format: String,
     level: i32,
     in_hex: String,
     out_hex: String,
-    _in_len: usize,
+    in_len: usize,
     out_len: usize,
-    _crc32: u32,
+    crc32: u32,
 }
 
 fn hex_to_bytes(s: &str) -> Vec<u8> {
