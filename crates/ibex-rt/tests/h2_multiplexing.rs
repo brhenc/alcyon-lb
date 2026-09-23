@@ -455,3 +455,665 @@ fn settings_flood_triggers_goaway_enhance_your_calm() {
         "SETTINGS flood must trigger a GOAWAY frame from the daemon"
     );
 }
+
+/// An HTTP/1 backend that records every complete request header block it receives.
+fn spawn_backend_full() -> (u16, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind backend");
+    let port = listener.local_addr().expect("addr").port();
+    let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    thread::spawn(move || {
+        for conn in listener.incoming().take(8) {
+            let Ok(mut c) = conn else { continue };
+            let sink = Arc::clone(&sink);
+            thread::spawn(move || {
+                c.set_read_timeout(Some(Duration::from_secs(3))).ok();
+                let mut buf: Vec<u8> = Vec::new();
+                let mut tmp = [0u8; 4096];
+                while let Ok(n) = c.read(&mut tmp) {
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    while let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head: Vec<u8> = buf.drain(..p + 4).collect();
+                        let header_text = String::from_utf8_lossy(&head).to_string();
+                        sink.lock().expect("lock").push(header_text);
+                        let _ = c.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+                        );
+                    }
+                }
+            });
+        }
+    });
+    (port, seen)
+}
+
+fn hpack_get_with_authority_and_headers(
+    path: &str,
+    authority: &str,
+    extra_headers: &[(&str, &str)],
+) -> Vec<u8> {
+    let mut v = vec![0x82, 0x86]; // :method: GET, :scheme: http
+    v.push(0x04);
+    v.push(u8::try_from(path.len()).expect("short path"));
+    v.extend_from_slice(path.as_bytes());
+    v.push(0x01);
+    v.push(u8::try_from(authority.len()).expect("short authority"));
+    v.extend_from_slice(authority.as_bytes());
+    for (name, val) in extra_headers {
+        v.push(0x00);
+        v.push(u8::try_from(name.len()).expect("short name"));
+        v.extend_from_slice(name.as_bytes());
+        v.push(u8::try_from(val.len()).expect("short val"));
+        v.extend_from_slice(val.as_bytes());
+    }
+    v
+}
+
+fn hpack_get_with_unknown_pseudo(path: &str, pseudo_name: &str, pseudo_val: &str) -> Vec<u8> {
+    let mut v = vec![0x82, 0x86];
+    v.push(0x04);
+    v.push(u8::try_from(path.len()).expect("short path"));
+    v.extend_from_slice(path.as_bytes());
+    v.push(0x01);
+    v.push(9);
+    v.extend_from_slice(b"localhost");
+    v.push(0x00);
+    v.push(u8::try_from(pseudo_name.len()).expect("short name"));
+    v.extend_from_slice(pseudo_name.as_bytes());
+    v.push(u8::try_from(pseudo_val.len()).expect("short val"));
+    v.extend_from_slice(pseudo_val.as_bytes());
+    v
+}
+
+fn hpack_get_pseudo_after_regular(path: &str) -> Vec<u8> {
+    let mut v = vec![0x82]; // :method: GET
+    // Regular header: x-custom: test
+    v.push(0x00);
+    v.push(8);
+    v.extend_from_slice(b"x-custom");
+    v.push(4);
+    v.extend_from_slice(b"test");
+    // Pseudo header after regular: :scheme: http (0x86)
+    v.push(0x86);
+    // :path
+    v.push(0x04);
+    v.push(u8::try_from(path.len()).expect("short path"));
+    v.extend_from_slice(path.as_bytes());
+    // :authority
+    v.push(0x01);
+    v.push(9);
+    v.extend_from_slice(b"localhost");
+    v
+}
+
+fn hpack_get_duplicate_pseudo(path: &str) -> Vec<u8> {
+    let mut v = vec![0x82, 0x82, 0x86]; // Duplicate :method GET
+    v.push(0x04);
+    v.push(u8::try_from(path.len()).expect("short path"));
+    v.extend_from_slice(path.as_bytes());
+    v.push(0x01);
+    v.push(9);
+    v.extend_from_slice(b"localhost");
+    v
+}
+
+fn recv_h2_frames(s: &mut TcpStream, timeout: Duration) -> Vec<(u8, u8, u32, Vec<u8>)> {
+    s.set_read_timeout(Some(timeout)).ok();
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 1024];
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        match s.read(&mut tmp) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+        }
+    }
+    let mut frames = Vec::new();
+    let mut i = 0;
+    while i + 9 <= buf.len() {
+        let len = ((buf[i] as usize) << 16) | ((buf[i + 1] as usize) << 8) | (buf[i + 2] as usize);
+        let ftype = buf[i + 3];
+        let flags = buf[i + 4];
+        let sid = u32::from_be_bytes([buf[i + 5] & 0x7f, buf[i + 6], buf[i + 7], buf[i + 8]]);
+        if i + 9 + len > buf.len() {
+            break;
+        }
+        let payload = buf[i + 9..i + 9 + len].to_vec();
+        frames.push((ftype, flags, sid, payload));
+        i += 9 + len;
+    }
+    frames
+}
+
+/// Exactly one Host header matching :authority reaches the HTTP/1.1 backend,
+/// and zero pseudo-headers (starting with ':') reach the backend.
+#[test]
+fn exactly_one_host_matching_authority_and_no_colon_headers_reach_backend() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (backend_port, seen) = spawn_backend_full();
+    let port = free_port();
+    let cfg = std::env::temp_dir().join(format!("ibex_h2pseudo_norm_{}.cfg", std::process::id()));
+    std::fs::write(
+        &cfg,
+        format!(
+            "defaults\n\tmode http\n\ttimeout connect 3s\n\ttimeout client 10s\n\t\
+             timeout server 10s\n\n\
+             frontend fe\n\tbind 127.0.0.1:{port}\n\tdefault_backend be\n\n\
+             backend be\n\tserver s1 127.0.0.1:{backend_port}\n"
+        ),
+    )
+    .expect("write config");
+
+    let _d = Daemon(
+        Command::new(ibex_bin())
+            .arg("-f")
+            .arg(&cfg)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn ibex"),
+    );
+    assert!(wait_for_port(port), "the daemon never listened on {port}");
+
+    let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    s.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").expect("preface");
+    s.write_all(&frame(0x04, 0, 0, &[])).expect("settings");
+
+    let payload = hpack_get_with_authority_and_headers(
+        "/probe",
+        "example.com",
+        &[("user-agent", "curl/8.18.0"), ("accept", "*/*")],
+    );
+    s.write_all(&frame(0x01, 0x05, 1, &payload)).expect("headers");
+    s.flush().ok();
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if !seen.lock().expect("lock").is_empty() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    let got = seen.lock().expect("lock").clone();
+    let _ = std::fs::remove_file(&cfg);
+
+    assert_eq!(
+        got.len(),
+        1,
+        "backend must receive exactly 1 request, got {got:?}"
+    );
+
+    let raw_req = &got[0];
+    let lines: Vec<&str> = raw_req.lines().collect();
+    assert_eq!(lines[0], "GET /probe HTTP/1.1");
+
+    let mut host_count = 0;
+    let mut host_val = None;
+    let mut colon_headers = Vec::new();
+
+    for line in &lines[1..] {
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((name, val)) = line.split_once(':') {
+            let name_trimmed = name.trim();
+            if name_trimmed.starts_with(':') {
+                colon_headers.push(line.to_string());
+            }
+            if name_trimmed.eq_ignore_ascii_case("host") {
+                host_count += 1;
+                host_val = Some(val.trim().to_string());
+            }
+        }
+    }
+
+    assert_eq!(
+        host_count, 1,
+        "backend must receive exactly one Host header; received: {raw_req:?}"
+    );
+    assert_eq!(
+        host_val,
+        Some("example.com".to_string()),
+        "Host header value must match :authority 'example.com'; received: {raw_req:?}"
+    );
+    assert!(
+        colon_headers.is_empty(),
+        "no headers starting with ':' may reach the backend; found: {colon_headers:?}"
+    );
+}
+
+/// Agreeing Host and :authority is accepted and forwarded with a single Host header.
+#[test]
+fn agreeing_host_and_authority_is_accepted_and_forwarded_with_single_host() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (backend_port, seen) = spawn_backend_full();
+    let port = free_port();
+    let cfg = std::env::temp_dir().join(format!("ibex_h2agree_{}.cfg", std::process::id()));
+    std::fs::write(
+        &cfg,
+        format!(
+            "defaults\n\tmode http\n\ttimeout connect 3s\n\ttimeout client 10s\n\t\
+             timeout server 10s\n\n\
+             frontend fe\n\tbind 127.0.0.1:{port}\n\tdefault_backend be\n\n\
+             backend be\n\tserver s1 127.0.0.1:{backend_port}\n"
+        ),
+    )
+    .expect("write config");
+
+    let _d = Daemon(
+        Command::new(ibex_bin())
+            .arg("-f")
+            .arg(&cfg)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn ibex"),
+    );
+    assert!(wait_for_port(port), "the daemon never listened on {port}");
+
+    let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    s.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").expect("preface");
+    s.write_all(&frame(0x04, 0, 0, &[])).expect("settings");
+
+    let payload = hpack_get_with_authority_and_headers(
+        "/agree",
+        "example.com",
+        &[("host", "example.com")],
+    );
+    s.write_all(&frame(0x01, 0x05, 1, &payload)).expect("headers");
+    s.flush().ok();
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if !seen.lock().expect("lock").is_empty() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    let got = seen.lock().expect("lock").clone();
+    let _ = std::fs::remove_file(&cfg);
+
+    assert_eq!(
+        got.len(),
+        1,
+        "agreeing Host and :authority must be accepted; got {got:?}"
+    );
+
+    let raw_req = &got[0];
+    let host_headers: Vec<&str> = raw_req
+        .lines()
+        .filter(|l| l.to_ascii_lowercase().starts_with("host:"))
+        .collect();
+    assert_eq!(
+        host_headers.len(),
+        1,
+        "backend must receive exactly 1 host header; received: {raw_req:?}"
+    );
+}
+
+/// Disagreeing Host vs :authority is rejected with `RST_STREAM` (RFC 9113 §8.3.1).
+#[test]
+fn disagreeing_host_and_authority_is_rejected_with_rst_stream() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (backend_port, seen) = spawn_backend_full();
+    let port = free_port();
+    let cfg = std::env::temp_dir().join(format!("ibex_h2disagree_{}.cfg", std::process::id()));
+    std::fs::write(
+        &cfg,
+        format!(
+            "defaults\n\tmode http\n\ttimeout connect 3s\n\ttimeout client 10s\n\t\
+             timeout server 10s\n\n\
+             frontend fe\n\tbind 127.0.0.1:{port}\n\tdefault_backend be\n\n\
+             backend be\n\tserver s1 127.0.0.1:{backend_port}\n"
+        ),
+    )
+    .expect("write config");
+
+    let _d = Daemon(
+        Command::new(ibex_bin())
+            .arg("-f")
+            .arg(&cfg)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn ibex"),
+    );
+    assert!(wait_for_port(port), "the daemon never listened on {port}");
+
+    let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    s.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").expect("preface");
+    s.write_all(&frame(0x04, 0, 0, &[])).expect("settings");
+
+    let payload = hpack_get_with_authority_and_headers(
+        "/disagree",
+        "example.com",
+        &[("host", "evil.com")],
+    );
+    s.write_all(&frame(0x01, 0x05, 1, &payload)).expect("headers");
+    s.flush().ok();
+
+    let frames = recv_h2_frames(&mut s, Duration::from_secs(1));
+    let _ = std::fs::remove_file(&cfg);
+
+    let has_rst = frames.iter().any(|(ftype, _, sid, pld)| {
+        *ftype == 0x03 && *sid == 1 && pld.len() >= 4 && u32::from_be_bytes([pld[0], pld[1], pld[2], pld[3]]) == 1
+    });
+
+    assert!(
+        has_rst,
+        "disagreeing Host vs :authority must trigger RST_STREAM (PROTOCOL_ERROR=1) on stream 1; frames received: {frames:?}"
+    );
+
+    let got = seen.lock().expect("lock").clone();
+    assert!(
+        got.is_empty(),
+        "disagreeing Host vs :authority must not reach backend; backend saw: {got:?}"
+    );
+}
+
+/// Unknown pseudo-header (e.g. :custom) is rejected with `RST_STREAM` (RFC 9113 §8.3).
+#[test]
+fn unknown_pseudo_header_is_rejected_with_rst_stream() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (backend_port, seen) = spawn_backend_full();
+    let port = free_port();
+    let cfg = std::env::temp_dir().join(format!("ibex_h2unknown_pseudo_{}.cfg", std::process::id()));
+    std::fs::write(
+        &cfg,
+        format!(
+            "defaults\n\tmode http\n\ttimeout connect 3s\n\ttimeout client 10s\n\t\
+             timeout server 10s\n\n\
+             frontend fe\n\tbind 127.0.0.1:{port}\n\tdefault_backend be\n\n\
+             backend be\n\tserver s1 127.0.0.1:{backend_port}\n"
+        ),
+    )
+    .expect("write config");
+
+    let _d = Daemon(
+        Command::new(ibex_bin())
+            .arg("-f")
+            .arg(&cfg)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn ibex"),
+    );
+    assert!(wait_for_port(port), "the daemon never listened on {port}");
+
+    let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    s.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").expect("preface");
+    s.write_all(&frame(0x04, 0, 0, &[])).expect("settings");
+
+    let payload = hpack_get_with_unknown_pseudo("/unknown", ":custom", "value");
+    s.write_all(&frame(0x01, 0x05, 1, &payload)).expect("headers");
+    s.flush().ok();
+
+    let frames = recv_h2_frames(&mut s, Duration::from_secs(1));
+    let _ = std::fs::remove_file(&cfg);
+
+    let has_rst = frames.iter().any(|(ftype, _, sid, pld)| {
+        *ftype == 0x03 && *sid == 1 && pld.len() >= 4 && u32::from_be_bytes([pld[0], pld[1], pld[2], pld[3]]) == 1
+    });
+
+    assert!(
+        has_rst,
+        "unknown pseudo-header must trigger RST_STREAM (PROTOCOL_ERROR=1) on stream 1; frames received: {frames:?}"
+    );
+
+    let got = seen.lock().expect("lock").clone();
+    assert!(
+        got.is_empty(),
+        "unknown pseudo-header must not reach backend; backend saw: {got:?}"
+    );
+}
+
+/// Pseudo-header appearing after regular header is rejected with `RST_STREAM` (RFC 9113 §8.3).
+#[test]
+fn pseudo_header_after_regular_header_is_rejected_with_rst_stream() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (backend_port, seen) = spawn_backend_full();
+    let port = free_port();
+    let cfg = std::env::temp_dir().join(format!("ibex_h2pseudo_after_reg_{}.cfg", std::process::id()));
+    std::fs::write(
+        &cfg,
+        format!(
+            "defaults\n\tmode http\n\ttimeout connect 3s\n\ttimeout client 10s\n\t\
+             timeout server 10s\n\n\
+             frontend fe\n\tbind 127.0.0.1:{port}\n\tdefault_backend be\n\n\
+             backend be\n\tserver s1 127.0.0.1:{backend_port}\n"
+        ),
+    )
+    .expect("write config");
+
+    let _d = Daemon(
+        Command::new(ibex_bin())
+            .arg("-f")
+            .arg(&cfg)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn ibex"),
+    );
+    assert!(wait_for_port(port), "the daemon never listened on {port}");
+
+    let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    s.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").expect("preface");
+    s.write_all(&frame(0x04, 0, 0, &[])).expect("settings");
+
+    let payload = hpack_get_pseudo_after_regular("/after_reg");
+    s.write_all(&frame(0x01, 0x05, 1, &payload)).expect("headers");
+    s.flush().ok();
+
+    let frames = recv_h2_frames(&mut s, Duration::from_secs(1));
+    let _ = std::fs::remove_file(&cfg);
+
+    let has_rst = frames.iter().any(|(ftype, _, sid, pld)| {
+        *ftype == 0x03 && *sid == 1 && pld.len() >= 4 && u32::from_be_bytes([pld[0], pld[1], pld[2], pld[3]]) == 1
+    });
+
+    assert!(
+        has_rst,
+        "pseudo-header after regular header must trigger RST_STREAM (PROTOCOL_ERROR=1) on stream 1; frames received: {frames:?}"
+    );
+
+    let got = seen.lock().expect("lock").clone();
+    assert!(
+        got.is_empty(),
+        "pseudo-header after regular header must not reach backend; backend saw: {got:?}"
+    );
+}
+
+/// Duplicate pseudo-header (e.g. duplicate :method) is rejected with `RST_STREAM` (RFC 9113 §8.3).
+#[test]
+fn duplicate_pseudo_header_is_rejected_with_rst_stream() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (backend_port, seen) = spawn_backend_full();
+    let port = free_port();
+    let cfg = std::env::temp_dir().join(format!("ibex_h2dup_pseudo_{}.cfg", std::process::id()));
+    std::fs::write(
+        &cfg,
+        format!(
+            "defaults\n\tmode http\n\ttimeout connect 3s\n\ttimeout client 10s\n\t\
+             timeout server 10s\n\n\
+             frontend fe\n\tbind 127.0.0.1:{port}\n\tdefault_backend be\n\n\
+             backend be\n\tserver s1 127.0.0.1:{backend_port}\n"
+        ),
+    )
+    .expect("write config");
+
+    let _d = Daemon(
+        Command::new(ibex_bin())
+            .arg("-f")
+            .arg(&cfg)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn ibex"),
+    );
+    assert!(wait_for_port(port), "the daemon never listened on {port}");
+
+    let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    s.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").expect("preface");
+    s.write_all(&frame(0x04, 0, 0, &[])).expect("settings");
+
+    let payload = hpack_get_duplicate_pseudo("/dup");
+    s.write_all(&frame(0x01, 0x05, 1, &payload)).expect("headers");
+    s.flush().ok();
+
+    let frames = recv_h2_frames(&mut s, Duration::from_secs(1));
+    let _ = std::fs::remove_file(&cfg);
+
+    let has_rst = frames.iter().any(|(ftype, _, sid, pld)| {
+        *ftype == 0x03 && *sid == 1 && pld.len() >= 4 && u32::from_be_bytes([pld[0], pld[1], pld[2], pld[3]]) == 1
+    });
+
+    assert!(
+        has_rst,
+        "duplicate pseudo-header must trigger RST_STREAM (PROTOCOL_ERROR=1) on stream 1; frames received: {frames:?}"
+    );
+
+    let got = seen.lock().expect("lock").clone();
+    assert!(
+        got.is_empty(),
+        "duplicate pseudo-header must not reach backend; backend saw: {got:?}"
+    );
+}
+
+/// Compares received backend headers between HAProxy oracle and Ibex for an identical HTTP/2 request.
+#[test]
+fn h2_backend_headers_match_haproxy_reference_oracle() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let oracle_bin = std::path::PathBuf::from("/home/bhenc/reference/haproxy-quic/haproxy");
+    let haproxy_bin = if oracle_bin.exists() {
+        oracle_bin
+    } else {
+        std::path::PathBuf::from("/home/bhenc/reference/haproxy/haproxy")
+    };
+    if !haproxy_bin.exists() {
+        return;
+    }
+
+    // 1. Run HAProxy
+    let (haproxy_be_port, haproxy_seen) = spawn_backend_full();
+    let haproxy_port = free_port();
+    let haproxy_cfg = std::env::temp_dir().join(format!("haproxy_diff_{}.cfg", std::process::id()));
+    std::fs::write(
+        &haproxy_cfg,
+        format!(
+            "global\n\ttune.h2.fe.glitches-threshold 100\n\ndefaults\n\tmode http\n\ttimeout connect 3s\n\ttimeout client 10s\n\t\
+             timeout server 10s\n\n\
+             frontend fe\n\tbind 127.0.0.1:{haproxy_port} proto h2\n\tdefault_backend be\n\n\
+             backend be\n\tserver s1 127.0.0.1:{haproxy_be_port}\n"
+        ),
+    )
+    .expect("write haproxy cfg");
+
+    let _d_haproxy = Daemon(
+        Command::new(&haproxy_bin)
+            .arg("-f")
+            .arg(&haproxy_cfg)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn haproxy"),
+    );
+    assert!(wait_for_port(haproxy_port), "haproxy never listened on {haproxy_port}");
+
+    let mut s_haproxy = TcpStream::connect(("127.0.0.1", haproxy_port)).expect("connect haproxy");
+    s_haproxy.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").expect("preface");
+    s_haproxy.write_all(&frame(0x04, 0, 0, &[])).expect("settings");
+
+    let payload = hpack_get_with_authority_and_headers(
+        "/probe",
+        "example.com",
+        &[("user-agent", "curl/8.18.0"), ("accept", "*/*")],
+    );
+    s_haproxy.write_all(&frame(0x01, 0x05, 1, &payload)).expect("headers");
+    s_haproxy.flush().ok();
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if !haproxy_seen.lock().expect("lock").is_empty() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let haproxy_got = haproxy_seen.lock().expect("lock").clone();
+    let _ = std::fs::remove_file(&haproxy_cfg);
+
+    // 2. Run Ibex
+    let (ibex_be_port, ibex_seen) = spawn_backend_full();
+    let ibex_port = free_port();
+    let ibex_cfg = std::env::temp_dir().join(format!("ibex_diff_{}.cfg", std::process::id()));
+    std::fs::write(
+        &ibex_cfg,
+        format!(
+            "defaults\n\tmode http\n\ttimeout connect 3s\n\ttimeout client 10s\n\t\
+             timeout server 10s\n\n\
+             frontend fe\n\tbind 127.0.0.1:{ibex_port}\n\tdefault_backend be\n\n\
+             backend be\n\tserver s1 127.0.0.1:{ibex_be_port}\n"
+        ),
+    )
+    .expect("write ibex cfg");
+
+    let _d_ibex = Daemon(
+        Command::new(ibex_bin())
+            .arg("-f")
+            .arg(&ibex_cfg)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn ibex"),
+    );
+    assert!(wait_for_port(ibex_port), "ibex never listened on {ibex_port}");
+
+    let mut s_ibex = TcpStream::connect(("127.0.0.1", ibex_port)).expect("connect ibex");
+    s_ibex.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").expect("preface");
+    s_ibex.write_all(&frame(0x04, 0, 0, &[])).expect("settings");
+    s_ibex.write_all(&frame(0x01, 0x05, 1, &payload)).expect("headers");
+    s_ibex.flush().ok();
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if !ibex_seen.lock().expect("lock").is_empty() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let ibex_got = ibex_seen.lock().expect("lock").clone();
+    let _ = std::fs::remove_file(&ibex_cfg);
+
+    assert_eq!(haproxy_got.len(), 1, "HAProxy must produce 1 request");
+    assert_eq!(ibex_got.len(), 1, "Ibex must produce 1 request");
+
+    let parse_hdrs = |raw: &str| -> (String, Vec<(String, String)>) {
+        let lines: Vec<&str> = raw.lines().collect();
+        let req_line = lines.first().copied().unwrap_or("").to_string();
+        let mut hdrs = Vec::new();
+        for line in &lines[1..] {
+            if line.is_empty() {
+                continue;
+            }
+            if let Some((k, v)) = line.split_once(':') {
+                hdrs.push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
+            }
+        }
+        hdrs.sort();
+        (req_line, hdrs)
+    };
+
+    let (haproxy_req, haproxy_hdrs) = parse_hdrs(&haproxy_got[0]);
+    let (ibex_req, ibex_hdrs) = parse_hdrs(&ibex_got[0]);
+
+    assert_eq!(ibex_req, haproxy_req, "Request lines must match");
+    assert_eq!(
+        ibex_hdrs, haproxy_hdrs,
+        "Forwarded HTTP/1.1 headers between Ibex and HAProxy oracle must match identically.\nIbex saw: {:?}\nHAProxy saw: {:?}",
+        ibex_got[0], haproxy_got[0]
+    );
+}

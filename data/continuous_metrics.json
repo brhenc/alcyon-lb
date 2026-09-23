@@ -1,0 +1,332 @@
+{
+  "timestamp": "2026-09-23T18:50:35.980533+00:00",
+  "git": {
+    "commit": "e22b854bcc81dcf1eedc4e8d92f2cfc7dd34d2b3",
+    "commit_short": "e22b854b",
+    "branch": "main",
+    "subject": "tasks: T35 converters redone, T36 health checks, T37 backend TLS"
+  },
+  "allocations": {
+    "status": "success",
+    "allocations_per_request": 5,
+    "bytes_per_request": 132,
+    "call_sites": [
+      {
+        "count": 2,
+        "bytes": 12,
+        "site": "<ibex_rt::proxy::TcpSession>::process_cli_io"
+      },
+      {
+        "count": 1,
+        "bytes": 32,
+        "site": "<alloc::vec::Vec<usize> as alloc::vec::spec_from_iter_nested::SpecFromIterNested<usize, core::iter::adapters::filter::Filter<core::ops::range::Range<usize>, <ibex_rt::engine::Proxy>::eligible_server_indices::{closure#1}>>>::from_iter"
+      },
+      {
+        "count": 1,
+        "bytes": 48,
+        "site": "<alloc::boxed::Box<ibex_proto::h1::H1Parser>>::new"
+      },
+      {
+        "count": 1,
+        "bytes": 40,
+        "site": "<no ibex frame>"
+      }
+    ],
+    "duration_seconds": 3.23,
+    "raw_output": "===== 5 allocations, 132 bytes, ranked by call site =====\n   2        12B  <ibex_rt::proxy::TcpSession>::process_cli_io\n   1        32B  <alloc::vec::Vec<usize> as alloc::vec::spec_from_iter_nested::SpecFromIterNested<usize, core::iter::adapters::filter::Filter<core::ops::range::Range<usize>, <ibex_rt::engine::Proxy>::eligible_server_indices::{closure#1}>>>::from_iter\n   1        48B  <alloc::boxed::Box<ibex_proto::h1::H1Parser>>::new\n   1        40B  <no ibex frame>"
+  },
+  "benchmark": {
+    "status": "success",
+    "duration_seconds": 8.25,
+    "bench_allocs_per_req": 5.0,
+    "bench_bytes_per_req": 124.0,
+    "rps_1_conn": 13013,
+    "rps_50_conn": 34769
+  },
+  "vtc": {
+    "status": "success",
+    "duration_seconds": 190.65,
+    "exit_code": 0,
+    "total": 312,
+    "passed": 7,
+    "failed": 164,
+    "skipped": 89,
+    "out_of_scope": 52,
+    "in_scope_run": 171,
+    "in_scope_total": 171,
+    "in_scope_pass_pct": 4.09,
+    "categories": {
+      "balance": {
+        "total": 5,
+        "PASS": 1,
+        "FAIL": 3,
+        "SKIP": 0,
+        "OUT_OF_SCOPE": 1
+      },
+      "cache": {
+        "total": 14,
+        "PASS": 0,
+        "FAIL": 0,
+        "SKIP": 1,
+        "OUT_OF_SCOPE": 13
+      },
+      "checks": {
+        "total": 25,
+        "PASS": 0,
+        "FAIL": 21,
+        "SKIP": 1,
+        "OUT_OF_SCOPE": 3
+      },
+      "compression": {
+        "total": 5,
+        "PASS": 0,
+        "FAIL": 0,
+        "SKIP": 5,
+        "OUT_OF_SCOPE": 0
+      },
+      "connection": {
+        "total": 19,
+        "PASS": 0,
+        "FAIL": 11,
+        "SKIP": 2,
+        "OUT_OF_SCOPE": 6
+      },
+      "contrib": {
+        "total": 1,
+        "PASS": 0,
+        "FAIL": 0,
+        "SKIP": 1,
+        "OUT_OF_SCOPE": 0
+      },
+      "converter": {
+        "total": 25,
+        "PASS": 1,
+        "FAIL": 24,
+        "SKIP": 0,
+        "OUT_OF_SCOPE": 0
+      },
+      "decompression": {
+        "total": 5,
+        "PASS": 0,
+        "FAIL": 0,
+        "SKIP": 5,
+        "OUT_OF_SCOPE": 0
+      },
+      "filters": {
+        "total": 1,
+        "PASS": 0,
+        "FAIL": 0,
+        "SKIP": 1,
+        "OUT_OF_SCOPE": 0
+      },
+      "http-capture": {
+        "total": 1,
+        "PASS": 0,
+        "FAIL": 1,
+        "SKIP": 0,
+        "OUT_OF_SCOPE": 0
+      },
+      "http-cookies": {
+        "total": 2,
+        "PASS": 0,
+        "FAIL": 1,
+        "SKIP": 0,
+        "OUT_OF_SCOPE": 1
+      },
+      "http-errorfiles": {
+        "total": 5,
+        "PASS": 0,
+        "FAIL": 5,
+        "SKIP": 0,
+        "OUT_OF_SCOPE": 0
+      },
+      "http-messaging": {
+        "total": 24,
+        "PASS": 2,
+        "FAIL": 7,
+        "SKIP": 4,
+        "OUT_OF_SCOPE": 11
+      },
+      "http-rules": {
+        "total": 22,
+        "PASS": 2,
+        "FAIL": 17,
+        "SKIP": 1,
+        "OUT_OF_SCOPE": 2
+      },
+      "jwt": {
+        "total": 2,
+        "PASS": 0,
+        "FAIL": 1,
+        "SKIP": 1,
+        "OUT_OF_SCOPE": 0
+      },
+      "log": {
+        "total": 11,
+        "PASS": 0,
+        "FAIL": 11,
+        "SKIP": 0,
+        "OUT_OF_SCOPE": 0
+      },
+      "lua": {
+        "total": 10,
+        "PASS": 0,
+        "FAIL": 0,
+        "SKIP": 10,
+        "OUT_OF_SCOPE": 0
+      },
+      "mailers": {
+        "total": 1,
+        "PASS": 0,
+        "FAIL": 0,
+        "SKIP": 1,
+        "OUT_OF_SCOPE": 0
+      },
+      "mcli": {
+        "total": 3,
+        "PASS": 0,
+        "FAIL": 0,
+        "SKIP": 1,
+        "OUT_OF_SCOPE": 2
+      },
+      "peers": {
+        "total": 4,
+        "PASS": 0,
+        "FAIL": 0,
+        "SKIP": 0,
+        "OUT_OF_SCOPE": 4
+      },
+      "protobuf": {
+        "total": 1,
+        "PASS": 0,
+        "FAIL": 0,
+        "SKIP": 0,
+        "OUT_OF_SCOPE": 1
+      },
+      "proxy": {
+        "total": 3,
+        "PASS": 0,
+        "FAIL": 3,
+        "SKIP": 0,
+        "OUT_OF_SCOPE": 0
+      },
+      "qmux": {
+        "total": 2,
+        "PASS": 0,
+        "FAIL": 0,
+        "SKIP": 2,
+        "OUT_OF_SCOPE": 0
+      },
+      "quic": {
+        "total": 30,
+        "PASS": 0,
+        "FAIL": 0,
+        "SKIP": 30,
+        "OUT_OF_SCOPE": 0
+      },
+      "resolvers": {
+        "total": 1,
+        "PASS": 0,
+        "FAIL": 0,
+        "SKIP": 0,
+        "OUT_OF_SCOPE": 1
+      },
+      "sample_fetches": {
+        "total": 12,
+        "PASS": 1,
+        "FAIL": 11,
+        "SKIP": 0,
+        "OUT_OF_SCOPE": 0
+      },
+      "seamless-reload": {
+        "total": 1,
+        "PASS": 0,
+        "FAIL": 0,
+        "SKIP": 0,
+        "OUT_OF_SCOPE": 1
+      },
+      "server": {
+        "total": 11,
+        "PASS": 0,
+        "FAIL": 8,
+        "SKIP": 0,
+        "OUT_OF_SCOPE": 3
+      },
+      "spoe": {
+        "total": 1,
+        "PASS": 0,
+        "FAIL": 0,
+        "SKIP": 0,
+        "OUT_OF_SCOPE": 1
+      },
+      "ssl": {
+        "total": 47,
+        "PASS": 0,
+        "FAIL": 25,
+        "SKIP": 22,
+        "OUT_OF_SCOPE": 0
+      },
+      "startup": {
+        "total": 3,
+        "PASS": 0,
+        "FAIL": 3,
+        "SKIP": 0,
+        "OUT_OF_SCOPE": 0
+      },
+      "stats": {
+        "total": 3,
+        "PASS": 0,
+        "FAIL": 3,
+        "SKIP": 0,
+        "OUT_OF_SCOPE": 0
+      },
+      "stick-table": {
+        "total": 3,
+        "PASS": 0,
+        "FAIL": 3,
+        "SKIP": 0,
+        "OUT_OF_SCOPE": 0
+      },
+      "stickiness": {
+        "total": 2,
+        "PASS": 0,
+        "FAIL": 0,
+        "SKIP": 0,
+        "OUT_OF_SCOPE": 2
+      },
+      "stream": {
+        "total": 4,
+        "PASS": 0,
+        "FAIL": 4,
+        "SKIP": 0,
+        "OUT_OF_SCOPE": 0
+      },
+      "tcp-rules": {
+        "total": 1,
+        "PASS": 0,
+        "FAIL": 1,
+        "SKIP": 0,
+        "OUT_OF_SCOPE": 0
+      },
+      "webstats": {
+        "total": 2,
+        "PASS": 0,
+        "FAIL": 1,
+        "SKIP": 1,
+        "OUT_OF_SCOPE": 0
+      }
+    }
+  },
+  "prometheus": {
+    "status": "success",
+    "duration_seconds": 0.99,
+    "exit_code": 0,
+    "ibex_metrics_count": 42,
+    "haproxy_metrics_count": 227,
+    "coverage_pct": 18.5,
+    "render_alloc_count": 0,
+    "render_bytes_allocated": 0,
+    "differential_test_passed": true,
+    "allocations_test_passed": true
+  }
+}

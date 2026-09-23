@@ -834,7 +834,7 @@ fn test_tcp_request_connection_reject_and_silent_drop() {
         thread::sleep(Duration::from_millis(5));
     }
     assert_eq!(
-        engine.proxies[0].stats.denied_conn, 1,
+        engine.proxies[0].stats[0].denied_conn.load(std::sync::atomic::Ordering::Relaxed), 1,
         "tcp-request connection reject must increment denied_conn"
     );
 
@@ -862,7 +862,7 @@ fn test_tcp_request_connection_reject_and_silent_drop() {
         thread::sleep(Duration::from_millis(5));
     }
     assert_eq!(
-        engine2.proxies[0].stats.denied_conn, 1,
+        engine2.proxies[0].stats[0].denied_conn.load(std::sync::atomic::Ordering::Relaxed), 1,
         "tcp-request connection silent-drop must increment denied_conn"
     );
 }
@@ -893,7 +893,7 @@ fn test_tcp_request_session_reject_and_silent_drop() {
         thread::sleep(Duration::from_millis(5));
     }
     assert_eq!(
-        engine.proxies[0].stats.denied_req, 1,
+        engine.proxies[0].stats[0].denied_req.load(std::sync::atomic::Ordering::Relaxed), 1,
         "tcp-request session reject must increment denied_req"
     );
 
@@ -921,7 +921,7 @@ fn test_tcp_request_session_reject_and_silent_drop() {
         thread::sleep(Duration::from_millis(5));
     }
     assert_eq!(
-        engine2.proxies[0].stats.denied_req, 1,
+        engine2.proxies[0].stats[0].denied_req.load(std::sync::atomic::Ordering::Relaxed), 1,
         "tcp-request session silent-drop must increment denied_req"
     );
 }
@@ -953,7 +953,7 @@ fn test_tcp_request_content_reject_and_silent_drop() {
         thread::sleep(Duration::from_millis(5));
     }
     assert_eq!(
-        engine.proxies[0].stats.denied_req, 1,
+        engine.proxies[0].stats[0].denied_req.load(std::sync::atomic::Ordering::Relaxed), 1,
         "tcp-request content reject must increment denied_req"
     );
 
@@ -982,7 +982,7 @@ fn test_tcp_request_content_reject_and_silent_drop() {
         thread::sleep(Duration::from_millis(5));
     }
     assert_eq!(
-        engine2.proxies[0].stats.denied_req, 1,
+        engine2.proxies[0].stats[0].denied_req.load(std::sync::atomic::Ordering::Relaxed), 1,
         "tcp-request content silent-drop must increment denied_req"
     );
 }

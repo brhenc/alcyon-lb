@@ -66,7 +66,7 @@ pub fn render(stats: &StatsSnapshot, out: &mut String) {
         let _ = writeln!(
             out,
             "haproxy_frontend_current_sessions{{proxy=\"{0}\"}} {1}",
-            proxy.name, proxy.stats.act_conn
+            proxy.name, proxy.stats.iter().map(|s| s.act_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u32>()
         );
     }
 
@@ -76,7 +76,7 @@ pub fn render(stats: &StatsSnapshot, out: &mut String) {
         let _ = writeln!(
             out,
             "haproxy_frontend_max_sessions{{proxy=\"{0}\"}} {1}",
-            proxy.name, proxy.stats.max_conn
+            proxy.name, proxy.stats.iter().map(|s| s.max_conn.load(std::sync::atomic::Ordering::Relaxed)).max().unwrap_or(0)
         );
     }
 
@@ -88,7 +88,7 @@ pub fn render(stats: &StatsSnapshot, out: &mut String) {
         let _ = writeln!(
             out,
             "haproxy_frontend_sessions_total{{proxy=\"{0}\"}} {1}",
-            proxy.name, proxy.stats.cum_conn
+            proxy.name, proxy.stats.iter().map(|s| s.cum_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()
         );
     }
 
@@ -98,7 +98,7 @@ pub fn render(stats: &StatsSnapshot, out: &mut String) {
         let _ = writeln!(
             out,
             "haproxy_frontend_bytes_in_total{{proxy=\"{0}\"}} {1}",
-            proxy.name, proxy.stats.bytes_in
+            proxy.name, proxy.stats.iter().map(|s| s.bytes_in.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()
         );
     }
 
@@ -108,7 +108,7 @@ pub fn render(stats: &StatsSnapshot, out: &mut String) {
         let _ = writeln!(
             out,
             "haproxy_frontend_bytes_out_total{{proxy=\"{0}\"}} {1}",
-            proxy.name, proxy.stats.bytes_out
+            proxy.name, proxy.stats.iter().map(|s| s.bytes_out.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()
         );
     }
 
@@ -118,7 +118,7 @@ pub fn render(stats: &StatsSnapshot, out: &mut String) {
         let _ = writeln!(
             out,
             "haproxy_frontend_requests_denied_total{{proxy=\"{0}\"}} {1}",
-            proxy.name, proxy.stats.denied_req
+            proxy.name, proxy.stats.iter().map(|s| s.denied_req.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()
         );
     }
 
@@ -128,7 +128,7 @@ pub fn render(stats: &StatsSnapshot, out: &mut String) {
         let _ = writeln!(
             out,
             "haproxy_frontend_responses_denied_total{{proxy=\"{0}\"}} {1}",
-            proxy.name, proxy.stats.denied_resp
+            proxy.name, proxy.stats.iter().map(|s| s.denied_resp.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()
         );
     }
 
@@ -138,7 +138,7 @@ pub fn render(stats: &StatsSnapshot, out: &mut String) {
         let _ = writeln!(
             out,
             "haproxy_frontend_denied_connections_total{{proxy=\"{0}\"}} {1}",
-            proxy.name, proxy.stats.denied_conn
+            proxy.name, proxy.stats.iter().map(|s| s.denied_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()
         );
     }
 
@@ -166,7 +166,7 @@ pub fn render(stats: &StatsSnapshot, out: &mut String) {
         let _ = writeln!(
             out,
             "haproxy_backend_current_sessions{{proxy=\"{0}\"}} {1}",
-            proxy.name, proxy.stats.act_conn
+            proxy.name, proxy.stats.iter().map(|s| s.act_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u32>()
         );
     }
 
@@ -176,7 +176,7 @@ pub fn render(stats: &StatsSnapshot, out: &mut String) {
         let _ = writeln!(
             out,
             "haproxy_backend_max_sessions{{proxy=\"{0}\"}} {1}",
-            proxy.name, proxy.stats.max_conn
+            proxy.name, proxy.stats.iter().map(|s| s.max_conn.load(std::sync::atomic::Ordering::Relaxed)).max().unwrap_or(0)
         );
     }
 
@@ -188,7 +188,7 @@ pub fn render(stats: &StatsSnapshot, out: &mut String) {
         let _ = writeln!(
             out,
             "haproxy_backend_sessions_total{{proxy=\"{0}\"}} {1}",
-            proxy.name, proxy.stats.cum_conn
+            proxy.name, proxy.stats.iter().map(|s| s.cum_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()
         );
     }
 
@@ -198,7 +198,7 @@ pub fn render(stats: &StatsSnapshot, out: &mut String) {
         let _ = writeln!(
             out,
             "haproxy_backend_bytes_in_total{{proxy=\"{0}\"}} {1}",
-            proxy.name, proxy.stats.bytes_in
+            proxy.name, proxy.stats.iter().map(|s| s.bytes_in.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()
         );
     }
 
@@ -208,7 +208,7 @@ pub fn render(stats: &StatsSnapshot, out: &mut String) {
         let _ = writeln!(
             out,
             "haproxy_backend_bytes_out_total{{proxy=\"{0}\"}} {1}",
-            proxy.name, proxy.stats.bytes_out
+            proxy.name, proxy.stats.iter().map(|s| s.bytes_out.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()
         );
     }
 
@@ -218,7 +218,7 @@ pub fn render(stats: &StatsSnapshot, out: &mut String) {
         let _ = writeln!(
             out,
             "haproxy_backend_requests_denied_total{{proxy=\"{0}\"}} {1}",
-            proxy.name, proxy.stats.denied_req
+            proxy.name, proxy.stats.iter().map(|s| s.denied_req.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()
         );
     }
 
@@ -228,7 +228,7 @@ pub fn render(stats: &StatsSnapshot, out: &mut String) {
         let _ = writeln!(
             out,
             "haproxy_backend_responses_denied_total{{proxy=\"{0}\"}} {1}",
-            proxy.name, proxy.stats.denied_resp
+            proxy.name, proxy.stats.iter().map(|s| s.denied_resp.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()
         );
     }
 
@@ -298,7 +298,7 @@ pub fn render(stats: &StatsSnapshot, out: &mut String) {
                 "haproxy_server_current_sessions{{proxy=\"{0}\",server=\"{1}\"}} {2}",
                 proxy.name,
                 srv_name,
-                proxy.server_actconn.get(s_idx).copied().unwrap_or(0)
+                proxy.server_actconn.get(s_idx).map(|a| a.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0)
             );
         }
     }
@@ -581,20 +581,14 @@ pub fn render(stats: &StatsSnapshot, out: &mut String) {
                 c.status == ServerStatus::Up
             } else {
                 proxy
-                    .server_statuses
-                    .get(s_idx)
-                    .copied()
-                    .unwrap_or(ServerStatus::Up)
+                    .server_statuses.get(s_idx).map(|s| ServerStatus::from(s.load(std::sync::atomic::Ordering::Relaxed))).unwrap_or(ServerStatus::Up)
                     == ServerStatus::Up
             };
             let is_down = if let Some(c) = _check_state {
                 c.status == ServerStatus::Down
             } else {
                 proxy
-                    .server_statuses
-                    .get(s_idx)
-                    .copied()
-                    .unwrap_or(ServerStatus::Up)
+                    .server_statuses.get(s_idx).map(|s| ServerStatus::from(s.load(std::sync::atomic::Ordering::Relaxed))).unwrap_or(ServerStatus::Up)
                     == ServerStatus::Down
             };
             let _ = writeln!(

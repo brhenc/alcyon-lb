@@ -598,6 +598,33 @@ fn main() {
     // 7. Diagnostic reporting
     report_diagnostics(&opts);
 
+    // 7.5 Daemon mode
+    if opts.daemon_mode && env::var("IBEX_DAEMON_CHILD").is_err() {
+        let exe = env::current_exe().unwrap_or_else(|_| PathBuf::from(&program));
+        let mut cmd = process::Command::new(exe);
+        cmd.args(env::args().skip(1));
+        cmd.env("IBEX_DAEMON_CHILD", "1");
+        cmd.stdin(process::Stdio::null());
+        cmd.stdout(process::Stdio::null());
+        cmd.stderr(process::Stdio::null());
+        match cmd.spawn() {
+            Ok(child) => {
+                if let Some(ref pidfile) = opts.pid_file {
+                    if let Err(err) = std::fs::write(pidfile, format!("{}\n", child.id())) {
+                        eprintln!("Cannot create pidfile '{}': {}", pidfile.display(), err);
+                        process::exit(1);
+                    }
+                }
+                process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("Failed to daemonize: {e}");
+                process::exit(1);
+            }
+        }
+    }
+
+
     // 8. Write PID file if requested (-p <pidfile>)
     if let Some(ref pidfile) = opts.pid_file {
         handle_pid_file(pidfile);
@@ -647,57 +674,60 @@ fn main() {
     }
 
     // 13. Initialize Ibex soft-realtime engine
+    
     let capacity = opts.maxconn.unwrap_or(65536) as usize;
-    let mut engine = match Engine::new(&config, capacity) {
-        Ok(eng) => eng,
+    let nbthread = config.global.as_ref().and_then(|g| g.nbthread).unwrap_or(1) as usize;
+
+    let shared_proxies = match Engine::build_shared_state(&config, nbthread) {
+        Ok(p) => p,
         Err(err) => {
-            eprintln!("Failed to initialize Ibex engine: {err}");
+            eprintln!("Failed to build shared state: {err}");
             process::exit(1);
         }
     };
 
-    // The runtime socket may come from `-S <path>` or, as HAProxy and every hatop
-    // tutorial do it, from `global stats socket <path>` in the config file. The config
-    // fields were parsed and then never read, so a config-only setup silently produced
-    // no socket at all and hatop had nothing to connect to. The flag wins when both
-    // are given.
     let cli_socket: Option<PathBuf> = opts.stats_socket.clone().or_else(|| {
-        config
-            .global
-            .as_ref()
-            .and_then(|g| g.stats_socket.as_ref())
-            .map(PathBuf::from)
+        config.global.as_ref().and_then(|g| g.stats_socket.as_ref()).map(PathBuf::from)
     });
+    
+    let stats_socket_mode = config.global.as_ref().and_then(|g| g.stats_socket_mode);
 
-    if let Some(ref sock_path) = cli_socket {
-        if let Err(err) = engine.bind_cli_socket(sock_path) {
-            eprintln!(
-                "Failed to bind CLI / stats socket '{}': {err}",
-                sock_path.display()
-            );
-            process::exit(1);
-        }
+    let mut threads = Vec::new();
+    for worker_id in 0..nbthread {
+        let config_clone = config.clone();
+        let proxies_clone = shared_proxies.clone();
+        let cli_socket_clone = cli_socket.clone();
 
-        // `stats socket <path> mode <octal>` sets the socket's permissions. It matters:
-        // this socket can disable servers and change weights, so a world-writable one
-        // is a privilege escalation waiting to happen.
-        if opts.stats_socket.is_none() {
-            if let Some(mode) = config.global.as_ref().and_then(|g| g.stats_socket_mode) {
-                use std::os::unix::fs::PermissionsExt;
-                if let Err(err) =
-                    std::fs::set_permissions(sock_path, std::fs::Permissions::from_mode(mode))
-                {
-                    eprintln!(
-                        "Warning: could not set mode {mode:o} on '{}': {err}",
-                        sock_path.display()
-                    );
+        let t = std::thread::spawn(move || {
+            let mut engine = match Engine::new_worker(&config_clone, capacity, worker_id, proxies_clone) {
+                Ok(eng) => eng,
+                Err(err) => {
+                    eprintln!("Failed to initialize Ibex engine (worker {}): {}", worker_id, err);
+                    process::exit(1);
+                }
+            };
+
+            if worker_id == 0 {
+                if let Some(ref sock_path) = cli_socket_clone {
+                    if let Err(err) = engine.bind_cli_socket(sock_path) {
+                        eprintln!("Failed to bind CLI / stats socket '{}': {}", sock_path.display(), err);
+                        process::exit(1);
+                    }
+                    if let Some(mode) = stats_socket_mode {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = std::fs::set_permissions(sock_path, std::fs::Permissions::from_mode(mode));
+                    }
                 }
             }
-        }
+            if let Err(err) = engine.run_loop() {
+                eprintln!("Engine error (worker {}): {}", worker_id, err);
+                process::exit(1);
+            }
+        });
+        threads.push(t);
     }
 
-    if let Err(err) = engine.run_loop() {
-        eprintln!("Engine error: {err}");
-        process::exit(1);
+    for t in threads {
+        let _ = t.join();
     }
 }

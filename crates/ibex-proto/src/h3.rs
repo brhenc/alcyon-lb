@@ -1,4 +1,4 @@
-use crate::htx::{HeaderField, HtxBlock, HttpMethod, HttpVersion, RequestLine, ResponseLine};
+use crate::htx::{HeaderField, HttpVersion, HtxBlock};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum H3Error {
@@ -93,42 +93,66 @@ pub fn parse_frame<'a>(data: &'a [u8], offset: &mut usize) -> Result<Frame<'a>, 
     }
 }
 
-pub fn headers_to_htx(decoded_headers: Vec<HeaderField>) -> Vec<HtxBlock> {
-    let mut method = None;
-    let mut path = None;
-    let mut status = None;
-    let mut regular_headers = Vec::new();
+pub fn headers_to_htx(decoded_headers: Vec<HeaderField>) -> Result<Vec<HtxBlock>, H3Error> {
+    crate::htx::pseudo_headers_to_htx(decoded_headers, HttpVersion::Http30)
+        .map_err(|_| H3Error::MessageError)
+}
 
-    for h in decoded_headers {
-        match h.name.as_str() {
-            ":method" => method = Some(HttpMethod::from_bytes(h.value.as_bytes())),
-            ":path" => path = Some(h.value),
-            ":status" => status = h.value.parse::<u16>().ok(),
-            _ => regular_headers.push(h),
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::htx::{HttpMethod, Htx};
+
+    #[test]
+    fn h3_headers_to_htx_request() {
+        let headers = vec![
+            HeaderField { name: ":method".into(), value: "GET".into() },
+            HeaderField { name: ":scheme".into(), value: "https".into() },
+            HeaderField { name: ":path".into(), value: "/quic".into() },
+            HeaderField { name: ":authority".into(), value: "h3.example.com".into() },
+            HeaderField { name: "user-agent".into(), value: "curl/8.18.0".into() },
+        ];
+        let blocks = headers_to_htx(headers).expect("valid h3 request");
+        let mut htx = Htx::new();
+        for b in blocks {
+            htx.push(b);
         }
+        let req = htx.req_line().expect("req_line");
+        assert_eq!(req.method, HttpMethod::Get);
+        assert_eq!(req.uri, "/quic");
+        assert_eq!(req.version, HttpVersion::Http30);
+        assert_eq!(htx.get_header("host"), Some("h3.example.com"));
+        assert_eq!(htx.get_header(":scheme"), None);
+        assert_eq!(htx.get_header(":authority"), None);
+
+        let wire = htx.to_h1_wire();
+        let wire_str = String::from_utf8(wire).expect("utf8");
+        assert!(wire_str.starts_with("GET /quic HTTP/1.1\r\n"));
+        assert!(wire_str.contains("host: h3.example.com\r\n"));
     }
 
-    let mut blocks = Vec::new();
+    #[test]
+    fn h3_headers_to_htx_errors() {
+        // Unknown pseudo header
+        let res = headers_to_htx(vec![
+            HeaderField { name: ":custom".into(), value: "bad".into() },
+        ]);
+        assert_eq!(res, Err(H3Error::MessageError));
 
-    if let Some(m) = method {
-        let uri = path.unwrap_or_else(|| "/".to_string());
-        blocks.push(HtxBlock::ReqLine(RequestLine {
-            method: m,
-            uri,
-            version: HttpVersion::Http20,
-        }));
-    } else if let Some(st) = status {
-        blocks.push(HtxBlock::ResLine(ResponseLine {
-            version: HttpVersion::Http20,
-            status: st,
-            reason: String::new(),
-        }));
-    }
+        // Pseudo after regular
+        let res = headers_to_htx(vec![
+            HeaderField { name: ":method".into(), value: "GET".into() },
+            HeaderField { name: "host".into(), value: "example.com".into() },
+            HeaderField { name: ":path".into(), value: "/".into() },
+        ]);
+        assert_eq!(res, Err(H3Error::MessageError));
 
-    for h in regular_headers {
-        blocks.push(HtxBlock::Header(h));
+        // Authority and host mismatch
+        let res = headers_to_htx(vec![
+            HeaderField { name: ":method".into(), value: "GET".into() },
+            HeaderField { name: ":authority".into(), value: "example.com".into() },
+            HeaderField { name: "host".into(), value: "evil.com".into() },
+        ]);
+        assert_eq!(res, Err(H3Error::MessageError));
     }
-    blocks.push(HtxBlock::Eoh);
-    
-    blocks
 }

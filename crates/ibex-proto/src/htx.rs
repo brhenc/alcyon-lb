@@ -195,6 +195,7 @@ pub enum HttpVersion {
     #[default]
     Http11,
     Http20,
+    Http30,
 }
 
 impl HttpVersion {
@@ -204,6 +205,7 @@ impl HttpVersion {
             HttpVersion::Http10 => "HTTP/1.0",
             HttpVersion::Http11 => "HTTP/1.1",
             HttpVersion::Http20 => "HTTP/2.0",
+            HttpVersion::Http30 => "HTTP/3.0",
         }
     }
 
@@ -213,6 +215,8 @@ impl HttpVersion {
             HttpVersion::Http10
         } else if bytes == b"HTTP/2.0" || bytes == b"HTTP/2" {
             HttpVersion::Http20
+        } else if bytes == b"HTTP/3.0" || bytes == b"HTTP/3" {
+            HttpVersion::Http30
         } else {
             HttpVersion::Http11
         }
@@ -811,7 +815,11 @@ impl<'a> HtxSliceRef<'a> {
         let mut cursor = 0;
 
         if let Some(req) = self.req_line() {
-            let version = if req.version == "HTTP/2.0" || req.version == "HTTP/2" {
+            let version = if req.version == "HTTP/2.0"
+                || req.version == "HTTP/2"
+                || req.version == "HTTP/3.0"
+                || req.version == "HTTP/3"
+            {
                 "HTTP/1.1"
             } else {
                 req.version
@@ -2455,7 +2463,7 @@ impl Htx {
         let mut buf = Vec::with_capacity(1024);
 
         if let Some(req) = self.req_line() {
-            let version = if req.version == HttpVersion::Http20 {
+            let version = if req.version == HttpVersion::Http20 || req.version == HttpVersion::Http30 {
                 "HTTP/1.1"
             } else {
                 req.version.as_str()
@@ -2537,6 +2545,126 @@ impl Htx {
     }
 }
 
+
+/// Converts HPACK/QPACK decoded pseudo-headers and headers into HTX blocks.
+/// Applies RFC 9113 / RFC 9114 validation and canonicalization.
+pub fn pseudo_headers_to_htx(
+    decoded_headers: Vec<HeaderField>,
+    version: HttpVersion,
+) -> Result<Vec<HtxBlock>, &'static str> {
+    let mut method = None;
+    let mut path = None;
+    let mut authority = None;
+    let mut status = None;
+    let mut regular_headers = Vec::new();
+    let mut host_header = None;
+    let mut seen_regular = false;
+    let mut scheme_seen = false;
+    let mut protocol_seen = false;
+
+    for h in decoded_headers {
+        if h.name.starts_with(':') {
+            if seen_regular {
+                return Err("pseudo-header after regular header");
+            }
+            match h.name.as_str() {
+                ":method" => {
+                    if method.is_some() {
+                        return Err("duplicate pseudo-header");
+                    }
+                    method = Some(HttpMethod::from_bytes(h.value.as_bytes()));
+                }
+                ":path" => {
+                    if path.is_some() {
+                        return Err("duplicate pseudo-header");
+                    }
+                    if h.value.is_empty() {
+                        return Err("empty :path");
+                    }
+                    path = Some(h.value);
+                }
+                ":authority" => {
+                    if authority.is_some() {
+                        return Err("duplicate pseudo-header");
+                    }
+                    authority = Some(h.value);
+                }
+                ":scheme" => {
+                    if scheme_seen {
+                        return Err("duplicate pseudo-header");
+                    }
+                    scheme_seen = true;
+                    /* consumed, not forwarded */
+                }
+                ":status" => {
+                    if status.is_some() {
+                        return Err("duplicate pseudo-header");
+                    }
+                    if let Ok(st) = h.value.parse::<u16>() {
+                        status = Some(st);
+                    } else {
+                        return Err("invalid :status value");
+                    }
+                }
+                ":protocol" => {
+                    if protocol_seen {
+                        return Err("duplicate pseudo-header");
+                    }
+                    protocol_seen = true;
+                }
+                _ => return Err("unknown pseudo-header"),
+            }
+        } else {
+            seen_regular = true;
+            if h.name.eq_ignore_ascii_case("host") {
+                if host_header.is_some() {
+                    return Err("multiple host headers");
+                }
+                host_header = Some(h.value.clone());
+            }
+            regular_headers.push(h);
+        }
+    }
+
+    if let (Some(auth), Some(host)) = (&authority, &host_header) {
+        if !auth.eq_ignore_ascii_case(host) {
+            return Err("authority and host mismatch");
+        }
+    }
+
+    let mut blocks = Vec::new();
+
+    if let Some(m) = method {
+        let uri = path.unwrap_or_else(|| "/".to_string());
+        blocks.push(HtxBlock::ReqLine(RequestLine {
+            method: m,
+            uri,
+            version,
+        }));
+    } else if let Some(st) = status {
+        blocks.push(HtxBlock::ResLine(ResponseLine {
+            version,
+            status: st,
+            reason: String::new(),
+        }));
+    }
+
+    if let Some(auth) = authority {
+        if host_header.is_none() {
+            blocks.push(HtxBlock::Header(HeaderField {
+                name: "host".to_string(),
+                value: auth,
+            }));
+        }
+    }
+
+    for h in regular_headers {
+        blocks.push(HtxBlock::Header(h));
+    }
+    blocks.push(HtxBlock::Eoh);
+
+    Ok(blocks)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2741,6 +2869,137 @@ mod tests {
         let wire_str = std::str::from_utf8(&wire[..n]).expect("utf8");
         assert!(wire_str.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(wire_str.contains("{\"status\":\"healthy\"}"));
+    }
+
+    #[test]
+    fn pseudo_headers_to_htx_converts_authority_and_consumes_scheme() {
+        let headers = vec![
+            HeaderField { name: ":method".into(), value: "GET".into() },
+            HeaderField { name: ":scheme".into(), value: "https".into() },
+            HeaderField { name: ":path".into(), value: "/index.html".into() },
+            HeaderField { name: ":authority".into(), value: "example.com".into() },
+            HeaderField { name: "user-agent".into(), value: "curl/8.0".into() },
+        ];
+        let blocks = pseudo_headers_to_htx(headers, HttpVersion::Http20).expect("conversion");
+        let mut htx = Htx::new();
+        for b in blocks {
+            htx.push(b);
+        }
+        assert_eq!(htx.req_line().unwrap().method, HttpMethod::Get);
+        assert_eq!(htx.req_line().unwrap().uri, "/index.html");
+        assert_eq!(htx.req_line().unwrap().version, HttpVersion::Http20);
+        assert_eq!(htx.get_header("host"), Some("example.com"));
+        assert_eq!(htx.get_header("user-agent"), Some("curl/8.0"));
+        assert_eq!(htx.get_header(":scheme"), None);
+        assert_eq!(htx.get_header(":authority"), None);
+
+        let wire = htx.to_h1_wire();
+        let wire_str = String::from_utf8(wire).expect("utf8");
+        assert!(wire_str.starts_with("GET /index.html HTTP/1.1\r\n"));
+        assert!(wire_str.contains("host: example.com\r\n"));
+        assert!(!wire_str.contains(":scheme"));
+        assert!(!wire_str.contains(":authority"));
+    }
+
+    #[test]
+    fn pseudo_headers_to_htx_agreeing_host_and_authority() {
+        let headers = vec![
+            HeaderField { name: ":method".into(), value: "GET".into() },
+            HeaderField { name: ":scheme".into(), value: "http".into() },
+            HeaderField { name: ":path".into(), value: "/".into() },
+            HeaderField { name: ":authority".into(), value: "example.org".into() },
+            HeaderField { name: "host".into(), value: "example.org".into() },
+        ];
+        let blocks = pseudo_headers_to_htx(headers, HttpVersion::Http20).expect("conversion");
+        let host_headers: Vec<_> = blocks
+            .iter()
+            .filter_map(|b| match b {
+                HtxBlock::Header(h) if h.name.eq_ignore_ascii_case("host") => Some(&h.value),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(host_headers, vec!["example.org"]);
+    }
+
+    #[test]
+    fn pseudo_headers_to_htx_disagreeing_host_and_authority() {
+        let headers = vec![
+            HeaderField { name: ":method".into(), value: "GET".into() },
+            HeaderField { name: ":scheme".into(), value: "http".into() },
+            HeaderField { name: ":path".into(), value: "/".into() },
+            HeaderField { name: ":authority".into(), value: "example.org".into() },
+            HeaderField { name: "host".into(), value: "evil.com".into() },
+        ];
+        let err = pseudo_headers_to_htx(headers, HttpVersion::Http20).unwrap_err();
+        assert_eq!(err, "authority and host mismatch");
+    }
+
+    #[test]
+    fn pseudo_headers_to_htx_unknown_pseudo_header() {
+        let headers = vec![
+            HeaderField { name: ":method".into(), value: "GET".into() },
+            HeaderField { name: ":custom".into(), value: "value".into() },
+        ];
+        let err = pseudo_headers_to_htx(headers, HttpVersion::Http20).unwrap_err();
+        assert_eq!(err, "unknown pseudo-header");
+    }
+
+    #[test]
+    fn pseudo_headers_to_htx_pseudo_after_regular() {
+        let headers = vec![
+            HeaderField { name: ":method".into(), value: "GET".into() },
+            HeaderField { name: "user-agent".into(), value: "curl/8.0".into() },
+            HeaderField { name: ":scheme".into(), value: "http".into() },
+        ];
+        let err = pseudo_headers_to_htx(headers, HttpVersion::Http20).unwrap_err();
+        assert_eq!(err, "pseudo-header after regular header");
+    }
+
+    #[test]
+    fn pseudo_headers_to_htx_duplicate_pseudo() {
+        let headers = vec![
+            HeaderField { name: ":method".into(), value: "GET".into() },
+            HeaderField { name: ":method".into(), value: "POST".into() },
+            HeaderField { name: ":scheme".into(), value: "http".into() },
+            HeaderField { name: ":path".into(), value: "/".into() },
+        ];
+        let err = pseudo_headers_to_htx(headers, HttpVersion::Http20).unwrap_err();
+        assert_eq!(err, "duplicate pseudo-header");
+    }
+
+    #[test]
+    fn pseudo_headers_to_htx_response_status() {
+        let headers = vec![
+            HeaderField { name: ":status".into(), value: "200".into() },
+            HeaderField { name: "content-length".into(), value: "0".into() },
+        ];
+        let blocks = pseudo_headers_to_htx(headers, HttpVersion::Http20).expect("conversion");
+        let mut htx = Htx::new();
+        for b in blocks {
+            htx.push(b);
+        }
+        assert_eq!(htx.res_line().unwrap().status, 200);
+        assert_eq!(htx.get_header("content-length"), Some("0"));
+    }
+
+    #[test]
+    fn htx_h3_to_h1_wire_normalizes_version() {
+        let mut htx = Htx::new();
+        htx.push(HtxBlock::ReqLine(RequestLine {
+            method: HttpMethod::Get,
+            uri: "/test".into(),
+            version: HttpVersion::Http30,
+        }));
+        htx.push(HtxBlock::Header(HeaderField {
+            name: "host".into(),
+            value: "example.com".into(),
+        }));
+        htx.push(HtxBlock::Eoh);
+        htx.push(HtxBlock::Eom);
+
+        let wire = htx.to_h1_wire();
+        let wire_str = String::from_utf8(wire).expect("utf8");
+        assert!(wire_str.starts_with("GET /test HTTP/1.1\r\n"));
     }
 }
 

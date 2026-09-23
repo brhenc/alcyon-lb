@@ -28,7 +28,7 @@ fn test_hex2i() {
     assert_eq!(eval_conv("hex2i", Sample::Str("010203".into()), &[]), Some(Sample::Sint(66051)));
     assert_eq!(eval_conv("hex2i", Sample::Str("0x12".into()), &[]), None); // HAProxy rejects 0x
     assert_eq!(eval_conv("hex2i", Sample::Str("nothex".into()), &[]), None);
-    assert_eq!(eval_conv("hex2i", Sample::Str(String::new()), &[]), None);
+    assert_eq!(eval_conv("hex2i", Sample::Str(String::new()), &[]), Some(Sample::Sint(0)));
 }
 
 

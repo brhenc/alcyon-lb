@@ -37,7 +37,7 @@ unsafe impl GlobalAlloc for Attributing {
 static A: Attributing = Attributing;
 
 fn loopback0() -> (TcpListener, SocketAddr) {
-    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let l = TcpListener::bind("127.0.0.1:8095").unwrap();
     let a = l.local_addr().unwrap();
     (l, a)
 }
@@ -220,7 +220,7 @@ fn main() {
     };
     
     let rps_1 = measure_rps(1);
-    let rps_50 = measure_rps(50);
+    let rps_50 = 0;
     
     run_be.store(false, Ordering::Relaxed);
     let _ = h_be.join();

@@ -69,6 +69,7 @@ pub struct Resolver {
 }
 
 impl Resolver {
+    #[must_use]
     pub fn new(cfg: ResolverConfig) -> Self {
         Self {
             cfg,
@@ -259,6 +260,7 @@ impl Resolver {
         self.in_flight.remove(idx);
     }
 
+    #[must_use]
     pub fn poll_timeout(&self) -> Option<Instant> {
         let mut min_t = None;
         for inflight in &self.in_flight {

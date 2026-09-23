@@ -38,10 +38,10 @@ pub fn render_stats_html(proxies: &[Proxy], checks: &[ServerCheckState], pid: u3
     let mut out = String::with_capacity(32768);
 
     // Calculate aggregated metrics
-    let total_act_conn: u32 = proxies.iter().map(|p| p.stats.act_conn).sum();
-    let total_cum_conn: u64 = proxies.iter().map(|p| p.stats.cum_conn).sum();
-    let total_bytes_in: u64 = proxies.iter().map(|p| p.stats.bytes_in).sum();
-    let total_bytes_out: u64 = proxies.iter().map(|p| p.stats.bytes_out).sum();
+    let total_act_conn: u32 = proxies.iter().map(|p| p.stats.iter().map(|s| s.act_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u32>()).sum();
+    let total_cum_conn: u64 = proxies.iter().map(|p| p.stats.iter().map(|s| s.cum_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()).sum();
+    let total_bytes_in: u64 = proxies.iter().map(|p| p.stats.iter().map(|s| s.bytes_in.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()).sum();
+    let total_bytes_out: u64 = proxies.iter().map(|p| p.stats.iter().map(|s| s.bytes_out.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()).sum();
 
     let mut total_servers = 0;
     let mut total_up = 0;
@@ -50,7 +50,7 @@ pub fn render_stats_html(proxies: &[Proxy], checks: &[ServerCheckState], pid: u3
     let mut total_maint = 0;
 
     for proxy in proxies {
-        for &status in &proxy.server_statuses {
+        for status_atomic in proxy.server_statuses.iter() { let status = ServerStatus::from(status_atomic.load(std::sync::atomic::Ordering::Relaxed));
             total_servers += 1;
             match status {
                 ServerStatus::Up => total_up += 1,
@@ -414,11 +414,11 @@ tr:hover td {{ background: rgba(255, 255, 255, 0.02); }}
                 name = proxy.name,
                 mode = proxy.mode,
                 addr = proxy.addr,
-                act_conn = proxy.stats.act_conn,
+                act_conn = proxy.stats.iter().map(|s| s.act_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u32>(),
                 maxconn = proxy.maxconn,
-                cum_conn = proxy.stats.cum_conn,
-                bytes_in = format_bytes(proxy.stats.bytes_in),
-                bytes_out = format_bytes(proxy.stats.bytes_out),
+                cum_conn = proxy.stats.iter().map(|s| s.cum_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>(),
+                bytes_in = format_bytes(proxy.stats.iter().map(|s| s.bytes_in.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()),
+                bytes_out = format_bytes(proxy.stats.iter().map(|s| s.bytes_out.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()),
             );
         }
     }
@@ -491,23 +491,20 @@ tr:hover td {{ background: rgba(255, 255, 255, 0.02); }}
             name = proxy.name,
             mode = proxy.mode,
             algo = proxy.balance,
-            act_conn = proxy.stats.act_conn,
-            cum_conn = proxy.stats.cum_conn,
-            bytes_in = format_bytes(proxy.stats.bytes_in),
-            bytes_out = format_bytes(proxy.stats.bytes_out),
+            act_conn = proxy.stats.iter().map(|s| s.act_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u32>(),
+            cum_conn = proxy.stats.iter().map(|s| s.cum_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>(),
+            bytes_in = format_bytes(proxy.stats.iter().map(|s| s.bytes_in.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()),
+            bytes_out = format_bytes(proxy.stats.iter().map(|s| s.bytes_out.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()),
         );
 
         for (s_idx, srv_addr) in proxy.servers.iter().enumerate() {
             let srv_id = proxy.server_ids.get(s_idx).map_or("srv", String::as_str);
             let srv_status = proxy
-                .server_statuses
-                .get(s_idx)
-                .copied()
-                .unwrap_or(ServerStatus::Up);
+                .server_statuses.get(s_idx).map(|s| ServerStatus::from(s.load(std::sync::atomic::Ordering::Relaxed))).unwrap_or(ServerStatus::Up);
             let is_backup = proxy.server_backups.get(s_idx).copied().unwrap_or(false);
             let weight = proxy.server_weights.get(s_idx).copied().unwrap_or(1);
             let srv_maxconn = proxy.server_maxconn.get(s_idx).copied().flatten().unwrap_or(0);
-            let actconn = proxy.server_actconn.get(s_idx).copied().unwrap_or(0);
+            let actconn = proxy.server_actconn.get(s_idx).map(|a| a.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0);
 
             let check_state = checks
                 .iter()
@@ -965,10 +962,10 @@ tr:hover td {{ background: rgba(255, 255, 255, 0.02); }}
 pub fn render_stats_json(proxies: &[Proxy], checks: &[ServerCheckState], pid: u32) -> String {
     let mut out = String::with_capacity(8192);
 
-    let total_act_conn: u32 = proxies.iter().map(|p| p.stats.act_conn).sum();
-    let total_cum_conn: u64 = proxies.iter().map(|p| p.stats.cum_conn).sum();
-    let total_bytes_in: u64 = proxies.iter().map(|p| p.stats.bytes_in).sum();
-    let total_bytes_out: u64 = proxies.iter().map(|p| p.stats.bytes_out).sum();
+    let total_act_conn: u32 = proxies.iter().map(|p| p.stats.iter().map(|s| s.act_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u32>()).sum();
+    let total_cum_conn: u64 = proxies.iter().map(|p| p.stats.iter().map(|s| s.cum_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()).sum();
+    let total_bytes_in: u64 = proxies.iter().map(|p| p.stats.iter().map(|s| s.bytes_in.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()).sum();
+    let total_bytes_out: u64 = proxies.iter().map(|p| p.stats.iter().map(|s| s.bytes_out.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()).sum();
 
     let mut count_up = 0;
     let mut count_down = 0;
@@ -976,7 +973,7 @@ pub fn render_stats_json(proxies: &[Proxy], checks: &[ServerCheckState], pid: u3
     let mut count_maint = 0;
 
     for proxy in proxies {
-        for &status in &proxy.server_statuses {
+        for status_atomic in proxy.server_statuses.iter() { let status = ServerStatus::from(status_atomic.load(std::sync::atomic::Ordering::Relaxed));
             match status {
                 ServerStatus::Up => count_up += 1,
                 ServerStatus::Down => count_down += 1,
@@ -1000,10 +997,10 @@ pub fn render_stats_json(proxies: &[Proxy], checks: &[ServerCheckState], pid: u3
             r#"{{"name":"{}","maxconn":{},"act_conn":{},"cum_conn":{},"bytes_in":{},"bytes_out":{},"servers":["#,
             proxy.name,
             proxy.maxconn,
-            proxy.stats.act_conn,
-            proxy.stats.cum_conn,
-            proxy.stats.bytes_in,
-            proxy.stats.bytes_out,
+            proxy.stats.iter().map(|s| s.act_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u32>(),
+            proxy.stats.iter().map(|s| s.cum_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>(),
+            proxy.stats.iter().map(|s| s.bytes_in.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>(),
+            proxy.stats.iter().map(|s| s.bytes_out.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>(),
         );
 
         for (s_idx, _) in proxy.servers.iter().enumerate() {
@@ -1012,13 +1009,10 @@ pub fn render_stats_json(proxies: &[Proxy], checks: &[ServerCheckState], pid: u3
             }
             let srv_id = proxy.server_ids.get(s_idx).map_or("srv", String::as_str);
             let srv_status = proxy
-                .server_statuses
-                .get(s_idx)
-                .copied()
-                .unwrap_or(ServerStatus::Up);
+                .server_statuses.get(s_idx).map(|s| ServerStatus::from(s.load(std::sync::atomic::Ordering::Relaxed))).unwrap_or(ServerStatus::Up);
             let weight = proxy.server_weights.get(s_idx).copied().unwrap_or(1);
             let srv_maxconn = proxy.server_maxconn.get(s_idx).copied().flatten().unwrap_or(0);
-            let actconn = proxy.server_actconn.get(s_idx).copied().unwrap_or(0);
+            let actconn = proxy.server_actconn.get(s_idx).map(|a| a.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0);
 
             let check_state = checks
                 .iter()

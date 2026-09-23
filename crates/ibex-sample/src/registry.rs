@@ -201,6 +201,20 @@ fn resolve_int_arg(arg: &str) -> Option<i64> {
     }
 }
 
+fn resolve_var_str(arg: &str) -> String {
+    let trimmed = arg.trim().trim_matches('"').trim_matches('\'');
+    let var_name = if trimmed.starts_with("var(") && trimmed.ends_with(')') {
+        &trimmed[4..trimmed.len() - 1]
+    } else {
+        trimmed
+    };
+    if var_name.starts_with("proc.") {
+        get_proc_var(var_name).unwrap_or_default()
+    } else {
+        CURRENT_VARS.with(|v| v.borrow().get(var_name).cloned().unwrap_or_default())
+    }
+}
+
 impl Default for Registry {
     fn default() -> Self {
         Self::new()
@@ -1945,12 +1959,19 @@ impl Registry {
             out_type: TypeSpec::Exact(SampleType::Str),
             func: |smp, args| match smp {
                 Sample::Str(mut s) => {
-                    for arg in args {
-                        let piece = CURRENT_VARS
-                            .with(|v| v.borrow().get(arg).cloned())
-                            .unwrap_or_else(|| arg.clone());
-                        s.push_str(&piece);
-                    }
+                    let start = args.first().map_or("", String::as_str);
+                    let var_name = args.get(1).map_or("", String::as_str);
+                    let end = args.get(2).map_or("", String::as_str);
+
+                    let var_val = if var_name.is_empty() {
+                        String::new()
+                    } else {
+                        resolve_var_str(var_name)
+                    };
+
+                    s.push_str(start);
+                    s.push_str(&var_val);
+                    s.push_str(end);
                     Some(Sample::Str(s))
                 }
                 _ => None,
@@ -2023,23 +2044,70 @@ impl Registry {
             out_type: TypeSpec::Exact(SampleType::Str),
             func: |smp, args| {
                 let idx_str = args.first()?;
-                let delim_char = args.get(1).and_then(|d| d.chars().next()).unwrap_or(' ');
+                let delims = args.get(1).map_or(" ", String::as_str);
+                let count_str = args.get(2);
+
                 let idx: i64 = idx_str.parse().ok()?;
-                if idx <= 0 {
+                if idx == 0 {
                     return None;
                 }
-                let uidx = usize::try_from(idx - 1).ok()?;
-                match smp {
-                    Sample::Str(s) => {
-                        let mut words = s.split(delim_char).filter(|w| !w.is_empty());
-                        if let Some(w) = words.nth(uidx) {
-                            Some(Sample::Str(w.to_string()))
-                        } else {
-                            Some(Sample::Str(String::new()))
-                        }
-                    }
-                    _ => None,
+                let count: usize = count_str.and_then(|c| c.parse().ok()).unwrap_or(1);
+
+                let Sample::Str(s) = smp else { return None };
+                if s.is_empty() {
+                    return Some(Sample::Str(String::new()));
                 }
+
+                let mut words: Vec<(usize, usize)> = Vec::new();
+                let mut in_word = false;
+                let mut word_start = 0;
+                for (char_idx, ch) in s.char_indices() {
+                    let is_delim = delims.contains(ch);
+                    if in_word {
+                        if is_delim {
+                            words.push((word_start, char_idx));
+                            in_word = false;
+                        }
+                    } else if !is_delim {
+                        word_start = char_idx;
+                        in_word = true;
+                    }
+                }
+                if in_word {
+                    words.push((word_start, s.len()));
+                }
+
+                let len = words.len();
+                if len == 0 {
+                    return Some(Sample::Str(String::new()));
+                }
+
+                let start_idx = match idx.cmp(&0) {
+                    std::cmp::Ordering::Greater => {
+                        usize::try_from(idx).unwrap_or(usize::MAX).saturating_sub(1)
+                    }
+                    std::cmp::Ordering::Less => {
+                        let neg_idx = usize::try_from(idx.saturating_neg()).unwrap_or(usize::MAX);
+                        if neg_idx > len {
+                            return Some(Sample::Str(String::new()));
+                        }
+                        len - neg_idx
+                    }
+                    std::cmp::Ordering::Equal => return None,
+                };
+
+                if start_idx >= len {
+                    return Some(Sample::Str(String::new()));
+                }
+
+                let end_word_idx = if count == 0 {
+                    len - 1
+                } else {
+                    (start_idx + count - 1).min(len - 1)
+                };
+
+                let slice = &s[words[start_idx].0..words[end_word_idx].1];
+                Some(Sample::Str(slice.to_string()))
             },
         });
 
@@ -2069,11 +2137,22 @@ impl Registry {
             in_type: TypeSpec::Exact(SampleType::Str),
             out_type: TypeSpec::Exact(SampleType::Str),
             func: |smp, args| {
-                let item = args.first()?;
-                let delim = args.get(1).map_or(",", String::as_str);
+                let delim = args.first().map_or(",", String::as_str);
+                let var_name = args.get(1).map_or("", String::as_str);
+                let suff = args.get(2).map_or("", String::as_str);
+
+                let var_val = if var_name.is_empty() {
+                    String::new()
+                } else {
+                    resolve_var_str(var_name)
+                };
+
+                let item = format!("{var_val}{suff}");
                 let Sample::Str(s) = smp else { return None };
-                if s.is_empty() {
-                    Some(Sample::Str(item.clone()))
+                if item.is_empty() {
+                    Some(Sample::Str(s))
+                } else if s.is_empty() {
+                    Some(Sample::Str(item))
                 } else {
                     Some(Sample::Str(format!("{s}{delim}{item}")))
                 }
@@ -2085,7 +2164,12 @@ impl Registry {
             in_type: TypeSpec::Exact(SampleType::Str),
             out_type: TypeSpec::Exact(SampleType::Str),
             func: |smp, _args| match smp {
-                Sample::Str(s) => Some(Sample::Str(s.trim_end_matches(['\r', '\n']).to_string())),
+                Sample::Str(mut s) => {
+                    if let Some(pos) = s.find(['\r', '\n']) {
+                        s.truncate(pos);
+                    }
+                    Some(Sample::Str(s))
+                }
                 _ => None,
             },
         });
@@ -2159,7 +2243,7 @@ impl Registry {
                     } else {
                         &s
                     };
-                    Some(Sample::Str(host.to_string()))
+                    Some(Sample::Str(host.to_lowercase()))
                 }
                 _ => None,
             },
@@ -2476,6 +2560,12 @@ impl Registry {
             func: |smp, _args| match smp {
                 Sample::Str(s) => {
                     let clean = s.trim();
+                    if clean.is_empty() {
+                        return Some(Sample::Sint(0));
+                    }
+                    if !clean.chars().all(|c| c.is_ascii_hexdigit()) {
+                        return None;
+                    }
                     i64::from_str_radix(clean, 16).ok().map(Sample::Sint)
                 }
                 _ => None,
@@ -2497,7 +2587,7 @@ impl Registry {
             in_type: TypeSpec::Exact(SampleType::Str),
             out_type: TypeSpec::Exact(SampleType::Bin),
             func: |smp, _args| match smp {
-                Sample::Str(s) => base64_decode(&s).map(Sample::Bin),
+                Sample::Str(s) => base64_decode(&s, false, true).map(Sample::Bin),
                 _ => None,
             },
         });
@@ -2517,7 +2607,7 @@ impl Registry {
             in_type: TypeSpec::Exact(SampleType::Str),
             out_type: TypeSpec::Exact(SampleType::Bin),
             func: |smp, _args| match smp {
-                Sample::Str(s) => base64_decode(&s).map(Sample::Bin),
+                Sample::Str(s) => base64_decode(&s, true, false).map(Sample::Bin),
                 _ => None,
             },
         });
@@ -2543,13 +2633,38 @@ impl Registry {
             name: "be2dec",
             in_type: TypeSpec::Exact(SampleType::Bin),
             out_type: TypeSpec::Exact(SampleType::Str),
-            func: |smp, _args| match smp {
+            func: |smp, args| match smp {
                 Sample::Bin(b) => {
-                    let mut n: u64 = 0;
-                    for byte in b.iter().take(8) {
-                        n = (n << 8) | u64::from(*byte);
+                    let sep = args.first().map_or("", String::as_str);
+                    let chunk_size = match args.get(1) {
+                        Some(s) => match s.parse::<usize>() {
+                            Ok(n) if (1..=8).contains(&n) => n,
+                            _ => return None,
+                        },
+                        None => {
+                            if b.is_empty() {
+                                1
+                            } else {
+                                b.len().min(8)
+                            }
+                        }
+                    };
+                    let truncate = args.get(2).and_then(|s| s.parse::<u32>().ok()).unwrap_or(0) == 1;
+                    if b.is_empty() {
+                        return Some(Sample::Str(String::new()));
                     }
-                    Some(Sample::Str(n.to_string()))
+                    let mut parts = Vec::new();
+                    for chunk in b.chunks(chunk_size) {
+                        if chunk.len() < chunk_size && truncate {
+                            continue;
+                        }
+                        let mut n: u64 = 0;
+                        for byte in chunk {
+                            n = (n << 8) | u64::from(*byte);
+                        }
+                        parts.push(n.to_string());
+                    }
+                    Some(Sample::Str(parts.join(sep)))
                 }
                 _ => None,
             },
@@ -2559,13 +2674,38 @@ impl Registry {
             name: "le2dec",
             in_type: TypeSpec::Exact(SampleType::Bin),
             out_type: TypeSpec::Exact(SampleType::Str),
-            func: |smp, _args| match smp {
+            func: |smp, args| match smp {
                 Sample::Bin(b) => {
-                    let mut n: u64 = 0;
-                    for (i, byte) in b.iter().take(8).enumerate() {
-                        n |= u64::from(*byte) << (i * 8);
+                    let sep = args.first().map_or("", String::as_str);
+                    let chunk_size = match args.get(1) {
+                        Some(s) => match s.parse::<usize>() {
+                            Ok(n) if (1..=8).contains(&n) => n,
+                            _ => return None,
+                        },
+                        None => {
+                            if b.is_empty() {
+                                1
+                            } else {
+                                b.len().min(8)
+                            }
+                        }
+                    };
+                    let truncate = args.get(2).and_then(|s| s.parse::<u32>().ok()).unwrap_or(0) == 1;
+                    if b.is_empty() {
+                        return Some(Sample::Str(String::new()));
                     }
-                    Some(Sample::Str(n.to_string()))
+                    let mut parts = Vec::new();
+                    for chunk in b.chunks(chunk_size) {
+                        if chunk.len() < chunk_size && truncate {
+                            continue;
+                        }
+                        let mut n: u64 = 0;
+                        for (i, byte) in chunk.iter().enumerate() {
+                            n |= u64::from(*byte) << (i * 8);
+                        }
+                        parts.push(n.to_string());
+                    }
+                    Some(Sample::Str(parts.join(sep)))
                 }
                 _ => None,
             },
@@ -2575,8 +2715,38 @@ impl Registry {
             name: "be2hex",
             in_type: TypeSpec::Exact(SampleType::Bin),
             out_type: TypeSpec::Exact(SampleType::Str),
-            func: |smp, _args| match smp {
-                Sample::Bin(b) => Some(Sample::Str(hex_encode(&b))),
+            func: |smp, args| match smp {
+                Sample::Bin(b) => {
+                    let sep = args.first().map_or("", String::as_str);
+                    let chunk_size = match args.get(1) {
+                        Some(s) => {
+                            let n = s.parse::<usize>().ok()?;
+                            if n == 0 {
+                                return None;
+                            }
+                            n
+                        }
+                        None => {
+                            if b.is_empty() {
+                                1
+                            } else {
+                                b.len()
+                            }
+                        }
+                    };
+                    let truncate = args.get(2).and_then(|s| s.parse::<u32>().ok()).unwrap_or(0) == 1;
+                    if b.is_empty() {
+                        return Some(Sample::Str(String::new()));
+                    }
+                    let mut parts = Vec::new();
+                    for chunk in b.chunks(chunk_size) {
+                        if chunk.len() < chunk_size && truncate {
+                            continue;
+                        }
+                        parts.push(hex_encode(chunk));
+                    }
+                    Some(Sample::Str(parts.join(sep)))
+                }
                 _ => None,
             },
         });
@@ -2615,11 +2785,28 @@ impl Registry {
             out_type: TypeSpec::Exact(SampleType::Bin),
             func: |smp, args| match smp {
                 Sample::Bin(b) => {
-                    let offset = args.first().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
-                    let len = args.get(1).and_then(|s| s.parse::<usize>().ok()).unwrap_or(usize::MAX);
+                    let offset_arg: i64 = match args.first() {
+                        Some(s) => s.parse().ok()?,
+                        None => 0,
+                    };
+                    if offset_arg < 0 {
+                        return None;
+                    }
+                    let len_arg: Option<i64> = match args.get(1) {
+                        Some(s) => {
+                            let l = s.parse().ok()?;
+                            if l < 0 {
+                                return None;
+                            }
+                            Some(l)
+                        }
+                        None => None,
+                    };
+                    let offset = usize::try_from(offset_arg).unwrap_or(usize::MAX);
                     if offset >= b.len() {
                         Some(Sample::Bin(Vec::new()))
                     } else {
+                        let len = len_arg.map_or(usize::MAX, |l| usize::try_from(l).unwrap_or(usize::MAX));
                         let end = b.len().min(offset.saturating_add(len));
                         Some(Sample::Bin(b[offset..end].to_vec()))
                     }
@@ -2663,8 +2850,8 @@ impl Registry {
                         Some(Sample::Ipv4(Ipv4Addr::from(u32::from(ip) & mask)))
                     }
                     Sample::Ipv6(ip) => {
-                        let chosen_mask = mask2_str.unwrap_or(mask1_str);
-                        let mask = if let Ok(prefix) = chosen_mask.parse::<u32>() {
+                        let mask6_str = mask2_str?;
+                        let mask = if let Ok(prefix) = mask6_str.parse::<u32>() {
                             if prefix == 0 {
                                 0
                             } else if prefix >= 128 {
@@ -2672,7 +2859,7 @@ impl Registry {
                             } else {
                                 !((1u128 << (128 - prefix)) - 1)
                             }
-                        } else if let Ok(m_ip) = chosen_mask.parse::<Ipv6Addr>() {
+                        } else if let Ok(m_ip) = mask6_str.parse::<Ipv6Addr>() {
                             u128::from(m_ip)
                         } else {
                             return None;
@@ -2689,8 +2876,14 @@ impl Registry {
             name: "crc32",
             in_type: TypeSpec::Exact(SampleType::Bin),
             out_type: TypeSpec::Exact(SampleType::Sint),
-            func: |smp, _args| match smp {
-                Sample::Bin(b) => Some(Sample::Sint(i64::from(hash_crc32(&b)))),
+            func: |smp, args| match smp {
+                Sample::Bin(b) => {
+                    let mut h = hash_crc32(&b);
+                    if args.first().and_then(|s| s.parse::<i64>().ok()).unwrap_or(0) != 0 {
+                        h = full_hash(h);
+                    }
+                    Some(Sample::Sint(i64::from(h)))
+                }
                 _ => None,
             },
         });
@@ -2699,8 +2892,14 @@ impl Registry {
             name: "crc32c",
             in_type: TypeSpec::Exact(SampleType::Bin),
             out_type: TypeSpec::Exact(SampleType::Sint),
-            func: |smp, _args| match smp {
-                Sample::Bin(b) => Some(Sample::Sint(i64::from(hash_crc32c(&b)))),
+            func: |smp, args| match smp {
+                Sample::Bin(b) => {
+                    let mut h = hash_crc32c(&b);
+                    if args.first().and_then(|s| s.parse::<i64>().ok()).unwrap_or(0) != 0 {
+                        h = full_hash(h);
+                    }
+                    Some(Sample::Sint(i64::from(h)))
+                }
                 _ => None,
             },
         });
@@ -2709,8 +2908,14 @@ impl Registry {
             name: "djb2",
             in_type: TypeSpec::Exact(SampleType::Bin),
             out_type: TypeSpec::Exact(SampleType::Sint),
-            func: |smp, _args| match smp {
-                Sample::Bin(b) => Some(Sample::Sint(i64::from(hash_djb2(&b)))),
+            func: |smp, args| match smp {
+                Sample::Bin(b) => {
+                    let mut h = hash_djb2(&b);
+                    if args.first().and_then(|s| s.parse::<i64>().ok()).unwrap_or(0) != 0 {
+                        h = full_hash(h);
+                    }
+                    Some(Sample::Sint(i64::from(h)))
+                }
                 _ => None,
             },
         });
@@ -2719,8 +2924,14 @@ impl Registry {
             name: "sdbm",
             in_type: TypeSpec::Exact(SampleType::Bin),
             out_type: TypeSpec::Exact(SampleType::Sint),
-            func: |smp, _args| match smp {
-                Sample::Bin(b) => Some(Sample::Sint(i64::from(hash_sdbm(&b)))),
+            func: |smp, args| match smp {
+                Sample::Bin(b) => {
+                    let mut h = hash_sdbm(&b);
+                    if args.first().and_then(|s| s.parse::<i64>().ok()).unwrap_or(0) != 0 {
+                        h = full_hash(h);
+                    }
+                    Some(Sample::Sint(i64::from(h)))
+                }
                 _ => None,
             },
         });
@@ -2729,8 +2940,14 @@ impl Registry {
             name: "wt6",
             in_type: TypeSpec::Exact(SampleType::Bin),
             out_type: TypeSpec::Exact(SampleType::Sint),
-            func: |smp, _args| match smp {
-                Sample::Bin(b) => Some(Sample::Sint(i64::from(hash_wt6(&b)))),
+            func: |smp, args| match smp {
+                Sample::Bin(b) => {
+                    let mut h = hash_wt6(&b);
+                    if args.first().and_then(|s| s.parse::<i64>().ok()).unwrap_or(0) != 0 {
+                        h = full_hash(h);
+                    }
+                    Some(Sample::Sint(i64::from(h)))
+                }
                 _ => None,
             },
         });
@@ -3742,15 +3959,20 @@ fn regsub_eval(input: &str, pattern: &str, repl: &str, flags: &str) -> Option<St
         .build()
         .ok()?;
 
-    // Translate \1, \2 to $1, $2 for Rust regex replacement
+    // Translate \1, \2 to ${1}, ${2} for Rust regex replacement
     let mut rust_repl = String::with_capacity(repl.len() + 4);
     let chars: Vec<char> = repl.chars().collect();
     let mut i = 0;
     while i < chars.len() {
         if chars[i] == '\\' && i + 1 < chars.len() && chars[i + 1].is_ascii_digit() {
-            rust_repl.push('$');
-            rust_repl.push(chars[i + 1]);
-            i += 2;
+            rust_repl.push_str("${");
+            let mut j = i + 1;
+            while j < chars.len() && chars[j].is_ascii_digit() {
+                rust_repl.push(chars[j]);
+                j += 1;
+            }
+            rust_repl.push('}');
+            i = j;
         } else if chars[i] == '&' {
             rust_repl.push_str("${0}");
             i += 1;
@@ -4210,7 +4432,7 @@ fn hex_encode(data: &[u8]) -> String {
     let mut s = String::with_capacity(data.len() * 2);
     for &b in data {
         use std::fmt::Write;
-        let _ = write!(s, "{b:02x}");
+        let _ = write!(s, "{b:02X}");
     }
     s
 }
@@ -4257,40 +4479,59 @@ fn base64_encode(data: &[u8], url_safe: bool) -> String {
 }
 
 #[allow(clippy::naive_bytecount)]
-fn base64_decode(input: &str) -> Option<Vec<u8>> {
-    fn decode_char(c: u8) -> Option<u8> {
+fn base64_decode(input: &str, url_safe: bool, strict_padding: bool) -> Option<Vec<u8>> {
+    fn decode_char(c: u8, url_safe: bool) -> Option<u8> {
         match c {
             b'A'..=b'Z' => Some(c - b'A'),
             b'a'..=b'z' => Some(c - b'a' + 26),
             b'0'..=b'9' => Some(c - b'0' + 52),
-            b'+' | b'-' => Some(62),
-            b'/' | b'_' => Some(63),
+            b'+' if !url_safe => Some(62),
+            b'-' if url_safe => Some(62),
+            b'/' if !url_safe => Some(63),
+            b'_' if url_safe => Some(63),
             _ => None,
         }
     }
 
-    let mut clean: Vec<u8> = input
+    let clean: Vec<u8> = input
         .bytes()
         .filter(|&b| !b.is_ascii_whitespace())
         .collect();
-    while !clean.len().is_multiple_of(4) {
-        clean.push(b'=');
+    if clean.is_empty() {
+        return Some(Vec::new());
     }
-    let mut out = Vec::with_capacity(clean.len() / 4 * 3);
-    for chunk in clean.as_chunks::<4>().0 {
+    if strict_padding && !clean.len().is_multiple_of(4) {
+        return None;
+    }
+    let mut padded = clean;
+    while !padded.len().is_multiple_of(4) {
+        padded.push(b'=');
+    }
+
+    let chunks = padded.as_chunks::<4>().0;
+    let num_chunks = chunks.len();
+    let mut out = Vec::with_capacity(num_chunks * 3);
+
+    for (chunk_idx, chunk) in chunks.iter().enumerate() {
+        let is_last = chunk_idx + 1 == num_chunks;
         let pad_count = chunk.iter().filter(|&&b| b == b'=').count();
-        if pad_count > 2 {
-            return None;
+        if pad_count > 0 {
+            if !is_last || pad_count > 2 {
+                return None;
+            }
+            if pad_count == 1 && chunk[3] != b'=' {
+                return None;
+            }
         }
-        let c0 = decode_char(chunk[0])?;
-        let c1 = decode_char(chunk[1])?;
+        let c0 = decode_char(chunk[0], url_safe)?;
+        let c1 = decode_char(chunk[1], url_safe)?;
         out.push((c0 << 2) | (c1 >> 4));
 
         if chunk[2] != b'=' {
-            let c2 = decode_char(chunk[2])?;
+            let c2 = decode_char(chunk[2], url_safe)?;
             out.push(((c1 & 0x0F) << 4) | (c2 >> 2));
             if chunk[3] != b'=' {
-                let c3 = decode_char(chunk[3])?;
+                let c3 = decode_char(chunk[3], url_safe)?;
                 out.push(((c2 & 0x03) << 6) | c3);
             }
         }
@@ -4517,7 +4758,7 @@ mod tests {
         assert_eq!(
             res_sha1,
             Some(Sample::Str(
-                "a9993e364706816aba3e25717850c26c9cd0d89d".to_string()
+                "A9993E364706816ABA3E25717850C26C9CD0D89D".to_string()
             ))
         );
 

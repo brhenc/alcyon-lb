@@ -4,7 +4,7 @@
 //! TLS configuration types and builders for `ibex-tls`.
 
 use crate::resolver::IbexCertResolver;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use std::sync::Arc;
 
@@ -116,6 +116,225 @@ impl TlsConfig {
 
         Ok(Arc::new(config))
     }
+}
+
+/// A custom certificate verifier that skips server authentication.
+///
+/// Used exclusively when `verify none` is explicitly configured for backend TLS.
+#[derive(Debug)]
+pub struct NoServerAuth {
+    provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl Default for NoServerAuth {
+    fn default() -> Self {
+        Self {
+            provider: Arc::new(rustls::crypto::ring::default_provider()),
+        }
+    }
+}
+
+impl NoServerAuth {
+    #[must_use]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for NoServerAuth {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// Loads CA certificates from a PEM file or directory into a [`RootCertStore`].
+///
+/// # Errors
+/// Returns an error if reading the file fails or no valid certificates are found.
+pub fn load_ca_file(path: &std::path::Path) -> Result<RootCertStore, String> {
+    let mut root_store = RootCertStore::empty();
+    let file = std::fs::File::open(path)
+        .map_err(|e| format!("Failed to open CA file {}: {}", path.display(), e))?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut count = 0;
+    for item in rustls_pemfile::read_all(&mut reader) {
+        let item = item.map_err(|e| format!("Failed to read PEM in {}: {}", path.display(), e))?;
+        if let rustls_pemfile::Item::X509Certificate(cert) = item {
+            root_store
+                .add(cert)
+                .map_err(|e| format!("Failed to add certificate to root store: {e}"))?;
+            count += 1;
+        }
+    }
+    if count == 0 {
+        return Err(format!("No CA certificates found in {}", path.display()));
+    }
+    Ok(root_store)
+}
+
+/// Standard locations for system CA certificate bundles.
+const STANDARD_CA_PATHS: &[&str] = &[
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/etc/pki/tls/certs/ca-bundle.crt",
+    "/etc/ssl/ca-bundle.pem",
+    "/etc/pki/tls/cacert.pem",
+    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+    "/etc/ssl/cert.pem",
+];
+
+/// Loads the default system root CA certificate store.
+#[must_use]
+pub fn load_system_ca_roots() -> RootCertStore {
+    if let Ok(path) = std::env::var("SSL_CERT_FILE") {
+        if let Ok(store) = load_ca_file(std::path::Path::new(&path)) {
+            if !store.is_empty() {
+                return store;
+            }
+        }
+    }
+    for path_str in STANDARD_CA_PATHS {
+        let p = std::path::Path::new(path_str);
+        if p.exists() {
+            if let Ok(store) = load_ca_file(p) {
+                if !store.is_empty() {
+                    return store;
+                }
+            }
+        }
+    }
+    RootCertStore::empty()
+}
+
+/// Options for configuring outbound backend TLS.
+#[derive(Clone, Debug)]
+pub struct BackendTlsOptions {
+    /// Whether certificate verification is required (`verify required` vs `verify none`).
+    /// Default in `HAProxy` 2.2+ is `true`.
+    pub verify_required: bool,
+    /// Path to trusted CA certificate file (`ca-file`).
+    pub ca_file: Option<std::path::PathBuf>,
+    /// Client certificate and private key file for mutual TLS (`crt`).
+    pub client_crt: Option<std::path::PathBuf>,
+    /// Explicit ALPN protocol list (defaults to `["http/1.1"]`).
+    pub alpn: Vec<Vec<u8>>,
+    /// Explicit SNI override or server hostname.
+    pub sni: Option<String>,
+}
+
+impl Default for BackendTlsOptions {
+    fn default() -> Self {
+        Self {
+            verify_required: true,
+            ca_file: None,
+            client_crt: None,
+            alpn: vec![b"http/1.1".to_vec()],
+            sni: None,
+        }
+    }
+}
+
+/// Builds a [`ClientConfig`] for outbound backend connections from [`BackendTlsOptions`].
+///
+/// # Errors
+/// Returns an error if CA / client certificate loading fails or protocol configuration errors.
+pub fn build_backend_client_config(
+    options: &BackendTlsOptions,
+) -> Result<Arc<ClientConfig>, String> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut config = if options.verify_required {
+        let root_store = if let Some(ref ca_path) = options.ca_file {
+            load_ca_file(ca_path)?
+        } else {
+            load_system_ca_roots()
+        };
+        let builder = ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|e| format!("Protocol version error: {e:?}"))?
+            .with_root_certificates(root_store);
+
+        if let Some(ref crt_path) = options.client_crt {
+            let (certs, key) = load_cert_file(crt_path)?;
+            builder
+                .with_client_auth_cert(certs, key)
+                .map_err(|e| format!("Client auth config error: {e:?}"))?
+        } else {
+            builder.with_no_client_auth()
+        }
+    } else {
+        let verifier = NoServerAuth::new();
+        let builder = ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|e| format!("Protocol version error: {e:?}"))?
+            .dangerous()
+            .with_custom_certificate_verifier(verifier);
+
+        if let Some(ref crt_path) = options.client_crt {
+            let (certs, key) = load_cert_file(crt_path)?;
+            builder
+                .with_client_auth_cert(certs, key)
+                .map_err(|e| format!("Client auth config error: {e:?}"))?
+        } else {
+            builder.with_no_client_auth()
+        }
+    };
+
+    if options.alpn.is_empty() {
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    } else {
+        config.alpn_protocols.clone_from(&options.alpn);
+    }
+
+    Ok(Arc::new(config))
+}
+
+/// Parses a server name string (DNS hostname or IP address) into a [`ServerName`].
+///
+/// # Errors
+/// Returns an error if the name is not a valid DNS name or IP address.
+pub fn parse_server_name(name: &str) -> Result<ServerName<'static>, String> {
+    ServerName::try_from(name.to_string())
+        .map_err(|e| format!("Invalid server name '{name}': {e:?}"))
 }
 
 /// Helper to create a [`rustls::sign::CertifiedKey`] from DER certificates and private key.
@@ -230,7 +449,11 @@ fn load_certs_from_path(path: &std::path::Path) -> Result<Vec<(Vec<CertificateDe
     }
 }
 
-fn load_cert_file(path: &std::path::Path) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), String> {
+/// Loads certificates and a private key from a PEM file.
+///
+/// # Errors
+/// Returns an error if the file cannot be opened, PEM parsing fails, or no private key / certificate is found.
+pub fn load_cert_file(path: &std::path::Path) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), String> {
     let file = std::fs::File::open(path).map_err(|e| format!("Failed to open file {}: {}", path.display(), e))?;
     let mut reader = std::io::BufReader::new(file);
     

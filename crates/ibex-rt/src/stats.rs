@@ -424,15 +424,15 @@ fn write_frontend_row(out: &mut String, proxy: &Proxy, pid: u32, iid: usize) {
     r.set("svname", "FRONTEND");
     r.set("qcur", 0);
     r.set("qmax", 0);
-    r.set("scur", proxy.stats.act_conn);
-    r.set("smax", proxy.stats.max_conn);
+    r.set("scur", proxy.stats.iter().map(|s| s.act_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u32>());
+    r.set("smax", proxy.stats.iter().map(|s| s.max_conn.load(std::sync::atomic::Ordering::Relaxed)).max().unwrap_or(0));
     r.set("slim", proxy.maxconn);
-    r.set("stot", proxy.stats.cum_conn);
-    r.set("bin", proxy.stats.bytes_in);
-    r.set("bout", proxy.stats.bytes_out);
-    r.set("dreq", proxy.stats.denied_req);
-    r.set("dresp", proxy.stats.denied_resp);
-    r.set("dcon", proxy.stats.denied_conn);
+    r.set("stot", proxy.stats.iter().map(|s| s.cum_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>());
+    r.set("bin", proxy.stats.iter().map(|s| s.bytes_in.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>());
+    r.set("bout", proxy.stats.iter().map(|s| s.bytes_out.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>());
+    r.set("dreq", proxy.stats.iter().map(|s| s.denied_req.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>());
+    r.set("dresp", proxy.stats.iter().map(|s| s.denied_resp.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>());
+    r.set("dcon", proxy.stats.iter().map(|s| s.denied_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>());
     r.set("ereq", 0);
     r.set("status", "OPEN");
     r.set("act", 1);
@@ -469,10 +469,7 @@ fn write_server_row(
             )
         } else {
             let s = proxy
-                .server_statuses
-                .get(s_idx)
-                .copied()
-                .unwrap_or(ServerStatus::Up);
+                .server_statuses.get(s_idx).map(|s| ServerStatus::from(s.load(std::sync::atomic::Ordering::Relaxed))).unwrap_or(ServerStatus::Up);
             let s_str = match s {
                 ServerStatus::Up => "no check",
                 ServerStatus::Down => "DOWN",
@@ -484,7 +481,7 @@ fn write_server_row(
 
     let is_backup = proxy.server_backups.get(s_idx).copied().unwrap_or(false);
     let (act, bck) = if is_backup { (0, 1) } else { (1, 0) };
-    let scur = proxy.server_actconn.get(s_idx).copied().unwrap_or(0);
+    let scur = proxy.server_actconn.get(s_idx).map(|a| a.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0);
     let weight = proxy.server_weights.get(s_idx).copied().unwrap_or(1);
     let slim = proxy
         .server_maxconn
@@ -525,14 +522,14 @@ fn write_backend_row(out: &mut String, proxy: &Proxy, pid: u32, iid: usize) {
     r.set("svname", "BACKEND");
     r.set("qcur", 0);
     r.set("qmax", 0);
-    r.set("scur", proxy.stats.act_conn);
-    r.set("smax", proxy.stats.max_conn);
+    r.set("scur", proxy.stats.iter().map(|s| s.act_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u32>());
+    r.set("smax", proxy.stats.iter().map(|s| s.max_conn.load(std::sync::atomic::Ordering::Relaxed)).max().unwrap_or(0));
     r.set("slim", proxy.maxconn);
-    r.set("stot", proxy.stats.cum_conn);
-    r.set("bin", proxy.stats.bytes_in);
-    r.set("bout", proxy.stats.bytes_out);
-    r.set("dreq", proxy.stats.denied_req);
-    r.set("dresp", proxy.stats.denied_resp);
+    r.set("stot", proxy.stats.iter().map(|s| s.cum_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>());
+    r.set("bin", proxy.stats.iter().map(|s| s.bytes_in.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>());
+    r.set("bout", proxy.stats.iter().map(|s| s.bytes_out.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>());
+    r.set("dreq", proxy.stats.iter().map(|s| s.denied_req.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>());
+    r.set("dresp", proxy.stats.iter().map(|s| s.denied_resp.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>());
     r.set("status", "UP");
     r.set("weight", 1);
     r.set("act", 1);
@@ -655,10 +652,10 @@ mod tests {
             srvexp: Vec::new(),
             servers: vec![addr],
             server_ids: vec!["srv1".into()],
-            server_statuses: vec![ServerStatus::Up],
+            server_statuses: std::sync::Arc::new(vec![std::sync::atomic::AtomicU8::new(0)]),
             server_weights: vec![1],
-            next_server_idx: 0,
-            stats: crate::engine::ProxyStats::default(),
+            next_server_idx: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            stats: std::sync::Arc::new(vec![crate::engine::ProxyStats::default()]),
             stats_config: ibex_config::StatsConfig::default(),
             balance: ibex_config::BalanceAlgorithm::RoundRobin,
             default_backend: None,
@@ -672,7 +669,7 @@ mod tests {
             server_send_proxy_v2: vec![false],
             server_backups: vec![false],
             server_maxconn: vec![None],
-            server_actconn: vec![0],
+            server_actconn: std::sync::Arc::new(vec![std::sync::atomic::AtomicU32::new(0)]),
             server_check_configs: vec![None],
             tcp_req_conn_rules: Vec::new(),
             tcp_req_session_rules: Vec::new(),

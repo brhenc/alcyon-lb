@@ -25,7 +25,7 @@ use crate::h2::{
     DEFAULT_INITIAL_WINDOW_SIZE, DEFAULT_MAX_FRAME_SIZE, FRAME_HEADER_LEN, H2_CONN_PREFACE,
 };
 use crate::hpack::{HpackDecoder, HpackEncoder};
-use crate::htx::{HeaderField, HttpMethod, HttpVersion, Htx, HtxBlock, RequestLine, ResponseLine};
+use crate::htx::{HeaderField, HttpVersion, Htx, HtxBlock};
 use crate::mux::{mux_flags, Mux, MuxFlags, MuxOps, ShutMode};
 use std::collections::BTreeMap;
 use std::io;
@@ -581,39 +581,17 @@ impl MuxH2 {
         stream.state = H2StreamState::Open;
 
         // Extract pseudo-headers and construct HTX blocks
-        let mut method = None;
-        let mut path = None;
-        let mut status = None;
-        let mut regular_headers = Vec::new();
-
-        for h in decoded_headers {
-            match h.name.as_str() {
-                ":method" => method = Some(HttpMethod::from_bytes(h.value.as_bytes())),
-                ":path" => path = Some(h.value),
-                ":status" => status = h.value.parse::<u16>().ok(),
-                _ => regular_headers.push(h),
+        match crate::htx::pseudo_headers_to_htx(decoded_headers, HttpVersion::Http20) {
+            Ok(blocks) => {
+                for b in blocks {
+                    stream.rx_htx.push(b);
+                }
+            }
+            Err(_) => {
+                ctx.send_rst_stream(stream_id, H2Error::ProtocolError);
+                return Ok(());
             }
         }
-
-        if let Some(m) = method {
-            let uri = path.unwrap_or_else(|| "/".to_string());
-            stream.rx_htx.push(HtxBlock::ReqLine(RequestLine {
-                method: m,
-                uri,
-                version: HttpVersion::Http20,
-            }));
-        } else if let Some(st) = status {
-            stream.rx_htx.push(HtxBlock::ResLine(ResponseLine {
-                version: HttpVersion::Http20,
-                status: st,
-                reason: String::new(),
-            }));
-        }
-
-        for h in regular_headers {
-            stream.rx_htx.push(HtxBlock::Header(h));
-        }
-        stream.rx_htx.push(HtxBlock::Eoh);
 
         if (flags & frame_flags::END_STREAM) != 0 {
             stream.rx_htx.push(HtxBlock::Eom);

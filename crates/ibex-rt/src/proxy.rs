@@ -20,7 +20,7 @@
 
 use crate::buf::Buf;
 use crate::raw::{self, Io};
-use crate::xprt::ClientXprt;
+use crate::xprt::{ClientXprt, ServerXprt};
 use ibex_proto::parser::ParserKind;
 use ibex_config::{HttpAfterResAction, HttpResAction, Mode};
 use ibex_proto::endpoint::ScState;
@@ -94,6 +94,8 @@ pub struct TcpSession {
     /// compiles to the same `raw::recv`/`raw::send` calls.
     pub cli_xprt: ClientXprt,
     pub srv: Option<OwnedFd>,
+    /// The transport under the backend server socket: plaintext, or TLS over the same fd.
+    pub srv_xprt: ServerXprt,
     pub mode: Mode,
     pub client_addr: Option<SocketAddr>,
     pub cookie_name: Option<String>,
@@ -196,6 +198,7 @@ impl TcpSession {
             parser_kind: ParserKind::H1,
             cli_xprt: ClientXprt::Plain,
             srv: None,
+            srv_xprt: ServerXprt::Plain,
             mode,
             client_addr: None,
             cookie_name,
@@ -340,7 +343,13 @@ impl TcpSession {
 
     /// Attaches a server-side connection that is still connecting.
     pub fn attach_server(&mut self, fd: OwnedFd, now: Tick) {
+        self.attach_server_with_xprt(fd, ServerXprt::Plain, now);
+    }
+
+    /// Attaches a server-side connection with a specific transport (`ServerXprt`).
+    pub fn attach_server_with_xprt(&mut self, fd: OwnedFd, xprt: ServerXprt, now: Tick) {
         self.srv = Some(fd);
+        self.srv_xprt = xprt;
         self.srv_state = ScState::Connecting;
         self.conn_exp = if self.timeouts.connect == 0 {
             Tick::ETERNITY
@@ -1212,14 +1221,33 @@ impl TcpSession {
     fn process_srv_io(&mut self) -> io::Result<bool> {
         let mut changed = false;
 
-        if self.srv_state.can_write() && !self.req.is_empty() {
+        if self.srv_xprt.is_tls() && !self.srv_xprt.is_ready() {
+            let sfd = self
+                .srv
+                .as_ref()
+                .map(AsFd::as_fd)
+                .ok_or_else(|| io::Error::from(io::ErrorKind::NotConnected))?;
+            match self.srv_xprt.handshake(sfd) {
+                Ok(true) => {
+                    changed = true;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    self.srv_state = ScState::Error;
+                    self.ending.get_or_insert(Ending::Error);
+                    return Err(e);
+                }
+            }
+        }
+
+        if self.srv_state.can_write() && (!self.req.is_empty() || self.srv_xprt.wants_write()) {
             let r = {
                 let sfd = self
                     .srv
                     .as_ref()
                     .map(AsFd::as_fd)
                     .ok_or_else(|| io::Error::from(io::ErrorKind::NotConnected))?;
-                raw::send(sfd, self.req.readable())?
+                self.srv_xprt.send(sfd, self.req.readable())?
             };
             match r {
                 Io::Done(n) if n > 0 => {
@@ -1243,11 +1271,12 @@ impl TcpSession {
                     .map(AsFd::as_fd)
                     .ok_or_else(|| io::Error::from(io::ErrorKind::NotConnected))?;
                 let dst = self.rep.writable();
-                raw::recv(sfd, dst)?
+                self.srv_xprt.recv(sfd, dst)?
             };
             match r {
                 Io::Eof => {
                     if let Some(sfd) = self.srv.as_ref().map(AsFd::as_fd) {
+                        self.srv_xprt.send_close_notify(sfd);
                         raw::shutdown_read(sfd);
                     }
                     self.srv_state = match self.srv_state {
@@ -1287,6 +1316,7 @@ impl TcpSession {
                 );
                 if cli_done_sending && self.req.is_empty() {
                     if let Some(sfd) = self.srv.as_ref().map(AsFd::as_fd) {
+                        self.srv_xprt.send_close_notify(sfd);
                         raw::shutdown_write(sfd);
                     }
                     self.srv_state = ScState::ShutW;
@@ -1312,6 +1342,7 @@ impl TcpSession {
                 );
                 if cli_done_sending && self.req.is_empty() {
                     if let Some(sfd) = self.srv.as_ref().map(AsFd::as_fd) {
+                        self.srv_xprt.send_close_notify(sfd);
                         raw::shutdown_write(sfd);
                     }
                     self.srv_state = ScState::Closed;
@@ -1432,7 +1463,7 @@ impl TcpSession {
             },
             ScState::Ready | ScState::Established | ScState::ShutR | ScState::ShutW => Want {
                 read: self.srv_state.can_read() && !self.rep.is_full(),
-                write: self.srv_state.can_write() && !self.req.is_empty(),
+                write: self.srv_state.can_write() && (!self.req.is_empty() || self.srv_xprt.wants_write()),
             },
             _ => Want::default(),
         };

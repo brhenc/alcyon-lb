@@ -199,8 +199,7 @@ fn cli_applet_show_stat_and_admin_server_state_mutations() {
     );
 
     assert_eq!(
-        engine.proxies[0].server_statuses[0],
-        ibex_rt::ServerStatus::Down,
+        engine.proxies[0].server_statuses[0].load(std::sync::atomic::Ordering::Relaxed), ibex_rt::ServerStatus::Down as u8,
         "srv1 should be marked Down after disable server"
     );
 
@@ -218,8 +217,7 @@ fn cli_applet_show_stat_and_admin_server_state_mutations() {
     );
 
     assert_eq!(
-        engine.proxies[0].server_statuses[0],
-        ibex_rt::ServerStatus::Up,
+        engine.proxies[0].server_statuses[0].load(std::sync::atomic::Ordering::Relaxed), ibex_rt::ServerStatus::Up as u8,
         "srv1 should be marked Up after enable server"
     );
 
@@ -237,8 +235,7 @@ fn cli_applet_show_stat_and_admin_server_state_mutations() {
     );
 
     assert_eq!(
-        engine.proxies[0].server_statuses[1],
-        ibex_rt::ServerStatus::Down,
+        engine.proxies[0].server_statuses[1].load(std::sync::atomic::Ordering::Relaxed), ibex_rt::ServerStatus::Down as u8,
         "srv2 should be marked Down after set server state drain"
     );
 }

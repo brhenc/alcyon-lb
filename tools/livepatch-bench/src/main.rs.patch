@@ -1,0 +1,11 @@
+--- tools/livepatch-bench/src/main.rs
++++ tools/livepatch-bench/src/main.rs
+@@ -48,7 +48,7 @@
+ }
+ 
+ fn loopback0() -> (TcpListener, SocketAddr) {
+-    let l = TcpListener::bind("127.0.0.1:0").unwrap();
++    let l = TcpListener::bind("127.0.0.1:8081").unwrap();
+     let a = l.local_addr().unwrap();
+     (l, a)
+ }

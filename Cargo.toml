@@ -10,7 +10,7 @@ members = [
     "crates/ibex-stick-table",
     "crates/ibex-tls",
     "crates/ibex-alloc",
-    "crates/ibex-h1-sys", "crates/slz", "crates/ibex-mmsg", "crates/ibex-dns",
+    "crates/ibex-h1-sys", "crates/slz", "crates/ibex-mmsg", "crates/ibex-dns", "crates/ibex-quic",
 ]
 
 
@@ -83,3 +83,6 @@ similar_names = "allow"
 [profile.livepatch]
 inherits = "release"
 lto = "off"
+
+[profile.release]
+debug = true

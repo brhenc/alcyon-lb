@@ -132,12 +132,12 @@ fn test_kill_sessions_web_admin_and_reclaim_actconn() {
     }
 
     assert!(
-        engine.proxies[0].stats.act_conn >= 1,
+        engine.proxies[0].stats[0].act_conn.load(std::sync::atomic::Ordering::Relaxed) >= 1,
         "act_conn should be >= 1, got {}",
-        engine.proxies[0].stats.act_conn
+        engine.proxies[0].stats[0].act_conn.load(std::sync::atomic::Ordering::Relaxed)
     );
     assert_eq!(
-        engine.proxies[0].server_actconn[0], 1,
+        engine.proxies[0].server_actconn[0].load(std::sync::atomic::Ordering::Relaxed), 1,
         "server_actconn should be 1"
     );
 
@@ -153,11 +153,11 @@ fn test_kill_sessions_web_admin_and_reclaim_actconn() {
 
     // 3. Verify active connection counts immediately reclaimed
     assert_eq!(
-        engine.proxies[0].server_actconn[0], 0,
+        engine.proxies[0].server_actconn[0].load(std::sync::atomic::Ordering::Relaxed), 0,
         "server_actconn must be reclaimed to 0"
     );
     assert_eq!(
-        engine.proxies[0].stats.act_conn, 0,
+        engine.proxies[0].stats[0].act_conn.load(std::sync::atomic::Ordering::Relaxed), 0,
         "proxy act_conn must be reclaimed to 0"
     );
 
@@ -200,8 +200,8 @@ listen test_proxy
     engine.bind_cli_socket(&socket_path).expect("bind cli");
 
     // Manually increment actconn to simulate active sessions
-    engine.proxies[0].stats.act_conn = 5;
-    engine.proxies[0].server_actconn[0] = 5;
+    engine.proxies[0].stats[0].act_conn.store(5, std::sync::atomic::Ordering::Relaxed);
+    engine.proxies[0].server_actconn[0].store(5, std::sync::atomic::Ordering::Relaxed);
 
     // 1. Test direct engine API
     let killed = engine.shutdown_sessions(Some("test_proxy"), Some("srv1"));
@@ -271,41 +271,41 @@ backend test_backend
     engine.bind_cli_socket(&socket_path).expect("bind cli");
 
     // Populate stats counters on test_backend (proxies[1])
-    engine.proxies[1].stats.bytes_in = 1_024_000;
-    engine.proxies[1].stats.bytes_out = 2_048_000;
-    engine.proxies[1].stats.cum_conn = 500;
-    engine.proxies[1].stats.act_conn = 12;
-    engine.proxies[1].stats.max_conn = 200;
-    engine.proxies[1].stats.failed_conn = 15;
-    engine.proxies[1].stats.srv_err = 5;
-    engine.proxies[1].stats.cli_err = 3;
+    engine.proxies[1].stats[0].bytes_in.store(1_024_000, std::sync::atomic::Ordering::Relaxed);
+    engine.proxies[1].stats[0].bytes_out.store(2_048_000, std::sync::atomic::Ordering::Relaxed);
+    engine.proxies[1].stats[0].cum_conn.store(500, std::sync::atomic::Ordering::Relaxed);
+    engine.proxies[1].stats[0].act_conn.store(12, std::sync::atomic::Ordering::Relaxed);
+    engine.proxies[1].stats[0].max_conn.store(200, std::sync::atomic::Ordering::Relaxed);
+    engine.proxies[1].stats[0].failed_conn.store(15, std::sync::atomic::Ordering::Relaxed);
+    engine.proxies[1].stats[0].srv_err.store(5, std::sync::atomic::Ordering::Relaxed);
+    engine.proxies[1].stats[0].cli_err.store(3, std::sync::atomic::Ordering::Relaxed);
 
     // 1. Clear via Web Admin POST with action=clear_counters&backend=test_backend
     let post_req = b"POST /stats HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 42\r\n\r\naction=clear_counters&backend=test_backend";
     let resp = send_http_request(proxy_addr, &mut engine, post_req);
     assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "Got: {resp}");
 
-    assert_eq!(engine.proxies[1].stats.bytes_in, 0);
-    assert_eq!(engine.proxies[1].stats.bytes_out, 0);
-    assert_eq!(engine.proxies[1].stats.cum_conn, 0);
-    assert_eq!(engine.proxies[1].stats.failed_conn, 0);
-    assert_eq!(engine.proxies[1].stats.srv_err, 0);
-    assert_eq!(engine.proxies[1].stats.cli_err, 0);
+    assert_eq!(engine.proxies[1].stats[0].bytes_in.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert_eq!(engine.proxies[1].stats[0].bytes_out.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert_eq!(engine.proxies[1].stats[0].cum_conn.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert_eq!(engine.proxies[1].stats[0].failed_conn.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert_eq!(engine.proxies[1].stats[0].srv_err.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert_eq!(engine.proxies[1].stats[0].cli_err.load(std::sync::atomic::Ordering::Relaxed), 0);
     assert_eq!(
-        engine.proxies[1].stats.max_conn, engine.proxies[1].stats.act_conn,
+        engine.proxies[1].stats[0].max_conn.load(std::sync::atomic::Ordering::Relaxed), engine.proxies[1].stats[0].act_conn.load(std::sync::atomic::Ordering::Relaxed),
         "max_conn must be reset to act_conn"
     );
 
     // 2. Populate again and clear via JSON request
-    engine.proxies[1].stats.bytes_in = 5555;
+    engine.proxies[1].stats[0].bytes_in.store(5555, std::sync::atomic::Ordering::Relaxed);
     let json_req = b"POST /stats HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 51\r\n\r\n{\"action\":\"clear_counters\",\"backend\":\"test_backend\"}";
     let json_resp = send_http_request(proxy_addr, &mut engine, json_req);
     assert!(json_resp.starts_with("HTTP/1.1 200 OK\r\n"), "Got: {json_resp}");
     assert!(json_resp.contains("\"status\":\"ok\""));
-    assert_eq!(engine.proxies[1].stats.bytes_in, 0);
+    assert_eq!(engine.proxies[1].stats[0].bytes_in.load(std::sync::atomic::Ordering::Relaxed), 0);
 
     // 3. Populate again and clear via CLI socket
-    engine.proxies[1].stats.bytes_in = 7777;
+    engine.proxies[1].stats[0].bytes_in.store(7777, std::sync::atomic::Ordering::Relaxed);
     let mut client = UnixStream::connect(&socket_path).expect("connect cli");
     client.set_nonblocking(true).expect("nonblocking");
     engine.step(Tick(100)).expect("step");
@@ -313,15 +313,15 @@ backend test_backend
     client.write_all(b"clear counters test_backend\n").expect("write");
     step_engine_until(
         &mut engine,
-        |eng| eng.proxies[1].stats.bytes_in == 0,
+        |eng| eng.proxies[1].stats[0].bytes_in.load(std::sync::atomic::Ordering::Relaxed) == 0,
         20,
     );
-    assert_eq!(engine.proxies[1].stats.bytes_in, 0);
+    assert_eq!(engine.proxies[1].stats[0].bytes_in.load(std::sync::atomic::Ordering::Relaxed), 0);
 
     // 4. Test direct engine API
-    engine.proxies[1].stats.bytes_out = 8888;
+    engine.proxies[1].stats[0].bytes_out.store(8888, std::sync::atomic::Ordering::Relaxed);
     assert!(engine.clear_counters(Some("test_backend")));
-    assert_eq!(engine.proxies[1].stats.bytes_out, 0);
+    assert_eq!(engine.proxies[1].stats[0].bytes_out.load(std::sync::atomic::Ordering::Relaxed), 0);
     assert!(engine.clear_counters(None));
 }
 
@@ -368,13 +368,12 @@ fn test_health_check_enable_disable_web_and_cli() {
     assert!(!engine.checks[0].enabled, "check should now be disabled");
 
     // Step engine: verify server_status is NOT modified by health checks while disabled
-    engine.proxies[0].server_statuses[0] = ServerStatus::Maint;
+    engine.proxies[0].server_statuses[0].store(ServerStatus::Maint as u8, std::sync::atomic::Ordering::Relaxed);
     for _ in 0..5 {
         let _ = engine.run_once();
     }
     assert_eq!(
-        engine.proxies[0].server_statuses[0],
-        ServerStatus::Maint,
+        engine.proxies[0].server_statuses[0].load(std::sync::atomic::Ordering::Relaxed), ServerStatus::Maint as u8,
         "administrative status must be preserved while health check is disabled"
     );
 

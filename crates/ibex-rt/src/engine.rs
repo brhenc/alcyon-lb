@@ -38,6 +38,8 @@ use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+
 use std::time::{Duration, Instant};
 
 // These four are the *same* thread-locals the sample fetches read. They used to be
@@ -53,6 +55,7 @@ use ibex_sample::registry::{
 };
 
 thread_local! {
+    pub static WORKER_ID: Cell<usize> = const { Cell::new(0) };
     static STRICT_MODE: Cell<bool> = const { Cell::new(true) };
     static REWRITE_ADDED_BYTES: Cell<usize> = const { Cell::new(0) };
     static MAX_REWRITE_LIMIT: Cell<usize> = const { Cell::new(8192) };
@@ -74,40 +77,43 @@ fn raw_fd_to_u64(fd: RawFd) -> u64 {
 }
 
 /// Accumulated statistics per proxy.
-#[derive(Debug, Clone, Default)]
+#[derive(Default, Debug)]
 pub struct ProxyStats {
-    pub cum_conn: u64,
-    pub act_conn: u32,
-    pub max_conn: u32,
-    pub bytes_in: u64,
-    pub bytes_out: u64,
-    pub retries_count: u64,
-    pub redispatches: u64,
-    pub failed_conn: u64,
-    pub srv_err: u64,
-    pub cli_err: u64,
-    pub denied_conn: u64,
-    pub denied_req: u64,
-    pub denied_resp: u64,
+    pub cum_conn: AtomicU64,
+    pub act_conn: AtomicU32,
+    pub max_conn: AtomicU32,
+    pub bytes_in: AtomicU64,
+    pub bytes_out: AtomicU64,
+    pub retries_count: AtomicU64,
+    pub redispatches: AtomicU64,
+    pub failed_conn: AtomicU64,
+    pub srv_err: AtomicU64,
+    pub cli_err: AtomicU64,
+    pub denied_conn: AtomicU64,
+    pub denied_req: AtomicU64,
+    pub denied_resp: AtomicU64,
 }
 
 impl ProxyStats {
-    /// Clears accumulated traffic and error counters, resetting `max_conn` to current `act_conn`.
-    pub fn clear(&mut self) {
-        self.cum_conn = 0;
-        self.max_conn = self.act_conn;
-        self.bytes_in = 0;
-        self.bytes_out = 0;
-        self.retries_count = 0;
-        self.redispatches = 0;
-        self.failed_conn = 0;
-        self.srv_err = 0;
-        self.cli_err = 0;
-        self.denied_conn = 0;
-        self.denied_req = 0;
-        self.denied_resp = 0;
+    pub fn clear(&self) {
+        self.cum_conn.store(0, Ordering::Relaxed);
+        let act = self.act_conn.load(Ordering::Relaxed);
+        self.max_conn.store(act, Ordering::Relaxed);
+        self.bytes_in.store(0, Ordering::Relaxed);
+        self.bytes_out.store(0, Ordering::Relaxed);
+        self.retries_count.store(0, Ordering::Relaxed);
+        self.redispatches.store(0, Ordering::Relaxed);
+        self.failed_conn.store(0, Ordering::Relaxed);
+        self.srv_err.store(0, Ordering::Relaxed);
+        self.cli_err.store(0, Ordering::Relaxed);
+        self.denied_conn.store(0, Ordering::Relaxed);
+        self.denied_req.store(0, Ordering::Relaxed);
+        self.denied_resp.store(0, Ordering::Relaxed);
     }
 }
+
+
+
 
 /// A configured proxy instance.
 #[derive(Debug, Clone)]
@@ -131,10 +137,10 @@ pub struct Proxy {
     pub srvexp: Vec<ibex_proto::CompiledExp>,
     pub servers: Vec<SocketAddr>,
     pub server_ids: Vec<String>,
-    pub server_statuses: Vec<ServerStatus>,
+    pub server_statuses: Arc<Vec<AtomicU8>>,
     pub server_weights: Vec<u32>,
-    pub next_server_idx: usize,
-    pub stats: ProxyStats,
+    pub next_server_idx: Arc<AtomicUsize>,
+    pub stats: Arc<Vec<ProxyStats>>,
     pub stats_config: ibex_config::StatsConfig,
     pub default_backend: Option<String>,
     pub use_backends: Vec<UseBackendRule>,
@@ -147,7 +153,7 @@ pub struct Proxy {
     pub server_send_proxy_v2: Vec<bool>,
     pub server_backups: Vec<bool>,
     pub server_maxconn: Vec<Option<u32>>,
-    pub server_actconn: Vec<u32>,
+    pub server_actconn: Arc<Vec<AtomicU32>>,
     pub server_check_configs: Vec<Option<ServerCheckConfig>>,
     pub tcp_req_conn_rules: Vec<ibex_config::TcpReqConnRule>,
     pub tcp_req_session_rules: Vec<ibex_config::TcpReqSessionRule>,
@@ -181,7 +187,7 @@ impl Proxy {
                 return false;
             }
             if let Some(status) = self.server_statuses.get(idx) {
-                if *status != ServerStatus::Up {
+                if status.load(Ordering::Relaxed) != ServerStatus::Up as u8 {
                     return false;
                 }
             } else {
@@ -189,7 +195,7 @@ impl Proxy {
             }
             if let Some(Some(mc)) = self.server_maxconn.get(idx) {
                 if *mc > 0 {
-                    let act = self.server_actconn.get(idx).copied().unwrap_or(0);
+                    let act = self.server_actconn.get(idx).map(|a| a.load(Ordering::Relaxed)).unwrap_or(0);
                     if act >= *mc {
                         return false;
                     }
@@ -226,10 +232,10 @@ impl Proxy {
     pub fn select_server_by_id(&self, id: &str) -> Option<SocketAddr> {
         for (idx, sid) in self.server_ids.iter().enumerate() {
             if sid == id && idx < self.servers.len() {
-                let is_up = self.server_statuses.get(idx).copied() == Some(ServerStatus::Up);
+                let is_up = self.server_statuses.get(idx).map(|s| s.load(Ordering::Relaxed)) == Some(ServerStatus::Up as u8);
                 let not_saturated = match self.server_maxconn.get(idx) {
                     Some(Some(mc)) if *mc > 0 => {
-                        let act = self.server_actconn.get(idx).copied().unwrap_or(0);
+                        let act = self.server_actconn.get(idx).map(|a| a.load(Ordering::Relaxed)).unwrap_or(0);
                         act < *mc
                     }
                     _ => true,
@@ -254,8 +260,8 @@ impl Proxy {
         if eligible.is_empty() {
             return self.dispatch;
         }
-        let chosen_idx = eligible[self.next_server_idx % eligible.len()];
-        self.next_server_idx = self.next_server_idx.wrapping_add(1);
+        let chosen_idx = eligible[self.next_server_idx.fetch_add(1, Ordering::Relaxed) % eligible.len()];
+        
         Some(self.servers[chosen_idx])
     }
 
@@ -283,8 +289,8 @@ impl Proxy {
                     let chosen_idx = eligible[hash % eligible.len()];
                     return Some(self.servers[chosen_idx]);
                 }
-                let chosen_idx = eligible[self.next_server_idx % eligible.len()];
-                self.next_server_idx = self.next_server_idx.wrapping_add(1);
+                let chosen_idx = eligible[self.next_server_idx.fetch_add(1, Ordering::Relaxed) % eligible.len()];
+                
                 Some(self.servers[chosen_idx])
             }
             _ => self.select_server(),
@@ -381,6 +387,11 @@ impl SessionArena {
     }
 }
 
+#[inline]
+pub fn worker_id() -> usize {
+    WORKER_ID.with(|id| id.get())
+}
+
 pub struct Engine {
     pub poller: Poller,
     pub scheduler: Scheduler,
@@ -395,6 +406,7 @@ pub struct Engine {
     pub start_time: Instant,
     pub now: Tick,
     pub is_running: bool,
+    pub worker_id: usize,
     events: Vec<crate::poller::Event>,
     timer_updates: Vec<(TaskRef, Tick)>,
     /// Every syslog target the config declared, global and per-proxy. Proxies reference
@@ -653,7 +665,7 @@ fn bind_tls(
     Ok(Some(cfg))
 }
 
-fn init_proxy_from_listen(proxy_idx: usize, listen: &ibex_config::ListenSection) -> Proxy {
+fn init_proxy_from_listen(proxy_idx: usize, listen: &ibex_config::ListenSection, nbthread: usize) -> Proxy {
     let timeouts = Timeouts {
         client: listen.clitimeout.map_or(0, millis_to_u32),
         server: listen.srvtimeout.map_or(0, millis_to_u32),
@@ -718,14 +730,14 @@ fn init_proxy_from_listen(proxy_idx: usize, listen: &ibex_config::ListenSection)
         srvexp,
         servers: listen.servers.iter().map(|s| s.addr).collect(),
         server_ids: listen.servers.iter().map(|s| s.id.clone()).collect(),
-        server_statuses: vec![ServerStatus::Up; server_count],
+        server_statuses: Arc::new((0..server_count).map(|_| AtomicU8::new(ServerStatus::Up as u8)).collect()),
         server_weights: listen
             .servers
             .iter()
             .map(|s| s.weight.unwrap_or(1))
             .collect(),
-        next_server_idx: 0,
-        stats: ProxyStats::default(),
+        next_server_idx: Arc::new(AtomicUsize::new(0)),
+        stats: Arc::new((0..nbthread).map(|_| ProxyStats::default()).collect()),
         stats_config: {
             let mut sc = listen.stats.clone();
             sc.raw_timeouts = listen.timeouts;
@@ -744,7 +756,7 @@ fn init_proxy_from_listen(proxy_idx: usize, listen: &ibex_config::ListenSection)
         server_send_proxy_v2: listen.servers.iter().map(|s| s.send_proxy_v2).collect(),
         server_backups: listen.servers.iter().map(|s| s.backup).collect(),
         server_maxconn: listen.servers.iter().map(|s| s.maxconn).collect(),
-        server_actconn: vec![0; server_count],
+        server_actconn: Arc::new((0..server_count).map(|_| AtomicU32::new(0)).collect()),
         server_check_configs,
         tcp_req_conn_rules: listen.tcp_req_conn_rules.clone(),
         tcp_req_session_rules: listen.tcp_req_session_rules.clone(),
@@ -757,7 +769,7 @@ fn init_proxy_from_listen(proxy_idx: usize, listen: &ibex_config::ListenSection)
     }
 }
 
-fn init_proxy_from_frontend(proxy_idx: usize, fe: &ibex_config::FrontendSection) -> Proxy {
+fn init_proxy_from_frontend(proxy_idx: usize, fe: &ibex_config::FrontendSection, nbthread: usize) -> Proxy {
     let timeouts = Timeouts {
         client: fe
             .clitimeout
@@ -800,10 +812,10 @@ fn init_proxy_from_frontend(proxy_idx: usize, fe: &ibex_config::FrontendSection)
         srvexp: Vec::new(),
         servers: Vec::new(),
         server_ids: Vec::new(),
-        server_statuses: Vec::new(),
+        server_statuses: std::sync::Arc::new(Vec::new()),
         server_weights: Vec::new(),
-        next_server_idx: 0,
-        stats: ProxyStats::default(),
+        next_server_idx: Arc::new(AtomicUsize::new(0)),
+        stats: Arc::new((0..nbthread).map(|_| ProxyStats::default()).collect()),
         stats_config: {
             let mut sc = fe.stats.clone();
             sc.raw_timeouts = fe.timeouts;
@@ -822,7 +834,7 @@ fn init_proxy_from_frontend(proxy_idx: usize, fe: &ibex_config::FrontendSection)
         server_send_proxy_v2: Vec::new(),
         server_backups: Vec::new(),
         server_maxconn: Vec::new(),
-        server_actconn: Vec::new(),
+        server_actconn: std::sync::Arc::new(Vec::new()),
         server_check_configs: Vec::new(),
         tcp_req_conn_rules: fe.tcp_req_conn_rules.clone(),
         tcp_req_session_rules: fe.tcp_req_session_rules.clone(),
@@ -835,7 +847,7 @@ fn init_proxy_from_frontend(proxy_idx: usize, fe: &ibex_config::FrontendSection)
     }
 }
 
-fn init_proxy_from_backend(proxy_idx: usize, be: &ibex_config::BackendSection) -> Proxy {
+fn init_proxy_from_backend(proxy_idx: usize, be: &ibex_config::BackendSection, nbthread: usize) -> Proxy {
     let timeouts = Timeouts {
         client: be.timeouts.client.map_or(0, millis_to_u32),
         server: be
@@ -900,10 +912,10 @@ fn init_proxy_from_backend(proxy_idx: usize, be: &ibex_config::BackendSection) -
         srvexp,
         servers: be.servers.iter().map(|s| s.addr).collect(),
         server_ids: be.servers.iter().map(|s| s.id.clone()).collect(),
-        server_statuses: vec![ServerStatus::Up; server_count],
+        server_statuses: Arc::new((0..server_count).map(|_| AtomicU8::new(ServerStatus::Up as u8)).collect()),
         server_weights: be.servers.iter().map(|s| s.weight.unwrap_or(1)).collect(),
-        next_server_idx: 0,
-        stats: ProxyStats::default(),
+        next_server_idx: Arc::new(AtomicUsize::new(0)),
+        stats: Arc::new((0..nbthread).map(|_| ProxyStats::default()).collect()),
         stats_config: {
             let mut sc = be.stats.clone();
             sc.raw_timeouts = be.timeouts;
@@ -922,7 +934,7 @@ fn init_proxy_from_backend(proxy_idx: usize, be: &ibex_config::BackendSection) -
         server_send_proxy_v2: be.servers.iter().map(|s| s.send_proxy_v2).collect(),
         server_backups: be.servers.iter().map(|s| s.backup).collect(),
         server_maxconn: be.servers.iter().map(|s| s.maxconn).collect(),
-        server_actconn: vec![0; server_count],
+        server_actconn: Arc::new((0..server_count).map(|_| AtomicU32::new(0)).collect()),
         server_check_configs,
         tcp_req_conn_rules: Vec::new(),
         tcp_req_session_rules: Vec::new(),
@@ -983,7 +995,28 @@ impl Engine {
     /// # Errors
     /// Returns an error if epoll creation or binding any listener fails.
     #[allow(clippy::too_many_lines)]
-    pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
+    pub fn build_shared_state(config: &Config, nbthread: usize) -> io::Result<Vec<Proxy>> {
+    let mut proxies = Vec::new();
+    for listen in &config.listens {
+        if !listen.disabled { proxies.push(init_proxy_from_listen(proxies.len(), listen, nbthread)); }
+    }
+    for backend in &config.backends {
+        if !backend.disabled { proxies.push(init_proxy_from_backend(proxies.len(), backend, nbthread)); }
+    }
+    for frontend in &config.frontends {
+        if !frontend.disabled { proxies.push(init_proxy_from_frontend(proxies.len(), frontend, nbthread)); }
+    }
+    let _ = resolve_log_targets(config, &mut proxies);
+    Ok(proxies)
+}
+
+pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
+        let proxies = Self::build_shared_state(config, 1)?;
+        Self::new_worker(config, capacity, 0, proxies)
+    }
+
+    pub fn new_worker(config: &Config, capacity: usize, worker_id: usize, mut proxies: Vec<Proxy>) -> io::Result<Self> {
+        WORKER_ID.with(|id| id.set(worker_id));
         let poller = Poller::new(capacity)?;
         let mut scheduler = Scheduler::with_capacity(capacity);
         let mut fdtab = FdTab::with_capacity(capacity * 2);
@@ -999,95 +1032,54 @@ impl Engine {
             crate::buf::preallocate_large_buffers();
         }
 
-        let mut listeners = Vec::new();
-        let mut proxies = Vec::new();
-
-        // 1. Process listen sections
+        let mut listeners: Vec<crate::listener::Listener> = Vec::new();
+        let mut proxy_idx = 0;
         for listen in &config.listens {
-            if listen.disabled {
-                continue;
-            }
-
-            let proxy_idx = proxies.len();
-            let proxy = init_proxy_from_listen(proxy_idx, listen);
-
+            if listen.disabled { continue; }
             let mut listener = Listener::bind(listen.addr, 128, usize_to_u32(proxy_idx))?;
             listener.maxconn = listen.maxconn;
-
-            // Keyed by the listener, not the proxy. A proxy may own several listeners
-            // -- `bind :80` beside `bind :443 ssl` is the ordinary HTTP-to-HTTPS setup --
-            // and storing the proxy here meant an event on the second was served by
-            // looking up the first, which is the wrong socket, the wrong connection
-            // accounting and, once TLS is per-bind, the wrong transport.
             let l_idx = listeners.len();
             let lfd = listener.raw_fd();
-            fdtab.insert(
-                lfd,
-                FdState::Listener {
-                    listener: usize_to_u32(l_idx),
-                },
-                Interest::READ,
-            );
+            fdtab.insert(lfd, FdState::Listener { listener: usize_to_u32(l_idx) }, Interest::READ);
             poller.add(listener.borrowed_fd(), raw_fd_to_u64(lfd), true, false)?;
-
             listeners.push(listener);
-            proxies.push(proxy);
+            proxy_idx += 1;
         }
-
-        // 2. Process backend sections
         for backend in &config.backends {
-            if backend.disabled {
-                continue;
-            }
-            let proxy_idx = proxies.len();
-            let proxy = init_proxy_from_backend(proxy_idx, backend);
-            proxies.push(proxy);
+            if backend.disabled { continue; }
+            proxy_idx += 1;
         }
-
-        // 3. Process frontend sections
         for frontend in &config.frontends {
-            if frontend.disabled {
-                continue;
-            }
-            let proxy_idx = proxies.len();
-            let proxy = init_proxy_from_frontend(proxy_idx, frontend);
-
+            if frontend.disabled { continue; }
             let mut bind_addrs = Vec::new();
-            if let Some(bind_addr) = frontend.bind {
-                bind_addrs.push(bind_addr);
-            }
+            if let Some(bind_addr) = frontend.bind { bind_addrs.push(bind_addr); }
             for b in &frontend.binds {
-                if !bind_addrs.contains(&b.addr) {
-                    bind_addrs.push(b.addr);
-                }
+                if !bind_addrs.contains(&b.addr) { bind_addrs.push(b.addr); }
             }
-
             for bind_addr in bind_addrs {
                 let mut listener = Listener::bind(bind_addr, 128, usize_to_u32(proxy_idx))?;
                 listener.maxconn = frontend.maxconn;
                 listener.tls = bind_tls(frontend, bind_addr)?;
-
                 let l_idx = listeners.len();
                 let lfd = listener.raw_fd();
-                fdtab.insert(
-                    lfd,
-                    FdState::Listener {
-                        listener: usize_to_u32(l_idx),
-                    },
-                    Interest::READ,
-                );
+                fdtab.insert(lfd, FdState::Listener { listener: usize_to_u32(l_idx) }, Interest::READ);
                 poller.add(listener.borrowed_fd(), raw_fd_to_u64(lfd), true, false)?;
-
                 listeners.push(listener);
             }
-            proxies.push(proxy);
+            proxy_idx += 1;
         }
 
         let log_targets = resolve_log_targets(config, &mut proxies);
 
         let start_time = Instant::now();
         let now = Tick(1);
-        let checks = init_checks(&proxies, &mut scheduler, now);
+        
+        let checks = if worker_id == 0 {
+            init_checks(&proxies, &mut scheduler, now)
+        } else {
+            Vec::new()
+        };
+
 
         Ok(Engine {
             poller,
@@ -1103,6 +1095,7 @@ impl Engine {
             start_time,
             now,
             is_running: true,
+            worker_id,
             events: Vec::with_capacity(capacity * 2),
             timer_updates: Vec::with_capacity(capacity * 2),
             log_targets,
@@ -1161,7 +1154,7 @@ impl Engine {
     #[must_use]
     pub fn format_stats_info(&self) -> String {
         let pid = std::process::id();
-        let active_conns: u32 = self.proxies.iter().map(|p| p.stats.act_conn).sum();
+        let active_conns: u32 = self.proxies.iter().map(|p| p.stats.iter().map(|s| s.act_conn.load(Ordering::Relaxed)).sum::<u32>()).sum();
         let max_conns: u32 = self.proxies.iter().map(|p| p.maxconn).sum();
         crate::stats::format_show_info(
             self.start_time,
@@ -1379,8 +1372,8 @@ impl Engine {
                 server_addr: Some(self.listeners[l_idx].addr()),
                 fc_src: Some(peer_addr),
                 fc_dst: Some(self.listeners[l_idx].addr()),
-                act_conn: self.proxies[proxy_idx].stats.act_conn,
-                cum_conn: self.proxies[proxy_idx].stats.cum_conn,
+                act_conn: self.proxies[proxy_idx].stats[worker_id()].act_conn.load(Ordering::Relaxed),
+                cum_conn: self.proxies[proxy_idx].stats[worker_id()].cum_conn.load(Ordering::Relaxed),
                 ..Default::default()
             };
 
@@ -1510,7 +1503,7 @@ impl Engine {
                 ConnEvalOutcome::Accept(c, s, fs, fd) => (c, s, fs, fd),
                 ConnEvalOutcome::Reject => {
                     raw::abort_with_rst(cli_fd.as_fd());
-                    self.proxies[proxy_idx].stats.denied_conn += 1;
+                    self.proxies[proxy_idx].stats[worker_id()].denied_conn.fetch_add(1, Ordering::Relaxed);
                     for (t_idx, ref key) in tracked_sc.iter().flatten() {
                         if let Some(ref tbl) = self.proxies[*t_idx].stick_table {
                             let _ = tbl.update_entry(key, |data| {
@@ -1523,7 +1516,7 @@ impl Engine {
                 }
                 ConnEvalOutcome::SilentDrop => {
                     raw::silent_drop(cli_fd.as_fd(), peer_addr.is_ipv6());
-                    self.proxies[proxy_idx].stats.denied_conn += 1;
+                    self.proxies[proxy_idx].stats[worker_id()].denied_conn.fetch_add(1, Ordering::Relaxed);
                     for (t_idx, ref key) in tracked_sc.iter().flatten() {
                         if let Some(ref tbl) = self.proxies[*t_idx].stick_table {
                             let _ = tbl.update_entry(key, |data| {
@@ -1538,10 +1531,10 @@ impl Engine {
 
             self.listeners[l_idx].nbconn += 1;
             let proxy = &mut self.proxies[proxy_idx];
-            proxy.stats.cum_conn += 1;
-            proxy.stats.act_conn += 1;
-            if proxy.stats.act_conn > proxy.stats.max_conn {
-                proxy.stats.max_conn = proxy.stats.act_conn;
+            proxy.stats[worker_id()].cum_conn.fetch_add(1, Ordering::Relaxed);
+            proxy.stats[worker_id()].act_conn.fetch_add(1, Ordering::Relaxed);
+            if proxy.stats[worker_id()].act_conn.load(Ordering::Relaxed) > proxy.stats[worker_id()].max_conn.load(Ordering::Relaxed) {
+                proxy.stats[worker_id()].max_conn.store(proxy.stats[worker_id()].act_conn.load(Ordering::Relaxed), Ordering::Relaxed);
             }
 
             if self.listeners[l_idx].is_full() {
@@ -1676,8 +1669,8 @@ fn eval_tcp_req_conn_rules(
         fc_src: Some(fc_src),
         fc_dst: Some(fc_dst),
         sc_conn_rates,
-        act_conn: proxy.stats.act_conn,
-        cum_conn: proxy.stats.cum_conn,
+        act_conn: proxy.stats[worker_id()].act_conn.load(Ordering::Relaxed),
+        cum_conn: proxy.stats[worker_id()].cum_conn.load(Ordering::Relaxed),
         ..Default::default()
     };
 
@@ -1755,8 +1748,8 @@ fn eval_tcp_req_session_rules(
         fc_src: sess.fc_src,
         fc_dst: sess.fc_dst,
         proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
-        act_conn: proxy.stats.act_conn,
-        cum_conn: proxy.stats.cum_conn,
+        act_conn: proxy.stats[worker_id()].act_conn.load(Ordering::Relaxed),
+        cum_conn: proxy.stats[worker_id()].cum_conn.load(Ordering::Relaxed),
         ..Default::default()
     };
 
@@ -2008,8 +2001,8 @@ fn eval_tcp_req_content_rules(
         fc_dst: sess.fc_dst,
         proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
         req_body: if has_content { Some(req_bytes) } else { None },
-        act_conn: proxy.stats.act_conn,
-        cum_conn: proxy.stats.cum_conn,
+        act_conn: proxy.stats[worker_id()].act_conn.load(Ordering::Relaxed),
+        cum_conn: proxy.stats[worker_id()].cum_conn.load(Ordering::Relaxed),
         ..Default::default()
     };
 
@@ -2288,7 +2281,7 @@ fn register_new_session(
     let target_server_idx = target_addr.and_then(|t| proxy.servers.iter().position(|&s| s == t));
     if let Some(idx) = target_server_idx {
         if idx < proxy.server_actconn.len() {
-            proxy.server_actconn[idx] += 1;
+            proxy.server_actconn[idx].fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -2314,7 +2307,7 @@ fn register_new_session(
     }) else {
         if let Some(idx) = target_server_idx {
             if idx < proxy.server_actconn.len() {
-                proxy.server_actconn[idx] = proxy.server_actconn[idx].saturating_sub(1);
+                proxy.server_actconn[idx].fetch_sub(1, Ordering::Relaxed);
             }
         }
         return;
@@ -2326,7 +2319,7 @@ fn register_new_session(
     else {
         if let Some(idx) = target_server_idx {
             if idx < proxy.server_actconn.len() {
-                proxy.server_actconn[idx] = proxy.server_actconn[idx].saturating_sub(1);
+                proxy.server_actconn[idx].fetch_sub(1, Ordering::Relaxed);
             }
         }
         engine.sessions.free(session_idx);
@@ -2499,13 +2492,13 @@ fn init_client_session(
         SessionEvalOutcome::Accept => {}
         SessionEvalOutcome::Reject => {
             raw::abort_with_rst(sess.cli.as_fd());
-            proxies[proxy_idx].stats.denied_req += 1;
+            proxies[proxy_idx].stats[worker_id()].denied_req.fetch_add(1, Ordering::Relaxed);
             return None;
         }
         SessionEvalOutcome::SilentDrop => {
             let is_ipv6 = peer_addr.is_ipv6();
             raw::silent_drop(sess.cli.as_fd(), is_ipv6);
-            proxies[proxy_idx].stats.denied_req += 1;
+            proxies[proxy_idx].stats[worker_id()].denied_req.fetch_add(1, Ordering::Relaxed);
             return None;
         }
     }
@@ -2545,7 +2538,7 @@ fn init_client_session(
                     sess.server_connected(now);
                 }
             } else {
-                proxy.stats.failed_conn += 1;
+                proxy.stats[worker_id()].failed_conn.fetch_add(1, Ordering::Relaxed);
                 if !sess.server_failed() {
                     sess.srv_state = ScState::Error;
                 }
@@ -2575,14 +2568,12 @@ pub fn shutdown_session_entry(
         entry.actconn_reclaimed = true;
         let proxy_idx = entry.proxy_idx;
         if proxy_idx < proxies.len() {
-            proxies[proxy_idx].stats.act_conn =
-                proxies[proxy_idx].stats.act_conn.saturating_sub(1);
+            proxies[proxy_idx].stats[worker_id()].act_conn.fetch_sub(1, Ordering::Relaxed);
         }
         if let Some(s_idx) = entry.target_server_idx {
             let be_idx = entry.backend_idx;
             if be_idx < proxies.len() && s_idx < proxies[be_idx].server_actconn.len() {
-                proxies[be_idx].server_actconn[s_idx] =
-                    proxies[be_idx].server_actconn[s_idx].saturating_sub(1);
+                proxies[be_idx].server_actconn[s_idx].fetch_sub(1, Ordering::Relaxed);
             }
         }
     }
@@ -2628,14 +2619,14 @@ pub fn clear_proxy_counters(proxies: &mut [Proxy], target: Option<&str>) -> bool
     if let Some(name) = target {
         if name.eq_ignore_ascii_case("all") {
             for p in proxies.iter_mut() {
-                p.stats.clear();
+                p.stats.iter().for_each(|s| s.clear());
             }
             true
         } else {
             let mut found = false;
             for p in proxies.iter_mut() {
                 if p.name == name {
-                    p.stats.clear();
+                    p.stats.iter().for_each(|s| s.clear());
                     found = true;
                 }
             }
@@ -2643,7 +2634,7 @@ pub fn clear_proxy_counters(proxies: &mut [Proxy], target: Option<&str>) -> bool
         }
     } else {
         for p in proxies.iter_mut() {
-            p.stats.clear();
+            p.stats.iter().for_each(|s| s.clear());
         }
         true
     }
@@ -2745,14 +2736,13 @@ fn retry_server_connect(
     if let Some(old_idx) = entry.target_server_idx.take() {
         let old_be = entry.backend_idx;
         if old_be < proxies.len() && old_idx < proxies[old_be].server_actconn.len() {
-            proxies[old_be].server_actconn[old_idx] =
-                proxies[old_be].server_actconn[old_idx].saturating_sub(1);
+            proxies[old_be].server_actconn[old_idx].fetch_sub(1, Ordering::Relaxed);
         }
     }
 
     let be_idx = EngineDispatcher::resolve_backend(entry, proxies);
     entry.backend_idx = be_idx;
-    proxies[be_idx].stats.retries_count += 1;
+    proxies[be_idx].stats[worker_id()].retries_count.fetch_add(1, Ordering::Relaxed);
     let source_ip = entry.sess.client_addr.map(|a| a.ip());
     let target = if proxies[be_idx].redisp {
         proxies[be_idx].select_server_with_key(source_ip)
@@ -2773,7 +2763,7 @@ fn retry_server_connect(
         .position(|&s| s == target_addr);
     if let Some(idx) = s_idx {
         if idx < proxies[be_idx].server_actconn.len() {
-            proxies[be_idx].server_actconn[idx] += 1;
+            proxies[be_idx].server_actconn[idx].fetch_add(1, Ordering::Relaxed);
         }
     }
     entry.target_server_idx = s_idx;
@@ -2824,7 +2814,7 @@ fn retry_server_connect(
             }
         }
     } else {
-        proxies[be_idx].stats.failed_conn += 1;
+        proxies[be_idx].stats[worker_id()].failed_conn.fetch_add(1, Ordering::Relaxed);
         if !entry.sess.server_failed() {
             entry.sess.srv_state = ScState::Error;
             if entry.sess.mode == Mode::Http {
@@ -2874,7 +2864,7 @@ fn check_srv_connect(
                     }
                 } else {
                     let be_idx = EngineDispatcher::resolve_backend(entry, proxies);
-                    proxies[be_idx].stats.failed_conn += 1;
+                    proxies[be_idx].stats[worker_id()].failed_conn.fetch_add(1, Ordering::Relaxed);
                     if entry.sess.server_failed() {
                         retry_server_connect(entry, proxies, fdtab, poller, now);
                     } else {
@@ -2946,16 +2936,15 @@ fn cleanup_done(
     }
 
     let proxy_idx = entry.proxy_idx;
-    proxies[proxy_idx].stats.bytes_in += entry.sess.bytes_in;
-    proxies[proxy_idx].stats.bytes_out += entry.sess.bytes_out;
+    proxies[proxy_idx].stats[worker_id()].bytes_in.fetch_add(entry.sess.bytes_in, Ordering::Relaxed);
+    proxies[proxy_idx].stats[worker_id()].bytes_out.fetch_add(entry.sess.bytes_out, Ordering::Relaxed);
     if !entry.actconn_reclaimed {
-        proxies[proxy_idx].stats.act_conn = proxies[proxy_idx].stats.act_conn.saturating_sub(1);
+        proxies[proxy_idx].stats[worker_id()].act_conn.fetch_sub(1, Ordering::Relaxed);
 
         if let Some(s_idx) = entry.target_server_idx {
             let be_idx = entry.backend_idx;
             if be_idx < proxies.len() && s_idx < proxies[be_idx].server_actconn.len() {
-                proxies[be_idx].server_actconn[s_idx] =
-                    proxies[be_idx].server_actconn[s_idx].saturating_sub(1);
+                proxies[be_idx].server_actconn[s_idx].fetch_sub(1, Ordering::Relaxed);
             }
         }
     }
@@ -3007,8 +2996,8 @@ impl EngineDispatcher<'_> {
             req_uri: entry.sess.req_uri.as_deref(),
             req_method: entry.sess.req_method.as_deref(),
             req_headers: entry.sess.req_headers.as_deref(),
-            act_conn: proxy.stats.act_conn,
-            cum_conn: proxy.stats.cum_conn,
+            act_conn: proxy.stats[worker_id()].act_conn.load(Ordering::Relaxed),
+            cum_conn: proxy.stats[worker_id()].cum_conn.load(Ordering::Relaxed),
             ..Default::default()
         };
 
@@ -3096,7 +3085,7 @@ impl EngineDispatcher<'_> {
                     }
                     ContentEvalResult::Reject => {
                         raw::abort_with_rst(entry.sess.cli.as_fd());
-                        self.proxies[proxy_idx].stats.denied_req += 1;
+                        self.proxies[proxy_idx].stats[worker_id()].denied_req.fetch_add(1, Ordering::Relaxed);
                         entry.sess.cli_state = ScState::Closed;
                         entry.sess.srv_state = ScState::Closed;
                         entry.sess.tcp_inspect_done = true;
@@ -3104,7 +3093,7 @@ impl EngineDispatcher<'_> {
                     ContentEvalResult::SilentDrop => {
                         let is_ipv6 = entry.sess.client_addr.is_some_and(|a| a.is_ipv6());
                         raw::silent_drop(entry.sess.cli.as_fd(), is_ipv6);
-                        self.proxies[proxy_idx].stats.denied_req += 1;
+                        self.proxies[proxy_idx].stats[worker_id()].denied_req.fetch_add(1, Ordering::Relaxed);
                         entry.sess.cli_state = ScState::Closed;
                         entry.sess.srv_state = ScState::Closed;
                         entry.sess.tcp_inspect_done = true;
@@ -3982,7 +3971,7 @@ impl EngineDispatcher<'_> {
                                         _ => None,
                                     };
                                     if let Some(st) = new_status {
-                                        proxy.server_statuses[s_idx] = st;
+                                        proxy.server_statuses[s_idx].store(st as u8, Ordering::Relaxed);
                                         if let Some(check) = checks
                                             .iter_mut()
                                             .find(|c| c.proxy_idx == p_idx && c.server_idx == s_idx)
@@ -4154,8 +4143,8 @@ impl EngineDispatcher<'_> {
             req_uri: entry.sess.req_uri.as_deref(),
             req_method: entry.sess.req_method.as_deref(),
             req_headers: entry.sess.req_headers.as_deref(),
-            act_conn: proxies[proxy_idx].stats.act_conn,
-            cum_conn: proxies[proxy_idx].stats.cum_conn,
+            act_conn: proxies[proxy_idx].stats[worker_id()].act_conn.load(Ordering::Relaxed),
+            cum_conn: proxies[proxy_idx].stats[worker_id()].cum_conn.load(Ordering::Relaxed),
             ..Default::default()
         };
 
@@ -4270,8 +4259,8 @@ impl EngineDispatcher<'_> {
             }
         }
 
-        let act_conn = proxies[proxy_idx].stats.act_conn;
-        let cum_conn = proxies[proxy_idx].stats.cum_conn;
+        let act_conn = proxies[proxy_idx].stats[worker_id()].act_conn.load(Ordering::Relaxed);
+        let cum_conn = proxies[proxy_idx].stats[worker_id()].cum_conn.load(Ordering::Relaxed);
         let eval_http_rules = |rules: &[ibex_config::HttpReqRule], acls: &HashMap<String, Expr>, sess: &mut TcpSession, target_addr: Option<SocketAddr>| -> Result<Option<()>, ()> {
             macro_rules! make_ctx {
                 ($s:expr) => {
@@ -4783,7 +4772,7 @@ impl EngineDispatcher<'_> {
             match res {
                 ContentEvalResult::Reject => {
                     raw::abort_with_rst(entry.sess.cli.as_fd());
-                    proxies[be_idx].stats.denied_req += 1;
+                    proxies[be_idx].stats[worker_id()].denied_req.fetch_add(1, Ordering::Relaxed);
                     entry.sess.cli_state = ScState::Closed;
                     entry.sess.srv_state = ScState::Closed;
                     return None;
@@ -4791,7 +4780,7 @@ impl EngineDispatcher<'_> {
                 ContentEvalResult::SilentDrop => {
                     let is_ipv6 = entry.sess.client_addr.is_some_and(|a| a.is_ipv6());
                     raw::silent_drop(entry.sess.cli.as_fd(), is_ipv6);
-                    proxies[be_idx].stats.denied_req += 1;
+                    proxies[be_idx].stats[worker_id()].denied_req.fetch_add(1, Ordering::Relaxed);
                     entry.sess.cli_state = ScState::Closed;
                     entry.sess.srv_state = ScState::Closed;
                     return None;
@@ -4942,7 +4931,7 @@ impl EngineDispatcher<'_> {
         };
 
         let Some(target_addr) = target else {
-            proxies[be_idx].stats.failed_conn += 1;
+            proxies[be_idx].stats[worker_id()].failed_conn.fetch_add(1, Ordering::Relaxed);
             entry.sess.srv_state = ScState::Error;
             entry.sess.send_synthetic_response(
                 503,
@@ -4958,7 +4947,7 @@ impl EngineDispatcher<'_> {
             .position(|&s| s == target_addr);
         if let Some(idx) = s_idx {
             if idx < proxies[be_idx].server_actconn.len() {
-                proxies[be_idx].server_actconn[idx] += 1;
+                proxies[be_idx].server_actconn[idx].fetch_add(1, Ordering::Relaxed);
             }
         }
         entry.target_server_idx = s_idx;
@@ -5049,7 +5038,7 @@ impl EngineDispatcher<'_> {
                 }
             }
         } else {
-            proxies[be_idx].stats.failed_conn += 1;
+            proxies[be_idx].stats[worker_id()].failed_conn.fetch_add(1, Ordering::Relaxed);
             retry_server_connect(entry, proxies, fdtab, poller, now);
         }
         None
@@ -5076,7 +5065,7 @@ impl EngineDispatcher<'_> {
             match res {
                 ContentEvalResult::Reject => {
                     raw::abort_with_rst(entry.sess.cli.as_fd());
-                    proxies[be_idx].stats.denied_req += 1;
+                    proxies[be_idx].stats[worker_id()].denied_req.fetch_add(1, Ordering::Relaxed);
                     entry.sess.cli_state = ScState::Closed;
                     entry.sess.srv_state = ScState::Closed;
                     return;
@@ -5084,7 +5073,7 @@ impl EngineDispatcher<'_> {
                 ContentEvalResult::SilentDrop => {
                     let is_ipv6 = entry.sess.client_addr.is_some_and(|a| a.is_ipv6());
                     raw::silent_drop(entry.sess.cli.as_fd(), is_ipv6);
-                    proxies[be_idx].stats.denied_req += 1;
+                    proxies[be_idx].stats[worker_id()].denied_req.fetch_add(1, Ordering::Relaxed);
                     entry.sess.cli_state = ScState::Closed;
                     entry.sess.srv_state = ScState::Closed;
                     return;
@@ -5107,7 +5096,7 @@ impl EngineDispatcher<'_> {
             .position(|&s| s == target_addr);
         if let Some(idx) = s_idx {
             if idx < proxies[be_idx].server_actconn.len() {
-                proxies[be_idx].server_actconn[idx] += 1;
+                proxies[be_idx].server_actconn[idx].fetch_add(1, Ordering::Relaxed);
             }
         }
         entry.target_server_idx = s_idx;
@@ -5158,7 +5147,7 @@ impl EngineDispatcher<'_> {
                 }
             }
         } else {
-            proxies[be_idx].stats.failed_conn += 1;
+            proxies[be_idx].stats[worker_id()].failed_conn.fetch_add(1, Ordering::Relaxed);
             retry_server_connect(entry, proxies, fdtab, poller, now);
         }
     }
@@ -5175,7 +5164,7 @@ impl EngineDispatcher<'_> {
                 && proxy_idx < self.proxies.len()
                 && server_idx < self.proxies[proxy_idx].server_statuses.len()
             {
-                self.proxies[proxy_idx].server_statuses[server_idx] = check.status;
+                self.proxies[proxy_idx].server_statuses[server_idx].store(check.status as u8, Ordering::Relaxed);
             }
 
             // The message is built while `check` is still borrowed, then the borrow ends

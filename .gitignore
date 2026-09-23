@@ -30,3 +30,9 @@ __pycache__/
 
 # Stray build artefacts: agent sessions have dropped .rlib files in the repo root.
 *.rlib
+
+# perf(1) output: T39 leaves perf.data in the repo root. 107 MB, and GitLab refuses
+# blobs over 100 MB, so this one rejected a push of 49 other files.
+perf.data
+perf.data.old
+*.perf

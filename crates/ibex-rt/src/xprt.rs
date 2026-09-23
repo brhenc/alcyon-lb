@@ -418,3 +418,194 @@ pub fn accept_tls(
         RustlsContext::new_server(fd.as_raw_fd(), conn),
     ))))
 }
+
+/// The transport under a backend server connection.
+///
+/// `Plain` costs nothing: the arms compile to the same `raw::recv`/`raw::send` calls
+/// as before. `Tls` is boxed to keep [`crate::proxy::TcpSession`] small on plaintext paths.
+pub enum ServerXprt {
+    Plain,
+    Tls(Box<TlsConn>),
+}
+
+impl ServerXprt {
+    #[must_use]
+    pub const fn is_tls(&self) -> bool {
+        matches!(self, ServerXprt::Tls(_))
+    }
+
+    #[must_use]
+    pub fn alpn(&self) -> Option<&[u8]> {
+        match self {
+            ServerXprt::Plain => None,
+            ServerXprt::Tls(t) => t.alpn(),
+        }
+    }
+
+    #[must_use]
+    pub fn sni(&self) -> Option<&str> {
+        match self {
+            ServerXprt::Plain => None,
+            ServerXprt::Tls(t) => t.ctx.tls_info.sni.as_deref(),
+        }
+    }
+
+    #[must_use]
+    pub fn tls_info(&self) -> Option<&dyn ibex_proto::transport::TlsInfo> {
+        match self {
+            ServerXprt::Plain => None,
+            ServerXprt::Tls(t) => Some(&t.ctx.tls_info),
+        }
+    }
+
+    /// True when the transport itself needs the socket to be writable.
+    #[must_use]
+    pub fn wants_write(&self) -> bool {
+        match self {
+            ServerXprt::Plain => false,
+            ServerXprt::Tls(t) => t.wants_write(),
+        }
+    }
+
+    /// True once bytes may flow. Plaintext is ready immediately.
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        match self {
+            ServerXprt::Plain => true,
+            ServerXprt::Tls(t) => t.handshake_done(),
+        }
+    }
+
+    /// True when the stream ended without `close_notify`.
+    #[must_use]
+    pub fn was_truncated(&self) -> bool {
+        match self {
+            ServerXprt::Plain => false,
+            ServerXprt::Tls(t) => t.was_truncated(),
+        }
+    }
+
+    /// Drives any pending handshake. `Ok(true)` when the transport is ready.
+    ///
+    /// # Errors
+    /// Propagates a failed handshake, certificate verification failure, or broken connection.
+    pub fn handshake(&mut self, fd: BorrowedFd<'_>) -> io::Result<bool> {
+        match self {
+            ServerXprt::Plain => Ok(true),
+            ServerXprt::Tls(t) => t.handshake(fd),
+        }
+    }
+
+    /// Reads plaintext from backend, mirroring [`raw::recv`].
+    ///
+    /// # Errors
+    /// Propagates socket failures and TLS protocol errors.
+    pub fn recv(&mut self, fd: BorrowedFd<'_>, dst: &mut [u8]) -> io::Result<Io> {
+        match self {
+            ServerXprt::Plain => raw::recv(fd, dst),
+            ServerXprt::Tls(t) => {
+                if !t.handshake(fd)? {
+                    return Ok(Io::WouldBlock);
+                }
+                let open = t.fill(fd)?;
+                t.flush(fd)?;
+
+                let n = match t.session() {
+                    Some(TlsSession::Server(c)) => c.reader().read(dst),
+                    Some(TlsSession::Client(c)) => c.reader().read(dst),
+                    None => return Ok(Io::Closed),
+                };
+                match n {
+                    Ok(n) if n > 0 => Ok(Io::Done(n)),
+                    Ok(_) | Err(_) if t.peer_closed => Ok(Io::Eof),
+                    Ok(_) | Err(_) if !open => {
+                        t.truncated = true;
+                        Ok(Io::Closed)
+                    }
+                    Ok(_) => Ok(Io::WouldBlock),
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(Io::WouldBlock),
+                    Err(e) => Err(e),
+                }
+            }
+        }
+    }
+
+    /// Writes plaintext to backend, mirroring [`raw::send`].
+    ///
+    /// # Errors
+    /// Propagates socket failures.
+    pub fn send(&mut self, fd: BorrowedFd<'_>, src: &[u8]) -> io::Result<Io> {
+        match self {
+            ServerXprt::Plain => raw::send(fd, src),
+            ServerXprt::Tls(t) => {
+                if !t.handshake(fd)? {
+                    return Ok(Io::WouldBlock);
+                }
+                let n = match t.session() {
+                    Some(TlsSession::Server(c)) => c.writer().write(src),
+                    Some(TlsSession::Client(c)) => c.writer().write(src),
+                    None => return Ok(Io::Closed),
+                };
+                let taken = match n {
+                    Ok(n) => n,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => 0,
+                    Err(e) => return Err(e),
+                };
+                t.flush(fd)?;
+                if taken == 0 {
+                    Ok(Io::WouldBlock)
+                } else {
+                    Ok(Io::Done(taken))
+                }
+            }
+        }
+    }
+
+    /// Sends `close_notify` so the backend server can tell a finished stream from a cut one.
+    pub fn send_close_notify(&mut self, fd: BorrowedFd<'_>) {
+        if let ServerXprt::Tls(t) = self {
+            match t.session() {
+                Some(TlsSession::Server(c)) => c.send_close_notify(),
+                Some(TlsSession::Client(c)) => c.send_close_notify(),
+                None => return,
+            }
+            let _ = t.flush(fd);
+        }
+    }
+}
+
+impl std::fmt::Debug for ServerXprt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ServerXprt::Plain => f.write_str("ServerXprt::Plain"),
+            ServerXprt::Tls(t) => f
+                .debug_struct("ServerXprt::Tls")
+                .field("handshake_done", &t.handshake_done())
+                .field("truncated", &t.was_truncated())
+                .finish(),
+        }
+    }
+}
+
+/// Builds an outbound client-side TLS transport to connect to an upstream backend server.
+///
+/// # Errors
+/// Propagates rustls client session setup failure.
+pub fn connect_tls(
+    fd: &impl AsRawFd,
+    config: std::sync::Arc<rustls::ClientConfig>,
+    server_name: rustls::pki_types::ServerName<'static>,
+) -> io::Result<ServerXprt> {
+    let sni_str = match &server_name {
+        rustls::pki_types::ServerName::DnsName(dns) => Some(dns.as_ref().to_string()),
+        rustls::pki_types::ServerName::IpAddress(ip) => Some(match ip {
+            rustls::pki_types::IpAddr::V4(v4) => std::net::Ipv4Addr::from(*v4).to_string(),
+            rustls::pki_types::IpAddr::V6(v6) => std::net::Ipv6Addr::from(*v6).to_string(),
+        }),
+        _ => None,
+    };
+    let conn = rustls::ClientConnection::new(config, server_name).map_err(io::Error::other)?;
+    Ok(ServerXprt::Tls(Box::new(TlsConn::new(
+        RustlsContext::new_client(fd.as_raw_fd(), conn, sni_str),
+    ))))
+}

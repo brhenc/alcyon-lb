@@ -16,6 +16,8 @@ rustls = { workspace = true }
 ibex-stick-table = { path = "../ibex-stick-table" }
 rustix = { version = "0.38", features = ["event", "net", "fs", "process", "std"] }
 ibex-mmsg = { path = "../ibex-mmsg" }
+ibex-quic = { path = "../ibex-quic" }
+ctrlc = "3.5.2"
 
 [lints.rust]
 unsafe_code = "forbid"

@@ -201,8 +201,8 @@ impl CliApplet {
                 for (s_idx, s) in p.server_ids.iter().enumerate() {
                     let addr = p.servers.get(s_idx).map_or_else(|| "-".to_string(), |a| a.ip().to_string());
                     let port = p.servers.get(s_idx).map_or_else(|| "-".to_string(), |a| a.port().to_string());
-                    let op_state = match p.server_statuses.get(s_idx) {
-                        Some(crate::check::ServerStatus::Up) => 2,
+                    let op_state = match p.server_statuses.get(s_idx).map(|s| s.load(std::sync::atomic::Ordering::Relaxed)) {
+                        Some(0 /* Up */) => 2,
                         _ => 0,
                     };
                     self.out_buf.extend_from_slice(
@@ -339,7 +339,7 @@ impl CliApplet {
     }
 
     fn handle_show_info(&mut self, ctx: &AppletContext) {
-        let active_conns: u32 = ctx.proxies.iter().map(|p| p.stats.act_conn).sum();
+        let active_conns: u32 = ctx.proxies.iter().map(|p| p.stats.iter().map(|s| s.act_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u32>()).sum();
         let max_conns: u32 = ctx.proxies.iter().map(|p| p.maxconn).sum();
         let info = format_show_info(
             ctx.start_time,
@@ -654,7 +654,7 @@ impl CliApplet {
                 found_px = true;
                 for (s_idx, sid) in proxy.server_ids.iter().enumerate() {
                     if sid == sv_name {
-                        proxy.server_statuses[s_idx] = ServerStatus::Up;
+                        proxy.server_statuses[s_idx].store(0 /* Up */, std::sync::atomic::Ordering::Relaxed);
                         found_sv = true;
                         if let Some(check) = ctx
                             .checks
@@ -691,7 +691,7 @@ impl CliApplet {
                 found_px = true;
                 for (s_idx, sid) in proxy.server_ids.iter().enumerate() {
                     if sid == sv_name {
-                        proxy.server_statuses[s_idx] = ServerStatus::Down;
+                        proxy.server_statuses[s_idx].store(1 /* Down */, std::sync::atomic::Ordering::Relaxed);
                         found_sv = true;
                         if let Some(check) = ctx
                             .checks
@@ -736,7 +736,7 @@ impl CliApplet {
                     if px_name.is_empty() || proxy.name == px_name {
                         for (s_idx, sid) in proxy.server_ids.iter().enumerate() {
                             if sid == sv_name {
-                                proxy.server_statuses[s_idx] = status;
+                                proxy.server_statuses[s_idx].store(status as u8, std::sync::atomic::Ordering::Relaxed);
                                 if let Some(check) = ctx
                                     .checks
                                     .iter_mut()

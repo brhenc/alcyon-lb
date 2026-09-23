@@ -123,17 +123,17 @@ proptest! {
         prop_assert_eq!(back_bin, Sample::Bin(data));
     }
 
-    /// `concat` converter appends all arguments in order.
+    /// `concat` converter appends prefix and suffix arguments.
     #[test]
-    fn prop_conv_concat(base in "\\PC*", args in prop::collection::vec("\\PC*", 1..5)) {
+    fn prop_conv_concat(base in "\\PC*", prefix in "\\PC*", suffix in "\\PC*") {
         let reg = Registry::new();
         let conv_concat = reg.get_converter("concat").unwrap();
 
-        let result = (conv_concat.func)(Sample::Str(base.clone()), &args).expect("concat");
-        let mut expected = base;
-        for a in &args {
-            expected.push_str(a);
-        }
+        let result = (conv_concat.func)(
+            Sample::Str(base.clone()),
+            &[prefix.clone(), String::new(), suffix.clone()],
+        ).expect("concat");
+        let expected = format!("{base}{prefix}{suffix}");
         prop_assert_eq!(result, Sample::Str(expected));
     }
 
@@ -181,7 +181,10 @@ proptest! {
         let reg = Registry::new();
         let conv_ipmask = reg.get_converter("ipmask").unwrap();
 
-        let result = (conv_ipmask.func)(Sample::Ipv6(ip), &[prefix.to_string()]).expect("ipmask v6");
+        let result = (conv_ipmask.func)(
+            Sample::Ipv6(ip),
+            &["32".to_string(), prefix.to_string()],
+        ).expect("ipmask v6");
         let mask = u128::MAX.checked_shl(128 - prefix).unwrap_or(0);
         let expected_ip = Ipv6Addr::from(u128::from(ip) & mask);
         prop_assert_eq!(result, Sample::Ipv6(expected_ip));
