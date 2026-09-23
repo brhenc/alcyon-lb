@@ -15,6 +15,7 @@ ibex-alloc = { workspace = true }
 rustls = { workspace = true }
 ibex-stick-table = { path = "../ibex-stick-table" }
 rustix = { version = "0.38", features = ["event", "net", "fs", "process", "std"] }
+ibex-mmsg = { path = "../ibex-mmsg" }
 
 [lints.rust]
 unsafe_code = "forbid"
@@ -26,3 +27,5 @@ pedantic = { level = "warn", priority = -1 }
 [dev-dependencies]
 tempfile = "3"
 rcgen = "0.13"
+serde = { workspace = true }
+serde_json = { workspace = true }

@@ -10,7 +10,7 @@ members = [
     "crates/ibex-stick-table",
     "crates/ibex-tls",
     "crates/ibex-alloc",
-    "crates/ibex-h1-sys",
+    "crates/ibex-h1-sys", "crates/slz", "crates/ibex-mmsg", "crates/ibex-dns",
 ]
 
 

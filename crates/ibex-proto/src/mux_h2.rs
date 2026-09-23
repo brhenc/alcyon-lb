@@ -72,8 +72,6 @@ pub struct H2FloodConfig {
     pub max_total_streams: usize,
     /// Threshold of glitch frames before graceful GOAWAY (75%) and hard close (100%) (`tune.h2.fe.glitches-threshold`). Default: 0 (disabled).
     pub glitches_threshold: usize,
-    /// Maximum burst resets allowed before task deprioritization (`tune.h2.fe.max-rst-at-once`). Default: 0 (disabled).
-    pub max_rst_at_once: usize,
 }
 
 /// HTTP/2 Connection Context.

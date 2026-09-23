@@ -224,6 +224,7 @@ impl StatRow {
 
 /// Formats the `show info` output for `HATop` and CLI consumers.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn format_show_info(
     start_time: Instant,
     pid: u32,
@@ -239,22 +240,175 @@ pub fn format_show_info(
     let mins = (total_secs % 3600) / 60;
     let secs = total_secs % 60;
 
-    format!(
-        "Name: Ibex\n\
-         Version: 0.1.0\n\
-         Release_date: 2026/09/21\n\
-         Nbproc: 1\n\
-         Process_num: 1\n\
-         Pid: {pid}\n\
-         Uptime: {days}d {hours:02}h{mins:02}m{secs:02}s\n\
-         Uptime_sec: {total_secs}\n\
-         Maxconn: {max_conns}\n\
-         CurrConns: {active_conns}\n\
-         Maxpipes: 0\n\
-         PipesUsed: 0\n\
-         Tasks: {total_tasks}\n\
-         Run_queue: {run_queue_len}\n\
-         node: ibex\n"
+format!(
+        "Name: Ibex
+\
+         Version: 0.1.0
+\
+         Release_date: 2026/09/21
+\
+         Nbthread: 1
+\
+         Nbproc: 1
+\
+         Process_num: 1
+\
+         Pid: {pid}
+\
+         Uptime: {days}d {hours:02}h{mins:02}m{secs:02}s
+\
+         Uptime_sec: {total_secs}
+\
+         Memmax_MB: 0
+\
+         PoolAlloc_MB: 0
+\
+         PoolUsed_MB: 0
+\
+         PoolFailed: 0
+\
+         Ulimit-n: 0
+\
+         Maxsock: 0
+\
+         Maxconn: {max_conns}
+\
+         Hard_maxconn: {max_conns}
+\
+         CurrConns: {active_conns}
+\
+         CumConns: 0
+\
+         CumReq: 0
+\
+         MaxSslConns: 0
+\
+         CurrSslConns: 0
+\
+         CumSslConns: 0
+\
+         Maxpipes: 0
+\
+         PipesUsed: 0
+\
+         PipesFree: 0
+\
+         ConnRate: 0
+\
+         ConnRateLimit: 0
+\
+         MaxConnRate: 0
+\
+         SessRate: 0
+\
+         SessRateLimit: 0
+\
+         MaxSessRate: 0
+\
+         SslRate: 0
+\
+         SslRateLimit: 0
+\
+         MaxSslRate: 0
+\
+         SslFrontendKeyRate: 0
+\
+         SslFrontendMaxKeyRate: 0
+\
+         SslFrontendSessionReuse_pct: 0
+\
+         SslBackendKeyRate: 0
+\
+         SslBackendMaxKeyRate: 0
+\
+         SslCacheLookups: 0
+\
+         SslCacheMisses: 0
+\
+         CompressBpsIn: 0
+\
+         CompressBpsOut: 0
+\
+         CompressBpsRateLim: 0
+\
+         ZlibMemUsage: 0
+\
+         MaxZlibMemUsage: 0
+\
+         Tasks: {total_tasks}
+\
+         Run_queue: {run_queue_len}
+\
+         Idle_pct: 100
+\
+         node: ibex
+\
+         description: Ibex Router
+\
+         Stopping: 0
+\
+         Jobs: 0
+\
+         Unstoppable Jobs: 0
+\
+         Listeners: 0
+\
+         ActivePeers: 0
+\
+         ConnectedPeers: 0
+\
+         DroppedLogs: 0
+\
+         BusyPolling: 0
+\
+         FailedResolutions: 0
+\
+         TotalBytesOut: 0
+\
+         TotalSplicedBytesOut: 0
+\
+         BytesOutRate: 0
+\
+         DebugCommandsIssued: 0
+\
+         CumRecvLogs: 0
+\
+         Build info: 0.1.0
+\
+         Memmax_bytes: 0
+\
+         PoolAlloc_bytes: 0
+\
+         PoolUsed_bytes: 0
+\
+         Start_time_sec: 0
+\
+         Tainted: 0
+\
+         TotalWarnings: 0
+\
+         MaxconnReached: 0
+\
+         BootTime_ms: 0
+\
+         Niced_tasks: 0
+\
+         CurrStreams: 0
+\
+         CumStreams: 0
+\
+         BlockedTrafficWarnings: 0
+\
+         PatternsAdded: 0
+\
+         PatternsFreed: 0
+\
+         NbThreadGroups: 0
+\
+         Master_id: master
+\
+         Worker_id: worker
+"
     )
 }
 

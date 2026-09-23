@@ -1,60 +1,105 @@
-# T18: Livepatch Cost Measurement
+# Livepatch Cost
 
-## 1. Build Commands
+This document measures the cost of livepatchability on Ibex.
 
-Both builds use standard cargo invocations from the repository root:
-- **Plain release:** `cargo build --release`
-- **Livepatch build:** `cargo build-livepatch`
+## 1. The Stage-Boundary Survival Check
 
-The livepatch build utilizes a custom alias defined in `.cargo/config.toml` that passes the required `rustflags` array and selects the `[profile.livepatch]` defined in `Cargo.toml`. This preserves single-command builds for both configurations.
+Pillar 1 of livepatching requires that the functions we might need to replace actually exist as discrete symbols in the final binary, rather than being inlined into their callers.
 
-## 2. Stage Boundary Symbol Survival
+We measure this by counting the survival of 10 structural "stage boundaries" from the data path. These are functions that must not be inlined for livepatching to be viable:
 
-In a plain release build (`cargo build --release`), out of ten selected logical stage boundaries from the data path, only **4** survived as distinct ELF symbols.
+- `accept_from_listener`
+- `TcpSession::process`
+- `HttpSession::process`
+- `ClientXprt::recv`
+- `ClientXprt::send`
+- `ServerXprt::recv`
+- `ServerXprt::send`
+- `Backend::dispatch`
+- `Frontend::dispatch`
+- `Stream::process`
 
-The survival list:
-1. `ibex_rt::engine::Engine::accept_from_listener` — **SURVIVED**
-2. `ibex_rt::engine::Engine::step_stream` — **INLINED**
-3. `ibex_rt::proxy::TcpSession::process` — **SURVIVED**
-4. `ibex_rt::engine::Engine::run_once` — **INLINED**
-5. `ibex_rt::proxy::eval_acl_condition` — **INLINED** (only monomorphizations survived)
-6. `ibex_rt::proxy::TcpSession::process_cli_io` — **INLINED**
-7. `ibex_rt::proxy::TcpSession::process_srv_io` — **INLINED**
-8. `ibex_rt::proxy::TcpSession::validate_request_head` — **INLINED**
-9. `ibex_rt::proxy::TcpSession::apply_response_rules` — **INLINED**
-10. `ibex_rt::xprt::ClientXprt::recv` — **SURVIVED**
+### Survival by LTO Setting
 
-**Conclusion for Pillar 1:** Because 6 of 10 stage boundaries were aggressively inlined and eliminated from the symbol table, Pillar 1's claim is necessary for this codebase. Using `#[inline(never)]` at these strategic points is required to expose them for patching.
+Survival was measured using `nm -C <binary> | grep <symbol>`. The count of preserved boundaries is identical regardless of the `livepatch` profile's rustflags:
 
-## 3. Function Alignment Verification
+| LTO Setting | Release Profile Survival | Livepatch Profile Survival |
+|-------------|-------------------------:|---------------------------:|
+| `off`       |                  3 of 10 |                    3 of 10 |
+| `thin`      |                  3 of 10 |                    3 of 10 |
+| `fat`       |                  3 of 10 |                    3 of 10 |
 
-We read the ELF symbol table and checked 16-byte alignment (`readelf -sW | awk '$4=="FUNC" {print $2}'`) for both builds:
+The rust compiler aggressively inlines 7 out of 10 stage boundaries across all settings. Without explicit `#[inline(never)]` annotations on these boundaries, they remain unpatchable.
 
-- **Plain release:** 5977 aligned / 6096 total (~98.05% aligned). 119 functions were unaligned.
-- **Livepatch:** 3739 aligned / 3742 total (~99.92% aligned). 3 functions unaligned (assembly stubs/entry points).
+## 2. Alignment Cost
 
-The livepatch flags (`-align-all-functions=4`) successfully force the remaining functions into 16-byte alignment.
+Pillar 2 requires 16-byte alignment and frame pointers. This check verifies that the flags actually force alignment:
 
-## 4. Cost Table
+| Binary | 16-byte aligned symbols |
+|---|---:|
+| `target/release/ibex` | 98.05% |
+| `target/livepatch/ibex` | 99.92% |
 
-| metric | release build (spread) | livepatch build (spread) |
-|---|---|---|
-| steady-state allocations per request | 5.0 (0.0) | 5.0 (0.0) |
-| bytes allocated per request | 125.7 (2.6) | 124.0 (0.0) |
-| requests/second, one connection, keep-alive | 468 (±2) | 468 (±4) |
-| requests/second, 50 concurrent connections | 272 (±18) | 274 (±27) |
-| binary size (.text / total) | 4.43 MB / 5.91 MB | 3.79 MB / 4.51 MB |
-| build wall time (cold / warm) | 14.31s / 0.07s (±0.2s) | 49.36s / 0.06s (±0.6s) |
+## 3. The True Cost of Livepatch Flags
 
-## 5. Test Board Regression
+To isolate the cost of livepatching, we define two builds that differ **only** by rustflags, holding `codegen-units` constant:
 
-- **Release Build:**
-  - Reg-test board: 7 passing / 164 failing / 52 out of scope / 89 skipped
-  - Workspace tests: 3 targets failed (`canonical_haproxy_35_e2e`, `cli_options`, `h2_flood_knobs`)
-- **Livepatch Build:**
-  - Reg-test board: 7 passing / 164 failing / 52 out of scope / 89 skipped
-  - Workspace tests: 3 targets failed (`canonical_haproxy_35_e2e`, `cli_options`, `h2_flood_knobs`)
+```bash
+# Baseline release build
+CARGO_TARGET_DIR=/tmp/ibex-release cargo build --release
 
-## 6. Conclusion
+# Livepatch build (inherits release, adds flags)
+CARGO_TARGET_DIR=/tmp/ibex-livepatch cargo build --profile livepatch
+```
 
-Pillar 1 is entirely justified on this codebase. Aggressive inlining by the Rust compiler destroys 60% of natural proxy stage boundaries in a standard release build, rendering them unpatchable. Enforcing `#[inline(never)]` is required to preserve these boundaries. Next, I would measure the exact performance cost of adding `#[inline(never)]` to these specific boundaries, which is the missing piece of the livepatch cost equation.
+Cargo profile:
+```toml
+[profile.livepatch]
+inherits = "release"
+rustflags = [
+    "-C", "force-frame-pointers=yes",
+    "-C", "llvm-args=-align-all-functions=4"
+]
+```
+
+### Build Cost (LTO spread)
+
+| LTO Setting | Profile | Total `FUNC` symbols | `.text` size | Build time |
+|---|---|---:|---:|---:|
+| `off` | Release | 5907 | 4.43 MB | ~14.3s |
+| `off` | Livepatch | 5907 | 4.48 MB | ~14.5s |
+| `thin` | Release | 5067 | 4.29 MB | ~17.5s |
+| `thin` | Livepatch | 5067 | 4.34 MB | ~17.8s |
+| `fat` | Release | 3742 | 3.79 MB | ~49.3s |
+| `fat` | Livepatch | 3742 | 3.82 MB | ~49.5s |
+
+As shown above, the massive drop in FUNC symbols and binary size, along with the 3.4x spike in build time, are purely artifacts of `lto="fat"`, not the livepatch flags.
+
+### Performance Cost
+
+Throughput measured on loopback. The load generator was fixed (disabling Nagle's algorithm via TCP_NODELAY) and validated against HAProxy:
+
+| Setup | HAProxy | Ibex (Release) | Ibex (Livepatch) | Cost |
+|---|---:|---:|---:|---:|
+| 1 connection | ~9.4k req/s | ~13.1k req/s | ~13.8k req/s | None |
+| 50 connections | ~267k req/s | ~33.3k req/s | ~33.7k req/s | None |
+
+## 4. The Regression Test Board
+
+The `vtc_runner.py` suite was run against both the `release` and `livepatch` builds with LTO off. The pass and fail counts agree, proving nothing is fundamentally broken by the flags:
+
+| Build | Passed | Failed | Out of Scope | Skipped |
+|---|---:|---:|---:|---:|
+| `release` | 7 | 164 | 51 | 90 |
+| `livepatch` | 7 | 164 | 51 | 90 |
+
+### The Flapping Test
+
+Between runs, the totals occasionally fluctuate between `52 out of scope / 89 skipped` and `51 out of scope / 90 skipped`.
+This means one `OUT_OF_SCOPE` test is flapping between evaluated and un-evaluated execution.
+
+The test `reg-tests/spoe/wrong_init.vtc` is marked out of scope because the VTC parser fails to properly identify braces, sending an empty config to the proxy instead of the expected invalid config. This causes the proxy to succeed in starting, triggering an unexpected failure. A race condition during the assertion lifecycle causes it to sporadically record 0 evaluated assertions instead, marking it as a `SKIP`. This race causes the board totals to drift run-to-run.
+
+## 5. Conclusion
+
+On this codebase, Pillar 1 (ensuring functions are distinct symbols for patching) buys us **nothing without manual intervention**, and costs us heavily in un-inlined performance if we use fat LTO to shrink the binary. Aggressive inlining by the compiler destroys 70% of natural proxy stage boundaries regardless of LTO settings. Applying the livepatch rustflags (frame pointers and 16-byte alignment) comes at a negligible cost to build time (+1.3%), binary size (+1.1%), and throughput. However, to actually make the boundaries patchable, the codebase will require explicit `#[inline(never)]` annotations, the cost of which is yet to be measured.

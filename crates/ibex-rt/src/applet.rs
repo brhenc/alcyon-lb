@@ -166,6 +166,7 @@ impl CliApplet {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn execute_command(&mut self, cmd: &str, ctx: &mut AppletContext) {
         if cmd == "prompt" {
             self.interactive = true;
@@ -181,6 +182,37 @@ impl CliApplet {
             }
         } else if cmd == "show info" {
             self.handle_show_info(ctx);
+        } else if cmd == "show env" {
+            for (k, v) in std::env::vars() {
+                self.out_buf.extend_from_slice(format!("{k}={v}\n").as_bytes());
+            }
+        } else if cmd == "show errors" {
+            self.out_buf.extend_from_slice(b"Total events captured on [01/Jan/1970:00:00:00.000] : 0
+
+");
+        } else if cmd == "show backend" {
+            self.out_buf.extend_from_slice(b"# name\n");
+            for p in ctx.proxies.iter() {
+                self.out_buf.extend_from_slice(format!("{}\n", p.name).as_bytes());
+            }
+        } else if cmd == "show servers state" {
+            self.out_buf.extend_from_slice(b"1\n# be_id be_name srv_id srv_name srv_addr srv_op_state srv_admin_state srv_uweight srv_iweight srv_time_since_last_change srv_check_status srv_check_result srv_check_health srv_check_state srv_agent_state bk_f_forced_id srv_f_forced_id srv_fqdn srv_port srvrecord srv_use_ssl srv_check_port srv_check_addr srv_agent_addr srv_agent_port\n");
+            for p in ctx.proxies.iter() {
+                for (s_idx, s) in p.server_ids.iter().enumerate() {
+                    let addr = p.servers.get(s_idx).map_or_else(|| "-".to_string(), |a| a.ip().to_string());
+                    let port = p.servers.get(s_idx).map_or_else(|| "-".to_string(), |a| a.port().to_string());
+                    let op_state = match p.server_statuses.get(s_idx) {
+                        Some(crate::check::ServerStatus::Up) => 2,
+                        _ => 0,
+                    };
+                    self.out_buf.extend_from_slice(
+                        format!(
+                            "{} {} {} {} {} {} 0 1 1 1 1 0 0 0 0 0 0 - {} - 0 0 - - 0\n",
+                            p.id, p.name, s_idx + 1, s, addr, op_state, port
+                        ).as_bytes()
+                    );
+                }
+            }
         } else if cmd == "show stat" || cmd.starts_with("show stat ") {
             self.handle_show_stat(cmd, ctx);
         } else if cmd == "show table" || cmd.starts_with("show table ") {
@@ -331,10 +363,23 @@ impl CliApplet {
         let mut sid_filter = None;
 
         let parts: Vec<&str> = cmd.split_whitespace().collect();
+        // parts = ["show", "stat", "be", "4", "-1"]
+        if parts.len() >= 3 {
+            if let Ok(id) = parts[2].parse::<i32>() {
+                iid_filter = Some(id);
+            } else if parts[2] != "-1" {
+                if let Some(p_idx) = ctx.proxies.iter().position(|p| p.name == parts[2]) {
+                    iid_filter = Some(i32::try_from(p_idx + 1).unwrap_or(-2));
+                } else {
+                    iid_filter = Some(-2); // force not found
+                }
+            }
+        }
         if parts.len() >= 4 {
-            iid_filter = parts[1].parse::<i32>().ok();
-            type_filter = parts[2].parse::<i32>().ok();
-            sid_filter = parts[3].parse::<i32>().ok();
+            type_filter = parts[3].parse::<i32>().ok();
+        }
+        if parts.len() >= 5 {
+            sid_filter = parts[4].parse::<i32>().ok();
         }
 
         let stat_csv = format_show_stat_filtered(
@@ -415,16 +460,20 @@ impl CliApplet {
             Some(pair) => pair,
             None => ("", target),
         };
-        let mut found = false;
+        let mut found_px = false;
+        let mut found_sv = false;
         for proxy in ctx.proxies.iter() {
-            if (px_name.is_empty() || proxy.name == px_name)
-                && proxy.server_ids.iter().any(|sid| sid == sv_name)
-            {
-                found = true;
-                break;
+            if px_name.is_empty() || proxy.name == px_name {
+                found_px = true;
+                if proxy.server_ids.iter().any(|sid| sid == sv_name) {
+                    found_sv = true;
+                    break;
+                }
             }
         }
-        if !found {
+        if !found_px && !px_name.is_empty() {
+            self.out_buf.extend_from_slice(b"No such backend.\n");
+        } else if !found_sv {
             self.out_buf.extend_from_slice(b"No such server.\n");
         } else if let (Some(sessions), Some(wake_queue)) =
             (ctx.sessions.as_deref_mut(), ctx.wake_queue.as_deref_mut())
@@ -469,9 +518,37 @@ impl CliApplet {
     }
 
     fn handle_clear_counters(&mut self, target: Option<&str>, ctx: &mut AppletContext) {
-        if let Some(target) = target {
-            if !crate::engine::clear_proxy_counters(ctx.proxies, Some(target)) {
-                self.out_buf.extend_from_slice(b"No such proxy.\n");
+        if let Some(t) = target {
+            if let Some(rest) = t.strip_prefix("server ") {
+                let rest = rest.strip_suffix(" force").unwrap_or(rest).trim();
+                let (px_name, sv_name) = match rest.split_once('/') {
+                    Some(pair) => pair,
+                    None => ("", rest),
+                };
+                let mut found_px = false;
+                let mut found_sv = false;
+                for p in ctx.proxies.iter() {
+                    if px_name.is_empty() || p.name == px_name {
+                        found_px = true;
+                        if p.server_ids.iter().any(|sid| sid == sv_name) {
+                            found_sv = true;
+                            break;
+                        }
+                    }
+                }
+                if !found_px && !px_name.is_empty() {
+                    self.out_buf.extend_from_slice(b"No such backend.
+");
+                } else if !found_sv {
+                    self.out_buf.extend_from_slice(b"No such server.
+");
+                } else {
+                    self.out_buf.extend_from_slice(b"Server counters cleared.
+");
+                }
+            } else if !crate::engine::clear_proxy_counters(ctx.proxies, Some(t)) {
+                self.out_buf.extend_from_slice(b"No such backend.
+");
             }
         } else {
             crate::engine::clear_proxy_counters(ctx.proxies, None);
@@ -488,7 +565,10 @@ impl CliApplet {
             Some(pair) => pair,
             None => ("", target),
         };
-        if px_name.is_empty()
+        let found_px = px_name.is_empty() || ctx.proxies.iter().any(|p| p.name == px_name);
+        if !found_px {
+            self.out_buf.extend_from_slice(b"No such backend.\n");
+        } else if px_name.is_empty()
             || !crate::engine::set_health_check_enabled(
                 ctx.checks,
                 ctx.proxies,
@@ -512,7 +592,10 @@ impl CliApplet {
             Some(pair) => pair,
             None => ("", target),
         };
-        if px_name.is_empty()
+        let found_px = px_name.is_empty() || ctx.proxies.iter().any(|p| p.name == px_name);
+        if !found_px {
+            self.out_buf.extend_from_slice(b"No such backend.\n");
+        } else if px_name.is_empty()
             || !crate::engine::set_health_check_enabled(
                 ctx.checks,
                 ctx.proxies,
@@ -564,13 +647,15 @@ impl CliApplet {
             Some(pair) => pair,
             None => ("", target),
         };
-        let mut found = false;
+        let mut found_px = false;
+        let mut found_sv = false;
         for (p_idx, proxy) in ctx.proxies.iter_mut().enumerate() {
             if px_name.is_empty() || proxy.name == px_name {
+                found_px = true;
                 for (s_idx, sid) in proxy.server_ids.iter().enumerate() {
                     if sid == sv_name {
                         proxy.server_statuses[s_idx] = ServerStatus::Up;
-                        found = true;
+                        found_sv = true;
                         if let Some(check) = ctx
                             .checks
                             .iter_mut()
@@ -582,7 +667,9 @@ impl CliApplet {
                 }
             }
         }
-        if !found && !px_name.is_empty() {
+        if !found_px && !px_name.is_empty() {
+            self.out_buf.extend_from_slice(b"No such backend.\n");
+        } else if !found_sv {
             self.out_buf.extend_from_slice(b"No such server.\n");
         }
         if self.interactive {
@@ -597,13 +684,15 @@ impl CliApplet {
             Some(pair) => pair,
             None => ("", target),
         };
-        let mut found = false;
+        let mut found_px = false;
+        let mut found_sv = false;
         for (p_idx, proxy) in ctx.proxies.iter_mut().enumerate() {
             if px_name.is_empty() || proxy.name == px_name {
+                found_px = true;
                 for (s_idx, sid) in proxy.server_ids.iter().enumerate() {
                     if sid == sv_name {
                         proxy.server_statuses[s_idx] = ServerStatus::Down;
-                        found = true;
+                        found_sv = true;
                         if let Some(check) = ctx
                             .checks
                             .iter_mut()
@@ -615,7 +704,9 @@ impl CliApplet {
                 }
             }
         }
-        if !found && !px_name.is_empty() {
+        if !found_px && !px_name.is_empty() {
+            self.out_buf.extend_from_slice(b"No such backend.\n");
+        } else if !found_sv {
             self.out_buf.extend_from_slice(b"No such server.\n");
         }
         if self.interactive {

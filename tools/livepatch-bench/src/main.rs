@@ -47,7 +47,7 @@ fn backend(l: TcpListener, run: Arc<AtomicBool>) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         while run.load(Ordering::Relaxed) {
             if let Ok((mut s, _)) = l.accept() {
-                s.set_nonblocking(false).ok();
+                s.set_nonblocking(false).ok(); s.set_nodelay(true).ok();
                 s.set_read_timeout(Some(Duration::from_millis(100))).ok();
                 let r = run.clone();
                 thread::spawn(move || {
@@ -155,14 +155,14 @@ fn main() {
             let r = run.clone(); let c = count.clone();
             threads.push(thread::spawn(move || {
                 let mut sock = TcpStream::connect(fa).unwrap();
-                sock.set_nonblocking(false).unwrap();
+                sock.set_nonblocking(false).unwrap(); sock.set_nodelay(true).unwrap();
                 sock.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
                 let mut b = [0u8; 4096];
                 while r.load(Ordering::Relaxed) {
                     if sock.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n").is_err() {
                         if let Ok(new_sock) = TcpStream::connect(fa) {
                             sock = new_sock;
-                            sock.set_nonblocking(false).unwrap();
+                            sock.set_nonblocking(false).unwrap(); sock.set_nodelay(true).unwrap();
                             sock.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
                         }
                         continue;
@@ -180,7 +180,7 @@ fn main() {
                             Ok(_) => {
                                 if let Ok(new_sock) = TcpStream::connect(fa) {
                                     sock = new_sock;
-                                    sock.set_nonblocking(false).unwrap();
+                                    sock.set_nonblocking(false).unwrap(); sock.set_nodelay(true).unwrap();
                                     sock.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
                                 }
                                 break;
@@ -189,7 +189,7 @@ fn main() {
                             Err(_) => {
                                 if let Ok(new_sock) = TcpStream::connect(fa) {
                                     sock = new_sock;
-                                    sock.set_nonblocking(false).unwrap();
+                                    sock.set_nonblocking(false).unwrap(); sock.set_nodelay(true).unwrap();
                                     sock.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
                                 }
                                 break;

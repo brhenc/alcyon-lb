@@ -15,6 +15,7 @@ pub mod applet;
 pub mod buf;
 pub mod check;
 pub mod cond;
+pub mod dgram;
 pub mod engine;
 pub mod fdtab;
 pub mod listener;
