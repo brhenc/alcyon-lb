@@ -10,11 +10,13 @@ use std::time::Duration;
 use crate::ast::{
     AclCondition, AclRule, AclTerm, BackendSection, BalanceAlgorithm, BindConfig, Config,
     DefaultServerConfig, DefaultsSection, FrontendSection, GlobalSection, GlobalSetVar,
-    HttpAfterResAction, HttpAfterResRule, HttpReqAction, HttpReqRule, HttpResAction, HttpResRule,
-    HttpReuse, ListenSection, LogConfig, LogFacility, LogLevel, LogTarget, Mode, Server, StatsConfig,
-    StickRule, StickRuleType, StickTableConfigAst, TcpReqConnAction, TcpReqConnRule,
-    TcpReqContentAction, TcpReqContentRule, TcpReqSessionAction, TcpReqSessionRule, TimeoutConfig,
-    UseBackendRule,
+    HttpAfterResAction, HttpAfterResRule, HttpCheckAction, HttpCheckExpectPattern, HttpChkConfig,
+    HttpReqAction, HttpReqRule, HttpResAction, HttpResRule, HttpReuse, ListenSection, LogConfig,
+    LogFacility, LogLevel, LogTarget, MatchType, Mode, ResolvedCheckConfig, ResolvedHttpCheck,
+    ResolvedHttpExpectPattern, ResolvedHttpExpectRule, ResolvedTcpExpectPattern, ResolvedTcpStep,
+    Server, StatsConfig, StickRule, StickRuleType, StickTableConfigAst, TcpCheckAction,
+    TcpCheckExpectPattern, TcpReqConnAction, TcpReqConnRule, TcpReqContentAction,
+    TcpReqContentRule, TcpReqSessionAction, TcpReqSessionRule, TimeoutConfig, UseBackendRule,
 };
 use crate::error::ConfigError;
 use crate::lexer::{lex, Token};
@@ -228,13 +230,16 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
 
     validate_config(global.as_ref(), &listens, &frontends, &backends)?;
 
-    Ok(Config {
+    let config = Config {
         global,
         defaults,
         listens,
         frontends,
         backends,
-    })
+    };
+    register_checks_from_config(&config);
+
+    Ok(config)
 }
 
 fn flush_current_section(
@@ -1309,10 +1314,47 @@ fn parse_backend_directive(
 }
 
 #[allow(clippy::unnecessary_wraps)]
+/// Options whose silent absence changes what the daemon *checks*, not merely what it logs.
+///
+/// `option httpchk GET /health` parsed into nothing and `ibex -c` reported the config valid.
+/// The server then got a bare TCP connect, so a backend accepting connections and answering
+/// 500 to everything was reported UP. A health check that silently degrades is how an outage
+/// is masked rather than caught, which is worse than one that never started.
+///
+/// This is deliberately a named list rather than a blanket refusal of unknown options.
+/// Making the `global` section strictly reject unknown keywords took the reg-test board from
+/// 7 passing to 1 in one commit, because `thread-groups` appears in nearly every HAProxy
+/// reg-test. Refuse what is dangerous to ignore; keep ignoring what is merely unimplemented.
+const CHECK_OPTIONS_THAT_MUST_NOT_BE_IGNORED: &[&str] = &[
+    "httpchk",
+    "ssl-hello-chk",
+    "smtpchk",
+    "mysql-check",
+    "pgsql-check",
+    "redis-check",
+    "ldap-check",
+    "spop-check",
+    "tcp-check",
+];
+
+fn refuse_if_check_option(name: &str, kw: &Token) -> Result<(), ConfigError> {
+    if CHECK_OPTIONS_THAT_MUST_NOT_BE_IGNORED.contains(&name) {
+        return Err(ConfigError::new(
+            kw.line,
+            kw.col,
+            format!(
+                "'option {name}' is not supported (only TCP connect health checks are \
+                 implemented); accepting it would silently downgrade the check"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn parse_option_listen(
     proxy: &mut ListenSection,
     tokens: &[Token],
-    _kw: &Token,
+    kw: &Token,
 ) -> Result<(), ConfigError> {
     if tokens.len() >= 2 {
         match tokens[1].text.as_str() {
@@ -1339,6 +1381,7 @@ fn parse_option_listen(
                 proxy.log_health_checks = true;
             }
             other => {
+                refuse_if_check_option(other, kw)?;
                 eprintln!("[ibex] warning: ignored option '{other}'");
             }
         }
@@ -1350,7 +1393,7 @@ fn parse_option_listen(
 fn parse_option_frontend(
     fe: &mut FrontendSection,
     tokens: &[Token],
-    _kw: &Token,
+    kw: &Token,
 ) -> Result<(), ConfigError> {
     if tokens.len() >= 2 {
         match tokens[1].text.as_str() {
@@ -1374,6 +1417,7 @@ fn parse_option_frontend(
                 fe.log_health_checks = true;
             }
             other => {
+                refuse_if_check_option(other, kw)?;
                 eprintln!("[ibex] warning: ignored option '{other}'");
             }
         }
@@ -1385,7 +1429,7 @@ fn parse_option_frontend(
 fn parse_option_backend(
     be: &mut BackendSection,
     tokens: &[Token],
-    _kw: &Token,
+    kw: &Token,
 ) -> Result<(), ConfigError> {
     if tokens.len() >= 2 {
         match tokens[1].text.as_str() {
@@ -1412,6 +1456,7 @@ fn parse_option_backend(
                 be.log_health_checks = true;
             }
             other => {
+                refuse_if_check_option(other, kw)?;
                 eprintln!("[ibex] warning: ignored option '{other}'");
             }
         }
@@ -1423,12 +1468,13 @@ fn parse_option_backend(
 fn parse_option_defaults(
     defaults: &mut DefaultsSection,
     tokens: &[Token],
-    _kw: &Token,
+    kw: &Token,
 ) -> Result<(), ConfigError> {
     if tokens.len() >= 2 {
         if tokens[1].text == "log-health-checks" {
             defaults.log_health_checks = true;
         } else {
+            refuse_if_check_option(&tokens[1].text, kw)?;
             eprintln!("[ibex] warning: ignored option '{}'", tokens[1].text);
         }
     }

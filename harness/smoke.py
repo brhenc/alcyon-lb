@@ -175,7 +175,7 @@ def main() -> int:
         print("smoke: --accept records the parse count only; refresh `passing` from a full")
         print("       `vtc_runner.py <reg-tests>/ --json` so the list is measured, not copied.")
         json.dump({"configs_parsed": ok, "configs_total": total,
-                   "passing": expected}, open(BASELINE, "w"), indent=1)
+                   "passing": expected, "rejected": rejected}, open(BASELINE, "w"), indent=1)
         open(BASELINE, "a").write("\n")
         print(f"smoke: baseline written -- {ok}/{total} configs parse, "
               f"{len(expected)} tests expected to pass")
@@ -189,11 +189,20 @@ def main() -> int:
 
     failed = False
     if prev is not None and ok < prev:
-        print(f"\n!! REGRESSION: {prev - ok} configs that used to parse no longer do.")
+        print(f"\n!! REGRESSION: {prev - ok} config(s) that used to parse no longer do.")
         print("   This is the shape of the thread-groups incident: the daemon stops")
-        print("   starting, and no unit test can see it. Most common causes:")
-        for line in rejected[:5]:
-            print(f"     {line}")
+        print("   starting, and no unit test can see it.")
+        # The delta, not a sample of every rejection. The first version printed
+        # `rejected[:5]`, which on a one-config regression showed five configs that had
+        # been failing all along -- noise where the answer should have been.
+        was = set(base.get("rejected", []))
+        now_new = [r for r in rejected if r not in was]
+        if now_new:
+            print("   newly rejected:")
+            for line in now_new[:10]:
+                print(f"     {line}")
+        else:
+            print("   (no baseline rejection list recorded -- run --accept to enable the delta)")
         failed = True
     if gone:
         print(f"\n!! REGRESSION: {len(gone)} test(s) that passed no longer pass:")
