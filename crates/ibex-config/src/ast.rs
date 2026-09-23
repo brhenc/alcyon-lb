@@ -5,7 +5,9 @@
 
 #![allow(clippy::struct_excessive_bools)]
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::{LazyLock, RwLock};
 use std::time::Duration;
 
 /// Full `HAProxy` configuration containing one or more proxy sections.
@@ -121,6 +123,14 @@ pub struct DefaultsSection {
     pub tcp_req_inspect_delay: Option<Duration>,
     /// Default HTTP connection reuse strategy (`http-reuse`).
     pub http_reuse: Option<HttpReuse>,
+    /// Default HTTP check configuration (`option httpchk`).
+    pub httpchk: Option<HttpChkConfig>,
+    /// Default custom HTTP check directives (`http-check`).
+    pub http_checks: Vec<HttpCheckAction>,
+    /// Default custom TCP check directives (`tcp-check`).
+    pub tcp_checks: Vec<TcpCheckAction>,
+    /// Default TCP check mode enabled (`option tcp-check`).
+    pub tcp_check: bool,
 }
 
 /// Unified timeouts configuration.
@@ -159,6 +169,9 @@ pub struct DefaultServerConfig {
     pub send_proxy: bool,
     pub send_proxy_v2: bool,
     pub maxconn: Option<u32>,
+    pub check_port: Option<u16>,
+    pub check_proto: Option<String>,
+    pub check_ssl: bool,
 }
 
 /// Modern TCP-request connection action.
@@ -484,6 +497,14 @@ pub struct ListenSection {
     pub http_reuse: Option<HttpReuse>,
     /// Stats applet and dashboard configuration.
     pub stats: StatsConfig,
+    /// HTTP check configuration (`option httpchk`).
+    pub httpchk: Option<HttpChkConfig>,
+    /// Custom HTTP check directives (`http-check`).
+    pub http_checks: Vec<HttpCheckAction>,
+    /// Custom TCP check directives (`tcp-check`).
+    pub tcp_checks: Vec<TcpCheckAction>,
+    /// TCP check mode enabled (`option tcp-check`).
+    pub tcp_check: bool,
 }
 
 /// Stats configuration options for a proxy.
@@ -546,6 +567,10 @@ impl Default for ListenSection {
             forwardfor: None,
             originalto: None,
             stats: StatsConfig::default(),
+            httpchk: None,
+            http_checks: Vec::new(),
+            tcp_checks: Vec::new(),
+            tcp_check: false,
         }
     }
 }
@@ -713,6 +738,14 @@ pub struct BackendSection {
     pub http_reuse: Option<HttpReuse>,
     /// Stats applet and dashboard configuration.
     pub stats: StatsConfig,
+    /// HTTP check configuration (`option httpchk`).
+    pub httpchk: Option<HttpChkConfig>,
+    /// Custom HTTP check directives (`http-check`).
+    pub http_checks: Vec<HttpCheckAction>,
+    /// Custom TCP check directives (`tcp-check`).
+    pub tcp_checks: Vec<TcpCheckAction>,
+    /// TCP check mode enabled (`option tcp-check`).
+    pub tcp_check: bool,
 }
 
 impl Default for BackendSection {
@@ -747,6 +780,10 @@ impl Default for BackendSection {
             originalto: None,
             http_reuse: None,
             stats: StatsConfig::default(),
+            httpchk: None,
+            http_checks: Vec::new(),
+            tcp_checks: Vec::new(),
+            tcp_check: false,
         }
     }
 }
@@ -874,6 +911,12 @@ pub struct Server {
     pub maxconn: Option<u32>,
     /// Whether this server is a backup server.
     pub backup: bool,
+    /// Custom port for health checks (`check-port` / `port`).
+    pub check_port: Option<u16>,
+    /// Protocol for health checks (`check-proto`).
+    pub check_proto: Option<String>,
+    /// Whether health checks use SSL (`check-ssl`).
+    pub check_ssl: bool,
 }
 
 impl Default for Server {
@@ -890,6 +933,9 @@ impl Default for Server {
             weight: None,
             maxconn: None,
             backup: false,
+            check_port: None,
+            check_proto: None,
+            check_ssl: false,
         }
     }
 }
@@ -909,6 +955,9 @@ impl Server {
             weight: None,
             maxconn: None,
             backup: false,
+            check_port: None,
+            check_proto: None,
+            check_ssl: false,
         }
     }
 }
@@ -1007,4 +1056,225 @@ pub struct HeaderExp {
     pub regex: String,
     /// Replacement string.
     pub replacement: String,
+}
+
+/// Configuration for `option httpchk [<method>] <uri> [<version>] [<host>]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpChkConfig {
+    pub method: Option<String>,
+    pub uri: Option<String>,
+    pub version: Option<String>,
+    pub host: Option<String>,
+}
+
+/// Action in an `http-check` rule list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HttpCheckAction {
+    Connect {
+        addr: Option<SocketAddr>,
+        port: Option<u16>,
+        send_proxy: bool,
+    },
+    Send {
+        method: Option<String>,
+        uri: Option<String>,
+        version: Option<String>,
+        headers: Vec<(String, String)>,
+        body: Option<String>,
+    },
+    Expect {
+        pattern: HttpCheckExpectPattern,
+        negate: bool,
+    },
+    Comment(String),
+    DisableOn404,
+    SendState,
+    SetVar {
+        var_name: String,
+        expr: String,
+    },
+    UnsetVar {
+        var_name: String,
+    },
+}
+
+/// Pattern to expect in an `http-check expect` rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HttpCheckExpectPattern {
+    Status(Vec<u16>),
+    StatusRange(u16, u16),
+    String(String),
+    RStatus(String),
+    RString(String),
+    Hdr {
+        name: String,
+        match_type: MatchType,
+        value: Option<String>,
+        value_match_type: MatchType,
+    },
+    Fhdr {
+        name: String,
+        match_type: MatchType,
+        value: Option<String>,
+        value_match_type: MatchType,
+    },
+}
+
+/// Match type for header expectation rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MatchType {
+    #[default]
+    Str,
+    Beg,
+    End,
+    Sub,
+    Reg,
+}
+
+/// Action in a `tcp-check` rule list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TcpCheckAction {
+    Connect {
+        port: Option<u16>,
+        send_proxy: bool,
+    },
+    Send(Vec<u8>),
+    Expect {
+        pattern: TcpCheckExpectPattern,
+        negate: bool,
+        min_recv: Option<usize>,
+        comment: Option<String>,
+    },
+    Comment(String),
+}
+
+/// Pattern to expect in a `tcp-check expect` rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TcpCheckExpectPattern {
+    String(String),
+    Binary(Vec<u8>),
+    RString(String),
+}
+
+/// Fully resolved health check configuration for a backend server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedCheckConfig {
+    TcpConnect,
+    Http(ResolvedHttpCheck),
+    TcpSteps(Vec<ResolvedTcpStep>),
+}
+
+/// Resolved HTTP health check parameters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedHttpCheck {
+    pub method: String,
+    pub uri: String,
+    pub version: String,
+    pub host: Option<String>,
+    pub headers: Vec<(String, String)>,
+    pub body: Option<String>,
+    pub send_state: bool,
+    pub expect_rules: Vec<ResolvedHttpExpectRule>,
+    pub check_port: Option<u16>,
+    pub send_proxy: bool,
+}
+
+/// Single expectation rule for an HTTP health check response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedHttpExpectRule {
+    pub pattern: ResolvedHttpExpectPattern,
+    pub negate: bool,
+}
+
+/// Pattern to match against an HTTP health check response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedHttpExpectPattern {
+    Status(Vec<u16>),
+    StatusRange(u16, u16),
+    String(String),
+    RStatus(String),
+    RString(String),
+    Hdr {
+        name: String,
+        match_type: MatchType,
+        value: Option<String>,
+        value_match_type: MatchType,
+    },
+    Fhdr {
+        name: String,
+        match_type: MatchType,
+        value: Option<String>,
+        value_match_type: MatchType,
+    },
+}
+
+/// Single step in a multi-step TCP health check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedTcpStep {
+    Connect {
+        port: Option<u16>,
+        send_proxy: bool,
+    },
+    Send(Vec<u8>),
+    Expect {
+        pattern: ResolvedTcpExpectPattern,
+        negate: bool,
+        min_recv: usize,
+        comment: Option<String>,
+    },
+    Comment(String),
+}
+
+/// Pattern to match against TCP received data in a TCP health check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedTcpExpectPattern {
+    String(String),
+    Binary(Vec<u8>),
+    RString(String),
+}
+
+static RESOLVED_CHECKS: LazyLock<RwLock<HashMap<(usize, usize), ResolvedCheckConfig>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+static ADDR_CHECKS: LazyLock<RwLock<HashMap<SocketAddr, ResolvedCheckConfig>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+pub fn register_resolved_check(proxy_idx: usize, server_idx: usize, check: ResolvedCheckConfig) {
+    if let Ok(mut map) = RESOLVED_CHECKS.write() {
+        map.insert((proxy_idx, server_idx), check);
+    }
+}
+
+pub fn register_resolved_check_for_addr(addr: SocketAddr, check: ResolvedCheckConfig) {
+    if let Ok(mut map) = ADDR_CHECKS.write() {
+        map.insert(addr, check);
+    }
+}
+
+pub fn clear_resolved_checks() {
+    if let Ok(mut map) = RESOLVED_CHECKS.write() {
+        map.clear();
+    }
+    if let Ok(mut map) = ADDR_CHECKS.write() {
+        map.clear();
+    }
+}
+
+#[must_use]
+pub fn get_resolved_check_config(
+    proxy_idx: usize,
+    server_idx: usize,
+    addr: SocketAddr,
+) -> Option<ResolvedCheckConfig> {
+    if let Ok(map) = RESOLVED_CHECKS.read() {
+        if let Some(cfg) = map.get(&(proxy_idx, server_idx)) {
+            return Some(cfg.clone());
+        }
+    }
+    if let Ok(map) = ADDR_CHECKS.read() {
+        if let Some(cfg) = map.get(&addr) {
+            return Some(cfg.clone());
+        }
+    }
+    None
 }
