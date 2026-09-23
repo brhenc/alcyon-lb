@@ -234,10 +234,11 @@ before this is run anywhere real.**
 
 | | |
 |---|---|
-| **Gained** | Compact server struct representation. Memory for 60,000 servers measured at **14.00 MB** (14,684,799 bytes, ~245 bytes/server), more than 14× smaller than HAProxy's 207 MB (3,456 bytes/server). |
-| **Gave up** | Some monolithic embedded state in HAProxy (`struct check` etc.) is decoupled into optional structures and indexed side arrays. |
-| **Status** | **measured** — verified and pinned to ≤ 20 MB bound in `crates/ibex-rt/tests/request_allocations.rs` (`sixty_thousand_backends_memory_bounded`). |
+| **Gained** | Compact server struct representation. Memory for 60,000 servers measured at:<br>- **Without checks**: **14.00 MB** (14,684,947 cumulative allocated bytes, ~245 bytes/server), >14× smaller than HAProxy's 207 MB (3,456 bytes/server).<br>- **With health checks**: **29.75 MB** (31,196,612 cumulative allocated bytes, 120,035 allocations, ~520 bytes/server), 7× smaller than HAProxy's 207 MB.<br>*(Note: Both numbers refer to `bytes_allocated` from `CountingAllocator` during construction, not RSS.)* |
+| **Gave up** | Some monolithic embedded state in HAProxy (`struct check` etc.) is decoupled into optional structures and indexed side arrays (`ServerCheckState`). |
+| **Status** | **measured** — verified and pinned to ≤ 20 MB bound (without checks) and ≤ 35 MB bound (with checks) in `crates/ibex-rt/tests/request_allocations.rs` (`sixty_thousand_backends_memory_bounded` and `sixty_thousand_backends_with_checks_memory_bounded`). |
 | **Revisit if** | Backends require heavy embedded state that cannot be modeled compactly or shared across worker contexts. |
+
 
 ### 6.6 Map converters in-memory caching — **resolved**
 
@@ -260,7 +261,25 @@ Status: **resolved and measured** — cached lookups verified in `crates/ibex-sa
 | **Status** | **measured** — with identical binary search and config (`tune.bufsize 4096`, `tune.maxrewrite 1024`): HAProxy 3.5-dev accepts max 2997 bytes, HAProxy 3.0.23 accepts max 3004 bytes, Ibex accepts 3072 bytes |
 | **Revisit if** | HTX lands on the data path. HAProxy loses ~68–75 bytes because it stores the message in HTX, where per-block descriptors (`struct htx_blk`) and the start-line block consume buffer space before the wire header block can use it. The divergence is a natural property of the buffer representation and must not be hardcoded. |
 
-### 6.8 Caller-borrowed HTX buffer and zero-allocation data path
+### 6.8 HTTP/2 flood mitigation knobs off by default for HAProxy compatibility
+
+| | |
+|---|---|
+| **Gained** | Strict compatibility with HAProxy 3.5's tuning model. Knobs implemented and wired directly to `H2MuxContext`: `tune.h2.fe.max-total-streams` (stream cap per connection), `tune.h2.fe.glitches-threshold` (graceful `GOAWAY` advertising future stream `0x7fff_ffff` with `NO_ERROR` at 75%, hard close `GOAWAY` with `EnhanceYourCalm` at 100%), and `tune.h2.fe.max-rst-at-once`. Legitimate clients generating occasional stream resets (e.g. browser navigation cancels) are not prematurely terminated. Unimplemented `tune.glitches.kill.cpu-usage` is explicitly refused at parse time rather than silently ignored. |
+| **Gave up** | Secure-by-default behavior. Shipping flood mitigations defaulted to zero (disabled) means an unconfigured proxy does not automatically kill rapid reset floods. |
+| **Status** | **measured and verified** — verified in `crates/ibex-rt/tests/h2_flood_knobs.rs` (all 3 tests pass: unconfigured flood survival, `max-total-streams` cap enforcement, and graceful 75% `GOAWAY` preceding hard close) and `crates/ibex-rt/tests/h2_multiplexing.rs`. |
+| **Revisit if** | Once compatibility is established. HAProxy's defaults here are compatibility decisions, not security ones. Shipping a flood mitigation off by default means an unconfigured Ibex has none, and "HAProxy does it too" is a reason, not a justification. Revisit once compatibility is established: a proxy whose stated purpose is surviving hostile traffic has a weak argument for inheriting a permissive default it did not choose. |
+
+### 6.9 QUIC stays declined — the architectural constraint is fd-per-session, not HTX
+
+| | |
+|---|---|
+| **Gained** | Architectural clarity and focus. Verified against the HAProxy codebase that HTX is not a blocker or dead end for QUIC/H3: <br>- `HTX introduced in HAProxy`: 2018-10-22 (`a3d2a16fa`)<br>- `QUIC mux introduced`: 2021-02-18 (`dfbae766b`)<br>- `htx_` calls in `src/mux_quic.c`: **0**<br>- Distinct `htx_` calls in H2 path: 40 (`mux_h2.c` + `h2.c`)<br>- Distinct `htx_` calls in H3 path: 30 (`mux_quic.c` + `h3.c`)<br>- QUIC-specific API in `htx.h`: **none**<br>HTX is 28 months older than any QUIC code in HAProxy and does not touch `mux_quic.c` (which operates on per-stream `qcs` buffers, converted to HTX by `h3.c` using a subset of H2's HTX API). |
+| **Gave up** | QUIC / HTTP/3 protocol support remains declined (bind prefixes `quic+`, `dgram+`, `quic4+`, `quic6+` are refused by name at config parse time). |
+| **Status** | **measured and verified** — the actual constraint is the fd-per-session architecture in `crates/ibex-rt/src/proxy.rs` (`pub struct TcpSession { pub cli: OwnedFd, ... }`), where thousands of UDP QUIC connections share a single socket demultiplexed by Connection ID. The architectural commitment is not to deepen the fd-per-session assumption gratuitously across `ibex-rt`. |
+| **Revisit if** | Concrete user requirements demand UDP datagram I/O (`recvmmsg`/`sendmmsg`/GSO/GRO) and the session abstraction is decoupled from owning a single file descriptor. |
+
+### 6.10 Caller-borrowed HTX buffer and zero-allocation data path
 
 | | |
 |---|---|
@@ -269,7 +288,7 @@ Status: **resolved and measured** — cached lookups verified in `crates/ibex-sa
 | **Status** | **measured** — 0 allocations for `HtxBuffer::with_capacity` and `to_h1_wire`, 5 allocs / 124 bytes measured per request in `tools/allocprofile`, pinned in `crates/ibex-rt/tests/request_allocations.rs`. |
 | **Revisit if** | Dynamic reallocation of HTX buffers becomes necessary for requests exceeding standard buffer size classes. |
 
-### 6.9 HAProxy C FFI Differential Oracle (`ibex-h1-sys` & `ParserKind::HaproxyFfi`)
+### 6.11 HAProxy C FFI Differential Oracle (`ibex-h1-sys` & `ParserKind::HaproxyFfi`)
 
 | | |
 |---|---|
@@ -277,4 +296,5 @@ Status: **resolved and measured** — cached lookups verified in `crates/ibex-sa
 | **Gave up** | Feature-gated behind `haproxy-ffi` (default off). HAProxy's C parser performs in-place byte mutation on unfolded headers (`start[eol] = ' '`), requiring an isolated mutable scratch buffer in the FFI adapter to prevent SIGSEGV on `.rodata` slices. |
 | **Status** | **measured** — 20 test vectors in `haproxy_ffi_differential.rs` passing, zero unsafe in `ibex-proto`, unsafe isolated to `ibex-h1-sys`. |
 | **Revisit if** | Upstream HAProxy changes C header parsing function signatures in future 3.x releases. |
+
 

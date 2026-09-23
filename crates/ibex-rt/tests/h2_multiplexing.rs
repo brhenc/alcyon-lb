@@ -16,6 +16,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+static TEST_MUTEX: Mutex<()> = Mutex::new(());
+
 fn ibex_bin() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_BIN_EXE_ibex"))
 }
@@ -138,6 +140,7 @@ fn hpack_get(path: &str) -> Vec<u8> {
 /// `curl --http2` passes against this daemon because it sends one request.
 #[test]
 fn each_h2_stream_carries_its_own_request() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let (backend_port, seen) = spawn_backend();
     let port = free_port();
     let cfg = std::env::temp_dir().join(format!("ibex_h2mux_{}.cfg", std::process::id()));
@@ -194,5 +197,261 @@ fn each_h2_stream_carries_its_own_request() {
         "each stream must reach the backend once with its own path. client sent {paths:?}, \
          backend saw {got:?} -- a request replayed under another stream's identity is \
          response-queue poisoning, and a request dropped without an error is a hang."
+    );
+
+    let mut exact_wanted: Vec<String> = paths.iter().map(|p| format!("GET {p} HTTP/1.1")).collect();
+    let mut exact_got = got;
+    exact_wanted.sort();
+    exact_got.sort();
+    assert_eq!(
+        exact_got, exact_wanted,
+        "backend must see HTTP/1.1 request lines normalized from HTTP/2 client"
+    );
+}
+
+/// Ten streams sent in an immediate burst over cleartext h2c without any inter-frame delay.
+/// All ten streams must reach the backend as normalized HTTP/1.1 requests without loss or replay.
+#[test]
+fn ten_h2_streams_burst_reach_backend_without_loss() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (backend_port, seen) = spawn_backend();
+    let port = free_port();
+    let cfg = std::env::temp_dir().join(format!("ibex_h2burst_{}.cfg", std::process::id()));
+    std::fs::write(
+        &cfg,
+        format!(
+            "defaults\n\tmode http\n\ttimeout connect 3s\n\ttimeout client 10s\n\t\
+             timeout server 10s\n\n\
+             frontend fe\n\tbind 127.0.0.1:{port}\n\tdefault_backend be\n\n\
+             backend be\n\tserver s1 127.0.0.1:{backend_port}\n"
+        ),
+    )
+    .expect("write config");
+
+    let _d = Daemon(
+        Command::new(ibex_bin())
+            .arg("-f")
+            .arg(&cfg)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn ibex"),
+    );
+    assert!(wait_for_port(port), "the daemon never listened on {port}");
+
+    let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    s.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").expect("preface");
+    s.write_all(&frame(0x04, 0, 0, &[])).expect("settings");
+
+    let mut burst_payload = Vec::new();
+    let count = 10;
+    let paths: Vec<String> = (0..count).map(|i| format!("/b{i}")).collect();
+    for (i, p) in paths.iter().enumerate() {
+        let sid = 1 + 2 * u32::try_from(i).expect("small");
+        burst_payload.extend_from_slice(&frame(0x01, 0x05, sid, &hpack_get(p)));
+    }
+    s.write_all(&burst_payload).expect("send burst");
+    s.flush().ok();
+
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while Instant::now() < deadline {
+        if seen.lock().expect("lock").len() >= count {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    let got = seen.lock().expect("lock").clone();
+    let _ = std::fs::remove_file(&cfg);
+
+    let mut wanted: Vec<String> = paths.iter().map(|p| format!("GET {p} HTTP/1.1")).collect();
+    let mut got_sorted = got.clone();
+    wanted.sort();
+    got_sorted.sort();
+
+    assert_eq!(
+        got_sorted, wanted,
+        "all 10 burst streams must reach the backend as normalized HTTP/1.1 requests without loss. \
+         client sent {paths:?}, backend saw {got:?}"
+    );
+}
+
+/// Rapid Reset flood (CVE-2023-44487) triggers GOAWAY with `ENHANCE_YOUR_CALM` (0xb).
+#[test]
+fn rapid_reset_flood_triggers_goaway_enhance_your_calm() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (backend_port, _) = spawn_backend();
+    let port = free_port();
+    let cfg = std::env::temp_dir().join(format!("ibex_h2rstflood_{}.cfg", std::process::id()));
+    std::fs::write(
+        &cfg,
+        format!(
+            "global\n\ttune.h2.fe.glitches-threshold 100\n\ndefaults\n\tmode http\n\ttimeout connect 3s\n\ttimeout client 10s\n\t\
+             timeout server 10s\n\n\
+             frontend fe\n\tbind 127.0.0.1:{port}\n\tdefault_backend be\n\n\
+             backend be\n\tserver s1 127.0.0.1:{backend_port}\n"
+        ),
+    )
+    .expect("write config");
+
+    let _d = Daemon(
+        Command::new(ibex_bin())
+            .arg("-f")
+            .arg(&cfg)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn ibex"),
+    );
+    assert!(wait_for_port(port), "the daemon never listened on {port}");
+
+    let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    s.set_read_timeout(Some(Duration::from_secs(3))).ok();
+    s.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").expect("preface");
+    s.write_all(&frame(0x04, 0, 0, &[])).expect("settings");
+
+    let mut flood = Vec::new();
+    for i in 0..150u32 {
+        let sid = 1 + 2 * i;
+        flood.extend_from_slice(&frame(0x01, 0x05, sid, &hpack_get("/flood")));
+        // RST_STREAM frame (type 0x03, cancel = error code 8)
+        flood.extend_from_slice(&frame(0x03, 0, sid, &8u32.to_be_bytes()));
+    }
+    s.write_all(&flood).ok();
+    s.flush().ok();
+
+    let mut resp = Vec::new();
+    let mut tmp = [0u8; 1024];
+    while let Ok(n) = s.read(&mut tmp) {
+        if n == 0 {
+            break;
+        }
+        resp.extend_from_slice(&tmp[..n]);
+    }
+    let _ = std::fs::remove_file(&cfg);
+
+    // Frame type 0x07 is GOAWAY. Verify GOAWAY was received in response frames.
+    let has_goaway = resp.windows(9).any(|hdr| hdr[3] == 0x07);
+    assert!(
+        has_goaway,
+        "Rapid reset flood must trigger a GOAWAY frame from the daemon"
+    );
+}
+
+/// PING flood triggers GOAWAY with `ENHANCE_YOUR_CALM` (0xb).
+#[test]
+fn ping_flood_triggers_goaway_enhance_your_calm() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (backend_port, _) = spawn_backend();
+    let port = free_port();
+    let cfg = std::env::temp_dir().join(format!("ibex_h2pingflood_{}.cfg", std::process::id()));
+    std::fs::write(
+        &cfg,
+        format!(
+            "defaults\n\tmode http\n\ttimeout connect 3s\n\ttimeout client 10s\n\t\
+             timeout server 10s\n\n\
+             frontend fe\n\tbind 127.0.0.1:{port}\n\tdefault_backend be\n\n\
+             backend be\n\tserver s1 127.0.0.1:{backend_port}\n"
+        ),
+    )
+    .expect("write config");
+
+    let _d = Daemon(
+        Command::new(ibex_bin())
+            .arg("-f")
+            .arg(&cfg)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn ibex"),
+    );
+    assert!(wait_for_port(port), "the daemon never listened on {port}");
+
+    let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    s.set_read_timeout(Some(Duration::from_secs(3))).ok();
+    s.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").expect("preface");
+    s.write_all(&frame(0x04, 0, 0, &[])).expect("settings");
+
+    let mut flood = Vec::new();
+    for i in 0..150u64 {
+        // PING frame (type 0x06, flags 0, stream 0, 8 bytes opaque data)
+        flood.extend_from_slice(&frame(0x06, 0, 0, &i.to_be_bytes()));
+    }
+    s.write_all(&flood).ok();
+    s.flush().ok();
+
+    let mut resp = Vec::new();
+    let mut tmp = [0u8; 1024];
+    while let Ok(n) = s.read(&mut tmp) {
+        if n == 0 {
+            break;
+        }
+        resp.extend_from_slice(&tmp[..n]);
+    }
+    let _ = std::fs::remove_file(&cfg);
+
+    let has_goaway = resp.windows(9).any(|hdr| hdr[3] == 0x07);
+    assert!(
+        has_goaway,
+        "PING flood must trigger a GOAWAY frame from the daemon"
+    );
+}
+
+/// SETTINGS flood triggers GOAWAY with `ENHANCE_YOUR_CALM` (0xb).
+#[test]
+fn settings_flood_triggers_goaway_enhance_your_calm() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (backend_port, _) = spawn_backend();
+    let port = free_port();
+    let cfg = std::env::temp_dir().join(format!("ibex_h2setflood_{}.cfg", std::process::id()));
+    std::fs::write(
+        &cfg,
+        format!(
+            "defaults\n\tmode http\n\ttimeout connect 3s\n\ttimeout client 10s\n\t\
+             timeout server 10s\n\n\
+             frontend fe\n\tbind 127.0.0.1:{port}\n\tdefault_backend be\n\n\
+             backend be\n\tserver s1 127.0.0.1:{backend_port}\n"
+        ),
+    )
+    .expect("write config");
+
+    let _d = Daemon(
+        Command::new(ibex_bin())
+            .arg("-f")
+            .arg(&cfg)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn ibex"),
+    );
+    assert!(wait_for_port(port), "the daemon never listened on {port}");
+
+    let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    s.set_read_timeout(Some(Duration::from_secs(3))).ok();
+    s.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").expect("preface");
+    s.write_all(&frame(0x04, 0, 0, &[])).expect("settings");
+
+    let mut flood = Vec::new();
+    for _ in 0..150 {
+        // Empty SETTINGS frame (non-ACK)
+        flood.extend_from_slice(&frame(0x04, 0, 0, &[]));
+    }
+    s.write_all(&flood).ok();
+    s.flush().ok();
+
+    let mut resp = Vec::new();
+    let mut tmp = [0u8; 1024];
+    while let Ok(n) = s.read(&mut tmp) {
+        if n == 0 {
+            break;
+        }
+        resp.extend_from_slice(&tmp[..n]);
+    }
+    let _ = std::fs::remove_file(&cfg);
+
+    let has_goaway = resp.windows(9).any(|hdr| hdr[3] == 0x07);
+    assert!(
+        has_goaway,
+        "SETTINGS flood must trigger a GOAWAY frame from the daemon"
     );
 }

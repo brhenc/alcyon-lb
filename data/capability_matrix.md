@@ -25,7 +25,7 @@ This capability matrix records what Project Ibex can actually perform end to end
 |---|---|---|---|---|
 | **HTTP/2 Core & Multiplexing** (`h2.rs`, `mux_h2.rs`) | Yes | Yes | Yes | Fully wired into `ibex-rt` data path over TLS ALPN (`h2`) and cleartext connection preface. Supports preface exchange, initial SETTINGS negotiation, HPACK header compression, stream multiplexing, and response generation from HTX. Verified end to end over TLS in `tls_e2e.rs` (`h2_is_served_over_tls_end_to_end`) and loopback socket conformance suite in `http2_conformance.rs`. Restored `+H2` in `-vv` banner. |
 | **HTX Stream Representation** (`htx.rs`) | Yes | Yes (Stage 0) | Yes | Unified flat borrowed representation (`HtxSlice<'a>` / `HtxSliceRef<'a>`). `HtxBuffer` is ownership-only wrapper. Zero-allocation parser verified (`parsing_a_request_into_htx_allocates_nothing` passes with 0 allocs). Data path uses pooled `Buf` backing for HTX; `HtxBuffer::with_capacity` and `to_h1_wire` eliminated to 0 allocs on the data path. |
-| **HAProxy C FFI Differential Oracle (T16)** | Yes (feature `haproxy-ffi`) | Off by default | Yes | Differential parser testing between `ibex-proto` H1 parser and reference HAProxy C parser (`h1.c` + `http.c` compiled via `ibex-h1-sys` with safe C wrapper and C stub). Differential suite in `haproxy_ffi_differential.rs` verifies framing agreement and catalogs exact differences. |
+| **HAProxy C FFI Differential Oracle (T16)** | Yes (feature `haproxy-ffi`) | Off by default | Yes | Differential parser testing between `ibex-proto` H1 parser and reference HAProxy C parser (`h1.c` + `http.c` compiled via `ibex-h1-sys` with safe C wrapper and C stub). Normalized differential suite in `haproxy_ffi_differential.rs` normalises 3 structural artifacts (header-block length, pseudo-headers, Eom), verifies framing agreement, matches obs-fold whitespace runs, and pins genuine Content-Length deduplication/normalization behaviors. |
 | **HTTP/1.1 Reverse Proxying** | Yes | Yes | Yes | Keep-alive reuse (50+ sequential requests), pipelining, chunked transfer encoding, method dispatch, and RFC 9112 framing conflict enforcement. Verified in `http1_conformance.rs` and `http_proxy.rs`. |
 | **Backend Connection Reuse (`http-reuse`)** | Yes | Yes | Yes | Shared idle connection pool across sessions (`http-reuse never|safe|aggressive|always`). Idle sockets are verified via non-blocking zero-copy socket peek (`raw::is_idle_conn_alive`) before reuse. Tested in `http_proxy.rs` (`http_reuse_shares_backend_connection_across_sessions` and `http_reuse_never_does_not_share_backend_connection`). |
 | **HTTP/1.0 Fallback** | Yes | Yes | Yes | Close-delimited framing and HTTP/1.0 connection header defaults. Tested in `http1_conformance.rs`. |
@@ -102,7 +102,8 @@ This capability matrix records what Project Ibex can actually perform end to end
     - Steady-state TCP connection: measured **0 allocs, 0 bytes**; bound pinned to `<= 5`.
     - Steady-state HTTP request: measured **6 allocs, 186 bytes**; bound lowered from 25 to `<= 10` allocs, `<= 500` bytes.
     - ACL + log-format request: measured **6 allocs, 186 bytes**; bound lowered from 25 to `<= 10` allocs, `<= 500` bytes.
-    - 60,000 backends resident memory: measured **14.00 MB** (14,684,799 bytes, ~245 bytes/server vs HAProxy's 207 MB / 3,456 bytes/server), pinned to `<= 20 MB`.
+    - 60,000 backends without checks: measured **14.00 MB** (14,684,947 cumulative allocated bytes, ~245 bytes/server vs HAProxy's 207 MB / 3,456 bytes/server), pinned to `<= 20 MB`.
+    - 60,000 backends with active health checks: measured **29.75 MB** (31,196,612 cumulative allocated bytes, 120,035 allocations, ~520 bytes/server), pinned to `<= 35 MB`.
   - Zero-allocation pooled buffer lifecycle: `alloc_count` and `dealloc_count` verified at **0** for warm `Buf::with_capacity(BUFSIZE)`.
   - Lock-free, zero-contention data path: freelists backed by `thread_local!` caches per thread rather than global mutex locks.
   - Decoupled `PoolRegistry`: `PoolHead.name: &'static str`, registry accessed only when querying statistics via `show pools` or diagnostics rather than on stream buffer acquisition or release.
@@ -123,7 +124,11 @@ This capability matrix records what Project Ibex can actually perform end to end
   - Safe Rust FFI wrapper (`ibex_h1_sys::parse_h1`) encapsulates all unsafe raw pointer arithmetic.
   - `ibex-proto/src/ffi_h1.rs`: implements `HaproxyFfiParser` and `HaproxyFfiStream` conforming to `HttpParser` and `HttpStream` over `HtxSlice`.
   - Comprehensive differential test suite in `crates/ibex-proto/tests/haproxy_ffi_differential.rs` comparing parsing results across 20 test vectors.
+  - Structural normalisation implemented and documented: header-block length comparison (ignoring body/chunk framing), pseudo-header filtering (`:method`, `:path`, etc.), and `Eom` block equivalence.
+  - `obs-fold` whitespace run preservation verified matching HAProxy 3.5 (`"foo\r\n bar"` -> `"foo   bar"`).
+  - Pinned exact surviving Content-Length deduplication/normalization behaviors (`duplicate_cl_agreeing`, `comma_cl_agreeing`).
 - **Reachability**: Reachable when compiled with `--features haproxy-ffi`. Verified framing agreement and cataloged differential nuances.
+
 
 ### 3.5 Explicitly Declined Subsystems (`tradeoff.md` §4.2)
 Per project architectural records, the following HAProxy subsystems have been formally declined:

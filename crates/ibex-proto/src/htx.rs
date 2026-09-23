@@ -811,13 +811,19 @@ impl<'a> HtxSliceRef<'a> {
         let mut cursor = 0;
 
         if let Some(req) = self.req_line() {
+            let version = if req.version == "HTTP/2.0" || req.version == "HTTP/2" {
+                "HTTP/1.1"
+            } else {
+                req.version
+            };
             cursor = write_slice(out, cursor, req.method.as_bytes())?;
             cursor = write_slice(out, cursor, b" ")?;
             cursor = write_slice(out, cursor, req.uri.as_bytes())?;
             cursor = write_slice(out, cursor, b" ")?;
-            cursor = write_slice(out, cursor, req.version.as_bytes())?;
+            cursor = write_slice(out, cursor, version.as_bytes())?;
             cursor = write_slice(out, cursor, b"\r\n")?;
         } else if let Some(res) = self.res_line() {
+
             cursor = write_slice(out, cursor, res.version.as_bytes())?;
             cursor = write_slice(out, cursor, b" ")?;
             let mut status_buf = [0u8; 10];
@@ -1367,7 +1373,7 @@ impl<'a> HtxSlice<'a> {
         let old_addr = desc.addr as usize;
         let old_val_len = desc.value_len as usize;
         let name_len = desc.name_len as usize;
-        let added_len = 1 + text.len();
+        let added_len = text.len();
         let new_val_len = old_val_len + added_len;
         if new_val_len > HTX_HDR_VALUE_MAX_LEN {
             return Err(HtxError::LimitExceeded);
@@ -1378,8 +1384,6 @@ impl<'a> HtxSlice<'a> {
             if free_capacity_at(self.buf.len(), self.tail_addr, self.num_blocks) < added_len {
                 return Err(HtxError::OutOfMemory);
             }
-            self.buf[self.tail_addr] = b' ';
-            self.tail_addr += 1;
             self.buf[self.tail_addr..self.tail_addr + text.len()].copy_from_slice(text.as_bytes());
             self.tail_addr += text.len();
             desc.value_len = new_val_len as u32;
@@ -1392,8 +1396,7 @@ impl<'a> HtxSlice<'a> {
             }
             let new_addr = self.tail_addr;
             self.buf.copy_within(old_addr..old_addr + name_len + old_val_len, new_addr);
-            self.buf[new_addr + name_len + old_val_len] = b' ';
-            self.buf[new_addr + name_len + old_val_len + 1..new_addr + total_new].copy_from_slice(text.as_bytes());
+            self.buf[new_addr + name_len + old_val_len..new_addr + total_new].copy_from_slice(text.as_bytes());
             self.tail_addr += total_new;
             desc.addr = new_addr as u32;
             desc.value_len = new_val_len as u32;
@@ -1415,7 +1418,7 @@ impl<'a> HtxSlice<'a> {
         let old_addr = desc.addr as usize;
         let old_val_len = desc.value_len as usize;
         let name_len = desc.name_len as usize;
-        let added_len = 1 + text.len();
+        let added_len = text.len();
         let new_val_len = old_val_len + added_len;
         if new_val_len > HTX_HDR_VALUE_MAX_LEN {
             return Err(HtxError::LimitExceeded);
@@ -1426,8 +1429,6 @@ impl<'a> HtxSlice<'a> {
             if free_capacity_at(self.buf.len(), self.tail_addr, self.num_blocks) < added_len {
                 return Err(HtxError::OutOfMemory);
             }
-            self.buf[self.tail_addr] = b' ';
-            self.tail_addr += 1;
             self.buf[self.tail_addr..self.tail_addr + text.len()].copy_from_slice(text.as_bytes());
             self.tail_addr += text.len();
             desc.value_len = new_val_len as u32;
@@ -1440,8 +1441,7 @@ impl<'a> HtxSlice<'a> {
             }
             let new_addr = self.tail_addr;
             self.buf.copy_within(old_addr..old_addr + name_len + old_val_len, new_addr);
-            self.buf[new_addr + name_len + old_val_len] = b' ';
-            self.buf[new_addr + name_len + old_val_len + 1..new_addr + total_new].copy_from_slice(text.as_bytes());
+            self.buf[new_addr + name_len + old_val_len..new_addr + total_new].copy_from_slice(text.as_bytes());
             self.tail_addr += total_new;
             desc.addr = new_addr as u32;
             desc.value_len = new_val_len as u32;
@@ -1449,6 +1449,103 @@ impl<'a> HtxSlice<'a> {
             Ok(())
         }
     }
+
+    pub fn finalize_last_header(&mut self) {
+        let last_hdr_idx = (0..self.num_blocks)
+            .rev()
+            .find(|&i| read_desc_at(self.buf, self.num_blocks, i).blk_type == HtxBlockType::Header);
+
+        let Some(idx) = last_hdr_idx else {
+            return;
+        };
+
+        let mut desc = read_desc_at(self.buf, self.num_blocks, idx);
+        let val_start = desc.addr as usize + desc.name_len as usize;
+        let val_len = desc.value_len as usize;
+        if val_len == 0 {
+            return;
+        }
+
+        let val_bytes = &self.buf[val_start..val_start + val_len];
+        let lead_trim = val_bytes
+            .iter()
+            .take_while(|&&b| b == b' ' || b == b'\t')
+            .count();
+
+        let new_val_len = if lead_trim == val_len {
+            0
+        } else {
+            let trail_trim = val_bytes[lead_trim..]
+                .iter()
+                .rev()
+                .take_while(|&&b| b == b' ' || b == b'\t')
+                .count();
+            val_len - lead_trim - trail_trim
+        };
+
+        if lead_trim > 0 && new_val_len > 0 {
+            self.buf.copy_within(val_start + lead_trim..val_start + lead_trim + new_val_len, val_start);
+        }
+
+        let trimmed_total = val_len - new_val_len;
+        if trimmed_total > 0 {
+            let is_at_tail = desc.addr as usize + desc.name_len as usize + val_len == self.tail_addr;
+            if is_at_tail {
+                self.tail_addr -= trimmed_total;
+            }
+            desc.value_len = new_val_len as u32;
+            write_desc_at(self.buf, self.num_blocks, idx, &desc);
+        }
+    }
+
+    pub fn finalize_last_trailer(&mut self) {
+        let last_trl_idx = (0..self.num_blocks)
+            .rev()
+            .find(|&i| read_desc_at(self.buf, self.num_blocks, i).blk_type == HtxBlockType::Trailer);
+
+        let Some(idx) = last_trl_idx else {
+            return;
+        };
+
+        let mut desc = read_desc_at(self.buf, self.num_blocks, idx);
+        let val_start = desc.addr as usize + desc.name_len as usize;
+        let val_len = desc.value_len as usize;
+        if val_len == 0 {
+            return;
+        }
+
+        let val_bytes = &self.buf[val_start..val_start + val_len];
+        let lead_trim = val_bytes
+            .iter()
+            .take_while(|&&b| b == b' ' || b == b'\t')
+            .count();
+
+        let new_val_len = if lead_trim == val_len {
+            0
+        } else {
+            let trail_trim = val_bytes[lead_trim..]
+                .iter()
+                .rev()
+                .take_while(|&&b| b == b' ' || b == b'\t')
+                .count();
+            val_len - lead_trim - trail_trim
+        };
+
+        if lead_trim > 0 && new_val_len > 0 {
+            self.buf.copy_within(val_start + lead_trim..val_start + lead_trim + new_val_len, val_start);
+        }
+
+        let trimmed_total = val_len - new_val_len;
+        if trimmed_total > 0 {
+            let is_at_tail = desc.addr as usize + desc.name_len as usize + val_len == self.tail_addr;
+            if is_at_tail {
+                self.tail_addr -= trimmed_total;
+            }
+            desc.value_len = new_val_len as u32;
+            write_desc_at(self.buf, self.num_blocks, idx, &desc);
+        }
+    }
+
 
     pub fn insert_header(&mut self, index: usize, name: &str, value: &str) -> Result<(), HtxError> {
         insert_header_raw(self.buf, &mut self.tail_addr, &mut self.num_blocks, index, name, value)
@@ -2358,14 +2455,20 @@ impl Htx {
         let mut buf = Vec::with_capacity(1024);
 
         if let Some(req) = self.req_line() {
+            let version = if req.version == HttpVersion::Http20 {
+                "HTTP/1.1"
+            } else {
+                req.version.as_str()
+            };
             let _ = write!(
                 buf,
                 "{} {} {}\r\n",
                 req.method.as_str(),
                 req.uri,
-                req.version.as_str()
+                version
             );
         } else if let Some(res) = self.res_line() {
+
             let _ = write!(
                 buf,
                 "{} {} {}\r\n",

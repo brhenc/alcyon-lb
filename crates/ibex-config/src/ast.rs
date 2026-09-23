@@ -42,6 +42,38 @@ pub struct GlobalSection {
     pub bufsize_small: Option<usize>,
     /// Large buffer size in bytes (`tune.bufsize.large`).
     pub bufsize_large: Option<usize>,
+    /// Maximum total streams per HTTP/2 connection (`tune.h2.fe.max-total-streams`). Default: 0 (unlimited).
+    pub h2_max_total_streams: Option<usize>,
+    /// Glitches threshold before graceful GOAWAY and hard close (`tune.h2.fe.glitches-threshold`). Default: 0 (disabled).
+    pub h2_glitches_threshold: Option<usize>,
+    /// Maximum reset stream frames allowed in a burst before deprioritizing connection (`tune.h2.fe.max-rst-at-once`). Default: 0 (disabled).
+    pub h2_max_rst_at_once: Option<usize>,
+    /// Global maximum connection limit.
+    pub maxconn: Option<u32>,
+    /// Background daemon mode.
+    pub daemon: bool,
+    /// Master-worker mode.
+    pub master_worker: bool,
+    /// User name for privilege dropping.
+    pub user: Option<String>,
+    /// Group name for privilege dropping.
+    pub group: Option<String>,
+    /// Chroot directory.
+    pub chroot: Option<String>,
+    /// Pidfile path.
+    pub pidfile: Option<String>,
+    /// Hard stop timeout on reload/exit.
+    pub hard_stop_after: Option<Duration>,
+    /// Max SSL connection limit.
+    pub maxsslconn: Option<u32>,
+    /// Default SSL bind ciphers.
+    pub ssl_default_bind_ciphers: Option<String>,
+    /// Default SSL bind options.
+    pub ssl_default_bind_options: Option<String>,
+    /// Default SSL server ciphers.
+    pub ssl_default_server_ciphers: Option<String>,
+    /// Default SSL server options.
+    pub ssl_default_server_options: Option<String>,
     /// Syslog targets declared here. Proxy sections inherit these with `log global`,
     /// which is how the canonical `HAProxy` configuration declares logging.
     pub logs: Vec<LogConfig>,
@@ -67,6 +99,20 @@ pub struct DefaultsSection {
     pub mode: Option<Mode>,
     /// Configured timeouts.
     pub timeouts: TimeoutConfig,
+    /// Default retries count.
+    pub retries: Option<u32>,
+    /// Default redispatch flag.
+    pub redisp: bool,
+    /// Default maxconn.
+    pub maxconn: Option<u32>,
+    /// Default load balancing algorithm.
+    pub balance: Option<BalanceAlgorithm>,
+    /// Default cookie name.
+    pub cookie: Option<String>,
+    /// Default server options.
+    pub default_server: Option<DefaultServerConfig>,
+    /// Default stats configuration.
+    pub stats: StatsConfig,
     /// Whether syslog logging is forwarded to global targets.
     pub log_global: bool,
     /// Syslog targets declared in `defaults`, inherited by every proxy that declares none.

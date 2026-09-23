@@ -65,6 +65,9 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                 cur_section = Some(CurrentSection::Global(GlobalSection::default()));
             }
             "defaults" => {
+                if tokens.len() >= 2 && !tokens[1].text.is_empty() {
+                    return Err(ConfigError::new(tokens[1].line, tokens[1].col, "named defaults sections are not implemented".to_string()));
+                }
                 flush_current_section(
                     &mut cur_section,
                     &mut global,
@@ -212,6 +215,9 @@ fn parse_listen_header(
     // which is the wrong direction for a compatibility target: a config that works on
     // Ibex and fails on HAProxy is a migration trap.
     if tokens.len() >= 3 && !tokens[2].text.is_empty() {
+        if tokens[2].text == "from" {
+            return Err(ConfigError::new(tokens[2].line, tokens[2].col, "named defaults sections are not implemented".to_string()));
+        }
         return Err(ConfigError::new(
             tokens[2].line,
             tokens[2].col,
@@ -295,7 +301,10 @@ fn parse_frontend_header(
 
     let id = tokens[1].text.clone();
     let bind = if tokens.len() >= 3 && !tokens[2].text.is_empty() {
-        Some(parse_socket_addr(&tokens[2], None)?)
+        if tokens[2].text == "from" {
+            return Err(ConfigError::new(tokens[2].line, tokens[2].col, "named defaults sections are not implemented".to_string()));
+        }
+        return Err(ConfigError::new(tokens[2].line, tokens[2].col, "please use the 'bind' keyword for listening addresses".to_string()));
     } else {
         None
     };
@@ -375,6 +384,12 @@ fn parse_backend_header(
     }
 
     let id = tokens[1].text.clone();
+    if tokens.len() >= 3 && !tokens[2].text.is_empty() {
+        if tokens[2].text == "from" {
+            return Err(ConfigError::new(tokens[2].line, tokens[2].col, "named defaults sections are not implemented".to_string()));
+        }
+        return Err(ConfigError::new(tokens[2].line, tokens[2].col, "unexpected extra argument in backend header".to_string()));
+    }
     let mode = defaults.and_then(|d| d.mode).unwrap_or(Mode::Tcp);
     let timeouts = defaults.map_or_else(TimeoutConfig::default, |d| d.timeouts);
 
@@ -546,6 +561,162 @@ fn parse_global_directive(
             global.bufsize_large = Some(rounded);
             Ok(())
         }
+        "tune.h2.fe.max-total-streams" => {
+            if tokens.len() < 2 {
+                return Err(ConfigError::new(
+                    kw.line,
+                    kw.col,
+                    "'tune.h2.fe.max-total-streams' expects an integer argument.",
+                ));
+            }
+            let val = tokens[1].text.parse::<usize>().map_err(|_| {
+                ConfigError::new(
+                    tokens[1].line,
+                    tokens[1].col,
+                    format!(
+                        "'tune.h2.fe.max-total-streams' expects an integer argument, got '{}'",
+                        tokens[1].text
+                    ),
+                )
+            })?;
+            global.h2_max_total_streams = Some(val);
+            Ok(())
+        }
+        "tune.h2.fe.glitches-threshold" => {
+            if tokens.len() < 2 {
+                return Err(ConfigError::new(
+                    kw.line,
+                    kw.col,
+                    "'tune.h2.fe.glitches-threshold' expects an integer argument.",
+                ));
+            }
+            let val = tokens[1].text.parse::<usize>().map_err(|_| {
+                ConfigError::new(
+                    tokens[1].line,
+                    tokens[1].col,
+                    format!(
+                        "'tune.h2.fe.glitches-threshold' expects an integer argument, got '{}'",
+                        tokens[1].text
+                    ),
+                )
+            })?;
+            global.h2_glitches_threshold = Some(val);
+            Ok(())
+        }
+        "tune.h2.fe.max-rst-at-once" => {
+            if tokens.len() < 2 {
+                return Err(ConfigError::new(
+                    kw.line,
+                    kw.col,
+                    "'tune.h2.fe.max-rst-at-once' expects an integer argument.",
+                ));
+            }
+            let val = tokens[1].text.parse::<usize>().map_err(|_| {
+                ConfigError::new(
+                    tokens[1].line,
+                    tokens[1].col,
+                    format!(
+                        "'tune.h2.fe.max-rst-at-once' expects an integer argument, got '{}'",
+                        tokens[1].text
+                    ),
+                )
+            })?;
+            global.h2_max_rst_at_once = Some(val);
+            Ok(())
+        }
+        "tune.glitches.kill.cpu-usage" => {
+            Err(ConfigError::new(
+                kw.line,
+                kw.col,
+                "'tune.glitches.kill.cpu-usage' is not supported (no CPU measurement subsystem in tree)",
+            ))
+        }
+        "maxconn" => {
+            if tokens.len() < 2 {
+                return Err(ConfigError::new(
+                    kw.line,
+                    kw.col,
+                    "'maxconn' expects an integer argument.",
+                ));
+            }
+            let val = tokens[1].text.parse::<u32>().map_err(|_| {
+                ConfigError::new(
+                    tokens[1].line,
+                    tokens[1].col,
+                    format!("'maxconn' expects an integer argument, got '{}'", tokens[1].text),
+                )
+            })?;
+            global.maxconn = Some(val);
+            Ok(())
+        }
+        "daemon" => {
+            global.daemon = true;
+            Ok(())
+        }
+        "master-worker" => {
+            global.master_worker = true;
+            Ok(())
+        }
+        "user" => {
+            if tokens.len() >= 2 {
+                global.user = Some(tokens[1].text.clone());
+            }
+            Ok(())
+        }
+        "group" => {
+            if tokens.len() >= 2 {
+                global.group = Some(tokens[1].text.clone());
+            }
+            Ok(())
+        }
+        "chroot" => {
+            if tokens.len() >= 2 {
+                global.chroot = Some(tokens[1].text.clone());
+            }
+            Ok(())
+        }
+        "pidfile" => {
+            if tokens.len() >= 2 {
+                global.pidfile = Some(tokens[1].text.clone());
+            }
+            Ok(())
+        }
+        "hard-stop-after" => {
+            if tokens.len() >= 2 {
+                global.hard_stop_after = Some(parse_timeout(&tokens[1], "hard-stop-after")?);
+            }
+            Ok(())
+        }
+        "maxsslconn" => {
+            if tokens.len() >= 2 {
+                global.maxsslconn = tokens[1].text.parse::<u32>().ok();
+            }
+            Ok(())
+        }
+        "ssl-default-bind-ciphers" => {
+            if tokens.len() >= 2 {
+                global.ssl_default_bind_ciphers = Some(tokens[1..].iter().map(|t| t.text.as_str()).collect::<Vec<_>>().join(" "));
+            }
+            Ok(())
+        }
+        "ssl-default-bind-options" => {
+            if tokens.len() >= 2 {
+                global.ssl_default_bind_options = Some(tokens[1..].iter().map(|t| t.text.as_str()).collect::<Vec<_>>().join(" "));
+            }
+            Ok(())
+        }
+        "ssl-default-server-ciphers" => {
+            if tokens.len() >= 2 {
+                global.ssl_default_server_ciphers = Some(tokens[1..].iter().map(|t| t.text.as_str()).collect::<Vec<_>>().join(" "));
+            }
+            Ok(())
+        }
+        "ssl-default-server-options" => {
+            if tokens.len() >= 2 {
+                global.ssl_default_server_options = Some(tokens[1..].iter().map(|t| t.text.as_str()).collect::<Vec<_>>().join(" "));
+            }
+            Ok(())
+        }
         "set-var" => {
             if tokens.len() >= 3 {
                 let var_name = tokens[1].text.clone();
@@ -570,7 +741,11 @@ fn parse_global_directive(
             }
             Ok(())
         }
-        _ => Ok(()),
+        _ => Err(ConfigError::new(
+            kw.line,
+            kw.col,
+            format!("unknown keyword '{}' in 'global' section", kw.text),
+        )),
     }
 }
 
@@ -587,11 +762,51 @@ fn parse_defaults_directive(
             Ok(())
         }
         "timeout" => parse_timeout_directive(&mut defaults.timeouts, tokens, kw),
+        "retries" => {
+            let mut r = defaults.retries.unwrap_or(0);
+            parse_retries(&mut r, tokens, kw)?;
+            defaults.retries = Some(r);
+            Ok(())
+        }
+        "redisp" => {
+            defaults.redisp = true;
+            Ok(())
+        }
+        "maxconn" => {
+            let mut mc = defaults.maxconn.unwrap_or(0);
+            parse_maxconn(&mut mc, tokens, kw)?;
+            defaults.maxconn = Some(mc);
+            Ok(())
+        }
+        "balance" => {
+            let mut b = defaults.balance.unwrap_or(BalanceAlgorithm::RoundRobin);
+            parse_balance(&mut b, tokens, kw)?;
+            defaults.balance = Some(b);
+            Ok(())
+        }
+        "cookie" => {
+            let mut c = defaults.cookie.clone();
+            parse_cookie(&mut c, tokens, kw)?;
+            defaults.cookie = c;
+            Ok(())
+        }
+        "default-server" => parse_default_server(&mut defaults.default_server, tokens, kw),
+        "stats" => parse_stats_directive(&mut defaults.stats, tokens, kw),
+        "errorfile" => {
+            // errorfile <status> <file> in defaults
+            Ok(())
+        }
         "tcp-request" => {
             if tokens.len() >= 3 && tokens[1].text == "inspect-delay" {
                 defaults.tcp_req_inspect_delay = Some(parse_timeout(&tokens[2], "tcp-request inspect-delay")?);
+                Ok(())
+            } else {
+                Err(ConfigError::new(
+                    tokens[1].line,
+                    tokens[1].col,
+                    format!("tcp-request subcommand '{}' is not supported in defaults", tokens[1].text),
+                ))
             }
-            Ok(())
         }
         "log" => {
             defaults.log_global |= parse_log(&mut defaults.logs, tokens, kw)?;
@@ -607,7 +822,18 @@ fn parse_defaults_directive(
         "http-reuse" => parse_http_reuse(&mut defaults.http_reuse, tokens, kw),
         "cliexp" => parse_cliexp(kw),
         "srvexp" => parse_srvexp(kw),
-        _ => Ok(()),
+        "tcp-response" | "http-request" | "http-response" | "http-after-request" => {
+            Err(ConfigError::new(
+                kw.line,
+                kw.col,
+                format!("directive '{}' is not supported in defaults", kw.text),
+            ))
+        }
+        _ => Err(ConfigError::new(
+            kw.line,
+            kw.col,
+            format!("unknown keyword '{}' in 'defaults' section", kw.text),
+        )),
     }
 }
 
@@ -3608,7 +3834,37 @@ fn validate_config(
 }
 
 fn parse_socket_addr(token: &Token, default_port: Option<u16>) -> Result<SocketAddr, ConfigError> {
-    let s = &token.text;
+    let mut s = token.text.as_str();
+
+    if let Some(stripped) = s.strip_prefix("stream+") {
+        s = stripped;
+    }
+
+    let unsupported_prefixes = [
+        "quic+", "dgram+", "quic4+", "quic6+",
+        "fd@", "unix@", "uxdg@", "uxst@", "abns@", "abnsz@", "ip@", "ipv4@",
+        "ipv6@", "tcp4@", "mptcp4@", "udp4@", "tcp6@", "mptcp6@", "udp6@",
+        "tcp@", "mptcp@", "udp@", "quic4@", "quic6@", "sockpair@", "rhttp@",
+    ];
+    for prefix in unsupported_prefixes {
+        if s.starts_with(prefix) {
+            return Err(ConfigError::new(
+                token.line,
+                token.col,
+                format!("address prefix '{prefix}' is not implemented"),
+            ));
+        }
+    }
+
+
+    if s.starts_with('/') {
+        return Err(ConfigError::new(
+            token.line,
+            token.col,
+            "address prefix 'unix@' is not implemented".to_string(),
+        ));
+    }
+
     if s.starts_with('[') {
         if let Some(bracket_end) = s.find(']') {
             let ip_str = &s[1..bracket_end];

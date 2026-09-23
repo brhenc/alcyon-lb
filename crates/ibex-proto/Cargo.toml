@@ -16,6 +16,7 @@ haproxy-ffi = ["dep:ibex-h1-sys"]
 [dev-dependencies]
 proptest = { workspace = true }
 ibex-alloc = { path = "../ibex-alloc" }
+ibex-sample = { path = "../ibex-sample" }
 
 [lints.rust]
 unsafe_code = "forbid"

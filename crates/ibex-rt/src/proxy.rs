@@ -156,6 +156,7 @@ pub struct TcpSession {
     pub connection_close: bool,
     pub h2_ctx: Option<H2MuxContext>,
     pub h2_active_stream_id: Option<u32>,
+    pub h2_flood_config: ibex_proto::H2FloodConfig,
 }
 
 impl TcpSession {
@@ -247,6 +248,7 @@ impl TcpSession {
             connection_close: false,
             h2_ctx: None,
             h2_active_stream_id: None,
+            h2_flood_config: ibex_proto::H2FloodConfig::default(),
         };
         s.arm_client(now);
         s
@@ -297,6 +299,20 @@ impl TcpSession {
         !self.rep.is_empty()
             || self.pending_resp.as_ref().is_some_and(|(d, o)| *o < d.len())
             || self.h2_ctx.as_ref().is_some_and(|h| h.tx_consumed < h.tx_buf.len())
+    }
+
+    #[must_use]
+    pub fn has_undispatched_h2_streams(&self) -> bool {
+        if let Some(ref h2) = self.h2_ctx {
+            h2.streams.values().any(|st| {
+                !st.dispatched
+                    && st.state != ibex_proto::H2StreamState::Closed
+                    && !matches!(st.state, ibex_proto::H2StreamState::Reset(_))
+                    && st.rx_htx.blocks().iter().any(|b| matches!(b, HtxBlock::Eoh))
+            })
+        } else {
+            false
+        }
     }
 
     pub fn enable_accept_proxy(&mut self, require_v2: bool) {
@@ -504,7 +520,9 @@ impl TcpSession {
         let is_h2 = self.h2_ctx.is_some() || self.cli_xprt.alpn() == Some(b"h2");
         if is_h2 {
             if self.h2_ctx.is_none() {
-                self.h2_ctx = Some(H2MuxContext::new(ibex_proto::conn::ConnId(0), true));
+                let mut h2 = H2MuxContext::new(ibex_proto::conn::ConnId(0), true);
+                h2.flood_config = self.h2_flood_config;
+                self.h2_ctx = Some(h2);
             }
             if self.cli_state.can_read() {
                 let mut raw_buf = [0u8; 16384];
@@ -564,6 +582,7 @@ impl TcpSession {
             // Check for cleartext H2 preface in self.req
             if self.req.readable().starts_with(H2_CONN_PREFACE) {
                 let mut h2 = H2MuxContext::new(ibex_proto::conn::ConnId(0), true);
+                h2.flood_config = self.h2_flood_config;
                 let to_parse = self.req.readable().to_vec();
                 let _ = MuxH2.parse(&mut h2, &to_parse)?;
                 self.req.clear();
@@ -616,21 +635,25 @@ impl TcpSession {
 
         if let Some(ref mut h2) = self.h2_ctx {
             // Check if any stream has arrived with a complete request
-            if self.cli_state == ScState::Ready || self.cli_state == ScState::Established {
+            if (self.cli_state == ScState::Ready || self.cli_state == ScState::Established)
+                && self.h2_active_stream_id.is_none()
+                && self.req_headers.is_none()
+                && !self.has_htx
+                && self.req.is_empty()
+            {
                 if let Some(&stream_id) = h2.streams.keys().find(|&&id| {
-                    if let Some(st) = h2.streams.get(&id) {
-                        st.rx_htx.blocks().iter().any(|b| matches!(b, HtxBlock::Eoh))
-                    } else {
-                        false
-                    }
-                }) {
-                    if (self.h2_active_stream_id.is_none() || self.h2_active_stream_id == Some(stream_id))
-                        && self.req_headers.is_none()
-                        && !self.has_htx
-                        && self.req.is_empty()
-                    {
+                        if let Some(st) = h2.streams.get(&id) {
+                            !st.dispatched
+                                && st.state != ibex_proto::H2StreamState::Closed
+                                && !matches!(st.state, ibex_proto::H2StreamState::Reset(_))
+                                && st.rx_htx.blocks().iter().any(|b| matches!(b, HtxBlock::Eoh))
+                        } else {
+                            false
+                        }
+                    }) {
                         self.h2_active_stream_id = Some(stream_id);
-                        if let Some(stream) = h2.streams.get(&stream_id) {
+                        if let Some(stream) = h2.streams.get_mut(&stream_id) {
+                            stream.dispatched = true;
                             let wire_req = stream.rx_htx.to_h1_wire();
                             if let Ok(parser) = ibex_proto::parser::build(ibex_proto::parser::ParserKind::H1) {
                                 let mut p_stream = parser.stream(false);
@@ -658,7 +681,6 @@ impl TcpSession {
                         }
                     }
                 }
-            }
 
             // Flush pending frames to client socket
             let pending = h2.tx_buf.len() - h2.tx_consumed;
@@ -676,6 +698,11 @@ impl TcpSession {
                     }
                     _ => {}
                 }
+            }
+            if h2.conn_state == ibex_proto::H2ConnState::GoAwaySent && h2.tx_consumed >= h2.tx_buf.len() {
+                self.cli_state = ScState::Closed;
+                self.ending.get_or_insert(Ending::Error);
+                changed = true;
             }
         }
 

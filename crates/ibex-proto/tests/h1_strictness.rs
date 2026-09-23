@@ -131,6 +131,92 @@ fn obs_fold_after_a_header_still_works() {
     ));
 }
 
+#[test]
+fn obs_fold_preserves_whitespace_run_matching_haproxy() {
+    // HAProxy 3.5 replaces preceding CRLF with 2 spaces and preserves the
+    // continuation line's whitespace run ("foo\r\n bar" -> "foo   bar").
+    let mut p = H1Parser::new(false);
+    let mut buf = [0u8; 4096];
+    let mut h = HtxSlice::new(&mut buf);
+    let input = b"GET / HTTP/1.1\r\nHost: example.com\r\nX-Fold: foo\r\n bar\r\n\r\n";
+    let res = p.parse(input, &mut h);
+    assert!(res.is_ok(), "parse failed: {res:?}");
+
+    let hdrs: Vec<(&str, &str)> = h.as_ref().headers().collect();
+    let fold_hdr = hdrs.iter().find(|(n, _)| n.eq_ignore_ascii_case("x-fold"));
+    assert!(fold_hdr.is_some(), "X-Fold header not found in {hdrs:?}");
+    let (_, val) = fold_hdr.unwrap();
+    assert_eq!(
+        *val, "foo   bar",
+        "obs-fold must preserve whitespace run matching HAProxy 3.5 ('foo   bar'), got: {val:?}"
+    );
+}
+
+#[test]
+fn obs_fold_five_shapes_oracle_parity() {
+    let cases: &[(&[u8], &str, &str)] = &[
+        (b"GET / HTTP/1.1\r\nHost: h\r\nX-F: foo\r\n bar   \r\n\r\n", "foo   bar", "trailing spaces on continuation line"),
+        (b"GET / HTTP/1.1\r\nHost: h\r\nX-F: foo\r\n bar\t\r\n\r\n", "foo   bar", "trailing tab on continuation line"),
+        (b"GET / HTTP/1.1\r\nHost: h\r\nX-F: foo  \r\n bar\r\n\r\n", "foo     bar", "trailing spaces on line 1 are interior to fold"),
+        (b"GET / HTTP/1.1\r\nHost: h\r\nX-F:\r\n bar\r\n\r\n", "bar", "empty value on line 1 before fold"),
+        (b"GET / HTTP/1.1\r\nHost: h\r\nX-F: foo\r\n   \r\n\r\n", "foo", "continuation line containing only whitespace"),
+    ];
+
+    for (input, expected, desc) in cases {
+        let mut p = H1Parser::new(false);
+        let mut buf = [0u8; 4096];
+        let mut h = HtxSlice::new(&mut buf);
+        let res = p.parse(input, &mut h);
+        assert!(res.is_ok(), "parse failed for {desc}: {res:?}");
+        let val = h.get_header("x-f").unwrap_or_else(|| panic!("X-F header missing for {desc}"));
+        assert_eq!(
+            val, *expected,
+            "obs-fold shape '{desc}' mismatch with HAProxy 3.5 oracle"
+        );
+    }
+}
+
+
+
+#[test]
+fn obs_fold_acl_sub_and_reg_matching() {
+    // Check that Ibex ACL matchers (-m sub and -m reg) evaluate correctly against the
+    // preserved whitespace run ("foo   bar" with 3 spaces).
+    use ibex_sample::{Matcher, Sample};
+
+    let mut p = H1Parser::new(false);
+    let mut buf = [0u8; 4096];
+    let mut h = HtxSlice::new(&mut buf);
+    let input = b"GET / HTTP/1.1\r\nHost: example.com\r\nX-Fold: foo\r\n bar\r\n\r\n";
+    let _ = p.parse(input, &mut h).expect("parse failed");
+
+    let val = h.get_header("x-fold").expect("header present");
+    assert_eq!(val, "foo   bar");
+    let sample = Sample::Str(val.to_string());
+
+    // -m sub matching via ibex-sample Matcher:
+    let matcher_sub_exact = Matcher::compile("sub", "foo   bar").expect("compile sub matcher");
+    assert!(matcher_sub_exact.matches(&sample), "-m sub 'foo   bar' must match");
+
+    let matcher_sub_spaces = Matcher::compile("sub", "   ").expect("compile sub matcher");
+    assert!(matcher_sub_spaces.matches(&sample), "-m sub '   ' (3 spaces) must match");
+
+    let matcher_sub_collapsed = Matcher::compile("sub", "foo bar").expect("compile sub matcher");
+    assert!(!matcher_sub_collapsed.matches(&sample), "-m sub 'foo bar' must NOT match");
+
+    // -m reg matching via ibex-sample Matcher:
+    let matcher_reg_three = Matcher::compile("reg", r"foo\x20{3}bar").expect("compile reg matcher");
+    assert!(matcher_reg_three.matches(&sample), "-m reg 'foo\\x20{{3}}bar' must match");
+
+    let matcher_reg_one = Matcher::compile("reg", r"foo\x20{1}bar").expect("compile reg matcher");
+    assert!(!matcher_reg_one.matches(&sample), "-m reg 'foo\\x20{{1}}bar' must NOT match");
+
+    let matcher_reg_any = Matcher::compile("reg", r"^foo\s+bar$").expect("compile reg matcher");
+    assert!(matcher_reg_any.matches(&sample), "-m reg '^foo\\s+bar$' must match");
+}
+
+
+
 // ---- header field validation --------------------------------------------------------
 
 #[test]

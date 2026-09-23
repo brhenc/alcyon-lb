@@ -797,3 +797,62 @@ listen li_custom
     assert!(res2.is_err(), "Missing http-reuse argument must be rejected");
 }
 
+#[test]
+fn test_global_and_defaults_unknown_keywords_refusal() {
+    let bad_global = "global\n\tthis-global-keyword-does-not-exist 42\n";
+    let err_g = parse_config(bad_global).unwrap_err();
+    assert!(
+        err_g.message.contains("unknown keyword 'this-global-keyword-does-not-exist' in 'global' section"),
+        "expected unknown global keyword error, got: {}",
+        err_g.message
+    );
+
+    let bad_defaults = "defaults\n\tthis-keyword-does-not-exist 42\n";
+    let err_d = parse_config(bad_defaults).unwrap_err();
+    assert!(
+        err_d.message.contains("unknown keyword 'this-keyword-does-not-exist' in 'defaults' section"),
+        "expected unknown defaults keyword error, got: {}",
+        err_d.message
+    );
+}
+
+#[test]
+fn test_unsupported_quic_dgram_prefixes_refusal() {
+    for prefix in &["quic+", "dgram+", "quic4+", "quic6+"] {
+        let cfg = format!("frontend fe\n\tbind {prefix}127.0.0.1:8443\n");
+        let err = parse_config(&cfg).unwrap_err();
+        assert!(
+            err.message.contains(prefix),
+            "expected refusal naming prefix '{prefix}', got: {}",
+            err.message
+        );
+    }
+}
+
+#[test]
+fn test_tune_h2_flood_knobs_parsing() {
+    let cfg_str = r"
+global
+    tune.h2.fe.max-total-streams 50
+    tune.h2.fe.glitches-threshold 100
+    tune.h2.fe.max-rst-at-once 20
+
+frontend fe
+    bind 127.0.0.1:8080
+";
+    let cfg = parse_config(cfg_str).expect("Valid h2 flood knobs must parse");
+    let global = cfg.global.as_ref().unwrap();
+    assert_eq!(global.h2_max_total_streams, Some(50));
+    assert_eq!(global.h2_glitches_threshold, Some(100));
+    assert_eq!(global.h2_max_rst_at_once, Some(20));
+
+    let unsupp_cpu = "global\n\ttune.glitches.kill.cpu-usage 80\n";
+    let err_cpu = parse_config(unsupp_cpu).unwrap_err();
+    assert!(
+        err_cpu.message.contains("tune.glitches.kill.cpu-usage"),
+        "expected cpu-usage refusal, got: {}",
+        err_cpu.message
+    );
+}
+
+

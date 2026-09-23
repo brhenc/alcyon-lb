@@ -476,3 +476,62 @@ fn sixty_thousand_backends_memory_bounded() {
 
     drop(engine);
 }
+
+#[test]
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+fn sixty_thousand_backends_with_checks_memory_bounded() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let before = ibex_alloc::alloc_counters();
+    let mut servers = Vec::with_capacity(60_000);
+    for i in 0..60_000u32 {
+        let port = (1024 + (i % 60000)) as u16;
+        let addr = SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, (i / 256) as u8, (i % 256) as u8)),
+            port,
+        );
+        let mut s = Server::new(format!("s_{i}"), addr);
+        s.check = true;
+        s.inter = Some(Duration::from_millis(2000));
+        s.fall = Some(3);
+        s.rise = Some(2);
+        servers.push(s);
+    }
+
+    let config = Config {
+        backends: vec![BackendSection {
+            name: "be_60k_checks".into(),
+            mode: Mode::Http,
+            servers,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let engine = Engine::new(&config, 64).expect("Engine::new 60k backends with checks");
+    let after = ibex_alloc::alloc_counters();
+
+    let diff = before.diff(&after);
+    println!(
+        "[MEASUREMENT] 60,000 backends WITH checks: {} allocs, {} bytes ({:.2} MB)",
+        diff.alloc_count,
+        diff.bytes_allocated,
+        diff.bytes_allocated as f64 / (1024.0 * 1024.0)
+    );
+
+    // HAProxy baseline for 60,000 backends: 3,456 bytes/server = 207 MB.
+    // Ibex measured (with active health checks enabled on all 60k servers):
+    // 29.75 MB (31,195,964 bytes, 120,033 allocations, ~520 bytes/server).
+    // Bound pinned to <= 35 MB (7x smaller than HAProxy's 207 MB).
+    let max_bound_bytes: usize = 35 * 1024 * 1024;
+    assert!(
+        diff.bytes_allocated <= max_bound_bytes,
+        "60,000 backends with checks allocated {} bytes (> {} bytes / 35 MB)",
+        diff.bytes_allocated,
+        max_bound_bytes
+    );
+
+    drop(engine);
+}
+
+

@@ -41,6 +41,7 @@ pub struct H1Parser {
     /// be reused.
     pub framing_conflict: bool,
     pub saw_bare_cr: bool,
+    pub prev_delim_len: usize,
 }
 
 impl H1Parser {
@@ -55,6 +56,7 @@ impl H1Parser {
             connection_close: false,
             framing_conflict: false,
             saw_bare_cr: false,
+            prev_delim_len: 2,
         }
     }
 
@@ -67,6 +69,7 @@ impl H1Parser {
         self.is_upgrade = false;
         self.connection_close = false;
         self.saw_bare_cr = false;
+        self.prev_delim_len = 2;
     }
 
     /// Finalizes parsing on connection close / EOF (for HTTP/1.0 close delimiter fallback).
@@ -195,6 +198,7 @@ impl H1Parser {
                 .map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
         }
 
+        self.prev_delim_len = delim_len;
         self.phase = H1Phase::Headers;
         Ok(line_end + delim_len)
     }
@@ -213,27 +217,35 @@ impl H1Parser {
         }
 
         if line_end == 0 {
+            htx.finalize_last_header();
             // Empty line -> End of headers
             htx.push_eoh()
                 .map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
             self.on_headers_finished(htx)?;
+            self.prev_delim_len = delim_len;
             Ok(delim_len)
         } else {
             let header_bytes = &input[..line_end];
             if header_bytes.starts_with(b" ") || header_bytes.starts_with(b"\t") {
-                // Multiline header (obs-fold): append to previous header
+                // Multiline header (obs-fold): append to previous header.
+                // RFC 9112 §5.2 / HAProxy replaces preceding CRLF with 2 SP (or LF with 1 SP)
+                // and preserves the continuation line's leading whitespace run.
+                let prefix = if self.prev_delim_len == 2 { "  " } else { " " };
                 let folded_val = std::str::from_utf8(header_bytes)
                     .map_err(|_| {
                         io::Error::new(io::ErrorKind::InvalidData, "Invalid folded header")
-                    })?
-                    .trim();
-                htx.append_to_last_header(folded_val).map_err(|_| {
+                    })?;
+                let mut combined = String::with_capacity(prefix.len() + folded_val.len());
+                combined.push_str(prefix);
+                combined.push_str(folded_val);
+                htx.append_to_last_header(&combined).map_err(|_| {
                     self.phase = H1Phase::Error;
                     io::Error::new(
                         io::ErrorKind::InvalidData,
                         "obs-fold continuation with no preceding header",
                     )
                 })?;
+                self.prev_delim_len = delim_len;
                 return Ok(line_end + delim_len);
             }
 
@@ -241,8 +253,10 @@ impl H1Parser {
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid header string"))?;
 
             let (name, value) = parse_header_field_borrowed(header_str)?;
+            htx.finalize_last_header();
             htx.push_header(name, value)
                 .map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
+            self.prev_delim_len = delim_len;
             Ok(line_end + delim_len)
         }
     }
@@ -255,34 +269,42 @@ impl H1Parser {
             };
 
             if line_end == 0 {
+                htx.finalize_last_trailer();
                 // Empty line -> End of trailers
                 htx.push_eot()
                     .map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
+                self.prev_delim_len = delim_len;
                 return Ok((cursor + delim_len, true));
             }
 
             let trailer_bytes = &input[cursor..cursor + line_end];
             if trailer_bytes.starts_with(b" ") || trailer_bytes.starts_with(b"\t") {
                 // Multiline trailer (obs-fold)
+                let prefix = if self.prev_delim_len == 2 { "  " } else { " " };
                 let folded_val = std::str::from_utf8(trailer_bytes)
                     .map_err(|_| {
                         io::Error::new(io::ErrorKind::InvalidData, "Invalid folded trailer")
-                    })?
-                    .trim();
-                let _ = htx.append_to_last_trailer(folded_val);
+                    })?;
+                let mut combined = String::with_capacity(prefix.len() + folded_val.len());
+                combined.push_str(prefix);
+                combined.push_str(folded_val);
+                let _ = htx.append_to_last_trailer(&combined);
             } else {
                 let trailer_str = std::str::from_utf8(trailer_bytes).map_err(|_| {
                     io::Error::new(io::ErrorKind::InvalidData, "Invalid trailer string")
                 })?;
                 let (name, value) = parse_header_field_borrowed(trailer_str)?;
+                htx.finalize_last_trailer();
                 htx.push_trailer(name, value)
                     .map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
             }
 
+            self.prev_delim_len = delim_len;
             cursor += line_end + delim_len;
         }
         Ok((cursor, false))
     }
+
 
     fn on_headers_finished(&mut self, htx: &mut HtxSlice<'_>) -> io::Result<()> {
         let last_start_line = (0..htx.num_blocks())
@@ -638,7 +660,7 @@ fn parse_header_field_borrowed(line: &str) -> io::Result<(&str, &str)> {
         ));
     }
 
-    Ok((name, val.trim_matches(|c| c == ' ' || c == '\t')))
+    Ok((name, val.trim_start_matches([' ', '\t'])))
 }
 
 #[cfg(test)]

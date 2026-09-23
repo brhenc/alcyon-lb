@@ -126,3 +126,17 @@ failed because Ibex does not expand `${VAR-default}` in configuration files. **T
 wrong.** It came from extracting the raw `-conf` block and running `ibex -c` on it
 directly, which skips the substitution the harness does at `vtc_runner.py:619`. The real
 run shows no such failures. Recorded because the wrong number was nearly the headline.
+
+## T17 Config Surface Run
+
+**Pass count before:** 7
+**Pass count after:** 7
+**Failing before:** 164
+**Failing after:** 164
+
+No tests that passed before are failing now.
+
+- `missing port in address` failures (31 tests) on prefixes like `unix@`, `fd@`, `abns@` were correctly changed to fail with `address prefix <prefix> is not implemented`.
+- `startup/default_rules.vtc` still reports "Config check unexpectedly succeeded". The underlying parser flaws (closing unknown keywords in `global` and `defaults` sections, refusing `http-request`/`http-response`/`http-after-request`/`tcp-response` in `defaults`, refusing `defaults <name>`, and refusing inline `from`) were fixed. The remaining failure is blocked by a harness bug where `vtc_runner.py`'s manual block parser incorrectly extracts an empty configuration for `haproxy h1 -conf-BAD {} {`, which `ibex` correctly parses as a valid empty configuration (returning 0).
+- Keywords `log-format`, `capture`, `http-check`, `tcp-check` etc. were left unimplemented and continue to fail with `unknown keyword`. Implementing them would require changes to `ibex-rt` to evaluate them on the data path, which is out of bounds for this session. Accepting them without implementing them would violate Rule 5.
+- `stats/clear_counters_server.vtc` is blocked because the required string `No such proxy.` resides in `crates/ibex-rt/src/applet.rs` which is strictly out of bounds.

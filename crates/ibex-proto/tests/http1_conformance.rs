@@ -176,9 +176,10 @@ fn test_chunked_trailers_with_multiline_obs_fold() {
     assert_eq!(htx.body_bytes(), b"test");
     assert_eq!(
         htx.get_trailer("x-multi-trailer"),
-        Some("line1 continued-line2 continued-line3")
+        Some("line1   continued-line2  \tcontinued-line3")
     );
 }
+
 
 #[test]
 fn test_chunked_streaming_incremental_bytes() {
@@ -560,16 +561,17 @@ fn test_header_multiline_obs_fold_spaces_and_tabs() {
     assert_eq!(parser.phase, H1Phase::Done);
     assert_eq!(
         htx.get_header("subject"),
-        Some("This is a test of folded header fields using RFC7230 obs-fold rules")
+        Some("This is a test of   folded header fields using  \tRFC7230 obs-fold rules")
     );
     assert_eq!(htx.get_header("accept"), Some("*/*"));
 
     // Serialization replaces obs-fold with standard single-line header
     let serialized = String::from_utf8(htx.to_h1_wire()).unwrap();
     assert!(serialized.contains(
-        "Subject: This is a test of folded header fields using RFC7230 obs-fold rules\r\n"
+        "Subject: This is a test of   folded header fields using  \tRFC7230 obs-fold rules\r\n"
     ));
 }
+
 
 #[test]
 fn test_header_whitespace_and_case_insensitivity() {

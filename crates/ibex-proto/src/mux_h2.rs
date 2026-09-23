@@ -27,7 +27,7 @@ use crate::h2::{
 use crate::hpack::{HpackDecoder, HpackEncoder};
 use crate::htx::{HeaderField, HttpMethod, HttpVersion, Htx, HtxBlock, RequestLine, ResponseLine};
 use crate::mux::{mux_flags, Mux, MuxFlags, MuxOps, ShutMode};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::io;
 
 static H2_OPS: MuxOps = MuxOps {
@@ -46,6 +46,7 @@ pub struct H2StreamCtx {
     pub recv_window: i32,
     pub reset_reason: Option<H2Error>,
     pub is_shut: bool,
+    pub dispatched: bool,
 }
 
 impl H2StreamCtx {
@@ -59,8 +60,20 @@ impl H2StreamCtx {
             recv_window: initial_recv_window,
             reset_reason: None,
             is_shut: false,
+            dispatched: false,
         }
     }
+}
+
+/// Configuration for HTTP/2 flood mitigation knobs matching HAProxy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct H2FloodConfig {
+    /// Caps total streams per connection (`tune.h2.fe.max-total-streams`). Default: 0 (unlimited).
+    pub max_total_streams: usize,
+    /// Threshold of glitch frames before graceful GOAWAY (75%) and hard close (100%) (`tune.h2.fe.glitches-threshold`). Default: 0 (disabled).
+    pub glitches_threshold: usize,
+    /// Maximum burst resets allowed before task deprioritization (`tune.h2.fe.max-rst-at-once`). Default: 0 (disabled).
+    pub max_rst_at_once: usize,
 }
 
 /// HTTP/2 Connection Context.
@@ -71,7 +84,7 @@ pub struct H2MuxContext {
     pub rx_buf: Vec<u8>,
     pub tx_buf: Vec<u8>,
     pub tx_consumed: usize,
-    pub streams: HashMap<u32, H2StreamCtx>,
+    pub streams: BTreeMap<u32, H2StreamCtx>,
     pub conn_send_window: i32,
     pub conn_recv_window: i32,
     pub remote_initial_window: i32,
@@ -86,6 +99,17 @@ pub struct H2MuxContext {
     pub decoder: HpackDecoder,
     pub encoder: HpackEncoder,
     pub is_shut: bool,
+    pub reset_count: u32,
+    pub ping_count: u32,
+    pub settings_count: u32,
+    pub continuation_stream: Option<u32>,
+    pub continuation_flags: u8,
+    pub continuation_buf: Vec<u8>,
+    pub continuation_count: u32,
+    pub flood_config: H2FloodConfig,
+    pub total_streams: usize,
+    pub glitch_count: usize,
+    pub graceful_goaway_sent: bool,
 }
 
 impl H2MuxContext {
@@ -102,7 +126,7 @@ impl H2MuxContext {
             rx_buf: Vec::with_capacity(8192),
             tx_buf: Vec::with_capacity(8192),
             tx_consumed: 0,
-            streams: HashMap::new(),
+            streams: BTreeMap::new(),
             conn_send_window: DEFAULT_INITIAL_WINDOW_SIZE,
             conn_recv_window: DEFAULT_INITIAL_WINDOW_SIZE,
             remote_initial_window: DEFAULT_INITIAL_WINDOW_SIZE,
@@ -117,6 +141,17 @@ impl H2MuxContext {
             decoder: HpackDecoder::new(),
             encoder: HpackEncoder::new(),
             is_shut: false,
+            reset_count: 0,
+            ping_count: 0,
+            settings_count: 0,
+            continuation_stream: None,
+            continuation_flags: 0,
+            continuation_buf: Vec::new(),
+            continuation_count: 0,
+            flood_config: H2FloodConfig::default(),
+            total_streams: 0,
+            glitch_count: 0,
+            graceful_goaway_sent: false,
         }
     }
 
@@ -357,6 +392,9 @@ impl Mux for MuxH2 {
 
         // Step 2: Demultiplex incoming frames
         while ctx.rx_buf.len() >= consumed + FRAME_HEADER_LEN {
+            if ctx.conn_state == H2ConnState::GoAwaySent {
+                break;
+            }
             let slice = &ctx.rx_buf[consumed..];
             let header = FrameHeader::decode(slice)?;
 
@@ -511,13 +549,134 @@ impl Mux for MuxH2 {
 }
 
 impl MuxH2 {
+    fn process_headers_block(
+        ctx: &mut H2MuxContext,
+        stream_id: u32,
+        flags: u8,
+        header_block: &[u8],
+    ) -> io::Result<()> {
+        if !ctx.streams.contains_key(&stream_id) {
+            let active = ctx
+                .streams
+                .values()
+                .filter(|s| s.state == H2StreamState::Open || s.state == H2StreamState::HalfClosedRemote)
+                .count();
+            if active >= ctx.max_concurrent_streams as usize {
+                ctx.send_rst_stream(stream_id, H2Error::RefusedStream);
+                return Ok(());
+            }
+        }
+
+        let decoded_headers = ctx.decoder.decode(header_block).map_err(|e| {
+            ctx.send_goaway(stream_id, e, b"HPACK compression error");
+            io::Error::new(io::ErrorKind::InvalidData, "HPACK compression error")
+        })?;
+
+        let stream = ctx.streams.entry(stream_id).or_insert_with(|| {
+            H2StreamCtx::new(
+                stream_id,
+                ctx.remote_initial_window,
+                ctx.local_initial_window,
+            )
+        });
+
+        stream.state = H2StreamState::Open;
+
+        // Extract pseudo-headers and construct HTX blocks
+        let mut method = None;
+        let mut path = None;
+        let mut status = None;
+        let mut regular_headers = Vec::new();
+
+        for h in decoded_headers {
+            match h.name.as_str() {
+                ":method" => method = Some(HttpMethod::from_bytes(h.value.as_bytes())),
+                ":path" => path = Some(h.value),
+                ":status" => status = h.value.parse::<u16>().ok(),
+                _ => regular_headers.push(h),
+            }
+        }
+
+        if let Some(m) = method {
+            let uri = path.unwrap_or_else(|| "/".to_string());
+            stream.rx_htx.push(HtxBlock::ReqLine(RequestLine {
+                method: m,
+                uri,
+                version: HttpVersion::Http20,
+            }));
+        } else if let Some(st) = status {
+            stream.rx_htx.push(HtxBlock::ResLine(ResponseLine {
+                version: HttpVersion::Http20,
+                status: st,
+                reason: String::new(),
+            }));
+        }
+
+        for h in regular_headers {
+            stream.rx_htx.push(HtxBlock::Header(h));
+        }
+        stream.rx_htx.push(HtxBlock::Eoh);
+
+        if (flags & frame_flags::END_STREAM) != 0 {
+            stream.rx_htx.push(HtxBlock::Eom);
+            stream.state = H2StreamState::HalfClosedRemote;
+        }
+
+        Ok(())
+    }
+
     fn handle_frame(ctx: &mut H2MuxContext, frame: Frame) -> io::Result<()> {
+        if let Some(c_sid) = ctx.continuation_stream {
+            if let Frame::Continuation {
+                stream_id,
+                flags,
+                header_block,
+            } = frame
+            {
+                if stream_id != c_sid {
+                    ctx.send_goaway(stream_id, H2Error::ProtocolError, b"continuation on wrong stream");
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "CONTINUATION on wrong stream",
+                    ));
+                }
+                ctx.continuation_count = ctx.continuation_count.saturating_add(1);
+                if ctx.continuation_count > 100
+                    || ctx.continuation_buf.len() + header_block.len() > 65536
+                {
+                    ctx.send_goaway(
+                        stream_id,
+                        H2Error::EnhanceYourCalm,
+                        b"CONTINUATION flood / header list too large",
+                    );
+                    return Ok(());
+                }
+                ctx.continuation_buf.extend_from_slice(&header_block);
+                if (flags & frame_flags::END_HEADERS) != 0 {
+                    let combined_flags = ctx.continuation_flags;
+                    let combined_block = std::mem::take(&mut ctx.continuation_buf);
+                    ctx.continuation_stream = None;
+                    ctx.continuation_count = 0;
+                    return Self::process_headers_block(ctx, c_sid, combined_flags, &combined_block);
+                }
+                return Ok(());
+            }
+
+            ctx.send_goaway(c_sid, H2Error::ProtocolError, b"expected CONTINUATION frame");
+            return Ok(());
+        }
+
         match frame {
             Frame::Settings { flags, settings } => {
                 if (flags & frame_flags::ACK) != 0 {
                     // Settings ACK received from peer
                     ctx.settings_ack_received = true;
                 } else {
+                    ctx.settings_count = ctx.settings_count.saturating_add(1);
+                    if ctx.settings_count > 100 {
+                        ctx.send_goaway(0, H2Error::EnhanceYourCalm, b"SETTINGS flood detected");
+                        return Ok(());
+                    }
                     // Peer sent settings: apply parameters
                     for (param, val) in settings {
                         match param {
@@ -585,60 +744,33 @@ impl MuxH2 {
                     ctx.last_client_stream_id = stream_id;
                 }
 
-                let decoded_headers = ctx.decoder.decode(&header_block).map_err(|e| {
-                    ctx.send_goaway(stream_id, e, b"HPACK compression error");
-                    io::Error::new(io::ErrorKind::InvalidData, "HPACK compression error")
-                })?;
-
-                let stream = ctx.streams.entry(stream_id).or_insert_with(|| {
-                    H2StreamCtx::new(
-                        stream_id,
-                        ctx.remote_initial_window,
-                        ctx.local_initial_window,
-                    )
-                });
-
-                stream.state = H2StreamState::Open;
-
-                // Extract pseudo-headers and construct HTX blocks
-                let mut method = None;
-                let mut path = None;
-                let mut status = None;
-                let mut regular_headers = Vec::new();
-
-                for h in decoded_headers {
-                    match h.name.as_str() {
-                        ":method" => method = Some(HttpMethod::from_bytes(h.value.as_bytes())),
-                        ":path" => path = Some(h.value),
-                        ":status" => status = h.value.parse::<u16>().ok(),
-                        _ => regular_headers.push(h),
+                if ctx.is_server {
+                    ctx.total_streams = ctx.total_streams.saturating_add(1);
+                    if ctx.flood_config.max_total_streams > 0
+                        && ctx.total_streams >= ctx.flood_config.max_total_streams
+                    {
+                        ctx.send_goaway(
+                            stream_id,
+                            H2Error::NoError,
+                            b"max-total-streams reached",
+                        );
+                        return Ok(());
                     }
                 }
 
-                if let Some(m) = method {
-                    let uri = path.unwrap_or_else(|| "/".to_string());
-                    stream.rx_htx.push(HtxBlock::ReqLine(RequestLine {
-                        method: m,
-                        uri,
-                        version: HttpVersion::Http20,
-                    }));
-                } else if let Some(st) = status {
-                    stream.rx_htx.push(HtxBlock::ResLine(ResponseLine {
-                        version: HttpVersion::Http20,
-                        status: st,
-                        reason: String::new(),
-                    }));
+                if (flags & frame_flags::END_HEADERS) == 0 {
+                    if header_block.len() > 65536 {
+                        ctx.send_goaway(stream_id, H2Error::EnhanceYourCalm, b"header block too large");
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, "Header block too large"));
+                    }
+                    ctx.continuation_stream = Some(stream_id);
+                    ctx.continuation_flags = flags;
+                    ctx.continuation_buf = header_block;
+                    ctx.continuation_count = 0;
+                    return Ok(());
                 }
 
-                for h in regular_headers {
-                    stream.rx_htx.push(HtxBlock::Header(h));
-                }
-                stream.rx_htx.push(HtxBlock::Eoh);
-
-                if (flags & frame_flags::END_STREAM) != 0 {
-                    stream.rx_htx.push(HtxBlock::Eom);
-                    stream.state = H2StreamState::HalfClosedRemote;
-                }
+                Self::process_headers_block(ctx, stream_id, flags, &header_block)?;
             }
 
             Frame::Data {
@@ -705,6 +837,30 @@ impl MuxH2 {
                 stream_id,
                 error_code,
             } => {
+                ctx.reset_count = ctx.reset_count.saturating_add(1);
+                ctx.glitch_count = ctx.glitch_count.saturating_add(1);
+
+                if ctx.flood_config.glitches_threshold > 0 {
+                    let threshold_75 = (ctx.flood_config.glitches_threshold * 75) / 100;
+                    if ctx.glitch_count >= ctx.flood_config.glitches_threshold {
+                        ctx.send_goaway(
+                            ctx.last_client_stream_id,
+                            H2Error::EnhanceYourCalm,
+                            b"glitches-threshold exceeded",
+                        );
+                        return Ok(());
+                    } else if ctx.glitch_count >= threshold_75 && !ctx.graceful_goaway_sent {
+                        ctx.graceful_goaway_sent = true;
+                        ctx.goaway_sent = Some((0x7fff_ffff, H2Error::NoError));
+                        let frame = Frame::GoAway {
+                            last_stream_id: 0x7fff_ffff,
+                            error_code: H2Error::NoError,
+                            debug_data: b"graceful shutdown (glitches threshold 75%)".to_vec(),
+                        };
+                        ctx.enqueue_frame(&frame);
+                    }
+                }
+
                 if let Some(stream) = ctx.streams.get_mut(&stream_id) {
                     stream.state = H2StreamState::Reset(error_code);
                     stream.reset_reason = Some(error_code);
@@ -723,6 +879,11 @@ impl MuxH2 {
 
             Frame::Ping { flags, opaque_data } => {
                 if (flags & frame_flags::ACK) == 0 {
+                    ctx.ping_count = ctx.ping_count.saturating_add(1);
+                    if ctx.ping_count > 100 {
+                        ctx.send_goaway(0, H2Error::EnhanceYourCalm, b"PING flood detected");
+                        return Ok(());
+                    }
                     // Send PING ACK reply with exact same opaque_data
                     let ping_ack = Frame::Ping {
                         flags: frame_flags::ACK,
@@ -732,9 +893,20 @@ impl MuxH2 {
                 }
             }
 
+            Frame::Continuation { stream_id, .. } => {
+                ctx.send_goaway(
+                    stream_id,
+                    H2Error::ProtocolError,
+                    b"unexpected CONTINUATION frame",
+                );
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Unexpected CONTINUATION frame",
+                ));
+            }
+
             Frame::Priority { .. }
             | Frame::PushPromise { .. }
-            | Frame::Continuation { .. }
             | Frame::Unknown { .. } => {}
         }
 

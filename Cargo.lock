@@ -167,6 +167,7 @@ version = "0.1.0"
 dependencies = [
  "ibex-alloc",
  "ibex-h1-sys",
+ "ibex-sample",
  "ibex-sched",
  "proptest",
  "regex",

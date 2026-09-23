@@ -110,7 +110,7 @@ pub use htx::{
 };
 pub use mux::{Mux, MuxFlags, MuxOps, ShutMode};
 pub use mux_h1::{H1MuxContext, MuxH1};
-pub use mux_h2::{H2MuxContext, H2StreamCtx, MuxH2};
+pub use mux_h2::{H2FloodConfig, H2MuxContext, H2StreamCtx, MuxH2};
 pub use mux_pt::{MuxPt, PtMuxContext};
 pub use proto::{ProtoKind, Protocol};
 pub use proxy_protocol::{

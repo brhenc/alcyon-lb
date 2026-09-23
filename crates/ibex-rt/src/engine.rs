@@ -409,6 +409,8 @@ pub struct Engine {
     global_bufsize: usize,
     /// Global `tune.maxrewrite` value, stored per-engine for the same reason.
     global_maxrewrite: usize,
+    /// Global HTTP/2 flood mitigation configuration.
+    pub global_h2_flood_config: ibex_proto::H2FloodConfig,
     /// Shared idle backend connection pool across sessions (`http-reuse`).
     pub idle_backend_pool: HashMap<SocketAddr, Vec<OwnedFd>>,
 }
@@ -1112,6 +1114,23 @@ impl Engine {
                 .as_ref()
                 .and_then(|g| g.maxrewrite)
                 .unwrap_or(1024),
+            global_h2_flood_config: ibex_proto::H2FloodConfig {
+                max_total_streams: config
+                    .global
+                    .as_ref()
+                    .and_then(|g| g.h2_max_total_streams)
+                    .unwrap_or(0),
+                glitches_threshold: config
+                    .global
+                    .as_ref()
+                    .and_then(|g| g.h2_glitches_threshold)
+                    .unwrap_or(0),
+                max_rst_at_once: config
+                    .global
+                    .as_ref()
+                    .and_then(|g| g.h2_max_rst_at_once)
+                    .unwrap_or(0),
+            },
             idle_backend_pool: HashMap::new(),
         })
     }
@@ -2263,6 +2282,7 @@ fn register_new_session(
         tracked_sc,
         engine.global_bufsize,
         engine.global_maxrewrite,
+        engine.global_h2_flood_config,
     ) else {
         // TLS setup failed; the fd is dropped with the session and the connection closes.
         return;
@@ -2424,6 +2444,7 @@ fn init_client_session(
     tracked_sc: [Option<(usize, StickKey)>; 3],
     global_bufsize: usize,
     global_maxrewrite: usize,
+    global_h2_flood_config: ibex_proto::H2FloodConfig,
 ) -> Option<(TcpSession, Option<SocketAddr>, Option<RawFd>)> {
     let mode = proxies[proxy_idx].mode;
     let timeouts = proxies[proxy_idx].timeouts;
@@ -2447,6 +2468,7 @@ fn init_client_session(
     sess.fc_src = Some(fc_src);
     sess.fc_dst = Some(fc_dst);
     sess.tracked_sc = tracked_sc;
+    sess.h2_flood_config = global_h2_flood_config;
     // Use per-engine values rather than the global `BUFSIZE_STANDARD` atomic so that
     // multiple Engine instances running in the same process (e.g. parallel tests) do not
     // race each other's configuration.
@@ -3280,6 +3302,13 @@ impl EngineDispatcher<'_> {
 
             // Step 4: Update interests
             update_interests(entry, self.fdtab, self.poller);
+
+            // Step 4b: If there are undispatched H2 streams or pending output, re-queue tasklet for immediate processing
+            if (entry.sess.has_undispatched_h2_streams() || entry.sess.has_pending_output())
+                && !entry.sess.is_done()
+            {
+                self.wake_queue.push(entry.task);
+            }
 
             // Step 5: Update timer
             self.timer_updates
