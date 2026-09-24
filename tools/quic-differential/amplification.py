@@ -52,9 +52,17 @@ def probe_amplification_single(
     host: str,
     port: int,
     payload: bytes,
-    listen_timeout: float = 0.5,
+    listen_timeout: float = 2.0,
 ) -> Tuple[int, int, List[int]]:
-    """Send payload to host:port and measure total response bytes received."""
+    """Send payload to host:port and measure total response bytes received.
+
+    The window must outlast the server's first PTO or the measurement is meaningless. This
+    defaulted to 0.5 s, which is shorter than a standard first probe: RFC 9002 §6.2.2 puts
+    kInitialRtt at 333 ms, placing the first PTO near 1000 ms. HAProxy 3.5-dev7 retransmits at
+    1002 ms, so a 0.5 s window counted only its first flight and reported 1.242x for what is
+    really 2.281x over 4 s. That number was quoted for a week as the parity target and made
+    Ibex look twice as bad as it was.
+    """
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(("127.0.0.1", 0))
     sock.settimeout(0.1)

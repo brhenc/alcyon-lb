@@ -870,3 +870,68 @@ fn a_refused_packet_is_never_generated_in_the_first_place() {
         "packets were generated and then thrown away by the budget"
     );
 }
+
+
+/// The first retransmission must not come sooner than RFC 9002's initial RTT allows.
+///
+/// `QuicConfig` set `initial_rtt` to 100 ms. RFC 9002 §6.2.2 puts kInitialRtt at 333 ms and
+/// `quinn-proto`'s own default is 333 ms, so this was an override to a third of the standard
+/// value with nothing recording why. PTO is `smoothed_rtt + 4 * rttvar`, so 100 ms fires the
+/// first probe at ~300 ms where the standard value fires at ~1000 ms -- measured, `HAProxy`
+/// 3.5-dev7 retransmits at 1002 ms and Ibex retransmitted at 301 ms.
+///
+/// It costs twice. Any client further away than 100 ms -- which is most of the internet --
+/// makes the server retransmit a handshake flight that was never lost. And on a path that is
+/// still unvalidated it spends the anti-amplification budget three times faster, which is
+/// throughput for anyone using the proxy as a reflector.
+#[test]
+fn a_handshake_is_not_retransmitted_sooner_than_the_initial_rtt() {
+    let tls = rustls_server_config();
+    let mut listener = QuicListener::bind(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        &tls,
+        None,
+    )
+    .expect("bind listener");
+
+    let server_addr = listener.addr();
+    let initial = client_initial(server_addr);
+    let sock = UdpSocket::bind("127.0.0.1:0").expect("client socket");
+    sock.set_nonblocking(true).expect("nonblocking");
+
+    // The client sends one Initial and then goes silent, so everything after the first flight
+    // is the server probing on its own timer.
+    let start = Instant::now();
+    sock.send_to(&initial, server_addr).expect("send Initial");
+
+    let mut buf = vec![0u8; 65535];
+    let mut first_flight_done: Option<Instant> = None;
+    let mut retransmit_at: Option<Duration> = None;
+
+    while start.elapsed() < Duration::from_millis(1500) && retransmit_at.is_none() {
+        let now = Instant::now();
+        let _ = listener.handle_read(now);
+        let _ = listener.handle_write(now);
+        listener.handle_timeout(now);
+        while let Ok((_n, _)) = sock.recv_from(&mut buf) {
+            let seen = Instant::now();
+            match first_flight_done {
+                // A gap of 50 ms after the first burst means the flight is over and this
+                // packet is a probe rather than the rest of the flight.
+                Some(last) if seen.duration_since(last) > Duration::from_millis(50) => {
+                    retransmit_at = Some(seen.duration_since(start));
+                }
+                _ => first_flight_done = Some(seen),
+            }
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+
+    let at = retransmit_at.expect("the server must probe at all within 1.5 s");
+    assert!(
+        at >= Duration::from_millis(500),
+        "the server retransmitted after {at:?}. RFC 9002 §6.2.2 puts kInitialRtt at 333 ms, \
+         which places the first PTO near 1000 ms; HAProxy measures 1002 ms. Anything near \
+         300 ms means initial_rtt is set below the standard value."
+    );
+}

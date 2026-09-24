@@ -11,31 +11,47 @@ Test Harness: `tools/quic-differential/` (`conformance.py`, `amplification.py`, 
 **Recommendation: Keep `quinn-proto` with specific Ibex runtime DoS policy wrappers.**
 
 ### The Numbers That Justify the Decision:
-1. **Anti-Amplification Compliance (RFC 9000 §8.1).** Corrected 2026-09-24. The claim that
-   "HAProxy and `quinn-proto` both enforce the strict 3× ceiling" was wrong, and the 1.242×
-   quoted here was HAProxy's number attributed to both. `quinn-proto` does *not* enforce the
-   ceiling: it deliberately allows a full MTU past it, documented at `connection/mod.rs:588`
-   ("If there is any anti-amplification budget left, we always allow a full MTU to be sent",
-   quinn-rs/quinn#1082). Ibex measured **3.472×**, a violation. `ibex-quic` now does its own
-   accounting.
+1. **Anti-Amplification Compliance (RFC 9000 §8.1).** Corrected twice on 2026-09-24; read the
+   second correction, because the first was measured through too short a window.
 
-   Measured today through `tools/quic-differential/amplification.py`, one 1200 B Initial,
-   0.5 s listen window, three runs each:
+   `quinn-proto` does not enforce the ceiling. It deliberately allows a full MTU past it,
+   documented at `connection/mod.rs:588` -- "If there is any anti-amplification budget left, we
+   always allow a full MTU to be sent", quinn-rs/quinn#1082. Ibex measured **3.472×**, a real
+   violation, and `ibex-quic` now does its own accounting.
 
-   | Server | Packets returned | Bytes | Ratio | RFC 9000 §8.1 |
+   **The 1.242× figure long quoted for HAProxy was an artefact of the harness.**
+   `amplification.py` listens for 0.5 s. HAProxy's first PTO fires at ~1002 ms, so the window
+   closed before its retransmission and counted only the first flight. Measured over 4 s,
+   three runs each, one 1200 B Initial from a client that then goes silent:
+
+   | Server | First flight | First PTO probe | Total | Ratio |
    |---|---|---|---|---|
-   | HAProxy 3.5-dev7 | `[1252, 239]` | 1490 | **1.242×** | pass |
-   | Ibex, before the fix | — | 4167 | **3.472×** | **violation** |
-   | Ibex, after the fix | `[1200, 573, 1200]` | 2970 | **2.475×** | pass |
+   | HAProxy 3.5-dev7 | 1490 B @ 4 ms | 1247 B @ 1002 ms | 2737 B | **2.281×** |
+   | Ibex, before any fix | — | — | 4167 B | **3.472×** (violation) |
+   | Ibex, budget fixed | 1769 B @ 5 ms | 1200 B @ **301 ms** | 2969 B | 2.474× |
+   | Ibex, current | 1763 B @ 5 ms | 1200 B @ **999 ms** | 2963 B | **2.469×** |
 
-   Ibex is compliant but sends twice what HAProxy does, and the difference is one packet: the
-   third. HAProxy answers with a single flight and then waits. Ibex's first flight is 1773 B
-   (1.478×); the third packet is a PTO retransmission into a path that is still unvalidated,
-   which `quinn-proto`'s loss recovery issues and the budget permits because 2970 ≤ 3600.
-   Closing the remaining gap means not retransmitting into an unvalidated path, which is a
-   change in `quinn-proto`'s loss recovery rather than in the budget.
+   Both servers probe exactly once and then stop, each held by the same 3× wall. The real gap
+   was never 2×; it is **8%**, and it decomposes into two things:
+
+   - **PTO timing, now fixed.** `QuicConfig` set `initial_rtt` to 100 ms against RFC 9002
+     §6.2.2's kInitialRtt of 333 ms, which is also `quinn-proto`'s default. PTO is
+     `smoothed_rtt + 4 * rttvar`, so Ibex probed at 301 ms where HAProxy probes at 1002 ms.
+     That cost a spurious handshake retransmission for every client further away than 100 ms
+     and spent the unvalidated-path budget three times faster. At the standard value Ibex
+     probes at 999 ms against HAProxy's 1002 ms.
+
+   - **First-flight size, open.** Ibex sends 1763 B where HAProxy sends 1490 B, ~270 B more,
+     for the same single RSA-2048 certificate (809 B DER). This is payload, not framing waste:
+     raising `initial_mtu` from 1200 to 1452 repartitions the flight from `[1200, 563]` to
+     `[1452, 309]` and leaves the total at 1761 B. The bytes are in the TLS flight or the
+     transport parameters. Not yet isolated.
 
    Runt datagrams (64 B, 500 B, 1199 B) are discarded with 0 bytes returned by both, per §14.1.
+
+   *Anyone re-running this: `amplification.py`'s 0.5 s window is shorter than a standard first
+   PTO and will silently under-report any RFC-conformant server. Use a window over 1.5 s.*
+
 2. **Duress & Rapid Reset Resilience:** Stream reset floods (1,000 rapid `RESET_STREAM` / `STOP_SENDING` frames) process at **1012.0 resets/s** on HAProxy with zero connection crashes and bounded RSS growth (+536 KB). Unanswered Initial floods at 1816.5 pps produce a response byte ratio of only **0.058×** (+16180 KB RSS delta) and leave the proxy fully responsive post-flood. Connection ID rapid retirement (200 rotations across 4 concurrent connections) sustained **369.4 rotations/s** with 100% connection survival.
 3. **Configuration Knobs Coverage:** Of HAProxy's **31** `tune.quic.*` knobs:
    - **16 knobs (51.6%)** map directly to `quinn-proto`'s `TransportConfig` (flow control, stream concurrency, idle timeouts, ACK thresholds, pacing, UDP GSO).

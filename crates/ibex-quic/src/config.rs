@@ -62,7 +62,12 @@ impl Default for QuicConfig {
             receive_window: 1024 * 1024,
             send_window: 1024 * 1024,
             packet_threshold: 3,
-            initial_rtt: Duration::from_millis(100),
+            // RFC 9002 §6.2.2 kInitialRtt, which is also quinn-proto's default and what
+            // HAProxy behaves as. This was 100 ms, which fires the first PTO at ~300 ms
+            // instead of ~1000 ms: a spurious handshake retransmission for every client
+            // further away than 100 ms, and three times the burn rate on the
+            // anti-amplification budget of a path that is not yet validated.
+            initial_rtt: Duration::from_millis(333),
             initial_mtu: 1200,
             min_mtu: 1200,
             enable_gso: true,
