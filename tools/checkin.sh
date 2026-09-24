@@ -51,6 +51,19 @@ echo "=== the oracles that measure a port against the real thing ==="
 cargo test -p slz --test test_slz -- --nocapture 2>&1 | grep -E "EXACT MATCHES|ROUND TRIPS|test result"
 
 echo
+echo "=== every test in the workspace, against a declared baseline ==="
+# The three sections above name four test targets by hand. The workspace has 77, so 73 of
+# them -- including every file a task had added -- never ran here. That is how T48 shipped
+# crates/ibex-rt/tests/load_balancing.rs with a red assertion and a SUCCESS report, past two
+# reviewers and a green check-in: nothing ran the file, so nothing could go red. A test that
+# exists and is never run is worse than no test, because it is counted as coverage.
+#
+# Failing targets are re-run alone before they count: tcp_proxy passes 17/17 by itself and
+# fails in the parallel run on port contention, and fc_src_is_the_real_peer_after_set_src
+# does the same. Known failures live in data/suite_baseline.json with a reason each.
+python3 harness/suite.py 2>&1 | grep -vE "^$"
+
+echo
 echo "=== the regressions no unit test can see ==="
 # A daemon that will not start is invisible to `cargo test`. Making the `global` section
 # strict about unknown keywords took the reg-test board from 7 passing to 1 -- `thread-groups`
