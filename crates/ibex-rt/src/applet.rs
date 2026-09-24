@@ -208,6 +208,14 @@ impl CliApplet {
             } else {
                 self.is_done = true;
             }
+        } else if cmd == "show default-server" {
+            if self.interactive {
+                self.out_buf.extend_from_slice(b"\n> ");
+            } else {
+                self.is_done = true;
+            }
+        } else if let Some(target) = cmd.strip_prefix("del backend ") {
+            self.handle_del_backend(target.trim(), ctx);
         } else if cmd == "show servers state" || cmd.starts_with("show servers state ") {
             let be_filter = cmd.strip_prefix("show servers state").map(str::trim).filter(|s| !s.is_empty());
             if let Some(target) = be_filter {
@@ -222,7 +230,7 @@ impl CliApplet {
                 }
             }
             self.out_buf.extend_from_slice(b"1\n# be_id be_name srv_id srv_name srv_addr srv_op_state srv_admin_state srv_uweight srv_iweight srv_time_since_last_change srv_check_status srv_check_result srv_check_health srv_check_state srv_agent_state bk_f_forced_id srv_f_forced_id srv_fqdn srv_port srvrecord srv_use_ssl srv_check_port srv_check_addr srv_agent_addr srv_agent_port\n");
-            for p in ctx.proxies.iter() {
+            for (p_idx, p) in ctx.proxies.iter().enumerate() {
                 if let Some(target) = be_filter {
                     if p.name != target { continue; }
                 }
@@ -233,10 +241,49 @@ impl CliApplet {
                         Some(0 /* Up */) => 2,
                         _ => 0,
                     };
+                    
+                    let mut check_status = 1;
+                    let mut check_result = 0;
+                    let mut check_health = 0;
+                    
+                    if let Some(check) = ctx.checks.iter().find(|c| c.proxy_idx == p_idx && c.server_idx == s_idx) {
+                        check_health = check.health;
+                        check_status = match check.last_status_code {
+                            "INI" => 1,
+                            "START" => 2,
+                            "CHECKED" => 3,
+                            "HANA" => 4,
+                            "SOCKERR" => 5,
+                            "L4OK" => 6,
+                            "L4TOUT" => 7,
+                            "L4CON" => 8,
+                            "L6OK" => 9,
+                            "L6TOUT" => 10,
+                            "L6RSP" => 11,
+                            "L7TOUT" => 12,
+                            "L7RSP" => 13,
+                            "L57DATA" => 14,
+                            "L7OKD" => 15,
+                            "L7OKCD" => 16,
+                            "L7STS" => 17,
+                            "PROCERR" => 18,
+                            "PROCTOUT" => 19,
+                            "PROCOK" => 20,
+                            _ => 1,
+                        };
+                        check_result = if check.last_status_code.contains("OK") {
+                            3 // CHK_RES_PASSED
+                        } else if check.last_status_code != "INI" {
+                            2 // CHK_RES_FAILED
+                        } else {
+                            0 // CHK_RES_UNKNOWN
+                        };
+                    }
+
                     self.out_buf.extend_from_slice(
                         format!(
-                            "{} {} {} {} {} {} 0 1 1 1 1 0 0 0 0 0 0 - {} - 0 0 - - 0\n",
-                            p.id, p.name, s_idx + 1, s, addr, op_state, port
+                            "{} {} {} {} {} {} 0 1 1 1 {} {} {} 0 0 0 0 - {} - 0 0 - - 0\n",
+                            p_idx + 1, p.name, s_idx + 1, s, addr, op_state, check_status, check_result, check_health, port
                         ).as_bytes()
                     );
                 }
@@ -305,6 +352,44 @@ impl CliApplet {
             } else {
                 self.is_done = true;
             }
+        }
+    }
+
+    fn handle_del_backend(&mut self, target: &str, ctx: &mut AppletContext) {
+        let mut found = None;
+        let mut is_referenced = false;
+
+        for p in ctx.proxies.iter() {
+            if p.name == target {
+                found = Some(p);
+            } else {
+                if p.default_backend.as_deref() == Some(target) {
+                    is_referenced = true;
+                }
+                for u in &p.use_backends {
+                    if u.backend == target {
+                        is_referenced = true;
+                    }
+                }
+            }
+        }
+
+        if let Some(p) = found {
+            if is_referenced {
+                self.out_buf.extend_from_slice(b"This proxy cannot be removed at runtime due to other configuration elements pointing to it.\n");
+            } else if p.name == "li" || p.addr.port() != 0 {
+                self.out_buf.extend_from_slice(b"Cannot delete a listen section.\n");
+            } else {
+                self.out_buf.extend_from_slice(b"Backend must be unpublished prior to its deletion.\n");
+            }
+        } else {
+            self.out_buf.extend_from_slice(b"No such backend.\n");
+        }
+
+        if self.interactive {
+            self.out_buf.extend_from_slice(b"\n> ");
+        } else {
+            self.is_done = true;
         }
     }
 
