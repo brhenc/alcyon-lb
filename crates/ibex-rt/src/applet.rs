@@ -245,9 +245,18 @@ impl CliApplet {
                     let mut check_status = 1;
                     let mut check_result = 0;
                     let mut check_health = 0;
+                    let mut check_state = 0;
                     
                     if let Some(check) = ctx.checks.iter().find(|c| c.proxy_idx == p_idx && c.server_idx == s_idx) {
                         check_health = check.health;
+                        check_state = 2; // CHK_ST_CONFIGURED
+                        if check.enabled {
+                            check_state |= 4; // CHK_ST_ENABLED
+                        }
+                        if check.in_progress {
+                            check_state |= 1; // CHK_ST_INPROGRESS
+                        }
+
                         check_status = match check.last_status_code {
                             "INI" => 1,
                             "START" => 2,
@@ -282,8 +291,8 @@ impl CliApplet {
 
                     self.out_buf.extend_from_slice(
                         format!(
-                            "{} {} {} {} {} {} 0 1 1 1 {} {} {} 0 0 0 0 - {} - 0 0 - - 0\n",
-                            p_idx + 1, p.name, s_idx + 1, s, addr, op_state, check_status, check_result, check_health, port
+                            "{} {} {} {} {} {} 0 1 1 1 {} {} {} {} 0 0 0 - {} - 0 0 - - 0\n",
+                            p.id, p.name, s_idx + 1, s, addr, op_state, check_status, check_result, check_health, check_state, port
                         ).as_bytes()
                     );
                 }
@@ -327,6 +336,8 @@ impl CliApplet {
             self.handle_disable_server(target.trim(), ctx);
         } else if let Some(rest) = cmd.strip_prefix("set server ") {
             self.handle_set_server(rest.trim(), ctx);
+        } else if let Some(rest) = cmd.strip_prefix("get weight ") {
+            self.handle_get_weight(rest.trim(), ctx);
         } else if let Some(rest) = cmd.strip_prefix("set weight ") {
             self.handle_set_weight(rest.trim(), ctx);
         } else if let Some(rest) = cmd.strip_prefix("set maxconn ") {
@@ -984,6 +995,34 @@ impl CliApplet {
                 };
                 let _ = crate::engine::set_proxy_maxconn(ctx.proxies, px_name, Some(sv_name), val);
             }
+        }
+        if self.interactive {
+            self.out_buf.extend_from_slice(b"\n> ");
+        } else {
+            self.is_done = true;
+        }
+    }
+
+    fn handle_get_weight(&mut self, target: &str, ctx: &mut AppletContext) {
+        let (px_name, sv_name) = match target.split_once('/') {
+            Some(pair) => pair,
+            None => ("", target),
+        };
+        let mut found = false;
+        for proxy in ctx.proxies.iter() {
+            if px_name.is_empty() || proxy.name == px_name {
+                for (s_idx, sid) in proxy.server_ids.iter().enumerate() {
+                    if sid == sv_name {
+                        found = true;
+                        let w = proxy.server_weights.get(s_idx).copied().unwrap_or(1);
+                        self.out_buf.extend_from_slice(format!("{} (initial {})\n", w, w).as_bytes());
+                        break;
+                    }
+                }
+            }
+        }
+        if !found {
+            self.out_buf.extend_from_slice(b"No such server.\n");
         }
         if self.interactive {
             self.out_buf.extend_from_slice(b"\n> ");

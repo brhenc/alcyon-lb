@@ -27,6 +27,12 @@ impl DgramSocket {
             None,
         )?;
         
+        let _ = rustix::net::sockopt::set_socket_reuseaddr(&fd, true);
+        let _ = rustix::net::sockopt::set_socket_reuseport(&fd, true);
+        if family == AddressFamily::INET6 {
+            let _ = rustix::net::sockopt::set_ipv6_v6only(&fd, true);
+        }
+
         let any = to_any(addr);
         bind_any(&fd, &any)?;
 
