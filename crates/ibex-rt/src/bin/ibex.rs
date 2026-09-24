@@ -10,7 +10,6 @@
 use ibex_rt::Engine;
 use rustix::process::{kill_process, Pid, Resource, Rlimit, setrlimit, Signal};
 use std::env;
-use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::process;
 
@@ -206,15 +205,6 @@ fn dump_loaded_libraries() {
         }
         for lib in seen {
             println!("{lib}");
-        }
-    }
-}
-
-/// Sends `READY=1` notification to systemd if `$NOTIFY_SOCKET` is present.
-fn notify_systemd() {
-    if let Ok(socket_path) = std::env::var("NOTIFY_SOCKET") {
-        if let Ok(sock) = UnixDatagram::unbound() {
-            let _ = sock.send_to(b"READY=1\n", Path::new(&socket_path));
         }
     }
 }
@@ -670,7 +660,12 @@ fn main() {
 
     // 12. Master-worker systemd notification (-Ws)
     if opts.systemd_notify {
-        notify_systemd();
+        // crates/ibex-rt/src/systemd.rs, not a local copy: `Path` cannot address the
+        // abstract socket systemd hands out as `@name`, and the module sends the full
+        // READY=1/MAINPID/STATUS message HAProxy does (src/cli.c:3087).
+        if let Err(e) = ibex_rt::systemd::notify_ready() {
+            eprintln!("[WARNING] systemd notify failed: {e}");
+        }
     }
 
     // 13. Initialize Ibex soft-realtime engine

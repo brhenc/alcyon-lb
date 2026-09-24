@@ -30,6 +30,7 @@ pub mod raw;
 pub mod stats;
 pub mod xprt;
 pub mod stats_html;
+pub mod systemd;
 
 pub use quic_listener::QuicListener;
 
