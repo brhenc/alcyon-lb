@@ -27,7 +27,8 @@ Evaluated using `tools/quic-differential/conformance.py` over genuine HTTP/3 ses
 
 > **Note on Ibex status, corrected 2026-09-24.** The rows below previously read
 > *"Blocked on T25"* for every Ibex entry, and that is no longer true: `curl --http3` now
-> reaches a backend through Ibex. `crates/ibex-proto/src/mux_h3.rs` supplies the encode half
+> reaches a backend through Ibex, and the backend leg is non-blocking: two concurrent
+> requests against a backend that takes 1s each complete in 1.03s, not 2s. `crates/ibex-proto/src/mux_h3.rs` supplies the encode half
 > (frames, SETTINGS, a static-table QPACK encoder) and `QuicListener::pump()` drives the
 > loop, verified by `crates/ibex-rt/tests/h3_end_to_end.rs`, which runs real `curl` and
 > asserts the backend received `GET /probe HTTP/1.1` with `Host:` derived from `:authority`.

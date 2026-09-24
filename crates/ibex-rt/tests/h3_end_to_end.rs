@@ -43,8 +43,7 @@ fn curl_has_http3() -> bool {
     Command::new("curl")
         .arg("-V")
         .output()
-        .ok()
-        .is_some_and(|o| String::from_utf8_lossy(&o.stdout).contains("HTTP3"))
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("HTTP3"))
 }
 
 /// A backend that echoes what it was asked, so the test can assert the request survived the
@@ -195,5 +194,106 @@ fn curl_http3_gets_a_response_from_ibex() {
     assert!(
         stdout.contains("hello-from-ibex-h3"),
         "the response body must reach the client.\nstdout: {stdout}"
+    );
+}
+
+const BACKEND_DELAY: Duration = Duration::from_millis(1000);
+
+/// A slow backend stalls only its own request, not the whole listener.
+///
+/// This is the property the non-blocking backend leg exists for, and the one the first
+/// version did not have: it did `TcpStream::connect` plus blocking reads inside the pump
+/// loop, so every QUIC connection on the listener waited for whichever backend request was
+/// in flight. Two concurrent requests against a backend that takes ~1s each would have taken
+/// ~2s serialised; overlapped they take ~1s.
+#[test]
+fn a_slow_backend_does_not_stall_other_quic_connections() {
+    if !curl_has_http3() {
+        eprintln!("curl on this host has no HTTP3 support; skipping");
+        return;
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_be = Arc::clone(&stop);
+    let l = TcpListener::bind("127.0.0.1:0").expect("bind slow backend");
+    let backend = l.local_addr().expect("addr");
+    l.set_nonblocking(true).expect("nonblocking");
+    thread::spawn(move || {
+        while !stop_be.load(Ordering::Relaxed) {
+            match l.accept() {
+                Ok((mut c, _)) => {
+                    // Each connection gets its own thread, so the backend itself is not the
+                    // bottleneck -- any serialisation observed is the proxy's.
+                    thread::spawn(move || {
+                        let mut buf = [0u8; 4096];
+                        let _ = c.set_read_timeout(Some(Duration::from_millis(500)));
+                        let _ = c.read(&mut buf);
+                        thread::sleep(BACKEND_DELAY);
+                        let body = b"slow";
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                            body.len(),
+                            String::from_utf8_lossy(body)
+                        );
+                        let _ = c.write_all(resp.as_bytes());
+                    });
+                }
+                Err(_) => thread::sleep(Duration::from_millis(5)),
+            }
+        }
+    });
+
+    let tls = server_config();
+    let mut listener =
+        QuicListener::bind("127.0.0.1:0".parse().expect("addr"), &tls, None).expect("bind");
+    listener.set_backend(backend);
+    let port = listener.addr().port();
+
+    let stop_worker = Arc::clone(&stop);
+    let worker = thread::spawn(move || {
+        while !stop_worker.load(Ordering::Relaxed) {
+            let _ = listener.pump(Instant::now());
+            thread::sleep(Duration::from_millis(2));
+        }
+    });
+
+    let started = Instant::now();
+    let clients: Vec<_> = (0..2)
+        .map(|i| {
+            thread::spawn(move || {
+                Command::new("curl")
+                    .args([
+                        "-sS", "--http3-only", "-k", "--max-time", "20",
+                        "--resolve", &format!("localhost:{port}:127.0.0.1"),
+                        &format!("https://localhost:{port}/slow{i}"),
+                        "-o", "-", "-w", "|%{http_code}",
+                    ])
+                    .output()
+                    .expect("run curl")
+            })
+        })
+        .collect();
+
+    let outs: Vec<String> = clients
+        .into_iter()
+        .map(|h| String::from_utf8_lossy(&h.join().expect("join").stdout).to_string())
+        .collect();
+    let elapsed = started.elapsed();
+
+    stop.store(true, Ordering::Relaxed);
+    let _ = worker.join();
+
+    for (i, o) in outs.iter().enumerate() {
+        assert!(o.contains("|200"), "request {i} did not get 200: {o}");
+    }
+
+    // Serialised would be >= 2 x BACKEND_DELAY. The margin is deliberately wide: this is a
+    // timing assertion on a shared box, and the failure it guards against is a doubling,
+    // not a few percent.
+    let serialised = BACKEND_DELAY * 2;
+    assert!(
+        elapsed < serialised,
+        "two requests against a {BACKEND_DELAY:?} backend took {elapsed:?}; \
+         serialised would be >= {serialised:?}, so the backend leg is blocking the pump loop"
     );
 }

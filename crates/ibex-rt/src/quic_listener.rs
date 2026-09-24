@@ -12,6 +12,8 @@ use std::time::Instant;
 use std::collections::HashMap;
 
 use crate::dgram::{DgramBuf, DgramOut, DgramSocket};
+use std::os::fd::{AsFd, AsRawFd as _, OwnedFd};
+
 use ibex_proto::htx::{HtxBlock, HtxSlice};
 use ibex_proto::mux_h3;
 use ibex_proto::qpack;
@@ -27,8 +29,6 @@ const BATCH_SIZE: usize = 32;
 const DGRAM_BUF_SIZE: usize = 2048;
 /// Control message buffer capacity per datagram for `IP_PKTINFO`.
 const CMSG_BUF_SIZE: usize = 128;
-/// How long the backend leg waits before giving up. Short, because it blocks the pump loop.
-const BACKEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// A QUIC listener managing datagram I/O on a nonblocking UDP socket and driving the QUIC transport.
 pub struct QuicListener {
@@ -42,6 +42,24 @@ pub struct QuicListener {
     /// Where to proxy requests. Without one the listener answers directly, which is what
     /// the bring-up test used before there was a backend leg.
     backend: Option<SocketAddr>,
+    /// Backend requests still in flight, one per answered request stream.
+    legs: Vec<BackendLeg>,
+}
+
+/// One backend request in flight, driven without blocking the pump loop.
+///
+/// The first version did `TcpStream::connect` plus blocking reads inside `on_readable`, so a
+/// single slow backend stalled every QUIC connection on the listener. Non-blocking from the
+/// start now: `raw::connect` returns immediately with `EINPROGRESS`, and each `pump` advances
+/// whatever legs are outstanding.
+struct BackendLeg {
+    fd: OwnedFd,
+    conn_id: ConnectionId,
+    stream_id: StreamId,
+    connected: bool,
+    request: Vec<u8>,
+    written: usize,
+    response: Vec<u8>,
 }
 
 /// Per-connection HTTP/3 state.
@@ -100,6 +118,7 @@ impl QuicListener {
             send_raw_bufs,
             h3: HashMap::new(),
             backend: None,
+            legs: Vec::new(),
         })
     }
 
@@ -266,8 +285,103 @@ impl QuicListener {
             }
         }
 
+        self.advance_backends();
         self.send_batch(now)?;
         Ok(())
+    }
+
+    /// The file descriptors of in-flight backend requests.
+    ///
+    /// Exposed so the engine's poller can watch them once the QUIC listener is registered
+    /// with the engine. Until then `pump` advances them opportunistically, which costs a
+    /// syscall per leg per pump but never blocks.
+    #[must_use]
+    pub fn backend_fds(&self) -> Vec<RawFd> {
+        self.legs.iter().map(|l| l.fd.as_raw_fd()).collect()
+    }
+
+    /// Advances every in-flight backend leg by whatever it can do without blocking.
+    fn advance_backends(&mut self) {
+        let mut finished: Vec<(ConnectionId, StreamId, Vec<u8>)> = Vec::new();
+        let mut still = Vec::with_capacity(self.legs.len());
+
+        for mut leg in std::mem::take(&mut self.legs) {
+            if !leg.connected {
+                if matches!(crate::raw::check_connect_error(leg.fd.as_fd()), Ok(None)) {
+                    leg.connected = true;
+                } else {
+                    finished.push((leg.conn_id, leg.stream_id,
+                                   mux_h3::encode_response(502, &[], b"")));
+                    continue;
+                }
+            }
+
+            while leg.written < leg.request.len() {
+                match crate::raw::send(leg.fd.as_fd(), &leg.request[leg.written..]) {
+                    Ok(crate::raw::Io::Done(n)) => leg.written += n,
+                    Ok(crate::raw::Io::WouldBlock) => break,
+                    _ => {
+                        finished.push((leg.conn_id, leg.stream_id,
+                                       mux_h3::encode_response(502, &[], b"")));
+                        leg.written = usize::MAX;
+                        break;
+                    }
+                }
+            }
+            if leg.written == usize::MAX {
+                continue;
+            }
+            if leg.written < leg.request.len() {
+                still.push(leg);
+                continue;
+            }
+
+            let mut chunk = [0u8; 4096];
+            let mut done = false;
+            let mut failed = false;
+            loop {
+                match crate::raw::recv(leg.fd.as_fd(), &mut chunk) {
+                    Ok(crate::raw::Io::Done(n)) => leg.response.extend_from_slice(&chunk[..n]),
+                    Ok(crate::raw::Io::WouldBlock) => break,
+                    Ok(crate::raw::Io::Eof) => {
+                        done = true;
+                        break;
+                    }
+                    _ => {
+                        failed = true;
+                        break;
+                    }
+                }
+                if Self::try_split_response(&leg.response).is_some() {
+                    done = true;
+                    break;
+                }
+            }
+
+            if failed && Self::try_split_response(&leg.response).is_none() {
+                finished.push((leg.conn_id, leg.stream_id,
+                               mux_h3::encode_response(502, &[], b"")));
+                continue;
+            }
+            if done || Self::try_split_response(&leg.response).is_some() {
+                let resp = match Self::try_split_response(&leg.response) {
+                    Some((status, body)) => mux_h3::encode_response(
+                        status,
+                        &[("content-length".to_string(), body.len().to_string())],
+                        &body,
+                    ),
+                    None => mux_h3::encode_response(502, &[], b""),
+                };
+                finished.push((leg.conn_id, leg.stream_id, resp));
+                continue;
+            }
+            still.push(leg);
+        }
+
+        self.legs = still;
+        for (conn_id, stream_id, resp) in finished {
+            let _ = self.endpoint.write_stream(conn_id, stream_id, &resp, true);
+        }
     }
 
     /// Opens our unidirectional control stream and sends SETTINGS.
@@ -320,43 +434,50 @@ impl QuicListener {
             return;
         };
 
-        let resp = if let Some(be) = self.backend {
-            Self::proxy_to_backend(be, &field_section)
-        } else {
-            let body = b"hello-from-ibex-h3".to_vec();
-            mux_h3::encode_response(
-                200,
-                &[("content-length".to_string(), body.len().to_string())],
-                &body,
-            )
-        };
-        let _ = self.endpoint.write_stream(conn_id, stream_id, &resp, true);
         let st = self.h3.entry(conn_id).or_default();
         st.answered.push(stream_id);
         st.req.remove(&stream_id);
+
+        if let Some(be) = self.backend {
+            match Self::start_backend(be, conn_id, stream_id, &field_section) {
+                Ok(leg) => self.legs.push(leg),
+                Err(resp) => {
+                    let _ = self.endpoint.write_stream(conn_id, stream_id, &resp, true);
+                }
+            }
+        } else {
+            let body = b"hello-from-ibex-h3".to_vec();
+            let resp = mux_h3::encode_response(
+                200,
+                &[("content-length".to_string(), body.len().to_string())],
+                &body,
+            );
+            let _ = self.endpoint.write_stream(conn_id, stream_id, &resp, true);
+        }
     }
 }
 
 impl QuicListener {
-    /// Turns a decoded HTTP/3 request into an HTTP/1.1 request, sends it to the backend and
-    /// returns the encoded HTTP/3 response.
+    /// Converts a decoded HTTP/3 request and starts a non-blocking backend connect.
     ///
-    /// The conversion goes through `headers_to_htx`, which is the same
-    /// `pseudo_headers_to_htx` the HTTP/2 mux uses: `:authority` becomes `Host`, `:scheme`
-    /// is consumed, and no pseudo-header reaches the backend. Duplicating that mapping here
-    /// is how HTTP/3 inherited the missing-`Host` defect in the first place.
+    /// The conversion goes through `headers_to_htx`, the same `pseudo_headers_to_htx` the
+    /// HTTP/2 mux uses: `:authority` becomes `Host`, `:scheme` is consumed, and no
+    /// pseudo-header reaches the backend. Reimplementing that mapping here is how HTTP/3
+    /// inherited the missing-`Host` defect in the first place.
     ///
-    /// **This blocks the pump loop for the duration of the backend exchange.** One slow
-    /// backend therefore stalls every QUIC connection on this listener. That is the first
-    /// thing to fix when this path becomes more than a bring-up: the backend leg belongs on
-    /// the engine's poller as a session, the way `TcpSession` already works.
-    fn proxy_to_backend(backend: SocketAddr, field_section: &[u8]) -> Vec<u8> {
-        let Ok(fields) = qpack::decode_qpack_static(field_section) else {
-            return mux_h3::encode_response(400, &[], b"");
-        };
-        let Ok(blocks) = ibex_proto::h3::headers_to_htx(fields) else {
-            return mux_h3::encode_response(400, &[], b"");
-        };
+    /// # Errors
+    /// Returns an already-encoded HTTP/3 error response when the request cannot be converted
+    /// or the socket cannot be created.
+    fn start_backend(
+        backend: SocketAddr,
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+        field_section: &[u8],
+    ) -> Result<BackendLeg, Vec<u8>> {
+        let fields = qpack::decode_qpack_static(field_section)
+            .map_err(|_| mux_h3::encode_response(400, &[], b""))?;
+        let blocks = ibex_proto::h3::headers_to_htx(fields)
+            .map_err(|_| mux_h3::encode_response(400, &[], b""))?;
 
         let mut scratch = vec![0u8; 16384];
         let mut slice = HtxSlice::new(&mut scratch);
@@ -370,43 +491,23 @@ impl QuicListener {
                 _ => Ok(()),
             };
             if pushed.is_err() {
-                return mux_h3::encode_response(431, &[], b"");
+                return Err(mux_h3::encode_response(431, &[], b""));
             }
         }
         let request = slice.as_ref().to_h1_wire();
 
-        match Self::exchange(backend, &request) {
-            Some((status, body)) => mux_h3::encode_response(
-                status,
-                &[("content-length".to_string(), body.len().to_string())],
-                &body,
-            ),
-            None => mux_h3::encode_response(502, &[], b""),
-        }
-    }
+        let (fd, connected) = crate::raw::connect(backend)
+            .map_err(|_| mux_h3::encode_response(502, &[], b""))?;
 
-    /// One HTTP/1.1 request/response against the backend. Returns status and body.
-    fn exchange(backend: SocketAddr, request: &[u8]) -> Option<(u16, Vec<u8>)> {
-        use std::io::{Read, Write};
-        let mut sock = std::net::TcpStream::connect_timeout(&backend, BACKEND_TIMEOUT).ok()?;
-        sock.set_read_timeout(Some(BACKEND_TIMEOUT)).ok()?;
-        sock.set_write_timeout(Some(BACKEND_TIMEOUT)).ok()?;
-        sock.write_all(request).ok()?;
-
-        let mut raw = Vec::new();
-        let mut chunk = [0u8; 4096];
-        while let Ok(n) = sock.read(&mut chunk) {
-            if n == 0 {
-                break;
-            }
-            raw.extend_from_slice(&chunk[..n]);
-            // Stop once the head plus the advertised body has arrived; otherwise a
-            // keep-alive backend holds the socket open and we block until timeout.
-            if let Some((status, body)) = Self::try_split_response(&raw) {
-                return Some((status, body));
-            }
-        }
-        Self::try_split_response(&raw)
+        Ok(BackendLeg {
+            fd,
+            conn_id,
+            stream_id,
+            connected,
+            request,
+            written: 0,
+            response: Vec::new(),
+        })
     }
 
     /// Parses a complete HTTP/1 response, or `None` if more bytes are needed.
