@@ -17,6 +17,7 @@ use ibex_config::ast::{
 };
 use ibex_sched::task::TaskRef;
 use ibex_sched::Tick;
+use std::fmt::Write as _;
 use std::io;
 use std::net::SocketAddr;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
@@ -51,7 +52,6 @@ impl From<u8> for ServerStatus {
     fn from(v: u8) -> Self {
         match v {
             0 => ServerStatus::Up,
-            1 => ServerStatus::Down,
             2 => ServerStatus::Drain,
             3 => ServerStatus::Maint,
             _ => ServerStatus::Down,
@@ -310,20 +310,21 @@ impl ServerCheckState {
         );
 
         if let Some(code) = self.http_code {
-            out.push_str(&format!(", code: {code}"));
+            let _ = write!(out, ", code: {code}");
         }
 
         if let Some(ref info) = self.last_status_info {
-            out.push_str(&format!(", info: \"{info}\""));
+            let _ = write!(out, ", info: \"{info}\"");
         }
 
-        out.push_str(&format!(
+        let _ = write!(
+            out,
             ", check duration: {}ms, status: {}/{} {}.",
             self.check_duration_ms,
             count,
             threshold,
             self.status.as_str()
-        ));
+        );
 
         out
     }
@@ -420,13 +421,12 @@ fn build_http_request_payload(chk: &ResolvedHttpCheck, target_addr: SocketAddr) 
 }
 
 /// Parses an HTTP status code, headers, and body from received data.
+#[allow(clippy::type_complexity)]
 fn parse_http_response(buf: &[u8]) -> Option<(u16, Vec<(String, String)>, Vec<u8>)> {
     let header_end = if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
         pos + 4
-    } else if let Some(pos) = buf.windows(2).position(|w| w == b"\n\n") {
-        pos + 2
     } else {
-        return None;
+        buf.windows(2).position(|w| w == b"\n\n")? + 2
     };
 
     let header_str = String::from_utf8_lossy(&buf[..header_end]);
@@ -482,8 +482,9 @@ pub fn step_check(
 
         if timed_out {
             let (code, desc, info) = match &check.sub_state {
-                CheckSubState::TcpConnecting => ("L4TOUT", "Layer4 timeout", None),
-                CheckSubState::HttpConnecting { .. } => ("L4TOUT", "Layer4 timeout", None),
+                CheckSubState::TcpConnecting | CheckSubState::HttpConnecting { .. } | CheckSubState::Idle => {
+                    ("L4TOUT", "Layer4 timeout", None)
+                }
                 CheckSubState::HttpSending { .. } | CheckSubState::HttpReceiving { .. } => {
                     ("L7TOUT", "Layer7 timeout", None)
                 }
@@ -492,7 +493,6 @@ pub fn step_check(
                     "Layer7 timeout",
                     Some(format!("at step {} of tcp-check", step_idx + 1)),
                 ),
-                CheckSubState::Idle => ("L4TOUT", "Layer4 timeout", None),
             };
 
             cleanup_check_socket(check, fdtab, poller);
@@ -554,30 +554,27 @@ pub fn step_check(
                     Ok(Some(io::Error::from(io::ErrorKind::NotConnected)))
                 };
 
-                match connect_res {
-                    Ok(None) => {
-                        check.sub_state = CheckSubState::HttpSending {
-                            req_buf,
-                            send_offset,
-                        };
-                        progress_http_check(check, fdtab, poller, now, duration)
-                    }
-                    Ok(Some(_)) | Err(_) => {
-                        cleanup_check_socket(check, fdtab, poller);
-                        let event = check.on_failure_full(
-                            "L4CON",
-                            "Connection refused / error",
-                            duration,
-                            None,
-                            None,
-                        );
-                        let next = check.schedule_next(now);
-                        check.next_check = next;
-                        Ok(CheckStep {
-                            next: Some(next),
-                            event,
-                        })
-                    }
+                if let Ok(None) = connect_res {
+                    check.sub_state = CheckSubState::HttpSending {
+                        req_buf,
+                        send_offset,
+                    };
+                    progress_http_check(check, fdtab, poller, now, duration)
+                } else {
+                    cleanup_check_socket(check, fdtab, poller);
+                    let event = check.on_failure_full(
+                        "L4CON",
+                        "Connection refused / error",
+                        duration,
+                        None,
+                        None,
+                    );
+                    let next = check.schedule_next(now);
+                    check.next_check = next;
+                    Ok(CheckStep {
+                        next: Some(next),
+                        event,
+                    })
                 }
             }
             CheckSubState::HttpSending { .. } | CheckSubState::HttpReceiving { .. } => {
@@ -607,8 +604,7 @@ pub fn step_check(
                     SocketAddr::new(check.addr.ip(), chk.check_port.unwrap_or(check.addr.port()));
                 let payload = build_http_request_payload(&chk, target_addr);
 
-                match raw::connect(target_addr) {
-                    Ok((sock, immediate)) => {
+                if let Ok((sock, immediate)) = raw::connect(target_addr) {
                         let raw_fd = sock.as_raw_fd();
                         check.check_fd = Some(raw_fd);
                         let timeout_ms =
@@ -645,8 +641,7 @@ pub fn step_check(
                             };
                             Ok(CheckStep::pending(Some(check.exp)))
                         }
-                    }
-                    Err(_) => {
+                    } else {
                         let event = check.on_failure_full(
                             "L4CON",
                             "Connection refused / error",
@@ -661,7 +656,6 @@ pub fn step_check(
                             event,
                         })
                     }
-                }
             }
             ResolvedCheckConfig::TcpSteps(steps) => {
                 check.sub_state = CheckSubState::TcpRunning {
@@ -950,11 +944,9 @@ fn progress_tcp_steps_start(
         });
     }
 
-    match &steps[0] {
-        ResolvedTcpStep::Connect { port, .. } => {
+    if let ResolvedTcpStep::Connect { port, .. } = &steps[0] {
             let target_addr = SocketAddr::new(check.addr.ip(), port.unwrap_or(check.addr.port()));
-            match raw::connect(target_addr) {
-                Ok((sock, immediate)) => {
+            if let Ok((sock, immediate)) = raw::connect(target_addr) {
                     let raw_fd = sock.as_raw_fd();
                     check.check_fd = Some(raw_fd);
                     fdtab.insert(
@@ -988,8 +980,7 @@ fn progress_tcp_steps_start(
                         };
                         Ok(CheckStep::pending(Some(check.exp)))
                     }
-                }
-                Err(_) => {
+                } else {
                     cleanup_check_socket(check, fdtab, poller);
                     let event = check.on_failure_full(
                         "L4CON",
@@ -1005,9 +996,7 @@ fn progress_tcp_steps_start(
                         event,
                     })
                 }
-            }
-        }
-        _ => {
+        } else {
             check.sub_state = CheckSubState::TcpRunning {
                 step_idx: 0,
                 send_offset: 0,
@@ -1015,11 +1004,10 @@ fn progress_tcp_steps_start(
             };
             progress_tcp_check(check, fdtab, poller, now, 0)
         }
-    }
 }
 
 /// Progresses execution through TCP steps.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::unnecessary_wraps)]
 fn progress_tcp_check(
     check: &mut ServerCheckState,
     fdtab: &mut FdTab,
@@ -1062,28 +1050,25 @@ fn progress_tcp_check(
                     }
                     fdtab.clear_ready(raw_fd, true, true);
                     let connect_res = raw::check_connect_error(sock.as_fd());
-                    match connect_res {
-                        Ok(None) => {
-                            step_idx += 1;
-                            continue;
-                        }
-                        Ok(Some(_)) | Err(_) => {
-                            cleanup_check_socket(check, fdtab, poller);
-                            let event = check.on_failure_full(
-                                "L4CON",
-                                "Connection refused / error",
-                                duration,
-                                None,
-                                Some(format!("ECONNREFUSED returned by OS at step {} of tcp-check (connect port {})", step_idx + 1, target_addr.port())),
-                            );
-                            let next = check.schedule_next(now);
-                            check.next_check = next;
-                            return Ok(CheckStep {
-                                next: Some(next),
-                                event,
-                            });
-                        }
+                    if let Ok(None) = connect_res {
+                        step_idx += 1;
+                        continue;
                     }
+                    
+                    cleanup_check_socket(check, fdtab, poller);
+                    let event = check.on_failure_full(
+                        "L4CON",
+                        "Connection refused / error",
+                        duration,
+                        None,
+                        Some(format!("ECONNREFUSED returned by OS at step {} of tcp-check (connect port {})", step_idx + 1, target_addr.port())),
+                    );
+                    let next = check.schedule_next(now);
+                    check.next_check = next;
+                    return Ok(CheckStep {
+                        next: Some(next),
+                        event,
+                    });
                 }
 
                 // If connecting a new connection mid-check:
@@ -1093,8 +1078,7 @@ fn progress_tcp_check(
                     u32::try_from(check.config.timeout.as_millis()).unwrap_or(u32::MAX);
                 check.exp = now.add(timeout_ms);
 
-                match raw::connect(target_addr) {
-                    Ok((sock, immediate)) => {
+                if let Ok((sock, immediate)) = raw::connect(target_addr) {
                         let raw_fd = sock.as_raw_fd();
                         check.check_fd = Some(raw_fd);
                         fdtab.insert(
@@ -1123,24 +1107,22 @@ fn progress_tcp_check(
                             recv_buf,
                         };
                         return Ok(CheckStep::pending(Some(check.exp)));
-                    }
-                    Err(_) => {
-                        cleanup_check_socket(check, fdtab, poller);
-                        let event = check.on_failure_full(
-                            "L4CON",
-                            "Connection refused / error",
-                            duration,
-                            None,
-                            Some(format!("ECONNREFUSED returned by OS at step {} of tcp-check (connect port {})", step_idx + 1, target_addr.port())),
-                        );
-                        let next = check.schedule_next(now);
-                        check.next_check = next;
-                        return Ok(CheckStep {
-                            next: Some(next),
-                            event,
-                        });
-                    }
                 }
+                
+                cleanup_check_socket(check, fdtab, poller);
+                let event = check.on_failure_full(
+                    "L4CON",
+                    "Connection refused / error",
+                    duration,
+                    None,
+                    Some(format!("ECONNREFUSED returned by OS at step {} of tcp-check (connect port {})", step_idx + 1, target_addr.port())),
+                );
+                let next = check.schedule_next(now);
+                check.next_check = next;
+                return Ok(CheckStep {
+                    next: Some(next),
+                    event,
+                });
             }
             ResolvedTcpStep::Send(data) => {
                 let Some(sock) = check.sock.as_ref() else {
@@ -1234,11 +1216,7 @@ fn progress_tcp_check(
                         Ok(Io::WouldBlock) => {
                             break;
                         }
-                        Ok(Io::Eof) => {
-                            eof = true;
-                            break;
-                        }
-                        Ok(Io::Closed) | Err(_) => {
+                        Ok(Io::Eof | Io::Closed) | Err(_) => {
                             eof = true;
                             break;
                         }

@@ -3,7 +3,7 @@
 use ibex_config::parser::parse_str;
 use ibex_rt::{Engine, ServerStatus};
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener};
+use std::net::{TcpListener};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -28,9 +28,8 @@ fn test_httpchk_500_backend_marked_down() {
             match s500_listener.accept() {
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(5));
-                    continue;
                 }
-                Err(_) => continue,
+                Err(_) => {}
                 Ok((mut stream, _)) => {
                     let mut buf = [0u8; 512];
                     let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
@@ -43,7 +42,7 @@ fn test_httpchk_500_backend_marked_down() {
     });
 
     let config_text = format!(
-        r#"
+        r"
 defaults
     mode http
     timeout client 5s
@@ -52,9 +51,8 @@ defaults
 
 backend be_test
     option httpchk GET /health HTTP/1.0
-    server srv1 {} check inter 50ms rise 1 fall 1
-"#,
-        s500_addr
+    server srv1 {s500_addr} check inter 50ms rise 1 fall 1
+"
     );
 
     let config = parse_str(&config_text).expect("parse config with option httpchk");

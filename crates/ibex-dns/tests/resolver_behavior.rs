@@ -189,6 +189,9 @@ fn test_retry_and_failover() {
     // Retry 1
     now += Duration::from_secs(1);
     let tx2 = resolver.poll_transmit(now).unwrap();
+    // TODO(T45): Code defect in resolver.rs: the resolver round-robins across nameservers
+    // on every retry rather than retrying `resolve_retries` times on the same nameserver
+    // before failing over. Leaving this assertion failing to track the defect.
     assert_eq!(tx2.0, ns1, "first retry should go to ns1");
 
     // Retry 2

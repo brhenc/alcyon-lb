@@ -17,7 +17,7 @@ fn generate_pem(sans: Vec<String>) -> (String, rustls::pki_types::CertificateDer
 fn default_bind() -> BindConfig {
     BindConfig {
         addr: "127.0.0.1:443".parse().unwrap(),
-        ssl: true,
+        quic: false, ssl: true,
         crt: vec![],
         alpn: vec![],
         proto: None,
@@ -262,7 +262,7 @@ mod alpn {
     fn bind_with(alpn: Vec<String>, crt: String) -> BindConfig {
         BindConfig {
             addr: "127.0.0.1:8443".parse().expect("addr"),
-            ssl: true,
+            quic: false, ssl: true,
             crt: vec![crt],
             alpn,
             proto: None,
