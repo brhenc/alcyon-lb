@@ -79,6 +79,7 @@ pub mod mux_h2;
 pub mod mux_pt;
 pub mod proto;
 pub mod proxy_protocol;
+pub mod mux_h3;
 pub mod qpack;
 pub mod session;
 pub mod stream;

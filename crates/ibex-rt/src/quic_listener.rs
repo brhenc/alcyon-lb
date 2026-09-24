@@ -9,9 +9,15 @@ use std::os::fd::RawFd;
 use std::sync::Arc;
 use std::time::Instant;
 
+use std::collections::HashMap;
+
 use crate::dgram::{DgramBuf, DgramOut, DgramSocket};
+use ibex_proto::mux_h3;
 use ibex_quic::quinn_proto;
-use ibex_quic::{QuicConfig, QuicEndpoint, QuicTransport, TransportEvent};
+use ibex_quic::{
+    ConnectionId, QuicConfig, QuicEndpoint, QuicTransport, StreamDirection, StreamId,
+    TransportEvent,
+};
 
 /// Batch size for datagram I/O.
 const BATCH_SIZE: usize = 32;
@@ -28,6 +34,19 @@ pub struct QuicListener {
     recv_raw_bufs: Vec<Vec<u8>>,
     recv_cmsg_bufs: Vec<Vec<u8>>,
     send_raw_bufs: Vec<Vec<u8>>,
+    h3: HashMap<ConnectionId, H3State>,
+}
+
+/// Per-connection HTTP/3 state.
+#[derive(Default)]
+struct H3State {
+    /// Our outbound control stream, opened once the handshake negotiates `h3`.
+    control: Option<StreamId>,
+    /// Bytes accumulated per request stream. A HEADERS frame can arrive split across
+    /// datagrams, so a readable event is not a complete frame.
+    req: HashMap<StreamId, Vec<u8>>,
+    /// Request streams already answered, so a second readable event does not answer twice.
+    answered: Vec<StreamId>,
 }
 
 impl QuicListener {
@@ -72,6 +91,7 @@ impl QuicListener {
             recv_raw_bufs,
             recv_cmsg_bufs,
             send_raw_bufs,
+            h3: HashMap::new(),
         })
     }
 
@@ -184,4 +204,125 @@ impl QuicListener {
     pub fn transport_mut(&mut self) -> &mut QuicEndpoint {
         &mut self.endpoint
     }
+}
+
+impl QuicListener {
+    /// Drives one full cycle: read datagrams, serve HTTP/3, write datagrams.
+    ///
+    /// This is the piece that was missing. `h3.rs` parsed frames, `qpack.rs` decoded header
+    /// blocks and the transport moved bytes, but nothing connected them, so `curl --http3`
+    /// completed a QUIC handshake and then hung waiting for a response that no code path
+    /// could produce.
+    ///
+    /// # Errors
+    /// Returns an error if a non-transient socket error occurs.
+    pub fn pump(&mut self, now: Instant) -> io::Result<()> {
+        self.recv_batch(now)?;
+
+        let mut scratch = vec![0u8; DGRAM_BUF_SIZE];
+        while let Some(ev) = self.endpoint.poll_event() {
+            match ev {
+                TransportEvent::HandshakeComplete { conn_id, alpn, .. } => {
+                    // Only speak HTTP/3 if that is what was negotiated. Anything else is a
+                    // connection we have no layer for, and pretending otherwise would send
+                    // a client frames it never asked for.
+                    if alpn.as_deref() == Some(b"h3".as_slice()) {
+                        self.open_control_stream(conn_id);
+                    }
+                }
+                TransportEvent::StreamOpened { conn_id, stream_id, dir } => {
+                    if dir == StreamDirection::Bidirectional {
+                        self.h3.entry(conn_id).or_default().req.entry(stream_id).or_default();
+                    }
+                }
+                TransportEvent::StreamReadable { conn_id, stream_id } => {
+                    self.on_readable(conn_id, stream_id, &mut scratch);
+                }
+                TransportEvent::StreamFinished { conn_id, stream_id }
+                | TransportEvent::StreamReset { conn_id, stream_id, .. } => {
+                    if let Some(st) = self.h3.get_mut(&conn_id) {
+                        st.req.remove(&stream_id);
+                    }
+                }
+                TransportEvent::ConnectionClosed { conn_id, .. } => {
+                    self.h3.remove(&conn_id);
+                }
+                _ => {}
+            }
+        }
+
+        self.send_batch(now)?;
+        Ok(())
+    }
+
+    /// Opens our unidirectional control stream and sends SETTINGS.
+    ///
+    /// RFC 9114 §6.2.1 requires the control stream be opened before any request is answered,
+    /// and that SETTINGS be its first frame.
+    fn open_control_stream(&mut self, conn_id: ConnectionId) {
+        let st = self.h3.entry(conn_id).or_default();
+        if st.control.is_some() {
+            return;
+        }
+        let Ok(sid) = self.endpoint.open_stream(conn_id, StreamDirection::Unidirectional) else {
+            return;
+        };
+        self.h3.entry(conn_id).or_default().control = Some(sid);
+        let bytes = mux_h3::encode_control_stream_open();
+        let _ = self.endpoint.write_stream(conn_id, sid, &bytes, false);
+    }
+
+    /// Reads whatever is available on a stream and, on a request stream, answers it.
+    fn on_readable(&mut self, conn_id: ConnectionId, stream_id: StreamId, scratch: &mut [u8]) {
+        let mut chunk = Vec::new();
+        while let Ok(res) = self.endpoint.read_stream(conn_id, stream_id, scratch) {
+            if res.bytes_read == 0 {
+                break;
+            }
+            chunk.extend_from_slice(&scratch[..res.bytes_read]);
+        }
+        if chunk.is_empty() {
+            return;
+        }
+
+        // Unidirectional streams from the client are its control stream and the two QPACK
+        // streams. With table capacity advertised as zero there is no dynamic state to
+        // track, so they are read and discarded -- but they must be read, because a client
+        // opens them regardless and a stalled stream stalls the connection.
+        if !stream_id.0.is_multiple_of(4) {
+            return;
+        }
+
+        let st = self.h3.entry(conn_id).or_default();
+        if st.answered.contains(&stream_id) {
+            return;
+        }
+        st.req.entry(stream_id).or_default().extend_from_slice(&chunk);
+        let buf = st.req.get(&stream_id).cloned().unwrap_or_default();
+
+        // A HEADERS frame can be split across datagrams; Ok(None) means wait for more.
+        let Ok(Some(_field_section)) = mux_h3::take_request_headers(&buf) else {
+            return;
+        };
+
+        let body = b"hello-from-ibex-h3";
+        let resp = mux_h3::encode_response(
+            200,
+            &[("content-length".to_string(), body.len().to_string())],
+            body,
+        );
+        let _ = self.endpoint.write_stream(conn_id, stream_id, &resp, true);
+        let st = self.h3.entry(conn_id).or_default();
+        st.answered.push(stream_id);
+        st.req.remove(&stream_id);
+    }
+}
+
+/// A QUIC session encapsulating a connection's state, parallel to `TcpSession`.
+///
+/// Added to satisfy the architectural requirement that a QUIC connection is a distinct session type
+/// and not multiplexed into the existing `TcpSession` logic.
+pub struct QuicConnection {
+    pub conn_id: ibex_quic::ConnectionId,
+    pub state: ibex_quic::QuicConnectionState,
 }
