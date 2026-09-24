@@ -1829,12 +1829,6 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         self.lifecycle = Some(lifecycle);
     }
 
-    /// Whether a soft stop is in progress.
-    #[must_use]
-    pub fn is_stopping(&self) -> bool {
-        self.stopping
-    }
-
     /// HAProxy's `soft_stop()` (`src/proxy.c:3961`): stop accepting, keep serving what is
     /// in flight, and exit once it has drained or `hard-stop-after` expires.
     ///
@@ -1888,7 +1882,12 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 && e.sess.rep.is_empty()
                 && e.sess.req_headers.is_none()
                 && !e.sess.has_htx
-                && e.sess.cli_state == ScState::Established;
+                // Between requests a keep-alive client sits in `Ready`, not `Established`:
+                // T71 keeps it there across transactions. Matching only `Established` meant
+                // this closed nothing, and an idle client held the soft stop open until
+                // `timeout client` -- which a test missed for as long as the client
+                // connection was being closed after its first response anyway.
+                && matches!(e.sess.cli_state, ScState::Established | ScState::Ready);
             if idle {
                 shutdown_session_entry(e, &mut self.proxies, &mut wake);
             }

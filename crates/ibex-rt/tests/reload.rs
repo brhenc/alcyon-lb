@@ -359,6 +359,32 @@ impl Drop for NotifySink {
     }
 }
 
+fn read_pidfile(p: &Path) -> Option<u32> {
+    std::fs::read_to_string(p).ok()?.trim().parse().ok()
+}
+
+fn alive(pid: u32) -> bool {
+    Pid::from_raw(i32::try_from(pid).unwrap_or(0))
+        .is_some_and(|p| rustix::process::test_kill_process(p).is_ok())
+}
+
+fn wait_gone(pid: u32, within: Duration) -> bool {
+    let deadline = Instant::now() + within;
+    while alive(pid) {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    true
+}
+
+fn send_signal(pid: u32, sig: Signal) {
+    if let Some(p) = Pid::from_raw(i32::try_from(pid).unwrap_or(0)) {
+        let _ = kill_process(p, sig);
+    }
+}
+
 fn mainpid(msg: &str) -> Option<u32> {
     msg.lines().find_map(|l| l.strip_prefix("MAINPID=")).and_then(|p| p.parse().ok())
 }
@@ -375,11 +401,13 @@ fn stop_pid(pid: u32) {
     let _ = kill_process(p, Signal::Kill);
 }
 
-fn start_notified(cfg: &Path, sink: &NotifySink) -> Proc {
+fn start_notified(cfg: &Path, sink: &NotifySink, pidfile: &Path) -> Proc {
     let child = Command::new(env!("CARGO_BIN_EXE_ibex"))
         .arg("-Ws")
         .arg("-f")
         .arg(cfg)
+        .arg("-p")
+        .arg(pidfile)
         .env("NOTIFY_SOCKET", &sink.path)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -402,8 +430,9 @@ fn sigusr2_reloads_and_hands_the_main_pid_to_the_new_process() {
     let sock = short_sock("usr2");
     let cfg = write_cfg(&config(fe, be, &sock, ""));
     let mut sink = NotifySink::new("usr2");
+    let pidfile = short_sock("usr2").with_extension("pid");
 
-    let mut old = start_notified(cfg.path(), &sink);
+    let mut old = start_notified(cfg.path(), &sink, &pidfile);
     let ready = sink.wait_for("READY=1", Duration::from_secs(5)).expect("initial READY=1");
     assert_eq!(mainpid(&ready), Some(old.pid()), "{ready:?}");
     wait_listening(fe);
@@ -446,8 +475,46 @@ fn sigusr2_reloads_and_hands_the_main_pid_to_the_new_process() {
         info.as_deref().is_some_and(|i| i.contains(&format!("Pid: {new_pid}"))),
         "the process named in MAINPID must be the one serving; got {info:?}"
     );
-    stop_pid(new_pid);
+    assert_eq!(
+        read_pidfile(&pidfile),
+        Some(new_pid),
+        "after a reload the pidfile must name the process now serving"
+    );
+
+    // Again, from the process the first reload started. It was itself started with
+    // `-x <socket> -sf <pid>`; those must be replaced, not passed on, or the second reload
+    // would try to take sockets from a process that no longer exists.
+    send_signal(new_pid, Signal::Usr2);
+    let third = sink
+        .wait_until(
+            |m| m.contains("READY=1") && mainpid(m).is_some_and(|p| p != old_pid && p != new_pid),
+            Duration::from_secs(5),
+        )
+        .as_deref()
+        .and_then(mainpid)
+        .unwrap_or_else(|| panic!("second reload: no handover; saw {:?}", sink.seen));
+    assert!(wait_gone(new_pid, Duration::from_secs(5)), "second reload: {new_pid} did not exit");
+    // The arguments a reload passes on must describe *this* reload only. Inheriting the
+    // previous `-sf` still works -- the option parser accumulates `-sf` -- but it signals
+    // the previous PID again, which by now may belong to an unrelated process.
+    let argv = std::fs::read(format!("/proc/{third}/cmdline")).unwrap_or_default();
+    let argv: Vec<String> =
+        argv.split(|&b| b == 0).map(|a| String::from_utf8_lossy(a).into_owned()).collect();
+    assert_eq!(argv.iter().filter(|a| *a == "-x").count(), 1, "one -x: {argv:?}");
+    assert_eq!(argv.iter().filter(|a| *a == "-sf").count(), 1, "one -sf: {argv:?}");
+    let sf = argv.iter().position(|a| a == "-sf").map(|i| argv[i + 1].clone());
+    assert_eq!(sf, Some(new_pid.to_string()), "-sf must name only the process being replaced: {argv:?}");
+    wait_listening(fe);
+    let info = cli(&sock, "show info");
+    assert!(
+        info.as_deref().is_some_and(|i| i.contains(&format!("Pid: {third}"))),
+        "second reload: the process named in MAINPID must be serving; got {info:?}"
+    );
+    assert_eq!(read_pidfile(&pidfile), Some(third), "second reload: pidfile");
+
+    stop_pid(third);
     let _ = std::fs::remove_file(&sock);
+    let _ = std::fs::remove_file(&pidfile);
 }
 
 /// `HAProxy`'s property that makes reloads safe to automate: a new configuration that does
@@ -458,16 +525,15 @@ fn a_reload_with_a_broken_config_leaves_the_old_process_serving() {
     let be = backend();
     let fe = free_addr();
     let sock = short_sock("usr2bad");
-    let mut cfg = write_cfg(&config(fe, be, &sock, ""));
+    let cfg = write_cfg(&config(fe, be, &sock, ""));
     let mut sink = NotifySink::new("usr2bad");
+    let pidfile = short_sock("usr2bad").with_extension("pid");
 
-    let mut old = start_notified(cfg.path(), &sink);
+    let mut old = start_notified(cfg.path(), &sink, &pidfile);
     sink.wait_for("READY=1", Duration::from_secs(5)).expect("initial READY=1");
     wait_listening(fe);
 
-    cfg.as_file_mut().set_len(0).expect("truncate");
-    cfg.write_all(b"frontend fe\n  this-is-not-a-keyword\n").expect("break cfg");
-    cfg.flush().expect("flush");
+    std::fs::write(cfg.path(), "frontend fe\n  this-is-not-a-keyword\n").expect("break cfg");
 
     old.signal(Signal::Usr2);
     assert!(
@@ -479,10 +545,60 @@ fn a_reload_with_a_broken_config_leaves_the_old_process_serving() {
         old.wait_exit(Duration::from_millis(500)).is_none(),
         "a failed reload must not stop the running process"
     );
+    assert_eq!(
+        read_pidfile(&pidfile),
+        Some(old.pid()),
+        "a failed reload must leave the pidfile naming the process still serving"
+    );
     let mut c = TcpStream::connect(fe).expect("still accepting");
     c.write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").expect("send");
     let resp = read_all(&mut c, Duration::from_secs(3));
     assert!(resp.starts_with("HTTP/1.1 200"), "old process must still serve: {resp:?}");
     let _ = std::fs::remove_file(&sock);
+    let _ = std::fs::remove_file(&pidfile);
+    old.stop();
+}
+
+/// A reload can also fail *after* the new configuration has loaded -- here, a bind to an
+/// address this host does not have. By then a process that wrote its pidfile at startup
+/// would have replaced the running process's PID with its own, and then exited. The
+/// pidfile must go on naming the process that is actually serving.
+#[test]
+fn a_reload_that_fails_after_loading_its_config_leaves_the_pidfile_alone() {
+    let be = backend();
+    let fe = free_addr();
+    let sock = short_sock("latefail");
+    let cfg = write_cfg(&config(fe, be, &sock, ""));
+    let mut sink = NotifySink::new("latefail");
+    let pidfile = short_sock("latefail").with_extension("pid");
+
+    let mut old = start_notified(cfg.path(), &sink, &pidfile);
+    sink.wait_for("READY=1", Duration::from_secs(5)).expect("initial READY=1");
+    wait_listening(fe);
+    assert_eq!(read_pidfile(&pidfile), Some(old.pid()));
+
+    // Parses; cannot bind. 192.0.2.1 is TEST-NET-1 (RFC 5737), never a local address.
+    // Not `set_len(0)` then `write_all`: truncating leaves the write offset where it was,
+    // so the new text lands after a run of NUL bytes, the config fails to *parse*, and the
+    // process never gets as far as the pidfile -- the path this test exists for. An earlier
+    // version did exactly that and passed with the pidfile deferral removed.
+    let unbindable = config(fe, be, &sock, "").replace(&format!("bind {fe}"), "bind 192.0.2.1:80");
+    std::fs::write(cfg.path(), unbindable).expect("rewrite cfg");
+
+    old.signal(Signal::Usr2);
+    assert!(
+        sink.wait_for("Reload failed", Duration::from_secs(5)).is_some(),
+        "the reload must be reported as failed; saw {:?}",
+        sink.seen
+    );
+    assert_eq!(
+        read_pidfile(&pidfile),
+        Some(old.pid()),
+        "a reload that failed after loading its config must leave the pidfile naming the \
+         process still serving"
+    );
+    assert!(old.wait_exit(Duration::from_millis(300)).is_none(), "old process stopped");
+    let _ = std::fs::remove_file(&sock);
+    let _ = std::fs::remove_file(&pidfile);
     old.stop();
 }

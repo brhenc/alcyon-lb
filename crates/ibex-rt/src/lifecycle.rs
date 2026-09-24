@@ -43,11 +43,6 @@ impl Lifecycle {
         Ok(())
     }
 
-    /// Requests a soft stop, as `SIGUSR1` would.
-    pub fn request_soft_stop(&self) {
-        self.soft_stop.store(true, Ordering::Relaxed);
-    }
-
     /// Consumes a pending reload request (`SIGUSR2`), if there is one.
     #[must_use]
     pub fn take_reload_request(&self) -> bool {

@@ -2,7 +2,6 @@ use std::os::linux::net::SocketAddrExt;
 use std::os::unix::net::{SocketAddr, UnixDatagram};
 use std::process::{Command, Stdio};
 use std::time::Duration;
-use std::io::Read;
 use tempfile::NamedTempFile;
 use std::io::Write;
 
@@ -10,8 +9,6 @@ fn run_ibex_with_notify(sock_addr: &SocketAddr, env_val: &str) -> String {
     let mut config_file = NamedTempFile::new().unwrap();
     write!(config_file, "listen test\n  bind 127.0.0.1:0\n").unwrap();
 
-    let sock = UnixDatagram::unbound().unwrap();
-    // Wait, we need to BIND the socket, not unbound.
     let sock = match sock_addr.as_pathname() {
         Some(p) => {
             let _ = std::fs::remove_file(p);
@@ -35,6 +32,17 @@ fn run_ibex_with_notify(sock_addr: &SocketAddr, env_val: &str) -> String {
 
     let mut buf = [0u8; 1024];
     let res = sock.recv(&mut buf);
+    // Soft stop, not SIGKILL: a killed process never writes its coverage profile, and the
+    // abstract-socket path this file exists to test would count as untested.
+    if let Some(pid) = rustix::process::Pid::from_raw(i32::try_from(cmd.id()).unwrap_or(0)) {
+        let _ = rustix::process::kill_process(pid, rustix::process::Signal::Usr1);
+    }
+    for _ in 0..250 {
+        if cmd.try_wait().ok().flatten().is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
     let _ = cmd.kill();
     let _ = cmd.wait();
 

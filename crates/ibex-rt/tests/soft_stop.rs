@@ -180,12 +180,37 @@ fn hard_stop_after_bounds_a_soft_stop() {
     );
 }
 
+/// A backend that keeps each connection open and answers every request on it. The idle
+/// test needs this: a backend that closes after responding makes Ibex close the client
+/// connection too -- a keep-alive defect of its own, measured against `HAProxy` (3 of 3
+/// requests answered) and Ibex (1 of 3) -- and then there is no idle session to test.
+fn keepalive_backend() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind backend");
+    let addr = listener.local_addr().expect("addr");
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            thread::spawn(move || {
+                let mut buf = [0u8; 2048];
+                while let Ok(n) = s.read(&mut buf) {
+                    if n == 0
+                        || s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
 /// A keep-alive client that is idle between requests is not work in flight. `HAProxy` closes
 /// it on soft stop; if it did not, every idle browser tab would hold the old process open
 /// until `timeout client`.
 #[test]
 fn an_idle_keepalive_connection_does_not_hold_a_soft_stop_open() {
-    let be = slow_backend(Some(Duration::from_millis(0)));
+    let be = keepalive_backend();
     let fe = free_addr();
     let mut ibex = Ibex::start(&http_config(fe, be, ""), fe);
 
@@ -196,7 +221,18 @@ fn an_idle_keepalive_connection_does_not_hold_a_soft_stop_open() {
     let n = client.read(&mut buf).expect("first response");
     assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"));
 
-    // The connection is now idle, waiting for a second request that never comes.
+    // The connection must really be idle -- open, and waiting for a second request -- or
+    // this test proves nothing: a proxy that closed it after the first response would let
+    // the process exit at once, and the test would pass without ever reaching the code that
+    // closes idle sessions. It did exactly that once.
+    client.set_nonblocking(true).expect("nonblocking");
+    thread::sleep(Duration::from_millis(300));
+    match client.read(&mut buf) {
+        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+        other => panic!("setup: the connection is not idle-and-open before the signal: {other:?}"),
+    }
+    client.set_nonblocking(false).expect("blocking");
+
     let started = Instant::now();
     ibex.signal(Signal::Usr1);
     let st = ibex.wait_exit(Duration::from_secs(3));

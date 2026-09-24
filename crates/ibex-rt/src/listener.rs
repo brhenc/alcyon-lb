@@ -269,4 +269,52 @@ mod tests {
         l.nbconn = 9;
         assert!(!l.is_full());
     }
+
+    /// `adopt` is the check on a descriptor received from another process over
+    /// `SCM_RIGHTS`. Whatever arrives is refused unless it is a listening TCP socket on the
+    /// address this bind asks for.
+    #[test]
+    fn adopt_takes_a_matching_listening_socket_and_serves_on_it() {
+        let orig = Listener::bind(loopback0(), 16, 0).expect("bind");
+        let addr = orig.addr();
+        let fd = orig.borrowed_fd().try_clone_to_owned().expect("dup");
+        let adopted = Listener::adopt(fd, addr, 16, 7).expect("adopt");
+        assert_eq!(adopted.addr(), addr);
+        assert_eq!(adopted.proxy, 7);
+        let _c = std::net::TcpStream::connect(addr).expect("connect");
+        let mut got = None;
+        for _ in 0..100 {
+            if let Some(conn) = adopted.accept().expect("accept") {
+                got = Some(conn);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(got.is_some(), "the adopted socket must accept connections");
+    }
+
+    #[test]
+    fn adopt_refuses_a_socket_bound_elsewhere() {
+        let orig = Listener::bind(loopback0(), 16, 0).expect("bind");
+        let other = Listener::bind(loopback0(), 16, 0).expect("bind other");
+        let fd = orig.borrowed_fd().try_clone_to_owned().expect("dup");
+        let err = Listener::adopt(fd, other.addr(), 16, 0).err().expect("must refuse");
+        assert!(err.to_string().contains("bound to"), "{err}");
+    }
+
+    #[test]
+    fn adopt_refuses_a_socket_that_is_not_listening() {
+        let fd = net::socket_with(AddressFamily::INET, SocketType::STREAM, SocketFlags::CLOEXEC, None)
+            .expect("socket");
+        let err = Listener::adopt(fd, loopback0(), 16, 0).err().expect("must refuse");
+        assert!(err.to_string().contains("not listening"), "{err}");
+    }
+
+    #[test]
+    fn adopt_refuses_a_datagram_socket() {
+        let fd = net::socket_with(AddressFamily::INET, SocketType::DGRAM, SocketFlags::CLOEXEC, None)
+            .expect("socket");
+        let err = Listener::adopt(fd, loopback0(), 16, 0).err().expect("must refuse");
+        assert!(err.to_string().contains("not a stream socket"), "{err}");
+    }
 }
