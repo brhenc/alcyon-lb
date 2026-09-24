@@ -159,6 +159,8 @@ pub struct Proxy {
     pub tcp_req_session_rules: Vec<ibex_config::TcpReqSessionRule>,
     pub tcp_req_content_rules: Vec<ibex_config::TcpReqContentRule>,
     pub tcp_req_inspect_delay: Option<Duration>,
+    pub tcp_res_content_rules: Vec<ibex_config::TcpReqContentRule>,
+    pub tcp_res_inspect_delay: Option<Duration>,
     pub http_req_rules: Vec<ibex_config::HttpReqRule>,
     pub http_res_rules: Vec<ibex_config::HttpResRule>,
     pub http_after_res_rules: Vec<ibex_config::HttpAfterResRule>,
@@ -789,6 +791,8 @@ fn init_proxy_from_listen(proxy_idx: usize, listen: &ibex_config::ListenSection,
         tcp_req_session_rules: listen.tcp_req_session_rules.clone(),
         tcp_req_content_rules: listen.tcp_req_content_rules.clone(),
         tcp_req_inspect_delay: listen.tcp_req_inspect_delay,
+        tcp_res_content_rules: listen.tcp_res_content_rules.clone(),
+        tcp_res_inspect_delay: listen.tcp_res_inspect_delay,
         http_req_rules: listen.http_req_rules.clone(),
         http_res_rules: listen.http_res_rules.clone(),
         http_after_res_rules: listen.http_after_res_rules.clone(),
@@ -867,6 +871,8 @@ fn init_proxy_from_frontend(proxy_idx: usize, fe: &ibex_config::FrontendSection,
         tcp_req_session_rules: fe.tcp_req_session_rules.clone(),
         tcp_req_content_rules: fe.tcp_req_content_rules.clone(),
         tcp_req_inspect_delay: fe.tcp_req_inspect_delay,
+        tcp_res_content_rules: Vec::new(),
+        tcp_res_inspect_delay: None,
         http_req_rules: fe.http_req_rules.clone(),
         http_res_rules: fe.http_res_rules.clone(),
         http_after_res_rules: fe.http_after_res_rules.clone(),
@@ -967,6 +973,8 @@ fn init_proxy_from_backend(proxy_idx: usize, be: &ibex_config::BackendSection, n
         tcp_req_session_rules: Vec::new(),
         tcp_req_content_rules: be.tcp_req_content_rules.clone(),
         tcp_req_inspect_delay: be.tcp_req_inspect_delay,
+        tcp_res_content_rules: be.tcp_res_content_rules.clone(),
+        tcp_res_inspect_delay: be.tcp_res_inspect_delay,
         http_req_rules: be.http_req_rules.clone(),
         http_res_rules: be.http_res_rules.clone(),
         http_after_res_rules: be.http_after_res_rules.clone(),
@@ -1165,7 +1173,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             events: Vec::with_capacity(capacity * 2),
             timer_updates: Vec::with_capacity(capacity * 2),
             log_targets,
-            log_tag: "haproxy".to_string(),
+            log_tag: format!("haproxy[{}]", std::process::id()),
             log_hostname: hostname(),
             global_bufsize: bufsize,
             global_maxrewrite: config
@@ -2148,6 +2156,7 @@ fn eval_tcp_req_content_rules(
     }
 
     let req_bytes = sess.req.readable();
+    eprintln!("[DEBUG_RULES] eval_tcp_req_content_rules proxy={} req_bytes={:?}", proxy.name, req_bytes);
     let has_content = !req_bytes.is_empty();
     let expired = sess.inspect_exp.is_some_and(|exp| exp.is_expired(now));
     let client_closed = sess.cli_state == ScState::ShutR || sess.cli_state == ScState::Closed;
@@ -3194,6 +3203,7 @@ impl EngineDispatcher<'_> {
             let Some(entry) = self.sessions.get_mut(session_idx) else {
                 return Outcome::Done;
             };
+            eprintln!("[DEBUG_STREAM] step_stream: proxy={} cli_state={:?} srv_state={:?} rep_len={} req_len={}", self.proxies[entry.proxy_idx].name, entry.sess.cli_state, entry.sess.srv_state, entry.sess.rep.len(), entry.sess.req.len());
 
             // Step 1: Server connect check if connecting
             check_srv_connect(entry, self.proxies, self.fdtab, self.poller, now);
@@ -3542,6 +3552,7 @@ impl EngineDispatcher<'_> {
             || !proxies[be_idx].http_after_res_rules.is_empty()
             || !proxies[fe_idx].http_res_rules.is_empty()
             || !proxies[fe_idx].http_after_res_rules.is_empty()
+            || !proxies[be_idx].tcp_res_content_rules.is_empty()
             || !proxies[be_idx].srvexp.is_empty();
 
         if !has_rules {
@@ -3614,8 +3625,66 @@ impl EngineDispatcher<'_> {
             req_uri: req_uri_clone.as_deref(),
             req_method: req_method_clone.as_deref(),
             req_headers: req_headers_clone.as_deref(),
+            fe_name: Some(&proxies[fe_idx].name),
+            be_name: Some(&proxies[be_idx].name),
             ..Default::default()
         };
+
+        // 0. Apply be.tcp_res_content_rules
+        for rule in &proxies[be_idx].tcp_res_content_rules {
+            let matches = match &rule.cond {
+                None => true,
+                Some(cond) => eval_condition(cond, &ctx, &proxies[be_idx].acls, registry),
+            };
+            if !matches {
+                continue;
+            }
+            match &rule.action {
+                ibex_config::TcpReqContentAction::Accept => break,
+                ibex_config::TcpReqContentAction::Reject | ibex_config::TcpReqContentAction::SilentDrop => {
+                    let resp = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    entry.sess.rep.replace_prefix(total_hdr_len, resp.as_bytes());
+                    entry.sess.resp_headers_processed = true;
+                    return;
+                }
+                ibex_config::TcpReqContentAction::SetVar { var_name, expr } => {
+                    let val = if let Ok(e) = Expr::parse(expr) {
+                        e.eval_sample(registry, &ctx)
+                            .map(|smp| sample_to_string(&smp))
+                            .unwrap_or_default()
+                    } else {
+                        format_sample_string(expr, &ctx, registry)
+                    };
+                    if var_name.starts_with("sess.") {
+                        entry.sess.sess_vars.insert(var_name.to_string(), val.clone());
+                    } else {
+                        entry.sess.req_vars.insert(var_name.to_string(), val.clone());
+                    }
+                    CURRENT_VARS.with(|v| {
+                        v.borrow_mut().insert(var_name.to_string(), val);
+                    });
+                }
+                ibex_config::TcpReqContentAction::SetVarFmt { var_name, fmt } => {
+                    let val = format_sample_string(fmt, &ctx, registry);
+                    if var_name.starts_with("sess.") {
+                        entry.sess.sess_vars.insert(var_name.to_string(), val.clone());
+                    } else {
+                        entry.sess.req_vars.insert(var_name.to_string(), val.clone());
+                    }
+                    CURRENT_VARS.with(|v| {
+                        v.borrow_mut().insert(var_name.to_string(), val);
+                    });
+                }
+                ibex_config::TcpReqContentAction::UnsetVar { var_name } => {
+                    entry.sess.sess_vars.remove(var_name);
+                    entry.sess.req_vars.remove(var_name);
+                    CURRENT_VARS.with(|v| {
+                        v.borrow_mut().remove(var_name);
+                    });
+                }
+                _ => {}
+            }
+        }
 
         let mut eval_res_action = |act_name: &str, act_fmt: &str, hdrs: &mut Vec<(String, String)>, status: &mut u16, status_msg: &mut String| -> Result<bool, u16> {
             if act_name == "\0allow" {
@@ -4306,6 +4375,7 @@ impl EngineDispatcher<'_> {
             req_uri: entry.sess.req_uri.as_deref(),
             req_method: entry.sess.req_method.as_deref(),
             req_headers: entry.sess.req_headers.as_deref(),
+            fe_name: Some(&proxies[proxy_idx].name),
             act_conn: proxies[proxy_idx].stats[worker_id()].act_conn.load(Ordering::Relaxed),
             cum_conn: proxies[proxy_idx].stats[worker_id()].cum_conn.load(Ordering::Relaxed),
             ..Default::default()
@@ -4424,7 +4494,7 @@ impl EngineDispatcher<'_> {
 
         let act_conn = proxies[proxy_idx].stats[worker_id()].act_conn.load(Ordering::Relaxed);
         let cum_conn = proxies[proxy_idx].stats[worker_id()].cum_conn.load(Ordering::Relaxed);
-        let eval_http_rules = |rules: &[ibex_config::HttpReqRule], acls: &HashMap<String, Expr>, sess: &mut TcpSession, target_addr: Option<SocketAddr>| -> Result<Option<()>, ()> {
+        let eval_http_rules = |rules: &[ibex_config::HttpReqRule], acls: &HashMap<String, Expr>, sess: &mut TcpSession, target_addr: Option<SocketAddr>, fe_name: Option<&str>, be_name: Option<&str>| -> Result<Option<()>, ()> {
             macro_rules! make_ctx {
                 ($s:expr) => {
                     SampleContext {
@@ -4438,6 +4508,9 @@ impl EngineDispatcher<'_> {
                         req_uri: $s.req_uri.as_deref(),
                         req_method: $s.req_method.as_deref(),
                         req_headers: $s.req_headers.as_deref(),
+                        fe_name,
+                        be_name,
+                        captures_req_hdr: Some(&$s.req_captures),
                         act_conn,
                         cum_conn,
                         sc_http_req_rates,
@@ -4904,6 +4977,32 @@ impl EngineDispatcher<'_> {
                             }
                         }
                     }
+                    ibex_config::HttpReqAction::Capture { expr, len, id } => {
+                        let val = if let Ok(e) = Expr::parse(expr) {
+                            e.eval_sample(registry, &make_ctx!(sess))
+                                .map(|smp| sample_to_string(&smp))
+                                .unwrap_or_default()
+                        } else {
+                            format_sample_string(expr, &make_ctx!(sess), registry)
+                        };
+                        let val = if let Some(max_l) = len {
+                            if val.len() > *max_l {
+                                val[..*max_l].to_string()
+                            } else {
+                                val
+                            }
+                        } else {
+                            val
+                        };
+                        if let Some(target_id) = id {
+                            if sess.req_captures.len() <= *target_id {
+                                sess.req_captures.resize(*target_id + 1, String::new());
+                            }
+                            sess.req_captures[*target_id] = val;
+                        } else {
+                            sess.req_captures.push(val);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -4914,7 +5013,7 @@ impl EngineDispatcher<'_> {
         if !proxies[proxy_idx].http_req_rules.is_empty() {
             let fe_rules = &proxies[proxy_idx].http_req_rules;
             let fe_acls = &proxies[proxy_idx].acls;
-            if let Ok(Some(())) = eval_http_rules(fe_rules, fe_acls, &mut entry.sess, entry.target_addr) {
+            if let Ok(Some(())) = eval_http_rules(fe_rules, fe_acls, &mut entry.sess, entry.target_addr, Some(&proxies[proxy_idx].name), None) {
                 return None;
             }
         }
@@ -4979,7 +5078,7 @@ impl EngineDispatcher<'_> {
         if be_idx != proxy_idx && !proxies[be_idx].http_req_rules.is_empty() {
             let be_rules = &proxies[be_idx].http_req_rules;
             let be_acls = &proxies[be_idx].acls;
-            if let Ok(Some(())) = eval_http_rules(be_rules, be_acls, &mut entry.sess, entry.target_addr) {
+            if let Ok(Some(())) = eval_http_rules(be_rules, be_acls, &mut entry.sess, entry.target_addr, Some(&proxies[proxy_idx].name), Some(&proxies[be_idx].name)) {
                 return None;
             }
         }
@@ -5249,9 +5348,11 @@ impl EngineDispatcher<'_> {
         let target = proxies[be_idx].select_server_with_key(source_ip, entry.sess.req_uri.as_deref());
 
         let Some(target_addr) = target else {
+            eprintln!("[DEBUG_BACKEND] connect_tcp_backend target=None for be={}", proxies[be_idx].name);
             entry.sess.srv_state = ScState::Error;
             return;
         };
+        eprintln!("[DEBUG_BACKEND] connect_tcp_backend target_addr={:?} for be={}", target_addr, proxies[be_idx].name);
 
         let s_idx = proxies[be_idx]
             .servers
@@ -5273,6 +5374,8 @@ impl EngineDispatcher<'_> {
             entry.sess.attach_server(srv_fd, now);
             if immediate {
                 entry.sess.server_connected(now);
+                fdtab.set_ready(sfd, false, true);
+                let _ = entry.sess.process(now);
                 let (_, srv_want) = entry.sess.interests();
                 let new_interest = Interest {
                     readable: srv_want.read,
@@ -5332,7 +5435,13 @@ impl EngineDispatcher<'_> {
 
             // The message is built while `check` is still borrowed, then the borrow ends
             // so the targets (which live behind `&self`) can be read to send it.
-            let pending = (check.task, check.next_check);
+            let pending = (
+                check.task,
+                step.as_ref()
+                    .ok()
+                    .and_then(|s| s.next)
+                    .unwrap_or(check.next_check),
+            );
             let log = step.ok().and_then(|s| s.event).and_then(|event| {
                 let proxy = self.proxies.get(proxy_idx)?;
                 // HAProxy logs an UP/DOWN transition always, and every other check result

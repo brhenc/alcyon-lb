@@ -111,12 +111,50 @@ pub enum TcpCheckExpectPattern {
     RString(String),
 }
 
+/// Version for `option mysql-check`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MysqlCheckVersion {
+    #[default]
+    Post41,
+    Pre41,
+    Post80,
+}
+
+/// Protocol-specific health check configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProtoCheckConfig {
+    Redis,
+    Smtp {
+        cmd: Option<String>,
+    },
+    Ldap,
+    Mysql {
+        user: Option<String>,
+        version: MysqlCheckVersion,
+    },
+    Pgsql {
+        user: String,
+    },
+    SslHello,
+}
+
 /// Fully resolved health check configuration for a backend server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolvedCheckConfig {
     TcpConnect,
     Http(ResolvedHttpCheck),
     TcpSteps(Vec<ResolvedTcpStep>),
+    Redis,
+    Smtp(Option<String>),
+    Ldap,
+    Mysql {
+        user: Option<String>,
+        version: MysqlCheckVersion,
+    },
+    Pgsql {
+        user: String,
+    },
+    SslHello,
 }
 
 /// Resolved HTTP health check parameters.

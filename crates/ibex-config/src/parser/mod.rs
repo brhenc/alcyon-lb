@@ -13,8 +13,8 @@ use crate::ast::{
     DefaultsSection, FrontendSection, GlobalSection, GlobalSetVar, HttpAfterResAction,
     HttpAfterResRule, HttpCheckAction, HttpCheckExpectPattern, HttpChkConfig, HttpReqAction,
     HttpReqRule, HttpResAction, HttpResRule, HttpReuse, ListenSection, LogConfig, LogFacility,
-    LogLevel, LogTarget, MatchType, Mode, ResolvedCheckConfig, ResolvedHttpCheck,
-    ResolvedHttpExpectPattern, ResolvedHttpExpectRule, ResolvedTcpStep,
+    LogLevel, LogTarget, MatchType, Mode, MysqlCheckVersion, ProtoCheckConfig, ResolvedCheckConfig,
+    ResolvedHttpCheck, ResolvedHttpExpectPattern, ResolvedHttpExpectRule, ResolvedTcpStep,
     Server, StatsConfig, StickRule, StickRuleType, StickTableConfigAst, TcpCheckAction,
     TcpCheckExpectPattern, TcpReqConnAction, TcpReqConnRule, TcpReqContentAction,
     TcpReqContentRule, TcpReqSessionAction, TcpReqSessionRule, TimeoutConfig, UseBackendRule,
@@ -129,6 +129,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
 
     let mut global: Option<GlobalSection> = None;
     let mut defaults: Option<DefaultsSection> = None;
+    let mut named_defaults: std::collections::HashMap<String, DefaultsSection> = std::collections::HashMap::new();
     let mut listens = Vec::new();
     let mut frontends = Vec::new();
     let mut backends = Vec::new();
@@ -147,6 +148,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut cur_section,
                     &mut global,
                     &mut defaults,
+                    &mut named_defaults,
                     &mut listens,
                     &mut frontends,
                     &mut backends,
@@ -154,24 +156,57 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                 cur_section = Some(CurrentSection::Global(GlobalSection::default()));
             }
             "defaults" => {
-                if tokens.len() >= 2 && !tokens[1].text.is_empty() {
-                    return Err(ConfigError::new(tokens[1].line, tokens[1].col, "named defaults sections are not implemented".to_string()));
-                }
                 flush_current_section(
                     &mut cur_section,
                     &mut global,
                     &mut defaults,
+                    &mut named_defaults,
                     &mut listens,
                     &mut frontends,
                     &mut backends,
                 );
-                cur_section = Some(CurrentSection::Defaults(DefaultsSection::default()));
+                let def = if tokens.len() >= 2 && !tokens[1].text.is_empty() {
+                    if tokens[1].text == "from" {
+                        if tokens.len() < 3 || tokens[2].text.is_empty() {
+                            return Err(ConfigError::new(tokens[1].line, tokens[1].col, "'from' expects a defaults section name".to_string()));
+                        }
+                        let parent = &tokens[2].text;
+                        let parent_def = named_defaults.get(parent).ok_or_else(|| {
+                            ConfigError::new(tokens[2].line, tokens[2].col, format!("defaults section '{parent}' not found for defaults 'unnamed'."))
+                        })?;
+                        let mut d = parent_def.clone();
+                        d.name = None;
+                        d
+                    } else {
+                        let name = tokens[1].text.clone();
+                        if tokens.len() >= 4 && tokens[2].text == "from" {
+                            let parent = &tokens[3].text;
+                            let parent_def = named_defaults.get(parent).ok_or_else(|| {
+                                ConfigError::new(tokens[3].line, tokens[3].col, format!("defaults section '{parent}' not found for defaults '{name}'."))
+                            })?;
+                            let mut d = parent_def.clone();
+                            d.name = Some(name);
+                            d
+                        } else if tokens.len() >= 3 && tokens[2].text == "from" {
+                            return Err(ConfigError::new(tokens[2].line, tokens[2].col, "'from' expects a defaults section name".to_string()));
+                        } else {
+                            DefaultsSection {
+                                name: Some(name),
+                                ..DefaultsSection::default()
+                            }
+                        }
+                    }
+                } else {
+                    DefaultsSection::default()
+                };
+                cur_section = Some(CurrentSection::Defaults(def));
             }
             "listen" => {
                 flush_current_section(
                     &mut cur_section,
                     &mut global,
                     &mut defaults,
+                    &mut named_defaults,
                     &mut listens,
                     &mut frontends,
                     &mut backends,
@@ -179,6 +214,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                 cur_section = Some(CurrentSection::Listen(parse_listen_header(
                     tokens,
                     kw,
+                    &named_defaults,
                     defaults.as_ref(),
                 )?));
             }
@@ -187,6 +223,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut cur_section,
                     &mut global,
                     &mut defaults,
+                    &mut named_defaults,
                     &mut listens,
                     &mut frontends,
                     &mut backends,
@@ -194,6 +231,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                 cur_section = Some(CurrentSection::Frontend(parse_frontend_header(
                     tokens,
                     kw,
+                    &named_defaults,
                     defaults.as_ref(),
                 )?));
             }
@@ -202,6 +240,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut cur_section,
                     &mut global,
                     &mut defaults,
+                    &mut named_defaults,
                     &mut listens,
                     &mut frontends,
                     &mut backends,
@@ -209,6 +248,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                 cur_section = Some(CurrentSection::Backend(parse_backend_header(
                     tokens,
                     kw,
+                    &named_defaults,
                     defaults.as_ref(),
                 )?));
             }
@@ -217,6 +257,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut cur_section,
                     &mut global,
                     &mut defaults,
+                    &mut named_defaults,
                     &mut listens,
                     &mut frontends,
                     &mut backends,
@@ -236,6 +277,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
         &mut cur_section,
         &mut global,
         &mut defaults,
+        &mut named_defaults,
         &mut listens,
         &mut frontends,
         &mut backends,
@@ -280,6 +322,7 @@ pub(crate) fn flush_current_section(
     cur: &mut Option<CurrentSection>,
     global: &mut Option<GlobalSection>,
     defaults: &mut Option<DefaultsSection>,
+    named_defaults: &mut std::collections::HashMap<String, DefaultsSection>,
     listens: &mut Vec<ListenSection>,
     frontends: &mut Vec<FrontendSection>,
     backends: &mut Vec<BackendSection>,
@@ -287,7 +330,12 @@ pub(crate) fn flush_current_section(
     if let Some(sec) = cur.take() {
         match sec {
             CurrentSection::Global(g) => *global = Some(g),
-            CurrentSection::Defaults(d) => *defaults = Some(d),
+            CurrentSection::Defaults(d) => {
+                if let Some(ref name) = d.name {
+                    named_defaults.insert(name.clone(), d.clone());
+                }
+                *defaults = Some(d);
+            }
             CurrentSection::Listen(l) => listens.push(l),
             CurrentSection::Frontend(f) => frontends.push(f),
             CurrentSection::Backend(b) => backends.push(b),
@@ -346,12 +394,6 @@ pub(crate) fn parse_resolvers_directive(tokens: &[Token], kw: &Token) -> Result<
 /// 7 passing to 1 in one commit, because `thread-groups` appears in nearly every `HAProxy`
 /// reg-test. Refuse what is dangerous to ignore; keep ignoring what is merely unimplemented.
 const CHECK_OPTIONS_THAT_MUST_NOT_BE_IGNORED: &[&str] = &[
-    "ssl-hello-chk",
-    "smtpchk",
-    "mysql-check",
-    "pgsql-check",
-    "redis-check",
-    "ldap-check",
     "spop-check",
 ];
 

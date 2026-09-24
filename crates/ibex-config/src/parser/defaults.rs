@@ -48,16 +48,67 @@ pub(crate) fn parse_defaults_directive(
             Ok(())
         }
         "tcp-request" => {
-            if tokens.len() >= 3 && tokens[1].text == "inspect-delay" {
-                defaults.tcp_req_inspect_delay = Some(parse_timeout(&tokens[2], "tcp-request inspect-delay")?);
-                Ok(())
-            } else {
-                Err(ConfigError::new(
+            if tokens.len() < 2 {
+                return Err(ConfigError::new(
+                    kw.line,
+                    kw.col,
+                    "missing argument for 'tcp-request'",
+                ));
+            }
+            match tokens[1].text.as_str() {
+                "inspect-delay" => {
+                    if tokens.len() < 3 {
+                        return Err(ConfigError::new(
+                            kw.line,
+                            kw.col,
+                            "<tcp-request inspect-delay> expects delay timeout",
+                        ));
+                    }
+                    defaults.tcp_req_inspect_delay = Some(parse_timeout(&tokens[2], "tcp-request inspect-delay")?);
+                    Ok(())
+                }
+                "connection" => parse_tcp_req_connection(&mut defaults.tcp_req_conn_rules, tokens, kw),
+                "session" => parse_tcp_req_session(&mut defaults.tcp_req_session_rules, tokens, kw),
+                "content" => parse_tcp_req_content(&mut defaults.tcp_req_content_rules, tokens, kw),
+                other => Err(ConfigError::new(
                     tokens[1].line,
                     tokens[1].col,
-                    format!("tcp-request subcommand '{}' is not supported in defaults", tokens[1].text),
-                ))
+                    format!("unknown tcp-request subcommand <{other}>, expects 'inspect-delay', 'connection', 'session', or 'content'"),
+                )),
             }
+        }
+        "tcp-response" => {
+            if tokens.len() < 2 {
+                return Err(ConfigError::new(
+                    kw.line,
+                    kw.col,
+                    "missing argument for 'tcp-response'",
+                ));
+            }
+            match tokens[1].text.as_str() {
+                "inspect-delay" => {
+                    if tokens.len() < 3 {
+                        return Err(ConfigError::new(
+                            kw.line,
+                            kw.col,
+                            "<tcp-response inspect-delay> expects delay timeout",
+                        ));
+                    }
+                    defaults.tcp_res_inspect_delay = Some(parse_timeout(&tokens[2], "tcp-response inspect-delay")?);
+                    Ok(())
+                }
+                "content" => parse_tcp_req_content(&mut defaults.tcp_res_content_rules, tokens, kw),
+                other => Err(ConfigError::new(
+                    tokens[1].line,
+                    tokens[1].col,
+                    format!("unknown tcp-response subcommand <{other}>, expects 'inspect-delay' or 'content'"),
+                )),
+            }
+        }
+        "http-request" => parse_http_req_rule(&mut defaults.http_req_rules, tokens, kw),
+        "http-response" => parse_http_res_rule(&mut defaults.http_res_rules, tokens, kw),
+        "http-after-response" => {
+            parse_http_after_res_rule(&mut defaults.http_after_res_rules, tokens, kw)
         }
         "log" => {
             defaults.log_global |= parse_log(&mut defaults.logs, tokens, kw)?;
@@ -73,13 +124,6 @@ pub(crate) fn parse_defaults_directive(
         "http-reuse" => parse_http_reuse(&mut defaults.http_reuse, tokens, kw),
         "cliexp" => parse_cliexp(kw),
         "srvexp" => parse_srvexp(kw),
-        "tcp-response" | "http-request" | "http-response" | "http-after-request" => {
-            Err(ConfigError::new(
-                kw.line,
-                kw.col,
-                format!("directive '{}' is not supported in defaults", kw.text),
-            ))
-        }
         "http-check" => {
             parse_http_check_directive(&mut defaults.http_checks, tokens, kw)?;
             Ok(())
@@ -121,6 +165,7 @@ pub(crate) fn parse_option_defaults(
             "tcp-check" => {
                 defaults.tcp_check = true;
             }
+            _ if parse_proto_check_option(&mut defaults.proto_check, tokens, kw)? => {}
             other => {
                 refuse_if_check_option(other, kw)?;
                 eprintln!("[ibex] warning: ignored option '{other}'");

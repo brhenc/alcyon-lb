@@ -13,7 +13,8 @@ use crate::fdtab::{FdState, FdTab, Interest};
 use crate::poller::Poller;
 use crate::raw::{self, Io};
 use ibex_config::ast::{
-    get_resolved_check_config, ResolvedCheckConfig, ResolvedHttpCheck, ResolvedTcpStep,
+    get_resolved_check_config, MysqlCheckVersion, ResolvedCheckConfig, ResolvedHttpCheck,
+    ResolvedTcpStep,
 };
 use ibex_sched::task::TaskRef;
 use ibex_sched::Tick;
@@ -88,6 +89,9 @@ impl Default for ServerCheckConfig {
 pub enum CheckSubState {
     Idle,
     TcpConnecting,
+    ProtoConnecting {
+        target_addr: SocketAddr,
+    },
     HttpConnecting {
         req_buf: Vec<u8>,
         send_offset: usize,
@@ -101,6 +105,43 @@ pub enum CheckSubState {
     },
     TcpRunning {
         step_idx: usize,
+        send_offset: usize,
+        recv_buf: Vec<u8>,
+    },
+    RedisRunning {
+        phase: u8,
+        send_offset: usize,
+        recv_buf: Vec<u8>,
+    },
+    SmtpRunning {
+        phase: u8,
+        cmd: String,
+        send_offset: usize,
+        recv_buf: Vec<u8>,
+    },
+    LdapRunning {
+        phase: u8,
+        send_offset: usize,
+        recv_buf: Vec<u8>,
+    },
+    MysqlRunning {
+        phase: u8,
+        user: Option<String>,
+        version: MysqlCheckVersion,
+        server_version: String,
+        send_offset: usize,
+        req_buf: Vec<u8>,
+        recv_buf: Vec<u8>,
+    },
+    PgsqlRunning {
+        phase: u8,
+        user: String,
+        send_offset: usize,
+        req_buf: Vec<u8>,
+        recv_buf: Vec<u8>,
+    },
+    SslHelloRunning {
+        phase: u8,
         send_offset: usize,
         recv_buf: Vec<u8>,
     },
@@ -482,12 +523,18 @@ pub fn step_check(
 
         if timed_out {
             let (code, desc, info) = match &check.sub_state {
-                CheckSubState::TcpConnecting | CheckSubState::HttpConnecting { .. } | CheckSubState::Idle => {
-                    ("L4TOUT", "Layer4 timeout", None)
-                }
-                CheckSubState::HttpSending { .. } | CheckSubState::HttpReceiving { .. } => {
-                    ("L7TOUT", "Layer7 timeout", None)
-                }
+                CheckSubState::TcpConnecting
+                | CheckSubState::HttpConnecting { .. }
+                | CheckSubState::ProtoConnecting { .. }
+                | CheckSubState::Idle => ("L4TOUT", "Layer4 timeout", None),
+                CheckSubState::HttpSending { .. }
+                | CheckSubState::HttpReceiving { .. }
+                | CheckSubState::RedisRunning { .. }
+                | CheckSubState::SmtpRunning { .. }
+                | CheckSubState::LdapRunning { .. }
+                | CheckSubState::MysqlRunning { .. }
+                | CheckSubState::PgsqlRunning { .. } => ("L7TOUT", "Layer7 timeout", None),
+                CheckSubState::SslHelloRunning { .. } => ("L6TOUT", "Layer6 timeout", None),
                 CheckSubState::TcpRunning { step_idx, .. } => (
                     "L7TOUT",
                     "Layer7 timeout",
@@ -540,6 +587,97 @@ pub fn step_check(
                     event,
                 })
             }
+            CheckSubState::ProtoConnecting { target_addr: _ } => {
+                if !ready.writable && !ready.readable {
+                    return Ok(CheckStep::pending(Some(check.exp)));
+                }
+                fdtab.clear_ready(raw_fd, true, true);
+                let connect_res = if let Some(sock) = check.sock.as_ref() {
+                    raw::check_connect_error(sock.as_fd())
+                } else {
+                    Ok(Some(io::Error::from(io::ErrorKind::NotConnected)))
+                };
+
+                if let Ok(None) = connect_res {
+                    match check.resolved_config.clone() {
+                        Some(ResolvedCheckConfig::Redis) => {
+                            check.sub_state = CheckSubState::RedisRunning {
+                                phase: 0,
+                                send_offset: 0,
+                                recv_buf: Vec::new(),
+                            };
+                            progress_redis_check(check, fdtab, poller, now, duration)
+                        }
+                        Some(ResolvedCheckConfig::Smtp(cmd)) => {
+                            check.sub_state = CheckSubState::SmtpRunning {
+                                phase: 0,
+                                cmd: cmd.unwrap_or_else(|| "HELO localhost".to_string()),
+                                send_offset: 0,
+                                recv_buf: Vec::new(),
+                            };
+                            progress_smtp_check(check, fdtab, poller, now, duration)
+                        }
+                        Some(ResolvedCheckConfig::Ldap) => {
+                            check.sub_state = CheckSubState::LdapRunning {
+                                phase: 0,
+                                send_offset: 0,
+                                recv_buf: Vec::new(),
+                            };
+                            progress_ldap_check(check, fdtab, poller, now, duration)
+                        }
+                        Some(ResolvedCheckConfig::Mysql { user, version }) => {
+                            check.sub_state = CheckSubState::MysqlRunning {
+                                phase: 0,
+                                user,
+                                version,
+                                server_version: String::new(),
+                                send_offset: 0,
+                                req_buf: Vec::new(),
+                                recv_buf: Vec::new(),
+                            };
+                            progress_mysql_check(check, fdtab, poller, now, duration)
+                        }
+                        Some(ResolvedCheckConfig::Pgsql { user }) => {
+                            check.sub_state = CheckSubState::PgsqlRunning {
+                                phase: 0,
+                                user,
+                                send_offset: 0,
+                                req_buf: Vec::new(),
+                                recv_buf: Vec::new(),
+                            };
+                            progress_pgsql_check(check, fdtab, poller, now, duration)
+                        }
+                        Some(ResolvedCheckConfig::SslHello) => {
+                            check.sub_state = CheckSubState::SslHelloRunning {
+                                phase: 0,
+                                send_offset: 0,
+                                recv_buf: Vec::new(),
+                            };
+                            progress_ssl_hello_check(check, fdtab, poller, now, duration)
+                        }
+                        _ => {
+                            cleanup_check_socket(check, fdtab, poller);
+                            let next = check.schedule_next(now);
+                            Ok(CheckStep::pending(Some(next)))
+                        }
+                    }
+                } else {
+                    cleanup_check_socket(check, fdtab, poller);
+                    let event = check.on_failure_full(
+                        "L4CON",
+                        "Connection refused / error",
+                        duration,
+                        None,
+                        None,
+                    );
+                    let next = check.schedule_next(now);
+                    check.next_check = next;
+                    Ok(CheckStep {
+                        next: Some(next),
+                        event,
+                    })
+                }
+            }
             CheckSubState::HttpConnecting {
                 req_buf,
                 send_offset,
@@ -582,6 +720,24 @@ pub fn step_check(
             }
             CheckSubState::TcpRunning { .. } => {
                 progress_tcp_check(check, fdtab, poller, now, duration)
+            }
+            CheckSubState::RedisRunning { .. } => {
+                progress_redis_check(check, fdtab, poller, now, duration)
+            }
+            CheckSubState::SmtpRunning { .. } => {
+                progress_smtp_check(check, fdtab, poller, now, duration)
+            }
+            CheckSubState::LdapRunning { .. } => {
+                progress_ldap_check(check, fdtab, poller, now, duration)
+            }
+            CheckSubState::MysqlRunning { .. } => {
+                progress_mysql_check(check, fdtab, poller, now, duration)
+            }
+            CheckSubState::PgsqlRunning { .. } => {
+                progress_pgsql_check(check, fdtab, poller, now, duration)
+            }
+            CheckSubState::SslHelloRunning { .. } => {
+                progress_ssl_hello_check(check, fdtab, poller, now, duration)
             }
             CheckSubState::Idle => {
                 cleanup_check_socket(check, fdtab, poller);
@@ -668,6 +824,187 @@ pub fn step_check(
                 check.exp = now.add(timeout_ms);
                 check.in_progress = true;
                 progress_tcp_steps_start(check, &steps, fdtab, poller, now)
+            }
+            ResolvedCheckConfig::Redis => {
+                if let Ok((sock, immediate)) = raw::connect(check.addr) {
+                    let raw_fd = sock.as_raw_fd();
+                    check.check_fd = Some(raw_fd);
+                    let timeout_ms = u32::try_from(check.config.timeout.as_millis()).unwrap_or(u32::MAX);
+                    check.exp = now.add(timeout_ms);
+                    check.in_progress = true;
+                    fdtab.insert(raw_fd, FdState::Conn { task: check.task, conn: 0 }, Interest::WRITE);
+                    let _ = poller.add(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), false, true);
+                    check.sock = Some(sock);
+
+                    if immediate {
+                        check.sub_state = CheckSubState::RedisRunning {
+                            phase: 0,
+                            send_offset: 0,
+                            recv_buf: Vec::new(),
+                        };
+                        progress_redis_check(check, fdtab, poller, now, 0)
+                    } else {
+                        check.sub_state = CheckSubState::ProtoConnecting { target_addr: check.addr };
+                        Ok(CheckStep::pending(Some(check.exp)))
+                    }
+                } else {
+                    let event = check.on_failure_full("L4CON", "Connection refused / error", 0, None, None);
+                    let next = check.schedule_next(now);
+                    check.next_check = next;
+                    Ok(CheckStep { next: Some(next), event })
+                }
+            }
+            ResolvedCheckConfig::Smtp(cmd) => {
+                if let Ok((sock, immediate)) = raw::connect(check.addr) {
+                    let raw_fd = sock.as_raw_fd();
+                    check.check_fd = Some(raw_fd);
+                    let timeout_ms = u32::try_from(check.config.timeout.as_millis()).unwrap_or(u32::MAX);
+                    check.exp = now.add(timeout_ms);
+                    check.in_progress = true;
+                    fdtab.insert(raw_fd, FdState::Conn { task: check.task, conn: 0 }, Interest::READ);
+                    let _ = poller.add(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), true, false);
+                    check.sock = Some(sock);
+
+                    if immediate {
+                        check.sub_state = CheckSubState::SmtpRunning {
+                            phase: 0,
+                            cmd: cmd.unwrap_or_else(|| "HELO localhost".to_string()),
+                            send_offset: 0,
+                            recv_buf: Vec::new(),
+                        };
+                        progress_smtp_check(check, fdtab, poller, now, 0)
+                    } else {
+                        check.sub_state = CheckSubState::ProtoConnecting { target_addr: check.addr };
+                        Ok(CheckStep::pending(Some(check.exp)))
+                    }
+                } else {
+                    let event = check.on_failure_full("L4CON", "Connection refused / error", 0, None, None);
+                    let next = check.schedule_next(now);
+                    check.next_check = next;
+                    Ok(CheckStep { next: Some(next), event })
+                }
+            }
+            ResolvedCheckConfig::Ldap => {
+                if let Ok((sock, immediate)) = raw::connect(check.addr) {
+                    let raw_fd = sock.as_raw_fd();
+                    check.check_fd = Some(raw_fd);
+                    let timeout_ms = u32::try_from(check.config.timeout.as_millis()).unwrap_or(u32::MAX);
+                    check.exp = now.add(timeout_ms);
+                    check.in_progress = true;
+                    fdtab.insert(raw_fd, FdState::Conn { task: check.task, conn: 0 }, Interest::WRITE);
+                    let _ = poller.add(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), false, true);
+                    check.sock = Some(sock);
+
+                    if immediate {
+                        check.sub_state = CheckSubState::LdapRunning {
+                            phase: 0,
+                            send_offset: 0,
+                            recv_buf: Vec::new(),
+                        };
+                        progress_ldap_check(check, fdtab, poller, now, 0)
+                    } else {
+                        check.sub_state = CheckSubState::ProtoConnecting { target_addr: check.addr };
+                        Ok(CheckStep::pending(Some(check.exp)))
+                    }
+                } else {
+                    let event = check.on_failure_full("L4CON", "Connection refused / error", 0, None, None);
+                    let next = check.schedule_next(now);
+                    check.next_check = next;
+                    Ok(CheckStep { next: Some(next), event })
+                }
+            }
+            ResolvedCheckConfig::Mysql { user, version } => {
+                if let Ok((sock, immediate)) = raw::connect(check.addr) {
+                    let raw_fd = sock.as_raw_fd();
+                    check.check_fd = Some(raw_fd);
+                    let timeout_ms = u32::try_from(check.config.timeout.as_millis()).unwrap_or(u32::MAX);
+                    check.exp = now.add(timeout_ms);
+                    check.in_progress = true;
+                    fdtab.insert(raw_fd, FdState::Conn { task: check.task, conn: 0 }, Interest::READ);
+                    let _ = poller.add(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), true, false);
+                    check.sock = Some(sock);
+
+                    if immediate {
+                        check.sub_state = CheckSubState::MysqlRunning {
+                            phase: 0,
+                            user,
+                            version,
+                            server_version: String::new(),
+                            send_offset: 0,
+                            req_buf: Vec::new(),
+                            recv_buf: Vec::new(),
+                        };
+                        progress_mysql_check(check, fdtab, poller, now, 0)
+                    } else {
+                        check.sub_state = CheckSubState::ProtoConnecting { target_addr: check.addr };
+                        Ok(CheckStep::pending(Some(check.exp)))
+                    }
+                } else {
+                    let event = check.on_failure_full("L4CON", "Connection refused / error", 0, None, None);
+                    let next = check.schedule_next(now);
+                    check.next_check = next;
+                    Ok(CheckStep { next: Some(next), event })
+                }
+            }
+            ResolvedCheckConfig::Pgsql { user } => {
+                if let Ok((sock, immediate)) = raw::connect(check.addr) {
+                    let raw_fd = sock.as_raw_fd();
+                    check.check_fd = Some(raw_fd);
+                    let timeout_ms = u32::try_from(check.config.timeout.as_millis()).unwrap_or(u32::MAX);
+                    check.exp = now.add(timeout_ms);
+                    check.in_progress = true;
+                    fdtab.insert(raw_fd, FdState::Conn { task: check.task, conn: 0 }, Interest::WRITE);
+                    let _ = poller.add(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), false, true);
+                    check.sock = Some(sock);
+
+                    if immediate {
+                        check.sub_state = CheckSubState::PgsqlRunning {
+                            phase: 0,
+                            user,
+                            send_offset: 0,
+                            req_buf: Vec::new(),
+                            recv_buf: Vec::new(),
+                        };
+                        progress_pgsql_check(check, fdtab, poller, now, 0)
+                    } else {
+                        check.sub_state = CheckSubState::ProtoConnecting { target_addr: check.addr };
+                        Ok(CheckStep::pending(Some(check.exp)))
+                    }
+                } else {
+                    let event = check.on_failure_full("L4CON", "Connection refused / error", 0, None, None);
+                    let next = check.schedule_next(now);
+                    check.next_check = next;
+                    Ok(CheckStep { next: Some(next), event })
+                }
+            }
+            ResolvedCheckConfig::SslHello => {
+                if let Ok((sock, immediate)) = raw::connect(check.addr) {
+                    let raw_fd = sock.as_raw_fd();
+                    check.check_fd = Some(raw_fd);
+                    let timeout_ms = u32::try_from(check.config.timeout.as_millis()).unwrap_or(u32::MAX);
+                    check.exp = now.add(timeout_ms);
+                    check.in_progress = true;
+                    fdtab.insert(raw_fd, FdState::Conn { task: check.task, conn: 0 }, Interest::WRITE);
+                    let _ = poller.add(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), false, true);
+                    check.sock = Some(sock);
+
+                    if immediate {
+                        check.sub_state = CheckSubState::SslHelloRunning {
+                            phase: 0,
+                            send_offset: 0,
+                            recv_buf: Vec::new(),
+                        };
+                        progress_ssl_hello_check(check, fdtab, poller, now, 0)
+                    } else {
+                        check.sub_state = CheckSubState::ProtoConnecting { target_addr: check.addr };
+                        Ok(CheckStep::pending(Some(check.exp)))
+                    }
+                } else {
+                    let event = check.on_failure_full("L4CON", "Connection refused / error", 0, None, None);
+                    let next = check.schedule_next(now);
+                    check.next_check = next;
+                    Ok(CheckStep { next: Some(next), event })
+                }
             }
             ResolvedCheckConfig::TcpConnect => {
                 check.sub_state = CheckSubState::TcpConnecting;
@@ -1311,4 +1648,1479 @@ pub fn cleanup_check_socket(check: &mut ServerCheckState, fdtab: &mut FdTab, pol
     check.in_progress = false;
     check.exp = Tick::ETERNITY;
     check.sub_state = CheckSubState::Idle;
+}
+
+#[allow(clippy::too_many_lines, clippy::unnecessary_wraps)]
+fn progress_redis_check(
+    check: &mut ServerCheckState,
+    fdtab: &mut FdTab,
+    poller: &mut Poller,
+    now: Tick,
+    duration: u32,
+) -> io::Result<CheckStep> {
+    let Some(raw_fd) = check.check_fd else {
+        cleanup_check_socket(check, fdtab, poller);
+        let next = check.schedule_next(now);
+        return Ok(CheckStep::pending(Some(next)));
+    };
+    let Some(sock) = check.sock.as_ref() else {
+        cleanup_check_socket(check, fdtab, poller);
+        let next = check.schedule_next(now);
+        return Ok(CheckStep::pending(Some(next)));
+    };
+
+    let CheckSubState::RedisRunning {
+        mut phase,
+        mut send_offset,
+        mut recv_buf,
+    } = check.sub_state.clone()
+    else {
+        cleanup_check_socket(check, fdtab, poller);
+        let next = check.schedule_next(now);
+        return Ok(CheckStep::pending(Some(next)));
+    };
+
+    eprintln!("[DEBUG_CHECK] progress_redis_check: phase={phase}, check.addr={:?}, duration={duration}", check.addr);
+    if phase == 0 {
+        let ping_req = b"*1\r\n$4\r\nPING\r\n";
+        while send_offset < ping_req.len() {
+            match raw::send(sock.as_fd(), &ping_req[send_offset..]) {
+                Ok(Io::Done(n)) => {
+                    send_offset += n;
+                }
+                Ok(Io::WouldBlock) => {
+                    fdtab.clear_ready(raw_fd, false, true);
+                    check.sub_state = CheckSubState::RedisRunning {
+                        phase,
+                        send_offset,
+                        recv_buf,
+                    };
+                    return Ok(CheckStep::pending(Some(check.exp)));
+                }
+                Ok(Io::Closed | Io::Eof) | Err(_) => {
+                    cleanup_check_socket(check, fdtab, poller);
+                    let event = check.on_failure_full(
+                        "L7RSP",
+                        "Layer7 invalid response",
+                        duration,
+                        None,
+                        None,
+                    );
+                    let next = check.schedule_next(now);
+                    check.next_check = next;
+                    return Ok(CheckStep {
+                        next: Some(next),
+                        event,
+                    });
+                }
+            }
+        }
+        phase = 1;
+        send_offset = 0;
+        fdtab.set_interest(raw_fd, Interest::READ);
+        let _ = poller.modify(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), true, false);
+    }
+
+    if phase == 1 {
+        let mut buf = [0u8; 4096];
+        let mut eof = false;
+        loop {
+            match raw::recv(sock.as_fd(), &mut buf) {
+                Ok(Io::Done(n)) => {
+                    recv_buf.extend_from_slice(&buf[..n]);
+                }
+                Ok(Io::WouldBlock) => break,
+                Ok(Io::Eof | Io::Closed) | Err(_) => {
+                    eof = true;
+                    break;
+                }
+            }
+        }
+
+        let has_crlf = recv_buf.windows(2).any(|w| w == b"\r\n");
+        eprintln!("[DEBUG_CHECK_PHASE1] recv_buf={:?} eof={} has_crlf={}", recv_buf, eof, has_crlf);
+        if !has_crlf && !eof {
+            fdtab.clear_ready(raw_fd, true, false);
+            check.sub_state = CheckSubState::RedisRunning {
+                phase,
+                send_offset,
+                recv_buf,
+            };
+            return Ok(CheckStep::pending(Some(check.exp)));
+        }
+
+        cleanup_check_socket(check, fdtab, poller);
+        let resp_str = String::from_utf8_lossy(&recv_buf)
+            .trim_end_matches(&['\r', '\n'][..])
+            .to_string();
+        let event = if resp_str.starts_with("+PONG") {
+            check.on_success_full(
+                "L7OK",
+                "Layer7 check passed",
+                duration,
+                None,
+                Some("Redis server is ok".to_string()),
+            )
+        } else if resp_str.starts_with('-') {
+            check.on_failure_full(
+                "L7STS",
+                "Layer7 wrong status",
+                duration,
+                None,
+                Some(resp_str),
+            )
+        } else {
+            check.on_failure_full(
+                "L7RSP",
+                "Layer7 invalid response",
+                duration,
+                None,
+                Some(resp_str),
+            )
+        };
+        let next = check.schedule_next(now);
+        check.next_check = next;
+        return Ok(CheckStep {
+            next: Some(next),
+            event,
+        });
+    }
+
+    cleanup_check_socket(check, fdtab, poller);
+    let next = check.schedule_next(now);
+    Ok(CheckStep::pending(Some(next)))
+}
+
+#[allow(clippy::too_many_lines, clippy::unnecessary_wraps)]
+fn progress_smtp_check(
+    check: &mut ServerCheckState,
+    fdtab: &mut FdTab,
+    poller: &mut Poller,
+    now: Tick,
+    duration: u32,
+) -> io::Result<CheckStep> {
+    let Some(raw_fd) = check.check_fd else {
+        cleanup_check_socket(check, fdtab, poller);
+        let next = check.schedule_next(now);
+        return Ok(CheckStep::pending(Some(next)));
+    };
+    let Some(sock) = check.sock.as_ref() else {
+        cleanup_check_socket(check, fdtab, poller);
+        let next = check.schedule_next(now);
+        return Ok(CheckStep::pending(Some(next)));
+    };
+
+    let CheckSubState::SmtpRunning {
+        mut phase,
+        cmd,
+        mut send_offset,
+        mut recv_buf,
+    } = check.sub_state.clone()
+    else {
+        cleanup_check_socket(check, fdtab, poller);
+        let next = check.schedule_next(now);
+        return Ok(CheckStep::pending(Some(next)));
+    };
+
+    let find_crlf = |b: &[u8]| b.windows(2).position(|w| w == b"\r\n");
+
+    if phase == 0 {
+        fdtab.set_interest(raw_fd, Interest::READ);
+        let _ = poller.modify(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), true, false);
+
+        let mut buf = [0u8; 4096];
+        let mut eof = false;
+        loop {
+            match raw::recv(sock.as_fd(), &mut buf) {
+                Ok(Io::Done(n)) => {
+                    recv_buf.extend_from_slice(&buf[..n]);
+                }
+                Ok(Io::WouldBlock) => break,
+                Ok(Io::Eof | Io::Closed) | Err(_) => {
+                    eof = true;
+                    break;
+                }
+            }
+        }
+
+        if find_crlf(&recv_buf).is_none() && !eof {
+            fdtab.clear_ready(raw_fd, true, false);
+            check.sub_state = CheckSubState::SmtpRunning {
+                phase,
+                cmd,
+                send_offset,
+                recv_buf,
+            };
+            return Ok(CheckStep::pending(Some(check.exp)));
+        }
+
+        let line = String::from_utf8_lossy(&recv_buf)
+            .trim_end_matches(&['\r', '\n'][..])
+            .to_string();
+        let code_res = line.get(0..3).and_then(|s| s.parse::<u16>().ok());
+        match code_res {
+            Some(code) if (200..300).contains(&code) => {
+                phase = 1;
+                send_offset = 0;
+                recv_buf.clear();
+                fdtab.set_interest(raw_fd, Interest::WRITE);
+                let _ = poller.modify(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), false, true);
+            }
+            Some(code) => {
+                cleanup_check_socket(check, fdtab, poller);
+                let info = line.get(4..).unwrap_or("").trim().to_string();
+                let event = check.on_failure_full(
+                    "L7STS",
+                    "Layer7 wrong status",
+                    duration,
+                    Some(code),
+                    if info.is_empty() { None } else { Some(info) },
+                );
+                let next = check.schedule_next(now);
+                check.next_check = next;
+                return Ok(CheckStep {
+                    next: Some(next),
+                    event,
+                });
+            }
+            None => {
+                cleanup_check_socket(check, fdtab, poller);
+                let info = line.trim().to_string();
+                let event = check.on_failure_full(
+                    "L7RSP",
+                    "Layer7 invalid response",
+                    duration,
+                    None,
+                    if info.is_empty() { None } else { Some(info) },
+                );
+                let next = check.schedule_next(now);
+                check.next_check = next;
+                return Ok(CheckStep {
+                    next: Some(next),
+                    event,
+                });
+            }
+        }
+    }
+
+    if phase == 1 {
+        let req_bytes = format!("{cmd}\r\n").into_bytes();
+        while send_offset < req_bytes.len() {
+            match raw::send(sock.as_fd(), &req_bytes[send_offset..]) {
+                Ok(Io::Done(n)) => {
+                    send_offset += n;
+                }
+                Ok(Io::WouldBlock) => {
+                    fdtab.clear_ready(raw_fd, false, true);
+                    check.sub_state = CheckSubState::SmtpRunning {
+                        phase,
+                        cmd,
+                        send_offset,
+                        recv_buf,
+                    };
+                    return Ok(CheckStep::pending(Some(check.exp)));
+                }
+                Ok(Io::Closed | Io::Eof) | Err(_) => {
+                    cleanup_check_socket(check, fdtab, poller);
+                    let event = check.on_failure_full(
+                        "L7RSP",
+                        "Layer7 invalid response",
+                        duration,
+                        None,
+                        None,
+                    );
+                    let next = check.schedule_next(now);
+                    check.next_check = next;
+                    return Ok(CheckStep {
+                        next: Some(next),
+                        event,
+                    });
+                }
+            }
+        }
+        phase = 2;
+        send_offset = 0;
+        recv_buf.clear();
+        fdtab.set_interest(raw_fd, Interest::READ);
+        let _ = poller.modify(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), true, false);
+    }
+
+    if phase == 2 {
+        let mut buf = [0u8; 4096];
+        let mut eof = false;
+        loop {
+            match raw::recv(sock.as_fd(), &mut buf) {
+                Ok(Io::Done(n)) => {
+                    recv_buf.extend_from_slice(&buf[..n]);
+                }
+                Ok(Io::WouldBlock) => break,
+                Ok(Io::Eof | Io::Closed) | Err(_) => {
+                    eof = true;
+                    break;
+                }
+            }
+        }
+
+        let resp_str = String::from_utf8_lossy(&recv_buf);
+        let mut completed = false;
+        let mut last_code = None;
+        let mut last_info = None;
+
+        for line in resp_str.lines() {
+            if line.len() >= 3
+                && line.as_bytes()[0].is_ascii_digit()
+                && line.as_bytes()[1].is_ascii_digit()
+                && line.as_bytes()[2].is_ascii_digit()
+            {
+                let code = line[0..3].parse::<u16>().ok();
+                if line.len() == 3 || line.as_bytes().get(3) == Some(&b' ') {
+                    completed = true;
+                    last_code = code;
+                    last_info = Some(line.get(4..).unwrap_or("").trim().to_string());
+                }
+            }
+        }
+
+        if !completed && !eof {
+            fdtab.clear_ready(raw_fd, true, false);
+            check.sub_state = CheckSubState::SmtpRunning {
+                phase,
+                cmd,
+                send_offset,
+                recv_buf,
+            };
+            return Ok(CheckStep::pending(Some(check.exp)));
+        }
+
+        match last_code {
+            Some(code) if (200..300).contains(&code) => {
+                phase = 3;
+                send_offset = 0;
+                recv_buf.clear();
+                fdtab.set_interest(raw_fd, Interest::WRITE);
+                let _ = poller.modify(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), false, true);
+            }
+            Some(code) => {
+                cleanup_check_socket(check, fdtab, poller);
+                let event = check.on_failure_full(
+                    "L7STS",
+                    "Layer7 wrong status",
+                    duration,
+                    Some(code),
+                    last_info,
+                );
+                let next = check.schedule_next(now);
+                check.next_check = next;
+                return Ok(CheckStep {
+                    next: Some(next),
+                    event,
+                });
+            }
+            None => {
+                cleanup_check_socket(check, fdtab, poller);
+                let info = resp_str.trim().to_string();
+                let event = check.on_failure_full(
+                    "L7RSP",
+                    "Layer7 invalid response",
+                    duration,
+                    None,
+                    if info.is_empty() { None } else { Some(info) },
+                );
+                let next = check.schedule_next(now);
+                check.next_check = next;
+                return Ok(CheckStep {
+                    next: Some(next),
+                    event,
+                });
+            }
+        }
+    }
+
+    if phase == 3 {
+        let quit_req = b"QUIT\r\n";
+        while send_offset < quit_req.len() {
+            match raw::send(sock.as_fd(), &quit_req[send_offset..]) {
+                Ok(Io::Done(n)) => {
+                    send_offset += n;
+                }
+                Ok(Io::WouldBlock) => {
+                    fdtab.clear_ready(raw_fd, false, true);
+                    check.sub_state = CheckSubState::SmtpRunning {
+                        phase,
+                        cmd,
+                        send_offset,
+                        recv_buf,
+                    };
+                    return Ok(CheckStep::pending(Some(check.exp)));
+                }
+                Ok(Io::Closed | Io::Eof) | Err(_) => {
+                    cleanup_check_socket(check, fdtab, poller);
+                    let event = check.on_failure_full(
+                        "L7RSP",
+                        "Layer7 invalid response",
+                        duration,
+                        None,
+                        None,
+                    );
+                    let next = check.schedule_next(now);
+                    check.next_check = next;
+                    return Ok(CheckStep {
+                        next: Some(next),
+                        event,
+                    });
+                }
+            }
+        }
+        phase = 4;
+        send_offset = 0;
+        recv_buf.clear();
+        fdtab.set_interest(raw_fd, Interest::READ);
+        let _ = poller.modify(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), true, false);
+    }
+
+    if phase == 4 {
+        let mut buf = [0u8; 4096];
+        let mut eof = false;
+        loop {
+            match raw::recv(sock.as_fd(), &mut buf) {
+                Ok(Io::Done(n)) => {
+                    recv_buf.extend_from_slice(&buf[..n]);
+                }
+                Ok(Io::WouldBlock) => break,
+                Ok(Io::Eof | Io::Closed) | Err(_) => {
+                    eof = true;
+                    break;
+                }
+            }
+        }
+
+        if find_crlf(&recv_buf).is_none() && !eof {
+            fdtab.clear_ready(raw_fd, true, false);
+            check.sub_state = CheckSubState::SmtpRunning {
+                phase,
+                cmd,
+                send_offset,
+                recv_buf,
+            };
+            return Ok(CheckStep::pending(Some(check.exp)));
+        }
+
+        cleanup_check_socket(check, fdtab, poller);
+        let line = String::from_utf8_lossy(&recv_buf)
+            .trim_end_matches(&['\r', '\n'][..])
+            .to_string();
+        let code_res = line.get(0..3).and_then(|s| s.parse::<u16>().ok());
+        let event = match code_res {
+            Some(code) if (200..300).contains(&code) => {
+                let info = line.get(4..).unwrap_or("").trim().to_string();
+                check.on_success_full(
+                    "L7OK",
+                    "Layer7 check passed",
+                    duration,
+                    Some(code),
+                    if info.is_empty() { None } else { Some(info) },
+                )
+            }
+            Some(code) => {
+                let info = line.get(4..).unwrap_or("").trim().to_string();
+                check.on_failure_full(
+                    "L7STS",
+                    "Layer7 wrong status",
+                    duration,
+                    Some(code),
+                    if info.is_empty() { None } else { Some(info) },
+                )
+            }
+            None => check.on_failure_full(
+                "L7RSP",
+                "Layer7 invalid response",
+                duration,
+                None,
+                Some(line),
+            ),
+        };
+        let next = check.schedule_next(now);
+        check.next_check = next;
+        return Ok(CheckStep {
+            next: Some(next),
+            event,
+        });
+    }
+
+    cleanup_check_socket(check, fdtab, poller);
+    let next = check.schedule_next(now);
+    Ok(CheckStep::pending(Some(next)))
+}
+
+#[allow(clippy::too_many_lines, clippy::unnecessary_wraps)]
+fn progress_ldap_check(
+    check: &mut ServerCheckState,
+    fdtab: &mut FdTab,
+    poller: &mut Poller,
+    now: Tick,
+    duration: u32,
+) -> io::Result<CheckStep> {
+    let Some(raw_fd) = check.check_fd else {
+        cleanup_check_socket(check, fdtab, poller);
+        let next = check.schedule_next(now);
+        return Ok(CheckStep::pending(Some(next)));
+    };
+    let Some(sock) = check.sock.as_ref() else {
+        cleanup_check_socket(check, fdtab, poller);
+        let next = check.schedule_next(now);
+        return Ok(CheckStep::pending(Some(next)));
+    };
+
+    let CheckSubState::LdapRunning {
+        mut phase,
+        mut send_offset,
+        mut recv_buf,
+    } = check.sub_state.clone()
+    else {
+        cleanup_check_socket(check, fdtab, poller);
+        let next = check.schedule_next(now);
+        return Ok(CheckStep::pending(Some(next)));
+    };
+
+    if phase == 0 {
+        let ldap_req: [u8; 14] = [
+            0x30, 0x0c, 0x02, 0x01, 0x01, 0x60, 0x07, 0x02, 0x01, 0x03, 0x04, 0x00, 0x80, 0x00,
+        ];
+        while send_offset < ldap_req.len() {
+            match raw::send(sock.as_fd(), &ldap_req[send_offset..]) {
+                Ok(Io::Done(n)) => {
+                    send_offset += n;
+                }
+                Ok(Io::WouldBlock) => {
+                    fdtab.clear_ready(raw_fd, false, true);
+                    check.sub_state = CheckSubState::LdapRunning {
+                        phase,
+                        send_offset,
+                        recv_buf,
+                    };
+                    return Ok(CheckStep::pending(Some(check.exp)));
+                }
+                Ok(Io::Closed | Io::Eof) | Err(_) => {
+                    cleanup_check_socket(check, fdtab, poller);
+                    let event = check.on_failure_full(
+                        "L7RSP",
+                        "Layer7 invalid response",
+                        duration,
+                        None,
+                        None,
+                    );
+                    let next = check.schedule_next(now);
+                    check.next_check = next;
+                    return Ok(CheckStep {
+                        next: Some(next),
+                        event,
+                    });
+                }
+            }
+        }
+        phase = 1;
+        send_offset = 0;
+        recv_buf.clear();
+        fdtab.set_interest(raw_fd, Interest::READ);
+        let _ = poller.modify(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), true, false);
+    }
+
+    if phase == 1 {
+        let mut buf = [0u8; 4096];
+        let mut eof = false;
+        loop {
+            match raw::recv(sock.as_fd(), &mut buf) {
+                Ok(Io::Done(n)) => {
+                    recv_buf.extend_from_slice(&buf[..n]);
+                }
+                Ok(Io::WouldBlock) => break,
+                Ok(Io::Eof | Io::Closed) | Err(_) => {
+                    eof = true;
+                    break;
+                }
+            }
+        }
+
+        if recv_buf.is_empty() && !eof {
+            fdtab.clear_ready(raw_fd, true, false);
+            check.sub_state = CheckSubState::LdapRunning {
+                phase,
+                send_offset,
+                recv_buf,
+            };
+            return Ok(CheckStep::pending(Some(check.exp)));
+        }
+
+        if recv_buf.first() != Some(&0x30) {
+            cleanup_check_socket(check, fdtab, poller);
+            let event = check.on_failure_full(
+                "L7RSP",
+                "Layer7 invalid response",
+                duration,
+                None,
+                Some("Not LDAPv3 protocol".to_string()),
+            );
+            let next = check.schedule_next(now);
+            check.next_check = next;
+            return Ok(CheckStep {
+                next: Some(next),
+                event,
+            });
+        }
+
+        if recv_buf.len() < 2 {
+            if !eof {
+                fdtab.clear_ready(raw_fd, true, false);
+                check.sub_state = CheckSubState::LdapRunning {
+                    phase,
+                    send_offset,
+                    recv_buf,
+                };
+                return Ok(CheckStep::pending(Some(check.exp)));
+            }
+        }
+
+        let mut ptr = 1;
+        let msglen: usize;
+        if recv_buf[ptr] & 0x80 != 0 {
+            let nbytes = (recv_buf[ptr] & 0x7f) as usize;
+            ptr += 1;
+            if recv_buf.len() < ptr + nbytes {
+                if !eof {
+                    fdtab.clear_ready(raw_fd, true, false);
+                    check.sub_state = CheckSubState::LdapRunning {
+                        phase,
+                        send_offset,
+                        recv_buf,
+                    };
+                    return Ok(CheckStep::pending(Some(check.exp)));
+                }
+            }
+            if nbytes == 4 && recv_buf.len() >= ptr + 4 {
+                msglen = u32::from_be_bytes([
+                    recv_buf[ptr],
+                    recv_buf[ptr + 1],
+                    recv_buf[ptr + 2],
+                    recv_buf[ptr + 3],
+                ]) as usize;
+            } else if nbytes == 2 && recv_buf.len() >= ptr + 2 {
+                msglen = u16::from_be_bytes([recv_buf[ptr], recv_buf[ptr + 1]]) as usize;
+            } else if nbytes == 1 && recv_buf.len() >= ptr + 1 {
+                msglen = recv_buf[ptr] as usize;
+            } else {
+                cleanup_check_socket(check, fdtab, poller);
+                let event = check.on_failure_full(
+                    "L7RSP",
+                    "Layer7 invalid response",
+                    duration,
+                    None,
+                    Some("Not LDAPv3 protocol".to_string()),
+                );
+                let next = check.schedule_next(now);
+                check.next_check = next;
+                return Ok(CheckStep {
+                    next: Some(next),
+                    event,
+                });
+            }
+            ptr += nbytes;
+        } else {
+            msglen = recv_buf[ptr] as usize;
+            ptr += 1;
+        }
+
+        if recv_buf.len() < ptr + msglen && !eof {
+            fdtab.clear_ready(raw_fd, true, false);
+            check.sub_state = CheckSubState::LdapRunning {
+                phase,
+                send_offset,
+                recv_buf,
+            };
+            return Ok(CheckStep::pending(Some(check.exp)));
+        }
+
+        if recv_buf.len() < ptr + 4 || &recv_buf[ptr..ptr + 4] != &[0x02, 0x01, 0x01, 0x61] {
+            cleanup_check_socket(check, fdtab, poller);
+            let event = check.on_failure_full(
+                "L7RSP",
+                "Layer7 invalid response",
+                duration,
+                None,
+                Some("Not LDAPv3 protocol".to_string()),
+            );
+            let next = check.schedule_next(now);
+            check.next_check = next;
+            return Ok(CheckStep {
+                next: Some(next),
+                event,
+            });
+        }
+        ptr += 4;
+
+        if ptr >= recv_buf.len() {
+            if !eof {
+                fdtab.clear_ready(raw_fd, true, false);
+                check.sub_state = CheckSubState::LdapRunning {
+                    phase,
+                    send_offset,
+                    recv_buf,
+                };
+                return Ok(CheckStep::pending(Some(check.exp)));
+            }
+        }
+        if recv_buf[ptr] & 0x80 != 0 {
+            let nbytes = (recv_buf[ptr] & 0x7f) as usize;
+            ptr += 1 + nbytes;
+        } else {
+            ptr += 1;
+        }
+
+        if recv_buf.len() < ptr + 3 || &recv_buf[ptr..ptr + 2] != &[0x0a, 0x01] {
+            cleanup_check_socket(check, fdtab, poller);
+            let event = check.on_failure_full(
+                "L7RSP",
+                "Layer7 invalid response",
+                duration,
+                None,
+                Some("Not LDAPv3 protocol".to_string()),
+            );
+            let next = check.schedule_next(now);
+            check.next_check = next;
+            return Ok(CheckStep {
+                next: Some(next),
+                event,
+            });
+        }
+        ptr += 2;
+        let result_code = recv_buf[ptr];
+
+        cleanup_check_socket(check, fdtab, poller);
+        let event = if result_code == 0 {
+            check.on_success_full(
+                "L7OK",
+                "Layer7 check passed",
+                duration,
+                None,
+                Some("Success".to_string()),
+            )
+        } else {
+            check.on_failure_full(
+                "L7STS",
+                "Layer7 wrong status",
+                duration,
+                Some(u16::from(result_code)),
+                Some("See RFC: http://tools.ietf.org/html/rfc4511#section-4.1.9".to_string()),
+            )
+        };
+        let next = check.schedule_next(now);
+        check.next_check = next;
+        return Ok(CheckStep {
+            next: Some(next),
+            event,
+        });
+    }
+
+    cleanup_check_socket(check, fdtab, poller);
+    let next = check.schedule_next(now);
+    Ok(CheckStep::pending(Some(next)))
+}
+
+#[allow(clippy::too_many_lines, clippy::unnecessary_wraps)]
+fn progress_mysql_check(
+    check: &mut ServerCheckState,
+    fdtab: &mut FdTab,
+    poller: &mut Poller,
+    now: Tick,
+    duration: u32,
+) -> io::Result<CheckStep> {
+    let Some(raw_fd) = check.check_fd else {
+        cleanup_check_socket(check, fdtab, poller);
+        let next = check.schedule_next(now);
+        return Ok(CheckStep::pending(Some(next)));
+    };
+    let Some(sock) = check.sock.as_ref() else {
+        cleanup_check_socket(check, fdtab, poller);
+        let next = check.schedule_next(now);
+        return Ok(CheckStep::pending(Some(next)));
+    };
+
+    let CheckSubState::MysqlRunning {
+        mut phase,
+        user,
+        version,
+        mut server_version,
+        mut send_offset,
+        mut req_buf,
+        mut recv_buf,
+    } = check.sub_state.clone()
+    else {
+        cleanup_check_socket(check, fdtab, poller);
+        let next = check.schedule_next(now);
+        return Ok(CheckStep::pending(Some(next)));
+    };
+
+    if phase == 0 {
+        fdtab.set_interest(raw_fd, Interest::READ);
+        let _ = poller.modify(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), true, false);
+
+        let mut buf = [0u8; 4096];
+        let mut eof = false;
+        loop {
+            match raw::recv(sock.as_fd(), &mut buf) {
+                Ok(Io::Done(n)) => {
+                    recv_buf.extend_from_slice(&buf[..n]);
+                }
+                Ok(Io::WouldBlock) => break,
+                Ok(Io::Eof | Io::Closed) | Err(_) => {
+                    eof = true;
+                    break;
+                }
+            }
+        }
+
+        if recv_buf.len() < 4 {
+            if !eof {
+                fdtab.clear_ready(raw_fd, true, false);
+                check.sub_state = CheckSubState::MysqlRunning {
+                    phase,
+                    user,
+                    version,
+                    server_version,
+                    send_offset,
+                    req_buf,
+                    recv_buf,
+                };
+                return Ok(CheckStep::pending(Some(check.exp)));
+            }
+            cleanup_check_socket(check, fdtab, poller);
+            let event = check.on_failure_full(
+                "L7RSP",
+                "Layer7 invalid response",
+                duration,
+                None,
+                None,
+            );
+            let next = check.schedule_next(now);
+            check.next_check = next;
+            return Ok(CheckStep {
+                next: Some(next),
+                event,
+            });
+        }
+
+        let plen = recv_buf[0] as usize
+            | ((recv_buf[1] as usize) << 8)
+            | ((recv_buf[2] as usize) << 16);
+        if recv_buf.len() < 4 + plen && !eof {
+            fdtab.clear_ready(raw_fd, true, false);
+            check.sub_state = CheckSubState::MysqlRunning {
+                phase,
+                user,
+                version,
+                server_version,
+                send_offset,
+                req_buf,
+                recv_buf,
+            };
+            return Ok(CheckStep::pending(Some(check.exp)));
+        }
+
+        if recv_buf.len() < 5 {
+            cleanup_check_socket(check, fdtab, poller);
+            let event = check.on_failure_full(
+                "L7RSP",
+                "Layer7 invalid response",
+                duration,
+                None,
+                None,
+            );
+            let next = check.schedule_next(now);
+            check.next_check = next;
+            return Ok(CheckStep {
+                next: Some(next),
+                event,
+            });
+        }
+
+        let srv_ver_bytes = &recv_buf[5..];
+        let null_pos = srv_ver_bytes
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(srv_ver_bytes.len());
+        server_version = String::from_utf8_lossy(&srv_ver_bytes[..null_pos]).to_string();
+
+        if let Some(ref username) = user {
+            let ubytes = username.as_bytes();
+            let mut pkt = Vec::new();
+            match version {
+                MysqlCheckVersion::Pre41 => {
+                    let packetlen = ubytes.len() + 7;
+                    pkt.extend_from_slice(&[
+                        (packetlen & 0xff) as u8,
+                        ((packetlen >> 8) & 0xff) as u8,
+                        ((packetlen >> 16) & 0xff) as u8,
+                        1,
+                        0x00,
+                        0x80,
+                        0x00,
+                        0x00,
+                        0x01,
+                    ]);
+                    pkt.extend_from_slice(ubytes);
+                    pkt.push(0);
+                    pkt.push(0);
+                    pkt.extend_from_slice(&[0x01, 0x00, 0x00, 0x00, 0x01]);
+                }
+                MysqlCheckVersion::Post41 => {
+                    let packetlen = ubytes.len() + 7 + 27;
+                    pkt.extend_from_slice(&[
+                        (packetlen & 0xff) as u8,
+                        ((packetlen >> 8) & 0xff) as u8,
+                        ((packetlen >> 16) & 0xff) as u8,
+                        1,
+                        0x00,
+                        0x82,
+                        0x00,
+                        0x00,
+                        0x00,
+                        0x80,
+                        0x00,
+                        0x01,
+                        0x21,
+                    ]);
+                    pkt.extend_from_slice(&[0u8; 23]);
+                    pkt.extend_from_slice(ubytes);
+                    pkt.push(0);
+                    pkt.push(0);
+                    pkt.extend_from_slice(&[0x01, 0x00, 0x00, 0x00, 0x01]);
+                }
+                MysqlCheckVersion::Post80 => {
+                    let packetlen = ubytes.len() + 7 + 27 + 22;
+                    pkt.extend_from_slice(&[
+                        (packetlen & 0xff) as u8,
+                        ((packetlen >> 8) & 0xff) as u8,
+                        ((packetlen >> 16) & 0xff) as u8,
+                        1,
+                        0x00,
+                        0x82,
+                        0x08,
+                        0x00,
+                        0x00,
+                        0x80,
+                        0x00,
+                        0x01,
+                        0x21,
+                    ]);
+                    pkt.extend_from_slice(&[0u8; 23]);
+                    pkt.extend_from_slice(ubytes);
+                    pkt.push(0);
+                    pkt.push(0);
+                    pkt.extend_from_slice(b"mysql_native_password\0");
+                    pkt.extend_from_slice(&[0x01, 0x00, 0x00, 0x00, 0x01]);
+                }
+            }
+
+            req_buf = pkt;
+            phase = 1;
+            send_offset = 0;
+            recv_buf.clear();
+            fdtab.set_interest(raw_fd, Interest::WRITE);
+            let _ = poller.modify(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), false, true);
+        } else {
+            cleanup_check_socket(check, fdtab, poller);
+            let event = check.on_success_full(
+                "L7OK",
+                "Layer7 check passed",
+                duration,
+                None,
+                Some(server_version),
+            );
+            let next = check.schedule_next(now);
+            check.next_check = next;
+            return Ok(CheckStep {
+                next: Some(next),
+                event,
+            });
+        }
+    }
+
+    if phase == 1 {
+        while send_offset < req_buf.len() {
+            match raw::send(sock.as_fd(), &req_buf[send_offset..]) {
+                Ok(Io::Done(n)) => {
+                    send_offset += n;
+                }
+                Ok(Io::WouldBlock) => {
+                    fdtab.clear_ready(raw_fd, false, true);
+                    check.sub_state = CheckSubState::MysqlRunning {
+                        phase,
+                        user,
+                        version,
+                        server_version,
+                        send_offset,
+                        req_buf,
+                        recv_buf,
+                    };
+                    return Ok(CheckStep::pending(Some(check.exp)));
+                }
+                Ok(Io::Closed | Io::Eof) | Err(_) => {
+                    cleanup_check_socket(check, fdtab, poller);
+                    let event = check.on_failure_full(
+                        "L7RSP",
+                        "Layer7 invalid response",
+                        duration,
+                        None,
+                        None,
+                    );
+                    let next = check.schedule_next(now);
+                    check.next_check = next;
+                    return Ok(CheckStep {
+                        next: Some(next),
+                        event,
+                    });
+                }
+            }
+        }
+        phase = 2;
+        send_offset = 0;
+        recv_buf.clear();
+        fdtab.set_interest(raw_fd, Interest::READ);
+        let _ = poller.modify(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), true, false);
+    }
+
+    if phase == 2 {
+        let mut buf = [0u8; 4096];
+        let mut eof = false;
+        loop {
+            match raw::recv(sock.as_fd(), &mut buf) {
+                Ok(Io::Done(n)) => {
+                    recv_buf.extend_from_slice(&buf[..n]);
+                }
+                Ok(Io::WouldBlock) => break,
+                Ok(Io::Eof | Io::Closed) | Err(_) => {
+                    eof = true;
+                    break;
+                }
+            }
+        }
+
+        if recv_buf.len() < 4 && !eof {
+            fdtab.clear_ready(raw_fd, true, false);
+            check.sub_state = CheckSubState::MysqlRunning {
+                phase,
+                user,
+                version,
+                server_version,
+                send_offset,
+                req_buf,
+                recv_buf,
+            };
+            return Ok(CheckStep::pending(Some(check.exp)));
+        }
+
+        if recv_buf.len() < 5 {
+            cleanup_check_socket(check, fdtab, poller);
+            let event = check.on_failure_full(
+                "L7RSP",
+                "Layer7 invalid response",
+                duration,
+                None,
+                None,
+            );
+            let next = check.schedule_next(now);
+            check.next_check = next;
+            return Ok(CheckStep {
+                next: Some(next),
+                event,
+            });
+        }
+
+        let plen = recv_buf[0] as usize
+            | ((recv_buf[1] as usize) << 8)
+            | ((recv_buf[2] as usize) << 16);
+        if recv_buf.len() < 4 + plen && !eof {
+            fdtab.clear_ready(raw_fd, true, false);
+            check.sub_state = CheckSubState::MysqlRunning {
+                phase,
+                user,
+                version,
+                server_version,
+                send_offset,
+                req_buf,
+                recv_buf,
+            };
+            return Ok(CheckStep::pending(Some(check.exp)));
+        }
+
+        let packet_type = recv_buf[4];
+        cleanup_check_socket(check, fdtab, poller);
+        let event = if packet_type == 0xff {
+            let err_code = if recv_buf.len() >= 7 {
+                recv_buf[5] as u16 | ((recv_buf[6] as u16) << 8)
+            } else {
+                0
+            };
+            let mut msg_offset = 7;
+            if recv_buf.len() > msg_offset && recv_buf[msg_offset] == b'#' {
+                msg_offset += 6;
+            }
+            let err_msg = if recv_buf.len() > msg_offset {
+                String::from_utf8_lossy(&recv_buf[msg_offset..])
+                    .trim_end_matches(&['\r', '\n', '\0'][..])
+                    .to_string()
+            } else {
+                String::new()
+            };
+            check.on_failure_full(
+                "L7STS",
+                "Layer7 wrong status",
+                duration,
+                Some(err_code),
+                Some(err_msg),
+            )
+        } else {
+            check.on_success_full(
+                "L7OK",
+                "Layer7 check passed",
+                duration,
+                None,
+                Some(server_version),
+            )
+        };
+        let next = check.schedule_next(now);
+        check.next_check = next;
+        return Ok(CheckStep {
+            next: Some(next),
+            event,
+        });
+    }
+
+    cleanup_check_socket(check, fdtab, poller);
+    let next = check.schedule_next(now);
+    Ok(CheckStep::pending(Some(next)))
+}
+
+#[allow(clippy::too_many_lines, clippy::unnecessary_wraps)]
+fn progress_pgsql_check(
+    check: &mut ServerCheckState,
+    fdtab: &mut FdTab,
+    poller: &mut Poller,
+    now: Tick,
+    duration: u32,
+) -> io::Result<CheckStep> {
+    let Some(raw_fd) = check.check_fd else {
+        cleanup_check_socket(check, fdtab, poller);
+        let next = check.schedule_next(now);
+        return Ok(CheckStep::pending(Some(next)));
+    };
+    let Some(sock) = check.sock.as_ref() else {
+        cleanup_check_socket(check, fdtab, poller);
+        let next = check.schedule_next(now);
+        return Ok(CheckStep::pending(Some(next)));
+    };
+
+    let CheckSubState::PgsqlRunning {
+        mut phase,
+        user,
+        mut send_offset,
+        mut req_buf,
+        mut recv_buf,
+    } = check.sub_state.clone()
+    else {
+        cleanup_check_socket(check, fdtab, poller);
+        let next = check.schedule_next(now);
+        return Ok(CheckStep::pending(Some(next)));
+    };
+
+    if phase == 0 {
+        if req_buf.is_empty() {
+            let ubytes = user.as_bytes();
+            let packetlen = (4 + 4 + 5 + ubytes.len() + 1 + 1) as u32;
+            req_buf.extend_from_slice(&packetlen.to_be_bytes());
+            req_buf.extend_from_slice(&[0x00, 0x03, 0x00, 0x00]);
+            req_buf.extend_from_slice(b"user\0");
+            req_buf.extend_from_slice(ubytes);
+            req_buf.extend_from_slice(b"\0\0");
+        }
+
+        while send_offset < req_buf.len() {
+            match raw::send(sock.as_fd(), &req_buf[send_offset..]) {
+                Ok(Io::Done(n)) => {
+                    send_offset += n;
+                }
+                Ok(Io::WouldBlock) => {
+                    fdtab.clear_ready(raw_fd, false, true);
+                    check.sub_state = CheckSubState::PgsqlRunning {
+                        phase,
+                        user,
+                        send_offset,
+                        req_buf,
+                        recv_buf,
+                    };
+                    return Ok(CheckStep::pending(Some(check.exp)));
+                }
+                Ok(Io::Closed | Io::Eof) | Err(_) => {
+                    cleanup_check_socket(check, fdtab, poller);
+                    let event = check.on_failure_full(
+                        "L7RSP",
+                        "Layer7 invalid response",
+                        duration,
+                        None,
+                        None,
+                    );
+                    let next = check.schedule_next(now);
+                    check.next_check = next;
+                    return Ok(CheckStep {
+                        next: Some(next),
+                        event,
+                    });
+                }
+            }
+        }
+        phase = 1;
+        send_offset = 0;
+        recv_buf.clear();
+        fdtab.set_interest(raw_fd, Interest::READ);
+        let _ = poller.modify(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), true, false);
+    }
+
+    if phase == 1 {
+        let mut buf = [0u8; 4096];
+        let mut eof = false;
+        loop {
+            match raw::recv(sock.as_fd(), &mut buf) {
+                Ok(Io::Done(n)) => {
+                    recv_buf.extend_from_slice(&buf[..n]);
+                }
+                Ok(Io::WouldBlock) => break,
+                Ok(Io::Eof | Io::Closed) | Err(_) => {
+                    eof = true;
+                    break;
+                }
+            }
+        }
+
+        if recv_buf.len() < 5 && !eof {
+            fdtab.clear_ready(raw_fd, true, false);
+            check.sub_state = CheckSubState::PgsqlRunning {
+                phase,
+                user,
+                send_offset,
+                req_buf,
+                recv_buf,
+            };
+            return Ok(CheckStep::pending(Some(check.exp)));
+        }
+
+        cleanup_check_socket(check, fdtab, poller);
+        let event = if recv_buf.first() == Some(&b'R') {
+            check.on_success_full(
+                "L7OK",
+                "Layer7 check passed",
+                duration,
+                None,
+                Some("PostgreSQL server is ok".to_string()),
+            )
+        } else if recv_buf.first() == Some(&b'E') {
+            let info = if recv_buf.len() > 6 {
+                let s_bytes = &recv_buf[6..];
+                let null_pos = s_bytes
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(s_bytes.len());
+                String::from_utf8_lossy(&s_bytes[..null_pos]).to_string()
+            } else {
+                "Error".to_string()
+            };
+            check.on_failure_full(
+                "L7RSP",
+                "Layer7 invalid response",
+                duration,
+                None,
+                Some(info),
+            )
+        } else {
+            check.on_failure_full(
+                "L7STS",
+                "Layer7 wrong status",
+                duration,
+                None,
+                Some("PostgreSQL unknown error".to_string()),
+            )
+        };
+        let next = check.schedule_next(now);
+        check.next_check = next;
+        return Ok(CheckStep {
+            next: Some(next),
+            event,
+        });
+    }
+
+    cleanup_check_socket(check, fdtab, poller);
+    let next = check.schedule_next(now);
+    Ok(CheckStep::pending(Some(next)))
+}
+
+#[allow(clippy::too_many_lines, clippy::unnecessary_wraps)]
+fn progress_ssl_hello_check(
+    check: &mut ServerCheckState,
+    fdtab: &mut FdTab,
+    poller: &mut Poller,
+    now: Tick,
+    duration: u32,
+) -> io::Result<CheckStep> {
+    let Some(raw_fd) = check.check_fd else {
+        cleanup_check_socket(check, fdtab, poller);
+        let next = check.schedule_next(now);
+        return Ok(CheckStep::pending(Some(next)));
+    };
+    let Some(sock) = check.sock.as_ref() else {
+        cleanup_check_socket(check, fdtab, poller);
+        let next = check.schedule_next(now);
+        return Ok(CheckStep::pending(Some(next)));
+    };
+
+    let CheckSubState::SslHelloRunning {
+        mut phase,
+        mut send_offset,
+        mut recv_buf,
+    } = check.sub_state.clone()
+    else {
+        cleanup_check_socket(check, fdtab, poller);
+        let next = check.schedule_next(now);
+        return Ok(CheckStep::pending(Some(next)));
+    };
+
+    if phase == 0 {
+        let mut client_hello = Vec::with_capacity(126);
+        client_hello.extend_from_slice(&[
+            0x16, 0x03, 0x00, 0x00, 0x79, 0x01, 0x00, 0x00, 0x75, 0x03, 0x00,
+        ]);
+        let ts = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as u32)
+            .to_be_bytes();
+        client_hello.extend_from_slice(&ts);
+        client_hello.extend_from_slice(b"HAPROXYSSLCHK\nHAPROXYSSLCHK\n");
+        client_hello.extend_from_slice(&[0x00, 0x00, 0x4e]);
+        for c in 1u16..=0x1b {
+            client_hello.extend_from_slice(&c.to_be_bytes());
+        }
+        for c in 0x2fu16..=0x3a {
+            client_hello.extend_from_slice(&c.to_be_bytes());
+        }
+        client_hello.extend_from_slice(&[0x01, 0x00]);
+
+        while send_offset < client_hello.len() {
+            match raw::send(sock.as_fd(), &client_hello[send_offset..]) {
+                Ok(Io::Done(n)) => {
+                    send_offset += n;
+                }
+                Ok(Io::WouldBlock) => {
+                    fdtab.clear_ready(raw_fd, false, true);
+                    check.sub_state = CheckSubState::SslHelloRunning {
+                        phase,
+                        send_offset,
+                        recv_buf,
+                    };
+                    return Ok(CheckStep::pending(Some(check.exp)));
+                }
+                Ok(Io::Closed | Io::Eof) | Err(_) => {
+                    cleanup_check_socket(check, fdtab, poller);
+                    let event = check.on_failure_full(
+                        "L6RSP",
+                        "Layer6 invalid response",
+                        duration,
+                        None,
+                        None,
+                    );
+                    let next = check.schedule_next(now);
+                    check.next_check = next;
+                    return Ok(CheckStep {
+                        next: Some(next),
+                        event,
+                    });
+                }
+            }
+        }
+        phase = 1;
+        send_offset = 0;
+        recv_buf.clear();
+        fdtab.set_interest(raw_fd, Interest::READ);
+        let _ = poller.modify(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), true, false);
+    }
+
+    if phase == 1 {
+        let mut buf = [0u8; 4096];
+        let mut eof = false;
+        loop {
+            match raw::recv(sock.as_fd(), &mut buf) {
+                Ok(Io::Done(n)) => {
+                    recv_buf.extend_from_slice(&buf[..n]);
+                }
+                Ok(Io::WouldBlock) => break,
+                Ok(Io::Eof | Io::Closed) | Err(_) => {
+                    eof = true;
+                    break;
+                }
+            }
+        }
+
+        if recv_buf.is_empty() {
+            if !eof {
+                fdtab.clear_ready(raw_fd, true, false);
+                check.sub_state = CheckSubState::SslHelloRunning {
+                    phase,
+                    send_offset,
+                    recv_buf,
+                };
+                return Ok(CheckStep::pending(Some(check.exp)));
+            }
+            cleanup_check_socket(check, fdtab, poller);
+            let event = check.on_failure_full(
+                "L6RSP",
+                "Layer6 invalid response",
+                duration,
+                None,
+                Some("TCPCHK got an empty response at step 2".to_string()),
+            );
+            let next = check.schedule_next(now);
+            check.next_check = next;
+            return Ok(CheckStep {
+                next: Some(next),
+                event,
+            });
+        }
+
+        cleanup_check_socket(check, fdtab, poller);
+        let first_byte = recv_buf[0];
+        let event = if first_byte == 0x15 || first_byte == 0x16 {
+            check.on_success_full(
+                "L6OK",
+                "Layer6 check passed",
+                duration,
+                None,
+                None,
+            )
+        } else {
+            check.on_failure_full(
+                "L6RSP",
+                "Layer6 invalid response",
+                duration,
+                None,
+                None,
+            )
+        };
+        let next = check.schedule_next(now);
+        check.next_check = next;
+        return Ok(CheckStep {
+            next: Some(next),
+            event,
+        });
+    }
+
+    cleanup_check_socket(check, fdtab, poller);
+    let next = check.schedule_next(now);
+    Ok(CheckStep::pending(Some(next)))
 }

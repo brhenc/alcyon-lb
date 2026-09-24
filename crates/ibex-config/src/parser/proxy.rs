@@ -1,9 +1,12 @@
+use std::collections::HashMap;
+
 use super::*;
 
 pub(crate) fn parse_listen_header(
     tokens: &[Token],
     kw: &Token,
-    defaults: Option<&DefaultsSection>,
+    named_defaults: &HashMap<String, DefaultsSection>,
+    current_defaults: Option<&DefaultsSection>,
 ) -> Result<ListenSection, ConfigError> {
     if tokens.len() < 2 || tokens[1].text.is_empty() {
         return Err(ConfigError::new(
@@ -14,21 +17,23 @@ pub(crate) fn parse_listen_header(
     }
 
     let id = tokens[1].text.clone();
-
-    // Modern HAProxy requires a `bind` line and rejects an inline listening address on
-    // the section header. Verified against 3.5-dev7, which answers:
-    //   "please use the 'bind' keyword for listening addresses."
-    //
-    // Accepting the 1.0 form here would make Ibex take configs that the oracle refuses,
-    // which is the wrong direction for a compatibility target: a config that works on
-    // Ibex and fails on HAProxy is a migration trap.
-    if tokens.len() >= 3 && !tokens[2].text.is_empty() {
-        if tokens[2].text == "from" {
-            return Err(ConfigError::new(tokens[2].line, tokens[2].col, "named defaults sections are not implemented".to_string()));
+    let (defaults, rest_idx) = if tokens.len() >= 3 && tokens[2].text == "from" {
+        if tokens.len() < 4 || tokens[3].text.is_empty() {
+            return Err(ConfigError::new(tokens[2].line, tokens[2].col, "'from' expects a defaults section name".to_string()));
         }
+        let def_name = &tokens[3].text;
+        let def = named_defaults.get(def_name).ok_or_else(|| {
+            ConfigError::new(tokens[3].line, tokens[3].col, format!("defaults section '{def_name}' not found for listen '{id}'."))
+        })?;
+        (Some(def), 4)
+    } else {
+        (current_defaults, 2)
+    };
+
+    if tokens.len() > rest_idx && !tokens[rest_idx].text.is_empty() {
         return Err(ConfigError::new(
-            tokens[2].line,
-            tokens[2].col,
+            tokens[rest_idx].line,
+            tokens[rest_idx].col,
             "please use the 'bind' keyword for listening addresses",
         ));
     }
@@ -36,7 +41,7 @@ pub(crate) fn parse_listen_header(
     let mut accept_proxy = false;
     let mut accept_proxy_v2 = false;
 
-    if let Some(extra_tokens) = tokens.get(3..) {
+    if let Some(extra_tokens) = tokens.get(rest_idx + 1..) {
         for tok in extra_tokens {
             if tok.text == "accept-proxy" {
                 accept_proxy = true;
@@ -52,6 +57,7 @@ pub(crate) fn parse_listen_header(
 
     Ok(ListenSection {
         httpchk: defaults.and_then(|d| d.httpchk.clone()),
+        proto_check: defaults.and_then(|d| d.proto_check.clone()),
         http_checks: defaults.map_or_else(Vec::new, |d| d.http_checks.clone()),
         tcp_checks: defaults.map_or_else(Vec::new, |d| d.tcp_checks.clone()),
         tcp_check: defaults.is_some_and(|d| d.tcp_check),
@@ -59,49 +65,52 @@ pub(crate) fn parse_listen_header(
         addr,
         mode,
         disabled: false,
-        cookie: None,
+        cookie: defaults.and_then(|d| d.cookie.clone()),
         contimeout: timeouts.connect,
         clitimeout: timeouts.client,
         srvtimeout: timeouts.server,
         timeouts,
-        retries: 3,
-        redisp: false,
-        maxconn: 2000,
+        retries: defaults.and_then(|d| d.retries).unwrap_or(3),
+        redisp: defaults.map_or(false, |d| d.redisp),
+        maxconn: defaults.and_then(|d| d.maxconn).unwrap_or(2000),
         grace: None,
         dispatch: None,
-        default_server: None,
+        default_server: defaults.and_then(|d| d.default_server.clone()),
         servers: Vec::new(),
-        logs: Vec::new(),
-        log_global: false,
-        log_health_checks: false,
+        logs: defaults.map_or_else(Vec::new, |d| d.logs.clone()),
+        log_global: defaults.map_or(false, |d| d.log_global),
+        log_health_checks: defaults.map_or(false, |d| d.log_health_checks),
         cliexp: Vec::new(),
         srvexp: Vec::new(),
         acls: Vec::new(),
         use_backends: Vec::new(),
         default_backend: None,
-        balance: BalanceAlgorithm::RoundRobin,
+        balance: defaults.and_then(|d| d.balance).unwrap_or(BalanceAlgorithm::RoundRobin),
         stick_table: None,
         stick_rules: Vec::new(),
         tcp_req_inspect_delay: defaults.and_then(|d| d.tcp_req_inspect_delay),
-        tcp_req_conn_rules: Vec::new(),
-        tcp_req_session_rules: Vec::new(),
-        tcp_req_content_rules: Vec::new(),
-        http_req_rules: Vec::new(),
-        http_res_rules: Vec::new(),
-        http_after_res_rules: Vec::new(),
+        tcp_req_conn_rules: defaults.map_or_else(Vec::new, |d| d.tcp_req_conn_rules.clone()),
+        tcp_req_session_rules: defaults.map_or_else(Vec::new, |d| d.tcp_req_session_rules.clone()),
+        tcp_req_content_rules: defaults.map_or_else(Vec::new, |d| d.tcp_req_content_rules.clone()),
+        tcp_res_inspect_delay: defaults.and_then(|d| d.tcp_res_inspect_delay),
+        tcp_res_content_rules: defaults.map_or_else(Vec::new, |d| d.tcp_res_content_rules.clone()),
+        http_req_rules: defaults.map_or_else(Vec::new, |d| d.http_req_rules.clone()),
+        http_res_rules: defaults.map_or_else(Vec::new, |d| d.http_res_rules.clone()),
+        http_after_res_rules: defaults.map_or_else(Vec::new, |d| d.http_after_res_rules.clone()),
         accept_proxy,
         accept_proxy_v2,
         http_reuse: defaults.and_then(|d| d.http_reuse),
         forwardfor: None,
         originalto: None,
-        stats: StatsConfig::default(),
+        stats: defaults.map_or_else(StatsConfig::default, |d| d.stats.clone()),
     })
 }
 
 pub(crate) fn parse_frontend_header(
     tokens: &[Token],
     kw: &Token,
-    defaults: Option<&DefaultsSection>,
+    named_defaults: &HashMap<String, DefaultsSection>,
+    current_defaults: Option<&DefaultsSection>,
 ) -> Result<FrontendSection, ConfigError> {
     if tokens.len() < 2 || tokens[1].text.is_empty() {
         return Err(ConfigError::new(
@@ -112,39 +121,21 @@ pub(crate) fn parse_frontend_header(
     }
 
     let id = tokens[1].text.clone();
-    let bind = if tokens.len() >= 3 && !tokens[2].text.is_empty() {
-        if tokens[2].text == "from" {
-            return Err(ConfigError::new(tokens[2].line, tokens[2].col, "named defaults sections are not implemented".to_string()));
+    let (defaults, rest_idx) = if tokens.len() >= 3 && tokens[2].text == "from" {
+        if tokens.len() < 4 || tokens[3].text.is_empty() {
+            return Err(ConfigError::new(tokens[2].line, tokens[2].col, "'from' expects a defaults section name".to_string()));
         }
-        return Err(ConfigError::new(tokens[2].line, tokens[2].col, "please use the 'bind' keyword for listening addresses".to_string()));
+        let def_name = &tokens[3].text;
+        let def = named_defaults.get(def_name).ok_or_else(|| {
+            ConfigError::new(tokens[3].line, tokens[3].col, format!("defaults section '{def_name}' not found for frontend '{id}'."))
+        })?;
+        (Some(def), 4)
     } else {
-        None
+        (current_defaults, 2)
     };
-    let mut accept_proxy = false;
-    let mut accept_proxy_v2 = false;
-    let mut binds = Vec::new();
 
-    if let Some(b_addr) = bind {
-        if let Some(extra_tokens) = tokens.get(3..) {
-            for tok in extra_tokens {
-                if tok.text == "accept-proxy" {
-                    accept_proxy = true;
-                } else if tok.text == "accept-proxy-v2" {
-                    accept_proxy = true;
-                    accept_proxy_v2 = true;
-                }
-            }
-        }
-        binds.push(BindConfig {
-            addr: b_addr,
-            quic: false,
-            ssl: false,
-            crt: Vec::new(),
-            alpn: Vec::new(),
-            proto: None,
-            accept_proxy,
-            accept_proxy_v2,
-        });
+    if tokens.len() > rest_idx && !tokens[rest_idx].text.is_empty() {
+        return Err(ConfigError::new(tokens[rest_idx].line, tokens[rest_idx].col, "please use the 'bind' keyword for listening addresses".to_string()));
     }
 
     let mode = defaults.and_then(|d| d.mode).unwrap_or(Mode::Tcp);
@@ -152,41 +143,42 @@ pub(crate) fn parse_frontend_header(
 
     Ok(FrontendSection {
         name: id,
-        bind,
-        binds,
+        bind: None,
+        binds: Vec::new(),
         mode,
         disabled: false,
         clitimeout: timeouts.client,
         timeouts,
-        maxconn: 2000,
+        maxconn: defaults.and_then(|d| d.maxconn).unwrap_or(2000),
         default_backend: None,
         use_backends: Vec::new(),
         acls: Vec::new(),
         cliexp: Vec::new(),
-        logs: Vec::new(),
-        log_global: false,
-        log_health_checks: false,
+        logs: defaults.map_or_else(Vec::new, |d| d.logs.clone()),
+        log_global: defaults.map_or(false, |d| d.log_global),
+        log_health_checks: defaults.map_or(false, |d| d.log_health_checks),
         stick_table: None,
         stick_rules: Vec::new(),
         tcp_req_inspect_delay: defaults.and_then(|d| d.tcp_req_inspect_delay),
-        tcp_req_conn_rules: Vec::new(),
-        tcp_req_session_rules: Vec::new(),
-        tcp_req_content_rules: Vec::new(),
-        http_req_rules: Vec::new(),
-        http_res_rules: Vec::new(),
-        http_after_res_rules: Vec::new(),
-        accept_proxy,
-        accept_proxy_v2,
+        tcp_req_conn_rules: defaults.map_or_else(Vec::new, |d| d.tcp_req_conn_rules.clone()),
+        tcp_req_session_rules: defaults.map_or_else(Vec::new, |d| d.tcp_req_session_rules.clone()),
+        tcp_req_content_rules: defaults.map_or_else(Vec::new, |d| d.tcp_req_content_rules.clone()),
+        http_req_rules: defaults.map_or_else(Vec::new, |d| d.http_req_rules.clone()),
+        http_res_rules: defaults.map_or_else(Vec::new, |d| d.http_res_rules.clone()),
+        http_after_res_rules: defaults.map_or_else(Vec::new, |d| d.http_after_res_rules.clone()),
+        accept_proxy: false,
+        accept_proxy_v2: false,
         forwardfor: None,
         originalto: None,
-        stats: StatsConfig::default(),
+        stats: defaults.map_or_else(StatsConfig::default, |d| d.stats.clone()),
     })
 }
 
 pub(crate) fn parse_backend_header(
     tokens: &[Token],
     kw: &Token,
-    defaults: Option<&DefaultsSection>,
+    named_defaults: &HashMap<String, DefaultsSection>,
+    current_defaults: Option<&DefaultsSection>,
 ) -> Result<BackendSection, ConfigError> {
     if tokens.len() < 2 || tokens[1].text.is_empty() {
         return Err(ConfigError::new(
@@ -197,49 +189,62 @@ pub(crate) fn parse_backend_header(
     }
 
     let id = tokens[1].text.clone();
-    if tokens.len() >= 3 && !tokens[2].text.is_empty() {
-        if tokens[2].text == "from" {
-            return Err(ConfigError::new(tokens[2].line, tokens[2].col, "named defaults sections are not implemented".to_string()));
+    let (defaults, rest_idx) = if tokens.len() >= 3 && tokens[2].text == "from" {
+        if tokens.len() < 4 || tokens[3].text.is_empty() {
+            return Err(ConfigError::new(tokens[2].line, tokens[2].col, "'from' expects a defaults section name".to_string()));
         }
-        return Err(ConfigError::new(tokens[2].line, tokens[2].col, "unexpected extra argument in backend header".to_string()));
+        let def_name = &tokens[3].text;
+        let def = named_defaults.get(def_name).ok_or_else(|| {
+            ConfigError::new(tokens[3].line, tokens[3].col, format!("defaults section '{def_name}' not found for backend '{id}'."))
+        })?;
+        (Some(def), 4)
+    } else {
+        (current_defaults, 2)
+    };
+
+    if tokens.len() > rest_idx && !tokens[rest_idx].text.is_empty() {
+        return Err(ConfigError::new(tokens[rest_idx].line, tokens[rest_idx].col, "unexpected extra argument in backend header".to_string()));
     }
     let mode = defaults.and_then(|d| d.mode).unwrap_or(Mode::Tcp);
     let timeouts = defaults.map_or_else(TimeoutConfig::default, |d| d.timeouts);
 
     Ok(BackendSection {
         httpchk: defaults.and_then(|d| d.httpchk.clone()),
+        proto_check: defaults.and_then(|d| d.proto_check.clone()),
         http_checks: defaults.map_or_else(Vec::new, |d| d.http_checks.clone()),
         tcp_checks: defaults.map_or_else(Vec::new, |d| d.tcp_checks.clone()),
         tcp_check: defaults.is_some_and(|d| d.tcp_check),
         name: id,
-        logs: Vec::new(),
-        log_global: false,
-        log_health_checks: false,
+        logs: defaults.map_or_else(Vec::new, |d| d.logs.clone()),
+        log_global: defaults.map_or(false, |d| d.log_global),
+        log_health_checks: defaults.map_or(false, |d| d.log_health_checks),
         mode,
         disabled: false,
-        balance: BalanceAlgorithm::RoundRobin,
-        cookie: None,
+        balance: defaults.and_then(|d| d.balance).unwrap_or(BalanceAlgorithm::RoundRobin),
+        cookie: defaults.and_then(|d| d.cookie.clone()),
         contimeout: timeouts.connect,
         srvtimeout: timeouts.server,
         timeouts,
-        retries: 3,
-        redisp: false,
+        retries: defaults.and_then(|d| d.retries).unwrap_or(3),
+        redisp: defaults.map_or(false, |d| d.redisp),
         dispatch: None,
-        default_server: None,
+        default_server: defaults.and_then(|d| d.default_server.clone()),
         servers: Vec::new(),
         srvexp: Vec::new(),
         acls: Vec::new(),
         stick_table: None,
         stick_rules: Vec::new(),
         tcp_req_inspect_delay: defaults.and_then(|d| d.tcp_req_inspect_delay),
-        tcp_req_content_rules: Vec::new(),
-        http_req_rules: Vec::new(),
-        http_res_rules: Vec::new(),
-        http_after_res_rules: Vec::new(),
+        tcp_req_content_rules: defaults.map_or_else(Vec::new, |d| d.tcp_req_content_rules.clone()),
+        tcp_res_inspect_delay: defaults.and_then(|d| d.tcp_res_inspect_delay),
+        tcp_res_content_rules: defaults.map_or_else(Vec::new, |d| d.tcp_res_content_rules.clone()),
+        http_req_rules: defaults.map_or_else(Vec::new, |d| d.http_req_rules.clone()),
+        http_res_rules: defaults.map_or_else(Vec::new, |d| d.http_res_rules.clone()),
+        http_after_res_rules: defaults.map_or_else(Vec::new, |d| d.http_after_res_rules.clone()),
         http_reuse: defaults.and_then(|d| d.http_reuse),
         forwardfor: None,
         originalto: None,
-        stats: StatsConfig::default(),
+        stats: defaults.map_or_else(StatsConfig::default, |d| d.stats.clone()),
     })
 }
 
@@ -313,6 +318,34 @@ pub(crate) fn parse_listen_directive(
         "http-check" => {
             parse_http_check_directive(&mut proxy.http_checks, tokens, kw)?;
             Ok(())
+        }
+        "tcp-response" => {
+            if tokens.len() < 2 {
+                return Err(ConfigError::new(
+                    kw.line,
+                    kw.col,
+                    "missing argument for 'tcp-response'",
+                ));
+            }
+            match tokens[1].text.as_str() {
+                "inspect-delay" => {
+                    if tokens.len() < 3 {
+                        return Err(ConfigError::new(
+                            kw.line,
+                            kw.col,
+                            "<tcp-response inspect-delay> expects delay timeout",
+                        ));
+                    }
+                    proxy.tcp_res_inspect_delay = Some(parse_timeout(&tokens[2], "tcp-response inspect-delay")?);
+                    Ok(())
+                }
+                "content" => parse_tcp_req_content(&mut proxy.tcp_res_content_rules, tokens, kw),
+                other => Err(ConfigError::new(
+                    tokens[1].line,
+                    tokens[1].col,
+                    format!("unknown tcp-response subcommand <{other}>, expects 'inspect-delay' or 'content'"),
+                )),
+            }
         }
         "tcp-check" => {
             parse_tcp_check_directive(&mut proxy.tcp_checks, tokens, kw)?;
@@ -460,6 +493,34 @@ pub(crate) fn parse_backend_directive(
         "http-check" => {
             parse_http_check_directive(&mut be.http_checks, tokens, kw)?;
             Ok(())
+        }
+        "tcp-response" => {
+            if tokens.len() < 2 {
+                return Err(ConfigError::new(
+                    kw.line,
+                    kw.col,
+                    "missing argument for 'tcp-response'",
+                ));
+            }
+            match tokens[1].text.as_str() {
+                "inspect-delay" => {
+                    if tokens.len() < 3 {
+                        return Err(ConfigError::new(
+                            kw.line,
+                            kw.col,
+                            "<tcp-response inspect-delay> expects delay timeout",
+                        ));
+                    }
+                    be.tcp_res_inspect_delay = Some(parse_timeout(&tokens[2], "tcp-response inspect-delay")?);
+                    Ok(())
+                }
+                "content" => parse_tcp_req_content(&mut be.tcp_res_content_rules, tokens, kw),
+                other => Err(ConfigError::new(
+                    tokens[1].line,
+                    tokens[1].col,
+                    format!("unknown tcp-response subcommand <{other}>, expects 'inspect-delay' or 'content'"),
+                )),
+            }
         }
         "tcp-check" => {
             parse_tcp_check_directive(&mut be.tcp_checks, tokens, kw)?;
@@ -628,6 +689,7 @@ pub(crate) fn parse_option_listen(
             "tcp-check" => {
                 proxy.tcp_check = true;
             }
+            _ if parse_proto_check_option(&mut proxy.proto_check, tokens, kw)? => {}
             other => {
                 refuse_if_check_option(other, kw)?;
                 eprintln!("[ibex] warning: ignored option '{other}'");
@@ -709,6 +771,7 @@ pub(crate) fn parse_option_backend(
             "tcp-check" => {
                 be.tcp_check = true;
             }
+            _ if parse_proto_check_option(&mut be.proto_check, tokens, kw)? => {}
             other => {
                 refuse_if_check_option(other, kw)?;
                 eprintln!("[ibex] warning: ignored option '{other}'");

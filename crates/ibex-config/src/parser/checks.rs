@@ -57,6 +57,107 @@ pub(crate) fn parse_httpchk_option(
     Ok(())
 }
 
+pub(crate) fn parse_proto_check_option(
+    proto_check: &mut Option<ProtoCheckConfig>,
+    tokens: &[Token],
+    kw: &Token,
+) -> Result<bool, ConfigError> {
+    if tokens.len() < 2 {
+        return Ok(false);
+    }
+    match tokens[1].text.as_str() {
+        "redis-check" => {
+            *proto_check = Some(ProtoCheckConfig::Redis);
+            Ok(true)
+        }
+        "smtpchk" => {
+            let cmd = if tokens.len() >= 4 && (tokens[2].text == "HELO" || tokens[2].text == "EHLO") {
+                Some(format!("{} {}", tokens[2].text, tokens[3].text))
+            } else if tokens.len() >= 3 && (tokens[2].text == "HELO" || tokens[2].text == "EHLO") {
+                Some(tokens[2].text.clone())
+            } else {
+                None
+            };
+            *proto_check = Some(ProtoCheckConfig::Smtp { cmd });
+            Ok(true)
+        }
+        "ldap-check" => {
+            *proto_check = Some(ProtoCheckConfig::Ldap);
+            Ok(true)
+        }
+        "mysql-check" => {
+            let mut user = None;
+            let mut version = MysqlCheckVersion::Post41;
+            let mut i = 2;
+            while i < tokens.len() {
+                if tokens[i].text == "user" {
+                    i += 1;
+                    if i < tokens.len() {
+                        user = Some(tokens[i].text.clone());
+                    }
+                    i += 1;
+                    if i < tokens.len() {
+                        match tokens[i].text.as_str() {
+                            "pre-41" => version = MysqlCheckVersion::Pre41,
+                            "post-41" => version = MysqlCheckVersion::Post41,
+                            "post-80" => version = MysqlCheckVersion::Post80,
+                            other => {
+                                return Err(ConfigError::new(
+                                    kw.line,
+                                    kw.col,
+                                    format!("keyword 'user' only supports 'post-41', 'pre-41' and 'post-80' (got '{other}')."),
+                                ));
+                            }
+                        }
+                        i += 1;
+                    }
+                } else {
+                    return Err(ConfigError::new(
+                        kw.line,
+                        kw.col,
+                        format!("'option mysql-check' only supports optional values: 'user' (got '{}').", tokens[i].text),
+                    ));
+                }
+            }
+            *proto_check = Some(ProtoCheckConfig::Mysql { user, version });
+            Ok(true)
+        }
+        "pgsql-check" => {
+            let mut user = None;
+            let mut i = 2;
+            while i < tokens.len() {
+                if tokens[i].text == "user" {
+                    i += 1;
+                    if i < tokens.len() {
+                        user = Some(tokens[i].text.clone());
+                    }
+                    i += 1;
+                } else {
+                    return Err(ConfigError::new(
+                        kw.line,
+                        kw.col,
+                        format!("'option pgsql-check' only supports optional values: 'user' (got '{}').", tokens[i].text),
+                    ));
+                }
+            }
+            let Some(u) = user else {
+                return Err(ConfigError::new(
+                    kw.line,
+                    kw.col,
+                    "'option pgsql-check' expects 'user <username>' as argument.",
+                ));
+            };
+            *proto_check = Some(ProtoCheckConfig::Pgsql { user: u });
+            Ok(true)
+        }
+        "ssl-hello-chk" => {
+            *proto_check = Some(ProtoCheckConfig::SslHello);
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 pub(crate) fn parse_http_check_directive(
     rules: &mut Vec<HttpCheckAction>,
@@ -713,6 +814,7 @@ pub(crate) fn register_checks_from_config(config: &Config) {
         register_section_checks(
             proxy_idx,
             listen.httpchk.as_ref(),
+            listen.proto_check.as_ref(),
             &listen.http_checks,
             &listen.tcp_checks,
             listen.tcp_check,
@@ -725,6 +827,7 @@ pub(crate) fn register_checks_from_config(config: &Config) {
         register_section_checks(
             proxy_idx,
             backend.httpchk.as_ref(),
+            backend.proto_check.as_ref(),
             &backend.http_checks,
             &backend.tcp_checks,
             backend.tcp_check,
@@ -737,6 +840,7 @@ pub(crate) fn register_checks_from_config(config: &Config) {
 pub(crate) fn register_section_checks(
     proxy_idx: usize,
     httpchk: Option<&HttpChkConfig>,
+    proto_check: Option<&ProtoCheckConfig>,
     http_checks: &[HttpCheckAction],
     tcp_checks: &[TcpCheckAction],
     tcp_check: bool,
@@ -746,7 +850,21 @@ pub(crate) fn register_section_checks(
         if !server.check {
             continue;
         }
-        let resolved = if tcp_check || !tcp_checks.is_empty() {
+        let resolved = if let Some(proto) = proto_check {
+            match proto {
+                ProtoCheckConfig::Redis => ResolvedCheckConfig::Redis,
+                ProtoCheckConfig::Smtp { cmd } => ResolvedCheckConfig::Smtp(cmd.clone()),
+                ProtoCheckConfig::Ldap => ResolvedCheckConfig::Ldap,
+                ProtoCheckConfig::Mysql { user, version } => ResolvedCheckConfig::Mysql {
+                    user: user.clone(),
+                    version: *version,
+                },
+                ProtoCheckConfig::Pgsql { user } => ResolvedCheckConfig::Pgsql {
+                    user: user.clone(),
+                },
+                ProtoCheckConfig::SslHello => ResolvedCheckConfig::SslHello,
+            }
+        } else if tcp_check || !tcp_checks.is_empty() {
             let steps = build_resolved_tcp_steps(tcp_checks, server);
             ResolvedCheckConfig::TcpSteps(steps)
         } else if httpchk.is_some() || !http_checks.is_empty() {

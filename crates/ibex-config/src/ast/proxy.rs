@@ -37,12 +37,32 @@ pub struct DefaultsSection {
     pub http_reuse: Option<HttpReuse>,
     /// Default HTTP check configuration (`option httpchk`).
     pub httpchk: Option<HttpChkConfig>,
+    /// Protocol-specific check configuration (`option redis-check`, `option smtpchk`, etc.).
+    pub proto_check: Option<ProtoCheckConfig>,
+    /// Optional name for named defaults sections (`defaults <name>`).
+    pub name: Option<String>,
     /// Default custom HTTP check directives (`http-check`).
     pub http_checks: Vec<HttpCheckAction>,
     /// Default custom TCP check directives (`tcp-check`).
     pub tcp_checks: Vec<TcpCheckAction>,
     /// Default TCP check mode enabled (`option tcp-check`).
     pub tcp_check: bool,
+    /// Default HTTP request rules (`http-request`).
+    pub http_req_rules: Vec<HttpReqRule>,
+    /// Default HTTP response rules (`http-response`).
+    pub http_res_rules: Vec<HttpResRule>,
+    /// Default HTTP after-response rules (`http-after-response`).
+    pub http_after_res_rules: Vec<HttpAfterResRule>,
+    /// Default TCP request connection rules (`tcp-request connection`).
+    pub tcp_req_conn_rules: Vec<TcpReqConnRule>,
+    /// Default TCP request session rules (`tcp-request session`).
+    pub tcp_req_session_rules: Vec<TcpReqSessionRule>,
+    /// Default TCP request content rules (`tcp-request content`).
+    pub tcp_req_content_rules: Vec<TcpReqContentRule>,
+    /// Default TCP response inspection delay.
+    pub tcp_res_inspect_delay: Option<Duration>,
+    /// Default TCP response content rules (`tcp-response content`).
+    pub tcp_res_content_rules: Vec<TcpReqContentRule>,
 }
 
 /// Unified timeouts configuration.
@@ -137,6 +157,10 @@ pub struct ListenSection {
     pub tcp_req_session_rules: Vec<TcpReqSessionRule>,
     /// Modern TCP-request content rules.
     pub tcp_req_content_rules: Vec<TcpReqContentRule>,
+    /// TCP-response inspect delay.
+    pub tcp_res_inspect_delay: Option<Duration>,
+    /// Modern TCP-response content rules.
+    pub tcp_res_content_rules: Vec<TcpReqContentRule>,
     /// Modern HTTP-request rules.
     pub http_req_rules: Vec<HttpReqRule>,
     /// Modern HTTP-response rules.
@@ -159,6 +183,8 @@ pub struct ListenSection {
     pub stats: StatsConfig,
     /// HTTP check configuration (`option httpchk`).
     pub httpchk: Option<HttpChkConfig>,
+    /// Protocol-specific check configuration (`option redis-check`, `option smtpchk`, etc.).
+    pub proto_check: Option<ProtoCheckConfig>,
     /// Custom HTTP check directives (`http-check`).
     pub http_checks: Vec<HttpCheckAction>,
     /// Custom TCP check directives (`tcp-check`).
@@ -218,6 +244,8 @@ impl Default for ListenSection {
             tcp_req_conn_rules: Vec::new(),
             tcp_req_session_rules: Vec::new(),
             tcp_req_content_rules: Vec::new(),
+            tcp_res_inspect_delay: None,
+            tcp_res_content_rules: Vec::new(),
             http_req_rules: Vec::new(),
             http_res_rules: Vec::new(),
             http_after_res_rules: Vec::new(),
@@ -228,6 +256,7 @@ impl Default for ListenSection {
             originalto: None,
             stats: StatsConfig::default(),
             httpchk: None,
+            proto_check: None,
             http_checks: Vec::new(),
             tcp_checks: Vec::new(),
             tcp_check: false,
@@ -384,6 +413,10 @@ pub struct BackendSection {
     pub tcp_req_inspect_delay: Option<Duration>,
     /// Modern TCP-request content rules.
     pub tcp_req_content_rules: Vec<TcpReqContentRule>,
+    /// TCP-response inspect delay.
+    pub tcp_res_inspect_delay: Option<Duration>,
+    /// Modern TCP-response content rules.
+    pub tcp_res_content_rules: Vec<TcpReqContentRule>,
     /// Modern HTTP-request rules.
     pub http_req_rules: Vec<HttpReqRule>,
     /// Modern HTTP-response rules.
@@ -400,6 +433,8 @@ pub struct BackendSection {
     pub stats: StatsConfig,
     /// HTTP check configuration (`option httpchk`).
     pub httpchk: Option<HttpChkConfig>,
+    /// Protocol-specific check configuration (`option redis-check`, `option smtpchk`, etc.).
+    pub proto_check: Option<ProtoCheckConfig>,
     /// Custom HTTP check directives (`http-check`).
     pub http_checks: Vec<HttpCheckAction>,
     /// Custom TCP check directives (`tcp-check`).
@@ -433,6 +468,8 @@ impl Default for BackendSection {
             stick_rules: Vec::new(),
             tcp_req_inspect_delay: None,
             tcp_req_content_rules: Vec::new(),
+            tcp_res_inspect_delay: None,
+            tcp_res_content_rules: Vec::new(),
             http_req_rules: Vec::new(),
             http_res_rules: Vec::new(),
             http_after_res_rules: Vec::new(),
@@ -441,6 +478,7 @@ impl Default for BackendSection {
             http_reuse: None,
             stats: StatsConfig::default(),
             httpchk: None,
+            proto_check: None,
             http_checks: Vec::new(),
             tcp_checks: Vec::new(),
             tcp_check: false,
