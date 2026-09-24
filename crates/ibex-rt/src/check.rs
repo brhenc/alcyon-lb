@@ -231,8 +231,8 @@ impl ServerCheckState {
             check_fd: None,
             exp: Tick::ETERNITY,
             next_check: now,
-            last_status_desc: "Initializing",
-            last_status_code: "INI",
+            last_status_desc: "Initial state",
+            last_status_code: "L4OK",
             http_code: None,
             last_status_info: None,
             resolved_config,
@@ -512,6 +512,14 @@ fn parse_http_response(buf: &[u8]) -> Option<(u16, Vec<(String, String)>, Vec<u8
     Some((status_code, headers, body))
 }
 
+fn format_l4_connect_error(err: &io::Error) -> String {
+    if err.kind() == io::ErrorKind::ConnectionRefused || err.raw_os_error() == Some(111) {
+        "ECONNREFUSED returned by OS".to_string()
+    } else {
+        format!("General socket error ({err})")
+    }
+}
+
 /// Executes or progresses a health check.
 ///
 /// # Errors
@@ -595,8 +603,13 @@ pub fn step_check(
 
                 let event = match connect_res {
                     Ok(None) => check.on_success(duration),
-                    Ok(Some(_)) | Err(_) => {
-                        check.on_failure("L4CON", "Connection refused / error", duration)
+                    Ok(Some(ref err)) => {
+                        let info = Some(format_l4_connect_error(err));
+                        check.on_failure_full("L4CON", "Layer4 connection problem", duration, None, info)
+                    }
+                    Err(ref e) => {
+                        let info = Some(format!("General socket error ({e})"));
+                        check.on_failure_full("L4CON", "Layer4 connection problem", duration, None, info)
                     }
                 };
 
@@ -629,6 +642,10 @@ pub fn step_check(
                             progress_redis_check(check, fdtab, poller, now, duration)
                         }
                         Some(ResolvedCheckConfig::Smtp(cmd)) => {
+                            fdtab.set_interest(raw_fd, Interest::READ);
+                            if let Some(sock) = check.sock.as_ref() {
+                                let _ = poller.modify(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), true, false);
+                            }
                             check.sub_state = CheckSubState::SmtpRunning {
                                 phase: 0,
                                 cmd: cmd.unwrap_or_else(|| "HELO localhost".to_string()),
@@ -689,12 +706,17 @@ pub fn step_check(
                     }
                 } else {
                     cleanup_check_socket(check, fdtab, poller);
+                    let info = match connect_res {
+                        Ok(Some(ref err)) => Some(format_l4_connect_error(err)),
+                        Err(ref e) => Some(format!("General socket error ({e})")),
+                        _ => None,
+                    };
                     let event = check.on_failure_full(
                         "L4CON",
-                        "Connection refused / error",
+                        "Layer4 connection problem",
                         duration,
                         None,
-                        None,
+                        info,
                     );
                     let next = check.schedule_next(now);
                     check.next_check = next;
@@ -726,12 +748,17 @@ pub fn step_check(
                     progress_http_check(check, fdtab, poller, now, duration)
                 } else {
                     cleanup_check_socket(check, fdtab, poller);
+                    let info = match connect_res {
+                        Ok(Some(ref err)) => Some(format_l4_connect_error(err)),
+                        Err(ref e) => Some(format!("General socket error ({e})")),
+                        _ => None,
+                    };
                     let event = check.on_failure_full(
                         "L4CON",
-                        "Connection refused / error",
+                        "Layer4 connection problem",
                         duration,
                         None,
-                        None,
+                        info,
                     );
                     let next = check.schedule_next(now);
                     check.next_check = next;
@@ -786,7 +813,8 @@ pub fn step_check(
                     SocketAddr::new(check.addr.ip(), chk.check_port.unwrap_or(check.addr.port()));
                 let payload = build_http_request_payload(&chk, target_addr);
 
-                if let Ok((sock, immediate)) = raw::connect(target_addr) {
+                match raw::connect(target_addr) {
+                    Ok((sock, immediate)) => {
                         let raw_fd = sock.as_raw_fd();
                         check.check_fd = Some(raw_fd);
                         let timeout_ms =
@@ -823,13 +851,15 @@ pub fn step_check(
                             };
                             Ok(CheckStep::pending(Some(check.exp)))
                         }
-                    } else {
+                    }
+                    Err(e) => {
+                        let info = Some(format_l4_connect_error(&e));
                         let event = check.on_failure_full(
                             "L4CON",
-                            "Connection refused / error",
+                            "Layer4 connection problem",
                             0,
                             None,
-                            None,
+                            info,
                         );
                         let next = check.schedule_next(now);
                         check.next_check = next;
@@ -838,6 +868,7 @@ pub fn step_check(
                             event,
                         })
                     }
+                }
             }
             ResolvedCheckConfig::TcpSteps(steps) => {
                 check.sub_state = CheckSubState::TcpRunning {
@@ -852,231 +883,264 @@ pub fn step_check(
                 progress_tcp_steps_start(check, &steps, fdtab, poller, now)
             }
             ResolvedCheckConfig::Redis => {
-                if let Ok((sock, immediate)) = raw::connect(check.addr) {
-                    let raw_fd = sock.as_raw_fd();
-                    check.check_fd = Some(raw_fd);
-                    let timeout_ms = u32::try_from(check.config.timeout.as_millis()).unwrap_or(u32::MAX);
-                    check.exp = now.add(timeout_ms);
-                    check.in_progress = true;
-                    fdtab.insert(raw_fd, FdState::Conn { task: check.task, conn: 0 }, Interest::WRITE);
-                    let _ = poller.add(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), false, true);
-                    check.sock = Some(sock);
+                match raw::connect(check.addr) {
+                    Ok((sock, immediate)) => {
+                        let raw_fd = sock.as_raw_fd();
+                        check.check_fd = Some(raw_fd);
+                        let timeout_ms = u32::try_from(check.config.timeout.as_millis()).unwrap_or(u32::MAX);
+                        check.exp = now.add(timeout_ms);
+                        check.in_progress = true;
+                        fdtab.insert(raw_fd, FdState::Conn { task: check.task, conn: 0 }, Interest::WRITE);
+                        let _ = poller.add(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), false, true);
+                        check.sock = Some(sock);
 
-                    if immediate {
-                        check.sub_state = CheckSubState::RedisRunning {
-                            phase: 0,
-                            send_offset: 0,
-                            recv_buf: Vec::new(),
-                        };
-                        progress_redis_check(check, fdtab, poller, now, 0)
-                    } else {
-                        check.sub_state = CheckSubState::ProtoConnecting { target_addr: check.addr };
-                        Ok(CheckStep::pending(Some(check.exp)))
+                        if immediate {
+                            check.sub_state = CheckSubState::RedisRunning {
+                                phase: 0,
+                                send_offset: 0,
+                                recv_buf: Vec::new(),
+                            };
+                            progress_redis_check(check, fdtab, poller, now, 0)
+                        } else {
+                            check.sub_state = CheckSubState::ProtoConnecting { target_addr: check.addr };
+                            Ok(CheckStep::pending(Some(check.exp)))
+                        }
                     }
-                } else {
-                    let event = check.on_failure_full("L4CON", "Connection refused / error", 0, None, None);
-                    let next = check.schedule_next(now);
-                    check.next_check = next;
-                    Ok(CheckStep { next: Some(next), event })
+                    Err(e) => {
+                        let info = Some(format_l4_connect_error(&e));
+                        let event = check.on_failure_full("L4CON", "Layer4 connection problem", 0, None, info);
+                        let next = check.schedule_next(now);
+                        check.next_check = next;
+                        Ok(CheckStep { next: Some(next), event })
+                    }
                 }
             }
             ResolvedCheckConfig::Smtp(cmd) => {
-                if let Ok((sock, immediate)) = raw::connect(check.addr) {
-                    let raw_fd = sock.as_raw_fd();
-                    check.check_fd = Some(raw_fd);
-                    let timeout_ms = u32::try_from(check.config.timeout.as_millis()).unwrap_or(u32::MAX);
-                    check.exp = now.add(timeout_ms);
-                    check.in_progress = true;
-                    fdtab.insert(raw_fd, FdState::Conn { task: check.task, conn: 0 }, Interest::READ);
-                    let _ = poller.add(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), true, false);
-                    check.sock = Some(sock);
+                match raw::connect(check.addr) {
+                    Ok((sock, immediate)) => {
+                        let raw_fd = sock.as_raw_fd();
+                        check.check_fd = Some(raw_fd);
+                        let timeout_ms = u32::try_from(check.config.timeout.as_millis()).unwrap_or(u32::MAX);
+                        check.exp = now.add(timeout_ms);
+                        check.in_progress = true;
+                        fdtab.insert(raw_fd, FdState::Conn { task: check.task, conn: 0 }, Interest::WRITE);
+                        let _ = poller.add(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), false, true);
+                        check.sock = Some(sock);
 
-                    if immediate {
-                        check.sub_state = CheckSubState::SmtpRunning {
-                            phase: 0,
-                            cmd: cmd.unwrap_or_else(|| "HELO localhost".to_string()),
-                            send_offset: 0,
-                            recv_buf: Vec::new(),
-                        };
-                        progress_smtp_check(check, fdtab, poller, now, 0)
-                    } else {
-                        check.sub_state = CheckSubState::ProtoConnecting { target_addr: check.addr };
-                        Ok(CheckStep::pending(Some(check.exp)))
+                        if immediate {
+                            check.sub_state = CheckSubState::SmtpRunning {
+                                phase: 0,
+                                cmd: cmd.unwrap_or_else(|| "HELO localhost".to_string()),
+                                send_offset: 0,
+                                recv_buf: Vec::new(),
+                            };
+                            progress_smtp_check(check, fdtab, poller, now, 0)
+                        } else {
+                            check.sub_state = CheckSubState::ProtoConnecting { target_addr: check.addr };
+                            Ok(CheckStep::pending(Some(check.exp)))
+                        }
                     }
-                } else {
-                    let event = check.on_failure_full("L4CON", "Connection refused / error", 0, None, None);
-                    let next = check.schedule_next(now);
-                    check.next_check = next;
-                    Ok(CheckStep { next: Some(next), event })
+                    Err(e) => {
+                        let info = Some(format_l4_connect_error(&e));
+                        let event = check.on_failure_full("L4CON", "Layer4 connection problem", 0, None, info);
+                        let next = check.schedule_next(now);
+                        check.next_check = next;
+                        Ok(CheckStep { next: Some(next), event })
+                    }
                 }
             }
             ResolvedCheckConfig::Ldap => {
-                if let Ok((sock, immediate)) = raw::connect(check.addr) {
-                    let raw_fd = sock.as_raw_fd();
-                    check.check_fd = Some(raw_fd);
-                    let timeout_ms = u32::try_from(check.config.timeout.as_millis()).unwrap_or(u32::MAX);
-                    check.exp = now.add(timeout_ms);
-                    check.in_progress = true;
-                    fdtab.insert(raw_fd, FdState::Conn { task: check.task, conn: 0 }, Interest::WRITE);
-                    let _ = poller.add(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), false, true);
-                    check.sock = Some(sock);
+                match raw::connect(check.addr) {
+                    Ok((sock, immediate)) => {
+                        let raw_fd = sock.as_raw_fd();
+                        check.check_fd = Some(raw_fd);
+                        let timeout_ms = u32::try_from(check.config.timeout.as_millis()).unwrap_or(u32::MAX);
+                        check.exp = now.add(timeout_ms);
+                        check.in_progress = true;
+                        fdtab.insert(raw_fd, FdState::Conn { task: check.task, conn: 0 }, Interest::WRITE);
+                        let _ = poller.add(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), false, true);
+                        check.sock = Some(sock);
 
-                    if immediate {
-                        check.sub_state = CheckSubState::LdapRunning {
-                            phase: 0,
-                            send_offset: 0,
-                            recv_buf: Vec::new(),
-                        };
-                        progress_ldap_check(check, fdtab, poller, now, 0)
-                    } else {
-                        check.sub_state = CheckSubState::ProtoConnecting { target_addr: check.addr };
-                        Ok(CheckStep::pending(Some(check.exp)))
+                        if immediate {
+                            check.sub_state = CheckSubState::LdapRunning {
+                                phase: 0,
+                                send_offset: 0,
+                                recv_buf: Vec::new(),
+                            };
+                            progress_ldap_check(check, fdtab, poller, now, 0)
+                        } else {
+                            check.sub_state = CheckSubState::ProtoConnecting { target_addr: check.addr };
+                            Ok(CheckStep::pending(Some(check.exp)))
+                        }
                     }
-                } else {
-                    let event = check.on_failure_full("L4CON", "Connection refused / error", 0, None, None);
-                    let next = check.schedule_next(now);
-                    check.next_check = next;
-                    Ok(CheckStep { next: Some(next), event })
+                    Err(e) => {
+                        let info = Some(format_l4_connect_error(&e));
+                        let event = check.on_failure_full("L4CON", "Layer4 connection problem", 0, None, info);
+                        let next = check.schedule_next(now);
+                        check.next_check = next;
+                        Ok(CheckStep { next: Some(next), event })
+                    }
                 }
             }
             ResolvedCheckConfig::Mysql { user, version } => {
-                if let Ok((sock, immediate)) = raw::connect(check.addr) {
-                    let raw_fd = sock.as_raw_fd();
-                    check.check_fd = Some(raw_fd);
-                    let timeout_ms = u32::try_from(check.config.timeout.as_millis()).unwrap_or(u32::MAX);
-                    check.exp = now.add(timeout_ms);
-                    check.in_progress = true;
-                    let req_buf = user.as_deref().map(|u| build_mysql_req(u, version)).unwrap_or_default();
-                    let initial_interest = if req_buf.is_empty() { Interest::READ } else { Interest::WRITE };
-                    fdtab.insert(raw_fd, FdState::Conn { task: check.task, conn: 0 }, initial_interest);
-                    let _ = poller.add(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), initial_interest.readable, initial_interest.writable);
-                    check.sock = Some(sock);
+                match raw::connect(check.addr) {
+                    Ok((sock, immediate)) => {
+                        let raw_fd = sock.as_raw_fd();
+                        check.check_fd = Some(raw_fd);
+                        let timeout_ms = u32::try_from(check.config.timeout.as_millis()).unwrap_or(u32::MAX);
+                        check.exp = now.add(timeout_ms);
+                        check.in_progress = true;
+                        let req_buf = user.as_deref().map(|u| build_mysql_req(u, version)).unwrap_or_default();
+                        fdtab.insert(raw_fd, FdState::Conn { task: check.task, conn: 0 }, Interest::WRITE);
+                        let _ = poller.add(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), false, true);
+                        check.sock = Some(sock);
 
-                    if immediate {
-                        check.sub_state = CheckSubState::MysqlRunning {
-                            phase: 0,
-                            user,
-                            version,
-                            server_version: String::new(),
-                            send_offset: 0,
-                            req_buf,
-                            recv_buf: Vec::new(),
-                        };
-                        progress_mysql_check(check, fdtab, poller, now, 0)
-                    } else {
-                        check.sub_state = CheckSubState::ProtoConnecting { target_addr: check.addr };
-                        Ok(CheckStep::pending(Some(check.exp)))
+                        if immediate {
+                            check.sub_state = CheckSubState::MysqlRunning {
+                                phase: 0,
+                                user,
+                                version,
+                                server_version: String::new(),
+                                send_offset: 0,
+                                req_buf,
+                                recv_buf: Vec::new(),
+                            };
+                            progress_mysql_check(check, fdtab, poller, now, 0)
+                        } else {
+                            check.sub_state = CheckSubState::ProtoConnecting { target_addr: check.addr };
+                            Ok(CheckStep::pending(Some(check.exp)))
+                        }
                     }
-                } else {
-                    let event = check.on_failure_full("L4CON", "Connection refused / error", 0, None, None);
-                    let next = check.schedule_next(now);
-                    check.next_check = next;
-                    Ok(CheckStep { next: Some(next), event })
+                    Err(e) => {
+                        let info = Some(format_l4_connect_error(&e));
+                        let event = check.on_failure_full("L4CON", "Layer4 connection problem", 0, None, info);
+                        let next = check.schedule_next(now);
+                        check.next_check = next;
+                        Ok(CheckStep { next: Some(next), event })
+                    }
                 }
             }
             ResolvedCheckConfig::Pgsql { user } => {
-                if let Ok((sock, immediate)) = raw::connect(check.addr) {
-                    let raw_fd = sock.as_raw_fd();
-                    check.check_fd = Some(raw_fd);
-                    let timeout_ms = u32::try_from(check.config.timeout.as_millis()).unwrap_or(u32::MAX);
-                    check.exp = now.add(timeout_ms);
-                    check.in_progress = true;
-                    fdtab.insert(raw_fd, FdState::Conn { task: check.task, conn: 0 }, Interest::WRITE);
-                    let _ = poller.add(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), false, true);
-                    check.sock = Some(sock);
+                match raw::connect(check.addr) {
+                    Ok((sock, immediate)) => {
+                        let raw_fd = sock.as_raw_fd();
+                        check.check_fd = Some(raw_fd);
+                        let timeout_ms = u32::try_from(check.config.timeout.as_millis()).unwrap_or(u32::MAX);
+                        check.exp = now.add(timeout_ms);
+                        check.in_progress = true;
+                        fdtab.insert(raw_fd, FdState::Conn { task: check.task, conn: 0 }, Interest::WRITE);
+                        let _ = poller.add(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), false, true);
+                        check.sock = Some(sock);
 
-                    if immediate {
-                        check.sub_state = CheckSubState::PgsqlRunning {
-                            phase: 0,
-                            user,
-                            send_offset: 0,
-                            req_buf: Vec::new(),
-                            recv_buf: Vec::new(),
-                        };
-                        progress_pgsql_check(check, fdtab, poller, now, 0)
-                    } else {
-                        check.sub_state = CheckSubState::ProtoConnecting { target_addr: check.addr };
-                        Ok(CheckStep::pending(Some(check.exp)))
+                        if immediate {
+                            check.sub_state = CheckSubState::PgsqlRunning {
+                                phase: 0,
+                                user,
+                                send_offset: 0,
+                                req_buf: Vec::new(),
+                                recv_buf: Vec::new(),
+                            };
+                            progress_pgsql_check(check, fdtab, poller, now, 0)
+                        } else {
+                            check.sub_state = CheckSubState::ProtoConnecting { target_addr: check.addr };
+                            Ok(CheckStep::pending(Some(check.exp)))
+                        }
                     }
-                } else {
-                    let event = check.on_failure_full("L4CON", "Connection refused / error", 0, None, None);
-                    let next = check.schedule_next(now);
-                    check.next_check = next;
-                    Ok(CheckStep { next: Some(next), event })
+                    Err(e) => {
+                        let info = Some(format_l4_connect_error(&e));
+                        let event = check.on_failure_full("L4CON", "Layer4 connection problem", 0, None, info);
+                        let next = check.schedule_next(now);
+                        check.next_check = next;
+                        Ok(CheckStep { next: Some(next), event })
+                    }
                 }
             }
             ResolvedCheckConfig::SslHello => {
-                if let Ok((sock, immediate)) = raw::connect(check.addr) {
-                    let raw_fd = sock.as_raw_fd();
-                    check.check_fd = Some(raw_fd);
-                    let timeout_ms = u32::try_from(check.config.timeout.as_millis()).unwrap_or(u32::MAX);
-                    check.exp = now.add(timeout_ms);
-                    check.in_progress = true;
-                    fdtab.insert(raw_fd, FdState::Conn { task: check.task, conn: 0 }, Interest::WRITE);
-                    let _ = poller.add(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), false, true);
-                    check.sock = Some(sock);
+                match raw::connect(check.addr) {
+                    Ok((sock, immediate)) => {
+                        let raw_fd = sock.as_raw_fd();
+                        check.check_fd = Some(raw_fd);
+                        let timeout_ms = u32::try_from(check.config.timeout.as_millis()).unwrap_or(u32::MAX);
+                        check.exp = now.add(timeout_ms);
+                        check.in_progress = true;
+                        fdtab.insert(raw_fd, FdState::Conn { task: check.task, conn: 0 }, Interest::WRITE);
+                        let _ = poller.add(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), false, true);
+                        check.sock = Some(sock);
 
-                    if immediate {
-                        check.sub_state = CheckSubState::SslHelloRunning {
-                            phase: 0,
-                            send_offset: 0,
-                            recv_buf: Vec::new(),
-                        };
-                        progress_ssl_hello_check(check, fdtab, poller, now, 0)
-                    } else {
-                        check.sub_state = CheckSubState::ProtoConnecting { target_addr: check.addr };
-                        Ok(CheckStep::pending(Some(check.exp)))
+                        if immediate {
+                            check.sub_state = CheckSubState::SslHelloRunning {
+                                phase: 0,
+                                send_offset: 0,
+                                recv_buf: Vec::new(),
+                            };
+                            progress_ssl_hello_check(check, fdtab, poller, now, 0)
+                        } else {
+                            check.sub_state = CheckSubState::ProtoConnecting { target_addr: check.addr };
+                            Ok(CheckStep::pending(Some(check.exp)))
+                        }
                     }
-                } else {
-                    let event = check.on_failure_full("L4CON", "Connection refused / error", 0, None, None);
-                    let next = check.schedule_next(now);
-                    check.next_check = next;
-                    Ok(CheckStep { next: Some(next), event })
+                    Err(e) => {
+                        let info = Some(format_l4_connect_error(&e));
+                        let event = check.on_failure_full("L4CON", "Layer4 connection problem", 0, None, info);
+                        let next = check.schedule_next(now);
+                        check.next_check = next;
+                        Ok(CheckStep { next: Some(next), event })
+                    }
                 }
             }
             ResolvedCheckConfig::TcpConnect => {
                 check.sub_state = CheckSubState::TcpConnecting;
-                if let Ok((sock, immediate)) = raw::connect(check.addr) {
-                    if immediate {
-                        let event = check.on_success(0);
+                match raw::connect(check.addr) {
+                    Ok((sock, immediate)) => {
+                        if immediate {
+                            let event = check.on_success(0);
+                            let next = check.schedule_next(now);
+                            check.next_check = next;
+                            return Ok(CheckStep {
+                                next: Some(next),
+                                event,
+                            });
+                        }
+                        let raw_fd = sock.as_raw_fd();
+                        check.check_fd = Some(raw_fd);
+                        let timeout_ms =
+                            u32::try_from(check.config.timeout.as_millis()).unwrap_or(u32::MAX);
+                        check.exp = now.add(timeout_ms);
+                        check.in_progress = true;
+
+                        fdtab.insert(
+                            raw_fd,
+                            FdState::Conn {
+                                task: check.task,
+                                conn: 0,
+                            },
+                            Interest::WRITE,
+                        );
+                        let _ = poller.add(
+                            sock.as_fd(),
+                            u64::try_from(raw_fd).unwrap_or(0),
+                            false,
+                            true,
+                        );
+                        check.sock = Some(sock);
+                        Ok(CheckStep::pending(Some(check.exp)))
+                    }
+                    Err(e) => {
+                        let info = Some(format_l4_connect_error(&e));
+                        let event = check.on_failure_full(
+                            "L4CON",
+                            "Layer4 connection problem",
+                            0,
+                            None,
+                            info,
+                        );
                         let next = check.schedule_next(now);
                         check.next_check = next;
-                        return Ok(CheckStep {
+                        Ok(CheckStep {
                             next: Some(next),
                             event,
-                        });
+                        })
                     }
-                    let raw_fd = sock.as_raw_fd();
-                    check.check_fd = Some(raw_fd);
-                    let timeout_ms =
-                        u32::try_from(check.config.timeout.as_millis()).unwrap_or(u32::MAX);
-                    check.exp = now.add(timeout_ms);
-                    check.in_progress = true;
-
-                    fdtab.insert(
-                        raw_fd,
-                        FdState::Conn {
-                            task: check.task,
-                            conn: 0,
-                        },
-                        Interest::WRITE,
-                    );
-                    let _ = poller.add(
-                        sock.as_fd(),
-                        u64::try_from(raw_fd).unwrap_or(0),
-                        false,
-                        true,
-                    );
-                    check.sock = Some(sock);
-                    Ok(CheckStep::pending(Some(check.exp)))
-                } else {
-                    let event = check.on_failure("L4CON", "Connection refused / error", 0);
-                    let next = check.schedule_next(now);
-                    check.next_check = next;
-                    Ok(CheckStep {
-                        next: Some(next),
-                        event,
-                    })
                 }
             }
         }
@@ -1969,6 +2033,14 @@ fn progress_smtp_check(
         recv_buf.clear();
         fdtab.set_interest(raw_fd, Interest::READ);
         let _ = poller.modify(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), true, false);
+        fdtab.clear_ready(raw_fd, false, true);
+        check.sub_state = CheckSubState::SmtpRunning {
+            phase,
+            cmd,
+            send_offset,
+            recv_buf,
+        };
+        return Ok(CheckStep::pending(Some(check.exp)));
     }
 
     if phase == 2 {
@@ -2102,6 +2174,14 @@ fn progress_smtp_check(
         recv_buf.clear();
         fdtab.set_interest(raw_fd, Interest::READ);
         let _ = poller.modify(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), true, false);
+        fdtab.clear_ready(raw_fd, false, true);
+        check.sub_state = CheckSubState::SmtpRunning {
+            phase,
+            cmd,
+            send_offset,
+            recv_buf,
+        };
+        return Ok(CheckStep::pending(Some(check.exp)));
     }
 
     if phase == 4 {

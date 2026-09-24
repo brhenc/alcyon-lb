@@ -1749,7 +1749,7 @@ class VtcExecutor:
             )
         except Exception as ex:
             elapsed = time.monotonic() - start_time
-            err_msg = str(ex) if str(ex) else traceback.format_exc()
+            err_msg = traceback.format_exc()
             for pid_name, p in self.proxies.items():
                 try:
                     if p.poll() is not None:
@@ -1941,6 +1941,8 @@ class VtcExecutor:
                     cfg_path = os.path.join(self.tmpdir, f"haproxy_{haproxy_id}_{len(self.temp_cfgs)}.cfg")
                     with open(cfg_path, "w") as f:
                         f.write(rewritten_cfg)
+                        if not rewritten_cfg.endswith("\n"):
+                            f.write("\n")
                     self.temp_cfgs.append(cfg_path)
                     if self.verbose:
                         print(f"     {Color.DIM}[haproxy {haproxy_id}] config {cfg_path}:{Color.RESET}")
@@ -1968,7 +1970,7 @@ class VtcExecutor:
                         if start_imm:
                             cli_sock = os.path.join(self.tmpdir, f"{haproxy_id}.sock")
                             proc = subprocess.Popen(
-                                [self.target_binary, "-f", cfg_path, "-S", cli_sock, "-d"],
+                                [self.target_binary, "-W", "-f", cfg_path, "-S", cli_sock, "-d"],
                                 stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE,
                             )

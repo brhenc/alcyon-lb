@@ -735,6 +735,11 @@ fn init_proxy_from_listen(proxy_idx: usize, listen: &ibex_config::ListenSection,
             if let Some(rise) = s.rise {
                 cfg.rise = rise;
             }
+            if let Some(chk_timeout) = listen.timeouts.check {
+                cfg.timeout = chk_timeout;
+            } else if let Some(inter) = s.inter {
+                cfg.timeout = inter;
+            }
             server_check_configs.push(Some(cfg));
         } else {
             server_check_configs.push(None);
@@ -920,6 +925,11 @@ fn init_proxy_from_backend(proxy_idx: usize, be: &ibex_config::BackendSection, n
             }
             if let Some(rise) = s.rise {
                 cfg.rise = rise;
+            }
+            if let Some(chk_timeout) = be.timeouts.check {
+                cfg.timeout = chk_timeout;
+            } else if let Some(inter) = s.inter {
+                cfg.timeout = inter;
             }
             server_check_configs.push(Some(cfg));
         } else {
@@ -2156,7 +2166,6 @@ fn eval_tcp_req_content_rules(
     }
 
     let req_bytes = sess.req.readable();
-    eprintln!("[DEBUG_RULES] eval_tcp_req_content_rules proxy={} req_bytes={:?}", proxy.name, req_bytes);
     let has_content = !req_bytes.is_empty();
     let expired = sess.inspect_exp.is_some_and(|exp| exp.is_expired(now));
     let client_closed = sess.cli_state == ScState::ShutR || sess.cli_state == ScState::Closed;
@@ -3203,7 +3212,6 @@ impl EngineDispatcher<'_> {
             let Some(entry) = self.sessions.get_mut(session_idx) else {
                 return Outcome::Done;
             };
-            eprintln!("[DEBUG_STREAM] step_stream: proxy={} cli_state={:?} srv_state={:?} rep_len={} req_len={}", self.proxies[entry.proxy_idx].name, entry.sess.cli_state, entry.sess.srv_state, entry.sess.rep.len(), entry.sess.req.len());
 
             // Step 1: Server connect check if connecting
             check_srv_connect(entry, self.proxies, self.fdtab, self.poller, now);
@@ -5348,11 +5356,9 @@ impl EngineDispatcher<'_> {
         let target = proxies[be_idx].select_server_with_key(source_ip, entry.sess.req_uri.as_deref());
 
         let Some(target_addr) = target else {
-            eprintln!("[DEBUG_BACKEND] connect_tcp_backend target=None for be={}", proxies[be_idx].name);
             entry.sess.srv_state = ScState::Error;
             return;
         };
-        eprintln!("[DEBUG_BACKEND] connect_tcp_backend target_addr={:?} for be={}", target_addr, proxies[be_idx].name);
 
         let s_idx = proxies[be_idx]
             .servers

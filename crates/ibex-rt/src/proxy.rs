@@ -152,6 +152,7 @@ pub struct TcpSession {
     pub inspect_exp: Option<Tick>,
     pub sess_vars: HashMap<String, String>,
     pub req_vars: HashMap<String, String>,
+    pub req_captures: Vec<String>,
     pub tracked_sc: [Option<(usize, StickKey)>; 3],
     pub bufsize: usize,
     pub maxrewrite: usize,
@@ -247,6 +248,7 @@ impl TcpSession {
             inspect_exp: None,
             sess_vars: HashMap::new(),
             req_vars: HashMap::new(),
+            req_captures: Vec::new(),
             tracked_sc: [None, None, None],
             connection_close: false,
             h2_ctx: None,
@@ -718,6 +720,18 @@ impl TcpSession {
         // Parse HTTP request headers if in Ready state
         if self.h2_ctx.is_none() && self.cli_state == ScState::Ready {
             let threshold = self.bufsize.saturating_sub(self.maxrewrite);
+            let req_data = self.req.readable();
+            if !req_data.is_empty() {
+                let first_byte = req_data[0];
+                let is_valid_method_char = first_byte.is_ascii_alphanumeric()
+                    || matches!(first_byte, b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~' | b'\r' | b'\n');
+                if !is_valid_method_char {
+                    self.send_synthetic_response(400, Some("text/html"), None);
+                    self.cli_state = ScState::ShutR;
+                    self.ending.get_or_insert(Ending::Error);
+                    return Ok(true);
+                }
+            }
             if let Some((hdr_len, eoh_len)) = find_eoh(self.req.readable()) {
                 let total_hdr_len = hdr_len + eoh_len;
 
@@ -1719,6 +1733,7 @@ pub fn eval_acl_term_extended<S: ::std::hash::BuildHasher>(
                     Some(ibex_sample::Matcher::Beg { prefix, .. }) => prefix.len(),
                     Some(ibex_sample::Matcher::End { suffix, .. }) => suffix.len(),
                     Some(ibex_sample::Matcher::Sub { sub, .. }) => sub.len(),
+                    Some(ibex_sample::Matcher::Bin(target)) => target.len(),
                     _ => 1,
                 };
                 offset.saturating_add(pat_len)

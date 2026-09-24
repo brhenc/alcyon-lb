@@ -124,23 +124,45 @@ impl Expr {
         let mut case_insensitive = false;
 
         if let Some(m_str) = matcher_part {
-            let mut parts = m_str.split_whitespace();
+            let tokens = tokenize_matcher_part(m_str);
+            let mut parts = tokens.into_iter();
             while let Some(arg) = parts.next() {
                 if arg == "-m" {
-                    match_method = parts
+                    let m_method = parts
                         .next()
                         .ok_or_else(|| "Missing matcher method after -m".to_string())?;
+                    match_method = match m_method.as_str() {
+                        "str" => "str",
+                        "beg" => "beg",
+                        "end" => "end",
+                        "sub" => "sub",
+                        "reg" => "reg",
+                        "int" => "int",
+                        "ip" => "ip",
+                        "len" => "len",
+                        "bin" => "bin",
+                        "found" => "found",
+                        other => return Err(format!("Unknown matcher method '{other}'")),
+                    };
                 } else if arg == "-i" {
                     case_insensitive = true;
                 } else if arg == "-n" {
                     // Negative / no-op flag
-                } else if matches!(arg, "gt" | "ge" | "lt" | "le" | "eq" | "ne") {
-                    match_method = arg;
+                } else if matches!(arg.as_str(), "gt" | "ge" | "lt" | "le" | "eq" | "ne") {
+                    match_method = match arg.as_str() {
+                        "gt" => "gt",
+                        "ge" => "ge",
+                        "lt" => "lt",
+                        "le" => "le",
+                        "eq" => "eq",
+                        "ne" => "ne",
+                        _ => "found",
+                    };
                     if let Some(next_tok) = parts.next() {
-                        pattern = next_tok.to_string();
+                        pattern = unescape_pattern(&next_tok);
                     }
                 } else if pattern.is_empty() {
-                    pattern = arg.to_string();
+                    pattern = unescape_pattern(&arg);
                 }
             }
         }
@@ -331,6 +353,106 @@ fn parse_call(input: &str) -> (String, Vec<String>) {
     } else {
         (input.to_string(), Vec::new())
     }
+}
+
+fn tokenize_matcher_part(input: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_quote = None;
+    let mut esc = false;
+
+    for ch in input.chars() {
+        if esc {
+            current.push('\\');
+            current.push(ch);
+            esc = false;
+            continue;
+        }
+        if ch == '\\' {
+            esc = true;
+            continue;
+        }
+        if let Some(q) = in_quote {
+            if ch == q {
+                in_quote = None;
+            } else {
+                current.push(ch);
+            }
+        } else if ch == '"' || ch == '\'' {
+            in_quote = Some(ch);
+        } else if ch.is_whitespace() {
+            if !current.is_empty() {
+                tokens.push(current);
+                current = String::new();
+            }
+        } else {
+            current.push(ch);
+        }
+    }
+    if esc {
+        current.push('\\');
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+fn unescape_pattern(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(&next) = chars.peek() {
+                match next {
+                    'r' => {
+                        out.push('\r');
+                        chars.next();
+                    }
+                    'n' => {
+                        out.push('\n');
+                        chars.next();
+                    }
+                    't' => {
+                        out.push('\t');
+                        chars.next();
+                    }
+                    '0' => {
+                        out.push('\0');
+                        chars.next();
+                    }
+                    '\\' => {
+                        out.push('\\');
+                        chars.next();
+                    }
+                    ' ' => {
+                        out.push(' ');
+                        chars.next();
+                    }
+                    '"' => {
+                        out.push('"');
+                        chars.next();
+                    }
+                    '\'' => {
+                        out.push('\'');
+                        chars.next();
+                    }
+                    '$' => {
+                        out.push('$');
+                        chars.next();
+                    }
+                    _ => {
+                        out.push(c);
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 #[cfg(test)]

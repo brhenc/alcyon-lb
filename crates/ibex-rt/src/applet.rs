@@ -186,12 +186,27 @@ impl CliApplet {
             for (k, v) in std::env::vars() {
                 self.out_buf.extend_from_slice(format!("{k}={v}\n").as_bytes());
             }
+            if self.interactive {
+                self.out_buf.extend_from_slice(b"\n> ");
+            } else {
+                self.is_done = true;
+            }
         } else if cmd == "show errors" {
             self.out_buf.extend_from_slice(b"Total events captured on [01/Jan/1970:00:00:00.000] : 0\n\n");
+            if self.interactive {
+                self.out_buf.extend_from_slice(b"\n> ");
+            } else {
+                self.is_done = true;
+            }
         } else if cmd == "show backend" {
             self.out_buf.extend_from_slice(b"# name\n");
             for p in ctx.proxies.iter() {
                 self.out_buf.extend_from_slice(format!("{}\n", p.name).as_bytes());
+            }
+            if self.interactive {
+                self.out_buf.extend_from_slice(b"\n> ");
+            } else {
+                self.is_done = true;
             }
         } else if cmd == "show servers state" || cmd.starts_with("show servers state ") {
             let be_filter = cmd.strip_prefix("show servers state").map(str::trim).filter(|s| !s.is_empty());
@@ -225,6 +240,11 @@ impl CliApplet {
                         ).as_bytes()
                     );
                 }
+            }
+            if self.interactive {
+                self.out_buf.extend_from_slice(b"\n> ");
+            } else {
+                self.is_done = true;
             }
         } else if cmd == "show stat" || cmd.starts_with("show stat ") {
             self.handle_show_stat(cmd, ctx);

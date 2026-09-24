@@ -41,6 +41,8 @@ pub enum Matcher {
     IpCidrV6 { network: u128, mask: u128 },
     /// Matches length.
     Len(usize),
+    /// Matches binary / hex payload.
+    Bin(Vec<u8>),
     /// Matches if sample exists / is found.
     Found,
 }
@@ -119,6 +121,21 @@ impl Matcher {
                     .map_err(|e| e.to_string())
             }
             "found" => Ok(Matcher::Found),
+            "bin" => {
+                let hex_str = pattern.trim().replace(' ', "");
+                let mut bytes = Vec::with_capacity(hex_str.len() / 2);
+                let chars: Vec<char> = hex_str.chars().collect();
+                if chars.len() % 2 != 0 {
+                    return Err(format!("Invalid hex binary pattern (odd length): {pattern}"));
+                }
+                for chunk in chars.chunks_exact(2) {
+                    let s: String = chunk.iter().collect();
+                    let b = u8::from_str_radix(&s, 16)
+                        .map_err(|e| format!("Invalid hex byte '{s}': {e}"))?;
+                    bytes.push(b);
+                }
+                Ok(Matcher::Bin(bytes))
+            }
             "len" => {
                 let l = pattern.parse::<usize>().map_err(|e| e.to_string())?;
                 Ok(Matcher::Len(l))
@@ -268,6 +285,15 @@ impl Matcher {
             Matcher::Len(expected_len) => {
                 if let Some(Sample::Str(s)) = cast(sample.clone(), SampleType::Str) {
                     s.len() == *expected_len
+                } else {
+                    false
+                }
+            }
+            Matcher::Bin(target) => {
+                if let Some(Sample::Bin(b)) = cast(sample.clone(), SampleType::Bin) {
+                    b == *target
+                } else if let Some(Sample::Str(s)) = cast(sample.clone(), SampleType::Str) {
+                    s.as_bytes() == target.as_slice()
                 } else {
                     false
                 }

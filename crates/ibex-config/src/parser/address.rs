@@ -184,6 +184,9 @@ pub(crate) fn parse_ip(s: &str, line: usize, col: usize) -> Result<IpAddr, Confi
     if s.is_empty() || s == "*" || s == "0" {
         return Ok(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
     }
+    if s.eq_ignore_ascii_case("localhost") {
+        return Ok(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
     s.parse::<IpAddr>()
         .map_err(|_| ConfigError::new(line, col, format!("invalid IP address '{s}'")))
 }

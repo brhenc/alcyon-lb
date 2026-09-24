@@ -110,6 +110,8 @@ pub struct SampleContext<'a> {
     pub so_name: Option<&'a str>,
     pub fc_rtt: Option<u32>,
     pub fc_rttvar: Option<u32>,
+    pub bc_rtt: Option<u32>,
+    pub bc_rttvar: Option<u32>,
     pub captures_req_hdr: Option<&'a [String]>,
     pub captures_res_hdr: Option<&'a [String]>,
     pub vars: Option<&'a HashMap<String, String>>,
@@ -396,6 +398,16 @@ impl Registry {
             name: "fc_rttvar",
             out_type: SampleType::Sint,
             func: |ctx, _args| Some(Sample::Sint(i64::from(ctx.fc_rttvar.unwrap_or(0)))),
+        });
+        self.register_fetch(FetchDesc {
+            name: "bc_rtt",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| Some(Sample::Sint(i64::from(ctx.bc_rtt.unwrap_or(0)))),
+        });
+        self.register_fetch(FetchDesc {
+            name: "bc_rttvar",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| Some(Sample::Sint(i64::from(ctx.bc_rttvar.unwrap_or(0)))),
         });
 
         // --- 2. HTTP Request Line & URL Fetches ---
