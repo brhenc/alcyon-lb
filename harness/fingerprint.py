@@ -9,10 +9,13 @@ import hashlib
 from collections import defaultdict
 import tempfile
 
-sys.path.insert(0, "/home/bhenc/project-ibex/harness")
+# Derived from this file's own location. The committed version hardcoded
+# /home/bhenc/project-ibex, which makes the script work on exactly one checkout.
+HARNESS_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HARNESS_DIR)
 import smoke
 
-REPO = os.path.dirname("/home/bhenc/project-ibex/harness")
+REPO = os.path.dirname(HARNESS_DIR)
 
 def normalize_whitespace(text):
     return " ".join(text.split())

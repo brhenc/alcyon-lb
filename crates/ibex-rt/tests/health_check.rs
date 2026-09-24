@@ -269,3 +269,76 @@ fn no_log_directive_means_no_datagrams() {
         "a proxy with no log directive sent a datagram"
     );
 }
+
+/// HAProxy reports a check result when the status *code* changes, independently of the
+/// health counter: `set_server_check_status()` opens with
+///
+///     int report = (status != prev_status) ? 1 : 0;
+///
+/// (`src/check.c`, HAProxy 3.5-dev7) and the health-counter branches below it can only
+/// raise `report`, never clear it.
+///
+/// That first term is what makes the very first check after boot loggable. A server with
+/// `check` starts at `health == rise`, which is already full health for `rise 1 fall 1`,
+/// so the counter does not move on the first success — but the status code goes from the
+/// initial value to `L7OK`, and HAProxy logs it. Verified against the reference binary:
+///
+///     backend be1
+///       option log-health-checks
+///       option redis-check
+///       server srv 127.0.0.1:$PORT check inter 1s rise 1 fall 1
+///
+///     <29>... haproxy[...]: Health check for server be1/srv succeeded, reason: Layer7
+///     check passed, code: 0, info: "Redis server is ok", check duration: 0ms, status: 1/1 UP.
+///
+/// Without the status-code term Ibex returns `None` here and the line is never emitted,
+/// which is why every reg-test in tasks/T54 asserts on a datagram that never arrives.
+#[test]
+fn first_check_result_is_reported_even_when_the_health_counter_does_not_move() {
+    use ibex_rt::{CheckEvent, ServerCheckConfig, ServerCheckState};
+    use ibex_sched::Tick;
+
+    let config = ServerCheckConfig {
+        inter: Duration::from_millis(1000),
+        rise: 1,
+        fall: 1,
+        timeout: Duration::from_millis(2000),
+    };
+    let addr: SocketAddr = "127.0.0.1:1".parse().expect("addr");
+    let mut check = ServerCheckState::new(0, 0, addr, config, Tick(0));
+
+    // `rise 1 fall 1` puts a fresh server at full health already, so the counter cannot
+    // move. HAProxy still logs this one, because the status code changed.
+    let event = check.on_success_full(
+        "L7OK",
+        "Layer7 check passed",
+        0,
+        None,
+        Some("Redis server is ok".to_string()),
+    );
+    assert!(
+        matches!(event, Some(CheckEvent::Succeeded | CheckEvent::WentUp)),
+        "the first successful check must be reported; HAProxy logs it because the status \
+         code changed, not because the health counter moved (got {event:?})"
+    );
+    assert_eq!(
+        check.log_line("be1", "srv", event.expect("event")),
+        "Health check for server be1/srv succeeded, reason: Layer7 check passed, \
+         info: \"Redis server is ok\", check duration: 0ms, status: 1/1 UP."
+    );
+
+    // A second identical result moves nothing and repeats the same status code, so
+    // HAProxy stays silent: one datagram per steady state, not one per interval.
+    let repeat = check.on_success_full(
+        "L7OK",
+        "Layer7 check passed",
+        0,
+        None,
+        Some("Redis server is ok".to_string()),
+    );
+    assert!(
+        repeat.is_none(),
+        "an unchanged status code with an unchanged health counter must not be reported \
+         (got {repeat:?})"
+    );
+}

@@ -231,8 +231,8 @@ impl ServerCheckState {
             check_fd: None,
             exp: Tick::ETERNITY,
             next_check: now,
-            last_status_desc: "Initial state",
-            last_status_code: "L4OK",
+            last_status_desc: "Initializing",
+            last_status_code: "INI",
             http_code: None,
             last_status_info: None,
             resolved_config,
@@ -278,6 +278,16 @@ impl ServerCheckState {
         self.total_checks += 1;
         self.fall_count = 0;
         self.rise_count += 1;
+        // HAProxy opens set_server_check_status() with
+        //
+        //     int report = (status != prev_status) ? 1 : 0;
+        //
+        // (src/check.c) and the health-counter branches below it can only raise `report`,
+        // never clear it. A result whose status code differs from the previous one is
+        // therefore always reported, even when the counter is pinned at full health --
+        // which is what makes the first check after boot loggable under
+        // `option log-health-checks`.
+        let status_changed = self.last_status_code != code;
         self.last_status_code = code;
         self.last_status_desc = desc;
         self.http_code = http_code;
@@ -285,7 +295,11 @@ impl ServerCheckState {
         self.check_duration_ms = duration_ms;
 
         if self.health >= self.full_health() {
-            return None;
+            return if status_changed {
+                Some(CheckEvent::Succeeded)
+            } else {
+                None
+            };
         }
         self.health += 1;
         if self.health >= self.config.rise {
@@ -311,6 +325,8 @@ impl ServerCheckState {
         self.failed_checks += 1;
         self.rise_count = 0;
         self.fall_count += 1;
+        // See on_success_full: the status-code change is HAProxy's first reporting term.
+        let status_changed = self.last_status_code != code;
         self.last_status_code = code;
         self.last_status_desc = desc;
         self.http_code = http_code;
@@ -318,7 +334,11 @@ impl ServerCheckState {
         self.check_duration_ms = duration_ms;
 
         if self.health == 0 {
-            return None;
+            return if status_changed {
+                Some(CheckEvent::Failed)
+            } else {
+                None
+            };
         }
         self.health -= 1;
         if self.health < self.config.rise {
@@ -626,13 +646,19 @@ pub fn step_check(
                             progress_ldap_check(check, fdtab, poller, now, duration)
                         }
                         Some(ResolvedCheckConfig::Mysql { user, version }) => {
+                            let req_buf = user.as_deref().map(|u| build_mysql_req(u, version)).unwrap_or_default();
+                            let initial_interest = if req_buf.is_empty() { Interest::READ } else { Interest::WRITE };
+                            fdtab.set_interest(raw_fd, initial_interest);
+                            if let Some(sock) = check.sock.as_ref() {
+                                let _ = poller.modify(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), initial_interest.readable, initial_interest.writable);
+                            }
                             check.sub_state = CheckSubState::MysqlRunning {
                                 phase: 0,
                                 user,
                                 version,
                                 server_version: String::new(),
                                 send_offset: 0,
-                                req_buf: Vec::new(),
+                                req_buf,
                                 recv_buf: Vec::new(),
                             };
                             progress_mysql_check(check, fdtab, poller, now, duration)
@@ -920,8 +946,10 @@ pub fn step_check(
                     let timeout_ms = u32::try_from(check.config.timeout.as_millis()).unwrap_or(u32::MAX);
                     check.exp = now.add(timeout_ms);
                     check.in_progress = true;
-                    fdtab.insert(raw_fd, FdState::Conn { task: check.task, conn: 0 }, Interest::READ);
-                    let _ = poller.add(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), true, false);
+                    let req_buf = user.as_deref().map(|u| build_mysql_req(u, version)).unwrap_or_default();
+                    let initial_interest = if req_buf.is_empty() { Interest::READ } else { Interest::WRITE };
+                    fdtab.insert(raw_fd, FdState::Conn { task: check.task, conn: 0 }, initial_interest);
+                    let _ = poller.add(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), initial_interest.readable, initial_interest.writable);
                     check.sock = Some(sock);
 
                     if immediate {
@@ -931,7 +959,7 @@ pub fn step_check(
                             version,
                             server_version: String::new(),
                             send_offset: 0,
-                            req_buf: Vec::new(),
+                            req_buf,
                             recv_buf: Vec::new(),
                         };
                         progress_mysql_check(check, fdtab, poller, now, 0)
@@ -1680,7 +1708,6 @@ fn progress_redis_check(
         return Ok(CheckStep::pending(Some(next)));
     };
 
-    eprintln!("[DEBUG_CHECK] progress_redis_check: phase={phase}, check.addr={:?}, duration={duration}", check.addr);
     if phase == 0 {
         let ping_req = b"*1\r\n$4\r\nPING\r\n";
         while send_offset < ping_req.len() {
@@ -1738,7 +1765,6 @@ fn progress_redis_check(
         }
 
         let has_crlf = recv_buf.windows(2).any(|w| w == b"\r\n");
-        eprintln!("[DEBUG_CHECK_PHASE1] recv_buf={:?} eof={} has_crlf={}", recv_buf, eof, has_crlf);
         if !has_crlf && !eof {
             fdtab.clear_ready(raw_fd, true, false);
             check.sub_state = CheckSubState::RedisRunning {
@@ -2425,6 +2451,79 @@ fn progress_ldap_check(
     Ok(CheckStep::pending(Some(next)))
 }
 
+fn build_mysql_req(user: &str, version: MysqlCheckVersion) -> Vec<u8> {
+    let ubytes = user.as_bytes();
+    let mut pkt = Vec::new();
+    match version {
+        MysqlCheckVersion::Pre41 => {
+            let packetlen = ubytes.len() + 7;
+            pkt.extend_from_slice(&[
+                (packetlen & 0xff) as u8,
+                ((packetlen >> 8) & 0xff) as u8,
+                ((packetlen >> 16) & 0xff) as u8,
+                1,
+                0x00,
+                0x80,
+                0x00,
+                0x00,
+                0x01,
+            ]);
+            pkt.extend_from_slice(ubytes);
+            pkt.push(0);
+            pkt.push(0);
+            pkt.extend_from_slice(&[0x01, 0x00, 0x00, 0x00, 0x01]);
+        }
+        MysqlCheckVersion::Post41 => {
+            let packetlen = ubytes.len() + 7 + 27;
+            pkt.extend_from_slice(&[
+                (packetlen & 0xff) as u8,
+                ((packetlen >> 8) & 0xff) as u8,
+                ((packetlen >> 16) & 0xff) as u8,
+                1,
+                0x00,
+                0x82,
+                0x00,
+                0x00,
+                0x00,
+                0x80,
+                0x00,
+                0x01,
+                0x21,
+            ]);
+            pkt.extend_from_slice(&[0u8; 23]);
+            pkt.extend_from_slice(ubytes);
+            pkt.push(0);
+            pkt.push(0);
+            pkt.extend_from_slice(&[0x01, 0x00, 0x00, 0x00, 0x01]);
+        }
+        MysqlCheckVersion::Post80 => {
+            let packetlen = ubytes.len() + 7 + 27 + 22;
+            pkt.extend_from_slice(&[
+                (packetlen & 0xff) as u8,
+                ((packetlen >> 8) & 0xff) as u8,
+                ((packetlen >> 16) & 0xff) as u8,
+                1,
+                0x00,
+                0x82,
+                0x08,
+                0x00,
+                0x00,
+                0x80,
+                0x00,
+                0x01,
+                0x21,
+            ]);
+            pkt.extend_from_slice(&[0u8; 23]);
+            pkt.extend_from_slice(ubytes);
+            pkt.push(0);
+            pkt.push(0);
+            pkt.extend_from_slice(b"mysql_native_password\0");
+            pkt.extend_from_slice(&[0x01, 0x00, 0x00, 0x00, 0x01]);
+        }
+    }
+    pkt
+}
+
 #[allow(clippy::too_many_lines, clippy::unnecessary_wraps)]
 fn progress_mysql_check(
     check: &mut ServerCheckState,
@@ -2450,7 +2549,7 @@ fn progress_mysql_check(
         version,
         mut server_version,
         mut send_offset,
-        mut req_buf,
+        req_buf,
         mut recv_buf,
     } = check.sub_state.clone()
     else {
@@ -2460,9 +2559,52 @@ fn progress_mysql_check(
     };
 
     if phase == 0 {
+        if !req_buf.is_empty() {
+            while send_offset < req_buf.len() {
+                match raw::send(sock.as_fd(), &req_buf[send_offset..]) {
+                    Ok(Io::Done(n)) => {
+                        send_offset += n;
+                    }
+                    Ok(Io::WouldBlock) => {
+                        fdtab.clear_ready(raw_fd, false, true);
+                        check.sub_state = CheckSubState::MysqlRunning {
+                            phase,
+                            user,
+                            version,
+                            server_version,
+                            send_offset,
+                            req_buf,
+                            recv_buf,
+                        };
+                        return Ok(CheckStep::pending(Some(check.exp)));
+                    }
+                    Ok(Io::Closed | Io::Eof) | Err(_) => {
+                        cleanup_check_socket(check, fdtab, poller);
+                        let event = check.on_failure_full(
+                            "L7RSP",
+                            "Layer7 invalid response",
+                            duration,
+                            None,
+                            None,
+                        );
+                        let next = check.schedule_next(now);
+                        check.next_check = next;
+                        return Ok(CheckStep {
+                            next: Some(next),
+                            event,
+                        });
+                    }
+                }
+            }
+        }
+        phase = 1;
+        send_offset = 0;
+        recv_buf.clear();
         fdtab.set_interest(raw_fd, Interest::READ);
         let _ = poller.modify(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), true, false);
+    }
 
+    if phase == 1 {
         let mut buf = [0u8; 4096];
         let mut eof = false;
         loop {
@@ -2508,21 +2650,37 @@ fn progress_mysql_check(
             });
         }
 
-        let plen = recv_buf[0] as usize
+        let plen_hs = recv_buf[0] as usize
             | ((recv_buf[1] as usize) << 8)
             | ((recv_buf[2] as usize) << 16);
-        if recv_buf.len() < 4 + plen && !eof {
-            fdtab.clear_ready(raw_fd, true, false);
-            check.sub_state = CheckSubState::MysqlRunning {
-                phase,
-                user,
-                version,
-                server_version,
-                send_offset,
-                req_buf,
-                recv_buf,
-            };
-            return Ok(CheckStep::pending(Some(check.exp)));
+        if recv_buf.len() < 4 + plen_hs {
+            if !eof {
+                fdtab.clear_ready(raw_fd, true, false);
+                check.sub_state = CheckSubState::MysqlRunning {
+                    phase,
+                    user,
+                    version,
+                    server_version,
+                    send_offset,
+                    req_buf,
+                    recv_buf,
+                };
+                return Ok(CheckStep::pending(Some(check.exp)));
+            }
+            cleanup_check_socket(check, fdtab, poller);
+            let event = check.on_failure_full(
+                "L7RSP",
+                "Layer7 invalid response",
+                duration,
+                None,
+                None,
+            );
+            let next = check.schedule_next(now);
+            check.next_check = next;
+            return Ok(CheckStep {
+                next: Some(next),
+                event,
+            });
         }
 
         if recv_buf.len() < 5 {
@@ -2542,98 +2700,26 @@ fn progress_mysql_check(
             });
         }
 
-        let srv_ver_bytes = &recv_buf[5..];
-        let null_pos = srv_ver_bytes
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(srv_ver_bytes.len());
-        server_version = String::from_utf8_lossy(&srv_ver_bytes[..null_pos]).to_string();
-
-        if let Some(ref username) = user {
-            let ubytes = username.as_bytes();
-            let mut pkt = Vec::new();
-            match version {
-                MysqlCheckVersion::Pre41 => {
-                    let packetlen = ubytes.len() + 7;
-                    pkt.extend_from_slice(&[
-                        (packetlen & 0xff) as u8,
-                        ((packetlen >> 8) & 0xff) as u8,
-                        ((packetlen >> 16) & 0xff) as u8,
-                        1,
-                        0x00,
-                        0x80,
-                        0x00,
-                        0x00,
-                        0x01,
-                    ]);
-                    pkt.extend_from_slice(ubytes);
-                    pkt.push(0);
-                    pkt.push(0);
-                    pkt.extend_from_slice(&[0x01, 0x00, 0x00, 0x00, 0x01]);
-                }
-                MysqlCheckVersion::Post41 => {
-                    let packetlen = ubytes.len() + 7 + 27;
-                    pkt.extend_from_slice(&[
-                        (packetlen & 0xff) as u8,
-                        ((packetlen >> 8) & 0xff) as u8,
-                        ((packetlen >> 16) & 0xff) as u8,
-                        1,
-                        0x00,
-                        0x82,
-                        0x00,
-                        0x00,
-                        0x00,
-                        0x80,
-                        0x00,
-                        0x01,
-                        0x21,
-                    ]);
-                    pkt.extend_from_slice(&[0u8; 23]);
-                    pkt.extend_from_slice(ubytes);
-                    pkt.push(0);
-                    pkt.push(0);
-                    pkt.extend_from_slice(&[0x01, 0x00, 0x00, 0x00, 0x01]);
-                }
-                MysqlCheckVersion::Post80 => {
-                    let packetlen = ubytes.len() + 7 + 27 + 22;
-                    pkt.extend_from_slice(&[
-                        (packetlen & 0xff) as u8,
-                        ((packetlen >> 8) & 0xff) as u8,
-                        ((packetlen >> 16) & 0xff) as u8,
-                        1,
-                        0x00,
-                        0x82,
-                        0x08,
-                        0x00,
-                        0x00,
-                        0x80,
-                        0x00,
-                        0x01,
-                        0x21,
-                    ]);
-                    pkt.extend_from_slice(&[0u8; 23]);
-                    pkt.extend_from_slice(ubytes);
-                    pkt.push(0);
-                    pkt.push(0);
-                    pkt.extend_from_slice(b"mysql_native_password\0");
-                    pkt.extend_from_slice(&[0x01, 0x00, 0x00, 0x00, 0x01]);
-                }
-            }
-
-            req_buf = pkt;
-            phase = 1;
-            send_offset = 0;
-            recv_buf.clear();
-            fdtab.set_interest(raw_fd, Interest::WRITE);
-            let _ = poller.modify(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), false, true);
-        } else {
+        if recv_buf[4] == 0xff {
+            let err_code = if recv_buf.len() >= 7 {
+                recv_buf[5] as u16 | ((recv_buf[6] as u16) << 8)
+            } else {
+                0
+            };
+            let info = if recv_buf.len() >= 8 {
+                let msg_bytes = &recv_buf[7..4 + plen_hs];
+                let null_end = msg_bytes.iter().position(|&b| b == 0).unwrap_or(msg_bytes.len());
+                String::from_utf8_lossy(&msg_bytes[..null_end]).to_string()
+            } else {
+                "Error".to_string()
+            };
             cleanup_check_socket(check, fdtab, poller);
-            let event = check.on_success_full(
-                "L7OK",
-                "Layer7 check passed",
+            let event = check.on_failure_full(
+                "L7STS",
+                "Layer7 wrong status",
                 duration,
-                None,
-                Some(server_version),
+                Some(err_code),
+                Some(info),
             );
             let next = check.schedule_next(now);
             check.next_check = next;
@@ -2642,16 +2728,19 @@ fn progress_mysql_check(
                 event,
             });
         }
-    }
 
-    if phase == 1 {
-        while send_offset < req_buf.len() {
-            match raw::send(sock.as_fd(), &req_buf[send_offset..]) {
-                Ok(Io::Done(n)) => {
-                    send_offset += n;
-                }
-                Ok(Io::WouldBlock) => {
-                    fdtab.clear_ready(raw_fd, false, true);
+        let srv_ver_bytes = &recv_buf[5..4 + plen_hs];
+        let null_pos = srv_ver_bytes
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(srv_ver_bytes.len());
+        server_version = String::from_utf8_lossy(&srv_ver_bytes[..null_pos]).to_string();
+
+        if user.is_some() {
+            let offset = 4 + plen_hs;
+            if recv_buf.len() < offset + 4 {
+                if !eof {
+                    fdtab.clear_ready(raw_fd, true, false);
                     check.sub_state = CheckSubState::MysqlRunning {
                         phase,
                         user,
@@ -2663,70 +2752,91 @@ fn progress_mysql_check(
                     };
                     return Ok(CheckStep::pending(Some(check.exp)));
                 }
-                Ok(Io::Closed | Io::Eof) | Err(_) => {
-                    cleanup_check_socket(check, fdtab, poller);
-                    let event = check.on_failure_full(
-                        "L7RSP",
-                        "Layer7 invalid response",
-                        duration,
-                        None,
-                        None,
-                    );
-                    let next = check.schedule_next(now);
-                    check.next_check = next;
-                    return Ok(CheckStep {
-                        next: Some(next),
-                        event,
-                    });
-                }
+                cleanup_check_socket(check, fdtab, poller);
+                let event = check.on_failure_full(
+                    "L7RSP",
+                    "Layer7 invalid response",
+                    duration,
+                    None,
+                    None,
+                );
+                let next = check.schedule_next(now);
+                check.next_check = next;
+                return Ok(CheckStep {
+                    next: Some(next),
+                    event,
+                });
             }
-        }
-        phase = 2;
-        send_offset = 0;
-        recv_buf.clear();
-        fdtab.set_interest(raw_fd, Interest::READ);
-        let _ = poller.modify(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), true, false);
-    }
 
-    if phase == 2 {
-        let mut buf = [0u8; 4096];
-        let mut eof = false;
-        loop {
-            match raw::recv(sock.as_fd(), &mut buf) {
-                Ok(Io::Done(n)) => {
-                    recv_buf.extend_from_slice(&buf[..n]);
+            let plen_res = recv_buf[offset] as usize
+                | ((recv_buf[offset + 1] as usize) << 8)
+                | ((recv_buf[offset + 2] as usize) << 16);
+            if recv_buf.len() < offset + 4 + plen_res {
+                if !eof {
+                    fdtab.clear_ready(raw_fd, true, false);
+                    check.sub_state = CheckSubState::MysqlRunning {
+                        phase,
+                        user,
+                        version,
+                        server_version,
+                        send_offset,
+                        req_buf,
+                        recv_buf,
+                    };
+                    return Ok(CheckStep::pending(Some(check.exp)));
                 }
-                Ok(Io::WouldBlock) => break,
-                Ok(Io::Eof | Io::Closed) | Err(_) => {
-                    eof = true;
-                    break;
-                }
+                cleanup_check_socket(check, fdtab, poller);
+                let event = check.on_failure_full(
+                    "L7RSP",
+                    "Layer7 invalid response",
+                    duration,
+                    None,
+                    None,
+                );
+                let next = check.schedule_next(now);
+                check.next_check = next;
+                return Ok(CheckStep {
+                    next: Some(next),
+                    event,
+                });
             }
-        }
 
-        if recv_buf.len() < 4 && !eof {
-            fdtab.clear_ready(raw_fd, true, false);
-            check.sub_state = CheckSubState::MysqlRunning {
-                phase,
-                user,
-                version,
-                server_version,
-                send_offset,
-                req_buf,
-                recv_buf,
-            };
-            return Ok(CheckStep::pending(Some(check.exp)));
-        }
-
-        if recv_buf.len() < 5 {
+            let res_type = recv_buf[offset + 4];
             cleanup_check_socket(check, fdtab, poller);
-            let event = check.on_failure_full(
-                "L7RSP",
-                "Layer7 invalid response",
-                duration,
-                None,
-                None,
-            );
+            let event = if res_type == 0xff {
+                let err_code = if recv_buf.len() >= offset + 7 {
+                    recv_buf[offset + 5] as u16 | ((recv_buf[offset + 6] as u16) << 8)
+                } else {
+                    0
+                };
+                let mut msg_offset = offset + 7;
+                if recv_buf.len() > msg_offset && recv_buf[msg_offset] == b'#' {
+                    msg_offset += 6;
+                }
+                let err_msg = if recv_buf.len() > msg_offset {
+                    let end_pos = (offset + 4 + plen_res).min(recv_buf.len());
+                    String::from_utf8_lossy(&recv_buf[msg_offset..end_pos])
+                        .trim_end_matches(&['\r', '\n', '\0'][..])
+                        .to_string()
+                } else {
+                    String::new()
+                };
+                check.on_failure_full(
+                    "L7STS",
+                    "Layer7 wrong status",
+                    duration,
+                    Some(err_code),
+                    Some(err_msg),
+                )
+            } else {
+                check.on_success_full(
+                    "L7OK",
+                    "Layer7 check passed",
+                    duration,
+                    None,
+                    Some(server_version),
+                )
+            };
             let next = check.schedule_next(now);
             check.next_check = next;
             return Ok(CheckStep {
@@ -2735,58 +2845,14 @@ fn progress_mysql_check(
             });
         }
 
-        let plen = recv_buf[0] as usize
-            | ((recv_buf[1] as usize) << 8)
-            | ((recv_buf[2] as usize) << 16);
-        if recv_buf.len() < 4 + plen && !eof {
-            fdtab.clear_ready(raw_fd, true, false);
-            check.sub_state = CheckSubState::MysqlRunning {
-                phase,
-                user,
-                version,
-                server_version,
-                send_offset,
-                req_buf,
-                recv_buf,
-            };
-            return Ok(CheckStep::pending(Some(check.exp)));
-        }
-
-        let packet_type = recv_buf[4];
         cleanup_check_socket(check, fdtab, poller);
-        let event = if packet_type == 0xff {
-            let err_code = if recv_buf.len() >= 7 {
-                recv_buf[5] as u16 | ((recv_buf[6] as u16) << 8)
-            } else {
-                0
-            };
-            let mut msg_offset = 7;
-            if recv_buf.len() > msg_offset && recv_buf[msg_offset] == b'#' {
-                msg_offset += 6;
-            }
-            let err_msg = if recv_buf.len() > msg_offset {
-                String::from_utf8_lossy(&recv_buf[msg_offset..])
-                    .trim_end_matches(&['\r', '\n', '\0'][..])
-                    .to_string()
-            } else {
-                String::new()
-            };
-            check.on_failure_full(
-                "L7STS",
-                "Layer7 wrong status",
-                duration,
-                Some(err_code),
-                Some(err_msg),
-            )
-        } else {
-            check.on_success_full(
-                "L7OK",
-                "Layer7 check passed",
-                duration,
-                None,
-                Some(server_version),
-            )
-        };
+        let event = check.on_success_full(
+            "L7OK",
+            "Layer7 check passed",
+            duration,
+            None,
+            Some(server_version),
+        );
         let next = check.schedule_next(now);
         check.next_check = next;
         return Ok(CheckStep {

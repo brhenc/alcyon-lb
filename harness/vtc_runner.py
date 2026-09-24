@@ -596,6 +596,51 @@ def parse_inner_actions(block_content: str) -> List[ActionItem]:
     return actions
 
 
+# varnishtest matches with POSIX ERE, which has bracket expressions Python's `re` does
+# not: `[[:digit:]]` compiles in Python as the class `[[:digit]` followed by a literal
+# `]`, so it silently matches the wrong thing instead of raising. Every health-check
+# reg-test writes its `check duration` assertion that way.
+_POSIX_CLASSES = {
+    "alpha": "a-zA-Z",
+    "digit": "0-9",
+    "alnum": "a-zA-Z0-9",
+    "upper": "A-Z",
+    "lower": "a-z",
+    "xdigit": "0-9A-Fa-f",
+    "space": r"\s",
+    "blank": r" \t",
+    "word": r"\w",
+    "punct": r"!-/:-@\[-`{-~",
+    "cntrl": r"\x00-\x1f\x7f",
+    "print": r"\x20-\x7e",
+    "graph": r"\x21-\x7e",
+}
+
+
+def _posix_classes_to_python(pattern: str) -> str:
+    """Rewrites POSIX bracket expressions into the ranges Python's `re` understands."""
+    return re.sub(
+        r"\[:(\w+):\]",
+        lambda m: _POSIX_CLASSES.get(m.group(1), m.group(0)),
+        pattern,
+    )
+
+
+def _unescape_vtc_string(text: str) -> str:
+    """Resolves the backslash escapes varnishtest applies to a double-quoted string."""
+    out = []
+    i = 0
+    while i < len(text):
+        if text[i] == "\\" and i + 1 < len(text):
+            nxt = text[i + 1]
+            out.append({"n": "\n", "r": "\r", "t": "\t"}.get(nxt, nxt))
+            i += 2
+        else:
+            out.append(text[i])
+            i += 1
+    return "".join(out)
+
+
 # ---------------------------------------------------------------------------
 # Macro Engine
 # ---------------------------------------------------------------------------
@@ -853,7 +898,22 @@ def preprocess_haproxy_config(
     # number this project quoted was measured through that filter.
     cleaned_lines: List[str] = list(lines)
 
-    for line in cleaned_lines:
+    # Which section headers already carry their own `bind`? A bare `listen <name>` gets a
+    # synthetic bind below so the section has somewhere to listen, but `listen mysql1` +
+    # `bind "fd@${mysql1}"` allocates the same port under the same key twice and emits the
+    # line twice. Ibex refuses the duplicate and the whole listener is lost, so the proxy's
+    # own health check reports "Connection refused" against a port it was meant to serve.
+    _section_has_own_bind: Dict[int, bool] = {}
+    _cur_header_idx = -1
+    for _idx, _line in enumerate(cleaned_lines):
+        _t = _line.strip()
+        if re.match(r"^(listen|frontend|backend|defaults|global)\b", _t):
+            _cur_header_idx = _idx
+            _section_has_own_bind[_idx] = False
+        elif _t.startswith("bind") and _cur_header_idx >= 0:
+            _section_has_own_bind[_cur_header_idx] = True
+
+    for line_idx, line in enumerate(cleaned_lines):
         trimmed = line.strip()
 
         # Check section headers
@@ -898,6 +958,11 @@ def preprocess_haproxy_config(
 
         # Check if line is 'listen <name>' without address
         listen_no_addr_m = re.match(r"^(\s*listen\s+([^\s{]+))\s*$", line)
+        if listen_no_addr_m and _section_has_own_bind.get(line_idx, False):
+            # The section binds itself; leave the header alone and let its own `bind` line
+            # be rewritten by the branch above.
+            out_lines.append(line)
+            continue
         if listen_no_addr_m:
             l_name = listen_no_addr_m.group(2)
             if l_name not in allocated_ports:
@@ -974,22 +1039,33 @@ class SyslogRunner:
         self._thread = threading.Thread(target=loop, daemon=True)
         self._thread.start()
 
-    def wait(self, timeout: float = 5.0) -> None:
+    async def wait(self, timeout: float = 5.0) -> None:
         """Waits until every expectation has matched, or the timeout expires.
 
         Returns rather than raising on timeout; the caller reports the mismatch so the
         failure names which pattern never arrived.
+
+        This has to yield to the event loop. `syslog S -wait` is the last thing a
+        health-check .vtc does, and it runs for as long as the collector is short an
+        expectation -- five seconds by default. A synchronous `time.sleep` here blocks
+        the loop for that whole window, so any mock server whose accept callback has not
+        already run never gets one: the proxy's check connects, sends, and waits for a
+        reply from a server that cannot be scheduled. It then reports a protocol timeout
+        that is entirely the harness's doing. That is what made `server s2` in
+        checks/redis-check.vtc look like an Ibex defect.
         """
         deadline = time.time() + timeout
         while time.time() < deadline:
             if self.unmatched() == []:
                 return
-            time.sleep(0.05)
+            await asyncio.sleep(0.05)
 
     def unmatched(self) -> List[str]:
         """Expectations with no matching datagram, in order."""
         missing = []
-        for pat in self.expectations:
+        for raw_pat in self.expectations:
+            # Late expansion: `${h1_pid}` does not exist until the proxy is running.
+            pat = _posix_classes_to_python(self.macro_engine.expand(raw_pat))
             try:
                 rx = re.compile(pat)
             except re.error:
@@ -1045,6 +1121,8 @@ class MockServerRunner:
         self.macro_engine.set(f"{self.server_id}_sock", f"127.0.0.1 {self.port}")
 
     async def _handle_incoming(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        if self.verbose:
+            print(f"       {Color.DIM}[{self.server_id}] accepted connection{Color.RESET}")
         await self.conn_queue.put((reader, writer))
 
     def start(self) -> None:
@@ -1140,17 +1218,28 @@ class MockServerRunner:
                         data_str = " ".join(args)
                         if data_str.startswith('"') and data_str.endswith('"'):
                             data_str = data_str[1:-1]
-                        writer.write(decode_escapes(data_str).encode("latin1"))
+                        payload = decode_escapes(data_str).encode("latin1")
+                        if self.verbose:
+                            print(f"       {Color.DIM}[{self.server_id}] send {payload!r}{Color.RESET}")
+                        writer.write(payload)
                         await writer.drain()
 
                     elif cmd == "sendhex":
-                        hex_str = "".join(args).replace(" ", "")
-                        writer.write(bytes.fromhex(hex_str))
+                        # `sendhex "300C020101 61 070A01 00 04000400"` is quoted in the
+                        # .vtc, and the quotes have to come off before fromhex sees them --
+                        # otherwise this raises, the connection dies, and the proxy reports
+                        # a protocol error for a response the harness never sent.
+                        hex_str = " ".join(args).strip()
+                        if len(hex_str) >= 2 and hex_str[0] == hex_str[-1] and hex_str[0] in "\"'":
+                            hex_str = hex_str[1:-1]
+                        writer.write(bytes.fromhex(hex_str.replace(" ", "")))
                         await writer.drain()
 
                     elif cmd == "recv":
                         n_bytes = int(args[0]) if args else 4096
-                        await reader.read(n_bytes)
+                        got = await reader.read(n_bytes)
+                        if self.verbose:
+                            print(f"       {Color.DIM}[{self.server_id}] recv {len(got)}/{n_bytes} {got!r}{Color.RESET}")
 
                     elif cmd == "barrier":
                         if len(args) >= 2 and args[1] == "sync":
@@ -1343,8 +1432,14 @@ class MockClientRunner:
                         await writer.drain()
 
                     elif cmd == "sendhex":
-                        hex_str = "".join(args).replace(" ", "")
-                        writer.write(bytes.fromhex(hex_str))
+                        # `sendhex "300C020101 61 070A01 00 04000400"` is quoted in the
+                        # .vtc, and the quotes have to come off before fromhex sees them --
+                        # otherwise this raises, the connection dies, and the proxy reports
+                        # a protocol error for a response the harness never sent.
+                        hex_str = " ".join(args).strip()
+                        if len(hex_str) >= 2 and hex_str[0] == hex_str[-1] and hex_str[0] in "\"'":
+                            hex_str = hex_str[1:-1]
+                        writer.write(bytes.fromhex(hex_str.replace(" ", "")))
                         await writer.drain()
 
                     elif cmd == "recv":
@@ -1488,6 +1583,12 @@ class VtcExecutor:
                     except asyncio.TimeoutError:
                         break
                 last_resp = resp_bytes.decode("utf-8", errors="replace")
+            elif line.startswith("barrier "):
+                parts = line.split()
+                if len(parts) >= 3 and parts[2] == "sync":
+                    b_id = parts[1]
+                    if b_id in self.barriers:
+                        await self.barriers[b_id].wait()
             elif line.startswith("expect "):
                 rest = line[7:].strip()
                 if rest.startswith("~"):
@@ -1675,8 +1776,21 @@ class VtcExecutor:
                         if m:
                             pat = m.group(1).strip()
                             if len(pat) >= 2 and pat[0] == pat[-1] and pat[0] in "\"'":
+                                quote = pat[0]
                                 pat = pat[1:-1]
-                            expectations.append(self.macro_engine.expand(pat))
+                                if quote == '"':
+                                    # varnishtest parses a double-quoted string before the
+                                    # regex engine ever sees it, so `\\[` in the .vtc is one
+                                    # backslash and a bracket by the time it is compiled.
+                                    # Keeping both backslashes turns `[^:\\[ ]` into "a
+                                    # literal backslash followed by the class [ ]", which
+                                    # matches nothing -- every syslog assertion in the
+                                    # health-check reg-tests failed on this alone.
+                                    pat = _unescape_vtc_string(pat)
+                            # Deliberately NOT expanded here: `${h1_pid}` is only known once
+                            # the proxy has been launched, which happens after this block is
+                            # parsed. SyslogRunner.unmatched() expands at match time instead.
+                            expectations.append(pat)
 
                     runner = SyslogRunner(syslog_id, self.macro_engine, expectations,
                                           repeat=repeat, level=level, verbose=self.verbose)
@@ -1691,7 +1805,7 @@ class VtcExecutor:
                     if not runner:
                         raise KeyError(f"Unknown syslog {syslog_id}")
                     if "-wait" in opts:
-                        runner.wait()
+                        await runner.wait()
                         # Syslog expectations are matched by SyslogRunner's own regex path rather than
                         # through `evaluate_expectation`, so they must be counted here. Without this a
                         # test whose only assertions are syslog ones would be scored SKIP by the
@@ -1703,7 +1817,8 @@ class VtcExecutor:
                             raise RuntimeError(
                                 f"syslog {syslog_id}: {len(missing)} expectation(s) never "
                                 f"matched. First: {missing[0]!r}. "
-                                f"Received {len(runner.received)} datagram(s)."
+                                f"Received {len(runner.received)} datagram(s): "
+                                + "; ".join(repr(d) for d in runner.received[:8])
                             )
 
             elif cmd == "server":
@@ -1770,6 +1885,10 @@ class VtcExecutor:
                     with open(cfg_path, "w") as f:
                         f.write(rewritten_cfg)
                     self.temp_cfgs.append(cfg_path)
+                    if self.verbose:
+                        print(f"     {Color.DIM}[haproxy {haproxy_id}] config {cfg_path}:{Color.RESET}")
+                        for _n, _l in enumerate(rewritten_cfg.splitlines(), 1):
+                            print(f"       {Color.DIM}{_n:3d}| {_l}{Color.RESET}")
 
                     if conf_type == "-conf-OK":
                         res = subprocess.run(
@@ -1797,6 +1916,10 @@ class VtcExecutor:
                                 stderr=subprocess.PIPE,
                             )
                             self.proxies[haproxy_id] = proc
+                            # `${h1_pid}` appears in every syslog assertion in the
+                            # health-check reg-tests, which anchor on the `tag[pid]:`
+                            # prefix to prove the line came from the proxy under test.
+                            self.macro_engine.set(f"{haproxy_id}_pid", str(proc.pid))
                             if self.verbose:
                                 print(f"     {Color.DIM}[haproxy {haproxy_id}] started (pid {proc.pid}) ports={list(alloc_ports.values())}{Color.RESET}")
 

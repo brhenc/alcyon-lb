@@ -35,7 +35,10 @@ def main():
         else:
             paths_rel.append(p)
 
-    fp_cmd = [sys.executable, "/tmp/fingerprint.py"]
+    # The committed version pointed at /tmp/fingerprint.py, a scratch copy that exists on
+    # one machine and is cleared on reboot. The script ships next to this one.
+    fingerprint_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fingerprint.py")
+    fp_cmd = [sys.executable, fingerprint_py]
     if sections:
         fp_cmd.append(sections)
 
@@ -124,8 +127,27 @@ def main():
     except SystemExit:
         raise
     except BaseException as e:
+        # The window between "revert" and "restore" is the whole point of this script and
+        # also its only dangerous moment: the paths under test are deleted from the tree,
+        # and for untracked files the tar is the only copy. Ctrl-C used to leave them
+        # deleted with a hint printed, which is how harness/covercheck.py was lost twice.
+        # Put them back before reporting the failure.
         print(f"\nERROR or INTERRUPT: {e}")
-        print(f"To manually restore, run: tar -xzf {backup_tar} -C {repo_root}")
+        print("=> Restoring from backup...")
+        try:
+            for p in paths_rel:
+                full_p = os.path.join(repo_root, p)
+                if os.path.exists(full_p):
+                    if os.path.isdir(full_p):
+                        shutil.rmtree(full_p)
+                    else:
+                        os.remove(full_p)
+            with tarfile.open(backup_tar, "r:gz") as tar:
+                tar.extractall(path=repo_root)
+            print(f"=> Restored. Backup kept at {backup_tar}")
+        except BaseException as restore_err:
+            print(f"RESTORE FAILED: {restore_err}")
+            print(f"Restore by hand with: tar -xzf {backup_tar} -C {repo_root}")
         sys.exit(1)
         
     print(f"Cleanly finished. Backup left at {backup_tar} just in case.")
