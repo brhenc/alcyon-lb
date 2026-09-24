@@ -272,3 +272,132 @@ fn client_connection_close_header_is_respected_as_control() {
     running.store(false, Ordering::Relaxed);
     let _ = srv_handle.join();
 }
+
+/// The acceptance case from `tasks/T71-client-keepalive.md`, which the test above stops
+/// one request short of: **three** requests down one client connection, each answered by
+/// a backend that says `Connection: close`.
+///
+/// HAProxy 3.5-dev7, measured on this config:
+///
+///     /cl OK  [content-length: 5]
+///     /cl OK  [content-length: 5]
+///     /cl OK  [content-length: 5]
+///
+/// Every response has the backend's `Connection: close` removed, because it is hop-by-hop
+/// and the client connection is still in keep-alive. The test above checks that request 2
+/// *returns*, but not what it returned: with a raw socket, a leaked `Connection: close` on
+/// response 2 is invisible until request 3 finds the connection gone. A real client obeys
+/// the header, so it never gets that far.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn every_response_on_a_keepalive_connection_drops_the_backends_connection_close() {
+    const N: usize = 3;
+    let srv_addr = free_addr();
+    let fe_addr = free_addr();
+
+    let running = Arc::new(AtomicBool::new(true));
+    let r_clone = Arc::clone(&running);
+    let be_conn_count = Arc::new(AtomicUsize::new(0));
+    let be_conns = Arc::clone(&be_conn_count);
+
+    let srv_handle = thread::spawn(move || {
+        let listener = TcpListener::bind(srv_addr).expect("bind srv");
+        listener.set_nonblocking(true).expect("nonblocking");
+        while r_clone.load(Ordering::Relaxed) {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let idx = be_conns.fetch_add(1, Ordering::SeqCst);
+                stream.set_nonblocking(false).expect("blocking");
+                stream.set_read_timeout(Some(Duration::from_secs(3))).expect("timeout");
+                let mut req = Vec::new();
+                let mut buf = [0u8; 1024];
+                while let Ok(n) = stream.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    req.extend_from_slice(&buf[..n]);
+                    if req.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let body = format!("resp-{idx}");
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                drop(stream);
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+    });
+
+    let config = Config {
+        frontends: vec![FrontendSection {
+            name: "fe".into(),
+            bind: Some(fe_addr),
+            mode: Mode::Http,
+            default_backend: Some("be".into()),
+            clitimeout: Some(Duration::from_secs(3)),
+            ..Default::default()
+        }],
+        backends: vec![BackendSection {
+            name: "be".into(),
+            mode: Mode::Http,
+            contimeout: Some(Duration::from_secs(3)),
+            srvtimeout: Some(Duration::from_secs(3)),
+            servers: vec![Server::new("s1", srv_addr)],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let mut engine = Engine::new(&config, 64).expect("Engine::new");
+    let mut client = TcpStream::connect(fe_addr).expect("client connect");
+    client.set_nonblocking(true).expect("set_nonblocking");
+
+    for i in 0..N {
+        client
+            .write_all(format!("GET /r{i} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+            .expect("write request");
+        let want = format!("resp-{i}");
+        let start = Instant::now();
+        let mut response = Vec::new();
+        let mut buf = [0u8; 1024];
+        let mut eof = false;
+        while start.elapsed() < Duration::from_secs(3) {
+            let _ = engine.run_once().expect("engine step");
+            match client.read(&mut buf) {
+                Ok(0) => {
+                    eof = true;
+                    break;
+                }
+                Ok(n) => {
+                    response.extend_from_slice(&buf[..n]);
+                    if response.windows(want.len()).any(|w| w == want.as_bytes()) {
+                        break;
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => {
+                    eof = true;
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        let resp = String::from_utf8_lossy(&response);
+        assert!(
+            !eof && resp.contains(&want),
+            "request {} of {N}: connection died or wrong body -- got {resp:?}",
+            i + 1
+        );
+        assert!(
+            !resp.to_ascii_lowercase().contains("connection: close"),
+            "request {} of {N}: the backend's hop-by-hop `Connection: close` reached a \
+             keep-alive client; a real client would now close. Got {resp:?}",
+            i + 1
+        );
+    }
+
+    running.store(false, Ordering::Relaxed);
+    let _ = srv_handle.join();
+}
