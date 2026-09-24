@@ -746,7 +746,7 @@ def _evaluate_expectation(
     req: Optional[HttpRequest] = None,
 ) -> ExpectationResult:
     """Evaluate an 'expect <expr> <op> <expected>' statement."""
-    exp_clean = expected_val.strip()
+    exp_clean = expected_val
     if (exp_clean.startswith('"') and exp_clean.endswith('"')) or (
         exp_clean.startswith("'") and exp_clean.endswith("'")
     ):
@@ -862,8 +862,8 @@ def format_expectation_diff(res: ExpectationResult) -> str:
         f"  {Color.red('FAIL: Expectation failed:')} expect {res.expr} {res.op} {res.expected}",
         f"    Target:   {Color.cyan(res.expr)}",
         f"    Operator: {res.op}",
-        f"    {Color.green('Expected:')} {res.expected!r}",
-        f"    {Color.red('Actual:  ')} {res.actual!r}",
+        f"    {Color.green('Expected:')} {res.expected!r} (len {len(res.expected) if res.expected else 0}) hex: {res.expected.encode().hex() if res.expected else ''}",
+        f"    {Color.red('Actual:  ')} {res.actual!r} (len {len(res.actual) if res.actual else 0}) hex: {res.actual.encode().hex() if res.actual else ''}",
     ]
     if res.error_message:
         lines.append(f"    {Color.yellow('Note:')}     {res.error_message}")
@@ -1980,7 +1980,7 @@ class VtcExecutor:
                         if start_imm:
                             cli_sock = os.path.join(self.tmpdir, f"{haproxy_id}.sock")
                             proc = subprocess.Popen(
-                                [self.target_binary, "-W", "-f", cfg_path, "-S", cli_sock, "-d"],
+                                [self.target_binary, "-f", cfg_path, "-S", cli_sock, "-d"],
                                 stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE,
                             )

@@ -1700,7 +1700,36 @@ impl Registry {
             out_type: SampleType::Str,
             func: |_ctx, args| {
                 let s = args.first().map_or("", |s| s.as_str());
-                Some(Sample::Str(s.to_string()))
+                let mut bytes = Vec::new();
+                let mut chars = s.chars().peekable();
+                while let Some(c) = chars.next() {
+                    if c == '\\' {
+                        if let Some(&'x') = chars.peek() {
+                            chars.next();
+                            let hex1 = chars.next();
+                            let hex2 = chars.next();
+                            if let (Some(h1), Some(h2)) = (hex1, hex2) {
+                                if let (Some(d1), Some(d2)) = (h1.to_digit(16), h2.to_digit(16)) {
+                                    bytes.push((d1 << 4 | d2) as u8);
+                                    continue;
+                                }
+                                bytes.push(b'\\');
+                                bytes.push(b'x');
+                                bytes.push(h1 as u8);
+                                bytes.push(h2 as u8);
+                                continue;
+                            }
+                            bytes.push(b'\\');
+                            bytes.push(b'x');
+                            if let Some(h1) = hex1 { bytes.push(h1 as u8); }
+                            continue;
+                        }
+                    }
+                    let mut buf = [0; 4];
+                    bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                }
+                let decoded = String::from_utf8_lossy(&bytes).into_owned();
+                Some(Sample::Str(decoded))
             },
         });
         self.register_fetch(FetchDesc {
@@ -2233,7 +2262,16 @@ impl Registry {
             in_type: TypeSpec::Exact(SampleType::Str),
             out_type: TypeSpec::Exact(SampleType::Str),
             func: |smp, _args| match smp {
-                Sample::Str(s) => {
+                Sample::Str(mut s) => {
+                    if s.ends_with('.') {
+                        s.pop();
+                    }
+                    if s.is_empty() {
+                        return Some(Sample::Str(String::new()));
+                    }
+                    if s.starts_with('.') || s.contains("..") {
+                        return None;
+                    }
                     let parts: Vec<&str> = s.split('.').collect();
                     let reversed = parts.into_iter().rev().collect::<Vec<_>>().join(".");
                     Some(Sample::Str(reversed))
@@ -2295,8 +2333,11 @@ impl Registry {
             name: "url_dec",
             in_type: TypeSpec::Exact(SampleType::Str),
             out_type: TypeSpec::Exact(SampleType::Str),
-            func: |smp, _args| match smp {
-                Sample::Str(s) => Some(Sample::Str(url_decode(&s))),
+            func: |smp, args| match smp {
+                Sample::Str(s) => {
+                    let in_form = args.first().and_then(|a| a.parse::<i64>().ok()).unwrap_or(0) != 0;
+                    Some(Sample::Str(url_decode(&s, in_form)))
+                }
                 _ => None,
             },
         });
@@ -2805,7 +2846,7 @@ impl Registry {
             func: |smp, args| match smp {
                 Sample::Bin(b) => {
                     let offset_arg: i64 = match args.first() {
-                        Some(s) => s.parse().ok()?,
+                        Some(s) => resolve_int_arg(s)?,
                         None => 0,
                     };
                     if offset_arg < 0 {
@@ -2813,7 +2854,7 @@ impl Registry {
                     }
                     let len_arg: Option<i64> = match args.get(1) {
                         Some(s) => {
-                            let l = s.parse().ok()?;
+                            let l = resolve_int_arg(s)?;
                             if l < 0 {
                                 return None;
                             }
@@ -3168,22 +3209,60 @@ impl Registry {
         reg_map!("map_ip", MapMatchType::Ip, TypeSpec::Addr);
 
         // --- 6. JSON Converters ---
-        let json_conv: ConvFn = |smp, args| {
-            let path = args.first()?;
-            let Sample::Str(s) = smp else { return None };
-            json_extract(&s, path).map(Sample::Str)
-        };
+        fn json_escape(s: &str) -> String {
+            let mut out = String::with_capacity(s.len());
+            for c in s.chars() {
+                match c {
+                    '"' => out.push_str("\\\""),
+                    '\\' => out.push_str("\\\\"),
+                    '/' => out.push_str("\\/"),
+                    '\x08' => out.push_str("\\b"),
+                    '\x0c' => out.push_str("\\f"),
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    '\t' => out.push_str("\\t"),
+                    _ if c.is_control() => {
+                        use std::fmt::Write;
+                        let _ = write!(out, "\\u{:04x}", c as u32);
+                    }
+                    _ => out.push(c),
+                }
+            }
+            out
+        }
+
         self.register_converter(ConvDesc {
             name: "json",
             in_type: TypeSpec::Exact(SampleType::Str),
             out_type: TypeSpec::Exact(SampleType::Str),
-            func: json_conv,
+            func: |smp, args| match smp {
+                Sample::Str(s) => {
+                    let mode = args.first().map(|x| x.as_str()).unwrap_or("");
+                    if mode == "utf8" && s.contains('\u{FFFD}') {
+                        return Some(Sample::Str(String::new()));
+                    }
+                    let s = if mode == "utf8s" {
+                        s.replace('\u{FFFD}', "")
+                    } else {
+                        s
+                    };
+                    Some(Sample::Str(json_escape(&s)))
+                }
+                _ => None,
+            },
         });
+        
+        let json_query_conv: ConvFn = |smp, args| {
+            let path = args.first()?;
+            let Sample::Str(s) = smp else { return None };
+            json_extract(&s, path).map(Sample::Str)
+        };
+
         self.register_converter(ConvDesc {
             name: "json_query",
             in_type: TypeSpec::Exact(SampleType::Str),
             out_type: TypeSpec::Any,
-            func: json_conv,
+            func: json_query_conv,
         });
 
         // --- 7. Time & Date Converters ---
@@ -3802,20 +3881,34 @@ pub fn match_map(path: &str, input: &str, match_type: MapMatchType) -> Option<(S
             None
         }
         MapMatchType::Beg => {
+            let mut best_match: Option<(String, String)> = None;
             for entry in &table.entries {
                 if input.starts_with(&entry.key) {
-                    return Some((entry.val.clone(), entry.key.clone()));
+                    if let Some((_, ref best_key)) = best_match {
+                        if entry.key.len() > best_key.len() {
+                            best_match = Some((entry.val.clone(), entry.key.clone()));
+                        }
+                    } else {
+                        best_match = Some((entry.val.clone(), entry.key.clone()));
+                    }
                 }
             }
-            None
+            best_match
         }
         MapMatchType::End => {
+            let mut best_match: Option<(String, String)> = None;
             for entry in &table.entries {
                 if input.ends_with(&entry.key) {
-                    return Some((entry.val.clone(), entry.key.clone()));
+                    if let Some((_, ref best_key)) = best_match {
+                        if entry.key.len() > best_key.len() {
+                            best_match = Some((entry.val.clone(), entry.key.clone()));
+                        }
+                    } else {
+                        best_match = Some((entry.val.clone(), entry.key.clone()));
+                    }
                 }
             }
-            None
+            best_match
         }
         MapMatchType::Sub => {
             for entry in &table.entries {
@@ -3937,12 +4030,32 @@ fn check_ip_cidr(ip_str: &str, cidr_str: &str) -> bool {
 
 fn json_extract(json_str: &str, path: &str) -> Option<String> {
     let val: serde_json::Value = serde_json::from_str(json_str).ok()?;
-    let clean_path = path.trim_start_matches('/');
-    let parts: Vec<&str> = if path.starts_with('/') {
-        clean_path.split('/').collect()
-    } else {
-        path.split('.').collect()
-    };
+    let path = path.trim_start_matches("$.");
+    let path = path.trim_start_matches('/');
+    
+    let mut parts = Vec::new();
+    let mut current_part = String::new();
+    let mut chars = path.chars().peekable();
+    let is_slash_delim = path.starts_with('/');
+    
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(&next_c) = chars.peek() {
+                if next_c == '.' || next_c == '\\' {
+                    current_part.push(next_c);
+                    chars.next();
+                    continue;
+                }
+            }
+            current_part.push(c);
+        } else if (is_slash_delim && c == '/') || (!is_slash_delim && c == '.') {
+            parts.push(current_part);
+            current_part = String::new();
+        } else {
+            current_part.push(c);
+        }
+    }
+    parts.push(current_part);
 
     let mut current = &val;
     for part in parts {
@@ -3955,7 +4068,7 @@ fn json_extract(json_str: &str, path: &str) -> Option<String> {
                 continue;
             }
         }
-        current = current.get(part)?;
+        current = current.get(&part)?;
     }
 
     match current {
@@ -4165,7 +4278,7 @@ fn extract_url_param(query: &str, param: &str) -> Option<String> {
     for pair in query.split('&') {
         if let Some((k, v)) = pair.split_once('=') {
             if k == param {
-                return Some(url_decode(v));
+                return Some(url_decode(v, true));
             }
         } else if pair == param {
             return Some(String::new());
@@ -4562,7 +4675,7 @@ fn base64_decode(input: &str, url_safe: bool, strict_padding: bool) -> Option<Ve
 ///
 /// Infallible: invalid escapes are left as written and invalid UTF-8 is replaced, so the
 /// return type is a `String` rather than an `Option` that was always `Some`.
-fn url_decode(s: &str) -> String {
+fn url_decode(s: &str, mut in_form: bool) -> String {
     let mut res = Vec::new();
     let bytes = s.as_bytes();
     let mut i = 0;
@@ -4573,10 +4686,12 @@ fn url_decode(s: &str) -> String {
                 i += 3;
                 continue;
             }
-        } else if bytes[i] == b'+' {
+        } else if in_form && bytes[i] == b'+' {
             res.push(b' ');
             i += 1;
             continue;
+        } else if bytes[i] == b'?' {
+            in_form = true;
         }
         res.push(bytes[i]);
         i += 1;
@@ -4795,7 +4910,7 @@ mod tests {
         let res_json = reg.eval(
             "str",
             &[json_input.to_string()],
-            &[("json", vec!["user.name".to_string()])],
+            &[("json_query", vec!["user.name".to_string()])],
             &ctx,
         );
         assert_eq!(res_json, Some(Sample::Str("bob".to_string())));
