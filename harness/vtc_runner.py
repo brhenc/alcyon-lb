@@ -863,7 +863,7 @@ def preprocess_haproxy_config(
             cur_section_name = sec_m.group(2) or ""
 
         # Check for bind "fd@${fe}" or bind fd@${fe}
-        bind_m = re.match(r"^(bind\s+)(?:\"fd@\$\{([a-zA-Z0-9_]+)\}\"|fd@\$\{([a-zA-Z0-9_]+)\})(.*)$", trimmed)
+        bind_m = re.match(r"^(bind\s+)(?:\"(?:[a-zA-Z0-9_\$\{\}\+]*)fd@\${([a-zA-Z0-9_]+)}\"|(?:[a-zA-Z0-9_\$\{\}\+]*)fd@\${([a-zA-Z0-9_]+)})(.*)$", trimmed)
         if bind_m:
             prefix = bind_m.group(1)
             var_name = bind_m.group(2) or bind_m.group(3)
@@ -878,13 +878,13 @@ def preprocess_haproxy_config(
             # Populate macros
             macro_engine.set(f"{haproxy_id}_{var_name}_addr", "127.0.0.1")
             macro_engine.set(f"{haproxy_id}_{var_name}_port", str(port))
-            macro_engine.set(f"{haproxy_id}_{var_name}_sock", f"127.0.0.1 {port}")
+            macro_engine.set(f"{haproxy_id}_{var_name}_sock", f"127.0.0.1:{port}")
             macro_engine.set(var_name, str(port))
 
             if cur_section_name and (var_name == cur_section_name or f"{haproxy_id}_{cur_section_name}_port" not in macro_engine.macros):
                 macro_engine.set(f"{haproxy_id}_{cur_section_name}_addr", "127.0.0.1")
                 macro_engine.set(f"{haproxy_id}_{cur_section_name}_port", str(port))
-                macro_engine.set(f"{haproxy_id}_{cur_section_name}_sock", f"127.0.0.1 {port}")
+                macro_engine.set(f"{haproxy_id}_{cur_section_name}_sock", f"127.0.0.1:{port}")
 
             # A `bind` becomes a `bind`, in every section type. This used to comment the
             # line out inside a `listen` and fold the address into the section header
@@ -908,7 +908,7 @@ def preprocess_haproxy_config(
 
             macro_engine.set(f"{haproxy_id}_{l_name}_addr", "127.0.0.1")
             macro_engine.set(f"{haproxy_id}_{l_name}_port", str(port))
-            macro_engine.set(f"{haproxy_id}_{l_name}_sock", f"127.0.0.1 {port}")
+            macro_engine.set(f"{haproxy_id}_{l_name}_sock", f"127.0.0.1:{port}")
 
             # Same reason: a bare `listen <name>` keeps its own line and gets a `bind`
             # underneath, rather than an address folded into the header.

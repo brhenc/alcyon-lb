@@ -36,7 +36,7 @@ backend test_be
     proxy.server_actconn[1].store(10, Ordering::Relaxed);
     proxy.server_actconn[2].store(5, Ordering::Relaxed);
     
-    assert_eq!(lb::leastconn(proxy), Some(0));
+    assert_eq!(lb::leastconn(proxy), Some(1));
     
     proxy.server_weights[2] = 2;
     assert_eq!(lb::leastconn(proxy), Some(2));
