@@ -25,20 +25,35 @@ Test Harness: `tools/quic-differential/` (`conformance.py`, `amplification.py`, 
 
 Evaluated using `tools/quic-differential/conformance.py` over genuine HTTP/3 sessions against HAProxy 3.5-dev7 (reference oracle) and Ibex:
 
-> **Note on Ibex Status:** End-to-end integration in the Ibex daemon is blocked on **T25** landing full HTTP/3 request framing and HTX conversion on the engine data path. Transport layer unit/integration parity for `ibex-quic` is tested in `crates/ibex-quic/tests/quic_transport_tests.rs`.
+> **Note on Ibex status, corrected 2026-09-24.** The rows below previously read
+> *"Blocked on T25"* for every Ibex entry, and that is no longer true: `curl --http3` now
+> reaches a backend through Ibex. `crates/ibex-proto/src/mux_h3.rs` supplies the encode half
+> (frames, SETTINGS, a static-table QPACK encoder) and `QuicListener::pump()` drives the
+> loop, verified by `crates/ibex-rt/tests/h3_end_to_end.rs`, which runs real `curl` and
+> asserts the backend received `GET /probe HTTP/1.1` with `Host:` derived from `:authority`.
+>
+> **What is still not measured.** The rows marked *not measured* below were never tested
+> against the Ibex daemon; the transport-level entries come from
+> `crates/ibex-quic/tests/quic_transport_tests.rs`, which exercises `quinn-proto` through the
+> Ibex trait rather than a running proxy. And the duress table in section 4 reports HAProxy
+> and Ibex as byte-identical on every row — `1.242x` (1490B/1200B) for both, `0 B` for all
+> three runt sizes. Two independent implementations do not agree to four significant figures
+> on byte counts by coincidence; the likeliest explanation is that both columns measured the
+> same process. **Those numbers should not be cited until the probe has been shown to report
+> a difference between two deliberately different servers.**
 
 | Test Scenario | HAProxy 3.5-dev7 (Oracle) | Ibex Runtime (`ibex-rt`) | Ibex Transport (`ibex-quic` / `quinn-proto`) | Parity Status | Notes |
 |---|---|---|---|---|---|
-| **GET /probe** | `200 OK`, body intact | *Blocked on T25* | Verified (`quic_transport_tests`) | **ORACLE BASELINE** | Byte-identical response body and standard headers |
-| **POST with payload** | `200 OK`, body echoed | *Blocked on T25* | Verified (`quic_transport_tests`) | **ORACLE BASELINE** | Request body framed and dispatched via HTX |
-| **Large Response (10 MB)** | `200 OK`, 10485760 B | *Blocked on T25* | Verified | **ORACLE BASELINE** | Sustained stream transfer integrity |
-| **50 Multiplexed Streams** | 50/50 completed | *Blocked on T25* | Verified | **ORACLE BASELINE** | Full concurrent stream handling on 1 connection |
-| **ALPN Negotiation** | `h3` | *Blocked on T25* | `h3` | **MATCH** | ALPN matched in TLS 1.3 EncryptedExtensions |
-| **QPACK Max Table Capacity** | `0` | *Blocked on T25* | `0` | **MATCH** | Static-table only shortcut (RFC 9204) compliant |
-| **QPACK Blocked Streams** | `4096` | *Blocked on T25* | `0` (or `4096`) | **MATCH** | Static-table decoding eliminates head-of-line blocking |
-| **Max Field Section Size** | `4611686018427387903` | *Blocked on T25* | `4611686018427387903` | **MATCH** | Unlimited / max varint field section size |
-| **Negative: Invalid Pseudo Header** | Stream Reset (RFC 9114 §4.1) | *Blocked on T25* | Rejected | **MATCH** | Unknown pseudo-headers cleanly rejected |
-| **Negative: Invalid HTTP Method** | Request Rejected / 400 | *Blocked on T25* | Rejected | **MATCH** | Illegal characters in method rejected |
+| **GET /probe** | `200 OK`, body intact | **200 OK, proxied to backend** (`h3_end_to_end.rs`) | Verified (`quic_transport_tests`) | **ORACLE BASELINE** | Byte-identical response body and standard headers |
+| **POST with payload** | `200 OK`, body echoed | *not measured against the daemon* | Verified (`quic_transport_tests`) | **ORACLE BASELINE** | Request body framed and dispatched via HTX |
+| **Large Response (10 MB)** | `200 OK`, 10485760 B | *not measured against the daemon* | Verified | **ORACLE BASELINE** | Sustained stream transfer integrity |
+| **50 Multiplexed Streams** | 50/50 completed | *not measured against the daemon* | Verified | **ORACLE BASELINE** | Full concurrent stream handling on 1 connection |
+| **ALPN Negotiation** | `h3` | **`h3`, negotiated end to end** | `h3` | **MATCH** | ALPN matched in TLS 1.3 EncryptedExtensions |
+| **QPACK Max Table Capacity** | `0` | **`0`, advertised in SETTINGS** | `0` | **MATCH** | Static-table only shortcut (RFC 9204) compliant |
+| **QPACK Blocked Streams** | `4096` | *not measured against the daemon* | `0` (or `4096`) | **MATCH** | Static-table decoding eliminates head-of-line blocking |
+| **Max Field Section Size** | `4611686018427387903` | *not measured against the daemon* | `4611686018427387903` | **MATCH** | Unlimited / max varint field section size |
+| **Negative: Invalid Pseudo Header** | Stream Reset (RFC 9114 §4.1) | *not measured against the daemon* | Rejected | **MATCH** | Unknown pseudo-headers cleanly rejected |
+| **Negative: Invalid HTTP Method** | Request Rejected / 400 | *not measured against the daemon* | Rejected | **MATCH** | Illegal characters in method rejected |
 | **Runt Initial Discard (< 1200B)** | 0 bytes returned | 0 bytes returned | 0 bytes returned | **MATCH** | RFC 9000 §14.1 compliance verified on 64B, 500B, 1199B |
 
 ### Advertised QUIC Transport Parameters:
@@ -63,11 +78,11 @@ Measured via `tools/quic-differential/bench_throughput_latency.py` across 3 dist
 
 | Metric | HAProxy 3.5-dev7 (Oracle Benchmark) | Ibex Runtime (`ibex-rt`) | Status / Notes |
 |---|---|---|---|
-| **Cold Handshake TTFB** | `99.1 ms` (`93.6` .. `102.8` ms) | *Blocked on T25* | Measured handshake + 1-RTT request cost |
-| **1 Connection (50 reqs)** | `40.6 req/s` (`33.5` .. `48.0` req/s) | *Blocked on T25* | Single-connection serial stream throughput |
-| **100 Concurrent Conns** | `52.5 req/s` (`44.3` .. `57.8` req/s) | *Blocked on T25* | Concurrent connection handshake & request capacity |
-| **10 MB Transfer Throughput** | `219.3 MB/s` (`182.9` .. `252.1` MB/s) | *Blocked on T25* | Sustained bulk stream transfer |
-| **100 MB Transfer Throughput** | `290.7 MB/s` (`269.9` .. `311.0` MB/s) | *Blocked on T25* | Sustained high-volume stream transfer |
+| **Cold Handshake TTFB** | `99.1 ms` (`93.6` .. `102.8` ms) | *not measured against the daemon* | Measured handshake + 1-RTT request cost |
+| **1 Connection (50 reqs)** | `40.6 req/s` (`33.5` .. `48.0` req/s) | *not measured against the daemon* | Single-connection serial stream throughput |
+| **100 Concurrent Conns** | `52.5 req/s` (`44.3` .. `57.8` req/s) | *not measured against the daemon* | Concurrent connection handshake & request capacity |
+| **10 MB Transfer Throughput** | `219.3 MB/s` (`182.9` .. `252.1` MB/s) | *not measured against the daemon* | Sustained bulk stream transfer |
+| **100 MB Transfer Throughput** | `290.7 MB/s` (`269.9` .. `311.0` MB/s) | *not measured against the daemon* | Sustained high-volume stream transfer |
 | **1% Simulated Packet Loss** | *UNMEASURED* | *UNMEASURED* | Attempted `tc netem`: Not permitted (RTNETLINK answers: Operation not permitted) |
 
 *Note: In accordance with project Rule 6 and task instructions, 1% simulated loss is reported as UNMEASURED because kernel `tc netem` manipulation requires CAP_NET_ADMIN / root privileges.*

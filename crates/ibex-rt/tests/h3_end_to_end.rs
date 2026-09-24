@@ -12,6 +12,8 @@
 //!   UDP datagram -> QUIC packet -> stream -> HTTP/3 HEADERS -> QPACK decode
 //!     -> response -> QPACK encode -> HEADERS + DATA -> stream -> QUIC -> UDP datagram
 
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -43,6 +45,95 @@ fn curl_has_http3() -> bool {
         .output()
         .ok()
         .is_some_and(|o| String::from_utf8_lossy(&o.stdout).contains("HTTP3"))
+}
+
+/// A backend that echoes what it was asked, so the test can assert the request survived the
+/// HTTP/3 -> HTTP/1.1 conversion rather than only that a response came back.
+fn spawn_echo_backend(stop: Arc<AtomicBool>) -> std::net::SocketAddr {
+    let l = TcpListener::bind("127.0.0.1:0").expect("bind backend");
+    let addr = l.local_addr().expect("backend addr");
+    l.set_nonblocking(true).expect("nonblocking");
+    thread::spawn(move || {
+        while !stop.load(Ordering::Relaxed) {
+            match l.accept() {
+                Ok((mut c, _)) => {
+                    let mut buf = [0u8; 4096];
+                    let _ = c.set_read_timeout(Some(Duration::from_millis(200)));
+                    let n = c.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let first = req.lines().next().unwrap_or("").to_string();
+                    let host = req
+                        .lines()
+                        .find(|l| l.to_ascii_lowercase().starts_with("host:"))
+                        .unwrap_or("host: MISSING")
+                        .to_string();
+                    let body = format!("{first}|{host}");
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = c.write_all(resp.as_bytes());
+                }
+                Err(_) => thread::sleep(Duration::from_millis(5)),
+            }
+        }
+    });
+    addr
+}
+
+#[test]
+fn curl_http3_is_proxied_to_a_backend() {
+    if !curl_has_http3() {
+        eprintln!("curl on this host has no HTTP3 support; skipping");
+        return;
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let backend = spawn_echo_backend(Arc::clone(&stop));
+
+    let tls = server_config();
+    let addr = "127.0.0.1:0".parse().expect("addr");
+    let mut listener = QuicListener::bind(addr, &tls, None).expect("bind QUIC listener");
+    listener.set_backend(backend);
+    let port = listener.addr().port();
+
+    let stop_worker = Arc::clone(&stop);
+    let worker = thread::spawn(move || {
+        while !stop_worker.load(Ordering::Relaxed) {
+            let _ = listener.pump(Instant::now());
+            thread::sleep(Duration::from_millis(2));
+        }
+    });
+
+    let out = Command::new("curl")
+        .args([
+            "-sS", "--http3-only", "-k", "--max-time", "15",
+            "--resolve", &format!("localhost:{port}:127.0.0.1"),
+            &format!("https://localhost:{port}/probe"),
+            "-o", "-", "-w", "\n__STATUS__%{http_code}",
+        ])
+        .output()
+        .expect("run curl");
+
+    stop.store(true, Ordering::Relaxed);
+    let _ = worker.join();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(stdout.contains("__STATUS__200"), "expected 200.\nstdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("GET /probe HTTP/1.1"),
+        "the backend must receive an HTTP/1.1 request line with the original path.\nstdout: {stdout}"
+    );
+    assert!(
+        stdout.to_ascii_lowercase().contains("host: localhost"),
+        "RFC 9112 requires Host; :authority must become it, as HAProxy does.\nstdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains(":authority") && !stdout.contains(":scheme"),
+        "no pseudo-header may reach an HTTP/1 backend.\nstdout: {stdout}"
+    );
 }
 
 #[test]
