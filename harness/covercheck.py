@@ -14,13 +14,18 @@ Usage:  python3 harness/covercheck.py [base]      # base defaults to origin/main
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import subprocess
 import sys
+import tempfile
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-LCOV = "/tmp/ibex-covercheck.lcov"
+# One report per checkout: agy runs several worktrees at once, and a shared path let one
+# checkout's covercheck read another's coverage.
+LCOV = os.path.join(tempfile.gettempdir(),
+                    f"ibex-covercheck-{hashlib.sha1(REPO.encode()).hexdigest()[:10]}.lcov")
 # Only source. Tests are expected to run; that is not the question being asked.
 SRC = re.compile(r"^crates/[^/]+/src/.*\.rs$")
 
