@@ -140,6 +140,18 @@ impl QuicListener {
         self.socket.as_raw_fd()
     }
 
+    /// Borrows the UDP socket for poller registration, without `unsafe` at the call site.
+    #[must_use]
+    pub fn borrowed_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.socket.borrowed_fd()
+    }
+
+    /// Borrows the descriptors of in-flight backend requests.
+    #[must_use]
+    pub fn backend_borrowed_fds(&self) -> Vec<std::os::fd::BorrowedFd<'_>> {
+        self.legs.iter().map(|l| l.fd.as_fd()).collect()
+    }
+
     /// Receives a batch of incoming datagrams and passes them to the QUIC transport.
     ///
     /// # Errors

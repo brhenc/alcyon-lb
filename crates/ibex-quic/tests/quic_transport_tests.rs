@@ -498,3 +498,68 @@ fn test_curl_http3_only_quic_handshake() {
         "curl stderr must confirm QUIC/TLS handshake completion and ALPN h3"
     );
 }
+
+/// RFC 9000 §8.1: a server must not send more than three times what it has received on an
+/// unvalidated path.
+///
+/// Exceeding this makes the proxy usable as a DDoS reflector: an attacker spoofing a
+/// victim's source address spends one datagram and causes several to be sent at the victim,
+/// with no handshake to prevent it.
+///
+/// Measured live against both proxies before this test existed:
+///
+/// ```text
+/// HAProxy 3.5-dev7   1200 B in -> 1490 B out   1.242x   PASS
+/// Ibex               1200 B in -> 4167 B out   3.472x   FAIL
+/// ```
+///
+/// The same violation appeared through a hand-rolled drive loop and through
+/// `Engine::run_once`, so it is below the drive loop rather than an artefact of it.
+#[test]
+fn a_server_must_not_amplify_beyond_three_times_before_address_validation() {
+    let server_config = QuicConfig::new()
+        .load_server_config_from_pem(cert_path())
+        .expect("load cert");
+    let mut server = QuicEndpoint::with_server_config(server_config).expect("server endpoint");
+
+    let (mut client_endpoint, client_config) = create_client_endpoint();
+    let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4433);
+    let client_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 55443);
+
+    let now = Instant::now();
+    let (_h, mut client_conn) = client_endpoint
+        .connect(now, (*client_config).clone(), server_addr, "localhost")
+        .expect("connect");
+
+    // Exactly one client datagram: the Initial. The client never replies after this, so the
+    // address is never validated and the budget stays at 3x this one datagram forever.
+    let mut client_buf = Vec::new();
+    let tx = client_conn
+        .poll_transmit(now, 1, &mut client_buf)
+        .expect("client Initial");
+    let received = tx.size;
+    server
+        .handle_datagram(now, client_addr, None, &client_buf[..tx.size])
+        .expect("server handles Initial");
+
+    // Drain everything the server will send, advancing time well past any PTO so that
+    // retransmissions are included -- §8.1 counts them against the same budget.
+    let mut sent = 0usize;
+    let mut out = vec![0u8; 65535];
+    let mut sim_now = now;
+    for _ in 0..200 {
+        while let Some(tx) = server.poll_transmit(sim_now, &mut out) {
+            sent += tx.size;
+        }
+        sim_now += Duration::from_millis(25);
+        server.handle_timeout(sim_now);
+    }
+
+    let limit = received * 3;
+    assert!(
+        sent <= limit,
+        "RFC 9000 §8.1: server sent {sent} B for {received} B received ({:.3}x), \
+         limit is {limit} B (3x). Exceeding it makes this a DDoS reflector.",
+        sent as f64 / received as f64
+    );
+}

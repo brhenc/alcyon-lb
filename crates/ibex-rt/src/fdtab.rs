@@ -53,6 +53,14 @@ pub enum FdState {
     CliListener,
     /// A connection. Readiness wakes the owning task.
     Conn { task: TaskRef, conn: u32 },
+    /// A QUIC listening socket. Readiness means datagrams are waiting.
+    ///
+    /// A QUIC connection is not a file descriptor -- thousands share this one socket and are
+    /// told apart by connection ID -- so unlike `Listener` there is nothing to accept. The
+    /// engine drives the listener, which demultiplexes internally.
+    QuicListener { listener: u32 },
+    /// A backend socket opened by a QUIC request. Readiness advances that listener's legs.
+    QuicBackend { listener: u32 },
 }
 
 #[derive(Copy, Clone, Debug)]

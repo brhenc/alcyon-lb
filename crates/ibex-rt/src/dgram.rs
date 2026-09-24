@@ -48,6 +48,12 @@ impl DgramSocket {
         self.fd.as_raw_fd()
     }
 
+    /// Borrows the socket for poller registration.
+    #[must_use]
+    pub fn borrowed_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         let addr = rustix::net::getsockname(self.fd.as_fd())?;
         crate::raw::from_any(&addr).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid address"))

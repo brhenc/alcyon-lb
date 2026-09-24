@@ -397,6 +397,8 @@ pub struct Engine {
     pub scheduler: Scheduler,
     pub fdtab: FdTab,
     pub listeners: Vec<Listener>,
+    /// QUIC listeners, driven by the engine like any other readiness source.
+    pub quic_listeners: Vec<crate::quic_listener::QuicListener>,
     pub proxies: Vec<Proxy>,
     pub checks: Vec<ServerCheckState>,
     pub sessions: SessionArena,
@@ -1082,6 +1084,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
 
 
         Ok(Engine {
+            quic_listeners: Vec::new(),
             poller,
             scheduler,
             fdtab,
@@ -1192,6 +1195,67 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
     ///
     /// # Errors
     /// Returns an error if polling epoll fails.
+    /// Binds a QUIC listener and registers it with the poller.
+    ///
+    /// # Errors
+    /// Returns an error if the socket cannot be bound or the endpoint cannot be built.
+    pub fn add_quic_listener(
+        &mut self,
+        addr: std::net::SocketAddr,
+        tls: &rustls::ServerConfig,
+        backend: Option<std::net::SocketAddr>,
+    ) -> io::Result<u16> {
+        let mut ql = crate::quic_listener::QuicListener::bind(addr, tls, None)?;
+        if let Some(be) = backend {
+            ql.set_backend(be);
+        }
+        let port = ql.addr().port();
+        let idx = self.quic_listeners.len();
+        let fd = ql.raw_fd();
+        self.fdtab.insert(
+            fd,
+            FdState::QuicListener { listener: usize_to_u32(idx) },
+            Interest::READ,
+        );
+        // SAFETY-adjacent: the listener owns the fd for as long as it is in the vector, and
+        // it is removed from the poller only when the listener is dropped.
+        self.poller.add(ql.borrowed_fd(), raw_fd_to_u64(fd), true, false)?;
+        self.quic_listeners.push(ql);
+        Ok(port)
+    }
+
+    /// Registers any backend socket a QUIC listener has opened since the last pass.
+    ///
+    /// The listener creates these when a request arrives, so the engine learns about them
+    /// after the fact rather than up front. Registering them is what lets a slow backend
+    /// wake the loop instead of being noticed on the next unrelated event.
+    fn sync_quic_backend_fds(&mut self) {
+        let mut to_add: Vec<(usize, RawFd)> = Vec::new();
+        for (idx, ql) in self.quic_listeners.iter().enumerate() {
+            for fd in ql.backend_fds() {
+                if matches!(self.fdtab.state(fd), FdState::Closed) {
+                    to_add.push((idx, fd));
+                }
+            }
+        }
+        for (idx, fd) in to_add {
+            let Some(ql) = self.quic_listeners.get(idx) else { continue };
+            let Some(borrowed) = ql
+                .backend_borrowed_fds()
+                .into_iter()
+                .find(|b| b.as_raw_fd() == fd)
+            else {
+                continue;
+            };
+            self.fdtab.insert(
+                fd,
+                FdState::QuicBackend { listener: usize_to_u32(idx) },
+                Interest { readable: true, writable: true },
+            );
+            let _ = self.poller.add(borrowed, raw_fd_to_u64(fd), true, true);
+        }
+    }
+
     pub fn step(&mut self, now: Tick) -> io::Result<usize> {
         self.now = now;
 
@@ -1211,12 +1275,24 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             }
         };
 
+        // A QUIC transport's next deadline can be sooner than the scheduler's. Waiting past
+        // it would delay loss recovery; the shortest of the two wins.
+        let now_inst = Instant::now();
+        let poll_timeout = self
+            .quic_listeners
+            .iter()
+            .filter_map(crate::quic_listener::QuicListener::poll_timeout)
+            .fold(poll_timeout, |acc, deadline| {
+                acc.min(deadline.saturating_duration_since(now_inst))
+            });
+
         // 3. Poll readiness events
         let mut events = std::mem::take(&mut self.events);
         events.clear();
         self.poller.poll(Some(poll_timeout), |ev| events.push(ev))?;
 
         // 4. Process polled readiness events
+        let mut quic_ready: Vec<usize> = Vec::new();
         for &ev in &events {
             match self.fdtab.state(ev.fd) {
                 FdState::Listener { listener: l_idx } => {
@@ -1233,10 +1309,34 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     self.scheduler
                         .tasklet_wakeup(task, Class::Urgent, state::WOKEN_IO);
                 }
+                FdState::QuicListener { listener: q_idx }
+                | FdState::QuicBackend { listener: q_idx } => {
+                    // A QUIC connection is not a descriptor, so there is nothing to accept
+                    // and no task to wake: the listener demultiplexes by connection ID.
+                    // Both the UDP socket and any backend socket it opened drive the same
+                    // listener, which is why they share an arm.
+                    quic_ready.push(q_idx as usize);
+                }
                 FdState::Closed => {}
             }
         }
         self.events = events;
+
+        // Drive every QUIC listener that had readiness, and every one whose transport timer
+        // has expired. `poll_timeout` is asked rather than calling `handle_timeout` on each
+        // wakeup, because a transport told the time has advanced when it has not will arm and
+        // fire loss-recovery timers that are not due.
+        let inst = Instant::now();
+        for (idx, ql) in self.quic_listeners.iter_mut().enumerate() {
+            let timer_due = ql.poll_timeout().is_some_and(|d| d <= inst);
+            if timer_due {
+                ql.handle_timeout(inst);
+            }
+            if timer_due || quic_ready.contains(&idx) {
+                let _ = ql.pump(inst);
+            }
+        }
+        self.sync_quic_backend_fds();
 
         // 5. Run runnable tasks through Dispatch
         let pid = std::process::id();
