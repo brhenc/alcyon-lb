@@ -8,6 +8,18 @@ cd "$(dirname "$0")/.." || exit 1
 
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-/tmp/ibex-checkin-target}
 
+# Every step below pipes into grep, and a pipeline's exit status is the last command's.
+# `pipefail` does not help when nothing checks the result: this script had no exit-code
+# handling at all, so it returned 0 whatever happened. It printed
+# "Verdict: FAIL (1 regression detected!)" and exited 0 in the same run that found a
+# 20% throughput drop. AGENTS.md calls this script "the project's definition of still
+# standing", and agents are asked to paste its output -- but anyone checking $? instead
+# of reading two hundred lines got a green that meant nothing. Collect the failures and
+# exit on them.
+FAILED=()
+note_fail() { FAILED+=("$1"); echo "!! FAILED: $1"; }
+check() { [ "$1" -eq 0 ] || note_fail "$2"; }
+
 SPEC_TESTS=(
   crates/ibex-sample/tests/sample_semantics.rs
   crates/ibex-rt/tests/tcp_request_rules.rs
@@ -33,13 +45,17 @@ elif sha256sum --quiet -c "$MANIFEST" 2>/dev/null; then
 else
   echo "!! SPEC TESTS CHANGED -- read this before trusting anything below:"
   sha256sum -c "$MANIFEST" 2>&1 | grep -v ': OK$'
+  note_fail "tripwire: spec tests modified"
 fi
 
 echo
 echo "=== the eight findings ==="
 cargo test -p ibex-sample --test sample_semantics 2>&1 | grep -E "^test |test result"
+check "${PIPESTATUS[0]}" "sample_semantics"
 cargo test -p ibex-rt --test tcp_request_rules 2>&1 | grep -E "^test |test result"
+check "${PIPESTATUS[0]}" "tcp_request_rules"
 cargo test -p ibex-rt --test tcp_request_tracking 2>&1 | grep -E "^test |test result"
+check "${PIPESTATUS[0]}" "tcp_request_tracking"
 
 echo
 echo "=== the oracles that measure a port against the real thing ==="
@@ -49,6 +65,7 @@ echo "=== the oracles that measure a port against the real thing ==="
 # `_in_len` where data/slz_vectors.json has `in_len`. It had never been run against the
 # oracle it exists for. A test nobody runs is a test nobody has.
 cargo test -p slz --test test_slz -- --nocapture 2>&1 | grep -E "EXACT MATCHES|ROUND TRIPS|test result"
+check "${PIPESTATUS[0]}" "slz oracle"
 
 echo
 echo "=== every test in the workspace, against a declared baseline ==="
@@ -62,6 +79,7 @@ echo "=== every test in the workspace, against a declared baseline ==="
 # fails in the parallel run on port contention, and fc_src_is_the_real_peer_after_set_src
 # does the same. Known failures live in data/suite_baseline.json with a reason each.
 python3 harness/suite.py 2>&1 | grep -vE "^$"
+check "${PIPESTATUS[0]}" "workspace suite"
 
 echo
 echo "=== did a test execute what changed ==="
@@ -75,6 +93,7 @@ echo "=== did a test execute what changed ==="
 # workspace instrumented and runs every test; set COVERCHECK=0 to skip it on a quick loop.
 if [ "${COVERCHECK:-1}" = "1" ]; then
   python3 harness/covercheck.py 2>&1 | grep -vE "^$"
+  check "${PIPESTATUS[0]}" "covercheck"
 else
   echo "covercheck: skipped (COVERCHECK=0)"
 fi
@@ -87,15 +106,19 @@ echo "=== the regressions no unit test can see ==="
 # test stayed green. This runs in about two seconds.
 cargo build -q --bin ibex 2>/dev/null
 python3 harness/smoke.py 2>&1 | grep -vE "^$"
+check "${PIPESTATUS[0]}" "smoke"
 
 echo
 echo "=== does the rest still build and lint ==="
 cargo clippy -q --workspace --all-targets 2>&1 | grep -E "^(warning|error)" | grep -v generated | sort | uniq -c
-echo "clippy exit: ${PIPESTATUS[0]}"
+CLIPPY_RC=${PIPESTATUS[0]}
+echo "clippy exit: $CLIPPY_RC"
+check "$CLIPPY_RC" "clippy"
 
 echo
 echo "=== continuous measurement ==="
 tools/measure/run.sh --fast
+check "$?" "continuous measurement"
 
 echo
 echo "=== new surface since the nudge, and whether it came with tests ==="
@@ -111,3 +134,13 @@ echo "=== stray files (the supervisor's own are expected) ==="
 git status --short | grep '^??' \
   | grep -vE 'tests/(sample_semantics|tcp_request_rules|tcp_request_tracking)\.rs|nudge-agy\.md|tools/checkin\.sh' \
   || echo "none"
+
+echo
+echo "=== verdict ==="
+if [ ${#FAILED[@]} -eq 0 ]; then
+  echo "checkin: PASS"
+  exit 0
+fi
+echo "checkin: FAIL (${#FAILED[@]})"
+for f in "${FAILED[@]}"; do echo "  - $f"; done
+exit 1

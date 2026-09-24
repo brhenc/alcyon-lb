@@ -512,11 +512,22 @@ fn parse_http_response(buf: &[u8]) -> Option<(u16, Vec<(String, String)>, Vec<u8
     Some((status_code, headers, body))
 }
 
+/// The bare `strerror(errno)` text, without the `" (os error N)"` that Rust's
+/// `io::Error` Display appends. HAProxy reports the former, and the reg-tests anchor on
+/// it -- `\(Network.* unreachable\)` needs the string to end at the closing paren.
+fn strerror(err: &io::Error) -> String {
+    let text = err.to_string();
+    match text.find(" (os error ") {
+        Some(idx) => text[..idx].to_string(),
+        None => text,
+    }
+}
+
 fn format_l4_connect_error(err: &io::Error) -> String {
     if err.kind() == io::ErrorKind::ConnectionRefused || err.raw_os_error() == Some(111) {
         "ECONNREFUSED returned by OS".to_string()
     } else {
-        format!("General socket error ({err})")
+        format!("General socket error ({})", strerror(err))
     }
 }
 
@@ -608,7 +619,7 @@ pub fn step_check(
                         check.on_failure_full("L4CON", "Layer4 connection problem", duration, None, info)
                     }
                     Err(ref e) => {
-                        let info = Some(format!("General socket error ({e})"));
+                        let info = Some(format!("General socket error ({})", strerror(e)));
                         check.on_failure_full("L4CON", "Layer4 connection problem", duration, None, info)
                     }
                 };
@@ -708,7 +719,7 @@ pub fn step_check(
                     cleanup_check_socket(check, fdtab, poller);
                     let info = match connect_res {
                         Ok(Some(ref err)) => Some(format_l4_connect_error(err)),
-                        Err(ref e) => Some(format!("General socket error ({e})")),
+                        Err(ref e) => Some(format!("General socket error ({})", strerror(e))),
                         _ => None,
                     };
                     let event = check.on_failure_full(
@@ -750,7 +761,7 @@ pub fn step_check(
                     cleanup_check_socket(check, fdtab, poller);
                     let info = match connect_res {
                         Ok(Some(ref err)) => Some(format_l4_connect_error(err)),
-                        Err(ref e) => Some(format!("General socket error ({e})")),
+                        Err(ref e) => Some(format!("General socket error ({})", strerror(e))),
                         _ => None,
                     };
                     let event = check.on_failure_full(
@@ -3269,4 +3280,33 @@ fn progress_ssl_hello_check(
     cleanup_check_socket(check, fdtab, poller);
     let next = check.schedule_next(now);
     Ok(CheckStep::pending(Some(next)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// HAProxy prints the bare `strerror(errno)` text in a check's `info:` field:
+    ///
+    ///     info: "General socket error (Network is unreachable)"
+    ///
+    /// Rust's `io::Error` Display appends `" (os error N)"` to the same string, and
+    /// checks/4be_1srv_smtpchk_httpchk_layer47errors.vtc anchors on the closing paren:
+    ///
+    ///     info: "General socket error \(Network.* unreachable\)"
+    ///
+    /// which the suffix makes unmatchable, since the text no longer ends in
+    /// `unreachable)`.
+    #[test]
+    fn l4_connect_errors_read_like_strerror_not_like_rust() {
+        let unreachable = io::Error::from_raw_os_error(101);
+        assert_eq!(
+            format_l4_connect_error(&unreachable),
+            "General socket error (Network is unreachable)"
+        );
+
+        // ECONNREFUSED keeps its own wording, which HAProxy special-cases too.
+        let refused = io::Error::from_raw_os_error(111);
+        assert_eq!(format_l4_connect_error(&refused), "ECONNREFUSED returned by OS");
+    }
 }

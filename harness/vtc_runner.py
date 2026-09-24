@@ -1313,6 +1313,16 @@ class MockServerRunner:
                 except Exception:
                     pass
 
+        except (ConnectionResetError, BrokenPipeError):
+            # The peer closing mid-write is a legitimate outcome, not a harness error.
+            # checks/4be_1srv_smtpchk_httpchk_layer47errors.vtc asserts on Layer7
+            # *timeouts*: the server is meant to stop answering, the proxy gives up and
+            # closes, and the server's next `send` writes into a dead socket. varnishtest
+            # ends that connection and moves on; raising here failed the test with a
+            # traceback for doing exactly what it was written to do. The assertions that
+            # matter in that .vtc live in its syslog blocks, which are unaffected.
+            if self.verbose:
+                print(f"       {Color.DIM}[{self.server_id}] peer closed mid-script{Color.RESET}")
         except Exception as ex:
             self.error = ex
         finally:
