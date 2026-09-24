@@ -285,7 +285,7 @@ impl Proxy {
     /// Selects the target backend server with load balancing algorithm (Source IP hash or round-robin),
     /// respecting backup failover and connection limits.
     #[must_use]
-    pub fn select_server_with_key(&mut self, source_ip: Option<IpAddr>) -> Option<SocketAddr> {
+    pub fn select_server_with_key(&mut self, source_ip: Option<IpAddr>, uri: Option<&str>) -> Option<SocketAddr> {
         if self.servers.is_empty() {
             return self.dispatch;
         }
@@ -310,7 +310,8 @@ impl Proxy {
                 Some(self.servers[chosen_idx])
             }
             BalanceAlgorithm::Uri => {
-                if let Some(idx) = crate::lb::balance_uri(self, "/") {
+                let u = uri.unwrap_or("/");
+                if let Some(idx) = crate::lb::balance_uri(self, u) {
                     Some(self.servers[idx])
                 } else {
                     self.select_server()
@@ -320,18 +321,6 @@ impl Proxy {
         }
     }
 
-    /// Selects a server using the URI load balancing algorithm with a specific URI string.
-    #[must_use]
-    pub fn select_server_with_uri(&mut self, uri: &str) -> Option<SocketAddr> {
-        if self.servers.is_empty() {
-            return self.dispatch;
-        }
-        if let Some(idx) = crate::lb::balance_uri(self, uri) {
-            Some(self.servers[idx])
-        } else {
-            self.select_server()
-        }
-    }
 }
 
 /// A session registered in the runtime engine.
@@ -2700,7 +2689,7 @@ fn init_client_session(
         sess.cli_state = ScState::ShutR;
         sess.srv_state = ScState::Closed;
     } else if mode == Mode::Tcp && !proxy.accept_proxy && !proxy.accept_proxy_v2 && sess.tcp_inspect_done {
-        target_addr = proxy.select_server_with_key(sess.client_addr.map(|a| a.ip()));
+        target_addr = proxy.select_server_with_key(sess.client_addr.map(|a| a.ip()), sess.req_uri.as_deref());
         if let Some(target) = target_addr {
             maybe_prepend_send_proxy(proxy, &mut sess, target);
 
@@ -2919,11 +2908,11 @@ fn retry_server_connect(
     proxies[be_idx].stats[worker_id()].retries_count.fetch_add(1, Ordering::Relaxed);
     let source_ip = entry.sess.client_addr.map(|a| a.ip());
     let target = if proxies[be_idx].redisp {
-        proxies[be_idx].select_server_with_key(source_ip)
+        proxies[be_idx].select_server_with_key(source_ip, entry.sess.req_uri.as_deref())
     } else {
         entry
             .target_addr
-            .or_else(|| proxies[be_idx].select_server_with_key(source_ip))
+            .or_else(|| proxies[be_idx].select_server_with_key(source_ip, entry.sess.req_uri.as_deref()))
     };
 
     let Some(target_addr) = target else {
@@ -5099,9 +5088,9 @@ impl EngineDispatcher<'_> {
         let target = if let Some(ref cval) = entry.sess.cookie_val {
             proxies[be_idx]
                 .select_server_by_id(cval)
-                .or_else(|| proxies[be_idx].select_server_with_key(source_ip))
+                .or_else(|| proxies[be_idx].select_server_with_key(source_ip, entry.sess.req_uri.as_deref()))
         } else {
-            proxies[be_idx].select_server_with_key(source_ip)
+            proxies[be_idx].select_server_with_key(source_ip, entry.sess.req_uri.as_deref())
         };
 
         let Some(target_addr) = target else {
@@ -5257,7 +5246,7 @@ impl EngineDispatcher<'_> {
         }
 
         let source_ip = entry.sess.client_addr.map(|a| a.ip());
-        let target = proxies[be_idx].select_server_with_key(source_ip);
+        let target = proxies[be_idx].select_server_with_key(source_ip, entry.sess.req_uri.as_deref());
 
         let Some(target_addr) = target else {
             entry.sess.srv_state = ScState::Error;

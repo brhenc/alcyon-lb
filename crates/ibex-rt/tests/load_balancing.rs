@@ -105,3 +105,33 @@ backend test_be
     assert!(counts[1] > 10);
     assert!(counts[2] > 10);
 }
+
+#[test]
+fn balance_uri_reaches_the_data_path() {
+    let cfg = "
+backend test_be
+    balance uri
+    mode http
+    server s1 127.0.0.1:8001 weight 1
+    server s2 127.0.0.1:8002 weight 1
+    server s3 127.0.0.1:8003 weight 1
+";
+    let mut eng = get_proxy(cfg);
+    let proxy = &mut eng.proxies[0];
+    
+    for s in proxy.server_statuses.iter() {
+        s.store(check::ServerStatus::Up as u8, Ordering::Relaxed);
+    }
+    
+    let mut counts = vec![0; 3];
+    for i in 0..100 {
+        let uri = format!("/api/v1/resource/{}", i);
+        // Drive the engine's real selection path -- not lb::balance_uri
+        let target = proxy.select_server_with_key(None, Some(&uri)).unwrap();
+        let idx = proxy.servers.iter().position(|&s| s == target).unwrap();
+        counts[idx] += 1;
+    }
+    
+    let active_servers = counts.iter().filter(|&&c| c > 0).count();
+    assert!(active_servers > 1, "balance uri sent all requests to a single server!");
+}
