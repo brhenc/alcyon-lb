@@ -317,4 +317,15 @@ mod tests {
         let err = Listener::adopt(fd, loopback0(), 16, 0).err().expect("must refuse");
         assert!(err.to_string().contains("not a stream socket"), "{err}");
     }
+
+    #[test]
+    fn adopt_takes_an_ipv6_listening_socket() {
+        let Ok(orig) = Listener::bind(SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 0)), 16, 0) else {
+            return; // no IPv6 loopback on this host
+        };
+        let addr = orig.addr();
+        let fd = orig.borrowed_fd().try_clone_to_owned().expect("dup");
+        let adopted = Listener::adopt(fd, addr, 16, 0).expect("adopt v6");
+        assert_eq!(adopted.addr(), addr);
+    }
 }

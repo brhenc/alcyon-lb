@@ -602,3 +602,72 @@ fn a_reload_that_fails_after_loading_its_config_leaves_the_pidfile_alone() {
     let _ = std::fs::remove_file(&pidfile);
     old.stop();
 }
+
+/// Without `-W` / `-Ws`, `SIGUSR2` is ignored, as in `HAProxy`'s standalone mode
+/// (`src/haproxy.c:2606`). Before the handler existed it was the default action: the
+/// process died.
+#[test]
+fn sigusr2_without_w_is_ignored_not_fatal() {
+    let be = backend();
+    let fe = free_addr();
+    let sock = short_sock("nousr2");
+    let cfg = write_cfg(&config(fe, be, &sock, ""));
+    let mut p = Proc::start(cfg.path(), &[]);
+    wait_listening(fe);
+    p.signal(Signal::Usr2);
+    assert!(p.wait_exit(Duration::from_millis(500)).is_none(), "SIGUSR2 stopped the process");
+    let mut c = TcpStream::connect(fe).expect("still accepting");
+    c.write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").expect("send");
+    assert!(read_all(&mut c, Duration::from_secs(3)).starts_with("HTTP/1.1 200"));
+    let _ = std::fs::remove_file(&sock);
+    p.stop();
+}
+
+/// A reload onto a configuration that no longer binds an address must close that
+/// address's socket. The old process hands every listener over; one the new process has
+/// no bind for would otherwise stay open in it -- listening, queueing connections, and
+/// never accepting them. `HAProxy` drops these (`sock_drop_unused_old_sockets`).
+#[test]
+fn a_reload_that_drops_a_bind_closes_its_socket() {
+    let be = backend();
+    let fe1 = free_addr();
+    let fe2 = free_addr();
+    let sock = short_sock("dropbind");
+    let mut sink = NotifySink::new("dropbind");
+    let pidfile = short_sock("dropbind").with_extension("pid");
+    let two = config(fe1, be, &sock, "").replace(
+        &format!("  bind {fe1}\n"),
+        &format!("  bind {fe1}\n  bind {fe2}\n"),
+    );
+    let cfg = write_cfg(&two);
+
+    let mut old = start_notified(cfg.path(), &sink, &pidfile);
+    sink.wait_for("READY=1", Duration::from_secs(5)).expect("initial READY=1");
+    wait_listening(fe1);
+    wait_listening(fe2);
+
+    std::fs::write(cfg.path(), config(fe1, be, &sock, "")).expect("drop the second bind");
+    let old_pid = old.pid();
+    old.signal(Signal::Usr2);
+    let new_pid = sink
+        .wait_until(
+            |m| m.contains("READY=1") && mainpid(m).is_some_and(|p| p != old_pid),
+            Duration::from_secs(5),
+        )
+        .as_deref()
+        .and_then(mainpid)
+        .unwrap_or_else(|| panic!("no handover; saw {:?}", sink.seen));
+    // `old` is this test's own child: once it exits it is a zombie until reaped, and
+    // `kill(pid, 0)` goes on succeeding for a zombie, so `wait_gone` would wait forever.
+    let st = old.wait_exit(Duration::from_secs(5));
+    assert!(st.is_some_and(|s| s.success()), "old process did not exit cleanly: {st:?}");
+
+    wait_listening(fe1);
+    assert!(
+        TcpStream::connect(fe2).is_err(),
+        "{fe2} was dropped from the configuration but its socket is still listening"
+    );
+    stop_pid(new_pid);
+    let _ = std::fs::remove_file(&sock);
+    let _ = std::fs::remove_file(&pidfile);
+}
