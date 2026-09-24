@@ -650,25 +650,15 @@ fn main() {
         enforce_memory_limit(megs, opts.quiet);
     }
 
-    // 11. Handle graceful reload and termination signals (-sf / -st)
-    if !opts.sf_pids.is_empty() {
-        send_signals_to_pids(&opts.sf_pids, Signal::Usr1, opts.quiet);
-    }
-    if !opts.st_pids.is_empty() {
-        send_signals_to_pids(&opts.st_pids, Signal::Term, opts.quiet);
-    }
-
-    // 12. Master-worker systemd notification (-Ws)
-    if opts.systemd_notify {
-        // crates/ibex-rt/src/systemd.rs, not a local copy: `Path` cannot address the
-        // abstract socket systemd hands out as `@name`, and the module sends the full
-        // READY=1/MAINPID/STATUS message HAProxy does (src/cli.c:3087).
-        if let Err(e) = ibex_rt::systemd::notify_ready() {
-            eprintln!("[WARNING] systemd notify failed: {e}");
-        }
+    // 11. SIGUSR1 is the soft stop, as in HAProxy. Installed before any listener exists,
+    //     so there is no moment where this process is serving and the signal is fatal.
+    let lifecycle = ibex_rt::lifecycle::Lifecycle::new();
+    if let Err(e) = lifecycle.install_signal_handlers() {
+        eprintln!("Failed to install signal handlers: {e}");
+        process::exit(1);
     }
 
-    // 13. Initialize Ibex soft-realtime engine
+    // 12. Initialize Ibex soft-realtime engine
     
     let capacity = opts.maxconn.unwrap_or(65536) as usize;
     let nbthread = config.global.as_ref().and_then(|g| g.nbthread).unwrap_or(1) as usize;
@@ -687,11 +677,15 @@ fn main() {
     
     let stats_socket_mode = config.global.as_ref().and_then(|g| g.stats_socket_mode);
 
+    // Each worker reports once it is listening. `-sf` and READY=1 wait for all of them.
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
     let mut threads = Vec::new();
     for worker_id in 0..nbthread {
         let config_clone = config.clone();
         let proxies_clone = shared_proxies.clone();
         let cli_socket_clone = cli_socket.clone();
+        let lifecycle_clone = lifecycle.clone();
+        let ready_tx = ready_tx.clone();
 
         let t = std::thread::spawn(move || {
             let mut engine = match Engine::new_worker(&config_clone, capacity, worker_id, proxies_clone) {
@@ -714,6 +708,9 @@ fn main() {
                     }
                 }
             }
+            engine.set_lifecycle(lifecycle_clone);
+            let _ = ready_tx.send(());
+            drop(ready_tx);
             if let Err(err) = engine.run_loop() {
                 eprintln!("Engine error (worker {}): {}", worker_id, err);
                 process::exit(1);
@@ -722,7 +719,35 @@ fn main() {
         threads.push(t);
     }
 
+    drop(ready_tx);
+
+    // 13. Only now, with every worker bound, tell the old process to go and tell systemd we
+    //     are up. These used to run before the engine was built: a reload signalled the old
+    //     process to stop before the new one was listening, so there was always a window
+    //     with nothing accepting, and READY=1 reported a service that did not exist yet. A
+    //     worker that fails to start exits the process, so this cannot wait forever.
+    for _ in 0..nbthread {
+        if ready_rx.recv().is_err() {
+            break;
+        }
+    }
+    if !opts.sf_pids.is_empty() {
+        send_signals_to_pids(&opts.sf_pids, Signal::Usr1, opts.quiet);
+    }
+    if !opts.st_pids.is_empty() {
+        send_signals_to_pids(&opts.st_pids, Signal::Term, opts.quiet);
+    }
+    if opts.systemd_notify {
+        // crates/ibex-rt/src/systemd.rs, not a local copy: `Path` cannot address the
+        // abstract socket systemd hands out as `@name`, and the module sends the full
+        // READY=1/MAINPID/STATUS message HAProxy does (src/cli.c:3087).
+        if let Err(e) = ibex_rt::systemd::notify_ready() {
+            eprintln!("[WARNING] systemd notify failed: {e}");
+        }
+    }
+
     for t in threads {
         let _ = t.join();
     }
+    process::exit(0);
 }

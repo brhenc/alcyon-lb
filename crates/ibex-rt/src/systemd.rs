@@ -40,3 +40,11 @@ pub fn notify_stopping() -> std::io::Result<()> {
 pub fn notify_reload_failed() -> std::io::Result<()> {
     notify("READY=1\nSTATUS=Reload failed!\n")
 }
+
+/// Sends `STOPPING=1` once per process, however many workers begin a soft stop.
+pub fn notify_stopping_once() {
+    static SENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !SENT.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        let _ = notify_stopping();
+    }
+}

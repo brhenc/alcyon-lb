@@ -454,14 +454,37 @@ pub struct Engine {
     pub global_h2_flood_config: ibex_proto::H2FloodConfig,
     /// Shared idle backend connection pool across sessions (`http-reuse`).
     pub idle_backend_pool: HashMap<SocketAddr, Vec<OwnedFd>>,
+    /// Stop requests from signals, shared by every worker. `None` in tests and embeddings
+    /// that drive the engine directly and stop it with [`Engine::stop`].
+    lifecycle: Option<crate::lifecycle::Lifecycle>,
+    /// Set once a soft stop has begun: listeners are closed and the loop is draining.
+    stopping: bool,
+    /// `global hard-stop-after`: how long a soft stop may drain before the loop ends anyway.
+    hard_stop_after: Option<Duration>,
+    /// When the current soft stop gives up draining, from `hard_stop_after`.
+    stop_deadline: Option<Instant>,
+    /// The identity (device, inode) of the CLI socket file this engine created, so that on
+    /// exit it only unlinks a path that is still its own. See the `Drop` impl.
+    cli_socket_ident: Option<(u64, u64)>,
 }
 
 impl Drop for Engine {
     fn drop(&mut self) {
-        if let Some(ref path) = self.cli_socket_path {
-            let _ = std::fs::remove_file(path);
+        // Unlink the CLI socket only if the path still names the socket this engine
+        // created. During a reload the new process binds the same path before the old one
+        // exits; an unconditional unlink here deleted the new process's stats socket, so
+        // every reload silently took the CLI away.
+        if let (Some(ref path), Some(ident)) = (&self.cli_socket_path, self.cli_socket_ident) {
+            if socket_file_ident(path) == Some(ident) {
+                let _ = std::fs::remove_file(path);
+            }
         }
     }
+}
+
+fn socket_file_ident(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(path).ok().map(|m| (m.dev(), m.ino()))
 }
 
 fn compile_acls(acl_rules: &[ibex_config::AclRule]) -> HashMap<String, Expr> {
@@ -1204,6 +1227,11 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     .unwrap_or(0),
             },
             idle_backend_pool: HashMap::new(),
+            lifecycle: None,
+            stopping: false,
+            hard_stop_after: config.global.as_ref().and_then(|g| g.hard_stop_after),
+            stop_deadline: None,
+            cli_socket_ident: None,
         })
     }
 
@@ -1222,6 +1250,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         self.poller
             .add(listener.as_fd(), raw_fd_to_u64(raw_fd), true, false)?;
         self.cli_listener = Some(listener);
+        self.cli_socket_ident = socket_file_ident(&path_buf);
         self.cli_socket_path = Some(path_buf);
         Ok(())
     }
@@ -1749,10 +1778,97 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
     /// Propagates polling errors.
     pub fn run_loop(&mut self) -> io::Result<()> {
         while self.is_running {
+            if !self.stopping
+                && self
+                    .lifecycle
+                    .as_ref()
+                    .is_some_and(crate::lifecycle::Lifecycle::soft_stop_requested)
+            {
+                self.begin_soft_stop();
+            }
+            if self.stopping {
+                self.close_idle_http_sessions();
+                if self.sessions.live() == 0 {
+                    break;
+                }
+                if self.stop_deadline.is_some_and(|d| Instant::now() >= d) {
+                    break;
+                }
+            }
             let now = self.current_tick();
             let _ = self.step(now)?;
         }
         Ok(())
+    }
+
+    /// Attaches the process lifecycle, so the run loop observes `SIGUSR1`.
+    pub fn set_lifecycle(&mut self, lifecycle: crate::lifecycle::Lifecycle) {
+        self.lifecycle = Some(lifecycle);
+    }
+
+    /// Whether a soft stop is in progress.
+    #[must_use]
+    pub fn is_stopping(&self) -> bool {
+        self.stopping
+    }
+
+    /// HAProxy's `soft_stop()` (`src/proxy.c:3961`): stop accepting, keep serving what is
+    /// in flight, and exit once it has drained or `hard-stop-after` expires.
+    ///
+    /// QUIC listeners are deliberately left open. A QUIC connection lives on the listening
+    /// UDP socket itself, so closing it would cut every in-flight HTTP/3 request, which is
+    /// the opposite of a soft stop. They are closed when the loop ends.
+    pub fn begin_soft_stop(&mut self) {
+        if self.stopping {
+            return;
+        }
+        self.stopping = true;
+        self.stop_deadline = self.hard_stop_after.map(|d| Instant::now() + d);
+        crate::systemd::notify_stopping_once();
+
+        // Listener indices live in the fd table, so entries cannot be removed one at a
+        // time; every listener goes at once. Session teardown looks listeners up with
+        // `find`, which is a no-op on an empty vector.
+        for l in self.listeners.drain(..) {
+            self.fdtab.remove(l.raw_fd());
+            let _ = self.poller.delete(l.borrowed_fd());
+        }
+        if let Some(cli) = self.cli_listener.take() {
+            self.fdtab.remove(cli.as_raw_fd());
+            let _ = self.poller.delete(cli.as_fd());
+        }
+
+        // An HTTP session finishes the transaction it is in and then closes, instead of
+        // waiting for another request that this process will not be around to serve.
+        for (_, e) in self.sessions.iter_mut() {
+            if e.sess.mode == Mode::Http {
+                e.sess.connection_close = true;
+            }
+        }
+    }
+
+    /// Closes HTTP/1 sessions that are between requests. They hold no work, and keeping
+    /// them would let every idle keep-alive client hold a stopping process open until
+    /// `timeout client`. A request already on the wire but not yet read is lost with the
+    /// connection; clients retry that case, and HAProxy has the same window.
+    fn close_idle_http_sessions(&mut self) {
+        let mut wake = Vec::new();
+        for (_, e) in self.sessions.iter_mut() {
+            let idle = e.sess.mode == Mode::Http
+                && e.sess.h2_ctx.is_none()
+                && !e.response_rules_applied
+                && e.sess.req.is_empty()
+                && e.sess.rep.is_empty()
+                && e.sess.req_headers.is_none()
+                && !e.sess.has_htx
+                && e.sess.cli_state == ScState::Established;
+            if idle {
+                shutdown_session_entry(e, &mut self.proxies, &mut wake);
+            }
+        }
+        for task in wake {
+            self.scheduler.tasklet_wakeup(task, Class::Urgent, state::WOKEN_IO);
+        }
     }
 
     /// Stops the engine loop.
