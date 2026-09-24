@@ -3152,6 +3152,65 @@ fn cleanup_done(
     }
 }
 
+fn is_http_response_complete(buf: &[u8]) -> bool {
+    let Some((hdr_len, eoh_len)) = crate::proxy::find_eoh(buf) else {
+        return false;
+    };
+    let total_hdr_len = hdr_len + eoh_len;
+    let body_bytes = buf.len() - total_hdr_len;
+
+    let Ok(hdr_str) = std::str::from_utf8(&buf[..total_hdr_len]) else {
+        return false;
+    };
+
+    if let Some((first_line, _)) = hdr_str.split_once("\r\n") {
+        let mut words = first_line.split_whitespace();
+        let _proto = words.next();
+        if let Some(status_str) = words.next() {
+            if let Ok(status) = status_str.parse::<u16>() {
+                if status == 204 || status == 304 || (100..200).contains(&status) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    let hdr_lower = hdr_str.to_ascii_lowercase();
+    if hdr_lower.contains("transfer-encoding: chunked") {
+        return buf[total_hdr_len..].windows(5).any(|w| w == b"0\r\n\r\n");
+    }
+
+    for line in hdr_str.lines() {
+        if let Some((k, v)) = line.split_once(':') {
+            if k.trim().eq_ignore_ascii_case("content-length") {
+                if let Ok(cl) = v.trim().parse::<usize>() {
+                    return body_bytes >= cl;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+fn inject_connection_close_header_zero_alloc(buf: &mut crate::buf::Buf) {
+    if let Some((eoh_pos, eoh_len)) = crate::find_eoh(buf.readable()) {
+        let inject = b"Connection: close\r\n";
+        let total_old = eoh_pos + eoh_len;
+        let total_new = total_old + inject.len();
+        if total_new <= 4096 {
+            let mut stack_hdr = [0u8; 4096];
+            let readable = buf.readable();
+            stack_hdr[..eoh_pos].copy_from_slice(&readable[..eoh_pos]);
+            stack_hdr[eoh_pos..eoh_pos + inject.len()].copy_from_slice(inject);
+            stack_hdr[eoh_pos + inject.len()..total_new].copy_from_slice(&readable[eoh_pos..total_old]);
+            buf.replace_prefix(total_old, &stack_hdr[..total_new]);
+        } else {
+            buf.inject_http_header("Connection", "close");
+        }
+    }
+}
+
 impl EngineDispatcher<'_> {
     fn resolve_backend(entry: &SessionEntry, proxies: &[Proxy]) -> usize {
         let proxy_idx = entry.proxy_idx;
@@ -3245,6 +3304,32 @@ impl EngineDispatcher<'_> {
                 }
             }
 
+            // Step 2.6: In HTTP mode with client keep-alive, if the backend response is completely received
+            // and the backend connection is closing, detach and clean up the backend connection now.
+            // This prevents `proxy.rs`'s `process_cli_transitions` from erroneously treating the backend close
+            // as an EOF on the client socket and calling `raw::shutdown_write(client)`.
+            if entry.sess.mode == Mode::Http
+                && !entry.sess.connection_close
+                && (entry.sess.srv.is_some() || matches!(entry.sess.srv_state, ScState::ShutR | ScState::Closed))
+                && entry.response_rules_applied
+            {
+                let complete = is_http_response_complete(entry.sess.rep.readable())
+                    || matches!(entry.sess.srv_state, ScState::ShutR | ScState::Closed);
+                let backend_closing = entry.sess.srv_connection_close
+                    || matches!(entry.sess.srv_state, ScState::ShutR | ScState::Closed);
+                if complete && backend_closing {
+                    if let Some(srv_fd) = entry.sess.srv.take() {
+                        let sfd = srv_fd.as_raw_fd();
+                        self.fdtab.remove(sfd);
+                        let _ = self.poller.delete(srv_fd.as_fd());
+                        entry.srv_raw_fd = None;
+                    }
+                    entry.target_addr = None;
+                    entry.target_server_idx = None;
+                    entry.sess.srv_state = ScState::Init;
+                }
+            }
+
             // Step 3: Stream engine process pass
             if !entry.sess.is_done() {
                 let _ = entry.sess.process(now);
@@ -3286,6 +3371,8 @@ impl EngineDispatcher<'_> {
             // Step 3.5: If in HTTP mode and request headers are parsed, initiate backend connect
             let mut pending_admin = None;
             if entry.sess.mode == Mode::Http
+                && !entry.response_rules_applied
+                && entry.sess.rep.is_empty()
                 && entry.sess.srv_state == ScState::Init
                 && (entry.sess.cli_state == ScState::Established
                     || (entry.sess.cli_state == ScState::ShutR && (entry.sess.req_headers.is_some() || entry.sess.has_htx)))
@@ -3349,10 +3436,6 @@ impl EngineDispatcher<'_> {
                             entry.sess.cli_state,
                             ScState::ShutW | ScState::ShutR | ScState::Closed | ScState::Error
                         )
-                        || matches!(
-                            entry.sess.srv_state,
-                            ScState::ShutR | ScState::Closed | ScState::Error
-                        )
                 };
                 if close_requested {
                     let srv_alive = !entry.sess.srv_connection_close
@@ -3391,9 +3474,10 @@ impl EngineDispatcher<'_> {
                     // It is only closed when the far end is actually finished with it --
                     // the server closed its read side, or the connection errored.
                     let backend_finished = entry.sess.srv.is_none()
+                        || entry.sess.srv_connection_close
                         || matches!(
                             entry.sess.srv_state,
-                            ScState::Closed | ScState::Error
+                            ScState::ShutR | ScState::Closed | ScState::Error
                         );
                     if backend_finished {
                         if let Some(srv_fd) = entry.sess.srv.take() {
@@ -3410,6 +3494,7 @@ impl EngineDispatcher<'_> {
                     if backend_finished {
                         entry.sess.srv_state = ScState::Init;
                     }
+                    entry.sess.srv_connection_close = false;
                     entry.sess.req_method = None;
                     entry.sess.req_uri = None;
                     entry.sess.req_headers = None;
@@ -3437,25 +3522,26 @@ impl EngineDispatcher<'_> {
                     entry.sess.cli_state,
                     ScState::ShutR | ScState::ShutW | ScState::Closed | ScState::Error
                 )
-                && entry.sess.srv.is_some()
             {
-                let srv_alive = !entry.sess.srv_connection_close
-                    && !matches!(
-                        entry.sess.srv_state,
-                        ScState::ShutR | ScState::Closed | ScState::Error
-                    );
-                if srv_alive {
-                    if let Some(srv_fd) = entry.sess.srv.take() {
-                        let sfd = srv_fd.as_raw_fd();
-                        self.fdtab.remove(sfd);
-                        let _ = self.poller.delete(srv_fd.as_fd());
-                        entry.srv_raw_fd = None;
-                        if let Some(target_addr) = entry.target_addr {
-                            let be_idx = entry.backend_idx;
-                            if self.proxies.get(be_idx).is_some_and(|p| p.http_reuse != ibex_config::HttpReuse::Never)
-                                && raw::is_idle_conn_alive(srv_fd.as_fd())
-                            {
-                                self.idle_backend_pool.entry(target_addr).or_default().push(srv_fd);
+                if entry.sess.srv.is_some() {
+                    let srv_alive = !entry.sess.srv_connection_close
+                        && !matches!(
+                            entry.sess.srv_state,
+                            ScState::ShutR | ScState::Closed | ScState::Error
+                        );
+                    if srv_alive {
+                        if let Some(srv_fd) = entry.sess.srv.take() {
+                            let sfd = srv_fd.as_raw_fd();
+                            self.fdtab.remove(sfd);
+                            let _ = self.poller.delete(srv_fd.as_fd());
+                            entry.srv_raw_fd = None;
+                            if let Some(target_addr) = entry.target_addr {
+                                let be_idx = entry.backend_idx;
+                                if self.proxies.get(be_idx).is_some_and(|p| p.http_reuse != ibex_config::HttpReuse::Never)
+                                    && raw::is_idle_conn_alive(srv_fd.as_fd())
+                                {
+                                    self.idle_backend_pool.entry(target_addr).or_default().push(srv_fd);
+                                }
                             }
                         }
                     }
@@ -3545,15 +3631,24 @@ impl EngineDispatcher<'_> {
             return;
         }
 
-        let hdr_bytes = &entry.sess.rep.readable()[..total_hdr_len];
-        if let Ok(s) = std::str::from_utf8(hdr_bytes) {
+        let mut srv_has_close = false;
+        if let Ok(s) = std::str::from_utf8(&entry.sess.rep.readable()[..total_hdr_len]) {
             for line in s.lines() {
                 if let Some((k, v)) = line.split_once(':') {
                     if k.trim().eq_ignore_ascii_case("connection") && v.trim().eq_ignore_ascii_case("close") {
-                        entry.sess.connection_close = true;
+                        srv_has_close = true;
                     }
                 }
             }
+        }
+        if srv_has_close {
+            entry.sess.srv_connection_close = true;
+        }
+
+        if !entry.sess.connection_close && srv_has_close {
+            entry.sess.rep.remove_http_header("connection");
+        } else if entry.sess.connection_close && !srv_has_close {
+            inject_connection_close_header_zero_alloc(&mut entry.sess.rep);
         }
 
         let has_rules = !proxies[be_idx].http_res_rules.is_empty()
@@ -3571,6 +3666,11 @@ impl EngineDispatcher<'_> {
             return;
         }
 
+        let (total_hdr_len, _) = match crate::find_eoh(entry.sess.rep.readable()) {
+            Some(x) => x,
+            None => return,
+        };
+        let hdr_bytes = &entry.sess.rep.readable()[..total_hdr_len];
         let hdr_str = String::from_utf8_lossy(hdr_bytes);
 
         let Some((first_line, rest_headers)) = hdr_str.split_once("\r\n") else {
@@ -4038,6 +4138,16 @@ impl EngineDispatcher<'_> {
             }
         }
 
+        // Connection header policy:
+        if !entry.sess.connection_close {
+            // Client is in keep-alive mode: strip hop-by-hop Connection: close
+            hdrs.retain(|(k, v)| {
+                !(k.eq_ignore_ascii_case("connection") && v.to_ascii_lowercase().contains("close"))
+            });
+        } else if !hdrs.iter().any(|(k, _v)| k.eq_ignore_ascii_case("connection")) {
+            hdrs.push(("Connection".to_string(), "close".to_string()));
+        }
+
         let mut new_hdr = format!("{proto_version} {status} {status_msg}\r\n");
         for (k, v) in hdrs {
             let _ = write!(new_hdr, "{k}: {v}\r\n");
@@ -4103,6 +4213,7 @@ impl EngineDispatcher<'_> {
         pid: u32,
         now: Tick,
     ) -> Option<crate::stats_html::AdminAction> {
+        entry.sess.connection_close = true;
         let req_uri = entry.sess.req_uri.as_deref().unwrap_or("/");
 
         // 1. CSV telemetry
@@ -6225,7 +6336,10 @@ const fn status_reason(status: u16) -> &'static str {
 
 #[cfg(test)]
 mod registry_tests {
-    use super::{build_sample_registry, CURRENT_RES_STATUS, CURRENT_VARS};
+    use super::{
+        build_sample_registry, inject_connection_close_header_zero_alloc,
+        is_http_response_complete, CURRENT_RES_STATUS, CURRENT_VARS,
+    };
     use ibex_sample::{Expr, Sample, SampleContext};
 
     /// The engine's registry must read the *same* thread-locals the engine writes.
@@ -6300,5 +6414,31 @@ mod registry_tests {
         let ctx = SampleContext::default();
         let expr = Expr::parse("status").expect("status must parse");
         assert_eq!(expr.eval_sample(&reg, &ctx), None);
+    }
+
+    #[test]
+    fn test_is_http_response_complete_cases() {
+        assert!(!is_http_response_complete(b"incomplete"));
+        assert!(!is_http_response_complete(b"\xff\xff\r\n\r\n"));
+        assert!(is_http_response_complete(b"HTTP/1.1 204 No Content\r\n\r\n"));
+        assert!(is_http_response_complete(b"HTTP/1.1 304 Not Modified\r\n\r\n"));
+        assert!(is_http_response_complete(b"HTTP/1.1 100 Continue\r\n\r\n"));
+        assert!(!is_http_response_complete(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"));
+        assert!(is_http_response_complete(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"));
+        assert!(!is_http_response_complete(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n123"));
+        assert!(is_http_response_complete(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n12345"));
+        assert!(!is_http_response_complete(b"HTTP/1.1 200 OK\r\n\r\n"));
+    }
+
+    #[test]
+    fn test_inject_connection_close_zero_alloc() {
+        let mut b = crate::buf::Buf::standard();
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        b.writable()[..raw.len()].copy_from_slice(raw);
+        b.commit(raw.len());
+        inject_connection_close_header_zero_alloc(&mut b);
+        let s = std::str::from_utf8(b.readable()).unwrap();
+        assert!(s.contains("Connection: close\r\n"));
+        assert!(s.ends_with("\r\n\r\nok"));
     }
 }

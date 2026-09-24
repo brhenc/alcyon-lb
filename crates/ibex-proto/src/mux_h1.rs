@@ -222,6 +222,36 @@ impl H1MuxContext {
     }
 }
 
+fn strip_connection_close_header(input: &[u8]) -> Vec<u8> {
+    let Ok(s) = std::str::from_utf8(input) else {
+        return input.to_vec();
+    };
+    let Some((first_line, rest)) = s.split_once("\r\n") else {
+        return input.to_vec();
+    };
+    let Some((headers, body)) = rest.split_once("\r\n\r\n") else {
+        return input.to_vec();
+    };
+
+    let mut out = Vec::with_capacity(input.len());
+    out.extend_from_slice(first_line.as_bytes());
+    out.extend_from_slice(b"\r\n");
+
+    for line in headers.lines() {
+        let trimmed = line.trim();
+        if let Some((k, v)) = trimmed.split_once(':') {
+            if k.trim().eq_ignore_ascii_case("connection") && v.to_ascii_lowercase().contains("close") {
+                continue;
+            }
+        }
+        out.extend_from_slice(line.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(body.as_bytes());
+    out
+}
+
 /// HTTP/1.1 Multiplexer implementation.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MuxH1;
@@ -407,10 +437,6 @@ impl Mux for MuxH1 {
             ctx.enter_tunnel();
         }
 
-        if input_str.to_ascii_lowercase().contains("connection: close") {
-            ctx.conn_close = true;
-        }
-
         if input_str
             .to_ascii_lowercase()
             .contains("transfer-encoding: chunked")
@@ -418,7 +444,16 @@ impl Mux for MuxH1 {
             ctx.tx_chunked = true;
         }
 
-        ctx.tx_buf.extend_from_slice(input);
+        let to_strip = !ctx.is_server && !ctx.conn_close && input_str.to_ascii_lowercase().contains("connection: close");
+        if to_strip {
+            let stripped = strip_connection_close_header(input);
+            ctx.tx_buf.extend_from_slice(&stripped);
+        } else {
+            if input_str.to_ascii_lowercase().contains("connection: close") {
+                ctx.conn_close = true;
+            }
+            ctx.tx_buf.extend_from_slice(input);
+        }
 
         // If complete bodyless response was buffered and not upgrading, mark stream done
         if !ctx.is_tunnel && !ctx.tx_chunked && input_str.contains("\r\n\r\n") {
@@ -792,5 +827,41 @@ mod tests {
         assert_eq!(ctx.state, H1ConnState::Error);
         assert_eq!(mux.avail_streams(&ctx), 0);
         assert!(!mux.is_reusable(&ctx));
+    }
+
+    #[test]
+    fn h1_mux_client_keepalive_strips_server_connection_close() {
+        let mux = MuxH1;
+        let mut ctx = mux.init(ConnId(10), false).expect("init");
+        let mut sd = SeDesc::new();
+
+        let req = b"GET /keepalive HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        mux.parse(&mut ctx, req).expect("parse req");
+        assert!(!ctx.conn_close);
+
+        let res = b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+        mux.snd_buf(&mut ctx, &mut sd, res).expect("snd");
+
+        // Verify that Connection: close was stripped from outgoing buffer
+        let out = mux.pending_output(&ctx);
+        let out_str = std::str::from_utf8(out).expect("utf8");
+        assert!(
+            !out_str.to_ascii_lowercase().contains("connection: close"),
+            "Expected Connection: close stripped from client response, got: {out_str}"
+        );
+
+        // Verify that client keep-alive state was preserved
+        assert!(!ctx.conn_close);
+        assert_eq!(ctx.state, H1ConnState::Idle);
+        assert_eq!(mux.avail_streams(&ctx), 1);
+        assert!(mux.is_reusable(&ctx));
+    }
+
+    #[test]
+    fn h1_mux_strip_connection_close_edge_cases() {
+        assert_eq!(strip_connection_close_header(b"\xff\xff"), b"\xff\xff");
+        assert_eq!(strip_connection_close_header(b"NoNewlines"), b"NoNewlines");
+        assert_eq!(strip_connection_close_header(b"HTTP/1.1 200 OK\r\nNoEndOfHeaders"), b"HTTP/1.1 200 OK\r\nNoEndOfHeaders");
+        assert_eq!(strip_connection_close_header(b"HTTP/1.1 200 OK\r\nNoColonHeader\r\n\r\n"), b"HTTP/1.1 200 OK\r\nNoColonHeader\r\n\r\n");
     }
 }
