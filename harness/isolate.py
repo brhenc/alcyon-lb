@@ -35,7 +35,7 @@ def main():
         else:
             paths_rel.append(p)
 
-    fp_cmd = [sys.executable, os.path.join(repo_root, "harness", "fingerprint.py")]
+    fp_cmd = [sys.executable, "/tmp/fingerprint.py"]
     if sections:
         fp_cmd.append(sections)
 
@@ -65,8 +65,11 @@ def main():
                     os.remove(full_p)
                 
     try:
+        env = os.environ.copy()
+        env["CARGO_INCREMENTAL"] = "0"
+        
         print("=> Rebuilding...")
-        subprocess.run(["cargo", "build", "--bin", "ibex"], cwd=repo_root, check=True)
+        subprocess.run(["cargo", "build", "--bin", "ibex"], cwd=repo_root, env=env, check=True)
         
         print("=> Fingerprinting reverted tree...")
         fp_rev_str = subprocess.run(fp_cmd, cwd=repo_root, capture_output=True, text=True, check=True).stdout
@@ -82,9 +85,12 @@ def main():
                     os.remove(full_p)
         with tarfile.open(backup_tar, "r:gz") as tar:
             tar.extractall(path=repo_root)
+            for m in tar.getmembers():
+                if m.isfile():
+                    os.utime(os.path.join(repo_root, m.name), None)
             
         print("=> Rebuilding restored tree...")
-        subprocess.run(["cargo", "build", "--bin", "ibex"], cwd=repo_root, check=True)
+        subprocess.run(["cargo", "build", "--bin", "ibex"], cwd=repo_root, env=env, check=True)
 
         print("=> Verifying restore...")
         fp_restored_str = subprocess.run(fp_cmd, cwd=repo_root, capture_output=True, text=True, check=True).stdout

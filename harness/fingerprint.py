@@ -9,10 +9,10 @@ import hashlib
 from collections import defaultdict
 import tempfile
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, "/home/bhenc/project-ibex/harness")
 import smoke
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO = os.path.dirname("/home/bhenc/project-ibex/harness")
 
 def normalize_whitespace(text):
     return " ".join(text.split())
