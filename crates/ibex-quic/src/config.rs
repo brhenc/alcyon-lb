@@ -48,6 +48,8 @@ pub struct QuicConfig {
     pub enable_stateless_reset: bool,
     /// Whether retry packets are required for address validation under load.
     pub require_retry: bool,
+    /// Anti-amplification factor limit for unvalidated peer paths (default: 3, per RFC 9000 §8.1).
+    pub anti_amplification_factor: u64,
 }
 
 impl Default for QuicConfig {
@@ -67,6 +69,7 @@ impl Default for QuicConfig {
             alpn_protocols: vec![ALPN_H3.to_vec()],
             enable_stateless_reset: true,
             require_retry: false,
+            anti_amplification_factor: 3,
         }
     }
 }
@@ -103,6 +106,13 @@ impl QuicConfig {
     #[must_use]
     pub fn with_alpn(mut self, protocols: Vec<Vec<u8>>) -> Self {
         self.alpn_protocols = protocols;
+        self
+    }
+
+    /// Sets the anti-amplification factor limit before address validation (default: 3).
+    #[must_use]
+    pub const fn with_anti_amplification_factor(mut self, factor: u64) -> Self {
+        self.anti_amplification_factor = factor;
         self
     }
 

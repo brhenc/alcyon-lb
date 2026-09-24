@@ -88,7 +88,16 @@ impl QuicListener {
         let server_config = config
             .build_server_config(tls_server_config)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
-        Self::bind_with_server_config(addr, server_config)
+        // The whole config has to reach the endpoint, not just its TLS half. Routing through
+        // `bind_with_server_config` dropped `require_retry` and `anti_amplification_factor`,
+        // so a stricter factor an operator asked for was silently ignored.
+        let endpoint = QuicEndpoint::with_configs_and_amplification(
+            Arc::new(config.build_endpoint_config()),
+            server_config,
+            config.require_retry,
+            config.anti_amplification_factor,
+        );
+        Self::from_endpoint(addr, endpoint)
     }
 
     /// Binds a UDP socket on `addr` and initializes with a pre-built `quinn_proto::ServerConfig`.
@@ -99,11 +108,15 @@ impl QuicListener {
         addr: SocketAddr,
         server_config: Arc<quinn_proto::ServerConfig>,
     ) -> io::Result<Self> {
-        let socket = DgramSocket::bind(addr)?;
-        let bound_addr = socket.local_addr().unwrap_or(addr);
-
         let endpoint = QuicEndpoint::with_server_config(server_config)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+        Self::from_endpoint(addr, endpoint)
+    }
+
+    /// Binds the UDP socket and wraps an already-configured endpoint.
+    fn from_endpoint(addr: SocketAddr, endpoint: QuicEndpoint) -> io::Result<Self> {
+        let socket = DgramSocket::bind(addr)?;
+        let bound_addr = socket.local_addr().unwrap_or(addr);
 
         let recv_raw_bufs = vec![vec![0u8; DGRAM_BUF_SIZE]; BATCH_SIZE];
         let recv_cmsg_bufs = vec![vec![0u8; CMSG_BUF_SIZE]; BATCH_SIZE];

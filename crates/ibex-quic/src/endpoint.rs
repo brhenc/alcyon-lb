@@ -25,6 +25,11 @@ pub struct QuicEndpoint {
     connection_table: ConnectionTable,
     connections: HashMap<ConnectionHandle, quinn_proto::Connection>,
     handle_to_primary_cid: HashMap<ConnectionHandle, ConnectionId>,
+    amplification_budgets: HashMap<ConnectionHandle, AmplificationBudget>,
+    anti_amplification_factor: u64,
+    /// Packets quinn-proto produced that the budget then refused. Every one of these is a
+    /// wasted packet number and an armed loss-recovery timer, so this is expected to be zero.
+    amplification_overshoots: u64,
     pending_transmits: VecDeque<TransmitEntry>,
     event_queue: VecDeque<TransportEvent>,
     active_handles: Vec<ConnectionHandle>,
@@ -34,6 +39,54 @@ pub struct QuicEndpoint {
     tx_buf: Vec<u8>,
 }
 
+/// RFC 9000 §8.1 accounting for one connection on an unvalidated path.
+///
+/// `validated` is set when the connection completes, which is *later* than the RFC requires:
+/// §8.1 lifts the limit once the server successfully processes a Handshake packet from the
+/// client. It is deliberately late rather than wrong. The RFC's condition is "successfully
+/// processed", meaning decrypted and authenticated, and quinn-proto keeps that state in
+/// `Connection::path.validated`, which is `pub(crate)` with no accessor. The only signal
+/// reachable from outside is the packet header, and an off-path attacker can forge a Handshake
+/// header as easily as an Initial one -- lifting the cap on an unauthenticated header would
+/// hand back exactly the reflector this limit exists to prevent.
+///
+/// So the cap stays on until `Event::Connected`. Being stricter than the RFC is always safe
+/// here; the cost is that a server sending a large certificate chain may wait for the client
+/// to speak again. Should quinn-proto ever expose path validation, this is the line to change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AmplificationBudget {
+    bytes_received: u64,
+    bytes_sent: u64,
+    max_factor: u64,
+    validated: bool,
+}
+
+impl AmplificationBudget {
+    const fn new(initial_received: u64, max_factor: u64) -> Self {
+        Self {
+            bytes_received: initial_received,
+            bytes_sent: 0,
+            max_factor,
+            validated: false,
+        }
+    }
+
+    fn record_received(&mut self, bytes: u64) {
+        self.bytes_received = self.bytes_received.saturating_add(bytes);
+    }
+
+    fn is_allowed(&self, bytes_to_send: u64) -> bool {
+        if self.validated {
+            return true;
+        }
+        let max_allowed = self.bytes_received.saturating_mul(self.max_factor);
+        self.bytes_sent.saturating_add(bytes_to_send) <= max_allowed
+    }
+
+    fn record_sent(&mut self, bytes: u64) {
+        self.bytes_sent = self.bytes_sent.saturating_add(bytes);
+    }
+}
 
 struct TransmitEntry {
     transmit: Transmit,
@@ -52,10 +105,11 @@ impl QuicEndpoint {
         let config = quic_config.unwrap_or_default();
         let server_config = config.build_server_config(tls_server_config)?;
         let endpoint_config = Arc::new(config.build_endpoint_config());
-        Ok(Self::with_configs(
+        Ok(Self::with_configs_and_amplification(
             endpoint_config,
             server_config,
             config.require_retry,
+            config.anti_amplification_factor,
         ))
     }
 
@@ -65,6 +119,17 @@ impl QuicEndpoint {
         endpoint_config: Arc<EndpointConfig>,
         server_config: Arc<ServerConfig>,
         require_retry: bool,
+    ) -> Self {
+        Self::with_configs_and_amplification(endpoint_config, server_config, require_retry, 3)
+    }
+
+    /// Creates a `QuicEndpoint` with custom `EndpointConfig`, `ServerConfig`, retry requirement, and anti-amplification factor.
+    #[must_use]
+    pub fn with_configs_and_amplification(
+        endpoint_config: Arc<EndpointConfig>,
+        server_config: Arc<ServerConfig>,
+        require_retry: bool,
+        anti_amplification_factor: u64,
     ) -> Self {
         let endpoint = Endpoint::new(
             endpoint_config,
@@ -79,6 +144,9 @@ impl QuicEndpoint {
             connection_table: ConnectionTable::new(),
             connections: HashMap::new(),
             handle_to_primary_cid: HashMap::new(),
+            amplification_budgets: HashMap::new(),
+            anti_amplification_factor: if anti_amplification_factor == 0 { 3 } else { anti_amplification_factor },
+            amplification_overshoots: 0,
             pending_transmits: VecDeque::new(),
             event_queue: VecDeque::new(),
             active_handles: Vec::new(),
@@ -95,6 +163,27 @@ impl QuicEndpoint {
     /// Returns `QuicError::Config` if initialization fails.
     pub fn with_server_config(server_config: Arc<ServerConfig>) -> Result<Self> {
         Ok(Self::with_configs(Arc::new(EndpointConfig::default()), server_config, false))
+    }
+
+    /// Sets the anti-amplification factor limit for unvalidated peer paths.
+    pub fn set_anti_amplification_factor(&mut self, factor: u64) {
+        self.anti_amplification_factor = if factor == 0 { 3 } else { factor };
+    }
+
+    /// Number of packets generated and then refused by the anti-amplification budget.
+    #[must_use]
+    pub const fn amplification_overshoots(&self) -> u64 {
+        self.amplification_overshoots
+    }
+
+    /// Whether `bytes` may be sent to `handle` under its anti-amplification budget.
+    fn may_send(&self, handle: ConnectionHandle, bytes: u64) -> bool {
+        // Fail closed. A missing budget means this code has lost track of a connection, and
+        // the safe reading of that is "no budget", not "unlimited" -- the limit being enforced
+        // is what stops this proxy being used as a reflector.
+        self.amplification_budgets
+            .get(&handle)
+            .is_some_and(|b| b.is_allowed(bytes))
     }
 
     /// Recomputes and caches the earliest timeout across all active connections.
@@ -120,6 +209,7 @@ impl QuicEndpoint {
     }
 
     /// Drives a connection's endpoint events and high-level poll events.
+    #[allow(clippy::too_many_lines)]
     fn drive_connection(&mut self, handle: ConnectionHandle, _now: Instant) {
         let Some(conn) = self.connections.get_mut(&handle) else {
             return;
@@ -142,6 +232,10 @@ impl QuicEndpoint {
         while let Some(evt) = conn.poll() {
             match evt {
                 quinn_proto::Event::Connected => {
+                    if let Some(budget) = self.amplification_budgets.get_mut(&handle) {
+                        budget.validated = true;
+                    }
+
                     let mut alpn = None;
                     let mut server_name = None;
 
@@ -246,6 +340,7 @@ impl QuicEndpoint {
         for handle in to_remove {
             self.connections.remove(&handle);
             self.handle_to_primary_cid.remove(&handle);
+            self.amplification_budgets.remove(&handle);
             self.connection_table.remove_connection(handle);
             self.active_handles.retain(|&h| h != handle);
         }
@@ -283,6 +378,10 @@ impl QuicTransport for QuicEndpoint {
                         self.handle_to_primary_cid.insert(handle, primary_cid);
                         self.connections.insert(handle, conn);
                         self.active_handles.push(handle);
+                        self.amplification_budgets.insert(
+                            handle,
+                            AmplificationBudget::new(buf.len() as u64, self.anti_amplification_factor),
+                        );
 
                         self.event_queue.push_back(TransportEvent::NewConnection {
                             conn_id: primary_cid,
@@ -316,6 +415,9 @@ impl QuicTransport for QuicEndpoint {
             }
 
             Some(DatagramEvent::ConnectionEvent(handle, conn_evt)) => {
+                if let Some(budget) = self.amplification_budgets.get_mut(&handle) {
+                    budget.record_received(buf.len() as u64);
+                }
                 if let Some(conn) = self.connections.get_mut(&handle) {
                     conn.handle_event(conn_evt);
                     self.drive_connection(handle, now);
@@ -364,11 +466,26 @@ impl QuicTransport for QuicEndpoint {
             self.round_robin_idx = self.round_robin_idx.wrapping_add(1);
             let handle = self.active_handles[idx];
 
+            // Decide before asking for a packet, not after. `poll_transmit` assigns a packet
+            // number and arms loss recovery before it returns, so a packet refused afterwards
+            // still has to be retransmitted later -- the refusal costs a round trip instead of
+            // saving one. The budget is already known here. A full MTU is reserved because
+            // that is the largest single datagram `poll_transmit` can hand back.
+            let Some((mtu, handshaking)) = self
+                .connections
+                .get(&handle)
+                .map(|c| (u64::from(c.current_mtu()), c.is_handshaking()))
+            else {
+                continue;
+            };
+            if handshaking && !self.may_send(handle, mtu) {
+                continue;
+            }
+
             if let Some(conn) = self.connections.get_mut(&handle) {
                 self.tx_buf.clear();
                 if let Some(tx) = conn.poll_transmit(now, 1, &mut self.tx_buf) {
                     let size = tx.size.min(out.len()).min(self.tx_buf.len());
-                    out[..size].copy_from_slice(&self.tx_buf[..size]);
 
                     // Drive any endpoint events produced during transmit
                     while let Some(ep_evt) = conn.poll_endpoint_events() {
@@ -377,6 +494,22 @@ impl QuicTransport for QuicEndpoint {
                         }
                     }
 
+                    if handshaking {
+                        if let Some(budget) = self.amplification_budgets.get_mut(&handle) {
+                            if !budget.is_allowed(size as u64) {
+                                // The pre-check reserved a full MTU, so reaching here means
+                                // `poll_transmit` returned more than the connection's MTU.
+                                self.amplification_overshoots += 1;
+                                // Exceeds 3x anti-amplification limit before address validation (RFC 9000 §8.1).
+                                // Suppress transmission to prevent DDoS amplification reflection.
+                                self.update_next_timeout();
+                                continue;
+                            }
+                            budget.record_sent(size as u64);
+                        }
+                    }
+
+                    out[..size].copy_from_slice(&self.tx_buf[..size]);
                     self.update_next_timeout();
                     return Some(Transmit {
                         destination: tx.destination,

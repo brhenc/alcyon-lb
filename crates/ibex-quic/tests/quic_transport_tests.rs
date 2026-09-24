@@ -1,4 +1,4 @@
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::os::fd::AsFd;
 use std::path::PathBuf;
 use std::process::Command;
@@ -502,7 +502,7 @@ fn test_curl_http3_only_quic_handshake() {
 /// RFC 9000 §8.1: a server must not send more than three times what it has received on an
 /// unvalidated path.
 ///
-/// Exceeding this makes the proxy usable as a DDoS reflector: an attacker spoofing a
+/// Exceeding this makes the proxy usable as a `DDoS` reflector: an attacker spoofing a
 /// victim's source address spends one datagram and causes several to be sent at the victim,
 /// with no handshake to prevent it.
 ///
@@ -516,6 +516,7 @@ fn test_curl_http3_only_quic_handshake() {
 /// The same violation appeared through a hand-rolled drive loop and through
 /// `Engine::run_once`, so it is below the drive loop rather than an artefact of it.
 #[test]
+#[allow(clippy::cast_precision_loss)]
 fn a_server_must_not_amplify_beyond_three_times_before_address_validation() {
     let server_config = QuicConfig::new()
         .load_server_config_from_pem(cert_path())
@@ -561,5 +562,311 @@ fn a_server_must_not_amplify_beyond_three_times_before_address_validation() {
         "RFC 9000 §8.1: server sent {sent} B for {received} B received ({:.3}x), \
          limit is {limit} B (3x). Exceeding it makes this a DDoS reflector.",
         sent as f64 / received as f64
+    );
+}
+
+#[test]
+fn test_runt_datagrams_discarded_zero_bytes_returned() {
+    let server_config = QuicConfig::new()
+        .load_server_config_from_pem(cert_path())
+        .expect("load cert");
+    let mut server = QuicEndpoint::with_server_config(server_config).expect("server endpoint");
+
+    let (mut client_endpoint, client_config) = create_client_endpoint();
+    let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4433);
+    let client_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 55444);
+
+    let now = Instant::now();
+    let (_h, mut client_conn) = client_endpoint
+        .connect(now, (*client_config).clone(), server_addr, "localhost")
+        .expect("connect");
+
+    let mut client_buf = Vec::new();
+    let tx = client_conn
+        .poll_transmit(now, 1, &mut client_buf)
+        .expect("client Initial");
+    let full_initial = client_buf[..tx.size].to_vec();
+    assert!(full_initial.len() >= 1200);
+
+    // RFC 9000 §14.1: runt datagrams (< 1200 bytes) must be dropped with 0 bytes returned.
+    for runt_len in [64, 500, 1199] {
+        let runt_payload = &full_initial[..runt_len];
+        let outcome = server
+            .handle_datagram(now, client_addr, None, runt_payload)
+            .expect("handle runt datagram");
+
+        assert_eq!(
+            outcome,
+            DatagramOutcome::Ignored,
+            "runt datagram of length {runt_len} B must be Ignored"
+        );
+
+        let mut out = vec![0u8; 65535];
+        let transmitted = server.poll_transmit(now, &mut out);
+        assert!(
+            transmitted.is_none(),
+            "server must return 0 bytes for runt datagram of length {runt_len} B"
+        );
+    }
+}
+
+#[test]
+#[allow(clippy::cast_precision_loss)]
+fn test_amplification_accounting_with_multiple_initial_datagrams() {
+    let server_config = QuicConfig::new()
+        .load_server_config_from_pem(cert_path())
+        .expect("load cert");
+    let mut server = QuicEndpoint::with_server_config(server_config).expect("server endpoint");
+
+    let (mut client_endpoint, client_config) = create_client_endpoint();
+    let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4433);
+    let client_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 55445);
+
+    let now = Instant::now();
+    let (_h, mut client_conn) = client_endpoint
+        .connect(now, (*client_config).clone(), server_addr, "localhost")
+        .expect("connect");
+
+    let mut client_buf = Vec::new();
+    let tx = client_conn
+        .poll_transmit(now, 1, &mut client_buf)
+        .expect("client Initial");
+    let dgram1 = client_buf[..tx.size].to_vec();
+
+    // Send first Initial (1200 B)
+    server
+        .handle_datagram(now, client_addr, None, &dgram1)
+        .expect("server handles first Initial");
+
+    let mut sent = 0usize;
+    let mut out = vec![0u8; 65535];
+    let mut sim_now = now;
+
+    // Drain initial flight
+    while let Some(tx) = server.poll_transmit(sim_now, &mut out) {
+        sent += tx.size;
+    }
+    assert!(sent <= 1200 * 3, "initial flight must be <= 3600 B");
+
+    // Client re-sends Initial (e.g. client timeout or second probe packet of 1200 B)
+    sim_now += Duration::from_millis(50);
+    server
+        .handle_datagram(sim_now, client_addr, None, &dgram1)
+        .expect("server handles second Initial");
+
+    // Advance time and drain all transmits
+    for _ in 0..100 {
+        while let Some(tx) = server.poll_transmit(sim_now, &mut out) {
+            sent += tx.size;
+        }
+        sim_now += Duration::from_millis(25);
+        server.handle_timeout(sim_now);
+    }
+
+    let total_received = dgram1.len() * 2;
+    let limit = total_received * 3;
+    assert!(
+        sent <= limit,
+        "server sent {sent} B for {total_received} B received ({:.3}x), limit is {limit} B",
+        sent as f64 / total_received as f64
+    );
+}
+
+/// A configured factor is enforced, not just accepted.
+///
+/// This test was called `test_strict_anti_amplification_matches_haproxy_profile` and carried a
+/// comment claiming the numbers were "verified against `HAProxy` baseline profile". It never
+/// ran `HAProxy`. In a project whose first rule is that the reference binary is the oracle, a
+/// test that names the oracle without consulting it is worse than one that does not mention
+/// it, because the name is
+/// what a reader trusts. The real differential lives in `tools/quic-differential/` and its
+/// measured numbers are recorded in `data/quic_parity.md`.
+///
+/// What this test actually proves is worth keeping: with the factor set to 2, the endpoint
+/// stays under 2x across 200 simulated timeouts. It would fail on the default factor of 3,
+/// which measures 2.4x, so it is a real check that the setting reaches the accounting.
+#[test]
+#[allow(clippy::cast_precision_loss)]
+fn a_configured_factor_of_two_is_enforced_across_retransmissions() {
+    let pem_path = cert_path();
+    let (_, key) = ibex_quic::config::load_pem_cert_and_key(pem_path.as_path()).expect("load key");
+    let certs = {
+        let file = std::fs::File::open(pem_path.as_path()).expect("open cert");
+        let mut reader = std::io::BufReader::new(file);
+        rustls_pemfile::certs(&mut reader)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("read certs")
+    };
+
+    let certified_key = ibex_tls::create_certified_key(certs.clone(), &key).expect("cert key");
+    let mut resolver = ibex_tls::IbexCertResolver::new();
+    resolver.set_default_cert(Arc::new(certified_key.clone()));
+
+    let rustls_config = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .expect("safe proto")
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::new(resolver));
+
+    // Configure strict anti-amplification factor of 2x (HAProxy baseline single flight profile)
+    let quic_config = QuicConfig::new().with_anti_amplification_factor(2);
+    let mut server = QuicEndpoint::new(&rustls_config, Some(quic_config)).expect("server endpoint");
+
+    let (mut client_endpoint, client_config) = create_client_endpoint();
+    let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4433);
+    let client_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 55446);
+
+    let now = Instant::now();
+    let (_h, mut client_conn) = client_endpoint
+        .connect(now, (*client_config).clone(), server_addr, "localhost")
+        .expect("connect");
+
+    let mut client_buf = Vec::new();
+    let tx = client_conn
+        .poll_transmit(now, 1, &mut client_buf)
+        .expect("client Initial");
+    let received = tx.size;
+    server
+        .handle_datagram(now, client_addr, None, &client_buf[..tx.size])
+        .expect("server handles Initial");
+
+    let mut sent = 0usize;
+    let mut out = vec![0u8; 65535];
+    let mut sim_now = now;
+    for _ in 0..200 {
+        while let Some(tx) = server.poll_transmit(sim_now, &mut out) {
+            sent += tx.size;
+        }
+        sim_now += Duration::from_millis(25);
+        server.handle_timeout(sim_now);
+    }
+
+    let limit = received * 2;
+    assert!(
+        sent <= limit,
+        "strict anti-amplification: server sent {sent} B for {received} B received ({:.3}x), \
+         limit is {limit} B (2x)",
+        sent as f64 / received as f64
+    );
+    assert!(
+        sent > 0,
+        "server must send the initial flight"
+    );
+}
+
+
+
+/// A `rustls::ServerConfig` for the tests that need to hand one to `QuicListener::bind`.
+fn rustls_server_config() -> rustls::ServerConfig {
+    let pem_path = cert_path();
+    let (_, key) = ibex_quic::config::load_pem_cert_and_key(pem_path.as_path()).expect("load key");
+    let certs = {
+        let file = std::fs::File::open(pem_path.as_path()).expect("open cert");
+        let mut reader = std::io::BufReader::new(file);
+        rustls_pemfile::certs(&mut reader)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("read certs")
+    };
+    let certified_key = ibex_tls::create_certified_key(certs, &key).expect("cert key");
+    let mut resolver = ibex_tls::IbexCertResolver::new();
+    resolver.set_default_cert(Arc::new(certified_key));
+    rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .expect("safe proto")
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::new(resolver))
+}
+
+/// Produces a genuine client Initial datagram aimed at `server_addr`.
+fn client_initial(server_addr: SocketAddr) -> Vec<u8> {
+    let (mut client_endpoint, client_config) = create_client_endpoint();
+    let now = Instant::now();
+    let (_h, mut conn) = client_endpoint
+        .connect(now, (*client_config).clone(), server_addr, "localhost")
+        .expect("connect");
+    let mut buf = Vec::new();
+    let tx = conn.poll_transmit(now, 1, &mut buf).expect("client Initial");
+    buf[..tx.size].to_vec()
+}
+
+/// Drives `listener` for `window`, returning (bytes sent to it, bytes it sent back).
+fn probe_listener(listener: &mut QuicListener, window: Duration) -> (usize, usize) {
+    let server_addr = listener.addr();
+    let initial = client_initial(server_addr);
+    let sock = UdpSocket::bind("127.0.0.1:0").expect("client socket");
+    sock.set_nonblocking(true).expect("nonblocking");
+    sock.send_to(&initial, server_addr).expect("send Initial");
+
+    let mut got = 0usize;
+    let mut buf = vec![0u8; 65535];
+    let start = Instant::now();
+    while start.elapsed() < window {
+        let now = Instant::now();
+        let _ = listener.handle_read(now);
+        let _ = listener.handle_write(now);
+        listener.handle_timeout(now);
+        while let Ok((n, _)) = sock.recv_from(&mut buf) {
+            got += n;
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    (initial.len(), got)
+}
+
+/// `QuicConfig::anti_amplification_factor` must reach the endpoint the listener builds.
+///
+/// `QuicListener::bind` took a `QuicConfig`, used it only to build the TLS `ServerConfig`, and
+/// dropped the rest on the way to `bind_with_server_config`. The cap still applied, because
+/// `QuicEndpoint::with_server_config` hardcodes 3 -- so the listener was compliant by accident
+/// and an operator asking for a stricter factor got silence. This is the project's recurring
+/// defect: a setting that parses and then does nothing.
+#[test]
+#[allow(clippy::cast_precision_loss)]
+fn a_listener_honours_the_configured_anti_amplification_factor() {
+    let tls = rustls_server_config();
+    let cfg = QuicConfig::new().with_anti_amplification_factor(2);
+    let mut listener = QuicListener::bind(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        &tls,
+        Some(cfg),
+    )
+    .expect("bind listener");
+
+    let (sent_to_server, got_back) = probe_listener(&mut listener, Duration::from_millis(700));
+
+    assert!(got_back > 0, "the listener must answer the Initial at all");
+    let limit = sent_to_server * 2;
+    assert!(
+        got_back <= limit,
+        "listener was configured with factor 2 but sent {got_back} B for {sent_to_server} B \
+         received ({:.3}x); limit is {limit} B. The configured factor never reached the endpoint.",
+        got_back as f64 / sent_to_server as f64
+    );
+}
+
+/// A packet refused by the budget must never have been generated.
+///
+/// Checking the budget after `poll_transmit` means quinn-proto has already assigned the packet
+/// a number and armed loss recovery for it by the time it is discarded, so every refusal costs
+/// a packet that must later be retransmitted. The budget is known before the call; the decision
+/// belongs there.
+#[test]
+fn a_refused_packet_is_never_generated_in_the_first_place() {
+    let tls = rustls_server_config();
+    let cfg = QuicConfig::new().with_anti_amplification_factor(2);
+    let mut listener = QuicListener::bind(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        &tls,
+        Some(cfg),
+    )
+    .expect("bind listener");
+
+    let (_sent, got_back) = probe_listener(&mut listener, Duration::from_millis(700));
+    assert!(got_back > 0, "the listener must answer the Initial at all");
+
+    assert_eq!(
+        listener.transport().amplification_overshoots(),
+        0,
+        "packets were generated and then thrown away by the budget"
     );
 }
