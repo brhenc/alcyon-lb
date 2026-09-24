@@ -180,24 +180,37 @@ impl CliApplet {
             if self.interactive {
                 self.out_buf.extend_from_slice(b"\n> ");
             }
-        } else if cmd == "show info" {
+        } else if cmd == "show info" || cmd.starts_with("show info ") {
             self.handle_show_info(ctx);
         } else if cmd == "show env" {
             for (k, v) in std::env::vars() {
                 self.out_buf.extend_from_slice(format!("{k}={v}\n").as_bytes());
             }
         } else if cmd == "show errors" {
-            self.out_buf.extend_from_slice(b"Total events captured on [01/Jan/1970:00:00:00.000] : 0
-
-");
+            self.out_buf.extend_from_slice(b"Total events captured on [01/Jan/1970:00:00:00.000] : 0\n\n");
         } else if cmd == "show backend" {
             self.out_buf.extend_from_slice(b"# name\n");
             for p in ctx.proxies.iter() {
                 self.out_buf.extend_from_slice(format!("{}\n", p.name).as_bytes());
             }
-        } else if cmd == "show servers state" {
+        } else if cmd == "show servers state" || cmd.starts_with("show servers state ") {
+            let be_filter = cmd.strip_prefix("show servers state").map(str::trim).filter(|s| !s.is_empty());
+            if let Some(target) = be_filter {
+                if !ctx.proxies.iter().any(|p| p.name == target) {
+                    self.out_buf.extend_from_slice(b"Can't find backend.\n");
+                    if self.interactive {
+                        self.out_buf.extend_from_slice(b"\n> ");
+                    } else {
+                        self.is_done = true;
+                    }
+                    return;
+                }
+            }
             self.out_buf.extend_from_slice(b"1\n# be_id be_name srv_id srv_name srv_addr srv_op_state srv_admin_state srv_uweight srv_iweight srv_time_since_last_change srv_check_status srv_check_result srv_check_health srv_check_state srv_agent_state bk_f_forced_id srv_f_forced_id srv_fqdn srv_port srvrecord srv_use_ssl srv_check_port srv_check_addr srv_agent_addr srv_agent_port\n");
             for p in ctx.proxies.iter() {
+                if let Some(target) = be_filter {
+                    if p.name != target { continue; }
+                }
                 for (s_idx, s) in p.server_ids.iter().enumerate() {
                     let addr = p.servers.get(s_idx).map_or_else(|| "-".to_string(), |a| a.ip().to_string());
                     let port = p.servers.get(s_idx).map_or_else(|| "-".to_string(), |a| a.port().to_string());
@@ -399,34 +412,112 @@ impl CliApplet {
     }
 
     fn handle_show_table(&mut self, cmd: &str, ctx: &AppletContext) {
-        let table_filter = cmd
-            .strip_prefix("show table")
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
+        let parts: Vec<&str> = cmd.split_whitespace().collect();
+        let table_name = if parts.len() >= 3 {
+            Some(parts[2])
+        } else {
+            None
+        };
+
+        let mut filter_field = None;
+        let mut filter_op = None;
+        let mut filter_val = None;
+
+        if parts.len() >= 6 && parts[3].starts_with("data.") {
+            filter_field = parts[3].strip_prefix("data.");
+            let op = parts[4];
+            let allowed_ops = ["eq", "ne", "le", "ge", "lt", "gt"];
+            if !allowed_ops.contains(&op) {
+                self.out_buf.extend_from_slice(b"Filter entry #1: Require and operator among \"eq\", \"ne\", \"le\", \"ge\", \"lt\", \"gt\"\n");
+                if self.interactive {
+                    self.out_buf.extend_from_slice(b"\n> ");
+                } else {
+                    self.is_done = true;
+                }
+                return;
+            }
+            filter_op = Some(op);
+            if let Ok(v) = parts[5].parse::<u64>() {
+                filter_val = Some(v);
+            }
+        }
+
         let mut out = String::new();
+        let mut found_table = false;
+
         for proxy in ctx.proxies.iter() {
             if let Some(ref table) = proxy.stick_table {
                 let cfg = table.config();
-                if let Some(target) = table_filter {
+                if let Some(target) = table_name {
                     if cfg.name != target && proxy.name != target {
                         continue;
                     }
                 }
+                found_table = true;
+
+                let key_type_str = match cfg.key_type {
+                    ibex_stick_table::table::KeyType::Ip => "ip",
+                    ibex_stick_table::table::KeyType::Ipv6 => "ipv6",
+                    ibex_stick_table::table::KeyType::Integer => "integer",
+                    ibex_stick_table::table::KeyType::String => "string",
+                    ibex_stick_table::table::KeyType::Binary => "binary",
+                };
+
                 let _ = writeln!(
                     out,
-                    "# table: {}, type: {:?}, size:{}, used:{}",
+                    "# table: {}, type: {}, size:{}, used:{}",
                     cfg.name,
-                    cfg.key_type,
+                    key_type_str,
                     cfg.max_size,
                     table.len()
                 );
+
                 if let Ok(entries) = table.dump_entries() {
                     for (k, v) in entries {
-                        let _ = write!(
-                            out,
-                            "0x0: key={:?} use=0 conn_cnt={} conn_cur={}",
-                            k, v.conn_cnt, v.conn_cur
-                        );
+                        if let (Some(ff), Some(fo), Some(fv)) = (filter_field, filter_op, filter_val) {
+                            let field_val = match ff {
+                                "conn_cnt" => v.conn_cnt as u64,
+                                "conn_cur" => v.conn_cur as u64,
+                                "gpc0" => v.gpc0,
+                                "gpc1" => v.gpc1,
+                                "gpt0" => v.gpt0 as u64,
+                                "conn_rate" => v.conn_rate.as_ref().map_or(0, |r| r.rate() as u64),
+                                "http_req_rate" => v.http_req_rate.as_ref().map_or(0, |r| r.rate() as u64),
+                                _ => 0,
+                            };
+                            let keep = match fo {
+                                "eq" => field_val == fv,
+                                "ne" => field_val != fv,
+                                "le" => field_val <= fv,
+                                "ge" => field_val >= fv,
+                                "lt" => field_val < fv,
+                                "gt" => field_val > fv,
+                                _ => true,
+                            };
+                            if !keep { continue; }
+                        }
+
+                        let key_str = match k {
+                            ibex_stick_table::entry::StickKey::Ip(ip) => ip.to_string(),
+                            ibex_stick_table::entry::StickKey::Integer(i) => i.to_string(),
+                            ibex_stick_table::entry::StickKey::String(s) => s,
+                            ibex_stick_table::entry::StickKey::Binary(b) => {
+                                let mut s = String::new();
+                                for byte in b {
+                                    use std::fmt::Write;
+                                    let _ = write!(s, "{:02X}", byte);
+                                }
+                                s
+                            }
+                        };
+
+                        let _ = write!(out, "0x0: key={} use=0 exp=0", key_str);
+                        if v.conn_cnt > 0 {
+                            let _ = write!(out, " conn_cnt={}", v.conn_cnt);
+                        }
+                        if v.conn_cur > 0 {
+                            let _ = write!(out, " conn_cur={}", v.conn_cur);
+                        }
                         if v.gpc0 > 0 {
                             let _ = write!(out, " gpc0={}", v.gpc0);
                         }
@@ -447,7 +538,13 @@ impl CliApplet {
                 }
             }
         }
-        self.out_buf.extend_from_slice(out.as_bytes());
+
+        if table_name.is_some() && !found_table {
+            self.out_buf.extend_from_slice(b"No such table\n");
+        } else {
+            self.out_buf.extend_from_slice(out.as_bytes());
+        }
+
         if self.interactive {
             self.out_buf.extend_from_slice(b"\n> ");
         } else {
@@ -643,14 +740,19 @@ impl CliApplet {
     }
 
     fn handle_enable_server(&mut self, target: &str, ctx: &mut AppletContext) {
-        let (px_name, sv_name) = match target.split_once('/') {
-            Some(pair) => pair,
-            None => ("", target),
+        let Some((px_name, sv_name)) = target.split_once('/') else {
+            self.out_buf.extend_from_slice(b"Require 'backend/server'.\n");
+            if self.interactive {
+                self.out_buf.extend_from_slice(b"\n> ");
+            } else {
+                self.is_done = true;
+            }
+            return;
         };
         let mut found_px = false;
         let mut found_sv = false;
         for (p_idx, proxy) in ctx.proxies.iter_mut().enumerate() {
-            if px_name.is_empty() || proxy.name == px_name {
+            if proxy.name == px_name {
                 found_px = true;
                 for (s_idx, sid) in proxy.server_ids.iter().enumerate() {
                     if sid == sv_name {
@@ -667,7 +769,7 @@ impl CliApplet {
                 }
             }
         }
-        if !found_px && !px_name.is_empty() {
+        if !found_px {
             self.out_buf.extend_from_slice(b"No such backend.\n");
         } else if !found_sv {
             self.out_buf.extend_from_slice(b"No such server.\n");
@@ -680,14 +782,19 @@ impl CliApplet {
     }
 
     fn handle_disable_server(&mut self, target: &str, ctx: &mut AppletContext) {
-        let (px_name, sv_name) = match target.split_once('/') {
-            Some(pair) => pair,
-            None => ("", target),
+        let Some((px_name, sv_name)) = target.split_once('/') else {
+            self.out_buf.extend_from_slice(b"Require 'backend/server'.\n");
+            if self.interactive {
+                self.out_buf.extend_from_slice(b"\n> ");
+            } else {
+                self.is_done = true;
+            }
+            return;
         };
         let mut found_px = false;
         let mut found_sv = false;
         for (p_idx, proxy) in ctx.proxies.iter_mut().enumerate() {
-            if px_name.is_empty() || proxy.name == px_name {
+            if proxy.name == px_name {
                 found_px = true;
                 for (s_idx, sid) in proxy.server_ids.iter().enumerate() {
                     if sid == sv_name {
@@ -704,7 +811,7 @@ impl CliApplet {
                 }
             }
         }
-        if !found_px && !px_name.is_empty() {
+        if !found_px {
             self.out_buf.extend_from_slice(b"No such backend.\n");
         } else if !found_sv {
             self.out_buf.extend_from_slice(b"No such server.\n");
@@ -721,9 +828,14 @@ impl CliApplet {
         if parts.len() >= 3 && parts[1] == "state" {
             let target = parts[0];
             let state = parts[2];
-            let (px_name, sv_name) = match target.split_once('/') {
-                Some(pair) => pair,
-                None => ("", target),
+            let Some((px_name, sv_name)) = target.split_once('/') else {
+                self.out_buf.extend_from_slice(b"Require 'backend/server'.\n");
+                if self.interactive {
+                    self.out_buf.extend_from_slice(b"\n> ");
+                } else {
+                    self.is_done = true;
+                }
+                return;
             };
             let new_status = match state {
                 "ready" => Some(ServerStatus::Up),
@@ -732,10 +844,14 @@ impl CliApplet {
             };
 
             if let Some(status) = new_status {
+                let mut found_px = false;
+                let mut found_sv = false;
                 for (p_idx, proxy) in ctx.proxies.iter_mut().enumerate() {
-                    if px_name.is_empty() || proxy.name == px_name {
+                    if proxy.name == px_name {
+                        found_px = true;
                         for (s_idx, sid) in proxy.server_ids.iter().enumerate() {
                             if sid == sv_name {
+                                found_sv = true;
                                 proxy.server_statuses[s_idx].store(status as u8, std::sync::atomic::Ordering::Relaxed);
                                 if let Some(check) = ctx
                                     .checks
@@ -747,6 +863,11 @@ impl CliApplet {
                             }
                         }
                     }
+                }
+                if !found_px {
+                    self.out_buf.extend_from_slice(b"No such backend.\n");
+                } else if !found_sv {
+                    self.out_buf.extend_from_slice(b"No such server.\n");
                 }
             }
         } else if parts.len() >= 3 && parts[1] == "maxconn" {

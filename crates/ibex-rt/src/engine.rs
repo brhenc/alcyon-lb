@@ -248,7 +248,7 @@ impl Proxy {
         None
     }
 
-    /// Selects the target backend server using round-robin across active (UP) servers,
+    /// Selects the target backend server using the configured load balancing algorithm,
     /// preferring primary servers over backup servers,
     /// or falls back to the dispatch address if all servers are down or absent.
     #[must_use]
@@ -256,13 +256,30 @@ impl Proxy {
         if self.servers.is_empty() {
             return self.dispatch;
         }
-        let eligible = self.eligible_server_indices();
-        if eligible.is_empty() {
-            return self.dispatch;
+        match self.balance {
+            BalanceAlgorithm::Leastconn => {
+                if let Some(idx) = crate::lb::leastconn(self) {
+                    Some(self.servers[idx])
+                } else {
+                    self.dispatch
+                }
+            }
+            BalanceAlgorithm::StaticRr => {
+                if let Some(idx) = crate::lb::static_rr(self) {
+                    Some(self.servers[idx])
+                } else {
+                    self.dispatch
+                }
+            }
+            _ => {
+                let eligible = self.eligible_server_indices();
+                if eligible.is_empty() {
+                    return self.dispatch;
+                }
+                let chosen_idx = eligible[self.next_server_idx.fetch_add(1, Ordering::Relaxed) % eligible.len()];
+                Some(self.servers[chosen_idx])
+            }
         }
-        let chosen_idx = eligible[self.next_server_idx.fetch_add(1, Ordering::Relaxed) % eligible.len()];
-        
-        Some(self.servers[chosen_idx])
     }
 
     /// Selects the target backend server with load balancing algorithm (Source IP hash or round-robin),
@@ -290,10 +307,29 @@ impl Proxy {
                     return Some(self.servers[chosen_idx]);
                 }
                 let chosen_idx = eligible[self.next_server_idx.fetch_add(1, Ordering::Relaxed) % eligible.len()];
-                
                 Some(self.servers[chosen_idx])
             }
+            BalanceAlgorithm::Uri => {
+                if let Some(idx) = crate::lb::balance_uri(self, "/") {
+                    Some(self.servers[idx])
+                } else {
+                    self.select_server()
+                }
+            }
             _ => self.select_server(),
+        }
+    }
+
+    /// Selects a server using the URI load balancing algorithm with a specific URI string.
+    #[must_use]
+    pub fn select_server_with_uri(&mut self, uri: &str) -> Option<SocketAddr> {
+        if self.servers.is_empty() {
+            return self.dispatch;
+        }
+        if let Some(idx) = crate::lb::balance_uri(self, uri) {
+            Some(self.servers[idx])
+        } else {
+            self.select_server()
         }
     }
 }
@@ -1034,6 +1070,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             crate::buf::preallocate_large_buffers();
         }
 
+        let mut quic_listeners: Vec<crate::quic_listener::QuicListener> = Vec::new();
         let mut listeners: Vec<crate::listener::Listener> = Vec::new();
         let mut proxy_idx = 0;
         for listen in &config.listens {
@@ -1053,20 +1090,57 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         }
         for frontend in &config.frontends {
             if frontend.disabled { continue; }
-            let mut bind_addrs = Vec::new();
-            if let Some(bind_addr) = frontend.bind { bind_addrs.push(bind_addr); }
-            for b in &frontend.binds {
-                if !bind_addrs.contains(&b.addr) { bind_addrs.push(b.addr); }
+            let mut all_binds = frontend.binds.clone();
+            if let Some(ba) = frontend.bind {
+                if !all_binds.iter().any(|b| b.addr == ba) {
+                    all_binds.insert(0, ibex_config::ast::BindConfig {
+                        addr: ba,
+                        quic: false,
+                        ssl: false,
+                        crt: vec![],
+                        alpn: vec![],
+                        proto: None,
+                        accept_proxy: frontend.accept_proxy,
+                        accept_proxy_v2: frontend.accept_proxy_v2,
+                    });
+                }
             }
-            for bind_addr in bind_addrs {
-                let mut listener = Listener::bind(bind_addr, 128, usize_to_u32(proxy_idx))?;
-                listener.maxconn = frontend.maxconn;
-                listener.tls = bind_tls(frontend, bind_addr)?;
-                let l_idx = listeners.len();
-                let lfd = listener.raw_fd();
-                fdtab.insert(lfd, FdState::Listener { listener: usize_to_u32(l_idx) }, Interest::READ);
-                poller.add(listener.borrowed_fd(), raw_fd_to_u64(lfd), true, false)?;
-                listeners.push(listener);
+            for b in &all_binds {
+                let bind_addr = b.addr;
+                if b.quic {
+                    let tls = bind_tls(frontend, bind_addr)?.expect("QUIC requires TLS");
+                    
+                    let mut be_addr = None;
+                    if let Some(be_name) = &frontend.default_backend {
+                        if let Some(be) = config.backends.iter().find(|b| b.name == *be_name) {
+                            be_addr = be.servers.first().map(|s| s.addr).or(be.dispatch);
+                        }
+                    }
+                    
+                    let mut ql = crate::quic_listener::QuicListener::bind(bind_addr, &tls, None)?;
+                    if let Some(addr) = be_addr {
+                        ql.set_backend(addr);
+                    }
+                    
+                    let l_idx = quic_listeners.len();
+                    let lfd = ql.raw_fd();
+                    fdtab.insert(
+                        lfd,
+                        FdState::QuicListener { listener: usize_to_u32(l_idx) },
+                        Interest::READ,
+                    );
+                    poller.add(ql.borrowed_fd(), raw_fd_to_u64(lfd), true, false)?;
+                    quic_listeners.push(ql);
+                } else {
+                    let mut listener = Listener::bind(bind_addr, 128, usize_to_u32(proxy_idx))?;
+                    listener.maxconn = frontend.maxconn;
+                    listener.tls = bind_tls(frontend, bind_addr)?;
+                    let l_idx = listeners.len();
+                    let lfd = listener.raw_fd();
+                    fdtab.insert(lfd, FdState::Listener { listener: usize_to_u32(l_idx) }, Interest::READ);
+                    poller.add(listener.borrowed_fd(), raw_fd_to_u64(lfd), true, false)?;
+                    listeners.push(listener);
+                }
             }
             proxy_idx += 1;
         }
@@ -1084,7 +1158,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
 
 
         Ok(Engine {
-            quic_listeners: Vec::new(),
+            quic_listeners,
             poller,
             scheduler,
             fdtab,

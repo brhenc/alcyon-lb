@@ -818,7 +818,7 @@ fn test_global_and_defaults_unknown_keywords_refusal() {
 
 #[test]
 fn test_unsupported_quic_dgram_prefixes_refusal() {
-    for prefix in &["quic+", "dgram+", "quic4+", "quic6+"] {
+    for prefix in &["dgram+", "quic4+", "quic6+"] {
         let cfg = format!("frontend fe\n\tbind {prefix}127.0.0.1:8443\n");
         let err = parse_config(&cfg).unwrap_err();
         assert!(
@@ -929,9 +929,7 @@ defaults
     let unsupp_rst = parse_config("global\n\ttune.h2.fe.max-rst-at-once 20\n").unwrap_err();
     assert!(unsupp_rst.message.contains("tune.h2.fe.max-rst-at-once"));
 
-    let unsupp_http_check = parse_config("backend be\n\thttp-check send meth GET\n").unwrap_err();
-    assert!(unsupp_http_check.message.contains("http-check"));
-
+    
     let unsupp_log_fmt = parse_config("frontend fe\n\tbind 127.0.0.1:80\n\tlog-format %ci:%cp\n").unwrap_err();
     assert!(unsupp_log_fmt.message.contains("log-format"));
 }

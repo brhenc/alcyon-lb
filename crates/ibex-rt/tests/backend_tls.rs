@@ -12,7 +12,7 @@
 use ibex_rt::{Io, TcpSession, Timeouts};
 use ibex_sched::Tick;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
-use rustls::{ClientConfig, RootCertStore, ServerConfig, ServerConnection};
+use rustls::{ClientConfig, ServerConfig, ServerConnection};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::AsFd;

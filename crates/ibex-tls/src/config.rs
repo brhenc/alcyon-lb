@@ -375,7 +375,7 @@ impl TlsConfig {
         };
         let (supported, unsupported): (Vec<String>, Vec<String>) = requested
             .into_iter()
-            .partition(|p| p == "h2" || p == "http/1.1" || p == "http/1.0");
+            .partition(|p| p == "h3" || p == "h2" || p == "http/1.1" || p == "http/1.0");
         for p in &unsupported {
             eprintln!(
                 "[ibex] warning: bind {}: ALPN '{p}' is not served by this build and was \

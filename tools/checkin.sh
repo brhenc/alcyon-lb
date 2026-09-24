@@ -65,6 +65,10 @@ cargo clippy -q --workspace --all-targets 2>&1 | grep -E "^(warning|error)" | gr
 echo "clippy exit: ${PIPESTATUS[0]}"
 
 echo
+echo "=== continuous measurement ==="
+tools/measure/run.sh --fast
+
+echo
 echo "=== new surface since the nudge, and whether it came with tests ==="
 echo "-- uncommitted:"
 git diff --stat | tail -1

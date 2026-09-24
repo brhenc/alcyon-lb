@@ -403,3 +403,51 @@ listen test_proxy
         "show pools must report configured tune.bufsize.large 65536: {text}"
     );
 }
+
+
+#[test]
+fn cli_applet_error_messages_and_tables_parity() {
+    let socket_path = PathBuf::from(format!("/tmp/ibex_test_cli_err_{}.sock", std::process::id()));
+    let cfg_str = r"
+backend be
+    stick-table type ip size 1m expire 10m store gpc0,conn_rate(10s)
+";
+    let config = ibex_config::parse_str(cfg_str).expect("config");
+    let mut engine = Engine::new(&config, 1024).expect("engine");
+    engine.bind_cli_socket(&socket_path).expect("bind");
+    engine.step(Tick(10)).unwrap();
+
+    let mut execute_cmd = |cmd: &str| -> String {
+        let mut client = UnixStream::connect(&socket_path).expect("connect");
+        client.set_nonblocking(true).unwrap();
+        client.write_all(cmd.as_bytes()).unwrap();
+        
+        let mut resp = Vec::new();
+        let mut tick = Tick(20);
+        for _ in 0..20 {
+            let _ = engine.step(tick);
+            let mut buf = [0u8; 1024];
+            if let Ok(n) = client.read(&mut buf) {
+                if n > 0 { resp.extend_from_slice(&buf[..n]); }
+            }
+            if engine.applets.live() == 0 && !resp.is_empty() { break; }
+            tick = tick.add(10);
+        }
+        String::from_utf8_lossy(&resp).into_owned()
+    };
+
+    assert_eq!(execute_cmd("clear counters server nosuch/s1\n"), "No such backend.\n");
+    assert_eq!(execute_cmd("clear counters server be/nosuch\n"), "No such server.\n");
+    
+    let info = execute_cmd("show info nonexistent\n");
+    assert!(info.starts_with("Name: Ibex"), "show info nonexistent should return info dump");
+
+    assert_eq!(execute_cmd("show servers state nonexistent\n"), "Can't find backend.\n");
+    
+    assert_eq!(execute_cmd("set server nosuch/s1 state maint\n"), "No such backend.\n");
+    assert_eq!(execute_cmd("set server be/nosuch state maint\n"), "No such server.\n");
+    assert_eq!(execute_cmd("set server be/nosuch maxconn 10\n"), "");
+
+    let table = execute_cmd("show table be\n");
+    assert!(table.contains("# table: be, type: ip, size:1048576, used:0"));
+}

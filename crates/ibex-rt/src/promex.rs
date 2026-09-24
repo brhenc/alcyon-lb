@@ -484,7 +484,7 @@ pub fn render(stats: &StatsSnapshot, out: &mut String) {
     }
 
     out.push_str("# HELP haproxy_server_check_failures_total Total number of failed individual health checks per server/backend, since the worker process started\n");
-    out.push_str("# TYPE haproxy_server_check_failures_total gauge\n");
+    out.push_str("# TYPE haproxy_server_check_failures_total counter\n");
     for (p_idx, proxy) in stats.proxies.iter().enumerate() {
         for s_idx in 0..proxy.servers.len() {
             let srv_name = if s_idx < proxy.server_ids.len() {
@@ -511,7 +511,7 @@ pub fn render(stats: &StatsSnapshot, out: &mut String) {
     }
 
     out.push_str("# HELP haproxy_server_check_up_down_total Total number of failed checks causing UP to DOWN server transitions, per server/backend, since the worker process started\n");
-    out.push_str("# TYPE haproxy_server_check_up_down_total gauge\n");
+    out.push_str("# TYPE haproxy_server_check_up_down_total counter\n");
     for (p_idx, proxy) in stats.proxies.iter().enumerate() {
         for s_idx in 0..proxy.servers.len() {
             let srv_name = if s_idx < proxy.server_ids.len() {

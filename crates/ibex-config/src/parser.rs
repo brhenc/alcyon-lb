@@ -14,7 +14,7 @@ use crate::ast::{
     HttpAfterResRule, HttpCheckAction, HttpCheckExpectPattern, HttpChkConfig, HttpReqAction,
     HttpReqRule, HttpResAction, HttpResRule, HttpReuse, ListenSection, LogConfig, LogFacility,
     LogLevel, LogTarget, MatchType, Mode, ResolvedCheckConfig, ResolvedHttpCheck,
-    ResolvedHttpExpectPattern, ResolvedHttpExpectRule, ResolvedTcpExpectPattern, ResolvedTcpStep,
+    ResolvedHttpExpectPattern, ResolvedHttpExpectRule, ResolvedTcpStep,
     Server, StatsConfig, StickRule, StickRuleType, StickTableConfigAst, TcpCheckAction,
     TcpCheckExpectPattern, TcpReqConnAction, TcpReqConnRule, TcpReqContentAction,
     TcpReqContentRule, TcpReqSessionAction, TcpReqSessionRule, TimeoutConfig, UseBackendRule,
@@ -406,6 +406,7 @@ fn parse_frontend_header(
         }
         binds.push(BindConfig {
             addr: b_addr,
+            quic: false,
             ssl: false,
             crt: Vec::new(),
             alpn: Vec::new(),
@@ -1039,25 +1040,7 @@ fn parse_listen_directive(
         "option" => parse_option_listen(proxy, tokens, kw),
         "no" => parse_no_directive(tokens, kw),
         "declare" => parse_declare(tokens, kw),
-        "bind" => {
-            if tokens.len() < 2 || tokens[1].text.is_empty() {
-                return Err(ConfigError::new(
-                    kw.line,
-                    kw.col,
-                    "<bind> expects <addr:port> as argument.",
-                ));
-            }
-            proxy.addr = parse_socket_addr(&tokens[1], None)?;
-            for tok in &tokens[2..] {
-                if tok.text == "accept-proxy" {
-                    proxy.accept_proxy = true;
-                } else if tok.text == "accept-proxy-v2" {
-                    proxy.accept_proxy = true;
-                    proxy.accept_proxy_v2 = true;
-                }
-            }
-            Ok(())
-        }
+        "bind" => parse_listen_bind(proxy, tokens, kw),
         "accept-proxy" => {
             proxy.accept_proxy = true;
             Ok(())
@@ -1100,6 +1083,38 @@ fn parse_listen_directive(
             format!("unknown keyword '{other}' in 'listen' section"),
         )),
     }
+}
+
+fn parse_listen_bind(
+    proxy: &mut ListenSection,
+    tokens: &[Token],
+    kw: &Token,
+) -> Result<(), ConfigError> {
+    if tokens.len() < 2 || tokens[1].text.is_empty() {
+        return Err(ConfigError::new(
+            kw.line,
+            kw.col,
+            "<bind> expects <addr:port> as argument.",
+        ));
+    }
+    let (addr, is_quic) = parse_socket_addr(&tokens[1], None)?;
+    if is_quic {
+        return Err(ConfigError::new(
+            kw.line,
+            kw.col,
+            "QUIC is not supported in listen sections".to_string(),
+        ));
+    }
+    proxy.addr = addr;
+    for tok in &tokens[2..] {
+        if tok.text == "accept-proxy" {
+            proxy.accept_proxy = true;
+        } else if tok.text == "accept-proxy-v2" {
+            proxy.accept_proxy = true;
+            proxy.accept_proxy_v2 = true;
+        }
+    }
+    Ok(())
 }
 
 fn parse_frontend_directive(
@@ -1187,7 +1202,7 @@ fn parse_frontend_bind(
             "<bind> expects <addr:port> as argument.",
         ));
     }
-    let addr = parse_socket_addr(&tokens[1], None)?;
+    let (addr, is_quic) = parse_socket_addr(&tokens[1], None)?;
     let mut ssl = false;
     let mut crt = Vec::new();
     let mut alpn = Vec::new();
@@ -1237,8 +1252,15 @@ fn parse_frontend_bind(
         fe.accept_proxy_v2 = true;
     }
 
+    if is_quic && !ssl {
+        return Err(ConfigError::new(kw.line, kw.col, "QUIC protocol detected, enabling ssl. Use 'ssl' to shut this warning. Proxy no SSL certificate specified for bind (use 'crt')".to_string()));
+    }
+    if is_quic && alpn.is_empty() {
+        alpn.push("h3".to_string());
+    }
     fe.binds.push(BindConfig {
         addr,
+        quic: is_quic,
         ssl,
         crt,
         alpn,
@@ -1333,7 +1355,7 @@ fn parse_backend_directive(
 ///
 /// This is deliberately a named list rather than a blanket refusal of unknown options.
 /// Making the `global` section strictly reject unknown keywords took the reg-test board from
-/// 7 passing to 1 in one commit, because `thread-groups` appears in nearly every HAProxy
+/// 7 passing to 1 in one commit, because `thread-groups` appears in nearly every `HAProxy`
 /// reg-test. Refuse what is dangerous to ignore; keep ignoring what is merely unimplemented.
 const CHECK_OPTIONS_THAT_MUST_NOT_BE_IGNORED: &[&str] = &[
     "ssl-hello-chk",
@@ -1630,7 +1652,7 @@ fn unescape_string(s: &str) -> String {
 
 fn parse_hex_binary(hex: &str) -> Result<Vec<u8>, String> {
     let clean = hex.trim().replace(' ', "");
-    if clean.len() % 2 != 0 {
+    if !clean.len().is_multiple_of(2) {
         return Err(format!("odd hex string length: {}", clean.len()));
     }
     let mut bytes = Vec::with_capacity(clean.len() / 2);
@@ -2235,73 +2257,34 @@ fn build_resolved_http_check(
     for act in http_checks {
         match act {
             HttpCheckAction::Send {
-                method: m,
-                uri: u,
-                version: v,
-                headers: h,
-                body: b,
+                method: req_method,
+                uri: req_uri,
+                version: req_version,
+                headers: req_headers,
+                body: req_body,
             } => {
-                if let Some(m) = m {
-                    method = m.clone();
+                if let Some(m) = req_method {
+                    method.clone_from(m);
                 }
-                if let Some(u) = u {
-                    uri = u.clone();
+                if let Some(u) = req_uri {
+                    uri.clone_from(u);
                 }
-                if let Some(v) = v {
-                    version = v.clone();
+                if let Some(v) = req_version {
+                    version.clone_from(v);
                 }
-                for (name, val) in h {
+                for (name, val) in req_headers {
                     if name.eq_ignore_ascii_case("host") {
                         host = Some(val.clone());
                     }
                     headers.push((name.clone(), val.clone()));
                 }
-                if let Some(b) = b {
+                if let Some(b) = req_body {
                     body = Some(b.clone());
                 }
             }
             HttpCheckAction::Expect { pattern, negate } => {
-                let resolved_pat = match pattern {
-                    HttpCheckExpectPattern::Status(codes) => {
-                        ResolvedHttpExpectPattern::Status(codes.clone())
-                    }
-                    HttpCheckExpectPattern::StatusRange(low, high) => {
-                        ResolvedHttpExpectPattern::StatusRange(*low, *high)
-                    }
-                    HttpCheckExpectPattern::String(s) => {
-                        ResolvedHttpExpectPattern::String(s.clone())
-                    }
-                    HttpCheckExpectPattern::RStatus(s) => {
-                        ResolvedHttpExpectPattern::RStatus(s.clone())
-                    }
-                    HttpCheckExpectPattern::RString(s) => {
-                        ResolvedHttpExpectPattern::RString(s.clone())
-                    }
-                    HttpCheckExpectPattern::Hdr {
-                        name,
-                        match_type,
-                        value,
-                        value_match_type,
-                    } => ResolvedHttpExpectPattern::Hdr {
-                        name: name.clone(),
-                        match_type: *match_type,
-                        value: value.clone(),
-                        value_match_type: *value_match_type,
-                    },
-                    HttpCheckExpectPattern::Fhdr {
-                        name,
-                        match_type,
-                        value,
-                        value_match_type,
-                    } => ResolvedHttpExpectPattern::Fhdr {
-                        name: name.clone(),
-                        match_type: *match_type,
-                        value: value.clone(),
-                        value_match_type: *value_match_type,
-                    },
-                };
                 expect_rules.push(ResolvedHttpExpectRule {
-                    pattern: resolved_pat,
+                    pattern: pattern.into(),
                     negate: *negate,
                 });
             }
@@ -2366,19 +2349,8 @@ fn build_resolved_tcp_steps(
                 min_recv,
                 comment,
             } => {
-                let pat = match pattern {
-                    TcpCheckExpectPattern::String(s) => {
-                        ResolvedTcpExpectPattern::String(s.clone())
-                    }
-                    TcpCheckExpectPattern::Binary(b) => {
-                        ResolvedTcpExpectPattern::Binary(b.clone())
-                    }
-                    TcpCheckExpectPattern::RString(r) => {
-                        ResolvedTcpExpectPattern::RString(r.clone())
-                    }
-                };
                 steps.push(ResolvedTcpStep::Expect {
-                    pattern: pat,
+                    pattern: pattern.into(),
                     negate: *negate,
                     min_recv: min_recv.unwrap_or(0),
                     comment: comment.clone(),
@@ -2658,6 +2630,8 @@ fn parse_balance(
         "roundrobin" => BalanceAlgorithm::RoundRobin,
         "source" => BalanceAlgorithm::Source,
         "uri" => BalanceAlgorithm::Uri,
+        "leastconn" => BalanceAlgorithm::Leastconn,
+        "static-rr" => BalanceAlgorithm::StaticRr,
         other => {
             return Err(ConfigError::new(
                 tokens[1].line,
@@ -2735,7 +2709,10 @@ fn parse_server(
             "<server> expects <name> and <addr:port> as arguments.",
         ));
     }
-    let addr = parse_socket_addr(&tokens[2], None)?;
+    let (addr, is_quic) = parse_socket_addr(&tokens[2], None)?;
+    if is_quic {
+        return Err(ConfigError::new(kw.line, kw.col, "QUIC not supported for backend servers".to_string()));
+    }
     let mut check = default_server.is_some_and(|d| d.check);
     let mut inter = default_server.and_then(|d| d.inter);
     let mut fall = default_server.and_then(|d| d.fall);
@@ -2948,7 +2925,11 @@ fn parse_log_target(tok: &Token) -> Result<LogTarget, ConfigError> {
     if t.starts_with('/') {
         return Ok(LogTarget::Unix(t.to_string()));
     }
-    Ok(LogTarget::Udp(parse_socket_addr(tok, Some(514))?))
+    let (addr, is_quic) = parse_socket_addr(tok, Some(514))?;
+    if is_quic {
+        return Err(ConfigError::new(tok.line, tok.col, "QUIC not supported for log targets".to_string()));
+    }
+    Ok(LogTarget::Udp(addr))
 }
 
 fn parse_cliexp(kw: &Token) -> Result<(), ConfigError> {
@@ -4998,18 +4979,28 @@ fn validate_config(
     Ok(())
 }
 
-fn parse_socket_addr(token: &Token, default_port: Option<u16>) -> Result<SocketAddr, ConfigError> {
+fn parse_socket_addr(token: &Token, default_port: Option<u16>) -> Result<(SocketAddr, bool), ConfigError> {
     let mut s = token.text.as_str();
 
+    let mut is_quic = false;
     if let Some(stripped) = s.strip_prefix("stream+") {
         s = stripped;
+    } else if let Some(stripped) = s.strip_prefix("quic+") {
+        s = stripped;
+        is_quic = true;
+    } else if let Some(stripped) = s.strip_prefix("quic4@") {
+        s = stripped;
+        is_quic = true;
+    } else if let Some(stripped) = s.strip_prefix("quic6@") {
+        s = stripped;
+        is_quic = true;
     }
 
     let unsupported_prefixes = [
-        "quic+", "dgram+", "quic4+", "quic6+",
+        "dgram+", "quic4+", "quic6+",
         "fd@", "unix@", "uxdg@", "uxst@", "abns@", "abnsz@", "ip@", "ipv4@",
         "ipv6@", "tcp4@", "mptcp4@", "udp4@", "tcp6@", "mptcp6@", "udp6@",
-        "tcp@", "mptcp@", "udp@", "quic4@", "quic6@", "sockpair@", "rhttp@",
+        "tcp@", "mptcp@", "udp@", "sockpair@", "rhttp@",
     ];
     for prefix in unsupported_prefixes {
         if s.starts_with(prefix) {
@@ -5052,7 +5043,7 @@ fn parse_socket_addr(token: &Token, default_port: Option<u16>) -> Result<SocketA
                 ));
             };
             let ip = parse_ip(ip_str, token.line, token.col)?;
-            return Ok(SocketAddr::new(ip, port));
+            return Ok((SocketAddr::new(ip, port), is_quic));
         }
     }
 
@@ -5074,10 +5065,10 @@ fn parse_socket_addr(token: &Token, default_port: Option<u16>) -> Result<SocketA
             )
         })?;
         let ip = parse_ip(host_part, token.line, token.col)?;
-        Ok(SocketAddr::new(ip, port))
+        Ok((SocketAddr::new(ip, port), is_quic))
     } else if let Some(port) = default_port {
         let ip = parse_ip(s, token.line, token.col)?;
-        Ok(SocketAddr::new(ip, port))
+        Ok((SocketAddr::new(ip, port), is_quic))
     } else {
         Err(ConfigError::new(
             token.line,

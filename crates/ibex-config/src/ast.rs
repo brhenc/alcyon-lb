@@ -151,6 +151,7 @@ pub struct TimeoutConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BindConfig {
     pub addr: SocketAddr,
+    pub quic: bool,
     pub ssl: bool,
     pub crt: Vec<String>,
     pub alpn: Vec<String>,
@@ -820,6 +821,10 @@ pub enum BalanceAlgorithm {
     Source,
     /// URI hash.
     Uri,
+    /// Least connections.
+    Leastconn,
+    /// Static round-robin.
+    StaticRr,
 }
 
 /// Dynamic backend switching rule.
@@ -1233,6 +1238,50 @@ pub enum ResolvedTcpExpectPattern {
     RString(String),
 }
 
+impl From<&HttpCheckExpectPattern> for ResolvedHttpExpectPattern {
+    fn from(pattern: &HttpCheckExpectPattern) -> Self {
+        match pattern {
+            HttpCheckExpectPattern::Status(codes) => Self::Status(codes.clone()),
+            HttpCheckExpectPattern::StatusRange(low, high) => Self::StatusRange(*low, *high),
+            HttpCheckExpectPattern::String(s) => Self::String(s.clone()),
+            HttpCheckExpectPattern::RStatus(s) => Self::RStatus(s.clone()),
+            HttpCheckExpectPattern::RString(s) => Self::RString(s.clone()),
+            HttpCheckExpectPattern::Hdr {
+                name,
+                match_type,
+                value,
+                value_match_type,
+            } => Self::Hdr {
+                name: name.clone(),
+                match_type: *match_type,
+                value: value.clone(),
+                value_match_type: *value_match_type,
+            },
+            HttpCheckExpectPattern::Fhdr {
+                name,
+                match_type,
+                value,
+                value_match_type,
+            } => Self::Fhdr {
+                name: name.clone(),
+                match_type: *match_type,
+                value: value.clone(),
+                value_match_type: *value_match_type,
+            },
+        }
+    }
+}
+
+impl From<&TcpCheckExpectPattern> for ResolvedTcpExpectPattern {
+    fn from(pattern: &TcpCheckExpectPattern) -> Self {
+        match pattern {
+            TcpCheckExpectPattern::String(s) => Self::String(s.clone()),
+            TcpCheckExpectPattern::Binary(b) => Self::Binary(b.clone()),
+            TcpCheckExpectPattern::RString(r) => Self::RString(r.clone()),
+        }
+    }
+}
+
 impl ResolvedHttpExpectRule {
     #[must_use]
     pub fn matches(&self, status: u16, headers: &[(String, String)], body: &[u8]) -> bool {
@@ -1241,9 +1290,7 @@ impl ResolvedHttpExpectRule {
             ResolvedHttpExpectPattern::StatusRange(low, high) => status >= *low && status <= *high,
             ResolvedHttpExpectPattern::RStatus(pattern) => {
                 let status_str = status.to_string();
-                regex::Regex::new(pattern)
-                    .map(|re| re.is_match(&status_str))
-                    .unwrap_or(false)
+                regex::Regex::new(pattern).is_ok_and(|re| re.is_match(&status_str))
             }
             ResolvedHttpExpectPattern::String(s) => {
                 let body_str = String::from_utf8_lossy(body);
@@ -1251,9 +1298,7 @@ impl ResolvedHttpExpectRule {
             }
             ResolvedHttpExpectPattern::RString(pattern) => {
                 let body_str = String::from_utf8_lossy(body);
-                regex::Regex::new(pattern)
-                    .map(|re| re.is_match(&body_str))
-                    .unwrap_or(false)
+                regex::Regex::new(pattern).is_ok_and(|re| re.is_match(&body_str))
             }
             ResolvedHttpExpectPattern::Hdr {
                 name,
@@ -1279,9 +1324,7 @@ impl ResolvedHttpExpectRule {
                         MatchType::Sub => {
                             hname.to_ascii_lowercase().contains(&name.to_ascii_lowercase())
                         }
-                        MatchType::Reg => regex::Regex::new(name)
-                            .map(|re| re.is_match(hname))
-                            .unwrap_or(false),
+                        MatchType::Reg => regex::Regex::new(name).is_ok_and(|re| re.is_match(hname)),
                     }
                 };
 
@@ -1295,9 +1338,7 @@ impl ResolvedHttpExpectRule {
                         MatchType::Beg => hval.split(',').any(|part| part.trim().starts_with(target_val)) || hval.starts_with(target_val),
                         MatchType::End => hval.split(',').any(|part| part.trim().ends_with(target_val)) || hval.ends_with(target_val),
                         MatchType::Sub => hval.contains(target_val),
-                        MatchType::Reg => regex::Regex::new(target_val)
-                            .map(|re| re.is_match(hval))
-                            .unwrap_or(false),
+                        MatchType::Reg => regex::Regex::new(target_val).is_ok_and(|re| re.is_match(hval)),
                     }
                 };
 
@@ -1344,9 +1385,7 @@ impl ResolvedTcpExpectPattern {
             }
             ResolvedTcpExpectPattern::RString(pattern) => {
                 let data_str = String::from_utf8_lossy(data);
-                regex::Regex::new(pattern)
-                    .map(|re| re.is_match(&data_str))
-                    .unwrap_or(false)
+                regex::Regex::new(pattern).is_ok_and(|re| re.is_match(&data_str))
             }
         }
     }

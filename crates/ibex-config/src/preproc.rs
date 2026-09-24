@@ -8,15 +8,15 @@ fn parse_cond(mut s: &str) -> Result<bool, String> {
         return Ok(!parse_cond(rest)?);
     }
     
-    let paren_idx = s.find('(').ok_or_else(|| format!("unparsable conditional expression '{}'", s))?;
+    let paren_idx = s.find('(').ok_or_else(|| format!("unparsable conditional expression '{s}'"))?;
     let func_name = s[..paren_idx].trim();
-    let end_idx = s.rfind(')').ok_or_else(|| format!("unparsable conditional expression '{}'", s))?;
+    let end_idx = s.rfind(')').ok_or_else(|| format!("unparsable conditional expression '{s}'"))?;
     if end_idx < paren_idx {
-        return Err(format!("unparsable conditional expression '{}'", s));
+        return Err(format!("unparsable conditional expression '{s}'"));
     }
     let args_str = &s[paren_idx + 1 .. end_idx];
     
-    let args: Vec<&str> = args_str.split(',').map(|arg| arg.trim()).collect();
+    let args: Vec<&str> = args_str.split(',').map(str::trim).collect();
     
     match func_name {
         "feature" => {
@@ -46,7 +46,7 @@ fn parse_cond(mut s: &str) -> Result<bool, String> {
             // Ibex uses rustls, so these OpenSSL specific features are absent.
             Ok(false)
         }
-        _ => Err(format!("unparsable conditional expression '{}'", s)),
+        _ => Err(format!("unparsable conditional expression '{s}'")),
     }
 }
 
@@ -82,6 +82,13 @@ fn expand_vars(s: &str) -> String {
 }
 
 /// Preprocesses the tokenized lines, resolving `.if`, `.elif`, `.else`, `.endif` blocks.
+///
+/// # Errors
+///
+/// Returns [`ConfigError`] if:
+/// - A conditional directive fails to parse or contains an unknown function
+/// - A `.elif`, `.else`, or `.endif` directive occurs without a preceding `.if`
+/// - An `.if` block remains unterminated at the end of the input
 pub fn preprocess(lines: Vec<Line>) -> Result<Vec<Line>, ConfigError> {
     let mut out = Vec::new();
     let mut if_stack: Vec<bool> = Vec::new();
@@ -108,11 +115,10 @@ pub fn preprocess(lines: Vec<Line>) -> Result<Vec<Line>, ConfigError> {
                 if_done.push(active && cond_val);
             }
             ".elif" => {
-                if if_stack.is_empty() {
+                let Some(done) = if_done.last_mut() else {
                     return Err(ConfigError::new(line.line_number, line.tokens[0].col, ".elif without .if"));
-                }
+                };
                 let active_parent = if if_stack.len() > 1 { if_stack[if_stack.len() - 2] } else { true };
-                let done = if_done.last_mut().unwrap();
                 let cond_str = line.tokens[1..].iter().map(|t| t.text.as_str()).collect::<Vec<_>>().join(" ");
                 
                 let mut cond_val = false;
@@ -120,7 +126,9 @@ pub fn preprocess(lines: Vec<Line>) -> Result<Vec<Line>, ConfigError> {
                     cond_val = parse_cond(&cond_str).map_err(|e| ConfigError::new(line.line_number, line.tokens[0].col, e))?;
                 }
                 
-                let current_stack = if_stack.last_mut().unwrap();
+                let Some(current_stack) = if_stack.last_mut() else {
+                    return Err(ConfigError::new(line.line_number, line.tokens[0].col, ".elif without .if"));
+                };
                 if active_parent && !*done && cond_val {
                     *current_stack = true;
                     *done = true;
@@ -129,13 +137,14 @@ pub fn preprocess(lines: Vec<Line>) -> Result<Vec<Line>, ConfigError> {
                 }
             }
             ".else" => {
-                if if_stack.is_empty() {
+                let Some(done) = if_done.last_mut() else {
                     return Err(ConfigError::new(line.line_number, line.tokens[0].col, ".else without .if"));
-                }
+                };
                 let active_parent = if if_stack.len() > 1 { if_stack[if_stack.len() - 2] } else { true };
-                let done = if_done.last_mut().unwrap();
                 
-                let current_stack = if_stack.last_mut().unwrap();
+                let Some(current_stack) = if_stack.last_mut() else {
+                    return Err(ConfigError::new(line.line_number, line.tokens[0].col, ".else without .if"));
+                };
                 if active_parent && !*done {
                     *current_stack = true;
                     *done = true;

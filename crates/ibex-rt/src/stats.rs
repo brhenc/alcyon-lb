@@ -12,6 +12,17 @@ use crate::check::{ServerCheckState, ServerStatus};
 use crate::engine::Proxy;
 pub use crate::stats_html::render_stats_html;
 use std::time::Instant;
+use crate::cpu;
+
+/// Global CPU usage threshold for flood detection (tune.glitches.kill.cpu-usage)
+pub static GLITCHES_KILL_CPU_USAGE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Checks if the current CPU usage exceeds the configured flood threshold.
+pub fn is_cpu_glitch_threshold_exceeded(cpu_usage: u8) -> bool {
+    let threshold = GLITCHES_KILL_CPU_USAGE.load(std::sync::atomic::Ordering::Relaxed);
+    threshold > 0 && cpu_usage >= threshold
+}
+
 
 /// Number of columns `HAProxy` 3.5 emits in `show stat`.
 ///
@@ -231,12 +242,14 @@ pub fn format_show_info(
     total_tasks: usize,
     run_queue_len: usize,
     active_conns: u32,
-    max_conns: u32,
+    max_conns: u32
+    
 ) -> String {
     let elapsed = start_time.elapsed();
     let total_secs = elapsed.as_secs();
     let days = total_secs / 86400;
     let hours = (total_secs % 86400) / 3600;
+    let idle_pct = cpu::get_idle_pct();
     let mins = (total_secs % 3600) / 60;
     let secs = total_secs % 60;
 
@@ -339,7 +352,7 @@ format!(
 \
          Run_queue: {run_queue_len}
 \
-         Idle_pct: 100
+         Idle_pct: {idle_pct}
 \
          node: ibex
 \
