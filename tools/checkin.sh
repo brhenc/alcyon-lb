@@ -64,6 +64,22 @@ echo "=== every test in the workspace, against a declared baseline ==="
 python3 harness/suite.py 2>&1 | grep -vE "^$"
 
 echo
+echo "=== did a test execute what changed ==="
+# The recurring defect is one thing wearing several hats: the test does not execute the code
+# the feature lives in. T48's test called lb::balance_uri directly and never entered the
+# engine, so `balance uri` sent every request to one server while its test passed, through
+# two reviewers and a green check-in. T40's module was never called. T26 never measured Ibex.
+# T51's first attempt changed nothing and reported SUCCESS.
+#
+# All four are the same mechanical question. Costs several minutes because it builds the
+# workspace instrumented and runs every test; set COVERCHECK=0 to skip it on a quick loop.
+if [ "${COVERCHECK:-1}" = "1" ]; then
+  python3 harness/covercheck.py 2>&1 | grep -vE "^$"
+else
+  echo "covercheck: skipped (COVERCHECK=0)"
+fi
+
+echo
 echo "=== the regressions no unit test can see ==="
 # A daemon that will not start is invisible to `cargo test`. Making the `global` section
 # strict about unknown keywords took the reg-test board from 7 passing to 1 -- `thread-groups`
