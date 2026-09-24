@@ -1,441 +1,478 @@
 #!/usr/bin/env python3
-import sys
-import os
+import asyncio
 import argparse
-import subprocess
 import json
-import socket
-import threading
-import time
+import subprocess
+import tempfile
+import os
+import sys
 import hashlib
 import re
-import tempfile
 
-CONFIG_TEMPLATES = {
-    "backend_selection": """
-global
-    log 127.0.0.1:{syslog_port} local0
-defaults
-    timeout connect 1s
-    timeout client 1s
-    timeout server 1s
-    mode http
-    option httplog
-frontend f1
-    bind 127.0.0.1:{front_port}
-    use_backend b2 if { path -m beg /b2 }
-    default_backend b1
-backend b1
-    server s1 127.0.0.1:{back1_port}
-backend b2
-    server s2 127.0.0.1:{back2_port}
-""",
-    "keep_alive": """
-global
-    log 127.0.0.1:{syslog_port} local0
-defaults
-    timeout connect 1s
-    timeout client 1s
-    timeout server 1s
-    mode http
-    option httplog
-frontend f1
-    bind 127.0.0.1:{front_port}
-    default_backend b1
-backend b1
-    option http-keep-alive
-    server s1 127.0.0.1:{back1_port}
-""",
-    "header_rewriting": """
-global
-    log 127.0.0.1:{syslog_port} local0
-defaults
-    timeout connect 1s
-    timeout client 1s
-    timeout server 1s
-    mode http
-    option httplog
-frontend f1
-    bind 127.0.0.1:{front_port}
-    http-request set-header X-Added-Front Front
-    default_backend b1
-backend b1
-    http-request set-header X-Added-Back Back
-    http-response set-header X-Added-Resp Resp
-    server s1 127.0.0.1:{back1_port}
-""",
-    "error_paths": """
-global
-    log 127.0.0.1:{syslog_port} local0
-defaults
-    timeout connect 1s
-    timeout client 1s
-    timeout server 1s
-    mode http
-    option httplog
-frontend f1
-    bind 127.0.0.1:{front_port}
-    http-request deny if { path -m beg /deny }
-    default_backend b1
-backend b1
-    server s1 127.0.0.1:{back1_port}
-""",
-    "timeouts": """
-global
-    log 127.0.0.1:{syslog_port} local0
-defaults
-    timeout connect 100ms
-    timeout client 100ms
-    timeout server 100ms
-    mode http
-    option httplog
-frontend f1
-    bind 127.0.0.1:{front_port}
-    default_backend b1
-backend b1
-    server s1 127.0.0.1:{back1_port}
-""",
-    "stick_table": """
-global
-    log 127.0.0.1:{syslog_port} local0
-defaults
-    timeout connect 1s
-    timeout client 1s
-    timeout server 1s
-    mode http
-    option httplog
-frontend f1
-    bind 127.0.0.1:{front_port}
-    default_backend b1
-backend b1
-    stick-table type ip size 1m
-    stick on src
-    server s1 127.0.0.1:{back1_port}
-""",
-    "no_server": """
-global
-defaults
-    timeout connect 1s
-    timeout client 1s
-    timeout server 1s
-    mode http
-frontend f1
-    bind 127.0.0.1:{front_port}
-    default_backend b1
-backend b1
-""",
-    "health_check": """
-global
-    log 127.0.0.1:{syslog_port} local0
-defaults
-    timeout connect 1s
-    timeout client 1s
-    timeout server 1s
-    mode http
-    option httplog
-frontend f1
-    bind 127.0.0.1:{front_port}
-    default_backend b1
-backend b1
-    option httpchk GET /health
-    server s1 127.0.0.1:{back1_port} check inter 100ms fall 1 rise 1
-    server s2 127.0.0.1:{back2_port} check inter 100ms fall 1 rise 1
-"""
-}
-
-PROBES = {
-    "backend_selection": [
-        {"path": "/"},
-        {"path": "/b2"},
-    ],
-    "keep_alive": [
-        {"path": "/", "headers": {"Connection": "keep-alive"}, "keep_open": True},
-        {"path": "/second", "headers": {"Connection": "keep-alive"}},
-    ],
-    "header_rewriting": [
-        {"path": "/"},
-    ],
-    "error_paths": [
-        {"path": "/deny"},
-        {"path": "/"},
-    ],
-    "timeouts": [
-        {"path": "/timeout", "backend_delay": 0.5},
-    ],
-    "stick_table": [
-        {"path": "/"},
-        {"path": "/"},
-    ],
-    "no_server": [
-        {"path": "/"},
-    ],
-    "health_check": [
-        {"path": "/", "delay_before": 0.3},
-    ]
-}
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BINARY = os.path.join(REPO, "target", "debug", "ibex")
 
 def get_free_port():
-    s = socket.socket()
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind(('127.0.0.1', 0))
     p = s.getsockname()[1]
     s.close()
     return p
 
-class MockBackend:
-    def __init__(self, port, name):
-        self.port = port
-        self.name = name
-        self.sock = socket.socket()
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.sock.bind(('127.0.0.1', port))
-        self.sock.listen(5)
-        self.running = True
-        self.t = threading.Thread(target=self.run)
-        self.t.start()
-        
-    def run(self):
-        self.sock.settimeout(0.1)
-        while self.running:
-            try:
-                conn, _ = self.sock.accept()
-                conn.settimeout(0.5)
-                threading.Thread(target=self.handle, args=(conn,)).start()
-            except socket.timeout:
-                pass
-                
-    def handle(self, conn):
-        try:
-            data = conn.recv(4096).decode('utf-8', errors='replace')
-            if not data:
-                return
-                
-            if "GET /timeout" in data:
-                time.sleep(0.5)
-                
-            body = f"Hello from {self.name}"
-            resp = (f"HTTP/1.1 200 OK\r\n"
-                    f"Content-Length: {len(body)}\r\n"
-                    f"Connection: close\r\n\r\n"
-                    f"{body}")
-            conn.sendall(resp.encode('utf-8'))
-        except:
-            pass
-        finally:
-            conn.close()
-
-    def stop(self):
-        self.running = False
-        self.t.join()
-        self.sock.close()
-
-class SyslogReceiver:
+class SyslogServer:
     def __init__(self, port):
         self.port = port
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.bind(('127.0.0.1', port))
-        self.sock.settimeout(0.1)
         self.logs = []
-        self.running = True
-        self.t = threading.Thread(target=self.run)
-        self.t.start()
-        
-    def run(self):
-        while self.running:
-            try:
-                data, _ = self.sock.recvfrom(4096)
-                self.logs.append(data.decode('utf-8', errors='replace').strip())
-            except socket.timeout:
-                pass
-                
-    def get_and_clear(self):
-        res = self.logs[:]
-        self.logs.clear()
-        return res
-        
-    def stop(self):
-        self.running = False
-        self.t.join()
-        self.sock.close()
+        self.transport = None
 
-def parse_response(raw):
-    parts = raw.split("\r\n\r\n", 1)
-    headers_part = parts[0]
-    body = parts[1] if len(parts) > 1 else ""
-    lines = headers_part.split("\r\n")
-    if not lines:
-        return {"error": "Empty response"}
-    status = lines[0]
-    headers = [h for h in lines[1:] if not h.lower().startswith("date:") and not h.lower().startswith("server:")]
-    headers.sort()
+    class Protocol(asyncio.DatagramProtocol):
+        def __init__(self, logs):
+            self.logs = logs
+        def datagram_received(self, data, addr):
+            self.logs.append(data.decode('utf-8', errors='replace'))
+
+    async def start(self):
+        loop = asyncio.get_running_loop()
+        self.transport, _ = await loop.create_datagram_endpoint(
+            lambda: self.Protocol(self.logs),
+            local_addr=('127.0.0.1', self.port)
+        )
+
+    def stop(self):
+        if self.transport:
+            self.transport.close()
+
+class MockBackend:
+    def __init__(self, port, name, delay=0.0, drop=False, respond=True):
+        self.port = port
+        self.name = name
+        self.delay = delay
+        self.drop = drop
+        self.respond = respond
+        self.server = None
+        self.requests_received = []
+        self.client_tasks = []
+
+    async def handle_client(self, reader, writer):
+        if self.drop:
+            writer.close()
+            return
+        
+        data = b""
+        try:
+            while True:
+                chunk = await asyncio.wait_for(reader.read(4096), timeout=0.1)
+                if not chunk:
+                    break
+                data += chunk
+                if b"\r\n\r\n" in data:
+                    break
+        except asyncio.TimeoutError:
+            pass
+        except Exception:
+            pass
+            
+        self.requests_received.append(data)
+
+        if self.delay > 0:
+            await asyncio.sleep(self.delay)
+
+        if self.respond:
+            resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"
+            try:
+                writer.write(resp)
+                await writer.drain()
+            except Exception:
+                pass
+        
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+    def accept_client(self, reader, writer):
+        task = asyncio.create_task(self.handle_client(reader, writer))
+        self.client_tasks.append(task)
+
+    async def start(self):
+        self.server = await asyncio.start_server(self.accept_client, '127.0.0.1', self.port)
+
+    async def stop(self):
+        if self.server:
+            self.server.close()
+            await self.server.wait_closed()
+        for task in self.client_tasks:
+            task.cancel()
+
+class Probe:
+    def __init__(self, request_data, delay_before=0.0, slow_send=False):
+        self.request_data = request_data
+        self.delay_before = delay_before
+        self.slow_send = slow_send
+        self.response = None
+        self.error = None
+
+    async def run(self, proxy_port):
+        if self.delay_before > 0:
+            await asyncio.sleep(self.delay_before)
+        
+        try:
+            reader, writer = await asyncio.open_connection('127.0.0.1', proxy_port)
+            if self.slow_send:
+                half = len(self.request_data) // 2
+                writer.write(self.request_data[:half])
+                await writer.drain()
+                await asyncio.sleep(0.2)
+                writer.write(self.request_data[half:])
+                await writer.drain()
+            else:
+                writer.write(self.request_data)
+                await writer.drain()
+
+            resp_data = b""
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(reader.read(4096), timeout=0.5)
+                    if not chunk:
+                        break
+                    resp_data += chunk
+                except asyncio.TimeoutError:
+                    break
+            
+            self.response = resp_data
+            writer.close()
+            await writer.wait_closed()
+        except Exception as e:
+            self.error = str(type(e).__name__)
+
+async def run_case(name, case_def):
+    proxy_port = get_free_port()
+    syslog_port = get_free_port()
+    
+    port_map = {
+        proxy_port: "<proxy_port>",
+        syslog_port: "<syslog_port>"
+    }
+    
+    be_ports = []
+    backends = []
+    for i, bdef in enumerate(case_def.get("backends", [])):
+        p = get_free_port()
+        be_ports.append(p)
+        port_map[p] = f"<be_port_{i}>"
+        b = MockBackend(
+            p, f"b{i}",
+            delay=bdef.get("delay", 0.0),
+            drop=bdef.get("drop", False),
+            respond=bdef.get("respond", True)
+        )
+        backends.append(b)
+
+    syslog = SyslogServer(syslog_port)
+    await syslog.start()
+
+    for b in backends:
+        await b.start()
+
+    config = case_def["config"].format(
+        proxy_port=proxy_port,
+        syslog_port=syslog_port,
+        be_ports=be_ports
+    )
+
+    with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
+        f.write(config)
+        cfg_path = f.name
+
+    proc = await asyncio.create_subprocess_exec(
+        BINARY, "-f", cfg_path,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+
+    await asyncio.sleep(0.1)
+
+    probes = case_def.get("probes", [])
+    probe_results = []
+    for p in probes:
+        probe = Probe(p.get("send", b""), delay_before=p.get("delay", 0.0), slow_send=p.get("slow", False))
+        await probe.run(proxy_port)
+        
+        resp = probe.response
+        if probe.error:
+            probe_results.append({"error": probe.error})
+        elif not resp:
+            probe_results.append({"error": "empty_response"})
+        else:
+            lines = resp.split(b"\r\n")
+            if not lines:
+                probe_results.append({"raw_response": resp.decode('latin1')})
+            else:
+                status_line = lines[0].decode('latin1')
+                headers = []
+                idx = 1
+                while idx < len(lines) and lines[idx]:
+                    headers.append(lines[idx].decode('latin1'))
+                    idx += 1
+                body = b"\r\n".join(lines[idx+1:])
+                body_hash = hashlib.sha256(body).hexdigest()[:16] if body else None
+                
+                headers.sort()
+                probe_results.append({
+                    "status_line": sanitize_str(status_line, port_map),
+                    "headers": [sanitize_str(h, port_map) for h in headers],
+                    "body_hash": body_hash
+                })
+
+    await asyncio.sleep(case_def.get("run_time", 0.1))
+    
+    proc.terminate()
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=1.0)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+    
+    os.remove(cfg_path)
+
+    for b in backends:
+        await b.stop()
+    syslog.stop()
+    
+    be_reqs = {}
+    for b in backends:
+        reqs = []
+        for r in b.requests_received:
+            lines = r.split(b"\r\n")
+            if lines and lines[0]:
+                status = lines[0].decode('latin1')
+                hdrs = []
+                for idx in range(1, len(lines)):
+                    if not lines[idx]: break
+                    hdrs.append(lines[idx].decode('latin1'))
+                hdrs.sort()
+                reqs.append({
+                    "request_line": sanitize_str(status, port_map),
+                    "headers": [sanitize_str(h, port_map) for h in hdrs]
+                })
+        be_reqs[b.name] = reqs
+        
+    sanitized_logs = []
+    for l in syslog.logs:
+        l = l.replace('\0', '')
+        sanitized_logs.append(sanitize_str(l, port_map).strip())
+    sanitized_logs.sort()
+    
     return {
-        "status": status,
-        "headers": headers,
-        "body_hash": hashlib.sha256(body.encode('utf-8')).hexdigest()[:16]
+        "probe_results": probe_results,
+        "backend_requests": be_reqs,
+        "syslog": sanitized_logs
     }
 
-def clean_syslog(lines, port_map):
-    cleaned = []
-    for line in lines:
-        line = re.sub(r'^<\d+>[A-Z][a-z]{2}\s+\d+\s+\d{2}:\d{2}:\d{2}\s+', '', line)
-        line = re.sub(r'^(ibex|haproxy)\[\d+\]:\s+', '', line)
-        for actual, placeholder in port_map.items():
-            line = line.replace(str(actual), placeholder)
-        cleaned.append(line)
-    return sorted(cleaned)
+def sanitize_str(text, port_map):
+    for p_val, p_name in sorted(port_map.items(), key=lambda x: -len(str(x[0]))):
+        text = text.replace(str(p_val), p_name)
+    text = re.sub(r'<\d+>', '<FAC>', text)
+    text = re.sub(r'\w{3} {1,2}\d{1,2} \d{2}:\d{2}:\d{2}', '<DATE>', text)
+    text = re.sub(r'\[\d+\]', '[<PID>]', text)
+    text = re.sub(r'pid = \d+', 'pid = <PID>', text)
+    text = re.sub(r'port \d+', 'port <PORT>', text)
+    return text
 
-def run_probes(front_port, probes, port_map):
-    results = []
-    conn = None
-    for p in probes:
-        if p.get("delay_before"):
-            time.sleep(p.get("delay_before"))
-            
-        if not conn:
-            conn = socket.socket()
-            conn.settimeout(1.0)
-            try:
-                conn.connect(('127.0.0.1', front_port))
-            except Exception as e:
-                results.append({"error": f"connect: {e}"})
-                conn = None
-                continue
-                
-        req = f"GET {p['path']} HTTP/1.1\r\nHost: 127.0.0.1\r\n"
-        for k, v in p.get("headers", {}).items():
-            req += f"{k}: {v}\r\n"
-        req += "\r\n"
-        
-        try:
-            conn.sendall(req.encode('utf-8'))
-            resp = conn.recv(8192).decode('utf-8', errors='replace')
-            if not resp:
-                results.append({"error": "empty response"})
-                conn.close()
-                conn = None
-            else:
-                parsed = parse_response(resp)
-                parsed_str = json.dumps(parsed)
-                for actual, placeholder in port_map.items():
-                    parsed_str = parsed_str.replace(str(actual), placeholder)
-                results.append(json.loads(parsed_str))
-                
-                if not p.get("keep_open"):
-                    conn.close()
-                    conn = None
-        except Exception as e:
-            results.append({"error": f"req: {e}"})
-            if conn:
-                conn.close()
-            conn = None
-            
-    if conn:
-        conn.close()
-    return results
+CASES = {
+    "backend_selection": {
+        "config": """
+global
+    log 127.0.0.1:{syslog_port} local0
+defaults
+    timeout client 5s
+    timeout server 5s
+    timeout connect 5s
+    log global
+    mode http
+frontend fe
+    bind 127.0.0.1:{proxy_port}
+    use_backend b1 if {{ path_beg /b1 }}
+    default_backend b2
+backend b1
+    server s1 127.0.0.1:{be_ports[0]}
+backend b2
+    server s2 127.0.0.1:{be_ports[1]}
+""",
+        "backends": [{"respond": True}, {"respond": True}],
+        "probes": [
+            {"send": b"GET /b1 HTTP/1.0\r\n\r\n"},
+            {"send": b"GET / HTTP/1.0\r\n\r\n"}
+        ]
+    },
+    "keep_alive": {
+        "config": """
+global
+    log 127.0.0.1:{syslog_port} local0
+defaults
+    timeout client 5s
+    timeout server 5s
+    timeout connect 5s
+    log global
+    mode http
+frontend fe
+    bind 127.0.0.1:{proxy_port}
+    default_backend b1
+backend b1
+    server s1 127.0.0.1:{be_ports[0]}
+""",
+        "backends": [{"respond": True}],
+        "probes": [
+            {"send": b"GET / HTTP/1.1\r\nHost: loc\r\n\r\nGET / HTTP/1.1\r\nConnection: close\r\nHost: loc\r\n\r\n"}
+        ]
+    },
+    "req_res_rule": {
+        "config": """
+global
+    log 127.0.0.1:{syslog_port} local0
+defaults
+    timeout client 5s
+    timeout server 5s
+    timeout connect 5s
+    log global
+    mode http
+frontend fe
+    bind 127.0.0.1:{proxy_port}
+    http-request set-header X-Added-Req 1
+    http-request deny if {{ path_beg /deny }}
+    default_backend b1
+backend b1
+    http-response set-header X-Added-Res 1
+    server s1 127.0.0.1:{be_ports[0]}
+""",
+        "backends": [{"respond": True}],
+        "probes": [
+            {"send": b"GET / HTTP/1.0\r\n\r\n"},
+            {"send": b"GET /deny HTTP/1.0\r\n\r\n"}
+        ]
+    },
+    "error_paths": {
+        "config": """
+global
+    log 127.0.0.1:{syslog_port} local0
+defaults
+    timeout client 5s
+    timeout server 5s
+    timeout connect 5s
+    log global
+    mode http
+frontend fe
+    bind 127.0.0.1:{proxy_port}
+    default_backend b1
+backend b1
+    server s1 127.0.0.1:{be_ports[0]}
+""",
+        "backends": [{"drop": True}],
+        "probes": [
+            {"send": b"GET / HTTP/1.0\r\n\r\n"},
+            {"send": b"INVALID REQUEST\r\n\r\n"}
+        ]
+    },
+    "timeouts": {
+        "config": """
+global
+    log 127.0.0.1:{syslog_port} local0
+defaults
+    timeout client 100ms
+    timeout server 100ms
+    timeout connect 100ms
+    log global
+    mode http
+frontend fe
+    bind 127.0.0.1:{proxy_port}
+    default_backend b1
+backend b1
+    server s1 127.0.0.1:{be_ports[0]}
+""",
+        "backends": [{"delay": 0.2, "respond": True}],
+        "probes": [
+            {"send": b"GET / HTT", "slow": True},
+            {"send": b"GET / HTTP/1.0\r\n\r\n"}
+        ]
+    },
+    "stick_table": {
+        "config": """
+global
+    log 127.0.0.1:{syslog_port} local0
+defaults
+    timeout client 5s
+    timeout server 5s
+    timeout connect 5s
+    log global
+    mode http
+frontend fe
+    bind 127.0.0.1:{proxy_port}
+    default_backend b1
+backend b1
+    stick-table type ip size 100
+    stick on src
+    server s1 127.0.0.1:{be_ports[0]}
+    server s2 127.0.0.1:{be_ports[1]}
+""",
+        "backends": [{"respond": True}, {"respond": True}],
+        "probes": [
+            {"send": b"GET / HTTP/1.0\r\n\r\n"},
+            {"send": b"GET / HTTP/1.0\r\n\r\n"}
+        ]
+    },
+    "health_check": {
+        "config": """
+global
+    log 127.0.0.1:{syslog_port} local0
+defaults
+    timeout client 5s
+    timeout server 5s
+    timeout connect 5s
+    log global
+    mode http
+frontend fe
+    bind 127.0.0.1:{proxy_port}
+    default_backend b1
+backend b1
+    server s1 127.0.0.1:{be_ports[0]} check inter 100ms
+""",
+        "backends": [{"respond": True}],
+        "run_time": 0.4
+    }
+}
 
-def wait_for_port(port, timeout=2.0):
-    start = time.time()
-    while time.time() - start < timeout:
-        s = socket.socket()
-        s.settimeout(0.1)
-        try:
-            s.connect(('127.0.0.1', port))
-            s.close()
-            return True
-        except:
-            pass
-        time.sleep(0.1)
-    return False
+async def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--diff", nargs=2, help="Diff two JSON fingerprint files")
+    args = parser.parse_args()
 
-def diff_dicts(d1, d2, path=""):
-    diffs = []
-    keys = sorted(set(d1.keys()) | set(d2.keys()))
-    for k in keys:
-        p = f"{path}.{k}" if path else k
-        if k not in d1:
-            diffs.append(f"+ {p}: {d2[k]}")
-        elif k not in d2:
-            diffs.append(f"- {p}: {d1[k]}")
-        elif isinstance(d1[k], dict) and isinstance(d2[k], dict):
-            diffs.extend(diff_dicts(d1[k], d2[k], p))
-        elif isinstance(d1[k], list) and isinstance(d2[k], list):
-            if d1[k] != d2[k]:
-                diffs.append(f"~ {p}: {d1[k]} -> {d2[k]}")
-        elif d1[k] != d2[k]:
-            diffs.append(f"~ {p}: {d1[k]} -> {d2[k]}")
-    return diffs
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--bin", default="./target/debug/ibex")
-    ap.add_argument("--diff", nargs=2, help="Diff two JSON fingerprint files")
-    args = ap.parse_args()
-    
     if args.diff:
+        import subprocess
+        import tempfile
         with open(args.diff[0]) as f1, open(args.diff[1]) as f2:
             d1 = json.load(f1)
             d2 = json.load(f2)
-            
-        diffs = diff_dicts(d1, d2)
-        if not diffs:
-            print("No differences found.")
-        else:
-            for d in diffs:
-                print(d)
-        return
+        fd1, f1_name = tempfile.mkstemp()
+        fd2, f2_name = tempfile.mkstemp()
+        with os.fdopen(fd1, "w") as f1_out, os.fdopen(fd2, "w") as f2_out:
+            json.dump(d1, f1_out, sort_keys=True, indent=2)
+            f1_out.write("\n")
+            json.dump(d2, f2_out, sort_keys=True, indent=2)
+            f2_out.write("\n")
+        subprocess.run(["diff", "-u", f1_name, f2_name])
+        os.remove(f1_name)
+        os.remove(f2_name)
+        sys.exit(0)
 
-    if not os.path.exists(args.bin):
-        print(f"Error: binary {args.bin} not found")
-        sys.exit(1)
-
+    # Fingerprint generation mode
     out = {}
+    for name, cdef in CASES.items():
+        out[name] = await run_case(name, cdef)
     
-    for name, template in sorted(CONFIG_TEMPLATES.items()):
-        syslog_port = get_free_port()
-        front_port = get_free_port()
-        back1_port = get_free_port()
-        back2_port = get_free_port()
-        
-        port_map = {
-            syslog_port: "<SYSLOG_PORT>",
-            front_port: "<FRONT_PORT>",
-            back1_port: "<BACK1_PORT>",
-            back2_port: "<BACK2_PORT>"
-        }
-        
-        cfg = template.replace("{syslog_port}", str(syslog_port)).replace("{front_port}", str(front_port)).replace("{back1_port}", str(back1_port)).replace("{back2_port}", str(back2_port))
-        
-        syslog = SyslogReceiver(syslog_port)
-        b1 = MockBackend(back1_port, "b1")
-        b2 = MockBackend(back2_port, "b2")
-        
-        with tempfile.NamedTemporaryFile("w", delete=False) as f:
-            f.write(cfg)
-            cfg_path = f.name
-            
-        proc = subprocess.Popen([args.bin, "-f", cfg_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        
-        ready = wait_for_port(front_port)
-        
-        if not ready:
-            out[name] = {"error": "proxy failed to start"}
-        else:
-            probes = PROBES.get(name, [])
-            results = run_probes(front_port, probes, port_map)
-            time.sleep(0.2)
-            syslog_lines = syslog.get_and_clear()
-            out[name] = {
-                "results": results,
-                "syslog": clean_syslog(syslog_lines, port_map)
-            }
-            
-        proc.kill()
-        proc.wait()
-        os.remove(cfg_path)
-        syslog.stop()
-        b1.stop()
-        b2.stop()
-
     print(json.dumps(out, sort_keys=True, indent=2))
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
