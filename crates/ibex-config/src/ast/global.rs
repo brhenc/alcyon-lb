@@ -15,6 +15,9 @@ pub struct GlobalSection {
     pub stats_socket_mode: Option<u32>,
     /// Privilege level for admin socket.
     pub stats_socket_level: Option<String>,
+    /// `stats socket ... expose-fd listeners`: the socket may hand this process's listening
+    /// sockets to a new process during a reload (`_getsocks`, `-x`).
+    pub stats_socket_expose_fd: bool,
     /// Maximum rewrite size in bytes.
     pub maxrewrite: Option<usize>,
     /// Buffer size in bytes (`tune.bufsize`).

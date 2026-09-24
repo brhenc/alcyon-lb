@@ -31,6 +31,8 @@ struct CliOptions {
     maxpconn: Option<u32>,
     memory_limit_mb: Option<u64>,
     sf_pids: Vec<u32>,
+    /// `-x <socket>`: take the listening sockets over from the process behind this socket.
+    old_socket: Option<PathBuf>,
     st_pids: Vec<u32>,
     ignore_resolve_fail: bool,
     disable_epoll: bool,
@@ -57,6 +59,7 @@ fn print_help(program: &str) {
     println!("        -D goes daemon ; -C changes to <dir> before loading files.");
     println!("        -W master-worker mode.");
     println!("        -Ws master-worker mode with systemd notify support.");
+    println!("        -x <unix_socket> get listening sockets from a unix socket");
     println!("        -q quiet mode : don't display messages");
     println!("        -c check mode : only check config files and exit");
     println!("        -n sets the maximum total # of connections");
@@ -330,6 +333,14 @@ fn parse_cli_args(args: &[String]) -> (String, CliOptions) {
                     process::exit(1);
                 }
                 opts.pid_file = Some(PathBuf::from(&args[i]));
+            }
+            "-x" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Option -x requires a unix socket path");
+                    process::exit(1);
+                }
+                opts.old_socket = Some(PathBuf::from(&args[i]));
             }
             "-sf" => {
                 while i + 1 < args.len() && !args[i + 1].starts_with('-') {
@@ -677,6 +688,32 @@ fn main() {
     
     let stats_socket_mode = config.global.as_ref().and_then(|g| g.stats_socket_mode);
 
+    // 12b. Hitless reload: take the listening sockets over from the old process rather
+    //      than binding new ones, so the connections already queued on them survive it
+    //      exiting. See crates/ibex-rt/src/handover.rs.
+    if config.global.as_ref().is_some_and(|g| g.stats_socket_expose_fd) {
+        ibex_rt::handover::enable_expose();
+    }
+    if let Some(ref old) = opts.old_socket {
+        if old != Path::new("/dev/null") {
+            match ibex_rt::handover::fetch(old) {
+                Ok(socks) => {
+                    if !opts.quiet {
+                        eprintln!("[NOTICE] took over {} listening socket(s) from {}", socks.len(), old.display());
+                    }
+                    ibex_rt::handover::distribute(socks, nbthread);
+                }
+                Err(e) => {
+                    // HAProxy's behaviour exactly (src/haproxy.c:2069): refuse to start. The
+                    // old process has not been signalled yet -- that only happens once this
+                    // one is listening -- so it keeps serving and nothing is lost.
+                    eprintln!("[ALERT] Failed to get the sockets from the old process! ({}: {e})", old.display());
+                    process::exit(1);
+                }
+            }
+        }
+    }
+
     // Each worker reports once it is listening. `-sf` and READY=1 wait for all of them.
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
     let mut threads = Vec::new();
@@ -730,6 +767,10 @@ fn main() {
         if ready_rx.recv().is_err() {
             break;
         }
+    }
+    let unused = ibex_rt::handover::drop_unused_inherited();
+    if unused > 0 && !opts.quiet {
+        eprintln!("[NOTICE] closed {unused} inherited socket(s) that no bind in this configuration uses");
     }
     if !opts.sf_pids.is_empty() {
         send_signals_to_pids(&opts.sf_pids, Signal::Usr1, opts.quiet);

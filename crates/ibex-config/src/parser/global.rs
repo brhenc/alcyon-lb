@@ -53,6 +53,21 @@ pub(crate) fn parse_global_directive(
                             i += 1;
                             global.stats_socket_level = Some(tokens[i].text.clone());
                         }
+                        // Until this arm existed, `expose-fd listeners` fell into the
+                        // catch-all below and was accepted and dropped -- so a HAProxy
+                        // config asking for hitless reload parsed cleanly and got none.
+                        "expose-fd" => {
+                            let what = tokens.get(i + 1).map(|t| t.text.as_str());
+                            if what != Some("listeners") {
+                                return Err(ConfigError::new(
+                                    tokens[i].line,
+                                    tokens[i].col,
+                                    "'expose-fd' only supports 'listeners'".to_string(),
+                                ));
+                            }
+                            i += 1;
+                            global.stats_socket_expose_fd = true;
+                        }
                         _ => {}
                     }
                     i += 1;

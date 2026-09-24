@@ -105,6 +105,50 @@ impl Listener {
         })
     }
 
+    /// Takes over a listening socket inherited from the previous process through
+    /// `-x` (see [`crate::handover`]), instead of binding a new one. Taking the same
+    /// socket is what keeps its accept queue -- connections the kernel had already
+    /// completed for the old process -- from being reset when that process exits.
+    ///
+    /// The descriptor is checked before it is trusted: it must be a listening TCP socket
+    /// bound to `addr`. It is set non-blocking and re-`listen`ed with this config's
+    /// backlog, which is how Linux changes the backlog of a listening socket.
+    ///
+    /// # Errors
+    /// Refuses a descriptor that is not a listening TCP socket on `addr`.
+    pub fn adopt(fd: OwnedFd, addr: SocketAddr, backlog: i32, proxy: u32) -> io::Result<Self> {
+        let bad = |why: &str| io::Error::new(io::ErrorKind::InvalidInput, format!("inherited socket for {addr}: {why}"));
+        if net::sockopt::get_socket_type(&fd)? != SocketType::STREAM {
+            return Err(bad("not a stream socket"));
+        }
+        if !net::sockopt::get_socket_acceptconn(&fd)? {
+            return Err(bad("not listening"));
+        }
+        let local = match net::getsockname(&fd)? {
+            rustix::net::SocketAddrAny::V4(v4) => SocketAddr::V4(std::net::SocketAddrV4::new(*v4.ip(), v4.port())),
+            rustix::net::SocketAddrAny::V6(v6) => SocketAddr::V6(std::net::SocketAddrV6::new(
+                *v6.ip(),
+                v6.port(),
+                v6.flowinfo(),
+                v6.scope_id(),
+            )),
+            _ => return Err(bad("not an inet socket")),
+        };
+        if local != addr {
+            return Err(bad(&format!("bound to {local}")));
+        }
+        rustix::io::ioctl_fionbio(&fd, true)?;
+        net::listen(&fd, backlog)?;
+        Ok(Listener {
+            fd,
+            addr,
+            proxy,
+            maxconn: 0,
+            nbconn: 0,
+            tls: None,
+        })
+    }
+
     /// Borrow the underlying descriptor, for registering with a [`crate::Poller`].
     #[must_use]
     pub fn borrowed_fd(&self) -> std::os::fd::BorrowedFd<'_> {

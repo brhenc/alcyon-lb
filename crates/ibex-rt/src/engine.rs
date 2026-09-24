@@ -482,6 +482,26 @@ impl Drop for Engine {
     }
 }
 
+/// The listening sockets for one bind on one worker: whatever the previous process handed
+/// over through `-x` (see [`crate::handover`]), or one freshly bound socket if nothing was.
+/// Each is registered for `_getsocks`, so the *next* reload can take it over in turn.
+fn listeners_for(worker_id: usize, addr: SocketAddr, proxy: u32) -> io::Result<Vec<Listener>> {
+    let mut out = Vec::new();
+    for fd in crate::handover::take_inherited(worker_id, addr) {
+        match Listener::adopt(fd, addr, 128, proxy) {
+            Ok(l) => out.push(l),
+            Err(e) => eprintln!("[WARNING] {e}; binding a fresh socket instead"),
+        }
+    }
+    if out.is_empty() {
+        out.push(Listener::bind(addr, 128, proxy)?);
+    }
+    for l in &out {
+        crate::handover::expose(l.addr(), l.borrowed_fd())?;
+    }
+    Ok(out)
+}
+
 fn socket_file_ident(path: &Path) -> Option<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
     std::fs::symlink_metadata(path).ok().map(|m| (m.dev(), m.ino()))
@@ -1105,13 +1125,14 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         let mut proxy_idx = 0;
         for listen in &config.listens {
             if listen.disabled { continue; }
-            let mut listener = Listener::bind(listen.addr, 128, usize_to_u32(proxy_idx))?;
-            listener.maxconn = listen.maxconn;
-            let l_idx = listeners.len();
-            let lfd = listener.raw_fd();
-            fdtab.insert(lfd, FdState::Listener { listener: usize_to_u32(l_idx) }, Interest::READ);
-            poller.add(listener.borrowed_fd(), raw_fd_to_u64(lfd), true, false)?;
-            listeners.push(listener);
+            for mut listener in listeners_for(worker_id, listen.addr, usize_to_u32(proxy_idx))? {
+                listener.maxconn = listen.maxconn;
+                let l_idx = listeners.len();
+                let lfd = listener.raw_fd();
+                fdtab.insert(lfd, FdState::Listener { listener: usize_to_u32(l_idx) }, Interest::READ);
+                poller.add(listener.borrowed_fd(), raw_fd_to_u64(lfd), true, false)?;
+                listeners.push(listener);
+            }
             proxy_idx += 1;
         }
         for backend in &config.backends {
@@ -1162,14 +1183,16 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     poller.add(ql.borrowed_fd(), raw_fd_to_u64(lfd), true, false)?;
                     quic_listeners.push(ql);
                 } else {
-                    let mut listener = Listener::bind(bind_addr, 128, usize_to_u32(proxy_idx))?;
-                    listener.maxconn = frontend.maxconn;
-                    listener.tls = bind_tls(frontend, bind_addr)?;
-                    let l_idx = listeners.len();
-                    let lfd = listener.raw_fd();
-                    fdtab.insert(lfd, FdState::Listener { listener: usize_to_u32(l_idx) }, Interest::READ);
-                    poller.add(listener.borrowed_fd(), raw_fd_to_u64(lfd), true, false)?;
-                    listeners.push(listener);
+                    let tls = bind_tls(frontend, bind_addr)?;
+                    for mut listener in listeners_for(worker_id, bind_addr, usize_to_u32(proxy_idx))? {
+                        listener.maxconn = frontend.maxconn;
+                        listener.tls.clone_from(&tls);
+                        let l_idx = listeners.len();
+                        let lfd = listener.raw_fd();
+                        fdtab.insert(lfd, FdState::Listener { listener: usize_to_u32(l_idx) }, Interest::READ);
+                        poller.add(listener.borrowed_fd(), raw_fd_to_u64(lfd), true, false)?;
+                        listeners.push(listener);
+                    }
                 }
             }
             proxy_idx += 1;
@@ -1833,6 +1856,10 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             self.fdtab.remove(l.raw_fd());
             let _ = self.poller.delete(l.borrowed_fd());
         }
+        // The `_getsocks` registry holds duplicates of those sockets. Left in place they
+        // would keep each socket open -- and queueing connections -- after its listener
+        // is gone. By now the new process has taken what it needs.
+        crate::handover::withdraw_all();
         if let Some(cli) = self.cli_listener.take() {
             self.fdtab.remove(cli.as_raw_fd());
             let _ = self.poller.delete(cli.as_fd());

@@ -1059,4 +1059,18 @@ backend be_out
         assert_eq!(be_def.http_res_rules.len(), 1);
         assert_eq!(be_def.http_after_res_rules.len(), 1);
     }
+
+    #[test]
+    fn stats_socket_expose_fd_listeners_is_parsed_and_other_values_are_refused() {
+        let cfg = parse_str("global\n  stats socket /tmp/s.sock level admin expose-fd listeners\n")
+            .expect("parse");
+        assert!(cfg.global.expect("global").stats_socket_expose_fd);
+
+        let plain = parse_str("global\n  stats socket /tmp/s.sock level admin\n").expect("parse");
+        assert!(!plain.global.expect("global").stats_socket_expose_fd);
+
+        let err = parse_str("global\n  stats socket /tmp/s.sock expose-fd everything\n")
+            .expect_err("only 'listeners' exists");
+        assert!(err.message.contains("expose-fd"), "{}", err.message);
+    }
 }

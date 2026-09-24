@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! Soft stop, as HAProxy does it on `SIGUSR1` (`src/haproxy.c:2609`, `sig_soft_stop`):
+//! Soft stop, as `HAProxy` does it on `SIGUSR1` (`src/haproxy.c:2609`, `sig_soft_stop`):
 //! stop accepting, let what is in flight finish, then exit.
 //!
 //! These drive the real binary rather than an in-process `Engine`, because what is under
@@ -180,7 +180,7 @@ fn hard_stop_after_bounds_a_soft_stop() {
     );
 }
 
-/// A keep-alive client that is idle between requests is not work in flight. HAProxy closes
+/// A keep-alive client that is idle between requests is not work in flight. `HAProxy` closes
 /// it on soft stop; if it did not, every idle browser tab would hold the old process open
 /// until `timeout client`.
 #[test]

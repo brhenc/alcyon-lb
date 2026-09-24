@@ -173,6 +173,15 @@ impl CliApplet {
             self.out_buf.extend_from_slice(b"\n> ");
         } else if cmd == "quit" {
             self.is_done = true;
+        } else if cmd == "_getsocks" {
+            // Answered on the stream itself: the listening sockets travel as SCM_RIGHTS,
+            // which the buffered output path cannot carry. See crate::handover.
+            if let Some(stream) = self.stream.as_ref() {
+                if let Err(e) = crate::handover::serve_getsocks(stream) {
+                    self.out_buf.extend_from_slice(format!("{e}\n").as_bytes());
+                }
+            }
+            self.is_done = true;
         } else if let Some(rest) = cmd.strip_prefix("set timeout cli") {
             if let Ok(secs) = rest.trim().parse::<u32>() {
                 self.timeout_ms = secs.saturating_mul(1000);

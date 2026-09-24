@@ -32,6 +32,7 @@ pub mod xprt;
 pub mod stats_html;
 pub mod systemd;
 pub mod lifecycle;
+pub mod handover;
 
 pub use quic_listener::QuicListener;
 
