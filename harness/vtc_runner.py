@@ -1002,18 +1002,23 @@ class SyslogRunner:
     macros -- `${S_addr}` and `${S_port}` -- alongside the lowercase server ones.
     """
 
-    def __init__(self, syslog_id: str, macro_engine, expectations, repeat: int = 1,
+    def __init__(self, syslog_id: str, macro_engine, expectations, block: Optional[str] = None,
+                 barriers: Optional[Dict[str, asyncio.Barrier]] = None, repeat: int = 1,
                  level: Optional[str] = None, verbose: bool = False):
         self.syslog_id = syslog_id
         self.macro_engine = macro_engine
         self.expectations = expectations      # list of regex strings to match
+        self.block = block
+        self.barriers = barriers or {}
         self.repeat = repeat
         self.level = level
         self.verbose = verbose
         self.sock: Optional[socket.socket] = None
         self.port = 0
         self.received: List[str] = []
+        self._recv_idx = 0
         self._thread: Optional[threading.Thread] = None
+        self._task: Optional[asyncio.Task] = None
         self._stop = threading.Event()
 
     def initialize_socket(self) -> None:
@@ -1035,9 +1040,42 @@ class SyslogRunner:
                     continue
                 except OSError:
                     break
-                self.received.append(data.decode("utf-8", "replace"))
+                msg = data.decode("utf-8", "replace")
+                self.received.append(msg)
+                if self.verbose:
+                    print(f"     {Color.DIM}[syslog {self.syslog_id}] recv {msg.strip()}{Color.RESET}")
         self._thread = threading.Thread(target=loop, daemon=True)
         self._thread.start()
+        try:
+            loop_obj = asyncio.get_running_loop()
+            self._task = loop_obj.create_task(self._run_script())
+        except RuntimeError:
+            pass
+
+    async def _run_script(self) -> None:
+        if not self.block:
+            return
+        lines = [line.strip() for line in self.block.splitlines() if line.strip() and not line.strip().startswith("#")]
+        for line in lines:
+            if line.startswith("recv"):
+                while self._recv_idx >= len(self.received) and not self._stop.is_set():
+                    await asyncio.sleep(0.02)
+                if self._recv_idx < len(self.received):
+                    self._recv_idx += 1
+            elif line.startswith("expect ~"):
+                pass
+            elif line.startswith("barrier "):
+                parts = line.split()
+                if len(parts) >= 3 and parts[2] == "sync":
+                    b_id = parts[1]
+                    if b_id in self.barriers:
+                        if self.verbose:
+                            print(f"     {Color.DIM}[syslog {self.syslog_id}] barrier {b_id} sync{Color.RESET}")
+                        await self.barriers[b_id].wait()
+            elif line.startswith("delay "):
+                parts = line.split()
+                if len(parts) >= 2:
+                    await asyncio.sleep(float(parts[1]))
 
     async def wait(self, timeout: float = 5.0) -> None:
         """Waits until every expectation has matched, or the timeout expires.
@@ -1054,6 +1092,11 @@ class SyslogRunner:
         that is entirely the harness's doing. That is what made `server s2` in
         checks/redis-check.vtc look like an Ibex defect.
         """
+        if self._task:
+            try:
+                await asyncio.wait_for(asyncio.shield(self._task), timeout=timeout)
+            except asyncio.TimeoutError:
+                pass
         deadline = time.time() + timeout
         while time.time() < deadline:
             if self.unmatched() == []:
@@ -1079,10 +1122,13 @@ class SyslogRunner:
 
     def stop(self) -> None:
         self._stop.set()
+        if self._task and not self._task.done():
+            self._task.cancel()
         if self.sock:
             try:
                 self.sock.close()
             except OSError:
+                pass
                 pass
         if self._thread:
             self._thread.join(timeout=1.0)
@@ -1594,7 +1640,17 @@ class VtcExecutor:
                 if rest.startswith("~"):
                     pat = rest[1:].strip()
                     if (pat.startswith('"') and pat.endswith('"')) or (pat.startswith("'") and pat.endswith("'")):
+                        quote = pat[0]
                         pat = pat[1:-1]
+                        if quote == '"':
+                            pat = _unescape_vtc_string(pat)
+                    # The same three steps the syslog expectations need, for the same
+                    # reasons: varnishtest parses the string before the regex engine sees
+                    # it, `${testdir}` and friends are macros, and `[[:digit:]]` is a POSIX
+                    # bracket expression Python reads as a nested set -- which it does not
+                    # raise on, it just matches something else. Python says so itself:
+                    # "FutureWarning: Possible nested set at position 33".
+                    pat = _posix_classes_to_python(self.macro_engine.expand(pat))
                     if not re.search(pat, last_resp, re.MULTILINE):
                         raise AssertionError(f"CLI expect pattern {pat!r} failed to match: {last_resp!r}")
         writer.close()
@@ -1793,6 +1849,7 @@ class VtcExecutor:
                             expectations.append(pat)
 
                     runner = SyslogRunner(syslog_id, self.macro_engine, expectations,
+                                          block=block, barriers=self.barriers,
                                           repeat=repeat, level=level, verbose=self.verbose)
                     runner.initialize_socket()
                     self.syslogs[syslog_id] = runner
