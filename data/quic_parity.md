@@ -33,6 +33,32 @@ Evaluated using `tools/quic-differential/conformance.py` over genuine HTTP/3 ses
 > loop, verified by `crates/ibex-rt/tests/h3_end_to_end.rs`, which runs real `curl` and
 > asserts the backend received `GET /probe HTTP/1.1` with `Host:` derived from `:authority`.
 >
+> **MEASURED 2026-09-24: Ibex violates the RFC 9000 §8.1 anti-amplification limit.**
+> Section 4's duress table below is wrong and is superseded by this. Against a live Ibex
+> QUIC listener (`duress_target`), with the same probe, same host, same certificate:
+>
+> ```
+> HAProxy 3.5-dev7   1200 B sent -> 1490 B returned   1.242x   PASS
+>                    packets [1252, 238]
+> Ibex               1200 B sent -> 4167 B returned   3.472x   FAIL
+>                    packets [1200, 566, 1200, 1200]
+> ```
+>
+> Reproduced twice (3.472x, 3.476x). RFC 9000 §8.1 caps a server at **three times** what it
+> has received on an unvalidated path; exceeding it makes the proxy usable as a DDoS
+> reflector, since an attacker spoofing a victim's source address gets 3.47x amplification
+> for free. Runt-datagram discard (§14.1) is correct on both: 64 B, 500 B and 1199 B are all
+> dropped with zero bytes returned.
+>
+> The probe was sound all along. Section 4 reported both columns as `1.242x` because both
+> columns were HAProxy — nothing had ever pointed it at Ibex, because until today Ibex had
+> no working QUIC listener to point it at.
+>
+> Cause not yet established. `crates/ibex-quic` contains no amplification accounting of its
+> own, so the budget is `quinn-proto`'s to enforce and it does implement it; the packet
+> pattern (three 1200-byte datagrams) suggests retransmission of a padded Initial rather
+> than a single oversized flight. That is a diagnosis to make, not to assume.
+
 > **What is still not measured.** The rows marked *not measured* below were never tested
 > against the Ibex daemon; the transport-level entries come from
 > `crates/ibex-quic/tests/quic_transport_tests.rs`, which exercises `quinn-proto` through the
