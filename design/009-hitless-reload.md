@@ -61,3 +61,56 @@ Ibex is a single-process Rust binary with an async scheduler. It does not carry 
   4. Only after safely binding the FDs does the new process send `SIGUSR1` to the old process to trigger a soft stop.
 
 This reaches HAProxy's exact behavioral guarantees without imitating its structural legacy.
+
+## Part 4 — As implemented (`eaddcd6`, `ed51cb9`, and the SIGUSR2 commit after them)
+
+Parts 1 and 2 above were implemented as written. Part 3's workflow was not, because it
+cannot work under systemd:
+
+> 1. Systemd spawns a *new* Ibex process.
+
+`ExecReload` commands must exit, so a process started by one cannot become the server; and
+under `Type=notify`, when the main PID exits with no successor named, systemd treats the
+service as failed. That is the exact failure the "haproxy-systemd-wrapper" history in
+`doc/internals/mworker.md` describes. HAProxy solves it with a master whose PID never
+changes. Ibex has no master and cannot re-exec in place without discarding every
+in-flight session, so the serving PID *must* change on reload. What makes that safe:
+
+- **The running process starts its successor**, on `SIGUSR2` (`-W` / `-Ws`), with the same
+  arguments plus `-x <private socket> -sf <own pid>`. The unit file is HAProxy's:
+  `ExecReload=... -c` then `ExecReload=/bin/kill -USR2 $MAINPID`.
+- **The successor's `-sf` is the success signal.** It is only sent once every worker is
+  listening. On receiving it, the old process sends `MAINPID=<new>` / `READY=1` itself --
+  it is still the main PID at that moment, so this works under the default
+  `NotifyAccess=main` -- and only then drains.
+- **The old process must not send `STOPPING=1` while handing over.** It is still the main
+  PID when it begins to drain, and systemd would read that as the service stopping in the
+  middle of a reload.
+- **A successor that exits instead is a failed reload**: `READY=1` / `STATUS=Reload failed!`,
+  and the old process goes on serving. Its pidfile is only written after takeover, so it
+  keeps naming the process that is actually serving.
+- **The handover socket is private**: a fresh 0700 directory, not the stats socket, so a
+  SIGUSR2 reload needs no `expose-fd listeners` and nothing else on the host can connect
+  and take the listeners.
+
+`-x` against an operator-managed stats socket with `expose-fd listeners` also works, for
+reloads done by hand as `ibex -f cfg -x <sock> -sf <pid>`.
+
+### Not done
+
+- **QUIC.** Listeners are not handed over and QUIC connections are not drained: a QUIC
+  connection lives on the listening UDP socket, so sharing it between two processes would
+  deliver each one's datagrams to the other. HTTP/3 connections are cut at reload.
+- **HTTP/2 soft stop** does not send GOAWAY; H2 sessions drain until `hard-stop-after`.
+- **`SIGTTOU`/`SIGTTIN`** (pause/resume listeners) are not handled.
+
+### Evidence
+
+`crates/ibex-rt/tests/soft_stop.rs` and `tests/reload.rs` drive the real binary.
+`harness/systemd_reload.sh` drives `admin/systemd/ibex.service` through `systemctl --user`
+under continuous load: three reloads, a reload onto a broken config (refused, `MainPID`
+unchanged, `Reload failed!`), a recovering reload, and a stop. Four runs, 27,002 requests,
+one failure; 40 SIGUSR2 reloads without systemd, 21,743 requests, none. The one failure was
+a response whose body arrived without its status line or headers -- not reproduced since,
+and nothing in the handover can drop bytes from an established connection, so it is
+recorded here as an open observation in the response path rather than as explained.

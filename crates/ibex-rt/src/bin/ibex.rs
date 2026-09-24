@@ -10,6 +10,7 @@
 use ibex_rt::Engine;
 use rustix::process::{kill_process, Pid, Resource, Rlimit, setrlimit, Signal};
 use std::env;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process;
 
@@ -57,8 +58,8 @@ fn print_help(program: &str) {
     println!("        -dM[<byte>,help,...] debug memory pools");
     println!("        -V enters verbose mode (disables quiet mode)");
     println!("        -D goes daemon ; -C changes to <dir> before loading files.");
-    println!("        -W master-worker mode.");
-    println!("        -Ws master-worker mode with systemd notify support.");
+    println!("        -W reload on SIGUSR2, handing listening sockets to the new process.");
+    println!("        -Ws as -W, with systemd notify support (Type=notify).");
     println!("        -x <unix_socket> get listening sockets from a unix socket");
     println!("        -q quiet mode : don't display messages");
     println!("        -c check mode : only check config files and exit");
@@ -538,6 +539,12 @@ fn handle_pid_file(pid_path: &Path) {
 fn main() {
     let raw_args: Vec<String> = env::args().collect();
     let (program, opts) = parse_cli_args(&raw_args);
+    // A reload restarts this binary with these same arguments; relative paths in them are
+    // relative to where it was started, not to wherever `-C` moved it.
+    let start_dir = std::env::current_dir().ok();
+    // Set by the process that started this one to take over from it (see `Reload`).
+    let reload_child = std::env::var_os("IBEX_RELOAD_CHILD").is_some();
+    std::env::remove_var("IBEX_RELOAD_CHILD");
 
     // 1. Change working directory if requested via -C <dir>
     if let Some(ref dir) = opts.change_dir {
@@ -626,9 +633,13 @@ fn main() {
     }
 
 
-    // 8. Write PID file if requested (-p <pidfile>)
+    // 8. Write PID file if requested (-p <pidfile>). A process started by a reload waits
+    //    until it has taken over: if its configuration fails to load, the pidfile must go
+    //    on naming the process that is still serving.
     if let Some(ref pidfile) = opts.pid_file {
-        handle_pid_file(pidfile);
+        if !reload_child {
+            handle_pid_file(pidfile);
+        }
     }
 
     // 9. Handle check-only syntax validation (-c)
@@ -663,6 +674,7 @@ fn main() {
 
     // 11. SIGUSR1 is the soft stop, as in HAProxy. Installed before any listener exists,
     //     so there is no moment where this process is serving and the signal is fatal.
+    ibex_rt::systemd::init();
     let lifecycle = ibex_rt::lifecycle::Lifecycle::new();
     if let Err(e) = lifecycle.install_signal_handlers() {
         eprintln!("Failed to install signal handlers: {e}");
@@ -691,7 +703,7 @@ fn main() {
     // 12b. Hitless reload: take the listening sockets over from the old process rather
     //      than binding new ones, so the connections already queued on them survive it
     //      exiting. See crates/ibex-rt/src/handover.rs.
-    if config.global.as_ref().is_some_and(|g| g.stats_socket_expose_fd) {
+    if opts.master_worker || config.global.as_ref().is_some_and(|g| g.stats_socket_expose_fd) {
         ibex_rt::handover::enable_expose();
     }
     if let Some(ref old) = opts.old_socket {
@@ -778,7 +790,15 @@ fn main() {
     if !opts.st_pids.is_empty() {
         send_signals_to_pids(&opts.st_pids, Signal::Term, opts.quiet);
     }
-    if opts.systemd_notify {
+    if reload_child {
+        if let Some(ref pidfile) = opts.pid_file {
+            handle_pid_file(pidfile);
+        }
+    }
+    // A reload child does not announce itself: it is not systemd's main PID yet, and under
+    // the default `NotifyAccess=main` systemd would drop the message. The process it
+    // replaces names it with `MAINPID=` instead (see `supervise`).
+    if opts.systemd_notify && !reload_child {
         // crates/ibex-rt/src/systemd.rs, not a local copy: `Path` cannot address the
         // abstract socket systemd hands out as `@name`, and the module sends the full
         // READY=1/MAINPID/STATUS message HAProxy does (src/cli.c:3087).
@@ -787,6 +807,193 @@ fn main() {
         }
     }
 
+    let respawn = Respawn { args: raw_args[1..].to_vec(), dir: start_dir };
+    supervise(threads, &lifecycle, opts.master_worker, &respawn, opts.quiet);
+}
+
+/// How to start the process that replaces this one on reload.
+struct Respawn {
+    args: Vec<String>,
+    dir: Option<PathBuf>,
+}
+
+impl Respawn {
+    /// The same arguments, less the ones that described *this* start: which process to take
+    /// over from, which to stop, and `-D` -- this process is already detached, and a
+    /// daemonising child would exit at once, which the supervisor would read as a failed
+    /// reload.
+    fn child_args(&self, sock: &Path) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < self.args.len() {
+            match self.args[i].as_str() {
+                "-x" => i += 2,
+                "-sf" | "-st" => {
+                    i += 1;
+                    while i < self.args.len() && !self.args[i].starts_with('-') {
+                        i += 1;
+                    }
+                }
+                "-D" => i += 1,
+                a => {
+                    out.push(a.to_string());
+                    i += 1;
+                }
+            }
+        }
+        out.extend([
+            "-x".to_string(),
+            sock.display().to_string(),
+            "-sf".to_string(),
+            process::id().to_string(),
+        ]);
+        out
+    }
+
+    /// The binary to run. `/proc/self/exe` still names this binary after it has been
+    /// replaced on disk, with " (deleted)" appended; the path without that suffix is the
+    /// upgraded binary, which is what a reload after an upgrade should run.
+    fn exe() -> io::Result<PathBuf> {
+        let exe = std::env::current_exe()?;
+        let text = exe.to_string_lossy();
+        Ok(text.strip_suffix(" (deleted)").map_or(exe.clone(), PathBuf::from))
+    }
+}
+
+/// One reload in progress: the new process, and the private socket it takes our listening
+/// sockets from.
+///
+/// The socket lives in a fresh 0700 directory rather than the stats socket's path, so a
+/// SIGUSR2 reload needs no `expose-fd listeners` in the configuration, and nothing else on
+/// the host can connect to it and walk off with the listeners.
+struct Reload {
+    child: std::process::Child,
+    listener: std::os::unix::net::UnixListener,
+    dir: PathBuf,
+    served: bool,
+}
+
+impl Reload {
+    fn start(respawn: &Respawn) -> io::Result<Self> {
+        use std::os::unix::fs::DirBuilderExt;
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("ibex-reload-{}-{seq}", process::id()));
+        std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+        let sock = dir.join("s");
+        let listener = std::os::unix::net::UnixListener::bind(&sock)?;
+        listener.set_nonblocking(true)?;
+
+        let mut cmd = std::process::Command::new(Respawn::exe()?);
+        cmd.args(respawn.child_args(&sock)).env("IBEX_RELOAD_CHILD", "1");
+        if let Some(ref d) = respawn.dir {
+            cmd.current_dir(d);
+        }
+        if let Some(n) = ibex_rt::systemd::notify_socket_env() {
+            cmd.env("NOTIFY_SOCKET", n);
+        }
+        let child = cmd.spawn()?;
+        Ok(Self { child, listener, dir, served: false })
+    }
+
+    /// Answers the new process's `_getsocks`, once, if it has connected.
+    fn serve_pending(&mut self) {
+        if self.served {
+            return;
+        }
+        let Ok((stream, _)) = self.listener.accept() else { return };
+        self.served = true;
+        let _ = stream.set_nonblocking(false);
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+        let mut line = Vec::new();
+        let mut byte = [0u8; 1];
+        while let Ok(1) = io::Read::read(&mut &stream, &mut byte) {
+            if byte[0] == b'\n' {
+                break;
+            }
+            line.push(byte[0]);
+        }
+        if line != b"_getsocks" {
+            return;
+        }
+        if let Err(e) = ibex_rt::handover::serve_getsocks(&stream) {
+            eprintln!("[ALERT] could not hand the listening sockets over: {e}");
+        }
+    }
+}
+
+impl Drop for Reload {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// The main thread, once the workers are running: waits for them, and carries out
+/// SIGUSR2 reloads under `-W` / `-Ws`.
+///
+/// A reload starts a new process on the same arguments. It loads its configuration, takes
+/// the listening sockets over from us, and once it is listening sends us `-sf`. That
+/// SIGUSR1 is how we know it succeeded: we name it systemd's main PID and soft-stop. If it
+/// exits instead, the reload failed -- systemd is told so, and we go on serving, which is
+/// the property HAProxy's master-worker mode exists to provide.
+fn supervise(
+    threads: Vec<std::thread::JoinHandle<()>>,
+    lifecycle: &ibex_rt::lifecycle::Lifecycle,
+    reloadable: bool,
+    respawn: &Respawn,
+    quiet: bool,
+) -> ! {
+    let mut reload: Option<Reload> = None;
+    let mut handed_over = false;
+    loop {
+        if lifecycle.take_reload_request() {
+            if !reloadable {
+                if !quiet {
+                    eprintln!("[NOTICE] SIGUSR2 ignored: reloading on SIGUSR2 needs -W or -Ws");
+                }
+            } else if reload.is_none() && !lifecycle.soft_stop_requested() {
+                ibex_rt::systemd::notify_reloading();
+                ibex_rt::systemd::set_handing_over(true);
+                match Reload::start(respawn) {
+                    Ok(r) => reload = Some(r),
+                    Err(e) => {
+                        eprintln!("[ALERT] reload failed to start a new process: {e}");
+                        ibex_rt::systemd::set_handing_over(false);
+                        let _ = ibex_rt::systemd::notify_reload_failed();
+                    }
+                }
+            }
+        }
+
+        if let Some(r) = reload.as_mut() {
+            r.serve_pending();
+            if !handed_over {
+                if let Ok(Some(st)) = r.child.try_wait() {
+                    eprintln!(
+                        "[ALERT] reload failed: the new process exited ({st}) before taking over; \
+                         still serving on the previous configuration"
+                    );
+                    ibex_rt::systemd::set_handing_over(false);
+                    let _ = ibex_rt::systemd::notify_reload_failed();
+                    reload = None;
+                }
+            }
+        }
+
+        // Checked before the workers are, so that a process with nothing to drain -- whose
+        // workers may be finished by the time we look -- still names its successor first.
+        if !handed_over && lifecycle.soft_stop_requested() {
+            handed_over = true;
+            if let Some(r) = reload.as_ref() {
+                ibex_rt::systemd::notify_handover(r.child.id());
+            }
+        }
+
+        if threads.iter().all(std::thread::JoinHandle::is_finished) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
     for t in threads {
         let _ = t.join();
     }

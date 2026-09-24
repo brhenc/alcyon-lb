@@ -94,6 +94,15 @@ impl Proc {
         let pid = Pid::from_raw(i32::try_from(self.pid()).expect("pid")).expect("pid");
         let _ = kill_process(pid, sig);
     }
+
+    /// Soft-stops the process and waits for it. Tests end this way rather than with
+    /// SIGKILL: a killed process never writes its coverage profile, so everything it ran
+    /// -- including the socket adoption only the *new* process performs -- would count
+    /// as untested.
+    fn stop(&mut self) {
+        self.signal(Signal::Usr1);
+        let _ = self.wait_exit(Duration::from_secs(5));
+    }
 }
 
 impl Drop for Proc {
@@ -144,7 +153,7 @@ fn a_graceful_reload_keeps_the_port_and_the_stats_socket() {
     let old_info = cli(&sock, "show info").expect("old CLI answers");
     assert!(old_info.contains(&format!("Pid: {}", old.pid())), "{old_info}");
 
-    let new = Proc::start(cfg.path(), &["-sf".into(), old.pid().to_string()]);
+    let mut new = Proc::start(cfg.path(), &["-sf".into(), old.pid().to_string()]);
     let st = old.wait_exit(Duration::from_secs(5));
     assert!(
         st.is_some_and(|s| s.success()),
@@ -159,7 +168,7 @@ fn a_graceful_reload_keeps_the_port_and_the_stats_socket() {
          got {info:?}"
     );
     let _ = std::fs::remove_file(&sock);
-    new.signal(Signal::Kill);
+    new.stop();
 }
 
 /// A backend that holds `/hold` for `hold`, and answers everything else at once.
@@ -248,7 +257,7 @@ fn a_reload_with_x_keeps_the_connections_queued_on_the_old_socket() {
         "the setup is wrong: the old process is serving connections it should be too full to accept"
     );
 
-    let new = Proc::start(
+    let mut new = Proc::start(
         cfg.path(),
         &["-x".into(), sock.display().to_string(), "-sf".into(), old.pid().to_string()],
     );
@@ -268,7 +277,7 @@ fn a_reload_with_x_keeps_the_connections_queued_on_the_old_socket() {
     assert!(st.is_some_and(|s| s.success()), "old process: {st:?}");
 
     let _ = std::fs::remove_file(&sock);
-    new.signal(Signal::Kill);
+    new.stop();
 }
 
 /// When the sockets cannot be taken over, the new process must refuse to start rather
@@ -302,4 +311,178 @@ fn x_against_a_process_that_does_not_expose_its_sockets_leaves_it_serving() {
     let resp = read_all(&mut c, Duration::from_secs(3));
     assert!(resp.starts_with("HTTP/1.1 200"), "old process must still serve: {resp:?}");
     let _ = std::fs::remove_file(&sock);
+    old.stop();
+}
+
+/// Collects `sd_notify` datagrams the way systemd would receive them.
+struct NotifySink {
+    sock: std::os::unix::net::UnixDatagram,
+    path: PathBuf,
+    seen: Vec<String>,
+}
+
+impl NotifySink {
+    fn new(tag: &str) -> Self {
+        let path = PathBuf::from(format!("/tmp/ibex-rl-{}-{tag}.ntf", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let sock = std::os::unix::net::UnixDatagram::bind(&path).expect("bind notify");
+        sock.set_read_timeout(Some(Duration::from_millis(200))).expect("timeout");
+        Self { sock, path, seen: Vec::new() }
+    }
+
+    /// Waits for a datagram containing `needle`; returns it.
+    fn wait_for(&mut self, needle: &str, within: Duration) -> Option<String> {
+        self.wait_until(|m| m.contains(needle), within)
+    }
+
+    /// Waits for a datagram satisfying `pred`; returns it.
+    fn wait_until(&mut self, pred: impl Fn(&str) -> bool, within: Duration) -> Option<String> {
+        let deadline = Instant::now() + within;
+        loop {
+            if let Some(m) = self.seen.iter().find(|m| pred(m)) {
+                return Some(m.clone());
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            let mut buf = [0u8; 4096];
+            if let Ok(n) = self.sock.recv(&mut buf) {
+                self.seen.push(String::from_utf8_lossy(&buf[..n]).into_owned());
+            }
+        }
+    }
+}
+
+impl Drop for NotifySink {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn mainpid(msg: &str) -> Option<u32> {
+    msg.lines().find_map(|l| l.strip_prefix("MAINPID=")).and_then(|p| p.parse().ok())
+}
+
+/// Soft-stops a process this test did not spawn (the one a reload started), and waits for
+/// it to go. See `Proc::stop` for why not SIGKILL.
+fn stop_pid(pid: u32) {
+    let Some(p) = Pid::from_raw(i32::try_from(pid).unwrap_or(0)) else { return };
+    let _ = kill_process(p, Signal::Usr1);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while rustix::process::test_kill_process(p).is_ok() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    let _ = kill_process(p, Signal::Kill);
+}
+
+fn start_notified(cfg: &Path, sink: &NotifySink) -> Proc {
+    let child = Command::new(env!("CARGO_BIN_EXE_ibex"))
+        .arg("-Ws")
+        .arg("-f")
+        .arg(cfg)
+        .env("NOTIFY_SOCKET", &sink.path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn ibex");
+    Proc { child }
+}
+
+/// `systemctl reload` with `HAProxy`'s own unit file is `kill -USR2 $MAINPID`
+/// (`admin/systemd/haproxy.service.in`). `SIGUSR2` had no handler, so the default action
+/// terminated the service: a reload was a crash, and `Restart=always` brought it back cold.
+///
+/// Ibex has no separate master process to keep the PID stable, so the serving PID changes
+/// on reload. The old process -- still systemd's main PID, so this works under the default
+/// `NotifyAccess=main` -- announces the new one with `MAINPID=` before it starts to stop.
+#[test]
+fn sigusr2_reloads_and_hands_the_main_pid_to_the_new_process() {
+    let be = backend();
+    let fe = free_addr();
+    let sock = short_sock("usr2");
+    let cfg = write_cfg(&config(fe, be, &sock, ""));
+    let mut sink = NotifySink::new("usr2");
+
+    let mut old = start_notified(cfg.path(), &sink);
+    let ready = sink.wait_for("READY=1", Duration::from_secs(5)).expect("initial READY=1");
+    assert_eq!(mainpid(&ready), Some(old.pid()), "{ready:?}");
+    wait_listening(fe);
+
+    old.signal(Signal::Usr2);
+
+    assert!(
+        sink.wait_for("RELOADING=1", Duration::from_secs(3)).is_some(),
+        "a reload must announce RELOADING=1; got {:?}",
+        sink.seen
+    );
+    let old_pid = old.pid();
+    let handed = sink.wait_until(
+        |m| m.contains("READY=1") && mainpid(m).is_some_and(|p| p != old_pid),
+        Duration::from_secs(5),
+    );
+    let new_pid = handed
+        .as_deref()
+        .and_then(mainpid)
+        .unwrap_or_else(|| panic!("no MAINPID handover to a new process; saw {:?}", sink.seen));
+
+    let st = old.wait_exit(Duration::from_secs(5));
+    assert!(
+        st.is_some_and(|s| s.success()),
+        "the old process must hand over, drain and exit cleanly; got {st:?}"
+    );
+    // Drain anything still in flight, then check the old process never said STOPPING=1.
+    // It is systemd's main PID when it begins to drain, so systemd would read that as the
+    // service going down in the middle of the reload.
+    let _ = sink.wait_for("never-sent", Duration::from_millis(300));
+    assert!(
+        !sink.seen.iter().any(|m| m.contains("STOPPING=1")),
+        "a reload must not announce STOPPING=1; saw {:?}",
+        sink.seen
+    );
+
+    wait_listening(fe);
+    let info = cli(&sock, "show info");
+    assert!(
+        info.as_deref().is_some_and(|i| i.contains(&format!("Pid: {new_pid}"))),
+        "the process named in MAINPID must be the one serving; got {info:?}"
+    );
+    stop_pid(new_pid);
+    let _ = std::fs::remove_file(&sock);
+}
+
+/// `HAProxy`'s property that makes reloads safe to automate: a new configuration that does
+/// not load leaves the running one serving (`doc/internals/mworker.md`, V3). systemd is
+/// told the reload failed, and nothing else changes.
+#[test]
+fn a_reload_with_a_broken_config_leaves_the_old_process_serving() {
+    let be = backend();
+    let fe = free_addr();
+    let sock = short_sock("usr2bad");
+    let mut cfg = write_cfg(&config(fe, be, &sock, ""));
+    let mut sink = NotifySink::new("usr2bad");
+
+    let mut old = start_notified(cfg.path(), &sink);
+    sink.wait_for("READY=1", Duration::from_secs(5)).expect("initial READY=1");
+    wait_listening(fe);
+
+    cfg.as_file_mut().set_len(0).expect("truncate");
+    cfg.write_all(b"frontend fe\n  this-is-not-a-keyword\n").expect("break cfg");
+    cfg.flush().expect("flush");
+
+    old.signal(Signal::Usr2);
+    assert!(
+        sink.wait_for("Reload failed", Duration::from_secs(5)).is_some(),
+        "systemd must be told the reload failed; saw {:?}",
+        sink.seen
+    );
+    assert!(
+        old.wait_exit(Duration::from_millis(500)).is_none(),
+        "a failed reload must not stop the running process"
+    );
+    let mut c = TcpStream::connect(fe).expect("still accepting");
+    c.write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").expect("send");
+    let resp = read_all(&mut c, Duration::from_secs(3));
+    assert!(resp.starts_with("HTTP/1.1 200"), "old process must still serve: {resp:?}");
+    let _ = std::fs::remove_file(&sock);
+    old.stop();
 }

@@ -14,7 +14,7 @@ ibex-tls = { path = "../ibex-tls" }
 ibex-alloc = { workspace = true }
 rustls = { workspace = true }
 ibex-stick-table = { path = "../ibex-stick-table" }
-rustix = { version = "0.38", features = ["event", "net", "fs", "process", "std"] }
+rustix = { version = "0.38", features = ["event", "net", "fs", "process", "std", "time"] }
 ibex-mmsg = { path = "../ibex-mmsg" }
 ibex-quic = { path = "../ibex-quic" }
 ctrlc = "3.5.2"

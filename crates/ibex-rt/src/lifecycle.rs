@@ -20,6 +20,7 @@ use std::sync::Arc;
 #[derive(Clone, Debug, Default)]
 pub struct Lifecycle {
     soft_stop: Arc<AtomicBool>,
+    reload: Arc<AtomicBool>,
 }
 
 impl Lifecycle {
@@ -35,12 +36,22 @@ impl Lifecycle {
     /// Propagates a failure to register the handler.
     pub fn install_signal_handlers(&self) -> io::Result<()> {
         signal_hook::flag::register(signal_hook::consts::SIGUSR1, Arc::clone(&self.soft_stop))?;
+        // HAProxy ignores SIGUSR2 in standalone mode (`src/haproxy.c:2606`) and reloads on it
+        // in master-worker mode; with a handler registered it is never fatal, and the binary
+        // acts on it only under `-W` / `-Ws`.
+        signal_hook::flag::register(signal_hook::consts::SIGUSR2, Arc::clone(&self.reload))?;
         Ok(())
     }
 
     /// Requests a soft stop, as `SIGUSR1` would.
     pub fn request_soft_stop(&self) {
         self.soft_stop.store(true, Ordering::Relaxed);
+    }
+
+    /// Consumes a pending reload request (`SIGUSR2`), if there is one.
+    #[must_use]
+    pub fn take_reload_request(&self) -> bool {
+        self.reload.swap(false, Ordering::Relaxed)
     }
 
     /// Whether a soft stop has been requested.
