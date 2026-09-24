@@ -2767,12 +2767,19 @@ impl Registry {
             name: "be_sort",
             in_type: TypeSpec::Exact(SampleType::Bin),
             out_type: TypeSpec::Exact(SampleType::Bin),
-            func: |smp, _args| match smp {
-                Sample::Bin(mut b) => {
-                    b.sort_unstable();
-                    Some(Sample::Bin(b))
+            func: |smp, args| {
+                let size = args.first().and_then(|s| s.parse::<usize>().ok()).unwrap_or(1);
+                match smp {
+                    Sample::Bin(b) => {
+                        if size == 0 || b.len() % size != 0 {
+                            return None;
+                        }
+                        let mut chunks: Vec<Vec<u8>> = b.chunks_exact(size).map(|c| c.to_vec()).collect();
+                        chunks.sort_unstable();
+                        Some(Sample::Bin(chunks.into_iter().flatten().collect()))
+                    }
+                    _ => None,
                 }
-                _ => None,
             },
         });
 

@@ -190,7 +190,7 @@ async def parse_http_request(reader: asyncio.StreamReader) -> Optional[HttpReque
         if not line or ":" not in line:
             continue
         k, v = line.split(":", 1)
-        headers.append((k.strip(), v.strip()))
+        headers.append((k.strip(), v.lstrip(" \t")))
 
     req = HttpRequest(method=method, url=url, proto=proto, headers=headers)
 
@@ -259,7 +259,7 @@ async def parse_http_response(reader: asyncio.StreamReader, req_method: str = "G
         if not line or ":" not in line:
             continue
         k, v = line.split(":", 1)
-        headers.append((k.strip(), v.strip()))
+        headers.append((k.strip(), v.lstrip(" \t")))
 
     resp = HttpResponse(status=status, reason=reason, proto=proto, headers=headers)
 
@@ -1227,7 +1227,7 @@ class MockServerRunner:
                                 hdr_line = args[idx]
                                 if ":" in hdr_line:
                                     hk, hv = hdr_line.split(":", 1)
-                                    headers.append((hk.strip(), hv.strip()))
+                                    headers.append((hk.strip(), hv.lstrip(" \t")))
                             elif opt == "-body" and idx + 1 < len(args):
                                 idx += 1
                                 body = args[idx]
@@ -1417,7 +1417,7 @@ class MockClientRunner:
                                 hdr_line = args[idx]
                                 if ":" in hdr_line:
                                     hk, hv = hdr_line.split(":", 1)
-                                    headers.append((hk.strip(), hv.strip()))
+                                    headers.append((hk.strip(), hv.lstrip(" \t")))
                             elif opt == "-body" and idx + 1 < len(args):
                                 idx += 1
                                 body = args[idx]
