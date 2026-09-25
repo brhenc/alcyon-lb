@@ -646,6 +646,29 @@ fn parse_request_line_borrowed(line: &str) -> io::Result<(&str, &str, &str)> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Missing HTTP URI"))?;
     let version_str = parts.next().unwrap_or("HTTP/1.1");
 
+    // Request-target forms (RFC 9112 section 3.2), as HAProxy's H1 parser enforces them
+    // (`reg-tests/http-messaging/h1_request_target_validation.vtc`): origin-form `/...`,
+    // absolute-form `scheme://authority...` with any scheme, asterisk-form only for
+    // OPTIONS, authority-form `host:port` only for CONNECT.
+    let absolute_form = |u: &str| {
+        u.split_once("://").is_some_and(|(scheme, rest)| {
+            scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+                && scheme
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+                && !rest.is_empty()
+        })
+    };
+    let is_valid = match method_str {
+        "CONNECT" => !uri.starts_with('/') && !uri.contains("://") && uri.contains(':'),
+        "OPTIONS" => uri == "*" || uri.starts_with('/') || absolute_form(uri),
+        _ => uri.starts_with('/') || absolute_form(uri),
+    };
+
+    if !is_valid {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid request target"));
+    }
+
     Ok((method_str, uri, version_str))
 }
 
@@ -794,5 +817,33 @@ mod tests {
         let hdrs: Vec<_> = htx.as_ref().headers().filter(|(k, _)| k.eq_ignore_ascii_case("content-length")).collect();
         assert_eq!(hdrs.len(), 1);
         assert_eq!(hdrs[0].1, "11");
+    }
+}
+
+#[cfg(test)]
+mod request_target_tests {
+    use super::parse_request_line_borrowed;
+
+    #[test]
+    fn test_request_target_validation() {
+        // Valid
+        assert!(parse_request_line_borrowed("OPTIONS * HTTP/1.1").is_ok());
+        assert!(parse_request_line_borrowed("GET / HTTP/1.1").is_ok());
+        assert!(parse_request_line_borrowed("GET http://haproxy.org/ HTTP/1.1").is_ok());
+        assert!(parse_request_line_borrowed("CONNECT haproxy.org:80 HTTP/1.1").is_ok());
+        // HAProxy accepts any scheme, in any case, in absolute-form.
+        assert!(parse_request_line_borrowed("GET ftp://h/x HTTP/1.1").is_ok());
+        assert!(parse_request_line_borrowed("GET HTTP://h/x HTTP/1.1").is_ok());
+        assert!(parse_request_line_borrowed("GET http:// HTTP/1.1").is_err());
+
+        // Invalid
+        assert!(parse_request_line_borrowed("OPTIONS */test HTTP/1.1").is_err());
+        assert!(parse_request_line_borrowed("GET * HTTP/1.1").is_err());
+        assert!(parse_request_line_borrowed("CONNECT haproxy.org HTTP/1.1").is_err());
+        assert!(parse_request_line_borrowed("CONNECT / HTTP/1.1").is_err());
+        assert!(parse_request_line_borrowed("CONNECT http://haproxy.org:80 HTTP/1.1").is_err());
+        assert!(parse_request_line_borrowed("GET haproxy.org:80 HTTP/1.1").is_err());
+        assert!(parse_request_line_borrowed("GET admin HTTP/1.1").is_err());
+        assert!(parse_request_line_borrowed("GET admin/a/b HTTP/1.1").is_err());
     }
 }
