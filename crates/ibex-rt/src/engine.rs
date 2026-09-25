@@ -2821,6 +2821,9 @@ fn init_client_session(
     // Use per-engine values rather than the global `BUFSIZE_STANDARD` atomic so that
     // multiple Engine instances running in the same process (e.g. parallel tests) do not
     // race each other's configuration.
+    // The engine applies `http-response` rules; hold responses until it has (see
+    // `TcpSession::resp_released`).
+    sess.resp_released = mode != Mode::Http;
     sess.bufsize = global_bufsize;
     sess.maxrewrite = proxies[proxy_idx]
         .stats_config
@@ -3681,8 +3684,18 @@ impl EngineDispatcher<'_> {
                     }
                     entry.response_rules_applied = false;
                     entry.sess.resp_headers_processed = false;
+                    entry.sess.resp_length_known = false;
+                    entry.sess.resp_released = false;
+                    entry.sess.resp_status = 0;
                     if backend_finished {
                         entry.sess.srv_state = ScState::Init;
+                    } else {
+                        // A kept backend connection waits for the next response's headers,
+                        // which is what `Ready` means on the server side. Left `Established`,
+                        // the next response bypassed both places that apply response rules
+                        // (Step 2.5 and `process_srv_active`), so only the first response on
+                        // a connection ever had its rules applied.
+                        entry.sess.srv_state = ScState::Ready;
                     }
                     entry.sess.srv_connection_close = false;
                     entry.sess.is_first_req = false;
@@ -3693,6 +3706,11 @@ impl EngineDispatcher<'_> {
                     entry.sess.h2_active_stream_id = None;
                     entry.sess.cli_state = ScState::Ready;
                     entry.sess.req_vars.clear();
+                    // Run once more straight away. The next request may already have
+                    // arrived while this one was finishing; its readiness was recorded
+                    // then, and the poller will not report it again, so without this the
+                    // session sat idle until `timeout client` with a request waiting.
+                    self.wake_queue.push(entry.task);
                     if !self.proxies[entry.proxy_idx].tcp_req_content_rules.is_empty() {
                         let _ = eval_tcp_req_content_rules(
                             &self.proxies[entry.proxy_idx],
@@ -3798,6 +3816,7 @@ impl EngineDispatcher<'_> {
         let Some((hdr_len, eoh_len)) = crate::proxy::find_eoh(entry.sess.rep.readable()) else {
             if entry.sess.rep.readable().len() > threshold {
                 entry.response_rules_applied = true;
+                entry.sess.resp_released = true;
                 entry.sess.rep.clear();
                 entry.sess.send_synthetic_response(502, Some("text/html"), None);
                 entry.sess.srv_state = ScState::Closed;
@@ -3808,6 +3827,7 @@ impl EngineDispatcher<'_> {
             return;
         };
         entry.response_rules_applied = true;
+        entry.sess.resp_released = true;
         let be_idx = Self::resolve_backend(entry, proxies);
         let fe_idx = entry.proxy_idx;
 
@@ -3834,6 +3854,12 @@ impl EngineDispatcher<'_> {
         }
         if srv_has_close {
             entry.sess.srv_connection_close = true;
+        }
+        {
+            let head = String::from_utf8_lossy(&entry.sess.rep.readable()[..total_hdr_len]);
+            entry.sess.resp_length_known =
+                crate::proxy::response_length_known(&head, entry.sess.req_method.as_deref());
+            entry.sess.resp_status = crate::proxy::response_status(&head);
         }
 
         if !entry.sess.connection_close && srv_has_close {

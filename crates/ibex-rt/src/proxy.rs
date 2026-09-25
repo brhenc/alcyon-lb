@@ -140,6 +140,19 @@ pub struct TcpSession {
     pub server_addr: Option<SocketAddr>,
     pub send_proxy_prepended: bool,
     pub resp_headers_processed: bool,
+    /// The current response's end is known without the server closing: it has a
+    /// `Content-Length`, is chunked, or cannot have a body. Then a server EOF after it ends
+    /// only the server side, and the client connection stays in keep-alive.
+    pub resp_length_known: bool,
+    /// Whether the response in `rep` may be written to the client. The engine clears it
+    /// on an HTTP session and sets it once its response rules have run: `process` reads
+    /// the server and writes the client in one call, so without the hold a response read
+    /// there went out before the engine saw it, and its `http-response` rules were
+    /// skipped -- intermittently, whenever `process` won the read. Synthetic responses
+    /// release it themselves. Sessions not driven by the engine never clear it.
+    pub resp_released: bool,
+    /// Status of the response in progress, 0 before its headers are processed.
+    pub resp_status: u16,
     pub srv_connection_close: bool,
     pub created_at: Instant,
     pub http_res_rules: Vec<ibex_config::HttpResRule>,
@@ -235,6 +248,9 @@ impl TcpSession {
             server_addr: None,
             send_proxy_prepended: false,
             resp_headers_processed: false,
+            resp_length_known: false,
+            resp_released: true,
+            resp_status: 0,
             srv_connection_close: false,
             created_at: Instant::now(),
             bufsize: crate::buf::get_bufsize(),
@@ -460,6 +476,7 @@ impl TcpSession {
         }
         self.cli_state = ScState::Established;
         self.srv_state = ScState::Closed;
+        self.resp_released = true;
     }
 
     /// Writes an RFC-compliant synthetic HTTP response into `self.rep` and closes the client read side.
@@ -900,7 +917,11 @@ impl TcpSession {
         }
 
         // Write any response data back to the client while writing is permitted.
-        if self.h2_ctx.is_none() && self.cli_state.can_write() && !self.rep.is_empty() {
+        if self.h2_ctx.is_none()
+            && self.cli_state.can_write()
+            && !self.rep.is_empty()
+            && self.resp_released
+        {
             match self.cli_xprt.send(self.cli.as_fd(), self.rep.readable())? {
                 Io::Done(n) if n > 0 => {
                     self.rep.consume(n);
@@ -932,7 +953,21 @@ impl TcpSession {
                     self.srv_state,
                     ScState::ShutR | ScState::Closed | ScState::Error
                 );
-                if srv_done_sending && self.rep.is_empty() && self.pending_resp.is_none() {
+                // A server that closes after a response whose length was known has finished
+                // that response, not the client's connection: HAProxy keeps the client in
+                // keep-alive and opens a new server connection for the next request. The
+                // engine's transaction step does that; closing the client here pre-empted it.
+                // A close-delimited response is different -- the close is the only end the
+                // client can see, so it is passed on.
+                let server_finished_cleanly = self.mode == Mode::Http
+                    && !self.connection_close
+                    && self.resp_length_known
+                    && matches!(self.srv_state, ScState::ShutR | ScState::Closed);
+                if srv_done_sending
+                    && self.rep.is_empty()
+                    && self.pending_resp.is_none()
+                    && !server_finished_cleanly
+                {
                     raw::shutdown_write(self.cli.as_fd());
                     self.cli_state = ScState::ShutW;
                     if self.connection_close {
@@ -1076,6 +1111,8 @@ impl TcpSession {
                     self.srv_connection_close = true;
                 }
 
+                self.resp_length_known = response_length_known(&hdr_str, self.req_method.as_deref());
+                self.resp_status = response_status(&hdr_str);
                 self.rep.replace_prefix(total_hdr_len, hdr_str.as_bytes());
                 self.srv_state = ScState::Established;
                 self.resp_headers_processed = true;
@@ -1256,14 +1293,18 @@ impl TcpSession {
             }
         }
 
-        if self.srv_state.can_write() && (!self.req.is_empty() || self.srv_xprt.wants_write()) {
+        let forwardable = self.request_bytes_forwardable();
+        if self.srv_state.can_write()
+            && ((forwardable && !self.req.is_empty()) || self.srv_xprt.wants_write())
+        {
             let r = {
                 let sfd = self
                     .srv
                     .as_ref()
                     .map(AsFd::as_fd)
                     .ok_or_else(|| io::Error::from(io::ErrorKind::NotConnected))?;
-                self.srv_xprt.send(sfd, self.req.readable())?
+                let data = if forwardable { self.req.readable() } else { &[] };
+                self.srv_xprt.send(sfd, data)?
             };
             match r {
                 Io::Done(n) if n > 0 => {
@@ -1462,6 +1503,15 @@ impl TcpSession {
     /// request buffer stops us asking for client readability, the client's socket
     /// buffer fills, and TCP slows the sender.
     #[must_use]
+    /// Whether bytes in `req` may go to the server. Once a final response has started on an
+    /// HTTP/1 session, anything more from the client is the *next* request: it waits in
+    /// `req` for the transaction to end, and is then routed on its own -- possibly to a new
+    /// server connection. Forwarded straight away, it went down the current connection,
+    /// which the server may be closing, and a keep-alive client's second request was lost.
+    fn request_bytes_forwardable(&self) -> bool {
+        !(self.mode == Mode::Http && self.h2_ctx.is_none() && self.resp_status >= 200)
+    }
+
     pub fn interests(&self) -> (Want, Want) {
         let has_pending = self.has_pending_output();
         // `cli_xprt.wants_write()` is the TLS term. A handshake is mostly the server
@@ -1479,12 +1529,47 @@ impl TcpSession {
             },
             ScState::Ready | ScState::Established | ScState::ShutR | ScState::ShutW => Want {
                 read: self.srv_state.can_read() && !self.rep.is_full(),
-                write: self.srv_state.can_write() && (!self.req.is_empty() || self.srv_xprt.wants_write()),
+                write: self.srv_state.can_write()
+                    && ((self.request_bytes_forwardable() && !self.req.is_empty())
+                        || self.srv_xprt.wants_write()),
             },
             _ => Want::default(),
         };
         (cli, srv)
     }
+}
+
+/// The status code of a response head, or 0 if the status line does not parse.
+#[must_use]
+pub fn response_status(head: &str) -> u16 {
+    head.split("\r\n")
+        .next()
+        .and_then(|l| l.split(' ').nth(1))
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Whether a response's end is known without the server closing the connection (RFC 9112
+/// section 6.3): no body (HEAD, 1xx, 204, 304), chunked, or a `Content-Length`.
+#[must_use]
+pub fn response_length_known(head: &str, req_method: Option<&str>) -> bool {
+    let status = response_status(head);
+    let mut lines = head.split("\r\n").skip(1);
+    if req_method.is_some_and(|m| m.eq_ignore_ascii_case("HEAD"))
+        || (100..200).contains(&status)
+        || status == 204
+        || status == 304
+    {
+        return true;
+    }
+    lines.any(|l| {
+        l.split_once(':').is_some_and(|(k, v)| {
+            let k = k.trim();
+            k.eq_ignore_ascii_case("content-length")
+                || (k.eq_ignore_ascii_case("transfer-encoding")
+                    && v.to_ascii_lowercase().contains("chunked"))
+        })
+    })
 }
 
 #[must_use]
