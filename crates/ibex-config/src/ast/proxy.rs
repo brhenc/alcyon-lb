@@ -141,6 +141,9 @@ pub struct ListenSection {
     pub acls: Vec<AclRule>,
     /// Dynamic switching rules (`use_backend <name> [if|unless <acl_cond>]`).
     pub use_backends: Vec<UseBackendRule>,
+    /// `monitor-uri <uri>`: requests for this URI are answered by the proxy itself, for
+    /// an external load balancer's health probe (`src/http_ana.c`).
+    pub monitor_uri: Option<String>,
     /// Default backend name to forward traffic to.
     pub default_backend: Option<String>,
     /// Load balancing algorithm.
@@ -236,6 +239,7 @@ impl Default for ListenSection {
             srvexp: Vec::new(),
             acls: Vec::new(),
             use_backends: Vec::new(),
+            monitor_uri: None,
             default_backend: None,
             balance: BalanceAlgorithm::RoundRobin,
             stick_table: None,
@@ -288,6 +292,9 @@ pub struct FrontendSection {
     pub default_backend: Option<String>,
     /// Dynamic switching rules (`use_backend <name> [if|unless <acl_cond>]`).
     pub use_backends: Vec<UseBackendRule>,
+    /// `monitor-uri <uri>`: requests for this URI are answered by the proxy itself, for
+    /// an external load balancer's health probe (`src/http_ana.c`).
+    pub monitor_uri: Option<String>,
     /// Declared ACL rules.
     pub acls: Vec<AclRule>,
     /// Client header regex rewrite rules.
@@ -342,6 +349,7 @@ impl Default for FrontendSection {
             maxconn: 2000,
             default_backend: None,
             use_backends: Vec::new(),
+            monitor_uri: None,
             acls: Vec::new(),
             cliexp: Vec::new(),
             logs: Vec::new(),

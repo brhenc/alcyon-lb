@@ -84,6 +84,7 @@ pub(crate) fn parse_listen_header(
         srvexp: Vec::new(),
         acls: Vec::new(),
         use_backends: Vec::new(),
+        monitor_uri: None,
         default_backend: None,
         balance: defaults.and_then(|d| d.balance).unwrap_or(BalanceAlgorithm::RoundRobin),
         stick_table: None,
@@ -152,6 +153,7 @@ pub(crate) fn parse_frontend_header(
         maxconn: defaults.and_then(|d| d.maxconn).unwrap_or(2000),
         default_backend: None,
         use_backends: Vec::new(),
+        monitor_uri: None,
         acls: Vec::new(),
         cliexp: Vec::new(),
         logs: defaults.map_or_else(Vec::new, |d| d.logs.clone()),
@@ -289,6 +291,7 @@ pub(crate) fn parse_listen_directive(
         "http-reuse" => parse_http_reuse(&mut proxy.http_reuse, tokens, kw),
         "acl" => parse_acl(&mut proxy.acls, tokens, kw),
         "use_backend" => parse_use_backend(&mut proxy.use_backends, tokens, kw),
+        "monitor-uri" => parse_monitor_uri(&mut proxy.monitor_uri, tokens, kw),
         "default_backend" => parse_default_backend(&mut proxy.default_backend, tokens, kw),
         "option" => parse_option_listen(proxy, tokens, kw),
         "no" => parse_no_directive(tokens, kw),
@@ -410,6 +413,7 @@ pub(crate) fn parse_frontend_directive(
         }
         "acl" => parse_acl(&mut fe.acls, tokens, kw),
         "use_backend" => parse_use_backend(&mut fe.use_backends, tokens, kw),
+        "monitor-uri" => parse_monitor_uri(&mut fe.monitor_uri, tokens, kw),
         "default_backend" => parse_default_backend(&mut fe.default_backend, tokens, kw),
         "stick-table" => parse_stick_table(&mut fe.stick_table, tokens, kw),
         "stick" => parse_stick_rule(&mut fe.stick_rules, tokens, kw),
@@ -781,3 +785,15 @@ pub(crate) fn parse_option_backend(
     Ok(())
 }
 
+/// `monitor-uri <uri>` (frontend and listen sections).
+fn parse_monitor_uri(
+    monitor_uri: &mut Option<String>,
+    tokens: &[Token],
+    kw: &Token,
+) -> Result<(), ConfigError> {
+    let Some(uri) = tokens.get(1).filter(|t| !t.text.is_empty()) else {
+        return Err(ConfigError::new(kw.line, kw.col, "'monitor-uri' expects an URI."));
+    };
+    *monitor_uri = Some(uri.text.clone());
+    Ok(())
+}

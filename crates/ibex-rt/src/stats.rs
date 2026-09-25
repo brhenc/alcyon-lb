@@ -673,6 +673,7 @@ mod tests {
             balance: ibex_config::BalanceAlgorithm::RoundRobin,
             default_backend: None,
             use_backends: Vec::new(),
+            monitor_uri: None,
             acls: std::collections::HashMap::new(),
             stick_table: None,
             stick_rules: Vec::new(),

@@ -144,6 +144,7 @@ pub struct Proxy {
     pub stats_config: ibex_config::StatsConfig,
     pub default_backend: Option<String>,
     pub use_backends: Vec<UseBackendRule>,
+    pub monitor_uri: Option<String>,
     pub acls: HashMap<String, Expr>,
     pub stick_table: Option<Arc<StickTable>>,
     pub stick_rules: Vec<StickRule>,
@@ -824,6 +825,7 @@ fn init_proxy_from_listen(proxy_idx: usize, listen: &ibex_config::ListenSection,
         },
         default_backend: listen.default_backend.clone(),
         use_backends: listen.use_backends.clone(),
+        monitor_uri: listen.monitor_uri.clone(),
         acls: compile_acls(&listen.acls),
         stick_table,
         stick_rules: listen.stick_rules.clone(),
@@ -904,6 +906,7 @@ fn init_proxy_from_frontend(proxy_idx: usize, fe: &ibex_config::FrontendSection,
         },
         default_backend: fe.default_backend.clone(),
         use_backends: fe.use_backends.clone(),
+        monitor_uri: fe.monitor_uri.clone(),
         acls: compile_acls(&fe.acls),
         stick_table,
         stick_rules: fe.stick_rules.clone(),
@@ -1011,6 +1014,7 @@ fn init_proxy_from_backend(proxy_idx: usize, be: &ibex_config::BackendSection, n
         },
         default_backend: None,
         use_backends: Vec::new(),
+        monitor_uri: None,
         acls: compile_acls(&be.acls),
         stick_table,
         stick_rules: be.stick_rules.clone(),
@@ -3369,6 +3373,12 @@ fn is_http_response_complete(buf: &[u8]) -> bool {
     false
 }
 
+/// HAProxy's `monitor-uri` answer. Ibex closes the connection after it (and the relay
+/// adds `Connection: close`), where HAProxy keeps it alive.
+const MONITOR_URI_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-length: 58\r\n\
+cache-control: no-cache\r\ncontent-type: text/html\r\n\r\n\
+<html><body><h1>200 OK</h1>\nService ready.\n</body></html>\n";
+
 fn inject_connection_close_header_zero_alloc(buf: &mut crate::buf::Buf) {
     if let Some((eoh_pos, eoh_len)) = crate::find_eoh(buf.readable()) {
         let inject = b"Connection: close\r\n";
@@ -4638,6 +4648,23 @@ impl EngineDispatcher<'_> {
         REWRITE_ADDED_BYTES.set(0);
         let max_rw = proxies[proxy_idx].stats_config.maxrewrite.unwrap_or(8192);
         MAX_REWRITE_LIMIT.set(max_rw);
+
+        // `monitor-uri`: answer the probe here, before any rule or backend sees it. The
+        // response is HAProxy's, byte for byte (`src/http_ana.c`), and matches the path of
+        // an absolute-form request too.
+        if let Some(m_uri) = proxies[proxy_idx].monitor_uri.as_deref() {
+            let req_uri = entry.sess.req_uri.as_deref().unwrap_or("/");
+            let path = if m_uri.starts_with('/') && req_uri.contains("://") {
+                split_uri(req_uri).1
+            } else {
+                req_uri
+            };
+            if path == m_uri {
+                entry.sess.connection_close = true;
+                entry.sess.send_synthetic_bytes(MONITOR_URI_RESPONSE);
+                return None;
+            }
+        }
 
         // Serve the stats page before anything else routes this request.
         //
