@@ -3366,12 +3366,15 @@ fn inject_connection_close_header_zero_alloc(buf: &mut crate::buf::Buf) {
         let inject = b"Connection: close\r\n";
         let total_old = eoh_pos + eoh_len;
         let total_new = total_old + inject.len();
+        // `find_eoh` points at the start of the blank-line pair; the last header's own
+        // line terminator is its first half. The new header goes after that, not before.
+        let at = eoh_pos + eoh_len / 2;
         if total_new <= 4096 {
             let mut stack_hdr = [0u8; 4096];
             let readable = buf.readable();
-            stack_hdr[..eoh_pos].copy_from_slice(&readable[..eoh_pos]);
-            stack_hdr[eoh_pos..eoh_pos + inject.len()].copy_from_slice(inject);
-            stack_hdr[eoh_pos + inject.len()..total_new].copy_from_slice(&readable[eoh_pos..total_old]);
+            stack_hdr[..at].copy_from_slice(&readable[..at]);
+            stack_hdr[at..at + inject.len()].copy_from_slice(inject);
+            stack_hdr[at + inject.len()..total_new].copy_from_slice(&readable[at..total_old]);
             buf.replace_prefix(total_old, &stack_hdr[..total_new]);
         } else {
             buf.inject_http_header("Connection", "close");
@@ -6605,8 +6608,25 @@ mod registry_tests {
         b.writable()[..raw.len()].copy_from_slice(raw);
         b.commit(raw.len());
         inject_connection_close_header_zero_alloc(&mut b);
-        let s = std::str::from_utf8(b.readable()).unwrap();
-        assert!(s.contains("Connection: close\r\n"));
-        assert!(s.ends_with("\r\n\r\nok"));
+        // Exact bytes. `contains` passed while the header was glued onto the previous one
+        // ("Content-Length: 2Connection: close") and a blank line was added -- every
+        // response Ibex closed after went out that way.
+        assert_eq!(
+            std::str::from_utf8(b.readable()).unwrap(),
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+        );
+    }
+
+    #[test]
+    fn test_inject_connection_close_bare_lf() {
+        let mut b = crate::buf::Buf::standard();
+        let raw = b"HTTP/1.1 200 OK\nContent-Length: 2\n\nok";
+        b.writable()[..raw.len()].copy_from_slice(raw);
+        b.commit(raw.len());
+        inject_connection_close_header_zero_alloc(&mut b);
+        assert_eq!(
+            std::str::from_utf8(b.readable()).unwrap(),
+            "HTTP/1.1 200 OK\nContent-Length: 2\nConnection: close\r\n\nok"
+        );
     }
 }
