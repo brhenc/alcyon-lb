@@ -235,16 +235,19 @@ fn content_inspection_waits_for_the_payload_not_the_first_byte() {
     let _ = std::fs::remove_file(&cfg);
 }
 
-/// `fc_src` is the real TCP peer and `set-src` must not touch it.
+/// `tcp-request connection set-src` rewrites the front connection's own source address,
+/// so `fc_src` reads the rewritten value as well as `src`.
 ///
-/// The two fetches exist precisely so that one can be rewritten and the other cannot:
-/// `src` is what the configuration decided the client is, `fc_src` is who actually
-/// connected. `eval_tcp_req_conn_rules` assigns both from `set-src`, which removes the
-/// only fetch that still reports the truth. An operator writing
-/// `tcp-request connection reject if { fc_src -f /etc/blocklist }` after a `set-src`
-/// derived from a client-supplied header is then matching the attacker's own value.
+/// This test used to require the opposite -- that `fc_src` keep the real TCP peer -- on
+/// the argument that one of the two fetches should always tell the truth. `HAProxy`
+/// disagrees: 3.5-dev7, run with this exact configuration, sends
+/// `x-ibex-src: 10.11.12.13` and `x-ibex-fc-src: 10.11.12.13`. At the connection layer
+/// `set-src` changes the connection's address itself (`conn->src`), and `fc_src` is
+/// registered with the same fetch function as `src` (`smp_fetch_src`,
+/// `src/tcp_sample.c:599`). `HAProxy` is the oracle, so the specification follows it. An operator
+/// who needs the real peer after `set-src` must capture it into a variable first.
 #[test]
-fn fc_src_is_the_real_peer_after_set_src() {
+fn fc_src_follows_set_src_at_the_connection_layer() {
     let be = Backend::spawn(1, HTTP_OK);
     let port = free_port();
     let cfg = write_cfg(
@@ -281,11 +284,11 @@ fn fc_src_is_the_real_peer_after_set_src() {
         req.contains("X-Ibex-Src: 10.11.12.13"),
         "`set-src` did not rewrite `src`; the request carried: {req:?}"
     );
-    // Then: the real peer must still be reachable.
+    // Then: `fc_src` reads the connection, which `set-src` rewrote -- as in HAProxy.
     assert!(
-        req.contains("X-Ibex-Fc-Src: 127.0.0.1"),
-        "`set-src` also overwrote `fc_src`, so nothing reports the real TCP peer any \
-         more. The request carried: {req:?}"
+        req.contains("X-Ibex-Fc-Src: 10.11.12.13"),
+        "`fc_src` must read the rewritten connection address, as HAProxy's does; \
+         the request carried: {req:?}"
     );
     let _ = std::fs::remove_file(&cfg);
 }
