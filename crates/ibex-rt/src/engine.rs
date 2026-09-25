@@ -1864,19 +1864,28 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         for (_, e) in self.sessions.iter_mut() {
             if e.sess.mode == Mode::Http {
                 e.sess.connection_close = true;
+                if let Some(ref mut h2_ctx) = e.sess.h2_ctx {
+                    h2_ctx.send_graceful_goaway();
+                    // Wake up the task so the mux can flush the frame.
+                    self.scheduler
+                        .tasklet_wakeup(e.task, Class::Urgent, state::WOKEN_IO);
+                }
             }
         }
     }
 
-    /// Closes HTTP/1 sessions that are between requests. They hold no work, and keeping
+    /// Closes HTTP sessions that are between requests. They hold no work, and keeping
     /// them would let every idle keep-alive client hold a stopping process open until
     /// `timeout client`. A request already on the wire but not yet read is lost with the
-    /// connection; clients retry that case, and HAProxy has the same window.
+    /// connection; clients retry that case, and HAProxy has the same window. An idle
+    /// HTTP/2 connection is told first, with a graceful GOAWAY, and closed once that has
+    /// been written (`src/mux_h2.c:5501`).
     fn close_idle_http_sessions(&mut self) {
+        use ibex_proto::h2::H2StreamState;
+        use ibex_proto::mux::Mux;
         let mut wake = Vec::new();
         for (_, e) in self.sessions.iter_mut() {
             let idle = e.sess.mode == Mode::Http
-                && e.sess.h2_ctx.is_none()
                 && !e.response_rules_applied
                 && e.sess.req.is_empty()
                 && e.sess.rep.is_empty()
@@ -1888,8 +1897,25 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 // `timeout client` -- which a test missed for as long as the client
                 // connection was being closed after its first response anyway.
                 && matches!(e.sess.cli_state, ScState::Established | ScState::Ready);
-            if idle {
-                shutdown_session_entry(e, &mut self.proxies, &mut wake);
+            if !idle {
+                continue;
+            }
+            match e.sess.h2_ctx.as_mut() {
+                None => shutdown_session_entry(e, &mut self.proxies, &mut wake),
+                Some(h2) => {
+                    let no_open_streams = h2.streams.values().all(|s| {
+                        matches!(s.state, H2StreamState::Closed | H2StreamState::Reset(_))
+                    });
+                    if !no_open_streams {
+                        continue;
+                    }
+                    h2.send_graceful_goaway();
+                    if ibex_proto::mux_h2::MuxH2.pending_output(h2).is_empty() {
+                        shutdown_session_entry(e, &mut self.proxies, &mut wake);
+                    } else {
+                        wake.push(e.task);
+                    }
+                }
             }
         }
         for task in wake {

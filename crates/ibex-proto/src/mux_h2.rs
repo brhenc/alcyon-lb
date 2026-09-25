@@ -175,6 +175,25 @@ impl H2MuxContext {
         self.conn_state = H2ConnState::GoAwaySent;
     }
 
+    /// Announces a graceful shutdown: GOAWAY with `NO_ERROR` and last-stream-id 2^31-1, so
+    /// streams already open finish and the client opens new ones elsewhere. Unlike
+    /// [`Self::send_goaway`] it does not stop parsing. `HAProxy` does the same when the
+    /// frontend is stopping (`src/mux_h2.c:5308`, last_sid `(1U << 31) - 1` at `:5330`).
+    pub fn send_graceful_goaway(&mut self) {
+        if self.graceful_goaway_sent || self.goaway_sent.is_some() {
+            return;
+        }
+        self.graceful_goaway_sent = true;
+        let last_stream_id = (1 << 31) - 1;
+        self.goaway_sent = Some((last_stream_id, H2Error::NoError));
+        let frame = Frame::GoAway {
+            last_stream_id,
+            error_code: H2Error::NoError,
+            debug_data: Vec::new(),
+        };
+        self.enqueue_frame(&frame);
+    }
+
     /// Sends a WINDOW_UPDATE frame on stream 0 (connection) or a specific stream.
     pub fn send_window_update(&mut self, stream_id: u32, increment: u32) {
         if increment == 0 {
