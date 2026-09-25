@@ -160,6 +160,7 @@ pub struct TcpSession {
     pub h2_ctx: Option<H2MuxContext>,
     pub h2_active_stream_id: Option<u32>,
     pub h2_flood_config: ibex_proto::H2FloodConfig,
+    pub is_first_req: bool,
 }
 
 impl TcpSession {
@@ -254,6 +255,7 @@ impl TcpSession {
             h2_ctx: None,
             h2_active_stream_id: None,
             h2_flood_config: ibex_proto::H2FloodConfig::default(),
+            is_first_req: true,
         };
         s.arm_client(now);
         s

@@ -1983,8 +1983,8 @@ fn eval_tcp_req_conn_rules(
 ) -> ConnEvalOutcome {
     let mut client_addr = peer_addr;
     let mut server_addr = local_addr;
-    let fc_src = peer_addr;
-    let fc_dst = local_addr;
+    let mut fc_src = peer_addr;
+    let mut fc_dst = local_addr;
 
     let mut ctx = SampleContext {
         client_addr: Some(client_addr),
@@ -2031,9 +2031,13 @@ fn eval_tcp_req_conn_rules(
                 if let Ok(ip) = val.parse::<IpAddr>() {
                     client_addr = SocketAddr::new(ip, client_addr.port());
                     ctx.client_addr = Some(client_addr);
+                    fc_src = client_addr;
+                    ctx.fc_src = Some(fc_src);
                 } else if let Ok(sa) = val.parse::<SocketAddr>() {
                     client_addr = sa;
                     ctx.client_addr = Some(client_addr);
+                    fc_src = client_addr;
+                    ctx.fc_src = Some(fc_src);
                 }
             }
             ibex_config::TcpReqConnAction::SetDst { expr } => {
@@ -2047,9 +2051,13 @@ fn eval_tcp_req_conn_rules(
                 if let Ok(ip) = val.parse::<IpAddr>() {
                     server_addr = SocketAddr::new(ip, server_addr.port());
                     ctx.server_addr = Some(server_addr);
+                    fc_dst = server_addr;
+                    ctx.fc_dst = Some(fc_dst);
                 } else if let Ok(sa) = val.parse::<SocketAddr>() {
                     server_addr = sa;
                     ctx.server_addr = Some(server_addr);
+                    fc_dst = server_addr;
+                    ctx.fc_dst = Some(fc_dst);
                 }
             }
             _ => {}
@@ -3367,6 +3375,7 @@ impl EngineDispatcher<'_> {
             server_addr: entry.target_addr,
             fc_src: entry.sess.fc_src,
             fc_dst: entry.sess.fc_dst,
+            is_first_req: entry.sess.is_first_req,
             proxy_tlvs: entry.sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
             req_body: if entry.sess.req.readable().is_empty() {
                 None
@@ -3637,6 +3646,7 @@ impl EngineDispatcher<'_> {
                         entry.sess.srv_state = ScState::Init;
                     }
                     entry.sess.srv_connection_close = false;
+                    entry.sess.is_first_req = false;
                     entry.sess.req_method = None;
                     entry.sess.req_uri = None;
                     entry.sess.req_headers = None;
@@ -3869,6 +3879,7 @@ impl EngineDispatcher<'_> {
             server_addr: entry.target_addr,
             fc_src: entry.sess.fc_src,
             fc_dst: entry.sess.fc_dst,
+            is_first_req: entry.sess.is_first_req,
             proxy_tlvs: entry.sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
             htx: None,
             htx_slice,
@@ -4632,6 +4643,7 @@ impl EngineDispatcher<'_> {
             server_addr: entry.target_addr,
             fc_src: entry.sess.fc_src,
             fc_dst: entry.sess.fc_dst,
+            is_first_req: entry.sess.is_first_req,
             proxy_tlvs: entry.sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
             req_uri: entry.sess.req_uri.as_deref(),
             req_method: entry.sess.req_method.as_deref(),
@@ -4763,6 +4775,7 @@ impl EngineDispatcher<'_> {
                         server_addr: target_addr,
                         fc_src: $s.fc_src,
                         fc_dst: $s.fc_dst,
+                        is_first_req: $s.is_first_req,
                         proxy_tlvs: $s.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
                         htx: None,
                         htx_slice: $s.htx_slice(),
@@ -5382,6 +5395,7 @@ impl EngineDispatcher<'_> {
                     || !proxies[proxy_idx].http_after_res_rules.is_empty()));
         if has_res_rules {
             let res_ctx = SampleContext {
+                is_first_req: entry.sess.is_first_req,
                 client_addr: entry.sess.client_addr,
                 server_addr: entry.target_addr,
                 htx: None,

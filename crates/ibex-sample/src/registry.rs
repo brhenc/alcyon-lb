@@ -114,6 +114,7 @@ pub struct SampleContext<'a> {
     pub bc_rttvar: Option<u32>,
     pub captures_req_hdr: Option<&'a [String]>,
     pub captures_res_hdr: Option<&'a [String]>,
+    pub is_first_req: bool,
     pub vars: Option<&'a HashMap<String, String>>,
     pub timeouts: Option<&'a HashMap<String, u32>>,
     pub act_conn: u32,
@@ -338,6 +339,14 @@ impl Registry {
             name: "fc_src",
             out_type: SampleType::Ipv4,
             func: fc_src_fetch,
+        });
+
+        let http_first_req_fetch: FetchFn =
+            |ctx, _args| Some(Sample::Bool(ctx.is_first_req));
+        self.register_fetch(FetchDesc {
+            name: "http_first_req",
+            out_type: SampleType::Bool,
+            func: http_first_req_fetch,
         });
 
         let src_port_fetch: FetchFn =
