@@ -3182,6 +3182,7 @@ fn retry_server_connect(
         if !entry.sess.server_failed() {
             entry.sess.srv_state = ScState::Error;
             if entry.sess.mode == Mode::Http {
+                entry.sess.discard_unforwarded_request();
                 entry.sess.send_synthetic_response(
                     503,
                     Some("text/html; charset=utf-8"),
@@ -3234,6 +3235,7 @@ fn check_srv_connect(
                     } else {
                         entry.sess.srv_state = ScState::Error;
                         if entry.sess.mode == Mode::Http {
+                            entry.sess.discard_unforwarded_request();
                             entry.sess.send_synthetic_response(
                                 503,
                                 Some("text/html; charset=utf-8"),
@@ -5552,6 +5554,7 @@ impl EngineDispatcher<'_> {
         let Some(target_addr) = target else {
             proxies[be_idx].stats[worker_id()].failed_conn.fetch_add(1, Ordering::Relaxed);
             entry.sess.srv_state = ScState::Error;
+            entry.sess.discard_unforwarded_request();
             entry.sess.send_synthetic_response(
                 503,
                 Some("text/html; charset=utf-8"),

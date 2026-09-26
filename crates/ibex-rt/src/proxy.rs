@@ -490,6 +490,34 @@ impl TcpSession {
         self.send_synthetic_bytes(&resp);
     }
 
+    /// Drops the request at the front of `req` when the proxy answered it itself without
+    /// sending any of it to a server (no server available, connect failed). Left in place,
+    /// the keep-alive reset at the end of the transaction reads it as the next request and
+    /// answers it again, without end.
+    ///
+    /// A request with a body is not drained: the rest of the buffer goes and the client
+    /// connection closes after the response, so body bytes are never parsed as a request.
+    pub fn discard_unforwarded_request(&mut self) {
+        let Some((head_len, eoh_len)) = find_eoh(self.req.readable()) else {
+            return;
+        };
+        let head = String::from_utf8_lossy(&self.req.readable()[..head_len]);
+        let has_body = head.split("\r\n").skip(1).any(|l| {
+            l.split_once(':').is_some_and(|(k, v)| {
+                let k = k.trim();
+                (k.eq_ignore_ascii_case("content-length") && v.trim() != "0")
+                    || k.eq_ignore_ascii_case("transfer-encoding")
+            })
+        });
+        if has_body {
+            let all = self.req.readable().len();
+            self.req.consume(all);
+            self.connection_close = true;
+        } else {
+            self.req.consume(head_len + eoh_len);
+        }
+    }
+
     /// Runs the configured parser over a complete request head.
     ///
     /// # Errors
