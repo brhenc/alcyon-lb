@@ -4903,43 +4903,36 @@ impl EngineDispatcher<'_> {
                         error_page,
                     } => {
                         let body = resolve_error_body(&proxies[proxy_idx], *status, error_page, content_type, lf_string);
-                        match body {
-                            ResolvedErrorBody::Raw(bytes) => {
-                                let w = sess.rep.writable();
-                                let n = w.len().min(bytes.len());
-                                w[..n].copy_from_slice(&bytes[..n]);
-                                sess.rep.commit(n);
-                                sess.cli_state = ScState::ShutR;
-                                sess.srv_state = ScState::Closed;
-                                return Ok(Some(()));
-                            }
+                        let full_resp: Vec<u8> = match body {
+                            ResolvedErrorBody::Raw(bytes) => bytes.to_vec(),
                             ResolvedErrorBody::Custom { content_type, lf_string } => {
-                                let full_resp = build_templated_error_response(
-                                    *status,
-                                    content_type,
-                                    lf_string,
-                                    &make_ctx!(sess),
-                                    registry,
-                                );
-
-                                let w = sess.rep.writable();
-                                let n = w.len().min(full_resp.len());
-                                w[..n].copy_from_slice(&full_resp[..n]);
-                                sess.rep.commit(n);
-
-                                if let Some((hdr_len, eoh_len)) = crate::proxy::find_eoh(sess.req.readable()) {
-                                    sess.req.consume(hdr_len + eoh_len);
-                                }
-                                sess.req_method = None;
-                                sess.req_uri = None;
-                                sess.req_headers = None;
-                                sess.clear_htx();
-                                sess.cli_state = ScState::Ready;
-                                sess.srv_state = ScState::Init;
-                                sess.resp_headers_processed = false;
-                                return Ok(Some(()));
+                                build_templated_error_response(*status, content_type, lf_string, &make_ctx!(sess), registry)
                             }
+                        };
+                        let w = sess.rep.writable();
+                        let n = w.len().min(full_resp.len());
+                        w[..n].copy_from_slice(&full_resp[..n]);
+                        sess.rep.commit(n);
+
+                        // An empty errorfile (the `/dev/null` idiom) or one that says
+                        // `Connection: close` ends the connection; anything else is an
+                        // ordinary response and the connection stays open, as in HAProxy.
+                        if full_resp.is_empty() || raw_response_closes(&full_resp) {
+                            sess.cli_state = ScState::ShutR;
+                            sess.srv_state = ScState::Closed;
+                            return Ok(Some(()));
                         }
+                        if let Some((hdr_len, eoh_len)) = crate::proxy::find_eoh(sess.req.readable()) {
+                            sess.req.consume(hdr_len + eoh_len);
+                        }
+                        sess.req_method = None;
+                        sess.req_uri = None;
+                        sess.req_headers = None;
+                        sess.clear_htx();
+                        sess.cli_state = ScState::Ready;
+                        sess.srv_state = ScState::Init;
+                        sess.resp_headers_processed = false;
+                        return Ok(Some(()));
                     }
                     ibex_config::HttpReqAction::Deny {
                         deny_status,
@@ -6597,6 +6590,55 @@ const BUILTIN_ERROR_PAGES: &[(u16, &str)] = &[
     (503, "HTTP/1.1 503 Service Unavailable\r\nContent-length: 107\r\nCache-Control: no-cache\r\nContent-Type: text/html\r\n\r\n<html><body><h1>503 Service Unavailable</h1>\nNo server is available to handle this request.\n</body></html>\n"),
     (504, "HTTP/1.1 504 Gateway Time-out\r\nContent-length: 92\r\nCache-Control: no-cache\r\nContent-Type: text/html\r\n\r\n<html><body><h1>504 Gateway Time-out</h1>\nThe server didn't respond in time.\n</body></html>\n"),
 ];
+
+/// The response for an error the proxy generates itself (no server, connect failed), as
+/// HAProxy's `http_error_message` picks it: the backend's `http-error`/`errorfile` for
+/// `status`, then the frontend's, then the built-in page.
+fn proxy_error_response(sess: &TcpSession, be: &Proxy, fe: &Proxy, status: u16) -> Vec<u8> {
+    let own = |proxy: &Proxy| -> Option<Vec<u8>> {
+        match proxy.error_replies.get(&status) {
+            Some(ibex_config::ErrorPageSource::Raw(bytes)) => return Some(bytes.clone()),
+            Some(ibex_config::ErrorPageSource::Custom { content_type, lf_string }) => {
+                let ctx = SampleContext {
+                    client_addr: sess.client_addr,
+                    fc_src: sess.fc_src,
+                    fc_dst: sess.fc_dst,
+                    is_first_req: sess.is_first_req,
+                    htx_slice: sess.htx_slice(),
+                    req_uri: sess.req_uri.as_deref(),
+                    req_method: sess.req_method.as_deref(),
+                    req_headers: sess.req_headers.as_deref(),
+                    fe_name: Some(fe.name.as_str()),
+                    be_name: Some(be.name.as_str()),
+                    ..Default::default()
+                };
+                return Some(build_templated_error_response(
+                    status,
+                    content_type.as_deref(),
+                    lf_string.as_deref(),
+                    &ctx,
+                    sample_registry(),
+                ));
+            }
+            Some(ibex_config::ErrorPageSource::DefaultErrorfiles) | None => {}
+        }
+        proxy.error_files.get(&status).cloned()
+    };
+    own(be)
+        .or_else(|| own(fe))
+        .or_else(|| builtin_error_page(status).map(<[u8]>::to_vec))
+        .unwrap_or_else(|| ibex_proto::build_synthetic_response(status, None, None))
+}
+
+/// Whether a raw response's head carries `Connection: close`.
+fn raw_response_closes(raw: &[u8]) -> bool {
+    let head_len = crate::proxy::find_eoh(raw).map_or(raw.len(), |(h, _)| h);
+    String::from_utf8_lossy(&raw[..head_len]).split('\n').skip(1).any(|l| {
+        l.split_once(':').is_some_and(|(k, v)| {
+            k.trim().eq_ignore_ascii_case("connection") && v.trim().eq_ignore_ascii_case("close")
+        })
+    })
+}
 
 fn builtin_error_page(status: u16) -> Option<&'static [u8]> {
     BUILTIN_ERROR_PAGES

@@ -3,6 +3,7 @@
 
 #[allow(unused_imports)]
 use super::*;
+use std::cell::RefCell;
 
 /// Modern HTTP-request action.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -196,46 +197,43 @@ pub enum ErrorPageSource {
     },
 }
 
-/// Registry of named `http-errors <name>` sections, keyed by section name and then by
-/// HTTP status code, holding the raw bytes `errorfile <code> <file>` loaded for each.
-///
-/// `errorfiles <name> [<code>...]` (a proxy directive or an `http-request`
-/// return`/`deny`/`http-error` argument) looks entries up here by name. Sections are
-/// declared textually before they are used in every configuration this crate parses
-/// (HAProxy requires the same ordering), so resolving eagerly at parse time, the same way
-/// `crate::ast::checks` resolves checks, avoids threading the registry through every
-/// proxy-section parser.
-static HTTP_ERRORS_SECTIONS: LazyLock<RwLock<HashMap<String, HashMap<u16, Vec<u8>>>>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
+/// One `http-errors <name>` section: status code to the raw response `errorfile` loaded.
+type HttpErrorsTable = HashMap<u16, Vec<u8>>;
 
-/// Clears the `http-errors` section registry. Called once at the start of `parse_str` so
-/// that sections from a previous parse in the same process (tests parse many configs)
-/// cannot leak into the next one.
+thread_local! {
+    /// Named `http-errors <name>` sections from the parse in progress on this thread.
+    ///
+    /// `errorfiles <name> [<code>...]` (a proxy directive or an `http-request`
+    /// `return`/`deny`/`http-error` argument) looks entries up here by name. HAProxy
+    /// requires a section to be declared before it is used, so the lookup is resolved at
+    /// parse time. Thread-local, not process-global: `parse_str` clears it on entry, and
+    /// two parses on different threads (tests, a reload beside a running check) must not
+    /// clear or read each other's sections.
+    static HTTP_ERRORS_SECTIONS: RefCell<HashMap<String, HttpErrorsTable>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Clears this thread's `http-errors` sections. Called at the start of `parse_str`.
 pub fn clear_http_errors_sections() {
-    if let Ok(mut map) = HTTP_ERRORS_SECTIONS.write() {
-        map.clear();
-    }
+    HTTP_ERRORS_SECTIONS.with_borrow_mut(HashMap::clear);
 }
 
 /// Registers a parsed `http-errors <name>` section's `errorfile` table under its name.
-pub fn register_http_errors_section(name: String, table: HashMap<u16, Vec<u8>>) {
-    if let Ok(mut map) = HTTP_ERRORS_SECTIONS.write() {
-        map.insert(name, table);
-    }
+pub fn register_http_errors_section(name: String, table: HttpErrorsTable) {
+    HTTP_ERRORS_SECTIONS.with_borrow_mut(|m| {
+        m.insert(name, table);
+    });
 }
 
-/// Looks up every `errorfile` entry declared in the named `http-errors` section.
+/// Every `errorfile` entry declared in the named `http-errors` section.
 #[must_use]
-pub fn http_errors_section(name: &str) -> Option<HashMap<u16, Vec<u8>>> {
-    HTTP_ERRORS_SECTIONS.read().ok().and_then(|map| map.get(name).cloned())
+pub fn http_errors_section(name: &str) -> Option<HttpErrorsTable> {
+    HTTP_ERRORS_SECTIONS.with_borrow(|m| m.get(name).cloned())
 }
 
-/// Looks up a single status code's `errorfile` entry in the named `http-errors` section.
+/// One status code's `errorfile` entry in the named `http-errors` section.
 #[must_use]
 pub fn http_errors_section_code(name: &str, code: u16) -> Option<Vec<u8>> {
-    HTTP_ERRORS_SECTIONS
-        .read()
-        .ok()
-        .and_then(|map| map.get(name).and_then(|table| table.get(&code).cloned()))
+    HTTP_ERRORS_SECTIONS.with_borrow(|m| m.get(name).and_then(|t| t.get(&code).cloned()))
 }
 
