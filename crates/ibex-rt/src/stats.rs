@@ -695,6 +695,8 @@ mod tests {
             http_res_rules: Vec::new(),
             http_after_res_rules: Vec::new(),
             http_reuse: ibex_config::HttpReuse::default(),
+            error_files: std::collections::HashMap::new(),
+            error_replies: std::collections::HashMap::new(),
         };
 
         let csv = format_show_stat(&[proxy], &[], 9999);

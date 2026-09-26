@@ -63,6 +63,10 @@ pub struct DefaultsSection {
     pub tcp_res_inspect_delay: Option<Duration>,
     /// Default TCP response content rules (`tcp-response content`).
     pub tcp_res_content_rules: Vec<TcpReqContentRule>,
+    /// Default custom error pages (`errorfile`/`errorfiles`), keyed by status code.
+    pub error_files: HashMap<u16, Vec<u8>>,
+    /// Default `http-error` overrides, keyed by status code.
+    pub error_replies: HashMap<u16, ErrorPageSource>,
 }
 
 /// Unified timeouts configuration.
@@ -194,6 +198,10 @@ pub struct ListenSection {
     pub tcp_checks: Vec<TcpCheckAction>,
     /// TCP check mode enabled (`option tcp-check`).
     pub tcp_check: bool,
+    /// Custom error pages (`errorfile`/`errorfiles`), keyed by status code.
+    pub error_files: HashMap<u16, Vec<u8>>,
+    /// `http-error` overrides, keyed by status code.
+    pub error_replies: HashMap<u16, ErrorPageSource>,
 }
 
 /// Stats configuration options for a proxy.
@@ -264,6 +272,8 @@ impl Default for ListenSection {
             http_checks: Vec::new(),
             tcp_checks: Vec::new(),
             tcp_check: false,
+            error_files: HashMap::new(),
+            error_replies: HashMap::new(),
         }
     }
 }
@@ -334,6 +344,10 @@ pub struct FrontendSection {
     pub originalto: Option<String>,
     /// Stats applet and dashboard configuration.
     pub stats: StatsConfig,
+    /// Custom error pages (`errorfile`/`errorfiles`), keyed by status code.
+    pub error_files: HashMap<u16, Vec<u8>>,
+    /// `http-error` overrides, keyed by status code.
+    pub error_replies: HashMap<u16, ErrorPageSource>,
 }
 
 impl Default for FrontendSection {
@@ -369,6 +383,8 @@ impl Default for FrontendSection {
             forwardfor: None,
             originalto: None,
             stats: StatsConfig::default(),
+            error_files: HashMap::new(),
+            error_replies: HashMap::new(),
         }
     }
 }
@@ -449,6 +465,10 @@ pub struct BackendSection {
     pub tcp_checks: Vec<TcpCheckAction>,
     /// TCP check mode enabled (`option tcp-check`).
     pub tcp_check: bool,
+    /// Custom error pages (`errorfile`/`errorfiles`), keyed by status code.
+    pub error_files: HashMap<u16, Vec<u8>>,
+    /// `http-error` overrides, keyed by status code.
+    pub error_replies: HashMap<u16, ErrorPageSource>,
 }
 
 impl Default for BackendSection {
@@ -490,6 +510,8 @@ impl Default for BackendSection {
             http_checks: Vec::new(),
             tcp_checks: Vec::new(),
             tcp_check: false,
+            error_files: HashMap::new(),
+            error_replies: HashMap::new(),
         }
     }
 }

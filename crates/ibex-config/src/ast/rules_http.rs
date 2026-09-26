@@ -23,9 +23,21 @@ pub enum HttpReqAction {
         status: u16,
         content_type: Option<String>,
         lf_string: Option<String>,
+        /// `default-errorfiles`/`errorfile`/`errorfiles`: use the proxy's configured
+        /// error page for `status` instead of the dummy/templated body above.
+        error_page: Option<ErrorPageSource>,
     },
     Deny {
         deny_status: Option<u16>,
+        /// Templated response payload, same encoding as `Return::content_type`.
+        content_type: Option<String>,
+        /// Templated response payload, same encoding as `Return::lf_string`.
+        lf_string: Option<String>,
+        /// `default-errorfiles`/`errorfile`/`errorfiles`: use the proxy's configured
+        /// error page for the deny status instead of the templated body above. HAProxy
+        /// implies this when `deny` carries no body argument at all (or only
+        /// `deny_status`), so the parser sets it in that case too.
+        error_page: Option<ErrorPageSource>,
     },
     Allow,
     SetHeader {
@@ -161,5 +173,69 @@ pub enum HttpAfterResAction {
 pub struct HttpAfterResRule {
     pub action: HttpAfterResAction,
     pub cond: Option<AclCondition>,
+}
+
+/// Source of a custom error page, as selected by `default-errorfiles`, `errorfile
+/// <file>`, or `errorfiles <name>` on `http-request return`/`deny`, or by `http-error`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ErrorPageSource {
+    /// `default-errorfiles`: use the proxy's own configured error page for this status
+    /// (an `http-error` override if any, else an `errorfile`/`errorfiles` entry, else
+    /// HAProxy's built-in page for the code), rather than a page named by this rule.
+    DefaultErrorfiles,
+    /// A full raw HTTP response, loaded verbatim from a file at config time (`errorfile
+    /// <file>`, or a status code resolved out of an `errorfiles <name>` / `http-errors`
+    /// section).
+    Raw(Vec<u8>),
+    /// `http-error`'s inline templated body (`content-type`/`hdr`/`string`/`lf-string`),
+    /// built at request/response time against the denying request -- the same encoding
+    /// `http-request return`'s own `content_type`/`lf_string` fields use.
+    Custom {
+        content_type: Option<String>,
+        lf_string: Option<String>,
+    },
+}
+
+/// Registry of named `http-errors <name>` sections, keyed by section name and then by
+/// HTTP status code, holding the raw bytes `errorfile <code> <file>` loaded for each.
+///
+/// `errorfiles <name> [<code>...]` (a proxy directive or an `http-request`
+/// return`/`deny`/`http-error` argument) looks entries up here by name. Sections are
+/// declared textually before they are used in every configuration this crate parses
+/// (HAProxy requires the same ordering), so resolving eagerly at parse time, the same way
+/// `crate::ast::checks` resolves checks, avoids threading the registry through every
+/// proxy-section parser.
+static HTTP_ERRORS_SECTIONS: LazyLock<RwLock<HashMap<String, HashMap<u16, Vec<u8>>>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// Clears the `http-errors` section registry. Called once at the start of `parse_str` so
+/// that sections from a previous parse in the same process (tests parse many configs)
+/// cannot leak into the next one.
+pub fn clear_http_errors_sections() {
+    if let Ok(mut map) = HTTP_ERRORS_SECTIONS.write() {
+        map.clear();
+    }
+}
+
+/// Registers a parsed `http-errors <name>` section's `errorfile` table under its name.
+pub fn register_http_errors_section(name: String, table: HashMap<u16, Vec<u8>>) {
+    if let Ok(mut map) = HTTP_ERRORS_SECTIONS.write() {
+        map.insert(name, table);
+    }
+}
+
+/// Looks up every `errorfile` entry declared in the named `http-errors` section.
+#[must_use]
+pub fn http_errors_section(name: &str) -> Option<HashMap<u16, Vec<u8>>> {
+    HTTP_ERRORS_SECTIONS.read().ok().and_then(|map| map.get(name).cloned())
+}
+
+/// Looks up a single status code's `errorfile` entry in the named `http-errors` section.
+#[must_use]
+pub fn http_errors_section_code(name: &str, code: u16) -> Option<Vec<u8>> {
+    HTTP_ERRORS_SECTIONS
+        .read()
+        .ok()
+        .and_then(|map| map.get(name).and_then(|table| table.get(&code).cloned()))
 }
 

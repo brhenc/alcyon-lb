@@ -8,16 +8,18 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use crate::ast::{
-    clear_resolved_checks, register_resolved_check, register_resolved_check_for_addr, AclCondition,
-    AclRule, AclTerm, BackendSection, BalanceAlgorithm, BindConfig, Config, DefaultServerConfig,
-    DefaultsSection, FrontendSection, GlobalSection, GlobalSetVar, HttpAfterResAction,
-    HttpAfterResRule, HttpCheckAction, HttpCheckExpectPattern, HttpChkConfig, HttpReqAction,
-    HttpReqRule, HttpResAction, HttpResRule, HttpReuse, ListenSection, LogConfig, LogFacility,
-    LogLevel, LogTarget, MatchType, Mode, MysqlCheckVersion, ProtoCheckConfig, ResolvedCheckConfig,
-    ResolvedHttpCheck, ResolvedHttpExpectPattern, ResolvedHttpExpectRule, ResolvedTcpStep,
-    Server, StatsConfig, StickRule, StickRuleType, StickTableConfigAst, TcpCheckAction,
-    TcpCheckExpectPattern, TcpReqConnAction, TcpReqConnRule, TcpReqContentAction,
-    TcpReqContentRule, TcpReqSessionAction, TcpReqSessionRule, TimeoutConfig, UseBackendRule,
+    clear_http_errors_sections, clear_resolved_checks, http_errors_section, http_errors_section_code,
+    register_http_errors_section, register_resolved_check, register_resolved_check_for_addr,
+    AclCondition, AclRule, AclTerm, BackendSection, BalanceAlgorithm, BindConfig, Config,
+    DefaultServerConfig, DefaultsSection, ErrorPageSource, FrontendSection, GlobalSection,
+    GlobalSetVar, HttpAfterResAction, HttpAfterResRule, HttpCheckAction, HttpCheckExpectPattern,
+    HttpChkConfig, HttpReqAction, HttpReqRule, HttpResAction, HttpResRule, HttpReuse,
+    ListenSection, LogConfig, LogFacility, LogLevel, LogTarget, MatchType, Mode,
+    MysqlCheckVersion, ProtoCheckConfig, ResolvedCheckConfig, ResolvedHttpCheck,
+    ResolvedHttpExpectPattern, ResolvedHttpExpectRule, ResolvedTcpStep, Server, StatsConfig,
+    StickRule, StickRuleType, StickTableConfigAst, TcpCheckAction, TcpCheckExpectPattern,
+    TcpReqConnAction, TcpReqConnRule, TcpReqContentAction, TcpReqContentRule,
+    TcpReqSessionAction, TcpReqSessionRule, TimeoutConfig, UseBackendRule,
 };
 use crate::error::ConfigError;
 use crate::lexer::{lex, Token};
@@ -81,6 +83,9 @@ pub(crate) enum CurrentSection {
     Frontend(FrontendSection),
     Backend(BackendSection),
     Resolvers,
+    /// `http-errors <name>`: a named, independent set of `errorfile` entries referenced by
+    /// proxies via `errorfiles <name> [<code>...]`.
+    HttpErrors(String, std::collections::HashMap<u16, Vec<u8>>),
 }
 
 pub(crate) mod global;
@@ -109,6 +114,8 @@ pub(crate) mod stats;
 pub(crate) use stats::*;
 pub(crate) mod scalars;
 pub(crate) use scalars::*;
+pub(crate) mod error_pages;
+pub(crate) use error_pages::*;
 
 /// Parses `HAProxy` configuration text into a typed `Config` AST.
 ///
@@ -126,6 +133,12 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
     // still failed with "unknown keyword" and the harness went on stripping the blocks
     // itself.
     let lines = crate::preproc::preprocess(lex(input))?;
+
+    // `http-errors` sections are resolved eagerly into a process-wide registry as they are
+    // parsed (see `crate::ast::rules_http`), the same way `crate::ast::checks` resolves
+    // checks. Clear it first so a previous `parse_str` call in the same process -- tests
+    // parse many configs -- cannot leak a section into this one.
+    clear_http_errors_sections();
 
     let mut global: Option<GlobalSection> = None;
     let mut defaults: Option<DefaultsSection> = None;
@@ -264,6 +277,28 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                 );
                 cur_section = Some(CurrentSection::Resolvers);
             }
+            "http-errors" => {
+                flush_current_section(
+                    &mut cur_section,
+                    &mut global,
+                    &mut defaults,
+                    &mut named_defaults,
+                    &mut listens,
+                    &mut frontends,
+                    &mut backends,
+                );
+                if tokens.len() < 2 || tokens[1].text.is_empty() {
+                    return Err(ConfigError::new(
+                        kw.line,
+                        kw.col,
+                        "<http-errors> expects a section name",
+                    ));
+                }
+                cur_section = Some(CurrentSection::HttpErrors(
+                    tokens[1].text.clone(),
+                    std::collections::HashMap::new(),
+                ));
+            }
             _ => {
                 let section = cur_section
                     .as_mut()
@@ -340,6 +375,7 @@ pub(crate) fn flush_current_section(
             CurrentSection::Frontend(f) => frontends.push(f),
             CurrentSection::Backend(b) => backends.push(b),
             CurrentSection::Resolvers => {}
+            CurrentSection::HttpErrors(name, table) => register_http_errors_section(name, table),
         }
     }
 }
@@ -359,6 +395,14 @@ pub(crate) fn parse_section_directive(
         CurrentSection::Frontend(f) => parse_frontend_directive(f, tokens, kw),
         CurrentSection::Backend(b) => parse_backend_directive(b, tokens, kw),
         CurrentSection::Resolvers => parse_resolvers_directive(tokens, kw),
+        CurrentSection::HttpErrors(_, table) => match kw.text.as_str() {
+            "errorfile" => parse_errorfile_directive(table, tokens, kw),
+            other => Err(ConfigError::new(
+                kw.line,
+                kw.col,
+                format!("unknown keyword '{other}' in 'http-errors' section, expects 'errorfile'"),
+            )),
+        },
     }
 }
 

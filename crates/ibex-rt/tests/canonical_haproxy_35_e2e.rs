@@ -329,13 +329,15 @@ fn test_canonical_haproxy_35_config_parse() {
         HttpReqAction::Return {
             status: 200,
             ref content_type,
-            ref lf_string
+            ref lf_string,
+            ..
         } if content_type.as_deref() == Some("text/plain") && (lf_string.as_deref() == Some("OK\n") || lf_string.as_deref() == Some("OK\\n"))
     ));
     assert!(matches!(
         fe.http_req_rules[2].action,
         HttpReqAction::Deny {
-            deny_status: Some(429)
+            deny_status: Some(429),
+            ..
         }
     ));
 
@@ -553,9 +555,14 @@ fn test_canonical_haproxy_35_security_rate_limiting() {
         rate_limited_resp.starts_with("HTTP/1.1 429 Too Many Requests"),
         "Expected synthetic HTTP 429 Too Many Requests, got: {rate_limited_resp}"
     );
+    // A bare `deny` with no body argument implies `default-errorfiles` (HAProxy's
+    // documented alias, see doc/configuration.txt on the `deny` action), which falls
+    // back to HAProxy's built-in 429 page -- not an empty body -- when the proxy has no
+    // `errorfile`/`http-error` override for 429. Transcribed from `http_err_msgs` in
+    // HAProxy 3.5-dev7's `src/http.c`.
     assert!(
-        rate_limited_resp.contains("Content-Length: 0"),
-        "Expected Content-Length: 0 on 429 response"
+        rate_limited_resp.contains("Content-length: 117"),
+        "Expected HAProxy's built-in 429 page (Content-length: 117), got: {rate_limited_resp}"
     );
 
     // 3. Exceed L4 connection rate threshold: `tcp-request connection silent-drop if { sc_conn_rate(0) gt 100 }`

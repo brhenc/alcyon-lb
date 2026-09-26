@@ -174,6 +174,10 @@ pub struct Proxy {
     pub log_health_checks: bool,
     /// HTTP connection reuse strategy (`http-reuse`).
     pub http_reuse: ibex_config::HttpReuse,
+    /// Custom error pages (`errorfile`/`errorfiles`), keyed by status code.
+    pub error_files: HashMap<u16, Vec<u8>>,
+    /// `http-error` overrides, keyed by status code; consulted before `error_files`.
+    pub error_replies: HashMap<u16, ibex_config::ErrorPageSource>,
 }
 
 impl Proxy {
@@ -847,6 +851,8 @@ fn init_proxy_from_listen(proxy_idx: usize, listen: &ibex_config::ListenSection,
         http_res_rules: listen.http_res_rules.clone(),
         http_after_res_rules: listen.http_after_res_rules.clone(),
         http_reuse: listen.http_reuse.unwrap_or_default(),
+        error_files: listen.error_files.clone(),
+        error_replies: listen.error_replies.clone(),
     }
 }
 
@@ -928,6 +934,8 @@ fn init_proxy_from_frontend(proxy_idx: usize, fe: &ibex_config::FrontendSection,
         http_res_rules: fe.http_res_rules.clone(),
         http_after_res_rules: fe.http_after_res_rules.clone(),
         http_reuse: ibex_config::HttpReuse::default(),
+        error_files: fe.error_files.clone(),
+        error_replies: fe.error_replies.clone(),
     }
 }
 
@@ -1036,6 +1044,8 @@ fn init_proxy_from_backend(proxy_idx: usize, be: &ibex_config::BackendSection, n
         http_res_rules: be.http_res_rules.clone(),
         http_after_res_rules: be.http_after_res_rules.clone(),
         http_reuse: be.http_reuse.unwrap_or_default(),
+        error_files: be.error_files.clone(),
+        error_replies: be.error_replies.clone(),
     }
 }
 
@@ -4890,77 +4900,64 @@ impl EngineDispatcher<'_> {
                         status,
                         content_type,
                         lf_string,
+                        error_page,
                     } => {
-                        let mut custom_headers: Vec<(String, String)> = Vec::new();
-                        let mut body_str = String::new();
+                        let body = resolve_error_body(&proxies[proxy_idx], *status, error_page, content_type, lf_string);
+                        match body {
+                            ResolvedErrorBody::Raw(bytes) => {
+                                let w = sess.rep.writable();
+                                let n = w.len().min(bytes.len());
+                                w[..n].copy_from_slice(&bytes[..n]);
+                                sess.rep.commit(n);
+                                sess.cli_state = ScState::ShutR;
+                                sess.srv_state = ScState::Closed;
+                                return Ok(Some(()));
+                            }
+                            ResolvedErrorBody::Custom { content_type, lf_string } => {
+                                let full_resp = build_templated_error_response(
+                                    *status,
+                                    content_type,
+                                    lf_string,
+                                    &make_ctx!(sess),
+                                    registry,
+                                );
 
-                        if let Some(s) = lf_string.as_deref() {
-                            let mut rest = s;
-                            while let Some(stripped) = rest.strip_prefix("\0HDR:") {
-                                if let Some((line, r)) = stripped.split_once('\n') {
-                                    if let Some((k, v)) = line.split_once(':') {
-                                        let formatted_v = format_sample_string(v, &make_ctx!(sess), registry);
-                                        custom_headers.push((k.to_string(), formatted_v));
-                                    }
-                                    rest = r;
-                                } else {
-                                    break;
+                                let w = sess.rep.writable();
+                                let n = w.len().min(full_resp.len());
+                                w[..n].copy_from_slice(&full_resp[..n]);
+                                sess.rep.commit(n);
+
+                                if let Some((hdr_len, eoh_len)) = crate::proxy::find_eoh(sess.req.readable()) {
+                                    sess.req.consume(hdr_len + eoh_len);
                                 }
-                            }
-                            if let Some(b) = rest.strip_prefix("\0BODY:") {
-                                body_str = format_sample_string(b, &make_ctx!(sess), registry);
-                            } else if !rest.starts_with('\0') {
-                                body_str = format_sample_string(rest, &make_ctx!(sess), registry);
-                            }
-                        }
-
-                        let unescaped = body_str
-                            .replace("\\n", "\n")
-                            .replace("\\r", "\r")
-                            .replace("\\t", "\t");
-                        let body = unescaped.as_bytes();
-
-                        let reason = status_reason(*status);
-                        let mut resp = format!("HTTP/1.1 {status} {reason}\r\n");
-                        if let Some(ct) = content_type.as_deref() {
-                            let _ = write!(resp, "Content-Type: {ct}\r\n");
-                        }
-                        for (k, v) in custom_headers {
-                            if !v.is_empty() {
-                                let _ = write!(resp, "{k}: {v}\r\n");
+                                sess.req_method = None;
+                                sess.req_uri = None;
+                                sess.req_headers = None;
+                                sess.clear_htx();
+                                sess.cli_state = ScState::Ready;
+                                sess.srv_state = ScState::Init;
+                                sess.resp_headers_processed = false;
+                                return Ok(Some(()));
                             }
                         }
-                        let _ = write!(resp, "Content-Length: {}\r\n\r\n", body.len());
-
-                        let mut full_resp = resp.into_bytes();
-                        full_resp.extend_from_slice(body);
-
-                        let w = sess.rep.writable();
-                        let n = w.len().min(full_resp.len());
-                        w[..n].copy_from_slice(&full_resp[..n]);
-                        sess.rep.commit(n);
-
-                        if let Some((hdr_len, eoh_len)) = crate::proxy::find_eoh(sess.req.readable()) {
-                            sess.req.consume(hdr_len + eoh_len);
-                        }
-                        sess.req_method = None;
-                        sess.req_uri = None;
-                        sess.req_headers = None;
-                        sess.clear_htx();
-                        sess.cli_state = ScState::Ready;
-                        sess.srv_state = ScState::Init;
-                        sess.resp_headers_processed = false;
-                        return Ok(Some(()));
                     }
-                    ibex_config::HttpReqAction::Deny { deny_status } => {
+                    ibex_config::HttpReqAction::Deny {
+                        deny_status,
+                        content_type,
+                        lf_string,
+                        error_page,
+                    } => {
                         let status_code = deny_status.unwrap_or(403);
-                        let reason = status_reason(status_code);
-                        let resp = format!(
-                            "HTTP/1.1 {status_code} {reason}\r\nContent-Type: text/plain\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                        );
+                        let body = resolve_error_body(&proxies[proxy_idx], status_code, error_page, content_type, lf_string);
+                        let resp: Vec<u8> = match body {
+                            ResolvedErrorBody::Raw(bytes) => bytes.to_vec(),
+                            ResolvedErrorBody::Custom { content_type, lf_string } => {
+                                build_templated_error_response(status_code, content_type, lf_string, &make_ctx!(sess), registry)
+                            }
+                        };
                         let w = sess.rep.writable();
                         let n = w.len().min(resp.len());
-                        w[..n].copy_from_slice(&resp.as_bytes()[..n]);
+                        w[..n].copy_from_slice(&resp[..n]);
                         sess.rep.commit(n);
                         sess.cli_state = ScState::ShutR;
                         sess.srv_state = ScState::Closed;
@@ -6570,6 +6567,160 @@ const fn status_reason(status: u16) -> &'static str {
         504 => "Gateway Timeout",
         _ => "OK",
     }
+}
+
+/// HAProxy's built-in error pages, transcribed byte-for-byte from `http_err_msgs` in
+/// `src/http.c` (3.5-dev7): status code paired with the full raw response HAProxy sends
+/// when nothing -- no `errorfile`, `errorfiles`, or `http-error` -- customises that code.
+/// This is the last fallback `default-errorfiles` (explicit, or implied by a bare `deny`)
+/// resolves to, and it is why, for example, an unconfigured 403 has `Content-length: 93`.
+const BUILTIN_ERROR_PAGES: &[(u16, &str)] = &[
+    (200, "HTTP/1.1 200 OK\r\nContent-length: 58\r\nCache-Control: no-cache\r\nContent-Type: text/html\r\n\r\n<html><body><h1>200 OK</h1>\nService ready.\n</body></html>\n"),
+    (400, "HTTP/1.1 400 Bad request\r\nContent-length: 90\r\nCache-Control: no-cache\r\nConnection: close\r\nContent-Type: text/html\r\n\r\n<html><body><h1>400 Bad request</h1>\nYour browser sent an invalid request.\n</body></html>\n"),
+    (401, "HTTP/1.1 401 Unauthorized\r\nContent-length: 112\r\nCache-Control: no-cache\r\nContent-Type: text/html\r\n\r\n<html><body><h1>401 Unauthorized</h1>\nYou need a valid user and password to access this content.\n</body></html>\n"),
+    (403, "HTTP/1.1 403 Forbidden\r\nContent-length: 93\r\nCache-Control: no-cache\r\nContent-Type: text/html\r\n\r\n<html><body><h1>403 Forbidden</h1>\nRequest forbidden by administrative rules.\n</body></html>\n"),
+    (404, "HTTP/1.1 404 Not Found\r\nContent-length: 83\r\nCache-Control: no-cache\r\nContent-Type: text/html\r\n\r\n<html><body><h1>404 Not Found</h1>\nThe resource could not be found.\n</body></html>\n"),
+    (405, "HTTP/1.1 405 Method Not Allowed\r\nContent-length: 147\r\nCache-Control: no-cache\r\nContent-Type: text/html\r\n\r\n<html><body><h1>405 Method Not Allowed</h1>\nA request was made of a resource using a request method not supported by that resource.\n</body></html>\n"),
+    (407, "HTTP/1.1 407 Unauthorized\r\nContent-length: 112\r\nCache-Control: no-cache\r\nContent-Type: text/html\r\n\r\n<html><body><h1>407 Unauthorized</h1>\nYou need a valid user and password to access this content.\n</body></html>\n"),
+    (408, "HTTP/1.1 408 Request Time-out\r\nContent-length: 110\r\nCache-Control: no-cache\r\nConnection: close\r\nContent-Type: text/html\r\n\r\n<html><body><h1>408 Request Time-out</h1>\nYour browser didn't send a complete request in time.\n</body></html>\n"),
+    (410, "HTTP/1.1 410 Gone\r\nContent-length: 114\r\nCache-Control: no-cache\r\nContent-Type: text/html\r\n\r\n<html><body><h1>410 Gone</h1>\nThe resource is no longer available and will not be available again.\n</body></html>\n"),
+    (413, "HTTP/1.1 413 Payload Too Large\r\nContent-length: 106\r\nCache-Control: no-cache\r\nContent-Type: text/html\r\n\r\n<html><body><h1>413 Payload Too Large</h1>\nThe request entity exceeds the maximum allowed.\n</body></html>\n"),
+    (414, "HTTP/1.1 414 URI Too Long\r\nContent-length: 110\r\nCache-Control: no-cache\r\nContent-Type: text/html\r\n\r\n<html><body><h1>414 URI Too Long</h1>\nThe URI provided was too long for the server to process.\n</body></html>\n"),
+    (421, "HTTP/1.1 421 Misdirected Request\r\nContent-length: 104\r\nCache-Control: no-cache\r\nContent-Type: text/html\r\n\r\n<html><body><h1>421 Misdirected Request</h1>\nRequest sent to a non-authoritative server.\n</body></html>\n"),
+    (422, "HTTP/1.1 422 Unprocessable Content\r\nContent-length: 116\r\nCache-Control: no-cache\r\nContent-Type: text/html\r\n\r\n<html><body><h1>422 Unprocessable Content</h1>\nThe server cannot process the contained instructions.\n</body></html>\n"),
+    (425, "HTTP/1.1 425 Too Early\r\nContent-length: 80\r\nCache-Control: no-cache\r\nContent-Type: text/html\r\n\r\n<html><body><h1>425 Too Early</h1>\nYour browser sent early data.\n</body></html>\n"),
+    (429, "HTTP/1.1 429 Too Many Requests\r\nContent-length: 117\r\nCache-Control: no-cache\r\nContent-Type: text/html\r\n\r\n<html><body><h1>429 Too Many Requests</h1>\nYou have sent too many requests in a given amount of time.\n</body></html>\n"),
+    (431, "HTTP/1.1 431 Request Header Fields Too Large\r\nContent-length: 105\r\nCache-Control: no-cache\r\nContent-Type: text/html\r\n\r\n<html><body><h1>431 Request Header Fields Too Large</h1>\nRequest Header Fields Too Large.\n</body></html>\n"),
+    (500, "HTTP/1.1 500 Internal Server Error\r\nContent-length: 97\r\nCache-Control: no-cache\r\nContent-Type: text/html\r\n\r\n<html><body><h1>500 Internal Server Error</h1>\nAn internal server error occurred.\n</body></html>\n"),
+    (501, "HTTP/1.1 501 Not Implemented\r\nContent-length: 135\r\nCache-Control: no-cache\r\nContent-Type: text/html\r\n\r\n<html><body><h1>501 Not Implemented</h1>\nThe server does not support the functionality required to fulfill the request.\n</body></html>\n"),
+    (502, "HTTP/1.1 502 Bad Gateway\r\nContent-length: 107\r\nCache-Control: no-cache\r\nContent-Type: text/html\r\n\r\n<html><body><h1>502 Bad Gateway</h1>\nThe server returned an invalid or incomplete response.\n</body></html>\n"),
+    (503, "HTTP/1.1 503 Service Unavailable\r\nContent-length: 107\r\nCache-Control: no-cache\r\nContent-Type: text/html\r\n\r\n<html><body><h1>503 Service Unavailable</h1>\nNo server is available to handle this request.\n</body></html>\n"),
+    (504, "HTTP/1.1 504 Gateway Time-out\r\nContent-length: 92\r\nCache-Control: no-cache\r\nContent-Type: text/html\r\n\r\n<html><body><h1>504 Gateway Time-out</h1>\nThe server didn't respond in time.\n</body></html>\n"),
+];
+
+fn builtin_error_page(status: u16) -> Option<&'static [u8]> {
+    BUILTIN_ERROR_PAGES
+        .iter()
+        .find(|(code, _)| *code == status)
+        .map(|(_, msg)| msg.as_bytes())
+}
+
+/// What `deny`/`return` will actually send for a given status, once `error_page` (and, for
+/// `default-errorfiles`, the proxy's own `error_replies`/`error_files` tables) has been
+/// resolved.
+enum ResolvedErrorBody<'a> {
+    /// A full response, taken verbatim from an `errorfile`, an `errorfiles` section entry,
+    /// or HAProxy's built-in page. An empty slice is a deliberately empty errorfile (the
+    /// documented `/dev/null` idiom): nothing is written, and the connection just closes.
+    Raw(&'a [u8]),
+    /// A response to build from `content-type`/`hdr`/`string`/`lf-string`, exactly as
+    /// `http-request return` already does.
+    Custom {
+        content_type: Option<&'a str>,
+        lf_string: Option<&'a str>,
+    },
+}
+
+/// Resolves `deny`/`return`'s `error_page` argument (and, transitively, `http-error`'s
+/// per-proxy overrides and `errorfile`/`errorfiles`'s per-proxy table) to what should
+/// actually be sent for `status`.
+///
+/// The data path this closes: a denied request whose proxy configured `errorfile 403
+/// site.http` used to always get Ibex's hardcoded 403 body; this is the line where it
+/// picks up the operator's file instead.
+fn resolve_error_body<'a>(
+    proxy: &'a Proxy,
+    status: u16,
+    error_page: &'a Option<ibex_config::ErrorPageSource>,
+    content_type: &'a Option<String>,
+    lf_string: &'a Option<String>,
+) -> ResolvedErrorBody<'a> {
+    match error_page {
+        None => ResolvedErrorBody::Custom {
+            content_type: content_type.as_deref(),
+            lf_string: lf_string.as_deref(),
+        },
+        Some(ibex_config::ErrorPageSource::Raw(bytes)) => ResolvedErrorBody::Raw(bytes.as_slice()),
+        Some(ibex_config::ErrorPageSource::Custom { content_type, lf_string }) => ResolvedErrorBody::Custom {
+            content_type: content_type.as_deref(),
+            lf_string: lf_string.as_deref(),
+        },
+        Some(ibex_config::ErrorPageSource::DefaultErrorfiles) => {
+            match proxy.error_replies.get(&status) {
+                Some(ibex_config::ErrorPageSource::Raw(bytes)) => return ResolvedErrorBody::Raw(bytes.as_slice()),
+                Some(ibex_config::ErrorPageSource::Custom { content_type, lf_string }) => {
+                    return ResolvedErrorBody::Custom {
+                        content_type: content_type.as_deref(),
+                        lf_string: lf_string.as_deref(),
+                    };
+                }
+                Some(ibex_config::ErrorPageSource::DefaultErrorfiles) | None => {}
+            }
+            if let Some(bytes) = proxy.error_files.get(&status) {
+                return ResolvedErrorBody::Raw(bytes.as_slice());
+            }
+            if let Some(builtin) = builtin_error_page(status) {
+                return ResolvedErrorBody::Raw(builtin);
+            }
+            ResolvedErrorBody::Custom { content_type: None, lf_string: None }
+        }
+    }
+}
+
+/// Builds a full raw HTTP response from `http-request return`/`deny`'s templated body
+/// arguments: an optional `content-type`, and the `\0HDR:`/`\0BODY:`-encoded custom
+/// headers and payload the parser already produces for `string`/`lf-string`/`file`/
+/// `lf-file`/`hdr`. Shared by `Return`'s dummy/templated body, `Deny`'s equivalent
+/// arguments, and an `http-error`'s inline template resolved through
+/// `ErrorPageSource::Custom`.
+fn build_templated_error_response(
+    status: u16,
+    content_type: Option<&str>,
+    lf_string: Option<&str>,
+    ctx: &SampleContext,
+    registry: &Registry,
+) -> Vec<u8> {
+    let mut custom_headers: Vec<(String, String)> = Vec::new();
+    let mut body_str = String::new();
+
+    if let Some(s) = lf_string {
+        let mut rest = s;
+        while let Some(stripped) = rest.strip_prefix("\0HDR:") {
+            if let Some((line, r)) = stripped.split_once('\n') {
+                if let Some((k, v)) = line.split_once(':') {
+                    let formatted_v = format_sample_string(v, ctx, registry);
+                    custom_headers.push((k.to_string(), formatted_v));
+                }
+                rest = r;
+            } else {
+                break;
+            }
+        }
+        if let Some(b) = rest.strip_prefix("\0BODY:") {
+            body_str = format_sample_string(b, ctx, registry);
+        } else if !rest.starts_with('\0') {
+            body_str = format_sample_string(rest, ctx, registry);
+        }
+    }
+
+    let unescaped = body_str.replace("\\n", "\n").replace("\\r", "\r").replace("\\t", "\t");
+    let body = unescaped.as_bytes();
+
+    let reason = status_reason(status);
+    let mut resp = format!("HTTP/1.1 {status} {reason}\r\n");
+    if let Some(ct) = content_type {
+        let _ = write!(resp, "Content-Type: {ct}\r\n");
+    }
+    for (k, v) in custom_headers {
+        if !v.is_empty() {
+            let _ = write!(resp, "{k}: {v}\r\n");
+        }
+    }
+    let _ = write!(resp, "Content-Length: {}\r\n\r\n", body.len());
+
+    let mut full_resp = resp.into_bytes();
+    full_resp.extend_from_slice(body);
+    full_resp
 }
 
 #[cfg(test)]
