@@ -169,3 +169,55 @@ fn a_close_delimited_response_still_closes_the_client() {
     assert!(resp.ends_with("body until close"), "{resp:?}");
     assert!(closed, "the client never saw the close that ends the body: {resp:?}");
 }
+
+/// Reads until `quiet` passes with nothing arriving, the peer closes, or two seconds pass.
+fn read_for(c: &mut TcpStream, quiet: Duration) -> String {
+    c.set_read_timeout(Some(quiet)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut resp = Vec::new();
+    let mut buf = [0u8; 4096];
+    while Instant::now() < deadline {
+        match c.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => resp.extend_from_slice(&buf[..n]),
+        }
+    }
+    String::from_utf8_lossy(&resp).into_owned()
+}
+
+/// A 503 the proxy generates itself (no server to send the request to) answers the request
+/// once, and the connection stays usable -- `HAProxy` 3.5 answers one 503 per request, three
+/// requests in a row on one connection. Ibex answered the first request five times: the
+/// request that caused the 503 was never forwarded, so it was still in the buffer when the
+/// transaction ended, and the session ran it again.
+#[test]
+fn a_generated_503_answers_its_request_once_and_keeps_the_connection() {
+    let fe = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+    let mut f = NamedTempFile::new().expect("tmp");
+    write!(
+        f,
+        "defaults\n  mode http\n  timeout connect 2s\n  timeout client 5s\n  timeout server 5s\n\
+         frontend fe\n  bind {fe}\n  default_backend be\nbackend be\n"
+    )
+    .unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_ibex"))
+        .arg("-f")
+        .arg(f.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn ibex");
+    let _ibex = Ibex(child, f);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while TcpStream::connect(fe).is_err() {
+        assert!(Instant::now() < deadline, "ibex never started listening on {fe}");
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let mut c = TcpStream::connect(fe).expect("connect");
+    for i in 0..3 {
+        c.write_all(format!("GET /{i} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes()).unwrap();
+        let got = read_for(&mut c, Duration::from_millis(500));
+        assert_eq!(got.matches("HTTP/1.1 503").count(), 1, "request {i}: {got:?}");
+    }
+}
