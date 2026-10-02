@@ -11,10 +11,11 @@
 //!
 //! A binary whose name contains `haproxy` is started with `-db`.
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -27,6 +28,8 @@ use tempfile::NamedTempFile;
 struct Seen {
     method: String,
     path: String,
+    /// The request line and headers as they arrived.
+    head: String,
     body: Vec<u8>,
     /// Which backend connection it arrived on, counted from 0.
     conn: usize,
@@ -107,7 +110,7 @@ fn read_request(s: &mut TcpStream, buf: &mut Vec<u8>, conn: usize) -> Option<See
         }
         body = buf.drain(..cl).collect();
     }
-    Some(Seen { method, path, body, conn })
+    Some(Seen { method, path, head, body, conn })
 }
 
 /// A keep-alive HTTP/1.1 backend that answers each request with `handler` and records it.
@@ -179,19 +182,9 @@ fn stop(child: &mut Child) {
 /// range (`bind :0`, then released), it could be handed straight to another test's backend
 /// before the proxy bound it -- the readiness probe then connected to the wrong process,
 /// and the test talked to a stranger. Backends bind `:0`, so they never land down here.
-fn frontend_addr() -> SocketAddr {
-    static NEXT: AtomicU16 = AtomicU16::new(0);
-    let base = u16::try_from(std::process::id() % 1000).unwrap_or(0) * 10;
-    loop {
-        let port = 20000 + (base + NEXT.fetch_add(1, Ordering::Relaxed)) % 10000;
-        if let Ok(l) = TcpListener::bind(("127.0.0.1", port)) {
-            return l.local_addr().unwrap();
-        }
-    }
-}
 
 fn start(cfg: &str, backends: &[SocketAddr]) -> (Proxy, SocketAddr) {
-    let fe = frontend_addr();
+    let fe = common::reserve_addr();
     let mut text = format!(
         // One thread: the suite runs every case at once, and a proxy per case with a worker
         // per CPU is thousands of threads.
@@ -685,6 +678,33 @@ fn connection_close_from_the_client_closes_after_the_response() {
     c.send(b"GET /x HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
     assert_eq!(c.final_response().map(|r| r.body_str()).as_deref(), Some("GET /x 0"));
     assert!(c.closed_within(Duration::from_secs(1)));
+}
+
+/// T89: `Content-Length` beside `Transfer-Encoding: chunked`. `HAProxy` forwards it: the
+/// chunked encoding wins, the `Content-Length` is removed, and the connection closes after
+/// the response (`src/h1.c`, `h1_parse_msg_hdrs`: "T-E + C-L: force close and remove C-L",
+/// unless `h1-do-not-close-on-insecure-transfer-encoding`). Measured on HAProxy
+/// 3.5-dev7-e6f616-55, 2026-10-02.
+///
+/// The checkin runs this file against the reference HAProxy (`harness/txn_oracle.py`), so
+/// if HAProxy starts refusing these (RFC 9112 6.3 allows either) or keeps the connection,
+/// that check goes red and says when.
+#[test]
+fn content_length_beside_chunked_is_forwarded_chunked_then_closed() {
+    let (_p, fe, seen) = simple(echo, "");
+    let mut c = Client::connect(fe);
+    c.send(
+        b"POST /p HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n\
+          3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n",
+    );
+    let r = c.final_response();
+    assert_eq!(r.as_ref().map(|r| (r.status, r.body_str())), Some((200, "POST /p 5".to_string())), "{r:?}");
+    assert!(c.closed_within(Duration::from_secs(1)), "the connection must close after the response");
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen[0].body, b"abcde", "the body is framed by the chunks, not the length");
+    let head = seen[0].head.to_ascii_lowercase();
+    assert!(!head.contains("content-length"), "Content-Length must be removed:\n{head}");
+    assert!(head.contains("transfer-encoding: chunked"), "{head}");
 }
 
 /// `http-request` rules run for every request on a connection, not only the first: the

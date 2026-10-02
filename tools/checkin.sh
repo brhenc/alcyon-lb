@@ -109,6 +109,14 @@ python3 harness/smoke.py 2>&1 | grep -vE "^$"
 check "${PIPESTATUS[0]}" "smoke"
 
 echo
+echo "=== does HAProxy still behave as the tests record ==="
+# http_txn.rs is measured against HAProxy; run against it here, a case that starts failing
+# means HAProxy changed (T89: Content-Length beside chunked is the case the user asked to
+# watch). Expected HAProxy failures: data/txn_oracle_baseline.json.
+python3 harness/txn_oracle.py 2>&1 | grep -vE "^$"
+check "${PIPESTATUS[0]}" "txn oracle"
+
+echo
 echo "=== does the rest still build and lint ==="
 cargo clippy -q --workspace --all-targets 2>&1 | grep -E "^(warning|error)" | grep -v generated | sort | uniq -c
 CLIPPY_RC=${PIPESTATUS[0]}

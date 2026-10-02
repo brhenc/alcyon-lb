@@ -585,8 +585,7 @@ impl TcpSession {
     /// Runs the configured parser over a complete request head.
     ///
     /// # Errors
-    /// A framing violation: conflicting or malformed `Content-Length` /
-    /// `Transfer-Encoding`, a bare CR as a line terminator, an invalid header name, or a
+    /// A framing violation: a malformed `Content-Length` / `Transfer-Encoding`, a bare CR as a line terminator, an invalid header name, or a
     /// malformed chunk size. Each of these is a way for two intermediaries to read the
     /// same bytes as different requests.
     fn validate_request_head(&mut self, head_len: usize) -> io::Result<bool> {
@@ -596,21 +595,23 @@ impl TcpSession {
         let raw = self.htx_buf.raw_slice_mut();
         let mut slice = ibex_proto::htx::HtxSlice::new(raw);
         stream.parse(&self.req.readable()[..head_len], &mut slice)?;
-        let close = stream.connection_close();
-        if stream.framing_conflict() {
-            // RFC 9112: Transfer-Encoding wins and the connection must not be reused.
-            // The message is parseable, so this is not an error -- but forwarding it to a
-            // backend that might resolve the conflict the other way is the whole attack.
-            self.ending.get_or_insert(Ending::Error);
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "conflicting Content-Length and Transfer-Encoding",
-            ));
+        let mut close = stream.connection_close();
+        // `Content-Length` beside `Transfer-Encoding`: forwarded as HAProxy does
+        // (`src/h1.c`, `h1_parse_msg_hdrs`, "T-E + C-L: force close and remove C-L"). The
+        // chunked encoding frames the body, the `Content-Length` is removed so no next hop
+        // can frame it by the length instead -- the smuggling this would otherwise be --
+        // and the connection closes after the response (RFC 9112 section 6.3, rule 3).
+        // tasks/T89; the user chose to follow HAProxy over refusing.
+        let conflict = stream.framing_conflict();
+        if conflict {
+            slice.remove_header("content-length");
+            close = true;
         }
         self.htx_tail = slice.tail_addr();
         self.htx_blocks = slice.num_blocks();
         self.has_htx = true;
-        self.htx_modified = false;
+        // Modified, so the head forwarded is regenerated from the HTX, without it.
+        self.htx_modified = conflict;
         Ok(close)
     }
 
@@ -866,10 +867,9 @@ impl TcpSession {
                 // will parse almost anything and forwards the headers verbatim. That is
                 // how a request carrying both `Content-Length` and `Transfer-Encoding`
                 // reached a backend with both headers intact and a second request behind
-                // them -- textbook CL.TE smuggling. (HAProxy 3.5 forwards that one with the
-                // chunked framing and closes after; Ibex refuses it: tasks/T89.)
-                // `h1.rs` has rejected that since the strict-framing work; nothing on
-                // this path was asking it.
+                // them -- textbook CL.TE smuggling. Such a request is now forwarded the
+                // way HAProxy forwards it: chunked, without the `Content-Length`, closing
+                // after (see `validate_request_head`, tasks/T89).
                 //
                 // The head is already buffered, so this is a complete message and the
                 // stream needs no state across calls. One allocation per request head
