@@ -1339,37 +1339,18 @@ impl TcpSession {
 
     /// Applies whichever timeout has fired, if any.
     pub fn check_timeouts(&mut self, now: Tick) -> bool {
-        if self.conn_exp.is_expired(now) && self.srv_state == ScState::Connecting {
+        if self.conn_exp.is_expired(now) && self.conn_timer_live() {
             self.conn_exp = Tick::ETERNITY;
             self.srv_state = ScState::Error;
             self.ending.get_or_insert(Ending::Timeout(Which::Connect));
             return true;
         }
-        // Once an HTTP request is complete the client owes nothing until its response
-        // starts: the wait belongs to `timeout server`, as in HAProxy.
-        let awaiting_server = self.mode == Mode::Http
-            && self.txn.as_ref().is_some_and(|t| t.req.is_done() && !t.local && t.error.is_none())
-            && !self.has_pending_output();
-        if self.cli_exp.is_expired(now)
-            && !awaiting_server
-            && matches!(
-                self.cli_state,
-                ScState::Ready | ScState::Established | ScState::ShutR | ScState::ShutW
-            )
-        {
+        if self.cli_exp.is_expired(now) && self.cli_timer_live() {
             self.cli_state = ScState::Error;
             self.ending.get_or_insert(Ending::Timeout(Which::Client));
             return true;
         }
-        // A server connection kept idle between HTTP transactions owes nothing.
-        let srv_idle = self.mode == Mode::Http && self.txn.is_none();
-        if self.srv_exp.is_expired(now)
-            && !srv_idle
-            && matches!(
-                self.srv_state,
-                ScState::Ready | ScState::Established | ScState::ShutR | ScState::ShutW
-            )
-        {
+        if self.srv_exp.is_expired(now) && self.srv_timer_live() {
             self.srv_state = ScState::Error;
             self.ending.get_or_insert(Ending::Timeout(Which::Server));
             return true;
@@ -1377,10 +1358,42 @@ impl TcpSession {
         false
     }
 
-    /// The earliest deadline across both sides, for the scheduler's wait queue.
+    fn conn_timer_live(&self) -> bool {
+        self.srv_state == ScState::Connecting
+    }
+
+    fn cli_timer_live(&self) -> bool {
+        // Once an HTTP request is complete the client owes nothing until its response
+        // starts: the wait belongs to `timeout server`, as in HAProxy.
+        let awaiting_server = self.mode == Mode::Http
+            && self.txn.as_ref().is_some_and(|t| t.req.is_done() && !t.local && t.error.is_none())
+            && !self.has_pending_output();
+        !awaiting_server
+            && matches!(
+                self.cli_state,
+                ScState::Ready | ScState::Established | ScState::ShutR | ScState::ShutW
+            )
+    }
+
+    fn srv_timer_live(&self) -> bool {
+        // A server connection kept idle between HTTP transactions owes nothing.
+        let srv_idle = self.mode == Mode::Http && self.txn.is_none();
+        !srv_idle
+            && matches!(
+                self.srv_state,
+                ScState::Ready | ScState::Established | ScState::ShutR | ScState::ShutW
+            )
+    }
+
+    /// The earliest deadline across both sides, for the scheduler's wait queue. A timer
+    /// `check_timeouts` would not act on is left out: expired, it would wake the session
+    /// at once, every pass, for nothing.
     #[must_use]
     pub fn next_expiry(&self) -> Tick {
-        let mut exp = self.cli_exp.earliest(self.srv_exp).earliest(self.conn_exp);
+        let live = |exp: Tick, live: bool| if live { exp } else { Tick::ETERNITY };
+        let mut exp = live(self.cli_exp, self.cli_timer_live())
+            .earliest(live(self.srv_exp, self.srv_timer_live()))
+            .earliest(live(self.conn_exp, self.conn_timer_live()));
         if let Some(i_exp) = self.inspect_exp {
             if !self.tcp_inspect_done {
                 exp = exp.earliest(i_exp);

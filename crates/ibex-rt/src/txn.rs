@@ -332,6 +332,10 @@ pub struct HttpTxn {
     pub close_after: bool,
     /// The server may keep its connection once this response is done.
     pub srv_reusable: bool,
+    /// The request went out on a server connection that had already carried one
+    /// (`HAProxy`'s `SF_SRV_REUSED`). If it closes before any response, the client
+    /// connection is closed with nothing sent, so the client retries.
+    pub srv_reused: bool,
     /// A reply owed to the client that the byte layer could not produce itself (it has no
     /// access to the error pages): a request that failed to parse.
     pub error: Option<u16>,
@@ -353,6 +357,7 @@ impl HttpTxn {
             local: false,
             close_after,
             srv_reusable: true,
+            srv_reused: false,
             error: None,
             aborted: false,
         }

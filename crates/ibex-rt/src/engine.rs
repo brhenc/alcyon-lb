@@ -3648,6 +3648,14 @@ impl EngineDispatcher<'_> {
                     Some(crate::proxy::Ending::Timeout(crate::proxy::Which::Connect)) => 503,
                     _ => 502,
                 };
+                if status == 502 && txn.srv_reused && entry.sess.rep.is_empty() {
+                    // `abort_keep_alive`: a keep-alive request lost to a network error,
+                    // nothing of a response received. The client retries only if it
+                    // sees the connection close unanswered.
+                    txn.close_after = true;
+                    txn.aborted = true;
+                    return;
+                }
                 entry.sess.rep.clear();
                 reply_error(entry, proxies, status);
             }
@@ -5500,6 +5508,9 @@ impl EngineDispatcher<'_> {
             {
                 // Its server timer is the last transaction's; this one starts its own.
                 entry.sess.server_connected(now);
+                if let Some(txn) = entry.sess.txn.as_mut() {
+                    txn.srv_reused = true;
+                }
                 return None;
             }
             release_server(entry, proxies, fdtab, poller, idle_pool, true);
@@ -5538,6 +5549,9 @@ impl EngineDispatcher<'_> {
             entry.srv_raw_fd = Some(sfd);
             entry.sess.attach_server(srv_fd, now);
             entry.sess.server_connected(now);
+            if let Some(txn) = entry.sess.txn.as_mut() {
+                txn.srv_reused = true;
+            }
             let (_, srv_want) = entry.sess.interests();
             let new_interest = Interest {
                 readable: srv_want.read,

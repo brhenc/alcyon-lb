@@ -1010,3 +1010,73 @@ fn an_unparsable_request_gets_a_400_and_a_close() {
     assert!(c.closed_within(Duration::from_secs(1)));
     assert!(seen.lock().unwrap().is_empty());
 }
+
+/// A server that answers the first request on each connection, then reads the second and
+/// closes without answering it.
+fn second_request_dropping_backend() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let be = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        for s in listener.incoming() {
+            let Ok(mut s) = s else { continue };
+            thread::spawn(move || {
+                let mut buf = Vec::new();
+                if read_request(&mut s, &mut buf, 0).is_some() {
+                    let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+                    let _ = read_request(&mut s, &mut buf, 0);
+                }
+            });
+        }
+    });
+    be
+}
+
+/// A request sent on a kept server connection that the server then closes, with nothing
+/// answered. The client connection closes with no bytes, so the client retries, as it
+/// would on a keep-alive connection closed under it -- `HAProxy`'s `abort_keep_alive`
+/// (`src/http_ana.c`, taken on `SF_SRV_REUSED`). A 502 would not be retried. `HAProxy`
+/// 3.5: 200, then closed with no bytes.
+#[test]
+fn a_kept_server_connection_closing_on_the_next_request_closes_the_client() {
+    let (_p, fe) = one_backend(second_request_dropping_backend(), "");
+    let mut c = Client::connect(fe);
+    assert_eq!(c.get("/1").map(|r| r.status), Some(200));
+    c.send(b"GET /2 HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert!(c.closed_within(Duration::from_secs(1)), "the client connection stayed open");
+    assert!(c.buf.is_empty(), "{:?}", String::from_utf8_lossy(&c.buf));
+}
+
+/// CPU time, in clock ticks, the process has used (`utime` + `stime`).
+fn cpu_ticks(pid: u32) -> u64 {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("/proc/<pid>/stat");
+    // Fields after the parenthesised command name; utime and stime are the 14th and 15th.
+    let rest = &stat[stat.rfind(')').expect("comm") + 2..];
+    let f: Vec<&str> = rest.split(' ').collect();
+    f[11].parse::<u64>().unwrap() + f[12].parse::<u64>().unwrap()
+}
+
+/// After a 502 the client connection is kept, and the server side is gone: its timer must
+/// not keep the session awake. Ibex left `timeout server` armed and expired, and spun --
+/// a zero-timeout poll and a read of the client, over and over -- until `timeout client`.
+/// `HAProxy` 3.5: idle (0-1 ticks over the second measured).
+#[test]
+fn a_kept_client_connection_after_a_502_is_idle() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let be = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        for s in listener.incoming() {
+            let Ok(mut s) = s else { continue };
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf);
+        }
+    });
+    let (p, fe) = one_backend(be, "  timeout server 200ms\n");
+    let mut c = Client::connect(fe);
+    assert_eq!(c.get("/x").map(|r| r.status), Some(502));
+    // Past the server timer, well inside `timeout client` (5s).
+    thread::sleep(Duration::from_millis(500));
+    let before = cpu_ticks(p.child.id());
+    thread::sleep(Duration::from_secs(1));
+    let used = cpu_ticks(p.child.id()) - before;
+    assert!(used < 20, "{used} ticks of CPU in one idle second");
+}
