@@ -105,8 +105,7 @@ impl Proc {
 
 impl Drop for Proc {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        common::stop(&mut self.child);
     }
 }
 

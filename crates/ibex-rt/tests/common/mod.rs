@@ -108,3 +108,29 @@ pub fn wait_listening(addr: SocketAddr) -> bool {
     }
     false
 }
+
+/// Stops a spawned `ibex` the way it exits cleanly -- `SIGUSR1`, the soft stop -- and waits
+/// for it; `SIGKILL` only if it is still there after five seconds.
+///
+/// Under `cargo llvm-cov` the spawned binary is instrumented, but it writes its coverage
+/// profile only on a normal exit. A test that ends the daemon with `SIGKILL` therefore runs
+/// its code and counts for nothing: `harness/covercheck.py` reported the HTTP/2 client read
+/// path (`proxy.rs`) as executed by no test while `h2_multiplexing` drove it on every run.
+/// Every test that spawns the binary ends it through here.
+pub fn stop(child: &mut std::process::Child) {
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return;
+    }
+    if let Some(pid) = i32::try_from(child.id()).ok().and_then(rustix::process::Pid::from_raw) {
+        let _ = rustix::process::kill_process(pid, rustix::process::Signal::Usr1);
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}

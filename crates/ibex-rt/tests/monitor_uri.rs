@@ -60,8 +60,7 @@ fn monitor_uri_is_answered_by_the_proxy_with_haproxys_response() {
     let origin = ask(fe, "GET /health HTTP/1.1");
     let absolute = ask(fe, "GET http://x/health HTTP/1.1");
     let other = ask(fe, "GET /other HTTP/1.1");
-    let _ = child.kill();
-    let _ = child.wait();
+    common::stop(&mut child);
 
     assert_eq!(origin, HAPROXY_RESPONSE);
     assert_eq!(absolute, HAPROXY_RESPONSE, "absolute-form must match the path too");

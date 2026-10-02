@@ -97,8 +97,7 @@ impl Ibex {
 
 impl Drop for Ibex {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        common::stop(&mut self.child);
     }
 }
 
