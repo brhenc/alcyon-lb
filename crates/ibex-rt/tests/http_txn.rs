@@ -644,3 +644,145 @@ fn connection_close_from_the_client_closes_after_the_response() {
     assert_eq!(c.final_response().map(|r| r.body_str()).as_deref(), Some("GET /x 0"));
     assert!(c.closed_within(Duration::from_secs(1)));
 }
+
+/// `http-request` rules run for every request on a connection, not only the first: the
+/// second request here is the one the rule matches. `HAProxy` 3.5: 200, 403, 200.
+#[test]
+fn request_rules_run_on_every_request() {
+    let (_p, fe, seen) = simple(echo, "  http-request deny if { path /local }\n");
+    let mut c = Client::connect(fe);
+    assert_eq!(c.get("/g").map(|r| r.status), Some(200));
+    assert_eq!(c.get("/local").map(|r| r.status), Some(403));
+    assert_eq!(c.get("/g").map(|r| r.status), Some(200));
+    assert!(seen.lock().unwrap().iter().all(|s| s.path != "/local"));
+}
+
+/// A server that closes without answering. `HAProxy` 3.5: 502 with its built-in page.
+#[test]
+fn a_server_closing_without_a_response_gets_a_502() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let be = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        for s in listener.incoming() {
+            let Ok(mut s) = s else { continue };
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf);
+        }
+    });
+    let (_p, fe) = start("frontend fe\n  bind @FE@\n  default_backend be\nbackend be\n  server s1 @BE0@\n", &[be]);
+    let mut c = Client::connect(fe);
+    let r = c.get("/x").expect("a response");
+    assert_eq!(r.status, 502);
+    assert!(r.body_str().contains("502 Bad Gateway"), "{r:?}");
+}
+
+/// A server that does not answer within `timeout server`. `HAProxy` 3.5: 504.
+#[test]
+fn a_server_timeout_gets_a_504() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let be = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        let mut held = Vec::new();
+        for s in listener.incoming() {
+            held.push(s);
+        }
+    });
+    let (_p, fe) = start(
+        "frontend fe\n  bind @FE@\n  default_backend be\nbackend be\n  timeout server 300ms\n  server s1 @BE0@\n",
+        &[be],
+    );
+    let mut c = Client::connect(fe);
+    let r = c.get("/x").expect("a response");
+    assert_eq!(r.status, 504);
+}
+
+/// An interim response and the final one in one packet: both reach the client, in order
+/// (RFC 9110 section 15.2). Not measurable against the oracle: `HAProxy` 3.5-dev7 aborts
+/// on it, `FATAL: bug condition "htx_msg_ended(htx) && type != HTX_BLK_RAW_DATA" matched
+/// at src/htx.c:391`, from `h1_parse_msg_hdrs`. The split-packet case below is measured.
+#[test]
+fn an_interim_and_a_final_response_in_one_packet() {
+    let (_p, fe, _) = simple(
+        |r| {
+            if r.path == "/eh" {
+                Reply {
+                    parts: vec![b"HTTP/1.1 103 Early Hints\r\nLink: </s.css>\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec()],
+                    gap: Duration::ZERO,
+                    close: false,
+                }
+            } else {
+                echo(r)
+            }
+        },
+        "",
+    );
+    let mut c = Client::connect(fe);
+    c.send(b"GET /eh HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert_eq!(c.response(false).map(|r| r.status), Some(103));
+    assert_eq!(c.response(false).map(|r| r.body_str()).as_deref(), Some("ok"));
+    assert_eq!(c.get("/g").map(|r| r.body_str()).as_deref(), Some("GET /g 0"));
+}
+
+/// An interim response, a pause, then the final one. `HAProxy` 3.5: 103, then 200.
+#[test]
+fn an_interim_response_then_the_final_one() {
+    let (_p, fe, _) = simple(
+        |r| {
+            if r.path == "/eh" {
+                Reply {
+                    parts: vec![
+                        b"HTTP/1.1 103 Early Hints\r\nLink: </s.css>\r\n\r\n".to_vec(),
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec(),
+                    ],
+                    gap: Duration::from_millis(100),
+                    close: false,
+                }
+            } else {
+                echo(r)
+            }
+        },
+        "",
+    );
+    let mut c = Client::connect(fe);
+    c.send(b"GET /eh HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert_eq!(c.response(false).map(|r| r.status), Some(103));
+    assert_eq!(c.response(false).map(|r| r.body_str()).as_deref(), Some("ok"));
+    assert_eq!(c.get("/g").map(|r| r.body_str()).as_deref(), Some("GET /g 0"));
+}
+
+/// A `101 Switching Protocols` turns the connection into a tunnel: bytes flow both ways
+/// unparsed until one side closes. `HAProxy` 3.5: both messages echoed. (Without
+/// `Sec-WebSocket-Key` it answers the upgrade request with a 400.)
+#[test]
+fn an_upgrade_becomes_a_tunnel() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let be = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        for s in listener.incoming() {
+            let Ok(mut s) = s else { continue };
+            thread::spawn(move || {
+                let mut buf = Vec::new();
+                if read_request(&mut s, &mut buf, 0).is_none() {
+                    return;
+                }
+                let _ = s.write_all(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n");
+                let mut chunk = [0u8; 4096];
+                while let Ok(n) = s.read(&mut chunk) {
+                    if n == 0 || s.write_all(&chunk[..n]).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    let (_p, fe) = start("frontend fe\n  bind @FE@\n  default_backend be\nbackend be\n  server s1 @BE0@\n", &[be]);
+    let mut c = Client::connect(fe);
+    c.send(b"GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n");
+    assert_eq!(c.response(false).map(|r| r.status), Some(101));
+    for msg in [&b"\r\n\r\nnot http\r\n\r\n"[..], b"HTTP/1.1 200 OK\r\n\r\n"] {
+        c.send(msg);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while c.buf.len() < msg.len() && c.fill(deadline) {}
+        assert_eq!(c.buf.drain(..).as_slice(), msg);
+    }
+}
