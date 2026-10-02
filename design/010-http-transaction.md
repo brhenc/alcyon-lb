@@ -1,6 +1,7 @@
 # Ibex Design: the HTTP transaction
 
-Status: proposed, 2026-09-27. For a clean session; nothing here is implemented.
+Status: steps 1-4 implemented on branch `txn/010`, 2026-10-02 (see "As built" at the end).
+Step 5 (one transaction per H2 stream) is not done.
 
 ## Why now
 
@@ -136,3 +137,54 @@ the kind of self-contained change agents have been good at.
 ## Not in scope
 
 HTX as HAProxy has it, filters, the analyser bit-mask, HTTP/3.
+
+## As built (2026-10-02)
+
+Where the implementation differs from the proposal above, and what it found.
+
+- **Where the transaction lives.** `TcpSession::txn: Option<HttpTxn>` (`crates/ibex-rt/src/
+  txn.rs`), not the session entry: the byte movers in `proxy.rs` need the message states to
+  bound what they forward. `req_method`/`req_uri`/`req_headers` stay on the session; they are
+  cleared in one place, `TcpSession::reset_for_next_request`.
+- **Steps 3 and 4 are one change.** A message state that does not know where the body ends
+  cannot say when the message is done, so the explicit states and body tracking went in
+  together. `MsgState::window`/`consume` scan Content-Length, chunked (with extensions and
+  trailers) and until-close bodies; the forwarders send only the window.
+- **The forwarders.** `TcpSession::req_window` / `rep_window`: a request's bytes and nothing
+  after them (a pipelined request waits for its turn and is routed on its own); a response is
+  held (`MsgState::Waiting`) until the engine has run its head through the response rules --
+  this replaces `resp_released`. The byte layer no longer parses response heads or applies
+  rules; `process_cli_transitions` does nothing in HTTP mode.
+- **One end.** `EngineDispatcher::end_txn`: the server connection goes to the idle pool if it
+  can carry another request (it is no longer kept on the session between transactions, so a
+  next request is always routed afresh), then the client either closes or is reset.
+- **One reply.** `TcpSession::write_reply` (bytes) and `reply_error` (status -> page in
+  `http_error_message` order). The request is dropped through its framing; the connection is
+  kept unless the body had not all arrived, the page says `Connection: close`, or it is empty.
+- **What `HttpTxn` replaced.** `resp_released`, `resp_length_known`, `resp_status`,
+  `resp_headers_processed`, `srv_connection_close`, `connection_close`, the session copies of
+  the response rules (`http_res_rules`, `http_after_res_rules`, `acls`) and their second
+  implementation in `proxy.rs`, `SessionEntry::response_rules_applied`, Steps 2.5, 2.6, 3.7,
+  3.8, 3.9, `discard_unforwarded_request`, `send_synthetic_*`.
+
+Defects found on the way, each with a test that failed first (`tests/http_txn.rs` unless
+noted):
+
+| Defect | Cause |
+|---|---|
+| `http-request deny` skipped for a request after the first on a connection with a kept server connection | rules ran only when `srv_state == Init` |
+| every response through `http-response` rules carried 4 extra bytes before its body | the rebuilt head was spliced in at the start of the old blank line, not its end |
+| a backend's own `timeout server`/`timeout connect` ignored; `defaults` won | legacy `srvtimeout`/`contimeout` fields, filled from `defaults`, read before the section's own |
+| a wake without a socket event waited up to 100 ms (50 pipelined requests: 4.9 s; now 0.01 s) | `Engine::step` polled with timeout 0 only for `runnable()`, which excludes tasklets |
+| a client that stops reading kept a session requeued every loop | Step 4b requeued on pending output; the poller is level-triggered and already asked for `EPOLLOUT` |
+| `send-proxy-v2` request forwarded as 4 bytes | the v2 signature starts with `\r\n\r\n` (counted now as head) |
+| no 502 for a server that closes without answering, no 504 on `timeout server` | no "response not started" state |
+| a 101 was not a tunnel | no tunnel state |
+
+Not done, recorded: T87 (oversized head: HAProxy says 431, earlier), T88 (client
+half-close: HAProxy aborts). HAProxy 3.5-dev7 itself aborts on a 1xx and a final response in
+one read (`BUG_ON` at `src/htx.c:391`); that case is decided by RFC 9110 in the suite.
+
+For profiling later: `MsgState::window` rescans a chunked body's buffered bytes on every call
+(it is asked by `interests`, `has_pending_output` and the forwarders); caching the window per
+buffer state is the obvious fix if it shows.
