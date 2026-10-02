@@ -35,6 +35,10 @@ pub struct DefaultsSection {
     pub tcp_req_inspect_delay: Option<Duration>,
     /// Default HTTP connection reuse strategy (`http-reuse`).
     pub http_reuse: Option<HttpReuse>,
+    /// Default hashing method for hash-based balancing algorithms (`hash-type`).
+    pub hash_type: Option<HashType>,
+    /// Default affinity-preservation mode for hash-based algorithms (`hash-preserve-affinity`).
+    pub hash_preserve_affinity: Option<HashPreserveAffinity>,
     /// Default HTTP check configuration (`option httpchk`).
     pub httpchk: Option<HttpChkConfig>,
     /// Protocol-specific check configuration (`option redis-check`, `option smtpchk`, etc.).
@@ -188,6 +192,10 @@ pub struct ListenSection {
     pub default_server: Option<DefaultServerConfig>,
     /// HTTP connection reuse strategy (`http-reuse`).
     pub http_reuse: Option<HttpReuse>,
+    /// Hashing method for hash-based balancing algorithms (`hash-type`).
+    pub hash_type: Option<HashType>,
+    /// Affinity-preservation mode for hash-based algorithms (`hash-preserve-affinity`).
+    pub hash_preserve_affinity: Option<HashPreserveAffinity>,
     /// Stats applet and dashboard configuration.
     pub stats: StatsConfig,
     /// HTTP check configuration (`option httpchk`).
@@ -268,6 +276,8 @@ impl Default for ListenSection {
             accept_proxy: false,
             accept_proxy_v2: false,
             http_reuse: None,
+            hash_type: None,
+            hash_preserve_affinity: None,
             forwardfor: None,
             originalto: None,
             stats: StatsConfig::default(),
@@ -461,6 +471,10 @@ pub struct BackendSection {
     pub originalto: Option<String>,
     /// HTTP connection reuse strategy (`http-reuse`).
     pub http_reuse: Option<HttpReuse>,
+    /// Hashing method for hash-based balancing algorithms (`hash-type`).
+    pub hash_type: Option<HashType>,
+    /// Affinity-preservation mode for hash-based algorithms (`hash-preserve-affinity`).
+    pub hash_preserve_affinity: Option<HashPreserveAffinity>,
     /// Stats applet and dashboard configuration.
     pub stats: StatsConfig,
     /// HTTP check configuration (`option httpchk`).
@@ -514,6 +528,8 @@ impl Default for BackendSection {
             forwardfor: None,
             originalto: None,
             http_reuse: None,
+            hash_type: None,
+            hash_preserve_affinity: None,
             stats: StatsConfig::default(),
             httpchk: None,
             proto_check: None,

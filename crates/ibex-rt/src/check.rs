@@ -232,7 +232,13 @@ impl ServerCheckState {
             exp: Tick::ETERNITY,
             next_check: now,
             last_status_desc: "Initial state",
-            last_status_code: "L4OK",
+            // HAProxy seeds this with HCHK_STATUS_INI ("Initializing"), a placeholder that
+            // matches no real check result code, so the first real outcome always differs
+            // from it and `report = (status != prev_status)` (src/check.c) is always true.
+            // "L4OK" here (a real success code) made the very first successful check
+            // indistinguishable from this placeholder, silently dropping the "succeeded ...
+            // status: 1/1 UP" log line a fresh, already-healthy server should always emit.
+            last_status_code: "INI",
             http_code: None,
             last_status_info: None,
             resolved_config,
@@ -3308,5 +3314,27 @@ mod tests {
         // ECONNREFUSED keeps its own wording, which HAProxy special-cases too.
         let refused = io::Error::from_raw_os_error(111);
         assert_eq!(format_l4_connect_error(&refused), "ECONNREFUSED returned by OS");
+    }
+
+    /// HAProxy seeds a fresh check's status with `HCHK_STATUS_INI` ("Initializing"), a
+    /// placeholder that matches no real result code, so `report = (status != prev_status)`
+    /// (src/check.c) is always true for the very first check outcome and it is always
+    /// logged. A server with `rise == 1` starts at full health already, so its first
+    /// successful check is the only chance to log the transition to a confirmed UP --
+    /// reg-test checks/40be_2srv_odd_health_checks.vtc depends on exactly this line
+    /// appearing under `option log-health-checks`.
+    #[test]
+    fn first_success_after_boot_is_reported_under_log_health_checks() {
+        let config = ServerCheckConfig {
+            rise: 1,
+            fall: 1,
+            ..ServerCheckConfig::default()
+        };
+        let mut state = ServerCheckState::new(0, 0, "127.0.0.1:1".parse().unwrap(), config, Tick(0));
+        let event = state.on_success(5);
+        assert!(
+            event.is_some(),
+            "the first successful check after boot must be reported under option log-health-checks"
+        );
     }
 }

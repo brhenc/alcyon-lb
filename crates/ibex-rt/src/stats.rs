@@ -699,6 +699,9 @@ mod tests {
             error_replies: std::collections::HashMap::new(),
             log_tag: None,
             log_cursors: std::sync::Arc::default(),
+            hash_type: ibex_config::HashType::default(),
+            hash_preserve_affinity: ibex_config::HashPreserveAffinity::default(),
+            chash: std::sync::Arc::default(),
         };
 
         let csv = format_show_stat(&[proxy], &[], 9999);

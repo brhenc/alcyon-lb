@@ -187,6 +187,12 @@ pub struct Proxy {
     /// behind an `Arc` so the workers, which each clone the proxies, share them as
     /// `HAProxy`'s threads share a logger.
     pub log_cursors: Arc<Vec<AtomicU64>>,
+    /// Hashing method for hash-based balancing algorithms (`hash-type`).
+    pub hash_type: ibex_config::HashType,
+    /// Affinity-preservation mode for hash-based algorithms (`hash-preserve-affinity`).
+    pub hash_preserve_affinity: ibex_config::HashPreserveAffinity,
+    /// The `hash-type consistent` ring, built on first use and shared by the workers.
+    pub chash: Arc<crate::lb::ChashRing>,
 }
 
 impl Proxy {
@@ -282,6 +288,20 @@ impl Proxy {
             }
             BalanceAlgorithm::StaticRr => {
                 if let Some(idx) = crate::lb::static_rr(self) {
+                    Some(self.servers[idx])
+                } else {
+                    self.dispatch
+                }
+            }
+            BalanceAlgorithm::First => {
+                if let Some(idx) = crate::lb::first(self) {
+                    Some(self.servers[idx])
+                } else {
+                    self.dispatch
+                }
+            }
+            BalanceAlgorithm::Random(draws) => {
+                if let Some(idx) = crate::lb::random(self, draws) {
                     Some(self.servers[idx])
                 } else {
                     self.dispatch
@@ -897,6 +917,9 @@ fn init_proxy_from_listen(proxy_idx: usize, listen: &ibex_config::ListenSection,
         error_replies: listen.error_replies.clone(),
         log_tag: listen.log_tag.as_deref().map(syslog_tag),
         log_cursors: Arc::default(),
+        hash_type: listen.hash_type.unwrap_or_default(),
+        hash_preserve_affinity: listen.hash_preserve_affinity.unwrap_or_default(),
+        chash: Arc::default(),
     }
 }
 
@@ -975,6 +998,9 @@ fn init_proxy_from_frontend(proxy_idx: usize, fe: &ibex_config::FrontendSection,
         error_replies: fe.error_replies.clone(),
         log_tag: fe.log_tag.as_deref().map(syslog_tag),
         log_cursors: Arc::default(),
+        hash_type: ibex_config::HashType::default(),
+        hash_preserve_affinity: ibex_config::HashPreserveAffinity::default(),
+        chash: Arc::default(),
     }
 }
 
@@ -1077,6 +1103,9 @@ fn init_proxy_from_backend(proxy_idx: usize, be: &ibex_config::BackendSection, n
         error_replies: be.error_replies.clone(),
         log_tag: be.log_tag.as_deref().map(syslog_tag),
         log_cursors: Arc::default(),
+        hash_type: be.hash_type.unwrap_or_default(),
+        hash_preserve_affinity: be.hash_preserve_affinity.unwrap_or_default(),
+        chash: Arc::default(),
     }
 }
 

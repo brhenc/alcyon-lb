@@ -102,6 +102,8 @@ pub(crate) fn parse_listen_header(
         accept_proxy,
         accept_proxy_v2,
         http_reuse: defaults.and_then(|d| d.http_reuse),
+        hash_type: defaults.and_then(|d| d.hash_type),
+        hash_preserve_affinity: defaults.and_then(|d| d.hash_preserve_affinity),
         forwardfor: None,
         originalto: None,
         stats: defaults.map_or_else(StatsConfig::default, |d| d.stats.clone()),
@@ -251,6 +253,8 @@ pub(crate) fn parse_backend_header(
         http_res_rules: defaults.map_or_else(Vec::new, |d| d.http_res_rules.clone()),
         http_after_res_rules: defaults.map_or_else(Vec::new, |d| d.http_after_res_rules.clone()),
         http_reuse: defaults.and_then(|d| d.http_reuse),
+        hash_type: defaults.and_then(|d| d.hash_type),
+        hash_preserve_affinity: defaults.and_then(|d| d.hash_preserve_affinity),
         forwardfor: None,
         originalto: None,
         stats: defaults.map_or_else(StatsConfig::default, |d| d.stats.clone()),
@@ -297,6 +301,18 @@ pub(crate) fn parse_listen_directive(
         "srvexp" => parse_srvexp(kw),
         "balance" => parse_balance(&mut proxy.balance, tokens, kw),
         "http-reuse" => parse_http_reuse(&mut proxy.http_reuse, tokens, kw),
+        "hash-type" => {
+            let mut ht = proxy.hash_type.unwrap_or_default();
+            parse_hash_type(&mut ht, tokens, kw)?;
+            proxy.hash_type = Some(ht);
+            Ok(())
+        }
+        "hash-preserve-affinity" => {
+            let mut a = proxy.hash_preserve_affinity.unwrap_or_default();
+            parse_hash_preserve_affinity(&mut a, tokens, kw)?;
+            proxy.hash_preserve_affinity = Some(a);
+            Ok(())
+        }
         "acl" => parse_acl(&mut proxy.acls, tokens, kw),
         "use_backend" => parse_use_backend(&mut proxy.use_backends, tokens, kw),
         "monitor-uri" => parse_monitor_uri(&mut proxy.monitor_uri, tokens, kw),
@@ -468,6 +484,18 @@ pub(crate) fn parse_backend_directive(
         }
         "balance" => parse_balance(&mut be.balance, tokens, kw),
         "http-reuse" => parse_http_reuse(&mut be.http_reuse, tokens, kw),
+        "hash-type" => {
+            let mut ht = be.hash_type.unwrap_or_default();
+            parse_hash_type(&mut ht, tokens, kw)?;
+            be.hash_type = Some(ht);
+            Ok(())
+        }
+        "hash-preserve-affinity" => {
+            let mut a = be.hash_preserve_affinity.unwrap_or_default();
+            parse_hash_preserve_affinity(&mut a, tokens, kw)?;
+            be.hash_preserve_affinity = Some(a);
+            Ok(())
+        }
         "cookie" => parse_cookie(&mut be.cookie, tokens, kw),
         "contimeout" => parse_contimeout(kw),
         "clitimeout" => parse_clitimeout(kw),
