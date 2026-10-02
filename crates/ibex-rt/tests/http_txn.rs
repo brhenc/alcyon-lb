@@ -1,0 +1,646 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+//! The HTTP transaction against the real binary: where a request ends, where a response
+//! ends, and what happens to the connection afterwards (design 010, step 1).
+//!
+//! Every case was measured against `HAProxy` 3.5 with the same configuration first. To
+//! re-measure, point the suite at the oracle:
+//!
+//! ```text
+//! IBEX_TXN_BIN=/home/bhenc/reference/haproxy/haproxy cargo test -p ibex-rt --test http_txn
+//! ```
+//!
+//! A binary whose name contains `haproxy` is started with `-db`.
+
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+use tempfile::NamedTempFile;
+
+// ---- the backend ------------------------------------------------------------------
+
+/// A request as the backend received it.
+#[derive(Clone, Debug)]
+struct Seen {
+    method: String,
+    path: String,
+    body: Vec<u8>,
+    /// Which backend connection it arrived on, counted from 0.
+    conn: usize,
+}
+
+/// How the backend answers one request.
+struct Reply {
+    /// Written in order, with `gap` between writes.
+    parts: Vec<Vec<u8>>,
+    gap: Duration,
+    /// Close the connection after the reply.
+    close: bool,
+}
+
+impl Reply {
+    fn ok(body: &str) -> Self {
+        Reply {
+            parts: vec![format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len()).into_bytes()],
+            gap: Duration::ZERO,
+            close: false,
+        }
+    }
+}
+
+type Handler = fn(&Seen) -> Reply;
+
+/// Reads one request (head and body) from `s`, `buf` holding what was read past the last
+/// one. `None` at EOF.
+fn read_request(s: &mut TcpStream, buf: &mut Vec<u8>, conn: usize) -> Option<Seen> {
+    let mut chunk = [0u8; 65536];
+    let head_end = loop {
+        if let Some(p) = find(buf, b"\r\n\r\n") {
+            break p + 4;
+        }
+        let n = s.read(&mut chunk).ok().filter(|&n| n > 0)?;
+        buf.extend_from_slice(&chunk[..n]);
+    };
+    let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+    buf.drain(..head_end);
+    let mut first = head.split("\r\n").next().unwrap_or("").split(' ');
+    let method = first.next().unwrap_or("").to_string();
+    let path = first.next().unwrap_or("").to_string();
+    let header = |name: &str| {
+        head.split("\r\n").skip(1).find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.trim().eq_ignore_ascii_case(name).then(|| v.trim().to_string())
+        })
+    };
+    if header("expect").is_some_and(|v| v.eq_ignore_ascii_case("100-continue")) {
+        s.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").ok()?;
+    }
+    let mut body = Vec::new();
+    if header("transfer-encoding").is_some_and(|v| v.to_ascii_lowercase().contains("chunked")) {
+        loop {
+            let line_end = loop {
+                if let Some(p) = find(buf, b"\r\n") {
+                    break p;
+                }
+                let n = s.read(&mut chunk).ok().filter(|&n| n > 0)?;
+                buf.extend_from_slice(&chunk[..n]);
+            };
+            let size_str = String::from_utf8_lossy(&buf[..line_end]).into_owned();
+            let size = usize::from_str_radix(size_str.split(';').next().unwrap_or("").trim(), 16).ok()?;
+            while buf.len() < line_end + 2 + size + 2 {
+                let n = s.read(&mut chunk).ok().filter(|&n| n > 0)?;
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            body.extend_from_slice(&buf[line_end + 2..line_end + 2 + size]);
+            buf.drain(..line_end + 2 + size + 2);
+            if size == 0 {
+                break;
+            }
+        }
+    } else if let Some(cl) = header("content-length").and_then(|v| v.parse::<usize>().ok()) {
+        while buf.len() < cl {
+            let n = s.read(&mut chunk).ok().filter(|&n| n > 0)?;
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        body = buf.drain(..cl).collect();
+    }
+    Some(Seen { method, path, body, conn })
+}
+
+/// A keep-alive HTTP/1.1 backend that answers each request with `handler` and records it.
+fn backend(handler: Handler) -> (SocketAddr, Arc<Mutex<Vec<Seen>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind backend");
+    let addr = listener.local_addr().expect("addr");
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&seen);
+    thread::spawn(move || {
+        for (conn, stream) in listener.incoming().enumerate() {
+            let Ok(mut s) = stream else { continue };
+            let log = Arc::clone(&log);
+            thread::spawn(move || {
+                let mut buf = Vec::new();
+                while let Some(req) = read_request(&mut s, &mut buf, conn) {
+                    log.lock().unwrap().push(req.clone());
+                    let reply = handler(&req);
+                    for (i, part) in reply.parts.iter().enumerate() {
+                        if i > 0 {
+                            thread::sleep(reply.gap);
+                        }
+                        if s.write_all(part).is_err() {
+                            return;
+                        }
+                    }
+                    if reply.close {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (addr, seen)
+}
+
+// ---- the proxy ----------------------------------------------------------------------
+
+struct Proxy(Child, NamedTempFile);
+
+impl Drop for Proxy {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Starts the binary under test with `cfg`, in which `@FE@` is replaced by the frontend
+/// address and `@BEn@` by `backends[n]`.
+fn start(cfg: &str, backends: &[SocketAddr]) -> (Proxy, SocketAddr) {
+    let fe = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+    let mut text = format!(
+        "defaults\n  mode http\n  timeout connect 2s\n  timeout client 5s\n  timeout server 5s\n{cfg}"
+    )
+    .replace("@FE@", &fe.to_string());
+    for (i, be) in backends.iter().enumerate() {
+        text = text.replace(&format!("@BE{i}@"), &be.to_string());
+    }
+    let mut f = NamedTempFile::new().expect("tmp");
+    f.write_all(text.as_bytes()).unwrap();
+    let bin = std::env::var("IBEX_TXN_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ibex").to_string());
+    let mut cmd = Command::new(&bin);
+    if bin.contains("haproxy") {
+        cmd.arg("-db");
+    }
+    let child = cmd
+        .arg("-f")
+        .arg(f.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn proxy");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while TcpStream::connect(fe).is_err() {
+        assert!(Instant::now() < deadline, "{bin} never started listening on {fe}");
+        thread::sleep(Duration::from_millis(20));
+    }
+    (Proxy(child, f), fe)
+}
+
+/// One frontend, one backend with one server.
+fn simple(handler: Handler, frontend_extra: &str) -> (Proxy, SocketAddr, Arc<Mutex<Vec<Seen>>>) {
+    let (be, seen) = backend(handler);
+    let (p, fe) = start(
+        &format!("frontend fe\n  bind @FE@\n{frontend_extra}  default_backend be\nbackend be\n  server s1 @BE0@\n"),
+        &[be],
+    );
+    (p, fe, seen)
+}
+
+// ---- the client ---------------------------------------------------------------------
+
+#[derive(Debug)]
+struct Resp {
+    status: u16,
+    head: String,
+    body: Vec<u8>,
+}
+
+impl Resp {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.head.split("\r\n").skip(1).find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.trim().eq_ignore_ascii_case(name).then(|| v.trim())
+        })
+    }
+    fn body_str(&self) -> String {
+        String::from_utf8_lossy(&self.body).into_owned()
+    }
+}
+
+struct Client {
+    s: TcpStream,
+    buf: Vec<u8>,
+    eof: bool,
+}
+
+impl Client {
+    fn connect(fe: SocketAddr) -> Self {
+        let s = TcpStream::connect(fe).expect("connect");
+        s.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+        Client { s, buf: Vec::new(), eof: false }
+    }
+
+    fn send(&mut self, data: &[u8]) {
+        self.s.write_all(data).expect("send");
+    }
+
+    /// Reads more into `buf`; false once `deadline` passes or the peer closed.
+    fn fill(&mut self, deadline: Instant) -> bool {
+        let mut chunk = [0u8; 65536];
+        while Instant::now() < deadline {
+            match self.s.read(&mut chunk) {
+                Ok(0) | Err(_) if self.eof => return false,
+                Ok(0) => {
+                    self.eof = true;
+                    return false;
+                }
+                Ok(n) => {
+                    self.buf.extend_from_slice(&chunk[..n]);
+                    return true;
+                }
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+                Err(_) => {
+                    self.eof = true;
+                    return false;
+                }
+            }
+        }
+        false
+    }
+
+    /// The next complete response, interim (1xx) ones included; `None` if none arrives
+    /// within three seconds. `head_req` says the request was a HEAD (no body follows).
+    fn response(&mut self, head_req: bool) -> Option<Resp> {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let head_end = loop {
+            if let Some(p) = find(&self.buf, b"\r\n\r\n") {
+                break p + 4;
+            }
+            if !self.fill(deadline) {
+                return None;
+            }
+        };
+        let head = String::from_utf8_lossy(&self.buf[..head_end]).into_owned();
+        self.buf.drain(..head_end);
+        let status: u16 = head.split(' ').nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let mut r = Resp { status, head, body: Vec::new() };
+        if head_req || (100..200).contains(&status) || status == 204 || status == 304 {
+            return Some(r);
+        }
+        if r.header("transfer-encoding").is_some_and(|v| v.to_ascii_lowercase().contains("chunked")) {
+            loop {
+                let line_end = loop {
+                    if let Some(p) = find(&self.buf, b"\r\n") {
+                        break p;
+                    }
+                    if !self.fill(deadline) {
+                        return None;
+                    }
+                };
+                let size_str = String::from_utf8_lossy(&self.buf[..line_end]).into_owned();
+                let size = usize::from_str_radix(size_str.split(';').next().unwrap_or("").trim(), 16).ok()?;
+                while self.buf.len() < line_end + 2 + size + 2 {
+                    if !self.fill(deadline) {
+                        return None;
+                    }
+                }
+                r.body.extend_from_slice(&self.buf[line_end + 2..line_end + 2 + size]);
+                self.buf.drain(..line_end + 2 + size + 2);
+                if size == 0 {
+                    return Some(r);
+                }
+            }
+        }
+        if let Some(cl) = r.header("content-length").and_then(|v| v.parse::<usize>().ok()) {
+            while self.buf.len() < cl {
+                if !self.fill(deadline) {
+                    return None;
+                }
+            }
+            r.body = self.buf.drain(..cl).collect();
+            return Some(r);
+        }
+        while self.fill(deadline) {}
+        r.body = std::mem::take(&mut self.buf);
+        Some(r)
+    }
+
+    /// The next final response, skipping interim ones.
+    fn final_response(&mut self) -> Option<Resp> {
+        loop {
+            let r = self.response(false)?;
+            if r.status >= 200 {
+                return Some(r);
+            }
+        }
+    }
+
+    /// Whether the proxy closes the connection within `wait`, with nothing more sent.
+    fn closed_within(&mut self, wait: Duration) -> bool {
+        let deadline = Instant::now() + wait;
+        while self.fill(deadline) {}
+        self.eof
+    }
+
+    fn get(&mut self, path: &str) -> Option<Resp> {
+        self.send(format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes());
+        self.final_response()
+    }
+}
+
+fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Echoes what arrived: `METHOD PATH BODYLEN`.
+fn echo(r: &Seen) -> Reply {
+    Reply::ok(&format!("{} {} {}", r.method, r.path, r.body.len()))
+}
+
+// ---- requests -----------------------------------------------------------------------
+
+/// Three requests written in one packet are three transactions, routed one at a time:
+/// the second goes where its own path says, not down the connection the first opened.
+/// `HAProxy` 3.5: be1, be2, be1.
+#[test]
+fn pipelined_requests_are_each_routed_on_their_own() {
+    let (b1, _) = backend(|_| Reply::ok("be1"));
+    let (b2, _) = backend(|_| Reply::ok("be2"));
+    let (_p, fe) = start(
+        "frontend fe\n  bind @FE@\n  use_backend be2 if { path_beg /b }\n  default_backend be1\n\
+         backend be1\n  server s1 @BE0@\nbackend be2\n  server s1 @BE1@\n",
+        &[b1, b2],
+    );
+    let mut c = Client::connect(fe);
+    c.send(b"GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\nGET /a HTTP/1.1\r\nHost: x\r\n\r\n");
+    let bodies: Vec<String> = (0..3).filter_map(|_| c.final_response()).map(|r| r.body_str()).collect();
+    assert_eq!(bodies, ["be1", "be2", "be1"]);
+}
+
+/// A POST's body reaches the server intact, and the GET after it on the same connection
+/// is a request of its own. `HAProxy` 3.5: both answered, body of 5 bytes forwarded.
+#[test]
+fn a_post_with_a_body_then_a_get() {
+    let (_p, fe, seen) = simple(echo, "");
+    let mut c = Client::connect(fe);
+    c.send(b"POST /p HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello");
+    assert_eq!(c.final_response().map(|r| r.body_str()).as_deref(), Some("POST /p 5"));
+    assert_eq!(c.get("/g").map(|r| r.body_str()).as_deref(), Some("GET /g 0"));
+    assert_eq!(seen.lock().unwrap()[0].body, b"hello");
+}
+
+/// The same with the body and the next request in one packet.
+#[test]
+fn a_post_body_and_the_next_request_in_one_packet() {
+    let (_p, fe, seen) = simple(echo, "");
+    let mut c = Client::connect(fe);
+    c.send(b"POST /p HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhelloGET /g HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert_eq!(c.final_response().map(|r| r.body_str()).as_deref(), Some("POST /p 5"));
+    assert_eq!(c.final_response().map(|r| r.body_str()).as_deref(), Some("GET /g 0"));
+    assert_eq!(seen.lock().unwrap()[0].body, b"hello");
+}
+
+/// A chunked request body, then a GET. `HAProxy` 3.5: both answered.
+#[test]
+fn a_chunked_post_then_a_get() {
+    let (_p, fe, seen) = simple(echo, "");
+    let mut c = Client::connect(fe);
+    c.send(b"POST /p HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n");
+    assert_eq!(c.final_response().map(|r| r.body_str()).as_deref(), Some("POST /p 5"));
+    assert_eq!(c.get("/g").map(|r| r.body_str()).as_deref(), Some("GET /g 0"));
+    assert_eq!(seen.lock().unwrap()[0].body, b"abcde");
+}
+
+/// A request body several times the buffer size is streamed through, then a GET.
+#[test]
+fn a_large_request_body_then_a_get() {
+    let (_p, fe, seen) = simple(echo, "");
+    let mut c = Client::connect(fe);
+    let body = vec![b'x'; 200_000];
+    c.send(format!("POST /big HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n", body.len()).as_bytes());
+    c.send(&body);
+    assert_eq!(c.final_response().map(|r| r.body_str()).as_deref(), Some("POST /big 200000"));
+    assert_eq!(c.get("/g").map(|r| r.body_str()).as_deref(), Some("GET /g 0"));
+    assert_eq!(seen.lock().unwrap()[0].body.len(), 200_000);
+}
+
+/// `Expect: 100-continue`: the interim response reaches the client, the body follows,
+/// and the final response and the next request work. `HAProxy` 3.5: 100, then 200, then
+/// the GET.
+#[test]
+fn expect_100_continue() {
+    let (_p, fe, seen) = simple(echo, "");
+    let mut c = Client::connect(fe);
+    c.send(b"POST /p HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n");
+    let interim = c.response(false);
+    assert_eq!(interim.as_ref().map(|r| r.status), Some(100), "{interim:?}");
+    c.send(b"hello");
+    assert_eq!(c.final_response().map(|r| r.body_str()).as_deref(), Some("POST /p 5"));
+    assert_eq!(c.get("/g").map(|r| r.body_str()).as_deref(), Some("GET /g 0"));
+    assert_eq!(seen.lock().unwrap()[0].body, b"hello");
+}
+
+// ---- responses ----------------------------------------------------------------------
+
+/// A response body that arrives in pieces, with pauses, and contains a blank line, is one
+/// response: the transaction ends at its `Content-Length`, not when the buffer happens to
+/// drain. Then the next request.
+#[test]
+fn a_slow_response_body_is_not_mistaken_for_the_next_response() {
+    let (_p, fe, _) = simple(
+        |_| {
+            let body = "first part\r\n\r\nHTTP/1.1 500 Fake\r\n\r\nlast part";
+            Reply {
+                parts: vec![
+                    format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\nfirst part", body.len()).into_bytes(),
+                    b"\r\n\r\nHTTP/1.1 500 Fake\r\n\r\n".to_vec(),
+                    b"last part".to_vec(),
+                ],
+                gap: Duration::from_millis(100),
+                close: false,
+            }
+        },
+        "  http-response set-header X-Seen yes\n",
+    );
+    let mut c = Client::connect(fe);
+    let r = c.get("/1").expect("first response");
+    assert_eq!(r.body_str(), "first part\r\n\r\nHTTP/1.1 500 Fake\r\n\r\nlast part");
+    let r = c.get("/2").expect("second response");
+    assert_eq!(r.status, 200);
+    assert_eq!(r.header("x-seen"), Some("yes"), "{r:?}");
+}
+
+/// A response much larger than the buffer, then the next request.
+#[test]
+fn a_large_response_then_a_get() {
+    let (_p, fe, _) = simple(
+        |r| {
+            if r.path == "/big" {
+                let body = "y".repeat(300_000);
+                Reply {
+                    parts: vec![format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len()).into_bytes()],
+                    gap: Duration::ZERO,
+                    close: false,
+                }
+            } else {
+                echo(r)
+            }
+        },
+        "",
+    );
+    let mut c = Client::connect(fe);
+    assert_eq!(c.get("/big").map(|r| r.body.len()), Some(300_000));
+    assert_eq!(c.get("/g").map(|r| r.body_str()).as_deref(), Some("GET /g 0"));
+}
+
+/// A chunked response sent in pieces, then the next request.
+#[test]
+fn a_chunked_response_in_pieces_then_a_get() {
+    let (_p, fe, _) = simple(
+        |r| {
+            if r.path == "/c" {
+                Reply {
+                    parts: vec![
+                        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n".to_vec(),
+                        b"6\r\n world\r\n".to_vec(),
+                        b"0\r\n\r\n".to_vec(),
+                    ],
+                    gap: Duration::from_millis(50),
+                    close: false,
+                }
+            } else {
+                echo(r)
+            }
+        },
+        "",
+    );
+    let mut c = Client::connect(fe);
+    assert_eq!(c.get("/c").map(|r| r.body_str()).as_deref(), Some("hello world"));
+    assert_eq!(c.get("/g").map(|r| r.body_str()).as_deref(), Some("GET /g 0"));
+}
+
+/// A HEAD response carries a `Content-Length` and no body; the next response follows
+/// straight after it.
+#[test]
+fn a_head_response_has_no_body() {
+    let (_p, fe, _) = simple(
+        |r| {
+            if r.method == "HEAD" {
+                Reply {
+                    parts: vec![b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n".to_vec()],
+                    gap: Duration::ZERO,
+                    close: false,
+                }
+            } else {
+                echo(r)
+            }
+        },
+        "",
+    );
+    let mut c = Client::connect(fe);
+    c.send(b"HEAD /h HTTP/1.1\r\nHost: x\r\n\r\n");
+    let r = c.response(true).expect("HEAD response");
+    assert_eq!(r.header("content-length"), Some("5"));
+    assert_eq!(c.get("/g").map(|r| r.body_str()).as_deref(), Some("GET /g 0"));
+}
+
+/// A 204 has no body; the next response follows straight after it.
+#[test]
+fn a_204_then_a_get() {
+    let (_p, fe, _) = simple(
+        |r| {
+            if r.path == "/nc" {
+                Reply { parts: vec![b"HTTP/1.1 204 No Content\r\n\r\n".to_vec()], gap: Duration::ZERO, close: false }
+            } else {
+                echo(r)
+            }
+        },
+        "",
+    );
+    let mut c = Client::connect(fe);
+    assert_eq!(c.get("/nc").map(|r| r.status), Some(204));
+    assert_eq!(c.get("/g").map(|r| r.body_str()).as_deref(), Some("GET /g 0"));
+}
+
+/// Keep-alive to the server: three requests on one client connection use one server
+/// connection.
+#[test]
+fn the_server_connection_is_kept_across_requests() {
+    let (_p, fe, seen) = simple(echo, "");
+    let mut c = Client::connect(fe);
+    for i in 0..3 {
+        assert!(c.get(&format!("/{i}")).is_some(), "request {i}");
+    }
+    let conns: Vec<usize> = seen.lock().unwrap().iter().map(|s| s.conn).collect();
+    assert_eq!(conns, [0, 0, 0]);
+}
+
+// ---- responses the proxy writes itself ------------------------------------------------
+
+/// What happens to the connection after each kind of locally generated response, then a
+/// second request on it.
+fn local_reply_then_get(rule: &str) -> (Resp, Option<Resp>) {
+    let (_p, fe, _) = simple(echo, &format!("  {rule} if {{ path /local }}\n"));
+    let mut c = Client::connect(fe);
+    let first = c.get("/local").expect("local reply");
+    let second = c.get("/g");
+    (first, second)
+}
+
+/// `http-request return` keeps the connection. `HAProxy` 3.5: 200 then the GET.
+#[test]
+fn return_keeps_the_connection() {
+    let (first, second) = local_reply_then_get("http-request return status 200 content-type text/plain string hi");
+    assert_eq!((first.status, first.body_str().as_str()), (200, "hi"));
+    assert_eq!(second.map(|r| r.body_str()).as_deref(), Some("GET /g 0"));
+}
+
+/// `http-request deny`. `HAProxy` 3.5: 403, and the connection is kept.
+#[test]
+fn deny_keeps_the_connection() {
+    let (first, second) = local_reply_then_get("http-request deny");
+    assert_eq!(first.status, 403);
+    assert_eq!(second.map(|r| r.body_str()).as_deref(), Some("GET /g 0"));
+}
+
+/// `http-request redirect`. `HAProxy` 3.5: 302, and the connection is kept.
+#[test]
+fn redirect_keeps_the_connection() {
+    let (first, second) = local_reply_then_get("http-request redirect location /elsewhere");
+    assert_eq!(first.status, 302);
+    assert_eq!(first.header("location"), Some("/elsewhere"));
+    assert_eq!(second.map(|r| r.body_str()).as_deref(), Some("GET /g 0"));
+}
+
+/// `http-request auth`. `HAProxy` 3.5: 401, and the connection is kept.
+#[test]
+fn auth_keeps_the_connection() {
+    let (first, second) = local_reply_then_get("http-request auth");
+    assert_eq!(first.status, 401);
+    assert_eq!(second.map(|r| r.body_str()).as_deref(), Some("GET /g 0"));
+}
+
+/// A locally answered POST whose body has not been read: the body must not be parsed as
+/// the next request.
+#[test]
+fn a_denied_post_body_is_not_read_as_a_request() {
+    let (_p, fe, seen) = simple(echo, "  http-request deny if { path /local }\n");
+    let mut c = Client::connect(fe);
+    c.send(b"POST /local HTTP/1.1\r\nHost: x\r\nContent-Length: 30\r\n\r\nGET /smuggled HTTP/1.1\r\nX: y\r\n\r\n");
+    assert_eq!(c.final_response().map(|r| r.status), Some(403));
+    let next = c.get("/g");
+    assert!(seen.lock().unwrap().iter().all(|s| s.path != "/smuggled"), "{:?}", seen.lock().unwrap());
+    if let Some(r) = next {
+        assert_eq!(r.body_str(), "GET /g 0");
+    }
+}
+
+/// A 503 the proxy generates (no server) then a second request. `HAProxy` 3.5: 503, 503.
+#[test]
+fn a_generated_503_keeps_the_connection() {
+    let (_p, fe) = start("frontend fe\n  bind @FE@\n  default_backend be\nbackend be\n", &[]);
+    let mut c = Client::connect(fe);
+    assert_eq!(c.get("/1").map(|r| r.status), Some(503));
+    assert_eq!(c.get("/2").map(|r| r.status), Some(503));
+    assert!(!c.closed_within(Duration::from_millis(200)));
+}
+
+/// `Connection: close` from the client: answered, then closed.
+#[test]
+fn connection_close_from_the_client_closes_after_the_response() {
+    let (_p, fe, _) = simple(echo, "");
+    let mut c = Client::connect(fe);
+    c.send(b"GET /x HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    assert_eq!(c.final_response().map(|r| r.body_str()).as_deref(), Some("GET /x 0"));
+    assert!(c.closed_within(Duration::from_secs(1)));
+}
