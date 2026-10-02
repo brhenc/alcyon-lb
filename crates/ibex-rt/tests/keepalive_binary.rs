@@ -50,9 +50,24 @@ struct Ibex(Child, NamedTempFile);
 
 impl Drop for Ibex {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        stop(&mut self.0);
     }
+}
+
+/// Stops the binary the way it exits cleanly -- `SIGUSR1`, the soft stop -- so an
+/// instrumented build writes its coverage profile; `SIGKILL` discards it, which left every
+/// line these tests run invisible to `harness/covercheck.py`. Killed if it lingers.
+fn stop(child: &mut Child) {
+    let _ = Command::new("kill").arg("-USR1").arg(child.id().to_string()).status();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn start(be: SocketAddr, frontend_extra: &str) -> (Ibex, SocketAddr) {
@@ -80,13 +95,16 @@ fn start(be: SocketAddr, frontend_extra: &str) -> (Ibex, SocketAddr) {
     (Ibex(child, f), fe)
 }
 
-/// Sends three requests down one connection; returns each complete response, stopping at
-/// the first that does not arrive.
-fn three_requests(fe: SocketAddr) -> Vec<String> {
+/// Sends three requests down one connection, `pause` apart; returns each complete
+/// response, stopping at the first that does not arrive.
+fn three_requests(fe: SocketAddr, pause: Duration) -> Vec<String> {
     let mut c = TcpStream::connect(fe).expect("connect");
     c.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
     let mut out = Vec::new();
     for i in 0..3 {
+        if i > 0 {
+            thread::sleep(pause);
+        }
         if c.write_all(format!("GET /{i} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes()).is_err() {
             break;
         }
@@ -117,7 +135,7 @@ fn has_header(resp: &str, name: &str) -> bool {
 #[test]
 fn response_rules_apply_to_every_response_on_a_kept_backend_connection() {
     let (_ibex, fe) = start(backend(Backend::KeepAlive), "  http-response set-header X-Seen yes\n");
-    let responses = three_requests(fe);
+    let responses = three_requests(fe, Duration::ZERO);
     assert_eq!(responses.len(), 3, "responses: {responses:?}");
     for (i, r) in responses.iter().enumerate() {
         assert!(has_header(r, "X-Seen"), "response {i} skipped the http-response rule: {r:?}");
@@ -127,10 +145,18 @@ fn response_rules_apply_to_every_response_on_a_kept_backend_connection() {
 /// A backend that closes after a complete, length-delimited response has finished that
 /// response; the client connection stays open and the next request gets a new backend
 /// connection. Ibex closed the client connection too.
+///
+/// The requests are paced so that the backend's close arrives before the next request
+/// does. Sent at once, the next request can reach the kept connection before its close
+/// is seen (the backend thread writes, then closes, and may be descheduled between the
+/// two); the proxy then has a request lost on a reused connection, which `HAProxy` answers
+/// by closing the client unanswered (`abort_keep_alive`) and so does Ibex -- that case is
+/// `http_txn.rs`, `a_kept_server_connection_closing_on_the_next_request_closes_the_client`.
+/// Unpaced, this failed 4 runs in 12 under a loaded machine.
 #[test]
 fn a_backend_closing_after_a_complete_response_does_not_close_the_client() {
     let (_ibex, fe) = start(backend(Backend::CloseAfterResponse), "");
-    let responses = three_requests(fe);
+    let responses = three_requests(fe, Duration::from_millis(100));
     assert_eq!(responses.len(), 3, "responses: {responses:?}");
     for (i, r) in responses.iter().enumerate() {
         assert!(!r.to_ascii_lowercase().contains("connection: close"), "response {i}: {r:?}");

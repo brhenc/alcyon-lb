@@ -619,10 +619,17 @@ fn test_rt_http_methods_suite() {
             resp_str.starts_with("HTTP/1.1 200 OK"),
             "{m} failed: {resp_str}"
         );
-        assert!(
-            resp_str.contains(&format!("ACK_{m}")),
-            "{m} missing body: {resp_str}"
-        );
+        // A response to HEAD has no body, whatever the server sends after its head
+        // (RFC 9112 section 6.3). HAProxy 3.5 forwards this backend's HEAD answer as the
+        // head alone; the eight bytes the server wrote after it are not a response.
+        if m == "HEAD" {
+            assert!(!resp_str.contains("ACK_HEAD"), "HEAD response carried a body: {resp_str}");
+        } else {
+            assert!(
+                resp_str.contains(&format!("ACK_{m}")),
+                "{m} missing body: {resp_str}"
+            );
+        }
     }
 
     running.store(false, Ordering::Relaxed);

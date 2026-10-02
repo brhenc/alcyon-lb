@@ -1270,6 +1270,20 @@ class MockServerRunner:
                         writer.write(payload)
                         await writer.drain()
 
+                    elif cmd in ("chunkedlen", "chunked"):
+                        # One chunk of a chunked body: `chunkedlen N` is N filler bytes,
+                        # `chunked "text"` the text; size 0 is the last chunk. Without
+                        # these the server announced a chunked body and never sent it.
+                        if cmd == "chunkedlen":
+                            data = (b"0123456789abcdef" * (int(args[0]) // 16 + 1))[: int(args[0])]
+                        else:
+                            text = " ".join(args)
+                            if len(text) >= 2 and text[0] == text[-1] == '"':
+                                text = text[1:-1]
+                            data = decode_escapes(text).encode("latin1")
+                        writer.write(b"%x\r\n" % len(data) + data + b"\r\n")
+                        await writer.drain()
+
                     elif cmd == "sendhex":
                         # `sendhex "300C020101 61 070A01 00 04000400"` is quoted in the
                         # .vtc, and the quotes have to come off before fromhex sees them --

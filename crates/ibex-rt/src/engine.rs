@@ -21,6 +21,7 @@ use crate::listener::Listener;
 use crate::poller::Poller;
 use crate::syslog::SyslogTarget;
 use ibex_config::LogLevel;
+use crate::txn::MsgState;
 use crate::proxy::{TcpSession, Timeouts};
 use crate::raw;
 use ibex_config::{regex, BalanceAlgorithm, Config, Mode, StickRule, UseBackendRule};
@@ -174,6 +175,10 @@ pub struct Proxy {
     pub log_health_checks: bool,
     /// HTTP connection reuse strategy (`http-reuse`).
     pub http_reuse: ibex_config::HttpReuse,
+    /// Custom error pages (`errorfile`/`errorfiles`), keyed by status code.
+    pub error_files: HashMap<u16, Vec<u8>>,
+    /// `http-error` overrides, keyed by status code; consulted before `error_files`.
+    pub error_replies: HashMap<u16, ibex_config::ErrorPageSource>,
 }
 
 impl Proxy {
@@ -331,7 +336,12 @@ pub struct SessionEntry {
     pub sess: TcpSession,
     pub task: TaskRef,
     pub proxy_idx: usize,
+    /// The backend of the transaction in progress (the frontend until one is chosen).
     pub backend_idx: usize,
+    /// The backend the attached server connection belongs to; `target_server_idx` indexes
+    /// its servers. Separate from `backend_idx` because a connection kept between
+    /// transactions outlives the routing of the one that opened it.
+    pub srv_backend_idx: usize,
     pub target_server_idx: Option<usize>,
     pub target_addr: Option<SocketAddr>,
     pub cli_raw_fd: RawFd,
@@ -339,7 +349,6 @@ pub struct SessionEntry {
     pub cli_interest: Interest,
     pub srv_interest: Interest,
     pub actconn_reclaimed: bool,
-    pub response_rules_applied: bool,
 }
 
 /// Per-thread storage for active sessions.
@@ -738,12 +747,26 @@ fn bind_tls(
     Ok(Some(cfg))
 }
 
+/// A section's timeouts. Its own `timeout` lines are in `own`; the legacy fields carry
+/// only what `defaults` said when the section opened (or what a test built in code), so
+/// they are the fallback. Read the other way round, `defaults` overrode the section's own
+/// `timeout server`.
+fn section_timeouts(
+    own: &ibex_config::TimeoutConfig,
+    client: Option<Duration>,
+    server: Option<Duration>,
+    connect: Option<Duration>,
+) -> Timeouts {
+    Timeouts {
+        client: own.client.or(client).map_or(0, millis_to_u32),
+        server: own.server.or(server).map_or(0, millis_to_u32),
+        connect: own.connect.or(connect).map_or(0, millis_to_u32),
+    }
+}
+
+#[allow(clippy::too_many_lines)] // a field-by-field mirror of the section
 fn init_proxy_from_listen(proxy_idx: usize, listen: &ibex_config::ListenSection, nbthread: usize) -> Proxy {
-    let timeouts = Timeouts {
-        client: listen.clitimeout.map_or(0, millis_to_u32),
-        server: listen.srvtimeout.map_or(0, millis_to_u32),
-        connect: listen.contimeout.map_or(0, millis_to_u32),
-    };
+    let timeouts = section_timeouts(&listen.timeouts, listen.clitimeout, listen.srvtimeout, listen.contimeout);
 
     let retries = u16::try_from(listen.retries).unwrap_or(u16::MAX);
 
@@ -847,18 +870,13 @@ fn init_proxy_from_listen(proxy_idx: usize, listen: &ibex_config::ListenSection,
         http_res_rules: listen.http_res_rules.clone(),
         http_after_res_rules: listen.http_after_res_rules.clone(),
         http_reuse: listen.http_reuse.unwrap_or_default(),
+        error_files: listen.error_files.clone(),
+        error_replies: listen.error_replies.clone(),
     }
 }
 
 fn init_proxy_from_frontend(proxy_idx: usize, fe: &ibex_config::FrontendSection, nbthread: usize) -> Proxy {
-    let timeouts = Timeouts {
-        client: fe
-            .clitimeout
-            .or(fe.timeouts.client)
-            .map_or(0, millis_to_u32),
-        server: fe.timeouts.server.map_or(0, millis_to_u32),
-        connect: fe.timeouts.connect.map_or(0, millis_to_u32),
-    };
+    let timeouts = section_timeouts(&fe.timeouts, fe.clitimeout, None, None);
 
     let mut cliexp = Vec::new();
     for exp in &fe.cliexp {
@@ -928,21 +946,13 @@ fn init_proxy_from_frontend(proxy_idx: usize, fe: &ibex_config::FrontendSection,
         http_res_rules: fe.http_res_rules.clone(),
         http_after_res_rules: fe.http_after_res_rules.clone(),
         http_reuse: ibex_config::HttpReuse::default(),
+        error_files: fe.error_files.clone(),
+        error_replies: fe.error_replies.clone(),
     }
 }
 
 fn init_proxy_from_backend(proxy_idx: usize, be: &ibex_config::BackendSection, nbthread: usize) -> Proxy {
-    let timeouts = Timeouts {
-        client: be.timeouts.client.map_or(0, millis_to_u32),
-        server: be
-            .srvtimeout
-            .or(be.timeouts.server)
-            .map_or(0, millis_to_u32),
-        connect: be
-            .contimeout
-            .or(be.timeouts.connect)
-            .map_or(0, millis_to_u32),
-    };
+    let timeouts = section_timeouts(&be.timeouts, None, be.srvtimeout, be.contimeout);
 
     let retries = u16::try_from(be.retries).unwrap_or(u16::MAX);
 
@@ -1036,6 +1046,8 @@ fn init_proxy_from_backend(proxy_idx: usize, be: &ibex_config::BackendSection, n
         http_res_rules: be.http_res_rules.clone(),
         http_after_res_rules: be.http_after_res_rules.clone(),
         http_reuse: be.http_reuse.unwrap_or_default(),
+        error_files: be.error_files.clone(),
+        error_replies: be.error_replies.clone(),
     }
 }
 
@@ -1400,8 +1412,11 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         self.scheduler.set_now(now);
         let _ = self.scheduler.wake_expired_tasks();
 
-        // 2. Determine epoll wait timeout based on scheduler
-        let poll_timeout = if self.scheduler.runnable() > 0 {
+        // 2. Determine epoll wait timeout based on scheduler. Queued tasklets count: a
+        // session woken without a socket event -- the next pipelined request already in
+        // its buffer -- otherwise waited for the poll timeout, 100 ms per request.
+        // `runnable()` is the timer run queue only.
+        let poll_timeout = if self.scheduler.run_queue_len() > 0 {
             Duration::from_millis(0)
         } else {
             let next_timer = self.scheduler.next_expiry();
@@ -1867,7 +1882,9 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         // waiting for another request that this process will not be around to serve.
         for (_, e) in self.sessions.iter_mut() {
             if e.sess.mode == Mode::Http {
-                e.sess.connection_close = true;
+                if let Some(t) = e.sess.txn.as_mut() {
+                    t.close_after = true;
+                }
                 if let Some(ref mut h2_ctx) = e.sess.h2_ctx {
                     h2_ctx.send_graceful_goaway();
                     // Wake up the task so the mux can flush the frame.
@@ -1890,7 +1907,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         let mut wake = Vec::new();
         for (_, e) in self.sessions.iter_mut() {
             let idle = e.sess.mode == Mode::Http
-                && !e.response_rules_applied
+                && e.sess.txn.is_none()
                 && e.sess.req.is_empty()
                 && e.sess.rep.is_empty()
                 && e.sess.req_headers.is_none()
@@ -2657,6 +2674,7 @@ fn register_new_session(
         task: TaskRef::NONE,
         proxy_idx,
         backend_idx: proxy_idx,
+        srv_backend_idx: proxy_idx,
         target_server_idx,
         target_addr,
         cli_raw_fd,
@@ -2664,7 +2682,6 @@ fn register_new_session(
         cli_interest,
         srv_interest: Interest::NONE,
         actconn_reclaimed: false,
-        response_rules_applied: false,
     }) else {
         if let Some(idx) = target_server_idx {
             if idx < proxy.server_actconn.len() {
@@ -2749,6 +2766,23 @@ fn maybe_prepend_send_proxy(proxy: &Proxy, sess: &mut TcpSession, target_addr: S
     if sess.send_proxy_prepended {
         return;
     }
+    let before = sess.req.len();
+    prepend_send_proxy(proxy, sess, target_addr);
+    // The header goes out ahead of the request, so it is counted as part of the request's
+    // head. Measured by the scanner it would not be: a v2 header opens with the bytes
+    // `\r\n\r\n`, which read as the end of a head four bytes in.
+    let added = sess.req.len() - before;
+    if added > 0 {
+        if let Some(t) = sess.txn.as_mut() {
+            if let MsgState::Head { left: 0, body } = t.req {
+                let head = crate::proxy::find_eoh(&sess.req.readable()[added..]).map_or(0, |(h, e)| h + e);
+                t.req = MsgState::Head { left: added + head, body };
+            }
+        }
+    }
+}
+
+fn prepend_send_proxy(proxy: &Proxy, sess: &mut TcpSession, target_addr: SocketAddr) {
     if let Some(idx) = proxy.servers.iter().position(|&s| s == target_addr) {
         let send_v2 = proxy
             .server_send_proxy_v2
@@ -2821,9 +2855,6 @@ fn init_client_session(
     // Use per-engine values rather than the global `BUFSIZE_STANDARD` atomic so that
     // multiple Engine instances running in the same process (e.g. parallel tests) do not
     // race each other's configuration.
-    // The engine applies `http-response` rules; hold responses until it has (see
-    // `TcpSession::resp_released`).
-    sess.resp_released = mode != Mode::Http;
     sess.bufsize = global_bufsize;
     sess.maxrewrite = proxies[proxy_idx]
         .stats_config
@@ -2935,7 +2966,7 @@ pub fn shutdown_session_entry(
             proxies[proxy_idx].stats[worker_id()].act_conn.fetch_sub(1, Ordering::Relaxed);
         }
         if let Some(s_idx) = entry.target_server_idx {
-            let be_idx = entry.backend_idx;
+            let be_idx = entry.srv_backend_idx;
             if be_idx < proxies.len() && s_idx < proxies[be_idx].server_actconn.len() {
                 proxies[be_idx].server_actconn[s_idx].fetch_sub(1, Ordering::Relaxed);
             }
@@ -2954,7 +2985,7 @@ pub fn shutdown_matching_sessions<'a>(
 ) -> usize {
     let mut count = 0;
     for entry in sessions {
-        let be_idx = entry.backend_idx;
+        let be_idx = entry.srv_backend_idx;
         if be_idx >= proxies.len() {
             continue;
         }
@@ -3085,6 +3116,80 @@ struct EngineDispatcher<'a> {
     idle_backend_pool: &'a mut HashMap<SocketAddr, Vec<OwnedFd>>,
 }
 
+/// Answers the current request with the page for `status`, chosen as HAProxy's
+/// `http_error_message` chooses it: the backend's `http-error`/`errorfile`, then the
+/// frontend's, then the built-in page. Every error the proxy generates goes through here.
+fn reply_error(entry: &mut SessionEntry, proxies: &[Proxy], status: u16) {
+    let be = proxies.get(entry.backend_idx).unwrap_or(&proxies[entry.proxy_idx]);
+    let page = proxy_error_response(&entry.sess, be, &proxies[entry.proxy_idx], status);
+    entry.sess.write_reply(&page);
+}
+
+/// Detaches the server connection from the session: into the idle pool when it can carry
+/// another request, closed otherwise. The server slot it held is released either way.
+fn release_server(
+    entry: &mut SessionEntry,
+    proxies: &[Proxy],
+    fdtab: &mut FdTab,
+    poller: &mut Poller,
+    idle_pool: &mut HashMap<SocketAddr, Vec<OwnedFd>>,
+    reusable: bool,
+) {
+    if let Some(srv_fd) = entry.sess.srv.take() {
+        let _ = poller.delete(srv_fd.as_fd());
+        if let Some(sfd) = entry.srv_raw_fd.take() {
+            fdtab.remove(sfd);
+        }
+        let reusable = reusable
+            && matches!(entry.sess.srv_state, ScState::Ready | ScState::Established)
+            // A connection that opened with a PROXY header speaks for this client only.
+            && !entry.sess.send_proxy_prepended
+            // The pool holds bare sockets; a TLS session's state does not go with them.
+            && !entry.sess.srv_xprt.is_tls()
+            && proxies
+                .get(entry.srv_backend_idx)
+                .is_some_and(|p| p.http_reuse != ibex_config::HttpReuse::Never)
+            && raw::is_idle_conn_alive(srv_fd.as_fd());
+        if let (true, Some(addr)) = (reusable, entry.target_addr) {
+            idle_pool.entry(addr).or_default().push(srv_fd);
+        }
+    }
+    entry.srv_raw_fd = None;
+    entry.sess.srv_xprt = crate::xprt::ServerXprt::Plain;
+    if let Some(s_idx) = entry.target_server_idx.take() {
+        let be = entry.srv_backend_idx;
+        if !entry.actconn_reclaimed && be < proxies.len() && s_idx < proxies[be].server_actconn.len() {
+            proxies[be].server_actconn[s_idx].fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+    entry.target_addr = None;
+    entry.sess.srv_state = ScState::Init;
+    // The next server connection is a new one and gets its own PROXY header.
+    if entry.sess.mode == Mode::Http {
+        entry.sess.send_proxy_prepended = false;
+    }
+}
+
+/// Ends the HTTP session: the server connection is pooled if `reusable`, the client
+/// connection closed.
+fn close_http_session(
+    entry: &mut SessionEntry,
+    proxies: &[Proxy],
+    fdtab: &mut FdTab,
+    poller: &mut Poller,
+    idle_pool: &mut HashMap<SocketAddr, Vec<OwnedFd>>,
+    reusable: bool,
+) {
+    release_server(entry, proxies, fdtab, poller, idle_pool, reusable);
+    if matches!(entry.sess.cli_state, ScState::Ready | ScState::Established | ScState::ShutR) {
+        raw::shutdown_write(entry.sess.cli.as_fd());
+    }
+    entry.sess.txn = None;
+    entry.sess.cli_state = ScState::Closed;
+    entry.sess.srv_state = ScState::Closed;
+    entry.sess.ending.get_or_insert(crate::proxy::Ending::Complete);
+}
+
 fn retry_server_connect(
     entry: &mut SessionEntry,
     proxies: &mut [Proxy],
@@ -3098,7 +3203,7 @@ fn retry_server_connect(
     }
 
     if let Some(old_idx) = entry.target_server_idx.take() {
-        let old_be = entry.backend_idx;
+        let old_be = entry.srv_backend_idx;
         if old_be < proxies.len() && old_idx < proxies[old_be].server_actconn.len() {
             proxies[old_be].server_actconn[old_idx].fetch_sub(1, Ordering::Relaxed);
         }
@@ -3131,6 +3236,7 @@ fn retry_server_connect(
         }
     }
     entry.target_server_idx = s_idx;
+    entry.srv_backend_idx = be_idx;
 
     maybe_prepend_send_proxy(&proxies[be_idx], &mut entry.sess, target_addr);
 
@@ -3182,12 +3288,7 @@ fn retry_server_connect(
         if !entry.sess.server_failed() {
             entry.sess.srv_state = ScState::Error;
             if entry.sess.mode == Mode::Http {
-                entry.sess.discard_unforwarded_request();
-                entry.sess.send_synthetic_response(
-                    503,
-                    Some("text/html; charset=utf-8"),
-                    Some("<html><body><h1>503 Service Unavailable</h1>Failed to connect to backend server.</body></html>\n"),
-                );
+                reply_error(entry, proxies, 503);
             }
         }
     }
@@ -3235,12 +3336,7 @@ fn check_srv_connect(
                     } else {
                         entry.sess.srv_state = ScState::Error;
                         if entry.sess.mode == Mode::Http {
-                            entry.sess.discard_unforwarded_request();
-                            entry.sess.send_synthetic_response(
-                                503,
-                                Some("text/html; charset=utf-8"),
-                                Some("<html><body><h1>503 Service Unavailable</h1>Failed to connect to backend server.</body></html>\n"),
-                            );
+                            reply_error(entry, proxies, 503);
                         }
                     }
                 }
@@ -3308,7 +3404,7 @@ fn cleanup_done(
         proxies[proxy_idx].stats[worker_id()].act_conn.fetch_sub(1, Ordering::Relaxed);
 
         if let Some(s_idx) = entry.target_server_idx {
-            let be_idx = entry.backend_idx;
+            let be_idx = entry.srv_backend_idx;
             if be_idx < proxies.len() && s_idx < proxies[be_idx].server_actconn.len() {
                 proxies[be_idx].server_actconn[s_idx].fetch_sub(1, Ordering::Relaxed);
             }
@@ -3337,49 +3433,8 @@ fn cleanup_done(
     }
 }
 
-fn is_http_response_complete(buf: &[u8]) -> bool {
-    let Some((hdr_len, eoh_len)) = crate::proxy::find_eoh(buf) else {
-        return false;
-    };
-    let total_hdr_len = hdr_len + eoh_len;
-    let body_bytes = buf.len() - total_hdr_len;
-
-    let Ok(hdr_str) = std::str::from_utf8(&buf[..total_hdr_len]) else {
-        return false;
-    };
-
-    if let Some((first_line, _)) = hdr_str.split_once("\r\n") {
-        let mut words = first_line.split_whitespace();
-        let _proto = words.next();
-        if let Some(status_str) = words.next() {
-            if let Ok(status) = status_str.parse::<u16>() {
-                if status == 204 || status == 304 || (100..200).contains(&status) {
-                    return true;
-                }
-            }
-        }
-    }
-
-    let hdr_lower = hdr_str.to_ascii_lowercase();
-    if hdr_lower.contains("transfer-encoding: chunked") {
-        return buf[total_hdr_len..].windows(5).any(|w| w == b"0\r\n\r\n");
-    }
-
-    for line in hdr_str.lines() {
-        if let Some((k, v)) = line.split_once(':') {
-            if k.trim().eq_ignore_ascii_case("content-length") {
-                if let Ok(cl) = v.trim().parse::<usize>() {
-                    return body_bytes >= cl;
-                }
-            }
-        }
-    }
-
-    false
-}
-
-/// HAProxy's `monitor-uri` answer. Ibex closes the connection after it (and the relay
-/// adds `Connection: close`), where HAProxy keeps it alive.
+/// `HAProxy`'s `monitor-uri` answer. Ibex closes the connection after it (and the relay
+/// adds `Connection: close`), where `HAProxy` keeps it alive.
 const MONITOR_URI_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-length: 58\r\n\
 cache-control: no-cache\r\ncontent-type: text/html\r\n\r\n\
 <html><body><h1>200 OK</h1>\nService ready.\n</body></html>\n";
@@ -3459,6 +3514,266 @@ impl EngineDispatcher<'_> {
         proxy_idx
     }
 
+    /// One pass over the HTTP transaction, after the byte layer has run: the reply owed
+    /// for an unparsable request, request rules and routing (once per transaction), the
+    /// response head, how each side ended, and the end of the transaction.
+    #[allow(clippy::too_many_arguments)]
+    fn http_step(
+        entry: &mut SessionEntry,
+        proxies: &mut [Proxy],
+        checks: &mut [ServerCheckState],
+        pid: u32,
+        fdtab: &mut FdTab,
+        poller: &mut Poller,
+        idle_pool: &mut HashMap<SocketAddr, Vec<OwnedFd>>,
+        wake_queue: &mut Vec<TaskRef>,
+        now: Tick,
+    ) -> Option<crate::stats_html::AdminAction> {
+        let Some(txn) = entry.sess.txn.as_mut() else {
+            // Between requests. A client that goes away here ends the session; a server
+            // connection kept from the last transaction goes back to the pool.
+            if !matches!(entry.sess.cli_state, ScState::Ready | ScState::Established) {
+                close_http_session(entry, proxies, fdtab, poller, idle_pool, true);
+            } else if entry.sess.srv.is_some()
+                && (!entry.sess.rep.is_empty()
+                    || !matches!(entry.sess.srv_state, ScState::Ready | ScState::Established))
+            {
+                // The kept connection closed, failed, or spoke out of turn: it is done.
+                entry.sess.rep.clear();
+                release_server(entry, proxies, fdtab, poller, idle_pool, false);
+            }
+            return None;
+        };
+
+        if let Some(status) = txn.error.take() {
+            reply_error(entry, proxies, status);
+        }
+
+        let mut admin = None;
+        if entry.sess.txn.as_ref().is_some_and(|t| !t.req_rules_done) && entry.sess.tcp_inspect_done {
+            if let Some(t) = entry.sess.txn.as_mut() {
+                t.req_rules_done = true;
+            }
+            admin = Self::connect_http_backend(entry, proxies, checks, pid, fdtab, poller, idle_pool, now);
+            // The rules have had their way with the head; it is final now.
+            let sess = &mut entry.sess;
+            if let Some(t) = sess.txn.as_mut() {
+                t.req.measure_head(sess.req.readable());
+            }
+        }
+
+        // The response head, then whatever this pass made ready to move: a request the
+        // rules just released, a response head they just processed, a reply, or the final
+        // head queued behind an interim one. It moves now rather than on the next poller
+        // round. Bounded, and it stops as soon as a byte pass makes no progress (a full
+        // socket), so it cannot spin.
+        for _ in 0..4 {
+            if entry.sess.txn.as_ref().is_some_and(|t| t.rsp == MsgState::Waiting && t.reads_server())
+                && !entry.sess.rep.is_empty()
+            {
+                Self::apply_http_response_rules(entry, proxies, now);
+            }
+            Self::h2_forward_response(entry);
+            Self::http_server_side(entry, proxies);
+            let movable = entry.sess.has_pending_output() || entry.sess.req_window() > 0;
+            if !movable || entry.sess.is_done() {
+                break;
+            }
+            let before = (
+                entry.sess.req.len(),
+                entry.sess.rep.len(),
+                entry.sess.txn.as_ref().map(|t| (t.req, t.rsp)),
+            );
+            let _ = entry.sess.process(now);
+            let after = (
+                entry.sess.req.len(),
+                entry.sess.rep.len(),
+                entry.sess.txn.as_ref().map(|t| (t.req, t.rsp)),
+            );
+            if before == after {
+                break;
+            }
+        }
+
+        let Some(txn) = entry.sess.txn.as_mut() else {
+            return admin;
+        };
+        match entry.sess.cli_state {
+            ScState::Ready | ScState::Established => {}
+            // The client finished sending. A complete request is still answered; one cut
+            // short cannot be.
+            // A tunnel has no end of its own: either side closing ends it, once what is
+            // in flight has been delivered.
+            ScState::ShutR if txn.req == MsgState::Tunnel => {
+                txn.close_after = true;
+                txn.aborted = true;
+            }
+            ScState::ShutR if txn.req.is_done() || txn.local => {
+                txn.close_after = true;
+            }
+            _ => {
+                close_http_session(entry, proxies, fdtab, poller, idle_pool, false);
+                return admin;
+            }
+        }
+
+        let drained = !entry.sess.has_pending_output();
+        let Some(txn) = entry.sess.txn.as_ref() else {
+            return admin;
+        };
+        if drained && txn.aborted {
+            close_http_session(entry, proxies, fdtab, poller, idle_pool, false);
+        } else if drained && txn.finished() {
+            Self::end_txn(entry, proxies, fdtab, poller, idle_pool, wake_queue, now);
+        }
+        admin
+    }
+
+    /// How the server side ended, if it has, for a response the server is sending.
+    fn http_server_side(entry: &mut SessionEntry, proxies: &[Proxy]) {
+        let srv_eof = matches!(entry.sess.srv_state, ScState::ShutR | ScState::Closed);
+        let srv_err = entry.sess.srv_state == ScState::Error;
+        let Some(txn) = entry.sess.txn.as_mut() else {
+            return;
+        };
+        if !(srv_eof || srv_err) || !txn.req_rules_done || txn.local || txn.rsp.is_done() {
+            return;
+        }
+        match txn.rsp {
+            MsgState::Waiting => {
+                // No response, or a partial head: HAProxy answers 502, or 504 when it gave
+                // up waiting, or 503 when the connection never completed.
+                let status = match entry.sess.ending {
+                    Some(crate::proxy::Ending::Timeout(crate::proxy::Which::Server)) => 504,
+                    Some(crate::proxy::Ending::Timeout(crate::proxy::Which::Connect)) => 503,
+                    _ => 502,
+                };
+                if status == 502 && txn.srv_reused && entry.sess.rep.is_empty() {
+                    // `abort_keep_alive`: a keep-alive request lost to a network error,
+                    // nothing of a response received. The client retries only if it
+                    // sees the connection close unanswered.
+                    txn.close_after = true;
+                    txn.aborted = true;
+                    return;
+                }
+                entry.sess.rep.clear();
+                reply_error(entry, proxies, status);
+            }
+            MsgState::Body(crate::txn::Body::UntilClose) | MsgState::Head { body: crate::txn::Framing::UntilClose, .. }
+                if srv_eof =>
+            {
+                // The close is the end of this body; the client learns it the same way.
+                txn.close_after = true;
+                if entry.sess.rep.is_empty() {
+                    txn.rsp = MsgState::Done;
+                }
+            }
+            _ => {
+                // A server closing after its response is all here has finished that
+                // response, not cut it short; it is delivered and the connection kept.
+                let mut probe = txn.rsp;
+                probe.advance(entry.sess.rep.readable());
+                if probe.is_done() {
+                    txn.srv_reusable = false;
+                } else {
+                    // Cut short: what arrived is delivered, then the client connection
+                    // closes, the only way left to tell it the response is incomplete.
+                    txn.close_after = true;
+                    txn.aborted = true;
+                }
+            }
+        }
+    }
+
+    /// HTTP/2: a response is handed to the stream once it is complete (or fills the
+    /// buffer). One stream at a time until each stream has its own transaction (design
+    /// 010 step 5).
+    fn h2_forward_response(entry: &mut SessionEntry) {
+        let sess = &mut entry.sess;
+        let (Some(h2), Some(txn)) = (sess.h2_ctx.as_mut(), sess.txn.as_mut()) else {
+            return;
+        };
+        if txn.rsp == MsgState::Waiting || txn.rsp.is_done() {
+            return;
+        }
+        let data = sess.rep.readable();
+        let win = txn.rsp.window(data);
+        if txn.rsp_interim {
+            // An HTTP/1 interim response has no place in this conversion; it is dropped.
+            txn.response_sent(data, win);
+            sess.rep.consume(win);
+            return;
+        }
+        let mut probe = txn.rsp;
+        probe.advance(data);
+        let srv_gone = matches!(sess.srv_state, ScState::ShutR | ScState::Closed | ScState::Error);
+        if probe.is_done() || sess.rep.is_full() || srv_gone {
+            let stream_id = sess.h2_active_stream_id.unwrap_or(1);
+            if h2.send_h1_response(stream_id, &data[..win]) {
+                txn.rsp.consume(data, win);
+                sess.rep.consume(win);
+                if !txn.rsp.is_done() {
+                    txn.rsp = MsgState::Done;
+                    txn.srv_reusable = false;
+                }
+            }
+        }
+    }
+
+    /// The transaction is over: both messages complete and the response delivered.
+    /// `HAProxy`'s `http_end_request`/`http_end_response` meeting at `DONE`. The server
+    /// connection goes back to the pool if it can carry another request; the client
+    /// connection either closes or waits for its next request.
+    fn end_txn(
+        entry: &mut SessionEntry,
+        proxies: &mut [Proxy],
+        fdtab: &mut FdTab,
+        poller: &mut Poller,
+        idle_pool: &mut HashMap<SocketAddr, Vec<OwnedFd>>,
+        wake_queue: &mut Vec<TaskRef>,
+        now: Tick,
+    ) {
+        let Some(txn) = entry.sess.txn.take() else {
+            return;
+        };
+        // Bytes after the end of the response are not the next response: the server broke
+        // framing (a body after a HEAD answer, say), and its connection is not reused.
+        let leftover = !entry.sess.rep.is_empty() && !txn.local;
+        if leftover {
+            entry.sess.rep.clear();
+        }
+        let reusable = txn.srv_reusable && !txn.local && !leftover && txn.req.is_done() && txn.rsp.is_done();
+        let close = if entry.sess.h2_ctx.is_some() {
+            !matches!(entry.sess.cli_state, ScState::Ready | ScState::Established)
+        } else {
+            txn.close_after || !matches!(entry.sess.cli_state, ScState::Ready | ScState::Established)
+        };
+        if close {
+            close_http_session(entry, proxies, fdtab, poller, idle_pool, reusable);
+            return;
+        }
+        if !reusable {
+            release_server(entry, proxies, fdtab, poller, idle_pool, false);
+        }
+        // A reusable server connection stays on the session for the next request, which
+        // takes it if routing sends it to the same server (`connect_http_backend`).
+        entry.sess.reset_for_next_request();
+        // A next request already in the buffer has no socket event left to announce it:
+        // run once more straight away. (Without one, the poller wakes the session.)
+        if !entry.sess.req.is_empty() {
+            wake_queue.push(entry.task);
+        }
+        if !proxies[entry.proxy_idx].tcp_req_content_rules.is_empty() {
+            let _ = eval_tcp_req_content_rules(
+                &proxies[entry.proxy_idx],
+                proxies,
+                sample_registry(),
+                &mut entry.sess,
+                now,
+            );
+        }
+    }
+
     #[allow(clippy::too_many_lines)] // one dispatch chain; splitting it would obscure the order
     fn step_stream(&mut self, session_idx: u32) -> Outcome {
         let now = self.now;
@@ -3470,60 +3785,16 @@ impl EngineDispatcher<'_> {
             // Step 1: Server connect check if connecting
             check_srv_connect(entry, self.proxies, self.fdtab, self.poller, now);
 
+            // A readiness event on the server socket: reading it may make progress again.
+            if let Some(sfd) = entry.srv_raw_fd {
+                if self.fdtab.ready(sfd).readable {
+                    entry.sess.srv_cant_recv = false;
+                    self.fdtab.clear_ready(sfd, true, false);
+                }
+            }
+
             // Step 2: Check timeouts
             let _ = entry.sess.check_timeouts(now);
-
-            // Step 2.5: In HTTP mode, if server is Ready to read response headers, read and apply rules before client writes
-            if entry.sess.mode == Mode::Http
-                && entry.sess.srv_state == ScState::Ready
-                && !entry.response_rules_applied
-            {
-                if let Some(ref srv_fd) = entry.sess.srv {
-                    if entry.sess.rep.writable().is_empty() && entry.sess.rep.len() < entry.sess.rep.capacity() {
-                        entry.sess.rep.compact();
-                    }
-                    let w = entry.sess.rep.writable();
-                    if !w.is_empty() {
-                        match raw::recv(srv_fd.as_fd(), w) {
-                            Ok(raw::Io::Done(n)) if n > 0 => {
-                                entry.sess.rep.commit(n);
-                                entry.sess.bytes_in += n as u64;
-                                Self::apply_http_response_rules(entry, self.proxies, now);
-                            }
-                            Ok(raw::Io::Closed) => {
-                                entry.sess.srv_state = ScState::ShutR;
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-
-            // Step 2.6: In HTTP mode with client keep-alive, if the backend response is completely received
-            // and the backend connection is closing, detach and clean up the backend connection now.
-            // This prevents `proxy.rs`'s `process_cli_transitions` from erroneously treating the backend close
-            // as an EOF on the client socket and calling `raw::shutdown_write(client)`.
-            if entry.sess.mode == Mode::Http
-                && !entry.sess.connection_close
-                && (entry.sess.srv.is_some() || matches!(entry.sess.srv_state, ScState::ShutR | ScState::Closed))
-                && entry.response_rules_applied
-            {
-                let complete = is_http_response_complete(entry.sess.rep.readable())
-                    || matches!(entry.sess.srv_state, ScState::ShutR | ScState::Closed);
-                let backend_closing = entry.sess.srv_connection_close
-                    || matches!(entry.sess.srv_state, ScState::ShutR | ScState::Closed);
-                if complete && backend_closing {
-                    if let Some(srv_fd) = entry.sess.srv.take() {
-                        let sfd = srv_fd.as_raw_fd();
-                        self.fdtab.remove(sfd);
-                        let _ = self.poller.delete(srv_fd.as_fd());
-                        entry.srv_raw_fd = None;
-                    }
-                    entry.target_addr = None;
-                    entry.target_server_idx = None;
-                    entry.sess.srv_state = ScState::Init;
-                }
-            }
 
             // Step 3: Stream engine process pass
             if !entry.sess.is_done() {
@@ -3563,19 +3834,10 @@ impl EngineDispatcher<'_> {
                 }
             }
 
-            // Step 3.5: If in HTTP mode and request headers are parsed, initiate backend connect
+            // Step 3.5: the HTTP transaction -- rules, routing, the response head, and its end.
             let mut pending_admin = None;
-            if entry.sess.mode == Mode::Http
-                && !entry.response_rules_applied
-                && entry.sess.rep.is_empty()
-                && entry.sess.srv_state == ScState::Init
-                && (entry.sess.cli_state == ScState::Established
-                    || (entry.sess.cli_state == ScState::ShutR && (entry.sess.req_headers.is_some() || entry.sess.has_htx)))
-                && (entry.sess.req_headers.is_some() || entry.sess.has_htx)
-                && entry.sess.tcp_inspect_done
-                && !entry.sess.is_done()
-            {
-                pending_admin = Self::connect_http_backend(
+            if entry.sess.mode == Mode::Http && !entry.sess.is_done() {
+                pending_admin = Self::http_step(
                     entry,
                     self.proxies,
                     self.checks,
@@ -3583,6 +3845,7 @@ impl EngineDispatcher<'_> {
                     self.fdtab,
                     self.poller,
                     self.idle_backend_pool,
+                    &mut self.wake_queue,
                     now,
                 );
             }
@@ -3597,178 +3860,14 @@ impl EngineDispatcher<'_> {
                 Self::connect_tcp_backend(entry, self.proxies, self.fdtab, self.poller, now);
             }
 
-            // Step 3.7: If in HTTP mode and response headers are ready in rep, apply response rules
-            if entry.sess.mode == Mode::Http
-                && !entry.response_rules_applied
-                && !entry.sess.rep.is_empty()
-            {
-                Self::apply_http_response_rules(entry, self.proxies, now);
-            }
-
-            // Step 3.7b: If HTTP/2 session and response is ready in rep, convert to H2 response frames
-            if let Some(ref mut h2) = entry.sess.h2_ctx {
-                if entry.response_rules_applied && !entry.sess.rep.is_empty() {
-                    let stream_id = entry.sess.h2_active_stream_id.unwrap_or(1);
-                    if h2.send_h1_response(stream_id, entry.sess.rep.readable()) {
-                        entry.sess.rep.clear();
-                    }
-                }
-            }
-
-            // Step 3.8: In HTTP mode, if a transaction has finished (response completely sent to client)
-            if entry.sess.mode == Mode::Http
-                && entry.response_rules_applied
-                && !entry.sess.has_pending_output()
-            {
-                let close_requested = if entry.sess.h2_ctx.is_some() {
-                    matches!(
-                        entry.sess.cli_state,
-                        ScState::ShutW | ScState::Closed | ScState::Error
-                    )
-                } else {
-                    entry.sess.connection_close
-                        || matches!(
-                            entry.sess.cli_state,
-                            ScState::ShutW | ScState::ShutR | ScState::Closed | ScState::Error
-                        )
-                };
-                if close_requested {
-                    let srv_alive = !entry.sess.srv_connection_close
-                        && !matches!(
-                            entry.sess.srv_state,
-                            ScState::ShutR | ScState::Closed | ScState::Error
-                        );
-                    if srv_alive {
-                        if let Some(srv_fd) = entry.sess.srv.take() {
-                            let sfd = srv_fd.as_raw_fd();
-                            self.fdtab.remove(sfd);
-                            let _ = self.poller.delete(srv_fd.as_fd());
-                            entry.srv_raw_fd = None;
-                            if let Some(target_addr) = entry.target_addr {
-                                let be_idx = entry.backend_idx;
-                                if self.proxies.get(be_idx).is_some_and(|p| p.http_reuse != ibex_config::HttpReuse::Never)
-                                    && raw::is_idle_conn_alive(srv_fd.as_fd())
-                                {
-                                    self.idle_backend_pool.entry(target_addr).or_default().push(srv_fd);
-                                }
-                            }
-                        }
-                    }
-                    entry.sess.cli_state = ScState::Closed;
-                    entry.sess.srv_state = ScState::Closed;
-                    entry.sess.ending.get_or_insert(crate::proxy::Ending::Complete);
-                } else if entry.sess.cli_state.can_read() && entry.sess.cli_state.can_write() {
-                    // Keep the backend connection for the next request on this session.
-                    //
-                    // Tearing it down after every transaction meant each keep-alive request
-                    // opened a fresh upstream connection, which is both a large performance
-                    // regression and a behavioural one: a backend that accepts once and
-                    // serves many requests on that stream never sees request two. HAProxy
-                    // reuses backend connections by default (`http-reuse safe`).
-                    //
-                    // It is only closed when the far end is actually finished with it --
-                    // the server closed its read side, or the connection errored.
-                    let backend_finished = entry.sess.srv.is_none()
-                        || entry.sess.srv_connection_close
-                        || matches!(
-                            entry.sess.srv_state,
-                            ScState::ShutR | ScState::Closed | ScState::Error
-                        );
-                    if backend_finished {
-                        if let Some(srv_fd) = entry.sess.srv.take() {
-                            let sfd = srv_fd.as_raw_fd();
-                            self.fdtab.remove(sfd);
-                            let _ = self.poller.delete(srv_fd.as_fd());
-                            entry.srv_raw_fd = None;
-                        }
-                        entry.target_addr = None;
-                        entry.target_server_idx = None;
-                    }
-                    entry.response_rules_applied = false;
-                    entry.sess.resp_headers_processed = false;
-                    entry.sess.resp_length_known = false;
-                    entry.sess.resp_released = false;
-                    entry.sess.resp_status = 0;
-                    if backend_finished {
-                        entry.sess.srv_state = ScState::Init;
-                    } else {
-                        // A kept backend connection waits for the next response's headers,
-                        // which is what `Ready` means on the server side. Left `Established`,
-                        // the next response bypassed both places that apply response rules
-                        // (Step 2.5 and `process_srv_active`), so only the first response on
-                        // a connection ever had its rules applied.
-                        entry.sess.srv_state = ScState::Ready;
-                    }
-                    entry.sess.srv_connection_close = false;
-                    entry.sess.is_first_req = false;
-                    entry.sess.req_method = None;
-                    entry.sess.req_uri = None;
-                    entry.sess.req_headers = None;
-                    entry.sess.clear_htx();
-                    entry.sess.h2_active_stream_id = None;
-                    entry.sess.cli_state = ScState::Ready;
-                    entry.sess.req_vars.clear();
-                    // Run once more straight away. The next request may already have
-                    // arrived while this one was finishing; its readiness was recorded
-                    // then, and the poller will not report it again, so without this the
-                    // session sat idle until `timeout client` with a request waiting.
-                    self.wake_queue.push(entry.task);
-                    if !self.proxies[entry.proxy_idx].tcp_req_content_rules.is_empty() {
-                        let _ = eval_tcp_req_content_rules(
-                            &self.proxies[entry.proxy_idx],
-                            self.proxies,
-                            sample_registry(),
-                            &mut entry.sess,
-                            now,
-                        );
-                    }
-                }
-            }
-
-            // Step 3.9: In HTTP mode, if client disconnected while idle between keep-alive requests
-            if entry.sess.mode == Mode::Http
-                && !entry.response_rules_applied
-                && entry.sess.req.is_empty()
-                && matches!(
-                    entry.sess.cli_state,
-                    ScState::ShutR | ScState::ShutW | ScState::Closed | ScState::Error
-                )
-            {
-                if entry.sess.srv.is_some() {
-                    let srv_alive = !entry.sess.srv_connection_close
-                        && !matches!(
-                            entry.sess.srv_state,
-                            ScState::ShutR | ScState::Closed | ScState::Error
-                        );
-                    if srv_alive {
-                        if let Some(srv_fd) = entry.sess.srv.take() {
-                            let sfd = srv_fd.as_raw_fd();
-                            self.fdtab.remove(sfd);
-                            let _ = self.poller.delete(srv_fd.as_fd());
-                            entry.srv_raw_fd = None;
-                            if let Some(target_addr) = entry.target_addr {
-                                let be_idx = entry.backend_idx;
-                                if self.proxies.get(be_idx).is_some_and(|p| p.http_reuse != ibex_config::HttpReuse::Never)
-                                    && raw::is_idle_conn_alive(srv_fd.as_fd())
-                                {
-                                    self.idle_backend_pool.entry(target_addr).or_default().push(srv_fd);
-                                }
-                            }
-                        }
-                    }
-                }
-                entry.sess.cli_state = ScState::Closed;
-                entry.sess.srv_state = ScState::Closed;
-                entry.sess.ending.get_or_insert(crate::proxy::Ending::Complete);
-            }
-
             // Step 4: Update interests
             update_interests(entry, self.fdtab, self.poller);
 
-            // Step 4b: If there are undispatched H2 streams or pending output, re-queue tasklet for immediate processing
-            if (entry.sess.has_undispatched_h2_streams() || entry.sess.has_pending_output())
-                && !entry.sess.is_done()
-            {
+            // Step 4b: undispatched H2 streams have no socket event to wake them; run again.
+            // Pending output needs no requeue: Step 4 asked the (level-triggered) poller
+            // for writability, and requeueing it here spun a CPU against a client that
+            // reads slowly.
+            if entry.sess.has_undispatched_h2_streams() && !entry.sess.is_done() {
                 self.wake_queue.push(entry.task);
             }
 
@@ -3817,58 +3916,61 @@ impl EngineDispatcher<'_> {
         let threshold = entry.sess.bufsize.saturating_sub(entry.sess.maxrewrite);
         let Some((hdr_len, eoh_len)) = crate::proxy::find_eoh(entry.sess.rep.readable()) else {
             if entry.sess.rep.readable().len() > threshold {
-                entry.response_rules_applied = true;
-                entry.sess.resp_released = true;
                 entry.sess.rep.clear();
-                entry.sess.send_synthetic_response(502, Some("text/html"), None);
-                entry.sess.srv_state = ScState::Closed;
-                entry.sess.cli_state = ScState::Established;
-                entry.sess.ending.get_or_insert(crate::proxy::Ending::Error);
-                entry.sess.resp_headers_processed = true;
+                reply_error(entry, proxies, 502);
             }
             return;
         };
-        entry.response_rules_applied = true;
-        entry.sess.resp_released = true;
-        let be_idx = Self::resolve_backend(entry, proxies);
+        let be_idx = entry.backend_idx;
         let fe_idx = entry.proxy_idx;
 
         let total_hdr_len = hdr_len + eoh_len;
-        if total_hdr_len > threshold {
+        // Read in place: the head is borrowed from `rep` (no copy for a UTF-8 head, which is
+        // every head on the fast path) and the borrow ends before `rep` is edited.
+        let (status, framing, srv_has_close) = {
+            let head = String::from_utf8_lossy(&entry.sess.rep.readable()[..total_hdr_len]);
+            let status = crate::txn::status_of(&head);
+            let framing = crate::txn::response_framing(&head, entry.sess.req_method.as_deref(), status);
+            (status, framing, crate::txn::head_wants_close(&head))
+        };
+        if total_hdr_len > threshold || status < 100 {
             entry.sess.rep.clear();
-            entry.sess.send_synthetic_response(502, Some("text/html"), None);
-            entry.sess.srv_state = ScState::Closed;
-            entry.sess.cli_state = ScState::Established;
-            entry.sess.ending.get_or_insert(crate::proxy::Ending::Error);
-            entry.sess.resp_headers_processed = true;
+            reply_error(entry, proxies, 502);
             return;
         }
+        let Some(txn) = entry.sess.txn.as_mut() else {
+            return;
+        };
+        if (100..200).contains(&status) && status != 101 {
+            // Interim: forwarded as it is, and the final response follows.
+            txn.rsp = MsgState::head(crate::txn::Framing::None);
+            txn.rsp_interim = true;
+            return;
+        }
+        txn.status = status;
+        txn.srv_reusable = !srv_has_close
+            && !matches!(framing, crate::txn::Framing::UntilClose | crate::txn::Framing::Tunnel);
+        if framing == crate::txn::Framing::UntilClose {
+            // The server's close is the only end the client can see.
+            txn.close_after = true;
+        }
+        let client_close = txn.close_after;
 
-        let mut srv_has_close = false;
-        if let Ok(s) = std::str::from_utf8(&entry.sess.rep.readable()[..total_hdr_len]) {
-            for line in s.lines() {
-                if let Some((k, v)) = line.split_once(':') {
-                    if k.trim().eq_ignore_ascii_case("connection") && v.trim().eq_ignore_ascii_case("close") {
-                        srv_has_close = true;
-                    }
-                }
-            }
-        }
-        if srv_has_close {
-            entry.sess.srv_connection_close = true;
-        }
-        {
-            let head = String::from_utf8_lossy(&entry.sess.rep.readable()[..total_hdr_len]);
-            entry.sess.resp_length_known =
-                crate::proxy::response_length_known(&head, entry.sess.req_method.as_deref());
-            entry.sess.resp_status = crate::proxy::response_status(&head);
-        }
-
-        if !entry.sess.connection_close && srv_has_close {
+        if !client_close && srv_has_close {
             entry.sess.rep.remove_http_header("connection");
-        } else if entry.sess.connection_close && !srv_has_close {
+        } else if client_close && !srv_has_close && framing != crate::txn::Framing::Tunnel {
             inject_connection_close_header_zero_alloc(&mut entry.sess.rep);
         }
+        let set_rsp = |entry: &mut SessionEntry| {
+            let sess = &mut entry.sess;
+            if let Some(txn) = sess.txn.as_mut() {
+                txn.rsp = MsgState::head(framing);
+                txn.rsp.measure_head(sess.rep.readable());
+                if framing == crate::txn::Framing::Tunnel && txn.req.is_done() {
+                    txn.req = MsgState::Tunnel;
+                }
+            }
+        };
 
         let has_rules = !proxies[be_idx].http_res_rules.is_empty()
             || !proxies[be_idx].http_after_res_rules.is_empty()
@@ -3878,21 +3980,23 @@ impl EngineDispatcher<'_> {
             || !proxies[be_idx].srvexp.is_empty();
 
         if !has_rules {
-            if entry.sess.srv.is_some() {
-                entry.sess.srv_state = ScState::Established;
-            }
-            entry.sess.resp_headers_processed = true;
+            set_rsp(entry);
             return;
         }
 
-        let (total_hdr_len, _) = match crate::find_eoh(entry.sess.rep.readable()) {
-            Some(x) => x,
+        // The whole head, blank line included: it is replaced by one that carries its own.
+        // Replacing only up to the blank line left the old one in front of the body, so
+        // every response through these rules arrived with four bytes more than its
+        // `Content-Length`.
+        let total_hdr_len = match crate::find_eoh(entry.sess.rep.readable()) {
+            Some((h, e)) => h + e,
             None => return,
         };
         let hdr_bytes = &entry.sess.rep.readable()[..total_hdr_len];
-        let hdr_str = String::from_utf8_lossy(hdr_bytes);
+        let hdr_str = String::from_utf8_lossy(hdr_bytes).into_owned();
 
         let Some((first_line, rest_headers)) = hdr_str.split_once("\r\n") else {
+            set_rsp(entry);
             return;
         };
 
@@ -3958,240 +4062,177 @@ impl EngineDispatcher<'_> {
             ..Default::default()
         };
 
-        // 0. Apply be.tcp_res_content_rules
-        for rule in &proxies[be_idx].tcp_res_content_rules {
-            let matches = match &rule.cond {
-                None => true,
-                Some(cond) => eval_condition(cond, &ctx, &proxies[be_idx].acls, registry),
-            };
-            if !matches {
-                continue;
-            }
-            match &rule.action {
-                ibex_config::TcpReqContentAction::Accept => break,
-                ibex_config::TcpReqContentAction::Reject | ibex_config::TcpReqContentAction::SilentDrop => {
-                    let resp = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                    entry.sess.rep.replace_prefix(total_hdr_len, resp.as_bytes());
-                    entry.sess.resp_headers_processed = true;
-                    return;
+        let failed: Option<u16> = 'rules: {
+            // 0. Apply be.tcp_res_content_rules
+            for rule in &proxies[be_idx].tcp_res_content_rules {
+                let matches = match &rule.cond {
+                    None => true,
+                    Some(cond) => eval_condition(cond, &ctx, &proxies[be_idx].acls, registry),
+                };
+                if !matches {
+                    continue;
                 }
-                ibex_config::TcpReqContentAction::SetVar { var_name, expr } => {
-                    let val = if let Ok(e) = Expr::parse(expr) {
+                match &rule.action {
+                    ibex_config::TcpReqContentAction::Accept => break,
+                    ibex_config::TcpReqContentAction::Reject | ibex_config::TcpReqContentAction::SilentDrop => {
+                        break 'rules Some(502);
+                    }
+                    ibex_config::TcpReqContentAction::SetVar { var_name, expr } => {
+                        let val = if let Ok(e) = Expr::parse(expr) {
+                            e.eval_sample(registry, &ctx)
+                                .map(|smp| sample_to_string(&smp))
+                                .unwrap_or_default()
+                        } else {
+                            format_sample_string(expr, &ctx, registry)
+                        };
+                        if var_name.starts_with("sess.") {
+                            entry.sess.sess_vars.insert(var_name.to_string(), val.clone());
+                        } else {
+                            entry.sess.req_vars.insert(var_name.to_string(), val.clone());
+                        }
+                        CURRENT_VARS.with(|v| {
+                            v.borrow_mut().insert(var_name.to_string(), val);
+                        });
+                    }
+                    ibex_config::TcpReqContentAction::SetVarFmt { var_name, fmt } => {
+                        let val = format_sample_string(fmt, &ctx, registry);
+                        if var_name.starts_with("sess.") {
+                            entry.sess.sess_vars.insert(var_name.to_string(), val.clone());
+                        } else {
+                            entry.sess.req_vars.insert(var_name.to_string(), val.clone());
+                        }
+                        CURRENT_VARS.with(|v| {
+                            v.borrow_mut().insert(var_name.to_string(), val);
+                        });
+                    }
+                    ibex_config::TcpReqContentAction::UnsetVar { var_name } => {
+                        entry.sess.sess_vars.remove(var_name);
+                        entry.sess.req_vars.remove(var_name);
+                        CURRENT_VARS.with(|v| {
+                            v.borrow_mut().remove(var_name);
+                        });
+                    }
+                    _ => {}
+                }
+            }
+
+            let mut eval_res_action = |act_name: &str, act_fmt: &str, hdrs: &mut Vec<(String, String)>, status: &mut u16, status_msg: &mut String| -> Result<bool, u16> {
+                if act_name == "\0allow" {
+                    return Ok(false);
+                }
+                if act_name == "\0deny" {
+                    let deny_st = act_fmt.parse::<u16>().unwrap_or(403);
+                    return Err(deny_st);
+                }
+                if act_name == "\0set-status" {
+                    if let Ok(st) = act_fmt.parse::<u16>() {
+                        *status = st;
+                        *status_msg = status_reason(st).to_string();
+                        CURRENT_RES_STATUS.set(st);
+                    }
+                    return Ok(true);
+                }
+                if let Some(var_name) = act_name.strip_prefix("\0set-var:") {
+                    let val = if let Ok(e) = Expr::parse(act_fmt) {
                         e.eval_sample(registry, &ctx)
                             .map(|smp| sample_to_string(&smp))
                             .unwrap_or_default()
                     } else {
-                        format_sample_string(expr, &ctx, registry)
+                        format_sample_string(act_fmt, &ctx, registry)
                     };
-                    if var_name.starts_with("sess.") {
-                        entry.sess.sess_vars.insert(var_name.to_string(), val.clone());
+                    if var_name.starts_with("proc.") {
+                        ibex_sample::set_proc_var(var_name, val);
                     } else {
-                        entry.sess.req_vars.insert(var_name.to_string(), val.clone());
+                        if var_name.starts_with("sess.") {
+                            entry.sess.sess_vars.insert(var_name.to_string(), val.clone());
+                        } else {
+                            entry.sess.req_vars.insert(var_name.to_string(), val.clone());
+                        }
+                        CURRENT_VARS.with(|v| {
+                            v.borrow_mut().insert(var_name.to_string(), val);
+                        });
                     }
-                    CURRENT_VARS.with(|v| {
-                        v.borrow_mut().insert(var_name.to_string(), val);
-                    });
+                    return Ok(true);
                 }
-                ibex_config::TcpReqContentAction::SetVarFmt { var_name, fmt } => {
-                    let val = format_sample_string(fmt, &ctx, registry);
+                if let Some(var_name) = act_name.strip_prefix("\0unset-var:") {
                     if var_name.starts_with("sess.") {
-                        entry.sess.sess_vars.insert(var_name.to_string(), val.clone());
+                        entry.sess.sess_vars.remove(var_name);
                     } else {
-                        entry.sess.req_vars.insert(var_name.to_string(), val.clone());
+                        entry.sess.req_vars.remove(var_name);
                     }
-                    CURRENT_VARS.with(|v| {
-                        v.borrow_mut().insert(var_name.to_string(), val);
-                    });
-                }
-                ibex_config::TcpReqContentAction::UnsetVar { var_name } => {
-                    entry.sess.sess_vars.remove(var_name);
-                    entry.sess.req_vars.remove(var_name);
                     CURRENT_VARS.with(|v| {
                         v.borrow_mut().remove(var_name);
                     });
+                    return Ok(true);
                 }
-                _ => {}
-            }
-        }
-
-        let mut eval_res_action = |act_name: &str, act_fmt: &str, hdrs: &mut Vec<(String, String)>, status: &mut u16, status_msg: &mut String| -> Result<bool, u16> {
-            if act_name == "\0allow" {
-                return Ok(false);
-            }
-            if act_name == "\0deny" {
-                let deny_st = act_fmt.parse::<u16>().unwrap_or(403);
-                return Err(deny_st);
-            }
-            if act_name == "\0set-status" {
-                if let Ok(st) = act_fmt.parse::<u16>() {
-                    *status = st;
-                    *status_msg = status_reason(st).to_string();
-                    CURRENT_RES_STATUS.set(st);
+                if act_name == "\0strict-mode" {
+                    STRICT_MODE.set(act_fmt == "on");
+                    return Ok(true);
                 }
-                return Ok(true);
-            }
-            if let Some(var_name) = act_name.strip_prefix("\0set-var:") {
-                let val = if let Ok(e) = Expr::parse(act_fmt) {
-                    e.eval_sample(registry, &ctx)
-                        .map(|smp| sample_to_string(&smp))
-                        .unwrap_or_default()
-                } else {
-                    format_sample_string(act_fmt, &ctx, registry)
-                };
-                if var_name.starts_with("proc.") {
-                    ibex_sample::set_proc_var(var_name, val);
-                } else {
-                    if var_name.starts_with("sess.") {
-                        entry.sess.sess_vars.insert(var_name.to_string(), val.clone());
-                    } else {
-                        entry.sess.req_vars.insert(var_name.to_string(), val.clone());
-                    }
-                    CURRENT_VARS.with(|v| {
-                        v.borrow_mut().insert(var_name.to_string(), val);
-                    });
-                }
-                return Ok(true);
-            }
-            if let Some(var_name) = act_name.strip_prefix("\0unset-var:") {
-                if var_name.starts_with("sess.") {
-                    entry.sess.sess_vars.remove(var_name);
-                } else {
-                    entry.sess.req_vars.remove(var_name);
-                }
-                CURRENT_VARS.with(|v| {
-                    v.borrow_mut().remove(var_name);
-                });
-                return Ok(true);
-            }
-            if act_name == "\0strict-mode" {
-                STRICT_MODE.set(act_fmt == "on");
-                return Ok(true);
-            }
-            if let Some(hdr_name) = act_name.strip_prefix("\0replace-header:") {
-                if let Some((re_str, repl_str)) = act_fmt.split_once('\t') {
-                    if let Ok(re) = regex::Regex::new(re_str) {
-                        let rust_repl = translate_backreferences(repl_str);
-                        let strict = STRICT_MODE.get();
-                        for (k, v) in hdrs.iter_mut() {
-                            if k.eq_ignore_ascii_case(hdr_name) {
-                                let new_v = re.replace_all(v, &rust_repl).to_string();
-                                if strict && new_v.len() > 1_048_575 {
-                                    return Err(500);
+                if let Some(hdr_name) = act_name.strip_prefix("\0replace-header:") {
+                    if let Some((re_str, repl_str)) = act_fmt.split_once('\t') {
+                        if let Ok(re) = regex::Regex::new(re_str) {
+                            let rust_repl = translate_backreferences(repl_str);
+                            let strict = STRICT_MODE.get();
+                            for (k, v) in hdrs.iter_mut() {
+                                if k.eq_ignore_ascii_case(hdr_name) {
+                                    let new_v = re.replace_all(v, &rust_repl).to_string();
+                                    if strict && new_v.len() > 1_048_575 {
+                                        return Err(500);
+                                    }
+                                    *v = new_v;
                                 }
-                                *v = new_v;
                             }
-                        }
-                        CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = hdrs.clone());
-                    }
-                }
-                return Ok(true);
-            }
-            if let Some(hdr_name) = act_name.strip_prefix("\0replace-value:") {
-                if let Some((re_str, repl_str)) = act_fmt.split_once('\t') {
-                    if let Ok(re) = regex::Regex::new(re_str) {
-                        let rust_repl = translate_backreferences(repl_str);
-                        let strict = STRICT_MODE.get();
-                        for (k, v) in hdrs.iter_mut() {
-                            if k.eq_ignore_ascii_case(hdr_name) {
-                                let new_v = re.replace_all(v, &rust_repl).to_string();
-                                if strict && new_v.len() > 1_048_575 {
-                                    return Err(500);
-                                }
-                                *v = new_v;
-                            }
-                        }
-                        CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = hdrs.clone());
-                    }
-                }
-                return Ok(true);
-            }
-
-            let val = format_sample_string(act_fmt, &ctx, registry);
-            let added = act_name.len() + val.len() + 4;
-            let total = REWRITE_ADDED_BYTES.get() + added;
-            if total > MAX_REWRITE_LIMIT.get() {
-                if STRICT_MODE.get() {
-                    return Err(500);
-                }
-                return Ok(true);
-            }
-            REWRITE_ADDED_BYTES.set(total);
-
-            if let Some(pos) = hdrs.iter().position(|(k, _)| k.eq_ignore_ascii_case(act_name)) {
-                hdrs[pos].1 = val;
-            } else {
-                hdrs.push((act_name.to_string(), val));
-            }
-            CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = hdrs.clone());
-            Ok(true)
-        };
-
-        // 1. Apply be.http_res_rules
-        for rule in &proxies[be_idx].http_res_rules {
-            let matches = match &rule.cond {
-                None => true,
-                Some(cond) => eval_condition(cond, &ctx, &proxies[be_idx].acls, registry),
-            };
-            if !matches {
-                continue;
-            }
-            match &rule.action {
-                ibex_config::HttpResAction::SetHeader { name, fmt } => {
-                    match eval_res_action(name, fmt, &mut hdrs, &mut status, &mut status_msg) {
-                        Ok(true) => {}
-                        Ok(false) => break,
-                        Err(err_st) => {
-                            let resp = format!("HTTP/1.1 {err_st} {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", status_reason(err_st));
-                            entry.sess.rep.replace_prefix(total_hdr_len, resp.as_bytes());
-                            entry.sess.resp_headers_processed = true;
-                            return;
-                        }
-                    }
-                }
-                ibex_config::HttpResAction::AddHeader { name, fmt } => {
-                    if let Some(var_name) = name.strip_prefix("\0set-var:") {
-                        let val = format_sample_string(fmt, &ctx, registry);
-                        CURRENT_VARS.with(|v| v.borrow_mut().insert(var_name.to_string(), val));
-                    } else {
-                        let val = format_sample_string(fmt, &ctx, registry);
-                        let added = name.len() + val.len() + 4;
-                        let total = REWRITE_ADDED_BYTES.get() + added;
-                        if total > MAX_REWRITE_LIMIT.get() {
-                            if STRICT_MODE.get() {
-                                let resp = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                                entry.sess.rep.replace_prefix(total_hdr_len, resp.as_bytes());
-                                entry.sess.resp_headers_processed = true;
-                                return;
-                            }
-                        } else {
-                            REWRITE_ADDED_BYTES.set(total);
-                            hdrs.push((name.clone(), val));
                             CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = hdrs.clone());
                         }
                     }
+                    return Ok(true);
                 }
-                ibex_config::HttpResAction::DelHeader { name } => {
-                    if let Some(var_name) = name.strip_prefix("\0unset-var:") {
-                        CURRENT_VARS.with(|v| v.borrow_mut().remove(var_name));
-                    } else {
-                        hdrs.retain(|(k, _)| !header_name_matches(k, name));
-                        CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = hdrs.clone());
+                if let Some(hdr_name) = act_name.strip_prefix("\0replace-value:") {
+                    if let Some((re_str, repl_str)) = act_fmt.split_once('\t') {
+                        if let Ok(re) = regex::Regex::new(re_str) {
+                            let rust_repl = translate_backreferences(repl_str);
+                            let strict = STRICT_MODE.get();
+                            for (k, v) in hdrs.iter_mut() {
+                                if k.eq_ignore_ascii_case(hdr_name) {
+                                    let new_v = re.replace_all(v, &rust_repl).to_string();
+                                    if strict && new_v.len() > 1_048_575 {
+                                        return Err(500);
+                                    }
+                                    *v = new_v;
+                                }
+                            }
+                            CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = hdrs.clone());
+                        }
                     }
+                    return Ok(true);
                 }
-                ibex_config::HttpResAction::SetStatus { status: new_st } => {
-                    status = *new_st;
-                    status_msg = status_reason(status).to_string();
-                    CURRENT_RES_STATUS.set(status);
-                }
-            }
-        }
 
-        // 1b. Apply fe.http_res_rules
-        if fe_idx != be_idx {
-            for rule in &proxies[fe_idx].http_res_rules {
+                let val = format_sample_string(act_fmt, &ctx, registry);
+                let added = act_name.len() + val.len() + 4;
+                let total = REWRITE_ADDED_BYTES.get() + added;
+                if total > MAX_REWRITE_LIMIT.get() {
+                    if STRICT_MODE.get() {
+                        return Err(500);
+                    }
+                    return Ok(true);
+                }
+                REWRITE_ADDED_BYTES.set(total);
+
+                if let Some(pos) = hdrs.iter().position(|(k, _)| k.eq_ignore_ascii_case(act_name)) {
+                    hdrs[pos].1 = val;
+                } else {
+                    hdrs.push((act_name.to_string(), val));
+                }
+                CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = hdrs.clone());
+                Ok(true)
+            };
+
+            // 1. Apply be.http_res_rules
+            for rule in &proxies[be_idx].http_res_rules {
                 let matches = match &rule.cond {
                     None => true,
-                    Some(cond) => eval_condition(cond, &ctx, &proxies[fe_idx].acls, registry),
+                    Some(cond) => eval_condition(cond, &ctx, &proxies[be_idx].acls, registry),
                 };
                 if !matches {
                     continue;
@@ -4202,10 +4243,7 @@ impl EngineDispatcher<'_> {
                             Ok(true) => {}
                             Ok(false) => break,
                             Err(err_st) => {
-                                let resp = format!("HTTP/1.1 {err_st} {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", status_reason(err_st));
-                                entry.sess.rep.replace_prefix(total_hdr_len, resp.as_bytes());
-                                entry.sess.resp_headers_processed = true;
-                                return;
+                                break 'rules Some(err_st);
                             }
                         }
                     }
@@ -4219,10 +4257,7 @@ impl EngineDispatcher<'_> {
                             let total = REWRITE_ADDED_BYTES.get() + added;
                             if total > MAX_REWRITE_LIMIT.get() {
                                 if STRICT_MODE.get() {
-                                    let resp = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                                    entry.sess.rep.replace_prefix(total_hdr_len, resp.as_bytes());
-                                    entry.sess.resp_headers_processed = true;
-                                    return;
+                                    break 'rules Some(500);
                                 }
                             } else {
                                 REWRITE_ADDED_BYTES.set(total);
@@ -4246,120 +4281,170 @@ impl EngineDispatcher<'_> {
                     }
                 }
             }
-        }
 
-        // 2. Apply be.http_after_res_rules
-        for rule in &proxies[be_idx].http_after_res_rules {
-            let matches = match &rule.cond {
-                None => true,
-                Some(cond) => eval_condition(cond, &ctx, &proxies[be_idx].acls, registry),
-            };
-            if !matches {
-                continue;
-            }
-            match &rule.action {
-                ibex_config::HttpAfterResAction::SetHeader { name, fmt } => {
-                    match eval_res_action(name, fmt, &mut hdrs, &mut status, &mut status_msg) {
-                        Ok(true) => {}
-                        Ok(false) => break,
-                        Err(err_st) => {
-                            let resp = format!("HTTP/1.1 {err_st} {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", status_reason(err_st));
-                            entry.sess.rep.replace_prefix(total_hdr_len, resp.as_bytes());
-                            entry.sess.resp_headers_processed = true;
-                            return;
+            // 1b. Apply fe.http_res_rules
+            if fe_idx != be_idx {
+                for rule in &proxies[fe_idx].http_res_rules {
+                    let matches = match &rule.cond {
+                        None => true,
+                        Some(cond) => eval_condition(cond, &ctx, &proxies[fe_idx].acls, registry),
+                    };
+                    if !matches {
+                        continue;
+                    }
+                    match &rule.action {
+                        ibex_config::HttpResAction::SetHeader { name, fmt } => {
+                            match eval_res_action(name, fmt, &mut hdrs, &mut status, &mut status_msg) {
+                                Ok(true) => {}
+                                Ok(false) => break,
+                                Err(err_st) => {
+                                    break 'rules Some(err_st);
+                                }
+                            }
+                        }
+                        ibex_config::HttpResAction::AddHeader { name, fmt } => {
+                            if let Some(var_name) = name.strip_prefix("\0set-var:") {
+                                let val = format_sample_string(fmt, &ctx, registry);
+                                CURRENT_VARS.with(|v| v.borrow_mut().insert(var_name.to_string(), val));
+                            } else {
+                                let val = format_sample_string(fmt, &ctx, registry);
+                                let added = name.len() + val.len() + 4;
+                                let total = REWRITE_ADDED_BYTES.get() + added;
+                                if total > MAX_REWRITE_LIMIT.get() {
+                                    if STRICT_MODE.get() {
+                                        break 'rules Some(500);
+                                    }
+                                } else {
+                                    REWRITE_ADDED_BYTES.set(total);
+                                    hdrs.push((name.clone(), val));
+                                    CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = hdrs.clone());
+                                }
+                            }
+                        }
+                        ibex_config::HttpResAction::DelHeader { name } => {
+                            if let Some(var_name) = name.strip_prefix("\0unset-var:") {
+                                CURRENT_VARS.with(|v| v.borrow_mut().remove(var_name));
+                            } else {
+                                hdrs.retain(|(k, _)| !header_name_matches(k, name));
+                                CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = hdrs.clone());
+                            }
+                        }
+                        ibex_config::HttpResAction::SetStatus { status: new_st } => {
+                            status = *new_st;
+                            status_msg = status_reason(status).to_string();
+                            CURRENT_RES_STATUS.set(status);
                         }
                     }
                 }
-                ibex_config::HttpAfterResAction::AddHeader { name, fmt } => {
-                    if let Some(var_name) = name.strip_prefix("\0set-var:") {
-                        let val = format_sample_string(fmt, &ctx, registry);
-                        CURRENT_VARS.with(|v| v.borrow_mut().insert(var_name.to_string(), val));
-                    } else {
-                        let val = format_sample_string(fmt, &ctx, registry);
-                        let added = name.len() + val.len() + 4;
-                        let total = REWRITE_ADDED_BYTES.get() + added;
-                        if total > MAX_REWRITE_LIMIT.get() {
-                            if STRICT_MODE.get() {
-                                let resp = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                                entry.sess.rep.replace_prefix(total_hdr_len, resp.as_bytes());
-                                entry.sess.resp_headers_processed = true;
-                                return;
+            }
+
+            // 2. Apply be.http_after_res_rules
+            for rule in &proxies[be_idx].http_after_res_rules {
+                let matches = match &rule.cond {
+                    None => true,
+                    Some(cond) => eval_condition(cond, &ctx, &proxies[be_idx].acls, registry),
+                };
+                if !matches {
+                    continue;
+                }
+                match &rule.action {
+                    ibex_config::HttpAfterResAction::SetHeader { name, fmt } => {
+                        match eval_res_action(name, fmt, &mut hdrs, &mut status, &mut status_msg) {
+                            Ok(true) => {}
+                            Ok(false) => break,
+                            Err(err_st) => {
+                                break 'rules Some(err_st);
                             }
+                        }
+                    }
+                    ibex_config::HttpAfterResAction::AddHeader { name, fmt } => {
+                        if let Some(var_name) = name.strip_prefix("\0set-var:") {
+                            let val = format_sample_string(fmt, &ctx, registry);
+                            CURRENT_VARS.with(|v| v.borrow_mut().insert(var_name.to_string(), val));
                         } else {
-                            REWRITE_ADDED_BYTES.set(total);
-                            hdrs.push((name.clone(), val));
+                            let val = format_sample_string(fmt, &ctx, registry);
+                            let added = name.len() + val.len() + 4;
+                            let total = REWRITE_ADDED_BYTES.get() + added;
+                            if total > MAX_REWRITE_LIMIT.get() {
+                                if STRICT_MODE.get() {
+                                    break 'rules Some(500);
+                                }
+                            } else {
+                                REWRITE_ADDED_BYTES.set(total);
+                                hdrs.push((name.clone(), val));
+                                CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = hdrs.clone());
+                            }
+                        }
+                    }
+                    ibex_config::HttpAfterResAction::DelHeader { name } => {
+                        if let Some(var_name) = name.strip_prefix("\0unset-var:") {
+                            CURRENT_VARS.with(|v| v.borrow_mut().remove(var_name));
+                        } else {
+                            hdrs.retain(|(k, _)| !header_name_matches(k, name));
                             CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = hdrs.clone());
                         }
                     }
                 }
-                ibex_config::HttpAfterResAction::DelHeader { name } => {
-                    if let Some(var_name) = name.strip_prefix("\0unset-var:") {
-                        CURRENT_VARS.with(|v| v.borrow_mut().remove(var_name));
-                    } else {
-                        hdrs.retain(|(k, _)| !header_name_matches(k, name));
-                        CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = hdrs.clone());
-                    }
-                }
             }
-        }
 
-        // 3. Apply fe.http_after_res_rules
-        for rule in &proxies[fe_idx].http_after_res_rules {
-            let matches = match &rule.cond {
-                None => true,
-                Some(cond) => eval_condition(cond, &ctx, &proxies[fe_idx].acls, registry),
-            };
-            if !matches {
-                continue;
-            }
-            match &rule.action {
-                ibex_config::HttpAfterResAction::SetHeader { name, fmt } => {
-                    match eval_res_action(name, fmt, &mut hdrs, &mut status, &mut status_msg) {
-                        Ok(true) => {}
-                        Ok(false) => break,
-                        Err(err_st) => {
-                            let resp = format!("HTTP/1.1 {err_st} {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", status_reason(err_st));
-                            entry.sess.rep.replace_prefix(total_hdr_len, resp.as_bytes());
-                            entry.sess.resp_headers_processed = true;
-                            return;
+            // 3. Apply fe.http_after_res_rules
+            for rule in &proxies[fe_idx].http_after_res_rules {
+                let matches = match &rule.cond {
+                    None => true,
+                    Some(cond) => eval_condition(cond, &ctx, &proxies[fe_idx].acls, registry),
+                };
+                if !matches {
+                    continue;
+                }
+                match &rule.action {
+                    ibex_config::HttpAfterResAction::SetHeader { name, fmt } => {
+                        match eval_res_action(name, fmt, &mut hdrs, &mut status, &mut status_msg) {
+                            Ok(true) => {}
+                            Ok(false) => break,
+                            Err(err_st) => {
+                                break 'rules Some(err_st);
+                            }
                         }
                     }
-                }
-                ibex_config::HttpAfterResAction::AddHeader { name, fmt } => {
-                    if let Some(var_name) = name.strip_prefix("\0set-var:") {
-                        let val = format_sample_string(fmt, &ctx, registry);
-                        CURRENT_VARS.with(|v| v.borrow_mut().insert(var_name.to_string(), val));
-                    } else {
-                        let val = format_sample_string(fmt, &ctx, registry);
-                        let added = name.len() + val.len() + 4;
-                        let total = REWRITE_ADDED_BYTES.get() + added;
-                        if total > MAX_REWRITE_LIMIT.get() {
-                            if STRICT_MODE.get() {
-                                let resp = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                                entry.sess.rep.replace_prefix(total_hdr_len, resp.as_bytes());
-                                entry.sess.resp_headers_processed = true;
-                                return;
-                            }
+                    ibex_config::HttpAfterResAction::AddHeader { name, fmt } => {
+                        if let Some(var_name) = name.strip_prefix("\0set-var:") {
+                            let val = format_sample_string(fmt, &ctx, registry);
+                            CURRENT_VARS.with(|v| v.borrow_mut().insert(var_name.to_string(), val));
                         } else {
-                            REWRITE_ADDED_BYTES.set(total);
-                            hdrs.push((name.clone(), val));
+                            let val = format_sample_string(fmt, &ctx, registry);
+                            let added = name.len() + val.len() + 4;
+                            let total = REWRITE_ADDED_BYTES.get() + added;
+                            if total > MAX_REWRITE_LIMIT.get() {
+                                if STRICT_MODE.get() {
+                                    break 'rules Some(500);
+                                }
+                            } else {
+                                REWRITE_ADDED_BYTES.set(total);
+                                hdrs.push((name.clone(), val));
+                                CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = hdrs.clone());
+                            }
+                        }
+                    }
+                    ibex_config::HttpAfterResAction::DelHeader { name } => {
+                        if let Some(var_name) = name.strip_prefix("\0unset-var:") {
+                            CURRENT_VARS.with(|v| v.borrow_mut().remove(var_name));
+                        } else {
+                            hdrs.retain(|(k, _)| !header_name_matches(k, name));
                             CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = hdrs.clone());
                         }
                     }
                 }
-                ibex_config::HttpAfterResAction::DelHeader { name } => {
-                    if let Some(var_name) = name.strip_prefix("\0unset-var:") {
-                        CURRENT_VARS.with(|v| v.borrow_mut().remove(var_name));
-                    } else {
-                        hdrs.retain(|(k, _)| !header_name_matches(k, name));
-                        CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = hdrs.clone());
-                    }
-                }
             }
+            None
+        };
+        if let Some(st) = failed {
+            entry.sess.rep.clear();
+            reply_error(entry, proxies, st);
+            return;
         }
 
         // Connection header policy:
-        if !entry.sess.connection_close {
+        if !client_close {
             // Client is in keep-alive mode: strip hop-by-hop Connection: close
             hdrs.retain(|(k, v)| {
                 !(k.eq_ignore_ascii_case("connection") && v.to_ascii_lowercase().contains("close"))
@@ -4378,10 +4463,7 @@ impl EngineDispatcher<'_> {
             .sess
             .rep
             .replace_prefix(total_hdr_len, new_hdr.as_bytes());
-        if entry.sess.srv.is_some() {
-            entry.sess.srv_state = ScState::Established;
-        }
-        entry.sess.resp_headers_processed = true;
+        set_rsp(entry);
     }
 
     fn is_stats_request(req_uri: &str, configured_uri: Option<&str>) -> bool {
@@ -4433,7 +4515,6 @@ impl EngineDispatcher<'_> {
         pid: u32,
         now: Tick,
     ) -> Option<crate::stats_html::AdminAction> {
-        entry.sess.connection_close = true;
         let req_uri = entry.sess.req_uri.as_deref().unwrap_or("/");
 
         // 1. CSV telemetry
@@ -4450,7 +4531,7 @@ impl EngineDispatcher<'_> {
                 csv.len(),
                 csv
             );
-            entry.sess.send_synthetic_bytes(resp.as_bytes());
+            entry.sess.write_reply(resp.as_bytes());
             return None;
         }
 
@@ -4468,7 +4549,7 @@ impl EngineDispatcher<'_> {
                 json.len(),
                 json
             );
-            entry.sess.send_synthetic_bytes(resp.as_bytes());
+            entry.sess.write_reply(resp.as_bytes());
             return None;
         }
 
@@ -4580,7 +4661,7 @@ impl EngineDispatcher<'_> {
                     body.len(),
                     body
                 );
-                entry.sess.send_synthetic_bytes(resp.as_bytes());
+                entry.sess.write_reply(resp.as_bytes());
                 return Some(cmd);
             }
 
@@ -4596,7 +4677,7 @@ impl EngineDispatcher<'_> {
                 html.len(),
                 html
             );
-            entry.sess.send_synthetic_bytes(resp.as_bytes());
+            entry.sess.write_reply(resp.as_bytes());
             return Some(cmd);
         }
 
@@ -4613,7 +4694,7 @@ impl EngineDispatcher<'_> {
             html.len(),
             html
         );
-        entry.sess.send_synthetic_bytes(resp.as_bytes());
+        entry.sess.write_reply(resp.as_bytes());
         None
     }
 
@@ -4630,6 +4711,9 @@ impl EngineDispatcher<'_> {
         now: Tick,
     ) -> Option<crate::stats_html::AdminAction> {
         let proxy_idx = entry.proxy_idx;
+        // Until a backend is chosen the frontend stands in for it, as `s->be` does in
+        // HAProxy: an error page picked before routing comes from the frontend.
+        entry.backend_idx = proxy_idx;
 
         // Initialize per-request thread locals
         CURRENT_VARS.with(|v| {
@@ -4688,8 +4772,10 @@ impl EngineDispatcher<'_> {
                 req_uri
             };
             if path == m_uri {
-                entry.sess.connection_close = true;
-                entry.sess.send_synthetic_bytes(MONITOR_URI_RESPONSE);
+                if let Some(t) = entry.sess.txn.as_mut() {
+                    t.close_after = true;
+                }
+                entry.sess.write_reply(MONITOR_URI_RESPONSE);
                 return None;
             }
         }
@@ -4851,7 +4937,7 @@ impl EngineDispatcher<'_> {
 
         let act_conn = proxies[proxy_idx].stats[worker_id()].act_conn.load(Ordering::Relaxed);
         let cum_conn = proxies[proxy_idx].stats[worker_id()].cum_conn.load(Ordering::Relaxed);
-        let eval_http_rules = |rules: &[ibex_config::HttpReqRule], acls: &HashMap<String, Expr>, sess: &mut TcpSession, target_addr: Option<SocketAddr>, fe_name: Option<&str>, be_name: Option<&str>| -> Result<Option<()>, ()> {
+        let eval_http_rules = |rules: &[ibex_config::HttpReqRule], acls: &HashMap<String, Expr>, sess: &mut TcpSession, target_addr: Option<SocketAddr>, fe_name: Option<&str>, be_name: Option<&str>| -> Result<Option<()>, u16> {
             macro_rules! make_ctx {
                 ($s:expr) => {
                     SampleContext {
@@ -4892,93 +4978,41 @@ impl EngineDispatcher<'_> {
                         status,
                         content_type,
                         lf_string,
+                        error_page,
                     } => {
-                        let mut custom_headers: Vec<(String, String)> = Vec::new();
-                        let mut body_str = String::new();
-
-                        if let Some(s) = lf_string.as_deref() {
-                            let mut rest = s;
-                            while let Some(stripped) = rest.strip_prefix("\0HDR:") {
-                                if let Some((line, r)) = stripped.split_once('\n') {
-                                    if let Some((k, v)) = line.split_once(':') {
-                                        let formatted_v = format_sample_string(v, &make_ctx!(sess), registry);
-                                        custom_headers.push((k.to_string(), formatted_v));
-                                    }
-                                    rest = r;
-                                } else {
-                                    break;
-                                }
+                        let body = resolve_error_body(&proxies[proxy_idx], *status, error_page.as_ref(), content_type.as_ref(), lf_string.as_ref());
+                        let full_resp: Vec<u8> = match body {
+                            ResolvedErrorBody::Raw(bytes) => bytes.to_vec(),
+                            ResolvedErrorBody::Custom { content_type, lf_string } => {
+                                build_templated_error_response(*status, content_type, lf_string, &make_ctx!(sess), registry)
                             }
-                            if let Some(b) = rest.strip_prefix("\0BODY:") {
-                                body_str = format_sample_string(b, &make_ctx!(sess), registry);
-                            } else if !rest.starts_with('\0') {
-                                body_str = format_sample_string(rest, &make_ctx!(sess), registry);
-                            }
-                        }
-
-                        let unescaped = body_str
-                            .replace("\\n", "\n")
-                            .replace("\\r", "\r")
-                            .replace("\\t", "\t");
-                        let body = unescaped.as_bytes();
-
-                        let reason = status_reason(*status);
-                        let mut resp = format!("HTTP/1.1 {status} {reason}\r\n");
-                        if let Some(ct) = content_type.as_deref() {
-                            let _ = write!(resp, "Content-Type: {ct}\r\n");
-                        }
-                        for (k, v) in custom_headers {
-                            if !v.is_empty() {
-                                let _ = write!(resp, "{k}: {v}\r\n");
-                            }
-                        }
-                        let _ = write!(resp, "Content-Length: {}\r\n\r\n", body.len());
-
-                        let mut full_resp = resp.into_bytes();
-                        full_resp.extend_from_slice(body);
-
-                        let w = sess.rep.writable();
-                        let n = w.len().min(full_resp.len());
-                        w[..n].copy_from_slice(&full_resp[..n]);
-                        sess.rep.commit(n);
-
-                        if let Some((hdr_len, eoh_len)) = crate::proxy::find_eoh(sess.req.readable()) {
-                            sess.req.consume(hdr_len + eoh_len);
-                        }
-                        sess.req_method = None;
-                        sess.req_uri = None;
-                        sess.req_headers = None;
-                        sess.clear_htx();
-                        sess.cli_state = ScState::Ready;
-                        sess.srv_state = ScState::Init;
-                        sess.resp_headers_processed = false;
+                        };
+                        sess.write_reply(&full_resp);
                         return Ok(Some(()));
                     }
-                    ibex_config::HttpReqAction::Deny { deny_status } => {
+                    ibex_config::HttpReqAction::Deny {
+                        deny_status,
+                        content_type,
+                        lf_string,
+                        error_page,
+                    } => {
                         let status_code = deny_status.unwrap_or(403);
-                        let reason = status_reason(status_code);
-                        let resp = format!(
-                            "HTTP/1.1 {status_code} {reason}\r\nContent-Type: text/plain\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                        );
-                        let w = sess.rep.writable();
-                        let n = w.len().min(resp.len());
-                        w[..n].copy_from_slice(&resp.as_bytes()[..n]);
-                        sess.rep.commit(n);
-                        sess.cli_state = ScState::ShutR;
-                        sess.srv_state = ScState::Closed;
+                        let body = resolve_error_body(&proxies[proxy_idx], status_code, error_page.as_ref(), content_type.as_ref(), lf_string.as_ref());
+                        let resp: Vec<u8> = match body {
+                            ResolvedErrorBody::Raw(bytes) => bytes.to_vec(),
+                            ResolvedErrorBody::Custom { content_type, lf_string } => {
+                                build_templated_error_response(status_code, content_type, lf_string, &make_ctx!(sess), registry)
+                            }
+                        };
+                        sess.write_reply(&resp);
                         return Ok(Some(()));
                     }
                     ibex_config::HttpReqAction::Allow => {
                         return Ok(None);
                     }
                     ibex_config::HttpReqAction::Auth => {
-                        let resp = "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"HAProxy\"\r\nContent-Type: text/plain\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                        let w = sess.rep.writable();
-                        let n = w.len().min(resp.len());
-                        w[..n].copy_from_slice(&resp.as_bytes()[..n]);
-                        sess.rep.commit(n);
-                        sess.cli_state = ScState::ShutR;
-                        sess.srv_state = ScState::Closed;
+                        let resp = "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"HAProxy\"\r\nContent-Type: text/plain\r\nContent-Length: 0\r\n\r\n";
+                        sess.write_reply(resp.as_bytes());
                         return Ok(Some(()));
                     }
                     ibex_config::HttpReqAction::Redirect { location, prefix, code, .. } => {
@@ -4987,14 +5021,9 @@ impl EngineDispatcher<'_> {
                         let formatted_loc = format_sample_string(loc, &make_ctx!(sess), registry);
                         let reason = status_reason(status_code);
                         let resp = format!(
-                            "HTTP/1.1 {status_code} {reason}\r\nLocation: {formatted_loc}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            "HTTP/1.1 {status_code} {reason}\r\nLocation: {formatted_loc}\r\nContent-Length: 0\r\n\r\n"
                         );
-                        let w = sess.rep.writable();
-                        let n = w.len().min(resp.len());
-                        w[..n].copy_from_slice(&resp.as_bytes()[..n]);
-                        sess.rep.commit(n);
-                        sess.cli_state = ScState::ShutR;
-                        sess.srv_state = ScState::Closed;
+                        sess.write_reply(resp.as_bytes());
                         return Ok(Some(()));
                     }
                     ibex_config::HttpReqAction::SetPath { fmt } => {
@@ -5219,14 +5248,7 @@ impl EngineDispatcher<'_> {
                             sess.req_uri = Some(new_uri);
                             rebuild_req_buffer(sess);
                         } else {
-                            let resp = "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                            let w = sess.rep.writable();
-                            let n = w.len().min(resp.len());
-                            w[..n].copy_from_slice(&resp.as_bytes()[..n]);
-                            sess.rep.commit(n);
-                            sess.cli_state = ScState::ShutR;
-                            sess.srv_state = ScState::Closed;
-                            return Ok(Some(()));
+                            return Err(400);
                         }
                     }
                     ibex_config::HttpReqAction::SetHeader { name, fmt } => {
@@ -5235,14 +5257,7 @@ impl EngineDispatcher<'_> {
                         let total = REWRITE_ADDED_BYTES.get() + added;
                         if total > MAX_REWRITE_LIMIT.get() {
                             if STRICT_MODE.get() {
-                                let resp = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                                let w = sess.rep.writable();
-                                let n = w.len().min(resp.len());
-                                w[..n].copy_from_slice(&resp.as_bytes()[..n]);
-                                sess.rep.commit(n);
-                                sess.cli_state = ScState::ShutR;
-                                sess.srv_state = ScState::Closed;
-                                return Ok(Some(()));
+                                return Err(500);
                             }
                         } else {
                             REWRITE_ADDED_BYTES.set(total);
@@ -5255,14 +5270,7 @@ impl EngineDispatcher<'_> {
                         let total = REWRITE_ADDED_BYTES.get() + added;
                         if total > MAX_REWRITE_LIMIT.get() {
                             if STRICT_MODE.get() {
-                                let resp = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                                let w = sess.rep.writable();
-                                let n = w.len().min(resp.len());
-                                w[..n].copy_from_slice(&resp.as_bytes()[..n]);
-                                sess.rep.commit(n);
-                                sess.cli_state = ScState::ShutR;
-                                sess.srv_state = ScState::Closed;
-                                return Ok(Some(()));
+                                return Err(500);
                             }
                         } else {
                             REWRITE_ADDED_BYTES.set(total);
@@ -5274,26 +5282,12 @@ impl EngineDispatcher<'_> {
                     }
                     ibex_config::HttpReqAction::ReplaceHeader { name, regex, repl } => {
                         if replace_req_header(sess, name, regex, repl).is_err() {
-                            let resp = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                            let w = sess.rep.writable();
-                            let n = w.len().min(resp.len());
-                            w[..n].copy_from_slice(&resp.as_bytes()[..n]);
-                            sess.rep.commit(n);
-                            sess.cli_state = ScState::ShutR;
-                            sess.srv_state = ScState::Closed;
-                            return Ok(Some(()));
+                            return Err(500);
                         }
                     }
                     ibex_config::HttpReqAction::ReplaceValue { name, regex, repl }
                         if replace_req_value(sess, name, regex, repl).is_err() => {
-                            let resp = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                            let w = sess.rep.writable();
-                            let n = w.len().min(resp.len());
-                            w[..n].copy_from_slice(&resp.as_bytes()[..n]);
-                            sess.rep.commit(n);
-                            sess.cli_state = ScState::ShutR;
-                            sess.srv_state = ScState::Closed;
-                            return Ok(Some(()));
+                            return Err(500);
                         }
                     ibex_config::HttpReqAction::ScIncGpc0 { sc } => {
                         let sc_idx = *sc as usize;
@@ -5371,14 +5365,25 @@ impl EngineDispatcher<'_> {
         if !proxies[proxy_idx].http_req_rules.is_empty() {
             let fe_rules = &proxies[proxy_idx].http_req_rules;
             let fe_acls = &proxies[proxy_idx].acls;
-            if let Ok(Some(())) = eval_http_rules(fe_rules, fe_acls, &mut entry.sess, entry.target_addr, Some(&proxies[proxy_idx].name), None) {
-                return None;
+            match eval_http_rules(fe_rules, fe_acls, &mut entry.sess, entry.target_addr, Some(&proxies[proxy_idx].name), None) {
+                Ok(Some(())) => return None,
+                Err(status) => {
+                    reply_error(entry, proxies, status);
+                    return None;
+                }
+                Ok(None) => {}
             }
         }
 
         // 3. Resolve backend and server
         let be_idx = Self::resolve_backend(entry, proxies);
         entry.backend_idx = be_idx;
+        // The server side runs on the backend's timeouts, as in HAProxy.
+        if be_idx != proxy_idx {
+            let t = proxies[be_idx].timeouts;
+            entry.sess.timeouts.server = t.server;
+            entry.sess.timeouts.connect = t.connect;
+        }
 
         // Evaluate backend tcp-request content rules
         if !proxies[be_idx].tcp_req_content_rules.is_empty() {
@@ -5436,8 +5441,13 @@ impl EngineDispatcher<'_> {
         if be_idx != proxy_idx && !proxies[be_idx].http_req_rules.is_empty() {
             let be_rules = &proxies[be_idx].http_req_rules;
             let be_acls = &proxies[be_idx].acls;
-            if let Ok(Some(())) = eval_http_rules(be_rules, be_acls, &mut entry.sess, entry.target_addr, Some(&proxies[proxy_idx].name), Some(&proxies[be_idx].name)) {
-                return None;
+            match eval_http_rules(be_rules, be_acls, &mut entry.sess, entry.target_addr, Some(&proxies[proxy_idx].name), Some(&proxies[be_idx].name)) {
+                Ok(Some(())) => return None,
+                Err(status) => {
+                    reply_error(entry, proxies, status);
+                    return None;
+                }
+                Ok(None) => {}
             }
         }
 
@@ -5472,76 +5482,6 @@ impl EngineDispatcher<'_> {
             }
         }
 
-        let has_res_rules = !proxies[be_idx].http_res_rules.is_empty()
-            || !proxies[be_idx].http_after_res_rules.is_empty()
-            || (be_idx != proxy_idx
-                && (!proxies[proxy_idx].http_res_rules.is_empty()
-                    || !proxies[proxy_idx].http_after_res_rules.is_empty()));
-        if has_res_rules {
-            let res_ctx = SampleContext {
-                is_first_req: entry.sess.is_first_req,
-                client_addr: entry.sess.client_addr,
-                server_addr: entry.target_addr,
-                htx: None,
-                req_uri: entry.sess.req_uri.as_deref(),
-                req_method: entry.sess.req_method.as_deref(),
-                req_headers: entry.sess.req_headers.as_deref(),
-                ..Default::default()
-            };
-
-            let mut res_rules = Vec::new();
-            let mut raw_res = proxies[be_idx].http_res_rules.clone();
-            if be_idx != proxy_idx {
-                raw_res.extend(proxies[proxy_idx].http_res_rules.clone());
-            }
-            for rule in &raw_res {
-                let action = match &rule.action {
-                    ibex_config::HttpResAction::SetHeader { name, fmt } => {
-                        let formatted_fmt = format_sample_string(fmt, &res_ctx, registry);
-                        ibex_config::HttpResAction::SetHeader {
-                            name: name.clone(),
-                            fmt: formatted_fmt,
-                        }
-                    }
-                    ibex_config::HttpResAction::AddHeader { name, fmt } => {
-                        let formatted_fmt = format_sample_string(fmt, &res_ctx, registry);
-                        ibex_config::HttpResAction::AddHeader {
-                            name: name.clone(),
-                            fmt: formatted_fmt,
-                        }
-                    }
-                    other => other.clone(),
-                };
-                res_rules.push(ibex_config::HttpResRule {
-                    action,
-                    cond: rule.cond.clone(),
-                });
-            }
-            entry.sess.http_res_rules = res_rules;
-
-            let mut after_rules = Vec::new();
-            let mut raw_after = proxies[be_idx].http_after_res_rules.clone();
-            if be_idx != proxy_idx {
-                raw_after.extend(proxies[proxy_idx].http_after_res_rules.clone());
-            }
-            for rule in &raw_after {
-                let mut action = rule.action.clone();
-                if let ibex_config::HttpAfterResAction::SetHeader { fmt, .. }
-                | ibex_config::HttpAfterResAction::AddHeader { fmt, .. } = &mut action
-                {
-                    *fmt = format_sample_string(fmt, &res_ctx, registry);
-                }
-                after_rules.push(ibex_config::HttpAfterResRule {
-                    action,
-                    cond: rule.cond.clone(),
-                });
-            }
-            entry.sess.http_after_res_rules = after_rules;
-        } else {
-            entry.sess.http_res_rules.clear();
-            entry.sess.http_after_res_rules.clear();
-        }
-
         let source_ip = entry.sess.client_addr.map(|a| a.ip());
         let target = if let Some(ref cval) = entry.sess.cookie_val {
             proxies[be_idx]
@@ -5553,15 +5493,28 @@ impl EngineDispatcher<'_> {
 
         let Some(target_addr) = target else {
             proxies[be_idx].stats[worker_id()].failed_conn.fetch_add(1, Ordering::Relaxed);
-            entry.sess.srv_state = ScState::Error;
-            entry.sess.discard_unforwarded_request();
-            entry.sess.send_synthetic_response(
-                503,
-                Some("text/html; charset=utf-8"),
-                Some("<html><body><h1>503 Service Unavailable</h1>No server is available to handle this request.</body></html>\n"),
-            );
+            reply_error(entry, proxies, 503);
             return None;
         };
+
+        // The connection kept from this session's last transaction, if this request goes
+        // to the same server: no new connection, no pool round trip. Otherwise it goes to
+        // the pool (or is closed) and the request is routed as usual.
+        if entry.sess.srv.is_some() {
+            let same = entry.srv_backend_idx == be_idx && entry.target_addr == Some(target_addr);
+            if same
+                && matches!(entry.sess.srv_state, ScState::Ready | ScState::Established)
+                && entry.sess.rep.is_empty()
+            {
+                // Its server timer is the last transaction's; this one starts its own.
+                entry.sess.server_connected(now);
+                if let Some(txn) = entry.sess.txn.as_mut() {
+                    txn.srv_reused = true;
+                }
+                return None;
+            }
+            release_server(entry, proxies, fdtab, poller, idle_pool, true);
+        }
 
         let s_idx = proxies[be_idx]
             .servers
@@ -5573,6 +5526,7 @@ impl EngineDispatcher<'_> {
             }
         }
         entry.target_server_idx = s_idx;
+        entry.srv_backend_idx = be_idx;
 
         maybe_prepend_send_proxy(&proxies[be_idx], &mut entry.sess, target_addr);
 
@@ -5595,6 +5549,9 @@ impl EngineDispatcher<'_> {
             entry.srv_raw_fd = Some(sfd);
             entry.sess.attach_server(srv_fd, now);
             entry.sess.server_connected(now);
+            if let Some(txn) = entry.sess.txn.as_mut() {
+                txn.srv_reused = true;
+            }
             let (_, srv_want) = entry.sess.interests();
             let new_interest = Interest {
                 readable: srv_want.read,
@@ -5722,6 +5679,7 @@ impl EngineDispatcher<'_> {
             }
         }
         entry.target_server_idx = s_idx;
+        entry.srv_backend_idx = be_idx;
 
         maybe_prepend_send_proxy(&proxies[be_idx], &mut entry.sess, target_addr);
 
@@ -6575,11 +6533,204 @@ const fn status_reason(status: u16) -> &'static str {
     }
 }
 
+/// HAProxy's built-in error pages, transcribed byte-for-byte from `http_err_msgs` in
+/// `src/http.c` (3.5-dev7): status code paired with the full raw response HAProxy sends
+/// when nothing -- no `errorfile`, `errorfiles`, or `http-error` -- customises that code.
+/// This is the last fallback `default-errorfiles` (explicit, or implied by a bare `deny`)
+/// resolves to, and it is why, for example, an unconfigured 403 has `Content-length: 93`.
+const BUILTIN_ERROR_PAGES: &[(u16, &str)] = &[
+    (200, "HTTP/1.1 200 OK\r\nContent-length: 58\r\nCache-Control: no-cache\r\nContent-Type: text/html\r\n\r\n<html><body><h1>200 OK</h1>\nService ready.\n</body></html>\n"),
+    (400, "HTTP/1.1 400 Bad request\r\nContent-length: 90\r\nCache-Control: no-cache\r\nConnection: close\r\nContent-Type: text/html\r\n\r\n<html><body><h1>400 Bad request</h1>\nYour browser sent an invalid request.\n</body></html>\n"),
+    (401, "HTTP/1.1 401 Unauthorized\r\nContent-length: 112\r\nCache-Control: no-cache\r\nContent-Type: text/html\r\n\r\n<html><body><h1>401 Unauthorized</h1>\nYou need a valid user and password to access this content.\n</body></html>\n"),
+    (403, "HTTP/1.1 403 Forbidden\r\nContent-length: 93\r\nCache-Control: no-cache\r\nContent-Type: text/html\r\n\r\n<html><body><h1>403 Forbidden</h1>\nRequest forbidden by administrative rules.\n</body></html>\n"),
+    (404, "HTTP/1.1 404 Not Found\r\nContent-length: 83\r\nCache-Control: no-cache\r\nContent-Type: text/html\r\n\r\n<html><body><h1>404 Not Found</h1>\nThe resource could not be found.\n</body></html>\n"),
+    (405, "HTTP/1.1 405 Method Not Allowed\r\nContent-length: 147\r\nCache-Control: no-cache\r\nContent-Type: text/html\r\n\r\n<html><body><h1>405 Method Not Allowed</h1>\nA request was made of a resource using a request method not supported by that resource.\n</body></html>\n"),
+    (407, "HTTP/1.1 407 Unauthorized\r\nContent-length: 112\r\nCache-Control: no-cache\r\nContent-Type: text/html\r\n\r\n<html><body><h1>407 Unauthorized</h1>\nYou need a valid user and password to access this content.\n</body></html>\n"),
+    (408, "HTTP/1.1 408 Request Time-out\r\nContent-length: 110\r\nCache-Control: no-cache\r\nConnection: close\r\nContent-Type: text/html\r\n\r\n<html><body><h1>408 Request Time-out</h1>\nYour browser didn't send a complete request in time.\n</body></html>\n"),
+    (410, "HTTP/1.1 410 Gone\r\nContent-length: 114\r\nCache-Control: no-cache\r\nContent-Type: text/html\r\n\r\n<html><body><h1>410 Gone</h1>\nThe resource is no longer available and will not be available again.\n</body></html>\n"),
+    (413, "HTTP/1.1 413 Payload Too Large\r\nContent-length: 106\r\nCache-Control: no-cache\r\nContent-Type: text/html\r\n\r\n<html><body><h1>413 Payload Too Large</h1>\nThe request entity exceeds the maximum allowed.\n</body></html>\n"),
+    (414, "HTTP/1.1 414 URI Too Long\r\nContent-length: 110\r\nCache-Control: no-cache\r\nContent-Type: text/html\r\n\r\n<html><body><h1>414 URI Too Long</h1>\nThe URI provided was too long for the server to process.\n</body></html>\n"),
+    (421, "HTTP/1.1 421 Misdirected Request\r\nContent-length: 104\r\nCache-Control: no-cache\r\nContent-Type: text/html\r\n\r\n<html><body><h1>421 Misdirected Request</h1>\nRequest sent to a non-authoritative server.\n</body></html>\n"),
+    (422, "HTTP/1.1 422 Unprocessable Content\r\nContent-length: 116\r\nCache-Control: no-cache\r\nContent-Type: text/html\r\n\r\n<html><body><h1>422 Unprocessable Content</h1>\nThe server cannot process the contained instructions.\n</body></html>\n"),
+    (425, "HTTP/1.1 425 Too Early\r\nContent-length: 80\r\nCache-Control: no-cache\r\nContent-Type: text/html\r\n\r\n<html><body><h1>425 Too Early</h1>\nYour browser sent early data.\n</body></html>\n"),
+    (429, "HTTP/1.1 429 Too Many Requests\r\nContent-length: 117\r\nCache-Control: no-cache\r\nContent-Type: text/html\r\n\r\n<html><body><h1>429 Too Many Requests</h1>\nYou have sent too many requests in a given amount of time.\n</body></html>\n"),
+    (431, "HTTP/1.1 431 Request Header Fields Too Large\r\nContent-length: 105\r\nCache-Control: no-cache\r\nContent-Type: text/html\r\n\r\n<html><body><h1>431 Request Header Fields Too Large</h1>\nRequest Header Fields Too Large.\n</body></html>\n"),
+    (500, "HTTP/1.1 500 Internal Server Error\r\nContent-length: 97\r\nCache-Control: no-cache\r\nContent-Type: text/html\r\n\r\n<html><body><h1>500 Internal Server Error</h1>\nAn internal server error occurred.\n</body></html>\n"),
+    (501, "HTTP/1.1 501 Not Implemented\r\nContent-length: 135\r\nCache-Control: no-cache\r\nContent-Type: text/html\r\n\r\n<html><body><h1>501 Not Implemented</h1>\nThe server does not support the functionality required to fulfill the request.\n</body></html>\n"),
+    (502, "HTTP/1.1 502 Bad Gateway\r\nContent-length: 107\r\nCache-Control: no-cache\r\nContent-Type: text/html\r\n\r\n<html><body><h1>502 Bad Gateway</h1>\nThe server returned an invalid or incomplete response.\n</body></html>\n"),
+    (503, "HTTP/1.1 503 Service Unavailable\r\nContent-length: 107\r\nCache-Control: no-cache\r\nContent-Type: text/html\r\n\r\n<html><body><h1>503 Service Unavailable</h1>\nNo server is available to handle this request.\n</body></html>\n"),
+    (504, "HTTP/1.1 504 Gateway Time-out\r\nContent-length: 92\r\nCache-Control: no-cache\r\nContent-Type: text/html\r\n\r\n<html><body><h1>504 Gateway Time-out</h1>\nThe server didn't respond in time.\n</body></html>\n"),
+];
+
+/// The response for an error the proxy generates itself (no server, connect failed), as
+/// HAProxy's `http_error_message` picks it: the backend's `http-error`/`errorfile` for
+/// `status`, then the frontend's, then the built-in page.
+fn proxy_error_response(sess: &TcpSession, be: &Proxy, fe: &Proxy, status: u16) -> Vec<u8> {
+    let own = |proxy: &Proxy| -> Option<Vec<u8>> {
+        match proxy.error_replies.get(&status) {
+            Some(ibex_config::ErrorPageSource::Raw(bytes)) => return Some(bytes.clone()),
+            Some(ibex_config::ErrorPageSource::Custom { content_type, lf_string }) => {
+                let ctx = SampleContext {
+                    client_addr: sess.client_addr,
+                    fc_src: sess.fc_src,
+                    fc_dst: sess.fc_dst,
+                    is_first_req: sess.is_first_req,
+                    htx_slice: sess.htx_slice(),
+                    req_uri: sess.req_uri.as_deref(),
+                    req_method: sess.req_method.as_deref(),
+                    req_headers: sess.req_headers.as_deref(),
+                    fe_name: Some(fe.name.as_str()),
+                    be_name: Some(be.name.as_str()),
+                    ..Default::default()
+                };
+                return Some(build_templated_error_response(
+                    status,
+                    content_type.as_deref(),
+                    lf_string.as_deref(),
+                    &ctx,
+                    sample_registry(),
+                ));
+            }
+            Some(ibex_config::ErrorPageSource::DefaultErrorfiles) | None => {}
+        }
+        proxy.error_files.get(&status).cloned()
+    };
+    own(be)
+        .or_else(|| own(fe))
+        .or_else(|| builtin_error_page(status).map(<[u8]>::to_vec))
+        .unwrap_or_else(|| ibex_proto::build_synthetic_response(status, None, None))
+}
+
+fn builtin_error_page(status: u16) -> Option<&'static [u8]> {
+    BUILTIN_ERROR_PAGES
+        .iter()
+        .find(|(code, _)| *code == status)
+        .map(|(_, msg)| msg.as_bytes())
+}
+
+/// What `deny`/`return` will actually send for a given status, once `error_page` (and, for
+/// `default-errorfiles`, the proxy's own `error_replies`/`error_files` tables) has been
+/// resolved.
+enum ResolvedErrorBody<'a> {
+    /// A full response, taken verbatim from an `errorfile`, an `errorfiles` section entry,
+    /// or HAProxy's built-in page. An empty slice is a deliberately empty errorfile (the
+    /// documented `/dev/null` idiom): nothing is written, and the connection just closes.
+    Raw(&'a [u8]),
+    /// A response to build from `content-type`/`hdr`/`string`/`lf-string`, exactly as
+    /// `http-request return` already does.
+    Custom {
+        content_type: Option<&'a str>,
+        lf_string: Option<&'a str>,
+    },
+}
+
+/// Resolves `deny`/`return`'s `error_page` argument (and, transitively, `http-error`'s
+/// per-proxy overrides and `errorfile`/`errorfiles`'s per-proxy table) to what should
+/// actually be sent for `status`.
+///
+/// The data path this closes: a denied request whose proxy configured `errorfile 403
+/// site.http` used to always get Ibex's hardcoded 403 body; this is the line where it
+/// picks up the operator's file instead.
+fn resolve_error_body<'a>(
+    proxy: &'a Proxy,
+    status: u16,
+    error_page: Option<&'a ibex_config::ErrorPageSource>,
+    content_type: Option<&'a String>,
+    lf_string: Option<&'a String>,
+) -> ResolvedErrorBody<'a> {
+    match error_page {
+        None => ResolvedErrorBody::Custom {
+            content_type: content_type.map(String::as_str),
+            lf_string: lf_string.map(String::as_str),
+        },
+        Some(ibex_config::ErrorPageSource::Raw(bytes)) => ResolvedErrorBody::Raw(bytes.as_slice()),
+        Some(ibex_config::ErrorPageSource::Custom { content_type, lf_string }) => ResolvedErrorBody::Custom {
+            content_type: content_type.as_deref(),
+            lf_string: lf_string.as_deref(),
+        },
+        Some(ibex_config::ErrorPageSource::DefaultErrorfiles) => {
+            match proxy.error_replies.get(&status) {
+                Some(ibex_config::ErrorPageSource::Raw(bytes)) => return ResolvedErrorBody::Raw(bytes.as_slice()),
+                Some(ibex_config::ErrorPageSource::Custom { content_type, lf_string }) => {
+                    return ResolvedErrorBody::Custom {
+                        content_type: content_type.as_deref(),
+                        lf_string: lf_string.as_deref(),
+                    };
+                }
+                Some(ibex_config::ErrorPageSource::DefaultErrorfiles) | None => {}
+            }
+            if let Some(bytes) = proxy.error_files.get(&status) {
+                return ResolvedErrorBody::Raw(bytes.as_slice());
+            }
+            if let Some(builtin) = builtin_error_page(status) {
+                return ResolvedErrorBody::Raw(builtin);
+            }
+            ResolvedErrorBody::Custom { content_type: None, lf_string: None }
+        }
+    }
+}
+
+/// Builds a full raw HTTP response from `http-request return`/`deny`'s templated body
+/// arguments: an optional `content-type`, and the `\0HDR:`/`\0BODY:`-encoded custom
+/// headers and payload the parser already produces for `string`/`lf-string`/`file`/
+/// `lf-file`/`hdr`. Shared by `Return`'s dummy/templated body, `Deny`'s equivalent
+/// arguments, and an `http-error`'s inline template resolved through
+/// `ErrorPageSource::Custom`.
+fn build_templated_error_response(
+    status: u16,
+    content_type: Option<&str>,
+    lf_string: Option<&str>,
+    ctx: &SampleContext,
+    registry: &Registry,
+) -> Vec<u8> {
+    let mut custom_headers: Vec<(String, String)> = Vec::new();
+    let mut body_str = String::new();
+
+    if let Some(s) = lf_string {
+        let mut rest = s;
+        while let Some(stripped) = rest.strip_prefix("\0HDR:") {
+            if let Some((line, r)) = stripped.split_once('\n') {
+                if let Some((k, v)) = line.split_once(':') {
+                    let formatted_v = format_sample_string(v, ctx, registry);
+                    custom_headers.push((k.to_string(), formatted_v));
+                }
+                rest = r;
+            } else {
+                break;
+            }
+        }
+        if let Some(b) = rest.strip_prefix("\0BODY:") {
+            body_str = format_sample_string(b, ctx, registry);
+        } else if !rest.starts_with('\0') {
+            body_str = format_sample_string(rest, ctx, registry);
+        }
+    }
+
+    let unescaped = body_str.replace("\\n", "\n").replace("\\r", "\r").replace("\\t", "\t");
+    let body = unescaped.as_bytes();
+
+    let reason = status_reason(status);
+    let mut resp = format!("HTTP/1.1 {status} {reason}\r\n");
+    if let Some(ct) = content_type {
+        let _ = write!(resp, "Content-Type: {ct}\r\n");
+    }
+    for (k, v) in custom_headers {
+        if !v.is_empty() {
+            let _ = write!(resp, "{k}: {v}\r\n");
+        }
+    }
+    let _ = write!(resp, "Content-Length: {}\r\n\r\n", body.len());
+
+    let mut full_resp = resp.into_bytes();
+    full_resp.extend_from_slice(body);
+    full_resp
+}
+
 #[cfg(test)]
 mod registry_tests {
     use super::{
         build_sample_registry, inject_connection_close_header_zero_alloc,
-        is_http_response_complete, CURRENT_RES_STATUS, CURRENT_VARS,
+        CURRENT_RES_STATUS, CURRENT_VARS,
     };
     use ibex_sample::{Expr, Sample, SampleContext};
 
@@ -6655,20 +6806,6 @@ mod registry_tests {
         let ctx = SampleContext::default();
         let expr = Expr::parse("status").expect("status must parse");
         assert_eq!(expr.eval_sample(&reg, &ctx), None);
-    }
-
-    #[test]
-    fn test_is_http_response_complete_cases() {
-        assert!(!is_http_response_complete(b"incomplete"));
-        assert!(!is_http_response_complete(b"\xff\xff\r\n\r\n"));
-        assert!(is_http_response_complete(b"HTTP/1.1 204 No Content\r\n\r\n"));
-        assert!(is_http_response_complete(b"HTTP/1.1 304 Not Modified\r\n\r\n"));
-        assert!(is_http_response_complete(b"HTTP/1.1 100 Continue\r\n\r\n"));
-        assert!(!is_http_response_complete(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"));
-        assert!(is_http_response_complete(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"));
-        assert!(!is_http_response_complete(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n123"));
-        assert!(is_http_response_complete(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n12345"));
-        assert!(!is_http_response_complete(b"HTTP/1.1 200 OK\r\n\r\n"));
     }
 
     #[test]

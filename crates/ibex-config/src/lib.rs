@@ -21,7 +21,7 @@ use std::path::Path;
 
 pub use ast::{
     AclCondition, AclRule, AclTerm, BackendSection, BalanceAlgorithm, Config, DefaultsSection,
-    FrontendSection, GlobalSection, GlobalSetVar,
+    ErrorPageSource, FrontendSection, GlobalSection, GlobalSetVar,
     HeaderExp, HttpAfterResAction, HttpAfterResRule, HttpReqAction, HttpReqRule, HttpResAction,
     HttpResRule, HttpReuse, ListenSection, LogConfig, LogFacility, LogLevel, LogTarget, Mode, Server, StatsConfig,
     StickRule, StickRuleType, StickTableConfigAst, TcpReqConnAction, TcpReqConnRule,

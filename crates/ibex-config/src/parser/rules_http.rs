@@ -1,4 +1,9 @@
-use super::*;
+use super::{
+    find_cond_idx, join_tokens_until, parse_acl_condition_from_tokens, parse_error_body_args,
+    parse_rule_condition, parse_sc_counter_action, parse_u16, ConfigError, ErrorPageSource,
+    HttpAfterResAction, HttpAfterResRule, HttpReqAction, HttpReqRule, HttpResAction, HttpResRule,
+    Token,
+};
 
 #[allow(clippy::too_many_lines)]
 pub(crate) fn parse_http_req_rule(
@@ -69,96 +74,71 @@ pub(crate) fn parse_http_req_rule(
         }
         rules.push(HttpReqRule { action: HttpReqAction::ScSetGpt0 { sc, expr }, cond });
     } else if act_str == "return" {
-        let mut status = 200u16;
-        let mut content_type = None;
-        let mut lf_string = None;
-        let mut custom_headers = Vec::new();
         let cond_idx = find_cond_idx(tokens, 2);
         let limit = cond_idx.unwrap_or(tokens.len());
-        let mut i = 2;
-        while i < limit {
-            match tokens[i].text.as_str() {
-                "status" if i + 1 < limit => {
-                    status = parse_u16(&tokens[i + 1], "status")?;
-                    i += 2;
-                }
-                "content-type" if i + 1 < limit => {
-                    content_type = Some(tokens[i + 1].text.clone());
-                    i += 2;
-                }
-                "lf-string" | "string" if i + 1 < limit => {
-                    lf_string = Some(tokens[i + 1].text.clone());
-                    i += 2;
-                }
-                "file" | "lf-file" if i + 1 < limit => {
-                    let path = &tokens[i + 1].text;
-                    if let Ok(c) = std::fs::read_to_string(path) {
-                        lf_string = Some(c);
-                    } else {
-                        lf_string = Some(String::new());
-                    }
-                    i += 2;
-                }
-                "hdr" if i + 2 < limit => {
-                    custom_headers.push((tokens[i + 1].text.clone(), tokens[i + 2].text.clone()));
-                    i += 3;
-                }
-                "errorfile" if i + 2 < limit => {
-                    i += 3;
-                }
-                "errorfiles" if i + 1 < limit => {
-                    i += 2;
-                }
-                _ => {
-                    i += 1;
-                }
+
+        // `errorfiles <name>` (if present) must pick a single status code out of a whole
+        // section, so `status` is resolved first, in a pre-scan, exactly like HAProxy's own
+        // two-pass argument parsing for this action.
+        let mut status = 200u16;
+        for i in 2..limit {
+            if tokens[i].text == "status" && i + 1 < limit {
+                status = parse_u16(&tokens[i + 1], "status")?;
+                break;
             }
         }
+
+        let (content_type, lf_string, error_page) = parse_error_body_args(tokens, 2, limit, status)?;
+
         let cond = if let Some(idx) = cond_idx {
             parse_acl_condition_from_tokens(&tokens[idx..])?
         } else {
             None
-        };
-        let final_lf_string = if custom_headers.is_empty() {
-            lf_string
-        } else {
-            let mut enc = String::new();
-            for (k, v) in custom_headers {
-                let _ = writeln!(enc, "\0HDR:{k}:{v}");
-            }
-            if let Some(s) = lf_string {
-                let _ = write!(enc, "\0BODY:{s}");
-            }
-            Some(enc)
         };
         rules.push(HttpReqRule {
             action: HttpReqAction::Return {
                 status,
                 content_type,
-                lf_string: final_lf_string,
+                lf_string,
+                error_page,
             },
             cond,
         });
     } else if act_str == "deny" {
-        let mut deny_status = None;
         let cond_idx = find_cond_idx(tokens, 2);
         let limit = cond_idx.unwrap_or(tokens.len());
-        let mut i = 2;
-        while i < limit {
+
+        let mut deny_status = None;
+        for i in 2..limit {
             if (tokens[i].text == "status" || tokens[i].text == "deny_status") && i + 1 < limit {
                 deny_status = Some(parse_u16(&tokens[i + 1], "deny_status")?);
-                i += 2;
-            } else {
-                i += 1;
+                break;
             }
         }
+
+        let (content_type, lf_string, mut error_page) =
+            parse_error_body_args(tokens, 2, limit, deny_status.unwrap_or(403))?;
+
+        // HAProxy: "for compatibility purposes, when no argument is defined, or only
+        // 'deny_status', the argument 'default-errorfiles' is implied" -- i.e. a bare
+        // `deny` (or one with only a status) must still consult the proxy's configured
+        // error page, not synthesize an empty body the way a bare `return` does.
+        if error_page.is_none() && content_type.is_none() && lf_string.is_none() {
+            error_page = Some(ErrorPageSource::DefaultErrorfiles);
+        }
+
         let cond = if let Some(idx) = cond_idx {
             parse_acl_condition_from_tokens(&tokens[idx..])?
         } else {
             None
         };
         rules.push(HttpReqRule {
-            action: HttpReqAction::Deny { deny_status },
+            action: HttpReqAction::Deny {
+                deny_status,
+                content_type,
+                lf_string,
+                error_page,
+            },
             cond,
         });
     } else if act_str == "allow" {
