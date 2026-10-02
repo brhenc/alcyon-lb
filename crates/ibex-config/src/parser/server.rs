@@ -179,11 +179,105 @@ pub(crate) fn parse_balance(
         "uri" => BalanceAlgorithm::Uri,
         "leastconn" => BalanceAlgorithm::Leastconn,
         "static-rr" => BalanceAlgorithm::StaticRr,
+        "first" => BalanceAlgorithm::First,
+        "random" => BalanceAlgorithm::Random(2),
+        other if other.starts_with("random(") => {
+            let Some(inner) = other.strip_prefix("random(").and_then(|s| s.strip_suffix(')')) else {
+                return Err(ConfigError::new(
+                    tokens[1].line,
+                    tokens[1].col,
+                    "random : missing closing parenthesis.",
+                ));
+            };
+            let draws: u32 = inner.parse().map_err(|_| {
+                ConfigError::new(
+                    tokens[1].line,
+                    tokens[1].col,
+                    format!("random : unexpected argument '{inner}'."),
+                )
+            })?;
+            if draws < 1 {
+                return Err(ConfigError::new(
+                    tokens[1].line,
+                    tokens[1].col,
+                    "random : number of draws must be at least 1.",
+                ));
+            }
+            BalanceAlgorithm::Random(draws)
+        }
         other => {
             return Err(ConfigError::new(
                 tokens[1].line,
                 tokens[1].col,
                 format!("unknown balance algorithm <{other}>"),
+            ));
+        }
+    };
+    Ok(())
+}
+
+pub(crate) fn parse_hash_type(
+    hash_type: &mut HashType,
+    tokens: &[Token],
+    kw: &Token,
+) -> Result<(), ConfigError> {
+    if tokens.len() < 2 || tokens[1].text.is_empty() {
+        return Err(ConfigError::new(
+            kw.line,
+            kw.col,
+            "'hash-type' only supports 'consistent' and 'map-based'.",
+        ));
+    }
+    *hash_type = match tokens[1].text.as_str() {
+        "consistent" => HashType::Consistent,
+        "map-based" => HashType::MapBased,
+        _ => {
+            return Err(ConfigError::new(
+                tokens[1].line,
+                tokens[1].col,
+                "'hash-type' only supports 'consistent' and 'map-based'.",
+            ));
+        }
+    };
+    if tokens.len() > 2 {
+        return Err(ConfigError::new(
+            tokens[2].line,
+            tokens[2].col,
+            "'hash-type': hash function and 'avalanche' modifiers are not implemented.",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn parse_hash_preserve_affinity(
+    mode: &mut HashPreserveAffinity,
+    tokens: &[Token],
+    kw: &Token,
+) -> Result<(), ConfigError> {
+    if tokens.len() < 2 || tokens[1].text.is_empty() {
+        return Err(ConfigError::new(
+            kw.line,
+            kw.col,
+            "'hash-preserve-affinity' needs a keyword to specify when to preserve hash affinity.",
+        ));
+    }
+    *mode = match tokens[1].text.as_str() {
+        "always" => HashPreserveAffinity::Always,
+        "maxconn" => HashPreserveAffinity::MaxConn,
+        "maxqueue" => {
+            return Err(ConfigError::new(
+                tokens[1].line,
+                tokens[1].col,
+                "'hash-preserve-affinity maxqueue' is not implemented: Ibex has no per-server \
+                 request queue, so it cannot hold a request at a saturated server until that \
+                 server's queue fills. Use 'always' or 'maxconn'.",
+            ));
+        }
+        other => {
+            return Err(ConfigError::new(
+                tokens[1].line,
+                tokens[1].col,
+                format!("'hash-preserve-affinity': unknown keyword '{other}'."),
             ));
         }
     };

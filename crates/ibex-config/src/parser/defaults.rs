@@ -120,6 +120,18 @@ pub(crate) fn parse_defaults_directive(
         "srvtimeout" => parse_srvtimeout(kw),
         "dispatch" => parse_dispatch(kw),
         "http-reuse" => parse_http_reuse(&mut defaults.http_reuse, tokens, kw),
+        "hash-type" => {
+            let mut ht = defaults.hash_type.unwrap_or_default();
+            parse_hash_type(&mut ht, tokens, kw)?;
+            defaults.hash_type = Some(ht);
+            Ok(())
+        }
+        "hash-preserve-affinity" => {
+            let mut a = defaults.hash_preserve_affinity.unwrap_or_default();
+            parse_hash_preserve_affinity(&mut a, tokens, kw)?;
+            defaults.hash_preserve_affinity = Some(a);
+            Ok(())
+        }
         "cliexp" => parse_cliexp(kw),
         "srvexp" => parse_srvexp(kw),
         "http-check" => {

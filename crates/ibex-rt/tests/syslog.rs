@@ -136,8 +136,16 @@ fn state(rise: u32, fall: u32) -> ServerCheckState {
 #[test]
 fn a_check_that_changes_nothing_is_not_reported() {
     // rise 1, fall 1 -> full health is 1, and a server starts at `rise`, so it is
-    // already saturated.
+    // already saturated. HAProxy still seeds a fresh check's status with the
+    // HCHK_STATUS_INI placeholder (src/check.c), which matches no real result code, so
+    // the very first check outcome always differs from it and is reported once -- only
+    // the *second* identical success, once steady state is reached, reports nothing.
     let mut s = state(1, 1);
+    assert_eq!(
+        s.on_success(3),
+        Some(CheckEvent::Succeeded),
+        "the first check after boot confirms the server and is always reported"
+    );
     assert_eq!(s.on_success(3), None, "an already-healthy server has nothing to report");
     assert_eq!(s.on_success(3), None);
 

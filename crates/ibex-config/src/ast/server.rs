@@ -55,6 +55,37 @@ pub enum BalanceAlgorithm {
     Leastconn,
     /// Static round-robin.
     StaticRr,
+    /// First server (in declaration order) with a free slot.
+    First,
+    /// Random draw over the weighted server set. The value is the number of
+    /// draws (`random(N)`; bare `random` is `N == 2`, matching HAProxy).
+    Random(u32),
+}
+
+/// Hashing method for hash-based balancing algorithms (`hash-type`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HashType {
+    /// Weighted modulo over the hash value (default).
+    #[default]
+    MapBased,
+    /// Consistent hashing ring: minimal remapping when a server's
+    /// eligibility changes, and the point where `hash-preserve-affinity`
+    /// takes effect.
+    Consistent,
+}
+
+/// When a hash-based algorithm keeps sending a key to the same server after
+/// that server is no longer able to take the request immediately
+/// (`hash-preserve-affinity`). Only meaningful with `hash-type consistent`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HashPreserveAffinity {
+    /// Always preserve affinity: keep using the hashed server regardless of
+    /// its load (default, matches HAProxy).
+    #[default]
+    Always,
+    /// Preserve affinity until the hashed server reaches `maxconn`, then
+    /// move on to the next server on the ring.
+    MaxConn,
 }
 
 /// Dynamic backend switching rule.

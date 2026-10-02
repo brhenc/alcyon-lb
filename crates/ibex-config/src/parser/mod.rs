@@ -12,7 +12,7 @@ use crate::ast::{
     register_http_errors_section, register_resolved_check, register_resolved_check_for_addr,
     AclCondition, AclRule, AclTerm, BackendSection, BalanceAlgorithm, BindConfig, Config,
     DefaultServerConfig, DefaultsSection, ErrorPageSource, FrontendSection, GlobalSection,
-    GlobalSetVar, HttpAfterResAction, HttpAfterResRule, HttpCheckAction, HttpCheckExpectPattern,
+    GlobalSetVar, HashPreserveAffinity, HashType, HttpAfterResAction, HttpAfterResRule, HttpCheckAction, HttpCheckExpectPattern,
     HttpChkConfig, HttpReqAction, HttpReqRule, HttpResAction, HttpResRule, HttpReuse,
     ListenSection, LogConfig, LogFacility, LogLevel, LogTarget, MatchType, Mode,
     MysqlCheckVersion, ProtoCheckConfig, ResolvedCheckConfig, ResolvedHttpCheck,
@@ -922,6 +922,75 @@ backend app_be
             srvtimeout_err.message,
             "'srvtimeout' was removed in HAProxy 2.1; use 'timeout server' instead"
         );
+    }
+
+    #[test]
+    fn test_balance_first_and_random() {
+        let sample = "
+backend b1
+    balance first
+    server s1 127.0.0.1:8001
+
+backend b2
+    balance random
+    server s1 127.0.0.1:8001
+
+backend b3
+    balance random(5)
+    server s1 127.0.0.1:8001
+";
+        let config = parse_str(sample).unwrap();
+        assert_eq!(config.backends[0].balance, BalanceAlgorithm::First);
+        // Bare `random` draws 2, matching HAProxy's default (`arg_opt1 = 2` in
+        // `backend_parse_balance` before the optional `(N)` is applied).
+        assert_eq!(config.backends[1].balance, BalanceAlgorithm::Random(2));
+        assert_eq!(config.backends[2].balance, BalanceAlgorithm::Random(5));
+
+        let bad_draws = parse_str("backend b\n balance random(0)\n server s1 127.0.0.1:8001\n").unwrap_err();
+        assert_eq!(bad_draws.message, "random : number of draws must be at least 1.");
+
+        let no_paren = parse_str("backend b\n balance random(5\n server s1 127.0.0.1:8001\n").unwrap_err();
+        assert_eq!(no_paren.message, "random : missing closing parenthesis.");
+    }
+
+    #[test]
+    fn test_hash_type_and_hash_preserve_affinity() {
+        let sample = "
+backend b1
+    balance uri
+    hash-type consistent
+    hash-preserve-affinity maxconn
+    server s1 127.0.0.1:8001
+
+backend b2
+    balance uri
+    hash-type map-based
+    server s1 127.0.0.1:8001
+";
+        let config = parse_str(sample).unwrap();
+        assert_eq!(config.backends[0].hash_type, Some(HashType::Consistent));
+        assert_eq!(
+            config.backends[0].hash_preserve_affinity,
+            Some(HashPreserveAffinity::MaxConn)
+        );
+        assert_eq!(config.backends[1].hash_type, Some(HashType::MapBased));
+        assert_eq!(config.backends[1].hash_preserve_affinity, None);
+
+        let always = parse_str("backend b\n hash-preserve-affinity always\n server s1 127.0.0.1:8001\n").unwrap();
+        assert_eq!(always.backends[0].hash_preserve_affinity, Some(HashPreserveAffinity::Always));
+
+        // Ibex has no per-server request queue, so it cannot hold a request at a saturated
+        // server until that server's own queue fills -- AGENTS.md #5: an unimplemented
+        // action must not parse as if it worked.
+        let maxqueue_err = parse_str("backend b\n hash-preserve-affinity maxqueue\n server s1 127.0.0.1:8001\n").unwrap_err();
+        assert!(
+            maxqueue_err.message.contains("not implemented"),
+            "hash-preserve-affinity maxqueue must be refused, not silently accepted: {}",
+            maxqueue_err.message
+        );
+
+        let bad_hash_type = parse_str("backend b\n hash-type bogus\n server s1 127.0.0.1:8001\n").unwrap_err();
+        assert_eq!(bad_hash_type.message, "'hash-type' only supports 'consistent' and 'map-based'.");
     }
 
     #[test]
