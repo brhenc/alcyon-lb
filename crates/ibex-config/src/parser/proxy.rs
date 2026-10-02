@@ -78,6 +78,7 @@ pub(crate) fn parse_listen_header(
         default_server: defaults.and_then(|d| d.default_server.clone()),
         servers: Vec::new(),
         logs: defaults.map_or_else(Vec::new, |d| d.logs.clone()),
+        log_tag: defaults.and_then(|d| d.log_tag.clone()),
         log_global: defaults.map_or(false, |d| d.log_global),
         log_health_checks: defaults.map_or(false, |d| d.log_health_checks),
         cliexp: Vec::new(),
@@ -159,6 +160,7 @@ pub(crate) fn parse_frontend_header(
         acls: Vec::new(),
         cliexp: Vec::new(),
         logs: defaults.map_or_else(Vec::new, |d| d.logs.clone()),
+        log_tag: defaults.and_then(|d| d.log_tag.clone()),
         log_global: defaults.map_or(false, |d| d.log_global),
         log_health_checks: defaults.map_or(false, |d| d.log_health_checks),
         stick_table: None,
@@ -222,6 +224,7 @@ pub(crate) fn parse_backend_header(
         tcp_check: defaults.is_some_and(|d| d.tcp_check),
         name: id,
         logs: defaults.map_or_else(Vec::new, |d| d.logs.clone()),
+        log_tag: defaults.and_then(|d| d.log_tag.clone()),
         log_global: defaults.map_or(false, |d| d.log_global),
         log_health_checks: defaults.map_or(false, |d| d.log_health_checks),
         mode,
@@ -256,6 +259,7 @@ pub(crate) fn parse_backend_header(
     })
 }
 
+#[allow(clippy::too_many_lines)]
 pub(crate) fn parse_listen_directive(
     proxy: &mut ListenSection,
     tokens: &[Token],
@@ -287,10 +291,8 @@ pub(crate) fn parse_listen_directive(
             tokens,
             kw,
         ),
-        "log" => {
-            proxy.log_global |= parse_log(&mut proxy.logs, tokens, kw)?;
-            Ok(())
-        }
+        "log" => parse_log(&mut proxy.logs, tokens, kw).map(|g| proxy.log_global |= g),
+        "log-tag" => parse_log_tag(tokens, kw).map(|t| proxy.log_tag = Some(t)),
         "cliexp" => parse_cliexp(kw),
         "srvexp" => parse_srvexp(kw),
         "balance" => parse_balance(&mut proxy.balance, tokens, kw),
@@ -416,10 +418,8 @@ pub(crate) fn parse_frontend_directive(
         "srvexp" => parse_srvexp(kw),
         "timeout" => parse_timeout_directive(&mut fe.timeouts, tokens, kw),
         "maxconn" => parse_maxconn(&mut fe.maxconn, tokens, kw),
-        "log" => {
-            fe.log_global |= parse_log(&mut fe.logs, tokens, kw)?;
-            Ok(())
-        }
+        "log" => parse_log(&mut fe.logs, tokens, kw).map(|g| fe.log_global |= g),
+        "log-tag" => parse_log_tag(tokens, kw).map(|t| fe.log_tag = Some(t)),
         "acl" => parse_acl(&mut fe.acls, tokens, kw),
         "use_backend" => parse_use_backend(&mut fe.use_backends, tokens, kw),
         "monitor-uri" => parse_monitor_uri(&mut fe.monitor_uri, tokens, kw),
@@ -502,10 +502,8 @@ pub(crate) fn parse_backend_directive(
         // `log` is valid in every proxy section, backends included. It was wired for
         // global, listen and frontend but not here, which alone blocked 19 reg-tests
         // -- the health-check suites all declare their syslog target on the backend.
-        "log" => {
-            be.log_global |= parse_log(&mut be.logs, tokens, kw)?;
-            Ok(())
-        }
+        "log" => parse_log(&mut be.logs, tokens, kw).map(|g| be.log_global |= g),
+        "log-tag" => parse_log_tag(tokens, kw).map(|t| be.log_tag = Some(t)),
         "http-check" => {
             parse_http_check_directive(&mut be.http_checks, tokens, kw)?;
             Ok(())

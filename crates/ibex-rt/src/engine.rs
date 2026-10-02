@@ -179,6 +179,14 @@ pub struct Proxy {
     pub error_files: HashMap<u16, Vec<u8>>,
     /// `http-error` overrides, keyed by status code; consulted before `error_files`.
     pub error_replies: HashMap<u16, ibex_config::ErrorPageSource>,
+    /// `log-tag`, as sent: the tag followed by `[pid]`, which `HAProxy` adds whichever
+    /// tag a line carries (`__send_log`, `src/log.c`). `None` sends the global tag.
+    pub log_tag: Option<Arc<str>>,
+    /// One sampling cursor per entry of `log_target_idx` (`syslog::sample_admits`).
+    /// Per proxy because `HAProxy` copies each logger into every proxy that uses it, and
+    /// behind an `Arc` so the workers, which each clone the proxies, share them as
+    /// `HAProxy`'s threads share a logger.
+    pub log_cursors: Arc<Vec<AtomicU64>>,
 }
 
 impl Proxy {
@@ -592,6 +600,12 @@ fn hostname() -> String {
         })
 }
 
+/// A syslog tag as sent: `tag[pid]`. Built once per proxy, after `-D` has re-executed,
+/// so the pid is the one that sends.
+fn syslog_tag(tag: &str) -> Arc<str> {
+    format!("{tag}[{}]", std::process::id()).into()
+}
+
 /// Builds the syslog targets and points every proxy at the ones its section resolved to.
 ///
 /// `HAProxy` resolves logging per proxy: a section's own `log <addr>` lines apply, `log
@@ -611,7 +625,7 @@ fn resolve_log_targets(config: &Config, proxies: &mut [Proxy]) -> Vec<SyslogTarg
         // two places interleaves partial lines.
         if let Some(i) = targets
             .iter()
-            .position(|t| t.same_destination(cfg))
+            .position(|t| t.same_logger(cfg))
         {
             return i;
         }
@@ -670,6 +684,11 @@ fn resolve_log_targets(config: &Config, proxies: &mut [Proxy]) -> Vec<SyslogTarg
         }
         resolved.sort_unstable();
         resolved.dedup();
+        // Kept when already there: each worker resolves again (the targets own sockets
+        // and are per engine), and the cursors must stay the ones the workers share.
+        if proxy.log_cursors.len() != resolved.len() {
+            proxy.log_cursors = Arc::new(resolved.iter().map(|_| AtomicU64::new(0)).collect());
+        }
         proxy.log_target_idx = resolved;
 
         if defaults_log_health {
@@ -876,6 +895,8 @@ fn init_proxy_from_listen(proxy_idx: usize, listen: &ibex_config::ListenSection,
         http_reuse: listen.http_reuse.unwrap_or_default(),
         error_files: listen.error_files.clone(),
         error_replies: listen.error_replies.clone(),
+        log_tag: listen.log_tag.as_deref().map(syslog_tag),
+        log_cursors: Arc::default(),
     }
 }
 
@@ -952,6 +973,8 @@ fn init_proxy_from_frontend(proxy_idx: usize, fe: &ibex_config::FrontendSection,
         http_reuse: ibex_config::HttpReuse::default(),
         error_files: fe.error_files.clone(),
         error_replies: fe.error_replies.clone(),
+        log_tag: fe.log_tag.as_deref().map(syslog_tag),
+        log_cursors: Arc::default(),
     }
 }
 
@@ -1052,6 +1075,8 @@ fn init_proxy_from_backend(proxy_idx: usize, be: &ibex_config::BackendSection, n
         http_reuse: be.http_reuse.unwrap_or_default(),
         error_files: be.error_files.clone(),
         error_replies: be.error_replies.clone(),
+        log_tag: be.log_tag.as_deref().map(syslog_tag),
+        log_cursors: Arc::default(),
     }
 }
 
@@ -1250,7 +1275,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             events: Vec::with_capacity(capacity * 2),
             timer_updates: Vec::with_capacity(capacity * 2),
             log_targets,
-            log_tag: format!("haproxy[{}]", std::process::id()),
+            log_tag: syslog_tag(config.global.as_ref().and_then(|g| g.log_tag.as_deref()).unwrap_or("haproxy")).to_string(),
             log_hostname: hostname(),
             global_bufsize: bufsize,
             global_maxrewrite: config
@@ -5805,12 +5830,23 @@ impl EngineDispatcher<'_> {
         let Some(proxy) = self.proxies.get(proxy_idx) else {
             return;
         };
-        for &i in &proxy.log_target_idx {
-            if let Some(target) = self.log_targets.get(i) {
-                // Discarded deliberately: syslog over UDP is fire-and-forget, and a
-                // collector that is down must not slow or fail the data path.
-                let _ = target.send(level, self.log_tag, self.log_hostname, msg);
+        for (k, &i) in proxy.log_target_idx.iter().enumerate() {
+            let Some(target) = self.log_targets.get(i) else {
+                continue;
+            };
+            // Level first: a line the logger filters out does not take a sampling slot.
+            if !target.accepts(level) {
+                continue;
             }
+            if let (Some(sample), Some(cursor)) = (target.sample(), proxy.log_cursors.get(k)) {
+                if !crate::syslog::sample_admits(sample, cursor) {
+                    continue;
+                }
+            }
+            let tag = proxy.log_tag.as_deref().unwrap_or(self.log_tag);
+            // Discarded deliberately: syslog over UDP is fire-and-forget, and a
+            // collector that is down must not slow or fail the data path.
+            let _ = target.send(level, tag, self.log_hostname, msg);
         }
     }
 

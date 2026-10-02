@@ -1,5 +1,6 @@
 use super::*;
 
+#[allow(clippy::too_many_lines)]
 pub(crate) fn parse_defaults_directive(
     defaults: &mut DefaultsSection,
     tokens: &[Token],
@@ -109,10 +110,8 @@ pub(crate) fn parse_defaults_directive(
         "http-after-response" => {
             parse_http_after_res_rule(&mut defaults.http_after_res_rules, tokens, kw)
         }
-        "log" => {
-            defaults.log_global |= parse_log(&mut defaults.logs, tokens, kw)?;
-            Ok(())
-        }
+        "log" => parse_log(&mut defaults.logs, tokens, kw).map(|g| defaults.log_global |= g),
+        "log-tag" => parse_log_tag(tokens, kw).map(|t| defaults.log_tag = Some(t)),
         "option" => parse_option_defaults(defaults, tokens, kw),
         "no" => parse_no_directive(tokens, kw),
         "declare" => parse_declare(tokens, kw),

@@ -20,8 +20,9 @@
 //! `PRI` is `facility * 8 + severity`, which is why both are carried per target rather
 //! than being a single number.
 
-use ibex_config::{LogConfig, LogFacility, LogLevel, LogTarget};
+use ibex_config::{LogConfig, LogFacility, LogLevel, LogSample, LogTarget};
 use std::net::{SocketAddr, UdpSocket};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Numeric facility code, as RFC 3164 defines them.
 #[must_use]
@@ -115,6 +116,9 @@ pub struct SyslogTarget {
     /// no continuation, so a split line is two malformed records rather than one long one.
     max_len: usize,
     sink: Sink,
+    /// `sample <ranges>:<size>`. Which lines it keeps depends on a cursor that belongs to
+    /// each proxy, not to the target: see [`sample_admits`].
+    sample: Option<Box<LogSample>>,
 }
 
 impl SyslogTarget {
@@ -157,6 +161,7 @@ impl SyslogTarget {
             max_level: cfg.level.unwrap_or(LogLevel::Debug),
             max_len: cfg.max_len,
             sink,
+            sample: cfg.sample.clone(),
         }
     }
 
@@ -242,6 +247,24 @@ impl SyslogTarget {
         }
     }
 
+    /// True when `cfg` is this target in every respect: destination, filters, length and
+    /// sampling. Only such a target may be shared between two `log` lines; one that
+    /// differed in level or `sample` would apply the first line's settings to both.
+    #[must_use]
+    pub fn same_logger(&self, cfg: &LogConfig) -> bool {
+        self.same_destination(cfg)
+            && self.default_level == cfg.level.unwrap_or(LogLevel::Info)
+            && self.max_level == cfg.level.unwrap_or(LogLevel::Debug)
+            && self.max_len == cfg.max_len
+            && self.sample == cfg.sample
+    }
+
+    /// The `sample` setting, if any.
+    #[must_use]
+    pub fn sample(&self) -> Option<&LogSample> {
+        self.sample.as_deref()
+    }
+
     #[must_use]
     pub const fn facility(&self) -> LogFacility {
         self.facility
@@ -311,4 +334,34 @@ fn local_timestamp() -> (u32, u32, u32, u32, u32) {
         minute,
         second,
     )
+}
+
+/// Whether the next line passes `sample`, advancing `cursor` (`process_send_log`,
+/// `src/log.c`).
+///
+/// The cursor holds the current range in its high 32 bits and the position of the last
+/// line within `size` in its low 32, exactly as `HAProxy`'s `lb.curr_rg_idx` does, and is
+/// advanced with a compare-and-swap so threads sharing it agree on every line's position.
+/// `HAProxy` keeps one per logger *per proxy* (`log global` and `defaults` copy the
+/// logger), so the caller owns it, not the target.
+pub fn sample_admits(sample: &LogSample, cursor: &AtomicU64) -> bool {
+    // The parser never builds these; a hand-built one samples nothing out.
+    if sample.ranges.is_empty() || sample.size == 0 {
+        return true;
+    }
+    let mut cur = cursor.load(Ordering::Relaxed);
+    loop {
+        let next_idx = (cur & 0xFFFF_FFFF) + 1;
+        let mut rg = cur >> 32;
+        let range = &sample.ranges[usize::try_from(rg).unwrap_or(0) % sample.ranges.len()];
+        let in_range = u64::from(*range.start()) <= next_idx && next_idx <= u64::from(*range.end());
+        if in_range && next_idx == u64::from(*range.end()) {
+            rg = (rg + 1) % sample.ranges.len() as u64;
+        }
+        let next = (rg << 32) | (next_idx % u64::from(sample.size));
+        match cursor.compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return in_range,
+            Err(seen) => cur = seen,
+        }
+    }
 }
