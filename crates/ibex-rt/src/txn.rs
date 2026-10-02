@@ -465,6 +465,46 @@ mod tests {
     }
 
     #[test]
+    fn bare_lf_chunk_framing_is_accepted() {
+        // Sizes, data ends and the last line ended by LF alone; an extension ended by LF; a
+        // trailer line ended by LF before the blank one.
+        for body in [
+            &b"H\r\n\r\n5\nhello\n0\n\nNEXT"[..],
+            b"H\r\n\r\n5;x\nhello\r\n0\r\n\r\nNEXT",
+            b"H\r\n\r\n0\r\nX: y\n\nNEXT",
+        ] {
+            let (n, s) = fwd(MsgState::head(Framing::Chunked), body);
+            assert_eq!((&body[n..], s), (&b"NEXT"[..], MsgState::Done), "{:?}", String::from_utf8_lossy(body));
+        }
+    }
+
+    #[test]
+    fn every_malformed_line_end_is_an_error() {
+        for bad in [
+            &b"H\r\n\r\n\n"[..],         // a size line with no digits
+            b"H\r\n\r\n5\rX",            // CR not followed by LF after a size
+            b"H\r\n\r\n5\r\nhello\rX", // after the data
+            b"H\r\n\r\n0\r\nX: y\rZ",  // after a trailer line
+        ] {
+            let (_, s) = fwd(MsgState::head(Framing::Chunked), bad);
+            assert_eq!(s, MsgState::Error, "{:?}", String::from_utf8_lossy(bad));
+        }
+    }
+
+    #[test]
+    fn a_head_without_its_end_moves_nothing() {
+        let mut s = MsgState::head(Framing::None);
+        assert_eq!(s.advance(b"GET / HTTP/1.1\r\nHost"), 0);
+        assert_eq!(s, MsgState::head(Framing::None));
+    }
+
+    #[test]
+    fn a_head_can_open_a_tunnel() {
+        let (n, s) = fwd(MsgState::head(Framing::Tunnel), b"HTTP/1.1 101 Switching\r\n\r\nraw bytes");
+        assert_eq!((n, s), (35, MsgState::Tunnel));
+    }
+
+    #[test]
     fn waiting_forwards_nothing_and_tunnel_everything() {
         assert_eq!(MsgState::Waiting.window(b"HTTP/1.1 200 OK\r\n\r\n"), 0);
         assert_eq!(MsgState::Tunnel.window(b"anything"), 8);

@@ -220,6 +220,11 @@ fn start(cfg: &str, backends: &[SocketAddr]) -> (Proxy, SocketAddr) {
         assert!(Instant::now() < deadline, "{bin} never started listening on {fe}");
         thread::sleep(Duration::from_millis(20));
     }
+    // Answering a connect is not yet being ready. With every case starting a proxy at once,
+    // a first request sent straight after the probe was now and then reset -- with
+    // HAProxy as the binary as well as Ibex (0-3 resets per run of the suite, never one
+    // run alone). A short settle removed them in five runs of five.
+    thread::sleep(Duration::from_millis(300));
     (Proxy { child, _cfg: f }, fe)
 }
 
