@@ -3540,11 +3540,12 @@ impl EngineDispatcher<'_> {
             // Between requests. A client that goes away here ends the session; a server
             // connection kept from the last transaction goes back to the pool.
             if !matches!(entry.sess.cli_state, ScState::Ready | ScState::Established) {
-                // `timeout client` in the middle of a request head: HAProxy answers 408
-                // (`http_wait_for_request`), from the frontend's pages. A keep-alive
-                // connection with nothing of a request on it closes silently.
+                // `timeout client` before a request head is complete: HAProxy answers 408
+                // (`h1_handle_req_tout`, `src/mux_h1.c`) from the frontend's pages, also on
+                // a new connection that sent nothing. Only a keep-alive connection waiting
+                // for its next request, with nothing of one on it, closes silently.
                 if entry.sess.ending == Some(crate::proxy::Ending::Timeout(crate::proxy::Which::Client))
-                    && !entry.sess.req.is_empty()
+                    && (!entry.sess.req.is_empty() || entry.sess.is_first_req)
                 {
                     let fe = &proxies[entry.proxy_idx];
                     let page = proxy_error_response(&entry.sess, fe, fe, 408);

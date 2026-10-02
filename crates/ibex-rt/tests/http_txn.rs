@@ -1435,6 +1435,34 @@ fn a_client_silent_in_the_middle_of_a_head_gets_a_408() {
     assert!(c.closed_within(Duration::from_secs(1)));
 }
 
+/// A connection that sends nothing at all past `timeout client` is answered the same way:
+/// `h1_handle_req_tout` (`src/mux_h1.c`) closes silently only for an idle keep-alive
+/// connection or under `option http-ignore-probes`. `HAProxy` 3.5: 408, then close.
+#[test]
+fn a_connection_that_never_sends_a_request_gets_a_408() {
+    let (_p, fe) = start(
+        "frontend fe\n  bind @FE@\n  timeout client 300ms\n  default_backend be\nbackend be\n",
+        &[],
+    );
+    let mut c = Client::connect(fe);
+    assert_eq!(c.final_response().map(|r| r.status), Some(408));
+    assert!(c.closed_within(Duration::from_secs(1)));
+}
+
+/// Between keep-alive requests, the same timeout closes the connection with nothing sent.
+/// `HAProxy` 3.5: the 200, then a close and no 408.
+#[test]
+fn an_idle_keep_alive_connection_closes_without_a_408() {
+    let (_p, fe) = start(
+        "frontend fe\n  bind @FE@\n  timeout client 300ms\n  http-request return status 200\n",
+        &[],
+    );
+    let mut c = Client::connect(fe);
+    assert_eq!(c.get("/").map(|r| r.status), Some(200));
+    assert!(c.closed_within(Duration::from_secs(2)), "the idle connection stayed open");
+    assert!(c.buf.is_empty(), "sent after the response: {:?}", String::from_utf8_lossy(&c.buf));
+}
+
 /// `timeout client` shorter than the server takes to answer: once the request is all in,
 /// the wait is the server's, and the client timer does not end it. `HAProxy` 3.5: 200.
 #[test]
