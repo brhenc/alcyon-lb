@@ -166,8 +166,10 @@ Where the implementation differs from the proposal above, and what it found.
 - **One reply.** `TcpSession::write_reply` (bytes) and `reply_error` (status -> page in
   `http_error_message` order). The request is dropped through its framing; a body still
   arriving is drained as it comes (`drain_request`), as `HAProxy` 3.5 does, bounded by
-  `timeout client`. The connection closes after an empty page, one that says
-  `Connection: close`, or an unread body behind `Expect: 100-continue`.
+  `timeout client`. The connection closes after an empty page or one that says
+  `Connection: close`. (It also closed after an unread body behind `Expect: 100-continue`;
+  `HAProxy` 3.5 keeps that connection, and so does Ibex now --
+  `a_reply_to_an_expect_100_continue_request_keeps_the_connection`.)
 - **What `HttpTxn` replaced.** `resp_released`, `resp_length_known`, `resp_status`,
   `resp_headers_processed`, `srv_connection_close`, `connection_close`, the session copies of
   the response rules (`http_res_rules`, `http_after_res_rules`, `acls`) and their second

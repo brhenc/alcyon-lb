@@ -500,6 +500,12 @@ impl TcpSession {
         self.mode == Mode::Http && !self.cli_xprt.is_tls()
     }
 
+    /// Writes `raw` to the client once, best effort, on a connection about to be closed:
+    /// what is not taken by the socket at once is dropped, as the connection is.
+    pub fn send_before_close(&mut self, raw: &[u8]) {
+        let _ = self.cli_xprt.send(self.cli.as_fd(), raw);
+    }
+
     /// Answers the current request with `raw`, a complete response the proxy built
     /// itself. `HAProxy`'s `http_reply_message`: the rest of the request is dropped, the
     /// response replaces anything in `rep`, and the transaction ends when it has been
@@ -507,23 +513,17 @@ impl TcpSession {
     ///
     /// The request is dropped through its framing, so its body is never read as the next
     /// request. A body not yet all here is drained as it arrives (`drain_request`) and the
-    /// connection then kept, as `HAProxy` 3.5 does, bounded by `timeout client`. A client
-    /// that sent `Expect: 100-continue` will not send a body it was not invited to, so
-    /// that connection closes, as it does after an empty reply (the `errorfile /dev/null`
-    /// idiom) and one that says `Connection: close`.
+    /// connection then kept, as `HAProxy` 3.5 does, bounded by `timeout client` -- also
+    /// for a client that sent `Expect: 100-continue` and was not invited to send its body
+    /// (`HAProxy` 3.5 keeps that connection too, and answers the next request once the
+    /// body has come). The connection closes after an empty reply (the `errorfile
+    /// /dev/null` idiom) and one that says `Connection: close`.
     pub fn write_reply(&mut self, raw: &[u8]) {
-        let expects_continue = self
-            .htx_slice()
-            .and_then(|h| h.get_header("expect"))
-            .is_some_and(|v| v.eq_ignore_ascii_case("100-continue"));
         let txn = self.txn.get_or_insert_with(|| HttpTxn::new(txn::Framing::None, false));
         let data = self.req.readable();
         let n = txn.req.window(data);
         txn.req.consume(data, n);
         self.req.consume(n);
-        if !txn.req.is_done() && expects_continue {
-            txn.close_after = true;
-        }
         let head_len = find_eoh(raw).map_or(raw.len(), |(h, e)| h + e);
         let head = String::from_utf8_lossy(&raw[..head_len]);
         txn.local = true;

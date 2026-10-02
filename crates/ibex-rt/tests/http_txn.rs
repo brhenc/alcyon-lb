@@ -1132,3 +1132,330 @@ fn a_head_rewritten_to_get_gets_no_body() {
     let seen = seen.lock().unwrap();
     assert_eq!(seen.iter().map(|s| (s.method.as_str(), s.conn)).collect::<Vec<_>>(), [("GET", 0), ("GET", 0)]);
 }
+
+// ---- the errors the proxy answers for itself ----------------------------------------
+//
+// Each of these was a path no test executed (harness/covercheck.py). The status each
+// asserts is what `HAProxy` 3.5 answered, run through this file with `IBEX_TXN_BIN`.
+
+/// A loopback address nothing listens on, so a connect to it is refused. Taken from the
+/// test port range and kept locked, so nothing else in the run starts listening there.
+fn refusing_addr() -> SocketAddr {
+    common::reserve_addr()
+}
+
+/// A server that refuses the connection, retried, then given up on. `HAProxy` 3.5: 503.
+#[test]
+fn a_refused_connect_is_retried_then_gets_a_503() {
+    let (_p, fe) = one_backend(refusing_addr(), "  retries 1\n");
+    let mut c = Client::connect(fe);
+    assert_eq!(c.get("/x").map(|r| r.status), Some(503));
+}
+
+/// `option redispatch`: the retry goes to another server. `HAProxy` 3.5: every request
+/// answered by the live server.
+#[test]
+fn a_refused_connect_is_redispatched_to_another_server() {
+    let (be, _) = backend(echo);
+    let (_p, fe) = start(
+        "frontend fe\n  bind @FE@\n  default_backend be\n\
+         backend be\n  balance roundrobin\n  option redispatch\n  retries 1\n\
+         \x20 server dead @BE0@\n  server live @BE1@\n",
+        &[refusing_addr(), be],
+    );
+    for i in 0..4 {
+        let mut c = Client::connect(fe);
+        assert_eq!(c.get(&format!("/{i}")).map(|r| r.body_str()), Some(format!("GET /{i} 0")), "request {i}");
+    }
+}
+
+/// A response head that does not end within the buffer. `HAProxy` 3.5: 502.
+#[test]
+fn a_response_head_too_large_for_the_buffer_gets_a_502() {
+    let mut head = b"HTTP/1.1 200 OK\r\nX-Big: ".to_vec();
+    head.extend(std::iter::repeat_n(b'a', 40_000));
+    let (_p, fe) = one_backend(raw_backend(Box::leak(head.into_boxed_slice())), "");
+    let mut c = Client::connect(fe);
+    assert_eq!(c.get("/x").map(|r| r.status), Some(502));
+}
+
+/// The request path, kept in `txn.p` for response rules: `path` itself is a request
+/// sample, and `HAProxy` no longer has it when the response is processed.
+const KEEP_PATH: &str = "  http-request set-var(txn.p) path\n";
+
+/// `http-response deny`, in the backend and in the frontend. `HAProxy` 3.5: 502 for both,
+/// the server's response discarded.
+#[test]
+fn a_response_deny_gets_a_502() {
+    let (be, _) = backend(echo);
+    let (_p, fe) = start(
+        &format!(
+            "frontend fe\n  bind @FE@\n{KEEP_PATH}  http-response deny if {{ var(txn.p) -m str /fe }}\n\
+             \x20 default_backend be\n\
+             backend be\n  http-response deny if {{ var(txn.p) -m str /be }}\n  server s1 @BE0@\n"
+        ),
+        &[be],
+    );
+    for path in ["/be", "/fe"] {
+        let mut c = Client::connect(fe);
+        let r = c.get(path).expect("a response");
+        assert_eq!(r.status, 502, "{path}: {r:?}");
+        assert!(!r.body_str().contains("GET"), "{path}: the server's body was sent: {r:?}");
+    }
+}
+
+/// `n` header actions of `action` adding 1000 bytes each, each followed by `cond`.
+fn big_headers(rule: &str, action: &str, n: usize, cond: &str) -> String {
+    (0..n).map(|i| format!("  {rule} {action} X-Big-{i} {} {cond}\n", "a".repeat(1000))).collect()
+}
+
+/// Response rewrites that no longer fit the buffer fail the response under the default
+/// `strict-mode on`, whichever rule set and proxy they are in. `HAProxy` 3.5: 500 for
+/// each.
+#[test]
+fn a_response_rewrite_that_does_not_fit_gets_a_500() {
+    let (be, _) = backend(echo);
+    let cases = [
+        ("http-response", "add-header"),
+        ("http-response", "set-header"),
+        ("http-after-response", "add-header"),
+        ("http-after-response", "set-header"),
+    ];
+    let mut fe_rules = String::new();
+    let mut routes = String::new();
+    let mut backends = String::new();
+    for (i, (rule, action)) in cases.iter().enumerate() {
+        fe_rules += &big_headers(rule, action, 20, &format!("if {{ var(txn.p) -m str /fe{i} }}"));
+        routes += &format!("  use_backend be{i} if {{ path /be{i} }}\n");
+        backends += &format!("backend be{i}\n{}  server s1 @BE0@\n", big_headers(rule, action, 20, ""));
+    }
+    let cfg = format!(
+        "frontend fe\n  bind @FE@\n{KEEP_PATH}{routes}{fe_rules}  default_backend be_plain\n\
+         {backends}backend be_plain\n  server s1 @BE0@\n"
+    );
+    let (_p, fe) = start(&cfg, &[be]);
+    for i in 0..cases.len() {
+        for path in [format!("/be{i}"), format!("/fe{i}")] {
+            let mut c = Client::connect(fe);
+            assert_eq!(c.get(&path).map(|r| r.status), Some(500), "{path}: {:?}", cases[i]);
+        }
+    }
+    let mut c = Client::connect(fe);
+    assert_eq!(c.get("/plain").map(|r| r.status), Some(200));
+}
+
+/// `tcp-response content reject` in an HTTP backend. `HAProxy` 3.5: the client connection
+/// closes with nothing sent.
+#[test]
+fn a_tcp_response_reject_closes_without_a_response() {
+    let (be, _) = backend(echo);
+    let (_p, fe) = one_backend(be, "  tcp-response content reject\n");
+    let mut c = Client::connect(fe);
+    c.send(b"GET /x HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert!(c.closed_within(Duration::from_secs(2)), "the client connection stayed open");
+    assert!(c.buf.is_empty(), "{:?}", String::from_utf8_lossy(&c.buf));
+}
+
+/// `normalize-uri ... strict` on a malformed percent-encoding, in the frontend and in the
+/// backend. `HAProxy` 3.5: 400 for both, nothing sent to the server.
+#[test]
+fn a_strict_uri_normalizer_refuses_a_bad_escape_with_a_400() {
+    let (be, seen) = backend(echo);
+    let (_p, fe) = start(
+        // HAProxy 3.5 calls `normalize-uri` experimental.
+        "global\n  expose-experimental-directives\n\
+         frontend fe\n  bind @FE@\n\
+         \x20 http-request normalize-uri percent-to-uppercase strict if { path_beg /fe }\n\
+         \x20 default_backend be\n\
+         backend be\n  http-request normalize-uri percent-to-uppercase strict\n  server s1 @BE0@\n",
+        &[be],
+    );
+    for path in ["/fe/%zz", "/be/%zz"] {
+        let mut c = Client::connect(fe);
+        assert_eq!(c.get(path).map(|r| r.status), Some(400), "{path}");
+    }
+    assert!(seen.lock().unwrap().is_empty(), "{:?}", seen.lock().unwrap());
+}
+
+/// Request rewrites that no longer fit the buffer. `HAProxy` 3.5: 500, nothing sent to the
+/// server.
+#[test]
+fn a_request_rewrite_that_does_not_fit_gets_a_500() {
+    let (be, seen) = backend(echo);
+    let cfg = format!(
+        "frontend fe\n  bind @FE@\n  use_backend be_set if {{ path /set }}\n  default_backend be_add\n\
+         backend be_add\n{}  server s1 @BE0@\nbackend be_set\n{}  server s1 @BE0@\n",
+        big_headers("http-request", "add-header", 20, ""),
+        big_headers("http-request", "set-header", 20, ""),
+    );
+    let (_p, fe) = start(&cfg, &[be]);
+    for path in ["/add", "/set"] {
+        let mut c = Client::connect(fe);
+        assert_eq!(c.get(path).map(|r| r.status), Some(500), "{path}");
+    }
+    assert!(seen.lock().unwrap().is_empty(), "{:?}", seen.lock().unwrap());
+}
+
+/// `replace-header` and `replace-value` with a back-reference. `HAProxy` 3.5: the server
+/// sees `x-a: abc-x` and `x-b: 1-y,2-y` (each value rewritten, rejoined with `,`).
+#[test]
+fn replace_header_and_value_substitute_back_references() {
+    let (_p, fe, seen) = simple(
+        echo,
+        "  http-request replace-header X-A ^(.*)$ \\1-x\n  http-request replace-value X-B ^(.*)$ \\1-y\n",
+    );
+    let mut c = Client::connect(fe);
+    c.send(b"GET / HTTP/1.1\r\nHost: x\r\nX-A: abc\r\nX-B: 1, 2\r\n\r\n");
+    assert_eq!(c.final_response().map(|r| r.status), Some(200));
+    let head = seen.lock().unwrap()[0].head.to_ascii_lowercase();
+    assert!(head.contains("\r\nx-a: abc-x\r\n"), "{head:?}");
+    assert!(head.contains("\r\nx-b: 1-y,2-y\r\n"), "{head:?}");
+}
+
+/// A `replace-header` whose result would no longer fit the buffer. `HAProxy` 3.5: 500.
+#[test]
+fn a_replace_header_that_does_not_fit_gets_a_500() {
+    let (be, seen) = backend(echo);
+    // The 100-byte value, 200 times over: 20 kB, more than the 16 kB buffer.
+    let repl = "\\1".repeat(200);
+    let (_p, fe) = start(
+        &format!(
+            "frontend fe\n  bind @FE@\n  use_backend value if {{ path /value }}\n  default_backend header\n\
+             backend header\n  http-request replace-header X-A ^(.*)$ {repl}\n  server s1 @BE0@\n\
+             backend value\n  http-request replace-value X-A ^(.*)$ {repl}\n  server s1 @BE0@\n"
+        ),
+        &[be],
+    );
+    for path in ["/header", "/value"] {
+        let mut c = Client::connect(fe);
+        c.send(format!("GET {path} HTTP/1.1\r\nHost: x\r\nX-A: {}\r\n\r\n", "a".repeat(100)).as_bytes());
+        assert_eq!(c.final_response().map(|r| r.status), Some(500), "{path}");
+    }
+    assert!(seen.lock().unwrap().is_empty(), "{:?}", seen.lock().unwrap());
+}
+
+/// A response head with bare-LF line ends, through response rules. `HAProxy` 3.5: 200,
+/// with the header the rule adds.
+#[test]
+fn a_bare_lf_response_head_still_goes_through_the_rules() {
+    let (_p, fe) = one_backend(
+        raw_backend(b"HTTP/1.1 200 OK\nContent-Length: 2\n\nok"),
+        "  http-response set-header X-Rule yes\n",
+    );
+    let mut c = Client::connect(fe);
+    let r = c.get("/x").expect("a response");
+    assert_eq!((r.status, r.body_str().as_str()), (200, "ok"), "{r:?}");
+    assert_eq!(r.header("x-rule"), Some("yes"), "{r:?}");
+}
+
+/// A server that answers with a body larger than the buffers and closes at once: the close
+/// arrives while the response is still being delivered. It ended the response rather than
+/// cutting it short. `HAProxy` 3.5: the whole body, and the client connection is kept.
+#[test]
+fn a_server_closing_right_after_a_large_response_has_finished_it() {
+    let mut raw = b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\n".to_vec();
+    raw.extend(std::iter::repeat_n(b'x', 1_000_000));
+    let (_p, fe) = one_backend(raw_backend(Box::leak(raw.into_boxed_slice())), "");
+    let mut c = Client::connect(fe);
+    c.send(b"GET /big HTTP/1.1\r\nHost: x\r\n\r\n");
+    // Let the server's whole answer and its close reach the proxy before reading any of it.
+    thread::sleep(Duration::from_millis(300));
+    let r = c.final_response().expect("a response");
+    assert_eq!((r.status, r.body.len()), (200, 1_000_000));
+    assert!(!c.closed_within(Duration::from_millis(200)), "the client connection was closed");
+}
+
+/// A body that runs until the server closes, ended by a reset instead. What arrived is
+/// delivered, then the client connection closes. `HAProxy` 3.5: the head and `partial`,
+/// then close.
+#[test]
+fn a_close_delimited_body_ended_by_a_reset_closes_the_client() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let be = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        for s in listener.incoming() {
+            let Ok(mut s) = s else { continue };
+            let mut buf = Vec::new();
+            if read_request(&mut s, &mut buf, 0).is_some() {
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\n\r\npartial");
+                thread::sleep(Duration::from_millis(200));
+                // SO_LINGER 0: the close is a reset.
+                let _ = rustix::net::sockopt::set_socket_linger(&s, Some(Duration::ZERO));
+            }
+        }
+    });
+    let (_p, fe) = one_backend(be, "");
+    let mut c = Client::connect(fe);
+    c.send(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert!(c.closed_within(Duration::from_secs(2)), "the client connection stayed open");
+    let got = String::from_utf8_lossy(&c.buf).into_owned();
+    assert!(got.starts_with("HTTP/1.1 200"), "{got:?}");
+    assert!(got.ends_with("\r\n\r\npartial"), "{got:?}");
+}
+
+/// A request answered before its body, from a client that asked `Expect: 100-continue`.
+/// Ibex closed the connection after the reply, on the reasoning that such a client will
+/// not send a body it was not invited to. `HAProxy` 3.5 keeps it: 403, the connection
+/// still open three seconds later, and when the body does come, followed by a request,
+/// the body is drained and the request answered.
+#[test]
+fn a_reply_to_an_expect_100_continue_request_keeps_the_connection() {
+    let (_p, fe, seen) = simple(echo, "  http-request deny if { path /local }\n");
+    let mut c = Client::connect(fe);
+    c.send(b"POST /local HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\nExpect: 100-continue\r\n\r\n");
+    assert_eq!(c.final_response().map(|r| r.status), Some(403));
+    assert!(!c.closed_within(Duration::from_secs(1)), "the client connection was closed");
+    c.send(b"0123456789GET /g HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert_eq!(c.final_response().map(|r| r.body_str()).as_deref(), Some("GET /g 0"));
+    assert_eq!(seen.lock().unwrap().len(), 1, "{:?}", seen.lock().unwrap());
+}
+
+/// A header line with no colon. `HAProxy` 3.5: 400, then close.
+#[test]
+fn a_header_line_without_a_colon_gets_a_400() {
+    let (_p, fe, seen) = simple(echo, "");
+    let mut c = Client::connect(fe);
+    c.send(b"GET / HTTP/1.1\r\nHost: x\r\nNoColonHere\r\n\r\n");
+    assert_eq!(c.final_response().map(|r| r.status), Some(400));
+    assert!(c.closed_within(Duration::from_secs(1)));
+    assert!(seen.lock().unwrap().is_empty());
+}
+
+/// A client that stops halfway through its request head, past `timeout client`. `HAProxy`
+/// 3.5: 408, then close.
+#[test]
+fn a_client_silent_in_the_middle_of_a_head_gets_a_408() {
+    let (_p, fe) = start(
+        "frontend fe\n  bind @FE@\n  timeout client 300ms\n  default_backend be\nbackend be\n",
+        &[],
+    );
+    let mut c = Client::connect(fe);
+    c.send(b"GET / HTTP/1.1\r\nHost");
+    assert_eq!(c.final_response().map(|r| r.status), Some(408));
+    assert!(c.closed_within(Duration::from_secs(1)));
+}
+
+/// `timeout client` shorter than the server takes to answer: once the request is all in,
+/// the wait is the server's, and the client timer does not end it. `HAProxy` 3.5: 200.
+#[test]
+fn timeout_client_does_not_cut_off_a_slow_server() {
+    fn slow(r: &Seen) -> Reply {
+        let body = format!("GET {} 0", r.path);
+        Reply {
+            parts: vec![
+                b"HTTP/1.1 200 OK\r\n".to_vec(),
+                format!("Content-Length: {}\r\n\r\n{body}", body.len()).into_bytes(),
+            ],
+            gap: Duration::from_millis(700),
+            close: false,
+        }
+    }
+    let (be, _) = backend(slow);
+    let (_p, fe) = start(
+        "frontend fe\n  bind @FE@\n  timeout client 250ms\n  default_backend be\n\
+         backend be\n  server s1 @BE0@\n",
+        &[be],
+    );
+    let mut c = Client::connect(fe);
+    assert_eq!(c.get("/slow").map(|r| r.body_str()).as_deref(), Some("GET /slow 0"));
+}
