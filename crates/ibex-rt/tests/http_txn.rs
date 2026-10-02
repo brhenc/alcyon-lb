@@ -1080,3 +1080,35 @@ fn a_kept_client_connection_after_a_502_is_idle() {
     let used = cpu_ticks(p.child.id()) - before;
     assert!(used < 20, "{used} ticks of CPU in one idle second");
 }
+
+fn chunked_for_req1(r: &Seen) -> Reply {
+    if r.path != "/req1" {
+        return Reply::ok("last response");
+    }
+    let mut parts = vec![b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec()];
+    for n in [15usize, 1024, 4048, 50000] {
+        parts.push([format!("{n:x}\r\n").into_bytes(), vec![b'x'; n], b"\r\n".to_vec()].concat());
+    }
+    parts.push(b"0\r\n\r\n".to_vec());
+    Reply { parts, gap: Duration::ZERO, close: false }
+}
+
+/// A HEAD the proxy turns into a GET: the server sends a body, framed as the GET it
+/// answers, and the client, which asked for a HEAD, gets the head alone. Ibex framed the
+/// response by the rewritten method and forwarded the body, so the client read it as the
+/// start of its next response. `HAProxy` 3.5 (and `reg-tests/http-messaging/
+/// http_bodyless_response.vtc`): the head only, then the next response, one server
+/// connection.
+#[test]
+fn a_head_rewritten_to_get_gets_no_body() {
+    let (_p, fe, seen) = simple(chunked_for_req1, "  http-request set-method GET\n");
+    let mut c = Client::connect(fe);
+    c.send(b"HEAD /req1 HTTP/1.1\r\nHost: x\r\n\r\n");
+    let r = c.response(true).expect("a response");
+    assert_eq!(r.status, 200);
+    c.send(b"GET /req2 HTTP/1.1\r\nHost: x\r\n\r\n");
+    let r = c.response(false).expect("a second response");
+    assert_eq!((r.status, r.body_str().as_str()), (200, "last response"), "{r:?}");
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.iter().map(|s| (s.method.as_str(), s.conn)).collect::<Vec<_>>(), [("GET", 0), ("GET", 0)]);
+}

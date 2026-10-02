@@ -457,7 +457,7 @@ impl TcpSession {
     pub fn rep_window(&self) -> usize {
         let data = self.rep.readable();
         match &self.txn {
-            Some(t) if self.mode == Mode::Http => t.rsp.window(data),
+            Some(t) if self.mode == Mode::Http => t.client_window(data),
             _ => data.len(),
         }
     }
@@ -985,7 +985,10 @@ impl TcpSession {
                 // will be forwarded.
                 let framing = find_eoh(self.req.readable())
                     .map_or(txn::Framing::None, |(h, e)| txn::request_framing(&self.req.readable()[..h + e]));
-                self.txn = Some(HttpTxn::new(framing, close));
+                let mut txn = HttpTxn::new(framing, close);
+                // The client's own method: rules that rewrite it have not run yet.
+                txn.client_head = self.req_method.as_deref().is_some_and(|m| m.eq_ignore_ascii_case("HEAD"));
+                self.txn = Some(txn);
                 self.cli_state = ScState::Established;
                 changed = true;
             } else if self.req.readable().len() > threshold {
@@ -1009,6 +1012,18 @@ impl TcpSession {
             }
             if *offset >= data.len() && self.rep.is_empty() {
                 self.pending_resp = None;
+            }
+        }
+
+        // A response to a HEAD that carries a body anyway (the server answered a GET):
+        // the body is read to its end and dropped.
+        if self.mode == Mode::Http && self.h2_ctx.is_none() {
+            if let Some(t) = self.txn.as_mut() {
+                let n = t.skip_head_body(self.rep.readable());
+                if n > 0 {
+                    self.rep.consume(n);
+                    changed = true;
+                }
             }
         }
 

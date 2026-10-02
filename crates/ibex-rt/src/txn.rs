@@ -332,6 +332,9 @@ pub struct HttpTxn {
     pub close_after: bool,
     /// The server may keep its connection once this response is done.
     pub srv_reusable: bool,
+    /// The client asked for a HEAD. The response is framed by the method the server
+    /// answered (a rule may have rewritten it), and the client gets its head alone.
+    pub client_head: bool,
     /// The request went out on a server connection that had already carried one
     /// (`HAProxy`'s `SF_SRV_REUSED`). If it closes before any response, the client
     /// connection is closed with nothing sent, so the client retries.
@@ -358,6 +361,7 @@ impl HttpTxn {
             close_after,
             srv_reusable: true,
             srv_reused: false,
+            client_head: false,
             error: None,
             aborted: false,
         }
@@ -391,6 +395,30 @@ impl HttpTxn {
             self.rsp = MsgState::Waiting;
             self.rsp_interim = false;
         }
+    }
+
+    /// How much of `rep` may go to the client now: the current response and nothing
+    /// after it, and of a response to a HEAD, the head alone.
+    #[must_use]
+    pub fn client_window(&self, rep: &[u8]) -> usize {
+        match self.rsp {
+            MsgState::Head { left, .. } if self.client_head => {
+                MsgState::Head { left, body: Framing::None }.window(rep)
+            }
+            MsgState::Body(_) if self.client_head => 0,
+            rsp => rsp.window(rep),
+        }
+    }
+
+    /// The body of a response to a HEAD, which the client does not get: how much of
+    /// `rep` it covers, recorded as delivered. The caller drops those bytes.
+    pub fn skip_head_body(&mut self, rep: &[u8]) -> usize {
+        if !self.client_head || !matches!(self.rsp, MsgState::Body(_)) {
+            return 0;
+        }
+        let n = self.rsp.window(rep);
+        self.rsp.consume(rep, n);
+        n
     }
 
     /// Both messages are complete: the transaction can end once output has drained.
