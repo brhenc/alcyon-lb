@@ -9,6 +9,8 @@
 //! Cleartext rather than TLS deliberately — the defect is in the mux, and putting a TLS
 //! handshake in front of it only adds ways for the test to fail for unrelated reasons.
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
@@ -22,13 +24,6 @@ fn ibex_bin() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_BIN_EXE_ibex"))
 }
 
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind")
-        .local_addr()
-        .expect("addr")
-        .port()
-}
 
 struct Daemon(Child);
 impl Drop for Daemon {
@@ -142,7 +137,7 @@ fn hpack_get(path: &str) -> Vec<u8> {
 fn each_h2_stream_carries_its_own_request() {
     let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let (backend_port, seen) = spawn_backend();
-    let port = free_port();
+    let port = common::reserve_port();
     let cfg = std::env::temp_dir().join(format!("ibex_h2mux_{}.cfg", std::process::id()));
     std::fs::write(
         &cfg,
@@ -215,7 +210,7 @@ fn each_h2_stream_carries_its_own_request() {
 fn ten_h2_streams_burst_reach_backend_without_loss() {
     let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let (backend_port, seen) = spawn_backend();
-    let port = free_port();
+    let port = common::reserve_port();
     let cfg = std::env::temp_dir().join(format!("ibex_h2burst_{}.cfg", std::process::id()));
     std::fs::write(
         &cfg,
@@ -281,7 +276,7 @@ fn ten_h2_streams_burst_reach_backend_without_loss() {
 fn rapid_reset_flood_triggers_goaway_enhance_your_calm() {
     let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let (backend_port, _) = spawn_backend();
-    let port = free_port();
+    let port = common::reserve_port();
     let cfg = std::env::temp_dir().join(format!("ibex_h2rstflood_{}.cfg", std::process::id()));
     std::fs::write(
         &cfg,
@@ -343,7 +338,7 @@ fn rapid_reset_flood_triggers_goaway_enhance_your_calm() {
 fn ping_flood_triggers_goaway_enhance_your_calm() {
     let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let (backend_port, _) = spawn_backend();
-    let port = free_port();
+    let port = common::reserve_port();
     let cfg = std::env::temp_dir().join(format!("ibex_h2pingflood_{}.cfg", std::process::id()));
     std::fs::write(
         &cfg,
@@ -402,7 +397,7 @@ fn ping_flood_triggers_goaway_enhance_your_calm() {
 fn settings_flood_triggers_goaway_enhance_your_calm() {
     let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let (backend_port, _) = spawn_backend();
-    let port = free_port();
+    let port = common::reserve_port();
     let cfg = std::env::temp_dir().join(format!("ibex_h2setflood_{}.cfg", std::process::id()));
     std::fs::write(
         &cfg,
@@ -594,7 +589,7 @@ fn recv_h2_frames(s: &mut TcpStream, timeout: Duration) -> Vec<(u8, u8, u32, Vec
 fn exactly_one_host_matching_authority_and_no_colon_headers_reach_backend() {
     let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let (backend_port, seen) = spawn_backend_full();
-    let port = free_port();
+    let port = common::reserve_port();
     let cfg = std::env::temp_dir().join(format!("ibex_h2pseudo_norm_{}.cfg", std::process::id()));
     std::fs::write(
         &cfg,
@@ -691,7 +686,7 @@ fn exactly_one_host_matching_authority_and_no_colon_headers_reach_backend() {
 fn agreeing_host_and_authority_is_accepted_and_forwarded_with_single_host() {
     let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let (backend_port, seen) = spawn_backend_full();
-    let port = free_port();
+    let port = common::reserve_port();
     let cfg = std::env::temp_dir().join(format!("ibex_h2agree_{}.cfg", std::process::id()));
     std::fs::write(
         &cfg,
@@ -761,7 +756,7 @@ fn agreeing_host_and_authority_is_accepted_and_forwarded_with_single_host() {
 fn disagreeing_host_and_authority_is_rejected_with_rst_stream() {
     let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let (backend_port, seen) = spawn_backend_full();
-    let port = free_port();
+    let port = common::reserve_port();
     let cfg = std::env::temp_dir().join(format!("ibex_h2disagree_{}.cfg", std::process::id()));
     std::fs::write(
         &cfg,
@@ -821,7 +816,7 @@ fn disagreeing_host_and_authority_is_rejected_with_rst_stream() {
 fn unknown_pseudo_header_is_rejected_with_rst_stream() {
     let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let (backend_port, seen) = spawn_backend_full();
-    let port = free_port();
+    let port = common::reserve_port();
     let cfg = std::env::temp_dir().join(format!("ibex_h2unknown_pseudo_{}.cfg", std::process::id()));
     std::fs::write(
         &cfg,
@@ -877,7 +872,7 @@ fn unknown_pseudo_header_is_rejected_with_rst_stream() {
 fn pseudo_header_after_regular_header_is_rejected_with_rst_stream() {
     let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let (backend_port, seen) = spawn_backend_full();
-    let port = free_port();
+    let port = common::reserve_port();
     let cfg = std::env::temp_dir().join(format!("ibex_h2pseudo_after_reg_{}.cfg", std::process::id()));
     std::fs::write(
         &cfg,
@@ -933,7 +928,7 @@ fn pseudo_header_after_regular_header_is_rejected_with_rst_stream() {
 fn duplicate_pseudo_header_is_rejected_with_rst_stream() {
     let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let (backend_port, seen) = spawn_backend_full();
-    let port = free_port();
+    let port = common::reserve_port();
     let cfg = std::env::temp_dir().join(format!("ibex_h2dup_pseudo_{}.cfg", std::process::id()));
     std::fs::write(
         &cfg,
@@ -1000,7 +995,7 @@ fn h2_backend_headers_match_haproxy_reference_oracle() {
 
     // 1. Run HAProxy
     let (haproxy_be_port, haproxy_seen) = spawn_backend_full();
-    let haproxy_port = free_port();
+    let haproxy_port = common::reserve_port();
     let haproxy_cfg = std::env::temp_dir().join(format!("haproxy_diff_{}.cfg", std::process::id()));
     std::fs::write(
         &haproxy_cfg,
@@ -1048,7 +1043,7 @@ fn h2_backend_headers_match_haproxy_reference_oracle() {
 
     // 2. Run Ibex
     let (ibex_be_port, ibex_seen) = spawn_backend_full();
-    let ibex_port = free_port();
+    let ibex_port = common::reserve_port();
     let ibex_cfg = std::env::temp_dir().join(format!("ibex_diff_{}.cfg", std::process::id()));
     std::fs::write(
         &ibex_cfg,

@@ -20,11 +20,11 @@ FAILED=()
 note_fail() { FAILED+=("$1"); echo "!! FAILED: $1"; }
 check() { [ "$1" -eq 0 ] || note_fail "$2"; }
 
+# tcp_request_rules.rs, tcp_request_tracking.rs and stick_table.rs were unprotected on
+# 2026-10-02 by the user (no agent owns them any more) so their racy port helpers could be
+# replaced; the eight findings below still run them.
 SPEC_TESTS=(
   crates/ibex-sample/tests/sample_semantics.rs
-  crates/ibex-rt/tests/tcp_request_rules.rs
-  crates/ibex-rt/tests/tcp_request_tracking.rs
-  crates/ibex-rt/tests/stick_table.rs
 )
 
 echo "=== tripwire: the spec tests must not change ==="
@@ -107,6 +107,14 @@ echo "=== the regressions no unit test can see ==="
 cargo build -q --bin ibex 2>/dev/null
 python3 harness/smoke.py 2>&1 | grep -vE "^$"
 check "${PIPESTATUS[0]}" "smoke"
+
+echo
+echo "=== does HAProxy still behave as the tests record ==="
+# http_txn.rs is measured against HAProxy; run against it here, a case that starts failing
+# means HAProxy changed (T89: Content-Length beside chunked is the case the user asked to
+# watch). Expected HAProxy failures: data/txn_oracle_baseline.json.
+python3 harness/txn_oracle.py 2>&1 | grep -vE "^$"
+check "${PIPESTATUS[0]}" "txn oracle"
 
 echo
 echo "=== does the rest still build and lint ==="

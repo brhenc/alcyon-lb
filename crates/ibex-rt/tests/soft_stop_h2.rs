@@ -1,3 +1,5 @@
+mod common;
+
 use rustix::process::{kill_process, Pid, Signal};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -6,10 +8,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::NamedTempFile;
 
-fn free_addr() -> SocketAddr {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind");
-    l.local_addr().expect("addr")
-}
 
 fn slow_backend(delay: Option<Duration>) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind backend");
@@ -166,7 +164,7 @@ fn recv_h2_frames(s: &mut TcpStream, timeout: Duration) -> Vec<(u8, u8, u32, Vec
 #[test]
 fn h2_sigusr1_finishes_the_request_in_flight_then_exits() {
     let be = slow_backend(Some(Duration::from_millis(1200)));
-    let fe = free_addr();
+    let fe = common::reserve_addr();
     let mut ibex = Ibex::start(&http_config(fe, be, ""), fe);
 
     let mut client = TcpStream::connect(fe).expect("connect");
@@ -198,7 +196,7 @@ fn h2_sigusr1_finishes_the_request_in_flight_then_exits() {
 #[test]
 fn h2_an_idle_keepalive_connection_does_not_hold_a_soft_stop_open() {
     let be = keepalive_backend();
-    let fe = free_addr();
+    let fe = common::reserve_addr();
     let mut ibex = Ibex::start(&http_config(fe, be, ""), fe);
 
     let mut client = TcpStream::connect(fe).expect("connect");

@@ -6,6 +6,8 @@
 //! `fc_src` reads the rewritten one, not the peer's (HAProxy: `x-fc: 10.1.2.3`). Ibex kept
 //! the peer's. `http_first_req` did not exist.
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
@@ -71,7 +73,7 @@ fn header(resp: &str, name: &str) -> Option<String> {
 #[test]
 fn fc_src_follows_set_src_and_http_first_req_is_true_on_the_first_request() {
     let be = backend();
-    let fe = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+    let fe = common::reserve_addr();
     let _ibex = start(
         &format!(
             "defaults\n  mode http\n  timeout connect 2s\n  timeout client 5s\n  timeout server 5s\n\

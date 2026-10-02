@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+mod common;
+
 use ibex_config::{Config, ListenSection, Mode, Server, LogTarget};
 use ibex_rt::{Engine, ServerStatus};
 use std::io::{Read, Write};
@@ -36,14 +38,10 @@ fn health_check_detects_down_server_and_routes_to_live_server() {
     });
 
     // 2. Pick a dead backend port where nothing listens
-    let dead_listener = TcpListener::bind("127.0.0.1:0").expect("bind temp");
-    let dead_addr = dead_listener.local_addr().expect("dead addr");
-    drop(dead_listener); // Now closed
+    let dead_addr = common::reserve_addr();
 
     // 3. Bind proxy listener
-    let proxy_bind = TcpListener::bind("127.0.0.1:0").expect("bind proxy");
-    let proxy_addr = proxy_bind.local_addr().expect("proxy addr");
-    drop(proxy_bind);
+    let proxy_addr = common::reserve_addr();
 
     let config = Config {
         listens: vec![ListenSection {
@@ -150,9 +148,7 @@ fn a_server_going_down_emits_a_syslog_datagram() {
         .expect("read timeout");
     let collector_addr = collector.local_addr().expect("collector addr");
 
-    let dead_listener = TcpListener::bind("127.0.0.1:0").expect("bind for a free port");
-    let dead_addr = dead_listener.local_addr().expect("local_addr");
-    drop(dead_listener);
+    let dead_addr = common::reserve_addr();
 
     let config = Config {
         global: Some(GlobalSection {
@@ -232,9 +228,7 @@ fn no_log_directive_means_no_datagrams() {
         .set_read_timeout(Some(Duration::from_millis(50)))
         .expect("read timeout");
 
-    let dead_listener = TcpListener::bind("127.0.0.1:0").expect("bind for a free port");
-    let dead_addr = dead_listener.local_addr().expect("local_addr");
-    drop(dead_listener);
+    let dead_addr = common::reserve_addr();
 
     let config = Config {
         listens: vec![ListenSection {

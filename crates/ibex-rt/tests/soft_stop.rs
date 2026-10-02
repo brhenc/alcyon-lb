@@ -7,6 +7,8 @@
 //! it exits. `-sf <pid>` sends exactly this signal to the old process on every reload, so
 //! until this works a reload is an abrupt kill of everything the old process was serving.
 
+mod common;
+
 use rustix::process::{kill_process, Pid, Signal};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -15,10 +17,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::NamedTempFile;
 
-fn free_addr() -> SocketAddr {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind");
-    l.local_addr().expect("addr")
-}
 
 /// A backend that answers each request after `delay`, or never if `delay` is `None`.
 fn slow_backend(delay: Option<Duration>) -> SocketAddr {
@@ -121,7 +119,7 @@ fn read_until_close(s: &mut TcpStream, within: Duration) -> String {
 #[test]
 fn sigusr1_finishes_the_request_in_flight_then_exits() {
     let be = slow_backend(Some(Duration::from_millis(1200)));
-    let fe = free_addr();
+    let fe = common::reserve_addr();
     let mut ibex = Ibex::start(&http_config(fe, be, ""), fe);
 
     let mut client = TcpStream::connect(fe).expect("connect");
@@ -155,7 +153,7 @@ fn sigusr1_finishes_the_request_in_flight_then_exits() {
 #[test]
 fn hard_stop_after_bounds_a_soft_stop() {
     let be = slow_backend(None);
-    let fe = free_addr();
+    let fe = common::reserve_addr();
     let mut ibex = Ibex::start(&http_config(fe, be, "  hard-stop-after 500ms\n"), fe);
 
     let mut client = TcpStream::connect(fe).expect("connect");
@@ -211,7 +209,7 @@ fn keepalive_backend() -> SocketAddr {
 #[test]
 fn an_idle_keepalive_connection_does_not_hold_a_soft_stop_open() {
     let be = keepalive_backend();
-    let fe = free_addr();
+    let fe = common::reserve_addr();
     let mut ibex = Ibex::start(&http_config(fe, be, ""), fe);
 
     let mut client = TcpStream::connect(fe).expect("connect");

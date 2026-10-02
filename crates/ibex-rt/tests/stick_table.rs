@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Integration tests for Milestone 2: Stick Table Engine & Runtime CLI Inspection.
 
+mod common;
+
 use ibex_config::ast::{
     BackendSection, Config, FrontendSection, Mode, Server, StickRule, StickRuleType,
     StickTableConfigAst,
@@ -14,12 +16,6 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-fn free_addr() -> SocketAddr {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = l.local_addr().expect("addr");
-    drop(l);
-    addr
-}
 
 fn start_dummy_backend(
     addr: SocketAddr,
@@ -58,8 +54,8 @@ fn start_dummy_backend(
 #[test]
 #[allow(clippy::too_many_lines)]
 fn test_stick_table_tracking_and_cli_show_table() {
-    let srv_addr = free_addr();
-    let fe_addr = free_addr();
+    let srv_addr = common::reserve_addr();
+    let fe_addr = common::reserve_addr();
 
     let running = Arc::new(AtomicBool::new(true));
     let h1 = start_dummy_backend(srv_addr, "OK_TRACKED", Arc::clone(&running));

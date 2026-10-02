@@ -41,6 +41,14 @@ VTC_RUNNER = REPO_ROOT / "harness" / "vtc_runner.py"
 os.environ["PATH"] = f"{Path.home()}/.cargo/bin:{os.environ.get('PATH', '')}"
 
 
+# Limits for the A/B against the reference build, both measured in alternating rounds of
+# the same run. Measured between identical builds (A/A, 2026-10-02): ibex CPU per request
+# at 50 connections within 0.3% (samples 2%), 1-conn requests/s within 3% (samples 10%:
+# mostly wake-up latency of three processes).
+AB_MAX_CPU_RISE_PCT = 4.0
+AB_MAX_DROP_PCT = 10.0
+
+
 class Verdict(Enum):
     PASS = "PASS"
     FAIL = "FAIL"
@@ -60,12 +68,42 @@ class MetricDelta:
     details: str = ""
 
 
+_HELD_PORT_LOCKS: List[Any] = []
+
+
 def get_free_port() -> int:
-    """Allocate an ephemeral TCP port on loopback."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+    """A loopback port nothing else in the test runs will be given.
+
+    Same scheme as crates/ibex-rt/tests/common/mod.rs, sharing its lock directory: a port
+    below the kernel's ephemeral range (so no connect() or bind(:0) is handed it between
+    our check and the proxy's bind), flock'ed until this process exits (so no concurrent
+    test or measurement takes it; ibex binds with SO_REUSEPORT, so a shared port does not
+    fail, it splits the traffic)."""
+    import fcntl
+    first, count = 20000, 12768
+    lock_dir = Path(tempfile.gettempdir()) / "ibex-test-ports"
+    lock_dir.mkdir(exist_ok=True)
+    start = (os.getpid() * 97) % count
+    for i in range(count):
+        port = first + (start + len(_HELD_PORT_LOCKS) + i) % count
+        f = open(lock_dir / str(port), "w")
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            f.close()
+            continue
+        try:
+            # Bound, not listening, SO_REUSEADDR: the way ibex binds, so a copy of this
+            # probe held by a concurrently forked child cannot make ibex's bind fail.
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind(("127.0.0.1", port))
+        except OSError:
+            f.close()
+            continue
+        _HELD_PORT_LOCKS.append(f)
+        return port
+    raise RuntimeError("no free test port")
 
 
 def get_git_info() -> Dict[str, Any]:
@@ -350,6 +388,174 @@ backend be
     return avg_rps, spread_info, cpu_pct
 
 
+def _git(*args: str) -> str:
+    return subprocess.run(["git", *args], cwd=REPO_ROOT, capture_output=True, text=True,
+                          check=True).stdout.strip()
+
+
+def reference_sha() -> str:
+    """The commit a throughput change is judged against.
+
+    `IBEX_MEASURE_REF` if set. Otherwise: off main, the merge-base with main (what the
+    branch would change); on main with uncommitted source changes, HEAD; on a clean main,
+    HEAD's first parent (what the last commit changed). `data/measurements.jsonl` does not
+    count as a change: every measurement run writes to it."""
+    if os.environ.get("IBEX_MEASURE_REF"):
+        return _git("rev-parse", os.environ["IBEX_MEASURE_REF"])
+    head = _git("rev-parse", "HEAD")
+    try:
+        main = _git("rev-parse", "main")
+    except subprocess.CalledProcessError:
+        main = head
+    if head != main:
+        return _git("merge-base", "HEAD", "main")
+    dirty = subprocess.run(["git", "diff", "--quiet", "HEAD", "--", ".",
+                            ":!data/measurements.jsonl"], cwd=REPO_ROOT).returncode != 0
+    return head if dirty else _git("rev-parse", "HEAD^")
+
+
+def ensure_reference_binary(sha: str, target_dir: Path) -> Path:
+    """A release ibex built from `sha`, cached under the target directory by commit."""
+    cache = target_dir / "measure-ref"
+    bin_path = cache / f"ibex-{sha[:12]}"
+    if bin_path.exists():
+        return bin_path
+    src = cache / "src"
+    cache.mkdir(parents=True, exist_ok=True)
+    if not (src / ".git").exists():
+        subprocess.run(["git", "worktree", "prune"], cwd=REPO_ROOT, capture_output=True)
+        _git("worktree", "add", "--detach", "-f", str(src), sha)
+    else:
+        subprocess.run(["git", "checkout", "-q", "--detach", "-f", sha], cwd=src, check=True,
+                       capture_output=True)
+    env = os.environ.copy()
+    env["CARGO_TARGET_DIR"] = str(cache / "target")
+    res = subprocess.run(["cargo", "build", "--release", "--bin", "ibex"], cwd=src, env=env,
+                         capture_output=True, text=True)
+    if res.returncode != 0:
+        raise RuntimeError(f"Failed to build reference ibex at {sha[:12]}: {res.stderr[-2000:]}")
+    shutil.copy2(cache / "target" / "release" / "ibex", bin_path)
+    # Keep the newest few reference binaries.
+    for old in sorted(cache.glob("ibex-*"), key=lambda q: q.stat().st_mtime)[:-4]:
+        old.unlink()
+    return bin_path
+
+
+def _cpu_ns(pid: int) -> int:
+    """CPU time all threads of a process have used, in nanoseconds.
+
+    `/proc/<pid>/schedstat` is the main thread alone; ibex runs its loop on a worker."""
+    total = 0
+    for task in os.listdir(f"/proc/{pid}/task"):
+        try:
+            with open(f"/proc/{pid}/task/{task}/schedstat") as f:
+                total += int(f.read().split()[0])
+        except OSError:
+            pass
+    return total
+
+
+def _wait_listening(port: int, proc: subprocess.Popen, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError(f"proxy exited with {proc.returncode} before listening")
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                return
+        except OSError:
+            time.sleep(0.02)
+    raise RuntimeError(f"proxy did not listen on {port} within {timeout}s")
+
+
+def measure_ab(cand_bin: Path, ref_bin: Path, target_dir: Path, rounds: int = 4,
+               latency_requests: int = 30000, load_conns: int = 50,
+               load_requests: int = 100000) -> Dict[str, Any]:
+    """Two builds in alternating rounds, ABBA order, one fresh proxy per sample.
+
+    Each sample measures two things on the same proxy:
+      * 1-connection requests/s: latency-bound, a request at a time;
+      * ibex CPU time per request under `load_conns` connections. Busy, ibex rarely sleeps,
+        so this is what a request costs. At one connection the CPU figure also moves with
+        how often ibex sleeps: 964e201 raised it 30% there by sleeping a quarter as often
+        (and gained 21% requests/s), while at 50 connections the two builds cost the same.
+
+    Machine load drifts over seconds; alternating puts both builds under the same drift, and
+    the median of each side discards a round a burst of load landed on."""
+    fe_port, be_port = get_free_port(), get_free_port()
+    bench_bin = ensure_parity_bench_binary(target_dir)
+    # Proxy, client and backend each on their own core, all three sharing one L3. Left to
+    # the scheduler, samples of one build split into two clusters ~25% apart (same L3 or
+    # not), and an A/A run differed by 6%.
+    cpus = os.environ.get("IBEX_MEASURE_CPUS", "4,5,6").split(",")
+    pin = (lambda i: ["taskset", "-c", cpus[i]]) if shutil.which("taskset") and len(cpus) >= 3 \
+        else (lambda i: [])
+    cfg = ("global\n    nbthread 1\n"
+           f"defaults\n    mode http\n    timeout client 10s\n    timeout server 10s\n"
+           f"    timeout connect 5s\nfrontend fe\n    bind 127.0.0.1:{fe_port}\n"
+           f"    default_backend be\nbackend be\n    server s1 127.0.0.1:{be_port}\n")
+    with tempfile.NamedTemporaryFile("w", suffix=".cfg", delete=False) as tf:
+        tf.write(cfg)
+        cfg_path = tf.name
+    rps: Dict[str, List[int]] = {"cand": [], "ref": []}
+    cpu: Dict[str, List[int]] = {"cand": [], "ref": []}
+
+    def fixed(addr: str, conns: int, n: int, what: str) -> float:
+        """Sends exactly `n` requests; returns the wall time."""
+        t0 = time.monotonic()
+        res = subprocess.run(pin(1) + [str(bench_bin), "fixed", addr, str(conns), str(n)],
+                             capture_output=True, text=True)
+        wall = time.monotonic() - t0
+        m = re.search(r"completed:\s*(\d+)", res.stdout)
+        if res.returncode != 0 or not m or int(m.group(1)) < n:
+            raise RuntimeError(f"{what}: {res.stdout!r} {res.stderr!r}")
+        return wall
+
+    be = subprocess.Popen(pin(2) + [str(bench_bin), "backend", str(be_port)],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        _wait_listening(be_port, be)
+        for r in range(rounds):
+            order = ["cand", "ref"] if r % 2 == 0 else ["ref", "cand"]
+            for side in order:
+                binary = cand_bin if side == "cand" else ref_bin
+                proc = subprocess.Popen(pin(0) + [str(binary), "-f", cfg_path],
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                try:
+                    _wait_listening(fe_port, proc)
+                    addr = f"127.0.0.1:{fe_port}"
+                    what = f"{side} round {r}"
+                    fixed(addr, 1, 5000, what + " warmup")
+                    rps[side].append(int(latency_requests / fixed(addr, 1, latency_requests, what)))
+                    before = _cpu_ns(proc.pid)
+                    fixed(addr, load_conns, load_requests, what)
+                    cpu[side].append(int((_cpu_ns(proc.pid) - before) / load_requests))
+                finally:
+                    proc.send_signal(signal.SIGUSR1)
+                    try:
+                        proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait()
+    finally:
+        be.terminate()
+        try:
+            be.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            be.kill()
+        os.remove(cfg_path)
+
+    def median(xs: List[int]) -> int:
+        ys = sorted(xs)
+        n = len(ys)
+        return ys[n // 2] if n % 2 else (ys[n // 2 - 1] + ys[n // 2]) // 2
+
+    return {"cand": median(rps["cand"]), "ref": median(rps["ref"]),
+            "cand_samples": rps["cand"], "ref_samples": rps["ref"],
+            "cand_ns": median(cpu["cand"]), "ref_ns": median(cpu["ref"]),
+            "cand_ns_samples": cpu["cand"], "ref_ns_samples": cpu["ref"]}
+
+
 def measure_60k_backends_memory(target_dir: Path) -> float:
     """Run request_allocations 60k backends test and return memory in MB."""
     env = os.environ.copy()
@@ -602,7 +808,19 @@ def check_regressions(
             deltas.append(MetricDelta("bytes_per_request", "Bytes / req", c, p, diff_str, status, is_reg, "B"))
 
     # 3. 1-conn Throughput
-    if "rps_1conn" in current and current["rps_1conn"] is not None:
+    if current.get("rps_1conn") is not None and current.get("rps_1conn_ref"):
+        # A/B: the base commit's build measured in the same run, rounds alternating, so
+        # both saw the same machine. The last record is not a baseline for throughput: it
+        # came from another moment's load, and a noisy one became everyone's baseline.
+        c, p = current["rps_1conn"], current["rps_1conn_ref"]
+        pct_diff = ((c - p) / p) * 100.0
+        is_reg = pct_diff < -AB_MAX_DROP_PCT
+        if is_reg:
+            has_regression = True
+        status = f"FAIL (>{AB_MAX_DROP_PCT:g}% below ref)" if is_reg else "PASS"
+        deltas.append(MetricDelta("rps_1conn", "1-conn Throughput", f"{c:,}", f"{p:,} (ref)",
+                                  f"{pct_diff:+.1f}%", status, is_reg, "req/s"))
+    elif "rps_1conn" in current and current["rps_1conn"] is not None:
         c = current["rps_1conn"]
         p = get_prev_val("rps_1conn")
         if p is None:
@@ -615,6 +833,17 @@ def check_regressions(
                 has_regression = True
             status = "FAIL (>15% drop)" if is_reg else "PASS"
             deltas.append(MetricDelta("rps_1conn", "1-conn Throughput", f"{c:,}", f"{p:,}", diff_str, status, is_reg, "req/s"))
+
+    # 3b. ibex CPU per request under 50 connections, A/B only.
+    if current.get("cpu_ns_per_req_50conn") is not None and current.get("cpu_ns_per_req_50conn_ref"):
+        c, p = current["cpu_ns_per_req_50conn"], current["cpu_ns_per_req_50conn_ref"]
+        pct_diff = ((c - p) / p) * 100.0
+        is_reg = pct_diff > AB_MAX_CPU_RISE_PCT
+        if is_reg:
+            has_regression = True
+        status = f"FAIL (>{AB_MAX_CPU_RISE_PCT:g}% above ref)" if is_reg else "PASS"
+        deltas.append(MetricDelta("cpu_ns_per_req_50conn", "50-conn ibex CPU / req", f"{c:,}",
+                                  f"{p:,} (ref)", f"{pct_diff:+.1f}%", status, is_reg, "ns"))
 
     # 4. 50-conn Throughput
     if "rps_50conn" in current and current["rps_50conn"] is not None:
@@ -816,11 +1045,22 @@ def main() -> int:
     record["binary_bytes"] = bin_bytes
     record["text_bytes"] = text_bytes
 
-    # Step 3: 1-connection throughput
-    print("[3/5] Measuring 1-connection keep-alive throughput (ibex rps_1conn)...")
-    rps_1, rps_1_spread, _ = measure_throughput("ibex", conns=1, target_dir=target_dir, ibex_bin=ibex_bin)
-    record["rps_1conn"] = rps_1
-    record["rps_1conn_spread"] = rps_1_spread
+    # Step 3: 1-connection throughput, A/B against the reference build
+    ref_sha = reference_sha()
+    print(f"[3/5] Measuring 1-connection keep-alive throughput, A/B against {ref_sha[:12]}...")
+    ref_bin = ensure_reference_binary(ref_sha, target_dir)
+    ab = measure_ab(ibex_bin, ref_bin, target_dir)
+    record["rps_1conn"] = ab["cand"]
+    record["rps_1conn_ref"] = ab["ref"]
+    record["rps_1conn_ref_sha"] = ref_sha
+    record["rps_1conn_samples"] = ab["cand_samples"]
+    record["rps_1conn_ref_samples"] = ab["ref_samples"]
+    record["cpu_ns_per_req_50conn"] = ab["cand_ns"]
+    record["cpu_ns_per_req_50conn_ref"] = ab["ref_ns"]
+    print(f"      this build {ab['cand_samples']} median {ab['cand']:,}; "
+          f"reference {ab['ref_samples']} median {ab['ref']:,}")
+    print(f"      ibex CPU ns/req at 50 conns: this build {ab['cand_ns_samples']} median {ab['cand_ns']:,}; "
+          f"reference {ab['ref_ns_samples']} median {ab['ref_ns']:,}")
 
     # Record system metrics
     record["load_1min"] = sys_info["load_1min"]

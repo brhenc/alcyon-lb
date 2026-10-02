@@ -2,8 +2,10 @@
 //! `monitor-uri` against the real binary. The expected bytes are what `HAProxy` 3.5 sends
 //! for the same configuration, captured from the reference binary.
 
+mod common;
+
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -32,7 +34,7 @@ fn ask(fe: std::net::SocketAddr, request_line: &str) -> String {
 
 #[test]
 fn monitor_uri_is_answered_by_the_proxy_with_haproxys_response() {
-    let fe = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+    let fe = common::reserve_addr();
     // No backend at all: a request that reached one would fail, so a 200 can only come
     // from the proxy itself.
     let mut cfg = tempfile::NamedTempFile::new().unwrap();

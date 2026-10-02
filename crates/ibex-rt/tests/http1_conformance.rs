@@ -8,6 +8,8 @@
     clippy::useless_vec
 )]
 
+mod common;
+
 use ibex_config::ast::{Config, ListenSection, Mode, Server};
 use ibex_rt::engine::Engine;
 use std::io::{Read, Write};
@@ -17,12 +19,6 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-fn free_addr() -> SocketAddr {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind free addr");
-    let addr = l.local_addr().expect("local addr");
-    drop(l);
-    addr
-}
 
 fn create_test_engine(proxy_addr: SocketAddr, srv_addr: SocketAddr) -> Engine {
     let config = Config {
@@ -50,8 +46,8 @@ fn create_test_engine(proxy_addr: SocketAddr, srv_addr: SocketAddr) -> Engine {
 
 #[test]
 fn test_rt_chunked_transfer_encoding() {
-    let srv_addr = free_addr();
-    let proxy_addr = free_addr();
+    let srv_addr = common::reserve_addr();
+    let proxy_addr = common::reserve_addr();
 
     let running = Arc::new(AtomicBool::new(true));
     let r_srv = Arc::clone(&running);
@@ -176,8 +172,8 @@ fn test_rt_chunked_transfer_encoding() {
 
 #[test]
 fn test_rt_keep_alive_50_plus_sequential_requests() {
-    let srv_addr = free_addr();
-    let proxy_addr = free_addr();
+    let srv_addr = common::reserve_addr();
+    let proxy_addr = common::reserve_addr();
 
     let running = Arc::new(AtomicBool::new(true));
     let r_srv = Arc::clone(&running);
@@ -287,8 +283,8 @@ fn test_rt_keep_alive_50_plus_sequential_requests() {
 
 #[test]
 fn test_rt_keep_alive_50_plus_pipelined_requests() {
-    let srv_addr = free_addr();
-    let proxy_addr = free_addr();
+    let srv_addr = common::reserve_addr();
+    let proxy_addr = common::reserve_addr();
 
     let running = Arc::new(AtomicBool::new(true));
     let r_srv = Arc::clone(&running);
@@ -395,8 +391,8 @@ fn test_rt_keep_alive_50_plus_pipelined_requests() {
 
 #[test]
 fn test_rt_http10_fallback_close_delimiter() {
-    let srv_addr = free_addr();
-    let proxy_addr = free_addr();
+    let srv_addr = common::reserve_addr();
+    let proxy_addr = common::reserve_addr();
 
     let running = Arc::new(AtomicBool::new(true));
     let r_srv = Arc::clone(&running);
@@ -477,8 +473,8 @@ fn test_rt_http10_fallback_close_delimiter() {
 
 #[test]
 fn test_rt_http_methods_suite() {
-    let srv_addr = free_addr();
-    let proxy_addr = free_addr();
+    let srv_addr = common::reserve_addr();
+    let proxy_addr = common::reserve_addr();
 
     let running = Arc::new(AtomicBool::new(true));
     let r_srv = Arc::clone(&running);
@@ -644,8 +640,8 @@ fn test_rt_http_methods_suite() {
 #[ignore = "asserts the lenient behaviour of the pre-parser data path; the h1 parser is \
             a baseline for the ported HTX parser, not something to conform this test to"]
 fn test_rt_header_boundary_edge_cases() {
-    let srv_addr = free_addr();
-    let proxy_addr = free_addr();
+    let srv_addr = common::reserve_addr();
+    let proxy_addr = common::reserve_addr();
 
     let running = Arc::new(AtomicBool::new(true));
     let r_srv = Arc::clone(&running);

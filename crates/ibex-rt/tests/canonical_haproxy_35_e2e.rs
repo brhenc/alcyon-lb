@@ -23,6 +23,8 @@
 //!    - Primary servers prioritized when active.
 //!    - Automatic failover to `app-backup` when active servers are down.
 
+mod common;
+
 use ibex_config::ast::{BalanceAlgorithm, Config, HttpReqAction, Mode, TcpReqConnAction};
 use ibex_proto::{parse_proxy_header, ProxyCommand, ProxyVersion, PP2_SIGNATURE};
 use ibex_rt::{Engine, ServerStatus};
@@ -152,9 +154,7 @@ impl CanonicalHarness {
         let static01 = MockServer::start("static-01");
         let static02 = MockServer::start("static-02");
 
-        let fe_l = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral fe");
-        let fe_addr = fe_l.local_addr().expect("fe local_addr");
-        drop(fe_l);
+        let fe_addr = common::reserve_addr();
 
         let raw_cfg = include_str!("../../../examples/canonical_haproxy_35.cfg");
         // The canonical config terminates TLS, and these tests speak plaintext to the

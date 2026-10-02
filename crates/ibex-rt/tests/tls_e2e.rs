@@ -8,6 +8,8 @@
 //! but the risk it guards has not moved. A listener on :443 that answers in cleartext,
 //! to clients that believe they negotiated TLS, is worse than one that is down.
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
@@ -24,13 +26,6 @@ fn ibex_bin() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_BIN_EXE_ibex"))
 }
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind")
-        .local_addr()
-        .expect("addr")
-        .port()
-}
 
 fn write_file(name: &str, body: &[u8]) -> std::path::PathBuf {
     let p = std::env::temp_dir().join(format!("ibex_tls_{}_{}", std::process::id(), name));
@@ -106,7 +101,7 @@ fn https_is_served_end_to_end() {
         }
     });
 
-    let port = free_port();
+    let port = common::reserve_port();
     let cfg = write_file(
         "e2e.cfg",
         format!(
@@ -168,7 +163,7 @@ fn https_is_served_end_to_end() {
 fn a_tls_port_does_not_answer_cleartext() {
     let (pem, _) = cert_bundle(&["localhost"]);
     let crt = write_file("cleartext.pem", pem.as_bytes());
-    let port = free_port();
+    let port = common::reserve_port();
     let cfg = write_file(
         "cleartext.cfg",
         format!(
@@ -207,7 +202,7 @@ fn a_missing_certificate_refuses_to_start() {
     if !bin.exists() {
         return;
     }
-    let port = free_port();
+    let port = common::reserve_port();
     let cfg = write_file(
         "missing.cfg",
         format!(
@@ -237,7 +232,7 @@ fn ssl_without_a_certificate_refuses_to_start() {
     if !bin.exists() {
         return;
     }
-    let port = free_port();
+    let port = common::reserve_port();
     let cfg = write_file(
         "nocrt.cfg",
         format!(
@@ -274,7 +269,7 @@ fn config_check_validates_certificates() {
     if !bin.exists() {
         return;
     }
-    let port = free_port();
+    let port = common::reserve_port();
     let cfg = write_file(
         "check.cfg",
         format!(
@@ -306,7 +301,7 @@ fn a_plaintext_bind_still_starts() {
     if !bin.exists() {
         return;
     }
-    let port = free_port();
+    let port = common::reserve_port();
     let cfg = write_file(
         "plain.cfg",
         format!(
@@ -356,7 +351,7 @@ fn h2_is_served_over_tls_end_to_end() {
         }
     });
 
-    let port = free_port();
+    let port = common::reserve_port();
     let cfg = write_file(
         "h2_e2e.cfg",
         format!(

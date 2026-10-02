@@ -5,6 +5,8 @@
 //! the old one to soft-stop with `-sf <pid>`. Everything that can go wrong is in the
 //! overlap, so these tests start two processes and look at what survives.
 
+mod common;
+
 use rustix::process::{kill_process, Pid, Signal};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -15,10 +17,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::NamedTempFile;
 
-fn free_addr() -> SocketAddr {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind");
-    l.local_addr().expect("addr")
-}
 
 /// A short socket path: `HAProxy` rejects anything over 97 bytes, and a tempdir path is
 /// easily longer than that.
@@ -144,7 +142,7 @@ fn write_cfg(text: &str) -> NamedTempFile {
 #[test]
 fn a_graceful_reload_keeps_the_port_and_the_stats_socket() {
     let be = backend();
-    let fe = free_addr();
+    let fe = common::reserve_addr();
     let sock = short_sock("graceful");
     let cfg = write_cfg(&config(fe, be, &sock, ""));
 
@@ -218,7 +216,7 @@ fn read_all(s: &mut TcpStream, within: Duration) -> String {
 fn a_reload_with_x_keeps_the_connections_queued_on_the_old_socket() {
     const QUEUED: usize = 5;
     let be = holding_backend(Duration::from_millis(1500));
-    let fe = free_addr();
+    let fe = common::reserve_addr();
     let sock = short_sock("hitless");
     let text = format!(
         "global\n  stats socket {} mode 600 level admin expose-fd listeners\n\
@@ -287,7 +285,7 @@ fn a_reload_with_x_keeps_the_connections_queued_on_the_old_socket() {
 #[test]
 fn x_against_a_process_that_does_not_expose_its_sockets_leaves_it_serving() {
     let be = backend();
-    let fe = free_addr();
+    let fe = common::reserve_addr();
     let sock = short_sock("noexpose");
     let cfg = write_cfg(&config(fe, be, &sock, ""));
 
@@ -426,7 +424,7 @@ fn start_notified(cfg: &Path, sink: &NotifySink, pidfile: &Path) -> Proc {
 #[test]
 fn sigusr2_reloads_and_hands_the_main_pid_to_the_new_process() {
     let be = backend();
-    let fe = free_addr();
+    let fe = common::reserve_addr();
     let sock = short_sock("usr2");
     let cfg = write_cfg(&config(fe, be, &sock, ""));
     let mut sink = NotifySink::new("usr2");
@@ -523,7 +521,7 @@ fn sigusr2_reloads_and_hands_the_main_pid_to_the_new_process() {
 #[test]
 fn a_reload_with_a_broken_config_leaves_the_old_process_serving() {
     let be = backend();
-    let fe = free_addr();
+    let fe = common::reserve_addr();
     let sock = short_sock("usr2bad");
     let cfg = write_cfg(&config(fe, be, &sock, ""));
     let mut sink = NotifySink::new("usr2bad");
@@ -566,7 +564,7 @@ fn a_reload_with_a_broken_config_leaves_the_old_process_serving() {
 #[test]
 fn a_reload_that_fails_after_loading_its_config_leaves_the_pidfile_alone() {
     let be = backend();
-    let fe = free_addr();
+    let fe = common::reserve_addr();
     let sock = short_sock("latefail");
     let cfg = write_cfg(&config(fe, be, &sock, ""));
     let mut sink = NotifySink::new("latefail");
@@ -609,7 +607,7 @@ fn a_reload_that_fails_after_loading_its_config_leaves_the_pidfile_alone() {
 #[test]
 fn sigusr2_without_w_is_ignored_not_fatal() {
     let be = backend();
-    let fe = free_addr();
+    let fe = common::reserve_addr();
     let sock = short_sock("nousr2");
     let cfg = write_cfg(&config(fe, be, &sock, ""));
     let mut p = Proc::start(cfg.path(), &[]);
@@ -630,8 +628,8 @@ fn sigusr2_without_w_is_ignored_not_fatal() {
 #[test]
 fn a_reload_that_drops_a_bind_closes_its_socket() {
     let be = backend();
-    let fe1 = free_addr();
-    let fe2 = free_addr();
+    let fe1 = common::reserve_addr();
+    let fe2 = common::reserve_addr();
     let sock = short_sock("dropbind");
     let mut sink = NotifySink::new("dropbind");
     let pidfile = short_sock("dropbind").with_extension("pid");

@@ -2,19 +2,15 @@
 // Integration tests for Ibex Modern Stats Dashboard & Web Admin UI.
 // Copyright (C) 2000-2026 Willy Tarreau and Ibex contributors. See LICENSE.
 
+mod common;
+
 use ibex_config::ast::{Config, ListenSection, Mode, Server, StatsConfig};
 use ibex_rt::{render_stats_html, Engine, ServerStatus};
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpStream};
 use std::thread;
 use std::time::{Duration, Instant};
 
-fn free_addr() -> SocketAddr {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = l.local_addr().expect("addr");
-    drop(l);
-    addr
-}
 
 fn send_http_request(proxy_addr: SocketAddr, engine: &mut Engine, req: &[u8]) -> String {
     let mut client = TcpStream::connect(proxy_addr).expect("client connect");
@@ -60,9 +56,9 @@ fn send_http_request(proxy_addr: SocketAddr, engine: &mut Engine, req: &[u8]) ->
 
 #[test]
 fn test_render_stats_html_helper_and_status_badges() {
-    let srv1_addr = free_addr();
-    let srv2_addr = free_addr();
-    let proxy_addr = free_addr();
+    let srv1_addr = common::reserve_addr();
+    let srv2_addr = common::reserve_addr();
+    let proxy_addr = common::reserve_addr();
 
     let config = Config {
         listens: vec![ListenSection {
@@ -130,8 +126,8 @@ fn test_render_stats_html_helper_and_status_badges() {
 
 #[test]
 fn test_stats_http_get_dashboard_and_csv() {
-    let srv1_addr = free_addr();
-    let proxy_addr = free_addr();
+    let srv1_addr = common::reserve_addr();
+    let proxy_addr = common::reserve_addr();
 
     let config = Config {
         listens: vec![ListenSection {
@@ -198,8 +194,8 @@ fn test_stats_http_get_dashboard_and_csv() {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn test_stats_server_state_and_weight_mutations() {
-    let srv1_addr = free_addr();
-    let proxy_addr = free_addr();
+    let srv1_addr = common::reserve_addr();
+    let proxy_addr = common::reserve_addr();
 
     let config = Config {
         listens: vec![ListenSection {
@@ -332,8 +328,8 @@ fn test_stats_server_state_and_weight_mutations() {
 
 #[test]
 fn test_stats_custom_uri_admin_stats() {
-    let srv_addr = free_addr();
-    let proxy_addr = free_addr();
+    let srv_addr = common::reserve_addr();
+    let proxy_addr = common::reserve_addr();
 
     let config = Config {
         listens: vec![ListenSection {

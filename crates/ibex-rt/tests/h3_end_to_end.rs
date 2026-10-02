@@ -81,6 +81,9 @@ fn spawn_echo_backend(stop: Arc<AtomicBool>) -> std::net::SocketAddr {
     addr
 }
 
+/// Known to flake rarely under a loaded parallel suite: 1 failure in 30 full-suite runs
+/// (2026-10-02), none in 48 runs alone. Cause not found; see `data/suite_baseline.json`
+/// (`known_flaky`). One red run is that; a repeatable failure is not.
 #[test]
 fn curl_http3_is_proxied_to_a_backend() {
     if !curl_has_http3() {

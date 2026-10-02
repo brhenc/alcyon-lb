@@ -60,6 +60,35 @@ class TestRegressionDetector(unittest.TestCase):
         self.assertEqual(verdict, Verdict.FAIL)
         self.assertTrue(any(d.name == "rps_1conn" and d.is_regression for d in deltas))
 
+    def test_throughput_is_judged_against_the_reference_build_of_the_same_run(self):
+        # An alternating A/B against the base commit's build measured in the same run.
+        # The last record does not matter: it may come from a noisier machine or moment.
+        previous = {"rps_1conn": 20000, "cpu_ns_per_req_50conn": 10000}
+        current = {"rps_1conn": 9200, "rps_1conn_ref": 10000,
+                   "cpu_ns_per_req_50conn": 41200, "cpu_ns_per_req_50conn_ref": 40000}
+        deltas, verdict = check_regressions(current, previous)
+        self.assertEqual(verdict, Verdict.PASS)
+
+        # Requests/s samples move 10% between identical builds; only a large drop fails.
+        current = {"rps_1conn": 8400, "rps_1conn_ref": 10000}
+        deltas, verdict = check_regressions(current, {"rps_1conn": 5000})
+        self.assertEqual(verdict, Verdict.FAIL)
+        d = next(d for d in deltas if d.name == "rps_1conn")
+        self.assertTrue(d.is_regression)
+        self.assertEqual(d.previous, "10,000 (ref)")
+
+    def test_cpu_per_request_is_the_tight_ab_check(self):
+        # ibex CPU per request at 50 connections varies about 2% between identical builds.
+        current = {"cpu_ns_per_req_50conn": 41800, "cpu_ns_per_req_50conn_ref": 40000}
+        deltas, verdict = check_regressions(current, {"cpu_ns_per_req_50conn": 99999})
+        self.assertEqual(verdict, Verdict.FAIL)
+        d = next(d for d in deltas if d.name == "cpu_ns_per_req_50conn")
+        self.assertTrue(d.is_regression)
+
+        current = {"cpu_ns_per_req_50conn": 41000, "cpu_ns_per_req_50conn_ref": 40000}
+        deltas, verdict = check_regressions(current, {"cpu_ns_per_req_50conn": 1})
+        self.assertEqual(verdict, Verdict.PASS)
+
     def test_binary_size_threshold(self):
         # <= 5% increase is PASS
         current = {"binary_bytes": 105000000}

@@ -9,6 +9,7 @@ use rustix::net::{
     self, AddressFamily, Ipv4Addr, Ipv6Addr, SocketAddrAny, SocketAddrV4, SocketAddrV6,
     SocketFlags, SocketType,
 };
+use std::cell::Cell;
 use std::io;
 use std::net::SocketAddr;
 use std::os::fd::{BorrowedFd, OwnedFd};
@@ -26,6 +27,20 @@ pub enum Io {
     Closed,
 }
 
+thread_local! {
+    static READS: Cell<u64> = const { Cell::new(0) };
+    static READS_BLOCKED: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Read syscalls [`recv`] has made on this thread, and how many of them the kernel
+/// answered with `EAGAIN`: a read made before the poller said there was anything to
+/// read. `HAProxy` makes almost none of the second kind (`fd_cant_recv`); the counts are
+/// how a test holds Ibex to that.
+#[must_use]
+pub fn read_counters() -> (u64, u64) {
+    (READS.with(Cell::get), READS_BLOCKED.with(Cell::get))
+}
+
 /// Reads into `buf`.
 ///
 /// `EAGAIN` becomes [`Io::WouldBlock`] rather than an error, `Ok(0)` becomes [`Io::Eof`],
@@ -39,10 +54,14 @@ pub fn recv(fd: BorrowedFd<'_>, buf: &mut [u8]) -> io::Result<Io> {
     if buf.is_empty() {
         return Ok(Io::Done(0));
     }
+    READS.with(|c| c.set(c.get() + 1));
     match rustix::io::read(fd, buf) {
         Ok(0) => Ok(Io::Eof),
         Ok(n) => Ok(Io::Done(n)),
-        Err(Errno::AGAIN | Errno::INTR) => Ok(Io::WouldBlock),
+        Err(Errno::AGAIN | Errno::INTR) => {
+            READS_BLOCKED.with(|c| c.set(c.get() + 1));
+            Ok(Io::WouldBlock)
+        }
         Err(Errno::CONNRESET | Errno::PIPE | Errno::NOTCONN | Errno::TIMEDOUT) => Ok(Io::Closed),
         Err(e) => Err(e.into()),
     }

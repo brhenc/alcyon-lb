@@ -7,8 +7,10 @@
 //! itself when no server can take the request; `HAProxy` looks for it in the backend's
 //! pages, then the frontend's (`http_error_message`, `src/http_ana.c`).
 
+mod common;
+
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpStream};
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -50,7 +52,7 @@ fn page(raw: &str) -> NamedTempFile {
 /// Starts ibex on `cfg`, where `{fe}` is the listening address and `{0}`, `{1}`, ... are the
 /// paths of `pages`.
 fn start(cfg: &str, pages: Vec<NamedTempFile>) -> (Ibex, SocketAddr) {
-    let fe = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+    let fe = common::reserve_addr();
     let mut text = cfg.replace("{fe}", &fe.to_string());
     for (i, p) in pages.iter().enumerate() {
         text = text.replace(&format!("{{{i}}}"), &p.path().display().to_string());

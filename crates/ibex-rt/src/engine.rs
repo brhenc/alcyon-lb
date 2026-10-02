@@ -443,6 +443,10 @@ pub struct Engine {
     pub cli_listener: Option<UnixListener>,
     pub cli_socket_path: Option<PathBuf>,
     pub start_time: Instant,
+    /// This process's id, read once: `std::process::id()` is a `getpid` syscall, and the
+    /// dispatcher wants it on every step. Nothing forks after an engine is built (`-D`
+    /// re-executes before any is).
+    pid: u32,
     pub now: Tick,
     pub is_running: bool,
     pub worker_id: usize,
@@ -1239,6 +1243,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             cli_listener: None,
             cli_socket_path: None,
             start_time,
+            pid: std::process::id(),
             now,
             is_running: true,
             worker_id,
@@ -1457,7 +1462,9 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     self.accept_from_cli_listener();
                 }
                 FdState::Conn { task, conn: _ } => {
-                    self.fdtab.set_ready(ev.fd, ev.readable, ev.writable);
+                    // A hang-up or error is news for a reader too: the read that finds it
+                    // must not be skipped by a socket marked drained (`cli_cant_recv`).
+                    self.fdtab.set_ready(ev.fd, ev.readable || ev.closed, ev.writable);
                     self.scheduler
                         .tasklet_wakeup(task, Class::Urgent, state::WOKEN_IO);
                 }
@@ -1491,7 +1498,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         self.sync_quic_backend_fds();
 
         // 5. Run runnable tasks through Dispatch
-        let pid = std::process::id();
+        let pid = self.pid;
         let total_tasks = self.scheduler.live_tasks();
         let run_queue_len = self.scheduler.run_queue_len();
 
@@ -3785,12 +3792,17 @@ impl EngineDispatcher<'_> {
             // Step 1: Server connect check if connecting
             check_srv_connect(entry, self.proxies, self.fdtab, self.poller, now);
 
-            // A readiness event on the server socket: reading it may make progress again.
+            // A readiness event on either socket: reading it may make progress again.
             if let Some(sfd) = entry.srv_raw_fd {
                 if self.fdtab.ready(sfd).readable {
                     entry.sess.srv_cant_recv = false;
                     self.fdtab.clear_ready(sfd, true, false);
                 }
+            }
+            let cfd = entry.sess.cli.as_raw_fd();
+            if self.fdtab.ready(cfd).readable {
+                entry.sess.cli_cant_recv = false;
+                self.fdtab.clear_ready(cfd, true, false);
             }
 
             // Step 2: Check timeouts

@@ -483,59 +483,20 @@ pub fn render(stats: &StatsSnapshot, out: &mut String) {
         }
     }
 
-    out.push_str("# HELP haproxy_server_check_failures_total Total number of failed individual health checks per server/backend, since the worker process started\n");
-    out.push_str("# TYPE haproxy_server_check_failures_total counter\n");
-    for (p_idx, proxy) in stats.proxies.iter().enumerate() {
-        for s_idx in 0..proxy.servers.len() {
-            let srv_name = if s_idx < proxy.server_ids.len() {
-                &proxy.server_ids[s_idx]
-            } else {
-                "srv"
-            };
-            let _check_state = stats
-                .checks
-                .iter()
-                .find(|c| c.proxy_idx == p_idx && c.server_idx == s_idx);
-            let _ = writeln!(
-                out,
-                "haproxy_server_check_failures_total{{proxy=\"{0}\",server=\"{1}\"}} {2}",
-                proxy.name,
-                srv_name,
-                if let Some(c) = _check_state {
-                    c.failed_checks
-                } else {
-                    0
-                }
-            );
-        }
-    }
-
-    out.push_str("# HELP haproxy_server_check_up_down_total Total number of failed checks causing UP to DOWN server transitions, per server/backend, since the worker process started\n");
-    out.push_str("# TYPE haproxy_server_check_up_down_total counter\n");
-    for (p_idx, proxy) in stats.proxies.iter().enumerate() {
-        for s_idx in 0..proxy.servers.len() {
-            let srv_name = if s_idx < proxy.server_ids.len() {
-                &proxy.server_ids[s_idx]
-            } else {
-                "srv"
-            };
-            let _check_state = stats
-                .checks
-                .iter()
-                .find(|c| c.proxy_idx == p_idx && c.server_idx == s_idx);
-            let _ = writeln!(
-                out,
-                "haproxy_server_check_up_down_total{{proxy=\"{0}\",server=\"{1}\"}} {2}",
-                proxy.name,
-                srv_name,
-                if let Some(c) = _check_state {
-                    c.down_transitions
-                } else {
-                    0
-                }
-            );
-        }
-    }
+    write_check_counter(
+        out,
+        stats,
+        "haproxy_server_check_failures_total",
+        "Total number of failed individual health checks per server/backend, since the worker process started",
+        |c| c.failed_checks,
+    );
+    write_check_counter(
+        out,
+        stats,
+        "haproxy_server_check_up_down_total",
+        "Total number of failed checks causing UP to DOWN server transitions, per server/backend, since the worker process started",
+        |c| c.down_transitions,
+    );
 
     out.push_str("# HELP haproxy_server_limit_sessions Frontend/listener/server's maxconn, backend's fullconn\n");
     out.push_str("# TYPE haproxy_server_limit_sessions gauge\n");
@@ -620,6 +581,42 @@ pub fn render(stats: &StatsSnapshot, out: &mut String) {
                 "haproxy_server_status{{{{proxy=\"{0}\",server=\"{1}\",state=\"NOLB\"}}}} 0",
                 proxy.name, srv_name
             );
+        }
+    }
+}
+
+
+/// A per-server health-check counter. A server without `check` has none: `HAProxy` leaves
+/// the field empty (`stats-proxy.c`, `ST_I_PX_CHKFAIL`/`ST_I_PX_CHKDOWN`) and prints `NaN`,
+/// and promex types the family by the first value it prints, so the family is a `gauge`
+/// when the first server has no check (measured, HAProxy 3.5-dev7).
+fn write_check_counter(
+    out: &mut String,
+    stats: &StatsSnapshot<'_>,
+    family: &str,
+    help: &str,
+    value: impl Fn(&ServerCheckState) -> u64,
+) {
+    let check = |p_idx: usize, s_idx: usize| {
+        stats.checks.iter().find(|c| c.proxy_idx == p_idx && c.server_idx == s_idx)
+    };
+    let first = stats
+        .proxies
+        .iter()
+        .enumerate()
+        .find(|(_, p)| !p.servers.is_empty())
+        .map(|(p_idx, _)| check(p_idx, 0).is_some());
+    let kind = if first == Some(false) { "gauge" } else { "counter" };
+    let _ = writeln!(out, "# HELP {family} {help}");
+    let _ = writeln!(out, "# TYPE {family} {kind}");
+    for (p_idx, proxy) in stats.proxies.iter().enumerate() {
+        for s_idx in 0..proxy.servers.len() {
+            let srv_name = proxy.server_ids.get(s_idx).map_or("srv", String::as_str);
+            let _ = write!(out, "{family}{{proxy=\"{0}\",server=\"{srv_name}\"}} ", proxy.name);
+            let _ = match check(p_idx, s_idx) {
+                Some(c) => writeln!(out, "{}", value(c)),
+                None => writeln!(out, "NaN"),
+            };
         }
     }
 }

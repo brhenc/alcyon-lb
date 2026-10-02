@@ -5,6 +5,8 @@
 //! The in-process tests in `client_keepalive.rs` passed while the binary failed both of
 //! these, so these drive `CARGO_BIN_EXE_ibex` over real sockets.
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
@@ -71,7 +73,7 @@ fn stop(child: &mut Child) {
 }
 
 fn start(be: SocketAddr, frontend_extra: &str) -> (Ibex, SocketAddr) {
-    let fe = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+    let fe = common::reserve_addr();
     let mut f = NamedTempFile::new().expect("tmp");
     write!(
         f,
@@ -218,7 +220,7 @@ fn read_for(c: &mut TcpStream, quiet: Duration) -> String {
 /// transaction ended, and the session ran it again.
 #[test]
 fn a_generated_503_answers_its_request_once_and_keeps_the_connection() {
-    let fe = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+    let fe = common::reserve_addr();
     let mut f = NamedTempFile::new().expect("tmp");
     write!(
         f,

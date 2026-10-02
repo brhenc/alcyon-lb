@@ -143,11 +143,16 @@ pub struct TcpSession {
     /// The HTTP transaction in progress: `None` between requests, and always in `mode
     /// tcp`. What may be forwarded in each direction is decided by its message states.
     pub txn: Option<HttpTxn>,
-    /// A read on the server would just block, so it is not tried again until the poller
-    /// reports the socket readable (`HAProxy`'s `fd_cant_recv`). HTTP only: those sessions
-    /// are always driven by the engine, which clears it on a readiness event; a TCP
-    /// session may be driven without a poller and keeps reading speculatively.
+    /// The server socket is drained, so it is not read again until the poller reports it
+    /// readable (`HAProxy`'s `fd_cant_recv`): set by a read that returned `EAGAIN` or
+    /// fewer bytes than asked for (`src/raw_sock.c`). HTTP over plain sockets only: those
+    /// sessions are always driven by the engine, which clears it on a readiness event; a
+    /// TCP session may be driven without a poller and keeps reading speculatively, and
+    /// TLS may hold decrypted bytes the socket no longer shows.
     pub srv_cant_recv: bool,
+    /// The same for the client socket. Without it every pass over the session read the
+    /// client again, eight `EAGAIN` reads per keep-alive request (`performance.md`).
+    pub cli_cant_recv: bool,
     pub created_at: Instant,
     pub pending_resp: Option<(Vec<u8>, usize)>,
     pub fc_src: Option<SocketAddr>,
@@ -239,6 +244,7 @@ impl TcpSession {
             send_proxy_prepended: false,
             txn: None,
             srv_cant_recv: false,
+            cli_cant_recv: false,
             created_at: Instant::now(),
             bufsize: crate::buf::get_bufsize(),
             maxrewrite: 1024,
@@ -489,6 +495,11 @@ impl TcpSession {
         self.mode != Mode::Http || self.txn.as_ref().is_none_or(|t| !t.local && t.error.is_none())
     }
 
+    /// Whether the client side keeps `cli_cant_recv` (see `srv_cant_recv` for the rule).
+    fn polls_cli(&self) -> bool {
+        self.mode == Mode::Http && !self.cli_xprt.is_tls()
+    }
+
     /// Answers the current request with `raw`, a complete response the proxy built
     /// itself. `HAProxy`'s `http_reply_message`: the rest of the request is dropped, the
     /// response replaces anything in `rep`, and the transaction ends when it has been
@@ -585,8 +596,7 @@ impl TcpSession {
     /// Runs the configured parser over a complete request head.
     ///
     /// # Errors
-    /// A framing violation: conflicting or malformed `Content-Length` /
-    /// `Transfer-Encoding`, a bare CR as a line terminator, an invalid header name, or a
+    /// A framing violation: a malformed `Content-Length` / `Transfer-Encoding`, a bare CR as a line terminator, an invalid header name, or a
     /// malformed chunk size. Each of these is a way for two intermediaries to read the
     /// same bytes as different requests.
     fn validate_request_head(&mut self, head_len: usize) -> io::Result<bool> {
@@ -596,21 +606,23 @@ impl TcpSession {
         let raw = self.htx_buf.raw_slice_mut();
         let mut slice = ibex_proto::htx::HtxSlice::new(raw);
         stream.parse(&self.req.readable()[..head_len], &mut slice)?;
-        let close = stream.connection_close();
-        if stream.framing_conflict() {
-            // RFC 9112: Transfer-Encoding wins and the connection must not be reused.
-            // The message is parseable, so this is not an error -- but forwarding it to a
-            // backend that might resolve the conflict the other way is the whole attack.
-            self.ending.get_or_insert(Ending::Error);
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "conflicting Content-Length and Transfer-Encoding",
-            ));
+        let mut close = stream.connection_close();
+        // `Content-Length` beside `Transfer-Encoding`: forwarded as HAProxy does
+        // (`src/h1.c`, `h1_parse_msg_hdrs`, "T-E + C-L: force close and remove C-L"). The
+        // chunked encoding frames the body, the `Content-Length` is removed so no next hop
+        // can frame it by the length instead -- the smuggling this would otherwise be --
+        // and the connection closes after the response (RFC 9112 section 6.3, rule 3).
+        // tasks/T89; the user chose to follow HAProxy over refusing.
+        let conflict = stream.framing_conflict();
+        if conflict {
+            slice.remove_header("content-length");
+            close = true;
         }
         self.htx_tail = slice.tail_addr();
         self.htx_blocks = slice.num_blocks();
         self.has_htx = true;
-        self.htx_modified = false;
+        // Modified, so the head forwarded is regenerated from the HTX, without it.
+        self.htx_modified = conflict;
         Ok(close)
     }
 
@@ -644,9 +656,11 @@ impl TcpSession {
                 h2.flood_config = self.h2_flood_config;
                 self.h2_ctx = Some(h2);
             }
-            if self.cli_state.can_read() {
+            if self.cli_state.can_read() && !self.cli_cant_recv {
                 let mut raw_buf = [0u8; 16384];
-                match self.cli_xprt.recv(self.cli.as_fd(), &mut raw_buf)? {
+                let r = self.cli_xprt.recv(self.cli.as_fd(), &mut raw_buf)?;
+                self.cli_cant_recv = self.polls_cli() && drained(r, raw_buf.len());
+                match r {
                     Io::Eof => {
                         raw::shutdown_read(self.cli.as_fd());
                         self.cli_state = match self.cli_state {
@@ -673,9 +687,12 @@ impl TcpSession {
         } else {
             // Read from the client into the request buffer while reading is permitted
             // and buffer space exists. Backpressure stops reads when full.
-            if self.cli_state.can_read() && !self.req.is_full() {
+            if self.cli_state.can_read() && !self.req.is_full() && !self.cli_cant_recv {
                 let dst = self.req.writable();
-                match self.cli_xprt.recv(self.cli.as_fd(), dst)? {
+                let asked = dst.len();
+                let r = self.cli_xprt.recv(self.cli.as_fd(), dst)?;
+                self.cli_cant_recv = self.polls_cli() && drained(r, asked);
+                match r {
                     Io::Eof => {
                         raw::shutdown_read(self.cli.as_fd());
                         self.cli_state = match self.cli_state {
@@ -866,10 +883,9 @@ impl TcpSession {
                 // will parse almost anything and forwards the headers verbatim. That is
                 // how a request carrying both `Content-Length` and `Transfer-Encoding`
                 // reached a backend with both headers intact and a second request behind
-                // them -- textbook CL.TE smuggling. (HAProxy 3.5 forwards that one with the
-                // chunked framing and closes after; Ibex refuses it: tasks/T89.)
-                // `h1.rs` has rejected that since the strict-framing work; nothing on
-                // this path was asking it.
+                // them -- textbook CL.TE smuggling. Such a request is now forwarded the
+                // way HAProxy forwards it: chunked, without the `Content-Length`, closing
+                // after (see `validate_request_head`, tasks/T89).
                 //
                 // The head is already buffered, so this is a complete message and the
                 // stream needs no state across calls. One allocation per request head
@@ -1223,7 +1239,10 @@ impl TcpSession {
                     .map(AsFd::as_fd)
                     .ok_or_else(|| io::Error::from(io::ErrorKind::NotConnected))?;
                 let dst = self.rep.writable();
-                self.srv_xprt.recv(sfd, dst)?
+                let asked = dst.len();
+                let r = self.srv_xprt.recv(sfd, dst)?;
+                self.srv_cant_recv = self.mode == Mode::Http && !self.srv_xprt.is_tls() && drained(r, asked);
+                r
             };
             match r {
                 Io::Eof => {
@@ -1246,9 +1265,6 @@ impl TcpSession {
                 Io::Done(n) if n > 0 => {
                     self.rep.commit(n);
                     changed = true;
-                }
-                Io::WouldBlock if self.mode == Mode::Http && !self.srv_xprt.is_tls() => {
-                    self.srv_cant_recv = true;
                 }
                 Io::Done(_) | Io::WouldBlock => {}
             }
@@ -1452,6 +1468,18 @@ impl TcpSession {
             _ => Want::default(),
         };
         (cli, srv)
+    }
+}
+
+/// Whether a read that asked for `asked` bytes and got `r` left the socket drained, so
+/// that reading it again before the poller reports it readable would only return
+/// `EAGAIN`. A short read is enough: `HAProxy` stops there too (`raw_sock_to_buf`), and an
+/// EOF behind the data is announced by `EPOLLRDHUP`.
+fn drained(r: Io, asked: usize) -> bool {
+    match r {
+        Io::WouldBlock => true,
+        Io::Done(n) => n < asked,
+        Io::Eof | Io::Closed => false,
     }
 }
 

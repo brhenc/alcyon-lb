@@ -1,0 +1,110 @@
+//! Shared helpers for the ibex-rt integration tests.
+//!
+//! Each test file that uses this says `mod common;`; not every file uses every helper.
+#![allow(dead_code)]
+
+use std::fs::File;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::Mutex;
+
+/// Ports handed out by [`reserve_addr`]: below the kernel's ephemeral range
+/// (`/proc/sys/net/ipv4/ip_local_port_range`, 32768-60999 by default).
+const FIRST: u16 = 20000;
+const COUNT: u16 = 12768;
+
+/// Lock files held until the process exits.
+static HELD: Mutex<Vec<File>> = Mutex::new(Vec::new());
+
+/// A loopback address on which the test can start a listener, for example the frontend
+/// of an ibex it is about to spawn.
+///
+/// Picking a port by binding `:0`, dropping the listener and binding again later loses a
+/// race. Between the drop and the rebind, the kernel can hand the same port to any
+/// `connect()` or `bind(:0)` in the test run, and the proxy then fails to start. And
+/// because ibex binds with `SO_REUSEPORT`, two proxies given the same port can both
+/// start, so one test's requests reach another test's proxy. Both happened in the suite.
+///
+/// So a port here:
+/// * comes from below the ephemeral range, so the kernel never assigns it to anyone;
+/// * is exclusively `flock`ed under the temp directory, so no other test in this
+///   process or in a concurrently running test process (another worktree, an oracle run)
+///   is given it. The lock is held until the process exits, and the kernel drops it then,
+///   even after a crash;
+/// * was bindable at the moment it was handed out, which skips ports that something
+///   outside the tests is using.
+pub fn reserve_addr() -> SocketAddr {
+    static NEXT: AtomicU16 = AtomicU16::new(0);
+    let dir = std::env::temp_dir().join("ibex-test-ports");
+    std::fs::create_dir_all(&dir).expect("create the port lock directory");
+    // Start each process somewhere different so concurrent runs rarely contend for a lock.
+    let start = u16::try_from(std::process::id().wrapping_mul(97) % u32::from(COUNT)).unwrap_or(0);
+    for _ in 0..COUNT {
+        let i = NEXT.fetch_add(1, Ordering::Relaxed) % COUNT;
+        let port = FIRST + (start + i) % COUNT;
+        let Ok(file) = File::create(dir.join(port.to_string())) else { continue };
+        if rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive).is_err() {
+            continue;
+        }
+        let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
+        if !bindable(addr) {
+            continue; // in use by something outside the tests
+        }
+        HELD.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(file);
+        return addr;
+    }
+    panic!("no free test port in {FIRST}..{}", FIRST + COUNT);
+}
+
+/// Whether `addr` can be bound, checked the way ibex binds (`SO_REUSEADDR`) and without
+/// listening.
+///
+/// `TcpListener::bind` listens. A test that spawns a process at that moment forks a child
+/// holding a copy of every open descriptor until it execs, so the probe could outlive its
+/// drop by a few hundred microseconds, still listening, and ibex's bind then failed with
+/// `EADDRINUSE` (traced in `tcp_proxy` under concurrent runs). A socket that is only bound
+/// does not conflict with a later `SO_REUSEADDR` bind, wherever copies of it live.
+fn bindable(addr: SocketAddr) -> bool {
+    use rustix::net::{AddressFamily, SocketFlags, SocketType};
+    let Ok(fd) = rustix::net::socket_with(AddressFamily::INET, SocketType::STREAM, SocketFlags::CLOEXEC, None)
+    else {
+        return false;
+    };
+    rustix::net::sockopt::set_socket_reuseaddr(&fd, true).is_ok() && rustix::net::bind(&fd, &addr).is_ok()
+}
+
+/// The port of [`reserve_addr`].
+pub fn reserve_port() -> u16 {
+    reserve_addr().port()
+}
+
+/// Steps an in-process engine until `done` holds, for up to two seconds.
+///
+/// A fixed number of steps is a guess at how long the kernel takes to deliver a connection
+/// to the listener, and on a loaded machine (the whole suite runs in parallel) the guess is
+/// short. Returns whether `done` held; the caller asserts on the value it wanted, so a real
+/// failure still reports what it saw.
+pub fn drive_until(engine: &mut ibex_rt::engine::Engine, mut done: impl FnMut(&ibex_rt::engine::Engine) -> bool) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        let _ = engine.run_once();
+        if done(engine) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    false
+}
+
+/// Waits up to five seconds for something to accept connections on `addr`. The probe
+/// connection is closed without sending anything.
+pub fn wait_listening(addr: SocketAddr) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(200)).is_ok() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    false
+}

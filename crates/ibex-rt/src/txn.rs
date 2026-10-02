@@ -255,8 +255,8 @@ fn chunked(head: &str) -> bool {
 }
 
 /// How a request body is framed, from its head. A request without a length has no body
-/// (RFC 9112 section 6.3, rule 7). Conflicting `Content-Length`/`Transfer-Encoding` is
-/// rejected by the parser before this is asked.
+/// (RFC 9112 section 6.3, rule 7). `Transfer-Encoding` wins over `Content-Length`; the
+/// proxy removes the `Content-Length` of such a request before this is asked.
 #[must_use]
 pub fn request_framing(head: &[u8]) -> Framing {
     let head = String::from_utf8_lossy(head);

@@ -400,11 +400,8 @@ fn a_request_with_acl_and_log_format_allocates_no_more_than_n_times() {
 fn pooled_buf_lifecycle_has_zero_allocations() {
     let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
-    // TODO(T45): The zero-allocation bound is correct, but this test can sporadically go red
-    // in parallel rounds. `ibex_alloc::alloc_counters()` is a process-global counter,
-    // so it counts allocations from background threads (like `start_dummy_http_backend`) 
-    // spawned by earlier tests. Even with `be.join()`, OS-level thread cleanup can bleed 
-    // allocations into this test. Leaving the test as-is to track the need for a thread-local allocator mock.
+    // Counted on this thread only: the process-wide counters also saw the backend threads
+    // of the other tests in this binary, and this test went red at random (T45).
 
     // 1. Warm-up buffer pool
     {
@@ -412,14 +409,14 @@ fn pooled_buf_lifecycle_has_zero_allocations() {
     }
 
     // 2. Measure lifecycle of a pooled buffer
-    let before = ibex_alloc::alloc_counters();
+    let before = ibex_alloc::thread_alloc_counters();
     {
         let mut b = ibex_rt::buf::Buf::with_capacity(ibex_rt::buf::BUFSIZE);
         b.writable()[..4].copy_from_slice(b"test");
         b.commit(4);
         assert_eq!(b.readable(), b"test");
     }
-    let after = ibex_alloc::alloc_counters();
+    let after = ibex_alloc::thread_alloc_counters();
 
     let diff = before.diff(&after);
     assert_eq!(

@@ -64,9 +64,20 @@ fn differential_test() {
     promex::render(&stats, &mut ibex_out);
     
     let ibex_metrics = parse_prom_metrics(&ibex_out);
+
+    // A server without `check` has no check counters: HAProxy leaves the field empty
+    // (stats-proxy.c, ST_I_PX_CHKFAIL/CHKDOWN), prints NaN, and the family takes its type
+    // from that empty value, gauge. Measured with HAProxy 3.5-dev7 (see the oracle file).
+    for family in ["haproxy_server_check_failures_total", "haproxy_server_check_up_down_total"] {
+        let line = format!("{family}{{proxy=\"be_http\",server=\"s1\"}} NaN");
+        assert!(ibex_out.contains(&line), "expected `{line}` in:\n{ibex_out}");
+    }
     
-    // Read the pre-generated oracle metrics for comparison
-    let oracle_str = std::fs::read_to_string("/tmp/oracle_metrics.txt").expect("Run oracle first");
+    // The oracle, captured from HAProxy and kept with the tests (how: see the file's header).
+    // It was read from /tmp/oracle_metrics.txt, which nothing in the repository wrote, so the
+    // test failed on every machine but the one it was written on.
+    let oracle_str = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/promex_oracle_types.txt"))
+        .expect("read the promex oracle");
     let oracle_metrics = parse_prom_metrics(&oracle_str);
     
     let mut missing_in_ibex = Vec::new();
@@ -89,6 +100,41 @@ fn differential_test() {
     println!("---------------------------------------------------");
     println!("Ibex emits {} metrics.", ibex_metrics.len());
     println!("HAProxy emits {} metrics.", oracle_metrics.len());
+}
+
+/// With `check` on the server the counters exist: a number, and the family is a counter
+/// (`ST_I_PX_CHKFAIL`/`CHKDOWN` are `FN_COUNTER` in stats-proxy.c).
+#[test]
+fn check_counters_of_a_checked_server_are_counters() {
+    let mut srv = Server::new("s1", "127.0.0.1:8080".parse().unwrap());
+    srv.check = true;
+    let config = Config {
+        backends: vec![BackendSection {
+            name: "be_http".into(),
+            mode: Mode::Http,
+            servers: vec![srv],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let engine = Engine::new(&config, 64).expect("Engine::new");
+    let stats = promex::StatsSnapshot {
+        proxies: &engine.proxies,
+        checks: &engine.checks,
+        start_time: engine.start_time,
+        pid: 1,
+        total_tasks: 0,
+        run_queue_len: 0,
+        active_conns: 0,
+        max_conns: 0,
+    };
+    let mut out = String::new();
+    promex::render(&stats, &mut out);
+    for family in ["haproxy_server_check_failures_total", "haproxy_server_check_up_down_total"] {
+        assert!(out.contains(&format!("# TYPE {family} counter\n")), "{family} type in:\n{out}");
+        let line = format!("{family}{{proxy=\"be_http\",server=\"s1\"}} 0\n");
+        assert!(out.contains(&line), "expected `{line}` in:\n{out}");
+    }
 }
 
 #[global_allocator]
