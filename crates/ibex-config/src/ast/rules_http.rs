@@ -3,6 +3,7 @@
 
 #[allow(unused_imports)]
 use super::*;
+use std::cell::RefCell;
 
 /// Modern HTTP-request action.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,9 +24,21 @@ pub enum HttpReqAction {
         status: u16,
         content_type: Option<String>,
         lf_string: Option<String>,
+        /// `default-errorfiles`/`errorfile`/`errorfiles`: use the proxy's configured
+        /// error page for `status` instead of the dummy/templated body above.
+        error_page: Option<ErrorPageSource>,
     },
     Deny {
         deny_status: Option<u16>,
+        /// Templated response payload, same encoding as `Return::content_type`.
+        content_type: Option<String>,
+        /// Templated response payload, same encoding as `Return::lf_string`.
+        lf_string: Option<String>,
+        /// `default-errorfiles`/`errorfile`/`errorfiles`: use the proxy's configured
+        /// error page for the deny status instead of the templated body above. HAProxy
+        /// implies this when `deny` carries no body argument at all (or only
+        /// `deny_status`), so the parser sets it in that case too.
+        error_page: Option<ErrorPageSource>,
     },
     Allow,
     SetHeader {
@@ -161,5 +174,66 @@ pub enum HttpAfterResAction {
 pub struct HttpAfterResRule {
     pub action: HttpAfterResAction,
     pub cond: Option<AclCondition>,
+}
+
+/// Source of a custom error page, as selected by `default-errorfiles`, `errorfile
+/// <file>`, or `errorfiles <name>` on `http-request return`/`deny`, or by `http-error`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ErrorPageSource {
+    /// `default-errorfiles`: use the proxy's own configured error page for this status
+    /// (an `http-error` override if any, else an `errorfile`/`errorfiles` entry, else
+    /// HAProxy's built-in page for the code), rather than a page named by this rule.
+    DefaultErrorfiles,
+    /// A full raw HTTP response, loaded verbatim from a file at config time (`errorfile
+    /// <file>`, or a status code resolved out of an `errorfiles <name>` / `http-errors`
+    /// section).
+    Raw(Vec<u8>),
+    /// `http-error`'s inline templated body (`content-type`/`hdr`/`string`/`lf-string`),
+    /// built at request/response time against the denying request -- the same encoding
+    /// `http-request return`'s own `content_type`/`lf_string` fields use.
+    Custom {
+        content_type: Option<String>,
+        lf_string: Option<String>,
+    },
+}
+
+/// One `http-errors <name>` section: status code to the raw response `errorfile` loaded.
+type HttpErrorsTable = HashMap<u16, Vec<u8>>;
+
+thread_local! {
+    /// Named `http-errors <name>` sections from the parse in progress on this thread.
+    ///
+    /// `errorfiles <name> [<code>...]` (a proxy directive or an `http-request`
+    /// `return`/`deny`/`http-error` argument) looks entries up here by name. HAProxy
+    /// requires a section to be declared before it is used, so the lookup is resolved at
+    /// parse time. Thread-local, not process-global: `parse_str` clears it on entry, and
+    /// two parses on different threads (tests, a reload beside a running check) must not
+    /// clear or read each other's sections.
+    static HTTP_ERRORS_SECTIONS: RefCell<HashMap<String, HttpErrorsTable>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Clears this thread's `http-errors` sections. Called at the start of `parse_str`.
+pub fn clear_http_errors_sections() {
+    HTTP_ERRORS_SECTIONS.with_borrow_mut(HashMap::clear);
+}
+
+/// Registers a parsed `http-errors <name>` section's `errorfile` table under its name.
+pub fn register_http_errors_section(name: String, table: HttpErrorsTable) {
+    HTTP_ERRORS_SECTIONS.with_borrow_mut(|m| {
+        m.insert(name, table);
+    });
+}
+
+/// Every `errorfile` entry declared in the named `http-errors` section.
+#[must_use]
+pub fn http_errors_section(name: &str) -> Option<HttpErrorsTable> {
+    HTTP_ERRORS_SECTIONS.with_borrow(|m| m.get(name).cloned())
+}
+
+/// One status code's `errorfile` entry in the named `http-errors` section.
+#[must_use]
+pub fn http_errors_section_code(name: &str, code: u16) -> Option<Vec<u8>> {
+    HTTP_ERRORS_SECTIONS.with_borrow(|m| m.get(name).and_then(|t| t.get(&code).cloned()))
 }
 
