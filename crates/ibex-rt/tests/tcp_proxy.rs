@@ -1141,8 +1141,11 @@ fn test_header_size_boundary_against_bufsize_minus_maxrewrite() {
     let req_above = format!("GET / HTTP/1.1\r\nX-Padding: {pad_above}\r\n\r\n").into_bytes();
     assert_eq!(req_above.len(), 3073);
     let resp3 = drive_req(&mut engine, &req_above);
+    // The status, not the reason: the page is HAProxy's built-in one now, which says
+    // "Bad request". (HAProxy 3.5 itself answers 431 here, and already at 3071 bytes:
+    // tasks/T87.)
     assert!(
-        resp3.starts_with("HTTP/1.1 400 Bad Request"),
+        resp3.starts_with("HTTP/1.1 400 "),
         "above threshold must produce 400 Bad Request, got: {resp3}"
     );
     assert_eq!(

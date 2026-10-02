@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use super::*;
 
 /// Reads the full contents of an `errorfile <code> <file>`-style file argument, exactly as
-/// HAProxy does: the file must exist and be readable at config time (files are read before
+/// `HAProxy` does: the file must exist and be readable at config time (files are read before
 /// any chroot), and its bytes are kept verbatim -- an empty file (`/dev/null` is the
 /// documented idiom) is a valid, deliberately empty response.
 pub(crate) fn load_errorfile_bytes(path_tok: &Token) -> Result<Vec<u8>, ConfigError> {
@@ -86,7 +86,7 @@ pub(crate) fn parse_errorfiles_directive(
 ///
 /// `default-errorfiles` removes any existing override for `<code>` rather than installing
 /// one: a later error for that status falls back to `errorfile`/`errorfiles` for the
-/// proxy, and ultimately to HAProxy's built-in page, exactly as if `http-error` had never
+/// proxy, and ultimately to `HAProxy`'s built-in page, exactly as if `http-error` had never
 /// mentioned that code.
 pub(crate) fn parse_http_error_directive(
     replies: &mut HashMap<u16, ErrorPageSource>,

@@ -35,7 +35,7 @@ pub enum HttpReqAction {
         /// Templated response payload, same encoding as `Return::lf_string`.
         lf_string: Option<String>,
         /// `default-errorfiles`/`errorfile`/`errorfiles`: use the proxy's configured
-        /// error page for the deny status instead of the templated body above. HAProxy
+        /// error page for the deny status instead of the templated body above. `HAProxy`
         /// implies this when `deny` carries no body argument at all (or only
         /// `deny_status`), so the parser sets it in that case too.
         error_page: Option<ErrorPageSource>,
@@ -182,7 +182,7 @@ pub struct HttpAfterResRule {
 pub enum ErrorPageSource {
     /// `default-errorfiles`: use the proxy's own configured error page for this status
     /// (an `http-error` override if any, else an `errorfile`/`errorfiles` entry, else
-    /// HAProxy's built-in page for the code), rather than a page named by this rule.
+    /// `HAProxy`'s built-in page for the code), rather than a page named by this rule.
     DefaultErrorfiles,
     /// A full raw HTTP response, loaded verbatim from a file at config time (`errorfile
     /// <file>`, or a status code resolved out of an `errorfiles <name>` / `http-errors`

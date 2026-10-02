@@ -14,6 +14,7 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -55,7 +56,7 @@ type Handler = fn(&Seen) -> Reply;
 /// Reads one request (head and body) from `s`, `buf` holding what was read past the last
 /// one. `None` at EOF.
 fn read_request(s: &mut TcpStream, buf: &mut Vec<u8>, conn: usize) -> Option<Seen> {
-    let mut chunk = [0u8; 65536];
+    let mut chunk = vec![0u8; 65536];
     let head_end = loop {
         if let Some(p) = find(buf, b"\r\n\r\n") {
             break p + 4;
@@ -144,21 +145,57 @@ fn backend(handler: Handler) -> (SocketAddr, Arc<Mutex<Vec<Seen>>>) {
 
 // ---- the proxy ----------------------------------------------------------------------
 
-struct Proxy(Child, NamedTempFile);
+/// The process, and the config file it reads, kept until the process is gone.
+struct Proxy {
+    child: Child,
+    _cfg: NamedTempFile,
+}
 
 impl Drop for Proxy {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        stop(&mut self.child);
     }
+}
+
+/// Stops the binary the way it exits cleanly -- `SIGUSR1`, the soft stop -- so an
+/// instrumented build writes its coverage profile; `SIGKILL` discards it, which left every
+/// line these tests run invisible to `harness/covercheck.py`. Killed if it lingers.
+fn stop(child: &mut Child) {
+    let _ = Command::new("kill").arg("-USR1").arg(child.id().to_string()).status();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Starts the binary under test with `cfg`, in which `@FE@` is replaced by the frontend
 /// address and `@BEn@` by `backends[n]`.
+/// A port for the proxy to listen on, below the kernel's ephemeral range. Taken from that
+/// range (`bind :0`, then released), it could be handed straight to another test's backend
+/// before the proxy bound it -- the readiness probe then connected to the wrong process,
+/// and the test talked to a stranger. Backends bind `:0`, so they never land down here.
+fn frontend_addr() -> SocketAddr {
+    static NEXT: AtomicU16 = AtomicU16::new(0);
+    let base = u16::try_from(std::process::id() % 1000).unwrap_or(0) * 10;
+    loop {
+        let port = 20000 + (base + NEXT.fetch_add(1, Ordering::Relaxed)) % 10000;
+        if let Ok(l) = TcpListener::bind(("127.0.0.1", port)) {
+            return l.local_addr().unwrap();
+        }
+    }
+}
+
 fn start(cfg: &str, backends: &[SocketAddr]) -> (Proxy, SocketAddr) {
-    let fe = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+    let fe = frontend_addr();
     let mut text = format!(
-        "defaults\n  mode http\n  timeout connect 2s\n  timeout client 5s\n  timeout server 5s\n{cfg}"
+        // One thread: the suite runs every case at once, and a proxy per case with a worker
+        // per CPU is thousands of threads.
+        "global\n  nbthread 1\ndefaults\n  mode http\n  timeout connect 2s\n  timeout client 5s\n  timeout server 5s\n{cfg}"
     )
     .replace("@FE@", &fe.to_string());
     for (i, be) in backends.iter().enumerate() {
@@ -183,7 +220,7 @@ fn start(cfg: &str, backends: &[SocketAddr]) -> (Proxy, SocketAddr) {
         assert!(Instant::now() < deadline, "{bin} never started listening on {fe}");
         thread::sleep(Duration::from_millis(20));
     }
-    (Proxy(child, f), fe)
+    (Proxy { child, _cfg: f }, fe)
 }
 
 /// One frontend, one backend with one server.
@@ -236,7 +273,7 @@ impl Client {
 
     /// Reads more into `buf`; false once `deadline` passes or the peer closed.
     fn fill(&mut self, deadline: Instant) -> bool {
-        let mut chunk = [0u8; 65536];
+        let mut chunk = vec![0u8; 65536];
         while Instant::now() < deadline {
             match self.s.read(&mut chunk) {
                 Ok(0) | Err(_) if self.eof => return false,
@@ -751,7 +788,7 @@ fn an_interim_response_then_the_final_one() {
 }
 
 /// A `101 Switching Protocols` turns the connection into a tunnel: bytes flow both ways
-/// unparsed until one side closes. `HAProxy` 3.5: both messages echoed. (Without
+/// unparsed until one side closes. `HAProxy` 3.5: both messages echoed, then closed. (Without
 /// `Sec-WebSocket-Key` it answers the upgrade request with a 400.)
 #[test]
 fn an_upgrade_becomes_a_tunnel() {
@@ -785,4 +822,186 @@ fn an_upgrade_becomes_a_tunnel() {
         while c.buf.len() < msg.len() && c.fill(deadline) {}
         assert_eq!(c.buf.drain(..).as_slice(), msg);
     }
+    // Either side closing ends the tunnel. `HAProxy` 3.5: the client's half-close reaches
+    // the server, which closes, and so does the client connection.
+    c.s.shutdown(std::net::Shutdown::Write).unwrap();
+    assert!(c.closed_within(Duration::from_secs(1)), "the tunnel outlived its client");
+}
+
+/// Request rewrites apply to every request on a connection, including those that go down a
+/// server connection kept from the previous one. `HAProxy` 3.5: the header on all three.
+#[test]
+fn request_rewrites_apply_to_every_request() {
+    let (_p, fe, seen) = simple(
+        |r| Reply::ok(&format!("{} {}", r.path, r.body.len())),
+        "  http-request set-header X-Tag tagged\n  http-request set-path /rewritten%[path]\n",
+    );
+    let mut c = Client::connect(fe);
+    for i in 0..3 {
+        assert_eq!(c.get(&format!("/{i}")).map(|r| r.body_str()), Some(format!("/rewritten/{i} 0")));
+    }
+    let paths: Vec<String> = seen.lock().unwrap().iter().map(|s| s.path.clone()).collect();
+    assert_eq!(paths, ["/rewritten/0", "/rewritten/1", "/rewritten/2"]);
+}
+
+// ---- edges: how each side can end, and the replies that close ---------------------------
+
+/// A server that accepts, answers each request it reads, and closes `idle` after the last.
+fn closing_backend(idle: Duration) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let be = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        for s in listener.incoming() {
+            let Ok(mut s) = s else { continue };
+            thread::spawn(move || {
+                s.set_read_timeout(Some(idle)).unwrap();
+                let mut buf = Vec::new();
+                while let Some(r) = read_request(&mut s, &mut buf, 0) {
+                    let body = format!("GET {} 0", r.path);
+                    let _ = s.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes());
+                }
+            });
+        }
+    });
+    be
+}
+
+/// A server that answers every request with `raw` and closes.
+fn raw_backend(raw: &'static [u8]) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let be = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        for s in listener.incoming() {
+            let Ok(mut s) = s else { continue };
+            let mut buf = Vec::new();
+            if read_request(&mut s, &mut buf, 0).is_some() {
+                let _ = s.write_all(raw);
+            }
+        }
+    });
+    be
+}
+
+fn one_backend(be: SocketAddr, backend_extra: &str) -> (Proxy, SocketAddr) {
+    start(&format!("frontend fe\n  bind @FE@\n  default_backend be\nbackend be\n{backend_extra}  server s1 @BE0@\n"), &[be])
+}
+
+/// The server closes the connection kept between two requests. The second request gets a
+/// new connection, not an error. `HAProxy` 3.5: 200, 200.
+#[test]
+fn a_kept_server_connection_closed_while_idle_is_replaced() {
+    let (_p, fe) = one_backend(closing_backend(Duration::from_millis(100)), "");
+    let mut c = Client::connect(fe);
+    assert_eq!(c.get("/1").map(|r| r.body_str()).as_deref(), Some("GET /1 0"));
+    thread::sleep(Duration::from_millis(400));
+    assert_eq!(c.get("/2").map(|r| r.body_str()).as_deref(), Some("GET /2 0"));
+}
+
+/// No server answers the connect within `timeout connect`. `HAProxy` 3.5: 503.
+#[test]
+fn a_connect_timeout_gets_a_503() {
+    // TEST-NET-1 (RFC 5737): routed nowhere, so the connect neither completes nor fails.
+    let be: SocketAddr = "192.0.2.1:80".parse().unwrap();
+    let (_p, fe) = one_backend(be, "  timeout connect 200ms\n  retries 0\n");
+    let mut c = Client::connect(fe);
+    assert_eq!(c.get("/x").map(|r| r.status), Some(503));
+}
+
+/// The server closes in the middle of a body. What arrived is delivered, then the client
+/// connection closes. `HAProxy` 3.5: the head and the 5 bytes, then close.
+#[test]
+fn a_response_cut_short_closes_the_client_after_what_arrived() {
+    let (_p, fe) = one_backend(raw_backend(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nhello"), "");
+    let mut c = Client::connect(fe);
+    c.send(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert!(c.closed_within(Duration::from_secs(2)), "the client connection stayed open");
+    let got = String::from_utf8_lossy(&c.buf).into_owned();
+    assert!(got.starts_with("HTTP/1.1 200"), "{got:?}");
+    assert!(got.ends_with("\r\n\r\nhello"), "{got:?}");
+}
+
+/// A response whose status line does not parse. `HAProxy` 3.5: 502.
+#[test]
+fn a_malformed_response_gets_a_502() {
+    let (_p, fe) = one_backend(raw_backend(b"NOT HTTP AT ALL\r\n\r\n"), "");
+    let mut c = Client::connect(fe);
+    assert_eq!(c.get("/x").map(|r| r.status), Some(502));
+}
+
+/// `http-request` rules in the backend answer too. `HAProxy` 3.5: 403.
+#[test]
+fn a_backend_rule_answers() {
+    let (be, seen) = backend(echo);
+    let (_p, fe) = one_backend(be, "  http-request deny if { path /local }\n");
+    let mut c = Client::connect(fe);
+    assert_eq!(c.get("/local").map(|r| r.status), Some(403));
+    assert_eq!(c.get("/g").map(|r| r.body_str()).as_deref(), Some("GET /g 0"));
+    assert!(seen.lock().unwrap().iter().all(|s| s.path != "/local"));
+}
+
+/// `http-error` replaces the page for the proxy's own error. `HAProxy` 3.5: the 503 carries
+/// the configured body.
+#[test]
+fn http_error_replaces_the_generated_page() {
+    let (_p, fe) = start(
+        "frontend fe\n  bind @FE@\n  default_backend be\n\
+         backend be\n  http-error status 503 content-type text/plain string busy\n",
+        &[],
+    );
+    let mut c = Client::connect(fe);
+    let r = c.get("/x").expect("a response");
+    assert_eq!((r.status, r.body_str().as_str()), (503, "busy"));
+}
+
+/// A request answered before its body has all arrived: the rest of the body is drained as
+/// it comes, and the connection is kept. `HAProxy` 3.5: 403, then once the body is in, the
+/// next request on the connection is answered.
+#[test]
+fn a_reply_before_the_body_arrives_drains_it() {
+    let (_p, fe, seen) = simple(echo, "  http-request deny if { path /local }\n");
+    let mut c = Client::connect(fe);
+    c.send(b"POST /local HTTP/1.1\r\nHost: x\r\nContent-Length: 1000\r\n\r\nonly-a-little");
+    assert_eq!(c.final_response().map(|r| r.status), Some(403));
+    let mut rest = vec![b'x'; 1000 - 13];
+    rest.extend_from_slice(b"GET /g HTTP/1.1\r\nHost: x\r\n\r\n");
+    c.send(&rest);
+    assert_eq!(c.final_response().map(|r| r.body_str()).as_deref(), Some("GET /g 0"));
+    assert_eq!(seen.lock().unwrap().len(), 1, "{:?}", seen.lock().unwrap());
+}
+
+/// A client that asked to close gets a reply saying so, then the close. `HAProxy` 3.5:
+/// `connection: close` on the 403.
+#[test]
+fn a_reply_to_a_closing_client_says_so() {
+    let (_p, fe, _) = simple(echo, "  http-request deny\n");
+    let mut c = Client::connect(fe);
+    c.send(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    let r = c.final_response().expect("a response");
+    assert_eq!(r.status, 403);
+    assert_eq!(r.header("connection").map(str::to_ascii_lowercase).as_deref(), Some("close"));
+    assert!(c.closed_within(Duration::from_secs(1)));
+}
+
+/// An empty errorfile: nothing is sent and the connection closes (the `/dev/null` idiom).
+/// `HAProxy` 3.5: closed with no bytes.
+#[test]
+fn an_empty_errorfile_closes_without_a_response() {
+    let empty = NamedTempFile::new().unwrap();
+    let (_p, fe, _) = simple(echo, &format!("  errorfile 403 {}\n  http-request deny\n", empty.path().display()));
+    let mut c = Client::connect(fe);
+    c.send(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert!(c.closed_within(Duration::from_secs(1)));
+    assert!(c.buf.is_empty(), "{:?}", String::from_utf8_lossy(&c.buf));
+}
+
+/// A request that does not parse. `HAProxy` 3.5: 400, then close. (Content-Length with
+/// chunked is not here: `HAProxy` 3.5 accepts it, Ibex refuses it -- tasks/T89.)
+#[test]
+fn an_unparsable_request_gets_a_400_and_a_close() {
+    let (_p, fe, seen) = simple(echo, "");
+    let mut c = Client::connect(fe);
+    c.send(b"\x01GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert_eq!(c.final_response().map(|r| r.status), Some(400));
+    assert!(c.closed_within(Duration::from_secs(1)));
+    assert!(seen.lock().unwrap().is_empty());
 }

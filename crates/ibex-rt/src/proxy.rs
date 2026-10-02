@@ -20,11 +20,12 @@
 
 use crate::buf::Buf;
 use crate::raw::{self, Io};
+use crate::txn::{self, HttpTxn};
 use crate::xprt::{ClientXprt, ServerXprt};
 use ibex_proto::parser::ParserKind;
-use ibex_config::{HttpAfterResAction, HttpResAction, Mode};
+use ibex_config::Mode;
 use ibex_proto::endpoint::ScState;
-use ibex_proto::htx::{HttpVersion, Htx, HtxBlock, ResponseLine};
+use ibex_proto::htx::HtxBlock;
 use ibex_proto::h2::H2_CONN_PREFACE;
 use ibex_proto::mux::Mux;
 use ibex_proto::mux_h2::{H2MuxContext, MuxH2};
@@ -139,25 +140,15 @@ pub struct TcpSession {
     pub proxy_info: Option<ibex_proto::ProxyInfo>,
     pub server_addr: Option<SocketAddr>,
     pub send_proxy_prepended: bool,
-    pub resp_headers_processed: bool,
-    /// The current response's end is known without the server closing: it has a
-    /// `Content-Length`, is chunked, or cannot have a body. Then a server EOF after it ends
-    /// only the server side, and the client connection stays in keep-alive.
-    pub resp_length_known: bool,
-    /// Whether the response in `rep` may be written to the client. The engine clears it
-    /// on an HTTP session and sets it once its response rules have run: `process` reads
-    /// the server and writes the client in one call, so without the hold a response read
-    /// there went out before the engine saw it, and its `http-response` rules were
-    /// skipped -- intermittently, whenever `process` won the read. Synthetic responses
-    /// release it themselves. Sessions not driven by the engine never clear it.
-    pub resp_released: bool,
-    /// Status of the response in progress, 0 before its headers are processed.
-    pub resp_status: u16,
-    pub srv_connection_close: bool,
+    /// The HTTP transaction in progress: `None` between requests, and always in `mode
+    /// tcp`. What may be forwarded in each direction is decided by its message states.
+    pub txn: Option<HttpTxn>,
+    /// A read on the server would just block, so it is not tried again until the poller
+    /// reports the socket readable (`HAProxy`'s `fd_cant_recv`). HTTP only: those sessions
+    /// are always driven by the engine, which clears it on a readiness event; a TCP
+    /// session may be driven without a poller and keeps reading speculatively.
+    pub srv_cant_recv: bool,
     pub created_at: Instant,
-    pub http_res_rules: Vec<ibex_config::HttpResRule>,
-    pub http_after_res_rules: Vec<ibex_config::HttpAfterResRule>,
-    pub acls: HashMap<String, Expr>,
     pub pending_resp: Option<(Vec<u8>, usize)>,
     pub fc_src: Option<SocketAddr>,
     pub fc_dst: Option<SocketAddr>,
@@ -169,7 +160,6 @@ pub struct TcpSession {
     pub tracked_sc: [Option<(usize, StickKey)>; 3],
     pub bufsize: usize,
     pub maxrewrite: usize,
-    pub connection_close: bool,
     pub h2_ctx: Option<H2MuxContext>,
     pub h2_active_stream_id: Option<u32>,
     pub h2_flood_config: ibex_proto::H2FloodConfig,
@@ -247,17 +237,11 @@ impl TcpSession {
             proxy_info: None,
             server_addr: None,
             send_proxy_prepended: false,
-            resp_headers_processed: false,
-            resp_length_known: false,
-            resp_released: true,
-            resp_status: 0,
-            srv_connection_close: false,
+            txn: None,
+            srv_cant_recv: false,
             created_at: Instant::now(),
             bufsize: crate::buf::get_bufsize(),
             maxrewrite: 1024,
-            http_res_rules: Vec::new(),
-            http_after_res_rules: Vec::new(),
-            acls: HashMap::new(),
             pending_resp: None,
             fc_src: None,
             fc_dst: None,
@@ -267,7 +251,6 @@ impl TcpSession {
             req_vars: HashMap::new(),
             req_captures: Vec::new(),
             tracked_sc: [None, None, None],
-            connection_close: false,
             h2_ctx: None,
             h2_active_stream_id: None,
             h2_flood_config: ibex_proto::H2FloodConfig::default(),
@@ -317,9 +300,12 @@ impl TcpSession {
         self.htx_modified = false;
     }
 
+    /// Whether there is output the client may be sent now: response bytes inside the
+    /// current response's window (a response still waiting for its head to be processed
+    /// is not output yet), the overflow of a local reply, or HTTP/2 frames.
     #[must_use]
     pub fn has_pending_output(&self) -> bool {
-        !self.rep.is_empty()
+        self.rep_window() > 0
             || self.pending_resp.as_ref().is_some_and(|(d, o)| *o < d.len())
             || self.h2_ctx.as_ref().is_some_and(|h| h.tx_consumed < h.tx_buf.len())
     }
@@ -370,6 +356,7 @@ impl TcpSession {
     pub fn attach_server_with_xprt(&mut self, fd: OwnedFd, xprt: ServerXprt, now: Tick) {
         self.srv = Some(fd);
         self.srv_xprt = xprt;
+        self.srv_cant_recv = false;
         self.srv_state = ScState::Connecting;
         self.conn_exp = if self.timeouts.connect == 0 {
             Tick::ETERNITY
@@ -462,60 +449,137 @@ impl TcpSession {
         self.rep.remove_http_header(name)
     }
 
-    /// Writes an RFC-compliant synthetic HTTP response from raw bytes into `self.rep`.
-    pub fn send_synthetic_bytes(&mut self, raw: &[u8]) {
+    /// How much of `rep` may be written to the client now: in HTTP, the bytes of the
+    /// response in flight, and none of a response whose head the engine has not yet
+    /// processed. That hold is what lets `http-response` rules see every response: the
+    /// byte layer reads the server and writes the client in one call.
+    #[must_use]
+    pub fn rep_window(&self) -> usize {
+        let data = self.rep.readable();
+        match &self.txn {
+            Some(t) if self.mode == Mode::Http => t.rsp.window(data),
+            _ => data.len(),
+        }
+    }
+
+    /// How much of `req` may go to the server now: in HTTP, the current request and
+    /// nothing after it. A pipelined request waits in `req` for this transaction to end,
+    /// and is then routed on its own.
+    #[must_use]
+    pub fn req_window(&self) -> usize {
+        let data = self.req.readable();
+        if self.mode != Mode::Http {
+            return data.len();
+        }
+        match &self.txn {
+            // Not before its rules have run: a server connection kept from the last
+            // transaction is ready to take bytes the moment a head is parsed, and the
+            // request would reach it unfiltered and unrewritten.
+            Some(t) if t.req_rules_done && !t.local && t.error.is_none() => t.req.window(data),
+            _ => 0,
+        }
+    }
+
+    /// Whether the server side may be read: always, except while the proxy writes its own
+    /// reply into `rep`. A kept connection is read between transactions too: that is how
+    /// its close is noticed, without probing it, and it keeps the poller's read interest
+    /// from flipping off and on with every transaction. Bytes outside a response are the
+    /// engine's to judge (`end_txn`, `http_step`).
+    fn reads_server(&self) -> bool {
+        self.mode != Mode::Http || self.txn.as_ref().is_none_or(|t| !t.local && t.error.is_none())
+    }
+
+    /// Answers the current request with `raw`, a complete response the proxy built
+    /// itself. `HAProxy`'s `http_reply_message`: the rest of the request is dropped, the
+    /// response replaces anything in `rep`, and the transaction ends when it has been
+    /// sent.
+    ///
+    /// The request is dropped through its framing, so its body is never read as the next
+    /// request. A body not yet all here is drained as it arrives (`drain_request`) and the
+    /// connection then kept, as `HAProxy` 3.5 does, bounded by `timeout client`. A client
+    /// that sent `Expect: 100-continue` will not send a body it was not invited to, so
+    /// that connection closes, as it does after an empty reply (the `errorfile /dev/null`
+    /// idiom) and one that says `Connection: close`.
+    pub fn write_reply(&mut self, raw: &[u8]) {
+        let expects_continue = self
+            .htx_slice()
+            .and_then(|h| h.get_header("expect"))
+            .is_some_and(|v| v.eq_ignore_ascii_case("100-continue"));
+        let txn = self.txn.get_or_insert_with(|| HttpTxn::new(txn::Framing::None, false));
+        let data = self.req.readable();
+        let n = txn.req.window(data);
+        txn.req.consume(data, n);
+        self.req.consume(n);
+        if !txn.req.is_done() && expects_continue {
+            txn.close_after = true;
+        }
+        let head_len = find_eoh(raw).map_or(raw.len(), |(h, e)| h + e);
+        let head = String::from_utf8_lossy(&raw[..head_len]);
+        txn.local = true;
+        txn.srv_reusable = false;
+        txn.rsp_interim = false;
+        txn.status = txn::status_of(&head);
+        if raw.is_empty() || txn::head_wants_close(&head) {
+            txn.close_after = true;
+        }
+        let mut out;
+        let raw = if txn.close_after && !raw.is_empty() && !has_header(&head, "connection") {
+            // The client is told, as for a server's response: last in the head, as
+            // `inject_connection_close_header_zero_alloc` places it.
+            let at = find_eoh(raw).map_or(0, |(h, e)| h + e / 2);
+            out = Vec::with_capacity(raw.len() + 19);
+            out.extend_from_slice(&raw[..at]);
+            out.extend_from_slice(b"Connection: close\r\n");
+            out.extend_from_slice(&raw[at..]);
+            out.as_slice()
+        } else {
+            raw
+        };
+        txn.rsp = if raw.is_empty() {
+            txn::MsgState::Done
+        } else {
+            txn::MsgState::Body(txn::Body::Length(raw.len() as u64))
+        };
         self.rep.clear();
         let w = self.rep.writable();
         let n = raw.len().min(w.len());
         w[..n].copy_from_slice(&raw[..n]);
         self.rep.commit(n);
-        if n < raw.len() {
-            self.pending_resp = Some((raw.to_vec(), n));
-        } else {
-            self.pending_resp = None;
-        }
-        self.cli_state = ScState::Established;
-        self.srv_state = ScState::Closed;
-        self.resp_released = true;
+        self.pending_resp = (n < raw.len()).then(|| (raw.to_vec(), n));
     }
 
-    /// Writes an RFC-compliant synthetic HTTP response into `self.rep` and closes the client read side.
-    pub fn send_synthetic_response(
-        &mut self,
-        status: u16,
-        content_type: Option<&str>,
-        body: Option<&str>,
-    ) {
-        let resp = ibex_proto::build_synthetic_response(status, content_type, body);
-        self.send_synthetic_bytes(&resp);
+    /// Clears what belonged to the transaction that just ended, so the next request on
+    /// this connection starts from nothing. The one place that list lives.
+    pub fn reset_for_next_request(&mut self) {
+        self.txn = None;
+        self.req_method = None;
+        self.req_uri = None;
+        self.req_headers = None;
+        self.clear_htx();
+        self.h2_active_stream_id = None;
+        self.req_vars.clear();
+        self.is_first_req = false;
+        self.cli_state = ScState::Ready;
     }
 
-    /// Drops the request at the front of `req` when the proxy answered it itself without
-    /// sending any of it to a server (no server available, connect failed). Left in place,
-    /// the keep-alive reset at the end of the transaction reads it as the next request and
-    /// answers it again, without end.
-    ///
-    /// A request with a body is not drained: the rest of the buffer goes and the client
-    /// connection closes after the response, so body bytes are never parsed as a request.
-    pub fn discard_unforwarded_request(&mut self) {
-        let Some((head_len, eoh_len)) = find_eoh(self.req.readable()) else {
-            return;
-        };
-        let head = String::from_utf8_lossy(&self.req.readable()[..head_len]);
-        let has_body = head.split("\r\n").skip(1).any(|l| {
-            l.split_once(':').is_some_and(|(k, v)| {
-                let k = k.trim();
-                (k.eq_ignore_ascii_case("content-length") && v.trim() != "0")
-                    || k.eq_ignore_ascii_case("transfer-encoding")
-            })
-        });
-        if has_body {
-            let all = self.req.readable().len();
-            self.req.consume(all);
-            self.connection_close = true;
-        } else {
-            self.req.consume(head_len + eoh_len);
+    /// Discards the body of a request the proxy has already answered, as it arrives, up
+    /// to its end; what follows it is the next request.
+    fn drain_request(&mut self) {
+        if let Some(t) = self.txn.as_mut().filter(|t| t.local && !t.req.is_done() && !t.close_after) {
+            let data = self.req.readable();
+            let n = t.req.window(data);
+            t.req.consume(data, n);
+            self.req.consume(n);
         }
+    }
+
+    /// The request cannot be parsed. It is answered with `status` -- by the engine, which
+    /// has the error pages -- and the connection closes; nothing more is read from it.
+    fn fail_request(&mut self, status: u16) {
+        self.req.clear();
+        self.txn = Some(HttpTxn::failed(status));
+        self.cli_state = ScState::ShutR;
+        self.ending.get_or_insert(Ending::Error);
     }
 
     /// Runs the configured parser over a complete request head.
@@ -525,16 +589,14 @@ impl TcpSession {
     /// `Transfer-Encoding`, a bare CR as a line terminator, an invalid header name, or a
     /// malformed chunk size. Each of these is a way for two intermediaries to read the
     /// same bytes as different requests.
-    fn validate_request_head(&mut self, head_len: usize) -> io::Result<()> {
+    fn validate_request_head(&mut self, head_len: usize) -> io::Result<bool> {
         let parser = ibex_proto::parser::build(self.parser_kind)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         let mut stream = parser.stream(false);
         let raw = self.htx_buf.raw_slice_mut();
         let mut slice = ibex_proto::htx::HtxSlice::new(raw);
         stream.parse(&self.req.readable()[..head_len], &mut slice)?;
-        if stream.connection_close() {
-            self.connection_close = true;
-        }
+        let close = stream.connection_close();
         if stream.framing_conflict() {
             // RFC 9112: Transfer-Encoding wins and the connection must not be reused.
             // The message is parseable, so this is not an error -- but forwarding it to a
@@ -549,7 +611,7 @@ impl TcpSession {
         self.htx_blocks = slice.num_blocks();
         self.has_htx = true;
         self.htx_modified = false;
-        Ok(())
+        Ok(close)
     }
 
     #[must_use]
@@ -649,6 +711,10 @@ impl TcpSession {
             }
         }
 
+        if self.mode == Mode::Http {
+            self.drain_request();
+        }
+
         // Parse PROXY protocol header if accept-proxy is configured
         if self.accept_proxy && !self.proxy_handshake_done {
             if !self.req.is_empty() {
@@ -734,6 +800,9 @@ impl TcpSession {
                             let n = wire_req.len().min(w.len());
                             w[..n].copy_from_slice(&wire_req[..n]);
                             self.req.commit(n);
+                            let framing = find_eoh(&wire_req)
+                                .map_or(txn::Framing::None, |(h, e)| txn::request_framing(&wire_req[..h + e]));
+                            self.txn = Some(HttpTxn::new(framing, false));
                             self.cli_state = ScState::Established;
                             changed = true;
                         }
@@ -766,6 +835,10 @@ impl TcpSession {
 
         // Parse HTTP request headers if in Ready state
         if self.h2_ctx.is_none() && self.cli_state == ScState::Ready {
+            // Empty lines before a request line are skipped (RFC 9112 section 2.2), as
+            // HAProxy's parser does in `H1_MSG_RQBEFORE`.
+            let blank = self.req.readable().iter().take_while(|b| matches!(b, b'\r' | b'\n')).count();
+            self.req.consume(blank);
             let threshold = self.bufsize.saturating_sub(self.maxrewrite);
             let req_data = self.req.readable();
             if !req_data.is_empty() {
@@ -773,9 +846,7 @@ impl TcpSession {
                 let is_valid_method_char = first_byte.is_ascii_alphanumeric()
                     || matches!(first_byte, b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~' | b'\r' | b'\n');
                 if !is_valid_method_char {
-                    self.send_synthetic_response(400, Some("text/html"), None);
-                    self.cli_state = ScState::ShutR;
-                    self.ending.get_or_insert(Ending::Error);
+                    self.fail_request(400);
                     return Ok(true);
                 }
             }
@@ -784,9 +855,7 @@ impl TcpSession {
 
                 // Enforce tune.bufsize - tune.maxrewrite limit: headers exceeding threshold produce 400
                 if total_hdr_len > threshold {
-                    self.send_synthetic_response(400, Some("text/html"), None);
-                    self.cli_state = ScState::ShutR;
-                    self.ending.get_or_insert(Ending::Error);
+                    self.fail_request(400);
                     return Ok(true);
                 }
 
@@ -797,7 +866,8 @@ impl TcpSession {
                 // will parse almost anything and forwards the headers verbatim. That is
                 // how a request carrying both `Content-Length` and `Transfer-Encoding`
                 // reached a backend with both headers intact and a second request behind
-                // them -- textbook CL.TE smuggling, which HAProxy answers with a 400.
+                // them -- textbook CL.TE smuggling. (HAProxy 3.5 forwards that one with the
+                // chunked framing and closes after; Ibex refuses it: tasks/T89.)
                 // `h1.rs` has rejected that since the strict-framing work; nothing on
                 // this path was asking it.
                 //
@@ -805,13 +875,10 @@ impl TcpSession {
                 // stream needs no state across calls. One allocation per request head
                 // for the trait object; it buys the framing rules and the seam that lets
                 // the parser be swapped.
-                if let Err(e) = self.validate_request_head(total_hdr_len) {
-                    let _ = e;
-                    self.send_synthetic_response(400, Some("text/html"), None);
-                    self.cli_state = ScState::ShutR;
-                    self.ending.get_or_insert(Ending::Error);
+                let Ok(mut close) = self.validate_request_head(total_hdr_len) else {
+                    self.fail_request(400);
                     return Ok(true);
-                }
+                };
 
                 if self.has_htx {
                     let (req_m, req_u, conn_close, wire_replacement) = {
@@ -852,9 +919,7 @@ impl TcpSession {
                     if let Some(u) = req_u {
                         self.req_uri = Some(u);
                     }
-                    if conn_close {
-                        self.connection_close = true;
-                    }
+                    close |= conn_close;
                     // Only regenerate wire buffer if HTX was actually modified
                     if let Some((wire_buf, n)) = wire_replacement {
                         self.req.replace_prefix(total_hdr_len, &wire_buf[..n]);
@@ -896,10 +961,10 @@ impl TcpSession {
                         }
                     }
                     if hdrs.iter().any(|(k, v)| k.eq_ignore_ascii_case("connection") && v.eq_ignore_ascii_case("close")) {
-                        self.connection_close = true;
+                        close = true;
                     }
                     if first_line.contains("HTTP/1.0") && !hdrs.iter().any(|(k, v)| k.eq_ignore_ascii_case("connection") && v.eq_ignore_ascii_case("keep-alive")) {
-                        self.connection_close = true;
+                        close = true;
                     }
                     self.req_headers = Some(hdrs);
                 }
@@ -916,12 +981,15 @@ impl TcpSession {
                     }
                 }
 
+                // The head may have been rewritten above; its framing is read from what
+                // will be forwarded.
+                let framing = find_eoh(self.req.readable())
+                    .map_or(txn::Framing::None, |(h, e)| txn::request_framing(&self.req.readable()[..h + e]));
+                self.txn = Some(HttpTxn::new(framing, close));
                 self.cli_state = ScState::Established;
                 changed = true;
             } else if self.req.readable().len() > threshold {
-                self.send_synthetic_response(400, Some("text/html"), None);
-                self.cli_state = ScState::ShutR;
-                self.ending.get_or_insert(Ending::Error);
+                self.fail_request(400);
                 return Ok(true);
             }
         }
@@ -944,14 +1012,17 @@ impl TcpSession {
             }
         }
 
-        // Write any response data back to the client while writing is permitted.
-        if self.h2_ctx.is_none()
-            && self.cli_state.can_write()
-            && !self.rep.is_empty()
-            && self.resp_released
-        {
-            match self.cli_xprt.send(self.cli.as_fd(), self.rep.readable())? {
+        // Write response data back to the client while writing is permitted: in HTTP, the
+        // current response's bytes and no more.
+        let window = self.rep_window();
+        if self.h2_ctx.is_none() && self.cli_state.can_write() && window > 0 {
+            match self.cli_xprt.send(self.cli.as_fd(), &self.rep.readable()[..window])? {
                 Io::Done(n) if n > 0 => {
+                    if self.mode == Mode::Http {
+                        if let Some(t) = self.txn.as_mut() {
+                            t.response_sent(self.rep.readable(), n);
+                        }
+                    }
                     self.rep.consume(n);
                     self.bytes_out += n as u64;
                     changed = true;
@@ -969,7 +1040,9 @@ impl TcpSession {
     }
 
     fn process_cli_transitions(&mut self) -> bool {
-        if self.h2_ctx.is_some() {
+        // An HTTP connection's life is decided per transaction, by the engine
+        // (`end_txn`): a server closing ends a response, not the client connection.
+        if self.h2_ctx.is_some() || self.mode == Mode::Http {
             return false;
         }
 
@@ -981,31 +1054,9 @@ impl TcpSession {
                     self.srv_state,
                     ScState::ShutR | ScState::Closed | ScState::Error
                 );
-                // A server that closes after a response whose length was known has finished
-                // that response, not the client's connection: HAProxy keeps the client in
-                // keep-alive and opens a new server connection for the next request. The
-                // engine's transaction step does that; closing the client here pre-empted it.
-                // A close-delimited response is different -- the close is the only end the
-                // client can see, so it is passed on.
-                let server_finished_cleanly = self.mode == Mode::Http
-                    && !self.connection_close
-                    && self.resp_length_known
-                    && matches!(self.srv_state, ScState::ShutR | ScState::Closed);
-                if srv_done_sending
-                    && self.rep.is_empty()
-                    && self.pending_resp.is_none()
-                    && !server_finished_cleanly
-                {
+                if srv_done_sending && self.rep.is_empty() && self.pending_resp.is_none() {
                     raw::shutdown_write(self.cli.as_fd());
                     self.cli_state = ScState::ShutW;
-                    if self.connection_close {
-                        raw::shutdown_read(self.cli.as_fd());
-                        self.cli_state = ScState::Closed;
-                        if let Some(sfd) = self.srv.as_ref().map(AsFd::as_fd) {
-                            raw::shutdown_write(sfd);
-                        }
-                        self.srv_state = ScState::Closed;
-                    }
                     self.ending
                         .get_or_insert(if self.srv_state == ScState::Error {
                             Ending::ServerAbort
@@ -1064,6 +1115,7 @@ impl TcpSession {
     /// Mirrors 1.0's `process_srv()`.
     fn process_srv(&mut self) -> io::Result<bool> {
         match self.srv_state {
+            ScState::Init if self.mode == Mode::Http => Ok(false),
             ScState::Init => {
                 // 1.0: while idle, give up if the client is gone and has left nothing
                 // behind. Connecting to a server for a client that has already
@@ -1091,212 +1143,10 @@ impl TcpSession {
     }
 
     fn process_srv_active(&mut self) -> io::Result<bool> {
-        let mut changed_io = self.process_srv_io()?;
-
-        // Parse HTTP response headers if in Ready state
-        if self.srv_state == ScState::Ready {
-            let threshold = self.bufsize.saturating_sub(self.maxrewrite);
-            if let Some((hdr_len, eoh_len)) = find_eoh(self.rep.readable()) {
-                let total_hdr_len = hdr_len + eoh_len;
-
-                // Enforce tune.bufsize - tune.maxrewrite limit: headers exceeding threshold produce 502
-                if total_hdr_len > threshold {
-                    self.rep.clear();
-                    self.send_synthetic_response(502, Some("text/html"), None);
-                    self.srv_state = ScState::Closed;
-                    self.cli_state = ScState::Established;
-                    self.ending.get_or_insert(Ending::Error);
-                    return Ok(true);
-                }
-
-                let hdr_bytes = &self.rep.readable()[..total_hdr_len];
-                let mut hdr_str = String::from_utf8_lossy(hdr_bytes).to_string();
-
-                if !self.srvexp.is_empty() {
-                    hdr_str = rewrite_header_block(&hdr_str, &self.srvexp);
-                }
-
-                if !self.http_res_rules.is_empty() || !self.http_after_res_rules.is_empty() {
-                    hdr_str = self.apply_response_rules(&hdr_str);
-                }
-
-                let is_http_10 = hdr_str.split_once("\r\n").is_some_and(|(fl, _)| fl.contains("HTTP/1.0"));
-                let has_close = hdr_str.lines().any(|l| {
-                    if let Some((k, v)) = l.split_once(':') {
-                        k.trim().eq_ignore_ascii_case("connection") && v.to_ascii_lowercase().contains("close")
-                    } else {
-                        false
-                    }
-                });
-                let has_keep_alive = hdr_str.lines().any(|l| {
-                    if let Some((k, v)) = l.split_once(':') {
-                        k.trim().eq_ignore_ascii_case("connection") && v.to_ascii_lowercase().contains("keep-alive")
-                    } else {
-                        false
-                    }
-                });
-                if has_close || (is_http_10 && !has_keep_alive) {
-                    self.srv_connection_close = true;
-                }
-
-                self.resp_length_known = response_length_known(&hdr_str, self.req_method.as_deref());
-                self.resp_status = response_status(&hdr_str);
-                self.rep.replace_prefix(total_hdr_len, hdr_str.as_bytes());
-                self.srv_state = ScState::Established;
-                self.resp_headers_processed = true;
-                changed_io = true;
-            } else if self.rep.readable().len() > threshold {
-                self.rep.clear();
-                self.send_synthetic_response(502, Some("text/html"), None);
-                self.srv_state = ScState::Closed;
-                self.cli_state = ScState::Established;
-                self.ending.get_or_insert(Ending::Error);
-                return Ok(true);
-            }
-        }
+        let changed_io = self.process_srv_io()?;
 
         let changed_trans = self.process_srv_transitions();
         Ok(changed_io || changed_trans)
-    }
-
-    fn apply_response_rules(&self, hdr_str: &str) -> String {
-        let mut out_hdr = hdr_str.to_string();
-
-        let status = if let Some((first_line, _)) = out_hdr.split_once("\r\n") {
-            let mut parts = first_line.split_whitespace();
-            let _ver = parts.next();
-            parts
-                .next()
-                .and_then(|s| s.parse::<u16>().ok())
-                .unwrap_or(200)
-        } else {
-            200
-        };
-
-        let mut htx = Htx::new();
-        htx.push(HtxBlock::ResLine(ResponseLine {
-            version: HttpVersion::Http11,
-            status,
-            reason: ibex_proto::status_reason_phrase(status).to_string(),
-        }));
-
-        let ctx = SampleContext {
-            client_addr: self.client_addr,
-            server_addr: self.server_addr,
-            htx: Some(&htx),
-            htx_slice: self.htx_slice(),
-            req_uri: self.req_uri.as_deref(),
-            req_method: self.req_method.as_deref(),
-            req_headers: self.req_headers.as_deref(),
-            ..Default::default()
-        };
-
-        let registry = Registry::new();
-        let elapsed_ms =
-            u64::try_from(self.created_at.elapsed().as_millis()).unwrap_or(u64::MAX);
-
-        for rule in &self.http_res_rules {
-            let matches = if let Some(ref cond) = rule.cond {
-                eval_acl_condition(cond, &self.acls, &registry, &ctx)
-            } else {
-                true
-            };
-
-            if matches {
-                match &rule.action {
-                    HttpResAction::SetHeader { name, fmt } => {
-                        let val =
-                            ibex_proto::format_log_format_string(fmt, self.client_addr, elapsed_ms);
-                        out_hdr = Self::apply_set_header(&out_hdr, name, &val);
-                    }
-                    HttpResAction::AddHeader { name, fmt } => {
-                        let val =
-                            ibex_proto::format_log_format_string(fmt, self.client_addr, elapsed_ms);
-                        out_hdr = Self::apply_add_header(&out_hdr, name, &val);
-                    }
-                    HttpResAction::DelHeader { name } => {
-                        out_hdr = Self::apply_del_header(&out_hdr, name);
-                    }
-                    HttpResAction::SetStatus { status: st } => {
-                        out_hdr = Self::apply_set_status(&out_hdr, *st);
-                    }
-                }
-            }
-        }
-
-        for rule in &self.http_after_res_rules {
-            let matches = if let Some(ref cond) = rule.cond {
-                eval_acl_condition(cond, &self.acls, &registry, &ctx)
-            } else {
-                true
-            };
-
-            if matches {
-                match &rule.action {
-                    HttpAfterResAction::SetHeader { name, fmt } => {
-                        let val =
-                            ibex_proto::format_log_format_string(fmt, self.client_addr, elapsed_ms);
-                        out_hdr = Self::apply_set_header(&out_hdr, name, &val);
-                    }
-                    HttpAfterResAction::AddHeader { name, fmt } => {
-                        let val =
-                            ibex_proto::format_log_format_string(fmt, self.client_addr, elapsed_ms);
-                        out_hdr = Self::apply_add_header(&out_hdr, name, &val);
-                    }
-                    HttpAfterResAction::DelHeader { name } => {
-                        out_hdr = Self::apply_del_header(&out_hdr, name);
-                    }
-                }
-            }
-        }
-
-        out_hdr
-    }
-
-    fn apply_set_header(raw_headers: &str, name: &str, value: &str) -> String {
-        let mut vec = raw_headers.as_bytes().to_vec();
-        vec.resize(vec.len() + name.len() + value.len() + 32, 0);
-        if let Some(new_len) = ibex_proto::inject_http_header(&mut vec, name, value) {
-            vec.truncate(new_len);
-            String::from_utf8(vec).unwrap_or_else(|_| raw_headers.to_string())
-        } else {
-            raw_headers.to_string()
-        }
-    }
-
-    fn apply_add_header(raw_headers: &str, name: &str, value: &str) -> String {
-        if let Some((eoh_pos, _)) = find_eoh(raw_headers.as_bytes()) {
-            let mut out = String::with_capacity(raw_headers.len() + name.len() + value.len() + 4);
-            out.push_str(&raw_headers[..eoh_pos]);
-            out.push_str(name);
-            out.push_str(": ");
-            out.push_str(value);
-            out.push_str("\r\n");
-            out.push_str(&raw_headers[eoh_pos..]);
-            out
-        } else {
-            raw_headers.to_string()
-        }
-    }
-
-    fn apply_del_header(raw_headers: &str, name: &str) -> String {
-        let mut vec = raw_headers.as_bytes().to_vec();
-        if let Some(new_len) = ibex_proto::remove_http_header(&mut vec, name) {
-            vec.truncate(new_len);
-            String::from_utf8(vec).unwrap_or_else(|_| raw_headers.to_string())
-        } else {
-            raw_headers.to_string()
-        }
-    }
-
-    fn apply_set_status(raw_headers: &str, status: u16) -> String {
-        if let Some((first_line, rest)) = raw_headers.split_once("\r\n") {
-            let reason = ibex_proto::status_reason_phrase(status);
-            let version = first_line.split_whitespace().next().unwrap_or("HTTP/1.1");
-            format!("{version} {status} {reason}\r\n{rest}")
-        } else {
-            raw_headers.to_string()
-        }
     }
 
     fn process_srv_io(&mut self) -> io::Result<bool> {
@@ -1321,21 +1171,23 @@ impl TcpSession {
             }
         }
 
-        let forwardable = self.request_bytes_forwardable();
-        if self.srv_state.can_write()
-            && ((forwardable && !self.req.is_empty()) || self.srv_xprt.wants_write())
-        {
+        let window = self.req_window();
+        if self.srv_state.can_write() && (window > 0 || self.srv_xprt.wants_write()) {
             let r = {
                 let sfd = self
                     .srv
                     .as_ref()
                     .map(AsFd::as_fd)
                     .ok_or_else(|| io::Error::from(io::ErrorKind::NotConnected))?;
-                let data = if forwardable { self.req.readable() } else { &[] };
-                self.srv_xprt.send(sfd, data)?
+                self.srv_xprt.send(sfd, &self.req.readable()[..window])?
             };
             match r {
                 Io::Done(n) if n > 0 => {
+                    if self.mode == Mode::Http {
+                        if let Some(t) = self.txn.as_mut() {
+                            t.req.consume(self.req.readable(), n);
+                        }
+                    }
                     self.req.consume(n);
                     changed = true;
                 }
@@ -1348,7 +1200,7 @@ impl TcpSession {
             }
         }
 
-        if self.srv_state.can_read() && !self.rep.is_full() {
+        if self.srv_state.can_read() && !self.rep.is_full() && self.reads_server() && !self.srv_cant_recv {
             let r = {
                 let sfd = self
                     .srv
@@ -1379,6 +1231,9 @@ impl TcpSession {
                 Io::Done(n) if n > 0 => {
                     self.rep.commit(n);
                     changed = true;
+                }
+                Io::WouldBlock if self.mode == Mode::Http && !self.srv_xprt.is_tls() => {
+                    self.srv_cant_recv = true;
                 }
                 Io::Done(_) | Io::WouldBlock => {}
             }
@@ -1490,7 +1345,13 @@ impl TcpSession {
             self.ending.get_or_insert(Ending::Timeout(Which::Connect));
             return true;
         }
+        // Once an HTTP request is complete the client owes nothing until its response
+        // starts: the wait belongs to `timeout server`, as in HAProxy.
+        let awaiting_server = self.mode == Mode::Http
+            && self.txn.as_ref().is_some_and(|t| t.req.is_done() && !t.local && t.error.is_none())
+            && !self.has_pending_output();
         if self.cli_exp.is_expired(now)
+            && !awaiting_server
             && matches!(
                 self.cli_state,
                 ScState::Ready | ScState::Established | ScState::ShutR | ScState::ShutW
@@ -1500,7 +1361,10 @@ impl TcpSession {
             self.ending.get_or_insert(Ending::Timeout(Which::Client));
             return true;
         }
+        // A server connection kept idle between HTTP transactions owes nothing.
+        let srv_idle = self.mode == Mode::Http && self.txn.is_none();
         if self.srv_exp.is_expired(now)
+            && !srv_idle
             && matches!(
                 self.srv_state,
                 ScState::Ready | ScState::Established | ScState::ShutR | ScState::ShutW
@@ -1531,15 +1395,6 @@ impl TcpSession {
     /// request buffer stops us asking for client readability, the client's socket
     /// buffer fills, and TCP slows the sender.
     #[must_use]
-    /// Whether bytes in `req` may go to the server. Once a final response has started on an
-    /// HTTP/1 session, anything more from the client is the *next* request: it waits in
-    /// `req` for the transaction to end, and is then routed on its own -- possibly to a new
-    /// server connection. Forwarded straight away, it went down the current connection,
-    /// which the server may be closing, and a keep-alive client's second request was lost.
-    fn request_bytes_forwardable(&self) -> bool {
-        !(self.mode == Mode::Http && self.h2_ctx.is_none() && self.resp_status >= 200)
-    }
-
     pub fn interests(&self) -> (Want, Want) {
         let has_pending = self.has_pending_output();
         // `cli_xprt.wants_write()` is the TLS term. A handshake is mostly the server
@@ -1556,10 +1411,8 @@ impl TcpSession {
                 write: true,
             },
             ScState::Ready | ScState::Established | ScState::ShutR | ScState::ShutW => Want {
-                read: self.srv_state.can_read() && !self.rep.is_full(),
-                write: self.srv_state.can_write()
-                    && ((self.request_bytes_forwardable() && !self.req.is_empty())
-                        || self.srv_xprt.wants_write()),
+                read: self.srv_state.can_read() && !self.rep.is_full() && self.reads_server(),
+                write: self.srv_state.can_write() && (self.req_window() > 0 || self.srv_xprt.wants_write()),
             },
             _ => Want::default(),
         };
@@ -1567,37 +1420,10 @@ impl TcpSession {
     }
 }
 
-/// The status code of a response head, or 0 if the status line does not parse.
-#[must_use]
-pub fn response_status(head: &str) -> u16 {
-    head.split("\r\n")
-        .next()
-        .and_then(|l| l.split(' ').nth(1))
-        .and_then(|c| c.parse().ok())
-        .unwrap_or(0)
-}
-
-/// Whether a response's end is known without the server closing the connection (RFC 9112
-/// section 6.3): no body (HEAD, 1xx, 204, 304), chunked, or a `Content-Length`.
-#[must_use]
-pub fn response_length_known(head: &str, req_method: Option<&str>) -> bool {
-    let status = response_status(head);
-    let mut lines = head.split("\r\n").skip(1);
-    if req_method.is_some_and(|m| m.eq_ignore_ascii_case("HEAD"))
-        || (100..200).contains(&status)
-        || status == 204
-        || status == 304
-    {
-        return true;
-    }
-    lines.any(|l| {
-        l.split_once(':').is_some_and(|(k, v)| {
-            let k = k.trim();
-            k.eq_ignore_ascii_case("content-length")
-                || (k.eq_ignore_ascii_case("transfer-encoding")
-                    && v.to_ascii_lowercase().contains("chunked"))
-        })
-    })
+fn has_header(head: &str, name: &str) -> bool {
+    head.split('\n')
+        .skip(1)
+        .any(|l| l.split_once(':').is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case(name)))
 }
 
 #[must_use]

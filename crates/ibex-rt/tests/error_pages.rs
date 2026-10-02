@@ -14,13 +14,31 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::NamedTempFile;
 
-struct Ibex(Child, Vec<NamedTempFile>);
+struct Ibex {
+    child: Child,
+    _cfgs: Vec<NamedTempFile>,
+}
 
 impl Drop for Ibex {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        stop(&mut self.child);
     }
+}
+
+/// Stops the binary the way it exits cleanly -- `SIGUSR1`, the soft stop -- so an
+/// instrumented build writes its coverage profile; `SIGKILL` discards it, which left every
+/// line these tests run invisible to `harness/covercheck.py`. Killed if it lingers.
+fn stop(child: &mut Child) {
+    let _ = Command::new("kill").arg("-USR1").arg(child.id().to_string()).status();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn page(raw: &str) -> NamedTempFile {
@@ -48,7 +66,7 @@ fn start(cfg: &str, pages: Vec<NamedTempFile>) -> (Ibex, SocketAddr) {
         .expect("spawn ibex");
     let mut files = pages;
     files.push(f);
-    let ibex = Ibex(child, files);
+    let ibex = Ibex { child, _cfgs: files };
     let deadline = Instant::now() + Duration::from_secs(5);
     while TcpStream::connect(fe).is_err() {
         assert!(Instant::now() < deadline, "ibex never started listening on {fe}");

@@ -25,6 +25,7 @@ pub mod logfmt;
 pub mod syslog;
 pub mod poller;
 pub mod proxy;
+pub mod txn;
 pub mod quic_listener;
 pub mod raw;
 pub mod stats;

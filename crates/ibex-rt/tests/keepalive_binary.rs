@@ -50,9 +50,24 @@ struct Ibex(Child, NamedTempFile);
 
 impl Drop for Ibex {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        stop(&mut self.0);
     }
+}
+
+/// Stops the binary the way it exits cleanly -- `SIGUSR1`, the soft stop -- so an
+/// instrumented build writes its coverage profile; `SIGKILL` discards it, which left every
+/// line these tests run invisible to `harness/covercheck.py`. Killed if it lingers.
+fn stop(child: &mut Child) {
+    let _ = Command::new("kill").arg("-USR1").arg(child.id().to_string()).status();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn start(be: SocketAddr, frontend_extra: &str) -> (Ibex, SocketAddr) {
