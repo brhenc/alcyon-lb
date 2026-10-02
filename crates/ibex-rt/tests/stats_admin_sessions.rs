@@ -2,6 +2,8 @@
 // Integration tests for HAProxy Connection Handling and Session Administration.
 // Copyright (C) 2000-2026 Willy Tarreau and Ibex contributors. See LICENSE.
 
+mod common;
+
 use ibex_config::ast::{Config, ListenSection, Mode, Server, StatsConfig};
 use ibex_config::parse_str;
 use ibex_rt::{render_stats_html, render_stats_json, Engine, ServerStatus};
@@ -13,12 +15,6 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 
-fn free_addr() -> SocketAddr {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = l.local_addr().expect("addr");
-    drop(l);
-    addr
-}
 
 fn send_http_request(proxy_addr: SocketAddr, engine: &mut Engine, req: &[u8]) -> String {
     let mut client = TcpStream::connect(proxy_addr).expect("client connect");
@@ -83,7 +79,7 @@ fn test_kill_sessions_web_admin_and_reclaim_actconn() {
     let srv_addr = srv_listener.local_addr().expect("srv addr");
     srv_listener.set_nonblocking(true).expect("nonblocking");
 
-    let proxy_addr = free_addr();
+    let proxy_addr = common::reserve_addr();
     let config = Config {
         listens: vec![ListenSection {
             name: "test_proxy".into(),
@@ -250,7 +246,7 @@ fn test_clear_counters_web_admin_and_cli() {
         "/tmp/ibex_test_clear_counters_{}.sock",
         std::process::id()
     ));
-    let proxy_addr = free_addr();
+    let proxy_addr = common::reserve_addr();
     let cfg_str = format!(
         r"
 listen stats_proxy
@@ -331,7 +327,7 @@ fn test_health_check_enable_disable_web_and_cli() {
         "/tmp/ibex_test_health_toggle_{}.sock",
         std::process::id()
     ));
-    let proxy_addr = free_addr();
+    let proxy_addr = common::reserve_addr();
     let config = Config {
         listens: vec![ListenSection {
             name: "chk_proxy".into(),
@@ -339,7 +335,7 @@ fn test_health_check_enable_disable_web_and_cli() {
             mode: Mode::Http,
             servers: vec![Server {
                 id: "srv1".into(),
-                addr: free_addr(),
+                addr: common::reserve_addr(),
                 check: true,
                 inter: Some(Duration::from_millis(50)),
                 ..Default::default()
@@ -421,7 +417,7 @@ fn test_maxconn_tuning_web_and_cli() {
         "/tmp/ibex_test_maxconn_tuning_{}.sock",
         std::process::id()
     ));
-    let proxy_addr = free_addr();
+    let proxy_addr = common::reserve_addr();
     let config = Config {
         listens: vec![ListenSection {
             name: "maxconn_proxy".into(),
@@ -429,7 +425,7 @@ fn test_maxconn_tuning_web_and_cli() {
             mode: Mode::Http,
             servers: vec![Server {
                 id: "srv1".into(),
-                addr: free_addr(),
+                addr: common::reserve_addr(),
                 maxconn: Some(10),
                 ..Default::default()
             }],
@@ -500,7 +496,7 @@ fn test_maxconn_tuning_web_and_cli() {
 
 #[test]
 fn test_html_dashboard_and_json_render_controls() {
-    let proxy_addr = free_addr();
+    let proxy_addr = common::reserve_addr();
     let config = Config {
         listens: vec![ListenSection {
             name: "web_admin".into(),
@@ -508,7 +504,7 @@ fn test_html_dashboard_and_json_render_controls() {
             mode: Mode::Http,
             servers: vec![Server {
                 id: "srv1".into(),
-                addr: free_addr(),
+                addr: common::reserve_addr(),
                 weight: Some(10),
                 maxconn: Some(50),
                 check: true,

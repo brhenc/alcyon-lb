@@ -1,14 +1,31 @@
-use std::env;
+mod common;
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::process::Command;
-use std::time::Duration;
+
+/// Kills the daemonized ibex when the test ends, pass or panic: a leaked daemon keeps its
+/// port, and with `SO_REUSEPORT` it shares that port with whatever is started on it next.
+struct Daemon(std::path::PathBuf);
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        if let Ok(pid) = std::fs::read_to_string(&self.0) {
+            let _ = Command::new("kill").arg(pid.trim()).output();
+        }
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
 
 #[test]
 fn test_multithread_config_initialization() {
+    let fe = common::reserve_addr();
+    let be = common::reserve_addr();
+    let dir = tempfile::tempdir().unwrap();
     // Write a config with nbthread 4 and custom maxrewrite.
-    let config_path = "/tmp/multithread_test.cfg";
-    let mut f = std::fs::File::create(config_path).unwrap();
+    let config_path = dir.path().join("multithread_test.cfg");
+    let pid_path = dir.path().join("ibex_test.pid");
+    let mut f = std::fs::File::create(&config_path).unwrap();
     f.write_all(b"
 global
     nbthread 4
@@ -21,8 +38,8 @@ defaults
     timeout server  5s
 
 frontend fe
-    bind 127.0.0.1:48192
-    http-request add-header X-Padding ").unwrap();
+    bind ").unwrap();
+    f.write_all(format!("{fe}\n    http-request add-header X-Padding ").as_bytes()).unwrap();
 
     let padding = "A".repeat(1500);
     f.write_all(padding.as_bytes()).unwrap();
@@ -31,36 +48,36 @@ frontend fe
     default_backend be
 
 backend be
-    server s1 127.0.0.1:48193
-").unwrap();
+    server s1 ").unwrap();
+    f.write_all(format!("{be}\n").as_bytes()).unwrap();
     f.flush().unwrap();
 
     // Start a dummy backend
-    let dummy_be = std::net::TcpListener::bind("127.0.0.1:48193").unwrap();
+    let dummy_be = std::net::TcpListener::bind(be).unwrap();
 
-    let exe = env::var("CARGO_BIN_EXE_ibex").unwrap_or_else(|_| "target/debug/ibex".to_string());
+    let exe = env!("CARGO_BIN_EXE_ibex");
     
     let mut child = Command::new(exe)
         .arg("-D")
         .arg("-p")
-        .arg("/tmp/ibex_test.pid")
+        .arg(&pid_path)
         .arg("-f")
-        .arg(config_path)
+        .arg(&config_path)
         .spawn()
         .expect("failed to spawn ibex");
 
     // Wait for it to daemonize
     let status = child.wait().expect("failed to wait on ibex");
     assert!(status.success(), "ibex failed to start: {:?}", status);
+    let _daemon = Daemon(pid_path.clone());
 
-    // Give it a moment to fully initialize
-    std::thread::sleep(Duration::from_millis(500));
+    assert!(common::wait_listening(fe), "ibex did not listen on {fe}");
 
     // Send 100 requests. If any thread did not initialize its thread_locals,
     // the request will fail because the padding is 1500 > default maxrewrite 1024.
     let mut success_count = 0;
     for _ in 0..100 {
-        if let Ok(mut stream) = TcpStream::connect("127.0.0.1:48192") {
+        if let Ok(mut stream) = TcpStream::connect(fe) {
             stream.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
             
             // Accept on dummy backend
@@ -76,11 +93,4 @@ backend be
     }
 
     assert_eq!(success_count, 100, "Not all requests succeeded. Some threads might have failed to initialize maxrewrite.");
-
-    // Clean up
-    if let Ok(pid_str) = std::fs::read_to_string("/tmp/ibex_test.pid") {
-        if let Ok(pid) = pid_str.trim().parse::<i32>() {
-            let _ = std::process::Command::new("kill").arg(pid_str.trim()).output();
-        }
-    }
 }

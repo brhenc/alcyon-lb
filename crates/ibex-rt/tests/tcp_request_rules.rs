@@ -7,6 +7,8 @@
 //! today, and each failure is the point. Do not relax an assertion to get a green run --
 //! the assertion is the specification, and the code is what has to move.
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
@@ -19,13 +21,6 @@ fn ibex_bin() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_BIN_EXE_ibex"))
 }
 
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind")
-        .local_addr()
-        .expect("addr")
-        .port()
-}
 
 fn write_cfg(name: &str, body: &str) -> std::path::PathBuf {
     let p = std::env::temp_dir().join(format!("ibex_tcpreq_{}_{}", std::process::id(), name));
@@ -178,7 +173,7 @@ fn tcp_inspect_cfg(port: u16, backend_port: u16) -> String {
 #[test]
 fn content_inspection_rejects_a_payload_written_in_one_go() {
     let be = Backend::spawn(1, HTTP_OK);
-    let port = free_port();
+    let port = common::reserve_port();
     let cfg = write_cfg("inspect_onego.cfg", &tcp_inspect_cfg(port, be.port));
     let _d = start(&cfg);
     assert!(wait_for_port(port), "the daemon never listened on {port}");
@@ -211,7 +206,7 @@ fn content_inspection_rejects_a_payload_written_in_one_go() {
 #[test]
 fn content_inspection_waits_for_the_payload_not_the_first_byte() {
     let be = Backend::spawn(1, HTTP_OK);
-    let port = free_port();
+    let port = common::reserve_port();
     let cfg = write_cfg("inspect_split.cfg", &tcp_inspect_cfg(port, be.port));
     let _d = start(&cfg);
     assert!(wait_for_port(port), "the daemon never listened on {port}");
@@ -249,7 +244,7 @@ fn content_inspection_waits_for_the_payload_not_the_first_byte() {
 #[test]
 fn fc_src_follows_set_src_at_the_connection_layer() {
     let be = Backend::spawn(1, HTTP_OK);
-    let port = free_port();
+    let port = common::reserve_port();
     let cfg = write_cfg(
         "fc_src.cfg",
         &format!(
@@ -306,7 +301,7 @@ fn fc_src_follows_set_src_at_the_connection_layer() {
 #[test]
 fn a_transaction_variable_does_not_leak_into_the_next_request() {
     let be = Backend::spawn(2, HTTP_OK);
-    let port = free_port();
+    let port = common::reserve_port();
     let cfg = write_cfg(
         "txn_leak.cfg",
         &format!(
@@ -364,7 +359,7 @@ fn a_transaction_variable_does_not_leak_into_the_next_request() {
 /// the action is not being ignored.
 #[test]
 fn a_track_sc_rule_naming_an_undefined_table_is_refused() {
-    let port = free_port();
+    let port = common::reserve_port();
     let cfg = write_cfg(
         "track_undef.cfg",
         &format!(
@@ -399,7 +394,7 @@ fn a_track_sc_rule_naming_an_undefined_table_is_refused() {
 #[test]
 fn backend_tcp_request_content_rules_are_evaluated() {
     let be = Backend::spawn(1, HTTP_OK);
-    let port = free_port();
+    let port = common::reserve_port();
     let cfg = write_cfg(
         "be_content.cfg",
         &format!(
@@ -451,7 +446,7 @@ fn backend_tcp_request_content_rules_are_evaluated() {
 #[test]
 fn inspect_delay_is_a_maximum_not_a_fixed_wait() {
     let be = Backend::spawn_echo(1);
-    let port = free_port();
+    let port = common::reserve_port();
     let cfg = write_cfg(
         "inspect_latency.cfg",
         &format!(
@@ -524,7 +519,7 @@ fn inspect_delay_is_a_maximum_not_a_fixed_wait() {
 #[test]
 fn an_unanchored_payload_match_is_not_decided_by_pattern_length_alone() {
     let be = Backend::spawn(1, HTTP_OK);
-    let port = free_port();
+    let port = common::reserve_port();
     let cfg = write_cfg("inspect_padded.cfg", &tcp_inspect_cfg(port, be.port));
     let _d = start(&cfg);
     assert!(wait_for_port(port), "the daemon never listened on {port}");

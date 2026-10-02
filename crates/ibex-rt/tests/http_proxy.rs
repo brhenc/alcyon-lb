@@ -2,26 +2,22 @@
 // Integration tests for HTTP mode: GET/POST, cookie persistence, and confirmation
 // that the legacy cliexp/srvexp rewrite path is gone.
 
+mod common;
+
 use ibex_config::ast::{Config, HeaderExp, ListenSection, Mode, Server};
 use ibex_rt::engine::Engine;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-fn free_addr() -> SocketAddr {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = l.local_addr().expect("addr");
-    drop(l);
-    addr
-}
 
 #[test]
 fn http_basic_get_and_post() {
-    let srv_addr = free_addr();
-    let proxy_addr = free_addr();
+    let srv_addr = common::reserve_addr();
+    let proxy_addr = common::reserve_addr();
 
     let running = Arc::new(AtomicBool::new(true));
     let r_clone = Arc::clone(&running);
@@ -109,9 +105,9 @@ fn http_basic_get_and_post() {
 
 #[test]
 fn http_cookie_persistence_routes_to_targeted_server() {
-    let srv1_addr = free_addr();
-    let srv2_addr = free_addr();
-    let proxy_addr = free_addr();
+    let srv1_addr = common::reserve_addr();
+    let srv2_addr = common::reserve_addr();
+    let proxy_addr = common::reserve_addr();
 
     let running = Arc::new(AtomicBool::new(true));
     let r1 = Arc::clone(&running);
@@ -204,8 +200,8 @@ fn http_cookie_persistence_routes_to_targeted_server() {
 #[test]
 #[allow(clippy::too_many_lines)] // end-to-end test: server thread, engine, client
 fn legacy_cliexp_srvexp_rewriting_no_longer_applies() {
-    let srv_addr = free_addr();
-    let proxy_addr = free_addr();
+    let srv_addr = common::reserve_addr();
+    let proxy_addr = common::reserve_addr();
 
     let running = Arc::new(AtomicBool::new(true));
     let r_clone = Arc::clone(&running);
@@ -341,8 +337,8 @@ fn legacy_cliexp_srvexp_rewriting_no_longer_applies() {
 fn http_reuse_shares_backend_connection_across_sessions() {
     use std::sync::atomic::AtomicUsize;
 
-    let srv_addr = free_addr();
-    let proxy_addr = free_addr();
+    let srv_addr = common::reserve_addr();
+    let proxy_addr = common::reserve_addr();
 
     let accept_count = Arc::new(AtomicUsize::new(0));
     let ac_clone = Arc::clone(&accept_count);

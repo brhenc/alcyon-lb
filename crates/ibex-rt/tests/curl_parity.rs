@@ -5,6 +5,8 @@
 //! Verifies that real HTTP traffic via `curl` through Ibex returns byte-identical
 //! responses to `HAProxy` 1.0.2 in `mode tcp`.
 
+mod common;
+
 use ibex_rt::proxy::{TcpSession, Timeouts};
 use ibex_rt::{Listener, Poller};
 use ibex_sched::Tick;
@@ -90,10 +92,7 @@ fn spawn_haproxy102(backend_addr: SocketAddr) -> Option<(SocketAddr, std::proces
         return None;
     }
 
-    // Allocate free port
-    let dummy = TcpListener::bind(loopback0()).expect("dummy bind");
-    let front_port = dummy.local_addr().expect("port").port();
-    drop(dummy);
+    let front_port = common::reserve_port();
 
     let front_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, front_port));
 

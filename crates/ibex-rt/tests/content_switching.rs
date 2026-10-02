@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Integration tests for Milestone 2: Dynamic Content Switching & ACL-based Routing.
 
+mod common;
+
 use ibex_config::ast::{
     AclCondition, AclRule, AclTerm, BackendSection, Config, FrontendSection, Mode, Server,
     UseBackendRule,
@@ -13,12 +15,6 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-fn free_addr() -> SocketAddr {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = l.local_addr().expect("addr");
-    drop(l);
-    addr
-}
 
 fn start_dummy_backend(
     addr: SocketAddr,
@@ -57,10 +53,10 @@ fn start_dummy_backend(
 #[test]
 #[allow(clippy::too_many_lines)]
 fn test_acl_content_switching_path_and_default_backend() {
-    let api_srv_addr = free_addr();
-    let static_srv_addr = free_addr();
-    let default_srv_addr = free_addr();
-    let fe_addr = free_addr();
+    let api_srv_addr = common::reserve_addr();
+    let static_srv_addr = common::reserve_addr();
+    let default_srv_addr = common::reserve_addr();
+    let fe_addr = common::reserve_addr();
 
     let running = Arc::new(AtomicBool::new(true));
     let h1 = start_dummy_backend(api_srv_addr, "API_ENDPOINT", Arc::clone(&running));
@@ -193,9 +189,9 @@ fn test_acl_content_switching_path_and_default_backend() {
 
 #[test]
 fn test_load_balancing_round_robin() {
-    let srv1_addr = free_addr();
-    let srv2_addr = free_addr();
-    let fe_addr = free_addr();
+    let srv1_addr = common::reserve_addr();
+    let srv2_addr = common::reserve_addr();
+    let fe_addr = common::reserve_addr();
 
     let running = Arc::new(AtomicBool::new(true));
     let h1 = start_dummy_backend(srv1_addr, "SRV_ONE", Arc::clone(&running));
@@ -277,9 +273,9 @@ fn test_load_balancing_round_robin() {
 
 #[test]
 fn test_load_balancing_source_ip() {
-    let srv1_addr = free_addr();
-    let srv2_addr = free_addr();
-    let fe_addr = free_addr();
+    let srv1_addr = common::reserve_addr();
+    let srv2_addr = common::reserve_addr();
+    let fe_addr = common::reserve_addr();
 
     let running = Arc::new(AtomicBool::new(true));
     let h1 = start_dummy_backend(srv1_addr, "SRV_ONE", Arc::clone(&running));

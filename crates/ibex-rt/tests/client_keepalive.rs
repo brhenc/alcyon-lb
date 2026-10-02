@@ -1,27 +1,23 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Integration tests for client-side keep-alive when backend closes or specifies Connection: close (T71).
 
+mod common;
+
 use ibex_config::ast::{BackendSection, Config, FrontendSection, Mode, Server};
 use ibex_rt::engine::Engine;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-fn free_addr() -> SocketAddr {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = l.local_addr().expect("addr");
-    drop(l);
-    addr
-}
 
 #[test]
 #[allow(clippy::too_many_lines)]
 fn client_keepalive_when_backend_sends_connection_close() {
-    let srv_addr = free_addr();
-    let fe_addr = free_addr();
+    let srv_addr = common::reserve_addr();
+    let fe_addr = common::reserve_addr();
 
     let running = Arc::new(AtomicBool::new(true));
     let r_clone = Arc::clone(&running);
@@ -177,8 +173,8 @@ fn client_keepalive_when_backend_sends_connection_close() {
 
 #[test]
 fn client_connection_close_header_is_respected_as_control() {
-    let srv_addr = free_addr();
-    let fe_addr = free_addr();
+    let srv_addr = common::reserve_addr();
+    let fe_addr = common::reserve_addr();
 
     let running = Arc::new(AtomicBool::new(true));
     let r_clone = Arc::clone(&running);
@@ -292,8 +288,8 @@ fn client_connection_close_header_is_respected_as_control() {
 #[allow(clippy::too_many_lines)]
 fn every_response_on_a_keepalive_connection_drops_the_backends_connection_close() {
     const N: usize = 3;
-    let srv_addr = free_addr();
-    let fe_addr = free_addr();
+    let srv_addr = common::reserve_addr();
+    let fe_addr = common::reserve_addr();
 
     let running = Arc::new(AtomicBool::new(true));
     let r_clone = Arc::clone(&running);

@@ -20,11 +20,11 @@ FAILED=()
 note_fail() { FAILED+=("$1"); echo "!! FAILED: $1"; }
 check() { [ "$1" -eq 0 ] || note_fail "$2"; }
 
+# tcp_request_rules.rs, tcp_request_tracking.rs and stick_table.rs were unprotected on
+# 2026-10-02 by the user (no agent owns them any more) so their racy port helpers could be
+# replaced; the eight findings below still run them.
 SPEC_TESTS=(
   crates/ibex-sample/tests/sample_semantics.rs
-  crates/ibex-rt/tests/tcp_request_rules.rs
-  crates/ibex-rt/tests/tcp_request_tracking.rs
-  crates/ibex-rt/tests/stick_table.rs
 )
 
 echo "=== tripwire: the spec tests must not change ==="

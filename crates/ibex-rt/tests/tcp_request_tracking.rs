@@ -25,6 +25,8 @@
 //! All three are fixed. These tests exist to keep them fixed: each one distinguishes
 //! "the rule tracked" from "something tracked", which is the distinction that was missing.
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
@@ -39,12 +41,6 @@ use ibex_config::ast::{
 };
 use ibex_rt::engine::Engine;
 
-fn free_addr() -> SocketAddr {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = l.local_addr().expect("addr");
-    drop(l);
-    addr
-}
 
 fn start_dummy_backend(
     addr: SocketAddr,
@@ -92,7 +88,7 @@ fn table_config() -> StickTableConfigAst {
 
 /// Drives `requests` requests through `frontend` and returns what `show table` reports.
 fn run_and_show_table(frontend: FrontendSection, fe_addr: SocketAddr, requests: usize) -> String {
-    let srv_addr = free_addr();
+    let srv_addr = common::reserve_addr();
     let running = Arc::new(AtomicBool::new(true));
     let backend = start_dummy_backend(srv_addr, Arc::clone(&running));
 
@@ -196,7 +192,7 @@ fn counter(dump: &str, name: &str) -> Option<u64> {
 /// the daemon allocate is the whole question.
 #[test]
 fn a_stick_table_is_not_populated_without_a_tracking_rule() {
-    let fe_addr = free_addr();
+    let fe_addr = common::reserve_addr();
     let dump = run_and_show_table(
         FrontendSection {
             name: "fe_untracked".into(),
@@ -237,7 +233,7 @@ fn a_stick_table_is_not_populated_without_a_tracking_rule() {
 /// rule is present and unchanged in both cases; only the unrelated rule differs.
 #[test]
 fn an_unrelated_http_request_rule_does_not_switch_off_tracking() {
-    let fe_addr = free_addr();
+    let fe_addr = common::reserve_addr();
     let tracked = || FrontendSection {
         name: "fe_track".into(),
         bind: Some(fe_addr),
@@ -262,7 +258,7 @@ fn an_unrelated_http_request_rule_does_not_switch_off_tracking() {
     );
 
     // The same tracking rule, plus one rule that has nothing to do with tracking.
-    let fe_addr2 = free_addr();
+    let fe_addr2 = common::reserve_addr();
     let mut with_header = tracked();
     with_header.bind = Some(fe_addr2);
     with_header.http_req_rules = vec![HttpReqRule {
@@ -301,7 +297,7 @@ fn an_unrelated_http_request_rule_does_not_switch_off_tracking() {
 /// keyword at all.
 #[test]
 fn track_sc0_at_content_scope_populates_the_stick_table() {
-    let fe_addr = free_addr();
+    let fe_addr = common::reserve_addr();
     let dump = run_and_show_table(
         FrontendSection {
             name: "fe_content_track".into(),

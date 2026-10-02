@@ -9,14 +9,17 @@ test, because it is counted as coverage.
 
 Two things make this usable as a gate rather than noise:
 
-  * A failing target is re-run **alone** before it counts. `tcp_proxy` passes 17/17 by
-    itself and failed in the full run purely on port contention with the other targets
-    running in parallel; `fc_src_is_the_real_peer_after_set_src` did the same thing
-    earlier. Without the retry the gate would be red about a third of the time and would
-    stop being read, which is the failure mode this script exists to fix.
+  * A failing target is re-run **alone**, `ALONE_RUNS` times. A test that fails in any of
+    those runs is a confirmed failure. One that failed only in the parallel run is
+    *flaky*: it is named, and it fails the gate like any other failure unless the
+    baseline lists it with a reason. This script used to re-run once and call a
+    single pass "flaky, not counted", and `keepalive_binary` was then excused while it
+    failed alone 4 runs in 12. A flake is a race in the test or in ibex, and the gate
+    is where it gets noticed.
 
-  * Known failures live in `data/suite_baseline.json` with a reason each. A *new* failure
-    fails the gate. A baselined failure that starts passing is reported too, so the
+  * Known failures live in `data/suite_baseline.json` with a reason each
+    (`known_failures`, and `known_flaky` for parallel-only failures). A *new* failure
+    fails the gate. A baselined entry that no longer fails is reported too, so the
     baseline gets tightened instead of quietly protecting a test that no longer needs it.
 
 Usage:  python3 harness/suite.py            # gate
@@ -38,11 +41,17 @@ BASELINE = os.path.join(REPO, "data", "suite_baseline.json")
 # failure is silently reclassified as a flake. That made the gate pass everything once.
 TARGET_RE = re.compile(r"^\s+`?-p ([^\s`]+) --test ([^\s`]+)`?\s*$")
 FAIL_RE = re.compile(r"^test (\S+) \.\.\. FAILED\s*$", re.M)
+# `     Running tests/foo.rs (target/debug/deps/foo-0123abcd)`, one per test binary.
+RUNNING_RE = re.compile(r"^\s+Running (?:unittests )?(?:\S+/)?([^/\s]+?)(?:\.rs)? \(\S+\)\s*$")
+ALONE_RUNS = 3
 
 
 def run(args: list[str], timeout: int = 1800) -> str:
-    p = subprocess.run(args, cwd=REPO, capture_output=True, text=True, timeout=timeout)
-    return p.stdout + p.stderr
+    # One stream, interleaved as written: cargo prints `Running <target>` on stderr and the
+    # test results on stdout, and `failed_by_target` needs them in order.
+    p = subprocess.run(args, cwd=REPO, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                       text=True, timeout=timeout)
+    return p.stdout
 
 
 def failing_targets(out: str) -> list[tuple[str, str]]:
@@ -61,10 +70,36 @@ def failing_targets(out: str) -> list[tuple[str, str]]:
     return targets
 
 
-def confirm(pkg: str, target: str) -> list[str]:
-    """Re-run one target alone. Returns the tests that still fail."""
-    out = run(["cargo", "test", "-p", pkg, "--test", target, "--no-fail-fast"])
-    return sorted(set(FAIL_RE.findall(out)))
+def failed_by_target(out: str) -> dict[str, set[str]]:
+    """The failing tests of each test binary in a cargo run, keyed by target name."""
+    failed: dict[str, set[str]] = {}
+    target = None
+    for line in out.splitlines():
+        m = RUNNING_RE.match(line)
+        if m:
+            target = m.group(1)
+            continue
+        f = FAIL_RE.match(line)
+        if f and target:
+            failed.setdefault(target, set()).add(f.group(1))
+    return failed
+
+
+def confirm(pkg: str, target: str) -> tuple[set[str], int]:
+    """Re-run one target alone `ALONE_RUNS` times.
+
+    Returns the tests that failed in any of those runs, and how many runs failed. A run that
+    fails without naming a test (a crash, a timeout) counts as the whole target failing."""
+    failed: set[str] = set()
+    bad_runs = 0
+    for _ in range(ALONE_RUNS):
+        p = subprocess.run(["cargo", "test", "-p", pkg, "--test", target, "--no-fail-fast"],
+                           cwd=REPO, capture_output=True, text=True, timeout=1800)
+        names = set(FAIL_RE.findall(p.stdout + p.stderr))
+        if p.returncode != 0:
+            bad_runs += 1
+            failed |= names or {"<target>"}
+    return failed, bad_runs
 
 
 def main() -> int:
@@ -77,38 +112,52 @@ def main() -> int:
         print("suite: could not parse cargo's failing-target list; treating as failure")
         return 1
 
+    in_parallel = failed_by_target(out)
     confirmed: dict[str, str] = {}
+    flaky: dict[str, str] = {}
     for pkg, target in targets:
-        still = confirm(pkg, target)
+        still, bad_runs = confirm(pkg, target)
         for name in still:
             confirmed[f"{pkg}/{target}::{name}"] = ""
-        flaked = set()
-        if not still:
-            flaked.add(target)
-        if flaked:
-            print(f"   {pkg}/{target}: failed in the parallel run, passes alone -- flaky, not counted")
+        if still:
+            print(f"   {pkg}/{target}: fails alone in {bad_runs}/{ALONE_RUNS} runs")
+        # A target whose parallel results could not be read: flaky only if it then passed
+        # alone every time.
+        only_parallel = in_parallel.get(target, set() if still else {"<target>"}) - still
+        for name in sorted(only_parallel):
+            flaky[f"{pkg}/{target}::{name}"] = ""
+            print(f"   {pkg}/{target}::{name}: failed in the parallel run, passes alone "
+                  f"{ALONE_RUNS}/{ALONE_RUNS} -- flaky")
 
-    base = {}
-    if os.path.exists(BASELINE):
-        base = json.load(open(BASELINE)).get("known_failures", {})
+    doc = json.load(open(BASELINE)) if os.path.exists(BASELINE) else {}
+    base = doc.get("known_failures", {})
+    base_flaky = doc.get("known_flaky", {})
 
     new = sorted(k for k in confirmed if k not in base)
+    new_flaky = sorted(k for k in flaky if k not in base_flaky and k not in base)
     fixed = sorted(k for k in base if k not in confirmed)
 
     if accept:
-        merged = {k: base.get(k, "recorded by --accept; reason not stated") for k in confirmed}
-        json.dump({"known_failures": merged}, open(BASELINE, "w"), indent=1, sort_keys=True)
+        unstated = "recorded by --accept; reason not stated"
+        doc = {"known_failures": {k: base.get(k, unstated) for k in confirmed},
+               "known_flaky": {k: base_flaky.get(k, unstated) for k in flaky}}
+        json.dump(doc, open(BASELINE, "w"), indent=1, sort_keys=True)
         open(BASELINE, "a").write("\n")
-        print(f"suite: baseline rewritten with {len(merged)} known failures")
+        print(f"suite: baseline rewritten with {len(confirmed)} known failures, "
+              f"{len(flaky)} known flaky")
         return 0
 
-    print(f"suite: {len(confirmed)} confirmed failing, {len(base)} baselined")
+    print(f"suite: {len(confirmed)} confirmed failing, {len(flaky)} flaky, "
+          f"{len(base)} + {len(base_flaky)} baselined")
     for k in fixed:
         print(f"   now passing (tighten the baseline): {k}")
-    if new:
+    # A known-flaky test that passed this time proves nothing, so it is not reported as fixed.
+    if new or new_flaky:
         print("suite: NEW FAILURES")
         for k in new:
             print(f"   {k}")
+        for k in new_flaky:
+            print(f"   {k} (flaky: parallel run only)")
         return 1
     print("suite: clean" + (" (baselined failures unchanged)" if base else ""))
     return 0

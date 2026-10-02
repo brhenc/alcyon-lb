@@ -23,6 +23,8 @@
 //! Emulating `HAProxy` here is a compatibility decision, not an endorsement of its
 //! defaults — see `tradeoff.md` §6.8.
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
@@ -36,13 +38,6 @@ fn ibex_bin() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_BIN_EXE_ibex"))
 }
 
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind")
-        .local_addr()
-        .expect("addr")
-        .port()
-}
 
 struct Daemon(Child);
 impl Drop for Daemon {
@@ -208,7 +203,7 @@ fn cfg_with(global: &str, port: u16, backend_port: u16) -> String {
 fn without_configuration_a_reset_flood_is_not_killed() {
     let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let (backend_port, _seen) = spawn_backend();
-    let port = free_port();
+    let port = common::reserve_port();
     let cfg = write_cfg("default.cfg", &cfg_with("", port, backend_port));
     let _d = start(&cfg);
     assert!(wait_for_port(port), "the daemon never listened on {port}");
@@ -236,7 +231,7 @@ fn without_configuration_a_reset_flood_is_not_killed() {
 fn max_total_streams_closes_the_connection_at_the_cap() {
     let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let (backend_port, _seen) = spawn_backend();
-    let port = free_port();
+    let port = common::reserve_port();
     let cfg = write_cfg(
         "maxtotal.cfg",
         &cfg_with("global\n\ttune.h2.fe.max-total-streams 50\n\n", port, backend_port),
@@ -267,7 +262,7 @@ fn max_total_streams_closes_the_connection_at_the_cap() {
 fn glitches_threshold_sends_a_graceful_goaway_before_killing() {
     let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let (backend_port, _seen) = spawn_backend();
-    let port = free_port();
+    let port = common::reserve_port();
     let cfg = write_cfg(
         "glitches.cfg",
         &cfg_with("global\n\ttune.h2.fe.glitches-threshold 100\n\n", port, backend_port),

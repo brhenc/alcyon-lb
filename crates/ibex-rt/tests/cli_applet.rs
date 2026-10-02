@@ -2,6 +2,8 @@
 // Integration tests for CLI Applet and Unix Domain Socket (hatop compatibility).
 // Copyright (C) 2000-2026 Willy Tarreau and Ibex contributors. See LICENSE.
 
+mod common;
+
 use ibex_config::parse_str;
 use ibex_rt::Engine;
 use ibex_sched::Tick;
@@ -10,14 +12,15 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
 fn create_test_engine(socket_path: &PathBuf) -> Engine {
-    let cfg_str = r"
-listen test_proxy
-    bind 127.0.0.1:28080
-    mode tcp
-    server srv1 127.0.0.1:29091
-    server srv2 127.0.0.1:29092
-";
-    let config = parse_str(cfg_str).expect("failed to parse test config");
+    // The servers are never connected to. The frontend port is reserved: every test here
+    // builds an engine, and with SO_REUSEPORT a shared fixed port does not fail to bind,
+    // it silently joins the other engines.
+    let cfg_str = format!(
+        "listen test_proxy\n    bind {}\n    mode tcp\n    server srv1 127.0.0.1:29091\n    \
+         server srv2 127.0.0.1:29092\n",
+        common::reserve_addr()
+    );
+    let config = parse_str(&cfg_str).expect("failed to parse test config");
     let mut engine = Engine::new(&config, 1024).expect("failed to create engine");
     engine
         .bind_cli_socket(socket_path)
@@ -284,8 +287,14 @@ fn cli_applet_one_shot_non_interactive_command() {
     );
 }
 
+/// `tune.bufsize` is process-global. `cli_applet_show_pools_configured_sizes` sets it while
+/// `cli_applet_show_pools` reads it to warm a buffer and again to check the answer; run in
+/// parallel, the size could change between the two and the check failed.
+static BUFSIZE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn cli_applet_show_pools() {
+    let _g = BUFSIZE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let socket_path = PathBuf::from(format!(
         "/tmp/ibex_test_pools_{}.sock",
         std::process::id()
@@ -348,18 +357,13 @@ fn cli_applet_show_pools_configured_sizes() {
         "/tmp/ibex_test_pools_cfg_{}.sock",
         std::process::id()
     ));
-    let cfg_str = r"
-global
-    tune.bufsize 32768
-    tune.bufsize.small 2048
-    tune.bufsize.large 65536
-
-listen test_proxy
-    bind 127.0.0.1:28082
-    mode tcp
-    server srv1 127.0.0.1:29093
-";
-    let config = parse_str(cfg_str).expect("failed to parse test config");
+    let _g = BUFSIZE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let cfg_str = format!(
+        "global\n    tune.bufsize 32768\n    tune.bufsize.small 2048\n    tune.bufsize.large 65536\n\n\
+         listen test_proxy\n    bind {}\n    mode tcp\n    server srv1 127.0.0.1:29093\n",
+        common::reserve_addr()
+    );
+    let config = parse_str(&cfg_str).expect("failed to parse test config");
     let mut engine = Engine::new(&config, 1024).expect("failed to create engine");
     engine
         .bind_cli_socket(&socket_path)

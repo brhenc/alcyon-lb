@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Integration and End-to-End tests for PROXY protocol (v1 & v2) support in Project Ibex.
 
+mod common;
+
 use ibex_config::ast::{BalanceAlgorithm, Config, ListenSection, Mode, Server};
 use ibex_proto::{
     parse_proxy_header, update_crc32c_in_buffer, ProxyCommand, ProxyHeader, ProxyTransport,
@@ -8,23 +10,17 @@ use ibex_proto::{
 };
 use ibex_rt::engine::Engine;
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-fn free_addr() -> SocketAddr {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = l.local_addr().expect("addr");
-    drop(l);
-    addr
-}
 
 #[test]
 fn test_frontend_accept_proxy_v1_http() {
-    let srv_addr = free_addr();
-    let proxy_addr = free_addr();
+    let srv_addr = common::reserve_addr();
+    let proxy_addr = common::reserve_addr();
 
     let running = Arc::new(AtomicBool::new(true));
     let r_clone = Arc::clone(&running);
@@ -116,8 +112,8 @@ fn test_frontend_accept_proxy_v1_http() {
 
 #[test]
 fn test_frontend_accept_proxy_v2_tcp() {
-    let srv_addr = free_addr();
-    let proxy_addr = free_addr();
+    let srv_addr = common::reserve_addr();
+    let proxy_addr = common::reserve_addr();
 
     let running = Arc::new(AtomicBool::new(true));
     let r_clone = Arc::clone(&running);
@@ -223,8 +219,8 @@ fn test_frontend_accept_proxy_v2_tcp() {
 
 #[test]
 fn test_frontend_accept_proxy_v2_strict_rejects_v1() {
-    let srv_addr = free_addr();
-    let proxy_addr = free_addr();
+    let srv_addr = common::reserve_addr();
+    let proxy_addr = common::reserve_addr();
 
     let config = Config {
         listens: vec![ListenSection {
@@ -270,8 +266,8 @@ fn test_frontend_accept_proxy_v2_strict_rejects_v1() {
 
 #[test]
 fn test_frontend_rejects_malformed_proxy_header() {
-    let srv_addr = free_addr();
-    let proxy_addr = free_addr();
+    let srv_addr = common::reserve_addr();
+    let proxy_addr = common::reserve_addr();
 
     let config = Config {
         listens: vec![ListenSection {
@@ -315,8 +311,8 @@ fn test_frontend_rejects_malformed_proxy_header() {
 
 #[test]
 fn test_backend_send_proxy_v1() {
-    let srv_addr = free_addr();
-    let proxy_addr = free_addr();
+    let srv_addr = common::reserve_addr();
+    let proxy_addr = common::reserve_addr();
 
     let running = Arc::new(AtomicBool::new(true));
     let r_clone = Arc::clone(&running);
@@ -405,8 +401,8 @@ fn test_backend_send_proxy_v1() {
 
 #[test]
 fn test_backend_send_proxy_v2() {
-    let srv_addr = free_addr();
-    let proxy_addr = free_addr();
+    let srv_addr = common::reserve_addr();
+    let proxy_addr = common::reserve_addr();
 
     let running = Arc::new(AtomicBool::new(true));
     let r_clone = Arc::clone(&running);
@@ -503,9 +499,9 @@ fn test_backend_send_proxy_v2() {
 fn test_chained_proxy_protocol_e2e() {
     // Architecture:
     // Client -> Ibex 1 [accept-proxy, send-proxy-v2] -> Ibex 2 [accept-proxy] -> Backend Server
-    let backend_addr = free_addr();
-    let ibex2_addr = free_addr();
-    let ibex1_addr = free_addr();
+    let backend_addr = common::reserve_addr();
+    let ibex2_addr = common::reserve_addr();
+    let ibex1_addr = common::reserve_addr();
 
     let running = Arc::new(AtomicBool::new(true));
     let r_clone = Arc::clone(&running);
@@ -618,9 +614,9 @@ fn test_chained_proxy_protocol_e2e() {
 
 #[test]
 fn test_source_ip_hash_uses_real_client_ip_from_proxy_header() {
-    let srv1_addr = free_addr();
-    let srv2_addr = free_addr();
-    let proxy_addr = free_addr();
+    let srv1_addr = common::reserve_addr();
+    let srv2_addr = common::reserve_addr();
+    let proxy_addr = common::reserve_addr();
 
     let running = Arc::new(AtomicBool::new(true));
     let r1 = Arc::clone(&running);
@@ -715,8 +711,8 @@ fn test_source_ip_hash_uses_real_client_ip_from_proxy_header() {
 
 #[test]
 fn test_frontend_accept_proxy_fragmented_chunks() {
-    let srv_addr = free_addr();
-    let proxy_addr = free_addr();
+    let srv_addr = common::reserve_addr();
+    let proxy_addr = common::reserve_addr();
 
     let running = Arc::new(AtomicBool::new(true));
     let r_clone = Arc::clone(&running);
@@ -807,8 +803,8 @@ fn test_frontend_accept_proxy_fragmented_chunks() {
 
 #[test]
 fn test_backend_send_proxy_v2_with_forwarded_tlvs() {
-    let srv_addr = free_addr();
-    let proxy_addr = free_addr();
+    let srv_addr = common::reserve_addr();
+    let proxy_addr = common::reserve_addr();
 
     let running = Arc::new(AtomicBool::new(true));
     let r_clone = Arc::clone(&running);

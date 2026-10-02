@@ -6,6 +6,8 @@
 //! byte-exact forwarding in both directions, half-close preserving in-flight data,
 //! shutdown propagation, and backpressure via buffer occupancy.
 
+mod common;
+
 use ibex_config::ast::{
     BackendSection, Config, FrontendSection, Mode, Server, StickTableConfigAst,
     TcpReqConnAction, TcpReqConnRule, TcpReqContentAction, TcpReqContentRule,
@@ -311,20 +313,6 @@ fn poller_and_fdtab_integrate_with_a_session() {
     assert_eq!(fds.live(), 1);
 }
 
-fn free_addr() -> SocketAddr {
-    static NEXT_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
-    let pid_offset = u16::try_from(std::process::id() % 10000).unwrap_or(0);
-    let base = 30000 + pid_offset;
-    loop {
-        let offset = NEXT_PORT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let port = base + (offset % 20000);
-        let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
-        if let Ok(l) = TcpListener::bind(addr) {
-            drop(l);
-            return addr;
-        }
-    }
-}
 
 fn start_dummy_backend(
     running: Arc<AtomicBool>,
@@ -436,7 +424,7 @@ fn run_and_show_table(mut frontend: FrontendSection, requests: usize) -> String 
 
 #[test]
 fn sc_inc_gpc0_increments_counter_and_reports_via_show_table() {
-    let fe_addr = free_addr();
+    let fe_addr = common::reserve_addr();
     let frontend = FrontendSection {
         name: "fe_gpc0".into(),
         bind: Some(fe_addr),
@@ -666,7 +654,7 @@ impl TestBackend {
 #[test]
 fn test_unanchored_end_matcher_waits_for_payload() {
     let be = TestBackend::spawn(1);
-    let port = free_addr().port();
+    let port = common::reserve_addr().port();
     let cfg_body = format!(
         "defaults\n\tmode tcp\n\ttimeout connect 3s\n\ttimeout client 5s\n\ttimeout server 5s\n\n\
          frontend fe\n\tbind 127.0.0.1:{port}\n\t\
@@ -700,7 +688,7 @@ fn test_unanchored_end_matcher_waits_for_payload() {
 #[test]
 fn test_unanchored_reg_matcher_waits_for_payload() {
     let be = TestBackend::spawn(1);
-    let port = free_addr().port();
+    let port = common::reserve_addr().port();
     let cfg_body = format!(
         "defaults\n\tmode tcp\n\ttimeout connect 3s\n\ttimeout client 5s\n\ttimeout server 5s\n\n\
          frontend fe\n\tbind 127.0.0.1:{port}\n\t\
@@ -734,7 +722,7 @@ fn test_unanchored_reg_matcher_waits_for_payload() {
 #[test]
 fn test_anchored_str_matcher_decides_immediately_without_waiting() {
     let be = TestBackend::spawn_echo(1);
-    let port = free_addr().port();
+    let port = common::reserve_addr().port();
     let cfg_body = format!(
         "defaults\n\tmode tcp\n\ttimeout connect 3s\n\ttimeout client 20s\n\ttimeout server 20s\n\n\
          frontend fe\n\tbind 127.0.0.1:{port}\n\t\
@@ -772,7 +760,7 @@ fn test_anchored_str_matcher_decides_immediately_without_waiting() {
 #[test]
 fn test_threshold_padding_lengths_around_pattern_size() {
     let be = TestBackend::spawn(3);
-    let port = free_addr().port();
+    let port = common::reserve_addr().port();
     let cfg_body = format!(
         "defaults\n\tmode tcp\n\ttimeout connect 3s\n\ttimeout client 5s\n\ttimeout server 5s\n\n\
          frontend fe\n\tbind 127.0.0.1:{port}\n\t\
@@ -811,7 +799,7 @@ fn test_threshold_padding_lengths_around_pattern_size() {
 #[test]
 fn test_tcp_request_connection_reject_and_silent_drop() {
     // 1. Connection reject
-    let fe_addr1 = free_addr();
+    let fe_addr1 = common::reserve_addr();
     let config_reject = Config {
         frontends: vec![FrontendSection {
             name: "fe_conn_reject".into(),
@@ -829,17 +817,14 @@ fn test_tcp_request_connection_reject_and_silent_drop() {
     let mut engine = Engine::new(&config_reject, 64).expect("Engine::new");
     let client = TcpStream::connect(fe_addr1).expect("connect");
     drop(client);
-    for _ in 0..5 {
-        let _ = engine.run_once();
-        thread::sleep(Duration::from_millis(5));
-    }
+    common::drive_until(&mut engine, |e| e.proxies[0].stats[0].denied_conn.load(std::sync::atomic::Ordering::Relaxed) >= 1);
     assert_eq!(
         engine.proxies[0].stats[0].denied_conn.load(std::sync::atomic::Ordering::Relaxed), 1,
         "tcp-request connection reject must increment denied_conn"
     );
 
     // 2. Connection silent-drop
-    let fe_addr2 = free_addr();
+    let fe_addr2 = common::reserve_addr();
     let config_drop = Config {
         frontends: vec![FrontendSection {
             name: "fe_conn_drop".into(),
@@ -857,10 +842,7 @@ fn test_tcp_request_connection_reject_and_silent_drop() {
     let mut engine2 = Engine::new(&config_drop, 64).expect("Engine::new");
     let client2 = TcpStream::connect(fe_addr2).expect("connect");
     drop(client2);
-    for _ in 0..5 {
-        let _ = engine2.run_once();
-        thread::sleep(Duration::from_millis(5));
-    }
+    common::drive_until(&mut engine2, |e| e.proxies[0].stats[0].denied_conn.load(std::sync::atomic::Ordering::Relaxed) >= 1);
     assert_eq!(
         engine2.proxies[0].stats[0].denied_conn.load(std::sync::atomic::Ordering::Relaxed), 1,
         "tcp-request connection silent-drop must increment denied_conn"
@@ -870,7 +852,7 @@ fn test_tcp_request_connection_reject_and_silent_drop() {
 #[test]
 fn test_tcp_request_session_reject_and_silent_drop() {
     // 1. Session reject
-    let fe_addr1 = free_addr();
+    let fe_addr1 = common::reserve_addr();
     let config_reject = Config {
         frontends: vec![FrontendSection {
             name: "fe_sess_reject".into(),
@@ -888,17 +870,14 @@ fn test_tcp_request_session_reject_and_silent_drop() {
     let mut engine = Engine::new(&config_reject, 64).expect("Engine::new");
     let client = TcpStream::connect(fe_addr1).expect("connect");
     drop(client);
-    for _ in 0..5 {
-        let _ = engine.run_once();
-        thread::sleep(Duration::from_millis(5));
-    }
+    common::drive_until(&mut engine, |e| e.proxies[0].stats[0].denied_req.load(std::sync::atomic::Ordering::Relaxed) >= 1);
     assert_eq!(
         engine.proxies[0].stats[0].denied_req.load(std::sync::atomic::Ordering::Relaxed), 1,
         "tcp-request session reject must increment denied_req"
     );
 
     // 2. Session silent-drop
-    let fe_addr2 = free_addr();
+    let fe_addr2 = common::reserve_addr();
     let config_drop = Config {
         frontends: vec![FrontendSection {
             name: "fe_sess_drop".into(),
@@ -916,10 +895,7 @@ fn test_tcp_request_session_reject_and_silent_drop() {
     let mut engine2 = Engine::new(&config_drop, 64).expect("Engine::new");
     let client2 = TcpStream::connect(fe_addr2).expect("connect");
     drop(client2);
-    for _ in 0..5 {
-        let _ = engine2.run_once();
-        thread::sleep(Duration::from_millis(5));
-    }
+    common::drive_until(&mut engine2, |e| e.proxies[0].stats[0].denied_req.load(std::sync::atomic::Ordering::Relaxed) >= 1);
     assert_eq!(
         engine2.proxies[0].stats[0].denied_req.load(std::sync::atomic::Ordering::Relaxed), 1,
         "tcp-request session silent-drop must increment denied_req"
@@ -929,7 +905,7 @@ fn test_tcp_request_session_reject_and_silent_drop() {
 #[test]
 fn test_tcp_request_content_reject_and_silent_drop() {
     // 1. Content reject
-    let fe_addr1 = free_addr();
+    let fe_addr1 = common::reserve_addr();
     let config_reject = Config {
         frontends: vec![FrontendSection {
             name: "fe_cnt_reject".into(),
@@ -948,17 +924,14 @@ fn test_tcp_request_content_reject_and_silent_drop() {
     let mut engine = Engine::new(&config_reject, 64).expect("Engine::new");
     let mut client = TcpStream::connect(fe_addr1).expect("connect");
     let _ = client.write_all(b"HELLO");
-    for _ in 0..5 {
-        let _ = engine.run_once();
-        thread::sleep(Duration::from_millis(5));
-    }
+    common::drive_until(&mut engine, |e| e.proxies[0].stats[0].denied_req.load(std::sync::atomic::Ordering::Relaxed) >= 1);
     assert_eq!(
         engine.proxies[0].stats[0].denied_req.load(std::sync::atomic::Ordering::Relaxed), 1,
         "tcp-request content reject must increment denied_req"
     );
 
     // 2. Content silent-drop
-    let fe_addr2 = free_addr();
+    let fe_addr2 = common::reserve_addr();
     let config_drop = Config {
         frontends: vec![FrontendSection {
             name: "fe_cnt_drop".into(),
@@ -977,10 +950,7 @@ fn test_tcp_request_content_reject_and_silent_drop() {
     let mut engine2 = Engine::new(&config_drop, 64).expect("Engine::new");
     let mut client2 = TcpStream::connect(fe_addr2).expect("connect");
     let _ = client2.write_all(b"HELLO");
-    for _ in 0..5 {
-        let _ = engine2.run_once();
-        thread::sleep(Duration::from_millis(5));
-    }
+    common::drive_until(&mut engine2, |e| e.proxies[0].stats[0].denied_req.load(std::sync::atomic::Ordering::Relaxed) >= 1);
     assert_eq!(
         engine2.proxies[0].stats[0].denied_req.load(std::sync::atomic::Ordering::Relaxed), 1,
         "tcp-request content silent-drop must increment denied_req"
@@ -995,7 +965,7 @@ fn test_header_size_boundary_against_bufsize_minus_maxrewrite() {
         let a = l.local_addr().expect("local_addr");
         (l, a)
     };
-    let fe_addr = free_addr();
+    let fe_addr = common::reserve_addr();
 
     let backend_seen = Arc::new(std::sync::Mutex::new(Vec::new()));
     let backend_seen_clone = Arc::clone(&backend_seen);

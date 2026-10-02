@@ -84,6 +84,21 @@ impl AllocDiff {
 }
 
 static GLOBAL_ALLOCS: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    /// This thread's allocations, deallocations, reallocations, bytes allocated and bytes
+    /// deallocated, for [`thread_alloc_counters`]. `const`-initialised, so reading it never
+    /// allocates.
+    static THREAD: [std::cell::Cell<usize>; 5] = const {
+        [const { std::cell::Cell::new(0) }; 5]
+    };
+}
+
+/// Adds to this thread's counters. `try_with`: during thread teardown the slot may be gone
+/// while the thread still frees memory.
+fn count_thread(i: usize, n: usize) {
+    let _ = THREAD.try_with(|t| t[i].set(t[i].get() + n));
+}
 static GLOBAL_REALLOCS: AtomicUsize = AtomicUsize::new(0);
 static GLOBAL_DEALLOCS: AtomicUsize = AtomicUsize::new(0);
 static GLOBAL_BYTES_ALLOC: AtomicUsize = AtomicUsize::new(0);
@@ -146,6 +161,8 @@ unsafe impl GlobalAlloc for CountingAllocator {
             self.bytes_alloc.fetch_add(sz, Ordering::SeqCst);
             GLOBAL_ALLOCS.fetch_add(1, Ordering::SeqCst);
             GLOBAL_BYTES_ALLOC.fetch_add(sz, Ordering::SeqCst);
+            count_thread(0, 1);
+            count_thread(3, sz);
         }
         ptr
     }
@@ -157,6 +174,8 @@ unsafe impl GlobalAlloc for CountingAllocator {
         self.bytes_dealloc.fetch_add(sz, Ordering::SeqCst);
         GLOBAL_DEALLOCS.fetch_add(1, Ordering::SeqCst);
         GLOBAL_BYTES_DEALLOC.fetch_add(sz, Ordering::SeqCst);
+        count_thread(1, 1);
+        count_thread(4, sz);
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
@@ -165,14 +184,17 @@ unsafe impl GlobalAlloc for CountingAllocator {
             let old_size = layout.size();
             self.reallocs.fetch_add(1, Ordering::SeqCst);
             GLOBAL_REALLOCS.fetch_add(1, Ordering::SeqCst);
+            count_thread(2, 1);
             if new_size > old_size {
                 let diff = new_size - old_size;
                 self.bytes_alloc.fetch_add(diff, Ordering::SeqCst);
                 GLOBAL_BYTES_ALLOC.fetch_add(diff, Ordering::SeqCst);
+                count_thread(3, diff);
             } else {
                 let diff = old_size - new_size;
                 self.bytes_dealloc.fetch_add(diff, Ordering::SeqCst);
                 GLOBAL_BYTES_DEALLOC.fetch_add(diff, Ordering::SeqCst);
+                count_thread(4, diff);
             }
         }
         new_ptr
@@ -189,6 +211,23 @@ pub fn alloc_counters() -> AllocCounters {
         bytes_allocated: GLOBAL_BYTES_ALLOC.load(Ordering::SeqCst),
         bytes_deallocated: GLOBAL_BYTES_DEALLOC.load(Ordering::SeqCst),
     }
+}
+
+/// This thread's allocation counters, through [`CountingAllocator`].
+///
+/// [`alloc_counters`] is process-wide, so a test asserting "this code allocates nothing"
+/// also counts every other thread in the test binary -- a backend thread an earlier test
+/// left winding down, or a test running in parallel -- and goes red at random. Code that
+/// runs on the calling thread is measured exactly here.
+#[must_use]
+pub fn thread_alloc_counters() -> AllocCounters {
+    THREAD.with(|t| AllocCounters {
+        alloc_count: t[0].get(),
+        dealloc_count: t[1].get(),
+        realloc_count: t[2].get(),
+        bytes_allocated: t[3].get(),
+        bytes_deallocated: t[4].get(),
+    })
 }
 
 /// Resets the global allocation counters.

@@ -54,16 +54,18 @@ fn run_ibex_with_notify(sock_addr: &SocketAddr, env_val: &str) -> String {
 
 #[test]
 fn test_systemd_notify_path() {
-    let path = "/tmp/ibex_test_notify.sock";
-    let addr = SocketAddr::from_pathname(path).unwrap();
-    let out = run_ibex_with_notify(&addr, path);
+    // Per process: a fixed name is shared by every concurrent run of this test.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("notify.sock");
+    let addr = SocketAddr::from_pathname(&path).unwrap();
+    let out = run_ibex_with_notify(&addr, path.to_str().unwrap());
     assert!(out.contains("READY=1\n"));
 }
 
 #[test]
 fn test_systemd_notify_abstract() {
-    let name = b"ibex_test_notify_abstract";
-    let addr = SocketAddr::from_abstract_name(name).unwrap();
-    let out = run_ibex_with_notify(&addr, "@ibex_test_notify_abstract");
+    let name = format!("ibex_test_notify_abstract_{}", std::process::id());
+    let addr = SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
+    let out = run_ibex_with_notify(&addr, &format!("@{name}"));
     assert!(out.contains("READY=1\n"));
 }
