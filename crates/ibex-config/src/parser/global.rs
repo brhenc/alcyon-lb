@@ -30,6 +30,14 @@ pub(crate) fn parse_global_directive(
             }
             Ok(())
         }
+        "log-tag" => {
+            // One argument only here (`alertif_too_many_args`); proxies take extras silently.
+            if tokens.len() > 2 {
+                return Err(ConfigError::new(kw.line, kw.col, "'log-tag' cannot handle unexpected argument"));
+            }
+            global.log_tag = Some(parse_log_tag(tokens, kw)?);
+            Ok(())
+        }
         "stats" => {
             if tokens.len() >= 3 && tokens[1].text == "socket" {
                 global.stats_socket = Some(tokens[2].text.clone());

@@ -697,6 +697,8 @@ mod tests {
             http_reuse: ibex_config::HttpReuse::default(),
             error_files: std::collections::HashMap::new(),
             error_replies: std::collections::HashMap::new(),
+            log_tag: None,
+            log_cursors: std::sync::Arc::default(),
         };
 
         let csv = format_show_stat(&[proxy], &[], 9999);

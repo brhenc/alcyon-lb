@@ -61,6 +61,8 @@ pub struct GlobalSection {
     pub logs: Vec<LogConfig>,
     /// Global variables initialized at startup via `set-var` and `set-var-fmt`.
     pub set_vars: Vec<GlobalSetVar>,
+    /// Global log tag (`log-tag`). Defaults to "haproxy".
+    pub log_tag: Option<std::sync::Arc<str>>,
 }
 
 /// Global variable initialized at startup via `set-var` or `set-var-fmt`.

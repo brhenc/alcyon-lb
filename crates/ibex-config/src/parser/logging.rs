@@ -1,17 +1,12 @@
 use super::*;
+use crate::ast::LogSample;
 
-/// Parses a `log` directive into `logs`, returning true for the `log global` form.
-///
-/// `log global` inherits whatever the `global` section declared, and is how essentially
-/// every real `HAProxy` configuration turns logging on for a proxy. It used to fall into
-/// the argument check below and be rejected as "expects <address> and <facility>", so a
-/// canonical config did not load at all.
 /// Parses a `log` directive into `logs`, returning true for the `log global` form.
 ///
 /// The grammar, from `src/log.c`:
 ///
 /// ```text
-/// log <target> [len <n>] [format <fmt>] <facility> [<level>]
+/// log <target> [len <n>] [format <fmt>] [sample <ranges>:<size>] <facility> [<level>]
 /// log global
 /// ```
 ///
@@ -43,6 +38,7 @@ pub(crate) fn parse_log(
     let mut i = 2;
     let mut max_len = 1024usize;
     let mut format = None;
+    let mut sample = None;
     while i + 1 < tokens.len() {
         match tokens[i].text.as_str() {
             "len" => {
@@ -67,6 +63,19 @@ pub(crate) fn parse_log(
                 format = Some(tokens[i + 1].text.clone());
                 i += 2;
             }
+            "sample" => {
+                sample = Some(Box::new(parse_log_sample(&tokens[i + 1])?));
+                i += 2;
+            }
+            // Not implemented (`log-profile` sections). Refused rather than dropped, so a
+            // config relying on it does not load as if it worked.
+            "profile" => {
+                return Err(ConfigError::new(
+                    tokens[i].line,
+                    tokens[i].col,
+                    "'log ... profile' is not supported",
+                ));
+            }
             _ => break,
         }
     }
@@ -90,6 +99,7 @@ pub(crate) fn parse_log(
         level,
         max_len,
         format,
+        sample,
     });
     Ok(false)
 }
@@ -125,7 +135,11 @@ pub(crate) fn parse_log_target(tok: &Token) -> Result<LogTarget, ConfigError> {
     if t.starts_with('/') {
         return Ok(LogTarget::Unix(t.to_string()));
     }
-    let (addr, is_quic) = parse_socket_addr(tok, Some(514))?;
+    // `udp@` names the transport a bare address already implies (`src/log.c`).
+    let (addr, is_quic) = match t.strip_prefix("udp@") {
+        Some(rest) => parse_socket_addr(&Token { text: rest.to_string(), ..tok.clone() }, Some(514))?,
+        None => parse_socket_addr(tok, Some(514))?,
+    };
     if is_quic {
         return Err(ConfigError::new(tok.line, tok.col, "QUIC not supported for log targets".to_string()));
     }
@@ -184,3 +198,53 @@ pub(crate) fn parse_level(token: &Token) -> Result<LogLevel, ConfigError> {
     }
 }
 
+/// `log-tag <tag>`, in a proxy section or `defaults`: the syslog tag for this proxy's
+/// lines, in place of the global one (`__send_log`, `src/log.c`).
+pub(crate) fn parse_log_tag(tokens: &[Token], kw: &Token) -> Result<std::sync::Arc<str>, ConfigError> {
+    match tokens.get(1) {
+        Some(t) if !t.text.is_empty() => Ok(t.text.as_str().into()),
+        _ => Err(ConfigError::new(kw.line, kw.col, "'log-tag' expects a tag for use in syslog")),
+    }
+}
+
+/// `sample <ranges>:<size>`, refused where `HAProxy`'s `parse_logger` refuses it: a range
+/// is `n` or `low-high` with `0 < low < high`, ranges may not overlap, and `size` is a
+/// positive integer no smaller than the highest bound. A trailing comma is accepted, as
+/// there. The ranges come back sorted.
+fn parse_log_sample(tok: &Token) -> Result<LogSample, ConfigError> {
+    let err = |msg: String| ConfigError::new(tok.line, tok.col, msg);
+    let Some((ranges_str, size_str)) = tok.text.split_once(':') else {
+        return Err(err("Missing sample size".into()));
+    };
+    let wrong_range = |r: &str| err(format!("wrong sample range '{r}'"));
+    let positive = |s: &str| s.parse::<u32>().ok().filter(|&n| n > 0 && s.bytes().all(|b| b.is_ascii_digit()));
+    let mut ranges: Vec<std::ops::RangeInclusive<u32>> = Vec::new();
+    let ranges_body = ranges_str.strip_suffix(',').unwrap_or(ranges_str);
+    for r in ranges_body.split(',') {
+        let (low, high) = match r.split_once('-') {
+            None => {
+                let n = positive(r).ok_or_else(|| wrong_range(r))?;
+                (n, n)
+            }
+            Some((l, h)) => {
+                let low = positive(l).ok_or_else(|| wrong_range(r))?;
+                let high = positive(h).filter(|&h| h > low).ok_or_else(|| wrong_range(r))?;
+                (low, high)
+            }
+        };
+        if ranges.iter().any(|o| o.contains(&low) || o.contains(&high)) {
+            return Err(err("ranges are overlapping".into()));
+        }
+        ranges.push(low..=high);
+    }
+    let size = positive(size_str)
+        .ok_or_else(|| err(format!("wrong sample size '{size_str}' for sample range '{ranges_str}'")))?;
+    let max = ranges.iter().map(|r| *r.end()).max().unwrap_or(0);
+    if size < max {
+        return Err(err(format!(
+            "sample size {size} should be greater or equal to {max} the maximum of the high ranges limits"
+        )));
+    }
+    ranges.sort_by_key(|r| *r.start());
+    Ok(LogSample { ranges, size })
+}

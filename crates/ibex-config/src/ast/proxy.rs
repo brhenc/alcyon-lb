@@ -67,6 +67,8 @@ pub struct DefaultsSection {
     pub error_files: HashMap<u16, Vec<u8>>,
     /// Default `http-error` overrides, keyed by status code.
     pub error_replies: HashMap<u16, ErrorPageSource>,
+    /// Default log tag (`log-tag`).
+    pub log_tag: Option<std::sync::Arc<str>>,
 }
 
 /// Unified timeouts configuration.
@@ -202,6 +204,8 @@ pub struct ListenSection {
     pub error_files: HashMap<u16, Vec<u8>>,
     /// `http-error` overrides, keyed by status code.
     pub error_replies: HashMap<u16, ErrorPageSource>,
+    /// Log tag (`log-tag`).
+    pub log_tag: Option<std::sync::Arc<str>>,
 }
 
 /// Stats configuration options for a proxy.
@@ -274,6 +278,7 @@ impl Default for ListenSection {
             tcp_check: false,
             error_files: HashMap::new(),
             error_replies: HashMap::new(),
+            log_tag: None,
         }
     }
 }
@@ -348,6 +353,8 @@ pub struct FrontendSection {
     pub error_files: HashMap<u16, Vec<u8>>,
     /// `http-error` overrides, keyed by status code.
     pub error_replies: HashMap<u16, ErrorPageSource>,
+    /// Log tag (`log-tag`).
+    pub log_tag: Option<std::sync::Arc<str>>,
 }
 
 impl Default for FrontendSection {
@@ -385,6 +392,7 @@ impl Default for FrontendSection {
             stats: StatsConfig::default(),
             error_files: HashMap::new(),
             error_replies: HashMap::new(),
+            log_tag: None,
         }
     }
 }
@@ -469,6 +477,8 @@ pub struct BackendSection {
     pub error_files: HashMap<u16, Vec<u8>>,
     /// `http-error` overrides, keyed by status code.
     pub error_replies: HashMap<u16, ErrorPageSource>,
+    /// Log tag (`log-tag`).
+    pub log_tag: Option<std::sync::Arc<str>>,
 }
 
 impl Default for BackendSection {
@@ -512,6 +522,7 @@ impl Default for BackendSection {
             tcp_check: false,
             error_files: HashMap::new(),
             error_replies: HashMap::new(),
+            log_tag: None,
         }
     }
 }

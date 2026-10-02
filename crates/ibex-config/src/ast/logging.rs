@@ -20,6 +20,19 @@ pub struct LogConfig {
     pub max_len: usize,
     /// `format <fmt>`: the wire format, as written. Only `rfc3164` is emitted today.
     pub format: Option<String>,
+    /// `sample <ranges>:<size>`: of every `size` lines, send those whose position
+    /// (1-based) falls in one of `ranges`.
+    pub sample: Option<Box<LogSample>>,
+}
+
+/// `log ... sample <ranges>:<size>` (`src/log.c`, `smp_log_range`).
+///
+/// The ranges are sorted and do not overlap, and the highest bound is at most `size`;
+/// the parser refuses anything else, as `HAProxy` does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogSample {
+    pub ranges: Vec<std::ops::RangeInclusive<u32>>,
+    pub size: u32,
 }
 
 /// Where a `log` line sends its output.

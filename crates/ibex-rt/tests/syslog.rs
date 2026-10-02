@@ -45,7 +45,7 @@ fn rfc3164_day_is_space_padded_not_zero_padded() {
 #[test]
 fn a_datagram_actually_arrives_and_is_well_formed() {
     let (rx, addr) = receiver();
-    let cfg = LogConfig { target: LogTarget::Udp(addr), max_len: 1024, format: None, facility: LogFacility::Local0, level: Some(LogLevel::Notice) };
+    let cfg = LogConfig { target: LogTarget::Udp(addr), max_len: 1024, format: None, sample: None, facility: LogFacility::Local0, level: Some(LogLevel::Notice) };
     let t = SyslogTarget::new(&cfg);
 
     assert!(t.send(LogLevel::Notice, "ibex", "testhost", "a message"));
@@ -64,7 +64,7 @@ fn level_filtering_drops_less_severe_messages() {
     // level or more severe are emitted. Severity counts downward, so "more severe"
     // means a numerically smaller code -- easy to invert by accident.
     let (rx, addr) = receiver();
-    let cfg = LogConfig { target: LogTarget::Udp(addr), max_len: 1024, format: None, facility: LogFacility::Local0, level: Some(LogLevel::Warning) };
+    let cfg = LogConfig { target: LogTarget::Udp(addr), max_len: 1024, format: None, sample: None, facility: LogFacility::Local0, level: Some(LogLevel::Warning) };
     let t = SyslogTarget::new(&cfg);
 
     assert!(t.accepts(LogLevel::Emerg), "more severe than the filter must pass");
@@ -86,6 +86,7 @@ fn sending_to_an_unreachable_collector_never_fails_the_caller() {
         target: LogTarget::Udp("192.0.2.1:514".parse::<SocketAddr>().expect("addr")),
         max_len: 1024,
         format: None,
+        sample: None,
         facility: LogFacility::Local0,
         level: Some(LogLevel::Info),
     };
@@ -260,4 +261,60 @@ fn the_status_field_stays_within_its_threshold() {
             "status count ran past its own threshold: {line}"
         );
     }
+}
+
+/// The lines `sample <ranges>:<size>` keeps, as `process_send_log` in `src/log.c` picks
+/// them: positions 1..=size, repeating, kept when inside one of the ranges.
+#[test]
+fn sampling_keeps_the_positions_in_its_ranges_and_repeats() {
+    use ibex_config::LogSample;
+    use ibex_rt::syslog::sample_admits;
+    use std::sync::atomic::AtomicU64;
+
+    let pattern = |ranges: Vec<std::ops::RangeInclusive<u32>>, size: u32, n: usize| -> String {
+        let sample = LogSample { ranges, size };
+        let cursor = AtomicU64::new(0);
+        (0..n).map(|_| if sample_admits(&sample, &cursor) { '1' } else { '0' }).collect()
+    };
+    // load_balancing.vtc's `sample 1,3:5`.
+    assert_eq!(pattern(vec![1..=1, 3..=3], 5, 10), "1010010100");
+    assert_eq!(pattern(vec![2..=3], 4, 8), "01100110");
+    assert_eq!(pattern(vec![1..=2, 4..=4], 4, 8), "11011101");
+    assert_eq!(pattern(vec![1..=1], 1, 3), "111");
+}
+
+/// Workers share a proxy's cursor, as `HAProxy`'s threads share a logger: however the
+/// lines interleave, `sample 1:4` keeps exactly one in four of them.
+#[test]
+fn threads_sharing_a_cursor_keep_exactly_the_sampled_share() {
+    use ibex_config::LogSample;
+    use ibex_rt::syslog::sample_admits;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    let sample = LogSample { ranges: vec![1..=1], size: 4 };
+    let cursor = AtomicU64::new(0);
+    let kept = AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for _ in 0..8 {
+            s.spawn(|| {
+                for _ in 0..20_000 {
+                    if sample_admits(&sample, &cursor) {
+                        kept.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            });
+        }
+    });
+    assert_eq!(kept.load(Ordering::Relaxed), 8 * 20_000 / 4);
+}
+
+#[test]
+fn a_sample_with_nothing_to_select_keeps_every_line() {
+    use ibex_config::LogSample;
+    use ibex_rt::syslog::sample_admits;
+    use std::sync::atomic::AtomicU64;
+
+    let cursor = AtomicU64::new(0);
+    assert!(sample_admits(&LogSample { ranges: vec![], size: 3 }, &cursor));
+    assert!(sample_admits(&LogSample { ranges: vec![1..=1], size: 0 }, &cursor));
 }

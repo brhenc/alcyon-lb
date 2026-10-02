@@ -156,6 +156,7 @@ fn a_server_going_down_emits_a_syslog_datagram() {
                 target: LogTarget::Udp(collector_addr),
                 max_len: 1024,
                 format: None,
+                sample: None,
                 facility: LogFacility::Local0,
                 level: None,
             }],
