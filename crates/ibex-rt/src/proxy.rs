@@ -1352,23 +1352,35 @@ impl TcpSession {
         Ok(())
     }
 
-    /// Applies whichever timeout has fired, if any.
+    /// Applies whichever timeout has fired, if any. A timer that has expired but no
+    /// longer applies (the server side released, or idle between transactions; the client
+    /// while its response is awaited) is disarmed, as `HAProxy` sets a timer it does not
+    /// need to `TICK_ETERNITY`: left armed and expired, it is the session's next expiry
+    /// and wakes it at once, every pass. Progress, or a new server connection, re-arms it.
     pub fn check_timeouts(&mut self, now: Tick) -> bool {
-        if self.conn_exp.is_expired(now) && self.conn_timer_live() {
+        if self.conn_exp.is_expired(now) {
             self.conn_exp = Tick::ETERNITY;
-            self.srv_state = ScState::Error;
-            self.ending.get_or_insert(Ending::Timeout(Which::Connect));
-            return true;
+            if self.conn_timer_live() {
+                self.srv_state = ScState::Error;
+                self.ending.get_or_insert(Ending::Timeout(Which::Connect));
+                return true;
+            }
         }
-        if self.cli_exp.is_expired(now) && self.cli_timer_live() {
-            self.cli_state = ScState::Error;
-            self.ending.get_or_insert(Ending::Timeout(Which::Client));
-            return true;
+        if self.cli_exp.is_expired(now) {
+            if self.cli_timer_live() {
+                self.cli_state = ScState::Error;
+                self.ending.get_or_insert(Ending::Timeout(Which::Client));
+                return true;
+            }
+            self.cli_exp = Tick::ETERNITY;
         }
-        if self.srv_exp.is_expired(now) && self.srv_timer_live() {
-            self.srv_state = ScState::Error;
-            self.ending.get_or_insert(Ending::Timeout(Which::Server));
-            return true;
+        if self.srv_exp.is_expired(now) {
+            if self.srv_timer_live() {
+                self.srv_state = ScState::Error;
+                self.ending.get_or_insert(Ending::Timeout(Which::Server));
+                return true;
+            }
+            self.srv_exp = Tick::ETERNITY;
         }
         false
     }
@@ -1400,15 +1412,10 @@ impl TcpSession {
             )
     }
 
-    /// The earliest deadline across both sides, for the scheduler's wait queue. A timer
-    /// `check_timeouts` would not act on is left out: expired, it would wake the session
-    /// at once, every pass, for nothing.
+    /// The earliest deadline across both sides, for the scheduler's wait queue.
     #[must_use]
     pub fn next_expiry(&self) -> Tick {
-        let live = |exp: Tick, live: bool| if live { exp } else { Tick::ETERNITY };
-        let mut exp = live(self.cli_exp, self.cli_timer_live())
-            .earliest(live(self.srv_exp, self.srv_timer_live()))
-            .earliest(live(self.conn_exp, self.conn_timer_live()));
+        let mut exp = self.cli_exp.earliest(self.srv_exp).earliest(self.conn_exp);
         if let Some(i_exp) = self.inspect_exp {
             if !self.tcp_inspect_done {
                 exp = exp.earliest(i_exp);
