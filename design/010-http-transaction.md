@@ -155,12 +155,19 @@ Where the implementation differs from the proposal above, and what it found.
   held (`MsgState::Waiting`) until the engine has run its head through the response rules --
   this replaces `resp_released`. The byte layer no longer parses response heads or applies
   rules; `process_cli_transitions` does nothing in HTTP mode.
-- **One end.** `EngineDispatcher::end_txn`: the server connection goes to the idle pool if it
-  can carry another request (it is no longer kept on the session between transactions, so a
-  next request is always routed afresh), then the client either closes or is reset.
+- **One end.** `EngineDispatcher::end_txn`: a server connection that can carry another
+  request stays on the session; the next request is routed afresh by its own rules and
+  takes it only if it goes to the same server (otherwise it goes to the idle pool). The
+  client then either closes or waits for its next request.
+- **Reading the server.** Always, except while the proxy writes its own reply: a kept
+  connection's close is seen without probing it, and the read interest does not flip per
+  transaction. A read that would block is not retried until the poller reports the socket
+  readable (`TcpSession::srv_cant_recv`, `HAProxy`'s `fd_cant_recv`).
 - **One reply.** `TcpSession::write_reply` (bytes) and `reply_error` (status -> page in
-  `http_error_message` order). The request is dropped through its framing; the connection is
-  kept unless the body had not all arrived, the page says `Connection: close`, or it is empty.
+  `http_error_message` order). The request is dropped through its framing; a body still
+  arriving is drained as it comes (`drain_request`), as `HAProxy` 3.5 does, bounded by
+  `timeout client`. The connection closes after an empty page, one that says
+  `Connection: close`, or an unread body behind `Expect: 100-continue`.
 - **What `HttpTxn` replaced.** `resp_released`, `resp_length_known`, `resp_status`,
   `resp_headers_processed`, `srv_connection_close`, `connection_close`, the session copies of
   the response rules (`http_res_rules`, `http_after_res_rules`, `acls`) and their second
