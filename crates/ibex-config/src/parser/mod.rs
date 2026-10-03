@@ -141,10 +141,8 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
     // still failed with "unknown keyword" and the harness went on stripping the blocks
     // itself.
     let lexed = lex(input);
-    if let Some(l) = lexed.iter().find(|l| l.error.is_some()) {
-        if let Some((col, msg)) = &l.error {
-            return Err(ConfigError::new(l.line_number, *col, msg.clone()));
-        }
+    if let Some((line, (col, msg))) = lexed.iter().find_map(|l| Some((l.line_number, l.error.clone()?))) {
+        return Err(ConfigError::new(line, col, msg));
     }
     let lines = crate::preproc::preprocess(lexed)?;
 
