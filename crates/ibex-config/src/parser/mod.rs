@@ -140,7 +140,13 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
     // preprocessor module existed, was unit-tested, and was reached by nothing, so `.if`
     // still failed with "unknown keyword" and the harness went on stripping the blocks
     // itself.
-    let lines = crate::preproc::preprocess(lex(input))?;
+    let lexed = lex(input);
+    if let Some(l) = lexed.iter().find(|l| l.error.is_some()) {
+        if let Some((col, msg)) = &l.error {
+            return Err(ConfigError::new(l.line_number, *col, msg.clone()));
+        }
+    }
+    let lines = crate::preproc::preprocess(lexed)?;
 
     // `http-errors` sections are resolved eagerly into a process-wide registry as they are
     // parsed (see `crate::ast::rules_http`), the same way `crate::ast::checks` resolves

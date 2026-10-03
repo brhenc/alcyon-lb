@@ -22,6 +22,8 @@ pub struct Line {
     pub line_number: usize,
     /// Tokens found on this line.
     pub tokens: Vec<Token>,
+    /// Set when `parse_line` would refuse the line: the 1-based column and the message.
+    pub error: Option<(usize, String)>,
 }
 
 /// Lexes `HAProxy` configuration text into a list of non-empty tokenized lines.
@@ -38,11 +40,12 @@ pub fn lex(input: &str) -> Vec<Line> {
 
     for (line_idx, raw_line) in input.lines().enumerate() {
         let line_number = line_idx + 1;
-        let tokens = lex_line(raw_line, line_number);
-        if !tokens.is_empty() {
+        let (tokens, error) = lex_line(raw_line, line_number);
+        if !tokens.is_empty() || error.is_some() {
             lines.push(Line {
                 line_number,
                 tokens,
+                error,
             });
         }
     }
@@ -51,7 +54,7 @@ pub fn lex(input: &str) -> Vec<Line> {
 }
 
 /// Tokenizes a single line of input according to `HAProxy` rules.
-fn lex_line(raw_line: &str, line_number: usize) -> Vec<Token> {
+fn lex_line(raw_line: &str, line_number: usize) -> (Vec<Token>, Option<(usize, String)>) {
     let mut tokens = Vec::new();
     let chars: Vec<char> = raw_line.chars().collect();
     let len = chars.len();
@@ -136,9 +139,19 @@ fn lex_line(raw_line: &str, line_number: usize) -> Vec<Token> {
                         });
                         idx += 2;
                     }
-                    'x' if hex(idx + 2).is_some() && hex(idx + 3).is_some() => {
-                        let byte = hex(idx + 2).unwrap_or(0) * 16 + hex(idx + 3).unwrap_or(0);
-                        token_text.push(u8::try_from(byte).unwrap_or(0));
+                    'x' => {
+                        // `parse_line` (src/tools.c) refuses a `\x` not followed by two
+                        // hex digits (PARSE_ERR_HEX); it does not keep the backslash.
+                        let (Some(h1), Some(h2)) = (hex(idx + 2), hex(idx + 3)) else {
+                            return (
+                                tokens,
+                                Some((
+                                    idx + 1,
+                                    format!("truncated or invalid hexadecimal sequence at position {}", idx + 1),
+                                )),
+                            );
+                        };
+                        token_text.push(u8::try_from(h1 * 16 + h2).unwrap_or(0));
                         idx += 4;
                     }
                     _ => {
@@ -171,7 +184,7 @@ fn lex_line(raw_line: &str, line_number: usize) -> Vec<Token> {
         });
     }
 
-    tokens
+    (tokens, None)
 }
 
 /// Checks whether a character is treated as whitespace by `HAProxy` 1.0.2 `isspace()`.
