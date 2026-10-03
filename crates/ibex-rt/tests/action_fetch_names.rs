@@ -97,6 +97,16 @@ const REFUSED: &[(&str, &str, &str)] = &[
     ("tcp-request content track-sc0 nosuch", "", "unknown fetch method 'nosuch'"),
     ("tcp-request content sc-set-gpt0(0) nosuch", "", "unknown fetch method 'nosuch'"),
     ("", "tcp-response content set-var(txn.x) nosuch", "unknown fetch method 'nosuch'"),
+    ("tcp-request connection track-sc1 nosuch table be", "", "unknown fetch method 'nosuch'"),
+    ("tcp-request connection track-sc2 nosuch table be", "", "unknown fetch method 'nosuch'"),
+    ("tcp-request session track-sc1 nosuch table be", "", "unknown fetch method 'nosuch'"),
+    ("tcp-request session track-sc2 nosuch table be", "", "unknown fetch method 'nosuch'"),
+    ("tcp-request session set-dst nosuch", "", "unknown fetch method 'nosuch'"),
+    ("tcp-request content track-sc1 nosuch table be", "", "unknown fetch method 'nosuch'"),
+    ("tcp-request content track-sc2 nosuch table be", "", "unknown fetch method 'nosuch'"),
+    ("tcp-request content set-src nosuch", "", "unknown fetch method 'nosuch'"),
+    // The quoted space is part of the argument, so the converter after it is still read.
+    ("http-request set-var(txn.x) str('a b'),lowr", "", "unknown converter 'lowr'"),
 ];
 
 /// The control: the same actions with expressions `HAProxy` accepts.
@@ -120,6 +130,7 @@ const ACCEPTED: &[(&str, &str)] = &[
     ("tcp-request connection track-sc0 src table be", ""),
     ("tcp-request content set-var(txn.x) src", ""),
     ("", "tcp-response content set-var(txn.x) str(a)"),
+    ("http-request set-var(txn.x) str('a b'),lower", ""),
 ];
 
 #[test]
