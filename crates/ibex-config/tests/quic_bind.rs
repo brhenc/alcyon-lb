@@ -18,6 +18,22 @@ use std::io::{Read, Write};
 /// (`<target>/debug/deps/quic_bind-*` -> `<target>/debug/ibex`), whatever
 /// `CARGO_TARGET_DIR` is. A fixed `<checkout>/target/debug/ibex` was missing in every
 /// worktree built with its own target directory (T109).
+
+/// Stops ibex as an operator would, `SIGUSR1` (soft stop), and kills it only if it is
+/// still running five seconds later. A `SIGKILL`ed process writes no coverage profile,
+/// so the lines only this test runs (the QUIC listener's setup) counted as never executed.
+fn soft_stop(child: &mut std::process::Child) {
+    let _ = Command::new("kill").arg("-USR1").arg(child.id().to_string()).status();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let _ = child.kill();
+}
+
 fn ibex_bin() -> std::path::PathBuf {
     let exe = std::env::current_exe().expect("test executable");
     let bin = exe.parent().and_then(std::path::Path::parent).expect("<target>/debug").join("ibex");
@@ -148,7 +164,7 @@ backend default
         .expect("run curl");
 
     stop.store(true, Ordering::Relaxed);
-    let _ = ibex.kill();
+    soft_stop(&mut ibex);
     let out_ibex = ibex.wait_with_output().expect("wait ibex");
     let ibex_stdout = String::from_utf8_lossy(&out_ibex.stdout);
     let ibex_stderr = String::from_utf8_lossy(&out_ibex.stderr);
