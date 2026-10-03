@@ -892,7 +892,7 @@ def check_regressions(
     # 7. Binary Size
     if "binary_bytes" in current and current["binary_bytes"] is not None:
         c = current["binary_bytes"]
-        p = get_prev_val("binary_bytes")
+        p = current.get("binary_bytes_ref") or get_prev_val("binary_bytes")
         c_mb = round(c / (1024 * 1024), 2)
         p_mb = round(p / (1024 * 1024), 2) if p else None
         if p is None:
@@ -904,12 +904,13 @@ def check_regressions(
             if is_reg:
                 has_regression = True
             status = "FAIL (>5% inc)" if is_reg else "PASS"
-            deltas.append(MetricDelta("binary_bytes", "Binary Size", f"{c_mb} MB", f"{p_mb} MB", diff_str, status, is_reg, ""))
+            ref = " (ref)" if current.get("binary_bytes_ref") else ""
+            deltas.append(MetricDelta("binary_bytes", "Binary Size", f"{c_mb} MB", f"{p_mb} MB{ref}", diff_str, status, is_reg, ""))
 
     # 8. Text Section Size
     if "text_bytes" in current and current["text_bytes"] is not None:
         c = current["text_bytes"]
-        p = get_prev_val("text_bytes")
+        p = current.get("text_bytes_ref") or get_prev_val("text_bytes")
         c_mb = round(c / (1024 * 1024), 2)
         p_mb = round(p / (1024 * 1024), 2) if p else None
         if p is None:
@@ -921,7 +922,8 @@ def check_regressions(
             if is_reg:
                 has_regression = True
             status = "FAIL (>5% inc)" if is_reg else "PASS"
-            deltas.append(MetricDelta("text_bytes", "Text Section Size", f"{c_mb} MB", f"{p_mb} MB", diff_str, status, is_reg, ""))
+            ref = " (ref)" if current.get("text_bytes_ref") else ""
+            deltas.append(MetricDelta("text_bytes", "Text Section Size", f"{c_mb} MB", f"{p_mb} MB{ref}", diff_str, status, is_reg, ""))
 
     # 9. 60k Backend Memory
     if "mem_60k_backends_mb" in current and current["mem_60k_backends_mb"] is not None:
@@ -1052,6 +1054,10 @@ def main() -> int:
     ref_sha = reference_sha()
     print(f"[3/5] Measuring 1-connection keep-alive throughput, A/B against {ref_sha[:12]}...")
     ref_bin = ensure_reference_binary(ref_sha, target_dir)
+    # Sizes are judged against the same reference build, not the last record: nobody
+    # commits data/measurements.jsonl, so "the last record" drifted to an old one and the
+    # growth of every change since added up until a harmless change failed the gate.
+    record["binary_bytes_ref"], record["text_bytes_ref"] = measure_binary_size(ref_bin)
     ab = measure_ab(ibex_bin, ref_bin, target_dir)
     record["rps_1conn"] = ab["cand"]
     record["rps_1conn_ref"] = ab["ref"]
