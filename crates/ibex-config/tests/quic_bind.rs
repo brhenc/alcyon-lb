@@ -12,6 +12,19 @@ use std::thread;
 use std::time::Duration;
 use std::io::{Read, Write};
 
+
+/// The `ibex` binary of this build. It belongs to another package, so cargo sets no
+/// `CARGO_BIN_EXE_ibex` here; it sits beside this test's own directory
+/// (`<target>/debug/deps/quic_bind-*` -> `<target>/debug/ibex`), whatever
+/// `CARGO_TARGET_DIR` is. A fixed `<checkout>/target/debug/ibex` was missing in every
+/// worktree built with its own target directory (T109).
+fn ibex_bin() -> std::path::PathBuf {
+    let exe = std::env::current_exe().expect("test executable");
+    let bin = exe.parent().and_then(std::path::Path::parent).expect("<target>/debug").join("ibex");
+    assert!(bin.exists(), "{} is not built: run `cargo build --bin ibex` with the same CARGO_TARGET_DIR", bin.display());
+    bin
+}
+
 fn find_free_port() -> u16 {
     UdpSocket::bind("127.0.0.1:0")
         .expect("bind udp")
@@ -116,7 +129,7 @@ backend default
     let stop = Arc::new(AtomicBool::new(false));
     spawn_echo_backend(Arc::clone(&stop), backend_port);
 
-    let bin = std::env::var("CARGO_BIN_EXE_ibex").unwrap_or_else(|_| std::env::current_dir().unwrap().parent().unwrap().parent().unwrap().join("target/debug/ibex").to_string_lossy().to_string());
+    let bin = ibex_bin();
     let mut ibex = Command::new(bin)
         .arg("-f")
         .arg(&cfg_path)
@@ -169,7 +182,7 @@ frontend test_quic
 ";
     fs::write(&cfg_path, cfg).expect("write config");
 
-    let bin = std::env::var("CARGO_BIN_EXE_ibex").unwrap_or_else(|_| std::env::current_dir().unwrap().parent().unwrap().parent().unwrap().join("target/debug/ibex").to_string_lossy().to_string());
+    let bin = ibex_bin();
     let out = Command::new(bin)
         .arg("-c")
         .arg("-f")
@@ -193,7 +206,7 @@ frontend test_quic
 ";
     fs::write(&cfg_path, cfg).expect("write config");
 
-    let bin = std::env::var("CARGO_BIN_EXE_ibex").unwrap_or_else(|_| std::env::current_dir().unwrap().parent().unwrap().parent().unwrap().join("target/debug/ibex").to_string_lossy().to_string());
+    let bin = ibex_bin();
     let out = Command::new(bin)
         .arg("-c")
         .arg("-f")

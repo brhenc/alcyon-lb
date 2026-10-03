@@ -19,7 +19,8 @@ import time
 
 CERT_PEM = "examples/certs/localhost.pem"
 CONFIG_FILE = "examples/reference_nginx_8443.cfg"
-IBEX_BIN = "target/debug/ibex"
+# The binary `cargo build` writes: CARGO_TARGET_DIR when it is set (T109).
+IBEX_BIN = os.path.join(os.environ.get("CARGO_TARGET_DIR") or "target", "debug", "ibex")
 
 class MockNginxHandler(http.server.BaseHTTPRequestHandler):
     def version_string(self):

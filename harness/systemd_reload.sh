@@ -15,7 +15,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 
-BIN=$(realpath "${1:-target/debug/ibex}")
+BIN=$(realpath "${1:-${CARGO_TARGET_DIR:-target}/debug/ibex}")
 TMP=$(mktemp -d /tmp/ibex-sd.XXXXXX)
 UNIT="ibex-e2e-$$"
 UNITFILE="$HOME/.config/systemd/user/$UNIT.service"

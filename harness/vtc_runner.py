@@ -2330,8 +2330,8 @@ def main() -> None:
     parser.add_argument("paths", nargs="+", help="Path(s) to .vtc file(s) or directories containing .vtc files")
     parser.add_argument(
         "--binary",
-        default="target/debug/ibex",
-        help="Path to Ibex proxy binary (default: target/debug/ibex)",
+        default=os.path.join(os.environ.get("CARGO_TARGET_DIR") or "target", "debug", "ibex"),
+        help="Path to Ibex proxy binary (default: $CARGO_TARGET_DIR/debug/ibex, else target/debug/ibex)",
     )
     parser.add_argument("--timeout", type=float, default=15.0, help="Per-test timeout in seconds (default: 15s)")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose execution trace")
