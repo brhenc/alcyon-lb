@@ -724,22 +724,19 @@ pub(crate) fn log_hostname() -> &'static str {
 
 /// The values of `slots` (`None` for a slot a rule fills) in a message head: the last
 /// occurrence of each header, cut to its length (`capture_headers`, src/http_ana.c).
-fn capture_values<'a>(slots: impl Iterator<Item = Option<(&'a str, usize)>>, headers: &[(&str, &str)]) -> Vec<Option<String>> {
+fn capture_values<'a>(slots: impl Iterator<Item = Option<(&'a str, usize)>>, headers: &[(&str, &str)]) -> Vec<Option<Vec<u8>>> {
     slots
         .map(|slot| {
             let (name, len) = slot?;
-            headers.iter().rev().find(|(k, _)| k.trim().eq_ignore_ascii_case(name)).map(|(_, v)| cut_at(v.trim(), len).to_string())
+            headers.iter().rev().find(|(k, _)| k.trim().eq_ignore_ascii_case(name)).map(|(_, v)| cut_at(v.trim(), len).to_vec())
         })
         .collect()
 }
 
-/// `s` cut to at most `len` bytes, on a character boundary.
-fn cut_at(s: &str, len: usize) -> &str {
-    let mut cut = len.min(s.len());
-    while !s.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    &s[..cut]
+/// `s` cut to at most `len` bytes: a capture is bytes, and one that ends inside a
+/// character keeps the byte it cut at, as in `HAProxy`.
+fn cut_at(s: &str, len: usize) -> &[u8] {
+    &s.as_bytes()[..len.min(s.len())]
 }
 
 /// A new HTTP transaction's request is in: its header captures and unique ID, before any
@@ -5865,7 +5862,7 @@ impl EngineDispatcher<'_> {
                             // With `id`, the length is the declared slot's.
                             let max = len.or_else(|| proxies[proxy_idx].req_capture_slots.get(*target_id)?.as_ref().map(|(_, l)| *l));
                             if let Some(slot) = sess.log.req_captures.get_mut(*target_id) {
-                                *slot = Some(cut_at(&val, max.unwrap_or(usize::MAX)).to_string());
+                                *slot = Some(cut_at(&val, max.unwrap_or(usize::MAX)).to_vec());
                             }
                         }
                     }

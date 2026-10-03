@@ -332,11 +332,16 @@ fn the_log_counter_counts_only_lines_logged() {
 }
 
 /// A capture length that ends inside a UTF-8 character. `HAProxy` keeps the byte it cut
-/// at: `hr={a#C3|b#C3}` for `x-a: aé` into `len 2` (measured 2026-10-03). Ibex keeps
-/// captures as text and cuts before the character (T105); the line is still logged.
+/// at: `hr={a#C3|b#C3}` for `x-a: a\u{e9}` into `len 2` (measured 2026-10-03); `%hr` writes the
+/// stray byte as `#C3`. Captures are bytes (T105). `x-a` is captured here to 3 bytes, so
+/// `ab\u{e9}` keeps `ab` and the first byte of the accent. The control, a cut on the
+/// boundary, keeps the whole character.
 #[test]
-fn a_capture_cut_inside_a_character_keeps_what_precedes_it() {
+fn a_capture_cut_inside_a_character_keeps_the_byte_it_cut_at() {
     let (line, _) = scenario(|fe| send(fe, "GET /ok HTTP/1.1\r\nHost: x\r\nX-A: ab\u{e9}\r\nConnection: close\r\n\r\n".as_bytes()));
     let line = line.expect("a log line");
-    assert!(line.contains(" c1=ab "), "{line}");
+    assert!(line.contains("|ab#C3|"), "the capture should end in the cut byte, #C3: {line}");
+    let (line, _) = scenario(|fe| send(fe, "GET /ok HTTP/1.1\r\nHost: x\r\nX-A: a\u{e9}\r\nConnection: close\r\n\r\n".as_bytes()));
+    let line = line.expect("a log line");
+    assert!(line.contains("|a#C3#A9|"), "a cut after the whole character keeps both its bytes: {line}");
 }

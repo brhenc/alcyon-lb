@@ -113,8 +113,8 @@ pub struct SampleContext<'a> {
     pub bc_rtt: Option<u32>,
     pub bc_rttvar: Option<u32>,
     /// Capture slots: `None` where nothing was captured (a header that was absent).
-    pub captures_req_hdr: Option<&'a [Option<String>]>,
-    pub captures_res_hdr: Option<&'a [Option<String>]>,
+    pub captures_req_hdr: Option<&'a [Option<Vec<u8>>]>,
+    pub captures_res_hdr: Option<&'a [Option<Vec<u8>>]>,
     /// The stream's unique ID (`unique-id-format`), for the `unique-id` fetch.
     pub unique_id: Option<&'a str>,
     pub is_first_req: bool,
@@ -1278,7 +1278,7 @@ impl Registry {
                 let idx_str = args.first()?;
                 let idx: usize = idx_str.parse().ok()?;
                 let caps = ctx.captures_req_hdr?;
-                caps.get(idx)?.clone().map(Sample::Str)
+                caps.get(idx)?.clone().map(capture_sample)
             },
         });
 
@@ -1289,7 +1289,7 @@ impl Registry {
                 let idx_str = args.first()?;
                 let idx: usize = idx_str.parse().ok()?;
                 let caps = ctx.captures_res_hdr?;
-                caps.get(idx)?.clone().map(Sample::Str)
+                caps.get(idx)?.clone().map(capture_sample)
             },
         });
 
@@ -5399,4 +5399,10 @@ mod date_tests {
         assert_eq!(format_http_date(784_111_777), "Sun, 06 Nov 1994 08:49:37 GMT");
         assert_eq!(format_http_date(1_709_164_800), "Thu, 29 Feb 2024 00:00:00 GMT");
     }
+}
+
+/// A header capture as a sample: a string, or the bytes when a capture length cut a
+/// multi-byte character (captures are bytes, as in `HAProxy`).
+fn capture_sample(bytes: Vec<u8>) -> Sample {
+    String::from_utf8(bytes).map_or_else(|e| Sample::Bin(e.into_bytes()), Sample::Str)
 }

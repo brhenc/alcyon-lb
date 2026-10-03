@@ -18,7 +18,7 @@ fn addr(s: &str) -> Option<SocketAddr> {
     Some(s.parse().expect("addr"))
 }
 
-fn base<'a>(req_caps: &'a [Option<String>], res_caps: &'a [Option<String>]) -> LogData<'a> {
+fn base<'a>(req_caps: &'a [Option<Vec<u8>>], res_caps: &'a [Option<Vec<u8>>]) -> LogData<'a> {
     LogData {
         client: addr("127.0.0.1:40000"),
         frontend_addr: addr("127.0.0.1:29600"),
@@ -58,8 +58,8 @@ fn render(fmt: &str, d: &LogData) -> String {
 
 #[test]
 fn an_http_transaction_renders_as_haproxy_wrote_it() {
-    let req = [Some("127.0.0.1:29600".to_string()), Some("aaaaa".to_string())];
-    let res = [Some("rv".to_string())];
+    let req = [Some("127.0.0.1:29600".as_bytes().to_vec()), Some("aaaaa".as_bytes().to_vec())];
+    let res = [Some("rv".as_bytes().to_vec())];
     let d = base(&req, &res);
     assert_eq!(
         render(FORMAT_A, &d),
@@ -69,8 +69,8 @@ fn an_http_transaction_renders_as_haproxy_wrote_it() {
 
 #[test]
 fn a_missing_capture_is_empty_in_hr_and_a_dash_in_hrl() {
-    let req = [Some("127.0.0.1:29600".to_string()), None];
-    let res = [Some("rv".to_string())];
+    let req = [Some("127.0.0.1:29600".as_bytes().to_vec()), None];
+    let res = [Some("rv".as_bytes().to_vec())];
     let d = LogData { request_line: Some("POST /post HTTP/1.1"), uniq_id: 2, bytes_in: 152, ..base(&req, &res) };
     let line = render(FORMAT_A, &d);
     assert!(line.contains("|HQ=|HV=HTTP/1.1|"), "{line}");
@@ -128,7 +128,7 @@ fn global_options_apply_to_what_follows() {
 fn the_request_line_and_captures_are_encoded() {
     // `url_encode_map` for %r: `"` and `#` as #XX (h1_authority_fragment_char.vtc logs
     // `GET http://hostname#23frag HTTP/1.1`); `hdr_encode_map` adds `{|}` for captures.
-    let req = [Some("a{b}|c\"d#".to_string())];
+    let req = [Some("a{b}|c\"d#".as_bytes().to_vec())];
     let d = LogData { request_line: Some("GET http://hostname#frag HTTP/1.1"), ..base(&req, &[]) };
     assert_eq!(render("%r %hr", &d), "GET http://hostname#23frag HTTP/1.1 {a#7Bb#7D#7Cc#22d#23}");
     assert_eq!(render("%HPO %HP %HU", &LogData { request_line: Some("GET http://localhost/r/4?q=4 HTTP/1.1"), ..d.clone() }),
@@ -281,7 +281,7 @@ fn a_percent_before_anything_but_an_alias_name_is_dropped() {
 
 #[test]
 fn flags_without_a_sign_or_unknown_are_ignored_and_absent_values_quote_as_empty() {
-    let req = [None, Some("v".to_string())];
+    let req = [None, Some("v".as_bytes().to_vec())];
     let d = LogData { request_line: Some("GET /a/b?q HTTP/1.1"), redispatched: true, retries: 1, ..base(&req, &[]) };
     assert_eq!(
         render("a=%{Q}r|u=%{+foo}r|qh=%{+Q}[var(txn.none)]|hrl=%{+Q}hrl|rc=%rc", &d),
