@@ -143,7 +143,12 @@ def run_pooled() -> bool:
     # what makes them meet there.
     outer = env.get("CARGO_TARGET_DIR") or os.path.join(REPO, "target")
     env["CARGO_TARGET_DIR"] = os.path.join(outer, "llvm-cov-target")
-    show = subprocess.run(["cargo", "llvm-cov", "show-env", "--sh", "--no-cfg-coverage"],
+    # --no-rustc-wrapper: with cargo-llvm-cov's wrapper, a build into a directory it has not
+    # built before left most crates (ibex-sample, ibex-rt ...) uninstrumented: 22 of 148
+    # binaries wrote a profile, every changed line read as "not executed" or, worse, the
+    # report held none of them and covercheck passed. RUSTFLAGS instruments everything.
+    show = subprocess.run(["cargo", "llvm-cov", "show-env", "--sh", "--no-cfg-coverage",
+                           "--no-rustc-wrapper"],
                           cwd=REPO, capture_output=True, text=True, env=env)
     for line in show.stdout.splitlines():
         m = re.match(r"export (\w+)='(.*)'$", line)
@@ -171,11 +176,34 @@ def run_pooled() -> bool:
     if any("<hung>" in t for t in failed_tests.values()):
         print("covercheck: a test binary hung (SUITE_TIMEOUT)")
         return False
+    profraws = sum(f.endswith(".profraw") for f in os.listdir(tdir))
+    binaries = _test_binaries(os.path.join(tdir, "debug", "deps"))
+    if not enough_profiles(profraws, binaries):
+        print(f"covercheck: only {profraws} profiles written by {binaries} test binaries: the "
+              "build was not instrumented, so this report cannot judge anything")
+        return False
     rep = subprocess.run(["cargo", "llvm-cov", "report", "--lcov", "--output-path", LCOV],
                          cwd=REPO, capture_output=True, text=True, env={**env, "CARGO_TARGET_DIR": outer})
     if rep.returncode != 0:
         print((rep.stderr or rep.stdout)[-600:])
     return True
+
+
+def _test_binaries(deps: str) -> int:
+    """Executables in cargo's deps directory (hash-suffixed, no extension)."""
+    n = 0
+    for f in os.listdir(deps) if os.path.isdir(deps) else []:
+        path = os.path.join(deps, f)
+        if "." not in f and os.path.isfile(path) and os.access(path, os.X_OK):
+            n += 1
+    return n
+
+
+def enough_profiles(profraws: int, binaries: int) -> bool:
+    """An instrumented binary writes a profile when it exits; far fewer profiles than
+    binaries means most of the build was not instrumented. (Merge pools and build scripts
+    make the two counts differ a little, hence a half, not equality.)"""
+    return binaries == 0 or profraws * 2 >= binaries
 
 
 def run_serial() -> bool:

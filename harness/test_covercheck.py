@@ -149,5 +149,16 @@ class TestBase(unittest.TestCase):
         self.assertEqual(changed.get("crates/x/src/new.rs"), {1, 2})
 
 
+class EnoughProfiles(unittest.TestCase):
+    def test_a_mostly_uninstrumented_build_is_refused(self):
+        # Seen on 2026-10-03: 22 profiles from 148 binaries; the report held none of
+        # ibex-sample, and covercheck exited 0 on a planted untested function.
+        self.assertFalse(covercheck.enough_profiles(22, 148))
+
+    def test_a_fully_instrumented_build_is_accepted(self):
+        self.assertTrue(covercheck.enough_profiles(140, 148))
+        self.assertTrue(covercheck.enough_profiles(0, 0))
+
+
 if __name__ == "__main__":
     unittest.main()
