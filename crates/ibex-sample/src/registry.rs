@@ -117,6 +117,10 @@ pub struct SampleContext<'a> {
     pub is_first_req: bool,
     pub vars: Option<&'a HashMap<String, String>>,
     pub timeouts: Option<&'a HashMap<String, u32>>,
+    /// The backend's `retries`, for `be_max_retries`.
+    pub be_max_retries: Option<u16>,
+    /// The stream's retry budget, for `cur_max_retries`: what `set-retries` changes.
+    pub cur_max_retries: Option<u16>,
     pub act_conn: u32,
     pub cum_conn: u64,
     pub conn_cnt: u64,
@@ -1648,6 +1652,17 @@ impl Registry {
         reg_timeout_fetch!("fe_tunnel_timeout");
         reg_timeout_fetch!("fe_tarpit_timeout");
         reg_timeout_fetch!("be_client_timeout");
+
+        self.register_fetch(FetchDesc {
+            name: "be_max_retries",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| ctx.be_max_retries.map(|v| Sample::Sint(i64::from(v))),
+        });
+        self.register_fetch(FetchDesc {
+            name: "cur_max_retries",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| ctx.cur_max_retries.map(|v| Sample::Sint(i64::from(v))),
+        });
 
         // --- 12. SSL Fetches ---
         self.register_fetch(FetchDesc {

@@ -1,9 +1,61 @@
 use super::{
     find_cond_idx, join_tokens_until, parse_acl_condition_from_tokens, parse_error_body_args,
     parse_rule_condition, parse_sc_counter_action, parse_u16, ConfigError, ErrorPageSource,
-    HttpAfterResAction, HttpAfterResRule, HttpReqAction, HttpReqRule, HttpResAction, HttpResRule,
-    Token,
+    AclCondition, HttpAfterResAction, HttpAfterResRule, HttpReqAction, HttpReqRule, HttpResAction,
+    HttpResRule, RetriesValue, Token,
 };
+
+/// The single sample expression at `tokens[2]` and the optional condition after it, as
+/// `sample_parse_expr` then `parse_rule_cond` take them: a second word that is not
+/// `if`/`unless` is refused, as is a word that cannot name a fetch.
+fn parse_one_expr_and_cond(
+    tokens: &[Token],
+    act_token: &Token,
+) -> Result<(String, Option<AclCondition>), ConfigError> {
+    let act = &act_token.text;
+    let Some(expr) = tokens.get(2).filter(|t| !matches!(t.text.as_str(), "" | "if" | "unless")) else {
+        return Err(ConfigError::new(act_token.line, act_token.col, format!("<http-request {act}> missing fetch method")));
+    };
+    if !expr.text.starts_with(|c: char| c.is_ascii_alphabetic()) {
+        return Err(ConfigError::new(expr.line, expr.col, format!("unknown fetch method '{}'", expr.text)));
+    }
+    Ok((expr.text.clone(), expect_cond_at(tokens, 3, act_token)?))
+}
+
+/// The optional `if`/`unless` condition starting at `tokens[at]`; any other word there is
+/// refused, as `HAProxy` refuses it.
+fn expect_cond_at(tokens: &[Token], at: usize, act_token: &Token) -> Result<Option<AclCondition>, ConfigError> {
+    match tokens.get(at) {
+        None => Ok(None),
+        Some(t) if t.text == "if" || t.text == "unless" => parse_acl_condition_from_tokens(&tokens[at..]),
+        Some(t) => Err(ConfigError::new(
+            t.line,
+            t.col,
+            format!(
+                "'http-request {}' expects either 'if' or 'unless' followed by a condition but found '{}'",
+                act_token.text, t.text
+            ),
+        )),
+    }
+}
+
+/// `strtol(s, &end, 0)` with `*end == '\0'`: decimal, `0x` hex or leading-`0` octal, with
+/// an optional sign; `None` if anything is left over.
+fn strtol0(s: &str) -> Option<i64> {
+    let (neg, digits) = match s.as_bytes().first() {
+        Some(b'-') => (true, &s[1..]),
+        Some(b'+') => (false, &s[1..]),
+        _ => (false, s),
+    };
+    let n = if let Some(hex) = digits.strip_prefix("0x").or_else(|| digits.strip_prefix("0X")) {
+        i64::from_str_radix(hex, 16).ok()?
+    } else if digits.len() > 1 && digits.starts_with('0') {
+        i64::from_str_radix(&digits[1..], 8).ok()?
+    } else {
+        digits.parse::<i64>().ok()?
+    };
+    Some(if neg { -n } else { n })
+}
 
 #[allow(clippy::too_many_lines)]
 pub(crate) fn parse_http_req_rule(
@@ -411,6 +463,40 @@ pub(crate) fn parse_http_req_rule(
         };
         rules.push(HttpReqRule {
             action: HttpReqAction::SetDst { expr },
+            cond,
+        });
+    } else if act_str == "set-dst-port" {
+        let (expr, cond) = parse_one_expr_and_cond(tokens, act_token)?;
+        rules.push(HttpReqRule {
+            action: HttpReqAction::SetDstPort { expr },
+            cond,
+        });
+    } else if act_str == "set-retries" {
+        // `stream_parse_set_retries` (src/stream.c): an integer as `strtol(.., 0)` reads
+        // it, in 0..=100, else an expression. The section checks (no frontend, no
+        // defaults) are where the section is known: `parse_frontend_section`,
+        // `parse_defaults_section`.
+        let Some(arg) = tokens.get(2).filter(|t| !matches!(t.text.as_str(), "" | "if" | "unless")) else {
+            return Err(ConfigError::new(
+                act_token.line,
+                act_token.col,
+                "<http-request set-retries> expects exactly 1 argument (an expression or an integer between 1 and 100)",
+            ));
+        };
+        let value = match strtol0(&arg.text) {
+            Some(n) if (0..=100).contains(&n) => RetriesValue::Fixed(u16::try_from(n).unwrap_or(0)),
+            Some(_) => {
+                return Err(ConfigError::new(
+                    arg.line,
+                    arg.col,
+                    "<http-request set-retries> expects an expression or an integer between 1 and 100",
+                ))
+            }
+            None => RetriesValue::Expr(parse_one_expr_and_cond(tokens, act_token)?.0),
+        };
+        let cond = expect_cond_at(tokens, 3, act_token)?;
+        rules.push(HttpReqRule {
+            action: HttpReqAction::SetRetries { value },
             cond,
         });
     } else if act_str == "redirect" {

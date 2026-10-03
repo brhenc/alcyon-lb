@@ -91,6 +91,15 @@ pub enum HttpReqAction {
     SetDst {
         expr: String,
     },
+    /// Rewrites the port of the stream's destination (`dst`), which a server without a
+    /// port connects to.
+    SetDstPort {
+        expr: String,
+    },
+    /// Replaces the stream's retry budget.
+    SetRetries {
+        value: RetriesValue,
+    },
     Redirect {
         location: Option<String>,
         scheme: Option<String>,
@@ -136,6 +145,14 @@ pub enum HttpReqAction {
         sc: u8,
         expr: String,
     },
+}
+
+/// The argument of `set-retries`: an integer from 0 to 100, or an expression evaluated per
+/// request whose result is used only when it falls in that range.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RetriesValue {
+    Fixed(u16),
+    Expr(String),
 }
 
 /// Rule pairing an HTTP-request action with an optional condition.

@@ -13,7 +13,9 @@ pub(crate) fn parse_server(
             "<server> expects <name> and <addr:port> as arguments.",
         ));
     }
-    let (addr, is_quic) = parse_socket_addr(&tokens[2], None)?;
+    // No port is port 0: the server connects to the stream's destination port
+    // (`SRV_F_MAPPORTS`; see `connect_addr` in ibex-rt).
+    let (addr, is_quic) = parse_socket_addr(&tokens[2], Some(0))?;
     if is_quic {
         return Err(ConfigError::new(kw.line, kw.col, "QUIC not supported for backend servers".to_string()));
     }

@@ -413,6 +413,12 @@ pub(crate) fn parse_frontend_directive(
             Ok(())
         }
         "tcp-request" => parse_frontend_tcp_request(fe, tokens, kw),
+        // `stream_parse_set_retries`: a retry budget belongs to a backend.
+        "http-request" if tokens.get(1).is_some_and(|t| t.text == "set-retries") => Err(ConfigError::new(
+            tokens[1].line,
+            tokens[1].col,
+            "'set-retries' only available in backend or listen section",
+        )),
         "http-request" => parse_http_req_rule(&mut fe.http_req_rules, tokens, kw),
         "http-response" => parse_http_res_rule(&mut fe.http_res_rules, tokens, kw),
         "http-after-response" => {

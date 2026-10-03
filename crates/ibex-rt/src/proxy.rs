@@ -120,6 +120,9 @@ pub struct TcpSession {
     pub timeouts: Timeouts,
     /// Connect attempts left before giving up.
     pub conn_retries: u16,
+    /// The retry budget this stream started with, `s->max_retries` in HAProxy: what
+    /// `cur_max_retries` reports while `conn_retries` counts down.
+    pub max_retries: u16,
     /// Deadline for the operation currently in flight on each side.
     pub cli_exp: Tick,
     pub srv_exp: Tick,
@@ -229,6 +232,7 @@ impl TcpSession {
             rep: Buf::standard(),
             timeouts,
             conn_retries: retries,
+            max_retries: retries,
             retry_after: Tick::ETERNITY,
             cli_exp: Tick::ETERNITY,
             srv_exp: Tick::ETERNITY,
@@ -380,6 +384,13 @@ impl TcpSession {
         };
         self.conn_exp = Tick::ETERNITY;
         self.arm_server(now);
+    }
+
+    /// Gives the stream a retry budget of `n`, before any connect attempt: a new request,
+    /// a backend switch, or `set-retries`.
+    pub fn set_retries(&mut self, n: u16) {
+        self.conn_retries = n;
+        self.max_retries = n;
     }
 
     /// The server connection failed. Returns `true` if a retry remains.

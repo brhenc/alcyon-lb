@@ -2823,6 +2823,24 @@ fn register_new_session(
         .tasklet_wakeup(task_ref, Class::Urgent, state::WOKEN_IO);
 }
 
+/// Whether a server written without a port, or without an address, takes them from the
+/// stream's destination (`SRV_F_MAPPORTS` in `HAProxy`).
+fn maps_destination(server: SocketAddr) -> bool {
+    server.port() == 0 || server.ip().is_unspecified()
+}
+
+/// The address a connection to `server` goes to: `alloc_dst_address` (src/backend.c). A
+/// server without an address connects to the destination's, and one without a port to
+/// the destination port -- which `set-dst-port` may have rewritten. The server keeps its
+/// configured address as its identity (selection, `actconn`, stats); only the socket
+/// sees this one.
+fn connect_addr(server: SocketAddr, dst: Option<SocketAddr>) -> SocketAddr {
+    let Some(dst) = dst else { return server };
+    let ip = if server.ip().is_unspecified() { dst.ip() } else { server.ip() };
+    let port = if server.port() == 0 { dst.port() } else { server.port() };
+    SocketAddr::new(ip, port)
+}
+
 fn maybe_prepend_send_proxy(proxy: &Proxy, sess: &mut TcpSession, target_addr: SocketAddr) {
     if sess.send_proxy_prepended {
         return;
@@ -2986,7 +3004,7 @@ fn init_client_session(
         if let Some(target) = target_addr {
             maybe_prepend_send_proxy(proxy, &mut sess, target);
 
-            if let Ok((srv_fd, immediate)) = raw::connect(target) {
+            if let Ok((srv_fd, immediate)) = raw::connect(connect_addr(target, sess.server_addr)) {
                 let sfd = srv_fd.as_raw_fd();
                 srv_raw_fd = Some(sfd);
                 sess.attach_server(srv_fd, now);
@@ -3211,7 +3229,9 @@ fn release_server(
                 .get(entry.srv_backend_idx)
                 .is_some_and(|p| p.http_reuse != ibex_config::HttpReuse::Never)
             && raw::is_idle_conn_alive(srv_fd.as_fd());
-        if let (true, Some(addr)) = (reusable, entry.target_addr) {
+        // The pool is keyed by server; a server that maps the destination may have been
+        // connected anywhere, so its connections are not pooled.
+        if let (true, Some(addr)) = (reusable, entry.target_addr.filter(|&a| !maps_destination(a))) {
             idle_pool.entry(addr).or_default().push(srv_fd);
         }
     }
@@ -3302,7 +3322,7 @@ fn retry_server_connect(
     maybe_prepend_send_proxy(&proxies[be_idx], &mut entry.sess, target_addr);
 
     entry.target_addr = Some(target_addr);
-    if let Ok((srv_fd, immediate)) = raw::connect(target_addr) {
+    if let Ok((srv_fd, immediate)) = raw::connect(connect_addr(target_addr, entry.sess.server_addr)) {
         let sfd = srv_fd.as_raw_fd();
         entry.srv_raw_fd = Some(sfd);
         entry.sess.attach_server(srv_fd, now);
@@ -3532,7 +3552,7 @@ impl EngineDispatcher<'_> {
 
         let ctx = SampleContext {
             client_addr: entry.sess.client_addr,
-            server_addr: entry.target_addr,
+            server_addr: entry.sess.server_addr,
             fc_src: entry.sess.fc_src,
             fc_dst: entry.sess.fc_dst,
             is_first_req: entry.sess.is_first_req,
@@ -4126,7 +4146,7 @@ impl EngineDispatcher<'_> {
 
         let ctx = SampleContext {
             client_addr: entry.sess.client_addr,
-            server_addr: entry.target_addr,
+            server_addr: entry.sess.server_addr,
             fc_src: entry.sess.fc_src,
             fc_dst: entry.sess.fc_dst,
             is_first_req: entry.sess.is_first_req,
@@ -4138,6 +4158,8 @@ impl EngineDispatcher<'_> {
             req_headers: req_headers_clone.as_deref(),
             fe_name: Some(&proxies[fe_idx].name),
             be_name: Some(&proxies[be_idx].name),
+            be_max_retries: Some(proxies[be_idx].retries),
+            cur_max_retries: Some(entry.sess.max_retries),
             ..Default::default()
         };
 
@@ -4807,6 +4829,9 @@ impl EngineDispatcher<'_> {
         // Until a backend is chosen the frontend stands in for it, as `s->be` does in
         // HAProxy: an error page picked before routing comes from the frontend.
         entry.backend_idx = proxy_idx;
+        // Each request is a new stream in HAProxy, with the retry budget of its proxy
+        // (`stream_new`); what the last request spent or `set-retries` does not carry over.
+        entry.sess.set_retries(proxies[proxy_idx].retries);
 
         // Initialize per-request thread locals
         CURRENT_VARS.with(|v| {
@@ -4903,7 +4928,7 @@ impl EngineDispatcher<'_> {
 
         let http_sample_ctx = SampleContext {
             client_addr: entry.sess.client_addr,
-            server_addr: entry.target_addr,
+            server_addr: entry.sess.server_addr,
             fc_src: entry.sess.fc_src,
             fc_dst: entry.sess.fc_dst,
             is_first_req: entry.sess.is_first_req,
@@ -5030,12 +5055,12 @@ impl EngineDispatcher<'_> {
 
         let act_conn = proxies[proxy_idx].stats[worker_id()].act_conn.load(Ordering::Relaxed);
         let cum_conn = proxies[proxy_idx].stats[worker_id()].cum_conn.load(Ordering::Relaxed);
-        let eval_http_rules = |rules: &[ibex_config::HttpReqRule], acls: &HashMap<String, Expr>, sess: &mut TcpSession, target_addr: Option<SocketAddr>, fe_name: Option<&str>, be_name: Option<&str>, pages_idx: usize| -> Result<Option<()>, u16> {
+        let eval_http_rules = |rules: &[ibex_config::HttpReqRule], acls: &HashMap<String, Expr>, sess: &mut TcpSession, be_retries: u16, fe_name: Option<&str>, be_name: Option<&str>, pages_idx: usize| -> Result<Option<()>, u16> {
             macro_rules! make_ctx {
                 ($s:expr) => {
                     SampleContext {
                         client_addr: $s.client_addr,
-                        server_addr: target_addr,
+                        server_addr: $s.server_addr,
                         fc_src: $s.fc_src,
                         fc_dst: $s.fc_dst,
                         is_first_req: $s.is_first_req,
@@ -5048,6 +5073,8 @@ impl EngineDispatcher<'_> {
                         fe_name,
                         be_name,
                         captures_req_hdr: Some(&$s.req_captures),
+                        be_max_retries: Some(be_retries),
+                        cur_max_retries: Some($s.max_retries),
                         act_conn,
                         cum_conn,
                         sc_http_req_rates,
@@ -5227,6 +5254,37 @@ impl EngineDispatcher<'_> {
                         };
                         if let Ok(ip) = val.parse::<IpAddr>() {
                             sess.client_addr = Some(SocketAddr::new(ip, 0));
+                        }
+                    }
+                    ibex_config::HttpReqAction::SetDstPort { expr } => {
+                        // `tcp_action_req_set_dst_port` (src/tcp_act.c): the value as an
+                        // integer, truncated to 16 bits, on the stream's destination; an
+                        // address of another family becomes 0.0.0.0.
+                        let port = Expr::parse(expr)
+                            .ok()
+                            .and_then(|e| e.eval_sample(registry, &make_ctx!(sess)))
+                            .and_then(|smp| ibex_sample::cast::cast(smp, ibex_sample::SampleType::Sint));
+                        if let Some(ibex_sample::Sample::Sint(n)) = port {
+                            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                            let port = n as u16;
+                            let ip = sess.server_addr.map_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), |a| a.ip());
+                            sess.server_addr = Some(SocketAddr::new(ip, port));
+                        }
+                    }
+                    ibex_config::HttpReqAction::SetRetries { value } => {
+                        // `stream_action_set_retries` (src/stream.c): an expression's value
+                        // is used only in 0..=100. A backend switch afterwards resets it.
+                        match value {
+                            ibex_config::RetriesValue::Fixed(n) => sess.set_retries(*n),
+                            ibex_config::RetriesValue::Expr(expr) => {
+                                let n = Expr::parse(expr)
+                                    .ok()
+                                    .and_then(|e| e.eval_sample(registry, &make_ctx!(sess)))
+                                    .and_then(|smp| ibex_sample::cast::cast(smp, ibex_sample::SampleType::Sint));
+                                if let Some(ibex_sample::Sample::Sint(n @ 0..=100)) = n {
+                                    sess.set_retries(u16::try_from(n).unwrap_or(0));
+                                }
+                            }
                         }
                     }
                     ibex_config::HttpReqAction::SetDst { expr } => {
@@ -5458,7 +5516,7 @@ impl EngineDispatcher<'_> {
         if !proxies[proxy_idx].http_req_rules.is_empty() {
             let fe_rules = &proxies[proxy_idx].http_req_rules;
             let fe_acls = &proxies[proxy_idx].acls;
-            match eval_http_rules(fe_rules, fe_acls, &mut entry.sess, entry.target_addr, Some(&proxies[proxy_idx].name), None, proxy_idx) {
+            match eval_http_rules(fe_rules, fe_acls, &mut entry.sess, proxies[proxy_idx].retries, Some(&proxies[proxy_idx].name), None, proxy_idx) {
                 Ok(Some(())) => return None,
                 Err(status) => {
                     reply_error(entry, proxies, status);
@@ -5471,6 +5529,11 @@ impl EngineDispatcher<'_> {
         // 3. Resolve backend and server
         let be_idx = Self::resolve_backend(entry, proxies);
         entry.backend_idx = be_idx;
+        // `stream_set_backend` (src/stream.c): switching to a backend takes its retry
+        // budget, whatever a frontend-side `set-retries` set.
+        if be_idx != proxy_idx {
+            entry.sess.set_retries(proxies[be_idx].retries);
+        }
         // The server side runs on the backend's timeouts, as in HAProxy.
         if be_idx != proxy_idx {
             let t = proxies[be_idx].timeouts;
@@ -5534,7 +5597,7 @@ impl EngineDispatcher<'_> {
         if be_idx != proxy_idx && !proxies[be_idx].http_req_rules.is_empty() {
             let be_rules = &proxies[be_idx].http_req_rules;
             let be_acls = &proxies[be_idx].acls;
-            match eval_http_rules(be_rules, be_acls, &mut entry.sess, entry.target_addr, Some(&proxies[proxy_idx].name), Some(&proxies[be_idx].name), be_idx) {
+            match eval_http_rules(be_rules, be_acls, &mut entry.sess, proxies[be_idx].retries, Some(&proxies[proxy_idx].name), Some(&proxies[be_idx].name), be_idx) {
                 Ok(Some(())) => return None,
                 Err(status) => {
                     reply_error(entry, proxies, status);
@@ -5594,7 +5657,11 @@ impl EngineDispatcher<'_> {
         // to the same server: no new connection, no pool round trip. Otherwise it goes to
         // the pool (or is closed) and the request is routed as usual.
         if entry.sess.srv.is_some() {
-            let same = entry.srv_backend_idx == be_idx && entry.target_addr == Some(target_addr);
+            // A server that maps the destination may have been reached at another
+            // address than this request's destination names; it is not kept.
+            let same = entry.srv_backend_idx == be_idx
+                && entry.target_addr == Some(target_addr)
+                && !maps_destination(target_addr);
             if same
                 && matches!(entry.sess.srv_state, ScState::Ready | ScState::Established)
                 && entry.sess.rep.is_empty()
@@ -5667,7 +5734,7 @@ impl EngineDispatcher<'_> {
                     new_interest.writable,
                 );
             }
-        } else if let Ok((srv_fd, immediate)) = raw::connect(target_addr) {
+        } else if let Ok((srv_fd, immediate)) = raw::connect(connect_addr(target_addr, entry.sess.server_addr)) {
             let sfd = srv_fd.as_raw_fd();
             entry.srv_raw_fd = Some(sfd);
             entry.sess.attach_server(srv_fd, now);
@@ -5725,6 +5792,9 @@ impl EngineDispatcher<'_> {
     ) {
         let be_idx = Self::resolve_backend(entry, proxies);
         entry.backend_idx = be_idx;
+        if be_idx != entry.proxy_idx {
+            entry.sess.set_retries(proxies[be_idx].retries);
+        }
 
         if !proxies[be_idx].tcp_req_content_rules.is_empty() {
             let res = eval_tcp_req_content_rules(
@@ -5777,7 +5847,7 @@ impl EngineDispatcher<'_> {
         maybe_prepend_send_proxy(&proxies[be_idx], &mut entry.sess, target_addr);
 
         entry.target_addr = Some(target_addr);
-        if let Ok((srv_fd, immediate)) = raw::connect(target_addr) {
+        if let Ok((srv_fd, immediate)) = raw::connect(connect_addr(target_addr, entry.sess.server_addr)) {
             let sfd = srv_fd.as_raw_fd();
             entry.srv_raw_fd = Some(sfd);
             entry.sess.attach_server(srv_fd, now);

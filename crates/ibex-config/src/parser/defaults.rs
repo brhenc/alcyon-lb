@@ -105,6 +105,11 @@ pub(crate) fn parse_defaults_directive(
                 )),
             }
         }
+        "http-request" if tokens.get(1).is_some_and(|t| t.text == "set-retries") => Err(ConfigError::new(
+            tokens[1].line,
+            tokens[1].col,
+            "'set-retries' is not allowed in 'defaults' sections",
+        )),
         "http-request" => parse_http_req_rule(&mut defaults.http_req_rules, tokens, kw),
         "http-response" => parse_http_res_rule(&mut defaults.http_res_rules, tokens, kw),
         "http-after-response" => {
