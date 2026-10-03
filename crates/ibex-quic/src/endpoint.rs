@@ -37,6 +37,8 @@ pub struct QuicEndpoint {
     next_timeout: Option<Instant>,
     response_buf: Vec<u8>,
     tx_buf: Vec<u8>,
+    /// Set by a soft stop: connections already here are served to the end, a new Initial is refused.
+    refusing_new: bool,
 }
 
 /// RFC 9000 §8.1 accounting for one connection on an unvalidated path.
@@ -154,7 +156,15 @@ impl QuicEndpoint {
             next_timeout: None,
             response_buf: Vec::with_capacity(2048),
             tx_buf: Vec::with_capacity(2048),
+            refusing_new: false,
         }
+    }
+
+    /// Soft stop (HAProxy's `soft_stop()`): refuse every new connection from now on while the
+    /// ones already established keep being served. The client of a refused one gets a
+    /// CONNECTION_REFUSED close and goes to whichever process is taking over.
+    pub fn stop_accepting(&mut self) {
+        self.refusing_new = true;
     }
 
     /// Creates a `QuicEndpoint` from an already configured `quinn_proto::ServerConfig`.
@@ -366,6 +376,21 @@ impl QuicTransport for QuicEndpoint {
         match event {
             Some(DatagramEvent::NewConnection(incoming)) => {
                 let remote_addr = incoming.remote_address();
+                if self.refusing_new {
+                    self.response_buf.clear();
+                    let tx = self.endpoint.refuse(incoming, &mut self.response_buf);
+                    self.pending_transmits.push_back(TransmitEntry {
+                        transmit: Transmit {
+                            destination: tx.destination,
+                            src_ip: tx.src_ip,
+                            size: tx.size,
+                            segment_size: tx.segment_size,
+                            ecn: tx.ecn.map(EcnCodepoint::from),
+                        },
+                        data: self.response_buf.clone(),
+                    });
+                    return Ok(DatagramOutcome::StatelessResponse);
+                }
                 let primary_cid = ConnectionId::from(*incoming.orig_dst_cid());
                 let outcome = match self.endpoint.accept(
                     incoming,
@@ -667,6 +692,11 @@ impl QuicTransport for QuicEndpoint {
                     conn.close(Instant::now(), code, Bytes::copy_from_slice(reason));
                 }
             }
+            self.drive_connection(handle, Instant::now());
+            // Closing arms a drain timer. Left out of the cached deadline, the engine would not
+            // wake for it, and the connection would be counted live until some unrelated
+            // datagram refreshed the cache.
+            self.update_next_timeout();
         }
     }
 

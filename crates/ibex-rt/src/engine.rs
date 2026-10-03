@@ -1769,6 +1769,34 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
     /// after the fact rather than up front. Registering them is what lets a slow backend
     /// wake the loop instead of being noticed on the next unrelated event.
     fn sync_quic_backend_fds(&mut self) {
+        // Backend legs and pinned sockets that have been dropped: the kernel took them out of
+        // the poller when it closed them, but their table slots are still ours. A slot left
+        // behind makes the next socket given that descriptor number look already registered,
+        // so it is never polled and its leg waits for an unrelated wakeup.
+        for ql in &mut self.quic_listeners {
+            for fd in ql.take_released_fds() {
+                self.fdtab.remove(fd);
+            }
+        }
+        // Sockets pinned to connections by a soft stop: readable interest only.
+        let mut pinned_add: Vec<(usize, RawFd)> = Vec::new();
+        for (idx, ql) in self.quic_listeners.iter().enumerate() {
+            for b in ql.pinned_borrowed_fds() {
+                if matches!(self.fdtab.state(b.as_raw_fd()), FdState::Closed) {
+                    pinned_add.push((idx, b.as_raw_fd()));
+                }
+            }
+        }
+        for (idx, fd) in pinned_add {
+            let Some(ql) = self.quic_listeners.get(idx) else { continue };
+            let Some(b) = ql.pinned_borrowed_fds().into_iter().find(|b| b.as_raw_fd() == fd) else { continue };
+            self.fdtab.insert(
+                fd,
+                FdState::QuicBackend { listener: usize_to_u32(idx) },
+                Interest::READ,
+            );
+            let _ = self.poller.add(b, raw_fd_to_u64(fd), true, false);
+        }
         let mut to_add: Vec<(usize, RawFd)> = Vec::new();
         for (idx, ql) in self.quic_listeners.iter().enumerate() {
             for fd in ql.backend_fds() {
@@ -2232,7 +2260,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             }
             if self.stopping {
                 self.close_idle_http_sessions();
-                if self.sessions.live() == 0 {
+                if self.sessions.live() == 0 && !self.quic_listeners.iter().any(crate::quic_listener::QuicListener::is_busy) {
                     break;
                 }
                 if self.stop_deadline.is_some_and(|d| Instant::now() >= d) {
@@ -2255,7 +2283,8 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
     ///
     /// QUIC listeners are deliberately left open. A QUIC connection lives on the listening
     /// UDP socket itself, so closing it would cut every in-flight HTTP/3 request, which is
-    /// the opposite of a soft stop. They are closed when the loop ends.
+    /// the opposite of a soft stop. Each one stops taking new connections and drains
+    /// (`QuicListener::begin_soft_stop`); the loop waits for it like it waits for sessions.
     pub fn begin_soft_stop(&mut self) {
         if self.stopping {
             return;
@@ -2275,6 +2304,9 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         // would keep each socket open -- and queueing connections -- after its listener
         // is gone. By now the new process has taken what it needs.
         crate::handover::withdraw_all();
+        for ql in &mut self.quic_listeners {
+            ql.begin_soft_stop();
+        }
         if let Some(cli) = self.cli_listener.take() {
             self.fdtab.remove(cli.as_raw_fd());
             let _ = self.poller.delete(cli.as_fd());

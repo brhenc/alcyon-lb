@@ -51,6 +51,14 @@ impl DgramSocket {
     }
 
     #[must_use]
+    /// Connects the socket to `peer`, so the kernel delivers only that peer's datagrams to it
+    /// and prefers it to every unconnected socket sharing the port.
+    pub fn connect(&self, peer: SocketAddr) -> io::Result<()> {
+        rustix::net::connect_any(self.fd.as_fd(), &to_any(peer))?;
+        Ok(())
+    }
+
+    #[must_use]
     pub fn as_raw_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
     }
