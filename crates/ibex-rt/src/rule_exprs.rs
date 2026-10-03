@@ -305,6 +305,9 @@ mod tests {
         assert_eq!(check_sample_expr("nosuch", &reg), Err("unknown fetch method 'nosuch'".into()));
         assert_eq!(check_sample_expr("hdr_beg(host)", &reg), Err("unknown fetch method 'hdr_beg'".into()));
         assert_eq!(check_sample_expr("src,lowr", &reg), Err("unknown converter 'lowr'".into()));
+        // As the text reaches here when the quotes survive tokenizing: the quoted space and
+        // comma are inside the argument (`haproxy -c` on `str('a b'),lowr`: unknown converter).
+        assert_eq!(check_sample_expr("str('a b'),lowr", &reg), Err("unknown converter 'lowr'".into()));
         assert_eq!(check_sample_expr("%[src]", &reg), Err("missing fetch method".into()));
         assert_eq!(check_int_or_expr("-1", &reg), Ok(()));
         assert_eq!(check_int_or_expr("0x10", &reg), Err("unknown fetch method '0x10'".into()));
