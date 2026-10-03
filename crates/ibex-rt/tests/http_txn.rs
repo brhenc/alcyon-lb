@@ -759,9 +759,9 @@ fn a_server_timeout_gets_a_504() {
 }
 
 /// An interim response and the final one in one packet: both reach the client, in order
-/// (RFC 9110 section 15.2). Not measurable against the oracle: `HAProxy` 3.5-dev7 aborts
-/// on it, `FATAL: bug condition "htx_msg_ended(htx) && type != HTX_BLK_RAW_DATA" matched
-/// at src/htx.c:391`, from `h1_parse_msg_hdrs`. The split-packet case below is measured.
+/// (RFC 9110 section 15.2). `HAProxy` 3.5-dev8: 103, then 200. (3.5-dev7 aborted on this,
+/// `BUG_ON` at `src/htx.c:391`; fixed upstream by 76454cbbf, see
+/// `upstream/haproxy-1xx-in-one-read.md`.)
 #[test]
 fn an_interim_and_a_final_response_in_one_packet() {
     let (_p, fe, _) = simple(

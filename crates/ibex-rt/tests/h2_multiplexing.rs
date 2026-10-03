@@ -1180,12 +1180,12 @@ fn status_200_and_data(frames: &[(u8, u8, u32, Vec<u8>)]) -> (bool, Vec<u8>) {
 }
 
 /// An unsolicited interim `100 Continue` from the HTTP/1 server ahead of the final
-/// response: the final response reaches the HTTP/2 client, the interim one is dropped
-/// (`h2_forward_response`).
+/// response, in one packet: the final response reaches the HTTP/2 client.
 ///
-/// NOT what `HAProxy` 3.5 does, and deliberately left so: given this exact exchange it sent
-/// nothing at all on the stream within two seconds (curl: HTTP/2 error, exit 16). Ibex's
-/// answer is the useful one; reported for a decision rather than copied.
+/// `HAProxy` 3.5-dev8 sends a `:status 100` HEADERS frame and then the 200. Ibex drops the
+/// interim response (`h2_forward_response`), which is the HTTP/2 1xx gap design 010 step 5
+/// closes; only the final response is asserted here. (3.5-dev7 aborted on this exchange,
+/// `BUG_ON` at `src/htx.c:391`, fixed upstream by 76454cbbf.)
 #[test]
 fn an_interim_response_ahead_of_the_final_one_reaches_an_h2_client() {
     let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);

@@ -1,6 +1,4 @@
 {
- "measured_on": "HAProxy version 3.5-dev7-e6f616-55 2026/09/21 (reference binary), 2026-10-02",
- "haproxy_fails": {
-  "an_interim_and_a_final_response_in_one_packet": "HAProxy crashes: BUG_ON at src/htx.c:391 when a 1xx and the final response arrive in one read. Ibex answers both; the case asserts the RFC behaviour."
- }
+ "measured_on": "HAProxy version 3.5-dev8-885761-29 2026/10/02 (reference binary), 2026-10-03",
+ "haproxy_fails": {}
 }
