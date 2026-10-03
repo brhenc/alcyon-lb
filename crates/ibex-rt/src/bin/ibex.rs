@@ -582,6 +582,14 @@ fn main() {
         }
     };
 
+    // 5a. Every rule action's expression must name fetches and converters that exist.
+    //     `HAProxy` refuses the configuration otherwise; checked here so that `-c` reports
+    //     it and a start fails before anything is daemonized, signalled or bound.
+    if let Err(e) = ibex_rt::rule_exprs::validate_config(&config) {
+        eprintln!("Configuration error: {e}");
+        process::exit(1);
+    }
+
     // 5b. TLS is wired now: `Engine::new` builds a rustls config per `bind ... ssl crt`
     // and refuses to start if one cannot be loaded, so the blanket guard that used to
     // live here is gone. What it protected against has not changed -- a listener on :443

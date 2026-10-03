@@ -387,10 +387,17 @@ impl Registry {
             func: fc_dst_fetch,
         });
 
-        let dst_port_fetch: FetchFn =
-            |ctx, _args| ctx.server_addr.map(|sa| Sample::Sint(i64::from(sa.port())));
-        let fc_dst_port_fetch: FetchFn =
-            |ctx, _args| ctx.fc_dst.or(ctx.server_addr).map(|sa| Sample::Sint(i64::from(sa.port())));
+        // `smp_fetch_dport` (src/tcp_sample.c) fails on port 0: `set-dst-port` can put it
+        // there, and HAProxy then prints nothing for `%[dst_port]`.
+        let dst_port_fetch: FetchFn = |ctx, _args| {
+            ctx.server_addr.filter(|sa| sa.port() != 0).map(|sa| Sample::Sint(i64::from(sa.port())))
+        };
+        let fc_dst_port_fetch: FetchFn = |ctx, _args| {
+            ctx.fc_dst
+                .or(ctx.server_addr)
+                .filter(|sa| sa.port() != 0)
+                .map(|sa| Sample::Sint(i64::from(sa.port())))
+        };
         self.register_fetch(FetchDesc {
             name: "dst_port",
             out_type: SampleType::Sint,

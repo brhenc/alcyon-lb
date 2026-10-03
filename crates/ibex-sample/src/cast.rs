@@ -242,10 +242,39 @@ fn c_str2bool(smp: Sample) -> Option<Sample> {
     }
 }
 
+/// `c_str2int` (`src/sample.c`): only an empty string fails; otherwise `read_int64`.
 fn c_str2sint(smp: Sample) -> Option<Sample> {
     match smp {
-        Sample::Str(s) => s.trim().parse::<i64>().ok().map(Sample::Sint),
+        Sample::Str(s) if s.is_empty() => None,
+        Sample::Str(s) => Some(Sample::Sint(read_int64(s.as_bytes()))),
         _ => None,
+    }
+}
+
+/// `read_int64` (`src/tools.c`): an optional `-` or `+`, then the leading decimal digits.
+/// Whatever follows them is ignored, nothing is skipped before them (so `"abc"` and
+/// `" 12"` are 0, `"12abc"` is 12), and a value out of range saturates at `i64::MAX` /
+/// `i64::MIN`.
+fn read_int64(s: &[u8]) -> i64 {
+    let (neg, digits) = match s.first() {
+        Some(b'-') => (true, &s[1..]),
+        Some(b'+') => (false, &s[1..]),
+        _ => (false, s),
+    };
+    // `read_uint64`: saturates at u64::MAX on overflow.
+    let mut n: u64 = 0;
+    for &c in digits.iter().take_while(|c| c.is_ascii_digit()) {
+        n = n.checked_mul(10).and_then(|v| v.checked_add(u64::from(c - b'0'))).unwrap_or(u64::MAX);
+    }
+    if neg {
+        // `-i` in two's complement; anything past 2^63 is LLONG_MIN.
+        if n > 1u64 << 63 {
+            i64::MIN
+        } else {
+            0i64.wrapping_sub_unsigned(n)
+        }
+    } else {
+        i64::try_from(n).unwrap_or(i64::MAX)
     }
 }
 
