@@ -67,7 +67,7 @@ pub struct DefaultsSection {
     /// Default TCP response inspection delay.
     pub tcp_res_inspect_delay: Option<Duration>,
     /// Default TCP response content rules (`tcp-response content`).
-    pub tcp_res_content_rules: Vec<TcpReqContentRule>,
+    pub tcp_res_content_rules: Vec<TcpResContentRule>,
     /// Default custom error pages (`errorfile`/`errorfiles`), keyed by status code.
     pub error_files: HashMap<u16, Vec<u8>>,
     /// Default `http-error` overrides, keyed by status code.
@@ -174,7 +174,7 @@ pub struct ListenSection {
     /// TCP-response inspect delay.
     pub tcp_res_inspect_delay: Option<Duration>,
     /// Modern TCP-response content rules.
-    pub tcp_res_content_rules: Vec<TcpReqContentRule>,
+    pub tcp_res_content_rules: Vec<TcpResContentRule>,
     /// Modern HTTP-request rules.
     pub http_req_rules: Vec<HttpReqRule>,
     /// Modern HTTP-response rules.
@@ -459,7 +459,7 @@ pub struct BackendSection {
     /// TCP-response inspect delay.
     pub tcp_res_inspect_delay: Option<Duration>,
     /// Modern TCP-response content rules.
-    pub tcp_res_content_rules: Vec<TcpReqContentRule>,
+    pub tcp_res_content_rules: Vec<TcpResContentRule>,
     /// Modern HTTP-request rules.
     pub http_req_rules: Vec<HttpReqRule>,
     /// Modern HTTP-response rules.

@@ -19,7 +19,7 @@ use crate::ast::{
     MysqlCheckVersion, ProtoCheckConfig, ResolvedCheckConfig, ResolvedHttpCheck,
     ResolvedHttpExpectPattern, ResolvedHttpExpectRule, ResolvedTcpStep, Server, StatsConfig,
     StickRule, StickRuleType, StickTableConfigAst, TcpCheckAction, TcpCheckExpectPattern,
-    TcpReqConnAction, TcpReqConnRule, TcpReqContentAction, TcpReqContentRule,
+    TcpReqConnAction, TcpReqConnRule, TcpReqContentAction, TcpReqContentRule, TcpResAction, TcpResContentRule,
     TcpReqSessionAction, TcpReqSessionRule, TimeoutConfig, UseBackendRule,
 };
 use crate::error::ConfigError;

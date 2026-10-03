@@ -11,6 +11,7 @@
 
 pub mod cast;
 pub mod expr;
+pub mod fix;
 pub mod hash;
 pub mod matcher;
 pub mod registry;

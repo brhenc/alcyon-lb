@@ -256,6 +256,52 @@ pub(crate) fn parse_tcp_content_switch_mode(
     })
 }
 
+/// `tcp-response content <action>`: the request-side grammar, kept only for the actions
+/// the response side runs (`eval_tcp_res_content_rules` in ibex-rt). `HAProxy` takes a
+/// few more there, refused here until they run; the rest it refuses itself
+/// (`tcp_parse_tcp_rep`, `src/tcp_rules.c`).
+pub(crate) fn parse_tcp_res_content(
+    rules: &mut Vec<TcpResContentRule>,
+    tokens: &[Token],
+    kw: &Token,
+) -> Result<(), ConfigError> {
+    let at = tokens.get(2).unwrap_or(kw);
+    let act = at.text.as_str();
+    let name = act.split('(').next().unwrap_or(act);
+    if matches!(
+        name,
+        "close" | "send-spoe-group" | "set-log-level" | "set-nice" | "sc-add-gpc" | "sc-inc-gpc"
+            | "sc-inc-gpc0" | "sc-inc-gpc1" | "sc-set-gpt" | "sc-set-gpt0" | "set-vars-from-map"
+            | "do-log" | "set-fc-mark" | "set-fc-tos" | "set-mark" | "set-tos" | "set-bandwidth-limit"
+    ) {
+        return Err(ConfigError::new(at.line, at.col, format!("'tcp-response content {name}' is not implemented")));
+    }
+    let mut parsed = Vec::new();
+    parse_tcp_req_content(&mut parsed, tokens, kw)?;
+    for TcpReqContentRule { action, cond } in parsed {
+        let action = match action {
+            TcpReqContentAction::Accept => TcpResAction::Accept,
+            TcpReqContentAction::Reject => TcpResAction::Reject,
+            TcpReqContentAction::SilentDrop => TcpResAction::SilentDrop,
+            TcpReqContentAction::SetVar { var_name, expr } => TcpResAction::SetVar { var_name, expr },
+            TcpReqContentAction::SetVarFmt { var_name, fmt } => TcpResAction::SetVarFmt { var_name, fmt },
+            TcpReqContentAction::UnsetVar { var_name } => TcpResAction::UnsetVar { var_name },
+            _ => {
+                return Err(ConfigError::new(
+                    at.line,
+                    at.col,
+                    format!(
+                        "'tcp-response content' expects 'accept', 'reject', 'silent-drop', 'set-var(*)', \
+                         'set-var-fmt(*)' or 'unset-var(*)' (got '{act}')"
+                    ),
+                ))
+            }
+        };
+        rules.push(TcpResContentRule { action, cond });
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 pub(crate) fn parse_tcp_req_content(
     rules: &mut Vec<TcpReqContentRule>,

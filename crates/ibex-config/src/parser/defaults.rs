@@ -100,7 +100,12 @@ pub(crate) fn parse_defaults_directive(
                     defaults.tcp_res_inspect_delay = Some(parse_timeout(&tokens[2], "tcp-response inspect-delay")?);
                     Ok(())
                 }
-                "content" => parse_tcp_req_content(&mut defaults.tcp_res_content_rules, tokens, kw),
+                "content" if defaults.name.is_none() => Err(ConfigError::new(
+                    kw.line,
+                    kw.col,
+                    "tcp-response content is only allowed in 'backend' sections or 'defaults' section with a name",
+                )),
+                "content" => parse_tcp_res_content(&mut defaults.tcp_res_content_rules, tokens, kw),
                 other => Err(ConfigError::new(
                     tokens[1].line,
                     tokens[1].col,

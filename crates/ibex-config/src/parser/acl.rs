@@ -35,61 +35,54 @@ pub(crate) fn parse_acl_condition_from_tokens(tokens: &[Token]) -> Result<Option
     };
 
     let mut terms = Vec::new();
+    // A `!` standing alone negates the term after it (`! { path /a }`).
+    let mut negate_next = false;
     let mut i = 1;
     while i < tokens.len() {
         let tok = &tokens[i];
-        if tok.text == "{" {
-            let mut brace_tokens = Vec::new();
-            brace_tokens.push("{");
+        if tok.text == "!" {
+            negate_next = !negate_next;
+            i += 1;
+            continue;
+        }
+        if tok.text == "||" || tok.text == "or" {
+            terms.push(AclTerm { negated: false, name: AclCondition::OR.to_string() });
+            negate_next = false;
+            i += 1;
+            continue;
+        }
+        let before = terms.len();
+        // `!` attached to a term negates it, a brace included (`!is_n`, `!{ path /a }`).
+        let (bang, text) = match tok.text.strip_prefix('!') {
+            Some(rest) => (true, rest),
+            None => (false, tok.text.as_str()),
+        };
+        if text == "{" {
+            let open = &tokens[i];
+            let mut brace_tokens = vec!["{"];
             i += 1;
             while i < tokens.len() && tokens[i].text != "}" {
                 brace_tokens.push(tokens[i].text.as_str());
                 i += 1;
             }
-            if i < tokens.len() && tokens[i].text == "}" {
-                brace_tokens.push("}");
-                i += 1;
+            if i == tokens.len() {
+                return Err(ConfigError::new(open.line, open.col, "missing closing '}' in condition"));
             }
-            terms.push(AclTerm {
-                negated: false,
-                name: brace_tokens.join(" "),
-            });
-        } else if tok.text.starts_with('{') {
-            if tok.text.ends_with('}') {
-                terms.push(AclTerm {
-                    negated: false,
-                    name: tok.text.clone(),
-                });
-                i += 1;
-            } else {
-                let mut brace_tokens = Vec::new();
-                brace_tokens.push(tok.text.as_str());
-                i += 1;
-                while i < tokens.len() && !tokens[i].text.ends_with('}') {
-                    brace_tokens.push(tokens[i].text.as_str());
-                    i += 1;
-                }
-                if i < tokens.len() {
-                    brace_tokens.push(tokens[i].text.as_str());
-                    i += 1;
-                }
-                terms.push(AclTerm {
-                    negated: false,
-                    name: brace_tokens.join(" "),
-                });
-            }
-        } else if let Some(stripped) = tok.text.strip_prefix('!') {
-            terms.push(AclTerm {
-                negated: true,
-                name: stripped.to_string(),
-            });
+            brace_tokens.push("}");
             i += 1;
+            terms.push(AclTerm { negated: bang, name: brace_tokens.join(" ") });
+        } else if text.starts_with('{') {
+            // `HAProxy` reads a brace only as a word of its own.
+            return Err(ConfigError::new(tok.line, tok.col, format!("unknown ACL or sample keyword '{text}'")));
         } else {
-            terms.push(AclTerm {
-                negated: false,
-                name: tok.text.clone(),
-            });
+            terms.push(AclTerm { negated: bang, name: text.to_string() });
             i += 1;
+        }
+        if negate_next && terms.len() > before {
+            if let Some(t) = terms.last_mut() {
+                t.negated = !t.negated;
+            }
+            negate_next = false;
         }
     }
 

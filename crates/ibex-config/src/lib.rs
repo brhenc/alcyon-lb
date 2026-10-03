@@ -28,7 +28,7 @@ pub use ast::{
     HttpResRule, HttpReuse, ListenSection, LogConfig, LogFacility, LogLevel, LogSample, LogTarget, Mode, RetriesValue,
     Server, StatsConfig,
     StickRule, StickRuleType, StickTableConfigAst, TcpReqConnAction, TcpReqConnRule,
-    TcpReqContentAction, TcpReqContentRule, TcpReqSessionAction, TcpReqSessionRule,
+    TcpReqContentAction, TcpReqContentRule, TcpResAction, TcpResContentRule, TcpReqSessionAction, TcpReqSessionRule,
     TimeoutConfig, UseBackendRule,
 };
 pub use error::ConfigError;

@@ -162,6 +162,14 @@ pub struct TcpSession {
     pub fc_dst: Option<SocketAddr>,
     pub tcp_inspect_done: bool,
     pub inspect_exp: Option<Tick>,
+    /// TCP mode, `tcp-response content` rules still deciding: the response is held from
+    /// the client (no write, no shutdown) until they accept or reject it.
+    pub res_inspect_pending: bool,
+    /// When `tcp-response inspect-delay` runs out and the rules decide on what they have.
+    pub res_inspect_exp: Option<Tick>,
+    /// The backend has `tcp-response content` rules for this stream: they start, with
+    /// this inspect-delay, once the server connection is up (`server_connected`).
+    pub res_inspect_armed: Option<Option<u32>>,
     pub sess_vars: HashMap<String, String>,
     pub req_vars: HashMap<String, String>,
     pub req_captures: Vec<String>,
@@ -257,6 +265,9 @@ impl TcpSession {
             fc_dst: None,
             tcp_inspect_done: true,
             inspect_exp: None,
+            res_inspect_pending: false,
+            res_inspect_exp: None,
+            res_inspect_armed: None,
             sess_vars: HashMap::new(),
             req_vars: HashMap::new(),
             req_captures: Vec::new(),
@@ -384,6 +395,11 @@ impl TcpSession {
         };
         self.conn_exp = Tick::ETERNITY;
         self.arm_server(now);
+        // `AN_RES_INSPECT` runs from here, before any of the response has arrived.
+        if let Some(delay) = self.res_inspect_armed.take() {
+            self.res_inspect_pending = true;
+            self.res_inspect_exp = delay.map(|ms| now.add(ms));
+        }
     }
 
     /// Gives the stream a retry budget of `n`, before any connect attempt: a new request,
@@ -1057,7 +1073,7 @@ impl TcpSession {
         // Write response data back to the client while writing is permitted: in HTTP, the
         // current response's bytes and no more.
         let window = self.rep_window();
-        if self.h2_ctx.is_none() && self.cli_state.can_write() && window > 0 {
+        if self.h2_ctx.is_none() && self.cli_state.can_write() && window > 0 && !self.res_inspect_pending {
             match self.cli_xprt.send(self.cli.as_fd(), &self.rep.readable()[..window])? {
                 Io::Done(n) if n > 0 => {
                     if self.mode == Mode::Http {
@@ -1096,7 +1112,7 @@ impl TcpSession {
                     self.srv_state,
                     ScState::ShutR | ScState::Closed | ScState::Error
                 );
-                if srv_done_sending && self.rep.is_empty() && self.pending_resp.is_none() {
+                if srv_done_sending && self.rep.is_empty() && self.pending_resp.is_none() && !self.res_inspect_pending {
                     raw::shutdown_write(self.cli.as_fd());
                     self.cli_state = ScState::ShutW;
                     self.ending
@@ -1123,7 +1139,7 @@ impl TcpSession {
                     self.srv_state,
                     ScState::ShutR | ScState::Closed | ScState::Error
                 );
-                if srv_done_sending && self.rep.is_empty() && self.pending_resp.is_none() {
+                if srv_done_sending && self.rep.is_empty() && self.pending_resp.is_none() && !self.res_inspect_pending {
                     raw::shutdown_write(self.cli.as_fd());
                     self.cli_state = ScState::Closed;
                     self.srv_state = ScState::Closed;
@@ -1447,6 +1463,9 @@ impl TcpSession {
             if !self.tcp_inspect_done {
                 exp = exp.earliest(i_exp);
             }
+        }
+        if let (true, Some(r_exp)) = (self.res_inspect_pending, self.res_inspect_exp) {
+            exp = exp.earliest(r_exp);
         }
         exp
     }
@@ -1805,28 +1824,47 @@ pub fn eval_acl_condition_extended<S: ::std::hash::BuildHasher>(
     req_bytes: &[u8],
     can_wait: bool,
 ) -> AclEvalResult {
-    let mut has_missing = false;
-    for term in &cond.terms {
-        match eval_acl_term_extended(term, acls, registry, ctx, req_bytes, can_wait) {
-            AclEvalResult::NotMatched => {
-                return if cond.is_if {
-                    AclEvalResult::NotMatched
-                } else {
-                    AclEvalResult::Matched
-                };
+    combine_condition(cond, |term| eval_acl_term_extended(term, acls, registry, ctx, req_bytes, can_wait))
+}
+
+/// `acl_exec_cond` (src/acl.c): within an alternative a failing term fails it and a
+/// missing one makes it a miss; across alternatives a passing one passes and a miss
+/// leaves the condition a miss. `unless` inverts pass and fail; a miss stays a miss.
+pub fn combine_condition(
+    cond: &ibex_config::AclCondition,
+    mut term: impl FnMut(&ibex_config::AclTerm) -> AclEvalResult,
+) -> AclEvalResult {
+    let mut any_missing = false;
+    let mut passed = false;
+    for suite in cond.suites() {
+        let mut suite_res = AclEvalResult::Matched;
+        for t in suite {
+            match term(t) {
+                AclEvalResult::NotMatched => {
+                    suite_res = AclEvalResult::NotMatched;
+                    break;
+                }
+                AclEvalResult::MissingData => suite_res = AclEvalResult::MissingData,
+                AclEvalResult::Matched => {}
             }
-            AclEvalResult::MissingData => {
-                has_missing = true;
+        }
+        match suite_res {
+            AclEvalResult::Matched => {
+                passed = true;
+                break;
             }
-            AclEvalResult::Matched => {}
+            AclEvalResult::MissingData => any_missing = true,
+            AclEvalResult::NotMatched => {}
         }
     }
-    if has_missing {
+    if passed {
+        if cond.is_if { AclEvalResult::Matched } else { AclEvalResult::NotMatched }
+    } else if any_missing {
         AclEvalResult::MissingData
     } else if cond.is_if {
-        AclEvalResult::Matched
-    } else {
         AclEvalResult::NotMatched
+    } else {
+        AclEvalResult::Matched
     }
 }
 
@@ -1837,16 +1875,11 @@ pub fn eval_acl_condition<S: ::std::hash::BuildHasher>(
     registry: &Registry,
     ctx: &SampleContext,
 ) -> bool {
-    let mut term_match = true;
-    for term in &cond.terms {
-        if !eval_acl_term(term, acls, registry, ctx) {
-            term_match = false;
-            break;
+    combine_condition(cond, |term| {
+        if eval_acl_term(term, acls, registry, ctx) {
+            AclEvalResult::Matched
+        } else {
+            AclEvalResult::NotMatched
         }
-    }
-    if cond.is_if {
-        term_match
-    } else {
-        !term_match
-    }
+    }) == AclEvalResult::Matched
 }

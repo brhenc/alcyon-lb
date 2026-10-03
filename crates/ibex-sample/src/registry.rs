@@ -517,16 +517,12 @@ impl Registry {
             },
         });
 
+        // `smp_fetch_rqver` / `smp_fetch_stver` (src/http_fetch.c): the version without
+        // its "HTTP/" ("1.1"), and nothing when there is no message to read it from.
         let request_version_fetch: FetchFn = |ctx, _args| {
-            if let Some(v) = get_context_req_version(ctx) {
-                return Some(Sample::Str(v.to_string()));
-            }
-            if let Some(htx) = ctx.htx {
-                if let Some(req) = htx.req_line() {
-                    return Some(Sample::Str(req.version.as_str().to_string()));
-                }
-            }
-            Some(Sample::Str("HTTP/1.1".to_string()))
+            let v = get_context_req_version(ctx).map(str::to_string)
+                .or_else(|| ctx.htx.and_then(|h| h.req_line()).map(|l| l.version.as_str().to_string()))?;
+            Some(Sample::Str(v.strip_prefix("HTTP/").unwrap_or(&v).to_string()))
         };
         self.register_fetch(FetchDesc {
             name: "req.ver",
@@ -539,16 +535,12 @@ impl Registry {
             func: request_version_fetch,
         });
 
+        // `smp_fetch_rqver` / `smp_fetch_stver` (src/http_fetch.c): the version without
+        // its "HTTP/" ("1.1"), and nothing when there is no message to read it from.
         let response_version_fetch: FetchFn = |ctx, _args| {
-            if let Some(v) = get_context_res_version(ctx) {
-                return Some(Sample::Str(v.to_string()));
-            }
-            if let Some(htx) = ctx.htx {
-                if let Some(res) = htx.res_line() {
-                    return Some(Sample::Str(res.version.as_str().to_string()));
-                }
-            }
-            Some(Sample::Str("HTTP/1.1".to_string()))
+            let v = get_context_res_version(ctx).map(str::to_string)
+                .or_else(|| ctx.htx.and_then(|h| h.res_line()).map(|l| l.version.as_str().to_string()))?;
+            Some(Sample::Str(v.strip_prefix("HTTP/").unwrap_or(&v).to_string()))
         };
         self.register_fetch(FetchDesc {
             name: "res.ver",
@@ -2610,6 +2602,33 @@ impl Registry {
         });
 
         // --- 3. Encoding & Binary Converters ---
+        // FIX (src/fix.c). A message that needs more data yields nothing; the
+        // response rules ask `fix` directly whether to wait (`SMP_F_MAY_CHANGE`).
+        self.register_converter(ConvDesc {
+            name: "fix_is_valid",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Bool),
+            func: |smp, _args| {
+                // The input is cast to binary first (`in_type`).
+                let Sample::Bin(b) = smp else { return None };
+                match crate::fix::validate_message(&b) {
+                    crate::fix::Validity::Valid => Some(Sample::Bool(true)),
+                    crate::fix::Validity::Invalid => Some(Sample::Bool(false)),
+                    crate::fix::Validity::NeedMoreData => None,
+                }
+            },
+        });
+        self.register_converter(ConvDesc {
+            name: "fix_tag_value",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Bin),
+            func: |smp, args| {
+                let Sample::Bin(b) = smp else { return None };
+                let id = crate::fix::tag_id(args.first()?.trim())?;
+                let crate::fix::TagValue::Found(v) = crate::fix::tag_value(&b, id) else { return None };
+                Some(Sample::Bin(v.to_vec()))
+            },
+        });
         self.register_converter(ConvDesc {
             name: "hex",
             in_type: TypeSpec::Exact(SampleType::Bin),

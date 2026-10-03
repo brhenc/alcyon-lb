@@ -10,8 +10,20 @@ use super::*;
 pub struct AclCondition {
     /// True for `if`, false for `unless`.
     pub is_if: bool,
-    /// ACL terms (e.g. `is_static !is_local` or `{ path_beg /api/ }`).
+    /// ACL terms (e.g. `is_static !is_local` or `{ path_beg /api/ }`), which must all hold. A term
+    /// named [`AclCondition::OR`] separates alternatives: `a b || c` is `(a && b) || c`,
+    /// as `HAProxy` reads it (`build_acl_cond`, src/acl.c).
     pub terms: Vec<AclTerm>,
+}
+
+impl AclCondition {
+    /// The name of the separator term between alternatives (`||` or `or` in the config).
+    pub const OR: &'static str = "||";
+
+    /// The alternatives, each a run of terms that must all hold.
+    pub fn suites(&self) -> impl Iterator<Item = &[AclTerm]> {
+        self.terms.split(|t| t.name == Self::OR)
+    }
 }
 
 /// Single term within an ACL condition expression.

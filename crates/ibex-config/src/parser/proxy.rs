@@ -369,7 +369,7 @@ pub(crate) fn parse_listen_directive(
                     proxy.tcp_res_inspect_delay = Some(parse_timeout(&tokens[2], "tcp-response inspect-delay")?);
                     Ok(())
                 }
-                "content" => parse_tcp_req_content(&mut proxy.tcp_res_content_rules, tokens, kw),
+                "content" => parse_tcp_res_content(&mut proxy.tcp_res_content_rules, tokens, kw),
                 other => Err(ConfigError::new(
                     tokens[1].line,
                     tokens[1].col,
@@ -565,7 +565,7 @@ pub(crate) fn parse_backend_directive(
                     be.tcp_res_inspect_delay = Some(parse_timeout(&tokens[2], "tcp-response inspect-delay")?);
                     Ok(())
                 }
-                "content" => parse_tcp_req_content(&mut be.tcp_res_content_rules, tokens, kw),
+                "content" => parse_tcp_res_content(&mut be.tcp_res_content_rules, tokens, kw),
                 other => Err(ConfigError::new(
                     tokens[1].line,
                     tokens[1].col,

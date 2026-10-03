@@ -77,6 +77,25 @@ pub enum TcpReqContentAction {
     Lua { name: String },
 }
 
+/// What a `tcp-response content` rule can do in Ibex: the parser refuses every other
+/// action (`parse_tcp_res_content`), so the runtime has nothing else to handle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TcpResAction {
+    Accept,
+    Reject,
+    SilentDrop,
+    SetVar { var_name: String, expr: String },
+    SetVarFmt { var_name: String, fmt: String },
+    UnsetVar { var_name: String },
+}
+
+/// Rule pairing a `tcp-response content` action with an optional condition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TcpResContentRule {
+    pub action: TcpResAction,
+    pub cond: Option<AclCondition>,
+}
+
 /// Rule pairing a TCP-request content action with an optional condition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TcpReqContentRule {

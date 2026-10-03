@@ -161,7 +161,7 @@ pub struct Proxy {
     pub tcp_req_session_rules: Vec<ibex_config::TcpReqSessionRule>,
     pub tcp_req_content_rules: Vec<ibex_config::TcpReqContentRule>,
     pub tcp_req_inspect_delay: Option<Duration>,
-    pub tcp_res_content_rules: Vec<ibex_config::TcpReqContentRule>,
+    pub tcp_res_content_rules: Vec<ibex_config::TcpResContentRule>,
     pub tcp_res_inspect_delay: Option<Duration>,
     pub http_req_rules: Vec<ibex_config::HttpReqRule>,
     pub http_res_rules: Vec<ibex_config::HttpResRule>,
@@ -549,8 +549,39 @@ fn socket_file_ident(path: &Path) -> Option<(u64, u64)> {
     std::fs::symlink_metadata(path).ok().map(|m| (m.dev(), m.ino()))
 }
 
+/// `HAProxy`'s predefined ACLs (`default_acl_list`, src/acl.c), by name. `RDP_COOKIE`
+/// (`req.rdp_cookie_cnt`) and `WAIT_END` (`wait_end`) are missing: Ibex has neither fetch.
+const PREDEFINED_ACLS: &[(&str, &str)] = &[
+    ("TRUE", "always_true"),
+    ("FALSE", "always_false"),
+    ("LOCALHOST", "src 127.0.0.1/8 ::1"),
+    ("HTTP", "req.proto_http"),
+    ("HTTP_1.0", "req.ver 1.0"),
+    ("HTTP_1.1", "req.ver 1.1"),
+    ("HTTP_2.0", "req.ver 2.0"),
+    ("HTTP_3.0", "req.ver 3.0"),
+    ("METH_CONNECT", "method CONNECT"),
+    ("METH_DELETE", "method DELETE"),
+    ("METH_GET", "method GET HEAD"),
+    ("METH_HEAD", "method HEAD"),
+    ("METH_OPTIONS", "method OPTIONS"),
+    ("METH_POST", "method POST"),
+    ("METH_PUT", "method PUT"),
+    ("METH_TRACE", "method TRACE"),
+    ("HTTP_URL_ABS", "url -m reg ^[^/:]*://"),
+    ("HTTP_URL_SLASH", "url -m beg /"),
+    ("HTTP_URL_STAR", "url *"),
+    ("HTTP_CONTENT", "req.hdr_val(content-length) gt 0"),
+    ("REQ_CONTENT", "req.len gt 0"),
+];
+
+/// A proxy's ACLs by name: the predefined ones, then its own (`find_acl_by_name` is
+/// searched before `find_acl_default`, so an ACL of the same name replaces one).
 fn compile_acls(acl_rules: &[ibex_config::AclRule]) -> HashMap<String, Expr> {
-    let mut acls = HashMap::new();
+    let mut acls: HashMap<String, Expr> = PREDEFINED_ACLS
+        .iter()
+        .filter_map(|&(name, expr)| Some((name.to_string(), Expr::parse(expr).ok()?)))
+        .collect();
     for rule in acl_rules {
         if let Ok(expr) = Expr::parse(&rule.expr) {
             acls.insert(rule.name.clone(), expr);
@@ -2675,6 +2706,144 @@ fn eval_tcp_req_content_rules(
     }
 }
 
+/// Whether a sample of the response may still change while more of it can arrive
+/// (`SMP_F_MAY_CHANGE`): `smp_fetch_payload` sets it with no length or not enough bytes
+/// yet, `smp_fetch_len` always (src/payload.c). The FIX converters decide it themselves
+/// from the message (`sample_conv_fix_is_valid`, `sample_conv_fix_tag_value`): only a
+/// message that needs more data may change.
+fn res_sample_may_change(expr: &Expr, rep: &[u8]) -> bool {
+    if expr.fetch_name == "res.len" {
+        return true;
+    }
+    if expr.fetch_name != "res.payload" {
+        return false;
+    }
+    let arg = |i: usize| expr.fetch_args.get(i).and_then(|a| a.trim().parse::<usize>().ok()).unwrap_or(0);
+    let (off, len) = (arg(0), arg(1));
+    if off.saturating_add(len) > rep.len() {
+        // `too_short`: the fetch itself fails, and may succeed with more data.
+        return true;
+    }
+    let payload = if len == 0 { &rep[off..] } else { &rep[off..off + len] };
+    match expr.converters.first().map(|(name, args)| (name.as_str(), args)) {
+        Some(("fix_is_valid", _)) => {
+            ibex_sample::fix::validate_message(payload) == ibex_sample::fix::Validity::NeedMoreData
+        }
+        Some(("fix_tag_value", args)) => {
+            let id = args.first().and_then(|a| ibex_sample::fix::tag_id(a.trim()));
+            id.is_some_and(|id| ibex_sample::fix::tag_value(payload, id) == ibex_sample::fix::TagValue::NeedMoreData)
+        }
+        _ => len == 0,
+    }
+}
+
+/// `tcp-response content` rules in TCP mode, as `tcp_inspect_response` (`src/tcp_rules.c`)
+/// runs them over the response received so far. They decide once a rule accepts or
+/// rejects, or all have run; a condition on response data that may still grow and does
+/// not hold yet makes them wait, until the server closes, the buffer fills, or
+/// `tcp-response inspect-delay` runs out, when they decide on what is there.
+fn eval_tcp_res_content_rules(proxy: &Proxy, registry: &Registry, sess: &mut TcpSession, now: Tick) -> ContentEvalResult {
+    let server_closed = matches!(sess.srv_state, ScState::ShutR | ScState::Closed | ScState::Error);
+    let expired = sess.res_inspect_exp.is_none_or(|exp| exp.is_expired(now));
+    let final_ = server_closed || sess.rep.is_full() || expired;
+    let rep_bytes = sess.rep.readable();
+    let ctx = SampleContext {
+        client_addr: sess.client_addr,
+        server_addr: sess.server_addr,
+        fc_src: sess.fc_src,
+        fc_dst: sess.fc_dst,
+        proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
+        res_body: Some(rep_bytes),
+        act_conn: proxy.stats[worker_id()].act_conn.load(Ordering::Relaxed),
+        cum_conn: proxy.stats[worker_id()].cum_conn.load(Ordering::Relaxed),
+        ..Default::default()
+    };
+    ibex_sample::CURRENT_VARS.with(|v| {
+        let mut map = v.borrow_mut();
+        map.clear();
+        map.extend(sess.sess_vars.iter().map(|(k, val)| (k.clone(), val.clone())));
+        map.extend(sess.req_vars.iter().map(|(k, val)| (k.clone(), val.clone())));
+    });
+    for rule in &proxy.tcp_res_content_rules {
+        if let Some(cond) = &rule.cond {
+            // `acl_exec_cond`: a sample that may change and does not match is a miss.
+            let res = crate::proxy::combine_condition(cond, |term| {
+                let parsed = if proxy.acls.contains_key(&term.name) { None } else { Expr::parse(&term.name).ok() };
+                let Some(expr) = proxy.acls.get(&term.name).or(parsed.as_ref()) else { return crate::proxy::AclEvalResult::NotMatched };
+                let matched = expr.eval(registry, &ctx);
+                if !matched && !final_ && res_sample_may_change(expr, rep_bytes) {
+                    crate::proxy::AclEvalResult::MissingData
+                } else if matched != term.negated {
+                    crate::proxy::AclEvalResult::Matched
+                } else {
+                    crate::proxy::AclEvalResult::NotMatched
+                }
+            });
+            match res {
+                crate::proxy::AclEvalResult::MissingData => return ContentEvalResult::Waiting,
+                crate::proxy::AclEvalResult::NotMatched => continue,
+                crate::proxy::AclEvalResult::Matched => {}
+            }
+        }
+        match &rule.action {
+            ibex_config::TcpResAction::Accept => return ContentEvalResult::Done,
+            ibex_config::TcpResAction::Reject => return ContentEvalResult::Reject,
+            ibex_config::TcpResAction::SilentDrop => return ContentEvalResult::SilentDrop,
+            ibex_config::TcpResAction::SetVar { var_name, expr } => {
+                set_var_from_expr(&mut sess.sess_vars, &mut sess.req_vars, var_name, expr, &ctx, registry);
+            }
+            ibex_config::TcpResAction::SetVarFmt { var_name, fmt } => {
+                store_var(&mut sess.sess_vars, &mut sess.req_vars, var_name, format_sample_string(fmt, &ctx, registry));
+            }
+            ibex_config::TcpResAction::UnsetVar { var_name } => unset_var(&mut sess.sess_vars, &mut sess.req_vars, var_name),
+        }
+    }
+    ContentEvalResult::Done
+}
+
+/// `set-var(<name>) <expr>`: `action_store` (src/vars.c) -- a sample that cannot be
+/// fetched sets nothing.
+fn set_var_from_expr(
+    sess_vars: &mut HashMap<String, String>,
+    req_vars: &mut HashMap<String, String>,
+    name: &str,
+    expr: &str,
+    ctx: &SampleContext,
+    registry: &Registry,
+) {
+    if let Some(val) = Expr::parse(expr).ok().and_then(|e| e.eval_sample(registry, ctx)) {
+        store_var(sess_vars, req_vars, name, sample_to_string(&val));
+    }
+}
+
+/// `unset-var(<name>)`, from the scope it lives in.
+fn unset_var(sess_vars: &mut HashMap<String, String>, req_vars: &mut HashMap<String, String>, name: &str) {
+    if name.starts_with("sess.") {
+        sess_vars.remove(name);
+    } else {
+        req_vars.remove(name);
+    }
+    ibex_sample::CURRENT_VARS.with(|v| v.borrow_mut().remove(name));
+}
+
+/// Stores a variable where its scope lives, and where the rules after it read it.
+fn store_var(sess_vars: &mut HashMap<String, String>, req_vars: &mut HashMap<String, String>, name: &str, val: String) {
+    if name.starts_with("proc.") {
+        ibex_sample::set_proc_var(name, val);
+        return;
+    }
+    let map = if name.starts_with("sess.") { sess_vars } else { req_vars };
+    map.insert(name.to_string(), val.clone());
+    ibex_sample::CURRENT_VARS.with(|v| v.borrow_mut().insert(name.to_string(), val));
+}
+
+/// Readies a TCP-mode stream for `proxy`'s `tcp-response content` rules, if it has any
+/// (`AN_RES_INSPECT`, set with the backend); they start when the server connects.
+fn arm_res_inspect(proxy: &Proxy, sess: &mut TcpSession) {
+    sess.res_inspect_armed = (sess.mode == Mode::Tcp && !proxy.tcp_res_content_rules.is_empty())
+        .then(|| proxy.tcp_res_inspect_delay.map(|d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX)));
+}
+
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn register_new_session(
     engine: &mut Engine,
@@ -3003,6 +3172,7 @@ fn init_client_session(
         target_addr = proxy.select_server_with_key(sess.client_addr.map(|a| a.ip()), sess.req_uri.as_deref());
         if let Some(target) = target_addr {
             maybe_prepend_send_proxy(proxy, &mut sess, target);
+            arm_res_inspect(proxy, &mut sess);
 
             if let Ok((srv_fd, immediate)) = raw::connect(connect_addr(target, sess.server_addr)) {
                 let sfd = srv_fd.as_raw_fd();
@@ -3931,6 +4101,45 @@ impl EngineDispatcher<'_> {
                 }
             }
 
+            // Step 3.45: TCP mode, `tcp-response content` rules over the response so far.
+            if entry.sess.res_inspect_pending && !entry.sess.is_done() {
+                let be_idx = entry.backend_idx;
+                let res = eval_tcp_res_content_rules(&self.proxies[be_idx], sample_registry(), &mut entry.sess, now);
+                if res != ContentEvalResult::Waiting {
+                    entry.sess.res_inspect_pending = false;
+                    entry.sess.res_inspect_exp = None;
+                }
+                match res {
+                    ContentEvalResult::Waiting => {}
+                    // Released: forward what was held.
+                    ContentEvalResult::Done => {
+                        let _ = entry.sess.process(now);
+                    }
+                    // `reject` (src/tcp_rules.c): the server connection is killed, the
+                    // client's closed with nothing forwarded.
+                    ContentEvalResult::Reject => {
+                        if let Some(srv_fd) = entry.sess.srv.as_ref() {
+                            raw::abort_with_rst(srv_fd.as_fd());
+                        }
+                        entry.sess.rep.clear();
+                        self.proxies[be_idx].stats[worker_id()].denied_resp.fetch_add(1, Ordering::Relaxed);
+                        entry.sess.cli_state = ScState::Closed;
+                        entry.sess.srv_state = ScState::Closed;
+                    }
+                    ContentEvalResult::SilentDrop => {
+                        let is_ipv6 = entry.sess.client_addr.is_some_and(|a| a.is_ipv6());
+                        raw::silent_drop(entry.sess.cli.as_fd(), is_ipv6);
+                        if let Some(srv_fd) = entry.sess.srv.as_ref() {
+                            raw::abort_with_rst(srv_fd.as_fd());
+                        }
+                        entry.sess.rep.clear();
+                        self.proxies[be_idx].stats[worker_id()].denied_resp.fetch_add(1, Ordering::Relaxed);
+                        entry.sess.cli_state = ScState::Closed;
+                        entry.sess.srv_state = ScState::Closed;
+                    }
+                }
+            }
+
             // Step 3.5: the HTTP transaction -- rules, routing, the response head, and its end.
             let mut pending_admin = None;
             if entry.sess.mode == Mode::Http && !entry.sess.is_done() {
@@ -4160,6 +4369,7 @@ impl EngineDispatcher<'_> {
             be_name: Some(&proxies[be_idx].name),
             be_max_retries: Some(proxies[be_idx].retries),
             cur_max_retries: Some(entry.sess.max_retries),
+            res_version: Some(&proto_version),
             ..Default::default()
         };
 
@@ -4167,59 +4377,40 @@ impl EngineDispatcher<'_> {
         // closed with nothing sent, as HAProxy does -- not answered with a 502.
         let mut rejected = false;
         let failed: Option<u16> = 'rules: {
-            // 0. Apply be.tcp_res_content_rules
+            // 0. Apply be.tcp_res_content_rules. They run before the response is analysed
+            // as HTTP (`AN_RES_INSPECT` ahead of `AN_RES_WAIT_HTTP`), so its status and
+            // headers are not there to fetch until they are done.
+            CURRENT_RES_STATUS.set(0);
+            CURRENT_RES_HEADERS.with(|h| h.borrow_mut().clear());
+            let tcp_ctx = SampleContext { res_version: None, ..ctx.clone() };
             for rule in &proxies[be_idx].tcp_res_content_rules {
                 let matches = match &rule.cond {
                     None => true,
-                    Some(cond) => eval_condition(cond, &ctx, &proxies[be_idx].acls, registry),
+                    Some(cond) => eval_condition(cond, &tcp_ctx, &proxies[be_idx].acls, registry),
                 };
                 if !matches {
                     continue;
                 }
                 match &rule.action {
-                    ibex_config::TcpReqContentAction::Accept => break,
-                    ibex_config::TcpReqContentAction::Reject | ibex_config::TcpReqContentAction::SilentDrop => {
+                    ibex_config::TcpResAction::Accept => break,
+                    ibex_config::TcpResAction::Reject | ibex_config::TcpResAction::SilentDrop => {
                         rejected = true;
                         break 'rules None;
                     }
-                    ibex_config::TcpReqContentAction::SetVar { var_name, expr } => {
-                        let val = if let Ok(e) = Expr::parse(expr) {
-                            e.eval_sample(registry, &ctx)
-                                .map(|smp| sample_to_string(&smp))
-                                .unwrap_or_default()
-                        } else {
-                            format_sample_string(expr, &ctx, registry)
-                        };
-                        if var_name.starts_with("sess.") {
-                            entry.sess.sess_vars.insert(var_name.to_string(), val.clone());
-                        } else {
-                            entry.sess.req_vars.insert(var_name.to_string(), val.clone());
-                        }
-                        CURRENT_VARS.with(|v| {
-                            v.borrow_mut().insert(var_name.to_string(), val);
-                        });
+                    ibex_config::TcpResAction::SetVar { var_name, expr } => {
+                        set_var_from_expr(&mut entry.sess.sess_vars, &mut entry.sess.req_vars, var_name, expr, &tcp_ctx, registry);
                     }
-                    ibex_config::TcpReqContentAction::SetVarFmt { var_name, fmt } => {
-                        let val = format_sample_string(fmt, &ctx, registry);
-                        if var_name.starts_with("sess.") {
-                            entry.sess.sess_vars.insert(var_name.to_string(), val.clone());
-                        } else {
-                            entry.sess.req_vars.insert(var_name.to_string(), val.clone());
-                        }
-                        CURRENT_VARS.with(|v| {
-                            v.borrow_mut().insert(var_name.to_string(), val);
-                        });
+                    ibex_config::TcpResAction::SetVarFmt { var_name, fmt } => {
+                        let val = format_sample_string(fmt, &tcp_ctx, registry);
+                        store_var(&mut entry.sess.sess_vars, &mut entry.sess.req_vars, var_name, val);
                     }
-                    ibex_config::TcpReqContentAction::UnsetVar { var_name } => {
-                        entry.sess.sess_vars.remove(var_name);
-                        entry.sess.req_vars.remove(var_name);
-                        CURRENT_VARS.with(|v| {
-                            v.borrow_mut().remove(var_name);
-                        });
+                    ibex_config::TcpResAction::UnsetVar { var_name } => {
+                        unset_var(&mut entry.sess.sess_vars, &mut entry.sess.req_vars, var_name);
                     }
-                    _ => {}
                 }
             }
+            CURRENT_RES_STATUS.set(status);
+            CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = hdrs.clone());
 
             let mut eval_res_action = |act_name: &str, act_fmt: &str, hdrs: &mut Vec<(String, String)>, status: &mut u16, status_msg: &mut String| -> Result<bool, u16> {
                 if act_name == "\0allow" {
@@ -5795,6 +5986,7 @@ impl EngineDispatcher<'_> {
         if be_idx != entry.proxy_idx {
             entry.sess.set_retries(proxies[be_idx].retries);
         }
+        arm_res_inspect(&proxies[be_idx], &mut entry.sess);
 
         if !proxies[be_idx].tcp_req_content_rules.is_empty() {
             let res = eval_tcp_req_content_rules(
@@ -6642,8 +6834,7 @@ fn eval_condition(
     acls: &HashMap<String, Expr>,
     registry: &Registry,
 ) -> bool {
-    let mut term_match = true;
-    for term in &cond.terms {
+    crate::proxy::combine_condition(cond, |term| {
         let term_res = if term.name == "always_true" {
             true
         } else if term.name == "always_false" {
@@ -6685,17 +6876,12 @@ fn eval_condition(
         } else {
             false
         };
-        let final_res = if term.negated { !term_res } else { term_res };
-        if !final_res {
-            term_match = false;
-            break;
+        if term.negated ^ term_res {
+            crate::proxy::AclEvalResult::Matched
+        } else {
+            crate::proxy::AclEvalResult::NotMatched
         }
-    }
-    if cond.is_if {
-        term_match
-    } else {
-        !term_match
-    }
+    }) == crate::proxy::AclEvalResult::Matched
 }
 
 const fn status_reason(status: u16) -> &'static str {
