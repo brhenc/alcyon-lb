@@ -320,7 +320,7 @@ fn hpo_is_empty_for_a_target_with_no_path() {
 /// it only for a proxy that logs, so these loaded.
 #[test]
 fn a_bad_log_format_is_refused_without_a_log_address_too() {
-    for sec in ["frontend f\n  bind 127.0.0.1:38917", "listen l\n  bind 127.0.0.1:38918"] {
+    for sec in ["frontend f\n  bind 127.0.0.1:0", "listen l\n  bind 127.0.0.1:0"] {
         for bad in ["abc%", "%zz", "%[nosuch]"] {
             let cfg = ibex_config::parse_str(&format!("{sec}\n  mode http\n  log-format \"{bad}\"\n")).expect("parses");
             let err = ibex_rt::Engine::new(&cfg, 4).err().map(|e| e.to_string()).unwrap_or_default();
