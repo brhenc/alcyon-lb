@@ -18,7 +18,21 @@ fn arb_http_method() -> impl Strategy<Value = HttpMethod> {
         Just(HttpMethod::Trace),
         Just(HttpMethod::Connect),
         Just(HttpMethod::Patch),
-        "[A-Z]{3,8}".prop_map(HttpMethod::Other),
+        // `Other` is a method the parser does not know: `Other("PUT")` cannot come from a
+        // request (it parses as `Put`), and a round trip rightly gives `Put` back.
+        "[A-Z]{3,8}"
+            .prop_filter("a known method is not `Other`", |m| {
+                !matches!(HttpMethod::from_bytes(m.as_bytes()), HttpMethod::Get
+                    | HttpMethod::Head
+                    | HttpMethod::Post
+                    | HttpMethod::Put
+                    | HttpMethod::Delete
+                    | HttpMethod::Connect
+                    | HttpMethod::Options
+                    | HttpMethod::Trace
+                    | HttpMethod::Patch)
+            })
+            .prop_map(HttpMethod::Other),
     ]
 }
 
