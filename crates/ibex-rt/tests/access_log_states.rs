@@ -96,6 +96,11 @@ fn scenario(client: impl FnOnce(SocketAddr) + Send + 'static) -> (Option<String>
 
 /// [`scenario`], with `be_extra` added to the backend.
 fn scenario_be(be_extra: &str, client: impl FnOnce(SocketAddr) + Send + 'static) -> (Option<String>, mpsc::Receiver<String>) {
+    scenario_with(FORMAT, be_extra, client)
+}
+
+/// [`scenario_be`], with the frontend's `log-format` `format`.
+fn scenario_with(format: &str, be_extra: &str, client: impl FnOnce(SocketAddr) + Send + 'static) -> (Option<String>, mpsc::Receiver<String>) {
     let (srv, heads) = server();
     let collector = UdpSocket::bind("127.0.0.1:0").expect("collector");
     collector.set_nonblocking(true).expect("nonblocking");
@@ -106,7 +111,7 @@ fn scenario_be(be_extra: &str, client: impl FnOnce(SocketAddr) + Send + 'static)
          capture request header host len 5\n  http-request capture req.hdr(x-a) len 3\n  \
          capture request header x-b len 10\n  capture response header x-r len 4\n  \
          unique-id-format U-%[req.hdr(x-a)]\n  unique-id-header X-Uid\n  \
-         log-format \"{FORMAT}\"\n  default_backend be\n\
+         log-format \"{format}\"\n  default_backend be\n\
          backend be\n{be_extra}  server s {srv}\n",
         collector.local_addr().expect("addr")
     );
@@ -344,4 +349,19 @@ fn a_capture_cut_inside_a_character_keeps_the_byte_it_cut_at() {
     let (line, _) = scenario(|fe| send(fe, "GET /ok HTTP/1.1\r\nHost: x\r\nX-A: a\u{e9}\r\nConnection: close\r\n\r\n".as_bytes()));
     let line = line.expect("a log line");
     assert!(line.contains("|a#C3#A9|"), "a cut after the whole character keeps both its bytes: {line}");
+}
+
+/// `%[method]` at log time: the request buffer is gone and `HAProxy` reads `txn->meth`,
+/// which names only its enum, so a method outside it logs `-` (`PATCH`, `FOO`) while
+/// `%HM`, from the request line, still has it. Measured 2026-10-03 (3.5-dev8-885761-29):
+/// `GET` `OPTIONS` `HEAD` `POST` `PUT` `DELETE` `TRACE` log themselves; `PATCH`, `FOO` and
+/// `LINK` log `-`.
+#[test]
+fn method_at_log_time_is_dash_outside_haproxy_s_enum() {
+    for (m, want) in [("GET", "GET"), ("OPTIONS", "OPTIONS"), ("DELETE", "DELETE"), ("TRACE", "TRACE"), ("PATCH", "-"), ("FOO", "-")] {
+        let req = format!("{m} /ok HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        let (line, _) = scenario_with("m=%[method] hm=%HM", "", move |fe| send(fe, req.as_bytes()));
+        let line = line.expect("a log line");
+        assert!(line.contains(&format!("m={want} hm={m}")), "`%[method]` for {m} should log `{want}`: {line}");
+    }
 }

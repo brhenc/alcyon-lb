@@ -873,7 +873,7 @@ fn stream_log_line(entry: &SessionEntry, proxies: &[Proxy], pid: u32) -> Option<
         return None;
     }
     let be = proxies.get(entry.backend_idx).unwrap_or(fe);
-    let line = fmt.render(&stream_log_data(entry, proxies, entry.proxy_idx, pid), sample_registry(), &stream_sample_ctx(&entry.sess, fe, be, &ProxiesView(proxies)));
+    let line = fmt.render(&stream_log_data(entry, proxies, entry.proxy_idx, pid), sample_registry(), &SampleContext { at_log: true, ..stream_sample_ctx(&entry.sess, fe, be, &ProxiesView(proxies)) });
     fe.log_count.fetch_add(1, Ordering::Relaxed);
     Some(line)
 }

@@ -84,6 +84,9 @@ fn len_to_sint(len: usize) -> i64 {
 /// Runtime context passed into sample fetch functions during evaluation.
 #[derive(Debug, Clone, Default)]
 pub struct SampleContext<'a> {
+    /// Evaluated for the access log, after the request buffer is gone: `method` reads
+    /// only the transaction's method enum then, so a method outside it has no value.
+    pub at_log: bool,
     pub client_addr: Option<SocketAddr>,
     pub server_addr: Option<SocketAddr>,
     pub fc_src: Option<SocketAddr>,
@@ -695,9 +698,16 @@ impl Registry {
             out_type: SampleType::Meth,
             func: |ctx, _args| {
                 if let Some(m_str) = get_context_method(ctx) {
-                    return Some(Sample::Meth(ibex_proto::htx::HttpMethod::from_bytes(
-                        m_str.as_bytes(),
-                    )));
+                    let m = ibex_proto::htx::HttpMethod::from_bytes(m_str.as_bytes());
+                    // `smp_fetch_meth` (src/http_fetch.c): `HTTP_METH_OTHER` is read from the
+                    // request buffer, which is gone when the log line is built. HAProxy
+                    // 3.5-dev8 logs `-` for `PATCH` and any other method outside its enum.
+                    if ctx.at_log
+                        && matches!(m, ibex_proto::htx::HttpMethod::Patch | ibex_proto::htx::HttpMethod::Other(_))
+                    {
+                        return None;
+                    }
+                    return Some(Sample::Meth(m));
                 }
                 ctx.htx?
                     .req_line()
