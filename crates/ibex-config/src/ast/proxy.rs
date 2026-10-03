@@ -119,8 +119,11 @@ pub struct BindConfig {
 pub struct ListenSection {
     /// Proxy name / identifier.
     pub name: String,
-    /// Listening socket address (IPv4).
+    /// Address of the first `bind` line (what the proxy reports as its address).
     pub addr: SocketAddr,
+    /// Every `bind` line, with its TLS settings. Empty only for a section built in code
+    /// that sets `addr` alone: that is one plaintext bind on `addr`.
+    pub binds: Vec<BindConfig>,
     /// Operating mode (tcp, http, health).
     pub mode: Mode,
     /// Whether this proxy is disabled.
@@ -259,6 +262,7 @@ impl Default for ListenSection {
         Self {
             name: String::new(),
             addr: SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0),
+            binds: Vec::new(),
             mode: Mode::Tcp,
             disabled: false,
             cookie: None,

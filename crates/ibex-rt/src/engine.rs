@@ -996,7 +996,13 @@ pub fn validate_tls(config: &Config) -> io::Result<()> {
             continue;
         }
         for bind in fe.binds.iter().filter(|b| b.ssl) {
-            bind_tls(fe, bind.addr)?;
+            bind_tls(&fe.name, &fe.binds, bind.addr)?;
+        }
+    }
+    // A `disabled` listen is checked too: `HAProxy` loads its certificates at parse time.
+    for l in &config.listens {
+        for bind in l.binds.iter().filter(|b| b.ssl) {
+            bind_tls(&l.name, &l.binds, bind.addr)?;
         }
     }
     Ok(())
@@ -1016,10 +1022,11 @@ pub fn validate_tls(config: &Config) -> io::Result<()> {
 ///
 /// `ssl` with no `crt` is the same class of mistake and is refused for the same reason.
 fn bind_tls(
-    fe: &ibex_config::FrontendSection,
+    section: &str,
+    binds: &[ibex_config::ast::BindConfig],
     addr: SocketAddr,
 ) -> io::Result<Option<Arc<rustls::ServerConfig>>> {
-    let Some(bind) = fe.binds.iter().find(|b| b.addr == addr && b.ssl) else {
+    let Some(bind) = binds.iter().find(|b| b.addr == addr && b.ssl) else {
         return Ok(None);
     };
 
@@ -1035,16 +1042,15 @@ fn bind_tls(
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "frontend '{}': bind {addr} has 'ssl' but no 'crt'; refusing to start \
-                 rather than serve cleartext on a port configured for TLS",
-                fe.name
+                "'{section}': bind {addr} has 'ssl' but no 'crt'; refusing to start \
+                 rather than serve cleartext on a port configured for TLS"
             ),
         ));
     }
     let cfg = ibex_tls::TlsConfig::from_bind_config(bind).map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("frontend '{}': bind {addr} ssl: {e}", fe.name),
+            format!("'{section}': bind {addr} ssl: {e}"),
         )
     })?;
     Ok(Some(cfg))
@@ -1499,13 +1505,32 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         let mut proxy_idx = 0;
         for listen in &config.listens {
             if listen.disabled { continue; }
-            for mut listener in listeners_for(worker_id, listen.addr, usize_to_u32(proxy_idx))? {
-                listener.maxconn = listen.maxconn;
-                let l_idx = listeners.len();
-                let lfd = listener.raw_fd();
-                fdtab.insert(lfd, FdState::Listener { listener: usize_to_u32(l_idx) }, Interest::READ);
-                poller.add(listener.borrowed_fd(), raw_fd_to_u64(lfd), true, false)?;
-                listeners.push(listener);
+            // A section built in code with `addr` alone is one plaintext bind on it.
+            let binds = if listen.binds.is_empty() {
+                vec![ibex_config::ast::BindConfig {
+                    addr: listen.addr,
+                    quic: false,
+                    ssl: false,
+                    crt: vec![],
+                    alpn: vec![],
+                    proto: None,
+                    accept_proxy: listen.accept_proxy,
+                    accept_proxy_v2: listen.accept_proxy_v2,
+                }]
+            } else {
+                listen.binds.clone()
+            };
+            for b in &binds {
+                let tls = bind_tls(&listen.name, &binds, b.addr)?;
+                for mut listener in listeners_for(worker_id, b.addr, usize_to_u32(proxy_idx))? {
+                    listener.maxconn = listen.maxconn;
+                    listener.tls.clone_from(&tls);
+                    let l_idx = listeners.len();
+                    let lfd = listener.raw_fd();
+                    fdtab.insert(lfd, FdState::Listener { listener: usize_to_u32(l_idx) }, Interest::READ);
+                    poller.add(listener.borrowed_fd(), raw_fd_to_u64(lfd), true, false)?;
+                    listeners.push(listener);
+                }
             }
             proxy_idx += 1;
         }
@@ -1533,7 +1558,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             for b in &all_binds {
                 let bind_addr = b.addr;
                 if b.quic {
-                    let tls = bind_tls(frontend, bind_addr)?.expect("QUIC requires TLS");
+                    let tls = bind_tls(&frontend.name, &frontend.binds, bind_addr)?.expect("QUIC requires TLS");
                     
                     let mut be_addr = None;
                     if let Some(be_name) = &frontend.default_backend {
@@ -1557,7 +1582,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     poller.add(ql.borrowed_fd(), raw_fd_to_u64(lfd), true, false)?;
                     quic_listeners.push(ql);
                 } else {
-                    let tls = bind_tls(frontend, bind_addr)?;
+                    let tls = bind_tls(&frontend.name, &frontend.binds, bind_addr)?;
                     for mut listener in listeners_for(worker_id, bind_addr, usize_to_u32(proxy_idx))? {
                         listener.maxconn = frontend.maxconn;
                         listener.tls.clone_from(&tls);

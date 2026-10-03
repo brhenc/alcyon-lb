@@ -66,6 +66,7 @@ pub(crate) fn parse_listen_header(
         tcp_check: defaults.is_some_and(|d| d.tcp_check),
         name: id,
         addr,
+        binds: Vec::new(),
         mode,
         disabled: false,
         cookie: defaults.and_then(|d| d.cookie.clone()),
@@ -652,11 +653,14 @@ pub(crate) fn parse_backend_directive(
     }
 }
 
-pub(crate) fn parse_listen_bind(
-    proxy: &mut ListenSection,
-    tokens: &[Token],
-    kw: &Token,
-) -> Result<(), ConfigError> {
+/// Parses one `bind` line of a `listen` or a `frontend` (`section` names which, for the
+/// messages): the address, then the keywords. Both sections share this, so a keyword is
+/// honoured or refused the same way in either (T110).
+///
+/// A keyword Ibex handles is read here; every other one goes to
+/// `bind_keywords::unimplemented_bind_keyword`, which refuses it or skips it and its
+/// argument with a warning, and refuses an unknown one as `HAProxy` does.
+fn parse_bind(tokens: &[Token], kw: &Token, section: &str) -> Result<BindConfig, ConfigError> {
     if tokens.len() < 2 || tokens[1].text.is_empty() {
         return Err(ConfigError::new(
             kw.line,
@@ -664,23 +668,76 @@ pub(crate) fn parse_listen_bind(
             "<bind> expects <addr:port> as argument.",
         ));
     }
-    let (addr, is_quic) = parse_socket_addr(&tokens[1], None)?;
-    if is_quic {
+    let (addr, quic) = parse_socket_addr(&tokens[1], None)?;
+    let mut bind = BindConfig {
+        addr,
+        quic,
+        ssl: false,
+        crt: Vec::new(),
+        alpn: Vec::new(),
+        proto: None,
+        accept_proxy: false,
+        accept_proxy_v2: false,
+    };
+    let prefix = format!("'bind {}' in section '{section}'", tokens[1].text);
+    let arg = |i: usize, what: &str| -> Result<&Token, ConfigError> {
+        tokens.get(i + 1).filter(|t| !t.text.is_empty()).ok_or_else(|| {
+            ConfigError::new(tokens[i].line, tokens[i].col, format!("{prefix} : '{}' : {what}", tokens[i].text))
+        })
+    };
+
+    let mut i = 2;
+    while i < tokens.len() {
+        match tokens[i].text.as_str() {
+            "ssl" => bind.ssl = true,
+            "crt" => {
+                bind.crt.push(arg(i, "missing certificate location")?.text.clone());
+                i += 1;
+            }
+            "alpn" => {
+                bind.alpn = arg(i, "missing ALPN protocol list")?
+                    .text
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                i += 1;
+            }
+            "proto" => {
+                bind.proto = Some(arg(i, "missing protocol name")?.text.clone());
+                i += 1;
+            }
+            "accept-proxy" => bind.accept_proxy = true,
+            "accept-proxy-v2" => {
+                bind.accept_proxy = true;
+                bind.accept_proxy_v2 = true;
+            }
+            _ => i = super::bind_keywords::unimplemented_bind_keyword(tokens, i, section)?,
+        }
+        i += 1;
+    }
+    Ok(bind)
+}
+
+pub(crate) fn parse_listen_bind(
+    proxy: &mut ListenSection,
+    tokens: &[Token],
+    kw: &Token,
+) -> Result<(), ConfigError> {
+    let bind = parse_bind(tokens, kw, "listen")?;
+    if bind.quic {
         return Err(ConfigError::new(
             kw.line,
             kw.col,
             "QUIC is not supported in listen sections".to_string(),
         ));
     }
-    proxy.addr = addr;
-    for tok in &tokens[2..] {
-        if tok.text == "accept-proxy" {
-            proxy.accept_proxy = true;
-        } else if tok.text == "accept-proxy-v2" {
-            proxy.accept_proxy = true;
-            proxy.accept_proxy_v2 = true;
-        }
+    if proxy.binds.is_empty() {
+        proxy.addr = bind.addr;
     }
+    proxy.accept_proxy |= bind.accept_proxy;
+    proxy.accept_proxy_v2 |= bind.accept_proxy_v2;
+    proxy.binds.push(bind);
     Ok(())
 }
 
@@ -689,79 +746,20 @@ pub(crate) fn parse_frontend_bind(
     tokens: &[Token],
     kw: &Token,
 ) -> Result<(), ConfigError> {
-    if tokens.len() < 2 || tokens[1].text.is_empty() {
-        return Err(ConfigError::new(
-            kw.line,
-            kw.col,
-            "<bind> expects <addr:port> as argument.",
-        ));
-    }
-    let (addr, is_quic) = parse_socket_addr(&tokens[1], None)?;
-    let mut ssl = false;
-    let mut crt = Vec::new();
-    let mut alpn = Vec::new();
-    let mut proto = None;
-    let mut accept_proxy = false;
-    let mut accept_proxy_v2 = false;
-
-    let mut i = 2;
-    while i < tokens.len() {
-        match tokens[i].text.as_str() {
-            "ssl" => ssl = true,
-            "crt" if i + 1 < tokens.len() => {
-                i += 1;
-                crt.push(tokens[i].text.clone());
-            }
-            "alpn" if i + 1 < tokens.len() => {
-                i += 1;
-                let protos: Vec<String> = tokens[i]
-                    .text
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                alpn = protos;
-            }
-            "proto" if i + 1 < tokens.len() => {
-                i += 1;
-                proto = Some(tokens[i].text.clone());
-            }
-            "accept-proxy" => accept_proxy = true,
-            "accept-proxy-v2" => {
-                accept_proxy = true;
-                accept_proxy_v2 = true;
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-
+    let mut bind = parse_bind(tokens, kw, "frontend")?;
     if fe.bind.is_none() {
-        fe.bind = Some(addr);
+        fe.bind = Some(bind.addr);
     }
-    if accept_proxy {
-        fe.accept_proxy = true;
-    }
-    if accept_proxy_v2 {
-        fe.accept_proxy_v2 = true;
-    }
+    fe.accept_proxy |= bind.accept_proxy;
+    fe.accept_proxy_v2 |= bind.accept_proxy_v2;
 
-    if is_quic && !ssl {
+    if bind.quic && !bind.ssl {
         return Err(ConfigError::new(kw.line, kw.col, "QUIC protocol detected, enabling ssl. Use 'ssl' to shut this warning. Proxy no SSL certificate specified for bind (use 'crt')".to_string()));
     }
-    if is_quic && alpn.is_empty() {
-        alpn.push("h3".to_string());
+    if bind.quic && bind.alpn.is_empty() {
+        bind.alpn.push("h3".to_string());
     }
-    fe.binds.push(BindConfig {
-        addr,
-        quic: is_quic,
-        ssl,
-        crt,
-        alpn,
-        proto,
-        accept_proxy,
-        accept_proxy_v2,
-    });
+    fe.binds.push(bind);
     Ok(())
 }
 

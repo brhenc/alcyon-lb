@@ -101,6 +101,7 @@ pub(crate) mod checks;
 pub(crate) use checks::*;
 pub(crate) mod server;
 pub(crate) use server::*;
+pub(crate) mod bind_keywords;
 pub(crate) mod server_keywords;
 pub(crate) use server_keywords::*;
 pub(crate) mod rules_tcp;
