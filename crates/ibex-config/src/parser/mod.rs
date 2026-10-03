@@ -95,10 +95,14 @@ pub(crate) mod defaults;
 pub(crate) use defaults::*;
 pub(crate) mod proxy;
 pub(crate) use proxy::*;
+pub(crate) mod proxy_options;
+pub(crate) use proxy_options::*;
 pub(crate) mod checks;
 pub(crate) use checks::*;
 pub(crate) mod server;
 pub(crate) use server::*;
+pub(crate) mod server_keywords;
+pub(crate) use server_keywords::*;
 pub(crate) mod rules_tcp;
 pub(crate) use rules_tcp::*;
 pub(crate) mod rules_http;
@@ -438,8 +442,47 @@ pub(crate) fn parse_resolvers_directive(tokens: &[Token], kw: &Token) -> Result<
 /// Making the `global` section strictly reject unknown keywords took the reg-test board from
 /// 7 passing to 1 in one commit, because `thread-groups` appears in nearly every `HAProxy`
 /// reg-test. Refuse what is dangerous to ignore; keep ignoring what is merely unimplemented.
+///
+/// `external-check` was ignored the same way until T94.
 const CHECK_OPTIONS_THAT_MUST_NOT_BE_IGNORED: &[&str] = &[
     "spop-check",
+    "external-check",
+];
+
+/// Options, other than checks, whose silent absence changes what reaches the server or the
+/// client, or which server is used. The same policy as the list above: by name, with the
+/// reason; an option `HAProxy` knows and that is not here is accepted with a warning
+/// (`parser/proxy_options.rs`). An option `HAProxy` does not know is refused, as `HAProxy`
+/// refuses it.
+///
+/// None of these appears in a reg-test that passed before T94.
+const OPTIONS_THAT_MUST_NOT_BE_IGNORED: &[(&str, &str)] = &[
+    (
+        "forwarded",
+        "Ibex does not add the RFC 7239 'Forwarded' header, and the server would trust whatever \
+         'Forwarded' header the client sent",
+    ),
+    (
+        "http-buffer-request",
+        "Ibex does not wait for the request body before evaluating rules, so a rule on the body \
+         would see none of it",
+    ),
+    ("http-drop-request-trailers", "Ibex does not drop request trailers; the server would receive them"),
+    ("http-drop-response-trailers", "Ibex does not drop response trailers; the client would receive them"),
+    (
+        "checkcache",
+        "Ibex does not block cacheable responses that set a cookie; a shared cache could serve one \
+         client's cookie to another",
+    ),
+    ("disable-h2-upgrade", "Ibex would still accept HTTP/2 on this HTTP/1 listener"),
+    (
+        "allbackups",
+        "Ibex sends traffic to the first available backup server only, not to all of them",
+    ),
+    (
+        "persist",
+        "Ibex does not send a request with a persistence cookie to a server that is down",
+    ),
 ];
 
 

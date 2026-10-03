@@ -22,6 +22,7 @@ pub(crate) fn parse_server(
     if is_quic {
         return Err(ConfigError::new(kw.line, kw.col, "QUIC not supported for backend servers".to_string()));
     }
+    let who = Some(tokens[1].text.as_str());
     let mut check = default_server.is_some_and(|d| d.check);
     let mut inter = default_server.and_then(|d| d.inter);
     let mut fall = default_server.and_then(|d| d.fall);
@@ -31,35 +32,34 @@ pub(crate) fn parse_server(
     let mut maxconn = default_server.and_then(|d| d.maxconn);
     let mut check_port = default_server.and_then(|d| d.check_port);
     let mut check_proto = default_server.and_then(|d| d.check_proto.clone());
-    let mut check_ssl = default_server.is_some_and(|d| d.check_ssl);
+    let mut weight = default_server.and_then(|d| d.weight);
+    let mut backup = default_server.is_some_and(|d| d.backup);
+    let mut cookie = default_server.and_then(|d| d.cookie.clone());
     let mut proxy_v2_unique_id = default_server.is_some_and(|d| d.proxy_v2_unique_id);
-    let mut weight = None;
-    let mut backup = false;
 
+    // Every keyword HAProxy knows is either implemented here or listed, with what Ibex
+    // does about it, in `server_keywords.rs`. A keyword's argument is consumed with it.
     let mut i = 3;
     while i < tokens.len() {
         match tokens[i].text.as_str() {
             "check" => check = true,
+            "no-check" => check = false,
             "inter" => {
+                inter = Some(parse_timeout(server_kw_arg(tokens, i, who, "expects a delay as argument.")?, "inter")?);
                 i += 1;
-                if i < tokens.len() {
-                    inter = Some(parse_timeout(&tokens[i], "inter")?);
-                }
             }
             "fall" => {
+                fall = Some(parse_u32(server_kw_arg(tokens, i, who, "expects an integer argument.")?, "fall")?);
                 i += 1;
-                if i < tokens.len() {
-                    fall = Some(parse_u32(&tokens[i], "fall")?);
-                }
             }
             "rise" => {
+                rise = Some(parse_u32(server_kw_arg(tokens, i, who, "expects an integer argument.")?, "rise")?);
                 i += 1;
-                if i < tokens.len() {
-                    rise = Some(parse_u32(&tokens[i], "rise")?);
-                }
             }
             "send-proxy" => send_proxy = true,
+            "no-send-proxy" => send_proxy = false,
             "send-proxy-v2" => send_proxy_v2 = true,
+            "no-send-proxy-v2" => send_proxy_v2 = false,
             "weight" => {
                 i += 1;
                 if i < tokens.len() {
@@ -72,25 +72,33 @@ pub(crate) fn parse_server(
                     maxconn = Some(parse_u32(&tokens[i], "maxconn")?);
                 }
             }
-            "check-port" | "port" => {
+            "port" => {
+                check_port = Some(parse_u16(server_kw_arg(tokens, i, who, "expects a port number as argument.")?, "port")?);
                 i += 1;
-                if i < tokens.len() {
-                    check_port = Some(parse_u16(&tokens[i], "check-port")?);
-                }
             }
             "check-proto" => {
+                check_proto = Some(parse_server_proto(tokens, i, who)?);
                 i += 1;
-                if i < tokens.len() {
-                    check_proto = Some(tokens[i].text.clone());
-                }
             }
-            "check-ssl" => check_ssl = true,
+            "proto" => {
+                parse_server_proto(tokens, i, who)?;
+                i += 1;
+            }
+            "cookie" => {
+                cookie = Some(server_kw_arg(tokens, i, who, "expects <value> as argument.")?.text.clone());
+                i += 1;
+            }
             "proxy-v2-options" => {
                 i += 1;
                 proxy_v2_unique_id |= parse_proxy_v2_options(tokens.get(i), kw)?;
             }
             "backup" => backup = true,
-            _ => {}
+            "no-backup" => backup = false,
+            // What these turn on, Ibex never does: they leave the server as Ibex runs it.
+            "enabled" | "stick" | "no-agent-check" | "no-check-send-proxy" | "no-check-reuse-pool" | "no-ssl"
+            | "no-check-ssl" | "no-send-proxy-v2-ssl" | "no-send-proxy-v2-ssl-cn" | "no-sni-auto"
+            | "no-check-sni-auto" => {}
+            _ => i = unimplemented_server_keyword(tokens, i, who)?,
         }
         i += 1;
     }
@@ -98,7 +106,7 @@ pub(crate) fn parse_server(
     servers.push(Server {
         check_port,
         check_proto,
-        check_ssl,
+        check_ssl: false,
         proxy_v2_unique_id,
         id: tokens[1].text.clone(),
         addr,
@@ -111,8 +119,41 @@ pub(crate) fn parse_server(
         weight,
         maxconn,
         backup,
+        cookie,
     });
     Ok(())
+}
+
+/// `proto <mux>` and `check-proto <mux>`: the protocol spoken to the server. Ibex speaks
+/// HTTP/1.1. `h2` is accepted with a warning: a server that expects h2 refuses HTTP/1.1
+/// rather than misreading it, and two reg-tests that pass rely on it. `HAProxy` refuses a
+/// protocol it has no mux for ("'proto' :  unknown MUX protocol 'h3'.").
+fn parse_server_proto(tokens: &[Token], i: usize, server: Option<&str>) -> Result<String, ConfigError> {
+    let kw = &tokens[i];
+    let value = &server_kw_arg(tokens, i, server, ": missing value.")?.text;
+    let prefix = server_prefix(server);
+    match value.as_str() {
+        "h1" => {}
+        "h2" => eprintln!(
+            "[ibex] warning: {prefix}'{} h2' is not implemented and is ignored; Ibex speaks HTTP/1.1 to this server.",
+            kw.text
+        ),
+        "fcgi" | "spop" | "quic" | "qmux" | "none" => {
+            return Err(ConfigError::new(
+                kw.line,
+                kw.col,
+                format!("{prefix}'{}' : '{value}' is not supported: Ibex speaks only HTTP/1.1 to servers.", kw.text),
+            ));
+        }
+        other => {
+            return Err(ConfigError::new(
+                kw.line,
+                kw.col,
+                format!("{prefix}'{}' :  unknown MUX protocol '{other}'.", kw.text),
+            ));
+        }
+    }
+    Ok(value.clone())
 }
 
 pub(crate) fn parse_default_server(
@@ -125,50 +166,61 @@ pub(crate) fn parse_default_server(
     while i < tokens.len() {
         match tokens[i].text.as_str() {
             "check" => cfg.check = true,
+            "no-check" => cfg.check = false,
             "inter" => {
+                cfg.inter = Some(parse_timeout(server_kw_arg(tokens, i, None, "expects a delay as argument.")?, "inter")?);
                 i += 1;
-                if i < tokens.len() {
-                    cfg.inter = Some(parse_timeout(&tokens[i], "inter")?);
-                }
             }
             "fall" => {
+                cfg.fall = Some(parse_u32(server_kw_arg(tokens, i, None, "expects an integer argument.")?, "fall")?);
                 i += 1;
-                if i < tokens.len() {
-                    cfg.fall = Some(parse_u32(&tokens[i], "fall")?);
-                }
             }
             "rise" => {
+                cfg.rise = Some(parse_u32(server_kw_arg(tokens, i, None, "expects an integer argument.")?, "rise")?);
                 i += 1;
-                if i < tokens.len() {
-                    cfg.rise = Some(parse_u32(&tokens[i], "rise")?);
-                }
             }
             "send-proxy" => cfg.send_proxy = true,
+            "no-send-proxy" => cfg.send_proxy = false,
             "send-proxy-v2" => cfg.send_proxy_v2 = true,
+            "no-send-proxy-v2" => cfg.send_proxy_v2 = false,
+            "weight" => {
+                i += 1;
+                if i < tokens.len() {
+                    cfg.weight = Some(parse_u32(&tokens[i], "weight")?);
+                }
+            }
             "maxconn" => {
                 i += 1;
                 if i < tokens.len() {
                     cfg.maxconn = Some(parse_u32(&tokens[i], "maxconn")?);
                 }
             }
-            "check-port" | "port" => {
+            "port" => {
+                cfg.check_port = Some(parse_u16(server_kw_arg(tokens, i, None, "expects a port number as argument.")?, "port")?);
                 i += 1;
-                if i < tokens.len() {
-                    cfg.check_port = Some(parse_u16(&tokens[i], "check-port")?);
-                }
             }
             "check-proto" => {
+                cfg.check_proto = Some(parse_server_proto(tokens, i, None)?);
                 i += 1;
-                if i < tokens.len() {
-                    cfg.check_proto = Some(tokens[i].text.clone());
-                }
             }
-            "check-ssl" => cfg.check_ssl = true,
+            "proto" => {
+                parse_server_proto(tokens, i, None)?;
+                i += 1;
+            }
+            "cookie" => {
+                cfg.cookie = Some(server_kw_arg(tokens, i, None, "expects <value> as argument.")?.text.clone());
+                i += 1;
+            }
             "proxy-v2-options" => {
                 i += 1;
                 cfg.proxy_v2_unique_id |= parse_proxy_v2_options(tokens.get(i), kw)?;
             }
-            _ => {}
+            "backup" => cfg.backup = true,
+            "no-backup" => cfg.backup = false,
+            "enabled" | "stick" | "no-agent-check" | "no-check-send-proxy" | "no-check-reuse-pool" | "no-ssl"
+            | "no-check-ssl" | "no-send-proxy-v2-ssl" | "no-send-proxy-v2-ssl-cn" | "no-sni-auto"
+            | "no-check-sni-auto" => {}
+            _ => i = unimplemented_server_keyword(tokens, i, None)?,
         }
         i += 1;
     }

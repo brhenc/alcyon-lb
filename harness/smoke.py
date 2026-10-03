@@ -48,7 +48,9 @@ import vtc_runner as _vtc  # noqa: E402  -- reuse its preprocessing rather than 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REGTESTS = "/home/bhenc/reference/haproxy/reg-tests/"
 BASELINE = os.path.join(REPO, "data", "board_baseline.json")
-BINARY = os.path.join(REPO, "target", "debug", "ibex")
+# The binary `tools/checkin.sh` just built: it builds into CARGO_TARGET_DIR, and a fixed
+# `target/` here checked whatever stale binary happened to be there (or none, in a worktree).
+BINARY = os.path.join(os.environ.get("CARGO_TARGET_DIR") or os.path.join(REPO, "target"), "debug", "ibex")
 
 
 def _vtc_files() -> list[str]:
@@ -137,7 +139,7 @@ def pass_gate(expected: list[str]) -> tuple[list[str], list[str]]:
     with tempfile.TemporaryDirectory() as td:
         out = os.path.join(td, "r.json")
         subprocess.run([sys.executable, os.path.join(REPO, "harness", "vtc_runner.py"),
-                        *paths, "--json", out],
+                        *paths, "--binary", BINARY, "--json", out],
                        capture_output=True, text=True, timeout=600)
         try:
             data = json.load(open(out))

@@ -138,6 +138,9 @@ pub struct Proxy {
     pub srvexp: Vec<ibex_proto::CompiledExp>,
     pub servers: Vec<SocketAddr>,
     pub server_ids: Vec<String>,
+    /// Each server's persistence cookie value (`server ... cookie <value>`). A server
+    /// without one is matched by its name.
+    pub server_cookies: Vec<Option<String>>,
     pub server_statuses: Arc<Vec<AtomicU8>>,
     pub server_weights: Vec<u32>,
     pub next_server_idx: Arc<AtomicUsize>,
@@ -269,7 +272,9 @@ impl Proxy {
     #[must_use]
     pub fn select_server_by_id(&self, id: &str) -> Option<SocketAddr> {
         for (idx, sid) in self.server_ids.iter().enumerate() {
-            if sid == id && idx < self.servers.len() {
+            // A server with a `cookie` value is selected by that value, not its name.
+            let key = self.server_cookies.get(idx).and_then(Option::as_deref).unwrap_or(sid);
+            if key == id && idx < self.servers.len() {
                 let is_up = self.server_statuses.get(idx).map(|s| s.load(Ordering::Relaxed)) == Some(ServerStatus::Up as u8);
                 let not_saturated = match self.server_maxconn.get(idx) {
                     Some(Some(mc)) if *mc > 0 => {
@@ -1120,6 +1125,7 @@ fn init_proxy_from_listen(proxy_idx: usize, listen: &ibex_config::ListenSection,
         srvexp,
         servers: listen.servers.iter().map(|s| s.addr).collect(),
         server_ids: listen.servers.iter().map(|s| s.id.clone()).collect(),
+        server_cookies: listen.servers.iter().map(|s| s.cookie.clone()).collect(),
         server_statuses: Arc::new((0..server_count).map(|_| AtomicU8::new(ServerStatus::Up as u8)).collect()),
         server_weights: listen
             .servers
@@ -1214,6 +1220,7 @@ fn init_proxy_from_frontend(proxy_idx: usize, fe: &ibex_config::FrontendSection,
         srvexp: Vec::new(),
         servers: Vec::new(),
         server_ids: Vec::new(),
+        server_cookies: Vec::new(),
         server_statuses: std::sync::Arc::new(Vec::new()),
         server_weights: Vec::new(),
         next_server_idx: Arc::new(AtomicUsize::new(0)),
@@ -1326,6 +1333,7 @@ fn init_proxy_from_backend(proxy_idx: usize, be: &ibex_config::BackendSection, n
         srvexp,
         servers: be.servers.iter().map(|s| s.addr).collect(),
         server_ids: be.servers.iter().map(|s| s.id.clone()).collect(),
+        server_cookies: be.servers.iter().map(|s| s.cookie.clone()).collect(),
         server_statuses: Arc::new((0..server_count).map(|_| AtomicU8::new(ServerStatus::Up as u8)).collect()),
         server_weights: be.servers.iter().map(|s| s.weight.unwrap_or(1)).collect(),
         next_server_idx: Arc::new(AtomicUsize::new(0)),
@@ -6147,15 +6155,16 @@ impl EngineDispatcher<'_> {
             }
         }
 
-        // Apply forwardfor & originalto header injection
-        if let Some(ref except_str) = proxies[be_idx].stats_config.forwardfor {
+        // Apply forwardfor & originalto header injection. As in HAProxy
+        // (`http_handle_xff_header`), the option applies when the frontend or the backend
+        // sets it, and it is not applied to an address in the `except` network of any
+        // proxy that sets it.
+        let fe_be = [proxy_idx, be_idx];
+        let xff_excepts: Vec<&str> = fe_be.iter().filter_map(|&i| proxies[i].stats_config.forwardfor.as_deref()).collect();
+        if !xff_excepts.is_empty() {
             let client_ip = entry.sess.client_addr.map(|a| a.ip());
             if let Some(ip) = client_ip {
-                let in_except = if except_str.is_empty() {
-                    false
-                } else {
-                    ip_in_cidr(ip, except_str)
-                };
+                let in_except = xff_excepts.iter().any(|e| !e.is_empty() && ip_in_cidr(ip, e));
                 if !in_except {
                     let ip_str = ip.to_string();
                     set_req_header(&mut entry.sess, "X-Forwarded-For", &ip_str);
@@ -6163,14 +6172,11 @@ impl EngineDispatcher<'_> {
             }
         }
 
-        if let Some(ref except_str) = proxies[be_idx].stats_config.originalto {
+        let xot_excepts: Vec<&str> = fe_be.iter().filter_map(|&i| proxies[i].stats_config.originalto.as_deref()).collect();
+        if !xot_excepts.is_empty() {
             let dst_ip = entry.sess.server_addr.or(entry.target_addr).map(|a| a.ip());
             if let Some(ip) = dst_ip {
-                let in_except = if except_str.is_empty() {
-                    false
-                } else {
-                    ip_in_cidr(ip, except_str)
-                };
+                let in_except = xot_excepts.iter().any(|e| !e.is_empty() && ip_in_cidr(ip, e));
                 if !in_except {
                     let ip_str = ip.to_string();
                     set_req_header(&mut entry.sess, "X-Original-To", &ip_str);

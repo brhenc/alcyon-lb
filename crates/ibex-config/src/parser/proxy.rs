@@ -112,8 +112,8 @@ pub(crate) fn parse_listen_header(
         http_reuse: defaults.and_then(|d| d.http_reuse),
         hash_type: defaults.and_then(|d| d.hash_type),
         hash_preserve_affinity: defaults.and_then(|d| d.hash_preserve_affinity),
-        forwardfor: None,
-        originalto: None,
+        forwardfor: defaults.and_then(|d| d.forwardfor.clone()),
+        originalto: defaults.and_then(|d| d.originalto.clone()),
         stats: defaults.map_or_else(StatsConfig::default, |d| d.stats.clone()),
         error_files: defaults.map_or_else(HashMap::new, |d| d.error_files.clone()),
         error_replies: defaults.map_or_else(HashMap::new, |d| d.error_replies.clone()),
@@ -189,8 +189,8 @@ pub(crate) fn parse_frontend_header(
         http_after_res_rules: defaults.map_or_else(Vec::new, |d| d.http_after_res_rules.clone()),
         accept_proxy: false,
         accept_proxy_v2: false,
-        forwardfor: None,
-        originalto: None,
+        forwardfor: defaults.and_then(|d| d.forwardfor.clone()),
+        originalto: defaults.and_then(|d| d.originalto.clone()),
         stats: defaults.map_or_else(StatsConfig::default, |d| d.stats.clone()),
         error_files: defaults.map_or_else(HashMap::new, |d| d.error_files.clone()),
         error_replies: defaults.map_or_else(HashMap::new, |d| d.error_replies.clone()),
@@ -271,8 +271,8 @@ pub(crate) fn parse_backend_header(
         http_reuse: defaults.and_then(|d| d.http_reuse),
         hash_type: defaults.and_then(|d| d.hash_type),
         hash_preserve_affinity: defaults.and_then(|d| d.hash_preserve_affinity),
-        forwardfor: None,
-        originalto: None,
+        forwardfor: defaults.and_then(|d| d.forwardfor.clone()),
+        originalto: defaults.and_then(|d| d.originalto.clone()),
         stats: defaults.map_or_else(StatsConfig::default, |d| d.stats.clone()),
         error_files: defaults.map_or_else(HashMap::new, |d| d.error_files.clone()),
         error_replies: defaults.map_or_else(HashMap::new, |d| d.error_replies.clone()),
@@ -334,7 +334,7 @@ pub(crate) fn parse_listen_directive(
         "monitor-uri" => parse_monitor_uri(&mut proxy.monitor_uri, tokens, kw),
         "default_backend" => parse_default_backend(&mut proxy.default_backend, tokens, kw),
         "option" => parse_option_listen(proxy, tokens, kw),
-        "no" => parse_no_directive(tokens, kw),
+        "no" => parse_no_listen(proxy, tokens, kw),
         "declare" if tokens.get(1).is_some_and(|t| t.text == "capture") => {
             let rule_slots = rule_capture_slots(&proxy.http_req_rules);
             parse_declare_capture(&mut proxy.req_header_captures, &mut proxy.res_header_captures, rule_slots, tokens, kw)
@@ -463,7 +463,7 @@ pub(crate) fn parse_frontend_directive(
             Ok(())
         }
         "option" => parse_option_frontend(fe, tokens, kw),
-        "no" => parse_no_directive(tokens, kw),
+        "no" => parse_no_frontend(tokens, kw),
         "declare" if tokens.get(1).is_some_and(|t| t.text == "capture") => {
             let rule_slots = rule_capture_slots(&fe.http_req_rules);
             parse_declare_capture(&mut fe.req_header_captures, &mut fe.res_header_captures, rule_slots, tokens, kw)
@@ -572,7 +572,7 @@ pub(crate) fn parse_backend_directive(
             parse_http_after_res_rule(&mut be.http_after_res_rules, tokens, kw)
         }
         "option" => parse_option_backend(be, tokens, kw),
-        "no" => parse_no_directive(tokens, kw),
+        "no" => parse_no_backend(be, tokens, kw),
         "declare" => parse_declare(tokens, kw),
         "cliexp" => parse_cliexp(kw),
         "srvexp" => parse_srvexp(kw),
@@ -770,137 +770,110 @@ pub(crate) fn parse_option_listen(
     tokens: &[Token],
     kw: &Token,
 ) -> Result<(), ConfigError> {
-    if tokens.len() >= 2 {
-        if let Some(spec) = parse_log_option(tokens, kw) {
-            proxy.log_format = Some(spec?);
-            return Ok(());
-        }
-        match tokens[1].text.as_str() {
-            "forwardfor" => {
-                let except = if tokens.len() >= 4 && tokens[2].text == "except" {
-                    tokens[3].text.clone()
-                } else {
-                    String::new()
-                };
-                proxy.forwardfor = Some(except);
-            }
-            "originalto" => {
-                let except = if tokens.len() >= 4 && tokens[2].text == "except" {
-                    tokens[3].text.clone()
-                } else {
-                    String::new()
-                };
-                proxy.originalto = Some(except);
-            }
-            "redispatch" => {
-                proxy.redisp = true;
-            }
-            "log-health-checks" => {
-                proxy.log_health_checks = true;
-            }
-            "httpchk" => {
-                parse_httpchk_option(&mut proxy.httpchk, tokens, kw)?;
-            }
-            "tcp-check" => {
-                proxy.tcp_check = true;
-            }
-            _ if parse_proto_check_option(&mut proxy.proto_check, tokens, kw)? => {}
-            other => {
-                refuse_if_check_option(other, kw)?;
-                eprintln!("[ibex] warning: ignored option '{other}'");
-            }
+    // `option httplog`/`tcplog` (and `clf`) are the log format (T53), ahead of the option
+    // table: the table would otherwise warn and drop them.
+    if let Some(spec) = parse_log_option(tokens, kw) {
+        proxy.log_format = Some(spec?);
+        return Ok(());
+    }
+    if !check_option(OptSection::Listen, tokens, kw)? {
+        return Ok(());
+    }
+    match tokens[1].text.as_str() {
+        "forwardfor" => proxy.forwardfor = Some(parse_forward_option(tokens, kw)?),
+        "originalto" => proxy.originalto = Some(parse_forward_option(tokens, kw)?),
+        "redispatch" => proxy.redisp = true,
+        "log-health-checks" => proxy.log_health_checks = true,
+        "httpchk" => parse_httpchk_option(&mut proxy.httpchk, tokens, kw)?,
+        "tcp-check" => proxy.tcp_check = true,
+        _ => {
+            parse_proto_check_option(&mut proxy.proto_check, tokens, kw)?;
         }
     }
     Ok(())
 }
 
-#[allow(clippy::unnecessary_wraps)]
 pub(crate) fn parse_option_frontend(
     fe: &mut FrontendSection,
     tokens: &[Token],
     kw: &Token,
 ) -> Result<(), ConfigError> {
-    if tokens.len() >= 2 {
-        if let Some(spec) = parse_log_option(tokens, kw) {
-            fe.log_format = Some(spec?);
-            return Ok(());
-        }
-        match tokens[1].text.as_str() {
-            "forwardfor" => {
-                let except = if tokens.len() >= 4 && tokens[2].text == "except" {
-                    tokens[3].text.clone()
-                } else {
-                    String::new()
-                };
-                fe.forwardfor = Some(except);
-            }
-            "originalto" => {
-                let except = if tokens.len() >= 4 && tokens[2].text == "except" {
-                    tokens[3].text.clone()
-                } else {
-                    String::new()
-                };
-                fe.originalto = Some(except);
-            }
-            "log-health-checks" => {
-                fe.log_health_checks = true;
-            }
-            other => {
-                refuse_if_check_option(other, kw)?;
-                eprintln!("[ibex] warning: ignored option '{other}'");
-            }
-        }
+    // `option httplog`/`tcplog` (and `clf`) are the log format (T53), ahead of the option
+    // table: the table would otherwise warn and drop them.
+    if let Some(spec) = parse_log_option(tokens, kw) {
+        fe.log_format = Some(spec?);
+        return Ok(());
+    }
+    if !check_option(OptSection::Frontend, tokens, kw)? {
+        return Ok(());
+    }
+    // The options a frontend implements are `forwardfor` and `originalto`; every other
+    // one `check_option` lets through needs a backend, and was warned about there.
+    let except = Some(parse_forward_option(tokens, kw)?);
+    if tokens[1].text == "forwardfor" {
+        fe.forwardfor = except;
+    } else {
+        fe.originalto = except;
     }
     Ok(())
 }
 
-#[allow(clippy::unnecessary_wraps)]
 pub(crate) fn parse_option_backend(
     be: &mut BackendSection,
     tokens: &[Token],
     kw: &Token,
 ) -> Result<(), ConfigError> {
-    if tokens.len() >= 2 {
-        // Ignored in backends, as `HAProxy` ignores it ("'option httplog' directive is
-        // ignored in backends").
-        if let Some(spec) = parse_log_option(tokens, kw) {
-            return spec.map(|_| ());
+    // Parsed (an error in it is still an error) and ignored in backends, as `HAProxy`
+    // ignores it ("'option httplog' directive is ignored in backends").
+    if let Some(spec) = parse_log_option(tokens, kw) {
+        // `httpslog` too: refused where it would take effect, ignored here like the rest.
+        return if tokens[1].text == "httpslog" { Ok(()) } else { spec.map(|_| ()) };
+    }
+    if !check_option(OptSection::Backend, tokens, kw)? {
+        return Ok(());
+    }
+    match tokens[1].text.as_str() {
+        "forwardfor" => be.forwardfor = Some(parse_forward_option(tokens, kw)?),
+        "originalto" => be.originalto = Some(parse_forward_option(tokens, kw)?),
+        "redispatch" => be.redisp = true,
+        "log-health-checks" => be.log_health_checks = true,
+        "httpchk" => parse_httpchk_option(&mut be.httpchk, tokens, kw)?,
+        "tcp-check" => be.tcp_check = true,
+        _ => {
+            parse_proto_check_option(&mut be.proto_check, tokens, kw)?;
         }
-        match tokens[1].text.as_str() {
-            "forwardfor" => {
-                let except = if tokens.len() >= 4 && tokens[2].text == "except" {
-                    tokens[3].text.clone()
-                } else {
-                    String::new()
-                };
-                be.forwardfor = Some(except);
-            }
-            "originalto" => {
-                let except = if tokens.len() >= 4 && tokens[2].text == "except" {
-                    tokens[3].text.clone()
-                } else {
-                    String::new()
-                };
-                be.originalto = Some(except);
-            }
-            "redispatch" => {
-                be.redisp = true;
-            }
-            "log-health-checks" => {
-                be.log_health_checks = true;
-            }
-            "httpchk" => {
-                parse_httpchk_option(&mut be.httpchk, tokens, kw)?;
-            }
-            "tcp-check" => {
-                be.tcp_check = true;
-            }
-            _ if parse_proto_check_option(&mut be.proto_check, tokens, kw)? => {}
-            other => {
-                refuse_if_check_option(other, kw)?;
-                eprintln!("[ibex] warning: ignored option '{other}'");
-            }
-        }
+    }
+    Ok(())
+}
+
+/// `no option <name>` in a proxy section: turns off an option this section inherited.
+pub(crate) fn parse_no_listen(proxy: &mut ListenSection, tokens: &[Token], kw: &Token) -> Result<(), ConfigError> {
+    if tokens.get(1).is_none_or(|t| t.text != "option") {
+        return parse_no_directive(tokens, kw);
+    }
+    match check_no_option(OptSection::Listen, tokens, kw)? {
+        Some("redispatch") => proxy.redisp = false,
+        Some("log-health-checks") => proxy.log_health_checks = false,
+        _ => {}
+    }
+    Ok(())
+}
+
+pub(crate) fn parse_no_frontend(tokens: &[Token], kw: &Token) -> Result<(), ConfigError> {
+    if tokens.get(1).is_none_or(|t| t.text != "option") {
+        return parse_no_directive(tokens, kw);
+    }
+    check_no_option(OptSection::Frontend, tokens, kw).map(|_| ())
+}
+
+pub(crate) fn parse_no_backend(be: &mut BackendSection, tokens: &[Token], kw: &Token) -> Result<(), ConfigError> {
+    if tokens.get(1).is_none_or(|t| t.text != "option") {
+        return parse_no_directive(tokens, kw);
+    }
+    match check_no_option(OptSection::Backend, tokens, kw)? {
+        Some("redispatch") => be.redisp = false,
+        Some("log-health-checks") => be.log_health_checks = false,
+        _ => {}
     }
     Ok(())
 }

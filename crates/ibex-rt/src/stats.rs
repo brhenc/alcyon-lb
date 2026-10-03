@@ -665,6 +665,7 @@ mod tests {
             srvexp: Vec::new(),
             servers: vec![addr],
             server_ids: vec!["srv1".into()],
+            server_cookies: vec![None],
             server_statuses: std::sync::Arc::new(vec![std::sync::atomic::AtomicU8::new(0)]),
             server_weights: vec![1],
             next_server_idx: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),

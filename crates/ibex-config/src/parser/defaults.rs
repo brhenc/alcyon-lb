@@ -126,7 +126,7 @@ pub(crate) fn parse_defaults_directive(
         "log" => parse_log(&mut defaults.logs, tokens, kw).map(|g| defaults.log_global |= g),
         "log-tag" => parse_log_tag(tokens, kw).map(|t| defaults.log_tag = Some(t)),
         "option" => parse_option_defaults(defaults, tokens, kw),
-        "no" => parse_no_directive(tokens, kw),
+        "no" => parse_no_defaults(defaults, tokens, kw),
         "declare" => parse_declare(tokens, kw),
         "contimeout" => parse_contimeout(kw),
         "clitimeout" => parse_clitimeout(kw),
@@ -186,28 +186,38 @@ pub(crate) fn parse_option_defaults(
     tokens: &[Token],
     kw: &Token,
 ) -> Result<(), ConfigError> {
-    if tokens.len() >= 2 {
-        if let Some(spec) = parse_log_option(tokens, kw) {
-            defaults.log_format = Some(spec?);
-            return Ok(());
-        }
-        match tokens[1].text.as_str() {
-            "log-health-checks" => {
-                defaults.log_health_checks = true;
-            }
-            "httpchk" => {
-                parse_httpchk_option(&mut defaults.httpchk, tokens, kw)?;
-            }
-            "tcp-check" => {
-                defaults.tcp_check = true;
-            }
-            _ if parse_proto_check_option(&mut defaults.proto_check, tokens, kw)? => {}
-            other => {
-                refuse_if_check_option(other, kw)?;
-                eprintln!("[ibex] warning: ignored option '{other}'");
-            }
+    // `option httplog`/`tcplog` (and `clf`) are the log format (T53), ahead of the option
+    // table: the table would otherwise warn and drop them.
+    if let Some(spec) = parse_log_option(tokens, kw) {
+        defaults.log_format = Some(spec?);
+        return Ok(());
+    }
+    if !check_option(OptSection::Defaults, tokens, kw)? {
+        return Ok(());
+    }
+    match tokens[1].text.as_str() {
+        "forwardfor" => defaults.forwardfor = Some(parse_forward_option(tokens, kw)?),
+        "originalto" => defaults.originalto = Some(parse_forward_option(tokens, kw)?),
+        "redispatch" => defaults.redisp = true,
+        "log-health-checks" => defaults.log_health_checks = true,
+        "httpchk" => parse_httpchk_option(&mut defaults.httpchk, tokens, kw)?,
+        "tcp-check" => defaults.tcp_check = true,
+        _ => {
+            parse_proto_check_option(&mut defaults.proto_check, tokens, kw)?;
         }
     }
     Ok(())
 }
 
+/// `no option <name>` in `defaults`.
+pub(crate) fn parse_no_defaults(defaults: &mut DefaultsSection, tokens: &[Token], kw: &Token) -> Result<(), ConfigError> {
+    if tokens.get(1).is_none_or(|t| t.text != "option") {
+        return parse_no_directive(tokens, kw);
+    }
+    match check_no_option(OptSection::Defaults, tokens, kw)? {
+        Some("redispatch") => defaults.redisp = false,
+        Some("log-health-checks") => defaults.log_health_checks = false,
+        _ => {}
+    }
+    Ok(())
+}

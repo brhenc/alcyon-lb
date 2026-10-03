@@ -38,6 +38,10 @@ pub struct DefaultsSection {
     /// `unique-id-header`: the request header the unique ID is sent to the server in.
     pub unique_id_header: Option<String>,
     pub log_health_checks: bool,
+    /// `option forwardfor` in `defaults`: the `except` network, empty for none.
+    pub forwardfor: Option<String>,
+    /// `option originalto` in `defaults`: the `except` network, empty for none.
+    pub originalto: Option<String>,
     /// Default TCP request inspection delay.
     pub tcp_req_inspect_delay: Option<Duration>,
     /// Default HTTP connection reuse strategy (`http-reuse`).

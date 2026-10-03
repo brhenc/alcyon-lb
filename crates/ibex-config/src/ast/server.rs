@@ -20,6 +20,9 @@ pub struct DefaultServerConfig {
     pub check_ssl: bool,
     /// `proxy-v2-options unique-id`.
     pub proxy_v2_unique_id: bool,
+    pub weight: Option<u32>,
+    pub backup: bool,
+    pub cookie: Option<String>,
 }
 
 /// Connection reuse mode for backends (`http-reuse`).
@@ -125,15 +128,17 @@ pub struct Server {
     pub maxconn: Option<u32>,
     /// Whether this server is a backup server.
     pub backup: bool,
-    /// Custom port for health checks (`check-port` / `port`).
+    /// Custom port for health checks (`port`).
     pub check_port: Option<u16>,
     /// Protocol for health checks (`check-proto`).
     pub check_proto: Option<String>,
-    /// Whether health checks use SSL (`check-ssl`).
+    /// Whether health checks use SSL (`check-ssl`). Always false: `check-ssl` is refused.
     pub check_ssl: bool,
     /// `proxy-v2-options unique-id`: the stream's unique ID goes in the PROXY v2 header
     /// (TLV `PP2_TYPE_UNIQUE_ID`).
     pub proxy_v2_unique_id: bool,
+    /// The value of the persistence cookie that selects this server (`cookie <value>`).
+    pub cookie: Option<String>,
 }
 
 impl Default for Server {
@@ -154,6 +159,7 @@ impl Default for Server {
             check_proto: None,
             check_ssl: false,
             proxy_v2_unique_id: false,
+            cookie: None,
         }
     }
 }
@@ -177,6 +183,7 @@ impl Server {
             check_proto: None,
             check_ssl: false,
             proxy_v2_unique_id: false,
+            cookie: None,
         }
     }
 }
