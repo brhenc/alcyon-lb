@@ -555,7 +555,7 @@ fn socket_file_ident(path: &Path) -> Option<(u64, u64)> {
 
 /// `HAProxy`'s predefined ACLs (`default_acl_list`, src/acl.c), by name. `RDP_COOKIE`
 /// (`req.rdp_cookie_cnt`) and `WAIT_END` (`wait_end`) are missing: Ibex has neither fetch.
-const PREDEFINED_ACLS: &[(&str, &str)] = &[
+const PREDEFINED_ACLS:&[(&str, &str)] = &[
     ("TRUE", "always_true"),
     ("FALSE", "always_false"),
     ("LOCALHOST", "src 127.0.0.1/8 ::1"),
@@ -4338,9 +4338,9 @@ impl EngineDispatcher<'_> {
         }
     }
 
-    /// HTTP/2: a response is handed to the stream once it is complete (or fills the
-    /// buffer). One stream at a time until each stream has its own transaction (design
-    /// 010 step 5).
+    /// HTTP/2: the response of the active stream, as HEADERS then DATA frames, as much as
+    /// the client's flow-control windows take. One stream at a time until each stream has
+    /// its own transaction (design 010 step 5).
     fn h2_forward_response(entry: &mut SessionEntry) {
         let sess = &mut entry.sess;
         let (Some(h2), Some(txn)) = (sess.h2_ctx.as_mut(), sess.txn.as_mut()) else {
@@ -4357,20 +4357,52 @@ impl EngineDispatcher<'_> {
             sess.rep.consume(win);
             return;
         }
-        let mut probe = txn.rsp;
-        probe.advance(data);
-        let srv_gone = matches!(sess.srv_state, ScState::ShutR | ScState::Closed | ScState::Error);
-        if probe.is_done() || sess.rep.is_full() || srv_gone {
-            let stream_id = sess.h2_active_stream_id.unwrap_or(1);
-            if h2.send_h1_response(stream_id, &data[..win]) {
-                txn.rsp.consume(data, win);
-                sess.rep.consume(win);
-                if !txn.rsp.is_done() {
-                    txn.rsp = MsgState::Done;
-                    txn.srv_reusable = false;
-                }
+        let stream_id = sess.h2_active_stream_id.unwrap_or(1);
+        if let MsgState::Head { body, .. } = txn.rsp {
+            // The head goes out as HEADERS once all of it is here; the body follows as
+            // DATA, as much as the client's windows take at a time.
+            let Some((h, e)) = crate::proxy::find_eoh(data) else { return };
+            let end_stream = matches!(body, crate::txn::Framing::None | crate::txn::Framing::Length(0));
+            if h2.send_h1_head(stream_id, &data[..h], end_stream) {
+                txn.rsp.consume(data, h + e);
+                sess.rep.consume(h + e);
             }
+            return;
         }
+        if !matches!(txn.rsp, MsgState::Body(_)) {
+            // A body that broke its framing, or a tunnel (101, CONNECT), which this
+            // conversion does not carry: the stream is reset and the server is let go.
+            h2.send_rst_stream(stream_id, ibex_proto::h2::H2Error::InternalError);
+            txn.srv_reusable = false;
+            txn.rsp = MsgState::Done;
+            return;
+        }
+        let mut out = Vec::new();
+        let mut state = txn.rsp;
+        let used = state.take_body(data, h2.data_budget(stream_id), &mut out);
+        let end = state.is_done();
+        if !out.is_empty() || end {
+            h2.send_data(stream_id, &out, end);
+        }
+        if used > 0 || end {
+            txn.rsp = state;
+            sess.rep.consume(used);
+        }
+        let srv_gone = matches!(sess.srv_state, ScState::ShutR | ScState::Closed | ScState::Error);
+        if txn.rsp.is_done() || !srv_gone || !sess.rep.is_empty() {
+            return;
+        }
+        // The server is gone and everything it sent has been delivered.
+        txn.srv_reusable = false;
+        if matches!(txn.rsp, MsgState::Body(crate::txn::Body::UntilClose)) {
+            // The close is the end of this body.
+            h2.send_data(stream_id, &[], true);
+        } else {
+            // Cut short: the stream cannot be completed, so it is reset.
+            h2.send_rst_stream(stream_id, ibex_proto::h2::H2Error::Cancel);
+            sess.log.term = Some(*b"SD");
+        }
+        txn.rsp = MsgState::Done;
     }
 
     /// The transaction is over: both messages complete and the response delivered.

@@ -225,21 +225,15 @@ impl H2MuxContext {
         }
     }
 
-    /// Sends an HTTP/2 response on the given stream ID with status and headers.
-    pub fn send_response(
-        &mut self,
-        stream_id: u32,
-        status: u16,
-        headers: &[(String, String)],
-        body: &[u8],
-    ) {
+    /// Encodes and queues a HEADERS frame for a response, dropping the connection-specific
+    /// headers HTTP/2 forbids (RFC 7540 section 8.1.2.2).
+    fn send_headers_frame(&mut self, stream_id: u32, status: u16, headers: &[(String, String)], end_stream: bool) {
         let mut hpack_headers = vec![HeaderField {
             name: ":status".to_string(),
             value: status.to_string(),
         }];
         for (name, val) in headers {
             let lower = name.to_ascii_lowercase();
-            // RFC 7540 §8.1.2.2: connection-specific headers must not be sent in HTTP/2
             if lower == "connection"
                 || lower == "keep-alive"
                 || lower == "proxy-connection"
@@ -254,7 +248,6 @@ impl H2MuxContext {
             });
         }
         let header_block = self.encoder.encode(&hpack_headers);
-        let end_stream = body.is_empty();
         let flags = if end_stream {
             frame_flags::END_HEADERS | frame_flags::END_STREAM
         } else {
@@ -265,65 +258,94 @@ impl H2MuxContext {
             stream_id,
             header_block,
         });
-
-        if !body.is_empty() {
-            let max_chunk = self.max_frame_size as usize;
-            let mut offset = 0;
-            while offset < body.len() {
-                let chunk_len = (body.len() - offset).min(max_chunk);
-                let is_last = offset + chunk_len >= body.len();
-                let flags = if is_last { frame_flags::END_STREAM } else { 0 };
-                self.enqueue_frame(&Frame::Data {
-                    flags,
-                    stream_id,
-                    data: body[offset..offset + chunk_len].to_vec(),
-                });
-                offset += chunk_len;
-            }
-        }
-
-        if let Some(stream) = self.streams.get_mut(&stream_id) {
-            stream.state = match stream.state {
-                H2StreamState::HalfClosedRemote => H2StreamState::Closed,
-                _ => H2StreamState::HalfClosedLocal,
-            };
-        }
     }
 
-    /// Parses an HTTP/1 response buffer and encodes it as HTTP/2 HEADERS/DATA frames.
-    pub fn send_h1_response(&mut self, stream_id: u32, h1_bytes: &[u8]) -> bool {
-        let (head, body) = if let Some(pos) = h1_bytes.windows(4).position(|w| w == b"\r\n\r\n") {
-            (&h1_bytes[..pos], &h1_bytes[pos + 4..])
-        } else if let Some(pos) = h1_bytes.windows(2).position(|w| w == b"\n\n") {
-            (&h1_bytes[..pos], &h1_bytes[pos + 2..])
-        } else {
-            return false;
-        };
-
+    /// Parses an HTTP/1 response head (status line and headers, with or without the
+    /// final blank line) and sends it as a HEADERS frame; the body follows through
+    /// [`Self::send_data`]. `end_stream` is for a response without a body. Returns false
+    /// if `head` is not a response head.
+    pub fn send_h1_head(&mut self, stream_id: u32, head: &[u8], end_stream: bool) -> bool {
         let head_str = String::from_utf8_lossy(head);
         let mut lines = head_str.lines();
-        let status_line = match lines.next() {
-            Some(l) => l,
-            None => return false,
-        };
+        let Some(status_line) = lines.next() else { return false };
         let parts: Vec<&str> = status_line.split_whitespace().collect();
         if parts.len() < 2 {
             return false;
         }
-        let status: u16 = match parts[1].parse() {
-            Ok(s) => s,
-            Err(_) => return false,
-        };
-
+        let Ok(status) = parts[1].parse::<u16>() else { return false };
         let mut headers = Vec::new();
         for line in lines {
             if let Some((name, val)) = line.split_once(':') {
                 headers.push((name.trim().to_string(), val.trim().to_string()));
             }
         }
-
-        self.send_response(stream_id, status, &headers, body);
+        self.send_headers_frame(stream_id, status, &headers, end_stream);
         true
+    }
+
+    /// How many DATA bytes the connection and stream send windows allow now. A stream
+    /// that is gone takes anything (it is discarded), so its budget is unbounded.
+    #[must_use]
+    pub fn data_budget(&self, stream_id: u32) -> usize {
+        match self.streams.get(&stream_id) {
+            Some(st) if !matches!(st.state, H2StreamState::Reset(_) | H2StreamState::Closed) => {
+                usize::try_from(self.conn_send_window.min(st.send_window)).unwrap_or(0)
+            }
+            _ => usize::MAX,
+        }
+    }
+
+    /// Sends as much of `data` as the connection and stream send windows (and the peer's
+    /// maximum frame size) allow, as DATA frames, and returns how many bytes were taken.
+    /// The caller keeps the rest and offers it again once a WINDOW_UPDATE has arrived.
+    /// `end_stream` is honoured only when all of `data` was taken, on the last frame
+    /// (an empty `data` with `end_stream` sends an empty DATA frame, which no window
+    /// can refuse). A stream that is gone (reset by the peer) takes everything and
+    /// discards it.
+    pub fn send_data(&mut self, stream_id: u32, data: &[u8], end_stream: bool) -> usize {
+        let Some(stream) = self.streams.get(&stream_id) else {
+            return data.len();
+        };
+        if matches!(stream.state, H2StreamState::Reset(_) | H2StreamState::Closed) {
+            return data.len();
+        }
+        let mut sent = 0;
+        while sent < data.len() {
+            let stream_win = self.streams.get(&stream_id).map_or(0, |s| s.send_window);
+            let win = self.conn_send_window.min(stream_win);
+            if win <= 0 {
+                break;
+            }
+            let n = (data.len() - sent).min(win as usize).min(self.max_frame_size as usize);
+            let last = end_stream && sent + n == data.len();
+            self.enqueue_frame(&Frame::Data {
+                flags: if last { frame_flags::END_STREAM } else { 0 },
+                stream_id,
+                data: data[sent..sent + n].to_vec(),
+            });
+            self.conn_send_window -= n as i32;
+            if let Some(s) = self.streams.get_mut(&stream_id) {
+                s.send_window -= n as i32;
+            }
+            sent += n;
+        }
+        if data.is_empty() && end_stream {
+            self.enqueue_frame(&Frame::Data { flags: frame_flags::END_STREAM, stream_id, data: Vec::new() });
+        }
+        if end_stream && sent == data.len() {
+            self.local_end_stream(stream_id);
+        }
+        sent
+    }
+
+    /// The stream's state once we have sent END_STREAM.
+    fn local_end_stream(&mut self, stream_id: u32) {
+        self.streams.entry(stream_id).and_modify(|stream| {
+            stream.state = match stream.state {
+                H2StreamState::HalfClosedRemote => H2StreamState::Closed,
+                _ => H2StreamState::HalfClosedLocal,
+            };
+        });
     }
 }
 
@@ -1012,5 +1034,31 @@ mod tests {
         let s3 = ctx.streams.get(&3).unwrap();
         assert_eq!(s3.rx_htx.req_line().unwrap().uri, "/stream3");
         assert_eq!(s3.rx_htx.body_bytes(), b"hello stream 3");
+    }
+
+    #[test]
+    fn response_data_stops_at_the_windows_and_resumes_after_a_window_update() {
+        let mux = MuxH2;
+        let mut ctx = mux.init(ConnId(1), true).expect("init");
+        ctx.streams.insert(1, H2StreamCtx::new(1, 10, 100));
+        assert!(!ctx.send_h1_head(1, b"garbage", false));
+        assert!(!ctx.send_h1_head(1, b"", false));
+        assert!(!ctx.send_h1_head(1, b"HTTP/1.1 abc", false));
+        assert!(ctx.send_h1_head(1, b"HTTP/1.1 200 OK\r\nContent-Length: 25", false));
+        assert_eq!(ctx.data_budget(1), 10);
+        // 25 bytes against a 10-byte stream window: 10 go, END_STREAM is not sent.
+        assert_eq!(ctx.send_data(1, &[7; 25], true), 10);
+        assert_eq!(ctx.data_budget(1), 0);
+        assert_eq!(ctx.send_data(1, &[7; 15], true), 0);
+        ctx.streams.get_mut(&1).unwrap().send_window += 15;
+        assert_eq!(ctx.send_data(1, &[7; 15], true), 15);
+        assert_eq!(ctx.streams.get(&1).unwrap().state, H2StreamState::HalfClosedLocal);
+        // A stream that is gone takes and discards anything; an empty END_STREAM needs no window.
+        assert_eq!(ctx.data_budget(3), usize::MAX);
+        assert_eq!(ctx.send_data(3, &[1; 5], true), 5);
+        ctx.streams.insert(5, H2StreamCtx::new(5, 0, 0));
+        ctx.streams.get_mut(&5).unwrap().state = H2StreamState::HalfClosedRemote;
+        assert_eq!(ctx.send_data(5, &[], true), 0);
+        assert_eq!(ctx.streams.get(&5).unwrap().state, H2StreamState::Closed);
     }
 }
