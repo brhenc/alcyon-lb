@@ -83,50 +83,6 @@ pub(crate) fn parse_size(token: &Token) -> Result<usize, ConfigError> {
     Ok(base.saturating_mul(multiplier))
 }
 
-pub(crate) fn unescape_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            if let Some(&next) = chars.peek() {
-                match next {
-                    'r' => {
-                        out.push('\r');
-                        chars.next();
-                    }
-                    'n' => {
-                        out.push('\n');
-                        chars.next();
-                    }
-                    't' => {
-                        out.push('\t');
-                        chars.next();
-                    }
-                    '0' => {
-                        out.push('\0');
-                        chars.next();
-                    }
-                    '\\' => {
-                        out.push('\\');
-                        chars.next();
-                    }
-                    ' ' => {
-                        out.push(' ');
-                        chars.next();
-                    }
-                    _ => {
-                        out.push(c);
-                    }
-                }
-            } else {
-                out.push(c);
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
 
 pub(crate) fn parse_hex_binary(hex: &str) -> Result<Vec<u8>, String> {
     let clean = hex.trim().replace(' ', "");

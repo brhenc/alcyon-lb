@@ -195,7 +195,7 @@ pub(crate) fn parse_http_check_directive(
                     "uri" | "uri-lf" => {
                         i += 1;
                         if i < tokens.len() {
-                            uri = Some(unescape_string(&tokens[i].text));
+                            uri = Some(tokens[i].text.clone());
                         }
                     }
                     "ver" => {
@@ -207,7 +207,7 @@ pub(crate) fn parse_http_check_directive(
                     "hdr" | "hdr-lf" => {
                         if i + 2 < tokens.len() {
                             let hname = tokens[i + 1].text.clone();
-                            let hval = unescape_string(&tokens[i + 2].text);
+                            let hval = tokens[i + 2].text.clone();
                             headers.push((hname, hval));
                             i += 2;
                         }
@@ -215,7 +215,7 @@ pub(crate) fn parse_http_check_directive(
                     "body" | "body-lf" => {
                         i += 1;
                         if i < tokens.len() {
-                            body = Some(unescape_string(&tokens[i].text));
+                            body = Some(tokens[i].text.clone());
                         }
                     }
                     other => {
@@ -309,7 +309,7 @@ pub(crate) fn parse_http_check_directive(
                             "http-check expect rstatus requires regex pattern",
                         ));
                     }
-                    HttpCheckExpectPattern::RStatus(unescape_string(&tokens[i].text))
+                    HttpCheckExpectPattern::RStatus(tokens[i].text.clone())
                 }
                 "string" => {
                     i += 1;
@@ -320,7 +320,7 @@ pub(crate) fn parse_http_check_directive(
                             "http-check expect string requires pattern",
                         ));
                     }
-                    HttpCheckExpectPattern::String(unescape_string(&tokens[i].text))
+                    HttpCheckExpectPattern::String(tokens[i].text.clone())
                 }
                 "rstring" => {
                     i += 1;
@@ -331,7 +331,7 @@ pub(crate) fn parse_http_check_directive(
                             "http-check expect rstring requires regex pattern",
                         ));
                     }
-                    HttpCheckExpectPattern::RString(unescape_string(&tokens[i].text))
+                    HttpCheckExpectPattern::RString(tokens[i].text.clone())
                 }
                 "hdr" | "fhdr" => {
                     let is_fhdr = pat_name == "fhdr";
@@ -353,7 +353,7 @@ pub(crate) fn parse_http_check_directive(
                                     }
                                 }
                                 if i < tokens.len() {
-                                    name = unescape_string(&tokens[i].text);
+                                    name = tokens[i].text.clone();
                                 }
                             }
                             "-m" => {
@@ -372,7 +372,7 @@ pub(crate) fn parse_http_check_directive(
                                     }
                                 }
                                 if i < tokens.len() {
-                                    value = Some(unescape_string(&tokens[i].text));
+                                    value = Some(tokens[i].text.clone());
                                 }
                             }
                             _ => {}
@@ -544,7 +544,7 @@ pub(crate) fn parse_tcp_check_directive(
                     "tcp-check send requires data",
                 ));
             }
-            let data = unescape_string(&tokens[2].text).into_bytes();
+            let data = tokens[2].text.clone().into_bytes();
             rules.push(TcpCheckAction::Send(data));
             Ok(())
         }
@@ -595,7 +595,7 @@ pub(crate) fn parse_tcp_check_directive(
                 if token_text == "comment" {
                     i += 1;
                     if i < tokens.len() {
-                        comment = Some(unescape_string(&tokens[i].text));
+                        comment = Some(tokens[i].text.clone());
                     }
                     i += 1;
                     continue;
@@ -611,7 +611,7 @@ pub(crate) fn parse_tcp_check_directive(
                     "string" => {
                         i += 1;
                         if i < tokens.len() {
-                            pattern = Some(TcpCheckExpectPattern::String(unescape_string(&tokens[i].text)));
+                            pattern = Some(TcpCheckExpectPattern::String(tokens[i].text.clone()));
                         }
                     }
                     "binary" => {
@@ -626,7 +626,7 @@ pub(crate) fn parse_tcp_check_directive(
                     "rstring" => {
                         i += 1;
                         if i < tokens.len() {
-                            pattern = Some(TcpCheckExpectPattern::RString(unescape_string(&tokens[i].text)));
+                            pattern = Some(TcpCheckExpectPattern::RString(tokens[i].text.clone()));
                         }
                     }
                     "error-status" | "on-error" | "status-code" => {

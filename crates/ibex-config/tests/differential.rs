@@ -930,9 +930,9 @@ defaults
     let unsupp_rst = parse_config("global\n\ttune.h2.fe.max-rst-at-once 20\n").unwrap_err();
     assert!(unsupp_rst.message.contains("tune.h2.fe.max-rst-at-once"));
 
-    
-    let unsupp_log_fmt = parse_config("frontend fe\n\tbind 127.0.0.1:80\n\tlog-format %ci:%cp\n").unwrap_err();
-    assert!(unsupp_log_fmt.message.contains("log-format"));
+    // `log-format` is implemented since T53; `log-format-sd` still is not.
+    let unsupp_log_fmt = parse_config("frontend fe\n\tbind 127.0.0.1:80\n\tlog-format-sd %ci:%cp\n").unwrap_err();
+    assert!(unsupp_log_fmt.message.contains("log-format-sd"));
 }
 
 

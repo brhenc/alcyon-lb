@@ -155,13 +155,22 @@ pub(crate) fn parse_defaults_directive(
             parse_tcp_check_directive(&mut defaults.tcp_checks, tokens, kw)?;
             Ok(())
         }
-        "log-format" | "log-format-sd" => {
-            Err(ConfigError::new(
-                kw.line,
-                kw.col,
-                format!("'{}' is not supported", kw.text),
-            ))
+        "log-format" => {
+            defaults.log_format = Some(LogFormatSpec::Custom(parse_format_arg(tokens, kw)?));
+            Ok(())
         }
+        "log-format-sd" => Err(ConfigError::new(kw.line, kw.col, "'log-format-sd' is not implemented".to_string())),
+        "unique-id-format" => {
+            defaults.unique_id_format = Some(parse_format_arg(tokens, kw)?);
+            Ok(())
+        }
+        "unique-id-header" => match tokens.get(1) {
+            Some(t) => {
+                defaults.unique_id_header = Some(t.text.clone());
+                Ok(())
+            }
+            None => Err(ConfigError::new(kw.line, kw.col, "unique-id-header expects an argument.".to_string())),
+        },
         other if IGNORED_DEFAULTS_KEYWORDS.iter().any(|(k, _)| *k == other) => Ok(()),
         _ => Err(ConfigError::new(
             kw.line,
@@ -178,6 +187,10 @@ pub(crate) fn parse_option_defaults(
     kw: &Token,
 ) -> Result<(), ConfigError> {
     if tokens.len() >= 2 {
+        if let Some(spec) = parse_log_option(tokens, kw) {
+            defaults.log_format = Some(spec?);
+            return Ok(());
+        }
         match tokens[1].text.as_str() {
             "log-health-checks" => {
                 defaults.log_health_checks = true;

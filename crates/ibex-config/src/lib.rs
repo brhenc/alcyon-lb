@@ -25,7 +25,7 @@ pub use ast::{
     ErrorPageSource, FrontendSection, GlobalSection, GlobalSetVar,
     HashPreserveAffinity, HashType,
     HeaderExp, HttpAfterResAction, HttpAfterResRule, HttpReqAction, HttpReqRule, HttpResAction,
-    HttpResRule, HttpReuse, ListenSection, LogConfig, LogFacility, LogLevel, LogSample, LogTarget, Mode, RetriesValue,
+    HeaderCapture, HttpResRule, HttpReuse, ListenSection, LogConfig, LogFormatSpec, LogFacility, LogLevel, LogSample, LogTarget, Mode, RetriesValue,
     Server, StatsConfig,
     StickRule, StickRuleType, StickTableConfigAst, TcpReqConnAction, TcpReqConnRule,
     TcpReqContentAction, TcpReqContentRule, TcpResAction, TcpResContentRule, TcpReqSessionAction, TcpReqSessionRule,

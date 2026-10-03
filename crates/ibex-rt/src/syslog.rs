@@ -289,50 +289,21 @@ impl SyslogTarget {
 /// is a common and quietly incompatible mistake.
 #[must_use]
 pub fn format_rfc3164(pri: u8, tag: &str, hostname: &str, msg: &str) -> String {
-    const MONTHS: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
-
-    let (month, day, hour, minute, second) = local_timestamp();
-    let month_name = MONTHS[(month as usize).saturating_sub(1).min(11)];
-    format!(
-        "<{pri}>{month_name} {day:>2} {hour:02}:{minute:02}:{second:02} \
-         {hostname} {tag}: {msg}"
-    )
-}
-
-/// Civil time from the system clock: (month, day, hour, minute, second).
-///
-/// Computed directly rather than pulled in as a dependency; the proxy needs no more
-/// calendar than this, and `chrono` would be a large addition for one format string.
-fn local_timestamp() -> (u32, u32, u32, u32, u32) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let days = now / 86_400;
-    let secs = now % 86_400;
-    let hour = u32::try_from(secs / 3600).unwrap_or(0);
-    let minute = u32::try_from((secs % 3600) / 60).unwrap_or(0);
-    let second = u32::try_from(secs % 60).unwrap_or(0);
-
-    // Civil-from-days, Howard Hinnant's algorithm, shifted to a March-based year so
-    // the leap day lands at the end and needs no special case.
-    let z = i64::try_from(days).unwrap_or(0) + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let _ = era; // the year is not part of an RFC 3164 timestamp
-    (
-        u32::try_from(month).unwrap_or(1),
-        u32::try_from(day).unwrap_or(1),
-        hour,
-        minute,
-        second,
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0));
+    // Local time, as `HAProxy` prints it (`localtime_r`).
+    let c = crate::localtime::Civil::local(now);
+    // The hostname only when there is one: `HAProxy` sends none unless
+    // `log-send-hostname` is set.
+    let sep = if hostname.is_empty() { "" } else { " " };
+    format!(
+        "<{pri}>{} {:>2} {:02}:{:02}:{:02} {hostname}{sep}{tag}: {msg}",
+        c.month_name(),
+        c.day,
+        c.hour,
+        c.minute,
+        c.second
     )
 }
 
@@ -363,5 +334,35 @@ pub fn sample_admits(sample: &LogSample, cursor: &AtomicU64) -> bool {
             Ok(_) => return in_range,
             Err(seen) => cur = seen,
         }
+    }
+}
+
+#[cfg(test)]
+mod local_time_tests {
+    use super::format_rfc3164;
+    use crate::localtime::Civil;
+
+    /// The header's time is local, as `HAProxy`'s is (`localtime_r`): it printed
+    /// `Oct  3 16:46:00` on a host in +0200 while UTC read 14:46.
+    #[test]
+    fn the_header_carries_local_time() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0));
+        let line = format_rfc3164(134, "t", "h", "m");
+        let c = Civil::local(now);
+        let want = format!("<134>{} {:>2} {:02}:{:02}", c.month_name(), c.day, c.hour, c.minute);
+        // A minute may turn between the two clock reads; the hour and date may not.
+        assert!(line.starts_with(&want[..want.len() - 3]), "{line:?} vs {want:?}");
+    }
+
+    /// Without `log-send-hostname` `HAProxy` puts no hostname in the header:
+    /// `<134>Oct  3 16:46:00 lt[1589592]: A r=...`.
+    #[test]
+    fn no_hostname_means_none_in_the_header() {
+        let line = format_rfc3164(134, "lt[7]", "", "m");
+        // The tag follows the time (`HH:MM:SS `) directly.
+        let at = line.find("lt[7]: m").expect("tag");
+        assert!(line.as_bytes()[at - 1] == b' ' && line.as_bytes()[at - 2].is_ascii_digit(), "{line:?}");
     }
 }

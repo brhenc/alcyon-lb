@@ -31,6 +31,12 @@ pub struct DefaultsSection {
     /// Syslog targets declared in `defaults`, inherited by every proxy that declares none.
     pub logs: Vec<LogConfig>,
     /// `option log-health-checks` in `defaults`.
+    /// `log-format`, or the default chosen by `option httplog` / `option tcplog`.
+    pub log_format: Option<LogFormatSpec>,
+    /// `unique-id-format`: the transaction's unique ID, built when first used.
+    pub unique_id_format: Option<String>,
+    /// `unique-id-header`: the request header the unique ID is sent to the server in.
+    pub unique_id_header: Option<String>,
     pub log_health_checks: bool,
     /// Default TCP request inspection delay.
     pub tcp_req_inspect_delay: Option<Duration>,
@@ -143,6 +149,16 @@ pub struct ListenSection {
     pub log_global: bool,
     /// `option log-health-checks`: log every check whose health counter moved, not only
     /// the transitions between UP and DOWN.
+    /// `log-format`, or the default chosen by `option httplog` / `option tcplog`.
+    pub log_format: Option<LogFormatSpec>,
+    /// `unique-id-format`: the transaction's unique ID, built when first used.
+    pub unique_id_format: Option<String>,
+    /// `unique-id-header`: the request header the unique ID is sent to the server in.
+    pub unique_id_header: Option<String>,
+    /// `capture request header`, in declaration order.
+    pub req_header_captures: Vec<HeaderCapture>,
+    /// `capture response header`, in declaration order.
+    pub res_header_captures: Vec<HeaderCapture>,
     pub log_health_checks: bool,
     /// Client header regex rewrite rules (up to 10).
     pub cliexp: Vec<HeaderExp>,
@@ -255,6 +271,11 @@ impl Default for ListenSection {
             servers: Vec::new(),
             logs: Vec::new(),
             log_global: false,
+            log_format: None,
+            unique_id_format: None,
+            unique_id_header: None,
+            req_header_captures: Vec::new(),
+            res_header_captures: Vec::new(),
             log_health_checks: false,
             cliexp: Vec::new(),
             srvexp: Vec::new(),
@@ -331,6 +352,16 @@ pub struct FrontendSection {
     pub log_global: bool,
     /// `option log-health-checks`: log every check whose health counter moved, not only
     /// the transitions between UP and DOWN.
+    /// `log-format`, or the default chosen by `option httplog` / `option tcplog`.
+    pub log_format: Option<LogFormatSpec>,
+    /// `unique-id-format`: the transaction's unique ID, built when first used.
+    pub unique_id_format: Option<String>,
+    /// `unique-id-header`: the request header the unique ID is sent to the server in.
+    pub unique_id_header: Option<String>,
+    /// `capture request header`, in declaration order.
+    pub req_header_captures: Vec<HeaderCapture>,
+    /// `capture response header`, in declaration order.
+    pub res_header_captures: Vec<HeaderCapture>,
     pub log_health_checks: bool,
     /// Stick table configuration.
     pub stick_table: Option<StickTableConfigAst>,
@@ -386,6 +417,11 @@ impl Default for FrontendSection {
             cliexp: Vec::new(),
             logs: Vec::new(),
             log_global: false,
+            log_format: None,
+            unique_id_format: None,
+            unique_id_header: None,
+            req_header_captures: Vec::new(),
+            res_header_captures: Vec::new(),
             log_health_checks: false,
             stick_table: None,
             stick_rules: Vec::new(),
@@ -419,6 +455,12 @@ pub struct BackendSection {
     pub log_global: bool,
     /// `option log-health-checks`: log every check whose health counter moved, not only
     /// the transitions between UP and DOWN.
+    /// `log-format`, or the default chosen by `option httplog` / `option tcplog`.
+    pub log_format: Option<LogFormatSpec>,
+    /// `unique-id-format`: the transaction's unique ID, built when first used.
+    pub unique_id_format: Option<String>,
+    /// `unique-id-header`: the request header the unique ID is sent to the server in.
+    pub unique_id_header: Option<String>,
     pub log_health_checks: bool,
     /// Operating mode (tcp, http, health).
     pub mode: Mode,
@@ -502,6 +544,9 @@ impl Default for BackendSection {
             name: String::new(),
             logs: Vec::new(),
             log_global: false,
+            log_format: None,
+            unique_id_format: None,
+            unique_id_header: None,
             log_health_checks: false,
             mode: Mode::Tcp,
             disabled: false,

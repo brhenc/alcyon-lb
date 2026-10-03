@@ -19,6 +19,11 @@ pub struct Expr {
     pub matcher: Option<Matcher>,
 }
 
+/// `is_idchar` (include/haproxy/tools.h): what a fetch or converter name may contain.
+fn is_idchar(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+' | ':')
+}
+
 impl Expr {
     /// Parses an expression string into an [`Expr`].
     ///
@@ -44,7 +49,7 @@ impl Expr {
         if fetch_name.is_empty()
             || !fetch_name
                 .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
+                .all(is_idchar)
         {
             return Err(format!("Invalid sample fetch name '{fetch_name}'"));
         }
@@ -55,7 +60,7 @@ impl Expr {
             if c_name.is_empty()
                 || !c_name
                     .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
+                    .all(is_idchar)
             {
                 return Err(format!("Invalid converter name '{c_name}'"));
             }
@@ -463,6 +468,16 @@ fn unescape_pattern(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// `is_idchar` (include/haproxy/tools.h): names take `-`, `+` and `:` too --
+    /// `unique-id`, `ssl_c_s_dn`'s siblings, `51d.all`.
+    #[test]
+    fn names_may_contain_haproxy_s_identifier_characters() {
+        assert_eq!(Expr::parse("unique-id").expect("unique-id").fetch_name, "unique-id");
+        assert!(Expr::parse("str(a),my-conv").is_ok());
+        assert!(Expr::parse("bad name").is_err() || Expr::parse("bad name").map(|e| e.fetch_name).as_deref() != Ok("bad name"));
+    }
+
     use super::*;
     use ibex_proto::htx::{HeaderField, HttpMethod, HttpVersion, Htx, HtxBlock, RequestLine};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};

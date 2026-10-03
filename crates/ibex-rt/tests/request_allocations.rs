@@ -131,8 +131,14 @@ fn drive_single_tcp_connection(fe_addr: SocketAddr, engine: &mut Engine) {
         }
         thread::sleep(Duration::from_millis(1));
     }
+    assert_eq!(response, b"PING\n", "the connection was relayed through the backend");
 
-    for _ in 0..5 {
+    // Close, and let the session end here, so that its buffers are back in the pool
+    // before the next connection is measured. (Until T53 a TCP frontend with a
+    // `default_backend` never reached its server, so the session ended with nothing
+    // relayed and this never mattered.)
+    drop(client);
+    for _ in 0..20 {
         let _ = engine.run_once();
         thread::sleep(Duration::from_millis(1));
     }

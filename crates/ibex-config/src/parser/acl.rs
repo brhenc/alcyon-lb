@@ -12,8 +12,7 @@ pub(crate) fn parse_acl(acls: &mut Vec<AclRule>, tokens: &[Token], kw: &Token) -
         ));
     }
     let name = tokens[1].text.clone();
-    let expr_tokens: Vec<&str> = tokens[2..].iter().map(|t| t.text.as_str()).collect();
-    let expr = expr_tokens.join(" ");
+    let expr = tokens[2..].iter().map(|t| expr_word(&t.text)).collect::<Vec<_>>().join(" ");
     acls.push(AclRule { name, expr });
     Ok(())
 }
@@ -59,16 +58,16 @@ pub(crate) fn parse_acl_condition_from_tokens(tokens: &[Token]) -> Result<Option
         };
         if text == "{" {
             let open = &tokens[i];
-            let mut brace_tokens = vec!["{"];
+            let mut brace_tokens = vec![std::borrow::Cow::Borrowed("{")];
             i += 1;
             while i < tokens.len() && tokens[i].text != "}" {
-                brace_tokens.push(tokens[i].text.as_str());
+                brace_tokens.push(expr_word(&tokens[i].text));
                 i += 1;
             }
             if i == tokens.len() {
                 return Err(ConfigError::new(open.line, open.col, "missing closing '}' in condition"));
             }
-            brace_tokens.push("}");
+            brace_tokens.push(std::borrow::Cow::Borrowed("}"));
             i += 1;
             terms.push(AclTerm { negated: bang, name: brace_tokens.join(" ") });
         } else if text.starts_with('{') {
@@ -119,3 +118,23 @@ pub(crate) fn join_tokens_until(tokens: &[Token], start: usize, cond_idx: Option
         .join(" ")
 }
 
+
+/// One config word, as the sample-expression parser will split it back out of the joined
+/// text: quoted, with `\\` and `\"` escaped, when it holds what that parser splits on or
+/// decodes (blanks, quotes, a backslash). The lexer has already applied `parse_line`'s
+/// escapes, so a pattern such as `"a b\r\n"` is these bytes and must stay one word.
+fn expr_word(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.is_empty() && !text.chars().any(|c| c.is_whitespace() || matches!(c, '"' | '\'' | '\\')) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for c in text.chars() {
+        if matches!(c, '"' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    std::borrow::Cow::Owned(out)
+}

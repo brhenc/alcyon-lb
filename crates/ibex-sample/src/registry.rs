@@ -112,8 +112,11 @@ pub struct SampleContext<'a> {
     pub fc_rttvar: Option<u32>,
     pub bc_rtt: Option<u32>,
     pub bc_rttvar: Option<u32>,
-    pub captures_req_hdr: Option<&'a [String]>,
-    pub captures_res_hdr: Option<&'a [String]>,
+    /// Capture slots: `None` where nothing was captured (a header that was absent).
+    pub captures_req_hdr: Option<&'a [Option<String>]>,
+    pub captures_res_hdr: Option<&'a [Option<String>]>,
+    /// The stream's unique ID (`unique-id-format`), for the `unique-id` fetch.
+    pub unique_id: Option<&'a str>,
     pub is_first_req: bool,
     pub vars: Option<&'a HashMap<String, String>>,
     pub timeouts: Option<&'a HashMap<String, u32>>,
@@ -1081,6 +1084,14 @@ impl Registry {
             func: response_payload_fetch,
         });
 
+        // `unique-id` (src/http_fetch.c): the stream's `unique-id-format` value; nothing
+        // when the proxy has no format.
+        self.register_fetch(FetchDesc {
+            name: "unique-id",
+            out_type: SampleType::Str,
+            func: |ctx, _args| ctx.unique_id.map(|u| Sample::Str(u.to_string())),
+        });
+
         // --- 7. Captures ---
         self.register_fetch(FetchDesc {
             name: "capture.req.hdr",
@@ -1089,7 +1100,7 @@ impl Registry {
                 let idx_str = args.first()?;
                 let idx: usize = idx_str.parse().ok()?;
                 let caps = ctx.captures_req_hdr?;
-                caps.get(idx).cloned().map(Sample::Str)
+                caps.get(idx)?.clone().map(Sample::Str)
             },
         });
 
@@ -1100,7 +1111,7 @@ impl Registry {
                 let idx_str = args.first()?;
                 let idx: usize = idx_str.parse().ok()?;
                 let caps = ctx.captures_res_hdr?;
-                caps.get(idx).cloned().map(Sample::Str)
+                caps.get(idx)?.clone().map(Sample::Str)
             },
         });
 
@@ -1806,6 +1817,23 @@ impl Registry {
                     b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]
                 );
                 Some(Sample::Str(s))
+            },
+        });
+        // `smp_fetch_fc_pp_unique_id`: `fc_pp_tlv(PP2_TYPE_UNIQUE_ID)`, first occurrence only.
+        self.register_fetch(FetchDesc {
+            name: "fc_pp_unique_id",
+            out_type: SampleType::Str,
+            func: |ctx, _args| {
+                let mut t = ctx.proxy_tlvs?;
+                while t.len() >= 3 {
+                    let len = usize::from(u16::from_be_bytes([t[1], t[2]]));
+                    let value = t.get(3..3 + len)?;
+                    if t[0] == 0x05 {
+                        return Some(Sample::Str(String::from_utf8_lossy(value).into_owned()));
+                    }
+                    t = &t[3 + len..];
+                }
+                None
             },
         });
         self.register_fetch(FetchDesc {

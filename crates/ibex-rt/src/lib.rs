@@ -21,11 +21,13 @@ pub mod engine;
 pub mod fdtab;
 pub mod lb;
 pub mod listener;
+pub mod localtime;
 pub mod logfmt;
 pub mod syslog;
 pub mod poller;
 pub mod proxy;
 pub mod txn;
+pub mod txnlog;
 pub mod quic_listener;
 pub mod raw;
 pub mod rule_exprs;
@@ -49,7 +51,7 @@ pub use ibex_proto::{
     remove_http_header_with_len, status_reason_phrase,
 };
 pub use listener::Listener;
-pub use logfmt::{LogFormat, LogNames, LogVars};
+pub use logfmt::{format_string, LogData, LogFormat, CLF_HTTP_LOG_FORMAT, CLF_TCP_LOG_FORMAT, DEFAULT_HTTP_LOG_FORMAT, DEFAULT_TCP_LOG_FORMAT};
 pub use syslog::{format_rfc3164, priority, SyslogTarget};
 pub use poller::{Event, Poller};
 pub use proxy::{find_eoh, Ending, TcpSession, Timeouts, Want, Which};

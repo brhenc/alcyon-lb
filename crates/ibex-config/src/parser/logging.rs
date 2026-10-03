@@ -251,3 +251,104 @@ fn parse_log_sample(tok: &Token) -> Result<LogSample, ConfigError> {
     ranges.sort_by_key(|r| *r.start());
     Ok(LogSample { ranges, size })
 }
+
+/// `log-format` / `unique-id-format <fmt>`: exactly one argument (`cfg_parse_listen`).
+pub(crate) fn parse_format_arg(tokens: &[Token], kw: &Token) -> Result<String, ConfigError> {
+    match tokens.len() {
+        0 | 1 => Err(ConfigError::new(kw.line, kw.col, format!("{} expects an argument.", kw.text))),
+        2 => Ok(tokens[1].text.clone()),
+        _ => Err(ConfigError::new(
+            kw.line,
+            kw.col,
+            format!("{} expects only one argument, don't forget to escape spaces!", kw.text),
+        )),
+    }
+}
+
+/// `option httplog [clf]` / `option tcplog [clf]`; `None` for any other option.
+pub(crate) fn parse_log_option(tokens: &[Token], kw: &Token) -> Option<Result<LogFormatSpec, ConfigError>> {
+    let name = tokens.get(1)?.text.as_str();
+    if name == "httpslog" {
+        return Some(Err(ConfigError::new(kw.line, kw.col, "'option httpslog' is not implemented".to_string())));
+    }
+    if name != "httplog" && name != "tcplog" {
+        return None;
+    }
+    let clf = match tokens.get(2).map(|t| t.text.as_str()) {
+        None => false,
+        Some("clf") => true,
+        Some(_) => {
+            return Some(Err(ConfigError::new(kw.line, kw.col, format!("keyword '{name}' only supports option 'clf'."))));
+        }
+    };
+    Some(Ok(if name == "httplog" { LogFormatSpec::Http { clf } } else { LogFormatSpec::Tcp { clf } }))
+}
+
+/// `capture request header <name> len <n>` / `capture response header <name> len <n>`.
+/// `rule_slots` is how many request slots `http-request capture` rules of the section
+/// have taken so far.
+pub(crate) fn parse_capture(
+    req: &mut Vec<HeaderCapture>,
+    res: &mut Vec<HeaderCapture>,
+    rule_slots: usize,
+    tokens: &[Token],
+    kw: &Token,
+) -> Result<(), ConfigError> {
+    let word = |i: usize| tokens.get(i).map_or("", |t| t.text.as_str());
+    let (list, what) = match (word(1), word(2)) {
+        ("request", "header") => (req, "capture request"),
+        ("response", "header") => (res, "capture response"),
+        ("cookie", _) => return Err(ConfigError::new(kw.line, kw.col, "'capture cookie' is not implemented".to_string())),
+        _ => {
+            return Err(ConfigError::new(
+                kw.line,
+                kw.col,
+                "'capture' expects 'cookie' or 'request header' or 'response header'.".to_string(),
+            ))
+        }
+    };
+    if word(3).is_empty() || word(4) != "len" || word(5).is_empty() {
+        return Err(ConfigError::new(kw.line, kw.col, format!("'{what}' expects 'header' <header_name> 'len' <len>.")));
+    }
+    // `atol`: leading digits, 0 without any.
+    let len = word(5).bytes().take_while(u8::is_ascii_digit).fold(0usize, |n, d| n.saturating_mul(10).saturating_add(usize::from(d - b'0')));
+    let slot = if what == "capture request" { list.len() + rule_slots } else { list.len() };
+    list.push(HeaderCapture { name: word(3).to_string(), len, slot });
+    Ok(())
+}
+
+/// The request capture slots `http-request capture` rules (without `id`) have taken.
+pub(crate) fn rule_capture_slots(rules: &[HttpReqRule]) -> usize {
+    rules.iter().filter(|r| matches!(r.action, HttpReqAction::Capture { id: None, .. })).count()
+}
+
+/// `declare capture request|response len <n>`: a slot taken in declaration order, like a
+/// `capture ... header` line's, that only `http-request capture ... id <n>` fills (its
+/// `name` is empty). Anything else after `declare` is ignored, as before.
+pub(crate) fn parse_declare_capture(
+    req: &mut Vec<HeaderCapture>,
+    res: &mut Vec<HeaderCapture>,
+    rule_slots: usize,
+    tokens: &[Token],
+    kw: &Token,
+) -> Result<(), ConfigError> {
+    let word = |i: usize| tokens.get(i).map_or("", |t| t.text.as_str());
+    let (list, offset) = match word(2) {
+        "request" => (req, rule_slots),
+        "response" => (res, 0),
+        _ => {
+            return Err(ConfigError::new(
+                kw.line,
+                kw.col,
+                "'declare capture' requires a direction ('request' or 'response')".to_string(),
+            ))
+        }
+    };
+    if word(3) != "len" || word(4).is_empty() {
+        return Err(ConfigError::new(kw.line, kw.col, "'declare capture' requires a capture length ('len')".to_string()));
+    }
+    let len = word(4).bytes().take_while(u8::is_ascii_digit).fold(0usize, |n, d| n.saturating_mul(10).saturating_add(usize::from(d - b'0')));
+    let slot = list.len() + offset;
+    list.push(HeaderCapture { name: String::new(), len, slot });
+    Ok(())
+}

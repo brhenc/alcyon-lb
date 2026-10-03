@@ -29,7 +29,8 @@ pub struct Line {
 /// Follows `HAProxy` 1.0.2 lexical conventions:
 /// - Comments start with `#` or `;` and continue to the end of the line.
 /// - Whitespace (spaces, tabs, form feeds) separates arguments.
-/// - Backslash `\` escapes the subsequent character so spaces can be embedded in arguments.
+/// - Backslash escapes as `parse_line` reads them: `\ `, `\\`, `\#`, `\'`, `\"`, `\t`, `\n`,
+///   `\r`, `\xHH` outside single quotes; any other backslash is kept.
 /// - Blank lines and comment-only lines are omitted.
 #[must_use]
 pub fn lex(input: &str) -> Vec<Line> {
@@ -98,40 +99,59 @@ fn lex_line(raw_line: &str, line_number: usize) -> Vec<Token> {
 
         // Start of a token (1-based column)
         let token_col = idx + 1;
-        let mut token_text = String::new();
-        let mut escaped = false;
+        // Bytes, not chars: `\xHH` is a byte (see `hex_escapes_are_bytes`).
+        let mut token_text: Vec<u8> = Vec::new();
+        let push = |t: &mut Vec<u8>, c: char| t.extend_from_slice(c.encode_utf8(&mut [0u8; 4]).as_bytes());
         let mut quote_mode = None;
 
         while idx < end_idx {
             let ch = chars[idx];
-            if let Some(q) = quote_mode {
-                if escaped {
-                    escaped = false;
-                    token_text.push(ch);
-                    idx += 1;
-                } else if ch == '\\' {
-                    escaped = true;
-                    if idx + 1 < end_idx && chars[idx + 1] == q {
-                        // Escaped quote: do not push backslash
-                        idx += 1;
-                    } else {
-                        token_text.push(ch);
+            if quote_mode == Some('\'') {
+                // Single quotes take everything literally, backslashes included.
+                if ch == '\'' {
+                    quote_mode = None;
+                } else {
+                    push(&mut token_text, ch);
+                }
+                idx += 1;
+            } else if ch == '\\' && idx + 1 < end_idx {
+                // `parse_line`'s escapes; any other backslash stays, for what follows
+                // to be read as usual (a regex's `\.`).
+                let next = chars[idx + 1];
+                let hex = |i: usize| chars.get(i).and_then(|c| c.to_digit(16)).filter(|_| i < end_idx);
+                match next {
+                    ' ' | '\\' | '#' | '\'' | '"' => {
+                        push(&mut token_text, next);
+                        idx += 2;
+                    }
+                    '$' if quote_mode == Some('"') => {
+                        push(&mut token_text, next);
+                        idx += 2;
+                    }
+                    't' | 'n' | 'r' => {
+                        token_text.push(match next {
+                            't' => b'\t',
+                            'n' => b'\n',
+                            _ => b'\r',
+                        });
+                        idx += 2;
+                    }
+                    'x' if hex(idx + 2).is_some() && hex(idx + 3).is_some() => {
+                        let byte = hex(idx + 2).unwrap_or(0) * 16 + hex(idx + 3).unwrap_or(0);
+                        token_text.push(u8::try_from(byte).unwrap_or(0));
+                        idx += 4;
+                    }
+                    _ => {
+                        push(&mut token_text, ch);
                         idx += 1;
                     }
-                } else if ch == q {
-                    quote_mode = None;
-                    idx += 1;
-                } else {
-                    token_text.push(ch);
-                    idx += 1;
                 }
-            } else if escaped {
-                escaped = false;
-                token_text.push(ch);
-                idx += 1;
-            } else if ch == '\\' {
-                escaped = true;
-                token_text.push(ch);
+            } else if quote_mode == Some('"') {
+                if ch == '"' {
+                    quote_mode = None;
+                } else {
+                    push(&mut token_text, ch);
+                }
                 idx += 1;
             } else if ch == '"' || ch == '\'' {
                 quote_mode = Some(ch);
@@ -139,13 +159,13 @@ fn lex_line(raw_line: &str, line_number: usize) -> Vec<Token> {
             } else if is_haproxy_space(ch) {
                 break;
             } else {
-                token_text.push(ch);
+                push(&mut token_text, ch);
                 idx += 1;
             }
         }
 
         tokens.push(Token {
-            text: token_text,
+            text: String::from_utf8_lossy(&token_text).into_owned(),
             line: line_number,
             col: token_col,
         });
@@ -163,6 +183,37 @@ fn is_haproxy_space(ch: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `parse_line` (src/tools.c): outside single quotes `\ `, `\\`, `\#`, `\'` and `\"`
+    /// give the character, `\t` `\n` `\r` and `\xHH` their byte; any other backslash
+    /// stays (a regex's `\.`). Single quotes take everything literally.
+    #[test]
+    fn backslash_escapes_are_haproxy_s() {
+        let toks = |s: &str| lex(s).remove(0).tokens.into_iter().map(|t| t.text).collect::<Vec<_>>();
+        assert_eq!(toks(r#"k a\ b\"c\\d\#e\.f\x41\tg"#), ["k", "a b\"c\\d#e\\.fA\tg"]);
+        assert_eq!(toks(r#"k "q\"x\\y\.z" 's\"t'"#), ["k", "q\"x\\y\\.z", "s\\\"t"]);
+        assert_eq!(toks(r#"k {\"dip\":\"%fi\"}"#), ["k", "{\"dip\":\"%fi\"}"]);
+    }
+
+    /// `\xHH` is a byte, not a character: bytes that make UTF-8 together make the
+    /// character, and a byte that does not is U+FFFD (a token is a `String`). The json
+    /// converter's `utf8` modes (converter/json.vtc: `str(\xE0),json(utf8)` is empty)
+    /// tell a bad sequence by that.
+    /// `\$` escapes the `$` inside double quotes only (where `$` would expand a
+    /// variable); outside them the backslash stays (checks/redis-check.vtc matches
+    /// `"*1\r\n\$4\r\nPING\r\n"`).
+    #[test]
+    fn a_dollar_is_escaped_inside_double_quotes_only() {
+        let toks = |s: &str| lex(s).remove(0).tokens.into_iter().map(|t| t.text).collect::<Vec<_>>();
+        assert_eq!(toks(r#"k "\$4\r" a\$b"#), ["k", "$4\r", "a\\$b"]);
+    }
+
+    #[test]
+    fn hex_escapes_are_bytes() {
+        let toks = |s: &str| lex(s).remove(0).tokens.into_iter().map(|t| t.text).collect::<Vec<_>>();
+        assert_eq!(toks(r#"k a\xC3\xA9b"#), ["k", "a\u{e9}b"]);
+        assert_eq!(toks(r#"k "-\xE0-" \r"#), ["k", "-\u{FFFD}-", "\r"]);
+    }
 
     #[test]
     fn test_lex_basic() {
@@ -211,8 +262,9 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].tokens.len(), 3);
         assert_eq!(lines[0].tokens[0].text, "cliexp");
-        assert_eq!(lines[0].tokens[1].text, "^(Host:\\ [^:]*).*");
-        assert_eq!(lines[0].tokens[2].text, "Host:\\ \\1:80");
+        // `\ ` is a space (`parse_line`); `\1`, not an escape, keeps its backslash.
+        assert_eq!(lines[0].tokens[1].text, "^(Host: [^:]*).*");
+        assert_eq!(lines[0].tokens[2].text, "Host: \\1:80");
     }
 
     #[test]
@@ -248,7 +300,8 @@ http-request return status 200 content-type "text/plain" lf-string "OK\n" if { p
         assert_eq!(lines[1].tokens[4].text, "content-type");
         assert_eq!(lines[1].tokens[5].text, "text/plain");
         assert_eq!(lines[1].tokens[6].text, "lf-string");
-        assert_eq!(lines[1].tokens[7].text, "OK\\n");
+        // `\n` is a newline, inside double quotes too (`parse_line`).
+        assert_eq!(lines[1].tokens[7].text, "OK\n");
         assert_eq!(lines[1].tokens[8].text, "if");
         assert_eq!(lines[1].tokens[9].text, "{");
         assert_eq!(lines[1].tokens[10].text, "path");

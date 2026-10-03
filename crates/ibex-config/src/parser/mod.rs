@@ -15,7 +15,7 @@ use crate::ast::{
     DefaultServerConfig, DefaultsSection, ErrorPageSource, FrontendSection, GlobalSection,
     GlobalSetVar, HashPreserveAffinity, HashType, HttpAfterResAction, HttpAfterResRule, HttpCheckAction, HttpCheckExpectPattern,
     HttpChkConfig, HttpReqAction, HttpReqRule, HttpResAction, HttpResRule, HttpReuse, RetriesValue,
-    ListenSection, LogConfig, LogFacility, LogLevel, LogTarget, MatchType, Mode,
+    HeaderCapture, ListenSection, LogConfig, LogFacility, LogFormatSpec, LogLevel, LogTarget, MatchType, Mode,
     MysqlCheckVersion, ProtoCheckConfig, ResolvedCheckConfig, ResolvedHttpCheck,
     ResolvedHttpExpectPattern, ResolvedHttpExpectRule, ResolvedTcpStep, Server, StatsConfig,
     StickRule, StickRuleType, StickTableConfigAst, TcpCheckAction, TcpCheckExpectPattern,

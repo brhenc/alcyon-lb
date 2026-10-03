@@ -5,6 +5,27 @@
 #[allow(unused_imports)]
 use super::*;
 
+/// The format a proxy's per-transaction log lines use: its own `log-format`, or one of
+/// `HAProxy`'s defaults chosen by `option httplog` / `option tcplog` (with `clf`, the
+/// Common Log Format variant). The last of these in a section wins, as in `HAProxy`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogFormatSpec {
+    Custom(String),
+    Http { clf: bool },
+    Tcp { clf: bool },
+}
+
+/// `capture request header <name> len <n>` / `capture response header ...`: a slot whose
+/// value `%hr`/`%hs` print and `capture.req.hdr(<n>)` fetches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeaderCapture {
+    pub name: String,
+    pub len: usize,
+    /// Its index among the section's capture slots, which `capture request header` and
+    /// `http-request capture` (without `id`) take in declaration order.
+    pub slot: usize,
+}
+
 /// Syslog destination configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogConfig {

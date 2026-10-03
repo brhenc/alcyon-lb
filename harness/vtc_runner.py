@@ -709,6 +709,21 @@ class ExpectationResult:
     error_message: Optional[str] = None
 
 
+def worker_pid(master: int, timeout: float = 2.0) -> int:
+    """The first child of a master-worker HAProxy, once it has forked one."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with open(f"/proc/{master}/task/{master}/children") as f:
+                kids = f.read().split()
+            if kids:
+                return int(kids[0])
+        except OSError:
+            pass
+        time.sleep(0.01)
+    return master
+
+
 def decode_escapes(s: str) -> str:
     """Safely decode common escape sequences without double unescaping."""
     return s.replace("\\n", "\n").replace("\\r", "\r").replace("\\t", "\t")
@@ -741,6 +756,35 @@ def evaluate_expectation(*args, **kwargs) -> "ExpectationResult":
     return _evaluate_expectation(*args, **kwargs)
 
 
+def _expect_field(expr: str, resp: Optional["HttpResponse"], req: Optional["HttpRequest"]):
+    """(known, value) for an expectation target such as `resp.status` or `req.http.x`."""
+    if expr == "resp.status":
+        return True, str(resp.status) if resp else None
+    if expr == "resp.reason":
+        return True, resp.reason if resp else None
+    if expr == "resp.proto":
+        return True, resp.proto if resp else None
+    if expr.startswith("resp.http."):
+        return True, resp.get_header(expr[len("resp.http."):]) if resp else None
+    if expr == "resp.body":
+        return True, resp.body.decode("latin1", errors="replace") if resp else None
+    if expr == "resp.bodylen":
+        return True, str(len(resp.body)) if resp else "0"
+    if expr == "req.method":
+        return True, req.method if req else None
+    if expr == "req.url":
+        return True, req.url if req else None
+    if expr == "req.proto":
+        return True, req.proto if req else None
+    if expr.startswith("req.http."):
+        return True, req.get_header(expr[len("req.http."):]) if req else None
+    if expr == "req.body":
+        return True, req.body.decode("latin1", errors="replace") if req else None
+    if expr == "req.bodylen":
+        return True, str(len(req.body)) if req else "0"
+    return False, None
+
+
 def _evaluate_expectation(
     expr: str,
     op: str,
@@ -756,39 +800,9 @@ def _evaluate_expectation(
         exp_clean = exp_clean[1:-1]
     exp_clean = decode_escapes(exp_clean)
 
-    actual_val: Optional[str] = None
     is_undef_check = exp_clean == "<undef>"
-
-    # 1. Response expectations
-    if expr == "resp.status":
-        actual_val = str(resp.status) if resp else None
-    elif expr == "resp.reason":
-        actual_val = resp.reason if resp else None
-    elif expr == "resp.proto":
-        actual_val = resp.proto if resp else None
-    elif expr.startswith("resp.http."):
-        hdr_name = expr[len("resp.http."):]
-        actual_val = resp.get_header(hdr_name) if resp else None
-    elif expr == "resp.body":
-        actual_val = resp.body.decode("latin1", errors="replace") if resp else None
-    elif expr == "resp.bodylen":
-        actual_val = str(len(resp.body)) if resp else "0"
-
-    # 2. Request expectations
-    elif expr == "req.method":
-        actual_val = req.method if req else None
-    elif expr == "req.url":
-        actual_val = req.url if req else None
-    elif expr == "req.proto":
-        actual_val = req.proto if req else None
-    elif expr.startswith("req.http."):
-        hdr_name = expr[len("req.http."):]
-        actual_val = req.get_header(hdr_name) if req else None
-    elif expr == "req.body":
-        actual_val = req.body.decode("latin1", errors="replace") if req else None
-    elif expr == "req.bodylen":
-        actual_val = str(len(req.body)) if req else "0"
-    else:
+    known, actual_val = _expect_field(expr, resp, req)
+    if not known:
         return ExpectationResult(
             passed=False,
             expr=expr,
@@ -797,6 +811,11 @@ def _evaluate_expectation(
             actual=None,
             error_message=f"Unsupported expectation target: {expr}",
         )
+    # vtest resolves the right-hand side the same way (`cmd_var_resolve`):
+    # `expect resp.http.a == resp.http.b` compares two headers.
+    rhs_known, rhs_val = _expect_field(exp_clean, resp, req)
+    if rhs_known and rhs_val is not None:
+        exp_clean = rhs_val
 
     # 3. Perform comparison
     passed = False
@@ -1979,8 +1998,14 @@ class VtcExecutor:
                         block, self.macro_engine, haproxy_id
                     )
 
-                    cfg_path = os.path.join(self.tmpdir, f"haproxy_{haproxy_id}_{len(self.temp_cfgs)}.cfg")
+                    # vtest writes `<tmpdir>/<id>/cfg` with three lines of its own (a
+                    # `global` with two `stats socket`s) ahead of the test's block, and
+                    # `last_rule_file`/`last_rule_line` reg-tests assert both. Three comment
+                    # lines keep every line number where vtest's are, for any binary.
+                    os.makedirs(os.path.join(self.tmpdir, haproxy_id), exist_ok=True)
+                    cfg_path = os.path.join(self.tmpdir, haproxy_id, "cfg")
                     with open(cfg_path, "w") as f:
+                        f.write("# vtc_runner: vtest's three-line prelude would be here\n#\n#\n")
                         f.write(rewritten_cfg)
                         if not rewritten_cfg.endswith("\n"):
                             f.write("\n")
@@ -2022,7 +2047,8 @@ class VtcExecutor:
                             # `${h1_pid}` appears in every syslog assertion in the
                             # health-check reg-tests, which anchor on the `tag[pid]:`
                             # prefix to prove the line came from the proxy under test.
-                            self.macro_engine.set(f"{haproxy_id}_pid", str(proc.pid))
+                            # Under `-W` that is the worker's pid, not the master's.
+                            self.macro_engine.set(f"{haproxy_id}_pid", str(worker_pid(proc.pid) if mw else proc.pid))
                             if self.verbose:
                                 print(f"     {Color.DIM}[haproxy {haproxy_id}] started (pid {proc.pid}) ports={list(alloc_ports.values())}{Color.RESET}")
 

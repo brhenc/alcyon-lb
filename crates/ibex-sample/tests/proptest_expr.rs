@@ -632,3 +632,20 @@ fn test_bare_non_numeric_converter_args_rejected() {
 }
 
 
+
+/// `fc_pp_unique_id` is `fc_pp_tlv(0x05)`'s first occurrence, as a string
+/// (`smp_fetch_fc_pp_unique_id`, src/connection.c).
+#[test]
+fn fc_pp_unique_id_is_the_first_unique_id_tlv() {
+    let reg = sample_registry();
+    let mut tlvs = vec![0x01, 0x00, 0x01, b'x'];
+    tlvs.extend_from_slice(&[0x05, 0x00, 0x03]);
+    tlvs.extend_from_slice(b"one");
+    tlvs.extend_from_slice(&[0x05, 0x00, 0x03]);
+    tlvs.extend_from_slice(b"two");
+    let ctx = SampleContext { proxy_tlvs: Some(&tlvs), ..Default::default() };
+    let expr = Expr::parse("fc_pp_unique_id").unwrap();
+    assert_eq!(expr.eval_all_samples(reg, &ctx), [Sample::Str("one".into())]);
+    let none = SampleContext { proxy_tlvs: Some(&[0x01, 0x00, 0x00]), ..Default::default() };
+    assert!(expr.eval_all_samples(reg, &none).is_empty());
+}

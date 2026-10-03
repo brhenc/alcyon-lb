@@ -83,6 +83,11 @@ pub(crate) fn parse_listen_header(
         logs: defaults.map_or_else(Vec::new, |d| d.logs.clone()),
         log_tag: defaults.and_then(|d| d.log_tag.clone()),
         log_global: defaults.map_or(false, |d| d.log_global),
+        log_format: defaults.and_then(|d| d.log_format.clone()),
+        unique_id_format: defaults.and_then(|d| d.unique_id_format.clone()),
+        unique_id_header: defaults.and_then(|d| d.unique_id_header.clone()),
+        req_header_captures: Vec::new(),
+        res_header_captures: Vec::new(),
         log_health_checks: defaults.map_or(false, |d| d.log_health_checks),
         cliexp: Vec::new(),
         srvexp: Vec::new(),
@@ -167,6 +172,11 @@ pub(crate) fn parse_frontend_header(
         logs: defaults.map_or_else(Vec::new, |d| d.logs.clone()),
         log_tag: defaults.and_then(|d| d.log_tag.clone()),
         log_global: defaults.map_or(false, |d| d.log_global),
+        log_format: defaults.and_then(|d| d.log_format.clone()),
+        unique_id_format: defaults.and_then(|d| d.unique_id_format.clone()),
+        unique_id_header: defaults.and_then(|d| d.unique_id_header.clone()),
+        req_header_captures: Vec::new(),
+        res_header_captures: Vec::new(),
         log_health_checks: defaults.map_or(false, |d| d.log_health_checks),
         stick_table: None,
         stick_rules: Vec::new(),
@@ -231,6 +241,9 @@ pub(crate) fn parse_backend_header(
         logs: defaults.map_or_else(Vec::new, |d| d.logs.clone()),
         log_tag: defaults.and_then(|d| d.log_tag.clone()),
         log_global: defaults.map_or(false, |d| d.log_global),
+        log_format: defaults.and_then(|d| d.log_format.clone()),
+        unique_id_format: defaults.and_then(|d| d.unique_id_format.clone()),
+        unique_id_header: defaults.and_then(|d| d.unique_id_header.clone()),
         log_health_checks: defaults.map_or(false, |d| d.log_health_checks),
         mode,
         disabled: false,
@@ -322,6 +335,10 @@ pub(crate) fn parse_listen_directive(
         "default_backend" => parse_default_backend(&mut proxy.default_backend, tokens, kw),
         "option" => parse_option_listen(proxy, tokens, kw),
         "no" => parse_no_directive(tokens, kw),
+        "declare" if tokens.get(1).is_some_and(|t| t.text == "capture") => {
+            let rule_slots = rule_capture_slots(&proxy.http_req_rules);
+            parse_declare_capture(&mut proxy.req_header_captures, &mut proxy.res_header_captures, rule_slots, tokens, kw)
+        }
         "declare" => parse_declare(tokens, kw),
         "bind" => parse_listen_bind(proxy, tokens, kw),
         "accept-proxy" => {
@@ -384,12 +401,25 @@ pub(crate) fn parse_listen_directive(
         "errorfile" | "errorfiles" | "http-error" => {
             parse_proxy_error_page(&mut proxy.error_files, &mut proxy.error_replies, tokens, kw)
         }
-        "log-format" | "log-format-sd" => {
-            Err(ConfigError::new(
-                kw.line,
-                kw.col,
-                format!("'{}' is not supported", kw.text),
-            ))
+        "log-format" => {
+            proxy.log_format = Some(LogFormatSpec::Custom(parse_format_arg(tokens, kw)?));
+            Ok(())
+        }
+        "log-format-sd" => Err(ConfigError::new(kw.line, kw.col, "'log-format-sd' is not implemented".to_string())),
+        "unique-id-format" => {
+            proxy.unique_id_format = Some(parse_format_arg(tokens, kw)?);
+            Ok(())
+        }
+        "unique-id-header" => match tokens.get(1) {
+            Some(t) => {
+                proxy.unique_id_header = Some(t.text.clone());
+                Ok(())
+            }
+            None => Err(ConfigError::new(kw.line, kw.col, "unique-id-header expects an argument.".to_string())),
+        },
+        "capture" => {
+            let rule_slots = rule_capture_slots(&proxy.http_req_rules);
+            parse_capture(&mut proxy.req_header_captures, &mut proxy.res_header_captures, rule_slots, tokens, kw)
         }
         other => Err(ConfigError::new(
             kw.line,
@@ -434,6 +464,10 @@ pub(crate) fn parse_frontend_directive(
         }
         "option" => parse_option_frontend(fe, tokens, kw),
         "no" => parse_no_directive(tokens, kw),
+        "declare" if tokens.get(1).is_some_and(|t| t.text == "capture") => {
+            let rule_slots = rule_capture_slots(&fe.http_req_rules);
+            parse_declare_capture(&mut fe.req_header_captures, &mut fe.res_header_captures, rule_slots, tokens, kw)
+        }
         "declare" => parse_declare(tokens, kw),
         "clitimeout" => parse_clitimeout(kw),
         "contimeout" => parse_contimeout(kw),
@@ -465,12 +499,25 @@ pub(crate) fn parse_frontend_directive(
         "errorfile" | "errorfiles" | "http-error" => {
             parse_proxy_error_page(&mut fe.error_files, &mut fe.error_replies, tokens, kw)
         }
-        "log-format" | "log-format-sd" => {
-            Err(ConfigError::new(
-                kw.line,
-                kw.col,
-                format!("'{}' is not supported", kw.text),
-            ))
+        "log-format" => {
+            fe.log_format = Some(LogFormatSpec::Custom(parse_format_arg(tokens, kw)?));
+            Ok(())
+        }
+        "log-format-sd" => Err(ConfigError::new(kw.line, kw.col, "'log-format-sd' is not implemented".to_string())),
+        "unique-id-format" => {
+            fe.unique_id_format = Some(parse_format_arg(tokens, kw)?);
+            Ok(())
+        }
+        "unique-id-header" => match tokens.get(1) {
+            Some(t) => {
+                fe.unique_id_header = Some(t.text.clone());
+                Ok(())
+            }
+            None => Err(ConfigError::new(kw.line, kw.col, "unique-id-header expects an argument.".to_string())),
+        },
+        "capture" => {
+            let rule_slots = rule_capture_slots(&fe.http_req_rules);
+            parse_capture(&mut fe.req_header_captures, &mut fe.res_header_captures, rule_slots, tokens, kw)
         }
         other => Err(ConfigError::new(
             kw.line,
@@ -580,13 +627,23 @@ pub(crate) fn parse_backend_directive(
         "errorfile" | "errorfiles" | "http-error" => {
             parse_proxy_error_page(&mut be.error_files, &mut be.error_replies, tokens, kw)
         }
-        "log-format" | "log-format-sd" => {
-            Err(ConfigError::new(
-                kw.line,
-                kw.col,
-                format!("'{}' is not supported", kw.text),
-            ))
+        // Ignored in backends, as `HAProxy` ignores it ("'log-format' directive is ignored
+        // in backends"): a backend's transactions log through their frontend.
+        "log-format" => parse_format_arg(tokens, kw).map(|_| ()),
+        "log-format-sd" => Err(ConfigError::new(kw.line, kw.col, "'log-format-sd' is not implemented".to_string())),
+        "unique-id-format" => {
+            be.unique_id_format = Some(parse_format_arg(tokens, kw)?);
+            Ok(())
         }
+        "unique-id-header" => match tokens.get(1) {
+            Some(t) => {
+                be.unique_id_header = Some(t.text.clone());
+                Ok(())
+            }
+            None => Err(ConfigError::new(kw.line, kw.col, "unique-id-header expects an argument.".to_string())),
+        },
+        // `HAProxy`: "'capture' ignored because backend has no frontend capability".
+        "capture" => parse_capture(&mut Vec::new(), &mut Vec::new(), 0, tokens, kw),
         other => Err(ConfigError::new(
             kw.line,
             kw.col,
@@ -714,6 +771,10 @@ pub(crate) fn parse_option_listen(
     kw: &Token,
 ) -> Result<(), ConfigError> {
     if tokens.len() >= 2 {
+        if let Some(spec) = parse_log_option(tokens, kw) {
+            proxy.log_format = Some(spec?);
+            return Ok(());
+        }
         match tokens[1].text.as_str() {
             "forwardfor" => {
                 let except = if tokens.len() >= 4 && tokens[2].text == "except" {
@@ -760,6 +821,10 @@ pub(crate) fn parse_option_frontend(
     kw: &Token,
 ) -> Result<(), ConfigError> {
     if tokens.len() >= 2 {
+        if let Some(spec) = parse_log_option(tokens, kw) {
+            fe.log_format = Some(spec?);
+            return Ok(());
+        }
         match tokens[1].text.as_str() {
             "forwardfor" => {
                 let except = if tokens.len() >= 4 && tokens[2].text == "except" {
@@ -796,6 +861,11 @@ pub(crate) fn parse_option_backend(
     kw: &Token,
 ) -> Result<(), ConfigError> {
     if tokens.len() >= 2 {
+        // Ignored in backends, as `HAProxy` ignores it ("'option httplog' directive is
+        // ignored in backends").
+        if let Some(spec) = parse_log_option(tokens, kw) {
+            return spec.map(|_| ());
+        }
         match tokens[1].text.as_str() {
             "forwardfor" => {
                 let except = if tokens.len() >= 4 && tokens[2].text == "except" {

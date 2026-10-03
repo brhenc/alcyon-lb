@@ -172,7 +172,8 @@ pub struct TcpSession {
     pub res_inspect_armed: Option<Option<u32>>,
     pub sess_vars: HashMap<String, String>,
     pub req_vars: HashMap<String, String>,
-    pub req_captures: Vec<String>,
+    /// What this stream measured for its log line, and its captures and unique ID.
+    pub log: crate::txnlog::StreamLog,
     pub tracked_sc: [Option<(usize, StickKey)>; 3],
     pub bufsize: usize,
     pub maxrewrite: usize,
@@ -180,6 +181,9 @@ pub struct TcpSession {
     pub h2_active_stream_id: Option<u32>,
     pub h2_flood_config: ibex_proto::H2FloodConfig,
     pub is_first_req: bool,
+    /// Keep each request line for the log (`txn->uri`): set when a format of the
+    /// frontend reads it, so a frontend that does not log it does not pay for a copy.
+    pub keep_request_line: bool,
 }
 
 impl TcpSession {
@@ -270,12 +274,13 @@ impl TcpSession {
             res_inspect_armed: None,
             sess_vars: HashMap::new(),
             req_vars: HashMap::new(),
-            req_captures: Vec::new(),
+            log: crate::txnlog::StreamLog::start(0, 0),
             tracked_sc: [None, None, None],
             h2_ctx: None,
             h2_active_stream_id: None,
             h2_flood_config: ibex_proto::H2FloodConfig::default(),
             is_first_req: true,
+            keep_request_line: false,
         };
         s.arm_client(now);
         s
@@ -375,6 +380,7 @@ impl TcpSession {
 
     /// Attaches a server-side connection with a specific transport (`ServerXprt`).
     pub fn attach_server_with_xprt(&mut self, fd: OwnedFd, xprt: ServerXprt, now: Tick) {
+        self.log.queue.get_or_insert_with(std::time::Instant::now);
         self.srv = Some(fd);
         self.srv_xprt = xprt;
         self.srv_cant_recv = false;
@@ -395,6 +401,7 @@ impl TcpSession {
         };
         self.conn_exp = Tick::ETERNITY;
         self.arm_server(now);
+        self.log.connect = Some(std::time::Instant::now());
         // `AN_RES_INSPECT` runs from here, before any of the response has arrived.
         if let Some(delay) = self.res_inspect_armed.take() {
             self.res_inspect_pending = true;
@@ -589,6 +596,7 @@ impl TcpSession {
     /// Clears what belonged to the transaction that just ended, so the next request on
     /// this connection starts from nothing. The one place that list lives.
     pub fn reset_for_next_request(&mut self) {
+        self.log = crate::txnlog::StreamLog::start(self.bytes_in, self.bytes_out);
         self.txn = None;
         self.req_method = None;
         self.req_uri = None;
@@ -614,6 +622,7 @@ impl TcpSession {
     /// The request cannot be parsed. It is answered with `status` -- by the engine, which
     /// has the error pages -- and the connection closes; nothing more is read from it.
     fn fail_request(&mut self, status: u16) {
+        self.log.term = Some(*b"PR");
         self.req.clear();
         self.txn = Some(HttpTxn::failed(status));
         self.cli_state = ScState::ShutR;
@@ -706,6 +715,7 @@ impl TcpSession {
                         let h2 = self.h2_ctx.as_mut().unwrap();
                         let _ = MuxH2.parse(h2, &raw_buf[..n])?;
                         self.bytes_in += n as u64;
+                        self.log.first_byte_now();
                         changed = true;
                     }
                     Io::Done(_) | Io::WouldBlock => {}
@@ -737,6 +747,7 @@ impl TcpSession {
                     Io::Done(n) if n > 0 => {
                         self.req.commit(n);
                         self.bytes_in += n as u64;
+                        self.log.first_byte_now();
                         changed = true;
                     }
                     Io::Done(_) | Io::WouldBlock => {}
@@ -922,6 +933,15 @@ impl TcpSession {
                     self.fail_request(400);
                     return Ok(true);
                 };
+                // `txn->uri`: the request line as received, before any rule rewrites it
+                // (`HAProxy` keeps its first `tune.http.logurilen`, 1024, bytes).
+                self.log.request = Some(std::time::Instant::now());
+                if self.keep_request_line {
+                    let head = &self.req.readable()[..total_hdr_len];
+                    let line_end = head.iter().position(|&b| b == b'\r' || b == b'\n').unwrap_or(head.len());
+                    let line = String::from_utf8_lossy(&head[..line_end.min(1024)]).into_owned();
+                    self.log.request_line = Some(line);
+                }
 
                 if self.has_htx {
                     let (req_m, req_u, conn_close, wire_replacement) = {
@@ -1291,6 +1311,7 @@ impl TcpSession {
                 }
                 Io::Done(n) if n > 0 => {
                     self.rep.commit(n);
+                    self.log.bytes_from_server += n as u64;
                     changed = true;
                 }
                 Io::Done(_) | Io::WouldBlock => {}

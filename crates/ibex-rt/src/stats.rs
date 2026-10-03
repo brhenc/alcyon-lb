@@ -681,6 +681,7 @@ mod tests {
             accept_proxy_v2: false,
             server_send_proxy: vec![false],
             server_send_proxy_v2: vec![false],
+            server_pp_unique_id: vec![false],
             server_backups: vec![false],
             server_maxconn: vec![None],
             server_actconn: std::sync::Arc::new(vec![std::sync::atomic::AtomicU32::new(0)]),
@@ -702,6 +703,12 @@ mod tests {
             hash_type: ibex_config::HashType::default(),
             hash_preserve_affinity: ibex_config::HashPreserveAffinity::default(),
             chash: std::sync::Arc::default(),
+            log_format: None,
+            unique_id_format: None,
+            unique_id_header: None,
+            req_capture_slots: std::sync::Arc::new([]),
+            res_capture_slots: std::sync::Arc::new([]),
+            log_count: std::sync::Arc::default(),
         };
 
         let csv = format_show_stat(&[proxy], &[], 9999);

@@ -153,6 +153,8 @@ pub struct Proxy {
     pub accept_proxy_v2: bool,
     pub server_send_proxy: Vec<bool>,
     pub server_send_proxy_v2: Vec<bool>,
+    /// `proxy-v2-options unique-id`, per server.
+    pub server_pp_unique_id: Vec<bool>,
     pub server_backups: Vec<bool>,
     pub server_maxconn: Vec<Option<u32>>,
     pub server_actconn: Arc<Vec<AtomicU32>>,
@@ -182,6 +184,20 @@ pub struct Proxy {
     /// `log-tag`, as sent: the tag followed by `[pid]`, which `HAProxy` adds whichever
     /// tag a line carries (`__send_log`, `src/log.c`). `None` sends the global tag.
     pub log_tag: Option<Arc<str>>,
+    /// The per-transaction log line's format (`log-format`, `option httplog`/`tcplog`);
+    /// frontends and listens only, as in `HAProxy`.
+    pub log_format: Option<Arc<crate::logfmt::LogFormat>>,
+    /// `unique-id-format`, compiled.
+    pub unique_id_format: Option<Arc<crate::logfmt::LogFormat>>,
+    /// `unique-id-header`: the request header the unique ID is sent to the server in.
+    pub unique_id_header: Option<String>,
+    /// Request capture slots: `capture request header` (name, length) where it took the
+    /// slot, `None` where an `http-request capture` rule did.
+    pub req_capture_slots: Arc<[Option<(String, usize)>]>,
+    /// `capture response header`, by slot.
+    pub res_capture_slots: Arc<[(String, usize)]>,
+    /// `%lc`: the lines this proxy has logged, shared by the workers.
+    pub log_count: Arc<AtomicU64>,
     /// One sampling cursor per entry of `log_target_idx` (`syslog::sample_admits`).
     /// Per proxy because `HAProxy` copies each logger into every proxy that uses it, and
     /// behind an `Arc` so the workers, which each clone the proxies, share them as
@@ -377,6 +393,8 @@ pub struct SessionEntry {
     pub cli_interest: Interest,
     pub srv_interest: Interest,
     pub actconn_reclaimed: bool,
+    /// A finished transaction's log line, waiting to be sent to its frontend's targets.
+    pub log_line: Option<String>,
 }
 
 /// Per-thread storage for active sessions.
@@ -485,8 +503,6 @@ pub struct Engine {
     log_targets: Vec<SyslogTarget>,
     /// Value for the syslog TAG field. `HAProxy` uses the program name.
     log_tag: String,
-    /// Value for the syslog HOSTNAME field.
-    log_hostname: String,
     /// Global `tune.bufsize` value, stored per-engine to avoid races in tests that run
     /// multiple engines in the same process against the global `BUFSIZE_STANDARD` atomic.
     global_bufsize: usize,
@@ -653,6 +669,203 @@ fn hostname() -> String {
 
 /// A syslog tag as sent: `tag[pid]`. Built once per proxy, after `-D` has re-executed,
 /// so the pid is the one that sends.
+/// A format already checked by [`crate::rule_exprs::validate_config`].
+fn compile_unique_id_format(fmt: &str) -> Option<Arc<crate::logfmt::LogFormat>> {
+    crate::logfmt::LogFormat::compile_unique_id(fmt, sample_registry()).ok().map(Arc::new)
+}
+
+fn compile_format(fmt: &str) -> Option<Arc<crate::logfmt::LogFormat>> {
+    crate::logfmt::LogFormat::compile(fmt, sample_registry()).ok().map(Arc::new)
+}
+
+fn compile_log_format(spec: Option<&ibex_config::LogFormatSpec>, mode_http: bool) -> Option<Arc<crate::logfmt::LogFormat>> {
+    compile_format(crate::logfmt::format_string(spec?, mode_http))
+}
+
+/// The proxy's request capture slots, and the slot each `http-request capture` rule
+/// without `id` writes: `HAProxy` numbers both in declaration order, and the header
+/// captures recorded theirs, so the rules take the rest in order.
+fn capture_slots(
+    headers: &[ibex_config::HeaderCapture],
+    rules: &mut [ibex_config::HttpReqRule],
+) -> Arc<[Option<(String, usize)>]> {
+    let rule_slots = rules
+        .iter()
+        .filter(|r| matches!(r.action, ibex_config::HttpReqAction::Capture { id: None, .. }))
+        .count();
+    let mut slots: Vec<Option<(String, usize)>> = vec![None; headers.len() + rule_slots];
+    for h in headers {
+        if let Some(s) = slots.get_mut(h.slot) {
+            *s = Some((h.name.clone(), h.len));
+        }
+    }
+    let mut free = (0..slots.len()).filter(|&i| slots[i].is_none()).collect::<Vec<_>>().into_iter();
+    for r in rules.iter_mut() {
+        if let ibex_config::HttpReqAction::Capture { id: id @ None, .. } = &mut r.action {
+            *id = free.next();
+        }
+    }
+    slots.into()
+}
+
+/// The host name, read once: `%H`.
+fn log_hostname() -> &'static str {
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAME.get_or_init(hostname)
+}
+
+/// The values of `slots` (`None` for a slot a rule fills) in a message head: the last
+/// occurrence of each header, cut to its length (`capture_headers`, src/http_ana.c).
+fn capture_values<'a>(slots: impl Iterator<Item = Option<(&'a str, usize)>>, headers: &[(&str, &str)]) -> Vec<Option<String>> {
+    slots
+        .map(|slot| {
+            let (name, len) = slot?;
+            headers.iter().rev().find(|(k, _)| k.trim().eq_ignore_ascii_case(name)).map(|(_, v)| cut_at(v.trim(), len).to_string())
+        })
+        .collect()
+}
+
+/// `s` cut to at most `len` bytes, on a character boundary.
+fn cut_at(s: &str, len: usize) -> &str {
+    let mut cut = len.min(s.len());
+    while !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    &s[..cut]
+}
+
+/// A new HTTP transaction's request is in: its header captures and unique ID, before any
+/// rule can read them, and the ID sent on in `unique-id-header` (`http_process_request`).
+fn begin_http_stream(entry: &mut SessionEntry, fe: &Proxy, pid: u32) {
+    if !fe.req_capture_slots.is_empty() {
+        // A request that reached here was parsed into HTX (H1 and H2 alike).
+        let headers: Vec<(&str, &str)> = entry.sess.htx_slice().map(|htx| htx.headers().collect()).unwrap_or_default();
+        entry.sess.log.req_captures = capture_values(fe.req_capture_slots.iter().map(|s| s.as_ref().map(|(n, l)| (n.as_str(), *l))), &headers);
+    }
+    // The response's slots exist from here on, empty until a response fills them: `%hs`
+    // is `{}` for a transaction the server never answered, and nothing for a request
+    // that never parsed.
+    entry.sess.log.res_captures = vec![None; fe.res_capture_slots.len()];
+    // `HAProxy` builds the ID on first use (`stream_generate_unique_id`); built here, once,
+    // it is the same value for every reader, from the request as received.
+    if let Some(fmt) = fe.unique_id_format.as_ref() {
+        let id = {
+            let data = stream_log_data(entry, std::slice::from_ref(fe), 0, pid);
+            let ctx = stream_sample_ctx(&entry.sess, fe, fe);
+            fmt.render(&data, sample_registry(), &ctx)
+        };
+        if let Some(h) = fe.unique_id_header.as_deref() {
+            entry.sess.req.inject_http_header(&h.to_ascii_lowercase(), &id);
+        }
+        entry.sess.log.unique_id = Some(id);
+    }
+}
+
+/// The sample context a log line's `%[...]` reads.
+fn stream_sample_ctx<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy) -> SampleContext<'a> {
+    SampleContext {
+        client_addr: s.client_addr,
+        server_addr: s.server_addr,
+        fc_src: s.fc_src,
+        fc_dst: s.fc_dst,
+        is_first_req: s.is_first_req,
+        proxy_tlvs: s.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
+        htx_slice: s.htx_slice(),
+        req_uri: s.req_uri.as_deref(),
+        req_method: s.req_method.as_deref(),
+        req_headers: s.req_headers.as_deref(),
+        fe_name: Some(&fe.name),
+        be_name: Some(&be.name),
+        captures_req_hdr: Some(&s.log.req_captures),
+        captures_res_hdr: Some(&s.log.res_captures),
+        unique_id: s.log.unique_id.as_deref(),
+        ..Default::default()
+    }
+}
+
+/// `%ts` (`StreamLog::term_state`).
+fn term_state(entry: &SessionEntry) -> [u8; 2] {
+    let s = &entry.sess;
+    s.log.term_state(s.ending, s.mode == Mode::Http, s.txn.as_ref().is_some_and(|t| t.rsp.is_done()))
+}
+
+/// What the stream measured, for its log line and `unique-id-format`. `proxies` holds the
+/// frontend at `entry.proxy_idx`, or is the frontend alone (`proxy_idx` then 0).
+fn stream_log_data<'a>(entry: &'a SessionEntry, proxies: &'a [Proxy], proxy_idx: usize, pid: u32) -> crate::logfmt::LogData<'a> {
+    let fe = &proxies[proxy_idx];
+    let be = proxies.get(entry.backend_idx).filter(|_| proxies.len() > 1).unwrap_or(fe);
+    let sum = |p: &Proxy| p.stats.iter().map(|st| u64::from(st.act_conn.load(Ordering::Relaxed))).sum::<u64>();
+    crate::logfmt::LogData {
+        server_addr: entry.target_addr.map(|t| connect_addr(t, entry.sess.server_addr)),
+        server: entry.target_server_idx.and_then(|i| proxies.get(entry.srv_backend_idx)?.server_ids.get(i)).map(String::as_str),
+        term_state: term_state(entry),
+        beconn: if std::ptr::eq(be, fe) { 0 } else { sum(be) },
+        srvconn: entry
+            .target_server_idx
+            .and_then(|i| proxies.get(entry.srv_backend_idx)?.server_actconn.get(i))
+            .map_or(0, |a| u64::from(a.load(Ordering::Relaxed))),
+        ..session_log_data(&entry.sess, fe, be, pid)
+    }
+}
+
+/// What the session alone knows, before (or without) a server: what `unique-id-format`
+/// reads when a TCP stream's PROXY header is built at connect.
+fn session_log_data<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, pid: u32) -> crate::logfmt::LogData<'a> {
+    let l = &s.log;
+    let sum = |p: &Proxy| p.stats.iter().map(|st| u64::from(st.act_conn.load(Ordering::Relaxed))).sum::<u64>();
+    crate::logfmt::LogData {
+        client: s.client_addr,
+        frontend_addr: s.server_addr,
+        frontend: &fe.name,
+        frontend_ssl: s.cli_xprt.is_tls(),
+        backend: &be.name,
+        backend_http: be.mode == Mode::Http,
+        accept_date: l.date,
+        t_handshake: 0,
+        t_idle: l.ms(l.first_byte),
+        t_request: l.ms(l.request),
+        t_queue: l.ms(l.queue),
+        t_connect: l.ms(l.connect),
+        t_data: l.ms(l.data),
+        t_close: l.ms(Some(std::time::Instant::now())),
+        status: s.txn.as_ref().map(|t| t.status).or(l.status).map_or(-1, i64::from),
+        bytes_out: l.bytes_from_server,
+        // A request that never parsed counts nothing (`HAProxy`: `U=0` with `<BADREQ>`).
+        bytes_in: if s.mode == Mode::Http && l.request.is_none() {
+            0
+        } else {
+            s.bytes_in.saturating_sub(l.bytes_in_at_start)
+        },
+        cookie_state: *b"--",
+        actconn: sum(fe),
+        feconn: sum(fe),
+        retries: i64::from(s.max_retries.saturating_sub(s.conn_retries)),
+        uniq_id: l.uniq_id,
+        log_counter: fe.log_count.load(Ordering::Relaxed),
+        pid,
+        hostname: log_hostname(),
+        request_line: l.request_line.as_deref(),
+        req_captures: (!fe.req_capture_slots.is_empty()).then_some(l.req_captures.as_slice()),
+        res_captures: (!fe.res_capture_slots.is_empty()).then_some(l.res_captures.as_slice()),
+        unique_id: l.unique_id.as_deref(),
+        ..crate::logfmt::LogData::default()
+    }
+}
+
+/// The stream's log line, when its frontend logs (`HAProxy` logs nothing without a
+/// `log` target).
+fn stream_log_line(entry: &SessionEntry, proxies: &[Proxy], pid: u32) -> Option<String> {
+    let fe = &proxies[entry.proxy_idx];
+    let fmt = fe.log_format.as_ref()?;
+    if fe.log_target_idx.is_empty() {
+        return None;
+    }
+    let be = proxies.get(entry.backend_idx).unwrap_or(fe);
+    let line = fmt.render(&stream_log_data(entry, proxies, entry.proxy_idx, pid), sample_registry(), &stream_sample_ctx(&entry.sess, fe, be));
+    fe.log_count.fetch_add(1, Ordering::Relaxed);
+    Some(line)
+}
+
 fn syslog_tag(tag: &str) -> Arc<str> {
     format!("{tag}[{}]", std::process::id()).into()
 }
@@ -840,6 +1053,8 @@ fn section_timeouts(
 
 #[allow(clippy::too_many_lines)] // a field-by-field mirror of the section
 fn init_proxy_from_listen(proxy_idx: usize, listen: &ibex_config::ListenSection, nbthread: usize) -> Proxy {
+    let mut http_req_rules = listen.http_req_rules.clone();
+    let req_capture_slots = capture_slots(&listen.req_header_captures, &mut http_req_rules);
     let timeouts = section_timeouts(&listen.timeouts, listen.clitimeout, listen.srvtimeout, listen.contimeout);
 
     let retries = u16::try_from(listen.retries).unwrap_or(u16::MAX);
@@ -930,6 +1145,7 @@ fn init_proxy_from_listen(proxy_idx: usize, listen: &ibex_config::ListenSection,
         accept_proxy_v2: listen.accept_proxy_v2,
         server_send_proxy: listen.servers.iter().map(|s| s.send_proxy).collect(),
         server_send_proxy_v2: listen.servers.iter().map(|s| s.send_proxy_v2).collect(),
+        server_pp_unique_id: listen.servers.iter().map(|s| s.proxy_v2_unique_id).collect(),
         server_backups: listen.servers.iter().map(|s| s.backup).collect(),
         server_maxconn: listen.servers.iter().map(|s| s.maxconn).collect(),
         server_actconn: Arc::new((0..server_count).map(|_| AtomicU32::new(0)).collect()),
@@ -940,13 +1156,19 @@ fn init_proxy_from_listen(proxy_idx: usize, listen: &ibex_config::ListenSection,
         tcp_req_inspect_delay: listen.tcp_req_inspect_delay,
         tcp_res_content_rules: listen.tcp_res_content_rules.clone(),
         tcp_res_inspect_delay: listen.tcp_res_inspect_delay,
-        http_req_rules: listen.http_req_rules.clone(),
+        http_req_rules,
         http_res_rules: listen.http_res_rules.clone(),
         http_after_res_rules: listen.http_after_res_rules.clone(),
         http_reuse: listen.http_reuse.unwrap_or_default(),
         error_files: listen.error_files.clone(),
         error_replies: listen.error_replies.clone(),
         log_tag: listen.log_tag.as_deref().map(syslog_tag),
+        log_format: compile_log_format(listen.log_format.as_ref(), listen.mode == Mode::Http),
+        unique_id_format: listen.unique_id_format.as_deref().and_then(compile_unique_id_format),
+        unique_id_header: listen.unique_id_header.clone(),
+        req_capture_slots,
+        res_capture_slots: listen.res_header_captures.iter().map(|c| (c.name.clone(), c.len)).collect(),
+        log_count: Arc::default(),
         log_cursors: Arc::default(),
         hash_type: listen.hash_type.unwrap_or_default(),
         hash_preserve_affinity: listen.hash_preserve_affinity.unwrap_or_default(),
@@ -955,6 +1177,8 @@ fn init_proxy_from_listen(proxy_idx: usize, listen: &ibex_config::ListenSection,
 }
 
 fn init_proxy_from_frontend(proxy_idx: usize, fe: &ibex_config::FrontendSection, nbthread: usize) -> Proxy {
+    let mut http_req_rules = fe.http_req_rules.clone();
+    let req_capture_slots = capture_slots(&fe.req_header_captures, &mut http_req_rules);
     let timeouts = section_timeouts(&fe.timeouts, fe.clitimeout, None, None);
 
     let mut cliexp = Vec::new();
@@ -1011,6 +1235,7 @@ fn init_proxy_from_frontend(proxy_idx: usize, fe: &ibex_config::FrontendSection,
         accept_proxy_v2: fe.accept_proxy_v2 || fe.binds.iter().any(|b| b.accept_proxy_v2),
         server_send_proxy: Vec::new(),
         server_send_proxy_v2: Vec::new(),
+        server_pp_unique_id: Vec::new(),
         server_backups: Vec::new(),
         server_maxconn: Vec::new(),
         server_actconn: std::sync::Arc::new(Vec::new()),
@@ -1021,13 +1246,19 @@ fn init_proxy_from_frontend(proxy_idx: usize, fe: &ibex_config::FrontendSection,
         tcp_req_inspect_delay: fe.tcp_req_inspect_delay,
         tcp_res_content_rules: Vec::new(),
         tcp_res_inspect_delay: None,
-        http_req_rules: fe.http_req_rules.clone(),
+        http_req_rules,
         http_res_rules: fe.http_res_rules.clone(),
         http_after_res_rules: fe.http_after_res_rules.clone(),
         http_reuse: ibex_config::HttpReuse::default(),
         error_files: fe.error_files.clone(),
         error_replies: fe.error_replies.clone(),
         log_tag: fe.log_tag.as_deref().map(syslog_tag),
+        log_format: compile_log_format(fe.log_format.as_ref(), fe.mode == Mode::Http),
+        unique_id_format: fe.unique_id_format.as_deref().and_then(compile_unique_id_format),
+        unique_id_header: fe.unique_id_header.clone(),
+        req_capture_slots,
+        res_capture_slots: fe.res_header_captures.iter().map(|c| (c.name.clone(), c.len)).collect(),
+        log_count: Arc::default(),
         log_cursors: Arc::default(),
         hash_type: ibex_config::HashType::default(),
         hash_preserve_affinity: ibex_config::HashPreserveAffinity::default(),
@@ -1116,6 +1347,7 @@ fn init_proxy_from_backend(proxy_idx: usize, be: &ibex_config::BackendSection, n
         accept_proxy_v2: false,
         server_send_proxy: be.servers.iter().map(|s| s.send_proxy).collect(),
         server_send_proxy_v2: be.servers.iter().map(|s| s.send_proxy_v2).collect(),
+        server_pp_unique_id: be.servers.iter().map(|s| s.proxy_v2_unique_id).collect(),
         server_backups: be.servers.iter().map(|s| s.backup).collect(),
         server_maxconn: be.servers.iter().map(|s| s.maxconn).collect(),
         server_actconn: Arc::new((0..server_count).map(|_| AtomicU32::new(0)).collect()),
@@ -1133,6 +1365,12 @@ fn init_proxy_from_backend(proxy_idx: usize, be: &ibex_config::BackendSection, n
         error_files: be.error_files.clone(),
         error_replies: be.error_replies.clone(),
         log_tag: be.log_tag.as_deref().map(syslog_tag),
+        log_format: None,
+        unique_id_format: be.unique_id_format.as_deref().and_then(compile_unique_id_format),
+        unique_id_header: be.unique_id_header.clone(),
+        req_capture_slots: Arc::from([]),
+        res_capture_slots: Arc::from([]),
+        log_count: Arc::default(),
         log_cursors: Arc::default(),
         hash_type: be.hash_type.unwrap_or_default(),
         hash_preserve_affinity: be.hash_preserve_affinity.unwrap_or_default(),
@@ -1342,7 +1580,6 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             timer_updates: Vec::with_capacity(capacity * 2),
             log_targets,
             log_tag: syslog_tag(config.global.as_ref().and_then(|g| g.log_tag.as_deref()).unwrap_or("haproxy")).to_string(),
-            log_hostname: hostname(),
             global_bufsize: bufsize,
             global_maxrewrite: config
                 .global
@@ -1613,7 +1850,6 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             wake_queue: Vec::new(),
             log_targets: &self.log_targets,
             log_tag: &self.log_tag,
-            log_hostname: &self.log_hostname,
             idle_backend_pool: &mut self.idle_backend_pool,
         };
 
@@ -2226,6 +2462,9 @@ fn eval_tcp_req_session_rules(
         proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
         act_conn: proxy.stats[worker_id()].act_conn.load(Ordering::Relaxed),
         cum_conn: proxy.stats[worker_id()].cum_conn.load(Ordering::Relaxed),
+        unique_id: sess.log.unique_id.as_deref(),
+        captures_req_hdr: Some(&sess.log.req_captures),
+        captures_res_hdr: Some(&sess.log.res_captures),
         ..Default::default()
     };
 
@@ -2479,6 +2718,9 @@ fn eval_tcp_req_content_rules(
         req_body: if has_content { Some(req_bytes) } else { None },
         act_conn: proxy.stats[worker_id()].act_conn.load(Ordering::Relaxed),
         cum_conn: proxy.stats[worker_id()].cum_conn.load(Ordering::Relaxed),
+        unique_id: sess.log.unique_id.as_deref(),
+        captures_req_hdr: Some(&sess.log.req_captures),
+        captures_res_hdr: Some(&sess.log.res_captures),
         ..Default::default()
     };
 
@@ -2762,6 +3004,9 @@ fn eval_tcp_res_content_rules(proxy: &Proxy, registry: &Registry, sess: &mut Tcp
         res_body: Some(rep_bytes),
         act_conn: proxy.stats[worker_id()].act_conn.load(Ordering::Relaxed),
         cum_conn: proxy.stats[worker_id()].cum_conn.load(Ordering::Relaxed),
+        unique_id: sess.log.unique_id.as_deref(),
+        captures_req_hdr: Some(&sess.log.req_captures),
+        captures_res_hdr: Some(&sess.log.res_captures),
         ..Default::default()
     };
     ibex_sample::CURRENT_VARS.with(|v| {
@@ -2918,6 +3163,7 @@ fn register_new_session(
         cli_interest,
         srv_interest: Interest::NONE,
         actconn_reclaimed: false,
+        log_line: None,
     }) else {
         if let Some(idx) = target_server_idx {
             if idx < proxy.server_actconn.len() {
@@ -3016,12 +3262,12 @@ fn connect_addr(server: SocketAddr, dst: Option<SocketAddr>) -> SocketAddr {
     SocketAddr::new(ip, port)
 }
 
-fn maybe_prepend_send_proxy(proxy: &Proxy, sess: &mut TcpSession, target_addr: SocketAddr) {
+fn maybe_prepend_send_proxy(fe: &Proxy, proxy: &Proxy, sess: &mut TcpSession, target_addr: SocketAddr) {
     if sess.send_proxy_prepended {
         return;
     }
     let before = sess.req.len();
-    prepend_send_proxy(proxy, sess, target_addr);
+    prepend_send_proxy(fe, proxy, sess, target_addr);
     // The header goes out ahead of the request, so it is counted as part of the request's
     // head. Measured by the scanner it would not be: a v2 header opens with the bytes
     // `\r\n\r\n`, which read as the end of a head four bytes in.
@@ -3036,7 +3282,7 @@ fn maybe_prepend_send_proxy(proxy: &Proxy, sess: &mut TcpSession, target_addr: S
     }
 }
 
-fn prepend_send_proxy(proxy: &Proxy, sess: &mut TcpSession, target_addr: SocketAddr) {
+fn prepend_send_proxy(fe: &Proxy, proxy: &Proxy, sess: &mut TcpSession, target_addr: SocketAddr) {
     if let Some(idx) = proxy.servers.iter().position(|&s| s == target_addr) {
         let send_v2 = proxy
             .server_send_proxy_v2
@@ -3048,12 +3294,25 @@ fn prepend_send_proxy(proxy: &Proxy, sess: &mut TcpSession, target_addr: SocketA
         if send_v2 {
             let src = sess.client_addr;
             let dst = sess.server_addr.or(Some(proxy.addr));
-            let tlv_data = sess
-                .proxy_info
-                .as_ref()
-                .map_or(&[] as &[u8], |p| &p.tlv_data);
+            let mut tlv_data = sess.proxy_info.as_ref().map_or_else(Vec::new, |p| p.tlv_data.clone());
+            if proxy.server_pp_unique_id.get(idx).copied().unwrap_or(false) {
+                // `PP2_TYPE_UNIQUE_ID`: the stream's ID, built now if nothing has yet (a TCP
+                // stream), from the frontend's format; without one, an empty TLV
+                // (`stream_generate_unique_id`, `make_proxy_line_v2`).
+                if sess.log.unique_id.is_none() {
+                    if let Some(fmt) = fe.unique_id_format.as_ref() {
+                        let id = fmt.render(&session_log_data(sess, fe, proxy, std::process::id()), sample_registry(), &stream_sample_ctx(sess, fe, proxy));
+                        sess.log.unique_id = Some(id);
+                    }
+                }
+                let id = sess.log.unique_id.as_deref().unwrap_or("").as_bytes();
+                let id = &id[..id.len().min(usize::from(u16::MAX))];
+                tlv_data.push(0x05);
+                tlv_data.extend_from_slice(&u16::try_from(id.len()).unwrap_or(u16::MAX).to_be_bytes());
+                tlv_data.extend_from_slice(id);
+            }
             let hdr =
-                ibex_proto::encode_proxy_v2(ibex_proto::ProxyCommand::Proxy, src, dst, tlv_data);
+                ibex_proto::encode_proxy_v2(ibex_proto::ProxyCommand::Proxy, src, dst, &tlv_data);
             sess.req.replace_prefix(0, &hdr);
             sess.send_proxy_prepended = true;
         } else if send_v1 {
@@ -3106,6 +3365,9 @@ fn init_client_session(
     sess.fc_dst = Some(fc_dst);
     sess.tracked_sc = tracked_sc;
     sess.h2_flood_config = global_h2_flood_config;
+    let fe = &proxies[proxy_idx];
+    sess.keep_request_line = (!fe.log_target_idx.is_empty() && fe.log_format.as_ref().is_some_and(|f| f.uses_request_line()))
+        || fe.unique_id_format.as_ref().is_some_and(|f| f.uses_request_line());
     // Use per-engine values rather than the global `BUFSIZE_STANDARD` atomic so that
     // multiple Engine instances running in the same process (e.g. parallel tests) do not
     // race each other's configuration.
@@ -3174,10 +3436,18 @@ fn init_client_session(
         sess.rep.commit(n);
         sess.cli_state = ScState::ShutR;
         sess.srv_state = ScState::Closed;
-    } else if mode == Mode::Tcp && !proxy.accept_proxy && !proxy.accept_proxy_v2 && sess.tcp_inspect_done {
+    } else if mode == Mode::Tcp
+        && !proxy.accept_proxy
+        && !proxy.accept_proxy_v2
+        && sess.tcp_inspect_done
+        // A proxy that routes (`use_backend`, `default_backend`) connects once the backend
+        // is resolved (`connect_tcp_backend`): its own server list is not the one to use.
+        && proxy.use_backends.is_empty()
+        && proxy.default_backend.is_none()
+    {
         target_addr = proxy.select_server_with_key(sess.client_addr.map(|a| a.ip()), sess.req_uri.as_deref());
         if let Some(target) = target_addr {
-            maybe_prepend_send_proxy(proxy, &mut sess, target);
+            maybe_prepend_send_proxy(proxy, proxy, &mut sess, target);
             arm_res_inspect(proxy, &mut sess);
 
             if let Ok((srv_fd, immediate)) = raw::connect(connect_addr(target, sess.server_addr)) {
@@ -3367,7 +3637,6 @@ struct EngineDispatcher<'a> {
     /// Shared read-only: the sockets live on the `Engine`, proxies index into this.
     log_targets: &'a [SyslogTarget],
     log_tag: &'a str,
-    log_hostname: &'a str,
     idle_backend_pool: &'a mut HashMap<SocketAddr, Vec<OwnedFd>>,
 }
 
@@ -3437,6 +3706,11 @@ fn close_http_session(
     idle_pool: &mut HashMap<SocketAddr, Vec<OwnedFd>>,
     reusable: bool,
 ) {
+    // A transaction that ends with its connection, not through `end_txn` (cut short by
+    // either side), logs here, while its request and response are still known.
+    if entry.sess.txn.is_some() && entry.log_line.is_none() {
+        entry.log_line = stream_log_line(entry, proxies, std::process::id());
+    }
     release_server(entry, proxies, fdtab, poller, idle_pool, reusable);
     if matches!(entry.sess.cli_state, ScState::Ready | ScState::Established | ScState::ShutR) {
         raw::shutdown_write(entry.sess.cli.as_fd());
@@ -3495,7 +3769,7 @@ fn retry_server_connect(
     entry.target_server_idx = s_idx;
     entry.srv_backend_idx = be_idx;
 
-    maybe_prepend_send_proxy(&proxies[be_idx], &mut entry.sess, target_addr);
+    maybe_prepend_send_proxy(&proxies[entry.proxy_idx], &proxies[be_idx], &mut entry.sess, target_addr);
 
     entry.target_addr = Some(target_addr);
     if let Ok((srv_fd, immediate)) = raw::connect(connect_addr(target_addr, entry.sess.server_addr)) {
@@ -3745,6 +4019,9 @@ impl EngineDispatcher<'_> {
             req_headers: entry.sess.req_headers.as_deref(),
             act_conn: proxy.stats[worker_id()].act_conn.load(Ordering::Relaxed),
             cum_conn: proxy.stats[worker_id()].cum_conn.load(Ordering::Relaxed),
+            unique_id: entry.sess.log.unique_id.as_deref(),
+            captures_req_hdr: Some(&entry.sess.log.req_captures),
+            captures_res_hdr: Some(&entry.sess.log.res_captures),
             ..Default::default()
         };
 
@@ -3800,6 +4077,19 @@ impl EngineDispatcher<'_> {
                     let fe = &proxies[entry.proxy_idx];
                     let page = proxy_error_response(&entry.sess, fe, fe, 408);
                     entry.sess.send_before_close(&page);
+                    entry.sess.log.status = Some(408);
+                    entry.sess.log.term = Some(*b"cR");
+                } else if !entry.sess.req.is_empty()
+                    || (entry.sess.is_first_req && matches!(entry.sess.ending, None | Some(crate::proxy::Ending::ClientAbort)))
+                {
+                    // Part of a request, or a new connection closed before its first byte,
+                    // then the client left: `HAProxy` logs it as a 400 the client aborted
+                    // (`CR`).
+                    entry.sess.log.status = Some(400);
+                    entry.sess.log.term = Some(*b"CR");
+                }
+                if entry.sess.log.status.is_some() {
+                    entry.log_line = stream_log_line(entry, proxies, pid);
                 }
                 close_http_session(entry, proxies, fdtab, poller, idle_pool, true);
             } else if entry.sess.srv.is_some()
@@ -3892,7 +4182,7 @@ impl EngineDispatcher<'_> {
         if drained && txn.aborted {
             close_http_session(entry, proxies, fdtab, poller, idle_pool, false);
         } else if drained && txn.finished() {
-            Self::end_txn(entry, proxies, fdtab, poller, idle_pool, wake_queue, now);
+            Self::end_txn(entry, proxies, fdtab, poller, idle_pool, wake_queue, now, pid);
         }
         admin
     }
@@ -3924,6 +4214,10 @@ impl EngineDispatcher<'_> {
                     txn.aborted = true;
                     return;
                 }
+                if status == 502 {
+                    // The server ended the connection before its response head: `SH`.
+                    entry.sess.log.term = Some(*b"SH");
+                }
                 entry.sess.rep.clear();
                 reply_error(entry, proxies, status);
             }
@@ -3948,6 +4242,7 @@ impl EngineDispatcher<'_> {
                     // closes, the only way left to tell it the response is incomplete.
                     txn.close_after = true;
                     txn.aborted = true;
+                    entry.sess.log.term = Some(*b"SD");
                 }
             }
         }
@@ -3992,6 +4287,7 @@ impl EngineDispatcher<'_> {
     /// `HAProxy`'s `http_end_request`/`http_end_response` meeting at `DONE`. The server
     /// connection goes back to the pool if it can carry another request; the client
     /// connection either closes or waits for its next request.
+    #[allow(clippy::too_many_arguments)]
     fn end_txn(
         entry: &mut SessionEntry,
         proxies: &mut [Proxy],
@@ -4000,7 +4296,12 @@ impl EngineDispatcher<'_> {
         idle_pool: &mut HashMap<SocketAddr, Vec<OwnedFd>>,
         wake_queue: &mut Vec<TaskRef>,
         now: Tick,
+        pid: u32,
     ) {
+        // The transaction's line, while its request and response are still here.
+        if entry.sess.txn.is_some() {
+            entry.log_line = stream_log_line(entry, proxies, pid);
+        }
         let Some(txn) = entry.sess.txn.take() else {
             return;
         };
@@ -4045,7 +4346,7 @@ impl EngineDispatcher<'_> {
     #[allow(clippy::too_many_lines)] // one dispatch chain; splitting it would obscure the order
     fn step_stream(&mut self, session_idx: u32) -> Outcome {
         let now = self.now;
-        let (is_done, pending_admin) = {
+        let (is_done, pending_admin, log_line) = {
             let Some(entry) = self.sessions.get_mut(session_idx) else {
                 return Outcome::Done;
             };
@@ -4162,6 +4463,8 @@ impl EngineDispatcher<'_> {
                 );
             }
 
+            let log_line = entry.log_line.take();
+
             // Step 3.6: If in TCP mode and server not yet connected (e.g. deferred on accept-proxy or inspect), connect once ready
             if entry.sess.mode == Mode::Tcp
                 && entry.sess.srv_state == ScState::Init
@@ -4187,8 +4490,13 @@ impl EngineDispatcher<'_> {
             self.timer_updates
                 .push((entry.task, entry.sess.next_expiry()));
 
-            (entry.sess.is_done(), pending_admin)
+            (entry.sess.is_done(), pending_admin, log_line)
         };
+
+        if let Some(line) = log_line {
+            let fe = self.sessions.get(session_idx).map_or(0, |e| e.proxy_idx);
+            self.send_log_line(fe, &line);
+        }
 
         if let Some(cmd) = pending_admin {
             if cmd.action == "kill_sessions" || cmd.action == "shutdown_sessions" {
@@ -4208,6 +4516,17 @@ impl EngineDispatcher<'_> {
 
         // Step 6: Completion cleanup
         if is_done {
+            // A TCP connection's line, and an HTTP transaction's that ended with the
+            // connection rather than through `end_txn` (aborted, timed out).
+            let line = self.sessions.get_mut(session_idx).and_then(|e| {
+                e.log_line
+                    .take()
+                    .or_else(|| (e.sess.mode == Mode::Tcp || e.sess.txn.is_some()).then(|| stream_log_line(e, self.proxies, self.pid)).flatten())
+                    .map(|l| (e.proxy_idx, l))
+            });
+            if let Some((fe, line)) = line {
+                self.send_log_line(fe, &line);
+            }
             if let Some(entry) = self.sessions.free(session_idx) {
                 cleanup_done(
                     &entry,
@@ -4258,6 +4577,14 @@ impl EngineDispatcher<'_> {
             txn.rsp = MsgState::head(crate::txn::Framing::None);
             txn.rsp_interim = true;
             return;
+        }
+        // The final response head: `t_data`, and `capture response header`.
+        entry.sess.log.data = Some(std::time::Instant::now());
+        let fe_caps = &proxies[fe_idx].res_capture_slots;
+        if !fe_caps.is_empty() {
+            let head = String::from_utf8_lossy(&entry.sess.rep.readable()[..total_hdr_len]).into_owned();
+            let headers: Vec<(&str, &str)> = head.split("\r\n").skip(1).filter_map(|l| l.split_once(':')).collect();
+            entry.sess.log.res_captures = capture_values(fe_caps.iter().map(|(n, l)| Some((n.as_str(), *l))), &headers);
         }
         txn.status = status;
         txn.srv_reusable = !srv_has_close
@@ -4376,6 +4703,9 @@ impl EngineDispatcher<'_> {
             be_max_retries: Some(proxies[be_idx].retries),
             cur_max_retries: Some(entry.sess.max_retries),
             res_version: Some(&proto_version),
+            unique_id: entry.sess.log.unique_id.as_deref(),
+            captures_req_hdr: Some(&entry.sess.log.req_captures),
+            captures_res_hdr: Some(&entry.sess.log.res_captures),
             ..Default::default()
         };
 
@@ -5047,6 +5377,7 @@ impl EngineDispatcher<'_> {
                 map.insert(k.clone(), val.clone());
             }
         });
+        begin_http_stream(entry, &proxies[proxy_idx], pid);
         CURRENT_TIMEOUTS.with(|t| {
             let mut map = t.borrow_mut();
             map.clear();
@@ -5142,6 +5473,9 @@ impl EngineDispatcher<'_> {
             fe_name: Some(&proxies[proxy_idx].name),
             act_conn: proxies[proxy_idx].stats[worker_id()].act_conn.load(Ordering::Relaxed),
             cum_conn: proxies[proxy_idx].stats[worker_id()].cum_conn.load(Ordering::Relaxed),
+            unique_id: entry.sess.log.unique_id.as_deref(),
+            captures_req_hdr: Some(&entry.sess.log.req_captures),
+            captures_res_hdr: Some(&entry.sess.log.res_captures),
             ..Default::default()
         };
 
@@ -5275,7 +5609,8 @@ impl EngineDispatcher<'_> {
                         req_headers: $s.req_headers.as_deref(),
                         fe_name,
                         be_name,
-                        captures_req_hdr: Some(&$s.req_captures),
+                        captures_req_hdr: Some(&$s.log.req_captures),
+                        unique_id: $s.log.unique_id.as_deref(),
                         be_max_retries: Some(be_retries),
                         cur_max_retries: Some($s.max_retries),
                         act_conn,
@@ -5327,6 +5662,8 @@ impl EngineDispatcher<'_> {
                                 build_templated_error_response(status_code, content_type, lf_string, &make_ctx!(sess), registry)
                             }
                         };
+                        // Denied by the proxy: `PR`, not a rule's answer (`LR`).
+                        sess.log.term = Some(*b"PR");
                         sess.write_reply(&resp);
                         return Ok(Some(()));
                     }
@@ -5684,29 +6021,21 @@ impl EngineDispatcher<'_> {
                         }
                     }
                     ibex_config::HttpReqAction::Capture { expr, len, id } => {
-                        let val = if let Ok(e) = Expr::parse(expr) {
-                            e.eval_sample(registry, &make_ctx!(sess))
-                                .map(|smp| sample_to_string(&smp))
-                                .unwrap_or_default()
-                        } else {
-                            format_sample_string(expr, &make_ctx!(sess), registry)
-                        };
-                        let val = if let Some(max_l) = len {
-                            if val.len() > *max_l {
-                                val[..*max_l].to_string()
-                            } else {
-                                val
+                        // No sample, no capture: the slot stays empty (`-` in `%hrl`).
+                        // The expression was checked when the configuration loaded.
+                        let val = Expr::parse(expr)
+                            .ok()
+                            .and_then(|e| e.eval_sample(registry, &make_ctx!(sess)))
+                            .map(|smp| sample_to_string(&smp));
+                        // `id` names one of the frontend's slots (a backend's rule too); without
+                        // it the rule's own, which the engine assigned when the proxy was built.
+                        // An `id` past the frontend's slots captures nothing.
+                        if let (Some(target_id), Some(val)) = (id, val) {
+                            // With `id`, the length is the declared slot's.
+                            let max = len.or_else(|| proxies[proxy_idx].req_capture_slots.get(*target_id)?.as_ref().map(|(_, l)| *l));
+                            if let Some(slot) = sess.log.req_captures.get_mut(*target_id) {
+                                *slot = Some(cut_at(&val, max.unwrap_or(usize::MAX)).to_string());
                             }
-                        } else {
-                            val
-                        };
-                        if let Some(target_id) = id {
-                            if sess.req_captures.len() <= *target_id {
-                                sess.req_captures.resize(*target_id + 1, String::new());
-                            }
-                            sess.req_captures[*target_id] = val;
-                        } else {
-                            sess.req_captures.push(val);
                         }
                     }
                     _ => {}
@@ -5720,8 +6049,12 @@ impl EngineDispatcher<'_> {
             let fe_rules = &proxies[proxy_idx].http_req_rules;
             let fe_acls = &proxies[proxy_idx].acls;
             match eval_http_rules(fe_rules, fe_acls, &mut entry.sess, proxies[proxy_idx].retries, Some(&proxies[proxy_idx].name), None, proxy_idx) {
-                Ok(Some(())) => return None,
+                Ok(Some(())) => {
+                    entry.sess.log.term.get_or_insert(*b"LR");
+                    return None;
+                }
                 Err(status) => {
+                    entry.sess.log.term.get_or_insert(*b"PR");
                     reply_error(entry, proxies, status);
                     return None;
                 }
@@ -5801,8 +6134,12 @@ impl EngineDispatcher<'_> {
             let be_rules = &proxies[be_idx].http_req_rules;
             let be_acls = &proxies[be_idx].acls;
             match eval_http_rules(be_rules, be_acls, &mut entry.sess, proxies[be_idx].retries, Some(&proxies[proxy_idx].name), Some(&proxies[be_idx].name), be_idx) {
-                Ok(Some(())) => return None,
+                Ok(Some(())) => {
+                    entry.sess.log.term.get_or_insert(*b"LR");
+                    return None;
+                }
                 Err(status) => {
+                    entry.sess.log.term.get_or_insert(*b"PR");
                     reply_error(entry, proxies, status);
                     return None;
                 }
@@ -5891,7 +6228,7 @@ impl EngineDispatcher<'_> {
         entry.target_server_idx = s_idx;
         entry.srv_backend_idx = be_idx;
 
-        maybe_prepend_send_proxy(&proxies[be_idx], &mut entry.sess, target_addr);
+        maybe_prepend_send_proxy(&proxies[entry.proxy_idx], &proxies[be_idx], &mut entry.sess, target_addr);
 
         entry.target_addr = Some(target_addr);
 
@@ -6048,7 +6385,7 @@ impl EngineDispatcher<'_> {
         entry.target_server_idx = s_idx;
         entry.srv_backend_idx = be_idx;
 
-        maybe_prepend_send_proxy(&proxies[be_idx], &mut entry.sess, target_addr);
+        maybe_prepend_send_proxy(&proxies[entry.proxy_idx], &proxies[be_idx], &mut entry.sess, target_addr);
 
         entry.target_addr = Some(target_addr);
         if let Ok((srv_fd, immediate)) = raw::connect(connect_addr(target_addr, entry.sess.server_addr)) {
@@ -6156,6 +6493,11 @@ impl EngineDispatcher<'_> {
     ///
     /// Silent when the proxy has no targets, which is the common case: `HAProxy` logs
     /// nothing unless a `log` directive says where to.
+    /// A transaction's or connection's log line, at `info` as `HAProxy` sends them.
+    fn send_log_line(&self, proxy_idx: usize, line: &str) {
+        self.send_log(proxy_idx, LogLevel::Info, line);
+    }
+
     fn send_log(&self, proxy_idx: usize, level: LogLevel, msg: &str) {
         let Some(proxy) = self.proxies.get(proxy_idx) else {
             return;
@@ -6176,7 +6518,9 @@ impl EngineDispatcher<'_> {
             let tag = proxy.log_tag.as_deref().unwrap_or(self.log_tag);
             // Discarded deliberately: syslog over UDP is fire-and-forget, and a
             // collector that is down must not slow or fail the data path.
-            let _ = target.send(level, tag, self.log_hostname, msg);
+            // No hostname in the header: `HAProxy` sends one only with
+            // `log-send-hostname`, which Ibex does not have.
+            let _ = target.send(level, tag, "", msg);
         }
     }
 
@@ -7096,8 +7440,9 @@ fn build_templated_error_response(
         }
     }
 
-    let unescaped = body_str.replace("\\n", "\n").replace("\\r", "\r").replace("\\t", "\t");
-    let body = unescaped.as_bytes();
+    // The config's escapes were decoded once, when it was read (`parse_line`); a second
+    // pass would turn a literal `\\n` into a newline, which `HAProxy` does not.
+    let body = body_str.as_bytes();
 
     let reason = status_reason(status);
     let mut resp = format!("HTTP/1.1 {status} {reason}\r\n");

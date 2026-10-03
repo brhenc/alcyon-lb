@@ -8,6 +8,14 @@
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 
+# In a linked worktree (an agent's), the default would be the same directory the main
+# checkout's run uses. Two checkouts building into one target directory overwrite each
+# other's test binaries, and each run then tests the other's code. Refuse instead.
+if [ -z "${CARGO_TARGET_DIR:-}" ] && [ "$(git rev-parse --git-dir)" != "$(git rev-parse --git-common-dir)" ]; then
+  echo "checkin: this is a linked worktree; set CARGO_TARGET_DIR to a directory of its own" >&2
+  echo "         (for example CARGO_TARGET_DIR=/home/bhenc/ibex-targets/<task> ./tools/checkin.sh)" >&2
+  exit 2
+fi
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-/tmp/ibex-checkin-target}
 
 # Every step below pipes into grep, and a pipeline's exit status is the last command's.

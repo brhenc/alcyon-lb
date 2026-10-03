@@ -298,7 +298,72 @@ pub fn validate_rule_exprs(config: &Config, registry: &Registry) -> Result<(), S
 /// # Errors
 /// As [`validate_rule_exprs`].
 pub fn validate_config(config: &Config) -> Result<(), String> {
-    validate_rule_exprs(config, crate::engine::sample_registry())
+    let registry = crate::engine::sample_registry();
+    validate_rule_exprs(config, registry)?;
+    validate_formats(config, registry)
+}
+
+/// Compiles every `log-format` and `unique-id-format` (`HAProxy`: "failed to parse
+/// log-format : ..."). A frontend's log format is compiled only when it has somewhere to
+/// log, as `HAProxy` skips it otherwise ("log format ignored for frontend ... since it has
+/// no log address").
+///
+/// # Errors
+/// The first format that does not compile.
+pub fn validate_formats(config: &Config, registry: &Registry) -> Result<(), String> {
+    use crate::logfmt::{format_string, LogFormat};
+    let global_logs = config.global.as_ref().is_some_and(|g| !g.logs.is_empty());
+    let check = |what: &str, name: &str, kind: &str, fmt: &str| {
+        LogFormat::compile(fmt, registry).map(|_| ()).map_err(|e| format!("{what} '{name}': failed to parse {kind} : {e}"))
+    };
+    let sections = config
+        .frontends
+        .iter()
+        .map(|f| ("frontend", &f.name, f.mode, &f.log_format, &f.unique_id_format, !f.logs.is_empty() || f.log_global && global_logs))
+        .chain(config.listens.iter().map(|l| {
+            ("proxy", &l.name, l.mode, &l.log_format, &l.unique_id_format, !l.logs.is_empty() || l.log_global && global_logs)
+        }));
+    for (what, name, mode, log_format, unique_id_format, logs) in sections {
+        if let (Some(spec), true) = (log_format, logs) {
+            check(what, name, "log-format", format_string(spec, mode == ibex_config::Mode::Http))?;
+        }
+        if let Some(fmt) = unique_id_format {
+            check(what, name, "unique-id", fmt)?;
+        }
+    }
+    for b in &config.backends {
+        if let Some(fmt) = &b.unique_id_format {
+            check("backend", &b.name, "unique-id", fmt)?;
+        }
+    }
+    // `http-request capture ... id <n>` fills an existing request slot: a `declare
+    // capture`, a `capture request header`, or another rule's (`check_http_req_capture`).
+    let sections = config
+        .frontends
+        .iter()
+        .map(|f| (&f.name, &f.http_req_rules, &f.req_header_captures))
+        .chain(config.listens.iter().map(|l| (&l.name, &l.http_req_rules, &l.req_header_captures)));
+    // Without `id` a rule takes a slot of its own, which only a proxy that receives
+    // requests has (`parse_http_req_capture`).
+    for b in &config.backends {
+        if b.http_req_rules.iter().any(|r| matches!(r.action, ibex_config::HttpReqAction::Capture { id: None, .. })) {
+            return Err(format!(
+                "error detected in backend '{0}' while parsing 'http-request capture' rule : proxy '{0}' has no frontend capability.",
+                b.name
+            ));
+        }
+    }
+    for (name, rules, caps) in sections {
+        for r in rules {
+            if let ibex_config::HttpReqAction::Capture { id: Some(id), .. } = r.action {
+                let slots = caps.len() + rules.iter().filter(|r| matches!(r.action, ibex_config::HttpReqAction::Capture { id: None, .. })).count();
+                if id >= slots {
+                    return Err(format!("Proxy '{name}': unable to find capture id '{id}' referenced by http-request capture rule."));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

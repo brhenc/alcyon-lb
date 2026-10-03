@@ -32,6 +32,7 @@ pub(crate) fn parse_server(
     let mut check_port = default_server.and_then(|d| d.check_port);
     let mut check_proto = default_server.and_then(|d| d.check_proto.clone());
     let mut check_ssl = default_server.is_some_and(|d| d.check_ssl);
+    let mut proxy_v2_unique_id = default_server.is_some_and(|d| d.proxy_v2_unique_id);
     let mut weight = None;
     let mut backup = false;
 
@@ -84,6 +85,10 @@ pub(crate) fn parse_server(
                 }
             }
             "check-ssl" => check_ssl = true,
+            "proxy-v2-options" => {
+                i += 1;
+                proxy_v2_unique_id |= parse_proxy_v2_options(tokens.get(i), kw)?;
+            }
             "backup" => backup = true,
             _ => {}
         }
@@ -94,6 +99,7 @@ pub(crate) fn parse_server(
         check_port,
         check_proto,
         check_ssl,
+        proxy_v2_unique_id,
         id: tokens[1].text.clone(),
         addr,
         check,
@@ -112,7 +118,7 @@ pub(crate) fn parse_server(
 pub(crate) fn parse_default_server(
     def: &mut Option<DefaultServerConfig>,
     tokens: &[Token],
-    _kw: &Token,
+    kw: &Token,
 ) -> Result<(), ConfigError> {
     let mut cfg = def.take().unwrap_or_default();
     let mut i = 1;
@@ -158,6 +164,10 @@ pub(crate) fn parse_default_server(
                 }
             }
             "check-ssl" => cfg.check_ssl = true,
+            "proxy-v2-options" => {
+                i += 1;
+                cfg.proxy_v2_unique_id |= parse_proxy_v2_options(tokens.get(i), kw)?;
+            }
             _ => {}
         }
         i += 1;
@@ -317,3 +327,27 @@ pub(crate) fn parse_http_reuse(
     Ok(())
 }
 
+
+/// `proxy-v2-options <option>[,<option>]*` (`srv_parse_proxy_v2_options`): whether it asks
+/// for `unique-id`. `HAProxy`'s other options (the SSL ones, `authority`, `crc32c`) put TLVs
+/// in the header that Ibex does not build, so they are refused rather than left out of it.
+fn parse_proxy_v2_options(arg: Option<&Token>, kw: &Token) -> Result<bool, ConfigError> {
+    let text = arg.map_or("", |t| t.text.as_str());
+    let mut unique_id = false;
+    for opt in text.split(',') {
+        match opt {
+            "unique-id" => unique_id = true,
+            "ssl" | "cert-cn" | "cert-key" | "cert-sig" | "ssl-cipher" | "authority" | "crc32c" => {
+                return Err(ConfigError::new(
+                    kw.line,
+                    kw.col,
+                    format!("'proxy-v2-options' : '{opt}' is not implemented in Ibex"),
+                ));
+            }
+            _ => {
+                return Err(ConfigError::new(kw.line, kw.col, format!("'{opt}' : proxy v2 option not implemented")));
+            }
+        }
+    }
+    Ok(unique_id)
+}
