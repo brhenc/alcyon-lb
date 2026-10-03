@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2013-2015 Willy Tarreau <w@1wt.eu>. See crates/slz/LICENSE.
 // Auto-generated from slz-tables.h
 
 pub static FIXED_HUFF: [u16; 288] = [

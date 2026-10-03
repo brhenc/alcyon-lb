@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 // Integration tests for Milestone 2: Stick Table Engine & Runtime CLI Inspection.
 
 mod common;

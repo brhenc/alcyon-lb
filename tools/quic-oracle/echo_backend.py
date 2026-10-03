@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
+
 """A one-response HTTP/1.1 backend for the QUIC oracle. Prints its port on stdout."""
 import socket
 import threading

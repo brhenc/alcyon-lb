@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
+
 """Keep-alive repro: 3 requests on one client connection, two backend styles.
 usage: ka_repro.py <proxy-binary> [runs]"""
 import socket, subprocess, sys, tempfile, threading, time

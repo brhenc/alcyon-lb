@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 //
 // HAProxy 1.0 configuration parser, ported to Rust.
 // Derived from HAProxy 1.0.2 (haproxy.c) by Willy Tarreau <willy@meta-x.org>.

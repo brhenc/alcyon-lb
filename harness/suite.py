@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
+
 """Run every test in the workspace and compare against a declared baseline.
 
 `tools/checkin.sh` named four test targets by hand. The workspace has 77, so 73 of them

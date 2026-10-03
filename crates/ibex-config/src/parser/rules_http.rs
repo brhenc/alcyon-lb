@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
+
 use super::{
     find_cond_idx, join_tokens_until, parse_acl_condition_from_tokens, parse_error_body_args,
     parse_rule_condition, parse_sc_counter_action, parse_u16, ConfigError, ErrorPageSource,

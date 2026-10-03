@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 # Start HAProxy 3.5-dev with QUIC in front of a trivial HTTP/1 backend, and prove
 # curl --http3 reaches it. Prints the QUIC port and leaves the daemon running.
 #

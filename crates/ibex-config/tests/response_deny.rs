@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 //! `http-response deny` takes a status and nothing Ibex does not act on.
 //!
 //! `HAProxy` 3.5 accepts the same body arguments as `http-request deny` (`content-type`,

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: LGPL-2.1-only
+// Copyright (C) 2002-2011 Willy Tarreau <w@1wt.eu>. See LICENSE.
+
 //! Randomised differential testing against `BTreeMap`.
 //!
 //! Hand-written cases test what the author thought of. These test what they did not.

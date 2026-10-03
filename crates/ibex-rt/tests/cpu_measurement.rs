@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
+
 use ibex_rt::cpu::CpuMonitor;
 use std::time::Duration;
 use ibex_rt::stats::format_show_info;

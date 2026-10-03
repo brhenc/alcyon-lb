@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 """
 Smoke test verifying that Project Ibex starts with a reference configuration,
 terminates TLS on https://localhost:8443/, and proxies requests to an upstream

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// Copyright (C) 2026 Project Ibex Contributors. See LICENSE.
+// Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
 //! `hash-type`, `hash-preserve-affinity` and `balance random(N)`: where they are read and
 //! what is refused (`cfgparse-listen.c`, `backend_parse_balance`).

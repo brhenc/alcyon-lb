@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 //! `curl --http3` against Ibex must return 200.
 //!
 //! Everything below this test existed separately and was never connected: the datagram path

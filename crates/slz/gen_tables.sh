@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2013-2015 Willy Tarreau <w@1wt.eu>. See crates/slz/LICENSE.
 # Extracts tables from haproxy-quic/include/import/slz-tables.h
 H="../../reference/haproxy-quic"
 cat << 'RUST' > src/tables.rs

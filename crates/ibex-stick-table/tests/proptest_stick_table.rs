@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 //! Property-based tests for `StickTable` storage engine and `StickKey` operations.
 
 use ibex_stick_table::{KeyType, StickKey, StickTable, StickTableConfig};

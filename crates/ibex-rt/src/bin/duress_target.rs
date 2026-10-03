@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 //! A QUIC listener driven by the real engine, for duress measurement.
 //!
 //! The first version of this binary drove `ibex_quic::listener::QuicListener` from its own

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
+
 """QUIC Rapid Reset and Stream Flood Duress Test Script.
 
 The QUIC analogue of HTTP/2 Rapid Reset (CVE-2023-44487):

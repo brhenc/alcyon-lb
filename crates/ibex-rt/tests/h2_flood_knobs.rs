@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
 //! The HTTP/2 flood-mitigation knobs, matched to `HAProxy`'s.
 //!

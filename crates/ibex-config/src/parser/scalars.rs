@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
+
 use super::*;
 
 pub(crate) fn parse_timeout(token: &Token, keyword: &str) -> Result<Duration, ConfigError> {

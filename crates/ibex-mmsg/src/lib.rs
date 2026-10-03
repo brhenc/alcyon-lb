@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 // `cast_possible_truncation` is allowed because counts are bounded by `BATCH_MAX` (64), `AF_INET` fits in `sa_family_t`, and `size_of_val` returns small constants.
 #![allow(clippy::cast_possible_truncation)]
 #![allow(unsafe_code)]

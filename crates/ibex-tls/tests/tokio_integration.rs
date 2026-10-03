@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// Copyright (C) 2026 Ibex contributors. See LICENSE.
+// Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
 //! Real TCP loopback integration test verifying TLS 1.3 handshake, SNI resolution,
 //! ALPN negotiation, and HTTP transactions over network sockets.

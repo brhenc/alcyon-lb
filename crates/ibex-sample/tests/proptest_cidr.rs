@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 //! Property-based tests for IPv4 and IPv6 CIDR matching in `Matcher`.
 
 use ibex_sample::{Matcher, Sample};

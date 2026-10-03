@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 #![forbid(unsafe_code)]
 #![allow(clippy::similar_names, clippy::too_many_lines, clippy::doc_markdown)]
 

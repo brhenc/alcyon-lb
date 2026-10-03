@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: LGPL-2.1-only
+// Copyright (C) 2002-2011 Willy Tarreau <w@1wt.eu>. See LICENSE.
+
 //! Stateful randomised testing: arbitrary interleavings of insert and delete, with
 //! structural invariants verified after *every* operation.
 //!

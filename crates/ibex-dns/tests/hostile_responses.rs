@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 //! A DNS response is attacker-influenced input.
 //!
 //! The resolver reads packets from whatever answered, which on a hostile network is not

@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 # End-to-end hitless reload under a real systemd, using admin/systemd/ibex.service.
 #
 # Starts Ibex as a user unit, keeps opening fresh connections against it the whole time,

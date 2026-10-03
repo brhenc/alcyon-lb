@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
+
 #![allow(clippy::field_reassign_with_default)]
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;

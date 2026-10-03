@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 //! Discrepancy Reporting, Corpus Serialization, and Hex Dump Formatter.
 //!
 //! Generates `fuzz/corpus/` raw files and formats `fuzz/FINDINGS.md`.

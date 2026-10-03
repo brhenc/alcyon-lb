@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
 //! End-to-end parity test: curl against `HAProxy` 1.0.2 vs Ibex proxy runtime.
 //!

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
+
 """Every line a change touched must be executed by a test.
 
 The dominant defect this project has shipped is one thing wearing several hats: the test

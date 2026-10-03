@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
+
 use ibex_proto::h3::H3Error;
 use ibex_proto::qpack::decode_qpack_static;
 

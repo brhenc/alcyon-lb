@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
+
 //! `thread_alloc_counters` counts the calling thread only, through every allocator entry.
 
 use ibex_alloc::{thread_alloc_counters, CountingAllocator};

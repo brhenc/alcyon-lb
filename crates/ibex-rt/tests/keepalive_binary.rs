@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 //! Client keep-alive against the real binary, three requests down one connection, measured
 //! against `HAProxy` 3.5 with the same configuration (3 of 3 in both cases below).
 //!

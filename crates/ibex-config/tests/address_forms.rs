@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
+
 //! Address forms, measured against what the reference binary accepts.
 //!
 //! `${VAR}` expansion landed in `parser/address.rs` under T62 and matches HAProxy on the

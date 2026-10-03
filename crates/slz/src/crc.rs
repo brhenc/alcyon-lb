@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2013-2015 Willy Tarreau <w@1wt.eu>. See crates/slz/LICENSE.
+
 use crate::tables::CRC32_FAST;
 
 pub fn crc32_by4(mut crc: u32, buf: &[u8]) -> u32 {

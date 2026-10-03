@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 // Integration tests for HTTP mode: GET/POST, cookie persistence, and confirmation
 // that the legacy cliexp/srvexp rewrite path is gone.
 

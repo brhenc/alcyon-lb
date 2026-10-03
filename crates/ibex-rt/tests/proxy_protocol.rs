@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 // Integration and End-to-End tests for PROXY protocol (v1 & v2) support in Project Ibex.
 
 mod common;

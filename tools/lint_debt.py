@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
+
 """Inventory every clippy suppression in the tree.
 
 `cargo clippy -D warnings` exiting 0 means nothing on its own if the lints were turned

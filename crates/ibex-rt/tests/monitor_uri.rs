@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 //! `monitor-uri` against the real binary. The expected bytes are what `HAProxy` 3.5 sends
 //! for the same configuration, captured from the reference binary.
 

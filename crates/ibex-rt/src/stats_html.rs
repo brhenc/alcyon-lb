@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 // Modern Single-Page Web Stats Dashboard & Web Admin UI for Ibex.
-// Copyright (C) 2000-2026 Willy Tarreau and Ibex contributors. See LICENSE.
 
 #![allow(clippy::too_many_lines, clippy::format_push_string)]
 

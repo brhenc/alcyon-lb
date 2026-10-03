@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
+
 use std::net::UdpSocket;
 use std::os::fd::AsFd;
 use ibex_mmsg::{sendmmsg, SendMsg, recvmmsg, RecvMsg};

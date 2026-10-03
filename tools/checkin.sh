@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 # Supervisor check-in: one command, everything needed to judge agy's progress.
 #
 # Uses its own target directory so it never contends with a build agy is running.

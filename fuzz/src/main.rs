@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 //! Ibex HTTP/1 Parser Differential Fuzzing Harness.
 //!
 //! Compares Ibex's HTTP/1 parser (`crates/ibex-proto`) against HAProxy 3.5 (`/home/bhenc/reference/haproxy/haproxy`)

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 //! Reloads, driven through the real binary the way an operator or systemd drives them.
 //!
 //! A reload is two processes overlapping: the new one starts on the same config, then tells

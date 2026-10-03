@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 //
 // `errorfile`, `errorfiles`, `http-errors` and `http-error`: operator-supplied
 // replacements for the pages Ibex (like HAProxy) generates itself for a denied request,

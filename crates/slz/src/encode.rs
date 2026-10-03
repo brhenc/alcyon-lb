@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2013-2015 Willy Tarreau <w@1wt.eu>. See crates/slz/LICENSE.
+
 use crate::tables::*;
 use crate::{Encoder, SLZ_MAX_DEBT, SLZ_SWITCH_COST, HASH_BITS, SLZ_ST_EOB, SLZ_ST_FIXED, SLZ_ST_LAST, SLZ_ST_DONE};
 

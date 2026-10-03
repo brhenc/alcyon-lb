@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 //! The HTTP transaction against the real binary: where a request ends, where a response
 //! ends, and what happens to the connection afterwards (design 010, step 1).
 //!

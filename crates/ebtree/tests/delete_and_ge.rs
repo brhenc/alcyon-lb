@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: LGPL-2.1-only
+// Copyright (C) 2002-2011 Willy Tarreau <w@1wt.eu>. See LICENSE.
+
 //! Tests for `delete` and `lookup_ge`.
 //!
 //! Delete is the subtle operation: removing a node's leaf half may leave its link half

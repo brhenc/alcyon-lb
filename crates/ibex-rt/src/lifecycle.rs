@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
+
 //! Process lifecycle: the signals `HAProxy` uses to stop and reload, as flags the run loop
 //! observes.
 //!

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
+
 """Tests for the base covercheck judges a change against, and which lines it calls changed.
 
 Run:  python3 -m unittest harness/test_covercheck.py

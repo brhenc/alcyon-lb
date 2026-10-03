@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2013-2015 Willy Tarreau <w@1wt.eu>. See crates/slz/LICENSE.
+
 use slz::{Encoder, Format, Level};
 use serde::Deserialize;
 use std::fs;

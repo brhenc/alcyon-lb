@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 //! Property-based tests for the 7x7 sample cast engine.
 
 use ibex_proto::htx::HttpMethod;

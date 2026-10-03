@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
+
 //! Shared helpers for the ibex-rt integration tests.
 //!
 //! Each test file that uses this says `mod common;`; not every file uses every helper.

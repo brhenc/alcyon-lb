@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 // Integration tests for HAProxy Connection Handling and Session Administration.
-// Copyright (C) 2000-2026 Willy Tarreau and Ibex contributors. See LICENSE.
 
 mod common;
 

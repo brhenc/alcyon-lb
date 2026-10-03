@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// Copyright (C) 2026 Project Ibex Contributors. See LICENSE.
+// Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
 //! Read syscalls per keep-alive request, counted in-process (`raw::read_counters`).
 //!

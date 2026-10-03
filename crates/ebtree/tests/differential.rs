@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: LGPL-2.1-only
+// Copyright (C) 2002-2011 Willy Tarreau <w@1wt.eu>. See LICENSE.
+
 //! Differential and structural tests for `Eb32Tree`.
 //!
 //! The oracle is `BTreeMap`: for any sequence of insertions, ascending traversal of the

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// Copyright (C) 2026 Project Ibex Contributors. See LICENSE.
+// Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
 //! `http-request set-dst-port` and `http-request set-retries`, and servers without a
 //! port, as the reference `HAProxy` (3.5-dev8-885761-29) accepts and refuses them with

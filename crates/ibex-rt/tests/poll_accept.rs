@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
 //! End-to-end: epoll reports a pending connection, the listener accepts it, and bytes
 //! move. This is the smallest thing that proves the runtime's foundation works rather

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
 use ibex_config::parser::parse_str;
 use ibex_rt::{Engine, ServerStatus};

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
+
 """Run the HTTP transaction tests against the reference HAProxy, to see when HAProxy changes.
 
 `crates/ibex-rt/tests/http_txn.rs` drives a proxy binary over real sockets, and every case
