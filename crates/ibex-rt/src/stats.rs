@@ -696,6 +696,7 @@ mod tests {
             tcp_res_content_rules: Vec::new(),
             tcp_res_inspect_delay: None,
             http_req_rules: Vec::new(),
+            http_req_capture_exprs: Vec::new(),
             http_res_rules: Vec::new(),
             http_after_res_rules: Vec::new(),
             http_reuse: ibex_config::HttpReuse::default(),

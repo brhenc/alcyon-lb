@@ -179,6 +179,9 @@ pub struct Proxy {
     pub tcp_res_content_rules: Vec<ibex_config::TcpResContentRule>,
     pub tcp_res_inspect_delay: Option<Duration>,
     pub http_req_rules: Vec<ibex_config::HttpReqRule>,
+    /// `http_req_rules`' `capture` expressions, compiled when the proxy is built: one entry
+    /// per rule, `None` for any other action.
+    pub http_req_capture_exprs: Vec<Option<Expr>>,
     pub http_res_rules: Vec<ibex_config::HttpResRule>,
     pub http_after_res_rules: Vec<ibex_config::HttpAfterResRule>,
     /// Indices into [`Engine::log_targets`]. Held as indices rather than targets because
@@ -700,6 +703,19 @@ fn capture_slots(
     slots.into()
 }
 
+/// The `http-request capture` expressions of `rules`, parsed once, parallel to the rules.
+/// `Expr::parse` was running on every request; an expression that does not parse was
+/// refused when the configuration loaded.
+fn compile_capture_exprs(rules: &[ibex_config::HttpReqRule]) -> Vec<Option<Expr>> {
+    rules
+        .iter()
+        .map(|r| match &r.action {
+            ibex_config::HttpReqAction::Capture { expr, .. } => Expr::parse(expr).ok(),
+            _ => None,
+        })
+        .collect()
+}
+
 /// The host name, read once: `%H`.
 pub(crate) fn log_hostname() -> &'static str {
     static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -1164,6 +1180,7 @@ fn init_proxy_from_listen(proxy_idx: usize, listen: &ibex_config::ListenSection,
         tcp_req_inspect_delay: listen.tcp_req_inspect_delay,
         tcp_res_content_rules: listen.tcp_res_content_rules.clone(),
         tcp_res_inspect_delay: listen.tcp_res_inspect_delay,
+        http_req_capture_exprs: compile_capture_exprs(&http_req_rules),
         http_req_rules,
         http_res_rules: listen.http_res_rules.clone(),
         http_after_res_rules: listen.http_after_res_rules.clone(),
@@ -1257,6 +1274,7 @@ fn init_proxy_from_frontend(proxy_idx: usize, fe: &ibex_config::FrontendSection,
         tcp_req_inspect_delay: fe.tcp_req_inspect_delay,
         tcp_res_content_rules: Vec::new(),
         tcp_res_inspect_delay: None,
+        http_req_capture_exprs: compile_capture_exprs(&http_req_rules),
         http_req_rules,
         http_res_rules: fe.http_res_rules.clone(),
         http_after_res_rules: fe.http_after_res_rules.clone(),
@@ -1372,6 +1390,7 @@ fn init_proxy_from_backend(proxy_idx: usize, be: &ibex_config::BackendSection, n
         tcp_req_inspect_delay: be.tcp_req_inspect_delay,
         tcp_res_content_rules: be.tcp_res_content_rules.clone(),
         tcp_res_inspect_delay: be.tcp_res_inspect_delay,
+        http_req_capture_exprs: compile_capture_exprs(&be.http_req_rules),
         http_req_rules: be.http_req_rules.clone(),
         http_res_rules: be.http_res_rules.clone(),
         http_after_res_rules: be.http_after_res_rules.clone(),
@@ -5402,7 +5421,7 @@ impl EngineDispatcher<'_> {
 
         let act_conn = proxies[proxy_idx].stats[worker_id()].act_conn.load(Ordering::Relaxed);
         let cum_conn = proxies[proxy_idx].stats[worker_id()].cum_conn.load(Ordering::Relaxed);
-        let eval_http_rules = |rules: &[ibex_config::HttpReqRule], acls: &HashMap<String, Expr>, sess: &mut TcpSession, be_retries: u16, fe_name: Option<&str>, be_name: Option<&str>, pages_idx: usize| -> Result<Option<()>, u16> {
+        let eval_http_rules = |rules: &[ibex_config::HttpReqRule], capture_exprs: &[Option<Expr>], acls: &HashMap<String, Expr>, sess: &mut TcpSession, be_retries: u16, fe_name: Option<&str>, be_name: Option<&str>, pages_idx: usize| -> Result<Option<()>, u16> {
             macro_rules! make_ctx {
                 ($s:expr) => {
                     SampleContext {
@@ -5433,7 +5452,7 @@ impl EngineDispatcher<'_> {
                 };
             }
 
-            for rule in rules {
+            for (rule_idx, rule) in rules.iter().enumerate() {
                 let matches = match &rule.cond {
                     None => true,
                     Some(cond) => eval_condition(cond, &make_ctx!(sess), acls, registry),
@@ -5831,11 +5850,12 @@ impl EngineDispatcher<'_> {
                             }
                         }
                     }
-                    ibex_config::HttpReqAction::Capture { expr, len, id } => {
+                    ibex_config::HttpReqAction::Capture { len, id, .. } => {
                         // No sample, no capture: the slot stays empty (`-` in `%hrl`).
                         // The expression was checked when the configuration loaded.
-                        let val = Expr::parse(expr)
-                            .ok()
+                        let val = capture_exprs
+                            .get(rule_idx)
+                            .and_then(Option::as_ref)
                             .and_then(|e| e.eval_sample(registry, &make_ctx!(sess)))
                             .map(|smp| sample_to_string(&smp));
                         // `id` names one of the frontend's slots (a backend's rule too); without
@@ -5859,7 +5879,7 @@ impl EngineDispatcher<'_> {
         if !proxies[proxy_idx].http_req_rules.is_empty() {
             let fe_rules = &proxies[proxy_idx].http_req_rules;
             let fe_acls = &proxies[proxy_idx].acls;
-            match eval_http_rules(fe_rules, fe_acls, &mut entry.sess, proxies[proxy_idx].retries, Some(&proxies[proxy_idx].name), None, proxy_idx) {
+            match eval_http_rules(fe_rules, &proxies[proxy_idx].http_req_capture_exprs, fe_acls, &mut entry.sess, proxies[proxy_idx].retries, Some(&proxies[proxy_idx].name), None, proxy_idx) {
                 Ok(Some(())) => {
                     entry.sess.log.term.get_or_insert(*b"LR");
                     return None;
@@ -5944,7 +5964,7 @@ impl EngineDispatcher<'_> {
         if be_idx != proxy_idx && !proxies[be_idx].http_req_rules.is_empty() {
             let be_rules = &proxies[be_idx].http_req_rules;
             let be_acls = &proxies[be_idx].acls;
-            match eval_http_rules(be_rules, be_acls, &mut entry.sess, proxies[be_idx].retries, Some(&proxies[proxy_idx].name), Some(&proxies[be_idx].name), be_idx) {
+            match eval_http_rules(be_rules, &proxies[be_idx].http_req_capture_exprs, be_acls, &mut entry.sess, proxies[be_idx].retries, Some(&proxies[proxy_idx].name), Some(&proxies[be_idx].name), be_idx) {
                 Ok(Some(())) => {
                     entry.sess.log.term.get_or_insert(*b"LR");
                     return None;

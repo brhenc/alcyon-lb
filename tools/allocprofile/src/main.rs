@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use ibex_config::ast::{BackendSection, Config, FrontendSection, Mode, Server};
+use ibex_config::ast::{BackendSection, Config, FrontendSection, HttpReqAction, HttpReqRule, Mode, Server};
 use ibex_rt::engine::Engine;
 
 thread_local! {
@@ -101,8 +101,18 @@ fn main() {
     let (fl, fa) = loopback0(); drop(fl);
     let run = Arc::new(AtomicBool::new(true));
     let h = backend(sl, Arc::clone(&run));
+    // `ALLOCPROFILE_CAPTURE=1` adds `http-request capture req.hdr(host) len 20`, to profile
+    // that rule's per-request cost (T105).
+    let mut http_req_rules = Vec::new();
+    if std::env::var_os("ALLOCPROFILE_CAPTURE").is_some() {
+        http_req_rules.push(HttpReqRule {
+            action: HttpReqAction::Capture { expr: "req.hdr(host)".into(), len: Some(20), id: None },
+            cond: None,
+        });
+    }
     let cfg = Config {
         frontends: vec![FrontendSection { name: "fe".into(), bind: Some(fa), mode: Mode::Http,
+            http_req_rules,
             default_backend: Some("be".into()), clitimeout: Some(Duration::from_secs(5)),
             ..Default::default() }],
         backends: vec![BackendSection { name: "be".into(), mode: Mode::Http,
