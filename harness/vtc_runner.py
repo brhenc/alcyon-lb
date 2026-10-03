@@ -1516,8 +1516,22 @@ class MockClientRunner:
                         await writer.drain()
 
                     elif cmd == "recv":
+                        # vtest reads exactly <n> bytes, failing on an early EOF.
                         n_bytes = int(args[0]) if args else 4096
-                        await reader.read(n_bytes)
+                        try:
+                            await reader.readexactly(n_bytes)
+                        except asyncio.IncompleteReadError as e:
+                            raise AssertionError(f"recv {n_bytes}: connection closed after {len(e.partial)} byte(s)")
+
+                    elif cmd == "expect_close":
+                        # vtest: the peer closes (EOF or reset) and sends nothing more.
+                        _note_assertion()
+                        try:
+                            extra = await reader.read(1)
+                        except ConnectionResetError:
+                            extra = b""
+                        if extra:
+                            raise AssertionError(f"expect_close: read {extra!r} instead of a close")
 
                     elif cmd == "barrier":
                         if len(args) >= 2 and args[1] == "sync":
@@ -1996,8 +2010,11 @@ class VtcExecutor:
                     else:
                         if start_imm:
                             cli_sock = os.path.join(self.tmpdir, f"{haproxy_id}.sock")
+                            # HAProxy only takes a master CLI (`-S`) in master-worker
+                            # mode; without `-W` the oracle refuses to start at all.
+                            mw = ["-W"] if "haproxy" in os.path.basename(self.target_binary) else []
                             proc = subprocess.Popen(
-                                [self.target_binary, "-f", cfg_path, "-S", cli_sock, "-d"],
+                                [self.target_binary, "-f", cfg_path, "-S", cli_sock, "-d", *mw],
                                 stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE,
                             )
