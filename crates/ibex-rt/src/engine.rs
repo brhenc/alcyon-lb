@@ -3594,6 +3594,17 @@ impl EngineDispatcher<'_> {
             // Between requests. A client that goes away here ends the session; a server
             // connection kept from the last transaction goes back to the pool.
             if !matches!(entry.sess.cli_state, ScState::Ready | ScState::Established) {
+                // `timeout client` before a request head is complete: HAProxy answers 408
+                // (`h1_handle_req_tout`, `src/mux_h1.c`) from the frontend's pages, also on
+                // a new connection that sent nothing. Only a keep-alive connection waiting
+                // for its next request, with nothing of one on it, closes silently.
+                if entry.sess.ending == Some(crate::proxy::Ending::Timeout(crate::proxy::Which::Client))
+                    && (!entry.sess.req.is_empty() || entry.sess.is_first_req)
+                {
+                    let fe = &proxies[entry.proxy_idx];
+                    let page = proxy_error_response(&entry.sess, fe, fe, 408);
+                    entry.sess.send_before_close(&page);
+                }
                 close_http_session(entry, proxies, fdtab, poller, idle_pool, true);
             } else if entry.sess.srv.is_some()
                 && (!entry.sess.rep.is_empty()
@@ -4061,7 +4072,9 @@ impl EngineDispatcher<'_> {
         let hdr_bytes = &entry.sess.rep.readable()[..total_hdr_len];
         let hdr_str = String::from_utf8_lossy(hdr_bytes).into_owned();
 
-        let Some((first_line, rest_headers)) = hdr_str.split_once("\r\n") else {
+        // Bare-LF line ends are a head too (`find_eoh` accepts them, as HAProxy's parser
+        // does); split only on CRLF, such a head skipped every rule.
+        let Some((first_line, rest_headers)) = hdr_str.split_once("\r\n").or_else(|| hdr_str.split_once('\n')) else {
             set_rsp(entry);
             return;
         };
@@ -4128,6 +4141,9 @@ impl EngineDispatcher<'_> {
             ..Default::default()
         };
 
+        // `tcp-response content reject`: the response is dropped and the client connection
+        // closed with nothing sent, as HAProxy does -- not answered with a 502.
+        let mut rejected = false;
         let failed: Option<u16> = 'rules: {
             // 0. Apply be.tcp_res_content_rules
             for rule in &proxies[be_idx].tcp_res_content_rules {
@@ -4141,7 +4157,8 @@ impl EngineDispatcher<'_> {
                 match &rule.action {
                     ibex_config::TcpReqContentAction::Accept => break,
                     ibex_config::TcpReqContentAction::Reject | ibex_config::TcpReqContentAction::SilentDrop => {
-                        break 'rules Some(502);
+                        rejected = true;
+                        break 'rules None;
                     }
                     ibex_config::TcpReqContentAction::SetVar { var_name, expr } => {
                         let val = if let Ok(e) = Expr::parse(expr) {
@@ -4187,7 +4204,9 @@ impl EngineDispatcher<'_> {
                     return Ok(false);
                 }
                 if act_name == "\0deny" {
-                    let deny_st = act_fmt.parse::<u16>().unwrap_or(403);
+                    // `http-response deny` with no status is a 502 in HAProxy (the
+                    // server's response is what was refused); 403 is the request side's.
+                    let deny_st = act_fmt.parse::<u16>().unwrap_or(502);
                     return Err(deny_st);
                 }
                 if act_name == "\0set-status" {
@@ -4503,6 +4522,14 @@ impl EngineDispatcher<'_> {
             }
             None
         };
+        if rejected {
+            entry.sess.rep.clear();
+            if let Some(txn) = entry.sess.txn.as_mut() {
+                txn.close_after = true;
+                txn.aborted = true;
+            }
+            return;
+        }
         if let Some(st) = failed {
             entry.sess.rep.clear();
             reply_error(entry, proxies, st);
@@ -5003,7 +5030,7 @@ impl EngineDispatcher<'_> {
 
         let act_conn = proxies[proxy_idx].stats[worker_id()].act_conn.load(Ordering::Relaxed);
         let cum_conn = proxies[proxy_idx].stats[worker_id()].cum_conn.load(Ordering::Relaxed);
-        let eval_http_rules = |rules: &[ibex_config::HttpReqRule], acls: &HashMap<String, Expr>, sess: &mut TcpSession, target_addr: Option<SocketAddr>, fe_name: Option<&str>, be_name: Option<&str>| -> Result<Option<()>, u16> {
+        let eval_http_rules = |rules: &[ibex_config::HttpReqRule], acls: &HashMap<String, Expr>, sess: &mut TcpSession, target_addr: Option<SocketAddr>, fe_name: Option<&str>, be_name: Option<&str>, pages_idx: usize| -> Result<Option<()>, u16> {
             macro_rules! make_ctx {
                 ($s:expr) => {
                     SampleContext {
@@ -5046,7 +5073,7 @@ impl EngineDispatcher<'_> {
                         lf_string,
                         error_page,
                     } => {
-                        let body = resolve_error_body(&proxies[proxy_idx], *status, error_page.as_ref(), content_type.as_ref(), lf_string.as_ref());
+                        let body = resolve_error_body(&proxies[pages_idx], &proxies[proxy_idx], *status, error_page.as_ref(), content_type.as_ref(), lf_string.as_ref());
                         let full_resp: Vec<u8> = match body {
                             ResolvedErrorBody::Raw(bytes) => bytes.to_vec(),
                             ResolvedErrorBody::Custom { content_type, lf_string } => {
@@ -5063,7 +5090,7 @@ impl EngineDispatcher<'_> {
                         error_page,
                     } => {
                         let status_code = deny_status.unwrap_or(403);
-                        let body = resolve_error_body(&proxies[proxy_idx], status_code, error_page.as_ref(), content_type.as_ref(), lf_string.as_ref());
+                        let body = resolve_error_body(&proxies[pages_idx], &proxies[proxy_idx], status_code, error_page.as_ref(), content_type.as_ref(), lf_string.as_ref());
                         let resp: Vec<u8> = match body {
                             ResolvedErrorBody::Raw(bytes) => bytes.to_vec(),
                             ResolvedErrorBody::Custom { content_type, lf_string } => {
@@ -5431,7 +5458,7 @@ impl EngineDispatcher<'_> {
         if !proxies[proxy_idx].http_req_rules.is_empty() {
             let fe_rules = &proxies[proxy_idx].http_req_rules;
             let fe_acls = &proxies[proxy_idx].acls;
-            match eval_http_rules(fe_rules, fe_acls, &mut entry.sess, entry.target_addr, Some(&proxies[proxy_idx].name), None) {
+            match eval_http_rules(fe_rules, fe_acls, &mut entry.sess, entry.target_addr, Some(&proxies[proxy_idx].name), None, proxy_idx) {
                 Ok(Some(())) => return None,
                 Err(status) => {
                     reply_error(entry, proxies, status);
@@ -5507,7 +5534,7 @@ impl EngineDispatcher<'_> {
         if be_idx != proxy_idx && !proxies[be_idx].http_req_rules.is_empty() {
             let be_rules = &proxies[be_idx].http_req_rules;
             let be_acls = &proxies[be_idx].acls;
-            match eval_http_rules(be_rules, be_acls, &mut entry.sess, entry.target_addr, Some(&proxies[proxy_idx].name), Some(&proxies[be_idx].name)) {
+            match eval_http_rules(be_rules, be_acls, &mut entry.sess, entry.target_addr, Some(&proxies[proxy_idx].name), Some(&proxies[be_idx].name), be_idx) {
                 Ok(Some(())) => return None,
                 Err(status) => {
                     reply_error(entry, proxies, status);
@@ -6457,49 +6484,60 @@ fn del_req_header(sess: &mut TcpSession, name: &str) {
 }
 
 fn replace_req_header(sess: &mut TcpSession, name: &str, regex: &str, repl: &str) -> Result<(), ()> {
-    sess.with_htx_mut(|htx| {
-        let _ = htx.replace_header(name, regex, repl);
-    });
-    let mut hdrs = sess.req_headers.take().unwrap_or_default();
-    let re = regex::Regex::new(regex).map_err(|_| ())?;
-    let rust_repl = translate_backreferences(repl);
-    let strict = STRICT_MODE.get();
-
-    for (k, v) in &mut hdrs {
-        if k.eq_ignore_ascii_case(name) {
-            let new_v = re.replace_all(v, &rust_repl).to_string();
-            if strict && new_v.len() > 1_048_575 {
-                sess.req_headers = Some(hdrs);
-                return Err(());
-            }
-            *v = new_v;
-        }
-    }
-    sess.req_headers = Some(hdrs);
-    rebuild_req_buffer(sess);
-    Ok(())
+    rewrite_req_header_values(sess, name, regex, repl, false)
 }
 
 fn replace_req_value(sess: &mut TcpSession, name: &str, regex: &str, repl: &str) -> Result<(), ()> {
-    sess.with_htx_mut(|htx| {
-        let _ = htx.replace_header(name, regex, repl);
-    });
-    let mut hdrs = sess.req_headers.take().unwrap_or_default();
+    rewrite_req_header_values(sess, name, regex, repl, true)
+}
+
+/// `replace-header` (`per_value` false: the whole value) and `replace-value` (`per_value`
+/// true: each comma-separated value, trimmed, rejoined with `,` as HAProxy rejoins them) on
+/// the request, `repl` written with HAProxy's `\N` back-references.
+///
+/// The head is the HTX one. The replacement given to it was `repl` untranslated, so a
+/// back-reference arrived as the literal text `\1`, and `replace-value` was applied to the
+/// whole value; the translated, per-value form went only to `req_headers`, which is empty
+/// once the head has been parsed into HTX. And the growth was checked only against a 1 MB
+/// ceiling, so a value expanded past the buffer was forwarded where HAProxy answers 500:
+/// it now comes out of the `maxrewrite` budget `add-header` and `set-header` use, and
+/// fails the request under `strict-mode on`.
+fn rewrite_req_header_values(
+    sess: &mut TcpSession,
+    name: &str,
+    regex: &str,
+    repl: &str,
+    per_value: bool,
+) -> Result<(), ()> {
     let re = regex::Regex::new(regex).map_err(|_| ())?;
     let rust_repl = translate_backreferences(repl);
-    let strict = STRICT_MODE.get();
-
-    for (k, v) in &mut hdrs {
-        if k.eq_ignore_ascii_case(name) {
-            let new_v = re.replace_all(v, &rust_repl).to_string();
-            if strict && new_v.len() > 1_048_575 {
-                sess.req_headers = Some(hdrs);
-                return Err(());
-            }
-            *v = new_v;
+    let rewrite = |v: &str| -> String {
+        if per_value {
+            v.split(',').map(|p| re.replace_all(p.trim(), rust_repl.as_str()).into_owned()).collect::<Vec<_>>().join(",")
+        } else {
+            re.replace_all(v, rust_repl.as_str()).into_owned()
         }
+    };
+    let edits: Vec<(String, String)> = sess.htx_slice().map_or_else(Vec::new, |h| {
+        h.headers()
+            .filter(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| (v.to_string(), rewrite(v)))
+            .filter(|(old, new)| old != new)
+            .collect()
+    });
+    let growth: usize = edits.iter().map(|(old, new)| new.len().saturating_sub(old.len())).sum();
+    let total = REWRITE_ADDED_BYTES.get() + growth;
+    if total > MAX_REWRITE_LIMIT.get() {
+        return if STRICT_MODE.get() { Err(()) } else { Ok(()) };
     }
-    sess.req_headers = Some(hdrs);
+    REWRITE_ADDED_BYTES.set(total);
+    sess.with_htx_mut(|htx| {
+        for (old, new) in &edits {
+            // Each value is replaced whole and literally: `$` is the only special
+            // character in a `regex` replacement.
+            let _ = htx.replace_header(name, &format!("^{}$", regex::escape(old)), &new.replace('$', "$$"));
+        }
+    });
     rebuild_req_buffer(sess);
     Ok(())
 }
@@ -6708,8 +6746,13 @@ enum ResolvedErrorBody<'a> {
 /// The data path this closes: a denied request whose proxy configured `errorfile 403
 /// site.http` used to always get Ibex's hardcoded 403 body; this is the line where it
 /// picks up the operator's file instead.
+///
+/// `be` is the proxy whose rule is answering (the frontend itself before a backend is
+/// chosen) and `fe` the frontend: the proxy's own page wins, then the frontend's, as
+/// `http_error_message` picks `s->be` then `strm_fe(s)`.
 fn resolve_error_body<'a>(
-    proxy: &'a Proxy,
+    be: &'a Proxy,
+    fe: &'a Proxy,
     status: u16,
     error_page: Option<&'a ibex_config::ErrorPageSource>,
     content_type: Option<&'a String>,
@@ -6726,18 +6769,20 @@ fn resolve_error_body<'a>(
             lf_string: lf_string.as_deref(),
         },
         Some(ibex_config::ErrorPageSource::DefaultErrorfiles) => {
-            match proxy.error_replies.get(&status) {
-                Some(ibex_config::ErrorPageSource::Raw(bytes)) => return ResolvedErrorBody::Raw(bytes.as_slice()),
-                Some(ibex_config::ErrorPageSource::Custom { content_type, lf_string }) => {
-                    return ResolvedErrorBody::Custom {
-                        content_type: content_type.as_deref(),
-                        lf_string: lf_string.as_deref(),
-                    };
+            for proxy in [be, fe] {
+                match proxy.error_replies.get(&status) {
+                    Some(ibex_config::ErrorPageSource::Raw(bytes)) => return ResolvedErrorBody::Raw(bytes.as_slice()),
+                    Some(ibex_config::ErrorPageSource::Custom { content_type, lf_string }) => {
+                        return ResolvedErrorBody::Custom {
+                            content_type: content_type.as_deref(),
+                            lf_string: lf_string.as_deref(),
+                        };
+                    }
+                    Some(ibex_config::ErrorPageSource::DefaultErrorfiles) | None => {}
                 }
-                Some(ibex_config::ErrorPageSource::DefaultErrorfiles) | None => {}
-            }
-            if let Some(bytes) = proxy.error_files.get(&status) {
-                return ResolvedErrorBody::Raw(bytes.as_slice());
+                if let Some(bytes) = proxy.error_files.get(&status) {
+                    return ResolvedErrorBody::Raw(bytes.as_slice());
+                }
             }
             if let Some(builtin) = builtin_error_page(status) {
                 return ResolvedErrorBody::Raw(builtin);

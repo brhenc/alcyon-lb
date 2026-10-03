@@ -191,6 +191,10 @@ pub enum ErrorPageSource {
     /// `http-error`'s inline templated body (`content-type`/`hdr`/`string`/`lf-string`),
     /// built at request/response time against the denying request -- the same encoding
     /// `http-request return`'s own `content_type`/`lf_string` fields use.
+    ///
+    /// On `deny`/`return`, `Custom { None, None }` is also what `errorfiles <name>` names
+    /// when the section has no page for the status: `HAProxy` then sends the status line
+    /// with `content-length: 0`, which is what an empty template builds.
     Custom {
         content_type: Option<String>,
         lf_string: Option<String>,

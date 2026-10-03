@@ -28,8 +28,7 @@ fn ibex_bin() -> std::path::PathBuf {
 struct Daemon(Child);
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        common::stop(&mut self.0);
     }
 }
 
@@ -1111,4 +1110,106 @@ fn h2_backend_headers_match_haproxy_reference_oracle() {
         "Forwarded HTTP/1.1 headers between Ibex and HAProxy oracle must match identically.\nIbex saw: {:?}\nHAProxy saw: {:?}",
         ibex_got[0], haproxy_got[0]
     );
+}
+
+// ---- responses the HTTP/1 server shapes oddly ---------------------------------------
+
+/// A backend that answers every request with `raw`, then closes.
+fn raw_backend(raw: &'static [u8]) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind backend");
+    let port = listener.local_addr().expect("addr").port();
+    thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut c) = conn else { continue };
+            c.set_read_timeout(Some(Duration::from_secs(3))).ok();
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                match c.read(&mut tmp) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                }
+            }
+            let _ = c.write_all(raw);
+        }
+    });
+    port
+}
+
+/// One h2c GET for `/` through a daemon in front of `backend_port`; the frames that come
+/// back within two seconds.
+fn h2_get_through(backend_port: u16) -> Vec<(u8, u8, u32, Vec<u8>)> {
+    let port = common::reserve_port();
+    let cfg = tempfile::NamedTempFile::new().expect("tmp");
+    std::fs::write(
+        cfg.path(),
+        format!(
+            "defaults\n\tmode http\n\ttimeout connect 3s\n\ttimeout client 10s\n\ttimeout server 10s\n\n\
+             frontend fe\n\tbind 127.0.0.1:{port}\n\tdefault_backend be\n\n\
+             backend be\n\tserver s1 127.0.0.1:{backend_port}\n"
+        ),
+    )
+    .expect("write config");
+    let _d = Daemon(
+        Command::new(ibex_bin())
+            .arg("-f")
+            .arg(cfg.path())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn ibex"),
+    );
+    assert!(wait_for_port(port), "the daemon never listened on {port}");
+    let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    s.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").expect("preface");
+    s.write_all(&frame(0x04, 0, 0, &[])).expect("settings");
+    s.write_all(&frame(0x01, 0x05, 1, &hpack_get("/"))).expect("headers");
+    recv_h2_frames(&mut s, Duration::from_secs(2))
+}
+
+/// Whether a `:status 200` HEADERS (HPACK static index 8, `0x88`) came on stream 1, and
+/// the DATA bytes on it.
+fn status_200_and_data(frames: &[(u8, u8, u32, Vec<u8>)]) -> (bool, Vec<u8>) {
+    let ok = frames.iter().any(|(t, _, sid, p)| *t == 0x01 && *sid == 1 && p.first() == Some(&0x88));
+    let data = frames
+        .iter()
+        .filter(|(t, _, sid, _)| *t == 0x00 && *sid == 1)
+        .flat_map(|(_, _, _, p)| p.clone())
+        .collect();
+    (ok, data)
+}
+
+/// An unsolicited interim `100 Continue` from the HTTP/1 server ahead of the final
+/// response: the final response reaches the HTTP/2 client, the interim one is dropped
+/// (`h2_forward_response`).
+///
+/// NOT what `HAProxy` 3.5 does, and deliberately left so: given this exact exchange it sent
+/// nothing at all on the stream within two seconds (curl: HTTP/2 error, exit 16). Ibex's
+/// answer is the useful one; reported for a decision rather than copied.
+#[test]
+fn an_interim_response_ahead_of_the_final_one_reaches_an_h2_client() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let be = raw_backend(b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    let frames = h2_get_through(be);
+    let (ok, data) = status_200_and_data(&frames);
+    assert!(ok, "no :status 200 HEADERS on stream 1: {frames:?}");
+    assert_eq!(data, b"ok", "{frames:?}");
+}
+
+/// The HTTP/1 server closes in the middle of the body: what arrived reaches the HTTP/2
+/// client. `HAProxy` 3.5: HEADERS (`content-length: 100`), DATA `hello`, then
+/// `RST_STREAM CANCEL`.
+///
+/// Not asserted, because Ibex differs: it ends the stream with `END_STREAM` on the DATA
+/// frame, telling the client a truncated body is complete. `H2MuxContext::send_response`
+/// has no way to leave a stream open for a reset; that belongs with per-stream
+/// transactions (design 010 step 5) and is reported, not fixed here.
+#[test]
+fn a_response_cut_short_delivers_what_arrived_to_an_h2_client() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let be = raw_backend(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nhello");
+    let frames = h2_get_through(be);
+    let (ok, data) = status_200_and_data(&frames);
+    assert!(ok, "no :status 200 HEADERS on stream 1: {frames:?}");
+    assert_eq!(data, b"hello", "{frames:?}");
 }

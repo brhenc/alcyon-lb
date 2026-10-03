@@ -42,8 +42,7 @@ fn ibex_bin() -> std::path::PathBuf {
 struct Daemon(Child);
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        common::stop(&mut self.0);
     }
 }
 

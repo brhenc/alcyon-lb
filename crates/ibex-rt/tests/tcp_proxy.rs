@@ -540,8 +540,7 @@ struct TestDaemon(std::process::Child);
 
 impl Drop for TestDaemon {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        common::stop(&mut self.0);
     }
 }
 

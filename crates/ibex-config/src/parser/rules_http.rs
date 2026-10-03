@@ -124,6 +124,7 @@ pub(crate) fn parse_http_req_rule(
         // `deny` (or one with only a status) must still consult the proxy's configured
         // error page, not synthesize an empty body the way a bare `return` does.
         if error_page.is_none() && content_type.is_none() && lf_string.is_none() {
+            super::error_pages::check_default_errorfiles(deny_status.unwrap_or(403), act_token)?;
             error_page = Some(ErrorPageSource::DefaultErrorfiles);
         }
 
@@ -834,7 +835,18 @@ pub(crate) fn parse_http_res_rule(
                 status = Some(parse_u16(&tokens[i + 1], "status")?);
                 i += 2;
             } else {
-                i += 1;
+                // HAProxy also takes a body here (`content-type`, `string`, `hdr`,
+                // `errorfile`, ...). Ibex sends the status's error page and would drop
+                // it, so it is refused until it is implemented (AGENTS.md rule 5); an
+                // unknown word is refused by HAProxy too.
+                return Err(ConfigError::new(
+                    tokens[i].line,
+                    tokens[i].col,
+                    format!(
+                        "'http-response deny' takes only 'status <code>' in Ibex; '{}' is not supported",
+                        tokens[i].text
+                    ),
+                ));
             }
         }
         let cond = if let Some(idx) = cond_idx {

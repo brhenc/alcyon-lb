@@ -80,6 +80,52 @@ pub(crate) fn parse_errorfiles_directive(
     Ok(())
 }
 
+/// The codes `HAProxy` has a built-in page for (`http_err_codes`, `src/http.c`).
+const DEFAULT_PAGE_CODES: [u16; 21] =
+    [200, 400, 401, 403, 404, 405, 407, 408, 410, 413, 414, 421, 422, 425, 429, 431, 500, 501, 502, 503, 504];
+
+/// `default-errorfiles` -- written, or implied by a `deny` with no body -- for a status
+/// with no built-in page. `HAProxy` refuses the rule ("status code '418' not handled by
+/// default with 'default-errorfiles' argument"); Ibex accepted it and sent an empty reply.
+pub(crate) fn check_default_errorfiles(status: u16, at: &Token) -> Result<(), ConfigError> {
+    if DEFAULT_PAGE_CODES.contains(&status) {
+        Ok(())
+    } else {
+        Err(ConfigError::new(
+            at.line,
+            at.col,
+            format!("status code '{status}' not handled by default with 'default-errorfiles' argument"),
+        ))
+    }
+}
+
+/// Parses a proxy's (or `defaults`') `errorfile`, `errorfiles` or `http-error` line.
+///
+/// The three fill what `HAProxy` keeps as one table per proxy, so for a given code the
+/// last declaration wins whichever keyword made it: an `errorfile 403` after an
+/// `http-error status 403` replaces it, and the reverse; `http-error ... default-errorfiles`
+/// clears the code altogether. Ibex keeps the two kinds in two maps (`error_files`,
+/// `error_replies`, the second consulted first), so each declaration removes the code
+/// from the other map.
+pub(crate) fn parse_proxy_error_page(
+    files: &mut HashMap<u16, Vec<u8>>,
+    replies: &mut HashMap<u16, ErrorPageSource>,
+    tokens: &[Token],
+    kw: &Token,
+) -> Result<(), ConfigError> {
+    let mut set = HashMap::new();
+    match kw.text.as_str() {
+        "errorfile" => parse_errorfile_directive(&mut set, tokens, kw)?,
+        "errorfiles" => parse_errorfiles_directive(&mut set, tokens, kw)?,
+        _ => return parse_http_error_directive(files, replies, tokens, kw),
+    }
+    for (code, bytes) in set {
+        replies.remove(&code);
+        files.insert(code, bytes);
+    }
+    Ok(())
+}
+
 /// Parses `http-error status <code> [content-type <type>] [default-errorfiles |
 /// errorfile <file> | errorfiles <name> | file <file> | lf-file <file> | string <str> |
 /// lf-string <fmt>] [hdr <name> <fmt>]*`.
@@ -88,7 +134,12 @@ pub(crate) fn parse_errorfiles_directive(
 /// one: a later error for that status falls back to `errorfile`/`errorfiles` for the
 /// proxy, and ultimately to `HAProxy`'s built-in page, exactly as if `http-error` had never
 /// mentioned that code.
-pub(crate) fn parse_http_error_directive(
+///
+/// Whatever it sets or clears also removes `<code>` from the proxy's `errorfile` table
+/// (`files`), so the later declaration wins. `errorfiles <name>` naming a section without
+/// `<code>` is accepted, as `HAProxy` accepts it (with a warning), and changes nothing.
+fn parse_http_error_directive(
+    files: &mut HashMap<u16, Vec<u8>>,
     replies: &mut HashMap<u16, ErrorPageSource>,
     tokens: &[Token],
     kw: &Token,
@@ -109,14 +160,13 @@ pub(crate) fn parse_http_error_directive(
         Some(raw @ ErrorPageSource::Raw(_)) => {
             replies.insert(code, raw);
         }
-        Some(ErrorPageSource::Custom { .. }) => unreachable!(
-            "parse_error_body_args never returns ErrorPageSource::Custom; only http-error \
-             itself builds one, below"
-        ),
+        // `errorfiles <name>` whose section has no page for `code`: nothing changes.
+        Some(ErrorPageSource::Custom { .. }) => return Ok(()),
         None => {
             replies.insert(code, ErrorPageSource::Custom { content_type, lf_string });
         }
     }
+    files.remove(&code);
     Ok(())
 }
 
@@ -165,6 +215,7 @@ pub(crate) fn parse_error_body_args(
                 i += 3;
             }
             "default-errorfiles" => {
+                check_default_errorfiles(status_for_errorfiles, &tokens[i])?;
                 error_page = Some(ErrorPageSource::DefaultErrorfiles);
                 i += 1;
             }
@@ -174,20 +225,33 @@ pub(crate) fn parse_error_body_args(
             }
             "errorfiles" if i + 1 < limit => {
                 let name = &tokens[i + 1].text;
-                let bytes = http_errors_section_code(name, status_for_errorfiles).ok_or_else(|| {
-                    ConfigError::new(
+                if http_errors_section(name).is_none() {
+                    return Err(ConfigError::new(
                         tokens[i + 1].line,
                         tokens[i + 1].col,
-                        format!(
-                            "http-errors section '{name}' has no errorfile for status {status_for_errorfiles}"
-                        ),
-                    )
-                })?;
-                error_page = Some(ErrorPageSource::Raw(bytes));
+                        format!("unknown http-errors section '{name}'"),
+                    ));
+                }
+                // A section without a page for the status is accepted, as HAProxy accepts
+                // it (with a warning): `deny`/`return` then send an empty reply -- the
+                // status line and `content-length: 0` -- which is what an empty template
+                // builds, and `http-error` leaves the code alone.
+                error_page = Some(match http_errors_section_code(name, status_for_errorfiles) {
+                    Some(bytes) => ErrorPageSource::Raw(bytes),
+                    None => ErrorPageSource::Custom { content_type: None, lf_string: None },
+                });
                 i += 2;
             }
-            _ => {
-                i += 1;
+            // HAProxy refuses a word it does not know here (`'http-request deny' expects
+            // either 'if' or 'unless' ...`, `http-error : unknown keyword ...`), and so
+            // does Ibex: skipping it accepted a line whose argument then did nothing. A
+            // keyword missing its value lands here too.
+            other => {
+                return Err(ConfigError::new(
+                    tokens[i].line,
+                    tokens[i].col,
+                    format!("unknown or incomplete argument '{other}'"),
+                ));
             }
         }
     }

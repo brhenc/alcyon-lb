@@ -378,9 +378,9 @@ pub(crate) fn parse_listen_directive(
             parse_tcp_check_directive(&mut proxy.tcp_checks, tokens, kw)?;
             Ok(())
         }
-        "errorfile" => parse_errorfile_directive(&mut proxy.error_files, tokens, kw),
-        "errorfiles" => parse_errorfiles_directive(&mut proxy.error_files, tokens, kw),
-        "http-error" => parse_http_error_directive(&mut proxy.error_replies, tokens, kw),
+        "errorfile" | "errorfiles" | "http-error" => {
+            parse_proxy_error_page(&mut proxy.error_files, &mut proxy.error_replies, tokens, kw)
+        }
         "log-format" | "log-format-sd" => {
             Err(ConfigError::new(
                 kw.line,
@@ -453,9 +453,9 @@ pub(crate) fn parse_frontend_directive(
                 "'http-check' is not supported in frontend",
             ))
         }
-        "errorfile" => parse_errorfile_directive(&mut fe.error_files, tokens, kw),
-        "errorfiles" => parse_errorfiles_directive(&mut fe.error_files, tokens, kw),
-        "http-error" => parse_http_error_directive(&mut fe.error_replies, tokens, kw),
+        "errorfile" | "errorfiles" | "http-error" => {
+            parse_proxy_error_page(&mut fe.error_files, &mut fe.error_replies, tokens, kw)
+        }
         "log-format" | "log-format-sd" => {
             Err(ConfigError::new(
                 kw.line,
@@ -568,9 +568,9 @@ pub(crate) fn parse_backend_directive(
             parse_tcp_check_directive(&mut be.tcp_checks, tokens, kw)?;
             Ok(())
         }
-        "errorfile" => parse_errorfile_directive(&mut be.error_files, tokens, kw),
-        "errorfiles" => parse_errorfiles_directive(&mut be.error_files, tokens, kw),
-        "http-error" => parse_http_error_directive(&mut be.error_replies, tokens, kw),
+        "errorfile" | "errorfiles" | "http-error" => {
+            parse_proxy_error_page(&mut be.error_files, &mut be.error_replies, tokens, kw)
+        }
         "log-format" | "log-format-sd" => {
             Err(ConfigError::new(
                 kw.line,
