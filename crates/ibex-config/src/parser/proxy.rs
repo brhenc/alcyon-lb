@@ -437,6 +437,16 @@ pub(crate) fn parse_frontend_directive(
 ) -> Result<(), ConfigError> {
     match kw.text.as_str() {
         "bind" => parse_frontend_bind(fe, tokens, kw),
+        // `HAProxy` checks the line, warns, and runs without it: persistence is the
+        // backend's (`warnifnotcap(curproxy, PR_CAP_BE, ...)`).
+        "cookie" => {
+            parse_cookie(&mut None, tokens, kw)?;
+            eprintln!(
+                "[ibex] warning: line {}: 'cookie' ignored because frontend '{}' has no backend capability.",
+                kw.line, fe.name
+            );
+            Ok(())
+        }
         "accept-proxy" => {
             fe.accept_proxy = true;
             Ok(())

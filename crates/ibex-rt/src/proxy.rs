@@ -29,7 +29,7 @@ use ibex_proto::htx::HtxBlock;
 use ibex_proto::h2::H2_CONN_PREFACE;
 use ibex_proto::mux::Mux;
 use ibex_proto::mux_h2::{H2MuxContext, MuxH2};
-use ibex_proto::{extract_cookie, rewrite_header_block, CompiledExp};
+use ibex_proto::{rewrite_header_block, CompiledExp};
 use ibex_sample::{Expr, Registry, SampleContext};
 use ibex_sched::Tick;
 use ibex_stick_table::StickKey;
@@ -99,8 +99,6 @@ pub struct TcpSession {
     pub srv_xprt: ServerXprt,
     pub mode: Mode,
     pub client_addr: Option<SocketAddr>,
-    pub cookie_name: Option<String>,
-    pub cookie_val: Option<String>,
     pub cliexp: Vec<CompiledExp>,
     pub srvexp: Vec<CompiledExp>,
     pub req_uri: Option<String>,
@@ -195,7 +193,6 @@ impl TcpSession {
         Self::new_with_mode(
             cli,
             Mode::Tcp,
-            None,
             Vec::new(),
             Vec::new(),
             timeouts,
@@ -209,7 +206,6 @@ impl TcpSession {
     pub fn new_with_mode(
         cli: OwnedFd,
         mode: Mode,
-        cookie_name: Option<String>,
         cliexp: Vec<CompiledExp>,
         srvexp: Vec<CompiledExp>,
         timeouts: Timeouts,
@@ -229,8 +225,6 @@ impl TcpSession {
             srv_xprt: ServerXprt::Plain,
             mode,
             client_addr: None,
-            cookie_name,
-            cookie_val: None,
             cliexp,
             srvexp,
             req_uri: None,
@@ -1037,16 +1031,11 @@ impl TcpSession {
                     self.req_headers = Some(hdrs);
                 }
 
-                if self.cookie_name.is_some() || !self.cliexp.is_empty() {
+                if !self.cliexp.is_empty() {
                     let hdr_bytes = &self.req.readable()[..total_hdr_len];
                     let hdr_str = String::from_utf8_lossy(hdr_bytes);
-                    if let Some(ref cname) = self.cookie_name {
-                        self.cookie_val = extract_cookie(&hdr_str, cname);
-                    }
-                    if !self.cliexp.is_empty() {
-                        let rewritten = rewrite_header_block(&hdr_str, &self.cliexp);
-                        self.req.replace_prefix(total_hdr_len, rewritten.as_bytes());
-                    }
+                    let rewritten = rewrite_header_block(&hdr_str, &self.cliexp);
+                    self.req.replace_prefix(total_hdr_len, rewritten.as_bytes());
                 }
 
                 // The head may have been rewritten above; its framing is read from what

@@ -141,13 +141,15 @@ pub struct Proxy {
     pub redisp: bool,
     pub maxconn: u32,
     pub dispatch: Option<SocketAddr>,
-    pub cookie_name: Option<String>,
+    /// The `cookie` line (`ck_opts`, `cookie_*`): persistence by a cookie. Only a backend
+    /// (or a `listen`) has one.
+    pub cookie: Option<ibex_config::CookieConfig>,
     pub cliexp: Vec<ibex_proto::CompiledExp>,
     pub srvexp: Vec<ibex_proto::CompiledExp>,
     pub servers: Vec<SocketAddr>,
     pub server_ids: Vec<String>,
     /// Each server's persistence cookie value (`server ... cookie <value>`). A server
-    /// without one is matched by its name.
+    /// without one is never chosen by a cookie, not even by its name.
     pub server_cookies: Vec<Option<String>>,
     pub server_statuses: Arc<Vec<AtomicU8>>,
     pub server_weights: Vec<u32>,
@@ -227,7 +229,7 @@ impl Proxy {
     ///
     /// Active (non-backup) servers that are UP and not saturated (actconn < maxconn) are prioritized.
     /// If at least one active server is available, only active servers are returned (backup servers receive 0 traffic).
-    /// If all active servers are DOWN (or saturated), returns available backup servers.
+    /// If all active servers are DOWN (or saturated), returns the first available backup alone.
     /// If no servers are available, returns an empty vector.
     #[must_use]
     pub fn eligible_server_indices(&self) -> Vec<usize> {
@@ -265,38 +267,8 @@ impl Proxy {
             return active_up;
         }
 
-        // 2. Failover to backup servers if all active servers are unavailable
-        let backup_up: Vec<usize> = (0..self.servers.len())
-            .filter(|&idx| {
-                let is_backup = self.server_backups.get(idx).copied().unwrap_or(false);
-                is_backup && is_server_available(idx)
-            })
-            .collect();
-
-        backup_up
-    }
-
-    /// Selects a server by ID if configured, UP, and not saturated.
-    #[must_use]
-    pub fn select_server_by_id(&self, id: &str) -> Option<SocketAddr> {
-        for (idx, sid) in self.server_ids.iter().enumerate() {
-            // A server with a `cookie` value is selected by that value, not its name.
-            let key = self.server_cookies.get(idx).and_then(Option::as_deref).unwrap_or(sid);
-            if key == id && idx < self.servers.len() {
-                let is_up = self.server_statuses.get(idx).map(|s| s.load(Ordering::Relaxed)) == Some(ServerStatus::Up as u8);
-                let not_saturated = match self.server_maxconn.get(idx) {
-                    Some(Some(mc)) if *mc > 0 => {
-                        let act = self.server_actconn.get(idx).map(|a| a.load(Ordering::Relaxed)).unwrap_or(0);
-                        act < *mc
-                    }
-                    _ => true,
-                };
-                if is_up && not_saturated {
-                    return Some(self.servers[idx]);
-                }
-            }
-        }
-        None
+        // 2. No active server: the first usable backup alone (`lbprm.fbck`).
+        crate::lb::first_backup(self).into_iter().collect()
     }
 
     /// Selects the target backend server using the configured load balancing algorithm,
@@ -852,7 +824,11 @@ fn session_log_data<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, pid: u3
         } else {
             s.bytes_in.saturating_sub(l.bytes_in_at_start)
         },
-        cookie_state: *b"--",
+        // `%tsc`'s cookie characters: only a backend with a cookie mode shows them.
+        cookie_state: match (&be.cookie, s.txn.as_ref()) {
+            (Some(c), Some(t)) if c.rewrite || c.indirect || c.insert || c.prefix => t.ck.log_chars(),
+            _ => *b"--",
+        },
         actconn: sum(fe),
         feconn: sum(fe),
         retries: i64::from(s.max_retries.saturating_sub(s.conn_retries)),
@@ -1139,7 +1115,7 @@ fn init_proxy_from_listen(proxy_idx: usize, listen: &ibex_config::ListenSection,
         redisp: listen.redisp,
         maxconn: listen.maxconn,
         dispatch: listen.dispatch,
-        cookie_name: listen.cookie.clone(),
+        cookie: listen.cookie.clone(),
         cliexp,
         srvexp,
         servers: listen.servers.iter().map(|s| s.addr).collect(),
@@ -1236,7 +1212,7 @@ fn init_proxy_from_frontend(proxy_idx: usize, fe: &ibex_config::FrontendSection,
         redisp: false,
         maxconn: fe.maxconn,
         dispatch: None,
-        cookie_name: None,
+        cookie: None,
         cliexp,
         srvexp: Vec::new(),
         servers: Vec::new(),
@@ -1351,7 +1327,7 @@ fn init_proxy_from_backend(proxy_idx: usize, be: &ibex_config::BackendSection, n
         redisp: be.redisp,
         maxconn: 2000,
         dispatch: be.dispatch,
-        cookie_name: be.cookie.clone(),
+        cookie: be.cookie.clone(),
         cliexp: Vec::new(),
         srvexp,
         servers: be.servers.iter().map(|s| s.addr).collect(),
@@ -3408,14 +3384,12 @@ fn init_client_session(
     let mode = proxies[proxy_idx].mode;
     let timeouts = proxies[proxy_idx].timeouts;
     let retries = proxies[proxy_idx].retries;
-    let cookie_name = proxies[proxy_idx].cookie_name.clone();
     let cliexp = proxies[proxy_idx].cliexp.clone();
     let srvexp = proxies[proxy_idx].srvexp.clone();
 
     let mut sess = TcpSession::new_with_mode(
         cli_fd,
         mode,
-        cookie_name,
         cliexp,
         srvexp,
         timeouts,
@@ -4677,6 +4651,7 @@ impl EngineDispatcher<'_> {
             txn.close_after = true;
         }
         let client_close = txn.close_after;
+        let cookie_txn = txn.ck;
 
         if !client_close && srv_has_close {
             entry.sess.rep.remove_http_header("connection");
@@ -4699,6 +4674,7 @@ impl EngineDispatcher<'_> {
             || !proxies[fe_idx].http_res_rules.is_empty()
             || !proxies[fe_idx].http_after_res_rules.is_empty()
             || !proxies[be_idx].tcp_res_content_rules.is_empty()
+            || proxies[be_idx].cookie.is_some()
             || !proxies[be_idx].srvexp.is_empty();
 
         if !has_rules {
@@ -4849,6 +4825,27 @@ impl EngineDispatcher<'_> {
                 ) {
                     break 'rules Some(stop);
                 }
+            }
+
+            // The backend's `cookie` line: the server's own cookie edited, the persistence
+            // cookie inserted (`http_manage_server_side_cookies` and the insertion in
+            // `http_process_res_common`), between the `http-response` and the
+            // `http-after-response` rules.
+            if let Some(cfg) = &proxies[be_idx].cookie {
+                let be = &proxies[be_idx];
+                let target = entry.target_server_idx.filter(|_| entry.srv_backend_idx == be_idx).map(|i| crate::cookie::Target {
+                    value: be.server_cookies.get(i).and_then(Option::as_deref).map(str::as_bytes),
+                });
+                let method = entry.sess.req_method.as_deref().unwrap_or("");
+                let req = crate::cookie::ReqKind {
+                    safe_method: matches!(method, "GET" | "HEAD" | "OPTIONS" | "TRACE"),
+                    post: method == "POST",
+                };
+                let sck = crate::cookie::process_response(cfg, target, &cookie_txn, req, status, unix_now(), &mut hdrs);
+                if let Some(txn) = entry.sess.txn.as_mut() {
+                    txn.ck.sck = sck;
+                }
+                CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = hdrs.clone());
             }
 
             // 2. and 3. `http-after-response`, the backend's then the frontend's.
@@ -5971,10 +5968,10 @@ impl EngineDispatcher<'_> {
         }
 
         let source_ip = entry.sess.client_addr.map(|a| a.ip());
-        let target = if let Some(ref cval) = entry.sess.cookie_val {
-            proxies[be_idx]
-                .select_server_by_id(cval)
-                .or_else(|| proxies[be_idx].select_server_with_key(source_ip, entry.sess.req_uri.as_deref()))
+        // The backend's `cookie` line: the client's cookies are cut and may name the server.
+        let cookie_server = manage_client_cookies(&mut entry.sess, &proxies[be_idx]);
+        let target = if let Some(idx) = cookie_server {
+            Some(proxies[be_idx].servers[idx])
         } else {
             proxies[be_idx].select_server_with_key(source_ip, entry.sess.req_uri.as_deref())
         };
@@ -6014,10 +6011,7 @@ impl EngineDispatcher<'_> {
             release_server(entry, proxies, fdtab, poller, idle_pool, true);
         }
 
-        let s_idx = proxies[be_idx]
-            .servers
-            .iter()
-            .position(|&s| s == target_addr);
+        let s_idx = cookie_server.or_else(|| proxies[be_idx].servers.iter().position(|&s| s == target_addr));
         if let Some(idx) = s_idx {
             if idx < proxies[be_idx].server_actconn.len() {
                 proxies[be_idx].server_actconn[idx].fetch_add(1, Ordering::Relaxed);
@@ -6956,6 +6950,60 @@ fn rewrite_req_header_values(
     });
     rebuild_req_buffer(sess);
     Ok(())
+}
+
+/// Seconds since the epoch (`date.tv_sec`).
+fn unix_now() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
+/// `http_manage_client_side_cookies`: the backend's `cookie` line applied to the request's
+/// `Cookie` headers, which are cut in place (`indirect`, `prefix`) and may name the server
+/// (`server ... cookie <value>`). Returns that server's index. What the response needs
+/// goes to the transaction (`HttpTxn::ck`).
+fn manage_client_cookies(sess: &mut TcpSession, be: &Proxy) -> Option<usize> {
+    let cfg = be.cookie.as_ref()?;
+    // `cur_state != SRV_ST_STOPPED`: a draining server still takes its clients.
+    let servers: Vec<crate::cookie::SrvCookie<'_>> = (0..be.servers.len())
+        .map(|i| crate::cookie::SrvCookie {
+            value: be.server_cookies.get(i).and_then(Option::as_deref).map(str::as_bytes),
+            usable: be
+                .server_statuses
+                .get(i)
+                .map(|s| s.load(Ordering::Relaxed))
+                .is_some_and(|s| s == ServerStatus::Up as u8 || s == ServerStatus::Drain as u8),
+        })
+        .collect();
+    // The HTX head: its block indices stay valid while others are replaced or removed.
+    let blocks: Vec<(usize, Vec<u8>)> = sess.htx_slice().map(|h| {
+        h.header_blocks().filter(|(_, k, _)| k.eq_ignore_ascii_case("cookie")).map(|(i, _, v)| (i, v.as_bytes().to_vec())).collect()
+    })?;
+    if blocks.is_empty() {
+        return None;
+    }
+    let values: Vec<Vec<u8>> = blocks.iter().map(|(_, v)| v.clone()).collect();
+    let (srv, st, edits) = crate::cookie::client_side(cfg, unix_now(), &servers, &values);
+    if let Some(txn) = sess.txn.as_mut() {
+        txn.ck = st;
+    }
+    if edits.iter().all(|e| *e == crate::cookie::HeaderEdit::Keep) {
+        return srv;
+    }
+    sess.with_htx_mut(|htx| {
+        for ((idx, _), e) in blocks.iter().zip(&edits) {
+            match e {
+                crate::cookie::HeaderEdit::Keep => {}
+                crate::cookie::HeaderEdit::Set(v) => {
+                    let _ = htx.replace_block_value(*idx, v);
+                }
+                crate::cookie::HeaderEdit::Remove => htx.remove_block(*idx),
+            }
+        }
+    });
+    // The parsed list is what `req.hdr` fetches read: it follows the head.
+    sess.req_headers = sess.htx_slice().map(|h| h.headers().map(|(k, v)| (k.to_string(), v.to_string())).collect());
+    rebuild_req_buffer(sess);
+    srv
 }
 
 fn rebuild_req_buffer(sess: &mut TcpSession) {

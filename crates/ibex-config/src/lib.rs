@@ -21,7 +21,7 @@ use std::fs;
 use std::path::Path;
 
 pub use ast::{
-    AclCondition, AclRule, AclTerm, BackendSection, BalanceAlgorithm, Config, DefaultsSection,
+    AclCondition, AclRule, AclTerm, BackendSection, BalanceAlgorithm, Config, CookieConfig, DefaultsSection,
     ErrorPageSource, FrontendSection, GlobalSection, GlobalSetVar,
     HashPreserveAffinity, HashType,
     HeaderExp, HttpAfterResAction, HttpAfterResRule, HttpReqAction, HttpReqRule, HttpResAction,

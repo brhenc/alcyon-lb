@@ -345,6 +345,9 @@ pub struct HttpTxn {
     /// The response was cut short (the server went away mid-body, or a tunnel side
     /// closed): what arrived is delivered and the connection closes.
     pub aborted: bool,
+    /// What the request's cookies told the backend's `cookie` persistence, which the
+    /// response needs (`SF_DIRECT`, `cookie_first_date`, `cookie_last_date`).
+    pub ck: crate::cookie::CookieTxn,
 }
 
 impl HttpTxn {
@@ -364,6 +367,7 @@ impl HttpTxn {
             client_head: false,
             error: None,
             aborted: false,
+            ck: crate::cookie::CookieTxn::default(),
         }
     }
 

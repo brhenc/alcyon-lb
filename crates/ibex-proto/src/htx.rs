@@ -974,6 +974,24 @@ impl<'a> HtxSliceRef<'a> {
         })
     }
 
+    /// The header blocks as `(block index, name, value)`. The index is what
+    /// `replace_block_value` and `remove_block` take, and stays valid while other
+    /// blocks are replaced or removed.
+    pub fn header_blocks(self) -> impl Iterator<Item = (usize, &'a str, &'a str)> + 'a {
+        (0..self.num_blocks).filter_map(move |i| {
+            let desc = self.read_desc(i);
+            if desc.blk_type != HtxBlockType::Header {
+                return None;
+            }
+            let name_start = desc.addr as usize;
+            let name_end = name_start + desc.name_len as usize;
+            let val_end = name_end + desc.value_len as usize;
+            let name = std::str::from_utf8(&self.buf[name_start..name_end]).ok()?;
+            let val = std::str::from_utf8(&self.buf[name_end..val_end]).ok()?;
+            Some((i, name, val))
+        })
+    }
+
     pub fn trailers(self) -> impl Iterator<Item = (&'a str, &'a str)> + 'a {
         (0..self.num_blocks).filter_map(move |i| {
             let desc = self.read_desc(i);

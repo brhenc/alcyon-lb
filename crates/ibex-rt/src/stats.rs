@@ -662,7 +662,7 @@ mod tests {
             redisp: false,
             maxconn: 1000,
             dispatch: None,
-            cookie_name: None,
+            cookie: None,
             cliexp: Vec::new(),
             srvexp: Vec::new(),
             servers: vec![addr],

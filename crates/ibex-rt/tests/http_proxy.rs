@@ -147,7 +147,7 @@ fn http_cookie_persistence_routes_to_targeted_server() {
             name: "cookie_proxy".into(),
             addr: proxy_addr,
             mode: Mode::Http,
-            cookie: Some("SERVERID".into()),
+            cookie: Some(ibex_config::CookieConfig { name: "SERVERID".into(), ..Default::default() }),
             contimeout: Some(Duration::from_secs(3)),
             clitimeout: Some(Duration::from_secs(3)),
             srvtimeout: Some(Duration::from_secs(3)),
@@ -155,7 +155,9 @@ fn http_cookie_persistence_routes_to_targeted_server() {
             maxconn: 100,
             servers: vec![
                 Server::new("srv1", srv1_addr),
-                Server::new("srv2", srv2_addr),
+                // HAProxy matches the cookie against `server ... cookie <value>`, never
+                // against a server's name.
+                Server { cookie: Some("srv2".into()), ..Server::new("srv2", srv2_addr) },
             ],
             ..Default::default()
         }],
