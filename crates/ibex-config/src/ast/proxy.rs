@@ -278,6 +278,9 @@ pub struct StatsConfig {
     pub forwardfor: Option<String>,
     pub originalto: Option<String>,
     pub maxrewrite: Option<usize>,
+    /// `option accept-unsafe-violations-in-http-request`: a `#` in the request target (and a
+    /// forbidden character in an absolute-form authority) is let through, not refused.
+    pub accept_unsafe_request: bool,
 }
 
 impl Default for ListenSection {

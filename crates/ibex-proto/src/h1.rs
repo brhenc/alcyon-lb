@@ -46,6 +46,9 @@ pub struct H1Parser {
     /// dropped, or the authority and `Host` normalised (`crate::authority`) -- so the
     /// head must be forwarded from the HTX, not as received.
     pub head_rewritten: bool,
+    /// `option accept-unsafe-violations-in-http-request`: a `#` in the request target, and
+    /// a forbidden character in an authority, are let through. Kept across `reset`.
+    pub accept_unsafe_request: bool,
 }
 
 impl H1Parser {
@@ -62,6 +65,7 @@ impl H1Parser {
             saw_bare_cr: false,
             prev_delim_len: 2,
             head_rewritten: false,
+            accept_unsafe_request: false,
         }
     }
 
@@ -316,7 +320,7 @@ impl H1Parser {
         if !self.is_response {
             // The authority against `Host`, as HAProxy checks it at the end of the head
             // (`h1_parse_msg_hdrs`) and normalises it (`http_scheme_based_normalize`).
-            match crate::authority::check_and_normalize(htx) {
+            match crate::authority::check_and_normalize(htx, self.accept_unsafe_request) {
                 Ok(rewritten) => self.head_rewritten |= rewritten,
                 Err(e) => {
                     self.phase = H1Phase::Error;

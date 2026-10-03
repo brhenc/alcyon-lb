@@ -141,6 +141,10 @@ pub trait HttpStream: Send {
     fn head_rewritten(&self) -> bool {
         false
     }
+
+    /// `option accept-unsafe-violations-in-http-request`: let a `#` in the request target
+    /// through. Only the built-in parser reads it.
+    fn set_accept_unsafe_request(&mut self, _on: bool) {}
 }
 
 /// A parser implementation. One per process.
@@ -193,6 +197,10 @@ impl HttpStream for H1Parser {
 
     fn head_rewritten(&self) -> bool {
         self.head_rewritten
+    }
+
+    fn set_accept_unsafe_request(&mut self, on: bool) {
+        self.accept_unsafe_request = on;
     }
 }
 
@@ -380,6 +388,11 @@ impl HttpStream for DifferentialStream {
         // The primary's HTX is the one forwarded; the candidate parses into scratch.
         self.primary.head_rewritten()
     }
+
+    fn set_accept_unsafe_request(&mut self, on: bool) {
+        self.primary.set_accept_unsafe_request(on);
+        self.candidate.set_accept_unsafe_request(on);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -480,6 +493,26 @@ mod tests {
         s.finish(&mut htx);
         s.reset(false);
         assert!(!s.connection_close() && !s.framing_conflict() && !s.head_rewritten());
+    }
+
+    /// `option accept-unsafe-violations-in-http-request` reaches the built-in parser, through
+    /// the differential to both of its parsers, and a parser that does not read it ignores it.
+    #[test]
+    fn accept_unsafe_request_lets_a_fragment_through_the_h1_parser() {
+        const FRAGMENT: &[u8] = b"GET /a#b HTTP/1.1\r\nHost: h\r\n\r\n";
+        let parse = |p: &dyn HttpParser, on: bool| {
+            let mut buf = [0u8; 4096];
+            let mut htx = HtxSlice::new(&mut buf);
+            let mut s = p.stream(false);
+            s.set_accept_unsafe_request(on);
+            s.parse(FRAGMENT, &mut htx).is_ok()
+        };
+        assert!(!parse(&H1, false));
+        assert!(parse(&H1, true));
+        let both = Differential::new(Box::new(H1), Box::new(H1), OnMismatch::Observe);
+        assert!(!parse(&both, false));
+        assert!(parse(&both, true));
+        assert!(parse(&MinimalParser, true), "a parser without the option ignores it");
     }
 
     /// The differential forwards the primary's HTX, so it reports the primary's rewrite,

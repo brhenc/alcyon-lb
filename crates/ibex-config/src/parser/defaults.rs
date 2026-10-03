@@ -199,6 +199,7 @@ pub(crate) fn parse_option_defaults(
         "forwardfor" => defaults.forwardfor = Some(parse_forward_option(tokens, kw)?),
         "originalto" => defaults.originalto = Some(parse_forward_option(tokens, kw)?),
         "redispatch" => defaults.redisp = true,
+        "accept-unsafe-violations-in-http-request" => defaults.stats.accept_unsafe_request = true,
         "log-health-checks" => defaults.log_health_checks = true,
         "httpchk" => parse_httpchk_option(&mut defaults.httpchk, tokens, kw)?,
         "tcp-check" => defaults.tcp_check = true,
@@ -216,6 +217,7 @@ pub(crate) fn parse_no_defaults(defaults: &mut DefaultsSection, tokens: &[Token]
     }
     match check_no_option(OptSection::Defaults, tokens, kw)? {
         Some("redispatch") => defaults.redisp = false,
+        Some("accept-unsafe-violations-in-http-request") => defaults.stats.accept_unsafe_request = false,
         Some("log-health-checks") => defaults.log_health_checks = false,
         _ => {}
     }

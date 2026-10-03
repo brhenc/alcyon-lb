@@ -185,6 +185,8 @@ pub struct TcpSession {
     /// Keep each request line for the log (`txn->uri`): set when a format of the
     /// frontend reads it, so a frontend that does not log it does not pay for a copy.
     pub keep_request_line: bool,
+    /// `option accept-unsafe-violations-in-http-request` on the frontend.
+    pub accept_unsafe_request: bool,
 }
 
 impl TcpSession {
@@ -279,6 +281,7 @@ impl TcpSession {
             h2_flood_config: ibex_proto::H2FloodConfig::default(),
             is_first_req: true,
             keep_request_line: false,
+            accept_unsafe_request: false,
         };
         s.arm_client(now);
         s
@@ -637,6 +640,7 @@ impl TcpSession {
         let parser = ibex_proto::parser::build(self.parser_kind)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         let mut stream = parser.stream(false);
+        stream.set_accept_unsafe_request(self.accept_unsafe_request);
         let raw = self.htx_buf.raw_slice_mut();
         let mut slice = ibex_proto::htx::HtxSlice::new(raw);
         stream.parse(&self.req.readable()[..head_len], &mut slice)?;
@@ -932,16 +936,6 @@ impl TcpSession {
                     self.fail_request(400);
                     return Ok(true);
                 };
-                // `txn->uri`: the request line as received, before any rule rewrites it
-                // (`HAProxy` keeps its first `tune.http.logurilen`, 1024, bytes).
-                self.log.request = Some(std::time::Instant::now());
-                if self.keep_request_line {
-                    let head = &self.req.readable()[..total_hdr_len];
-                    let line_end = head.iter().position(|&b| b == b'\r' || b == b'\n').unwrap_or(head.len());
-                    let line = String::from_utf8_lossy(&head[..line_end.min(1024)]).into_owned();
-                    self.log.request_line = Some(line);
-                }
-
                 if self.has_htx {
                     let (req_m, req_u, conn_close, wire_replacement) = {
                         let htx = ibex_proto::htx::HtxSliceRef::new(
@@ -964,12 +958,8 @@ impl TcpSession {
                             conn_close = true;
                         }
                         let wire_replacement = if self.htx_modified {
-                            let mut wire_buf = [0u8; 8192];
-                            if let Ok(n) = htx.write_h1_wire(&mut wire_buf) {
-                                Some((wire_buf, n))
-                            } else {
-                                None
-                            }
+                            // Sized to the head, not a fixed buffer (tasks/T101).
+                            Some(htx.write_h1_wire_vec())
                         } else {
                             None
                         };
@@ -983,8 +973,8 @@ impl TcpSession {
                     }
                     close |= conn_close;
                     // Only regenerate wire buffer if HTX was actually modified
-                    if let Some((wire_buf, n)) = wire_replacement {
-                        self.req.replace_prefix(total_hdr_len, &wire_buf[..n]);
+                    if let Some(wire) = wire_replacement {
+                        self.req.replace_prefix(total_hdr_len, &wire);
                     }
                 } else {
                     let hdr_bytes = &self.req.readable()[..total_hdr_len];
@@ -1029,6 +1019,18 @@ impl TcpSession {
                         close = true;
                     }
                     self.req_headers = Some(hdrs);
+                }
+
+                // `txn->uri`: the request line once the parser has normalised the authority
+                // (`HAProxy` takes it from the HTX start line), before any rule rewrites it
+                // (and keeps its first `tune.http.logurilen`, 1024, bytes). The head forwarded
+                // may have been regenerated just above, so its length is read again.
+                self.log.request = Some(std::time::Instant::now());
+                if self.keep_request_line {
+                    let head = self.req.readable();
+                    let line_end = head.iter().position(|&b| b == b'\r' || b == b'\n').unwrap_or(head.len());
+                    let line = String::from_utf8_lossy(&head[..line_end.min(1024)]).into_owned();
+                    self.log.request_line = Some(line);
                 }
 
                 if !self.cliexp.is_empty() {

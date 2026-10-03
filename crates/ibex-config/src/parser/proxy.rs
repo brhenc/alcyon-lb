@@ -474,7 +474,7 @@ pub(crate) fn parse_frontend_directive(
             Ok(())
         }
         "option" => parse_option_frontend(fe, tokens, kw),
-        "no" => parse_no_frontend(tokens, kw),
+        "no" => parse_no_frontend(fe, tokens, kw),
         "declare" if tokens.get(1).is_some_and(|t| t.text == "capture") => {
             let rule_slots = rule_capture_slots(&fe.http_req_rules);
             parse_declare_capture(&mut fe.req_header_captures, &mut fe.res_header_captures, rule_slots, tokens, kw)
@@ -791,6 +791,7 @@ pub(crate) fn parse_option_listen(
         "forwardfor" => proxy.forwardfor = Some(parse_forward_option(tokens, kw)?),
         "originalto" => proxy.originalto = Some(parse_forward_option(tokens, kw)?),
         "redispatch" => proxy.redisp = true,
+        "accept-unsafe-violations-in-http-request" => proxy.stats.accept_unsafe_request = true,
         "log-health-checks" => proxy.log_health_checks = true,
         "httpchk" => parse_httpchk_option(&mut proxy.httpchk, tokens, kw)?,
         "tcp-check" => proxy.tcp_check = true,
@@ -815,8 +816,13 @@ pub(crate) fn parse_option_frontend(
     if !check_option(OptSection::Frontend, tokens, kw)? {
         return Ok(());
     }
-    // The options a frontend implements are `forwardfor` and `originalto`; every other
-    // one `check_option` lets through needs a backend, and was warned about there.
+    // The options a frontend implements are `forwardfor`, `originalto` and
+    // `accept-unsafe-violations-in-http-request`; every other one `check_option` lets
+    // through needs a backend, and was warned about there.
+    if tokens[1].text == "accept-unsafe-violations-in-http-request" {
+        fe.stats.accept_unsafe_request = true;
+        return Ok(());
+    }
     let except = Some(parse_forward_option(tokens, kw)?);
     if tokens[1].text == "forwardfor" {
         fe.forwardfor = except;
@@ -861,17 +867,21 @@ pub(crate) fn parse_no_listen(proxy: &mut ListenSection, tokens: &[Token], kw: &
     }
     match check_no_option(OptSection::Listen, tokens, kw)? {
         Some("redispatch") => proxy.redisp = false,
+        Some("accept-unsafe-violations-in-http-request") => proxy.stats.accept_unsafe_request = false,
         Some("log-health-checks") => proxy.log_health_checks = false,
         _ => {}
     }
     Ok(())
 }
 
-pub(crate) fn parse_no_frontend(tokens: &[Token], kw: &Token) -> Result<(), ConfigError> {
+pub(crate) fn parse_no_frontend(fe: &mut FrontendSection, tokens: &[Token], kw: &Token) -> Result<(), ConfigError> {
     if tokens.get(1).is_none_or(|t| t.text != "option") {
         return parse_no_directive(tokens, kw);
     }
-    check_no_option(OptSection::Frontend, tokens, kw).map(|_| ())
+    if let Some("accept-unsafe-violations-in-http-request") = check_no_option(OptSection::Frontend, tokens, kw)? {
+        fe.stats.accept_unsafe_request = false;
+    }
+    Ok(())
 }
 
 pub(crate) fn parse_no_backend(be: &mut BackendSection, tokens: &[Token], kw: &Token) -> Result<(), ConfigError> {

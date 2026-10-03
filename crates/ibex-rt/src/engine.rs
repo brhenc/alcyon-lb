@@ -3435,6 +3435,7 @@ fn init_client_session(
     sess.tracked_sc = tracked_sc;
     sess.h2_flood_config = global_h2_flood_config;
     let fe = &proxies[proxy_idx];
+    sess.accept_unsafe_request = fe.stats_config.accept_unsafe_request;
     sess.keep_request_line = (!fe.log_target_idx.is_empty() && fe.log_format.as_ref().is_some_and(|f| f.uses_request_line()))
         || fe.unique_id_format.as_ref().is_some_and(|f| f.uses_request_line());
     // Use per-engine values rather than the global `BUFSIZE_STANDARD` atomic so that
@@ -7048,10 +7049,7 @@ fn rebuild_req_buffer(sess: &mut TcpSession) {
         return;
     };
     if let Some(htx) = sess.htx_slice() {
-        let mut out = [0u8; 8192];
-        if let Ok(n) = htx.write_h1_wire(&mut out) {
-            sess.req.replace_prefix(hdr_len + eoh_len, &out[..n]);
-        }
+        sess.req.replace_prefix(hdr_len + eoh_len, &htx.write_h1_wire_vec());
     } else {
         let method = sess.req_method.as_deref().unwrap_or("GET");
         let uri = sess.req_uri.as_deref().unwrap_or("/");

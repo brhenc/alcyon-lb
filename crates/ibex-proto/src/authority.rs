@@ -26,6 +26,23 @@ fn invalid(what: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, what)
 }
 
+/// `http_authority_has_forbidden_char` (`include/haproxy/http.h`): a byte outside `!`..`~`,
+/// or one of `, # / ? @ \`, or a bracket that is not the delimiter of an IP literal (`[`
+/// first, `]` last or before a colon), or a bracket left open.
+fn has_forbidden_char(v: &[u8]) -> bool {
+    let mut brackets = false;
+    for (i, &c) in v.iter().enumerate() {
+        if c < 0x21 || c > 0x7e || matches!(c, b',' | b'#' | b'/' | b'?' | b'@' | b'[' | b'\\' | b']') {
+            if (c == b'[' && i == 0) || (c == b']' && (i == v.len() - 1 || v[i + 1] == b':')) {
+                brackets = !brackets;
+            } else {
+                return true;
+            }
+        }
+    }
+    brackets
+}
+
 /// `http_get_host_port`: the port after the last `:` when only digits follow it. `None`
 /// when there is no such `:`, `Some("")` when the `:` ends the value.
 fn host_port(host: &str) -> Option<&str> {
@@ -138,7 +155,7 @@ fn host_value<'a>(view: &HtxSliceRef<'a>, i: usize) -> Option<&'a [u8]> {
 /// # Errors
 /// The request is invalid (HAProxy answers 400): two `Host` values that differ, a CONNECT
 /// target without a port, or an authority that does not match `Host`.
-pub fn check_and_normalize(htx: &mut HtxSlice<'_>) -> io::Result<bool> {
+pub fn check_and_normalize(htx: &mut HtxSlice<'_>, accept_unsafe: bool) -> io::Result<bool> {
     let mut rewritten = false;
 
     // 1. Host headers of this message: the first is kept, a repeat of it dropped. Read in
@@ -161,6 +178,18 @@ pub fn check_and_normalize(htx: &mut HtxSlice<'_>) -> io::Result<bool> {
                 htx.remove_block(i);
                 rewritten = true;
             }
+        }
+    }
+
+    // A `#` anywhere in the target is an invalid request line (`h1_headers_to_hdr_list`,
+    // `http_msg_rquri2`); it is checked first so that no form of target escapes it.
+    if !accept_unsafe && htx.req_line().is_some_and(|r| r.uri.contains('#')) {
+        return Err(invalid("a fragment in the request target"));
+    }
+    // The first `Host` of any request (`h1_parse_msg_hdrs`).
+    if let Some(i) = host_at {
+        if has_forbidden_char(host_value(&htx.as_ref(), i).unwrap_or_default()) {
+            return Err(invalid("a forbidden character in Host"));
         }
     }
 
@@ -187,6 +216,9 @@ pub fn check_and_normalize(htx: &mut HtxSlice<'_>) -> io::Result<bool> {
             return Err(invalid("a target without a scheme on a method other than CONNECT"));
         }
         let (_, authority, _) = parse_authority(&uri);
+        if !accept_unsafe && has_forbidden_char(authority.as_bytes()) {
+            return Err(invalid("a forbidden character in the CONNECT authority"));
+        }
         if let Some(h) = validate_connect(authority, host.as_deref())? {
             for &i in &host_idx {
                 htx.replace_block_value(i, h.as_bytes()).map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
@@ -200,6 +232,9 @@ pub fn check_and_normalize(htx: &mut HtxSlice<'_>) -> io::Result<bool> {
     }
     let rest = &uri[scheme.len()..];
     let (auth_at, authority, path) = parse_authority(rest);
+    if !accept_unsafe && has_forbidden_char(authority.as_bytes()) {
+        return Err(invalid("a forbidden character in the request authority"));
+    }
     if let Some(h) = host.as_deref() {
         if !authority.eq_ignore_ascii_case(h) && !mismatch_is_equivalent(scheme, authority, h) {
             return Err(invalid("Host does not match the request authority"));
@@ -264,7 +299,7 @@ mod tests {
         htx.push_req_line(method, uri, "HTTP/1.1").unwrap();
         htx.push_header("host", "h:80").unwrap();
         htx.push_eoh().unwrap();
-        check_and_normalize(&mut htx)
+        check_and_normalize(&mut htx, false)
     }
 
     /// The H1 request-line parser refuses these two before this runs; `HAProxy`'s
