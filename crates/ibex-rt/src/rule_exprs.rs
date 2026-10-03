@@ -320,8 +320,30 @@ pub fn validate_rule_exprs(config: &Config, registry: &Registry) -> Result<(), S
 pub fn validate_config(config: &Config) -> Result<(), String> {
     let registry = crate::engine::sample_registry();
     crate::proxy_state::check_sample_refs(config, registry)?;
+    validate_acls(config)?;
     validate_rule_exprs(config, registry)?;
     validate_formats(config, registry)
+}
+
+/// Compiles every `acl` line. An ACL that does not compile is left out when its proxy is
+/// built, and a rule that names it then never matches -- a deny list that silently allows
+/// everything -- so it is refused here, as `HAProxy` does ("error detected while parsing
+/// ACL 'bad' : '-z' is not a valid ACL option").
+///
+/// # Errors
+/// The first `acl` line that does not compile, with its proxy and ACL named.
+pub fn validate_acls(config: &Config) -> Result<(), String> {
+    let listens = config.listens.iter().map(|l| ("proxy", &l.name, &l.acls));
+    let frontends = config.frontends.iter().map(|f| ("frontend", &f.name, &f.acls));
+    let backends = config.backends.iter().map(|b| ("backend", &b.name, &b.acls));
+    for (kind, name, acls) in listens.chain(frontends).chain(backends) {
+        for rule in acls {
+            ibex_sample::Expr::parse(&rule.expr).map_err(|e| {
+                format!("error detected in {kind} '{name}' while parsing ACL '{}' : {e}", rule.name)
+            })?;
+        }
+    }
+    Ok(())
 }
 
 /// Compiles every `log-format` and `unique-id-format` (`HAProxy`: "failed to parse

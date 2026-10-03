@@ -33,14 +33,26 @@ pub enum Matcher {
     Reg(Regex),
     /// Matches integer comparison.
     Int { op: IntOp, value: i64 },
+    /// Matches an integer range (`pat_parse_int`: `5`, `1:5`, `:5`, `5:`).
+    IntRange(IntRange),
+    /// Matches a pattern as a whole word of the sample (`match_word`: `dir` is
+    /// delimited by `/` and `?`, `dom` by `/`, `?`, `.` and `:`).
+    Word {
+        pattern: Vec<u8>,
+        delimiters: &'static [u8],
+        case_insensitive: bool,
+    },
+    /// Matches if any of the patterns of the list matches (`pat_match_*` walks the whole
+    /// pattern list of an expression, and the first hit wins).
+    Any(Vec<Matcher>),
     /// Matches IP address exact.
     Ip(IpAddr),
     /// Matches IPv4 CIDR network (`network_ip`, mask).
     IpCidrV4 { network: u32, mask: u32 },
     /// Matches IPv6 CIDR network (`network_ip`, mask).
     IpCidrV6 { network: u128, mask: u128 },
-    /// Matches length.
-    Len(usize),
+    /// Matches length (a number or a range, as `pat_match_len`).
+    Len(IntRange),
     /// Matches binary / hex payload.
     Bin(Vec<u8>),
     /// Matches if sample exists / is found.
@@ -58,7 +70,111 @@ pub enum IntOp {
     Le,
 }
 
+/// An integer range, either end of which may be open (`pat_parse_int`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IntRange {
+    pub min: Option<i64>,
+    pub max: Option<i64>,
+}
+
+impl IntRange {
+    /// Parses `5` (`5:5`), `1:5`, `:5` or `5:`; `-` separates like `:` does.
+    ///
+    /// # Errors
+    /// Returns an error if the text is not a number or a valid range.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let bad = || format!("'{text}' is not a valid number range");
+        let num = |t: &str| t.parse::<i64>().map_err(|_| bad());
+        let Some(sep) = text.find([':', '-']) else {
+            let n = text.parse::<i64>().map_err(|_| format!("'{text}' is not a number"))?;
+            return Ok(IntRange { min: Some(n), max: Some(n) });
+        };
+        let (lo, hi) = (&text[..sep], &text[sep + 1..]);
+        match (lo.is_empty(), hi.is_empty()) {
+            (true, true) => Err(bad()),
+            (true, false) => Ok(IntRange { min: None, max: Some(num(hi)?) }),
+            (false, true) => Ok(IntRange { min: Some(num(lo)?), max: None }),
+            (false, false) => {
+                let (min, max) = (num(lo)?, num(hi)?);
+                if min > max {
+                    return Err(bad());
+                }
+                Ok(IntRange { min: Some(min), max: Some(max) })
+            }
+        }
+    }
+
+    fn contains(&self, v: i64) -> bool {
+        self.min.is_none_or(|m| m <= v) && self.max.is_none_or(|m| v <= m)
+    }
+}
+
+/// `match_word` (`src/pattern.c`): `pattern`, stripped of delimiters at both ends, must be
+/// a whole word of `smp`, a word being what lies between two delimiters.
+fn match_word(smp: &[u8], pattern: &[u8], delimiters: &[u8], icase: bool) -> bool {
+    let mut p = pattern;
+    while let [first, rest @ ..] = p {
+        if !delimiters.contains(first) {
+            break;
+        }
+        p = rest;
+    }
+    while let [rest @ .., last] = p {
+        if !delimiters.contains(last) {
+            break;
+        }
+        p = rest;
+    }
+    if p.len() > smp.len() {
+        return false;
+    }
+    let same = |a: &[u8], b: &[u8]| if icase { a.eq_ignore_ascii_case(b) } else { a == b };
+    let mut may_match = true;
+    for c in 0..=(smp.len() - p.len()) {
+        if delimiters.contains(&smp[c]) {
+            may_match = true;
+            continue;
+        }
+        if !may_match {
+            continue;
+        }
+        let end = c + p.len();
+        if same(&smp[c..end], p) && (end == smp.len() || delimiters.contains(&smp[end])) {
+            return true;
+        }
+        may_match = false;
+    }
+    false
+}
+
 impl Matcher {
+    /// The shortest sample this matcher can accept, for deciding whether to wait for more
+    /// payload; a list answers with its shortest pattern.
+    #[must_use]
+    pub fn min_pattern_len(&self) -> usize {
+        match self {
+            Matcher::Str { target, .. } => target.len(),
+            Matcher::Beg { prefix, .. } => prefix.len(),
+            Matcher::End { suffix, .. } => suffix.len(),
+            Matcher::Sub { sub, .. } => sub.len(),
+            Matcher::Bin(target) => target.len(),
+            Matcher::Any(list) => list.iter().map(Matcher::min_pattern_len).min().unwrap_or(1),
+            _ => 1,
+        }
+    }
+
+    /// Whether a non-match on a payload that may still grow is not final: an unanchored
+    /// substring, a suffix or a regex can match once more bytes arrive.
+    #[must_use]
+    pub fn may_match_later(&self, ends_with_newline: bool) -> bool {
+        match self {
+            Matcher::Sub { .. } => !ends_with_newline,
+            Matcher::End { .. } | Matcher::Reg(_) => true,
+            Matcher::Any(list) => list.iter().any(|m| m.may_match_later(ends_with_newline)),
+            _ => false,
+        }
+    }
+
     /// Compiles a matcher pattern from method name and pattern string.
     ///
     /// # Errors
@@ -136,10 +252,12 @@ impl Matcher {
                 }
                 Ok(Matcher::Bin(bytes))
             }
-            "len" => {
-                let l = pattern.parse::<usize>().map_err(|e| e.to_string())?;
-                Ok(Matcher::Len(l))
-            }
+            "len" => Ok(Matcher::Len(IntRange::parse(pattern)?)),
+            "dir" | "dom" => Ok(Matcher::Word {
+                pattern: pattern.as_bytes().to_vec(),
+                delimiters: if method == "dir" { b"/?" } else { b"/?.:" },
+                case_insensitive,
+            }),
             "ip" => {
                 if let Some((ip_str, prefix_str)) = pattern.split_once('/') {
                     let prefix: u32 = prefix_str
@@ -174,7 +292,8 @@ impl Matcher {
                     Ok(Matcher::Ip(ip))
                 }
             }
-            "int" | "eq" => {
+            "int" => Ok(Matcher::IntRange(IntRange::parse(pattern)?)),
+            "eq" => {
                 let val = pattern.parse::<i64>().map_err(|e| e.to_string())?;
                 Ok(Matcher::Int {
                     op: IntOp::Eq,
@@ -219,6 +338,14 @@ impl Matcher {
     pub fn matches(&self, sample: &Sample) -> bool {
         match self {
             Matcher::Found => true,
+            Matcher::Any(list) => list.iter().any(|m| m.matches(sample)),
+            Matcher::Word { pattern, delimiters, case_insensitive } => {
+                matches!(cast(sample.clone(), SampleType::Str),
+                    Some(Sample::Str(s)) if match_word(s.as_bytes(), pattern, delimiters, *case_insensitive))
+            }
+            Matcher::IntRange(range) => {
+                matches!(cast(sample.clone(), SampleType::Sint), Some(Sample::Sint(v)) if range.contains(v))
+            }
             Matcher::Str {
                 target,
                 case_insensitive,
@@ -282,9 +409,9 @@ impl Matcher {
                     false
                 }
             }
-            Matcher::Len(expected_len) => {
+            Matcher::Len(range) => {
                 if let Some(Sample::Str(s)) = cast(sample.clone(), SampleType::Str) {
-                    s.len() == *expected_len
+                    i64::try_from(s.len()).is_ok_and(|n| range.contains(n))
                 } else {
                     false
                 }
@@ -368,5 +495,42 @@ mod tests {
         let m_less = Matcher::compile("lt", "50").unwrap();
         assert!(m_greater.matches(&smp_int));
         assert!(m_less.matches(&smp_int));
+    }
+
+    /// `match_word`: delimiters at either end of the pattern are dropped, a pattern longer
+    /// than the sample never matches, a word is what lies between delimiters.
+    #[test]
+    fn words_are_delimited() {
+        let dir = |p: &str, s: &str| Matcher::compile("dir", p).unwrap().matches(&Sample::Str(s.into()));
+        assert!(dir("/a/", "/x/a/y"));
+        assert!(dir("a", "a"));
+        assert!(!dir("/a/", "/x/ab/y"));
+        assert!(!dir("longer", "a"));
+        assert!(!dir("a", "/xa/"));
+        assert!(Matcher::compile_with_flags("dom", "A.B", true).unwrap().matches(&Sample::Str("x.a.b:80".into())));
+        assert!(!Matcher::compile_with_flags("dom", "A.B", false).unwrap().matches(&Sample::Str("x.a.b".into())));
+    }
+
+    #[test]
+    fn a_list_knows_its_shortest_pattern() {
+        let m = |method: &str, p: &str| Matcher::compile(method, p).unwrap();
+        assert_eq!(m("str", "abc").min_pattern_len(), 3);
+        assert_eq!(m("beg", "ab").min_pattern_len(), 2);
+        assert_eq!(m("end", "a").min_pattern_len(), 1);
+        assert_eq!(m("bin", "0a0b").min_pattern_len(), 2);
+        assert_eq!(m("int", "5").min_pattern_len(), 1);
+        assert_eq!(Matcher::Any(vec![m("sub", "abc"), m("beg", "de")]).min_pattern_len(), 2);
+        assert_eq!(Matcher::Any(Vec::new()).min_pattern_len(), 1);
+    }
+
+    #[test]
+    fn int_ranges_follow_pat_parse_int() {
+        assert_eq!(IntRange::parse("5").unwrap(), IntRange { min: Some(5), max: Some(5) });
+        assert_eq!(IntRange::parse("1-5").unwrap(), IntRange { min: Some(1), max: Some(5) });
+        assert_eq!(IntRange::parse(":5").unwrap(), IntRange { min: None, max: Some(5) });
+        assert_eq!(IntRange::parse("5:").unwrap(), IntRange { min: Some(5), max: None });
+        for bad in ["", ":", "x", "1:x", "x:1", "5:1"] {
+            assert!(IntRange::parse(bad).is_err(), "{bad:?}");
+        }
     }
 }

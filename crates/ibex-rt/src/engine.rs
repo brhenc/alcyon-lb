@@ -32,7 +32,7 @@ use ibex_sched::task::{state, Kind, TaskRef, WorkKind};
 use ibex_sched::{Class, Dispatch, Outcome, Scheduler, Tick};
 use ibex_stick_table::{KeyType, StickKey, StickTable, StickTableConfig};
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -583,9 +583,16 @@ fn compile_acls(acl_rules: &[ibex_config::AclRule]) -> HashMap<String, Expr> {
         .iter()
         .filter_map(|&(name, expr)| Some((name.to_string(), Expr::parse(expr).ok()?)))
         .collect();
-    for rule in acl_rules {
-        if let Ok(expr) = Expr::parse(&rule.expr) {
-            acls.insert(rule.name.clone(), expr);
+    // A name declared on several lines is one ACL matching if any line does; the first of
+    // them replaces a predefined ACL of that name.
+    let mut own: HashSet<&str> = HashSet::new();
+    for (rule, expr) in acl_rules.iter().filter_map(|r| Some((r, Expr::parse(&r.expr).ok()?))) {
+        match acls.get_mut(&rule.name) {
+            Some(first) if own.contains(rule.name.as_str()) => first.alternates.push(expr),
+            _ => {
+                own.insert(rule.name.as_str());
+                acls.insert(rule.name.clone(), expr);
+            }
         }
     }
     acls
@@ -7043,36 +7050,6 @@ fn eval_condition(
             false
         } else if let Some(expr) = acls.get(&term.name) {
             expr.eval(registry, ctx)
-        } else if let Some(f_idx) = term.name.find("-f ") {
-            let before_f = &term.name[..f_idx];
-            let after_f = term.name[f_idx + 3..].trim();
-            let file_path = after_f.split_whitespace().next().unwrap_or(after_f);
-            let case_insensitive = term.name.contains("-i");
-            let expr_str = before_f.split_whitespace().next().unwrap_or(before_f);
-            let mut matched = false;
-            if let Ok(expr) = Expr::parse(expr_str) {
-                if let Some(smp) = expr.eval_sample(registry, ctx) {
-                    let s = sample_to_string(&smp);
-                    if let Ok(content) = std::fs::read_to_string(file_path) {
-                        for line in content.lines() {
-                            let line = line.trim();
-                            if line.is_empty() || line.starts_with('#') {
-                                continue;
-                            }
-                            if case_insensitive {
-                                if s.eq_ignore_ascii_case(line) {
-                                    matched = true;
-                                    break;
-                                }
-                            } else if s == line {
-                                matched = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            matched
         } else if let Ok(expr) = Expr::parse(&term.name) {
             expr.eval(registry, ctx)
         } else {

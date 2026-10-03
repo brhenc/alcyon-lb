@@ -1777,14 +1777,7 @@ pub fn eval_acl_term_extended<S: ::std::hash::BuildHasher>(
             let min_needed = if len > 0 {
                 offset.saturating_add(len)
             } else {
-                let pat_len = match &expr.matcher {
-                    Some(ibex_sample::Matcher::Str { target, .. }) => target.len(),
-                    Some(ibex_sample::Matcher::Beg { prefix, .. }) => prefix.len(),
-                    Some(ibex_sample::Matcher::End { suffix, .. }) => suffix.len(),
-                    Some(ibex_sample::Matcher::Sub { sub, .. }) => sub.len(),
-                    Some(ibex_sample::Matcher::Bin(target)) => target.len(),
-                    _ => 1,
-                };
+                let pat_len = expr.matcher.as_ref().map_or(1, ibex_sample::Matcher::min_pattern_len);
                 offset.saturating_add(pat_len)
             };
             if req_bytes.len() < min_needed {
@@ -1806,20 +1799,16 @@ pub fn eval_acl_term_extended<S: ::std::hash::BuildHasher>(
             .get(1)
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(0);
-        if len == 0 {
-            match &expr.matcher {
-                Some(ibex_sample::Matcher::Sub { .. }) => {
-                    // An unanchored substring non-match is not final while the payload can still grow,
-                    // unless a line delimiter indicates the write/message boundary has ended.
-                    if !req_bytes.ends_with(b"\n") {
-                        return AclEvalResult::MissingData;
-                    }
-                }
-                Some(ibex_sample::Matcher::End { .. } | ibex_sample::Matcher::Reg { .. }) => {
-                    return AclEvalResult::MissingData;
-                }
-                _ => {}
-            }
+        // A non-match is not final while the payload can still grow, for an unanchored
+        // substring unless a line delimiter says the message has ended, and for a suffix
+        // or a regex whatever the payload ends with.
+        if len == 0
+            && expr
+                .matcher
+                .as_ref()
+                .is_some_and(|m| m.may_match_later(req_bytes.ends_with(b"\n")))
+        {
+            return AclEvalResult::MissingData;
         }
     }
     let effective = if term.negated { !is_match } else { is_match };
