@@ -135,6 +135,12 @@ pub trait HttpStream: Send {
     /// Distinct from an error: RFC 9112 says to honour `Transfer-Encoding` and close the
     /// connection, so the message is parseable and the connection is not reusable.
     fn framing_conflict(&self) -> bool;
+
+    /// True when parsing rewrote the head -- a repeated `Host` dropped, or the authority
+    /// and `Host` normalised -- so it must be forwarded from the HTX, not as received.
+    fn head_rewritten(&self) -> bool {
+        false
+    }
 }
 
 /// A parser implementation. One per process.
@@ -183,6 +189,10 @@ impl HttpStream for H1Parser {
 
     fn framing_conflict(&self) -> bool {
         self.framing_conflict
+    }
+
+    fn head_rewritten(&self) -> bool {
+        self.head_rewritten
     }
 }
 
@@ -365,6 +375,11 @@ impl HttpStream for DifferentialStream {
     fn framing_conflict(&self) -> bool {
         self.primary.framing_conflict() || self.candidate.framing_conflict()
     }
+
+    fn head_rewritten(&self) -> bool {
+        // The primary's HTX is the one forwarded; the candidate parses into scratch.
+        self.primary.head_rewritten()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -409,4 +424,73 @@ pub fn available() -> Vec<&'static str> {
         .filter(|k| build(**k).is_ok())
         .map(|k| k.as_str())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A stream that implements only what the trait requires.
+    struct Minimal;
+
+    impl HttpStream for Minimal {
+        fn parse(&mut self, input: &[u8], _htx: &mut HtxSlice<'_>) -> io::Result<usize> {
+            Ok(input.len())
+        }
+        fn reset(&mut self, _is_response: bool) {}
+        fn finish(&mut self, _htx: &mut HtxSlice<'_>) {}
+        fn connection_close(&self) -> bool {
+            false
+        }
+        fn framing_conflict(&self) -> bool {
+            false
+        }
+    }
+
+    struct MinimalParser;
+
+    impl HttpParser for MinimalParser {
+        fn name(&self) -> &'static str {
+            "minimal"
+        }
+        fn stream(&self, _is_response: bool) -> Box<dyn HttpStream> {
+            Box::new(Minimal)
+        }
+    }
+
+    const NORMALISED: &[u8] = b"GET http://h:80/ HTTP/1.1\r\nHost: h\r\n\r\n";
+    const AS_SENT: &[u8] = b"GET / HTTP/1.1\r\nHost: h:80\r\n\r\n";
+
+    fn rewritten(p: &dyn HttpParser, input: &[u8]) -> bool {
+        let mut buf = [0u8; 4096];
+        let mut htx = HtxSlice::new(&mut buf);
+        let mut s = p.stream(false);
+        s.parse(input, &mut htx).expect("parse");
+        s.head_rewritten()
+    }
+
+    /// A parser that does not normalise says so: the head is forwarded as received.
+    #[test]
+    fn a_parser_that_rewrites_nothing_reports_nothing() {
+        assert!(!rewritten(&MinimalParser, NORMALISED));
+        // The rest of the minimal stream, so it is a stream and not only a `parse`.
+        let mut buf = [0u8; 64];
+        let mut htx = HtxSlice::new(&mut buf);
+        let mut s = MinimalParser.stream(false);
+        s.finish(&mut htx);
+        s.reset(false);
+        assert!(!s.connection_close() && !s.framing_conflict() && !s.head_rewritten());
+    }
+
+    /// The differential forwards the primary's HTX, so it reports the primary's rewrite,
+    /// and only that: the candidate parses into scratch.
+    #[test]
+    fn the_differential_reports_the_primarys_rewrite() {
+        let h1_first = Differential::new(Box::new(H1), Box::new(MinimalParser), OnMismatch::Observe);
+        assert!(rewritten(&H1, NORMALISED), "control: H1 itself rewrites this head");
+        assert!(rewritten(&h1_first, NORMALISED));
+        assert!(!rewritten(&h1_first, AS_SENT), "origin-form is forwarded as received");
+        let minimal_first = Differential::new(Box::new(MinimalParser), Box::new(H1), OnMismatch::Observe);
+        assert!(!rewritten(&minimal_first, NORMALISED));
+    }
 }

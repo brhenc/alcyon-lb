@@ -657,8 +657,9 @@ impl TcpSession {
         self.htx_tail = slice.tail_addr();
         self.htx_blocks = slice.num_blocks();
         self.has_htx = true;
-        // Modified, so the head forwarded is regenerated from the HTX, without it.
-        self.htx_modified = conflict;
+        // Modified, so the head forwarded is regenerated from the HTX, without it. So
+        // too when the parser normalised the authority and `Host` (tasks/T93).
+        self.htx_modified = conflict || stream.head_rewritten();
         Ok(close)
     }
 

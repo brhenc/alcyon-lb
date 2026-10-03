@@ -42,6 +42,10 @@ pub struct H1Parser {
     pub framing_conflict: bool,
     pub saw_bare_cr: bool,
     pub prev_delim_len: usize,
+    /// Set when the request head was rewritten while parsing it -- a repeated `Host`
+    /// dropped, or the authority and `Host` normalised (`crate::authority`) -- so the
+    /// head must be forwarded from the HTX, not as received.
+    pub head_rewritten: bool,
 }
 
 impl H1Parser {
@@ -57,6 +61,7 @@ impl H1Parser {
             framing_conflict: false,
             saw_bare_cr: false,
             prev_delim_len: 2,
+            head_rewritten: false,
         }
     }
 
@@ -70,6 +75,7 @@ impl H1Parser {
         self.connection_close = false;
         self.saw_bare_cr = false;
         self.prev_delim_len = 2;
+        self.head_rewritten = false;
     }
 
     /// Finalizes parsing on connection close / EOF (for HTTP/1.0 close delimiter fallback).
@@ -307,6 +313,17 @@ impl H1Parser {
 
 
     fn on_headers_finished(&mut self, htx: &mut HtxSlice<'_>) -> io::Result<()> {
+        if !self.is_response {
+            // The authority against `Host`, as HAProxy checks it at the end of the head
+            // (`h1_parse_msg_hdrs`) and normalises it (`http_scheme_based_normalize`).
+            match crate::authority::check_and_normalize(htx) {
+                Ok(rewritten) => self.head_rewritten |= rewritten,
+                Err(e) => {
+                    self.phase = H1Phase::Error;
+                    return Err(e);
+                }
+            }
+        }
         let last_start_line = (0..htx.num_blocks())
             .rev()
             .find(|&i| matches!(htx.block_type(i), Some(HtxBlockType::ReqLine | HtxBlockType::ResLine)))

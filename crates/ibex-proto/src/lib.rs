@@ -63,6 +63,7 @@
 )]
 
 pub mod actions;
+pub mod authority;
 pub mod conn;
 pub mod endpoint;
 pub mod exp;
