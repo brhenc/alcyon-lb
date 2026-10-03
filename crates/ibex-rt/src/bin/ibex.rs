@@ -20,6 +20,8 @@ struct CliOptions {
     config_paths: Vec<PathBuf>,
     stats_socket: Option<PathBuf>,
     check_only: bool,
+    /// `-cc <condition>`: evaluated once the whole command line is read, the last one wins.
+    check_condition: Option<String>,
     change_dir: Option<PathBuf>,
     pid_file: Option<PathBuf>,
     quiet: bool,
@@ -263,16 +265,7 @@ fn parse_cli_args(args: &[String]) -> (String, CliOptions) {
                     eprintln!("Option -cc expects a condition expression.");
                     process::exit(1);
                 }
-                match ibex_rt::cond::eval(&args[i]) {
-                    Some(true) => process::exit(0),
-                    Some(false) => process::exit(1),
-                    None => {
-                        // Distinguished from false: a condition nobody can parse is a
-                        // mistake to fix, not a feature we lack.
-                        eprintln!("Unparseable condition: {}", args[i]);
-                        process::exit(2);
-                    }
-                }
+                opts.check_condition = Some(args[i].clone());
             }
             "-c" => {
                 opts.check_only = true;
@@ -539,6 +532,18 @@ fn handle_pid_file(pid_path: &Path) {
 fn main() {
     let raw_args: Vec<String> = env::args().collect();
     let (program, opts) = parse_cli_args(&raw_args);
+    // `HAProxy` evaluates a `-cc` condition before anything else and exits: 0 for true, 1
+    // for false, 2 when it does not evaluate.
+    if let Some(cond) = &opts.check_condition {
+        match ibex_rt::cond::eval_cc(cond) {
+            Ok(true) => process::exit(0),
+            Ok(false) => process::exit(1),
+            Err(msg) => {
+                eprintln!("[ALERT] : {msg}");
+                process::exit(2);
+            }
+        }
+    }
     // A reload restarts this binary with these same arguments; relative paths in them are
     // relative to where it was started, not to wherever `-C` moved it.
     let start_dir = std::env::current_dir().ok();
