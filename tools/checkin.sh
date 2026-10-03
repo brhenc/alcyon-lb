@@ -29,9 +29,35 @@ export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-/tmp/ibex-checkin-target}
 FAILED=()
 note_fail() { FAILED+=("$1"); echo "!! FAILED: $1"; }
 # Each section header carries the time since the gate started, so a slow or stuck section
-# can be told from a long one while it runs (T116).
+# can be told from a long one while it runs (T116), and how long that section took on the
+# last few runs: past the "stuck after" mark, look at the processes rather than wait. The
+# history is per machine, not per checkout, so a fresh worktree has it too.
 GATE_T0=$SECONDS
-section() { echo "=== $1 === [+$((SECONDS - GATE_T0))s]"; }
+GATE_HISTORY=${IBEX_GATE_HISTORY:-$HOME/.cache/ibex/checkin-sections.tsv}
+mkdir -p "$(dirname "$GATE_HISTORY")" 2>/dev/null || true
+SECTION_NAME=""
+SECTION_T0=0
+section() {
+  local now=$((SECONDS - GATE_T0)) hint=""
+  if [ -n "$SECTION_NAME" ]; then
+    printf '%s\t%s\n' "$SECTION_NAME" $((now - SECTION_T0)) >> "$GATE_HISTORY" 2>/dev/null || true
+  fi
+  SECTION_NAME=$1
+  SECTION_T0=$now
+  hint=$(section_hint "$1")
+  echo "=== $1 === [+${now}s]${hint:+  ($hint)}"
+}
+# From the section's last seven runs: the median, and "stuck" at twice the longest (at
+# least a minute). Sections that never take ten seconds get no hint.
+section_hint() {
+  [ -r "$GATE_HISTORY" ] || return 0
+  awk -F'\t' -v n="$1" '$1 == n { print $2 }' "$GATE_HISTORY" | tail -n 7 | sort -n \
+    | awk '{ v[NR] = $1 } END {
+        if (NR == 0 || v[NR] < 10) exit
+        stuck = 2 * v[NR]; if (stuck < 60) stuck = 60
+        printf "usually ~%ds; stuck after %dm%02ds", v[int((NR + 1) / 2)], stuck / 60, stuck % 60
+      }'
+}
 check() { [ "$1" -eq 0 ] || note_fail "$2"; }
 
 # tcp_request_rules.rs, tcp_request_tracking.rs and stick_table.rs were unprotected on
@@ -41,6 +67,8 @@ SPEC_TESTS=(
   crates/ibex-sample/tests/sample_semantics.rs
 )
 
+hint=$(section_hint "(whole gate)")
+[ -z "$hint" ] || echo "checkin: the whole gate: $hint"
 section "tripwire: the spec tests must not change"
 # nudge-agy.md says to fix the code, not the assertions. A change here means either
 # that instruction was ignored or a supervisor weakened a test to go green.
@@ -159,6 +187,7 @@ git status --short | grep '^??' \
 
 echo
 section "verdict"
+printf '%s\t%s\n' "(whole gate)" $((SECONDS - GATE_T0)) >> "$GATE_HISTORY" 2>/dev/null || true
 if [ ${#FAILED[@]} -eq 0 ]; then
   echo "checkin: PASS"
   exit 0
