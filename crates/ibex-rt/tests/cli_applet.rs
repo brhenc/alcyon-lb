@@ -12,6 +12,12 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
 fn create_test_engine(socket_path: &PathBuf) -> Engine {
+    let _g = BUFSIZE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    build_test_engine(socket_path)
+}
+
+/// [`create_test_engine`] for a test that already holds `BUFSIZE` (it is not re-entrant).
+fn build_test_engine(socket_path: &PathBuf) -> Engine {
     // The servers are never connected to. The frontend port is reserved: every test here
     // builds an engine, and with SO_REUSEPORT a shared fixed port does not fail to bind,
     // it silently joins the other engines.
@@ -292,6 +298,16 @@ fn cli_applet_one_shot_non_interactive_command() {
 /// parallel, the size could change between the two and the check failed.
 static BUFSIZE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// `Engine::new` sets the process-global `tune.bufsize` (16384 when the config says
+/// nothing), so every engine is built under `BUFSIZE`: built in parallel with
+/// `cli_applet_show_pools_configured_sizes`, another test's engine put the size back to
+/// 16384 between its `Engine::new` and its `show pools`, about one run in three. A test
+/// that holds `BUFSIZE` itself builds with `build_test_engine`.
+fn new_engine(config: &ibex_config::Config) -> Engine {
+    let _g = BUFSIZE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    Engine::new(config, 1024).expect("failed to create engine")
+}
+
 #[test]
 fn cli_applet_show_pools() {
     let _g = BUFSIZE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -299,7 +315,7 @@ fn cli_applet_show_pools() {
         "/tmp/ibex_test_pools_{}.sock",
         std::process::id()
     ));
-    let mut engine = create_test_engine(&socket_path);
+    let mut engine = build_test_engine(&socket_path);
 
     // Warm-up a buffer so Pool buffer has non-zero stats. Take the size from the
     // configured standard rather than the BUFSIZE constant: the two are separate (a
@@ -417,7 +433,7 @@ backend be
     stick-table type ip size 1m expire 10m store gpc0,conn_rate(10s)
 ";
     let config = ibex_config::parse_str(cfg_str).expect("config");
-    let mut engine = Engine::new(&config, 1024).expect("engine");
+    let mut engine = new_engine(&config);
     engine.bind_cli_socket(&socket_path).expect("bind");
     engine.step(Tick(10)).unwrap();
 

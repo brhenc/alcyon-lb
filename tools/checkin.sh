@@ -28,6 +28,10 @@ export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-/tmp/ibex-checkin-target}
 # exit on them.
 FAILED=()
 note_fail() { FAILED+=("$1"); echo "!! FAILED: $1"; }
+# Each section header carries the time since the gate started, so a slow or stuck section
+# can be told from a long one while it runs (T116).
+GATE_T0=$SECONDS
+section() { echo "=== $1 === [+$((SECONDS - GATE_T0))s]"; }
 check() { [ "$1" -eq 0 ] || note_fail "$2"; }
 
 # tcp_request_rules.rs, tcp_request_tracking.rs and stick_table.rs were unprotected on
@@ -37,7 +41,7 @@ SPEC_TESTS=(
   crates/ibex-sample/tests/sample_semantics.rs
 )
 
-echo "=== tripwire: the spec tests must not change ==="
+section "tripwire: the spec tests must not change"
 # nudge-agy.md says to fix the code, not the assertions. A change here means either
 # that instruction was ignored or a supervisor weakened a test to go green.
 #
@@ -59,7 +63,7 @@ else
 fi
 
 echo
-echo "=== the eight findings ==="
+section "the eight findings"
 cargo test -p ibex-sample --test sample_semantics 2>&1 | grep -E "^test |test result"
 check "${PIPESTATUS[0]}" "sample_semantics"
 cargo test -p ibex-rt --test tcp_request_rules 2>&1 | grep -E "^test |test result"
@@ -68,7 +72,7 @@ cargo test -p ibex-rt --test tcp_request_tracking 2>&1 | grep -E "^test |test re
 check "${PIPESTATUS[0]}" "tcp_request_tracking"
 
 echo
-echo "=== the oracles that measure a port against the real thing ==="
+section "the oracles that measure a port against the real thing"
 # A crate whose correctness is defined by a reference must be checked against it here,
 # not only in its own task. crates/slz was landed reporting SUCCESS while its only test
 # panicked on `serde_json::from_str` before comparing a single vector -- the struct named
@@ -78,7 +82,7 @@ cargo test -p slz --test test_slz -- --nocapture 2>&1 | grep -E "EXACT MATCHES|R
 check "${PIPESTATUS[0]}" "slz oracle"
 
 echo
-echo "=== every test in the workspace, against a declared baseline ==="
+section "every test in the workspace, against a declared baseline"
 # The three sections above name four test targets by hand. The workspace has 77, so 73 of
 # them -- including every file a task had added -- never ran here. That is how T48 shipped
 # crates/ibex-rt/tests/load_balancing.rs with a red assertion and a SUCCESS report, past two
@@ -92,7 +96,7 @@ python3 harness/suite.py 2>&1 | grep -vE "^$"
 check "${PIPESTATUS[0]}" "workspace suite"
 
 echo
-echo "=== did a test execute what changed ==="
+section "did a test execute what changed"
 # The recurring defect is one thing wearing several hats: the test does not execute the code
 # the feature lives in. T48's test called lb::balance_uri directly and never entered the
 # engine, so `balance uri` sent every request to one server while its test passed, through
@@ -109,7 +113,7 @@ else
 fi
 
 echo
-echo "=== the regressions no unit test can see ==="
+section "the regressions no unit test can see"
 # A daemon that will not start is invisible to `cargo test`. Making the `global` section
 # strict about unknown keywords took the reg-test board from 7 passing to 1 -- `thread-groups`
 # appears in nearly every HAProxy reg-test -- and it survived two hours because every unit
@@ -119,7 +123,7 @@ python3 harness/smoke.py 2>&1 | grep -vE "^$"
 check "${PIPESTATUS[0]}" "smoke"
 
 echo
-echo "=== does HAProxy still behave as the tests record ==="
+section "does HAProxy still behave as the tests record"
 # http_txn.rs is measured against HAProxy; run against it here, a case that starts failing
 # means HAProxy changed (T89: Content-Length beside chunked is the case the user asked to
 # watch). Expected HAProxy failures: data/txn_oracle_baseline.json.
@@ -127,19 +131,19 @@ python3 harness/txn_oracle.py 2>&1 | grep -vE "^$"
 check "${PIPESTATUS[0]}" "txn oracle"
 
 echo
-echo "=== does the rest still build and lint ==="
+section "does the rest still build and lint"
 cargo clippy -q --workspace --all-targets 2>&1 | grep -E "^(warning|error)" | grep -v generated | sort | uniq -c
 CLIPPY_RC=${PIPESTATUS[0]}
 echo "clippy exit: $CLIPPY_RC"
 check "$CLIPPY_RC" "clippy"
 
 echo
-echo "=== continuous measurement ==="
+section "continuous measurement"
 tools/measure/run.sh --fast
 check "$?" "continuous measurement"
 
 echo
-echo "=== new surface since the nudge, and whether it came with tests ==="
+section "new surface since the nudge, and whether it came with tests"
 echo "-- uncommitted:"
 git diff --stat | tail -1
 echo "src lines changed:  $(git diff --numstat -- '*/src/*.rs'   | awk '{s+=$1} END {print s+0}')"
@@ -148,13 +152,13 @@ echo "-- commits since the nudge was written:"
 git log --oneline --since="2026-09-22" | head -20
 
 echo
-echo "=== stray files (the supervisor's own are expected) ==="
+section "stray files (the supervisor's own are expected)"
 git status --short | grep '^??' \
   | grep -vE 'tests/(sample_semantics|tcp_request_rules|tcp_request_tracking)\.rs|nudge-agy\.md|tools/checkin\.sh' \
   || echo "none"
 
 echo
-echo "=== verdict ==="
+section "verdict"
 if [ ${#FAILED[@]} -eq 0 ]; then
   echo "checkin: PASS"
   exit 0

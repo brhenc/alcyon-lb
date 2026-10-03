@@ -35,6 +35,8 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # One report per checkout: agy runs several worktrees at once, and a shared path let one
@@ -109,7 +111,7 @@ def changed_lines(base: str, repo: str = REPO) -> dict[str, set[int]]:
     return per
 
 
-def covered(paths: set[str]) -> tuple[dict[str, set[int]], dict[str, set[int]]]:
+def covered(paths: set[str]) -> tuple[dict[str, set[int]], dict[str, set[int]]] | None:
     env = dict(os.environ)
     # Fedora-packaged Rust, no rustup, so llvm-tools-preview is not installable that way.
     env.setdefault("LLVM_COV", "/usr/bin/llvm-cov")
@@ -118,10 +120,37 @@ def covered(paths: set[str]) -> tuple[dict[str, set[int]], dict[str, set[int]]]:
     # --ignore-run-fail: the suite has two declared failures (data/suite_baseline.json).
     # Without it llvm-cov exits non-zero and writes no report, and this check silently
     # passes -- which is the failure mode that made suite.py green on everything once.
-    r = subprocess.run(["cargo", "llvm-cov", "--workspace", "--no-cfg-coverage",
-                        "--ignore-run-fail",
-                        "--lcov", "--output-path", LCOV],
-                       cwd=REPO, capture_output=True, text=True, env=env)
+    # A heartbeat while it runs (minutes, all output captured), so a stuck test shows as
+    # a stuck test: the newest test binary llvm-cov started, and for how long.
+    stop = threading.Event()
+    t0 = time.monotonic()
+
+    def heartbeat():
+        while not stop.wait(30):
+            newest = subprocess.run(["pgrep", "-n", "-f", "llvm-cov-target/debug/deps/"],
+                                    capture_output=True, text=True).stdout.strip()
+            what = ""
+            if newest:
+                try:
+                    exe = os.path.basename(open(f"/proc/{newest}/cmdline").read().split("\0")[0])
+                    secs = time.time() - os.stat(f"/proc/{newest}").st_mtime
+                    what = f"; running {exe} ({secs:.0f}s)"
+                except OSError:
+                    pass
+            print(f"   ... covercheck {time.monotonic() - t0:.0f}s{what}", flush=True)
+
+    threading.Thread(target=heartbeat, daemon=True).start()
+    try:
+        r = subprocess.run(["cargo", "llvm-cov", "--workspace", "--no-cfg-coverage",
+                            "--ignore-run-fail",
+                            "--lcov", "--output-path", LCOV],
+                           cwd=REPO, capture_output=True, text=True, env=env,
+                           timeout=int(os.environ.get("COVERCHECK_TIMEOUT", "1800")))
+    except subprocess.TimeoutExpired:
+        print("covercheck: cargo llvm-cov ran past COVERCHECK_TIMEOUT -- a test is hung")
+        return None
+    finally:
+        stop.set()
     if not os.path.exists(LCOV):
         print("covercheck: cargo llvm-cov produced no report; skipping")
         print((r.stderr or r.stdout)[-400:])
@@ -160,7 +189,10 @@ def main() -> int:
     print(f"covercheck: {total} source lines changed in {len(changed)} files"
           f" since {base[:12]}")
 
-    execd, hitmap = covered(set(changed))
+    result = covered(set(changed))
+    if result is None:
+        return 1  # hung: a gate that cannot finish has not passed
+    execd, hitmap = result
     if not execd:
         return 0  # reported above; an unavailable tool is not a gate failure
 
