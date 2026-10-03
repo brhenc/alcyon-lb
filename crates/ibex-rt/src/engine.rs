@@ -1887,12 +1887,21 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         };
 
         let tasks_run = self.scheduler.process_runnable_tasks(&mut dispatcher);
+        // A task recorded here may have ended later in the same pass (a session shut down
+        // by the CLI, then run to `Outcome::Done`), and the scheduler has freed it. Its
+        // slot must not be queued: it is handed to the next connection, and the stale
+        // membership corrupted the tasklet lists (T100). No task is allocated during the
+        // pass, so a live reference here still names the task it was recorded for.
         for &(task_ref, expiry) in &dispatcher.timer_updates {
-            self.scheduler.queue_timer(task_ref, expiry);
+            if self.scheduler.is_live(task_ref) {
+                self.scheduler.queue_timer(task_ref, expiry);
+            }
         }
         for task_ref in dispatcher.wake_queue {
-            self.scheduler
-                .tasklet_wakeup(task_ref, Class::Urgent, state::WOKEN_IO);
+            if self.scheduler.is_live(task_ref) {
+                self.scheduler
+                    .tasklet_wakeup(task_ref, Class::Urgent, state::WOKEN_IO);
+            }
         }
         self.timer_updates = dispatcher.timer_updates;
         Ok(tasks_run)
@@ -4550,9 +4559,13 @@ impl EngineDispatcher<'_> {
                 self.wake_queue.push(entry.task);
             }
 
-            // Step 5: Update timer
-            self.timer_updates
-                .push((entry.task, entry.sess.next_expiry()));
+            // Step 5: Update timer. Not for a stream that has ended: its task is freed when
+            // this returns `Outcome::Done`, and a timer queued on it after the pass was
+            // T100's crash.
+            if !entry.sess.is_done() {
+                self.timer_updates
+                    .push((entry.task, entry.sess.next_expiry()));
+            }
 
             (entry.sess.is_done(), pending_admin, log_line)
         };
