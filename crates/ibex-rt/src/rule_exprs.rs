@@ -142,6 +142,7 @@ fn res_set_var<'a>(name: &str, fmt: &'a str) -> Exprs<'a> {
 fn http_res(a: &HttpResAction) -> Exprs<'_> {
     match a {
         HttpResAction::SetHeader { name, fmt } => res_set_var(name, fmt),
+        HttpResAction::Capture { expr, .. } => vec![("capture".into(), expr, false)],
         _ => Vec::new(),
     }
 }
@@ -400,6 +401,23 @@ pub fn validate_formats(config: &Config, registry: &Registry) -> Result<(), Stri
                 let slots = caps.len() + rules.iter().filter(|r| matches!(r.action, ibex_config::HttpReqAction::Capture { id: None, .. })).count();
                 if id >= slots {
                     return Err(format!("Proxy '{name}': unable to find capture id '{id}' referenced by http-request capture rule."));
+                }
+            }
+        }
+    }
+    // `http-response capture ... id <n>` fills a response slot of the proxy that receives the
+    // requests: a `declare capture response` or a `capture response header`. A backend's
+    // rule names one of its frontend's, found only when a response comes back.
+    let sections = config
+        .frontends
+        .iter()
+        .map(|f| (&f.name, &f.http_res_rules, f.res_header_captures.len()))
+        .chain(config.listens.iter().map(|l| (&l.name, &l.http_res_rules, l.res_header_captures.len())));
+    for (name, rules, slots) in sections {
+        for r in rules {
+            if let HttpResAction::Capture { id, .. } = r.action {
+                if id >= slots {
+                    return Err(format!("Proxy '{name}': unable to find capture id '{id}' referenced by http-response capture rule."));
                 }
             }
         }

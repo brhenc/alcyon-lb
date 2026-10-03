@@ -584,7 +584,7 @@ pub(crate) fn parse_backend_directive(
         }
         "option" => parse_option_backend(be, tokens, kw),
         "no" => parse_no_backend(be, tokens, kw),
-        "declare" => parse_declare(tokens, kw),
+        "declare" => refuse_declare(DeclareIn::Backend, kw),
         "cliexp" => parse_cliexp(kw),
         "srvexp" => parse_srvexp(kw),
         "acl" => parse_acl(&mut be.acls, tokens, kw),

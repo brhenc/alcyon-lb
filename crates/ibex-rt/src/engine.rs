@@ -207,9 +207,10 @@ pub struct Proxy {
     pub unique_id_format: Option<Arc<crate::logfmt::LogFormat>>,
     /// `unique-id-header`: the request header the unique ID is sent to the server in.
     pub unique_id_header: Option<String>,
-    /// Request capture slots: `capture request header` (name, length) where it took the
-    /// slot, `None` where an `http-request capture` rule did.
-    pub req_capture_slots: Arc<[Option<(String, usize)>]>,
+    /// Request capture slots as (header name, length): a `capture request header`'s name is
+    /// the header, an empty name is a slot only a rule fills (`declare capture request`, or
+    /// an `http-request capture` rule's own, which has the rule's `len`).
+    pub req_capture_slots: Arc<[(String, usize)]>,
     /// `capture response header`, by slot.
     pub res_capture_slots: Arc<[(String, usize)]>,
     /// `%lc`: the lines this proxy has logged, shared by the workers.
@@ -679,11 +680,12 @@ fn compile_log_format(spec: Option<&ibex_config::LogFormatSpec>, mode_http: bool
 
 /// The proxy's request capture slots, and the slot each `http-request capture` rule
 /// without `id` writes: `HAProxy` numbers both in declaration order, and the header
-/// captures recorded theirs, so the rules take the rest in order.
+/// captures recorded theirs, so the rules take the rest in order. A rule's slot is as long
+/// as the rule's `len`, which a later rule writing it by `id` is cut to.
 fn capture_slots(
     headers: &[ibex_config::HeaderCapture],
     rules: &mut [ibex_config::HttpReqRule],
-) -> Arc<[Option<(String, usize)>]> {
+) -> Arc<[(String, usize)]> {
     let rule_slots = rules
         .iter()
         .filter(|r| matches!(r.action, ibex_config::HttpReqAction::Capture { id: None, .. }))
@@ -696,11 +698,14 @@ fn capture_slots(
     }
     let mut free = (0..slots.len()).filter(|&i| slots[i].is_none()).collect::<Vec<_>>().into_iter();
     for r in rules.iter_mut() {
-        if let ibex_config::HttpReqAction::Capture { id: id @ None, .. } = &mut r.action {
+        if let ibex_config::HttpReqAction::Capture { id: id @ None, len, .. } = &mut r.action {
             *id = free.next();
+            if let Some(slot) = id.and_then(|i| slots.get_mut(i)) {
+                *slot = Some((String::new(), len.unwrap_or(usize::MAX)));
+            }
         }
     }
-    slots.into()
+    slots.into_iter().map(Option::unwrap_or_default).collect()
 }
 
 /// The `http-request capture` expressions of `rules`, parsed once, parallel to the rules.
@@ -724,10 +729,13 @@ pub(crate) fn log_hostname() -> &'static str {
 
 /// The values of `slots` (`None` for a slot a rule fills) in a message head: the last
 /// occurrence of each header, cut to its length (`capture_headers`, src/http_ana.c).
-fn capture_values<'a>(slots: impl Iterator<Item = Option<(&'a str, usize)>>, headers: &[(&str, &str)]) -> Vec<Option<Vec<u8>>> {
+fn capture_values<'a>(slots: impl Iterator<Item = (&'a str, usize)>, headers: &[(&str, &str)]) -> Vec<Option<Vec<u8>>> {
     slots
-        .map(|slot| {
-            let (name, len) = slot?;
+        .map(|(name, len)| {
+            // A slot no header fills (`declare capture`, a rule's) has no name.
+            if name.is_empty() {
+                return None;
+            }
             headers.iter().rev().find(|(k, _)| k.trim().eq_ignore_ascii_case(name)).map(|(_, v)| cut_at(v.trim(), len).to_vec())
         })
         .collect()
@@ -746,7 +754,7 @@ fn begin_http_stream(entry: &mut SessionEntry, proxies: &[Proxy], fe_idx: usize,
     if !fe.req_capture_slots.is_empty() {
         // A request that reached here was parsed into HTX (H1 and H2 alike).
         let headers: Vec<(&str, &str)> = entry.sess.htx_slice().map(|htx| htx.headers().collect()).unwrap_or_default();
-        entry.sess.log.req_captures = capture_values(fe.req_capture_slots.iter().map(|s| s.as_ref().map(|(n, l)| (n.as_str(), *l))), &headers);
+        entry.sess.log.req_captures = capture_values(fe.req_capture_slots.iter().map(|(n, l)| (n.as_str(), *l)), &headers);
     }
     // The response's slots exist from here on, empty until a response fills them: `%hs`
     // is `{}` for a transaction the server never answered, and nothing for a request
@@ -4710,7 +4718,7 @@ impl EngineDispatcher<'_> {
         if !fe_caps.is_empty() {
             let head = String::from_utf8_lossy(&entry.sess.rep.readable()[..total_hdr_len]).into_owned();
             let headers: Vec<(&str, &str)> = head.split("\r\n").skip(1).filter_map(|l| l.split_once(':')).collect();
-            entry.sess.log.res_captures = capture_values(fe_caps.iter().map(|(n, l)| Some((n.as_str(), *l))), &headers);
+            entry.sess.log.res_captures = capture_values(fe_caps.iter().map(|(n, l)| (n.as_str(), *l)), &headers);
         }
         txn.status = status;
         txn.srv_reusable = !srv_has_close
@@ -4805,6 +4813,10 @@ impl EngineDispatcher<'_> {
         let req_uri_clone = entry.sess.req_uri.clone();
         let req_method_clone = entry.sess.req_method.clone();
         let req_headers_clone = entry.sess.req_headers.clone();
+        // The response capture slots the `http-response capture` rules write, and that the
+        // context reads (as they were when the response came in).
+        let mut res_caps = entry.sess.log.res_captures.clone();
+        let res_caps_in = res_caps.clone();
 
         let htx_slice = if entry.sess.has_htx {
             Some(ibex_proto::htx::HtxSliceRef::new(
@@ -4835,7 +4847,7 @@ impl EngineDispatcher<'_> {
             res_version: Some(&proto_version),
             unique_id: entry.sess.log.unique_id.as_deref(),
             captures_req_hdr: Some(&entry.sess.log.req_captures),
-            captures_res_hdr: Some(&entry.sess.log.res_captures),
+            captures_res_hdr: Some(&res_caps_in),
             ..Default::default()
         };
 
@@ -4881,19 +4893,32 @@ impl EngineDispatcher<'_> {
             // 1. The backend's `http-response` rules, then the frontend's when it is another
             // proxy; an `allow` ends only its own list.
             let order: &[usize] = if fe_idx == be_idx { &[be_idx] } else { &[be_idx, fe_idx] };
+            // `http-response capture` writes the frontend's slots, whichever proxy the rule is in.
+            let fe_res_slots = &proxies[fe_idx].res_capture_slots;
+            let mut stopped = None;
             for &px in order {
                 let rules = proxies[px].http_res_rules.iter().map(|r| (ResOp::of_res(&r.action), r.cond.as_ref()));
+                let caps = (!fe_res_slots.is_empty()).then_some((&mut res_caps, &fe_res_slots[..]));
                 if let Err(stop) = run_res_rules(
                     rules,
                     &proxies[px].acls,
                     (&mut hdrs, &mut status, &mut status_msg),
                     &ctx,
+                    caps,
                     registry,
                     &mut entry.sess.sess_vars,
                     &mut entry.sess.req_vars,
                 ) {
-                    break 'rules Some(stop);
+                    stopped = Some(stop);
+                    break;
                 }
+            }
+            // What the rules captured is what the log line shows, and what the rules after
+            // them (`http-after-response`) read.
+            entry.sess.log.res_captures.clone_from(&res_caps);
+            let ctx = SampleContext { captures_res_hdr: Some(&res_caps), ..ctx.clone() };
+            if stopped.is_some() {
+                break 'rules stopped;
             }
 
             // The backend's `cookie` line: the server's own cookie edited, the persistence
@@ -5893,7 +5918,7 @@ impl EngineDispatcher<'_> {
                         // An `id` past the frontend's slots captures nothing.
                         if let (Some(target_id), Some(val)) = (id, val) {
                             // With `id`, the length is the declared slot's.
-                            let max = len.or_else(|| proxies[proxy_idx].req_capture_slots.get(*target_id)?.as_ref().map(|(_, l)| *l));
+                            let max = len.or_else(|| proxies[proxy_idx].req_capture_slots.get(*target_id).map(|(_, l)| *l));
                             if let Some(slot) = sess.log.req_captures.get_mut(*target_id) {
                                 *slot = Some(cut_at(&val, max.unwrap_or(usize::MAX)).to_vec());
                             }
@@ -7193,22 +7218,31 @@ enum ResOp<'a> {
     Status(u16),
 }
 
+/// An entry of a response rule list: a [`ResOp`] on the response head, or -- `capture` only
+/// being in `http-response` -- a sample (a fetch expression) written to a capture slot.
+#[derive(Clone, Copy)]
+enum ResRule<'a> {
+    Op(ResOp<'a>),
+    Capture(&'a str, usize),
+}
+
 impl<'a> ResOp<'a> {
-    fn of_res(a: &'a ibex_config::HttpResAction) -> Self {
-        match a {
+    fn of_res(a: &'a ibex_config::HttpResAction) -> ResRule<'a> {
+        ResRule::Op(match a {
             ibex_config::HttpResAction::SetHeader { name, fmt } => Self::Set(name, fmt),
             ibex_config::HttpResAction::AddHeader { name, fmt } => Self::Add(name, fmt),
             ibex_config::HttpResAction::DelHeader { name } => Self::Del(name),
             ibex_config::HttpResAction::SetStatus { status } => Self::Status(*status),
-        }
+            ibex_config::HttpResAction::Capture { expr, id } => return ResRule::Capture(expr, *id),
+        })
     }
 
-    fn of_after_res(a: &'a ibex_config::HttpAfterResAction) -> Self {
-        match a {
+    fn of_after_res(a: &'a ibex_config::HttpAfterResAction) -> ResRule<'a> {
+        ResRule::Op(match a {
             ibex_config::HttpAfterResAction::SetHeader { name, fmt } => Self::Set(name, fmt),
             ibex_config::HttpAfterResAction::AddHeader { name, fmt } => Self::Add(name, fmt),
             ibex_config::HttpAfterResAction::DelHeader { name } => Self::Del(name),
-        }
+        })
     }
 }
 
@@ -7459,12 +7493,17 @@ fn res_action(
 /// Runs one rule list (`http_res_get_intercept_rule`): each rule whose condition holds,
 /// until `allow` ends the list or an action stops the response. Every list starts in
 /// strict mode, and a `strict-mode off` in it lasts to its end only.
+///
+/// `caps` is the response capture slots with their lengths, for the lists that have
+/// `http-response capture`: a rule writes its slot there, and the rules after it (and the
+/// caller, once the list is done) read what it wrote.
 #[allow(clippy::too_many_arguments)]
 fn run_res_rules<'a>(
-    rules: impl Iterator<Item = (ResOp<'a>, Option<&'a ibex_config::AclCondition>)>,
+    rules: impl Iterator<Item = (ResRule<'a>, Option<&'a ibex_config::AclCondition>)>,
     acls: &HashMap<String, Expr>,
     head: (&mut Vec<(String, String)>, &mut u16, &mut String),
     ctx: &SampleContext,
+    mut caps: Option<(&mut Vec<Option<Vec<u8>>>, &[(String, usize)])>,
     registry: &Registry,
     sess_vars: &mut HashMap<String, String>,
     req_vars: &mut HashMap<String, String>,
@@ -7473,9 +7512,32 @@ fn run_res_rules<'a>(
     STRICT_MODE.set(true);
     let mut result = Ok(());
     for (op, cond) in rules {
+        // The slots as the earlier rules left them, for `capture.res.hdr`.
+        let with_caps;
+        let ctx = match &caps {
+            Some((slots, _)) => {
+                with_caps = SampleContext { captures_res_hdr: Some(slots.as_slice()), ..ctx.clone() };
+                &with_caps
+            }
+            None => ctx,
+        };
         if cond.is_some_and(|c| !eval_condition(c, ctx, acls, registry)) {
             continue;
         }
+        let op = match op {
+            ResRule::Op(op) => op,
+            ResRule::Capture(expr, id) => {
+                // No sample, no capture (the slot keeps what it had); an `id` past the frontend's
+                // slots captures nothing (`http_action_res_capture_by_id`: `id >= fe->nb_rsp_cap`).
+                let val = Expr::parse(expr).ok().and_then(|e| e.eval_sample(registry, ctx)).map(|smp| sample_to_string(&smp));
+                if let (Some(val), Some((slots, lens))) = (val, caps.as_mut()) {
+                    if let (Some(slot), Some((_, len))) = (slots.get_mut(id), lens.get(id)) {
+                        *slot = Some(cut_at(&val, *len).to_vec());
+                    }
+                }
+                continue;
+            }
+        };
         match res_action(op, hdrs, status, status_msg, ctx, registry, sess_vars, req_vars) {
             Ok(true) => {}
             Ok(false) => break,
@@ -7511,7 +7573,7 @@ fn eval_after_res_rules(
     let order: &[usize] = if fe_idx == be_idx { &[be_idx] } else { &[be_idx, fe_idx] };
     for &px in order {
         let rules = proxies[px].http_after_res_rules.iter().map(|r| (ResOp::of_after_res(&r.action), r.cond.as_ref()));
-        run_res_rules(rules, &proxies[px].acls, (&mut *hdrs, &mut *status, &mut *status_msg), ctx, registry, sess_vars, req_vars)?;
+        run_res_rules(rules, &proxies[px].acls, (&mut *hdrs, &mut *status, &mut *status_msg), ctx, None, registry, sess_vars, req_vars)?;
     }
     Ok(())
 }

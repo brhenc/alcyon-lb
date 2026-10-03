@@ -508,25 +508,40 @@ pub(crate) fn parse_no_directive(tokens: &[Token], _kw: &Token) -> Result<(), Co
     Ok(())
 }
 
-#[allow(clippy::unnecessary_wraps)]
-pub(crate) fn parse_declare(tokens: &[Token], _kw: &Token) -> Result<(), ConfigError> {
-    if tokens.len() >= 2 {
-        eprintln!("[ibex] warning: ignored declare directive '{}'", tokens[1].text);
-    }
-    Ok(())
+/// Where a `declare` line is, for the sections `HAProxy` refuses it in.
+#[derive(Clone, Copy)]
+pub(crate) enum DeclareIn {
+    Defaults,
+    Backend,
 }
 
+/// `declare` in a section that cannot have one: `HAProxy` refuses it in a `backend`
+/// ("'declare' only available in frontend or listen section") and in `defaults`
+/// ("'declare' not available in default section"), whatever follows it.
+pub(crate) fn refuse_declare(section: DeclareIn, kw: &Token) -> Result<(), ConfigError> {
+    let msg = match section {
+        DeclareIn::Defaults => "'declare' not available in default section",
+        DeclareIn::Backend => "'declare' only available in frontend or listen section",
+    };
+    Err(ConfigError::new(kw.line, kw.col, msg.to_string()))
+}
 
-
-
-
-
-
-
-
-
-
-
+/// A `declare` in a frontend or a listen that is not `declare capture` (that one has its own
+/// parser, `parse_declare_capture`): `HAProxy` supports `capture` only.
+pub(crate) fn parse_declare(tokens: &[Token], kw: &Token) -> Result<(), ConfigError> {
+    match tokens.get(1).map(|t| t.text.as_str()) {
+        None | Some("") => Err(ConfigError::new(
+            kw.line,
+            kw.col,
+            "'declare' needs a second keyword that specify the type of declaration ('capture')".to_string(),
+        )),
+        Some(other) => Err(ConfigError::new(
+            kw.line,
+            kw.col,
+            format!("unknown declaration type '{other}' (supports 'capture')"),
+        )),
+    }
+}
 
 pub(crate) fn parse_mode(mode: &mut Mode, tokens: &[Token], kw: &Token) -> Result<(), ConfigError> {
     if tokens.len() < 2 || tokens[1].text.is_empty() {

@@ -127,7 +127,7 @@ pub(crate) fn parse_defaults_directive(
         "log-tag" => parse_log_tag(tokens, kw).map(|t| defaults.log_tag = Some(t)),
         "option" => parse_option_defaults(defaults, tokens, kw),
         "no" => parse_no_defaults(defaults, tokens, kw),
-        "declare" => parse_declare(tokens, kw),
+        "declare" => refuse_declare(DeclareIn::Defaults, kw),
         "contimeout" => parse_contimeout(kw),
         "clitimeout" => parse_clitimeout(kw),
         "srvtimeout" => parse_srvtimeout(kw),
