@@ -6,8 +6,69 @@
 Unit tests for Ibex Continuous Measurement regression detector.
 """
 
+import os
+import subprocess
+import tempfile
 import unittest
-from measure import check_regressions, MetricDelta, Verdict
+from measure import check_regressions, MetricDelta, Verdict, reference_sha
+
+
+def _git(repo, *args):
+    return subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True,
+                          text=True).stdout.strip()
+
+
+class TestReferenceSha(unittest.TestCase):
+    """On a main with uncommitted changes, the reference is HEAD: the change being measured
+    is the uncommitted one. Only a change to what builds the binary counts. A note under
+    tasks/ once made T98's merge commit its own reference, and a +0.0% size A/B looked like
+    a pass (2026-10-03)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = self.tmp.name
+        _git(self.repo, "init", "-q", "-b", "main")
+        _git(self.repo, "config", "user.email", "t@example.invalid")
+        _git(self.repo, "config", "user.name", "t")
+        _git(self.repo, "config", "commit.gpgsign", "false")
+        for rel, text in (("crates/x/src/lib.rs", "fn a() {}\n"), ("tasks/T1.md", "one\n"),
+                          ("Cargo.toml", "[workspace]\n")):
+            self.write(rel, text)
+        _git(self.repo, "add", ".")
+        _git(self.repo, "commit", "-q", "-m", "root")
+        self.parent = _git(self.repo, "rev-parse", "HEAD")
+        self.write("crates/x/src/lib.rs", "fn a() {}\nfn b() {}\n")
+        _git(self.repo, "commit", "-q", "-am", "change")
+        self.head = _git(self.repo, "rev-parse", "HEAD")
+        self.env = {k: v for k, v in os.environ.items() if k != "IBEX_MEASURE_REF"}
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write(self, rel, text):
+        path = os.path.join(self.repo, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(text)
+
+    def ref(self):
+        return reference_sha(self.repo, self.env)
+
+    def test_clean_main_is_judged_against_the_parent(self):
+        self.assertEqual(self.ref(), self.parent)
+
+    def test_a_task_note_does_not_make_the_commit_its_own_reference(self):
+        self.write("tasks/T1.md", "one\ntwo\n")
+        self.assertEqual(self.ref(), self.parent)
+
+    def test_uncommitted_source_is_judged_against_head(self):
+        self.write("crates/x/src/lib.rs", "fn a() {}\nfn b() {}\nfn c() {}\n")
+        self.assertEqual(self.ref(), self.head)
+
+    def test_an_uncommitted_manifest_change_is_judged_against_head(self):
+        self.write("Cargo.toml", "[workspace]\nmembers = []\n")
+        self.assertEqual(self.ref(), self.head)
+
 
 
 class TestRegressionDetector(unittest.TestCase):

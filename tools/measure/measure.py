@@ -391,30 +391,36 @@ backend be
     return avg_rps, spread_info, cpu_pct
 
 
-def _git(*args: str) -> str:
-    return subprocess.run(["git", *args], cwd=REPO_ROOT, capture_output=True, text=True,
+def _git(*args: str, repo: Path | str = REPO_ROOT) -> str:
+    return subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True,
                           check=True).stdout.strip()
 
 
-def reference_sha() -> str:
+# What the measured binary is built from; an uncommitted change elsewhere is not measured.
+BUILD_INPUTS = ("crates", "Cargo.toml", "Cargo.lock")
+
+
+def reference_sha(repo: Path | str = REPO_ROOT, env: dict | None = None) -> str:
     """The commit a throughput change is judged against.
 
     `IBEX_MEASURE_REF` if set. Otherwise: off main, the merge-base with main (what the
     branch would change); on main with uncommitted source changes, HEAD; on a clean main,
-    HEAD's first parent (what the last commit changed). `data/measurements.jsonl` does not
-    count as a change: every measurement run writes to it."""
-    if os.environ.get("IBEX_MEASURE_REF"):
-        return _git("rev-parse", os.environ["IBEX_MEASURE_REF"])
-    head = _git("rev-parse", "HEAD")
+    HEAD's first parent (what the last commit changed). Only a change to what builds the
+    binary counts as uncommitted (`BUILD_INPUTS`): a task note or the record every run
+    appends to `data/measurements.jsonl` once made a merge commit its own reference."""
+    env = os.environ if env is None else env
+    if env.get("IBEX_MEASURE_REF"):
+        return _git("rev-parse", env["IBEX_MEASURE_REF"], repo=repo)
+    head = _git("rev-parse", "HEAD", repo=repo)
     try:
-        main = _git("rev-parse", "main")
+        main = _git("rev-parse", "main", repo=repo)
     except subprocess.CalledProcessError:
         main = head
     if head != main:
-        return _git("merge-base", "HEAD", "main")
-    dirty = subprocess.run(["git", "diff", "--quiet", "HEAD", "--", ".",
-                            ":!data/measurements.jsonl"], cwd=REPO_ROOT).returncode != 0
-    return head if dirty else _git("rev-parse", "HEAD^")
+        return _git("merge-base", "HEAD", "main", repo=repo)
+    dirty = subprocess.run(["git", "diff", "--quiet", "HEAD", "--", *BUILD_INPUTS],
+                           cwd=repo).returncode != 0
+    return head if dirty else _git("rev-parse", "HEAD^", repo=repo)
 
 
 def ensure_reference_binary(sha: str, target_dir: Path) -> Path:
