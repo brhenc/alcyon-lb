@@ -9,7 +9,10 @@
 //! or error, the server's health counters (`rise_count`, `fall_count`, `health`) are updated,
 //! and server availability transitions between `Up` and `Down`.
 
+use crate::engine::Proxy;
 use crate::fdtab::{FdState, FdTab, Interest};
+use crate::logfmt::{LogData, LogFormat};
+use crate::proxy_state::{total_weight, ProxiesView};
 use crate::poller::Poller;
 use crate::raw::{self, Io};
 use ibex_config::ast::{
@@ -22,6 +25,7 @@ use std::fmt::Write as _;
 use std::io;
 use std::net::SocketAddr;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 /// Availability state of a backend server.
@@ -175,6 +179,8 @@ pub struct ServerCheckState {
     pub last_status_info: Option<String>,
     pub resolved_config: Option<ResolvedCheckConfig>,
     pub sub_state: CheckSubState,
+    /// The `http-check send` log-formats, compiled once from `resolved_config`.
+    pub http_send: Option<HttpSendFormats>,
     pub check_duration_ms: u32,
     pub check_start_tick: Tick,
     pub total_checks: u64,
@@ -216,6 +222,7 @@ impl ServerCheckState {
     ) -> Self {
         let config_rise = config.rise;
         let resolved_config = get_resolved_check_config(proxy_idx, server_idx, addr);
+        let http_send = HttpSendFormats::for_config(resolved_config.as_ref());
         ServerCheckState {
             proxy_idx,
             server_idx,
@@ -243,6 +250,7 @@ impl ServerCheckState {
             last_status_info: None,
             resolved_config,
             sub_state: CheckSubState::Idle,
+            http_send,
             check_duration_ms: 0,
             check_start_tick: now,
             total_checks: 0,
@@ -418,8 +426,118 @@ impl CheckStep {
     }
 }
 
-/// Builds the HTTP request payload for a health check.
-fn build_http_request_payload(chk: &ResolvedHttpCheck, target_addr: SocketAddr) -> Vec<u8> {
+/// The log-formats of an `http-check send`: its `hdr` values, and `uri-lf` and
+/// `body-lf`, compiled when the check is set up. The configuration was refused at load if
+/// one did not compile ([`crate::rule_exprs::validate_formats`]).
+#[derive(Debug, Clone)]
+pub struct HttpSendFormats {
+    uri: Option<LogFormat>,
+    body: Option<LogFormat>,
+    /// One per `hdr`, in order.
+    hdrs: Vec<Option<LogFormat>>,
+}
+
+impl HttpSendFormats {
+    fn for_config(cfg: Option<&ResolvedCheckConfig>) -> Option<Self> {
+        let Some(ResolvedCheckConfig::Http(chk)) = cfg else { return None };
+        let reg = crate::engine::sample_registry();
+        let compile = |f: &str| LogFormat::compile(f, reg).ok();
+        Some(HttpSendFormats {
+            uri: chk.uri_lf.then(|| compile(&chk.uri)).flatten(),
+            body: chk.body.as_deref().filter(|_| chk.body_lf).and_then(compile),
+            hdrs: chk.headers.iter().map(|(_, v)| compile(v)).collect(),
+        })
+    }
+}
+
+/// The check's view of itself for its log-formats, as `HAProxy`'s check session has it:
+/// the backend as both frontend and backend, the server, and the unique ID the backend's
+/// `unique-id-format` gives (`sess_build_logline` on `check->sess`).
+fn render_check_formats(
+    fmts: &HttpSendFormats,
+    check: &ServerCheckState,
+    px: &Proxy,
+    proxies: &[Proxy],
+) -> RenderedSend {
+    let reg = crate::engine::sample_registry();
+    let srv = px.server_ids.get(check.server_idx).map(String::as_str);
+    let view = ProxiesView(proxies);
+    let mut ctx = ibex_sample::SampleContext {
+        fe_name: Some(&px.name),
+        fe_id: Some(px.id),
+        be_name: Some(&px.name),
+        be_id: Some(px.id),
+        srv_name: srv,
+        srv_id: u32::try_from(check.server_idx + 1).ok(),
+        server_addr: Some(check.addr),
+        proxies: Some(&view),
+        ..Default::default()
+    };
+    let mut data = LogData {
+        frontend: &px.name,
+        backend: &px.name,
+        server: srv,
+        server_addr: Some(check.addr),
+        pid: std::process::id(),
+        ..LogData::default()
+    };
+    let unique_id = px.unique_id_format.as_ref().map(|f| f.render(&data, reg, &ctx));
+    ctx.unique_id = unique_id.as_deref();
+    data.unique_id = unique_id.as_deref();
+    let render = |f: &LogFormat| f.render_value(&data, reg, &ctx);
+    (fmts.uri.as_ref().map(render), fmts.body.as_ref().map(render), fmts.hdrs.iter().map(|h| h.as_ref().map(render)).collect())
+}
+
+/// `uri-lf`, `body-lf` and each `hdr` as rendered for one check; `None` where the request
+/// uses the configured text.
+type RenderedSend = (Option<String>, Option<String>, Vec<Option<String>>);
+
+/// `httpchk_build_status_header` (`src/check.c`): the value of `X-Haproxy-Server-State`.
+///
+/// The backend's stream count in `scur=<srv>/<backend>` is the streams on the backend's
+/// servers: Ibex counts no backend streams of its own, and has no queue to subtract.
+fn server_state_header(check: &ServerCheckState, proxies: &[Proxy]) -> String {
+    let health = i64::from(check.health);
+    let (rise, fall) = (i64::from(check.config.rise), i64::from(check.config.fall));
+    let stopped = matches!(check.status, ServerStatus::Down | ServerStatus::Maint);
+    let mut out = if !check.enabled {
+        "no check".to_string()
+    } else if !stopped {
+        if health == rise + fall - 1 {
+            "UP".to_string()
+        } else {
+            format!("UP {}/{fall}", health - rise + 1)
+        }
+    } else if health > 0 {
+        format!("DOWN {health}/{rise}")
+    } else {
+        "DOWN".to_string()
+    };
+    let Some(px) = proxies.get(check.proxy_idx) else { return out };
+    let i = check.server_idx;
+    let addr = px.servers.get(i).copied().unwrap_or(check.addr);
+    let cur = |j: usize| px.server_actconn.get(j).map_or(0, |a| a.load(Ordering::Relaxed));
+    let be_streams: u32 = (0..px.servers.len()).map(cur).sum();
+    let _ = write!(
+        out,
+        "; address={}; port={}; name={}/{}; node={}; weight={}/{}; scur={}/{}; qcur=0",
+        addr.ip(),
+        addr.port(),
+        px.name,
+        px.server_ids.get(i).map_or("", String::as_str),
+        crate::engine::log_hostname(),
+        px.server_weights.get(i).copied().unwrap_or(1),
+        total_weight(px),
+        cur(i),
+        be_streams,
+    );
+    out
+}
+
+/// Builds the HTTP request payload for a health check, as `tcpcheck_eval_send` sends it:
+/// the request line, the `hdr` headers (one whose value renders empty is left out), the
+/// server state, `content-length` when there is a body, `connection: close`.
+fn build_http_request_payload(chk: &ResolvedHttpCheck, target_addr: SocketAddr, check: &ServerCheckState, proxies: &[Proxy]) -> Vec<u8> {
     let mut payload = Vec::new();
 
     if chk.send_proxy {
@@ -433,14 +551,28 @@ fn build_http_request_payload(chk: &ResolvedHttpCheck, target_addr: SocketAddr) 
         payload.extend_from_slice(line.as_bytes());
     }
 
-    let req_line = format!("{} {} {}\r\n", chk.method, chk.uri, chk.version);
+    let rendered = check.http_send.as_ref().zip(proxies.get(check.proxy_idx));
+    let (uri, body, hdr_values) = rendered.map(|(fmts, px)| render_check_formats(fmts, check, px, proxies)).unwrap_or_default();
+    // An `uri-lf` that renders empty sends `/`.
+    let uri = match uri {
+        Some(u) if u.is_empty() => "/".to_string(),
+        Some(u) => u,
+        None => chk.uri.clone(),
+    };
+    let body = body.or_else(|| chk.body.clone());
+
+    let req_line = format!("{} {} {}\r\n", chk.method, uri, chk.version);
     payload.extend_from_slice(req_line.as_bytes());
 
     let mut has_host = false;
     let mut has_connection = false;
     let mut has_content_length = false;
 
-    for (name, val) in &chk.headers {
+    for (i, (name, val)) in chk.headers.iter().enumerate() {
+        let val = hdr_values.get(i).and_then(Option::as_deref).unwrap_or(val);
+        if val.is_empty() {
+            continue;
+        }
         if name.eq_ignore_ascii_case("host") {
             has_host = true;
         }
@@ -462,26 +594,24 @@ fn build_http_request_payload(chk: &ResolvedHttpCheck, target_addr: SocketAddr) 
     }
 
     if chk.send_state {
-        let state_line = format!(
-            "x-haproxy-server-state: UP 1/1; name=srv; qcur=0; srv_port={}\r\n",
-            target_addr.port()
-        );
+        let state_line = format!("x-haproxy-server-state: {}\r\n", server_state_header(check, proxies));
         payload.extend_from_slice(state_line.as_bytes());
+    }
+
+    if let Some(ref body) = body {
+        if !has_content_length {
+            let cl_line = format!("content-length: {}\r\n", body.len());
+            payload.extend_from_slice(cl_line.as_bytes());
+        }
     }
 
     if chk.version.eq_ignore_ascii_case("HTTP/1.1") && !has_connection {
         payload.extend_from_slice(b"connection: close\r\n");
     }
 
-    if let Some(ref body) = chk.body {
-        if !has_content_length {
-            let cl_line = format!("content-length: {}\r\n", body.len());
-            payload.extend_from_slice(cl_line.as_bytes());
-        }
-        payload.extend_from_slice(b"\r\n");
+    payload.extend_from_slice(b"\r\n");
+    if let Some(ref body) = body {
         payload.extend_from_slice(body.as_bytes());
-    } else {
-        payload.extend_from_slice(b"\r\n");
     }
 
     payload
@@ -548,6 +678,7 @@ pub fn step_check(
     fdtab: &mut FdTab,
     poller: &mut Poller,
     now: Tick,
+    proxies: &[Proxy],
 ) -> io::Result<CheckStep> {
     if !check.enabled {
         if check.in_progress {
@@ -560,6 +691,7 @@ pub fn step_check(
 
     if check.resolved_config.is_none() {
         check.resolved_config = get_resolved_check_config(check.proxy_idx, check.server_idx, check.addr);
+        check.http_send = HttpSendFormats::for_config(check.resolved_config.as_ref());
     }
 
     if check.in_progress {
@@ -828,7 +960,7 @@ pub fn step_check(
             ResolvedCheckConfig::Http(chk) => {
                 let target_addr =
                     SocketAddr::new(check.addr.ip(), chk.check_port.unwrap_or(check.addr.port()));
-                let payload = build_http_request_payload(&chk, target_addr);
+                let payload = build_http_request_payload(&chk, target_addr, check, proxies);
 
                 match raw::connect(target_addr) {
                     Ok((sock, immediate)) => {
@@ -3336,5 +3468,28 @@ mod tests {
             event.is_some(),
             "the first successful check after boot must be reported under option log-health-checks"
         );
+    }
+
+    /// The state word of `X-Haproxy-Server-State` (`httpchk_build_status_header`) across
+    /// the health counter, `rise 2 fall 2`. `HAProxy` 3.5-dev8-885761-29, 2026-10-03, sent
+    /// `UP 0/2` with health 1 while running, `UP` at full health, `DOWN` at 0; `DOWN 1/2`
+    /// (health 1 while stopped) and `no check` (check disabled) are the same function's
+    /// other branches, read from `src/check.c`.
+    #[test]
+    fn server_state_word_follows_the_health_counter() {
+        let config = ServerCheckConfig { rise: 2, fall: 2, ..ServerCheckConfig::default() };
+        let mut s = ServerCheckState::new(0, 0, "127.0.0.1:1".parse().unwrap(), config, Tick(0));
+        let word = |s: &ServerCheckState| server_state_header(s, &[]);
+        s.status = ServerStatus::Up;
+        s.health = 3;
+        assert_eq!(word(&s), "UP");
+        s.health = 1;
+        assert_eq!(word(&s), "UP 0/2");
+        s.status = ServerStatus::Down;
+        assert_eq!(word(&s), "DOWN 1/2");
+        s.health = 0;
+        assert_eq!(word(&s), "DOWN");
+        s.enabled = false;
+        assert_eq!(word(&s), "no check");
     }
 }

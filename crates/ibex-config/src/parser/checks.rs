@@ -179,9 +179,11 @@ pub(crate) fn parse_http_check_directive(
         "send" => {
             let mut method = None;
             let mut uri = None;
+            let mut uri_lf = false;
             let mut version = None;
             let mut headers = Vec::new();
             let mut body = None;
+            let mut body_lf = false;
 
             let mut i = 2;
             while i < tokens.len() {
@@ -192,7 +194,8 @@ pub(crate) fn parse_http_check_directive(
                             method = Some(tokens[i].text.clone());
                         }
                     }
-                    "uri" | "uri-lf" => {
+                    kw @ ("uri" | "uri-lf") => {
+                        uri_lf = kw == "uri-lf";
                         i += 1;
                         if i < tokens.len() {
                             uri = Some(tokens[i].text.clone());
@@ -212,7 +215,8 @@ pub(crate) fn parse_http_check_directive(
                             i += 2;
                         }
                     }
-                    "body" | "body-lf" => {
+                    kw @ ("body" | "body-lf") => {
+                        body_lf = kw == "body-lf";
                         i += 1;
                         if i < tokens.len() {
                             body = Some(tokens[i].text.clone());
@@ -228,9 +232,11 @@ pub(crate) fn parse_http_check_directive(
             rules.push(HttpCheckAction::Send {
                 method,
                 uri,
+                uri_lf,
                 version,
                 headers,
                 body,
+                body_lf,
             });
             Ok(())
         }
@@ -692,7 +698,9 @@ pub(crate) fn build_resolved_http_check(
         .unwrap_or_else(|| "HTTP/1.0".to_string());
     let mut host = httpchk.and_then(|h| h.host.clone());
     let mut headers = Vec::new();
+    let mut uri_lf = false;
     let mut body = None;
+    let mut body_lf = false;
     let mut send_state = false;
     let mut expect_rules = Vec::new();
     let check_port = server.check_port;
@@ -703,15 +711,18 @@ pub(crate) fn build_resolved_http_check(
             HttpCheckAction::Send {
                 method: req_method,
                 uri: req_uri,
+                uri_lf: req_uri_lf,
                 version: req_version,
                 headers: req_headers,
                 body: req_body,
+                body_lf: req_body_lf,
             } => {
                 if let Some(m) = req_method {
                     method.clone_from(m);
                 }
                 if let Some(u) = req_uri {
                     uri.clone_from(u);
+                    uri_lf = *req_uri_lf;
                 }
                 if let Some(v) = req_version {
                     version.clone_from(v);
@@ -724,6 +735,7 @@ pub(crate) fn build_resolved_http_check(
                 }
                 if let Some(b) = req_body {
                     body = Some(b.clone());
+                    body_lf = *req_body_lf;
                 }
             }
             HttpCheckAction::Expect { pattern, negate } => {
@@ -749,10 +761,12 @@ pub(crate) fn build_resolved_http_check(
     ResolvedHttpCheck {
         method,
         uri,
+        uri_lf,
         version,
         host,
         headers,
         body,
+        body_lf,
         send_state,
         expect_rules,
         check_port,

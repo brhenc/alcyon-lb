@@ -147,6 +147,45 @@ pub struct SampleContext<'a> {
     pub ssl_cipher: Option<&'a str>,
     pub ssl_version: Option<&'a str>,
     pub ssl_used: bool,
+    /// The proxies' live state, for the fetches and converters that read it (`nbsrv`,
+    /// `srv_is_up`, `srv_conn`, `fe_exists`, `in_table`, ...). `None` where the caller
+    /// has none to give, and those fetches then return no sample -- never a guess.
+    pub proxies: Option<&'a dyn ProxyState>,
+}
+
+/// One server's live state, as the server fetches read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerState {
+    /// `smp_fetch_srv_is_up`: not in maintenance, and not DOWN by its health check (a
+    /// server without a check, or with weight 0, is up).
+    pub is_up: bool,
+    /// The streams currently on the server (`srv->cur_sess`).
+    pub cur_sess: u32,
+    /// `maxconn`; `None` for unlimited.
+    pub maxconn: Option<u32>,
+}
+
+/// The live state of the configured proxies, which the runtime provides through
+/// [`SampleContext::proxies`].
+///
+/// Backend and server names are resolved against the configuration when it loads, so a
+/// `None` from these at run time means the name was not checked (a converter's input is
+/// only known per request).
+pub trait ProxyState: std::fmt::Debug {
+    /// `be_usable_srv` (`include/haproxy/backend.h`): the usable active servers -- UP, not
+    /// in maintenance, weight above 0 -- or, when there are none, 1 if a backup is usable;
+    /// `None` if no proxy with a backend named `backend` exists.
+    fn usable_servers(&self, backend: &str) -> Option<i64>;
+    /// `smp_fetch_be_conn_free`: the free connection slots over the servers that would take
+    /// traffic, `-1` if one of them has no `maxconn`.
+    fn backend_conn_free(&self, backend: &str) -> Option<i64>;
+    /// The server `server` of backend `backend`.
+    fn server(&self, backend: &str, server: &str) -> Option<ServerState>;
+    /// Whether a proxy with a frontend (a `frontend` or a `listen`) is named `name`.
+    fn frontend_exists(&self, name: &str) -> bool;
+    /// Whether `key` is an entry of the stick table `table`; `None` if there is no such
+    /// table or the key cannot be one of its keys.
+    fn table_has_key(&self, table: &str, key: &Sample) -> Option<bool>;
 }
 
 /// A sample fetch implementation.
@@ -154,6 +193,112 @@ pub type FetchFn = fn(&SampleContext, &[String]) -> Option<Sample>;
 
 /// A sample converter implementation.
 pub type ConvFn = fn(Sample, &[String]) -> Option<Sample>;
+
+/// A converter that reads the runtime state ([`SampleContext::proxies`]) as well as its
+/// input: `nbsrv`, `srv_is_up`, `fe_exists`, `in_table`.
+pub type CtxConvFn = fn(&SampleContext, Sample, &[String]) -> Option<Sample>;
+
+/// Registered definition of a converter that reads the runtime state.
+#[derive(Clone)]
+pub struct CtxConvDesc {
+    pub name: &'static str,
+    pub in_type: TypeSpec,
+    pub out_type: TypeSpec,
+    pub func: CtxConvFn,
+}
+
+/// The fetches and converters `HAProxy` has and Ibex does not implement, with what is
+/// missing. They are not registered, and the configuration is refused where they appear
+/// (`ibex-rt`'s load-time checks), rather than evaluated to a constant: each of these used
+/// to load and return 0 or 1, which an ACL then compared as if it were the state.
+pub const NOT_IMPLEMENTED: &[(&str, &str)] = &[
+    ("queue", "Ibex has no server queues"),
+    ("avg_queue", "Ibex has no server queues"),
+    ("srv_queue", "Ibex has no server queues"),
+    ("be_conn", "Ibex does not count the streams on a backend"),
+    ("sc_trackers", "Ibex keeps no tracker count on stick-table entries"),
+    ("table_conn_cnt", "Ibex has no stick-table converters"),
+    ("table_conn_cur", "Ibex has no stick-table converters"),
+    ("table_conn_rate", "Ibex has no stick-table converters"),
+    ("table_sess_cnt", "Ibex has no stick-table converters"),
+    ("table_sess_rate", "Ibex has no stick-table converters"),
+    ("table_http_req_cnt", "Ibex has no stick-table converters"),
+    ("table_http_req_rate", "Ibex has no stick-table converters"),
+    ("table_http_err_cnt", "Ibex has no stick-table converters"),
+    ("table_http_err_rate", "Ibex has no stick-table converters"),
+    ("table_bytes_in_rate", "Ibex has no stick-table converters"),
+    ("table_bytes_out_rate", "Ibex has no stick-table converters"),
+    ("table_kbytes_in", "Ibex has no stick-table converters"),
+    ("table_kbytes_out", "Ibex has no stick-table converters"),
+    ("table_trackers", "Ibex has no stick-table converters"),
+    ("table_expire", "Ibex has no stick-table converters"),
+    ("table_server_id", "Ibex has no stick-table converters"),
+    ("table_gpc0", "Ibex has no stick-table converters"),
+    ("table_gpc1", "Ibex has no stick-table converters"),
+    ("table_gpc", "Ibex has no stick-table converters"),
+    ("table_gpt0", "Ibex has no stick-table converters"),
+    ("table_gpt", "Ibex has no stick-table converters"),
+    ("table_gpc0_rate", "Ibex has no stick-table converters"),
+    ("table_gpc1_rate", "Ibex has no stick-table converters"),
+    ("table_gpc_rate", "Ibex has no stick-table converters"),
+    ("table_glitch_cnt", "Ibex has no stick-table converters"),
+    ("table_glitch_rate", "Ibex has no stick-table converters"),
+    ("table_http_fail_cnt", "Ibex has no stick-table converters"),
+    ("table_http_fail_rate", "Ibex has no stick-table converters"),
+    ("table_inc_gpc0", "Ibex has no stick-table converters"),
+    ("table_inc_gpc1", "Ibex has no stick-table converters"),
+    ("table_inc_gpc", "Ibex has no stick-table converters"),
+    ("table_clr_gpc0", "Ibex has no stick-table converters"),
+    ("table_clr_gpc1", "Ibex has no stick-table converters"),
+    ("table_clr_gpc", "Ibex has no stick-table converters"),
+    ("table_idle", "Ibex has no stick-table converters"),
+];
+
+/// Why `name` -- a fetch or a converter -- is in [`NOT_IMPLEMENTED`].
+#[must_use]
+pub fn not_implemented(name: &str) -> Option<&'static str> {
+    NOT_IMPLEMENTED.iter().find(|(n, _)| *n == name).map(|&(_, why)| why)
+}
+
+/// The refusal for a name in [`NOT_IMPLEMENTED`]: "'<name>' : not implemented in Ibex
+/// (<why>)".
+#[must_use]
+pub fn not_implemented_message(name: &str) -> Option<String> {
+    not_implemented(name).map(|why| format!("'{name}' : not implemented in Ibex ({why})"))
+}
+
+/// `smp_fetch_srv_*`'s server argument, `[<backend>/]<server>`, with the backend defaulting
+/// to the current one (`ctx.be_name`).
+fn server_arg<'a>(ctx: &'a SampleContext, arg: &'a str) -> Option<(&'a str, &'a str)> {
+    match arg.split_once('/') {
+        Some((be, srv)) => Some((be, srv)),
+        None => Some((ctx.be_name?, arg)),
+    }
+}
+
+/// A server fetch: the named server's [`ServerState`] through `f`.
+fn server_fetch(ctx: &SampleContext, args: &[String], f: fn(ServerState) -> Sample) -> Option<Sample> {
+    let (be, srv) = server_arg(ctx, args.first()?)?;
+    ctx.proxies?.server(be, srv).map(f)
+}
+
+/// A backend fetch: `[<backend>]`, defaulting to the current backend.
+fn backend_arg<'a>(ctx: &'a SampleContext, args: &'a [String]) -> Option<&'a str> {
+    args.first().map(String::as_str).filter(|a| !a.is_empty()).or(ctx.be_name)
+}
+
+/// A string converter's input, which the registry has cast to a string already.
+fn input_str(smp: Sample) -> Option<String> {
+    if let Sample::Str(s) = smp { Some(s) } else { None }
+}
+
+/// `smp_fetch_srv_conn_free`: `-1` without `maxconn`, else the slots left, never below 0.
+fn conn_free(s: ServerState) -> Sample {
+    Sample::Sint(match s.maxconn {
+        None | Some(0) => -1,
+        Some(mc) => i64::from(mc.saturating_sub(s.cur_sess)),
+    })
+}
 
 /// Registered sample fetch definition.
 #[derive(Clone)]
@@ -178,6 +323,7 @@ pub type MultiFetchFn = fn(&SampleContext, &[String]) -> Vec<Sample>;
 pub struct Registry {
     fetches: HashMap<&'static str, FetchDesc>,
     converters: HashMap<&'static str, ConvDesc>,
+    ctx_converters: HashMap<&'static str, CtxConvDesc>,
     multi_fetches: HashMap<&'static str, MultiFetchFn>,
 }
 
@@ -237,6 +383,7 @@ impl Registry {
         let mut r = Registry {
             fetches: HashMap::new(),
             converters: HashMap::new(),
+            ctx_converters: HashMap::new(),
             multi_fetches: HashMap::new(),
         };
         r.register_builtin_fetches();
@@ -292,14 +439,44 @@ impl Registry {
         self.converters.insert(desc.name, desc);
     }
 
+    /// Registers a converter that reads the runtime state. Panics if a converter of
+    /// either kind already has this name, as [`Registry::register_converter`] does.
+    ///
+    /// # Panics
+    ///
+    /// If a converter with this name is already registered.
+    pub fn register_ctx_converter(&mut self, desc: CtxConvDesc) {
+        assert!(
+            !self.converters.contains_key(desc.name) && !self.ctx_converters.contains_key(desc.name),
+            "converter '{}' registered twice; the later registration would silently \
+             shadow the earlier one",
+            desc.name
+        );
+        self.ctx_converters.insert(desc.name, desc);
+    }
+
     #[must_use]
     pub fn get_fetch(&self, name: &str) -> Option<&FetchDesc> {
         self.fetches.get(name)
     }
 
+    /// A converter that needs no runtime state. [`Registry::has_converter`] also sees the
+    /// ones that do.
     #[must_use]
     pub fn get_converter(&self, name: &str) -> Option<&ConvDesc> {
         self.converters.get(name)
+    }
+
+    /// A converter that reads the runtime state (`nbsrv`, `srv_is_up`, ...).
+    #[must_use]
+    pub fn get_ctx_converter(&self, name: &str) -> Option<&CtxConvDesc> {
+        self.ctx_converters.get(name)
+    }
+
+    /// Whether a converter of either kind is named `name`.
+    #[must_use]
+    pub fn has_converter(&self, name: &str) -> bool {
+        self.converters.contains_key(name) || self.ctx_converters.contains_key(name)
     }
 
     #[must_use]
@@ -309,7 +486,7 @@ impl Registry {
 
     #[must_use]
     pub fn converter_count(&self) -> usize {
-        self.converters.len()
+        self.converters.len() + self.ctx_converters.len()
     }
 
     #[must_use]
@@ -321,7 +498,8 @@ impl Registry {
 
     #[must_use]
     pub fn converter_names(&self) -> Vec<&'static str> {
-        let mut names: Vec<&'static str> = self.converters.keys().copied().collect();
+        let mut names: Vec<&'static str> =
+            self.converters.keys().chain(self.ctx_converters.keys()).copied().collect();
         names.sort_unstable();
         names
     }
@@ -1183,50 +1361,33 @@ impl Registry {
             out_type: SampleType::Str,
             func: |ctx, _args| ctx.srv_name.map(|n| Sample::Str(n.to_string())),
         });
+        // The server and backend state fetches (`src/backend.c`). Their arguments are
+        // resolved when the configuration loads; `queue`, `avg_queue`, `srv_queue` and
+        // `be_conn` are refused there instead (see [`NOT_IMPLEMENTED`]).
         self.register_fetch(FetchDesc {
             name: "srv_is_up",
             out_type: SampleType::Bool,
-            func: |_ctx, _args| Some(Sample::Bool(true)),
+            func: |ctx, args| server_fetch(ctx, args, |s| Sample::Bool(s.is_up)),
         });
         self.register_fetch(FetchDesc {
             name: "nbsrv",
             out_type: SampleType::Sint,
-            func: |_ctx, _args| Some(Sample::Sint(1)),
-        });
-        self.register_fetch(FetchDesc {
-            name: "srv_queue",
-            out_type: SampleType::Sint,
-            func: |_ctx, _args| Some(Sample::Sint(0)),
-        });
-        self.register_fetch(FetchDesc {
-            name: "avg_queue",
-            out_type: SampleType::Sint,
-            func: |_ctx, _args| Some(Sample::Sint(0)),
-        });
-        self.register_fetch(FetchDesc {
-            name: "queue",
-            out_type: SampleType::Sint,
-            func: |_ctx, _args| Some(Sample::Sint(0)),
+            func: |ctx, args| ctx.proxies?.usable_servers(backend_arg(ctx, args)?).map(Sample::Sint),
         });
         self.register_fetch(FetchDesc {
             name: "srv_conn",
             out_type: SampleType::Sint,
-            func: |_ctx, _args| Some(Sample::Sint(0)),
+            func: |ctx, args| server_fetch(ctx, args, |s| Sample::Sint(i64::from(s.cur_sess))),
         });
         self.register_fetch(FetchDesc {
             name: "srv_conn_free",
             out_type: SampleType::Sint,
-            func: |_ctx, _args| Some(Sample::Sint(100)),
-        });
-        self.register_fetch(FetchDesc {
-            name: "be_conn",
-            out_type: SampleType::Sint,
-            func: |_ctx, _args| Some(Sample::Sint(0)),
+            func: |ctx, args| server_fetch(ctx, args, conn_free),
         });
         self.register_fetch(FetchDesc {
             name: "be_conn_free",
             out_type: SampleType::Sint,
-            func: |_ctx, _args| Some(Sample::Sint(100)),
+            func: |ctx, args| ctx.proxies?.backend_conn_free(backend_arg(ctx, args)?).map(Sample::Sint),
         });
         self.register_fetch(FetchDesc {
             name: "fe_conn",
@@ -1390,11 +1551,6 @@ impl Registry {
             name: "sc_kbytes_out",
             out_type: SampleType::Sint,
             func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.bytes_out_cnt / 1024))),
-        });
-        self.register_fetch(FetchDesc {
-            name: "sc_trackers",
-            out_type: SampleType::Sint,
-            func: |_ctx, _args| Some(Sample::Sint(1)),
         });
         self.register_fetch(FetchDesc {
             name: "sc_gpc0",
@@ -1586,11 +1742,6 @@ impl Registry {
             func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.bytes_out_cnt / 1024))),
         });
         self.register_fetch(FetchDesc {
-            name: "src_trackers",
-            out_type: SampleType::Sint,
-            func: |_ctx, _args| Some(Sample::Sint(1)),
-        });
-        self.register_fetch(FetchDesc {
             name: "src_gpc0",
             out_type: SampleType::Sint,
             func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.gpc0))),
@@ -1614,11 +1765,6 @@ impl Registry {
             name: "src_gpt0",
             out_type: SampleType::Sint,
             func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.gpt0))),
-        });
-        self.register_fetch(FetchDesc {
-            name: "src_in_table",
-            out_type: SampleType::Bool,
-            func: |_ctx, _args| Some(Sample::Bool(true)),
         });
 
         // --- 11. Timeout Fetches ---
@@ -3436,88 +3582,58 @@ impl Registry {
             },
         });
 
-        // --- 8. Stick Table Converters ---
-        macro_rules! reg_table_conv {
-            ($name:literal) => {
-                self.register_converter(ConvDesc {
-                    name: $name,
-                    in_type: TypeSpec::Any,
-                    out_type: TypeSpec::Exact(SampleType::Sint),
-                    func: |_smp, _args| Some(Sample::Sint(0)),
-                });
-            };
-        }
-
-        reg_table_conv!("table_conn_cnt");
-        reg_table_conv!("table_conn_cur");
-        reg_table_conv!("table_conn_rate");
-        reg_table_conv!("table_sess_cnt");
-        reg_table_conv!("table_sess_rate");
-        reg_table_conv!("table_http_req_cnt");
-        reg_table_conv!("table_http_req_rate");
-        reg_table_conv!("table_http_err_cnt");
-        reg_table_conv!("table_http_err_rate");
-        reg_table_conv!("table_bytes_in_rate");
-        reg_table_conv!("table_bytes_out_rate");
-        reg_table_conv!("table_kbytes_in");
-        reg_table_conv!("table_kbytes_out");
-        reg_table_conv!("table_trackers");
-        reg_table_conv!("table_expire");
-        reg_table_conv!("table_server_id");
-        reg_table_conv!("table_gpc0");
-        reg_table_conv!("table_gpc1");
-        reg_table_conv!("table_gpc");
-        reg_table_conv!("table_gpt0");
-        reg_table_conv!("table_gpt");
-        reg_table_conv!("table_gpc0_rate");
-        reg_table_conv!("table_gpc1_rate");
-        reg_table_conv!("table_gpc_rate");
-        reg_table_conv!("table_glitch_cnt");
-        reg_table_conv!("table_glitch_rate");
-        reg_table_conv!("table_http_fail_cnt");
-        reg_table_conv!("table_http_fail_rate");
-        reg_table_conv!("table_inc_gpc0");
-        reg_table_conv!("table_inc_gpc1");
-        reg_table_conv!("table_inc_gpc");
-        reg_table_conv!("table_clr_gpc0");
-        reg_table_conv!("table_clr_gpc1");
-        reg_table_conv!("table_clr_gpc");
-        reg_table_conv!("table_idle");
-
-        self.register_converter(ConvDesc {
+        // --- 8. Stick table, server and frontend converters ---
+        //
+        // These read the runtime state, so they are context converters. The `table_*`
+        // family and `srv_queue` are not implemented and are refused at load
+        // ([`NOT_IMPLEMENTED`]); they used to be registered here returning 0.
+        self.register_ctx_converter(CtxConvDesc {
             name: "in_table",
             in_type: TypeSpec::Any,
             out_type: TypeSpec::Exact(SampleType::Bool),
-            func: |_smp, _args| Some(Sample::Bool(true)),
+            // `sample_conv_in_table`. Without an argument the table is the current
+            // proxy's, which the load-time check has made sure exists.
+            func: |ctx, smp, args| {
+                let proxies = ctx.proxies?;
+                let table = args.first().map(String::as_str).filter(|a| !a.is_empty());
+                let found = match table {
+                    Some(t) => proxies.table_has_key(t, &smp),
+                    None => ctx
+                        .be_name
+                        .and_then(|t| proxies.table_has_key(t, &smp))
+                        .or_else(|| proxies.table_has_key(ctx.fe_name?, &smp)),
+                };
+                found.map(Sample::Bool)
+            },
         });
 
-        // --- 9. Server / Fe / Misc Converters ---
-        self.register_converter(ConvDesc {
+        // `sample_conv_nbsrv`: the input names a backend; none of that name, no sample.
+        self.register_ctx_converter(CtxConvDesc {
             name: "nbsrv",
             in_type: TypeSpec::Exact(SampleType::Str),
             out_type: TypeSpec::Exact(SampleType::Sint),
-            func: |_smp, _args| Some(Sample::Sint(1)),
+            func: |ctx, smp, _args| ctx.proxies?.usable_servers(&input_str(smp)?).map(Sample::Sint),
         });
 
-        self.register_converter(ConvDesc {
+        // `sample_conv_srv_is_up`: `<backend>/<server>`, or `<server>` in the current
+        // backend; a name that resolves to nothing gives no sample.
+        self.register_ctx_converter(CtxConvDesc {
             name: "srv_is_up",
             in_type: TypeSpec::Exact(SampleType::Str),
             out_type: TypeSpec::Exact(SampleType::Bool),
-            func: |_smp, _args| Some(Sample::Bool(true)),
+            func: |ctx, smp, _args| {
+                let name = input_str(smp)?;
+                let (be, srv) = server_arg(ctx, &name)?;
+                ctx.proxies?.server(be, srv).map(|s| Sample::Bool(s.is_up))
+            },
         });
 
-        self.register_converter(ConvDesc {
-            name: "srv_queue",
-            in_type: TypeSpec::Exact(SampleType::Str),
-            out_type: TypeSpec::Exact(SampleType::Sint),
-            func: |_smp, _args| Some(Sample::Sint(0)),
-        });
-
-        self.register_converter(ConvDesc {
+        // `sample_conv_fe_exists`: a proxy with a frontend (`frontend` or `listen`).
+        self.register_ctx_converter(CtxConvDesc {
             name: "fe_exists",
             in_type: TypeSpec::Exact(SampleType::Str),
             out_type: TypeSpec::Exact(SampleType::Bool),
-            func: |_smp, _args| Some(Sample::Bool(true)),
+            func: |ctx, smp, _args| Some(Sample::Bool(ctx.proxies?.frontend_exists(&input_str(smp)?))),
         });
 
         self.register_converter(ConvDesc {
@@ -3707,21 +3823,33 @@ impl Registry {
         });
     }
 
-    /// Applies a chain of converters to a sample value.
+    /// Applies a chain of converters to a sample value, with the runtime state the context
+    /// converters read.
     #[must_use]
-    pub fn apply_converters(
+    pub fn apply_converters_in(
         &self,
+        ctx: &SampleContext,
         mut smp: Sample,
         converters: &[(&str, Vec<String>)],
     ) -> Option<Sample> {
+        /// A converter, and whether it reads the context.
+        enum Conv {
+            Plain(ConvFn),
+            WithCtx(CtxConvFn),
+        }
         for (c_name, c_args) in converters {
-            let c_desc = self.get_converter(c_name)?;
+            let (in_type, func) = if let Some(d) = self.get_converter(c_name) {
+                (d.in_type, Conv::Plain(d.func))
+            } else {
+                let d = self.get_ctx_converter(c_name)?;
+                (d.in_type, Conv::WithCtx(d.func))
+            };
 
             // Apply implicit cast if input type doesn't match
-            if !c_desc.in_type.matches(smp.sample_type()) {
-                if let TypeSpec::Exact(target_ty) = c_desc.in_type {
+            if !in_type.matches(smp.sample_type()) {
+                if let TypeSpec::Exact(target_ty) = in_type {
                     smp = cast(smp, target_ty)?;
-                } else if c_desc.in_type == TypeSpec::Addr {
+                } else if in_type == TypeSpec::Addr {
                     if let Some(v4) = cast(smp.clone(), SampleType::Ipv4) {
                         smp = v4;
                     } else {
@@ -3732,7 +3860,10 @@ impl Registry {
                 }
             }
 
-            smp = (c_desc.func)(smp, c_args)?;
+            smp = match func {
+                Conv::Plain(f) => f(smp, c_args)?,
+                Conv::WithCtx(f) => f(ctx, smp, c_args)?,
+            };
         }
 
         Some(smp)
@@ -3757,7 +3888,7 @@ impl Registry {
 
         let mut out = Vec::with_capacity(initial_samples.len());
         for smp in initial_samples {
-            if let Some(res) = self.apply_converters(smp, converters) {
+            if let Some(res) = self.apply_converters_in(ctx, smp, converters) {
                 out.push(res);
             }
         }
@@ -5110,7 +5241,7 @@ mod oracle_tests {
         "sc1_bytes_out_cnt", "sc2_bytes_in_cnt", "sc2_bytes_out_cnt", "sc_bytes_in_cnt",
         "sc_bytes_out_cnt", "sc_gpc0", "sc_gpc1", "sc_gpt0", "sess_cnt", "sess_rate",
         "src_bytes_in_cnt", "src_bytes_out_cnt", "src_gpc0", "src_gpc1", "src_gpt0",
-        "src_in_table", "src_trackers", "ssl_fc_version",
+        "ssl_fc_version",
     ];
 
     const NOT_IN_HAPROXY_CONVERTERS: &[&str] = &[

@@ -653,6 +653,8 @@ mod tests {
             log_target_idx: Vec::new(),
             log_health_checks: false,
             name: "test_proxy".into(),
+            has_frontend: true,
+            has_backend: true,
             addr,
             mode: Mode::Tcp,
             timeouts: Timeouts::default(),

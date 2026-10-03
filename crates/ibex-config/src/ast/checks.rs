@@ -34,9 +34,14 @@ pub enum HttpCheckAction {
     Send {
         method: Option<String>,
         uri: Option<String>,
+        /// `uri-lf`: `uri` is a log-format.
+        uri_lf: bool,
         version: Option<String>,
+        /// `hdr <name> <fmt>`: every value is a log-format.
         headers: Vec<(String, String)>,
         body: Option<String>,
+        /// `body-lf`: `body` is a log-format.
+        body_lf: bool,
     },
     Expect {
         pattern: HttpCheckExpectPattern,
@@ -163,10 +168,14 @@ pub enum ResolvedCheckConfig {
 pub struct ResolvedHttpCheck {
     pub method: String,
     pub uri: String,
+    /// `uri` is a log-format (`uri-lf`); otherwise it is sent as written.
+    pub uri_lf: bool,
     pub version: String,
     pub host: Option<String>,
     pub headers: Vec<(String, String)>,
     pub body: Option<String>,
+    /// `body` is a log-format (`body-lf`).
+    pub body_lf: bool,
     pub send_state: bool,
     pub expect_rules: Vec<ResolvedHttpExpectRule>,
     pub check_port: Option<u16>,

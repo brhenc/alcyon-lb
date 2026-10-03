@@ -44,3 +44,37 @@ pub struct AclRule {
     pub expr: String,
 }
 
+
+/// The kind of section a [`SampleRef`] was written in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SectionKind {
+    Defaults,
+    Frontend,
+    Backend,
+    Listen,
+}
+
+/// Where a sample expression was written, as the parser saw it: an ACL's expression
+/// (`acl <name> <expr>`, `{ <expr> ... }`) or a log-format's `%[<expr>]`.
+///
+/// `HAProxy` resolves the backend, server and table arguments of every sample expression
+/// when it loads the configuration, and so must Ibex; but ACLs are stored as text and
+/// log-formats are spread over dozens of actions, so the parser records each expression
+/// here, with its section, for the runtime's load-time check to read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SampleRef {
+    /// 1-based line of the configuration the expression is on.
+    pub line: usize,
+    /// The section it is in.
+    pub section: SectionKind,
+    /// That section's name (`None` for an unnamed `defaults`).
+    pub proxy: Option<String>,
+    /// Whether it is an ACL expression (`true`) or a log-format's (`false`).
+    pub acl: bool,
+    /// The directive the expression is on, its first word (`http-request`,
+    /// `unique-id-format`, ...).
+    pub directive: String,
+    /// The expression: the fetch, its arguments and its converters (`nbsrv(be),add(1)`),
+    /// without an ACL's pattern or a log-format's surroundings.
+    pub expr: String,
+}

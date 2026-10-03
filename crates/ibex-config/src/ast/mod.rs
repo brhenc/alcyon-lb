@@ -51,5 +51,8 @@ pub struct Config {
     pub frontends: Vec<FrontendSection>,
     /// List of backend sections (`HAProxy` 1.1+ style).
     pub backends: Vec<BackendSection>,
+    /// Every ACL and log-format sample expression in the proxy and defaults sections, in
+    /// the order written. Empty for a configuration not built by the parser.
+    pub sample_refs: Vec<SampleRef>,
 }
 

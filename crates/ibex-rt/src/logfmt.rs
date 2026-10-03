@@ -397,7 +397,7 @@ impl LogFormat {
                 if registry.get_fetch(&expr.fetch_name).is_none() {
                     return Err(format!("failed to parse sample expression <{src}> : unknown fetch method '{}'", expr.fetch_name));
                 }
-                if let Some((c, _)) = expr.converters.iter().find(|(c, _)| registry.get_converter(c).is_none()) {
+                if let Some((c, _)) = expr.converters.iter().find(|(c, _)| !registry.has_converter(c)) {
                     return Err(format!("failed to parse sample expression <{src}> : unknown converter '{c}'"));
                 }
                 flush(&mut text, &mut nodes);
@@ -469,6 +469,28 @@ impl LogFormat {
                     Some(s) => sample(&mut out, &s, *o),
                     None if o.quote => out.push_str("\"\""),
                     None if o.mandatory => out.push('-'),
+                    None => {}
+                },
+            }
+        }
+        out
+    }
+
+    /// Renders the format outside a log line, where an expression that yields nothing, or
+    /// an empty string, writes nothing rather than `-`: what `HAProxy` sends for an
+    /// `http-check send hdr x %[str()]` (no header at all, 3.5-dev8-885761-29, 2026-10-03).
+    #[must_use]
+    pub fn render_value(&self, d: &LogData, registry: &Registry, ctx: &SampleContext) -> String {
+        let mut out = String::new();
+        for n in &self.nodes {
+            match n {
+                Node::Text(t) => out.push_str(t),
+                Node::Alias(a, o) => alias(&mut out, *a, *o, d),
+                Node::Expr(e, o) => match e.eval_sample(registry, ctx) {
+                    Some(Sample::Str(v)) if v.is_empty() && !o.quote => {}
+                    Some(Sample::Bin(v)) if v.is_empty() && !o.quote => {}
+                    Some(s) => sample(&mut out, &s, *o),
+                    None if o.quote => out.push_str("\"\""),
                     None => {}
                 },
             }

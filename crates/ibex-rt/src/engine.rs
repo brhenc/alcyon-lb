@@ -19,6 +19,7 @@ use crate::check::{self, ServerCheckConfig, ServerCheckState, ServerStatus};
 use crate::fdtab::{FdState, FdTab, Interest};
 use crate::listener::Listener;
 use crate::poller::Poller;
+use crate::proxy_state::ProxiesView;
 use crate::syslog::SyslogTarget;
 use ibex_config::LogLevel;
 use crate::txn::MsgState;
@@ -128,6 +129,10 @@ impl ProxyStats {
 pub struct Proxy {
     pub id: u32,
     pub name: String,
+    /// A `frontend` or a `listen`: what `fe_exists` looks for.
+    pub has_frontend: bool,
+    /// A `backend` or a `listen`: what the server-state fetches' backend arguments name.
+    pub has_backend: bool,
     pub addr: SocketAddr,
     pub mode: Mode,
     pub balance: BalanceAlgorithm,
@@ -717,7 +722,7 @@ fn capture_slots(
 }
 
 /// The host name, read once: `%H`.
-fn log_hostname() -> &'static str {
+pub(crate) fn log_hostname() -> &'static str {
     static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     NAME.get_or_init(hostname)
 }
@@ -744,7 +749,8 @@ fn cut_at(s: &str, len: usize) -> &str {
 
 /// A new HTTP transaction's request is in: its header captures and unique ID, before any
 /// rule can read them, and the ID sent on in `unique-id-header` (`http_process_request`).
-fn begin_http_stream(entry: &mut SessionEntry, fe: &Proxy, pid: u32) {
+fn begin_http_stream(entry: &mut SessionEntry, proxies: &[Proxy], fe_idx: usize, pid: u32) {
+    let fe = &proxies[fe_idx];
     if !fe.req_capture_slots.is_empty() {
         // A request that reached here was parsed into HTX (H1 and H2 alike).
         let headers: Vec<(&str, &str)> = entry.sess.htx_slice().map(|htx| htx.headers().collect()).unwrap_or_default();
@@ -759,7 +765,8 @@ fn begin_http_stream(entry: &mut SessionEntry, fe: &Proxy, pid: u32) {
     if let Some(fmt) = fe.unique_id_format.as_ref() {
         let id = {
             let data = stream_log_data(entry, std::slice::from_ref(fe), 0, pid);
-            let ctx = stream_sample_ctx(&entry.sess, fe, fe);
+            let view = ProxiesView(proxies);
+            let ctx = stream_sample_ctx(&entry.sess, fe, fe, &view);
             fmt.render(&data, sample_registry(), &ctx)
         };
         if let Some(h) = fe.unique_id_header.as_deref() {
@@ -770,8 +777,9 @@ fn begin_http_stream(entry: &mut SessionEntry, fe: &Proxy, pid: u32) {
 }
 
 /// The sample context a log line's `%[...]` reads.
-fn stream_sample_ctx<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy) -> SampleContext<'a> {
+fn stream_sample_ctx<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, view: &'a ProxiesView<'a>) -> SampleContext<'a> {
     SampleContext {
+        proxies: Some(view),
         client_addr: s.client_addr,
         server_addr: s.server_addr,
         fc_src: s.fc_src,
@@ -869,7 +877,7 @@ fn stream_log_line(entry: &SessionEntry, proxies: &[Proxy], pid: u32) -> Option<
         return None;
     }
     let be = proxies.get(entry.backend_idx).unwrap_or(fe);
-    let line = fmt.render(&stream_log_data(entry, proxies, entry.proxy_idx, pid), sample_registry(), &stream_sample_ctx(&entry.sess, fe, be));
+    let line = fmt.render(&stream_log_data(entry, proxies, entry.proxy_idx, pid), sample_registry(), &stream_sample_ctx(&entry.sess, fe, be, &ProxiesView(proxies)));
     fe.log_count.fetch_add(1, Ordering::Relaxed);
     Some(line)
 }
@@ -1113,6 +1121,8 @@ fn init_proxy_from_listen(proxy_idx: usize, listen: &ibex_config::ListenSection,
     Proxy {
         id: usize_to_u32(proxy_idx),
         name: listen.name.clone(),
+        has_frontend: true,
+        has_backend: true,
         log_target_idx: Vec::new(),
         log_health_checks: listen.log_health_checks,
         addr: listen.addr,
@@ -1205,6 +1215,8 @@ fn init_proxy_from_frontend(proxy_idx: usize, fe: &ibex_config::FrontendSection,
     Proxy {
         id: usize_to_u32(proxy_idx),
         name: fe.name.clone(),
+        has_frontend: true,
+        has_backend: false,
         log_target_idx: Vec::new(),
         log_health_checks: fe.log_health_checks,
         addr: fe.bind.unwrap_or(SocketAddr::new(
@@ -1321,6 +1333,8 @@ fn init_proxy_from_backend(proxy_idx: usize, be: &ibex_config::BackendSection, n
     Proxy {
         id: usize_to_u32(proxy_idx),
         name: be.name.clone(),
+        has_frontend: false,
+        has_backend: true,
         log_target_idx: Vec::new(),
         log_health_checks: be.log_health_checks,
         addr: SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0),
@@ -1965,6 +1979,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             let mut tracked_sc: [Option<(usize, StickKey)>; 3] = [None, None, None];
 
             let sample_ctx = SampleContext {
+                proxies: Some(&ProxiesView(&self.proxies)),
                 client_addr: Some(peer_addr),
                 server_addr: Some(self.listeners[l_idx].addr()),
                 fc_src: Some(peer_addr),
@@ -2092,6 +2107,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
 
             let (client_addr, server_addr, fc_src, fc_dst) = match eval_tcp_req_conn_rules(
                 &self.proxies[proxy_idx],
+                &self.proxies,
                 sample_registry(),
                 peer_addr,
                 local_addr,
@@ -2368,6 +2384,7 @@ enum SessionEvalOutcome {
 #[allow(clippy::too_many_lines)]
 fn eval_tcp_req_conn_rules(
     proxy: &Proxy,
+    proxies: &[Proxy],
     registry: &Registry,
     peer_addr: SocketAddr,
     local_addr: SocketAddr,
@@ -2379,6 +2396,7 @@ fn eval_tcp_req_conn_rules(
     let mut fc_dst = local_addr;
 
     let mut ctx = SampleContext {
+        proxies: Some(&ProxiesView(proxies)),
         client_addr: Some(client_addr),
         server_addr: Some(server_addr),
         fc_src: Some(fc_src),
@@ -2466,6 +2484,7 @@ fn eval_tcp_req_session_rules(
     sess: &mut TcpSession,
 ) -> SessionEvalOutcome {
     let mut ctx = SampleContext {
+        proxies: Some(&ProxiesView(proxies)),
         client_addr: sess.client_addr,
         server_addr: sess.server_addr,
         fc_src: sess.fc_src,
@@ -2721,6 +2740,7 @@ fn eval_tcp_req_content_rules(
     }
 
     let mut ctx = SampleContext {
+        proxies: Some(&ProxiesView(proxies)),
         client_addr: sess.client_addr,
         server_addr: sess.server_addr,
         fc_src: sess.fc_src,
@@ -3001,12 +3021,13 @@ fn res_sample_may_change(expr: &Expr, rep: &[u8]) -> bool {
 /// rejects, or all have run; a condition on response data that may still grow and does
 /// not hold yet makes them wait, until the server closes, the buffer fills, or
 /// `tcp-response inspect-delay` runs out, when they decide on what is there.
-fn eval_tcp_res_content_rules(proxy: &Proxy, registry: &Registry, sess: &mut TcpSession, now: Tick) -> ContentEvalResult {
+fn eval_tcp_res_content_rules(proxy: &Proxy, proxies: &[Proxy], registry: &Registry, sess: &mut TcpSession, now: Tick) -> ContentEvalResult {
     let server_closed = matches!(sess.srv_state, ScState::ShutR | ScState::Closed | ScState::Error);
     let expired = sess.res_inspect_exp.is_none_or(|exp| exp.is_expired(now));
     let final_ = server_closed || sess.rep.is_full() || expired;
     let rep_bytes = sess.rep.readable();
     let ctx = SampleContext {
+        proxies: Some(&ProxiesView(proxies)),
         client_addr: sess.client_addr,
         server_addr: sess.server_addr,
         fc_src: sess.fc_src,
@@ -3273,12 +3294,12 @@ fn connect_addr(server: SocketAddr, dst: Option<SocketAddr>) -> SocketAddr {
     SocketAddr::new(ip, port)
 }
 
-fn maybe_prepend_send_proxy(fe: &Proxy, proxy: &Proxy, sess: &mut TcpSession, target_addr: SocketAddr) {
+fn maybe_prepend_send_proxy(fe: &Proxy, proxy: &Proxy, proxies: &[Proxy], sess: &mut TcpSession, target_addr: SocketAddr) {
     if sess.send_proxy_prepended {
         return;
     }
     let before = sess.req.len();
-    prepend_send_proxy(fe, proxy, sess, target_addr);
+    prepend_send_proxy(fe, proxy, proxies, sess, target_addr);
     // The header goes out ahead of the request, so it is counted as part of the request's
     // head. Measured by the scanner it would not be: a v2 header opens with the bytes
     // `\r\n\r\n`, which read as the end of a head four bytes in.
@@ -3293,8 +3314,8 @@ fn maybe_prepend_send_proxy(fe: &Proxy, proxy: &Proxy, sess: &mut TcpSession, ta
     }
 }
 
-fn prepend_send_proxy(fe: &Proxy, proxy: &Proxy, sess: &mut TcpSession, target_addr: SocketAddr) {
-    if let Some(hdr) = proxy_header(fe, proxy, sess, target_addr) {
+fn prepend_send_proxy(fe: &Proxy, proxy: &Proxy, proxies: &[Proxy], sess: &mut TcpSession, target_addr: SocketAddr) {
+    if let Some(hdr) = proxy_header(fe, proxy, proxies, sess, target_addr) {
         sess.req.replace_prefix(0, &hdr);
         sess.send_proxy_prepended = true;
         sess.send_proxy_header = hdr;
@@ -3303,7 +3324,7 @@ fn prepend_send_proxy(fe: &Proxy, proxy: &Proxy, sess: &mut TcpSession, target_a
 
 /// The PROXY header this stream sends ahead of its request to `target_addr`, if that
 /// server line asks for one.
-fn proxy_header(fe: &Proxy, proxy: &Proxy, sess: &mut TcpSession, target_addr: SocketAddr) -> Option<Vec<u8>> {
+fn proxy_header(fe: &Proxy, proxy: &Proxy, proxies: &[Proxy], sess: &mut TcpSession, target_addr: SocketAddr) -> Option<Vec<u8>> {
     let idx = proxy.servers.iter().position(|&s| s == target_addr)?;
     let send_v2 = proxy
         .server_send_proxy_v2
@@ -3322,7 +3343,7 @@ fn proxy_header(fe: &Proxy, proxy: &Proxy, sess: &mut TcpSession, target_addr: S
             // (`stream_generate_unique_id`, `make_proxy_line_v2`).
             if sess.log.unique_id.is_none() {
                 if let Some(fmt) = fe.unique_id_format.as_ref() {
-                    let id = fmt.render(&session_log_data(sess, fe, proxy, std::process::id()), sample_registry(), &stream_sample_ctx(sess, fe, proxy));
+                    let id = fmt.render(&session_log_data(sess, fe, proxy, std::process::id()), sample_registry(), &stream_sample_ctx(sess, fe, proxy, &ProxiesView(proxies)));
                     sess.log.unique_id = Some(id);
                 }
             }
@@ -3464,7 +3485,9 @@ fn init_client_session(
     {
         target_addr = proxy.select_server_with_key(sess.client_addr.map(|a| a.ip()), sess.req_uri.as_deref());
         if let Some(target) = target_addr {
-            maybe_prepend_send_proxy(proxy, proxy, &mut sess, target);
+            let proxies: &[Proxy] = proxies;
+            let proxy = &proxies[proxy_idx];
+            maybe_prepend_send_proxy(proxy, proxy, proxies, &mut sess, target);
             arm_res_inspect(proxy, &mut sess);
 
             if let Ok((srv_fd, immediate)) = raw::connect(connect_addr(target, sess.server_addr)) {
@@ -3663,7 +3686,7 @@ struct EngineDispatcher<'a> {
 /// through here, and through the `http-after-response` rules.
 fn reply_error(entry: &mut SessionEntry, proxies: &[Proxy], status: u16) {
     let be_idx = if entry.backend_idx < proxies.len() { entry.backend_idx } else { entry.proxy_idx };
-    let page = proxy_error_response(&entry.sess, &proxies[be_idx], &proxies[entry.proxy_idx], status);
+    let page = proxy_error_response(&entry.sess, &proxies[be_idx], &proxies[entry.proxy_idx], proxies, status);
     send_proxy_reply(&mut entry.sess, proxies, entry.proxy_idx, be_idx, &page);
 }
 
@@ -3679,7 +3702,7 @@ fn reply_empty(entry: &mut SessionEntry, proxies: &[Proxy], status: u16) {
 /// there is a stream, so no rule runs on it -- `http-after-response` included.
 fn reply_parse_error(entry: &mut SessionEntry, proxies: &[Proxy], status: u16) {
     let be = proxies.get(entry.backend_idx).unwrap_or(&proxies[entry.proxy_idx]);
-    let page = proxy_error_response(&entry.sess, be, &proxies[entry.proxy_idx], status);
+    let page = proxy_error_response(&entry.sess, be, &proxies[entry.proxy_idx], proxies, status);
     entry.sess.write_reply(&page);
 }
 
@@ -3803,7 +3826,7 @@ fn retry_server_connect(
     entry.target_server_idx = s_idx;
     entry.srv_backend_idx = be_idx;
 
-    maybe_prepend_send_proxy(&proxies[entry.proxy_idx], &proxies[be_idx], &mut entry.sess, target_addr);
+    maybe_prepend_send_proxy(&proxies[entry.proxy_idx], &proxies[be_idx], proxies, &mut entry.sess, target_addr);
 
     entry.target_addr = Some(target_addr);
     if let Ok((srv_fd, immediate)) = raw::connect(connect_addr(target_addr, entry.sess.server_addr)) {
@@ -4035,6 +4058,7 @@ impl EngineDispatcher<'_> {
         }
 
         let ctx = SampleContext {
+            proxies: Some(&ProxiesView(proxies)),
             client_addr: entry.sess.client_addr,
             server_addr: entry.sess.server_addr,
             fc_src: entry.sess.fc_src,
@@ -4109,7 +4133,7 @@ impl EngineDispatcher<'_> {
                     && (!entry.sess.req.is_empty() || entry.sess.is_first_req)
                 {
                     let fe = &proxies[entry.proxy_idx];
-                    let page = proxy_error_response(&entry.sess, fe, fe, 408);
+                    let page = proxy_error_response(&entry.sess, fe, fe, proxies, 408);
                     entry.sess.send_before_close(&page);
                     entry.sess.log.status = Some(408);
                     entry.sess.log.term = Some(*b"cR");
@@ -4445,7 +4469,7 @@ impl EngineDispatcher<'_> {
             // Step 3.45: TCP mode, `tcp-response content` rules over the response so far.
             if entry.sess.res_inspect_pending && !entry.sess.is_done() {
                 let be_idx = entry.backend_idx;
-                let res = eval_tcp_res_content_rules(&self.proxies[be_idx], sample_registry(), &mut entry.sess, now);
+                let res = eval_tcp_res_content_rules(&self.proxies[be_idx], &self.proxies, sample_registry(), &mut entry.sess, now);
                 if res != ContentEvalResult::Waiting {
                     entry.sess.res_inspect_pending = false;
                     entry.sess.res_inspect_exp = None;
@@ -4722,6 +4746,7 @@ impl EngineDispatcher<'_> {
         };
 
         let ctx = SampleContext {
+            proxies: Some(&ProxiesView(proxies)),
             client_addr: entry.sess.client_addr,
             server_addr: entry.sess.server_addr,
             fc_src: entry.sess.fc_src,
@@ -5119,7 +5144,7 @@ impl EngineDispatcher<'_> {
                 map.insert(k.clone(), val.clone());
             }
         });
-        begin_http_stream(entry, &proxies[proxy_idx], pid);
+        begin_http_stream(entry, proxies, proxy_idx, pid);
         CURRENT_TIMEOUTS.with(|t| {
             let mut map = t.borrow_mut();
             map.clear();
@@ -5203,6 +5228,7 @@ impl EngineDispatcher<'_> {
         let mut sc_conn_rates = [0u64; 3];
 
         let http_sample_ctx = SampleContext {
+            proxies: Some(&ProxiesView(proxies)),
             client_addr: entry.sess.client_addr,
             server_addr: entry.sess.server_addr,
             fc_src: entry.sess.fc_src,
@@ -5338,6 +5364,7 @@ impl EngineDispatcher<'_> {
             macro_rules! make_ctx {
                 ($s:expr) => {
                     SampleContext {
+                        proxies: Some(&ProxiesView(proxies)),
                         client_addr: $s.client_addr,
                         server_addr: $s.server_addr,
                         fc_src: $s.fc_src,
@@ -5946,7 +5973,7 @@ impl EngineDispatcher<'_> {
                 // send that same header: HAProxy hashes it into the reuse key, so a
                 // per-request unique-id TLV gets a connection of its own.
                 && (!entry.sess.send_proxy_prepended
-                    || proxy_header(&proxies[entry.proxy_idx], &proxies[be_idx], &mut entry.sess, target_addr)
+                    || proxy_header(&proxies[entry.proxy_idx], &proxies[be_idx], proxies, &mut entry.sess, target_addr)
                         .is_some_and(|h| h == entry.sess.send_proxy_header));
             if same
                 && matches!(entry.sess.srv_state, ScState::Ready | ScState::Established)
@@ -5974,7 +6001,7 @@ impl EngineDispatcher<'_> {
         entry.target_server_idx = s_idx;
         entry.srv_backend_idx = be_idx;
 
-        maybe_prepend_send_proxy(&proxies[entry.proxy_idx], &proxies[be_idx], &mut entry.sess, target_addr);
+        maybe_prepend_send_proxy(&proxies[entry.proxy_idx], &proxies[be_idx], proxies, &mut entry.sess, target_addr);
 
         entry.target_addr = Some(target_addr);
 
@@ -6131,7 +6158,7 @@ impl EngineDispatcher<'_> {
         entry.target_server_idx = s_idx;
         entry.srv_backend_idx = be_idx;
 
-        maybe_prepend_send_proxy(&proxies[entry.proxy_idx], &proxies[be_idx], &mut entry.sess, target_addr);
+        maybe_prepend_send_proxy(&proxies[entry.proxy_idx], &proxies[be_idx], proxies, &mut entry.sess, target_addr);
 
         entry.target_addr = Some(target_addr);
         if let Ok((srv_fd, immediate)) = raw::connect(connect_addr(target_addr, entry.sess.server_addr)) {
@@ -6188,7 +6215,7 @@ impl EngineDispatcher<'_> {
         if check_idx < self.checks.len() {
             let check = &mut self.checks[check_idx];
             let now = self.now;
-            let step = check::step_check(check, self.fdtab, self.poller, now);
+            let step = check::step_check(check, self.fdtab, self.poller, now, self.proxies);
 
             let proxy_idx = check.proxy_idx;
             let server_idx = check.server_idx;
@@ -7392,7 +7419,7 @@ fn send_proxy_reply(sess: &mut TcpSession, proxies: &[Proxy], fe_idx: usize, be_
         sess.write_reply(&out);
         return;
     }
-    let page = proxy_error_response(sess, &proxies[be_idx], &proxies[fe_idx], 500);
+    let page = proxy_error_response(sess, &proxies[be_idx], &proxies[fe_idx], proxies, 500);
     let head_len = crate::proxy::find_eoh(raw).map_or(raw.len(), |(h, _)| h);
     if crate::txn::status_of(&String::from_utf8_lossy(&raw[..head_len])) != 500 {
         if let Ok(out) = after_res_on_reply(sess, proxies, fe_idx, be_idx, &page) {
@@ -7502,12 +7529,13 @@ fn after_res_on_reply<'r>(
 /// The response for an error the proxy generates itself (no server, connect failed), as
 /// HAProxy's `http_error_message` picks it: the backend's `http-error`/`errorfile` for
 /// `status`, then the frontend's, then the built-in page.
-fn proxy_error_response(sess: &TcpSession, be: &Proxy, fe: &Proxy, status: u16) -> Vec<u8> {
+fn proxy_error_response(sess: &TcpSession, be: &Proxy, fe: &Proxy, proxies: &[Proxy], status: u16) -> Vec<u8> {
     let own = |proxy: &Proxy| -> Option<Vec<u8>> {
         match proxy.error_replies.get(&status) {
             Some(ibex_config::ErrorPageSource::Raw(bytes)) => return Some(bytes.clone()),
             Some(ibex_config::ErrorPageSource::Custom { content_type, lf_string }) => {
                 let ctx = SampleContext {
+                    proxies: Some(&ProxiesView(proxies)),
                     client_addr: sess.client_addr,
                     fc_src: sess.fc_src,
                     fc_dst: sess.fc_dst,

@@ -24,6 +24,8 @@ use ibex_config::{
     HttpResRule, RetriesValue, TcpReqConnAction, TcpReqConnRule, TcpReqContentAction,
     TcpReqContentRule, TcpReqSessionAction, TcpReqSessionRule, TcpResAction, TcpResContentRule,
 };
+use crate::proxy_state::{check_expr, Where};
+use ibex_config::SectionKind;
 use ibex_sample::Registry;
 
 /// `is_idchar` (`include/haproxy/tools.h`): the characters of a fetch or converter name.
@@ -75,12 +77,18 @@ pub fn check_sample_expr(expr: &str, registry: &Registry) -> Result<(), String> 
     if fetch.is_empty() {
         return Err("missing fetch method".to_string());
     }
+    if let Some(msg) = ibex_sample::not_implemented_message(fetch) {
+        return Err(msg);
+    }
     if registry.get_fetch(fetch).is_none() {
         return Err(format!("unknown fetch method '{fetch}'"));
     }
     for term in terms.filter(|t| !t.trim().is_empty()) {
         let conv = leading_name(term);
-        if registry.get_converter(conv).is_none() {
+        if let Some(msg) = ibex_sample::not_implemented_message(conv) {
+            return Err(msg);
+        }
+        if !registry.has_converter(conv) {
             return Err(format!("unknown converter '{conv}'"));
         }
     }
@@ -196,6 +204,7 @@ fn tcp_res(a: &TcpResAction) -> Exprs<'_> {
 /// One section's rule lists. A section without a list passes an empty slice.
 struct Section<'a> {
     what: String,
+    at: Where<'a>,
     http_req: &'a [HttpReqRule],
     http_res: &'a [HttpResRule],
     http_after_res: &'a [HttpAfterResRule],
@@ -206,7 +215,7 @@ struct Section<'a> {
 }
 
 impl Section<'_> {
-    fn check(&self, registry: &Registry) -> Result<(), String> {
+    fn check(&self, config: &Config, registry: &Registry) -> Result<(), String> {
         let lists: [(&str, Vec<Exprs<'_>>); 7] = [
             ("http-request", self.http_req.iter().map(|r| http_req(&r.action)).collect()),
             ("http-response", self.http_res.iter().map(|r| http_res(&r.action)).collect()),
@@ -222,7 +231,14 @@ impl Section<'_> {
                     check_int_or_expr(expr, registry)
                 } else {
                     check_sample_expr(expr, registry)
-                };
+                }
+                .and_then(|()| {
+                    if *int_ok && expr.trim().trim_start_matches(['-', '+']).bytes().all(|b| b.is_ascii_digit()) {
+                        Ok(())
+                    } else {
+                        check_expr(config, registry, self.at, expr, false)
+                    }
+                });
                 res.map_err(|e| {
                     format!("error detected in {} while parsing '{kw} {action}' rule : {e}", self.what)
                 })?;
@@ -245,6 +261,7 @@ pub fn validate_rule_exprs(config: &Config, registry: &Registry) -> Result<(), S
     if let Some(d) = &config.defaults {
         sections.push(Section {
             what: "defaults section".to_string(),
+            at: Where { section: SectionKind::Defaults, proxy: d.name.as_deref() },
             http_req: &d.http_req_rules,
             http_res: &d.http_res_rules,
             http_after_res: &d.http_after_res_rules,
@@ -257,6 +274,7 @@ pub fn validate_rule_exprs(config: &Config, registry: &Registry) -> Result<(), S
     for l in &config.listens {
         sections.push(Section {
             what: format!("proxy '{}'", l.name),
+            at: Where { section: SectionKind::Listen, proxy: Some(&l.name) },
             http_req: &l.http_req_rules,
             http_res: &l.http_res_rules,
             http_after_res: &l.http_after_res_rules,
@@ -269,6 +287,7 @@ pub fn validate_rule_exprs(config: &Config, registry: &Registry) -> Result<(), S
     for f in &config.frontends {
         sections.push(Section {
             what: format!("frontend '{}'", f.name),
+            at: Where { section: SectionKind::Frontend, proxy: Some(&f.name) },
             http_req: &f.http_req_rules,
             http_res: &f.http_res_rules,
             http_after_res: &f.http_after_res_rules,
@@ -281,6 +300,7 @@ pub fn validate_rule_exprs(config: &Config, registry: &Registry) -> Result<(), S
     for b in &config.backends {
         sections.push(Section {
             what: format!("backend '{}'", b.name),
+            at: Where { section: SectionKind::Backend, proxy: Some(&b.name) },
             http_req: &b.http_req_rules,
             http_res: &b.http_res_rules,
             http_after_res: &b.http_after_res_rules,
@@ -290,7 +310,7 @@ pub fn validate_rule_exprs(config: &Config, registry: &Registry) -> Result<(), S
             tcp_res_content: &b.tcp_res_content_rules,
         });
     }
-    sections.iter().try_for_each(|s| s.check(registry))
+    sections.iter().try_for_each(|s| s.check(config, registry))
 }
 
 /// [`validate_rule_exprs`] against the registry the engine evaluates with.
@@ -299,6 +319,7 @@ pub fn validate_rule_exprs(config: &Config, registry: &Registry) -> Result<(), S
 /// As [`validate_rule_exprs`].
 pub fn validate_config(config: &Config) -> Result<(), String> {
     let registry = crate::engine::sample_registry();
+    crate::proxy_state::check_sample_refs(config, registry)?;
     validate_rule_exprs(config, registry)?;
     validate_formats(config, registry)
 }
@@ -359,6 +380,28 @@ pub fn validate_formats(config: &Config, registry: &Registry) -> Result<(), Stri
                 let slots = caps.len() + rules.iter().filter(|r| matches!(r.action, ibex_config::HttpReqAction::Capture { id: None, .. })).count();
                 if id >= slots {
                     return Err(format!("Proxy '{name}': unable to find capture id '{id}' referenced by http-request capture rule."));
+                }
+            }
+        }
+    }
+    // `http-check send`: the `hdr` values, `uri-lf` and `body-lf` are log-formats
+    // (`parse_tcpcheck_send_http`, "'%s' invalid log-format string").
+    let checks = config
+        .backends
+        .iter()
+        .map(|b| ("backend", &b.name, &b.http_checks))
+        .chain(config.listens.iter().map(|l| ("proxy", &l.name, &l.http_checks)));
+    for (what, name, actions) in checks {
+        for act in actions {
+            if let ibex_config::ast::HttpCheckAction::Send { uri, uri_lf, headers, body, body_lf, .. } = act {
+                for (_, v) in headers {
+                    check(what, name, "http-check send hdr", v)?;
+                }
+                if let (Some(u), true) = (uri, *uri_lf) {
+                    check(what, name, "http-check send uri-lf", u)?;
+                }
+                if let (Some(b), true) = (body, *body_lf) {
+                    check(what, name, "http-check send body-lf", b)?;
                 }
             }
         }

@@ -17,7 +17,7 @@ use crate::ast::{
     HttpChkConfig, HttpReqAction, HttpReqRule, HttpResAction, HttpResRule, HttpReuse, RetriesValue,
     HeaderCapture, ListenSection, LogConfig, LogFacility, LogFormatSpec, LogLevel, LogTarget, MatchType, Mode,
     MysqlCheckVersion, ProtoCheckConfig, ResolvedCheckConfig, ResolvedHttpCheck,
-    ResolvedHttpExpectPattern, ResolvedHttpExpectRule, ResolvedTcpStep, Server, StatsConfig,
+    ResolvedHttpExpectPattern, ResolvedHttpExpectRule, ResolvedTcpStep, SampleRef, SectionKind, Server, StatsConfig,
     StickRule, StickRuleType, StickTableConfigAst, TcpCheckAction, TcpCheckExpectPattern,
     TcpReqConnAction, TcpReqConnRule, TcpReqContentAction, TcpReqContentRule, TcpResAction, TcpResContentRule,
     TcpReqSessionAction, TcpReqSessionRule, TimeoutConfig, UseBackendRule,
@@ -120,6 +120,8 @@ pub(crate) use stats::*;
 pub(crate) mod scalars;
 pub(crate) use scalars::*;
 pub(crate) mod error_pages;
+pub(crate) mod sample_refs;
+pub use sample_refs::log_format_exprs;
 pub(crate) use error_pages::*;
 
 /// Parses `HAProxy` configuration text into a typed `Config` AST.
@@ -152,6 +154,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
     let mut frontends = Vec::new();
     let mut backends = Vec::new();
     let mut cur_section: Option<CurrentSection> = None;
+    let mut sample_refs = Vec::new();
 
     for line in &lines {
         let tokens = &line.tokens;
@@ -308,6 +311,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                 let section = cur_section
                     .as_mut()
                     .ok_or_else(|| ConfigError::new(kw.line, kw.col, "<listen> expected."))?;
+                sample_refs::collect(section, tokens, &mut sample_refs);
                 parse_section_directive(section, tokens, kw)?;
             }
         }
@@ -352,6 +356,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
         listens,
         frontends,
         backends,
+        sample_refs,
     };
     register_checks_from_config(&config);
 
