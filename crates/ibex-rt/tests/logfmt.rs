@@ -311,3 +311,22 @@ fn hpo_is_empty_for_a_target_with_no_path() {
     let d = LogData { request_line: Some("CONNECT host:443 HTTP/1.1"), ..d };
     assert_eq!(render("HPO=%HPO|HP=%HP", &d), "HPO=|HP=host:443");
 }
+
+/// `HAProxy` parses a `log-format` whether or not the proxy has a log address; only the
+/// "log format ignored ... since it has no log address" warning follows. `haproxy -c`
+/// (3.5-dev8-885761-29, 2026-10-03) on a frontend with no `log` line exits 1 for each of
+/// `abc%` ("truncated line after '%'"), `%zz` ("no such format alias 'zz'") and
+/// `%[nosuch]` ("unknown fetch method 'nosuch'"), and 0 for a good format. Ibex compiled
+/// it only for a proxy that logs, so these loaded.
+#[test]
+fn a_bad_log_format_is_refused_without_a_log_address_too() {
+    for sec in ["frontend f\n  bind 127.0.0.1:38917", "listen l\n  bind 127.0.0.1:38918"] {
+        for bad in ["abc%", "%zz", "%[nosuch]"] {
+            let cfg = ibex_config::parse_str(&format!("{sec}\n  mode http\n  log-format \"{bad}\"\n")).expect("parses");
+            let err = ibex_rt::Engine::new(&cfg, 4).err().map(|e| e.to_string()).unwrap_or_default();
+            assert!(err.contains("failed to parse log-format"), "{sec} with `{bad}` and no log address loaded: {err:?}");
+        }
+        let cfg = ibex_config::parse_str(&format!("{sec}\n  mode http\n  log-format \"%ci %[src]\"\n")).expect("parses");
+        ibex_rt::Engine::new(&cfg, 4).expect("a good format loads without a log address");
+    }
+}

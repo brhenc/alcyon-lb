@@ -347,27 +347,25 @@ pub fn validate_acls(config: &Config) -> Result<(), String> {
 }
 
 /// Compiles every `log-format` and `unique-id-format` (`HAProxy`: "failed to parse
-/// log-format : ..."). A frontend's log format is compiled only when it has somewhere to
-/// log, as `HAProxy` skips it otherwise ("log format ignored for frontend ... since it has
-/// no log address").
+/// log-format : ..."). A frontend's log format is compiled whether or not it has somewhere
+/// to log: `HAProxy` parses it on the `log-format` line and only warns "log format
+/// ignored for frontend ... since it has no log address" afterwards (measured with
+/// `haproxy -c`: a bad format is fatal without a `log` line too).
 ///
 /// # Errors
 /// The first format that does not compile.
 pub fn validate_formats(config: &Config, registry: &Registry) -> Result<(), String> {
     use crate::logfmt::{format_string, LogFormat};
-    let global_logs = config.global.as_ref().is_some_and(|g| !g.logs.is_empty());
     let check = |what: &str, name: &str, kind: &str, fmt: &str| {
         LogFormat::compile(fmt, registry).map(|_| ()).map_err(|e| format!("{what} '{name}': failed to parse {kind} : {e}"))
     };
     let sections = config
         .frontends
         .iter()
-        .map(|f| ("frontend", &f.name, f.mode, &f.log_format, &f.unique_id_format, !f.logs.is_empty() || f.log_global && global_logs))
-        .chain(config.listens.iter().map(|l| {
-            ("proxy", &l.name, l.mode, &l.log_format, &l.unique_id_format, !l.logs.is_empty() || l.log_global && global_logs)
-        }));
-    for (what, name, mode, log_format, unique_id_format, logs) in sections {
-        if let (Some(spec), true) = (log_format, logs) {
+        .map(|f| ("frontend", &f.name, f.mode, &f.log_format, &f.unique_id_format))
+        .chain(config.listens.iter().map(|l| ("proxy", &l.name, l.mode, &l.log_format, &l.unique_id_format)));
+    for (what, name, mode, log_format, unique_id_format) in sections {
+        if let Some(spec) = log_format {
             check(what, name, "log-format", format_string(spec, mode == ibex_config::Mode::Http))?;
         }
         if let Some(fmt) = unique_id_format {
