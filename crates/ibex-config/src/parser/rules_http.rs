@@ -846,6 +846,10 @@ pub(crate) fn parse_http_res_rule(
             cond,
         });
     } else if act_str.starts_with("set-var(") || act_str.starts_with("set-var-fmt(") {
+        // `set-var-fmt` takes a log-format string, `set-var` a sample expression; they are
+        // told apart by the marker, or `set-var-fmt(txn.x) abc` would be evaluated as a
+        // fetch named `abc`.
+        let marker = if act_str.starts_with("set-var-fmt(") { "set-var-fmt" } else { "set-var" };
         let var_name = act_token
             .text
             .trim_start_matches("set-var(")
@@ -862,7 +866,7 @@ pub(crate) fn parse_http_res_rule(
         };
         rules.push(HttpResRule {
             action: HttpResAction::SetHeader {
-                name: format!("\0set-var:{var_name}"),
+                name: format!("\0{marker}:{var_name}"),
                 fmt: expr,
             },
             cond,
@@ -1104,6 +1108,10 @@ pub(crate) fn parse_http_after_res_rule(
             cond,
         });
     } else if act_str.starts_with("set-var(") || act_str.starts_with("set-var-fmt(") {
+        // `set-var-fmt` takes a log-format string, `set-var` a sample expression; they are
+        // told apart by the marker, or `set-var-fmt(txn.x) abc` would be evaluated as a
+        // fetch named `abc`.
+        let marker = if act_str.starts_with("set-var-fmt(") { "set-var-fmt" } else { "set-var" };
         let var_name = act_token
             .text
             .trim_start_matches("set-var(")
@@ -1120,7 +1128,7 @@ pub(crate) fn parse_http_after_res_rule(
         };
         rules.push(HttpAfterResRule {
             action: HttpAfterResAction::SetHeader {
-                name: format!("\0set-var:{var_name}"),
+                name: format!("\0{marker}:{var_name}"),
                 fmt: expr,
             },
             cond,

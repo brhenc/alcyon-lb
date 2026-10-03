@@ -1155,9 +1155,15 @@ impl Engine {
     /// Constructs an `Engine` configured from the given parsed config.
     ///
     /// # Errors
-    /// Returns an error if epoll creation or binding any listener fails.
+    /// Returns an error if epoll creation or binding any listener fails, or if a rule
+    /// action's sample expression names an unknown fetch or converter
+    /// ([`crate::rule_exprs::validate_rule_exprs`]).
     #[allow(clippy::too_many_lines)]
     pub fn build_shared_state(config: &Config, nbthread: usize) -> io::Result<Vec<Proxy>> {
+    // An action naming a fetch or converter the registry lacks would load and then do
+    // nothing on every request; `HAProxy` refuses the configuration instead.
+    crate::rule_exprs::validate_config(config)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     let mut proxies = Vec::new();
     for listen in &config.listens {
         if !listen.disabled { proxies.push(init_proxy_from_listen(proxies.len(), listen, nbthread)); }
@@ -4239,8 +4245,14 @@ impl EngineDispatcher<'_> {
                     }
                     return Ok(true);
                 }
-                if let Some(var_name) = act_name.strip_prefix("\0set-var:") {
-                    let val = if let Ok(e) = Expr::parse(act_fmt) {
+                let set_var = act_name
+                    .strip_prefix("\0set-var:")
+                    .map(|v| (v, false))
+                    .or_else(|| act_name.strip_prefix("\0set-var-fmt:").map(|v| (v, true)));
+                if let Some((var_name, is_fmt)) = set_var {
+                    let val = if is_fmt {
+                        format_sample_string(act_fmt, &ctx, registry)
+                    } else if let Ok(e) = Expr::parse(act_fmt) {
                         e.eval_sample(registry, &ctx)
                             .map(|smp| sample_to_string(&smp))
                             .unwrap_or_default()
