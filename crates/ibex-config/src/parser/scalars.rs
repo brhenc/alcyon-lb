@@ -108,7 +108,6 @@ pub(crate) fn parse_match_type(s: &str) -> MatchType {
     }
 }
 
-#[allow(dead_code)]
 pub(crate) fn validate_regex(token: &Token) -> Result<(), ConfigError> {
     regex::Regex::new(&token.text).map_err(|e| {
         ConfigError::new(

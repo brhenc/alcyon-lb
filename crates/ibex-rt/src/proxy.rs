@@ -143,6 +143,9 @@ pub struct TcpSession {
     pub proxy_info: Option<ibex_proto::ProxyInfo>,
     pub server_addr: Option<SocketAddr>,
     pub send_proxy_prepended: bool,
+    /// The PROXY header the server connection opened with, if any: a later request reuses
+    /// that connection only if it would send the same one.
+    pub send_proxy_header: Vec<u8>,
     /// The HTTP transaction in progress: `None` between requests, and always in `mode
     /// tcp`. What may be forwarded in each direction is decided by its message states.
     pub txn: Option<HttpTxn>,
@@ -258,6 +261,7 @@ impl TcpSession {
             proxy_info: None,
             server_addr: None,
             send_proxy_prepended: false,
+            send_proxy_header: Vec::new(),
             txn: None,
             srv_cant_recv: false,
             cli_cant_recv: false,

@@ -14,13 +14,50 @@ use super::*;
 /// any chroot), and its bytes are kept verbatim -- an empty file (`/dev/null` is the
 /// documented idiom) is a valid, deliberately empty response.
 pub(crate) fn load_errorfile_bytes(path_tok: &Token) -> Result<Vec<u8>, ConfigError> {
-    std::fs::read(&path_tok.text).map_err(|e| {
+    let bytes = std::fs::read(&path_tok.text).map_err(|e| {
         ConfigError::new(
             path_tok.line,
             path_tok.col,
             format!("unable to load errorfile '{}': {e}", path_tok.text),
         )
-    })
+    })?;
+    check_errorfile(&bytes).map_err(|msg| {
+        ConfigError::new(path_tok.line, path_tok.col, format!("errorfile : '{}': {msg}", path_tok.text))
+    })?;
+    Ok(bytes)
+}
+
+/// What `http_str_to_htx` (`src/http_htx.c`) refuses in an errorfile: anything but an
+/// HTTP response head -- a status line of an 8-character version and a 3-digit status,
+/// header lines, the blank line -- and an interim status. The messages are `HAProxy`'s,
+/// without the parser's error offset. Ibex loaded such a file and sent its bytes as the
+/// reply, a status line no client can read.
+fn check_errorfile(bytes: &[u8]) -> Result<(), String> {
+    const UNPARSABLE: &str = "unable to parse headers";
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let text = String::from_utf8_lossy(bytes);
+    let end = [text.find("\r\n\r\n"), text.find("\n\n")].into_iter().flatten().min().ok_or(UNPARSABLE)?;
+    let mut lines = text[..end].split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l));
+    let mut status_line = lines.next().unwrap_or_default().splitn(3, ' ');
+    let version = status_line.next().unwrap_or_default();
+    let code = status_line.next().unwrap_or_default();
+    if code.len() != 3 || !code.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(UNPARSABLE.to_string());
+    }
+    let is_token = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_graphic() && !b"()<>@,;:\\\"/[]?={}".contains(&b));
+    if !lines.all(|l| l.split_once(':').is_some_and(|(name, _)| is_token(name))) {
+        return Err(UNPARSABLE.to_string());
+    }
+    if version.len() != 8 {
+        return Err(format!("invalid http version ({version})"));
+    }
+    let status: u16 = code.parse().unwrap_or(0);
+    if status == 100 || (102..200).contains(&status) {
+        return Err(format!("invalid http status code for an error message ({status})"));
+    }
+    Ok(())
 }
 
 /// Parses `errorfile <code> <file>` (in `defaults`/`frontend`/`backend`/`listen`, or inside

@@ -60,6 +60,9 @@ thread_local! {
     static STRICT_MODE: Cell<bool> = const { Cell::new(true) };
     static REWRITE_ADDED_BYTES: Cell<usize> = const { Cell::new(0) };
     static MAX_REWRITE_LIMIT: Cell<usize> = const { Cell::new(8192) };
+    /// The response being rewritten by `http-response`/`http-after-response`, as the HTX
+    /// message `HAProxy` holds it in: (bytes in use, size). See [`res_htx_init`].
+    static RES_HTX: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
 }
 
 #[inline]
@@ -3291,45 +3294,51 @@ fn maybe_prepend_send_proxy(fe: &Proxy, proxy: &Proxy, sess: &mut TcpSession, ta
 }
 
 fn prepend_send_proxy(fe: &Proxy, proxy: &Proxy, sess: &mut TcpSession, target_addr: SocketAddr) {
-    if let Some(idx) = proxy.servers.iter().position(|&s| s == target_addr) {
-        let send_v2 = proxy
-            .server_send_proxy_v2
-            .get(idx)
-            .copied()
-            .unwrap_or(false);
-        let send_v1 = proxy.server_send_proxy.get(idx).copied().unwrap_or(false);
+    if let Some(hdr) = proxy_header(fe, proxy, sess, target_addr) {
+        sess.req.replace_prefix(0, &hdr);
+        sess.send_proxy_prepended = true;
+        sess.send_proxy_header = hdr;
+    }
+}
 
-        if send_v2 {
-            let src = sess.client_addr;
-            let dst = sess.server_addr.or(Some(proxy.addr));
-            let mut tlv_data = sess.proxy_info.as_ref().map_or_else(Vec::new, |p| p.tlv_data.clone());
-            if proxy.server_pp_unique_id.get(idx).copied().unwrap_or(false) {
-                // `PP2_TYPE_UNIQUE_ID`: the stream's ID, built now if nothing has yet (a TCP
-                // stream), from the frontend's format; without one, an empty TLV
-                // (`stream_generate_unique_id`, `make_proxy_line_v2`).
-                if sess.log.unique_id.is_none() {
-                    if let Some(fmt) = fe.unique_id_format.as_ref() {
-                        let id = fmt.render(&session_log_data(sess, fe, proxy, std::process::id()), sample_registry(), &stream_sample_ctx(sess, fe, proxy));
-                        sess.log.unique_id = Some(id);
-                    }
+/// The PROXY header this stream sends ahead of its request to `target_addr`, if that
+/// server line asks for one.
+fn proxy_header(fe: &Proxy, proxy: &Proxy, sess: &mut TcpSession, target_addr: SocketAddr) -> Option<Vec<u8>> {
+    let idx = proxy.servers.iter().position(|&s| s == target_addr)?;
+    let send_v2 = proxy
+        .server_send_proxy_v2
+        .get(idx)
+        .copied()
+        .unwrap_or(false);
+    let send_v1 = proxy.server_send_proxy.get(idx).copied().unwrap_or(false);
+
+    if send_v2 {
+        let src = sess.client_addr;
+        let dst = sess.server_addr.or(Some(proxy.addr));
+        let mut tlv_data = sess.proxy_info.as_ref().map_or_else(Vec::new, |p| p.tlv_data.clone());
+        if proxy.server_pp_unique_id.get(idx).copied().unwrap_or(false) {
+            // `PP2_TYPE_UNIQUE_ID`: the stream's ID, built now if nothing has yet (a TCP
+            // stream), from the frontend's format; without one, an empty TLV
+            // (`stream_generate_unique_id`, `make_proxy_line_v2`).
+            if sess.log.unique_id.is_none() {
+                if let Some(fmt) = fe.unique_id_format.as_ref() {
+                    let id = fmt.render(&session_log_data(sess, fe, proxy, std::process::id()), sample_registry(), &stream_sample_ctx(sess, fe, proxy));
+                    sess.log.unique_id = Some(id);
                 }
-                let id = sess.log.unique_id.as_deref().unwrap_or("").as_bytes();
-                let id = &id[..id.len().min(usize::from(u16::MAX))];
-                tlv_data.push(0x05);
-                tlv_data.extend_from_slice(&u16::try_from(id.len()).unwrap_or(u16::MAX).to_be_bytes());
-                tlv_data.extend_from_slice(id);
             }
-            let hdr =
-                ibex_proto::encode_proxy_v2(ibex_proto::ProxyCommand::Proxy, src, dst, &tlv_data);
-            sess.req.replace_prefix(0, &hdr);
-            sess.send_proxy_prepended = true;
-        } else if send_v1 {
-            let src = sess.client_addr;
-            let dst = sess.server_addr.or(Some(proxy.addr));
-            let hdr = ibex_proto::encode_proxy_v1(src, dst);
-            sess.req.replace_prefix(0, &hdr);
-            sess.send_proxy_prepended = true;
+            let id = sess.log.unique_id.as_deref().unwrap_or("").as_bytes();
+            let id = &id[..id.len().min(usize::from(u16::MAX))];
+            tlv_data.push(0x05);
+            tlv_data.extend_from_slice(&u16::try_from(id.len()).unwrap_or(u16::MAX).to_be_bytes());
+            tlv_data.extend_from_slice(id);
         }
+        Some(ibex_proto::encode_proxy_v2(ibex_proto::ProxyCommand::Proxy, src, dst, &tlv_data))
+    } else if send_v1 {
+        let src = sess.client_addr;
+        let dst = sess.server_addr.or(Some(proxy.addr));
+        Some(ibex_proto::encode_proxy_v1(src, dst))
+    } else {
+        None
     }
 }
 
@@ -3650,8 +3659,25 @@ struct EngineDispatcher<'a> {
 
 /// Answers the current request with the page for `status`, chosen as HAProxy's
 /// `http_error_message` chooses it: the backend's `http-error`/`errorfile`, then the
-/// frontend's, then the built-in page. Every error the proxy generates goes through here.
+/// frontend's, then the built-in page. Every error the proxy generates on a stream goes
+/// through here, and through the `http-after-response` rules.
 fn reply_error(entry: &mut SessionEntry, proxies: &[Proxy], status: u16) {
+    let be_idx = if entry.backend_idx < proxies.len() { entry.backend_idx } else { entry.proxy_idx };
+    let page = proxy_error_response(&entry.sess, &proxies[be_idx], &proxies[entry.proxy_idx], status);
+    send_proxy_reply(&mut entry.sess, proxies, entry.proxy_idx, be_idx, &page);
+}
+
+/// An `http_reply` with neither body nor headers: the status line and `content-length: 0`
+/// (`http_reply_to_htx`, `src/http_htx.c`), through the `http-after-response` rules.
+fn reply_empty(entry: &mut SessionEntry, proxies: &[Proxy], status: u16) {
+    let be_idx = if entry.backend_idx < proxies.len() { entry.backend_idx } else { entry.proxy_idx };
+    let reply = format!("HTTP/1.1 {status} {}\r\ncontent-length: 0\r\n\r\n", status_reason(status));
+    send_proxy_reply(&mut entry.sess, proxies, entry.proxy_idx, be_idx, reply.as_bytes());
+}
+
+/// The answer to a request that could not be parsed. `HAProxy`'s H1 mux sends it before
+/// there is a stream, so no rule runs on it -- `http-after-response` included.
+fn reply_parse_error(entry: &mut SessionEntry, proxies: &[Proxy], status: u16) {
     let be = proxies.get(entry.backend_idx).unwrap_or(&proxies[entry.proxy_idx]);
     let page = proxy_error_response(&entry.sess, be, &proxies[entry.proxy_idx], status);
     entry.sess.write_reply(&page);
@@ -4112,7 +4138,7 @@ impl EngineDispatcher<'_> {
         };
 
         if let Some(status) = txn.error.take() {
-            reply_error(entry, proxies, status);
+            reply_parse_error(entry, proxies, status);
         }
 
         let mut admin = None;
@@ -4675,9 +4701,10 @@ impl EngineDispatcher<'_> {
 
         CURRENT_RES_STATUS.set(status);
         CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = hdrs.clone());
-        REWRITE_ADDED_BYTES.set(0);
-        let max_rw = proxies[fe_idx].stats_config.maxrewrite.unwrap_or(8192);
-        MAX_REWRITE_LIMIT.set(max_rw);
+        // `HAProxy` caps `tune.maxrewrite` at half the buffer (`src/haproxy.c`).
+        let reserve = entry.sess.maxrewrite.min(entry.sess.bufsize / 2);
+        let body_in_buf = entry.sess.rep.readable().len().saturating_sub(total_hdr_len);
+        res_htx_init(entry.sess.bufsize, Some(reserve), &proto_version, &status_msg, &hdrs, body_in_buf);
 
         let registry = sample_registry();
 
@@ -4720,7 +4747,7 @@ impl EngineDispatcher<'_> {
         // `tcp-response content reject`: the response is dropped and the client connection
         // closed with nothing sent, as HAProxy does -- not answered with a 502.
         let mut rejected = false;
-        let failed: Option<u16> = 'rules: {
+        let failed: Option<ResStop> = 'rules: {
             // 0. Apply be.tcp_res_content_rules. They run before the response is analysed
             // as HTTP (`AN_RES_INSPECT` ahead of `AN_RES_WAIT_HTTP`), so its status and
             // headers are not there to fetch until they are done.
@@ -4756,332 +4783,36 @@ impl EngineDispatcher<'_> {
             CURRENT_RES_STATUS.set(status);
             CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = hdrs.clone());
 
-            let mut eval_res_action = |act_name: &str, act_fmt: &str, hdrs: &mut Vec<(String, String)>, status: &mut u16, status_msg: &mut String| -> Result<bool, u16> {
-                if act_name == "\0allow" {
-                    return Ok(false);
-                }
-                if act_name == "\0deny" {
-                    // `http-response deny` with no status is a 502 in HAProxy (the
-                    // server's response is what was refused); 403 is the request side's.
-                    let deny_st = act_fmt.parse::<u16>().unwrap_or(502);
-                    return Err(deny_st);
-                }
-                if act_name == "\0set-status" {
-                    if let Ok(st) = act_fmt.parse::<u16>() {
-                        *status = st;
-                        *status_msg = status_reason(st).to_string();
-                        CURRENT_RES_STATUS.set(st);
-                    }
-                    return Ok(true);
-                }
-                let set_var = act_name
-                    .strip_prefix("\0set-var:")
-                    .map(|v| (v, false))
-                    .or_else(|| act_name.strip_prefix("\0set-var-fmt:").map(|v| (v, true)));
-                if let Some((var_name, is_fmt)) = set_var {
-                    let val = if is_fmt {
-                        format_sample_string(act_fmt, &ctx, registry)
-                    } else if let Ok(e) = Expr::parse(act_fmt) {
-                        e.eval_sample(registry, &ctx)
-                            .map(|smp| sample_to_string(&smp))
-                            .unwrap_or_default()
-                    } else {
-                        format_sample_string(act_fmt, &ctx, registry)
-                    };
-                    if var_name.starts_with("proc.") {
-                        ibex_sample::set_proc_var(var_name, val);
-                    } else {
-                        if var_name.starts_with("sess.") {
-                            entry.sess.sess_vars.insert(var_name.to_string(), val.clone());
-                        } else {
-                            entry.sess.req_vars.insert(var_name.to_string(), val.clone());
-                        }
-                        CURRENT_VARS.with(|v| {
-                            v.borrow_mut().insert(var_name.to_string(), val);
-                        });
-                    }
-                    return Ok(true);
-                }
-                if let Some(var_name) = act_name.strip_prefix("\0unset-var:") {
-                    if var_name.starts_with("sess.") {
-                        entry.sess.sess_vars.remove(var_name);
-                    } else {
-                        entry.sess.req_vars.remove(var_name);
-                    }
-                    CURRENT_VARS.with(|v| {
-                        v.borrow_mut().remove(var_name);
-                    });
-                    return Ok(true);
-                }
-                if act_name == "\0strict-mode" {
-                    STRICT_MODE.set(act_fmt == "on");
-                    return Ok(true);
-                }
-                if let Some(hdr_name) = act_name.strip_prefix("\0replace-header:") {
-                    if let Some((re_str, repl_str)) = act_fmt.split_once('\t') {
-                        if let Ok(re) = regex::Regex::new(re_str) {
-                            let rust_repl = translate_backreferences(repl_str);
-                            let strict = STRICT_MODE.get();
-                            for (k, v) in hdrs.iter_mut() {
-                                if k.eq_ignore_ascii_case(hdr_name) {
-                                    let new_v = re.replace_all(v, &rust_repl).to_string();
-                                    if strict && new_v.len() > 1_048_575 {
-                                        return Err(500);
-                                    }
-                                    *v = new_v;
-                                }
-                            }
-                            CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = hdrs.clone());
-                        }
-                    }
-                    return Ok(true);
-                }
-                if let Some(hdr_name) = act_name.strip_prefix("\0replace-value:") {
-                    if let Some((re_str, repl_str)) = act_fmt.split_once('\t') {
-                        if let Ok(re) = regex::Regex::new(re_str) {
-                            let rust_repl = translate_backreferences(repl_str);
-                            let strict = STRICT_MODE.get();
-                            for (k, v) in hdrs.iter_mut() {
-                                if k.eq_ignore_ascii_case(hdr_name) {
-                                    let new_v = re.replace_all(v, &rust_repl).to_string();
-                                    if strict && new_v.len() > 1_048_575 {
-                                        return Err(500);
-                                    }
-                                    *v = new_v;
-                                }
-                            }
-                            CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = hdrs.clone());
-                        }
-                    }
-                    return Ok(true);
-                }
-
-                let val = format_sample_string(act_fmt, &ctx, registry);
-                let added = act_name.len() + val.len() + 4;
-                let total = REWRITE_ADDED_BYTES.get() + added;
-                if total > MAX_REWRITE_LIMIT.get() {
-                    if STRICT_MODE.get() {
-                        return Err(500);
-                    }
-                    return Ok(true);
-                }
-                REWRITE_ADDED_BYTES.set(total);
-
-                if let Some(pos) = hdrs.iter().position(|(k, _)| k.eq_ignore_ascii_case(act_name)) {
-                    hdrs[pos].1 = val;
-                } else {
-                    hdrs.push((act_name.to_string(), val));
-                }
-                CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = hdrs.clone());
-                Ok(true)
-            };
-
-            // 1. Apply be.http_res_rules
-            for rule in &proxies[be_idx].http_res_rules {
-                let matches = match &rule.cond {
-                    None => true,
-                    Some(cond) => eval_condition(cond, &ctx, &proxies[be_idx].acls, registry),
-                };
-                if !matches {
-                    continue;
-                }
-                match &rule.action {
-                    ibex_config::HttpResAction::SetHeader { name, fmt } => {
-                        match eval_res_action(name, fmt, &mut hdrs, &mut status, &mut status_msg) {
-                            Ok(true) => {}
-                            Ok(false) => break,
-                            Err(err_st) => {
-                                break 'rules Some(err_st);
-                            }
-                        }
-                    }
-                    ibex_config::HttpResAction::AddHeader { name, fmt } => {
-                        if let Some(var_name) = name.strip_prefix("\0set-var:") {
-                            let val = format_sample_string(fmt, &ctx, registry);
-                            CURRENT_VARS.with(|v| v.borrow_mut().insert(var_name.to_string(), val));
-                        } else {
-                            let val = format_sample_string(fmt, &ctx, registry);
-                            let added = name.len() + val.len() + 4;
-                            let total = REWRITE_ADDED_BYTES.get() + added;
-                            if total > MAX_REWRITE_LIMIT.get() {
-                                if STRICT_MODE.get() {
-                                    break 'rules Some(500);
-                                }
-                            } else {
-                                REWRITE_ADDED_BYTES.set(total);
-                                hdrs.push((name.clone(), val));
-                                CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = hdrs.clone());
-                            }
-                        }
-                    }
-                    ibex_config::HttpResAction::DelHeader { name } => {
-                        if let Some(var_name) = name.strip_prefix("\0unset-var:") {
-                            CURRENT_VARS.with(|v| v.borrow_mut().remove(var_name));
-                        } else {
-                            hdrs.retain(|(k, _)| !header_name_matches(k, name));
-                            CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = hdrs.clone());
-                        }
-                    }
-                    ibex_config::HttpResAction::SetStatus { status: new_st } => {
-                        status = *new_st;
-                        status_msg = status_reason(status).to_string();
-                        CURRENT_RES_STATUS.set(status);
-                    }
+            // 1. The backend's `http-response` rules, then the frontend's when it is another
+            // proxy; an `allow` ends only its own list.
+            let order: &[usize] = if fe_idx == be_idx { &[be_idx] } else { &[be_idx, fe_idx] };
+            for &px in order {
+                let rules = proxies[px].http_res_rules.iter().map(|r| (ResOp::of_res(&r.action), r.cond.as_ref()));
+                if let Err(stop) = run_res_rules(
+                    rules,
+                    &proxies[px].acls,
+                    (&mut hdrs, &mut status, &mut status_msg),
+                    &ctx,
+                    registry,
+                    &mut entry.sess.sess_vars,
+                    &mut entry.sess.req_vars,
+                ) {
+                    break 'rules Some(stop);
                 }
             }
 
-            // 1b. Apply fe.http_res_rules
-            if fe_idx != be_idx {
-                for rule in &proxies[fe_idx].http_res_rules {
-                    let matches = match &rule.cond {
-                        None => true,
-                        Some(cond) => eval_condition(cond, &ctx, &proxies[fe_idx].acls, registry),
-                    };
-                    if !matches {
-                        continue;
-                    }
-                    match &rule.action {
-                        ibex_config::HttpResAction::SetHeader { name, fmt } => {
-                            match eval_res_action(name, fmt, &mut hdrs, &mut status, &mut status_msg) {
-                                Ok(true) => {}
-                                Ok(false) => break,
-                                Err(err_st) => {
-                                    break 'rules Some(err_st);
-                                }
-                            }
-                        }
-                        ibex_config::HttpResAction::AddHeader { name, fmt } => {
-                            if let Some(var_name) = name.strip_prefix("\0set-var:") {
-                                let val = format_sample_string(fmt, &ctx, registry);
-                                CURRENT_VARS.with(|v| v.borrow_mut().insert(var_name.to_string(), val));
-                            } else {
-                                let val = format_sample_string(fmt, &ctx, registry);
-                                let added = name.len() + val.len() + 4;
-                                let total = REWRITE_ADDED_BYTES.get() + added;
-                                if total > MAX_REWRITE_LIMIT.get() {
-                                    if STRICT_MODE.get() {
-                                        break 'rules Some(500);
-                                    }
-                                } else {
-                                    REWRITE_ADDED_BYTES.set(total);
-                                    hdrs.push((name.clone(), val));
-                                    CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = hdrs.clone());
-                                }
-                            }
-                        }
-                        ibex_config::HttpResAction::DelHeader { name } => {
-                            if let Some(var_name) = name.strip_prefix("\0unset-var:") {
-                                CURRENT_VARS.with(|v| v.borrow_mut().remove(var_name));
-                            } else {
-                                hdrs.retain(|(k, _)| !header_name_matches(k, name));
-                                CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = hdrs.clone());
-                            }
-                        }
-                        ibex_config::HttpResAction::SetStatus { status: new_st } => {
-                            status = *new_st;
-                            status_msg = status_reason(status).to_string();
-                            CURRENT_RES_STATUS.set(status);
-                        }
-                    }
-                }
-            }
-
-            // 2. Apply be.http_after_res_rules
-            for rule in &proxies[be_idx].http_after_res_rules {
-                let matches = match &rule.cond {
-                    None => true,
-                    Some(cond) => eval_condition(cond, &ctx, &proxies[be_idx].acls, registry),
-                };
-                if !matches {
-                    continue;
-                }
-                match &rule.action {
-                    ibex_config::HttpAfterResAction::SetHeader { name, fmt } => {
-                        match eval_res_action(name, fmt, &mut hdrs, &mut status, &mut status_msg) {
-                            Ok(true) => {}
-                            Ok(false) => break,
-                            Err(err_st) => {
-                                break 'rules Some(err_st);
-                            }
-                        }
-                    }
-                    ibex_config::HttpAfterResAction::AddHeader { name, fmt } => {
-                        if let Some(var_name) = name.strip_prefix("\0set-var:") {
-                            let val = format_sample_string(fmt, &ctx, registry);
-                            CURRENT_VARS.with(|v| v.borrow_mut().insert(var_name.to_string(), val));
-                        } else {
-                            let val = format_sample_string(fmt, &ctx, registry);
-                            let added = name.len() + val.len() + 4;
-                            let total = REWRITE_ADDED_BYTES.get() + added;
-                            if total > MAX_REWRITE_LIMIT.get() {
-                                if STRICT_MODE.get() {
-                                    break 'rules Some(500);
-                                }
-                            } else {
-                                REWRITE_ADDED_BYTES.set(total);
-                                hdrs.push((name.clone(), val));
-                                CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = hdrs.clone());
-                            }
-                        }
-                    }
-                    ibex_config::HttpAfterResAction::DelHeader { name } => {
-                        if let Some(var_name) = name.strip_prefix("\0unset-var:") {
-                            CURRENT_VARS.with(|v| v.borrow_mut().remove(var_name));
-                        } else {
-                            hdrs.retain(|(k, _)| !header_name_matches(k, name));
-                            CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = hdrs.clone());
-                        }
-                    }
-                }
-            }
-
-            // 3. Apply fe.http_after_res_rules
-            for rule in &proxies[fe_idx].http_after_res_rules {
-                let matches = match &rule.cond {
-                    None => true,
-                    Some(cond) => eval_condition(cond, &ctx, &proxies[fe_idx].acls, registry),
-                };
-                if !matches {
-                    continue;
-                }
-                match &rule.action {
-                    ibex_config::HttpAfterResAction::SetHeader { name, fmt } => {
-                        match eval_res_action(name, fmt, &mut hdrs, &mut status, &mut status_msg) {
-                            Ok(true) => {}
-                            Ok(false) => break,
-                            Err(err_st) => {
-                                break 'rules Some(err_st);
-                            }
-                        }
-                    }
-                    ibex_config::HttpAfterResAction::AddHeader { name, fmt } => {
-                        if let Some(var_name) = name.strip_prefix("\0set-var:") {
-                            let val = format_sample_string(fmt, &ctx, registry);
-                            CURRENT_VARS.with(|v| v.borrow_mut().insert(var_name.to_string(), val));
-                        } else {
-                            let val = format_sample_string(fmt, &ctx, registry);
-                            let added = name.len() + val.len() + 4;
-                            let total = REWRITE_ADDED_BYTES.get() + added;
-                            if total > MAX_REWRITE_LIMIT.get() {
-                                if STRICT_MODE.get() {
-                                    break 'rules Some(500);
-                                }
-                            } else {
-                                REWRITE_ADDED_BYTES.set(total);
-                                hdrs.push((name.clone(), val));
-                                CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = hdrs.clone());
-                            }
-                        }
-                    }
-                    ibex_config::HttpAfterResAction::DelHeader { name } => {
-                        if let Some(var_name) = name.strip_prefix("\0unset-var:") {
-                            CURRENT_VARS.with(|v| v.borrow_mut().remove(var_name));
-                        } else {
-                            hdrs.retain(|(k, _)| !header_name_matches(k, name));
-                            CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = hdrs.clone());
-                        }
-                    }
-                }
+            // 2. and 3. `http-after-response`, the backend's then the frontend's.
+            if let Err(stop) = eval_after_res_rules(
+                proxies,
+                fe_idx,
+                be_idx,
+                (&mut hdrs, &mut status, &mut status_msg),
+                &ctx,
+                registry,
+                &mut entry.sess.sess_vars,
+                &mut entry.sess.req_vars,
+            ) {
+                break 'rules Some(stop);
             }
             None
         };
@@ -5093,9 +4824,12 @@ impl EngineDispatcher<'_> {
             }
             return;
         }
-        if let Some(st) = failed {
+        if let Some(stop) = failed {
             entry.sess.rep.clear();
-            reply_error(entry, proxies, st);
+            match stop {
+                ResStop::Page(st) => reply_error(entry, proxies, st),
+                ResStop::Empty(st) => reply_empty(entry, proxies, st),
+            }
             return;
         }
 
@@ -5435,7 +5169,7 @@ impl EngineDispatcher<'_> {
                 if let Some(t) = entry.sess.txn.as_mut() {
                     t.close_after = true;
                 }
-                entry.sess.write_reply(MONITOR_URI_RESPONSE);
+                send_proxy_reply(&mut entry.sess, proxies, proxy_idx, proxy_idx, MONITOR_URI_RESPONSE);
                 return None;
             }
         }
@@ -5653,7 +5387,7 @@ impl EngineDispatcher<'_> {
                                 build_templated_error_response(*status, content_type, lf_string, &make_ctx!(sess), registry)
                             }
                         };
-                        sess.write_reply(&full_resp);
+                        send_proxy_reply(sess, &proxies[..], proxy_idx, pages_idx, &full_resp);
                         return Ok(Some(()));
                     }
                     ibex_config::HttpReqAction::Deny {
@@ -5672,7 +5406,7 @@ impl EngineDispatcher<'_> {
                         };
                         // Denied by the proxy: `PR`, not a rule's answer (`LR`).
                         sess.log.term = Some(*b"PR");
-                        sess.write_reply(&resp);
+                        send_proxy_reply(sess, &proxies[..], proxy_idx, pages_idx, &resp);
                         return Ok(Some(()));
                     }
                     ibex_config::HttpReqAction::Allow => {
@@ -5680,7 +5414,7 @@ impl EngineDispatcher<'_> {
                     }
                     ibex_config::HttpReqAction::Auth => {
                         let resp = "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"HAProxy\"\r\nContent-Type: text/plain\r\nContent-Length: 0\r\n\r\n";
-                        sess.write_reply(resp.as_bytes());
+                        send_proxy_reply(sess, &proxies[..], proxy_idx, pages_idx, resp.as_bytes());
                         return Ok(Some(()));
                     }
                     ibex_config::HttpReqAction::Redirect { location, prefix, code, .. } => {
@@ -5691,7 +5425,7 @@ impl EngineDispatcher<'_> {
                         let resp = format!(
                             "HTTP/1.1 {status_code} {reason}\r\nLocation: {formatted_loc}\r\nContent-Length: 0\r\n\r\n"
                         );
-                        sess.write_reply(resp.as_bytes());
+                        send_proxy_reply(sess, &proxies[..], proxy_idx, pages_idx, resp.as_bytes());
                         return Ok(Some(()));
                     }
                     ibex_config::HttpReqAction::SetPath { fmt } => {
@@ -6207,7 +5941,13 @@ impl EngineDispatcher<'_> {
             // address than this request's destination names; it is not kept.
             let same = entry.srv_backend_idx == be_idx
                 && entry.target_addr == Some(target_addr)
-                && !maps_destination(target_addr);
+                && !maps_destination(target_addr)
+                // A connection opened with a PROXY header carries only requests that would
+                // send that same header: HAProxy hashes it into the reuse key, so a
+                // per-request unique-id TLV gets a connection of its own.
+                && (!entry.sess.send_proxy_prepended
+                    || proxy_header(&proxies[entry.proxy_idx], &proxies[be_idx], &mut entry.sess, target_addr)
+                        .is_some_and(|h| h == entry.sess.send_proxy_header));
             if same
                 && matches!(entry.sess.srv_state, ScState::Ready | ScState::Established)
                 && entry.sess.rep.is_empty()
@@ -7294,6 +7034,470 @@ const BUILTIN_ERROR_PAGES: &[(u16, &str)] = &[
     (503, "HTTP/1.1 503 Service Unavailable\r\nContent-length: 107\r\nCache-Control: no-cache\r\nContent-Type: text/html\r\n\r\n<html><body><h1>503 Service Unavailable</h1>\nNo server is available to handle this request.\n</body></html>\n"),
     (504, "HTTP/1.1 504 Gateway Time-out\r\nContent-length: 92\r\nCache-Control: no-cache\r\nContent-Type: text/html\r\n\r\n<html><body><h1>504 Gateway Time-out</h1>\nThe server didn't respond in time.\n</body></html>\n"),
 ];
+
+/// What ends the response rules early: the reply that goes out in place of the response.
+/// `Page` is the proxy's page for the status (`deny`, `deny deny_status <code>`, a rewrite
+/// that fails in strict mode), `Empty` the status line and `content-length: 0` alone
+/// (`deny status <code>`, an `http_reply` with no body, `src/http_htx.c`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResStop {
+    Page(u16),
+    Empty(u16),
+}
+
+/// One `http-response` or `http-after-response` action, whichever list it comes from.
+/// The configuration encodes the actions that are not header edits as a `SetHeader` (or,
+/// for `unset-var`, a `DelHeader`) whose name starts with a NUL (`rules_http.rs`).
+#[derive(Clone, Copy)]
+enum ResOp<'a> {
+    Set(&'a str, &'a str),
+    Add(&'a str, &'a str),
+    Del(&'a str),
+    Status(u16),
+}
+
+impl<'a> ResOp<'a> {
+    fn of_res(a: &'a ibex_config::HttpResAction) -> Self {
+        match a {
+            ibex_config::HttpResAction::SetHeader { name, fmt } => Self::Set(name, fmt),
+            ibex_config::HttpResAction::AddHeader { name, fmt } => Self::Add(name, fmt),
+            ibex_config::HttpResAction::DelHeader { name } => Self::Del(name),
+            ibex_config::HttpResAction::SetStatus { status } => Self::Status(*status),
+        }
+    }
+
+    fn of_after_res(a: &'a ibex_config::HttpAfterResAction) -> Self {
+        match a {
+            ibex_config::HttpAfterResAction::SetHeader { name, fmt } => Self::Set(name, fmt),
+            ibex_config::HttpAfterResAction::AddHeader { name, fmt } => Self::Add(name, fmt),
+            ibex_config::HttpAfterResAction::DelHeader { name } => Self::Del(name),
+        }
+    }
+}
+
+/// Bytes an HTX header block takes: the 8-byte block descriptor, the name and the value
+/// (`htx_add_header`, `include/haproxy/htx.h`).
+fn htx_hdr_size(name: &str, value: &str) -> usize {
+    8 + name.len() + value.len()
+}
+
+/// Sizes the HTX message the rules rewrite (`RES_HTX`), as `HAProxy` holds the response: a
+/// buffer of `tune.bufsize` less the 40-byte `struct htx`, holding the status line (an
+/// 8-byte block, 20 bytes of `htx_sl` and the three strings), each header
+/// ([`htx_hdr_size`]), the 9-byte end-of-headers, and the body bytes already in the buffer
+/// (an 8-byte block and the data).
+///
+/// A rewrite fails when what it adds does not fit (`htx_reserve_nxblk`): `tune.maxrewrite`
+/// plays no part in it except that a response is read into the buffer only up to
+/// `tune.bufsize - tune.maxrewrite`, so that much stays free when the body would have
+/// filled it -- `reserve`, `None` for a reply the proxy wrote whole.
+///
+/// Measured on `HAProxy` 3.5-dev8 (2026-10-03, `tests/response_rule_actions.rs`): with the
+/// default buffer, a server's `HTTP/1.1 200 OK` and `Content-Length: 0` alone, two
+/// `set-header` of `n`-byte values on two-letter names fit up to `n` = 8125 and fail at
+/// 8126; each further header, or body byte, takes the bytes above from that room.
+fn res_htx_init(bufsize: usize, reserve: Option<usize>, version: &str, reason: &str, hdrs: &[(String, String)], body: usize) {
+    let size = bufsize.saturating_sub(40);
+    let head = 8 + 20 + version.len() + 3 + reason.len() + hdrs.iter().map(|(k, v)| htx_hdr_size(k, v)).sum::<usize>() + 9;
+    let mut body = if body == 0 { 0 } else { 8 + body };
+    if let Some(reserve) = reserve {
+        body = body.min(size.saturating_sub(reserve).saturating_sub(head));
+    }
+    RES_HTX.set((head + body, size));
+}
+
+/// Replaces `free` bytes of the HTX message by `take` bytes: false, the message left as it
+/// was, when they do not fit.
+fn res_htx_resize(free: usize, take: usize) -> bool {
+    let (used, size) = RES_HTX.get();
+    let used = used.saturating_sub(free) + take;
+    if used > size {
+        return false;
+    }
+    RES_HTX.set((used, size));
+    true
+}
+
+/// `exp_replace` (`src/regex.c`): `repl` with `\0`..`\9` replaced by that group of the
+/// match (nothing for a group that did not take part), `\xHH` by that byte -- computed as
+/// `HAProxy` computes it, which takes any two characters -- and a backslash before
+/// anything else dropped. `None`, a failed rewrite, for a backslash or `\x` cut short.
+fn exp_replace(repl: &str, caps: &regex::Captures<'_>) -> Option<String> {
+    let nibble = |c: u8| {
+        let n = c.to_ascii_uppercase().wrapping_sub(b'0');
+        if n > 9 { n.wrapping_sub(b'A' - b'9' - 1) } else { n }
+    };
+    let mut out = Vec::with_capacity(repl.len());
+    let mut s = repl.as_bytes();
+    while let Some((&c, rest)) = s.split_first() {
+        s = rest;
+        if c != b'\\' {
+            out.push(c);
+            continue;
+        }
+        let (&e, rest) = s.split_first()?;
+        s = rest;
+        if e.is_ascii_digit() {
+            if let Some(m) = caps.get(usize::from(e - b'0')) {
+                out.extend_from_slice(m.as_str().as_bytes());
+            }
+        } else if e == b'x' {
+            let (&[h1, h2], rest) = s.split_first_chunk::<2>()?;
+            out.push((nibble(h1) << 4).wrapping_add(nibble(h2)));
+            s = rest;
+        } else {
+            out.push(e);
+        }
+    }
+    Some(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// Where the header value starting `v` ends: the first comma outside a quoted string
+/// (`http_find_hdr_value_end`, `src/http.c`).
+fn hdr_value_end(v: &str) -> usize {
+    let b = v.as_bytes();
+    let mut i = 0;
+    let mut quoted = false;
+    while i < b.len() {
+        match b[i] {
+            b'\\' if quoted => i += 1,
+            b'"' => quoted = !quoted,
+            b',' if !quoted => return i,
+            _ => {}
+        }
+        i += 1;
+    }
+    b.len()
+}
+
+/// `replace-value`'s rewrite of one header line: each comma-separated value that `re`
+/// matches is replaced, with the blanks around it, by [`exp_replace`]'s output; the
+/// commas and the values it does not match stay as they were (`http_replace_hdrs` with
+/// `full` unset, `http_replace_header_value`). `None` when [`exp_replace`] fails.
+fn replace_each_value(v: &str, re: &regex::Regex, repl: &str) -> Option<String> {
+    let mut out = String::with_capacity(v.len());
+    let mut rest = v;
+    loop {
+        let before = rest.len() - rest.trim_start_matches([' ', '\t']).len();
+        let end = before + hdr_value_end(&rest[before..]);
+        let value = rest[before..end].trim_end_matches([' ', '\t']);
+        match re.captures(value) {
+            Some(caps) => out.push_str(&exp_replace(repl, &caps)?),
+            None => out.push_str(&rest[..end]),
+        }
+        let Some(next) = rest[end..].strip_prefix(',') else { break };
+        out.push(',');
+        rest = next;
+    }
+    Some(out)
+}
+
+/// One `http-response`/`http-after-response` action on the response head being rewritten:
+/// `Ok(true)` to go on, `Ok(false)` for `allow` (the rest of this rule list is skipped),
+/// `Err` when the response is refused or a rewrite does not fit in strict mode.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn res_action(
+    op: ResOp<'_>,
+    hdrs: &mut Vec<(String, String)>,
+    status: &mut u16,
+    status_msg: &mut String,
+    ctx: &SampleContext,
+    registry: &Registry,
+    sess_vars: &mut HashMap<String, String>,
+    req_vars: &mut HashMap<String, String>,
+) -> Result<bool, ResStop> {
+    // A rewrite that does not fit: the response fails in strict mode, and the rule is
+    // skipped otherwise (`fail_rewrite`, `src/http_act.c`).
+    let failed = || if STRICT_MODE.get() { Err(ResStop::Page(500)) } else { Ok(true) };
+    let publish = |hdrs: &Vec<(String, String)>| CURRENT_RES_HEADERS.with(|h| h.borrow_mut().clone_from(hdrs));
+    let (act_name, act_fmt) = match op {
+        ResOp::Status(st) => {
+            let reason = status_reason(st);
+            if !res_htx_resize(status_msg.len(), reason.len()) {
+                return failed();
+            }
+            *status = st;
+            *status_msg = reason.to_string();
+            CURRENT_RES_STATUS.set(st);
+            return Ok(true);
+        }
+        ResOp::Del(name) => {
+            if let Some(var_name) = name.strip_prefix("\0unset-var:") {
+                unset_var(sess_vars, req_vars, var_name);
+                return Ok(true);
+            }
+            let freed: usize = hdrs.iter().filter(|(k, _)| header_name_matches(k, name)).map(|(k, v)| htx_hdr_size(k, v)).sum();
+            hdrs.retain(|(k, _)| !header_name_matches(k, name));
+            res_htx_resize(freed, 0);
+            publish(hdrs);
+            return Ok(true);
+        }
+        ResOp::Add(name, fmt) => {
+            let val = format_sample_string(fmt, ctx, registry);
+            if !res_htx_resize(0, htx_hdr_size(name, &val)) {
+                return failed();
+            }
+            hdrs.push((name.to_string(), val));
+            publish(hdrs);
+            return Ok(true);
+        }
+        ResOp::Set(name, fmt) => (name, fmt),
+    };
+    if act_name == "\0allow" {
+        return Ok(false);
+    }
+    if act_name == "\0deny" {
+        // `http-response deny` with no status is a 502 in HAProxy (the
+        // server's response is what was refused); 403 is the request side's.
+        return Err(match act_fmt.strip_suffix(":empty") {
+            Some(st) => ResStop::Empty(st.parse().unwrap_or(502)),
+            None => ResStop::Page(act_fmt.parse().unwrap_or(502)),
+        });
+    }
+    if act_name == "\0set-status" {
+        return res_action(ResOp::Status(act_fmt.parse().unwrap_or(*status)), hdrs, status, status_msg, ctx, registry, sess_vars, req_vars);
+    }
+    if let Some(var_name) = act_name.strip_prefix("\0set-var:") {
+        // A fetch that finds nothing leaves the variable as it was (`action_store`).
+        set_var_from_expr(sess_vars, req_vars, var_name, act_fmt, ctx, registry);
+        return Ok(true);
+    }
+    if let Some(var_name) = act_name.strip_prefix("\0set-var-fmt:") {
+        store_var(sess_vars, req_vars, var_name, format_sample_string(act_fmt, ctx, registry));
+        return Ok(true);
+    }
+    if act_name == "\0strict-mode" {
+        STRICT_MODE.set(act_fmt == "on");
+        return Ok(true);
+    }
+    let replace = act_name
+        .strip_prefix("\0replace-header:")
+        .map(|n| (n, true))
+        .or_else(|| act_name.strip_prefix("\0replace-value:").map(|n| (n, false)));
+    if let Some((hdr_name, full)) = replace {
+        // `http_replace_hdrs`: header by header, the first that does not fit failing the
+        // action with the ones before it rewritten.
+        let Some((re_str, repl)) = act_fmt.split_once('\t') else { return Ok(true) };
+        let Ok(re) = regex::Regex::new(re_str) else { return Ok(true) };
+        let mut result = Ok(true);
+        for (k, v) in hdrs.iter_mut().filter(|(k, _)| k.eq_ignore_ascii_case(hdr_name)) {
+            let new_v = if full {
+                match re.captures(v) {
+                    Some(caps) => exp_replace(repl, &caps),
+                    None => continue,
+                }
+            } else {
+                replace_each_value(v, &re, repl)
+            };
+            match new_v {
+                Some(n) if res_htx_resize(htx_hdr_size(k, v), htx_hdr_size(k, &n)) => *v = n,
+                _ => {
+                    result = failed();
+                    break;
+                }
+            }
+        }
+        publish(hdrs);
+        return result;
+    }
+
+    // `set-header`: every occurrence goes, then one is added at the end
+    // (`http_action_set_header`) -- the removal stays when the addition does not fit.
+    let val = format_sample_string(act_fmt, ctx, registry);
+    let freed: usize = hdrs.iter().filter(|(k, _)| k.eq_ignore_ascii_case(act_name)).map(|(k, v)| htx_hdr_size(k, v)).sum();
+    hdrs.retain(|(k, _)| !k.eq_ignore_ascii_case(act_name));
+    res_htx_resize(freed, 0);
+    let fits = res_htx_resize(0, htx_hdr_size(act_name, &val));
+    if fits {
+        hdrs.push((act_name.to_string(), val));
+    }
+    publish(hdrs);
+    if fits {
+        Ok(true)
+    } else {
+        failed()
+    }
+}
+
+/// Runs one rule list (`http_res_get_intercept_rule`): each rule whose condition holds,
+/// until `allow` ends the list or an action stops the response. Every list starts in
+/// strict mode, and a `strict-mode off` in it lasts to its end only.
+#[allow(clippy::too_many_arguments)]
+fn run_res_rules<'a>(
+    rules: impl Iterator<Item = (ResOp<'a>, Option<&'a ibex_config::AclCondition>)>,
+    acls: &HashMap<String, Expr>,
+    head: (&mut Vec<(String, String)>, &mut u16, &mut String),
+    ctx: &SampleContext,
+    registry: &Registry,
+    sess_vars: &mut HashMap<String, String>,
+    req_vars: &mut HashMap<String, String>,
+) -> Result<(), ResStop> {
+    let (hdrs, status, status_msg) = head;
+    STRICT_MODE.set(true);
+    let mut result = Ok(());
+    for (op, cond) in rules {
+        if cond.is_some_and(|c| !eval_condition(c, ctx, acls, registry)) {
+            continue;
+        }
+        match res_action(op, hdrs, status, status_msg, ctx, registry, sess_vars, req_vars) {
+            Ok(true) => {}
+            Ok(false) => break,
+            Err(stop) => {
+                result = Err(stop);
+                break;
+            }
+        }
+    }
+    STRICT_MODE.set(true);
+    result
+}
+
+/// `http_eval_after_res_rules` (`src/http_ana.c`): the backend's `http-after-response`
+/// rules, then the frontend's when it is another proxy -- a `listen` section's run once,
+/// and a reply made before routing (the frontend still `s->be`) runs the frontend's once.
+/// The response side starts with the request's `req.*` variables pruned. `head` is the
+/// response's headers, status and reason, rewritten in place.
+#[allow(clippy::too_many_arguments)]
+fn eval_after_res_rules(
+    proxies: &[Proxy],
+    fe_idx: usize,
+    be_idx: usize,
+    head: (&mut Vec<(String, String)>, &mut u16, &mut String),
+    ctx: &SampleContext,
+    registry: &Registry,
+    sess_vars: &mut HashMap<String, String>,
+    req_vars: &mut HashMap<String, String>,
+) -> Result<(), ResStop> {
+    let (hdrs, status, status_msg) = head;
+    req_vars.retain(|k, _| !k.starts_with("req."));
+    CURRENT_VARS.with(|v| v.borrow_mut().retain(|k, _| !k.starts_with("req.")));
+    let order: &[usize] = if fe_idx == be_idx { &[be_idx] } else { &[be_idx, fe_idx] };
+    for &px in order {
+        let rules = proxies[px].http_after_res_rules.iter().map(|r| (ResOp::of_after_res(&r.action), r.cond.as_ref()));
+        run_res_rules(rules, &proxies[px].acls, (&mut *hdrs, &mut *status, &mut *status_msg), ctx, registry, sess_vars, req_vars)?;
+    }
+    Ok(())
+}
+
+/// Sends a reply the proxy made itself -- `return`, `deny`, `redirect`, `auth`, an error
+/// page -- through the `http-after-response` rules first, as `http_forward_proxy_resp`
+/// does for every one of them. `be_idx` is the proxy standing as `s->be`: the frontend
+/// until a backend is chosen.
+///
+/// A rule that fails turns the reply into the 500 page, which goes through the rules once
+/// more; if they fail on that too, or the failed reply was already a 500, the 500 goes out
+/// without them (`http_reply_and_close`, `TX_CONST_REPLY`).
+fn send_proxy_reply(sess: &mut TcpSession, proxies: &[Proxy], fe_idx: usize, be_idx: usize, raw: &[u8]) {
+    if let Ok(out) = after_res_on_reply(sess, proxies, fe_idx, be_idx, raw) {
+        sess.write_reply(&out);
+        return;
+    }
+    let page = proxy_error_response(sess, &proxies[be_idx], &proxies[fe_idx], 500);
+    let head_len = crate::proxy::find_eoh(raw).map_or(raw.len(), |(h, _)| h);
+    if crate::txn::status_of(&String::from_utf8_lossy(&raw[..head_len])) != 500 {
+        if let Ok(out) = after_res_on_reply(sess, proxies, fe_idx, be_idx, &page) {
+            sess.write_reply(&out);
+            return;
+        }
+    }
+    sess.write_reply(&page);
+}
+
+/// `raw`, a whole reply, with the `http-after-response` rules applied to its head; `Err`
+/// when one of them fails. The rules see what the server-response path gives them: the
+/// session's variables, the request, and this reply's status and headers.
+fn after_res_on_reply<'r>(
+    sess: &mut TcpSession,
+    proxies: &[Proxy],
+    fe_idx: usize,
+    be_idx: usize,
+    raw: &'r [u8],
+) -> Result<std::borrow::Cow<'r, [u8]>, ()> {
+    use std::borrow::Cow;
+    if proxies[be_idx].http_after_res_rules.is_empty() && proxies[fe_idx].http_after_res_rules.is_empty() {
+        return Ok(Cow::Borrowed(raw));
+    }
+    // The one reply with no head is an empty errorfile (`/dev/null`, the documented way to
+    // send nothing): it goes out as it is, nothing. Every other one has a head with a
+    // status -- the built-in pages and the replies Ibex builds, and errorfiles, which are
+    // refused at load when they are not an HTTP response (`load_errorfile_bytes`).
+    let parsed = crate::proxy::find_eoh(raw).and_then(|(hdr_end, eoh_len)| {
+        let head = String::from_utf8_lossy(&raw[..hdr_end]);
+        let (first, rest) = head.split_once('\n').unwrap_or((&head, ""));
+        let mut parts = first.trim_end_matches('\r').splitn(3, ' ');
+        let version = parts.next().unwrap_or("HTTP/1.1").to_string();
+        let status = parts.next()?.parse::<u16>().ok()?;
+        let reason = parts.next().unwrap_or_default().to_string();
+        let hdrs: Vec<(String, String)> = rest
+            .split('\n')
+            .filter_map(|l| l.split_once(':').map(|(k, v)| (k.trim().to_string(), v.trim().to_string())))
+            .collect();
+        Some((hdr_end, eoh_len, version, status, reason, hdrs))
+    });
+    let Some((hdr_end, eoh_len, version, mut status, mut reason, mut hdrs)) = parsed else {
+        return Ok(Cow::Borrowed(raw));
+    };
+
+    CURRENT_RES_STATUS.set(status);
+    CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = hdrs.clone());
+    res_htx_init(sess.bufsize, None, &version, &reason, &hdrs, raw.len() - hdr_end - eoh_len);
+    // The variables are the session's own: a reply made after the request rules (502, 504)
+    // comes when other streams may have run theirs on this thread.
+    CURRENT_VARS.with(|v| {
+        let mut map = v.borrow_mut();
+        map.clear();
+        map.extend(sess.sess_vars.iter().chain(sess.req_vars.iter()).map(|(k, val)| (k.clone(), val.clone())));
+    });
+    let mut sess_vars = std::mem::take(&mut sess.sess_vars);
+    let mut req_vars = std::mem::take(&mut sess.req_vars);
+    let result = {
+        let ctx = SampleContext {
+            client_addr: sess.client_addr,
+            server_addr: sess.server_addr,
+            fc_src: sess.fc_src,
+            fc_dst: sess.fc_dst,
+            is_first_req: sess.is_first_req,
+            proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
+            htx_slice: sess.htx_slice(),
+            req_uri: sess.req_uri.as_deref(),
+            req_method: sess.req_method.as_deref(),
+            req_headers: sess.req_headers.as_deref(),
+            fe_name: Some(&proxies[fe_idx].name),
+            be_name: Some(&proxies[be_idx].name),
+            be_max_retries: Some(proxies[be_idx].retries),
+            cur_max_retries: Some(sess.max_retries),
+            res_version: Some(&version),
+            unique_id: sess.log.unique_id.as_deref(),
+            captures_req_hdr: Some(&sess.log.req_captures),
+            captures_res_hdr: Some(&sess.log.res_captures),
+            ..Default::default()
+        };
+        eval_after_res_rules(
+            proxies,
+            fe_idx,
+            be_idx,
+            (&mut hdrs, &mut status, &mut reason),
+            &ctx,
+            sample_registry(),
+            &mut sess_vars,
+            &mut req_vars,
+        )
+    };
+    sess.sess_vars = sess_vars;
+    sess.req_vars = req_vars;
+    CURRENT_RES_STATUS.set(0);
+    CURRENT_RES_HEADERS.with(|h| h.borrow_mut().clear());
+    result.map_err(|_| ())?;
+
+    let mut out = format!("{version} {status} {reason}\r\n");
+    for (k, v) in &hdrs {
+        let _ = write!(out, "{k}: {v}\r\n");
+    }
+    out.push_str("\r\n");
+    let mut bytes = out.into_bytes();
+    bytes.extend_from_slice(&raw[hdr_end + eoh_len..]);
+    Ok(Cow::Owned(bytes))
+}
 
 /// The response for an error the proxy generates itself (no server, connect failed), as
 /// HAProxy's `http_error_message` picks it: the backend's `http-error`/`errorfile` for

@@ -42,6 +42,26 @@ fn expect_cond_at(tokens: &[Token], at: usize, act_token: &Token) -> Result<Opti
     }
 }
 
+/// The one argument at `tokens[2]` (a `set-var` expression, a `set-var-fmt` format) and
+/// the optional condition after it: a second word that is not `if`/`unless` is refused,
+/// as `HAProxy` refuses it. Ibex joined the words and set the variable to something else.
+fn one_arg_and_cond(tokens: &[Token], kw: &str, act_token: &Token) -> Result<(String, Option<AclCondition>), ConfigError> {
+    let arg = tokens.get(2).filter(|t| t.text != "if" && t.text != "unless").map_or_else(String::new, |t| t.text.clone());
+    let at = if arg.is_empty() { 2 } else { 3 };
+    match tokens.get(at) {
+        None => Ok((arg, None)),
+        Some(t) if t.text == "if" || t.text == "unless" => Ok((arg, parse_acl_condition_from_tokens(&tokens[at..])?)),
+        Some(t) => Err(ConfigError::new(
+            t.line,
+            t.col,
+            format!(
+                "'{kw} {}' expects either 'if' or 'unless' followed by a condition but found '{}'.",
+                act_token.text, t.text
+            ),
+        )),
+    }
+}
+
 /// `strtol(s, &end, 0)` with `*end == '\0'`: decimal, `0x` hex or leading-`0` octal, with
 /// an optional sign; `None` if anything is left over.
 fn strtol0(s: &str) -> Option<i64> {
@@ -805,6 +825,9 @@ pub(crate) fn parse_http_res_rule(
                 "<http-response replace-header> expects <name>, <regex>, <replace>.",
             ));
         }
+        // A regex that cannot be compiled would make the rule do nothing on every
+        // response; HAProxy refuses one it cannot compile, and so does this.
+        super::scalars::validate_regex(&tokens[3])?;
         let name = tokens[2].text.clone();
         let regex = tokens[3].text.clone();
         let repl = tokens[4].text.clone();
@@ -829,6 +852,9 @@ pub(crate) fn parse_http_res_rule(
                 "<http-response replace-value> expects <name>, <regex>, <replace>.",
             ));
         }
+        // A regex that cannot be compiled would make the rule do nothing on every
+        // response; HAProxy refuses one it cannot compile, and so does this.
+        super::scalars::validate_regex(&tokens[3])?;
         let name = tokens[2].text.clone();
         let regex = tokens[3].text.clone();
         let repl = tokens[4].text.clone();
@@ -856,14 +882,7 @@ pub(crate) fn parse_http_res_rule(
             .trim_start_matches("set-var-fmt(")
             .trim_end_matches(')')
             .to_string();
-        let cond_idx = find_cond_idx(tokens, 2);
-        let limit = cond_idx.unwrap_or(tokens.len());
-        let expr = tokens[2..limit].iter().map(|t| t.text.as_str()).collect::<Vec<_>>().join(" ");
-        let cond = if let Some(idx) = cond_idx {
-            parse_acl_condition_from_tokens(&tokens[idx..])?
-        } else {
-            None
-        };
+        let (expr, cond) = one_arg_and_cond(tokens, "http-response", act_token)?;
         rules.push(HttpResRule {
             action: HttpResAction::SetHeader {
                 name: format!("\0{marker}:{var_name}"),
@@ -919,29 +938,49 @@ pub(crate) fn parse_http_res_rule(
             cond,
         });
     } else if act_str == "deny" {
-        let mut status = None;
+        // `parse_http_deny` (`src/http_act.c`): with nothing, or only `deny_status <code>`,
+        // the reply is the proxy's page for the status (502 by default here) and the
+        // status must have a built-in one; otherwise the words are an `http_reply`, here
+        // only `status <code>`, and the reply is empty.
         let cond_idx = find_cond_idx(tokens, 2);
         let limit = cond_idx.unwrap_or(tokens.len());
-        let mut i = 2;
-        while i < limit {
-            if (tokens[i].text == "status" || tokens[i].text == "deny_status") && i + 1 < limit {
-                status = Some(parse_u16(&tokens[i + 1], "status")?);
-                i += 2;
-            } else {
-                // HAProxy also takes a body here (`content-type`, `string`, `hdr`,
-                // `errorfile`, ...). Ibex sends the status's error page and would drop
-                // it, so it is refused until it is implemented (AGENTS.md rule 5); an
-                // unknown word is refused by HAProxy too.
-                return Err(ConfigError::new(
-                    tokens[i].line,
-                    tokens[i].col,
-                    format!(
-                        "'http-response deny' takes only 'status <code>' in Ibex; '{}' is not supported",
-                        tokens[i].text
-                    ),
-                ));
+        let fmt = if limit == 2 {
+            String::new()
+        } else if tokens[2].text == "deny_status" && limit == 4 {
+            let status = parse_u16(&tokens[3], "deny_status")?;
+            super::error_pages::check_default_errorfiles(status, act_token)?;
+            status.to_string()
+        } else {
+            let mut status = 502;
+            let mut i = 2;
+            while i < limit {
+                if (tokens[i].text == "status" || (i == 2 && tokens[i].text == "deny_status")) && i + 1 < limit {
+                    status = parse_u16(&tokens[i + 1], "status")?;
+                    if !(200..=599).contains(&status) {
+                        return Err(ConfigError::new(
+                            tokens[i + 1].line,
+                            tokens[i + 1].col,
+                            format!("Unexpected status code '{status}'"),
+                        ));
+                    }
+                    i += 2;
+                } else {
+                    // HAProxy also takes a body here (`content-type`, `string`, `hdr`,
+                    // `errorfile`, ...). Ibex would drop it, so it is refused until it is
+                    // implemented (AGENTS.md rule 5); an unknown word is refused by HAProxy
+                    // too.
+                    return Err(ConfigError::new(
+                        tokens[i].line,
+                        tokens[i].col,
+                        format!(
+                            "'http-response deny' takes only 'status <code>' in Ibex; '{}' is not supported",
+                            tokens[i].text
+                        ),
+                    ));
+                }
             }
-        }
+            format!("{status}:empty")
+        };
         let cond = if let Some(idx) = cond_idx {
             parse_acl_condition_from_tokens(&tokens[idx..])?
         } else {
@@ -950,7 +989,7 @@ pub(crate) fn parse_http_res_rule(
         rules.push(HttpResRule {
             action: HttpResAction::SetHeader {
                 name: "\0deny".to_string(),
-                fmt: status.map_or_else(String::new, |s| s.to_string()),
+                fmt,
             },
             cond,
         });
@@ -1067,6 +1106,9 @@ pub(crate) fn parse_http_after_res_rule(
                 "<http-after-response replace-header> expects <name>, <regex>, <replace>.",
             ));
         }
+        // A regex that cannot be compiled would make the rule do nothing on every
+        // response; HAProxy refuses one it cannot compile, and so does this.
+        super::scalars::validate_regex(&tokens[3])?;
         let name = tokens[2].text.clone();
         let regex = tokens[3].text.clone();
         let repl = tokens[4].text.clone();
@@ -1091,6 +1133,9 @@ pub(crate) fn parse_http_after_res_rule(
                 "<http-after-response replace-value> expects <name>, <regex>, <replace>.",
             ));
         }
+        // A regex that cannot be compiled would make the rule do nothing on every
+        // response; HAProxy refuses one it cannot compile, and so does this.
+        super::scalars::validate_regex(&tokens[3])?;
         let name = tokens[2].text.clone();
         let regex = tokens[3].text.clone();
         let repl = tokens[4].text.clone();
@@ -1118,14 +1163,7 @@ pub(crate) fn parse_http_after_res_rule(
             .trim_start_matches("set-var-fmt(")
             .trim_end_matches(')')
             .to_string();
-        let cond_idx = find_cond_idx(tokens, 2);
-        let limit = cond_idx.unwrap_or(tokens.len());
-        let expr = tokens[2..limit].iter().map(|t| t.text.as_str()).collect::<Vec<_>>().join(" ");
-        let cond = if let Some(idx) = cond_idx {
-            parse_acl_condition_from_tokens(&tokens[idx..])?
-        } else {
-            None
-        };
+        let (expr, cond) = one_arg_and_cond(tokens, "http-after-response", act_token)?;
         rules.push(HttpAfterResRule {
             action: HttpAfterResAction::SetHeader {
                 name: format!("\0{marker}:{var_name}"),
@@ -1177,31 +1215,6 @@ pub(crate) fn parse_http_after_res_rule(
             action: HttpAfterResAction::SetHeader {
                 name: "\0allow".to_string(),
                 fmt: String::new(),
-            },
-            cond,
-        });
-    } else if act_str == "deny" {
-        let mut status = None;
-        let cond_idx = find_cond_idx(tokens, 2);
-        let limit = cond_idx.unwrap_or(tokens.len());
-        let mut i = 2;
-        while i < limit {
-            if (tokens[i].text == "status" || tokens[i].text == "deny_status") && i + 1 < limit {
-                status = Some(parse_u16(&tokens[i + 1], "status")?);
-                i += 2;
-            } else {
-                i += 1;
-            }
-        }
-        let cond = if let Some(idx) = cond_idx {
-            parse_acl_condition_from_tokens(&tokens[idx..])?
-        } else {
-            None
-        };
-        rules.push(HttpAfterResRule {
-            action: HttpAfterResAction::SetHeader {
-                name: "\0deny".to_string(),
-                fmt: status.map_or_else(String::new, |s| s.to_string()),
             },
             cond,
         });
