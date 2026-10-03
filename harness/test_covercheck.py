@@ -160,5 +160,37 @@ class EnoughProfiles(unittest.TestCase):
         self.assertTrue(covercheck.enough_profiles(0, 0))
 
 
+class StaleBinaries(unittest.TestCase):
+    """`cargo llvm-cov report` reads every executable in deps/, and an earlier tree's test
+    binaries stay there under other hashes. Their coverage maps carry that tree's line
+    numbers, all unexecuted: the gate on 5553218 reported doc comments and blank lines as
+    "changed lines no test executes" (306 binaries for 152 targets). Only what this build
+    produced may reach the report."""
+
+    def test_only_the_binaries_this_build_produced_are_kept(self):
+        with tempfile.TemporaryDirectory() as root:
+            deps = os.path.join(root, "deps")
+            os.mkdir(deps)
+
+            def exe(name):
+                path = os.path.join(deps, name)
+                open(path, "w").close()
+                os.chmod(path, 0o755)
+                return path
+            tests = {exe("reload-1111111111111111"), exe("ibex-2222222222222222")}
+            exe("reload-3333333333333333")
+            exe("ibex-4444444444444444")
+            open(os.path.join(deps, "libibex_rt-5555555555555555.rlib"), "w").close()
+            # The binary the integration tests spawn: cargo names it by its uplifted path,
+            # a hard link of the one in deps/.
+            in_deps = exe("ibex-6666666666666666")
+            uplifted = os.path.join(root, "ibex")
+            os.link(in_deps, uplifted)
+            self.assertEqual(covercheck.prune_stale_binaries(deps, tests | {uplifted}), 2)
+            self.assertEqual(sorted(os.listdir(deps)),
+                             sorted([os.path.basename(p) for p in tests | {in_deps}]
+                                    + ["libibex_rt-5555555555555555.rlib"]))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -141,6 +141,9 @@ def target_dir() -> str:
     return os.environ.get("CARGO_TARGET_DIR") or os.path.join(REPO, "target")
 
 
+built_executables: set[str] = set()
+
+
 def test_targets() -> list[tuple[str, str, list[str], str, dict]] | None:
     """Builds every test target and lists them: (package, target, selector args for `cargo
     test`, executable, the package's metadata).
@@ -158,8 +161,12 @@ def test_targets() -> list[tuple[str, str, list[str], str, dict]] | None:
         print(p.stderr[-2000:])
         return None
     found = []
+    # covercheck reports on these and nothing else (older builds' binaries share deps/).
+    built_executables.clear()
     for line in p.stdout.splitlines():
         m = json.loads(line) if line.startswith("{") else {}
+        if m.get("reason") == "compiler-artifact" and m.get("executable"):
+            built_executables.add(m["executable"])
         if m.get("reason") != "compiler-artifact" or not m["profile"]["test"] or not m.get("executable"):
             continue
         kind, name = m["target"]["kind"][0], m["target"]["name"]

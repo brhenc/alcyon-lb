@@ -176,6 +176,9 @@ def run_pooled() -> bool:
     if any("<hung>" in t for t in failed_tests.values()):
         print("covercheck: a test binary hung (SUITE_TIMEOUT)")
         return False
+    stale = prune_stale_binaries(os.path.join(tdir, "debug", "deps"), suite.built_executables)
+    if stale:
+        print(f"covercheck: removed {stale} test binaries an earlier build left in deps/")
     profraws = sum(f.endswith(".profraw") for f in os.listdir(tdir))
     binaries = _test_binaries(os.path.join(tdir, "debug", "deps"))
     if not enough_profiles(profraws, binaries):
@@ -187,6 +190,28 @@ def run_pooled() -> bool:
     if rep.returncode != 0:
         print((rep.stderr or rep.stdout)[-600:])
     return True
+
+
+def prune_stale_binaries(deps: str, current: set[str]) -> int:
+    """Deletes the executables in deps/ this build did not produce, and counts them.
+
+    `cargo llvm-cov report` reads every executable there. An earlier tree's test binary
+    (same target, another hash) carries that tree's line numbers, none executed in this run,
+    and the report then marks comments and blank lines of the current tree "not executed"."""
+    # By inode: cargo names a binary target by its uplifted copy (target/debug/ibex), a hard
+    # link of the one in deps/ that the report reads.
+    def inode(p):
+        st = os.stat(p)
+        return st.st_dev, st.st_ino
+    keep = {inode(p) for p in current if os.path.exists(p)}
+    n = 0
+    for f in os.listdir(deps) if os.path.isdir(deps) else []:
+        path = os.path.join(deps, f)
+        if ("." not in f and os.path.isfile(path) and os.access(path, os.X_OK)
+                and inode(path) not in keep):
+            os.unlink(path)
+            n += 1
+    return n
 
 
 def _test_binaries(deps: str) -> int:
