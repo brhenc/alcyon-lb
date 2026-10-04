@@ -13,6 +13,7 @@ pub mod cast;
 pub mod expr;
 pub mod fix;
 pub mod hash;
+pub mod localtime;
 pub mod matcher;
 pub mod rawpayload;
 pub mod registry;

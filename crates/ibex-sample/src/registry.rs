@@ -3433,26 +3433,29 @@ impl Registry {
 
         // `utime`, `ltime` (seconds) and their `ms_`/`us_` variants: `<fmt>[,<offset>]`, the
         // offset in the unit of the input (`sample_conv_ltime`/`sample_conv_ms_ltime` ...).
-        fn time_conv(smp: Sample, args: &[String], per_sec: i64) -> Option<Sample> {
+        fn time_conv(smp: Sample, args: &[String], per_sec: i64, local: bool) -> Option<Sample> {
             let fmt = args.first().map_or("%d/%b/%Y:%H:%M:%S", String::as_str);
             let offset = args.get(1).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
             let Sample::Sint(v) = smp else { return None };
             let v = v.checked_add(offset)?;
             let frac = u32::try_from(v.rem_euclid(per_sec) * (1_000_000_000 / per_sec)).ok()?;
-            Some(Sample::Str(format_time_ns(v.div_euclid(per_sec), frac, fmt)))
+            Some(Sample::Str(format_time_ns(v.div_euclid(per_sec), frac, fmt, local)))
         }
-        for (name, per_sec) in [
-            ("ltime", 1),
-            ("utime", 1),
-            ("ms_ltime", 1000),
-            ("ms_utime", 1000),
-            ("us_ltime", 1_000_000),
-            ("us_utime", 1_000_000),
+        for (name, per_sec, local) in [
+            ("ltime", 1, true),
+            ("utime", 1, false),
+            ("ms_ltime", 1000, true),
+            ("ms_utime", 1000, false),
+            ("us_ltime", 1_000_000, true),
+            ("us_utime", 1_000_000, false),
         ] {
-            let func: ConvFn = match per_sec {
-                1 => |smp, args| time_conv(smp, args, 1),
-                1000 => |smp, args| time_conv(smp, args, 1000),
-                _ => |smp, args| time_conv(smp, args, 1_000_000),
+            let func: ConvFn = match (per_sec, local) {
+                (1, true) => |smp, args| time_conv(smp, args, 1, true),
+                (1, false) => |smp, args| time_conv(smp, args, 1, false),
+                (1000, true) => |smp, args| time_conv(smp, args, 1000, true),
+                (1000, false) => |smp, args| time_conv(smp, args, 1000, false),
+                (_, true) => |smp, args| time_conv(smp, args, 1_000_000, true),
+                (_, false) => |smp, args| time_conv(smp, args, 1_000_000, false),
             };
             self.register_converter(ConvDesc {
                 name,
@@ -4617,12 +4620,12 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 }
 
 fn format_time(epoch: i64, format: &str) -> String {
-    format_time_ns(epoch, 0, format)
+    format_time_ns(epoch, 0, format, false)
 }
 
 /// `epoch` seconds and `nanos` nanoseconds; `%N` prints the nanoseconds on 9 digits and
 /// `%<n>N` the first `n` of them, as the date converters in `HAProxy` do.
-fn format_time_ns(epoch: i64, nanos: u32, format: &str) -> String {
+fn format_time_ns(epoch: i64, nanos: u32, format: &str, local: bool) -> String {
     use std::fmt::Write;
 
     const MONTHS: [&str; 12] = [
@@ -4643,7 +4646,9 @@ fn format_time_ns(epoch: i64, nanos: u32, format: &str) -> String {
         "Wednesday",
     ];
 
-    let (days, secs) = split_epoch(epoch);
+    let zone = crate::localtime::zone();
+    let offset = if local { zone.offset_at(epoch) } else { 0 };
+    let (days, secs) = split_epoch(epoch + i64::from(offset));
 
     let (y, m, d) = civil_from_days(days);
     let wday_idx = weekday_index(days);
@@ -4682,7 +4687,12 @@ fn format_time_ns(epoch: i64, nanos: u32, format: &str) -> String {
                         let digits = usize::from(spec as u8 - b'0');
                         let _ = write!(out, "{}", &format!("{nanos:09}")[..digits]);
                     }
-                    'z' | 'Z' => out.push_str("GMT"),
+                    'z' => {
+                        let sign = if offset < 0 { '-' } else { '+' };
+                        let mins = offset.unsigned_abs() / 60;
+                        let _ = write!(out, "{sign}{:02}{:02}", mins / 60, mins % 60);
+                    }
+                    'Z' => out.push_str(if local { zone.abbr_at(epoch) } else { "GMT" }),
                     '%' => out.push('%'),
                     other => {
                         out.push('%');

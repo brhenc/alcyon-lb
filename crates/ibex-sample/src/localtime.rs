@@ -19,6 +19,9 @@ use std::sync::OnceLock;
 pub struct Zone {
     transitions: Vec<(i64, i32)>,
     initial: i32,
+    /// The abbreviation of each transition's type (`CEST`), and of the initial one.
+    abbrs: Vec<String>,
+    initial_abbr: String,
 }
 
 impl Zone {
@@ -29,6 +32,16 @@ impl Zone {
             0 => self.initial,
             n => self.transitions[n - 1].1,
         }
+    }
+
+    /// The zone's abbreviation (`CEST`) at `unix` seconds; `UTC` for no zone file.
+    #[must_use]
+    pub fn abbr_at(&self, unix: i64) -> &str {
+        let abbr = match self.transitions.partition_point(|&(t, _)| t <= unix) {
+            0 => &self.initial_abbr,
+            n => &self.abbrs[n - 1],
+        };
+        if abbr.is_empty() { "UTC" } else { abbr }
     }
 
     /// Parses a TZif file (RFC 8536), version 1 or later. Uses the 64-bit section when
@@ -54,7 +67,7 @@ impl Zone {
         } else {
             (0, 4)
         };
-        let [_, _, _, time, typ, _] = header(at)?;
+        let [_, _, _, time, typ, nchars] = header(at)?;
         let mut o = at + 44;
         let mut times = Vec::with_capacity(time);
         for _ in 0..time {
@@ -69,16 +82,25 @@ impl Zone {
         let idx = data.get(o..o + time)?.to_vec();
         o += time;
         let mut offsets = Vec::with_capacity(typ);
+        let mut abbr_idx = Vec::with_capacity(typ);
         for _ in 0..typ {
             offsets.push(i32::from_be_bytes(data.get(o..o + 4)?.try_into().ok()?));
+            abbr_idx.push(usize::from(*data.get(o + 5)?));
             o += 6;
         }
+        let chars = data.get(o..o + nchars)?;
+        let abbr_of = |t: usize| -> String {
+            let from = abbr_idx.get(t).copied().unwrap_or(0).min(chars.len());
+            let end = chars[from..].iter().position(|&c| c == 0).map_or(chars.len(), |e| from + e);
+            String::from_utf8_lossy(&chars[from..end]).into_owned()
+        };
+        let abbrs = idx.iter().map(|&i| abbr_of(usize::from(i))).collect();
         let transitions = times
             .into_iter()
             .zip(idx)
             .map(|(t, i)| Some((t, *offsets.get(usize::from(i))?)))
             .collect::<Option<Vec<_>>>()?;
-        Some(Zone { transitions, initial: offsets.first().copied().unwrap_or(0) })
+        Some(Zone { transitions, initial: offsets.first().copied().unwrap_or(0), abbrs, initial_abbr: abbr_of(0) })
     }
 }
 
@@ -89,7 +111,7 @@ pub fn zone() -> &'static Zone {
         let path = std::env::var("TZ")
             .ok()
             .and_then(|tz| tz.strip_prefix(':').map(str::to_string).or(Some(tz)))
-            .filter(|tz| tz.starts_with('/'))
+            .map(|tz| if tz.starts_with('/') { tz } else { format!("/usr/share/zoneinfo/{tz}") })
             .unwrap_or_else(|| "/etc/localtime".to_string());
         std::fs::read(path).ok().and_then(|d| Zone::parse(&d)).unwrap_or_default()
     })
