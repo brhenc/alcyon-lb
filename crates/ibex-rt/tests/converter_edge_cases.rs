@@ -198,6 +198,79 @@ fn secure_memcmp_compares_against_a_variable() {
     assert_eq!(run(text, &reqs), ["true", "true", "false", "false"].map(|v| vec![format!("x-match: {v}")]));
 }
 
+/// `reg-tests/converter/time.vtc`: utime/ltime in s, ms and us, offsets in the input unit,
+/// `%N`, `%3N`, `%6N`, and http_date's ms/us units.
+#[test]
+fn date_converters_handle_units_offsets_and_fractions() {
+    let h = |name: &str, expr: &str| format!("  http-after-response set-header x-{name} \"%[{expr}]\"\n");
+    let mut rules = String::from("  http-request return status 200\n");
+    for (n, e) in [
+        ("utime", "int(1000000000),utime(%Y-%m-%dT%H:%M:%S)"),
+        ("utime-p", "int(1000000000),utime(%Y-%m-%dT%H:%M:%S,60)"),
+        ("utime-n", "int(1000000000),utime(%Y-%m-%dT%H:%M:%S,-100)"),
+        ("msu", "int(1234567890123),ms_utime(%Y-%m-%dT%H:%M:%S.%3N)"),
+        ("msu-6", "int(1234567890123),ms_utime(%6N)"),
+        ("msu-9", "int(1234567890123),ms_utime(%N)"),
+        ("msu-p", "int(1234567890123),ms_utime(%H:%M:%S.%3N,877)"),
+        ("usu", "int(1234567890123456),us_utime(%Y-%m-%dT%H:%M:%S.%6N)"),
+        ("usu-3", "int(1234567890123456),us_utime(%3N)"),
+        ("usu-9", "int(1234567890123456),us_utime(%N)"),
+        ("usu-n", "int(1234567890123456),us_utime(%H:%M:%S.%6N,-123456)"),
+        ("msl", "int(1234567890123),ms_ltime(%S.%3N)"),
+        ("usl", "int(1234567890123456),us_ltime(%S.%6N)"),
+        ("hdate", "int(1000000000),http_date"),
+        ("hdate-o", "int(1000000000),http_date(3600)"),
+        ("hdate-ms", "int(1000000000123),http_date(0,ms)"),
+        ("hdate-us", "int(1000000000123456),http_date(0,us)"),
+        ("hdate-mo", "int(1000000000123),http_date(-1000,ms)"),
+        ("hdate-pd", "int(1000000000023),http_date(0,ms)"),
+        ("hdate-pu", "int(1000000000000023),http_date(0,us)"),
+        ("acc-s", "accept_date"),
+        ("acc-ms", "accept_date(ms),div(1000)"),
+        ("acc-us", "accept_date(us),div(1000000)"),
+        ("date-s", "date"),
+        ("date-ms", "date(0,ms),div(1000)"),
+        ("date-us", "date(0,us),div(1000000)"),
+    ] {
+        rules.push_str(&h(n, e));
+    }
+    let got = run(&rules, &[&get("/")]);
+    let hdrs: std::collections::HashMap<String, String> = got[0]
+        .iter()
+        .filter_map(|l| l.split_once(": "))
+        .map(|(k, v)| (k.to_ascii_lowercase().trim_start_matches("x-").to_string(), v.to_string()))
+        .collect();
+    let want = [
+        ("utime", "2001-09-09T01:46:40"),
+        ("utime-p", "2001-09-09T01:47:40"),
+        ("utime-n", "2001-09-09T01:45:00"),
+        ("msu", "2009-02-13T23:31:30.123"),
+        ("msu-6", "123000"),
+        ("msu-9", "123000000"),
+        ("msu-p", "23:31:31.000"),
+        ("usu", "2009-02-13T23:31:30.123456"),
+        ("usu-3", "123"),
+        ("usu-9", "123456000"),
+        ("usu-n", "23:31:30.000000"),
+        ("msl", "30.123"),
+        ("usl", "30.123456"),
+        ("hdate", "Sun, 09 Sep 2001 01:46:40 GMT"),
+        ("hdate-o", "Sun, 09 Sep 2001 02:46:40 GMT"),
+        ("hdate-ms", "Sun, 09 Sep 2001 01:46:40.123 GMT"),
+        ("hdate-us", "Sun, 09 Sep 2001 01:46:40.123456 GMT"),
+        ("hdate-mo", "Sun, 09 Sep 2001 01:46:39.123 GMT"),
+        ("hdate-pd", "Sun, 09 Sep 2001 01:46:40.023 GMT"),
+        ("hdate-pu", "Sun, 09 Sep 2001 01:46:40.000023 GMT"),
+    ];
+    for (k, v) in want {
+        assert_eq!(hdrs.get(k).map(String::as_str), Some(v), "header {k}");
+    }
+    assert_eq!(hdrs.get("acc-ms"), hdrs.get("acc-s"));
+    assert_eq!(hdrs.get("acc-us"), hdrs.get("acc-s"));
+    assert_eq!(hdrs.get("date-ms"), hdrs.get("date-s"));
+    assert_eq!(hdrs.get("date-us"), hdrs.get("date-s"));
+}
+
 #[test]
 fn set_var_with_a_failing_converter_leaves_the_variable_alone() {
     let rules = "  http-request set-var(txn.a) str(one)\n\

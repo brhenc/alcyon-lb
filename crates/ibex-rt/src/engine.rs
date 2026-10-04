@@ -1072,6 +1072,7 @@ fn stream_sample_ctx<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, view: 
         captures_req_hdr: Some(&s.log.req_captures),
         captures_res_hdr: Some(&s.log.res_captures),
         unique_id: s.log.unique_id.as_deref(),
+        accept_date: Some(s.log.date),
         last_rule: last_rule_at(s.log.last_rule),
         ..Default::default()
     }
@@ -2941,6 +2942,7 @@ fn eval_tcp_req_session_rules(
         proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
         act_conn: proxy.stats[worker_id()].act_conn.load(Ordering::Relaxed),
         unique_id: sess.log.unique_id.as_deref(),
+        accept_date: Some(sess.log.date),
         captures_req_hdr: Some(&sess.log.req_captures),
         captures_res_hdr: Some(&sess.log.res_captures),
         ..Default::default()
@@ -3207,6 +3209,7 @@ fn eval_tcp_req_content_rules(
         req_headers: sess.req_headers.as_deref(),
         act_conn: proxy.stats[worker_id()].act_conn.load(Ordering::Relaxed),
         unique_id: sess.log.unique_id.as_deref(),
+        accept_date: Some(sess.log.date),
         last_rule: last_rule_at(sess.log.last_rule),
         captures_req_hdr: Some(&sess.log.req_captures),
         captures_res_hdr: Some(&sess.log.res_captures),
@@ -3500,6 +3503,7 @@ fn eval_tcp_res_content_rules(proxy: &Proxy, proxies: &[Proxy], registry: &Regis
         raw_res: Some(rep_bytes),
         act_conn: proxy.stats[worker_id()].act_conn.load(Ordering::Relaxed),
         unique_id: sess.log.unique_id.as_deref(),
+        accept_date: Some(sess.log.date),
         captures_req_hdr: Some(&sess.log.req_captures),
         captures_res_hdr: Some(&sess.log.res_captures),
         ..Default::default()
@@ -4635,6 +4639,7 @@ impl EngineDispatcher<'_> {
             req_headers: sess.req_headers.as_deref(),
             act_conn: proxy.stats[worker_id()].act_conn.load(Ordering::Relaxed),
             unique_id: sess.log.unique_id.as_deref(),
+            accept_date: Some(sess.log.date),
             captures_req_hdr: Some(&sess.log.req_captures),
             captures_res_hdr: Some(&sess.log.res_captures),
             ..Default::default()
@@ -5506,6 +5511,7 @@ impl EngineDispatcher<'_> {
             res_version: Some(&proto_version),
             res_body: has_wait.then_some(res_body.as_slice()),
             unique_id: entry.sess.log.unique_id.as_deref(),
+            accept_date: Some(entry.sess.log.date),
             last_rule: last_rule_at(entry.sess.log.last_rule),
             captures_req_hdr: Some(&entry.sess.log.req_captures),
             captures_res_hdr: Some(&res_caps_in),
@@ -6112,6 +6118,7 @@ impl EngineDispatcher<'_> {
             fe_name: Some(&proxies[proxy_idx].name),
             act_conn: proxies[proxy_idx].stats[worker_id()].act_conn.load(Ordering::Relaxed),
             unique_id: entry.sess.log.unique_id.as_deref(),
+            accept_date: Some(entry.sess.log.date),
             captures_req_hdr: Some(&entry.sess.log.req_captures),
             captures_res_hdr: Some(&entry.sess.log.res_captures),
             ..Default::default()
@@ -6234,6 +6241,7 @@ impl EngineDispatcher<'_> {
                         be_name,
                         captures_req_hdr: Some(&$s.log.req_captures),
                         unique_id: $s.log.unique_id.as_deref(),
+                        accept_date: Some($s.log.date),
                         last_rule: last_rule_at($s.log.last_rule),
                         be_max_retries: Some(be_retries),
                         cur_max_retries: Some($s.max_retries),
@@ -8687,6 +8695,7 @@ fn after_res_on_reply<'r>(
             cur_max_retries: Some(sess.max_retries),
             res_version: Some(&version),
             unique_id: sess.log.unique_id.as_deref(),
+            accept_date: Some(sess.log.date),
             captures_req_hdr: Some(&sess.log.req_captures),
             captures_res_hdr: Some(&res_caps_in),
             ..Default::default()

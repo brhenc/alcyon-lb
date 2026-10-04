@@ -128,6 +128,8 @@ pub struct SampleContext<'a> {
     /// The file and line of the last rule that ended a rule set for the request
     /// (`last_rule_file`, `last_rule_line`); `None` where no rule did.
     pub last_rule: Option<(&'a str, u32)>,
+    /// When the stream was accepted, as unix seconds and milliseconds: `accept_date`.
+    pub accept_date: Option<(i64, u32)>,
     pub is_first_req: bool,
     pub vars: Option<&'a HashMap<String, String>>,
     pub timeouts: Option<&'a HashMap<String, u32>>,
@@ -1967,16 +1969,34 @@ impl Registry {
                 std::env::var(var_name).ok().map(Sample::Str)
             },
         });
-        let date_fetch: FetchFn = |_ctx, _args| {
+        // `date([<offset>],[<unit>])`: now, in seconds, `ms` or `us`; the offset is in that
+        // unit (measured on HAProxy 3.5-dev8: `date(3600,ms)` is 3.6 seconds ahead).
+        let date_fetch: FetchFn = |_ctx, args| {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default();
-            Some(Sample::Sint(u64_to_sint(now.as_secs())))
+            let offset = args.first().filter(|a| !a.is_empty()).map_or(Some(0), |a| a.parse::<i64>().ok())?;
+            let v = match args.get(1).map_or("s", String::as_str) {
+                "s" | "" => u64_to_sint(now.as_secs()),
+                "ms" => i64::try_from(now.as_millis()).ok()?,
+                "us" => i64::try_from(now.as_micros()).ok()?,
+                _ => return None,
+            };
+            Some(Sample::Sint(v.checked_add(offset)?))
         };
+        // `accept_date[(<unit>)]`: when the stream was accepted (milliseconds resolution).
         self.register_fetch(FetchDesc {
-            name: "date",
+            name: "accept_date",
             out_type: SampleType::Sint,
-            func: date_fetch,
+            func: |ctx, args| {
+                let (secs, ms) = ctx.accept_date?;
+                match args.first().map_or("s", String::as_str) {
+                    "s" | "" => Some(Sample::Sint(secs)),
+                    "ms" => Some(Sample::Sint(secs * 1000 + i64::from(ms))),
+                    "us" => Some(Sample::Sint((secs * 1000 + i64::from(ms)) * 1000)),
+                    _ => None,
+                }
+            },
         });
         self.register_fetch(FetchDesc {
             name: "epoch",
@@ -3366,11 +3386,24 @@ impl Registry {
             in_type: TypeSpec::Exact(SampleType::Sint),
             out_type: TypeSpec::Exact(SampleType::Str),
             func: |smp, args| {
+                // `http_date([<offset>[,<unit>]])`: the unit (s, ms or us) is the input's and
+                // the offset's; ms and us add a fractional part.
                 let offset = args.first().and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
-                match smp {
-                    Sample::Sint(epoch) => Some(Sample::Str(format_http_date(epoch + offset))),
-                    _ => None,
+                let (per_sec, digits) = match args.get(1).map(String::as_str) {
+                    None | Some("s") => (1, 0),
+                    Some("ms") => (1000, 3),
+                    Some("us") => (1_000_000, 6),
+                    Some(_) => return None,
+                };
+                let Sample::Sint(v) = smp else { return None };
+                let v = v.checked_add(offset)?;
+                let date = format_http_date(v.div_euclid(per_sec));
+                if digits == 0 {
+                    return Some(Sample::Str(date));
                 }
+                let frac = v.rem_euclid(per_sec);
+                let (head, _) = date.rsplit_once(" GMT")?;
+                Some(Sample::Str(format!("{head}.{frac:0digits$} GMT")))
             },
         });
 
@@ -3384,74 +3417,36 @@ impl Registry {
             },
         });
 
-        let ltime_conv: ConvFn = |smp, args| {
+        // `utime`, `ltime` (seconds) and their `ms_`/`us_` variants: `<fmt>[,<offset>]`, the
+        // offset in the unit of the input (`sample_conv_ltime`/`sample_conv_ms_ltime` ...).
+        fn time_conv(smp: Sample, args: &[String], per_sec: i64) -> Option<Sample> {
             let fmt = args.first().map_or("%d/%b/%Y:%H:%M:%S", String::as_str);
             let offset = args.get(1).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
-            match smp {
-                Sample::Sint(epoch) => Some(Sample::Str(format_time(epoch + offset, fmt))),
-                _ => None,
-            }
-        };
-        self.register_converter(ConvDesc {
-            name: "ltime",
-            in_type: TypeSpec::Exact(SampleType::Sint),
-            out_type: TypeSpec::Exact(SampleType::Str),
-            func: ltime_conv,
-        });
-        self.register_converter(ConvDesc {
-            name: "utime",
-            in_type: TypeSpec::Exact(SampleType::Sint),
-            out_type: TypeSpec::Exact(SampleType::Str),
-            func: ltime_conv,
-        });
-        self.register_converter(ConvDesc {
-            name: "ms_ltime",
-            in_type: TypeSpec::Exact(SampleType::Sint),
-            out_type: TypeSpec::Exact(SampleType::Str),
-            func: |smp, args| {
-                let fmt = args.first().map_or("%d/%b/%Y:%H:%M:%S", String::as_str);
-                match smp {
-                    Sample::Sint(ms) => Some(Sample::Str(format_time(ms / 1000, fmt))),
-                    _ => None,
-                }
-            },
-        });
-        self.register_converter(ConvDesc {
-            name: "us_ltime",
-            in_type: TypeSpec::Exact(SampleType::Sint),
-            out_type: TypeSpec::Exact(SampleType::Str),
-            func: |smp, args| {
-                let fmt = args.first().map_or("%d/%b/%Y:%H:%M:%S", String::as_str);
-                match smp {
-                    Sample::Sint(us) => Some(Sample::Str(format_time(us / 1_000_000, fmt))),
-                    _ => None,
-                }
-            },
-        });
-        self.register_converter(ConvDesc {
-            name: "ms_utime",
-            in_type: TypeSpec::Exact(SampleType::Sint),
-            out_type: TypeSpec::Exact(SampleType::Str),
-            func: |smp, args| {
-                let fmt = args.first().map_or("%d/%b/%Y:%H:%M:%S", String::as_str);
-                match smp {
-                    Sample::Sint(ms) => Some(Sample::Str(format_time(ms / 1000, fmt))),
-                    _ => None,
-                }
-            },
-        });
-        self.register_converter(ConvDesc {
-            name: "us_utime",
-            in_type: TypeSpec::Exact(SampleType::Sint),
-            out_type: TypeSpec::Exact(SampleType::Str),
-            func: |smp, args| {
-                let fmt = args.first().map_or("%d/%b/%Y:%H:%M:%S", String::as_str);
-                match smp {
-                    Sample::Sint(us) => Some(Sample::Str(format_time(us / 1_000_000, fmt))),
-                    _ => None,
-                }
-            },
-        });
+            let Sample::Sint(v) = smp else { return None };
+            let v = v.checked_add(offset)?;
+            let frac = u32::try_from(v.rem_euclid(per_sec) * (1_000_000_000 / per_sec)).ok()?;
+            Some(Sample::Str(format_time_ns(v.div_euclid(per_sec), frac, fmt)))
+        }
+        for (name, per_sec) in [
+            ("ltime", 1),
+            ("utime", 1),
+            ("ms_ltime", 1000),
+            ("ms_utime", 1000),
+            ("us_ltime", 1_000_000),
+            ("us_utime", 1_000_000),
+        ] {
+            let func: ConvFn = match per_sec {
+                1 => |smp, args| time_conv(smp, args, 1),
+                1000 => |smp, args| time_conv(smp, args, 1000),
+                _ => |smp, args| time_conv(smp, args, 1_000_000),
+            };
+            self.register_converter(ConvDesc {
+                name,
+                in_type: TypeSpec::Exact(SampleType::Sint),
+                out_type: TypeSpec::Exact(SampleType::Str),
+                func,
+            });
+        }
 
         // --- 8. Stick table, server and frontend converters ---
         //
@@ -4612,6 +4607,12 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 }
 
 fn format_time(epoch: i64, format: &str) -> String {
+    format_time_ns(epoch, 0, format)
+}
+
+/// `epoch` seconds and `nanos` nanoseconds; `%N` prints the nanoseconds on 9 digits and
+/// `%<n>N` the first `n` of them, as the date converters in `HAProxy` do.
+fn format_time_ns(epoch: i64, nanos: u32, format: &str) -> String {
     use std::fmt::Write;
 
     const MONTHS: [&str; 12] = [
@@ -4665,6 +4666,12 @@ fn format_time(epoch: i64, format: &str) -> String {
                     'T' => { let _ = write!(out, "{hour:02}:{min:02}:{sec:02}"); }
                     'F' => { let _ = write!(out, "{y:04}-{m:02}-{d:02}"); }
                     's' => out.push_str(&epoch.to_string()),
+                    'N' => { let _ = write!(out, "{nanos:09}"); }
+                    '1'..='9' if chars.peek() == Some(&'N') => {
+                        chars.next();
+                        let digits = usize::from(spec as u8 - b'0');
+                        let _ = write!(out, "{}", &format!("{nanos:09}")[..digits]);
+                    }
                     'z' | 'Z' => out.push_str("GMT"),
                     '%' => out.push('%'),
                     other => {
