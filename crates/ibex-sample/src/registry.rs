@@ -142,6 +142,8 @@ pub struct SampleContext<'a> {
     /// The file and line of the last rule that ended a rule set for the request
     /// (`last_rule_file`, `last_rule_line`); `None` where no rule did.
     pub last_rule: Option<(&'a str, u32)>,
+    /// The stream's priority class and offset (`prio_class`, `prio_offset`).
+    pub prio: (i32, i32),
     /// When the stream was accepted, as unix seconds and milliseconds: `accept_date`.
     pub accept_date: Option<(i64, u32)>,
     /// What `when()` reads of the stream; `None` is a stream that has done nothing yet.
@@ -1098,6 +1100,11 @@ impl Registry {
             out_type: SampleType::Sint,
             func: req_hdr_cnt_fetch,
         });
+        self.register_fetch(FetchDesc {
+            name: "req.fhdr_cnt",
+            out_type: SampleType::Sint,
+            func: req_hdr_cnt_fetch,
+        });
 
         self.register_fetch(FetchDesc {
             name: "res.hdr_cnt",
@@ -1466,6 +1473,16 @@ impl Registry {
             name: "last_rule_file",
             out_type: SampleType::Str,
             func: |ctx, _args| ctx.last_rule.map(|(file, _)| Sample::Str(file.to_string())),
+        });
+        self.register_fetch(FetchDesc {
+            name: "prio_class",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| Some(Sample::Sint(i64::from(ctx.prio.0))),
+        });
+        self.register_fetch(FetchDesc {
+            name: "prio_offset",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| Some(Sample::Sint(i64::from(ctx.prio.1))),
         });
         self.register_fetch(FetchDesc {
             name: "last_rule_line",
@@ -1873,6 +1890,9 @@ impl Registry {
             out_type: SampleType::Sint,
             func: |ctx, args| ctx.proxies?.table_usage(source_tables(ctx, args).first()?).map(|(_, avl)| Sample::Sint(avl)),
         });
+
+        crate::auth::register(self);
+        crate::rfc7239::register(self);
 
         // --- 11. Timeout Fetches ---
         macro_rules! reg_timeout_fetch {
@@ -4621,6 +4641,11 @@ pub fn sample_to_string(smp: &Sample) -> String {
     }
 }
 
+/// The first `name` header of the request.
+pub(crate) fn request_header(ctx: &SampleContext, name: &str) -> Option<String> {
+    get_req_header(ctx, name)
+}
+
 fn get_req_header(ctx: &SampleContext, name: &str) -> Option<String> {
     if let Some(htx) = ctx.htx_slice {
         if let Some(v) = htx.get_header(name) {
@@ -5065,7 +5090,7 @@ fn base64_encode(data: &[u8], url_safe: bool) -> String {
 }
 
 #[allow(clippy::naive_bytecount)]
-fn base64_decode(input: &str, url_safe: bool, strict_padding: bool) -> Option<Vec<u8>> {
+pub(crate) fn base64_decode(input: &str, url_safe: bool, strict_padding: bool) -> Option<Vec<u8>> {
     fn decode_char(c: u8, url_safe: bool) -> Option<u8> {
         match c {
             b'A'..=b'Z' => Some(c - b'A'),

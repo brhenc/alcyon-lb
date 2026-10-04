@@ -198,17 +198,6 @@ impl StickEntryData {
         tick(&mut self.http_req_rate, 1);
     }
 
-    /// A request the proxy or the server answered with `status`: `http_err_*` for the 4xx
-    /// (`http-err-codes`, 400 to 499), `http_fail_*` for the 5xx but 501 and 505
-    /// (`http-fail-codes`, 500 to 599 without those two).
-    pub fn count_response_class(&mut self, status: u16) {
-        match status {
-            400..=499 => self.count_err(),
-            500 | 502..=504 | 506..=599 => self.count_fail(),
-            _ => {}
-        }
-    }
-
     /// `stream_inc_http_err_ctr`: a request in error.
     pub fn count_err(&mut self) {
         self.http_err_cnt += 1;

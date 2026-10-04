@@ -405,6 +405,8 @@ enum ArgKind {
     Server,
     /// `[<table>]`, defaulting to the current proxy (`ARGT_TAB`).
     Table,
+    /// `<userlist>` (`ARGT_USR`), with no default.
+    Userlist,
 }
 
 /// Where a fetch's argument that names something is, and what it names.
@@ -436,6 +438,7 @@ fn fetch_arg(name: &str) -> Option<ArgSpec> {
         "nbsrv" | "be_conn_free" | "be_sess_rate" => at(ArgKind::Backend, 0),
         "srv_is_up" | "srv_conn" | "srv_conn_free" | "srv_sess_rate" => at(ArgKind::Server, 0),
         "fe_conn" | "fe_sess_rate" | "fe_req_rate" => at(ArgKind::Frontend, 0),
+        "http_auth" | "http_auth_group" => at(ArgKind::Userlist, 0),
         "table_cnt" | "table_avl" => at(ArgKind::Table, 0),
         _ => {
             // `sc_<what>(<ctr>[,<table>])`, `sc[0-9]_<what>([<table>])`, `src_<what>(<table>)`.
@@ -609,6 +612,13 @@ fn resolve(config: &Config, at: Where<'_>, spec: ArgSpec, arg: Option<&str>, wha
                 Err(format!("unable to find server '{srv}' in proxy '{px}', referenced in arg {n} of {what}"))
             }
         }
+        ArgKind::Userlist => match arg {
+            None => Err(format!("missing userlist name in arg {n} of {what}")),
+            Some(u) if !config.userlists.iter().any(|l| l.name == u) => {
+                Err(format!("unable to find userlist '{u}' referenced in arg {n} of {what}"))
+            }
+            Some(_) => Ok(()),
+        },
         ArgKind::Table => match arg.or(cur) {
             Some(t) if !has_table(config, t) => Err(format!("unable to find table '{t}' referenced in arg {n} of {what}")),
             Some(_) => Ok(()),

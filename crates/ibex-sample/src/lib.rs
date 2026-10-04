@@ -9,6 +9,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod auth;
 pub mod cast;
 pub mod expr;
 pub mod fix;
@@ -16,9 +17,11 @@ pub mod hash;
 pub mod localtime;
 pub mod matcher;
 pub mod rawpayload;
+pub mod rfc7239;
 pub mod registry;
 pub mod sample;
 
+pub use auth::{set_userlists, AuthUser, AuthUserlist};
 pub use cast::{can_cast, cast};
 pub use expr::Expr;
 pub use matcher::{IntOp, IntRange, Matcher};

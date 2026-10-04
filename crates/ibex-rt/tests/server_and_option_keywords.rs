@@ -332,14 +332,14 @@ fn option_redispatch_in_defaults_is_inherited() {
 }
 
 /// An option that changes what reaches the server is refused rather than ignored.
-/// `HAProxy` 3.5-dev8 accepts `option forwarded` in a backend and adds a `forwarded`
-/// header; Ibex has no RFC 7239 support, and the server would see only what the client
-/// sent. A tuning option is accepted with a warning.
+/// `HAProxy` 3.5-dev8 accepts `option http-drop-request-trailers` in a backend and drops the
+/// request's trailers; Ibex does not, and the server would receive them. (`option forwarded`
+/// was the example until T124 implemented it.) A tuning option is accepted with a warning.
 #[test]
 fn ibex_c_refuses_an_option_it_cannot_honour_and_warns_about_tuning() {
-    let (code, text) = check("forwarded.cfg", &format!("{DEFAULTS}backend b\n  option forwarded\n  server s1 127.0.0.1:8080\n"));
-    assert_ne!(code, Some(0), "`option forwarded` was accepted and would do nothing:\n{text}");
-    assert!(text.contains("'forwarded'") || text.contains("option forwarded"), "{text}");
+    let (code, text) = check("trailers.cfg", &format!("{DEFAULTS}backend b\n  option http-drop-request-trailers\n  server s1 127.0.0.1:8080\n"));
+    assert_ne!(code, Some(0), "`option http-drop-request-trailers` was accepted and would do nothing:\n{text}");
+    assert!(text.contains("http-drop-request-trailers"), "{text}");
 
     let (code, text) = check("tcpka.cfg", &format!("{DEFAULTS}backend b\n  option srvtcpka\n  server s1 127.0.0.1:8080\n"));
     assert_eq!(code, Some(0), "{text}");

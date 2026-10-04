@@ -46,6 +46,10 @@ pub struct DefaultsSection {
     pub buffer_request: bool,
     /// `option forwardfor` in `defaults`: the `except` network, empty for none.
     pub forwardfor: Option<String>,
+    /// `option forwardfor ... if-none` (without it, `HAProxy` adds the header always).
+    pub forwardfor_if_none: bool,
+    /// `option forwarded`: the RFC 7239 header parameters to add; `None` when it is off.
+    pub forwarded: Option<Box<Forwarded>>,
     /// `option originalto` in `defaults`: the `except` network, empty for none.
     pub originalto: Option<String>,
     /// Default TCP request inspection delay.
@@ -257,6 +261,10 @@ pub struct ListenSection {
     pub accept_proxy_v2: bool,
     /// Forwardfor header options.
     pub forwardfor: Option<String>,
+    /// `option forwardfor ... if-none` (without it, `HAProxy` adds the header always).
+    pub forwardfor_if_none: bool,
+    /// `option forwarded`: the RFC 7239 header parameters to add; `None` when it is off.
+    pub forwarded: Option<Box<Forwarded>>,
     /// Originalto header options.
     pub originalto: Option<String>,
     /// Default server options applied to all servers in this listen section.
@@ -306,6 +314,10 @@ pub struct StatsConfig {
     pub show_node: Option<String>,
     pub raw_timeouts: TimeoutConfig,
     pub forwardfor: Option<String>,
+    /// `option forwardfor ... if-none` (without it, `HAProxy` adds the header always).
+    pub forwardfor_if_none: bool,
+    /// `option forwarded`: the RFC 7239 header parameters to add; `None` when it is off.
+    pub forwarded: Option<Box<Forwarded>>,
     pub originalto: Option<String>,
     pub maxrewrite: Option<usize>,
     /// `option accept-unsafe-violations-in-http-request`: a `#` in the request target (and a
@@ -371,6 +383,8 @@ impl Default for ListenSection {
             hash_type: None,
             hash_preserve_affinity: None,
             forwardfor: None,
+            forwardfor_if_none: false,
+            forwarded: None,
             originalto: None,
             stats: StatsConfig::default(),
             httpchk: None,
@@ -466,6 +480,8 @@ pub struct FrontendSection {
     pub accept_proxy_v2: bool,
     /// Forwardfor header options.
     pub forwardfor: Option<String>,
+    /// `option forwardfor ... if-none` (without it, `HAProxy` adds the header always).
+    pub forwardfor_if_none: bool,
     /// Originalto header options.
     pub originalto: Option<String>,
     /// Stats applet and dashboard configuration.
@@ -517,6 +533,7 @@ impl Default for FrontendSection {
             accept_proxy: false,
             accept_proxy_v2: false,
             forwardfor: None,
+            forwardfor_if_none: false,
             originalto: None,
             stats: StatsConfig::default(),
             error_files: HashMap::new(),
@@ -604,6 +621,10 @@ pub struct BackendSection {
     pub http_after_res_rules: Vec<HttpAfterResRule>,
     /// Forwardfor header options.
     pub forwardfor: Option<String>,
+    /// `option forwardfor ... if-none` (without it, `HAProxy` adds the header always).
+    pub forwardfor_if_none: bool,
+    /// `option forwarded`: the RFC 7239 header parameters to add; `None` when it is off.
+    pub forwarded: Option<Box<Forwarded>>,
     /// Originalto header options.
     pub originalto: Option<String>,
     /// HTTP connection reuse strategy (`http-reuse`).
@@ -675,6 +696,8 @@ impl Default for BackendSection {
             http_res_rules: Vec::new(),
             http_after_res_rules: Vec::new(),
             forwardfor: None,
+            forwardfor_if_none: false,
+            forwarded: None,
             originalto: None,
             http_reuse: None,
             hash_type: None,

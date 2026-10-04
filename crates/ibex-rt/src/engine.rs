@@ -1330,6 +1330,7 @@ fn stream_sample_ctx<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, view: 
         unique_id: s.log.unique_id.as_deref(),
         accept_date: Some(s.log.date),
         last_rule: last_rule_at(s.log.last_rule),
+        prio: (s.log.prio_class, s.log.prio_offset),
         ..Default::default()
     }
 }
@@ -1785,6 +1786,8 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, list
             let mut sc = listen.stats.clone();
             sc.raw_timeouts = listen.timeouts;
             sc.forwardfor.clone_from(&listen.forwardfor);
+            sc.forwardfor_if_none = listen.forwardfor_if_none;
+            sc.forwarded.clone_from(&listen.forwarded);
             sc.originalto.clone_from(&listen.originalto);
             sc
         },
@@ -1902,6 +1905,7 @@ fn init_proxy_from_frontend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, fe
             let mut sc = fe.stats.clone();
             sc.raw_timeouts = fe.timeouts;
             sc.forwardfor.clone_from(&fe.forwardfor);
+            sc.forwardfor_if_none = fe.forwardfor_if_none;
             sc.originalto.clone_from(&fe.originalto);
             sc
         },
@@ -2043,6 +2047,8 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, be:
             let mut sc = be.stats.clone();
             sc.raw_timeouts = be.timeouts;
             sc.forwardfor.clone_from(&be.forwardfor);
+            sc.forwardfor_if_none = be.forwardfor_if_none;
+            sc.forwarded.clone_from(&be.forwarded);
             sc.originalto.clone_from(&be.originalto);
             sc
         },
@@ -2125,6 +2131,120 @@ fn init_checks(proxies: &[Proxy], scheduler: &mut Scheduler, now: Tick) -> Vec<S
     checks
 }
 
+thread_local! {
+    /// `http-err-codes` and `http-fail-codes` (`global`), the statuses that count in the
+    /// `http_err_cnt` and `http_fail_cnt` of the tracked entries.
+    static HTTP_ERR_CODES: std::cell::Cell<ibex_config::StatusCodeSet> = const { std::cell::Cell::new(ibex_config::StatusCodeSet::EMPTY) };
+    static HTTP_FAIL_CODES: std::cell::Cell<ibex_config::StatusCodeSet> = const { std::cell::Cell::new(ibex_config::StatusCodeSet::EMPTY) };
+}
+
+/// Whether a response with `status` is an error and/or a failure, per `http-err-codes` and
+/// `http-fail-codes` (the defaults: 400 to 499, and 500 to 599 but 501 and 505).
+fn response_class(status: u16) -> (bool, bool) {
+    (HTTP_ERR_CODES.with(|c| c.get().contains(status)), HTTP_FAIL_CODES.with(|c| c.get().contains(status)))
+}
+
+/// The address of a `Forwarded` node: an IPv4 address as it is, an IPv6 one in brackets.
+fn node_text(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(a) => a.to_string(),
+        IpAddr::V6(a) => format!("[{a}]"),
+    }
+}
+
+/// The element `option forwarded` adds: `proto`, `host`, `by` and `for`, in that order, each
+/// from its sample expression or from the connection.
+fn forwarded_element(fwd: &ibex_config::Forwarded, sess: &TcpSession, ctx: &SampleContext) -> String {
+    use ibex_config::ForwardedValue::{Default as Plain, Expr as Expression, Off};
+    use ibex_sample::rfc7239::{node_from_sample, port_from_sample, valid_host};
+    let registry = sample_registry();
+    let eval = |e: &str| Expr::parse(e).ok().and_then(|e| e.eval_sample(registry, ctx));
+    let mut parts: Vec<String> = Vec::new();
+    if fwd.proto {
+        parts.push(format!("proto={}", if sess.cli_xprt.is_tls() { "https" } else { "http" }));
+    }
+    match &fwd.host {
+        Off => {}
+        v => {
+            let host = match v {
+                Expression(e) => eval(e).map(|s| sample_to_string(&s)),
+                _ => sess.htx_slice().and_then(|h| h.get_header("host")).map(str::to_string),
+            };
+            parts.push(format!("host=\"{}\"", host.filter(|h| valid_host(h)).unwrap_or_default()));
+        }
+    }
+    // The address of the stream (`set-src`/`set-dst` change it), and the port of the connection.
+    let src = sess.client_addr.map(|a| (a.ip(), if a.port() == 0 { sess.fc_src.map_or(0, |c| c.port()) } else { a.port() }));
+    let dst_port = sess.fc_dst.map_or(0, |c| c.port());
+    let dst = sess.server_addr.map(|a| a.ip()).or(sess.fc_dst.map(|a| a.ip())).map(|ip| (ip, dst_port));
+    for (name, node, port, addr) in [("by", &fwd.by, &fwd.by_port, dst), ("for", &fwd.for_, &fwd.for_port, src)] {
+        if *node == Off {
+            continue;
+        }
+        let name_text = match node {
+            Expression(e) => node_from_sample(eval(e).as_ref()),
+            _ => addr.map_or_else(|| "unknown".to_string(), |(ip, _)| node_text(ip)),
+        };
+        let port_text = match port {
+            Off => None,
+            Plain => addr.map(|(_, p)| p).filter(|p| *p != 0).map(|p| p.to_string()),
+            Expression(e) => port_from_sample(eval(e).as_ref()),
+        };
+        let quoted = *port != Off || name_text.contains([':', '[']);
+        let value = port_text.map_or_else(|| name_text.clone(), |p| format!("{name_text}:{p}"));
+        parts.push(if quoted { format!("{name}=\"{value}\"") } else { format!("{name}={value}") });
+    }
+    parts.join(";")
+}
+
+/// Adds `element` at the end of the request's last `Forwarded` header, or as a header of its
+/// own when it has none.
+fn append_forwarded_element(sess: &mut TcpSession, element: &str) {
+    let existing: Vec<String> = sess
+        .htx_slice()
+        .map(|s| s.headers().filter(|(n, _)| n.eq_ignore_ascii_case("forwarded")).map(|(_, v)| v.to_string()).collect())
+        .unwrap_or_default();
+    match existing.as_slice() {
+        [] => add_req_header(sess, "forwarded", element),
+        [only] => set_req_header(sess, "forwarded", &format!("{only},{element}")),
+        many => {
+            let last = many.len() - 1;
+            let values: Vec<String> = many.iter().enumerate().map(|(i, v)| if i == last { format!("{v},{element}") } else { v.clone() }).collect();
+            sess.with_htx_mut(|htx| {
+                htx.remove_header("forwarded");
+                for v in &values {
+                    let _ = htx.add_header("forwarded", v);
+                }
+            });
+            let mut hdrs = sess.req_headers.take().unwrap_or_default();
+            hdrs.retain(|(k, _)| !k.eq_ignore_ascii_case("forwarded"));
+            hdrs.extend(values.into_iter().map(|v| ("forwarded".to_string(), v)));
+            sess.req_headers = Some(hdrs);
+            rebuild_req_buffer(sess);
+        }
+    }
+}
+
+/// `reply`, a whole response, with `header` as the first header line.
+fn with_header_after_status_line(reply: &[u8], header: &str) -> Vec<u8> {
+    let at = reply.windows(2).position(|w| w == b"\r\n").map_or(reply.len(), |p| p + 2);
+    let mut out = Vec::with_capacity(reply.len() + header.len() + 2);
+    out.extend_from_slice(&reply[..at]);
+    out.extend_from_slice(header.as_bytes());
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(&reply[at..]);
+    out
+}
+
+/// A sample as an integer, as a string converts to one: its leading digits, 0 when it has none.
+fn sample_as_sint(smp: &ibex_sample::Sample) -> i64 {
+    let text = sample_to_string(smp);
+    let t = text.trim_start();
+    let (neg, digits) = t.strip_prefix('-').map_or((false, t.strip_prefix('+').unwrap_or(t)), |d| (true, d));
+    let n = digits.bytes().take_while(u8::is_ascii_digit).fold(0i64, |n, d| n.saturating_mul(10).saturating_add(i64::from(d - b'0')));
+    if neg { -n } else { n }
+}
+
 fn init_global_vars(global: Option<&ibex_config::GlobalSection>) {
     if let Some(global) = global {
         let sample_reg = sample_registry();
@@ -2203,6 +2323,22 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         let applets = AppletArena::with_capacity(capacity);
 
         init_global_vars(config.global.as_ref());
+        ibex_sample::set_userlists(
+            config
+                .userlists
+                .iter()
+                .map(|l| ibex_sample::AuthUserlist {
+                    name: l.name.clone(),
+                    users: l
+                        .users
+                        .iter()
+                        .map(|u| ibex_sample::AuthUser { name: u.name.clone(), password: u.password.clone(), groups: u.groups.clone() })
+                        .collect(),
+                })
+                .collect(),
+        );
+        HTTP_ERR_CODES.set(config.global.as_ref().and_then(|g| g.http_err_codes).unwrap_or_else(ibex_config::StatusCodeSet::default_err));
+        HTTP_FAIL_CODES.set(config.global.as_ref().and_then(|g| g.http_fail_codes).unwrap_or_else(ibex_config::StatusCodeSet::default_fail));
         let bufsize = config.global.as_ref().and_then(|g| g.bufsize).unwrap_or(16384);
         let bufsize_small = config.global.as_ref().and_then(|g| g.bufsize_small).unwrap_or(1024);
         let bufsize_large = config.global.as_ref().and_then(|g| g.bufsize_large);
@@ -3626,6 +3762,7 @@ fn eval_tcp_req_content_rules(
         unique_id: sess.log.unique_id.as_deref(),
         accept_date: Some(sess.log.date),
         last_rule: last_rule_at(sess.log.last_rule),
+        prio: (sess.log.prio_class, sess.log.prio_offset),
         captures_req_hdr: Some(&sess.log.req_captures),
         captures_res_hdr: Some(&sess.log.res_captures),
         ..Default::default()
@@ -5789,8 +5926,16 @@ impl EngineDispatcher<'_> {
         let client_close = txn.close_after;
         let cookie_txn = txn.ck;
         // Only an error changes a counter: a response that is not one costs the tracked entries no update.
-        if resume.is_none() && status >= 400 {
-            for_tracked(proxies, &entry.sess, |data| data.count_response_class(status));
+        let (is_err, is_fail) = response_class(status);
+        if resume.is_none() && (is_err || is_fail) {
+            for_tracked(proxies, &entry.sess, |data| {
+                if is_err {
+                    data.count_err();
+                }
+                if is_fail {
+                    data.count_fail();
+                }
+            });
         }
 
         if !client_close && srv_has_close {
@@ -5940,6 +6085,7 @@ impl EngineDispatcher<'_> {
             accept_date: Some(entry.sess.log.date),
             stream: Some(stream_facts(&entry.sess.log, Some(status), entry.sess.max_retries > entry.sess.conn_retries)),
             last_rule: last_rule_at(entry.sess.log.last_rule),
+            prio: (entry.sess.log.prio_class, entry.sess.log.prio_offset),
             captures_req_hdr: Some(&entry.sess.log.req_captures),
             captures_res_hdr: Some(&res_caps_in),
             ..Default::default()
@@ -6665,6 +6811,7 @@ impl EngineDispatcher<'_> {
                         unique_id: $s.log.unique_id.as_deref(),
                         accept_date: Some($s.log.date),
                         last_rule: last_rule_at($s.log.last_rule),
+                        prio: ($s.log.prio_class, $s.log.prio_offset),
                         be_max_retries: Some(be_retries),
                         cur_max_retries: Some($s.max_retries),
                         acls: Some(acls),
@@ -6692,7 +6839,7 @@ impl EngineDispatcher<'_> {
                     ibex_config::HttpReqAction::Return { .. }
                         | ibex_config::HttpReqAction::Deny { .. }
                         | ibex_config::HttpReqAction::Allow
-                        | ibex_config::HttpReqAction::Auth
+                        | ibex_config::HttpReqAction::Auth { .. }
                         | ibex_config::HttpReqAction::Redirect { .. }
                 ) {
                     note_last_rule(sess, rule.line);
@@ -6778,10 +6925,19 @@ impl EngineDispatcher<'_> {
                     ibex_config::HttpReqAction::Allow => {
                         return Ok(RuleFlow::Next);
                     }
-                    ibex_config::HttpReqAction::Auth => {
-                        let resp = "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"HAProxy\"\r\nContent-Type: text/plain\r\nContent-Length: 0\r\n\r\n";
+                    ibex_config::HttpReqAction::Auth { realm } => {
+                        // The 401 page of the proxy with `WWW-Authenticate` added; with no
+                        // realm, the name of the proxy the rule is in (`http_action_auth`).
+                        let realm = realm.as_deref().or(if be_stage { be_name } else { fe_name }).unwrap_or_default();
+                        let page = match resolve_error_body(&proxies[pages_idx], &proxies[proxy_idx], 401, Some(&ibex_config::ErrorPageSource::DefaultErrorfiles), None, None) {
+                            ResolvedErrorBody::Raw(bytes) => bytes.to_vec(),
+                            ResolvedErrorBody::Custom { content_type, lf_string } => {
+                                build_templated_error_response(401, content_type, lf_string, &make_ctx!(sess), registry)
+                            }
+                        };
+                        let resp = with_header_after_status_line(&page, &format!("www-authenticate: Basic realm=\"{realm}\""));
                         for_tracked(proxies, sess, |data| data.count_err());
-                        send_proxy_reply(sess, &proxies[..], proxy_idx, pages_idx, resp.as_bytes());
+                        send_proxy_reply(sess, &proxies[..], proxy_idx, pages_idx, &resp);
                         return Ok(RuleFlow::Replied);
                     }
                     ibex_config::HttpReqAction::Redirect { location, prefix, code, .. } => {
@@ -6864,6 +7020,24 @@ impl EngineDispatcher<'_> {
                             rebuild_req_buffer(sess);
                         }
                     }
+                    ibex_config::HttpReqAction::ReplaceUri { regex, repl } => {
+                        // The whole target, scheme and authority included; the first match only.
+                        let rebuilt = {
+                            let current_uri = sess.req_uri.as_deref().unwrap_or("/");
+                            let rust_repl = translate_backreferences(repl);
+                            regex::Regex::new(regex)
+                                .ok()
+                                .filter(|re| re.is_match(current_uri))
+                                .map(|re| re.replace(current_uri, &rust_repl).to_string())
+                        };
+                        if let Some(rebuilt) = rebuilt {
+                            sess.with_htx_mut(|htx| {
+                                let _ = htx.set_uri(&rebuilt);
+                            });
+                            sess.req_uri = Some(rebuilt);
+                            rebuild_req_buffer(sess);
+                        }
+                    }
                     ibex_config::HttpReqAction::SetQuery { fmt } => {
                         let new_query = format_sample_string(fmt, &make_ctx!(sess), registry);
                         let rebuilt = {
@@ -6910,6 +7084,22 @@ impl EngineDispatcher<'_> {
                     ibex_config::HttpReqAction::SetSrcPort { expr } => {
                         if let Some(port) = eval_port_expr(expr, registry, &make_ctx!(sess)) {
                             sess.client_addr = Some(with_port(sess.client_addr, port));
+                        }
+                    }
+                    ibex_config::HttpReqAction::SetPriorityClass { expr } | ibex_config::HttpReqAction::SetPriorityOffset { expr } => {
+                        // `http_action_set_priority` (src/http_act.c): the sample as an
+                        // integer (a string that is not a number is 0), clamped; a sample that
+                        // cannot be fetched changes nothing.
+                        let value = Expr::parse(expr)
+                            .ok()
+                            .and_then(|e| e.eval_sample(registry, &make_ctx!(sess)))
+                            .map(|smp| sample_as_sint(&smp));
+                        if let Some(v) = value {
+                            if matches!(rule.action, ibex_config::HttpReqAction::SetPriorityClass { .. }) {
+                                sess.log.prio_class = v.clamp(-2047, 2047) as i32;
+                            } else {
+                                sess.log.prio_offset = v.clamp(-524_287, 524_287) as i32;
+                            }
                         }
                     }
                     ibex_config::HttpReqAction::SetDstPort { expr } => {
@@ -7275,12 +7465,20 @@ impl EngineDispatcher<'_> {
         let fe_be = [proxy_idx, be_idx];
         let xff_excepts: Vec<&str> = fe_be.iter().filter_map(|&i| proxies[i].stats_config.forwardfor.as_deref()).collect();
         if !xff_excepts.is_empty() {
+            // `if-none` only counts when no proxy that sets the option leaves it out
+            // (`PR_O_FF_ALWAYS`): then a header the client sent is kept as the only one.
+            let always = fe_be.iter().any(|&i| {
+                let sc = &proxies[i].stats_config;
+                sc.forwardfor.is_some() && !sc.forwardfor_if_none
+            });
+            let has_own = entry.sess.htx_slice().is_some_and(|s| s.get_header("x-forwarded-for").is_some());
             let client_ip = entry.sess.client_addr.map(|a| a.ip());
-            if let Some(ip) = client_ip {
+            if let Some(ip) = client_ip.filter(|_| always || !has_own) {
                 let in_except = xff_excepts.iter().any(|e| !e.is_empty() && ip_in_cidr(ip, e));
                 if !in_except {
                     let ip_str = ip.to_string();
-                    set_req_header(&mut entry.sess, "X-Forwarded-For", &ip_str);
+                    // A new line after the client's own, as `HAProxy` writes it.
+                    add_req_header(&mut entry.sess, "X-Forwarded-For", &ip_str);
                 }
             }
         }
@@ -7295,6 +7493,14 @@ impl EngineDispatcher<'_> {
                     set_req_header(&mut entry.sess, "X-Original-To", &ip_str);
                 }
             }
+        }
+
+        // `option forwarded` (`http_handle_7239_header`): the backend's, as one more element
+        // at the end of the last `Forwarded` header.
+        if let Some(fwd) = proxies[be_idx].stats_config.forwarded.clone() {
+            let stick = StickView::new(proxies, &entry.sess.tracked_sc);
+            let element = forwarded_element(&fwd, &entry.sess, &stream_sample_ctx(&entry.sess, &proxies[proxy_idx], &proxies[be_idx], &ProxiesView(proxies), &stick));
+            append_forwarded_element(&mut entry.sess, &element);
         }
 
         let source_ip = entry.sess.client_addr.map(|a| a.ip());
@@ -9187,6 +9393,7 @@ fn after_res_on_reply<'r>(
     let mut req_vars = std::mem::take(&mut sess.req_vars);
     let mut res_caps = std::mem::take(&mut sess.log.res_captures);
     let res_caps_in = res_caps.clone();
+    let stick = StickView::new(proxies, &sess.tracked_sc);
     let result = {
         // The reply is the proxy's own, and the rules read the same state they read on a server's.
         let view = ProxiesView(proxies);
@@ -9194,6 +9401,7 @@ fn after_res_on_reply<'r>(
         let ctx = SampleContext {
             proxies: Some(&view),
             stick: Some(&stick),
+            prio: (sess.log.prio_class, sess.log.prio_offset),
             client_addr: sess.client_addr,
             server_addr: sess.server_addr,
             fc_src: sess.fc_src,

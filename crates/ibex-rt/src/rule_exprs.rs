@@ -128,6 +128,8 @@ fn http_req(a: &HttpReqAction) -> Exprs<'_> {
         HttpReqAction::SetSrc { expr } => vec![("set-src".into(), expr, false)],
         HttpReqAction::SetDst { expr } => vec![("set-dst".into(), expr, false)],
         HttpReqAction::SetDstPort { expr } => vec![("set-dst-port".into(), expr, false)],
+        HttpReqAction::SetPriorityClass { expr } => vec![("set-priority-class".into(), expr, false)],
+        HttpReqAction::SetPriorityOffset { expr } => vec![("set-priority-offset".into(), expr, false)],
         HttpReqAction::SetRetries { value: RetriesValue::Expr(expr) } => {
             vec![("set-retries".into(), expr, false)]
         }
@@ -324,6 +326,20 @@ pub fn validate_rule_exprs(config: &Config, registry: &Registry) -> Result<(), S
             tcp_content: &b.tcp_req_content_rules,
             tcp_res_content: &b.tcp_res_content_rules,
         });
+    }
+    // `option forwarded ... for-expr <expr>` and the other `-expr` parameters; a `defaults`
+    // option is checked in each proxy that inherited it.
+    let proxies = config
+        .listens
+        .iter()
+        .map(|l| (format!("proxy '{}'", l.name), SectionKind::Listen, &l.name, &l.forwarded))
+        .chain(config.backends.iter().map(|b| (format!("backend '{}'", b.name), SectionKind::Backend, &b.name, &b.forwarded)));
+    for (what, section, name, forwarded) in proxies {
+        for (_, expr) in forwarded.iter().flat_map(|f| f.exprs()) {
+            check_sample_expr(expr, registry)
+                .and_then(|()| check_expr(config, registry, Where { section, proxy: Some(name) }, expr, false))
+                .map_err(|e| format!("{what}: failed to parse 'option forwarded' expression '{expr}' in : {e}"))?;
+        }
     }
     sections.iter().try_for_each(|s| s.check(config, registry))
 }

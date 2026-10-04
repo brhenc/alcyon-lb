@@ -155,6 +155,7 @@ const IMPLEMENTED: &[&str] = &[
     "tcplog",
     "forwardfor",
     "originalto",
+    "forwarded",
     "redispatch",
     // Waits for the request body ahead of the rules (T119).
     "http-buffer-request",
@@ -283,16 +284,16 @@ pub(crate) fn check_no_option<'t>(section: OptSection, tokens: &'t [Token], kw: 
 
 /// `option forwardfor [except <net>] [header <name>] [if-none]` and
 /// `option originalto [except <net>] [header <name>]`. Returns the `except` network, or
-/// an empty string for none.
+/// an empty string for none, and whether `if-none` was given.
 ///
 /// Ibex always writes the client (destination) address to `X-Forwarded-For`
-/// (`X-Original-To`), replacing what the client sent. With another header name, the
-/// server would read a header only the client wrote; with `if-none`, `HAProxy` keeps the
-/// client's own header. Both are refused rather than run differently.
-pub(crate) fn parse_forward_option(tokens: &[Token], kw: &Token) -> Result<String, ConfigError> {
+/// (`X-Original-To`). With another header name, the server would read a header only the
+/// client wrote: refused rather than run differently.
+pub(crate) fn parse_forward_option(tokens: &[Token], kw: &Token) -> Result<(String, bool), ConfigError> {
     let name = tokens[1].text.as_str();
     let allowed = if name == "forwardfor" { "'except', 'header' and 'if-none'" } else { "'except' and 'header'" };
     let mut except = String::new();
+    let mut if_none = false;
     let mut i = 2;
     while let Some(arg) = tokens.get(i).map(|t| t.text.as_str()) {
         match arg {
@@ -313,15 +314,57 @@ pub(crate) fn parse_forward_option(tokens: &[Token], kw: &Token) -> Result<Strin
                 ));
             }
             "if-none" if name == "forwardfor" => {
-                return Err(err(
-                    kw,
-                    "'option forwardfor if-none' is not supported: Ibex replaces the client's \
-                     X-Forwarded-For instead of keeping it."
-                        .to_string(),
-                ));
+                if_none = true;
+                i += 1;
             }
             _ => return Err(err(kw, format!("'option {name}' only supports optional values: {allowed}."))),
         }
     }
-    Ok(except)
+    Ok((except, if_none))
+}
+
+/// `option forwarded [proto] [host[-expr <e>]] [by[-expr <e>]] [by_port[-expr <e>]]
+/// [for[-expr <e>]] [for_port[-expr <e>]]`: no parameter is `proto for`; a parameter given
+/// twice keeps its last form. The messages are `HAProxy`'s (3.5-dev8-885761-29).
+pub(crate) fn parse_forwarded_option(tokens: &[Token]) -> Result<crate::ast::Forwarded, ConfigError> {
+    use crate::ast::{Forwarded, ForwardedValue::{Default as Plain, Expr}};
+    if tokens.len() < 3 {
+        return Ok(Forwarded::plain());
+    }
+    let mut f = Forwarded::default();
+    let mut i = 2;
+    while let Some(arg) = tokens.get(i) {
+        let name = arg.text.as_str();
+        let slot = match name {
+            "proto" => {
+                f.proto = true;
+                i += 1;
+                continue;
+            }
+            "host" | "host-expr" => &mut f.host,
+            "by" | "by-expr" => &mut f.by,
+            "by_port" | "by_port-expr" => &mut f.by_port,
+            "for" | "for-expr" => &mut f.for_,
+            "for_port" | "for_port-expr" => &mut f.for_port,
+            _ => {
+                return Err(err(
+                    arg,
+                    "'option forwarded' only supports optional values: 'proto', 'host', 'host-expr', 'by', \
+                     'by-expr', 'by_port', 'by_port-expr', 'for', 'for-expr', 'for_port' and 'for_port-expr'."
+                        .to_string(),
+                ));
+            }
+        };
+        if name.ends_with("-expr") {
+            let Some(e) = tokens.get(i + 1).filter(|t| !t.text.is_empty()) else {
+                return Err(err(arg, format!("'{name}' expects <expr> as argument.")));
+            };
+            *slot = Expr(e.text.clone());
+            i += 2;
+        } else {
+            *slot = Plain;
+            i += 1;
+        }
+    }
+    Ok(f)
 }

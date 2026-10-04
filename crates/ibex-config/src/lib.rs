@@ -23,14 +23,14 @@ use std::path::Path;
 
 pub use ast::{
     AclCondition, AclRule, AclTerm, BackendSection, BalanceAlgorithm, Config, CookieConfig, DefaultsSection,
-    ErrorPageSource, FrontendSection, GlobalSection, GlobalSetVar, StatsSocket,
+    ErrorPageSource, Forwarded, ForwardedValue, FrontendSection, GlobalSection, GlobalSetVar, StatsSocket,
     HashPreserveAffinity, HashType,
     HeaderExp, HttpAfterResAction, HttpAfterResRule, HttpReqAction, HttpReqRule, HttpResAction, RedirectCookie,
     HeaderCapture, HttpResRule, HttpReuse, ListenSection, LogConfig, LogFormatSpec, LogFacility, LogLevel, LogSample, LogTarget, Mode, RetriesValue,
-    SampleRef, SectionKind, Server, ServerSsl, SslVerify, StatsConfig, TlsVersion,
+    SampleRef, SectionKind, Server, ServerSsl, SslVerify, StatsConfig, StatusCodeSet, TlsVersion,
     StickRule, StickRuleType, StickTableConfigAst, TcpReqConnAction, TcpReqConnRule,
     TcpReqContentAction, TcpReqContentRule, TcpResAction, TcpResContentRule, TcpReqSessionAction, TcpReqSessionRule,
-    TimeoutConfig, UseBackendRule, UseServerRule,
+    TimeoutConfig, UseBackendRule, UseServerRule, Userlist, UserlistUser,
 };
 pub use error::ConfigError;
 pub use parser::parse_str;

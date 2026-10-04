@@ -85,6 +85,10 @@ pub enum HttpReqAction {
         regex: String,
         repl: String,
     },
+    ReplaceUri {
+        regex: String,
+        repl: String,
+    },
     SetQuery {
         fmt: String,
     },
@@ -107,6 +111,14 @@ pub enum HttpReqAction {
     /// Rewrites the port of the stream's destination (`dst`), which a server without a
     /// port connects to.
     SetDstPort {
+        expr: String,
+    },
+    /// `set-priority-class <expr>`: the stream's queue class, clamped to +-2047.
+    SetPriorityClass {
+        expr: String,
+    },
+    /// `set-priority-offset <expr>`: the stream's queue offset, clamped to +-524287.
+    SetPriorityOffset {
         expr: String,
     },
     /// Replaces the stream's retry budget.
@@ -142,7 +154,10 @@ pub enum HttpReqAction {
         timeout_type: String,
         timeout_val: String,
     },
-    Auth,
+    /// `auth [realm <realm>]`: the 401 that asks for credentials; no realm is the proxy's name.
+    Auth {
+        realm: Option<String>,
+    },
     Capture {
         expr: String,
         len: Option<usize>,

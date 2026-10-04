@@ -32,6 +32,12 @@ pub use acl::*;
 pub mod stick;
 pub use stick::*;
 
+pub mod userlist;
+pub use userlist::*;
+
+pub mod forwarded;
+pub use forwarded::*;
+
 pub mod logging;
 pub use logging::*;
 
@@ -54,6 +60,8 @@ pub struct Config {
     /// Every ACL and log-format sample expression in the proxy and defaults sections, in
     /// the order written. Empty for a configuration not built by the parser.
     pub sample_refs: Vec<SampleRef>,
+    /// The `userlist` sections, in the order written.
+    pub userlists: Vec<Userlist>,
     /// The proxy sections in the order they were written, as `(kind, index in its list)`.
     /// `HAProxy` numbers proxies in this order; empty for a configuration not built by the
     /// parser, which [`Config::proxy_ids`] then takes as listens, backends, frontends.
