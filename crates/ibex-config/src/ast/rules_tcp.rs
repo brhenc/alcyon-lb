@@ -45,6 +45,11 @@ pub enum TcpReqSessionAction {
     ScIncGpc0 { sc: u8 },
     ScIncGpc1 { sc: u8 },
     ScSetGpt0 { sc: u8, expr: String },
+    /// `sc-inc-gpc(<idx>,<sc>)`, `sc-add-gpc(<idx>,<sc>) <value>`, `sc-set-gpt(<idx>,<sc>) <value>`:
+    /// the array form of the general purpose storage.
+    ScIncGpc { idx: usize, sc: u8 },
+    ScAddGpc { idx: usize, sc: u8, expr: String },
+    ScSetGpt { idx: usize, sc: u8, expr: String },
 }
 
 /// Rule pairing a TCP-request session action with an optional condition.
@@ -72,6 +77,11 @@ pub enum TcpReqContentAction {
     ScIncGpc0 { sc: u8 },
     ScIncGpc1 { sc: u8 },
     ScSetGpt0 { sc: u8, expr: String },
+    /// `sc-inc-gpc(<idx>,<sc>)`, `sc-add-gpc(<idx>,<sc>) <value>`, `sc-set-gpt(<idx>,<sc>) <value>`:
+    /// the array form of the general purpose storage.
+    ScIncGpc { idx: usize, sc: u8 },
+    ScAddGpc { idx: usize, sc: u8, expr: String },
+    ScSetGpt { idx: usize, sc: u8, expr: String },
     DoLog,
     UseService { service: String },
     Lua { name: String },

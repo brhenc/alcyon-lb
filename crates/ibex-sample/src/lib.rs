@@ -28,7 +28,7 @@ pub use matcher::{IntOp, IntRange, Matcher};
 pub use registry::{
     check_converter_args, get_proc_var, not_implemented, not_implemented_message, sample_registry, set_proc_var, ConvDesc,
     ConvFn, CtxConvDesc, CtxConvFn, FetchDesc, FetchFn, FrontendCounter, ProxyState, Registry,
-    ServerState, SampleContext, StickData, StickState, StreamFacts, CURRENT_VARS, STOPPING, GLOBAL_PROC_VARS, SAMPLE_REGISTRY,
+    ServerState, SampleContext, StickData, StickGpc, StickOp, StickState, StreamFacts, CURRENT_VARS, STOPPING, GLOBAL_PROC_VARS, SAMPLE_REGISTRY,
 };
 pub use rawpayload::{check_args as check_raw_fetch_args, raw_may_change};
 pub use sample::{Sample, SampleType, TypeSpec, SAMPLE_TYPES_COUNT};

@@ -45,6 +45,8 @@ pub struct Listener {
     pub tls: Option<Arc<rustls::ServerConfig>>,
     /// `bind ... name <n>`, what `so_name` reads.
     pub name: Option<Arc<str>>,
+    /// The listener's numeric id (`luid`), what `so_id` reads; 0 until the engine sets it.
+    pub luid: u32,
 }
 
 impl Listener {
@@ -105,6 +107,7 @@ impl Listener {
             nbconn: 0,
             tls: None,
             name: None,
+            luid: 0,
         })
     }
 
@@ -150,6 +153,7 @@ impl Listener {
             nbconn: 0,
             tls: None,
             name: None,
+            luid: 0,
         })
     }
 

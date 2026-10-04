@@ -234,6 +234,12 @@ impl CliApplet {
             let line = line.trim_end_matches('\r');
 
             self.execute_line(line, ctx);
+            // A connection that is not in `prompt` mode runs one command line and closes;
+            // what came after it in the same write is never run (HAProxy, T146 item 4).
+            if !self.interactive {
+                self.in_buf.clear();
+                break;
+            }
         }
     }
 
@@ -327,7 +333,7 @@ impl CliApplet {
         } else if cmd == "show servers state" || cmd.starts_with("show servers state ") {
             let be_filter = cmd.strip_prefix("show servers state").map(str::trim).filter(|s| !s.is_empty());
             if let Some(target) = be_filter {
-                if !ctx.proxies.iter().any(|p| p.name == target) {
+                if !ctx.proxies.iter().any(|p| p.name == target || p.iid.to_string() == target) {
                     self.out_buf.extend_from_slice(b"Can't find backend.\n");
                     if self.interactive {
                         self.out_buf.extend_from_slice(b"\n> ");
@@ -338,9 +344,13 @@ impl CliApplet {
                 }
             }
             self.out_buf.extend_from_slice(b"1\n# be_id be_name srv_id srv_name srv_addr srv_op_state srv_admin_state srv_uweight srv_iweight srv_time_since_last_change srv_check_status srv_check_result srv_check_health srv_check_state srv_agent_state bk_f_forced_id srv_f_forced_id srv_fqdn srv_port srvrecord srv_use_ssl srv_check_port srv_check_addr srv_agent_addr srv_agent_port\n");
-            for (p_idx, p) in ctx.proxies.iter().enumerate() {
+            // `HAProxy` lists the proxies in the order the sections were written.
+            let mut order: Vec<usize> = (0..ctx.proxies.len()).collect();
+            order.sort_by_key(|&i| ctx.proxies[i].decl);
+            for p_idx in order {
+                let p = &ctx.proxies[p_idx];
                 if let Some(target) = be_filter {
-                    if p.name != target { continue; }
+                    if p.name != target && p.iid.to_string() != target { continue; }
                 }
                 for (s_idx, s) in p.server_ids.iter().enumerate() {
                     let addr = p.servers.get(s_idx).map_or_else(|| "-".to_string(), |a| a.ip().to_string());
@@ -352,7 +362,12 @@ impl CliApplet {
                         _ => 0,
                     };
                     // srv_admin_state: SRV_ADMF_FMAINT 1, SRV_ADMF_FDRAIN 8.
+                    // A tracker whose target is in maintenance or drain has the inherited flags
+                    // instead (SRV_ADMF_IMAINT 2, SRV_ADMF_IDRAIN 16).
+                    let inherited = crate::track::inherited(p, s_idx);
                     let admin_state = match status {
+                        Some(ServerStatus::Maint) if inherited => 2,
+                        Some(ServerStatus::Drain) if inherited => 16,
                         Some(ServerStatus::Maint) => 1,
                         Some(ServerStatus::Drain) => 8,
                         _ => 0,
@@ -362,7 +377,7 @@ impl CliApplet {
                     
                     let mut check_status = 1;
                     let mut check_result = 0;
-                    let mut check_health = 0;
+                    let mut check_health = p.server_init_health(s_idx);
                     let mut check_state = 0;
                     
                     if let Some(check) = ctx.checks.iter().find(|c| c.proxy_idx == p_idx && c.server_idx == s_idx) {
@@ -407,10 +422,13 @@ impl CliApplet {
                         };
                     }
 
+                    let puid = p.server_puid(s_idx);
+                    let bk_forced = u8::from(p.forced_id);
+                    let srv_forced = u8::from(p.server_forced_id(s_idx));
                     self.out_buf.extend_from_slice(
                         format!(
-                            "{} {} {} {} {} {} {} {} {} 1 {} {} {} {} 0 0 0 - {} - 0 0 - - 0\n",
-                            p.id, p.name, s_idx + 1, s, addr, op_state, admin_state, uweight, iweight, check_status, check_result, check_health, check_state, port
+                            "{} {} {} {} {} {} {} {} {} 1 {} {} {} {} 0 {} {} - {} - 0 0 - - 0\n",
+                            p.iid, p.name, puid, s, addr, op_state, admin_state, uweight, iweight, check_status, check_result, check_health, check_state, bk_forced, srv_forced, port
                         ).as_bytes()
                     );
                 }
@@ -616,7 +634,7 @@ impl CliApplet {
                 iid_filter = Some(id);
             } else if parts[2] != "-1" {
                 if let Some(p_idx) = ctx.proxies.iter().position(|p| p.name == parts[2]) {
-                    iid_filter = Some(i32::try_from(p_idx + 1).unwrap_or(-2));
+                    iid_filter = Some(i32::try_from(ctx.proxies[p_idx].iid).unwrap_or(-2));
                 } else {
                     iid_filter = Some(-2); // force not found
                 }
@@ -981,8 +999,19 @@ impl CliApplet {
                 let _ = crate::engine::set_proxy_maxconn(ctx.proxies, &px_name, sv.as_deref(), val);
                 self.finish_msg("");
             }
-            // Not implemented: the global maxconn is not enforced anywhere, so accepting it
-            // would be accepting and dropping it.
+            // `global.maxconn`, enforced by `globalconn` (listeners stop accepting at it).
+            Some("global") => {
+                let Some(v) = parts.get(1) else {
+                    self.finish_msg("Expects an integer value.");
+                    return;
+                };
+                // `atoi`: digits after an optional sign, anything else counts as 0.
+                let v = crate::applet::atoi(v);
+                match crate::globalconn::set(v) {
+                    Ok(()) => self.finish_msg(""),
+                    Err(msg) => self.finish_msg(msg),
+                }
+            }
             _ => self.finish_msg("No such target or invalid maxconn."),
         }
     }
@@ -998,13 +1027,14 @@ impl CliApplet {
             return;
         };
         let mut found_px = false;
+        let mut track_changes = Vec::new();
         let mut found_sv = false;
         for (p_idx, proxy) in ctx.proxies.iter_mut().enumerate() {
             if proxy.name == px_name {
                 found_px = true;
                 for (s_idx, sid) in proxy.server_ids.iter().enumerate() {
                     if sid == sv_name {
-                        proxy.server_statuses[s_idx].store(0 /* Up */, std::sync::atomic::Ordering::Relaxed);
+                        track_changes.push((p_idx, s_idx, ServerStatus::Up));
                         found_sv = true;
                         if let Some(check) = ctx
                             .checks
@@ -1016,6 +1046,9 @@ impl CliApplet {
                     }
                 }
             }
+        }
+        for (p_idx, s_idx, st) in track_changes {
+            crate::track::set_status(ctx.proxies, p_idx, s_idx, st);
         }
         if !found_px {
             self.out_buf.extend_from_slice(b"No such backend.\n");
@@ -1040,13 +1073,14 @@ impl CliApplet {
             return;
         };
         let mut found_px = false;
+        let mut track_changes = Vec::new();
         let mut found_sv = false;
         for (p_idx, proxy) in ctx.proxies.iter_mut().enumerate() {
             if proxy.name == px_name {
                 found_px = true;
                 for (s_idx, sid) in proxy.server_ids.iter().enumerate() {
                     if sid == sv_name {
-                        proxy.server_statuses[s_idx].store(ServerStatus::Maint as u8, std::sync::atomic::Ordering::Relaxed);
+                        track_changes.push((p_idx, s_idx, ServerStatus::Maint));
                         found_sv = true;
                         if let Some(check) = ctx
                             .checks
@@ -1058,6 +1092,9 @@ impl CliApplet {
                     }
                 }
             }
+        }
+        for (p_idx, s_idx, st) in track_changes {
+            crate::track::set_status(ctx.proxies, p_idx, s_idx, st);
         }
         if !found_px {
             self.out_buf.extend_from_slice(b"No such backend.\n");
@@ -1176,7 +1213,7 @@ impl CliApplet {
                         return;
                     }
                 };
-                ctx.proxies[p_idx].server_statuses[s_idx].store(status as u8, std::sync::atomic::Ordering::Relaxed);
+                crate::track::set_status(ctx.proxies, p_idx, s_idx, status);
                 if let Some(check) = ctx.checks.iter_mut().find(|c| c.proxy_idx == p_idx && c.server_idx == s_idx) {
                     check.status = status;
                 }
@@ -1271,6 +1308,7 @@ impl CliApplet {
                       set server <backend>/<server> state ...    : Set server state (ready, maint, drain)\n\
                       set server <backend>/<server> maxconn <n>  : Set server maxconn\n\
                       set maxconn server <backend>/<server> <n>  : Set server maxconn\n\
+                      set maxconn global <value>                : Set the process maxconn\n\
                       set maxconn frontend <frontend> <n>        : Set frontend maxconn\n\
                       set maxconn backend <backend> <n>          : Set backend maxconn\n\
                       set weight <backend>/<server> <weight>     : Set server weight\n";
@@ -1363,4 +1401,16 @@ impl AppletArena {
     pub const fn live(&self) -> usize {
         self.live
     }
+}
+
+/// C's `atoi` on the leading integer of `s`: 0 when there is none.
+fn atoi(s: &str) -> i64 {
+    let t = s.trim_start();
+    let (neg, digits) = match t.as_bytes().first() {
+        Some(b'-') => (true, &t[1..]),
+        Some(b'+') => (false, &t[1..]),
+        _ => (false, t),
+    };
+    let n: i64 = digits.bytes().take_while(u8::is_ascii_digit).fold(0i64, |a, d| a.saturating_mul(10).saturating_add(i64::from(d - b'0')));
+    if neg { -n } else { n }
 }

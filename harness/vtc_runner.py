@@ -1709,22 +1709,20 @@ class VtcExecutor:
             except Exception:
                 pass
 
-    def is_oracle(self) -> bool:
-        return "haproxy" in os.path.basename(self.target_binary)
-
-    async def _execute_haproxy_cli(self, haproxy_id: str, block: str) -> None:
-        cli_sock = os.path.join(self.tmpdir, f"{haproxy_id}.sock")
-        reader, writer = None, None
+    async def _cli_connect(self, cli_sock: str):
         for _ in range(50):
             if os.path.exists(cli_sock):
                 try:
-                    reader, writer = await asyncio.open_unix_connection(cli_sock)
-                    break
+                    return await asyncio.open_unix_connection(cli_sock)
                 except Exception:
                     pass
             await asyncio.sleep(0.05)
-        if not writer or not reader:
-            raise RuntimeError(f"Could not connect to HAProxy CLI socket {cli_sock}")
+        raise RuntimeError(f"Could not connect to HAProxy CLI socket {cli_sock}")
+
+    async def _execute_haproxy_cli(self, haproxy_id: str, block: str) -> None:
+        cli_sock = os.path.join(self.tmpdir, f"{haproxy_id}.sock")
+        # Like vtest, a new connection for every `send`: a non-interactive stats-socket
+        # connection runs one command line and closes, on HAProxy and on Ibex alike (T146).
 
         lines = block.splitlines()
         last_resp = ""
@@ -1736,21 +1734,28 @@ class VtcExecutor:
                 cmd = line[5:].strip()
                 if (cmd.startswith('"') and cmd.endswith('"')) or (cmd.startswith("'") and cmd.endswith("'")):
                     cmd = cmd[1:-1]
+                reader, writer = await self._cli_connect(cli_sock)
                 writer.write((cmd + "\n").encode("utf-8"))
                 await writer.drain()
-                await asyncio.sleep(0.05)
                 resp_bytes = bytearray()
                 while True:
                     try:
-                        chunk = await asyncio.wait_for(reader.read(4096), timeout=0.1)
-                        if not chunk:
-                            break
-                        resp_bytes.extend(chunk)
-                        if len(chunk) < 4096:
-                            break
+                        # The answer ends with the close; an idle second ends a connection
+                        # that stays open (`prompt`).
+                        chunk = await asyncio.wait_for(reader.read(4096), timeout=1.0)
                     except asyncio.TimeoutError:
                         break
+                    except ConnectionError:
+                        break
+                    if not chunk:
+                        break
+                    resp_bytes.extend(chunk)
                 last_resp = resp_bytes.decode("utf-8", errors="replace")
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
             elif line.startswith("barrier "):
                 parts = line.split()
                 if len(parts) >= 3 and parts[2] == "sync":
@@ -1775,11 +1780,6 @@ class VtcExecutor:
                     pat = _posix_classes_to_python(self.macro_engine.expand(pat))
                     if not re.search(pat, last_resp, re.MULTILINE):
                         raise AssertionError(f"CLI expect pattern {pat!r} failed to match: {last_resp!r}")
-        writer.close()
-        try:
-            await writer.wait_closed()
-        except Exception:
-            pass
 
     async def execute(self) -> TestResult:
         start_time = time.monotonic()
@@ -2075,17 +2075,13 @@ class VtcExecutor:
                     os.makedirs(os.path.join(self.tmpdir, haproxy_id), exist_ok=True)
                     cfg_path = os.path.join(self.tmpdir, haproxy_id, "cfg")
                     with open(cfg_path, "w") as f:
-                        if self.is_oracle():
-                            # A worker-level admin socket, as vtest has: `-S` is the master
-                            # CLI, which refuses `show stat` and the rest (T138).
-                            f.write("global\n"
-                                    f"    stats socket {os.path.join(self.tmpdir, haproxy_id + '.sock')} level admin\n"
-                                    "# vtc_runner: vtest's third prelude line\n")
-                        else:
-                            # Ibex keeps `-S`: a second `global` section (every test that
-                            # opens its config with one) replaces the first instead of
-                            # merging with it, so the prelude's socket would vanish.
-                            f.write("# vtc_runner: vtest's three-line prelude would be here\n#\n#\n")
+                        # A worker-level admin socket, as vtest has, for both binaries:
+                        # `-S` is the master CLI, which refuses `show stat` and the rest
+                        # (T138). Several `global` sections merge (T146), so a test that
+                        # opens its config with its own `global` adds to this one.
+                        f.write("global\n"
+                                f"    stats socket {os.path.join(self.tmpdir, haproxy_id + '.sock')} level admin\n"
+                                "# vtc_runner: vtest's third prelude line\n")
                         f.write(rewritten_cfg)
                         if not rewritten_cfg.endswith("\n"):
                             f.write("\n")
@@ -2124,8 +2120,7 @@ class VtcExecutor:
                             # in the foreground, as vtest runs it.
                             mw = []
                             proc = subprocess.Popen(
-                                [self.target_binary, "-f", cfg_path, "-d",
-                                 *([] if self.is_oracle() else ["-S", cli_sock])],
+                                [self.target_binary, "-f", cfg_path, "-d"],
                                 stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE,
                             )

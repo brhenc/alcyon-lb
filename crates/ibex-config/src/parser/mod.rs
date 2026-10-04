@@ -8,7 +8,7 @@ use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
-use crate::ast::{
+use crate::ast::{ProxyKind, ServerExtras,
     clear_http_errors_sections, clear_resolved_checks, clear_userlists, http_errors_section, http_errors_section_code,
     register_userlist, take_userlists, Userlist, UserlistUser,
     register_http_errors_section, register_resolved_check, register_resolved_check_for_addr,
@@ -93,6 +93,18 @@ pub(crate) enum CurrentSection {
     HttpErrors(String, std::collections::HashMap<u16, Vec<u8>>),
 }
 
+impl CurrentSection {
+    /// The kind, the name and the `id` of a proxy section that has given one.
+    fn explicit_id(&self) -> Option<(&'static str, &str, u32)> {
+        match self {
+            Self::Listen(l) => l.id.map(|id| ("listen", l.name.as_str(), id)),
+            Self::Frontend(f) => f.id.map(|id| ("frontend", f.name.as_str(), id)),
+            Self::Backend(b) => b.id.map(|id| ("backend", b.name.as_str(), id)),
+            _ => None,
+        }
+    }
+}
+
 pub(crate) mod global;
 pub(crate) use global::*;
 pub(crate) mod defaults;
@@ -167,6 +179,10 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
     let mut backends = Vec::new();
     let mut cur_section: Option<CurrentSection> = None;
     let mut sample_refs = Vec::new();
+    // The proxy sections in the order written, and the explicit `id` of each, for the
+    // numbering of the others (`Config::proxy_ids`) and for refusing a reused one.
+    let mut proxy_order: Vec<(ProxyKind, usize)> = Vec::new();
+    let mut explicit_ids: Vec<(u32, &'static str, String, usize)> = Vec::new();
     // Where each named defaults section starts, and what kind of section first inherited
     // from it, for [`check_inheritance`].
     let mut defaults_lines: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
@@ -192,7 +208,9 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut frontends,
                     &mut backends,
                 );
-                cur_section = Some(CurrentSection::Global(GlobalSection::default()));
+                // HAProxy reads every `global` section into the same struct: a later one
+                // adds to the earlier ones, it does not replace them.
+                cur_section = Some(CurrentSection::Global(global.take().unwrap_or_default()));
             }
             "defaults" => {
                 flush_current_section(
@@ -257,6 +275,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut backends,
                 );
                 check_inheritance(Inheritor::Listen, tokens, &named_defaults, &defaults_lines, &mut defaults_users)?;
+                proxy_order.push((ProxyKind::Listen, listens.len()));
                 cur_section = Some(CurrentSection::Listen(parse_listen_header(
                     tokens,
                     kw,
@@ -275,6 +294,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut backends,
                 );
                 check_inheritance(Inheritor::Frontend, tokens, &named_defaults, &defaults_lines, &mut defaults_users)?;
+                proxy_order.push((ProxyKind::Frontend, frontends.len()));
                 cur_section = Some(CurrentSection::Frontend(parse_frontend_header(
                     tokens,
                     kw,
@@ -298,6 +318,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                         d.backend_user = true;
                     }
                 }
+                proxy_order.push((ProxyKind::Backend, backends.len()));
                 cur_section = Some(CurrentSection::Backend(parse_backend_header(
                     tokens,
                     kw,
@@ -368,6 +389,18 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     }
                 }
                 parse_section_directive(section, tokens, kw)?;
+                if kw.text == "id" {
+                    for (kind, name, id) in section.explicit_id() {
+                        if let Some((_, okind, oname, oline)) = explicit_ids.iter().find(|e| e.0 == id) {
+                            return Err(ConfigError::new(
+                                kw.line,
+                                kw.col,
+                                format!("{kind} {name} reuses same custom id as {okind} {oname} (declared at line {oline})."),
+                            ));
+                        }
+                        explicit_ids.push((id, kind, name.to_string(), kw.line));
+                    }
+                }
             }
         }
     }
@@ -428,6 +461,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
         backends,
         sample_refs,
         userlists,
+        proxy_order,
     };
     register_checks_from_config(&config);
 
@@ -1118,6 +1152,65 @@ pub(crate) fn parse_default_backend(
 
 
 
+/// Where `track [<proxy>/]<server>` of a server of `px` points: the proxy name is what
+/// precedes the last `/`, and a bare name is a server of the same proxy.
+#[must_use]
+pub fn tracked_target<'a>(px: &'a str, spec: &'a str) -> (&'a str, &'a str) {
+    spec.rsplit_once('/').unwrap_or((px, spec))
+}
+
+/// `track` is resolved when the configuration loads, the servers taken in the order they
+/// are declared, as `srv_apply_track` does (`src/server.c`): the target must exist, must
+/// have a check or itself track something (a later server's `track` counts), and the chain
+/// it starts must not lead back to the server.
+fn validate_tracking(listens: &[ListenSection], backends: &[BackendSection]) -> Result<(), ConfigError> {
+    // Most configurations track nothing, and the bookkeeping below allocates per backend.
+    let tracks = |servers: &[Server]| servers.iter().any(|s| s.track.is_some());
+    if !listens.iter().any(|l| tracks(&l.servers)) && !backends.iter().any(|b| tracks(&b.servers)) {
+        return Ok(());
+    }
+    let all: Vec<(&str, &[Server])> = listens
+        .iter()
+        .map(|l| (l.name.as_str(), l.servers.as_slice()))
+        .chain(backends.iter().map(|b| (b.name.as_str(), b.servers.as_slice())))
+        .collect();
+    let find = |px: &str, sv: &str| -> Option<(usize, usize)> {
+        let p = all.iter().position(|(n, _)| *n == px)?;
+        Some((p, all[p].1.iter().position(|s| s.id == sv)?))
+    };
+    // The links applied so far.
+    let mut link: Vec<Vec<Option<(usize, usize)>>> = all.iter().map(|(_, s)| vec![None; s.len()]).collect();
+    for (p, (px, servers)) in all.iter().enumerate() {
+        for (s, server) in servers.iter().enumerate() {
+            let Some(spec) = &server.track else { continue };
+            let err = |msg: String| ConfigError::new(1, 1, format!("'server {px}/{}' : {msg}", server.id));
+            if server.check {
+                return Err(err("unable to enable checks and tracking at the same time!".to_string()));
+            }
+            let (tpx, tsv) = tracked_target(px, spec);
+            if !all.iter().any(|(n, _)| *n == tpx) {
+                return Err(err(format!("unable to find required proxy '{tpx}' for tracking.")));
+            }
+            let Some(t) = find(tpx, tsv) else {
+                return Err(err(format!("unable to find required server '{tsv}' for tracking.")));
+            };
+            let target = &all[t.0].1[t.1];
+            if !target.check && target.track.is_none() {
+                return Err(err(format!("unable to use {tpx}/{tsv} for tracking as it does not have any check nor agent enabled.")));
+            }
+            let mut at = Some(t);
+            while let Some(x) = at {
+                if x == (p, s) {
+                    return Err(err(format!("unable to track {tpx}/{tsv} as it belongs to a tracking chain looping back to {px}/{}.", server.id)));
+                }
+                at = link[x.0][x.1];
+            }
+            link[p][s] = Some(t);
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_config(
     global: Option<&GlobalSection>,
     listens: &[ListenSection],
@@ -1177,6 +1270,7 @@ pub(crate) fn validate_config(
             }
         }
     }
+    validate_tracking(listens, backends)?;
     for proxy in listens {
         if proxy.mode == Mode::Http && proxy.cookie.is_some() && proxy.servers.is_empty() {
             return Err(ConfigError::new(
@@ -1216,6 +1310,15 @@ pub(crate) fn validate_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_proxy_section_gives_an_explicit_id() {
+        assert!(CurrentSection::Resolvers.explicit_id().is_none());
+        let mut be = BackendSection { name: "b".into(), ..Default::default() };
+        assert!(CurrentSection::Backend(be.clone()).explicit_id().is_none());
+        be.id = Some(4);
+        assert_eq!(CurrentSection::Backend(be).explicit_id(), Some(("backend", "b", 4)));
+    }
 
     #[test]
     fn test_parse_example_cfg() {

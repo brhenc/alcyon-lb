@@ -51,6 +51,8 @@ pub enum FdState {
     Listener { listener: u32 },
     /// A listening socket for CLI / stats. Readiness means a CLI client is waiting.
     CliListener,
+    /// A further CLI socket (`stats socket` lines after the first), by index.
+    CliExtra(u32),
     /// A connection. Readiness wakes the owning task.
     Conn { task: TaskRef, conn: u32 },
     /// A QUIC listening socket. Readiness means datagrams are waiting.

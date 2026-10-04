@@ -3,7 +3,7 @@
 
 use super::{
     find_cond_idx, join_tokens_until, parse_acl_condition_from_tokens, parse_error_body_args,
-    parse_rule_condition, parse_sc_counter_action, parse_u16, ConfigError, ErrorPageSource,
+    parse_rule_condition, parse_gpc_array_action, parse_sc_counter_action, parse_u16, ConfigError, ErrorPageSource,
     AclCondition, HttpAfterResAction, HttpAfterResRule, HttpReqAction, HttpReqRule, HttpResAction,
     HttpResRule, RedirectCookie, RetriesValue, Token,
 };
@@ -261,6 +261,21 @@ fn parse_http_req_rule_at(
             ));
         }
         rules.push(HttpReqRule { action: HttpReqAction::ScSetGpt0 { sc, expr }, cond, line: 0 });
+    } else if let Some((idx, sc)) = parse_gpc_array_action(act_str, "sc-inc-gpc", act_token)? {
+        let (_, cond) = parse_rule_condition(tokens, 2)?;
+        rules.push(HttpReqRule { action: HttpReqAction::ScIncGpc { idx, sc }, cond, line: 0 });
+    } else if let Some((idx, sc)) = parse_gpc_array_action(act_str, "sc-add-gpc", act_token)? {
+        let (cond_idx, cond) = parse_rule_condition(tokens, 3)?;
+        let expr = join_tokens_until(tokens, 2, cond_idx);
+        // No value is 0: `strtol` reads nothing and the end of the line is what it stopped at.
+        let expr = if expr.is_empty() { "0".to_string() } else { expr };
+        rules.push(HttpReqRule { action: HttpReqAction::ScAddGpc { idx, sc, expr }, cond, line: 0 });
+    } else if let Some((idx, sc)) = parse_gpc_array_action(act_str, "sc-set-gpt", act_token)? {
+        let (cond_idx, cond) = parse_rule_condition(tokens, 3)?;
+        let expr = join_tokens_until(tokens, 2, cond_idx);
+        // No value is 0: `strtol` reads nothing and the end of the line is what it stopped at.
+        let expr = if expr.is_empty() { "0".to_string() } else { expr };
+        rules.push(HttpReqRule { action: HttpReqAction::ScSetGpt { idx, sc, expr }, cond, line: 0 });
     } else if act_str == "return" {
         let cond_idx = find_cond_idx(tokens, 2);
         let limit = cond_idx.unwrap_or(tokens.len());

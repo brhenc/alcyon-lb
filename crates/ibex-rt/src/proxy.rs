@@ -102,6 +102,8 @@ pub struct TcpSession {
     pub client_addr: Option<SocketAddr>,
     /// The name of the bind that accepted this connection (`so_name`).
     pub so_name: Option<Arc<str>>,
+    /// The id of the bind that accepted this connection (`so_id`).
+    pub so_id: Option<u32>,
     pub cliexp: Vec<CompiledExp>,
     pub srvexp: Vec<CompiledExp>,
     pub req_uri: Option<String>,
@@ -126,6 +128,11 @@ pub struct TcpSession {
     pub max_retries: u16,
     /// Deadline for the operation currently in flight on each side.
     pub cli_exp: Tick,
+    /// `timeout http-request`, in ms (0: none), and when it ends for the request head now
+    /// being received: from the connection for its first request, from the first byte of
+    /// a later one. It ends with the head, and does not move with the client's progress.
+    pub http_request_ms: u32,
+    pub req_exp: Tick,
     pub srv_exp: Tick,
     pub conn_exp: Tick,
     /// Earliest tick at which a failed connect may be retried.
@@ -137,6 +144,11 @@ pub struct TcpSession {
     pub retry_after: Tick,
     pub bytes_in: u64,
     pub bytes_out: u64,
+    /// What the stick-table entries this session tracks have been credited of `bytes_in`
+    /// (`flush_stick_bytes`).
+    pub stick_acct_in: u64,
+    /// What the servers sent in the requests that are over and not credited yet.
+    pub stick_out_pending: u64,
     pub ending: Option<Ending>,
     pub accept_proxy: bool,
     pub accept_proxy_v2: bool,
@@ -166,6 +178,9 @@ pub struct TcpSession {
     pub fc_dst: Option<SocketAddr>,
     pub tcp_inspect_done: bool,
     pub inspect_exp: Option<Tick>,
+    /// The backend's `tcp-request content` rules are waiting (TCP mode): `inspect_exp` is
+    /// their delay, and the backend is chosen again when it is over.
+    pub be_inspect: bool,
     /// TCP mode, `tcp-response content` rules still deciding: the response is held from
     /// the client (no write, no shutdown) until they accept or reject it.
     pub res_inspect_pending: bool,
@@ -235,6 +250,7 @@ impl TcpSession {
             mode,
             client_addr: None,
             so_name: None,
+            so_id: None,
             cliexp,
             srvexp,
             req_uri: None,
@@ -254,10 +270,14 @@ impl TcpSession {
             max_retries: retries,
             retry_after: Tick::ETERNITY,
             cli_exp: Tick::ETERNITY,
+            http_request_ms: 0,
+            req_exp: Tick::ETERNITY,
             srv_exp: Tick::ETERNITY,
             conn_exp: Tick::ETERNITY,
             bytes_in: 0,
             bytes_out: 0,
+            stick_acct_in: 0,
+            stick_out_pending: 0,
             ending: None,
             accept_proxy: false,
             accept_proxy_v2: false,
@@ -277,6 +297,7 @@ impl TcpSession {
             fc_dst: None,
             tcp_inspect_done: true,
             inspect_exp: None,
+            be_inspect: false,
             res_inspect_pending: false,
             res_inspect_exp: None,
             res_inspect_armed: None,
@@ -396,6 +417,25 @@ impl TcpSession {
         } else {
             now.add(self.timeouts.client)
         };
+    }
+
+    /// Whether the request head is still being received: no transaction yet, and either
+    /// the connection is new or part of a request is here.
+    fn head_pending(&self) -> bool {
+        self.mode == Mode::Http && self.txn.is_none() && (self.is_first_req || !self.req.is_empty())
+    }
+
+    /// Starts `timeout http-request` when a request head starts, and ends it when the head
+    /// is complete.
+    pub fn arm_request(&mut self, now: Tick) {
+        if self.http_request_ms == 0 {
+            return;
+        }
+        if !self.head_pending() {
+            self.req_exp = Tick::ETERNITY;
+        } else if !self.req_exp.is_set() {
+            self.req_exp = now.add(self.http_request_ms);
+        }
     }
 
     fn arm_server(&mut self, now: Tick) {
@@ -648,6 +688,7 @@ impl TcpSession {
     /// Clears what belonged to the transaction that just ended, so the next request on
     /// this connection starts from nothing. The one place that list lives.
     pub fn reset_for_next_request(&mut self) {
+        self.stick_out_pending += self.log.bytes_from_server;
         self.log = crate::txnlog::StreamLog::start(self.bytes_in, self.bytes_out);
         self.txn = None;
         self.req_method = None;
@@ -1540,6 +1581,7 @@ impl TcpSession {
                 self.arm_server(now);
             }
         }
+        self.arm_request(now);
         Ok(())
     }
 
@@ -1565,6 +1607,9 @@ impl TcpSession {
             }
             self.cli_exp = Tick::ETERNITY;
         }
+        if self.req_exp.is_expired(now) && self.expire_request() {
+            return true;
+        }
         if self.srv_exp.is_expired(now) {
             if self.srv_timer_live() {
                 self.srv_state = ScState::Error;
@@ -1574,6 +1619,18 @@ impl TcpSession {
             self.srv_exp = Tick::ETERNITY;
         }
         false
+    }
+
+    /// `timeout http-request` is over: if the head is still not complete, that is the
+    /// client's timeout, `408` and all. Whether it fired.
+    fn expire_request(&mut self) -> bool {
+        self.req_exp = Tick::ETERNITY;
+        let live = self.head_pending() && self.cli_timer_live();
+        live.then(|| {
+            self.cli_state = ScState::Error;
+            self.ending.get_or_insert(Ending::Timeout(Which::Client));
+        })
+        .is_some()
     }
 
     fn conn_timer_live(&self) -> bool {
@@ -1613,9 +1670,9 @@ impl TcpSession {
     /// The earliest deadline across both sides, for the scheduler's wait queue.
     #[must_use]
     pub fn next_expiry(&self) -> Tick {
-        let mut exp = self.cli_exp.earliest(self.srv_exp).earliest(self.conn_exp).earliest(self.retry_after);
+        let mut exp = self.cli_exp.earliest(self.req_exp).earliest(self.srv_exp).earliest(self.conn_exp).earliest(self.retry_after);
         if let Some(i_exp) = self.inspect_exp {
-            if !self.tcp_inspect_done {
+            if !self.tcp_inspect_done || self.be_inspect {
                 exp = exp.earliest(i_exp);
             }
         }

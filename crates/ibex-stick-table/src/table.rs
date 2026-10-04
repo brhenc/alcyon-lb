@@ -37,12 +37,55 @@ pub struct TrackFlags {
     pub sess_cnt: bool,
     pub http_req_cnt: bool,
     pub http_err_cnt: bool,
-    pub http_fail_cnt: bool,
     pub bytes_in_cnt: bool,
     pub bytes_out_cnt: bool,
     pub gpc0: bool,
     pub gpc1: bool,
     pub gpt0: bool,
+    pub http_fail_cnt: bool,
+    pub glitch_cnt: bool,
+    pub server_id: bool,
+}
+
+/// The rate periods and array sizes of the data types the flags do not cover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StickExtra {
+    pub sess_rate_ms: Option<u64>,
+    pub bytes_in_rate_ms: Option<u64>,
+    pub bytes_out_rate_ms: Option<u64>,
+    pub http_fail_rate_ms: Option<u64>,
+    pub glitch_rate_ms: Option<u64>,
+    pub gpc0_rate_ms: Option<u64>,
+    pub gpc1_rate_ms: Option<u64>,
+    /// `gpc(<n>)`: the number of general purpose counters.
+    pub gpc_n: usize,
+    /// `gpc_rate(<n>,<period>)`: the number of counters with a rate, and its period.
+    pub gpc_rate_n: usize,
+    pub gpc_rate_ms: u64,
+    /// `gpt(<n>)`: the number of general purpose tags.
+    pub gpt_n: usize,
+}
+
+/// A general purpose counter: the legacy `gpc0` and `gpc1`, or an element of the array of
+/// `gpc(<n>)`; and, for the tags, `Zero` is `gpt0` and `Idx` an element of `gpt(<n>)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gpc {
+    Zero,
+    One,
+    Idx(usize),
+}
+
+/// What a rule, a fetch or a converter does to a general purpose counter or tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpcOp {
+    /// `inc_gpc`: one more, and a tick of its rate; gives the new value.
+    Inc,
+    /// `sc-add-gpc`: `n` more, and `n` ticks of its rate; gives the new value.
+    Add(u64),
+    /// `clr_gpc`: back to zero; gives the previous value.
+    Clr,
+    /// `sc-set-gpt`: the tag set; gives the value.
+    SetTag(u32),
 }
 
 /// Stick Table configuration options
@@ -56,6 +99,7 @@ pub struct StickTableConfig {
     pub track_conn_rate_ms: Option<u64>,
     pub track_http_req_rate_ms: Option<u64>,
     pub track_http_err_rate_ms: Option<u64>,
+    pub extra: StickExtra,
 }
 
 impl Default for StickTableConfig {
@@ -71,16 +115,19 @@ impl Default for StickTableConfig {
                 sess_cnt: true,
                 http_req_cnt: true,
                 http_err_cnt: true,
-                http_fail_cnt: true,
                 bytes_in_cnt: true,
                 bytes_out_cnt: true,
                 gpc0: true,
                 gpc1: true,
                 gpt0: true,
+                http_fail_cnt: true,
+                glitch_cnt: true,
+                server_id: true,
             },
             track_conn_rate_ms: Some(10_000),
             track_http_req_rate_ms: Some(10_000),
             track_http_err_rate_ms: Some(10_000),
+            extra: StickExtra::default(),
         }
     }
 }
@@ -401,6 +448,64 @@ impl StickTable {
         Ok(result)
     }
 
+    /// Applies `op` to the counter or tag `which` of the entry `key`, which is created when
+    /// `create` (`stktable_get_entry`; a lookup otherwise). `None` where the table does not
+    /// store that counter, `Some(0)` where the entry is not there and is not created.
+    pub fn gpc_op(&self, key: &StickKey, create: bool, which: Gpc, op: GpcOp) -> Option<i64> {
+        let x = &self.config.extra;
+        let f = self.config.flags;
+        // `gpc0`, `gpc1` and `gpt0` of a table that stores the array form are its elements 0 and 1.
+        let tag = matches!(op, GpcOp::SetTag(_));
+        let which = match which {
+            Gpc::Zero if !(if tag { f.gpt0 } else { f.gpc0 }) => Gpc::Idx(0),
+            Gpc::One if !f.gpc1 => Gpc::Idx(1),
+            w => w,
+        };
+        let stored = match (op, which) {
+            (GpcOp::SetTag(_), Gpc::Zero) => f.gpt0,
+            (GpcOp::SetTag(_), Gpc::Idx(i)) => i < x.gpt_n,
+            (GpcOp::SetTag(_), Gpc::One) => false,
+            (_, Gpc::Zero) => f.gpc0,
+            (_, Gpc::One) => f.gpc1,
+            (_, Gpc::Idx(i)) => i < x.gpc_n,
+        };
+        if !stored {
+            return None;
+        }
+        if !create && self.get_entry(key).ok().flatten().is_none() {
+            return Some(0);
+        }
+        let mut out = 0u64;
+        self.update_entry(key, |e| {
+            let (cnt, rate) = match which {
+                Gpc::Zero => (&mut e.gpc0, e.gpc0_rate.as_mut()),
+                Gpc::One => (&mut e.gpc1, e.gpc1_rate.as_mut()),
+                Gpc::Idx(i) => (&mut e.gpc[i], e.gpc_rate.get_mut(i)),
+            };
+            match op {
+                GpcOp::Inc | GpcOp::Add(_) => {
+                    let n = if let GpcOp::Add(n) = op { n } else { 1 };
+                    *cnt = cnt.saturating_add(n);
+                    if let Some(r) = rate {
+                        r.tick(n);
+                    }
+                    out = *cnt;
+                }
+                GpcOp::Clr => out = std::mem::take(cnt),
+                GpcOp::SetTag(v) => {
+                    match which {
+                        Gpc::Idx(i) => e.gpt[i] = v,
+                        // `One` is no tag: refused above, never here.
+                        Gpc::Zero | Gpc::One => e.gpt0 = v,
+                    }
+                    out = u64::from(v);
+                }
+            }
+        })
+        .ok()?;
+        Some(i64::try_from(out).unwrap_or(i64::MAX))
+    }
+
     fn create_default_entry(&self) -> StickEntryData {
         let mut entry = StickEntryData::default();
         if let Some(period) = self.config.track_conn_rate_ms {
@@ -412,6 +517,18 @@ impl StickTable {
         if let Some(period) = self.config.track_http_err_rate_ms {
             entry.http_err_rate = Some(SlidingRate::new(period));
         }
+        let x = &self.config.extra;
+        let rate = |ms: Option<u64>| ms.map(SlidingRate::new);
+        entry.sess_rate = rate(x.sess_rate_ms);
+        entry.bytes_in_rate = rate(x.bytes_in_rate_ms);
+        entry.bytes_out_rate = rate(x.bytes_out_rate_ms);
+        entry.http_fail_rate = rate(x.http_fail_rate_ms);
+        entry.glitch_rate = rate(x.glitch_rate_ms);
+        entry.gpc0_rate = rate(x.gpc0_rate_ms);
+        entry.gpc1_rate = rate(x.gpc1_rate_ms);
+        entry.gpc = vec![0; x.gpc_n];
+        entry.gpc_rate = (0..x.gpc_rate_n).map(|_| SlidingRate::new(x.gpc_rate_ms)).collect();
+        entry.gpt = vec![0; x.gpt_n];
         entry
     }
 
@@ -564,6 +681,50 @@ mod tests {
         assert!(table.get_entry(&k1).unwrap().is_some());
         assert!(table.get_entry(&k2).unwrap().is_none()); // Evicted
         assert!(table.get_entry(&k3).unwrap().is_some());
+    }
+
+    /// Counters and tags are written where the table stores them: not elsewhere, nothing is
+    /// created by a lookup-only write, and the legacy names reach the array's first elements.
+    #[test]
+    fn gpc_op_writes_what_the_table_stores() {
+        let key = StickKey::Integer(1);
+        let flags = TrackFlags { gpc0: true, gpt0: true, ..TrackFlags::default() };
+        let legacy = StickTable::new(StickTableConfig {
+            key_type: KeyType::Integer,
+            flags,
+            extra: StickExtra { gpc0_rate_ms: Some(1000), ..StickExtra::default() },
+            ..Default::default()
+        });
+        assert_eq!(legacy.gpc_op(&key, false, Gpc::Zero, GpcOp::Inc), Some(0), "not created by a lookup");
+        assert!(legacy.is_empty());
+        assert_eq!(legacy.gpc_op(&key, true, Gpc::Zero, GpcOp::Add(5)), Some(5));
+        assert_eq!(legacy.gpc_op(&key, true, Gpc::Zero, GpcOp::SetTag(9)), Some(9));
+        assert_eq!(legacy.get_entry(&key).unwrap().unwrap().gpt0, 9);
+        assert_eq!(legacy.gpc_op(&key, true, Gpc::Zero, GpcOp::Clr), Some(5));
+        // gpc1, an array element and a tag one of them is not stored.
+        assert_eq!(legacy.gpc_op(&key, true, Gpc::One, GpcOp::Inc), None);
+        assert_eq!(legacy.gpc_op(&key, true, Gpc::Idx(0), GpcOp::Inc), None);
+        assert_eq!(legacy.gpc_op(&key, true, Gpc::Idx(0), GpcOp::SetTag(1)), None);
+        assert_eq!(legacy.gpc_op(&key, true, Gpc::One, GpcOp::SetTag(1)), None);
+        let with_gpc1 = StickTable::new(StickTableConfig {
+            key_type: KeyType::Integer,
+            flags: TrackFlags { gpc1: true, ..TrackFlags::default() },
+            ..Default::default()
+        });
+        assert_eq!(with_gpc1.gpc_op(&key, true, Gpc::One, GpcOp::SetTag(1)), None, "gpc1 is no tag");
+        let array = StickTable::new(StickTableConfig {
+            key_type: KeyType::Integer,
+            flags: TrackFlags::default(),
+            extra: StickExtra { gpc_n: 2, gpt_n: 2, gpc_rate_n: 2, gpc_rate_ms: 1000, ..StickExtra::default() },
+            ..Default::default()
+        });
+        assert_eq!(array.gpc_op(&key, true, Gpc::Zero, GpcOp::Inc), Some(1), "gpc0 is element 0");
+        assert_eq!(array.gpc_op(&key, true, Gpc::One, GpcOp::Add(3)), Some(3), "gpc1 is element 1");
+        assert_eq!(array.gpc_op(&key, true, Gpc::Zero, GpcOp::SetTag(4)), Some(4), "gpt0 is element 0");
+        let e = array.get_entry(&key).unwrap().unwrap();
+        assert_eq!((e.gpc.clone(), e.gpt.clone()), (vec![1, 3], vec![4, 0]));
+        assert_eq!(e.gpc_rate[1].rate(), 3);
+        assert_eq!(array.gpc_op(&key, true, Gpc::Idx(2), GpcOp::Inc), None, "past the end");
     }
 
     /// The conversions measured on `HAProxy` 3.5-dev8-885761-29 (see `tests/stick_key_types.rs`

@@ -26,6 +26,8 @@ pub struct DefaultServerConfig {
     pub cookie: Option<String>,
     /// `disabled` / `enabled`: servers declared after start in maintenance.
     pub disabled: bool,
+    /// `track [<proxy>/]<server>`, as written.
+    pub track: Option<Box<str>>,
 }
 
 /// `verify none|required` on a server line.
@@ -184,6 +186,19 @@ pub struct UseServerRule {
     pub cond: AclCondition,
 }
 
+/// What a section knows about some of its servers beyond the `Server`s themselves. Kept
+/// apart, as `(index in the section's servers, value)` for those that have one, so a
+/// backend of 60,000 servers does not pay for them in every `Server`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ServerExtras {
+    /// `id <n>` (`SRV_F_FORCED_ID`): the server's explicit numeric id, what `srv_id` and
+    /// the `sid` column of `show stat` report.
+    pub puid: Vec<(u32, u32)>,
+    /// What `show servers state` reports as `srv_check_health` while no check runs on the
+    /// server, when that is not 0; see `parse_server`.
+    pub init_health: Vec<(u32, u32)>,
+}
+
 /// Backend server definition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Server {
@@ -224,6 +239,8 @@ pub struct Server {
     /// `disabled`: the server starts in maintenance and takes no traffic until the CLI's
     /// `enable server` brings it back.
     pub disabled: bool,
+    /// `track [<proxy>/]<server>`, as written.
+    pub track: Option<Box<str>>,
 }
 
 impl Default for Server {
@@ -246,6 +263,7 @@ impl Default for Server {
             proxy_v2_unique_id: false,
             cookie: None,
             disabled: false,
+            track: None,
         }
     }
 }
@@ -271,6 +289,7 @@ impl Server {
             proxy_v2_unique_id: false,
             cookie: None,
             disabled: false,
+            track: None,
         }
     }
 }

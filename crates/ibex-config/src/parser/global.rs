@@ -43,7 +43,7 @@ pub(crate) fn parse_global_directive(
         }
         "stats" => {
             if tokens.len() >= 3 && tokens[1].text == "socket" {
-                global.stats_socket = Some(tokens[2].text.clone());
+                let mut sock = crate::ast::StatsSocket { path: tokens[2].text.clone(), ..Default::default() };
                 let mut i = 3;
                 while i < tokens.len() {
                     match tokens[i].text.as_str() {
@@ -58,7 +58,7 @@ pub(crate) fn parse_global_directive(
                                         format!("invalid socket mode <{}>", tokens[i].text),
                                     )
                                 })?;
-                            global.stats_socket_mode = Some(mode_val);
+                            sock.mode = Some(mode_val);
                         }
                         "level" if i + 1 < tokens.len() => {
                             i += 1;
@@ -72,7 +72,7 @@ pub(crate) fn parse_global_directive(
                                     ),
                                 ));
                             }
-                            global.stats_socket_level = Some(tokens[i].text.clone());
+                            sock.level = Some(tokens[i].text.clone());
                         }
                         // Until this arm existed, `expose-fd listeners` fell into the
                         // catch-all below and was accepted and dropped -- so a HAProxy
@@ -87,11 +87,21 @@ pub(crate) fn parse_global_directive(
                                 ));
                             }
                             i += 1;
-                            global.stats_socket_expose_fd = true;
+                            sock.expose_fd = true;
                         }
                         _ => {}
                     }
                     i += 1;
+                }
+                // The first socket fills the fields every other part of Ibex reads; each
+                // later one (in this section or another) is kept beside it.
+                if global.stats_socket.is_none() {
+                    global.stats_socket = Some(sock.path);
+                    global.stats_socket_mode = sock.mode;
+                    global.stats_socket_level = sock.level;
+                    global.stats_socket_expose_fd = sock.expose_fd;
+                } else {
+                    global.extra_stats_sockets.push(sock);
                 }
             }
             Ok(())

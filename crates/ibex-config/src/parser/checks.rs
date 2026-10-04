@@ -177,6 +177,22 @@ pub(crate) fn parse_proto_check_option(
     }
 }
 
+/// `min-recv`, read as `atol` does (a text that is no number is 0), within -1 to INT_MAX.
+fn parse_min_recv(text: &str, kw: &Token) -> Result<i64, ConfigError> {
+    let t = text.trim_start();
+    let (neg, digits) = match t.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    let n: i64 = digits.chars().take_while(char::is_ascii_digit).collect::<String>().parse().unwrap_or(0);
+    let n = if neg { -n } else { n };
+    if (-1..=i64::from(i32::MAX)).contains(&n) {
+        Ok(n)
+    } else {
+        Err(check_err(kw, "'min-recv' expects -1 or an integer from 0 to INT_MAX"))
+    }
+}
+
 fn check_err(kw: &Token, msg: impl Into<String>) -> ConfigError {
     ConfigError::new(kw.line, kw.col, msg.into())
 }
@@ -384,9 +400,7 @@ pub(crate) fn parse_http_check_directive(
                 match key {
                     "min-recv" if !in_pattern => {
                         let v = arg(1, "a integer")?;
-                        min_recv = v.text.parse::<i64>().ok().filter(|m| (-1..=i64::from(i32::MAX)).contains(m)).ok_or_else(
-                            || check_err(kw, "'min-recv' expects -1 or an integer from 0 to INT_MAX"),
-                        )?;
+                        min_recv = parse_min_recv(&v.text, kw)?;
                         i += 1;
                     }
                     "comment" if !in_pattern => {
@@ -683,14 +697,7 @@ pub(crate) fn parse_tcp_check_directive(
                 if token_text == "min-recv" {
                     i += 1;
                     if i < tokens.len() {
-                        min_recv = Some(
-                            tokens[i]
-                                .text
-                                .parse::<i64>()
-                                .ok()
-                                .filter(|m| (-1..=i64::from(i32::MAX)).contains(m))
-                                .ok_or_else(|| check_err(kw, "'min-recv' expects -1 or an integer from 0 to INT_MAX"))?,
-                        );
+                        min_recv = Some(parse_min_recv(&tokens[i].text, kw)?);
                     }
                     i += 1;
                     continue;
@@ -710,6 +717,9 @@ pub(crate) fn parse_tcp_check_directive(
                     ptext = &ptext[1..];
                 }
 
+                if matches!(ptext, "string" | "binary" | "rstring") && pattern.is_some() {
+                    return Err(check_err(kw, "only one pattern expected"));
+                }
                 match ptext {
                     "string" => {
                         i += 1;
@@ -772,12 +782,10 @@ pub(crate) fn parse_tcp_check_directive(
             Ok(())
         }
         "comment" => {
-            let comment = if tokens.len() >= 3 {
-                tokens[2].text.clone()
-            } else {
-                String::new()
+            let Some(t) = tokens.get(2) else {
+                return Err(check_err(kw, "'comment' expects a string as argument"));
             };
-            rules.push(TcpCheckAction::Comment(comment));
+            rules.push(TcpCheckAction::Comment(t.text.clone()));
             Ok(())
         }
         other => Err(ConfigError::new(
@@ -1030,7 +1038,7 @@ pub(crate) fn register_section_checks(
             ResolvedCheckConfig::TcpSteps(steps)
         } else if httpchk.is_some() {
             let chk = build_resolved_http_check(httpchk, http_checks, server);
-            ResolvedCheckConfig::Http(chk)
+            ResolvedCheckConfig::Http(Box::new(chk))
         } else {
             ResolvedCheckConfig::TcpConnect
         };

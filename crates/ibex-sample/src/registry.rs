@@ -208,13 +208,53 @@ pub enum StickData {
     HttpReqRate,
     HttpErrCnt,
     HttpErrRate,
-    HttpFailCnt,
     /// `bytes_in_cnt`, in kilobytes (`bytes >> 10`).
     KbytesIn,
     KbytesOut,
     Gpc0,
     Gpc1,
     Gpt0,
+    /// `gpc0_rate` and `gpc1_rate`.
+    Gpc0Rate,
+    Gpc1Rate,
+    /// An element of the array of `gpc(<n>)`, of `gpc_rate(<n>,<period>)`, of `gpt(<n>)`.
+    GpcIdx(usize),
+    GpcRateIdx(usize),
+    GptIdx(usize),
+    SessRate,
+    BytesInRate,
+    BytesOutRate,
+    HttpFailCnt,
+    HttpFailRate,
+    GlitchCnt,
+    GlitchRate,
+    /// The streams that track the entry (`sc_trackers`, `table_trackers`).
+    Trackers,
+    /// `table_server_id`: the server the entry sticks to, 0 for none.
+    ServerId,
+    /// `table_expire`: the milliseconds before the entry expires.
+    Expire,
+    /// `table_idle`: the milliseconds since the entry was last used.
+    Idle,
+}
+
+/// The general purpose counter a write names: `gpc0`, `gpc1`, or an element of `gpc(<n>)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StickGpc {
+    Zero,
+    One,
+    Idx(usize),
+}
+
+/// What a fetch writes to a stick-table entry (`inc_gpc`, `clr_gpc`, `src_updt_conn_cnt`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StickOp {
+    /// `src_updt_conn_cnt`: one more connection counted; gives the new count.
+    UpdtConnCnt,
+    /// `*_inc_gpc*`: one more; gives the new value.
+    IncGpc(StickGpc),
+    /// `*_clr_gpc*`: back to 0; gives the previous value.
+    ClrGpc(StickGpc),
 }
 
 /// The stick-table entries a stream tracks, which the `sc_*`, `sc[0-9]_*` and `src_*`
@@ -231,6 +271,17 @@ pub trait StickState: std::fmt::Debug {
     /// exists (the one the fetch names, or else the current proxies' own); it is looked up,
     /// never created.
     fn source(&self, addr: IpAddr, tables: &[&str], data: StickData) -> Option<i64>;
+    /// Writes `op` to the entry tracked in `slot` (or the one of the same key in `table`,
+    /// which is looked up and not created); the value the fetch gives. No sample where nothing
+    /// is tracked or the table does not store what is written.
+    fn write_tracked(&self, slot: usize, table: Option<&str>, op: StickOp) -> Option<i64>;
+    /// Writes `op` to the entry of `addr` in the first of `tables` that exists, which is
+    /// created if need be (`src_updt_conn_cnt`, `src_inc_gpc0`).
+    fn write_source(&self, addr: IpAddr, tables: &[&str], op: StickOp) -> Option<i64>;
+    /// The key of the entry tracked in `slot` (`sc_key`), as a sample of the table's key
+    /// type, or of the entry of the same key in `table`; `None` where nothing is tracked
+    /// (`sc_tracked` is whether there is one).
+    fn tracked_key(&self, slot: usize, table: Option<&str>) -> Option<Sample>;
 }
 
 /// The live state of the configured proxies, which the runtime provides through
@@ -266,6 +317,12 @@ pub trait ProxyState: std::fmt::Debug {
     /// the table has no such entry, `None` if there is no such table or it does not store
     /// `data`.
     fn table_value(&self, table: &str, key: &Sample, data: StickData) -> Option<i64>;
+    /// `table_cnt` and `table_avl`: the entries of the stick table `table` and the ones it
+    /// can still take; `None` if there is no such table.
+    fn table_usage(&self, table: &str) -> Option<(i64, i64)>;
+    /// `table_inc_gpc*` and `table_clr_gpc*`: writes `op` to the entry of `key` in `table`,
+    /// which is created; `None` if there is no such table or it does not store what is written.
+    fn table_write(&self, table: &str, key: &Sample, op: StickOp) -> Option<i64>;
 }
 
 /// A sample fetch implementation.
@@ -296,54 +353,6 @@ pub const NOT_IMPLEMENTED: &[(&str, &str)] = &[
     ("avg_queue", "Ibex has no server queues"),
     ("srv_queue", "Ibex has no server queues"),
     ("be_conn", "Ibex does not count the streams on a backend"),
-    ("sc_trackers", "Ibex keeps no tracker count on stick-table entries"),
-    ("sc_sess_rate", "Ibex does not measure the session rate of a stick-table entry"),
-    ("sc_bytes_in_rate", "Ibex does not measure the bytes rate of a stick-table entry"),
-    ("sc_bytes_out_rate", "Ibex does not measure the bytes rate of a stick-table entry"),
-    ("sc_gpc0_rate", "Ibex does not measure the rate of a general purpose counter"),
-    ("sc_gpc1_rate", "Ibex does not measure the rate of a general purpose counter"),
-    ("sc0_sess_rate", "Ibex does not measure the session rate of a stick-table entry"),
-    ("sc0_bytes_in_rate", "Ibex does not measure the bytes rate of a stick-table entry"),
-    ("sc0_bytes_out_rate", "Ibex does not measure the bytes rate of a stick-table entry"),
-    ("sc0_gpc0_rate", "Ibex does not measure the rate of a general purpose counter"),
-    ("sc0_gpc1_rate", "Ibex does not measure the rate of a general purpose counter"),
-    ("sc1_sess_rate", "Ibex does not measure the session rate of a stick-table entry"),
-    ("sc1_bytes_in_rate", "Ibex does not measure the bytes rate of a stick-table entry"),
-    ("sc1_bytes_out_rate", "Ibex does not measure the bytes rate of a stick-table entry"),
-    ("sc1_gpc0_rate", "Ibex does not measure the rate of a general purpose counter"),
-    ("sc1_gpc1_rate", "Ibex does not measure the rate of a general purpose counter"),
-    ("sc2_sess_rate", "Ibex does not measure the session rate of a stick-table entry"),
-    ("sc2_bytes_in_rate", "Ibex does not measure the bytes rate of a stick-table entry"),
-    ("sc2_bytes_out_rate", "Ibex does not measure the bytes rate of a stick-table entry"),
-    ("sc2_gpc0_rate", "Ibex does not measure the rate of a general purpose counter"),
-    ("sc2_gpc1_rate", "Ibex does not measure the rate of a general purpose counter"),
-    ("src_sess_rate", "Ibex does not measure the session rate of a stick-table entry"),
-    ("src_bytes_in_rate", "Ibex does not measure the bytes rate of a stick-table entry"),
-    ("src_bytes_out_rate", "Ibex does not measure the bytes rate of a stick-table entry"),
-    ("src_gpc0_rate", "Ibex does not measure the rate of a general purpose counter"),
-    ("src_gpc1_rate", "Ibex does not measure the rate of a general purpose counter"),
-    ("table_sess_rate", "Ibex implements only the stick-table converters that read a counter"),
-    ("table_bytes_in_rate", "Ibex implements only the stick-table converters that read a counter"),
-    ("table_bytes_out_rate", "Ibex implements only the stick-table converters that read a counter"),
-    ("table_trackers", "Ibex implements only the stick-table converters that read a counter"),
-    ("table_expire", "Ibex implements only the stick-table converters that read a counter"),
-    ("table_server_id", "Ibex implements only the stick-table converters that read a counter"),
-    ("table_gpc", "Ibex implements only the stick-table converters that read a counter"),
-    ("table_gpt", "Ibex implements only the stick-table converters that read a counter"),
-    ("table_gpc0_rate", "Ibex implements only the stick-table converters that read a counter"),
-    ("table_gpc1_rate", "Ibex implements only the stick-table converters that read a counter"),
-    ("table_gpc_rate", "Ibex implements only the stick-table converters that read a counter"),
-    ("table_glitch_cnt", "Ibex implements only the stick-table converters that read a counter"),
-    ("table_glitch_rate", "Ibex implements only the stick-table converters that read a counter"),
-    ("table_http_fail_cnt", "Ibex implements only the stick-table converters that read a counter"),
-    ("table_http_fail_rate", "Ibex implements only the stick-table converters that read a counter"),
-    ("table_inc_gpc0", "Ibex implements only the stick-table converters that read a counter"),
-    ("table_inc_gpc1", "Ibex implements only the stick-table converters that read a counter"),
-    ("table_inc_gpc", "Ibex implements only the stick-table converters that read a counter"),
-    ("table_clr_gpc0", "Ibex implements only the stick-table converters that read a counter"),
-    ("table_clr_gpc1", "Ibex implements only the stick-table converters that read a counter"),
-    ("table_clr_gpc", "Ibex implements only the stick-table converters that read a counter"),
-    ("table_idle", "Ibex implements only the stick-table converters that read a counter"),
 ];
 
 /// Why `name` -- a fetch or a converter -- is in [`NOT_IMPLEMENTED`].
@@ -387,6 +396,31 @@ fn source_tables<'a>(ctx: &'a SampleContext, args: &'a [String]) -> Vec<&'a str>
         Some(t) => vec![t],
         None => ctx.be_name.into_iter().chain(ctx.fe_name).collect(),
     }
+}
+
+/// What a stick-counter fetch does to the entry it names.
+#[derive(Clone, Copy)]
+enum Act {
+    Read(StickData),
+    Write(StickOp),
+}
+
+/// The entry a stick-counter fetch names: what a stream tracks in a slot (and the table
+/// to look the same key up in), or the client's address in the first of some tables.
+enum Target<'a> {
+    Slot(usize, Option<&'a str>),
+    Source(&'a [&'a str]),
+}
+
+fn stick_act(ctx: &SampleContext, target: Target, act: Act) -> Option<Sample> {
+    let stick = ctx.stick?;
+    match (target, act) {
+        (Target::Slot(slot, table), Act::Read(d)) => stick.tracked(slot, table, d),
+        (Target::Slot(slot, table), Act::Write(op)) => stick.write_tracked(slot, table, op),
+        (Target::Source(tables), Act::Read(d)) => stick.source(ctx.client_addr?.ip(), tables, d),
+        (Target::Source(tables), Act::Write(op)) => stick.write_source(ctx.client_addr?.ip(), tables, op),
+    }
+    .map(Sample::Sint)
 }
 
 /// A `sc[0-9]_*` or `src_*` fetch's optional `[<table>]` argument.
@@ -1673,9 +1707,189 @@ impl Registry {
         reg_stick!("http_req_rate", StickData::HttpReqRate);
         reg_stick!("http_err_cnt", StickData::HttpErrCnt);
         reg_stick!("http_err_rate", StickData::HttpErrRate);
-        reg_stick!("http_fail_cnt", StickData::HttpFailCnt);
         reg_stick!("kbytes_in", StickData::KbytesIn);
         reg_stick!("kbytes_out", StickData::KbytesOut);
+        reg_stick!("sess_rate", StickData::SessRate);
+        reg_stick!("http_fail_cnt", StickData::HttpFailCnt);
+        reg_stick!("http_fail_rate", StickData::HttpFailRate);
+        reg_stick!("bytes_in_rate", StickData::BytesInRate);
+        reg_stick!("bytes_out_rate", StickData::BytesOutRate);
+        reg_stick!("glitch_cnt", StickData::GlitchCnt);
+        reg_stick!("glitch_rate", StickData::GlitchRate);
+
+        // The general purpose counters and tags. `sc_get_gpc0(<ctr>[,<table>])`,
+        // `sc[0-2]_get_gpc0([<table>])` and `src_get_gpc0(<table>)` read, `*_inc_gpc0` and
+        // `*_clr_gpc0` (and `1`) write, `gpc0_rate` reads the rate; the array forms take the
+        // element first: `sc_get_gpc(<idx>,<ctr>[,<table>])`, `src_get_gpc(<idx>,<table>)`.
+        // `sc1_clr_gpc` is the only `sc[0-2]_` shorthand of an array form `HAProxy` registers.
+        macro_rules! reg_legacy {
+            ($suffix:literal, $read:expr) => {
+                self.register_fetch(FetchDesc {
+                    name: concat!("sc_", $suffix),
+                    out_type: SampleType::Sint,
+                    func: |ctx, args| {
+                        let slot = args.first()?.parse::<usize>().ok()?;
+                        let table = args.get(1).map(String::as_str).filter(|a| !a.is_empty());
+                        stick_act(ctx, Target::Slot(slot, table), $read)
+                    },
+                });
+                self.register_fetch(FetchDesc {
+                    name: concat!("sc0_", $suffix),
+                    out_type: SampleType::Sint,
+                    func: |ctx, args| stick_act(ctx, Target::Slot(0, table_arg(args)), $read),
+                });
+                self.register_fetch(FetchDesc {
+                    name: concat!("sc1_", $suffix),
+                    out_type: SampleType::Sint,
+                    func: |ctx, args| stick_act(ctx, Target::Slot(1, table_arg(args)), $read),
+                });
+                self.register_fetch(FetchDesc {
+                    name: concat!("sc2_", $suffix),
+                    out_type: SampleType::Sint,
+                    func: |ctx, args| stick_act(ctx, Target::Slot(2, table_arg(args)), $read),
+                });
+                self.register_fetch(FetchDesc {
+                    name: concat!("src_", $suffix),
+                    out_type: SampleType::Sint,
+                    func: |ctx, args| stick_act(ctx, Target::Source(&source_tables(ctx, args)), $read),
+                });
+            };
+        }
+        reg_legacy!("get_gpc0", Act::Read(StickData::Gpc0));
+        reg_legacy!("get_gpc1", Act::Read(StickData::Gpc1));
+        reg_legacy!("get_gpt0", Act::Read(StickData::Gpt0));
+        reg_legacy!("gpc0_rate", Act::Read(StickData::Gpc0Rate));
+        reg_legacy!("gpc1_rate", Act::Read(StickData::Gpc1Rate));
+        reg_legacy!("inc_gpc0", Act::Write(StickOp::IncGpc(StickGpc::Zero)));
+        reg_legacy!("inc_gpc1", Act::Write(StickOp::IncGpc(StickGpc::One)));
+        reg_legacy!("clr_gpc0", Act::Write(StickOp::ClrGpc(StickGpc::Zero)));
+        reg_legacy!("clr_gpc1", Act::Write(StickOp::ClrGpc(StickGpc::One)));
+        macro_rules! reg_array {
+            ($suffix:literal, $idx:ident => $act:expr) => {
+                self.register_fetch(FetchDesc {
+                    name: concat!("sc_", $suffix),
+                    out_type: SampleType::Sint,
+                    func: |ctx, args| {
+                        let $idx = args.first()?.parse::<usize>().ok()?;
+                        let slot = args.get(1)?.parse::<usize>().ok()?;
+                        let table = args.get(2).map(String::as_str).filter(|a| !a.is_empty());
+                        stick_act(ctx, Target::Slot(slot, table), $act)
+                    },
+                });
+                self.register_fetch(FetchDesc {
+                    name: concat!("src_", $suffix),
+                    out_type: SampleType::Sint,
+                    func: |ctx, args| {
+                        let $idx = args.first()?.parse::<usize>().ok()?;
+                        let tables: Vec<&str> = match args.get(1).map(String::as_str).filter(|a| !a.is_empty()) {
+                            Some(t) => vec![t],
+                            None => ctx.be_name.into_iter().chain(ctx.fe_name).collect(),
+                        };
+                        stick_act(ctx, Target::Source(&tables), $act)
+                    },
+                });
+            };
+        }
+        reg_array!("get_gpc", i => Act::Read(StickData::GpcIdx(i)));
+        reg_array!("get_gpt", i => Act::Read(StickData::GptIdx(i)));
+        reg_array!("gpc_rate", i => Act::Read(StickData::GpcRateIdx(i)));
+        reg_array!("inc_gpc", i => Act::Write(StickOp::IncGpc(StickGpc::Idx(i))));
+        reg_array!("clr_gpc", i => Act::Write(StickOp::ClrGpc(StickGpc::Idx(i))));
+        self.register_fetch(FetchDesc {
+            name: "sc1_clr_gpc",
+            out_type: SampleType::Sint,
+            func: |ctx, args| {
+                let i = args.first()?.parse::<usize>().ok()?;
+                let table = args.get(1).map(String::as_str).filter(|a| !a.is_empty());
+                stick_act(ctx, Target::Slot(1, table), Act::Write(StickOp::ClrGpc(StickGpc::Idx(i))))
+            },
+        });
+        // `sc_trackers` has no `src_` form in `HAProxy` (it is a stream's tracker count).
+        self.register_fetch(FetchDesc {
+            name: "sc_trackers",
+            out_type: SampleType::Sint,
+            func: |ctx, args| {
+                let slot = args.first()?.parse::<usize>().ok()?;
+                let table = args.get(1).map(String::as_str).filter(|a| !a.is_empty());
+                ctx.stick?.tracked(slot, table, StickData::Trackers).map(Sample::Sint)
+            },
+        });
+        self.register_fetch(FetchDesc {
+            name: "sc0_trackers",
+            out_type: SampleType::Sint,
+            func: |ctx, args| ctx.stick?.tracked(0, table_arg(args), StickData::Trackers).map(Sample::Sint),
+        });
+        self.register_fetch(FetchDesc {
+            name: "sc1_trackers",
+            out_type: SampleType::Sint,
+            func: |ctx, args| ctx.stick?.tracked(1, table_arg(args), StickData::Trackers).map(Sample::Sint),
+        });
+        self.register_fetch(FetchDesc {
+            name: "sc2_trackers",
+            out_type: SampleType::Sint,
+            func: |ctx, args| ctx.stick?.tracked(2, table_arg(args), StickData::Trackers).map(Sample::Sint),
+        });
+        // `smp_fetch_sc_key` and `smp_fetch_sc_tracked`.
+        self.register_fetch(FetchDesc {
+            name: "sc_key",
+            out_type: SampleType::Str,
+            func: |ctx, args| ctx.stick?.tracked_key(args.first()?.parse().ok()?, None),
+        });
+        self.register_fetch(FetchDesc {
+            name: "sc_tracked",
+            out_type: SampleType::Bool,
+            func: |ctx, args| {
+                let table = args.get(1).map(String::as_str).filter(|a| !a.is_empty());
+                Some(Sample::Bool(ctx.stick?.tracked_key(args.first()?.parse().ok()?, table).is_some()))
+            },
+        });
+        self.register_fetch(FetchDesc {
+            name: "sc0_key",
+            out_type: SampleType::Str,
+            func: |ctx, _args| ctx.stick?.tracked_key(0, None),
+        });
+        self.register_fetch(FetchDesc {
+            name: "sc1_key",
+            out_type: SampleType::Str,
+            func: |ctx, _args| ctx.stick?.tracked_key(1, None),
+        });
+        self.register_fetch(FetchDesc {
+            name: "sc2_key",
+            out_type: SampleType::Str,
+            func: |ctx, _args| ctx.stick?.tracked_key(2, None),
+        });
+        self.register_fetch(FetchDesc {
+            name: "sc0_tracked",
+            out_type: SampleType::Bool,
+            func: |ctx, args| Some(Sample::Bool(ctx.stick?.tracked_key(0, table_arg(args)).is_some())),
+        });
+        self.register_fetch(FetchDesc {
+            name: "sc1_tracked",
+            out_type: SampleType::Bool,
+            func: |ctx, args| Some(Sample::Bool(ctx.stick?.tracked_key(1, table_arg(args)).is_some())),
+        });
+        self.register_fetch(FetchDesc {
+            name: "sc2_tracked",
+            out_type: SampleType::Bool,
+            func: |ctx, args| Some(Sample::Bool(ctx.stick?.tracked_key(2, table_arg(args)).is_some())),
+        });
+        // `smp_fetch_src_updt_conn_cnt`: creates or updates the client's entry.
+        self.register_fetch(FetchDesc {
+            name: "src_updt_conn_cnt",
+            out_type: SampleType::Sint,
+            func: |ctx, args| ctx.stick?.write_source(ctx.client_addr?.ip(), &source_tables(ctx, args), StickOp::UpdtConnCnt).map(Sample::Sint),
+        });
+        // `smp_fetch_table_cnt` and `smp_fetch_table_avl`.
+        self.register_fetch(FetchDesc {
+            name: "table_cnt",
+            out_type: SampleType::Sint,
+            func: |ctx, args| ctx.proxies?.table_usage(source_tables(ctx, args).first()?).map(|(used, _)| Sample::Sint(used)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "table_avl",
+            out_type: SampleType::Sint,
+            func: |ctx, args| ctx.proxies?.table_usage(source_tables(ctx, args).first()?).map(|(_, avl)| Sample::Sint(avl)),
+        });
 
         crate::auth::register(self);
         crate::rfc7239::register(self);
@@ -3548,6 +3762,97 @@ impl Registry {
         reg_table_conv!("table_http_err_rate", StickData::HttpErrRate);
         reg_table_conv!("table_kbytes_in", StickData::KbytesIn);
         reg_table_conv!("table_kbytes_out", StickData::KbytesOut);
+        reg_table_conv!("table_sess_rate", StickData::SessRate);
+        reg_table_conv!("table_http_fail_cnt", StickData::HttpFailCnt);
+        reg_table_conv!("table_http_fail_rate", StickData::HttpFailRate);
+        reg_table_conv!("table_bytes_in_rate", StickData::BytesInRate);
+        reg_table_conv!("table_bytes_out_rate", StickData::BytesOutRate);
+        reg_table_conv!("table_glitch_cnt", StickData::GlitchCnt);
+        reg_table_conv!("table_glitch_rate", StickData::GlitchRate);
+        reg_table_conv!("table_trackers", StickData::Trackers);
+        reg_table_conv!("table_server_id", StickData::ServerId);
+        // `table_expire(<table>[,<default>])` and `table_idle`: the time of an entry, in
+        // milliseconds; the default (none: no sample) where the entry is not in the table.
+        macro_rules! reg_table_time {
+            ($name:literal, $data:expr) => {
+                self.register_ctx_converter(CtxConvDesc {
+                    name: $name,
+                    in_type: TypeSpec::Any,
+                    out_type: TypeSpec::Exact(SampleType::Sint),
+                    func: |ctx, smp, args| {
+                        let proxies = ctx.proxies?;
+                        let found = match table_arg(args) {
+                            Some(t) => proxies.table_value(t, &smp, $data),
+                            None => ctx
+                                .be_name
+                                .and_then(|t| proxies.table_value(t, &smp, $data))
+                                .or_else(|| proxies.table_value(ctx.fe_name?, &smp, $data)),
+                        };
+                        let default = args.get(1).and_then(|d| d.trim().parse::<i64>().ok());
+                        found.or(default).map(Sample::Sint)
+                    },
+                });
+            };
+        }
+        reg_table_time!("table_expire", StickData::Expire);
+        reg_table_time!("table_idle", StickData::Idle);
+        // The counters and tags that take an element (`table_gpc(<idx>,<table>)`), the rates of
+        // the legacy ones, and the converters that write (`table_inc_gpc0`, `table_clr_gpc`).
+        macro_rules! reg_table_conv_at {
+            ($name:literal, $pos:literal, $idx:ident => $data:expr) => {
+                self.register_ctx_converter(CtxConvDesc {
+                    name: $name,
+                    in_type: TypeSpec::Any,
+                    out_type: TypeSpec::Exact(SampleType::Sint),
+                    func: |ctx, smp, args| {
+                        let proxies = ctx.proxies?;
+                        let $idx = if $pos == 1 { args.first()?.trim().parse::<usize>().ok()? } else { 0 };
+                        let table = args.get($pos).map(String::as_str).filter(|a| !a.is_empty());
+                        match table {
+                            Some(t) => proxies.table_value(t, &smp, $data),
+                            None => ctx
+                                .be_name
+                                .and_then(|t| proxies.table_value(t, &smp, $data))
+                                .or_else(|| proxies.table_value(ctx.fe_name?, &smp, $data)),
+                        }
+                        .map(Sample::Sint)
+                    },
+                });
+            };
+        }
+        reg_table_conv_at!("table_gpc", 1, i => StickData::GpcIdx(i));
+        reg_table_conv_at!("table_gpt", 1, i => StickData::GptIdx(i));
+        reg_table_conv_at!("table_gpc_rate", 1, i => StickData::GpcRateIdx(i));
+        reg_table_conv_at!("table_gpc0_rate", 0, _i => StickData::Gpc0Rate);
+        reg_table_conv_at!("table_gpc1_rate", 0, _i => StickData::Gpc1Rate);
+        macro_rules! reg_table_write {
+            ($name:literal, $pos:literal, $idx:ident => $op:expr) => {
+                self.register_ctx_converter(CtxConvDesc {
+                    name: $name,
+                    in_type: TypeSpec::Any,
+                    out_type: TypeSpec::Exact(SampleType::Sint),
+                    func: |ctx, smp, args| {
+                        let proxies = ctx.proxies?;
+                        let $idx = if $pos == 1 { args.first()?.trim().parse::<usize>().ok()? } else { 0 };
+                        let table = args.get($pos).map(String::as_str).filter(|a| !a.is_empty());
+                        match table {
+                            Some(t) => proxies.table_write(t, &smp, $op),
+                            None => ctx
+                                .be_name
+                                .and_then(|t| proxies.table_write(t, &smp, $op))
+                                .or_else(|| proxies.table_write(ctx.fe_name?, &smp, $op)),
+                        }
+                        .map(Sample::Sint)
+                    },
+                });
+            };
+        }
+        reg_table_write!("table_inc_gpc", 1, i => StickOp::IncGpc(StickGpc::Idx(i)));
+        reg_table_write!("table_clr_gpc", 1, i => StickOp::ClrGpc(StickGpc::Idx(i)));
+        reg_table_write!("table_inc_gpc0", 0, _i => StickOp::IncGpc(StickGpc::Zero));
+        reg_table_write!("table_inc_gpc1", 0, _i => StickOp::IncGpc(StickGpc::One));
+        reg_table_write!("table_clr_gpc0", 0, _i => StickOp::ClrGpc(StickGpc::Zero));
+        reg_table_write!("table_clr_gpc1", 0, _i => StickOp::ClrGpc(StickGpc::One));
         reg_table_conv!("table_gpc0", StickData::Gpc0);
         reg_table_conv!("table_gpc1", StickData::Gpc1);
         reg_table_conv!("table_gpt0", StickData::Gpt0);
@@ -4644,10 +4949,6 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let doy = (153 * mp + 2) / 5 + d - 1; // 0..=365
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     era * 146_097 + doe - 719_468
-}
-
-fn format_time(epoch: i64, format: &str) -> String {
-    format_time_ns(epoch, 0, format, false)
 }
 
 /// `epoch` seconds and `nanos` nanoseconds; `%N` prints the nanoseconds on 9 digits and

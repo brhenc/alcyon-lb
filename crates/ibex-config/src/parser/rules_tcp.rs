@@ -131,6 +131,21 @@ pub(crate) fn parse_tcp_req_session(
             ));
         }
         rules.push(TcpReqSessionRule { action: TcpReqSessionAction::ScSetGpt0 { sc, expr }, cond });
+    } else if let Some((idx, sc)) = parse_gpc_array_action(act_str, "sc-inc-gpc", act_tok)? {
+        let (_, cond) = parse_rule_condition(tokens, 3)?;
+        rules.push(TcpReqSessionRule { action: TcpReqSessionAction::ScIncGpc { idx, sc }, cond });
+    } else if let Some((idx, sc)) = parse_gpc_array_action(act_str, "sc-add-gpc", act_tok)? {
+        let (cond_idx, cond) = parse_rule_condition(tokens, 4)?;
+        let expr = join_tokens_until(tokens, 3, cond_idx);
+        // No value is 0: `strtol` reads nothing and the end of the line is what it stopped at.
+        let expr = if expr.is_empty() { "0".to_string() } else { expr };
+        rules.push(TcpReqSessionRule { action: TcpReqSessionAction::ScAddGpc { idx, sc, expr }, cond });
+    } else if let Some((idx, sc)) = parse_gpc_array_action(act_str, "sc-set-gpt", act_tok)? {
+        let (cond_idx, cond) = parse_rule_condition(tokens, 4)?;
+        let expr = join_tokens_until(tokens, 3, cond_idx);
+        // No value is 0: `strtol` reads nothing and the end of the line is what it stopped at.
+        let expr = if expr.is_empty() { "0".to_string() } else { expr };
+        rules.push(TcpReqSessionRule { action: TcpReqSessionAction::ScSetGpt { idx, sc, expr }, cond });
     } else {
         match act_str.as_str() {
             "track-sc0" | "track-sc1" | "track-sc2" => {
@@ -368,6 +383,21 @@ fn parse_tcp_req_content_at(
             ));
         }
         rules.push(TcpReqContentRule { action: TcpReqContentAction::ScSetGpt0 { sc, expr }, cond, line: 0 });
+    } else if let Some((idx, sc)) = parse_gpc_array_action(act_str, "sc-inc-gpc", act_tok)? {
+        let (_, cond) = parse_rule_condition(tokens, 3)?;
+        rules.push(TcpReqContentRule { action: TcpReqContentAction::ScIncGpc { idx, sc }, cond, line: 0 });
+    } else if let Some((idx, sc)) = parse_gpc_array_action(act_str, "sc-add-gpc", act_tok)? {
+        let (cond_idx, cond) = parse_rule_condition(tokens, 4)?;
+        let expr = join_tokens_until(tokens, 3, cond_idx);
+        // No value is 0: `strtol` reads nothing and the end of the line is what it stopped at.
+        let expr = if expr.is_empty() { "0".to_string() } else { expr };
+        rules.push(TcpReqContentRule { action: TcpReqContentAction::ScAddGpc { idx, sc, expr }, cond, line: 0 });
+    } else if let Some((idx, sc)) = parse_gpc_array_action(act_str, "sc-set-gpt", act_tok)? {
+        let (cond_idx, cond) = parse_rule_condition(tokens, 4)?;
+        let expr = join_tokens_until(tokens, 3, cond_idx);
+        // No value is 0: `strtol` reads nothing and the end of the line is what it stopped at.
+        let expr = if expr.is_empty() { "0".to_string() } else { expr };
+        rules.push(TcpReqContentRule { action: TcpReqContentAction::ScSetGpt { idx, sc, expr }, cond, line: 0 });
     } else if act_str.starts_with("lua.") {
         return Err(ConfigError::new(
             act_tok.line,
@@ -620,3 +650,52 @@ pub(crate) fn parse_track_sc_args(
     Ok((expr, table, cond_start))
 }
 
+
+/// The array forms of the general purpose actions: `sc-inc-gpc(<idx>,<sc>)`,
+/// `sc-add-gpc(<idx>,<sc>) <value>` and `sc-set-gpt(<idx>,<sc>) <value>` (`parse_inc_gpc`,
+/// `parse_add_gpc` and `parse_set_gpt`, `src/stick_table.c`, which words the messages).
+/// `None` if `act_str` is not one of them; the legacy `sc-inc-gpc0`, `sc-inc-gpc1` and
+/// `sc-set-gpt0` are parsed before this is asked.
+pub(crate) fn parse_gpc_array_action(
+    act_str: &str,
+    prefix: &str,
+    act_tok: &Token,
+) -> Result<Option<(usize, u8)>, ConfigError> {
+    let Some(rest) = act_str.strip_prefix(prefix) else { return Ok(None) };
+    let err = |m: String| ConfigError::new(act_tok.line, act_tok.col, m);
+    let add = prefix == "sc-add-gpc";
+    let what = if prefix == "sc-set-gpt" { "GPT" } else { "GPC" };
+    let expects = format!("Expects {prefix}(<{what} ID>,<Track ID>)");
+    let Some(args) = rest.strip_prefix('(') else {
+        return Err(err(if add {
+            format!("Missing or invalid arguments for '{act_str}'. {expects}")
+        } else {
+            format!("invalid {} ID '{act_str}'. {expects}", what.to_lowercase())
+        }));
+    };
+    // `strtoul`: the digits, which must be followed by the comma.
+    let digits = args.bytes().take_while(u8::is_ascii_digit).count();
+    let Some(after) = args[digits..].strip_prefix(',') else {
+        return Err(err(if add {
+            format!("Missing gpc ID. Expects {act_str}(<GPC ID>,<Track ID>)")
+        } else {
+            format!("Missing {} ID '{act_str}'. {expects}", what.to_lowercase())
+        }));
+    };
+    let idx = args[..digits].parse::<usize>().unwrap_or(usize::MAX);
+    let sc_digits = after.strip_prefix('-').map_or(0, |_| 1) + after.trim_start_matches('-').bytes().take_while(u8::is_ascii_digit).count();
+    let Some(tail) = after[sc_digits..].strip_prefix(')').filter(|t| t.is_empty()) else {
+        return Err(err(format!(
+            "invalid stick table track ID '{}'. {expects}",
+            if add { after } else { act_str }
+        )));
+    };
+    debug_assert!(tail.is_empty());
+    match after[..sc_digits].parse::<i64>() {
+        Ok(sc) if (0..3).contains(&sc) => Ok(Some((idx, u8::try_from(sc).unwrap_or(0)))),
+        _ => Err(err(format!(
+            "invalid stick table track ID '{act_str}'. The max allowed ID is 2{}",
+            if prefix == "sc-set-gpt" { "" } else { " (tune.stick-counters)" }
+        ))),
+    }
+}

@@ -47,3 +47,24 @@ fn the_sets_are_built_as_haproxy_builds_them() {
     let e = g.http_err_codes.expect("set");
     assert!(e.contains(300) && e.contains(310) && e.contains(320) && e.contains(401) && !e.contains(400));
 }
+
+/// What `http_err_cnt` and `http_fail_cnt` count without the keywords: 400 to 499, and 500 to
+/// 599 but 501 and 505, and nothing else (this replaces the stick-table crate's
+/// `response_class` test, whose rule is now the default of these sets).
+#[test]
+fn the_default_sets_are_the_error_and_failure_classes() {
+    use ibex_config::StatusCodeSet;
+    let (err, fail) = (StatusCodeSet::default_err(), StatusCodeSet::default_fail());
+    for status in [100, 200, 204, 301, 304, 399, 600] {
+        assert!(!err.contains(status) && !fail.contains(status), "status {status}");
+    }
+    for status in [501, 505] {
+        assert!(!err.contains(status) && !fail.contains(status), "status {status}");
+    }
+    for status in [400, 401, 404, 429, 499] {
+        assert!(err.contains(status) && !fail.contains(status), "status {status}");
+    }
+    for status in [500, 502, 503, 504, 506, 599] {
+        assert!(!err.contains(status) && fail.contains(status), "status {status}");
+    }
+}
