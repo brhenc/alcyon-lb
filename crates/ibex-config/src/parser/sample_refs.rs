@@ -92,6 +92,7 @@ pub(crate) fn collect(section: &CurrentSection, tokens: &[Token], out: &mut Vec<
             proxy: proxy.clone(),
             acl,
             directive: tokens[0].text.clone(),
+            action: tokens.get(1).map(|t| t.text.clone()).unwrap_or_default(),
             expr: expr.to_string(),
         });
     };

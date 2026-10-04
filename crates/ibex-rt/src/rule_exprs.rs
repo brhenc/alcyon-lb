@@ -102,6 +102,31 @@ pub fn check_sample_expr(expr: &str, registry: &Registry) -> Result<(), String> 
     Ok(())
 }
 
+/// What a fetch that reads only the HTTP response needs of it, in `HAProxy`'s words:
+/// "HTTP response" for its persistent facts (`SMP_USE_HRSHP`: the status, the version),
+/// "HTTP response headers" for what is gone once they are forwarded (`SMP_USE_HRSHV`).
+/// `None` for any other fetch, `hdr` and `cookie` among them: they read the request in a
+/// request rule.
+#[must_use]
+pub fn response_part(fetch: &str) -> Option<&'static str> {
+    match fetch {
+        "status" | "txn.status" | "res.ver" | "resp_ver" | "server_status" | "res.comp" | "res.comp_algo"
+        | "res.cache_hit" | "res.cache_name" | "capture.res.hdr" => Some("HTTP response"),
+        "res.hdr" | "res.hdr_cnt" | "res.hdr_ip" | "res.hdr_val" | "res.hdr_names" | "res.hdrs" | "res.hdrs_bin"
+        | "res.fhdr" | "res.fhdr_cnt" | "res.cook" | "res.cook_cnt" | "res.cook_val" | "res.cook_names"
+        | "res.body" | "res.body_len" | "res.body_size" | "res.timer.hdr" | "shdr" | "shdr_cnt" | "shdr_ip"
+        | "shdr_val" | "scook" | "scook_cnt" | "scook_val" => Some("HTTP response headers"),
+        _ => None,
+    }
+}
+
+/// The fetch `expr` starts with.
+#[must_use]
+pub fn leading_fetch(expr: &str) -> &str {
+    let word = split_top_level(expr.trim(), char::is_whitespace).into_iter().next().unwrap_or("");
+    leading_name(split_top_level(word, |c| c == ',').into_iter().next().unwrap_or(""))
+}
+
 /// `sc-set-gpt0`'s value: a plain integer as `strtol(.., 10)` reads all of it, else an
 /// expression (`parse_set_gpt`, `src/stick_table.c`). `0x10` is an expression there.
 fn check_int_or_expr(value: &str, registry: &Registry) -> Result<(), String> {
@@ -259,6 +284,22 @@ impl Section<'_> {
                 res.map_err(|e| {
                     format!("error detected in {} while parsing '{kw} {action}' rule : {e}", self.what)
                 })?;
+                // A request rule has no response to read: its fetches would read the one of
+                // whatever stream ran last on the thread (T156). `HAProxy` names the action
+                // for `set-var`, the expression for the others.
+                if let ("http-request" | "tcp-request content", Some(part)) = (*kw, response_part(leading_fetch(expr))) {
+                    let name = if action.starts_with("set-var(") {
+                        action.as_str()
+                    } else {
+                        split_top_level(expr.trim(), char::is_whitespace).into_iter().next().unwrap_or("")
+                    };
+                    let msg = format!("fetch method '{name}' extracts information from '{part}', none of which is available here");
+                    return Err(if *kw == "http-request" {
+                        format!("error detected in {} while parsing '{kw} {action}' rule : {msg}.", self.what)
+                    } else {
+                        msg
+                    });
+                }
             }
         }
         Ok(())

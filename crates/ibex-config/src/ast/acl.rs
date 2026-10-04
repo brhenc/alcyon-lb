@@ -74,6 +74,9 @@ pub struct SampleRef {
     /// The directive the expression is on, its first word (`http-request`,
     /// `unique-id-format`, ...).
     pub directive: String,
+    /// The directive's second word: the action of a rule (`set-header`,
+    /// `set-var-fmt(txn.x)`), empty when there is none.
+    pub action: String,
     /// The expression: the fetch, its arguments and its converters (`nbsrv(be),add(1)`),
     /// without an ACL's pattern or a log-format's surroundings.
     pub expr: String,
