@@ -2424,6 +2424,16 @@ impl Registry {
             func: |smp, args| match smp {
                 Sample::Str(s) => {
                     let in_form = args.first().and_then(|a| a.parse::<i64>().ok()).unwrap_or(0) != 0;
+                    // A '%' not followed by two hex digits makes the conversion fail.
+                    let bytes = s.as_bytes();
+                    let bad = bytes.iter().enumerate().any(|(i, &b)| {
+                        b == b'%'
+                            && !(bytes.get(i + 1).is_some_and(u8::is_ascii_hexdigit)
+                                && bytes.get(i + 2).is_some_and(u8::is_ascii_hexdigit))
+                    });
+                    if bad {
+                        return None;
+                    }
                     Some(Sample::Str(url_decode(&s, in_form)))
                 }
                 _ => None,

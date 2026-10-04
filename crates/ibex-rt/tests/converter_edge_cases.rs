@@ -272,6 +272,31 @@ fn date_converters_handle_units_offsets_and_fractions() {
 }
 
 #[test]
+fn url_enc_and_url_dec_keep_trailing_spaces_and_encode_reserved_characters() {
+    let rules = "  http-request set-var(txn.url0) \"str(foo=bar+42 42 )\"\n\
+  http-request set-var(txn.url1) \"var(txn.url0),url_enc\"\n\
+  http-request set-var(txn.url2) \"var(txn.url1),url_dec\"\n\
+  http-request set-var(txn.url3) \"var(txn.url2),url_enc(query)\"\n\
+  http-request set-var(txn.s) \"str(a/b?c=d&e~f-g_h.i*j!kl:o@p+q%r),url_enc\"\n\
+  http-request set-var(txn.e) \"str( ),url_enc\"\n\
+  http-request set-var(txn.u) \"str(%41%zz%4),url_dec\"\n\
+  http-request set-var(txn.u2) \"str(a+b%20c),url_dec\"\n\
+  http-request return status 200 hdr x-0 \"%[var(txn.url1)]\" hdr x-d \"[%[var(txn.url2)]]\" hdr x-1 \"%[var(txn.url3)]\" hdr x-s \"%[var(txn.s)]\" hdr x-e \"[%[var(txn.e)]]\" hdr x-u \"[%[var(txn.u)]]\" hdr x-u2 \"%[var(txn.u2)]\"\n";
+    assert_eq!(
+        run(rules, &[&get("/")]),
+        vec![vec![
+            "x-0: foo%3Dbar%2B42%2042%20",
+            "x-d: [foo=bar+42 42 ]",
+            "x-1: foo%3Dbar%2B42%2042%20",
+            "x-s: a%2Fb%3Fc%3Dd%26e~f-g_h.i%2Aj%21kl%3Ao%40p%2Bq%25r",
+            "x-e: [%20]",
+            "x-u: []",
+            "x-u2: a+b c",
+        ]]
+    );
+}
+
+#[test]
 fn set_var_with_a_failing_converter_leaves_the_variable_alone() {
     let rules = "  http-request set-var(txn.a) str(one)\n\
   http-request set-var(txn.a) str(x),field(3,/)\n\

@@ -489,6 +489,12 @@ fn unquote_arg(arg: &str) -> &str {
     }
 }
 
+/// `str( x )` is the string " x ": the one fetch whose argument is data keeps its
+/// whitespace; every other argument is trimmed.
+fn trim_arg<'a>(name: &str, arg: &'a str) -> &'a str {
+    if name == "str" { arg } else { arg.trim() }
+}
+
 fn parse_call(input: &str) -> (String, Vec<String>) {
     let input = input.trim();
     if let Some(open_idx) = input.find('(') {
@@ -513,14 +519,14 @@ fn parse_call(input: &str) -> (String, Vec<String>) {
             } else if ch == ')' {
                 paren_depth = paren_depth.saturating_sub(1);
             } else if ch == ',' && paren_depth == 0 {
-                let arg = args_str[start..i].trim();
+                let arg = trim_arg(&name, &args_str[start..i]);
                 let unquoted = unquote_arg(arg);
                 args.push(unquoted.to_string());
                 start = i + 1;
             }
         }
         if start <= args_str.len() {
-            let arg = args_str[start..].trim();
+            let arg = trim_arg(&name, &args_str[start..]);
             if !arg.is_empty() || !args.is_empty() {
                 let unquoted = unquote_arg(arg);
                 args.push(unquoted.to_string());
