@@ -213,6 +213,7 @@ fn entry_value(table: &StickTable, key: &StickKey, data: StickData) -> Option<i6
         StickData::HttpReqRate => cfg.track_http_req_rate_ms.and(e.http_req_rate.as_ref()).map(|r| to_i64(r.rate())),
         StickData::HttpErrCnt => f.http_err_cnt.then(|| to_i64(e.http_err_cnt)),
         StickData::HttpErrRate => cfg.track_http_err_rate_ms.and(e.http_err_rate.as_ref()).map(|r| to_i64(r.rate())),
+        StickData::HttpFailCnt => f.http_fail_cnt.then(|| to_i64(e.http_fail_cnt)),
         StickData::KbytesIn => f.bytes_in_cnt.then(|| to_i64(e.bytes_in_cnt >> 10)),
         StickData::KbytesOut => f.bytes_out_cnt.then(|| to_i64(e.bytes_out_cnt >> 10)),
         StickData::Gpc0 => f.gpc0.then(|| to_i64(e.gpc0)),
@@ -301,7 +302,7 @@ struct ArgSpec {
 /// The data types the `sc_*`, `sc[0-9]_*` and `src_*` fetches read.
 const STICK_FETCHES: &[&str] = &[
     "conn_cnt", "conn_cur", "conn_rate", "sess_cnt", "http_req_cnt", "http_req_rate", "http_err_cnt",
-    "http_err_rate", "kbytes_in", "kbytes_out",
+    "http_err_rate", "http_fail_cnt", "kbytes_in", "kbytes_out",
 ];
 
 fn fetch_arg(name: &str) -> Option<ArgSpec> {

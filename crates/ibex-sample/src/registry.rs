@@ -206,6 +206,7 @@ pub enum StickData {
     HttpReqRate,
     HttpErrCnt,
     HttpErrRate,
+    HttpFailCnt,
     /// `bytes_in_cnt`, in kilobytes (`bytes >> 10`).
     KbytesIn,
     KbytesOut,
@@ -1655,6 +1656,7 @@ impl Registry {
         reg_stick!("http_req_rate", StickData::HttpReqRate);
         reg_stick!("http_err_cnt", StickData::HttpErrCnt);
         reg_stick!("http_err_rate", StickData::HttpErrRate);
+        reg_stick!("http_fail_cnt", StickData::HttpFailCnt);
         reg_stick!("kbytes_in", StickData::KbytesIn);
         reg_stick!("kbytes_out", StickData::KbytesOut);
 

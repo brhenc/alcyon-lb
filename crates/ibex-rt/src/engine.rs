@@ -842,6 +842,7 @@ fn init_stick_table(ast: &ibex_config::StickTableConfigAst, name: &str) -> Stick
         sess_cnt: false,
         http_req_cnt: false,
         http_err_cnt: false,
+        http_fail_cnt: false,
         bytes_in_cnt: false,
         bytes_out_cnt: false,
         gpc0: false,
@@ -856,6 +857,7 @@ fn init_stick_table(ast: &ibex_config::StickTableConfigAst, name: &str) -> Stick
             "sess_cnt" => flags.sess_cnt = true,
             "http_req_cnt" => flags.http_req_cnt = true,
             "http_err_cnt" => flags.http_err_cnt = true,
+            "http_fail_cnt" => flags.http_fail_cnt = true,
             "bytes_in_cnt" => flags.bytes_in_cnt = true,
             "bytes_out_cnt" => flags.bytes_out_cnt = true,
             "gpc0" => flags.gpc0 = true,
@@ -1791,6 +1793,54 @@ fn init_checks(proxies: &[Proxy], scheduler: &mut Scheduler, now: Tick) -> Vec<S
     checks
 }
 
+thread_local! {
+    /// `http-err-codes` and `http-fail-codes` (`global`), the statuses that count in the
+    /// `http_err_cnt` and `http_fail_cnt` of the tracked entries.
+    static HTTP_ERR_CODES: std::cell::Cell<ibex_config::StatusCodeSet> = const { std::cell::Cell::new(ibex_config::StatusCodeSet::EMPTY) };
+    static HTTP_FAIL_CODES: std::cell::Cell<ibex_config::StatusCodeSet> = const { std::cell::Cell::new(ibex_config::StatusCodeSet::EMPTY) };
+}
+
+/// Counts an error (`http_err_cnt`, `http_err_rate`) and/or a failure (`http_fail_cnt`) of
+/// the stream into the entries it tracks, per `http-err-codes` / `http-fail-codes`
+/// (`stream_inc_http_err_ctr` and `stream_inc_http_fail_ctr`, called as a response head
+/// comes in from the server).
+fn count_http_status(tracked: &[Option<(usize, StickKey)>; 3], proxies: &[Proxy], status: u16) {
+    let err = HTTP_ERR_CODES.with(|c| c.get().contains(status));
+    let fail = HTTP_FAIL_CODES.with(|c| c.get().contains(status));
+    if !err && !fail {
+        return;
+    }
+    for (t_idx, k) in tracked.iter().flatten() {
+        if let Some(tbl) = proxies.get(*t_idx).and_then(|p| p.stick_table.as_ref()) {
+            let _ = tbl.update_entry(k, |d| {
+                if err {
+                    d.http_err_cnt += 1;
+                    if let Some(r) = d.http_err_rate.as_mut() {
+                        r.tick(1);
+                    }
+                }
+                if fail {
+                    d.http_fail_cnt += 1;
+                }
+            });
+        }
+    }
+}
+
+/// An error of the client that does not depend on a status: what a `deny` or a `tarpit` rule counts.
+fn count_http_err(tracked: &[Option<(usize, StickKey)>; 3], proxies: &[Proxy]) {
+    for (t_idx, k) in tracked.iter().flatten() {
+        if let Some(tbl) = proxies.get(*t_idx).and_then(|p| p.stick_table.as_ref()) {
+            let _ = tbl.update_entry(k, |d| {
+                d.http_err_cnt += 1;
+                if let Some(r) = d.http_err_rate.as_mut() {
+                    r.tick(1);
+                }
+            });
+        }
+    }
+}
+
 fn init_global_vars(global: Option<&ibex_config::GlobalSection>) {
     if let Some(global) = global {
         let sample_reg = sample_registry();
@@ -1866,6 +1916,8 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         let applets = AppletArena::with_capacity(capacity);
 
         init_global_vars(config.global.as_ref());
+        HTTP_ERR_CODES.set(config.global.as_ref().and_then(|g| g.http_err_codes).unwrap_or_else(ibex_config::StatusCodeSet::default_err));
+        HTTP_FAIL_CODES.set(config.global.as_ref().and_then(|g| g.http_fail_codes).unwrap_or_else(ibex_config::StatusCodeSet::default_fail));
         let bufsize = config.global.as_ref().and_then(|g| g.bufsize).unwrap_or(16384);
         let bufsize_small = config.global.as_ref().and_then(|g| g.bufsize_small).unwrap_or(1024);
         let bufsize_large = config.global.as_ref().and_then(|g| g.bufsize_large);
@@ -5358,6 +5410,7 @@ impl EngineDispatcher<'_> {
         // The final response head: `t_data`, and `capture response header`.
         if resume.is_none() {
             entry.sess.log.data = Some(std::time::Instant::now());
+            count_http_status(&entry.sess.tracked_sc, proxies, status);
         }
         let fe_caps = &proxies[fe_idx].res_capture_slots;
         if resume.is_none() && !fe_caps.is_empty() {
@@ -6321,6 +6374,8 @@ impl EngineDispatcher<'_> {
                                 build_templated_error_response(status_code, content_type, lf_string, &make_ctx!(sess), registry)
                             }
                         };
+                        // A denied request is an error of its client, whatever the status.
+                        count_http_err(&sess.tracked_sc, proxies);
                         // Denied by the proxy: `PR`, not a rule's answer (`LR`).
                         sess.log.term = Some(*b"PR");
                         send_proxy_reply(sess, &proxies[..], proxy_idx, pages_idx, &resp);
@@ -6361,6 +6416,7 @@ impl EngineDispatcher<'_> {
                                 build_templated_error_response(status_code, content_type, lf_string, &make_ctx!(sess), registry)
                             }
                         };
+                        count_http_err(&sess.tracked_sc, proxies);
                         sess.log.term = Some(*b"PT");
                         send_proxy_reply(sess, &proxies[..], proxy_idx, pages_idx, &resp);
                         return Ok(RuleFlow::Replied);
@@ -8708,8 +8764,10 @@ fn after_res_on_reply<'r>(
     let mut req_vars = std::mem::take(&mut sess.req_vars);
     let mut res_caps = std::mem::take(&mut sess.log.res_captures);
     let res_caps_in = res_caps.clone();
+    let stick = StickView::new(proxies, &sess.tracked_sc);
     let result = {
         let ctx = SampleContext {
+            stick: Some(&stick),
             client_addr: sess.client_addr,
             server_addr: sess.server_addr,
             fc_src: sess.fc_src,

@@ -56,9 +56,36 @@ fn echo_server() -> SocketAddr {
     addr
 }
 
+/// A server answering `GET /<status>` with that status, an empty body, and `Connection: close`.
+fn status_server() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    thread::spawn(move || {
+        for mut c in listener.incoming().flatten() {
+            thread::spawn(move || {
+                let mut buf: Vec<u8> = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match c.read(&mut chunk) {
+                        Ok(n) if n > 0 => buf.extend_from_slice(&chunk[..n]),
+                        _ => return,
+                    }
+                }
+                let head = String::from_utf8_lossy(&buf).into_owned();
+                let status: u16 = head.split(' ').nth(1).and_then(|p| p.trim_matches('/').parse().ok()).unwrap_or(200);
+                let _ = c.write_all(format!("HTTP/1.1 {status} X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes());
+            });
+        }
+    });
+    addr
+}
+
 fn start(cfg: &str) -> (Ibex, SocketAddr) {
     let fe = common::reserve_addr();
-    let text = cfg.replace("{fe}", &fe.to_string()).replace("{srv}", &echo_server().to_string());
+    let text = cfg
+        .replace("{fe}", &fe.to_string())
+        .replace("{srv}", &echo_server().to_string())
+        .replace("{status}", &status_server().to_string());
     let mut f = NamedTempFile::new().expect("tmp");
     f.write_all(text.as_bytes()).expect("write cfg");
     let child = Command::new(env!("CARGO_BIN_EXE_ibex"))
@@ -159,4 +186,83 @@ fn errorloc303_and_a_relative_location() {
     assert!(got.starts_with("HTTP/1.1 303 See Other\r\n") && got.contains("location: /l503\r\n"), "{got:?}");
     let got = get_close(fe, "/denied");
     assert!(got.starts_with("HTTP/1.1 302 Found\r\n") && got.contains("location: /l403\r\n"), "{got:?}");
+}
+
+const ERR_FAIL: &str = "{global}defaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n\
+frontend fe\n  bind {fe}\n  http-request track-sc0 path\n\
+  http-after-response add-header x-table err=%[sc0_http_err_cnt],fail=%[sc0_http_fail_cnt]\n\
+  stick-table type string size 100 store http_err_cnt,http_fail_cnt\n\
+  http-request deny if { path /deny }\n  http-request return status 404 if { path /ret404 }\n\
+  http-request return status 500 if { path /ret500 }\n  default_backend be\n\
+backend be\n  server s {status}\n";
+
+/// The `x-table` header `HAProxy` answered for `GET /<code>` (the counters as the response
+/// leaves, so counting the response itself).
+fn x_table(fe: SocketAddr, code: &str) -> String {
+    let got = get_close(fe, &format!("/{code}"));
+    got.lines()
+        .find_map(|l| l.strip_prefix("x-table: ").or_else(|| l.strip_prefix("X-Table: ")))
+        .unwrap_or_else(|| panic!("/{code}: no x-table in {got:?}"))
+        .to_string()
+}
+
+#[test]
+fn the_default_error_and_failure_codes_count_what_haproxy_counts() {
+    let (_i, fe) = start(&ERR_FAIL.replace("{global}", ""));
+    // (path, "err=..,fail=..") measured on HAProxy 3.5-dev8-885761-29 with the same config.
+    for (code, want) in [
+        ("200", "err=0,fail=0"),
+        ("301", "err=0,fail=0"),
+        ("399", "err=0,fail=0"),
+        ("400", "err=1,fail=0"),
+        ("401", "err=1,fail=0"),
+        ("404", "err=1,fail=0"),
+        ("407", "err=1,fail=0"),
+        ("499", "err=1,fail=0"),
+        ("500", "err=0,fail=1"),
+        ("501", "err=0,fail=0"),
+        ("502", "err=0,fail=1"),
+        ("505", "err=0,fail=0"),
+        ("599", "err=0,fail=1"),
+        ("600", "err=0,fail=0"),
+    ] {
+        assert_eq!(x_table(fe, code), want, "status {code}");
+    }
+}
+
+#[test]
+fn deny_counts_an_error_and_return_does_not() {
+    let (_i, fe) = start(&ERR_FAIL.replace("{global}", ""));
+    assert_eq!(x_table(fe, "deny"), "err=1,fail=0");
+    assert_eq!(x_table(fe, "deny"), "err=2,fail=0");
+    assert_eq!(x_table(fe, "ret404"), "err=0,fail=0");
+    assert_eq!(x_table(fe, "ret500"), "err=0,fail=0");
+}
+
+#[test]
+fn http_err_codes_and_http_fail_codes_redefine_the_sets() {
+    // The vtc's lines: `220 +300-499 -300-399` leaves 220 and 400-499; the fail codes lose
+    // 550-580 and gain 555, 599, 556-566.
+    let g = "global\n  http-err-codes 220 +300-499 -300-399\n  http-fail-codes -550-580 +555,599,556-566\n";
+    let (_i, fe) = start(&ERR_FAIL.replace("{global}", g));
+    for (code, want) in [
+        ("220", "err=1,fail=0"),
+        ("300", "err=0,fail=0"),
+        ("400", "err=1,fail=0"),
+        ("555", "err=0,fail=1"),
+        ("550", "err=0,fail=0"),
+        ("556", "err=0,fail=1"),
+        ("500", "err=0,fail=1"),
+        ("301", "err=0,fail=0"),
+    ] {
+        assert_eq!(x_table(fe, code), want, "status {code}");
+    }
+    // A sign sticks along a comma list; an unsigned element clears the set first.
+    let g = "global\n  http-err-codes +300,310 -400,401\n";
+    let (_i, fe) = start(&ERR_FAIL.replace("{global}", g));
+    for (code, want) in
+        [("300", "err=1"), ("310", "err=1"), ("400", "err=0"), ("401", "err=0"), ("402", "err=1")]
+    {
+        assert!(x_table(fe, code).starts_with(want), "status {code}");
+    }
 }

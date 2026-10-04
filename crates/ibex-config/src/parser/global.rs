@@ -319,6 +319,29 @@ pub(crate) fn parse_global_directive(
             }
             Ok(())
         }
+        "http-err-codes" | "http-fail-codes" => {
+            if tokens.len() < 2 {
+                return Err(ConfigError::new(
+                    kw.line,
+                    kw.col,
+                    format!("Missing status codes range for '{}'.", kw.text),
+                ));
+            }
+            let (slot, mut set) = if kw.text == "http-err-codes" {
+                (&mut global.http_err_codes, crate::ast::StatusCodeSet::default_err())
+            } else {
+                (&mut global.http_fail_codes, crate::ast::StatusCodeSet::default_fail())
+            };
+            // The list starts from what a previous line left, or the defaults.
+            if let Some(prev) = slot {
+                set = *prev;
+            }
+            for tok in &tokens[1..] {
+                set.parse_arg(&kw.text, &tok.text).map_err(|m| ConfigError::new(tok.line, tok.col, m))?;
+            }
+            *slot = Some(set);
+            Ok(())
+        }
         "hard-stop-after" => {
             if tokens.len() >= 2 {
                 global.hard_stop_after = Some(parse_timeout(&tokens[1], "hard-stop-after")?);
