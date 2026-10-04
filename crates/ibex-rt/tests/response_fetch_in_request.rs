@@ -114,3 +114,24 @@ fn what_haproxy_accepts_is_accepted() {
         }
     }
 }
+
+#[test]
+fn the_section_is_named_as_haproxy_names_it() {
+    let head = "defaults\n  mode http\n  timeout connect 1s\n  timeout client 1s\n  timeout server 1s\n";
+    let rule = "  http-request set-header x %[status]\n";
+    for (text, what) in [
+        (format!("{head}frontend f\n  bind 127.0.0.1:19812\n  default_backend b\nbackend b\n{rule}  server s 127.0.0.1:1\n"), "backend 'b'"),
+        (format!("{head}listen l\n  bind 127.0.0.1:19812\n{rule}  server s 127.0.0.1:1\n"), "proxy 'l'"),
+        (
+            format!("defaults d\n  mode http\n  timeout connect 1s\n  timeout client 1s\n  timeout server 1s\n{rule}frontend f from d\n  bind 127.0.0.1:19812\n"),
+            "defaults 'd'",
+        ),
+    ] {
+        let want = format!("error detected in {what} while parsing 'http-request set-header' rule : sample fetch <status> may not be reliably used here because it needs {HRSHP} which is not available here.");
+        let got = parse_config(&text).map_err(|e| e.to_string()).and_then(|c| validate_config(&c));
+        match got {
+            Ok(()) => panic!("accepted:\n{text}"),
+            Err(e) => assert!(e.contains(&want), "got {e}\nwant {want}"),
+        }
+    }
+}

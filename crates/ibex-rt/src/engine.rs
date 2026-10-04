@@ -4265,11 +4265,8 @@ fn stream_timeouts(fe: &Proxy, be: &Proxy, set: Option<&crate::proxy::TimeoutsSe
 /// ([`stream_timeouts`]). Like the variables ([`with_stream_vars`]) they are the thread's
 /// for one run of one stream only: `None` outside a run.
 fn stream_timeouts_enter(proxies: &[Proxy], fe_idx: usize, be_idx: usize, sess: &TcpSession) {
-    let (Some(fe), Some(be)) = (proxies.get(fe_idx), proxies.get(be_idx)) else {
-        CURRENT_TIMEOUTS.set(None);
-        return;
-    };
-    CURRENT_TIMEOUTS.set(Some(stream_timeouts(fe, be, sess.timeouts_set.as_deref())));
+    let pair = proxies.get(fe_idx).zip(proxies.get(be_idx));
+    CURRENT_TIMEOUTS.set(pair.map(|(fe, be)| stream_timeouts(fe, be, sess.timeouts_set.as_deref())));
 }
 
 /// Readies a TCP-mode stream for `proxy`'s `tcp-response content` rules, if it has any

@@ -711,13 +711,13 @@ pub fn check_sample_refs(config: &Config, registry: &Registry) -> Result<(), Str
             let headers = part == "HTTP response headers";
             let refused = match r.directive.as_str() {
                 "http-request" => {
-                    let what = match (r.section, r.proxy.as_deref()) {
-                        (SectionKind::Frontend, Some(n)) => format!("frontend '{n}'"),
-                        (SectionKind::Backend, Some(n)) => format!("backend '{n}'"),
-                        (SectionKind::Listen, Some(n)) => format!("proxy '{n}'"),
-                        (SectionKind::Defaults, Some(n)) => format!("defaults '{n}'"),
-                        _ => "defaults section".to_string(),
+                    let kind = match r.section {
+                        SectionKind::Frontend => "frontend",
+                        SectionKind::Backend => "backend",
+                        SectionKind::Listen => "proxy",
+                        SectionKind::Defaults => "defaults",
                     };
+                    let what = r.proxy.as_deref().map_or_else(|| format!("{kind} section"), |n| format!("{kind} '{n}'"));
                     Some(format!("error detected in {what} while parsing 'http-request {}' rule : {why}", r.action))
                 }
                 "log-format" | "error-log-format" if headers => Some(format!("failed to parse {} : {why}", r.directive)),

@@ -120,10 +120,6 @@ pub fn set_current_vars(vars: HashMap<String, String>) {
     CURRENT_VARS.with(|v| *v.borrow_mut() = vars);
 }
 
-pub fn set_current_timeouts(timeouts: Option<StreamTimeouts>) {
-    CURRENT_TIMEOUTS.set(timeouts);
-}
-
 pub fn set_current_res_headers(headers: Vec<(String, String)>) {
     CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = headers);
 }
@@ -5739,6 +5735,28 @@ mod tests {
         let reg = Registry::new();
         assert!(reg.fetch_count() >= 50);
         assert!(reg.converter_count() >= 50);
+    }
+
+    /// `unset-var` removes a stream variable from the running stream's map, and only
+    /// from it; a `proc.` name is the process's (T156).
+    #[test]
+    fn unset_var_removes_a_stream_variable_from_the_running_stream() {
+        let reg = Registry::new();
+        let conv = reg.get_converter("unset-var").expect("unset-var is registered");
+        CURRENT_VARS.with(|v| v.borrow_mut().insert("txn.t156".to_string(), "v".to_string()));
+        set_proc_var("proc.t156", "p".to_string());
+        assert_eq!((conv.func)(Sample::Sint(1), &["txn.t156".to_string()]), Some(Sample::Sint(1)));
+        assert!(CURRENT_VARS.with(|v| !v.borrow().contains_key("txn.t156")));
+        assert_eq!(get_proc_var("proc.t156").as_deref(), Some("p"));
+        (conv.func)(Sample::Sint(1), &["proc.t156".to_string()]);
+        assert_eq!(get_proc_var("proc.t156"), None);
+    }
+
+    /// The names `set-timeout` takes; the parser refuses any other.
+    #[test]
+    fn timeout_kinds_by_name() {
+        assert_eq!(TimeoutKind::from_name("tarpit"), Some(TimeoutKind::Tarpit));
+        assert_eq!(TimeoutKind::from_name("http-request"), None);
     }
 
     #[test]
