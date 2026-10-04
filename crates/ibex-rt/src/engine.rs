@@ -7560,7 +7560,7 @@ fn wait_for_request_body(
     for txn in sess.txn.as_mut() {
         txn.body_wait = pending.then_some(crate::txn::BodyWait { backend, rule, deadline });
         if ready {
-            txn.req_body = Some(body);
+            txn.req_body = Some(std::mem::take(&mut body));
         }
     }
     outcome
