@@ -23,11 +23,7 @@ pub(crate) fn parse_defaults_directive(
             defaults.retries = Some(r);
             Ok(())
         }
-        "redisp" => {
-            defaults.redisp = true;
-            defaults.redisp_after = -1;
-            Ok(())
-        }
+        "redisp" => parse_redisp(kw),
         "maxconn" => {
             let mut mc = defaults.maxconn.unwrap_or(0);
             parse_maxconn(&mut mc, tokens, kw)?;

@@ -944,6 +944,14 @@ pub(crate) fn parse_grace(
     Ok(())
 }
 
+pub(crate) fn parse_redisp(kw: &Token) -> Result<(), ConfigError> {
+    Err(ConfigError::new(
+        kw.line,
+        kw.col,
+        "keyword 'redisp' directive is not supported anymore since HAProxy 2.1. Use 'option redispatch'.",
+    ))
+}
+
 pub(crate) fn parse_dispatch(kw: &Token) -> Result<(), ConfigError> {
     Err(ConfigError::new(
         kw.line,
@@ -1195,7 +1203,7 @@ listen proxy1
 	timeout client	150000
 	timeout server	150000
 	maxconn 60000
-	redisp
+	option redispatch
 	retries	3
 	grace 3000
 

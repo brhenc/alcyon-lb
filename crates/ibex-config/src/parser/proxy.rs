@@ -307,11 +307,7 @@ pub(crate) fn parse_listen_directive(
         "srvtimeout" => parse_srvtimeout(kw),
         "timeout" => parse_timeout_directive(&mut proxy.timeouts, tokens, kw),
         "retries" => parse_retries(&mut proxy.retries, tokens, kw),
-        "redisp" => {
-            proxy.redisp = true;
-            proxy.redisp_after = -1;
-            Ok(())
-        }
+        "redisp" => parse_redisp(kw),
         "maxconn" => parse_maxconn(&mut proxy.maxconn, tokens, kw),
         "grace" => parse_grace(&mut proxy.grace, tokens, kw),
         "dispatch" => parse_dispatch(kw),
@@ -594,11 +590,7 @@ pub(crate) fn parse_backend_directive(
         "srvtimeout" => parse_srvtimeout(kw),
         "timeout" => parse_timeout_directive(&mut be.timeouts, tokens, kw),
         "retries" => parse_retries(&mut be.retries, tokens, kw),
-        "redisp" => {
-            be.redisp = true;
-            be.redisp_after = -1;
-            Ok(())
-        }
+        "redisp" => parse_redisp(kw),
         "dispatch" => parse_dispatch(kw),
         "default-server" => parse_default_server(&mut be.default_server, tokens, kw),
         "server" => parse_server(&mut be.servers, be.default_server.as_ref(), tokens, kw),

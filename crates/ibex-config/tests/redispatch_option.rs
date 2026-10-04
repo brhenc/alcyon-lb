@@ -28,18 +28,18 @@ fn the_interval_is_read_like_atol() {
     assert!(!be("  option redispatch 2\n  no option redispatch\n").0);
 }
 
-/// The old `redisp` keyword (HAProxy 3.5 refuses it; Ibex still accepts it as the option
-/// with the default interval, which this pins until it is made to refuse it).
+/// The old `redisp` keyword: HAProxy 3.5 refuses it in every section ("not supported
+/// anymore since HAProxy 2.1. Use 'option redispatch'", measured).
 #[test]
-fn the_legacy_redisp_keyword_is_the_default_interval() {
-    let cfg = parse_str(
-        "defaults\n  redisp\nbackend a\n  server s 127.0.0.1:1\nbackend b\n  redisp\n  server s 127.0.0.1:1\n\
-         listen l\n  bind 127.0.0.1:0\n  redisp\n  server s 127.0.0.1:1\n",
-    )
-    .expect("parse");
-    assert_eq!((cfg.backends[0].redisp, cfg.backends[0].redisp_after), (true, -1));
-    assert_eq!((cfg.backends[1].redisp, cfg.backends[1].redisp_after), (true, -1));
-    assert_eq!((cfg.listens[0].redisp, cfg.listens[0].redisp_after), (true, -1));
+fn the_legacy_redisp_keyword_is_refused() {
+    for cfg in [
+        "defaults\n  redisp\nbackend a\n  server s 127.0.0.1:1\n",
+        "backend b\n  redisp\n  server s 127.0.0.1:1\n",
+        "listen l\n  bind 127.0.0.1:0\n  redisp\n  server s 127.0.0.1:1\n",
+    ] {
+        let err = parse_str(cfg).expect_err("redisp must be refused");
+        assert!(err.to_string().contains("not supported anymore since HAProxy 2.1"), "{err}");
+    }
 }
 
 #[test]
