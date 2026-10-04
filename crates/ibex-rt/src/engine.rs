@@ -4548,8 +4548,7 @@ fn cleanup_done(
     }
 }
 
-/// `HAProxy`'s `monitor-uri` answer. Ibex closes the connection after it (and the relay
-/// adds `Connection: close`), where `HAProxy` keeps it alive.
+/// `HAProxy`'s `monitor-uri` answer; the connection stays open after it.
 const MONITOR_URI_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-length: 58\r\n\
 cache-control: no-cache\r\ncontent-type: text/html\r\n\r\n\
 <html><body><h1>200 OK</h1>\nService ready.\n</body></html>\n";
@@ -6020,9 +6019,6 @@ impl EngineDispatcher<'_> {
                 req_uri
             };
             if path == m_uri {
-                if let Some(t) = entry.sess.txn.as_mut() {
-                    t.close_after = true;
-                }
                 send_proxy_reply(&mut entry.sess, proxies, proxy_idx, proxy_idx, MONITOR_URI_RESPONSE);
                 return None;
             }

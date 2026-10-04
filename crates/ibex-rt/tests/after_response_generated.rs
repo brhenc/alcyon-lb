@@ -165,10 +165,7 @@ fn after_response_rules_run_on_every_reply_the_proxy_makes() {
     for (what, cfg, srv, status) in cases {
         let (_ibex, fe) = start(&cfg, srv.map(server));
         let resp = exchange(fe, G, Duration::from_millis(1500));
-        // Ibex closes after a `monitor-uri` reply and says so in a `Connection` header it
-        // adds after the rules have run; `HAProxy` keeps that connection. Not this test's
-        // business: the rules' header is the last one before it.
-        let last = head(&resp).rsplit("\r\n").find(|l| !l.to_ascii_lowercase().starts_with("connection:")).unwrap_or("");
+        let last = head(&resp).rsplit("\r\n").next().unwrap_or("");
         if !resp.starts_with(status) || last != "static: yes" {
             wrong.push(format!("{what}: {resp:?}"));
         }
