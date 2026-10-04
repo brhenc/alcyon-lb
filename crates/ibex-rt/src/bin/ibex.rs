@@ -718,11 +718,21 @@ fn main() {
     let extra_sockets: Vec<ibex_config::StatsSocket> =
         config.global.as_ref().map(|g| g.extra_stats_sockets.clone()).unwrap_or_default();
     let stats_socket_mode = config.global.as_ref().and_then(|g| g.stats_socket_mode);
-    let stats_socket_level = config
-        .global
-        .as_ref()
-        .and_then(|g| g.stats_socket_level.as_deref())
-        .and_then(ibex_rt::applet::CliLevel::parse);
+    // A `stats socket` without `level` is operator, as in HAProxy (`bind_conf->level |=
+    // ACCESS_LVL_OPER`, src/cli.c); the master socket `-S` is admin.
+    let default_level = if opts.stats_socket.is_some() {
+        ibex_rt::applet::CliLevel::Admin
+    } else {
+        ibex_rt::applet::CliLevel::Operator
+    };
+    let stats_socket_level = Some(
+        config
+            .global
+            .as_ref()
+            .and_then(|g| g.stats_socket_level.as_deref())
+            .and_then(ibex_rt::applet::CliLevel::parse)
+            .unwrap_or(default_level),
+    );
 
     // 12b. Hitless reload: take the listening sockets over from the old process rather
     //      than binding new ones, so the connections already queued on them survive it
@@ -787,7 +797,7 @@ fn main() {
                 // The `stats socket` lines after the first (HAProxy binds every one), each
                 // with its own level and mode.
                 for x in &extra_sockets {
-                    let level = x.level.as_deref().and_then(ibex_rt::applet::CliLevel::parse).unwrap_or(ibex_rt::applet::CliLevel::Admin);
+                    let level = x.level.as_deref().and_then(ibex_rt::applet::CliLevel::parse).unwrap_or(ibex_rt::applet::CliLevel::Operator);
                     if let Err(err) = engine.bind_extra_cli_socket(&x.path, level) {
                         eprintln!("Failed to bind CLI / stats socket '{}': {}", x.path, err);
                         process::exit(1);
