@@ -23,12 +23,52 @@ use std::sync::{Arc, LazyLock, RwLock};
 
 thread_local! {
     pub static CURRENT_VARS: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
-    pub static CURRENT_TIMEOUTS: RefCell<HashMap<&'static str, u32>> = RefCell::new(HashMap::new());
+    /// The timeouts of the stream running on the thread, for the `*_timeout` fetches; set
+    /// by the engine for the length of one run of a stream, `None` outside one.
+    pub static CURRENT_TIMEOUTS: Cell<Option<StreamTimeouts>> = const { Cell::new(None) };
     pub static CURRENT_RES_HEADERS: RefCell<Vec<(String, String)>> = const { RefCell::new(Vec::new()) };
     pub static CURRENT_RES_STATUS: Cell<u16> = const { Cell::new(0) };
 }
 
-pub static GLOBAL_PROC_VARS: LazyLock<RwLock<HashMap<String, String>>> =
+/// The timeouts a `set-timeout` names, as indexes into [`StreamTimeouts`]' arrays.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimeoutKind {
+    Client = 0,
+    Server = 1,
+    Connect = 2,
+    Queue = 3,
+    Tunnel = 4,
+    Tarpit = 5,
+}
+
+impl TimeoutKind {
+    /// The kind `set-timeout <name>` names.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "client" => Self::Client,
+            "server" => Self::Server,
+            "connect" => Self::Connect,
+            "queue" => Self::Queue,
+            "tunnel" => Self::Tunnel,
+            "tarpit" => Self::Tarpit,
+            _ => return None,
+        })
+    }
+}
+
+/// One stream's timeouts, in ms (0: none), indexed by [`TimeoutKind`]: its frontend's
+/// (`fe_*_timeout`), its backend's (`be_*_timeout`, the frontend's until one is chosen) and
+/// the ones it runs on (`cur_*_timeout`: the backend's, or what `set-timeout` set). `Copy`:
+/// the engine computes it for each run of a stream, from the stream.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StreamTimeouts {
+    pub fe: [u32; 6],
+    pub be: [u32; 6],
+    pub cur: [u32; 6],
+}
+
+pub static GLOBAL_PROC_VARS:LazyLock<RwLock<HashMap<String, String>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
 pub static SAMPLE_REGISTRY: LazyLock<Registry> = LazyLock::new(Registry::new);
@@ -80,9 +120,8 @@ pub fn set_current_vars(vars: HashMap<String, String>) {
     CURRENT_VARS.with(|v| *v.borrow_mut() = vars);
 }
 
-#[allow(clippy::implicit_hasher)]
-pub fn set_current_timeouts(timeouts: HashMap<&'static str, u32>) {
-    CURRENT_TIMEOUTS.with(|t| *t.borrow_mut() = timeouts);
+pub fn set_current_timeouts(timeouts: Option<StreamTimeouts>) {
+    CURRENT_TIMEOUTS.set(timeouts);
 }
 
 pub fn set_current_res_headers(headers: Vec<(String, String)>) {
@@ -1993,7 +2032,7 @@ impl Registry {
 
         // --- 11. Timeout Fetches ---
         macro_rules! reg_timeout_fetch {
-            ($name:literal) => {
+            ($name:literal, $set:ident, $kind:expr) => {
                 self.register_fetch(FetchDesc {
                     name: $name,
                     out_type: SampleType::Sint,
@@ -2003,35 +2042,31 @@ impl Registry {
                                 return Some(Sample::Sint(i64::from(v)));
                             }
                         }
-                        CURRENT_TIMEOUTS.with(|t| {
-                            t.borrow()
-                                .get($name)
-                                .copied()
-                                .map(|v| Sample::Sint(i64::from(v)))
-                        })
+                        CURRENT_TIMEOUTS.get().map(|t| Sample::Sint(i64::from(t.$set[$kind as usize])))
                     },
                 });
             };
         }
 
-        reg_timeout_fetch!("fe_client_timeout");
-        reg_timeout_fetch!("cur_client_timeout");
-        reg_timeout_fetch!("be_server_timeout");
-        reg_timeout_fetch!("cur_server_timeout");
-        reg_timeout_fetch!("be_connect_timeout");
-        reg_timeout_fetch!("cur_connect_timeout");
-        reg_timeout_fetch!("be_queue_timeout");
-        reg_timeout_fetch!("cur_queue_timeout");
-        reg_timeout_fetch!("be_tunnel_timeout");
-        reg_timeout_fetch!("cur_tunnel_timeout");
-        reg_timeout_fetch!("be_tarpit_timeout");
-        reg_timeout_fetch!("cur_tarpit_timeout");
-        reg_timeout_fetch!("fe_connect_timeout");
-        reg_timeout_fetch!("fe_server_timeout");
-        reg_timeout_fetch!("fe_queue_timeout");
-        reg_timeout_fetch!("fe_tunnel_timeout");
-        reg_timeout_fetch!("fe_tarpit_timeout");
-        reg_timeout_fetch!("be_client_timeout");
+        use TimeoutKind::{Client, Connect, Queue, Server, Tarpit, Tunnel};
+        reg_timeout_fetch!("fe_client_timeout", fe, Client);
+        reg_timeout_fetch!("cur_client_timeout", cur, Client);
+        reg_timeout_fetch!("be_server_timeout", be, Server);
+        reg_timeout_fetch!("cur_server_timeout", cur, Server);
+        reg_timeout_fetch!("be_connect_timeout", be, Connect);
+        reg_timeout_fetch!("cur_connect_timeout", cur, Connect);
+        reg_timeout_fetch!("be_queue_timeout", be, Queue);
+        reg_timeout_fetch!("cur_queue_timeout", cur, Queue);
+        reg_timeout_fetch!("be_tunnel_timeout", be, Tunnel);
+        reg_timeout_fetch!("cur_tunnel_timeout", cur, Tunnel);
+        reg_timeout_fetch!("be_tarpit_timeout", be, Tarpit);
+        reg_timeout_fetch!("cur_tarpit_timeout", cur, Tarpit);
+        reg_timeout_fetch!("fe_connect_timeout", fe, Connect);
+        reg_timeout_fetch!("fe_server_timeout", fe, Server);
+        reg_timeout_fetch!("fe_queue_timeout", fe, Queue);
+        reg_timeout_fetch!("fe_tunnel_timeout", fe, Tunnel);
+        reg_timeout_fetch!("fe_tarpit_timeout", fe, Tarpit);
+        reg_timeout_fetch!("be_client_timeout", be, Client);
 
         self.register_fetch(FetchDesc {
             name: "be_max_retries",

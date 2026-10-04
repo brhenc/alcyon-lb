@@ -134,6 +134,16 @@ pub struct Timeouts {
     pub connect: u32,
 }
 
+/// The timeouts `set-timeout` gave one stream (`stream_set_timeout`, src/stream.c).
+#[derive(Clone, Copy, Debug)]
+pub struct TimeoutsSet {
+    /// What each rule set, in ms, indexed by [`ibex_sample::TimeoutKind`]; 0: not set.
+    pub ms: [u32; 6],
+    /// The session's timeouts before the first rule changed them: the next stream starts
+    /// from these, as a new stream in `HAProxy` starts from its proxies'.
+    pub before: Timeouts,
+}
+
 /// One TCP / HTTP session: two connections, two buffers, two state machines.
 #[allow(clippy::struct_excessive_bools)]
 pub struct TcpSession {
@@ -177,6 +187,9 @@ pub struct TcpSession {
     /// Server to client.
     pub rep: Buf,
     pub timeouts: Timeouts,
+    /// What `http-request set-timeout` set for the stream in progress; `None` until a rule
+    /// sets one, so a stream that sets none allocates nothing.
+    pub timeouts_set: Option<Box<TimeoutsSet>>,
     /// Connect attempts left before giving up.
     pub conn_retries: u16,
     /// The retry budget this stream started with, `s->max_retries` in HAProxy: what
@@ -332,6 +345,7 @@ impl TcpSession {
             req: Buf::standard(),
             rep: Buf::standard(),
             timeouts,
+            timeouts_set: None,
             conn_retries: retries,
             max_retries: retries,
             retry_after: Tick::ETERNITY,
@@ -786,6 +800,9 @@ impl TcpSession {
         self.clear_htx();
         self.h2_active_stream_id = None;
         self.req_vars.clear();
+        if let Some(set) = self.timeouts_set.take() {
+            self.timeouts = set.before;
+        }
         // The stream is running, so its variables are in the thread's map
         // (`engine::with_stream_vars`): the transaction's go from there too.
         ibex_sample::CURRENT_VARS.with(|v| v.borrow_mut().retain(|k, _| k.starts_with("sess.")));

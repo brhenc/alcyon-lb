@@ -873,9 +873,27 @@ fn parse_http_req_rule_at(
             ));
         }
         let timeout_type = tokens[2].text.clone();
+        // `cfg_parse_rule_set_timeout` (src/action.c). Which side the proxy has is checked
+        // by the caller, which knows the section ([`set_timeout_sides`]).
+        if !matches!(timeout_type.as_str(), "client" | "connect" | "queue" | "server" | "tarpit" | "tunnel") {
+            return Err(ConfigError::new(
+                kw.line,
+                kw.col,
+                format!(
+                    "error detected while parsing 'http-request set-timeout' rule : 'set-timeout' rule supports 'client'/'connect'/'queue'/'server'/'tarpit'/'tunnel' (got '{timeout_type}')."
+                ),
+            ));
+        }
         let cond_idx = find_cond_idx(tokens, 3);
         let limit = cond_idx.unwrap_or(tokens.len());
         let timeout_val = tokens[3..limit].iter().map(|t| t.text.as_str()).collect::<Vec<_>>().join(" ");
+        if parse_time_ms(&timeout_val) == Ok(0) {
+            return Err(ConfigError::new(
+                kw.line,
+                kw.col,
+                format!("error detected while parsing 'http-request set-timeout' rule : null value is not valid for a 'set-timeout {timeout_type}' rule."),
+            ));
+        }
         let cond = if let Some(idx) = cond_idx {
             parse_acl_condition_from_tokens(&tokens[idx..])?
         } else {
@@ -1594,6 +1612,25 @@ pub(crate) fn parse_http_after_res_rule(
     Ok(())
 }
 
+
+/// `cfg_parse_rule_set_timeout`: a `set-timeout` of the server side (`server`, `connect`,
+/// `queue`, `tunnel`) needs a proxy with a backend, one of the client side a proxy with a
+/// frontend. Run on the rule `parse_http_req_rule` has just added to `rules`.
+pub(crate) fn set_timeout_sides(rules: &[HttpReqRule], kw: &Token, name: &str, has_fe: bool, has_be: bool) -> Result<(), ConfigError> {
+    let Some(HttpReqRule { action: HttpReqAction::SetTimeout { timeout_type, .. }, .. }) = rules.last() else {
+        return Ok(());
+    };
+    let missing = match timeout_type.as_str() {
+        "server" | "connect" | "queue" | "tunnel" if !has_be => "backend",
+        "client" if !has_fe => "frontend",
+        _ => return Ok(()),
+    };
+    Err(ConfigError::new(
+        kw.line,
+        kw.col,
+        format!("error detected while parsing 'http-request set-timeout' rule : '{name}' has no {missing} capability."),
+    ))
+}
 
 /// HAProxy words a rule's parse error "error detected in <kind> '<name>' while parsing ...";
 /// the rule parsers do not know the section, so the caller names it here.

@@ -53,7 +53,7 @@ use std::time::{Duration, Instant};
 // yet" and renders `-`, where the old engine-local default reported a 200 that had
 // never been sent.
 use ibex_sample::registry::{
-    set_proc_var, CURRENT_RES_HEADERS, CURRENT_RES_STATUS, CURRENT_TIMEOUTS, CURRENT_VARS,
+    set_proc_var, TimeoutKind, CURRENT_RES_HEADERS, CURRENT_RES_STATUS, CURRENT_TIMEOUTS, CURRENT_VARS,
 };
 
 thread_local! {
@@ -4237,6 +4237,41 @@ fn stream_vars_leave(sess: Option<&mut TcpSession>) {
     });
 }
 
+/// The timeouts the `*_timeout` fetches report for a stream of frontend `fe` on backend
+/// `be` (the frontend until one is chosen), with what its `set-timeout` rules set (T156).
+///
+/// `cur_*` is the backend's timeout, the client's the frontend's, unless a rule set it,
+/// as `smp_fetch_cur_*_timeout` (src/stream.c) read the stream's own timers.
+fn stream_timeouts(fe: &Proxy, be: &Proxy, set: Option<&crate::proxy::TimeoutsSet>) -> ibex_sample::StreamTimeouts {
+    let ms = |p: &Proxy| {
+        let t = &p.stats_config.raw_timeouts;
+        [t.client, t.server, t.connect, t.queue, t.tunnel, t.tarpit].map(|v| v.map_or(0, millis_to_u32))
+    };
+    let fe_ms = ms(fe);
+    let mut be_ms = ms(be);
+    be_ms[TimeoutKind::Client as usize] = fe_ms[TimeoutKind::Client as usize];
+    let mut cur = be_ms;
+    if let Some(set) = set {
+        for (c, s) in cur.iter_mut().zip(set.ms) {
+            if s != 0 {
+                *c = s;
+            }
+        }
+    }
+    ibex_sample::StreamTimeouts { fe: fe_ms, be: be_ms, cur }
+}
+
+/// Puts the timeouts of the stream that runs now where its fetches read them
+/// ([`stream_timeouts`]). Like the variables ([`with_stream_vars`]) they are the thread's
+/// for one run of one stream only: `None` outside a run.
+fn stream_timeouts_enter(proxies: &[Proxy], fe_idx: usize, be_idx: usize, sess: &TcpSession) {
+    let (Some(fe), Some(be)) = (proxies.get(fe_idx), proxies.get(be_idx)) else {
+        CURRENT_TIMEOUTS.set(None);
+        return;
+    };
+    CURRENT_TIMEOUTS.set(Some(stream_timeouts(fe, be, sess.timeouts_set.as_deref())));
+}
+
 /// Readies a TCP-mode stream for `proxy`'s `tcp-response content` rules, if it has any
 /// (`AN_RES_INSPECT`, set with the backend); they start when the server connects.
 fn arm_res_inspect(proxy: &Proxy, sess: &mut TcpSession) {
@@ -4566,7 +4601,10 @@ fn init_client_session(
     }
 
     let registry = sample_registry();
-    match with_stream_vars(&mut sess, |sess| eval_tcp_req_session_rules(&proxies[proxy_idx], proxies, registry, sess)) {
+    stream_timeouts_enter(proxies, proxy_idx, proxy_idx, &sess);
+    let session_rules = with_stream_vars(&mut sess, |sess| eval_tcp_req_session_rules(&proxies[proxy_idx], proxies, registry, sess));
+    CURRENT_TIMEOUTS.set(None);
+    match session_rules {
         SessionEvalOutcome::Accept => {}
         SessionEvalOutcome::Reject => {
             raw::abort_with_rst(sess.cli.as_fd());
@@ -5820,9 +5858,11 @@ impl EngineDispatcher<'_> {
     fn step_stream(&mut self, session_idx: u32) -> Outcome {
         if let Some(entry) = self.sessions.get_mut(session_idx) {
             stream_vars_enter(&mut entry.sess);
+            stream_timeouts_enter(self.proxies, entry.proxy_idx, entry.backend_idx, &entry.sess);
         }
         let out = self.step_stream_run(session_idx);
         stream_vars_leave(self.sessions.get_mut(session_idx).map(|e| &mut e.sess));
+        CURRENT_TIMEOUTS.set(None);
         out
     }
 
@@ -6882,36 +6922,8 @@ impl EngineDispatcher<'_> {
         if resume.is_none() {
             begin_http_stream(entry, proxies, proxy_idx, pid);
         }
-        CURRENT_TIMEOUTS.with(|t| {
-            let mut map = t.borrow_mut();
-            map.clear();
-            let fe_client = proxies[proxy_idx].stats_config.raw_timeouts.client.map_or(0, millis_to_u32);
-            let fe_connect = proxies[proxy_idx].stats_config.raw_timeouts.connect.map_or(0, millis_to_u32);
-            let fe_server = proxies[proxy_idx].stats_config.raw_timeouts.server.map_or(0, millis_to_u32);
-            let fe_queue = proxies[proxy_idx].stats_config.raw_timeouts.queue.map_or(0, millis_to_u32);
-            let fe_tunnel = proxies[proxy_idx].stats_config.raw_timeouts.tunnel.map_or(0, millis_to_u32);
-            let fe_tarpit = proxies[proxy_idx].stats_config.raw_timeouts.tarpit.map_or(0, millis_to_u32);
-
-            map.insert("fe_client_timeout", fe_client);
-            map.insert("cur_client_timeout", fe_client);
-            map.insert("fe_connect_timeout", fe_connect);
-            map.insert("cur_connect_timeout", fe_connect);
-            map.insert("fe_server_timeout", fe_server);
-            map.insert("cur_server_timeout", fe_server);
-            map.insert("fe_queue_timeout", fe_queue);
-            map.insert("cur_queue_timeout", fe_queue);
-            map.insert("fe_tunnel_timeout", fe_tunnel);
-            map.insert("cur_tunnel_timeout", fe_tunnel);
-            map.insert("fe_tarpit_timeout", fe_tarpit);
-            map.insert("cur_tarpit_timeout", fe_tarpit);
-
-            map.insert("be_client_timeout", fe_client);
-            map.insert("be_server_timeout", fe_server);
-            map.insert("be_connect_timeout", fe_connect);
-            map.insert("be_queue_timeout", fe_queue);
-            map.insert("be_tunnel_timeout", fe_tunnel);
-            map.insert("be_tarpit_timeout", fe_tarpit);
-        });
+        // Until a backend is chosen the frontend's timeouts are the backend's too.
+        stream_timeouts_enter(proxies, proxy_idx, entry.backend_idx, &entry.sess);
         STRICT_MODE.set(true);
 
         // `monitor-uri`: answer the probe here, before any rule or backend sees it. The
@@ -7153,10 +7165,7 @@ impl EngineDispatcher<'_> {
                             || {
                                 let t = &proxies[proxy_idx].stats_config.raw_timeouts;
                                 // `http-request set-timeout tarpit` of this stream wins.
-                                let set = CURRENT_TIMEOUTS.with(|m| {
-                                    let m = m.borrow();
-                                    (m.get("cur_tarpit_timeout_set").copied() == Some(1)).then(|| m.get("cur_tarpit_timeout").copied()).flatten()
-                                });
+                                let set = sess.timeouts_set.as_ref().map(|s| s.ms[TimeoutKind::Tarpit as usize]).filter(|&ms| ms != 0);
                                 let ms = set.unwrap_or_else(|| t.tarpit.or(t.connect).map_or(0, millis_to_u32));
                                 now.add(ms)
                             },
@@ -7441,36 +7450,24 @@ impl EngineDispatcher<'_> {
                         } else {
                             parse_timeout_val(timeout_val)
                         };
-                        CURRENT_TIMEOUTS.with(|t| {
-                            let mut map = t.borrow_mut();
-                            match timeout_type.as_str() {
-                                "client" => {
-                                    map.insert("cur_client_timeout", ms);
-                                    map.insert("cur_client_timeout_set", 1);
-                                }
-                                "server" => {
-                                    map.insert("cur_server_timeout", ms);
-                                    map.insert("cur_server_timeout_set", 1);
-                                }
-                                "connect" => {
-                                    map.insert("cur_connect_timeout", ms);
-                                    map.insert("cur_connect_timeout_set", 1);
-                                }
-                                "queue" => {
-                                    map.insert("cur_queue_timeout", ms);
-                                    map.insert("cur_queue_timeout_set", 1);
-                                }
-                                "tunnel" => {
-                                    map.insert("cur_tunnel_timeout", ms);
-                                    map.insert("cur_tunnel_timeout_set", 1);
-                                }
-                                "tarpit" => {
-                                    map.insert("cur_tarpit_timeout", ms);
-                                    map.insert("cur_tarpit_timeout_set", 1);
-                                }
-                                _ => {}
+                        // `stream_set_timeout` (src/stream.c): the stream runs on it from here,
+                        // and `cur_*_timeout` reports it. 0 leaves the timeout as it was.
+                        if let Some(kind) = TimeoutKind::from_name(timeout_type).filter(|_| ms != 0) {
+                            let before = sess.timeouts;
+                            sess.timeouts_set.get_or_insert_with(|| Box::new(crate::proxy::TimeoutsSet { ms: [0; 6], before })).ms[kind as usize] = ms;
+                            match kind {
+                                TimeoutKind::Client => sess.timeouts.client = ms,
+                                TimeoutKind::Server => sess.timeouts.server = ms,
+                                TimeoutKind::Connect => sess.timeouts.connect = ms,
+                                // Ibex has no server queue nor tunnel timer: these change only
+                                // what the fetches report. The tarpit reads `timeouts_set`.
+                                TimeoutKind::Queue | TimeoutKind::Tunnel | TimeoutKind::Tarpit => {}
                             }
-                        });
+                            if let Some(mut t) = CURRENT_TIMEOUTS.get() {
+                                t.cur[kind as usize] = ms;
+                                CURRENT_TIMEOUTS.set(Some(t));
+                            }
+                        }
                     }
                     ibex_config::HttpReqAction::NormalizeUri { normalizer, full, strict } => {
                         let current_uri = sess.req_uri.as_deref().unwrap_or("/");
@@ -7605,12 +7602,21 @@ impl EngineDispatcher<'_> {
         if be_idx != proxy_idx && !resume_be {
             entry.sess.set_retries(proxies[be_idx].retries);
         }
-        // The server side runs on the backend's timeouts, as in HAProxy.
-        if be_idx != proxy_idx {
+        // The server side runs on the backend's timeouts, as in HAProxy: `stream_set_backend`
+        // drops what a frontend-side `set-timeout` set for it (the client's and the
+        // tarpit's stay). Not again on a stream resumed in the backend, whose own rules may
+        // have set them since.
+        if be_idx != proxy_idx && !resume_be {
             let t = proxies[be_idx].timeouts;
             entry.sess.timeouts.server = t.server;
             entry.sess.timeouts.connect = t.connect;
+            if let Some(set) = entry.sess.timeouts_set.as_mut() {
+                for k in [TimeoutKind::Server, TimeoutKind::Connect, TimeoutKind::Queue, TimeoutKind::Tunnel] {
+                    set.ms[k as usize] = 0;
+                }
+            }
         }
+        stream_timeouts_enter(proxies, proxy_idx, be_idx, &entry.sess);
 
         // Evaluate backend tcp-request content rules
         let inspect_wait = resume.filter(|w| w.inspect);
@@ -7660,29 +7666,6 @@ impl EngineDispatcher<'_> {
                 ContentEvalResult::Done | ContentEvalResult::Waiting => {}
             }
         }
-
-        // Update backend timeouts
-        CURRENT_TIMEOUTS.with(|t| {
-            let mut map = t.borrow_mut();
-            let be_server = proxies[be_idx].stats_config.raw_timeouts.server.map_or(0, millis_to_u32);
-            let be_connect = proxies[be_idx].stats_config.raw_timeouts.connect.map_or(0, millis_to_u32);
-            let be_queue = proxies[be_idx].stats_config.raw_timeouts.queue.map_or(0, millis_to_u32);
-            let be_tunnel = proxies[be_idx].stats_config.raw_timeouts.tunnel.map_or(0, millis_to_u32);
-            let be_tarpit = proxies[be_idx].stats_config.raw_timeouts.tarpit.map_or(0, millis_to_u32);
-
-            map.insert("be_server_timeout", be_server);
-            map.insert("be_connect_timeout", be_connect);
-            map.insert("be_queue_timeout", be_queue);
-            map.insert("be_tunnel_timeout", be_tunnel);
-            map.insert("be_tarpit_timeout", be_tarpit);
-
-            if be_idx != proxy_idx {
-                map.insert("cur_server_timeout", be_server);
-                map.insert("cur_connect_timeout", be_connect);
-                map.insert("cur_queue_timeout", be_queue);
-                map.insert("cur_tunnel_timeout", be_tunnel);
-            }
-        });
 
         // If be_idx != proxy_idx, execute backend rules
         if be_idx != proxy_idx && !proxies[be_idx].http_req_rules.is_empty() {
@@ -7944,6 +7927,7 @@ impl EngineDispatcher<'_> {
         // already counted for the backend.
         let resumed = entry.sess.be_inspect;
         entry.backend_idx = be_idx;
+        stream_timeouts_enter(proxies, entry.proxy_idx, be_idx, &entry.sess);
         if !resumed {
             // `stream_set_backend` counts the stream for the backend (`proxy_inc_be_ctr`).
             proxies[be_idx].stats[worker_id()].be_sess_rate.tick();

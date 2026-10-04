@@ -508,7 +508,12 @@ pub(crate) fn parse_frontend_directive(
             tokens[1].col,
             "'set-retries' only available in backend or listen section",
         )),
-        "http-request" => in_section(parse_http_req_rule(&mut fe.http_req_rules, tokens, kw), "frontend", &fe.name),
+        "http-request" => in_section(
+            parse_http_req_rule(&mut fe.http_req_rules, tokens, kw)
+                .and_then(|()| set_timeout_sides(&fe.http_req_rules, kw, &fe.name, true, false)),
+            "frontend",
+            &fe.name,
+        ),
         "http-response" => in_section(parse_http_res_rule(&mut fe.http_res_rules, tokens, kw), "frontend", &fe.name),
         "http-after-response" => {
             in_section(parse_http_after_res_rule(&mut fe.http_after_res_rules, tokens, kw), "frontend", &fe.name)
@@ -638,7 +643,12 @@ pub(crate) fn parse_backend_directive(
         "default-server" => parse_default_server(&mut be.default_server, tokens, kw),
         "server" => parse_server(&mut be.servers, &mut be.server_extras, be.default_server.as_ref(), tokens, kw),
         "tcp-request" => parse_backend_tcp_request(be, tokens, kw),
-        "http-request" => in_section(parse_http_req_rule(&mut be.http_req_rules, tokens, kw), "backend", &be.name),
+        "http-request" => in_section(
+            parse_http_req_rule(&mut be.http_req_rules, tokens, kw)
+                .and_then(|()| set_timeout_sides(&be.http_req_rules, kw, &be.name, false, true)),
+            "backend",
+            &be.name,
+        ),
         "http-response" => in_section(parse_http_res_rule(&mut be.http_res_rules, tokens, kw), "backend", &be.name),
         "http-after-response" => {
             in_section(parse_http_after_res_rule(&mut be.http_after_res_rules, tokens, kw), "backend", &be.name)
