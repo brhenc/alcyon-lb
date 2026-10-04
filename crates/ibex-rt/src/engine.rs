@@ -25,7 +25,7 @@ use ibex_config::LogLevel;
 use crate::txn::MsgState;
 use crate::proxy::{TcpSession, Timeouts};
 use crate::raw;
-use ibex_config::{regex, BalanceAlgorithm, Config, Mode, StickRule, UseBackendRule};
+use ibex_config::{BalanceAlgorithm, Config, Mode, StickRule, UseBackendRule};
 use ibex_proto::endpoint::ScState;
 use ibex_sample::{Expr, Registry, Sample, SampleContext};
 use ibex_sched::task::{state, Kind, TaskRef, WorkKind};
@@ -7025,7 +7025,7 @@ impl EngineDispatcher<'_> {
                             let current_uri = sess.req_uri.as_deref().unwrap_or("/");
                             let (pfx, path, query) = split_uri(current_uri);
                             let rust_repl = translate_backreferences(repl);
-                            if let Ok(re) = regex::Regex::new(regex) {
+                            if let Ok(re) = ibex_regex::UserRegex::new(regex) {
                                 let new_path = re.replace_all(path, &rust_repl).to_string();
                                 let rebuilt = rebuild_uri(pfx, &new_path, query);
                                 Some((new_path, rebuilt))
@@ -7060,7 +7060,7 @@ impl EngineDispatcher<'_> {
                             let (pfx, path, query) = split_uri(current_uri);
                             let pathq = if query.is_empty() { path.to_string() } else { format!("{path}?{query}") };
                             let rust_repl = translate_backreferences(repl);
-                            if let Ok(re) = regex::Regex::new(regex) {
+                            if let Ok(re) = ibex_regex::UserRegex::new(regex) {
                                 let new_pathq = re.replace_all(&pathq, &rust_repl).to_string();
                                 let rebuilt = format!("{pfx}{new_pathq}");
                                 Some(rebuilt)
@@ -7081,7 +7081,7 @@ impl EngineDispatcher<'_> {
                         let rebuilt = {
                             let current_uri = sess.req_uri.as_deref().unwrap_or("/");
                             let rust_repl = translate_backreferences(repl);
-                            regex::Regex::new(regex)
+                            ibex_regex::UserRegex::new(regex)
                                 .ok()
                                 .filter(|re| re.is_match(current_uri))
                                 .map(|re| re.replace(current_uri, &rust_repl).to_string())
@@ -8266,7 +8266,7 @@ fn header_name_matches(header_key: &str, pattern: &str) -> bool {
                 "beg" => header_key.to_lowercase().starts_with(&pat.to_lowercase()),
                 "end" => header_key.to_lowercase().ends_with(&pat.to_lowercase()),
                 "sub" => header_key.to_lowercase().contains(&pat.to_lowercase()),
-                "reg" => regex::Regex::new(pat).is_ok_and(|re| re.is_match(header_key)),
+                "reg" => ibex_regex::UserRegex::new(pat).is_ok_and(|re| re.is_match(header_key)),
                 _ => header_key.eq_ignore_ascii_case(pat),
             }
         } else {
@@ -8616,8 +8616,16 @@ fn wait_for_request_body(
 }
 
 fn del_req_header(sess: &mut TcpSession, name: &str) {
+    // `-m beg|end|sub|reg` names a set of headers: remove each that matches.
+    let names: Vec<String> = if name.starts_with('\0') {
+        sess.htx_slice().map_or_else(Vec::new, |h| h.headers().map(|(k, _)| k.to_string()).filter(|k| header_name_matches(k, name)).collect())
+    } else {
+        vec![name.to_string()]
+    };
     sess.with_htx_mut(|htx| {
-        let _ = htx.remove_header(name);
+        for n in &names {
+            let _ = htx.remove_header(n);
+        }
     });
     let mut hdrs = sess.req_headers.take().unwrap_or_default();
     hdrs.retain(|(k, _)| !header_name_matches(k, name));
@@ -8686,7 +8694,7 @@ fn replace_req_value(sess: &mut TcpSession, name: &str, regex: &str, repl: &str)
 /// `repl` is cut short and the request is in strict mode: header by header, the ones
 /// before it stay rewritten.
 fn rewrite_req_header_values(sess: &mut TcpSession, name: &str, regex: &str, repl: &str, per_value: bool) -> Result<(), ()> {
-    let re = regex::Regex::new(regex).map_err(|_| ())?;
+    let re = ibex_regex::UserRegex::new(regex).map_err(|_| ())?;
     let headers: Vec<(String, String)> = sess.htx_slice().map_or_else(Vec::new, |h| {
         h.headers().filter(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(k, v)| (k.to_string(), v.to_string())).collect()
     });
@@ -8718,7 +8726,7 @@ fn rewrite_req_header_values(sess: &mut TcpSession, name: &str, regex: &str, rep
         // edit is not rewritten again. A value is replaced whole and literally: `$` is the
         // only special character in a `regex` replacement.
         for (i, (old, _)) in edits.iter().enumerate() {
-            let _ = htx.replace_header(name, &format!("^{}$", regex::escape(old)), &format!("@@ibex-rewrite-{i}@@"));
+            let _ = htx.replace_header(name, &format!("^{}$", ibex_regex::UserRegex::escape(old)), &format!("@@ibex-rewrite-{i}@@"));
         }
         for (i, (_, new)) in edits.iter().enumerate() {
             let _ = htx.replace_header(name, &format!("^@@ibex-rewrite-{i}@@$"), &new.replace('$', "$$"));
@@ -8978,7 +8986,7 @@ fn res_htx_resize(free: usize, take: usize) -> bool {
 /// match (nothing for a group that did not take part), `\xHH` by that byte -- computed as
 /// `HAProxy` computes it, which takes any two characters -- and a backslash before
 /// anything else dropped. `None`, a failed rewrite, for a backslash or `\x` cut short.
-fn exp_replace(repl: &str, caps: &regex::Captures<'_>) -> Option<String> {
+fn exp_replace(repl: &str, caps: &ibex_regex::Captures<'_>) -> Option<String> {
     let nibble = |c: u8| {
         let n = c.to_ascii_uppercase().wrapping_sub(b'0');
         if n > 9 { n.wrapping_sub(b'A' - b'9' - 1) } else { n }
@@ -8995,7 +9003,7 @@ fn exp_replace(repl: &str, caps: &regex::Captures<'_>) -> Option<String> {
         s = rest;
         if e.is_ascii_digit() {
             if let Some(m) = caps.get(usize::from(e - b'0')) {
-                out.extend_from_slice(m.as_str().as_bytes());
+                out.extend_from_slice(m.as_bytes());
             }
         } else if e == b'x' {
             let (&[h1, h2], rest) = s.split_first_chunk::<2>()?;
@@ -9030,7 +9038,7 @@ fn hdr_value_end(v: &str) -> usize {
 /// matches is replaced, with the blanks around it, by [`exp_replace`]'s output; the
 /// commas and the values it does not match stay as they were (`http_replace_hdrs` with
 /// `full` unset, `http_replace_header_value`). `None` when [`exp_replace`] fails.
-fn replace_each_value(v: &str, re: &regex::Regex, repl: &str) -> Option<String> {
+fn replace_each_value(v: &str, re: &ibex_regex::UserRegex, repl: &str) -> Option<String> {
     let mut out = String::with_capacity(v.len());
     let mut rest = v;
     loop {
@@ -9149,7 +9157,7 @@ fn res_action(
         // `http_replace_hdrs`: header by header, the first that does not fit failing the
         // action with the ones before it rewritten.
         let Some((re_str, repl)) = act_fmt.split_once('\t') else { return Ok(true) };
-        let Ok(re) = regex::Regex::new(re_str) else { return Ok(true) };
+        let Ok(re) = ibex_regex::UserRegex::new(re_str) else { return Ok(true) };
         let mut result = Ok(true);
         for (k, v) in hdrs.iter_mut().filter(|(k, _)| k.eq_ignore_ascii_case(hdr_name)) {
             let new_v = if full {

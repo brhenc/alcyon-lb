@@ -7,7 +7,7 @@ description = "Ibex layer model: protocol / transport / mux vtables and the stre
 
 [dependencies]
 ibex-sched = { path = "../ibex-sched" }
-regex = { workspace = true }
+ibex-regex = { workspace = true }
 ibex-h1-sys = { path = "../ibex-h1-sys", optional = true }
 
 [features]

@@ -15,7 +15,7 @@ use crate::hash::{
 };
 use crate::sample::{Sample, SampleType, TypeSpec};
 use ibex_proto::htx::{Htx, HtxSliceRef};
-use regex::RegexBuilder;
+
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -4408,7 +4408,7 @@ pub enum MapMatchType {
 pub struct CachedMapEntry {
     pub key: String,
     pub val: String,
-    pub regex: Option<regex::Regex>,
+    pub regex: Option<ibex_regex::UserRegex>,
     pub int_val: Option<i64>,
 }
 
@@ -4443,7 +4443,7 @@ impl CachedMapTable {
             };
 
             let int_val = key.parse::<i64>().ok();
-            let regex = regex::Regex::new(&key).ok();
+            let regex = ibex_regex::UserRegex::new(&key).ok();
 
             if let Some(n) = int_val {
                 exact_int.entry(n).or_insert_with(|| (val.clone(), key.clone()));
@@ -4598,7 +4598,7 @@ pub fn match_map(path: &str, input: &str, match_type: MapMatchType) -> Option<(S
                         let mut result = entry.val.clone();
                         for i in 1..caps.len() {
                             let backref = format!("\\{i}");
-                            let captured = caps.get(i).map_or("", |m| m.as_str());
+                            let captured = caps.get(i).unwrap_or("");
                             result = result.replace(&backref, captured);
                         }
                         return Some((result, entry.key.clone()));
@@ -4722,10 +4722,7 @@ fn regsub_eval(input: &str, pattern: &str, repl: &str, flags: &str) -> Option<St
     let case_insensitive = flags.contains('i');
     let global = flags.contains('g');
 
-    let re = RegexBuilder::new(pattern)
-        .case_insensitive(case_insensitive)
-        .build()
-        .ok()?;
+    let re = ibex_regex::UserRegex::with_case(pattern, case_insensitive).ok()?;
 
     // Translate \1, \2 to ${1}, ${2} for Rust regex replacement
     let mut rust_repl = String::with_capacity(repl.len() + 4);

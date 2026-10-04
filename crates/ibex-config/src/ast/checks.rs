@@ -283,7 +283,7 @@ impl ResolvedTcpExpectPattern {
             }
             ResolvedTcpExpectPattern::RString(pattern) => {
                 let data_str = String::from_utf8_lossy(data);
-                regex::Regex::new(pattern).is_ok_and(|re| re.is_match(&data_str))
+                ibex_regex::UserRegex::new(pattern).is_ok_and(|re| re.is_match(&data_str))
             }
         }
     }

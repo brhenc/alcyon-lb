@@ -35,7 +35,6 @@ pub use ast::{
 pub use error::ConfigError;
 pub use parser::parse_str;
 pub use parser::parse_str as parse_config;
-pub use regex;
 
 
 /// Parses an `HAProxy` 1.0 configuration file from disk.

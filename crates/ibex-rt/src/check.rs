@@ -836,8 +836,8 @@ fn fail_with(status: (&'static str, &'static str), resp: &HttpResp, info: String
 }
 
 /// Compiles a regular expression written in the configuration (checked when it was read).
-fn config_regex(pattern: &str, case_insensitive: bool) -> Option<regex::Regex> {
-    regex::RegexBuilder::new(pattern).case_insensitive(case_insensitive).build().ok()
+fn config_regex(pattern: &str, case_insensitive: bool) -> Option<ibex_regex::UserRegex> {
+    ibex_regex::UserRegex::with_case(pattern, case_insensitive).ok()
 }
 
 /// The values of a header `hdr` looks at: the comma-separated elements, trimmed, or with

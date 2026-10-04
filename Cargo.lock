@@ -215,6 +215,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "fancy-regex"
+version = "0.19.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d301f5bf187b3c295fce6468d3875037a0bccc5f6b151c63cac2f85babf21912"
+dependencies = [
+ "bit-set",
+ "regex-automata",
+ "regex-syntax",
+]
+
+[[package]]
 name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -366,7 +377,7 @@ version = "0.1.0"
 name = "ibex-config"
 version = "0.1.0"
 dependencies = [
- "regex",
+ "ibex-regex",
  "thiserror 1.0.69",
 ]
 
@@ -400,10 +411,10 @@ version = "0.1.0"
 dependencies = [
  "ibex-alloc",
  "ibex-h1-sys",
+ "ibex-regex",
  "ibex-sample",
  "ibex-sched",
  "proptest",
- "regex",
 ]
 
 [[package]]
@@ -421,6 +432,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ibex-regex"
+version = "0.1.0"
+dependencies = [
+ "fancy-regex",
+ "regex",
+]
+
+[[package]]
 name = "ibex-rt"
 version = "0.1.0"
 dependencies = [
@@ -430,12 +449,12 @@ dependencies = [
  "ibex-mmsg",
  "ibex-proto",
  "ibex-quic",
+ "ibex-regex",
  "ibex-sample",
  "ibex-sched",
  "ibex-stick-table",
  "ibex-tls",
  "rcgen",
- "regex",
  "rustix 0.38.44",
  "rustls",
  "serde",
@@ -450,8 +469,8 @@ version = "0.1.0"
 dependencies = [
  "getrandom 0.2.17",
  "ibex-proto",
+ "ibex-regex",
  "proptest",
- "regex",
  "serde",
  "serde_json",
 ]
