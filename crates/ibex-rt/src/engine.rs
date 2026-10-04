@@ -5514,7 +5514,6 @@ impl EngineDispatcher<'_> {
             // What the rules captured is what the log line shows, and what the rules after
             // them (`http-after-response`) read.
             entry.sess.log.res_captures.clone_from(&res_caps);
-            let ctx = SampleContext { captures_res_hdr: Some(&res_caps), ..ctx.clone() };
             if stopped.is_some() {
                 break 'rules stopped;
             }
@@ -5541,16 +5540,19 @@ impl EngineDispatcher<'_> {
             }
 
             // 2. and 3. `http-after-response`, the backend's then the frontend's.
-            if let Err(stop) = eval_after_res_rules(
+            let after = eval_after_res_rules(
                 proxies,
                 fe_idx,
                 be_idx,
                 (&mut hdrs, &mut status, &mut status_msg),
                 &ctx,
+                Some(&mut res_caps),
                 registry,
                 &mut entry.sess.sess_vars,
                 &mut entry.sess.req_vars,
-            ) {
+            );
+            entry.sess.log.res_captures.clone_from(&res_caps);
+            if let Err(stop) = after {
                 break 'rules Some(stop);
             }
             None
@@ -8024,6 +8026,7 @@ impl<'a> ResOp<'a> {
 
     fn of_after_res(a: &'a ibex_config::HttpAfterResAction) -> ResRule<'a> {
         ResRule::Op(match a {
+            ibex_config::HttpAfterResAction::Capture { expr, id } => return ResRule::Capture(expr, *id),
             ibex_config::HttpAfterResAction::SetHeader { name, fmt } => Self::Set(name, fmt),
             ibex_config::HttpAfterResAction::AddHeader { name, fmt } => Self::Add(name, fmt),
             ibex_config::HttpAfterResAction::DelHeader { name } => Self::Del(name),
@@ -8364,6 +8367,7 @@ fn eval_after_res_rules(
     be_idx: usize,
     head: (&mut Vec<(String, String)>, &mut u16, &mut String),
     ctx: &SampleContext,
+    mut res_caps: Option<&mut Vec<Option<Vec<u8>>>>,
     registry: &Registry,
     sess_vars: &mut HashMap<String, String>,
     req_vars: &mut HashMap<String, String>,
@@ -8374,7 +8378,10 @@ fn eval_after_res_rules(
     let order: &[usize] = if fe_idx == be_idx { &[be_idx] } else { &[be_idx, fe_idx] };
     for &px in order {
         let rules = proxies[px].http_after_res_rules.iter().map(|r| (ResOp::of_after_res(&r.action), r.cond.as_ref()));
-        run_res_rules(rules, &proxies[px].acls, (&mut *hdrs, &mut *status, &mut *status_msg), ctx, None, registry, sess_vars, req_vars, None)?;
+        // `http-after-response capture` writes the frontend's slots, whichever proxy the rule is in.
+        let fe_slots = &proxies[fe_idx].res_capture_slots;
+        let caps = res_caps.as_deref_mut().filter(|_| !fe_slots.is_empty()).map(|c| (c, &fe_slots[..]));
+        run_res_rules(rules, &proxies[px].acls, (&mut *hdrs, &mut *status, &mut *status_msg), ctx, caps, registry, sess_vars, req_vars, None)?;
     }
     Ok(())
 }
@@ -8450,6 +8457,8 @@ fn after_res_on_reply<'r>(
     });
     let mut sess_vars = std::mem::take(&mut sess.sess_vars);
     let mut req_vars = std::mem::take(&mut sess.req_vars);
+    let mut res_caps = std::mem::take(&mut sess.log.res_captures);
+    let res_caps_in = res_caps.clone();
     let result = {
         let ctx = SampleContext {
             client_addr: sess.client_addr,
@@ -8470,7 +8479,7 @@ fn after_res_on_reply<'r>(
             res_version: Some(&version),
             unique_id: sess.log.unique_id.as_deref(),
             captures_req_hdr: Some(&sess.log.req_captures),
-            captures_res_hdr: Some(&sess.log.res_captures),
+            captures_res_hdr: Some(&res_caps_in),
             ..Default::default()
         };
         eval_after_res_rules(
@@ -8479,6 +8488,7 @@ fn after_res_on_reply<'r>(
             be_idx,
             (&mut hdrs, &mut status, &mut reason),
             &ctx,
+            Some(&mut res_caps),
             sample_registry(),
             &mut sess_vars,
             &mut req_vars,
@@ -8486,6 +8496,7 @@ fn after_res_on_reply<'r>(
     };
     sess.sess_vars = sess_vars;
     sess.req_vars = req_vars;
+    sess.log.res_captures = res_caps;
     CURRENT_RES_STATUS.set(0);
     CURRENT_RES_HEADERS.with(|h| h.borrow_mut().clear());
     result.map_err(|_| ())?;

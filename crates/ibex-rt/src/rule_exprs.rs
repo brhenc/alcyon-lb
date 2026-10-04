@@ -150,6 +150,7 @@ fn http_res(a: &HttpResAction) -> Exprs<'_> {
 fn http_after_res(a: &HttpAfterResAction) -> Exprs<'_> {
     match a {
         HttpAfterResAction::SetHeader { name, fmt } => res_set_var(name, fmt),
+        HttpAfterResAction::Capture { expr, .. } => vec![("capture".into(), expr, false)],
         _ => Vec::new(),
     }
 }
@@ -411,14 +412,17 @@ pub fn validate_formats(config: &Config, registry: &Registry) -> Result<(), Stri
     let sections = config
         .frontends
         .iter()
-        .map(|f| (&f.name, &f.http_res_rules, f.res_header_captures.len()))
-        .chain(config.listens.iter().map(|l| (&l.name, &l.http_res_rules, l.res_header_captures.len())));
-    for (name, rules, slots) in sections {
-        for r in rules {
-            if let HttpResAction::Capture { id, .. } = r.action {
-                if id >= slots {
-                    return Err(format!("Proxy '{name}': unable to find capture id '{id}' referenced by http-response capture rule."));
-                }
+        .map(|f| (&f.name, &f.http_res_rules, &f.http_after_res_rules, f.res_header_captures.len()))
+        .chain(config.listens.iter().map(|l| (&l.name, &l.http_res_rules, &l.http_after_res_rules, l.res_header_captures.len())));
+    for (name, rules, after, slots) in sections {
+        // `http-after-response capture` is checked the same way and worded as `http-response`.
+        let ids = rules
+            .iter()
+            .filter_map(|r| if let HttpResAction::Capture { id, .. } = r.action { Some(id) } else { None })
+            .chain(after.iter().filter_map(|r| if let HttpAfterResAction::Capture { id, .. } = r.action { Some(id) } else { None }));
+        for id in ids {
+            if id >= slots {
+                return Err(format!("Proxy '{name}': unable to find capture id '{id}' referenced by http-response capture rule."));
             }
         }
     }

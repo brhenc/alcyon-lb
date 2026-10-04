@@ -335,3 +335,59 @@ fn the_http_request_capture_forms_haproxy_refuses_are_refused_and_name_the_proxy
         assert!(ok, "`ibex -c` refused\n{cfg}\nwhich haproxy accepts: {out:?}");
     }
 }
+
+/// `http-after-response capture <sample> id <n>` writes the same frontend response slots as
+/// `http-response capture`, after every `http-response` rule and after the cookie line, and
+/// it runs on the replies the proxy makes itself too. Measured on `HAProxy
+/// 3.5-dev8-885761-29` (2026-10-04) with two slots of 4 and 5 bytes, a 9-byte `X-S` from the
+/// server, after-response rules capturing `res.hdr(x-s)` into slot 0 and `str(abcdefgh)`
+/// into slot 1 when the status is 200, an `http-response` header reading slot 0 and an
+/// after-response header reading both: `/` gave `x-early: []` (the after rule had not run
+/// yet) and `x-late: [1234][abcde]`; `/gen`, a `return status 201 hdr x-s generated`, gave
+/// `x-late: [gene][]`; `/deny` gave `x-late: [][]`.
+#[test]
+fn an_http_after_response_capture_fills_the_slot_it_names() {
+    let cfg = format!(
+        "{DEFAULTS}frontend fe\n  bind {{fe}}\n  declare capture response len 4\n  declare capture response len 5\n  \
+         http-after-response capture res.hdr(x-s) id 0\n  http-after-response capture str(abcdefgh) id 1 if {{ status 200 }}\n  \
+         http-response set-header x-early \"[%[capture.res.hdr(0)]]\"\n  \
+         http-after-response set-header x-late \"[%[capture.res.hdr(0)]][%[capture.res.hdr(1)]]\"\n  \
+         http-request return status 201 hdr x-s generated if {{ path /gen }}\n  http-request deny if {{ path /deny }}\n  \
+         default_backend be\nbackend be\n  server s1 {{srv}}\n"
+    );
+    let (_ibex, fe) = start(&cfg, server(b"X-S: 123456789\r\n"), None);
+    for (path, early, late) in [("/", Some("[]"), "[1234][abcde]"), ("/gen", None, "[gene][]"), ("/deny", None, "[][]")] {
+        let r = exchange(fe, format!("GET {path} HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n").as_bytes());
+        let shown = String::from_utf8_lossy(&r);
+        assert_eq!(header(&r, "x-early").as_deref(), early, "{path}: {shown}");
+        assert_eq!(header(&r, "x-late").as_deref(), Some(late), "{path}: {shown}");
+    }
+}
+
+/// The configurations `HAProxy` refuses for `http-after-response capture`, with the message
+/// it gave (`haproxy -c`, 2026-10-04).
+#[test]
+fn the_http_after_response_capture_forms_haproxy_refuses_are_refused() {
+    let fe = |rule: &str| format!("frontend fe\n  mode http\n  bind 127.0.0.1:1\n  declare capture response len 4\n  http-after-response capture str(a){rule}\n");
+    let head = "error detected in frontend 'fe' while parsing 'http-after-response capture' rule : ";
+    let refused = [
+        (fe(""), format!("{head}expects <expression> id <idx>.")),
+        (fe(" id"), format!("{head}expects <expression> id <idx>.")),
+        (fe(" len 3"), format!("{head}expects 'id', found 'len'.")),
+        (fe(" id abc"), format!("{head}cannot parse id 'abc'.")),
+        (fe(" id 0 foo"), "'http-after-response capture' expects either 'if' or 'unless' followed by a condition but found 'foo'.".to_string()),
+        (fe(" id 5"), "Proxy 'fe': unable to find capture id '5' referenced by http-response capture rule.".to_string()),
+        (
+            "frontend fe\n  mode http\n  bind 127.0.0.1:1\n  http-after-response capture str(a) id 0\n".to_string(),
+            "Proxy 'fe': unable to find capture id '0' referenced by http-response capture rule.".to_string(),
+        ),
+    ];
+    for (cfg, want) in &refused {
+        let (ok, out) = check(cfg);
+        assert!(!ok && out.contains(want.as_str()), "`ibex -c` on\n{cfg}\nwanted a refusal with {want:?}; accepted={ok}, said {out:?}");
+    }
+    for cfg in [fe(" id 0"), fe(" id 0 unless { status 200 }"), "backend be\n  mode http\n  http-after-response capture str(a) id 5\n".to_string()] {
+        let (ok, out) = check(&cfg);
+        assert!(ok, "`ibex -c` refused\n{cfg}\nwhich haproxy accepts: {out:?}");
+    }
+}

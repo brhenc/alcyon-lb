@@ -937,36 +937,8 @@ pub(crate) fn parse_http_res_rule(
             cond,
         });
     } else if act_str == "capture" {
-        // `parse_http_res_capture`: `capture <sample> id <idx>`, and nothing but a condition
-        // after it -- unlike `http-request capture` there is no `len`, the slot has one.
-        let refuse = |at: &Token, what: String| {
-            ConfigError::new(at.line, at.col, format!("error detected while parsing 'http-response capture' rule : {what}"))
-        };
-        let word = |i: usize| tokens.get(i).map_or("", |t| t.text.as_str());
-        if word(2).is_empty() || word(3).is_empty() {
-            return Err(refuse(act_token, "expects <expression> id <idx>.".to_string()));
-        }
-        if word(3) != "id" {
-            return Err(refuse(act_token, format!("expects 'id', found '{}'.", word(3))));
-        }
-        if word(4).is_empty() {
-            return Err(refuse(act_token, "expects <expression> id <idx>.".to_string()));
-        }
-        let Ok(id) = word(4).parse::<usize>() else {
-            return Err(refuse(act_token, format!("cannot parse id '{}'.", word(4))));
-        };
-        let cond = match tokens.get(5) {
-            None => None,
-            Some(t) if t.text == "if" || t.text == "unless" => parse_acl_condition_from_tokens(&tokens[5..])?,
-            Some(t) => {
-                return Err(ConfigError::new(
-                    t.line,
-                    t.col,
-                    format!("'http-response capture' expects either 'if' or 'unless' followed by a condition but found '{}'.", t.text),
-                ))
-            }
-        };
-        rules.push(HttpResRule { action: HttpResAction::Capture { expr: tokens[2].text.clone(), id }, cond });
+        let (expr, id, cond) = parse_res_capture(tokens, act_token, "http-response")?;
+        rules.push(HttpResRule { action: HttpResAction::Capture { expr, id }, cond });
     } else if act_str == "replace-header" {
         if tokens.len() < 5 {
             return Err(ConfigError::new(
@@ -1371,6 +1343,9 @@ pub(crate) fn parse_http_after_res_rule(
             },
             cond,
         });
+    } else if act_str == "capture" {
+        let (expr, id, cond) = parse_res_capture(tokens, act_token, "http-after-response")?;
+        rules.push(HttpAfterResRule { action: HttpAfterResAction::Capture { expr, id }, cond });
     } else {
         return Err(ConfigError::new(
             act_token.line,
@@ -1391,4 +1366,42 @@ pub(crate) fn in_section(r: Result<(), ConfigError>, kind: &str, name: &str) -> 
         }
         e
     })
+}
+
+/// `parse_http_res_capture` / `parse_http_after_res_capture`: `capture <sample> id <idx>`,
+/// and nothing but a condition after it -- unlike `http-request capture` there is no `len`,
+/// the slot has one. `rule` is the keyword the rule was written under.
+fn parse_res_capture(
+    tokens: &[Token],
+    act_token: &Token,
+    rule: &str,
+) -> Result<(String, usize, Option<AclCondition>), ConfigError> {
+    let refuse = |at: &Token, what: String| {
+        ConfigError::new(at.line, at.col, format!("error detected while parsing '{rule} capture' rule : {what}"))
+    };
+    let word = |i: usize| tokens.get(i).map_or("", |t| t.text.as_str());
+    if word(2).is_empty() || word(3).is_empty() {
+        return Err(refuse(act_token, "expects <expression> id <idx>.".to_string()));
+    }
+    if word(3) != "id" {
+        return Err(refuse(act_token, format!("expects 'id', found '{}'.", word(3))));
+    }
+    if word(4).is_empty() {
+        return Err(refuse(act_token, "expects <expression> id <idx>.".to_string()));
+    }
+    let Ok(id) = word(4).parse::<usize>() else {
+        return Err(refuse(act_token, format!("cannot parse id '{}'.", word(4))));
+    };
+    let cond = match tokens.get(5) {
+        None => None,
+        Some(t) if t.text == "if" || t.text == "unless" => parse_acl_condition_from_tokens(&tokens[5..])?,
+        Some(t) => {
+            return Err(ConfigError::new(
+                t.line,
+                t.col,
+                format!("'{rule} capture' expects either 'if' or 'unless' followed by a condition but found '{}'.", t.text),
+            ))
+        }
+    };
+    Ok((tokens[2].text.clone(), id, cond))
 }

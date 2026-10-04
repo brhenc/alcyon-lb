@@ -202,6 +202,8 @@ pub enum HttpAfterResAction {
     SetHeader { name: String, fmt: String },
     AddHeader { name: String, fmt: String },
     DelHeader { name: String },
+    /// `capture <sample> id <idx>`: a frontend response slot, as `http-response capture`.
+    Capture { expr: String, id: usize },
 }
 
 /// Rule pairing an HTTP-after-response action with an optional condition.
