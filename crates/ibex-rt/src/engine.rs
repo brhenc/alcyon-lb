@@ -1406,6 +1406,7 @@ fn session_log_data<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, pid: u3
         actconn: sum(fe),
         feconn: sum(fe),
         retries: i64::from(s.max_retries.saturating_sub(s.conn_retries)),
+        redispatched: s.log.redispatched,
         uniq_id: l.uniq_id,
         log_counter: fe.log_count.load(Ordering::Relaxed),
         pid,
@@ -5010,6 +5011,7 @@ fn retry_server_connect(
             hash,
         )
     };
+    entry.sess.log.redispatched |= redispatch;
     let target = if resuming {
         entry.target_addr
     } else if redispatch {
