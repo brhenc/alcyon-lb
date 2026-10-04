@@ -4125,12 +4125,6 @@ fn store_var_smp(
     val: String,
     empty: bool,
 ) {
-    // Variables the expression's converters set on the way (`aes_gcm_enc`'s tag) live
-    // where the rest of the session's variables do.
-    for (n, v) in ibex_sample::take_pending_var_writes() {
-        let map = if n.starts_with("sess.") { &mut *sess_vars } else { &mut *req_vars };
-        map.insert(n, v);
-    }
     let name = spec.split(',').next().unwrap_or("");
     let is_proc = name.starts_with("proc.");
     let is_set = if is_proc {

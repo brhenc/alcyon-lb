@@ -26,15 +26,6 @@ thread_local! {
     pub static CURRENT_TIMEOUTS: RefCell<HashMap<&'static str, u32>> = RefCell::new(HashMap::new());
     pub static CURRENT_RES_HEADERS: RefCell<Vec<(String, String)>> = const { RefCell::new(Vec::new()) };
     pub static CURRENT_RES_STATUS: Cell<u16> = const { Cell::new(0) };
-    /// Variables a converter set while an expression was evaluated (`aes_gcm_enc`'s tag):
-    /// the engine moves them to the session's own maps when the rule that evaluated the
-    /// expression stores its result, so they outlive that rule.
-    static PENDING_VAR_WRITES: RefCell<Vec<(String, String)>> = const { RefCell::new(Vec::new()) };
-}
-
-/// Takes the variables converters have set since the last call, as `(name, value)`.
-pub fn take_pending_var_writes() -> Vec<(String, String)> {
-    PENDING_VAR_WRITES.with(|p| std::mem::take(&mut *p.borrow_mut()))
 }
 
 pub static GLOBAL_PROC_VARS: LazyLock<RwLock<HashMap<String, String>>> =
@@ -5451,15 +5442,14 @@ fn read_var(name: &str) -> Option<String> {
     }
 }
 
-/// Sets a variable from a converter. The engine stores it in the session when the rule
-/// that is evaluating the expression stores its own result.
+/// Sets a variable from a converter: in the stream's map, which the engine hands back to
+/// the session when the step ends.
 fn write_var(name: &str, value: String) {
     if name.starts_with("proc.") {
         set_proc_var(name, value);
         return;
     }
-    CURRENT_VARS.with(|v| v.borrow_mut().insert(name.to_string(), value.clone()));
-    PENDING_VAR_WRITES.with(|p| p.borrow_mut().push((name.to_string(), value)));
+    CURRENT_VARS.with(|v| v.borrow_mut().insert(name.to_string(), value));
 }
 
 /// A base64 argument: the text of the variable it names, or the literal, decoded.
