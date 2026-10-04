@@ -720,12 +720,16 @@ pub fn check_sample_refs(config: &Config, registry: &Registry) -> Result<(), Str
         // whatever stream ran last on the thread (T156): in a request rule, and for the
         // headers in a log-format, rendered once they are gone. `HAProxy` refuses both.
         // An ACL is only warned about there, and never matches.
-        if let Some(part) = (!r.acl).then(|| crate::rule_exprs::response_part(crate::rule_exprs::leading_fetch(&r.expr))).flatten() {
+        let part_missing = |fetch: &str| match r.directive.as_str() {
+            "http-response" | "http-after-response" => crate::rule_exprs::request_part(fetch, false),
+            _ => crate::rule_exprs::response_part(fetch),
+        };
+        if let Some(part) = (!r.acl).then(|| part_missing(crate::rule_exprs::leading_fetch(&r.expr))).flatten() {
             let fetch = crate::rule_exprs::leading_fetch(&r.expr);
             let why = format!("sample fetch <{fetch}> may not be reliably used here because it needs '{part}' which is not available here.");
             let headers = part == "HTTP response headers";
             let refused = match r.directive.as_str() {
-                "http-request" => {
+                "http-request" | "http-response" | "http-after-response" => {
                     let kind = match r.section {
                         SectionKind::Frontend => "frontend",
                         SectionKind::Backend => "backend",
@@ -733,7 +737,7 @@ pub fn check_sample_refs(config: &Config, registry: &Registry) -> Result<(), Str
                         SectionKind::Defaults => "defaults",
                     };
                     let what = r.proxy.as_deref().map_or_else(|| format!("{kind} section"), |n| format!("{kind} '{n}'"));
-                    Some(format!("error detected in {what} while parsing 'http-request {}' rule : {why}", r.action))
+                    Some(format!("error detected in {what} while parsing '{} {}' rule : {why}", r.directive, r.action))
                 }
                 "log-format" | "error-log-format" if headers => Some(format!("failed to parse {} : {why}", r.directive)),
                 "unique-id-format" if headers => Some(format!("failed to parse unique-id : {why}")),

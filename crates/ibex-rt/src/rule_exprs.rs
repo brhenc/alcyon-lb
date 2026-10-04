@@ -116,6 +116,33 @@ pub fn response_part(fetch: &str) -> Option<&'static str> {
         | "res.fhdr" | "res.fhdr_cnt" | "res.cook" | "res.cook_cnt" | "res.cook_val" | "res.cook_names"
         | "res.body" | "res.body_len" | "res.body_size" | "res.timer.hdr" | "shdr" | "shdr_cnt" | "shdr_ip"
         | "shdr_val" | "scook" | "scook_cnt" | "scook_val" => Some("HTTP response headers"),
+        // `SMP_USE_L6RES` (`src/payload.c`): the raw response, which a request rule or a
+        // `tcp-request` has not got.
+        "res.len" | "res.payload" | "res.payload_lv" | "res.ssl_hello_type" | "rep_ssl_hello_type" => Some("response buffer"),
+        _ => None,
+    }
+}
+
+/// What a fetch that reads only the request needs of it, which a response rule no longer
+/// has (`SMP_USE_HRQHV` without `SMP_USE_HRSHV`, `src/http_fetch.c`): "HTTP request
+/// headers" -- and, with `raw`, for a `tcp-response` rule, the raw request (`SMP_USE_L6REQ`,
+/// `src/payload.c`) too. `hdr`, `cookie` and `internal.htx*` read either side and are not
+/// here; the request line's persistent facts (`method`, `req.ver`) are still there.
+#[must_use]
+pub fn request_part(fetch: &str, raw: bool) -> Option<&'static str> {
+    match fetch {
+        "base" | "base32" | "base32+src" | "baseq" | "cook" | "cook_cnt" | "cook_val" | "hdr_cnt" | "hdr_ip"
+        | "hdr_val" | "http_auth_type" | "http_auth_user" | "http_auth_pass" | "http_auth_bearer" | "http_auth"
+        | "http_auth_group" | "path" | "pathq" | "query" | "req.body" | "req.body_len" | "req.body_size"
+        | "req.body_param" | "req.hdrs" | "req.hdrs_bin" | "req.cook" | "req.cook_cnt" | "req.cook_val"
+        | "req.cook_names" | "req.fhdr" | "req.fhdr_cnt" | "req.hdr" | "req.hdr_cnt" | "req.hdr_ip"
+        | "req.hdr_names" | "req.hdr_val" | "url" | "url32" | "url32+src" | "url_ip" | "url_port" | "url_param"
+        | "urlp" | "urlp_val" | "req.timer.idle" | "req.timer.tq" | "req.timer.hdr" | "fcgi.docroot"
+        | "fcgi.index" => Some("HTTP request headers"),
+        "req.len" | "req_len" | "req.payload" | "req.payload_lv" | "req.ssl_hello_type" | "req_ssl_hello_type"
+        | "req.ssl_sni" | "req_ssl_sni" | "req.ssl_ver" | "req_ssl_ver" | "req.rdp_cookie" | "rdp_cookie"
+        | "req.rdp_cookie_cnt" | "rdp_cookie_cnt" | "req.ssl_alpn" | "req.ssl_ec_ext" | "req.ssl_st_ext"
+            if raw => Some("request buffer"),
         _ => None,
     }
 }
@@ -285,16 +312,26 @@ impl Section<'_> {
                     format!("error detected in {} while parsing '{kw} {action}' rule : {e}", self.what)
                 })?;
                 // A request rule has no response to read: its fetches would read the one of
-                // whatever stream ran last on the thread (T156). `HAProxy` names the action
-                // for `set-var`, the expression for the others.
-                if let ("http-request" | "tcp-request content", Some(part)) = (*kw, response_part(leading_fetch(expr))) {
+                // whatever stream ran last on the thread (T156); a response rule has no
+                // request headers left, and a `tcp-response` no request at all. `HAProxy`
+                // names the action for `set-var`, the expression for the others.
+                let fetch = leading_fetch(expr);
+                let part = match *kw {
+                    "http-request" | "tcp-request content" | "tcp-request session" | "tcp-request connection" => {
+                        response_part(fetch)
+                    }
+                    "http-response" | "http-after-response" => request_part(fetch, false),
+                    "tcp-response content" => request_part(fetch, true),
+                    _ => None,
+                };
+                if let Some(part) = part {
                     let name = if action.starts_with("set-var(") {
                         action.as_str()
                     } else {
                         split_top_level(expr.trim(), char::is_whitespace).into_iter().next().unwrap_or("")
                     };
                     let msg = format!("fetch method '{name}' extracts information from '{part}', none of which is available here");
-                    return Err(if *kw == "http-request" {
+                    return Err(if kw.starts_with("http-") {
                         format!("error detected in {} while parsing '{kw} {action}' rule : {msg}.", self.what)
                     } else {
                         msg
