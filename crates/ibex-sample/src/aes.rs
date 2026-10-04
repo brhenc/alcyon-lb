@@ -1,184 +1,71 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
-//! AES (FIPS 197) with the two modes `aes_cbc_*` and `aes_gcm_*` need: CBC with PKCS#7
-//! padding and GCM (NIST SP 800-38D) with a tag of 16 bytes.
+//! AES in the two modes `aes_cbc_*` and `aes_gcm_*` need: CBC with PKCS#7 padding and GCM
+//! with a tag of 16 bytes, for keys of 128, 192 and 256 bits.
 //!
-//! Written here because the workspace's TLS stack (`ring`) offers neither CBC nor 192-bit
-//! keys nor nonces of other lengths than 12 bytes, and `OpenSSL`, which `HAProxy` uses,
-//! offers all of them. The S-box is looked up by index, so the timing of a block depends
-//! on its data; this is meant for the sample converters, which see what the configuration
-//! gives them, not for protecting keys from a co-located attacker. TLS does not use it.
+//! The block cipher, CBC, the counter mode and GHASH are the `RustCrypto` crates `aes`,
+//! `cbc`, `ctr` and `ghash`: pure Rust, constant time (hardware AES where the CPU has it,
+//! the fixsliced software implementation otherwise). What is written here is the glue GCM
+//! is made of: `J0`, the counter start, the tag. It is not `aes-gcm`'s `AesGcm` because that
+//! one fixes the nonce length in its type (12 bytes, or one instantiation per length), while
+//! `HAProxy` takes any length from 1 byte up; the tests check this glue against `AesGcm` for
+//! the lengths it can be instantiated with, against the GCM specification's vectors for the
+//! others, and against ciphertexts measured on `HAProxy`.
 
-use std::sync::LazyLock;
+use aes::cipher::{block_padding::Pkcs7, BlockDecrypt, BlockDecryptMut, BlockEncrypt, BlockEncryptMut, KeyInit, KeyIvInit, StreamCipher};
+use aes::{Aes128, Aes192, Aes256};
+use ghash::universal_hash::UniversalHash;
+use ghash::GHash;
 
 const BLOCK: usize = 16;
 
-/// The S-box and its inverse, generated as FIPS 197 section 5.1.1 describes: the
-/// multiplicative inverse in GF(2^8) followed by the affine transform.
-fn gen_sboxes() -> ([u8; 256], [u8; 256]) {
-    let mut sbox = [0u8; 256];
-    let mut inv = [0u8; 256];
-    let mut p: u8 = 1;
-    let mut q: u8 = 1;
-    loop {
-        // p *= 3
-        p = p ^ (p << 1) ^ if p & 0x80 != 0 { 0x1b } else { 0 };
-        // q /= 3
-        q ^= q << 1;
-        q ^= q << 2;
-        q ^= q << 4;
-        if q & 0x80 != 0 {
-            q ^= 0x09;
+/// Runs `$body` with `$c` naming the AES variant `$key`'s length selects.
+macro_rules! with_aes {
+    ($key:expr, $c:ident => $body:expr) => {
+        match $key.len() {
+            16 => {
+                type $c = Aes128;
+                $body
+            }
+            24 => {
+                type $c = Aes192;
+                $body
+            }
+            _ => {
+                type $c = Aes256;
+                $body
+            }
         }
-        let x = q ^ q.rotate_left(1) ^ q.rotate_left(2) ^ q.rotate_left(3) ^ q.rotate_left(4);
-        sbox[p as usize] = x ^ 0x63;
-        if p == 1 {
-            break;
-        }
-    }
-    sbox[0] = 0x63;
-    let mut i = 0;
-    while i < 256 {
-        inv[sbox[i] as usize] = i as u8;
-        i += 1;
-    }
-    (sbox, inv)
+    };
 }
 
-static SBOXES: LazyLock<([u8; 256], [u8; 256])> = LazyLock::new(gen_sboxes);
-
-fn xtime(x: u8) -> u8 {
-    (x << 1) ^ if x & 0x80 != 0 { 0x1b } else { 0 }
-}
-
-fn gmul8(mut a: u8, mut b: u8) -> u8 {
-    let mut r = 0;
-    while b != 0 {
-        if b & 1 != 0 {
-            r ^= a;
-        }
-        a = xtime(a);
-        b >>= 1;
-    }
-    r
-}
-
-/// An expanded AES key.
+/// An AES key of 16, 24 or 32 bytes.
 pub struct Aes {
-    round_keys: Vec<[u8; BLOCK]>,
+    key: Vec<u8>,
 }
 
 impl Aes {
-    /// The key schedule for a key of 16, 24 or 32 bytes; `None` for any other length.
+    /// `None` for a key of any other length.
     #[must_use]
     pub fn new(key: &[u8]) -> Option<Aes> {
-        let nk = match key.len() {
-            16 => 4,
-            24 => 6,
-            32 => 8,
-            _ => return None,
-        };
-        let rounds = nk + 6;
-        let mut w: Vec<[u8; 4]> = key.chunks(4).map(|c| [c[0], c[1], c[2], c[3]]).collect();
-        let mut rcon: u8 = 1;
-        for i in nk..4 * (rounds + 1) {
-            let mut t = w[i - 1];
-            if i % nk == 0 {
-                t = [SBOXES.0[t[1] as usize] ^ rcon, SBOXES.0[t[2] as usize], SBOXES.0[t[3] as usize], SBOXES.0[t[0] as usize]];
-                rcon = xtime(rcon);
-            } else if nk > 6 && i % nk == 4 {
-                t = t.map(|b| SBOXES.0[b as usize]);
-            }
-            let p = w[i - nk];
-            w.push([p[0] ^ t[0], p[1] ^ t[1], p[2] ^ t[2], p[3] ^ t[3]]);
-        }
-        let round_keys = w
-            .chunks(4)
-            .map(|c| {
-                let mut k = [0u8; BLOCK];
-                for (i, word) in c.iter().enumerate() {
-                    k[4 * i..4 * i + 4].copy_from_slice(word);
-                }
-                k
-            })
-            .collect();
-        Some(Aes { round_keys })
-    }
-
-    fn add_round_key(&self, s: &mut [u8; BLOCK], round: usize) {
-        for (b, k) in s.iter_mut().zip(&self.round_keys[round]) {
-            *b ^= k;
-        }
+        matches!(key.len(), 16 | 24 | 32).then(|| Aes { key: key.to_vec() })
     }
 
     /// Encrypts one block.
     #[must_use]
     pub fn encrypt_block(&self, block: &[u8; BLOCK]) -> [u8; BLOCK] {
-        let rounds = self.round_keys.len() - 1;
-        let mut s = *block;
-        self.add_round_key(&mut s, 0);
-        for round in 1..=rounds {
-            for b in &mut s {
-                *b = SBOXES.0[*b as usize];
-            }
-            // ShiftRows: row r of the state (bytes r, r+4, r+8, r+12) rotates left by r.
-            let t = s;
-            for c in 0..4 {
-                for r in 0..4 {
-                    s[r + 4 * c] = t[r + 4 * ((c + r) % 4)];
-                }
-            }
-            if round != rounds {
-                for c in 0..4 {
-                    let col = [s[4 * c], s[4 * c + 1], s[4 * c + 2], s[4 * c + 3]];
-                    let all = col[0] ^ col[1] ^ col[2] ^ col[3];
-                    for r in 0..4 {
-                        s[4 * c + r] = col[r] ^ all ^ xtime(col[r] ^ col[(r + 1) % 4]);
-                    }
-                }
-            }
-            self.add_round_key(&mut s, round);
-        }
-        s
+        let mut b = (*block).into();
+        with_aes!(self.key, C => C::new_from_slice(&self.key).expect("key length checked").encrypt_block(&mut b));
+        b.into()
     }
 
     /// Decrypts one block.
     #[must_use]
     pub fn decrypt_block(&self, block: &[u8; BLOCK]) -> [u8; BLOCK] {
-        let rounds = self.round_keys.len() - 1;
-        let mut s = *block;
-        self.add_round_key(&mut s, rounds);
-        for round in (0..rounds).rev() {
-            let t = s;
-            for c in 0..4 {
-                for r in 0..4 {
-                    s[r + 4 * ((c + r) % 4)] = t[r + 4 * c];
-                }
-            }
-            for b in &mut s {
-                *b = SBOXES.1[*b as usize];
-            }
-            self.add_round_key(&mut s, round);
-            if round != 0 {
-                for c in 0..4 {
-                    let col = [s[4 * c], s[4 * c + 1], s[4 * c + 2], s[4 * c + 3]];
-                    for r in 0..4 {
-                        s[4 * c + r] = gmul8(col[r], 14)
-                            ^ gmul8(col[(r + 1) % 4], 11)
-                            ^ gmul8(col[(r + 2) % 4], 13)
-                            ^ gmul8(col[(r + 3) % 4], 9);
-                    }
-                }
-            }
-        }
-        s
-    }
-}
-
-fn xor_block(a: &mut [u8; BLOCK], b: &[u8; BLOCK]) {
-    for (x, y) in a.iter_mut().zip(b) {
-        *x ^= y;
+        let mut b = (*block).into();
+        with_aes!(self.key, C => C::new_from_slice(&self.key).expect("key length checked").decrypt_block(&mut b));
+        b.into()
     }
 }
 
@@ -186,70 +73,22 @@ fn xor_block(a: &mut [u8; BLOCK], b: &[u8; BLOCK]) {
 /// than `data` fills.
 #[must_use]
 pub fn cbc_encrypt(aes: &Aes, iv: &[u8; BLOCK], data: &[u8]) -> Vec<u8> {
-    let pad = BLOCK - data.len() % BLOCK;
-    let mut padded = data.to_vec();
-    padded.resize(data.len() + pad, u8::try_from(pad).unwrap_or(0));
-    let mut prev = *iv;
-    let mut out = Vec::with_capacity(padded.len());
-    for chunk in padded.chunks_exact(BLOCK) {
-        let mut b = [0u8; BLOCK];
-        b.copy_from_slice(chunk);
-        xor_block(&mut b, &prev);
-        prev = aes.encrypt_block(&b);
-        out.extend_from_slice(&prev);
-    }
-    out
+    with_aes!(aes.key, C => cbc::Encryptor::<C>::new_from_slices(&aes.key, iv)
+        .expect("key and iv lengths checked")
+        .encrypt_padded_vec_mut::<Pkcs7>(data))
 }
 
 /// CBC decryption; `None` when `data` is not a whole, non-empty number of blocks or its
 /// padding is not valid PKCS#7.
 #[must_use]
 pub fn cbc_decrypt(aes: &Aes, iv: &[u8; BLOCK], data: &[u8]) -> Option<Vec<u8>> {
-    if data.is_empty() || data.len() % BLOCK != 0 {
+    if data.is_empty() {
         return None;
     }
-    let mut prev = *iv;
-    let mut out = Vec::with_capacity(data.len());
-    for chunk in data.chunks_exact(BLOCK) {
-        let mut c = [0u8; BLOCK];
-        c.copy_from_slice(chunk);
-        let mut b = aes.decrypt_block(&c);
-        xor_block(&mut b, &prev);
-        out.extend_from_slice(&b);
-        prev = c;
-    }
-    let pad = usize::from(*out.last()?);
-    if pad == 0 || pad > BLOCK || out[out.len() - pad..].iter().any(|&b| usize::from(b) != pad) {
-        return None;
-    }
-    out.truncate(out.len() - pad);
-    Some(out)
-}
-
-/// Multiplication in GF(2^128) as GCM defines it (bit 0 is the most significant).
-fn gf128_mul(x: u128, y: u128) -> u128 {
-    const R: u128 = 0xe1 << 120;
-    let mut z = 0u128;
-    let mut v = y;
-    for i in 0..128 {
-        if (x >> (127 - i)) & 1 == 1 {
-            z ^= v;
-        }
-        v = if v & 1 == 1 { (v >> 1) ^ R } else { v >> 1 };
-    }
-    z
-}
-
-fn ghash(h: u128, parts: &[&[u8]]) -> u128 {
-    let mut y = 0u128;
-    for part in parts {
-        for chunk in part.chunks(BLOCK) {
-            let mut b = [0u8; BLOCK];
-            b[..chunk.len()].copy_from_slice(chunk);
-            y = gf128_mul(y ^ u128::from_be_bytes(b), h);
-        }
-    }
-    y
+    with_aes!(aes.key, C => cbc::Decryptor::<C>::new_from_slices(&aes.key, iv)
+        .expect("key and iv lengths checked")
+        .decrypt_padded_vec_mut::<Pkcs7>(data)
+        .ok())
 }
 
 fn length_block(a_bytes: usize, b_bytes: usize) -> [u8; BLOCK] {
@@ -259,38 +98,44 @@ fn length_block(a_bytes: usize, b_bytes: usize) -> [u8; BLOCK] {
     l
 }
 
-/// The counter block `J0` for a nonce of any length.
-fn gcm_j0(h: u128, nonce: &[u8]) -> [u8; BLOCK] {
+/// The pre-counter block `J0` for a nonce of any length (NIST SP 800-38D, 7.1).
+fn gcm_j0(h: &[u8; BLOCK], nonce: &[u8]) -> [u8; BLOCK] {
     if nonce.len() == 12 {
         let mut j = [0u8; BLOCK];
         j[..12].copy_from_slice(nonce);
         j[15] = 1;
         j
     } else {
-        ghash(h, &[nonce, &length_block(0, nonce.len())]).to_be_bytes()
+        let mut g = GHash::new(&(*h).into());
+        g.update_padded(nonce);
+        g.update_padded(&length_block(0, nonce.len()));
+        g.finalize().into()
     }
 }
 
-fn gcm_ctr(aes: &Aes, j0: &[u8; BLOCK], data: &[u8]) -> Vec<u8> {
-    let mut counter = *j0;
-    let mut out = Vec::with_capacity(data.len());
-    for chunk in data.chunks(BLOCK) {
-        // inc32 on the last four bytes
-        let n = u32::from_be_bytes([counter[12], counter[13], counter[14], counter[15]]).wrapping_add(1);
-        counter[12..].copy_from_slice(&n.to_be_bytes());
-        let ks = aes.encrypt_block(&counter);
-        out.extend(chunk.iter().zip(ks).map(|(d, k)| d ^ k));
-    }
-    out
-}
-
-fn gcm_tag(aes: &Aes, h: u128, j0: &[u8; BLOCK], aad: &[u8], cipher: &[u8]) -> [u8; BLOCK] {
-    let s = ghash(h, &[aad, cipher, &length_block(aad.len(), cipher.len())]);
-    let mut tag = aes.encrypt_block(j0);
-    for (t, s) in tag.iter_mut().zip(s.to_be_bytes()) {
+/// Everything GCM does to `data`: the counter-mode transformation (`apply`) and the tag over
+/// `aad` and the cipher text; `encrypt` says which side of `apply` the cipher text is on.
+fn gcm(aes: &Aes, nonce: &[u8], aad: &[u8], data: &[u8], encrypt: bool) -> (Vec<u8>, [u8; BLOCK]) {
+    let h = aes.encrypt_block(&[0u8; BLOCK]);
+    let j0 = gcm_j0(&h, nonce);
+    // The counter starts one past J0, over its last 32 bits.
+    let mut start = j0;
+    let n = u32::from_be_bytes([j0[12], j0[13], j0[14], j0[15]]).wrapping_add(1);
+    start[12..].copy_from_slice(&n.to_be_bytes());
+    let mut out = data.to_vec();
+    with_aes!(aes.key, C => ctr::Ctr32BE::<C>::new_from_slices(&aes.key, &start)
+        .expect("key and counter lengths checked")
+        .apply_keystream(&mut out));
+    let cipher = if encrypt { &out[..] } else { data };
+    let mut g = GHash::new(&h.into());
+    g.update_padded(aad);
+    g.update_padded(cipher);
+    g.update_padded(&length_block(aad.len(), cipher.len()));
+    let mut tag = aes.encrypt_block(&j0);
+    for (t, s) in tag.iter_mut().zip(g.finalize()) {
         *t ^= s;
     }
-    tag
+    (out, tag)
 }
 
 /// GCM encryption with a nonce of any non-zero length: the cipher text and the 16-byte tag.
@@ -299,11 +144,7 @@ pub fn gcm_encrypt(aes: &Aes, nonce: &[u8], aad: &[u8], data: &[u8]) -> Option<(
     if nonce.is_empty() {
         return None;
     }
-    let h = u128::from_be_bytes(aes.encrypt_block(&[0u8; BLOCK]));
-    let j0 = gcm_j0(h, nonce);
-    let cipher = gcm_ctr(aes, &j0, data);
-    let tag = gcm_tag(aes, h, &j0, aad, &cipher);
-    Some((cipher, tag))
+    Some(gcm(aes, nonce, aad, data, true))
 }
 
 /// GCM decryption; `None` when the tag does not authenticate the cipher text and aad.
@@ -312,14 +153,12 @@ pub fn gcm_decrypt(aes: &Aes, nonce: &[u8], aad: &[u8], data: &[u8], tag: &[u8])
     if nonce.is_empty() || tag.len() != BLOCK {
         return None;
     }
-    let h = u128::from_be_bytes(aes.encrypt_block(&[0u8; BLOCK]));
-    let j0 = gcm_j0(h, nonce);
-    let want = gcm_tag(aes, h, &j0, aad, data);
+    let (plain, want) = gcm(aes, nonce, aad, data, false);
     // no early exit on the first difference
     if want.iter().zip(tag).fold(0u8, |acc, (a, b)| acc | (a ^ b)) != 0 {
         return None;
     }
-    Some(gcm_ctr(aes, &j0, data))
+    Some(plain)
 }
 
 #[cfg(test)]
@@ -328,6 +167,12 @@ mod tests {
 
     fn unhex(s: &str) -> Vec<u8> {
         (0..s.len() / 2).map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).expect("hex")).collect()
+    }
+
+    fn xor_block(a: &mut [u8; BLOCK], b: &[u8; BLOCK]) {
+        for (x, y) in a.iter_mut().zip(b) {
+            *x ^= y;
+        }
     }
 
     fn block(s: &str) -> [u8; BLOCK] {
@@ -425,25 +270,39 @@ mod tests {
         assert_eq!(t, block("3612d2e79e3b0785561be14aaca2fccb"));
     }
 
-    /// The same cipher texts and tags as `ring`, for 128 and 256-bit keys and a 12-byte nonce.
+    /// The same cipher texts and tags as the `aes-gcm` crate's `AesGcm`, for the three key
+    /// sizes and the nonce lengths it is instantiated with here (12 and 16 bytes).
     #[test]
-    fn gcm_agrees_with_ring() {
-        use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_128_GCM, AES_256_GCM};
-        for (alg, key) in [(&AES_128_GCM, vec![0x42u8; 16]), (&AES_256_GCM, (0..32).collect::<Vec<u8>>())] {
-            let ring_key = LessSafeKey::new(UnboundKey::new(alg, &key).expect("ring key"));
-            let aes = Aes::new(&key).expect("key");
-            for len in [0usize, 1, 15, 16, 17, 33, 100] {
-                let data: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
-                let aad = b"associated";
-                let nonce = [9u8; 12];
-                let mut buf = data.clone();
-                ring_key
-                    .seal_in_place_append_tag(Nonce::assume_unique_for_key(nonce), Aad::from(aad), &mut buf)
-                    .expect("seal");
-                let (c, t) = gcm_encrypt(&aes, &nonce, aad, &data).expect("enc");
-                assert_eq!(&buf[..len], &c[..], "cipher, len {len}");
-                assert_eq!(&buf[len..], &t[..], "tag, len {len}");
-            }
+    fn gcm_agrees_with_aes_gcm() {
+        use aes_gcm::aead::consts::{U12, U16};
+        use aes_gcm::aead::generic_array::GenericArray;
+        use aes_gcm::aead::{Aead, Payload};
+        use aes_gcm::AesGcm;
+
+        macro_rules! check {
+            ($aes:ty, $n:ty, $key:expr, $nonce:expr) => {{
+                let key: Vec<u8> = $key;
+                let reference = AesGcm::<$aes, $n>::new(GenericArray::from_slice(&key));
+                let ours = Aes::new(&key).expect("key");
+                for len in [0usize, 1, 15, 16, 17, 33, 100] {
+                    let data: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
+                    let aad = b"associated";
+                    let nonce: &[u8] = $nonce;
+                    let want = reference
+                        .encrypt(GenericArray::from_slice(nonce), Payload { msg: &data, aad })
+                        .expect("reference seal");
+                    let (c, t) = gcm_encrypt(&ours, nonce, aad, &data).expect("enc");
+                    assert_eq!(&want[..len], &c[..], "cipher, len {len}");
+                    assert_eq!(&want[len..], &t[..], "tag, len {len}");
+                    assert_eq!(gcm_decrypt(&ours, nonce, aad, &c, &t), Some(data));
+                }
+            }};
         }
+        check!(aes::Aes128, U12, vec![0x42; 16], &[9u8; 12]);
+        check!(aes::Aes192, U12, (0..24).collect(), &[9u8; 12]);
+        check!(aes::Aes256, U12, (0..32).collect(), &[9u8; 12]);
+        check!(aes::Aes128, U16, vec![0x42; 16], &[7u8; 16]);
+        check!(aes::Aes192, U16, (0..24).collect(), &[7u8; 16]);
+        check!(aes::Aes256, U16, (0..32).collect(), &[7u8; 16]);
     }
 }
