@@ -291,6 +291,8 @@ pub struct TcpSession {
     pub maxrewrite: usize,
     pub h2_ctx: Option<H2MuxContext>,
     pub h2_active_stream_id: Option<u32>,
+    /// How much of the active HTTP/2 stream's request body has been written to `req`.
+    pub h2_body: H2ReqBody,
     pub h2_flood_config: ibex_proto::H2FloodConfig,
     pub is_first_req: bool,
     /// Keep each request line for the log (`txn->uri`): set when a format of the
@@ -302,6 +304,78 @@ pub struct TcpSession {
     /// request, over TLS, logged as `HTTP/3.0` with the URI `HAProxy` builds from
     /// `:scheme` and `:authority`.
     pub h3: bool,
+}
+
+/// Where the body of an HTTP/2 request has got to on its way into `req`: the next block of
+/// the stream's message, how far into it, whether it goes out chunked (no length was
+/// given), and whether the end has been written.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct H2ReqBody {
+    pub cursor: usize,
+    pub off: usize,
+    pub chunked: bool,
+    pub done: bool,
+}
+
+/// Writes what has come of an HTTP/2 request's body into `req`, as much as there is room
+/// for: each DATA frame as it is, or as a chunk when the request has no length, and the
+/// end as the last chunk. True if anything was written.
+fn pump_h2_body(msg: &ibex_proto::htx::Htx, st: &mut H2ReqBody, req: &mut Buf) -> bool {
+    let blocks = msg.blocks();
+    let mut wrote = false;
+    while !st.done && st.cursor < blocks.len() {
+        match &blocks[st.cursor] {
+            HtxBlock::Data(d) | HtxBlock::RawData(d) => {
+                let rest = &d[st.off.min(d.len())..];
+                if rest.is_empty() {
+                    st.cursor += 1;
+                    st.off = 0;
+                    continue;
+                }
+                // A chunk's size line takes at most 8 bytes, with its two CRLFs.
+                let framing = if st.chunked { 12 } else { 0 };
+                let room = req.writable();
+                if room.len() <= framing {
+                    break;
+                }
+                let n = rest.len().min(room.len() - framing);
+                let at = if st.chunked {
+                    let size = format!("{n:x}\r\n");
+                    room[..size.len()].copy_from_slice(size.as_bytes());
+                    size.len()
+                } else {
+                    0
+                };
+                room[at..at + n].copy_from_slice(&rest[..n]);
+                let mut len = at + n;
+                if st.chunked {
+                    room[len..len + 2].copy_from_slice(b"\r\n");
+                    len += 2;
+                }
+                req.commit(len);
+                wrote = true;
+                st.off += n;
+                if st.off >= d.len() {
+                    st.cursor += 1;
+                    st.off = 0;
+                }
+            }
+            HtxBlock::Eom => {
+                if st.chunked {
+                    let room = req.writable();
+                    if room.len() < 5 {
+                        break;
+                    }
+                    room[..5].copy_from_slice(b"0\r\n\r\n");
+                    req.commit(5);
+                    wrote = true;
+                }
+                st.done = true;
+            }
+            _ => st.cursor += 1,
+        }
+    }
+    wrote
 }
 
 impl TcpSession {
@@ -408,6 +482,7 @@ impl TcpSession {
             stick_stores: Vec::new(),
             h2_ctx: None,
             h2_active_stream_id: None,
+            h2_body: H2ReqBody::default(),
             h2_flood_config: ibex_proto::H2FloodConfig::default(),
             is_first_req: true,
             keep_request_line: false,
@@ -765,7 +840,7 @@ impl TcpSession {
         let txn = self.txn.get_or_insert_with(|| HttpTxn::new(txn::Framing::None, false));
         let data = self.req.readable();
         let n = txn.req.window(data);
-        txn.req.consume(data, n);
+        txn.request_consumed(data, n);
         self.req.consume(n);
         let head_len = find_eoh(raw).map_or(raw.len(), |(h, e)| h + e);
         let head = String::from_utf8_lossy(&raw[..head_len]);
@@ -823,6 +898,7 @@ impl TcpSession {
         self.req_headers = None;
         self.clear_htx();
         self.h2_active_stream_id = None;
+        self.h2_body = H2ReqBody::default();
         self.req_vars.clear();
         if let Some(set) = self.timeouts_set.take() {
             self.timeouts = set.before;
@@ -841,7 +917,7 @@ impl TcpSession {
         if let Some(t) = self.txn.as_mut().filter(|t| t.local && !t.req.is_done() && !t.close_after) {
             let data = self.req.readable();
             let n = t.req.window(data);
-            t.req.consume(data, n);
+            t.request_consumed(data, n);
             self.req.consume(n);
         }
     }
@@ -1140,12 +1216,23 @@ impl TcpSession {
                         self.h2_active_stream_id = Some(stream_id);
                         if let Some(stream) = h2.streams.get_mut(&stream_id) {
                             stream.dispatched = true;
-                            let wire_req = stream.rx_htx.to_h1_wire();
+                            // The head goes to the server as HTTP/1.1, and the body follows
+                            // as the DATA frames come (`pump_h2_body`): with the length the
+                            // client gave, else chunked, as `HAProxy` writes it.
+                            let has_data = stream.rx_htx.blocks().iter().any(|b| matches!(b, HtxBlock::Data(_) | HtxBlock::RawData(_)));
+                            let chunked = stream.rx_htx.get_header("content-length").is_none() && (has_data || !stream.rx_htx.is_eom());
+                            if chunked {
+                                stream.rx_htx.set_header("transfer-encoding", "chunked");
+                            }
+                            let first_body = stream.rx_htx.blocks().iter().position(|b| matches!(b, HtxBlock::Eoh)).map_or(stream.rx_htx.blocks().len(), |i| i + 1);
+                            self.h2_body = H2ReqBody { cursor: first_body, off: 0, chunked, done: false };
+                            let full_req = stream.rx_htx.to_h1_wire();
+                            let wire_req = find_eoh(&full_req).map_or(&full_req[..], |(h, e)| &full_req[..h + e]);
                             if let Ok(parser) = ibex_proto::parser::build(ibex_proto::parser::ParserKind::H1) {
                                 let mut p_stream = parser.stream(false);
                                 let raw = self.htx_buf.raw_slice_mut();
                                 let mut slice = ibex_proto::htx::HtxSlice::new(raw);
-                                if p_stream.parse(&wire_req, &mut slice).is_ok() {
+                                if p_stream.parse(wire_req, &mut slice).is_ok() {
                                     self.htx_tail = slice.tail_addr();
                                     self.htx_blocks = slice.num_blocks();
                                     self.has_htx = true;
@@ -1162,12 +1249,18 @@ impl TcpSession {
                             let n = wire_req.len().min(w.len());
                             w[..n].copy_from_slice(&wire_req[..n]);
                             self.req.commit(n);
-                            let framing = find_eoh(&wire_req)
+                            let framing = find_eoh(wire_req)
                                 .map_or(txn::Framing::None, |(h, e)| txn::request_framing(&wire_req[..h + e]));
                             self.txn = Some(HttpTxn::new(framing, false));
                             self.cli_state = ScState::Established;
                             changed = true;
                         }
+                    }
+                }
+                // The DATA frames of the request being served that have come since.
+                if let Some(stream) = self.h2_active_stream_id.and_then(|id| h2.streams.get(&id)) {
+                    if pump_h2_body(&stream.rx_htx, &mut self.h2_body, &mut self.req) {
+                        changed = true;
                     }
                 }
 
@@ -1220,6 +1313,10 @@ impl TcpSession {
                     self.fail_request(400);
                     return Ok(true);
                 }
+
+                // What `%U` counts of this head: the message as received, whatever the
+                // rules make of it afterwards.
+                let req_htx = txn::htx_head_size(&self.req.readable()[..total_hdr_len], true);
 
                 // Validate the head through the selected parser before anything below
                 // reads it.
@@ -1355,6 +1452,7 @@ impl TcpSession {
                 let framing = find_eoh(self.req.readable())
                     .map_or(txn::Framing::None, |(h, e)| txn::request_framing(&self.req.readable()[..h + e]));
                 let mut txn = HttpTxn::new(framing, close || self.close_client);
+                txn.req_htx = req_htx;
                 // The client's own method: rules that rewrite it have not run yet.
                 txn.client_head = self.req_method.as_deref().is_some_and(|m| m.eq_ignore_ascii_case("HEAD"));
                 self.txn = Some(txn);
@@ -1576,7 +1674,7 @@ impl TcpSession {
                 Io::Done(n) if n > 0 => {
                     if self.mode == Mode::Http {
                         if let Some(t) = self.txn.as_mut() {
-                            t.req.consume(self.req.readable(), n);
+                            t.request_consumed(self.req.readable(), n);
                         }
                     }
                     self.req.consume(n);
@@ -2172,7 +2270,10 @@ pub fn combine_condition(
 ) -> AclEvalResult {
     let mut any_missing = false;
     let mut passed = false;
-    for suite in cond.suites() {
+    // An alternative with no term in it (`if` and nothing, `if !`, a trailing `||`) is not
+    // one: `HAProxy` builds no suite for it, so `if` is false and `unless` true when none
+    // is left (measured: `http-request deny if` lets the request through).
+    for suite in cond.suites().filter(|s| !s.is_empty()) {
         let mut suite_res = AclEvalResult::Matched;
         for t in suite {
             match term(t) {

@@ -301,3 +301,26 @@ fn wait_end_holds_a_tcp_response_content_rule_until_the_inspect_delay_is_over() 
     assert_eq!(&got[..n], b"pong");
     assert!(sent.elapsed() >= Duration::from_millis(250), "the client had the answer after {:?}", sent.elapsed());
 }
+
+#[test]
+fn a_tarpit_is_the_last_rule_of_its_request() {
+    // HAProxy: `lr=<file>:<line of the tarpit>` for both forms, `deny_status` or not;
+    // a request no rule matches is unaffected.
+    let cfg = "defaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n  timeout tarpit 200ms\n\
+frontend fe\n  bind {fe}\n  log {log} local0\n  log-format \"p=%HP lr=%[last_rule_file]:%[last_rule_line]\"\n  default_backend be\n\
+backend be\n\
+  http-request tarpit deny_status 429 if { path_beg /tq }\n\
+  http-request tarpit if { path_beg /tp }\n\
+  http-request deny if { path_beg /dn }\n\
+  server s {srv}\n";
+    let (ibex, fe, logs) = start(cfg);
+    let file = ibex.cfg.path().display().to_string();
+    for (path, status, line) in [("/tq", "HTTP/1.1 429", Some(13)), ("/tp", "HTTP/1.1 500", Some(14)), ("/dn", "HTTP/1.1 403", Some(15)), ("/none", "HTTP/1.1 200", None)] {
+        drain(&logs);
+        let mut c = TcpStream::connect(fe).expect("connect");
+        let got = exchange(&mut c, path);
+        assert!(got.starts_with(status), "{path}: {got:?}");
+        let want = line.map_or_else(|| "-:-".to_string(), |l| format!("{file}:{l}"));
+        assert_eq!(lr(&logs, path), want, "{path}");
+    }
+}

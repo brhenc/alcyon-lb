@@ -14,9 +14,9 @@
 //! <BADREQ> ST=400 B=0 U=0 ts=PR Tw=-1 Tc=-1 Tr=-1 s=<NOSRV> b=fe
 //! ```
 //!
-//! `%B` is what the server sent (0 for a response the proxy made), `%U` what the client
-//! sent for a request that parsed (curl's requests were 84 to 86 bytes; here they are
-//! whatever these requests are). The syslog header carries the tag and pid, and no host
+//! `%B` is the size of the HTX message the server sent (0 for a response the proxy made),
+//! `%U` that of the request that parsed, as `HAProxy` counts them (curl's requests were 84
+//! to 86; here they are what these requests make). The syslog header carries the tag and pid, and no host
 //! name: `<134>Oct  3 17:11:54 haproxy[1605231]: ...`.
 
 mod common;
@@ -71,8 +71,12 @@ fn each_transaction_logs_one_line_as_haproxy_does() {
         collector.local_addr().expect("addr")
     );
     let mut engine = Engine::new(&ibex_config::parse_str(&cfg).expect("parse"), 64).expect("Engine::new");
-    let reqs = ["/ret", "/deny", "/red", "/ok", "/dead"].map(request);
-    let lens: Vec<usize> = reqs.iter().map(String::len).collect();
+    let paths = ["/ret", "/deny", "/red", "/ok", "/dead"];
+    let reqs = paths.map(request);
+    // `%U` is the HTX message HAProxy parsed (tests/htx_byte_counts.rs): 20 bytes, the three
+    // strings of the request line, `Host` (4 + 9), the end of the headers (1); `Connection:
+    // close` is not kept.
+    let lens: Vec<usize> = paths.iter().map(|p| 20 + 3 + p.len() + 8 + 13 + 1).collect();
     let client = thread::spawn(move || {
         for r in reqs.iter().map(String::as_str).chain(["GARBAGE\r\n\r\n"]) {
             let mut c = TcpStream::connect(fe).expect("connect");
@@ -122,7 +126,7 @@ fn each_transaction_logs_one_line_as_haproxy_does() {
             format!("/ret ST=200 B=0 U={} ts=LR Tw=-1 Tc=-1 Tr=-1 s=<NOSRV> b=fe", lens[0]),
             format!("/deny ST=403 B=0 U={} ts=PR Tw=-1 Tc=-1 Tr=-1 s=<NOSRV> b=fe", lens[1]),
             format!("/red ST=302 B=0 U={} ts=LR Tw=-1 Tc=-1 Tr=-1 s=<NOSRV> b=fe", lens[2]),
-            format!("/ok ST=201 B={} U={} ts=-- Tw=0 Tc=n Tr=n s=s1 b=be", RESPONSE.len(), lens[3]),
+            format!("/ok ST=201 B=77 U={} ts=-- Tw=0 Tc=n Tr=n s=s1 b=be", lens[3]),
             format!("/dead ST=503 B=0 U={} ts=SC Tw=0 Tc=-1 Tr=-1 s=s2 b=dead", lens[4]),
             "<BADREQ> ST=400 B=0 U=0 ts=PR Tw=-1 Tc=-1 Tr=-1 s=<NOSRV> b=fe".to_string(),
         ]

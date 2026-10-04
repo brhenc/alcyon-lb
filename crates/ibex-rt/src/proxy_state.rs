@@ -737,6 +737,15 @@ pub fn check_sample_refs(config: &Config, registry: &Registry) -> Result<(), Str
         }
         let at = Where { section: r.section, proxy: r.proxy.as_deref() };
         check_expr(config, registry, at, &r.expr, r.acl).map_err(in_line)?;
+        // An anonymous ACL is compiled when the configuration loads, as a named one is: a
+        // pattern that does not compile is refused (`HAProxy`: "error detected while
+        // parsing an 'http-request deny' condition : ..."), not left to never match.
+        if let Some(full) = &r.full {
+            ibex_sample::Expr::parse(full).map_err(|e| {
+                let rule = if r.action.is_empty() { r.directive.clone() } else { format!("{} {}", r.directive, r.action) };
+                in_line(format!("error detected while parsing an '{rule}' condition : {e}."))
+            })?;
+        }
     }
     Ok(())
 }

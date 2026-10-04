@@ -220,16 +220,17 @@ fn check_acl(keyword: &str) -> (Option<i32>, String) {
 
 /// A keyword Ibex has no fetch behind used to load and never match. `HAProxy` refuses a
 /// keyword it does not know ("unknown fetch method 'nosuch' in ACL expression 'nosuch'",
-/// measured, exit 1); Ibex refuses the ones it does not implement the same way, here
-/// `url_ip` and `url_port`, which `HAProxy` accepts.
+/// measured, exit 1); Ibex refuses the ones it does not implement the same way. (`url_ip`
+/// and `url_port`, which `HAProxy` accepts and this test used for the case, are fetches
+/// now: `tests/url_ip_port.rs`.)
 #[test]
 fn an_acl_keyword_without_a_fetch_is_refused() {
-    for kw in ["nosuch", "nosuch_beg /a", "url_ip 1.2.3.4", "url_port 80"] {
+    for kw in ["nosuch", "nosuch_beg /a"] {
         let (code, text) = check_acl(kw);
         assert_eq!(code, Some(1), "{kw}: {text}");
         assert!(text.contains("unknown fetch method"), "{kw}: {text}");
     }
-    for kw in ["url_beg /a", "hdr_val(x-n) gt 5", "shdr_len(x-r) 3"] {
+    for kw in ["url_beg /a", "hdr_val(x-n) gt 5", "shdr_len(x-r) 3", "url_ip 1.2.3.4", "url_port 80"] {
         let (code, text) = check_acl(kw);
         assert_eq!(code, Some(0), "{kw}: {text}");
     }

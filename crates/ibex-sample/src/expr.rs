@@ -185,6 +185,13 @@ impl Expr {
         let has_patterns = !file_patterns.is_empty() || !inline.is_empty();
 
         if has_patterns && match_method == "found" && !forced {
+            // A binary sample has no default method: the payload fetches are ACL keywords
+            // only as `payload` and `payload_lv`.
+            if converters.is_empty() && matches!(fetch_name.as_str(), "req.payload" | "req.payload_lv" | "res.payload" | "res.payload_lv") {
+                return Err(format!(
+                    "matching method must be specified first (using '-m') when using a sample fetch of this type ('{fetch_name}')"
+                ));
+            }
             match_method = default_match_method(&fetch_name, converters.is_empty());
         }
 
