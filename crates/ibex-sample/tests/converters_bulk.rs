@@ -1098,10 +1098,7 @@ fn test_conv_reverse_dom() {
         Some(Sample::Str("localhost".into()))
     );
     // 3. Empty input
-    assert_eq!(
-        eval_conv("reverse_dom", Sample::Str(String::new()), &[]),
-        Some(Sample::Str(String::new()))
-    );
+    assert_eq!(eval_conv("reverse_dom", Sample::Str(String::new()), &[]), None);
     // 4. Two labels
     assert_eq!(
         eval_conv("reverse_dom", Sample::Str("example.com".into()), &[]),

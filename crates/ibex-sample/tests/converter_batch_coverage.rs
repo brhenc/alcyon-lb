@@ -26,7 +26,7 @@ fn reverse_dom_edge_cases() {
     let ctx = SampleContext::default();
 
     let res = reg.eval("str", &[".".to_string()], &[("reverse_dom", vec![])], &ctx);
-    assert_eq!(res, Some(Sample::Str("".to_string())));
+    assert_eq!(res, None); // HAProxy 3.5-dev8: "." has no reverse
 
     let res2 = reg.eval("str", &[".foo".to_string()], &[("reverse_dom", vec![])], &ctx);
     assert_eq!(res2, None);

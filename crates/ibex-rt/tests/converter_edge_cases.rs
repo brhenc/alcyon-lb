@@ -143,6 +143,44 @@ fn param_finds_a_name_anywhere_in_the_query_with_a_char_or_hex_separator() {
     );
 }
 
+/// `reg-tests/converter/reverse_dom.vtc`, expectations as `HAProxy` meets them.
+#[test]
+fn reverse_dom_route_is_unset_when_the_host_has_no_reverse() {
+    let map = std::env::temp_dir().join(format!("ibex-reverse-dom-{}.map", std::process::id()));
+    std::fs::write(&map, "com.example. example\ncom.example.mail. mail\n").expect("map");
+    let rules = format!(
+        "  http-request set-var(txn.rev_const) str(MaIl.EXAMPLE.com),reverse_dom\n\
+  http-request set-var(txn.rev_host) req.hdr(Host),host_only,reverse_dom if {{ req.hdr(Host) -m found }}\n\
+  http-request set-var(txn.rev_host_dot) var(txn.rev_host),concat(.) if {{ var(txn.rev_host) -m found }}\n\
+  http-request set-var(txn.route) var(txn.rev_host_dot),map_beg({},miss) if {{ var(txn.rev_host_dot) -m found }}\n\
+  http-request set-var(txn.sub_only) str(no)\n\
+  http-request set-var(txn.sub_only) str(yes) if {{ var(txn.rev_host) -m beg com.example. }}\n\
+  http-request return status 200 hdr X-Rev-Const \"%[var(txn.rev_const)]\" hdr X-Rev-Host \"%[var(txn.rev_host)]\" hdr X-Route \"%[var(txn.route)]\" hdr X-Sub-Only \"%[var(txn.sub_only)]\"\n",
+        map.display()
+    );
+    let reqs: Vec<String> = ["example.com", "mail.example.com", "example.com.", "localhost", "badexample.com", "foo..bar", ".example.com", "."]
+        .iter()
+        .map(|h| format!("GET / HTTP/1.1\r\nHost: {h}\r\nConnection: close\r\n\r\n"))
+        .collect();
+    let reqs: Vec<&str> = reqs.iter().map(String::as_str).collect();
+    let got = run(&rules, &reqs);
+    let _ = std::fs::remove_file(&map);
+    let cst = "X-Rev-Const: com.EXAMPLE.MaIl";
+    assert_eq!(
+        got,
+        vec![
+            vec![cst, "X-Rev-Host: com.example", "X-Route: example", "X-Sub-Only: no"],
+            vec![cst, "X-Rev-Host: com.example.mail", "X-Route: mail", "X-Sub-Only: yes"],
+            vec![cst, "X-Rev-Host: com.example", "X-Route: example", "X-Sub-Only: no"],
+            vec![cst, "X-Rev-Host: localhost", "X-Route: miss", "X-Sub-Only: no"],
+            vec![cst, "X-Rev-Host: com.badexample", "X-Route: miss", "X-Sub-Only: no"],
+            vec![cst, "X-Sub-Only: no"],
+            vec![cst, "X-Sub-Only: no"],
+            vec![cst, "X-Sub-Only: no"],
+        ]
+    );
+}
+
 #[test]
 fn set_var_with_a_failing_converter_leaves_the_variable_alone() {
     let rules = "  http-request set-var(txn.a) str(one)\n\

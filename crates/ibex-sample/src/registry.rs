@@ -2337,10 +2337,7 @@ impl Registry {
                     if s.ends_with('.') {
                         s.pop();
                     }
-                    if s.is_empty() {
-                        return Some(Sample::Str(String::new()));
-                    }
-                    if s.starts_with('.') || s.contains("..") {
+                    if s.is_empty() || s.starts_with('.') || s.contains("..") {
                         return None;
                     }
                     let parts: Vec<&str> = s.split('.').collect();
