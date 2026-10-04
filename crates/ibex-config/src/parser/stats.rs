@@ -62,9 +62,19 @@ pub(crate) fn parse_stats_directive(
             Ok(())
         }
         "show-node" => {
-            if tokens.len() >= 3 {
-                stats.show_node = Some(tokens[2].text.as_str().into());
+            // No name: the host name, which the stats page looks up (stored as "").
+            let name = tokens.get(2).map_or("", |t| t.text.as_str());
+            if !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+            {
+                return Err(ConfigError::new(
+                    kw.line,
+                    kw.col,
+                    "'stats show-node' invalid node name - should be a stringwith digits(0-9), letters(A-Z, a-z), hyphen(-) or underscode(_).",
+                ));
             }
+            stats.show_node = Some(name.into());
             Ok(())
         }
         _ => {

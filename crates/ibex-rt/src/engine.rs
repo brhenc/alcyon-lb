@@ -6696,6 +6696,7 @@ impl EngineDispatcher<'_> {
         checks: &mut [ServerCheckState],
         pid: u32,
         now: Tick,
+        serving: usize,
     ) -> Option<crate::stats_html::AdminAction> {
         let req_uri = entry.sess.req_uri.as_deref().unwrap_or("/");
 
@@ -6853,7 +6854,7 @@ impl EngineDispatcher<'_> {
                 return Some(cmd);
             }
 
-            let html = crate::stats_html::render_stats_html(proxies, checks, pid);
+            let html = crate::stats_html::render_stats_html_for(proxies, checks, pid, &proxies[serving].stats_config);
             let resp = format!(
                 "HTTP/1.1 200 OK\r\n\
                  Content-Type: text/html; charset=utf-8\r\n\
@@ -6870,7 +6871,7 @@ impl EngineDispatcher<'_> {
         }
 
         // 4. Default: Render full HTML dashboard
-        let html = crate::stats_html::render_stats_html(proxies, checks, pid);
+        let html = crate::stats_html::render_stats_html_for(proxies, checks, pid, &proxies[serving].stats_config);
         let resp = format!(
             "HTTP/1.1 200 OK\r\n\
              Content-Type: text/html; charset=utf-8\r\n\
@@ -6960,7 +6961,7 @@ impl EngineDispatcher<'_> {
                     && proxies[proxy_idx].default_backend.is_none()
                     && proxies[proxy_idx].use_backends.is_empty())
             {
-                return Self::handle_stats_request(entry, proxies, checks, pid, now);
+                return Self::handle_stats_request(entry, proxies, checks, pid, now, proxy_idx);
             }
         }
 
