@@ -141,6 +141,9 @@ pub struct GlobalSection {
     pub extra_stats_sockets: Vec<StatsSocket>,
     /// Maximum rewrite size in bytes.
     pub maxrewrite: Option<usize>,
+    /// `tune.idle-pool.shared off`: each worker takes only the idle server connections it
+    /// released itself (the default, `on` or `full`, lets it take another worker's).
+    pub idle_pool_unshared: bool,
     /// Buffer size in bytes (`tune.bufsize`).
     pub bufsize: Option<usize>,
     /// Small buffer size in bytes (`tune.bufsize.small`).

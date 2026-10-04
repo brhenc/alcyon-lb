@@ -763,9 +763,13 @@ fn main() {
     // Each worker reports once it is listening. `-sf` and READY=1 wait for all of them.
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
     let mut threads = Vec::new();
+    // The idle server connections, one slot per worker, taken across workers unless
+    // `tune.idle-pool.shared off`.
+    let idle_pools = ibex_rt::engine::IdlePools::new(nbthread, &config);
     for worker_id in 0..nbthread {
         let config_clone = config.clone();
         let proxies_clone = shared_proxies.clone();
+        let idle_pools = std::sync::Arc::clone(&idle_pools);
         let cli_socket_clone = cli_socket.clone();
         let extra_sockets = extra_sockets.clone();
         let lifecycle_clone = lifecycle.clone();
@@ -779,6 +783,7 @@ fn main() {
                     process::exit(1);
                 }
             };
+            engine.share_idle_pools(&idle_pools, worker_id);
 
             if worker_id == 0 {
                 if let Some(ref sock_path) = cli_socket_clone {

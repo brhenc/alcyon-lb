@@ -137,9 +137,10 @@ struct SrvIdle {
     purge_delay: Duration,
 }
 
-/// The idle server connections of a worker, per server.
+/// The idle server connections of a worker, per server (`srv->per_thr[tid]`). Shared with
+/// the other workers through [`IdlePools`].
 #[derive(Debug, Default)]
-pub struct IdlePool {
+struct WorkerPool {
     servers: HashMap<(usize, usize), SrvIdle>,
     /// Connections in all lists: a session whose server connection has the pool to itself
     /// (the usual keep-alive case) never looks the server up.
@@ -148,14 +149,9 @@ pub struct IdlePool {
     next_purge: Option<Instant>,
 }
 
-impl IdlePool {
-    /// Whether no worker connection is idle at all.
-    fn is_empty(&self) -> bool {
-        self.conns == 0
-    }
-
-    /// When [`IdlePool::purge`] next has work.
-    pub fn next_purge(&self) -> Option<Instant> {
+impl WorkerPool {
+    /// When [`WorkerPool::purge`] next has work.
+    fn next_purge(&self) -> Option<Instant> {
         self.next_purge
     }
 
@@ -225,7 +221,7 @@ impl IdlePool {
     /// idle connections beyond what the server needs, rounded up, plus one, are closed,
     /// oldest first; the estimate of the need moves halfway to the peak seen since the last
     /// purge (never below it), and the peak restarts from the connections in use (`used`).
-    pub fn purge(&mut self, now: Instant, used: impl Fn((usize, usize)) -> u32) {
+    fn purge(&mut self, now: Instant, used: impl Fn((usize, usize)) -> u32) {
         if self.next_purge.is_none_or(|t| t > now) {
             return;
         }
@@ -260,6 +256,225 @@ impl IdlePool {
     }
 }
 
+/// One worker's idle connections as the other workers see them (`idle_conns[tid]`): the
+/// lists behind their lock and how many they hold (`srv->curr_idle_thr[tid]`, summed over
+/// servers), read without it.
+#[derive(Debug, Default)]
+#[repr(align(64))]
+struct IdleSlot {
+    pool: std::sync::Mutex<WorkerPool>,
+    conns: AtomicUsize,
+}
+
+/// The idle server connections of every worker. Each worker keeps its released connections
+/// in its own slot and purges them; one whose own slot holds nothing for a server takes
+/// another worker's (`conn_backend_get`), unless `tune.idle-pool.shared off`. The socket was
+/// taken off its worker's poller when it went idle and joins the taker's.
+#[derive(Debug)]
+pub struct IdlePools {
+    slots: Box<[IdleSlot]>,
+    /// `tune.idle-pool.shared` is not `off` (`GTUNE_IDLE_POOL_SHARED`).
+    shared: bool,
+    /// The slot the next takeover starts from (`srv->per_tgrp[].next_takeover`, here one for
+    /// all servers).
+    next_takeover: AtomicUsize,
+}
+
+impl IdlePools {
+    /// The pools of `workers` workers, `tune.idle-pool.shared` read from `config`.
+    #[must_use]
+    pub fn new(workers: usize, config: &Config) -> Arc<Self> {
+        let unshared = config.global.as_ref().is_some_and(|g| g.idle_pool_unshared);
+        Self::with(workers, !unshared)
+    }
+
+    fn with(workers: usize, shared: bool) -> Arc<Self> {
+        Arc::new(Self {
+            slots: (0..workers.max(1)).map(|_| IdleSlot::default()).collect(),
+            shared,
+            next_takeover: AtomicUsize::new(0),
+        })
+    }
+
+    /// Worker `wid`'s handle.
+    #[must_use]
+    pub fn worker(self: &Arc<Self>, wid: usize) -> IdlePool {
+        IdlePool { pools: Arc::clone(self), wid: wid % self.slots.len(), next_purge: None }
+    }
+
+    fn lock(slot: &IdleSlot) -> std::sync::MutexGuard<'_, WorkerPool> {
+        slot.pool.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// A worker's handle on [`IdlePools`]: what the engine keeps, takes and purges through.
+#[derive(Debug)]
+pub struct IdlePool {
+    pools: Arc<IdlePools>,
+    wid: usize,
+    /// When this worker's purge next has work: kept here so that a step with nothing to purge
+    /// does not take the lock.
+    next_purge: Option<Instant>,
+}
+
+impl Default for IdlePool {
+    /// A worker alone.
+    fn default() -> Self {
+        IdlePools::with(1, true).worker(0)
+    }
+}
+
+impl IdlePool {
+    fn slot(&self) -> &IdleSlot {
+        &self.pools.slots[self.wid]
+    }
+
+    /// Whether this worker holds no idle connection.
+    fn is_empty(&self) -> bool {
+        self.slot().conns.load(Ordering::Relaxed) == 0
+    }
+
+    /// Whether a request of this worker may find an idle connection: its own, or with
+    /// sharing on another worker's.
+    fn may_find(&self) -> bool {
+        !self.is_empty() || (self.pools.shared && self.pools.slots.iter().any(|s| s.conns.load(Ordering::Relaxed) != 0))
+    }
+
+    /// When [`IdlePool::purge`] next has work.
+    #[must_use]
+    pub fn next_purge(&self) -> Option<Instant> {
+        self.next_purge
+    }
+
+    /// See [`WorkerPool::keep`]; into this worker's slot.
+    fn keep(&mut self, key: IdleKey, conn: IdleConn, is_safe: bool, cfg: SrvPoolCfg, used: u32, now: Instant) -> Result<(), IdleConn> {
+        let slot = &self.pools.slots[self.wid];
+        let mut pool = IdlePools::lock(slot);
+        let r = pool.keep(key, conn, is_safe, cfg, used, now);
+        slot.conns.store(pool.conns, Ordering::Relaxed);
+        self.next_purge = pool.next_purge();
+        r
+    }
+
+    /// `conn_backend_get`: this worker's lists first; when they hold nothing that matches,
+    /// with sharing on and unless the server keeps fewer idle connections than its
+    /// `pool-low-conn` (`steal` false), every other worker's whose lock is free, from the
+    /// one after the last taken from (`HA_SPIN_TRYLOCK`: a busy one is skipped).
+    fn take(&mut self, key: &IdleKey, first_req: bool, mode: ibex_config::HttpReuse, steal: bool) -> Option<(IdleConn, bool)> {
+        let pools = &*self.pools;
+        let own = &pools.slots[self.wid];
+        if own.conns.load(Ordering::Relaxed) != 0 {
+            let mut pool = IdlePools::lock(own);
+            let found = pool.take(key, first_req, mode);
+            own.conns.store(pool.conns, Ordering::Relaxed);
+            self.next_purge = pool.next_purge();
+            if found.is_some() {
+                return found;
+            }
+        }
+        let n = pools.slots.len();
+        if !pools.shared || !steal || n == 1 {
+            return None;
+        }
+        let start = pools.next_takeover.load(Ordering::Relaxed) % n;
+        for i in (start..n).chain(0..start) {
+            let slot = &pools.slots[i];
+            if i == self.wid || slot.conns.load(Ordering::Relaxed) == 0 {
+                continue;
+            }
+            // A busy slot is skipped, and so is a poisoned one: its worker panicked.
+            let Ok(mut pool) = slot.pool.try_lock() else { continue };
+            let found = pool.take(key, first_req, mode);
+            slot.conns.store(pool.conns, Ordering::Relaxed);
+            drop(pool);
+            if found.is_some() {
+                pools.next_takeover.store(i + 1, Ordering::Relaxed);
+                return found;
+            }
+        }
+        None
+    }
+
+    /// Idle connections in every worker's slot: what `pool-low-conn` is compared with
+    /// before taking another worker's (`srv->curr_idle_conns`, here for all servers).
+    fn total(&self) -> usize {
+        self.pools.slots.iter().map(|s| s.conns.load(Ordering::Relaxed)).sum()
+    }
+
+    /// See [`WorkerPool::purge`]; this worker's slot, when its purge is due.
+    pub fn purge(&mut self, now: Instant, used: impl Fn((usize, usize)) -> u32) {
+        if self.next_purge.is_none_or(|t| t > now) {
+            return;
+        }
+        let slot = &self.pools.slots[self.wid];
+        let mut pool = IdlePools::lock(slot);
+        pool.purge(now, used);
+        slot.conns.store(pool.conns, Ordering::Relaxed);
+        self.next_purge = pool.next_purge();
+    }
+}
+
+#[cfg(test)]
+mod shared_pool_tests {
+    use super::*;
+
+    fn alive() -> (IdleConn, std::os::unix::net::UnixStream) {
+        let (a, b) = std::os::unix::net::UnixStream::pair().expect("pair");
+        (IdleConn { fd: OwnedFd::from(a), xprt: crate::xprt::ServerXprt::Plain }, b)
+    }
+
+    fn key() -> IdleKey {
+        IdleKey { srv: (0, 0), addr: "127.0.0.1:1".parse().unwrap(), name: None }
+    }
+
+    const CFG: SrvPoolCfg = SrvPoolCfg { max_conn: -1, low_conn: 0, purge_delay_ms: 500 };
+
+    /// A connection worker 0 released is taken by worker 1 when shared, not when not, nor
+    /// when the lock is held, nor when `pool-low-conn` forbids it.
+    #[test]
+    fn another_worker_takes_an_idle_connection_only_when_shared() {
+        use ibex_config::HttpReuse::Always;
+        let t0 = Instant::now();
+        for shared in [true, false] {
+            let pools = IdlePools::with(2, shared);
+            let (mut w0, mut w1) = (pools.worker(0), pools.worker(1));
+            let (c, _peer) = alive();
+            assert!(w0.keep(key(), c, false, CFG, 1, t0).is_ok());
+            assert!(!w1.is_empty() || w1.may_find() == shared);
+            assert_eq!(w1.total(), 1);
+            assert!(w1.take(&key(), true, Always, false).is_none());
+            {
+                let _held = IdlePools::lock(&pools.slots[0]);
+                assert!(w1.take(&key(), true, Always, true).is_none());
+            }
+            assert_eq!(w1.take(&key(), true, Always, true).is_some(), shared);
+            assert_eq!(w0.is_empty(), shared);
+            // The worker the connection was taken from purges nothing and is unscheduled;
+            // one that still holds it purges again later.
+            w0.purge(t0 + Duration::from_secs(1), |_| 0);
+            assert_eq!(w0.next_purge().is_none(), shared);
+        }
+    }
+
+    /// Another worker's connection to another server is not taken; the search goes on to
+    /// the next worker.
+    #[test]
+    fn a_takeover_matches_the_server() {
+        use ibex_config::HttpReuse::Always;
+        let t0 = Instant::now();
+        let pools = IdlePools::with(3, true);
+        let (mut w0, mut w1, mut w2) = (pools.worker(0), pools.worker(1), pools.worker(2));
+        let other = IdleKey { srv: (0, 1), ..key() };
+        let (c0, _p0) = alive();
+        let (c1, _p1) = alive();
+        assert!(w0.keep(other, c0, false, CFG, 1, t0).is_ok());
+        assert!(w1.keep(key(), c1, false, CFG, 1, t0).is_ok());
+        assert!(w2.take(&key(), true, Always, true).is_some());
+        assert!(w1.is_empty() && !w0.is_empty());
+        assert!(w2.take(&key(), true, Always, true).is_none());
+    }
+}
+
 #[cfg(test)]
 mod pool_tests {
     use super::*;
@@ -280,7 +495,7 @@ mod pool_tests {
     #[test]
     fn each_purge_closes_half_the_excess_plus_one() {
         let t0 = Instant::now();
-        let mut pool = IdlePool::default();
+        let mut pool = WorkerPool::default();
         for used in (1..=8).rev() {
             assert!(pool.keep(key(), conn(), false, CFG, used, t0).is_ok());
         }
@@ -301,7 +516,7 @@ mod pool_tests {
     #[test]
     fn purge_delay_zero_and_low_conn() {
         let t0 = Instant::now();
-        let mut pool = IdlePool::default();
+        let mut pool = WorkerPool::default();
         assert!(pool.keep(key(), conn(), false, SrvPoolCfg { purge_delay_ms: 0, ..CFG }, 1, t0).is_err());
         let low = SrvPoolCfg { low_conn: 1, ..CFG };
         assert!(pool.keep(key(), conn(), false, low, 1, t0).is_ok());
@@ -315,7 +530,7 @@ mod pool_tests {
     #[test]
     fn a_purge_with_nothing_idle_unschedules_the_server() {
         let t0 = Instant::now();
-        let mut pool = IdlePool::default();
+        let mut pool = WorkerPool::default();
         // A socket pair: the idle connection must look alive to be taken.
         let (a, _b) = std::os::unix::net::UnixStream::pair().expect("pair");
         let c = IdleConn { fd: OwnedFd::from(a), xprt: crate::xprt::ServerXprt::Plain };
@@ -2732,6 +2947,13 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
     /// Sets the level new CLI connections start at (`stats socket ... level`).
     pub fn set_cli_level(&mut self, level: crate::applet::CliLevel) {
         self.cli_level = level;
+    }
+
+    /// Makes this engine worker `wid` of `pools`, the idle server connections all workers
+    /// share (`tune.idle-pool.shared`). Called before the engine runs: a worker alone keeps
+    /// a pool of its own.
+    pub fn share_idle_pools(&mut self, pools: &Arc<IdlePools>, wid: usize) {
+        self.idle_backend_pool = pools.worker(wid);
     }
 
     /// Computes the current monotonic tick.
@@ -8028,10 +8250,14 @@ impl EngineDispatcher<'_> {
 
         let mut reused = None;
         entry.srv_served = 0;
-        if proxies[be_idx].http_reuse != ibex_config::HttpReuse::Never && !idle_pool.is_empty() {
+        if proxies[be_idx].http_reuse != ibex_config::HttpReuse::Never && idle_pool.may_find() {
             let sni = server_sni(&entry.sess, proxies, entry.proxy_idx, be_idx, s_idx);
             let key = idle_key(target_addr, be_idx, s_idx, sni);
-            if let Some((conn, safe)) = key.and_then(|k| idle_pool.take(&k, entry.sess.is_first_req, proxies[be_idx].http_reuse)) {
+            // `conn_backend_get` takes none of another thread's while the server keeps fewer
+            // idle connections than its `pool-low-conn` (and few fds are in use).
+            let low = s_idx.map_or(0, |i| proxies[be_idx].ids.server_pool(i).low_conn);
+            let steal = low == 0 || idle_pool.total() >= usize::try_from(low).unwrap_or(usize::MAX);
+            if let Some((conn, safe)) = key.and_then(|k| idle_pool.take(&k, entry.sess.is_first_req, proxies[be_idx].http_reuse, steal)) {
                 entry.srv_served = if safe { 2 } else { 1 };
                 reused = Some(conn);
             }

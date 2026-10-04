@@ -106,6 +106,23 @@ pub(crate) fn parse_global_directive(
             }
             Ok(())
         }
+        // `cfg_parse_idle_pool_shared` (src/server.c): Ibex has one thread group, so `full`
+        // (every thread) and `on` (the threads of the group) are the same.
+        "tune.idle-pool.shared" => {
+            let arg = tokens.get(1).map_or("", |t| t.text.as_str());
+            global.idle_pool_unshared = match arg {
+                "full" | "on" => false,
+                "off" => true,
+                _ => {
+                    return Err(ConfigError::new(
+                        kw.line,
+                        kw.col,
+                        format!("'tune.idle-pool.shared' expects 'full', 'on' or 'off' but got '{arg}'."),
+                    ));
+                }
+            };
+            Ok(())
+        }
         "tune.maxrewrite" => {
             if tokens.len() < 2 {
                 return Err(ConfigError::new(kw.line, kw.col, "'tune.maxrewrite' expects an integer argument."));
