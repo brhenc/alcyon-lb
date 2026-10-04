@@ -703,7 +703,7 @@ fn main() {
     let capacity = opts.maxconn.unwrap_or(65536) as usize;
     let nbthread = config.global.as_ref().and_then(|g| g.nbthread).unwrap_or(1) as usize;
 
-    let shared_proxies = match Engine::build_shared_state(&config, nbthread) {
+    let shared_proxies = match Engine::build_shared_state(&config) {
         Ok(p) => p,
         Err(err) => {
             eprintln!("Failed to build shared state: {err}");
@@ -766,8 +766,11 @@ fn main() {
     // The idle server connections, one slot per worker, taken across workers unless
     // `tune.idle-pool.shared off`.
     let idle_pools = ibex_rt::engine::IdlePools::new(nbthread, &config);
+    // One configuration for every worker, as the proxies are (T160): a worker reads it
+    // while it starts, and a copy each held it for the life of the process.
+    let config = std::sync::Arc::new(config);
     for worker_id in 0..nbthread {
-        let config_clone = config.clone();
+        let config_clone = std::sync::Arc::clone(&config);
         let proxies_clone = shared_proxies.clone();
         let idle_pools = std::sync::Arc::clone(&idle_pools);
         let cli_socket_clone = cli_socket.clone();

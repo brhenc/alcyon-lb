@@ -605,7 +605,6 @@ fn write_server_row(
     r.set("slim", &slim);
     r.set("stot", ld(&c.stot));
     r.set("dresp", 0);
-    r.set("econ", ld(&c.econ));
     r.set("eresp", ld(&c.eresp));
     r.set("lbtot", ld(&c.lbtot));
     r.set("rate", c.sess_rate.rate());
@@ -613,13 +612,14 @@ fn write_server_row(
     r.set("lastchg", crate::statcnt::TxnCounters::since_secs(c.last_chg.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or_else(|| crate::statcnt::now_ms() / 1000));
     fill_counters(&mut r, c, proxy.mode == ibex_config::Mode::Http, true);
     r.set("uweight", weight);
-    let (wretr, wredis) = proxy
+    let (wretr, wredis, econ) = proxy
         .server_retr
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(&s_idx)
         .copied()
         .unwrap_or_default();
+    r.set("econ", econ);
     r.set("wretr", wretr);
     r.set("wredis", wredis);
     r.set("status", status_str);
@@ -670,12 +670,12 @@ fn write_backend_row(out: &mut String, proxy: &Proxy, _pid: u32, iid: u32) {
     r.set("smax", c.smax.load(Relaxed).max(scur));
     r.set("slim", proxy.maxconn);
     r.set("stot", ld(&c.stot));
-    r.set("dreq", proxy.stats.iter().map(|s| s.denied_req.load(Relaxed)).sum::<u64>());
-    r.set("dresp", proxy.stats.iter().map(|s| s.denied_resp.load(Relaxed)).sum::<u64>());
-    r.set("econ", ld(&c.econ));
+    r.set("dreq", proxy.counters().denied_req.load(Relaxed));
+    r.set("dresp", proxy.counters().denied_resp.load(Relaxed));
+    r.set("econ", proxy.counters().failed_conn.load(Relaxed));
     r.set("eresp", ld(&c.eresp));
-    r.set("wretr", proxy.stats.iter().map(|s| s.retries_count.load(Relaxed)).sum::<u64>());
-    r.set("wredis", proxy.stats.iter().map(|s| s.redispatches.load(Relaxed)).sum::<u64>());
+    r.set("wretr", proxy.counters().retries_count.load(Relaxed));
+    r.set("wredis", proxy.counters().redispatches.load(Relaxed));
     r.set("status", if be_down { "DOWN" } else { "UP" });
     r.set("weight", weight);
     r.set("uweight", weight);
@@ -819,7 +819,6 @@ mod tests {
             retries: 3,
             redisp: false,
             redisp_after: -1,
-            avoid_idx: None,
             maxconn: 1000,
             dispatch: None,
             cookie: None,

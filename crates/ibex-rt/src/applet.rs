@@ -31,7 +31,7 @@ use std::time::Instant;
 
 /// Runtime context passed to CLI applet command handlers.
 pub struct AppletContext<'a> {
-    pub proxies: &'a mut [Proxy],
+    pub proxies: &'a mut crate::engine::Proxies,
     pub checks: &'a mut [ServerCheckState],
     pub sessions: Option<&'a mut SessionArena>,
     pub wake_queue: Option<&'a mut Vec<TaskRef>>,
@@ -1003,7 +1003,7 @@ impl CliApplet {
                     return;
                 };
                 // `server_maxconn` and `Proxy::maxconn` are what admission reads.
-                let _ = crate::engine::set_proxy_maxconn(ctx.proxies, &px_name, sv.as_deref(), val);
+                let _ = crate::engine::set_proxy_maxconn(ctx.proxies.make_mut(), &px_name, sv.as_deref(), val);
                 self.finish_msg("");
             }
             // `global.maxconn`, enforced by `globalconn` (listeners stop accepting at it).
@@ -1036,7 +1036,7 @@ impl CliApplet {
         let mut found_px = false;
         let mut track_changes = Vec::new();
         let mut found_sv = false;
-        for (p_idx, proxy) in ctx.proxies.iter_mut().enumerate() {
+        for (p_idx, proxy) in ctx.proxies.iter().enumerate() {
             if proxy.name == px_name {
                 found_px = true;
                 for (s_idx, sid) in proxy.server_ids.iter().enumerate() {
@@ -1082,7 +1082,7 @@ impl CliApplet {
         let mut found_px = false;
         let mut track_changes = Vec::new();
         let mut found_sv = false;
-        for (p_idx, proxy) in ctx.proxies.iter_mut().enumerate() {
+        for (p_idx, proxy) in ctx.proxies.iter().enumerate() {
             if proxy.name == px_name {
                 found_px = true;
                 for (s_idx, sid) in proxy.server_ids.iter().enumerate() {
@@ -1187,7 +1187,7 @@ impl CliApplet {
         match Self::parse_weight_change(arg, iw) {
             Ok(w) => {
                 // Read by every balancing algorithm (`lb.rs`) and by `show stat`.
-                ctx.proxies[p_idx].set_weight(s_idx, w);
+                ctx.proxies.make_mut()[p_idx].set_weight(s_idx, w);
                 self.finish_msg("");
             }
             Err(msg) => self.finish_msg(msg),
@@ -1300,7 +1300,7 @@ impl CliApplet {
                 }
                 msg.push_str(" by 'stats socket command'");
                 // `proxy.servers` is where every connection to this server takes its address.
-                ctx.proxies[p_idx].servers[s_idx] = new;
+                ctx.proxies.make_mut()[p_idx].servers[s_idx] = new;
                 if let Some(check) = ctx.checks.iter_mut().find(|c| c.proxy_idx == p_idx && c.server_idx == s_idx) {
                     check.addr = new;
                 }

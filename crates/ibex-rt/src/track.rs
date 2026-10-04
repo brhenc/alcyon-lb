@@ -83,7 +83,7 @@ pub fn set_status(proxies: &[Proxy], p: usize, s: usize, st: ServerStatus) {
     if before != after {
         let px = &proxies[p];
         let (was_down, down) = (before == ServerStatus::Down as u8, after == ServerStatus::Down as u8);
-        let pc = px.counters();
+        let pc = px.txn_counters();
         if let Some(c) = pc.srv.get(s) {
             c.state_changed(was_down, down);
         }

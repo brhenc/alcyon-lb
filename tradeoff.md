@@ -289,6 +289,39 @@ comparison is like-for-like. Until then this entry records the trajectory rather
 target: **14.00 MB bare, 29.75 MB with TCP-connect checks, 47.09 MB with HTTP checks**, and
 the next number belongs beside them.
 
+**2026-10-04 (T160): the bytes above were one worker's; every worker held its own.** Each
+worker got a clone of every `Proxy` (and of the parsed `Config`), and every proxy kept one
+set of counters per thread. At 10,000 backends that was ~15 KB per backend per worker. The
+workers now share one `Arc<Vec<Proxy>>` (`engine::Proxies`); nothing on the data path
+takes it mutably (the compiler holds that line: `Proxies` has no `DerefMut`), and the rare
+writer, a CLI or stats-page admin command, copies it for its worker with
+`Proxies::make_mut`, as every worker had before. The redispatch's "avoid this server" moved
+to a thread-local (`lb::with_avoided`); the counters are one set per proxy, as `HAProxy`'s
+are per thread group; the fd table is reserved rather than filled (2 MB per worker at the
+default 65,536 connections). Startup `VmRSS`, release build, `global maxconn 1000`, one
+frontend and N backends of one server each (`/proc/<pid>/status`, 2 s after the bind
+answers):
+
+```
+                       nbthread 1   nbthread 16   delta
+HAProxy 3.5-dev8   10       22.0 MB       23.8 MB    +1.7
+                 1k       30.7 MB       34.2 MB    +3.4
+                10k      109.6 MB      130.6 MB   +20.9
+Ibex before      10       10.2 MB       44.8 MB   +34.6
+                 1k       53.6 MB      367.9 MB  +314.3
+                10k      450.4 MB    2,550.4 MB  +2,100
+Ibex after       10        8.0 MB        9.1 MB    +1.2
+                 1k       33.1 MB       35.4 MB    +2.3
+                10k      263.3 MB      277.6 MB   +14.3
+```
+
+Pinned by `crates/ibex-rt/tests/worker_proxy_memory.rs`: an extra engine costs 153 KB
+whatever the backend count (counting allocator), and the binary at `nbthread 16` stays
+within 20 MB of `nbthread 1` at 10,000 backends. One thread at 10,000 backends is still
+2.4x `HAProxy` (263 MB against 110 MB): that is per-backend heap in the one shared copy
+(a suspect, not measured: the 22 predefined ACLs are compiled into every proxy), and is
+the next number to chase.
+
 
 ### 6.6 Map converters in-memory caching — **resolved**
 
