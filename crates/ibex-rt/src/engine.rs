@@ -1055,7 +1055,8 @@ fn session_log_data<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, pid: u3
         client: s.client_addr,
         frontend_addr: s.server_addr,
         frontend: &fe.name,
-        frontend_ssl: s.cli_xprt.is_tls(),
+        // QUIC is TLS, though the relayed stream the engine reads is not (T130).
+        frontend_ssl: s.cli_xprt.is_tls() || s.h3,
         backend: &be.name,
         backend_http: be.mode == Mode::Http,
         accept_date: l.date,
@@ -1855,19 +1856,13 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 let bind_addr = b.addr;
                 if b.quic {
                     let tls = bind_tls(&frontend.name, &frontend.binds, bind_addr)?.expect("QUIC requires TLS");
-                    
-                    let mut be_addr = None;
-                    if let Some(be_name) = &frontend.default_backend {
-                        if let Some(be) = config.backends.iter().find(|b| b.name == *be_name) {
-                            be_addr = be.servers.first().map(|s| s.addr).or(be.dispatch);
-                        }
-                    }
-                    
+
+                    // Each request is handed to this frontend's stream engine (T130). It
+                    // used to go straight to the first server of the default backend, and
+                    // no rule, `use_backend`, balancing or log line ever saw it.
                     let mut ql = crate::quic_listener::QuicListener::bind(bind_addr, &tls, None)?;
-                    if let Some(addr) = be_addr {
-                        ql.set_backend(addr);
-                    }
-                    
+                    ql.set_frontend(proxy_idx);
+
                     let l_idx = quic_listeners.len();
                     let lfd = ql.raw_fd();
                     fdtab.insert(
@@ -2086,29 +2081,33 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             );
             let _ = self.poller.add(b, raw_fd_to_u64(fd), true, false);
         }
-        let mut to_add: Vec<(usize, RawFd)> = Vec::new();
+        // Backend legs and request relays, with the interest each one has now: write only
+        // while it has bytes to write. Registering them all for writing made a slow leg
+        // wake the loop on every pass until it answered (T108).
         for (idx, ql) in self.quic_listeners.iter().enumerate() {
-            for fd in ql.backend_fds() {
+            for (b, readable, writable) in ql.io_fds() {
+                let fd = b.as_raw_fd();
+                let want = Interest { readable, writable };
                 if matches!(self.fdtab.state(fd), FdState::Closed) {
-                    to_add.push((idx, fd));
+                    self.fdtab.insert(fd, FdState::QuicBackend { listener: usize_to_u32(idx) }, want);
+                    let _ = self.poller.add(b, raw_fd_to_u64(fd), readable, writable);
+                } else if self.fdtab.interest(fd) != want {
+                    self.fdtab.set_interest(fd, want);
+                    let _ = self.poller.modify(b, raw_fd_to_u64(fd), readable, writable);
                 }
             }
         }
-        for (idx, fd) in to_add {
-            let Some(ql) = self.quic_listeners.get(idx) else { continue };
-            let Some(borrowed) = ql
-                .backend_borrowed_fds()
-                .into_iter()
-                .find(|b| b.as_raw_fd() == fd)
-            else {
-                continue;
-            };
-            self.fdtab.insert(
-                fd,
-                FdState::QuicBackend { listener: usize_to_u32(idx) },
-                Interest { readable: true, writable: true },
-            );
-            let _ = self.poller.add(borrowed, raw_fd_to_u64(fd), true, true);
+    }
+
+    /// Adopts the HTTP/3 request streams the QUIC listeners opened since the last pass, each
+    /// as a client connection of its frontend (T130). From here an HTTP/3 request is an
+    /// ordinary stream: rules, backend choice, balancing, server connection and log line.
+    fn adopt_quic_streams(&mut self) {
+        for q_idx in 0..self.quic_listeners.len() {
+            let Some(proxy_idx) = self.quic_listeners[q_idx].frontend() else { continue };
+            for st in self.quic_listeners[q_idx].take_accepted() {
+                self.admit_connection(proxy_idx, None, st.fd, st.peer, st.local);
+            }
         }
     }
 
@@ -2197,6 +2196,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 let _ = ql.pump(inst);
             }
         }
+        self.adopt_quic_streams();
         self.sync_quic_backend_fds();
 
         // 5. Run runnable tasks through Dispatch
@@ -2332,15 +2332,32 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             }) else {
                 break;
             };
+            let local_addr = self.listeners[l_idx].addr();
+            self.admit_connection(proxy_idx, Some(l_idx), cli_fd, peer_addr, local_addr);
+        }
+    }
 
+    /// Admits a client connection to frontend `proxy_idx`: stick and `tcp-request
+    /// connection` rules, counters, then the session. `l_idx` is the TCP listener that
+    /// accepted it; `None` for an HTTP/3 request stream (`adopt_quic_streams`), which has
+    /// no listener slot of its own to count against.
+    fn admit_connection(
+        &mut self,
+        proxy_idx: usize,
+        l_idx: Option<usize>,
+        cli_fd: std::os::fd::OwnedFd,
+        peer_addr: SocketAddr,
+        local_addr: SocketAddr,
+    ) {
+        {
             let mut tracked_sc: [Option<(usize, StickKey)>; 3] = [None, None, None];
 
             let sample_ctx = SampleContext {
                 proxies: Some(&ProxiesView(&self.proxies)),
                 client_addr: Some(peer_addr),
-                server_addr: Some(self.listeners[l_idx].addr()),
+                server_addr: Some(local_addr),
                 fc_src: Some(peer_addr),
-                fc_dst: Some(self.listeners[l_idx].addr()),
+                fc_dst: Some(local_addr),
                 act_conn: self.proxies[proxy_idx].stats[worker_id()].act_conn.load(Ordering::Relaxed),
                 ..Default::default()
             };
@@ -2449,9 +2466,6 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 }
             }
 
-            let listener_addr = self.listeners[l_idx].addr();
-            let local_addr = listener_addr;
-
             let (client_addr, server_addr, fc_src, fc_dst) = match eval_tcp_req_conn_rules(
                 &self.proxies[proxy_idx],
                 &self.proxies,
@@ -2472,7 +2486,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                         }
                     }
                     drop(cli_fd);
-                    continue;
+                    return;
                 }
                 ConnEvalOutcome::SilentDrop => {
                     raw::silent_drop(cli_fd.as_fd(), peer_addr.is_ipv6());
@@ -2485,11 +2499,13 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                         }
                     }
                     drop(cli_fd);
-                    continue;
+                    return;
                 }
             };
 
-            self.listeners[l_idx].nbconn += 1;
+            if let Some(l_idx) = l_idx {
+                self.listeners[l_idx].nbconn += 1;
+            }
             let proxy = &mut self.proxies[proxy_idx];
             proxy.stats[worker_id()].cum_conn.fetch_add(1, Ordering::Relaxed);
             proxy.stats[worker_id()].fe_sess_rate.tick();
@@ -2498,7 +2514,8 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 proxy.stats[worker_id()].max_conn.store(proxy.stats[worker_id()].act_conn.load(Ordering::Relaxed), Ordering::Relaxed);
             }
 
-            if self.listeners[l_idx].is_full() {
+            if let Some(l_idx) = l_idx.filter(|&i| self.listeners[i].is_full()) {
+                let lfd = self.listeners[l_idx].raw_fd();
                 let _ = self.poller.modify(
                     self.listeners[l_idx].borrowed_fd(),
                     raw_fd_to_u64(lfd),
@@ -3495,7 +3512,7 @@ fn arm_res_inspect(proxy: &Proxy, sess: &mut TcpSession) {
 fn register_new_session(
     engine: &mut Engine,
     proxy_idx: usize,
-    listener_idx: usize,
+    listener_idx: Option<usize>,
     cli_fd: std::os::fd::OwnedFd,
     peer_addr: SocketAddr,
     client_addr: SocketAddr,
@@ -3506,12 +3523,11 @@ fn register_new_session(
 ) {
     // Cloned out before `proxies` is borrowed mutably. TLS belongs to the bind that
     // accepted, not to the proxy, so it is read from the listener.
-    let tls = engine
-        .listeners
-        .get(listener_idx)
+    let tls = listener_idx
+        .and_then(|i| engine.listeners.get(i))
         .and_then(|l| l.tls.clone());
     let cli_raw_fd = cli_fd.as_raw_fd();
-    let Some((sess, target_addr, srv_raw_fd)) = init_client_session(
+    let Some((mut sess, target_addr, srv_raw_fd)) = init_client_session(
         &mut engine.proxies,
         proxy_idx,
         cli_fd,
@@ -3530,6 +3546,8 @@ fn register_new_session(
         // TLS setup failed; the fd is dropped with the session and the connection closes.
         return;
     };
+    // Without a listener, the client is an HTTP/3 request stream (`adopt_quic_streams`).
+    sess.h3 = listener_idx.is_none();
 
     let proxy = &mut engine.proxies[proxy_idx];
 
@@ -4451,7 +4469,8 @@ fn cleanup_done(
         }
     }
 
-    if let Some(l) = listeners.iter_mut().find(|l| l.proxy == usize_to_u32(proxy_idx)) {
+    // An HTTP/3 request stream took no listener slot (`admit_connection`).
+    if let Some(l) = listeners.iter_mut().filter(|_| !entry.sess.h3).find(|l| l.proxy == usize_to_u32(proxy_idx)) {
         l.nbconn = l.nbconn.saturating_sub(1);
         let lfd = l.raw_fd();
         if !l.is_full() && fdtab.interest(lfd).is_none() {

@@ -418,9 +418,12 @@ fn an_error_response_is_delivered_and_the_stop_completes() {
     let client = curl(ibex.quic, &["-H", &big], &["/slow"]);
     let out = client.wait_with_output().expect("curl");
     let stdout = String::from_utf8_lossy(&out.stdout);
+    // Since T130 the head is refused by the stream engine, as on H1, where Ibex answers 400
+    // (HAProxy 3.5 answers 431 on H1, and over HTTP/3 does not answer at all: curl times
+    // out). Either error is a delivered response, which is what this test is about.
     assert!(
-        stdout.contains("__STATUS__431 __VER__3"),
-        "an oversized request must be refused with 431 over HTTP/3.\nstdout: {stdout}\nstderr: {}",
+        stdout.contains("__STATUS__431 __VER__3") || stdout.contains("__STATUS__400 __VER__3"),
+        "an oversized request must be refused with an error over HTTP/3.\nstdout: {stdout}\nstderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     ibex.signal(Signal::Usr1);
