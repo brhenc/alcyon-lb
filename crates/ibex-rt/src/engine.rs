@@ -760,8 +760,7 @@ fn socket_file_ident(path: &Path) -> Option<(u64, u64)> {
     std::fs::symlink_metadata(path).ok().map(|m| (m.dev(), m.ino()))
 }
 
-/// `HAProxy`'s predefined ACLs (`default_acl_list`, src/acl.c), by name. `RDP_COOKIE`
-/// (`req.rdp_cookie_cnt`) is missing: Ibex has no such fetch.
+/// `HAProxy`'s predefined ACLs (`default_acl_list`, src/acl.c), by name.
 const PREDEFINED_ACLS:&[(&str, &str)] = &[
     ("TRUE", "always_true"),
     ("WAIT_END", "wait_end"),
@@ -785,6 +784,7 @@ const PREDEFINED_ACLS:&[(&str, &str)] = &[
     ("HTTP_URL_STAR", "url *"),
     ("HTTP_CONTENT", "req.hdr_val(content-length) gt 0"),
     ("REQ_CONTENT", "req.len gt 0"),
+    ("RDP_COOKIE", "req.rdp_cookie_cnt gt 0"),
 ];
 
 /// A proxy's ACLs by name: the predefined ones, then its own (`find_acl_by_name` is
@@ -3177,6 +3177,7 @@ fn eval_tcp_req_content_rules(
         fc_dst: sess.fc_dst,
         proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
         req_body: if has_content { Some(req_bytes) } else { None },
+        raw_req: (sess.mode == Mode::Tcp).then_some(req_bytes),
         // In HTTP mode the request is parsed by the time these rules run, and `path`,
         // `hdr()` and the like read it, as they do in `HAProxy`. Built from the fields: the
         // rules change `sess_vars` while this borrows.
@@ -3437,6 +3438,9 @@ fn res_sample_may_change(expr: &Expr, rep: &[u8]) -> bool {
     if expr.fetch_name == "res.len" {
         return true;
     }
+    if let Some(wait) = ibex_sample::raw_may_change(&expr.fetch_name, &expr.fetch_args, rep) {
+        return wait;
+    }
     if expr.fetch_name != "res.payload" {
         return false;
     }
@@ -3480,6 +3484,7 @@ fn eval_tcp_res_content_rules(proxy: &Proxy, proxies: &[Proxy], registry: &Regis
         fc_dst: sess.fc_dst,
         proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
         res_body: Some(rep_bytes),
+        raw_res: Some(rep_bytes),
         act_conn: proxy.stats[worker_id()].act_conn.load(Ordering::Relaxed),
         unique_id: sess.log.unique_id.as_deref(),
         captures_req_hdr: Some(&sess.log.req_captures),
@@ -3919,7 +3924,7 @@ fn init_client_session(
         sess.tcp_inspect_done = false;
         if let Some(delay) = proxy.tcp_req_inspect_delay {
             let ms = u32::try_from(delay.as_millis()).unwrap_or(u32::MAX);
-            sess.inspect_exp = Some(now.add(ms));
+            sess.inspect_exp = Some(fresh_tick(now).add(ms));
         }
     }
 
@@ -4594,6 +4599,7 @@ impl EngineDispatcher<'_> {
                 None if sess.req.readable().is_empty() => None,
                 None => Some(sess.req.readable()),
             },
+            raw_req: (sess.mode == Mode::Tcp).then(|| sess.req.readable()),
             htx: None,
             htx_slice: sess.htx_slice(),
             req_uri: sess.req_uri.as_deref(),

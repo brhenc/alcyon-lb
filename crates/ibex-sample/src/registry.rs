@@ -99,6 +99,11 @@ pub struct SampleContext<'a> {
     pub req_headers: Option<&'a [(String, String)]>,
     pub req_version: Option<&'a str>,
     pub req_body: Option<&'a [u8]>,
+    /// The raw buffer of a TCP stream, for the fetches that parse it (`req.ssl_*`,
+    /// `req.rdp_cookie`, `payload_lv`): the request's and the response's. `None` for an HTTP
+    /// stream, where `HAProxy` has no raw buffer to read.
+    pub raw_req: Option<&'a [u8]>,
+    pub raw_res: Option<&'a [u8]>,
     pub res_version: Option<&'a str>,
     pub res_headers: Option<&'a [(String, String)]>,
     pub res_status: Option<u16>,
@@ -1260,6 +1265,11 @@ impl Registry {
             func: request_body_len_fetch,
         });
         self.register_fetch(FetchDesc {
+            name: "req_len",
+            out_type: SampleType::Sint,
+            func: request_body_len_fetch,
+        });
+        self.register_fetch(FetchDesc {
             name: "req.body_len",
             out_type: SampleType::Sint,
             func: request_body_len_fetch,
@@ -1301,7 +1311,9 @@ impl Registry {
             func: response_body_len_fetch,
         });
 
-        let request_payload_fetch: FetchFn = |ctx, args| {
+        crate::rawpayload::register(self);
+
+        fn request_payload_fetch(ctx: &SampleContext, args: &[String]) -> Option<Sample> {
             let offset = args.first().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
             let len = args.get(1).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
 
@@ -1331,16 +1343,30 @@ impl Registry {
             }
 
             None
-        };
+        }
         self.register_fetch(FetchDesc {
             name: "req.payload",
             out_type: SampleType::Bin,
             func: request_payload_fetch,
         });
+        let response_payload_fetch_early: FetchFn = |ctx, args| {
+            // `payload` takes the direction of the rule set that runs it.
+            if ctx.raw_res.is_some() && ctx.raw_req.is_none() {
+                let body = ctx.res_body?;
+                let offset = args.first().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+                let len = args.get(1).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+                if offset >= body.len() {
+                    return None;
+                }
+                let end = if len == 0 || offset.saturating_add(len) > body.len() { body.len() } else { offset + len };
+                return Some(Sample::Bin(body[offset..end].to_vec()));
+            }
+            request_payload_fetch(ctx, args)
+        };
         self.register_fetch(FetchDesc {
             name: "payload",
             out_type: SampleType::Bin,
-            func: request_payload_fetch,
+            func: response_payload_fetch_early,
         });
 
         let response_payload_fetch: FetchFn = |ctx, args| {

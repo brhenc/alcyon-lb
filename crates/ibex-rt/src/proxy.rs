@@ -1878,12 +1878,16 @@ pub fn eval_acl_term_extended<S: ::std::hash::BuildHasher>(
             if req_bytes.is_empty() {
                 return AclEvalResult::MissingData;
             }
-        } else if expr.fetch_name.starts_with("req.ssl_") && req_bytes.len() < 5 {
-            return AclEvalResult::MissingData;
         }
     }
 
     let is_match = expr.eval(registry, ctx);
+    // The raw-buffer fetches (`src/payload.c`) say themselves whether more data could still give them one
+    // (`SMP_F_MAY_CHANGE`): a miss then is not final.
+    let may_change = ctx.raw_req.is_some() && ibex_sample::raw_may_change(&expr.fetch_name, &expr.fetch_args, req_bytes) == Some(true);
+    if can_wait && !is_match && may_change {
+        return AclEvalResult::MissingData;
+    }
     if can_wait && !is_match && (expr.fetch_name == "req.payload" || expr.fetch_name == "payload") {
         let len = expr
             .fetch_args

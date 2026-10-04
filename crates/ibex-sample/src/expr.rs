@@ -188,6 +188,11 @@ impl Expr {
             match_method = default_match_method(&fetch_name, converters.is_empty());
         }
 
+        // A keyword's own match method only applies when there is something to match.
+        if !has_patterns && !forced {
+            match_method = "found";
+        }
+
         let mut patterns = file_patterns;
         if match_method == "int" {
             // `eq`, `ge`, `gt`, `le`, `lt` before a value make it a range (and stay in force
@@ -198,7 +203,9 @@ impl Expr {
                     op = word.as_str();
                     continue;
                 }
-                patterns.push(int_pattern_with_op(op, &unescape_pattern(word))?);
+                let word = unescape_pattern(word);
+                let word = if matches!(fetch_name.as_str(), "req.ssl_ver" | "req_ssl_ver") { dotted_ver(&word)? } else { word };
+                patterns.push(int_pattern_with_op(op, &word)?);
             }
         } else {
             patterns.extend(inline.iter().map(|w| unescape_pattern(w)));
@@ -311,8 +318,8 @@ fn acl_keyword(name: &str) -> Option<(&'static str, &'static str)> {
         "req_ssl_ver" | "req.ssl_ver" => ("req.ssl_ver", "int"),
         "req_rdp_cookie" => ("req.rdp_cookie", "str"),
         "req_rdp_cookie_cnt" => ("req.rdp_cookie_cnt", "int"),
-        "payload" => ("req.payload", "bin"),
-        "payload_lv" => ("req.payload_lv", "bin"),
+        "payload" => ("payload", "bin"),
+        "payload_lv" => ("payload_lv", "bin"),
         "ssl_fc_sni_end" => ("ssl_fc_sni", "end"),
         "ssl_fc_sni_reg" => ("ssl_fc_sni", "reg"),
         "http_auth_group" => ("http_auth_group", "str"),
@@ -374,6 +381,27 @@ fn read_pattern_file(path: &str) -> Result<Vec<String>, String> {
         .filter(|line| !line.is_empty())
         .map(str::to_string)
         .collect())
+}
+
+/// `pat_parse_dotted_ver`: the patterns of `req.ssl_ver` are `<major>[.<minor>]` numbers, alone
+/// or around a `:` or `-` of a range, each standing for `major << 16 | minor`.
+fn dotted_ver(word: &str) -> Result<String, String> {
+    let one = |t: &str| -> Result<String, String> {
+        let (major, minor) = t.split_once('.').unwrap_or((t, ""));
+        let major: i64 = major.parse().map_err(|_| format!("'{word}' is not a dotted number"))?;
+        let minor: i64 = if t.contains('.') { minor.parse().map_err(|_| format!("'{word}' is not a dotted number"))? } else { 0 };
+        if !(0..65536).contains(&major) || !(0..65536).contains(&minor) {
+            return Err(format!("'{word}' is not a dotted number"));
+        }
+        Ok(((major << 16) | minor).to_string())
+    };
+    match word.find([':', '-']) {
+        None => one(word),
+        Some(at) => {
+            let (lo, hi) = (&word[..at], &word[at + 1..]);
+            Ok(format!("{}:{}", if lo.is_empty() { String::new() } else { one(lo)? }, if hi.is_empty() { String::new() } else { one(hi)? }))
+        }
+    }
 }
 
 /// An integer pattern under the operator in force: `gt 5` is the range `6:`, `le 5` is
