@@ -7233,11 +7233,9 @@ impl EngineDispatcher<'_> {
                             let (pfx, _, query) = split_uri(current_uri);
                             rebuild_uri(pfx, &new_path, query)
                         };
-                        sess.with_htx_mut(|htx| {
-                            let _ = htx.set_path(&new_path);
-                        });
-                        sess.req_uri = Some(rebuilt);
-                        rebuild_req_buffer(sess);
+                        if !req_set_uri(sess, rebuilt) && STRICT_MODE.get() {
+                            return Err(500);
+                        }
                     }
                     ibex_config::HttpReqAction::ReplacePath { regex, repl } => {
                         let result = {
@@ -7253,11 +7251,9 @@ impl EngineDispatcher<'_> {
                             }
                         };
                         if let Some((new_path, rebuilt)) = result {
-                            sess.with_htx_mut(|htx| {
-                                let _ = htx.set_path(&new_path);
-                            });
-                            sess.req_uri = Some(rebuilt);
-                            rebuild_req_buffer(sess);
+                            if !req_set_uri(sess, rebuilt) && STRICT_MODE.get() {
+                                return Err(500);
+                            }
                         }
                     }
                     ibex_config::HttpReqAction::SetPathq { fmt } => {
@@ -7267,11 +7263,9 @@ impl EngineDispatcher<'_> {
                             let (pfx, _, _) = split_uri(current_uri);
                             format!("{pfx}{new_pathq}")
                         };
-                        sess.with_htx_mut(|htx| {
-                            let _ = htx.set_uri(&rebuilt);
-                        });
-                        sess.req_uri = Some(rebuilt);
-                        rebuild_req_buffer(sess);
+                        if !req_set_uri(sess, rebuilt) && STRICT_MODE.get() {
+                            return Err(500);
+                        }
                     }
                     ibex_config::HttpReqAction::ReplacePathq { regex, repl } => {
                         let result = {
@@ -7288,11 +7282,9 @@ impl EngineDispatcher<'_> {
                             }
                         };
                         if let Some(rebuilt) = result {
-                            sess.with_htx_mut(|htx| {
-                                let _ = htx.set_uri(&rebuilt);
-                            });
-                            sess.req_uri = Some(rebuilt);
-                            rebuild_req_buffer(sess);
+                            if !req_set_uri(sess, rebuilt) && STRICT_MODE.get() {
+                                return Err(500);
+                            }
                         }
                     }
                     ibex_config::HttpReqAction::ReplaceUri { regex, repl } => {
@@ -7306,11 +7298,9 @@ impl EngineDispatcher<'_> {
                                 .map(|re| re.replace(current_uri, &rust_repl).to_string())
                         };
                         if let Some(rebuilt) = rebuilt {
-                            sess.with_htx_mut(|htx| {
-                                let _ = htx.set_uri(&rebuilt);
-                            });
-                            sess.req_uri = Some(rebuilt);
-                            rebuild_req_buffer(sess);
+                            if !req_set_uri(sess, rebuilt) && STRICT_MODE.get() {
+                                return Err(500);
+                            }
                         }
                     }
                     ibex_config::HttpReqAction::SetQuery { fmt } => {
@@ -7320,27 +7310,21 @@ impl EngineDispatcher<'_> {
                             let (pfx, path, _) = split_uri(current_uri);
                             rebuild_uri(pfx, path, &new_query)
                         };
-                        sess.with_htx_mut(|htx| {
-                            let _ = htx.set_uri(&rebuilt);
-                        });
-                        sess.req_uri = Some(rebuilt);
-                        rebuild_req_buffer(sess);
+                        if !req_set_uri(sess, rebuilt) && STRICT_MODE.get() {
+                            return Err(500);
+                        }
                     }
                     ibex_config::HttpReqAction::SetUri { fmt } => {
                         let new_uri = format_sample_string(fmt, &make_ctx!(sess), registry);
-                        sess.with_htx_mut(|htx| {
-                            let _ = htx.set_uri(&new_uri);
-                        });
-                        sess.req_uri = Some(new_uri);
-                        rebuild_req_buffer(sess);
+                        if !req_set_uri(sess, new_uri) && STRICT_MODE.get() {
+                            return Err(500);
+                        }
                     }
                     ibex_config::HttpReqAction::SetMethod { fmt } => {
                         let new_method = format_sample_string(fmt, &make_ctx!(sess), registry);
-                        sess.with_htx_mut(|htx| {
-                            let _ = htx.set_method(&new_method);
-                        });
-                        sess.req_method = Some(new_method);
-                        rebuild_req_buffer(sess);
+                        if !req_set_method(sess, new_method) && STRICT_MODE.get() {
+                            return Err(500);
+                        }
                     }
                     ibex_config::HttpReqAction::SetSrc { expr } => {
                         let val = if let Ok(e) = Expr::parse(expr) {
@@ -8887,6 +8871,39 @@ fn req_htx_init(sess: &TcpSession) {
     let reserve = sess.maxrewrite.min(sess.bufsize / 2);
     let body = if body == 0 { 0 } else { (8 + body).min(size.saturating_sub(reserve).saturating_sub(head)) };
     RES_HTX.set((head + body, size));
+}
+
+/// Puts `uri` in the request line when it fits the message `HAProxy` would hold
+/// ([`req_htx_init`]'s model: the target takes what its length changes); false, and the
+/// line as it was, when it does not (`http_replace_req_uri`, `http_req_replace_stline`
+/// failing). The caller fails the request in strict mode and goes on otherwise.
+fn req_set_uri(sess: &mut TcpSession, uri: String) -> bool {
+    let old = sess.req_uri.as_deref().map_or(1, str::len);
+    if !res_htx_resize(old, uri.len()) {
+        return false;
+    }
+    sess.htx_reserve(old + uri.len() + 16);
+    sess.with_htx_mut(|htx| {
+        let _ = htx.set_uri(&uri);
+    });
+    sess.req_uri = Some(uri);
+    rebuild_req_buffer(sess);
+    true
+}
+
+/// [`req_set_uri`] for the method.
+fn req_set_method(sess: &mut TcpSession, method: String) -> bool {
+    let old = sess.req_method.as_deref().map_or(3, str::len);
+    if !res_htx_resize(old, method.len()) {
+        return false;
+    }
+    sess.htx_reserve(old + method.len() + 16);
+    sess.with_htx_mut(|htx| {
+        let _ = htx.set_method(&method);
+    });
+    sess.req_method = Some(method);
+    rebuild_req_buffer(sess);
+    true
 }
 
 /// The bytes the request's headers named `name` take in the HTX message.

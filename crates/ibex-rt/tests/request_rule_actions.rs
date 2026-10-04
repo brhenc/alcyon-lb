@@ -529,3 +529,43 @@ fn request_strict_mode_lasts_until_the_end_of_its_rule_list() {
         assert_eq!(received(&resp, &names), present, "{cfg}: {short}");
     }
 }
+
+/// A rewrite of the request line fails when the new target (or method) does not fit the
+/// buffer, as a header does: 500 in strict mode, skipped under `strict-mode off`, the next
+/// rules still running (T127). Ibex dropped these rewrites without a word, and answered 200
+/// with the old line. Measured on HAProxy 3.5-dev8 on `GET /` with an `x` header of 14000
+/// bytes: each of these takes 2273 more bytes than the line has and refuses 2274, with
+/// `tune.bufsize` 16384.
+#[test]
+fn a_request_line_rewrite_fails_when_the_buffer_is_full() {
+    type Mk = Box<dyn Fn(usize) -> String>;
+    let rules: Vec<(&str, Mk, &str)> = vec![
+        ("set-path", Box::new(|m| format!("set-path /{}", "p".repeat(m))), "GET /ppp"),
+        ("set-uri", Box::new(|m| format!("set-uri /{}", "p".repeat(m))), "GET /ppp"),
+        ("set-pathq", Box::new(|m| format!("set-pathq /{}", "p".repeat(m))), "GET /ppp"),
+        ("set-query", Box::new(|m| format!("set-query {}", "q".repeat(m - 1))), "GET /?qqq"),
+        ("set-method", Box::new(|m| format!("set-method {}", "M".repeat(m + 3))), "MMMM"),
+        ("replace-path", Box::new(|m| format!("replace-path (.*) /{}", "p".repeat(m))), "GET /ppp"),
+        ("replace-pathq", Box::new(|m| format!("replace-pathq (.*) /{}", "p".repeat(m))), "GET /ppp"),
+        ("replace-uri", Box::new(|m| format!("replace-uri (.*) /{}", "p".repeat(m))), "GET /ppp"),
+    ];
+    for (what, mk, applied) in rules {
+        let line = |resp: &str| resp.split_once("\r\n\r\n").map_or("", |(_, b)| b).split("\r\n").next().unwrap_or("").to_string();
+        let cfg = |strict: &str, n: usize| {
+            let after = if strict.is_empty() { "" } else { "  http-request set-header after yes\n" };
+            format!("{DEFAULTS}listen l\n  bind {{fe}}\n{strict}  http-request {}\n{after}  server s {{srv}}\n", mk(n))
+        };
+        let (_ibex, fe) = start(&cfg("", 2273), Some(echo_server()));
+        let resp = one(fe, &req(14000, ""));
+        assert!(resp.starts_with("HTTP/1.1 200 "), "{what} 2273: {}", &resp[..resp.len().min(120)]);
+        assert!(line(&resp).starts_with(applied), "{what} 2273: {}", &line(&resp)[..line(&resp).len().min(40)]);
+        let (_ibex, fe) = start(&cfg("", 2274), Some(echo_server()));
+        let resp = one(fe, &req(14000, ""));
+        assert!(resp.starts_with("HTTP/1.1 500 "), "{what} 2274: {}", &resp[..resp.len().min(120)]);
+        let (_ibex, fe) = start(&cfg("  http-request strict-mode off\n", 2274), Some(echo_server()));
+        let resp = one(fe, &req(14000, ""));
+        assert!(resp.starts_with("HTTP/1.1 200 "), "{what} off: {}", &resp[..resp.len().min(120)]);
+        assert_eq!(line(&resp), "GET / HTTP/1.1", "{what} off: the line stays as it was");
+        assert_eq!(received(&resp, &["after"]), ["after"], "{what} off: the next rule ran");
+    }
+}
