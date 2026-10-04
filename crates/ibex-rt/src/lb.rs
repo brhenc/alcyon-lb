@@ -835,7 +835,12 @@ mod fwrr_tests {
     #[test]
     fn a_weight_change_for_a_server_in_the_next_window() {
         let mut st = state(&[3, 1]);
-        let _ = (0..4).filter_map(|_| st.pick(|_| true)).count();
+        let mut picks = 0;
+        while st.next.is_empty() {
+            st.pick(|_| true).expect("a server");
+            picks += 1;
+            assert!(picks < 64, "no server ever queued for the next window");
+        }
         let next: Vec<usize> = st.next.iter().map(|n| n.1).collect();
         for s in next {
             st.weight_change(s, 2 * 16);
