@@ -3096,11 +3096,7 @@ fn eval_tcp_req_session_rules(
             }
             ibex_config::TcpReqSessionAction::SetVar { var_name, expr } => {
                 // A sample that cannot be fetched sets nothing (`action_store`, src/vars.c).
-                let val = if let Ok(e) = Expr::parse(expr) {
-                    e.eval_sample(registry, &ctx).map(|smp| sample_to_string(&smp))
-                } else {
-                    Some(format_sample_string(expr, &ctx, registry))
-                };
+                let val = Expr::parse(expr).ok().and_then(|e| e.eval_sample(registry, &ctx)).map(|smp| sample_to_string(&smp));
                 if let Some(val) = val {
                     store_var(&mut sess.sess_vars, &mut sess.req_vars, var_name, val);
                 }
@@ -3374,11 +3370,7 @@ fn eval_tcp_req_content_rules(
             }
             ibex_config::TcpReqContentAction::SetVar { var_name, expr } => {
                 // A sample that cannot be fetched sets nothing (`action_store`, src/vars.c).
-                let val = if let Ok(e) = Expr::parse(expr) {
-                    e.eval_sample(registry, &ctx).map(|smp| sample_to_string(&smp))
-                } else {
-                    Some(format_sample_string(expr, &ctx, registry))
-                };
+                let val = Expr::parse(expr).ok().and_then(|e| e.eval_sample(registry, &ctx)).map(|smp| sample_to_string(&smp));
                 if let Some(val) = val {
                     store_var(&mut sess.sess_vars, &mut sess.req_vars, var_name, val);
                 }
@@ -6539,11 +6531,7 @@ impl EngineDispatcher<'_> {
                     }
                     ibex_config::HttpReqAction::SetVar { var_name, expr } => {
                         // A sample that cannot be fetched sets nothing (`action_store`, src/vars.c).
-                        let val = if let Ok(e) = Expr::parse(expr) {
-                            e.eval_sample(registry, &make_ctx!(sess)).map(|smp| sample_to_string(&smp))
-                        } else {
-                            Some(format_sample_string(expr, &make_ctx!(sess), registry))
-                        };
+                        let val = Expr::parse(expr).ok().and_then(|e| e.eval_sample(registry, &make_ctx!(sess))).map(|smp| sample_to_string(&smp));
                         if let Some(val) = val {
                             store_var(&mut sess.sess_vars, &mut sess.req_vars, var_name, val);
                         }

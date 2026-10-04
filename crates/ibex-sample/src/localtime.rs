@@ -217,6 +217,9 @@ mod tests {
         d.extend_from_slice(b"UTC\0");
         let z = Zone::parse(&d).expect("v1 TZif");
         assert_eq!(z.offset_at(2000), 3600);
+        // before the first transition the initial type's abbreviation is in force
+        assert_eq!(z.abbr_at(500), "UTC");
+        assert_eq!(z.abbr_at(2000), "UTC");
     }
 
     #[test]

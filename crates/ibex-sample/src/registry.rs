@@ -4619,10 +4619,6 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
-fn format_time(epoch: i64, format: &str) -> String {
-    format_time_ns(epoch, 0, format, false)
-}
-
 /// `epoch` seconds and `nanos` nanoseconds; `%N` prints the nanoseconds on 9 digits and
 /// `%<n>N` the first `n` of them, as the date converters in `HAProxy` do.
 fn format_time_ns(epoch: i64, nanos: u32, format: &str, local: bool) -> String {
