@@ -80,4 +80,7 @@ pub struct SampleRef {
     /// The expression: the fetch, its arguments and its converters (`nbsrv(be),add(1)`),
     /// without an ACL's pattern or a log-format's surroundings.
     pub expr: String,
+    /// For the expression of an anonymous ACL (`{ path_len 3 }`), the whole of it, patterns
+    /// included, as `Expr::parse` reads it; empty for the others.
+    pub acl_text: String,
 }

@@ -85,7 +85,7 @@ fn expr_end(bytes: &[u8], start: usize) -> Option<usize> {
 /// Appends the sample expressions on the directive `tokens`, written in `section`, to `out`.
 pub(crate) fn collect(section: &CurrentSection, tokens: &[Token], out: &mut Vec<SampleRef>) {
     let Some((kind, proxy)) = section_of(section) else { return };
-    let push = |out: &mut Vec<SampleRef>, t: &Token, acl: bool, expr: &str| {
+    let push = |out: &mut Vec<SampleRef>, t: &Token, acl: bool, expr: &str, acl_text: String| {
         out.push(SampleRef {
             line: t.line,
             section: kind,
@@ -94,11 +94,12 @@ pub(crate) fn collect(section: &CurrentSection, tokens: &[Token], out: &mut Vec<
             directive: tokens[0].text.clone(),
             action: tokens.get(1).map(|t| t.text.clone()).unwrap_or_default(),
             expr: expr.to_string(),
+            acl_text,
         });
     };
     if tokens[0].text == "acl" {
         if let Some(t) = tokens.get(2) {
-            push(out, t, true, &t.text);
+            push(out, t, true, &t.text, String::new());
         }
     }
     // A server's `sni <expr>` is a sample expression evaluated when it is connected to.
@@ -106,7 +107,7 @@ pub(crate) fn collect(section: &CurrentSection, tokens: &[Token], out: &mut Vec<
         for (i, t) in tokens.iter().enumerate() {
             if t.text == "sni" {
                 if let Some(e) = tokens.get(i + 1) {
-                    push(out, e, false, &e.text);
+                    push(out, e, false, &e.text, String::new());
                 }
             }
         }
@@ -124,7 +125,9 @@ pub(crate) fn collect(section: &CurrentSection, tokens: &[Token], out: &mut Vec<
     for (i, t) in tokens.iter().enumerate() {
         if t.text == "{" {
             if let Some(next) = tokens.get(i + 1).filter(|n| n.text != "}") {
-                push(out, next, true, &next.text);
+                let end = tokens[i + 1..].iter().position(|w| w.text == "}").map_or(tokens.len(), |p| i + 1 + p);
+                let text = tokens[i + 1..end].iter().map(|w| super::acl::expr_word(&w.text)).collect::<Vec<_>>().join(" ");
+                push(out, next, true, &next.text, text);
             }
             continue;
         }
@@ -132,7 +135,7 @@ pub(crate) fn collect(section: &CurrentSection, tokens: &[Token], out: &mut Vec<
             continue;
         }
         for expr in log_format_exprs(&t.text) {
-            push(out, t, false, expr);
+            push(out, t, false, expr, String::new());
         }
     }
 }

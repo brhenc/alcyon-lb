@@ -692,6 +692,21 @@ pub fn check_expr(config: &Config, registry: &Registry, at: Where<'_>, expr: &st
 pub fn check_sample_refs(config: &Config, registry: &Registry) -> Result<(), String> {
     for r in &config.sample_refs {
         let in_line = |e: String| format!("parsing [line {}]: {e}", r.line);
+        // The patterns of an anonymous ACL, which a named one has checked since `validate_acls`.
+        if r.acl && !r.acl_text.is_empty() {
+            if let Err(e) = Expr::parse(&r.acl_text) {
+                let what = match r.directive.as_str() {
+                    "http-request" | "http-response" | "http-after-response" => {
+                        format!("an '{} {}' condition", r.directive, r.action)
+                    }
+                    "use_backend" | "use-server" => "switching rule".to_string(),
+                    "force-persist" | "ignore-persist" => format!("a '{}' rule", r.directive),
+                    "stick" => "sticking condition".to_string(),
+                    d => format!("an '{d}' condition"),
+                };
+                return Err(in_line(format!("error detected while parsing {what} : {e}.")));
+            }
+        }
         // A fetch or converter that does not exist would load and yield an empty value on
         // every request; `sample_parse_expr` refuses it wherever the `%[...]` is written.
         // (An ACL's expression is checked by `check_expr`, in `HAProxy`'s ACL wording.)

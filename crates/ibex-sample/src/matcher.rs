@@ -258,7 +258,7 @@ impl Matcher {
                 delimiters: if method == "dir" { b"/?" } else { b"/?.:" },
                 case_insensitive,
             }),
-            "ip" => {
+            "ip" => (|| {
                 if let Some((ip_str, prefix_str)) = pattern.split_once('/') {
                     let prefix: u32 = prefix_str
                         .trim()
@@ -291,7 +291,9 @@ impl Matcher {
                         .map_err(|e| e.to_string())?;
                     Ok(Matcher::Ip(ip))
                 }
-            }
+            })()
+            // `HAProxy`'s wording, whatever made the address or its prefix unusable.
+            .map_err(|_: String| format!("'{pattern}' is not a valid IPv4 or IPv6 address")),
             "int" => Ok(Matcher::IntRange(IntRange::parse(pattern)?)),
             "eq" => {
                 let val = pattern.parse::<i64>().map_err(|e| e.to_string())?;
@@ -328,7 +330,7 @@ impl Matcher {
                     value: val,
                 })
             }
-            other => Err(format!("Unknown matcher method '{other}'")),
+            other => Err(format!("unknown matching method '{other}' when parsing ACL expression")),
         }
     }
 
