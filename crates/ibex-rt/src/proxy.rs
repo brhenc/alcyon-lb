@@ -329,6 +329,29 @@ impl TcpSession {
         Some(res)
     }
 
+    /// Makes sure the HTX holds `bytes` more of header (and its descriptor). This HTX is
+    /// laid out with 16-byte block descriptors where `HAProxy`'s are 8, so a request that
+    /// still has room in the message `HAProxy` would hold may have none in this buffer: the
+    /// buffer is then replaced by a larger one, the data kept at the front and the
+    /// descriptors at the end, as they were.
+    pub fn htx_reserve(&mut self, bytes: usize) {
+        use ibex_proto::htx::HTX_DESC_SIZE;
+        let len = self.htx_buf.raw_slice().len();
+        let descs = self.htx_blocks * HTX_DESC_SIZE;
+        let free = len.saturating_sub(descs).saturating_sub(self.htx_tail);
+        let needed = bytes + HTX_DESC_SIZE;
+        if free >= needed {
+            return;
+        }
+        let new_len = len + (needed - free) + 4096;
+        let mut bigger = Buf::with_capacity(new_len);
+        let old = self.htx_buf.raw_slice();
+        let new = bigger.raw_slice_mut();
+        new[..self.htx_tail].copy_from_slice(&old[..self.htx_tail]);
+        new[new_len - descs..].copy_from_slice(&old[len - descs..]);
+        self.htx_buf = bigger;
+    }
+
     pub fn clear_htx(&mut self) {
         self.has_htx = false;
         self.htx_tail = 0;

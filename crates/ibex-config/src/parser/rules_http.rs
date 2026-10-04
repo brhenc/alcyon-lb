@@ -299,11 +299,28 @@ fn parse_http_req_rule_at(
         let cond_idx = find_cond_idx(tokens, 2);
         let limit = cond_idx.unwrap_or(tokens.len());
 
+        // `deny_status` is only accepted as the first argument; `status` anywhere, the last
+        // of either winning (`http_parse_http_reply`, measured). `status` is the status of a
+        // reply built like `return`'s -- an empty one when nothing gives it a body -- while
+        // `deny_status` picks the page the proxy has for the code.
         let mut deny_status = None;
+        let mut status_keyword = false;
         for i in 2..limit {
-            if (tokens[i].text == "status" || tokens[i].text == "deny_status") && i + 1 < limit {
-                deny_status = Some(parse_u16(&tokens[i + 1], "deny_status")?);
-                break;
+            let word = tokens[i].text.as_str();
+            if word == "deny_status" && i != 2 {
+                return Err(ConfigError::new(
+                    tokens[i].line,
+                    tokens[i].col,
+                    format!("'http-request {act_str}' expects either 'if' or 'unless' followed by a condition but found 'deny_status'"),
+                ));
+            }
+            if (word == "status" || word == "deny_status") && i + 1 < limit {
+                let code = parse_u16(&tokens[i + 1], "deny_status")?;
+                if !(200..=599).contains(&code) {
+                    return Err(ConfigError::new(tokens[i + 1].line, tokens[i + 1].col, format!("Unexpected status code '{code}'")));
+                }
+                deny_status = Some(code);
+                status_keyword = word == "status";
             }
         }
 
@@ -312,9 +329,10 @@ fn parse_http_req_rule_at(
 
         // HAProxy: "for compatibility purposes, when no argument is defined, or only
         // 'deny_status', the argument 'default-errorfiles' is implied" -- i.e. a bare
-        // `deny` (or one with only a status) must still consult the proxy's configured
-        // error page, not synthesize an empty body the way a bare `return` does.
-        if error_page.is_none() && content_type.is_none() && lf_string.is_none() {
+        // `deny` (or one with only a `deny_status`) must still consult the proxy's
+        // configured error page, not synthesize an empty body the way a bare `return`
+        // does; with `status` it does synthesize one.
+        if !status_keyword && error_page.is_none() && content_type.is_none() && lf_string.is_none() {
             super::error_pages::check_default_errorfiles(deny_status.unwrap_or(default_status), act_token)?;
             error_page = Some(ErrorPageSource::DefaultErrorfiles);
         }
@@ -411,6 +429,9 @@ fn parse_http_req_rule_at(
                 "<http-request replace-header> expects <name>, <regex>, <replace>.",
             ));
         }
+        // A regex that cannot be compiled would make the rule do nothing on every request;
+        // HAProxy refuses one it cannot compile, and so does this.
+        super::scalars::validate_regex(&tokens[3])?;
         let name = tokens[2].text.clone();
         let regex = tokens[3].text.clone();
         let repl = tokens[4].text.clone();
@@ -433,6 +454,9 @@ fn parse_http_req_rule_at(
                 "<http-request replace-value> expects <name>, <regex>, <replace>.",
             ));
         }
+        // A regex that cannot be compiled would make the rule do nothing on every request;
+        // HAProxy refuses one it cannot compile, and so does this.
+        super::scalars::validate_regex(&tokens[3])?;
         let name = tokens[2].text.clone();
         let regex = tokens[3].text.clone();
         let repl = tokens[4].text.clone();

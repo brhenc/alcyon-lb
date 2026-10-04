@@ -65,8 +65,6 @@ thread_local! {
     /// The line of the `http-response` rule that last ended the rules (`allow`, `deny`,
     /// `redirect`), left by `run_res_rules` for its caller to take.
     static LAST_RULE: Cell<Option<u32>> = const { Cell::new(None) };
-    static REWRITE_ADDED_BYTES: Cell<usize> = const { Cell::new(0) };
-    static MAX_REWRITE_LIMIT: Cell<usize> = const { Cell::new(8192) };
     /// The response being rewritten by `http-response`/`http-after-response`, as the HTX
     /// message `HAProxy` holds it in: (bytes in use, size). See [`res_htx_init`].
     static RES_HTX: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
@@ -6015,9 +6013,6 @@ impl EngineDispatcher<'_> {
             map.insert("be_tarpit_timeout", fe_tarpit);
         });
         STRICT_MODE.set(true);
-        REWRITE_ADDED_BYTES.set(0);
-        let max_rw = proxies[proxy_idx].stats_config.maxrewrite.unwrap_or(8192);
-        MAX_REWRITE_LIMIT.set(max_rw);
 
         // `monitor-uri`: answer the probe here, before any rule or backend sees it. The
         // response is HAProxy's, byte for byte (`src/http_ana.c`), and matches the path of
@@ -6213,6 +6208,10 @@ impl EngineDispatcher<'_> {
                 };
             }
 
+            // Each list starts strict (`http_req_get_intercept_rule` clears
+            // `HTTP_MSGF_SOFT_RW`) and sizes the request as it is now.
+            STRICT_MODE.set(true);
+            req_htx_init(sess);
             for (rule_idx, rule) in rules.iter().enumerate().skip(start) {
                 let matches = match &rule.cond {
                     None => true,
@@ -6583,33 +6582,23 @@ impl EngineDispatcher<'_> {
                         }
                     }
                     ibex_config::HttpReqAction::SetHeader { name, fmt } => {
+                        // A header that does not fit fails the request in strict mode and is
+                        // skipped otherwise (`fail_rewrite`).
                         let val = format_sample_string(fmt, &make_ctx!(sess), registry);
-                        let added = name.len() + val.len() + 4;
-                        let total = REWRITE_ADDED_BYTES.get() + added;
-                        if total > MAX_REWRITE_LIMIT.get() {
-                            if STRICT_MODE.get() {
-                                return Err(500);
-                            }
-                        } else {
-                            REWRITE_ADDED_BYTES.set(total);
-                            set_req_header(sess, name, &val);
+                        if !req_rule_header(sess, name, &val, true) && STRICT_MODE.get() {
+                            return Err(500);
                         }
                     }
                     ibex_config::HttpReqAction::AddHeader { name, fmt } => {
                         let val = format_sample_string(fmt, &make_ctx!(sess), registry);
-                        let added = name.len() + val.len() + 4;
-                        let total = REWRITE_ADDED_BYTES.get() + added;
-                        if total > MAX_REWRITE_LIMIT.get() {
-                            if STRICT_MODE.get() {
-                                return Err(500);
-                            }
-                        } else {
-                            REWRITE_ADDED_BYTES.set(total);
-                            add_req_header(sess, name, &val);
+                        if !req_rule_header(sess, name, &val, false) && STRICT_MODE.get() {
+                            return Err(500);
                         }
                     }
                     ibex_config::HttpReqAction::DelHeader { name } => {
+                        let freed = req_hdr_bytes(sess, name);
                         del_req_header(sess, name);
+                        res_htx_resize(freed, 0);
                     }
                     ibex_config::HttpReqAction::ReplaceHeader { name, regex, repl } => {
                         if replace_req_header(sess, name, regex, repl).is_err() {
@@ -7903,6 +7892,52 @@ fn del_req_header(sess: &mut TcpSession, name: &str) {
     rebuild_req_buffer(sess);
 }
 
+/// Sizes the HTX message the `http-request` rules rewrite, as `HAProxy` holds the request
+/// (the same model as [`res_htx_init`]'s, in the same cell): a buffer of `tune.bufsize` less
+/// the 40-byte `struct htx`, holding the request line (an 8-byte block, 20 bytes of `htx_sl`
+/// and the method, the target and the version), each header ([`htx_hdr_size`]), the 9-byte
+/// end-of-headers, and the body bytes already in the buffer (an 8-byte block and the data),
+/// of which only what fits before the `tune.maxrewrite` reserve was read.
+///
+/// Measured on `HAProxy` 3.5-dev8 (2026-10-04, `tests/request_rule_actions.rs`): `GET /`
+/// with `Host: x` and an `x` header of `n` bytes takes a `set-header` of the same `n` bytes
+/// up to `n` = 8131. It is computed from the request as it is now, so the rewrites of the
+/// rules before it count and a header a rule removed gives its room back.
+fn req_htx_init(sess: &TcpSession) {
+    let size = sess.bufsize.saturating_sub(40);
+    let hdrs: usize = sess.htx_slice().map_or(0, |h| h.headers().map(|(k, v)| htx_hdr_size(k, v)).sum());
+    let data = sess.req.readable();
+    let head_len = crate::proxy::find_eoh(data).map_or(data.len(), |(h, e)| h + e);
+    let body = data.len().saturating_sub(head_len);
+    let line = 8 + 20 + sess.req_method.as_deref().map_or(3, str::len) + sess.req_uri.as_deref().map_or(1, str::len) + 8;
+    let head = line + hdrs + 9;
+    let reserve = sess.maxrewrite.min(sess.bufsize / 2);
+    let body = if body == 0 { 0 } else { (8 + body).min(size.saturating_sub(reserve).saturating_sub(head)) };
+    RES_HTX.set((head + body, size));
+}
+
+/// The bytes the request's headers named `name` take in the HTX message.
+fn req_hdr_bytes(sess: &TcpSession, name: &str) -> usize {
+    sess.htx_slice().map_or(0, |h| h.headers().filter(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(k, v)| htx_hdr_size(k, v)).sum())
+}
+
+/// `add-header` (`replace` false) and `set-header` (`replace` true: every occurrence goes
+/// first, as `http_action_set_header` removes them before it adds) on the request. False
+/// when the header does not fit; what was removed stays removed.
+fn req_rule_header(sess: &mut TcpSession, name: &str, val: &str, replace: bool) -> bool {
+    if replace {
+        let freed = req_hdr_bytes(sess, name);
+        del_req_header(sess, name);
+        res_htx_resize(freed, 0);
+    }
+    if !res_htx_resize(0, htx_hdr_size(name, val)) {
+        return false;
+    }
+    sess.htx_reserve(name.len() + val.len());
+    add_req_header(sess, name, val);
+    true
+}
+
 fn replace_req_header(sess: &mut TcpSession, name: &str, regex: &str, repl: &str) -> Result<(), ()> {
     rewrite_req_header_values(sess, name, regex, repl, false)
 }
@@ -7911,55 +7946,57 @@ fn replace_req_value(sess: &mut TcpSession, name: &str, regex: &str, repl: &str)
     rewrite_req_header_values(sess, name, regex, repl, true)
 }
 
-/// `replace-header` (`per_value` false: the whole value) and `replace-value` (`per_value`
-/// true: each comma-separated value, trimmed, rejoined with `,` as HAProxy rejoins them) on
-/// the request, `repl` written with HAProxy's `\N` back-references.
-///
-/// The head is the HTX one. The replacement given to it was `repl` untranslated, so a
-/// back-reference arrived as the literal text `\1`, and `replace-value` was applied to the
-/// whole value; the translated, per-value form went only to `req_headers`, which is empty
-/// once the head has been parsed into HTX. And the growth was checked only against a 1 MB
-/// ceiling, so a value expanded past the buffer was forwarded where HAProxy answers 500:
-/// it now comes out of the `maxrewrite` budget `add-header` and `set-header` use, and
-/// fails the request under `strict-mode on`.
-fn rewrite_req_header_values(
-    sess: &mut TcpSession,
-    name: &str,
-    regex: &str,
-    repl: &str,
-    per_value: bool,
-) -> Result<(), ()> {
+/// `replace-header` (`per_value` false: the whole value, `repl` from the first match) and
+/// `replace-value` (`per_value` true: each comma-separated value that matches, with the
+/// blanks around it) on the request, `repl` read as `exp_replace` reads it
+/// ([`replace_each_value`], as the response rules do). `Err` when a value does not fit or
+/// `repl` is cut short and the request is in strict mode: header by header, the ones
+/// before it stay rewritten.
+fn rewrite_req_header_values(sess: &mut TcpSession, name: &str, regex: &str, repl: &str, per_value: bool) -> Result<(), ()> {
     let re = regex::Regex::new(regex).map_err(|_| ())?;
-    let rust_repl = translate_backreferences(repl);
-    let rewrite = |v: &str| -> String {
-        if per_value {
-            v.split(',').map(|p| re.replace_all(p.trim(), rust_repl.as_str()).into_owned()).collect::<Vec<_>>().join(",")
-        } else {
-            re.replace_all(v, rust_repl.as_str()).into_owned()
-        }
-    };
-    let edits: Vec<(String, String)> = sess.htx_slice().map_or_else(Vec::new, |h| {
-        h.headers()
-            .filter(|(k, _)| k.eq_ignore_ascii_case(name))
-            .map(|(_, v)| (v.to_string(), rewrite(v)))
-            .filter(|(old, new)| old != new)
-            .collect()
+    let headers: Vec<(String, String)> = sess.htx_slice().map_or_else(Vec::new, |h| {
+        h.headers().filter(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(k, v)| (k.to_string(), v.to_string())).collect()
     });
-    let growth: usize = edits.iter().map(|(old, new)| new.len().saturating_sub(old.len())).sum();
-    let total = REWRITE_ADDED_BYTES.get() + growth;
-    if total > MAX_REWRITE_LIMIT.get() {
-        return if STRICT_MODE.get() { Err(()) } else { Ok(()) };
+    let mut edits: Vec<(String, String)> = Vec::new();
+    let mut failed = false;
+    for (k, v) in &headers {
+        let new = if per_value {
+            replace_each_value(v, &re, repl)
+        } else {
+            match re.captures(v) {
+                Some(caps) => exp_replace(repl, &caps),
+                None => continue,
+            }
+        };
+        match new {
+            Some(n) if n == *v => {}
+            Some(n) if res_htx_resize(htx_hdr_size(k, v), htx_hdr_size(k, &n)) => edits.push((v.clone(), n)),
+            _ => {
+                failed = true;
+                break;
+            }
+        }
     }
-    REWRITE_ADDED_BYTES.set(total);
+    // Each value is written at the end of the HTX, twice (the marker and the new value), the
+    // old ones staying where they were until the message is defragmented.
+    sess.htx_reserve(edits.iter().map(|(old, new)| old.len() + new.len() + 64).sum());
     sess.with_htx_mut(|htx| {
-        for (old, new) in &edits {
-            // Each value is replaced whole and literally: `$` is the only special
-            // character in a `regex` replacement.
-            let _ = htx.replace_header(name, &format!("^{}$", regex::escape(old)), &new.replace('$', "$$"));
+        // Two steps through a marker, so that a new value equal to the old value of a later
+        // edit is not rewritten again. A value is replaced whole and literally: `$` is the
+        // only special character in a `regex` replacement.
+        for (i, (old, _)) in edits.iter().enumerate() {
+            let _ = htx.replace_header(name, &format!("^{}$", regex::escape(old)), &format!("@@ibex-rewrite-{i}@@"));
+        }
+        for (i, (_, new)) in edits.iter().enumerate() {
+            let _ = htx.replace_header(name, &format!("^@@ibex-rewrite-{i}@@$"), &new.replace('$', "$$"));
         }
     });
     rebuild_req_buffer(sess);
-    Ok(())
+    if failed && STRICT_MODE.get() {
+        Err(())
+    } else {
+        Ok(())
+    }
 }
 
 /// Seconds since the epoch (`date.tv_sec`).
