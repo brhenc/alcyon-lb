@@ -166,6 +166,9 @@ pub struct TcpSession {
     pub fc_dst: Option<SocketAddr>,
     pub tcp_inspect_done: bool,
     pub inspect_exp: Option<Tick>,
+    /// The backend's `tcp-request content` rules are waiting (TCP mode): `inspect_exp` is
+    /// their delay, and the backend is chosen again when it is over.
+    pub be_inspect: bool,
     /// TCP mode, `tcp-response content` rules still deciding: the response is held from
     /// the client (no write, no shutdown) until they accept or reject it.
     pub res_inspect_pending: bool,
@@ -277,6 +280,7 @@ impl TcpSession {
             fc_dst: None,
             tcp_inspect_done: true,
             inspect_exp: None,
+            be_inspect: false,
             res_inspect_pending: false,
             res_inspect_exp: None,
             res_inspect_armed: None,
@@ -1615,7 +1619,7 @@ impl TcpSession {
     pub fn next_expiry(&self) -> Tick {
         let mut exp = self.cli_exp.earliest(self.srv_exp).earliest(self.conn_exp).earliest(self.retry_after);
         if let Some(i_exp) = self.inspect_exp {
-            if !self.tcp_inspect_done {
+            if !self.tcp_inspect_done || self.be_inspect {
                 exp = exp.earliest(i_exp);
             }
         }

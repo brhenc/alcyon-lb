@@ -82,6 +82,42 @@ fn timed(fe: SocketAddr, req: &str) -> (Duration, String) {
 const GET: &str = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
 
 #[test]
+fn wait_end_holds_a_tcp_mode_backend_rule_until_the_inspect_delay_is_over() {
+    // HAProxy (TCP mode), the same configuration with `mode tcp`: the client has the
+    // answer at +0.502 s, and the server hears the request no sooner.
+    let (srv, heard) = server();
+    let cfg = "defaults\n  mode tcp\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n\
+        frontend fe\n  bind {fe}\n  default_backend be\n\
+        backend be\n  tcp-request inspect-delay 500ms\n  tcp-request content accept if WAIT_END\n  server s {srv}\n";
+    let (_ibex, fe) = start(cfg, srv);
+    let sent = Instant::now();
+    let (took, resp) = timed(fe, GET);
+    assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "{resp:?}");
+    let at = heard.recv_timeout(Duration::from_secs(3)).expect("the server heard the request");
+    assert!(at.duration_since(sent) >= Duration::from_millis(480), "the server heard it after {:?}", at.duration_since(sent));
+    assert!(took < Duration::from_millis(3000), "the client had the response after {took:?}");
+}
+
+#[test]
+fn wait_end_holds_a_backend_tcp_request_content_rule_until_the_inspect_delay_is_over() {
+    // HAProxy (HTTP mode): the backend's `tcp-request inspect-delay 500ms` with
+    // `tcp-request content accept if WAIT_END` -- the request reaches the server, and the
+    // client has the response, at +0.502 s.
+    let (srv, heard) = server();
+    let cfg = "defaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n\
+        frontend fe\n  bind {fe}\n  default_backend be\n\
+        backend be\n  tcp-request inspect-delay 500ms\n  tcp-request content accept if WAIT_END\n  server s {srv}\n";
+    let (_ibex, fe) = start(cfg, srv);
+    let sent = Instant::now();
+    let (took, resp) = timed(fe, GET);
+    assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "{resp:?}");
+    let at = heard.recv_timeout(Duration::from_secs(3)).expect("the server heard the request");
+    assert!(at.duration_since(sent) >= Duration::from_millis(480), "the server heard it after {:?}", at.duration_since(sent));
+    assert!(took >= Duration::from_millis(480), "the client had the response after {took:?}");
+    assert!(took < Duration::from_millis(3000), "the client had the response after {took:?}");
+}
+
+#[test]
 fn wait_end_holds_an_http_response_until_the_inspect_delay_is_over() {
     // HAProxy (HTTP mode): `tcp-response inspect-delay 500ms` and `tcp-response content
     // accept if WAIT_END` -- the server answers at once, the client has the response at

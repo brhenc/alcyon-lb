@@ -4901,7 +4901,7 @@ impl EngineDispatcher<'_> {
         // `timeout client` while the request is held for its body: the 408 the wait's own
         // time-out gives.
         if entry.sess.ending == Some(crate::proxy::Ending::Timeout(crate::proxy::Which::Client))
-            && entry.sess.txn.as_ref().is_some_and(|t| t.body_wait.is_some_and(|w| !w.tarpit))
+            && entry.sess.txn.as_ref().is_some_and(|t| t.body_wait.is_some_and(|w| !w.tarpit && !w.inspect))
         {
             let fe = &proxies[entry.proxy_idx];
             let page = proxy_error_response(&entry.sess, fe, fe, proxies, 408);
@@ -6485,7 +6485,7 @@ impl EngineDispatcher<'_> {
                         );
                         if !deadline.is_expired(now) {
                             if let Some(t) = sess.txn.as_mut() {
-                                t.body_wait = Some(crate::txn::BodyWait { backend: be_stage, rule: rule_idx, deadline, tarpit: true });
+                                t.body_wait = Some(crate::txn::BodyWait { backend: be_stage, rule: rule_idx, deadline, tarpit: true, inspect: false });
                             }
                             return Ok(RuleFlow::Suspend);
                         }
@@ -6922,7 +6922,13 @@ impl EngineDispatcher<'_> {
         }
 
         // Evaluate backend tcp-request content rules
-        if !resume_be && !proxies[be_idx].tcp_req_content_rules.is_empty() {
+        let inspect_wait = resume.filter(|w| w.inspect);
+        if (!resume_be || inspect_wait.is_some()) && !proxies[be_idx].tcp_req_content_rules.is_empty() {
+            // The backend's own `inspect-delay`, from the first pass over its rules.
+            let deadline = inspect_wait.map(|w| w.deadline).or_else(|| {
+                proxies[be_idx].tcp_req_inspect_delay.map(|d| fresh_tick(now).add(u32::try_from(d.as_millis()).unwrap_or(u32::MAX)))
+            });
+            entry.sess.inspect_exp = deadline;
             let res = eval_tcp_req_content_rules(
                 &proxies[be_idx],
                 proxies,
@@ -6930,6 +6936,21 @@ impl EngineDispatcher<'_> {
                 &mut entry.sess,
                 now,
             );
+            entry.sess.inspect_exp = None;
+            if let Some(txn) = entry.sess.txn.as_mut() {
+                txn.body_wait = (res == ContentEvalResult::Waiting).then(|| crate::txn::BodyWait {
+                    backend: true,
+                    rule: 0,
+                    deadline: deadline.unwrap_or(Tick::ETERNITY),
+                    tarpit: false,
+                    inspect: true,
+                });
+            }
+            if res == ContentEvalResult::Waiting {
+                // Held until the delay is over: back here then, past the rules and the
+                // routing that already ran.
+                return None;
+            }
             match res {
                 ContentEvalResult::Reject => {
                     raw::abort_with_rst(entry.sess.cli.as_fd());
@@ -7195,15 +7216,27 @@ impl EngineDispatcher<'_> {
             entry.sess.srv_state = ScState::Error;
             return;
         };
+        // Back here after the backend's `tcp-request content` rules waited: the stream is
+        // already counted for the backend.
+        let resumed = entry.sess.be_inspect;
         entry.backend_idx = be_idx;
-        // `stream_set_backend` counts the stream for the backend (`proxy_inc_be_ctr`).
-        proxies[be_idx].stats[worker_id()].be_sess_rate.tick();
-        if be_idx != entry.proxy_idx {
-            entry.sess.set_retries(proxies[be_idx].retries);
+        if !resumed {
+            // `stream_set_backend` counts the stream for the backend (`proxy_inc_be_ctr`).
+            proxies[be_idx].stats[worker_id()].be_sess_rate.tick();
+            if be_idx != entry.proxy_idx {
+                entry.sess.set_retries(proxies[be_idx].retries);
+            }
         }
         arm_res_inspect(&proxies[be_idx], &mut entry.sess);
 
         if !proxies[be_idx].tcp_req_content_rules.is_empty() {
+            if !resumed {
+                // The backend's own `inspect-delay`, from the first pass over its rules
+                // (`stream_set_backend` clears the analyser's expiry).
+                entry.sess.inspect_exp = proxies[be_idx]
+                    .tcp_req_inspect_delay
+                    .map(|d| fresh_tick(now).add(u32::try_from(d.as_millis()).unwrap_or(u32::MAX)));
+            }
             let res = eval_tcp_req_content_rules(
                 &proxies[be_idx],
                 proxies,
@@ -7211,6 +7244,14 @@ impl EngineDispatcher<'_> {
                 &mut entry.sess,
                 now,
             );
+            if res == ContentEvalResult::Waiting {
+                // Held until the delay is over, or the request says more: the server is
+                // not connected, and this runs again.
+                entry.sess.be_inspect = true;
+                return;
+            }
+            entry.sess.be_inspect = false;
+            entry.sess.inspect_exp = None;
             match res {
                 ContentEvalResult::Reject => {
                     raw::abort_with_rst(entry.sess.cli.as_fd());
@@ -8058,7 +8099,7 @@ fn wait_for_request_body(
     let pending = matches!(outcome, BodyWait::Pending);
     let ready = matches!(outcome, BodyWait::Ready);
     for txn in sess.txn.as_mut() {
-        txn.body_wait = pending.then_some(crate::txn::BodyWait { backend, rule, deadline, tarpit: false });
+        txn.body_wait = pending.then_some(crate::txn::BodyWait { backend, rule, deadline, tarpit: false, inspect: false });
         if ready {
             txn.req_body = Some(std::mem::take(&mut body));
         }
