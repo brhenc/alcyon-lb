@@ -132,8 +132,14 @@ impl FwrrState {
         if self.built_from.len() == n && (0..n).all(|i| self.built_from[i] == Self::eweight(proxy, i)) {
             return;
         }
+        self.rebuild((0..n).map(|i| Self::eweight(proxy, i)));
+    }
+
+    /// `fwrr_init_server_groups` for these effective weights.
+    fn rebuild(&mut self, eweights: impl Iterator<Item = u32>) {
         self.built_from.clear();
-        self.built_from.extend((0..n).map(|i| Self::eweight(proxy, i)));
+        self.built_from.extend(eweights);
+        let n = self.built_from.len();
         self.slots.clear();
         self.slots.resize(n, FwrrSlot::default());
         for tree in [&mut self.curr, &mut self.init, &mut self.next] {
@@ -691,4 +697,34 @@ pub fn redispatch_due(
         return true;
     }
     !direct && active_servers > 1 && !hash_kind
+}
+
+#[cfg(test)]
+mod fwrr_tests {
+    use super::FwrrState;
+
+    fn state(weights: &[u32]) -> FwrrState {
+        let mut st = FwrrState::default();
+        st.rebuild(weights.iter().map(|w| w * 16));
+        st
+    }
+
+    #[test]
+    fn an_unavailable_server_is_skipped_and_keeps_its_share_when_it_comes_back() {
+        let mut st = state(&[1, 1, 1]);
+        // s1 is full for six picks, over two windows: the others alternate...
+        let skipped: Vec<usize> = (0..6).filter_map(|_| st.pick(|i| i != 1)).collect();
+        assert_eq!(skipped, [0, 2, 0, 2, 0, 2]);
+        // ...and it is served again as soon as it can be, without a burst.
+        let after: Vec<usize> = (0..6).filter_map(|_| st.pick(|_| true)).collect();
+        assert_eq!(after.iter().filter(|&&i| i == 1).count(), 2, "{after:?}");
+    }
+
+    #[test]
+    fn nothing_usable_gives_none_and_loses_no_server() {
+        let mut st = state(&[2, 1]);
+        assert_eq!(st.pick(|_| false), None);
+        let got: Vec<usize> = (0..6).filter_map(|_| st.pick(|_| true)).collect();
+        assert_eq!(got.iter().filter(|&&i| i == 0).count(), 4, "{got:?}");
+    }
 }

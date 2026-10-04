@@ -145,3 +145,15 @@ fn set_maxconn_global_is_checked_like_haproxy() {
     assert_eq!(cli(&ibex.sock, "set maxconn global x"), "\n");
     assert_eq!(info(&ibex.sock, "Maxconn"), "4");
 }
+
+#[test]
+fn the_value_is_read_like_atoi() {
+    let (ibex, _fe) = start(4);
+    // Measured on HAProxy: a sign is read, text counts as 0, and 0 or less is the limit of
+    // the configuration again.
+    assert_eq!(cli(&ibex.sock, "set maxconn global +2"), "\n");
+    assert_eq!(info(&ibex.sock, "Maxconn"), "2");
+    assert_eq!(cli(&ibex.sock, "set maxconn global -1"), "\n");
+    assert_eq!(info(&ibex.sock, "Maxconn"), "4");
+    assert!(cli(&ibex.sock, "help").contains("set maxconn global <value>"));
+}

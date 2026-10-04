@@ -2404,10 +2404,8 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         loop {
             let (listener, level, path) = match which {
                 None => (self.cli_listener.as_ref(), self.cli_level, self.cli_socket_path.as_ref()),
-                Some(i) => match self.extra_cli.get(i) {
-                    Some(x) => (x.listener.as_ref(), x.level, Some(&x.path)),
-                    None => return,
-                },
+                // `FdState::CliExtra(i)` is registered by `bind_extra_cli_socket` with `i` its index.
+                Some(i) => (self.extra_cli[i].listener.as_ref(), self.extra_cli[i].level, Some(&self.extra_cli[i].path)),
             };
             let Some(listener) = listener else {
                 return;
