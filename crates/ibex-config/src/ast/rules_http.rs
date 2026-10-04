@@ -100,6 +100,10 @@ pub enum HttpReqAction {
     SetDst {
         expr: String,
     },
+    /// Rewrites the port of the stream's source (`src`).
+    SetSrcPort {
+        expr: String,
+    },
     /// Rewrites the port of the stream's destination (`dst`), which a server without a
     /// port connects to.
     SetDstPort {

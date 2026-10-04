@@ -656,6 +656,13 @@ fn parse_http_req_rule_at(
             cond,
             line: 0,
         });
+    } else if act_str == "set-src-port" {
+        let (expr, cond) = parse_one_expr_and_cond(tokens, act_token)?;
+        rules.push(HttpReqRule {
+            action: HttpReqAction::SetSrcPort { expr },
+            cond,
+            line: 0,
+        });
     } else if act_str == "set-dst-port" {
         let (expr, cond) = parse_one_expr_and_cond(tokens, act_token)?;
         rules.push(HttpReqRule {

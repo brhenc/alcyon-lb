@@ -3214,6 +3214,25 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
     }
 }
 
+/// The value of a `set-src-port`/`set-dst-port` expression: an integer, cut to 16 bits as
+/// `htons(smp->data.u.sint)` does (`tcp_action_req_set_src_port`, src/tcp_act.c). `None`
+/// when the sample cannot be fetched: the rule then changes nothing.
+fn eval_port_expr(expr: &str, registry: &Registry, ctx: &SampleContext<'_>) -> Option<u16> {
+    let smp = Expr::parse(expr).ok()?.eval_sample(registry, ctx)?;
+    match ibex_sample::cast::cast(smp, ibex_sample::SampleType::Sint)? {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        ibex_sample::Sample::Sint(n) => Some(n as u16),
+        _ => None,
+    }
+}
+
+/// `addr` with its port replaced and its address kept; with no address, `0.0.0.0` (HAProxy
+/// forces AF_INET "0.0.0.0" when the family was neither inet nor inet6).
+fn with_port(addr: Option<SocketAddr>, port: u16) -> SocketAddr {
+    let ip = addr.map_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), |a| a.ip());
+    SocketAddr::new(ip, port)
+}
+
 #[derive(Debug)]
 enum ConnEvalOutcome {
     /// Client, server, `fc_src`, `fc_dst`, and whether `expect-proxy` matched.
@@ -3281,6 +3300,22 @@ fn eval_tcp_req_conn_rules(
             }
             ibex_config::TcpReqConnAction::ExpectProxy => {
                 expect_proxy = true;
+            }
+            ibex_config::TcpReqConnAction::SetSrcPort { expr } => {
+                if let Some(port) = eval_port_expr(expr, registry, &ctx) {
+                    client_addr = with_port(Some(client_addr), port);
+                    fc_src = client_addr;
+                    ctx.client_addr = Some(client_addr);
+                    ctx.fc_src = Some(fc_src);
+                }
+            }
+            ibex_config::TcpReqConnAction::SetDstPort { expr } => {
+                if let Some(port) = eval_port_expr(expr, registry, &ctx) {
+                    server_addr = with_port(Some(server_addr), port);
+                    fc_dst = server_addr;
+                    ctx.server_addr = Some(server_addr);
+                    ctx.fc_dst = Some(fc_dst);
+                }
             }
             ibex_config::TcpReqConnAction::SetSrc { expr } => {
                 let val = if let Ok(e) = Expr::parse(expr) {
@@ -3474,6 +3509,20 @@ fn eval_tcp_req_session_rules(
                 } else if let Ok(sa) = val.parse::<SocketAddr>() {
                     sess.server_addr = Some(sa);
                     ctx.server_addr = Some(sa);
+                }
+            }
+            ibex_config::TcpReqSessionAction::SetSrcPort { expr } => {
+                if let Some(port) = eval_port_expr(expr, registry, &ctx) {
+                    let new_addr = with_port(sess.client_addr, port);
+                    sess.client_addr = Some(new_addr);
+                    ctx.client_addr = Some(new_addr);
+                }
+            }
+            ibex_config::TcpReqSessionAction::SetDstPort { expr } => {
+                if let Some(port) = eval_port_expr(expr, registry, &ctx) {
+                    let new_addr = with_port(sess.server_addr, port);
+                    sess.server_addr = Some(new_addr);
+                    ctx.server_addr = Some(new_addr);
                 }
             }
             ibex_config::TcpReqSessionAction::SetVar { var_name, expr } => {
@@ -3715,6 +3764,20 @@ fn eval_tcp_req_content_rules(
                 } else if let Ok(sa) = val.parse::<SocketAddr>() {
                     sess.server_addr = Some(sa);
                     ctx.server_addr = Some(sa);
+                }
+            }
+            ibex_config::TcpReqContentAction::SetSrcPort { expr } => {
+                if let Some(port) = eval_port_expr(expr, registry, &ctx) {
+                    let new_addr = with_port(sess.client_addr, port);
+                    sess.client_addr = Some(new_addr);
+                    ctx.client_addr = Some(new_addr);
+                }
+            }
+            ibex_config::TcpReqContentAction::SetDstPort { expr } => {
+                if let Some(port) = eval_port_expr(expr, registry, &ctx) {
+                    let new_addr = with_port(sess.server_addr, port);
+                    sess.server_addr = Some(new_addr);
+                    ctx.server_addr = Some(new_addr);
                 }
             }
             ibex_config::TcpReqContentAction::SetVar { var_name, expr } => {
@@ -6839,8 +6902,15 @@ impl EngineDispatcher<'_> {
                         } else {
                             format_sample_string(expr, &make_ctx!(sess), registry)
                         };
+                        // The address changes, the port stays (`tcp_action_req_set_src`).
                         if let Ok(ip) = val.parse::<IpAddr>() {
-                            sess.client_addr = Some(SocketAddr::new(ip, 0));
+                            let port = sess.client_addr.map_or(0, |a| a.port());
+                            sess.client_addr = Some(SocketAddr::new(ip, port));
+                        }
+                    }
+                    ibex_config::HttpReqAction::SetSrcPort { expr } => {
+                        if let Some(port) = eval_port_expr(expr, registry, &make_ctx!(sess)) {
+                            sess.client_addr = Some(with_port(sess.client_addr, port));
                         }
                     }
                     ibex_config::HttpReqAction::SetDstPort { expr } => {
@@ -6883,7 +6953,8 @@ impl EngineDispatcher<'_> {
                             format_sample_string(expr, &make_ctx!(sess), registry)
                         };
                         if let Ok(ip) = val.parse::<IpAddr>() {
-                            sess.server_addr = Some(SocketAddr::new(ip, 0));
+                            let port = sess.server_addr.map_or(0, |a| a.port());
+                            sess.server_addr = Some(SocketAddr::new(ip, port));
                         }
                     }
                     ibex_config::HttpReqAction::SetVar { var_name, expr } => {

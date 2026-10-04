@@ -47,7 +47,23 @@ pub(crate) fn parse_tcp_req_connection(
             let expr = join_tokens_until(tokens, 3, cond_idx);
             rules.push(TcpReqConnRule { action: TcpReqConnAction::SetSrc { expr }, cond });
         }
-        "set-dst" => {
+        "set-src-port" => {
+                let (cond_idx, cond) = parse_rule_condition(tokens, 3)?;
+                let expr = join_tokens_until(tokens, 3, cond_idx);
+                if expr.is_empty() {
+                    return Err(ConfigError::new(act_tok.line, act_tok.col, "'set-src-port' expects an expression"));
+                }
+                rules.push(TcpReqConnRule { action: TcpReqConnAction::SetSrcPort { expr }, cond });
+            }
+            "set-dst-port" => {
+                let (cond_idx, cond) = parse_rule_condition(tokens, 3)?;
+                let expr = join_tokens_until(tokens, 3, cond_idx);
+                if expr.is_empty() {
+                    return Err(ConfigError::new(act_tok.line, act_tok.col, "'set-dst-port' expects an expression"));
+                }
+                rules.push(TcpReqConnRule { action: TcpReqConnAction::SetDstPort { expr }, cond });
+            }
+            "set-dst" => {
             let (cond_idx, cond) = parse_rule_condition(tokens, 3)?;
             let expr = join_tokens_until(tokens, 3, cond_idx);
             rules.push(TcpReqConnRule { action: TcpReqConnAction::SetDst { expr }, cond });
@@ -197,6 +213,22 @@ pub(crate) fn parse_tcp_req_session(
                 let (cond_idx, cond) = parse_rule_condition(tokens, 3)?;
                 let expr = join_tokens_until(tokens, 3, cond_idx);
                 rules.push(TcpReqSessionRule { action: TcpReqSessionAction::SetSrc { expr }, cond });
+            }
+            "set-src-port" => {
+                let (cond_idx, cond) = parse_rule_condition(tokens, 3)?;
+                let expr = join_tokens_until(tokens, 3, cond_idx);
+                if expr.is_empty() {
+                    return Err(ConfigError::new(act_tok.line, act_tok.col, "'set-src-port' expects an expression"));
+                }
+                rules.push(TcpReqSessionRule { action: TcpReqSessionAction::SetSrcPort { expr }, cond });
+            }
+            "set-dst-port" => {
+                let (cond_idx, cond) = parse_rule_condition(tokens, 3)?;
+                let expr = join_tokens_until(tokens, 3, cond_idx);
+                if expr.is_empty() {
+                    return Err(ConfigError::new(act_tok.line, act_tok.col, "'set-dst-port' expects an expression"));
+                }
+                rules.push(TcpReqSessionRule { action: TcpReqSessionAction::SetDstPort { expr }, cond });
             }
             "set-dst" => {
                 let (cond_idx, cond) = parse_rule_condition(tokens, 3)?;
@@ -462,6 +494,22 @@ fn parse_tcp_req_content_at(
                 let (cond_idx, cond) = parse_rule_condition(tokens, 3)?;
                 let expr = join_tokens_until(tokens, 3, cond_idx);
                 rules.push(TcpReqContentRule { action: TcpReqContentAction::SetSrc { expr }, cond, line: 0 });
+            }
+            "set-src-port" => {
+                let (cond_idx, cond) = parse_rule_condition(tokens, 3)?;
+                let expr = join_tokens_until(tokens, 3, cond_idx);
+                if expr.is_empty() {
+                    return Err(ConfigError::new(act_tok.line, act_tok.col, "'set-src-port' expects an expression"));
+                }
+                rules.push(TcpReqContentRule { action: TcpReqContentAction::SetSrcPort { expr }, cond, line: 0 });
+            }
+            "set-dst-port" => {
+                let (cond_idx, cond) = parse_rule_condition(tokens, 3)?;
+                let expr = join_tokens_until(tokens, 3, cond_idx);
+                if expr.is_empty() {
+                    return Err(ConfigError::new(act_tok.line, act_tok.col, "'set-dst-port' expects an expression"));
+                }
+                rules.push(TcpReqContentRule { action: TcpReqContentAction::SetDstPort { expr }, cond, line: 0 });
             }
             "set-dst" => {
                 let (cond_idx, cond) = parse_rule_condition(tokens, 3)?;
