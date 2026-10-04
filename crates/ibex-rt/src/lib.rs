@@ -32,6 +32,7 @@ pub mod txnlog;
 pub mod quic_listener;
 pub mod raw;
 pub mod rule_exprs;
+pub mod srv_tls;
 pub mod stats;
 pub mod xprt;
 pub mod stats_html;

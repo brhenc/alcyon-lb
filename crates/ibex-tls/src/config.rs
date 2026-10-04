@@ -246,20 +246,27 @@ pub fn load_system_ca_roots() -> RootCertStore {
     RootCertStore::empty()
 }
 
-/// Options for configuring outbound backend TLS.
+/// What a `server` line says about the TLS it speaks (`src/cfgparse-ssl.c`), as the
+/// engine hands it over. The name to send and to verify against is decided per
+/// connection, so it is not here.
 #[derive(Clone, Debug)]
 pub struct BackendTlsOptions {
-    /// Whether certificate verification is required (`verify required` vs `verify none`).
-    /// Default in `HAProxy` 2.2+ is `true`.
+    /// `verify required` (the default, `ssl-server-verify`) or `verify none`.
     pub verify_required: bool,
-    /// Path to trusted CA certificate file (`ca-file`).
+    /// `ca-file`: a PEM bundle, or `@system-ca` for the system's.
     pub ca_file: Option<std::path::PathBuf>,
-    /// Client certificate and private key file for mutual TLS (`crt`).
+    /// `crl-file`: PEM-encoded revocation lists.
+    pub crl_file: Option<std::path::PathBuf>,
+    /// `crt`: the client certificate and its key, in one PEM file.
     pub client_crt: Option<std::path::PathBuf>,
-    /// Explicit ALPN protocol list (defaults to `["http/1.1"]`).
+    /// `alpn`, in order. Empty offers nothing, as `HAProxy` offers nothing without it.
     pub alpn: Vec<Vec<u8>>,
-    /// Explicit SNI override or server hostname.
-    pub sni: Option<String>,
+    /// `ssl-min-ver`.
+    pub min_ver: Option<ibex_config::TlsVersion>,
+    /// `ssl-max-ver`.
+    pub max_ver: Option<ibex_config::TlsVersion>,
+    /// `no-ssl-reuse`: never resume a session.
+    pub no_reuse: bool,
 }
 
 impl Default for BackendTlsOptions {
@@ -267,64 +274,237 @@ impl Default for BackendTlsOptions {
         Self {
             verify_required: true,
             ca_file: None,
+            crl_file: None,
             client_crt: None,
-            alpn: vec![b"http/1.1".to_vec()],
-            sni: None,
+            alpn: Vec::new(),
+            min_ver: None,
+            max_ver: None,
+            no_reuse: false,
         }
     }
 }
 
-/// Builds a [`ClientConfig`] for outbound backend connections from [`BackendTlsOptions`].
+/// The protocol versions a server line allows, out of those this build of rustls speaks
+/// (TLS 1.3, and TLS 1.2 when the `tls12` feature is on).
+fn protocol_versions(options: &BackendTlsOptions) -> Vec<&'static rustls::SupportedProtocolVersion> {
+    use ibex_config::TlsVersion;
+    let allowed = |v: TlsVersion| options.min_ver.is_none_or(|m| m <= v) && options.max_ver.is_none_or(|m| v <= m);
+    rustls::DEFAULT_VERSIONS
+        .iter()
+        .copied()
+        .filter(|v| match v.version {
+            rustls::ProtocolVersion::TLSv1_2 => allowed(TlsVersion::Tls12),
+            rustls::ProtocolVersion::TLSv1_3 => allowed(TlsVersion::Tls13),
+            _ => false,
+        })
+        .collect()
+}
+
+/// What this build of rustls speaks, for the error when a server line allows none of it.
+fn spoken_versions() -> String {
+    rustls::DEFAULT_VERSIONS
+        .iter()
+        .map(|v| format!("{:?}", v.version))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Loads `path` as the trust anchors of a server line: `@system-ca` is the system's
+/// bundle (`HAProxy` warns and loads nothing when it is empty).
 ///
 /// # Errors
-/// Returns an error if CA / client certificate loading fails or protocol configuration errors.
+/// A bundle that cannot be read, or holds no certificate.
+pub fn load_server_ca(path: &std::path::Path) -> Result<RootCertStore, String> {
+    if path.as_os_str() == "@system-ca" {
+        return Ok(load_system_ca_roots());
+    }
+    load_ca_file(path)
+}
+
+/// Loads the PEM-encoded CRLs of a `crl-file`.
+fn load_crl_file(path: &std::path::Path) -> Result<Vec<rustls::pki_types::CertificateRevocationListDer<'static>>, String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("Couldn't open the crl-file '{}' ({e})", path.display()))?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut crls = Vec::new();
+    for item in rustls_pemfile::read_all(&mut reader) {
+        let item = item.map_err(|e| format!("Failed to read PEM in {}: {e}", path.display()))?;
+        if let rustls_pemfile::Item::Crl(crl) = item {
+            crls.push(crl);
+        }
+    }
+    if crls.is_empty() {
+        return Err(format!("No CRL found in {}", path.display()));
+    }
+    Ok(crls)
+}
+
+/// `ssl_sock_srv_hostcheck` (`src/ssl_sock.c`): does the certificate name `pattern` cover
+/// `hostname`? Case-insensitive; one `*` is allowed, in the leftmost label only, and
+/// covers one label (RFC 6125 6.4.3).
+#[must_use]
+pub fn hostcheck(pattern: &str, hostname: &str) -> bool {
+    if pattern.eq_ignore_ascii_case(hostname) {
+        return true;
+    }
+    // The leftmost label of the pattern, which must end in a dot.
+    let Some(pattern_dot) = pattern.find('.') else { return false };
+    let left = &pattern[..pattern_dot];
+    let mut stars = left.match_indices('*');
+    let Some((wild, _)) = stars.next() else { return false };
+    if stars.next().is_some() {
+        return false;
+    }
+    // Every label but the leftmost must match.
+    let Some(hostname_dot) = hostname.find('.') else { return false };
+    if !pattern[pattern_dot..].eq_ignore_ascii_case(&hostname[hostname_dot..]) {
+        return false;
+    }
+    // The leftmost label of the hostname must be long enough for the wildcard to match.
+    let hleft = &hostname[..hostname_dot];
+    let prefix = &left[..wild];
+    let suffix = &left[wild + 1..];
+    if hleft.len() < prefix.len() + suffix.len() {
+        return false;
+    }
+    hleft[..prefix.len()].eq_ignore_ascii_case(prefix) && hleft[hleft.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+}
+
+/// `ssl_sock_srv_verifycbk`'s name rule: `name` against the dNSName SANs, or against the
+/// subject CN when the certificate has no dNSName at all.
+fn cert_covers_name(der: &[u8], name: &str) -> bool {
+    let sans = extract_dns_sans(der);
+    if !sans.is_empty() {
+        return sans.iter().any(|san| hostcheck(san, name));
+    }
+    extract_subject_cn(der).is_some_and(|cn| hostcheck(&cn, name))
+}
+
+/// The server certificate check of a `verify required` server line, with `HAProxy`'s
+/// rules (`ssl_sock_srv_verifycbk`, `src/ssl_sock.c`) rather than webpki's.
+///
+/// The chain is verified by webpki against the `ca-file` anchors (and `crl-file`). The
+/// name is where the two differ: `HAProxy` checks it only against the SNI it sent or, when
+/// it sent none, against `verifyhost`, and not at all when neither is set; and it falls
+/// back to the subject CN when the certificate has no dNSName, which webpki never does.
+/// The engine encodes that in the [`ServerName`] it connects with: a DNS name is the name
+/// to check (and send, unless the config's `enable_sni` is off), the server's IP address
+/// means "no name to check". Measured on 3.5-dev8: a CN-only certificate passes a matching
+/// `verifyhost`, and with neither SNI nor `verifyhost` any name passes.
+#[derive(Debug)]
+pub struct ServerVerifier {
+    inner: Arc<rustls::client::WebPkiServerVerifier>,
+}
+
+impl ServerVerifier {
+    /// Builds the verifier of a server line.
+    ///
+    /// # Errors
+    /// No `ca-file` (`HAProxy`: "verify is enabled but no CA file specified"), or one
+    /// that cannot be loaded, or a `crl-file` that cannot.
+    pub fn from_options(options: &BackendTlsOptions) -> Result<Arc<Self>, String> {
+        let Some(ca_path) = options.ca_file.as_deref() else {
+            return Err("verify is enabled but no CA file specified".to_string());
+        };
+        let roots = load_server_ca(ca_path)?;
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut builder = rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider);
+        if let Some(crl_path) = options.crl_file.as_deref() {
+            builder = builder.with_crls(load_crl_file(crl_path)?);
+        }
+        let inner = builder.build().map_err(|e| format!("unable to set up certificate verification: {e}"))?;
+        Ok(Arc::new(Self { inner }))
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for ServerVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        use rustls::client::danger::ServerCertVerified;
+        use rustls::{CertificateError, Error};
+        match self.inner.verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now) {
+            // webpki verifies the chain before the name, so a name error means the chain
+            // is good and only HAProxy's name rule is left to apply.
+            Err(Error::InvalidCertificate(CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. })) => {
+                match server_name {
+                    ServerName::IpAddress(_) => Ok(ServerCertVerified::assertion()),
+                    ServerName::DnsName(name) if cert_covers_name(end_entity.as_ref(), name.as_ref()) => {
+                        Ok(ServerCertVerified::assertion())
+                    }
+                    _ => Err(Error::InvalidCertificate(CertificateError::NotValidForName)),
+                }
+            }
+            other => other,
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
+
+/// Builds the [`ClientConfig`] of a server line. `enable_sni` is on; the engine clones
+/// it off for a connection that verifies against `verifyhost` without sending a name.
+///
+/// # Errors
+/// `verify required` without a loadable `ca-file`, a `crl-file` or `crt` that cannot be
+/// loaded, or a version range with nothing in it.
 pub fn build_backend_client_config(
     options: &BackendTlsOptions,
 ) -> Result<Arc<ClientConfig>, String> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut config = if options.verify_required {
-        let root_store = if let Some(ref ca_path) = options.ca_file {
-            load_ca_file(ca_path)?
-        } else {
-            load_system_ca_roots()
-        };
-        let builder = ClientConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
-            .map_err(|e| format!("Protocol version error: {e:?}"))?
-            .with_root_certificates(root_store);
-
-        if let Some(ref crt_path) = options.client_crt {
-            let (certs, key) = load_cert_file(crt_path)?;
-            builder
-                .with_client_auth_cert(certs, key)
-                .map_err(|e| format!("Client auth config error: {e:?}"))?
-        } else {
-            builder.with_no_client_auth()
-        }
-    } else {
-        let verifier = NoServerAuth::new();
-        let builder = ClientConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
-            .map_err(|e| format!("Protocol version error: {e:?}"))?
-            .dangerous()
-            .with_custom_certificate_verifier(verifier);
-
-        if let Some(ref crt_path) = options.client_crt {
-            let (certs, key) = load_cert_file(crt_path)?;
-            builder
-                .with_client_auth_cert(certs, key)
-                .map_err(|e| format!("Client auth config error: {e:?}"))?
-        } else {
-            builder.with_no_client_auth()
-        }
-    };
-
-    if options.alpn.is_empty() {
-        config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    } else {
-        config.alpn_protocols.clone_from(&options.alpn);
+    let versions = protocol_versions(options);
+    if versions.is_empty() {
+        return Err(format!(
+            "no TLS version is left between 'ssl-min-ver' and 'ssl-max-ver': this build speaks {}",
+            spoken_versions()
+        ));
     }
-
+    let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> = if options.verify_required {
+        ServerVerifier::from_options(options)?
+    } else {
+        NoServerAuth::new()
+    };
+    let builder = ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&versions)
+        .map_err(|e| format!("Protocol version error: {e:?}"))?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier);
+    let mut config = if let Some(ref crt_path) = options.client_crt {
+        let (certs, key) = load_cert_file(crt_path)?;
+        builder
+            .with_client_auth_cert(certs, key)
+            .map_err(|e| format!("unable to load SSL certificate from file '{}': {e}", crt_path.display()))?
+    } else {
+        builder.with_no_client_auth()
+    };
+    config.alpn_protocols.clone_from(&options.alpn);
+    if options.no_reuse {
+        config.resumption = rustls::client::Resumption::disabled();
+    }
     Ok(Arc::new(config))
 }
 

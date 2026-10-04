@@ -46,21 +46,20 @@ fn backend_client_config_with_ca(ca_pem: &str) -> (Arc<ClientConfig>, tempfile::
     let opts = BackendTlsOptions {
         verify_required: true,
         ca_file: Some(temp.path().to_path_buf()),
-        client_crt: None,
         alpn: vec![b"http/1.1".to_vec()],
-        sni: None,
+        ..Default::default()
     };
     let cfg = build_backend_client_config(&opts).expect("build backend config");
     (cfg, temp)
 }
 
+/// `ca-file @system-ca`: the system's bundle, which does not know a test CA.
 fn backend_client_config_system_ca() -> Arc<ClientConfig> {
     let opts = BackendTlsOptions {
         verify_required: true,
-        ca_file: None,
-        client_crt: None,
+        ca_file: Some("@system-ca".into()),
         alpn: vec![b"http/1.1".to_vec()],
-        sni: None,
+        ..Default::default()
     };
     build_backend_client_config(&opts).expect("build backend config")
 }
@@ -68,10 +67,8 @@ fn backend_client_config_system_ca() -> Arc<ClientConfig> {
 fn backend_client_config_verify_none() -> Arc<ClientConfig> {
     let opts = BackendTlsOptions {
         verify_required: false,
-        ca_file: None,
-        client_crt: None,
         alpn: vec![b"http/1.1".to_vec()],
-        sni: None,
+        ..Default::default()
     };
     build_backend_client_config(&opts).expect("build backend config")
 }

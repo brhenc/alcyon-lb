@@ -66,6 +66,97 @@ thread_local! {
     static RES_HTX: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
 }
 
+/// What an idle server connection is pooled under. `HAProxy` keys a server's idle
+/// connections by a hash of what shaped them (`conn_calculate_hash`): for TLS that is
+/// the SNI, so a connection opened for one name never carries a request for another.
+/// A plaintext connection is keyed by address alone, as before T113; a TLS one by the
+/// server line it belongs to (two backends may name one address with different TLS
+/// settings) and the name it was opened with.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct IdleKey {
+    pub addr: SocketAddr,
+    /// `(backend, server, SNI)` of a TLS connection.
+    pub tls: Option<(usize, usize, Option<String>)>,
+}
+
+/// An idle server connection: its socket and, for TLS, its session.
+#[derive(Debug)]
+pub struct IdleConn {
+    pub fd: OwnedFd,
+    pub xprt: crate::xprt::ServerXprt,
+}
+
+/// The idle server connections of a worker.
+pub type IdlePool = HashMap<IdleKey, Vec<IdleConn>>;
+
+/// Attaches the freshly connected `srv_fd` to `sess` with the transport the server line
+/// `proxies[be_idx].servers[s_idx]` asks for: plaintext, or TLS with the SNI its
+/// expression gives over this stream. This is where `server ... ssl` reaches the data
+/// path (T113). A TLS session that cannot be set up is a connect failure.
+fn attach_server_to(
+    sess: &mut TcpSession,
+    proxies: &[Proxy],
+    fe_idx: usize,
+    be_idx: usize,
+    s_idx: Option<usize>,
+    srv_fd: OwnedFd,
+    now: Tick,
+) -> bool {
+    let tls = s_idx.and_then(|i| proxies.get(be_idx).and_then(|p| p.server_tls.get(i)).and_then(Option::as_ref));
+    let Some(tls) = tls else {
+        sess.attach_server(srv_fd, now);
+        return true;
+    };
+    let (fe, be) = (&proxies[fe_idx], &proxies[be_idx]);
+    let sni = tls.sni(sample_registry(), &stream_sample_ctx(sess, fe, be, &ProxiesView(proxies)));
+    let ip = s_idx.and_then(|i| be.servers.get(i)).map_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), SocketAddr::ip);
+    match tls.connect(&srv_fd, sni.as_deref(), ip) {
+        Ok(xprt) => {
+            sess.attach_server_with_xprt(srv_fd, xprt, now);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// The SNI a request on `sess` would send to `proxies[be_idx].servers[s_idx]`, for the
+/// idle pool's key and for deciding whether the connection in hand can carry it.
+fn server_sni(sess: &TcpSession, proxies: &[Proxy], fe_idx: usize, be_idx: usize, s_idx: Option<usize>) -> Option<String> {
+    let tls = s_idx.and_then(|i| proxies.get(be_idx).and_then(|p| p.server_tls.get(i)).and_then(Option::as_ref))?;
+    tls.sni(sample_registry(), &stream_sample_ctx(sess, &proxies[fe_idx], &proxies[be_idx], &ProxiesView(proxies)))
+}
+
+/// The pool key of a connection to `proxies[be_idx].servers[s_idx]` opened with `sni`.
+fn idle_key(proxies: &[Proxy], addr: SocketAddr, be_idx: usize, s_idx: Option<usize>, sni: Option<String>) -> IdleKey {
+    let is_tls = s_idx.is_some_and(|i| proxies.get(be_idx).and_then(|p| p.server_tls.get(i)).is_some_and(Option::is_some));
+    IdleKey { addr, tls: is_tls.then(|| (be_idx, s_idx.unwrap_or(0), sni)) }
+}
+
+/// Builds the TLS of every server of `proxy` from its section (`servers`). Done once per
+/// proxy at load, as `ssl_sock_prepare_srv_ctx` is, so a missing `ca-file` or `crt` is
+/// a load error and `ibex -c` reports it.
+fn attach_server_tls(proxy: &mut Proxy, servers: &[ibex_config::Server], mode_http: bool, section: &str) -> io::Result<()> {
+    proxy.server_tls.clear();
+    proxy.server_check_tls.clear();
+    // A backend with no TLS server anywhere keeps both maps empty; indexing is by
+    // `.get(i)`, which reads an empty map as "all plaintext". So 60,000 plaintext
+    // servers cost nothing here -- the memory-bound tests stay where they were.
+    if !servers.iter().any(|s| s.ssl.as_deref().is_some_and(|x| x.ssl || x.check_uses_tls(s.check_port))) {
+        return Ok(());
+    }
+    proxy.server_tls.resize_with(servers.len(), || None);
+    proxy.server_check_tls.resize_with(servers.len(), || None);
+    for (i, s) in servers.iter().enumerate() {
+        if !s.ssl.as_deref().is_some_and(|x| x.ssl || x.check_uses_tls(s.check_port)) {
+            continue;
+        }
+        let who = format!("'server {}/{}'", section, s.id);
+        proxy.server_tls[i] = crate::srv_tls::ServerTls::from_server(s, mode_http, &who)?.map(Arc::new);
+        proxy.server_check_tls[i] = crate::srv_tls::CheckTls::from_server(s, &who)?.map(Arc::new);
+    }
+    Ok(())
+}
+
 #[inline]
 fn millis_to_u32(d: Duration) -> u32 {
     u32::try_from(d.as_millis()).unwrap_or(u32::MAX)
@@ -170,6 +261,11 @@ pub struct Proxy {
     pub server_maxconn: Vec<Option<u32>>,
     pub server_actconn: Arc<Vec<AtomicU32>>,
     pub server_check_configs: Vec<Option<ServerCheckConfig>>,
+    /// Each server's TLS (`server ... ssl`), `None` for a plaintext one (T113).
+    pub server_tls: Vec<Option<Arc<crate::srv_tls::ServerTls>>>,
+    /// Each server's health-check TLS (`check-ssl`, or `ssl` inherited), `None` for
+    /// plaintext checks.
+    pub server_check_tls: Vec<Option<Arc<crate::srv_tls::CheckTls>>>,
     pub tcp_req_conn_rules: Vec<ibex_config::TcpReqConnRule>,
     pub tcp_req_session_rules: Vec<ibex_config::TcpReqSessionRule>,
     pub tcp_req_content_rules: Vec<ibex_config::TcpReqContentRule>,
@@ -524,7 +620,7 @@ pub struct Engine {
     /// Global HTTP/2 flood mitigation configuration.
     pub global_h2_flood_config: ibex_proto::H2FloodConfig,
     /// Shared idle backend connection pool across sessions (`http-reuse`).
-    pub idle_backend_pool: HashMap<SocketAddr, Vec<OwnedFd>>,
+    pub idle_backend_pool: IdlePool,
     /// Stop requests from signals, shared by every worker. `None` in tests and embeddings
     /// that drive the engine directly and stop it with [`Engine::stop`].
     lifecycle: Option<crate::lifecycle::Lifecycle>,
@@ -1005,6 +1101,20 @@ pub fn validate_tls(config: &Config) -> io::Result<()> {
             bind_tls(&l.name, &l.binds, bind.addr)?;
         }
     }
+    // Servers: `ca-file`, `crl-file` and `crt` are opened, and the `sni` expression
+    // parsed, as `ssl_sock_prepare_srv_ctx` does at load.
+    let servers = config
+        .listens
+        .iter()
+        .map(|l| (&l.name, &l.servers, l.mode))
+        .chain(config.backends.iter().map(|b| (&b.name, &b.servers, b.mode)));
+    for (name, servers, mode) in servers {
+        for s in servers {
+            let who = format!("'server {}/{}'", name, s.id);
+            crate::srv_tls::ServerTls::from_server(s, mode == Mode::Http, &who)?;
+            crate::srv_tls::CheckTls::from_server(s, &who)?;
+        }
+    }
     Ok(())
 }
 
@@ -1175,6 +1285,8 @@ fn init_proxy_from_listen(proxy_idx: usize, listen: &ibex_config::ListenSection,
         server_maxconn: listen.servers.iter().map(|s| s.maxconn).collect(),
         server_actconn: Arc::new((0..server_count).map(|_| AtomicU32::new(0)).collect()),
         server_check_configs,
+        server_tls: Vec::new(),
+        server_check_tls: Vec::new(),
         tcp_req_conn_rules: listen.tcp_req_conn_rules.clone(),
         tcp_req_session_rules: listen.tcp_req_session_rules.clone(),
         tcp_req_content_rules: listen.tcp_req_content_rules.clone(),
@@ -1268,6 +1380,8 @@ fn init_proxy_from_frontend(proxy_idx: usize, fe: &ibex_config::FrontendSection,
         server_maxconn: Vec::new(),
         server_actconn: std::sync::Arc::new(Vec::new()),
         server_check_configs: Vec::new(),
+        server_tls: Vec::new(),
+        server_check_tls: Vec::new(),
         tcp_req_conn_rules: fe.tcp_req_conn_rules.clone(),
         tcp_req_session_rules: fe.tcp_req_session_rules.clone(),
         tcp_req_content_rules: fe.tcp_req_content_rules.clone(),
@@ -1383,6 +1497,8 @@ fn init_proxy_from_backend(proxy_idx: usize, be: &ibex_config::BackendSection, n
         server_maxconn: be.servers.iter().map(|s| s.maxconn).collect(),
         server_actconn: Arc::new((0..server_count).map(|_| AtomicU32::new(0)).collect()),
         server_check_configs,
+        server_tls: Vec::new(),
+        server_check_tls: Vec::new(),
         tcp_req_conn_rules: Vec::new(),
         tcp_req_session_rules: Vec::new(),
         tcp_req_content_rules: be.tcp_req_content_rules.clone(),
@@ -1421,6 +1537,7 @@ fn init_checks(proxies: &[Proxy], scheduler: &mut Scheduler, now: Tick) -> Vec<S
                 continue;
             };
             let mut check = ServerCheckState::new(proxy_idx, server_idx, srv_addr, check_cfg, now);
+            check.tls = proxy.server_check_tls.get(server_idx).cloned().flatten();
             let check_idx = usize_to_u32(checks.len());
             if let Some(task_ref) = scheduler.create(WorkKind::new(Kind::Check, check_idx)) {
                 check.task = task_ref;
@@ -1466,10 +1583,18 @@ impl Engine {
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     let mut proxies = Vec::new();
     for listen in &config.listens {
-        if !listen.disabled { proxies.push(init_proxy_from_listen(proxies.len(), listen, nbthread)); }
+        if !listen.disabled {
+            let mut p = init_proxy_from_listen(proxies.len(), listen, nbthread);
+            attach_server_tls(&mut p, &listen.servers, listen.mode == Mode::Http, &listen.name)?;
+            proxies.push(p);
+        }
     }
     for backend in &config.backends {
-        if !backend.disabled { proxies.push(init_proxy_from_backend(proxies.len(), backend, nbthread)); }
+        if !backend.disabled {
+            let mut p = init_proxy_from_backend(proxies.len(), backend, nbthread);
+            attach_server_tls(&mut p, &backend.servers, backend.mode == Mode::Http, &backend.name)?;
+            proxies.push(p);
+        }
     }
     for frontend in &config.frontends {
         if !frontend.disabled { proxies.push(init_proxy_from_frontend(proxies.len(), frontend, nbthread)); }
@@ -3517,10 +3642,14 @@ fn init_client_session(
 
             if let Ok((srv_fd, immediate)) = raw::connect(connect_addr(target, sess.server_addr)) {
                 let sfd = srv_fd.as_raw_fd();
-                srv_raw_fd = Some(sfd);
-                sess.attach_server(srv_fd, now);
-                if immediate {
-                    sess.server_connected(now);
+                let s_idx = proxy.servers.iter().position(|&s| s == target);
+                if attach_server_to(&mut sess, proxies, proxy_idx, proxy_idx, s_idx, srv_fd, now) {
+                    srv_raw_fd = Some(sfd);
+                    if immediate {
+                        sess.server_connected(now);
+                    }
+                } else {
+                    sess.srv_state = ScState::Error;
                 }
             } else {
                 proxy.stats[worker_id()].failed_conn.fetch_add(1, Ordering::Relaxed);
@@ -3702,7 +3831,7 @@ struct EngineDispatcher<'a> {
     /// Shared read-only: the sockets live on the `Engine`, proxies index into this.
     log_targets: &'a [SyslogTarget],
     log_tag: &'a str,
-    idle_backend_pool: &'a mut HashMap<SocketAddr, Vec<OwnedFd>>,
+    idle_backend_pool: &'a mut IdlePool,
 }
 
 /// Answers the current request with the page for `status`, chosen as HAProxy's
@@ -3738,7 +3867,7 @@ fn release_server(
     proxies: &[Proxy],
     fdtab: &mut FdTab,
     poller: &mut Poller,
-    idle_pool: &mut HashMap<SocketAddr, Vec<OwnedFd>>,
+    idle_pool: &mut IdlePool,
     reusable: bool,
 ) {
     if let Some(srv_fd) = entry.sess.srv.take() {
@@ -3750,16 +3879,22 @@ fn release_server(
             && matches!(entry.sess.srv_state, ScState::Ready | ScState::Established)
             // A connection that opened with a PROXY header speaks for this client only.
             && !entry.sess.send_proxy_prepended
-            // The pool holds bare sockets; a TLS session's state does not go with them.
-            && !entry.sess.srv_xprt.is_tls()
+            // A TLS session goes to the pool with its socket, once it is established.
+            && entry.sess.srv_xprt.is_ready()
             && proxies
                 .get(entry.srv_backend_idx)
                 .is_some_and(|p| p.http_reuse != ibex_config::HttpReuse::Never)
             && raw::is_idle_conn_alive(srv_fd.as_fd());
         // The pool is keyed by server; a server that maps the destination may have been
         // connected anywhere, so its connections are not pooled.
+        let xprt = std::mem::replace(&mut entry.sess.srv_xprt, crate::xprt::ServerXprt::Plain);
         if let (true, Some(addr)) = (reusable, entry.target_addr.filter(|&a| !maps_destination(a))) {
-            idle_pool.entry(addr).or_default().push(srv_fd);
+            let sni = xprt.sni().map(str::to_string);
+            let key = idle_key(proxies, addr, entry.srv_backend_idx, entry.target_server_idx, sni);
+            idle_pool.entry(key).or_default().push(IdleConn { fd: srv_fd, xprt });
+        } else {
+            let mut xprt = xprt;
+            xprt.send_close_notify(srv_fd.as_fd());
         }
     }
     entry.srv_raw_fd = None;
@@ -3785,7 +3920,7 @@ fn close_http_session(
     proxies: &[Proxy],
     fdtab: &mut FdTab,
     poller: &mut Poller,
-    idle_pool: &mut HashMap<SocketAddr, Vec<OwnedFd>>,
+    idle_pool: &mut IdlePool,
     reusable: bool,
 ) {
     // A transaction that ends with its connection, not through `end_txn` (cut short by
@@ -3856,8 +3991,14 @@ fn retry_server_connect(
     entry.target_addr = Some(target_addr);
     if let Ok((srv_fd, immediate)) = raw::connect(connect_addr(target_addr, entry.sess.server_addr)) {
         let sfd = srv_fd.as_raw_fd();
+        if !attach_server_to(&mut entry.sess, proxies, entry.proxy_idx, be_idx, s_idx, srv_fd, now) {
+            entry.sess.srv_state = ScState::Error;
+            if entry.sess.mode == Mode::Http {
+                reply_error(entry, proxies, 503);
+            }
+            return;
+        }
         entry.srv_raw_fd = Some(sfd);
-        entry.sess.attach_server(srv_fd, now);
         if immediate {
             entry.sess.server_connected(now);
             let (_, srv_want) = entry.sess.interests();
@@ -4142,7 +4283,7 @@ impl EngineDispatcher<'_> {
         pid: u32,
         fdtab: &mut FdTab,
         poller: &mut Poller,
-        idle_pool: &mut HashMap<SocketAddr, Vec<OwnedFd>>,
+        idle_pool: &mut IdlePool,
         wake_queue: &mut Vec<TaskRef>,
         now: Tick,
     ) -> Option<crate::stats_html::AdminAction> {
@@ -4376,7 +4517,7 @@ impl EngineDispatcher<'_> {
         proxies: &mut [Proxy],
         fdtab: &mut FdTab,
         poller: &mut Poller,
-        idle_pool: &mut HashMap<SocketAddr, Vec<OwnedFd>>,
+        idle_pool: &mut IdlePool,
         wake_queue: &mut Vec<TaskRef>,
         now: Tick,
         pid: u32,
@@ -4456,6 +4597,29 @@ impl EngineDispatcher<'_> {
             // Step 3: Stream engine process pass
             if !entry.sess.is_done() {
                 let _ = entry.sess.process(now);
+            }
+
+            // Step 3.1: a TLS handshake with the server that failed (certificate refused,
+            // a peer not speaking TLS) is a connect failure: `HAProxy` retries it and,
+            // out of retries, answers 503 `SC` (measured: `ssl verify required` against
+            // a certificate the SNI does not match, "0/0/-1/-1/1 503 ... SC-- ... /3").
+            if entry.sess.srv_xprt.handshake_failed() && entry.sess.srv_state == ScState::Error {
+                if let (Some(fd), Some(sfd)) = (entry.sess.srv.as_ref(), entry.srv_raw_fd.take()) {
+                    let _ = self.poller.delete(fd.as_fd());
+                    self.fdtab.remove(sfd);
+                }
+                entry.sess.srv_xprt = crate::xprt::ServerXprt::Plain;
+                entry.sess.ending = None;
+                let be_idx = Self::resolve_backend(entry, self.proxies);
+                self.proxies[be_idx].stats[worker_id()].failed_conn.fetch_add(1, Ordering::Relaxed);
+                if entry.sess.server_failed() {
+                    retry_server_connect(entry, self.proxies, self.fdtab, self.poller, now);
+                } else {
+                    entry.sess.srv_state = ScState::Error;
+                    if entry.sess.mode == Mode::Http {
+                        reply_error(entry, self.proxies, 503);
+                    }
+                }
             }
 
             // Step 3.4: Content inspection for TCP rules (or before HTTP request parsing)
@@ -5147,7 +5311,7 @@ impl EngineDispatcher<'_> {
         pid: u32,
         fdtab: &mut FdTab,
         poller: &mut Poller,
-        idle_pool: &mut HashMap<SocketAddr, Vec<OwnedFd>>,
+        idle_pool: &mut IdlePool,
         now: Tick,
     ) -> Option<crate::stats_html::AdminAction> {
         let proxy_idx = entry.proxy_idx;
@@ -5994,6 +6158,11 @@ impl EngineDispatcher<'_> {
             let same = entry.srv_backend_idx == be_idx
                 && entry.target_addr == Some(target_addr)
                 && !maps_destination(target_addr)
+                // A TLS connection carries the name it was opened with; a request whose
+                // SNI differs (another Host, under the automatic SNI) needs its own.
+                && (!entry.sess.srv_xprt.is_tls()
+                    || server_sni(&entry.sess, proxies, entry.proxy_idx, be_idx, entry.target_server_idx).as_deref()
+                        == entry.sess.srv_xprt.sni())
                 // A connection opened with a PROXY header carries only requests that would
                 // send that same header: HAProxy hashes it into the reuse key, so a
                 // per-request unique-id TLV gets a connection of its own.
@@ -6030,22 +6199,24 @@ impl EngineDispatcher<'_> {
 
         entry.target_addr = Some(target_addr);
 
-        let mut reused_fd = None;
+        let mut reused = None;
         if proxies[be_idx].http_reuse != ibex_config::HttpReuse::Never {
-            if let Some(pool) = idle_pool.get_mut(&target_addr) {
+            let sni = server_sni(&entry.sess, proxies, entry.proxy_idx, be_idx, s_idx);
+            let key = idle_key(proxies, target_addr, be_idx, s_idx, sni);
+            if let Some(pool) = idle_pool.get_mut(&key) {
                 while let Some(candidate) = pool.pop() {
-                    if raw::is_idle_conn_alive(candidate.as_fd()) {
-                        reused_fd = Some(candidate);
+                    if raw::is_idle_conn_alive(candidate.fd.as_fd()) {
+                        reused = Some(candidate);
                         break;
                     }
                 }
             }
         }
 
-        if let Some(srv_fd) = reused_fd {
+        if let Some(IdleConn { fd: srv_fd, xprt }) = reused {
             let sfd = srv_fd.as_raw_fd();
             entry.srv_raw_fd = Some(sfd);
-            entry.sess.attach_server(srv_fd, now);
+            entry.sess.attach_server_with_xprt(srv_fd, xprt, now);
             entry.sess.server_connected(now);
             if let Some(txn) = entry.sess.txn.as_mut() {
                 txn.srv_reused = true;
@@ -6074,8 +6245,12 @@ impl EngineDispatcher<'_> {
             }
         } else if let Ok((srv_fd, immediate)) = raw::connect(connect_addr(target_addr, entry.sess.server_addr)) {
             let sfd = srv_fd.as_raw_fd();
+            if !attach_server_to(&mut entry.sess, proxies, entry.proxy_idx, be_idx, s_idx, srv_fd, now) {
+                proxies[be_idx].stats[worker_id()].failed_conn.fetch_add(1, Ordering::Relaxed);
+                retry_server_connect(entry, proxies, fdtab, poller, now);
+                return None;
+            }
             entry.srv_raw_fd = Some(sfd);
-            entry.sess.attach_server(srv_fd, now);
             if immediate {
                 entry.sess.server_connected(now);
                 let (_, srv_want) = entry.sess.interests();
@@ -6188,8 +6363,11 @@ impl EngineDispatcher<'_> {
         entry.target_addr = Some(target_addr);
         if let Ok((srv_fd, immediate)) = raw::connect(connect_addr(target_addr, entry.sess.server_addr)) {
             let sfd = srv_fd.as_raw_fd();
+            if !attach_server_to(&mut entry.sess, proxies, entry.proxy_idx, be_idx, s_idx, srv_fd, now) {
+                entry.sess.srv_state = ScState::Error;
+                return;
+            }
             entry.srv_raw_fd = Some(sfd);
-            entry.sess.attach_server(srv_fd, now);
             if immediate {
                 entry.sess.server_connected(now);
                 fdtab.set_ready(sfd, false, true);

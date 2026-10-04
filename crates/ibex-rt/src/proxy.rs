@@ -403,7 +403,10 @@ impl TcpSession {
         } else {
             ScState::Established
         };
-        self.conn_exp = Tick::ETERNITY;
+        // A TLS handshake still to run stays under `timeout connect` (see `process_srv_io`).
+        if self.srv_xprt.is_ready() {
+            self.conn_exp = Tick::ETERNITY;
+        }
         self.arm_server(now);
         self.log.connect = Some(std::time::Instant::now());
         // `AN_RES_INSPECT` runs from here, before any of the response has arrived.
@@ -1243,12 +1246,16 @@ impl TcpSession {
                 .ok_or_else(|| io::Error::from(io::ErrorKind::NotConnected))?;
             match self.srv_xprt.handshake(sfd) {
                 Ok(true) => {
+                    // The connection is established only now: `timeout connect` covered
+                    // the handshake (HAProxy: a TLS handshake that hangs is a connect
+                    // timeout), and the server timer starts here.
+                    self.conn_exp = Tick::ETERNITY;
                     changed = true;
                 }
                 Ok(false) => {}
                 Err(e) => {
+                    // A connect failure, which the engine retries (`srv_xprt.handshake_failed`).
                     self.srv_state = ScState::Error;
-                    self.ending.get_or_insert(Ending::Error);
                     return Err(e);
                 }
             }
@@ -1262,7 +1269,10 @@ impl TcpSession {
                     .as_ref()
                     .map(AsFd::as_fd)
                     .ok_or_else(|| io::Error::from(io::ErrorKind::NotConnected))?;
-                self.srv_xprt.send(sfd, &self.req.readable()[..window])?
+                match self.srv_xprt.send(sfd, &self.req.readable()[..window]) {
+                    Err(e) if e.kind() == io::ErrorKind::InvalidData && self.srv_xprt.is_ready() => Io::Closed,
+                    r => r?,
+                }
             };
             match r {
                 Io::Done(n) if n > 0 => {
@@ -1292,7 +1302,16 @@ impl TcpSession {
                     .ok_or_else(|| io::Error::from(io::ErrorKind::NotConnected))?;
                 let dst = self.rep.writable();
                 let asked = dst.len();
-                let r = self.srv_xprt.recv(sfd, dst)?;
+                // A TLS protocol error *after* the handshake (a post-handshake alert,
+                // such as a server that wanted a client certificate and the TLS 1.3
+                // handshake completed on our side first) is the server hanging up:
+                // HAProxy logs `SH` and answers 502. A failure *during* the handshake is
+                // a connect failure instead, which the engine retries (`handshake_failed`),
+                // so it is left to propagate.
+                let r = match self.srv_xprt.recv(sfd, dst) {
+                    Err(e) if e.kind() == io::ErrorKind::InvalidData && self.srv_xprt.is_ready() => Io::Closed,
+                    r => r?,
+                };
                 self.srv_cant_recv = self.mode == Mode::Http && !self.srv_xprt.is_tls() && drained(r, asked);
                 r
             };
@@ -1456,6 +1475,7 @@ impl TcpSession {
 
     fn conn_timer_live(&self) -> bool {
         self.srv_state == ScState::Connecting
+            || (matches!(self.srv_state, ScState::Ready | ScState::Established) && self.srv_xprt.is_tls() && !self.srv_xprt.is_ready())
     }
 
     fn cli_timer_live(&self) -> bool {

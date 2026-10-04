@@ -68,6 +68,10 @@ pub struct TlsConn {
     /// can inject a TCP FIN ends the stream early, and a proxy that reports it as a clean
     /// end will forward a partial body as though it were complete.
     truncated: bool,
+    /// The handshake failed (a refused certificate, a peer that is not speaking TLS, a
+    /// peer gone mid-handshake). For a server connection this is a connect failure:
+    /// `HAProxy` retries it and answers 503 `SC` when the retries are spent.
+    failed: bool,
 }
 
 impl TlsConn {
@@ -77,7 +81,13 @@ impl TlsConn {
             ctx,
             peer_closed: false,
             truncated: false,
+            failed: false,
         }
+    }
+
+    #[must_use]
+    pub const fn handshake_failed(&self) -> bool {
+        self.failed
     }
 
     fn session(&mut self) -> Option<&mut TlsSession> {
@@ -206,6 +216,17 @@ impl TlsConn {
         if self.ctx.handshake_done {
             return Ok(true);
         }
+        if self.failed {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "TLS handshake failed"));
+        }
+        let r = self.handshake_step(fd);
+        if r.is_err() {
+            self.failed = true;
+        }
+        r
+    }
+
+    fn handshake_step(&mut self, fd: BorrowedFd<'_>) -> io::Result<bool> {
         // Flush first: the very first thing a server does is answer a ClientHello it has
         // already been given, and there may be nothing to read yet.
         self.flush(fd)?;
@@ -442,11 +463,21 @@ impl ServerXprt {
         }
     }
 
+    /// The name sent in SNI, known from the start of the connection.
     #[must_use]
     pub fn sni(&self) -> Option<&str> {
         match self {
             ServerXprt::Plain => None,
-            ServerXprt::Tls(t) => t.ctx.tls_info.sni.as_deref(),
+            ServerXprt::Tls(t) => t.ctx.client_sni.as_deref(),
+        }
+    }
+
+    /// True once the handshake has failed: the connection is not, and will not be, usable.
+    #[must_use]
+    pub fn handshake_failed(&self) -> bool {
+        match self {
+            ServerXprt::Plain => false,
+            ServerXprt::Tls(t) => t.handshake_failed(),
         }
     }
 
@@ -589,6 +620,9 @@ impl std::fmt::Debug for ServerXprt {
 
 /// Builds an outbound client-side TLS transport to connect to an upstream backend server.
 ///
+/// The recorded SNI is the name that goes on the wire: a DNS name when the config sends
+/// SNI, nothing for an IP address (rustls never sends one) or when `enable_sni` is off.
+///
 /// # Errors
 /// Propagates rustls client session setup failure.
 pub fn connect_tls(
@@ -597,11 +631,7 @@ pub fn connect_tls(
     server_name: rustls::pki_types::ServerName<'static>,
 ) -> io::Result<ServerXprt> {
     let sni_str = match &server_name {
-        rustls::pki_types::ServerName::DnsName(dns) => Some(dns.as_ref().to_string()),
-        rustls::pki_types::ServerName::IpAddress(ip) => Some(match ip {
-            rustls::pki_types::IpAddr::V4(v4) => std::net::Ipv4Addr::from(*v4).to_string(),
-            rustls::pki_types::IpAddr::V6(v6) => std::net::Ipv6Addr::from(*v6).to_string(),
-        }),
+        rustls::pki_types::ServerName::DnsName(dns) if config.enable_sni => Some(dns.as_ref().to_string()),
         _ => None,
     };
     let conn = rustls::ClientConnection::new(config, server_name).map_err(io::Error::other)?;

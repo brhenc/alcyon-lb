@@ -17,12 +17,81 @@ pub struct DefaultServerConfig {
     pub maxconn: Option<u32>,
     pub check_port: Option<u16>,
     pub check_proto: Option<String>,
-    pub check_ssl: bool,
+    /// The TLS keywords (`ssl`, `verify`, `sni`, `check-ssl`, ...).
+    pub ssl: ServerSsl,
     /// `proxy-v2-options unique-id`.
     pub proxy_v2_unique_id: bool,
     pub weight: Option<u32>,
     pub backup: bool,
     pub cookie: Option<String>,
+}
+
+/// `verify none|required` on a server line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SslVerify {
+    None,
+    Required,
+}
+
+/// A TLS protocol version rustls speaks (`ssl-min-ver`, `ssl-max-ver`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TlsVersion {
+    Tls12,
+    Tls13,
+}
+
+/// The TLS settings of a `server` line (`src/cfgparse-ssl.c`), for the data path and
+/// for the health checks. Everything here is accepted without `ssl` too, as `HAProxy`
+/// does: it applies once `ssl` (data path) or `check-ssl` (checks) turns TLS on.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ServerSsl {
+    /// `ssl`: the data path is TLS. `no-ssl` undoes an inherited one.
+    pub ssl: bool,
+    /// `verify none|required`. `None` is `HAProxy`'s default, `required`, which needs a
+    /// `ca-file` or the configuration is refused.
+    pub verify: Option<SslVerify>,
+    /// `ca-file <path>`: the trust anchors. `@system-ca` is the system's bundle.
+    pub ca_file: Option<String>,
+    /// `crl-file <path>`.
+    pub crl_file: Option<String>,
+    /// `crt <path>`: the client certificate and its key, in one PEM file.
+    pub crt: Option<String>,
+    /// `sni <expr>`: a sample expression giving the name to send.
+    pub sni: Option<String>,
+    /// `no-sni-auto`: without `sni`, do not send the request's Host header as SNI.
+    pub no_sni_auto: bool,
+    /// `verifyhost <name>`: the name the certificate is checked against when no SNI is sent.
+    pub verifyhost: Option<String>,
+    /// `alpn <protos>`, as written, in order.
+    pub alpn: Vec<String>,
+    /// `ssl-min-ver`, also `force-tlsv1x` / `no-tlsv12`.
+    pub min_ver: Option<TlsVersion>,
+    /// `ssl-max-ver`, also `force-tlsv1x` / `no-tlsv13`.
+    pub max_ver: Option<TlsVersion>,
+    /// `no-ssl-reuse`: no session resumption.
+    pub no_reuse: bool,
+    /// `check-ssl` (`Some(true)`), `no-check-ssl` (`Some(false)`); `None` follows `ssl`
+    /// unless the check has its own `port`.
+    pub check_ssl: Option<bool>,
+    /// `check-sni <name>`.
+    pub check_sni: Option<String>,
+    /// `check-alpn <protos>`.
+    pub check_alpn: Vec<String>,
+    /// `no-check-sni-auto`: without `check-sni`, do not send the `http-check` Host header.
+    pub no_check_sni_auto: bool,
+}
+
+impl ServerSsl {
+    /// Whether the health checks of a server with this configuration and `check_port`
+    /// use TLS: `check-ssl` says so; otherwise they follow `ssl` unless the check has a
+    /// port of its own (`init_srv_check`, `src/check.c`).
+    #[must_use]
+    pub fn check_uses_tls(&self, check_port: Option<u16>) -> bool {
+        match self.check_ssl {
+            Some(explicit) => explicit,
+            None => self.ssl && check_port.is_none(),
+        }
+    }
 }
 
 /// Connection reuse mode for backends (`http-reuse`).
@@ -132,8 +201,9 @@ pub struct Server {
     pub check_port: Option<u16>,
     /// Protocol for health checks (`check-proto`).
     pub check_proto: Option<String>,
-    /// Whether health checks use SSL (`check-ssl`). Always false: `check-ssl` is refused.
-    pub check_ssl: bool,
+    /// The TLS keywords (`ssl`, `verify`, `sni`, `check-ssl`, ...), boxed and absent for
+    /// a plaintext server so 60,000 of them stay cheap (`request_allocations`).
+    pub ssl: Option<Box<ServerSsl>>,
     /// `proxy-v2-options unique-id`: the stream's unique ID goes in the PROXY v2 header
     /// (TLV `PP2_TYPE_UNIQUE_ID`).
     pub proxy_v2_unique_id: bool,
@@ -157,7 +227,7 @@ impl Default for Server {
             backup: false,
             check_port: None,
             check_proto: None,
-            check_ssl: false,
+            ssl: None,
             proxy_v2_unique_id: false,
             cookie: None,
         }
@@ -181,7 +251,7 @@ impl Server {
             backup: false,
             check_port: None,
             check_proto: None,
-            check_ssl: false,
+            ssl: None,
             proxy_v2_unique_id: false,
             cookie: None,
         }
