@@ -293,3 +293,212 @@ fn pool_max_conn_is_checked_at_load_and_no_longer_called_ignored() {
         assert!(text.contains(why), "{bad}: {text}");
     }
 }
+
+// T159 part A: the pools are per server, `pool-purge-delay` and `pool-low-conn`.
+// Measured on HAProxy 3.5-dev8-885761-29 as above (`nbthread 1`, clients 100 ms apart).
+
+/// A backend that numbers its connections, answers `/slow` after 400 ms, and records which
+/// connections were closed by their peer.
+struct Tracked {
+    addr: SocketAddr,
+    closed: Arc<std::sync::Mutex<Vec<usize>>>,
+}
+
+fn tracked_backend() -> Tracked {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind backend");
+    let addr = listener.local_addr().expect("addr");
+    let count = Arc::new(AtomicUsize::new(0));
+    let closed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let closed2 = Arc::clone(&closed);
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let id = count.fetch_add(1, Ordering::SeqCst) + 1;
+            let closed = Arc::clone(&closed2);
+            thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                let mut pending = Vec::new();
+                'conn: loop {
+                    let n = match s.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    pending.extend_from_slice(&buf[..n]);
+                    while let Some(end) = pending.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head: Vec<u8> = pending.drain(..end + 4).collect();
+                        if head.starts_with(b"GET /slow") {
+                            thread::sleep(Duration::from_millis(400));
+                        }
+                        let rsp = format!("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nX-Conn: {id}\r\n\r\n");
+                        if s.write_all(rsp.as_bytes()).is_err() {
+                            break 'conn;
+                        }
+                    }
+                }
+                closed.lock().unwrap().push(id);
+            });
+        }
+    });
+    Tracked { addr, closed }
+}
+
+impl Tracked {
+    fn closed(&self) -> Vec<usize> {
+        let mut v = self.closed.lock().unwrap().clone();
+        v.sort_unstable();
+        v
+    }
+}
+
+/// One request of `path` on `c`: the backend connection that carried it.
+fn request(c: &mut TcpStream, path: &str) -> usize {
+    c.write_all(format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes()).unwrap();
+    let mut resp = Vec::new();
+    let mut buf = [0u8; 4096];
+    while !resp.windows(4).any(|w| w == b"\r\n\r\n") {
+        match c.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => resp.extend_from_slice(&buf[..n]),
+        }
+    }
+    let resp = String::from_utf8_lossy(&resp).to_ascii_lowercase();
+    resp.split("x-conn: ")
+        .nth(1)
+        .and_then(|r| r.split("\r\n").next())
+        .and_then(|n| n.trim().parse().ok())
+        .unwrap_or_else(|| panic!("no answer: {resp:?}"))
+}
+
+/// `n` client connections one after the other, `reqs` requests of `path` each.
+fn clients(fe: SocketAddr, n: usize, reqs: usize, path: &str) -> Vec<Vec<usize>> {
+    (0..n)
+        .map(|_| {
+            let mut c = TcpStream::connect(fe).expect("connect");
+            c.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let seq = (0..reqs).map(|_| request(&mut c, path)).collect();
+            drop(c);
+            thread::sleep(Duration::from_millis(100));
+            seq
+        })
+        .collect()
+}
+
+fn start_with(body: &str) -> (Ibex, SocketAddr) {
+    let fe = common::reserve_addr();
+    let cfg = format!(
+        "global\n  nbthread 1\ndefaults\n  mode http\n  timeout connect 2s\n  timeout client 30s\n  timeout server 30s\n{}",
+        body.replace("{fe}", &fe.to_string())
+    );
+    (start(&cfg, fe), fe)
+}
+
+/// HAProxy keeps idle connections per server (`srv->per_thr[].idle_conns`), and the
+/// connection hash names the server: two backends whose servers share an address do not
+/// take each other's connections.
+#[test]
+fn idle_connections_belong_to_their_server_not_to_its_address() {
+    let be = tracked_backend();
+    let (_ibex, fe) = start_with(&format!(
+        "frontend f\n  bind {{fe}}\n  use_backend b2 if {{ path_beg /b2 }}\n  default_backend b1\n\
+         backend b1\n  http-reuse always\n  server s {a}\nbackend b2\n  http-reuse always\n  server s {a}\n",
+        a = be.addr
+    ));
+    let got: Vec<_> = ["/b1", "/b2", "/b1", "/b2"].iter().map(|p| clients(fe, 1, 1, p)[0][0]).collect();
+    assert_eq!(got, [1, 2, 1, 2]);
+}
+
+/// `pool-purge-delay 0` keeps no idle connection (`srv_add_to_idle_list`), not even for the
+/// next request of the same client; under `never` the connection is the client's alone.
+#[test]
+fn pool_purge_delay_zero_keeps_no_idle_connection() {
+    for (mode, want) in [("always", [[1, 2], [3, 4], [5, 6]]), ("safe", [[1, 2], [3, 4], [5, 6]]), ("never", [[1, 1], [2, 2], [3, 3]])] {
+        let be = tracked_backend();
+        let (_ibex, fe) = start_with(&format!("listen l\n  bind {{fe}}\n  http-reuse {mode}\n  server s {} pool-purge-delay 0\n", be.addr));
+        assert_eq!(clients(fe, 3, 2, "/"), want, "http-reuse {mode}");
+    }
+}
+
+/// Every `pool-purge-delay` the server's estimate of what it needs decays
+/// (`srv_cleanup_idle_conns`: halfway down to the peak since the last purge) and half the
+/// idle connections beyond it, plus one, are closed, oldest first. HAProxy, eight
+/// connections idle after a burst of eight, 500 ms purges: nothing closed at the first two
+/// purges, then 3, 3 and 2. Here with 600 ms purges, sampled between them.
+#[test]
+fn pool_purge_delay_closes_idle_connections_beyond_the_estimate() {
+    let be = tracked_backend();
+    let (_ibex, fe) = start_with(&format!("listen l\n  bind {{fe}}\n  http-reuse always\n  server s {} pool-purge-delay 600\n", be.addr));
+    let burst: Vec<_> = (0..8)
+        .map(|_| {
+            thread::spawn(move || {
+                let mut c = TcpStream::connect(fe).expect("connect");
+                c.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                request(&mut c, "/slow")
+            })
+        })
+        .collect();
+    let mut ids: Vec<usize> = burst.into_iter().map(|t| t.join().unwrap()).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, [1, 2, 3, 4, 5, 6, 7, 8]);
+    let t0 = Instant::now();
+    let at = |ms: u64| thread::sleep(Duration::from_millis(ms).saturating_sub(t0.elapsed()));
+    // Purges at about 0.6 s (estimate 8: none), 1.2 s (4: none), 1.8 s (3), 2.4 s (3), 3.0 s (2).
+    at(1500);
+    assert_eq!(be.closed(), Vec::<usize>::new(), "before the third purge");
+    at(2100);
+    // The oldest idle go first: the order the burst's responses ended in, not their numbers.
+    assert_eq!(be.closed().len(), 3, "after the third purge: {:?}", be.closed());
+    at(2700);
+    assert_eq!(be.closed().len(), 6, "after the fourth purge: {:?}", be.closed());
+    at(3500);
+    assert_eq!(be.closed(), [1, 2, 3, 4, 5, 6, 7, 8]);
+    // Nothing is left to reuse.
+    assert_eq!(clients(fe, 1, 1, "/"), [[9]]);
+}
+
+/// `pool-low-conn` lets a server keep that many idle connections beyond what it was seen to
+/// need (`srv_add_to_idle_list`), and a request takes the oldest idle connection first.
+/// Under `safe`, four clients of one request each open four connections; a fifth client of
+/// four requests then shows what was kept.
+#[test]
+fn pool_low_conn_keeps_idle_connections_beyond_the_estimate() {
+    for (low, closed, last) in [
+        ("", vec![2, 3, 4], [5, 1, 1, 1]),
+        (" pool-low-conn 1", vec![3, 4], [5, 1, 2, 1]),
+        (" pool-low-conn 3", vec![], [5, 1, 2, 3]),
+    ] {
+        let be = tracked_backend();
+        let (_ibex, fe) = start_with(&format!("listen l\n  bind {{fe}}\n  http-reuse safe\n  server s {}{low}\n", be.addr));
+        assert_eq!(clients(fe, 4, 1, "/"), [[1], [2], [3], [4]], "{low}");
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(be.closed(), closed, "{low}");
+        assert_eq!(clients(fe, 1, 4, "/"), [last], "{low}");
+    }
+}
+
+#[test]
+fn pool_purge_delay_and_pool_low_conn_are_checked_at_load_and_not_called_ignored() {
+    for ok in ["pool-purge-delay 0", "pool-purge-delay 500", "pool-purge-delay 2s", "pool-low-conn 4", "pool-low-conn +2", "pool-low-conn abc", "pool-low-conn -3"] {
+        for default_server in [false, true] {
+            let (success, text) = check(ok, default_server);
+            assert!(success, "{ok} (default-server: {default_server}) refused: {text}");
+            assert!(!text.contains("is ignored"), "{ok}: {text}");
+        }
+    }
+    for (bad, why) in [
+        ("pool-purge-delay abc", "unexpected character 'a' in argument to <pool-purge-delay>."),
+        ("pool-purge-delay 10x", "unexpected character 'x' in argument to <pool-purge-delay>."),
+        ("pool-purge-delay -1", "unexpected character '-' in argument to <pool-purge-delay>."),
+        ("pool-purge-delay", "'pool-purge-delay' expects <value> as argument."),
+        (
+            "pool-purge-delay 99999999999",
+            "timer overflow in argument '99999999999' to 'pool-purge-delay' (maximum value is 2147483647 ms or ~24.8 days)",
+        ),
+        ("pool-low-conn", "'pool-low-conn' expects <value> as argument."),
+    ] {
+        for default_server in [false, true] {
+            let (success, text) = check(bad, default_server);
+            assert!(!success, "{bad} accepted: {text}");
+            assert!(text.contains(why), "{bad}: {text}");
+        }
+    }
+}

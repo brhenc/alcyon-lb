@@ -67,17 +67,18 @@ thread_local! {
     static RES_HTX: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
 }
 
-/// What an idle server connection is pooled under. `HAProxy` keys a server's idle
-/// connections by a hash of what shaped them (`conn_calculate_hash`): for TLS that is
-/// the SNI, so a connection opened for one name never carries a request for another.
-/// A plaintext connection is keyed by address alone, as before T113; a TLS one by the
-/// server line it belongs to (two backends may name one address with different TLS
-/// settings) and the name it was opened with.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+/// What an idle server connection is pooled under. `HAProxy` keeps idle connections per
+/// server (`srv->per_thr[tid]`) and finds one by a hash of what shaped it
+/// (`be_calculate_conn_hash`): the server, the destination address and the connection's
+/// name, which for TLS is the SNI, so a connection opened for one name never carries a
+/// request for another. Two backends naming one address do not share connections.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IdleKey {
+    /// `(backend, server)`.
+    pub srv: (usize, usize),
     pub addr: SocketAddr,
-    /// `(backend, server, SNI)` of a TLS connection.
-    pub tls: Option<(usize, usize, Option<String>)>,
+    /// The SNI of a TLS connection.
+    pub name: Option<String>,
 }
 
 /// An idle server connection: its socket and, for TLS, its session.
@@ -87,28 +88,64 @@ pub struct IdleConn {
     pub xprt: crate::xprt::ServerXprt,
 }
 
-/// What a server keeps idle under one key. `HAProxy` has two lists: a connection that has
-/// carried one request waits in `idle`, one that has carried two or more in `safe` (it
-/// proved the server reuses connections); `est_need` is `srv->est_need_conns`.
-#[derive(Debug, Default)]
-pub struct PoolLists {
-    idle: Vec<IdleConn>,
-    safe: Vec<IdleConn>,
-    max_used: u32,
-    est_need: u32,
-    tick: Option<std::time::Instant>,
+impl IdleConn {
+    fn close(mut self) {
+        self.xprt.send_close_notify(self.fd.as_fd());
+    }
 }
 
-/// `pool-purge-delay`'s default: how often the server refreshes what it estimates it needs.
-const POOL_PURGE_DELAY: Duration = Duration::from_millis(5000);
+/// A server's idle connection settings: `pool-max-conn` (-1: no limit), `pool-low-conn`,
+/// `pool-purge-delay` in milliseconds (0: nothing is kept).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SrvPoolCfg {
+    pub max_conn: i32,
+    pub low_conn: u32,
+    pub purge_delay_ms: u32,
+}
 
-/// The idle server connections of a worker.
+impl SrvPoolCfg {
+    pub const DEFAULT: Self = Self { max_conn: -1, low_conn: 0, purge_delay_ms: 5000 };
+
+    /// Whether the server keeps idle connections at all.
+    fn keeps_any(self) -> bool {
+        self.max_conn != 0 && self.purge_delay_ms != 0
+    }
+}
+
+#[derive(Debug)]
+struct Pooled {
+    addr: SocketAddr,
+    name: Option<String>,
+    safe: bool,
+    conn: IdleConn,
+}
+
+/// What a server keeps idle in one worker. `HAProxy` has two lists: a connection that has
+/// carried one request waits in `idle`, one that has carried two or more in `safe` (it
+/// proved the server reuses connections); both are also on `idle_conn_list`, oldest first,
+/// which is the order here. `max_used` and `est_need` are `srv->max_used_conns` and
+/// `srv->est_need_conns`.
+#[derive(Debug, Default)]
+struct SrvIdle {
+    conns: std::collections::VecDeque<Pooled>,
+    safe: usize,
+    max_used: u32,
+    est_need: u32,
+    /// When the purge next looks at this server: armed when a connection goes idle while
+    /// none was scheduled, re-armed while connections remain (`idle_conn_srv`).
+    purge_at: Option<Instant>,
+    purge_delay: Duration,
+}
+
+/// The idle server connections of a worker, per server.
 #[derive(Debug, Default)]
 pub struct IdlePool {
-    map: HashMap<IdleKey, PoolLists>,
+    servers: HashMap<(usize, usize), SrvIdle>,
     /// Connections in all lists: a session whose server connection has the pool to itself
-    /// (the usual keep-alive case) never looks the key up.
+    /// (the usual keep-alive case) never looks the server up.
     conns: usize,
+    /// The earliest `purge_at` of all servers.
+    next_purge: Option<Instant>,
 }
 
 impl IdlePool {
@@ -117,47 +154,54 @@ impl IdlePool {
         self.conns == 0
     }
 
-    /// `srv_add_to_idle_list`: the server keeps a released connection if `max_idle` allows
-    /// (`pool-max-conn`, -1 for no limit), and its safe list is empty and it is itself safe
-    /// or its idle list is empty, or the server is not keeping more than it was seen to need
-    /// (`used` is the server's connections in use, this one included). Otherwise it is
-    /// given back for closing.
-    fn keep(&mut self, key: IdleKey, conn: IdleConn, is_safe: bool, max_idle: i32, used: u32, now: Instant) -> Result<(), IdleConn> {
-        let lists = self.map.entry(key).or_default();
-        let curr_idle = lists.idle.len() + lists.safe.len();
-        if max_idle >= 0 && usize::try_from(max_idle).is_ok_and(|m| m <= curr_idle) {
+    /// When [`IdlePool::purge`] next has work.
+    pub fn next_purge(&self) -> Option<Instant> {
+        self.next_purge
+    }
+
+    /// `srv_add_to_idle_list`: the server keeps a released connection if it keeps any
+    /// (`pool-purge-delay` not 0), `pool-max-conn` allows, and its safe list is empty and
+    /// the connection is itself safe or its idle list is empty, or the server is not keeping
+    /// more than it was seen to need plus `pool-low-conn` (`used` is the server's
+    /// connections in use, this one included). Otherwise it is given back for closing.
+    fn keep(&mut self, key: IdleKey, conn: IdleConn, is_safe: bool, cfg: SrvPoolCfg, used: u32, now: Instant) -> Result<(), IdleConn> {
+        if cfg.purge_delay_ms == 0 {
             return Err(conn);
         }
-        match lists.tick {
-            Some(t) if now.duration_since(t) >= POOL_PURGE_DELAY => {
-                lists.est_need = ((lists.est_need + lists.max_used) / 2).max(lists.max_used);
-                lists.max_used = used;
-                lists.tick = Some(now);
-            }
-            None => lists.tick = Some(now),
-            Some(_) => {}
-        }
+        let s = self.servers.entry(key.srv).or_default();
         // `srv_use_conn` raises both with every connection in use; seen from here, the
         // peak is at least the connections in use at a release.
-        lists.max_used = lists.max_used.max(used);
-        lists.est_need = lists.est_need.max(used);
-        let curr_idle = u32::try_from(curr_idle).unwrap_or(u32::MAX);
-        if !((lists.safe.is_empty() && (is_safe || lists.idle.is_empty())) || used.saturating_add(curr_idle) <= used.max(lists.est_need)) {
+        s.max_used = s.max_used.max(used);
+        s.est_need = s.est_need.max(used);
+        let curr_idle = s.conns.len();
+        if usize::try_from(cfg.max_conn).is_ok_and(|m| m <= curr_idle) {
             return Err(conn);
         }
-        if is_safe { &mut lists.safe } else { &mut lists.idle }.push(conn);
+        let idle_empty = curr_idle == s.safe;
+        let curr = u32::try_from(curr_idle).unwrap_or(u32::MAX);
+        if !((s.safe == 0 && (is_safe || idle_empty)) || used.saturating_add(curr) <= used.max(s.est_need).saturating_add(cfg.low_conn)) {
+            return Err(conn);
+        }
+        s.conns.push_back(Pooled { addr: key.addr, name: key.name, safe: is_safe, conn });
+        s.safe += usize::from(is_safe);
         self.conns += 1;
+        if s.purge_at.is_none() {
+            s.purge_delay = Duration::from_millis(u64::from(cfg.purge_delay_ms));
+            let at = now + s.purge_delay;
+            s.purge_at = Some(at);
+            self.next_purge = Some(self.next_purge.map_or(at, |n| n.min(at)));
+        }
         Ok(())
     }
 
     /// `be_reuse_connection`: the connection a request may take, and whether it was a safe
     /// one. A request that is not the first of its client connection takes an idle
     /// connection, then a safe one; a first request takes nothing under `safe`, a safe
-    /// connection under `aggressive`, a safe then an idle one under `always`. A connection
-    /// whose peer has closed is dropped on the way.
+    /// connection under `aggressive`, a safe then an idle one under `always`. The oldest
+    /// that matches is taken; one whose peer has closed is dropped on the way.
     fn take(&mut self, key: &IdleKey, first_req: bool, mode: ibex_config::HttpReuse) -> Option<(IdleConn, bool)> {
         use ibex_config::HttpReuse::{Aggressive, Always, Never, Safe};
-        let lists = self.map.get_mut(key)?;
+        let s = self.servers.get_mut(&key.srv)?;
         let order: &[bool] = match (first_req, mode) {
             (_, Never) | (true, Safe) => &[],
             (false, _) => &[false, true],
@@ -165,15 +209,54 @@ impl IdlePool {
             (true, Always) => &[true, false],
         };
         for &safe in order {
-            let list = if safe { &mut lists.safe } else { &mut lists.idle };
-            while let Some(c) = list.pop() {
+            while let Some(pos) = s.conns.iter().position(|p| p.safe == safe && p.addr == key.addr && p.name == key.name) {
+                let Some(p) = s.conns.remove(pos) else { break };
+                s.safe -= usize::from(safe);
                 self.conns -= 1;
-                if raw::is_idle_conn_alive(c.fd.as_fd()) {
-                    return Some((c, safe));
+                if raw::is_idle_conn_alive(p.conn.fd.as_fd()) {
+                    return Some((p.conn, safe));
                 }
             }
         }
         None
+    }
+
+    /// `srv_cleanup_idle_conns`, for every server whose purge is due at `now`: half the
+    /// idle connections beyond what the server needs, rounded up, plus one, are closed,
+    /// oldest first; the estimate of the need moves halfway to the peak seen since the last
+    /// purge (never below it), and the peak restarts from the connections in use (`used`).
+    pub fn purge(&mut self, now: Instant, used: impl Fn((usize, usize)) -> u32) {
+        if self.next_purge.is_none_or(|t| t > now) {
+            return;
+        }
+        let mut next: Option<Instant> = None;
+        for (&srv, s) in &mut self.servers {
+            let Some(at) = s.purge_at else { continue };
+            if at <= now {
+                let curr_idle = s.conns.len();
+                if curr_idle > 0 {
+                    let in_use = used(srv);
+                    let exceed = i64::from(in_use) + i64::try_from(curr_idle).unwrap_or(i64::MAX) - i64::from(s.max_used.max(s.est_need));
+                    let exceed = exceed / 2 + (exceed & 1);
+                    let avg = (u64::from(s.est_need) + u64::from(s.max_used)) / 2;
+                    s.est_need = u32::try_from(avg).unwrap_or(u32::MAX).max(s.max_used);
+                    s.max_used = in_use;
+                    if exceed > 0 {
+                        let n = usize::try_from(exceed + 1).unwrap_or(usize::MAX).min(curr_idle);
+                        for p in s.conns.drain(..n) {
+                            s.safe -= usize::from(p.safe);
+                            p.conn.close();
+                        }
+                        self.conns -= n;
+                    }
+                }
+                s.purge_at = (!s.conns.is_empty()).then(|| now + s.purge_delay);
+            }
+            if let Some(t) = s.purge_at {
+                next = Some(next.map_or(t, |n| n.min(t)));
+            }
+        }
+        self.next_purge = next;
     }
 }
 
@@ -186,37 +269,74 @@ mod pool_tests {
     }
 
     fn key() -> IdleKey {
-        IdleKey { addr: "127.0.0.1:1".parse().unwrap(), tls: None }
+        IdleKey { srv: (0, 0), addr: "127.0.0.1:1".parse().unwrap(), name: None }
     }
 
-    /// What the server believes it needs falls by half each purge delay once the peak is
-    /// over (`srv_cleanup_idle_conns`), and a connection beyond it is not kept.
+    const CFG: SrvPoolCfg = SrvPoolCfg { max_conn: -1, low_conn: 0, purge_delay_ms: 500 };
+
+    /// HAProxy, eight connections idle after a burst of eight, `pool-purge-delay 500`:
+    /// nothing is closed at the first two purges, then 3, 3 and 2 (the estimate 8, 8, 4, 2,
+    /// 1, 0).
     #[test]
-    fn the_estimate_decays_with_the_purge_delay() {
+    fn each_purge_closes_half_the_excess_plus_one() {
         let t0 = Instant::now();
         let mut pool = IdlePool::default();
-        // A peak of six connections in use: one is kept, a second one too (safe list empty,
-        // idle empty / peak), the estimate is six.
-        assert!(pool.keep(key(), conn(), false, -1, 6, t0).is_ok());
-        assert!(pool.keep(key(), conn(), false, -1, 5, t0).is_ok());
-        assert_eq!(pool.map[&key()].est_need, 6);
-        // One purge delay later, one connection in use: the estimate is the average of the
-        // old estimate and the peak since, and never below that peak.
-        assert!(pool.keep(key(), conn(), false, -1, 1, t0 + POOL_PURGE_DELAY).is_ok());
-        assert_eq!(pool.map[&key()].est_need, 6);
-        // The next, with that peak down to one: the estimate halves to three, and with
-        // three kept already (1 + 3 > 3) the connection is not.
-        assert!(pool.keep(key(), conn(), false, -1, 1, t0 + 2 * POOL_PURGE_DELAY).is_err());
-        assert_eq!(pool.map[&key()].est_need, 3);
+        for used in (1..=8).rev() {
+            assert!(pool.keep(key(), conn(), false, CFG, used, t0).is_ok());
+        }
+        assert_eq!(pool.next_purge(), Some(t0 + Duration::from_millis(500)));
+        let mut left = Vec::new();
+        for k in 1..=6 {
+            let now = t0 + Duration::from_millis(500 * k);
+            pool.purge(now - Duration::from_millis(1), |_| 0);
+            assert_eq!(pool.conns, left.last().copied().unwrap_or(8), "not due yet at purge {k}");
+            pool.purge(now, |_| 0);
+            left.push(pool.conns);
+        }
+        assert_eq!(left, [8, 8, 5, 2, 0, 0]);
+        assert_eq!(pool.next_purge(), None);
+    }
+
+    /// `pool-purge-delay 0` keeps nothing; `pool-low-conn` keeps that many beyond the need.
+    #[test]
+    fn purge_delay_zero_and_low_conn() {
+        let t0 = Instant::now();
+        let mut pool = IdlePool::default();
+        assert!(pool.keep(key(), conn(), false, SrvPoolCfg { purge_delay_ms: 0, ..CFG }, 1, t0).is_err());
+        let low = SrvPoolCfg { low_conn: 1, ..CFG };
+        assert!(pool.keep(key(), conn(), false, low, 1, t0).is_ok());
+        assert!(pool.keep(key(), conn(), false, low, 1, t0).is_ok());
+        assert!(pool.keep(key(), conn(), false, low, 1, t0).is_err());
+        assert!(pool.keep(key(), conn(), false, CFG, 1, t0).is_err());
+    }
+
+    /// A server whose idle connections were all taken before its purge is unscheduled
+    /// (`srv_cleanup_idle_conns`: `curr_idle == 0`), its estimate untouched.
+    #[test]
+    fn a_purge_with_nothing_idle_unschedules_the_server() {
+        let t0 = Instant::now();
+        let mut pool = IdlePool::default();
+        // A socket pair: the idle connection must look alive to be taken.
+        let (a, _b) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let c = IdleConn { fd: OwnedFd::from(a), xprt: crate::xprt::ServerXprt::Plain };
+        assert!(pool.keep(key(), c, false, CFG, 3, t0).is_ok());
+        assert!(pool.take(&key(), false, ibex_config::HttpReuse::Safe).is_some());
+        pool.purge(t0 + Duration::from_millis(500), |_| 0);
+        assert_eq!(pool.next_purge(), None);
+        assert_eq!(pool.servers[&(0, 0)].est_need, 3);
     }
 }
 
-/// The `pool-max-conn` of each server of a proxy; empty when none sets one.
-fn pool_max_conns(servers: &[ibex_config::Server]) -> Vec<i32> {
-    if servers.iter().all(|s| s.pool_max_conn == -1) {
+/// The idle connection settings of each server of a proxy; empty when all are the defaults.
+fn pool_cfgs(servers: &[ibex_config::Server]) -> Vec<SrvPoolCfg> {
+    let cfg = |s: &ibex_config::Server| {
+        let p = s.pool.as_deref().copied().unwrap_or_default();
+        SrvPoolCfg { max_conn: p.max_conn, low_conn: p.low_conn, purge_delay_ms: p.purge_delay }
+    };
+    if servers.iter().all(|s| cfg(s) == SrvPoolCfg::DEFAULT) {
         Vec::new()
     } else {
-        servers.iter().map(|s| s.pool_max_conn).collect()
+        servers.iter().map(cfg).collect()
     }
 }
 
@@ -271,10 +391,10 @@ fn server_sni(sess: &TcpSession, proxies: &[Proxy], fe_idx: usize, be_idx: usize
     tls.sni(sample_registry(), &stream_sample_ctx(sess, &proxies[fe_idx], &proxies[be_idx], &ProxiesView(proxies), &stick))
 }
 
-/// The pool key of a connection to `proxies[be_idx].servers[s_idx]` opened with `sni`.
-fn idle_key(proxies: &[Proxy], addr: SocketAddr, be_idx: usize, s_idx: Option<usize>, sni: Option<String>) -> IdleKey {
-    let is_tls = s_idx.is_some_and(|i| proxies.get(be_idx).and_then(|p| p.server_tls.get(i)).is_some_and(Option::is_some));
-    IdleKey { addr, tls: is_tls.then(|| (be_idx, s_idx.unwrap_or(0), sni)) }
+/// The pool key of a connection to `addr` for server `s_idx` of backend `be_idx`, opened
+/// with `sni` (a plaintext connection has none); none without a server.
+fn idle_key(addr: SocketAddr, be_idx: usize, s_idx: Option<usize>, sni: Option<String>) -> Option<IdleKey> {
+    Some(IdleKey { srv: (be_idx, s_idx?), addr, name: sni })
 }
 
 /// Builds the TLS of every server of `proxy` from its section (`servers`). Done once per
@@ -455,15 +575,24 @@ pub struct ProxyIdInfo {
     pub server_init_health: Vec<u32>,
     /// Each listener's numeric id (`luid`) by `bind` line, as `so_id` reads it.
     pub listener_ids: Vec<u32>,
-    /// `pool-max-conn` per server; empty when no server sets it (-1, unlimited, then).
-    /// Read when a server connection is released, so it lives here, off `Proxy`'s inline
-    /// size (`struct_sizes.rs`).
-    pub server_pool_max_conn: Vec<i32>,
+    /// `pool-max-conn`, `pool-low-conn` and `pool-purge-delay` per server; empty when every
+    /// server has the defaults (read it with [`ProxyIdInfo::server_pool`]). Read when a
+    /// server connection is released, so it lives here, off `Proxy`'s inline size
+    /// (`struct_sizes.rs`).
+    pub server_pool: Vec<SrvPoolCfg>,
     /// `option http-server-close`: the server connection carries one request. Read when a
     /// request goes to a server and when its response ends.
     pub http_mode: ibex_config::ast::HttpMode,
     /// `option persist`: a server named by a cookie or a stick table is used when it is down.
     pub persist: bool,
+}
+
+impl ProxyIdInfo {
+    /// The idle connection settings of server `i`.
+    #[must_use]
+    pub fn server_pool(&self, i: usize) -> SrvPoolCfg {
+        self.server_pool.get(i).copied().unwrap_or(SrvPoolCfg::DEFAULT)
+    }
 }
 
 /// A configured proxy instance.
@@ -1791,7 +1920,7 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, list
             server_forced_ids: server_forced_ids(listen.servers.len(), &listen.server_extras),
             server_init_health: server_init_health(listen.servers.len(), &listen.server_extras),
             listener_ids: ibex_config::ast::listener_ids(&listen.binds),
-            server_pool_max_conn: pool_max_conns(&listen.servers),
+            server_pool: pool_cfgs(&listen.servers),
             http_mode: listen.http_mode,
             persist: listen.persist,
             ..ProxyIdInfo::default()
@@ -2061,7 +2190,7 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, be:
             server_forced_ids: server_forced_ids(be.servers.len(), &be.server_extras),
             server_init_health: server_init_health(be.servers.len(), &be.server_extras),
             listener_ids: Vec::new(),
-            server_pool_max_conn: pool_max_conns(&be.servers),
+            server_pool: pool_cfgs(&be.servers),
             http_mode: be.http_mode,
             persist: be.persist,
             ..ProxyIdInfo::default()
@@ -2784,6 +2913,17 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             .fold(poll_timeout, |acc, deadline| {
                 acc.min(deadline.saturating_duration_since(now_inst))
             });
+
+        // The idle server connections beyond what their servers need are purged every
+        // `pool-purge-delay` (`srv_cleanup_idle_conns`): this is where that keyword acts.
+        let proxies = &self.proxies;
+        self.idle_backend_pool.purge(now_inst, |(be, s)| {
+            proxies.get(be).and_then(|p| p.server_actconn.get(s)).map_or(0, |a| a.load(Ordering::Relaxed))
+        });
+        let poll_timeout = self
+            .idle_backend_pool
+            .next_purge()
+            .map_or(poll_timeout, |t| poll_timeout.min(t.saturating_duration_since(now_inst)));
 
         if self.global_paused && !crate::globalconn::full() {
             self.resume_listeners_after_global();
@@ -4973,16 +5113,16 @@ fn release_server(
         // The pool is keyed by server; a server that maps the destination may have been
         // connected anywhere, so its connections are not pooled.
         let xprt = std::mem::replace(&mut entry.sess.srv_xprt, crate::xprt::ServerXprt::Plain);
-        if let (true, Some(addr)) = (reusable, entry.target_addr.filter(|&a| !maps_destination(a))) {
-            let sni = xprt.sni().map(str::to_string);
-            let key = idle_key(proxies, addr, entry.srv_backend_idx, entry.target_server_idx, sni);
-            let be = proxies.get(entry.srv_backend_idx);
-            let max_idle = entry.target_server_idx.and_then(|i| be?.ids.server_pool_max_conn.get(i)).copied().unwrap_or(-1);
-            let used = entry.target_server_idx.and_then(|i| be?.server_actconn.get(i)).map_or(0, |a| a.load(Ordering::Relaxed));
-            if let Err(IdleConn { fd, mut xprt }) =
-                idle_pool.keep(key, IdleConn { fd: srv_fd, xprt }, entry.srv_served >= 2, max_idle, used, Instant::now())
-            {
-                xprt.send_close_notify(fd.as_fd());
+        // Only a server's connections are pooled (`srv_add_to_idle_list` needs one).
+        let key = entry
+            .target_addr
+            .filter(|&a| reusable && !maps_destination(a))
+            .and_then(|addr| idle_key(addr, entry.srv_backend_idx, entry.target_server_idx, xprt.sni().map(str::to_string)));
+        if let (Some(key), Some(be)) = (key, proxies.get(entry.srv_backend_idx)) {
+            let cfg = be.ids.server_pool(key.srv.1);
+            let used = be.server_actconn.get(key.srv.1).map_or(0, |a| a.load(Ordering::Relaxed));
+            if let Err(conn) = idle_pool.keep(key, IdleConn { fd: srv_fd, xprt }, entry.srv_served >= 2, cfg, used, Instant::now()) {
+                conn.close();
             }
         } else {
             let mut xprt = xprt;
@@ -7852,13 +7992,12 @@ impl EngineDispatcher<'_> {
             // Under `http-reuse` other than `never` the connection goes back to the server's
             // lists after each response and the next request takes one by the mode's rules;
             // while the lists hold nothing else, and the server keeps idle connections at
-            // all (`pool-max-conn`), that is this one, and the round trip is skipped.
+            // all (`pool-max-conn`, `pool-purge-delay`), that is this one, and the round trip is skipped.
             let alone = proxies[be_idx].http_reuse == ibex_config::HttpReuse::Never
                 || (idle_pool.is_empty()
                     && cookie_server
                         .or(entry.target_server_idx)
-                        .and_then(|i| proxies[be_idx].ids.server_pool_max_conn.get(i))
-                        .is_none_or(|&m| m != 0));
+                        .is_none_or(|i| proxies[be_idx].ids.server_pool(i).keeps_any()));
             if same
                 && alone
                 && matches!(entry.sess.srv_state, ScState::Ready | ScState::Established)
@@ -7891,8 +8030,8 @@ impl EngineDispatcher<'_> {
         entry.srv_served = 0;
         if proxies[be_idx].http_reuse != ibex_config::HttpReuse::Never && !idle_pool.is_empty() {
             let sni = server_sni(&entry.sess, proxies, entry.proxy_idx, be_idx, s_idx);
-            let key = idle_key(proxies, target_addr, be_idx, s_idx, sni);
-            if let Some((conn, safe)) = idle_pool.take(&key, entry.sess.is_first_req, proxies[be_idx].http_reuse) {
+            let key = idle_key(target_addr, be_idx, s_idx, sni);
+            if let Some((conn, safe)) = key.and_then(|k| idle_pool.take(&k, entry.sess.is_first_req, proxies[be_idx].http_reuse)) {
                 entry.srv_served = if safe { 2 } else { 1 };
                 reused = Some(conn);
             }

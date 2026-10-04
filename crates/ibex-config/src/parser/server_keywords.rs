@@ -98,8 +98,6 @@ pub(crate) const UNIMPLEMENTED_SERVER_KEYWORDS: &[ServerKeyword] = &[
     kw!("pool-conn-name", Arg::Word, Refuse(
         "Ibex does not implement it; requests it should keep apart would share server connections",
     )),
-    kw!("pool-low-conn", Arg::Word, Ignore("idle connection pool sizing")),
-    kw!("pool-purge-delay", Arg::Delay, Ignore("idle connection pool purging")),
     kw!("redir", Arg::Word, ROUTE),
     kw!("resolve-net", Arg::Word, Ignore("DNS resolution at runtime, which needs 'resolvers'; Ibex refuses it")),
     kw!("resolve-opts", Arg::Word, Ignore("DNS resolution at runtime, which needs 'resolvers'; Ibex refuses it")),

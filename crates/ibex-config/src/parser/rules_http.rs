@@ -83,7 +83,7 @@ fn strtol0(s: &str) -> Option<i64> {
 /// A time in milliseconds as `parse_time_err(.., TIME_UNIT_MS)` reads it: digits, then
 /// `us`, `ms`, `s`, `m`, `h` or `d` (none: milliseconds), `us` rounded up. The messages
 /// are `HAProxy`'s.
-fn parse_time_ms(text: &str) -> Result<u32, String> {
+pub(crate) fn parse_time_ms(text: &str) -> Result<u32, String> {
     const OVERFLOW: &str = "time overflow (maximum value is 2147483647 ms or ~24.8 days).";
     let digits = text.bytes().take_while(u8::is_ascii_digit).count();
     if digits == 0 {
