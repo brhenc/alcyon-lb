@@ -560,7 +560,7 @@ fn check_shapes_over_tls() {
         (fronts[0], &format!("  server s {} ssl verify none check {chk}", srv.addr)),
         (fronts[1], &format!("  option tcp-check\n  tcp-check connect\n  tcp-check send \"GET / HTTP/1.1\\r\\nHost: tc.example\\r\\n\\r\\n\"\n  tcp-check expect string 200\n  server s {} ssl verify none check {chk}", srv2.addr)),
         (fronts[2], &format!("  option httpchk GET /\n  server s {} ssl verify none check {chk}", plain.addr)),
-        (fronts[3], &format!("  server s {} ssl verify none check {chk}", silent)),
+        (fronts[3], &format!("  timeout check 150ms\n  server s {} ssl verify none check {chk}", silent)),
     ]);
     let _ibex = start(&p.dir, &cfg, &fronts);
 
@@ -630,6 +630,26 @@ fn accept_proxy_on_a_tls_bind_reads_the_header_before_the_handshake() {
     let text = String::from_utf8_lossy(&out);
     assert!(text.starts_with("HTTP/1.1 200"), "{text}");
     assert!(text.to_ascii_lowercase().contains("x-id: test-foo"), "the receiver must see the unique-id TLV:\n{text}");
+
+    // What arrives raw at that bind and is not a PROXY header is refused, as HAProxy's
+    // `conn_recv_proxy` refuses it: bytes that are not a header close the connection;
+    // a header that has not fully arrived is waited for; a peer that leaves is let go.
+    let mut raw = TcpStream::connect(recv).expect("connect");
+    raw.set_read_timeout(Some(Duration::from_secs(3))).ok();
+    raw.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").expect("write");
+    let mut b = [0u8; 16];
+    assert!(matches!(raw.read(&mut b), Ok(0) | Err(_)), "a bind expecting PROXY must close on a request in its place");
+    let mut partial = TcpStream::connect(recv).expect("connect");
+    partial.set_read_timeout(Some(Duration::from_millis(400))).ok();
+    partial.write_all(&PP2_SIG[..8]).expect("write");
+    assert!(
+        matches!(partial.read(&mut b), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut),
+        "half a header is waited for, not refused"
+    );
+    drop(partial);
+    drop(TcpStream::connect(recv).expect("connect and leave"));
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(get(front, "x").0, 200, "the receiver still serves after those");
 }
 
 /// `-c` refuses what the start refuses: a rule naming a fetch the registry lacks, on a

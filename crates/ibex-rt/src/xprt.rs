@@ -512,19 +512,6 @@ impl ServerXprt {
         }
     }
 
-    /// Plaintext bytes written before the TLS handshake (a PROXY header). On a plaintext
-    /// transport there is nothing to go before: the caller keeps them in the stream.
-    /// Returns whether they were taken.
-    pub fn set_plain_prefix(&mut self, bytes: Vec<u8>) -> bool {
-        match self {
-            ServerXprt::Plain => false,
-            ServerXprt::Tls(t) => {
-                t.set_plain_prefix(bytes);
-                true
-            }
-        }
-    }
-
     #[must_use]
     pub fn tls_info(&self) -> Option<&dyn ibex_proto::transport::TlsInfo> {
         match self {
