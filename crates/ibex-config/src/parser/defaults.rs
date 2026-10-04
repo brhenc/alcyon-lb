@@ -23,6 +23,12 @@ pub(crate) fn parse_defaults_directive(
             defaults.retries = Some(r);
             Ok(())
         }
+        "retry-on" => {
+            let mut r = defaults.retry_on.unwrap_or(crate::ast::RE_CONN_FAILED);
+            super::parse_retry_on(&mut r, tokens, kw)?;
+            defaults.retry_on = Some(r);
+            Ok(())
+        }
         "redisp" => parse_redisp(kw),
         "maxconn" => {
             let mut mc = defaults.maxconn.unwrap_or(0);

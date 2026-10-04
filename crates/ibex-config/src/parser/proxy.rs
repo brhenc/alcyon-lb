@@ -77,6 +77,7 @@ pub(crate) fn parse_listen_header(
         srvtimeout: timeouts.server,
         timeouts,
         retries: defaults.and_then(|d| d.retries).unwrap_or(3),
+        retry_on: defaults.and_then(|d| d.retry_on).unwrap_or(crate::ast::RE_CONN_FAILED),
         redisp: defaults.map_or(false, |d| d.redisp),
         redisp_after: defaults.map_or(-1, |d| if d.redisp { d.redisp_after } else { -1 }),
         maxconn: defaults.and_then(|d| d.maxconn).unwrap_or(2000),
@@ -277,6 +278,7 @@ pub(crate) fn parse_backend_header(
         srvtimeout: timeouts.server,
         timeouts,
         retries: defaults.and_then(|d| d.retries).unwrap_or(3),
+        retry_on: defaults.and_then(|d| d.retry_on).unwrap_or(crate::ast::RE_CONN_FAILED),
         redisp: defaults.map_or(false, |d| d.redisp),
         redisp_after: defaults.map_or(-1, |d| if d.redisp { d.redisp_after } else { -1 }),
         dispatch: None,
@@ -344,6 +346,7 @@ pub(crate) fn parse_listen_directive(
         "srvtimeout" => parse_srvtimeout(kw),
         "timeout" => parse_timeout_directive(&mut proxy.timeouts, tokens, kw),
         "retries" => parse_retries(&mut proxy.retries, tokens, kw),
+        "retry-on" => super::parse_retry_on(&mut proxy.retry_on, tokens, kw),
         "redisp" => parse_redisp(kw),
         "maxconn" => parse_maxconn(&mut proxy.maxconn, tokens, kw),
         "grace" => parse_grace(&mut proxy.grace, tokens, kw),
@@ -599,6 +602,7 @@ pub(crate) fn parse_frontend_directive(
             let rule_slots = rule_capture_slots(&fe.http_req_rules);
             parse_capture(&mut fe.req_header_captures, &mut fe.res_header_captures, rule_slots, tokens, kw)
         }
+        "retry-on" => Err(ConfigError::new(kw.line, kw.col, "'retry-on' only available in backend or listen section")),
         other => Err(ConfigError::new(
             kw.line,
             kw.col,
@@ -640,6 +644,7 @@ pub(crate) fn parse_backend_directive(
         "srvtimeout" => parse_srvtimeout(kw),
         "timeout" => parse_timeout_directive(&mut be.timeouts, tokens, kw),
         "retries" => parse_retries(&mut be.retries, tokens, kw),
+        "retry-on" => super::parse_retry_on(&mut be.retry_on, tokens, kw),
         "redisp" => parse_redisp(kw),
         "dispatch" => parse_dispatch(kw),
         "default-server" => parse_default_server(&mut be.default_server, tokens, kw),

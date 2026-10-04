@@ -171,6 +171,10 @@ pub struct StreamFacts {
     pub forwarded: bool,
     /// An applet is serving the request.
     pub toapplet: bool,
+    /// Connection retries spent on the stream (`txn.conn_retries`).
+    pub retries: u32,
+    /// The stream was redispatched (`txn.redispatched`).
+    pub redispatched: bool,
 }
 
 /// Runtime context passed into sample fetch functions during evaluation.
@@ -1044,6 +1048,18 @@ impl Registry {
             name: "res.status",
             out_type: SampleType::Sint,
             func: status_fetch,
+        });
+        // `txn.conn_retries` and `txn.redispatched` (`smp_fetch_conn_retries`,
+        // `smp_fetch_redispatched`): what the stream has spent on reaching a server.
+        self.register_fetch(FetchDesc {
+            name: "txn.conn_retries",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| ctx.stream.map(|f| Sample::Sint(i64::from(f.retries))),
+        });
+        self.register_fetch(FetchDesc {
+            name: "txn.redispatched",
+            out_type: SampleType::Bool,
+            func: |ctx, _args| ctx.stream.map(|f| Sample::Bool(f.redispatched)),
         });
         // `txn.status`: the status the log reports, `status` where a response is read.
         self.register_fetch(FetchDesc {

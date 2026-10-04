@@ -26,7 +26,7 @@ pub use ast::{
     ErrorPageSource, Forwarded, ForwardedValue, FrontendSection, GlobalSection, GlobalSetVar, StatsSocket,
     HashPreserveAffinity, HashType,
     HeaderExp, HttpAfterResAction, HttpAfterResRule, HttpReqAction, HttpReqRule, HttpResAction, RedirectCookie,
-    HeaderCapture, LOG_OPT_ASAP, LOG_OPT_DONTLOG_NORMAL, LOG_OPT_SEPARATE_ERRORS, HttpResRule, HttpReuse, ListenSection, LogConfig, LogFormatSpec, LogFacility, LogLevel, LogSample, LogTarget, LogForwardBind, LogForwardHost, LogForwardSection, Mode, RingFormat, RingSection, RingServer, RingServerAddr, RetriesValue,
+    HeaderCapture, RE_CONN_FAILED, RE_DISCONNECTED, RE_EARLY_ERROR, RE_JUNK_RESPONSE, RE_STATUSES, RE_STATUS_MASK, RE_TIMEOUT, LOG_OPT_ASAP, LOG_OPT_DONTLOG_NORMAL, LOG_OPT_SEPARATE_ERRORS, HttpResRule, HttpReuse, ListenSection, LogConfig, LogFormatSpec, LogFacility, LogLevel, LogSample, LogTarget, LogForwardBind, LogForwardHost, LogForwardSection, Mode, RingFormat, RingSection, RingServer, RingServerAddr, RetriesValue,
     SampleRef, SectionKind, Server, ServerSsl, SslVerify, StatsConfig, StatusCodeSet, TlsVersion,
     StickRule, StickRuleType, StickTableConfigAst, TcpReqConnAction, TcpReqConnRule,
     TcpReqContentAction, TcpReqContentRule, TcpResAction, TcpResContentRule, TcpReqSessionAction, TcpReqSessionRule,

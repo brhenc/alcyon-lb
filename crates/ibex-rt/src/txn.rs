@@ -467,6 +467,32 @@ pub struct HttpTxn {
     /// What the request's cookies told the backend's `cookie` persistence, which the
     /// response needs (`SF_DIRECT`, `cookie_first_date`, `cookie_last_date`).
     pub ck: crate::cookie::CookieTxn,
+    /// `http-request disable-l7-retry` ran for this request (`TX_D_L7_RETRY`).
+    pub l7_off: bool,
+    /// A retry on the server's answer (`retry-on <status>`): the request as it was sent.
+    pub l7: L7Retry,
+}
+
+/// Where a request stands for a retry on what the server answers (`TX_L7_RETRY` and the
+/// `l7_buffer`).
+#[derive(Debug, Default)]
+pub enum L7Retry {
+    /// Not a candidate: the backend does not retry on a response, or nothing armed it.
+    #[default]
+    Off,
+    /// A candidate; the request is copied when it is first sent.
+    Armed,
+    /// The request did not fit, or was not whole when it was first sent: no retry.
+    Dead,
+    /// The request as it was sent, and where its message state stood before.
+    Saved(Box<L7Snapshot>),
+}
+
+/// What a retry on a response replays.
+#[derive(Debug)]
+pub struct L7Snapshot {
+    pub bytes: Vec<u8>,
+    pub req_state: MsgState,
 }
 
 impl HttpTxn {
@@ -490,6 +516,8 @@ impl HttpTxn {
             error: None,
             aborted: false,
             ck: crate::cookie::CookieTxn::default(),
+            l7_off: false,
+            l7: L7Retry::Off,
         }
     }
 

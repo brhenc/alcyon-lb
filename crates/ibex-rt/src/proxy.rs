@@ -217,6 +217,10 @@ pub struct TcpSession {
     /// server, because an instant retry almost always reproduces the same error and
     /// just burns the retry budget. See `src/backend.c:2890`.
     pub retry_after: Tick,
+    /// The backend retries a failed connection (`retry-on conn-failure`, the default).
+    pub retry_conn: bool,
+    /// The stream was redispatched (`SF_REDISP`): what `txn.redispatched` reads.
+    pub redispatched: bool,
     pub bytes_in: u64,
     pub bytes_out: u64,
     /// What the stick-table entries this session tracks have been credited of `bytes_in`
@@ -349,6 +353,8 @@ impl TcpSession {
             conn_retries: retries,
             max_retries: retries,
             retry_after: Tick::ETERNITY,
+            retry_conn: true,
+            redispatched: false,
             cli_exp: Tick::ETERNITY,
             http_request_ms: 0,
             keep_alive_ms: 0,
@@ -593,6 +599,18 @@ impl TcpSession {
     pub fn set_retries(&mut self, n: u16) {
         self.conn_retries = n;
         self.max_retries = n;
+        self.redispatched = false;
+    }
+
+    /// A retry on the server's answer (`do_l7_retry`): one retry is spent, the server
+    /// connection is dropped and the request goes out again from `Init`.
+    pub fn l7_retried(&mut self) {
+        self.conn_retries = self.conn_retries.saturating_sub(1);
+        self.srv = None;
+        self.conn_exp = Tick::ETERNITY;
+        self.srv_exp = Tick::ETERNITY;
+        self.srv_state = ScState::Init;
+        self.retry_after = Tick::ETERNITY;
     }
 
     /// The server connection failed. Returns `true` if a retry remains.
@@ -603,7 +621,7 @@ impl TcpSession {
     pub fn server_failed_at(&mut self, now: Tick, same_server: bool) -> bool {
         self.srv = None;
         self.conn_exp = Tick::ETERNITY;
-        if self.conn_retries > 0 {
+        if self.conn_retries > 0 && self.retry_conn {
             self.conn_retries -= 1;
             self.srv_state = ScState::Init;
             self.retry_after = if same_server {
@@ -1532,6 +1550,20 @@ impl TcpSession {
         }
 
         let window = self.req_window();
+        // `retry-on <status>`: the request is copied the first time it is sent, whole, so
+        // that it can be sent again when the answer is one to retry on.
+        if window > 0 && self.srv_state.can_write() && self.mode == Mode::Http {
+            if let Some(t) = self.txn.as_mut().filter(|t| matches!(t.l7, txn::L7Retry::Armed)) {
+                let data = &self.req.readable()[..window];
+                let mut after = t.req;
+                after.advance(data);
+                t.l7 = if after.is_done() && window <= self.bufsize {
+                    txn::L7Retry::Saved(Box::new(txn::L7Snapshot { bytes: data.to_vec(), req_state: t.req }))
+                } else {
+                    txn::L7Retry::Dead
+                };
+            }
+        }
         if self.srv_state.can_write() && (window > 0 || self.srv_xprt.wants_write()) {
             let r = {
                 let sfd = self

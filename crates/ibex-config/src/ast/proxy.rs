@@ -14,6 +14,8 @@ pub struct DefaultsSection {
     pub timeouts: TimeoutConfig,
     /// Default retries count.
     pub retries: Option<u32>,
+    /// `retry-on`, as the `RE_*` bits; `None` is the default, `RE_CONN_FAILED`.
+    pub retry_on: Option<u32>,
     /// Default redispatch flag.
     pub redisp: bool,
     /// `option redispatch <interval>`: retries between redispatches (`redispatch_after`);
@@ -188,6 +190,8 @@ pub struct ListenSection {
     pub timeouts: TimeoutConfig,
     /// Number of connection retries before failing over (default: 3).
     pub retries: u32,
+    /// `retry-on`, as the `RE_*` bits: what a failed attempt is retried on.
+    pub retry_on: u32,
     /// Whether reconnection to dispatch address is enabled on error.
     pub redisp: bool,
     /// `option redispatch <interval>`: retries between redispatches (`redispatch_after`);
@@ -356,6 +360,7 @@ impl Default for ListenSection {
             srvtimeout: None,
             timeouts: TimeoutConfig::default(),
             retries: 3,
+            retry_on: RE_CONN_FAILED,
             redisp: false,
             redisp_after: -1,
             maxconn: 2000,
@@ -615,6 +620,8 @@ pub struct BackendSection {
     pub timeouts: TimeoutConfig,
     /// Number of connection retries before failing over (default: 3).
     pub retries: u32,
+    /// `retry-on`, as the `RE_*` bits: what a failed attempt is retried on.
+    pub retry_on: u32,
     /// Whether reconnection to dispatch address is enabled on error.
     pub redisp: bool,
     /// `option redispatch <interval>`: retries between redispatches (`redispatch_after`);
@@ -711,6 +718,7 @@ impl Default for BackendSection {
             srvtimeout: None,
             timeouts: TimeoutConfig::default(),
             retries: 3,
+            retry_on: RE_CONN_FAILED,
             redisp: false,
             redisp_after: -1,
             dispatch: None,
@@ -768,3 +776,31 @@ pub fn log_opt_bit(name: &str) -> u8 {
         _ => 0,
     }
 }
+
+/// `retry-on` bits, `HAProxy`'s `PR_RE_*`.
+pub const RE_CONN_FAILED: u32 = 0x0000_0001;
+/// `empty-response`: the server closed with nothing sent back.
+pub const RE_DISCONNECTED: u32 = 0x0000_0002;
+/// `response-timeout`: `timeout server` ran out before any response.
+pub const RE_TIMEOUT: u32 = 0x0000_0004;
+/// `0rtt-rejected`.
+pub const RE_EARLY_ERROR: u32 = 0x0001_0000;
+/// `junk-response`: something that is not a complete HTTP response head.
+pub const RE_JUNK_RESPONSE: u32 = 0x0002_0000;
+/// The statuses `retry-on` takes, with their bits.
+pub const RE_STATUSES: [(u16, u32); 12] = [
+    (401, 0x0008),
+    (403, 0x0010),
+    (404, 0x0020),
+    (408, 0x0040),
+    (421, 0x0080),
+    (425, 0x0100),
+    (429, 0x0200),
+    (500, 0x0400),
+    (501, 0x0800),
+    (502, 0x1000),
+    (503, 0x2000),
+    (504, 0x4000),
+];
+/// Any of the status bits.
+pub const RE_STATUS_MASK: u32 = 0x7ff8;
