@@ -125,12 +125,8 @@ pub enum HttpReqAction {
     SetRetries {
         value: RetriesValue,
     },
-    Redirect {
-        location: Option<String>,
-        scheme: Option<String>,
-        prefix: Option<String>,
-        code: Option<u16>,
-    },
+    /// `http-request redirect location|prefix|scheme <fmt> [options]`.
+    Redirect(RedirectRule),
     StrictMode {
         on: bool,
     },
@@ -238,12 +234,43 @@ pub enum HttpResAction {
     Redirect { location: String, code: u16, cookie: Option<RedirectCookie> },
 }
 
+/// The three kinds of `http-request redirect`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedirectKind {
+    /// `location <fmt>`: the location is the formatted text.
+    Location,
+    /// `prefix <fmt>`: the formatted text, then the request's path and query.
+    Prefix,
+    /// `scheme <fmt>`: `<scheme>://<host>` then the request's path and query.
+    Scheme,
+}
+
+/// An `http-request redirect` rule (`http_parse_redirect_rule`, `src/http_act.c`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedirectRule {
+    pub kind: RedirectKind,
+    /// The log-format text of the location, prefix or scheme.
+    pub target: String,
+    pub code: u16,
+    pub cookie: Option<RedirectCookie>,
+    /// `drop-query`: a prefix or scheme redirect leaves the query out.
+    pub drop_query: bool,
+    /// `keep-query`: a location redirect appends the request's query.
+    pub keep_query: bool,
+    /// `append-slash`: a prefix or scheme redirect ends with a `/`.
+    pub append_slash: bool,
+    /// `ignore-empty`: an empty location skips the rule.
+    pub ignore_empty: bool,
+}
+
 /// The cookie a redirect sets or clears: of `set-cookie` and `clear-cookie` the last one
 /// on the line stands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RedirectCookie {
     /// `set-cookie NAME[=VALUE]`: `set-cookie: NAME[=VALUE]; path=/;`.
     Set(String),
+    /// `set-cookie-fmt <log-format>`: as `Set`, the text being formatted for the request.
+    SetFmt(String),
     /// `clear-cookie NAME`: `set-cookie: NAME; path=/; Max-Age=0;`.
     Clear(String),
 }

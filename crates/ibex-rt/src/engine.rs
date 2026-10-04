@@ -2286,9 +2286,10 @@ fn append_forwarded_element(sess: &mut TcpSession, element: &str) {
     }
 }
 
-/// `reply`, a whole response, with `header` as the first header line.
-fn with_header_after_status_line(reply: &[u8], header: &str) -> Vec<u8> {
-    let at = reply.windows(2).position(|w| w == b"\r\n").map_or(reply.len(), |p| p + 2);
+/// `reply`, a whole response, with `header` as the last header line of its head
+/// (`http_action_auth` adds `www-authenticate` after the page's own headers).
+fn with_header_at_end_of_head(reply: &[u8], header: &str) -> Vec<u8> {
+    let at = reply.windows(4).position(|w| w == b"\r\n\r\n").map_or(reply.len(), |p| p + 2);
     let mut out = Vec::with_capacity(reply.len() + header.len() + 2);
     out.extend_from_slice(&reply[..at]);
     out.extend_from_slice(header.as_bytes());
@@ -7221,20 +7222,62 @@ impl EngineDispatcher<'_> {
                                 build_templated_error_response(401, content_type, lf_string, &make_ctx!(sess), registry)
                             }
                         };
-                        let resp = with_header_after_status_line(&page, &format!("www-authenticate: Basic realm=\"{realm}\""));
+                        let resp = with_header_at_end_of_head(&page, &format!("www-authenticate: Basic realm=\"{realm}\""));
                         for_tracked(proxies, sess, |data| data.count_err());
                         send_proxy_reply(sess, &proxies[..], proxy_idx, pages_idx, &resp);
                         return Ok(RuleFlow::Replied);
                     }
-                    ibex_config::HttpReqAction::Redirect { location, prefix, code, .. } => {
-                        let status_code = code.unwrap_or(302);
-                        let loc = location.as_deref().or(prefix.as_deref()).unwrap_or("/");
-                        let formatted_loc = format_sample_string(loc, &make_ctx!(sess), registry);
-                        let reason = status_reason(status_code);
-                        let resp = format!(
-                            "HTTP/1.1 {status_code} {reason}\r\nLocation: {formatted_loc}\r\nContent-Length: 0\r\n\r\n"
+                    ibex_config::HttpReqAction::Redirect(r) => {
+                        // `http_apply_redirect_rule` (src/http_ana.c).
+                        let ctx = make_ctx!(sess);
+                        let target = format_sample_string(&r.target, &ctx, registry);
+                        let uri = sess.req_uri.as_deref().unwrap_or("/");
+                        let (pfx, path, query) = split_uri(uri);
+                        let query_part = if query.is_empty() { String::new() } else { format!("?{query}") };
+                        let mut loc = match r.kind {
+                            ibex_config::RedirectKind::Location => {
+                                let mut l = target;
+                                if r.keep_query && !query.is_empty() {
+                                    l.push(if l.contains('?') { '&' } else { '?' });
+                                    l.push_str(query);
+                                }
+                                l
+                            }
+                            ibex_config::RedirectKind::Prefix => {
+                                format!("{target}{path}{}", if r.drop_query { "" } else { &query_part })
+                            }
+                            ibex_config::RedirectKind::Scheme => {
+                                let mut host = format_sample_string("%[req.hdr(host)]", &ctx, registry);
+                                if host.is_empty() {
+                                    host = pfx.split_once("://").map(|(_, a)| a.to_string()).unwrap_or_default();
+                                }
+                                format!("{target}://{host}{path}{}", if r.drop_query { "" } else { &query_part })
+                            }
+                        };
+                        if r.append_slash && r.kind != ibex_config::RedirectKind::Location && !loc.ends_with('/') {
+                            loc.push('/');
+                        }
+                        if loc.is_empty() && r.ignore_empty {
+                            continue;
+                        }
+                        let mut reply = format!(
+                            "HTTP/1.1 {} {}\r\ncontent-length: 0\r\nlocation: {loc}\r\n",
+                            r.code,
+                            status_reason(r.code)
                         );
-                        send_proxy_reply(sess, &proxies[..], proxy_idx, pages_idx, resp.as_bytes());
+                        if matches!(r.code, 302 | 303 | 307) {
+                            reply.push_str("cache-control: no-cache\r\n");
+                        }
+                        match &r.cookie {
+                            Some(ibex_config::RedirectCookie::Set(c)) => reply.push_str(&format!("set-cookie: {c}; path=/;\r\n")),
+                            Some(ibex_config::RedirectCookie::SetFmt(f)) => {
+                                reply.push_str(&format!("set-cookie: {}; path=/;\r\n", format_sample_string(f, &ctx, registry)));
+                            }
+                            Some(ibex_config::RedirectCookie::Clear(n)) => reply.push_str(&format!("set-cookie: {n}; path=/; Max-Age=0;\r\n")),
+                            None => {}
+                        }
+                        reply.push_str("\r\n");
+                        send_proxy_reply(sess, &proxies[..], proxy_idx, pages_idx, reply.as_bytes());
                         return Ok(RuleFlow::Replied);
                     }
                     ibex_config::HttpReqAction::SetPath { fmt } => {
@@ -9327,6 +9370,9 @@ fn res_action(
             }
             match cookie {
                 Some(ibex_config::RedirectCookie::Set(c)) => reply.push_str(&format!("set-cookie: {c}; path=/;\r\n")),
+                Some(ibex_config::RedirectCookie::SetFmt(f)) => {
+                    reply.push_str(&format!("set-cookie: {}; path=/;\r\n", format_sample_string(f, ctx, registry)));
+                }
                 Some(ibex_config::RedirectCookie::Clear(n)) => reply.push_str(&format!("set-cookie: {n}; path=/; Max-Age=0;\r\n")),
                 None => {}
             }
