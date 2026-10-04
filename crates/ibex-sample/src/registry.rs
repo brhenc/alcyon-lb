@@ -4042,12 +4042,16 @@ pub fn match_map(path: &str, input: &str, match_type: MapMatchType) -> Option<(S
             None
         }
         MapMatchType::Int => {
-            if let Ok(n) = input.parse::<i64>() {
-                if let Some(res) = table.exact_int.get(&n) {
-                    return Some(res.clone());
-                }
+            let n = input.parse::<i64>().ok()?;
+            if let Some(res) = table.exact_int.get(&n) {
+                return Some(res.clone());
             }
-            None
+            // `<low>-<high>` keys, bounds included.
+            table.entries.iter().find_map(|e| {
+                let (lo, hi) = e.key.split_once('-')?;
+                let (lo, hi) = (lo.parse::<i64>().ok()?, hi.parse::<i64>().ok()?);
+                (lo <= n && n <= hi).then(|| (e.val.clone(), e.key.clone()))
+            })
         }
         MapMatchType::Beg => {
             let mut best_match: Option<(String, String)> = None;

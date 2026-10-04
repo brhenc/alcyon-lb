@@ -296,6 +296,29 @@ fn url_enc_and_url_dec_keep_trailing_spaces_and_encode_reserved_characters() {
     );
 }
 
+/// `reg-tests/converter/map_variants.vtc`, integer keys: a plain key and a `100-200` range.
+#[test]
+fn map_int_matches_a_key_range_and_reports_the_range_as_key() {
+    let dir = std::env::temp_dir().join(format!("ibex-map-int-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("dir");
+    let ikey = dir.join("ikey.map");
+    std::fs::write(&ikey, "# Integer keyed map, including a range, with integer values.\n7 700\n10 100\n100-200 150\n").expect("map");
+    let m = ikey.display();
+    let rules = format!(
+        "  http-request return status 200 hdr x-int \"%[int(10),map_int({m})]\" hdr x-i \"%[int(7),map_int_int({m}),add(1)]\" \
+hdr x-r \"%[int(150),map_int({m})]\" hdr x-k \"%[int(150),map_int_key({m})]\" hdr x-lo \"%[int(100),map_int({m})]\" \
+hdr x-hi \"%[int(200),map_int({m})]\" hdr x-out \"[%[int(201),map_int({m})]]\" hdr x-d \"%[int(999),map_int_int({m},42),add(1)]\"\n"
+    );
+    let got = run(&rules, &[&get("/")]);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(
+        got,
+        vec![vec![
+            "x-int: 100", "x-i: 701", "x-r: 150", "x-k: 100-200", "x-lo: 150", "x-hi: 150", "x-out: []", "x-d: 43",
+        ]]
+    );
+}
+
 #[test]
 fn set_var_with_a_failing_converter_leaves_the_variable_alone() {
     let rules = "  http-request set-var(txn.a) str(one)\n\
