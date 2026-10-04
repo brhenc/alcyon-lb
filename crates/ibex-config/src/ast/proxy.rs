@@ -140,6 +140,8 @@ pub struct BindConfig {
     pub proto: Option<String>,
     pub accept_proxy: bool,
     pub accept_proxy_v2: bool,
+    /// `name <n>`: what `so_name` reads on connections this bind accepted.
+    pub name: Option<String>,
 }
 
 /// A `listen` proxy section combining frontend and backend.

@@ -911,6 +911,7 @@ fn stream_sample_ctx<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, view: 
         req_headers: s.req_headers.as_deref(),
         fe_name: Some(&fe.name),
         be_name: Some(&be.name),
+        so_name: s.so_name.as_deref(),
         captures_req_hdr: Some(&s.log.req_captures),
         captures_res_hdr: Some(&s.log.res_captures),
         unique_id: s.log.unique_id.as_deref(),
@@ -1685,6 +1686,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     proto: None,
                     accept_proxy: listen.accept_proxy,
                     accept_proxy_v2: listen.accept_proxy_v2,
+                    name: None,
                 }]
             } else {
                 listen.binds.clone()
@@ -1693,6 +1695,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 let tls = bind_tls(&listen.name, &binds, b.addr)?;
                 for mut listener in listeners_for(worker_id, b.addr, usize_to_u32(proxy_idx))? {
                     listener.maxconn = listen.maxconn;
+                    listener.name = b.name.as_deref().map(Into::into);
                     listener.tls.clone_from(&tls);
                     let l_idx = listeners.len();
                     let lfd = listener.raw_fd();
@@ -1721,6 +1724,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                         proto: None,
                         accept_proxy: frontend.accept_proxy,
                         accept_proxy_v2: frontend.accept_proxy_v2,
+                        name: None,
                     });
                 }
             }
@@ -1748,6 +1752,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     let tls = bind_tls(&frontend.name, &frontend.binds, bind_addr)?;
                     for mut listener in listeners_for(worker_id, bind_addr, usize_to_u32(proxy_idx))? {
                         listener.maxconn = frontend.maxconn;
+                        listener.name = b.name.as_deref().map(Into::into);
                         listener.tls.clone_from(&tls);
                         let l_idx = listeners.len();
                         let lfd = listener.raw_fd();
@@ -2732,6 +2737,7 @@ fn eval_tcp_req_session_rules(
         client_addr: sess.client_addr,
         server_addr: sess.server_addr,
         fc_src: sess.fc_src,
+        so_name: sess.so_name.as_deref(),
         fc_dst: sess.fc_dst,
         proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
         act_conn: proxy.stats[worker_id()].act_conn.load(Ordering::Relaxed),
@@ -2995,6 +3001,7 @@ fn eval_tcp_req_content_rules(
         client_addr: sess.client_addr,
         server_addr: sess.server_addr,
         fc_src: sess.fc_src,
+        so_name: sess.so_name.as_deref(),
         fc_dst: sess.fc_dst,
         proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
         req_body: if has_content { Some(req_bytes) } else { None },
@@ -3286,6 +3293,7 @@ fn eval_tcp_res_content_rules(proxy: &Proxy, proxies: &[Proxy], registry: &Regis
         client_addr: sess.client_addr,
         server_addr: sess.server_addr,
         fc_src: sess.fc_src,
+        so_name: sess.so_name.as_deref(),
         fc_dst: sess.fc_dst,
         proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
         res_body: Some(rep_bytes),
@@ -3421,6 +3429,7 @@ fn register_new_session(
     };
     // Without a listener, the client is an HTTP/3 request stream (`adopt_quic_streams`).
     sess.h3 = listener_idx.is_none();
+    sess.so_name = listener_idx.and_then(|i| engine.listeners.get(i)).and_then(|l| l.name.clone());
 
     let proxy = &mut engine.proxies[proxy_idx];
 
@@ -4374,6 +4383,7 @@ impl EngineDispatcher<'_> {
             client_addr: sess.client_addr,
             server_addr: sess.server_addr,
             fc_src: sess.fc_src,
+            so_name: sess.so_name.as_deref(),
             fc_dst: sess.fc_dst,
             is_first_req: sess.is_first_req,
             proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
@@ -5210,6 +5220,7 @@ impl EngineDispatcher<'_> {
             client_addr: entry.sess.client_addr,
             server_addr: entry.sess.server_addr,
             fc_src: entry.sess.fc_src,
+            so_name: entry.sess.so_name.as_deref(),
             fc_dst: entry.sess.fc_dst,
             is_first_req: entry.sess.is_first_req,
             proxy_tlvs: entry.sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
@@ -5801,6 +5812,7 @@ impl EngineDispatcher<'_> {
             client_addr: entry.sess.client_addr,
             server_addr: entry.sess.server_addr,
             fc_src: entry.sess.fc_src,
+            so_name: entry.sess.so_name.as_deref(),
             fc_dst: entry.sess.fc_dst,
             is_first_req: entry.sess.is_first_req,
             proxy_tlvs: entry.sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
@@ -5922,6 +5934,7 @@ impl EngineDispatcher<'_> {
                         client_addr: $s.client_addr,
                         server_addr: $s.server_addr,
                         fc_src: $s.fc_src,
+                        so_name: $s.so_name.as_deref(),
                         fc_dst: $s.fc_dst,
                         is_first_req: $s.is_first_req,
                         proxy_tlvs: $s.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
@@ -8268,6 +8281,7 @@ fn after_res_on_reply<'r>(
             client_addr: sess.client_addr,
             server_addr: sess.server_addr,
             fc_src: sess.fc_src,
+            so_name: sess.so_name.as_deref(),
             fc_dst: sess.fc_dst,
             is_first_req: sess.is_first_req,
             proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
@@ -8324,6 +8338,7 @@ fn proxy_error_response(sess: &TcpSession, be: &Proxy, fe: &Proxy, proxies: &[Pr
                     proxies: Some(&ProxiesView(proxies)),
                     client_addr: sess.client_addr,
                     fc_src: sess.fc_src,
+                    so_name: sess.so_name.as_deref(),
                     fc_dst: sess.fc_dst,
                     is_first_req: sess.is_first_req,
                     htx_slice: sess.htx_slice(),

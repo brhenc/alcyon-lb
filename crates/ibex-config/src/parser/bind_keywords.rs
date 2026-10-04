@@ -58,7 +58,6 @@ pub(crate) const UNIMPLEMENTED_BIND_KEYWORDS: &[BindKeyword] = &[
     refuse!("maxconn", 1),
     refuse!("mode", 1),
     ignore!("mss", 1, "the TCP maximum segment size"),
-    ignore!("name", 1, "the listener's name in the stats"),
     refuse!("namespace", 1),
     ignore!("nbconn", 1, "the number of sockets per listener"),
     ignore!("nice", 1, "the scheduling priority of its connections"),

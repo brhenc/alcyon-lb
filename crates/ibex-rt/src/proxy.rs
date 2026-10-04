@@ -18,6 +18,7 @@
 //!
 //! [`Mux`]: ibex_proto::Mux
 
+use std::sync::Arc;
 use crate::buf::Buf;
 use crate::raw::{self, Io};
 use crate::txn::{self, HttpTxn};
@@ -99,6 +100,8 @@ pub struct TcpSession {
     pub srv_xprt: ServerXprt,
     pub mode: Mode,
     pub client_addr: Option<SocketAddr>,
+    /// The name of the bind that accepted this connection (`so_name`).
+    pub so_name: Option<Arc<str>>,
     pub cliexp: Vec<CompiledExp>,
     pub srvexp: Vec<CompiledExp>,
     pub req_uri: Option<String>,
@@ -231,6 +234,7 @@ impl TcpSession {
             srv_xprt: ServerXprt::Plain,
             mode,
             client_addr: None,
+            so_name: None,
             cliexp,
             srvexp,
             req_uri: None,

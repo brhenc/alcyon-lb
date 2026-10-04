@@ -714,6 +714,7 @@ fn parse_bind(tokens: &[Token], kw: &Token, section: &str) -> Result<BindConfig,
         proto: None,
         accept_proxy: false,
         accept_proxy_v2: false,
+        name: None,
     };
     let prefix = format!("'bind {}' in section '{section}'", tokens[1].text);
     let arg = |i: usize, what: &str| -> Result<&Token, ConfigError> {
@@ -741,6 +742,10 @@ fn parse_bind(tokens: &[Token], kw: &Token, section: &str) -> Result<BindConfig,
             }
             "proto" => {
                 bind.proto = Some(arg(i, "missing protocol name")?.text.clone());
+                i += 1;
+            }
+            "name" => {
+                bind.name = Some(arg(i, "missing name")?.text.clone());
                 i += 1;
             }
             "accept-proxy" => bind.accept_proxy = true,
