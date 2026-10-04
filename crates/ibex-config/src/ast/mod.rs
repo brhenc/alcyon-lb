@@ -73,6 +73,20 @@ pub struct Config {
     /// `HAProxy` numbers proxies in this order; empty for a configuration not built by the
     /// parser, which [`Config::proxy_ids`] then takes as listens, backends, frontends.
     pub proxy_order: Vec<(ProxyKind, usize)>,
+    /// The `.warning` and `.notice` lines of the configuration (an `.alert` fails the
+    /// parse), for the caller to print as `HAProxy` does while it loads.
+    pub directive_messages: Vec<DirectiveMessage>,
+}
+
+/// A `.warning` or `.notice` directive that was in force.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectiveMessage {
+    /// `true` for `.warning`, `false` for `.notice`.
+    pub warning: bool,
+    /// 1-based line of the directive in the configuration text.
+    pub line: usize,
+    /// Its argument: empty when it has none.
+    pub text: String,
 }
 
 /// Which list of [`Config`] a proxy section is in.

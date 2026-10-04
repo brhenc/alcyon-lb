@@ -3,6 +3,7 @@
 
 use crate::lexer::Line;
 use crate::error::ConfigError;
+use crate::ast::DirectiveMessage;
 
 fn parse_cond(s: &str) -> Result<bool, String> {
     crate::cond::eval_if(s)
@@ -17,6 +18,20 @@ fn parse_cond(s: &str) -> Result<bool, String> {
 /// - A `.elif`, `.else`, or `.endif` directive occurs without a preceding `.if`
 /// - An `.if` block remains unterminated at the end of the input
 pub fn preprocess(lines: Vec<Line>) -> Result<Vec<Line>, ConfigError> {
+    preprocess_with_messages(lines).map(|(out, _)| out)
+}
+
+/// [`preprocess`], and the `.warning` and `.notice` directives that were in force.
+///
+/// `.alert` is fatal, as in `HAProxy`; `.diag` says nothing unless diagnostics are asked
+/// for (`-dD`), which Ibex does not have, so it is dropped. A directive takes at most one
+/// argument, its message.
+///
+/// # Errors
+///
+/// As [`preprocess`], and for an `.alert` or a message directive with too many arguments.
+pub fn preprocess_with_messages(lines: Vec<Line>) -> Result<(Vec<Line>, Vec<DirectiveMessage>), ConfigError> {
+    let mut messages = Vec::new();
     let mut out = Vec::new();
     let mut if_stack: Vec<bool> = Vec::new();
     let mut if_done: Vec<bool> = Vec::new();
@@ -87,8 +102,20 @@ pub fn preprocess(lines: Vec<Line>) -> Result<Vec<Line>, ConfigError> {
                 if_done.pop();
             }
             ".diag" | ".notice" | ".warning" | ".alert" => {
-                // Informational directives are dropped from the parsed tree,
-                // matching the instruction to skip them cleanly.
+                if if_stack.last().copied().unwrap_or(true) && first != ".diag" {
+                    if let Some(extra) = line.tokens.get(2) {
+                        return Err(ConfigError::new(
+                            line.line_number,
+                            extra.col,
+                            format!("Unexpected argument '{}' for '{first}'. Use quotes if the message should contain spaces.", extra.text),
+                        ));
+                    }
+                    let text = line.tokens.get(1).map(|t| t.text.clone()).unwrap_or_default();
+                    if first == ".alert" {
+                        return Err(ConfigError::new(line.line_number, line.tokens[0].col, format!("'{text}'.")));
+                    }
+                    messages.push(DirectiveMessage { warning: first == ".warning", line: line.line_number, text });
+                }
             }
             _ => {
                 if if_stack.last().copied().unwrap_or(true) {
@@ -102,5 +129,5 @@ pub fn preprocess(lines: Vec<Line>) -> Result<Vec<Line>, ConfigError> {
         return Err(ConfigError::new(last_line, 1, "non-terminated '.if' block."));
     }
 
-    Ok(out)
+    Ok((out, messages))
 }

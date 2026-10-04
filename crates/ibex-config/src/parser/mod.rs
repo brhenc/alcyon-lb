@@ -159,7 +159,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
     if let Some((line, (col, msg))) = lexed.iter().find_map(|l| Some((l.line_number, l.error.clone()?))) {
         return Err(ConfigError::new(line, col, msg));
     }
-    let lines = crate::preproc::preprocess(lexed)?;
+    let (lines, directive_messages) = crate::preproc::preprocess_with_messages(lexed)?;
 
     // `http-errors` sections are resolved eagerly into a process-wide registry as they are
     // parsed (see `crate::ast::rules_http`), the same way `crate::ast::checks` resolves
@@ -515,6 +515,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
         sample_refs,
         userlists,
         proxy_order,
+        directive_messages,
     };
     register_checks_from_config(&config);
 

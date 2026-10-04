@@ -25,7 +25,7 @@ pub use ast::{
     AclCondition, AclRule, AclTerm, BackendSection, BalanceAlgorithm, Config, CookieConfig, DefaultsSection,
     ErrorPageSource, Forwarded, ForwardedValue, FrontendSection, GlobalSection, GlobalSetVar, StatsSocket,
     HashPreserveAffinity, HashType,
-    HeaderExp, HttpAfterResAction, HttpAfterResRule, HttpReqAction, HttpReqRule, HttpResAction, RedirectCookie, RedirectKind, RedirectRule,
+    HeaderExp, HttpAfterResAction, HttpAfterResRule, HttpReqAction, HttpReqRule, HttpResAction, RedirectCookie, RedirectKind, RedirectRule, DirectiveMessage,
     HeaderCapture, HttpResRule, HttpReuse, ListenSection, LogConfig, LogFormatSpec, LogFacility, LogLevel, LogSample, LogTarget, LogForwardBind, LogForwardHost, LogForwardSection, Mode, RingFormat, RingSection, RingServer, RingServerAddr, RetriesValue,
     SampleRef, SectionKind, Server, ServerSsl, SslVerify, StatsConfig, StatusCodeSet, TlsVersion,
     StickRule, StickRuleType, StickTableConfigAst, TcpReqConnAction, TcpReqConnRule,
