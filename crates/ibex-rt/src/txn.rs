@@ -317,6 +317,9 @@ pub struct RspWait {
     pub list: usize,
     pub rule: usize,
     pub deadline: ibex_sched::Tick,
+    /// The backend's `tcp-response content` rules wait for the end of their
+    /// `inspect-delay` (`WAIT_END`); `list` and `rule` are unused.
+    pub inspect: bool,
 }
 
 /// How much of a message body `data` holds.

@@ -5458,13 +5458,17 @@ impl EngineDispatcher<'_> {
         }
         // A response held for its body (`wait-for-body`) comes back here with its head as
         // the rules before the wait left it, and goes on from the wait.
-        let resume = txn.rsp_wait.take();
+        let wait = txn.rsp_wait.take();
+        // Held by `tcp-response content` (`WAIT_END`): the rules start over, with the delay
+        // already running.
+        let inspect_wait = wait.filter(|w| w.inspect);
+        let resume = wait.filter(|w| !w.inspect);
         // The final response head: `t_data`, and `capture response header`.
-        if resume.is_none() {
+        if wait.is_none() {
             entry.sess.log.data = Some(std::time::Instant::now());
         }
         let fe_caps = &proxies[fe_idx].res_capture_slots;
-        if resume.is_none() && !fe_caps.is_empty() {
+        if wait.is_none() && !fe_caps.is_empty() {
             // From the bytes of the head, not a lossy copy of them.
             let head = &entry.sess.rep.readable()[..total_hdr_len];
             let headers: Vec<(&[u8], &[u8])> = head
@@ -5650,10 +5654,37 @@ impl EngineDispatcher<'_> {
             CURRENT_RES_STATUS.set(0);
             CURRENT_RES_HEADERS.with(|h| h.borrow_mut().clear());
             let tcp_ctx = SampleContext { res_version: None, ..ctx.clone() };
+            // `tcp-response inspect-delay` runs from the first pass over the head; with none,
+            // the rules cannot wait (`tcp_inspect_response`).
+            let inspect_exp = inspect_wait.map(|w| w.deadline).or_else(|| {
+                proxies[be_idx].tcp_res_inspect_delay.map(|d| fresh_tick(now).add(u32::try_from(d.as_millis()).unwrap_or(u32::MAX)))
+            });
+            let inspect_final = srv_ended || rep_full || srv_timed_out || inspect_exp.is_none_or(|exp| exp.is_expired(fresh_tick(now)));
             for rule in proxies[be_idx].tcp_res_content_rules.iter().filter(|_| resume.is_none()) {
                 let matches = match &rule.cond {
                     None => true,
-                    Some(cond) => eval_condition(cond, &tcp_ctx, &proxies[be_idx].acls, registry),
+                    Some(cond) => {
+                        let res = crate::proxy::combine_condition(cond, |term| {
+                            let parsed = if proxies[be_idx].acls.contains_key(&term.name) { None } else { Expr::parse(&term.name).ok() };
+                            let Some(expr) = proxies[be_idx].acls.get(&term.name).or(parsed.as_ref()) else {
+                                return crate::proxy::AclEvalResult::NotMatched;
+                            };
+                            if expr.fetch_name == "wait_end" && !inspect_final {
+                                return crate::proxy::AclEvalResult::MissingData;
+                            }
+                            if expr.eval(registry, &tcp_ctx) != term.negated {
+                                crate::proxy::AclEvalResult::Matched
+                            } else {
+                                crate::proxy::AclEvalResult::NotMatched
+                            }
+                        });
+                        if res == crate::proxy::AclEvalResult::MissingData {
+                            // Held until the delay is over: the rules start again then.
+                            held = Some(crate::txn::RspWait { list: 0, rule: 0, deadline: inspect_exp.unwrap_or(Tick::ETERNITY), inspect: true });
+                            break 'rules None;
+                        }
+                        res == crate::proxy::AclEvalResult::Matched
+                    }
                 };
                 if !matches {
                     continue;
@@ -5721,7 +5752,7 @@ impl EngineDispatcher<'_> {
                         BodyWait::Pending
                     };
                     match outcome {
-                        BodyWait::Pending => held = Some(crate::txn::RspWait { list, rule, deadline }),
+                        BodyWait::Pending => held = Some(crate::txn::RspWait { list, rule, deadline, inspect: false }),
                         BodyWait::TimedOut => timed_out = true,
                         BodyWait::Malformed => malformed = true,
                         _ => {}
