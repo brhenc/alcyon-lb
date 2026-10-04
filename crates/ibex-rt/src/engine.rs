@@ -57,9 +57,6 @@ use ibex_sample::registry::{
 };
 
 thread_local! {
-    /// What the engine's ticks count from, on this thread: set by every `step`, read by
-    /// [`fresh_tick`].
-    static TICK_EPOCH: Cell<Option<Instant>> = const { Cell::new(None) };
     pub static WORKER_ID: Cell<usize> = const { Cell::new(0) };
     static STRICT_MODE: Cell<bool> = const { Cell::new(true) };
     /// The line of the `http-response` rule that last ended the rules (`allow`, `deny`,
@@ -2745,7 +2742,6 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
 
     pub fn step(&mut self, now: Tick) -> io::Result<usize> {
         self.now = now;
-        TICK_EPOCH.with(|e| e.set(Some(self.start_time)));
 
         // 1. Expire scheduler timers
         self.scheduler.set_now(now);
@@ -4616,7 +4612,7 @@ fn init_client_session(
         sess.tcp_inspect_done = false;
         if let Some(delay) = proxy.tcp_req_inspect_delay {
             let ms = u32::try_from(delay.as_millis()).unwrap_or(u32::MAX);
-            sess.inspect_exp = Some(fresh_tick(now).add(ms));
+            sess.inspect_exp = Some(now.add(ms));
         }
     }
 
@@ -5824,7 +5820,7 @@ impl EngineDispatcher<'_> {
         entry.sess.reset_for_next_request();
         // The wait for the next request starts with the response's end
         // (`timeout http-keep-alive`).
-        entry.sess.arm_request(fresh_tick(now));
+        entry.sess.arm_request(now);
         // A next request already in the buffer has no socket event left to announce it:
         // run once more straight away. (Without one, the poller wakes the session.)
         if !entry.sess.req.is_empty() {
@@ -5839,7 +5835,7 @@ impl EngineDispatcher<'_> {
             entry.sess.tcp_inspect_done = false;
             entry.sess.inspect_exp = proxy
                 .tcp_req_inspect_delay
-                .map(|d| fresh_tick(now).add(u32::try_from(d.as_millis()).unwrap_or(u32::MAX)));
+                .map(|d| now.add(u32::try_from(d.as_millis()).unwrap_or(u32::MAX)));
         }
     }
 
@@ -5947,6 +5943,9 @@ impl EngineDispatcher<'_> {
                     ContentEvalResult::Done => {
                         entry.sess.tcp_inspect_done = true;
                         entry.sess.inspect_exp = None;
+                        // `switch-mode http` made the first request's head a thing to wait
+                        // for: `timeout http-request` starts now, not at the next event.
+                        entry.sess.arm_request(now);
                     }
                     ContentEvalResult::Reject => {
                         raw::abort_with_rst(entry.sess.cli.as_fd());
@@ -6412,11 +6411,11 @@ impl EngineDispatcher<'_> {
             // `tcp-response inspect-delay` runs from the first pass over the head; with none,
             // the rules cannot wait (`tcp_inspect_response`).
             let inspect_exp = inspect_wait.map(|w| w.deadline).or_else(|| {
-                proxies[be_idx].tcp_res_inspect_delay.map(|d| fresh_tick(now).add(u32::try_from(d.as_millis()).unwrap_or(u32::MAX)))
+                proxies[be_idx].tcp_res_inspect_delay.map(|d| now.add(u32::try_from(d.as_millis()).unwrap_or(u32::MAX)))
             });
             // A server that closed after its response does not end the wait: measured, the
             // response still waits for the whole delay.
-            let inspect_final = rep_full || srv_timed_out || inspect_exp.is_none_or(|exp| exp.is_expired(fresh_tick(now)));
+            let inspect_final = rep_full || srv_timed_out || inspect_exp.is_none_or(|exp| exp.is_expired(now));
             for rule in proxies[be_idx].tcp_res_content_rules.iter().filter(|_| resume.is_none()) {
                 let matches = match &rule.cond {
                     None => true,
@@ -6482,7 +6481,6 @@ impl EngineDispatcher<'_> {
                 let rules = proxies[px].http_res_rules.iter().map(|r| (ResOp::of_res(&r.action), r.cond.as_ref(), r.line));
                 let caps = (!fe_res_slots.is_empty()).then_some((&mut res_caps, &fe_res_slots[..]));
                 let mut check = |rule: usize, time_ms: u32, at_least: u32| -> BodyWait {
-                    let now = fresh_tick(now);
                     let here = resume.filter(|w| w.list == list && w.rule == rule);
                     let deadline = here.map_or_else(
                         || if time_ms > 0 { now.add(time_ms) } else { Tick::ETERNITY },
@@ -7183,7 +7181,6 @@ impl EngineDispatcher<'_> {
                     ibex_config::HttpReqAction::Tarpit { deny_status, content_type, lf_string, error_page } => {
                         // The request is held until `timeout tarpit` (`timeout connect` when
                         // unset) has passed, then answered like a `deny` with status 500.
-                        let now = fresh_tick(now);
                         let held = sess.txn.as_ref().and_then(|t| t.body_wait).filter(|w| w.tarpit && w.backend == be_stage && w.rule == rule_idx);
                         let deadline = held.map_or_else(
                             || {
@@ -7653,7 +7650,7 @@ impl EngineDispatcher<'_> {
         if (!resume_be || inspect_wait.is_some()) && !proxies[be_idx].tcp_req_content_rules.is_empty() {
             // The backend's own `inspect-delay`, from the first pass over its rules.
             let deadline = inspect_wait.map(|w| w.deadline).or_else(|| {
-                proxies[be_idx].tcp_req_inspect_delay.map(|d| fresh_tick(now).add(u32::try_from(d.as_millis()).unwrap_or(u32::MAX)))
+                proxies[be_idx].tcp_req_inspect_delay.map(|d| now.add(u32::try_from(d.as_millis()).unwrap_or(u32::MAX)))
             });
             entry.sess.inspect_exp = deadline;
             let res = eval_tcp_req_content_rules(
@@ -7995,7 +7992,7 @@ impl EngineDispatcher<'_> {
                 // (`stream_set_backend` clears the analyser's expiry).
                 entry.sess.inspect_exp = proxies[be_idx]
                     .tcp_req_inspect_delay
-                    .map(|d| fresh_tick(now).add(u32::try_from(d.as_millis()).unwrap_or(u32::MAX)));
+                    .map(|d| now.add(u32::try_from(d.as_millis()).unwrap_or(u32::MAX)));
             }
             let res = eval_tcp_req_content_rules(
                 &proxies[be_idx],
@@ -8786,16 +8783,6 @@ fn add_req_header(sess: &mut TcpSession, name: &str, val: &str) {
     rebuild_req_buffer(sess);
 }
 
-/// The time now. `step` takes its tick before it waits in the poller, so a stream woken by a
-/// request after an idle second would arm a `wait-for-body` of 300 ms from a second ago;
-/// `now`, the pass's tick, stands in where no step has run on this thread.
-fn fresh_tick(now: Tick) -> Tick {
-    TICK_EPOCH.with(Cell::get).map_or(now, |start| {
-        let ms = u32::try_from(start.elapsed().as_millis() & 0xFFFF_FFFF).unwrap_or(u32::MAX);
-        Tick(if ms == 0 { 1 } else { ms })
-    })
-}
-
 /// What a pass over a list of `http-request` rules came to.
 #[derive(Debug, PartialEq, Eq)]
 enum RuleFlow {
@@ -8848,7 +8835,6 @@ fn wait_for_request_body(
         if let MsgState::Head { body, .. } = t.req { body } else { crate::txn::Framing::None }
     });
     let held = sess.txn.as_ref().and_then(|t| t.body_wait).filter(|w| w.backend == backend && w.rule == rule);
-    let now = fresh_tick(now);
     let deadline = match held {
         Some(w) => w.deadline,
         None => {
