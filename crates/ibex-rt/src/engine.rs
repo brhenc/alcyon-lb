@@ -5206,8 +5206,21 @@ fn reply_empty(entry: &mut SessionEntry, proxies: &[Proxy], status: u16) {
 /// there is a stream, so no rule runs on it -- `http-after-response` included.
 fn reply_parse_error(entry: &mut SessionEntry, proxies: &[Proxy], status: u16) {
     let be = proxies.get(entry.backend_idx).unwrap_or(&proxies[entry.proxy_idx]);
-    let page = proxy_error_response(&entry.sess, be, &proxies[entry.proxy_idx], proxies, status);
-    entry.sess.write_reply(&page);
+    let mut page = proxy_error_response(&entry.sess, be, &proxies[entry.proxy_idx], proxies, status);
+    // The H1 mux's own error reply goes through HTX, which writes the header names in lower
+    // case (measured on 3.5-dev8: `content-length: 105`, `cache-control: ...`).
+    {
+        let head = crate::proxy::find_eoh(&page).map_or(0, |(h, _)| h);
+        let mut at = page[..head].iter().position(|&b| b == b'\n').map_or(head, |i| i + 1);
+        while at < head {
+            let end = page[at..head].iter().position(|&b| b == b'\n').map_or(head, |i| at + i + 1);
+            let colon = page[at..end].iter().position(|&b| b == b':').map_or(at, |i| at + i);
+            page[at..colon].make_ascii_lowercase();
+            at = end;
+        }
+    }
+    // HAProxy's 431 does not say `Connection: close`, though it closes.
+    entry.sess.write_reply_with(&page, status != 431);
     // The request that could not be parsed counts as a request and as the error or failure its
     // status is (measured: `http_req_cnt=1 http_err_cnt=1` for a 400).
     let (is_err, is_fail) = response_class(status);
@@ -9542,7 +9555,7 @@ enum ResOp<'a> {
     Set(&'a str, &'a str),
     Add(&'a str, &'a str),
     Del(&'a str),
-    Status(u16),
+    Status(u16, Option<&'a str>),
     /// `http-response redirect location <fmt> code <c> [cookie]`.
     Redirect(&'a str, u16, Option<&'a ibex_config::RedirectCookie>),
 }
@@ -9570,7 +9583,7 @@ impl<'a> ResOp<'a> {
             ibex_config::HttpResAction::SetHeader { name, fmt } => Self::Set(name, fmt),
             ibex_config::HttpResAction::AddHeader { name, fmt } => Self::Add(name, fmt),
             ibex_config::HttpResAction::DelHeader { name } => Self::Del(name),
-            ibex_config::HttpResAction::SetStatus { status } => Self::Status(*status),
+            ibex_config::HttpResAction::SetStatus { status, reason } => Self::Status(*status, reason.as_deref()),
             ibex_config::HttpResAction::Redirect { location, code, cookie } => Self::Redirect(location, *code, cookie.as_ref()),
             ibex_config::HttpResAction::Capture { expr, id } => return ResRule::Capture(expr, *id),
             ibex_config::HttpResAction::WaitForBody { time_ms, at_least } => return ResRule::Wait(*time_ms, *at_least),
@@ -9738,8 +9751,8 @@ fn res_action(
             reply.push_str("\r\n");
             return Err(ResStop::Reply(reply.into_bytes()));
         }
-        ResOp::Status(st) => {
-            let reason = status_reason(st);
+        ResOp::Status(st, custom) => {
+            let reason = custom.unwrap_or_else(|| status_reason(st));
             if !res_htx_resize(status_msg.len(), reason.len()) {
                 return failed();
             }
@@ -9782,7 +9795,12 @@ fn res_action(
         });
     }
     if act_name == "\0set-status" {
-        return res_action(ResOp::Status(act_fmt.parse().unwrap_or(*status)), hdrs, status, status_msg, ctx, registry, sess_vars, req_vars);
+        // `http-after-response set-status` is stored as `<code>` or `<code>\0<reason>`.
+        let (code, reason) = match act_fmt.split_once('\0') {
+            Some((c, r)) => (c, Some(r)),
+            None => (act_fmt, None),
+        };
+        return res_action(ResOp::Status(code.parse().unwrap_or(*status), reason), hdrs, status, status_msg, ctx, registry, sess_vars, req_vars);
     }
     if let Some(var_name) = act_name.strip_prefix("\0set-var:") {
         // A fetch that finds nothing leaves the variable as it was (`action_store`).

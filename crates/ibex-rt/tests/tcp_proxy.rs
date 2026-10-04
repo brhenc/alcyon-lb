@@ -1078,11 +1078,18 @@ fn test_header_size_boundary_against_bufsize_minus_maxrewrite() {
         String::from_utf8_lossy(&response).into_owned()
     };
 
-    // 1. Request below threshold: 3071 bytes
-    // Fixed: GET / HTTP/1.1\r\n (16) + X-Padding:  (11) + \r\n\r\n (4) = 31 bytes
-    let pad_below = "A".repeat(3071 - 31);
-    let req_below = format!("GET / HTTP/1.1\r\nX-Padding: {pad_below}\r\n\r\n").into_bytes();
-    assert_eq!(req_below.len(), 3071);
+    // HAProxy 3.5-dev8 (tune.bufsize 4096, tune.maxrewrite 1024), `GET / HTTP/1.1` plus one
+    // `X-Padding` header and no `Host`, measured by bisection (tasks/T87): a head of 2997
+    // bytes is accepted, 2998 gets `431 Request Header Fields Too Large`. The limit is not
+    // `bufsize - maxrewrite` on the wire: the head is parsed into HTX, whose buffer holds a
+    // 40-byte `struct htx` and an 8-byte `struct htx_blk` per block (start line, each
+    // header, end of headers) beside the data, and that has to fit in 3072
+    // (`HTX_BUF_OVERHEAD` in `include/haproxy/htx-t.h`).
+    let req_of = |len: usize, c: &str| format!("GET / HTTP/1.1\r\nX-Padding: {}\r\n\r\n", c.repeat(len - 31)).into_bytes();
+
+    // 1. Below the limit: 2996 bytes
+    let req_below = req_of(2996, "A");
+    assert_eq!(req_below.len(), 2996);
     let resp1 = drive_req(&mut engine, &req_below);
     assert!(
         resp1.starts_with("HTTP/1.1 200 OK"),
@@ -1094,10 +1101,9 @@ fn test_header_size_boundary_against_bufsize_minus_maxrewrite() {
         "backend must have received below-threshold request"
     );
 
-    // 2. Request at threshold: 3072 bytes
-    let pad_at = "B".repeat(3072 - 31);
-    let req_at = format!("GET / HTTP/1.1\r\nX-Padding: {pad_at}\r\n\r\n").into_bytes();
-    assert_eq!(req_at.len(), 3072);
+    // 2. At the limit: 2997 bytes
+    let req_at = req_of(2997, "B");
+    assert_eq!(req_at.len(), 2997);
     let resp2 = drive_req(&mut engine, &req_at);
     assert!(
         resp2.starts_with("HTTP/1.1 200 OK"),
@@ -1109,23 +1115,21 @@ fn test_header_size_boundary_against_bufsize_minus_maxrewrite() {
         "backend must have received at-threshold request"
     );
 
-    // 3. Request above threshold: 3073 bytes
-    let pad_above = "C".repeat(3073 - 31);
-    let req_above = format!("GET / HTTP/1.1\r\nX-Padding: {pad_above}\r\n\r\n").into_bytes();
-    assert_eq!(req_above.len(), 3073);
-    let resp3 = drive_req(&mut engine, &req_above);
-    // The status, not the reason: the page is HAProxy's built-in one now, which says
-    // "Bad request". (HAProxy 3.5 itself answers 431 here, and already at 3071 bytes:
-    // tasks/T87.)
-    assert!(
-        resp3.starts_with("HTTP/1.1 400 "),
-        "above threshold must produce 400 Bad Request, got: {resp3}"
-    );
-    assert_eq!(
-        backend_seen.lock().unwrap().len(),
-        2,
-        "backend must NOT receive above-threshold request"
-    );
+    // 3. Above the limit: 2998 bytes, and the 3071 .. 4000 the task measured
+    for (n, c) in [(2998, "C"), (3071, "D"), (4000, "E")] {
+        let resp3 = drive_req(&mut engine, &req_of(n, c));
+        assert_eq!(
+            resp3,
+            "HTTP/1.1 431 Request Header Fields Too Large\r\ncontent-length: 105\r\ncache-control: no-cache\r\ncontent-type: text/html\r\n\r\n\
+             <html><body><h1>431 Request Header Fields Too Large</h1>\nRequest Header Fields Too Large.\n</body></html>\n",
+            "{n} bytes: above the limit must produce HAProxy's 431 page, got: {resp3}"
+        );
+        assert_eq!(
+            backend_seen.lock().unwrap().len(),
+            2,
+            "backend must NOT receive above-threshold request"
+        );
+    }
 
     // 4. Response below threshold (3071 bytes header)
     response_mode.store(1, std::sync::atomic::Ordering::Relaxed);
