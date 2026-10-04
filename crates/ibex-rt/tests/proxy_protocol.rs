@@ -938,56 +938,96 @@ fn test_proxy_v2_crc32c_wire_validation() {
     }
 }
 
-/// `tcp-request content` rules run once the PROXY header is in, never over a part of it
-/// (T157). A client that writes the header in pieces used to have the rules run on the
-/// first piece -- `fc_pp_tlv` empty, the condition false, the rules done -- so a
-/// `set-var(sess.*)` taken from a TLV was never set. `HAProxy` reads the header in the
-/// connection's handshake, before the stream and its rules exist (measured with
-/// `reg-tests/sample_fetches/tlvs.vtc`, whose `sendhex` writes are this test's pieces).
-#[test]
-fn test_tcp_content_rules_wait_for_a_fragmented_proxy_v2_header() {
-    let fe = common::reserve_addr();
-    let cfg = format!(
-        "defaults\n    mode http\n    timeout connect 3s\n    timeout client 3s\n    timeout server 3s\n\n\
-         frontend fe\n    bind {fe} accept-proxy\n    \
-         tcp-request content set-var(sess.aws) fc_pp_tlv(0xEA),bytes(1) if {{ fc_pp_tlv(0xEA),bytes(0,1),hex eq 01 }}\n    \
-         http-after-response set-header echo1 %[var(sess.aws)]\n    \
-         http-request return status 200\n"
-    );
-    let mut engine = Engine::new(&ibex_config::parse_str(&cfg).expect("parse"), 64).expect("Engine::new");
+/// A PROXY v2 header from 10.1.2.3:42 to 127.0.0.2:1337 (a source the socket's own peer
+/// cannot be mistaken for) with one AWS TLV (0xEA, subtype 0x01, "aws-vpc-id"), split
+/// after its fixed 16 bytes.
+fn pp2_aws_header() -> (Vec<u8>, Vec<u8>) {
+    let mut head = b"\r\n\r\n\x00\r\nQUIT\n\x21\x11".to_vec();
+    head.extend_from_slice(&26u16.to_be_bytes());
+    let tail = b"\x0a\x01\x02\x03\x7f\x00\x00\x02\x00\x2a\x05\x39\xea\x00\x0b\x01aws-vpc-id".to_vec();
+    (head, tail)
+}
 
-    // Signature, version, family, length (12 + 14), addresses, then one AWS TLV.
-    let pieces: [&[u8]; 6] = [
-        b"\r\n\r\n\x00\r\nQUIT\n",
-        b"\x21",
-        b"\x11",
-        b"\x00\x1a",
-        b"\x7f\x00\x00\x01\x7f\x00\x00\x01\x00\x2a\x05\x39",
-        b"\xea\x00\x0b\x01aws-vpc-id",
-    ];
-    let mut client = TcpStream::connect(fe).expect("connect");
-    for piece in pieces {
-        client.write_all(piece).expect("write piece");
-        // Each piece reaches the engine on runs of its own.
-        for _ in 0..5 {
-            let _ = engine.run_once();
-            thread::sleep(Duration::from_millis(2));
-        }
-    }
-    client.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").expect("write request");
-
+/// Runs `engine` until `client` has a response head, and returns it lowercased.
+fn read_head(engine: &mut Engine, client: &mut TcpStream) -> String {
     client.set_nonblocking(true).expect("nonblocking");
     let start = Instant::now();
     let mut response = Vec::new();
     let mut buf = [0u8; 1024];
     while start.elapsed() < Duration::from_secs(2) && !response.windows(4).any(|w| w == b"\r\n\r\n") {
         let _ = engine.run_once();
-        if let Ok(n) = client.read(&mut buf) {
-            response.extend_from_slice(&buf[..n]);
+        match client.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => response.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(_) => break,
         }
         thread::sleep(Duration::from_millis(2));
     }
-    let response = String::from_utf8_lossy(&response).to_ascii_lowercase();
-    assert!(response.starts_with("http/1.1 200"), "{response}");
-    assert!(response.contains("\r\necho1: aws-vpc-id\r\n"), "{response}");
+    String::from_utf8_lossy(&response).to_ascii_lowercase()
+}
+
+/// The PROXY header is first read when the poller reports the socket readable, not at
+/// accept (T157). `HAProxy`'s `conn_recv_proxy` starts with `if (!fd_recv_ready(fd))
+/// goto not_ready;`, and a new connection's fd is not ready until the poller says so, one
+/// loop after the accept: by then a client's writes of the header have normally all
+/// arrived. Ibex read at accept, found the first piece alone, and refused the header as
+/// truncated (`stream/unique-id-from-proxy.vtc`, `sample_fetches/tlvs.vtc`).
+#[test]
+fn test_accept_proxy_first_read_waits_for_the_poller() {
+    let fe = common::reserve_addr();
+    let cfg = format!(
+        "defaults\n    mode http\n    timeout connect 3s\n    timeout client 3s\n    timeout server 3s\n\n\
+         frontend fe\n    bind {fe} accept-proxy\n    \
+         http-after-response set-header x-src %[src]\n    \
+         http-request return status 200\n"
+    );
+    let mut engine = Engine::new(&ibex_config::parse_str(&cfg).expect("parse"), 64).expect("Engine::new");
+    let (head, tail) = pp2_aws_header();
+
+    let mut client = TcpStream::connect(fe).expect("connect");
+    client.write_all(&head).expect("write head");
+    // The engine accepts with the first piece on the socket...
+    let _ = engine.run_once();
+    // ...and the rest follows a millisecond later, before the next poll.
+    thread::sleep(Duration::from_millis(1));
+    // A refused header resets the connection: these writes may fail, and the response is
+    // then empty.
+    let _ = client.write_all(&tail);
+    let _ = client.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+
+    let response = read_head(&mut engine, &mut client);
+    assert!(response.starts_with("http/1.1 200"), "{response:?}");
+    assert!(response.contains("\r\nx-src: 10.1.2.3\r\n"), "{response:?}");
+}
+
+/// `tcp-request session` rules run once the PROXY header is in: `fc_pp_tlv` and `src`
+/// read the header's values (T157). `HAProxy` runs them in `conn_complete_session`,
+/// after the connection's handshake; Ibex ran them at accept, before a byte of it.
+/// Measured: `sample_fetches/tlvs.vtc` with its two `tcp-request content set-var` rules
+/// as `tcp-request session` passes on `HAProxy`.
+#[test]
+fn test_tcp_session_rules_see_the_proxy_header() {
+    let fe = common::reserve_addr();
+    let cfg = format!(
+        "defaults\n    mode http\n    timeout connect 3s\n    timeout client 3s\n    timeout server 3s\n\n\
+         frontend fe\n    bind {fe} accept-proxy\n    \
+         tcp-request session set-var(sess.aws) fc_pp_tlv(0xEA),bytes(1) if {{ fc_pp_tlv(0xEA),bytes(0,1),hex eq 01 }}\n    \
+         tcp-request session set-var(sess.src) src\n    \
+         http-after-response set-header echo1 %[var(sess.aws)]\n    \
+         http-after-response set-header x-src %[var(sess.src)]\n    \
+         http-request return status 200\n"
+    );
+    let mut engine = Engine::new(&ibex_config::parse_str(&cfg).expect("parse"), 64).expect("Engine::new");
+    let (mut hdr, tail) = pp2_aws_header();
+    hdr.extend_from_slice(&tail);
+    hdr.extend_from_slice(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+
+    let mut client = TcpStream::connect(fe).expect("connect");
+    client.write_all(&hdr).expect("write header and request");
+
+    let response = read_head(&mut engine, &mut client);
+    assert!(response.starts_with("http/1.1 200"), "{response:?}");
+    assert!(response.contains("\r\necho1: aws-vpc-id\r\n"), "{response:?}");
+    assert!(response.contains("\r\nx-src: 10.1.2.3\r\n"), "{response:?}");
 }

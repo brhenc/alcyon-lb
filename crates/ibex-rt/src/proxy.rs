@@ -58,6 +58,11 @@ pub enum ProxyHdrError {
     BadHdr,
     /// A v1 protocol that is not `TCP4`, `TCP6` or `UNKNOWN` (`CO_ER_PRX_BAD_PROTO`).
     BadProto,
+    /// The header was good, and the `tcp-request session` rules it let run refused the
+    /// connection (T157). `conn_complete_session` fails with no error code
+    /// (`CO_ER_NONE`), so `session_kill_embryonic` logs its text, "Success" (measured:
+    /// "10.1.2.3:42 [...] fe/1: Success"), and nothing under `option dontlognull`.
+    SessionRefused,
 }
 
 impl ProxyHdrError {
@@ -72,6 +77,7 @@ impl ProxyHdrError {
             Self::NotHdr => "Received something which does not look like a PROXY protocol header",
             Self::BadHdr => "Received an invalid PROXY protocol header",
             Self::BadProto => "Received an unhandled protocol in the PROXY protocol header",
+            Self::SessionRefused => "Success",
         }
     }
 
@@ -87,10 +93,11 @@ impl ProxyHdrError {
     }
 
     /// `option dontlognull` drops the lines of a client that sent nothing (`session_kill_embryonic`
-    /// checks the code before a timeout has been given one, so that is silent too).
+    /// checks the code before a timeout has been given one, so that is silent too), and
+    /// that of a connection its session rules refused (no error code at all).
     #[must_use]
     pub fn is_null(self) -> bool {
-        matches!(self, Self::Empty | Self::Abort | Self::Timeout)
+        matches!(self, Self::Empty | Self::Abort | Self::Timeout | Self::SessionRefused)
     }
 }
 
@@ -228,6 +235,10 @@ pub struct TcpSession {
     pub accept_proxy: bool,
     pub accept_proxy_v2: bool,
     pub proxy_handshake_done: bool,
+    /// The `tcp-request session` rules wait for the PROXY header (T157): `HAProxy` runs
+    /// them in `conn_complete_session`, after the handshake, so `src` and `fc_pp_tlv`
+    /// read the header.
+    pub session_rules_pending: bool,
     pub proxy_info: Option<ibex_proto::ProxyInfo>,
     pub server_addr: Option<SocketAddr>,
     pub send_proxy_prepended: bool,
@@ -364,6 +375,7 @@ impl TcpSession {
             accept_proxy: false,
             accept_proxy_v2: false,
             proxy_handshake_done: false,
+            session_rules_pending: false,
             proxy_info: None,
             server_addr: None,
             send_proxy_prepended: false,
@@ -492,6 +504,12 @@ impl TcpSession {
         self.accept_proxy_v2 = require_v2;
         self.proxy_handshake_done = false;
         self.cli_state = ScState::Ready;
+        // The header's first read waits for the poller (T157). `conn_recv_proxy` starts
+        // with `if (!fd_recv_ready(fd)) goto not_ready;`, and a new connection's fd is not
+        // ready until the poller reports it, a loop after the accept. That read is the
+        // only one the header gets (a part of it is refused as truncated), so reading at
+        // accept, before the client's writes are all in, refused headers `HAProxy` takes.
+        self.cli_cant_recv = true;
     }
 
     fn arm_client(&mut self, now: Tick) {
@@ -920,6 +938,10 @@ impl TcpSession {
     /// length -- before the transport's handshake consumes anything. `Ok(true)` once the
     /// header is in, `Ok(false)` while it is still arriving.
     fn read_proxy_header_before_tls(&mut self) -> io::Result<bool> {
+        // Not before the poller reports the socket readable (`enable_accept_proxy`).
+        if self.cli_cant_recv {
+            return Ok(false);
+        }
         let fd = self.cli.as_fd();
         let mut peek = [0u8; 16384];
         let n = match raw::peek(fd, &mut peek)? {
