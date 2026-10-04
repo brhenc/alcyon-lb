@@ -12,6 +12,7 @@
 #![forbid(unsafe_code)]
 
 pub mod ast;
+pub mod cond;
 pub mod error;
 pub mod lexer;
 pub mod preproc;

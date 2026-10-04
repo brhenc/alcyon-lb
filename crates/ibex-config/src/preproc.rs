@@ -4,84 +4,8 @@
 use crate::lexer::Line;
 use crate::error::ConfigError;
 
-/// Evaluates a condition string for a conditional block.
-fn parse_cond(mut s: &str) -> Result<bool, String> {
-    s = s.trim();
-    if let Some(rest) = s.strip_prefix('!') {
-        return Ok(!parse_cond(rest)?);
-    }
-    
-    let paren_idx = s.find('(').ok_or_else(|| format!("unparsable conditional expression '{s}'"))?;
-    let func_name = s[..paren_idx].trim();
-    let end_idx = s.rfind(')').ok_or_else(|| format!("unparsable conditional expression '{s}'"))?;
-    if end_idx < paren_idx {
-        return Err(format!("unparsable conditional expression '{s}'"));
-    }
-    let args_str = &s[paren_idx + 1 .. end_idx];
-    
-    let args: Vec<&str> = args_str.split(',').map(str::trim).collect();
-    
-    match func_name {
-        "feature" => {
-            if args.len() != 1 { return Err("feature requires 1 argument".into()); }
-            let feature = args[0];
-            // Ibex supports THREAD. Others (QUIC, LUA, OPENSSL, etc.) are absent.
-            Ok(feature == "THREAD")
-        }
-        "streq" => {
-            if args.len() != 2 { return Err("streq requires 2 arguments".into()); }
-            let a = expand_vars(args[0]);
-            let b = expand_vars(args[1]);
-            Ok(a == b)
-        }
-        "strneq" => {
-            if args.len() != 2 { return Err("strneq requires 2 arguments".into()); }
-            let a = expand_vars(args[0]);
-            let b = expand_vars(args[1]);
-            Ok(a != b)
-        }
-        "defined" => {
-            if args.len() != 1 { return Err("defined requires 1 argument".into()); }
-            let var = args[0];
-            Ok(std::env::var(var).is_ok())
-        }
-        "ssllib_name_startswith" | "openssl_version_atleast" | "openssl_version_before" => {
-            // Ibex uses rustls, so these OpenSSL specific features are absent.
-            Ok(false)
-        }
-        _ => Err(format!("unparsable conditional expression '{s}'")),
-    }
-}
-
-fn expand_vars(s: &str) -> String {
-    let mut out = String::new();
-    let chars: Vec<char> = s.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        if chars[i] == '$' {
-            i += 1;
-            let mut var_name = String::new();
-            let mut has_brace = false;
-            if i < chars.len() && chars[i] == '{' {
-                has_brace = true;
-                i += 1;
-            }
-            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
-                var_name.push(chars[i]);
-                i += 1;
-            }
-            if has_brace && i < chars.len() && chars[i] == '}' {
-                i += 1;
-            }
-            if let Ok(val) = std::env::var(&var_name) {
-                out.push_str(&val);
-            }
-        } else {
-            out.push(chars[i]);
-            i += 1;
-        }
-    }
-    out
+fn parse_cond(s: &str) -> Result<bool, String> {
+    crate::cond::eval_if(s)
 }
 
 /// Preprocesses the tokenized lines, resolving `.if`, `.elif`, `.else`, `.endif` blocks.

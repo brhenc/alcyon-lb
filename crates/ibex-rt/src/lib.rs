@@ -14,7 +14,7 @@
 pub mod applet;
 pub mod buf;
 pub mod check;
-pub mod cond;
+pub use ibex_config::cond;
 pub mod cookie;
 pub mod cpu;
 pub mod dgram;

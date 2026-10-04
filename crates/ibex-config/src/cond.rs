@@ -315,6 +315,19 @@ fn eval_checked(expr: &str) -> Result<bool, String> {
     Ok(v)
 }
 
+/// A `.if` / `.elif` condition (`cfg_eval_condition`): the words of the line, already split
+/// and unquoted by the lexer, joined by single spaces. An empty condition is false.
+///
+/// # Errors
+///
+/// The message `HAProxy` prints, when the condition does not parse.
+pub fn eval_if(expr: &str) -> Result<bool, String> {
+    if expr.is_empty() {
+        return Ok(false);
+    }
+    eval_checked(expr)
+}
+
 /// The command-line half of `-cc`: what `parse_line` (`src/tools.c`) does to the argument
 /// before the expression is parsed, as `do_check_condition` asks for it.
 ///
