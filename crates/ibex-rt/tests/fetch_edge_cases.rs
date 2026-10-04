@@ -98,3 +98,148 @@ fn acl_fetch_evaluates_named_acls_with_negation_and_the_predefined_ones() {
         "{r}"
     );
 }
+
+#[test]
+fn set_var_conditions_are_honoured_on_every_rule_set() {
+    let be = backend();
+    let fe = common::reserve_addr();
+    let _ibex = start(
+        &format!(
+            r####"global
+  set-var proc.int12 int(12)
+defaults
+  mode http
+  timeout connect 2s
+  timeout client 5s
+  timeout server 5s
+frontend fe
+  bind {fe}
+  tcp-request content set-var(txn.t,ifnotexists) str(t1)
+  tcp-request content set-var(txn.t,ifnotexists) str(t2)
+  tcp-request session set-var(sess.q,ifnotexists) str(q1)
+  tcp-request session set-var(sess.q,ifnotexists) str(q2)
+  http-request set-var(txn.a) str(a)
+  http-request set-var(txn.a,ifexists) str(b)
+  http-request set-var(txn.n,ifexists) str(never)
+  http-request set-var(txn.e,ifnotexists) str(first)
+  http-request set-var(txn.e,ifnotexists) str(second)
+  http-request set-var(txn.s,ifset) str(never)
+  http-request set-var(txn.s,ifnotset) str(one)
+  http-request set-var(txn.s,ifnotset) str(two)
+  http-request set-var(txn.s,ifset) str(three)
+  http-request set-var(txn.m) str(full)
+  http-request set-var(txn.m,ifempty) str(x)
+  http-request set-var(txn.m,ifnotempty) str(y)
+  http-request set-var(txn.m,ifempty) str()
+  http-request set-var(txn.m,ifnotempty) str(z)
+  http-request set-var(txn.i,ifempty) int(7)
+  http-request set-var(txn.i2,ifnotempty) int(8)
+  http-request set-var(txn.c,ifnotset,ifnotempty) str(both)
+  http-request set-var(txn.c2,ifnotset,ifempty) str(c2)
+  http-request set-var-fmt(txn.f,ifnotexists) "fmt-%[str(1)]"
+  http-request set-var-fmt(txn.f,ifnotexists) "fmt2"
+  http-request set-var(proc.pe,ifexists) int(5)
+  http-request set-var(proc.pn,ifnotexists) int(5)
+  http-request set-var(proc.ps,ifnotset) int(6)
+  http-request set-var(proc.ps,ifnotset) int(7)
+  http-request unset-var(proc.ps)
+  http-request set-var(proc.pu) int(9)
+  http-request unset-var(proc.pu)
+  http-response set-var(res.r,ifnotexists) str(r1)
+  http-response set-var(res.r,ifnotexists) str(r2)
+  http-response set-header x-a "a=%[var(txn.a)] n=%[var(txn.n)] e=%[var(txn.e)] s=%[var(txn.s)] m=%[var(txn.m)] i=%[var(txn.i)] i2=%[var(txn.i2)] c=%[var(txn.c)] c2=%[var(txn.c2)] f=%[var(txn.f)] t=%[var(txn.t)] q=%[var(sess.q)]"
+  http-response set-header x-b "pe=%[var(proc.pe)] pn=%[var(proc.pn)] ps=%[var(proc.ps)] pu=%[var(proc.pu)] r=%[var(res.r)] i12=%[var(proc.int12)]"
+  default_backend be
+backend be
+  server s {be}
+"####
+        ),
+        fe,
+    );
+    let r = get(fe, "");
+    assert_eq!(
+        header(&r, "x-a").as_deref(),
+        Some("a=b n= e=first s=three m=z i= i2=8 c=both c2= f=fmt-1 t=t1 q=q1"),
+        "{r}"
+    );
+    assert_eq!(header(&r, "x-b").as_deref(), Some("pe=5 pn= ps= pu= r=r1 i12=12"), "{r}");
+}
+
+#[test]
+fn set_var_converter_honours_its_conditions() {
+    let be = backend();
+    let fe = common::reserve_addr();
+    let _ibex = start(
+        &format!(
+            r####"defaults
+  mode http
+  timeout connect 2s
+  timeout client 5s
+  timeout server 5s
+frontend fe
+  bind {fe}
+  http-request set-var(txn.pre) str(x)
+  http-request set-header x-t1 "%[str(first),set-var(txn.cv,ifnotexists)]"
+  http-request set-header x-t2 "%[str(second),set-var(txn.cv,ifnotexists)]"
+  http-request set-header x-t3 "%[str(third),set-var(txn.pre,ifexists)]"
+  http-request set-header x-t4 "%[str(),set-var(txn.cv2,ifnotempty)]"
+  http-request set-header x-t5 "%[str(five),set-var(proc.pc,ifexists)]"
+  http-request set-header x-t6 "%[str(six),set-var(sess.sc,ifnotset)]"
+  http-request set-header x-t7 "%[str(seven),set-var(sess.sc,ifnotset)]"
+  http-response set-header x-var "cv=%[var(txn.cv)] pre=%[var(txn.pre)] cv2=%[var(txn.cv2)] pc=%[var(proc.pc)] sc=%[var(sess.sc)]"
+  default_backend be
+backend be
+  server s {be}
+"####
+        ),
+        fe,
+    );
+    let r = get(fe, "");
+    assert_eq!(
+        header(&r, "x-var").as_deref(),
+        Some("cv=first pre=third cv2= pc=five sc=six"),
+        "{r}"
+    );
+}
+
+/// `haproxy -c` on one rule; the exit code and what it printed.
+fn load(rule: &str) -> (Option<i32>, String) {
+    let cfg = format!("{DEFAULTS}frontend fe\n  bind 127.0.0.1:18081\n  {rule}\n  default_backend be\nbackend be\n  server s1 127.0.0.1:1\n");
+    let path = std::env::temp_dir().join(format!("ibex_t137_{}_{}.cfg", std::process::id(), rule.len()));
+    std::fs::write(&path, cfg).expect("write config");
+    let out = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-c").arg("-f").arg(&path).output().expect("run ibex -c");
+    let _ = std::fs::remove_file(&path);
+    (out.status.code(), format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)))
+}
+
+/// HAProxy: `unknown condition "ifbad".` on the action and `invalid args in converter 'set-var'
+/// : unknown condition "ifbad".` on the converter. `ifgt` and `iflt` are valid there, but need
+/// typed variables, so Ibex refuses them rather than ignore them.
+#[test]
+fn set_var_unknown_and_untyped_conditions_are_refused_at_load() {
+    for rule in [
+        "http-request set-var(txn.x,ifbad) str(a)",
+        "http-request set-var(txn.x,IFEXISTS) str(a)",
+        "http-response set-var-fmt(txn.x,ifbad) a",
+        "http-after-response set-var(txn.x,ifbad) str(a)",
+        "tcp-request content set-var(txn.x,ifbad) str(a)",
+        "tcp-request session set-var(sess.x,ifbad) str(a)",
+        "http-request set-header x \"%[str(a),set-var(txn.x,ifbad)]\"",
+        "http-request set-var(txn.x,ifgt) int(1)",
+        "http-request set-var(txn.x,iflt) int(1)",
+        "http-request set-header x \"%[int(1),set-var(txn.x,iflt)]\"",
+    ] {
+        let (code, out) = load(rule);
+        assert_ne!(code, Some(0), "{rule} loaded: {out}");
+        assert!(out.contains("condition"), "{rule}: {out}");
+    }
+    for rule in [
+        "http-request set-var(txn.x,ifexists,ifnotexists) str(a)",
+        "http-request set-var(txn.x,) str(a)",
+        "http-request set-var-fmt(txn.x,ifnotset) a",
+        "http-request set-header x \"%[str(a),set-var(txn.x,ifempty,ifset)]\"",
+    ] {
+        let (code, out) = load(rule);
+        assert_eq!(code, Some(0), "{rule} refused: {out}");
+    }
+}

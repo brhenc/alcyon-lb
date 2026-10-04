@@ -43,6 +43,29 @@ pub fn get_proc_var(name: &str) -> Option<String> {
     GLOBAL_PROC_VARS.read().ok()?.get(name).cloned()
 }
 
+/// The conditions of `set-var(<name>,<cond>...)` against what is known of the variable and the
+/// sample (`var_set`, src/vars.c): `exists`/`is_set` describe the variable, `empty` the new
+/// sample. `ifgt` and `iflt` are refused when the configuration loads.
+#[must_use]
+pub fn var_conds_hold(spec: &str, exists: bool, is_set: bool, empty: bool) -> bool {
+    spec.split(',').skip(1).all(|c| match c {
+        "ifexists" => exists,
+        "ifnotexists" => !exists,
+        "ifset" => is_set,
+        "ifnotset" => !is_set,
+        "ifempty" => empty,
+        "ifnotempty" => !empty,
+        _ => true,
+    })
+}
+
+/// `unset-var` of a process variable: it stays declared but has no value.
+pub fn unset_proc_var(name: &str) {
+    if let Ok(mut lock) = GLOBAL_PROC_VARS.write() {
+        lock.remove(name);
+    }
+}
+
 pub fn set_proc_var(name: &str, val: String) {
     if let Ok(mut lock) = GLOBAL_PROC_VARS.write() {
         lock.insert(name.to_string(), val);
@@ -3589,11 +3612,28 @@ impl Registry {
             in_type: TypeSpec::Any,
             out_type: TypeSpec::Same,
             func: |smp, args| {
-                if let Some(var_name) = args.first() {
-                    let val_str = sample_to_string(&smp);
-                    CURRENT_VARS.with(|v| {
-                        v.borrow_mut().insert(var_name.clone(), val_str);
-                    });
+                if !args.is_empty() {
+                    let spec = args.join(",");
+                    let spec = spec.as_str();
+                    let name = spec.split(',').next().unwrap_or("");
+                    let is_proc = name.starts_with("proc.");
+                    let is_set = if is_proc {
+                        get_proc_var(name).is_some()
+                    } else {
+                        CURRENT_VARS.with(|v| v.borrow().contains_key(name))
+                    };
+                    let empty = matches!(&smp, Sample::Str(s) if s.is_empty())
+                        || matches!(&smp, Sample::Bin(b) if b.is_empty());
+                    if var_conds_hold(spec, is_proc || is_set, is_set, empty) {
+                        let val_str = sample_to_string(&smp);
+                        if is_proc {
+                            set_proc_var(name, val_str);
+                        } else {
+                            CURRENT_VARS.with(|v| {
+                                v.borrow_mut().insert(name.to_string(), val_str);
+                            });
+                        }
+                    }
                 }
                 Some(smp)
             },
@@ -4970,6 +5010,13 @@ pub fn check_converter_args(name: &str, args: &[String]) -> Option<String> {
             }
             None
         }
+        "set-var" => args.iter().skip(1).filter(|c| !c.is_empty()).find_map(|c| match c.as_str() {
+            "ifexists" | "ifnotexists" | "ifempty" | "ifnotempty" | "ifset" | "ifnotset" => None,
+            "ifgt" | "iflt" => Some(format!(
+                "invalid args in converter 'set-var' : condition \"{c}\" needs typed variables, which Ibex does not implement"
+            )),
+            _ => Some(format!("invalid args in converter 'set-var' : unknown condition \"{c}\".")),
+        }),
         "url_enc" => match args {
             [] => None,
             [a] if a.is_empty() || a == "query" => None,
