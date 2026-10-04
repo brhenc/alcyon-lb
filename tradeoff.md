@@ -218,11 +218,28 @@ HAProxy walks with `eb32_next()`. O(depth) per task instead of O(1) amortised, c
 because correctness under concurrent deletion was not worth reasoning about yet. At 280
 tasks per pass and depth ≤ 32 this is ~9k steps; whether that matters is unmeasured.
 
-### 6.3 `takeover()` not implemented
+### 6.3 `takeover()` not implemented — **decided 2026-10-04: per-thread pools first, a shared pool second**
 
 Idle backend connections can only be reused by their owning thread, costing some reuse
 ratio under uneven load. HAProxy needs three cooperating layers and ~60 lines for this,
 and it can fail at each.
+
+HAProxy keeps idle connections per server and per thread, and with `tune.idle-pool.shared`
+(on by default) a thread that finds none `TRYLOCK`s its siblings' lists and takes a
+connection over (`backend.c` `conn_backend_get`, `mux->takeover()`). Ibex keeps one pool
+per worker, keyed by address and SNI, and never shares. Three ways were weighed (T151 item 7):
+
+| | |
+|---|---|
+| **A** | Per-worker pools keyed by server, `pool-low-conn` / `pool-purge-delay` honoured. No locks; a connection idle on worker 1 stays invisible to worker 2. |
+| **B** | One pool per server behind a mutex, `try_lock` with a fall-back to a new connect as HAProxy does, the fd moved to the taking worker's poller. HAProxy's model; a lock on every reuse and release. |
+| **C** | Per-worker pools plus lock-free hand-over queues. No lock on the fast path; the most machinery and the most room for subtle bugs. |
+
+**Decision (the user, 2026-10-04): A, then B.** A first because it fixes two keywords that are
+parsed and ignored (AGENTS.md §5) and cannot cost the fast path. B second, to match HAProxy's
+connection counts; it must keep `tools/allocprofile` at 4 allocations per request and put its
+shared state behind a `Box` in `ProxyIdInfo` (`Proxy` is bounded in `struct_sizes.rs`).
+**Gave up:** C's lock-free fast path. **Revisit if** B's lock shows in a profile.
 
 ### 6.4 No watchdog
 
