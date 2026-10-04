@@ -16,7 +16,7 @@
 //!   ("unknown fetch method").
 //! * **Ibex has not implemented it.** `HAProxy` accepts every `NOT_IMPLEMENTED` rule (exit
 //!   0, same measurement). Ibex has no server queues, does not count a backend's streams,
-//!   keeps no tracker count on a stick-table entry, and has no `table_*` converters. These
+//!   keeps no tracker count on a stick-table entry, and has only the `table_*` converters that read a counter. These
 //!   used to load and evaluate to a constant 0 or 1. They are refused now, naming what is
 //!   missing, wherever the expression appears: an ACL, an inline condition, a log-format,
 //!   a rule action, `http-check send`.
@@ -90,8 +90,10 @@ const NOT_IMPLEMENTED: &[(&str, &str, &str)] = &[
     ("http-request set-var(txn.x) str(be/s1),srv_queue", "", "srv_queue"),
     ("", "http-request set-header x %[be_conn]", "be_conn"),
     ("http-request set-header x %[sc_trackers(0)]", "", "sc_trackers"),
-    ("http-request set-header x %[src,table_conn_cnt(be)]", "", "table_conn_cnt"),
-    ("acl t src,table_http_req_rate(be) gt 1\n  http-request deny if t", "", "table_http_req_rate"),
+    ("http-request set-header x %[src,table_server_id(be)]", "", "table_server_id"),
+    ("acl t src,table_expire(be) gt 1\n  http-request deny if t", "", "table_expire"),
+    ("http-request set-header x %[src,table_inc_gpc0(be)]", "", "table_inc_gpc0"),
+    ("http-request set-header x %[src,table_http_req_rate(be)]\n  http-request set-header y %[src,table_bytes_in_rate(be)]", "", "table_bytes_in_rate"),
     ("", "option httpchk\n  http-check send hdr x %[queue]", "queue"),
 ];
 

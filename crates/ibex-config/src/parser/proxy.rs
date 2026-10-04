@@ -76,10 +76,12 @@ pub(crate) fn parse_listen_header(
         timeouts,
         retries: defaults.and_then(|d| d.retries).unwrap_or(3),
         redisp: defaults.map_or(false, |d| d.redisp),
+        redisp_after: defaults.map_or(-1, |d| if d.redisp { d.redisp_after } else { -1 }),
         maxconn: defaults.and_then(|d| d.maxconn).unwrap_or(2000),
         grace: None,
         dispatch: None,
         default_server: defaults.and_then(|d| d.default_server.clone()),
+        use_servers: Vec::new(),
         servers: Vec::new(),
         logs: defaults.map_or_else(Vec::new, |d| d.logs.clone()),
         log_tag: defaults.and_then(|d| d.log_tag.clone()),
@@ -95,6 +97,7 @@ pub(crate) fn parse_listen_header(
         srvexp: Vec::new(),
         acls: Vec::new(),
         use_backends: Vec::new(),
+        force_be_switch: Vec::new(),
         monitor_uri: None,
         default_backend: None,
         balance: defaults.and_then(|d| d.balance).unwrap_or(BalanceAlgorithm::RoundRobin),
@@ -168,6 +171,7 @@ pub(crate) fn parse_frontend_header(
         maxconn: defaults.and_then(|d| d.maxconn).unwrap_or(2000),
         default_backend: None,
         use_backends: Vec::new(),
+        force_be_switch: Vec::new(),
         monitor_uri: None,
         acls: Vec::new(),
         cliexp: Vec::new(),
@@ -258,8 +262,10 @@ pub(crate) fn parse_backend_header(
         timeouts,
         retries: defaults.and_then(|d| d.retries).unwrap_or(3),
         redisp: defaults.map_or(false, |d| d.redisp),
+        redisp_after: defaults.map_or(-1, |d| if d.redisp { d.redisp_after } else { -1 }),
         dispatch: None,
         default_server: defaults.and_then(|d| d.default_server.clone()),
+        use_servers: Vec::new(),
         servers: Vec::new(),
         srvexp: Vec::new(),
         acls: Vec::new(),
@@ -303,6 +309,7 @@ pub(crate) fn parse_listen_directive(
         "retries" => parse_retries(&mut proxy.retries, tokens, kw),
         "redisp" => {
             proxy.redisp = true;
+            proxy.redisp_after = -1;
             Ok(())
         }
         "maxconn" => parse_maxconn(&mut proxy.maxconn, tokens, kw),
@@ -335,6 +342,8 @@ pub(crate) fn parse_listen_directive(
         }
         "acl" => parse_acl(&mut proxy.acls, tokens, kw),
         "use_backend" => parse_use_backend(&mut proxy.use_backends, tokens, kw),
+        "use-server" => parse_use_server(&mut proxy.use_servers, tokens, kw),
+        "force-be-switch" => parse_force_be_switch(&mut proxy.force_be_switch, tokens, kw),
         "monitor-uri" => parse_monitor_uri(&mut proxy.monitor_uri, tokens, kw),
         "default_backend" => parse_default_backend(&mut proxy.default_backend, tokens, kw),
         "option" => parse_option_listen(proxy, tokens, kw),
@@ -495,6 +504,18 @@ pub(crate) fn parse_frontend_directive(
         "log-tag" => parse_log_tag(tokens, kw).map(|t| fe.log_tag = Some(t)),
         "acl" => parse_acl(&mut fe.acls, tokens, kw),
         "use_backend" => parse_use_backend(&mut fe.use_backends, tokens, kw),
+        "force-be-switch" => parse_force_be_switch(&mut fe.force_be_switch, tokens, kw),
+        // `HAProxy` warns that a frontend has no backend capability and keeps the rule,
+        // then fails the load because the frontend has no server by that name.
+        "use-server" => Err(ConfigError::new(
+            kw.line,
+            kw.col,
+            format!(
+                "frontend '{}' : unable to find server '{}' referenced in a 'use-server' rule.",
+                fe.name,
+                tokens.get(1).map_or("", |t| t.text.as_str())
+            ),
+        )),
         "monitor-uri" => parse_monitor_uri(&mut fe.monitor_uri, tokens, kw),
         "default_backend" => parse_default_backend(&mut fe.default_backend, tokens, kw),
         "stick-table" => parse_stick_table(&mut fe.stick_table, tokens, kw),
@@ -552,6 +573,7 @@ pub(crate) fn parse_backend_directive(
             be.disabled = true;
             Ok(())
         }
+        "use-server" => parse_use_server(&mut be.use_servers, tokens, kw),
         "balance" => parse_balance(&mut be.balance, tokens, kw),
         "http-reuse" => parse_http_reuse(&mut be.http_reuse, tokens, kw),
         "hash-type" => {
@@ -574,6 +596,7 @@ pub(crate) fn parse_backend_directive(
         "retries" => parse_retries(&mut be.retries, tokens, kw),
         "redisp" => {
             be.redisp = true;
+            be.redisp_after = -1;
             Ok(())
         }
         "dispatch" => parse_dispatch(kw),
@@ -793,7 +816,7 @@ pub(crate) fn parse_option_listen(
     match tokens[1].text.as_str() {
         "forwardfor" => proxy.forwardfor = Some(parse_forward_option(tokens, kw)?),
         "originalto" => proxy.originalto = Some(parse_forward_option(tokens, kw)?),
-        "redispatch" => proxy.redisp = true,
+        "redispatch" => set_redispatch(&mut proxy.redisp, &mut proxy.redisp_after, tokens),
         "http-buffer-request" => proxy.buffer_request = true,
         "accept-unsafe-violations-in-http-request" => proxy.stats.accept_unsafe_request = true,
         "log-health-checks" => proxy.log_health_checks = true,
@@ -857,7 +880,7 @@ pub(crate) fn parse_option_backend(
     match tokens[1].text.as_str() {
         "forwardfor" => be.forwardfor = Some(parse_forward_option(tokens, kw)?),
         "originalto" => be.originalto = Some(parse_forward_option(tokens, kw)?),
-        "redispatch" => be.redisp = true,
+        "redispatch" => set_redispatch(&mut be.redisp, &mut be.redisp_after, tokens),
         "http-buffer-request" => be.buffer_request = true,
         "log-health-checks" => be.log_health_checks = true,
         "httpchk" => parse_httpchk_option(&mut be.httpchk, tokens, kw)?,
@@ -875,7 +898,7 @@ pub(crate) fn parse_no_listen(proxy: &mut ListenSection, tokens: &[Token], kw: &
         return parse_no_directive(tokens, kw);
     }
     match check_no_option(OptSection::Listen, tokens, kw)? {
-        Some("redispatch") => proxy.redisp = false,
+        Some("redispatch") => (proxy.redisp, proxy.redisp_after) = (false, -1),
         Some("http-buffer-request") => proxy.buffer_request = false,
         Some("accept-unsafe-violations-in-http-request") => proxy.stats.accept_unsafe_request = false,
         Some("log-health-checks") => proxy.log_health_checks = false,
@@ -901,7 +924,7 @@ pub(crate) fn parse_no_backend(be: &mut BackendSection, tokens: &[Token], kw: &T
         return parse_no_directive(tokens, kw);
     }
     match check_no_option(OptSection::Backend, tokens, kw)? {
-        Some("redispatch") => be.redisp = false,
+        Some("redispatch") => (be.redisp, be.redisp_after) = (false, -1),
         Some("http-buffer-request") => be.buffer_request = false,
         Some("log-health-checks") => be.log_health_checks = false,
         _ => {}

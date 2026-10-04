@@ -37,6 +37,8 @@ pub struct QuicEndpoint {
     next_timeout: Option<Instant>,
     response_buf: Vec<u8>,
     tx_buf: Vec<u8>,
+    /// Set by a soft stop: connections already here are served to the end, a new Initial is refused.
+    refusing_new: bool,
 }
 
 /// RFC 9000 §8.1 accounting for one connection on an unvalidated path.
@@ -154,7 +156,15 @@ impl QuicEndpoint {
             next_timeout: None,
             response_buf: Vec::with_capacity(2048),
             tx_buf: Vec::with_capacity(2048),
+            refusing_new: false,
         }
+    }
+
+    /// Soft stop (HAProxy's `soft_stop()`): refuse every new connection from now on while the
+    /// ones already established keep being served. The client of a refused one gets a
+    /// CONNECTION_REFUSED close and goes to whichever process is taking over.
+    pub fn stop_accepting(&mut self) {
+        self.refusing_new = true;
     }
 
     /// Creates a `QuicEndpoint` from an already configured `quinn_proto::ServerConfig`.
@@ -282,9 +292,11 @@ impl QuicEndpoint {
                     });
                 }
                 quinn_proto::Event::Stream(stream_evt) => match stream_evt {
+                    // "One or more" streams: a client that opens several requests in one
+                    // flight raises a single `Opened`. Accepting only the first left the
+                    // others unanswered for ever (T130).
                     quinn_proto::StreamEvent::Opened { dir } => {
-                        let stream_id = conn.streams().accept(dir);
-                        if let Some(sid) = stream_id {
+                        while let Some(sid) = conn.streams().accept(dir) {
                             self.event_queue.push_back(TransportEvent::StreamOpened {
                                 conn_id: primary_cid,
                                 stream_id: StreamId::from(sid),
@@ -366,6 +378,21 @@ impl QuicTransport for QuicEndpoint {
         match event {
             Some(DatagramEvent::NewConnection(incoming)) => {
                 let remote_addr = incoming.remote_address();
+                if self.refusing_new {
+                    self.response_buf.clear();
+                    let tx = self.endpoint.refuse(incoming, &mut self.response_buf);
+                    self.pending_transmits.push_back(TransmitEntry {
+                        transmit: Transmit {
+                            destination: tx.destination,
+                            src_ip: tx.src_ip,
+                            size: tx.size,
+                            segment_size: tx.segment_size,
+                            ecn: tx.ecn.map(EcnCodepoint::from),
+                        },
+                        data: self.response_buf.clone(),
+                    });
+                    return Ok(DatagramOutcome::StatelessResponse);
+                }
                 let primary_cid = ConnectionId::from(*incoming.orig_dst_cid());
                 let outcome = match self.endpoint.accept(
                     incoming,
@@ -635,11 +662,17 @@ impl QuicTransport for QuicEndpoint {
             .ok_or_else(|| QuicError::ConnectionNotFound(conn_id.to_string()))?;
 
         let mut send = conn.send_stream(stream_id.into());
+        // Flow control or the send buffer full is not an error: nothing was taken, and the
+        // caller keeps the bytes until the stream is writable again.
         let written = send
             .write(buf)
+            .or_else(|e| if e == quinn_proto::WriteError::Blocked { Ok(0) } else { Err(e) })
             .map_err(|e| QuicError::Transport(format!("stream write error: {e}")))?;
 
-        if fin {
+        // Finishing after a partial write would end the stream on what fitted, which is how
+        // an HTTP/3 response larger than the window arrived truncated (T108, T130). The
+        // stream is finished only once the last byte has been taken.
+        if fin && written == buf.len() {
             let _ = send.finish();
         }
 
@@ -667,6 +700,11 @@ impl QuicTransport for QuicEndpoint {
                     conn.close(Instant::now(), code, Bytes::copy_from_slice(reason));
                 }
             }
+            self.drive_connection(handle, Instant::now());
+            // Closing arms a drain timer. Left out of the cached deadline, the engine would not
+            // wake for it, and the connection would be counted live until some unrelated
+            // datagram refreshed the cache.
+            self.update_next_timeout();
         }
     }
 

@@ -1488,7 +1488,13 @@ fn quic_stays(how: Reload) {
         stdout.contains("__STATUS__200") && stdout.contains("__VER__3"),
         "the HTTP/3 request in flight across the reload must complete over QUIC.\n{seen}"
     );
-    assert!(stdout.to_ascii_lowercase().contains("\r\nx-gen: 1\r\n"), "it must be served by the old process.\n{seen}");
+    // The request was handed to the backend before the reload, so the old process's rules
+    // (generation 1) processed it. Not asserted before T130: HTTP/3 ran no `http-request`
+    // rule at all, so the header was never added.
+    assert!(
+        stdout.contains("\r\nX-Gen: 1\r\n") || stdout.contains("\r\nx-gen: 1\r\n"),
+        "the HTTP/3 request must have been processed by the old process's rules.\n{seen}"
+    );
     let st = procs::wait_gone(&mut old);
     assert!(st.success(), "old process: {st}");
 }
@@ -1503,7 +1509,6 @@ fn migrate_leaves_quic_connections_to_drain_in_the_old_process() {
 
 /// Item 11: the control for `migrate_leaves_quic_connections_to_drain_in_the_old_process`.
 #[test]
-#[ignore = "pre-existing defect outside T96: on a reload today the old process exits at once with an HTTP/3 request in flight, and the request is lost (curl times out)"]
 fn control_quic_connections_drain_in_the_old_process() {
     quic_stays(Reload::Control);
 }

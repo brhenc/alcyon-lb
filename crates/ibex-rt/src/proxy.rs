@@ -187,6 +187,10 @@ pub struct TcpSession {
     pub keep_request_line: bool,
     /// `option accept-unsafe-violations-in-http-request` on the frontend.
     pub accept_unsafe_request: bool,
+    /// The client is an HTTP/3 request stream relayed by a QUIC listener (T130): one
+    /// request, over TLS, logged as `HTTP/3.0` with the URI `HAProxy` builds from
+    /// `:scheme` and `:authority`.
+    pub h3: bool,
 }
 
 impl TcpSession {
@@ -282,6 +286,7 @@ impl TcpSession {
             is_first_req: true,
             keep_request_line: false,
             accept_unsafe_request: false,
+            h3: false,
         };
         s.arm_client(now);
         s
@@ -1029,7 +1034,13 @@ impl TcpSession {
                 if self.keep_request_line {
                     let head = self.req.readable();
                     let line_end = head.iter().position(|&b| b == b'\r' || b == b'\n').unwrap_or(head.len());
-                    let line = String::from_utf8_lossy(&head[..line_end.min(1024)]).into_owned();
+                    let mut line = String::from_utf8_lossy(&head[..line_end.min(1024)]).into_owned();
+                    if self.h3 {
+                        let host = self.htx_slice().and_then(|h| {
+                            h.headers().find(|(k, _)| k.eq_ignore_ascii_case("host")).map(|(_, v)| v.to_string())
+                        });
+                        line = h3_log_line(&line, host.as_deref());
+                    }
                     self.log.request_line = Some(line);
                 }
 
@@ -1896,4 +1907,32 @@ pub fn eval_acl_condition<S: ::std::hash::BuildHasher>(
             AclEvalResult::NotMatched
         }
     }) == AclEvalResult::Matched
+}
+
+/// The request line an HTTP/3 request is logged with: `HAProxy` keeps the absolute URI the
+/// `:scheme` and `:authority` pseudo-headers make, and the version `HTTP/3.0`
+/// (`"GET https://localhost:8443/ HTTP/3.0"`). The relay hands the engine an origin-form
+/// HTTP/1.1 line, with `:authority` as `host`.
+fn h3_log_line(line: &str, host: Option<&str>) -> String {
+    let mut parts = line.splitn(3, ' ');
+    let (Some(method), Some(uri)) = (parts.next(), parts.next()) else {
+        return line.to_string();
+    };
+    match host {
+        Some(host) if uri.starts_with('/') => format!("{method} https://{host}{uri} HTTP/3.0"),
+        _ => format!("{method} {uri} HTTP/3.0"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::h3_log_line;
+
+    #[test]
+    fn the_h3_log_line_is_absolute_when_it_can_be() {
+        assert_eq!(h3_log_line("GET /a?b HTTP/1.1", Some("h:1")), "GET https://h:1/a?b HTTP/3.0");
+        assert_eq!(h3_log_line("GET /a HTTP/1.1", None), "GET /a HTTP/3.0");
+        assert_eq!(h3_log_line("OPTIONS * HTTP/1.1", Some("h")), "OPTIONS * HTTP/3.0");
+        assert_eq!(h3_log_line("garbage", Some("h")), "garbage");
+    }
 }

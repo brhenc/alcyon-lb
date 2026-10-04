@@ -29,7 +29,7 @@ pub use ast::{
     SampleRef, SectionKind, Server, StatsConfig,
     StickRule, StickRuleType, StickTableConfigAst, TcpReqConnAction, TcpReqConnRule,
     TcpReqContentAction, TcpReqContentRule, TcpResAction, TcpResContentRule, TcpReqSessionAction, TcpReqSessionRule,
-    TimeoutConfig, UseBackendRule,
+    TimeoutConfig, UseBackendRule, UseServerRule,
 };
 pub use error::ConfigError;
 pub use parser::parse_str;

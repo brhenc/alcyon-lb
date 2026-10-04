@@ -210,7 +210,8 @@ pub trait QuicTransport {
         buf: &mut [u8],
     ) -> Result<ReadStreamResult>;
 
-    /// Write data to a stream.
+    /// Write data to a stream. Returns how much was taken, which may be less than `buf`
+    /// (zero when flow control blocks it); `fin` takes effect only once all of `buf` was.
     ///
     /// # Errors
     /// Returns an error if the stream is closed or has been reset.

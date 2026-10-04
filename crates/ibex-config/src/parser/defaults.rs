@@ -25,6 +25,7 @@ pub(crate) fn parse_defaults_directive(
         }
         "redisp" => {
             defaults.redisp = true;
+            defaults.redisp_after = -1;
             Ok(())
         }
         "maxconn" => {
@@ -70,6 +71,11 @@ pub(crate) fn parse_defaults_directive(
                     defaults.tcp_req_inspect_delay = Some(parse_timeout(&tokens[2], "tcp-request inspect-delay")?);
                     Ok(())
                 }
+                sub @ ("connection" | "session" | "content") if defaults.name.is_none() => Err(ConfigError::new(
+                    kw.line,
+                    kw.col,
+                    format!("tcp-request {sub} is not allowed in anonymous 'defaults' sections"),
+                )),
                 "connection" => parse_tcp_req_connection(&mut defaults.tcp_req_conn_rules, tokens, kw),
                 "session" => parse_tcp_req_session(&mut defaults.tcp_req_session_rules, tokens, kw),
                 "content" => parse_tcp_req_content(&mut defaults.tcp_req_content_rules, tokens, kw),
@@ -112,6 +118,11 @@ pub(crate) fn parse_defaults_directive(
                     format!("unknown tcp-response subcommand <{other}>, expects 'inspect-delay' or 'content'"),
                 )),
             }
+        }
+        // `HAProxy` keeps no rule of an unnamed `defaults` section: the sections that follow
+        // do not inherit them (`src/cfgparse-listen.c`).
+        kw_name @ ("http-request" | "http-response" | "http-after-response") if defaults.name.is_none() => {
+            Err(ConfigError::new(kw.line, kw.col, format!("'{kw_name}' not allowed in anonymous 'defaults' section.")))
         }
         "http-request" if tokens.get(1).is_some_and(|t| t.text == "set-retries") => Err(ConfigError::new(
             tokens[1].line,
@@ -198,7 +209,7 @@ pub(crate) fn parse_option_defaults(
     match tokens[1].text.as_str() {
         "forwardfor" => defaults.forwardfor = Some(parse_forward_option(tokens, kw)?),
         "originalto" => defaults.originalto = Some(parse_forward_option(tokens, kw)?),
-        "redispatch" => defaults.redisp = true,
+        "redispatch" => set_redispatch(&mut defaults.redisp, &mut defaults.redisp_after, tokens),
         "http-buffer-request" => defaults.buffer_request = true,
         "accept-unsafe-violations-in-http-request" => defaults.stats.accept_unsafe_request = true,
         "log-health-checks" => defaults.log_health_checks = true,
@@ -217,7 +228,7 @@ pub(crate) fn parse_no_defaults(defaults: &mut DefaultsSection, tokens: &[Token]
         return parse_no_directive(tokens, kw);
     }
     match check_no_option(OptSection::Defaults, tokens, kw)? {
-        Some("redispatch") => defaults.redisp = false,
+        Some("redispatch") => (defaults.redisp, defaults.redisp_after) = (false, -1),
         Some("http-buffer-request") => defaults.buffer_request = false,
         Some("accept-unsafe-violations-in-http-request") => defaults.stats.accept_unsafe_request = false,
         Some("log-health-checks") => defaults.log_health_checks = false,

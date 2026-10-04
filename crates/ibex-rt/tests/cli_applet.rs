@@ -208,8 +208,8 @@ fn cli_applet_show_stat_and_admin_server_state_mutations() {
     );
 
     assert_eq!(
-        engine.proxies[0].server_statuses[0].load(std::sync::atomic::Ordering::Relaxed), ibex_rt::ServerStatus::Down as u8,
-        "srv1 should be marked Down after disable server"
+        engine.proxies[0].server_statuses[0].load(std::sync::atomic::Ordering::Relaxed), ibex_rt::ServerStatus::Maint as u8,
+        "srv1 should be in maintenance after disable server (HAProxy: MAINT)"
     );
 
     // Re-enable srv1
@@ -244,8 +244,8 @@ fn cli_applet_show_stat_and_admin_server_state_mutations() {
     );
 
     assert_eq!(
-        engine.proxies[0].server_statuses[1].load(std::sync::atomic::Ordering::Relaxed), ibex_rt::ServerStatus::Down as u8,
-        "srv2 should be marked Down after set server state drain"
+        engine.proxies[0].server_statuses[1].load(std::sync::atomic::Ordering::Relaxed), ibex_rt::ServerStatus::Drain as u8,
+        "srv2 should be draining (HAProxy: DRAIN) after set server state drain"
     );
 }
 

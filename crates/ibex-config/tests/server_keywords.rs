@@ -55,7 +55,7 @@ const KEYWORDS: &[(&str, Ibex)] = &[
     // src/server.c
     ("backup", Accepts),
     ("cookie c1", Accepts),
-    ("disabled", Refuses),
+    ("disabled", Accepts),
     ("enabled", Accepts),
     ("error-limit 5", Accepts),
     ("guid g1", Accepts),

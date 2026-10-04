@@ -128,24 +128,6 @@ pub struct SampleContext<'a> {
     /// The stream's retry budget, for `cur_max_retries`: what `set-retries` changes.
     pub cur_max_retries: Option<u16>,
     pub act_conn: u32,
-    pub cum_conn: u64,
-    pub conn_cnt: u64,
-    pub conn_rate: u64,
-    pub http_req_rate: u64,
-    pub http_err_rate: u64,
-    pub http_req_cnt: u64,
-    pub bytes_in_cnt: u64,
-    pub bytes_out_cnt: u64,
-    pub gpc0: u64,
-    pub gpc1: u64,
-    pub gpt0: u64,
-    pub sc_conn_rates: [u64; 3],
-    pub sc_http_req_rates: [u64; 3],
-    pub sc_http_err_rates: [u64; 3],
-    pub sc_conn_cnts: [u64; 3],
-    pub sc_http_req_cnts: [u64; 3],
-    pub sc_bytes_in_cnts: [u64; 3],
-    pub sc_bytes_out_cnts: [u64; 3],
     pub ssl_sni: Option<&'a str>,
     pub ssl_cipher: Option<&'a str>,
     pub ssl_version: Option<&'a str>,
@@ -154,6 +136,9 @@ pub struct SampleContext<'a> {
     /// `srv_is_up`, `srv_conn`, `fe_exists`, `in_table`, ...). `None` where the caller
     /// has none to give, and those fetches then return no sample -- never a guess.
     pub proxies: Option<&'a dyn ProxyState>,
+    /// The stream's tracked stick-table entries, for the `sc_*` and `src_*` fetches. `None`
+    /// where the caller has none, and those fetches then give no sample.
+    pub stick: Option<&'a dyn StickState>,
 }
 
 /// One server's live state, as the server fetches read it.
@@ -166,6 +151,54 @@ pub struct ServerState {
     pub cur_sess: u32,
     /// `maxconn`; `None` for unlimited.
     pub maxconn: Option<u32>,
+    /// The streams assigned to the server over the last second (`srv_sess_rate`).
+    pub sess_rate: i64,
+}
+
+/// A frontend counter, for [`ProxyState::frontend_counter`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrontendCounter {
+    /// The connections open on the frontend now (`fe_conn`, `feconn`).
+    Conn,
+    /// The sessions it accepted over the last second (`fe_sess_rate`).
+    SessRate,
+    /// The HTTP requests it received over the last second (`fe_req_rate`).
+    ReqRate,
+}
+
+/// A data type of a stick-table entry, as the `sc_*` and `src_*` fetches read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StickData {
+    ConnCnt,
+    ConnCur,
+    ConnRate,
+    SessCnt,
+    HttpReqCnt,
+    HttpReqRate,
+    HttpErrCnt,
+    HttpErrRate,
+    /// `bytes_in_cnt`, in kilobytes (`bytes >> 10`).
+    KbytesIn,
+    KbytesOut,
+    Gpc0,
+    Gpc1,
+    Gpt0,
+}
+
+/// The stick-table entries a stream tracks, which the `sc_*`, `sc[0-9]_*` and `src_*`
+/// fetches read, provided through [`SampleContext::stick`].
+///
+/// Both answer as `HAProxy` does: `None` where there is no sample (nothing is tracked in
+/// the slot; the entry is there and its table does not store `data`; a table argument whose
+/// key type is not the tracked table's), 0 where the entry is missing from the table the
+/// fetch looks in.
+pub trait StickState: std::fmt::Debug {
+    /// The entry tracked in slot `slot`, or the entry of the same key in `table`.
+    fn tracked(&self, slot: usize, table: Option<&str>, data: StickData) -> Option<i64>;
+    /// The entry whose key is the client's address `addr` in the first of `tables` that
+    /// exists (the one the fetch names, or else the current proxies' own); it is looked up,
+    /// never created.
+    fn source(&self, addr: IpAddr, tables: &[&str], data: StickData) -> Option<i64>;
 }
 
 /// The live state of the configured proxies, which the runtime provides through
@@ -186,9 +219,21 @@ pub trait ProxyState: std::fmt::Debug {
     fn server(&self, backend: &str, server: &str) -> Option<ServerState>;
     /// Whether a proxy with a frontend (a `frontend` or a `listen`) is named `name`.
     fn frontend_exists(&self, name: &str) -> bool;
+    /// A counter of the frontend `frontend`; `None` if there is none of that name.
+    fn frontend_counter(&self, frontend: &str, counter: FrontendCounter) -> Option<i64>;
+    /// The streams assigned to backend `backend` over the last second (`be_sess_rate`).
+    fn backend_sess_rate(&self, backend: &str) -> Option<i64>;
+    /// The `default_backend` of frontend `frontend`, if it has one.
+    fn default_backend(&self, frontend: &str) -> Option<String>;
+    /// The connections open on all the frontends (`actconn`).
+    fn active_connections(&self) -> i64;
     /// Whether `key` is an entry of the stick table `table`; `None` if there is no such
     /// table or the key cannot be one of its keys.
     fn table_has_key(&self, table: &str, key: &Sample) -> Option<bool>;
+    /// `data` of the entry `key` of the stick table `table` (the `table_*` converters): 0 if
+    /// the table has no such entry, `None` if there is no such table or it does not store
+    /// `data`.
+    fn table_value(&self, table: &str, key: &Sample, data: StickData) -> Option<i64>;
 }
 
 /// A sample fetch implementation.
@@ -220,41 +265,53 @@ pub const NOT_IMPLEMENTED: &[(&str, &str)] = &[
     ("srv_queue", "Ibex has no server queues"),
     ("be_conn", "Ibex does not count the streams on a backend"),
     ("sc_trackers", "Ibex keeps no tracker count on stick-table entries"),
-    ("table_conn_cnt", "Ibex has no stick-table converters"),
-    ("table_conn_cur", "Ibex has no stick-table converters"),
-    ("table_conn_rate", "Ibex has no stick-table converters"),
-    ("table_sess_cnt", "Ibex has no stick-table converters"),
-    ("table_sess_rate", "Ibex has no stick-table converters"),
-    ("table_http_req_cnt", "Ibex has no stick-table converters"),
-    ("table_http_req_rate", "Ibex has no stick-table converters"),
-    ("table_http_err_cnt", "Ibex has no stick-table converters"),
-    ("table_http_err_rate", "Ibex has no stick-table converters"),
-    ("table_bytes_in_rate", "Ibex has no stick-table converters"),
-    ("table_bytes_out_rate", "Ibex has no stick-table converters"),
-    ("table_kbytes_in", "Ibex has no stick-table converters"),
-    ("table_kbytes_out", "Ibex has no stick-table converters"),
-    ("table_trackers", "Ibex has no stick-table converters"),
-    ("table_expire", "Ibex has no stick-table converters"),
-    ("table_server_id", "Ibex has no stick-table converters"),
-    ("table_gpc0", "Ibex has no stick-table converters"),
-    ("table_gpc1", "Ibex has no stick-table converters"),
-    ("table_gpc", "Ibex has no stick-table converters"),
-    ("table_gpt0", "Ibex has no stick-table converters"),
-    ("table_gpt", "Ibex has no stick-table converters"),
-    ("table_gpc0_rate", "Ibex has no stick-table converters"),
-    ("table_gpc1_rate", "Ibex has no stick-table converters"),
-    ("table_gpc_rate", "Ibex has no stick-table converters"),
-    ("table_glitch_cnt", "Ibex has no stick-table converters"),
-    ("table_glitch_rate", "Ibex has no stick-table converters"),
-    ("table_http_fail_cnt", "Ibex has no stick-table converters"),
-    ("table_http_fail_rate", "Ibex has no stick-table converters"),
-    ("table_inc_gpc0", "Ibex has no stick-table converters"),
-    ("table_inc_gpc1", "Ibex has no stick-table converters"),
-    ("table_inc_gpc", "Ibex has no stick-table converters"),
-    ("table_clr_gpc0", "Ibex has no stick-table converters"),
-    ("table_clr_gpc1", "Ibex has no stick-table converters"),
-    ("table_clr_gpc", "Ibex has no stick-table converters"),
-    ("table_idle", "Ibex has no stick-table converters"),
+    ("sc_sess_rate", "Ibex does not measure the session rate of a stick-table entry"),
+    ("sc_bytes_in_rate", "Ibex does not measure the bytes rate of a stick-table entry"),
+    ("sc_bytes_out_rate", "Ibex does not measure the bytes rate of a stick-table entry"),
+    ("sc_gpc0_rate", "Ibex does not measure the rate of a general purpose counter"),
+    ("sc_gpc1_rate", "Ibex does not measure the rate of a general purpose counter"),
+    ("sc0_sess_rate", "Ibex does not measure the session rate of a stick-table entry"),
+    ("sc0_bytes_in_rate", "Ibex does not measure the bytes rate of a stick-table entry"),
+    ("sc0_bytes_out_rate", "Ibex does not measure the bytes rate of a stick-table entry"),
+    ("sc0_gpc0_rate", "Ibex does not measure the rate of a general purpose counter"),
+    ("sc0_gpc1_rate", "Ibex does not measure the rate of a general purpose counter"),
+    ("sc1_sess_rate", "Ibex does not measure the session rate of a stick-table entry"),
+    ("sc1_bytes_in_rate", "Ibex does not measure the bytes rate of a stick-table entry"),
+    ("sc1_bytes_out_rate", "Ibex does not measure the bytes rate of a stick-table entry"),
+    ("sc1_gpc0_rate", "Ibex does not measure the rate of a general purpose counter"),
+    ("sc1_gpc1_rate", "Ibex does not measure the rate of a general purpose counter"),
+    ("sc2_sess_rate", "Ibex does not measure the session rate of a stick-table entry"),
+    ("sc2_bytes_in_rate", "Ibex does not measure the bytes rate of a stick-table entry"),
+    ("sc2_bytes_out_rate", "Ibex does not measure the bytes rate of a stick-table entry"),
+    ("sc2_gpc0_rate", "Ibex does not measure the rate of a general purpose counter"),
+    ("sc2_gpc1_rate", "Ibex does not measure the rate of a general purpose counter"),
+    ("src_sess_rate", "Ibex does not measure the session rate of a stick-table entry"),
+    ("src_bytes_in_rate", "Ibex does not measure the bytes rate of a stick-table entry"),
+    ("src_bytes_out_rate", "Ibex does not measure the bytes rate of a stick-table entry"),
+    ("src_gpc0_rate", "Ibex does not measure the rate of a general purpose counter"),
+    ("src_gpc1_rate", "Ibex does not measure the rate of a general purpose counter"),
+    ("table_sess_rate", "Ibex implements only the stick-table converters that read a counter"),
+    ("table_bytes_in_rate", "Ibex implements only the stick-table converters that read a counter"),
+    ("table_bytes_out_rate", "Ibex implements only the stick-table converters that read a counter"),
+    ("table_trackers", "Ibex implements only the stick-table converters that read a counter"),
+    ("table_expire", "Ibex implements only the stick-table converters that read a counter"),
+    ("table_server_id", "Ibex implements only the stick-table converters that read a counter"),
+    ("table_gpc", "Ibex implements only the stick-table converters that read a counter"),
+    ("table_gpt", "Ibex implements only the stick-table converters that read a counter"),
+    ("table_gpc0_rate", "Ibex implements only the stick-table converters that read a counter"),
+    ("table_gpc1_rate", "Ibex implements only the stick-table converters that read a counter"),
+    ("table_gpc_rate", "Ibex implements only the stick-table converters that read a counter"),
+    ("table_glitch_cnt", "Ibex implements only the stick-table converters that read a counter"),
+    ("table_glitch_rate", "Ibex implements only the stick-table converters that read a counter"),
+    ("table_http_fail_cnt", "Ibex implements only the stick-table converters that read a counter"),
+    ("table_http_fail_rate", "Ibex implements only the stick-table converters that read a counter"),
+    ("table_inc_gpc0", "Ibex implements only the stick-table converters that read a counter"),
+    ("table_inc_gpc1", "Ibex implements only the stick-table converters that read a counter"),
+    ("table_inc_gpc", "Ibex implements only the stick-table converters that read a counter"),
+    ("table_clr_gpc0", "Ibex implements only the stick-table converters that read a counter"),
+    ("table_clr_gpc1", "Ibex implements only the stick-table converters that read a counter"),
+    ("table_clr_gpc", "Ibex implements only the stick-table converters that read a counter"),
+    ("table_idle", "Ibex implements only the stick-table converters that read a counter"),
 ];
 
 /// Why `name` -- a fetch or a converter -- is in [`NOT_IMPLEMENTED`].
@@ -283,6 +340,26 @@ fn server_arg<'a>(ctx: &'a SampleContext, arg: &'a str) -> Option<(&'a str, &'a 
 fn server_fetch(ctx: &SampleContext, args: &[String], f: fn(ServerState) -> Sample) -> Option<Sample> {
     let (be, srv) = server_arg(ctx, args.first()?)?;
     ctx.proxies?.server(be, srv).map(f)
+}
+
+/// A frontend fetch: `[<frontend>]`, defaulting to the current frontend.
+fn frontend_arg<'a>(ctx: &'a SampleContext, args: &'a [String]) -> Option<&'a str> {
+    args.first().map(String::as_str).filter(|a| !a.is_empty()).or(ctx.fe_name)
+}
+
+/// The tables a `src_*` fetch looks in: the one it names, or else the current proxy's own,
+/// which is the backend's if the rule runs once a backend is chosen and has a table, and the
+/// frontend's otherwise (the same guess `in_table` makes).
+fn source_tables<'a>(ctx: &'a SampleContext, args: &'a [String]) -> Vec<&'a str> {
+    match table_arg(args) {
+        Some(t) => vec![t],
+        None => ctx.be_name.into_iter().chain(ctx.fe_name).collect(),
+    }
+}
+
+/// A `sc[0-9]_*` or `src_*` fetch's optional `[<table>]` argument.
+fn table_arg(args: &[String]) -> Option<&str> {
+    args.first().map(String::as_str).filter(|a| !a.is_empty())
 }
 
 /// A backend fetch: `[<backend>]`, defaulting to the current backend.
@@ -1352,7 +1429,7 @@ impl Registry {
         self.register_fetch(FetchDesc {
             name: "fe_defbe",
             out_type: SampleType::Str,
-            func: |ctx, _args| ctx.be_name.map(|n| Sample::Str(n.to_string())),
+            func: |ctx, _args| ctx.proxies?.default_backend(ctx.fe_name?).map(Sample::Str),
         });
 
         self.register_fetch(FetchDesc {
@@ -1407,7 +1484,7 @@ impl Registry {
         self.register_fetch(FetchDesc {
             name: "fe_conn",
             out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(i64::from(ctx.act_conn))),
+            func: |ctx, args| ctx.proxies?.frontend_counter(frontend_arg(ctx, args)?, FrontendCounter::Conn).map(Sample::Sint),
         });
 
         self.register_fetch(FetchDesc {
@@ -1425,7 +1502,8 @@ impl Registry {
         self.register_fetch(FetchDesc {
             name: "act_conn",
             out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(i64::from(ctx.act_conn))),
+            // `smp_fetch_actconn`: the connections open on every frontend, not the current one's.
+            func: |ctx, _args| ctx.proxies.map(|p| Sample::Sint(p.active_connections())),
         });
         self.register_fetch(FetchDesc {
             name: "dst_conn",
@@ -1433,354 +1511,76 @@ impl Registry {
             func: |ctx, _args| Some(Sample::Sint(i64::from(ctx.act_conn))),
         });
         self.register_fetch(FetchDesc {
-            name: "conn_cnt",
-            out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.conn_cnt))),
-        });
-        self.register_fetch(FetchDesc {
-            name: "cum_conn",
-            out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.cum_conn))),
-        });
-        self.register_fetch(FetchDesc {
-            name: "conn_rate",
-            out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.conn_rate))),
-        });
-        self.register_fetch(FetchDesc {
-            name: "sess_rate",
-            out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.conn_rate))),
-        });
-        self.register_fetch(FetchDesc {
             name: "fe_sess_rate",
             out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.conn_rate))),
+            func: |ctx, args| ctx.proxies?.frontend_counter(frontend_arg(ctx, args)?, FrontendCounter::SessRate).map(Sample::Sint),
         });
         self.register_fetch(FetchDesc {
             name: "be_sess_rate",
             out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.conn_rate))),
+            func: |ctx, args| ctx.proxies?.backend_sess_rate(backend_arg(ctx, args)?).map(Sample::Sint),
         });
         self.register_fetch(FetchDesc {
             name: "srv_sess_rate",
             out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.conn_rate))),
-        });
-        self.register_fetch(FetchDesc {
-            name: "sess_cnt",
-            out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.conn_cnt))),
-        });
-        self.register_fetch(FetchDesc {
-            name: "req_rate",
-            out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.http_req_rate))),
+            func: |ctx, args| server_fetch(ctx, args, |s| Sample::Sint(s.sess_rate)),
         });
         self.register_fetch(FetchDesc {
             name: "fe_req_rate",
             out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.http_req_rate))),
-        });
-        self.register_fetch(FetchDesc {
-            name: "req_cnt",
-            out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.http_req_cnt))),
-        });
-        self.register_fetch(FetchDesc {
-            name: "err_rate",
-            out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.http_err_rate))),
-        });
-        self.register_fetch(FetchDesc {
-            name: "err_cnt",
-            out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.http_err_rate))),
+            func: |ctx, args| ctx.proxies?.frontend_counter(frontend_arg(ctx, args)?, FrontendCounter::ReqRate).map(Sample::Sint),
         });
 
-        // --- 10. Stick Table Trackers Fetches ---
-        macro_rules! reg_sc_fetches {
-            ($name:literal, $field:ident, $arr:ident) => {
+        // --- 10. Stick-table counters: sc_*, sc[0-9]_*, src_* ---
+        //
+        // `smp_fetch_sc_conn_cnt` and its siblings (`src/stick_table.c`): the entry of the
+        // table tracked in the stream's slot, or the client's address looked up in the table
+        // the argument names. Nothing tracked, or a data type the table does not store, is no
+        // sample -- these used to fall back to unrelated per-connection fields. Where the
+        // entry itself is missing the value is 0. The rest is [`StickState`].
+        macro_rules! reg_stick {
+            ($suffix:literal, $data:expr) => {
                 self.register_fetch(FetchDesc {
-                    name: $name,
+                    name: concat!("sc_", $suffix),
                     out_type: SampleType::Sint,
                     func: |ctx, args| {
-                        let slot = args
-                            .first()
-                            .and_then(|s| s.parse::<usize>().ok())
-                            .unwrap_or(0);
-                        if slot < 3 && ctx.$arr[slot] > 0 {
-                            Some(Sample::Sint(u64_to_sint(ctx.$arr[slot])))
-                        } else {
-                            Some(Sample::Sint(u64_to_sint(ctx.$field)))
-                        }
+                        let slot = args.first()?.parse::<usize>().ok()?;
+                        let table = args.get(1).map(String::as_str).filter(|a| !a.is_empty());
+                        ctx.stick?.tracked(slot, table, $data).map(Sample::Sint)
                     },
+                });
+                self.register_fetch(FetchDesc {
+                    name: concat!("sc0_", $suffix),
+                    out_type: SampleType::Sint,
+                    func: |ctx, args| ctx.stick?.tracked(0, table_arg(args), $data).map(Sample::Sint),
+                });
+                self.register_fetch(FetchDesc {
+                    name: concat!("sc1_", $suffix),
+                    out_type: SampleType::Sint,
+                    func: |ctx, args| ctx.stick?.tracked(1, table_arg(args), $data).map(Sample::Sint),
+                });
+                self.register_fetch(FetchDesc {
+                    name: concat!("sc2_", $suffix),
+                    out_type: SampleType::Sint,
+                    func: |ctx, args| ctx.stick?.tracked(2, table_arg(args), $data).map(Sample::Sint),
+                });
+                self.register_fetch(FetchDesc {
+                    name: concat!("src_", $suffix),
+                    out_type: SampleType::Sint,
+                    func: |ctx, args| ctx.stick?.source(ctx.client_addr?.ip(), &source_tables(ctx, args), $data).map(Sample::Sint),
                 });
             };
         }
-
-        reg_sc_fetches!("sc_conn_cnt", conn_cnt, sc_conn_cnts);
-        reg_sc_fetches!("sc_conn_rate", conn_rate, sc_conn_rates);
-        reg_sc_fetches!("sc_http_req_rate", http_req_rate, sc_http_req_rates);
-        reg_sc_fetches!("sc_http_err_rate", http_err_rate, sc_http_err_rates);
-        reg_sc_fetches!("sc_http_req_cnt", http_req_cnt, sc_http_req_cnts);
-        reg_sc_fetches!("sc_bytes_in_cnt", bytes_in_cnt, sc_bytes_in_cnts);
-        reg_sc_fetches!("sc_bytes_out_cnt", bytes_out_cnt, sc_bytes_out_cnts);
-
-        self.register_fetch(FetchDesc {
-            name: "sc_conn_cur",
-            out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(i64::from(ctx.act_conn))),
-        });
-        self.register_fetch(FetchDesc {
-            name: "sc_sess_cnt",
-            out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.conn_cnt))),
-        });
-        self.register_fetch(FetchDesc {
-            name: "sc_sess_rate",
-            out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.conn_rate))),
-        });
-        self.register_fetch(FetchDesc {
-            name: "sc_http_err_cnt",
-            out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.http_err_rate))),
-        });
-        self.register_fetch(FetchDesc {
-            name: "sc_bytes_in_rate",
-            out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.bytes_in_cnt))),
-        });
-        self.register_fetch(FetchDesc {
-            name: "sc_bytes_out_rate",
-            out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.bytes_out_cnt))),
-        });
-        self.register_fetch(FetchDesc {
-            name: "sc_kbytes_in",
-            out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.bytes_in_cnt / 1024))),
-        });
-        self.register_fetch(FetchDesc {
-            name: "sc_kbytes_out",
-            out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.bytes_out_cnt / 1024))),
-        });
-        self.register_fetch(FetchDesc {
-            name: "sc_gpc0",
-            out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.gpc0))),
-        });
-        self.register_fetch(FetchDesc {
-            name: "sc_gpc1",
-            out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.gpc1))),
-        });
-        self.register_fetch(FetchDesc {
-            name: "sc_gpc0_rate",
-            out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.gpc0))),
-        });
-        self.register_fetch(FetchDesc {
-            name: "sc_gpc1_rate",
-            out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.gpc1))),
-        });
-        self.register_fetch(FetchDesc {
-            name: "sc_gpt0",
-            out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.gpt0))),
-        });
-
-        // sc0_*, sc1_*, sc2_* aliases
-        macro_rules! reg_sc_slot {
-            ($slot:expr, $prefix:literal) => {
-                self.register_fetch(FetchDesc {
-                    name: concat!($prefix, "conn_cnt"),
-                    out_type: SampleType::Sint,
-                    func: |ctx, _args| {
-                        if ctx.sc_conn_cnts[$slot] > 0 {
-                            Some(Sample::Sint(u64_to_sint(ctx.sc_conn_cnts[$slot])))
-                        } else {
-                            Some(Sample::Sint(u64_to_sint(ctx.conn_cnt)))
-                        }
-                    },
-                });
-                self.register_fetch(FetchDesc {
-                    name: concat!($prefix, "conn_rate"),
-                    out_type: SampleType::Sint,
-                    func: |ctx, _args| {
-                        if ctx.sc_conn_rates[$slot] > 0 {
-                            Some(Sample::Sint(u64_to_sint(ctx.sc_conn_rates[$slot])))
-                        } else {
-                            Some(Sample::Sint(u64_to_sint(ctx.conn_rate)))
-                        }
-                    },
-                });
-                self.register_fetch(FetchDesc {
-                    name: concat!($prefix, "http_req_rate"),
-                    out_type: SampleType::Sint,
-                    func: |ctx, _args| {
-                        if ctx.sc_http_req_rates[$slot] > 0 {
-                            Some(Sample::Sint(u64_to_sint(ctx.sc_http_req_rates[$slot])))
-                        } else {
-                            Some(Sample::Sint(u64_to_sint(ctx.http_req_rate)))
-                        }
-                    },
-                });
-                self.register_fetch(FetchDesc {
-                    name: concat!($prefix, "http_err_rate"),
-                    out_type: SampleType::Sint,
-                    func: |ctx, _args| {
-                        if ctx.sc_http_err_rates[$slot] > 0 {
-                            Some(Sample::Sint(u64_to_sint(ctx.sc_http_err_rates[$slot])))
-                        } else {
-                            Some(Sample::Sint(u64_to_sint(ctx.http_err_rate)))
-                        }
-                    },
-                });
-                self.register_fetch(FetchDesc {
-                    name: concat!($prefix, "http_req_cnt"),
-                    out_type: SampleType::Sint,
-                    func: |ctx, _args| {
-                        if ctx.sc_http_req_cnts[$slot] > 0 {
-                            Some(Sample::Sint(u64_to_sint(ctx.sc_http_req_cnts[$slot])))
-                        } else {
-                            Some(Sample::Sint(u64_to_sint(ctx.http_req_cnt)))
-                        }
-                    },
-                });
-                self.register_fetch(FetchDesc {
-                    name: concat!($prefix, "bytes_in_cnt"),
-                    out_type: SampleType::Sint,
-                    func: |ctx, _args| {
-                        if ctx.sc_bytes_in_cnts[$slot] > 0 {
-                            Some(Sample::Sint(u64_to_sint(ctx.sc_bytes_in_cnts[$slot])))
-                        } else {
-                            Some(Sample::Sint(u64_to_sint(ctx.bytes_in_cnt)))
-                        }
-                    },
-                });
-                self.register_fetch(FetchDesc {
-                    name: concat!($prefix, "bytes_out_cnt"),
-                    out_type: SampleType::Sint,
-                    func: |ctx, _args| {
-                        if ctx.sc_bytes_out_cnts[$slot] > 0 {
-                            Some(Sample::Sint(u64_to_sint(ctx.sc_bytes_out_cnts[$slot])))
-                        } else {
-                            Some(Sample::Sint(u64_to_sint(ctx.bytes_out_cnt)))
-                        }
-                    },
-                });
-            };
-        }
-
-        reg_sc_slot!(0, "sc0_");
-        reg_sc_slot!(1, "sc1_");
-        reg_sc_slot!(2, "sc2_");
-
-        // src_* stick table metrics
-        self.register_fetch(FetchDesc {
-            name: "src_conn_cnt",
-            out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.conn_cnt))),
-        });
-        self.register_fetch(FetchDesc {
-            name: "src_conn_cur",
-            out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(i64::from(ctx.act_conn))),
-        });
-        self.register_fetch(FetchDesc {
-            name: "src_conn_rate",
-            out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.conn_rate))),
-        });
-        self.register_fetch(FetchDesc {
-            name: "src_sess_cnt",
-            out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.conn_cnt))),
-        });
-        self.register_fetch(FetchDesc {
-            name: "src_sess_rate",
-            out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.conn_rate))),
-        });
-        self.register_fetch(FetchDesc {
-            name: "src_http_req_cnt",
-            out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.http_req_cnt))),
-        });
-        self.register_fetch(FetchDesc {
-            name: "src_http_req_rate",
-            out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.http_req_rate))),
-        });
-        self.register_fetch(FetchDesc {
-            name: "src_http_err_cnt",
-            out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.http_err_rate))),
-        });
-        self.register_fetch(FetchDesc {
-            name: "src_http_err_rate",
-            out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.http_err_rate))),
-        });
-        self.register_fetch(FetchDesc {
-            name: "src_bytes_in_cnt",
-            out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.bytes_in_cnt))),
-        });
-        self.register_fetch(FetchDesc {
-            name: "src_bytes_in_rate",
-            out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.bytes_in_cnt))),
-        });
-        self.register_fetch(FetchDesc {
-            name: "src_bytes_out_cnt",
-            out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.bytes_out_cnt))),
-        });
-        self.register_fetch(FetchDesc {
-            name: "src_bytes_out_rate",
-            out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.bytes_out_cnt))),
-        });
-        self.register_fetch(FetchDesc {
-            name: "src_kbytes_in",
-            out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.bytes_in_cnt / 1024))),
-        });
-        self.register_fetch(FetchDesc {
-            name: "src_kbytes_out",
-            out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.bytes_out_cnt / 1024))),
-        });
-        self.register_fetch(FetchDesc {
-            name: "src_gpc0",
-            out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.gpc0))),
-        });
-        self.register_fetch(FetchDesc {
-            name: "src_gpc1",
-            out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.gpc1))),
-        });
-        self.register_fetch(FetchDesc {
-            name: "src_gpc0_rate",
-            out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.gpc0))),
-        });
-        self.register_fetch(FetchDesc {
-            name: "src_gpc1_rate",
-            out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.gpc1))),
-        });
-        self.register_fetch(FetchDesc {
-            name: "src_gpt0",
-            out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(u64_to_sint(ctx.gpt0))),
-        });
+        reg_stick!("conn_cnt", StickData::ConnCnt);
+        reg_stick!("conn_cur", StickData::ConnCur);
+        reg_stick!("conn_rate", StickData::ConnRate);
+        reg_stick!("sess_cnt", StickData::SessCnt);
+        reg_stick!("http_req_cnt", StickData::HttpReqCnt);
+        reg_stick!("http_req_rate", StickData::HttpReqRate);
+        reg_stick!("http_err_cnt", StickData::HttpErrCnt);
+        reg_stick!("http_err_rate", StickData::HttpErrRate);
+        reg_stick!("kbytes_in", StickData::KbytesIn);
+        reg_stick!("kbytes_out", StickData::KbytesOut);
 
         // --- 11. Timeout Fetches ---
         macro_rules! reg_timeout_fetch {
@@ -3622,6 +3422,46 @@ impl Registry {
             },
         });
 
+        // `sample_conv_table_conn_cnt` and its siblings (`src/stick_table.c`): the input cast to
+        // the table's key type is looked up in the table; 0 where it has no entry, no sample
+        // where the table does not store the data type. Those that write (`table_inc_gpc0`,
+        // `table_clr_gpc0`), or read what Ibex does not keep (`table_expire`, `table_idle`,
+        // `table_trackers`, `table_server_id`, rates, `glitch` and `http_fail` counters, the
+        // indexed `table_gpc(<idx>)`), are refused ([`NOT_IMPLEMENTED`]).
+        macro_rules! reg_table_conv {
+            ($name:literal, $data:expr) => {
+                self.register_ctx_converter(CtxConvDesc {
+                    name: $name,
+                    in_type: TypeSpec::Any,
+                    out_type: TypeSpec::Exact(SampleType::Sint),
+                    func: |ctx, smp, args| {
+                        let proxies = ctx.proxies?;
+                        match table_arg(args) {
+                            Some(t) => proxies.table_value(t, &smp, $data),
+                            None => ctx
+                                .be_name
+                                .and_then(|t| proxies.table_value(t, &smp, $data))
+                                .or_else(|| proxies.table_value(ctx.fe_name?, &smp, $data)),
+                        }
+                        .map(Sample::Sint)
+                    },
+                });
+            };
+        }
+        reg_table_conv!("table_conn_cnt", StickData::ConnCnt);
+        reg_table_conv!("table_conn_cur", StickData::ConnCur);
+        reg_table_conv!("table_conn_rate", StickData::ConnRate);
+        reg_table_conv!("table_sess_cnt", StickData::SessCnt);
+        reg_table_conv!("table_http_req_cnt", StickData::HttpReqCnt);
+        reg_table_conv!("table_http_req_rate", StickData::HttpReqRate);
+        reg_table_conv!("table_http_err_cnt", StickData::HttpErrCnt);
+        reg_table_conv!("table_http_err_rate", StickData::HttpErrRate);
+        reg_table_conv!("table_kbytes_in", StickData::KbytesIn);
+        reg_table_conv!("table_kbytes_out", StickData::KbytesOut);
+        reg_table_conv!("table_gpc0", StickData::Gpc0);
+        reg_table_conv!("table_gpc1", StickData::Gpc1);
+        reg_table_conv!("table_gpt0", StickData::Gpt0);
+
         // `sample_conv_nbsrv`: the input names a backend; none of that name, no sample.
         self.register_ctx_converter(CtxConvDesc {
             name: "nbsrv",
@@ -5249,14 +5089,9 @@ mod oracle_tests {
     /// with `file:line` citations) and by grepping the `smp_fetch` registration tables in
     /// the reference tree directly.
     const NOT_IN_HAPROXY_FETCHES: &[&str] = &[
-        "be_client_timeout", "conn_cnt", "conn_rate", "cum_conn", "epoch", "err_cnt",
-        "err_rate", "fe_connect_timeout", "fe_queue_timeout", "fe_server_timeout",
-        "fe_tunnel_timeout", "req.uri", "req_cnt", "req_rate", "res.proto_http", "res.status",
-        "res_ver", "sc0_bytes_in_cnt", "sc0_bytes_out_cnt", "sc1_bytes_in_cnt",
-        "sc1_bytes_out_cnt", "sc2_bytes_in_cnt", "sc2_bytes_out_cnt", "sc_bytes_in_cnt",
-        "sc_bytes_out_cnt", "sc_gpc0", "sc_gpc1", "sc_gpt0", "sess_cnt", "sess_rate",
-        "src_bytes_in_cnt", "src_bytes_out_cnt", "src_gpc0", "src_gpc1", "src_gpt0",
-        "ssl_fc_version",
+        "be_client_timeout", "epoch", "fe_connect_timeout", "fe_queue_timeout",
+        "fe_server_timeout", "fe_tunnel_timeout", "req.uri", "res.proto_http", "res.status",
+        "res_ver", "ssl_fc_version",
     ];
 
     const NOT_IN_HAPROXY_CONVERTERS: &[&str] = &[
