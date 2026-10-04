@@ -4534,28 +4534,15 @@ pub struct CachedMapTable {
 }
 
 impl CachedMapTable {
+    /// The table of `(key, value)` entries, in order.
     #[must_use]
-    pub fn parse(content: &str) -> Self {
+    pub fn from_pairs(pairs: &[(String, String)]) -> Self {
         let mut entries = Vec::new();
         let mut exact_str = HashMap::new();
         let mut exact_int = HashMap::new();
 
-        for line in content.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.is_empty() {
-                continue;
-            }
-            let key = parts[0].to_string();
-            let val = if parts.len() > 1 {
-                parts[1..].join(" ")
-            } else {
-                String::new()
-            };
-
+        for (key, val) in pairs {
+            let (key, val) = (key.clone(), val.clone());
             let int_val = key.parse::<i64>().ok();
             let regex = ibex_regex::UserRegex::new(&key).ok();
 
@@ -4582,6 +4569,15 @@ impl CachedMapTable {
 
 static MAP_CACHE: RwLock<Option<HashMap<String, Arc<CachedMapTable>>>> = RwLock::new(None);
 
+/// Replaces the table the converters read for map file `path` (the runtime CLI changed it).
+pub fn publish_map_table(path: &str, entries: &[crate::patref::PatEntry]) {
+    let pairs: Vec<(String, String)> = entries.iter().map(|e| (e.key.clone(), e.val.clone())).collect();
+    let table = Arc::new(CachedMapTable::from_pairs(&pairs));
+    if let Ok(mut guard) = MAP_CACHE.write() {
+        guard.get_or_insert_with(HashMap::new).insert(path.to_string(), table);
+    }
+}
+
 #[must_use]
 pub fn get_or_load_map_table(path: &str) -> Option<Arc<CachedMapTable>> {
     // Fast path: read lock
@@ -4593,14 +4589,15 @@ pub fn get_or_load_map_table(path: &str) -> Option<Arc<CachedMapTable>> {
         }
     }
 
-    // Disk read performed once
-    let content = std::fs::read_to_string(path).ok()?;
-    let table = Arc::new(CachedMapTable::parse(&content));
+    // Disk read performed once; the file becomes a pattern reference the CLI can change.
+    let pat = crate::patref::map_file(path, crate::patref::MapKeys::Str, None)?;
+    let pairs: Vec<(String, String)> = pat.entries().into_iter().map(|e| (e.key, e.val)).collect();
+    let table = Arc::new(CachedMapTable::from_pairs(&pairs));
 
-    // Slow path: insert into cache
+    // Slow path: insert into cache, unless the CLI published a newer table meanwhile.
     if let Ok(mut guard) = MAP_CACHE.write() {
         let map = guard.get_or_insert_with(HashMap::new);
-        map.insert(path.to_string(), Arc::clone(&table));
+        return Some(Arc::clone(map.entry(path.to_string()).or_insert(table)));
     }
 
     Some(table)
