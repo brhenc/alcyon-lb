@@ -717,6 +717,8 @@ mod tests {
         assert!(Expr::parse("src 300.1.1.1").is_err(), "an address match");
         assert!(Expr::parse("src,ipmask(24) 300.1.1.1").is_err(), "a converter that leaves an address");
         assert!(Expr::parse("src,debug 300.1.1.1").is_err(), "a converter that keeps the fetch's type");
+        Expr::parse("str(a),map_str_ip(/dev/null) 10.0.0.1").expect("a converter that makes an address");
+        assert!(Expr::parse("str(a),map_str_ip(/dev/null) 300.1.1.1").is_err(), "a converter that makes an address");
     }
     use ibex_proto::htx::{HeaderField, HttpMethod, HttpVersion, Htx, HtxBlock, RequestLine};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
