@@ -73,6 +73,20 @@ pub struct PatRef {
     version: AtomicU64,
 }
 
+/// Locks, taking the data of a lock a panicking thread poisoned: the registry holds plain
+/// lists that a panic cannot leave half-written.
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn read<T>(l: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    l.read().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn write<T>(l: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    l.write().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 static REFS: Mutex<Vec<Arc<PatRef>>> = Mutex::new(Vec::new());
 static NEXT_ENTRY: AtomicU64 = AtomicU64::new(0x5581_0000);
 
@@ -119,15 +133,14 @@ impl PatRef {
     /// A copy of the entries, in the order they were added.
     #[must_use]
     pub fn entries(&self) -> Vec<PatEntry> {
-        self.entries.read().map(|e| e.clone()).unwrap_or_default()
+        read(&self.entries).clone()
     }
 
     /// Records a reader of this file: what `show` says it is "used by".
     pub fn add_user(&self, text: String) {
-        if let Ok(mut u) = self.users.lock() {
-            if !u.contains(&text) {
-                u.push(text);
-            }
+        let mut u = lock(&self.users);
+        if !u.contains(&text) {
+            u.push(text);
         }
     }
 
@@ -148,7 +161,7 @@ impl PatRef {
     fn check_key(&self, key: &str) -> Result<(), String> {
         self.writable()?;
         match self.kind {
-            RefKind::Map => match self.map_keys.lock().map_or(MapKeys::Str, |m| *m) {
+            RefKind::Map => match *lock(&self.map_keys) {
                 MapKeys::Str => Ok(()),
                 MapKeys::Int => {
                     let ok = |s: &str| s.parse::<i64>().is_ok();
@@ -168,7 +181,7 @@ impl PatRef {
                     .map_err(|e| format!("regex '{key}' is invalid (error={e}).")),
             },
             RefKind::Acl => {
-                let readers = self.readers.lock().map(|r| r.clone()).unwrap_or_default();
+                let readers = lock(&self.readers).clone();
                 for (method, ci) in readers {
                     Matcher::compile_with_flags(&method, key, ci).map_err(|e| format!("{e}"))?;
                 }
@@ -179,9 +192,7 @@ impl PatRef {
 
     fn add(&self, key: &str, val: &str) -> Result<(), String> {
         self.check_key(key)?;
-        if let Ok(mut e) = self.entries.write() {
-            e.push(PatEntry { id: next_entry_id(), key: key.to_string(), val: val.to_string() });
-        }
+        write(&self.entries).push(PatEntry { id: next_entry_id(), key: key.to_string(), val: val.to_string() });
         self.changed();
         Ok(())
     }
@@ -201,28 +212,22 @@ impl PatRef {
 /// The file cannot be read.
 pub fn acl_file(path: &str) -> Result<Arc<PatRef>, String> {
     let failed = || format!("failed to open pattern file <{path}>");
-    let mut refs = REFS.lock().map_err(|_| "pattern registry poisoned".to_string())?;
+    let mut refs = lock(&REFS);
     let stamp = std::fs::metadata(path).map_err(|_| failed()).map(|m| (m.modified().ok(), m.len()))?;
     if let Some(r) = refs.iter().find(|r| r.kind == RefKind::Acl && r.file == path) {
         // A file that changed on disk since it was read, and that the CLI has not touched,
         // is read again: parsing an ACL reads its file, as it always did.
-        let stale = r.stamp.lock().is_ok_and(|s| *s != Some(stamp));
+        let stale = *lock(&r.stamp) != Some(stamp);
         if stale && r.version() == 1 {
             let pairs = read_acl_file(path).ok_or_else(failed)?;
-            if let Ok(mut e) = r.entries.write() {
-                *e = pairs.into_iter().map(|(key, val)| PatEntry { id: next_entry_id(), key, val }).collect();
-            }
-            if let Ok(mut s) = r.stamp.lock() {
-                *s = Some(stamp);
-            }
+            *write(&r.entries) = pairs.into_iter().map(|(key, val)| PatEntry { id: next_entry_id(), key, val }).collect();
+            *lock(&r.stamp) = Some(stamp);
         }
         return Ok(Arc::clone(r));
     }
     let pairs = read_acl_file(path).ok_or_else(failed)?;
     let r = Arc::new(PatRef::new(refs.len(), RefKind::Acl, path, pairs));
-    if let Ok(mut s) = r.stamp.lock() {
-        *s = Some(stamp);
-    }
+    *lock(&r.stamp) = Some(stamp);
     refs.push(Arc::clone(&r));
     Ok(r)
 }
@@ -248,27 +253,24 @@ fn read_acl_file(path: &str) -> Option<Vec<(String, String)>> {
 /// that ids are numbered as `HAProxy` numbers them, but its entries cannot be changed at
 /// runtime.
 fn acl_expr(desc: String) {
-    if let Ok(mut refs) = REFS.lock() {
-        let r = Arc::new(PatRef::new(refs.len(), RefKind::Acl, "", Vec::new()));
-        r.add_user(desc);
-        refs.push(r);
-    }
+    let mut refs = lock(&REFS);
+    let r = Arc::new(PatRef::new(refs.len(), RefKind::Acl, "", Vec::new()));
+    r.add_user(desc);
+    refs.push(r);
 }
 
 /// The reference of map file `path`, created (and read) when none is registered; `keys` and
 /// `user` describe the converter that reads it. `None` when the file cannot be read.
 #[must_use]
 pub fn map_file(path: &str, keys: MapKeys, user: Option<String>) -> Option<Arc<PatRef>> {
-    let mut refs = REFS.lock().ok()?;
+    let mut refs = lock(&REFS);
     let found = refs.iter().find(|r| r.kind == RefKind::Map && r.file == path).cloned();
     let r = if let Some(r) = found {
         r
     } else {
         let text = std::fs::read_to_string(path).ok()?;
         let r = Arc::new(PatRef::new(refs.len(), RefKind::Map, path, parse_lines(&text)));
-        if let Ok(mut m) = r.map_keys.lock() {
-            *m = keys;
-        }
+        *lock(&r.map_keys) = keys;
         refs.push(Arc::clone(&r));
         r
     };
@@ -282,7 +284,7 @@ pub fn map_file(path: &str, keys: MapKeys, user: Option<String>) -> Option<Arc<P
 /// Every registered reference of `kind`, in id order.
 #[must_use]
 pub fn list(kind: RefKind) -> Vec<Arc<PatRef>> {
-    REFS.lock().map(|r| r.iter().filter(|x| x.kind == kind).cloned().collect()).unwrap_or_default()
+    lock(&REFS).iter().filter(|x| x.kind == kind).cloned().collect()
 }
 
 fn find(kind: RefKind, ident: &str) -> Result<Arc<PatRef>, String> {
@@ -366,8 +368,8 @@ pub fn scan_config(text: &str, locate: &dyn Fn(usize) -> (String, usize)) {
 fn show_list(kind: RefKind) -> String {
     let mut out = String::from("# id (file) description\n");
     for r in list(kind) {
-        let users = r.users.lock().map(|u| u.join(", ")).unwrap_or_default();
-        let n = r.entries.read().map_or(0, |e| e.len());
+        let users = lock(&r.users).join(", ");
+        let n = read(&r.entries).len();
         let what = if r.file.is_empty() { users } else { format!("pattern loaded from file '{}' used by {users}", r.file) };
         let _ = writeln!(out, "{} ({}) {what}. curr_ver=0 next_ver=0 entry_cnt={n}", r.id, r.file);
     }
@@ -416,9 +418,7 @@ fn run(verb: &str, kind: RefKind, args: &[&str], payload: Option<&str>) -> Resul
             let id = ident_or(format!("Missing {} identifier.", if kind == RefKind::Map { "map" } else { "ACL" }))?;
             let r = find(kind, id)?;
             r.writable()?;
-            if let Ok(mut e) = r.entries.write() {
-                e.clear();
-            }
+            write(&r.entries).clear();
             r.changed();
             Ok(String::new())
         }
@@ -452,11 +452,9 @@ fn run(verb: &str, kind: RefKind, args: &[&str], payload: Option<&str>) -> Resul
             }
             let r = find(kind, args[0])?;
             let mut hit = false;
-            if let Ok(mut e) = r.entries.write() {
-                for entry in e.iter_mut().filter(|e| PatRef::matches(e, args[1])) {
-                    entry.val = args[2].to_string();
-                    hit = true;
-                }
+            for entry in write(&r.entries).iter_mut().filter(|e| PatRef::matches(e, args[1])) {
+                entry.val = args[2].to_string();
+                hit = true;
             }
             if !hit {
                 return Err(if args[1].starts_with('#') { "key or pattern not found." } else { "entry not found." }.to_string());
@@ -474,11 +472,12 @@ fn run(verb: &str, kind: RefKind, args: &[&str], payload: Option<&str>) -> Resul
             let r = find(kind, args[0])?;
             r.writable()?;
             let by_ref = args[1].starts_with('#');
-            let removed = r.entries.write().map_or(0, |mut e| {
+            let removed = {
+                let mut e = write(&r.entries);
                 let before = e.len();
                 e.retain(|x| !PatRef::matches(x, args[1]));
                 before - e.len()
-            });
+            };
             if removed == 0 && by_ref {
                 return Err("Key not found.".to_string());
             }
@@ -503,7 +502,8 @@ impl FileMatcher {
     /// # Errors
     /// A pattern of the file does not compile with `method`.
     pub fn new(pat: Arc<PatRef>, method: &str, case_insensitive: bool) -> Result<Self, String> {
-        if let Ok(mut r) = pat.readers.lock() {
+        {
+            let mut r = lock(&pat.readers);
             if !r.iter().any(|(m, c)| m == method && *c == case_insensitive) {
                 r.push((method.to_string(), case_insensitive));
             }
@@ -520,7 +520,8 @@ impl FileMatcher {
     #[must_use]
     pub fn matches(&self, sample: &crate::sample::Sample) -> bool {
         let version = self.pat.version();
-        if let Ok(c) = self.compiled.read() {
+        {
+            let c = read(&self.compiled);
             if c.0 == version {
                 return c.1.iter().any(|m| m.matches(sample));
             }
@@ -532,10 +533,9 @@ impl FileMatcher {
             .filter_map(|e| Matcher::compile_with_flags(&self.method, &e.key, self.case_insensitive).ok())
             .collect();
         let hit = list.iter().any(|m| m.matches(sample));
-        if let Ok(mut c) = self.compiled.write() {
-            if c.0 < version {
-                *c = (version, list);
-            }
+        let mut c = write(&self.compiled);
+        if c.0 < version {
+            *c = (version, list);
         }
         hit
     }
@@ -543,19 +543,19 @@ impl FileMatcher {
     /// Whether the file has no pattern now.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.pat.entries.read().is_ok_and(|e| e.is_empty())
+        read(&self.pat.entries).is_empty()
     }
 
     /// The shortest pattern (for payload waiting decisions).
     #[must_use]
     pub fn min_pattern_len(&self) -> usize {
-        self.compiled.read().map_or(1, |c| c.1.iter().map(Matcher::min_pattern_len).min().unwrap_or(1))
+        read(&self.compiled).1.iter().map(Matcher::min_pattern_len).min().unwrap_or(1)
     }
 
     /// Whether a miss may become a hit with more payload.
     #[must_use]
     pub fn may_match_later(&self, ends_with_newline: bool) -> bool {
-        self.compiled.read().is_ok_and(|c| c.1.iter().any(|m| m.may_match_later(ends_with_newline)))
+        read(&self.compiled).1.iter().any(|m| m.may_match_later(ends_with_newline))
     }
 }
 
@@ -581,6 +581,9 @@ mod tests {
         assert!(!m.may_match_later(false));
         assert_eq!(command("add", RefKind::Acl, &[&path, "/z"], None), "");
         assert!(m.matches(&s("/z1")));
+        r.add_user("acl at file 'c' line 1".to_string());
+        r.add_user("acl at file 'c' line 1".to_string());
+        assert_eq!(command("frob", RefKind::Acl, &[&path], None), "Unknown acl command.\n");
         // A pattern no reader can compile is refused, and the file is unchanged.
         let ints = tmp("i.acl", "5\n");
         let ri = acl_file(&ints).expect("file");
