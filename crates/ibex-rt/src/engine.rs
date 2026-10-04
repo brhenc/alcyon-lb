@@ -7505,14 +7505,12 @@ fn wait_for_request_body(
     if sess.h2_ctx.is_some() {
         return BodyWait::Ready;
     }
-    let Some(txn) = sess.txn.as_ref() else {
-        return BodyWait::Ready;
-    };
-    let framing = match txn.req {
+    // The request is in `Head` until its rules are done, which is where this runs.
+    let framing = sess.txn.as_ref().map_or(crate::txn::Framing::None, |t| match t.req {
         MsgState::Head { body, .. } => body,
         _ => crate::txn::Framing::None,
-    };
-    let held = txn.body_wait.filter(|w| w.backend == backend && w.rule == rule);
+    });
+    let held = sess.txn.as_ref().and_then(|t| t.body_wait).filter(|w| w.backend == backend && w.rule == rule);
     let now = fresh_tick(now);
     let deadline = match held {
         Some(w) => w.deadline,
@@ -7520,11 +7518,7 @@ fn wait_for_request_body(
             // `Expect: 100-continue`: the client is invited to send its body now, and the
             // server, which was not asked, is not told to.
             let asks = |name: &str, value: &str| name.eq_ignore_ascii_case("expect") && value.trim().eq_ignore_ascii_case("100-continue");
-            let expects = if let Some(htx) = sess.htx_slice() {
-                htx.headers().any(|(name, value)| asks(name, value))
-            } else {
-                sess.req_headers.as_ref().is_some_and(|h| h.iter().any(|(name, value)| asks(name, value)))
-            };
+            let expects = sess.htx_slice().is_some_and(|htx| htx.headers().any(|(name, value)| asks(name, value)));
             if expects {
                 sess.send_before_close(b"HTTP/1.1 100 Continue\r\n\r\n");
                 del_req_header(sess, "expect");
@@ -7562,15 +7556,14 @@ fn wait_for_request_body(
         BodyWait::TimedOut | BodyWait::ClientGone | BodyWait::Malformed => sess.log.request = None,
         _ => {}
     }
-    let Some(txn) = sess.txn.as_mut() else {
-        return outcome;
-    };
-    if matches!(outcome, BodyWait::Pending) {
-        txn.body_wait = Some(crate::txn::BodyWait { backend, rule, deadline });
-    } else {
-        txn.body_wait = None;
-        if matches!(outcome, BodyWait::Ready) {
-            txn.req_body = Some(body);
+    if let Some(txn) = sess.txn.as_mut() {
+        if matches!(outcome, BodyWait::Pending) {
+            txn.body_wait = Some(crate::txn::BodyWait { backend, rule, deadline });
+        } else {
+            txn.body_wait = None;
+            if matches!(outcome, BodyWait::Ready) {
+                txn.req_body = Some(body);
+            }
         }
     }
     outcome

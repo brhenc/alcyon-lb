@@ -488,6 +488,66 @@ fn every_request_of_a_connection_waits_and_a_client_that_leaves_is_not_forwarded
 }
 
 #[test]
+fn an_allow_ahead_of_the_wait_ends_the_rules_and_the_request_is_not_held() {
+    // HAProxy: `http-request allow` stops the list, so the wait after it is never reached:
+    // the request goes at once, with no x-len set.
+    let srv = server();
+    let cfg = cfg("http-request allow if { path /x }\n  http-request wait-for-body time 5s", "");
+    let (_i, fe) = start(&cfg, srv.addr, None);
+    let mut c = Client::connect(fe);
+    c.send(POST_CL10).send(b"abcde");
+    let _ = c.read(Duration::from_millis(1500));
+    let seen = srv.seen();
+    assert_eq!(seen.len(), 1, "the request must go on");
+    assert!(seen[0].at.duration_since(c.t0) < Duration::from_millis(250), "it was held");
+}
+
+#[test]
+fn an_http2_client_is_not_held_for_a_body() {
+    // The body of an HTTP/2 request does not pass through the buffer the wait reads, so the
+    // wait does not apply to it: a GET on an `h2` bind is answered at once.
+    let srv = server();
+    let cfg = cfg("http-request wait-for-body time 5s", "").replace("bind {fe}", "bind {fe} proto h2");
+    let (_i, fe) = start(&cfg, srv.addr, None);
+    let mut s = TcpStream::connect(fe).expect("connect");
+    s.set_read_timeout(Some(Duration::from_millis(1500))).ok();
+    let frame = |kind: u8, flags: u8, id: u32, payload: &[u8]| {
+        let mut v = u32::try_from(payload.len()).expect("short").to_be_bytes()[1..].to_vec();
+        v.extend_from_slice(&[kind, flags]);
+        v.extend_from_slice(&id.to_be_bytes());
+        v.extend_from_slice(payload);
+        v
+    };
+    s.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").expect("preface");
+    s.write_all(&frame(0x04, 0, 0, &[])).expect("settings");
+    let mut head = vec![0x82, 0x86, 0x04, 1, b'/', 0x01, 9];
+    head.extend_from_slice(b"localhost");
+    s.write_all(&frame(0x01, 0x05, 1, &head)).expect("headers");
+    let t0 = Instant::now();
+    let (mut buf, mut answered) = (Vec::new(), false);
+    let mut chunk = vec![0u8; 4096];
+    while !answered && t0.elapsed() < Duration::from_millis(2500) {
+        match s.read(&mut chunk) {
+            Ok(n) if n > 0 => buf.extend_from_slice(&chunk[..n]),
+            _ => {}
+        }
+        // A HEADERS frame of stream 1 whose first byte is `:status 200` (static index 8).
+        let mut at = 0;
+        while at + 9 <= buf.len() {
+            let len = (usize::from(buf[at]) << 16) | (usize::from(buf[at + 1]) << 8) | usize::from(buf[at + 2]);
+            if at + 9 + len > buf.len() {
+                break;
+            }
+            answered |= buf[at + 3] == 0x01 && buf[at + 9..].first() == Some(&0x88);
+            at += 9 + len;
+        }
+    }
+    assert!(answered, "no `200` HEADERS frame within {:?}", t0.elapsed());
+    assert!(t0.elapsed() < Duration::from_millis(1500), "answered after {:?}", t0.elapsed());
+    assert_eq!(srv.seen().len(), 1);
+}
+
+#[test]
 fn a_client_that_leaves_during_the_wait_is_a_400_flagged_cr() {
     // HAProxy, a client that sends 5 of 10 body bytes and shuts down its sending side:
     // the transaction is logged `400 ... CR--` and nothing goes to the server.
