@@ -62,8 +62,9 @@ macro_rules! not_for_default {
     };
 }
 
+/// The TLS keywords with no rustls equivalent (`server.rs` implements the others, T113).
 const TLS: Unimplemented = Refuse(
-    "TLS towards servers is not implemented; Ibex would connect in plaintext and check no certificate",
+    "Ibex's TLS engine (rustls) has no equivalent; the connection would be made with other settings than asked",
 );
 const CHECK: Unimplemented = Refuse(
     "Ibex does not implement it; the health check would silently test something else",
@@ -132,48 +133,25 @@ pub(crate) const UNIMPLEMENTED_SERVER_KEYWORDS: &[ServerKeyword] = &[
     kw!("check-via-socks4", Arg::None, CHECK),
     kw!("fastinter", Arg::Delay, Ignore("the check interval while a server changes state")),
     kw!("downinter", Arg::Delay, Ignore("the check interval while a server is down")),
-    // src/cfgparse-ssl.c
+    // src/cfgparse-ssl.c: the rest is implemented in `server.rs` (`parse_server_ssl_keyword`).
     kw!("allow-0rtt", Arg::None, TLS),
-    kw!("alpn", Arg::Word, TLS),
-    kw!("ca-file", Arg::Word, TLS),
-    kw!("check-alpn", Arg::Word, TLS),
-    kw!("check-sni", Arg::Word, TLS),
-    kw!("check-sni-auto", Arg::None, TLS),
-    kw!("check-ssl", Arg::None, TLS),
     kw!("ciphers", Arg::Word, TLS),
     kw!("ciphersuites", Arg::Word, TLS),
     kw!("client-sigalgs", Arg::Word, TLS),
-    kw!("crl-file", Arg::Word, TLS),
     kw!("curves", Arg::Word, TLS),
-    kw!("crt", Arg::Word, TLS),
-    kw!("force-sslv3", Arg::None, TLS),
-    kw!("force-tlsv10", Arg::None, TLS),
-    kw!("force-tlsv11", Arg::None, TLS),
-    kw!("force-tlsv12", Arg::None, TLS),
-    kw!("force-tlsv13", Arg::None, TLS),
     kw!("ktls", Arg::Word, TLS),
     kw!("no-renegotiate", Arg::None, TLS),
-    kw!("no-ssl-reuse", Arg::None, TLS),
-    not_for_default!("no-sslv3", Arg::None, TLS),
-    not_for_default!("no-tlsv10", Arg::None, TLS),
-    not_for_default!("no-tlsv11", Arg::None, TLS),
-    not_for_default!("no-tlsv12", Arg::None, TLS),
-    not_for_default!("no-tlsv13", Arg::None, TLS),
     kw!("no-tls-tickets", Arg::None, TLS),
     kw!("npn", Arg::Word, TLS),
     kw!("renegotiate", Arg::None, TLS),
-    kw!("send-proxy-v2-ssl", Arg::None, TLS),
-    kw!("send-proxy-v2-ssl-cn", Arg::None, TLS),
+    kw!("send-proxy-v2-ssl", Arg::None, Refuse(
+        "Ibex does not implement it; the PROXY header would carry no TLS information about the client",
+    )),
+    kw!("send-proxy-v2-ssl-cn", Arg::None, Refuse(
+        "Ibex does not implement it; the PROXY header would carry no TLS information about the client",
+    )),
     kw!("sigalgs", Arg::Word, TLS),
-    kw!("sni", Arg::Word, TLS),
-    kw!("sni-auto", Arg::None, TLS),
-    kw!("ssl", Arg::None, TLS),
-    kw!("ssl-min-ver", Arg::Word, TLS),
-    kw!("ssl-max-ver", Arg::Word, TLS),
-    kw!("ssl-reuse", Arg::None, TLS),
     kw!("tls-tickets", Arg::None, TLS),
-    kw!("verify", Arg::Word, TLS),
-    kw!("verifyhost", Arg::Word, TLS),
     // src/cfgparse-tcp.c
     kw!("cc", Arg::Word, Ignore("the TCP congestion control algorithm")),
     kw!("tcp-md5sig", Arg::Word, Refuse("Ibex does not implement it; connections would carry no TCP MD5 signature")),

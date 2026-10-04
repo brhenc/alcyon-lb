@@ -23,9 +23,9 @@ pub use arena::{
     TlsArena, TlsArenaError, TlsSession, TlsSlot, DEFAULT_TLS_BUF_CAPACITY, MAX_TLS_SLOTS,
 };
 pub use config::{
-    build_backend_client_config, create_certified_key, extract_dns_sans,
-    install_default_crypto_provider, load_ca_file, load_cert_file, load_system_ca_roots, parse_server_name,
-    BackendTlsOptions, NoServerAuth, TlsConfig, TlsEngineKind,
+    build_backend_client_config, create_certified_key, extract_dns_sans, extract_subject_cn, hostcheck,
+    install_default_crypto_provider, load_ca_file, load_cert_file, load_server_ca, load_system_ca_roots,
+    parse_server_name, BackendTlsOptions, NoServerAuth, ServerVerifier, TlsConfig, TlsEngineKind,
 };
 pub use resolver::IbexCertResolver;
 pub use transport::{RustlsContext, RustlsTlsInfo, RustlsTransport};

@@ -112,17 +112,19 @@ fn get(port: u16, path: &str, extra: &str) -> String {
 
 const DEFAULTS: &str = "defaults\n  mode http\n  timeout connect 1s\n  timeout client 3s\n  timeout server 3s\n";
 
-/// The task's configuration. `HAProxy` connects to the server with TLS and verifies its
-/// certificate; Ibex has no TLS towards servers, loaded this, said it was valid, and
-/// connected in plaintext.
+/// The T94 configuration. `HAProxy` connects to the server with TLS and verifies its
+/// certificate against `ca.pem`, and refuses the configuration when that file cannot be
+/// opened ("Couldn't open the ca-file 'ca.pem'"). Ibex once loaded this, said it was
+/// valid, and connected in plaintext; since T113 it does what the line says
+/// (`tests/server_tls.rs`), and `-c` opens the file as `HAProxy` does.
 #[test]
-fn ibex_c_refuses_a_server_it_would_reach_in_plaintext() {
+fn ibex_c_opens_the_ca_file_of_a_tls_server() {
     let (code, text) = check(
         "tls.cfg",
         &format!("{DEFAULTS}backend b\n  server s1 10.0.0.1:443 ssl verify required ca-file ca.pem alpn h2\n"),
     );
-    assert_ne!(code, Some(0), "`ibex -c` accepted a TLS server line; Ibex would connect in plaintext:\n{text}");
-    assert!(text.contains("'ssl'"), "the error must name the keyword:\n{text}");
+    assert_ne!(code, Some(0), "`ibex -c` accepted a TLS server whose CA file does not exist:\n{text}");
+    assert!(text.contains("ca.pem"), "the error must name the file:\n{text}");
 }
 
 /// A tuning keyword is accepted, and the operator is told it does nothing.

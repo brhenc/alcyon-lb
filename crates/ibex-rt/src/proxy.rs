@@ -409,7 +409,10 @@ impl TcpSession {
         } else {
             ScState::Established
         };
-        self.conn_exp = Tick::ETERNITY;
+        // A TLS handshake still to run stays under `timeout connect` (see `process_srv_io`).
+        if self.srv_xprt.is_ready() {
+            self.conn_exp = Tick::ETERNITY;
+        }
         self.arm_server(now);
         self.log.connect = Some(std::time::Instant::now());
         // `AN_RES_INSPECT` runs from here, before any of the response has arrived.
@@ -689,9 +692,79 @@ impl TcpSession {
         Ok(changed_io || changed_trans)
     }
 
+    /// Takes a parsed PROXY header as the connection's: the addresses it carries, its
+    /// TLVs, and the state that lets the request through. `false` when `accept-proxy`
+    /// was told to insist on v2 and this is not (the caller ends the connection).
+    fn apply_proxy_header(&mut self, info: ibex_proto::ProxyInfo, is_v2: bool) -> bool {
+        if self.accept_proxy_v2 && !is_v2 {
+            return false;
+        }
+        if let Some(src) = info.src_sockaddr() {
+            self.client_addr = Some(src);
+        }
+        if let Some(dst) = info.dst_sockaddr() {
+            self.server_addr = Some(dst);
+        }
+        self.proxy_info = Some(info);
+        self.proxy_handshake_done = true;
+        self.cli_state = if self.mode == Mode::Http { ScState::Ready } else { ScState::Established };
+        true
+    }
+
+    /// `accept-proxy` on a TLS bind: the PROXY header comes in plaintext, ahead of the
+    /// ClientHello (`HAProxy` reads it in `conn_recv_proxy` before `ssl_sock` sees a
+    /// byte; a `send-proxy ... ssl` server writes it from `xprt_handshake` under TLS).
+    /// So it is read off the socket raw -- peeked, parsed, then taken to exactly its
+    /// length -- before the transport's handshake consumes anything. `Ok(true)` once the
+    /// header is in, `Ok(false)` while it is still arriving.
+    fn read_proxy_header_before_tls(&mut self) -> io::Result<bool> {
+        let fd = self.cli.as_fd();
+        let mut peek = [0u8; 16384];
+        let n = match raw::peek(fd, &mut peek)? {
+            Io::Done(n) => n,
+            Io::WouldBlock => return Ok(false),
+            Io::Eof | Io::Closed => {
+                self.cli_state = ScState::Closed;
+                self.ending.get_or_insert(Ending::ClientAbort);
+                return Ok(false);
+            }
+        };
+        match ibex_proto::parse_proxy_header(&peek[..n]) {
+            Ok(Some((hdr, consumed))) => {
+                let (info, is_v2) = (hdr.to_owned(), hdr.version == ibex_proto::ProxyVersion::V2);
+                // The header is in `peek` already; this read only takes it off the socket.
+                let mut sink = vec![0u8; consumed];
+                // What the peek showed is on the socket, so one read takes all of it.
+                let taken = if let Io::Done(k) = raw::recv(fd, &mut sink)? { k } else { 0 };
+                if taken != consumed || !self.apply_proxy_header(info, is_v2) {
+                    self.cli_state = ScState::Error;
+                    self.ending = Some(Ending::Error);
+                    return Ok(false);
+                }
+                Ok(true)
+            }
+            // Not all of it yet; a header this buffer cannot hold is not one.
+            Ok(None) if n < peek.len() => Ok(false),
+            Ok(None) | Err(_) => {
+                self.cli_state = ScState::Error;
+                self.ending = Some(Ending::Error);
+                Ok(false)
+            }
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     fn process_cli_io(&mut self) -> io::Result<bool> {
         let mut changed = false;
+
+        // A PROXY header to a TLS bind precedes the handshake: read it before the
+        // transport reads anything.
+        if self.accept_proxy && !self.proxy_handshake_done && self.cli_xprt.is_tls() {
+            if !self.read_proxy_header_before_tls()? {
+                return Ok(matches!(self.cli_state, ScState::Error | ScState::Closed));
+            }
+            changed = true;
+        }
 
         // Read from the client.
         // For H2 connections (negotiated via ALPN or active H2 context), decrypted bytes
@@ -787,25 +860,13 @@ impl TcpSession {
             if !self.req.is_empty() {
                 match ibex_proto::parse_proxy_header(self.req.readable()) {
                     Ok(Some((hdr, consumed))) => {
-                        if self.accept_proxy_v2 && hdr.version != ibex_proto::ProxyVersion::V2 {
+                        let (info, is_v2) = (hdr.to_owned(), hdr.version == ibex_proto::ProxyVersion::V2);
+                        if !self.apply_proxy_header(info, is_v2) {
                             self.cli_state = ScState::Error;
                             self.ending = Some(Ending::Error);
                             return Ok(true);
                         }
-                        if let Some(src) = hdr.src_sockaddr() {
-                            self.client_addr = Some(src);
-                        }
-                        if let Some(dst) = hdr.dst_sockaddr() {
-                            self.server_addr = Some(dst);
-                        }
-                        self.proxy_info = Some(hdr.to_owned());
                         self.req.consume(consumed);
-                        self.proxy_handshake_done = true;
-                        if self.mode == Mode::Http {
-                            self.cli_state = ScState::Ready;
-                        } else {
-                            self.cli_state = ScState::Established;
-                        }
                         changed = true;
                     }
                     Ok(None) => {
@@ -1249,12 +1310,16 @@ impl TcpSession {
                 .ok_or_else(|| io::Error::from(io::ErrorKind::NotConnected))?;
             match self.srv_xprt.handshake(sfd) {
                 Ok(true) => {
+                    // The connection is established only now: `timeout connect` covered
+                    // the handshake (HAProxy: a TLS handshake that hangs is a connect
+                    // timeout), and the server timer starts here.
+                    self.conn_exp = Tick::ETERNITY;
                     changed = true;
                 }
                 Ok(false) => {}
                 Err(e) => {
+                    // A connect failure, which the engine retries (`srv_xprt.handshake_failed`).
                     self.srv_state = ScState::Error;
-                    self.ending.get_or_insert(Ending::Error);
                     return Err(e);
                 }
             }
@@ -1268,7 +1333,10 @@ impl TcpSession {
                     .as_ref()
                     .map(AsFd::as_fd)
                     .ok_or_else(|| io::Error::from(io::ErrorKind::NotConnected))?;
-                self.srv_xprt.send(sfd, &self.req.readable()[..window])?
+                match self.srv_xprt.send(sfd, &self.req.readable()[..window]) {
+                    Err(e) if e.kind() == io::ErrorKind::InvalidData && self.srv_xprt.is_ready() => Io::Closed,
+                    r => r?,
+                }
             };
             match r {
                 Io::Done(n) if n > 0 => {
@@ -1298,7 +1366,16 @@ impl TcpSession {
                     .ok_or_else(|| io::Error::from(io::ErrorKind::NotConnected))?;
                 let dst = self.rep.writable();
                 let asked = dst.len();
-                let r = self.srv_xprt.recv(sfd, dst)?;
+                // A TLS protocol error *after* the handshake (a post-handshake alert,
+                // such as a server that wanted a client certificate and the TLS 1.3
+                // handshake completed on our side first) is the server hanging up:
+                // HAProxy logs `SH` and answers 502. A failure *during* the handshake is
+                // a connect failure instead, which the engine retries (`handshake_failed`),
+                // so it is left to propagate.
+                let r = match self.srv_xprt.recv(sfd, dst) {
+                    Err(e) if e.kind() == io::ErrorKind::InvalidData && self.srv_xprt.is_ready() => Io::Closed,
+                    r => r?,
+                };
                 self.srv_cant_recv = self.mode == Mode::Http && !self.srv_xprt.is_tls() && drained(r, asked);
                 r
             };
@@ -1462,6 +1539,7 @@ impl TcpSession {
 
     fn conn_timer_live(&self) -> bool {
         self.srv_state == ScState::Connecting
+            || (matches!(self.srv_state, ScState::Ready | ScState::Established) && self.srv_xprt.is_tls() && !self.srv_xprt.is_ready())
     }
 
     fn cli_timer_live(&self) -> bool {

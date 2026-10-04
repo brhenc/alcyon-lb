@@ -86,7 +86,7 @@ const KEYWORDS: &[(&str, Ibex)] = &[
     ("pool-max-conn 5", Accepts),
     ("pool-purge-delay 5s", Accepts),
     ("proto h1", Accepts),
-    ("proto h2", Accepts),
+    ("proto h2", Refuses),
     ("proxy-v2-options ssl", Refuses),
     ("redir http://example.com", Refuses),
     ("resolve-net 10.0.0.0/8", Accepts),
@@ -116,7 +116,7 @@ const KEYWORDS: &[(&str, Ibex)] = &[
     ("check", Accepts),
     ("check-pool-conn-name foo", Accepts),
     ("check-proto h1", Accepts),
-    ("check-proto h2", Accepts),
+    ("check-proto h2", Refuses),
     ("check-reuse-pool", Accepts),
     ("check-send-proxy", Refuses),
     ("check-via-socks4", Refuses),
@@ -130,26 +130,28 @@ const KEYWORDS: &[(&str, Ibex)] = &[
     ("fastinter 1s", Accepts),
     ("downinter 1s", Accepts),
     ("port 81", Accepts),
-    // src/cfgparse-ssl.c: TLS to servers is not implemented, so everything that turns it
-    // on or configures it is refused, and what turns it off is what Ibex already does.
+    // src/cfgparse-ssl.c: TLS to servers is implemented (T113, `tests/server_tls.rs`).
+    // `ssl` and `check-ssl` alone are refused as HAProxy refuses them (no CA file); a
+    // keyword rustls has no equivalent for stays refused; the paths of `ca-file`, `crt`
+    // and `crl-file` are opened at load (`ibex -c`), as a bind's `crt` is.
     ("allow-0rtt", Refuses),
-    ("alpn h2", Refuses),
-    ("ca-file /etc/ssl/ca.pem", Refuses),
-    ("check-alpn h2", Refuses),
-    ("check-sni foo", Refuses),
-    ("check-sni-auto", Refuses),
+    ("alpn h2", Accepts),
+    ("ca-file /etc/ssl/ca.pem", Accepts),
+    ("check-alpn h2", Accepts),
+    ("check-sni foo", Accepts),
+    ("check-sni-auto", Accepts),
     ("check-ssl", Refuses),
     ("ciphers ECDHE-RSA-AES128-GCM-SHA256", Refuses),
     ("ciphersuites TLS_AES_128_GCM_SHA256", Refuses),
     ("client-sigalgs RSA-PSS+SHA256", Refuses),
-    ("crl-file /etc/ssl/crl.pem", Refuses),
+    ("crl-file /etc/ssl/crl.pem", Accepts),
     ("curves X25519", Refuses),
-    ("crt /etc/ssl/client.pem", Refuses),
+    ("crt /etc/ssl/client.pem", Accepts),
     ("force-sslv3", Refuses),
     ("force-tlsv10", Refuses),
     ("force-tlsv11", Refuses),
-    ("force-tlsv12", Refuses),
-    ("force-tlsv13", Refuses),
+    ("force-tlsv12", Accepts),
+    ("force-tlsv13", Accepts),
     ("ktls on", Refuses),
     ("no-check-sni-auto", Accepts),
     ("no-check-ssl", Accepts),
@@ -158,27 +160,27 @@ const KEYWORDS: &[(&str, Ibex)] = &[
     ("no-send-proxy-v2-ssl-cn", Accepts),
     ("no-sni-auto", Accepts),
     ("no-ssl", Accepts),
-    ("no-ssl-reuse", Refuses),
-    ("no-sslv3", Refuses),
-    ("no-tlsv10", Refuses),
-    ("no-tlsv11", Refuses),
-    ("no-tlsv12", Refuses),
-    ("no-tlsv13", Refuses),
+    ("no-ssl-reuse", Accepts),
+    ("no-sslv3", Accepts),
+    ("no-tlsv10", Accepts),
+    ("no-tlsv11", Accepts),
+    ("no-tlsv12", Accepts),
+    ("no-tlsv13", Accepts),
     ("no-tls-tickets", Refuses),
     ("npn h2", Refuses),
     ("renegotiate", Refuses),
     ("send-proxy-v2-ssl", Refuses),
     ("send-proxy-v2-ssl-cn", Refuses),
     ("sigalgs RSA-PSS+SHA256", Refuses),
-    ("sni str(foo)", Refuses),
-    ("sni-auto", Refuses),
+    ("sni str(foo)", Accepts),
+    ("sni-auto", Accepts),
     ("ssl", Refuses),
-    ("ssl-min-ver TLSv1.2", Refuses),
-    ("ssl-max-ver TLSv1.3", Refuses),
-    ("ssl-reuse", Refuses),
+    ("ssl-min-ver TLSv1.2", Accepts),
+    ("ssl-max-ver TLSv1.3", Accepts),
+    ("ssl-reuse", Accepts),
     ("tls-tickets", Refuses),
-    ("verify none", Refuses),
-    ("verifyhost foo", Refuses),
+    ("verify none", Accepts),
+    ("verifyhost foo", Accepts),
     // src/cfgparse-tcp.c
     ("cc cubic", Accepts),
     ("tcp-md5sig secret", Refuses),
@@ -242,15 +244,19 @@ fn keywords_haproxy_does_not_know_are_refused() {
     }
 }
 
-/// The configuration from the task. `HAProxy` connects with TLS and checks the server's
-/// certificate against `ca.pem`; Ibex used to load it and connect in plaintext.
+/// The configuration from T94. `HAProxy` connects with TLS and checks the server's
+/// certificate against `ca.pem`; Ibex used to load it and connect in plaintext, then (T94)
+/// refused it, and since T113 does what it says (`tests/server_tls.rs`; the file is
+/// opened at load). A server line that would verify against nothing is refused with
+/// `HAProxy`'s alert, from a `default-server` too.
 #[test]
-fn a_tls_server_is_refused_rather_than_reached_in_plaintext() {
-    let err = server_line("ssl verify required ca-file ca.pem alpn h2").expect_err("must not load");
-    assert!(err.message.contains("'ssl'"), "{}", err.message);
-    assert!(err.message.contains("plaintext"), "the error should say what ignoring it would do: {}", err.message);
-    let err = default_server_line("ssl verify none").expect_err("must not load");
-    assert!(err.message.contains("'ssl'"), "{}", err.message);
+fn a_tls_server_loads_and_one_without_trust_anchors_is_refused() {
+    server_line("ssl verify required ca-file ca.pem alpn h2").expect("loads");
+    let err = server_line("ssl").expect_err("must not load");
+    assert!(err.message.contains("no CA file specified"), "{}", err.message);
+    let err = default_server_line("ssl").expect_err("must not load");
+    assert!(err.message.contains("no CA file specified"), "{}", err.message);
+    default_server_line("ssl verify none").expect("loads");
 }
 
 /// An argument is consumed with its keyword. `HAProxy` reads `cookie backup` as the cookie
@@ -296,17 +302,17 @@ fn a_trailing_weight_or_maxconn_is_accepted_as_haproxy_accepts_it() {
     }
 }
 
-/// `proto` and `check-proto` name the protocol spoken to the server. Ibex speaks HTTP/1.1;
-/// `h2` is accepted with a warning (the reg-tests `checks/http-check.vtc` and
-/// `http-messaging/http_bodyless_response.vtc` use it, and a server expecting h2 refuses
-/// HTTP/1.1 rather than misreading it). `HAProxy` refuses a protocol it has no mux for:
-/// "'proto' :  unknown MUX protocol 'h3'."
+/// `proto` and `check-proto` name the protocol spoken to the server. Ibex speaks HTTP/1.1
+/// and has no HTTP/2 mux towards servers, so `h2` is refused (T113; until then it was a
+/// warning, and the reg-tests `checks/http-check.vtc` and
+/// `http-messaging/http_bodyless_response.vtc` passed only because both ends ignored it).
+/// `HAProxy` refuses a protocol it has no mux for: "'proto' :  unknown MUX protocol 'h3'."
 #[test]
 fn proto_values() {
-    for line in ["proto h1", "proto h2", "check-proto h1", "check-proto h2"] {
+    for line in ["proto h1", "check-proto h1"] {
         assert!(server_line(line).is_ok(), "{line}");
     }
-    for line in ["proto h3", "proto fcgi", "proto spop", "check-proto bogus"] {
+    for line in ["proto h2", "check-proto h2", "proto h3", "proto fcgi", "proto spop", "check-proto bogus"] {
         let err = server_line(line).expect_err(line);
         assert!(err.message.contains(&format!("'{}'", keyword(line))), "{line}: {}", err.message);
     }

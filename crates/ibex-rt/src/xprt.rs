@@ -68,6 +68,16 @@ pub struct TlsConn {
     /// can inject a TCP FIN ends the stream early, and a proxy that reports it as a clean
     /// end will forward a partial body as though it were complete.
     truncated: bool,
+    /// The handshake failed (a refused certificate, a peer that is not speaking TLS, a
+    /// peer gone mid-handshake). For a server connection this is a connect failure:
+    /// `HAProxy` retries it and answers 503 `SC` when the retries are spent.
+    failed: bool,
+    /// Bytes that go on the wire in plaintext before the ClientHello: a PROXY protocol
+    /// header to a `send-proxy` server, which `HAProxy` writes from its `xprt_handshake`
+    /// layer under `ssl_sock`, and which the peer's `accept-proxy` reads before its own
+    /// handshake. `prefix_sent` is how much of it is out.
+    prefix: Vec<u8>,
+    prefix_sent: usize,
 }
 
 impl TlsConn {
@@ -77,7 +87,33 @@ impl TlsConn {
             ctx,
             peer_closed: false,
             truncated: false,
+            failed: false,
+            prefix: Vec::new(),
+            prefix_sent: 0,
         }
+    }
+
+    #[must_use]
+    pub const fn handshake_failed(&self) -> bool {
+        self.failed
+    }
+
+    /// Sets the plaintext bytes written before the handshake. Only before it started.
+    pub fn set_plain_prefix(&mut self, bytes: Vec<u8>) {
+        self.prefix = bytes;
+        self.prefix_sent = 0;
+    }
+
+    /// Writes what is left of the plaintext prefix. `Ok(true)` once it is all out.
+    fn send_prefix(&mut self, fd: BorrowedFd<'_>) -> io::Result<bool> {
+        while self.prefix_sent < self.prefix.len() {
+            match raw::send(fd, &self.prefix[self.prefix_sent..])? {
+                Io::Done(n) => self.prefix_sent += n,
+                Io::WouldBlock => return Ok(false),
+                Io::Closed | Io::Eof => return Err(io::ErrorKind::ConnectionReset.into()),
+            }
+        }
+        Ok(true)
     }
 
     fn session(&mut self) -> Option<&mut TlsSession> {
@@ -91,11 +127,12 @@ impl TlsConn {
     /// asks to write when its response buffer is non-empty.
     #[must_use]
     pub fn wants_write(&self) -> bool {
-        match &self.ctx.session {
-            Some(TlsSession::Server(c)) => c.wants_write(),
-            Some(TlsSession::Client(c)) => c.wants_write(),
-            None => false,
-        }
+        self.prefix_sent < self.prefix.len()
+            || match &self.ctx.session {
+                Some(TlsSession::Server(c)) => c.wants_write(),
+                Some(TlsSession::Client(c)) => c.wants_write(),
+                None => false,
+            }
     }
 
     #[must_use]
@@ -206,6 +243,21 @@ impl TlsConn {
         if self.ctx.handshake_done {
             return Ok(true);
         }
+        if self.failed {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "TLS handshake failed"));
+        }
+        let r = match self.send_prefix(fd) {
+            Ok(true) => self.handshake_step(fd),
+            Ok(false) => Ok(false),
+            Err(e) => Err(e),
+        };
+        if r.is_err() {
+            self.failed = true;
+        }
+        r
+    }
+
+    fn handshake_step(&mut self, fd: BorrowedFd<'_>) -> io::Result<bool> {
         // Flush first: the very first thing a server does is answer a ClientHello it has
         // already been given, and there may be nothing to read yet.
         self.flush(fd)?;
@@ -442,11 +494,21 @@ impl ServerXprt {
         }
     }
 
+    /// The name sent in SNI, known from the start of the connection.
     #[must_use]
     pub fn sni(&self) -> Option<&str> {
         match self {
             ServerXprt::Plain => None,
-            ServerXprt::Tls(t) => t.ctx.tls_info.sni.as_deref(),
+            ServerXprt::Tls(t) => t.ctx.client_sni.as_deref(),
+        }
+    }
+
+    /// True once the handshake has failed: the connection is not, and will not be, usable.
+    #[must_use]
+    pub fn handshake_failed(&self) -> bool {
+        match self {
+            ServerXprt::Plain => false,
+            ServerXprt::Tls(t) => t.handshake_failed(),
         }
     }
 
@@ -589,23 +651,25 @@ impl std::fmt::Debug for ServerXprt {
 
 /// Builds an outbound client-side TLS transport to connect to an upstream backend server.
 ///
-/// # Errors
-/// Propagates rustls client session setup failure.
+/// The recorded SNI is the name that goes on the wire: a DNS name when the config sends
+/// SNI, nothing for an IP address (rustls never sends one) or when `enable_sni` is off.
+///
+/// rustls refuses a session only for a client config that asks for something this
+/// proxy never configures (Encrypted Client Hello), so setup has no failure of its own
+/// to report here: a session that did not come up is a transport already marked failed,
+/// and the first handshake step reports it as every other handshake failure -- a connect
+/// failure that `HAProxy` retries and answers 503 `SC` for.
 pub fn connect_tls(
     fd: &impl AsRawFd,
     config: std::sync::Arc<rustls::ClientConfig>,
     server_name: rustls::pki_types::ServerName<'static>,
-) -> io::Result<ServerXprt> {
+) -> ServerXprt {
     let sni_str = match &server_name {
-        rustls::pki_types::ServerName::DnsName(dns) => Some(dns.as_ref().to_string()),
-        rustls::pki_types::ServerName::IpAddress(ip) => Some(match ip {
-            rustls::pki_types::IpAddr::V4(v4) => std::net::Ipv4Addr::from(*v4).to_string(),
-            rustls::pki_types::IpAddr::V6(v6) => std::net::Ipv6Addr::from(*v6).to_string(),
-        }),
+        rustls::pki_types::ServerName::DnsName(dns) if config.enable_sni => Some(dns.as_ref().to_string()),
         _ => None,
     };
-    let conn = rustls::ClientConnection::new(config, server_name).map_err(io::Error::other)?;
-    Ok(ServerXprt::Tls(Box::new(TlsConn::new(
-        RustlsContext::new_client(fd.as_raw_fd(), conn, sni_str),
-    ))))
+    let conn = rustls::ClientConnection::new(config, server_name).ok();
+    let mut tls = TlsConn::new(RustlsContext::new_client_session(fd.as_raw_fd(), conn, sni_str));
+    tls.failed = tls.ctx.session.is_none();
+    ServerXprt::Tls(Box::new(tls))
 }

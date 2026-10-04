@@ -100,6 +100,17 @@ pub(crate) fn collect(section: &CurrentSection, tokens: &[Token], out: &mut Vec<
             push(out, t, true, &t.text);
         }
     }
+    // A server's `sni <expr>` is a sample expression evaluated when it is connected to.
+    if tokens[0].text == "server" || tokens[0].text == "default-server" {
+        for (i, t) in tokens.iter().enumerate() {
+            if t.text == "sni" {
+                if let Some(e) = tokens.get(i + 1) {
+                    push(out, e, false, &e.text);
+                }
+            }
+        }
+        return;
+    }
     // `http-check send uri <uri>` and `body <string>` are literal (`uri-lf`, `body-lf` and
     // the `hdr` values are the log-formats), and so is `option httpchk`'s URI.
     let literal_after = |i: usize| {
