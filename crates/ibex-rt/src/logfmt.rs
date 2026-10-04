@@ -593,6 +593,20 @@ fn port(out: &mut String, a: Option<SocketAddr>, o: Opts) {
 }
 
 /// `date2str_log`: `03/Oct/2026:16:48:18.622`.
+/// The line `HAProxy` writes for a connection that failed before it was a stream
+/// (`session_embryonic_build_legacy_err`): `<src>:<port> [<accept date>] <fe>/<listener>:
+/// <message>`. The listener is its name if it has one, else its numeric id; a client with
+/// no address is `unknown`.
+#[must_use]
+pub fn connection_error_line(client: Option<SocketAddr>, accept_date: (i64, u32), frontend: &str, listener: &str, message: &str) -> String {
+    let mut out = String::new();
+    let who = client.map_or_else(|| "unknown".to_string(), |a| format!("{}:{}", a.ip(), a.port()));
+    let _ = write!(out, "{who} [");
+    date_ms(&mut out, accept_date.0, accept_date.1);
+    let _ = write!(out, "] {frontend}/{listener}: {message}");
+    out
+}
+
 fn date_ms(out: &mut String, unix: i64, ms: u32) {
     let c = Civil::local(unix);
     let _ = write!(out, "{:02}/{}/{:04}:{:02}:{:02}:{:02}.{ms:03}", c.day, c.month_name(), c.year, c.hour, c.minute, c.second);

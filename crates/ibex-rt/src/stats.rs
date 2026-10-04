@@ -750,6 +750,7 @@ mod tests {
             chash: std::sync::Arc::default(),
             fwrr: std::sync::Arc::default(),
             log_format: None,
+            dont_log_null: false,
             unique_id_format: None,
             unique_id_header: None,
             req_capture_slots: std::sync::Arc::new([]),

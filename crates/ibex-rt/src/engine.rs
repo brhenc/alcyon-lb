@@ -584,6 +584,8 @@ pub struct Proxy {
     /// The per-transaction log line's format (`log-format`, `option httplog`/`tcplog`);
     /// frontends and listens only, as in `HAProxy`.
     pub log_format: Option<Arc<crate::logfmt::LogFormat>>,
+    /// `option dontlognull`: a connection that carried nothing logs nothing.
+    pub dont_log_null: bool,
     /// `unique-id-format`, compiled.
     pub unique_id_format: Option<Arc<crate::logfmt::LogFormat>>,
     /// `unique-id-header`: the request header the unique ID is sent to the server in.
@@ -1430,6 +1432,36 @@ fn stream_log_line(entry: &SessionEntry, proxies: &[Proxy], pid: u32) -> Option<
     Some(line)
 }
 
+/// Why a connection that was to open with a PROXY header did not get past it, if that is
+/// what happened: the parser's refusal, or the client closing, resetting or timing out
+/// before sending one.
+fn proxy_header_failure(s: &TcpSession) -> Option<crate::proxy::ProxyHdrError> {
+    use crate::proxy::{Ending, ProxyHdrError};
+    if s.proxy_hdr_err.is_some() {
+        return s.proxy_hdr_err;
+    }
+    if !s.accept_proxy || s.proxy_handshake_done {
+        return None;
+    }
+    // The header's reads end in `proxy_hdr_err` themselves; what is left is the timer.
+    matches!(s.ending?, Ending::Timeout(crate::proxy::Which::Client)).then_some(ProxyHdrError::Timeout)
+}
+
+/// `HAProxy`'s own line for a bad PROXY header (`session_kill_embryonic`): only for a
+/// frontend that logs, not in its log-format, and not for the empty cases under `option
+/// dontlognull`.
+fn proxy_header_error_line(entry: &SessionEntry, proxies: &[Proxy]) -> Option<String> {
+    let why = proxy_header_failure(&entry.sess)?;
+    let fe = &proxies[entry.proxy_idx];
+    if fe.log_format.is_none() || fe.log_target_idx.is_empty() || (fe.dont_log_null && why.is_null()) {
+        return None;
+    }
+    let s = &entry.sess;
+    let listener = s.so_name.as_deref().map_or_else(|| s.so_id.unwrap_or(0).to_string(), str::to_string);
+    fe.log_count.fetch_add(1, Ordering::Relaxed);
+    Some(crate::logfmt::connection_error_line(s.client_addr, s.log.date, &fe.name, &listener, why.message()))
+}
+
 fn syslog_tag(tag: &str) -> Arc<str> {
     format!("{tag}[{}]", std::process::id()).into()
 }
@@ -1836,6 +1868,7 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, list
         error_replies: listen.error_replies.clone(),
         log_tag: listen.log_tag.as_deref().map(syslog_tag),
         log_format: compile_log_format(listen.log_format.as_ref(), listen.mode == Mode::Http),
+        dont_log_null: listen.dontlognull,
         unique_id_format: listen.unique_id_format.as_deref().and_then(compile_unique_id_format),
         unique_id_header: listen.unique_id_header.clone(),
         req_capture_slots,
@@ -1955,6 +1988,7 @@ fn init_proxy_from_frontend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, fe
         error_replies: fe.error_replies.clone(),
         log_tag: fe.log_tag.as_deref().map(syslog_tag),
         log_format: compile_log_format(fe.log_format.as_ref(), fe.mode == Mode::Http),
+        dont_log_null: fe.dontlognull,
         unique_id_format: fe.unique_id_format.as_deref().and_then(compile_unique_id_format),
         unique_id_header: fe.unique_id_header.clone(),
         req_capture_slots,
@@ -2099,6 +2133,7 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, be:
         error_replies: be.error_replies.clone(),
         log_tag: be.log_tag.as_deref().map(syslog_tag),
         log_format: None,
+        dont_log_null: false,
         unique_id_format: be.unique_id_format.as_deref().and_then(compile_unique_id_format),
         unique_id_header: be.unique_id_header.clone(),
         req_capture_slots: Arc::from([]),
@@ -5951,7 +5986,7 @@ impl EngineDispatcher<'_> {
                 );
             }
 
-            let log_line = entry.log_line.take();
+            let log_line = entry.log_line.take().filter(|_| proxy_header_failure(&entry.sess).is_none());
 
             // Step 3.6: If in TCP mode and server not yet connected (e.g. deferred on accept-proxy or inspect), connect once ready
             if entry.sess.mode == Mode::Tcp
@@ -6011,6 +6046,11 @@ impl EngineDispatcher<'_> {
             // A TCP connection's line, and an HTTP transaction's that ended with the
             // connection rather than through `end_txn` (aborted, timed out).
             let line = self.sessions.get_mut(session_idx).and_then(|e| {
+                // A refused PROXY header has its own line, never the frontend's format.
+                if proxy_header_failure(&e.sess).is_some() {
+                    e.log_line = None;
+                    return proxy_header_error_line(e, self.proxies).map(|l| (e.proxy_idx, l));
+                }
                 e.log_line
                     .take()
                     .or_else(|| (e.sess.mode == Mode::Tcp || e.sess.txn.is_some()).then(|| stream_log_line(e, self.proxies, self.pid)).flatten())

@@ -711,7 +711,7 @@ fn test_source_ip_hash_uses_real_client_ip_from_proxy_header() {
 }
 
 #[test]
-fn test_frontend_accept_proxy_fragmented_chunks() {
+fn test_frontend_accept_proxy_partial_header_is_refused() {
     let srv_addr = common::reserve_addr();
     let proxy_addr = common::reserve_addr();
 
@@ -763,40 +763,23 @@ fn test_frontend_accept_proxy_fragmented_chunks() {
 
     let mut client = TcpStream::connect(proxy_addr).expect("client connect");
 
-    // Send PROXY header in 3 small fragmented chunks with pauses
-    let chunk1 = b"PROXY TCP4 192.168.";
-    let chunk2 = b"1.100 10.0.0.1 55443";
-    let chunk3 = b" 80\r\nCOMPLETE";
-
-    client.write_all(chunk1).expect("write chunk 1");
-    let _ = engine.run_once();
-    thread::sleep(Duration::from_millis(10));
-
-    client.write_all(chunk2).expect("write chunk 2");
-    let _ = engine.run_once();
-    thread::sleep(Duration::from_millis(10));
-
-    client.write_all(chunk3).expect("write chunk 3");
-
+    // `HAProxy` (conn_recv_proxy) peeks once and, finding part of a header, closes the
+    // connection ("Truncated PROXY protocol header received", T128); it does not wait for the
+    // rest. A header sent in pieces is refused, and nothing reaches the server.
+    client.write_all(b"PROXY TCP4 192.168.").expect("write chunk 1");
     let start = Instant::now();
-    let mut response = Vec::new();
     let mut buf = [0u8; 1024];
     client.set_nonblocking(true).expect("nonblocking");
-
-    while start.elapsed() < Duration::from_secs(2) {
+    let mut closed = false;
+    while start.elapsed() < Duration::from_secs(2) && !closed {
         let _ = engine.run_once().expect("engine step");
-        if let Ok(n) = client.read(&mut buf) {
-            if n > 0 {
-                response.extend_from_slice(&buf[..n]);
-                if response == b"FRAGMENT_OK" {
-                    break;
-                }
-            }
-        }
+        closed = match client.read(&mut buf) {
+            Ok(n) => n == 0,
+            Err(e) => e.kind() != std::io::ErrorKind::WouldBlock,
+        };
         thread::sleep(Duration::from_millis(5));
     }
-
-    assert_eq!(&response, b"FRAGMENT_OK");
+    assert!(closed, "a partial PROXY header closes the connection");
 
     running.store(false, Ordering::Relaxed);
     let _ = srv_handle.join();

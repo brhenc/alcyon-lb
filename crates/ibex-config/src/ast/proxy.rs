@@ -47,6 +47,8 @@ pub struct DefaultsSection {
     /// `option http-server-close`: each request goes on its own server connection, which
     /// is asked to close; the client connection stays.
     pub server_close: bool,
+    /// `option dontlognull`: no log line for a connection that carried nothing.
+    pub dontlognull: bool,
     /// `option forwardfor` in `defaults`: the `except` network, empty for none.
     pub forwardfor: Option<String>,
     /// `option forwardfor ... if-none` (without it, `HAProxy` adds the header always).
@@ -221,6 +223,8 @@ pub struct ListenSection {
     /// `option http-server-close`: each request goes on its own server connection, which
     /// is asked to close; the client connection stays.
     pub server_close: bool,
+    /// `option dontlognull`: no log line for a connection that carried nothing.
+    pub dontlognull: bool,
     /// Client header regex rewrite rules (up to 10).
     pub cliexp: Vec<HeaderExp>,
     /// Server header regex rewrite rules (up to 10).
@@ -365,6 +369,7 @@ impl Default for ListenSection {
             log_health_checks: false,
             buffer_request: false,
             server_close: false,
+            dontlognull: false,
             cliexp: Vec::new(),
             srvexp: Vec::new(),
             acls: Vec::new(),
@@ -466,6 +471,8 @@ pub struct FrontendSection {
     /// `option http-server-close`: each request goes on its own server connection, which
     /// is asked to close; the client connection stays.
     pub server_close: bool,
+    /// `option dontlognull`: no log line for a connection that carried nothing.
+    pub dontlognull: bool,
     /// Stick table configuration.
     pub stick_table: Option<StickTableConfigAst>,
     /// Stick rules.
@@ -532,6 +539,7 @@ impl Default for FrontendSection {
             log_health_checks: false,
             buffer_request: false,
             server_close: false,
+            dontlognull: false,
             stick_table: None,
             stick_rules: Vec::new(),
             tcp_req_inspect_delay: None,

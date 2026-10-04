@@ -40,6 +40,60 @@ use std::net::SocketAddr;
 use std::os::fd::{AsFd, OwnedFd};
 use std::time::Instant;
 
+/// Why a connection that was to carry a PROXY header did not get one past the parser:
+/// `HAProxy`'s `CO_ER_PRX_*` codes, with the texts of `conn_err_code_str`.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum ProxyHdrError {
+    /// The client closed before sending a byte (`CO_ER_PRX_EMPTY`).
+    Empty,
+    /// The read failed, as on a reset (`CO_ER_PRX_ABORT`).
+    Abort,
+    /// `timeout client` expired with no header (`CO_ER_PRX_TIMEOUT`).
+    Timeout,
+    /// Some of a header, and `HAProxy` does not wait for the rest (`CO_ER_PRX_TRUNCATED`).
+    Truncated,
+    /// Neither a v1 line nor a v2 signature (`CO_ER_PRX_NOT_HDR`).
+    NotHdr,
+    /// A header that does not hold together (`CO_ER_PRX_BAD_HDR`).
+    BadHdr,
+    /// A v1 protocol that is not `TCP4`, `TCP6` or `UNKNOWN` (`CO_ER_PRX_BAD_PROTO`).
+    BadProto,
+}
+
+impl ProxyHdrError {
+    /// The text `HAProxy` logs after `fe/<listener>: `.
+    #[must_use]
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::Empty => "Connection closed while waiting for PROXY protocol header",
+            Self::Abort => "Connection error while waiting for PROXY protocol header",
+            Self::Timeout => "Timeout while waiting for PROXY protocol header",
+            Self::Truncated => "Truncated PROXY protocol header received",
+            Self::NotHdr => "Received something which does not look like a PROXY protocol header",
+            Self::BadHdr => "Received an invalid PROXY protocol header",
+            Self::BadProto => "Received an unhandled protocol in the PROXY protocol header",
+        }
+    }
+
+    /// The code for a parser error, as `conn_recv_proxy` picks it.
+    #[must_use]
+    pub fn from_parse(e: &ibex_proto::ProxyParseError) -> Self {
+        use ibex_proto::ProxyParseError as E;
+        match e {
+            E::InvalidSignature | E::UnsupportedVersion(_) => Self::NotHdr,
+            E::InvalidProtocol => Self::BadProto,
+            _ => Self::BadHdr,
+        }
+    }
+
+    /// `option dontlognull` drops the lines of a client that sent nothing (`session_kill_embryonic`
+    /// checks the code before a timeout has been given one, so that is silent too).
+    #[must_use]
+    pub fn is_null(self) -> bool {
+        matches!(self, Self::Empty | Self::Abort | Self::Timeout)
+    }
+}
+
 /// Why a session ended. Reported to logs and to `show sess`.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Ending {
@@ -104,6 +158,8 @@ pub struct TcpSession {
     pub so_name: Option<Arc<str>>,
     /// The id of the bind that accepted this connection (`so_id`).
     pub so_id: Option<u32>,
+    /// Set when the PROXY header was refused: the connection logs that, not a request.
+    pub proxy_hdr_err: Option<ProxyHdrError>,
     pub cliexp: Vec<CompiledExp>,
     pub srvexp: Vec<CompiledExp>,
     pub req_uri: Option<String>,
@@ -260,6 +316,7 @@ impl TcpSession {
             client_addr: None,
             so_name: None,
             so_id: None,
+            proxy_hdr_err: None,
             cliexp,
             srvexp,
             req_uri: None,
@@ -827,6 +884,18 @@ impl TcpSession {
         true
     }
 
+    /// `accept-proxy` is on and nothing of the header has been taken in yet.
+    fn awaiting_proxy_header(&self) -> bool {
+        self.accept_proxy && !self.proxy_handshake_done && self.proxy_hdr_err.is_none() && self.req.is_empty()
+    }
+
+    /// Ends the connection for a PROXY header that was not accepted, and remembers why.
+    fn refuse_proxy_header(&mut self, why: ProxyHdrError) {
+        self.proxy_hdr_err = Some(why);
+        self.cli_state = ScState::Error;
+        self.ending = Some(Ending::Error);
+    }
+
     /// `accept-proxy` on a TLS bind: the PROXY header comes in plaintext, ahead of the
     /// ClientHello (`HAProxy` reads it in `conn_recv_proxy` before `ssl_sock` sees a
     /// byte; a `send-proxy ... ssl` server writes it from `xprt_handshake` under TLS).
@@ -839,9 +908,8 @@ impl TcpSession {
         let n = match raw::peek(fd, &mut peek)? {
             Io::Done(n) => n,
             Io::WouldBlock => return Ok(false),
-            Io::Eof | Io::Closed => {
-                self.cli_state = ScState::Closed;
-                self.ending.get_or_insert(Ending::ClientAbort);
+            r @ (Io::Eof | Io::Closed) => {
+                self.refuse_proxy_header(if matches!(r, Io::Eof) { ProxyHdrError::Empty } else { ProxyHdrError::Abort });
                 return Ok(false);
             }
         };
@@ -852,18 +920,20 @@ impl TcpSession {
                 let mut sink = vec![0u8; consumed];
                 // What the peek showed is on the socket, so one read takes all of it.
                 let taken = if let Io::Done(k) = raw::recv(fd, &mut sink)? { k } else { 0 };
-                if taken != consumed || !self.apply_proxy_header(info, is_v2) {
-                    self.cli_state = ScState::Error;
-                    self.ending = Some(Ending::Error);
-                    return Ok(false);
+                if taken == consumed && self.apply_proxy_header(info, is_v2) {
+                    return Ok(true);
                 }
-                Ok(true)
+                self.refuse_proxy_header(if taken == consumed { ProxyHdrError::NotHdr } else { ProxyHdrError::Abort });
+                Ok(false)
             }
             // Not all of it yet; a header this buffer cannot hold is not one.
-            Ok(None) if n < peek.len() => Ok(false),
-            Ok(None) | Err(_) => {
-                self.cli_state = ScState::Error;
-                self.ending = Some(Ending::Error);
+            // `HAProxy` peeks once: what it did not get in that read it does not wait for.
+            Ok(None) => {
+                self.refuse_proxy_header(ProxyHdrError::Truncated);
+                Ok(false)
+            }
+            Err(e) => {
+                self.refuse_proxy_header(ProxyHdrError::from_parse(&e));
                 Ok(false)
             }
         }
@@ -931,6 +1001,9 @@ impl TcpSession {
                 let r = self.cli_xprt.recv(self.cli.as_fd(), dst)?;
                 self.cli_cant_recv = self.polls_cli() && drained(r, asked);
                 match r {
+                    // The client left before a byte of the PROXY header.
+                    Io::Eof if self.awaiting_proxy_header() => self.refuse_proxy_header(ProxyHdrError::Empty),
+                    Io::Closed if self.awaiting_proxy_header() => self.refuse_proxy_header(ProxyHdrError::Abort),
                     Io::Eof => {
                         raw::shutdown_read(self.cli.as_fd());
                         self.cli_state = match self.cli_state {
@@ -978,20 +1051,20 @@ impl TcpSession {
                     Ok(Some((hdr, consumed))) => {
                         let (info, is_v2) = (hdr.to_owned(), hdr.version == ibex_proto::ProxyVersion::V2);
                         if !self.apply_proxy_header(info, is_v2) {
-                            self.cli_state = ScState::Error;
-                            self.ending = Some(Ending::Error);
+                            self.refuse_proxy_header(ProxyHdrError::NotHdr);
                             return Ok(true);
                         }
                         self.req.consume(consumed);
                         changed = true;
                     }
                     Ok(None) => {
-                        // Incomplete header in buffer, await more data from client
+                        // Not all of it in the first read: `HAProxy` does not wait for the rest.
+                        self.refuse_proxy_header(ProxyHdrError::Truncated);
+                        return Ok(true);
                     }
-                    Err(_) => {
+                    Err(e) => {
                         // Invalid signature, malformed header, or CRC mismatch: reject immediately
-                        self.cli_state = ScState::Error;
-                        self.ending = Some(Ending::Error);
+                        self.refuse_proxy_header(ProxyHdrError::from_parse(&e));
                         return Ok(true);
                     }
                 }
