@@ -885,6 +885,23 @@ impl Registry {
         });
 
         self.register_fetch(FetchDesc {
+            name: "url_ip",
+            out_type: SampleType::Ipv4,
+            func: |ctx, _args| {
+                let (ip, _) = url_ipv4_authority(get_context_uri(ctx)?)?;
+                Some(Sample::Ipv4(ip))
+            },
+        });
+        self.register_fetch(FetchDesc {
+            name: "url_port",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| {
+                let (_, port) = url_ipv4_authority(get_context_uri(ctx)?)?;
+                Some(Sample::Sint(i64::from(port)))
+            },
+        });
+
+        self.register_fetch(FetchDesc {
             name: "query",
             out_type: SampleType::Str,
             func: |ctx, _args| {
@@ -4958,6 +4975,47 @@ fn extract_url_param(query: &str, param: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// The address and port `url_ip` and `url_port` read from an absolute-form target
+/// (`url2sa`): a `http` or `https` scheme (any case; the port defaults to 80 or 443), no
+/// userinfo, and a host that is four decimal numbers up to 255 -- a name, an IPv6 literal or
+/// a short form is no address. The port is the digits after the colon, nothing if there are
+/// none, and wraps at 65536 as the `u16` it is stored in does.
+fn url_ipv4_authority(uri: &str) -> Option<(Ipv4Addr, u16)> {
+    let (scheme, rest) = uri.split_once("://")?;
+    let default = if scheme.eq_ignore_ascii_case("http") {
+        80
+    } else if scheme.eq_ignore_ascii_case("https") {
+        443
+    } else {
+        return None;
+    };
+    let authority = &rest[..rest.find(['/', '?']).unwrap_or(rest.len())];
+    if authority.contains('@') {
+        return None;
+    }
+    let (host, port) = match authority.split_once(':') {
+        Some((h, p)) => (h, Some(p)),
+        None => (authority, None),
+    };
+    let mut octets = [0u8; 4];
+    let mut parts = host.split('.');
+    for o in &mut octets {
+        let part = parts.next().filter(|p| (1..=3).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_digit()))?;
+        *o = part.parse().ok()?;
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+    let port = match port {
+        None | Some("") => default,
+        Some(p) => {
+            let digits = p.bytes().take_while(u8::is_ascii_digit).fold(0u32, |n, b| (n * 10 + u32::from(b - b'0')) & 0xFFFF_FFF);
+            (digits & 0xFFFF) as u16
+        }
+    };
+    Some((Ipv4Addr::from(octets), port))
 }
 
 fn split_uri(uri: &str) -> (&str, &str, &str) {
