@@ -310,8 +310,8 @@ pub struct StatsConfig {
     pub admin: bool,
     pub admin_cond: Option<AclCondition>,
     pub show_legends: bool,
-    pub show_desc: Option<String>,
-    pub show_node: Option<String>,
+    pub show_desc: Option<Box<str>>,
+    pub show_node: Option<Box<str>>,
     pub raw_timeouts: TimeoutConfig,
     pub forwardfor: Option<String>,
     /// `option forwardfor ... if-none` (without it, `HAProxy` adds the header always).

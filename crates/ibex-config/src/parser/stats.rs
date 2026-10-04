@@ -55,14 +55,15 @@ pub(crate) fn parse_stats_directive(
                         .iter()
                         .map(|t| t.text.as_str())
                         .collect::<Vec<_>>()
-                        .join(" "),
+                        .join(" ")
+                        .into(),
                 );
             }
             Ok(())
         }
         "show-node" => {
             if tokens.len() >= 3 {
-                stats.show_node = Some(tokens[2].text.clone());
+                stats.show_node = Some(tokens[2].text.as_str().into());
             }
             Ok(())
         }
