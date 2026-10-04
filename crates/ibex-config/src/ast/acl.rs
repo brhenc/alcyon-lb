@@ -80,4 +80,7 @@ pub struct SampleRef {
     /// The expression: the fetch, its arguments and its converters (`nbsrv(be),add(1)`),
     /// without an ACL's pattern or a log-format's surroundings.
     pub expr: String,
+    /// For an anonymous ACL (`{ ... }`), the whole expression with its flags and patterns,
+    /// as `acl <name> ...` would hold it: what is compiled when the configuration loads.
+    pub full: Option<String>,
 }

@@ -238,17 +238,20 @@ impl Matcher {
             }
             "found" => Ok(Matcher::Found),
             "bin" => {
+                // `parse_binary`: whole bytes written as hex digits, in the pattern's own
+                // word. The length is checked first, then each digit.
                 let hex_str = pattern.trim().replace(' ', "");
-                let mut bytes = Vec::with_capacity(hex_str.len() / 2);
-                let chars: Vec<char> = hex_str.chars().collect();
-                if chars.len() % 2 != 0 {
-                    return Err(format!("Invalid hex binary pattern (odd length): {pattern}"));
+                let digits = hex_str.as_bytes();
+                if digits.len() % 2 != 0 {
+                    return Err("an even number of hex digit is expected".to_string());
                 }
-                for chunk in chars.chunks_exact(2) {
-                    let s: String = chunk.iter().collect();
-                    let b = u8::from_str_radix(&s, 16)
-                        .map_err(|e| format!("Invalid hex byte '{s}': {e}"))?;
-                    bytes.push(b);
+                let mut bytes = Vec::with_capacity(digits.len() / 2);
+                for pair in digits.chunks_exact(2) {
+                    let nibble = |b: u8| {
+                        char::from(b).to_digit(16).ok_or_else(|| format!("an hex digit is expected (found '{}')", char::from(b)))
+                    };
+                    let (hi, lo) = (nibble(pair[0])?, nibble(pair[1])?);
+                    bytes.push(u8::try_from(hi * 16 + lo).unwrap_or(0));
                 }
                 Ok(Matcher::Bin(bytes))
             }

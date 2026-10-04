@@ -162,7 +162,7 @@ pub(crate) fn join_tokens_until(tokens: &[Token], start: usize, cond_idx: Option
 /// text: quoted, with `\\` and `\"` escaped, when it holds what that parser splits on or
 /// decodes (blanks, quotes, a backslash). The lexer has already applied `parse_line`'s
 /// escapes, so a pattern such as `"a b\r\n"` is these bytes and must stay one word.
-fn expr_word(text: &str) -> std::borrow::Cow<'_, str> {
+pub(super) fn expr_word(text: &str) -> std::borrow::Cow<'_, str> {
     if !text.is_empty() && !text.chars().any(|c| c.is_whitespace() || matches!(c, '"' | '\'' | '\\')) {
         return std::borrow::Cow::Borrowed(text);
     }
