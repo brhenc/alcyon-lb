@@ -339,7 +339,7 @@ pub struct Proxy {
     pub server_ids: Vec<String>,
     /// Each server's persistence cookie value (`server ... cookie <value>`). A server
     /// without one is never chosen by a cookie, not even by its name.
-    pub server_cookies: Vec<Option<String>>,
+    pub server_cookies: Vec<Option<Box<str>>>,
     pub server_statuses: Arc<Vec<AtomicU8>>,
     /// `track` of each server (`None` for one that tracks nothing; empty when none does).
     pub server_track: Option<Arc<Vec<Option<crate::track::Track>>>>,
@@ -379,7 +379,7 @@ pub struct Proxy {
     pub server_retr: Arc<std::sync::Mutex<std::collections::HashMap<usize, (u64, u64)>>>,
     /// Streams assigned to each server per second (`srv_sess_rate`).
     pub server_sess_rates: Arc<Vec<RateCtr>>,
-    pub server_check_configs: Vec<Option<ServerCheckConfig>>,
+    pub server_check_configs: Vec<Option<Box<ServerCheckConfig>>>,
     /// Each server's TLS (`server ... ssl`), `None` for a plaintext one (T113).
     pub server_tls: Vec<Option<Arc<crate::srv_tls::ServerTls>>>,
     /// Each server's health-check TLS (`check-ssl`, or `ssl` inherited), `None` for
@@ -1490,7 +1490,7 @@ fn init_proxy_from_listen(proxy_idx: usize, listen: &ibex_config::ListenSection,
             } else if let Some(inter) = s.inter {
                 cfg.timeout = inter;
             }
-            server_check_configs.push(Some(cfg));
+            server_check_configs.push(Some(Box::new(cfg)));
         } else {
             server_check_configs.push(None);
         }
@@ -1518,7 +1518,7 @@ fn init_proxy_from_listen(proxy_idx: usize, listen: &ibex_config::ListenSection,
         srvexp,
         servers: listen.servers.iter().map(|s| s.addr).collect(),
         server_ids: listen.servers.iter().map(|s| s.id.clone()).collect(),
-        server_cookies: listen.servers.iter().map(|s| s.cookie.clone()).collect(),
+        server_cookies: listen.servers.iter().map(|s| s.cookie.as_deref().map(Box::from)).collect(),
         server_statuses: Arc::new(listen.servers.iter().map(|s| AtomicU8::new(initial_status(s))).collect()),
         server_track: None,
         server_weights: listen
@@ -1731,7 +1731,7 @@ fn init_proxy_from_backend(proxy_idx: usize, be: &ibex_config::BackendSection, n
             } else if let Some(inter) = s.inter {
                 cfg.timeout = inter;
             }
-            server_check_configs.push(Some(cfg));
+            server_check_configs.push(Some(Box::new(cfg)));
         } else {
             server_check_configs.push(None);
         }
@@ -1759,7 +1759,7 @@ fn init_proxy_from_backend(proxy_idx: usize, be: &ibex_config::BackendSection, n
         srvexp,
         servers: be.servers.iter().map(|s| s.addr).collect(),
         server_ids: be.servers.iter().map(|s| s.id.clone()).collect(),
-        server_cookies: be.servers.iter().map(|s| s.cookie.clone()).collect(),
+        server_cookies: be.servers.iter().map(|s| s.cookie.as_deref().map(Box::from)).collect(),
         server_statuses: Arc::new(be.servers.iter().map(|s| AtomicU8::new(initial_status(s))).collect()),
         server_track: None,
         server_weights: be.servers.iter().map(|s| s.weight.unwrap_or(1)).collect(),
@@ -1830,7 +1830,7 @@ fn init_checks(proxies: &[Proxy], scheduler: &mut Scheduler, now: Tick) -> Vec<S
             let Some(check_cfg) = proxy
                 .server_check_configs
                 .get(server_idx)
-                .and_then(Clone::clone)
+                .and_then(|c| c.as_deref().cloned())
             else {
                 continue;
             };
