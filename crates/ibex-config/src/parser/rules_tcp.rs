@@ -52,6 +52,26 @@ pub(crate) fn parse_tcp_req_connection(
             let expr = join_tokens_until(tokens, 3, cond_idx);
             rules.push(TcpReqConnRule { action: TcpReqConnAction::SetDst { expr }, cond });
         }
+        "expect-proxy" => {
+            // HAProxy: only `layer4`, then `if`/`unless` or nothing.
+            let arg = tokens.get(3).map_or("", |t| t.text.as_str());
+            if arg != "layer4" {
+                return Err(ConfigError::new(
+                    act_tok.line,
+                    act_tok.col,
+                    format!("'tcp-request connection expect-proxy' only supports 'layer4' (got '{arg}')"),
+                ));
+            }
+            if let Some(t) = tokens.get(4).filter(|t| t.text != "if" && t.text != "unless") {
+                return Err(ConfigError::new(
+                    t.line,
+                    t.col,
+                    format!("'tcp-request connection expect-proxy' only accepts 'if' or 'unless' (got '{}')", t.text),
+                ));
+            }
+            let (_, cond) = parse_rule_condition(tokens, 4)?;
+            rules.push(TcpReqConnRule { action: TcpReqConnAction::ExpectProxy, cond });
+        }
         "do-log" => {
             return Err(ConfigError::new(
                 act_tok.line,
@@ -182,6 +202,13 @@ pub(crate) fn parse_tcp_req_session(
                 let (cond_idx, cond) = parse_rule_condition(tokens, 3)?;
                 let expr = join_tokens_until(tokens, 3, cond_idx);
                 rules.push(TcpReqSessionRule { action: TcpReqSessionAction::SetDst { expr }, cond });
+            }
+            "expect-proxy" => {
+                return Err(ConfigError::new(
+                    act_tok.line,
+                    act_tok.col,
+                    "'expect-proxy layer4' is not allowed in 'tcp-request session' rules",
+                ));
             }
             "attach-srv" => {
                 return Err(ConfigError::new(

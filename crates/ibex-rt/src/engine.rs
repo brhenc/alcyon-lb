@@ -2935,7 +2935,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 }
             }
 
-            let (client_addr, server_addr, fc_src, fc_dst) = match eval_tcp_req_conn_rules(
+            let (client_addr, server_addr, fc_src, fc_dst, expect_proxy) = match eval_tcp_req_conn_rules(
                 &self.proxies[proxy_idx],
                 &self.proxies,
                 sample_registry(),
@@ -2943,7 +2943,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 local_addr,
                 &tracked_sc,
             ) {
-                ConnEvalOutcome::Accept(c, s, fs, fd) => (c, s, fs, fd),
+                ConnEvalOutcome::Accept(c, s, fs, fd, ep) => (c, s, fs, fd, ep),
                 ConnEvalOutcome::Reject => {
                     raw::abort_with_rst(cli_fd.as_fd());
                     self.proxies[proxy_idx].stats[worker_id()].denied_conn.fetch_add(1, Ordering::Relaxed);
@@ -3006,6 +3006,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 fc_src,
                 fc_dst,
                 tracked_sc,
+                expect_proxy,
             );
         }
     }
@@ -3215,7 +3216,8 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
 
 #[derive(Debug)]
 enum ConnEvalOutcome {
-    Accept(SocketAddr, SocketAddr, SocketAddr, SocketAddr),
+    /// Client, server, `fc_src`, `fc_dst`, and whether `expect-proxy` matched.
+    Accept(SocketAddr, SocketAddr, SocketAddr, SocketAddr, bool),
     Reject,
     SilentDrop,
 }
@@ -3240,6 +3242,7 @@ fn eval_tcp_req_conn_rules(
     let mut server_addr = local_addr;
     let mut fc_src = peer_addr;
     let mut fc_dst = local_addr;
+    let mut expect_proxy = false;
 
     let stick = StickView::new(proxies, tracked);
     let mut ctx = SampleContext {
@@ -3275,6 +3278,9 @@ fn eval_tcp_req_conn_rules(
             }
             ibex_config::TcpReqConnAction::Accept => {
                 break;
+            }
+            ibex_config::TcpReqConnAction::ExpectProxy => {
+                expect_proxy = true;
             }
             ibex_config::TcpReqConnAction::SetSrc { expr } => {
                 let val = if let Ok(e) = Expr::parse(expr) {
@@ -3319,7 +3325,7 @@ fn eval_tcp_req_conn_rules(
             _ => {}
         }
     }
-    ConnEvalOutcome::Accept(client_addr, server_addr, fc_src, fc_dst)
+    ConnEvalOutcome::Accept(client_addr, server_addr, fc_src, fc_dst, expect_proxy)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -3942,6 +3948,7 @@ fn register_new_session(
     fc_src: SocketAddr,
     fc_dst: SocketAddr,
     tracked_sc: [Option<(usize, StickKey)>; 3],
+    expect_proxy: bool,
 ) {
     // Cloned out before `proxies` is borrowed mutably. TLS belongs to the bind that
     // accepted, not to the proxy, so it is read from the listener.
@@ -3964,6 +3971,7 @@ fn register_new_session(
         engine.global_bufsize,
         engine.global_maxrewrite,
         engine.global_h2_flood_config,
+        expect_proxy,
     ) else {
         // TLS setup failed; the fd is dropped with the session and the connection closes.
         return;
@@ -4186,6 +4194,7 @@ fn init_client_session(
     global_bufsize: usize,
     global_maxrewrite: usize,
     global_h2_flood_config: ibex_proto::H2FloodConfig,
+    expect_proxy: bool,
 ) -> Option<(TcpSession, Option<SocketAddr>, Option<RawFd>)> {
     let mode = proxies[proxy_idx].mode;
     let timeouts = proxies[proxy_idx].timeouts;
@@ -4242,6 +4251,9 @@ fn init_client_session(
     }
     if proxies[proxy_idx].accept_proxy || proxies[proxy_idx].accept_proxy_v2 {
         sess.enable_accept_proxy(proxies[proxy_idx].accept_proxy_v2);
+    } else if expect_proxy {
+        // `tcp-request connection expect-proxy layer4` matched: v1 or v2, as `accept-proxy`.
+        sess.enable_accept_proxy(false);
     }
 
     let registry = sample_registry();
@@ -4285,8 +4297,7 @@ fn init_client_session(
         sess.cli_state = ScState::ShutR;
         sess.srv_state = ScState::Closed;
     } else if mode == Mode::Tcp
-        && !proxy.accept_proxy
-        && !proxy.accept_proxy_v2
+        && !sess.accept_proxy
         && sess.tcp_inspect_done
         // A proxy that routes (`use_backend`, `default_backend`) connects once the backend
         // is resolved (`connect_tcp_backend`): its own server list is not the one to use.

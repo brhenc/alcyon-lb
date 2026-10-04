@@ -17,6 +17,8 @@ pub enum TcpReqConnAction {
     SetSrc { expr: String },
     SetDst { expr: String },
     DoLog,
+    /// `expect-proxy layer4`: a PROXY header is expected on the connections the rule matches.
+    ExpectProxy,
 }
 
 /// Rule pairing a TCP-request connection action with an optional condition.
