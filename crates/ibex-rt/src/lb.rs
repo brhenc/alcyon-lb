@@ -815,6 +815,22 @@ mod fwrr_tests {
         assert_eq!(after.iter().filter(|&&i| i == 1).count(), 2, "{after:?}");
     }
 
+    /// A weight change before the first pick (the server is in `init`) and one that takes a
+    /// server out of the trees and back (`status_down`, `status_up`).
+    #[test]
+    fn weight_changes_before_any_pick_and_a_server_going_away_and_back() {
+        let mut st = state(&[1, 1]);
+        st.weight_change(1, 3 * 16);
+        let got: Vec<usize> = (0..8).filter_map(|_| st.pick(|_| true)).collect();
+        assert_eq!(got.iter().filter(|&&i| i == 1).count(), 6, "{got:?}");
+        st.status_down(1);
+        let alone: Vec<usize> = (0..3).filter_map(|_| st.pick(|_| true)).collect();
+        assert_eq!(alone, [0, 0, 0]);
+        st.status_up(1, 16);
+        let back: Vec<usize> = (0..6).filter_map(|_| st.pick(|_| true)).collect();
+        assert_eq!(back.iter().filter(|&&i| i == 1).count(), 3, "{back:?}");
+    }
+
     #[test]
     fn nothing_usable_gives_none_and_loses_no_server() {
         let mut st = state(&[2, 1]);

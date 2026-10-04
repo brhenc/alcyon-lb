@@ -6113,6 +6113,20 @@ mod oracle_tests {
 }
 
 #[cfg(test)]
+mod iso_week_tests {
+    use super::format_time_ns;
+
+    /// ISO weeks at the turn of a year (`%G-%V`): 2021-01-01 is in 2020's week 53, 2024-12-30
+    /// in 2025's week 1, 2026-01-01 in 2026's week 1.
+    #[test]
+    fn the_iso_year_and_week_cross_the_new_year() {
+        for (epoch, want) in [(1_609_459_200, "2020-53"), (1_735_516_800, "2025-01"), (1_767_225_600, "2026-01")] {
+            assert_eq!(format_time_ns(epoch, 0, "%G-%V", false), want, "{epoch}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod date_tests {
     use super::{civil_from_days, days_from_civil, format_http_date, parse_http_date, split_epoch};
 

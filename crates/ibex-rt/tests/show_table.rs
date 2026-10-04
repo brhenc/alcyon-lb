@@ -237,6 +237,19 @@ fn each_request_of_a_connection_tracks_its_own_key() {
     );
 }
 
+/// A filter on a type the table does not store matches nothing; a `binary` key is printed as
+/// its bytes in lowercase hex (measured: padded with zeros to `len`, which Ibex does not do).
+#[test]
+fn a_filter_on_an_unstored_type_and_a_binary_key() {
+    let (ibex, fe) = start("type binary len 20 size 100 expire 60s store http_req_cnt", "", Duration::ZERO);
+    finish(send(fe));
+    thread::sleep(Duration::from_millis(200));
+    let out = cli(&ibex, "show table f data.gpc0 eq 0");
+    assert!(!out.contains("key="), "{out}");
+    let out = cli(&ibex, "show table f");
+    assert!(out.contains("key=616263"), "{out}");
+}
+
 /// A server that promises 100 bytes, sends 7 and closes.
 fn aborting_server() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
