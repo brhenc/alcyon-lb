@@ -773,6 +773,11 @@ impl CliApplet {
                                 Some(p) => {
                                     let _ = write!(out, " {name}({p})={val}");
                                 }
+                                None if name == "server_key" => {
+                                    // The name of the server `server_id` stands for.
+                                    let sname = v.server_id.and_then(|id| (0..proxy.servers.len()).find(|&i| proxy.server_puid(i) == id)).and_then(|i| proxy.server_ids.get(i));
+                                    let _ = write!(out, " server_key={}", sname.map_or("", String::as_str));
+                                }
                                 None => {
                                     let _ = write!(out, " {name}={val}");
                                 }

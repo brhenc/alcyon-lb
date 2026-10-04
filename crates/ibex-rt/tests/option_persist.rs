@@ -154,3 +154,16 @@ fn cookie_with_persist_goes_to_the_server_in_maint_and_issues_nothing() {
     cli(&ibex, "set server b/s1 state maint");
     assert_eq!(get(fe, "Cookie: SRV=c1\r\n"), ("s1".to_string(), None));
 }
+
+/// Measured: a table a `stick` rule fills shows the server it stored, whether or not `store`
+/// names `server_id`: `... shard=0 server_id=1 server_key=s1`, the ids numbering the servers
+/// from 1.
+#[test]
+fn a_stick_table_shows_the_server_it_stored() {
+    let (ibex, fe) = start(STICK);
+    assert_eq!(get(fe, "X-K: a\r\n").0, "s1");
+    assert_eq!(get(fe, "X-K: b\r\n").0, "s2");
+    let out = cli(&ibex, "show table b");
+    assert!(out.contains("key=a ") && out.contains(" shard=0 server_id=1 server_key=s1"), "{out}");
+    assert!(out.contains("key=b ") && out.contains(" shard=0 server_id=2 server_key=s2"), "{out}");
+}

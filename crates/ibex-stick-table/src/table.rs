@@ -541,8 +541,9 @@ impl StickTable {
         let rate = |r: &Option<SlidingRate>| r.as_ref().map_or(0, SlidingRate::rate);
         // Each is a counter (stored when its flag is set) or a rate (when it has a period).
         let scalar = x.gpc_n == 0;
-        let types: [(&str, bool, Option<u64>, u64); 21] = [
-            ("server_id", f.server_id, None, u64::from(d.server_id.unwrap_or(0))),
+        let types: [(&str, bool, Option<u64>, u64); 22] = [
+            // A table a `stick` rule fills keeps the server whether or not `store` says so.
+            ("server_id", f.server_id || d.server_id.is_some(), None, u64::from(d.server_id.unwrap_or(0))),
             ("gpt0", f.gpt0 && x.gpt_n == 0, None, u64::from(d.gpt0)),
             ("gpc0", f.gpc0 && scalar, None, d.gpc0),
             ("gpc0_rate", false, x.gpc0_rate_ms, rate(&d.gpc0_rate)),
@@ -561,6 +562,8 @@ impl StickTable {
             ("bytes_out_rate", false, x.bytes_out_rate_ms, rate(&d.bytes_out_rate)),
             ("gpc1", f.gpc1 && scalar, None, d.gpc1),
             ("gpc1_rate", false, x.gpc1_rate_ms, rate(&d.gpc1_rate)),
+            // The value is the server's name, which only the proxy knows: `show table` fills it in.
+            ("server_key", d.server_id.is_some(), None, 0),
             ("http_fail_cnt", f.http_fail_cnt, None, d.http_fail_cnt),
             ("http_fail_rate", false, x.http_fail_rate_ms, rate(&d.http_fail_rate)),
         ];
