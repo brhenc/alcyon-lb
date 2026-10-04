@@ -468,3 +468,91 @@ fn unimplemented_check_rules_are_refused_at_load() {
         assert!(!out.status.success(), "`{rule}` was accepted");
     }
 }
+
+/// A server that answers each request with `parts`, each followed by a pause (ms).
+fn slow_server(parts: Vec<(&'static str, u64)>) -> SocketAddr {
+    fake(move |mut s| {
+        let _ = read_request(&mut s);
+        for (data, ms) in &parts {
+            let _ = s.write_all(data.as_bytes());
+            let _ = s.flush();
+            thread::sleep(Duration::from_millis(*ms));
+        }
+    })
+}
+
+/// Replies that arrive in pieces (the rules wait for the rest), are chunked, or end with
+/// the connection; and rules on header names and values and on variables.
+#[test]
+fn http_check_waits_for_the_response_it_needs() {
+    let head6 = "HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\n";
+    let in_three = || vec![(head6, 150), ("foo", 150), ("bar", 0)];
+    let chunked = vec![("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nfoo\r\n", 150), ("3\r\nbar\r\n0\r\n\r\n", 0)];
+    let until_close = vec![("HTTP/1.0 200 OK\r\n\r\nfoo", 100), ("bar", 0)];
+    let ok = "succeeded, reason: Layer7 check passed";
+    let rows: Vec<(&str, Vec<(&'static str, u64)>, &str)> = vec![
+        ("  http-check expect string bar", in_three(), ok),
+        ("  http-check expect string foobar", in_three(), ok),
+        ("  http-check expect min-recv 6 string foo", in_three(), ok),
+        ("  http-check expect rstring ^foo", in_three(), ok),
+        ("  http-check expect string zzz", in_three(), "HTTP content check did not match"),
+        ("  http-check expect string foobar", chunked, ok),
+        ("  http-check expect string foobar", until_close, ok),
+        ("  http-check expect string a", vec![("HTTP/1.1 204 No Content\r\n\r\n", 0)], "could not find a response body"),
+        ("  http-check expect string-lf \"%[var(check.none)]\"", in_three(), "log-format string evaluated to an empty string"),
+        (
+            "  http-check set-var(check.v) str(two)\n  http-check unset-var(check.v)\n  http-check expect hdr name x-a value-lf \"%[var(check.v)]\"",
+            vec![("HTTP/1.1 200 OK\r\nX-A: two\r\nContent-Length: 0\r\n\r\n", 0)],
+            "log-format string evaluated to an empty string",
+        ),
+        (
+            "  http-check expect status 200\n  http-check set-var(check.v) str(two)\n  http-check unset-var(check.v)\n  http-check expect hdr name x-a value-lf \"%[var(check.v)]\"",
+            vec![("HTTP/1.1 200 OK\r\nX-A: two\r\nContent-Length: 0\r\n\r\n", 0)],
+            "log-format string evaluated to an empty string",
+        ),
+        ("  http-check expect hdr name -m end -a value -m beg on", vec![("HTTP/1.1 200 OK\r\nX-A: one, two\r\nContent-Length: 0\r\n\r\n", 0)], ok),
+        ("  http-check expect hdr name -m sub -b value -m sub al", vec![("HTTP/1.1 200 OK\r\nX-B: Val\r\nContent-Length: 0\r\n\r\n", 0)], ok),
+        ("  http-check expect hdr name x-b value -m reg \"^V.l\\$\"", vec![("HTTP/1.1 200 OK\r\nX-B: Val\r\nContent-Length: 0\r\n\r\n", 0)], ok),
+        ("  http-check expect hdr name -m reg \"^y\" ", vec![("HTTP/1.1 200 OK\r\nX-B: Val\r\nContent-Length: 0\r\n\r\n", 0)], "reason: Layer7 wrong status"),
+        ("  http-check expect hdr name x-b value -m reg \"^v\"", vec![("HTTP/1.1 200 OK\r\nX-B: Val\r\nContent-Length: 0\r\n\r\n", 0)], "reason: Layer7 wrong status"),
+        ("  http-check expect hdr name -m end -q", vec![("HTTP/1.1 200 OK\r\nX-B: Val\r\nContent-Length: 0\r\n\r\n", 0)], "reason: Layer7 wrong status"),
+        ("  http-check expect hdr name -m sub -q", vec![("HTTP/1.1 200 OK\r\nX-B: Val\r\nContent-Length: 0\r\n\r\n", 0)], "reason: Layer7 wrong status"),
+        ("  http-check expect hdr name x-b value -m beg zz", vec![("HTTP/1.1 200 OK\r\nX-B: Val\r\nContent-Length: 0\r\n\r\n", 0)], "reason: Layer7 wrong status"),
+        ("  http-check expect hdr name x-b value -m sub zz", vec![("HTTP/1.1 200 OK\r\nX-B: Val\r\nContent-Length: 0\r\n\r\n", 0)], "reason: Layer7 wrong status"),
+        ("  http-check expect hdr name x-b value -m end zz", vec![("HTTP/1.1 200 OK\r\nX-B: Val\r\nContent-Length: 0\r\n\r\n", 0)], "reason: Layer7 wrong status"),
+    ];
+    for (rules, parts, expected) in rows {
+        let srv = slow_server(parts);
+        let line = check_line("", "http", &http_body(srv, &format!("  option httpchk\n{rules}")));
+        assert!(line.contains(expected), "rules:\n{rules}\nexpected `{expected}` in:\n{line}");
+    }
+}
+
+/// A server that resets the connection once the request is in.
+#[test]
+fn http_check_connection_reset_is_a_socket_error() {
+    let srv = fake(|mut s| {
+        let _ = read_request(&mut s);
+        let _ = rustix::net::sockopt::set_socket_linger(&s, Some(Duration::ZERO));
+    });
+    let line = check_line("", "http", &http_body(srv, "  option httpchk"));
+    has(&line, &["failed, reason: Socket error"]);
+}
+
+/// A connection that fails at once (the broadcast address is unreachable) names its step.
+#[test]
+fn tcp_check_unreachable_server_fails_at_the_connect() {
+    let srv: SocketAddr = "255.255.255.255:9".parse().unwrap();
+    let line = check_line("", "tcp", &tcp_body(srv, "  tcp-check connect\n  tcp-check expect string x", "300ms"));
+    has(&line, &["Layer4 connection problem", "Network is unreachable", "at step 1 of tcp-check (connect)"]);
+    let line = check_line("", "tcp", &tcp_body(srv, "  tcp-check expect string x", "300ms"));
+    has(&line, &["Layer4 connection problem", "Network is unreachable", "at initial connection step of tcp-check"]);
+}
+
+/// The step named by a timeout on a binary `expect`.
+#[test]
+fn tcp_check_binary_expect_timeout_names_the_pattern() {
+    let srv = fake(says(b"", true));
+    let line = check_line("", "tcp", &tcp_body(srv, "  tcp-check connect\n  tcp-check expect binary 616263", "300ms"));
+    has(&line, &["Layer7 timeout", "at step 2 of tcp-check (expect binary '616263')"]);
+}
