@@ -192,5 +192,58 @@ class VtcQuotingTest(unittest.TestCase):
         self.assertEqual(acts[1].args, ["-hdr", "X-A: b c", "-hdr", "X-B: d"])
 
 
+class ClientSendCoalescing(unittest.TestCase):
+    """Consecutive send/sendhex lines go out in one write, as in vtest."""
+
+    def _received(self, actions):
+        async def go():
+            chunks = []
+            done = asyncio.Event()
+
+            async def handle(reader, writer):
+                # The first read returns as soon as any byte arrives, so a split
+                # write shows up as a short first chunk.
+                chunks.append(await reader.read(4096))
+                await asyncio.sleep(0.3)
+                rest = await reader.read(4096)
+                if rest:
+                    chunks.append(rest)
+                writer.close()
+                done.set()
+
+            srv = await asyncio.start_server(handle, "127.0.0.1", 0)
+            port = srv.sockets[0].getsockname()[1]
+            blk = vtc_runner.ClientBlock("c1", [], actions, [], connect_target=f"127.0.0.1 {port}")
+            macros = vtc_runner.MacroEngine({}) if hasattr(vtc_runner, "MacroEngine") else None
+            runner = vtc_runner.MockClientRunner(blk, macros, {})
+            # Each StreamWriter.write is one send(2) on the socket, i.e. a possible
+            # segment boundary; count them (in-process timing cannot show a split).
+            real_write = asyncio.StreamWriter.write
+            self.writes = []
+
+            def counting_write(w, data):
+                self.writes.append(bytes(data))
+                return real_write(w, data)
+
+            asyncio.StreamWriter.write = counting_write
+            try:
+                runner.start()
+                await asyncio.wait_for(done.wait(), 5)
+            finally:
+                asyncio.StreamWriter.write = real_write
+            await asyncio.wait_for(runner.done_event.wait(), 5)
+            srv.close()
+            self.assertIsNone(runner.error)
+            return chunks
+
+        return asyncio.run(go())
+
+    def test_two_sendhex_arrive_in_one_recv(self):
+        A = vtc_runner.ActionItem
+        got = self._received([A("sendhex", ['"0D 0A"']), A("sendhex", ['"0A 51"']), A("send", ['"hi"'])])
+        self.assertEqual(self.writes, [b"\r\n\nQhi"])
+        self.assertEqual(got, [b"\r\n\nQhi"])
+
+
 if __name__ == "__main__":
     unittest.main()

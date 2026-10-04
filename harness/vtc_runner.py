@@ -1518,9 +1518,20 @@ class MockClientRunner:
                 cur_resp: Optional[HttpResponse] = None
                 last_req_method = "GET"
 
+                # vtest sends consecutive send/sendhex lines back to back; a gap
+                # between writes splits e.g. a PROXY header, which HAProxy refuses.
+                # So they are buffered and flushed in one write before any other
+                # command (and at the end of the script).
+                pending = bytearray()
+
                 for action in self.client_def.actions:
                     cmd = action.cmd
                     args = [self.macro_engine.expand(a) for a in action.args]
+
+                    if pending and cmd not in ("send", "sendhex"):
+                        writer.write(bytes(pending))
+                        pending.clear()
+                        await writer.drain()
 
                     if cmd == "txreq":
                         method = "GET"
@@ -1615,8 +1626,7 @@ class MockClientRunner:
                         data_str = " ".join(args)
                         if data_str.startswith('"') and data_str.endswith('"'):
                             data_str = data_str[1:-1]
-                        writer.write(decode_escapes(data_str).encode("latin1"))
-                        await writer.drain()
+                        pending += decode_escapes(data_str).encode("latin1")
 
                     elif cmd == "sendhex":
                         # `sendhex "300C020101 61 070A01 00 04000400"` is quoted in the
@@ -1626,8 +1636,7 @@ class MockClientRunner:
                         hex_str = " ".join(args).strip()
                         if len(hex_str) >= 2 and hex_str[0] == hex_str[-1] and hex_str[0] in "\"'":
                             hex_str = hex_str[1:-1]
-                        writer.write(bytes.fromhex(hex_str.replace(" ", "")))
-                        await writer.drain()
+                        pending += bytes.fromhex(hex_str.replace(" ", ""))
 
                     elif cmd == "recv":
                         # vtest reads exactly <n> bytes, failing on an early EOF.
@@ -1663,6 +1672,11 @@ class MockClientRunner:
                             await writer.wait_closed()
                         except Exception:
                             pass
+
+                if pending:
+                    writer.write(bytes(pending))
+                    pending.clear()
+                    await writer.drain()
 
                 try:
                     writer.close()
