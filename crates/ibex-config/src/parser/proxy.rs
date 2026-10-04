@@ -410,7 +410,7 @@ pub(crate) fn parse_listen_directive(
             parse_tcp_check_directive(&mut proxy.tcp_checks, tokens, kw)?;
             Ok(())
         }
-        "errorfile" | "errorfiles" | "http-error" => {
+        "errorfile" | "errorfiles" | "http-error" | "errorloc" | "errorloc302" | "errorloc303" => {
             parse_proxy_error_page(&mut proxy.error_files, &mut proxy.error_replies, tokens, kw)
         }
         "log-format" => {
@@ -530,7 +530,7 @@ pub(crate) fn parse_frontend_directive(
                 "'http-check' is not supported in frontend",
             ))
         }
-        "errorfile" | "errorfiles" | "http-error" => {
+        "errorfile" | "errorfiles" | "http-error" | "errorloc" | "errorloc302" | "errorloc303" => {
             parse_proxy_error_page(&mut fe.error_files, &mut fe.error_replies, tokens, kw)
         }
         "log-format" => {
@@ -657,7 +657,7 @@ pub(crate) fn parse_backend_directive(
             parse_tcp_check_directive(&mut be.tcp_checks, tokens, kw)?;
             Ok(())
         }
-        "errorfile" | "errorfiles" | "http-error" => {
+        "errorfile" | "errorfiles" | "http-error" | "errorloc" | "errorloc302" | "errorloc303" => {
             parse_proxy_error_page(&mut be.error_files, &mut be.error_replies, tokens, kw)
         }
         // Ignored in backends, as `HAProxy` ignores it ("'log-format' directive is ignored

@@ -120,3 +120,43 @@ fn replace_uri_rewrites_the_whole_target_scheme_and_authority_included() {
     );
     assert_eq!(seen_target(fe, "/bar?t=nomatch", "a"), "GET /bar?t=nomatch HTTP/1.1");
 }
+
+const ERRORLOC: &str = "defaults\n  mode http\n  retries 0\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n\
+frontend fe1\n  bind {fe}\n  errorloc 503 http://www.example.com/oops503\n\
+  http-request deny deny_status 403 if { path /denied }\n  default_backend dead\n\
+backend dead\n  server s1 {dead}\n";
+
+fn start_dead(cfg: &str) -> (Ibex, SocketAddr) {
+    let dead = common::reserve_addr();
+    start(&cfg.replace("{dead}", &dead.to_string()))
+}
+
+fn get_close(fe: SocketAddr, path: &str) -> String {
+    send(fe, &format!("GET {path} HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n"))
+}
+
+#[test]
+fn errorloc_answers_with_the_redirect_haproxy_builds() {
+    let (_i, fe) = start_dead(ERRORLOC);
+    assert_eq!(
+        // Header names are case-insensitive: Ibex writes `Connection: close` capitalised.
+        get_close(fe, "/gone").replace("Connection: close", "connection: close"),
+        "HTTP/1.1 302 Found\r\ncache-control: no-cache\r\ncontent-length: 0\r\nlocation: http://www.example.com/oops503\r\nconnection: close\r\n\r\n"
+    );
+    // No errorloc for 403: the default page.
+    let got = get_close(fe, "/denied");
+    assert!(got.starts_with("HTTP/1.1 403 Forbidden\r\n") && !got.contains("location"), "{got:?}");
+}
+
+#[test]
+fn errorloc303_and_a_relative_location() {
+    let cfg = ERRORLOC.replace(
+        "errorloc 503 http://www.example.com/oops503",
+        "errorloc303 503 /l503\n  errorloc302 403 /l403",
+    );
+    let (_i, fe) = start_dead(&cfg);
+    let got = get_close(fe, "/gone");
+    assert!(got.starts_with("HTTP/1.1 303 See Other\r\n") && got.contains("location: /l503\r\n"), "{got:?}");
+    let got = get_close(fe, "/denied");
+    assert!(got.starts_with("HTTP/1.1 302 Found\r\n") && got.contains("location: /l403\r\n"), "{got:?}");
+}

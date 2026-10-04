@@ -44,7 +44,7 @@ pub(crate) fn parse_defaults_directive(
         }
         "default-server" => parse_default_server(&mut defaults.default_server, tokens, kw),
         "stats" => parse_stats_directive(&mut defaults.stats, tokens, kw),
-        "errorfile" | "errorfiles" | "http-error" => {
+        "errorfile" | "errorfiles" | "http-error" | "errorloc" | "errorloc302" | "errorloc303" => {
             parse_proxy_error_page(&mut defaults.error_files, &mut defaults.error_replies, tokens, kw)
         }
         "tcp-request" => {

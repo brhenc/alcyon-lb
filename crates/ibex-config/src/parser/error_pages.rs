@@ -80,6 +80,38 @@ pub(crate) fn parse_errorfile_directive(
     Ok(())
 }
 
+/// Parses `errorloc[302|303] <code> <url>`: like `HAProxy`, it builds the redirect as a
+/// canned errorfile (302 `Found` for `errorloc`/`errorloc302`, 303 `See Other` for
+/// `errorloc303`), so it reaches the data path the way an `errorfile` does.
+pub(crate) fn parse_errorloc_directive(
+    files: &mut HashMap<u16, Vec<u8>>,
+    tokens: &[Token],
+    kw: &Token,
+) -> Result<(), ConfigError> {
+    let name = &kw.text;
+    if tokens.len() < 3 {
+        return Err(ConfigError::new(kw.line, kw.col, format!("{name} : expects <status_code> and <url> as arguments.")));
+    }
+    if tokens.len() > 3 {
+        return Err(ConfigError::new(kw.line, kw.col, format!("{name} : expects exactly two arguments.")));
+    }
+    let code = tokens[1].text.parse::<u16>().unwrap_or(0);
+    if !DEFAULT_PAGE_CODES.contains(&code) {
+        return Err(ConfigError::new(
+            tokens[1].line,
+            tokens[1].col,
+            format!("{name} : status code '{code}' not handled."),
+        ));
+    }
+    let (status, reason) = if name == "errorloc303" { (303, "See Other") } else { (302, "Found") };
+    let page = format!(
+        "HTTP/1.1 {status} {reason}\r\ncache-control: no-cache\r\ncontent-length: 0\r\nlocation: {}\r\n\r\n",
+        tokens[2].text
+    );
+    files.insert(code, page.into_bytes());
+    Ok(())
+}
+
 /// Parses `errorfiles <name> [<code> ...]`: imports some or all of the error pages
 /// declared in the `http-errors <name>` section named `name` into `files`, overriding any
 /// entry already present for the same code, exactly as `errorfile` would.
@@ -155,6 +187,7 @@ pub(crate) fn parse_proxy_error_page(
     match kw.text.as_str() {
         "errorfile" => parse_errorfile_directive(&mut set, tokens, kw)?,
         "errorfiles" => parse_errorfiles_directive(&mut set, tokens, kw)?,
+        "errorloc" | "errorloc302" | "errorloc303" => parse_errorloc_directive(&mut set, tokens, kw)?,
         _ => return parse_http_error_directive(files, replies, tokens, kw),
     }
     for (code, bytes) in set {
