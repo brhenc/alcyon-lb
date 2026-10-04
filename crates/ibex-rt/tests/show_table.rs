@@ -205,3 +205,31 @@ fn the_data_filter_reads_any_stored_type() {
         assert_eq!(out.contains("key=abc"), shown, "{filter}: {out}");
     }
 }
+
+/// Measured: `http-request track-sc0` tracks for one request, not for the connection: two
+/// requests with different keys on one connection leave two entries, one request each.
+#[test]
+fn each_request_of_a_connection_tracks_its_own_key() {
+    let (ibex, fe) = start("type string len 20 size 100 expire 60s store gpc0,conn_cnt,http_req_cnt", "  http-request sc-inc-gpc0(0)\n", Duration::ZERO);
+    let mut c = TcpStream::connect(fe).expect("connect");
+    c.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
+    for k in ["aaa", "bbb"] {
+        c.write_all(format!("GET / HTTP/1.1\r\nHost: x\r\nX-K: {k}\r\n\r\n").as_bytes()).expect("send");
+        let mut buf = [0u8; 512];
+        let _ = c.read(&mut buf);
+    }
+    // Measured: `use=0` for both with the connection still open, since a request is a
+    // stream there. Ibex keeps the slot until the connection closes (T149b leftovers).
+    drop(c);
+    thread::sleep(Duration::from_millis(200));
+    let out = cli(&ibex, "show table f");
+    let (lines, _) = normalise(&out);
+    let mut entries: Vec<&String> = lines.iter().skip(1).collect();
+    entries.sort();
+    assert_eq!(lines[0], "# table: f, type: string, size:100, used:2", "{out}");
+    assert_eq!(
+        entries,
+        ["key=aaa use=0 exp=N shard=0 gpc0=1 conn_cnt=1 http_req_cnt=1", "key=bbb use=0 exp=N shard=0 gpc0=1 conn_cnt=1 http_req_cnt=1"],
+        "{out}"
+    );
+}

@@ -846,17 +846,23 @@ backend be_test
     }
     let mut ctrl_dump = String::new();
     cli_ctrl.read_to_string(&mut ctrl_dump).expect("read dump");
+    // HAProxy prints every type the table stores, zero included; what the control
+    // frontend must not show is a value the other frontends' rules set.
     assert!(
-        !ctrl_dump.contains("gpc0="),
-        "control dump must not contain gpc0=: {ctrl_dump}"
+        ctrl_dump.contains("gpc0=0"),
+        "control dump must show gpc0=0, untouched: {ctrl_dump}"
     );
+    // HAProxy prints every type the table stores, zero included; what the control
+    // frontend must not show is a value the other frontends' rules set.
     assert!(
-        !ctrl_dump.contains("gpc1="),
-        "control dump must not contain gpc1=: {ctrl_dump}"
+        ctrl_dump.contains("gpc1=0"),
+        "control dump must show gpc1=0, untouched: {ctrl_dump}"
     );
+    // HAProxy prints every type the table stores, zero included; what the control
+    // frontend must not show is a value the other frontends' rules set.
     assert!(
-        !ctrl_dump.contains("gpt0="),
-        "control dump must not contain gpt0=: {ctrl_dump}"
+        ctrl_dump.contains("gpt0=0"),
+        "control dump must show gpt0=0, untouched: {ctrl_dump}"
     );
 
     let _ = std::fs::remove_file(&cli_path);
