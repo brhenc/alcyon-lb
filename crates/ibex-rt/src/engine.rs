@@ -7506,9 +7506,8 @@ fn wait_for_request_body(
         return BodyWait::Ready;
     }
     // The request is in `Head` until its rules are done, which is where this runs.
-    let framing = sess.txn.as_ref().map_or(crate::txn::Framing::None, |t| match t.req {
-        MsgState::Head { body, .. } => body,
-        _ => crate::txn::Framing::None,
+    let framing = sess.txn.as_ref().map_or(crate::txn::Framing::None, |t| {
+        if let MsgState::Head { body, .. } = t.req { body } else { crate::txn::Framing::None }
     });
     let held = sess.txn.as_ref().and_then(|t| t.body_wait).filter(|w| w.backend == backend && w.rule == rule);
     let now = fresh_tick(now);
@@ -7556,14 +7555,12 @@ fn wait_for_request_body(
         BodyWait::TimedOut | BodyWait::ClientGone | BodyWait::Malformed => sess.log.request = None,
         _ => {}
     }
-    if let Some(txn) = sess.txn.as_mut() {
-        if matches!(outcome, BodyWait::Pending) {
-            txn.body_wait = Some(crate::txn::BodyWait { backend, rule, deadline });
-        } else {
-            txn.body_wait = None;
-            if matches!(outcome, BodyWait::Ready) {
-                txn.req_body = Some(body);
-            }
+    let pending = matches!(outcome, BodyWait::Pending);
+    let ready = matches!(outcome, BodyWait::Ready);
+    for txn in sess.txn.as_mut() {
+        txn.body_wait = pending.then_some(crate::txn::BodyWait { backend, rule, deadline });
+        if ready {
+            txn.req_body = Some(body);
         }
     }
     outcome
