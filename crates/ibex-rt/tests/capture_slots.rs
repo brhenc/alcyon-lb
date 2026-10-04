@@ -296,3 +296,128 @@ fn a_response_capture_is_cut_by_bytes_not_characters() {
         assert!(lines.iter().any(|l| l.ends_with(&format!("LOG {logged}"))), "slot of {len} bytes: the log lines are {lines:?}");
     }
 }
+
+/// `http-request capture` is as strict as `HAProxy`'s `parse_http_req_capture`, and each
+/// message names the proxy it was found in. Measured on `HAProxy 3.5-dev8-885761-29`
+/// (2026-10-04), same configurations through `haproxy -c`.
+#[test]
+fn the_http_request_capture_forms_haproxy_refuses_are_refused_and_name_the_proxy() {
+    let fe = |rule: &str| format!("frontend fe\n  mode http\n  bind 127.0.0.1:1\n  declare capture request len 20\n  http-request capture req.hdr(host){rule}\n");
+    let cond = "expects either 'if' or 'unless' followed by a condition but found";
+    let refused = [
+        (fe(" len 5 id 0 if TRUE"), format!("{cond} 'id'.")),
+        (fe(" id 0 len 5"), format!("{cond} 'len'.")),
+        (fe(" len 5 bogus"), format!("{cond} 'bogus'.")),
+        (fe(" id 0 bogus"), format!("{cond} 'bogus'.")),
+        (fe(""), "error detected in frontend 'fe' while parsing 'http-request capture' rule : expects <expression> [ 'len' <length> | id <idx> ].".to_string()),
+        (fe(" len 0"), "error detected in frontend 'fe' while parsing 'http-request capture' rule : length must be > 0.".to_string()),
+        (fe(" id abc"), "error detected in frontend 'fe' while parsing 'http-request capture' rule : cannot parse id 'abc'.".to_string()),
+        (
+            "frontend fe\n  mode http\n  bind 127.0.0.1:1\n  http-request capture\n".to_string(),
+            "error detected in frontend 'fe' while parsing 'http-request capture' rule : expects <expression> [ 'len' <length> | id <idx> ].".to_string(),
+        ),
+        (
+            "defaults dd\n  mode http\n  http-after-response capture str(a)\n".to_string(),
+            "error detected in defaults 'dd' while parsing 'http-after-response capture' rule : expects <expression> id <idx>.".to_string(),
+        ),
+        (fe(" len abc"), "error detected in frontend 'fe' while parsing 'http-request capture' rule : length must be > 0.".to_string()),
+        (
+            "backend be\n  mode http\n  http-request capture req.hdr(host)\n".to_string(),
+            "error detected in backend 'be' while parsing 'http-request capture' rule : expects <expression> [ 'len' <length> | id <idx> ].".to_string(),
+        ),
+        (
+            "listen li\n  mode http\n  http-response capture str(a)\n".to_string(),
+            "error detected in proxy 'li' while parsing 'http-response capture' rule : expects <expression> id <idx>.".to_string(),
+        ),
+        (
+            "defaults dd\n  mode http\n  http-response capture str(a)\n".to_string(),
+            "error detected in defaults 'dd' while parsing 'http-response capture' rule : expects <expression> id <idx>.".to_string(),
+        ),
+    ];
+    for (cfg, want) in &refused {
+        let (ok, out) = check(cfg);
+        assert!(!ok && out.contains(want.as_str()), "`ibex -c` on\n{cfg}\nwanted a refusal with {want:?}; accepted={ok}, said {out:?}");
+    }
+    for rule in [" id 0", " len 5", " len 5 if TRUE", " id 0 unless TRUE"] {
+        let cfg = fe(rule);
+        let (ok, out) = check(&cfg);
+        assert!(ok, "`ibex -c` refused\n{cfg}\nwhich haproxy accepts: {out:?}");
+    }
+}
+
+/// `http-after-response capture <sample> id <n>` writes the same frontend response slots as
+/// `http-response capture`, after every `http-response` rule and after the cookie line, and
+/// it runs on the replies the proxy makes itself too. Measured on `HAProxy
+/// 3.5-dev8-885761-29` (2026-10-04) with two slots of 4 and 5 bytes, a 9-byte `X-S` from the
+/// server, after-response rules capturing `res.hdr(x-s)` into slot 0 and `str(abcdefgh)`
+/// into slot 1 when the status is 200, an `http-response` header reading slot 0 and an
+/// after-response header reading both: `/` gave `x-early: []` (the after rule had not run
+/// yet) and `x-late: [1234][abcde]`; `/gen`, a `return status 201 hdr x-s generated`, gave
+/// `x-late: [gene][]`; `/deny` gave `x-late: [][]`.
+#[test]
+fn an_http_after_response_capture_fills_the_slot_it_names() {
+    let cfg = format!(
+        "{DEFAULTS}frontend fe\n  bind {{fe}}\n  declare capture response len 4\n  declare capture response len 5\n  \
+         http-after-response capture res.hdr(x-s) id 0\n  http-after-response capture str(abcdefgh) id 1 if {{ status 200 }}\n  \
+         http-response set-header x-early \"[%[capture.res.hdr(0)]]\"\n  \
+         http-after-response set-header x-late \"[%[capture.res.hdr(0)]][%[capture.res.hdr(1)]]\"\n  \
+         http-request return status 201 hdr x-s generated if {{ path /gen }}\n  http-request deny if {{ path /deny }}\n  \
+         default_backend be\nbackend be\n  server s1 {{srv}}\n"
+    );
+    let (_ibex, fe) = start(&cfg, server(b"X-S: 123456789\r\n"), None);
+    for (path, early, late) in [("/", Some("[]"), "[1234][abcde]"), ("/gen", None, "[gene][]"), ("/deny", None, "[][]")] {
+        let r = exchange(fe, format!("GET {path} HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n").as_bytes());
+        let shown = String::from_utf8_lossy(&r);
+        assert_eq!(header(&r, "x-early").as_deref(), early, "{path}: {shown}");
+        assert_eq!(header(&r, "x-late").as_deref(), Some(late), "{path}: {shown}");
+    }
+}
+
+/// The configurations `HAProxy` refuses for `http-after-response capture`, with the message
+/// it gave (`haproxy -c`, 2026-10-04).
+#[test]
+fn the_http_after_response_capture_forms_haproxy_refuses_are_refused() {
+    let fe = |rule: &str| format!("frontend fe\n  mode http\n  bind 127.0.0.1:1\n  declare capture response len 4\n  http-after-response capture str(a){rule}\n");
+    let head = "error detected in frontend 'fe' while parsing 'http-after-response capture' rule : ";
+    let refused = [
+        (fe(""), format!("{head}expects <expression> id <idx>.")),
+        (fe(" id"), format!("{head}expects <expression> id <idx>.")),
+        (fe(" len 3"), format!("{head}expects 'id', found 'len'.")),
+        (fe(" id abc"), format!("{head}cannot parse id 'abc'.")),
+        (fe(" id 0 foo"), "'http-after-response capture' expects either 'if' or 'unless' followed by a condition but found 'foo'.".to_string()),
+        (fe(" id 5"), "Proxy 'fe': unable to find capture id '5' referenced by http-response capture rule.".to_string()),
+        (
+            "frontend fe\n  mode http\n  bind 127.0.0.1:1\n  http-after-response capture str(a) id 0\n".to_string(),
+            "Proxy 'fe': unable to find capture id '0' referenced by http-response capture rule.".to_string(),
+        ),
+    ];
+    for (cfg, want) in &refused {
+        let (ok, out) = check(cfg);
+        assert!(!ok && out.contains(want.as_str()), "`ibex -c` on\n{cfg}\nwanted a refusal with {want:?}; accepted={ok}, said {out:?}");
+    }
+    for cfg in [fe(" id 0"), fe(" id 0 unless { status 200 }"), "backend be\n  mode http\n  http-after-response capture str(a) id 5\n".to_string()] {
+        let (ok, out) = check(&cfg);
+        assert!(ok, "`ibex -c` refused\n{cfg}\nwhich haproxy accepts: {out:?}");
+    }
+}
+
+/// A response header that is not UTF-8 is captured as the bytes the server sent: `HAProxy`
+/// with `X-S: b<E9><FF>` from the server and a slot of 8 gave `capture.res.hdr(0)` (hex)
+/// `62E9FF` and `%hs` `{b#E9#FF}` (2026-10-04).
+#[test]
+fn a_response_capture_keeps_the_bytes_of_a_header_that_is_not_utf8() {
+    let collector = UdpSocket::bind("127.0.0.1:0").expect("collector");
+    collector.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
+    let cfg = format!(
+        "{DEFAULTS}frontend fe\n  bind {{fe}}\n  log {} local0\n  log-format \"LOG %hs\"\n  \
+         capture response header x-s len 8\n  \
+         http-response set-header x-r0 \"%[capture.res.hdr(0),hex]\"\n  \
+         default_backend be\nbackend be\n  server s1 {{srv}}\n",
+        collector.local_addr().expect("addr")
+    );
+    let (_ibex, fe) = start(&cfg, server(b"X-S: b\xe9\xff\r\n"), None);
+    let r = exchange(fe, b"GET / HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n");
+    assert_eq!(header(&r, "x-r0").as_deref(), Some("62E9FF"), "{}", String::from_utf8_lossy(&r));
+    let lines = log_lines(&collector);
+    assert!(lines.iter().any(|l| l.ends_with("LOG {b#E9#FF}")), "the log lines are {lines:?}");
+}

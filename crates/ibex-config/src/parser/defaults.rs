@@ -129,10 +129,10 @@ pub(crate) fn parse_defaults_directive(
             tokens[1].col,
             "'set-retries' is not allowed in 'defaults' sections",
         )),
-        "http-request" => parse_http_req_rule(&mut defaults.http_req_rules, tokens, kw),
-        "http-response" => parse_http_res_rule(&mut defaults.http_res_rules, tokens, kw),
+        "http-request" => in_section(parse_http_req_rule(&mut defaults.http_req_rules, tokens, kw), "defaults", defaults.name.as_deref().unwrap_or_default()),
+        "http-response" => in_section(parse_http_res_rule(&mut defaults.http_res_rules, tokens, kw), "defaults", defaults.name.as_deref().unwrap_or_default()),
         "http-after-response" => {
-            parse_http_after_res_rule(&mut defaults.http_after_res_rules, tokens, kw)
+            in_section(parse_http_after_res_rule(&mut defaults.http_after_res_rules, tokens, kw), "defaults", defaults.name.as_deref().unwrap_or_default())
         }
         "log" => parse_log(&mut defaults.logs, tokens, kw).map(|g| defaults.log_global |= g),
         "log-tag" => parse_log_tag(tokens, kw).map(|t| defaults.log_tag = Some(t)),
@@ -210,6 +210,7 @@ pub(crate) fn parse_option_defaults(
         "forwardfor" => defaults.forwardfor = Some(parse_forward_option(tokens, kw)?),
         "originalto" => defaults.originalto = Some(parse_forward_option(tokens, kw)?),
         "redispatch" => set_redispatch(&mut defaults.redisp, &mut defaults.redisp_after, tokens),
+        "http-buffer-request" => defaults.buffer_request = true,
         "accept-unsafe-violations-in-http-request" => defaults.stats.accept_unsafe_request = true,
         "log-health-checks" => defaults.log_health_checks = true,
         "httpchk" => parse_httpchk_option(&mut defaults.httpchk, tokens, kw)?,
@@ -228,6 +229,7 @@ pub(crate) fn parse_no_defaults(defaults: &mut DefaultsSection, tokens: &[Token]
     }
     match check_no_option(OptSection::Defaults, tokens, kw)? {
         Some("redispatch") => (defaults.redisp, defaults.redisp_after) = (false, -1),
+        Some("http-buffer-request") => defaults.buffer_request = false,
         Some("accept-unsafe-violations-in-http-request") => defaults.stats.accept_unsafe_request = false,
         Some("log-health-checks") => defaults.log_health_checks = false,
         _ => {}

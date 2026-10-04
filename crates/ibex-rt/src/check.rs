@@ -15,6 +15,9 @@ use crate::logfmt::{LogData, LogFormat};
 use crate::proxy_state::{total_weight, ProxiesView};
 use crate::poller::Poller;
 use crate::raw::{self, Io};
+use crate::srv_tls::CheckTls;
+use crate::xprt::ServerXprt;
+use std::sync::Arc;
 use ibex_config::ast::{
     get_resolved_check_config, MysqlCheckVersion, ResolvedCheckConfig, ResolvedHttpCheck,
     ResolvedTcpStep,
@@ -170,6 +173,13 @@ pub struct ServerCheckState {
     pub health: u32,
     pub in_progress: bool,
     pub sock: Option<OwnedFd>,
+    /// The transport over `sock`: plaintext, or the TLS of `tls` (T113).
+    pub xprt: ServerXprt,
+    /// The server line's check TLS (`check-ssl`, or `ssl` inherited), `None` for plaintext.
+    pub tls: Option<Arc<CheckTls>>,
+    /// The `tcp-check connect` step (after the first) whose connection is being opened:
+    /// while it is set, the socket in `sock` is that step's, not the previous step's.
+    pub tcp_connect_step: Option<usize>,
     pub check_fd: Option<RawFd>,
     pub exp: Tick,
     pub next_check: Tick,
@@ -235,6 +245,9 @@ impl ServerCheckState {
             health: config_rise,
             in_progress: false,
             sock: None,
+            xprt: ServerXprt::Plain,
+            tls: None,
+            tcp_connect_step: None,
             check_fd: None,
             exp: Tick::ETERNITY,
             next_check: now,
@@ -699,7 +712,9 @@ pub fn step_check(
         let timed_out = check.exp.is_expired(now);
 
         if timed_out {
+            let handshaking = check.xprt.is_tls() && !check.xprt.is_ready();
             let (code, desc, info) = match &check.sub_state {
+                _ if handshaking => ("L6TOUT", "Layer6 timeout", None),
                 CheckSubState::TcpConnecting
                 | CheckSubState::HttpConnecting { .. }
                 | CheckSubState::ProtoConnecting { .. }
@@ -748,9 +763,19 @@ pub fn step_check(
                 } else {
                     Ok(Some(io::Error::from(io::ErrorKind::NotConnected)))
                 };
+                if let Ok(None) = connect_res {
+                    match drive_check_handshake(check, fdtab, poller, raw_fd) {
+                        Handshake::Ready => {}
+                        Handshake::Pending => return Ok(CheckStep::pending(Some(check.exp))),
+                        Handshake::Failed(info) => return Ok(fail_check_l6(check, fdtab, poller, now, duration, info)),
+                    }
+                }
+                // A connect check over TLS passes at layer 6 ("Layer6 check passed").
+                let l6 = check.xprt.is_tls();
                 cleanup_check_socket(check, fdtab, poller);
 
                 let event = match connect_res {
+                    Ok(None) if l6 => check.on_success_full("L6OK", "Layer6 check passed", duration, None, None),
                     Ok(None) => check.on_success(duration),
                     Ok(Some(ref err)) => {
                         let info = Some(format_l4_connect_error(err));
@@ -781,6 +806,11 @@ pub fn step_check(
                 };
 
                 if let Ok(None) = connect_res {
+                    match drive_check_handshake(check, fdtab, poller, raw_fd) {
+                        Handshake::Ready => {}
+                        Handshake::Pending => return Ok(CheckStep::pending(Some(check.exp))),
+                        Handshake::Failed(info) => return Ok(fail_check_l6(check, fdtab, poller, now, duration, info)),
+                    }
                     match check.resolved_config.clone() {
                         Some(ResolvedCheckConfig::Redis) => {
                             check.sub_state = CheckSubState::RedisRunning {
@@ -890,6 +920,15 @@ pub fn step_check(
                 };
 
                 if let Ok(None) = connect_res {
+                    match drive_check_handshake(check, fdtab, poller, raw_fd) {
+                        Handshake::Ready => {}
+                        Handshake::Pending => return Ok(CheckStep::pending(Some(check.exp))),
+                        Handshake::Failed(info) => return Ok(fail_check_l6(check, fdtab, poller, now, duration, info)),
+                    }
+                    fdtab.set_interest(raw_fd, Interest::WRITE);
+                    if let Some(sock) = check.sock.as_ref() {
+                        let _ = poller.modify(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), false, true);
+                    }
                     check.sub_state = CheckSubState::HttpSending {
                         req_buf,
                         send_offset,
@@ -962,7 +1001,7 @@ pub fn step_check(
                     SocketAddr::new(check.addr.ip(), chk.check_port.unwrap_or(check.addr.port()));
                 let payload = build_http_request_payload(&chk, target_addr, check, proxies);
 
-                match raw::connect(target_addr) {
+                match connect_check(check, Some(target_addr)) {
                     Ok((sock, immediate)) => {
                         let raw_fd = sock.as_raw_fd();
                         check.check_fd = Some(raw_fd);
@@ -1032,7 +1071,7 @@ pub fn step_check(
                 progress_tcp_steps_start(check, &steps, fdtab, poller, now)
             }
             ResolvedCheckConfig::Redis => {
-                match raw::connect(check.addr) {
+                match connect_check(check, None) {
                     Ok((sock, immediate)) => {
                         let raw_fd = sock.as_raw_fd();
                         check.check_fd = Some(raw_fd);
@@ -1065,7 +1104,7 @@ pub fn step_check(
                 }
             }
             ResolvedCheckConfig::Smtp(cmd) => {
-                match raw::connect(check.addr) {
+                match connect_check(check, None) {
                     Ok((sock, immediate)) => {
                         let raw_fd = sock.as_raw_fd();
                         check.check_fd = Some(raw_fd);
@@ -1099,7 +1138,7 @@ pub fn step_check(
                 }
             }
             ResolvedCheckConfig::Ldap => {
-                match raw::connect(check.addr) {
+                match connect_check(check, None) {
                     Ok((sock, immediate)) => {
                         let raw_fd = sock.as_raw_fd();
                         check.check_fd = Some(raw_fd);
@@ -1132,7 +1171,7 @@ pub fn step_check(
                 }
             }
             ResolvedCheckConfig::Mysql { user, version } => {
-                match raw::connect(check.addr) {
+                match connect_check(check, None) {
                     Ok((sock, immediate)) => {
                         let raw_fd = sock.as_raw_fd();
                         check.check_fd = Some(raw_fd);
@@ -1170,7 +1209,7 @@ pub fn step_check(
                 }
             }
             ResolvedCheckConfig::Pgsql { user } => {
-                match raw::connect(check.addr) {
+                match connect_check(check, None) {
                     Ok((sock, immediate)) => {
                         let raw_fd = sock.as_raw_fd();
                         check.check_fd = Some(raw_fd);
@@ -1205,7 +1244,7 @@ pub fn step_check(
                 }
             }
             ResolvedCheckConfig::SslHello => {
-                match raw::connect(check.addr) {
+                match connect_check(check, None) {
                     Ok((sock, immediate)) => {
                         let raw_fd = sock.as_raw_fd();
                         check.check_fd = Some(raw_fd);
@@ -1239,7 +1278,7 @@ pub fn step_check(
             }
             ResolvedCheckConfig::TcpConnect => {
                 check.sub_state = CheckSubState::TcpConnecting;
-                match raw::connect(check.addr) {
+                match connect_check(check, None) {
                     Ok((sock, immediate)) => {
                         if immediate {
                             let event = check.on_success(0);
@@ -1329,7 +1368,7 @@ fn progress_http_check(
             };
 
             while send_offset < req_buf.len() {
-                match raw::send(sock.as_fd(), &req_buf[send_offset..]) {
+                match check.xprt.send(sock.as_fd(), &req_buf[send_offset..]) {
                     Ok(Io::Done(n)) => {
                         send_offset += n;
                     }
@@ -1376,7 +1415,7 @@ fn progress_http_check(
 
             let mut buf = [0u8; 4096];
             loop {
-                match raw::recv(sock.as_fd(), &mut buf) {
+                match check.xprt.recv(sock.as_fd(), &mut buf) {
                     Ok(Io::Done(n)) => {
                         recv_buf.extend_from_slice(&buf[..n]);
                         if let Some((status_code, headers, body)) = parse_http_response(&recv_buf) {
@@ -1524,7 +1563,7 @@ fn progress_tcp_steps_start(
 
     if let ResolvedTcpStep::Connect { port, .. } = &steps[0] {
             let target_addr = SocketAddr::new(check.addr.ip(), port.unwrap_or(check.addr.port()));
-            if let Ok((sock, immediate)) = raw::connect(target_addr) {
+            if let Ok((sock, immediate)) = connect_check(check, Some(target_addr)) {
                     let raw_fd = sock.as_raw_fd();
                     check.check_fd = Some(raw_fd);
                     fdtab.insert(
@@ -1615,7 +1654,15 @@ fn progress_tcp_check(
             ResolvedTcpStep::Connect { port, .. } => {
                 let target_addr =
                     SocketAddr::new(check.addr.ip(), port.unwrap_or(check.addr.port()));
-                if let Some(sock) = check.sock.as_ref() {
+                // The socket in hand is this step's own connection only for the first
+                // step (opened by `progress_tcp_steps_start`) or when this step's connect
+                // is the one in flight. Otherwise it is the previous step's, and a
+                // `tcp-check connect` mid-script means a new connection (HAProxy drops
+                // the buffers too: "Always release input and output buffer when a new
+                // connect is evaluated"). Treating the old socket as the new connection
+                // made the next `expect` read the old server's end of stream.
+                let this_steps_socket = step_idx == 0 || check.tcp_connect_step == Some(step_idx);
+                if let (true, Some(sock)) = (this_steps_socket, check.sock.as_ref()) {
                     let raw_fd = sock.as_raw_fd();
                     let ready = fdtab.ready(raw_fd);
                     if !ready.writable && !ready.readable {
@@ -1629,6 +1676,7 @@ fn progress_tcp_check(
                     fdtab.clear_ready(raw_fd, true, true);
                     let connect_res = raw::check_connect_error(sock.as_fd());
                     if let Ok(None) = connect_res {
+                        check.tcp_connect_step = None;
                         step_idx += 1;
                         continue;
                     }
@@ -1655,10 +1703,13 @@ fn progress_tcp_check(
                 let timeout_ms =
                     u32::try_from(check.config.timeout.as_millis()).unwrap_or(u32::MAX);
                 check.exp = now.add(timeout_ms);
+                recv_buf.clear();
+                send_offset = 0;
 
-                if let Ok((sock, immediate)) = raw::connect(target_addr) {
+                if let Ok((sock, immediate)) = connect_check(check, Some(target_addr)) {
                         let raw_fd = sock.as_raw_fd();
                         check.check_fd = Some(raw_fd);
+                        check.tcp_connect_step = Some(step_idx);
                         fdtab.insert(
                             raw_fd,
                             FdState::Conn {
@@ -1722,7 +1773,7 @@ fn progress_tcp_check(
 
                 let raw_fd = sock.as_raw_fd();
                 while send_offset < data.len() {
-                    match raw::send(sock.as_fd(), &data[send_offset..]) {
+                    match check.xprt.send(sock.as_fd(), &data[send_offset..]) {
                         Ok(Io::Done(n)) => {
                             send_offset += n;
                         }
@@ -1787,7 +1838,7 @@ fn progress_tcp_check(
                 let mut eof = false;
 
                 loop {
-                    match raw::recv(sock.as_fd(), &mut buf) {
+                    match check.xprt.recv(sock.as_fd(), &mut buf) {
                         Ok(Io::Done(n)) => {
                             recv_buf.extend_from_slice(&buf[..n]);
                         }
@@ -1864,12 +1915,14 @@ fn progress_tcp_check(
     } else {
         "L7OK"
     };
-    let desc = if code == "L4OK" {
-        "Layer4 check passed"
+    // HAProxy's tcp-check success carries `info: "(tcp-check)"` (measured: a two-connect
+    // script logs `Layer7 check passed, code: 0, info: "(tcp-check)"`).
+    let (desc, http_code, info) = if code == "L4OK" {
+        ("Layer4 check passed", None, Some("(tcp-check)".to_string()))
     } else {
-        "Layer7 check passed"
+        ("Layer7 check passed", Some(0), Some("(tcp-check)".to_string()))
     };
-    let event = check.on_success_full(code, desc, duration, None, None);
+    let event = check.on_success_full(code, desc, duration, http_code, info);
     let next = check.schedule_next(now);
     check.next_check = next;
     Ok(CheckStep {
@@ -1879,10 +1932,119 @@ fn progress_tcp_check(
 }
 
 /// Cleans up any open sockets or poller registrations for a check in progress.
+/// `cut_crlf`: the bytes before the first CR or LF.
+fn cut_crlf(b: &[u8]) -> &[u8] {
+    let end = b.iter().position(|&c| c == b'\r' || c == b'\n').unwrap_or(b.len());
+    &b[..end]
+}
+
+/// `chunk_asciiencode` (src/chunk.c): printable ASCII as is, every other byte as `<XX>`.
+fn ascii_encode(b: &[u8]) -> String {
+    let mut out = String::with_capacity(b.len());
+    for &c in b {
+        if (0x20..0x7f).contains(&c) {
+            out.push(char::from(c));
+        } else {
+            let _ = write!(out, "<{c:02X}>");
+        }
+    }
+    out
+}
+
+/// Connects a check to `addr` (the server's unless given) and, when the server line asks
+/// for it (`check-ssl`, or `ssl` inherited), puts the check's TLS over the socket. This
+/// is where `check-ssl` reaches the check (T113). A TLS check never takes the immediate
+/// path: its handshake runs from the `*Connecting` state ([`drive_check_handshake`]).
+fn connect_check(check: &mut ServerCheckState, addr: Option<SocketAddr>) -> io::Result<(OwnedFd, bool)> {
+    let addr = addr.unwrap_or(check.addr);
+    let (sock, immediate) = raw::connect(addr)?;
+    let Some(tls) = check.tls.as_ref() else {
+        check.xprt = ServerXprt::Plain;
+        return Ok((sock, immediate));
+    };
+    let host = check_host(check);
+    check.xprt = tls.connect(&sock, host.as_deref(), addr.ip());
+    Ok((sock, false))
+}
+
+/// The Host header an HTTP check sends, the automatic SNI of a TLS check
+/// (`tcpcheck_connect_auto_sni`). A log-format value is taken as written.
+fn check_host(check: &ServerCheckState) -> Option<String> {
+    let Some(ResolvedCheckConfig::Http(chk)) = check.resolved_config.as_ref() else { return None };
+    chk.headers
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case("host"))
+        .map(|(_, v)| v.clone())
+        .or_else(|| chk.host.clone())
+}
+
+/// Where a check's TLS handshake stands.
+enum Handshake {
+    /// A plaintext check, or a handshake already complete.
+    Ready,
+    /// Still going: the poller will bring the check back.
+    Pending,
+    /// Failed, with `HAProxy`'s wording for the log.
+    Failed(String),
+}
+
+/// Drives the TLS handshake of a check whose socket is connected.
+fn drive_check_handshake(check: &mut ServerCheckState, fdtab: &mut FdTab, poller: &mut Poller, raw_fd: RawFd) -> Handshake {
+    if !check.xprt.is_tls() || check.xprt.is_ready() {
+        return Handshake::Ready;
+    }
+    // A check past its connect always has its socket; a missing one reads as a failed
+    // handshake, through the arm below.
+    let step = check.sock.as_ref().map_or_else(|| Err(io::ErrorKind::NotConnected.into()), |s| check.xprt.handshake(s.as_fd()));
+    match step {
+        Ok(true) => Handshake::Ready,
+        Ok(false) => {
+            let interest = Interest { readable: true, writable: check.xprt.wants_write() };
+            fdtab.set_interest(raw_fd, interest);
+            if let Some(sock) = check.sock.as_ref() {
+                let _ = poller.modify(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), interest.readable, interest.writable);
+            }
+            Handshake::Pending
+        }
+        Err(e) => {
+            // `HAProxy`'s `conn_err_code_str`: a certificate the name check refused is
+            // reported apart from the other handshake failures.
+            let name_mismatch = e.get_ref().and_then(|i| i.downcast_ref::<rustls::Error>()).is_some_and(|e| {
+                matches!(
+                    e,
+                    rustls::Error::InvalidCertificate(
+                        rustls::CertificateError::NotValidForName | rustls::CertificateError::NotValidForNameContext { .. }
+                    )
+                )
+            });
+            Handshake::Failed(
+                if name_mismatch {
+                    "Server presented an SSL certificate different from the configured one"
+                } else {
+                    "SSL handshake failure"
+                }
+                .to_string(),
+            )
+        }
+    }
+}
+
+/// Ends a check whose TLS handshake failed: `L6RSP`, as `HAProxy` reports it.
+fn fail_check_l6(check: &mut ServerCheckState, fdtab: &mut FdTab, poller: &mut Poller, now: Tick, duration: u32, info: String) -> CheckStep {
+    cleanup_check_socket(check, fdtab, poller);
+    let event = check.on_failure_full("L6RSP", "Layer6 invalid response", duration, None, Some(info));
+    let next = check.schedule_next(now);
+    check.next_check = next;
+    CheckStep { next: Some(next), event }
+}
+
 pub fn cleanup_check_socket(check: &mut ServerCheckState, fdtab: &mut FdTab, poller: &mut Poller) {
     if let Some(sock) = check.sock.take() {
+        check.xprt.send_close_notify(sock.as_fd());
         let _ = poller.delete(sock.as_fd());
     }
+    check.xprt = ServerXprt::Plain;
+    check.tcp_connect_step = None;
     if let Some(raw_fd) = check.check_fd.take() {
         fdtab.remove(raw_fd);
     }
@@ -1924,7 +2086,7 @@ fn progress_redis_check(
     if phase == 0 {
         let ping_req = b"*1\r\n$4\r\nPING\r\n";
         while send_offset < ping_req.len() {
-            match raw::send(sock.as_fd(), &ping_req[send_offset..]) {
+            match check.xprt.send(sock.as_fd(), &ping_req[send_offset..]) {
                 Ok(Io::Done(n)) => {
                     send_offset += n;
                 }
@@ -1965,7 +2127,7 @@ fn progress_redis_check(
         let mut buf = [0u8; 4096];
         let mut eof = false;
         loop {
-            match raw::recv(sock.as_fd(), &mut buf) {
+            match check.xprt.recv(sock.as_fd(), &mut buf) {
                 Ok(Io::Done(n)) => {
                     recv_buf.extend_from_slice(&buf[..n]);
                 }
@@ -1989,10 +2151,11 @@ fn progress_redis_check(
         }
 
         cleanup_check_socket(check, fdtab, poller);
-        let resp_str = String::from_utf8_lossy(&recv_buf)
-            .trim_end_matches(&['\r', '\n'][..])
-            .to_string();
-        let event = if resp_str.starts_with("+PONG") {
+        // HAProxy's rule: `expect string +PONG error-status L7STS on-error
+        // %[res.payload(0,0),cut_crlf]` (src/tcpcheck.c): anything but a PONG is "Layer7
+        // wrong status", with the reply up to its first CR/LF, non-printables as `<XX>`.
+        // Measured: an LDAP answer gives `info: "0<0C><02><01><01>a<07>"`.
+        let event = if recv_buf.starts_with(b"+PONG") {
             check.on_success_full(
                 "L7OK",
                 "Layer7 check passed",
@@ -2000,21 +2163,13 @@ fn progress_redis_check(
                 None,
                 Some("Redis server is ok".to_string()),
             )
-        } else if resp_str.starts_with('-') {
+        } else {
             check.on_failure_full(
                 "L7STS",
                 "Layer7 wrong status",
                 duration,
                 None,
-                Some(resp_str),
-            )
-        } else {
-            check.on_failure_full(
-                "L7RSP",
-                "Layer7 invalid response",
-                duration,
-                None,
-                Some(resp_str),
+                Some(ascii_encode(cut_crlf(&recv_buf))),
             )
         };
         let next = check.schedule_next(now);
@@ -2070,7 +2225,7 @@ fn progress_smtp_check(
         let mut buf = [0u8; 4096];
         let mut eof = false;
         loop {
-            match raw::recv(sock.as_fd(), &mut buf) {
+            match check.xprt.recv(sock.as_fd(), &mut buf) {
                 Ok(Io::Done(n)) => {
                     recv_buf.extend_from_slice(&buf[..n]);
                 }
@@ -2145,7 +2300,7 @@ fn progress_smtp_check(
     if phase == 1 {
         let req_bytes = format!("{cmd}\r\n").into_bytes();
         while send_offset < req_bytes.len() {
-            match raw::send(sock.as_fd(), &req_bytes[send_offset..]) {
+            match check.xprt.send(sock.as_fd(), &req_bytes[send_offset..]) {
                 Ok(Io::Done(n)) => {
                     send_offset += n;
                 }
@@ -2196,7 +2351,7 @@ fn progress_smtp_check(
         let mut buf = [0u8; 4096];
         let mut eof = false;
         loop {
-            match raw::recv(sock.as_fd(), &mut buf) {
+            match check.xprt.recv(sock.as_fd(), &mut buf) {
                 Ok(Io::Done(n)) => {
                     recv_buf.extend_from_slice(&buf[..n]);
                 }
@@ -2297,7 +2452,7 @@ fn progress_smtp_check(
     if phase == 3 {
         let quit_req = b"QUIT\r\n";
         while send_offset < quit_req.len() {
-            match raw::send(sock.as_fd(), &quit_req[send_offset..]) {
+            match check.xprt.send(sock.as_fd(), &quit_req[send_offset..]) {
                 Ok(Io::Done(n)) => {
                     send_offset += n;
                 }
@@ -2348,7 +2503,7 @@ fn progress_smtp_check(
         let mut buf = [0u8; 4096];
         let mut eof = false;
         loop {
-            match raw::recv(sock.as_fd(), &mut buf) {
+            match check.xprt.recv(sock.as_fd(), &mut buf) {
                 Ok(Io::Done(n)) => {
                     recv_buf.extend_from_slice(&buf[..n]);
                 }
@@ -2453,7 +2608,7 @@ fn progress_ldap_check(
             0x30, 0x0c, 0x02, 0x01, 0x01, 0x60, 0x07, 0x02, 0x01, 0x03, 0x04, 0x00, 0x80, 0x00,
         ];
         while send_offset < ldap_req.len() {
-            match raw::send(sock.as_fd(), &ldap_req[send_offset..]) {
+            match check.xprt.send(sock.as_fd(), &ldap_req[send_offset..]) {
                 Ok(Io::Done(n)) => {
                     send_offset += n;
                 }
@@ -2495,7 +2650,7 @@ fn progress_ldap_check(
         let mut buf = [0u8; 4096];
         let mut eof = false;
         loop {
-            match raw::recv(sock.as_fd(), &mut buf) {
+            match check.xprt.recv(sock.as_fd(), &mut buf) {
                 Ok(Io::Done(n)) => {
                     recv_buf.extend_from_slice(&buf[..n]);
                 }
@@ -2801,7 +2956,7 @@ fn progress_mysql_check(
     if phase == 0 {
         if !req_buf.is_empty() {
             while send_offset < req_buf.len() {
-                match raw::send(sock.as_fd(), &req_buf[send_offset..]) {
+                match check.xprt.send(sock.as_fd(), &req_buf[send_offset..]) {
                     Ok(Io::Done(n)) => {
                         send_offset += n;
                     }
@@ -2848,7 +3003,7 @@ fn progress_mysql_check(
         let mut buf = [0u8; 4096];
         let mut eof = false;
         loop {
-            match raw::recv(sock.as_fd(), &mut buf) {
+            match check.xprt.recv(sock.as_fd(), &mut buf) {
                 Ok(Io::Done(n)) => {
                     recv_buf.extend_from_slice(&buf[..n]);
                 }
@@ -3150,7 +3305,7 @@ fn progress_pgsql_check(
         }
 
         while send_offset < req_buf.len() {
-            match raw::send(sock.as_fd(), &req_buf[send_offset..]) {
+            match check.xprt.send(sock.as_fd(), &req_buf[send_offset..]) {
                 Ok(Io::Done(n)) => {
                     send_offset += n;
                 }
@@ -3194,7 +3349,7 @@ fn progress_pgsql_check(
         let mut buf = [0u8; 4096];
         let mut eof = false;
         loop {
-            match raw::recv(sock.as_fd(), &mut buf) {
+            match check.xprt.recv(sock.as_fd(), &mut buf) {
                 Ok(Io::Done(n)) => {
                     recv_buf.extend_from_slice(&buf[..n]);
                 }
@@ -3319,7 +3474,7 @@ fn progress_ssl_hello_check(
         client_hello.extend_from_slice(&[0x01, 0x00]);
 
         while send_offset < client_hello.len() {
-            match raw::send(sock.as_fd(), &client_hello[send_offset..]) {
+            match check.xprt.send(sock.as_fd(), &client_hello[send_offset..]) {
                 Ok(Io::Done(n)) => {
                     send_offset += n;
                 }
@@ -3361,7 +3516,7 @@ fn progress_ssl_hello_check(
         let mut buf = [0u8; 4096];
         let mut eof = false;
         loop {
-            match raw::recv(sock.as_fd(), &mut buf) {
+            match check.xprt.recv(sock.as_fd(), &mut buf) {
                 Ok(Io::Done(n)) => {
                     recv_buf.extend_from_slice(&buf[..n]);
                 }

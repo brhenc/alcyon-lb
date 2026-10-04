@@ -92,6 +92,7 @@ pub(crate) fn parse_listen_header(
         req_header_captures: Vec::new(),
         res_header_captures: Vec::new(),
         log_health_checks: defaults.map_or(false, |d| d.log_health_checks),
+        buffer_request: defaults.is_some_and(|d| d.buffer_request),
         cliexp: Vec::new(),
         srvexp: Vec::new(),
         acls: Vec::new(),
@@ -183,6 +184,7 @@ pub(crate) fn parse_frontend_header(
         req_header_captures: Vec::new(),
         res_header_captures: Vec::new(),
         log_health_checks: defaults.map_or(false, |d| d.log_health_checks),
+        buffer_request: defaults.is_some_and(|d| d.buffer_request),
         stick_table: None,
         stick_rules: Vec::new(),
         tcp_req_inspect_delay: defaults.and_then(|d| d.tcp_req_inspect_delay),
@@ -250,6 +252,7 @@ pub(crate) fn parse_backend_header(
         unique_id_format: defaults.and_then(|d| d.unique_id_format.clone()),
         unique_id_header: defaults.and_then(|d| d.unique_id_header.clone()),
         log_health_checks: defaults.map_or(false, |d| d.log_health_checks),
+        buffer_request: defaults.is_some_and(|d| d.buffer_request),
         mode,
         disabled: false,
         balance: defaults.and_then(|d| d.balance).unwrap_or(BalanceAlgorithm::RoundRobin),
@@ -366,10 +369,10 @@ pub(crate) fn parse_listen_directive(
             parse_track_rule(&mut proxy.stick_rules, tokens, kw)
         }
         "tcp-request" => parse_listen_tcp_request(proxy, tokens, kw),
-        "http-request" => parse_http_req_rule(&mut proxy.http_req_rules, tokens, kw),
-        "http-response" => parse_http_res_rule(&mut proxy.http_res_rules, tokens, kw),
+        "http-request" => in_section(parse_http_req_rule(&mut proxy.http_req_rules, tokens, kw), "proxy", &proxy.name),
+        "http-response" => in_section(parse_http_res_rule(&mut proxy.http_res_rules, tokens, kw), "proxy", &proxy.name),
         "http-after-response" => {
-            parse_http_after_res_rule(&mut proxy.http_after_res_rules, tokens, kw)
+            in_section(parse_http_after_res_rule(&mut proxy.http_after_res_rules, tokens, kw), "proxy", &proxy.name)
         }
         "stats" => parse_stats_directive(&mut proxy.stats, tokens, kw),
         "http-check" => {
@@ -472,10 +475,10 @@ pub(crate) fn parse_frontend_directive(
             tokens[1].col,
             "'set-retries' only available in backend or listen section",
         )),
-        "http-request" => parse_http_req_rule(&mut fe.http_req_rules, tokens, kw),
-        "http-response" => parse_http_res_rule(&mut fe.http_res_rules, tokens, kw),
+        "http-request" => in_section(parse_http_req_rule(&mut fe.http_req_rules, tokens, kw), "frontend", &fe.name),
+        "http-response" => in_section(parse_http_res_rule(&mut fe.http_res_rules, tokens, kw), "frontend", &fe.name),
         "http-after-response" => {
-            parse_http_after_res_rule(&mut fe.http_after_res_rules, tokens, kw)
+            in_section(parse_http_after_res_rule(&mut fe.http_after_res_rules, tokens, kw), "frontend", &fe.name)
         }
         "mode" => parse_mode(&mut fe.mode, tokens, kw),
         "disabled" => {
@@ -600,10 +603,10 @@ pub(crate) fn parse_backend_directive(
         "default-server" => parse_default_server(&mut be.default_server, tokens, kw),
         "server" => parse_server(&mut be.servers, be.default_server.as_ref(), tokens, kw),
         "tcp-request" => parse_backend_tcp_request(be, tokens, kw),
-        "http-request" => parse_http_req_rule(&mut be.http_req_rules, tokens, kw),
-        "http-response" => parse_http_res_rule(&mut be.http_res_rules, tokens, kw),
+        "http-request" => in_section(parse_http_req_rule(&mut be.http_req_rules, tokens, kw), "backend", &be.name),
+        "http-response" => in_section(parse_http_res_rule(&mut be.http_res_rules, tokens, kw), "backend", &be.name),
         "http-after-response" => {
-            parse_http_after_res_rule(&mut be.http_after_res_rules, tokens, kw)
+            in_section(parse_http_after_res_rule(&mut be.http_after_res_rules, tokens, kw), "backend", &be.name)
         }
         "option" => parse_option_backend(be, tokens, kw),
         "no" => parse_no_backend(be, tokens, kw),
@@ -711,6 +714,7 @@ fn parse_bind(tokens: &[Token], kw: &Token, section: &str) -> Result<BindConfig,
         proto: None,
         accept_proxy: false,
         accept_proxy_v2: false,
+        name: None,
     };
     let prefix = format!("'bind {}' in section '{section}'", tokens[1].text);
     let arg = |i: usize, what: &str| -> Result<&Token, ConfigError> {
@@ -738,6 +742,10 @@ fn parse_bind(tokens: &[Token], kw: &Token, section: &str) -> Result<BindConfig,
             }
             "proto" => {
                 bind.proto = Some(arg(i, "missing protocol name")?.text.clone());
+                i += 1;
+            }
+            "name" => {
+                bind.name = Some(arg(i, "missing name")?.text.clone());
                 i += 1;
             }
             "accept-proxy" => bind.accept_proxy = true,
@@ -814,6 +822,7 @@ pub(crate) fn parse_option_listen(
         "forwardfor" => proxy.forwardfor = Some(parse_forward_option(tokens, kw)?),
         "originalto" => proxy.originalto = Some(parse_forward_option(tokens, kw)?),
         "redispatch" => set_redispatch(&mut proxy.redisp, &mut proxy.redisp_after, tokens),
+        "http-buffer-request" => proxy.buffer_request = true,
         "accept-unsafe-violations-in-http-request" => proxy.stats.accept_unsafe_request = true,
         "log-health-checks" => proxy.log_health_checks = true,
         "httpchk" => parse_httpchk_option(&mut proxy.httpchk, tokens, kw)?,
@@ -846,6 +855,10 @@ pub(crate) fn parse_option_frontend(
         fe.stats.accept_unsafe_request = true;
         return Ok(());
     }
+    if tokens[1].text == "http-buffer-request" {
+        fe.buffer_request = true;
+        return Ok(());
+    }
     let except = Some(parse_forward_option(tokens, kw)?);
     if tokens[1].text == "forwardfor" {
         fe.forwardfor = except;
@@ -873,6 +886,7 @@ pub(crate) fn parse_option_backend(
         "forwardfor" => be.forwardfor = Some(parse_forward_option(tokens, kw)?),
         "originalto" => be.originalto = Some(parse_forward_option(tokens, kw)?),
         "redispatch" => set_redispatch(&mut be.redisp, &mut be.redisp_after, tokens),
+        "http-buffer-request" => be.buffer_request = true,
         "log-health-checks" => be.log_health_checks = true,
         "httpchk" => parse_httpchk_option(&mut be.httpchk, tokens, kw)?,
         "tcp-check" => be.tcp_check = true,
@@ -890,6 +904,7 @@ pub(crate) fn parse_no_listen(proxy: &mut ListenSection, tokens: &[Token], kw: &
     }
     match check_no_option(OptSection::Listen, tokens, kw)? {
         Some("redispatch") => (proxy.redisp, proxy.redisp_after) = (false, -1),
+        Some("http-buffer-request") => proxy.buffer_request = false,
         Some("accept-unsafe-violations-in-http-request") => proxy.stats.accept_unsafe_request = false,
         Some("log-health-checks") => proxy.log_health_checks = false,
         _ => {}
@@ -901,8 +916,10 @@ pub(crate) fn parse_no_frontend(fe: &mut FrontendSection, tokens: &[Token], kw: 
     if tokens.get(1).is_none_or(|t| t.text != "option") {
         return parse_no_directive(tokens, kw);
     }
-    if let Some("accept-unsafe-violations-in-http-request") = check_no_option(OptSection::Frontend, tokens, kw)? {
-        fe.stats.accept_unsafe_request = false;
+    match check_no_option(OptSection::Frontend, tokens, kw)? {
+        Some("accept-unsafe-violations-in-http-request") => fe.stats.accept_unsafe_request = false,
+        Some("http-buffer-request") => fe.buffer_request = false,
+        _ => {}
     }
     Ok(())
 }
@@ -913,6 +930,7 @@ pub(crate) fn parse_no_backend(be: &mut BackendSection, tokens: &[Token], kw: &T
     }
     match check_no_option(OptSection::Backend, tokens, kw)? {
         Some("redispatch") => (be.redisp, be.redisp_after) = (false, -1),
+        Some("http-buffer-request") => be.buffer_request = false,
         Some("log-health-checks") => be.log_health_checks = false,
         _ => {}
     }

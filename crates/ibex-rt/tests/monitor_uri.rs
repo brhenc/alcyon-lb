@@ -11,11 +11,9 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// HAProxy's response, plus the `Connection: close` Ibex adds because it closes the
-/// connection after a synthetic answer where HAProxy keeps it alive. That header is the
-/// one known difference; everything else is byte for byte.
+/// HAProxy's response, byte for byte; the connection stays open after it.
 const HAPROXY_RESPONSE: &str = "HTTP/1.1 200 OK\r\ncontent-length: 58\r\n\
-cache-control: no-cache\r\ncontent-type: text/html\r\nConnection: close\r\n\r\n\
+cache-control: no-cache\r\ncontent-type: text/html\r\n\r\n\
 <html><body><h1>200 OK</h1>\nService ready.\n</body></html>\n";
 
 fn ask(fe: std::net::SocketAddr, request_line: &str) -> String {
@@ -66,4 +64,43 @@ fn monitor_uri_is_answered_by_the_proxy_with_haproxys_response() {
     assert_eq!(origin, HAPROXY_RESPONSE);
     assert_eq!(absolute, HAPROXY_RESPONSE, "absolute-form must match the path too");
     assert!(!other.starts_with("HTTP/1.1 200"), "only the monitor URI is answered: {other:?}");
+}
+
+/// `HAProxy` keeps the connection after a `monitor-uri` answer: a second request on it is
+/// answered too.
+#[test]
+fn monitor_uri_keeps_the_connection_alive() {
+    let fe = common::reserve_addr();
+    let mut cfg = tempfile::NamedTempFile::new().unwrap();
+    write!(
+        cfg,
+        "defaults\n  mode http\n  timeout connect 1s\n  timeout client 3s\n  timeout server 3s\n\
+         frontend fe\n  bind {fe}\n  monitor-uri /health\n"
+    )
+    .unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ibex"))
+        .arg("-f")
+        .arg(cfg.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn ibex");
+    assert!(common::wait_listening(fe), "ibex never started listening");
+    let mut c = TcpStream::connect(fe).expect("connect");
+    c.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    let mut seen = Vec::new();
+    for _ in 0..2 {
+        write!(c, "GET /health HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        let mut buf = [0u8; 4096];
+        let want = seen.len() + HAPROXY_RESPONSE.len();
+        while seen.len() < want {
+            match c.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => seen.extend_from_slice(&buf[..n]),
+            }
+        }
+    }
+    common::stop(&mut child);
+    let both = format!("{HAPROXY_RESPONSE}{HAPROXY_RESPONSE}");
+    assert_eq!(String::from_utf8_lossy(&seen), both);
 }

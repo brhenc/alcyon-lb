@@ -14,10 +14,11 @@ use crate::ast::{
     AclCondition, AclRule, AclTerm, BackendSection, BalanceAlgorithm, BindConfig, Config, CookieConfig,
     DefaultServerConfig, DefaultsSection, ErrorPageSource, FrontendSection, GlobalSection,
     GlobalSetVar, HashPreserveAffinity, HashType, HttpAfterResAction, HttpAfterResRule, HttpCheckAction, HttpCheckExpectPattern,
-    HttpChkConfig, HttpReqAction, HttpReqRule, HttpResAction, HttpResRule, HttpReuse, RetriesValue,
+    HttpChkConfig, HttpReqAction, HttpReqRule, HttpResAction, HttpResRule, HttpReuse, RedirectCookie, RetriesValue,
     HeaderCapture, ListenSection, LogConfig, LogFacility, LogFormatSpec, LogLevel, LogTarget, MatchType, Mode,
     MysqlCheckVersion, ProtoCheckConfig, ResolvedCheckConfig, ResolvedHttpCheck,
-    ResolvedHttpExpectPattern, ResolvedHttpExpectRule, ResolvedTcpStep, SampleRef, SectionKind, Server, StatsConfig,
+    ResolvedHttpExpectPattern, ResolvedHttpExpectRule, ResolvedTcpStep, SampleRef, SectionKind, Server, ServerSsl,
+    SslVerify, StatsConfig, TlsVersion,
     StickRule, StickRuleType, StickTableConfigAst, TcpCheckAction, TcpCheckExpectPattern,
     TcpReqConnAction, TcpReqConnRule, TcpReqContentAction, TcpReqContentRule, TcpResAction, TcpResContentRule,
     TcpReqSessionAction, TcpReqSessionRule, TimeoutConfig, UseBackendRule, UseServerRule,
@@ -587,11 +588,6 @@ const OPTIONS_THAT_MUST_NOT_BE_IGNORED: &[(&str, &str)] = &[
         "forwarded",
         "Ibex does not add the RFC 7239 'Forwarded' header, and the server would trust whatever \
          'Forwarded' header the client sent",
-    ),
-    (
-        "http-buffer-request",
-        "Ibex does not wait for the request body before evaluating rules, so a rule on the body \
-         would see none of it",
     ),
     ("http-drop-request-trailers", "Ibex does not drop request trailers; the server would receive them"),
     ("http-drop-response-trailers", "Ibex does not drop response trailers; the client would receive them"),

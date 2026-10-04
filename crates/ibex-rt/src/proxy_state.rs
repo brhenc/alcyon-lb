@@ -460,6 +460,15 @@ pub fn check_expr(config: &Config, registry: &Registry, at: Where<'_>, expr: &st
     if NOT_HAPROXY_FETCHES.contains(&e.fetch_name.as_str()) && registry.get_fetch(&e.fetch_name).is_none() {
         return Err(format!("unknown fetch method '{}'", e.fetch_name));
     }
+    // An ACL keyword Ibex has no fetch behind would load and never match, so a `deny if`
+    // on it lets everything through (T132): refuse it, as `HAProxy` refuses a keyword it
+    // does not know ("unknown fetch method '%s' in ACL expression '%s'").
+    if acl && !registry.has_fetch(&e.fetch_name) {
+        let written = word.split('(').next().unwrap_or(word);
+        return Err(format!(
+            "unknown fetch method '{written}' in ACL expression '{written}' (HAProxy does not know it, or Ibex does not implement it)."
+        ));
+    }
     for (c, _) in &e.converters {
         if let Some(msg) = not_implemented_message(c) {
             return Err(msg);

@@ -345,6 +345,7 @@ fn a_request_with_acl_and_log_format_allocates_no_more_than_n_times() {
                 name: "is_api".into(),
             }],
         }),
+        line: 0,
     });
 
     let config = Config {

@@ -41,6 +41,14 @@ pub enum HttpReqAction {
         /// `deny_status`), so the parser sets it in that case too.
         error_page: Option<ErrorPageSource>,
     },
+    /// Holds the request for `timeout tarpit` (`timeout connect` when unset), then answers
+    /// as `Deny` does, with status 500 unless given.
+    Tarpit {
+        deny_status: Option<u16>,
+        content_type: Option<String>,
+        lf_string: Option<String>,
+        error_page: Option<ErrorPageSource>,
+    },
     Allow,
     SetHeader {
         name: String,
@@ -146,6 +154,15 @@ pub enum HttpReqAction {
         sc: u8,
         expr: String,
     },
+    /// `http-request wait-for-body time <t> [at-least <bytes>]`: the rules after this one
+    /// run once the request body is complete, or `at_least` bytes of it are here, or the
+    /// buffer is full; `time_ms` after the rule is reached, the client gets a 408. `None`
+    /// is the wait `option http-buffer-request` stands for: `timeout http-request`, else
+    /// `timeout client`.
+    WaitForBody {
+        time_ms: Option<u32>,
+        at_least: u32,
+    },
 }
 
 /// The argument of `set-retries`: an integer from 0 to 100, or an expression evaluated per
@@ -161,6 +178,8 @@ pub enum RetriesValue {
 pub struct HttpReqRule {
     pub action: HttpReqAction,
     pub cond: Option<AclCondition>,
+    /// The configuration line the rule was written on, for `last_rule_line`.
+    pub line: u32,
 }
 
 /// Modern HTTP-response action.
@@ -174,6 +193,24 @@ pub enum HttpResAction {
     /// capture slot `id` (a `declare capture response`, or a `capture response header`),
     /// cut to that slot's length.
     Capture { expr: String, id: usize },
+    /// `http-response wait-for-body time <t> [at-least <bytes>]`: the rules after this one
+    /// run once the response body is complete, or `at_least` bytes of it are here, or the
+    /// buffer is full; after `time_ms` the client gets a 504.
+    WaitForBody { time_ms: u32, at_least: u32 },
+    /// `http-response redirect location <fmt> [code <c>] [set-cookie <c>|clear-cookie <n>]`:
+    /// the response is replaced by an empty redirect to `location` (a log-format string).
+    /// `HAProxy` refuses the `prefix` and `scheme` types in a response.
+    Redirect { location: String, code: u16, cookie: Option<RedirectCookie> },
+}
+
+/// The cookie a redirect sets or clears: of `set-cookie` and `clear-cookie` the last one
+/// on the line stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RedirectCookie {
+    /// `set-cookie NAME[=VALUE]`: `set-cookie: NAME[=VALUE]; path=/;`.
+    Set(String),
+    /// `clear-cookie NAME`: `set-cookie: NAME; path=/; Max-Age=0;`.
+    Clear(String),
 }
 
 /// Rule pairing an HTTP-response action with an optional condition.
@@ -181,6 +218,8 @@ pub enum HttpResAction {
 pub struct HttpResRule {
     pub action: HttpResAction,
     pub cond: Option<AclCondition>,
+    /// The configuration line the rule was written on, for `last_rule_line`.
+    pub line: u32,
 }
 
 /// Modern HTTP-after-response action.
@@ -189,6 +228,8 @@ pub enum HttpAfterResAction {
     SetHeader { name: String, fmt: String },
     AddHeader { name: String, fmt: String },
     DelHeader { name: String },
+    /// `capture <sample> id <idx>`: a frontend response slot, as `http-response capture`.
+    Capture { expr: String, id: usize },
 }
 
 /// Rule pairing an HTTP-after-response action with an optional condition.

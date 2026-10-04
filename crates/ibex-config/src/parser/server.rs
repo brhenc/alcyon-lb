@@ -3,6 +3,7 @@
 
 use super::*;
 
+#[allow(clippy::too_many_lines)]
 pub(crate) fn parse_server(
     servers: &mut Vec<Server>,
     default_server: Option<&DefaultServerConfig>,
@@ -31,17 +32,22 @@ pub(crate) fn parse_server(
     let mut send_proxy_v2 = default_server.is_some_and(|d| d.send_proxy_v2);
     let mut maxconn = default_server.and_then(|d| d.maxconn);
     let mut check_port = default_server.and_then(|d| d.check_port);
-    let mut check_proto = default_server.and_then(|d| d.check_proto.clone());
+    let mut check_proto = default_server.and_then(|d| d.check_proto);
     let mut weight = default_server.and_then(|d| d.weight);
     let mut backup = default_server.is_some_and(|d| d.backup);
     let mut cookie = default_server.and_then(|d| d.cookie.clone());
     let mut proxy_v2_unique_id = default_server.is_some_and(|d| d.proxy_v2_unique_id);
+    let mut ssl = default_server.map(|d| d.ssl.clone()).unwrap_or_default();
     let mut disabled = default_server.is_some_and(|d| d.disabled);
 
     // Every keyword HAProxy knows is either implemented here or listed, with what Ibex
     // does about it, in `server_keywords.rs`. A keyword's argument is consumed with it.
     let mut i = 3;
     while i < tokens.len() {
+        if let Some(last) = parse_server_ssl_keyword(&mut ssl, tokens, i, who)? {
+            i = last + 1;
+            continue;
+        }
         match tokens[i].text.as_str() {
             "check" => check = true,
             "no-check" => check = false,
@@ -98,18 +104,20 @@ pub(crate) fn parse_server(
             "disabled" => disabled = true,
             "enabled" => disabled = false,
             // What these turn on, Ibex never does: they leave the server as Ibex runs it.
-            "stick" | "no-agent-check" | "no-check-send-proxy" | "no-check-reuse-pool" | "no-ssl"
-            | "no-check-ssl" | "no-send-proxy-v2-ssl" | "no-send-proxy-v2-ssl-cn" | "no-sni-auto"
-            | "no-check-sni-auto" => {}
+            "stick" | "no-agent-check" | "no-check-send-proxy" | "no-check-reuse-pool"
+            | "no-send-proxy-v2-ssl" | "no-send-proxy-v2-ssl-cn" => {}
             _ => i = unimplemented_server_keyword(tokens, i, who)?,
         }
         i += 1;
     }
+    validate_server_ssl(&ssl, check_port, kw, who)?;
 
     servers.push(Server {
         check_port,
         check_proto,
-        check_ssl: false,
+        // Boxed, and absent when no TLS keyword touched it, so a plaintext server is 8
+        // bytes (`Server` embeds no TLS state): the memory-bound tests stay where they were.
+        ssl: (ssl != ServerSsl::default()).then(|| Box::new(ssl)),
         proxy_v2_unique_id,
         id: tokens[1].text.clone(),
         addr,
@@ -128,20 +136,233 @@ pub(crate) fn parse_server(
     Ok(())
 }
 
+/// The TLS keywords of a server line (`src/cfgparse-ssl.c`). `Ok(Some(last))` when
+/// `tokens[i]` is one, with the index of its last argument; `Ok(None)` when it is not.
+///
+/// What rustls cannot do is refused rather than approximated: it speaks TLS 1.2 and 1.3
+/// only, so a line that pins an older version would describe a server Ibex can never
+/// reach. `no-sslv3`, `no-tlsv10` and `no-tlsv11` are accepted because what they ask for
+/// is already the case.
+#[allow(clippy::too_many_lines)]
+fn parse_server_ssl_keyword(
+    ssl: &mut ServerSsl,
+    tokens: &[Token],
+    i: usize,
+    who: Option<&str>,
+) -> Result<Option<usize>, ConfigError> {
+    let kw = &tokens[i];
+    let prefix = server_prefix(who);
+    let arg = |what: &str| server_kw_arg(tokens, i, who, what);
+    let list = |t: &Token| t.text.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect::<Vec<_>>();
+    let rustls_only = |what: &str| {
+        Err(ConfigError::new(
+            kw.line,
+            kw.col,
+            format!("{prefix}'{}' is not supported: rustls speaks TLS 1.2 and 1.3 only, so {what}.", kw.text),
+        ))
+    };
+    // HAProxy skips these on a default-server line with an alert; the configuration is valid.
+    if who.is_none() && matches!(kw.text.as_str(), "no-sslv3" | "no-tlsv10" | "no-tlsv11" | "no-tlsv12" | "no-tlsv13") {
+        eprintln!("[ibex] warning: '{}' option is not accepted in default-server sections; ignored", kw.text);
+        return Ok(Some(i));
+    }
+    let last = match kw.text.as_str() {
+        "ssl" => {
+            ssl.ssl = true;
+            i
+        }
+        "no-ssl" => {
+            ssl.ssl = false;
+            i
+        }
+        "verify" => {
+            let v = arg(": missing parameter.")?;
+            ssl.verify = Some(match v.text.as_str() {
+                "none" => SslVerify::None,
+                "required" => SslVerify::Required,
+                other => {
+                    return Err(ConfigError::new(
+                        kw.line,
+                        kw.col,
+                        format!("{prefix}'verify' : unknown verify method '{other}', only 'none' and 'required' are supported."),
+                    ))
+                }
+            });
+            i + 1
+        }
+        "ca-file" => {
+            ssl.ca_file = Some(arg(": missing CAfile path.")?.text.clone());
+            i + 1
+        }
+        "crl-file" => {
+            ssl.crl_file = Some(arg(": missing CRLfile path.")?.text.clone());
+            i + 1
+        }
+        "crt" => {
+            ssl.crt = Some(arg(": missing certificate file path.")?.text.clone());
+            i + 1
+        }
+        "sni" => {
+            ssl.sni = Some(arg(": missing sni expression.")?.text.clone());
+            i + 1
+        }
+        "sni-auto" => {
+            ssl.no_sni_auto = false;
+            i
+        }
+        "no-sni-auto" => {
+            ssl.no_sni_auto = true;
+            i
+        }
+        "verifyhost" => {
+            ssl.verifyhost = Some(arg(": missing hostname to verify against.")?.text.clone());
+            i + 1
+        }
+        "alpn" => {
+            ssl.alpn = list(arg(": missing the comma-delimited ALPN protocol suite.")?);
+            i + 1
+        }
+        "check-alpn" => {
+            ssl.check_alpn = list(arg(": missing the comma-delimited ALPN protocol suite.")?);
+            i + 1
+        }
+        "check-sni" => {
+            ssl.check_sni = Some(arg(": missing SNI.")?.text.clone());
+            i + 1
+        }
+        "check-sni-auto" => {
+            ssl.no_check_sni_auto = false;
+            i
+        }
+        "no-check-sni-auto" => {
+            ssl.no_check_sni_auto = true;
+            i
+        }
+        "check-ssl" => {
+            ssl.check_ssl = Some(true);
+            i
+        }
+        "no-check-ssl" => {
+            ssl.check_ssl = Some(false);
+            i
+        }
+        "ssl-min-ver" => {
+            ssl.min_ver = Some(parse_tls_version(arg(": missing the ssl/tls version.")?, who)?);
+            i + 1
+        }
+        "ssl-max-ver" => {
+            ssl.max_ver = Some(parse_tls_version(arg(": missing the ssl/tls version.")?, who)?);
+            i + 1
+        }
+        "force-tlsv12" => {
+            ssl.min_ver = Some(TlsVersion::Tls12);
+            ssl.max_ver = Some(TlsVersion::Tls12);
+            i
+        }
+        "force-tlsv13" => {
+            ssl.min_ver = Some(TlsVersion::Tls13);
+            ssl.max_ver = Some(TlsVersion::Tls13);
+            i
+        }
+        "force-sslv3" | "force-tlsv10" | "force-tlsv11" => {
+            return rustls_only("a server that only speaks that version cannot be reached");
+        }
+        "no-tlsv12" => {
+            ssl.min_ver = Some(TlsVersion::Tls13);
+            i
+        }
+        "no-tlsv13" => {
+            ssl.max_ver = Some(TlsVersion::Tls12);
+            i
+        }
+        // rustls never offers these: what the keyword asks for is already the case.
+        "no-sslv3" | "no-tlsv10" | "no-tlsv11" => i,
+        "ssl-reuse" => {
+            ssl.no_reuse = false;
+            i
+        }
+        "no-ssl-reuse" => {
+            ssl.no_reuse = true;
+            i
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(last))
+}
+
+/// `ssl-min-ver` / `ssl-max-ver`: `HAProxy` knows `SSLv3` and `TLSv1.0` to `TLSv1.3`
+/// ("'TLSv1.4' : unknown ssl/tls version."); rustls speaks the last two.
+fn parse_tls_version(t: &Token, who: Option<&str>) -> Result<TlsVersion, ConfigError> {
+    let prefix = server_prefix(who);
+    match t.text.as_str() {
+        "TLSv1.2" => Ok(TlsVersion::Tls12),
+        "TLSv1.3" => Ok(TlsVersion::Tls13),
+        "SSLv3" | "TLSv1.0" | "TLSv1.1" => Err(ConfigError::new(
+            t.line,
+            t.col,
+            format!(
+                "{prefix}'{}' is not supported: rustls speaks TLS 1.2 and 1.3 only, so a server that needs it cannot be reached.",
+                t.text
+            ),
+        )),
+        other => Err(ConfigError::new(t.line, t.col, format!("{prefix}'{other}' : unknown ssl/tls version."))),
+    }
+}
+
+/// What `HAProxy` checks once a server line is complete (`ssl_sock_prepare_srv_ctx`):
+/// a TLS server, or a TLS check, verifies the certificate unless told not to, and that
+/// needs trust anchors. The alert is `HAProxy`'s.
+fn validate_server_ssl(ssl: &ServerSsl, check_port: Option<u16>, kw: &Token, who: Option<&str>) -> Result<(), ConfigError> {
+    let prefix = server_prefix(who);
+    if (ssl.ssl || ssl.check_uses_tls(check_port)) && ssl.verify != Some(SslVerify::None) && ssl.ca_file.is_none() {
+        let turned_on = if ssl.ssl { "ssl" } else { "check-ssl" };
+        return Err(ConfigError::new(
+            kw.line,
+            kw.col,
+            format!(
+                "{prefix}'{turned_on}' : verify is enabled by default but no CA file specified. If you're running on a LAN where \
+                 you're certain to trust the server's certificate, please set an explicit 'verify none' statement \
+                 on the 'server' line, or use 'ssl-server-verify none' in the global section to disable \
+                 server-side verifications by default."
+            ),
+        ));
+    }
+    if let (Some(min), Some(max)) = (ssl.min_ver, ssl.max_ver) {
+        if min > max {
+            return Err(ConfigError::new(
+                kw.line,
+                kw.col,
+                format!("{prefix}no TLS version is left between 'ssl-min-ver' and 'ssl-max-ver'."),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// `proto <mux>` and `check-proto <mux>`: the protocol spoken to the server. Ibex speaks
-/// HTTP/1.1. `h2` is accepted with a warning: a server that expects h2 refuses HTTP/1.1
-/// rather than misreading it, and two reg-tests that pass rely on it. `HAProxy` refuses a
+/// HTTP/1.1 and has no HTTP/2 mux towards servers, so `h2` is refused: a server that
+/// speaks only h2 would refuse every request, and until T113 the keyword was a warning
+/// that two reg-tests passed through by having both ends ignore it. `HAProxy` refuses a
 /// protocol it has no mux for ("'proto' :  unknown MUX protocol 'h3'.").
-fn parse_server_proto(tokens: &[Token], i: usize, server: Option<&str>) -> Result<String, ConfigError> {
+fn parse_server_proto(tokens: &[Token], i: usize, server: Option<&str>) -> Result<&'static str, ConfigError> {
     let kw = &tokens[i];
     let value = &server_kw_arg(tokens, i, server, ": missing value.")?.text;
     let prefix = server_prefix(server);
     match value.as_str() {
-        "h1" => {}
-        "h2" => eprintln!(
-            "[ibex] warning: {prefix}'{} h2' is not implemented and is ignored; Ibex speaks HTTP/1.1 to this server.",
-            kw.text
-        ),
+        // The one protocol Ibex speaks to servers; a `&'static str` so `Server` stays the
+        // size it was before `ssl` joined it (60,000 of them are measured).
+        "h1" => Ok("h1"),
+        "h2" => {
+            return Err(ConfigError::new(
+                kw.line,
+                kw.col,
+                format!(
+                    "{prefix}'{}' : 'h2' is not supported: Ibex has no HTTP/2 mux towards servers and speaks \
+                     HTTP/1.1 to them, which a server expecting h2 would refuse.",
+                    kw.text
+                ),
+            ));
+        }
         "fcgi" | "spop" | "quic" | "qmux" | "none" => {
             return Err(ConfigError::new(
                 kw.line,
@@ -149,15 +370,12 @@ fn parse_server_proto(tokens: &[Token], i: usize, server: Option<&str>) -> Resul
                 format!("{prefix}'{}' : '{value}' is not supported: Ibex speaks only HTTP/1.1 to servers.", kw.text),
             ));
         }
-        other => {
-            return Err(ConfigError::new(
-                kw.line,
-                kw.col,
-                format!("{prefix}'{}' :  unknown MUX protocol '{other}'.", kw.text),
-            ));
-        }
+        other => Err(ConfigError::new(
+            kw.line,
+            kw.col,
+            format!("{prefix}'{}' :  unknown MUX protocol '{other}'.", kw.text),
+        )),
     }
-    Ok(value.clone())
 }
 
 pub(crate) fn parse_default_server(
@@ -168,6 +386,10 @@ pub(crate) fn parse_default_server(
     let mut cfg = def.take().unwrap_or_default();
     let mut i = 1;
     while i < tokens.len() {
+        if let Some(last) = parse_server_ssl_keyword(&mut cfg.ssl, tokens, i, None)? {
+            i = last + 1;
+            continue;
+        }
         match tokens[i].text.as_str() {
             "check" => cfg.check = true,
             "no-check" => cfg.check = false,
@@ -223,9 +445,8 @@ pub(crate) fn parse_default_server(
             "no-backup" => cfg.backup = false,
             "disabled" => cfg.disabled = true,
             "enabled" => cfg.disabled = false,
-            "stick" | "no-agent-check" | "no-check-send-proxy" | "no-check-reuse-pool" | "no-ssl"
-            | "no-check-ssl" | "no-send-proxy-v2-ssl" | "no-send-proxy-v2-ssl-cn" | "no-sni-auto"
-            | "no-check-sni-auto" => {}
+            "stick" | "no-agent-check" | "no-check-send-proxy" | "no-check-reuse-pool"
+            | "no-send-proxy-v2-ssl" | "no-send-proxy-v2-ssl-cn" => {}
             _ => i = unimplemented_server_keyword(tokens, i, None)?,
         }
         i += 1;

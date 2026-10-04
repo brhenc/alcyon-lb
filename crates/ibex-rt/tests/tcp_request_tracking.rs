@@ -268,6 +268,7 @@ fn an_unrelated_http_request_rule_does_not_switch_off_tracking() {
             fmt: "1".into(),
         },
         cond: None,
+        line: 0,
     }];
     let with = run_and_show_table(with_header, fe_addr2, 3);
 
@@ -314,6 +315,7 @@ fn track_sc0_at_content_scope_populates_the_stick_table() {
                     table: None,
                 },
                 cond: None,
+                line: 0,
             }],
             ..Default::default()
         },

@@ -156,6 +156,8 @@ const IMPLEMENTED: &[&str] = &[
     "forwardfor",
     "originalto",
     "redispatch",
+    // Waits for the request body ahead of the rules (T119).
+    "http-buffer-request",
     "log-health-checks",
     "httpchk",
     "tcp-check",

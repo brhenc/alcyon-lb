@@ -104,8 +104,6 @@ pub struct SampleContext<'a> {
     /// stream, where `HAProxy` has no raw buffer to read.
     pub raw_req: Option<&'a [u8]>,
     pub raw_res: Option<&'a [u8]>,
-    /// A content inspection that can still wait for more data: `wait_end` has no value yet.
-    pub wait_pending: bool,
     pub res_version: Option<&'a str>,
     pub res_headers: Option<&'a [(String, String)]>,
     pub res_status: Option<u16>,
@@ -127,6 +125,9 @@ pub struct SampleContext<'a> {
     pub captures_res_hdr: Option<&'a [Option<Vec<u8>>]>,
     /// The stream's unique ID (`unique-id-format`), for the `unique-id` fetch.
     pub unique_id: Option<&'a str>,
+    /// The file and line of the last rule that ended a rule set for the request
+    /// (`last_rule_file`, `last_rule_line`); `None` where no rule did.
+    pub last_rule: Option<(&'a str, u32)>,
     pub is_first_req: bool,
     pub vars: Option<&'a HashMap<String, String>>,
     pub timeouts: Option<&'a HashMap<String, u32>>,
@@ -540,6 +541,12 @@ impl Registry {
             desc.name
         );
         self.ctx_converters.insert(desc.name, desc);
+    }
+
+    /// Whether a fetch, of either kind, is registered under `name`.
+    #[must_use]
+    pub fn has_fetch(&self, name: &str) -> bool {
+        self.fetches.contains_key(name) || self.multi_fetches.contains_key(name)
     }
 
     #[must_use]
@@ -1262,12 +1269,6 @@ impl Registry {
             out_type: SampleType::Sint,
             func: request_body_len_fetch,
         });
-        // `smp_fetch_wait_end` (src/payload.c): true once the inspection can wait no more.
-        self.register_fetch(FetchDesc {
-            name: "wait_end",
-            out_type: SampleType::Bool,
-            func: |ctx, _args| (!ctx.wait_pending).then_some(Sample::Bool(true)),
-        });
         self.register_fetch(FetchDesc {
             name: "req.body_len",
             out_type: SampleType::Sint,
@@ -1301,6 +1302,11 @@ impl Registry {
         });
         self.register_fetch(FetchDesc {
             name: "res.body_size",
+            out_type: SampleType::Sint,
+            func: response_body_len_fetch,
+        });
+        self.register_fetch(FetchDesc {
+            name: "res.body_len",
             out_type: SampleType::Sint,
             func: response_body_len_fetch,
         });
@@ -1389,6 +1395,26 @@ impl Registry {
             name: "unique-id",
             out_type: SampleType::Str,
             func: |ctx, _args| ctx.unique_id.map(|u| Sample::Str(u.to_string())),
+        });
+        // `smp_fetch_wait_end` (src/payload.c): true once the rules may no longer wait. The
+        // tcp-request and tcp-response content rules hold a condition on it while they can
+        // wait (`inspect-delay` not over, the buffer not full, the peer not closed), so a
+        // sample is only ever asked for when they cannot.
+        self.register_fetch(FetchDesc {
+            name: "wait_end",
+            out_type: SampleType::Bool,
+            func: |_ctx, _args| Some(Sample::Bool(true)),
+        });
+        // `smp_fetch_last_rule_file` / `smp_fetch_last_rule_line` (src/stream.c).
+        self.register_fetch(FetchDesc {
+            name: "last_rule_file",
+            out_type: SampleType::Str,
+            func: |ctx, _args| ctx.last_rule.map(|(file, _)| Sample::Str(file.to_string())),
+        });
+        self.register_fetch(FetchDesc {
+            name: "last_rule_line",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| ctx.last_rule.map(|(_, line)| Sample::Sint(i64::from(line))),
         });
 
         // --- 7. Captures ---
@@ -4285,59 +4311,19 @@ fn get_all_req_headers(ctx: &SampleContext, name: &str) -> Vec<String> {
     matches
 }
 
+/// The response's header `name`. Only the response is read: `ctx.htx_slice` holds the
+/// *request* while a response rule runs, so a `shdr(x-n)` that fell back to it answered
+/// with the request's `X-N` (T132).
 fn get_res_header(ctx: &SampleContext, name: &str) -> Option<String> {
-    if let Some(htx) = ctx.htx_slice {
-        if let Some(v) = htx.get_header(name) {
-            return Some(v.to_string());
-        }
-    }
-    if let Some(headers) = ctx.res_headers {
-        for (k, v) in headers {
-            if k.eq_ignore_ascii_case(name) {
-                return Some(v.clone());
-            }
-        }
-    }
-    if let Some(htx) = ctx.htx {
-        for hf in htx.headers() {
-            if hf.name.eq_ignore_ascii_case(name) {
-                return Some(hf.value.clone());
-            }
-        }
-    }
-    CURRENT_RES_HEADERS.with(|hdrs| {
-        for (k, v) in hdrs.borrow().iter() {
-            if k.eq_ignore_ascii_case(name) {
-                return Some(v.clone());
-            }
-        }
-        None
-    })
+    get_all_res_headers(ctx, name).into_iter().next()
 }
 
 fn get_all_res_headers(ctx: &SampleContext, name: &str) -> Vec<String> {
     let mut matches = Vec::new();
-    if let Some(htx) = ctx.htx_slice {
-        for (hn, hv) in htx.headers() {
-            if hn.eq_ignore_ascii_case(name) {
-                matches.push(hv.to_string());
-            }
-        }
-        if !matches.is_empty() {
-            return matches;
-        }
-    }
     if let Some(headers) = ctx.res_headers {
         for (k, v) in headers {
             if k.eq_ignore_ascii_case(name) {
                 matches.push(v.clone());
-            }
-        }
-    }
-    if let Some(htx) = ctx.htx {
-        for hf in htx.headers() {
-            if hf.name.eq_ignore_ascii_case(name) {
-                matches.push(hf.value.clone());
             }
         }
     }

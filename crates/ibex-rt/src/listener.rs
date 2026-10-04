@@ -43,6 +43,8 @@ pub struct Listener {
     /// frontend commonly carries `bind :80` beside `bind :443 ssl crt`, and the two must
     /// not share a transport. `None` is plaintext.
     pub tls: Option<Arc<rustls::ServerConfig>>,
+    /// `bind ... name <n>`, what `so_name` reads.
+    pub name: Option<Arc<str>>,
 }
 
 impl Listener {
@@ -102,6 +104,7 @@ impl Listener {
             maxconn: 0,
             nbconn: 0,
             tls: None,
+            name: None,
         })
     }
 
@@ -146,6 +149,7 @@ impl Listener {
             maxconn: 0,
             nbconn: 0,
             tls: None,
+            name: None,
         })
     }
 

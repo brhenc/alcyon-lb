@@ -94,6 +94,8 @@ pub enum TcpResAction {
 pub struct TcpResContentRule {
     pub action: TcpResAction,
     pub cond: Option<AclCondition>,
+    /// The configuration line the rule was written on, for `last_rule_line`.
+    pub line: u32,
 }
 
 /// Rule pairing a TCP-request content action with an optional condition.
@@ -101,5 +103,7 @@ pub struct TcpResContentRule {
 pub struct TcpReqContentRule {
     pub action: TcpReqContentAction,
     pub cond: Option<AclCondition>,
+    /// The configuration line the rule was written on, for `last_rule_line`.
+    pub line: u32,
 }
 

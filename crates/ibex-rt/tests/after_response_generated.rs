@@ -165,10 +165,7 @@ fn after_response_rules_run_on_every_reply_the_proxy_makes() {
     for (what, cfg, srv, status) in cases {
         let (_ibex, fe) = start(&cfg, srv.map(server));
         let resp = exchange(fe, G, Duration::from_millis(1500));
-        // Ibex closes after a `monitor-uri` reply and says so in a `Connection` header it
-        // adds after the rules have run; `HAProxy` keeps that connection. Not this test's
-        // business: the rules' header is the last one before it.
-        let last = head(&resp).rsplit("\r\n").find(|l| !l.to_ascii_lowercase().starts_with("connection:")).unwrap_or("");
+        let last = head(&resp).rsplit("\r\n").next().unwrap_or("");
         if !resp.starts_with(status) || last != "static: yes" {
             wrong.push(format!("{what}: {resp:?}"));
         }
@@ -364,5 +361,93 @@ fn the_log_line_reports_the_reply_the_rules_made() {
             }
         }
         assert_eq!(lines, [want], "{rules}");
+    }
+}
+
+/// The reason phrase of a rewritten status is `http_get_reason`'s, class name included for
+/// the codes it does not list. Measured on 3.5-dev8 with `http-after-response set-status N`
+/// on an `http-request return status 200`.
+#[test]
+fn set_status_gives_the_reason_haproxy_gives() {
+    let expected: [(u16, &str); 14] = [
+        (101, "Switching Protocols"),
+        (208, "Success"),
+        (299, "Success"),
+        (306, "Redirection"),
+        (402, "Payment Required"),
+        (408, "Request Time-out"),
+        (416, "Requested range unsatisfiable"),
+        (418, "I'm a teapot"),
+        (419, "Client Error"),
+        (499, "client has closed connection"),
+        (502, "Bad Gateway or Proxy Error"),
+        (504, "Gateway Time-out"),
+        (505, "HTTP Version not supported"),
+        (599, "Server Error"),
+    ];
+    let mut cfg = format!("{DEFAULTS}listen l\n  bind {{fe}}\n  http-request set-var(txn.s) req.hdr(x-s)\n");
+    for (s, _) in expected {
+        cfg.push_str(&format!("  http-after-response set-status {s} if {{ var(txn.s) -m str {s} }}\n"));
+    }
+    cfg.push_str("  http-request return status 200\n");
+    let (_ibex, fe) = start(&cfg, None);
+    let mut wrong = Vec::new();
+    for (s, reason) in expected {
+        let req = format!("GET / HTTP/1.1\r\nHost: x\r\nx-s: {s}\r\nConnection: close\r\n\r\n");
+        let resp = exchange(fe, &req, Duration::from_millis(1500));
+        let line = resp.split("\r\n").next().unwrap_or("");
+        if line != format!("HTTP/1.1 {s} {reason}") {
+            wrong.push(format!("{s}: {line:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "reason phrases differ from HAProxy's:\n{}", wrong.join("\n"));
+}
+
+/// The termination state of a reply the proxy made after a server error. Measured with
+/// `log-format "%HU ST=%ST ts=%ts"`:
+///
+/// ```text
+/// listen, no server                                   ST=503 ts=SC
+/// frontend + backend, no server                       ST=503 ts=SC
+/// `http-after-response` fails on the server's reply   ST=500 ts=PH
+/// ```
+#[test]
+fn the_termination_state_of_a_503_and_of_a_failed_rewrite() {
+    let big = "A".repeat(7000);
+    let fail = "  http-request set-var(txn.big) req.hdr(x)\n  \
+                http-after-response set-header h1 %[var(txn.big)] if { status 200 }\n  \
+                http-after-response set-header h2 %[var(txn.big)] if { status 200 }\n  \
+                http-after-response set-header h3 %[var(txn.big)] if { status 200 }\n  server s {srv}\n";
+    let cases = [
+        ("listen l\n  bind {fe}\n", String::new(), G.to_string(), "/ ST=503 ts=SC", None),
+        ("frontend f\n  bind {fe}\n  default_backend b\nbackend b\n", String::new(), G.to_string(), "/ ST=503 ts=SC", None),
+        (
+            "listen l\n  bind {fe}\n",
+            fail.to_string(),
+            format!("GET / HTTP/1.1\r\nHost: x\r\nx: {big}\r\n\r\n"),
+            "/ ST=500 ts=PH",
+            Some(Srv::Ok),
+        ),
+    ];
+    for (head_cfg, rules, req, want, srv) in cases {
+        let collector = UdpSocket::bind("127.0.0.1:0").expect("collector");
+        collector.set_read_timeout(Some(Duration::from_secs(3))).expect("timeout");
+        let cfg = format!(
+            "{DEFAULTS}  log {} local0\n  log-format \"%HU ST=%ST ts=%ts\"\n{head_cfg}{rules}",
+            collector.local_addr().expect("addr")
+        );
+        let (_ibex, fe) = start(&cfg, srv.map(server));
+        let _ = exchange(fe, &req, Duration::from_millis(1500));
+        let mut line = String::new();
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = collector.recv(&mut buf) {
+            let l = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let body = l.split_once("]: ").map_or("", |(_, b)| b.trim_end()).to_string();
+            if body.starts_with("/ ") {
+                line = body;
+                break;
+            }
+        }
+        assert_eq!(line, want, "{cfg}");
     }
 }

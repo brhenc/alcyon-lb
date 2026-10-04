@@ -50,6 +50,26 @@ pub fn read_counters() -> (u64, u64) {
 ///
 /// # Errors
 /// Propagates genuinely unexpected failures.
+/// Reads what is queued on `fd` without consuming it (`MSG_PEEK`). For the bytes that
+/// come before a protocol another layer owns: a PROXY header ahead of a TLS handshake
+/// is parsed from a peek, then exactly its length is taken with [`recv`], so not one
+/// byte of the ClientHello behind it is read away from rustls.
+///
+/// # Errors
+/// Socket errors other than the ones [`Io`] stands for.
+pub fn peek(fd: BorrowedFd<'_>, buf: &mut [u8]) -> io::Result<Io> {
+    if buf.is_empty() {
+        return Ok(Io::Done(0));
+    }
+    match net::recv(fd, buf, net::RecvFlags::PEEK | net::RecvFlags::DONTWAIT) {
+        Ok(0) => Ok(Io::Eof),
+        Ok(n) => Ok(Io::Done(n)),
+        Err(Errno::AGAIN | Errno::INTR) => Ok(Io::WouldBlock),
+        Err(Errno::CONNRESET | Errno::PIPE | Errno::NOTCONN | Errno::TIMEDOUT) => Ok(Io::Closed),
+        Err(e) => Err(e.into()),
+    }
+}
+
 pub fn recv(fd: BorrowedFd<'_>, buf: &mut [u8]) -> io::Result<Io> {
     if buf.is_empty() {
         return Ok(Io::Done(0));

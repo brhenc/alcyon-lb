@@ -695,6 +695,8 @@ mod tests {
             server_actconn: std::sync::Arc::new(vec![std::sync::atomic::AtomicU32::new(0)]),
             server_sess_rates: std::sync::Arc::new(vec![crate::engine::RateCtr::default()]),
             server_check_configs: vec![None],
+            server_tls: vec![None],
+            server_check_tls: vec![None],
             tcp_req_conn_rules: Vec::new(),
             tcp_req_session_rules: Vec::new(),
             tcp_req_content_rules: Vec::new(),

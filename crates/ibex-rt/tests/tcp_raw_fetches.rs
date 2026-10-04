@@ -384,12 +384,10 @@ fn payload_fetches_follow_the_direction_of_their_rule_set() {
     assert_eq!(sample("payload_lv(0,4)", &ctx), Some(Sample::Bin(b"onions".to_vec())));
     assert_eq!(sample("payload(40,6)", &ctx), None);
     let req = b"\x00\x00\x00\x05hello";
-    let ctx = SampleContext { raw_req: Some(req), req_body: Some(req), wait_pending: true, ..Default::default() };
+    let ctx = SampleContext { raw_req: Some(req), req_body: Some(req), ..Default::default() };
     assert_eq!(sample("req_len", &ctx), Some(Sample::Sint(9)));
     assert_eq!(sample("payload(4,5)", &ctx), Some(Sample::Bin(b"hello".to_vec())), "a request rule set");
     assert_eq!(sample("payload_lv(0,4)", &ctx), Some(Sample::Bin(b"hello".to_vec())));
-    assert_eq!(sample("wait_end", &ctx), None, "still waiting");
-    assert_eq!(sample("wait_end", &SampleContext::default()), Some(Sample::Bool(true)));
     // The ACL forms of `req.ssl_ver`: dotted, ranged, with operators.
     let hello = client_hello();
     let ctx = SampleContext { raw_req: Some(&hello), req_body: Some(&hello), ..Default::default() };

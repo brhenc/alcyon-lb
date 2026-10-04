@@ -49,6 +49,9 @@ pub struct StreamLog {
     pub res_captures: Vec<Option<Vec<u8>>>,
     /// `unique-id-format`'s value for this stream.
     pub unique_id: Option<String>,
+    /// The configuration line of the last rule that ended a rule set for this request
+    /// (`s->last_rule_line`), for `last_rule_file` and `last_rule_line`.
+    pub last_rule: Option<u32>,
     /// `%rt`.
     pub uniq_id: u64,
     /// The termination state, when the proxy itself ended the stream: `PR` for a denied
@@ -79,6 +82,7 @@ impl StreamLog {
             req_captures: Vec::new(),
             res_captures: Vec::new(),
             unique_id: None,
+            last_rule: None,
             uniq_id: STREAM_COUNTER.fetch_add(1, Ordering::Relaxed),
             term: None,
             status: None,

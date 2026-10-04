@@ -41,6 +41,9 @@ pub struct DefaultsSection {
     /// `unique-id-header`: the request header the unique ID is sent to the server in.
     pub unique_id_header: Option<String>,
     pub log_health_checks: bool,
+    /// `option http-buffer-request`: wait for the request body before the rules run (as
+    /// an implicit `http-request wait-for-body` ahead of them).
+    pub buffer_request: bool,
     /// `option forwardfor` in `defaults`: the `except` network, empty for none.
     pub forwardfor: Option<String>,
     /// `option originalto` in `defaults`: the `except` network, empty for none.
@@ -137,6 +140,8 @@ pub struct BindConfig {
     pub proto: Option<String>,
     pub accept_proxy: bool,
     pub accept_proxy_v2: bool,
+    /// `name <n>`: what `so_name` reads on connections this bind accepted.
+    pub name: Option<String>,
 }
 
 /// A `listen` proxy section combining frontend and backend.
@@ -196,6 +201,9 @@ pub struct ListenSection {
     /// `capture response header`, in declaration order.
     pub res_header_captures: Vec<HeaderCapture>,
     pub log_health_checks: bool,
+    /// `option http-buffer-request`: wait for the request body before the rules run (as
+    /// an implicit `http-request wait-for-body` ahead of them).
+    pub buffer_request: bool,
     /// Client header regex rewrite rules (up to 10).
     pub cliexp: Vec<HeaderExp>,
     /// Server header regex rewrite rules (up to 10).
@@ -324,6 +332,7 @@ impl Default for ListenSection {
             req_header_captures: Vec::new(),
             res_header_captures: Vec::new(),
             log_health_checks: false,
+            buffer_request: false,
             cliexp: Vec::new(),
             srvexp: Vec::new(),
             acls: Vec::new(),
@@ -414,6 +423,9 @@ pub struct FrontendSection {
     /// `capture response header`, in declaration order.
     pub res_header_captures: Vec<HeaderCapture>,
     pub log_health_checks: bool,
+    /// `option http-buffer-request`: wait for the request body before the rules run (as
+    /// an implicit `http-request wait-for-body` ahead of them).
+    pub buffer_request: bool,
     /// Stick table configuration.
     pub stick_table: Option<StickTableConfigAst>,
     /// Stick rules.
@@ -475,6 +487,7 @@ impl Default for FrontendSection {
             req_header_captures: Vec::new(),
             res_header_captures: Vec::new(),
             log_health_checks: false,
+            buffer_request: false,
             stick_table: None,
             stick_rules: Vec::new(),
             tcp_req_inspect_delay: None,
@@ -514,6 +527,9 @@ pub struct BackendSection {
     /// `unique-id-header`: the request header the unique ID is sent to the server in.
     pub unique_id_header: Option<String>,
     pub log_health_checks: bool,
+    /// `option http-buffer-request`: wait for the request body before the rules run (as
+    /// an implicit `http-request wait-for-body` ahead of them).
+    pub buffer_request: bool,
     /// Operating mode (tcp, http, health).
     pub mode: Mode,
     /// Whether this backend is disabled.
@@ -605,6 +621,7 @@ impl Default for BackendSection {
             unique_id_format: None,
             unique_id_header: None,
             log_health_checks: false,
+            buffer_request: false,
             mode: Mode::Tcp,
             disabled: false,
             balance: BalanceAlgorithm::RoundRobin,
