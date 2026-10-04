@@ -22,7 +22,7 @@ pub use cast::{can_cast, cast};
 pub use expr::Expr;
 pub use matcher::{IntOp, IntRange, Matcher};
 pub use registry::{
-    get_proc_var, not_implemented, not_implemented_message, sample_registry, set_proc_var, ConvDesc,
+    check_converter_args, get_proc_var, not_implemented, not_implemented_message, sample_registry, set_proc_var, ConvDesc,
     ConvFn, CtxConvDesc, CtxConvFn, FetchDesc, FetchFn, FrontendCounter, ProxyState, Registry,
     ServerState, SampleContext, StickData, StickState, CURRENT_VARS, GLOBAL_PROC_VARS, SAMPLE_REGISTRY,
 };

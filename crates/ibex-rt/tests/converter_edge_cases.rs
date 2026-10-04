@@ -319,6 +319,58 @@ hdr x-hi \"%[int(200),map_int({m})]\" hdr x-out \"[%[int(201),map_int({m})]]\" h
     );
 }
 
+/// `reg-tests/converter/has_ctl.vtc`: the default, `any`, `http` and numeric masks.
+#[test]
+fn has_ctl_default_any_http_and_mask() {
+    let rules = "  http-request set-var(txn.in) req.hdr(data),b64dec\n\
+  http-request return status 200 hdr x-def \"%[var(txn.in),has_ctl]\" hdr x-empty \"%[var(txn.in),has_ctl()]\" \
+hdr x-any \"%[var(txn.in),has_ctl(any)]\" hdr x-http \"%[var(txn.in),has_ctl(http)]\" hdr x-mask \"%[var(txn.in),has_ctl(0x200)]\"\n";
+    // (base64 input, def, empty, any, http, mask)
+    let cases = [
+        ("aGVsbG8gd29ybGQ=", "0", "0", "0", "0", "0"), // "hello world"
+        ("YQli", "0", "0", "1", "0", "1"),             // a<tab>b
+        ("YQ1i", "1", "1", "1", "1", "0"),             // a<cr>b
+        ("YQpi", "1", "1", "1", "1", "0"),             // a<lf>b
+        ("YQBi", "1", "1", "1", "1", "0"),             // a<nul>b
+        ("YQFi", "1", "1", "1", "0", "0"),             // a<soh>b
+        ("YRti", "1", "1", "1", "0", "0"),             // a<esc>b
+        ("YX9i", "1", "1", "1", "0", "0"),             // a<del>b
+    ];
+    let reqs: Vec<String> = cases
+        .iter()
+        .map(|c| format!("GET / HTTP/1.1\r\nHost: x\r\nData: {}\r\nConnection: close\r\n\r\n", c.0))
+        .collect();
+    let reqs: Vec<&str> = reqs.iter().map(String::as_str).collect();
+    let want: Vec<Vec<String>> = cases
+        .iter()
+        .map(|c| {
+            ["def", "empty", "any", "http", "mask"]
+                .iter()
+                .zip([c.1, c.2, c.3, c.4, c.5])
+                .map(|(n, v)| format!("x-{n}: {v}"))
+                .collect()
+        })
+        .collect();
+    assert_eq!(run(rules, &reqs), want);
+}
+
+/// A non-numeric, non-keyword argument and a mask above 33 bits are refused at load.
+#[test]
+fn has_ctl_refuses_bad_arguments() {
+    for (arg, ok) in [("any", true), ("0x1ffffffff", true), ("bogus", false), ("0x400000000", false)] {
+        let cfg = format!(
+            "defaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n\
+             frontend fe\n  bind {}\n  http-request set-var(txn.ctl) req.hdr(data),has_ctl({arg})\n",
+            common::reserve_addr()
+        );
+        let loaded = match ibex_config::parse_str(&cfg) {
+            Err(_) => false,
+            Ok(c) => Engine::new(&c, 64).is_ok(),
+        };
+        assert_eq!(loaded, ok, "has_ctl({arg})");
+    }
+}
+
 #[test]
 fn set_var_with_a_failing_converter_leaves_the_variable_alone() {
     let rules = "  http-request set-var(txn.a) str(one)\n\

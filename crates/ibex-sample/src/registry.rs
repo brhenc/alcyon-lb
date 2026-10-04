@@ -2953,11 +2953,14 @@ impl Registry {
             name: "has_ctl",
             in_type: TypeSpec::Exact(SampleType::Bin),
             out_type: TypeSpec::Exact(SampleType::Bool),
-            func: |smp, _args| match smp {
+            func: |smp, args| match smp {
                 Sample::Bin(b) => {
-                    let has = b
-                        .iter()
-                        .any(|&c| c < 32 && c != b'\t' && c != b'\r' && c != b'\n');
+                    let mask = has_ctl_mask(args.first().map_or("", String::as_str))?;
+                    let has = b.iter().any(|&c| match c {
+                        0..=31 => mask >> c & 1 != 0,
+                        127 => mask >> 32 & 1 != 0,
+                        _ => false,
+                    });
                     Some(Sample::Bool(has))
                 }
                 _ => None,
@@ -4842,6 +4845,37 @@ fn url_decode(s: &str, mut in_form: bool) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&res).to_string()
+}
+
+/// The characters `has_ctl` looks for, as a mask: bit `n` is the character `n` (0-31), bit 32 is
+/// DEL. No argument or an empty one is every control character but tab; `any` is all of them,
+/// `http` only NUL, LF and CR; otherwise a number of at most 33 bits (`sample_conv_has_ctl`).
+pub fn has_ctl_mask(arg: &str) -> Option<u64> {
+    const ALL: u64 = 0x1_FFFF_FFFF;
+    match arg {
+        "" => Some(ALL & !(1 << 9)),
+        "any" => Some(ALL),
+        "http" => Some(1 | 1 << 10 | 1 << 13),
+        n => {
+            let v = match n.strip_prefix("0x").or_else(|| n.strip_prefix("0X")) {
+                Some(h) => u64::from_str_radix(h, 16).ok()?,
+                None => n.parse::<u64>().ok()?,
+            };
+            (v <= ALL).then_some(v)
+        }
+    }
+}
+
+/// Load-time check of a converter's arguments, where `HAProxy` refuses some
+/// (`invalid args in converter '<name>'`). `None` when they are acceptable.
+#[must_use]
+pub fn check_converter_args(name: &str, args: &[String]) -> Option<String> {
+    match name {
+        "has_ctl" if has_ctl_mask(args.first().map_or("", String::as_str)).is_none() => {
+            Some("invalid args in converter 'has_ctl' : expects 'any', 'http' or a mask of at most 33 bits".to_string())
+        }
+        _ => None,
+    }
 }
 
 fn url_encode(s: &str) -> String {
