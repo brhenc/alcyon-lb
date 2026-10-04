@@ -154,6 +154,10 @@ pub struct BindConfig {
     /// `id <n>`: the listener's explicit numeric id, what `so_id` reads. `None` takes the
     /// next free one in the proxy.
     pub id: Option<u32>,
+    /// `ssl-min-ver`, also `force-tlsvN` / `no-tlsvN`, and `ssl-default-bind-options` where the line says nothing.
+    pub min_ver: Option<TlsVersion>,
+    /// `ssl-max-ver`, likewise.
+    pub max_ver: Option<TlsVersion>,
 }
 
 /// A `listen` proxy section combining frontend and backend.

@@ -28,6 +28,8 @@ fn default_bind() -> BindConfig {
         accept_proxy_v2: false,
         name: None,
         id: None,
+        min_ver: None,
+        max_ver: None,
     }
 }
 
@@ -275,6 +277,8 @@ mod alpn {
             accept_proxy_v2: false,
             name: None,
             id: None,
+            min_ver: None,
+            max_ver: None,
         }
     }
 
@@ -317,5 +321,63 @@ mod alpn {
         let bind = bind_with(vec!["spdy/3".to_string()], crt);
         let err = TlsConfig::from_bind_config(&bind).expect_err("must refuse");
         assert!(err.contains("ALPN"), "{err}");
+    }
+}
+
+/// The version bounds of a bind (T153): what the configuration parser has already checked
+/// is checked again where the handshake configuration is built.
+mod versions {
+    use ibex_config::ast::BindConfig;
+    use ibex_config::TlsVersion;
+    use ibex_tls::TlsConfig;
+
+    fn bind(quic: bool, min: Option<TlsVersion>, max: Option<TlsVersion>) -> (tempfile::TempDir, BindConfig) {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("c.pem");
+        std::fs::write(&path, super::common::generate_test_cert_bundle_pem(vec!["localhost".to_string()])).expect("write");
+        let b = BindConfig {
+            addr: "127.0.0.1:8443".parse().expect("addr"),
+            quic,
+            ssl: true,
+            crt: vec![path.to_string_lossy().to_string()],
+            alpn: vec!["http/1.1".to_string()],
+            proto: None,
+            accept_proxy: false,
+            accept_proxy_v2: false,
+            name: None,
+            id: None,
+            min_ver: min,
+            max_ver: max,
+        };
+        (dir, b)
+    }
+
+    #[test]
+    fn a_range_with_no_version_in_it_is_refused() {
+        let (_d, b) = bind(false, Some(TlsVersion::Tls13), Some(TlsVersion::Tls12));
+        let err = TlsConfig::from_bind_config(&b).expect_err("nothing left");
+        assert!(err.contains("all SSL/TLS versions are disabled for bind '127.0.0.1:8443'"), "{err}");
+    }
+
+    #[test]
+    fn a_quic_bind_cannot_be_held_to_tls12() {
+        let (_d, b) = bind(true, None, Some(TlsVersion::Tls12));
+        let err = TlsConfig::from_bind_config(&b).expect_err("QUIC is TLS 1.3");
+        assert!(err.contains("QUIC needs TLS 1.3"), "{err}");
+        // With no bound, or a bound that leaves 1.3, it builds (and offers 1.3 only).
+        for (min, max) in [(None, None), (Some(TlsVersion::Tls12), None)] {
+            let (_d, b) = bind(true, min, max);
+            TlsConfig::from_bind_config(&b).expect("builds");
+        }
+    }
+
+    #[test]
+    fn version_ranges_narrow_what_rustls_speaks() {
+        use rustls::ProtocolVersion::{TLSv1_2, TLSv1_3};
+        let names = |min, max| ibex_tls::versions_between(min, max).iter().map(|v| v.version).collect::<Vec<_>>();
+        assert_eq!(names(None, None), vec![TLSv1_3, TLSv1_2]);
+        assert_eq!(names(Some(TlsVersion::Tls13), None), vec![TLSv1_3]);
+        assert_eq!(names(None, Some(TlsVersion::Tls12)), vec![TLSv1_2]);
+        assert!(names(Some(TlsVersion::Tls13), Some(TlsVersion::Tls12)).is_empty());
     }
 }

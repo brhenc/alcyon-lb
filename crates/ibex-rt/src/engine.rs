@@ -1691,6 +1691,8 @@ fn frontend_binds(frontend: &ibex_config::FrontendSection) -> Vec<ibex_config::a
                 accept_proxy_v2: frontend.accept_proxy_v2,
                 name: None,
                 id: None,
+                min_ver: None,
+                max_ver: None,
             });
         }
     }
@@ -2417,6 +2419,8 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     accept_proxy_v2: listen.accept_proxy_v2,
                     name: None,
                     id: None,
+                    min_ver: None,
+                    max_ver: None,
                 }]
             } else {
                 listen.binds.clone()

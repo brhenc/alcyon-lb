@@ -46,6 +46,28 @@ pub enum TlsVersion {
     Tls13,
 }
 
+/// The bounds a line puts on the TLS version, `None` being "nothing said": the global
+/// `ssl-default-bind-options` / `ssl-default-server-options` fill those in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TlsRange {
+    pub min: Option<TlsVersion>,
+    pub max: Option<TlsVersion>,
+}
+
+impl TlsRange {
+    /// Whether no version is left between the bounds.
+    #[must_use]
+    pub fn is_empty(self) -> bool {
+        matches!((self.min, self.max), (Some(lo), Some(hi)) if lo > hi)
+    }
+
+    /// This range, with what it leaves open taken from `defaults`.
+    #[must_use]
+    pub fn or(self, defaults: TlsRange) -> TlsRange {
+        TlsRange { min: self.min.or(defaults.min), max: self.max.or(defaults.max) }
+    }
+}
+
 /// The TLS settings of a `server` line (`src/cfgparse-ssl.c`), for the data path and
 /// for the health checks. Everything here is accepted without `ssl` too, as `HAProxy`
 /// does: it applies once `ssl` (data path) or `check-ssl` (checks) turns TLS on.

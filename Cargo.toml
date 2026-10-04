@@ -57,7 +57,7 @@ ibex-regex = { path = "crates/ibex-regex" }
 
 
 # TLS & Cryptography
-rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 tokio-rustls = "0.26"
 
 # CLI & Logging

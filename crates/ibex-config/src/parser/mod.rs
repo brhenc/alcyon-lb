@@ -115,6 +115,7 @@ pub(crate) mod server;
 pub(crate) use server::*;
 pub(crate) mod ring;
 pub(crate) mod bind_keywords;
+pub(crate) mod tls_versions;
 pub(crate) mod server_keywords;
 pub(crate) use server_keywords::*;
 pub(crate) mod rules_tcp;
@@ -496,6 +497,9 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
         apply_ssl_bases(g, &mut listens, &mut frontends, &mut backends);
     }
     apply_ssl_server_verify(global.as_ref().and_then(|g| g.ssl_server_verify), &mut listens, &mut backends)?;
+    if let Some(g) = global.as_ref() {
+        apply_ssl_default_versions(g, &mut listens, &mut frontends, &mut backends)?;
+    }
 
     stick::allocate_server_id(&mut listens, &mut frontends, &mut backends);
     validate_config(global.as_ref(), &listens, &frontends, &backends)?;
@@ -618,6 +622,39 @@ fn apply_ssl_server_verify(
                 ssl.verify = Some(SslVerify::None);
             }
         }
+    }
+    Ok(())
+}
+
+/// Global `ssl-default-bind-options` / `ssl-default-server-options`: the TLS version bounds
+/// a `bind` or a `server` line that names none gets, one bound at a time (a line's own
+/// `ssl-min-ver` wins, the default's `ssl-max-ver` still applies). Done once the whole file
+/// is read, because the keyword may come after the lines.
+///
+/// # Errors
+/// A `bind` whose bounds, once the defaults are in, leave no version: `HAProxy`'s alert.
+fn apply_ssl_default_versions(
+    global: &GlobalSection,
+    listens: &mut [ListenSection],
+    frontends: &mut [FrontendSection],
+    backends: &mut [BackendSection],
+) -> Result<(), ConfigError> {
+    let default = global.ssl_default_bind_versions;
+    let binds = listens.iter_mut().flat_map(|l| l.binds.iter_mut()).chain(frontends.iter_mut().flat_map(|f| f.binds.iter_mut()));
+    for bind in binds.filter(|b| b.ssl) {
+        let range = crate::ast::TlsRange { min: bind.min_ver, max: bind.max_ver }.or(default);
+        if range.is_empty() {
+            return Err(ConfigError::new(1, 1, format!("all SSL/TLS versions are disabled for bind '{}'.", bind.addr)));
+        }
+        bind.min_ver = range.min;
+        bind.max_ver = range.max;
+    }
+    let default = global.ssl_default_server_versions;
+    let servers = listens.iter_mut().flat_map(|l| l.servers.iter_mut()).chain(backends.iter_mut().flat_map(|b| b.servers.iter_mut()));
+    for ssl in servers.filter_map(|s| s.ssl.as_mut()) {
+        let range = crate::ast::TlsRange { min: ssl.min_ver, max: ssl.max_ver }.or(default);
+        ssl.min_ver = range.min;
+        ssl.max_ver = range.max;
     }
     Ok(())
 }

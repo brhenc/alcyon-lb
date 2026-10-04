@@ -762,6 +762,8 @@ pub(crate) fn parse_bind(tokens: &[Token], kw: &Token, section: &str) -> Result<
         accept_proxy_v2: false,
         name: None,
         id: None,
+        min_ver: None,
+        max_ver: None,
     };
     let prefix = format!("'bind {}' in section '{section}'", tokens[1].text);
     let arg = |i: usize, what: &str| -> Result<&Token, ConfigError> {
@@ -770,8 +772,13 @@ pub(crate) fn parse_bind(tokens: &[Token], kw: &Token, section: &str) -> Result<
         })
     };
 
+    let mut versions = super::tls_versions::TlsRange::default();
     let mut i = 2;
     while i < tokens.len() {
+        if let Some(last) = super::tls_versions::version_keyword(&mut versions, tokens, i, &prefix)? {
+            i = last + 1;
+            continue;
+        }
         match tokens[i].text.as_str() {
             "ssl" => bind.ssl = true,
             "crt" => {
@@ -815,6 +822,11 @@ pub(crate) fn parse_bind(tokens: &[Token], kw: &Token, section: &str) -> Result<
         }
         i += 1;
     }
+    if versions.is_empty() {
+        return Err(ConfigError::new(kw.line, kw.col, format!("all SSL/TLS versions are disabled for bind '{}'.", tokens[1].text)));
+    }
+    bind.min_ver = versions.min;
+    bind.max_ver = versions.max;
     Ok(bind)
 }
 
