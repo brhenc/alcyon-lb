@@ -1783,17 +1783,6 @@ pub fn apply_del_header(hdr_str: &str, name: &str) -> String {
 }
 
 #[must_use]
-pub fn update_http_response_status(raw: &str, status: u16) -> String {
-    let Some((first_line, rest)) = raw.split_once("\r\n") else {
-        return raw.to_string();
-    };
-    let version = first_line.split_whitespace().next().unwrap_or("HTTP/1.1");
-    let reason = ibex_proto::status_reason_phrase(status);
-    let new_first_line = format!("{version} {status} {reason}");
-    format!("{new_first_line}\r\n{rest}")
-}
-
-#[must_use]
 pub fn eval_acl_term<S: ::std::hash::BuildHasher>(
     term: &ibex_config::AclTerm,
     acls: &HashMap<String, Expr, S>,
