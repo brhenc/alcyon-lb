@@ -555,12 +555,18 @@ fn check_shapes_over_tls() {
     let plain = serve(None);
     let silent = serve_silent();
     let fronts: Vec<SocketAddr> = (0..4).map(|_| common::reserve_addr()).collect();
+    // The check results, as `option log-health-checks` reports them (HAProxy's words,
+    // measured: "Layer6 check passed", "Layer6 invalid response, info: \"SSL handshake
+    // failure\"", "Layer6 timeout").
+    let syslog = std::net::UdpSocket::bind("127.0.0.1:0").expect("udp");
+    syslog.set_read_timeout(Some(Duration::from_millis(200))).ok();
+    let log = format!("  log 127.0.0.1:{} local0\n  option log-health-checks\n", syslog.local_addr().unwrap().port());
     let chk = "inter 100ms fall 1 rise 1";
     let cfg = config(&[
-        (fronts[0], &format!("  server s {} ssl verify none check {chk}", srv.addr)),
+        (fronts[0], &format!("{log}  server s {} ssl verify none check {chk}", srv.addr)),
         (fronts[1], &format!("  option tcp-check\n  tcp-check connect\n  tcp-check send \"GET / HTTP/1.1\\r\\nHost: tc.example\\r\\n\\r\\n\"\n  tcp-check expect string 200\n  server s {} ssl verify none check {chk}", srv2.addr)),
-        (fronts[2], &format!("  option httpchk GET /\n  server s {} ssl verify none check {chk}", plain.addr)),
-        (fronts[3], &format!("  timeout check 150ms\n  server s {} ssl verify none check {chk}", silent)),
+        (fronts[2], &format!("{log}  option httpchk GET /\n  server s {} ssl verify none check {chk}", plain.addr)),
+        (fronts[3], &format!("{log}  timeout check 150ms\n  server s {} ssl verify none check {chk}", silent)),
     ]);
     let _ibex = start(&p.dir, &cfg, &fronts);
 
@@ -570,6 +576,27 @@ fn check_shapes_over_tls() {
     assert_eq!(get(fronts[1], "www.test1.com").0, 200, "the tcp-check script passed over TLS");
     assert!(wait_for(Duration::from_secs(3), || get(fronts[2], "x").0 == 503), "an http check over TLS against plaintext takes the server DOWN");
     assert!(wait_for(Duration::from_secs(3), || get(fronts[3], "x").0 == 503), "a handshake that never completes times out and takes the server DOWN");
+
+    // The reasons, from the log lines.
+    let mut lines = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let mut buf = [0u8; 2048];
+    let want = |lines: &[String]| {
+        ["Layer6 invalid response, info: \"SSL handshake failure\"", "Layer6 timeout"]
+            .iter()
+            .all(|w| lines.iter().any(|l| l.contains(w)))
+    };
+    while Instant::now() < deadline && !want(&lines) {
+        if let Ok((n, _)) = syslog.recv_from(&mut buf) {
+            lines.push(String::from_utf8_lossy(&buf[..n]).into_owned());
+        }
+    }
+    assert!(want(&lines), "the check reasons must be HAProxy's:\n{}", lines.join("\n"));
+    assert!(
+        !lines.iter().any(|l| l.contains("b0/s") && l.contains("DOWN")),
+        "the connect check over TLS must not take its server down:\n{}",
+        lines.join("\n")
+    );
 }
 
 /// `send-proxy-v2` with `ssl`: the PROXY header goes on the wire in plaintext before the
