@@ -1038,7 +1038,7 @@ pub(crate) fn register_section_checks(
             ResolvedCheckConfig::TcpSteps(steps)
         } else if httpchk.is_some() {
             let chk = build_resolved_http_check(httpchk, http_checks, server);
-            ResolvedCheckConfig::Http(chk)
+            ResolvedCheckConfig::Http(Box::new(chk))
         } else {
             ResolvedCheckConfig::TcpConnect
         };

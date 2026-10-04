@@ -1824,7 +1824,7 @@ fn init_proxy_from_backend(proxy_idx: usize, be: &ibex_config::BackendSection, n
 }
 
 fn init_checks(proxies: &[Proxy], scheduler: &mut Scheduler, now: Tick) -> Vec<ServerCheckState> {
-    let mut checks = Vec::new();
+    let mut checks = Vec::with_capacity(proxies.iter().map(|p| p.server_check_configs.iter().flatten().count()).sum());
     for (proxy_idx, proxy) in proxies.iter().enumerate() {
         for (server_idx, &srv_addr) in proxy.servers.iter().enumerate() {
             let Some(check_cfg) = proxy

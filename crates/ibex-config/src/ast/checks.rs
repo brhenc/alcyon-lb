@@ -157,7 +157,7 @@ pub enum ProtoCheckConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolvedCheckConfig {
     TcpConnect,
-    Http(ResolvedHttpCheck),
+    Http(Box<ResolvedHttpCheck>),
     TcpSteps(Vec<ResolvedTcpStep>),
     Redis,
     Smtp(Option<String>),

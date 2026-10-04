@@ -33,3 +33,9 @@ fn per_server_check_config_is_boxed() {
         "the per-server check config must stay one pointer"
     );
 }
+
+#[test]
+fn server_check_state_stays_small() {
+    let n = size_of::<ibex_rt::check::ServerCheckState>();
+    assert!(n <= 456, "ServerCheckState grew to {n} bytes (bound 456): one is held per checked server, box the new field");
+}

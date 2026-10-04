@@ -191,7 +191,7 @@ pub struct ServerCheckState {
     pub resolved_config: Option<ResolvedCheckConfig>,
     pub sub_state: CheckSubState,
     /// The `http-check send` log-formats, compiled once from `resolved_config`.
-    pub http_send: Option<HttpSendFormats>,
+    pub http_send: Option<Box<HttpSendFormats>>,
     /// The check's variables (`http-check set-var`, scope `check`), for the run in progress.
     pub vars: HashMap<String, String>,
     pub check_duration_ms: u32,
@@ -235,7 +235,7 @@ impl ServerCheckState {
     ) -> Self {
         let config_rise = config.rise;
         let resolved_config = get_resolved_check_config(proxy_idx, server_idx, addr);
-        let http_send = HttpSendFormats::for_config(resolved_config.as_ref());
+        let http_send = HttpSendFormats::for_config(resolved_config.as_ref()).map(Box::new);
         ServerCheckState {
             proxy_idx,
             server_idx,
@@ -1029,7 +1029,7 @@ pub fn step_check(
 
     if check.resolved_config.is_none() {
         check.resolved_config = get_resolved_check_config(check.proxy_idx, check.server_idx, check.addr);
-        check.http_send = HttpSendFormats::for_config(check.resolved_config.as_ref());
+        check.http_send = HttpSendFormats::for_config(check.resolved_config.as_ref()).map(Box::new);
     }
 
     if check.in_progress {
