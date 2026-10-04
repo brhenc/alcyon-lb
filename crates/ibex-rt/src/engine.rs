@@ -595,6 +595,35 @@ impl ProxyIdInfo {
     }
 }
 
+/// The proxies, built once by [`Engine::build_shared_state`] and shared by every worker,
+/// as `HAProxy`'s threads share one `struct proxy` (T160). Each worker used to hold a clone
+/// of every `Proxy`, about 14 KB per backend per worker.
+///
+/// What the workers change at run time is behind the `Arc`s and atomics inside each
+/// `Proxy`; nothing on the data path takes it mutably. [`Proxies::make_mut`] is for the rare
+/// writer (a CLI command, a test): it gives this worker its own copy, as before T160.
+#[derive(Debug, Clone, Default)]
+pub struct Proxies(Arc<Vec<Proxy>>);
+
+impl Proxies {
+    #[must_use]
+    pub fn new(proxies: Vec<Proxy>) -> Self {
+        Self(Arc::new(proxies))
+    }
+
+    /// The proxies, mutably: copied for this worker first if another one shares them.
+    pub fn make_mut(&mut self) -> &mut Vec<Proxy> {
+        Arc::make_mut(&mut self.0)
+    }
+}
+
+impl std::ops::Deref for Proxies {
+    type Target = [Proxy];
+    fn deref(&self) -> &[Proxy] {
+        &self.0
+    }
+}
+
 /// A configured proxy instance.
 #[derive(Debug, Clone)]
 // More than three bools, and they are genuinely independent switches rather than a state
@@ -621,9 +650,6 @@ pub struct Proxy {
     pub redisp: bool,
     /// `option redispatch <interval>` (`redispatch_after`), see [`crate::lb::redispatch_due`].
     pub redisp_after: i32,
-    /// A server the next selection steers away from (the one a retry just left); set only
-    /// around that selection.
-    pub avoid_idx: Option<usize>,
     pub maxconn: u32,
     pub dispatch: Option<SocketAddr>,
     /// The `cookie` line (`ck_opts`, `cookie_*`): persistence by a cookie. Only a backend
@@ -646,6 +672,11 @@ pub struct Proxy {
     /// change (all but the odd one) pays nothing for it: `None` means they are the current ones.
     pub server_iweights: Option<Box<Vec<u32>>>,
     pub next_server_idx: Arc<AtomicUsize>,
+    /// The proxy's counters: one set, which every worker counts into, as `HAProxy`'s
+    /// threads count into their thread group's (`fe_counters_shared.tg[]`; one group by
+    /// default). Read with [`Proxy::counters`]. One set per worker cost 152 bytes per
+    /// proxy per thread, 23 MB for 10,000 backends at `nbthread 16` (T160). A `Vec`, and
+    /// summed by its readers, so thread groups can slot in.
     pub stats: Arc<Vec<ProxyStats>>,
     pub stats_config: ibex_config::StatsConfig,
     pub default_backend: Option<String>,
@@ -742,6 +773,13 @@ pub struct Proxy {
 }
 
 impl Proxy {
+    /// The counters this worker counts into (see [`Proxy::stats`]).
+    #[inline]
+    #[must_use]
+    pub fn counters(&self) -> &ProxyStats {
+        &self.stats[0]
+    }
+
     /// `srv_check_health` of the server at `idx` while no check runs on it.
     #[must_use]
     pub fn server_init_health(&self, idx: usize) -> u32 {
@@ -769,7 +807,7 @@ impl Proxy {
     #[must_use]
     pub fn eligible_server_indices(&self) -> Vec<usize> {
         let is_server_available = |idx: usize| -> bool {
-            if idx >= self.servers.len() || self.avoid_idx == Some(idx) {
+            if idx >= self.servers.len() || crate::lb::avoided(self, idx) {
                 return false;
             }
             if let Some(status) = self.server_statuses.get(idx) {
@@ -811,7 +849,7 @@ impl Proxy {
     /// preferring primary servers over backup servers,
     /// or falls back to the dispatch address if all servers are down or absent.
     #[must_use]
-    pub fn select_server(&mut self) -> Option<SocketAddr> {
+    pub fn select_server(&self) -> Option<SocketAddr> {
         if self.servers.is_empty() {
             return self.dispatch;
         }
@@ -865,7 +903,7 @@ impl Proxy {
     /// Selects the target backend server with load balancing algorithm (Source IP hash or round-robin),
     /// respecting backup failover and connection limits.
     #[must_use]
-    pub fn select_server_with_key(&mut self, source_ip: Option<IpAddr>, uri: Option<&str>) -> Option<SocketAddr> {
+    pub fn select_server_with_key(&self, source_ip: Option<IpAddr>, uri: Option<&str>) -> Option<SocketAddr> {
         if self.servers.is_empty() {
             return self.dispatch;
         }
@@ -1017,7 +1055,9 @@ pub struct Engine {
     pub listeners: Vec<Listener>,
     /// QUIC listeners, driven by the engine like any other readiness source.
     pub quic_listeners: Vec<crate::quic_listener::QuicListener>,
-    pub proxies: Vec<Proxy>,
+    /// Every proxy, shared by the workers (T160): read through it, and mutate only with
+    /// [`Proxies::make_mut`], which copies them for this worker alone.
+    pub proxies: Proxies,
     pub checks: Vec<ServerCheckState>,
     pub sessions: SessionArena,
     pub applets: AppletArena,
@@ -1675,8 +1715,7 @@ fn resolve_log_targets(config: &Config, proxies: &mut [Proxy]) -> Vec<SyslogTarg
         }
         resolved.sort_unstable();
         resolved.dedup();
-        // Kept when already there: each worker resolves again (the targets own sockets
-        // and are per engine), and the cursors must stay the ones the workers share.
+        // Kept when already there, so the cursors stay the ones every user shares.
         if proxy.log_cursors.len() != resolved.len() {
             proxy.log_cursors = Arc::new(resolved.iter().map(|_| AtomicU64::new(0)).collect());
         }
@@ -1859,7 +1898,7 @@ fn server_forced_ids(count: usize, extras: &ibex_config::ast::ServerExtras) -> V
     forced
 }
 
-fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, listen: &ibex_config::ListenSection, nbthread: usize) -> Proxy {
+fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, listen: &ibex_config::ListenSection) -> Proxy {
     let mut http_req_rules = listen.http_req_rules.clone();
     with_buffered_request(&mut http_req_rules, listen.buffer_request);
     let req_capture_slots = capture_slots(&listen.req_header_captures, &mut http_req_rules);
@@ -1937,7 +1976,6 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, list
         retries,
         redisp: listen.redisp,
         redisp_after: listen.redisp_after,
-        avoid_idx: None,
         maxconn: listen.maxconn,
         dispatch: listen.dispatch,
         cookie: listen.cookie.clone(),
@@ -1955,7 +1993,7 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, list
             .collect(),
         server_iweights: None,
         next_server_idx: Arc::new(AtomicUsize::new(0)),
-        stats: Arc::new((0..nbthread).map(|_| ProxyStats::default()).collect()),
+        stats: Arc::new(vec![ProxyStats::default()]),
         stats_config: {
             let mut sc = listen.stats.clone();
             sc.raw_timeouts = listen.timeouts;
@@ -2016,7 +2054,7 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, list
     }
 }
 
-fn init_proxy_from_frontend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, fe: &ibex_config::FrontendSection, nbthread: usize) -> Proxy {
+fn init_proxy_from_frontend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, fe: &ibex_config::FrontendSection) -> Proxy {
     let mut http_req_rules = fe.http_req_rules.clone();
     with_buffered_request(&mut http_req_rules, fe.buffer_request);
     let req_capture_slots = capture_slots(&fe.req_header_captures, &mut http_req_rules);
@@ -2062,7 +2100,6 @@ fn init_proxy_from_frontend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, fe
         retries: 3,
         redisp: false,
         redisp_after: -1,
-        avoid_idx: None,
         maxconn: fe.maxconn,
         dispatch: None,
         cookie: None,
@@ -2076,7 +2113,7 @@ fn init_proxy_from_frontend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, fe
         server_weights: Vec::new(),
         server_iweights: None,
         next_server_idx: Arc::new(AtomicUsize::new(0)),
-        stats: Arc::new((0..nbthread).map(|_| ProxyStats::default()).collect()),
+        stats: Arc::new(vec![ProxyStats::default()]),
         stats_config: {
             let mut sc = fe.stats.clone();
             sc.raw_timeouts = fe.timeouts;
@@ -2136,7 +2173,7 @@ fn init_proxy_from_frontend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, fe
     }
 }
 
-fn init_proxy_from_backend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, be: &ibex_config::BackendSection, nbthread: usize) -> Proxy {
+fn init_proxy_from_backend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, be: &ibex_config::BackendSection) -> Proxy {
     let mut http_req_rules = be.http_req_rules.clone();
     with_buffered_request(&mut http_req_rules, be.buffer_request);
     let timeouts = section_timeouts(&be.timeouts, None, be.srvtimeout, be.contimeout);
@@ -2207,7 +2244,6 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, be:
         retries,
         redisp: be.redisp,
         redisp_after: be.redisp_after,
-        avoid_idx: None,
         maxconn: 2000,
         dispatch: be.dispatch,
         cookie: be.cookie.clone(),
@@ -2221,7 +2257,7 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, be:
         server_weights: be.servers.iter().map(|s| s.weight.unwrap_or(1)).collect(),
         server_iweights: None,
         next_server_idx: Arc::new(AtomicUsize::new(0)),
-        stats: Arc::new((0..nbthread).map(|_| ProxyStats::default()).collect()),
+        stats: Arc::new(vec![ProxyStats::default()]),
         stats_config: {
             let mut sc = be.stats.clone();
             sc.raw_timeouts = be.timeouts;
@@ -2451,7 +2487,7 @@ impl Engine {
     /// action's sample expression names an unknown fetch or converter
     /// ([`crate::rule_exprs::validate_rule_exprs`]).
     #[allow(clippy::too_many_lines)]
-    pub fn build_shared_state(config: &Config, nbthread: usize) -> io::Result<Vec<Proxy>> {
+    pub fn build_shared_state(config: &Config) -> io::Result<Proxies> {
     {
         // The listeners the file descriptor budget has to leave room for.
         let stats_sockets = config.global.as_ref().map_or(0, |g| usize::from(g.stats_socket.is_some()) + g.extra_stats_sockets.len());
@@ -2468,19 +2504,19 @@ impl Engine {
     let mut proxies = Vec::new();
     let ids = config.proxy_ids();
     for (i, listen) in config.listens.iter().enumerate().filter(|(_, l)| !l.disabled) {
-        let mut p = init_proxy_from_listen(proxies.len(), ids.listens[i], listen, nbthread);
+        let mut p = init_proxy_from_listen(proxies.len(), ids.listens[i], listen);
         attach_server_tls(&mut p, &listen.servers, listen.mode == Mode::Http, &listen.name)?;
         proxies.push(p);
     }
     for (i, backend) in config.backends.iter().enumerate() {
         if !backend.disabled {
-            let mut p = init_proxy_from_backend(proxies.len(), ids.backends[i], backend, nbthread);
+            let mut p = init_proxy_from_backend(proxies.len(), ids.backends[i], backend);
             attach_server_tls(&mut p, &backend.servers, backend.mode == Mode::Http, &backend.name)?;
             proxies.push(p);
         }
     }
     for (i, frontend) in config.frontends.iter().enumerate() {
-        if !frontend.disabled { proxies.push(init_proxy_from_frontend(proxies.len(), ids.frontends[i], frontend, nbthread)); }
+        if !frontend.disabled { proxies.push(init_proxy_from_frontend(proxies.len(), ids.frontends[i], frontend)); }
     }
     let disabled: Arc<Vec<String>> = Arc::new(
         config.listens.iter().map(|l| (l.disabled, &l.name))
@@ -2495,15 +2531,15 @@ impl Engine {
     crate::track::attach(&mut proxies, config);
     crate::logfwd::start(config)?;
     let _ = resolve_log_targets(config, &mut proxies);
-    Ok(proxies)
+    Ok(Proxies::new(proxies))
 }
 
 pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
-        let proxies = Self::build_shared_state(config, 1)?;
+        let proxies = Self::build_shared_state(config)?;
         Self::new_worker(config, capacity, 0, proxies)
     }
 
-    pub fn new_worker(config: &Config, capacity: usize, worker_id: usize, mut proxies: Vec<Proxy>) -> io::Result<Self> {
+    pub fn new_worker(config: &Config, capacity: usize, worker_id: usize, proxies: Proxies) -> io::Result<Self> {
         WORKER_ID.with(|id| id.set(worker_id));
         let poller = Poller::new(capacity)?;
         let mut scheduler = Scheduler::with_capacity(capacity);
@@ -2628,7 +2664,9 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         }
 
         crate::logfwd::start(config)?;
-        let log_targets = resolve_log_targets(config, &mut proxies);
+        // The sockets are this worker's; the proxies' indices into them were resolved once,
+        // by `build_shared_state`, and interning gives the same order here.
+        let log_targets = resolve_log_targets(config, &mut []);
 
         let start_time = Instant::now();
         let now = Tick(1);
@@ -3192,7 +3230,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 server_addr: Some(local_addr),
                 fc_src: Some(peer_addr),
                 fc_dst: Some(local_addr),
-                act_conn: self.proxies[proxy_idx].stats[worker_id()].act_conn.load(Ordering::Relaxed),
+                act_conn: self.proxies[proxy_idx].counters().act_conn.load(Ordering::Relaxed),
                 ..Default::default()
             };
 
@@ -3291,7 +3329,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 ConnEvalOutcome::Accept(c, s, fs, fd, ep) => (c, s, fs, fd, ep),
                 ConnEvalOutcome::Reject => {
                     raw::abort_with_rst(cli_fd.as_fd());
-                    self.proxies[proxy_idx].stats[worker_id()].denied_conn.fetch_add(1, Ordering::Relaxed);
+                    self.proxies[proxy_idx].counters().denied_conn.fetch_add(1, Ordering::Relaxed);
                     for (t_idx, ref key) in tracked_sc.iter().flatten() {
                         if let Some(ref tbl) = self.proxies[*t_idx].stick_table {
                             let _ = tbl.update_entry(key, |data| {
@@ -3304,7 +3342,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 }
                 ConnEvalOutcome::SilentDrop => {
                     raw::silent_drop(cli_fd.as_fd(), peer_addr.is_ipv6());
-                    self.proxies[proxy_idx].stats[worker_id()].denied_conn.fetch_add(1, Ordering::Relaxed);
+                    self.proxies[proxy_idx].counters().denied_conn.fetch_add(1, Ordering::Relaxed);
                     for (t_idx, ref key) in tracked_sc.iter().flatten() {
                         if let Some(ref tbl) = self.proxies[*t_idx].stick_table {
                             let _ = tbl.update_entry(key, |data| {
@@ -3320,13 +3358,13 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             if let Some(l_idx) = l_idx {
                 self.listeners[l_idx].nbconn += 1;
             }
-            let proxy = &mut self.proxies[proxy_idx];
-            proxy.stats[worker_id()].cum_conn.fetch_add(1, Ordering::Relaxed);
-            proxy.stats[worker_id()].fe_sess_rate.tick();
-            proxy.stats[worker_id()].act_conn.fetch_add(1, Ordering::Relaxed);
+            let proxy = &self.proxies[proxy_idx];
+            proxy.counters().cum_conn.fetch_add(1, Ordering::Relaxed);
+            proxy.counters().fe_sess_rate.tick();
+            proxy.counters().act_conn.fetch_add(1, Ordering::Relaxed);
             crate::globalconn::acquire();
-            if proxy.stats[worker_id()].act_conn.load(Ordering::Relaxed) > proxy.stats[worker_id()].max_conn.load(Ordering::Relaxed) {
-                proxy.stats[worker_id()].max_conn.store(proxy.stats[worker_id()].act_conn.load(Ordering::Relaxed), Ordering::Relaxed);
+            if proxy.counters().act_conn.load(Ordering::Relaxed) > proxy.counters().max_conn.load(Ordering::Relaxed) {
+                proxy.counters().max_conn.store(proxy.counters().act_conn.load(Ordering::Relaxed), Ordering::Relaxed);
             }
 
             if let Some(l_idx) = l_idx.filter(|&i| self.listeners[i].is_full()) {
@@ -3550,12 +3588,12 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
 
     /// Clears traffic and error counters for a specific proxy, or all proxies if `target` is `None`.
     pub fn clear_counters(&mut self, target: Option<&str>) -> bool {
-        clear_proxy_counters(&mut self.proxies, target)
+        clear_proxy_counters(&self.proxies, target)
     }
 
     /// Dynamically tunes maxconn on a proxy or a server.
     pub fn set_maxconn(&mut self, px_name: &str, sv_name: Option<&str>, maxconn: u32) -> bool {
-        set_proxy_maxconn(&mut self.proxies, px_name, sv_name, maxconn)
+        set_proxy_maxconn(self.proxies.make_mut(), px_name, sv_name, maxconn)
     }
 }
 
@@ -3610,7 +3648,7 @@ fn run_deferred_session_rules(proxy_idx: usize, proxies: &[Proxy], sess: &mut Tc
             raw::silent_drop(sess.cli.as_fd(), is_ipv6);
         }
     }
-    proxies[proxy_idx].stats[worker_id()].denied_req.fetch_add(1, Ordering::Relaxed);
+    proxies[proxy_idx].counters().denied_req.fetch_add(1, Ordering::Relaxed);
     sess.proxy_hdr_err = Some(crate::proxy::ProxyHdrError::SessionRefused);
     sess.cli_state = ScState::Closed;
     sess.srv_state = ScState::Closed;
@@ -3640,7 +3678,7 @@ fn eval_tcp_req_conn_rules(
         server_addr: Some(server_addr),
         fc_src: Some(fc_src),
         fc_dst: Some(fc_dst),
-        act_conn: proxy.stats[worker_id()].act_conn.load(Ordering::Relaxed),
+        act_conn: proxy.counters().act_conn.load(Ordering::Relaxed),
         ..Default::default()
     };
 
@@ -3753,7 +3791,7 @@ fn eval_tcp_req_session_rules(
         proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
         ssl_fc: sess.cli_xprt.ssl_facts(),
         ssl_bc: sess.srv_xprt.ssl_facts(),
-        act_conn: proxy.stats[worker_id()].act_conn.load(Ordering::Relaxed),
+        act_conn: proxy.counters().act_conn.load(Ordering::Relaxed),
         unique_id: sess.log.unique_id.as_deref(),
         accept_date: Some(sess.log.date),
         captures_req_hdr: Some(&sess.log.req_captures),
@@ -3984,7 +4022,7 @@ fn eval_tcp_req_content_rules(
         req_uri: sess.req_uri.as_deref(),
         req_method: sess.req_method.as_deref(),
         req_headers: sess.req_headers.as_deref(),
-        act_conn: proxy.stats[worker_id()].act_conn.load(Ordering::Relaxed),
+        act_conn: proxy.counters().act_conn.load(Ordering::Relaxed),
         unique_id: sess.log.unique_id.as_deref(),
         accept_date: Some(sess.log.date),
         last_rule: last_rule_at(sess.log.last_rule),
@@ -4236,7 +4274,7 @@ fn eval_tcp_res_content_rules(proxy: &Proxy, proxies: &[Proxy], registry: &Regis
         ssl_bc: sess.srv_xprt.ssl_facts(),
         res_body: Some(rep_bytes),
         raw_res: Some(rep_bytes),
-        act_conn: proxy.stats[worker_id()].act_conn.load(Ordering::Relaxed),
+        act_conn: proxy.counters().act_conn.load(Ordering::Relaxed),
         unique_id: sess.log.unique_id.as_deref(),
         accept_date: Some(sess.log.date),
         captures_req_hdr: Some(&sess.log.req_captures),
@@ -4504,7 +4542,7 @@ fn register_new_session(
     sess.so_name = listener_idx.and_then(|i| engine.listeners.get(i)).and_then(|l| l.name.clone());
     sess.so_id = listener_idx.and_then(|i| engine.listeners.get(i)).map(|l| l.luid).filter(|&id| id != 0);
 
-    let proxy = &mut engine.proxies[proxy_idx];
+    let proxy = &engine.proxies[proxy_idx];
 
     let target_server_idx = target_addr.and_then(|t| proxy.servers.iter().position(|&s| s == t));
     if let Some(idx) = target_server_idx {
@@ -4703,7 +4741,7 @@ fn proxy_header(fe: &Proxy, proxy: &Proxy, proxies: &[Proxy], sess: &mut TcpSess
 
 #[allow(clippy::too_many_arguments)]
 fn init_client_session(
-    proxies: &mut [Proxy],
+    proxies: &[Proxy],
     proxy_idx: usize,
     cli_fd: std::os::fd::OwnedFd,
     now: Tick,
@@ -4796,13 +4834,13 @@ fn init_client_session(
         SessionEvalOutcome::Accept => {}
         SessionEvalOutcome::Reject => {
             raw::abort_with_rst(sess.cli.as_fd());
-            proxies[proxy_idx].stats[worker_id()].denied_req.fetch_add(1, Ordering::Relaxed);
+            proxies[proxy_idx].counters().denied_req.fetch_add(1, Ordering::Relaxed);
             return None;
         }
         SessionEvalOutcome::SilentDrop => {
             let is_ipv6 = peer_addr.is_ipv6();
             raw::silent_drop(sess.cli.as_fd(), is_ipv6);
-            proxies[proxy_idx].stats[worker_id()].denied_req.fetch_add(1, Ordering::Relaxed);
+            proxies[proxy_idx].counters().denied_req.fetch_add(1, Ordering::Relaxed);
             return None;
         }
     }
@@ -4821,7 +4859,7 @@ fn init_client_session(
             && p.default_backend.is_none();
         direct.then(|| EngineDispatcher::sticking_rules(&mut sess, proxy_idx, proxies, false)).flatten()
     });
-    let proxy = &mut proxies[proxy_idx];
+    let proxy = &proxies[proxy_idx];
 
     let has_inspect = proxy.tcp_req_inspect_delay.is_some() || !proxy.tcp_req_content_rules.is_empty();
     if has_inspect {
@@ -4870,7 +4908,7 @@ fn init_client_session(
                     sess.server_connected(now);
                 }
             } else {
-                proxy.stats[worker_id()].failed_conn.fetch_add(1, Ordering::Relaxed);
+                proxy.counters().failed_conn.fetch_add(1, Ordering::Relaxed);
                 if !sess.server_failed() {
                     sess.srv_state = ScState::Error;
                 }
@@ -4887,7 +4925,7 @@ fn init_client_session(
 /// and enqueuing its tasklet for wakeup.
 pub fn shutdown_session_entry(
     entry: &mut SessionEntry,
-    proxies: &mut [Proxy],
+    proxies: &[Proxy],
     wake_queue: &mut Vec<TaskRef>,
 ) {
     entry.sess.cli_state = ScState::Closed;
@@ -4900,7 +4938,7 @@ pub fn shutdown_session_entry(
         entry.actconn_reclaimed = true;
         let proxy_idx = entry.proxy_idx;
         if proxy_idx < proxies.len() {
-            proxies[proxy_idx].stats[worker_id()].act_conn.fetch_sub(1, Ordering::Relaxed);
+            proxies[proxy_idx].counters().act_conn.fetch_sub(1, Ordering::Relaxed);
             crate::globalconn::release();
         }
         if let Some(s_idx) = entry.target_server_idx {
@@ -4916,7 +4954,7 @@ pub fn shutdown_session_entry(
 /// Shuts down active sessions matching an optional backend name and optional server ID.
 pub fn shutdown_matching_sessions<'a>(
     sessions: impl IntoIterator<Item = &'a mut SessionEntry>,
-    proxies: &mut [Proxy],
+    proxies: &[Proxy],
     backend_name: Option<&str>,
     server_id: Option<&str>,
     wake_queue: &mut Vec<TaskRef>,
@@ -4953,7 +4991,7 @@ fn clear_one(p: &Proxy) {
 }
 
 /// Clears traffic and error counters for a specific proxy, or all proxies if `target` is `None` or `"all"`.
-pub fn clear_proxy_counters(proxies: &mut [Proxy], target: Option<&str>) -> bool {
+pub fn clear_proxy_counters(proxies: &[Proxy], target: Option<&str>) -> bool {
     let all = target.is_none_or(|n| n.eq_ignore_ascii_case("all"));
     let mut found = false;
     for p in proxies.iter().filter(|p| all || Some(p.name.as_str()) == target) {
@@ -5025,7 +5063,7 @@ pub fn set_proxy_maxconn(
 struct EngineDispatcher<'a> {
     sessions: &'a mut SessionArena,
     applets: &'a mut AppletArena,
-    proxies: &'a mut [Proxy],
+    proxies: &'a mut Proxies,
     checks: &'a mut [ServerCheckState],
     fdtab: &'a mut FdTab,
     poller: &'a mut Poller,
@@ -5184,7 +5222,7 @@ fn count_server_session(proxies: &[Proxy], be_idx: usize, addr: SocketAddr) {
 
 fn retry_server_connect(
     entry: &mut SessionEntry,
-    proxies: &mut [Proxy],
+    proxies: &[Proxy],
     fdtab: &mut FdTab,
     poller: &mut Poller,
     now: Tick,
@@ -5243,10 +5281,10 @@ fn retry_server_connect(
         // Only another active server counts: a backup is not a way out of the one active
         // server, which is then asked again.
         let others = proxies[be_idx].eligible_server_indices().len() > 1;
-        proxies[be_idx].avoid_idx = if hash || !others { None } else { old_idx };
-        let t = proxies[be_idx].select_server_with_key(source_ip, entry.sess.req_uri.as_deref());
-        proxies[be_idx].avoid_idx = None;
-        t
+        let be = &proxies[be_idx];
+        crate::lb::with_avoided(be, if hash || !others { None } else { old_idx }, || {
+            be.select_server_with_key(source_ip, entry.sess.req_uri.as_deref())
+        })
     } else {
         entry
             .target_addr
@@ -5255,7 +5293,7 @@ fn retry_server_connect(
     // A different server is a redispatch (`wredis`), the same one a retry (`wretr`); the
     // client's persistence cookie no longer holds (`SF_DIRECT` cleared, `TX_CK_DOWN`).
     let moved = target.is_some() && entry.target_addr.is_some() && target != entry.target_addr;
-    let stats = &proxies[be_idx].stats[worker_id()];
+    let stats = &proxies[be_idx].counters();
     let count_on_server = |redispatch: bool| {
         let mut m = proxies[be_idx].server_retr.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         old_idx.into_iter().for_each(|i| {
@@ -5347,7 +5385,7 @@ fn retry_server_connect(
             }
         }
     } else {
-        proxies[be_idx].stats[worker_id()].failed_conn.fetch_add(1, Ordering::Relaxed);
+        proxies[be_idx].counters().failed_conn.fetch_add(1, Ordering::Relaxed);
         if !entry.sess.server_failed() {
             entry.sess.srv_state = ScState::Error;
             if entry.sess.mode == Mode::Http {
@@ -5359,7 +5397,7 @@ fn retry_server_connect(
 
 fn check_srv_connect(
     entry: &mut SessionEntry,
-    proxies: &mut [Proxy],
+    proxies: &[Proxy],
     fdtab: &mut FdTab,
     poller: &mut Poller,
     now: Tick,
@@ -5393,7 +5431,7 @@ fn check_srv_connect(
                     }
                 } else {
                     let be_idx = EngineDispatcher::resolve_backend(entry, proxies).unwrap_or(entry.proxy_idx);
-                    proxies[be_idx].stats[worker_id()].failed_conn.fetch_add(1, Ordering::Relaxed);
+                    proxies[be_idx].counters().failed_conn.fetch_add(1, Ordering::Relaxed);
                     if entry.sess.server_failed() {
                         retry_server_connect(entry, proxies, fdtab, poller, now);
                     } else {
@@ -5447,7 +5485,7 @@ fn update_interests(entry: &mut SessionEntry, fdtab: &mut FdTab, poller: &mut Po
 
 fn cleanup_done(
     entry: &SessionEntry,
-    proxies: &mut [Proxy],
+    proxies: &[Proxy],
     fdtab: &mut FdTab,
     poller: &mut Poller,
     listeners: &mut [Listener],
@@ -5461,10 +5499,10 @@ fn cleanup_done(
     }
 
     let proxy_idx = entry.proxy_idx;
-    proxies[proxy_idx].stats[worker_id()].bytes_in.fetch_add(entry.sess.bytes_in, Ordering::Relaxed);
-    proxies[proxy_idx].stats[worker_id()].bytes_out.fetch_add(entry.sess.bytes_out, Ordering::Relaxed);
+    proxies[proxy_idx].counters().bytes_in.fetch_add(entry.sess.bytes_in, Ordering::Relaxed);
+    proxies[proxy_idx].counters().bytes_out.fetch_add(entry.sess.bytes_out, Ordering::Relaxed);
     if !entry.actconn_reclaimed {
-        proxies[proxy_idx].stats[worker_id()].act_conn.fetch_sub(1, Ordering::Relaxed);
+        proxies[proxy_idx].counters().act_conn.fetch_sub(1, Ordering::Relaxed);
         crate::globalconn::release();
 
         if let Some(s_idx) = entry.target_server_idx {
@@ -5547,7 +5585,7 @@ impl EngineDispatcher<'_> {
             req_uri: sess.req_uri.as_deref(),
             req_method: sess.req_method.as_deref(),
             req_headers: sess.req_headers.as_deref(),
-            act_conn: proxy.stats[worker_id()].act_conn.load(Ordering::Relaxed),
+            act_conn: proxy.counters().act_conn.load(Ordering::Relaxed),
             unique_id: sess.log.unique_id.as_deref(),
             accept_date: Some(sess.log.date),
             captures_req_hdr: Some(&sess.log.req_captures),
@@ -5701,7 +5739,7 @@ impl EngineDispatcher<'_> {
     #[allow(clippy::too_many_arguments)]
     fn http_step(
         entry: &mut SessionEntry,
-        proxies: &mut [Proxy],
+        proxies: &mut Proxies,
         checks: &mut [ServerCheckState],
         pid: u32,
         fdtab: &mut FdTab,
@@ -5998,7 +6036,7 @@ impl EngineDispatcher<'_> {
     #[allow(clippy::too_many_arguments)]
     fn end_txn(
         entry: &mut SessionEntry,
-        proxies: &mut [Proxy],
+        proxies: &[Proxy],
         fdtab: &mut FdTab,
         poller: &mut Poller,
         idle_pool: &mut IdlePool,
@@ -6141,7 +6179,7 @@ impl EngineDispatcher<'_> {
                 entry.sess.srv_xprt = crate::xprt::ServerXprt::Plain;
                 entry.sess.ending = None;
                 let be_idx = Self::resolve_backend(entry, self.proxies).unwrap_or(entry.proxy_idx);
-                self.proxies[be_idx].stats[worker_id()].failed_conn.fetch_add(1, Ordering::Relaxed);
+                self.proxies[be_idx].counters().failed_conn.fetch_add(1, Ordering::Relaxed);
                 if entry.sess.server_failed() {
                     retry_server_connect(entry, self.proxies, self.fdtab, self.poller, now);
                 } else {
@@ -6174,7 +6212,7 @@ impl EngineDispatcher<'_> {
                     }
                     ContentEvalResult::Reject => {
                         raw::abort_with_rst(entry.sess.cli.as_fd());
-                        self.proxies[proxy_idx].stats[worker_id()].denied_req.fetch_add(1, Ordering::Relaxed);
+                        self.proxies[proxy_idx].counters().denied_req.fetch_add(1, Ordering::Relaxed);
                         entry.sess.cli_state = ScState::Closed;
                         entry.sess.srv_state = ScState::Closed;
                         entry.sess.tcp_inspect_done = true;
@@ -6182,7 +6220,7 @@ impl EngineDispatcher<'_> {
                     ContentEvalResult::SilentDrop => {
                         let is_ipv6 = entry.sess.client_addr.is_some_and(|a| a.is_ipv6());
                         raw::silent_drop(entry.sess.cli.as_fd(), is_ipv6);
-                        self.proxies[proxy_idx].stats[worker_id()].denied_req.fetch_add(1, Ordering::Relaxed);
+                        self.proxies[proxy_idx].counters().denied_req.fetch_add(1, Ordering::Relaxed);
                         entry.sess.cli_state = ScState::Closed;
                         entry.sess.srv_state = ScState::Closed;
                         entry.sess.tcp_inspect_done = true;
@@ -6212,7 +6250,7 @@ impl EngineDispatcher<'_> {
                             raw::abort_with_rst(srv_fd.as_fd());
                         }
                         entry.sess.rep.clear();
-                        self.proxies[be_idx].stats[worker_id()].denied_resp.fetch_add(1, Ordering::Relaxed);
+                        self.proxies[be_idx].counters().denied_resp.fetch_add(1, Ordering::Relaxed);
                         entry.sess.cli_state = ScState::Closed;
                         entry.sess.srv_state = ScState::Closed;
                     }
@@ -6223,7 +6261,7 @@ impl EngineDispatcher<'_> {
                             raw::abort_with_rst(srv_fd.as_fd());
                         }
                         entry.sess.rep.clear();
-                        self.proxies[be_idx].stats[worker_id()].denied_resp.fetch_add(1, Ordering::Relaxed);
+                        self.proxies[be_idx].counters().denied_resp.fetch_add(1, Ordering::Relaxed);
                         entry.sess.cli_state = ScState::Closed;
                         entry.sess.srv_state = ScState::Closed;
                     }
@@ -6914,7 +6952,7 @@ impl EngineDispatcher<'_> {
     #[allow(clippy::too_many_lines)]
     fn handle_stats_request(
         entry: &mut SessionEntry,
-        proxies: &mut [Proxy],
+        proxies: &mut Proxies,
         checks: &mut [ServerCheckState],
         pid: u32,
         now: Tick,
@@ -7006,7 +7044,7 @@ impl EngineDispatcher<'_> {
                 "maxconn" => {
                     if let Some(mc) = cmd.maxconn {
                         if let Some(be) = cmd.backend.as_deref() {
-                            let _ = set_proxy_maxconn(proxies, be, cmd.server.as_deref(), mc);
+                            let _ = set_proxy_maxconn(proxies.make_mut(), be, cmd.server.as_deref(), mc);
                         }
                     }
                 }
@@ -7018,7 +7056,8 @@ impl EngineDispatcher<'_> {
                     let target_server = cmd.server.as_deref();
 
                     let mut status_changes = Vec::new();
-                    for (p_idx, proxy) in proxies.iter_mut().enumerate() {
+                    // The stats page's admin form: a write, rare, and copied to this worker.
+                    for (p_idx, proxy) in proxies.make_mut().iter_mut().enumerate() {
                         if target_backend.is_none() || target_backend == Some(proxy.name.as_str()) {
                             let mut weight_changes = Vec::new();
                             for (s_idx, sid) in proxy.server_ids.iter().enumerate() {
@@ -7113,7 +7152,7 @@ impl EngineDispatcher<'_> {
     #[allow(clippy::too_many_arguments)]
     fn connect_http_backend(
         entry: &mut SessionEntry,
-        proxies: &mut [Proxy],
+        proxies: &mut Proxies,
         checks: &mut [ServerCheckState],
         pid: u32,
         fdtab: &mut FdTab,
@@ -7137,7 +7176,7 @@ impl EngineDispatcher<'_> {
         }
         // `proxy_inc_fe_req_ctr`: the request counts for the frontend before any rule sees it.
         if resume.is_none() {
-            proxies[proxy_idx].stats[worker_id()].fe_req_rate.tick();
+            proxies[proxy_idx].counters().fe_req_rate.tick();
         }
 
         // The stream's variables are in `CURRENT_VARS` for this whole run (`step_stream`).
@@ -7212,7 +7251,7 @@ impl EngineDispatcher<'_> {
             htx_slice: entry.sess.has_htx.then(|| ibex_proto::htx::HtxSliceRef::new(entry.sess.htx_buf.raw_slice(), entry.sess.htx_blocks)),
             fe_name: Some(&proxies[proxy_idx].name),
             fe_id: Some(proxies[proxy_idx].ids.iid),
-            act_conn: proxies[proxy_idx].stats[worker_id()].act_conn.load(Ordering::Relaxed),
+            act_conn: proxies[proxy_idx].counters().act_conn.load(Ordering::Relaxed),
             unique_id: entry.sess.log.unique_id.as_deref(),
             accept_date: Some(entry.sess.log.date),
             captures_req_hdr: Some(&entry.sess.log.req_captures),
@@ -7277,7 +7316,7 @@ impl EngineDispatcher<'_> {
         }
 
         let stick = StickView::new(proxies, &entry.sess.tracked_sc);
-        let act_conn = proxies[proxy_idx].stats[worker_id()].act_conn.load(Ordering::Relaxed);
+        let act_conn = proxies[proxy_idx].counters().act_conn.load(Ordering::Relaxed);
         let eval_http_rules = |rules: &[ibex_config::HttpReqRule], capture_exprs: &[Option<Expr>], acls: &HashMap<String, Expr>, sess: &mut TcpSession, be_retries: u16, fe_name: Option<&str>, be_name: Option<&str>, pages_idx: usize, be_stage: bool, start: usize| -> Result<RuleFlow, u16> {
             macro_rules! make_ctx {
                 ($s:expr) => {
@@ -7796,13 +7835,13 @@ impl EngineDispatcher<'_> {
         } else {
             // `force-be-switch` sent the request to a disabled backend: no server.
             entry.backend_idx = proxy_idx;
-            proxies[proxy_idx].stats[worker_id()].failed_conn.fetch_add(1, Ordering::Relaxed);
+            proxies[proxy_idx].counters().failed_conn.fetch_add(1, Ordering::Relaxed);
             reply_error(entry, proxies, 503);
             return None;
         };
         entry.backend_idx = be_idx;
         // `stream_set_backend` counts the stream for the backend (`proxy_inc_be_ctr`).
-        proxies[be_idx].stats[worker_id()].be_sess_rate.tick();
+        proxies[be_idx].counters().be_sess_rate.tick();
         // `stream_set_backend` (src/stream.c): switching to a backend takes its retry
         // budget, whatever a frontend-side `set-retries` set.
         if be_idx != proxy_idx && !resume_be {
@@ -7856,7 +7895,7 @@ impl EngineDispatcher<'_> {
             match res {
                 ContentEvalResult::Reject => {
                     raw::abort_with_rst(entry.sess.cli.as_fd());
-                    proxies[be_idx].stats[worker_id()].denied_req.fetch_add(1, Ordering::Relaxed);
+                    proxies[be_idx].counters().denied_req.fetch_add(1, Ordering::Relaxed);
                     entry.sess.cli_state = ScState::Closed;
                     entry.sess.srv_state = ScState::Closed;
                     return None;
@@ -7864,7 +7903,7 @@ impl EngineDispatcher<'_> {
                 ContentEvalResult::SilentDrop => {
                     let is_ipv6 = entry.sess.client_addr.is_some_and(|a| a.is_ipv6());
                     raw::silent_drop(entry.sess.cli.as_fd(), is_ipv6);
-                    proxies[be_idx].stats[worker_id()].denied_req.fetch_add(1, Ordering::Relaxed);
+                    proxies[be_idx].counters().denied_req.fetch_add(1, Ordering::Relaxed);
                     entry.sess.cli_state = ScState::Closed;
                     entry.sess.srv_state = ScState::Closed;
                     return None;
@@ -7961,7 +8000,7 @@ impl EngineDispatcher<'_> {
         };
 
         let Some(target_addr) = target else {
-            proxies[be_idx].stats[worker_id()].failed_conn.fetch_add(1, Ordering::Relaxed);
+            proxies[be_idx].counters().failed_conn.fetch_add(1, Ordering::Relaxed);
             // No server to connect to: `SC`, whatever the stream's progress.
             entry.sess.log.term = Some(*b"SC");
             reply_error(entry, proxies, 503);
@@ -8110,7 +8149,7 @@ impl EngineDispatcher<'_> {
                 }
             }
         } else {
-            proxies[be_idx].stats[worker_id()].failed_conn.fetch_add(1, Ordering::Relaxed);
+            proxies[be_idx].counters().failed_conn.fetch_add(1, Ordering::Relaxed);
             retry_server_connect(entry, proxies, fdtab, poller, now);
         }
         None
@@ -8118,7 +8157,7 @@ impl EngineDispatcher<'_> {
 
     fn connect_tcp_backend(
         entry: &mut SessionEntry,
-        proxies: &mut [Proxy],
+        proxies: &[Proxy],
         fdtab: &mut FdTab,
         poller: &mut Poller,
         now: Tick,
@@ -8135,7 +8174,7 @@ impl EngineDispatcher<'_> {
         stream_timeouts_enter(proxies, entry.proxy_idx, be_idx, &entry.sess);
         if !resumed {
             // `stream_set_backend` counts the stream for the backend (`proxy_inc_be_ctr`).
-            proxies[be_idx].stats[worker_id()].be_sess_rate.tick();
+            proxies[be_idx].counters().be_sess_rate.tick();
             if be_idx != entry.proxy_idx {
                 entry.sess.set_retries(proxies[be_idx].retries);
             }
@@ -8168,7 +8207,7 @@ impl EngineDispatcher<'_> {
             match res {
                 ContentEvalResult::Reject => {
                     raw::abort_with_rst(entry.sess.cli.as_fd());
-                    proxies[be_idx].stats[worker_id()].denied_req.fetch_add(1, Ordering::Relaxed);
+                    proxies[be_idx].counters().denied_req.fetch_add(1, Ordering::Relaxed);
                     entry.sess.cli_state = ScState::Closed;
                     entry.sess.srv_state = ScState::Closed;
                     return;
@@ -8176,7 +8215,7 @@ impl EngineDispatcher<'_> {
                 ContentEvalResult::SilentDrop => {
                     let is_ipv6 = entry.sess.client_addr.is_some_and(|a| a.is_ipv6());
                     raw::silent_drop(entry.sess.cli.as_fd(), is_ipv6);
-                    proxies[be_idx].stats[worker_id()].denied_req.fetch_add(1, Ordering::Relaxed);
+                    proxies[be_idx].counters().denied_req.fetch_add(1, Ordering::Relaxed);
                     entry.sess.cli_state = ScState::Closed;
                     entry.sess.srv_state = ScState::Closed;
                     return;
@@ -8260,7 +8299,7 @@ impl EngineDispatcher<'_> {
                 }
             }
         } else {
-            proxies[be_idx].stats[worker_id()].failed_conn.fetch_add(1, Ordering::Relaxed);
+            proxies[be_idx].counters().failed_conn.fetch_add(1, Ordering::Relaxed);
             retry_server_connect(entry, proxies, fdtab, poller, now);
         }
     }

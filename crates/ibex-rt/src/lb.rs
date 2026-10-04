@@ -9,12 +9,35 @@ use ibex_config::{HashPreserveAffinity, HashType};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{RwLock, RwLockReadGuard};
 
+thread_local! {
+    /// The server a redispatch steers this worker's next selection away from (the one a
+    /// retry just left), as `(proxy id, server index)`. Per worker and set only around that
+    /// selection, so it is not on the `Proxy` the workers share (T160).
+    static AVOID: std::cell::Cell<Option<(u32, usize)>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether the server at `idx` is the one this worker's current selection avoids.
+#[inline]
+#[must_use]
+pub fn avoided(proxy: &Proxy, idx: usize) -> bool {
+    AVOID.with(|a| a.get() == Some((proxy.id, idx)))
+}
+
+/// Runs `select` while the server `avoid` of `proxy` is not eligible (`None`: every
+/// server is).
+pub fn with_avoided<T>(proxy: &Proxy, avoid: Option<usize>, select: impl FnOnce() -> T) -> T {
+    AVOID.with(|a| a.set(avoid.map(|i| (proxy.id, i))));
+    let t = select();
+    AVOID.with(|a| a.set(None));
+    t
+}
+
 /// Determines whether a server at `idx` in `proxy` is eligible to receive traffic.
 #[inline]
 #[must_use]
 pub fn is_server_available(proxy: &Proxy, idx: usize) -> bool {
     // The server a retry has just left, while a redispatch looks for another one.
-    if idx >= proxy.servers.len() || proxy.avoid_idx == Some(idx) {
+    if idx >= proxy.servers.len() || avoided(proxy, idx) {
         return false;
     }
     if let Some(status) = proxy.server_statuses.get(idx) {

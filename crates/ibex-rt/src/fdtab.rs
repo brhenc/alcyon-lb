@@ -92,8 +92,13 @@ pub struct FdTab {
 impl FdTab {
     #[must_use]
     pub fn with_capacity(max_fd: usize) -> Self {
+        // Reserved, not filled: the table is indexed by fd number, which is per process,
+        // so every worker's covers the highest fd any of them holds. Filling it wrote
+        // `max_fd` entries (2 MB at the default 65,536 connections) into every worker
+        // whether or not it ever saw that fd (T160); `slot` fills it as fds arrive,
+        // within the reservation, so it still does not reallocate on the data path.
         FdTab {
-            entries: vec![Entry::EMPTY; max_fd],
+            entries: Vec::with_capacity(max_fd),
             live: 0,
         }
     }
@@ -106,8 +111,8 @@ impl FdTab {
     fn slot(&mut self, fd: RawFd) -> &mut Entry {
         let i = usize::try_from(fd).unwrap_or(0);
         if i >= self.entries.len() {
-            // Growing here is a boot-time event in practice: the table is sized from
-            // the fd rlimit, so a resize means the limit was raised under us.
+            // Within the reserved capacity this writes the new entries and does not
+            // allocate; beyond it (the fd rlimit was raised under us) it reallocates.
             self.entries.resize(i + 1, Entry::EMPTY);
         }
         &mut self.entries[i]
