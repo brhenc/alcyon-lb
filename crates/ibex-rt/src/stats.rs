@@ -724,6 +724,7 @@ mod tests {
             server_pp_unique_id: vec![false],
             server_backups: vec![false],
             server_maxconn: vec![None],
+            server_pool_max_conn: Vec::new(),
             server_actconn: std::sync::Arc::new(vec![std::sync::atomic::AtomicU32::new(0)]),
             server_retr: Default::default(),
             server_sess_rates: std::sync::Arc::new(vec![crate::engine::RateCtr::default()]),

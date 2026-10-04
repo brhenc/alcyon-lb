@@ -15,6 +15,8 @@ pub struct DefaultServerConfig {
     pub send_proxy: bool,
     pub send_proxy_v2: bool,
     pub maxconn: Option<u32>,
+    /// `pool-max-conn`.
+    pub pool_max_conn: Option<i32>,
     pub check_port: Option<u16>,
     pub check_proto: Option<&'static str>,
     /// The TLS keywords (`ssl`, `verify`, `sni`, `check-ssl`, ...).
@@ -222,6 +224,9 @@ pub struct Server {
     pub weight: Option<u32>,
     /// Server connection limit.
     pub maxconn: Option<u32>,
+    /// `pool-max-conn`: the most idle connections kept for this server; -1 is unlimited
+    /// (the default), 0 keeps none, not even for the next request of the same client.
+    pub pool_max_conn: i32,
     /// Whether this server is a backup server.
     pub backup: bool,
     /// Custom port for health checks (`port`).
@@ -256,6 +261,7 @@ impl Default for Server {
             send_proxy_v2: false,
             weight: None,
             maxconn: None,
+            pool_max_conn: -1,
             backup: false,
             check_port: None,
             check_proto: None,
@@ -282,6 +288,7 @@ impl Server {
             send_proxy_v2: false,
             weight: None,
             maxconn: None,
+            pool_max_conn: -1,
             backup: false,
             check_port: None,
             check_proto: None,

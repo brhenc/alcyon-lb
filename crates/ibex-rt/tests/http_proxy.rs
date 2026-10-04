@@ -420,6 +420,9 @@ fn http_reuse_shares_backend_connection_across_sessions() {
             clitimeout: Some(Duration::from_secs(5)),
             srvtimeout: Some(Duration::from_secs(5)),
             contimeout: Some(Duration::from_secs(5)),
+            // `safe`, the default, opens a connection for the first request of a client
+            // connection; sharing across sessions is `always`.
+            http_reuse: Some(ibex_config::HttpReuse::Always),
             servers: vec![Server::new("s1", srv_addr)],
             ..Default::default()
         }],

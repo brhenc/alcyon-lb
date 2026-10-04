@@ -32,6 +32,7 @@ pub(crate) fn parse_server(
     let mut send_proxy = default_server.is_some_and(|d| d.send_proxy);
     let mut send_proxy_v2 = default_server.is_some_and(|d| d.send_proxy_v2);
     let mut maxconn = default_server.and_then(|d| d.maxconn);
+    let mut pool_max_conn = default_server.and_then(|d| d.pool_max_conn).unwrap_or(-1);
     let mut check_port = default_server.and_then(|d| d.check_port);
     let mut check_proto = default_server.and_then(|d| d.check_proto);
     let mut weight = default_server.and_then(|d| d.weight);
@@ -88,6 +89,10 @@ pub(crate) fn parse_server(
                 if i < tokens.len() {
                     maxconn = Some(parse_u32(&tokens[i], "maxconn")?);
                 }
+            }
+            "pool-max-conn" => {
+                pool_max_conn = parse_pool_max_conn(tokens, i, who)?;
+                i += 1;
             }
             "port" => {
                 check_port = Some(parse_u16(server_kw_arg(tokens, i, who, "expects a port number as argument.")?, "port")?);
@@ -178,6 +183,7 @@ pub(crate) fn parse_server(
         send_proxy_v2,
         weight,
         maxconn,
+        pool_max_conn,
         backup,
         cookie,
         disabled,
@@ -428,6 +434,28 @@ fn parse_server_proto(tokens: &[Token], i: usize, server: Option<&str>) -> Resul
     }
 }
 
+/// `pool-max-conn <max>` (`srv_parse_pool_max_conn`): `atoi`, so text that is not a number
+/// reads as 0, and anything below -1 is refused.
+fn parse_pool_max_conn(tokens: &[Token], i: usize, who: Option<&str>) -> Result<i32, ConfigError> {
+    let arg = server_kw_arg(tokens, i, who, "expects <value> as argument.")?;
+    let t = arg.text.trim_start();
+    let (neg, digits) = match t.as_bytes().first() {
+        Some(b'-') => (true, &t[1..]),
+        Some(b'+') => (false, &t[1..]),
+        _ => (false, t),
+    };
+    let mut n: i64 = 0;
+    for b in digits.bytes().take_while(u8::is_ascii_digit) {
+        n = (n * 10 + i64::from(b - b'0')).min(i64::from(i32::MAX) + 1);
+    }
+    let n = if neg { -n } else { n };
+    if n < -1 {
+        let prefix = server_keywords::server_prefix(who);
+        return Err(ConfigError::new(tokens[i].line, tokens[i].col, format!("{prefix}'pool-max-conn' must be >= -1")));
+    }
+    Ok(n.min(i64::from(i32::MAX)) as i32)
+}
+
 pub(crate) fn parse_default_server(
     def: &mut Option<DefaultServerConfig>,
     tokens: &[Token],
@@ -470,6 +498,10 @@ pub(crate) fn parse_default_server(
                 if i < tokens.len() {
                     cfg.maxconn = Some(parse_u32(&tokens[i], "maxconn")?);
                 }
+            }
+            "pool-max-conn" => {
+                cfg.pool_max_conn = Some(parse_pool_max_conn(tokens, i, None)?);
+                i += 1;
             }
             "port" => {
                 cfg.check_port = Some(parse_u16(server_kw_arg(tokens, i, None, "expects a port number as argument.")?, "port")?);
