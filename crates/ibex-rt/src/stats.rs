@@ -512,6 +512,10 @@ fn write_server_row(
     r.set("smax", 0);
     r.set("slim", &slim);
     r.set("stot", 0);
+    if let Some((wretr, wredis)) = proxy.server_retr.get(s_idx) {
+        r.set("wretr", wretr.load(std::sync::atomic::Ordering::Relaxed));
+        r.set("wredis", wredis.load(std::sync::atomic::Ordering::Relaxed));
+    }
     r.set("status", status_str);
     r.set("weight", weight);
     r.set("act", act);
@@ -543,6 +547,8 @@ fn write_backend_row(out: &mut String, proxy: &Proxy, pid: u32, iid: usize) {
     r.set("bout", proxy.stats.iter().map(|s| s.bytes_out.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>());
     r.set("dreq", proxy.stats.iter().map(|s| s.denied_req.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>());
     r.set("dresp", proxy.stats.iter().map(|s| s.denied_resp.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>());
+    r.set("wretr", proxy.stats.iter().map(|s| s.retries_count.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>());
+    r.set("wredis", proxy.stats.iter().map(|s| s.redispatches.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>());
     r.set("status", "UP");
     r.set("weight", 1);
     r.set("act", 1);
@@ -694,6 +700,7 @@ mod tests {
             server_backups: vec![false],
             server_maxconn: vec![None],
             server_actconn: std::sync::Arc::new(vec![std::sync::atomic::AtomicU32::new(0)]),
+            server_retr: std::sync::Arc::new(vec![(std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0))]),
             server_sess_rates: std::sync::Arc::new(vec![crate::engine::RateCtr::default()]),
             server_check_configs: vec![None],
             server_tls: vec![None],
