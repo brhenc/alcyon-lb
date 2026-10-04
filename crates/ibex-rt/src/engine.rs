@@ -30,7 +30,7 @@ use ibex_proto::endpoint::ScState;
 use ibex_sample::{Expr, Registry, Sample, SampleContext};
 use ibex_sched::task::{state, Kind, TaskRef, WorkKind};
 use ibex_sched::{Class, Dispatch, Outcome, Scheduler, Tick};
-use ibex_stick_table::{KeyType, StickKey, StickTable, StickTableConfig};
+use ibex_stick_table::{Gpc, GpcOp, KeyType, StickKey, StickTable, StickTableConfig};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
@@ -864,6 +864,7 @@ fn init_stick_table(ast: &ibex_config::StickTableConfigAst, name: &str) -> Stick
     let mut track_conn_rate_ms = None;
     let mut track_http_req_rate_ms = None;
     let mut track_http_err_rate_ms = None;
+    let mut extra = ibex_stick_table::table::StickExtra::default();
     // What the table stores (`store`): the fetches that read a data type it does not store
     // give no sample, as they do in `HAProxy`.
     let mut flags = ibex_stick_table::table::TrackFlags {
@@ -877,23 +878,46 @@ fn init_stick_table(ast: &ibex_config::StickTableConfigAst, name: &str) -> Stick
         gpc0: false,
         gpc1: false,
         gpt0: false,
+        http_fail_cnt: false,
+        glitch_cnt: false,
+        server_id: false,
     };
 
     for field in &ast.store_fields {
-        match field.split('(').next().unwrap_or("") {
+        let (name, args) = field.split_once('(').map_or((field.as_str(), ""), |(n, a)| (n, a.trim_end_matches(')')));
+        // The period of a rate: `<name>(<period>)`, in milliseconds.
+        let period = |a: &str| Some(u64::from(parse_timeout_val(a)));
+        match name {
             "conn_cnt" => flags.conn_cnt = true,
             "conn_cur" => flags.conn_cur = true,
             "sess_cnt" => flags.sess_cnt = true,
             "http_req_cnt" => flags.http_req_cnt = true,
             "http_err_cnt" => flags.http_err_cnt = true,
+            "http_fail_cnt" => flags.http_fail_cnt = true,
             "bytes_in_cnt" => flags.bytes_in_cnt = true,
             "bytes_out_cnt" => flags.bytes_out_cnt = true,
+            "glitch_cnt" => flags.glitch_cnt = true,
+            "server_id" => flags.server_id = true,
             "gpc0" => flags.gpc0 = true,
             "gpc1" => flags.gpc1 = true,
             "gpt0" => flags.gpt0 = true,
-            "conn_rate" => track_conn_rate_ms = Some(10_000),
-            "http_req_rate" => track_http_req_rate_ms = Some(10_000),
-            "http_err_rate" => track_http_err_rate_ms = Some(10_000),
+            "conn_rate" => track_conn_rate_ms = period(args),
+            "http_req_rate" => track_http_req_rate_ms = period(args),
+            "http_err_rate" => track_http_err_rate_ms = period(args),
+            "sess_rate" => extra.sess_rate_ms = period(args),
+            "http_fail_rate" => extra.http_fail_rate_ms = period(args),
+            "bytes_in_rate" => extra.bytes_in_rate_ms = period(args),
+            "bytes_out_rate" => extra.bytes_out_rate_ms = period(args),
+            "glitch_rate" => extra.glitch_rate_ms = period(args),
+            "gpc0_rate" => extra.gpc0_rate_ms = period(args),
+            "gpc1_rate" => extra.gpc1_rate_ms = period(args),
+            "gpc" => extra.gpc_n = args.parse().unwrap_or(0),
+            "gpt" => extra.gpt_n = args.parse().unwrap_or(0),
+            "gpc_rate" => {
+                let (n, p) = args.split_once(',').unwrap_or((args, ""));
+                extra.gpc_rate_n = n.trim().parse().unwrap_or(0);
+                extra.gpc_rate_ms = u64::from(parse_timeout_val(p));
+            }
             _ => {}
         }
     }
@@ -907,6 +931,7 @@ fn init_stick_table(ast: &ibex_config::StickTableConfigAst, name: &str) -> Stick
         track_conn_rate_ms,
         track_http_req_rate_ms,
         track_http_err_rate_ms,
+        extra,
     };
 
     StickTable::new(config)
@@ -2576,15 +2601,10 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 if let Some(slot) = slot {
                     if let Some(key) = resolve_sample_stick_key(&srule.expr, sample_registry(), &sample_ctx, self.proxies[proxy_idx].stick_table.as_ref()) {
                         if let Some(ref tbl) = self.proxies[proxy_idx].stick_table {
-                            let _ = tbl.update_entry(&key, |data| {
-                                data.conn_cnt += 1;
-                                data.sess_cnt += 1;
-                                data.conn_cur += 1;
-                                if let Some(ref mut r) = data.conn_rate {
-                                    r.tick(1);
-                                }
-                            });
-                            tracked_sc[slot] = Some((proxy_idx, key));
+                            if tracked_sc[slot].is_none() {
+                                let _ = tbl.update_entry(&key, |data| data.track(true));
+                                tracked_sc[slot] = Some((proxy_idx, key));
+                            }
                         }
                     }
                 }
@@ -2613,15 +2633,10 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                         };
                         if let Some(key) = resolve_sample_stick_key(expr, sample_registry(), &sample_ctx, self.proxies[t_idx].stick_table.as_ref()) {
                             if let Some(ref tbl) = self.proxies[t_idx].stick_table {
-                                let _ = tbl.update_entry(&key, |data| {
-                                    data.conn_cnt += 1;
-                                    data.sess_cnt += 1;
-                                    data.conn_cur += 1;
-                                    if let Some(ref mut r) = data.conn_rate {
-                                        r.tick(1);
-                                    }
-                                });
-                                tracked_sc[0] = Some((t_idx, key));
+                                if tracked_sc[0].is_none() {
+                                    let _ = tbl.update_entry(&key, |data| data.track(true));
+                                    tracked_sc[0] = Some((t_idx, key));
+                                }
                             }
                         }
                     }
@@ -2633,15 +2648,10 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                         };
                         if let Some(key) = resolve_sample_stick_key(expr, sample_registry(), &sample_ctx, self.proxies[t_idx].stick_table.as_ref()) {
                             if let Some(ref tbl) = self.proxies[t_idx].stick_table {
-                                let _ = tbl.update_entry(&key, |data| {
-                                    data.conn_cnt += 1;
-                                    data.sess_cnt += 1;
-                                    data.conn_cur += 1;
-                                    if let Some(ref mut r) = data.conn_rate {
-                                        r.tick(1);
-                                    }
-                                });
-                                tracked_sc[1] = Some((t_idx, key));
+                                if tracked_sc[1].is_none() {
+                                    let _ = tbl.update_entry(&key, |data| data.track(true));
+                                    tracked_sc[1] = Some((t_idx, key));
+                                }
                             }
                         }
                     }
@@ -2653,15 +2663,10 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                         };
                         if let Some(key) = resolve_sample_stick_key(expr, sample_registry(), &sample_ctx, self.proxies[t_idx].stick_table.as_ref()) {
                             if let Some(ref tbl) = self.proxies[t_idx].stick_table {
-                                let _ = tbl.update_entry(&key, |data| {
-                                    data.conn_cnt += 1;
-                                    data.sess_cnt += 1;
-                                    data.conn_cur += 1;
-                                    if let Some(ref mut r) = data.conn_rate {
-                                        r.tick(1);
-                                    }
-                                });
-                                tracked_sc[2] = Some((t_idx, key));
+                                if tracked_sc[2].is_none() {
+                                    let _ = tbl.update_entry(&key, |data| data.track(true));
+                                    tracked_sc[2] = Some((t_idx, key));
+                                }
                             }
                         }
                     }
@@ -2684,7 +2689,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     for (t_idx, ref key) in tracked_sc.iter().flatten() {
                         if let Some(ref tbl) = self.proxies[*t_idx].stick_table {
                             let _ = tbl.update_entry(key, |data| {
-                                data.conn_cur = data.conn_cur.saturating_sub(1);
+                                data.untrack();
                             });
                         }
                     }
@@ -2697,7 +2702,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     for (t_idx, ref key) in tracked_sc.iter().flatten() {
                         if let Some(ref tbl) = self.proxies[*t_idx].stick_table {
                             let _ = tbl.update_entry(key, |data| {
-                                data.conn_cur = data.conn_cur.saturating_sub(1);
+                                data.untrack();
                             });
                         }
                     }
@@ -3123,16 +3128,12 @@ fn eval_tcp_req_session_rules(
                 };
                 if let Some(key) = resolve_sample_stick_key(expr, registry, &ctx, proxies.get(t_idx).and_then(|p| p.stick_table.as_ref())) {
                     if let Some(tbl) = proxies.get(t_idx).and_then(|p| p.stick_table.as_ref()) {
-                        let _ = tbl.update_entry(&key, |data| {
-                            data.conn_cnt += 1;
-                            data.sess_cnt += 1;
-                            data.conn_cur += 1;
-                            if let Some(ref mut r) = data.conn_rate {
-                                r.tick(1);
-                            }
-                        });
-                        stick.track(0, t_idx, &key);
-                        sess.tracked_sc[0] = Some((t_idx, key));
+                        // A slot that tracks an entry already keeps it (`stream_track_stkctr` is not called again).
+                        if sess.tracked_sc[0].is_none() {
+                            let _ = tbl.update_entry(&key, |data| data.track(true));
+                            stick.track(0, t_idx, &key);
+                            sess.tracked_sc[0] = Some((t_idx, key));
+                        }
                     }
                 }
             }
@@ -3144,16 +3145,12 @@ fn eval_tcp_req_session_rules(
                 };
                 if let Some(key) = resolve_sample_stick_key(expr, registry, &ctx, proxies.get(t_idx).and_then(|p| p.stick_table.as_ref())) {
                     if let Some(tbl) = proxies.get(t_idx).and_then(|p| p.stick_table.as_ref()) {
-                        let _ = tbl.update_entry(&key, |data| {
-                            data.conn_cnt += 1;
-                            data.sess_cnt += 1;
-                            data.conn_cur += 1;
-                            if let Some(ref mut r) = data.conn_rate {
-                                r.tick(1);
-                            }
-                        });
-                        stick.track(1, t_idx, &key);
-                        sess.tracked_sc[1] = Some((t_idx, key));
+                        // A slot that tracks an entry already keeps it (`stream_track_stkctr` is not called again).
+                        if sess.tracked_sc[1].is_none() {
+                            let _ = tbl.update_entry(&key, |data| data.track(true));
+                            stick.track(1, t_idx, &key);
+                            sess.tracked_sc[1] = Some((t_idx, key));
+                        }
                     }
                 }
             }
@@ -3165,16 +3162,12 @@ fn eval_tcp_req_session_rules(
                 };
                 if let Some(key) = resolve_sample_stick_key(expr, registry, &ctx, proxies.get(t_idx).and_then(|p| p.stick_table.as_ref())) {
                     if let Some(tbl) = proxies.get(t_idx).and_then(|p| p.stick_table.as_ref()) {
-                        let _ = tbl.update_entry(&key, |data| {
-                            data.conn_cnt += 1;
-                            data.sess_cnt += 1;
-                            data.conn_cur += 1;
-                            if let Some(ref mut r) = data.conn_rate {
-                                r.tick(1);
-                            }
-                        });
-                        stick.track(2, t_idx, &key);
-                        sess.tracked_sc[2] = Some((t_idx, key));
+                        // A slot that tracks an entry already keeps it (`stream_track_stkctr` is not called again).
+                        if sess.tracked_sc[2].is_none() {
+                            let _ = tbl.update_entry(&key, |data| data.track(true));
+                            stick.track(2, t_idx, &key);
+                            sess.tracked_sc[2] = Some((t_idx, key));
+                        }
                     }
                 }
             }
@@ -3241,45 +3234,20 @@ fn eval_tcp_req_session_rules(
                 }
                 ibex_sample::CURRENT_VARS.with(|v| v.borrow_mut().remove(var_name));
             }
-            ibex_config::TcpReqSessionAction::ScIncGpc0 { sc } => {
-                let sc_idx = *sc as usize;
-                if sc_idx < 3 {
-                    if let Some((t_idx, ref key)) = sess.tracked_sc[sc_idx] {
-                        if let Some(tbl) = proxies.get(t_idx).and_then(|p| p.stick_table.as_ref()) {
-                            let _ = tbl.update_entry(key, |data| {
-                                data.gpc0 = data.gpc0.saturating_add(1);
-                                data.last_updated = std::time::Instant::now();
-                            });
-                        }
-                    }
-                }
-            }
-            ibex_config::TcpReqSessionAction::ScIncGpc1 { sc } => {
-                let sc_idx = *sc as usize;
-                if sc_idx < 3 {
-                    if let Some((t_idx, ref key)) = sess.tracked_sc[sc_idx] {
-                        if let Some(tbl) = proxies.get(t_idx).and_then(|p| p.stick_table.as_ref()) {
-                            let _ = tbl.update_entry(key, |data| {
-                                data.gpc1 = data.gpc1.saturating_add(1);
-                                data.last_updated = std::time::Instant::now();
-                            });
-                        }
-                    }
-                }
-            }
+            ibex_config::TcpReqSessionAction::ScIncGpc0 { sc } => sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::Zero, GpcOp::Inc),
+            ibex_config::TcpReqSessionAction::ScIncGpc1 { sc } => sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::One, GpcOp::Inc),
             ibex_config::TcpReqSessionAction::ScSetGpt0 { sc, expr } => {
-                let sc_idx = *sc as usize;
-                if sc_idx < 3 {
-                    if let Some((t_idx, ref key)) = sess.tracked_sc[sc_idx] {
-                        let val = resolve_gpt0_val(expr, registry, &ctx);
-                        if let Some(tbl) = proxies.get(t_idx).and_then(|p| p.stick_table.as_ref()) {
-                            let _ = tbl.update_entry(key, |data| {
-                                data.gpt0 = val;
-                                data.last_updated = std::time::Instant::now();
-                            });
-                        }
-                    }
-                }
+                let val = resolve_gpt0_val(expr, registry, &ctx);
+                sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::Zero, GpcOp::SetTag(val));
+            }
+            ibex_config::TcpReqSessionAction::ScIncGpc { idx, sc } => sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::Idx(*idx), GpcOp::Inc),
+            ibex_config::TcpReqSessionAction::ScAddGpc { idx, sc, expr } => {
+                let n = resolve_gpt0_val(expr, registry, &ctx);
+                sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::Idx(*idx), GpcOp::Add(u64::from(n)));
+            }
+            ibex_config::TcpReqSessionAction::ScSetGpt { idx, sc, expr } => {
+                let val = resolve_gpt0_val(expr, registry, &ctx);
+                sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::Idx(*idx), GpcOp::SetTag(val));
             }
             _ => {}
         }
@@ -3400,15 +3368,12 @@ fn eval_tcp_req_content_rules(
                 };
                 if let Some(key) = resolve_sample_stick_key(expr, registry, &ctx, proxies.get(t_idx).and_then(|p| p.stick_table.as_ref())) {
                     if let Some(tbl) = proxies.get(t_idx).and_then(|p| p.stick_table.as_ref()) {
-                        let _ = tbl.update_entry(&key, |data| {
-                            data.conn_cnt += 1;
-                            data.conn_cur += 1;
-                            if let Some(ref mut r) = data.conn_rate {
-                                r.tick(1);
-                            }
-                        });
-                        stick.track(0, t_idx, &key);
-                        sess.tracked_sc[0] = Some((t_idx, key));
+                        // A slot that tracks an entry already keeps it (`stream_track_stkctr` is not called again).
+                        if sess.tracked_sc[0].is_none() {
+                            let _ = tbl.update_entry(&key, |data| data.track(false));
+                            stick.track(0, t_idx, &key);
+                            sess.tracked_sc[0] = Some((t_idx, key));
+                        }
                     }
                 }
             }
@@ -3420,15 +3385,12 @@ fn eval_tcp_req_content_rules(
                 };
                 if let Some(key) = resolve_sample_stick_key(expr, registry, &ctx, proxies.get(t_idx).and_then(|p| p.stick_table.as_ref())) {
                     if let Some(tbl) = proxies.get(t_idx).and_then(|p| p.stick_table.as_ref()) {
-                        let _ = tbl.update_entry(&key, |data| {
-                            data.conn_cnt += 1;
-                            data.conn_cur += 1;
-                            if let Some(ref mut r) = data.conn_rate {
-                                r.tick(1);
-                            }
-                        });
-                        stick.track(1, t_idx, &key);
-                        sess.tracked_sc[1] = Some((t_idx, key));
+                        // A slot that tracks an entry already keeps it (`stream_track_stkctr` is not called again).
+                        if sess.tracked_sc[1].is_none() {
+                            let _ = tbl.update_entry(&key, |data| data.track(false));
+                            stick.track(1, t_idx, &key);
+                            sess.tracked_sc[1] = Some((t_idx, key));
+                        }
                     }
                 }
             }
@@ -3440,15 +3402,12 @@ fn eval_tcp_req_content_rules(
                 };
                 if let Some(key) = resolve_sample_stick_key(expr, registry, &ctx, proxies.get(t_idx).and_then(|p| p.stick_table.as_ref())) {
                     if let Some(tbl) = proxies.get(t_idx).and_then(|p| p.stick_table.as_ref()) {
-                        let _ = tbl.update_entry(&key, |data| {
-                            data.conn_cnt += 1;
-                            data.conn_cur += 1;
-                            if let Some(ref mut r) = data.conn_rate {
-                                r.tick(1);
-                            }
-                        });
-                        stick.track(2, t_idx, &key);
-                        sess.tracked_sc[2] = Some((t_idx, key));
+                        // A slot that tracks an entry already keeps it (`stream_track_stkctr` is not called again).
+                        if sess.tracked_sc[2].is_none() {
+                            let _ = tbl.update_entry(&key, |data| data.track(false));
+                            stick.track(2, t_idx, &key);
+                            sess.tracked_sc[2] = Some((t_idx, key));
+                        }
                     }
                 }
             }
@@ -3515,45 +3474,20 @@ fn eval_tcp_req_content_rules(
                 }
                 ibex_sample::CURRENT_VARS.with(|v| v.borrow_mut().remove(var_name));
             }
-            ibex_config::TcpReqContentAction::ScIncGpc0 { sc } => {
-                let sc_idx = *sc as usize;
-                if sc_idx < 3 {
-                    if let Some((t_idx, ref key)) = sess.tracked_sc[sc_idx] {
-                        if let Some(tbl) = proxies.get(t_idx).and_then(|p| p.stick_table.as_ref()) {
-                            let _ = tbl.update_entry(key, |data| {
-                                data.gpc0 = data.gpc0.saturating_add(1);
-                                data.last_updated = std::time::Instant::now();
-                            });
-                        }
-                    }
-                }
-            }
-            ibex_config::TcpReqContentAction::ScIncGpc1 { sc } => {
-                let sc_idx = *sc as usize;
-                if sc_idx < 3 {
-                    if let Some((t_idx, ref key)) = sess.tracked_sc[sc_idx] {
-                        if let Some(tbl) = proxies.get(t_idx).and_then(|p| p.stick_table.as_ref()) {
-                            let _ = tbl.update_entry(key, |data| {
-                                data.gpc1 = data.gpc1.saturating_add(1);
-                                data.last_updated = std::time::Instant::now();
-                            });
-                        }
-                    }
-                }
-            }
+            ibex_config::TcpReqContentAction::ScIncGpc0 { sc } => sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::Zero, GpcOp::Inc),
+            ibex_config::TcpReqContentAction::ScIncGpc1 { sc } => sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::One, GpcOp::Inc),
             ibex_config::TcpReqContentAction::ScSetGpt0 { sc, expr } => {
-                let sc_idx = *sc as usize;
-                if sc_idx < 3 {
-                    if let Some((t_idx, ref key)) = sess.tracked_sc[sc_idx] {
-                        let val = resolve_gpt0_val(expr, registry, &ctx);
-                        if let Some(tbl) = proxies.get(t_idx).and_then(|p| p.stick_table.as_ref()) {
-                            let _ = tbl.update_entry(key, |data| {
-                                data.gpt0 = val;
-                                data.last_updated = std::time::Instant::now();
-                            });
-                        }
-                    }
-                }
+                let val = resolve_gpt0_val(expr, registry, &ctx);
+                sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::Zero, GpcOp::SetTag(val));
+            }
+            ibex_config::TcpReqContentAction::ScIncGpc { idx, sc } => sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::Idx(*idx), GpcOp::Inc),
+            ibex_config::TcpReqContentAction::ScAddGpc { idx, sc, expr } => {
+                let n = resolve_gpt0_val(expr, registry, &ctx);
+                sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::Idx(*idx), GpcOp::Add(u64::from(n)));
+            }
+            ibex_config::TcpReqContentAction::ScSetGpt { idx, sc, expr } => {
+                let val = resolve_gpt0_val(expr, registry, &ctx);
+                sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::Idx(*idx), GpcOp::SetTag(val));
             }
             ibex_config::TcpReqContentAction::SwitchModeHttp { .. } => {
                 sess.mode = Mode::Http;
@@ -4289,6 +4223,10 @@ struct EngineDispatcher<'a> {
 /// frontend's, then the built-in page. Every error the proxy generates on a stream goes
 /// through here, and through the `http-after-response` rules.
 fn reply_error(entry: &mut SessionEntry, proxies: &[Proxy], status: u16) {
+    // A server that fails to answer (502) or in time (504) is a failure of the request.
+    if matches!(status, 502 | 504) {
+        for_tracked(proxies, &entry.sess, |data| data.count_fail());
+    }
     let be_idx = if entry.backend_idx < proxies.len() { entry.backend_idx } else { entry.proxy_idx };
     let page = proxy_error_response(&entry.sess, &proxies[be_idx], &proxies[entry.proxy_idx], proxies, status);
     send_proxy_reply(&mut entry.sess, proxies, entry.proxy_idx, be_idx, &page);
@@ -4691,17 +4629,11 @@ fn cleanup_done(
         }
     }
 
-    for (tbl_idx, ref key) in entry.sess.tracked_sc.iter().flatten() {
-        if *tbl_idx < proxies.len() {
-            if let Some(ref table) = proxies[*tbl_idx].stick_table {
-                let _ = table.update_entry(key, |data| {
-                    data.conn_cur = data.conn_cur.saturating_sub(1);
-                    data.bytes_in_cnt += entry.sess.bytes_in;
-                    data.bytes_out_cnt += entry.sess.bytes_out;
-                });
-            }
-        }
-    }
+    let (din, dout) = stick_bytes_due(&entry.sess, true);
+    for_tracked(proxies, &entry.sess, |data| {
+        data.add_bytes(din, dout);
+        data.untrack();
+    });
 
     // An HTTP/3 request stream took no listener slot (`admit_connection`).
     if let Some(l) = listeners.iter_mut().filter(|_| !entry.sess.h3).find(|l| l.proxy == usize_to_u32(proxy_idx)) {
@@ -5504,6 +5436,10 @@ impl EngineDispatcher<'_> {
         }
         let client_close = txn.close_after;
         let cookie_txn = txn.ck;
+        // Only an error changes a counter: a response that is not one costs the tracked entries no update.
+        if resume.is_none() && status >= 400 {
+            for_tracked(proxies, &entry.sess, |data| data.count_response_class(status));
+        }
 
         if !client_close && srv_has_close {
             entry.sess.rep.remove_http_header("connection");
@@ -6303,19 +6239,7 @@ impl EngineDispatcher<'_> {
                         proxy_idx
                     };
                     if let Some(k) = resolve_sample_stick_key(expr, registry, &http_sample_ctx, proxies.get(t_idx).and_then(|p| p.stick_table.as_ref())) {
-                        let is_new = entry.sess.tracked_sc[0].as_ref().is_none_or(|(old_idx, old_k)| *old_idx != t_idx || old_k != &k);
-                        if is_new {
-                            if let Some(ref tbl) = proxies[t_idx].stick_table {
-                                let _ = tbl.update_entry(&k, |data| {
-                                    data.conn_cnt += 1;
-                                    data.conn_cur += 1;
-                                    if let Some(ref mut r) = data.conn_rate {
-                                        r.tick(1);
-                                    }
-                                });
-                            }
-                            entry.sess.tracked_sc[0] = Some((t_idx, k));
-                        }
+                        track_http_slot(proxies, &mut entry.sess.tracked_sc, 0, t_idx, k);
                     }
                 }
                 ibex_config::HttpReqAction::TrackSc1 { table, expr } => {
@@ -6325,19 +6249,7 @@ impl EngineDispatcher<'_> {
                         proxy_idx
                     };
                     if let Some(k) = resolve_sample_stick_key(expr, registry, &http_sample_ctx, proxies.get(t_idx).and_then(|p| p.stick_table.as_ref())) {
-                        let is_new = entry.sess.tracked_sc[1].as_ref().is_none_or(|(old_idx, old_k)| *old_idx != t_idx || old_k != &k);
-                        if is_new {
-                            if let Some(ref tbl) = proxies[t_idx].stick_table {
-                                let _ = tbl.update_entry(&k, |data| {
-                                    data.conn_cnt += 1;
-                                    data.conn_cur += 1;
-                                    if let Some(ref mut r) = data.conn_rate {
-                                        r.tick(1);
-                                    }
-                                });
-                            }
-                            entry.sess.tracked_sc[1] = Some((t_idx, k));
-                        }
+                        track_http_slot(proxies, &mut entry.sess.tracked_sc, 1, t_idx, k);
                     }
                 }
                 ibex_config::HttpReqAction::TrackSc2 { table, expr } => {
@@ -6347,37 +6259,24 @@ impl EngineDispatcher<'_> {
                         proxy_idx
                     };
                     if let Some(k) = resolve_sample_stick_key(expr, registry, &http_sample_ctx, proxies.get(t_idx).and_then(|p| p.stick_table.as_ref())) {
-                        let is_new = entry.sess.tracked_sc[2].as_ref().is_none_or(|(old_idx, old_k)| *old_idx != t_idx || old_k != &k);
-                        if is_new {
-                            if let Some(ref tbl) = proxies[t_idx].stick_table {
-                                let _ = tbl.update_entry(&k, |data| {
-                                    data.conn_cnt += 1;
-                                    data.conn_cur += 1;
-                                    if let Some(ref mut r) = data.conn_rate {
-                                        r.tick(1);
-                                    }
-                                });
-                            }
-                            entry.sess.tracked_sc[2] = Some((t_idx, k));
-                        }
+                        track_http_slot(proxies, &mut entry.sess.tracked_sc, 2, t_idx, k);
                     }
                 }
                 _ => {}
             }
         }
 
-        // Count HTTP request into all active tracked slots
-        for (t_idx, ref k) in entry.sess.tracked_sc.iter().flatten().filter(|_| resume.is_none()) {
-            if *t_idx < proxies.len() {
-                if let Some(ref tbl) = proxies[*t_idx].stick_table {
-                    let _ = tbl.update_entry(k, |data| {
-                        data.http_req_cnt += 1;
-                        if let Some(ref mut r) = data.http_req_rate {
-                            r.tick(1);
-                        }
-                    });
-                }
-            }
+        // Count HTTP request into all active tracked slots, and credit them the bytes of the
+        // requests that are over.
+        if resume.is_none() {
+            // One update per slot: the request, and the bytes of the ones that are over.
+            let (din, dout) = stick_bytes_due(&entry.sess, false);
+            entry.sess.stick_acct_in += din;
+            entry.sess.stick_out_pending = 0;
+            for_tracked(proxies, &entry.sess, |data| {
+                data.count_request();
+                data.add_bytes(din, dout);
+            });
         }
 
         let stick = StickView::new(proxies, &entry.sess.tracked_sc);
@@ -6472,6 +6371,7 @@ impl EngineDispatcher<'_> {
                         };
                         // Denied by the proxy: `PR`, not a rule's answer (`LR`).
                         sess.log.term = Some(*b"PR");
+                        for_tracked(proxies, sess, |data| data.count_err());
                         send_proxy_reply(sess, &proxies[..], proxy_idx, pages_idx, &resp);
                         return Ok(RuleFlow::Replied);
                     }
@@ -6511,6 +6411,7 @@ impl EngineDispatcher<'_> {
                             }
                         };
                         sess.log.term = Some(*b"PT");
+                        for_tracked(proxies, sess, |data| data.count_err());
                         send_proxy_reply(sess, &proxies[..], proxy_idx, pages_idx, &resp);
                         return Ok(RuleFlow::Replied);
                     }
@@ -6519,6 +6420,7 @@ impl EngineDispatcher<'_> {
                     }
                     ibex_config::HttpReqAction::Auth => {
                         let resp = "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"HAProxy\"\r\nContent-Type: text/plain\r\nContent-Length: 0\r\n\r\n";
+                        for_tracked(proxies, sess, |data| data.count_err());
                         send_proxy_reply(sess, &proxies[..], proxy_idx, pages_idx, resp.as_bytes());
                         return Ok(RuleFlow::Replied);
                     }
@@ -6803,45 +6705,20 @@ impl EngineDispatcher<'_> {
                         if replace_req_value(sess, name, regex, repl).is_err() => {
                             return Err(500);
                         }
-                    ibex_config::HttpReqAction::ScIncGpc0 { sc } => {
-                        let sc_idx = *sc as usize;
-                        if sc_idx < 3 {
-                            if let Some((t_idx, ref key)) = sess.tracked_sc[sc_idx] {
-                                if let Some(tbl) = proxies.get(t_idx).and_then(|p| p.stick_table.as_ref()) {
-                                    let _ = tbl.update_entry(key, |data| {
-                                        data.gpc0 = data.gpc0.saturating_add(1);
-                                        data.last_updated = std::time::Instant::now();
-                                    });
-                                }
-                            }
-                        }
-                    }
-                    ibex_config::HttpReqAction::ScIncGpc1 { sc } => {
-                        let sc_idx = *sc as usize;
-                        if sc_idx < 3 {
-                            if let Some((t_idx, ref key)) = sess.tracked_sc[sc_idx] {
-                                if let Some(tbl) = proxies.get(t_idx).and_then(|p| p.stick_table.as_ref()) {
-                                    let _ = tbl.update_entry(key, |data| {
-                                        data.gpc1 = data.gpc1.saturating_add(1);
-                                        data.last_updated = std::time::Instant::now();
-                                    });
-                                }
-                            }
-                        }
-                    }
+                    ibex_config::HttpReqAction::ScIncGpc0 { sc } => sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::Zero, GpcOp::Inc),
+                    ibex_config::HttpReqAction::ScIncGpc1 { sc } => sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::One, GpcOp::Inc),
                     ibex_config::HttpReqAction::ScSetGpt0 { sc, expr } => {
-                        let sc_idx = *sc as usize;
-                        if sc_idx < 3 {
-                            if let Some((t_idx, ref key)) = sess.tracked_sc[sc_idx] {
-                                let val = resolve_gpt0_val(expr, registry, &make_ctx!(sess));
-                                if let Some(tbl) = proxies.get(t_idx).and_then(|p| p.stick_table.as_ref()) {
-                                    let _ = tbl.update_entry(key, |data| {
-                                        data.gpt0 = val;
-                                        data.last_updated = std::time::Instant::now();
-                                    });
-                                }
-                            }
-                        }
+                        let val = resolve_gpt0_val(expr, registry, &make_ctx!(sess));
+                        sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::Zero, GpcOp::SetTag(val));
+                    }
+                    ibex_config::HttpReqAction::ScIncGpc { idx, sc } => sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::Idx(*idx), GpcOp::Inc),
+                    ibex_config::HttpReqAction::ScAddGpc { idx, sc, expr } => {
+                        let n = resolve_gpt0_val(expr, registry, &make_ctx!(sess));
+                        sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::Idx(*idx), GpcOp::Add(u64::from(n)));
+                    }
+                    ibex_config::HttpReqAction::ScSetGpt { idx, sc, expr } => {
+                        let val = resolve_gpt0_val(expr, registry, &make_ctx!(sess));
+                        sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::Idx(*idx), GpcOp::SetTag(val));
                     }
                     ibex_config::HttpReqAction::WaitForBody { time_ms, at_least } => {
                         match wait_for_request_body(sess, &proxies[proxy_idx], be_stage, rule_idx, *time_ms, *at_least, now) {
@@ -8802,6 +8679,65 @@ fn eval_after_res_rules(
     Ok(())
 }
 
+/// `http-request track-sc<slot>` on `key` in the table of proxy `t_idx`: the entry is counted as a
+/// connection (not a session) and tracked once more. `HAProxy` leaves a slot that already
+/// tracks something alone; Ibex moves it to a different key, releasing the old entry -- it tracks
+/// a connection with the peer's address when it accepts it, before a PROXY header gives the
+/// source (T139: `canonical_haproxy_35_e2e` relies on the move).
+fn track_http_slot(proxies: &[Proxy], tracked: &mut [Option<(usize, StickKey)>; 3], slot: usize, t_idx: usize, key: StickKey) {
+    if tracked[slot].as_ref().is_some_and(|(old_idx, old_key)| *old_idx == t_idx && *old_key == key) {
+        return;
+    }
+    if let Some((old_idx, old_key)) = tracked[slot].take() {
+        proxies.get(old_idx).and_then(|p| p.stick_table.as_ref()).into_iter().for_each(|t| {
+            let _ = t.update_entry(&old_key, |data| data.untrack());
+        });
+    }
+    proxies.get(t_idx).and_then(|p| p.stick_table.as_ref()).into_iter().for_each(|t| {
+        let _ = t.update_entry(&key, |data| data.track(false));
+    });
+    tracked[slot] = Some((t_idx, key));
+}
+
+/// What a `sc-inc-gpc*`, `sc-add-gpc` or `sc-set-gpt*` rule does to the entry tracked in slot
+/// `sc`: nothing if none is, or if its table does not store the counter
+/// (`action_inc_gpc` and its siblings, `src/stick_table.c`).
+fn sc_gpc_rule(
+    proxies: &[Proxy],
+    tracked: &[Option<(usize, StickKey)>; 3],
+    sc: u8,
+    which: Gpc,
+    op: GpcOp,
+) {
+    tracked.get(usize::from(sc)).into_iter().flatten().for_each(|(t_idx, key)| {
+        proxies.get(*t_idx).and_then(|p| p.stick_table.as_ref()).into_iter().for_each(|table| {
+            let _ = table.gpc_op(key, true, which, op);
+        });
+    });
+}
+
+/// Applies `f` to the entry each stick counter of `sess` tracks.
+fn for_tracked(proxies: &[Proxy], sess: &TcpSession, f: impl Fn(&mut ibex_stick_table::StickEntryData)) {
+    sess.tracked_sc.iter().flatten().for_each(|(t_idx, key)| {
+        proxies.get(*t_idx).and_then(|p| p.stick_table.as_ref()).into_iter().for_each(|table| {
+            let _ = table.update_entry(key, |data| f(data));
+        });
+    });
+}
+
+/// The bytes `sess` has exchanged that its tracked entries are not credited yet, in and out:
+/// those of the requests that are over (`last`: all of them, the session ends). It is what
+/// `HAProxy` credits once it has produced a response: the bytes the client sent, and the ones
+/// the server sent -- a reply the proxy makes itself sends none.
+fn stick_bytes_due(sess: &TcpSession, last: bool) -> (u64, u64) {
+    let http = sess.mode == Mode::Http;
+    let upto = if last || !http { sess.bytes_in } else { sess.log.bytes_in_at_start };
+    // `last` is 0 or 1: the current request's server bytes and a tcp session's are only the last ones.
+    let end = u64::from(last);
+    let dout = if http { sess.stick_out_pending + sess.log.bytes_from_server * end } else { sess.bytes_out * end };
+    (upto.saturating_sub(sess.stick_acct_in), dout)
+}
+
 /// Sends a reply the proxy made itself -- `return`, `deny`, `redirect`, `auth`, an error
 /// page -- through the `http-after-response` rules first, as `http_forward_proxy_resp`
 /// does for every one of them. `be_idx` is the proxy standing as `s->be`: the frontend
@@ -8876,7 +8812,12 @@ fn after_res_on_reply<'r>(
     let mut res_caps = std::mem::take(&mut sess.log.res_captures);
     let res_caps_in = res_caps.clone();
     let result = {
+        // The reply is the proxy's own, and the rules read the same state they read on a server's.
+        let view = ProxiesView(proxies);
+        let stick = StickView::new(proxies, &sess.tracked_sc);
         let ctx = SampleContext {
+            proxies: Some(&view),
+            stick: Some(&stick),
             client_addr: sess.client_addr,
             server_addr: sess.server_addr,
             fc_src: sess.fc_src,

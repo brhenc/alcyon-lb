@@ -62,6 +62,11 @@ const ARG_REFUSED: &[(&str, &str, &str)] = &[
     ("http-request set-var(txn.x) nbsrv(nope)", "", "unable to find backend 'nope'"),
     ("http-request set-header x %[be_conn_free(nope)]", "", "unable to find backend 'nope'"),
     ("http-request set-header x %[srv_conn_free(be/zz)]", "", "unable to find server 'zz' in proxy 'be'"),
+    // T139, measured: the array forms need the table (or the counter) argument, empty at most.
+    ("http-request set-header x %[src_get_gpc(0)]", "", "missing arguments (got 1/2), type 'table' expected"),
+    ("http-request set-header x %[src_inc_gpc(0)]", "", "missing arguments (got 1/2), type 'table' expected"),
+    ("http-request set-header x %[sc_get_gpc(0)]", "", "missing arguments (got 1/2), type 'integer' expected"),
+    ("http-request set-header x %[src,table_gpc(0)]", "", "invalid arg 2 in converter 'table_gpc' : missing arguments (got 1/2), type 'table' expected"),
     ("http-request set-header x %[src_trackers]", "", "unknown fetch method 'src_trackers'"),
     ("http-request set-header x %[src_in_table]", "", "unknown fetch method 'src_in_table'"),
 ];
@@ -78,6 +83,12 @@ const ACCEPTED: &[(&str, &str)] = &[
     ("http-request set-var(txn.x) nbsrv(be)", ""),
     ("", "unique-id-format %[srv_is_up(s1)]\n  option httpchk\n  http-check send hdr x %[unique-id]"),
     ("http-request set-header x %[str(fe),fe_exists]", ""),
+    // Implemented by T139 (they were refused: "Ibex keeps no tracker count", and so on).
+    ("http-request set-header x %[sc_trackers(0)]", ""),
+    ("http-request set-header x %[src,table_server_id(be)]", ""),
+    ("http-request set-header x %[src,table_expire(be)]", ""),
+    ("http-request set-header x %[src,table_inc_gpc0(be)]", ""),
+    ("http-request set-header x %[src,table_bytes_in_rate(be)]", ""),
 ];
 
 /// `(frontend rule, backend rule, the keyword the error must name)`.
@@ -89,11 +100,6 @@ const NOT_IMPLEMENTED: &[(&str, &str, &str)] = &[
     ("http-request set-var(txn.x) be_conn(be)", "", "be_conn"),
     ("http-request set-var(txn.x) str(be/s1),srv_queue", "", "srv_queue"),
     ("", "http-request set-header x %[be_conn]", "be_conn"),
-    ("http-request set-header x %[sc_trackers(0)]", "", "sc_trackers"),
-    ("http-request set-header x %[src,table_server_id(be)]", "", "table_server_id"),
-    ("acl t src,table_expire(be) gt 1\n  http-request deny if t", "", "table_expire"),
-    ("http-request set-header x %[src,table_inc_gpc0(be)]", "", "table_inc_gpc0"),
-    ("http-request set-header x %[src,table_http_req_rate(be)]\n  http-request set-header y %[src,table_bytes_in_rate(be)]", "", "table_bytes_in_rate"),
     ("", "option httpchk\n  http-check send hdr x %[queue]", "queue"),
 ];
 

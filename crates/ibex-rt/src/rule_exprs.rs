@@ -134,6 +134,8 @@ fn http_req(a: &HttpReqAction) -> Exprs<'_> {
         HttpReqAction::SetVar { var_name, expr } => vec![(format!("set-var({var_name})"), expr, false)],
         HttpReqAction::Capture { expr, .. } => vec![("capture".into(), expr, false)],
         HttpReqAction::ScSetGpt0 { sc, expr } => vec![(format!("sc-set-gpt0({sc})"), expr, true)],
+        HttpReqAction::ScAddGpc { idx, sc, expr } => vec![(format!("sc-add-gpc({idx},{sc})"), expr, true)],
+        HttpReqAction::ScSetGpt { idx, sc, expr } => vec![(format!("sc-set-gpt({idx},{sc})"), expr, true)],
         _ => Vec::new(),
     }
 }
@@ -182,6 +184,8 @@ fn tcp_session(a: &TcpReqSessionAction) -> Exprs<'_> {
         TcpReqSessionAction::SetSrc { expr } => vec![("set-src".into(), expr, false)],
         TcpReqSessionAction::SetDst { expr } => vec![("set-dst".into(), expr, false)],
         TcpReqSessionAction::ScSetGpt0 { sc, expr } => vec![(format!("sc-set-gpt0({sc})"), expr, true)],
+        TcpReqSessionAction::ScAddGpc { idx, sc, expr } => vec![(format!("sc-add-gpc({idx},{sc})"), expr, true)],
+        TcpReqSessionAction::ScSetGpt { idx, sc, expr } => vec![(format!("sc-set-gpt({idx},{sc})"), expr, true)],
         _ => Vec::new(),
     }
 }
@@ -195,6 +199,8 @@ fn tcp_content(a: &TcpReqContentAction) -> Exprs<'_> {
         TcpReqContentAction::SetSrc { expr } => vec![("set-src".into(), expr, false)],
         TcpReqContentAction::SetDst { expr } => vec![("set-dst".into(), expr, false)],
         TcpReqContentAction::ScSetGpt0 { sc, expr } => vec![(format!("sc-set-gpt0({sc})"), expr, true)],
+        TcpReqContentAction::ScAddGpc { idx, sc, expr } => vec![(format!("sc-add-gpc({idx},{sc})"), expr, true)],
+        TcpReqContentAction::ScSetGpt { idx, sc, expr } => vec![(format!("sc-set-gpt({idx},{sc})"), expr, true)],
         _ => Vec::new(),
     }
 }

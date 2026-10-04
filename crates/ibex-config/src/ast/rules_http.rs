@@ -154,6 +154,22 @@ pub enum HttpReqAction {
         sc: u8,
         expr: String,
     },
+    /// `sc-inc-gpc(<idx>,<sc>)`, `sc-add-gpc(<idx>,<sc>) <value>`, `sc-set-gpt(<idx>,<sc>) <value>`:
+    /// the array form of the general purpose storage.
+    ScIncGpc {
+        idx: usize,
+        sc: u8,
+    },
+    ScAddGpc {
+        idx: usize,
+        sc: u8,
+        expr: String,
+    },
+    ScSetGpt {
+        idx: usize,
+        sc: u8,
+        expr: String,
+    },
     /// `http-request wait-for-body time <t> [at-least <bytes>]`: the rules after this one
     /// run once the request body is complete, or `at_least` bytes of it are here, or the
     /// buffer is full; `time_ms` after the rule is reached, the client gets a 408. `None`

@@ -142,6 +142,11 @@ pub struct TcpSession {
     pub retry_after: Tick,
     pub bytes_in: u64,
     pub bytes_out: u64,
+    /// What the stick-table entries this session tracks have been credited of `bytes_in`
+    /// (`flush_stick_bytes`).
+    pub stick_acct_in: u64,
+    /// What the servers sent in the requests that are over and not credited yet.
+    pub stick_out_pending: u64,
     pub ending: Option<Ending>,
     pub accept_proxy: bool,
     pub accept_proxy_v2: bool,
@@ -268,6 +273,8 @@ impl TcpSession {
             conn_exp: Tick::ETERNITY,
             bytes_in: 0,
             bytes_out: 0,
+            stick_acct_in: 0,
+            stick_out_pending: 0,
             ending: None,
             accept_proxy: false,
             accept_proxy_v2: false,
@@ -678,6 +685,7 @@ impl TcpSession {
     /// Clears what belonged to the transaction that just ended, so the next request on
     /// this connection starts from nothing. The one place that list lives.
     pub fn reset_for_next_request(&mut self) {
+        self.stick_out_pending += self.log.bytes_from_server;
         self.log = crate::txnlog::StreamLog::start(self.bytes_in, self.bytes_out);
         self.txn = None;
         self.req_method = None;
