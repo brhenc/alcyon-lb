@@ -551,7 +551,11 @@ pub(crate) fn parse_frontend_directive(
         "monitor-uri" => parse_monitor_uri(&mut fe.monitor_uri, tokens, kw),
         "default_backend" => parse_default_backend(&mut fe.default_backend, tokens, kw),
         "stick-table" => parse_stick_table(&mut fe.stick_table, tokens, kw),
-        "stick" => parse_stick_rule(&mut fe.stick_rules, tokens, kw),
+        // A frontend has no backend capability: `HAProxy` warns and ignores the line.
+        "stick" => {
+            eprintln!("[ibex] warning: 'stick' ignored because frontend '{}' has no backend capability.", fe.name);
+            Ok(())
+        }
         "track-sc0" | "track-sc1" | "track-sc2" => {
             parse_track_rule(&mut fe.stick_rules, tokens, kw)
         }

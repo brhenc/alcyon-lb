@@ -4542,6 +4542,18 @@ fn init_client_session(
 
     // `use-server` of a proxy that serves directly (a TCP `listen`).
     let use_server = EngineDispatcher::use_server(&sess, proxy_idx, proxies);
+    // `stick match` of a TCP `listen` that connects right here (`stick` rules wait for the
+    // inspection of the request otherwise: `connect_tcp_backend`).
+    let use_server = use_server.or_else(|| {
+        let p = &proxies[proxy_idx];
+        let direct = mode == Mode::Tcp
+            && !sess.accept_proxy
+            && p.tcp_req_inspect_delay.is_none()
+            && p.tcp_req_content_rules.is_empty()
+            && p.use_backends.is_empty()
+            && p.default_backend.is_none();
+        direct.then(|| EngineDispatcher::sticking_rules(&mut sess, proxy_idx, proxies, false)).flatten()
+    });
     let proxy = &mut proxies[proxy_idx];
 
     let has_inspect = proxy.tcp_req_inspect_delay.is_some() || !proxy.tcp_req_content_rules.is_empty();
@@ -5340,6 +5352,69 @@ impl EngineDispatcher<'_> {
         None
     }
 
+    /// `process_sticking_rules` (`src/stream.c`): the backend's `stick` rules on a request.
+    /// The server a `stick match` finds for the request is returned, unless `assigned`
+    /// (`use-server` or a persistence cookie chose already). The keys of `stick on` and
+    /// `stick store-request` are queued to be stored with the server that answers
+    /// ([`commit_stick_stores`]); the first of them for a table wins, and a rule that stores
+    /// for a table that has one is skipped whole, its match included.
+    fn sticking_rules(sess: &mut TcpSession, be_idx: usize, proxies: &[Proxy], mut assigned: bool) -> Option<usize> {
+        use ibex_config::StickRuleType::{StickMatch, StickOn, StickStoreRequest};
+        let be = &proxies[be_idx];
+        if be.stick_rules.is_empty() {
+            return None;
+        }
+        let view = ProxiesView(proxies);
+        let stick = StickView::new(proxies, &sess.tracked_sc);
+        let ctx = Self::request_ctx(sess, be, &view, &stick);
+        let registry = sample_registry();
+        let mut found = None;
+        let mut stores: Vec<(usize, StickKey)> = Vec::new();
+        for rule in &be.stick_rules {
+            let is_store = matches!(rule.rule_type, StickOn | StickStoreRequest);
+            let is_match = matches!(rule.rule_type, StickOn | StickMatch);
+            if !is_store && !is_match {
+                continue;
+            }
+            let t_idx = match &rule.table {
+                Some(name) => proxies.iter().position(|p| p.name == *name),
+                None => Some(be_idx),
+            };
+            let Some((t_idx, tbl)) = t_idx.and_then(|i| Some((i, proxies[i].stick_table.as_ref()?))) else {
+                continue;
+            };
+            if is_store && sess.stick_stores.iter().chain(stores.iter()).any(|(t, _)| *t == t_idx) {
+                continue;
+            }
+            if rule.cond.as_ref().is_some_and(|c| !crate::proxy::eval_acl_condition(c, &be.acls, registry, &ctx)) {
+                continue;
+            }
+            let Some(key) = resolve_sample_stick_key(&rule.expr, registry, &ctx, Some(tbl)) else {
+                continue;
+            };
+            if is_match {
+                if let Ok(Some(entry)) = tbl.get_entry(&key) {
+                    if !assigned {
+                        // The server stored by its id, if it is still there and not stopped.
+                        let i = entry.server_id.and_then(|id| (0..be.servers.len()).find(|&i| be.server_puid(i) == id));
+                        let up = |i: usize| be.server_statuses.get(i).is_none_or(|s| !matches!(ServerStatus::from(s.load(Ordering::Relaxed)), ServerStatus::Down | ServerStatus::Maint));
+                        if let Some(i) = i.filter(|&i| up(i)) {
+                            found = Some(i);
+                            assigned = true;
+                        }
+                    }
+                    // `stktable_touch_local`: the entry lives on.
+                    let _ = tbl.update_entry(&key, |_| {});
+                }
+            }
+            if is_store && stores.len() + sess.stick_stores.len() < 8 {
+                stores.push((t_idx, key));
+            }
+        }
+        sess.stick_stores.extend(stores);
+        found
+    }
+
     /// One pass over the HTTP transaction, after the byte layer has run: the reply owed
     /// for an unparsable request, request rules and routing (once per transaction), the
     /// response head, how each side ended, and the end of the transaction.
@@ -5748,6 +5823,16 @@ impl EngineDispatcher<'_> {
             if !entry.sess.is_done() {
                 let _ = entry.sess.process(now);
             }
+            // A TCP stream stores what its `stick` rules took once the server has accepted
+            // the connection (`AN_RES_STORE_RULES` runs on the first event of the response
+            // side); a server that refused stores nothing.
+            if !entry.sess.stick_stores.is_empty()
+                && entry.sess.mode == Mode::Tcp
+                && entry.sess.log.connect.is_some()
+            {
+                let stores = std::mem::take(&mut entry.sess.stick_stores);
+                commit_stick_stores(stores.into_iter(), self.proxies, entry.srv_backend_idx, entry.target_server_idx);
+            }
 
             // Step 3.1: a TLS handshake with the server that failed (certificate refused,
             // a peer not speaking TLS) is a connect failure: `HAProxy` retries it and,
@@ -6043,7 +6128,18 @@ impl EngineDispatcher<'_> {
             }
         };
 
-        let has_rules = !proxies[be_idx].http_res_rules.is_empty()
+        // `stick store-response` reads the response head: it takes the slow path below, where
+        // the response's fetches are set up. Without one, the keys of the request are stored
+        // here, with the server that answered.
+        let store_rsp = wait.is_none()
+            && proxies[be_idx].stick_rules.iter().any(|r| r.rule_type == ibex_config::StickRuleType::StickStoreResponse);
+        if wait.is_none() && !store_rsp && !entry.sess.stick_stores.is_empty() {
+            let stores = std::mem::take(&mut entry.sess.stick_stores);
+            commit_stick_stores(stores.into_iter(), proxies, entry.srv_backend_idx, entry.target_server_idx);
+        }
+
+        let has_rules = store_rsp
+            || !proxies[be_idx].http_res_rules.is_empty()
             || !proxies[be_idx].http_after_res_rules.is_empty()
             || !proxies[fe_idx].http_res_rules.is_empty()
             || !proxies[fe_idx].http_after_res_rules.is_empty()
@@ -6145,6 +6241,8 @@ impl EngineDispatcher<'_> {
         let srv_ended = matches!(entry.sess.srv_state, ScState::ShutR | ScState::Closed | ScState::Error);
         let srv_timed_out = entry.sess.ending == Some(crate::proxy::Ending::Timeout(crate::proxy::Which::Server));
 
+        // The keys of the request, and the response's own, wait for the server's id.
+        let mut stick_stores = std::mem::take(&mut entry.sess.stick_stores);
         let stick = StickView::new(proxies, &entry.sess.tracked_sc);
         let ctx = SampleContext {
             proxies: Some(&ProxiesView(proxies)),
@@ -6187,6 +6285,33 @@ impl EngineDispatcher<'_> {
                 .map(String::as_str),
             ..Default::default()
         };
+
+        // `process_store_rules`: `stick store-response` takes a key from the response (the
+        // first per table, none where the request already stored one), and every key queued
+        // is stored with the server that sent it, ahead of the `http-response` rules.
+        if store_rsp {
+            let be = &proxies[be_idx];
+            let from_request = stick_stores.len();
+            for rule in be.stick_rules.iter().filter(|r| r.rule_type == ibex_config::StickRuleType::StickStoreResponse) {
+                let t_idx = match &rule.table {
+                    Some(name) => proxies.iter().position(|p| p.name == *name),
+                    None => Some(be_idx),
+                };
+                let Some((t_idx, tbl)) = t_idx.and_then(|i| Some((i, proxies[i].stick_table.as_ref()?))) else {
+                    continue;
+                };
+                if stick_stores[from_request..].iter().any(|(t, _)| *t == t_idx) || stick_stores.len() >= 8 {
+                    continue;
+                }
+                if rule.cond.as_ref().is_some_and(|c| !crate::proxy::eval_acl_condition(c, &be.acls, registry, &ctx)) {
+                    continue;
+                }
+                if let Some(key) = resolve_sample_stick_key(&rule.expr, registry, &ctx, Some(tbl)) {
+                    stick_stores.push((t_idx, key));
+                }
+            }
+        }
+        commit_stick_stores(stick_stores.drain(..), proxies, entry.srv_backend_idx, entry.target_server_idx);
 
         // `tcp-response content reject`: the response is dropped and the client connection
         // closed with nothing sent, as HAProxy does -- not answered with a 502.
@@ -7591,6 +7716,9 @@ impl EngineDispatcher<'_> {
         // `use-server` comes first: a server it picked (SF_ASSIGNED) is not overridden by
         // the cookie, which is still cut as above.
         let cookie_server = Self::use_server(&entry.sess, be_idx, proxies).or(cookie_server);
+        // `stick match` after those (`SF_ASSIGNED`); the keys to store are queued either way.
+        let assigned = cookie_server.is_some();
+        let cookie_server = cookie_server.or(Self::sticking_rules(&mut entry.sess, be_idx, proxies, assigned));
         let target = if let Some(idx) = cookie_server {
             Some(proxies[be_idx].servers[idx])
         } else {
@@ -7823,7 +7951,9 @@ impl EngineDispatcher<'_> {
         }
 
         let source_ip = entry.sess.client_addr.map(|a| a.ip());
-        let target = match Self::use_server(&entry.sess, be_idx, proxies) {
+        let chosen = Self::use_server(&entry.sess, be_idx, proxies);
+        let assigned = chosen.is_some();
+        let target = match chosen.or(Self::sticking_rules(&mut entry.sess, be_idx, proxies, assigned)) {
             Some(i) => Some(proxies[be_idx].servers[i]),
             None => proxies[be_idx].select_server_with_key(source_ip, entry.sess.req_uri.as_deref()),
         };
@@ -8512,6 +8642,19 @@ fn apply_normalize_uri(
             Ok(encoded)
         }
         _ => Ok(uri.to_string()),
+    }
+}
+
+/// `process_store_rules`: each key queued for a table is stored there with the id of the
+/// server of backend `be_idx` that answered (`server_idx`); with no server, they are dropped.
+fn commit_stick_stores(stores: impl Iterator<Item = (usize, StickKey)>, proxies: &[Proxy], be_idx: usize, server_idx: Option<usize>) {
+    let Some(id) = server_idx.map(|i| proxies[be_idx].server_puid(i)) else {
+        return;
+    };
+    for (t_idx, key) in stores {
+        if let Some(tbl) = proxies.get(t_idx).and_then(|p| p.stick_table.as_ref()) {
+            let _ = tbl.update_entry(&key, |d| d.server_id = Some(id));
+        }
     }
 }
 

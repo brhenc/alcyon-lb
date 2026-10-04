@@ -444,6 +444,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
     }
     apply_ssl_server_verify(global.as_ref().and_then(|g| g.ssl_server_verify), &mut listens, &mut backends)?;
 
+    stick::allocate_server_id(&mut listens, &mut frontends, &mut backends);
     validate_config(global.as_ref(), &listens, &frontends, &backends)?;
     let mut userlists = take_userlists();
     for list in &mut userlists {
@@ -1369,6 +1370,7 @@ pub(crate) fn validate_config(
         }
     }
     validate_tracking(listens, backends)?;
+    stick::validate_stick_rules(listens, frontends, backends)?;
     for proxy in listens {
         if proxy.mode == Mode::Http && proxy.cookie.is_some() && proxy.servers.is_empty() {
             return Err(ConfigError::new(
@@ -1647,10 +1649,9 @@ frontend fe_rate
         assert_eq!(st.size, 100 * 1024);
         assert_eq!(st.expire, Duration::from_secs(30));
         assert_eq!(st.store_fields, vec!["conn_rate(10s)", "conn_cur"]);
-        assert_eq!(fe.stick_rules.len(), 2);
-        assert_eq!(fe.stick_rules[0].rule_type, StickRuleType::StickOn);
-        assert_eq!(fe.stick_rules[0].expr, "src");
-        assert_eq!(fe.stick_rules[1].rule_type, StickRuleType::TrackSc0);
+        // `stick on` in a frontend is ignored, as `HAProxy` does; `track-sc0` is kept.
+        assert_eq!(fe.stick_rules.len(), 1);
+        assert_eq!(fe.stick_rules[0].rule_type, StickRuleType::TrackSc0);
     }
 
     #[test]

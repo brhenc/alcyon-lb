@@ -56,35 +56,118 @@ pub(crate) fn parse_stick_table(
     Ok(())
 }
 
+/// `stick on|match|store-request|store-response <pattern> [table <t>] [{if|unless} <cond>]`.
+/// `HAProxy`'s words for what it refuses (`parse_stick`, `src/stick_table.c`).
 pub(crate) fn parse_stick_rule(
     rules: &mut Vec<StickRule>,
     tokens: &[Token],
     kw: &Token,
 ) -> Result<(), ConfigError> {
-    if tokens.len() < 3 || tokens[1].text.is_empty() || tokens[2].text.is_empty() {
-        return Err(ConfigError::new(
-            kw.line,
-            kw.col,
-            "<stick> expects <action> and <sample> as arguments.",
-        ));
-    }
-    let rule_type = match tokens[1].text.as_str() {
+    let fail = |at: &Token, msg: String| Err(ConfigError::new(at.line, at.col, msg));
+    let Some(action) = tokens.get(1).filter(|t| !t.text.is_empty()) else {
+        return fail(kw, "'stick' expects 'on', 'match', or 'store'.".to_string());
+    };
+    let rule_type = match action.text.as_str() {
         "on" => StickRuleType::StickOn,
         "match" => StickRuleType::StickMatch,
         "store-request" => StickRuleType::StickStoreRequest,
         "store-response" => StickRuleType::StickStoreResponse,
-        other => {
-            return Err(ConfigError::new(
-                tokens[1].line,
-                tokens[1].col,
-                format!("unknown stick action <{other}>"),
-            ));
+        _ => return fail(action, "'stick' expects 'on', 'match', or 'store'.".to_string()),
+    };
+    let Some(expr) = tokens.get(2).filter(|t| !t.text.is_empty()) else {
+        return fail(kw, "'stick' expects a fetch method.".to_string());
+    };
+    let mut rule = StickRule::new(rule_type, expr.text.clone());
+    let mut i = 3;
+    while let Some(tok) = tokens.get(i) {
+        match tok.text.as_str() {
+            "table" => {
+                rule.table = Some(tokens.get(i + 1).map(|t| t.text.clone()).unwrap_or_default());
+                i += 2;
+            }
+            "if" | "unless" => {
+                rule.cond = parse_acl_condition_from_tokens(&tokens[i..])?;
+                break;
+            }
+            other => return fail(tok, format!("'stick': unknown keyword '{other}'.")),
+        }
+    }
+    rules.push(rule);
+    Ok(())
+}
+
+/// A rule that looks keys up or stores them with a server: not `track-sc*`.
+fn is_sticking(r: &StickRule) -> bool {
+    !matches!(r.rule_type, StickRuleType::TrackSc0 | StickRuleType::TrackSc1 | StickRuleType::TrackSc2)
+}
+
+/// Checked when the configuration loads, as `HAProxy` checks it after parsing
+/// (`check_config_validity`): the table each `stick` rule names exists ("Proxy 'b': unable
+/// to find stick-table 'b'."), and a TCP proxy has no response to take a key from.
+pub(crate) fn validate_stick_rules(
+    listens: &[ListenSection],
+    frontends: &[FrontendSection],
+    backends: &[BackendSection],
+) -> Result<(), ConfigError> {
+    let has_table = |name: &str| {
+        listens.iter().any(|p| p.name == name && p.stick_table.is_some())
+            || frontends.iter().any(|p| p.name == name && p.stick_table.is_some())
+            || backends.iter().any(|p| p.name == name && p.stick_table.is_some())
+    };
+    let sections = listens
+        .iter()
+        .map(|p| (&p.name, p.mode, &p.stick_rules))
+        .chain(backends.iter().map(|p| (&p.name, p.mode, &p.stick_rules)));
+    for (name, mode, rules) in sections {
+        for r in rules.iter().filter(|r| is_sticking(r)) {
+            let table = r.table.as_deref().unwrap_or(name);
+            if !has_table(table) {
+                return Err(ConfigError::new(1, 1, format!("Proxy '{name}': unable to find stick-table '{table}'.")));
+            }
+            if mode == Mode::Tcp && r.rule_type == StickRuleType::StickStoreResponse {
+                return Err(ConfigError::new(
+                    1,
+                    1,
+                    format!(
+                        "Proxy '{name}': 'stick store-response' is not supported in TCP mode: Ibex does not \
+                         inspect the response there, so a key taken from it could not be stored."
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A table a `stick` rule uses holds the server's id whether or not `store` says so
+/// (`stktable_alloc_data_type(.., STKTABLE_DT_SERVER_ID, ..)` in `parse_stick`).
+pub(crate) fn allocate_server_id(
+    listens: &mut [ListenSection],
+    frontends: &mut [FrontendSection],
+    backends: &mut [BackendSection],
+) {
+    let mut used: Vec<String> = Vec::new();
+    let sections = listens
+        .iter()
+        .map(|p| (&p.name, &p.stick_rules))
+        .chain(backends.iter().map(|p| (&p.name, &p.stick_rules)));
+    for (name, rules) in sections {
+        used.extend(rules.iter().filter(|r| is_sticking(r)).map(|r| r.table.clone().unwrap_or_else(|| name.clone())));
+    }
+    let add = |name: &str, table: &mut Option<StickTableConfigAst>| {
+        if let Some(t) = table.as_mut().filter(|t| used.iter().any(|u| u == name) && !t.store_fields.iter().any(|f| f == "server_id")) {
+            t.store_fields.push("server_id".to_string());
         }
     };
-    let expr_tokens: Vec<&str> = tokens[2..].iter().map(|t| t.text.as_str()).collect();
-    let expr = expr_tokens.join(" ");
-    rules.push(StickRule { rule_type, expr });
-    Ok(())
+    for p in listens.iter_mut() {
+        add(&p.name.clone(), &mut p.stick_table);
+    }
+    for p in frontends.iter_mut() {
+        add(&p.name.clone(), &mut p.stick_table);
+    }
+    for p in backends.iter_mut() {
+        add(&p.name.clone(), &mut p.stick_table);
+    }
 }
 
 pub(crate) fn parse_track_rule(
@@ -106,7 +189,7 @@ pub(crate) fn parse_track_rule(
     };
     let expr_tokens: Vec<&str> = tokens[1..].iter().map(|t| t.text.as_str()).collect();
     let expr = expr_tokens.join(" ");
-    rules.push(StickRule { rule_type, expr });
+    rules.push(StickRule::new(rule_type, expr));
     Ok(())
 }
 

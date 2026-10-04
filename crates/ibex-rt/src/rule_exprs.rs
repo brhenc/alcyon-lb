@@ -344,6 +344,35 @@ pub fn validate_rule_exprs(config: &Config, registry: &Registry) -> Result<(), S
     sections.iter().try_for_each(|s| s.check(config, registry))
 }
 
+/// Checks the pattern of every `stick on|match|store-request|store-response` rule: the fetch
+/// and converters exist ("'stick': unknown fetch method 'nosuch'", `parse_stick`).
+///
+/// # Errors
+/// The first unknown fetch or converter, with the section and the rule named.
+pub fn validate_stick_rules(config: &Config, registry: &Registry) -> Result<(), String> {
+    use ibex_config::StickRuleType;
+    let sections = config
+        .listens
+        .iter()
+        .map(|p| (format!("proxy '{}'", p.name), Where { section: SectionKind::Listen, proxy: Some(&p.name) }, &p.stick_rules))
+        .chain(config.backends.iter().map(|p| (format!("backend '{}'", p.name), Where { section: SectionKind::Backend, proxy: Some(&p.name) }, &p.stick_rules)));
+    for (what, at, rules) in sections {
+        for r in rules {
+            let kw = match r.rule_type {
+                StickRuleType::StickOn => "stick on",
+                StickRuleType::StickMatch => "stick match",
+                StickRuleType::StickStoreRequest => "stick store-request",
+                StickRuleType::StickStoreResponse => "stick store-response",
+                _ => continue,
+            };
+            check_sample_expr(&r.expr, registry)
+                .and_then(|()| check_expr(config, registry, at, &r.expr, false))
+                .map_err(|e| format!("error detected in {what} while parsing '{kw}' rule : {e}"))?;
+        }
+    }
+    Ok(())
+}
+
 /// [`validate_rule_exprs`] against the registry the engine evaluates with.
 ///
 /// # Errors
@@ -353,6 +382,7 @@ pub fn validate_config(config: &Config) -> Result<(), String> {
     crate::proxy_state::check_sample_refs(config, registry)?;
     validate_acls(config)?;
     validate_rule_exprs(config, registry)?;
+    validate_stick_rules(config, registry)?;
     validate_formats(config, registry)
 }
 

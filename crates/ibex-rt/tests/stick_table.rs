@@ -80,10 +80,7 @@ fn test_stick_table_tracking_and_cli_show_table() {
                     "http_req_rate(10s)".into(),
                 ],
             }),
-            stick_rules: vec![StickRule {
-                rule_type: StickRuleType::TrackSc0,
-                expr: "src".into(),
-            }],
+            stick_rules: vec![StickRule::new(StickRuleType::TrackSc0, "src".into())],
             ..Default::default()
         }],
         backends: vec![BackendSection {

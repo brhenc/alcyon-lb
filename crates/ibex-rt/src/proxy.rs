@@ -200,6 +200,9 @@ pub struct TcpSession {
     /// What this stream measured for its log line, and its captures and unique ID.
     pub log: crate::txnlog::StreamLog,
     pub tracked_sc: [Option<(usize, StickKey)>; 3],
+    /// The keys `stick on` and `stick store-request` took from the request, each with the
+    /// proxy whose table keeps it: stored with the server that answers.
+    pub stick_stores: Vec<(usize, StickKey)>,
     pub bufsize: usize,
     pub maxrewrite: usize,
     pub h2_ctx: Option<H2MuxContext>,
@@ -313,6 +316,7 @@ impl TcpSession {
             req_vars: HashMap::new(),
             log: crate::txnlog::StreamLog::start(0, 0),
             tracked_sc: [None, None, None],
+            stick_stores: Vec::new(),
             h2_ctx: None,
             h2_active_stream_id: None,
             h2_flood_config: ibex_proto::H2FloodConfig::default(),
@@ -728,6 +732,7 @@ impl TcpSession {
         // The stream is running, so its variables are in the thread's map
         // (`engine::with_stream_vars`): the transaction's go from there too.
         ibex_sample::CURRENT_VARS.with(|v| v.borrow_mut().retain(|k, _| k.starts_with("sess.")));
+        self.stick_stores.clear();
         self.is_first_req = false;
         self.cli_state = ScState::Ready;
     }
