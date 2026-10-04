@@ -304,16 +304,9 @@ impl ProxyStats {
 
 
 
-/// A configured proxy instance.
-#[derive(Debug, Clone)]
-// More than three bools, and they are genuinely independent switches rather than a state
-// machine: PROXY protocol on accept, v2 on accept, and the two logging options. Grouping
-// them into an enum would model a relationship that does not exist.
-#[allow(clippy::struct_excessive_bools)]
-pub struct Proxy {
-    /// The proxy's index in the engine's list, which the engine addresses it by. Not the
-    /// number `HAProxy` shows for it: that is [`Proxy::iid`].
-    pub id: u32,
+/// What [`Proxy::ids`] holds.
+#[derive(Debug, Clone, Default)]
+pub struct ProxyIdInfo {
     /// The proxy's numeric id (`uuid`): `iid` in `show stat`, `be_id` in `show servers
     /// state`, what `fe_id` and `be_id` read. Numbered in the order the sections were
     /// written, from 2, around the ones that asked for an `id` (`Config::proxy_ids`).
@@ -335,6 +328,21 @@ pub struct Proxy {
     pub server_init_health: Vec<u32>,
     /// Each listener's numeric id (`luid`) by `bind` line, as `so_id` reads it.
     pub listener_ids: Vec<u32>,
+}
+
+/// A configured proxy instance.
+#[derive(Debug, Clone)]
+// More than three bools, and they are genuinely independent switches rather than a state
+// machine: PROXY protocol on accept, v2 on accept, and the two logging options. Grouping
+// them into an enum would model a relationship that does not exist.
+#[allow(clippy::struct_excessive_bools)]
+pub struct Proxy {
+    /// The proxy's index in the engine's list, which the engine addresses it by. Not the
+    /// number `HAProxy` shows for it: that is [`Proxy::iid`].
+    pub id: u32,
+    /// The ids of the proxy, its servers and its listeners: cold (the CLI, `show stat` and the
+    /// id fetches read them), so boxed, as every proxy pays for the struct.
+    pub ids: Box<ProxyIdInfo>,
     pub name: String,
     /// A `frontend` or a `listen`: what `fe_exists` looks for.
     pub has_frontend: bool,
@@ -385,7 +393,7 @@ pub struct Proxy {
     /// instantiated, and only `force-be-switch` lets a rule choose one (then it has no
     /// server to give).
     pub disabled_backends: Arc<Vec<String>>,
-    pub monitor_uri: Option<String>,
+    pub monitor_uri: Option<Box<str>>,
     pub acls: HashMap<String, Expr>,
     pub stick_table: Option<Arc<StickTable>>,
     pub stick_rules: Vec<StickRule>,
@@ -470,19 +478,19 @@ impl Proxy {
     /// `srv_check_health` of the server at `idx` while no check runs on it.
     #[must_use]
     pub fn server_init_health(&self, idx: usize) -> u32 {
-        self.server_init_health.get(idx).copied().unwrap_or(0)
+        self.ids.server_init_health.get(idx).copied().unwrap_or(0)
     }
 
     /// The numeric id of the server at `idx` (`puid`).
     #[must_use]
     pub fn server_puid(&self, idx: usize) -> u32 {
-        self.server_puids.get(idx).copied().unwrap_or_else(|| u32::try_from(idx + 1).unwrap_or(u32::MAX))
+        self.ids.server_puids.get(idx).copied().unwrap_or_else(|| u32::try_from(idx + 1).unwrap_or(u32::MAX))
     }
 
     /// Whether the server at `idx` has an `id` of its own (`SRV_F_FORCED_ID`).
     #[must_use]
     pub fn server_forced_id(&self, idx: usize) -> bool {
-        self.server_forced_ids.get(idx).copied().unwrap_or(false)
+        self.ids.server_forced_ids.get(idx).copied().unwrap_or(false)
     }
 
     /// Returns the indices of eligible servers for request routing.
@@ -1175,9 +1183,9 @@ fn stream_sample_ctx<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, view: 
         req_method: s.req_method.as_deref(),
         req_headers: s.req_headers.as_deref(),
         fe_name: Some(&fe.name),
-        fe_id: Some(fe.iid),
+        fe_id: Some(fe.ids.iid),
         be_name: Some(&be.name),
-        be_id: Some(be.iid),
+        be_id: Some(be.ids.iid),
         so_name: s.so_name.as_deref(),
         so_id: s.so_id,
         captures_req_hdr: Some(&s.log.req_captures),
@@ -1594,13 +1602,16 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, list
 
     Proxy {
         id: usize_to_u32(proxy_idx),
-        iid: ids.iid,
-        decl: ids.decl,
-        forced_id: ids.forced,
-        server_puids: server_puids(listen.servers.len(), &listen.server_extras),
-        server_forced_ids: server_forced_ids(listen.servers.len(), &listen.server_extras),
-        server_init_health: server_init_health(listen.servers.len(), &listen.server_extras),
-        listener_ids: ibex_config::ast::listener_ids(&listen.binds),
+        ids: Box::new(ProxyIdInfo {
+            iid: ids.iid,
+            decl: ids.decl,
+            forced_id: ids.forced,
+            server_puids: server_puids(listen.servers.len(), &listen.server_extras),
+            server_forced_ids: server_forced_ids(listen.servers.len(), &listen.server_extras),
+            server_init_health: server_init_health(listen.servers.len(), &listen.server_extras),
+            listener_ids: ibex_config::ast::listener_ids(&listen.binds),
+            ..ProxyIdInfo::default()
+        }),
         name: listen.name.clone(),
         has_frontend: true,
         has_backend: true,
@@ -1644,7 +1655,7 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, list
         use_servers: listen.use_servers.clone(),
         force_be_switch: listen.force_be_switch.clone(),
         disabled_backends: Arc::default(),
-        monitor_uri: listen.monitor_uri.clone(),
+        monitor_uri: listen.monitor_uri.as_deref().map(Into::into),
         acls: compile_acls(&listen.acls),
         stick_table,
         stick_rules: listen.stick_rules.clone(),
@@ -1709,13 +1720,16 @@ fn init_proxy_from_frontend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, fe
 
     Proxy {
         id: usize_to_u32(proxy_idx),
-        iid: ids.iid,
-        decl: ids.decl,
-        forced_id: ids.forced,
-        server_puids: Vec::new(),
-        server_forced_ids: Vec::new(),
-        server_init_health: Vec::new(),
-        listener_ids: ibex_config::ast::listener_ids(&frontend_binds(fe)),
+        ids: Box::new(ProxyIdInfo {
+            iid: ids.iid,
+            decl: ids.decl,
+            forced_id: ids.forced,
+            server_puids: Vec::new(),
+            server_forced_ids: Vec::new(),
+            server_init_health: Vec::new(),
+            listener_ids: ibex_config::ast::listener_ids(&frontend_binds(fe)),
+            ..ProxyIdInfo::default()
+        }),
         name: fe.name.clone(),
         has_frontend: true,
         has_backend: false,
@@ -1758,7 +1772,7 @@ fn init_proxy_from_frontend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, fe
         use_servers: Vec::new(),
         force_be_switch: fe.force_be_switch.clone(),
         disabled_backends: Arc::default(),
-        monitor_uri: fe.monitor_uri.clone(),
+        monitor_uri: fe.monitor_uri.as_deref().map(Into::into),
         acls: compile_acls(&fe.acls),
         stick_table,
         stick_rules: fe.stick_rules.clone(),
@@ -1849,13 +1863,16 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, be:
 
     Proxy {
         id: usize_to_u32(proxy_idx),
-        iid: ids.iid,
-        decl: ids.decl,
-        forced_id: ids.forced,
-        server_puids: server_puids(be.servers.len(), &be.server_extras),
-        server_forced_ids: server_forced_ids(be.servers.len(), &be.server_extras),
-        server_init_health: server_init_health(be.servers.len(), &be.server_extras),
-        listener_ids: Vec::new(),
+        ids: Box::new(ProxyIdInfo {
+            iid: ids.iid,
+            decl: ids.decl,
+            forced_id: ids.forced,
+            server_puids: server_puids(be.servers.len(), &be.server_extras),
+            server_forced_ids: server_forced_ids(be.servers.len(), &be.server_extras),
+            server_init_health: server_init_health(be.servers.len(), &be.server_extras),
+            listener_ids: Vec::new(),
+            ..ProxyIdInfo::default()
+        }),
         name: be.name.clone(),
         has_frontend: false,
         has_backend: true,
@@ -2080,7 +2097,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             for (bind_idx, b) in binds.iter().enumerate() {
                 let tls = bind_tls(&listen.name, &binds, b.addr)?;
                 for mut listener in listeners_for(worker_id, b.addr, usize_to_u32(proxy_idx))? {
-                    listener.luid = proxies[proxy_idx].listener_ids.get(bind_idx).copied().unwrap_or(0);
+                    listener.luid = proxies[proxy_idx].ids.listener_ids.get(bind_idx).copied().unwrap_or(0);
                     listener.maxconn = listen.maxconn;
                     listener.name = b.name.as_deref().map(Into::into);
                     listener.tls.clone_from(&tls);
@@ -2123,7 +2140,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 } else {
                     let tls = bind_tls(&frontend.name, &frontend.binds, bind_addr)?;
                     for mut listener in listeners_for(worker_id, bind_addr, usize_to_u32(proxy_idx))? {
-                        listener.luid = proxies[proxy_idx].listener_ids.get(bind_idx).copied().unwrap_or(0);
+                        listener.luid = proxies[proxy_idx].ids.listener_ids.get(bind_idx).copied().unwrap_or(0);
                         listener.maxconn = frontend.maxconn;
                         listener.name = b.name.as_deref().map(Into::into);
                         listener.tls.clone_from(&tls);
@@ -3183,7 +3200,7 @@ fn eval_tcp_req_session_rules(
         fc_src: sess.fc_src,
         so_name: sess.so_name.as_deref(),
         so_id: sess.so_id,
-        fe_id: Some(proxy.iid),
+        fe_id: Some(proxy.ids.iid),
         fc_dst: sess.fc_dst,
         proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
         act_conn: proxy.stats[worker_id()].act_conn.load(Ordering::Relaxed),
@@ -5689,9 +5706,9 @@ impl EngineDispatcher<'_> {
             req_method: req_method_clone.as_deref(),
             req_headers: req_headers_clone.as_deref(),
             fe_name: Some(&proxies[fe_idx].name),
-            fe_id: Some(proxies[fe_idx].iid),
+            fe_id: Some(proxies[fe_idx].ids.iid),
             be_name: Some(&proxies[be_idx].name),
-            be_id: Some(proxies[be_idx].iid),
+            be_id: Some(proxies[be_idx].ids.iid),
             be_max_retries: Some(proxies[be_idx].retries),
             cur_max_retries: Some(entry.sess.max_retries),
             res_version: Some(&proto_version),
@@ -6331,7 +6348,7 @@ impl EngineDispatcher<'_> {
             // rules below set its `tracked_sc`.
             htx_slice: entry.sess.has_htx.then(|| ibex_proto::htx::HtxSliceRef::new(entry.sess.htx_buf.raw_slice(), entry.sess.htx_blocks)),
             fe_name: Some(&proxies[proxy_idx].name),
-            fe_id: Some(proxies[proxy_idx].iid),
+            fe_id: Some(proxies[proxy_idx].ids.iid),
             act_conn: proxies[proxy_idx].stats[worker_id()].act_conn.load(Ordering::Relaxed),
             unique_id: entry.sess.log.unique_id.as_deref(),
             accept_date: Some(entry.sess.log.date),
@@ -6419,8 +6436,8 @@ impl EngineDispatcher<'_> {
                         req_body: $s.txn.as_ref().and_then(|t| t.req_body.as_deref()),
                         fe_name,
                         be_name,
-                        fe_id: fe_name.and_then(|n| proxies.iter().find(|p| p.has_frontend && p.name == n)).map(|p| p.iid),
-                        be_id: be_name.and_then(|n| proxies.iter().find(|p| p.has_backend && p.name == n)).map(|p| p.iid),
+                        fe_id: fe_name.and_then(|n| proxies.iter().find(|p| p.has_frontend && p.name == n)).map(|p| p.ids.iid),
+                        be_id: be_name.and_then(|n| proxies.iter().find(|p| p.has_backend && p.name == n)).map(|p| p.ids.iid),
                         captures_req_hdr: Some(&$s.log.req_captures),
                         unique_id: $s.log.unique_id.as_deref(),
                         accept_date: Some($s.log.date),
@@ -8951,9 +8968,9 @@ fn after_res_on_reply<'r>(
             req_method: sess.req_method.as_deref(),
             req_headers: sess.req_headers.as_deref(),
             fe_name: Some(&proxies[fe_idx].name),
-            fe_id: Some(proxies[fe_idx].iid),
+            fe_id: Some(proxies[fe_idx].ids.iid),
             be_name: Some(&proxies[be_idx].name),
-            be_id: Some(proxies[be_idx].iid),
+            be_id: Some(proxies[be_idx].ids.iid),
             be_max_retries: Some(proxies[be_idx].retries),
             cur_max_retries: Some(sess.max_retries),
             res_version: Some(&version),
@@ -9014,9 +9031,9 @@ fn proxy_error_response(sess: &TcpSession, be: &Proxy, fe: &Proxy, proxies: &[Pr
                     req_method: sess.req_method.as_deref(),
                     req_headers: sess.req_headers.as_deref(),
                     fe_name: Some(fe.name.as_str()),
-                    fe_id: Some(fe.iid),
+                    fe_id: Some(fe.ids.iid),
                     be_name: Some(be.name.as_str()),
-                    be_id: Some(be.iid),
+                    be_id: Some(be.ids.iid),
                     ..Default::default()
                 };
                 return Some(build_templated_error_response(

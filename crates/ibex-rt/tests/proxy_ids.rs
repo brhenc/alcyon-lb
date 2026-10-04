@@ -269,12 +269,12 @@ fn listener_ids_follow_the_binds_a_frontend_has() {
     let addr = common::reserve_addr();
     let config = ibex_config::parse_str("frontend nobind\n  mode http\n").expect("parse");
     let engine = ibex_rt::engine::Engine::new(&config, 64).expect("engine");
-    assert!(engine.proxies[0].listener_ids.is_empty());
+    assert!(engine.proxies[0].ids.listener_ids.is_empty());
 
     let config = ibex_config::Config {
         frontends: vec![ibex_config::FrontendSection { name: "fe".into(), bind: Some(addr), ..Default::default() }],
         ..Default::default()
     };
     let engine = ibex_rt::engine::Engine::new(&config, 64).expect("engine");
-    assert_eq!(engine.proxies[0].listener_ids, [1]);
+    assert_eq!(engine.proxies[0].ids.listener_ids, [1]);
 }

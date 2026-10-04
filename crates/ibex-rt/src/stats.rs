@@ -597,10 +597,10 @@ pub fn format_show_stat_filtered(
 
     // `HAProxy` lists the proxies in the order the sections were written.
     let mut order: Vec<usize> = (0..proxies.len()).collect();
-    order.sort_by_key(|&i| proxies[i].decl);
+    order.sort_by_key(|&i| proxies[i].ids.decl);
     for p_idx in order {
         let proxy = &proxies[p_idx];
-        let iid = proxy.iid;
+        let iid = proxy.ids.iid;
         if let Some(f_iid) = iid_filter {
             if f_iid != -1 && u32::try_from(f_iid).ok() != Some(iid) {
                 continue;
@@ -679,13 +679,7 @@ mod tests {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
         let proxy = Proxy {
             id: 0,
-            iid: 2,
-            decl: 0,
-            forced_id: false,
-            server_puids: Vec::new(),
-            server_forced_ids: Vec::new(),
-            server_init_health: Vec::new(),
-            listener_ids: Vec::new(),
+            ids: Box::new(crate::engine::ProxyIdInfo { iid: 2, ..Default::default() }),
             log_target_idx: Vec::new(),
             log_health_checks: false,
             name: "test_proxy".into(),

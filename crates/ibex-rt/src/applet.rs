@@ -333,7 +333,7 @@ impl CliApplet {
         } else if cmd == "show servers state" || cmd.starts_with("show servers state ") {
             let be_filter = cmd.strip_prefix("show servers state").map(str::trim).filter(|s| !s.is_empty());
             if let Some(target) = be_filter {
-                if !ctx.proxies.iter().any(|p| p.name == target || p.iid.to_string() == target) {
+                if !ctx.proxies.iter().any(|p| p.name == target || p.ids.iid.to_string() == target) {
                     self.out_buf.extend_from_slice(b"Can't find backend.\n");
                     if self.interactive {
                         self.out_buf.extend_from_slice(b"\n> ");
@@ -346,11 +346,11 @@ impl CliApplet {
             self.out_buf.extend_from_slice(b"1\n# be_id be_name srv_id srv_name srv_addr srv_op_state srv_admin_state srv_uweight srv_iweight srv_time_since_last_change srv_check_status srv_check_result srv_check_health srv_check_state srv_agent_state bk_f_forced_id srv_f_forced_id srv_fqdn srv_port srvrecord srv_use_ssl srv_check_port srv_check_addr srv_agent_addr srv_agent_port\n");
             // `HAProxy` lists the proxies in the order the sections were written.
             let mut order: Vec<usize> = (0..ctx.proxies.len()).collect();
-            order.sort_by_key(|&i| ctx.proxies[i].decl);
+            order.sort_by_key(|&i| ctx.proxies[i].ids.decl);
             for p_idx in order {
                 let p = &ctx.proxies[p_idx];
                 if let Some(target) = be_filter {
-                    if p.name != target && p.iid.to_string() != target { continue; }
+                    if p.name != target && p.ids.iid.to_string() != target { continue; }
                 }
                 for (s_idx, s) in p.server_ids.iter().enumerate() {
                     let addr = p.servers.get(s_idx).map_or_else(|| "-".to_string(), |a| a.ip().to_string());
@@ -423,12 +423,12 @@ impl CliApplet {
                     }
 
                     let puid = p.server_puid(s_idx);
-                    let bk_forced = u8::from(p.forced_id);
+                    let bk_forced = u8::from(p.ids.forced_id);
                     let srv_forced = u8::from(p.server_forced_id(s_idx));
                     self.out_buf.extend_from_slice(
                         format!(
                             "{} {} {} {} {} {} {} {} {} 1 {} {} {} {} 0 {} {} - {} - 0 0 - - 0\n",
-                            p.iid, p.name, puid, s, addr, op_state, admin_state, uweight, iweight, check_status, check_result, check_health, check_state, bk_forced, srv_forced, port
+                            p.ids.iid, p.name, puid, s, addr, op_state, admin_state, uweight, iweight, check_status, check_result, check_health, check_state, bk_forced, srv_forced, port
                         ).as_bytes()
                     );
                 }
@@ -634,7 +634,7 @@ impl CliApplet {
                 iid_filter = Some(id);
             } else if parts[2] != "-1" {
                 if let Some(p_idx) = ctx.proxies.iter().position(|p| p.name == parts[2]) {
-                    iid_filter = Some(i32::try_from(ctx.proxies[p_idx].iid).unwrap_or(-2));
+                    iid_filter = Some(i32::try_from(ctx.proxies[p_idx].ids.iid).unwrap_or(-2));
                 } else {
                     iid_filter = Some(-2); // force not found
                 }

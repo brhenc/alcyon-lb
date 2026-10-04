@@ -499,9 +499,9 @@ fn with_check_ctx<R>(
     let view = ProxiesView(proxies);
     let mut ctx = ibex_sample::SampleContext {
         fe_name: Some(&px.name),
-        fe_id: Some(px.iid),
+        fe_id: Some(px.ids.iid),
         be_name: Some(&px.name),
-        be_id: Some(px.iid),
+        be_id: Some(px.ids.iid),
         srv_name: srv,
         srv_id: Some(px.server_puid(check.server_idx)),
         server_addr: Some(check.addr),
