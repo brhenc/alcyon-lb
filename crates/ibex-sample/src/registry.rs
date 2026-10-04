@@ -538,6 +538,12 @@ impl Registry {
         self.ctx_converters.insert(desc.name, desc);
     }
 
+    /// Whether a fetch, of either kind, is registered under `name`.
+    #[must_use]
+    pub fn has_fetch(&self, name: &str) -> bool {
+        self.fetches.contains_key(name) || self.multi_fetches.contains_key(name)
+    }
+
     #[must_use]
     pub fn get_fetch(&self, name: &str) -> Option<&FetchDesc> {
         self.fetches.get(name)
@@ -4279,59 +4285,19 @@ fn get_all_req_headers(ctx: &SampleContext, name: &str) -> Vec<String> {
     matches
 }
 
+/// The response's header `name`. Only the response is read: `ctx.htx_slice` holds the
+/// *request* while a response rule runs, so a `shdr(x-n)` that fell back to it answered
+/// with the request's `X-N` (T132).
 fn get_res_header(ctx: &SampleContext, name: &str) -> Option<String> {
-    if let Some(htx) = ctx.htx_slice {
-        if let Some(v) = htx.get_header(name) {
-            return Some(v.to_string());
-        }
-    }
-    if let Some(headers) = ctx.res_headers {
-        for (k, v) in headers {
-            if k.eq_ignore_ascii_case(name) {
-                return Some(v.clone());
-            }
-        }
-    }
-    if let Some(htx) = ctx.htx {
-        for hf in htx.headers() {
-            if hf.name.eq_ignore_ascii_case(name) {
-                return Some(hf.value.clone());
-            }
-        }
-    }
-    CURRENT_RES_HEADERS.with(|hdrs| {
-        for (k, v) in hdrs.borrow().iter() {
-            if k.eq_ignore_ascii_case(name) {
-                return Some(v.clone());
-            }
-        }
-        None
-    })
+    get_all_res_headers(ctx, name).into_iter().next()
 }
 
 fn get_all_res_headers(ctx: &SampleContext, name: &str) -> Vec<String> {
     let mut matches = Vec::new();
-    if let Some(htx) = ctx.htx_slice {
-        for (hn, hv) in htx.headers() {
-            if hn.eq_ignore_ascii_case(name) {
-                matches.push(hv.to_string());
-            }
-        }
-        if !matches.is_empty() {
-            return matches;
-        }
-    }
     if let Some(headers) = ctx.res_headers {
         for (k, v) in headers {
             if k.eq_ignore_ascii_case(name) {
                 matches.push(v.clone());
-            }
-        }
-    }
-    if let Some(htx) = ctx.htx {
-        for hf in htx.headers() {
-            if hf.name.eq_ignore_ascii_case(name) {
-                matches.push(hf.value.clone());
             }
         }
     }

@@ -101,33 +101,16 @@ impl Expr {
             converters.push((c_name, c_args));
         }
 
-        // Shorthand method resolution (e.g. path_beg, hdr_sub)
+        // ACL keyword shorthands (`path_beg`, `hdr_sub`, `url_len`, `shdr_reg`, `req_ver`, ...):
+        // a fetch and a default match method (`haproxy -dKacl`). Any other name is the
+        // fetch itself, where HAProxy also lets a few bare names (`hdr_val`, `scook`, ...)
+        // stand for the dotted ones Ibex registers.
         let mut default_method = "found";
-        if let Some(suffix) = fetch_name.strip_prefix("path_") {
-            default_method = match suffix {
-                "beg" => "beg",
-                "end" => "end",
-                "sub" => "sub",
-                "dir" => "dir",
-                "dom" => "dom",
-                "reg" => "reg",
-                _ => "found",
-            };
-            fetch_name = "path".to_string();
-        } else if let Some(suffix) = fetch_name.strip_prefix("hdr_") {
-            default_method = match suffix {
-                "beg" => "beg",
-                "end" => "end",
-                "sub" => "sub",
-                "dir" => "dir",
-                "dom" => "dom",
-                "reg" => "reg",
-                _ => "str",
-            };
-            fetch_name = "req.hdr".to_string();
-        } else if fetch_name == "hdr" {
-            fetch_name = "req.hdr".to_string();
-            default_method = "str";
+        if let Some((fetch, method)) = acl_keyword(&fetch_name) {
+            fetch_name = fetch.to_string();
+            default_method = method;
+        } else if let Some(canonical) = fetch_alias(&fetch_name) {
+            fetch_name = canonical.to_string();
         }
 
         // What follows the expression is `parse_acl_expr`'s: options (`-i`, `-n`, `-m <method>`,
@@ -292,6 +275,68 @@ impl Expr {
             })
         }
     }
+}
+
+/// The ACL keywords that are a fetch with a default match method, as `haproxy -dKacl`
+/// lists them: `<family>[_<beg|end|sub|dir|dom|reg|len>]` for the string families, and a
+/// handful of one-off names.
+fn acl_keyword(name: &str) -> Option<(&'static str, &'static str)> {
+    const FAMILIES: &[(&str, &str)] = &[
+        ("base", "base"),
+        ("cook", "req.cook"),
+        ("hdr", "req.hdr"),
+        ("path", "path"),
+        ("scook", "res.cook"),
+        ("shdr", "res.hdr"),
+        ("url", "url"),
+        ("urlp", "urlp"),
+    ];
+    const SUFFIXES: &[&str] = &["beg", "end", "sub", "dir", "dom", "reg", "len"];
+    for &(family, fetch) in FAMILIES {
+        let Some(rest) = name.strip_prefix(family) else { continue };
+        if rest.is_empty() {
+            return Some((fetch, "str"));
+        }
+        if let Some(suffix) = rest.strip_prefix('_') {
+            if let Some(m) = SUFFIXES.iter().find(|s| **s == suffix) {
+                return Some((fetch, m));
+            }
+        }
+    }
+    Some(match name {
+        "method" => ("method", "str"),
+        "req_ver" => ("req.ver", "str"),
+        "resp_ver" => ("res.ver", "str"),
+        "req_ssl_sni" => ("req.ssl_sni", "str"),
+        "req_ssl_ver" | "req.ssl_ver" => ("req.ssl_ver", "int"),
+        "req_rdp_cookie" => ("req.rdp_cookie", "str"),
+        "req_rdp_cookie_cnt" => ("req.rdp_cookie_cnt", "int"),
+        "payload" => ("req.payload", "bin"),
+        "payload_lv" => ("req.payload_lv", "bin"),
+        "ssl_fc_sni_end" => ("ssl_fc_sni", "end"),
+        "ssl_fc_sni_reg" => ("ssl_fc_sni", "reg"),
+        "http_auth_group" => ("http_auth_group", "str"),
+        _ => return None,
+    })
+}
+
+/// A bare `HAProxy` fetch name whose implementation Ibex registers under the dotted one.
+fn fetch_alias(name: &str) -> Option<&'static str> {
+    let canonical = match name {
+        "hdr_val" => "req.hdr_val",
+        "hdr_ip" => "req.hdr_ip",
+        "cook_val" => "req.cook_val",
+        "scook_cnt" => "res.cook_cnt",
+        "scook_val" => "res.cook_val",
+        "shdr_cnt" => "res.hdr_cnt",
+        "shdr_val" => "res.hdr_val",
+        "shdr_ip" => "res.hdr_ip",
+        "rdp_cookie" => "req.rdp_cookie",
+        "rdp_cookie_cnt" => "req.rdp_cookie_cnt",
+        _ => return None,
+    };
+    let reg = crate::registry::sample_registry();
+    (reg.get_fetch(name).is_none() && reg.get_fetch(canonical).is_some()).then_some(canonical)
 }
 
 /// The match method a fetch takes when none is given (`parse_acl_expr` picks it from the
