@@ -146,7 +146,6 @@ fn what_haproxy_refuses_or_ibex_does_not_render_is_a_config_error() {
         ("%[path,no_such_conv]", "unknown converter"),
         ("%{+Q}", "parse argument modifier without alias name"),
         ("%OG", "not implemented"),
-        ("%sslv", "not implemented"),
         ("%(name:raw)[int(1)]", "not implemented"),
         ("abc %", "truncated"),
     ] {
@@ -157,6 +156,8 @@ fn what_haproxy_refuses_or_ibex_does_not_render_is_a_config_error() {
 
 #[test]
 fn haproxy_s_default_formats_compile() {
+    // `%sslv` and `%sslc` (the TLS version and cipher of `option httpslog`) render now (T165).
+    assert!(LogFormat::compile("%sslv/%sslc", sample_registry()).is_ok());
     let reg = sample_registry();
     LogFormat::compile(ibex_rt::DEFAULT_HTTP_LOG_FORMAT, reg).expect("httplog");
     LogFormat::compile(ibex_rt::DEFAULT_TCP_LOG_FORMAT, reg).expect("tcplog");
@@ -233,6 +234,9 @@ fn option_formats_are_the_default_strings() {
     assert_eq!(ibex_rt::format_string(&S::Http { clf: false }, false), ibex_rt::DEFAULT_TCP_LOG_FORMAT);
     assert_eq!(ibex_rt::format_string(&S::Http { clf: true }, false), ibex_rt::CLF_TCP_LOG_FORMAT);
     assert_eq!(ibex_rt::format_string(&S::Tcp { clf: false }, true), ibex_rt::DEFAULT_TCP_LOG_FORMAT);
+    // `option httpslog`: the HTTP log and the TLS fields; on a TCP proxy, the TCP log.
+    assert_eq!(ibex_rt::format_string(&S::Https, true), ibex_rt::DEFAULT_HTTPS_LOG_FORMAT);
+    assert_eq!(ibex_rt::format_string(&S::Https, false), ibex_rt::DEFAULT_TCP_LOG_FORMAT);
     assert_eq!(ibex_rt::format_string(&S::Custom("x %ci".into()), true), "x %ci");
 }
 

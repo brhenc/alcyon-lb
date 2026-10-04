@@ -118,9 +118,6 @@ const IBEX_REFUSES: &[(&str, &str)] = &[
     ("http-drop-response-trailers", "fld"),
     ("checkcache", "bld"),
     ("disable-h2-upgrade", "fld"),
-    // The log format: an HTTPS log line Ibex cannot write (T53 refuses it where it would
-    // apply; a backend ignores log formats, as HAProxy does).
-    ("httpslog", "fld"),
     // Which log a failed request goes to: Ibex would write it to the normal log.
     ("log-separate-errors", "fld"),
     // Which server is used.

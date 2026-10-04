@@ -236,15 +236,26 @@ impl StatRow {
 /// Formats the `show info` output for `HATop` and CLI consumers.
 #[must_use]
 #[allow(clippy::too_many_lines)]
-pub fn format_show_info(
+pub fn format_show_info(start_time: Instant, pid: u32, total_tasks: usize, run_queue_len: usize, active_conns: u32, max_conns: u32) -> String {
+    format_show_info_counts(start_time, pid, total_tasks, run_queue_len, active_conns, max_conns, 0, 0)
+}
+
+/// [`format_show_info`] with the cumulative connections and requests the proxies counted
+/// (`CumConns`, `CumReq`).
+#[must_use]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+pub fn format_show_info_counts(
     start_time: Instant,
     pid: u32,
     total_tasks: usize,
     run_queue_len: usize,
     active_conns: u32,
-    max_conns: u32
-    
+    max_conns: u32,
+    cum_conns: u64,
+    cum_reqs: u64,
 ) -> String {
+    // `Ulimit-n` and `Maxsock`: the descriptors the process may hold (`getrlimit`).
+    let nofile = rustix::process::getrlimit(rustix::process::Resource::Nofile).current.unwrap_or(0);
     // `global maxconn` and its configured ceiling, when there is one.
     let maxconn = if crate::globalconn::max() > 0 { crate::globalconn::max() } else { max_conns };
     let hard_maxconn = if crate::globalconn::hard() > 0 { crate::globalconn::hard() } else { max_conns };
@@ -271,7 +282,7 @@ format!(
 \
          Pid: {pid}
 \
-         Uptime: {days}d {hours:02}h{mins:02}m{secs:02}s
+         Uptime: {days}d {hours}h{mins:02}m{secs:02}s
 \
          Uptime_sec: {total_secs}
 \
@@ -283,9 +294,9 @@ format!(
 \
          PoolFailed: 0
 \
-         Ulimit-n: 0
+         Ulimit-n: {nofile}
 \
-         Maxsock: 0
+         Maxsock: {nofile}
 \
          Maxconn: {maxconn}
 \
@@ -293,9 +304,9 @@ format!(
 \
          CurrConns: {active_conns}
 \
-         CumConns: 0
+         CumConns: {cum_conns}
 \
-         CumReq: 0
+         CumReq: {cum_reqs}
 \
          MaxSslConns: 0
 \
@@ -438,28 +449,92 @@ pub fn format_show_stat(proxies: &[Proxy], checks: &[ServerCheckState], pid: u32
 /// the operating-system process id.
 const PROCESS_NUM: u32 = 1;
 
+/// What a proxy that never took a request reports.
+static EMPTY: std::sync::LazyLock<crate::statcnt::TxnCounters> = std::sync::LazyLock::new(crate::statcnt::TxnCounters::default);
+
+fn ld(a: &std::sync::atomic::AtomicU64) -> u64 {
+    a.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The columns every kind of row counts the same way: response classes and requests (HTTP
+/// only: `HAProxy` leaves them empty in TCP mode), bytes, aborts and the timings.
+fn fill_counters(r: &mut StatRow, c: &crate::statcnt::TxnCounters, http: bool, timed: bool) {
+    if http {
+        for (name, h) in ["hrsp_1xx", "hrsp_2xx", "hrsp_3xx", "hrsp_4xx", "hrsp_5xx", "hrsp_other"].iter().zip(&c.hrsp) {
+            r.set(name, ld(h));
+        }
+        r.set("req_tot", ld(&c.req_tot));
+        r.set("mode", "http");
+    } else {
+        r.set("mode", "tcp");
+    }
+    r.set("bin", ld(&c.bin));
+    r.set("bout", ld(&c.bout));
+    if timed {
+        r.set("cli_abrt", ld(&c.cli_abrt));
+        r.set("srv_abrt", ld(&c.srv_abrt));
+        if let Some(secs) = crate::statcnt::TxnCounters::since_secs(c.last_sess.load(std::sync::atomic::Ordering::Relaxed)) {
+            r.set("lastsess", secs);
+        }
+        let counted = if http { ld(&c.req_tot) } else { ld(&c.lbtot) };
+        r.set("qtime", c.qtime.avg(counted));
+        r.set("ctime", c.ctime.avg(counted));
+        r.set("rtime", c.rtime.avg(counted));
+        r.set("ttime", c.ttime.avg(counted));
+        r.set("qtime_max", c.qtime.max());
+        r.set("ctime_max", c.ctime.max());
+        r.set("rtime_max", c.rtime.max());
+        r.set("ttime_max", c.ttime.max());
+        r.set("wrew", 0);
+        r.set("eint", 0);
+    }
+}
+
 fn write_frontend_row(out: &mut String, proxy: &Proxy, _pid: u32, iid: u32) {
+    let c = proxy.ids.tc.get().map_or(&*EMPTY, |p| &p.fe);
+    let http = proxy.mode == ibex_config::Mode::Http;
     let mut r = StatRow::new();
     r.set("pxname", &proxy.name);
     r.set("svname", "FRONTEND");
-    r.set("qcur", 0);
-    r.set("qmax", 0);
     r.set("scur", proxy.stats.iter().map(|s| s.act_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u32>());
     r.set("smax", proxy.stats.iter().map(|s| s.max_conn.load(std::sync::atomic::Ordering::Relaxed)).max().unwrap_or(0));
     r.set("slim", proxy.maxconn);
-    r.set("stot", proxy.stats.iter().map(|s| s.cum_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>());
-    r.set("bin", proxy.stats.iter().map(|s| s.bytes_in.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>());
-    r.set("bout", proxy.stats.iter().map(|s| s.bytes_out.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>());
+    let stot = proxy.stats.iter().map(|s| s.cum_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>();
+    r.set("stot", stot);
     r.set("dreq", proxy.stats.iter().map(|s| s.denied_req.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>());
     r.set("dresp", proxy.stats.iter().map(|s| s.denied_resp.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>());
     r.set("dcon", proxy.stats.iter().map(|s| s.denied_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>());
-    r.set("ereq", 0);
+    r.set("ereq", ld(&c.ereq));
     r.set("status", "OPEN");
-    r.set("act", 1);
     r.set("pid", PROCESS_NUM);
     r.set("iid", iid);
     r.set("sid", 0);
     r.set("type", 0);
+    let rate: u64 = proxy.stats.iter().map(|s| s.fe_sess_rate.rate()).sum();
+    let rate_max = u64::from(c.rate_max.load(std::sync::atomic::Ordering::Relaxed));
+    r.set("rate", rate);
+    r.set("rate_lim", 0);
+    r.set("rate_max", rate_max);
+    r.set("conn_rate", rate);
+    r.set("conn_rate_max", rate_max);
+    r.set("conn_tot", stot);
+    if !http {
+        r.set("req_tot", 0);
+    }
+    if http {
+        r.set("req_rate", proxy.stats.iter().map(|s| s.fe_req_rate.rate()).sum::<u64>());
+        r.set("req_rate_max", c.req_rate_max.load(std::sync::atomic::Ordering::Relaxed));
+        r.set("comp_in", 0);
+        r.set("comp_out", 0);
+        r.set("comp_byp", 0);
+        r.set("comp_rsp", 0);
+        r.set("cache_lookups", 0);
+        r.set("cache_hits", 0);
+    }
+    fill_counters(&mut r, c, http, false);
+    r.set("eint", 0);
+    r.set("dses", 0);
+    r.set("wrew", 0);
     out.push_str(&r.finish());
 }
 
@@ -505,6 +580,7 @@ fn write_server_row(
             };
             (s_str, 0, 0, "", 0, 0)
         };
+    let has_check = check_state.is_some();
 
     let is_backup = proxy.server_backups.get(s_idx).copied().unwrap_or(false);
     let (act, bck) = if is_backup { (0, 1) } else { (1, 0) };
@@ -520,12 +596,23 @@ fn write_server_row(
     let mut r = StatRow::new();
     r.set("pxname", &proxy.name);
     r.set("svname", srv_name);
+    let pc = proxy.ids.tc.get();
+    let c = pc.and_then(|p| p.srv.get(s_idx)).unwrap_or(&EMPTY);
     r.set("qcur", 0);
     r.set("qmax", 0);
     r.set("scur", scur);
-    r.set("smax", 0);
+    r.set("smax", c.smax.load(std::sync::atomic::Ordering::Relaxed).max(scur));
     r.set("slim", &slim);
-    r.set("stot", 0);
+    r.set("stot", ld(&c.stot));
+    r.set("dresp", 0);
+    r.set("econ", ld(&c.econ));
+    r.set("eresp", ld(&c.eresp));
+    r.set("lbtot", ld(&c.lbtot));
+    r.set("rate", c.sess_rate.rate());
+    r.set("rate_max", c.rate_max.load(std::sync::atomic::Ordering::Relaxed));
+    r.set("lastchg", crate::statcnt::TxnCounters::since_secs(c.last_chg.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or_else(|| crate::statcnt::now_ms() / 1000));
+    fill_counters(&mut r, c, proxy.mode == ibex_config::Mode::Http, true);
+    r.set("uweight", weight);
     let (wretr, wredis) = proxy
         .server_retr
         .lock()
@@ -540,42 +627,79 @@ fn write_server_row(
     r.set("weight", weight);
     r.set("act", act);
     r.set("bck", bck);
-    r.set("chkfail", chkfail);
-    r.set("chkdown", chkdown);
+    if has_check {
+        r.set("chkfail", chkfail);
+        r.set("chkdown", chkdown);
+        r.set("downtime", c.downtime_secs());
+    }
     r.set("pid", PROCESS_NUM);
     r.set("iid", iid);
     r.set("sid", sid);
     r.set("type", 2);
-    r.set("check_status", check_status);
-    r.set("check_code", check_code);
-    r.set("check_duration", check_duration);
+    if has_check {
+        r.set("check_status", check_status);
+        r.set("check_code", check_code);
+        r.set("check_duration", check_duration);
+    }
     r.set("addr", srv_addr);
     out.push_str(&r.finish());
 }
 
 fn write_backend_row(out: &mut String, proxy: &Proxy, _pid: u32, iid: u32) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let c = proxy.ids.tc.get().map_or(&*EMPTY, |p| &p.be);
+    let http = proxy.mode == ibex_config::Mode::Http;
+    let up = |i: usize| {
+        proxy
+            .server_statuses
+            .get(i)
+            .is_none_or(|s| matches!(ServerStatus::from(s.load(Relaxed)), ServerStatus::Up | ServerStatus::Drain))
+    };
+    let backup = |i: usize| proxy.server_backups.get(i).copied().unwrap_or(false);
+    let act = (0..proxy.servers.len()).filter(|&i| !backup(i) && up(i)).count();
+    let bck = (0..proxy.servers.len()).filter(|&i| backup(i) && up(i)).count();
+    let weight: u32 = (0..proxy.servers.len()).filter(|&i| !backup(i) && up(i)).map(|i| proxy.server_weights.get(i).copied().unwrap_or(1)).sum();
+    let scur: u32 = (0..proxy.servers.len()).map(|i| proxy.server_actconn.get(i).map_or(0, |a| a.load(Relaxed))).sum();
+    let be_down = !proxy.servers.is_empty() && act + bck == 0 && proxy.ids.tc.get().is_some_and(|p| p.be.down_since.load(Relaxed) != 0);
     let mut r = StatRow::new();
     r.set("pxname", &proxy.name);
     r.set("svname", "BACKEND");
     r.set("qcur", 0);
     r.set("qmax", 0);
-    r.set("scur", proxy.stats.iter().map(|s| s.act_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u32>());
-    r.set("smax", proxy.stats.iter().map(|s| s.max_conn.load(std::sync::atomic::Ordering::Relaxed)).max().unwrap_or(0));
+    r.set("scur", scur);
+    r.set("smax", c.smax.load(Relaxed).max(scur));
     r.set("slim", proxy.maxconn);
-    r.set("stot", proxy.stats.iter().map(|s| s.cum_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>());
-    r.set("bin", proxy.stats.iter().map(|s| s.bytes_in.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>());
-    r.set("bout", proxy.stats.iter().map(|s| s.bytes_out.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>());
-    r.set("dreq", proxy.stats.iter().map(|s| s.denied_req.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>());
-    r.set("dresp", proxy.stats.iter().map(|s| s.denied_resp.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>());
-    r.set("wretr", proxy.stats.iter().map(|s| s.retries_count.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>());
-    r.set("wredis", proxy.stats.iter().map(|s| s.redispatches.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>());
-    r.set("status", "UP");
-    r.set("weight", 1);
-    r.set("act", 1);
+    r.set("stot", ld(&c.stot));
+    r.set("dreq", proxy.stats.iter().map(|s| s.denied_req.load(Relaxed)).sum::<u64>());
+    r.set("dresp", proxy.stats.iter().map(|s| s.denied_resp.load(Relaxed)).sum::<u64>());
+    r.set("econ", ld(&c.econ));
+    r.set("eresp", ld(&c.eresp));
+    r.set("wretr", proxy.stats.iter().map(|s| s.retries_count.load(Relaxed)).sum::<u64>());
+    r.set("wredis", proxy.stats.iter().map(|s| s.redispatches.load(Relaxed)).sum::<u64>());
+    r.set("status", if be_down { "DOWN" } else { "UP" });
+    r.set("weight", weight);
+    r.set("uweight", weight);
+    r.set("act", act);
+    r.set("bck", bck);
+    r.set("chkdown", ld(&c.chkdown));
+    r.set("lastchg", crate::statcnt::TxnCounters::since_secs(c.last_chg.load(Relaxed)).unwrap_or_else(|| crate::statcnt::now_ms() / 1000));
+    r.set("downtime", c.downtime_secs());
+    r.set("lbtot", ld(&c.lbtot));
+    r.set("rate", c.sess_rate.rate());
+    r.set("rate_max", c.rate_max.load(Relaxed));
     r.set("pid", PROCESS_NUM);
     r.set("iid", iid);
     r.set("sid", 0);
     r.set("type", 1);
+    if http {
+        r.set("comp_in", 0);
+        r.set("comp_out", 0);
+        r.set("comp_byp", 0);
+        r.set("comp_rsp", 0);
+        r.set("cache_lookups", 0);
+        r.set("cache_hits", 0);
+    }
+    fill_counters(&mut r, c, http, true);
     out.push_str(&r.finish());
 }
 
@@ -653,7 +777,7 @@ mod tests {
 
     #[test]
     fn show_info_contains_all_fourteen_mandatory_hatop_keys() {
-        let out = format_show_info(Instant::now(), 1234, 10, 2, 5, 1000);
+        let out = format_show_info_counts(Instant::now(), 1234, 10, 2, 5, 1000, 7, 9);
         let mandatory = [
             "Name:",
             "Version:",

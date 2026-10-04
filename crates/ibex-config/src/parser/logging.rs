@@ -278,11 +278,12 @@ pub(crate) fn parse_format_arg(tokens: &[Token], kw: &Token) -> Result<String, C
     }
 }
 
-/// `option httplog [clf]` / `option tcplog [clf]`; `None` for any other option.
+/// `option httplog [clf]` / `option httpslog` / `option tcplog [clf]`; `None` for any other option.
 pub(crate) fn parse_log_option(tokens: &[Token], kw: &Token) -> Option<Result<LogFormatSpec, ConfigError>> {
     let name = tokens.get(1)?.text.as_str();
+    // `httpslog` takes no argument, and `HAProxy` ignores any that follow it.
     if name == "httpslog" {
-        return Some(Err(ConfigError::new(kw.line, kw.col, "'option httpslog' is not implemented".to_string())));
+        return Some(Ok(LogFormatSpec::Https));
     }
     if name != "httplog" && name != "tcplog" {
         return None;

@@ -33,9 +33,17 @@ fn start(cfg: &str) {
     ibex_rt::logfwd::start(&cfg).expect("starts");
 }
 
+/// What the collector got, without the line feed `HAProxy` ends every datagram with (measured
+/// 2026-10-04, 3.5-dev8-885761-29: a forwarded `hello` and `hello\n` both arrive as
+/// `hello\n`); a datagram without one is a failure, as is a second one.
 fn recv(collect: &UdpSocket) -> Option<String> {
     let mut b = [0u8; 2048];
-    collect.recv_from(&mut b).ok().map(|(n, _)| String::from_utf8_lossy(&b[..n]).into_owned())
+    collect.recv_from(&mut b).ok().map(|(n, _)| {
+        let text = String::from_utf8_lossy(&b[..n]).into_owned();
+        let line = text.strip_suffix('\n').unwrap_or_else(|| panic!("a datagram ends with a line feed: {text:?}"));
+        assert!(!line.ends_with('\n'), "one line feed only: {text:?}");
+        line.to_string()
+    })
 }
 
 /// Sends `msg` to the forwarder and returns what the collector received, if anything.
@@ -63,6 +71,8 @@ fn a_message_keeps_its_shape_or_takes_the_targets_format() {
     let m3164 = "<134>Oct  4 18:17:12 myhost tag[7]: hello";
     // As it came: the header is rebuilt from what was parsed.
     assert_eq!(through(p_keep, &col, m3164.as_bytes()).as_deref(), Some(m3164));
+    // One that came with its own line feed leaves with one (`recv` refuses two).
+    assert_eq!(through(p_keep, &col, format!("{m3164}\n").as_bytes()).as_deref(), Some(m3164));
     let m5424 = "<134>1 2026-10-04T18:17:12-00:00 myhost tag 7 - - hello";
     assert_eq!(through(p_keep, &col, m5424.as_bytes()).as_deref(), Some(m5424));
     // `HAProxy` itself sends no hostname: `haproxy[1]:` reads as the host, and the text follows.

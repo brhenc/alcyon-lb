@@ -310,6 +310,7 @@ fn facts_of(info: &ibex_tls::RustlsTlsInfo) -> ibex_sample::SslFacts<'_> {
         cipher: info.cipher.as_deref().map(openssl_cipher_name),
         protocol: info.protocol_version.as_deref(),
         has_crt: info.peer_has_cert,
+        resumed: info.session_resumed,
     }
 }
 

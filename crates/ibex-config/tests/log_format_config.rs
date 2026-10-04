@@ -75,10 +75,12 @@ fn what_haproxy_refuses_is_refused() {
         let err = fe(body).expect_err(body);
         assert!(err.message.contains(why), "{body}: {}", err.message);
     }
+    // `option httpslog` is the HTTP log with the TLS fields (T165), and takes no argument.
+    assert_eq!(fe("  option httpslog\n").expect("loads").frontends[0].log_format, Some(LogFormatSpec::Https));
+    assert_eq!(fe("  option httpslog extra\n").expect("loads").frontends[0].log_format, Some(LogFormatSpec::Https));
     // Not implemented in Ibex: refused rather than accepted and dropped.
     for (body, why) in [
         ("  log-format-sd \"%ci\"\n", "log-format-sd"),
-        ("  option httpslog\n", "httpslog"),
         ("  capture cookie c len 5\n", "capture cookie"),
     ] {
         let err = fe(body).expect_err(body);
