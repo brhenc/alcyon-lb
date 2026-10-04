@@ -644,8 +644,7 @@ fn socket_file_ident(path: &Path) -> Option<(u64, u64)> {
     std::fs::symlink_metadata(path).ok().map(|m| (m.dev(), m.ino()))
 }
 
-/// `HAProxy`'s predefined ACLs (`default_acl_list`, src/acl.c), by name. `RDP_COOKIE`
-/// (`req.rdp_cookie_cnt`) and `WAIT_END` (`wait_end`) are missing: Ibex has neither fetch.
+/// `HAProxy`'s predefined ACLs (`default_acl_list`, src/acl.c), by name.
 const PREDEFINED_ACLS:&[(&str, &str)] = &[
     ("TRUE", "always_true"),
     ("FALSE", "always_false"),
@@ -668,6 +667,8 @@ const PREDEFINED_ACLS:&[(&str, &str)] = &[
     ("HTTP_URL_STAR", "url *"),
     ("HTTP_CONTENT", "req.hdr_val(content-length) gt 0"),
     ("REQ_CONTENT", "req.len gt 0"),
+    ("RDP_COOKIE", "req.rdp_cookie_cnt gt 0"),
+    ("WAIT_END", "wait_end"),
 ];
 
 /// A proxy's ACLs by name: the predefined ones, then its own (`find_acl_by_name` is
@@ -2981,6 +2982,8 @@ fn eval_tcp_req_content_rules(
         fc_dst: sess.fc_dst,
         proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
         req_body: if has_content { Some(req_bytes) } else { None },
+        raw_req: (sess.mode == Mode::Tcp).then_some(req_bytes),
+        wait_pending: can_wait,
         act_conn: proxy.stats[worker_id()].act_conn.load(Ordering::Relaxed),
         unique_id: sess.log.unique_id.as_deref(),
         captures_req_hdr: Some(&sess.log.req_captures),
@@ -3227,8 +3230,11 @@ fn eval_tcp_req_content_rules(
 /// from the message (`sample_conv_fix_is_valid`, `sample_conv_fix_tag_value`): only a
 /// message that needs more data may change.
 fn res_sample_may_change(expr: &Expr, rep: &[u8]) -> bool {
-    if expr.fetch_name == "res.len" {
+    if expr.fetch_name == "res.len" || expr.fetch_name == "wait_end" {
         return true;
+    }
+    if let Some(wait) = ibex_sample::raw_may_change(&expr.fetch_name, &expr.fetch_args, rep) {
+        return wait;
     }
     if expr.fetch_name != "res.payload" {
         return false;
@@ -3272,6 +3278,8 @@ fn eval_tcp_res_content_rules(proxy: &Proxy, proxies: &[Proxy], registry: &Regis
         fc_dst: sess.fc_dst,
         proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
         res_body: Some(rep_bytes),
+        raw_res: Some(rep_bytes),
+        wait_pending: !final_,
         act_conn: proxy.stats[worker_id()].act_conn.load(Ordering::Relaxed),
         unique_id: sess.log.unique_id.as_deref(),
         captures_req_hdr: Some(&sess.log.req_captures),
@@ -4365,6 +4373,7 @@ impl EngineDispatcher<'_> {
             } else {
                 Some(sess.req.readable())
             },
+            raw_req: (sess.mode == Mode::Tcp).then(|| sess.req.readable()),
             htx: None,
             htx_slice: sess.htx_slice(),
             req_uri: sess.req_uri.as_deref(),

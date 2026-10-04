@@ -465,6 +465,9 @@ pub fn check_expr(config: &Config, registry: &Registry, at: Where<'_>, expr: &st
             return Err(msg);
         }
     }
+    if let Some(msg) = ibex_sample::check_raw_fetch_args(&e.fetch_name, &e.fetch_args) {
+        return Err(msg);
+    }
     if let Some(spec) = fetch_arg(&e.fetch_name) {
         let what = format!("{} '{}'{in_proxy}", if acl { "ACL keyword" } else { "sample fetch keyword" }, e.fetch_name);
         resolve(config, at, spec, e.fetch_args.get(spec.pos).map(String::as_str), &what)?;

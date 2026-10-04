@@ -125,6 +125,9 @@ impl Expr {
                 _ => "str",
             };
             fetch_name = "req.hdr".to_string();
+        } else if fetch_name == "req_rdp_cookie" || fetch_name == "req_rdp_cookie_cnt" {
+            // ACL-only spellings (`acl_kws`, src/payload.c) of the `req.rdp_cookie*` fetches.
+            fetch_name = fetch_name.replacen("req_", "req.", 1);
         } else if fetch_name == "hdr" {
             fetch_name = "req.hdr".to_string();
             default_method = "str";
@@ -215,7 +218,9 @@ impl Expr {
                     op = word.as_str();
                     continue;
                 }
-                patterns.push(int_pattern_with_op(op, &unescape_pattern(word))?);
+                let word = unescape_pattern(word);
+                let word = if matches!(fetch_name.as_str(), "req.ssl_ver" | "req_ssl_ver") { dotted_ver(&word)? } else { word };
+                patterns.push(int_pattern_with_op(op, &word)?);
             }
         } else {
             patterns.extend(inline.iter().map(|w| unescape_pattern(w)));
@@ -329,6 +334,27 @@ fn read_pattern_file(path: &str) -> Result<Vec<String>, String> {
         .filter(|line| !line.is_empty())
         .map(str::to_string)
         .collect())
+}
+
+/// `pat_parse_dotted_ver`: the patterns of `req.ssl_ver` are `<major>[.<minor>]` numbers, alone
+/// or around a `:` or `-` of a range, each standing for `major << 16 | minor`.
+fn dotted_ver(word: &str) -> Result<String, String> {
+    let one = |t: &str| -> Result<String, String> {
+        let (major, minor) = t.split_once('.').unwrap_or((t, ""));
+        let major: i64 = major.parse().map_err(|_| format!("'{word}' is not a dotted number"))?;
+        let minor: i64 = if t.contains('.') { minor.parse().map_err(|_| format!("'{word}' is not a dotted number"))? } else { 0 };
+        if !(0..65536).contains(&major) || !(0..65536).contains(&minor) {
+            return Err(format!("'{word}' is not a dotted number"));
+        }
+        Ok(((major << 16) | minor).to_string())
+    };
+    match word.find([':', '-']) {
+        None => one(word),
+        Some(at) => {
+            let (lo, hi) = (&word[..at], &word[at + 1..]);
+            Ok(format!("{}:{}", if lo.is_empty() { String::new() } else { one(lo)? }, if hi.is_empty() { String::new() } else { one(hi)? }))
+        }
+    }
 }
 
 /// An integer pattern under the operator in force: `gt 5` is the range `6:`, `le 5` is

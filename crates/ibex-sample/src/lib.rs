@@ -14,6 +14,7 @@ pub mod expr;
 pub mod fix;
 pub mod hash;
 pub mod matcher;
+pub mod rawpayload;
 pub mod registry;
 pub mod sample;
 
@@ -25,4 +26,5 @@ pub use registry::{
     ConvFn, CtxConvDesc, CtxConvFn, FetchDesc, FetchFn, FrontendCounter, ProxyState, Registry,
     ServerState, SampleContext, StickData, StickState, CURRENT_VARS, GLOBAL_PROC_VARS, SAMPLE_REGISTRY,
 };
+pub use rawpayload::{check_args as check_raw_fetch_args, raw_may_change};
 pub use sample::{Sample, SampleType, TypeSpec, SAMPLE_TYPES_COUNT};
