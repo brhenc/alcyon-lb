@@ -375,13 +375,14 @@ impl CliApplet {
                     // A tracker whose target is in maintenance or drain has the inherited flags
                     // instead (SRV_ADMF_IMAINT 2, SRV_ADMF_IDRAIN 16).
                     let inherited = crate::track::inherited(p, s_idx);
+                    // A server the file disabled keeps SRV_ADMF_CMAINT (4) for good.
                     let admin_state = match status {
                         Some(ServerStatus::Maint) if inherited => 2,
                         Some(ServerStatus::Drain) if inherited => 16,
                         Some(ServerStatus::Maint) => 1,
                         Some(ServerStatus::Drain) => 8,
                         _ => 0,
-                    };
+                    } | if p.server_cmaint(s_idx) { 4 } else { 0 };
                     let uweight = p.server_weights.get(s_idx).copied().unwrap_or(1);
                     let iweight = p.initial_weight(s_idx);
                     

@@ -456,6 +456,9 @@ pub struct ProxyIdInfo {
     /// What `show servers state` reports as each server's `srv_check_health` while no check
     /// runs on it; empty when that is 0 for all (see [`Proxy::server_init_health`]).
     pub server_init_health: Vec<u32>,
+    /// Which servers the configuration disabled (`SRV_ADMF_CMAINT`, 4 in `show servers state`
+    /// whatever the CLI does afterwards); empty when none (see [`Proxy::server_cmaint`]).
+    pub server_cmaint: Vec<bool>,
     /// Each listener's numeric id (`luid`) by `bind` line, as `so_id` reads it.
     pub listener_ids: Vec<u32>,
     /// `pool-max-conn` per server; empty when no server sets it (-1, unlimited, then).
@@ -624,6 +627,12 @@ impl Proxy {
     #[must_use]
     pub fn server_puid(&self, idx: usize) -> u32 {
         self.ids.server_puids.get(idx).copied().unwrap_or_else(|| u32::try_from(idx + 1).unwrap_or(u32::MAX))
+    }
+
+    /// Whether the configuration disabled the server at `idx` (`SRV_ADMF_CMAINT`).
+    #[must_use]
+    pub fn server_cmaint(&self, idx: usize) -> bool {
+        self.ids.server_cmaint.get(idx).copied().unwrap_or(false)
     }
 
     /// Whether the server at `idx` has an `id` of its own (`SRV_F_FORCED_ID`).
@@ -1714,6 +1723,11 @@ fn server_init_health(count: usize, extras: &ibex_config::ast::ServerExtras) -> 
     health
 }
 
+/// The flags for [`Proxy::server_cmaint`]: empty when no server is `disabled` in the file.
+fn server_cmaint(servers: &[ibex_config::Server]) -> Vec<bool> {
+    if servers.iter().any(|s| s.disabled) { servers.iter().map(|s| s.disabled).collect() } else { Vec::new() }
+}
+
 /// The flags for [`Proxy::server_forced_ids`]: empty when none asked for an id.
 fn server_forced_ids(count: usize, extras: &ibex_config::ast::ServerExtras) -> Vec<bool> {
     let mut forced = Vec::new();
@@ -1786,6 +1800,7 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, list
             server_puids: server_puids(listen.servers.len(), &listen.server_extras),
             server_forced_ids: server_forced_ids(listen.servers.len(), &listen.server_extras),
             server_init_health: server_init_health(listen.servers.len(), &listen.server_extras),
+            server_cmaint: server_cmaint(&listen.servers),
             listener_ids: ibex_config::ast::listener_ids(&listen.binds),
             server_pool_max_conn: pool_max_conns(&listen.servers),
             server_close: listen.server_close,
@@ -2055,6 +2070,7 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, be:
             server_puids: server_puids(be.servers.len(), &be.server_extras),
             server_forced_ids: server_forced_ids(be.servers.len(), &be.server_extras),
             server_init_health: server_init_health(be.servers.len(), &be.server_extras),
+            server_cmaint: server_cmaint(&be.servers),
             listener_ids: Vec::new(),
             server_pool_max_conn: pool_max_conns(&be.servers),
             server_close: be.server_close,
