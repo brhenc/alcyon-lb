@@ -549,7 +549,13 @@ impl TcpSession {
 
     /// Writes `raw` to the client once, best effort, on a connection about to be closed:
     /// what is not taken by the socket at once is dropped, as the connection is.
+    ///
+    /// `raw` is HTTP/1 text, so on an HTTP/2 connection nothing is sent: the h2 mux has
+    /// no 408 for an idle client (it closes), and a `100 Continue` is not its to send.
     pub fn send_before_close(&mut self, raw: &[u8]) {
+        if self.h2_ctx.is_some() {
+            return;
+        }
         let _ = self.cli_xprt.send(self.cli.as_fd(), raw);
     }
 
@@ -580,8 +586,14 @@ impl TcpSession {
         if raw.is_empty() || txn::head_wants_close(&head) {
             txn.close_after = true;
         }
+        let h2 = self.h2_ctx.is_some();
+        // On an HTTP/2 connection the reply is a response like a server's: its head
+        // goes out as HEADERS and its body as DATA on the request's stream
+        // (`h2_forward_response`), so it is queued as a head with its framing, not as
+        // an opaque run of bytes, and says nothing about `Connection`.
+        let raw = if h2 && txn.client_head { &raw[..head_len.min(raw.len())] } else { raw };
         let mut out;
-        let raw = if txn.close_after && !raw.is_empty() && !has_header(&head, "connection") {
+        let raw = if !h2 && txn.close_after && !raw.is_empty() && !has_header(&head, "connection") {
             // The client is told, as for a server's response: last in the head, as
             // `inject_connection_close_header_zero_alloc` places it.
             let at = find_eoh(raw).map_or(0, |(h, e)| h + e / 2);
@@ -595,6 +607,10 @@ impl TcpSession {
         };
         txn.rsp = if raw.is_empty() {
             txn::MsgState::Done
+        } else if h2 {
+            let body = raw.len() - head_len.min(raw.len());
+            let bodyless = body == 0 || matches!(txn.status, 100..=199 | 204 | 304);
+            txn::MsgState::head(if bodyless { txn::Framing::None } else { txn::Framing::Length(body as u64) })
         } else {
             txn::MsgState::Body(txn::Body::Length(raw.len() as u64))
         };
