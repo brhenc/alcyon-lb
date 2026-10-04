@@ -3660,7 +3660,7 @@ impl Registry {
             in_type: TypeSpec::Any,
             out_type: TypeSpec::Same,
             func: |smp, args| {
-                if !args.is_empty() {
+                { // `set-var` always has its variable name: the load refuses `set-var()`
                     let spec = args.join(",");
                     let spec = spec.as_str();
                     let name = spec.split(',').next().unwrap_or("");
@@ -5057,6 +5057,9 @@ pub fn check_converter_args(name: &str, args: &[String]) -> Option<String> {
                 return Some("invalid args in converter 'hmac' : failed to parse key : argument needs to be base64 encoded, and can either be a string or a variable.".to_string());
             }
             None
+        }
+        "set-var" if args.first().is_none_or(String::is_empty) => {
+            Some("invalid args in converter 'set-var' : Empty variable name cannot be accepted.".to_string())
         }
         "set-var" => args.iter().skip(1).filter(|c| !c.is_empty()).find_map(|c| match c.as_str() {
             "ifexists" | "ifnotexists" | "ifempty" | "ifnotempty" | "ifset" | "ifnotset" => None,

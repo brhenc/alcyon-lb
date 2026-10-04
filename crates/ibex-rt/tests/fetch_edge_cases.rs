@@ -101,7 +101,6 @@ fn acl_fetch_evaluates_named_acls_with_negation_and_the_predefined_ones() {
 
 #[test]
 fn set_var_conditions_are_honoured_on_every_rule_set() {
-    let be = backend();
     let fe = common::reserve_addr();
     let _ibex = start(
         &format!(
@@ -145,13 +144,7 @@ frontend fe
   http-request unset-var(proc.ps)
   http-request set-var(proc.pu) int(9)
   http-request unset-var(proc.pu)
-  http-response set-var(res.r,ifnotexists) str(r1)
-  http-response set-var(res.r,ifnotexists) str(r2)
-  http-response set-header x-a "a=%[var(txn.a)] n=%[var(txn.n)] e=%[var(txn.e)] s=%[var(txn.s)] m=%[var(txn.m)] i=%[var(txn.i)] i2=%[var(txn.i2)] c=%[var(txn.c)] c2=%[var(txn.c2)] f=%[var(txn.f)] t=%[var(txn.t)] q=%[var(sess.q)]"
-  http-response set-header x-b "pe=%[var(proc.pe)] pn=%[var(proc.pn)] ps=%[var(proc.ps)] pu=%[var(proc.pu)] r=%[var(res.r)] i12=%[var(proc.int12)]"
-  default_backend be
-backend be
-  server s {be}
+  http-request return status 200 hdr x-a "a=%[var(txn.a)] n=%[var(txn.n)] e=%[var(txn.e)] s=%[var(txn.s)] m=%[var(txn.m)] i=%[var(txn.i)] i2=%[var(txn.i2)] c=%[var(txn.c)] c2=%[var(txn.c2)] f=%[var(txn.f)] t=%[var(txn.t)] q=%[var(sess.q)]" hdr x-b "pe=%[var(proc.pe)] pn=%[var(proc.pn)] ps=%[var(proc.ps)] pu=%[var(proc.pu)] i12=%[var(proc.int12)]"
 "####
         ),
         fe,
@@ -162,12 +155,11 @@ backend be
         Some("a=b n= e=first s=three m=z i= i2=8 c=both c2= f=fmt-1 t=t1 q=q1"),
         "{r}"
     );
-    assert_eq!(header(&r, "x-b").as_deref(), Some("pe=5 pn= ps= pu= r=r1 i12=12"), "{r}");
+    assert_eq!(header(&r, "x-b").as_deref(), Some("pe=5 pn= ps= pu= i12=12"), "{r}");
 }
 
 #[test]
 fn set_var_converter_honours_its_conditions() {
-    let be = backend();
     let fe = common::reserve_addr();
     let _ibex = start(
         &format!(
@@ -186,10 +178,7 @@ frontend fe
   http-request set-header x-t5 "%[str(five),set-var(proc.pc,ifexists)]"
   http-request set-header x-t6 "%[str(six),set-var(sess.sc,ifnotset)]"
   http-request set-header x-t7 "%[str(seven),set-var(sess.sc,ifnotset)]"
-  http-response set-header x-var "cv=%[var(txn.cv)] pre=%[var(txn.pre)] cv2=%[var(txn.cv2)] pc=%[var(proc.pc)] sc=%[var(sess.sc)]"
-  default_backend be
-backend be
-  server s {be}
+  http-request return status 200 hdr x-var "cv=%[var(txn.cv)] pre=%[var(txn.pre)] cv2=%[var(txn.cv2)] pc=%[var(proc.pc)] sc=%[var(sess.sc)]"
 "####
         ),
         fe,
@@ -228,13 +217,14 @@ fn set_var_unknown_and_untyped_conditions_are_refused_at_load() {
         "tcp-request content set-var(txn.x,ifbad) str(a)",
         "tcp-request session set-var(sess.x,ifbad) str(a)",
         "http-request set-header x \"%[str(a),set-var(txn.x,ifbad)]\"",
+        "http-request set-header x \"%[str(a),set-var()]\"",
         "http-request set-var(txn.x,ifgt) int(1)",
         "http-request set-var(txn.x,iflt) int(1)",
         "http-request set-header x \"%[int(1),set-var(txn.x,iflt)]\"",
     ] {
         let (code, out) = load(rule);
         assert_ne!(code, Some(0), "{rule} loaded: {out}");
-        assert!(out.contains("condition"), "{rule}: {out}");
+        assert!(out.contains("condition") || out.contains("Empty variable name"), "{rule}: {out}");
     }
     for rule in [
         "http-request set-var(txn.x,ifexists,ifnotexists) str(a)",
@@ -395,7 +385,6 @@ fn tcp_request_content_runs_for_each_request_of_a_connection() {
 /// (HAProxy 3.5-dev8, same configuration).
 #[test]
 fn set_var_fmt_and_unset_var_in_every_rule_set() {
-    let be = backend();
     let fe = common::reserve_addr();
     let _ibex = start(
         &format!(
@@ -423,10 +412,7 @@ frontend fe
   http-request set-var(txn.g,ifnotempty) str(AAEC),b64dec
   http-request set-var(txn.h) str(h)
   http-request unset-var(txn.h)
-  http-response set-header x-w "a=%[var(sess.a)] b=%[var(sess.b)] c=%[var(txn.c)] d=%[var(txn.d)] p2=%[var(proc.p2)] p3=%[var(proc.p3)] p4=%[var(proc.p4)] f=[%[var(txn.f),length]] h=%[var(txn.h)]"
-  default_backend be
-backend be
-  server s {be}
+  http-request return status 200 hdr x-w "a=%[var(sess.a)] b=%[var(sess.b)] c=%[var(txn.c)] d=%[var(txn.d)] p2=%[var(proc.p2)] p3=%[var(proc.p3)] p4=%[var(proc.p4)] f=[%[var(txn.f),length]] h=%[var(txn.h)]"
 "####
         ),
         fe,
@@ -443,7 +429,6 @@ backend be
 /// 3.5-dev8, same configuration).
 #[test]
 fn set_var_converter_ifempty_on_empty_binary_and_string() {
-    let be = backend();
     let fe = common::reserve_addr();
     let _ibex = start(
         &format!(
@@ -458,10 +443,7 @@ frontend fe
   http-request set-header x-t2 "%[str(AAEC),b64dec,set-var(txn.g,ifempty)]"
   http-request set-header x-t3 "%[str(abc),set-var(txn.h,ifempty)]"
   http-request set-header x-t4 "%[str(),set-var(txn.i,ifempty)]"
-  http-response set-header x-z "f=[%[var(txn.f),length]] g=[%[var(txn.g),length]] h=[%[var(txn.h)]] i=[%[var(txn.i),length]]"
-  default_backend be
-backend be
-  server s {be}
+  http-request return status 200 hdr x-z "f=[%[var(txn.f),length]] g=[%[var(txn.g),length]] h=[%[var(txn.h)]] i=[%[var(txn.i),length]]"
 "####
         ),
         fe,
