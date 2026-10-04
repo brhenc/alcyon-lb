@@ -964,11 +964,8 @@ fn test_conv_word() {
         eval_conv("word", Sample::Str("foo   bar  baz".into()), &["2", " "]),
         Some(Sample::Str("bar".into()))
     );
-    // 2. Empty input
-    assert_eq!(
-        eval_conv("word", Sample::Str(String::new()), &["1", " "]),
-        Some(Sample::Str(String::new()))
-    );
+    // 2. Empty input has no word (HAProxy 3.5-dev8: no sample)
+    assert_eq!(eval_conv("word", Sample::Str(String::new()), &["1", " "]), None);
     // 3. Negative index
     assert_eq!(
         eval_conv("word", Sample::Str("foo   bar  baz".into()), &["-1", " "]),

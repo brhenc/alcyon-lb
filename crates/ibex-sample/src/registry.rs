@@ -2121,20 +2121,22 @@ impl Registry {
                 let Sample::Str(s) = smp else { return None };
                 let fields: Vec<&str> = s.split(delim_char).collect();
                 let len = fields.len();
-                if len == 0 {
-                    return Some(Sample::Str(String::new()));
-                }
+                // A field past either end is "no sample", not an empty one.
                 let start_idx = match idx.cmp(&0) {
                     std::cmp::Ordering::Greater => {
                         usize::try_from(idx).unwrap_or(usize::MAX).saturating_sub(1)
                     }
-                    std::cmp::Ordering::Less => len.saturating_sub(
-                        usize::try_from(idx.saturating_neg()).unwrap_or(usize::MAX),
-                    ),
+                    std::cmp::Ordering::Less => {
+                        let neg_idx = usize::try_from(idx.saturating_neg()).unwrap_or(usize::MAX);
+                        if neg_idx > len {
+                            return None;
+                        }
+                        len - neg_idx
+                    }
                     std::cmp::Ordering::Equal => return None,
                 };
                 if start_idx >= len {
-                    return Some(Sample::Str(String::new()));
+                    return None;
                 }
                 let end_idx = if count == 0 {
                     len
@@ -2162,10 +2164,6 @@ impl Registry {
                 let count: usize = count_str.and_then(|c| c.parse().ok()).unwrap_or(1);
 
                 let Sample::Str(s) = smp else { return None };
-                if s.is_empty() {
-                    return Some(Sample::Str(String::new()));
-                }
-
                 let mut words: Vec<(usize, usize)> = Vec::new();
                 let mut in_word = false;
                 let mut word_start = 0;
@@ -2187,7 +2185,7 @@ impl Registry {
 
                 let len = words.len();
                 if len == 0 {
-                    return Some(Sample::Str(String::new()));
+                    return None;
                 }
 
                 let start_idx = match idx.cmp(&0) {
@@ -2197,7 +2195,7 @@ impl Registry {
                     std::cmp::Ordering::Less => {
                         let neg_idx = usize::try_from(idx.saturating_neg()).unwrap_or(usize::MAX);
                         if neg_idx > len {
-                            return Some(Sample::Str(String::new()));
+                            return None;
                         }
                         len - neg_idx
                     }
@@ -2205,7 +2203,7 @@ impl Registry {
                 };
 
                 if start_idx >= len {
-                    return Some(Sample::Str(String::new()));
+                    return None;
                 }
 
                 let end_word_idx = if count == 0 {

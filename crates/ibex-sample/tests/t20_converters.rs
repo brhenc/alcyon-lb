@@ -49,7 +49,7 @@ fn test_bytes() {
 #[test]
 fn test_field() {
     assert_eq!(eval_conv("field", Sample::Str("a|b|c".into()), &["1", "|"]), Some(Sample::Str("a".into())));
-    assert_eq!(eval_conv("field", Sample::Str("a|b|c".into()), &["4", "|"]), Some(Sample::Str(String::new())));
+    assert_eq!(eval_conv("field", Sample::Str("a|b|c".into()), &["4", "|"]), None);
     assert_eq!(eval_conv("field", Sample::Str("a|b|c".into()), &["0", "|"]), None);
     assert_eq!(eval_conv("field", Sample::Str(String::new()), &["1", "|"]), Some(Sample::Str(String::new())));
     assert_eq!(eval_conv("field", Sample::Bin(b"abc".to_vec()), &["1", "|"]), None);
@@ -59,7 +59,7 @@ fn test_field() {
 fn test_word() {
     assert_eq!(eval_conv("word", Sample::Str("a b c".into()), &["2"]), Some(Sample::Str("b".into())));
     assert_eq!(eval_conv("word", Sample::Str("a b c".into()), &["0"]), None);
-    assert_eq!(eval_conv("word", Sample::Str(String::new()), &["1"]), Some(Sample::Str(String::new())));
+    assert_eq!(eval_conv("word", Sample::Str(String::new()), &["1"]), None);
     assert_eq!(eval_conv("word", Sample::Bin(b"abc".to_vec()), &["1"]), None);
 }
 

@@ -3080,21 +3080,14 @@ fn eval_tcp_req_session_rules(
                 }
             }
             ibex_config::TcpReqSessionAction::SetVar { var_name, expr } => {
+                // A sample that cannot be fetched sets nothing (`action_store`, src/vars.c).
                 let val = if let Ok(e) = Expr::parse(expr) {
-                    e.eval_sample(registry, &ctx)
-                        .map(|smp| sample_to_string(&smp))
-                        .unwrap_or_default()
+                    e.eval_sample(registry, &ctx).map(|smp| sample_to_string(&smp))
                 } else {
-                    format_sample_string(expr, &ctx, registry)
+                    Some(format_sample_string(expr, &ctx, registry))
                 };
-                if var_name.starts_with("proc.") {
-                    ibex_sample::set_proc_var(var_name, val);
-                } else if var_name.starts_with("sess.") {
-                    sess.sess_vars.insert(var_name.clone(), val.clone());
-                    ibex_sample::CURRENT_VARS.with(|v| v.borrow_mut().insert(var_name.clone(), val));
-                } else {
-                    sess.req_vars.insert(var_name.clone(), val.clone());
-                    ibex_sample::CURRENT_VARS.with(|v| v.borrow_mut().insert(var_name.clone(), val));
+                if let Some(val) = val {
+                    store_var(&mut sess.sess_vars, &mut sess.req_vars, var_name, val);
                 }
             }
             ibex_config::TcpReqSessionAction::SetVarFmt { var_name, fmt } => {
@@ -3364,21 +3357,14 @@ fn eval_tcp_req_content_rules(
                 }
             }
             ibex_config::TcpReqContentAction::SetVar { var_name, expr } => {
+                // A sample that cannot be fetched sets nothing (`action_store`, src/vars.c).
                 let val = if let Ok(e) = Expr::parse(expr) {
-                    e.eval_sample(registry, &ctx)
-                        .map(|smp| sample_to_string(&smp))
-                        .unwrap_or_default()
+                    e.eval_sample(registry, &ctx).map(|smp| sample_to_string(&smp))
                 } else {
-                    format_sample_string(expr, &ctx, registry)
+                    Some(format_sample_string(expr, &ctx, registry))
                 };
-                if var_name.starts_with("proc.") {
-                    ibex_sample::set_proc_var(var_name, val);
-                } else if var_name.starts_with("sess.") {
-                    sess.sess_vars.insert(var_name.clone(), val.clone());
-                    ibex_sample::CURRENT_VARS.with(|v| v.borrow_mut().insert(var_name.clone(), val));
-                } else {
-                    sess.req_vars.insert(var_name.clone(), val.clone());
-                    ibex_sample::CURRENT_VARS.with(|v| v.borrow_mut().insert(var_name.clone(), val));
+                if let Some(val) = val {
+                    store_var(&mut sess.sess_vars, &mut sess.req_vars, var_name, val);
                 }
             }
             ibex_config::TcpReqContentAction::SetVarFmt { var_name, fmt } => {
@@ -6529,24 +6515,14 @@ impl EngineDispatcher<'_> {
                         }
                     }
                     ibex_config::HttpReqAction::SetVar { var_name, expr } => {
+                        // A sample that cannot be fetched sets nothing (`action_store`, src/vars.c).
                         let val = if let Ok(e) = Expr::parse(expr) {
-                            e.eval_sample(registry, &make_ctx!(sess))
-                                .map(|smp| sample_to_string(&smp))
-                                .unwrap_or_default()
+                            e.eval_sample(registry, &make_ctx!(sess)).map(|smp| sample_to_string(&smp))
                         } else {
-                            format_sample_string(expr, &make_ctx!(sess), registry)
+                            Some(format_sample_string(expr, &make_ctx!(sess), registry))
                         };
-                        if var_name.starts_with("proc.") {
-                            ibex_sample::set_proc_var(var_name, val);
-                        } else {
-                            if var_name.starts_with("sess.") {
-                                sess.sess_vars.insert(var_name.clone(), val.clone());
-                            } else {
-                                sess.req_vars.insert(var_name.clone(), val.clone());
-                            }
-                            CURRENT_VARS.with(|v| {
-                                v.borrow_mut().insert(var_name.clone(), val);
-                            });
+                        if let Some(val) = val {
+                            store_var(&mut sess.sess_vars, &mut sess.req_vars, var_name, val);
                         }
                     }
                     ibex_config::HttpReqAction::SetVarFmt { var_name, fmt } => {
