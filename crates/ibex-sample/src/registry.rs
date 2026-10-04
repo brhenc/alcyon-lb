@@ -2223,9 +2223,15 @@ impl Registry {
             out_type: TypeSpec::Exact(SampleType::Str),
             func: |smp, args| {
                 let param_name = args.first()?;
-                let delim = args.get(1).map_or("&", String::as_str);
+                // The separator is one character, written as itself or as `0x<hex>`.
+                let delim = args.get(1).map_or("&".to_string(), |d| {
+                    d.strip_prefix("0x")
+                        .or_else(|| d.strip_prefix("0X"))
+                        .and_then(|h| u8::from_str_radix(h, 16).ok())
+                        .map_or_else(|| d.clone(), |b| char::from(b).to_string())
+                });
                 let Sample::Str(s) = smp else { return None };
-                for pair in s.split(delim) {
+                for pair in s.split(delim.as_str()) {
                     if let Some((k, v)) = pair.split_once('=') {
                         if k == param_name {
                             return Some(Sample::Str(v.to_string()));

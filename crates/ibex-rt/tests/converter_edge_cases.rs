@@ -106,6 +106,44 @@ hdr x-un \"[%[var(txn.hash),hmac(sha1,txn.nokey),hex,lower]]\"\n";
 }
 
 #[test]
+fn param_finds_a_name_anywhere_in_the_query_with_a_char_or_hex_separator() {
+    let rules = "  http-request set-var(txn.query) query\n\
+  http-request set-var(txn.a) var(txn.query),param(test)\n\
+  http-request set-var(txn.b) var(txn.query),param(test,0x26)\n\
+  http-request set-var(txn.c) var(txn.query),param(test,;)\n\
+  http-request set-var(txn.d) var(txn.query),param(test,0x3b)\n\
+  http-request return status 200 hdr x-q \"[%[var(txn.query)]]\" hdr x-a \"[%[var(txn.a)]]\" if { var(txn.a) -m found }\n\
+  http-request return status 200 hdr x-q \"[%[var(txn.query)]]\" hdr x-na y hdr x-b \"[%[var(txn.b)]]\" hdr x-c \"[%[var(txn.c)]]\" hdr x-d \"[%[var(txn.d)]]\"\n";
+    let reqs: Vec<String> = [
+        "/foo/?test=1&b=4&d",
+        "/?a=1&b=4&test=34",
+        "/?a=b&c=d",
+        "/?a=b&test&c=d",
+        "/?test=",
+        "/?testing=123&test=4",
+        "/?a=1;test=5&b=2",
+        "/?a=1;test=5&test=7",
+    ]
+    .iter()
+    .map(|p| get(p))
+    .collect();
+    let reqs: Vec<&str> = reqs.iter().map(String::as_str).collect();
+    assert_eq!(
+        run(rules, &reqs),
+        vec![
+            vec!["x-q: [test=1&b=4&d]", "x-a: [1]"],
+            vec!["x-q: [a=1&b=4&test=34]", "x-a: [34]"],
+            vec!["x-q: [a=b&c=d]", "x-na: y", "x-b: []", "x-c: []", "x-d: []"],
+            vec!["x-q: [a=b&test&c=d]", "x-a: []"],
+            vec!["x-q: [test=]", "x-a: []"],
+            vec!["x-q: [testing=123&test=4]", "x-a: [4]"],
+            vec!["x-q: [a=1;test=5&b=2]", "x-na: y", "x-b: []", "x-c: [5&b=2]", "x-d: [5&b=2]"],
+            vec!["x-q: [a=1;test=5&test=7]", "x-a: [7]"],
+        ]
+    );
+}
+
+#[test]
 fn set_var_with_a_failing_converter_leaves_the_variable_alone() {
     let rules = "  http-request set-var(txn.a) str(one)\n\
   http-request set-var(txn.a) str(x),field(3,/)\n\
