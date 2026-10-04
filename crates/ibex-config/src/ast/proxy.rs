@@ -49,6 +49,9 @@ pub struct DefaultsSection {
     pub server_close: bool,
     /// `option dontlognull`: no log line for a connection that carried nothing.
     pub dontlognull: bool,
+    /// `option dontlog-normal`, `option log-separate-errors` and `option logasap`, as the
+    /// `LOG_OPT_*` bits.
+    pub log_opts: u8,
     /// `option forwardfor` in `defaults`: the `except` network, empty for none.
     pub forwardfor: Option<String>,
     /// `option forwardfor ... if-none` (without it, `HAProxy` adds the header always).
@@ -225,6 +228,9 @@ pub struct ListenSection {
     pub server_close: bool,
     /// `option dontlognull`: no log line for a connection that carried nothing.
     pub dontlognull: bool,
+    /// `option dontlog-normal`, `option log-separate-errors` and `option logasap`, as the
+    /// `LOG_OPT_*` bits.
+    pub log_opts: u8,
     /// Client header regex rewrite rules (up to 10).
     pub cliexp: Vec<HeaderExp>,
     /// Server header regex rewrite rules (up to 10).
@@ -370,6 +376,7 @@ impl Default for ListenSection {
             buffer_request: false,
             server_close: false,
             dontlognull: false,
+            log_opts: 0,
             cliexp: Vec::new(),
             srvexp: Vec::new(),
             acls: Vec::new(),
@@ -473,6 +480,9 @@ pub struct FrontendSection {
     pub server_close: bool,
     /// `option dontlognull`: no log line for a connection that carried nothing.
     pub dontlognull: bool,
+    /// `option dontlog-normal`, `option log-separate-errors` and `option logasap`, as the
+    /// `LOG_OPT_*` bits.
+    pub log_opts: u8,
     /// Stick table configuration.
     pub stick_table: Option<StickTableConfigAst>,
     /// Stick rules.
@@ -540,6 +550,7 @@ impl Default for FrontendSection {
             buffer_request: false,
             server_close: false,
             dontlognull: false,
+            log_opts: 0,
             stick_table: None,
             stick_rules: Vec::new(),
             tcp_req_inspect_delay: None,
@@ -739,3 +750,21 @@ impl Default for BackendSection {
     }
 }
 
+
+/// `option dontlog-normal`: a stream that did not fail logs nothing.
+pub const LOG_OPT_DONTLOG_NORMAL: u8 = 1;
+/// `option log-separate-errors`: a failed stream is logged at level `err`.
+pub const LOG_OPT_SEPARATE_ERRORS: u8 = 2;
+/// `option logasap`: the line is sent when the response head is, not at the end.
+pub const LOG_OPT_ASAP: u8 = 4;
+
+/// The `LOG_OPT_*` bit of the option `name`, 0 for any other.
+#[must_use]
+pub fn log_opt_bit(name: &str) -> u8 {
+    match name {
+        "dontlog-normal" => LOG_OPT_DONTLOG_NORMAL,
+        "log-separate-errors" => LOG_OPT_SEPARATE_ERRORS,
+        "logasap" => LOG_OPT_ASAP,
+        _ => 0,
+    }
+}

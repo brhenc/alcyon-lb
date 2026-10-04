@@ -65,6 +65,8 @@ pub struct StreamLog {
     pub status: Option<u16>,
     /// The stream was answered by an applet (the stats page): `when(toapplet)`.
     pub applet: bool,
+    /// `option logasap`: the line went out with the response head; none follows.
+    pub asap_done: bool,
 }
 
 impl StreamLog {
@@ -94,6 +96,7 @@ impl StreamLog {
             term: None,
             status: None,
             applet: false,
+            asap_done: false,
         }
     }
 

@@ -1045,6 +1045,12 @@ impl Registry {
             out_type: SampleType::Sint,
             func: status_fetch,
         });
+        // `txn.status`: the status the log reports, `status` where a response is read.
+        self.register_fetch(FetchDesc {
+            name: "txn.status",
+            out_type: SampleType::Sint,
+            func: status_fetch,
+        });
 
         self.register_fetch(FetchDesc {
             name: "req.proto_http",

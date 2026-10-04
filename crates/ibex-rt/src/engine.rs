@@ -586,6 +586,9 @@ pub struct Proxy {
     pub log_format: Option<Arc<crate::logfmt::LogFormat>>,
     /// `option dontlognull`: a connection that carried nothing logs nothing.
     pub dont_log_null: bool,
+    /// `option dontlog-normal`, `option log-separate-errors`, `option logasap`: the
+    /// `ibex_config::LOG_OPT_*` bits.
+    pub log_opts: u8,
     /// `unique-id-format`, compiled.
     pub unique_id_format: Option<Arc<crate::logfmt::LogFormat>>,
     /// `unique-id-header`: the request header the unique ID is sent to the server in.
@@ -802,6 +805,8 @@ pub struct SessionEntry {
     pub srv_served: u8,
     /// A finished transaction's log line, waiting to be sent to its frontend's targets.
     pub log_line: Option<Vec<u8>>,
+    /// `log_line` is a failed stream's: `option log-separate-errors` sends it at `err`.
+    pub log_err: bool,
 }
 
 /// Per-thread storage for active sessions.
@@ -1387,7 +1392,8 @@ fn session_log_data<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, pid: u3
         t_queue: l.ms(l.queue),
         t_connect: l.ms(l.connect),
         t_data: l.ms(l.data),
-        t_close: l.ms(Some(std::time::Instant::now())),
+        t_close: if l.asap_done || fe.log_opts & ibex_config::LOG_OPT_ASAP != 0 { l.ms(l.data.or(Some(std::time::Instant::now()))) } else { l.ms(Some(std::time::Instant::now())) },
+        plus: fe.log_opts & ibex_config::LOG_OPT_ASAP != 0,
         status: s.txn.as_ref().map(|t| t.status).or(l.status).map_or(-1, i64::from),
         bytes_out: l.bytes_from_server,
         // A request that never parsed counts nothing (`HAProxy`: `U=0` with `<BADREQ>`).
@@ -1418,18 +1424,47 @@ fn session_log_data<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, pid: u3
 
 /// The stream's log line, when its frontend logs (`HAProxy` logs nothing without a
 /// `log` target).
-fn stream_log_line(entry: &SessionEntry, proxies: &[Proxy], pid: u32) -> Option<Vec<u8>> {
+///
+/// With it, whether the stream failed (`strm_log`'s `err`): a redispatch or a retry, a
+/// termination state that names a fault (anything but `-` and `L`), or a 5xx status. A
+/// stream that did not fail has no line under `option dontlog-normal`.
+fn stream_log_line(entry: &SessionEntry, proxies: &[Proxy], pid: u32) -> Option<(Vec<u8>, bool)> {
     let fe = &proxies[entry.proxy_idx];
     let fmt = fe.log_format.as_ref()?;
-    if fe.log_target_idx.is_empty() {
+    if fe.log_target_idx.is_empty() || entry.sess.log.asap_done {
         return None;
     }
     let be = proxies.get(entry.backend_idx).unwrap_or(fe);
     // `status` is the transaction's (`txn->status`, as `%ST`), not whatever response the
     // thread rewrote last (T152).
-    let line = fmt.render_bytes(&stream_log_data(entry, proxies, entry.proxy_idx, pid), sample_registry(), &SampleContext { at_log: true, res_status: entry.sess.txn.as_ref().map(|t| t.status).or(entry.sess.log.status).filter(|&s| s > 0), ..stream_sample_ctx(&entry.sess, fe, be, &ProxiesView(proxies), &StickView::new(proxies, &entry.sess.tracked_sc)) });
+    // A stream that never had a transaction (an aborted or timed-out connection, a bad
+    // request) has no status for a fetch: `%[status]` and `%[txn.status]` are empty there,
+    // while `%ST` still reports the 400 or 408.
+    let txn_status = entry.sess.txn.as_ref().map(|t| t.status).filter(|&s| s > 0);
+    let status = txn_status.or(entry.sess.log.status.filter(|&s| s > 0));
+    let term = term_state(entry);
+    let err = (term[0] != b'-' && term[0] != b'L')
+        || (term[0] == b'-' && entry.sess.max_retries > entry.sess.conn_retries)
+        || (entry.sess.mode == Mode::Http && status.is_some_and(|s| s >= 500));
+    if !err && fe.log_opts & ibex_config::LOG_OPT_DONTLOG_NORMAL != 0 {
+        return None;
+    }
+    let line = fmt.render_bytes(&stream_log_data(entry, proxies, entry.proxy_idx, pid), sample_registry(), &SampleContext { at_log: true, res_status: txn_status, ..stream_sample_ctx(&entry.sess, fe, be, &ProxiesView(proxies), &StickView::new(proxies, &entry.sess.tracked_sc)) });
     fe.log_count.fetch_add(1, Ordering::Relaxed);
-    Some(line)
+    Some((line, err))
+}
+
+/// Queues the stream's log line, with the level it goes out at, on `entry`.
+fn set_stream_log(entry: &mut SessionEntry, proxies: &[Proxy], pid: u32) {
+    // `option logasap` sent this stream's line with its response head; it may not have gone
+    // out yet, and nothing replaces it.
+    if entry.sess.log.asap_done {
+        return;
+    }
+    match stream_log_line(entry, proxies, pid) {
+        Some((line, err)) => (entry.log_line, entry.log_err) = (Some(line), err),
+        None => entry.log_line = None,
+    }
 }
 
 /// Why a connection that was to open with a PROXY header did not get past it, if that is
@@ -1870,6 +1905,7 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, list
         log_tag: listen.log_tag.as_deref().map(syslog_tag),
         log_format: compile_log_format(listen.log_format.as_ref(), listen.mode == Mode::Http),
         dont_log_null: listen.dontlognull,
+        log_opts: listen.log_opts,
         unique_id_format: listen.unique_id_format.as_deref().and_then(compile_unique_id_format),
         unique_id_header: listen.unique_id_header.clone(),
         req_capture_slots,
@@ -1990,6 +2026,7 @@ fn init_proxy_from_frontend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, fe
         log_tag: fe.log_tag.as_deref().map(syslog_tag),
         log_format: compile_log_format(fe.log_format.as_ref(), fe.mode == Mode::Http),
         dont_log_null: fe.dontlognull,
+        log_opts: fe.log_opts,
         unique_id_format: fe.unique_id_format.as_deref().and_then(compile_unique_id_format),
         unique_id_header: fe.unique_id_header.clone(),
         req_capture_slots,
@@ -2135,6 +2172,7 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, be:
         log_tag: be.log_tag.as_deref().map(syslog_tag),
         log_format: None,
         dont_log_null: false,
+        log_opts: 0,
         unique_id_format: be.unique_id_format.as_deref().and_then(compile_unique_id_format),
         unique_id_header: be.unique_id_header.clone(),
         req_capture_slots: Arc::from([]),
@@ -4354,6 +4392,7 @@ fn register_new_session(
         actconn_reclaimed: false,
         srv_served: 0,
         log_line: None,
+        log_err: false,
     }) else {
         if let Some(idx) = target_server_idx {
             if idx < proxy.server_actconn.len() {
@@ -4959,7 +4998,7 @@ fn close_http_session(
     // A transaction that ends with its connection, not through `end_txn` (cut short by
     // either side), logs here, while its request and response are still known.
     if entry.sess.txn.is_some() && entry.log_line.is_none() {
-        entry.log_line = stream_log_line(entry, proxies, std::process::id());
+        set_stream_log(entry, proxies, std::process::id());
     }
     release_server(entry, proxies, fdtab, poller, idle_pool, reusable);
     if matches!(entry.sess.cli_state, ScState::Ready | ScState::Established | ScState::ShutR) {
@@ -5513,6 +5552,9 @@ impl EngineDispatcher<'_> {
             // Between requests. A client that goes away here ends the session; a server
             // connection kept from the last transaction goes back to the pool.
             if !matches!(entry.sess.cli_state, ScState::Ready | ScState::Established) {
+                // `option dontlognull`: a connection that sent nothing is not logged, whether
+                // the client left or `timeout client` ran out.
+                let mut quiet = false;
                 // `timeout client` before a request head is complete: HAProxy answers 408
                 // (`h1_handle_req_tout`, `src/mux_h1.c`) from the frontend's pages, also on
                 // a new connection that sent nothing. Only a keep-alive connection waiting
@@ -5525,6 +5567,7 @@ impl EngineDispatcher<'_> {
                     entry.sess.send_before_close(&page);
                     entry.sess.log.status = Some(408);
                     entry.sess.log.term = Some(*b"cR");
+                    quiet = entry.sess.req.is_empty() && proxies[entry.proxy_idx].dont_log_null;
                 } else if !entry.sess.req.is_empty()
                     || (entry.sess.is_first_req && matches!(entry.sess.ending, None | Some(crate::proxy::Ending::ClientAbort)))
                 {
@@ -5533,9 +5576,10 @@ impl EngineDispatcher<'_> {
                     // (`CR`).
                     entry.sess.log.status = Some(400);
                     entry.sess.log.term = Some(*b"CR");
+                    quiet = entry.sess.req.is_empty() && proxies[entry.proxy_idx].dont_log_null;
                 }
-                if entry.sess.log.status.is_some() {
-                    entry.log_line = stream_log_line(entry, proxies, pid);
+                if entry.sess.log.status.is_some() && !quiet {
+                    set_stream_log(entry, proxies, pid);
                 }
                 close_http_session(entry, proxies, fdtab, poller, idle_pool, true);
             } else if entry.sess.srv.is_some()
@@ -5564,7 +5608,7 @@ impl EngineDispatcher<'_> {
             entry.sess.log.status = Some(408);
             entry.sess.log.term = Some(*b"cR");
             entry.sess.log.request = None;
-            entry.log_line = stream_log_line(entry, proxies, pid);
+            set_stream_log(entry, proxies, pid);
             close_http_session(entry, proxies, fdtab, poller, idle_pool, true);
             return None;
         }
@@ -5801,7 +5845,7 @@ impl EngineDispatcher<'_> {
     ) {
         // The transaction's line, while its request and response are still here.
         if entry.sess.txn.is_some() {
-            entry.log_line = stream_log_line(entry, proxies, pid);
+            set_stream_log(entry, proxies, pid);
         }
         let Some(txn) = entry.sess.txn.take() else {
             return;
@@ -6026,7 +6070,7 @@ impl EngineDispatcher<'_> {
                 );
             }
 
-            let log_line = entry.log_line.take().filter(|_| proxy_header_failure(&entry.sess).is_none());
+            let log_line = entry.log_line.take().filter(|_| proxy_header_failure(&entry.sess).is_none()).map(|l| (l, entry.log_err));
 
             // Step 3.6: If in TCP mode and server not yet connected (e.g. deferred on accept-proxy or inspect), connect once ready
             if entry.sess.mode == Mode::Tcp
@@ -6060,9 +6104,9 @@ impl EngineDispatcher<'_> {
             (entry.sess.is_done(), pending_admin, log_line)
         };
 
-        if let Some(line) = log_line {
+        if let Some((line, err)) = log_line {
             let fe = self.sessions.get(session_idx).map_or(0, |e| e.proxy_idx);
-            self.send_log_line(fe, &line);
+            self.send_stream_log(fe, err, &line);
         }
 
         if let Some(cmd) = pending_admin {
@@ -6089,15 +6133,17 @@ impl EngineDispatcher<'_> {
                 // A refused PROXY header has its own line, never the frontend's format.
                 if proxy_header_failure(&e.sess).is_some() {
                     e.log_line = None;
-                    return proxy_header_error_line(e, self.proxies).map(|l| (e.proxy_idx, l.into_bytes()));
+                    // `session_kill_embryonic`: `err` with `log-separate-errors`, else `info`.
+                    let err = self.proxies[e.proxy_idx].log_opts & ibex_config::LOG_OPT_SEPARATE_ERRORS != 0;
+                    return proxy_header_error_line(e, self.proxies).map(|l| (e.proxy_idx, l.into_bytes(), err));
                 }
-                e.log_line
-                    .take()
+                let queued = e.log_line.take().map(|l| (l, e.log_err));
+                queued
                     .or_else(|| (e.sess.mode == Mode::Tcp || e.sess.txn.is_some()).then(|| stream_log_line(e, self.proxies, self.pid)).flatten())
-                    .map(|l| (e.proxy_idx, l))
+                    .map(|(l, err)| (e.proxy_idx, l, err))
             });
-            if let Some((fe, line)) = line {
-                self.send_log_line(fe, &line);
+            if let Some((fe, line, err)) = line {
+                self.send_stream_log(fe, err, &line);
             }
             if let Some(entry) = self.sessions.free(session_idx) {
                 cleanup_done(
@@ -6211,6 +6257,12 @@ impl EngineDispatcher<'_> {
                 if framing == crate::txn::Framing::Tunnel && txn.req.is_done() {
                     txn.req = MsgState::Tunnel;
                 }
+            }
+            // `option logasap`: the line goes out with the response head (`http_process_res_common`),
+            // with what has come from the server so far, and the end of the stream logs nothing.
+            if proxies[fe_idx].log_opts & ibex_config::LOG_OPT_ASAP != 0 && !entry.sess.log.asap_done {
+                set_stream_log(entry, proxies, std::process::id());
+                entry.sess.log.asap_done = true;
             }
         };
 
@@ -8128,6 +8180,13 @@ impl EngineDispatcher<'_> {
     /// A transaction's or connection's log line, at `info` as `HAProxy` sends them.
     fn send_log_line(&self, proxy_idx: usize, line: &[u8]) {
         self.send_log(proxy_idx, LogLevel::Info, line);
+    }
+
+    /// A stream's line: `info`, or `err` when it failed and the frontend has `option
+    /// log-separate-errors` (`strm_log`).
+    fn send_stream_log(&self, proxy_idx: usize, err: bool, line: &[u8]) {
+        let separate = self.proxies.get(proxy_idx).is_some_and(|p| p.log_opts & ibex_config::LOG_OPT_SEPARATE_ERRORS != 0);
+        self.send_log(proxy_idx, if err && separate { LogLevel::Err } else { LogLevel::Info }, line);
     }
 
     fn send_log(&self, proxy_idx: usize, level: LogLevel, msg: &[u8]) {

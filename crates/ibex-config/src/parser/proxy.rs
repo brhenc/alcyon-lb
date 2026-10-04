@@ -98,6 +98,7 @@ pub(crate) fn parse_listen_header(
         buffer_request: defaults.is_some_and(|d| d.buffer_request),
         server_close: defaults.is_some_and(|d| d.server_close),
         dontlognull: defaults.is_some_and(|d| d.dontlognull),
+        log_opts: defaults.map_or(0, |d| d.log_opts),
         cliexp: Vec::new(),
         srvexp: Vec::new(),
         acls: Vec::new(),
@@ -195,6 +196,7 @@ pub(crate) fn parse_frontend_header(
         buffer_request: defaults.is_some_and(|d| d.buffer_request),
         server_close: defaults.is_some_and(|d| d.server_close),
         dontlognull: defaults.is_some_and(|d| d.dontlognull),
+        log_opts: defaults.map_or(0, |d| d.log_opts),
         stick_table: None,
         stick_rules: Vec::new(),
         tcp_req_inspect_delay: defaults.and_then(|d| d.tcp_req_inspect_delay),
@@ -907,6 +909,7 @@ pub(crate) fn parse_option_listen(
         "http-server-close" => proxy.server_close = true,
         "http-keep-alive" => proxy.server_close = false,
         "dontlognull" => proxy.dontlognull = true,
+        "dontlog-normal" | "log-separate-errors" | "logasap" => proxy.log_opts |= crate::ast::log_opt_bit(&tokens[1].text),
         "accept-unsafe-violations-in-http-request" => proxy.stats.accept_unsafe_request = true,
         "log-health-checks" => proxy.log_health_checks = true,
         "httpchk" => {
@@ -952,6 +955,10 @@ pub(crate) fn parse_option_frontend(
     }
     if tokens[1].text == "dontlognull" {
         fe.dontlognull = true;
+        return Ok(());
+    }
+    if matches!(tokens[1].text.as_str(), "dontlog-normal" | "log-separate-errors" | "logasap") {
+        fe.log_opts |= crate::ast::log_opt_bit(&tokens[1].text);
         return Ok(());
     }
     let (except, if_none) = parse_forward_option(tokens, kw)?;
@@ -1013,6 +1020,7 @@ pub(crate) fn parse_no_listen(proxy: &mut ListenSection, tokens: &[Token], kw: &
         Some("http-buffer-request") => proxy.buffer_request = false,
         Some("http-server-close") => proxy.server_close = false,
         Some("dontlognull") => proxy.dontlognull = false,
+        Some(n @ ("dontlog-normal" | "log-separate-errors" | "logasap")) => proxy.log_opts &= !crate::ast::log_opt_bit(n),
         Some("accept-unsafe-violations-in-http-request") => proxy.stats.accept_unsafe_request = false,
         Some("log-health-checks") => proxy.log_health_checks = false,
         Some("forwarded") => proxy.forwarded = None,
@@ -1030,6 +1038,7 @@ pub(crate) fn parse_no_frontend(fe: &mut FrontendSection, tokens: &[Token], kw: 
         Some("http-buffer-request") => fe.buffer_request = false,
         Some("http-server-close") => fe.server_close = false,
         Some("dontlognull") => fe.dontlognull = false,
+        Some(n @ ("dontlog-normal" | "log-separate-errors" | "logasap")) => fe.log_opts &= !crate::ast::log_opt_bit(n),
         _ => {}
     }
     Ok(())

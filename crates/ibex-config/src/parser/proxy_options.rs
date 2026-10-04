@@ -165,6 +165,10 @@ const IMPLEMENTED: &[&str] = &[
     "log-health-checks",
     // A connection that carried nothing is not logged (T128).
     "dontlognull",
+    // Which streams are logged, and at which level (T131).
+    "dontlog-normal",
+    "log-separate-errors",
+    "logasap",
     "httpchk",
     "tcp-check",
     "ssl-hello-chk",

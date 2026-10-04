@@ -54,6 +54,9 @@ pub struct LogData<'a> {
     pub status: i64,
     pub bytes_out: u64,
     pub bytes_in: u64,
+    /// `option logasap`: `%B`, `%Tt`, `%Ta` and `%Tu` are what the stream had reached when
+    /// the line was written, which `HAProxy` marks with a leading `+`.
+    pub plus: bool,
     /// `%ts`: two characters, the termination cause and the session state at its end.
     pub term_state: [u8; 2],
     /// `%tsc`'s last two characters: the persistence cookie's status.
@@ -100,6 +103,7 @@ impl Default for LogData<'_> {
             t_data: -1,
             t_close: 0,
             status: -1,
+            plus: false,
             bytes_out: 0,
             bytes_in: 0,
             term_state: *b"--",
@@ -1072,6 +1076,9 @@ fn alias(out: &mut Out, a: Alias, o: Opts, d: &LogData) {
     };
     let t_request = d.t_request;
     let badreq = || "<BADREQ>".to_string();
+    if d.plus && matches!(a, Alias::Bytes | Alias::TActive | Alias::TTotal | Alias::TUser) {
+        out.push('+');
+    }
     match a {
         Alias::Bytes => int(out, i64::try_from(d.bytes_out).unwrap_or(i64::MAX)),
         Alias::BytesUp => int(out, i64::try_from(d.bytes_in).unwrap_or(i64::MAX)),
