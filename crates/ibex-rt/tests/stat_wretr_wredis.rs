@@ -83,7 +83,7 @@ fn wretr_and_wredis_are_counted_per_server_and_backend() {
     let dir = std::env::temp_dir();
     let sock = dir.join(format!("ibex_t131_stat_{}.sock", std::process::id()));
     let cfg = format!(
-        "global\n  stats socket {}\n\
+        "global\n  stats socket {} level admin\n\
          defaults\n  mode http\n  timeout connect 300ms\n  timeout client 10s\n  timeout server 10s\n  retries 1\n\
          frontend f\n  bind 127.0.0.1:{port}\n  use_backend redis if {{ path /r }}\n  default_backend plain\n\
          backend plain\n  server dead 127.0.0.1:{dead}\n\

@@ -245,6 +245,9 @@ pub fn format_show_info(
     max_conns: u32
     
 ) -> String {
+    // `global maxconn` and its configured ceiling, when there is one.
+    let maxconn = if crate::globalconn::max() > 0 { crate::globalconn::max() } else { max_conns };
+    let hard_maxconn = if crate::globalconn::hard() > 0 { crate::globalconn::hard() } else { max_conns };
     let elapsed = start_time.elapsed();
     let total_secs = elapsed.as_secs();
     let days = total_secs / 86400;
@@ -284,9 +287,9 @@ format!(
 \
          Maxsock: 0
 \
-         Maxconn: {max_conns}
+         Maxconn: {maxconn}
 \
-         Hard_maxconn: {max_conns}
+         Hard_maxconn: {hard_maxconn}
 \
          CurrConns: {active_conns}
 \
@@ -431,7 +434,7 @@ pub fn format_show_stat(proxies: &[Proxy], checks: &[ServerCheckState], pid: u32
     format_show_stat_filtered(proxies, checks, pid, None, None, None)
 }
 
-fn write_frontend_row(out: &mut String, proxy: &Proxy, pid: u32, iid: usize) {
+fn write_frontend_row(out: &mut String, proxy: &Proxy, pid: u32, iid: u32) {
     let mut r = StatRow::new();
     r.set("pxname", &proxy.name);
     r.set("svname", "FRONTEND");
@@ -451,6 +454,7 @@ fn write_frontend_row(out: &mut String, proxy: &Proxy, pid: u32, iid: usize) {
     r.set("act", 1);
     r.set("pid", pid);
     r.set("iid", iid);
+    r.set("sid", 0);
     r.set("type", 0);
     out.push_str(&r.finish());
 }
@@ -461,8 +465,8 @@ fn write_server_row(
     s_idx: usize,
     check_state: Option<&ServerCheckState>,
     pid: u32,
-    iid: usize,
-    sid: usize,
+    iid: u32,
+    sid: u32,
 ) {
     let srv_name = if s_idx < proxy.server_ids.len() {
         &proxy.server_ids[s_idx]
@@ -473,7 +477,7 @@ fn write_server_row(
     let (status_str, chkfail, chkdown, check_status, check_code, check_duration) =
         if let Some(c) = check_state {
             (
-                c.status.as_str(),
+                c.status.as_str().to_string(),
                 c.failed_checks,
                 c.down_transitions,
                 c.last_status_code,
@@ -483,11 +487,17 @@ fn write_server_row(
         } else {
             let s = proxy
                 .server_statuses.get(s_idx).map(|s| ServerStatus::from(s.load(std::sync::atomic::Ordering::Relaxed))).unwrap_or(ServerStatus::Up);
+            let tracker = !crate::track::tracked_label(proxy, s_idx).is_empty();
             let s_str = match s {
-                ServerStatus::Up => "no check",
-                ServerStatus::Down => "DOWN",
-                ServerStatus::Drain => "DRAIN",
-                ServerStatus::Maint => "MAINT",
+                ServerStatus::Up if tracker => "UP".to_string(),
+                ServerStatus::Up => "no check".to_string(),
+                ServerStatus::Down => "DOWN".to_string(),
+                ServerStatus::Drain => "DRAIN".to_string(),
+                // The maintenance of a tracker's target says where it comes from.
+                ServerStatus::Maint if crate::track::inherited(proxy, s_idx) => {
+                    format!("MAINT (via {})", crate::track::tracked_label(proxy, s_idx))
+                }
+                ServerStatus::Maint => "MAINT".to_string(),
             };
             (s_str, 0, 0, "", 0, 0)
         };
@@ -522,6 +532,7 @@ fn write_server_row(
     r.set("wretr", wretr);
     r.set("wredis", wredis);
     r.set("status", status_str);
+    r.set("tracked", crate::track::tracked_label(proxy, s_idx));
     r.set("weight", weight);
     r.set("act", act);
     r.set("bck", bck);
@@ -538,7 +549,7 @@ fn write_server_row(
     out.push_str(&r.finish());
 }
 
-fn write_backend_row(out: &mut String, proxy: &Proxy, pid: u32, iid: usize) {
+fn write_backend_row(out: &mut String, proxy: &Proxy, pid: u32, iid: u32) {
     let mut r = StatRow::new();
     r.set("pxname", &proxy.name);
     r.set("svname", "BACKEND");
@@ -559,6 +570,7 @@ fn write_backend_row(out: &mut String, proxy: &Proxy, pid: u32, iid: usize) {
     r.set("act", 1);
     r.set("pid", pid);
     r.set("iid", iid);
+    r.set("sid", 0);
     r.set("type", 1);
     out.push_str(&r.finish());
 }
@@ -583,15 +595,20 @@ pub fn format_show_stat_filtered(
         }
     };
 
-    for (p_idx, proxy) in proxies.iter().enumerate() {
-        let iid = p_idx + 1;
+    // `HAProxy` lists the proxies in the order the sections were written.
+    let mut order: Vec<usize> = (0..proxies.len()).collect();
+    order.sort_by_key(|&i| proxies[i].ids.decl);
+    for p_idx in order {
+        let proxy = &proxies[p_idx];
+        let iid = proxy.ids.iid;
         if let Some(f_iid) = iid_filter {
-            if f_iid != -1 && usize::try_from(f_iid).ok() != Some(iid) {
+            if f_iid != -1 && u32::try_from(f_iid).ok() != Some(iid) {
                 continue;
             }
         }
 
-        if match_type(0)
+        if proxy.has_frontend
+            && match_type(0)
             && (sid_filter.is_none() || sid_filter == Some(-1) || sid_filter == Some(0))
         {
             write_frontend_row(&mut out, proxy, pid, iid);
@@ -599,9 +616,9 @@ pub fn format_show_stat_filtered(
 
         if match_type(2) {
             for (s_idx, _) in proxy.servers.iter().enumerate() {
-                let sid = s_idx + 1;
+                let sid = proxy.server_puid(s_idx);
                 if let Some(f_sid) = sid_filter {
-                    if f_sid != -1 && usize::try_from(f_sid).ok() != Some(sid) {
+                    if f_sid != -1 && u32::try_from(f_sid).ok() != Some(sid) {
                         continue;
                     }
                 }
@@ -612,7 +629,8 @@ pub fn format_show_stat_filtered(
             }
         }
 
-        if match_type(1)
+        if proxy.has_backend
+            && match_type(1)
             && (sid_filter.is_none() || sid_filter == Some(-1) || sid_filter == Some(0))
         {
             write_backend_row(&mut out, proxy, pid, iid);
@@ -661,6 +679,7 @@ mod tests {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
         let proxy = Proxy {
             id: 0,
+            ids: Box::new(crate::engine::ProxyIdInfo { iid: 2, ..Default::default() }),
             log_target_idx: Vec::new(),
             log_health_checks: false,
             name: "test_proxy".into(),
@@ -682,6 +701,7 @@ mod tests {
             server_ids: vec!["srv1".into()],
             server_cookies: vec![None],
             server_statuses: std::sync::Arc::new(vec![std::sync::atomic::AtomicU8::new(0)]),
+            server_track: None,
             server_weights: vec![1],
             server_iweights: None,
             next_server_idx: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -728,6 +748,7 @@ mod tests {
             hash_type: ibex_config::HashType::default(),
             hash_preserve_affinity: ibex_config::HashPreserveAffinity::default(),
             chash: std::sync::Arc::default(),
+            fwrr: std::sync::Arc::default(),
             log_format: None,
             unique_id_format: None,
             unique_id_header: None,

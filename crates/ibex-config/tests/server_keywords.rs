@@ -61,7 +61,7 @@ const KEYWORDS: &[(&str, Ibex)] = &[
     ("guid g1", Accepts),
     ("ws auto", Accepts),
     ("hash-key id", Refuses),
-    ("id 7", Refuses),
+    ("id 7", Accepts),
     ("idle-ping 5s", Accepts),
     ("init-addr none", Accepts),
     ("init-state up", Refuses),
@@ -102,7 +102,8 @@ const KEYWORDS: &[(&str, Ibex)] = &[
     ("stick", Accepts),
     ("strict-maxconn", Accepts),
     ("tfo", Accepts),
-    ("track b2/s2", Refuses),
+    // `track` needs a checked server to point at, which these one-server lines lack: it is
+    // implemented (T141) and tested in `crates/ibex-rt/tests/server_track.rs`.
     ("socks4 127.0.0.1:1080", Refuses),
     ("usesrc client", Refuses),
     ("weight 10", Accepts),

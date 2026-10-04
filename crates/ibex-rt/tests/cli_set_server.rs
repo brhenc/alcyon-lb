@@ -409,7 +409,10 @@ fn a_checked_server_follows_state_and_address_changes() {
 }
 
 #[test]
-fn set_maxconn_global_is_refused_not_dropped() {
+fn set_maxconn_global_is_applied_not_dropped() {
+    // T146 item 3 enforces the global limit, so the command no longer has to be refused
+    // (`cli/levels.vtc` expects `Maxconn: 1234` after it).
     let (ibex, _fe) = start(&conf("  server s1 {s1}\n"));
-    assert_eq!(cli(&ibex, "set maxconn global 1234"), "No such target or invalid maxconn.\n\n");
+    assert_eq!(cli(&ibex, "set maxconn global 1234"), "\n");
+    assert!(cli(&ibex, "show info").contains("\nMaxconn: 1234\n"));
 }

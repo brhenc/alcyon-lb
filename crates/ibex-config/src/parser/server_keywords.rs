@@ -79,10 +79,7 @@ pub(crate) const UNIMPLEMENTED_SERVER_KEYWORDS: &[ServerKeyword] = &[
     not_for_default!("guid", Arg::Word, Ignore("a global identifier for the CLI and stats")),
     kw!("ws", Arg::Word, Ignore("the protocol for WebSocket; Ibex upgrades over HTTP/1.1")),
     kw!("hash-key", Arg::Word, ROUTE),
-    not_for_default!("id", Arg::Word, Refuse(
-        "Ibex does not implement it; the server's numeric id places it on the consistent-hash ring, \
-         so keys would hash to different servers",
-    )),
+    not_for_default!("id", Arg::Word, Ignore("handled with the other server keywords in parse_server")),
     kw!("idle-ping", Arg::Delay, Ignore("idle connection pings")),
     kw!("init-addr", Arg::Word, Ignore("how an unresolved address is handled at startup; Ibex refuses one")),
     kw!("init-state", Arg::Word, Refuse("Ibex does not implement it; the server would take traffic in a state it should not")),
@@ -102,7 +99,6 @@ pub(crate) const UNIMPLEMENTED_SERVER_KEYWORDS: &[ServerKeyword] = &[
         "Ibex does not implement it; requests it should keep apart would share server connections",
     )),
     kw!("pool-low-conn", Arg::Word, Ignore("idle connection pool sizing")),
-    kw!("pool-max-conn", Arg::Word, Ignore("idle connection pool sizing")),
     kw!("pool-purge-delay", Arg::Delay, Ignore("idle connection pool purging")),
     kw!("redir", Arg::Word, ROUTE),
     kw!("resolve-net", Arg::Word, Ignore("DNS resolution at runtime, which needs 'resolvers'; Ibex refuses it")),
@@ -117,7 +113,6 @@ pub(crate) const UNIMPLEMENTED_SERVER_KEYWORDS: &[ServerKeyword] = &[
     kw!("source", Arg::Word, ROUTE),
     kw!("strict-maxconn", Arg::None, Ignore("whether idle connections count against maxconn")),
     kw!("tfo", Arg::None, Ignore("TCP Fast Open")),
-    kw!("track", Arg::Word, Refuse("Ibex does not implement it; the server would stay up when the server it tracks goes down")),
     kw!("socks4", Arg::Word, ROUTE),
     kw!("usesrc", Arg::None, ROUTE),
     // src/check.c

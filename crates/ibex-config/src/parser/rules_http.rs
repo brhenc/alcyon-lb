@@ -3,7 +3,7 @@
 
 use super::{
     find_cond_idx, join_tokens_until, parse_acl_condition_from_tokens, parse_error_body_args,
-    parse_rule_condition, parse_sc_counter_action, parse_u16, ConfigError, ErrorPageSource,
+    parse_rule_condition, parse_gpc_array_action, parse_sc_counter_action, parse_u16, ConfigError, ErrorPageSource,
     AclCondition, HttpAfterResAction, HttpAfterResRule, HttpReqAction, HttpReqRule, HttpResAction,
     HttpResRule, RedirectCookie, RetriesValue, Token,
 };
@@ -261,6 +261,21 @@ fn parse_http_req_rule_at(
             ));
         }
         rules.push(HttpReqRule { action: HttpReqAction::ScSetGpt0 { sc, expr }, cond, line: 0 });
+    } else if let Some((idx, sc)) = parse_gpc_array_action(act_str, "sc-inc-gpc", act_token)? {
+        let (_, cond) = parse_rule_condition(tokens, 2)?;
+        rules.push(HttpReqRule { action: HttpReqAction::ScIncGpc { idx, sc }, cond, line: 0 });
+    } else if let Some((idx, sc)) = parse_gpc_array_action(act_str, "sc-add-gpc", act_token)? {
+        let (cond_idx, cond) = parse_rule_condition(tokens, 3)?;
+        let expr = join_tokens_until(tokens, 2, cond_idx);
+        // No value is 0: `strtol` reads nothing and the end of the line is what it stopped at.
+        let expr = if expr.is_empty() { "0".to_string() } else { expr };
+        rules.push(HttpReqRule { action: HttpReqAction::ScAddGpc { idx, sc, expr }, cond, line: 0 });
+    } else if let Some((idx, sc)) = parse_gpc_array_action(act_str, "sc-set-gpt", act_token)? {
+        let (cond_idx, cond) = parse_rule_condition(tokens, 3)?;
+        let expr = join_tokens_until(tokens, 2, cond_idx);
+        // No value is 0: `strtol` reads nothing and the end of the line is what it stopped at.
+        let expr = if expr.is_empty() { "0".to_string() } else { expr };
+        rules.push(HttpReqRule { action: HttpReqAction::ScSetGpt { idx, sc, expr }, cond, line: 0 });
     } else if act_str == "return" {
         let cond_idx = find_cond_idx(tokens, 2);
         let limit = cond_idx.unwrap_or(tokens.len());
@@ -553,6 +568,27 @@ fn parse_http_req_rule_at(
             cond,
             line: 0,
         });
+    } else if act_str == "replace-uri" {
+        if tokens.len() < 4 {
+            return Err(ConfigError::new(
+                kw.line,
+                kw.col,
+                "<http-request replace-uri> expects <regex> and <replace>.",
+            ));
+        }
+        let regex = tokens[2].text.clone();
+        let repl = tokens[3].text.clone();
+        let cond_idx = find_cond_idx(tokens, 4);
+        let cond = if let Some(idx) = cond_idx {
+            parse_acl_condition_from_tokens(&tokens[idx..])?
+        } else {
+            None
+        };
+        rules.push(HttpReqRule {
+            action: HttpReqAction::ReplaceUri { regex, repl },
+            cond,
+            line: 0,
+        });
     } else if act_str == "set-query" {
         if tokens.len() < 3 {
             return Err(ConfigError::new(
@@ -641,6 +677,21 @@ fn parse_http_req_rule_at(
             cond,
             line: 0,
         });
+    } else if act_str == "set-src-port" {
+        let (expr, cond) = parse_one_expr_and_cond(tokens, act_token)?;
+        rules.push(HttpReqRule {
+            action: HttpReqAction::SetSrcPort { expr },
+            cond,
+            line: 0,
+        });
+    } else if act_str == "set-priority-class" || act_str == "set-priority-offset" {
+        let (expr, cond) = parse_one_expr_and_cond(tokens, act_token)?;
+        let action = if act_str == "set-priority-class" {
+            HttpReqAction::SetPriorityClass { expr }
+        } else {
+            HttpReqAction::SetPriorityOffset { expr }
+        };
+        rules.push(HttpReqRule { action, cond, line: 0 });
     } else if act_str == "set-dst-port" {
         let (expr, cond) = parse_one_expr_and_cond(tokens, act_token)?;
         rules.push(HttpReqRule {
@@ -839,14 +890,24 @@ fn parse_http_req_rule_at(
             line: 0,
         });
     } else if act_str == "auth" {
-        let cond_idx = find_cond_idx(tokens, 2);
-        let cond = if let Some(idx) = cond_idx {
-            parse_acl_condition_from_tokens(&tokens[idx..])?
+        // `parse_http_auth` (src/http_act.c): `auth [realm <realm>]`, then a condition.
+        let (realm, at) = if tokens.get(2).is_some_and(|t| t.text == "realm") {
+            match tokens.get(3) {
+                Some(r) if !matches!(r.text.as_str(), "" | "if" | "unless") => (Some(r.text.clone()), 4),
+                _ => {
+                    return Err(ConfigError::new(
+                        act_token.line,
+                        act_token.col,
+                        "error detected while parsing 'http-request auth' rule : missing realm value.",
+                    ))
+                }
+            }
         } else {
-            None
+            (None, 2)
         };
+        let cond = expect_cond_at(tokens, at, act_token)?;
         rules.push(HttpReqRule {
-            action: HttpReqAction::Auth,
+            action: HttpReqAction::Auth { realm },
             cond,
             line: 0,
         });

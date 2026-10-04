@@ -6,6 +6,7 @@ use super::*;
 #[allow(clippy::too_many_lines)]
 pub(crate) fn parse_server(
     servers: &mut Vec<Server>,
+    extras: &mut ServerExtras,
     default_server: Option<&DefaultServerConfig>,
     tokens: &[Token],
     kw: &Token,
@@ -31,6 +32,7 @@ pub(crate) fn parse_server(
     let mut send_proxy = default_server.is_some_and(|d| d.send_proxy);
     let mut send_proxy_v2 = default_server.is_some_and(|d| d.send_proxy_v2);
     let mut maxconn = default_server.and_then(|d| d.maxconn);
+    let mut pool_max_conn = default_server.and_then(|d| d.pool_max_conn).unwrap_or(-1);
     let mut check_port = default_server.and_then(|d| d.check_port);
     let mut check_proto = default_server.and_then(|d| d.check_proto);
     let mut weight = default_server.and_then(|d| d.weight);
@@ -39,6 +41,13 @@ pub(crate) fn parse_server(
     let mut proxy_v2_unique_id = default_server.is_some_and(|d| d.proxy_v2_unique_id);
     let mut ssl = default_server.map(|d| d.ssl.clone()).unwrap_or_default();
     let mut disabled = default_server.is_some_and(|d| d.disabled);
+    let mut track = default_server.and_then(|d| d.track.clone());
+    let mut puid = 0u32;
+    let index = u32::try_from(servers.len()).unwrap_or(u32::MAX);
+    // `srv_check_health` of a server nothing checks: the last `rise` given (`srv_settings_cpy`
+    // copies the one of `default-server`, `srv_parse_check_rise` sets it again), 0 when there
+    // is none, and for a server `disabled` after it.
+    let mut health = if disabled { 0 } else { default_server.and_then(|d| d.rise).unwrap_or(0) };
 
     // Every keyword HAProxy knows is either implemented here or listed, with what Ibex
     // does about it, in `server_keywords.rs`. A keyword's argument is consumed with it.
@@ -60,7 +69,9 @@ pub(crate) fn parse_server(
                 i += 1;
             }
             "rise" => {
-                rise = Some(parse_u32(server_kw_arg(tokens, i, who, "expects an integer argument.")?, "rise")?);
+                let value = parse_u32(server_kw_arg(tokens, i, who, "expects an integer argument.")?, "rise")?;
+                rise = Some(value);
+                health = value;
                 i += 1;
             }
             "send-proxy" => send_proxy = true,
@@ -78,6 +89,10 @@ pub(crate) fn parse_server(
                 if i < tokens.len() {
                     maxconn = Some(parse_u32(&tokens[i], "maxconn")?);
                 }
+            }
+            "pool-max-conn" => {
+                pool_max_conn = parse_pool_max_conn(tokens, i, who)?;
+                i += 1;
             }
             "port" => {
                 check_port = Some(parse_u16(server_kw_arg(tokens, i, who, "expects a port number as argument.")?, "port")?);
@@ -99,10 +114,42 @@ pub(crate) fn parse_server(
                 i += 1;
                 proxy_v2_unique_id |= parse_proxy_v2_options(tokens.get(i), kw)?;
             }
+            "id" => {
+                // `srv_parse_id`: `atol`, then 1 to `u32::MAX`; a name is 0.
+                let arg = server_kw_arg(tokens, i, who, "expects an integer argument")?;
+                let digits: String = arg.text.chars().take_while(char::is_ascii_digit).collect();
+                let value = digits.parse::<u64>().unwrap_or(0);
+                let Some(id) = u32::try_from(value).ok().filter(|&v| v >= 1) else {
+                    return Err(ConfigError::new(
+                        arg.line,
+                        arg.col,
+                        format!("'server {}' : 'id' : custom id has to be between 1 and 4294967295.", tokens[1].text),
+                    ));
+                };
+                if let Some(other) = extras.puid.iter().find(|e| e.1 == id).and_then(|e| servers.get(e.0 as usize)) {
+                    return Err(ConfigError::new(
+                        arg.line,
+                        arg.col,
+                        format!("'server {}' : 'id' : custom id {id} already used by 'server {}'", tokens[1].text, other.id),
+                    ));
+                }
+                puid = id;
+                i += 1;
+            }
             "backup" => backup = true,
             "no-backup" => backup = false,
-            "disabled" => disabled = true,
-            "enabled" => disabled = false,
+            "disabled" => {
+                disabled = true;
+                health = 0;
+            }
+            "enabled" => {
+                disabled = false;
+                health = rise.unwrap_or(0);
+            }
+            "track" => {
+                track = Some(server_kw_arg(tokens, i, who, "expects [<proxy>/]<server> as argument.")?.text.as_str().into());
+                i += 1;
+            }
             // What these turn on, Ibex never does: they leave the server as Ibex runs it.
             "stick" | "no-agent-check" | "no-check-send-proxy" | "no-check-reuse-pool"
             | "no-send-proxy-v2-ssl" | "no-send-proxy-v2-ssl-cn" => {}
@@ -112,6 +159,13 @@ pub(crate) fn parse_server(
     }
     validate_server_ssl(&ssl, check_port, kw, who)?;
 
+    // Kept apart from the server: a backend of 60,000 of them must stay small.
+    if health != 0 {
+        extras.init_health.push((index, health));
+    }
+    if puid != 0 {
+        extras.puid.push((index, puid));
+    }
     servers.push(Server {
         check_port,
         check_proto,
@@ -129,9 +183,11 @@ pub(crate) fn parse_server(
         send_proxy_v2,
         weight,
         maxconn,
+        pool_max_conn,
         backup,
         cookie,
         disabled,
+        track,
     });
     Ok(())
 }
@@ -378,6 +434,28 @@ fn parse_server_proto(tokens: &[Token], i: usize, server: Option<&str>) -> Resul
     }
 }
 
+/// `pool-max-conn <max>` (`srv_parse_pool_max_conn`): `atoi`, so text that is not a number
+/// reads as 0, and anything below -1 is refused.
+fn parse_pool_max_conn(tokens: &[Token], i: usize, who: Option<&str>) -> Result<i32, ConfigError> {
+    let arg = server_kw_arg(tokens, i, who, "expects <value> as argument.")?;
+    let t = arg.text.trim_start();
+    let (neg, digits) = match t.as_bytes().first() {
+        Some(b'-') => (true, &t[1..]),
+        Some(b'+') => (false, &t[1..]),
+        _ => (false, t),
+    };
+    let mut n: i64 = 0;
+    for b in digits.bytes().take_while(u8::is_ascii_digit) {
+        n = (n * 10 + i64::from(b - b'0')).min(i64::from(i32::MAX) + 1);
+    }
+    let n = if neg { -n } else { n };
+    if n < -1 {
+        let prefix = server_keywords::server_prefix(who);
+        return Err(ConfigError::new(tokens[i].line, tokens[i].col, format!("{prefix}'pool-max-conn' must be >= -1")));
+    }
+    Ok(n.min(i64::from(i32::MAX)) as i32)
+}
+
 pub(crate) fn parse_default_server(
     def: &mut Option<DefaultServerConfig>,
     tokens: &[Token],
@@ -421,6 +499,10 @@ pub(crate) fn parse_default_server(
                     cfg.maxconn = Some(parse_u32(&tokens[i], "maxconn")?);
                 }
             }
+            "pool-max-conn" => {
+                cfg.pool_max_conn = Some(parse_pool_max_conn(tokens, i, None)?);
+                i += 1;
+            }
             "port" => {
                 cfg.check_port = Some(parse_u16(server_kw_arg(tokens, i, None, "expects a port number as argument.")?, "port")?);
                 i += 1;
@@ -445,6 +527,10 @@ pub(crate) fn parse_default_server(
             "no-backup" => cfg.backup = false,
             "disabled" => cfg.disabled = true,
             "enabled" => cfg.disabled = false,
+            "track" => {
+                cfg.track = Some(server_kw_arg(tokens, i, None, "expects [<proxy>/]<server> as argument.")?.text.as_str().into());
+                i += 1;
+            }
             "stick" | "no-agent-check" | "no-check-send-proxy" | "no-check-reuse-pool"
             | "no-send-proxy-v2-ssl" | "no-send-proxy-v2-ssl-cn" => {}
             _ => i = unimplemented_server_keyword(tokens, i, None)?,

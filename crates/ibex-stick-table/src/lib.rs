@@ -15,4 +15,4 @@ pub mod table;
 
 pub use entry::{StickEntryData, StickKey};
 pub use rate::SlidingRate;
-pub use table::{coerce_key, KeyType, StickTable, StickTableConfig, StickTableError};
+pub use table::{coerce_key, Gpc, GpcOp, KeyType, StickTable, StickTableConfig, StickTableError};

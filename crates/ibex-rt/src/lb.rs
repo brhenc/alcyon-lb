@@ -64,6 +64,199 @@ pub fn first_backup(proxy: &Proxy) -> Option<usize> {
     (0..proxy.servers.len()).find(|&idx| proxy.server_backups.get(idx).copied().unwrap_or(false) && is_selectable(proxy, idx))
 }
 
+/// `balance roundrobin`: HAProxy's fast weighted round-robin (`fwrr_get_next_server`,
+/// `src/lb_fwrr.c`), for one thread group. Each server owns positions in a window of
+/// `sum(weights)` slots (`npos`), the servers wait in the `curr` tree sorted by position,
+/// or in the `next`/`init` trees sorted by weight, and a window ends when `curr` is empty.
+/// The order is not the nginx smooth round-robin's, so it is a port, not a look-alike.
+///
+/// The state is shared by the workers, as the thread group's is in `HAProxy`, and is
+/// rebuilt from the servers' weights when one that takes balanced traffic changes
+/// (down, up, `set server ... weight`): `HAProxy` adjusts positions in place there, which
+/// keeps the order going where the rebuild restarts it; the shares are the same.
+///
+/// Per request it costs one uncontended mutex, one compare of the weights with the ones
+/// the state was built from (`O(servers)`, no allocation) and, in `HAProxy`'s own terms,
+/// a handful of `eb32` operations, here pops and inserts on small sorted vectors whose
+/// capacity is reserved at the rebuild: no allocation either.
+#[derive(Debug, Default)]
+pub struct Fwrr(std::sync::Mutex<Option<Box<FwrrState>>>);
+
+/// One server's place in the window (`struct srv_per_tgroup`).
+#[derive(Debug, Clone, Copy, Default)]
+struct FwrrSlot {
+    npos: u32,
+    rweight: u32,
+}
+
+#[derive(Debug, Default)]
+struct FwrrState {
+    /// Effective weight each server was built with: weight * 16, 0 when it takes no
+    /// balanced traffic (backup, not UP, weight 0).
+    built_from: Vec<u32>,
+    slots: Vec<FwrrSlot>,
+    /// The three trees, as `(key, server)` sorted by decreasing key so that the first
+    /// node of an `eb32` tree is the last of the vector; a node inserted with an existing
+    /// key goes after the ones that have it, as in `eb32_insert`.
+    curr: Vec<(u32, usize)>,
+    init: Vec<(u32, usize)>,
+    next: Vec<(u32, usize)>,
+    /// Servers taken out of the trees for being unavailable, put back after the pick.
+    full: Vec<usize>,
+    curr_pos: u32,
+    curr_weight: u32,
+    next_weight: u32,
+}
+
+/// `BE_WEIGHT_SCALE`, and `SRV_EWGHT_MAX` (`SRV_UWGHT_MAX` * `BE_WEIGHT_SCALE`).
+const FWRR_EWGHT_MAX: u32 = 256 * BE_WEIGHT_SCALE;
+
+fn tree_insert(tree: &mut Vec<(u32, usize)>, key: u32, idx: usize) {
+    let at = tree.partition_point(|n| n.0 > key);
+    tree.insert(at, (key, idx));
+}
+
+impl FwrrState {
+    /// The weight server `idx` counts for in the window.
+    fn eweight(proxy: &Proxy, idx: usize) -> u32 {
+        let backup = proxy.server_backups.get(idx).copied().unwrap_or(false);
+        let up = proxy.server_statuses.get(idx).is_some_and(|s| s.load(Ordering::Relaxed) == ServerStatus::Up as u8);
+        let w = proxy.server_weights.get(idx).copied().unwrap_or(1).min(256);
+        if backup || !up { 0 } else { w * BE_WEIGHT_SCALE }
+    }
+
+    /// Rebuild when a server's effective weight is not the one the trees were built with
+    /// (`fwrr_init_server_groups`: every usable server in `init`, in declaration order).
+    fn sync(&mut self, proxy: &Proxy) {
+        let n = proxy.servers.len();
+        if self.built_from.len() == n && (0..n).all(|i| self.built_from[i] == Self::eweight(proxy, i)) {
+            return;
+        }
+        self.rebuild((0..n).map(|i| Self::eweight(proxy, i)));
+    }
+
+    /// `fwrr_init_server_groups` for these effective weights.
+    fn rebuild(&mut self, eweights: impl Iterator<Item = u32>) {
+        self.built_from.clear();
+        self.built_from.extend(eweights);
+        let n = self.built_from.len();
+        self.slots.clear();
+        self.slots.resize(n, FwrrSlot::default());
+        for tree in [&mut self.curr, &mut self.init, &mut self.next] {
+            tree.clear();
+            tree.reserve(n);
+        }
+        self.full.clear();
+        self.full.reserve(n);
+        self.next_weight = self.built_from.iter().sum();
+        self.curr_pos = self.next_weight;
+        self.curr_weight = self.next_weight;
+        for i in 0..n {
+            if self.built_from[i] > 0 {
+                tree_insert(&mut self.init, FWRR_EWGHT_MAX - self.built_from[i], i);
+            }
+        }
+    }
+
+    /// `fwrr_get_server_from_group`: the first server of `curr` if its position has come,
+    /// else the first of `init`, else (a hole in the window, nothing new) the one of `curr`.
+    fn get_from_group(&mut self) -> Option<usize> {
+        if let Some(&(_, s1)) = self.curr.last() {
+            if self.slots[s1].npos <= self.curr_pos {
+                self.curr.pop();
+                return Some(s1);
+            }
+        }
+        if let Some((_, s2)) = self.init.pop() {
+            self.slots[s2] = FwrrSlot::default();
+            return Some(s2);
+        }
+        self.curr.pop().map(|(_, s1)| s1)
+    }
+
+    /// `fwrr_update_position`.
+    fn update_position(&mut self, s: usize) {
+        let ew = self.built_from[s];
+        let slot = &mut self.slots[s];
+        if slot.npos == 0 {
+            slot.npos = self.curr_pos;
+        }
+        slot.npos = slot.npos.wrapping_add(self.next_weight / ew);
+        slot.rweight += self.next_weight % ew;
+        if slot.rweight >= ew {
+            slot.rweight -= ew;
+            slot.npos = slot.npos.wrapping_add(1);
+        }
+    }
+
+    /// `fwrr_queue_srv`: back into the window, or into the next one.
+    fn queue(&mut self, s: usize) {
+        let ew = self.built_from[s];
+        let slot = &mut self.slots[s];
+        if slot.npos >= self.curr_weight.wrapping_mul(2) || slot.npos >= self.curr_weight.wrapping_add(self.next_weight) {
+            slot.npos = slot.npos.wrapping_sub(self.curr_weight);
+            tree_insert(&mut self.next, FWRR_EWGHT_MAX - ew, s);
+        } else {
+            let key = 256u32
+                .wrapping_mul(slot.npos)
+                .wrapping_add(FWRR_EWGHT_MAX.wrapping_add(slot.rweight).wrapping_sub(ew) / BE_WEIGHT_SCALE);
+            tree_insert(&mut self.curr, key, s);
+        }
+    }
+
+    /// `fwrr_get_next_server` for the active servers: the next one for which `usable` holds.
+    /// The others are taken out, then queued back as if they had been served, so that they
+    /// keep their place (or, if the window ended meanwhile, by weight).
+    fn pick(&mut self, usable: impl Fn(usize) -> bool) -> Option<usize> {
+        let mut switched = false;
+        self.full.clear();
+        let chosen = loop {
+            let s = loop {
+                if let Some(s) = self.get_from_group() {
+                    break Some(s);
+                }
+                if switched {
+                    break None;
+                }
+                switched = true;
+                std::mem::swap(&mut self.init, &mut self.next);
+                self.curr_weight = self.next_weight;
+                self.curr_pos = self.curr_weight;
+            };
+            let Some(s) = s else { break None };
+            self.update_position(s);
+            self.curr_pos = self.curr_pos.wrapping_add(1);
+            if usable(s) {
+                break Some(s);
+            }
+            self.full.push(s);
+        };
+        if let Some(s) = chosen {
+            self.queue(s);
+        }
+        while let Some(f) = self.full.pop() {
+            if switched {
+                tree_insert(&mut self.init, FWRR_EWGHT_MAX - self.built_from[f], f);
+            } else {
+                self.queue(f);
+            }
+        }
+        chosen
+    }
+}
+
+/// The server `balance roundrobin` picks: the next of the active ones in the weighted
+/// order, else the first usable backup alone.
+#[must_use]
+pub fn round_robin(proxy: &Proxy) -> Option<usize> {
+    let mut guard = proxy.fwrr.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Built on first use: a configuration of tens of thousands of backends pays for the
+    // ones that balance only.
+    let st = guard.get_or_insert_with(Box::default);
+    st.sync(proxy);
+    st.pick(|i| is_server_available(proxy, i)).or_else(|| first_backup(proxy))
+}
+
 /// First Available Server (`balance first`).
 /// Picks the first server, in declaration order, that is UP and has a free `maxconn` slot.
 /// Falls back to backup servers, in declaration order, if no primary server qualifies.
@@ -443,9 +636,9 @@ impl ChashRing {
             let built_from: Vec<bool> = (0..proxy.servers.len()).map(in_ring).collect();
             ring.points.clear();
             for idx in (0..proxy.servers.len()).filter(|&i| built_from[i]) {
-                // `puid`: servers are numbered from 1 in declaration order (Ibex has no
-                // `id` keyword on servers), and `hash-key id` is the default.
-                let puid = u32::try_from(idx + 1).unwrap_or(u32::MAX);
+                // `puid`: the server's id, from 1 in declaration order around the ones
+                // with an `id`; `hash-key id` is the default.
+                let puid = proxy.server_puid(idx);
                 let base = puid.wrapping_mul(SRV_EWGHT_RANGE);
                 let nodes = proxy.server_weights.get(idx).copied().unwrap_or(1) * BE_WEIGHT_SCALE;
                 let server = u32::try_from(idx).unwrap_or(u32::MAX);
@@ -504,4 +697,34 @@ pub fn redispatch_due(
         return true;
     }
     !direct && active_servers > 1 && !hash_kind
+}
+
+#[cfg(test)]
+mod fwrr_tests {
+    use super::FwrrState;
+
+    fn state(weights: &[u32]) -> FwrrState {
+        let mut st = FwrrState::default();
+        st.rebuild(weights.iter().map(|w| w * 16));
+        st
+    }
+
+    #[test]
+    fn an_unavailable_server_is_skipped_and_keeps_its_share_when_it_comes_back() {
+        let mut st = state(&[1, 1, 1]);
+        // s1 is full for six picks, over two windows: the others alternate...
+        let skipped: Vec<usize> = (0..6).filter_map(|_| st.pick(|i| i != 1)).collect();
+        assert_eq!(skipped, [0, 2, 0, 2, 0, 2]);
+        // ...and it is served again as soon as it can be, without a burst.
+        let after: Vec<usize> = (0..6).filter_map(|_| st.pick(|_| true)).collect();
+        assert_eq!(after.iter().filter(|&&i| i == 1).count(), 2, "{after:?}");
+    }
+
+    #[test]
+    fn nothing_usable_gives_none_and_loses_no_server() {
+        let mut st = state(&[2, 1]);
+        assert_eq!(st.pick(|_| false), None);
+        let got: Vec<usize> = (0..6).filter_map(|_| st.pick(|_| true)).collect();
+        assert_eq!(got.iter().filter(|&&i| i == 0).count(), 4, "{got:?}");
+    }
 }

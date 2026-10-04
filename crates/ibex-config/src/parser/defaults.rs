@@ -42,9 +42,10 @@ pub(crate) fn parse_defaults_directive(
             defaults.cookie = c;
             Ok(())
         }
+        "id" => Err(ConfigError::new(kw.line, kw.col, "'id' not allowed in 'defaults' section.")),
         "default-server" => parse_default_server(&mut defaults.default_server, tokens, kw),
         "stats" => parse_stats_directive(&mut defaults.stats, tokens, kw),
-        "errorfile" | "errorfiles" | "http-error" => {
+        "errorfile" | "errorfiles" | "http-error" | "errorloc" | "errorloc302" | "errorloc303" => {
             parse_proxy_error_page(&mut defaults.error_files, &mut defaults.error_replies, tokens, kw)
         }
         "tcp-request" => {
@@ -203,8 +204,13 @@ pub(crate) fn parse_option_defaults(
         return Ok(());
     }
     match tokens[1].text.as_str() {
-        "forwardfor" => defaults.forwardfor = Some(parse_forward_option(tokens, kw)?),
-        "originalto" => defaults.originalto = Some(parse_forward_option(tokens, kw)?),
+        "forwardfor" => {
+            let (except, if_none) = parse_forward_option(tokens, kw)?;
+            defaults.forwardfor = Some(except);
+            defaults.forwardfor_if_none = if_none;
+        }
+        "originalto" => defaults.originalto = Some(parse_forward_option(tokens, kw)?.0),
+        "forwarded" => defaults.forwarded = Some(Box::new(parse_forwarded_option(tokens)?)),
         "redispatch" => set_redispatch(&mut defaults.redisp, &mut defaults.redisp_after, tokens),
         "http-buffer-request" => defaults.buffer_request = true,
         "accept-unsafe-violations-in-http-request" => defaults.stats.accept_unsafe_request = true,
@@ -228,6 +234,7 @@ pub(crate) fn parse_no_defaults(defaults: &mut DefaultsSection, tokens: &[Token]
         Some("http-buffer-request") => defaults.buffer_request = false,
         Some("accept-unsafe-violations-in-http-request") => defaults.stats.accept_unsafe_request = false,
         Some("log-health-checks") => defaults.log_health_checks = false,
+        Some("forwarded") => defaults.forwarded = None,
         _ => {}
     }
     Ok(())

@@ -471,7 +471,7 @@ fn tls_server_connections_are_reused_per_sni() {
     let p = pki();
     let srv = serve(Some(server_config(&p.cert, &p.key, None, &[])));
     let front = common::reserve_addr();
-    let _ibex = start(&p.dir, &config(&[(front, &format!("  server s {} ssl verify none", srv.addr))]), &[front]);
+    let _ibex = start(&p.dir, &config(&[(front, &format!("  http-reuse always\n  server s {} ssl verify none", srv.addr))]), &[front]);
 
     // Two requests on one client connection, same Host: one handshake.
     assert_eq!(get_keepalive(front, &["a.example", "a.example"]), [200, 200]);

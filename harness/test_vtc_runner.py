@@ -154,13 +154,16 @@ class MasterCliVersusStatsSocket(unittest.TestCase):
     answers `Unknown command: 'show'` to worker commands, so ~18 reg-tests failed on HAProxy
     itself (T138)."""
 
-    def test_ibex_keeps_the_master_socket_and_a_comment_prelude(self):
+    def test_ibex_gets_the_same_prelude_and_no_master_socket(self):
+        # T146: several `global` sections merge, so the prelude is the same for both.
         fp = FakeProxy()
         self.addCleanup(fp.tmp.cleanup)
         ex = executor('varnishtest "x"\nhaproxy h1 -conf {\n  defaults\n} -start\n', fp.path)
         asyncio.run(ex.execute())
-        self.assertIn("-S", open(fp.log + ".args").read().split())
-        self.assertEqual(open(fp.log + ".cfg").read().splitlines()[0][:1], "#")
+        self.assertNotIn("-S", open(fp.log + ".args").read().split())
+        cfg = open(fp.log + ".cfg").read().splitlines()
+        self.assertEqual(cfg[0], "global")
+        self.assertRegex(cfg[1], r"^\s*stats socket \S+/h1\.sock level admin$")
 
     def test_config_has_a_stats_socket_admin_ahead_of_the_test_block(self):
         fp = FakeProxy("haproxy")

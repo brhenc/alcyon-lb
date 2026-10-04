@@ -8,8 +8,9 @@ use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
-use crate::ast::{
-    clear_http_errors_sections, clear_resolved_checks, http_errors_section, http_errors_section_code,
+use crate::ast::{ProxyKind, ServerExtras,
+    clear_http_errors_sections, clear_resolved_checks, clear_userlists, http_errors_section, http_errors_section_code,
+    register_userlist, take_userlists, Userlist, UserlistUser,
     register_http_errors_section, register_resolved_check, register_resolved_check_for_addr,
     AclCondition, AclRule, AclTerm, BackendSection, BalanceAlgorithm, BindConfig, Config, CookieConfig,
     DefaultServerConfig, DefaultsSection, ErrorPageSource, FrontendSection, GlobalSection,
@@ -54,10 +55,6 @@ const IGNORED_GLOBAL_KEYWORDS: &[(&str, &str)] = &[
         "ssl-server-verify",
         "SSL server certificate verification mode default",
     ),
-    (
-        "crt-base",
-        "SSL certificate directory path prefix",
-    ),
 ];
 
 /// `HAProxy` keywords in `defaults` section that are deliberately inert or accepted.
@@ -85,9 +82,23 @@ pub(crate) enum CurrentSection {
     Frontend(FrontendSection),
     Backend(BackendSection),
     Resolvers,
+    /// `userlist <name>`.
+    Userlist(Userlist),
     /// `http-errors <name>`: a named, independent set of `errorfile` entries referenced by
     /// proxies via `errorfiles <name> [<code>...]`.
     HttpErrors(String, std::collections::HashMap<u16, Vec<u8>>),
+}
+
+impl CurrentSection {
+    /// The kind, the name and the `id` of a proxy section that has given one.
+    fn explicit_id(&self) -> Option<(&'static str, &str, u32)> {
+        match self {
+            Self::Listen(l) => l.id.map(|id| ("listen", l.name.as_str(), id)),
+            Self::Frontend(f) => f.id.map(|id| ("frontend", f.name.as_str(), id)),
+            Self::Backend(b) => b.id.map(|id| ("backend", b.name.as_str(), id)),
+            _ => None,
+        }
+    }
 }
 
 pub(crate) mod global;
@@ -110,6 +121,8 @@ pub(crate) use rules_tcp::*;
 pub(crate) mod rules_http;
 pub(crate) use rules_http::*;
 pub(crate) mod stick;
+pub(crate) mod userlist;
+pub(crate) use userlist::*;
 pub(crate) use stick::*;
 pub(crate) mod logging;
 pub(crate) use logging::*;
@@ -152,6 +165,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
     // checks. Clear it first so a previous `parse_str` call in the same process -- tests
     // parse many configs -- cannot leak a section into this one.
     clear_http_errors_sections();
+    clear_userlists();
 
     let mut global: Option<GlobalSection> = None;
     let mut defaults: Option<DefaultsSection> = None;
@@ -161,6 +175,10 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
     let mut backends = Vec::new();
     let mut cur_section: Option<CurrentSection> = None;
     let mut sample_refs = Vec::new();
+    // The proxy sections in the order written, and the explicit `id` of each, for the
+    // numbering of the others (`Config::proxy_ids`) and for refusing a reused one.
+    let mut proxy_order: Vec<(ProxyKind, usize)> = Vec::new();
+    let mut explicit_ids: Vec<(u32, &'static str, String, usize)> = Vec::new();
     // Where each named defaults section starts, and what kind of section first inherited
     // from it, for [`check_inheritance`].
     let mut defaults_lines: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
@@ -186,7 +204,9 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut frontends,
                     &mut backends,
                 );
-                cur_section = Some(CurrentSection::Global(GlobalSection::default()));
+                // HAProxy reads every `global` section into the same struct: a later one
+                // adds to the earlier ones, it does not replace them.
+                cur_section = Some(CurrentSection::Global(global.take().unwrap_or_default()));
             }
             "defaults" => {
                 flush_current_section(
@@ -251,6 +271,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut backends,
                 );
                 check_inheritance(Inheritor::Listen, tokens, &named_defaults, &defaults_lines, &mut defaults_users)?;
+                proxy_order.push((ProxyKind::Listen, listens.len()));
                 cur_section = Some(CurrentSection::Listen(parse_listen_header(
                     tokens,
                     kw,
@@ -269,6 +290,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut backends,
                 );
                 check_inheritance(Inheritor::Frontend, tokens, &named_defaults, &defaults_lines, &mut defaults_users)?;
+                proxy_order.push((ProxyKind::Frontend, frontends.len()));
                 cur_section = Some(CurrentSection::Frontend(parse_frontend_header(
                     tokens,
                     kw,
@@ -292,6 +314,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                         d.backend_user = true;
                     }
                 }
+                proxy_order.push((ProxyKind::Backend, backends.len()));
                 cur_section = Some(CurrentSection::Backend(parse_backend_header(
                     tokens,
                     kw,
@@ -310,6 +333,21 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut backends,
                 );
                 cur_section = Some(CurrentSection::Resolvers);
+            }
+            "userlist" => {
+                flush_current_section(
+                    &mut cur_section,
+                    &mut global,
+                    &mut defaults,
+                    &mut named_defaults,
+                    &mut listens,
+                    &mut frontends,
+                    &mut backends,
+                );
+                let Some(name) = tokens.get(1).filter(|t| !t.text.is_empty()) else {
+                    return Err(ConfigError::new(kw.line, kw.col, "'userlist' expects <name> as arguments."));
+                };
+                cur_section = Some(CurrentSection::Userlist(Userlist { name: name.text.clone(), line: kw.line, ..Userlist::default() }));
             }
             "http-errors" => {
                 flush_current_section(
@@ -347,6 +385,18 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     }
                 }
                 parse_section_directive(section, tokens, kw)?;
+                if kw.text == "id" {
+                    for (kind, name, id) in section.explicit_id() {
+                        if let Some((_, okind, oname, oline)) = explicit_ids.iter().find(|e| e.0 == id) {
+                            return Err(ConfigError::new(
+                                kw.line,
+                                kw.col,
+                                format!("{kind} {name} reuses same custom id as {okind} {oname} (declared at line {oline})."),
+                            ));
+                        }
+                        explicit_ids.push((id, kind, name.to_string(), kw.line));
+                    }
+                }
             }
         }
     }
@@ -393,7 +443,15 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
         b.stats.maxrewrite = maxrewrite;
     }
 
+    if let Some(g) = global.as_ref() {
+        apply_ssl_bases(g, &mut listens, &mut frontends, &mut backends);
+    }
+
     validate_config(global.as_ref(), &listens, &frontends, &backends)?;
+    let mut userlists = take_userlists();
+    for list in &mut userlists {
+        list.resolve().map_err(|(line, msg)| ConfigError::new(line, 1, msg))?;
+    }
 
     let config = Config {
         global,
@@ -402,10 +460,66 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
         frontends,
         backends,
         sample_refs,
+        userlists,
+        proxy_order,
     };
     register_checks_from_config(&config);
 
     Ok(config)
+}
+
+/// `path` under `base` when it is relative (`ssl_sock_load_cert_file`, `ssl_store_load_locations_file`
+/// join them with a `/`); an absolute path is kept.
+fn under_base(base: Option<&str>, path: &mut String) {
+    if let Some(base) = base.filter(|_| !path.starts_with('/')) {
+        *path = format!("{base}/{path}");
+    }
+}
+
+fn rebase_server_ssl(ssl: &mut ServerSsl, crt_base: Option<&str>, ca_base: Option<&str>) {
+    if let Some(p) = ssl.crt.as_mut() {
+        under_base(crt_base, p);
+    }
+    // `@system-ca` is not a path.
+    if let Some(p) = ssl.ca_file.as_mut().filter(|p| !p.starts_with('@')) {
+        under_base(ca_base, p);
+    }
+    if let Some(p) = ssl.crl_file.as_mut() {
+        under_base(ca_base, p);
+    }
+}
+
+/// Global `crt-base` / `ca-base`: HAProxy applies them when it loads the files, after the
+/// whole configuration is read, so the keyword may follow the sections that use it. Ibex
+/// loads from the paths the AST carries, so they are rewritten here.
+fn apply_ssl_bases(
+    global: &GlobalSection,
+    listens: &mut [ListenSection],
+    frontends: &mut [FrontendSection],
+    backends: &mut [BackendSection],
+) {
+    let (crt_base, ca_base) = (global.crt_base.as_deref(), global.ca_base.as_deref());
+    if crt_base.is_none() && ca_base.is_none() {
+        return;
+    }
+    let binds = listens.iter_mut().flat_map(|l| l.binds.iter_mut()).chain(frontends.iter_mut().flat_map(|f| f.binds.iter_mut()));
+    for bind in binds {
+        for crt in &mut bind.crt {
+            under_base(crt_base, crt);
+        }
+    }
+    let mut servers: Vec<&mut Server> = Vec::new();
+    servers.extend(listens.iter_mut().flat_map(|l| l.servers.iter_mut()));
+    servers.extend(backends.iter_mut().flat_map(|b| b.servers.iter_mut()));
+    for srv in servers {
+        if let Some(ssl) = srv.ssl.as_mut() {
+            rebase_server_ssl(ssl, crt_base, ca_base);
+        }
+    }
+    let defaults = listens.iter_mut().filter_map(|l| l.default_server.as_mut()).chain(backends.iter_mut().filter_map(|b| b.default_server.as_mut()));
+    for ds in defaults {
+        rebase_server_ssl(&mut ds.ssl, crt_base, ca_base);
+    }
 }
 
 /// An unnamed `defaults` section, and what its `http-check` rules need to be resolved.
@@ -507,6 +621,7 @@ pub(crate) fn flush_current_section(
             CurrentSection::Frontend(f) => frontends.push(f),
             CurrentSection::Backend(b) => backends.push(b),
             CurrentSection::Resolvers => {}
+            CurrentSection::Userlist(u) => register_userlist(u),
             CurrentSection::HttpErrors(name, table) => register_http_errors_section(name, table),
         }
     }
@@ -527,6 +642,7 @@ pub(crate) fn parse_section_directive(
         CurrentSection::Frontend(f) => parse_frontend_directive(f, tokens, kw),
         CurrentSection::Backend(b) => parse_backend_directive(b, tokens, kw),
         CurrentSection::Resolvers => parse_resolvers_directive(tokens, kw),
+        CurrentSection::Userlist(u) => parse_userlist_directive(u, tokens, kw),
         CurrentSection::HttpErrors(_, table) => match kw.text.as_str() {
             "errorfile" => parse_errorfile_directive(table, tokens, kw),
             other => Err(ConfigError::new(
@@ -584,11 +700,6 @@ const CHECK_OPTIONS_THAT_MUST_NOT_BE_IGNORED: &[&str] = &[
 ///
 /// None of these appears in a reg-test that passed before T94.
 const OPTIONS_THAT_MUST_NOT_BE_IGNORED: &[(&str, &str)] = &[
-    (
-        "forwarded",
-        "Ibex does not add the RFC 7239 'Forwarded' header, and the server would trust whatever \
-         'Forwarded' header the client sent",
-    ),
     ("http-drop-request-trailers", "Ibex does not drop request trailers; the server would receive them"),
     ("http-drop-response-trailers", "Ibex does not drop response trailers; the client would receive them"),
     (
@@ -1095,6 +1206,65 @@ pub(crate) fn parse_default_backend(
 
 
 
+/// Where `track [<proxy>/]<server>` of a server of `px` points: the proxy name is what
+/// precedes the last `/`, and a bare name is a server of the same proxy.
+#[must_use]
+pub fn tracked_target<'a>(px: &'a str, spec: &'a str) -> (&'a str, &'a str) {
+    spec.rsplit_once('/').unwrap_or((px, spec))
+}
+
+/// `track` is resolved when the configuration loads, the servers taken in the order they
+/// are declared, as `srv_apply_track` does (`src/server.c`): the target must exist, must
+/// have a check or itself track something (a later server's `track` counts), and the chain
+/// it starts must not lead back to the server.
+fn validate_tracking(listens: &[ListenSection], backends: &[BackendSection]) -> Result<(), ConfigError> {
+    // Most configurations track nothing, and the bookkeeping below allocates per backend.
+    let tracks = |servers: &[Server]| servers.iter().any(|s| s.track.is_some());
+    if !listens.iter().any(|l| tracks(&l.servers)) && !backends.iter().any(|b| tracks(&b.servers)) {
+        return Ok(());
+    }
+    let all: Vec<(&str, &[Server])> = listens
+        .iter()
+        .map(|l| (l.name.as_str(), l.servers.as_slice()))
+        .chain(backends.iter().map(|b| (b.name.as_str(), b.servers.as_slice())))
+        .collect();
+    let find = |px: &str, sv: &str| -> Option<(usize, usize)> {
+        let p = all.iter().position(|(n, _)| *n == px)?;
+        Some((p, all[p].1.iter().position(|s| s.id == sv)?))
+    };
+    // The links applied so far.
+    let mut link: Vec<Vec<Option<(usize, usize)>>> = all.iter().map(|(_, s)| vec![None; s.len()]).collect();
+    for (p, (px, servers)) in all.iter().enumerate() {
+        for (s, server) in servers.iter().enumerate() {
+            let Some(spec) = &server.track else { continue };
+            let err = |msg: String| ConfigError::new(1, 1, format!("'server {px}/{}' : {msg}", server.id));
+            if server.check {
+                return Err(err("unable to enable checks and tracking at the same time!".to_string()));
+            }
+            let (tpx, tsv) = tracked_target(px, spec);
+            if !all.iter().any(|(n, _)| *n == tpx) {
+                return Err(err(format!("unable to find required proxy '{tpx}' for tracking.")));
+            }
+            let Some(t) = find(tpx, tsv) else {
+                return Err(err(format!("unable to find required server '{tsv}' for tracking.")));
+            };
+            let target = &all[t.0].1[t.1];
+            if !target.check && target.track.is_none() {
+                return Err(err(format!("unable to use {tpx}/{tsv} for tracking as it does not have any check nor agent enabled.")));
+            }
+            let mut at = Some(t);
+            while let Some(x) = at {
+                if x == (p, s) {
+                    return Err(err(format!("unable to track {tpx}/{tsv} as it belongs to a tracking chain looping back to {px}/{}.", server.id)));
+                }
+                at = link[x.0][x.1];
+            }
+            link[p][s] = Some(t);
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_config(
     global: Option<&GlobalSection>,
     listens: &[ListenSection],
@@ -1154,6 +1324,7 @@ pub(crate) fn validate_config(
             }
         }
     }
+    validate_tracking(listens, backends)?;
     for proxy in listens {
         if proxy.mode == Mode::Http && proxy.cookie.is_some() && proxy.servers.is_empty() {
             return Err(ConfigError::new(
@@ -1193,6 +1364,15 @@ pub(crate) fn validate_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_proxy_section_gives_an_explicit_id() {
+        assert!(CurrentSection::Resolvers.explicit_id().is_none());
+        let mut be = BackendSection { name: "b".into(), ..Default::default() };
+        assert!(CurrentSection::Backend(be.clone()).explicit_id().is_none());
+        be.id = Some(4);
+        assert_eq!(CurrentSection::Backend(be).explicit_id(), Some(("backend", "b", 4)));
+    }
 
     #[test]
     fn test_parse_example_cfg() {

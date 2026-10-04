@@ -43,7 +43,7 @@ pub(crate) fn parse_global_directive(
         }
         "stats" => {
             if tokens.len() >= 3 && tokens[1].text == "socket" {
-                global.stats_socket = Some(tokens[2].text.clone());
+                let mut sock = crate::ast::StatsSocket { path: tokens[2].text.clone(), ..Default::default() };
                 let mut i = 3;
                 while i < tokens.len() {
                     match tokens[i].text.as_str() {
@@ -58,7 +58,7 @@ pub(crate) fn parse_global_directive(
                                         format!("invalid socket mode <{}>", tokens[i].text),
                                     )
                                 })?;
-                            global.stats_socket_mode = Some(mode_val);
+                            sock.mode = Some(mode_val);
                         }
                         "level" if i + 1 < tokens.len() => {
                             i += 1;
@@ -72,7 +72,7 @@ pub(crate) fn parse_global_directive(
                                     ),
                                 ));
                             }
-                            global.stats_socket_level = Some(tokens[i].text.clone());
+                            sock.level = Some(tokens[i].text.clone());
                         }
                         // Until this arm existed, `expose-fd listeners` fell into the
                         // catch-all below and was accepted and dropped -- so a HAProxy
@@ -87,11 +87,21 @@ pub(crate) fn parse_global_directive(
                                 ));
                             }
                             i += 1;
-                            global.stats_socket_expose_fd = true;
+                            sock.expose_fd = true;
                         }
                         _ => {}
                     }
                     i += 1;
+                }
+                // The first socket fills the fields every other part of Ibex reads; each
+                // later one (in this section or another) is kept beside it.
+                if global.stats_socket.is_none() {
+                    global.stats_socket = Some(sock.path);
+                    global.stats_socket_mode = sock.mode;
+                    global.stats_socket_level = sock.level;
+                    global.stats_socket_expose_fd = sock.expose_fd;
+                } else {
+                    global.extra_stats_sockets.push(sock);
                 }
             }
             Ok(())
@@ -319,6 +329,29 @@ pub(crate) fn parse_global_directive(
             }
             Ok(())
         }
+        "http-err-codes" | "http-fail-codes" => {
+            if tokens.len() < 2 {
+                return Err(ConfigError::new(
+                    kw.line,
+                    kw.col,
+                    format!("Missing status codes range for '{}'.", kw.text),
+                ));
+            }
+            let (slot, mut set) = if kw.text == "http-err-codes" {
+                (&mut global.http_err_codes, crate::ast::StatusCodeSet::default_err())
+            } else {
+                (&mut global.http_fail_codes, crate::ast::StatusCodeSet::default_fail())
+            };
+            // The list starts from what a previous line left, or the defaults.
+            if let Some(prev) = slot {
+                set = *prev;
+            }
+            for tok in &tokens[1..] {
+                set.parse_arg(&kw.text, &tok.text).map_err(|m| ConfigError::new(tok.line, tok.col, m))?;
+            }
+            *slot = Some(set);
+            Ok(())
+        }
         "hard-stop-after" => {
             if tokens.len() >= 2 {
                 global.hard_stop_after = Some(parse_timeout(&tokens[1], "hard-stop-after")?);
@@ -353,6 +386,28 @@ pub(crate) fn parse_global_directive(
             if tokens.len() >= 2 {
                 global.ssl_default_server_options = Some(tokens[1..].iter().map(|t| t.text.as_str()).collect::<Vec<_>>().join(" "));
             }
+            Ok(())
+        }
+        "crt-base" | "ca-base" => {
+            let Some(dir) = tokens.get(1) else {
+                return Err(ConfigError::new(
+                    kw.line,
+                    kw.col,
+                    format!("global statement '{}' expects a directory path as an argument.", kw.text),
+                ));
+            };
+            if let Some(extra) = tokens.get(2) {
+                return Err(ConfigError::new(
+                    extra.line,
+                    extra.col,
+                    format!("'{}' cannot handle unexpected argument '{}'.", kw.text, extra.text),
+                ));
+            }
+            let slot = if kw.text == "crt-base" { &mut global.crt_base } else { &mut global.ca_base };
+            if slot.is_some() {
+                return Err(ConfigError::new(kw.line, kw.col, format!("'{}' already specified.", kw.text)));
+            }
+            *slot = Some(dir.text.clone());
             Ok(())
         }
         "set-var" => {

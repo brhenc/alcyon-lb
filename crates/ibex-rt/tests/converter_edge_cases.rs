@@ -421,6 +421,17 @@ fn when_acl_evaluates_the_named_acl_inline() {
     );
 }
 
+/// The same rule at the session and content stages of `tcp-request`.
+#[test]
+fn tcp_request_set_var_with_a_failing_converter_leaves_the_variable_alone() {
+    let rules = "  tcp-request session set-var(sess.a) str(one)\n\
+  tcp-request session set-var(sess.a) str(x),field(3,/)\n\
+  tcp-request content set-var(txn.b) str(two)\n\
+  tcp-request content set-var(txn.b) str(x),field(3,/)\n\
+  http-request return status 200 hdr x-a \"[%[var(sess.a)]]\" hdr x-b \"[%[var(txn.b)]]\"\n";
+    assert_eq!(run(rules, &[&get("/")]), vec![vec!["x-a: [one]", "x-b: [two]"]]);
+}
+
 #[test]
 fn set_var_with_a_failing_converter_leaves_the_variable_alone() {
     let rules = "  http-request set-var(txn.a) str(one)\n\

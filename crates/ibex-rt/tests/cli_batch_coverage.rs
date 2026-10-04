@@ -49,16 +49,15 @@ fn cli_commands_coverage() {
     assert_eq!(lines[0], "1");
     // HAProxy 3.5, same backend, prints
     //   2 be 1 s1 127.0.0.1 2 0 1 1 0 1 0 0 0 0 0 0 - 80 - 0 0 - - 0
-    // Field 0 (be_id) is 2 there and 0 here -- a real divergence, left to its own task
-    // rather than written down as correct. Field 9 (srv_time_since_last_change) is
-    // seconds elapsed and cannot be pinned. Every other field must match.
+    // Field 9 (srv_time_since_last_change) is seconds elapsed and cannot be pinned.
+    // Every other field must match, be_id (2: HAProxy numbers proxies from 2) included.
     let fields: Vec<&str> = lines[2].split(' ').collect();
     let haproxy: Vec<&str> = "2 be 1 s1 127.0.0.1 2 0 1 1 0 1 0 0 0 0 0 0 - 80 - 0 0 - - 0"
         .split(' ')
         .collect();
     assert_eq!(fields.len(), haproxy.len(), "{}", lines[2]);
     for (i, (got, want)) in fields.iter().zip(&haproxy).enumerate() {
-        if i != 0 && i != 9 {
+        if i != 9 {
             assert_eq!(got, want, "field {i} of {:?}", lines[2]);
         }
     }

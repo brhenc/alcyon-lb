@@ -665,6 +665,25 @@ mod tests {
         fn source(&self, _addr: IpAddr, _tables: &[&str], _data: crate::StickData) -> Option<i64> {
             None
         }
+        fn tracked_key(&self, _slot: usize, _table: Option<&str>) -> Option<crate::Sample> {
+            None
+        }
+        fn write_tracked(&self, _slot: usize, _table: Option<&str>, _op: crate::StickOp) -> Option<i64> {
+            None
+        }
+        fn write_source(&self, _addr: IpAddr, _tables: &[&str], _op: crate::StickOp) -> Option<i64> {
+            None
+        }
+    }
+
+    /// The stand-in tracks nothing and writes nothing.
+    #[test]
+    fn the_slot0_stand_in_answers_nothing_for_keys_and_writes() {
+        use crate::StickState;
+        let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        assert!(Slot0.tracked_key(0, None).is_none());
+        assert!(Slot0.write_tracked(0, None, crate::StickOp::UpdtConnCnt).is_none());
+        assert!(Slot0.write_source(ip, &[], crate::StickOp::UpdtConnCnt).is_none());
     }
 
     use super::*;

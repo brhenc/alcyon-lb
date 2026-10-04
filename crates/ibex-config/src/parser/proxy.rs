@@ -70,6 +70,7 @@ pub(crate) fn parse_listen_header(
         binds: Vec::new(),
         mode,
         disabled: false,
+        id: None,
         cookie: defaults.and_then(|d| d.cookie.clone()),
         contimeout: timeouts.connect,
         clitimeout: timeouts.client,
@@ -84,6 +85,7 @@ pub(crate) fn parse_listen_header(
         default_server: defaults.and_then(|d| d.default_server.clone()),
         use_servers: Vec::new(),
         servers: Vec::new(),
+        server_extras: ServerExtras::default(),
         logs: defaults.map_or_else(Vec::new, |d| d.logs.clone()),
         log_tag: defaults.and_then(|d| d.log_tag.clone()),
         log_global: defaults.map_or(false, |d| d.log_global),
@@ -119,6 +121,8 @@ pub(crate) fn parse_listen_header(
         hash_type: defaults.and_then(|d| d.hash_type),
         hash_preserve_affinity: defaults.and_then(|d| d.hash_preserve_affinity),
         forwardfor: defaults.and_then(|d| d.forwardfor.clone()),
+        forwardfor_if_none: defaults.is_some_and(|d| d.forwardfor_if_none),
+        forwarded: defaults.and_then(|d| d.forwarded.clone()),
         originalto: defaults.and_then(|d| d.originalto.clone()),
         stats: defaults.map_or_else(StatsConfig::default, |d| d.stats.clone()),
         error_files: defaults.map_or_else(HashMap::new, |d| d.error_files.clone()),
@@ -167,6 +171,7 @@ pub(crate) fn parse_frontend_header(
         binds: Vec::new(),
         mode,
         disabled: false,
+        id: None,
         clitimeout: timeouts.client,
         timeouts,
         maxconn: defaults.and_then(|d| d.maxconn).unwrap_or(2000),
@@ -198,6 +203,7 @@ pub(crate) fn parse_frontend_header(
         accept_proxy: false,
         accept_proxy_v2: false,
         forwardfor: defaults.and_then(|d| d.forwardfor.clone()),
+        forwardfor_if_none: defaults.is_some_and(|d| d.forwardfor_if_none),
         originalto: defaults.and_then(|d| d.originalto.clone()),
         stats: defaults.map_or_else(StatsConfig::default, |d| d.stats.clone()),
         error_files: defaults.map_or_else(HashMap::new, |d| d.error_files.clone()),
@@ -257,6 +263,7 @@ pub(crate) fn parse_backend_header(
         buffer_request: defaults.is_some_and(|d| d.buffer_request),
         mode,
         disabled: false,
+        id: None,
         balance: defaults.and_then(|d| d.balance).unwrap_or(BalanceAlgorithm::RoundRobin),
         cookie: defaults.and_then(|d| d.cookie.clone()),
         contimeout: timeouts.connect,
@@ -269,6 +276,7 @@ pub(crate) fn parse_backend_header(
         default_server: defaults.and_then(|d| d.default_server.clone()),
         use_servers: Vec::new(),
         servers: Vec::new(),
+        server_extras: ServerExtras::default(),
         srvexp: Vec::new(),
         acls: Vec::new(),
         stick_table: None,
@@ -284,11 +292,30 @@ pub(crate) fn parse_backend_header(
         hash_type: defaults.and_then(|d| d.hash_type),
         hash_preserve_affinity: defaults.and_then(|d| d.hash_preserve_affinity),
         forwardfor: defaults.and_then(|d| d.forwardfor.clone()),
+        forwardfor_if_none: defaults.is_some_and(|d| d.forwardfor_if_none),
+        forwarded: defaults.and_then(|d| d.forwarded.clone()),
         originalto: defaults.and_then(|d| d.originalto.clone()),
         stats: defaults.map_or_else(StatsConfig::default, |d| d.stats.clone()),
         error_files: defaults.map_or_else(HashMap::new, |d| d.error_files.clone()),
         error_replies: defaults.map_or_else(HashMap::new, |d| d.error_replies.clone()),
     })
+}
+
+/// `id <n>` in a proxy section (`cfg_parse_listen`, `src/cfgparse-listen.c`). `HAProxy`
+/// reads it with `atol` into an `int`, so anything that does not come out above zero,
+/// words and values past `i32::MAX` included, is "custom id has to be > 0".
+fn parse_proxy_id(id: &mut Option<u32>, tokens: &[Token], kw: &Token) -> Result<(), ConfigError> {
+    let Some(arg) = tokens.get(1).filter(|t| !t.text.is_empty()) else {
+        return Err(ConfigError::new(kw.line, kw.col, "'id' expects an integer argument."));
+    };
+    let digits: String = arg.text.trim_start().chars().take_while(char::is_ascii_digit).collect();
+    // `atol`, then the `int` it is stored in.
+    let value = digits.parse::<i64>().map_or(0, |v| i64::from(v as i32));
+    if value <= 0 {
+        return Err(ConfigError::new(arg.line, arg.col, "custom id has to be > 0."));
+    }
+    *id = u32::try_from(value).ok();
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -303,6 +330,7 @@ pub(crate) fn parse_listen_directive(
             proxy.disabled = true;
             Ok(())
         }
+        "id" => parse_proxy_id(&mut proxy.id, tokens, kw),
         "cookie" => parse_cookie(&mut proxy.cookie, tokens, kw),
         "contimeout" => parse_contimeout(kw),
         "clitimeout" => parse_clitimeout(kw),
@@ -316,6 +344,7 @@ pub(crate) fn parse_listen_directive(
         "default-server" => parse_default_server(&mut proxy.default_server, tokens, kw),
         "server" => parse_server(
             &mut proxy.servers,
+            &mut proxy.server_extras,
             proxy.default_server.as_ref(),
             tokens,
             kw,
@@ -410,7 +439,7 @@ pub(crate) fn parse_listen_directive(
             parse_tcp_check_directive(&mut proxy.tcp_checks, tokens, kw)?;
             Ok(())
         }
-        "errorfile" | "errorfiles" | "http-error" => {
+        "errorfile" | "errorfiles" | "http-error" | "errorloc" | "errorloc302" | "errorloc303" => {
             parse_proxy_error_page(&mut proxy.error_files, &mut proxy.error_replies, tokens, kw)
         }
         "log-format" => {
@@ -480,6 +509,7 @@ pub(crate) fn parse_frontend_directive(
             in_section(parse_http_after_res_rule(&mut fe.http_after_res_rules, tokens, kw), "frontend", &fe.name)
         }
         "mode" => parse_mode(&mut fe.mode, tokens, kw),
+        "id" => parse_proxy_id(&mut fe.id, tokens, kw),
         "disabled" => {
             fe.disabled = true;
             Ok(())
@@ -530,7 +560,7 @@ pub(crate) fn parse_frontend_directive(
                 "'http-check' is not supported in frontend",
             ))
         }
-        "errorfile" | "errorfiles" | "http-error" => {
+        "errorfile" | "errorfiles" | "http-error" | "errorloc" | "errorloc302" | "errorloc303" => {
             parse_proxy_error_page(&mut fe.error_files, &mut fe.error_replies, tokens, kw)
         }
         "log-format" => {
@@ -568,6 +598,7 @@ pub(crate) fn parse_backend_directive(
 ) -> Result<(), ConfigError> {
     match kw.text.as_str() {
         "mode" => parse_mode(&mut be.mode, tokens, kw),
+        "id" => parse_proxy_id(&mut be.id, tokens, kw),
         "disabled" => {
             be.disabled = true;
             Ok(())
@@ -596,7 +627,7 @@ pub(crate) fn parse_backend_directive(
         "redisp" => parse_redisp(kw),
         "dispatch" => parse_dispatch(kw),
         "default-server" => parse_default_server(&mut be.default_server, tokens, kw),
-        "server" => parse_server(&mut be.servers, be.default_server.as_ref(), tokens, kw),
+        "server" => parse_server(&mut be.servers, &mut be.server_extras, be.default_server.as_ref(), tokens, kw),
         "tcp-request" => parse_backend_tcp_request(be, tokens, kw),
         "http-request" => in_section(parse_http_req_rule(&mut be.http_req_rules, tokens, kw), "backend", &be.name),
         "http-response" => in_section(parse_http_res_rule(&mut be.http_res_rules, tokens, kw), "backend", &be.name),
@@ -657,7 +688,7 @@ pub(crate) fn parse_backend_directive(
             parse_tcp_check_directive(&mut be.tcp_checks, tokens, kw)?;
             Ok(())
         }
-        "errorfile" | "errorfiles" | "http-error" => {
+        "errorfile" | "errorfiles" | "http-error" | "errorloc" | "errorloc302" | "errorloc303" => {
             parse_proxy_error_page(&mut be.error_files, &mut be.error_replies, tokens, kw)
         }
         // Ignored in backends, as `HAProxy` ignores it ("'log-format' directive is ignored
@@ -711,6 +742,7 @@ fn parse_bind(tokens: &[Token], kw: &Token, section: &str) -> Result<BindConfig,
         accept_proxy: false,
         accept_proxy_v2: false,
         name: None,
+        id: None,
     };
     let prefix = format!("'bind {}' in section '{section}'", tokens[1].text);
     let arg = |i: usize, what: &str| -> Result<&Token, ConfigError> {
@@ -744,6 +776,17 @@ fn parse_bind(tokens: &[Token], kw: &Token, section: &str) -> Result<BindConfig,
                 bind.name = Some(arg(i, "missing name")?.text.clone());
                 i += 1;
             }
+            "id" => {
+                let a = arg(i, "expects an integer argument")?;
+                let value = a.text.parse::<i64>().map_err(|_| {
+                    ConfigError::new(a.line, a.col, format!("{prefix} : 'id' : expects an integer argument, found '{}'", a.text))
+                })?;
+                if value <= 0 || value > i64::from(i32::MAX) {
+                    return Err(ConfigError::new(a.line, a.col, format!("{prefix} : 'id' : custom id has to be > 0")));
+                }
+                bind.id = u32::try_from(value).ok();
+                i += 1;
+            }
             "accept-proxy" => bind.accept_proxy = true,
             "accept-proxy-v2" => {
                 bind.accept_proxy = true;
@@ -754,6 +797,22 @@ fn parse_bind(tokens: &[Token], kw: &Token, section: &str) -> Result<BindConfig,
         i += 1;
     }
     Ok(bind)
+}
+
+/// `bind_parse_id`: a listener id may be given once in a proxy.
+fn check_bind_id(binds: &[BindConfig], bind: &BindConfig, kw: &Token, section: &str) -> Result<(), ConfigError> {
+    let Some(id) = bind.id else { return Ok(()) };
+    if let Some(other) = binds.iter().find(|b| b.id == Some(id)) {
+        return Err(ConfigError::new(
+            kw.line,
+            kw.col,
+            format!(
+                "'bind {}' in section '{section}' : 'id' : custom id {id} already used by 'bind {}'",
+                bind.addr, other.addr
+            ),
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn parse_listen_bind(
@@ -772,6 +831,7 @@ pub(crate) fn parse_listen_bind(
     if proxy.binds.is_empty() {
         proxy.addr = bind.addr;
     }
+    check_bind_id(&proxy.binds, &bind, kw, "listen")?;
     proxy.accept_proxy |= bind.accept_proxy;
     proxy.accept_proxy_v2 |= bind.accept_proxy_v2;
     proxy.binds.push(bind);
@@ -796,6 +856,7 @@ pub(crate) fn parse_frontend_bind(
     if bind.quic && bind.alpn.is_empty() {
         bind.alpn.push("h3".to_string());
     }
+    check_bind_id(&fe.binds, &bind, kw, "frontend")?;
     fe.binds.push(bind);
     Ok(())
 }
@@ -815,8 +876,13 @@ pub(crate) fn parse_option_listen(
         return Ok(());
     }
     match tokens[1].text.as_str() {
-        "forwardfor" => proxy.forwardfor = Some(parse_forward_option(tokens, kw)?),
-        "originalto" => proxy.originalto = Some(parse_forward_option(tokens, kw)?),
+        "forwardfor" => {
+            let (except, if_none) = parse_forward_option(tokens, kw)?;
+            proxy.forwardfor = Some(except);
+            proxy.forwardfor_if_none = if_none;
+        }
+        "originalto" => proxy.originalto = Some(parse_forward_option(tokens, kw)?.0),
+        "forwarded" => proxy.forwarded = Some(Box::new(parse_forwarded_option(tokens)?)),
         "redispatch" => set_redispatch(&mut proxy.redisp, &mut proxy.redisp_after, tokens),
         "http-buffer-request" => proxy.buffer_request = true,
         "accept-unsafe-violations-in-http-request" => proxy.stats.accept_unsafe_request = true,
@@ -858,11 +924,12 @@ pub(crate) fn parse_option_frontend(
         fe.buffer_request = true;
         return Ok(());
     }
-    let except = Some(parse_forward_option(tokens, kw)?);
+    let (except, if_none) = parse_forward_option(tokens, kw)?;
     if tokens[1].text == "forwardfor" {
-        fe.forwardfor = except;
+        fe.forwardfor = Some(except);
+        fe.forwardfor_if_none = if_none;
     } else {
-        fe.originalto = except;
+        fe.originalto = Some(except);
     }
     Ok(())
 }
@@ -882,8 +949,13 @@ pub(crate) fn parse_option_backend(
         return Ok(());
     }
     match tokens[1].text.as_str() {
-        "forwardfor" => be.forwardfor = Some(parse_forward_option(tokens, kw)?),
-        "originalto" => be.originalto = Some(parse_forward_option(tokens, kw)?),
+        "forwardfor" => {
+            let (except, if_none) = parse_forward_option(tokens, kw)?;
+            be.forwardfor = Some(except);
+            be.forwardfor_if_none = if_none;
+        }
+        "originalto" => be.originalto = Some(parse_forward_option(tokens, kw)?.0),
+        "forwarded" => be.forwarded = Some(Box::new(parse_forwarded_option(tokens)?)),
         "redispatch" => set_redispatch(&mut be.redisp, &mut be.redisp_after, tokens),
         "http-buffer-request" => be.buffer_request = true,
         "log-health-checks" => be.log_health_checks = true,
@@ -909,6 +981,7 @@ pub(crate) fn parse_no_listen(proxy: &mut ListenSection, tokens: &[Token], kw: &
         Some("http-buffer-request") => proxy.buffer_request = false,
         Some("accept-unsafe-violations-in-http-request") => proxy.stats.accept_unsafe_request = false,
         Some("log-health-checks") => proxy.log_health_checks = false,
+        Some("forwarded") => proxy.forwarded = None,
         _ => {}
     }
     Ok(())
@@ -934,6 +1007,7 @@ pub(crate) fn parse_no_backend(be: &mut BackendSection, tokens: &[Token], kw: &T
         Some("redispatch") => (be.redisp, be.redisp_after) = (false, -1),
         Some("http-buffer-request") => be.buffer_request = false,
         Some("log-health-checks") => be.log_health_checks = false,
+        Some("forwarded") => be.forwarded = None,
         _ => {}
     }
     Ok(())

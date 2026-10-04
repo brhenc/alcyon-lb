@@ -46,6 +46,10 @@ pub struct DefaultsSection {
     pub buffer_request: bool,
     /// `option forwardfor` in `defaults`: the `except` network, empty for none.
     pub forwardfor: Option<String>,
+    /// `option forwardfor ... if-none` (without it, `HAProxy` adds the header always).
+    pub forwardfor_if_none: bool,
+    /// `option forwarded`: the RFC 7239 header parameters to add; `None` when it is off.
+    pub forwarded: Option<Box<Forwarded>>,
     /// `option originalto` in `defaults`: the `except` network, empty for none.
     pub originalto: Option<String>,
     /// Default TCP request inspection delay.
@@ -142,6 +146,9 @@ pub struct BindConfig {
     pub accept_proxy_v2: bool,
     /// `name <n>`: what `so_name` reads on connections this bind accepted.
     pub name: Option<String>,
+    /// `id <n>`: the listener's explicit numeric id, what `so_id` reads. `None` takes the
+    /// next free one in the proxy.
+    pub id: Option<u32>,
 }
 
 /// A `listen` proxy section combining frontend and backend.
@@ -159,6 +166,8 @@ pub struct ListenSection {
     pub mode: Mode,
     /// Whether this proxy is disabled.
     pub disabled: bool,
+    /// `id <n>`: the proxy's explicit numeric id (`HAProxy` `PR_O_FORCED_ID`); `None` takes the next free one.
+    pub id: Option<u32>,
     /// The `cookie` line: HTTP session persistence.
     pub cookie: Option<CookieConfig>,
     /// Connect timeout in milliseconds / Duration.
@@ -184,6 +193,8 @@ pub struct ListenSection {
     pub dispatch: Option<SocketAddr>,
     /// Known backend servers.
     pub servers: Vec<Server>,
+    /// The explicit `id` and the initial health of some of the servers.
+    pub server_extras: ServerExtras,
     /// Syslog logging destinations (up to 2).
     pub logs: Vec<LogConfig>,
     /// `log global`: inherit the targets declared in the `global` section.
@@ -250,6 +261,10 @@ pub struct ListenSection {
     pub accept_proxy_v2: bool,
     /// Forwardfor header options.
     pub forwardfor: Option<String>,
+    /// `option forwardfor ... if-none` (without it, `HAProxy` adds the header always).
+    pub forwardfor_if_none: bool,
+    /// `option forwarded`: the RFC 7239 header parameters to add; `None` when it is off.
+    pub forwarded: Option<Box<Forwarded>>,
     /// Originalto header options.
     pub originalto: Option<String>,
     /// Default server options applied to all servers in this listen section.
@@ -295,10 +310,14 @@ pub struct StatsConfig {
     pub admin: bool,
     pub admin_cond: Option<AclCondition>,
     pub show_legends: bool,
-    pub show_desc: Option<String>,
-    pub show_node: Option<String>,
+    pub show_desc: Option<Box<str>>,
+    pub show_node: Option<Box<str>>,
     pub raw_timeouts: TimeoutConfig,
     pub forwardfor: Option<String>,
+    /// `option forwardfor ... if-none` (without it, `HAProxy` adds the header always).
+    pub forwardfor_if_none: bool,
+    /// `option forwarded`: the RFC 7239 header parameters to add; `None` when it is off.
+    pub forwarded: Option<Box<Forwarded>>,
     pub originalto: Option<String>,
     pub maxrewrite: Option<usize>,
     /// `option accept-unsafe-violations-in-http-request`: a `#` in the request target (and a
@@ -314,6 +333,7 @@ impl Default for ListenSection {
             binds: Vec::new(),
             mode: Mode::Tcp,
             disabled: false,
+            id: None,
             cookie: None,
             contimeout: None,
             clitimeout: None,
@@ -328,6 +348,7 @@ impl Default for ListenSection {
             default_server: None,
             use_servers: Vec::new(),
             servers: Vec::new(),
+            server_extras: ServerExtras::default(),
             logs: Vec::new(),
             log_global: false,
             log_format: None,
@@ -362,6 +383,8 @@ impl Default for ListenSection {
             hash_type: None,
             hash_preserve_affinity: None,
             forwardfor: None,
+            forwardfor_if_none: false,
+            forwarded: None,
             originalto: None,
             stats: StatsConfig::default(),
             httpchk: None,
@@ -391,6 +414,8 @@ pub struct FrontendSection {
     pub mode: Mode,
     /// Whether this frontend is disabled.
     pub disabled: bool,
+    /// `id <n>`: the proxy's explicit numeric id (`HAProxy` `PR_O_FORCED_ID`); `None` takes the next free one.
+    pub id: Option<u32>,
     /// Client timeout in milliseconds / Duration.
     pub clitimeout: Option<Duration>,
     /// Structured timeouts.
@@ -455,6 +480,8 @@ pub struct FrontendSection {
     pub accept_proxy_v2: bool,
     /// Forwardfor header options.
     pub forwardfor: Option<String>,
+    /// `option forwardfor ... if-none` (without it, `HAProxy` adds the header always).
+    pub forwardfor_if_none: bool,
     /// Originalto header options.
     pub originalto: Option<String>,
     /// Stats applet and dashboard configuration.
@@ -475,6 +502,7 @@ impl Default for FrontendSection {
             binds: Vec::new(),
             mode: Mode::Tcp,
             disabled: false,
+            id: None,
             clitimeout: None,
             timeouts: TimeoutConfig::default(),
             maxconn: 2000,
@@ -505,6 +533,7 @@ impl Default for FrontendSection {
             accept_proxy: false,
             accept_proxy_v2: false,
             forwardfor: None,
+            forwardfor_if_none: false,
             originalto: None,
             stats: StatsConfig::default(),
             error_files: HashMap::new(),
@@ -539,6 +568,8 @@ pub struct BackendSection {
     pub mode: Mode,
     /// Whether this backend is disabled.
     pub disabled: bool,
+    /// `id <n>`: the proxy's explicit numeric id (`HAProxy` `PR_O_FORCED_ID`); `None` takes the next free one.
+    pub id: Option<u32>,
     /// Load balancing algorithm.
     pub balance: BalanceAlgorithm,
     /// The `cookie` line: HTTP session persistence.
@@ -564,6 +595,8 @@ pub struct BackendSection {
     pub use_servers: Vec<UseServerRule>,
     /// Known backend servers.
     pub servers: Vec<Server>,
+    /// The explicit `id` and the initial health of some of the servers.
+    pub server_extras: ServerExtras,
     /// Server header regex rewrite rules.
     pub srvexp: Vec<HeaderExp>,
     /// Declared ACL rules.
@@ -588,6 +621,10 @@ pub struct BackendSection {
     pub http_after_res_rules: Vec<HttpAfterResRule>,
     /// Forwardfor header options.
     pub forwardfor: Option<String>,
+    /// `option forwardfor ... if-none` (without it, `HAProxy` adds the header always).
+    pub forwardfor_if_none: bool,
+    /// `option forwarded`: the RFC 7239 header parameters to add; `None` when it is off.
+    pub forwarded: Option<Box<Forwarded>>,
     /// Originalto header options.
     pub originalto: Option<String>,
     /// HTTP connection reuse strategy (`http-reuse`).
@@ -633,6 +670,7 @@ impl Default for BackendSection {
             buffer_request: false,
             mode: Mode::Tcp,
             disabled: false,
+            id: None,
             balance: BalanceAlgorithm::RoundRobin,
             cookie: None,
             contimeout: None,
@@ -645,6 +683,7 @@ impl Default for BackendSection {
             default_server: None,
             use_servers: Vec::new(),
             servers: Vec::new(),
+            server_extras: ServerExtras::default(),
             srvexp: Vec::new(),
             acls: Vec::new(),
             stick_table: None,
@@ -657,6 +696,8 @@ impl Default for BackendSection {
             http_res_rules: Vec::new(),
             http_after_res_rules: Vec::new(),
             forwardfor: None,
+            forwardfor_if_none: false,
+            forwarded: None,
             originalto: None,
             http_reuse: None,
             hash_type: None,

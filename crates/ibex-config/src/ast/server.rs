@@ -15,6 +15,8 @@ pub struct DefaultServerConfig {
     pub send_proxy: bool,
     pub send_proxy_v2: bool,
     pub maxconn: Option<u32>,
+    /// `pool-max-conn`.
+    pub pool_max_conn: Option<i32>,
     pub check_port: Option<u16>,
     pub check_proto: Option<&'static str>,
     /// The TLS keywords (`ssl`, `verify`, `sni`, `check-ssl`, ...).
@@ -26,6 +28,8 @@ pub struct DefaultServerConfig {
     pub cookie: Option<String>,
     /// `disabled` / `enabled`: servers declared after start in maintenance.
     pub disabled: bool,
+    /// `track [<proxy>/]<server>`, as written.
+    pub track: Option<Box<str>>,
 }
 
 /// `verify none|required` on a server line.
@@ -184,6 +188,19 @@ pub struct UseServerRule {
     pub cond: AclCondition,
 }
 
+/// What a section knows about some of its servers beyond the `Server`s themselves. Kept
+/// apart, as `(index in the section's servers, value)` for those that have one, so a
+/// backend of 60,000 servers does not pay for them in every `Server`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ServerExtras {
+    /// `id <n>` (`SRV_F_FORCED_ID`): the server's explicit numeric id, what `srv_id` and
+    /// the `sid` column of `show stat` report.
+    pub puid: Vec<(u32, u32)>,
+    /// What `show servers state` reports as `srv_check_health` while no check runs on the
+    /// server, when that is not 0; see `parse_server`.
+    pub init_health: Vec<(u32, u32)>,
+}
+
 /// Backend server definition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Server {
@@ -207,6 +224,9 @@ pub struct Server {
     pub weight: Option<u32>,
     /// Server connection limit.
     pub maxconn: Option<u32>,
+    /// `pool-max-conn`: the most idle connections kept for this server; -1 is unlimited
+    /// (the default), 0 keeps none, not even for the next request of the same client.
+    pub pool_max_conn: i32,
     /// Whether this server is a backup server.
     pub backup: bool,
     /// Custom port for health checks (`port`).
@@ -224,6 +244,8 @@ pub struct Server {
     /// `disabled`: the server starts in maintenance and takes no traffic until the CLI's
     /// `enable server` brings it back.
     pub disabled: bool,
+    /// `track [<proxy>/]<server>`, as written.
+    pub track: Option<Box<str>>,
 }
 
 impl Default for Server {
@@ -239,6 +261,7 @@ impl Default for Server {
             send_proxy_v2: false,
             weight: None,
             maxconn: None,
+            pool_max_conn: -1,
             backup: false,
             check_port: None,
             check_proto: None,
@@ -246,6 +269,7 @@ impl Default for Server {
             proxy_v2_unique_id: false,
             cookie: None,
             disabled: false,
+            track: None,
         }
     }
 }
@@ -264,6 +288,7 @@ impl Server {
             send_proxy_v2: false,
             weight: None,
             maxconn: None,
+            pool_max_conn: -1,
             backup: false,
             check_port: None,
             check_proto: None,
@@ -271,6 +296,7 @@ impl Server {
             proxy_v2_unique_id: false,
             cookie: None,
             disabled: false,
+            track: None,
         }
     }
 }

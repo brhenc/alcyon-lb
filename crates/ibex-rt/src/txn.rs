@@ -308,6 +308,9 @@ pub struct BodyWait {
     /// A `tarpit`, not a `wait-for-body`: the request is held until `deadline` whatever the
     /// client does, and `timeout client` does not apply meanwhile.
     pub tarpit: bool,
+    /// The backend's `tcp-request content` rules wait for their `inspect-delay` (`backend`
+    /// is set, `rule` is unused): the frontend's rules and the routing are not run again.
+    pub inspect: bool,
 }
 
 /// Where `http-response` rules are held for a body: the rule list (the backend's, then
@@ -317,6 +320,9 @@ pub struct RspWait {
     pub list: usize,
     pub rule: usize,
     pub deadline: ibex_sched::Tick,
+    /// The backend's `tcp-response content` rules wait for the end of their
+    /// `inspect-delay` (`WAIT_END`); `list` and `rule` are unused.
+    pub inspect: bool,
 }
 
 /// How much of a message body `data` holds.
