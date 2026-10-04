@@ -3181,6 +3181,16 @@ fn eval_tcp_req_content_rules(
 
     let req_bytes = sess.req.readable();
     let has_content = !req_bytes.is_empty();
+    // A kept-alive connection closed by the client with no next request has no stream to
+    // inspect: HAProxy runs nothing for it.
+    if sess.mode == Mode::Http
+        && !sess.is_first_req
+        && !sess.has_htx
+        && !has_content
+        && matches!(sess.cli_state, ScState::ShutR | ScState::Closed)
+    {
+        return ContentEvalResult::Done;
+    }
     let expired = sess.inspect_exp.is_some_and(|exp| exp.is_expired(now));
     let client_closed = sess.cli_state == ScState::ShutR || sess.cli_state == ScState::Closed;
     let can_wait = sess.inspect_exp.is_some() && !expired && !client_closed;

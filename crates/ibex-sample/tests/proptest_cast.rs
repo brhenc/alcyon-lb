@@ -225,10 +225,23 @@ proptest! {
         prop_assert_eq!(back_meth, Sample::Meth(m));
     }
 
-    /// Invalid UTF-8 bytes in Bin -> Str must fail safely with None.
+    /// A NUL byte ends the string: what follows it, valid UTF-8 or not, is not part of it.
+    #[test]
+    fn prop_cast_bin_to_str_stops_at_nul(
+        head in "[a-z]{0,8}",
+        tail in prop::collection::vec(any::<u8>(), 0..10)
+    ) {
+        let mut bytes = head.clone().into_bytes();
+        bytes.push(0);
+        bytes.extend(tail);
+        prop_assert_eq!(cast(Sample::Bin(bytes), SampleType::Str), Some(Sample::Str(head)));
+    }
+
+    /// Invalid UTF-8 bytes in Bin -> Str must fail safely with None. The prefix has no NUL: the
+    /// cast stops at the first NUL byte (`c_bin2str`), so a NUL before the bad bytes drops them.
     #[test]
     fn prop_cast_invalid_utf8_fails(
-        prefix in prop::collection::vec(any::<u8>(), 0..10),
+        prefix in prop::collection::vec(1u8..=255, 0..10),
         suffix in prop::collection::vec(any::<u8>(), 0..10)
     ) {
         // Construct invalid UTF-8 sequence [0xFF, 0xFF]
