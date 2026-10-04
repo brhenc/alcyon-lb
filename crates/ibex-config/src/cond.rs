@@ -36,8 +36,9 @@ pub const REPORTED_VERSION: &str = "3.5.0";
 fn feature(name: &str) -> bool {
     // OPENSSL is answered true because the suite uses it to mean "this build terminates
     // TLS", not "OpenSSL is linked in" -- see the module comment. RUSTLS names the
-    // backend so a condition can ask which one directly.
-    matches!(name, "OPENSSL" | "RUSTLS")
+    // backend so a condition can ask which one directly. THREAD is what `-vv` of the
+    // reference says ("+THREAD"): Ibex runs worker threads.
+    matches!(name, "OPENSSL" | "RUSTLS" | "THREAD")
 }
 
 /// Compares dotted version strings, ignoring any `-dev`/`-rc` suffix.
@@ -502,6 +503,15 @@ mod tests {
         assert_eq!(eval("ssllib_name_startswith(wolfSSL)"), Some(false));
         assert_eq!(eval("ssllib_name_startswith(rustls)"), Some(true));
         assert_eq!(eval("openssl_version_atleast(1.1.1)"), Some(false));
+    }
+
+    /// `haproxy -cc 'feature(THREAD)'` exits 0 on the reference binary (3.5-dev8-885761-29,
+    /// "+THREAD" in `-vv`), and Ibex is multi-threaded: 407 lines of the reg-tests are
+    /// `.if feature(THREAD)` around `thread-groups`, which Ibex accepts (T146 item 17).
+    #[test]
+    fn threads_are_reported_present() {
+        assert_eq!(eval("feature(THREAD)"), Some(true));
+        assert_eq!(eval("feature(THREAD) && feature(OPENSSL)"), Some(true));
     }
 
     #[test]
