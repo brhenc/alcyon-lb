@@ -36,6 +36,7 @@ pub(crate) fn parse_server(
     let mut backup = default_server.is_some_and(|d| d.backup);
     let mut cookie = default_server.and_then(|d| d.cookie.clone());
     let mut proxy_v2_unique_id = default_server.is_some_and(|d| d.proxy_v2_unique_id);
+    let mut disabled = default_server.is_some_and(|d| d.disabled);
 
     // Every keyword HAProxy knows is either implemented here or listed, with what Ibex
     // does about it, in `server_keywords.rs`. A keyword's argument is consumed with it.
@@ -94,8 +95,10 @@ pub(crate) fn parse_server(
             }
             "backup" => backup = true,
             "no-backup" => backup = false,
+            "disabled" => disabled = true,
+            "enabled" => disabled = false,
             // What these turn on, Ibex never does: they leave the server as Ibex runs it.
-            "enabled" | "stick" | "no-agent-check" | "no-check-send-proxy" | "no-check-reuse-pool" | "no-ssl"
+            "stick" | "no-agent-check" | "no-check-send-proxy" | "no-check-reuse-pool" | "no-ssl"
             | "no-check-ssl" | "no-send-proxy-v2-ssl" | "no-send-proxy-v2-ssl-cn" | "no-sni-auto"
             | "no-check-sni-auto" => {}
             _ => i = unimplemented_server_keyword(tokens, i, who)?,
@@ -120,6 +123,7 @@ pub(crate) fn parse_server(
         maxconn,
         backup,
         cookie,
+        disabled,
     });
     Ok(())
 }
@@ -217,7 +221,9 @@ pub(crate) fn parse_default_server(
             }
             "backup" => cfg.backup = true,
             "no-backup" => cfg.backup = false,
-            "enabled" | "stick" | "no-agent-check" | "no-check-send-proxy" | "no-check-reuse-pool" | "no-ssl"
+            "disabled" => cfg.disabled = true,
+            "enabled" => cfg.disabled = false,
+            "stick" | "no-agent-check" | "no-check-send-proxy" | "no-check-reuse-pool" | "no-ssl"
             | "no-check-ssl" | "no-send-proxy-v2-ssl" | "no-send-proxy-v2-ssl-cn" | "no-sni-auto"
             | "no-check-sni-auto" => {}
             _ => i = unimplemented_server_keyword(tokens, i, None)?,

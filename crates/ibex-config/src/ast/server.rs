@@ -23,6 +23,8 @@ pub struct DefaultServerConfig {
     pub weight: Option<u32>,
     pub backup: bool,
     pub cookie: Option<String>,
+    /// `disabled` / `enabled`: servers declared after start in maintenance.
+    pub disabled: bool,
 }
 
 /// Connection reuse mode for backends (`http-reuse`).
@@ -103,6 +105,16 @@ pub struct UseBackendRule {
     pub cond: Option<AclCondition>,
 }
 
+/// `use-server <server> if|unless <cond>`: the rule picks the server, bypassing the
+/// balance algorithm (`process_server_rules`, `src/stream.c`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UseServerRule {
+    /// The server's name, in the backend the rule is in.
+    pub server: String,
+    /// The condition; `use-server` requires one.
+    pub cond: AclCondition,
+}
+
 /// Backend server definition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Server {
@@ -139,6 +151,9 @@ pub struct Server {
     pub proxy_v2_unique_id: bool,
     /// The value of the persistence cookie that selects this server (`cookie <value>`).
     pub cookie: Option<String>,
+    /// `disabled`: the server starts in maintenance and takes no traffic until the CLI's
+    /// `enable server` brings it back.
+    pub disabled: bool,
 }
 
 impl Default for Server {
@@ -160,6 +175,7 @@ impl Default for Server {
             check_ssl: false,
             proxy_v2_unique_id: false,
             cookie: None,
+            disabled: false,
         }
     }
 }
@@ -184,6 +200,7 @@ impl Server {
             check_ssl: false,
             proxy_v2_unique_id: false,
             cookie: None,
+            disabled: false,
         }
     }
 }

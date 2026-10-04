@@ -923,14 +923,14 @@ impl CliApplet {
                 found_px = true;
                 for (s_idx, sid) in proxy.server_ids.iter().enumerate() {
                     if sid == sv_name {
-                        proxy.server_statuses[s_idx].store(1 /* Down */, std::sync::atomic::Ordering::Relaxed);
+                        proxy.server_statuses[s_idx].store(ServerStatus::Maint as u8, std::sync::atomic::Ordering::Relaxed);
                         found_sv = true;
                         if let Some(check) = ctx
                             .checks
                             .iter_mut()
                             .find(|c| c.proxy_idx == p_idx && c.server_idx == s_idx)
                         {
-                            check.status = ServerStatus::Down;
+                            check.status = ServerStatus::Maint;
                         }
                     }
                 }
@@ -964,7 +964,8 @@ impl CliApplet {
             };
             let new_status = match state {
                 "ready" => Some(ServerStatus::Up),
-                "maint" | "drain" => Some(ServerStatus::Down),
+                "maint" => Some(ServerStatus::Maint),
+                "drain" => Some(ServerStatus::Drain),
                 _ => None,
             };
 

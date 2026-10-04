@@ -74,7 +74,6 @@ const SENT: Unimplemented = Refuse("Ibex does not implement it; the server would
 /// Keywords `HAProxy` registers that the loops in `server.rs` do not handle.
 pub(crate) const UNIMPLEMENTED_SERVER_KEYWORDS: &[ServerKeyword] = &[
     // src/server.c
-    kw!("disabled", Arg::None, Refuse("Ibex does not implement it; the server would take traffic it should not")),
     kw!("error-limit", Arg::Word, Ignore("the error count for 'observe' and 'on-error', which Ibex refuses")),
     not_for_default!("guid", Arg::Word, Ignore("a global identifier for the CLI and stats")),
     kw!("ws", Arg::Word, Ignore("the protocol for WebSocket; Ibex upgrades over HTTP/1.1")),

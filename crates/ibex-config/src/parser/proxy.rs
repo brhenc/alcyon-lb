@@ -81,6 +81,7 @@ pub(crate) fn parse_listen_header(
         grace: None,
         dispatch: None,
         default_server: defaults.and_then(|d| d.default_server.clone()),
+        use_servers: Vec::new(),
         servers: Vec::new(),
         logs: defaults.map_or_else(Vec::new, |d| d.logs.clone()),
         log_tag: defaults.and_then(|d| d.log_tag.clone()),
@@ -95,6 +96,7 @@ pub(crate) fn parse_listen_header(
         srvexp: Vec::new(),
         acls: Vec::new(),
         use_backends: Vec::new(),
+        force_be_switch: Vec::new(),
         monitor_uri: None,
         default_backend: None,
         balance: defaults.and_then(|d| d.balance).unwrap_or(BalanceAlgorithm::RoundRobin),
@@ -168,6 +170,7 @@ pub(crate) fn parse_frontend_header(
         maxconn: defaults.and_then(|d| d.maxconn).unwrap_or(2000),
         default_backend: None,
         use_backends: Vec::new(),
+        force_be_switch: Vec::new(),
         monitor_uri: None,
         acls: Vec::new(),
         cliexp: Vec::new(),
@@ -259,6 +262,7 @@ pub(crate) fn parse_backend_header(
         redisp_after: defaults.map_or(-1, |d| if d.redisp { d.redisp_after } else { -1 }),
         dispatch: None,
         default_server: defaults.and_then(|d| d.default_server.clone()),
+        use_servers: Vec::new(),
         servers: Vec::new(),
         srvexp: Vec::new(),
         acls: Vec::new(),
@@ -335,6 +339,8 @@ pub(crate) fn parse_listen_directive(
         }
         "acl" => parse_acl(&mut proxy.acls, tokens, kw),
         "use_backend" => parse_use_backend(&mut proxy.use_backends, tokens, kw),
+        "use-server" => parse_use_server(&mut proxy.use_servers, tokens, kw),
+        "force-be-switch" => parse_force_be_switch(&mut proxy.force_be_switch, tokens, kw),
         "monitor-uri" => parse_monitor_uri(&mut proxy.monitor_uri, tokens, kw),
         "default_backend" => parse_default_backend(&mut proxy.default_backend, tokens, kw),
         "option" => parse_option_listen(proxy, tokens, kw),
@@ -495,6 +501,18 @@ pub(crate) fn parse_frontend_directive(
         "log-tag" => parse_log_tag(tokens, kw).map(|t| fe.log_tag = Some(t)),
         "acl" => parse_acl(&mut fe.acls, tokens, kw),
         "use_backend" => parse_use_backend(&mut fe.use_backends, tokens, kw),
+        "force-be-switch" => parse_force_be_switch(&mut fe.force_be_switch, tokens, kw),
+        // `HAProxy` warns that a frontend has no backend capability and keeps the rule,
+        // then fails the load because the frontend has no server by that name.
+        "use-server" => Err(ConfigError::new(
+            kw.line,
+            kw.col,
+            format!(
+                "frontend '{}' : unable to find server '{}' referenced in a 'use-server' rule.",
+                fe.name,
+                tokens.get(1).map_or("", |t| t.text.as_str())
+            ),
+        )),
         "monitor-uri" => parse_monitor_uri(&mut fe.monitor_uri, tokens, kw),
         "default_backend" => parse_default_backend(&mut fe.default_backend, tokens, kw),
         "stick-table" => parse_stick_table(&mut fe.stick_table, tokens, kw),
@@ -552,6 +570,7 @@ pub(crate) fn parse_backend_directive(
             be.disabled = true;
             Ok(())
         }
+        "use-server" => parse_use_server(&mut be.use_servers, tokens, kw),
         "balance" => parse_balance(&mut be.balance, tokens, kw),
         "http-reuse" => parse_http_reuse(&mut be.http_reuse, tokens, kw),
         "hash-type" => {

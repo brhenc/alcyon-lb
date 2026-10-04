@@ -238,6 +238,14 @@ pub struct Proxy {
     pub stats_config: ibex_config::StatsConfig,
     pub default_backend: Option<String>,
     pub use_backends: Vec<UseBackendRule>,
+    /// `use-server` rules (backends and listens), in order.
+    pub use_servers: Vec<ibex_config::UseServerRule>,
+    /// `force-be-switch` conditions (frontends and listens).
+    pub force_be_switch: Vec<ibex_config::AclCondition>,
+    /// The names of the backends and listens the configuration disables: they are not
+    /// instantiated, and only `force-be-switch` lets a rule choose one (then it has no
+    /// server to give).
+    pub disabled_backends: Arc<Vec<String>>,
     pub monitor_uri: Option<String>,
     pub acls: HashMap<String, Expr>,
     pub stick_table: Option<Arc<StickTable>>,
@@ -1177,6 +1185,12 @@ fn section_timeouts(
 }
 
 #[allow(clippy::too_many_lines)] // a field-by-field mirror of the section
+/// The state a server starts in: `disabled` is maintenance, which the CLI's `enable
+/// server` ends.
+fn initial_status(s: &ibex_config::Server) -> u8 {
+    if s.disabled { ServerStatus::Maint as u8 } else { ServerStatus::Up as u8 }
+}
+
 fn init_proxy_from_listen(proxy_idx: usize, listen: &ibex_config::ListenSection, nbthread: usize) -> Proxy {
     let mut http_req_rules = listen.http_req_rules.clone();
     let req_capture_slots = capture_slots(&listen.req_header_captures, &mut http_req_rules);
@@ -1250,7 +1264,7 @@ fn init_proxy_from_listen(proxy_idx: usize, listen: &ibex_config::ListenSection,
         servers: listen.servers.iter().map(|s| s.addr).collect(),
         server_ids: listen.servers.iter().map(|s| s.id.clone()).collect(),
         server_cookies: listen.servers.iter().map(|s| s.cookie.clone()).collect(),
-        server_statuses: Arc::new((0..server_count).map(|_| AtomicU8::new(ServerStatus::Up as u8)).collect()),
+        server_statuses: Arc::new(listen.servers.iter().map(|s| AtomicU8::new(initial_status(s))).collect()),
         server_weights: listen
             .servers
             .iter()
@@ -1267,6 +1281,9 @@ fn init_proxy_from_listen(proxy_idx: usize, listen: &ibex_config::ListenSection,
         },
         default_backend: listen.default_backend.clone(),
         use_backends: listen.use_backends.clone(),
+        use_servers: listen.use_servers.clone(),
+        force_be_switch: listen.force_be_switch.clone(),
+        disabled_backends: Arc::default(),
         monitor_uri: listen.monitor_uri.clone(),
         acls: compile_acls(&listen.acls),
         stick_table,
@@ -1364,6 +1381,9 @@ fn init_proxy_from_frontend(proxy_idx: usize, fe: &ibex_config::FrontendSection,
         },
         default_backend: fe.default_backend.clone(),
         use_backends: fe.use_backends.clone(),
+        use_servers: Vec::new(),
+        force_be_switch: fe.force_be_switch.clone(),
+        disabled_backends: Arc::default(),
         monitor_uri: fe.monitor_uri.clone(),
         acls: compile_acls(&fe.acls),
         stick_table,
@@ -1470,7 +1490,7 @@ fn init_proxy_from_backend(proxy_idx: usize, be: &ibex_config::BackendSection, n
         servers: be.servers.iter().map(|s| s.addr).collect(),
         server_ids: be.servers.iter().map(|s| s.id.clone()).collect(),
         server_cookies: be.servers.iter().map(|s| s.cookie.clone()).collect(),
-        server_statuses: Arc::new((0..server_count).map(|_| AtomicU8::new(ServerStatus::Up as u8)).collect()),
+        server_statuses: Arc::new(be.servers.iter().map(|s| AtomicU8::new(initial_status(s))).collect()),
         server_weights: be.servers.iter().map(|s| s.weight.unwrap_or(1)).collect(),
         next_server_idx: Arc::new(AtomicUsize::new(0)),
         stats: Arc::new((0..nbthread).map(|_| ProxyStats::default()).collect()),
@@ -1483,6 +1503,9 @@ fn init_proxy_from_backend(proxy_idx: usize, be: &ibex_config::BackendSection, n
         },
         default_backend: None,
         use_backends: Vec::new(),
+        use_servers: be.use_servers.clone(),
+        force_be_switch: Vec::new(),
+        disabled_backends: Arc::default(),
         monitor_uri: None,
         acls: compile_acls(&be.acls),
         stick_table,
@@ -1536,6 +1559,10 @@ fn init_checks(proxies: &[Proxy], scheduler: &mut Scheduler, now: Tick) -> Vec<S
                 continue;
             };
             let mut check = ServerCheckState::new(proxy_idx, server_idx, srv_addr, check_cfg, now);
+            // A `disabled` server stays in maintenance whatever its checks find.
+            if proxy.server_statuses.get(server_idx).is_some_and(|s| s.load(Ordering::Relaxed) == ServerStatus::Maint as u8) {
+                check.status = ServerStatus::Maint;
+            }
             let check_idx = usize_to_u32(checks.len());
             if let Some(task_ref) = scheduler.create(WorkKind::new(Kind::Check, check_idx)) {
                 check.task = task_ref;
@@ -1588,6 +1615,16 @@ impl Engine {
     }
     for frontend in &config.frontends {
         if !frontend.disabled { proxies.push(init_proxy_from_frontend(proxies.len(), frontend, nbthread)); }
+    }
+    let disabled: Arc<Vec<String>> = Arc::new(
+        config.listens.iter().map(|l| (l.disabled, &l.name))
+            .chain(config.backends.iter().map(|b| (b.disabled, &b.name)))
+            .filter(|(d, _)| *d)
+            .map(|(_, n)| n.clone())
+            .collect(),
+    );
+    for p in &mut proxies {
+        p.disabled_backends = Arc::clone(&disabled);
     }
     let _ = resolve_log_targets(config, &mut proxies);
     Ok(proxies)
@@ -3634,6 +3671,8 @@ fn init_client_session(
         }
     }
 
+    // `use-server` of a proxy that serves directly (a TCP `listen`).
+    let use_server = EngineDispatcher::use_server(&sess, proxy_idx, proxies);
     let proxy = &mut proxies[proxy_idx];
 
     let has_inspect = proxy.tcp_req_inspect_delay.is_some() || !proxy.tcp_req_content_rules.is_empty();
@@ -3665,7 +3704,10 @@ fn init_client_session(
         && proxy.use_backends.is_empty()
         && proxy.default_backend.is_none()
     {
-        target_addr = proxy.select_server_with_key(sess.client_addr.map(|a| a.ip()), sess.req_uri.as_deref());
+        target_addr = match use_server {
+            Some(i) => Some(proxy.servers[i]),
+            None => proxy.select_server_with_key(sess.client_addr.map(|a| a.ip()), sess.req_uri.as_deref()),
+        };
         if let Some(target) = target_addr {
             let proxies: &[Proxy] = proxies;
             let proxy = &proxies[proxy_idx];
@@ -3991,7 +4033,7 @@ fn retry_server_connect(
         }
     }
 
-    let be_idx = EngineDispatcher::resolve_backend(entry, proxies);
+    let be_idx = EngineDispatcher::resolve_backend(entry, proxies).unwrap_or(entry.proxy_idx);
     entry.backend_idx = be_idx;
     let source_ip = entry.sess.client_addr.map(|a| a.ip());
     let be = &proxies[be_idx];
@@ -4155,7 +4197,7 @@ fn check_srv_connect(
                         entry.srv_interest = new_interest;
                     }
                 } else {
-                    let be_idx = EngineDispatcher::resolve_backend(entry, proxies);
+                    let be_idx = EngineDispatcher::resolve_backend(entry, proxies).unwrap_or(entry.proxy_idx);
                     proxies[be_idx].stats[worker_id()].failed_conn.fetch_add(1, Ordering::Relaxed);
                     if entry.sess.server_failed() {
                         retry_server_connect(entry, proxies, fdtab, poller, now);
@@ -4287,42 +4329,58 @@ fn inject_connection_close_header_zero_alloc(buf: &mut crate::buf::Buf) {
 }
 
 impl EngineDispatcher<'_> {
-    fn resolve_backend(entry: &SessionEntry, proxies: &[Proxy]) -> usize {
+    /// What the sample fetches of a request rule see: the session, the proxy whose rules
+    /// run (for its counters), and the proxies' state.
+    fn request_ctx<'a>(sess: &'a TcpSession, proxy: &Proxy, view: &'a ProxiesView<'a>, stick: &'a StickView<'a>) -> SampleContext<'a> {
+        SampleContext {
+            proxies: Some(view),
+            stick: Some(stick),
+            client_addr: sess.client_addr,
+            server_addr: sess.server_addr,
+            fc_src: sess.fc_src,
+            fc_dst: sess.fc_dst,
+            is_first_req: sess.is_first_req,
+            proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
+            req_body: if sess.req.readable().is_empty() {
+                None
+            } else {
+                Some(sess.req.readable())
+            },
+            htx: None,
+            htx_slice: sess.htx_slice(),
+            req_uri: sess.req_uri.as_deref(),
+            req_method: sess.req_method.as_deref(),
+            req_headers: sess.req_headers.as_deref(),
+            act_conn: proxy.stats[worker_id()].act_conn.load(Ordering::Relaxed),
+            unique_id: sess.log.unique_id.as_deref(),
+            captures_req_hdr: Some(&sess.log.req_captures),
+            captures_res_hdr: Some(&sess.log.res_captures),
+            ..Default::default()
+        }
+    }
+
+    /// The backend a request goes to: the first `use_backend` rule that holds and names a
+    /// backend that is enabled, else the default backend, else the proxy itself.
+    ///
+    /// `None` is a request that `force-be-switch` sent to a backend the configuration
+    /// disables (`process_switching_rules`, `src/stream.c`): `HAProxy` runs the request
+    /// in that backend, which has no server to give.
+    fn resolve_backend(entry: &SessionEntry, proxies: &[Proxy]) -> Option<usize> {
         let proxy_idx = entry.proxy_idx;
         let proxy = &proxies[proxy_idx];
 
         if proxy.use_backends.is_empty() && proxy.default_backend.is_none() {
-            return proxy_idx;
+            return Some(proxy_idx);
         }
 
+        let view = ProxiesView(proxies);
         let stick = StickView::new(proxies, &entry.sess.tracked_sc);
-        let ctx = SampleContext {
-            proxies: Some(&ProxiesView(proxies)),
-            stick: Some(&stick),
-            client_addr: entry.sess.client_addr,
-            server_addr: entry.sess.server_addr,
-            fc_src: entry.sess.fc_src,
-            fc_dst: entry.sess.fc_dst,
-            is_first_req: entry.sess.is_first_req,
-            proxy_tlvs: entry.sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
-            req_body: if entry.sess.req.readable().is_empty() {
-                None
-            } else {
-                Some(entry.sess.req.readable())
-            },
-            htx: None,
-            htx_slice: entry.sess.htx_slice(),
-            req_uri: entry.sess.req_uri.as_deref(),
-            req_method: entry.sess.req_method.as_deref(),
-            req_headers: entry.sess.req_headers.as_deref(),
-            act_conn: proxy.stats[worker_id()].act_conn.load(Ordering::Relaxed),
-            unique_id: entry.sess.log.unique_id.as_deref(),
-            captures_req_hdr: Some(&entry.sess.log.req_captures),
-            captures_res_hdr: Some(&entry.sess.log.res_captures),
-            ..Default::default()
-        };
-
+        let ctx = Self::request_ctx(&entry.sess, proxy, &view, &stick);
         let registry = sample_registry();
+        // `lookup_fe_persist_rules`: the frontend's `force-be-switch` conditions.
+        let forced = || {
+            proxy.force_be_switch.iter().any(|c| crate::proxy::eval_acl_condition(c, &proxy.acls, registry, &ctx))
+        };
 
         for rule in &proxy.use_backends {
             let mut matches = true;
@@ -4331,18 +4389,50 @@ impl EngineDispatcher<'_> {
             }
             if matches {
                 if let Some(idx) = proxies.iter().position(|p| p.name == rule.backend) {
-                    return idx;
+                    return Some(idx);
+                }
+                if proxy.disabled_backends.contains(&rule.backend) && forced() {
+                    return None;
                 }
             }
         }
 
         if let Some(ref def_name) = proxy.default_backend {
             if let Some(idx) = proxies.iter().position(|p| p.name == *def_name) {
-                return idx;
+                return Some(idx);
+            }
+            if proxy.disabled_backends.contains(def_name) && forced() {
+                return None;
             }
         }
 
-        proxy_idx
+        Some(proxy_idx)
+    }
+
+    /// `process_server_rules` (`src/stream.c`): the server a `use-server` rule of backend
+    /// `be_idx` picks for this request, bypassing the balance algorithm. The first rule
+    /// whose condition holds and whose server is not stopped (down or in maintenance; a
+    /// draining one is still picked) wins; a stopped server's rule is skipped for the next.
+    fn use_server(sess: &TcpSession, be_idx: usize, proxies: &[Proxy]) -> Option<usize> {
+        let be = &proxies[be_idx];
+        if be.use_servers.is_empty() {
+            return None;
+        }
+        let view = ProxiesView(proxies);
+        let stick = StickView::new(proxies, &sess.tracked_sc);
+        let ctx = Self::request_ctx(sess, be, &view, &stick);
+        let registry = sample_registry();
+        for rule in &be.use_servers {
+            if !crate::proxy::eval_acl_condition(&rule.cond, &be.acls, registry, &ctx) {
+                continue;
+            }
+            let Some(i) = be.server_ids.iter().position(|s| *s == rule.server) else { continue };
+            let st = be.server_statuses.get(i).map_or(ServerStatus::Down, |s| ServerStatus::from(s.load(Ordering::Relaxed)));
+            if !matches!(st, ServerStatus::Down | ServerStatus::Maint) {
+                return Some(i);
+            }
+        }
+        None
     }
 
     /// One pass over the HTTP transaction, after the byte layer has run: the reply owed
@@ -6133,7 +6223,13 @@ impl EngineDispatcher<'_> {
         }
 
         // 3. Resolve backend and server
-        let be_idx = Self::resolve_backend(entry, proxies);
+        let Some(be_idx) = Self::resolve_backend(entry, proxies) else {
+            // `force-be-switch` sent the request to a disabled backend: no server.
+            entry.backend_idx = proxy_idx;
+            proxies[proxy_idx].stats[worker_id()].failed_conn.fetch_add(1, Ordering::Relaxed);
+            reply_error(entry, proxies, 503);
+            return None;
+        };
         entry.backend_idx = be_idx;
         // `stream_set_backend` counts the stream for the backend (`proxy_inc_be_ctr`).
         proxies[be_idx].stats[worker_id()].be_sess_rate.tick();
@@ -6251,6 +6347,9 @@ impl EngineDispatcher<'_> {
         let source_ip = entry.sess.client_addr.map(|a| a.ip());
         // The backend's `cookie` line: the client's cookies are cut and may name the server.
         let cookie_server = manage_client_cookies(&mut entry.sess, &proxies[be_idx]);
+        // `use-server` comes first: a server it picked (SF_ASSIGNED) is not overridden by
+        // the cookie, which is still cut as above.
+        let cookie_server = Self::use_server(&entry.sess, be_idx, proxies).or(cookie_server);
         let target = if let Some(idx) = cookie_server {
             Some(proxies[be_idx].servers[idx])
         } else {
@@ -6404,7 +6503,11 @@ impl EngineDispatcher<'_> {
         poller: &mut Poller,
         now: Tick,
     ) {
-        let be_idx = Self::resolve_backend(entry, proxies);
+        let Some(be_idx) = Self::resolve_backend(entry, proxies) else {
+            // `force-be-switch` sent the connection to a disabled backend: no server.
+            entry.sess.srv_state = ScState::Error;
+            return;
+        };
         entry.backend_idx = be_idx;
         // `stream_set_backend` counts the stream for the backend (`proxy_inc_be_ctr`).
         proxies[be_idx].stats[worker_id()].be_sess_rate.tick();
@@ -6442,7 +6545,10 @@ impl EngineDispatcher<'_> {
         }
 
         let source_ip = entry.sess.client_addr.map(|a| a.ip());
-        let target = proxies[be_idx].select_server_with_key(source_ip, entry.sess.req_uri.as_deref());
+        let target = match Self::use_server(&entry.sess, be_idx, proxies) {
+            Some(i) => Some(proxies[be_idx].servers[i]),
+            None => proxies[be_idx].select_server_with_key(source_ip, entry.sess.req_uri.as_deref()),
+        };
 
         let Some(target_addr) = target else {
             entry.sess.srv_state = ScState::Error;
