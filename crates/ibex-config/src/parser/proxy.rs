@@ -742,7 +742,7 @@ pub(crate) fn parse_backend_directive(
 /// A keyword Ibex handles is read here; every other one goes to
 /// `bind_keywords::unimplemented_bind_keyword`, which refuses it or skips it and its
 /// argument with a warning, and refuses an unknown one as `HAProxy` does.
-fn parse_bind(tokens: &[Token], kw: &Token, section: &str) -> Result<BindConfig, ConfigError> {
+pub(crate) fn parse_bind(tokens: &[Token], kw: &Token, section: &str) -> Result<BindConfig, ConfigError> {
     if tokens.len() < 2 || tokens[1].text.is_empty() {
         return Err(ConfigError::new(
             kw.line,

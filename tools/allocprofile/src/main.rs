@@ -120,6 +120,27 @@ fn main() {
             contimeout: Some(Duration::from_secs(5)), srvtimeout: Some(Duration::from_secs(5)),
             servers: vec![Server::new("s1", sa)], ..Default::default() }],
         ..Default::default() };
+    // `ALLOCPROFILE_LOG=ring` (or `udp`) profiles the request with an access log written to a
+    // `ring` section (or a UDP collector), to show where the log line's allocations are.
+    let cfg = match std::env::var("ALLOCPROFILE_LOG").ok().as_deref() {
+        Some(kind) => {
+            let collector = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let (ring, log) = if kind == "ring" {
+                ("ring r\n  size 65536\n".to_string(), "  log ring@r local0\n".to_string())
+            } else {
+                (String::new(), format!("  log {} local0\n", collector.local_addr().unwrap()))
+            };
+            let text = format!(
+                "{ring}frontend fe\n  mode http\n  option httplog\n  bind {fa}\n  timeout client 5s\n{log}  default_backend be\n\
+                 backend be\n  mode http\n  timeout connect 5s\n  timeout server 5s\n  server s1 {sa}\n"
+            );
+            let cfg = ibex_config::parse_str(&text).unwrap();
+            ibex_rt::logfwd::start(&cfg).unwrap();
+            std::mem::forget(collector);
+            cfg
+        }
+        None => cfg,
+    };
     let mut e = Engine::new(&cfg, 64).unwrap();
     drive(fa, &mut e);
     SITES.with(|s| s.borrow_mut().clear());

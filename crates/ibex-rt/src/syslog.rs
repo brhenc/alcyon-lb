@@ -20,9 +20,33 @@
 //! `PRI` is `facility * 8 + severity`, which is why both are carried per target rather
 //! than being a single number.
 
-use ibex_config::{LogConfig, LogFacility, LogLevel, LogSample, LogTarget};
+use ibex_config::{LogConfig, LogFacility, LogLevel, LogSample, LogTarget, RingFormat};
+use std::cell::RefCell;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+use crate::loghdr::{build_header, Meta};
+use crate::ring::Ring;
+
+thread_local! {
+    /// The line being built, reused so that sending one allocates nothing once warm.
+    static LINE: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Writes `line` and a line feed to a descriptor, and flushes.
+fn write_line(out: &mut impl std::io::Write, line: &mut Vec<u8>) -> bool {
+    line.push(b'\n');
+    out.write_all(line).is_ok() && out.flush().is_ok()
+}
+
+/// Splits the `name[pid]` tag the engine hands over into its two header fields.
+fn split_tag(tag: &str) -> (&str, &str) {
+    match tag.strip_suffix(']').and_then(|t| t.rsplit_once('[')) {
+        Some((name, pid)) => (name, pid),
+        None => (tag, ""),
+    }
+}
 
 /// Numeric facility code, as RFC 3164 defines them.
 #[must_use]
@@ -90,6 +114,8 @@ enum Sink {
     Stdout,
     /// The process's own standard error.
     Stderr,
+    /// A `ring` section's buffer (`ring@<name>`).
+    Ring(Arc<Ring>),
     /// Configured but unwritable: `fd@<n>` for some other descriptor, or a unix socket
     /// path. Lines are dropped rather than sent somewhere they were not addressed to.
     ///
@@ -119,6 +145,9 @@ pub struct SyslogTarget {
     /// `sample <ranges>:<size>`. Which lines it keeps depends on a cursor that belongs to
     /// each proxy, not to the target: see [`sample_admits`].
     sample: Option<Box<LogSample>>,
+    /// `format <fmt>`: the header the line is written under. `None` lets the message's own
+    /// fields choose it (`LOG_FORMAT_UNSPEC`).
+    format: Option<RingFormat>,
 }
 
 impl SyslogTarget {
@@ -138,6 +167,13 @@ impl SyslogTarget {
                 });
                 Sink::Udp(*addr, sock)
             }
+            LogTarget::Ring(name) => match crate::ring::find(name) {
+                Some(r) => Sink::Ring(r),
+                None => {
+                    eprintln!("[ibex] warning: log target ring@{name} names no ring section; these lines are dropped");
+                    Sink::Discard
+                }
+            },
             LogTarget::Fd(1) => Sink::Stdout,
             LogTarget::Fd(2) => Sink::Stderr,
             LogTarget::Fd(other) => {
@@ -162,6 +198,7 @@ impl SyslogTarget {
             max_len: cfg.max_len,
             sink,
             sample: cfg.sample.clone(),
+            format: cfg.format.as_deref().and_then(RingFormat::from_name),
         }
     }
 
@@ -176,53 +213,60 @@ impl SyslogTarget {
     /// Returns whether the datagram was handed to the kernel, which is useful in tests
     /// but is not a delivery guarantee -- UDP never gives one.
     #[must_use]
-    pub fn send(&self, level: LogLevel, tag: &str, hostname: &str, msg: &str) -> bool {
+    pub fn send(&self, level: LogLevel, tag: &str, hostname: &str, msg: impl AsRef<[u8]>) -> bool {
         if !self.accepts(level) {
             return false;
         }
-        let mut line = format_rfc3164(priority(self.facility, level), tag, hostname, msg);
-        if line.len() > self.max_len {
-            // On a char boundary, so the result is still a valid line rather than a
-            // partial UTF-8 sequence a collector will reject.
-            let mut cut = self.max_len;
-            while cut > 0 && !line.is_char_boundary(cut) {
-                cut -= 1;
-            }
-            line.truncate(cut);
-        }
+        let (name, pid) = split_tag(tag);
+        let meta = Meta { host: hostname.as_bytes(), tag: name.as_bytes(), pid: pid.as_bytes(), ..Meta::default() };
+        self.deliver(level_code(level), facility_code(self.facility), &meta, msg.as_ref())
+    }
+
+    /// Sends a message that carries its own header fields, as a `log-forward` section does:
+    /// the line is written under this target's `format`, or the one `meta` calls for.
+    /// The level filter and sampling are the caller's.
+    #[must_use]
+    pub fn send_meta(&self, level: u8, facility: u8, meta: &Meta, msg: &[u8]) -> bool {
+        self.deliver(level, facility, meta, msg)
+    }
+
+    fn deliver(&self, level: u8, facility: u8, meta: &Meta, msg: &[u8]) -> bool {
         match &self.sink {
-            Sink::Udp(addr, Some(sock)) => sock.send_to(line.as_bytes(), *addr).is_ok(),
+            Sink::Ring(ring) => {
+                ring.write(facility, level, meta, self.max_len, msg);
+                true
+            }
             // A UDP target whose socket would not bind, and anything configured but
-            // unwritable. Both drop the line; neither is worth a separate arm.
-            Sink::Udp(_, None) | Sink::Discard => false,
-            // A newline terminates the record: a descriptor is a stream, so unlike a
-            // datagram there is no frame boundary to mark the end of the line.
-            // Flushed on every line. Rust's stdout is block-buffered when it is a pipe,
-            // which is exactly how a supervisor or container runtime collects it, so
-            // without this the logs appear in 8 KiB bursts or not at all before a
-            // restart. A log nobody sees until the buffer fills is not a log.
-            //
-            // One `write` per line either way: the flush pushes the same bytes the
-            // write_all just buffered, and a syslog line is far below any coalescing
-            // worth having.
-            Sink::Stdout => {
-                line.push('\n');
-                let mut out = std::io::stdout().lock();
-                std::io::Write::write_all(&mut out, line.as_bytes()).is_ok()
-                    && std::io::Write::flush(&mut out).is_ok()
-            }
-            Sink::Stderr => {
-                line.push('\n');
-                let mut out = std::io::stderr().lock();
-                std::io::Write::write_all(&mut out, line.as_bytes()).is_ok()
-                    && std::io::Write::flush(&mut out).is_ok()
-            }
+            // unwritable.
+            Sink::Discard | Sink::Udp(_, None) => false,
+            Sink::Udp(addr, Some(sock)) => self.with_line(level, facility, meta, msg, |line| sock.send_to(line, *addr).is_ok()),
+            // A descriptor is a stream, so unlike a datagram there is no frame boundary to mark
+            // the end of the line: a newline terminates the record.
+            // Flushed on every line. Rust's stdout is block-buffered when it is a pipe, which is
+            // exactly how a supervisor or container runtime collects it, so without this the logs
+            // appear in 8 KiB bursts or not at all before a restart. A log nobody sees until the
+            // buffer fills is not a log.
+            Sink::Stdout => self.with_line(level, facility, meta, msg, |line| write_line(&mut std::io::stdout().lock(), line)),
+            Sink::Stderr => self.with_line(level, facility, meta, msg, |line| write_line(&mut std::io::stderr().lock(), line)),
         }
+    }
+
+    /// Builds the line (header, then the message cut to `len`) in the per-thread buffer and
+    /// hands it to `f`.
+    fn with_line<R>(&self, level: u8, facility: u8, meta: &Meta, msg: &[u8], f: impl FnOnce(&mut Vec<u8>) -> R) -> R {
+        LINE.with(|line| {
+            let mut line = line.borrow_mut();
+            line.clear();
+            build_header(&mut line, self.format, facility, level, meta);
+            line.extend_from_slice(msg);
+            line.truncate(self.max_len);
+            f(&mut line)
+        })
     }
 
     /// Sends at this target's configured default level.
     #[must_use]
-    pub fn send_default(&self, tag: &str, hostname: &str, msg: &str) -> bool {
+    pub fn send_default(&self, tag: &str, hostname: &str, msg: impl AsRef<[u8]>) -> bool {
         self.send(self.default_level, tag, hostname, msg)
     }
 
@@ -243,6 +287,7 @@ impl SyslogTarget {
         match (&self.sink, &cfg.target) {
             (Sink::Udp(a, _), LogTarget::Udp(b)) => a == b,
             (Sink::Stdout, LogTarget::Fd(1)) | (Sink::Stderr, LogTarget::Fd(2)) => true,
+            (Sink::Ring(r), LogTarget::Ring(n)) => r.name == *n,
             _ => false,
         }
     }
@@ -257,9 +302,16 @@ impl SyslogTarget {
             && self.max_level == cfg.level.unwrap_or(LogLevel::Debug)
             && self.max_len == cfg.max_len
             && self.sample == cfg.sample
+            && self.format == cfg.format.as_deref().and_then(RingFormat::from_name)
     }
 
     /// The `sample` setting, if any.
+    /// The most verbose level this target takes (its `log` line's `<level>`).
+    #[must_use]
+    pub const fn max_level(&self) -> LogLevel {
+        self.max_level
+    }
+
     #[must_use]
     pub fn sample(&self) -> Option<&LogSample> {
         self.sample.as_deref()

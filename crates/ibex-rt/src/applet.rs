@@ -294,6 +294,16 @@ impl CliApplet {
             if self.interactive {
                 self.out_buf.extend_from_slice(b"\n> ");
             }
+        } else if cmd == "show events" || cmd.starts_with("show events ") {
+            let args: Vec<&str> = cmd["show events".len()..].split_whitespace().collect();
+            let events = crate::ring::show_events(&args);
+            self.out_buf.extend_from_slice(&events);
+            if self.interactive {
+                self.out_buf.extend_from_slice(b"\n> ");
+            } else {
+                self.out_buf.push(b'\n');
+                self.is_done = true;
+            }
         } else if cmd == "show info" || cmd.starts_with("show info ") {
             self.handle_show_info(ctx);
         } else if cmd == "show env" {
@@ -1289,6 +1299,7 @@ impl CliApplet {
                       prompt                                     : Switch session to interactive prompt mode\n\
                       quit                                       : Disconnect CLI session\n\
                       set timeout cli <sec>                      : Set CLI session idle timeout\n\
+                      show events [-0rsn] [<sink>]               : List the event sinks, or dump a ring\n\
                       show info                                  : Dump system statistics\n\
                       show pools                                 : Report information about the memory pools usage\n\
                       show stat [<iid> <type> <sid>]             : Dump CSV proxies and servers statistics\n\

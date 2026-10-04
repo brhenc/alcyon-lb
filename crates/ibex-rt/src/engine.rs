@@ -801,7 +801,7 @@ pub struct SessionEntry {
     /// kept in the server's safe list (`http-reuse`).
     pub srv_served: u8,
     /// A finished transaction's log line, waiting to be sent to its frontend's targets.
-    pub log_line: Option<String>,
+    pub log_line: Option<Vec<u8>>,
 }
 
 /// Per-thread storage for active sessions.
@@ -1418,7 +1418,7 @@ fn session_log_data<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, pid: u3
 
 /// The stream's log line, when its frontend logs (`HAProxy` logs nothing without a
 /// `log` target).
-fn stream_log_line(entry: &SessionEntry, proxies: &[Proxy], pid: u32) -> Option<String> {
+fn stream_log_line(entry: &SessionEntry, proxies: &[Proxy], pid: u32) -> Option<Vec<u8>> {
     let fe = &proxies[entry.proxy_idx];
     let fmt = fe.log_format.as_ref()?;
     if fe.log_target_idx.is_empty() {
@@ -1427,7 +1427,7 @@ fn stream_log_line(entry: &SessionEntry, proxies: &[Proxy], pid: u32) -> Option<
     let be = proxies.get(entry.backend_idx).unwrap_or(fe);
     // `status` is the transaction's (`txn->status`, as `%ST`), not whatever response the
     // thread rewrote last (T152).
-    let line = fmt.render(&stream_log_data(entry, proxies, entry.proxy_idx, pid), sample_registry(), &SampleContext { at_log: true, res_status: entry.sess.txn.as_ref().map(|t| t.status).or(entry.sess.log.status).filter(|&s| s > 0), ..stream_sample_ctx(&entry.sess, fe, be, &ProxiesView(proxies), &StickView::new(proxies, &entry.sess.tracked_sc)) });
+    let line = fmt.render_bytes(&stream_log_data(entry, proxies, entry.proxy_idx, pid), sample_registry(), &SampleContext { at_log: true, res_status: entry.sess.txn.as_ref().map(|t| t.status).or(entry.sess.log.status).filter(|&s| s > 0), ..stream_sample_ctx(&entry.sess, fe, be, &ProxiesView(proxies), &StickView::new(proxies, &entry.sess.tracked_sc)) });
     fe.log_count.fetch_add(1, Ordering::Relaxed);
     Some(line)
 }
@@ -2350,6 +2350,7 @@ impl Engine {
         p.disabled_backends = Arc::clone(&disabled);
     }
     crate::track::attach(&mut proxies, config);
+    crate::logfwd::start(config)?;
     let _ = resolve_log_targets(config, &mut proxies);
     Ok(proxies)
 }
@@ -2481,6 +2482,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             proxy_idx += 1;
         }
 
+        crate::logfwd::start(config)?;
         let log_targets = resolve_log_targets(config, &mut proxies);
 
         let start_time = Instant::now();
@@ -6086,7 +6088,7 @@ impl EngineDispatcher<'_> {
                 // A refused PROXY header has its own line, never the frontend's format.
                 if proxy_header_failure(&e.sess).is_some() {
                     e.log_line = None;
-                    return proxy_header_error_line(e, self.proxies).map(|l| (e.proxy_idx, l));
+                    return proxy_header_error_line(e, self.proxies).map(|l| (e.proxy_idx, l.into_bytes()));
                 }
                 e.log_line
                     .take()
@@ -8098,7 +8100,7 @@ impl EngineDispatcher<'_> {
             });
 
             if let Some(msg) = log {
-                self.send_log(proxy_idx, LogLevel::Notice, &msg);
+                self.send_log(proxy_idx, LogLevel::Notice, msg.as_bytes());
             }
 
             self.timer_updates.push(pending);
@@ -8113,11 +8115,11 @@ impl EngineDispatcher<'_> {
     /// Silent when the proxy has no targets, which is the common case: `HAProxy` logs
     /// nothing unless a `log` directive says where to.
     /// A transaction's or connection's log line, at `info` as `HAProxy` sends them.
-    fn send_log_line(&self, proxy_idx: usize, line: &str) {
+    fn send_log_line(&self, proxy_idx: usize, line: &[u8]) {
         self.send_log(proxy_idx, LogLevel::Info, line);
     }
 
-    fn send_log(&self, proxy_idx: usize, level: LogLevel, msg: &str) {
+    fn send_log(&self, proxy_idx: usize, level: LogLevel, msg: &[u8]) {
         let Some(proxy) = self.proxies.get(proxy_idx) else {
             return;
         };

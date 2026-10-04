@@ -753,6 +753,24 @@ fn parse_header_field_borrowed(line: &str) -> io::Result<(&str, &str)> {
 mod tests {
     use super::*;
 
+    /// A header value that is not UTF-8 is a 400, whatever the header. The rest of the proxy reads
+    /// headers as text (ACLs, fetches, rule actions); a header it cannot read but the server
+    /// receives would walk around `http-request deny if { req.hdr(x-admin) -m found }` (T158).
+    #[test]
+    fn a_header_value_that_is_not_utf8_is_refused_for_every_header() {
+        for name in [
+            "x-admin", "Content-Length", "transfer-encoding", "Connection", "PROXY-CONNECTION", "keep-alive",
+            "Host", "Expect", "upgrade", "TE", "Trailer", "Cookie", "Forwarded",
+        ] {
+            let mut raw = b"POST / HTTP/1.1\r\nHost: h\r\n".to_vec();
+            raw.extend_from_slice(name.as_bytes());
+            raw.extend_from_slice(b": 5\xff\r\n\r\n");
+            let mut buf = [0u8; 4096];
+            let mut htx = HtxSlice::new(&mut buf);
+            assert!(H1Parser::new(false).parse(&raw, &mut htx).is_err(), "{name}");
+        }
+    }
+
     #[test]
     fn parse_http_get_request() {
         let req =

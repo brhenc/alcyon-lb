@@ -147,8 +147,7 @@ fn what_haproxy_refuses_or_ibex_does_not_render_is_a_config_error() {
         ("%{+Q}", "parse argument modifier without alias name"),
         ("%OG", "not implemented"),
         ("%sslv", "not implemented"),
-        ("%{+E}r", "not implemented"),
-        ("%(name)ci", "not implemented"),
+        ("%(name:raw)[int(1)]", "not implemented"),
         ("abc %", "truncated"),
     ] {
         let err = LogFormat::compile(fmt, reg).expect_err(fmt);

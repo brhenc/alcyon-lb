@@ -71,6 +71,8 @@ pub enum LogTarget {
     Fd(i32),
     /// A unix datagram socket path.
     Unix(String),
+    /// `ring@<name>`: the events go into that `ring` section's buffer.
+    Ring(String),
 }
 
 impl LogTarget {

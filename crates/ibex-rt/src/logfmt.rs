@@ -159,6 +159,21 @@ struct Opts {
     hex: bool,
     /// `LOG_OPT_MANDATORY` (`+M`): an empty or absent value prints `-`.
     mandatory: bool,
+    /// `+E`: `"`, `\` and `]` get a backslash (`rfc5424_escape_map`).
+    esc: bool,
+    /// `+json`, `+cbor`: the value is encoded; given to `%o`, the whole line is.
+    json: bool,
+    cbor: bool,
+    /// `+bin`: CBOR as raw bytes instead of hex text.
+    bin: bool,
+    /// `+utf8`: valid UTF-8 passes through a JSON string.
+    utf8: bool,
+}
+
+impl Opts {
+    const fn encoded(self) -> bool {
+        self.json || self.cbor
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -294,40 +309,112 @@ const ALIASES: &[(&str, Option<Alias>)] = &[
     ("tsc", Some(Alias::TermStateCk)),
 ];
 
+/// What `%(name:type)` asks of an expression's value when the line is encoded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+enum Cast {
+    #[default]
+    Same,
+    Str,
+    Sint,
+    Bool,
+}
+
+/// `%(name:type)`: the key an encoded line (`%{+json}o`, `%{+cbor}o`) gives the value, and the
+/// type it is forced to. Without `%o` an encoded line has no keys and the name is unused.
+#[derive(Clone, Debug, Default)]
+struct Named {
+    name: Option<Box<str>>,
+    cast: Cast,
+}
+
 #[derive(Clone, Debug)]
 enum Node {
     Text(String),
-    Alias(Alias, Opts),
-    Expr(Box<Expr>, Opts),
+    /// Boxed: a node with no `%(name)` is most of them, and a proxy holds a few dozen.
+    Alias(Alias, Opts, Option<Box<Named>>),
+    Expr(Box<Expr>, Opts, Option<Box<Named>>),
 }
 
 /// A compiled log-format string.
 #[derive(Clone, Debug)]
 pub struct LogFormat {
-    nodes: Vec<Node>,
+    /// A boxed slice, so that with `global` this is no larger than a `Vec`: every proxy holds
+    /// two of these.
+    nodes: Box<[Node]>,
+    /// The options `%o` gave, for the whole line: whether it is a JSON object or a CBOR map.
+    global: Opts,
 }
 
 /// Applies `%{+Q,-X,...}` to `opts` (`parse_logformat_node_args`). Unknown names are
-/// ignored, as `HAProxy` ignores them; flags it has that Ibex does not render are refused.
-fn apply_flags(arg: &str, opts: Opts) -> Result<Opts, String> {
-    let mut signed = arg.split(',').filter_map(|item| match item.as_bytes().first() {
+/// ignored, as `HAProxy` ignores them.
+fn apply_flags(arg: &str, opts: Opts) -> Opts {
+    let signed = arg.split(',').filter_map(|item| match item.as_bytes().first() {
         Some(b'+') => Some((true, &item[1..])),
         Some(b'-') => Some((false, &item[1..])),
         _ => None,
     });
-    signed.try_fold(opts, |mut opts, (add, name)| {
-        if name == "Q" {
-            opts.quote = add;
-        } else if name == "X" {
-            opts.hex = add;
-        } else if name == "M" {
-            opts.mandatory = add;
-        } else if add && matches!(name, "E" | "bin" | "utf8" | "json" | "cbor") {
-            return Err(format!("log-format option '+{name}' is not implemented"));
+    signed.fold(opts, |mut opts, (add, name)| {
+        match name {
+            "Q" => opts.quote = add,
+            "X" => opts.hex = add,
+            "M" => opts.mandatory = add,
+            "E" => opts.esc = add,
+            "json" => opts.json = add,
+            "cbor" => opts.cbor = add,
+            "bin" => opts.bin = add,
+            "utf8" => opts.utf8 = add,
+            _ => {}
         }
-        Ok(opts)
+        opts
     })
 }
+
+/// `lf_expr_postcheck_node_opt`: a node's encoding is the line's when the line has one, `bin`
+/// is only ever the line's, and an encoded value takes no `+E`.
+fn settle(mut node: Opts, global: Opts) -> Opts {
+    if global.encoded() {
+        node.json = global.json;
+        node.cbor = global.cbor;
+    }
+    node.bin = global.bin;
+    if node.encoded() {
+        node.esc = false;
+    }
+    node
+}
+
+/// The aliases whose value is a number: an encoded line carries them as one.
+const NUMERIC: &[Alias] = &[
+    Alias::Bytes,
+    Alias::BytesUp,
+    Alias::Status,
+    Alias::TActive,
+    Alias::TConnect,
+    Alias::THandshake,
+    Alias::TIdle,
+    Alias::TRequestTotal,
+    Alias::TResponse,
+    Alias::TRequest,
+    Alias::TData,
+    Alias::Timestamp,
+    Alias::Ms,
+    Alias::Retries,
+    Alias::TTotal,
+    Alias::TUser,
+    Alias::TQueue,
+    Alias::ActConn,
+    Alias::BeConn,
+    Alias::BeQueue,
+    Alias::ClientPort,
+    Alias::FeConn,
+    Alias::FrontendPort,
+    Alias::LogCount,
+    Alias::Pid,
+    Alias::Counter,
+    Alias::SrvConn,
+    Alias::ServerPort,
+    Alias::SrvQueue,
+];
 
 impl LogFormat {
     /// Compiles `fmt`, checking every expression's fetch and converters against
@@ -350,11 +437,42 @@ impl LogFormat {
         Self::compile_with(fmt, registry, false)
     }
 
+    /// `%(name[:type])`, at `i` (the `(`): the name and cast, and where they end.
+    fn parse_name(fmt: &str, i: usize) -> Result<(Named, usize), String> {
+        let rest = &fmt[i + 1..];
+        let Some(close) = rest.find(')') else {
+            return Err(format!("truncated line after '{}'", &fmt[i..]));
+        };
+        let inner = &rest[..close];
+        let (name, ty) = inner.split_once(':').map_or((inner, None), |(n, t)| (n, Some(t)));
+        if let Some(c) = name.chars().find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))) {
+            return Err(format!(
+                "invalid character in custom name near '{c}' at position {} line : '{fmt}'",
+                i + 1 + name.find(c).unwrap_or(0)
+            ));
+        }
+        let cast = match ty {
+            None => Cast::Same,
+            Some("str") => Cast::Str,
+            Some("sint") => Cast::Sint,
+            Some("bool") => Cast::Bool,
+            Some("raw") => return Err("log-format output type 'raw' is not implemented".to_string()),
+            Some(t) => {
+                return Err(format!(
+                    "unexpected output type '{t}' at position {} line : '{fmt}'. Supported types are: str, sint, bool, raw",
+                    i + 2 + name.len()
+                ));
+            }
+        };
+        Ok((Named { name: Some(name.into()), cast }, i + close + 2))
+    }
+
     fn compile_with(fmt: &str, registry: &Registry, mandatory: bool) -> Result<Self, String> {
         let b = fmt.as_bytes();
         let mut nodes = Vec::new();
         let mut text = String::new();
         let mut defaults = Opts { mandatory, ..Opts::default() };
+        let mut global = defaults;
         let mut i = 0;
         while i < b.len() {
             if b[i] != b'%' {
@@ -365,6 +483,29 @@ impl LogFormat {
             }
             i += 1;
             let mut opts = defaults;
+            let mut named = Named::default();
+            if b.get(i) == Some(&b'(') {
+                (named, i) = Self::parse_name(fmt, i)?;
+                // After a name: an argument, an expression or an alias. A `%` is a literal one, a
+                // blank or a digit is refused, and any other character is text, the name
+                // dropped (`LF_EDONAME`).
+                match b.get(i) {
+                    None => return Err(format!("truncated line after '%({})'", named.name.as_deref().unwrap_or(""))),
+                    Some(b'%') => {
+                        text.push('%');
+                        i += 1;
+                        continue;
+                    }
+                    Some(c) if c.is_ascii_digit() || *c == b' ' || *c == b'\t' => {
+                        return Err(format!(
+                            "unexpected alias name near '{}' at position {i} line : '{fmt}'. Maybe you want to write a single '%', use the syntax '%%'",
+                            char::from(*c)
+                        ));
+                    }
+                    Some(c) if !(matches!(c, b'{' | b'[') || c.is_ascii_alphabetic()) => continue,
+                    Some(_) => {}
+                }
+            }
             match b.get(i) {
                 None => return Err("truncated line after '%'".to_string()),
                 Some(b'%') => {
@@ -372,7 +513,6 @@ impl LogFormat {
                     i += 1;
                     continue;
                 }
-                Some(b'(') => return Err("named log-format fields ('%(name)') are not implemented".to_string()),
                 Some(c) if c.is_ascii_digit() || *c == b' ' || *c == b'\t' => {
                     return Err(format!(
                         "unexpected alias name near '{}' at position {i} line : '{fmt}'. Maybe you want to write a single '%', use the syntax '%%'",
@@ -382,7 +522,7 @@ impl LogFormat {
                 Some(b'{') => {
                     let end = fmt[i..].find('}').ok_or_else(|| format!("truncated line after '{}'", &fmt[i + 1..]))?;
                     let arg = &fmt[i + 1..i + end];
-                    opts = apply_flags(arg, opts)?;
+                    opts = apply_flags(arg, opts);
                     i += end + 1;
                     if !b.get(i).is_some_and(|c| *c == b'[' || c.is_ascii_alphanumeric()) {
                         return Err(format!("parse argument modifier without alias name near '%{{{arg}}}'"));
@@ -401,7 +541,7 @@ impl LogFormat {
                     return Err(format!("failed to parse sample expression <{src}> : unknown converter '{c}'"));
                 }
                 flush(&mut text, &mut nodes);
-                nodes.push(Node::Expr(Box::new(expr), opts));
+                nodes.push(Node::Expr(Box::new(expr), opts, named.name.is_some().then(|| Box::new(named))));
                 i += end + 2;
                 continue;
             }
@@ -417,6 +557,7 @@ impl LogFormat {
             }
             if name == "o" {
                 defaults = opts;
+                global = opts;
                 continue;
             }
             match ALIASES.iter().find(|(n, _)| *n == name) {
@@ -428,12 +569,18 @@ impl LogFormat {
                 Some((_, None)) => return Err(format!("log-format alias '%{name}' is not implemented")),
                 Some((_, Some(a))) => {
                     flush(&mut text, &mut nodes);
-                    nodes.push(Node::Alias(*a, opts));
+                    nodes.push(Node::Alias(*a, opts, named.name.is_some().then(|| Box::new(named))));
                 }
             }
         }
         flush(&mut text, &mut nodes);
-        Ok(LogFormat { nodes })
+        for n in &mut nodes {
+            match n {
+                Node::Alias(_, o, _) | Node::Expr(_, o, _) => *o = settle(*o, global),
+                Node::Text(_) => {}
+            }
+        }
+        Ok(LogFormat { nodes: nodes.into_boxed_slice(), global })
     }
 
     /// Whether the format reads the request line (`%r`, `%HM`, `%HU`, ...): `HAProxy`
@@ -451,6 +598,7 @@ impl LogFormat {
                         | Alias::HttpPathOnly
                         | Alias::HttpVersion
                         | Alias::HttpQuery,
+                    _,
                     _
                 )
             )
@@ -460,20 +608,16 @@ impl LogFormat {
     /// Renders the line (`sess_build_logline`).
     #[must_use]
     pub fn render(&self, d: &LogData, registry: &Registry, ctx: &SampleContext) -> String {
-        let mut out = String::with_capacity(160);
-        for n in &self.nodes {
-            match n {
-                Node::Text(t) => out.push_str(t),
-                Node::Alias(a, o) => alias(&mut out, *a, *o, d),
-                Node::Expr(e, o) => match e.eval_sample(registry, ctx) {
-                    Some(s) => sample(&mut out, &s, *o),
-                    None if o.quote => out.push_str("\"\""),
-                    None if o.mandatory => out.push('-'),
-                    None => {}
-                },
-            }
-        }
-        out
+        let bytes = self.render_bytes(d, registry, ctx);
+        String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+    }
+
+    /// Renders the line as bytes: a sample may hold any, and a CBOR line is not text.
+    #[must_use]
+    pub fn render_bytes(&self, d: &LogData, registry: &Registry, ctx: &SampleContext) -> Vec<u8> {
+        let mut out = Out(Vec::with_capacity(160));
+        self.render_into(&mut out, d, registry, ctx, true);
+        out.0
     }
 
     /// Renders the format outside a log line, where an expression that yields nothing, or
@@ -481,23 +625,276 @@ impl LogFormat {
     /// `http-check send hdr x %[str()]` (no header at all, 3.5-dev8-885761-29, 2026-10-03).
     #[must_use]
     pub fn render_value(&self, d: &LogData, registry: &Registry, ctx: &SampleContext) -> String {
-        let mut out = String::new();
+        let mut out = Out(Vec::new());
+        self.render_into(&mut out, d, registry, ctx, false);
+        String::from_utf8(out.0).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+    }
+
+    /// The nodes in order. On an encoded line (`%{+json}o`, `%{+cbor}o`) the text between
+    /// them is dropped and each named node is a key and its value, inside `{...}` or a CBOR
+    /// map; one with no name cannot be a member and is skipped (`sess_build_logline`).
+    fn render_into(&self, out: &mut Out, d: &LogData, registry: &Registry, ctx: &SampleContext, log: bool) {
+        let g = self.global;
+        if g.json {
+            out.push('{');
+        } else if g.cbor {
+            cbor_put(out, &[0xBF], g.bin);
+        }
+        let mut first = true;
         for n in &self.nodes {
-            match n {
-                Node::Text(t) => out.push_str(t),
-                Node::Alias(a, o) => alias(&mut out, *a, *o, d),
-                Node::Expr(e, o) => match e.eval_sample(registry, ctx) {
-                    Some(Sample::Str(v)) if v.is_empty() && !o.quote => {}
-                    Some(Sample::Bin(v)) if v.is_empty() && !o.quote => {}
-                    Some(s) => sample(&mut out, &s, *o),
-                    None if o.quote => out.push_str("\"\""),
-                    None => {}
+            let (o, named, value) = match n {
+                Node::Text(t) => {
+                    if !g.encoded() {
+                        out.push_str(t);
+                    }
+                    continue;
+                }
+                Node::Alias(a, o, named) => (*o, named.as_deref(), Value::Alias(*a)),
+                Node::Expr(e, o, named) => (*o, named.as_deref(), Value::Expr(e)),
+            };
+            if g.encoded() {
+                let Some(name) = named.and_then(|n| n.name.as_deref()) else { continue };
+                if g.json {
+                    if !first {
+                        out.push_str(", ");
+                    }
+                    out.push('"');
+                    out.push_str(name);
+                    out.push_str("\": ");
+                } else {
+                    cbor_text(out, name.as_bytes(), g.bin);
+                }
+                first = false;
+            }
+            let value_beg = out.0.len();
+            match value {
+                Value::Expr(e) => match e.eval_sample(registry, ctx) {
+                    // Outside a log line an empty value writes nothing, not `-`.
+                    Some(Sample::Str(v)) if !log && v.is_empty() && !o.quote && !o.encoded() => {}
+                    Some(Sample::Bin(v)) if !log && v.is_empty() && !o.quote && !o.encoded() => {}
+                    Some(s) => sample(out, &s, o, named.as_ref().map_or(Cast::Same, |n| n.cast), !e.converters.is_empty()),
+                    None => missing(out, o, log),
                 },
+                Value::Alias(a) => {
+                    if o.encoded() {
+                        // The value as the plain format writes it, then as the encoding carries it:
+                        // a number for the aliases that are one, a string for the others.
+                        let mut plain = Out(Vec::new());
+                        alias(&mut plain, a, Opts { mandatory: false, ..Opts::default() }, d);
+                        let value = match std::str::from_utf8(&plain.0).ok().and_then(|s| s.parse::<i64>().ok()) {
+                            Some(v) if NUMERIC.contains(&a) => Sample::Sint(v),
+                            _ => Sample::Bin(plain.0),
+                        };
+                        match value {
+                            Sample::Bin(b) if b.is_empty() => {}
+                            v => sample_encoded(out, &v, o, named.as_ref().map_or(Cast::Same, |n| n.cast), false),
+                        }
+                    } else if o.esc {
+                        let mut plain = Out(Vec::new());
+                        alias(&mut plain, a, Opts { esc: false, ..o }, d);
+                        escaped_5424(out, &plain.0);
+                    } else {
+                        alias(out, a, o, d);
+                    }
+                }
+            }
+            // A value that wrote nothing is `null` in JSON and the null primitive in CBOR, so
+            // that the key before it has a value (`sess_build_logline`, `next_fmt`).
+            if out.0.len() == value_beg {
+                if o.json {
+                    out.push_str("null");
+                } else if o.cbor {
+                    cbor_put(out, &[0xF6], o.bin);
+                }
             }
         }
-        out
+        if g.json {
+            out.push('}');
+        } else if g.cbor {
+            cbor_put(out, &[0xFF], g.bin);
+        }
     }
 }
+
+/// What a node that is not text computes its value from.
+enum Value<'a> {
+    Alias(Alias),
+    Expr(&'a Expr),
+}
+
+/// The output of a rendering: bytes, because a captured header or a decoded sample holds any.
+struct Out(Vec<u8>);
+
+impl Out {
+    fn push(&mut self, c: char) {
+        let mut b = [0u8; 4];
+        self.0.extend_from_slice(c.encode_utf8(&mut b).as_bytes());
+    }
+
+    fn push_str(&mut self, s: &str) {
+        self.0.extend_from_slice(s.as_bytes());
+    }
+}
+
+impl std::fmt::Write for Out {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.push_str(s);
+        Ok(())
+    }
+}
+
+/// A value that is not there (`lf_text_len` with no text): `""` quoted or JSON, `-` when
+/// mandatory, and nothing in CBOR, where an absent or empty text writes no item at all.
+fn missing(out: &mut Out, o: Opts, log: bool) {
+    if o.json || o.quote {
+        out.push_str("\"\"");
+    } else if o.mandatory && log && !o.cbor {
+        out.push('-');
+    }
+}
+
+/// `cbor_encode_*`: bytes as hex text, or raw with `+bin`.
+fn cbor_put(out: &mut Out, bytes: &[u8], bin: bool) {
+    if bin {
+        out.0.extend_from_slice(bytes);
+    } else {
+        for b in bytes {
+            let _ = write!(out, "{b:02X}");
+        }
+    }
+}
+
+/// A CBOR item head: the major type's bits and the argument in its shortest form.
+fn cbor_head(out: &mut Out, major: u8, n: u64, bin: bool) {
+    let mut h = [0u8; 9];
+    let len = if n < 24 {
+        h[0] = major | n as u8;
+        1
+    } else if let Ok(v) = u8::try_from(n) {
+        h[0] = major | 24;
+        h[1] = v;
+        2
+    } else if let Ok(v) = u16::try_from(n) {
+        h[0] = major | 25;
+        h[1..3].copy_from_slice(&v.to_be_bytes());
+        3
+    } else if let Ok(v) = u32::try_from(n) {
+        h[0] = major | 26;
+        h[1..5].copy_from_slice(&v.to_be_bytes());
+        5
+    } else {
+        h[0] = major | 27;
+        h[1..9].copy_from_slice(&n.to_be_bytes());
+        9
+    };
+    cbor_put(out, &h[..len], bin);
+}
+
+fn cbor_text(out: &mut Out, s: &[u8], bin: bool) {
+    cbor_head(out, 0x60, s.len() as u64, bin);
+    cbor_put(out, s, bin);
+}
+
+fn cbor_int(out: &mut Out, v: i64, bin: bool) {
+    if v >= 0 {
+        cbor_head(out, 0x00, v as u64, bin);
+    } else {
+        cbor_head(out, 0x20, (-1 - v) as u64, bin);
+    }
+}
+
+/// A binary sample is a byte string of indefinite length: one chunk, then the break.
+fn cbor_bytes(out: &mut Out, s: &[u8], bin: bool) {
+    cbor_put(out, &[0x5F], bin);
+    if !s.is_empty() {
+        cbor_head(out, 0x40, s.len() as u64, bin);
+        cbor_put(out, s, bin);
+    }
+    cbor_put(out, &[0xFF], bin);
+}
+
+/// A number on an encoded line.
+fn number(out: &mut Out, v: i64, o: Opts) {
+    if o.cbor {
+        cbor_int(out, v, o.bin);
+    } else {
+        let _ = write!(out, "{v}");
+    }
+}
+
+fn boolean(out: &mut Out, v: bool, o: Opts) {
+    if o.cbor {
+        cbor_put(out, &[if v { 0xF5 } else { 0xF4 }], o.bin);
+    } else {
+        out.push_str(if v { "true" } else { "false" });
+    }
+}
+
+/// `+E`: `"`, `\` and `]` get a backslash (`rfc5424_escape_map`).
+fn escaped_5424(out: &mut Out, s: &[u8]) {
+    for &c in s {
+        if matches!(c, b'"' | b'\\' | b']') {
+            out.0.push(b'\\');
+        }
+        out.0.push(c);
+    }
+}
+
+/// The two-character JSON escape for the bytes that have one, `\u00XX` for the others.
+fn json_escape_seq(out: &mut Out, b: u8) {
+    match b {
+        b'"' => out.push_str("\\\""),
+        b'\\' => out.push_str("\\\\"),
+        8 => out.push_str("\\b"),
+        12 => out.push_str("\\f"),
+        b'\n' => out.push_str("\\n"),
+        b'\r' => out.push_str("\\r"),
+        b'\t' => out.push_str("\\t"),
+        _ => {
+            let _ = write!(out, "\\u{b:04X}");
+        }
+    }
+}
+
+/// `_lf_json_utf8_len`: the length and code point of the valid multi-byte UTF-8 sequence at
+/// the start of `s` (no overlong form, no surrogate, nothing above U+10FFFF, and not
+/// U+FFFE or U+FFFF).
+fn utf8_sequence(s: &[u8]) -> Option<(usize, u32)> {
+    let len = match *s.first()? {
+        0xC2..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF4 => 4,
+        _ => return None,
+    };
+    let c = std::str::from_utf8(s.get(..len)?).ok()?.chars().next()?;
+    (c != '\u{FFFE}' && c != '\u{FFFF}').then_some((len, u32::from(c)))
+}
+
+/// A JSON string's content. Only 32..=126 stays as it is, so the output is plain ASCII and no
+/// byte can be taken for an introducer; with `+utf8` the valid multi-byte sequences are
+/// kept, except the C1 controls, which are escaped like the C0 ones.
+fn json_escape(out: &mut Out, s: &[u8], utf8: bool) {
+    let mut i = 0;
+    while i < s.len() {
+        let b = s[i];
+        if b == b'"' || b == b'\\' || b < 0x20 || b >= 0x7F {
+            if let Some((len, c)) = utf8.then(|| utf8_sequence(&s[i..])).flatten() {
+                if c < 0xA0 {
+                    json_escape_seq(out, u8::try_from(c).unwrap_or(0));
+                } else {
+                    out.0.extend_from_slice(&s[i..i + len]);
+                }
+                i += len;
+                continue;
+            }
+            json_escape_seq(out, b);
+        } else {
+            out.0.push(b);
+        }
+        i += 1;
+    }
+}
+
 
 fn flush(text: &mut String, nodes: &mut Vec<Node>) {
     if !text.is_empty() {
@@ -534,7 +931,7 @@ fn url_escaped(b: u8) -> bool {
 
 /// `lf_encode_string`: `s`, with every byte `escaped` selects written `#XX`, quoted if
 /// asked.
-fn encoded(out: &mut String, s: &[u8], escaped: fn(u8) -> bool, o: Opts) {
+fn encoded(out: &mut Out, s: &[u8], escaped: fn(u8) -> bool, o: Opts) {
     if o.quote {
         out.push('"');
     }
@@ -550,18 +947,35 @@ fn encoded(out: &mut String, s: &[u8], escaped: fn(u8) -> bool, o: Opts) {
     }
 }
 
-/// `lf_text`: text, quoted if asked; nothing for none.
-fn text(out: &mut String, s: Option<&str>, o: Opts) {
-    if o.quote {
+/// `lf_text`: text, quoted if asked; nothing for none. An encoded line carries it as a JSON
+/// string or a CBOR text, and `+E` puts a backslash before `"`, `\` and `]`.
+fn text<S: AsRef<[u8]> + ?Sized>(out: &mut Out, s: Option<&S>, o: Opts) {
+    let s = s.map_or(&b""[..], AsRef::as_ref);
+    if o.json {
         out.push('"');
-        out.push_str(s.unwrap_or(""));
+        json_escape(out, s, o.utf8);
         out.push('"');
+    } else if o.cbor {
+        // An empty or absent text writes no item (`_lf_text_len`).
+        if !s.is_empty() {
+            cbor_text(out, s, o.bin);
+        }
     } else {
-        out.push_str(s.unwrap_or(""));
+        if o.quote {
+            out.push('"');
+        }
+        if o.esc {
+            escaped_5424(out, s);
+        } else {
+            out.0.extend_from_slice(s);
+        }
+        if o.quote {
+            out.push('"');
+        }
     }
 }
 
-fn ip(out: &mut String, a: Option<SocketAddr>, o: Opts) {
+fn ip(out: &mut Out, a: Option<SocketAddr>, o: Opts) {
     match a {
         None => out.push('-'),
         Some(SocketAddr::V4(v)) if o.hex => {
@@ -580,7 +994,7 @@ fn ip(out: &mut String, a: Option<SocketAddr>, o: Opts) {
     }
 }
 
-fn port(out: &mut String, a: Option<SocketAddr>, o: Opts) {
+fn port(out: &mut Out, a: Option<SocketAddr>, o: Opts) {
     match a {
         None => out.push('-'),
         Some(a) if o.hex => {
@@ -592,28 +1006,28 @@ fn port(out: &mut String, a: Option<SocketAddr>, o: Opts) {
     }
 }
 
-/// `date2str_log`: `03/Oct/2026:16:48:18.622`.
 /// The line `HAProxy` writes for a connection that failed before it was a stream
 /// (`session_embryonic_build_legacy_err`): `<src>:<port> [<accept date>] <fe>/<listener>:
 /// <message>`. The listener is its name if it has one, else its numeric id; a client with
 /// no address is `unknown`.
 #[must_use]
 pub fn connection_error_line(client: Option<SocketAddr>, accept_date: (i64, u32), frontend: &str, listener: &str, message: &str) -> String {
-    let mut out = String::new();
+    let mut out = Out(Vec::new());
     let who = client.map_or_else(|| "unknown".to_string(), |a| format!("{}:{}", a.ip(), a.port()));
     let _ = write!(out, "{who} [");
     date_ms(&mut out, accept_date.0, accept_date.1);
     let _ = write!(out, "] {frontend}/{listener}: {message}");
-    out
+    String::from_utf8_lossy(&out.0).into_owned()
 }
 
-fn date_ms(out: &mut String, unix: i64, ms: u32) {
+/// `date2str_log`: `03/Oct/2026:16:48:18.622`.
+fn date_ms(out: &mut Out, unix: i64, ms: u32) {
     let c = Civil::local(unix);
     let _ = write!(out, "{:02}/{}/{:04}:{:02}:{:02}:{:02}.{ms:03}", c.day, c.month_name(), c.year, c.hour, c.minute, c.second);
 }
 
 /// `gmt2str_log` / `localdate2str_log`: `03/Oct/2026:14:48:18 +0000`.
-fn date_zone(out: &mut String, c: Civil) {
+fn date_zone(out: &mut Out, c: Civil) {
     let _ = write!(
         out,
         "{:02}/{}/{:04}:{:02}:{:02}:{:02} {}",
@@ -652,8 +1066,8 @@ fn path_only(target: &str) -> &str {
 }
 
 #[allow(clippy::too_many_lines)]
-fn alias(out: &mut String, a: Alias, o: Opts, d: &LogData) {
-    let int = |out: &mut String, v: i64| {
+fn alias(out: &mut Out, a: Alias, o: Opts, d: &LogData) {
+    let int = |out: &mut Out, v: i64| {
         let _ = write!(out, "{v}");
     };
     let t_request = d.t_request;
@@ -815,22 +1229,74 @@ fn alias(out: &mut String, a: Alias, o: Opts, d: &LogData) {
     }
 }
 
+/// A sample's value as text.
+fn sample_bytes(s: &Sample) -> std::borrow::Cow<'_, [u8]> {
+    use std::borrow::Cow;
+    match s {
+        Sample::Str(v) => Cow::Borrowed(v.as_bytes()),
+        Sample::Bin(v) => Cow::Borrowed(v),
+        Sample::Sint(v) => Cow::Owned(v.to_string().into_bytes()),
+        Sample::Bool(v) => Cow::Borrowed(if *v { b"1" } else { b"0" }),
+        Sample::Ipv4(v) => Cow::Owned(v.to_string().into_bytes()),
+        Sample::Ipv6(v) => Cow::Owned(v.to_string().into_bytes()),
+        Sample::Meth(v) => Cow::Borrowed(v.as_str().as_bytes()),
+    }
+}
+
+/// A sample on an encoded line (`%{+json}[...]`, `%{+cbor}[...]`): a number stays a number, a
+/// boolean a boolean, and anything else a string; a binary sample from a converter is a CBOR
+/// byte string. `%(name:type)` forces the type.
+fn sample_encoded(out: &mut Out, s: &Sample, o: Opts, cast: Cast, converted: bool) {
+    // A string becomes the integer its leading digits make, 0 when there are none (`atoll`).
+    let as_sint = || match s {
+        Sample::Sint(v) => Some(*v),
+        Sample::Bool(v) => Some(i64::from(*v)),
+        Sample::Str(v) => {
+            let t = v.trim_start();
+            let (neg, digits) = t.strip_prefix('-').map_or((false, t.strip_prefix('+').unwrap_or(t)), |d| (true, d));
+            let n = digits.bytes().take_while(u8::is_ascii_digit).fold(0i64, |a, d| a.saturating_mul(10).saturating_add(i64::from(d - b'0')));
+            Some(if neg { -n } else { n })
+        }
+        _ => None,
+    };
+    match cast {
+        Cast::Sint => match as_sint() {
+            Some(v) => number(out, v, o),
+            None => missing(out, o, true),
+        },
+        Cast::Bool => match as_sint() {
+            Some(v) => boolean(out, v != 0, o),
+            None => missing(out, o, true),
+        },
+        Cast::Str => text(out, Some(&*sample_bytes(s)), o),
+        Cast::Same => match s {
+            Sample::Sint(v) => number(out, *v, o),
+            Sample::Bool(v) => boolean(out, *v, o),
+            Sample::Bin(v) if o.cbor && converted => cbor_bytes(out, v, o.bin),
+            _ => text(out, Some(&*sample_bytes(s)), o),
+        },
+    }
+}
+
 /// A sample's text in a log line (`lf_text`/`lf_int`): strings quoted if asked, an empty
 /// string as `-` (or `""` quoted), binary as its bytes.
-fn sample(out: &mut String, s: &Sample, o: Opts) {
+fn sample(out: &mut Out, s: &Sample, o: Opts, cast: Cast, converted: bool) {
+    if o.encoded() {
+        return sample_encoded(out, s, o, cast, converted);
+    }
     match s {
         Sample::Str(v) if v.is_empty() && !o.quote => {
             if o.mandatory {
                 out.push('-');
             }
         }
-        Sample::Str(v) => text(out, Some(v), o),
         Sample::Bin(v) if v.is_empty() && !o.quote => {
             if o.mandatory {
                 out.push('-');
             }
         }
-        Sample::Bin(v) => text(out, Some(&String::from_utf8_lossy(v)), o),
+        Sample::Str(v) => text(out, Some(v.as_str()), o),
+        Sample::Bin(v) => text(out, Some(v.as_slice()), o),
         Sample::Sint(v) => {
             let _ = write!(out, "{v}");
         }
