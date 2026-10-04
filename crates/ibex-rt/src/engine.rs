@@ -543,6 +543,12 @@ impl Proxy {
             return self.dispatch;
         }
         match self.balance {
+            BalanceAlgorithm::Source if self.hash_type == ibex_config::HashType::Consistent && source_ip.is_some() => {
+                match crate::lb::balance_source_consistent(self, source_ip.unwrap_or(IpAddr::from([0, 0, 0, 0]))) {
+                    Some(idx) => Some(self.servers[idx]),
+                    None => self.dispatch,
+                }
+            }
             BalanceAlgorithm::Source => {
                 let eligible = self.eligible_server_indices();
                 if eligible.is_empty() {
@@ -4347,7 +4353,9 @@ fn retry_server_connect(
     let target = if resuming {
         entry.target_addr
     } else if redispatch {
-        let hash = matches!(proxies[be_idx].balance, BalanceAlgorithm::Source | BalanceAlgorithm::Uri);
+        // A consistent ring walks past the server to avoid; a map-based hash cannot.
+        let hash = matches!(proxies[be_idx].balance, BalanceAlgorithm::Source | BalanceAlgorithm::Uri)
+            && proxies[be_idx].hash_type != ibex_config::HashType::Consistent;
         // The balancing algorithm is asked to avoid the server that just failed, unless it
         // is the only one left (`fwrr_get_next_server(.., prev_srv)` and the like).
         // Only another active server counts: a backup is not a way out of the one active

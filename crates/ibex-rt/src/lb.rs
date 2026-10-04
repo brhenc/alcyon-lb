@@ -321,8 +321,26 @@ pub fn balance_uri(proxy: &Proxy, uri: &str) -> Option<usize> {
 /// is full. `None` when no server is up, or every candidate is full.
 fn balance_uri_consistent(proxy: &Proxy, uri: &str) -> Option<usize> {
     let key = uri.split('?').next().unwrap_or("");
-    let hash = full_hash(hash_sdbm(key.as_bytes()));
+    chash_lookup(proxy, |_| full_hash(hash_sdbm(key.as_bytes())))
+}
 
+/// `balance source` with `hash-type consistent` (`get_server_sh`, `src/backend.c`): the
+/// key is the XOR of the address' 32-bit words (host order), avalanched by `full_hash`,
+/// and 0 when only one server is left to choose from, then the ring as for `balance uri`.
+#[must_use]
+pub fn balance_source_consistent(proxy: &Proxy, ip: std::net::IpAddr) -> Option<usize> {
+    let words = match ip {
+        std::net::IpAddr::V4(a) => vec![u32::from(a)],
+        std::net::IpAddr::V6(a) => a.octets().chunks(4).map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]])).collect(),
+    };
+    chash_lookup(proxy, |servers_in_ring| {
+        if servers_in_ring <= 1 { 0 } else { full_hash(words.iter().fold(0, |h, w| h ^ w)) }
+    })
+}
+
+/// The server owning the ring point nearest to the key `hash(n)`, `n` being how many
+/// servers the ring holds (`tot_used`).
+fn chash_lookup(proxy: &Proxy, hash: impl FnOnce(usize) -> u32) -> Option<usize> {
     let ring = proxy.chash.ring(proxy);
     let points = match &ring.members {
         RingMembers::Active => &ring.points,
@@ -334,6 +352,10 @@ fn balance_uri_consistent(proxy: &Proxy, uri: &str) -> Option<usize> {
 
     // The point at or after the key, or the first one past the end of the ring; then
     // whichever of it and the point before is closer, the earlier one on a tie.
+    let mut in_ring: Vec<u32> = points.iter().map(|p| p.1).collect();
+    in_ring.sort_unstable();
+    in_ring.dedup();
+    let hash = hash(in_ring.len());
     let next = points.partition_point(|&(k, _)| k < hash) % points.len();
     let prev = (next + points.len() - 1) % points.len();
     let dp = hash.wrapping_sub(points[prev].0);
