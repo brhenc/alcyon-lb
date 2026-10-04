@@ -1204,8 +1204,8 @@ fn test_conv_when() {
         reg.eval("str", &["v".to_string()], &[("when", args)], &ctx)
     };
     let v = Some(Sample::Str("v".into()));
-    let err = Some(StreamFacts { error: true, forwarded: true, toapplet: false });
-    let app = Some(StreamFacts { error: false, forwarded: false, toapplet: true });
+    let err = Some(StreamFacts { error: true, forwarded: true, toapplet: false, ..Default::default() });
+    let app = Some(StreamFacts { error: false, forwarded: false, toapplet: true, ..Default::default() });
     // a stream that has done nothing yet
     assert_eq!(when(None, &["normal"]), v);
     assert_eq!(when(None, &["error"]), None);
