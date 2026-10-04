@@ -1052,11 +1052,12 @@ fn note_last_rule(sess: &mut TcpSession, line: u32) {
 }
 
 /// What `when()` reads of a stream (`sample_conv_when`): an error is a 5xx status; a
-/// connection attempt, once made, counts as forwarded. Retries and redispatches are not
-/// counted.
-fn stream_facts(log: &crate::txnlog::StreamLog, status: Option<u16>) -> ibex_sample::StreamFacts {
+/// connection attempt, once made, counts as forwarded. A connection retry (`retried`) is an
+/// error too (`conn_retries` with no error flag); a redispatch is one retry, so it is
+/// covered.
+fn stream_facts(log: &crate::txnlog::StreamLog, status: Option<u16>, retried: bool) -> ibex_sample::StreamFacts {
     ibex_sample::StreamFacts {
-        error: status.is_some_and(|s| s >= 500),
+        error: retried || status.is_some_and(|s| s >= 500),
         forwarded: log.queue.is_some() || log.connect.is_some(),
         toapplet: false,
     }
@@ -5524,7 +5525,7 @@ impl EngineDispatcher<'_> {
             res_body: has_wait.then_some(res_body.as_slice()),
             unique_id: entry.sess.log.unique_id.as_deref(),
             accept_date: Some(entry.sess.log.date),
-            stream: Some(stream_facts(&entry.sess.log, Some(status))),
+            stream: Some(stream_facts(&entry.sess.log, Some(status), entry.sess.max_retries > entry.sess.conn_retries)),
             last_rule: last_rule_at(entry.sess.log.last_rule),
             captures_req_hdr: Some(&entry.sess.log.req_captures),
             captures_res_hdr: Some(&res_caps_in),
@@ -8709,7 +8710,7 @@ fn after_res_on_reply<'r>(
             res_version: Some(&version),
             unique_id: sess.log.unique_id.as_deref(),
             accept_date: Some(sess.log.date),
-            stream: Some(stream_facts(&sess.log, Some(status))),
+            stream: Some(stream_facts(&sess.log, Some(status), sess.max_retries > sess.conn_retries)),
             captures_req_hdr: Some(&sess.log.req_captures),
             captures_res_hdr: Some(&res_caps_in),
             ..Default::default()
