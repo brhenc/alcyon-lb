@@ -677,3 +677,35 @@ fn set_status_and_replace_fail_when_there_is_no_room() {
         assert!(lines_named(&resp, "after").is_empty(), "{kind}");
     }
 }
+
+/// The request's `req.*` variables are gone once the response is here: `http-response` and
+/// `http-after-response` rules read them empty, while `txn.*` lives on. Measured:
+///
+/// ```text
+/// x-resp-req:      x-resp-txn: txnv      x-aft-req:      x-aft-res: resv      x-aft-txn: txnv
+/// ```
+#[test]
+fn http_response_rules_do_not_see_the_requests_variables() {
+    let srv = server(SRV.to_vec());
+    let cfg = format!(
+        "{DEFAULTS}listen l\n  bind {{fe}}\n  http-request set-var(req.a) str(reqv)\n  \
+         http-request set-var(txn.a) str(txnv)\n  \
+         http-response set-header x-resp-req \"%[var(req.a)]\"\n  \
+         http-response set-header x-resp-txn \"%[var(txn.a)]\"\n  \
+         http-response set-var(res.b) str(resv)\n  \
+         http-after-response set-header x-aft-req \"%[var(req.a)]\"\n  \
+         http-after-response set-header x-aft-res \"%[var(res.b)]\"\n  \
+         http-after-response set-header x-aft-txn \"%[var(txn.a)]\"\n  server s {{srv}}\n"
+    );
+    let (_ibex, fe) = start(&cfg, Some(srv));
+    let resp = one(fe, G);
+    let got: Vec<String> = ["x-resp-req", "x-resp-txn", "x-aft-req", "x-aft-res", "x-aft-txn"]
+        .iter()
+        .flat_map(|n| lines_named(&resp, n))
+        .collect();
+    assert_eq!(
+        got,
+        ["x-resp-req: ", "x-resp-txn: txnv", "x-aft-req: ", "x-aft-res: resv", "x-aft-txn: txnv"],
+        "{resp:?}"
+    );
+}

@@ -5524,6 +5524,9 @@ impl EngineDispatcher<'_> {
             // 1. The backend's `http-response` rules, then the frontend's when it is another
             // proxy; an `allow` ends only its own list.
             // `http-response capture` writes the frontend's slots, whichever proxy the rule is in.
+            // The response side starts with the request's `req.*` variables gone.
+            entry.sess.req_vars.retain(|k, _| !k.starts_with("req."));
+            CURRENT_VARS.with(|v| v.borrow_mut().retain(|k, _| !k.starts_with("req.")));
             let fe_res_slots = &proxies[fe_idx].res_capture_slots;
             let mut stopped = None;
             LAST_RULE.set(None);
