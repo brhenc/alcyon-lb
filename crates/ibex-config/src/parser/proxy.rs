@@ -76,6 +76,7 @@ pub(crate) fn parse_listen_header(
         timeouts,
         retries: defaults.and_then(|d| d.retries).unwrap_or(3),
         redisp: defaults.map_or(false, |d| d.redisp),
+        redisp_after: defaults.map_or(-1, |d| if d.redisp { d.redisp_after } else { -1 }),
         maxconn: defaults.and_then(|d| d.maxconn).unwrap_or(2000),
         grace: None,
         dispatch: None,
@@ -255,6 +256,7 @@ pub(crate) fn parse_backend_header(
         timeouts,
         retries: defaults.and_then(|d| d.retries).unwrap_or(3),
         redisp: defaults.map_or(false, |d| d.redisp),
+        redisp_after: defaults.map_or(-1, |d| if d.redisp { d.redisp_after } else { -1 }),
         dispatch: None,
         default_server: defaults.and_then(|d| d.default_server.clone()),
         servers: Vec::new(),
@@ -300,6 +302,7 @@ pub(crate) fn parse_listen_directive(
         "retries" => parse_retries(&mut proxy.retries, tokens, kw),
         "redisp" => {
             proxy.redisp = true;
+            proxy.redisp_after = -1;
             Ok(())
         }
         "maxconn" => parse_maxconn(&mut proxy.maxconn, tokens, kw),
@@ -571,6 +574,7 @@ pub(crate) fn parse_backend_directive(
         "retries" => parse_retries(&mut be.retries, tokens, kw),
         "redisp" => {
             be.redisp = true;
+            be.redisp_after = -1;
             Ok(())
         }
         "dispatch" => parse_dispatch(kw),
@@ -790,7 +794,7 @@ pub(crate) fn parse_option_listen(
     match tokens[1].text.as_str() {
         "forwardfor" => proxy.forwardfor = Some(parse_forward_option(tokens, kw)?),
         "originalto" => proxy.originalto = Some(parse_forward_option(tokens, kw)?),
-        "redispatch" => proxy.redisp = true,
+        "redispatch" => set_redispatch(&mut proxy.redisp, &mut proxy.redisp_after, tokens),
         "accept-unsafe-violations-in-http-request" => proxy.stats.accept_unsafe_request = true,
         "log-health-checks" => proxy.log_health_checks = true,
         "httpchk" => parse_httpchk_option(&mut proxy.httpchk, tokens, kw)?,
@@ -849,7 +853,7 @@ pub(crate) fn parse_option_backend(
     match tokens[1].text.as_str() {
         "forwardfor" => be.forwardfor = Some(parse_forward_option(tokens, kw)?),
         "originalto" => be.originalto = Some(parse_forward_option(tokens, kw)?),
-        "redispatch" => be.redisp = true,
+        "redispatch" => set_redispatch(&mut be.redisp, &mut be.redisp_after, tokens),
         "log-health-checks" => be.log_health_checks = true,
         "httpchk" => parse_httpchk_option(&mut be.httpchk, tokens, kw)?,
         "tcp-check" => be.tcp_check = true,
@@ -866,7 +870,7 @@ pub(crate) fn parse_no_listen(proxy: &mut ListenSection, tokens: &[Token], kw: &
         return parse_no_directive(tokens, kw);
     }
     match check_no_option(OptSection::Listen, tokens, kw)? {
-        Some("redispatch") => proxy.redisp = false,
+        Some("redispatch") => (proxy.redisp, proxy.redisp_after) = (false, -1),
         Some("accept-unsafe-violations-in-http-request") => proxy.stats.accept_unsafe_request = false,
         Some("log-health-checks") => proxy.log_health_checks = false,
         _ => {}
@@ -889,7 +893,7 @@ pub(crate) fn parse_no_backend(be: &mut BackendSection, tokens: &[Token], kw: &T
         return parse_no_directive(tokens, kw);
     }
     match check_no_option(OptSection::Backend, tokens, kw)? {
-        Some("redispatch") => be.redisp = false,
+        Some("redispatch") => (be.redisp, be.redisp_after) = (false, -1),
         Some("log-health-checks") => be.log_health_checks = false,
         _ => {}
     }

@@ -16,6 +16,9 @@ pub struct DefaultsSection {
     pub retries: Option<u32>,
     /// Default redispatch flag.
     pub redisp: bool,
+    /// `option redispatch <interval>`: retries between redispatches (`redispatch_after`);
+    /// negative counts back from the last retry, the default `-1` redispatches on it.
+    pub redisp_after: i32,
     /// Default maxconn.
     pub maxconn: Option<u32>,
     /// Default load balancing algorithm.
@@ -165,6 +168,9 @@ pub struct ListenSection {
     pub retries: u32,
     /// Whether reconnection to dispatch address is enabled on error.
     pub redisp: bool,
+    /// `option redispatch <interval>`: retries between redispatches (`redispatch_after`);
+    /// negative counts back from the last retry, the default `-1` redispatches on it.
+    pub redisp_after: i32,
     /// Maximum concurrent connections for this proxy (default: 2000).
     pub maxconn: u32,
     /// Grace time in milliseconds / Duration before stopping.
@@ -298,6 +304,7 @@ impl Default for ListenSection {
             timeouts: TimeoutConfig::default(),
             retries: 3,
             redisp: false,
+            redisp_after: -1,
             maxconn: 2000,
             grace: None,
             dispatch: None,
@@ -514,6 +521,9 @@ pub struct BackendSection {
     pub retries: u32,
     /// Whether reconnection to dispatch address is enabled on error.
     pub redisp: bool,
+    /// `option redispatch <interval>`: retries between redispatches (`redispatch_after`);
+    /// negative counts back from the last retry, the default `-1` redispatches on it.
+    pub redisp_after: i32,
     /// Default dispatch address to connect to.
     pub dispatch: Option<SocketAddr>,
     /// Default server options applied to all servers.
@@ -591,6 +601,7 @@ impl Default for BackendSection {
             timeouts: TimeoutConfig::default(),
             retries: 3,
             redisp: false,
+            redisp_after: -1,
             dispatch: None,
             default_server: None,
             servers: Vec::new(),

@@ -161,6 +161,12 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
     let mut backends = Vec::new();
     let mut cur_section: Option<CurrentSection> = None;
     let mut sample_refs = Vec::new();
+    // Where each named defaults section starts, and what kind of section first inherited
+    // from it, for [`check_inheritance`].
+    let mut defaults_lines: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut defaults_users: std::collections::HashMap<String, Inheritor> = std::collections::HashMap::new();
+    // The unnamed `defaults` sections, for [`AnonDefaults`].
+    let mut anon_defaults: Vec<AnonDefaults> = Vec::new();
 
     for line in &lines {
         let tokens = &line.tokens;
@@ -192,6 +198,12 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut frontends,
                     &mut backends,
                 );
+                check_inheritance(Inheritor::Defaults, tokens, &named_defaults, &defaults_lines, &mut defaults_users)?;
+                if tokens.len() >= 2 && !tokens[1].text.is_empty() && tokens[1].text != "from" {
+                    defaults_lines.insert(tokens[1].text.clone(), kw.line);
+                } else {
+                    anon_defaults.push(AnonDefaults { line: kw.line, httpchk: false, backend_user: false });
+                }
                 let def = if tokens.len() >= 2 && !tokens[1].text.is_empty() {
                     if tokens[1].text == "from" {
                         if tokens.len() < 3 || tokens[2].text.is_empty() {
@@ -238,6 +250,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut frontends,
                     &mut backends,
                 );
+                check_inheritance(Inheritor::Listen, tokens, &named_defaults, &defaults_lines, &mut defaults_users)?;
                 cur_section = Some(CurrentSection::Listen(parse_listen_header(
                     tokens,
                     kw,
@@ -255,6 +268,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut frontends,
                     &mut backends,
                 );
+                check_inheritance(Inheritor::Frontend, tokens, &named_defaults, &defaults_lines, &mut defaults_users)?;
                 cur_section = Some(CurrentSection::Frontend(parse_frontend_header(
                     tokens,
                     kw,
@@ -272,6 +286,12 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut frontends,
                     &mut backends,
                 );
+                check_inheritance(Inheritor::Backend, tokens, &named_defaults, &defaults_lines, &mut defaults_users)?;
+                if !tokens.iter().any(|t| t.text == "from") {
+                    if let Some(d) = anon_defaults.last_mut() {
+                        d.backend_user = true;
+                    }
+                }
                 cur_section = Some(CurrentSection::Backend(parse_backend_header(
                     tokens,
                     kw,
@@ -318,6 +338,14 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     .as_mut()
                     .ok_or_else(|| ConfigError::new(kw.line, kw.col, "<listen> expected."))?;
                 sample_refs::collect(section, tokens, &mut sample_refs);
+                if matches!(section, CurrentSection::Defaults(d) if d.name.is_none())
+                    && kw.text == "option"
+                    && tokens.get(1).is_some_and(|t| t.text == "httpchk")
+                {
+                    if let Some(d) = anon_defaults.last_mut() {
+                        d.httpchk = true;
+                    }
+                }
                 parse_section_directive(section, tokens, kw)?;
             }
         }
@@ -343,6 +371,17 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
     // The old "no <listen> line. Nothing to do !" error is HAProxy 1.x wording that
     // modern HAProxy no longer emits.
 
+    // `HAProxy` resolves the arguments of an unnamed `defaults`' `http-check` rules only in
+    // the backends that inherit them (`proxy_ref_defaults`): a section with no backend
+    // after it, or without `option httpchk`, never resolves them.
+    sample_refs.retain(|r| {
+        if r.section != SectionKind::Defaults || r.proxy.is_some() || r.directive != "http-check" {
+            return true;
+        }
+        let owner = anon_defaults.iter().rev().find(|d| d.line <= r.line);
+        owner.is_some_and(|d| d.httpchk && d.backend_user)
+    });
+
     let maxrewrite = global.as_ref().and_then(|g| g.maxrewrite);
     for l in &mut listens {
         l.stats.maxrewrite = maxrewrite;
@@ -367,6 +406,83 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
     register_checks_from_config(&config);
 
     Ok(config)
+}
+
+/// An unnamed `defaults` section, and what its `http-check` rules need to be resolved.
+struct AnonDefaults {
+    /// The line of its header.
+    line: usize,
+    /// It has `option httpchk`: only then do its `http-check` rules reach the backends.
+    httpchk: bool,
+    /// A `backend` (not a `listen`, whose capabilities are not a backend's alone) without `from` follows it, before the next `defaults`.
+    backend_user: bool,
+}
+
+/// A kind of section that can inherit from a named `defaults` section.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Inheritor {
+    Defaults,
+    Listen,
+    Frontend,
+    Backend,
+}
+
+/// What `proxy_ref_defaults` (`src/proxy.c`) refuses when a section is initialised from a
+/// named `defaults` section (`<section> ... from <name>`) that defines TCP/HTTP rules:
+///
+/// * another `defaults` section, or a `listen`, cannot inherit them;
+/// * one section kind only can: a frontend and a backend (or listen) cannot both use it;
+/// * a backend cannot inherit `tcp-request connection` or `session` rules, and a frontend
+///   cannot inherit `tcp-response content` rules.
+///
+/// Ibex copies the defaults into each section, so a rule would otherwise run in a section
+/// where `HAProxy` has none of them. `HAProxy` words the location as `file:line`; Ibex's
+/// errors carry no file, so only the line is given.
+fn check_inheritance(
+    kind: Inheritor,
+    tokens: &[Token],
+    named: &std::collections::HashMap<String, DefaultsSection>,
+    lines: &std::collections::HashMap<String, usize>,
+    users: &mut std::collections::HashMap<String, Inheritor>,
+) -> Result<(), ConfigError> {
+    let Some(at) = tokens.iter().skip(1).position(|t| t.text == "from") else { return Ok(()) };
+    let Some(name_tok) = tokens.get(at + 2) else { return Ok(()) };
+    let Some(def) = named.get(&name_tok.text) else { return Ok(()) };
+    let l4_l5 = !def.tcp_req_conn_rules.is_empty() || !def.tcp_req_session_rules.is_empty();
+    let inspect_res = !def.tcp_res_content_rules.is_empty();
+    let defines_rules = l4_l5
+        || inspect_res
+        || !def.http_req_rules.is_empty()
+        || !def.http_res_rules.is_empty()
+        || !def.http_after_res_rules.is_empty()
+        || !def.tcp_req_content_rules.is_empty();
+    if !defines_rules {
+        return Ok(());
+    }
+    let (line, col) = (tokens[0].line, tokens[0].col);
+    let def_at = lines.get(&name_tok.text).copied().unwrap_or(0);
+    let err = |msg: String| Err(ConfigError::new(line, col, msg));
+    match kind {
+        Inheritor::Defaults => {
+            return err(format!("a defaults section cannot inherit from a defaults section defining TCP/HTTP rules (defaults section at line {def_at})"));
+        }
+        Inheritor::Listen => {
+            return err("a listen section cannot inherit from a defaults section defining TCP/HTTP rules".to_string());
+        }
+        Inheritor::Frontend | Inheritor::Backend => {
+            if users.get(&name_tok.text).is_some_and(|first| *first != kind) {
+                return err(format!("frontends and backends cannot inherit from the same defaults section if it defines TCP/HTTP rules (defaults section at line {def_at})"));
+            }
+            if kind == Inheritor::Backend && l4_l5 {
+                return err(format!("a backend section cannot inherit from a defaults section defining 'tcp-request connection' or 'tcp-request session' rules (defaults section at line {def_at})"));
+            }
+            if kind == Inheritor::Frontend && inspect_res {
+                return err(format!("a frontend section cannot inherit from a defaults section defining 'tcp-response content' rules (defaults section at line {def_at})"));
+            }
+        }
+    }
+    users.entry(name_tok.text.clone()).or_insert(kind);
+    Ok(())
 }
 
 pub(crate) fn flush_current_section(
@@ -756,6 +872,36 @@ pub(crate) fn parse_timeout_directive(
         _ => {}
     }
     Ok(())
+}
+
+/// `option redispatch [<interval>]` (`cfgparse-listen.c`): the interval is read with
+/// `atol`, so a non-numeric one is 0, and 0 clears the option. Without one the default is
+/// -1, a redispatch on the last retry.
+pub(crate) fn set_redispatch(on: &mut bool, after: &mut i32, tokens: &[Token]) {
+    *after = -1;
+    *on = true;
+    if let Some(arg) = tokens.get(2) {
+        *after = atol(&arg.text);
+        if *after == 0 {
+            *on = false;
+        }
+    }
+}
+
+/// C `atol`: leading blanks, an optional sign, then digits; anything after is ignored and
+/// no digit is 0. Out-of-range values saturate.
+fn atol(s: &str) -> i32 {
+    let t = s.trim_start();
+    let (neg, digits) = match t.as_bytes().first() {
+        Some(b'-') => (true, &t[1..]),
+        Some(b'+') => (false, &t[1..]),
+        _ => (false, t),
+    };
+    let mut n: i64 = 0;
+    for b in digits.bytes().take_while(u8::is_ascii_digit) {
+        n = (n * 10 + i64::from(b - b'0')).min(i64::from(i32::MAX));
+    }
+    i32::try_from(if neg { -n } else { n }).unwrap_or(0)
 }
 
 pub(crate) fn parse_retries(retries: &mut u32, tokens: &[Token], kw: &Token) -> Result<(), ConfigError> {
