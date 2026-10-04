@@ -1064,6 +1064,11 @@ impl Registry {
             out_type: SampleType::Sint,
             func: req_hdr_cnt_fetch,
         });
+        self.register_fetch(FetchDesc {
+            name: "req.fhdr_cnt",
+            out_type: SampleType::Sint,
+            func: req_hdr_cnt_fetch,
+        });
 
         self.register_fetch(FetchDesc {
             name: "res.hdr_cnt",

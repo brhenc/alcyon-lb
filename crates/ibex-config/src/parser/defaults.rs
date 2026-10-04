@@ -203,8 +203,12 @@ pub(crate) fn parse_option_defaults(
         return Ok(());
     }
     match tokens[1].text.as_str() {
-        "forwardfor" => defaults.forwardfor = Some(parse_forward_option(tokens, kw)?),
-        "originalto" => defaults.originalto = Some(parse_forward_option(tokens, kw)?),
+        "forwardfor" => {
+            let (except, if_none) = parse_forward_option(tokens, kw)?;
+            defaults.forwardfor = Some(except);
+            defaults.forwardfor_if_none = if_none;
+        }
+        "originalto" => defaults.originalto = Some(parse_forward_option(tokens, kw)?.0),
         "redispatch" => set_redispatch(&mut defaults.redisp, &mut defaults.redisp_after, tokens),
         "http-buffer-request" => defaults.buffer_request = true,
         "accept-unsafe-violations-in-http-request" => defaults.stats.accept_unsafe_request = true,

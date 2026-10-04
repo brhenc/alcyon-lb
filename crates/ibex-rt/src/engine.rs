@@ -1479,6 +1479,7 @@ fn init_proxy_from_listen(proxy_idx: usize, listen: &ibex_config::ListenSection,
             let mut sc = listen.stats.clone();
             sc.raw_timeouts = listen.timeouts;
             sc.forwardfor.clone_from(&listen.forwardfor);
+            sc.forwardfor_if_none = listen.forwardfor_if_none;
             sc.originalto.clone_from(&listen.originalto);
             sc
         },
@@ -1584,6 +1585,7 @@ fn init_proxy_from_frontend(proxy_idx: usize, fe: &ibex_config::FrontendSection,
             let mut sc = fe.stats.clone();
             sc.raw_timeouts = fe.timeouts;
             sc.forwardfor.clone_from(&fe.forwardfor);
+            sc.forwardfor_if_none = fe.forwardfor_if_none;
             sc.originalto.clone_from(&fe.originalto);
             sc
         },
@@ -1712,6 +1714,7 @@ fn init_proxy_from_backend(proxy_idx: usize, be: &ibex_config::BackendSection, n
             let mut sc = be.stats.clone();
             sc.raw_timeouts = be.timeouts;
             sc.forwardfor.clone_from(&be.forwardfor);
+            sc.forwardfor_if_none = be.forwardfor_if_none;
             sc.originalto.clone_from(&be.originalto);
             sc
         },
@@ -6939,12 +6942,20 @@ impl EngineDispatcher<'_> {
         let fe_be = [proxy_idx, be_idx];
         let xff_excepts: Vec<&str> = fe_be.iter().filter_map(|&i| proxies[i].stats_config.forwardfor.as_deref()).collect();
         if !xff_excepts.is_empty() {
+            // `if-none` only counts when no proxy that sets the option leaves it out
+            // (`PR_O_FF_ALWAYS`): then a header the client sent is kept as the only one.
+            let always = fe_be.iter().any(|&i| {
+                let sc = &proxies[i].stats_config;
+                sc.forwardfor.is_some() && !sc.forwardfor_if_none
+            });
+            let has_own = entry.sess.htx_slice().is_some_and(|s| s.get_header("x-forwarded-for").is_some());
             let client_ip = entry.sess.client_addr.map(|a| a.ip());
-            if let Some(ip) = client_ip {
+            if let Some(ip) = client_ip.filter(|_| always || !has_own) {
                 let in_except = xff_excepts.iter().any(|e| !e.is_empty() && ip_in_cidr(ip, e));
                 if !in_except {
                     let ip_str = ip.to_string();
-                    set_req_header(&mut entry.sess, "X-Forwarded-For", &ip_str);
+                    // A new line after the client's own, as `HAProxy` writes it.
+                    add_req_header(&mut entry.sess, "X-Forwarded-For", &ip_str);
                 }
             }
         }

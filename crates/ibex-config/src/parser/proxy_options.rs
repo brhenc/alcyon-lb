@@ -283,16 +283,16 @@ pub(crate) fn check_no_option<'t>(section: OptSection, tokens: &'t [Token], kw: 
 
 /// `option forwardfor [except <net>] [header <name>] [if-none]` and
 /// `option originalto [except <net>] [header <name>]`. Returns the `except` network, or
-/// an empty string for none.
+/// an empty string for none, and whether `if-none` was given.
 ///
 /// Ibex always writes the client (destination) address to `X-Forwarded-For`
-/// (`X-Original-To`), replacing what the client sent. With another header name, the
-/// server would read a header only the client wrote; with `if-none`, `HAProxy` keeps the
-/// client's own header. Both are refused rather than run differently.
-pub(crate) fn parse_forward_option(tokens: &[Token], kw: &Token) -> Result<String, ConfigError> {
+/// (`X-Original-To`). With another header name, the server would read a header only the
+/// client wrote: refused rather than run differently.
+pub(crate) fn parse_forward_option(tokens: &[Token], kw: &Token) -> Result<(String, bool), ConfigError> {
     let name = tokens[1].text.as_str();
     let allowed = if name == "forwardfor" { "'except', 'header' and 'if-none'" } else { "'except' and 'header'" };
     let mut except = String::new();
+    let mut if_none = false;
     let mut i = 2;
     while let Some(arg) = tokens.get(i).map(|t| t.text.as_str()) {
         match arg {
@@ -313,15 +313,11 @@ pub(crate) fn parse_forward_option(tokens: &[Token], kw: &Token) -> Result<Strin
                 ));
             }
             "if-none" if name == "forwardfor" => {
-                return Err(err(
-                    kw,
-                    "'option forwardfor if-none' is not supported: Ibex replaces the client's \
-                     X-Forwarded-For instead of keeping it."
-                        .to_string(),
-                ));
+                if_none = true;
+                i += 1;
             }
             _ => return Err(err(kw, format!("'option {name}' only supports optional values: {allowed}."))),
         }
     }
-    Ok(except)
+    Ok((except, if_none))
 }

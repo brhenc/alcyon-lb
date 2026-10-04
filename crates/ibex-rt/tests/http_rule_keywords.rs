@@ -188,6 +188,38 @@ fn errorloc303_and_a_relative_location() {
     assert!(got.starts_with("HTTP/1.1 302 Found\r\n") && got.contains("location: /l403\r\n"), "{got:?}");
 }
 
+const FORWARDFOR: &str = "defaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n\
+frontend fe\n  bind {fe}\n  {ffopt}\n  use_backend be1 if { path /req1 }\n  use_backend be2 if { path /req2 }\n  use_backend be3 if { path /req3 }\n\
+backend be1\n  option forwardfor\n  server s {srv}\n\
+backend be2\n  option forwardfor if-none\n  server s {srv}\n\
+backend be3\n  server s {srv}\n";
+
+/// How many `x-forwarded-for` header lines the server got for `path`, the client having
+/// sent one of its own when `own`.
+fn xff_count(fe: SocketAddr, path: &str, own: bool) -> usize {
+    let hdr = if own { "x-forwarded-for: 127.0.0.9\r\n" } else { "" };
+    let got = send(fe, &format!("GET {path} HTTP/1.1\r\nHost: a\r\n{hdr}Connection: close\r\n\r\n"));
+    let body = got.split("\r\n\r\n").nth(1).unwrap_or("");
+    body.lines().filter(|l| l.to_ascii_lowercase().starts_with("x-forwarded-for:")).count()
+}
+
+#[test]
+fn forwardfor_if_none_adds_only_where_no_proxy_asks_for_it_always() {
+    // Measured on HAProxy 3.5-dev8-885761-29 (reg-tests/http-rules/ifnone-forwardfor.vtc,
+    // with the same frontend and backend options): the header is added always as soon as the
+    // frontend or the backend asks for it without `if-none`; and it is added, not replaced.
+    let (_i, fe) = start(&FORWARDFOR.replace("{ffopt}", "option forwardfor if-none"));
+    assert_eq!(xff_count(fe, "/req1", true), 2);
+    assert_eq!(xff_count(fe, "/req2", true), 1);
+    assert_eq!(xff_count(fe, "/req2", false), 1);
+    assert_eq!(xff_count(fe, "/req3", true), 1);
+    assert_eq!(xff_count(fe, "/req3", false), 1);
+    let (_i, fe) = start(&FORWARDFOR.replace("{ffopt}", "option forwardfor"));
+    assert_eq!(xff_count(fe, "/req1", true), 2);
+    assert_eq!(xff_count(fe, "/req2", true), 2);
+    assert_eq!(xff_count(fe, "/req3", true), 2);
+}
+
 const ERR_FAIL: &str = "{global}defaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n\
 frontend fe\n  bind {fe}\n  http-request track-sc0 path\n\
   http-after-response add-header x-table err=%[sc0_http_err_cnt],fail=%[sc0_http_fail_cnt]\n\

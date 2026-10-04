@@ -196,12 +196,12 @@ fn every_haproxy_option_negated_in_every_section() {
 /// `except <net>`, `header <name>` and (forwardfor only) `if-none`, and refuses anything
 /// else: "'option forwardfor' only supports optional values: 'except', 'header' and
 /// 'if-none'.", "'option forwardfor except' expects <address>[/mask] as argument.".
-/// Ibex sends the client address in `X-Forwarded-For` / `X-Original-To` always, so a
-/// different header name (the server would read a header only the client wrote) and
-/// `if-none` are refused.
+/// Ibex sends the client address in `X-Forwarded-For` / `X-Original-To`, so a
+/// different header name (the server would read a header only the client wrote) is
+/// refused; `if-none` is implemented (T124).
 #[test]
 fn forwardfor_and_originalto_arguments() {
-    for line in ["option forwardfor", "option forwardfor except 10.0.0.0/8", "option originalto except 10.0.0.1"] {
+    for line in ["option forwardfor", "option forwardfor except 10.0.0.0/8", "option forwardfor if-none", "option originalto except 10.0.0.1"] {
         assert!(config('b', line).is_ok(), "{line}");
     }
     for line in [
@@ -209,7 +209,6 @@ fn forwardfor_and_originalto_arguments() {
         "option forwardfor except",
         "option originalto bogus",
         "option forwardfor header X-Real-IP",
-        "option forwardfor if-none",
         "option originalto header X-Orig",
     ] {
         let err = config('b', line).expect_err(line);

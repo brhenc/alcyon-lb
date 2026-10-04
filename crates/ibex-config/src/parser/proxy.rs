@@ -119,6 +119,7 @@ pub(crate) fn parse_listen_header(
         hash_type: defaults.and_then(|d| d.hash_type),
         hash_preserve_affinity: defaults.and_then(|d| d.hash_preserve_affinity),
         forwardfor: defaults.and_then(|d| d.forwardfor.clone()),
+        forwardfor_if_none: defaults.is_some_and(|d| d.forwardfor_if_none),
         originalto: defaults.and_then(|d| d.originalto.clone()),
         stats: defaults.map_or_else(StatsConfig::default, |d| d.stats.clone()),
         error_files: defaults.map_or_else(HashMap::new, |d| d.error_files.clone()),
@@ -198,6 +199,7 @@ pub(crate) fn parse_frontend_header(
         accept_proxy: false,
         accept_proxy_v2: false,
         forwardfor: defaults.and_then(|d| d.forwardfor.clone()),
+        forwardfor_if_none: defaults.is_some_and(|d| d.forwardfor_if_none),
         originalto: defaults.and_then(|d| d.originalto.clone()),
         stats: defaults.map_or_else(StatsConfig::default, |d| d.stats.clone()),
         error_files: defaults.map_or_else(HashMap::new, |d| d.error_files.clone()),
@@ -284,6 +286,7 @@ pub(crate) fn parse_backend_header(
         hash_type: defaults.and_then(|d| d.hash_type),
         hash_preserve_affinity: defaults.and_then(|d| d.hash_preserve_affinity),
         forwardfor: defaults.and_then(|d| d.forwardfor.clone()),
+        forwardfor_if_none: defaults.is_some_and(|d| d.forwardfor_if_none),
         originalto: defaults.and_then(|d| d.originalto.clone()),
         stats: defaults.map_or_else(StatsConfig::default, |d| d.stats.clone()),
         error_files: defaults.map_or_else(HashMap::new, |d| d.error_files.clone()),
@@ -815,8 +818,12 @@ pub(crate) fn parse_option_listen(
         return Ok(());
     }
     match tokens[1].text.as_str() {
-        "forwardfor" => proxy.forwardfor = Some(parse_forward_option(tokens, kw)?),
-        "originalto" => proxy.originalto = Some(parse_forward_option(tokens, kw)?),
+        "forwardfor" => {
+            let (except, if_none) = parse_forward_option(tokens, kw)?;
+            proxy.forwardfor = Some(except);
+            proxy.forwardfor_if_none = if_none;
+        }
+        "originalto" => proxy.originalto = Some(parse_forward_option(tokens, kw)?.0),
         "redispatch" => set_redispatch(&mut proxy.redisp, &mut proxy.redisp_after, tokens),
         "http-buffer-request" => proxy.buffer_request = true,
         "accept-unsafe-violations-in-http-request" => proxy.stats.accept_unsafe_request = true,
@@ -858,11 +865,12 @@ pub(crate) fn parse_option_frontend(
         fe.buffer_request = true;
         return Ok(());
     }
-    let except = Some(parse_forward_option(tokens, kw)?);
+    let (except, if_none) = parse_forward_option(tokens, kw)?;
     if tokens[1].text == "forwardfor" {
-        fe.forwardfor = except;
+        fe.forwardfor = Some(except);
+        fe.forwardfor_if_none = if_none;
     } else {
-        fe.originalto = except;
+        fe.originalto = Some(except);
     }
     Ok(())
 }
@@ -882,8 +890,12 @@ pub(crate) fn parse_option_backend(
         return Ok(());
     }
     match tokens[1].text.as_str() {
-        "forwardfor" => be.forwardfor = Some(parse_forward_option(tokens, kw)?),
-        "originalto" => be.originalto = Some(parse_forward_option(tokens, kw)?),
+        "forwardfor" => {
+            let (except, if_none) = parse_forward_option(tokens, kw)?;
+            be.forwardfor = Some(except);
+            be.forwardfor_if_none = if_none;
+        }
+        "originalto" => be.originalto = Some(parse_forward_option(tokens, kw)?.0),
         "redispatch" => set_redispatch(&mut be.redisp, &mut be.redisp_after, tokens),
         "http-buffer-request" => be.buffer_request = true,
         "log-health-checks" => be.log_health_checks = true,
