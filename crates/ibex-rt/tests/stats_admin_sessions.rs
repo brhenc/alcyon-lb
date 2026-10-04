@@ -306,7 +306,9 @@ backend test_backend
     client.set_nonblocking(true).expect("nonblocking");
     engine.step(Tick(100)).expect("step");
 
-    client.write_all(b"clear counters test_backend\n").expect("write");
+    // HAProxy has no per-proxy form (`clear counters test_backend` only resets maxima, as
+    // plain `clear counters` does, T146 item 20): `all` is what zeroes the totals.
+    client.write_all(b"clear counters all\n").expect("write");
     step_engine_until(
         &mut engine,
         |eng| eng.proxies[1].stats[0].bytes_in.load(std::sync::atomic::Ordering::Relaxed) == 0,

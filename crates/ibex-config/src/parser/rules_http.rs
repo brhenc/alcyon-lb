@@ -5,7 +5,7 @@ use super::{
     find_cond_idx, join_tokens_until, parse_acl_condition_from_tokens, parse_error_body_args,
     parse_rule_condition, parse_gpc_array_action, parse_sc_counter_action, parse_u16, ConfigError, ErrorPageSource,
     AclCondition, HttpAfterResAction, HttpAfterResRule, HttpReqAction, HttpReqRule, HttpResAction,
-    HttpResRule, RedirectCookie, RetriesValue, Token,
+    HttpResRule, RedirectCookie, RedirectKind, RedirectRule, RetriesValue, Token,
 };
 
 /// The single sample expression at `tokens[2]` and the optional condition after it, as
@@ -524,26 +524,8 @@ fn parse_http_req_rule_at(
             line: 0,
         });
     } else if act_str == "replace-path" {
-        if tokens.len() < 4 {
-            return Err(ConfigError::new(
-                kw.line,
-                kw.col,
-                "<http-request replace-path> expects <regex> and <replace>.",
-            ));
-        }
-        let regex = tokens[2].text.clone();
-        let repl = tokens[3].text.clone();
-        let cond_idx = find_cond_idx(tokens, 4);
-        let cond = if let Some(idx) = cond_idx {
-            parse_acl_condition_from_tokens(&tokens[idx..])?
-        } else {
-            None
-        };
-        rules.push(HttpReqRule {
-            action: HttpReqAction::ReplacePath { regex, repl },
-            cond,
-            line: 0,
-        });
+        let (regex, repl, cond) = parse_replace_uri(tokens, "replace-path")?;
+        rules.push(HttpReqRule { action: HttpReqAction::ReplacePath { regex, repl }, cond, line: 0 });
     } else if act_str == "set-pathq" {
         if tokens.len() < 3 {
             return Err(ConfigError::new(
@@ -565,47 +547,11 @@ fn parse_http_req_rule_at(
             line: 0,
         });
     } else if act_str == "replace-pathq" {
-        if tokens.len() < 4 {
-            return Err(ConfigError::new(
-                kw.line,
-                kw.col,
-                "<http-request replace-pathq> expects <regex> and <replace>.",
-            ));
-        }
-        let regex = tokens[2].text.clone();
-        let repl = tokens[3].text.clone();
-        let cond_idx = find_cond_idx(tokens, 4);
-        let cond = if let Some(idx) = cond_idx {
-            parse_acl_condition_from_tokens(&tokens[idx..])?
-        } else {
-            None
-        };
-        rules.push(HttpReqRule {
-            action: HttpReqAction::ReplacePathq { regex, repl },
-            cond,
-            line: 0,
-        });
+        let (regex, repl, cond) = parse_replace_uri(tokens, "replace-pathq")?;
+        rules.push(HttpReqRule { action: HttpReqAction::ReplacePathq { regex, repl }, cond, line: 0 });
     } else if act_str == "replace-uri" {
-        if tokens.len() < 4 {
-            return Err(ConfigError::new(
-                kw.line,
-                kw.col,
-                "<http-request replace-uri> expects <regex> and <replace>.",
-            ));
-        }
-        let regex = tokens[2].text.clone();
-        let repl = tokens[3].text.clone();
-        let cond_idx = find_cond_idx(tokens, 4);
-        let cond = if let Some(idx) = cond_idx {
-            parse_acl_condition_from_tokens(&tokens[idx..])?
-        } else {
-            None
-        };
-        rules.push(HttpReqRule {
-            action: HttpReqAction::ReplaceUri { regex, repl },
-            cond,
-            line: 0,
-        });
+        let (regex, repl, cond) = parse_replace_uri(tokens, "replace-uri")?;
+        rules.push(HttpReqRule { action: HttpReqAction::ReplaceUri { regex, repl }, cond, line: 0 });
     } else if act_str == "set-query" {
         if tokens.len() < 3 {
             return Err(ConfigError::new(
@@ -746,51 +692,8 @@ fn parse_http_req_rule_at(
             line: 0,
         });
     } else if act_str == "redirect" {
-        let mut location = None;
-        let mut scheme = None;
-        let mut prefix = None;
-        let mut code = None;
-        let cond_idx = find_cond_idx(tokens, 2);
-        let limit = cond_idx.unwrap_or(tokens.len());
-        let mut i = 2;
-        while i < limit {
-            match tokens[i].text.as_str() {
-                "location" if i + 1 < limit => {
-                    location = Some(tokens[i + 1].text.clone());
-                    i += 2;
-                }
-                "scheme" if i + 1 < limit => {
-                    scheme = Some(tokens[i + 1].text.clone());
-                    i += 2;
-                }
-                "prefix" if i + 1 < limit => {
-                    prefix = Some(tokens[i + 1].text.clone());
-                    i += 2;
-                }
-                "code" if i + 1 < limit => {
-                    code = Some(parse_u16(&tokens[i + 1], "code")?);
-                    i += 2;
-                }
-                _ => {
-                    i += 1;
-                }
-            }
-        }
-        let cond = if let Some(idx) = cond_idx {
-            parse_acl_condition_from_tokens(&tokens[idx..])?
-        } else {
-            None
-        };
-        rules.push(HttpReqRule {
-            action: HttpReqAction::Redirect {
-                location,
-                scheme,
-                prefix,
-                code,
-            },
-            cond,
-            line: 0,
-        });
+        let (rule, cond) = parse_req_redirect(tokens)?;
+        rules.push(HttpReqRule { action: HttpReqAction::Redirect(rule), cond, line: 0 });
     } else if act_str == "strict-mode" {
         let on = tokens.get(2).is_none_or(|t| t.text == "on");
         let cond_idx = find_cond_idx(tokens, 2);
@@ -1316,6 +1219,130 @@ fn parse_http_res_rule_at(
         ));
     }
     Ok(())
+}
+
+/// `http-request replace-path|replace-pathq|replace-uri <match-regex> <replace-format>
+/// [if|unless <cond>]` (`parse_replace_uri`, `src/http_act.c`): exactly two arguments, then
+/// a condition or nothing; a regex that does not compile stops the load.
+fn parse_replace_uri(tokens: &[Token], name: &str) -> Result<(String, String, Option<AclCondition>), ConfigError> {
+    let kw = &tokens[1];
+    let bad_count = tokens.len() < 4 || tokens.get(4).is_some_and(|t| t.text != "if" && t.text != "unless");
+    if bad_count {
+        return Err(ConfigError::new(
+            kw.line,
+            kw.col,
+            format!("error detected while parsing 'http-request {name}' rule : expects exactly 2 arguments <match-regex> and <replace-format>."),
+        ));
+    }
+    if let Err(e) = ibex_regex::UserRegex::new(&tokens[2].text) {
+        return Err(ConfigError::new(
+            tokens[2].line,
+            tokens[2].col,
+            format!("error detected while parsing 'http-request {name}' rule : failed to parse the regex : regex '{}' is invalid ({e}).", tokens[2].text),
+        ));
+    }
+    let cond = find_cond_idx(tokens, 4).map(|idx| parse_acl_condition_from_tokens(&tokens[idx..])).transpose()?.flatten();
+    Ok((tokens[2].text.clone(), tokens[3].text.clone(), cond))
+}
+
+/// `http-request redirect location|prefix|scheme <fmt> [code <c>] [set-cookie <c> |
+/// set-cookie-fmt <f> | clear-cookie <n>] [drop-query | keep-query] [append-slash]
+/// [ignore-empty] [if|unless <cond>]` (`http_parse_redirect_rule`, `src/http_act.c`). The
+/// last type on the line stands, as does the last cookie option.
+fn parse_req_redirect(tokens: &[Token]) -> Result<(RedirectRule, Option<AclCondition>), ConfigError> {
+    let cond_idx = find_cond_idx(tokens, 2);
+    let limit = cond_idx.unwrap_or(tokens.len());
+    let mut rule = RedirectRule {
+        kind: RedirectKind::Location,
+        target: String::new(),
+        code: 302,
+        cookie: None,
+        drop_query: false,
+        keep_query: false,
+        append_slash: false,
+        ignore_empty: false,
+    };
+    let mut have_kind = false;
+    let mut i = 2;
+    while i < limit {
+        let t = &tokens[i];
+        let word = t.text.as_str();
+        let arg = || {
+            tokens
+                .get(i + 1)
+                .filter(|_| i + 1 < limit)
+                .ok_or_else(|| ConfigError::new(t.line, t.col, format!("missing argument for '{word}'.")))
+        };
+        match word {
+            "location" | "prefix" | "scheme" => {
+                rule.target.clone_from(&arg()?.text);
+                rule.kind = match word {
+                    "location" => RedirectKind::Location,
+                    "prefix" => RedirectKind::Prefix,
+                    _ => RedirectKind::Scheme,
+                };
+                have_kind = true;
+                i += 2;
+            }
+            "code" => {
+                let a = arg()?;
+                rule.code = match a.text.parse::<u16>() {
+                    Ok(c @ (301 | 302 | 303 | 307 | 308)) => c,
+                    _ => {
+                        return Err(ConfigError::new(
+                            a.line,
+                            a.col,
+                            format!("'code': unsupported HTTP code '{}' (must be one of 301, 302, 303, 307 or 308).", a.text),
+                        ))
+                    }
+                };
+                i += 2;
+            }
+            "set-cookie" => {
+                rule.cookie = Some(RedirectCookie::Set(arg()?.text.clone()));
+                i += 2;
+            }
+            "set-cookie-fmt" => {
+                rule.cookie = Some(RedirectCookie::SetFmt(arg()?.text.clone()));
+                i += 2;
+            }
+            "clear-cookie" => {
+                rule.cookie = Some(RedirectCookie::Clear(arg()?.text.clone()));
+                i += 2;
+            }
+            "drop-query" => {
+                rule.drop_query = true;
+                i += 1;
+            }
+            "keep-query" => {
+                rule.keep_query = true;
+                i += 1;
+            }
+            "append-slash" => {
+                rule.append_slash = true;
+                i += 1;
+            }
+            "ignore-empty" => {
+                rule.ignore_empty = true;
+                i += 1;
+            }
+            _ => {
+                return Err(ConfigError::new(
+                    t.line,
+                    t.col,
+                    format!(
+                        "expects 'code', 'prefix', 'location', 'scheme', 'set-cookie', 'set-cookie-fmt', 'clear-cookie', 'drop-query', 'keep-query', 'ignore-empty' or 'append-slash' (was '{word}')."
+                    ),
+                ))
+            }
+        }
+    }
+    if !have_kind {
+        let at = tokens.get(1).unwrap_or(&tokens[0]);
+        return Err(ConfigError::new(at.line, at.col, "redirection type expected ('prefix', 'location', or 'scheme')."));
+    }
+    let cond = cond_idx.map(|idx| parse_acl_condition_from_tokens(&tokens[idx..])).transpose()?.flatten();
+    Ok((rule, cond))
 }
 
 /// `http-response redirect location <fmt> [code <c>] [set-cookie <c> | clear-cookie <n>]

@@ -157,7 +157,7 @@ impl Expr {
                         "len" => "len",
                         "bin" => "bin",
                         "found" => "found",
-                        other => return Err(format!("Unknown matcher method '{other}'")),
+                        other => return Err(format!("unknown matching method '{other}' when parsing ACL expression")),
                     };
                     forced = true;
                 }

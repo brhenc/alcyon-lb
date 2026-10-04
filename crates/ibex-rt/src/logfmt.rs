@@ -1328,13 +1328,18 @@ fn sample(out: &mut Out, s: &Sample, o: Opts, cast: Cast, converted: bool) {
                 out.push('-');
             }
         }
-        Sample::Bin(v) if v.is_empty() && !o.quote => {
-            if o.mandatory {
-                out.push('-');
+        // Written as text, a binary is cast with `c_bin2str`: it ends at the first NUL.
+        Sample::Bin(v) => {
+            let v = &v[..v.iter().position(|&c| c == 0).unwrap_or(v.len())];
+            if v.is_empty() && !o.quote {
+                if o.mandatory {
+                    out.push('-');
+                }
+            } else {
+                text(out, Some(v), o);
             }
         }
         Sample::Str(v) => text(out, Some(v.as_str()), o),
-        Sample::Bin(v) => text(out, Some(v.as_slice()), o),
         Sample::Sint(v) => {
             let _ = write!(out, "{v}");
         }

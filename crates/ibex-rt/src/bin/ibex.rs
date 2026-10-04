@@ -591,6 +591,14 @@ fn main() {
         }
     };
 
+    // 5-bis. `.warning` and `.notice` lines of the configuration, as HAProxy prints them
+    //     while it loads (`.alert` has failed the parse).
+    for m in &config.directive_messages {
+        let file = if config_files.len() == 1 { config_files[0].display().to_string() } else { "<config>".to_string() };
+        let (sev, pad) = if m.warning { ("WARNING", " ") } else { ("NOTICE", "  ") };
+        eprintln!("[{sev}]{pad} ({}) : config : parsing [{file}:{}]: '{}'.", process::id(), m.line, m.text);
+    }
+
     // 5a. Every rule action's expression must name fetches and converters that exist.
     //     `HAProxy` refuses the configuration otherwise; checked here so that `-c` reports
     //     it and a start fails before anything is daemonized, signalled or bound.

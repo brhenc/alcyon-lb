@@ -852,7 +852,12 @@ impl Registry {
             out_type: SampleType::Str,
             func: |ctx, _args| {
                 let uri = get_context_uri(ctx)?;
-                let (_, path, _) = split_uri(uri);
+                let (prefix, path, _) = split_uri(uri);
+                // `http_parse_path`: a target that is neither an absolute path nor an
+                // absolute URI (`*`, `host:port`, what `replace-path a Y` leaves) has none.
+                if prefix.is_empty() && !uri.starts_with('/') {
+                    return None;
+                }
                 Some(Sample::Str(path.to_string()))
             },
         });
@@ -862,7 +867,10 @@ impl Registry {
             out_type: SampleType::Str,
             func: |ctx, _args| {
                 let uri = get_context_uri(ctx)?;
-                let (_, path, query) = split_uri(uri);
+                let (prefix, path, query) = split_uri(uri);
+                if prefix.is_empty() && !uri.starts_with('/') {
+                    return None;
+                }
                 if query.is_empty() {
                     Some(Sample::Str(path.to_string()))
                 } else {
@@ -2867,7 +2875,8 @@ impl Registry {
                             && !(bytes.get(i + 1).is_some_and(u8::is_ascii_hexdigit)
                                 && bytes.get(i + 2).is_some_and(u8::is_ascii_hexdigit))
                     });
-                    if bad {
+                    // `%00` "cannot be represented in a string" (`url_decode`, `src/tools.c`).
+                    if bad || s.contains("%00") {
                         return None;
                     }
                     Some(Sample::Str(url_decode(&s, in_form)))
