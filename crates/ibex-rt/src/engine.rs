@@ -6453,6 +6453,24 @@ impl EngineDispatcher<'_> {
                             rebuild_req_buffer(sess);
                         }
                     }
+                    ibex_config::HttpReqAction::ReplaceUri { regex, repl } => {
+                        // The whole target, scheme and authority included; the first match only.
+                        let rebuilt = {
+                            let current_uri = sess.req_uri.as_deref().unwrap_or("/");
+                            let rust_repl = translate_backreferences(repl);
+                            regex::Regex::new(regex)
+                                .ok()
+                                .filter(|re| re.is_match(current_uri))
+                                .map(|re| re.replace(current_uri, &rust_repl).to_string())
+                        };
+                        if let Some(rebuilt) = rebuilt {
+                            sess.with_htx_mut(|htx| {
+                                let _ = htx.set_uri(&rebuilt);
+                            });
+                            sess.req_uri = Some(rebuilt);
+                            rebuild_req_buffer(sess);
+                        }
+                    }
                     ibex_config::HttpReqAction::SetQuery { fmt } => {
                         let new_query = format_sample_string(fmt, &make_ctx!(sess), registry);
                         let rebuilt = {

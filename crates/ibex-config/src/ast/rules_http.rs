@@ -85,6 +85,10 @@ pub enum HttpReqAction {
         regex: String,
         repl: String,
     },
+    ReplaceUri {
+        regex: String,
+        repl: String,
+    },
     SetQuery {
         fmt: String,
     },

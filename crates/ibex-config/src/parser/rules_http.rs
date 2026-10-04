@@ -553,6 +553,27 @@ fn parse_http_req_rule_at(
             cond,
             line: 0,
         });
+    } else if act_str == "replace-uri" {
+        if tokens.len() < 4 {
+            return Err(ConfigError::new(
+                kw.line,
+                kw.col,
+                "<http-request replace-uri> expects <regex> and <replace>.",
+            ));
+        }
+        let regex = tokens[2].text.clone();
+        let repl = tokens[3].text.clone();
+        let cond_idx = find_cond_idx(tokens, 4);
+        let cond = if let Some(idx) = cond_idx {
+            parse_acl_condition_from_tokens(&tokens[idx..])?
+        } else {
+            None
+        };
+        rules.push(HttpReqRule {
+            action: HttpReqAction::ReplaceUri { regex, repl },
+            cond,
+            line: 0,
+        });
     } else if act_str == "set-query" {
         if tokens.len() < 3 {
             return Err(ConfigError::new(
