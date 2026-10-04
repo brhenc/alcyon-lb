@@ -726,16 +726,12 @@ impl CliApplet {
 
                 if let Ok(entries) = table.dump_entries() {
                     for (k, v) in entries {
+                        let fields = table.data_fields(&v);
                         if let (Some(ff), Some(fo), Some(fv)) = (filter_field, filter_op, filter_val) {
-                            let field_val = match ff {
-                                "conn_cnt" => v.conn_cnt as u64,
-                                "conn_cur" => v.conn_cur as u64,
-                                "gpc0" => v.gpc0,
-                                "gpc1" => v.gpc1,
-                                "gpt0" => v.gpt0 as u64,
-                                "conn_rate" => v.conn_rate.as_ref().map_or(0, |r| r.rate() as u64),
-                                "http_req_rate" => v.http_req_rate.as_ref().map_or(0, |r| r.rate() as u64),
-                                _ => 0,
+                            // An entry of a table that does not store the type has no value
+                            // to compare: it is left out.
+                            let Some(field_val) = fields.iter().find(|(n, _, _)| n == ff).map(|(_, _, x)| *x) else {
+                                continue;
                             };
                             let keep = match fo {
                                 "eq" => field_val == fv,
@@ -757,33 +753,30 @@ impl CliApplet {
                                 let mut s = String::new();
                                 for byte in b {
                                     use std::fmt::Write;
-                                    let _ = write!(s, "{:02X}", byte);
+                                    let _ = write!(s, "{byte:02x}");
                                 }
                                 s
                             }
                         };
 
-                        let _ = write!(out, "0x0: key={} use=0 exp=0", key_str);
-                        if v.conn_cnt > 0 {
-                            let _ = write!(out, " conn_cnt={}", v.conn_cnt);
-                        }
-                        if v.conn_cur > 0 {
-                            let _ = write!(out, " conn_cur={}", v.conn_cur);
-                        }
-                        if v.gpc0 > 0 {
-                            let _ = write!(out, " gpc0={}", v.gpc0);
-                        }
-                        if v.gpc1 > 0 {
-                            let _ = write!(out, " gpc1={}", v.gpc1);
-                        }
-                        if v.gpt0 > 0 {
-                            let _ = write!(out, " gpt0={}", v.gpt0);
-                        }
-                        if let Some(ref r) = v.conn_rate {
-                            let _ = write!(out, " conn_rate(10000)={}", r.rate());
-                        }
-                        if let Some(ref r) = v.http_req_rate {
-                            let _ = write!(out, " http_req_rate(10000)={}", r.rate());
+                        // `exp=` is what is left of `expire`; the address is only an identity.
+                        let left = cfg.expire.saturating_sub(v.last_updated.elapsed()).as_millis();
+                        let addr = {
+                            use std::hash::{Hash, Hasher};
+                            let mut h = std::collections::hash_map::DefaultHasher::new();
+                            key_str.hash(&mut h);
+                            h.finish() & 0xffff_ffff_f0
+                        };
+                        let _ = write!(out, "{addr:#x}: key={key_str} use={} exp={left} shard=0", v.trackers);
+                        for (name, period, val) in &fields {
+                            match period {
+                                Some(p) => {
+                                    let _ = write!(out, " {name}({p})={val}");
+                                }
+                                None => {
+                                    let _ = write!(out, " {name}={val}");
+                                }
+                            }
                         }
                         out.push('\n');
                     }
