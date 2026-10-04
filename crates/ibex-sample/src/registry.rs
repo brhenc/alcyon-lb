@@ -850,7 +850,12 @@ impl Registry {
             out_type: SampleType::Str,
             func: |ctx, _args| {
                 let uri = get_context_uri(ctx)?;
-                let (_, path, _) = split_uri(uri);
+                let (prefix, path, _) = split_uri(uri);
+                // `http_parse_path`: a target that is neither an absolute path nor an
+                // absolute URI (`*`, `host:port`, what `replace-path a Y` leaves) has none.
+                if prefix.is_empty() && !uri.starts_with('/') {
+                    return None;
+                }
                 Some(Sample::Str(path.to_string()))
             },
         });
@@ -860,7 +865,10 @@ impl Registry {
             out_type: SampleType::Str,
             func: |ctx, _args| {
                 let uri = get_context_uri(ctx)?;
-                let (_, path, query) = split_uri(uri);
+                let (prefix, path, query) = split_uri(uri);
+                if prefix.is_empty() && !uri.starts_with('/') {
+                    return None;
+                }
                 if query.is_empty() {
                     Some(Sample::Str(path.to_string()))
                 } else {

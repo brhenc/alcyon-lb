@@ -507,26 +507,8 @@ fn parse_http_req_rule_at(
             line: 0,
         });
     } else if act_str == "replace-path" {
-        if tokens.len() < 4 {
-            return Err(ConfigError::new(
-                kw.line,
-                kw.col,
-                "<http-request replace-path> expects <regex> and <replace>.",
-            ));
-        }
-        let regex = tokens[2].text.clone();
-        let repl = tokens[3].text.clone();
-        let cond_idx = find_cond_idx(tokens, 4);
-        let cond = if let Some(idx) = cond_idx {
-            parse_acl_condition_from_tokens(&tokens[idx..])?
-        } else {
-            None
-        };
-        rules.push(HttpReqRule {
-            action: HttpReqAction::ReplacePath { regex, repl },
-            cond,
-            line: 0,
-        });
+        let (regex, repl, cond) = parse_replace_uri(tokens, "replace-path")?;
+        rules.push(HttpReqRule { action: HttpReqAction::ReplacePath { regex, repl }, cond, line: 0 });
     } else if act_str == "set-pathq" {
         if tokens.len() < 3 {
             return Err(ConfigError::new(
@@ -548,47 +530,11 @@ fn parse_http_req_rule_at(
             line: 0,
         });
     } else if act_str == "replace-pathq" {
-        if tokens.len() < 4 {
-            return Err(ConfigError::new(
-                kw.line,
-                kw.col,
-                "<http-request replace-pathq> expects <regex> and <replace>.",
-            ));
-        }
-        let regex = tokens[2].text.clone();
-        let repl = tokens[3].text.clone();
-        let cond_idx = find_cond_idx(tokens, 4);
-        let cond = if let Some(idx) = cond_idx {
-            parse_acl_condition_from_tokens(&tokens[idx..])?
-        } else {
-            None
-        };
-        rules.push(HttpReqRule {
-            action: HttpReqAction::ReplacePathq { regex, repl },
-            cond,
-            line: 0,
-        });
+        let (regex, repl, cond) = parse_replace_uri(tokens, "replace-pathq")?;
+        rules.push(HttpReqRule { action: HttpReqAction::ReplacePathq { regex, repl }, cond, line: 0 });
     } else if act_str == "replace-uri" {
-        if tokens.len() < 4 {
-            return Err(ConfigError::new(
-                kw.line,
-                kw.col,
-                "<http-request replace-uri> expects <regex> and <replace>.",
-            ));
-        }
-        let regex = tokens[2].text.clone();
-        let repl = tokens[3].text.clone();
-        let cond_idx = find_cond_idx(tokens, 4);
-        let cond = if let Some(idx) = cond_idx {
-            parse_acl_condition_from_tokens(&tokens[idx..])?
-        } else {
-            None
-        };
-        rules.push(HttpReqRule {
-            action: HttpReqAction::ReplaceUri { regex, repl },
-            cond,
-            line: 0,
-        });
+        let (regex, repl, cond) = parse_replace_uri(tokens, "replace-uri")?;
+        rules.push(HttpReqRule { action: HttpReqAction::ReplaceUri { regex, repl }, cond, line: 0 });
     } else if act_str == "set-query" {
         if tokens.len() < 3 {
             return Err(ConfigError::new(
@@ -1255,6 +1201,30 @@ fn parse_http_res_rule_at(
         ));
     }
     Ok(())
+}
+
+/// `http-request replace-path|replace-pathq|replace-uri <match-regex> <replace-format>
+/// [if|unless <cond>]` (`parse_replace_uri`, `src/http_act.c`): exactly two arguments, then
+/// a condition or nothing; a regex that does not compile stops the load.
+fn parse_replace_uri(tokens: &[Token], name: &str) -> Result<(String, String, Option<AclCondition>), ConfigError> {
+    let kw = &tokens[1];
+    let bad_count = tokens.len() < 4 || tokens.get(4).is_some_and(|t| t.text != "if" && t.text != "unless");
+    if bad_count {
+        return Err(ConfigError::new(
+            kw.line,
+            kw.col,
+            format!("error detected while parsing 'http-request {name}' rule : expects exactly 2 arguments <match-regex> and <replace-format>."),
+        ));
+    }
+    if let Err(e) = ibex_regex::UserRegex::new(&tokens[2].text) {
+        return Err(ConfigError::new(
+            tokens[2].line,
+            tokens[2].col,
+            format!("error detected while parsing 'http-request {name}' rule : failed to parse the regex : regex '{}' is invalid ({e}).", tokens[2].text),
+        ));
+    }
+    let cond = find_cond_idx(tokens, 4).map(|idx| parse_acl_condition_from_tokens(&tokens[idx..])).transpose()?.flatten();
+    Ok((tokens[2].text.clone(), tokens[3].text.clone(), cond))
 }
 
 /// `http-request redirect location|prefix|scheme <fmt> [code <c>] [set-cookie <c> |

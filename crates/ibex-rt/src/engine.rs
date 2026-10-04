@@ -7294,24 +7294,22 @@ impl EngineDispatcher<'_> {
                         rebuild_req_buffer(sess);
                     }
                     ibex_config::HttpReqAction::ReplacePath { regex, repl } => {
-                        let result = {
+                        let step = {
                             let current_uri = sess.req_uri.as_deref().unwrap_or("/");
                             let (pfx, path, query) = split_uri(current_uri);
-                            let rust_repl = translate_backreferences(repl);
-                            if let Ok(re) = ibex_regex::UserRegex::new(regex) {
-                                let new_path = re.replace_all(path, &rust_repl).to_string();
-                                let rebuilt = rebuild_uri(pfx, &new_path, query);
-                                Some((new_path, rebuilt))
-                            } else {
-                                None
-                            }
+                            replace_uri_part(path, regex, repl, &make_ctx!(sess), registry)
+                                .map(|r| r.map(|new_path| (rebuild_uri(pfx, &new_path, query), new_path)))
                         };
-                        if let Some((new_path, rebuilt)) = result {
-                            sess.with_htx_mut(|htx| {
-                                let _ = htx.set_path(&new_path);
-                            });
-                            sess.req_uri = Some(rebuilt);
-                            rebuild_req_buffer(sess);
+                        match step {
+                            None => {}
+                            Some(Err(())) => return Err(500),
+                            Some(Ok((rebuilt, new_path))) => {
+                                sess.with_htx_mut(|htx| {
+                                    let _ = htx.set_path(&new_path);
+                                });
+                                sess.req_uri = Some(rebuilt);
+                                rebuild_req_buffer(sess);
+                            }
                         }
                     }
                     ibex_config::HttpReqAction::SetPathq { fmt } => {
@@ -7328,43 +7326,40 @@ impl EngineDispatcher<'_> {
                         rebuild_req_buffer(sess);
                     }
                     ibex_config::HttpReqAction::ReplacePathq { regex, repl } => {
-                        let result = {
+                        let step = {
                             let current_uri = sess.req_uri.as_deref().unwrap_or("/");
                             let (pfx, path, query) = split_uri(current_uri);
                             let pathq = if query.is_empty() { path.to_string() } else { format!("{path}?{query}") };
-                            let rust_repl = translate_backreferences(repl);
-                            if let Ok(re) = ibex_regex::UserRegex::new(regex) {
-                                let new_pathq = re.replace_all(&pathq, &rust_repl).to_string();
-                                let rebuilt = format!("{pfx}{new_pathq}");
-                                Some(rebuilt)
-                            } else {
-                                None
-                            }
+                            replace_uri_part(&pathq, regex, repl, &make_ctx!(sess), registry).map(|r| r.map(|n| format!("{pfx}{n}")))
                         };
-                        if let Some(rebuilt) = result {
-                            sess.with_htx_mut(|htx| {
-                                let _ = htx.set_uri(&rebuilt);
-                            });
-                            sess.req_uri = Some(rebuilt);
-                            rebuild_req_buffer(sess);
+                        match step {
+                            None => {}
+                            Some(Err(())) => return Err(500),
+                            Some(Ok(rebuilt)) => {
+                                sess.with_htx_mut(|htx| {
+                                    let _ = htx.set_uri(&rebuilt);
+                                });
+                                sess.req_uri = Some(rebuilt);
+                                rebuild_req_buffer(sess);
+                            }
                         }
                     }
                     ibex_config::HttpReqAction::ReplaceUri { regex, repl } => {
-                        // The whole target, scheme and authority included; the first match only.
-                        let rebuilt = {
+                        // The whole target, scheme and authority included.
+                        let step = {
                             let current_uri = sess.req_uri.as_deref().unwrap_or("/");
-                            let rust_repl = translate_backreferences(repl);
-                            ibex_regex::UserRegex::new(regex)
-                                .ok()
-                                .filter(|re| re.is_match(current_uri))
-                                .map(|re| re.replace(current_uri, &rust_repl).to_string())
+                            replace_uri_part(current_uri, regex, repl, &make_ctx!(sess), registry)
                         };
-                        if let Some(rebuilt) = rebuilt {
-                            sess.with_htx_mut(|htx| {
-                                let _ = htx.set_uri(&rebuilt);
-                            });
-                            sess.req_uri = Some(rebuilt);
-                            rebuild_req_buffer(sess);
+                        match step {
+                            None => {}
+                            Some(Err(())) => return Err(500),
+                            Some(Ok(rebuilt)) => {
+                                sess.with_htx_mut(|htx| {
+                                    let _ = htx.set_uri(&rebuilt);
+                                });
+                                sess.req_uri = Some(rebuilt);
+                                rebuild_req_buffer(sess);
+                            }
                         }
                     }
                     ibex_config::HttpReqAction::SetQuery { fmt } => {
@@ -8500,25 +8495,6 @@ fn parse_timeout_val(s: &str) -> u32 {
     num_str.parse::<u32>().unwrap_or(0).saturating_mul(factor)
 }
 
-fn translate_backreferences(repl: &str) -> String {
-    let mut out = String::with_capacity(repl.len());
-    let mut chars = repl.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            if let Some(&next_c) = chars.peek() {
-                if next_c.is_ascii_digit() {
-                    chars.next();
-                    out.push('$');
-                    out.push(next_c);
-                    continue;
-                }
-            }
-        }
-        out.push(c);
-    }
-    out
-}
-
 fn header_name_matches(header_key: &str, pattern: &str) -> bool {
     if let Some(rest) = pattern.strip_prefix("\0m:") {
         if let Some((meth, pat)) = rest.split_once(':') {
@@ -9266,6 +9242,27 @@ fn res_htx_resize(free: usize, take: usize) -> bool {
     }
     RES_HTX.set((used, size));
     true
+}
+
+/// `http_action_replace_uri` (`src/http_act.c`) on `part` (the path, the path and query, or
+/// the whole target): `None` when `part` is empty or the regex does not match it; otherwise
+/// the replacement, a log-format string, expanded by [`exp_replace`] -- *all* of `part`
+/// becomes that, not only the matched text. `Err` for a replacement `exp_replace` cannot
+/// expand (a backslash cut short).
+fn replace_uri_part(
+    part: &str,
+    regex: &str,
+    repl: &str,
+    ctx: &SampleContext,
+    registry: &Registry,
+) -> Option<Result<String, ()>> {
+    if part.is_empty() {
+        return None;
+    }
+    let re = ibex_regex::UserRegex::new(regex).ok()?;
+    let caps = re.captures(part)?;
+    let fmt = format_sample_string(repl, ctx, registry);
+    Some(exp_replace(&fmt, &caps).ok_or(()))
 }
 
 /// `exp_replace` (`src/regex.c`): `repl` with `\0`..`\9` replaced by that group of the
