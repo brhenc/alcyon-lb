@@ -70,10 +70,11 @@ pub fn first_backup(proxy: &Proxy) -> Option<usize> {
 /// or in the `next`/`init` trees sorted by weight, and a window ends when `curr` is empty.
 /// The order is not the nginx smooth round-robin's, so it is a port, not a look-alike.
 ///
-/// The state is shared by the workers, as the thread group's is in `HAProxy`, and is
-/// rebuilt from the servers' weights when one that takes balanced traffic changes
-/// (down, up, `set server ... weight`): `HAProxy` adjusts positions in place there, which
-/// keeps the order going where the rebuild restarts it; the shares are the same.
+/// The state is shared by the workers, as the thread group's is in `HAProxy`, and is built
+/// from the servers' weights on first use. When the weight or state of one server that
+/// takes balanced traffic changes (down, up, `set server ... weight`) only that server is
+/// moved, as `HAProxy` does (`fwrr_update_server_weight`, `fwrr_set_server_status_up` and
+/// `_down`), and the window goes on.
 ///
 /// Per request it costs one uncontended mutex, one compare of the weights with the ones
 /// the state was built from (`O(servers)`, no allocation) and, in `HAProxy`'s own terms,
@@ -86,7 +87,20 @@ pub struct Fwrr(std::sync::Mutex<Option<Box<FwrrState>>>);
 #[derive(Debug, Clone, Copy, Default)]
 struct FwrrSlot {
     npos: u32,
+    /// The position it was last served at (`lpos`), where a weight change goes on from.
+    lpos: u32,
     rweight: u32,
+    /// The tree its node is in (`lb_tree`).
+    tree: FwrrTree,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum FwrrTree {
+    #[default]
+    None,
+    Init,
+    Curr,
+    Next,
 }
 
 #[derive(Debug, Default)]
@@ -129,10 +143,85 @@ impl FwrrState {
     /// (`fwrr_init_server_groups`: every usable server in `init`, in declaration order).
     fn sync(&mut self, proxy: &Proxy) {
         let n = proxy.servers.len();
-        if self.built_from.len() == n && (0..n).all(|i| self.built_from[i] == Self::eweight(proxy, i)) {
+        if self.built_from.len() != n {
+            self.rebuild((0..n).map(|i| Self::eweight(proxy, i)));
             return;
         }
-        self.rebuild((0..n).map(|i| Self::eweight(proxy, i)));
+        // A server whose weight or state changed is moved where `HAProxy` moves it, and the
+        // window goes on (`fwrr_update_server_weight`, `fwrr_set_server_status_up/down`).
+        for i in 0..n {
+            let new = Self::eweight(proxy, i);
+            let old = self.built_from[i];
+            match (old > 0, new > 0) {
+                (false, false) => self.built_from[i] = new,
+                (false, true) => self.status_up(i, new),
+                (true, false) => self.status_down(i),
+                (true, true) if old != new => self.weight_change(i, new),
+                (true, true) => {}
+            }
+        }
+    }
+
+    /// Takes the server's node out of whichever tree it is in.
+    fn dequeue(&mut self, s: usize) {
+        for tree in [&mut self.curr, &mut self.init, &mut self.next] {
+            tree.retain(|n| n.1 != s);
+        }
+    }
+
+    /// `fwrr_set_server_status_down`.
+    fn status_down(&mut self, s: usize) {
+        self.dequeue(s);
+        self.slots[s].tree = FwrrTree::None;
+        self.next_weight -= self.built_from[s];
+        self.built_from[s] = 0;
+    }
+
+    /// `fwrr_set_server_status_up`, for a server whose weight is now `ew`.
+    fn status_up(&mut self, s: usize, ew: u32) {
+        self.next_weight += ew;
+        self.built_from[s] = ew;
+        self.get_srv(s);
+        self.slots[s].npos = self.curr_pos.wrapping_add(self.next_weight.wrapping_add(self.curr_weight).wrapping_sub(self.curr_pos) / ew);
+        self.queue(s);
+    }
+
+    /// `fwrr_update_server_weight` for a server that stays usable with the weight `ew`.
+    ///
+    /// `HAProxy` tests `srv->lb_tree`, a field `fwrr` no longer sets (the trees are per thread
+    /// group now), so the branch for a server that is in no tree is the one every weight
+    /// change takes, whatever tree the server is in: it is taken out, prepared for the tree
+    /// it was in (`fwrr_get_srv`), and given a position from the new total
+    /// (measured: thirty sequences with weight changes at every point of the window all
+    /// follow this and none the branches written for a server in `init`, `curr` or `next`).
+    fn weight_change(&mut self, s: usize, ew: u32) {
+        let old = self.built_from[s];
+        self.next_weight = self.next_weight - old + ew;
+        self.built_from[s] = ew;
+        self.dequeue(s);
+        self.get_srv(s);
+        self.slots[s].npos = self.curr_pos.wrapping_add(self.next_weight.wrapping_add(self.curr_weight).wrapping_sub(self.curr_pos) / ew);
+        self.queue(s);
+    }
+
+    /// `fwrr_queue_by_weight` into `init`.
+    fn queue_by_weight_init(&mut self, s: usize) {
+        tree_insert(&mut self.init, FWRR_EWGHT_MAX - self.built_from[s], s);
+        self.slots[s].tree = FwrrTree::Init;
+    }
+
+    /// `fwrr_get_srv`: prepares a server taken out of its tree.
+    fn get_srv(&mut self, s: usize) {
+        let slot = &mut self.slots[s];
+        match slot.tree {
+            FwrrTree::Init => {
+                slot.npos = 0;
+                slot.rweight = 0;
+            }
+            FwrrTree::Next => slot.npos = slot.npos.wrapping_add(self.curr_weight),
+            FwrrTree::None => slot.npos = self.curr_pos,
+            FwrrTree::Curr => {}
+        }
     }
 
     /// `fwrr_init_server_groups` for these effective weights.
@@ -153,7 +242,7 @@ impl FwrrState {
         self.curr_weight = self.next_weight;
         for i in 0..n {
             if self.built_from[i] > 0 {
-                tree_insert(&mut self.init, FWRR_EWGHT_MAX - self.built_from[i], i);
+                self.queue_by_weight_init(i);
             }
         }
     }
@@ -181,6 +270,7 @@ impl FwrrState {
         if slot.npos == 0 {
             slot.npos = self.curr_pos;
         }
+        slot.lpos = slot.npos;
         slot.npos = slot.npos.wrapping_add(self.next_weight / ew);
         slot.rweight += self.next_weight % ew;
         if slot.rweight >= ew {
@@ -195,8 +285,10 @@ impl FwrrState {
         let slot = &mut self.slots[s];
         if slot.npos >= self.curr_weight.wrapping_mul(2) || slot.npos >= self.curr_weight.wrapping_add(self.next_weight) {
             slot.npos = slot.npos.wrapping_sub(self.curr_weight);
+            slot.tree = FwrrTree::Next;
             tree_insert(&mut self.next, FWRR_EWGHT_MAX - ew, s);
         } else {
+            slot.tree = FwrrTree::Curr;
             let key = 256u32
                 .wrapping_mul(slot.npos)
                 .wrapping_add(FWRR_EWGHT_MAX.wrapping_add(slot.rweight).wrapping_sub(ew) / BE_WEIGHT_SCALE);
@@ -220,6 +312,9 @@ impl FwrrState {
                 }
                 switched = true;
                 std::mem::swap(&mut self.init, &mut self.next);
+                for k in 0..self.init.len() {
+                    self.slots[self.init[k].1].tree = FwrrTree::Init;
+                }
                 self.curr_weight = self.next_weight;
                 self.curr_pos = self.curr_weight;
             };
@@ -236,7 +331,7 @@ impl FwrrState {
         }
         while let Some(f) = self.full.pop() {
             if switched {
-                tree_insert(&mut self.init, FWRR_EWGHT_MAX - self.built_from[f], f);
+                self.queue_by_weight_init(f);
             } else {
                 self.queue(f);
             }
