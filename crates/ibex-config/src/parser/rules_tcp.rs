@@ -135,6 +135,7 @@ pub(crate) fn parse_tcp_req_session(
             .trim_start_matches("set-var-fmt(")
             .trim_end_matches(')')
             .to_string();
+        check_set_var_conds(&tokens[2], &var_name)?;
         let (cond_idx, cond) = parse_rule_condition(tokens, 3)?;
         let expr = join_tokens_until(tokens, 3, cond_idx);
         let action = if is_fmt {
@@ -286,6 +287,7 @@ pub(crate) fn parse_tcp_content_var(
             .trim_start_matches("set-var-fmt(")
             .trim_end_matches(')')
             .to_string();
+        check_set_var_conds(&tokens[2], &var_name)?;
         let (cond_idx, cond) = parse_rule_condition(tokens, 3)?;
         let expr = join_tokens_until(tokens, 3, cond_idx);
         let action = if is_fmt {

@@ -795,6 +795,7 @@ fn parse_http_req_rule_at(
             .trim_start_matches("set-var-fmt(")
             .trim_end_matches(')')
             .to_string();
+        super::check_set_var_conds(act_token, &var_name)?;
         let cond_idx = find_cond_idx(tokens, 2);
         let limit = cond_idx.unwrap_or(tokens.len());
         let expr = tokens[2..limit].iter().map(|t| t.text.as_str()).collect::<Vec<_>>().join(" ");
@@ -1148,6 +1149,7 @@ fn parse_http_res_rule_at(
             .trim_start_matches("set-var-fmt(")
             .trim_end_matches(')')
             .to_string();
+        super::check_set_var_conds(act_token, &var_name)?;
         let (expr, cond) = one_arg_and_cond(tokens, "http-response", act_token)?;
         rules.push(HttpResRule {
             action: HttpResAction::SetHeader {
@@ -1523,6 +1525,7 @@ pub(crate) fn parse_http_after_res_rule(
             .trim_start_matches("set-var-fmt(")
             .trim_end_matches(')')
             .to_string();
+        super::check_set_var_conds(act_token, &var_name)?;
         let (expr, cond) = one_arg_and_cond(tokens, "http-after-response", act_token)?;
         rules.push(HttpAfterResRule {
             action: HttpAfterResAction::SetHeader {

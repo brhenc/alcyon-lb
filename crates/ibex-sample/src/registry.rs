@@ -43,6 +43,28 @@ pub fn get_proc_var(name: &str) -> Option<String> {
     GLOBAL_PROC_VARS.read().ok()?.get(name).cloned()
 }
 
+/// The conditions of `set-var(<name>,<cond>...)` against what is known of the variable and the
+/// sample (`var_set`, src/vars.c): `exists`/`is_set` describe the variable, `empty` the new
+/// sample. `ifgt` and `iflt` are refused when the configuration loads.
+#[must_use]
+pub fn var_conds_hold(spec: &str, exists: bool, is_set: bool, empty: bool) -> bool {
+    spec.split(',').skip(1).all(|c| {
+        (c != "ifexists" || exists)
+            && (c != "ifnotexists" || !exists)
+            && (c != "ifset" || is_set)
+            && (c != "ifnotset" || !is_set)
+            && (c != "ifempty" || empty)
+            && (c != "ifnotempty" || !empty)
+    })
+}
+
+/// `unset-var` of a process variable: it stays declared but has no value.
+pub fn unset_proc_var(name: &str) {
+    if let Ok(mut lock) = GLOBAL_PROC_VARS.write() {
+        lock.remove(name);
+    }
+}
+
 pub fn set_proc_var(name: &str, val: String) {
     if let Ok(mut lock) = GLOBAL_PROC_VARS.write() {
         lock.insert(name.to_string(), val);
@@ -349,6 +371,12 @@ pub struct CtxConvDesc {
 /// (`ibex-rt`'s load-time checks), rather than evaluated to a constant: each of these used
 /// to load and return 0 or 1, which an ACL then compared as if it were the state.
 pub const NOT_IMPLEMENTED: &[(&str, &str)] = &[
+    ("fc_unacked", "Ibex does not read TCP_INFO"),
+    ("fc_sacked", "Ibex does not read TCP_INFO"),
+    ("fc_lost", "Ibex does not read TCP_INFO"),
+    ("fc_retrans", "Ibex does not read TCP_INFO"),
+    ("fc_fackets", "Ibex does not read TCP_INFO"),
+    ("fc_reordering", "Ibex does not read TCP_INFO"),
     ("queue", "Ibex has no server queues"),
     ("avg_queue", "Ibex has no server queues"),
     ("srv_queue", "Ibex has no server queues"),
@@ -842,6 +870,18 @@ impl Registry {
             },
         });
 
+        // `meth(<name>)`: the constant method `<name>` (`smp_fetch_meth` is `method`; this one
+        // is the constant `meth` of src/sample.c). A name outside the known methods is kept as
+        // it was written.
+        self.register_fetch(FetchDesc {
+            name: "meth",
+            out_type: SampleType::Meth,
+            func: |_ctx, args| {
+                let name = args.first()?;
+                Some(Sample::Meth(ibex_proto::htx::HttpMethod::from_bytes(name.as_bytes())))
+            },
+        });
+
         self.register_fetch(FetchDesc {
             name: "method",
             out_type: SampleType::Meth,
@@ -1047,6 +1087,27 @@ impl Registry {
             name: "req.fhdr",
             out_type: SampleType::Str,
             func: request_header_fetch,
+        });
+
+        // `http_auth_bearer([<header>])` (`smp_fetch_http_auth_bearer`): the token of a
+        // `Bearer` credential in the first `<header>` (default `Authorization`). The scheme is
+        // matched without regard to case and needs at least one space before the token, which
+        // is the rest of the value; no token, another scheme or no header is no sample.
+        self.register_fetch(FetchDesc {
+            name: "http_auth_bearer",
+            out_type: SampleType::Str,
+            func: |ctx, args| {
+                let name = args.first().map_or("authorization", String::as_str);
+                let name = if name.is_empty() { "authorization" } else { name };
+                let hdrs = get_all_req_headers(ctx, name);
+                let value = hdrs.first()?;
+                let (scheme, rest) = value.split_at_checked(6)?;
+                if !scheme.eq_ignore_ascii_case("bearer") || !rest.starts_with(' ') {
+                    return None;
+                }
+                let token = rest.trim_start_matches(' ');
+                (!token.is_empty()).then(|| Sample::Str(token.to_string()))
+            },
         });
 
         let response_header_fetch: FetchFn = |ctx, args| {
@@ -1580,6 +1641,24 @@ impl Registry {
             name: "srv_name",
             out_type: SampleType::Str,
             func: |ctx, _args| ctx.srv_name.map(|n| Sample::Str(n.to_string())),
+        });
+        // `acl(<name>[,<name>...])`: true when every named ACL matches, each one optionally
+        // negated by a leading `!` (`smp_fetch_acl`, src/acl.c). An ACL that does not exist
+        // gives no sample.
+        self.register_fetch(FetchDesc {
+            name: "acl",
+            out_type: SampleType::Bool,
+            func: |ctx, args| {
+                let acls = ctx.acls?;
+                let reg = sample_registry();
+                for a in args {
+                    let (neg, name) = a.strip_prefix('!').map_or((false, a.as_str()), |n| (true, n));
+                    if acls.get(name)?.eval(reg, ctx) == neg {
+                        return Some(Sample::Bool(false));
+                    }
+                }
+                Some(Sample::Bool(true))
+            },
         });
         // The server and backend state fetches (`src/backend.c`). Their arguments are
         // resolved when the configuration loads; `queue`, `avg_queue`, `srv_queue` and
@@ -2329,11 +2408,21 @@ impl Registry {
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: len_conv,
         });
+        // `length` takes a string: a binary is cast first, and the cast stops at the first NUL
+        // byte (`c_bin2str`), so the length of `\x00\x01...` is 0. The bytes are counted here,
+        // before they would have to be valid UTF-8 to become a `String`.
         self.register_converter(ConvDesc {
             name: "length",
-            in_type: TypeSpec::Exact(SampleType::Str),
+            in_type: TypeSpec::Any,
             out_type: TypeSpec::Exact(SampleType::Sint),
-            func: len_conv,
+            func: |smp, _args| {
+                let n = match &smp {
+                    Sample::Str(s) => s.len(),
+                    Sample::Bin(b) => b.iter().position(|&c| c == 0).unwrap_or(b.len()),
+                    other => sample_to_string(other).len(),
+                };
+                Some(Sample::Sint(i64::try_from(n).unwrap_or(i64::MAX)))
+            },
         });
 
         self.register_converter(ConvDesc {
@@ -3898,11 +3987,28 @@ impl Registry {
             in_type: TypeSpec::Any,
             out_type: TypeSpec::Same,
             func: |smp, args| {
-                if let Some(var_name) = args.first() {
-                    let val_str = sample_to_string(&smp);
-                    CURRENT_VARS.with(|v| {
-                        v.borrow_mut().insert(var_name.clone(), val_str);
-                    });
+                { // `set-var` always has its variable name: the load refuses `set-var()`
+                    let spec = args.join(",");
+                    let spec = spec.as_str();
+                    let name = spec.split(',').next().unwrap_or("");
+                    let is_proc = name.starts_with("proc.");
+                    let is_set = if is_proc {
+                        get_proc_var(name).is_some()
+                    } else {
+                        CURRENT_VARS.with(|v| v.borrow().contains_key(name))
+                    };
+                    let empty = matches!(&smp, Sample::Str(s) if s.is_empty())
+                        || matches!(&smp, Sample::Bin(b) if b.is_empty());
+                    if var_conds_hold(spec, is_proc || is_set, is_set, empty) {
+                        let val_str = sample_to_string(&smp);
+                        if is_proc {
+                            set_proc_var(name, val_str);
+                        } else {
+                            CURRENT_VARS.with(|v| {
+                                v.borrow_mut().insert(name.to_string(), val_str);
+                            });
+                        }
+                    }
                 }
                 Some(smp)
             },
@@ -5280,6 +5386,16 @@ pub fn check_converter_args(name: &str, args: &[String]) -> Option<String> {
             }
             None
         }
+        "set-var" if args.first().is_none_or(String::is_empty) => {
+            Some("invalid args in converter 'set-var' : Empty variable name cannot be accepted.".to_string())
+        }
+        "set-var" => args.iter().skip(1).filter(|c| !c.is_empty()).find_map(|c| match c.as_str() {
+            "ifexists" | "ifnotexists" | "ifempty" | "ifnotempty" | "ifset" | "ifnotset" => None,
+            "ifgt" | "iflt" => Some(format!(
+                "invalid args in converter 'set-var' : condition \"{c}\" needs typed variables, which Ibex does not implement"
+            )),
+            _ => Some(format!("invalid args in converter 'set-var' : unknown condition \"{c}\".")),
+        }),
         "url_enc" => match args {
             [] => None,
             [a] if a.is_empty() || a == "query" => None,

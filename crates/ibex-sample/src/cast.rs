@@ -308,7 +308,13 @@ fn c_str2meth(smp: Sample) -> Option<Sample> {
 
 fn c_bin2str(smp: Sample) -> Option<Sample> {
     match smp {
-        Sample::Bin(b) => String::from_utf8(b).ok().map(Sample::Str),
+        // `c_bin2str` stops at the first NUL byte: what follows it is not part of the string.
+        Sample::Bin(mut b) => {
+            if let Some(nul) = b.iter().position(|&c| c == 0) {
+                b.truncate(nul);
+            }
+            String::from_utf8(b).ok().map(Sample::Str)
+        }
         _ => None,
     }
 }
