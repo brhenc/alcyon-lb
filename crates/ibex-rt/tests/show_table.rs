@@ -58,16 +58,16 @@ fn server(delay: Duration) -> SocketAddr {
 }
 
 fn start(table: &str, rules: &str, delay: Duration) -> (Ibex, SocketAddr) {
-    start_full(table, "  http-request track-sc0 req.hdr(x-k)\n", rules, server(delay))
+    start_full(table, "  http-request track-sc0 req.hdr(x-k)\n", rules, server(delay), "")
 }
 
-fn start_full(table: &str, track: &str, rules: &str, be: SocketAddr) -> (Ibex, SocketAddr) {
+fn start_full(table: &str, track: &str, rules: &str, be: SocketAddr, global: &str) -> (Ibex, SocketAddr) {
     let fe = common::reserve_addr();
     static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let sock = std::env::temp_dir().join(format!("ibex_t149b_st_{}_{n}.sock", std::process::id()));
     let text = format!(
-        "global\n  nbthread 1\n  stats socket {sock} mode 600 level admin\ndefaults\n  mode http\n  timeout connect 2s\n  timeout client 5s\n  timeout server 5s\n\
+        "global\n  nbthread 1\n{global}  stats socket {sock} mode 600 level admin\ndefaults\n  mode http\n  timeout connect 2s\n  timeout client 5s\n  timeout server 5s\n\
          frontend f\n  bind {fe}\n  stick-table {table}\n{track}{rules}  default_backend b\nbackend b\n  server s1 {be}\n",
         sock = sock.display()
     );
@@ -250,6 +250,20 @@ fn a_filter_on_an_unstored_type_and_a_binary_key() {
     assert!(out.contains("key=616263"), "{out}");
 }
 
+/// `http-fail-codes 400` makes the parse-error 400 a failure instead of an error.
+#[test]
+fn a_parse_error_status_in_http_fail_codes_counts_as_a_failure() {
+    let (ibex, fe) = start_full(IP_TABLE, "  tcp-request connection track-sc0 src\n", "", server(Duration::ZERO), "  http-fail-codes 400\n");
+    let mut c = TcpStream::connect(fe).expect("connect");
+    c.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
+    c.write_all(b"GARBAGE\r\n\r\n").expect("send");
+    let mut got = Vec::new();
+    let _ = c.read_to_end(&mut got);
+    thread::sleep(Duration::from_millis(300));
+    let (lines, _) = normalise(&cli(&ibex, "show table f"));
+    assert!(lines[1].contains("http_fail_cnt=1"), "{lines:?}");
+}
+
 /// A server that promises 100 bytes, sends 7 and closes.
 fn aborting_server() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -273,7 +287,7 @@ const IP_TABLE: &str = "type ip size 100 expire 60s store http_req_cnt,http_err_
 /// (answered 400) counts as a request and an error.
 #[test]
 fn a_parse_error_400_counts_in_http_err() {
-    let (ibex, fe) = start_full(IP_TABLE, "  tcp-request connection track-sc0 src\n", "", server(Duration::ZERO));
+    let (ibex, fe) = start_full(IP_TABLE, "  tcp-request connection track-sc0 src\n", "", server(Duration::ZERO), "");
     let mut c = TcpStream::connect(fe).expect("connect");
     c.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
     c.write_all(b"GARBAGE\r\n\r\n").expect("send");
@@ -292,7 +306,7 @@ fn a_parse_error_400_counts_in_http_err() {
 /// Measured: a server that closes in the middle of the body is one failed request, not an error.
 #[test]
 fn a_server_that_aborts_mid_body_counts_in_http_fail() {
-    let (ibex, fe) = start_full(IP_TABLE, "  tcp-request connection track-sc0 src\n", "", aborting_server());
+    let (ibex, fe) = start_full(IP_TABLE, "  tcp-request connection track-sc0 src\n", "", aborting_server(), "");
     let mut c = TcpStream::connect(fe).expect("connect");
     c.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
     c.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").expect("send");

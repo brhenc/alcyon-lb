@@ -831,6 +831,19 @@ mod fwrr_tests {
         assert_eq!(back.iter().filter(|&&i| i == 1).count(), 3, "{back:?}");
     }
 
+    /// A weight change for a server that was queued for the next window (`Next`).
+    #[test]
+    fn a_weight_change_for_a_server_in_the_next_window() {
+        let mut st = state(&[3, 1]);
+        let _ = (0..4).filter_map(|_| st.pick(|_| true)).count();
+        let next: Vec<usize> = st.next.iter().map(|n| n.1).collect();
+        for s in next {
+            st.weight_change(s, 2 * 16);
+        }
+        let got: Vec<usize> = (0..12).filter_map(|_| st.pick(|_| true)).collect();
+        assert_eq!(got.len(), 12);
+    }
+
     #[test]
     fn nothing_usable_gives_none_and_loses_no_server() {
         let mut st = state(&[2, 1]);
