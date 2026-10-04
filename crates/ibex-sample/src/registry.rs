@@ -3727,17 +3727,9 @@ impl Registry {
             out_type: TypeSpec::Exact(SampleType::Bin),
             func: |smp, args| {
                 let Sample::Bin(msg) = smp else { return None };
-                let (digest, block): (fn(&[u8]) -> Vec<u8>, usize) = match args.first()?.to_ascii_lowercase().as_str() {
-                    "md5" => (|d| md5_digest(d).to_vec(), 64),
-                    "sha1" => (|d| sha1_digest(d).to_vec(), 64),
-                    "sha224" => (|d| sha224_digest(d).to_vec(), 64),
-                    "sha256" => (|d| sha256_digest(d).to_vec(), 64),
-                    "sha384" => (|d| sha384_digest(d).to_vec(), 128),
-                    "sha512" => (|d| sha512_digest(d).to_vec(), 128),
-                    _ => return None,
-                };
+                let (digest, block) = hmac_digest(args.first()?)?;
                 let key_arg = args.get(1)?.trim();
-                let is_var = ["txn.", "sess.", "req.", "res.", "proc."].iter().any(|p| key_arg.starts_with(p));
+                let is_var = hmac_key_is_var(key_arg);
                 let key = if is_var {
                     let v = if key_arg.starts_with("proc.") {
                         get_proc_var(key_arg)
@@ -4895,6 +4887,33 @@ pub fn has_ctl_mask(arg: &str) -> Option<u64> {
     }
 }
 
+/// The digest and block size `hmac` computes for an `OpenSSL` message digest name
+/// (`EVP_get_digestbyname`: case-insensitive, with the `SHA-256` and `SHA2-256` aliases).
+fn hmac_digest(alg: &str) -> Option<(fn(&[u8]) -> Vec<u8>, usize)> {
+    Some(match alg.to_ascii_lowercase().as_str() {
+        "md5" => (|d| md5_digest(d).to_vec(), 64),
+        "sha1" | "sha-1" => (|d| sha1_digest(d).to_vec(), 64),
+        "sha224" | "sha-224" | "sha2-224" => (|d| sha224_digest(d).to_vec(), 64),
+        "sha256" | "sha-256" | "sha2-256" => (|d| sha256_digest(d).to_vec(), 64),
+        "sha384" | "sha-384" | "sha2-384" => (|d| sha384_digest(d).to_vec(), 128),
+        "sha512" | "sha-512" | "sha2-512" => (|d| sha512_digest(d).to_vec(), 128),
+        _ => return None,
+    })
+}
+
+/// Digests `OpenSSL` has that `hmac` does not compute here; `HAProxy` loads them, so
+/// refusing is the honest answer to a name that is valid but would never give a sample.
+const HMAC_UNIMPLEMENTED: &[&str] = &[
+    "sha3-224", "sha3-256", "sha3-384", "sha3-512", "sha512-224", "sha512-256", "sha512-224",
+    "blake2b512", "blake2s256", "ripemd160", "rmd160", "ripemd", "sm3", "md4", "md5-sha1",
+    "whirlpool", "shake128", "shake256", "mdc2",
+];
+
+/// A key written as a variable name (scope prefix) rather than as base64 text.
+fn hmac_key_is_var(key: &str) -> bool {
+    ["txn.", "sess.", "req.", "res.", "proc."].iter().any(|p| key.starts_with(p))
+}
+
 /// Load-time check of a converter's arguments, where `HAProxy` refuses some
 /// (`invalid args in converter '<name>'`). `None` when they are acceptable.
 #[must_use]
@@ -4903,6 +4922,32 @@ pub fn check_converter_args(name: &str, args: &[String]) -> Option<String> {
         "has_ctl" if has_ctl_mask(args.first().map_or("", String::as_str)).is_none() => {
             Some("invalid args in converter 'has_ctl' : expects 'any', 'http' or a mask of at most 33 bits".to_string())
         }
+        "hmac" => {
+            if args.len() < 2 {
+                return Some("invalid arg 2 in converter 'hmac' : missing arguments (got 1/2), type 'string' expected.".to_string());
+            }
+            if args.len() > 2 {
+                return Some(format!("invalid arg 2 in converter 'hmac' : expected ')' before ',{})'.", args[2..].join(",")));
+            }
+            if hmac_digest(&args[0]).is_none() {
+                return Some(if HMAC_UNIMPLEMENTED.contains(&args[0].to_ascii_lowercase().as_str()) {
+                    format!("converter 'hmac' with digest '{}' is not implemented by Ibex", args[0])
+                } else {
+                    "invalid args in converter 'hmac' : algorithm must be a valid OpenSSL message digest name..".to_string()
+                });
+            }
+            let key = args[1].trim();
+            if !hmac_key_is_var(key) && base64_decode(key, false, true).is_none() {
+                return Some("invalid args in converter 'hmac' : failed to parse key : argument needs to be base64 encoded, and can either be a string or a variable.".to_string());
+            }
+            None
+        }
+        "url_enc" => match args {
+            [] => None,
+            [a] if a.is_empty() || a == "query" => None,
+            [_, rest @ ..] if !rest.is_empty() => Some(format!("invalid arg 2 in converter 'url_enc' : expected ')' before ',{})'.", rest.join(","))),
+            _ => Some("invalid args in converter 'url_enc' : Unexpected encode type. Allowed value is 'query'.".to_string()),
+        },
         "when" if parse_when_cond(args).is_none() => Some(
             "invalid args in converter 'when' : expects [!]error, forwarded, normal, processed, stopping, toapplet or acl,<name>".to_string(),
         ),
