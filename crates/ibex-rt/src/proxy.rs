@@ -275,6 +275,8 @@ pub struct TcpSession {
     pub bufsize: usize,
     pub maxrewrite: usize,
     pub h2_ctx: Option<H2MuxContext>,
+    /// The first GOAWAY of an HTTP/2 `timeout client` has gone: the next expiry closes.
+    pub h2_idle_goaway: bool,
     pub h2_active_stream_id: Option<u32>,
     pub h2_flood_config: ibex_proto::H2FloodConfig,
     pub is_first_req: bool,
@@ -389,6 +391,7 @@ impl TcpSession {
             tracked_sc: [None, None, None],
             stick_stores: Vec::new(),
             h2_ctx: None,
+            h2_idle_goaway: false,
             h2_active_stream_id: None,
             h2_flood_config: ibex_proto::H2FloodConfig::default(),
             is_first_req: true,
@@ -1727,6 +1730,22 @@ impl TcpSession {
         }
         if self.cli_exp.is_expired(now) {
             if self.cli_timer_live() {
+                // An HTTP/2 connection that is idle gets a GOAWAY (`NO_ERROR`, the last
+                // stream it opened) at the end of `timeout client`, and the same again,
+                // with the close, at the end of the next one (measured on HAProxy 3.5,
+                // `h2c_timeout` in `src/mux_h2.c`).
+                if let Some(h2) = self.h2_ctx.as_mut() {
+                    let last = h2.last_client_stream_id;
+                    if self.h2_idle_goaway {
+                        h2.send_goaway(last, ibex_proto::h2::H2Error::NoError, &[]);
+                    } else {
+                        h2.enqueue_frame(&ibex_proto::h2::Frame::GoAway { last_stream_id: last, error_code: ibex_proto::h2::H2Error::NoError, debug_data: Vec::new() });
+                        self.h2_idle_goaway = true;
+                        self.arm_client(now);
+                    }
+                    self.ending.get_or_insert(Ending::Timeout(Which::Client));
+                    return true;
+                }
                 self.cli_state = ScState::Error;
                 self.ending.get_or_insert(Ending::Timeout(Which::Client));
                 return true;
