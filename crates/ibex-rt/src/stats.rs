@@ -695,7 +695,6 @@ mod tests {
             retries: 3,
             redisp: false,
             redisp_after: -1,
-            avoid_idx: None,
             maxconn: 1000,
             dispatch: None,
             cookie: None,

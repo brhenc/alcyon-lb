@@ -703,7 +703,7 @@ fn main() {
     let capacity = opts.maxconn.unwrap_or(65536) as usize;
     let nbthread = config.global.as_ref().and_then(|g| g.nbthread).unwrap_or(1) as usize;
 
-    let shared_proxies = match Engine::build_shared_state(&config, nbthread) {
+    let shared_proxies = match Engine::build_shared_state(&config) {
         Ok(p) => p,
         Err(err) => {
             eprintln!("Failed to build shared state: {err}");
@@ -763,8 +763,11 @@ fn main() {
     // Each worker reports once it is listening. `-sf` and READY=1 wait for all of them.
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
     let mut threads = Vec::new();
+    // One configuration for every worker, as the proxies are (T160): a worker reads it
+    // while it starts, and a copy each held it for the life of the process.
+    let config = std::sync::Arc::new(config);
     for worker_id in 0..nbthread {
-        let config_clone = config.clone();
+        let config_clone = std::sync::Arc::clone(&config);
         let proxies_clone = shared_proxies.clone();
         let cli_socket_clone = cli_socket.clone();
         let extra_sockets = extra_sockets.clone();

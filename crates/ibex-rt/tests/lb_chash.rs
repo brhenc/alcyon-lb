@@ -56,7 +56,7 @@ fn engine(extra: &str, servers: &str) -> Engine {
 }
 
 fn pick(engine: &mut Engine, uri: &str) -> Option<String> {
-    let proxy = &mut engine.proxies[0];
+    let proxy = &engine.proxies[0];
     let addr = proxy.select_server_with_key(None, Some(uri))?;
     let idx = proxy.servers.iter().position(|&a| a == addr).expect("a configured server");
     Some(proxy.server_ids[idx].clone())

@@ -28,7 +28,7 @@ backend test_be
     server s3 127.0.0.1:8003 weight 1 maxconn 100
 ";
     let mut eng = get_proxy(cfg);
-    let proxy = &mut eng.proxies[0];
+    let proxy = &mut eng.proxies.make_mut()[0];
     
     for s in proxy.server_statuses.iter() {
         s.store(check::ServerStatus::Up as u8, Ordering::Relaxed);
@@ -56,7 +56,7 @@ backend test_be
     server s2 127.0.0.1:8002 weight 1
 ";
     let mut eng = get_proxy(cfg);
-    let proxy = &mut eng.proxies[0];
+    let proxy = &mut eng.proxies.make_mut()[0];
     
     for s in proxy.server_statuses.iter() {
         s.store(check::ServerStatus::Up as u8, Ordering::Relaxed);
@@ -83,7 +83,7 @@ backend test_be
     server s3 127.0.0.1:8003 weight 1
 ";
     let mut eng = get_proxy(cfg);
-    let proxy = &mut eng.proxies[0];
+    let proxy = &mut eng.proxies.make_mut()[0];
     
     for s in proxy.server_statuses.iter() {
         s.store(check::ServerStatus::Up as u8, Ordering::Relaxed);
@@ -119,7 +119,7 @@ backend test_be
     server s3 127.0.0.1:8003 weight 1
 ";
     let mut eng = get_proxy(cfg);
-    let proxy = &mut eng.proxies[0];
+    let proxy = &mut eng.proxies.make_mut()[0];
     
     for s in proxy.server_statuses.iter() {
         s.store(check::ServerStatus::Up as u8, Ordering::Relaxed);
@@ -154,7 +154,7 @@ backend test_be
     server s3 127.0.0.1:8003
 ";
     let mut eng = get_proxy(cfg);
-    let proxy = &mut eng.proxies[0];
+    let proxy = &mut eng.proxies.make_mut()[0];
 
     for s in proxy.server_statuses.iter() {
         s.store(check::ServerStatus::Up as u8, Ordering::Relaxed);
@@ -179,7 +179,7 @@ backend test_be
     server s2 127.0.0.1:8002 maxconn 1
 ";
     let mut eng = get_proxy(cfg);
-    let proxy = &mut eng.proxies[0];
+    let proxy = &mut eng.proxies.make_mut()[0];
 
     for s in proxy.server_statuses.iter() {
         s.store(check::ServerStatus::Up as u8, Ordering::Relaxed);
@@ -205,7 +205,7 @@ backend test_be
     server s3 127.0.0.1:8003
 ";
     let mut eng = get_proxy(cfg);
-    let proxy = &mut eng.proxies[0];
+    let proxy = &mut eng.proxies.make_mut()[0];
 
     for s in proxy.server_statuses.iter() {
         s.store(check::ServerStatus::Up as u8, Ordering::Relaxed);
@@ -236,7 +236,7 @@ backend test_be
     server s2 127.0.0.1:8002 maxconn 5
 ";
     let mut eng = get_proxy(cfg);
-    let proxy = &mut eng.proxies[0];
+    let proxy = &mut eng.proxies.make_mut()[0];
 
     for s in proxy.server_statuses.iter() {
         s.store(check::ServerStatus::Up as u8, Ordering::Relaxed);
@@ -265,7 +265,7 @@ backend test_be
     server s2 127.0.0.1:8002 maxconn 1
 ";
     let mut eng = get_proxy(cfg);
-    let proxy = &mut eng.proxies[0];
+    let proxy = &mut eng.proxies.make_mut()[0];
     for s in proxy.server_statuses.iter() {
         s.store(check::ServerStatus::Up as u8, Ordering::Relaxed);
     }
@@ -296,7 +296,7 @@ fn random_and_first_fall_back_to_the_first_backup_only() {
         let mut eng = get_proxy(&format!(
             "backend b\n    balance {algo}\n    server a 127.0.0.1:8001\n    server b1 127.0.0.1:8002 backup\n    server b2 127.0.0.1:8003 backup\n"
         ));
-        let proxy = &mut eng.proxies[0];
+        let proxy = &mut eng.proxies.make_mut()[0];
         all_up(proxy);
         proxy.server_statuses[0].store(check::ServerStatus::Down as u8, Ordering::Relaxed);
         for _ in 0..50 {
@@ -314,7 +314,7 @@ fn random_and_first_fall_back_to_the_first_backup_only() {
 #[test]
 fn random_draws_prefer_the_less_loaded_server() {
     let mut eng = get_proxy("backend b\n    balance random(10)\n    server s1 127.0.0.1:8001\n    server s2 127.0.0.1:8002\n");
-    let proxy = &mut eng.proxies[0];
+    let proxy = &mut eng.proxies.make_mut()[0];
     all_up(proxy);
     proxy.server_actconn[0].store(50, Ordering::Relaxed);
     let to_s2 = (0..1000).filter(|_| proxy.select_server_with_key(None, None) == Some(proxy.servers[1])).count();
