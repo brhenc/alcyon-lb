@@ -541,23 +541,19 @@ fn run_var_rules(
     let Some(px) = proxies.get(check.proxy_idx) else { return };
     let reg = crate::engine::sample_registry();
     for rule in rules {
-        match rule {
-            ResolvedHttpRule::SetVar { var_name, expr } => {
-                let val = with_check_ctx(check, px, proxies, vars, resp, |_, ctx| {
-                    ibex_sample::Expr::parse(expr)
-                        .ok()
-                        .and_then(|e| e.eval_sample(reg, ctx))
-                        .map(|smp| crate::engine::sample_to_string(&smp))
-                });
-                // An expression that gives no sample leaves the variable as it was.
-                if let Some(v) = val {
-                    vars.insert(var_name.clone(), v);
-                }
+        if let ResolvedHttpRule::SetVar { var_name, expr } = rule {
+            let val = with_check_ctx(check, px, proxies, vars, resp, |_, ctx| {
+                ibex_sample::Expr::parse(expr)
+                    .ok()
+                    .and_then(|e| e.eval_sample(reg, ctx))
+                    .map(|smp| crate::engine::sample_to_string(&smp))
+            });
+            // An expression that gives no sample leaves the variable as it was.
+            if let Some(v) = val {
+                vars.insert(var_name.clone(), v);
             }
-            ResolvedHttpRule::UnsetVar { var_name } => {
-                vars.remove(var_name);
-            }
-            ResolvedHttpRule::Expect(_) => {}
+        } else if let ResolvedHttpRule::UnsetVar { var_name } = rule {
+            vars.remove(var_name);
         }
     }
 }
@@ -1057,13 +1053,7 @@ pub fn step_check(
                 | CheckSubState::PgsqlRunning { .. } => ("L7TOUT", "Layer7 timeout", None),
                 CheckSubState::SslHelloRunning { .. } => ("L6TOUT", "Layer6 timeout", None),
                 CheckSubState::TcpRunning { step_idx, .. } => {
-                    let steps = tcp_steps_of(check);
-                    let info = Some(tcp_step_suffix(steps, *step_idx));
-                    if matches!(steps.get(*step_idx), Some(ResolvedTcpStep::Connect { .. })) {
-                        ("L4TOUT", "Layer4 timeout", info)
-                    } else {
-                        ("L7TOUT", "Layer7 timeout", info)
-                    }
+                    tcp_timeout_status(tcp_steps_of(check), *step_idx)
                 }
             };
 
@@ -1738,7 +1728,9 @@ fn progress_http_check(
             };
             progress_http_check(check, fdtab, poller, now, duration, proxies)
         }
-        CheckSubState::HttpReceiving { mut recv_buf } => {
+        // The receiving state; `step_check` runs this only in a sending or receiving one.
+        other => {
+            let mut recv_buf = if let CheckSubState::HttpReceiving { recv_buf } = other { recv_buf } else { Vec::new() };
             let Some(sock) = check.sock.as_ref() else {
                 cleanup_check_socket(check, fdtab, poller);
                 let next = check.schedule_next(now);
@@ -1791,12 +1783,16 @@ fn progress_http_check(
             check.next_check = next;
             Ok(CheckStep { next: Some(next), event })
         }
-        _ => {
-            cleanup_check_socket(check, fdtab, poller);
-            let next = check.schedule_next(now);
-            check.next_check = next;
-            Ok(CheckStep::pending(Some(next)))
-        }
+    }
+}
+
+/// The status of a timeout while rule `idx` of a script was running: while it was
+/// connecting, layer 4; otherwise layer 7.
+fn tcp_timeout_status(steps: &[ResolvedTcpStep], idx: usize) -> (&'static str, &'static str, Option<String>) {
+    let info = Some(tcp_step_suffix(steps, idx));
+    match steps.get(idx) {
+        Some(ResolvedTcpStep::Connect { .. }) => ("L4TOUT", "Layer4 timeout", info),
+        _ => ("L7TOUT", "Layer7 timeout", info),
     }
 }
 
@@ -1987,10 +1983,7 @@ fn progress_tcp_check(
                         continue;
                     }
                     
-                    let connect_err = match &connect_res {
-                        Ok(Some(e)) => Some(e),
-                        _ => None,
-                    };
+                    let connect_err = connect_res.as_ref().ok().and_then(Option::as_ref);
                     let info = tcp_connect_failure_info(&steps, step_idx, connect_err);
                     cleanup_check_socket(check, fdtab, poller);
                     let event = check.on_failure_full("L4CON", "Layer4 connection problem", duration, None, Some(info));
@@ -3967,6 +3960,13 @@ mod tests {
         assert_eq!(tcp_expect_head(&run, 4), 1);
         assert_eq!(tcp_expect_head(&run, 3), 1);
         assert_eq!(tcp_expect_head(&run, 1), 1);
+    }
+
+    #[test]
+    fn a_timeout_while_connecting_is_layer_4() {
+        let steps = vec![connect(false, None, None), expect(ResolvedTcpExpectPattern::String("a".into()), false, None)];
+        assert_eq!(tcp_timeout_status(&steps, 0), ("L4TOUT", "Layer4 timeout", Some(" at step 1 of tcp-check (connect)".into())));
+        assert_eq!(tcp_timeout_status(&steps, 1).0, "L7TOUT");
     }
 
     #[test]
