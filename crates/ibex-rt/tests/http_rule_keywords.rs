@@ -220,6 +220,45 @@ fn forwardfor_if_none_adds_only_where_no_proxy_asks_for_it_always() {
     assert_eq!(xff_count(fe, "/req3", true), 2);
 }
 
+const PRIORITY: &str = "defaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n\
+frontend fe\n  bind {fe}\n  http-after-response set-header x-prio %[prio_class]/%[prio_offset]\n\
+  http-request set-priority-class int(3) if { path /a }\n  http-request set-priority-offset int(-10) if { path /a }\n\
+  http-request set-priority-class int(5000) if { path /b }\n  http-request set-priority-class int(-5000) if { path /c }\n\
+  http-request set-priority-offset int(2000000) if { path /d }\n  http-request set-priority-offset int(-2000000) if { path /e }\n\
+  http-request set-priority-class str(abc) if { path /f }\n\
+  http-request set-priority-class req.hdr(x-c) if { path /g }\n  http-request set-priority-offset req.hdr(x-o) if { path /g }\n\
+  http-request set-priority-class int(5) if { path /m }\n  http-request set-priority-class str(abc) if { path /m }\n\
+  http-request set-priority-offset int(5) if { path /m }\n  http-request set-priority-offset req.hdr(x-none) if { path /m }\n\
+  default_backend be\n\
+backend be\n  server s {srv}\n";
+
+fn x_prio(fe: SocketAddr, path: &str, hdrs: &str) -> String {
+    let got = send(fe, &format!("GET {path} HTTP/1.1\r\nHost: a\r\n{hdrs}Connection: close\r\n\r\n"));
+    got.lines()
+        .find_map(|l| l.strip_prefix("x-prio: ").or_else(|| l.strip_prefix("X-Prio: ")))
+        .unwrap_or_else(|| panic!("{path}: no x-prio in {got:?}"))
+        .trim()
+        .to_string()
+}
+
+#[test]
+fn set_priority_class_and_offset_are_read_back_by_the_fetches() {
+    let (_i, fe) = start(PRIORITY);
+    // Measured on HAProxy 3.5-dev8-885761-29 with the same rules.
+    assert_eq!(x_prio(fe, "/a", ""), "3/-10");
+    assert_eq!(x_prio(fe, "/none", ""), "0/0");
+    // The class is clamped to +-2047, the offset to +-524287.
+    assert_eq!(x_prio(fe, "/b", ""), "2047/0");
+    assert_eq!(x_prio(fe, "/c", ""), "-2047/0");
+    assert_eq!(x_prio(fe, "/d", ""), "0/524287");
+    assert_eq!(x_prio(fe, "/e", ""), "0/-524287");
+    // A string that is not a number is 0; a sample that cannot be fetched changes nothing.
+    assert_eq!(x_prio(fe, "/f", ""), "0/0");
+    assert_eq!(x_prio(fe, "/g", "x-c: 4\r\nx-o: -7\r\n"), "4/-7");
+    assert_eq!(x_prio(fe, "/g", "x-c: zz\r\nx-o: 99999999\r\n"), "0/524287");
+    assert_eq!(x_prio(fe, "/m", ""), "0/5");
+}
+
 const ERR_FAIL: &str = "{global}defaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n\
 frontend fe\n  bind {fe}\n  http-request track-sc0 path\n\
   http-after-response add-header x-table err=%[sc0_http_err_cnt],fail=%[sc0_http_fail_cnt]\n\

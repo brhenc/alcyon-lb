@@ -1088,6 +1088,7 @@ fn stream_sample_ctx<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, view: 
         unique_id: s.log.unique_id.as_deref(),
         accept_date: Some(s.log.date),
         last_rule: last_rule_at(s.log.last_rule),
+        prio: (s.log.prio_class, s.log.prio_offset),
         ..Default::default()
     }
 }
@@ -1828,6 +1829,15 @@ fn count_http_status(tracked: &[Option<(usize, StickKey)>; 3], proxies: &[Proxy]
             });
         }
     }
+}
+
+/// A sample as an integer, as a string converts to one: its leading digits, 0 when it has none.
+fn sample_as_sint(smp: &ibex_sample::Sample) -> i64 {
+    let text = sample_to_string(smp);
+    let t = text.trim_start();
+    let (neg, digits) = t.strip_prefix('-').map_or((false, t.strip_prefix('+').unwrap_or(t)), |d| (true, d));
+    let n = digits.bytes().take_while(u8::is_ascii_digit).fold(0i64, |n, d| n.saturating_mul(10).saturating_add(i64::from(d - b'0')));
+    if neg { -n } else { n }
 }
 
 /// An error of the client that does not depend on a status: what a `deny` or a `tarpit` rule counts.
@@ -3279,6 +3289,7 @@ fn eval_tcp_req_content_rules(
         unique_id: sess.log.unique_id.as_deref(),
         accept_date: Some(sess.log.date),
         last_rule: last_rule_at(sess.log.last_rule),
+        prio: (sess.log.prio_class, sess.log.prio_offset),
         captures_req_hdr: Some(&sess.log.req_captures),
         captures_res_hdr: Some(&sess.log.res_captures),
         ..Default::default()
@@ -5583,6 +5594,7 @@ impl EngineDispatcher<'_> {
             accept_date: Some(entry.sess.log.date),
             stream: Some(stream_facts(&entry.sess.log, Some(status), entry.sess.max_retries > entry.sess.conn_retries)),
             last_rule: last_rule_at(entry.sess.log.last_rule),
+            prio: (entry.sess.log.prio_class, entry.sess.log.prio_offset),
             captures_req_hdr: Some(&entry.sess.log.req_captures),
             captures_res_hdr: Some(&res_caps_in),
             ..Default::default()
@@ -6313,6 +6325,7 @@ impl EngineDispatcher<'_> {
                         unique_id: $s.log.unique_id.as_deref(),
                         accept_date: Some($s.log.date),
                         last_rule: last_rule_at($s.log.last_rule),
+                        prio: ($s.log.prio_class, $s.log.prio_offset),
                         be_max_retries: Some(be_retries),
                         cur_max_retries: Some($s.max_retries),
                         acls: Some(acls),
@@ -6569,6 +6582,22 @@ impl EngineDispatcher<'_> {
                         };
                         if let Ok(ip) = val.parse::<IpAddr>() {
                             sess.client_addr = Some(SocketAddr::new(ip, 0));
+                        }
+                    }
+                    ibex_config::HttpReqAction::SetPriorityClass { expr } | ibex_config::HttpReqAction::SetPriorityOffset { expr } => {
+                        // `http_action_set_priority` (src/http_act.c): the sample as an
+                        // integer (a string that is not a number is 0), clamped; a sample that
+                        // cannot be fetched changes nothing.
+                        let value = Expr::parse(expr)
+                            .ok()
+                            .and_then(|e| e.eval_sample(registry, &make_ctx!(sess)))
+                            .map(|smp| sample_as_sint(&smp));
+                        if let Some(v) = value {
+                            if matches!(rule.action, ibex_config::HttpReqAction::SetPriorityClass { .. }) {
+                                sess.log.prio_class = v.clamp(-2047, 2047) as i32;
+                            } else {
+                                sess.log.prio_offset = v.clamp(-524_287, 524_287) as i32;
+                            }
                         }
                     }
                     ibex_config::HttpReqAction::SetDstPort { expr } => {
@@ -8779,6 +8808,7 @@ fn after_res_on_reply<'r>(
     let result = {
         let ctx = SampleContext {
             stick: Some(&stick),
+            prio: (sess.log.prio_class, sess.log.prio_offset),
             client_addr: sess.client_addr,
             server_addr: sess.server_addr,
             fc_src: sess.fc_src,

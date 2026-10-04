@@ -142,6 +142,8 @@ pub struct SampleContext<'a> {
     /// The file and line of the last rule that ended a rule set for the request
     /// (`last_rule_file`, `last_rule_line`); `None` where no rule did.
     pub last_rule: Option<(&'a str, u32)>,
+    /// The stream's priority class and offset (`prio_class`, `prio_offset`).
+    pub prio: (i32, i32),
     /// When the stream was accepted, as unix seconds and milliseconds: `accept_date`.
     pub accept_date: Option<(i64, u32)>,
     /// What `when()` reads of the stream; `None` is a stream that has done nothing yet.
@@ -1437,6 +1439,16 @@ impl Registry {
             name: "last_rule_file",
             out_type: SampleType::Str,
             func: |ctx, _args| ctx.last_rule.map(|(file, _)| Sample::Str(file.to_string())),
+        });
+        self.register_fetch(FetchDesc {
+            name: "prio_class",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| Some(Sample::Sint(i64::from(ctx.prio.0))),
+        });
+        self.register_fetch(FetchDesc {
+            name: "prio_offset",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| Some(Sample::Sint(i64::from(ctx.prio.1))),
         });
         self.register_fetch(FetchDesc {
             name: "last_rule_line",

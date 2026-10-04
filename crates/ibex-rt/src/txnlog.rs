@@ -52,6 +52,9 @@ pub struct StreamLog {
     /// The configuration line of the last rule that ended a rule set for this request
     /// (`s->last_rule_line`), for `last_rule_file` and `last_rule_line`.
     pub last_rule: Option<u32>,
+    /// `set-priority-class` and `set-priority-offset` (`s->priority_class`, `priority_offset`).
+    pub prio_class: i32,
+    pub prio_offset: i32,
     /// `%rt`.
     pub uniq_id: u64,
     /// The termination state, when the proxy itself ended the stream: `PR` for a denied
@@ -83,6 +86,8 @@ impl StreamLog {
             res_captures: Vec::new(),
             unique_id: None,
             last_rule: None,
+            prio_class: 0,
+            prio_offset: 0,
             uniq_id: STREAM_COUNTER.fetch_add(1, Ordering::Relaxed),
             term: None,
             status: None,

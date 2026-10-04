@@ -109,6 +109,14 @@ pub enum HttpReqAction {
     SetDstPort {
         expr: String,
     },
+    /// `set-priority-class <expr>`: the stream's queue class, clamped to +-2047.
+    SetPriorityClass {
+        expr: String,
+    },
+    /// `set-priority-offset <expr>`: the stream's queue offset, clamped to +-524287.
+    SetPriorityOffset {
+        expr: String,
+    },
     /// Replaces the stream's retry budget.
     SetRetries {
         value: RetriesValue,

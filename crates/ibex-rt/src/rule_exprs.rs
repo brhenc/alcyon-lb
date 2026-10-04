@@ -128,6 +128,8 @@ fn http_req(a: &HttpReqAction) -> Exprs<'_> {
         HttpReqAction::SetSrc { expr } => vec![("set-src".into(), expr, false)],
         HttpReqAction::SetDst { expr } => vec![("set-dst".into(), expr, false)],
         HttpReqAction::SetDstPort { expr } => vec![("set-dst-port".into(), expr, false)],
+        HttpReqAction::SetPriorityClass { expr } => vec![("set-priority-class".into(), expr, false)],
+        HttpReqAction::SetPriorityOffset { expr } => vec![("set-priority-offset".into(), expr, false)],
         HttpReqAction::SetRetries { value: RetriesValue::Expr(expr) } => {
             vec![("set-retries".into(), expr, false)]
         }
