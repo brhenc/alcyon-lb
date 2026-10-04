@@ -1,0 +1,17 @@
+[package]
+name = "ibex-regex"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+description = "The regular expressions an operator writes: regex first, fancy-regex for what only a PCRE has"
+
+[dependencies]
+regex = { workspace = true }
+fancy-regex = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }

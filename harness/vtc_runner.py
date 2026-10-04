@@ -589,6 +589,54 @@ class VtcParser:
         )
 
 
+def vtc_split(line: str) -> List[str]:
+    """Split a vtc command line the way varnishtest does: whitespace separates words,
+    "..." and '...' quote (backslash escapes inside double quotes), and {...} is one
+    word taken verbatim (nested braces balanced) with its quotes left alone. shlex
+    would strip the quotes inside `{Basic realm="protected area"}`."""
+    out: List[str] = []
+    i, n = 0, len(line)
+    while i < n:
+        c = line[i]
+        if c.isspace():
+            i += 1
+            continue
+        if c == "#":
+            break
+        word = ""
+        while i < n and not line[i].isspace():
+            c = line[i]
+            if c == "{" and not word:
+                depth, j = 1, i + 1
+                while j < n and depth:
+                    depth += (line[j] == "{") - (line[j] == "}")
+                    j += 1
+                if depth:
+                    raise ValueError("unbalanced brace")
+                word += line[i + 1:j - 1]
+                i = j
+            elif c in "\"'":
+                j = i + 1
+                while j < n and line[j] != c:
+                    if c == '"' and line[j] == "\\" and j + 1 < n and line[j + 1] in '"\\':
+                        j += 1
+                    word += line[j]
+                    j += 1
+                if j >= n:
+                    raise ValueError("unbalanced quote")
+                i = j + 1
+            elif c == "\\" and i + 1 < n:
+                word += line[i + 1]
+                i += 2
+            elif c == "#":
+                i = n
+            else:
+                word += c
+                i += 1
+        out.append(word)
+    return out
+
+
 def parse_inner_actions(block_content: str) -> List[ActionItem]:
     """Parse sequential commands inside server/client { ... } block."""
     actions: List[ActionItem] = []
@@ -617,7 +665,7 @@ def parse_inner_actions(block_content: str) -> List[ActionItem]:
             continue
 
         try:
-            tokens = shlex.split(trimmed, comments=True)
+            tokens = vtc_split(trimmed)
         except ValueError:
             tokens = trimmed.split()
 
@@ -668,6 +716,12 @@ def _unescape_vtc_string(text: str) -> str:
     while i < len(text):
         if text[i] == "\\" and i + 1 < len(text):
             nxt = text[i + 1]
+            hexa = text[i + 2:i + 4]
+            if nxt == "x" and len(hexa) == 2 and all(c in "0123456789abcdefABCDEF" for c in hexa):
+                # `\xHH` is one byte; the runner carries bytes as latin-1 characters.
+                out.append(chr(int(hexa, 16)))
+                i += 4
+                continue
             out.append({"n": "\n", "r": "\r", "t": "\t"}.get(nxt, nxt))
             i += 2
         else:
@@ -759,6 +813,15 @@ def worker_pid(master: int, timeout: float = 2.0) -> int:
 def decode_escapes(s: str) -> str:
     """Safely decode common escape sequences without double unescaping."""
     return s.replace("\\n", "\n").replace("\\r", "\r").replace("\\t", "\t")
+
+
+def decode_hex_escapes(s: str) -> str:
+    """`\\xHH` is one byte in a varnishtest string; the runner carries bytes as latin-1.
+
+    For text `shlex` has already unquoted: a backslash that is not part of `\\xHH`, `\\n`, `\\r` or
+    `\\t` stays as it is, so nothing is unescaped twice.
+    """
+    return decode_escapes(re.sub(r"\\x([0-9a-fA-F]{2})", lambda m: chr(int(m.group(1), 16)), s))
 
 
 # Assertions actually evaluated, process-wide. A pass has to mean an assertion was made
@@ -1482,7 +1545,7 @@ class MockClientRunner:
                                 proto = args[idx]
                             elif opt in ("-hdr", "-litHdr") and idx + 1 < len(args):
                                 idx += 1
-                                hdr_line = args[idx]
+                                hdr_line = decode_hex_escapes(args[idx])
                                 if ":" in hdr_line:
                                     hk, hv = hdr_line.split(":", 1)
                                     headers.append((hk.strip(), hv.lstrip(" \t")))
@@ -1750,7 +1813,7 @@ class VtcExecutor:
                     if not chunk:
                         break
                     resp_bytes.extend(chunk)
-                last_resp = resp_bytes.decode("utf-8", errors="replace")
+                last_resp = resp_bytes.decode("latin-1")
                 writer.close()
                 try:
                     await writer.wait_closed()
@@ -1780,6 +1843,17 @@ class VtcExecutor:
                     pat = _posix_classes_to_python(self.macro_engine.expand(pat))
                     if not re.search(pat, last_resp, re.MULTILINE):
                         raise AssertionError(f"CLI expect pattern {pat!r} failed to match: {last_resp!r}")
+                elif rest.startswith("!~"):
+                    pat = rest[2:].strip()
+                    if (pat.startswith('"') and pat.endswith('"')) or (pat.startswith("'") and pat.endswith("'")):
+                        quote = pat[0]
+                        pat = pat[1:-1]
+                        if quote == '"':
+                            pat = _unescape_vtc_string(pat)
+                    pat = _posix_classes_to_python(self.macro_engine.expand(pat))
+                    _note_assertion()
+                    if re.search(pat, last_resp, re.MULTILINE):
+                        raise AssertionError(f"CLI expect !~ pattern {pat!r} matched: {last_resp!r}")
 
     async def execute(self) -> TestResult:
         start_time = time.monotonic()

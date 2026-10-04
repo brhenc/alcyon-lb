@@ -13,6 +13,8 @@ pub struct UserlistUser {
     pub name: String,
     /// `insecure-password`; `None` for a user declared without one, who never authenticates.
     pub password: Option<String>,
+    /// `password <hash>` (a `crypt(3)` hash, checked by `ibex-crypt`) rather than `insecure-password`.
+    pub password_is_hash: bool,
     pub groups: Vec<String>,
 }
 

@@ -97,6 +97,7 @@ pub(crate) fn parse_listen_header(
         log_health_checks: defaults.map_or(false, |d| d.log_health_checks),
         buffer_request: defaults.is_some_and(|d| d.buffer_request),
         server_close: defaults.is_some_and(|d| d.server_close),
+        dontlognull: defaults.is_some_and(|d| d.dontlognull),
         cliexp: Vec::new(),
         srvexp: Vec::new(),
         acls: Vec::new(),
@@ -193,6 +194,7 @@ pub(crate) fn parse_frontend_header(
         log_health_checks: defaults.map_or(false, |d| d.log_health_checks),
         buffer_request: defaults.is_some_and(|d| d.buffer_request),
         server_close: defaults.is_some_and(|d| d.server_close),
+        dontlognull: defaults.is_some_and(|d| d.dontlognull),
         stick_table: None,
         stick_rules: Vec::new(),
         tcp_req_inspect_delay: defaults.and_then(|d| d.tcp_req_inspect_delay),
@@ -506,7 +508,12 @@ pub(crate) fn parse_frontend_directive(
             tokens[1].col,
             "'set-retries' only available in backend or listen section",
         )),
-        "http-request" => in_section(parse_http_req_rule(&mut fe.http_req_rules, tokens, kw), "frontend", &fe.name),
+        "http-request" => in_section(
+            parse_http_req_rule(&mut fe.http_req_rules, tokens, kw)
+                .and_then(|()| set_timeout_sides(&fe.http_req_rules, kw, &fe.name, true, false)),
+            "frontend",
+            &fe.name,
+        ),
         "http-response" => in_section(parse_http_res_rule(&mut fe.http_res_rules, tokens, kw), "frontend", &fe.name),
         "http-after-response" => {
             in_section(parse_http_after_res_rule(&mut fe.http_after_res_rules, tokens, kw), "frontend", &fe.name)
@@ -636,7 +643,12 @@ pub(crate) fn parse_backend_directive(
         "default-server" => parse_default_server(&mut be.default_server, tokens, kw),
         "server" => parse_server(&mut be.servers, &mut be.server_extras, be.default_server.as_ref(), tokens, kw),
         "tcp-request" => parse_backend_tcp_request(be, tokens, kw),
-        "http-request" => in_section(parse_http_req_rule(&mut be.http_req_rules, tokens, kw), "backend", &be.name),
+        "http-request" => in_section(
+            parse_http_req_rule(&mut be.http_req_rules, tokens, kw)
+                .and_then(|()| set_timeout_sides(&be.http_req_rules, kw, &be.name, false, true)),
+            "backend",
+            &be.name,
+        ),
         "http-response" => in_section(parse_http_res_rule(&mut be.http_res_rules, tokens, kw), "backend", &be.name),
         "http-after-response" => {
             in_section(parse_http_after_res_rule(&mut be.http_after_res_rules, tokens, kw), "backend", &be.name)
@@ -730,7 +742,7 @@ pub(crate) fn parse_backend_directive(
 /// A keyword Ibex handles is read here; every other one goes to
 /// `bind_keywords::unimplemented_bind_keyword`, which refuses it or skips it and its
 /// argument with a warning, and refuses an unknown one as `HAProxy` does.
-fn parse_bind(tokens: &[Token], kw: &Token, section: &str) -> Result<BindConfig, ConfigError> {
+pub(crate) fn parse_bind(tokens: &[Token], kw: &Token, section: &str) -> Result<BindConfig, ConfigError> {
     if tokens.len() < 2 || tokens[1].text.is_empty() {
         return Err(ConfigError::new(
             kw.line,
@@ -894,6 +906,7 @@ pub(crate) fn parse_option_listen(
         "http-buffer-request" => proxy.buffer_request = true,
         "http-server-close" => proxy.server_close = true,
         "http-keep-alive" => proxy.server_close = false,
+        "dontlognull" => proxy.dontlognull = true,
         "accept-unsafe-violations-in-http-request" => proxy.stats.accept_unsafe_request = true,
         "log-health-checks" => proxy.log_health_checks = true,
         "httpchk" => {
@@ -935,6 +948,10 @@ pub(crate) fn parse_option_frontend(
     }
     if matches!(tokens[1].text.as_str(), "http-server-close" | "http-keep-alive") {
         fe.server_close = tokens[1].text == "http-server-close";
+        return Ok(());
+    }
+    if tokens[1].text == "dontlognull" {
+        fe.dontlognull = true;
         return Ok(());
     }
     let (except, if_none) = parse_forward_option(tokens, kw)?;
@@ -995,6 +1012,7 @@ pub(crate) fn parse_no_listen(proxy: &mut ListenSection, tokens: &[Token], kw: &
         Some("redispatch") => (proxy.redisp, proxy.redisp_after) = (false, -1),
         Some("http-buffer-request") => proxy.buffer_request = false,
         Some("http-server-close") => proxy.server_close = false,
+        Some("dontlognull") => proxy.dontlognull = false,
         Some("accept-unsafe-violations-in-http-request") => proxy.stats.accept_unsafe_request = false,
         Some("log-health-checks") => proxy.log_health_checks = false,
         Some("forwarded") => proxy.forwarded = None,
@@ -1011,6 +1029,7 @@ pub(crate) fn parse_no_frontend(fe: &mut FrontendSection, tokens: &[Token], kw: 
         Some("accept-unsafe-violations-in-http-request") => fe.stats.accept_unsafe_request = false,
         Some("http-buffer-request") => fe.buffer_request = false,
         Some("http-server-close") => fe.server_close = false,
+        Some("dontlognull") => fe.dontlognull = false,
         _ => {}
     }
     Ok(())

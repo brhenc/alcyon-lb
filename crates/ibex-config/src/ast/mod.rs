@@ -44,6 +44,9 @@ pub use logging::*;
 pub mod checks;
 pub use checks::*;
 
+pub mod ring;
+pub use ring::*;
+
 /// Full `HAProxy` configuration containing one or more proxy sections.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Config {
@@ -57,6 +60,10 @@ pub struct Config {
     pub frontends: Vec<FrontendSection>,
     /// List of backend sections (`HAProxy` 1.1+ style).
     pub backends: Vec<BackendSection>,
+    /// `ring` sections.
+    pub rings: Vec<RingSection>,
+    /// `log-forward` sections.
+    pub log_forwards: Vec<LogForwardSection>,
     /// Every ACL and log-format sample expression in the proxy and defaults sections, in
     /// the order written. Empty for a configuration not built by the parser.
     pub sample_refs: Vec<SampleRef>,

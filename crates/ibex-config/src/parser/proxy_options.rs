@@ -163,6 +163,8 @@ const IMPLEMENTED: &[&str] = &[
     "http-server-close",
     "http-keep-alive",
     "log-health-checks",
+    // A connection that carried nothing is not logged (T128).
+    "dontlognull",
     "httpchk",
     "tcp-check",
     "ssl-hello-chk",

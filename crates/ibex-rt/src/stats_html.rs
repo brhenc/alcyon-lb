@@ -35,6 +35,35 @@ pub fn format_bytes(bytes: u64) -> String {
 /// Renders the complete, modern single-page HTML stats and administration dashboard.
 #[must_use]
 pub fn render_stats_html(proxies: &[Proxy], checks: &[ServerCheckState], pid: u32) -> String {
+    render_stats_html_for(proxies, checks, pid, &ibex_config::StatsConfig::default())
+}
+
+/// The host name `stats show-node` without a name reports (HAProxy: `gethostname()`).
+fn host_name() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .map(|h| h.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// [`render_stats_html`] for the page served by the proxy whose `stats` section is
+/// `serving`: its `show-node` and `show-desc` go in the title and the report heading
+/// ("Statistics Report for pid N on <node>: <desc>", the description unescaped, as
+/// HAProxy prints it).
+#[must_use]
+pub fn render_stats_html_for(
+    proxies: &[Proxy],
+    checks: &[ServerCheckState],
+    pid: u32,
+    serving: &ibex_config::StatsConfig,
+) -> String {
+    let node = serving
+        .show_node
+        .as_deref()
+        .map(|n| if n.is_empty() { host_name() } else { n.to_string() })
+        .filter(|n| !n.is_empty());
+    let on_node = node.as_deref().map_or(String::new(), |n| format!(" on {n}"));
+    let desc = serving.show_desc.as_deref().map_or(String::new(), |d| format!(": {d}"));
+    let heading = format!("Statistics Report for pid {pid}{on_node}{desc}");
     let mut out = String::with_capacity(32768);
 
     // Calculate aggregated metrics
@@ -68,7 +97,7 @@ pub fn render_stats_html(proxies: &[Proxy], checks: &[ServerCheckState], pid: u3
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Ibex Runtime - Stats &amp; Web Admin</title>
+<title>Ibex Runtime - Stats &amp; Web Admin{on_node}</title>
 <style>
 :root {{
   --bg-page: #0b0f19;
@@ -116,6 +145,7 @@ header {{
 }}
 .brand {{ display: flex; align-items: center; gap: 12px; }}
 .brand h1 {{ font-size: 22px; font-weight: 700; letter-spacing: -0.5px; }}
+.report-title {{ font-size: 13px; font-weight: 400; margin: 0; color: var(--text-muted); }}
 .tag {{
   background: #1e293b;
   color: #38bdf8;
@@ -300,6 +330,7 @@ tr:hover td {{ background: rgba(255, 255, 255, 0.02); }}
       <span class="tag">Load Balancer &amp; Runtime</span>
       <span class="tag mono">PID: {pid}</span>
     </div>
+    <h2 class="report-title">{heading}</h2>
     <div class="toolbar">
       <div class="toolbar-item">
         <span class="pulse" id="live-indicator"></span>

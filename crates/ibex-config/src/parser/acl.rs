@@ -12,6 +12,7 @@ pub(crate) fn parse_acl(acls: &mut Vec<AclRule>, tokens: &[Token], kw: &Token) -
         ));
     }
     let name = tokens[1].text.clone();
+    validate_acl_regexes(&tokens[2..])?;
     let expr = tokens[2..].iter().map(|t| expr_word(&t.text)).collect::<Vec<_>>().join(" ");
     acls.push(AclRule { name, expr });
     Ok(())
@@ -60,6 +61,9 @@ pub(crate) fn parse_acl_condition_from_tokens(tokens: &[Token]) -> Result<Option
             let open = &tokens[i];
             let mut brace_tokens = vec![std::borrow::Cow::Borrowed("{")];
             i += 1;
+            if let Some(end) = tokens[i..].iter().position(|t| t.text == "}") {
+                validate_acl_regexes(&tokens[i..i + end])?;
+            }
             while i < tokens.len() && tokens[i].text != "}" {
                 brace_tokens.push(expr_word(&tokens[i].text));
                 i += 1;
@@ -86,6 +90,41 @@ pub(crate) fn parse_acl_condition_from_tokens(tokens: &[Token]) -> Result<Option
     }
 
     Ok(Some(AclCondition { is_if, terms }))
+}
+
+/// Refuses at load an ACL whose `-m reg` (or `*_reg`) pattern does not compile, as
+/// `HAProxy` does ("regex '(' is invalid"), and with it a pattern only a PCRE2 has that
+/// Ibex cannot run, so that a rule on it is not one that silently never matches.
+/// `words` is the ACL expression: the fetch, its flags and its patterns.
+fn validate_acl_regexes(words: &[Token]) -> Result<(), ConfigError> {
+    let Some(fetch) = words.first() else { return Ok(()) };
+    let mut is_reg = fetch.text.split(['(', ',']).next().is_some_and(|f| f.ends_with("_reg"));
+    let mut i = 1;
+    let mut patterns_from = None;
+    while i < words.len() {
+        match words[i].text.as_str() {
+            "--" => {
+                patterns_from = Some(i + 1);
+                break;
+            }
+            "-m" => {
+                is_reg = words.get(i + 1).is_some_and(|m| m.text == "reg");
+                i += 2;
+            }
+            "-f" | "-M" | "-u" => i += 2,
+            f if f.len() > 1 && f.starts_with('-') && f[1..].chars().all(|c| c.is_ascii_alphabetic()) => i += 1,
+            _ => {
+                patterns_from = Some(i);
+                break;
+            }
+        }
+    }
+    if let (true, Some(from)) = (is_reg, patterns_from) {
+        for pattern in &words[from.min(words.len())..] {
+            validate_regex(pattern)?;
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn parse_rule_condition(

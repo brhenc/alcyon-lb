@@ -9,6 +9,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod aes;
 pub mod auth;
 pub mod cast;
 pub mod expr;
@@ -22,13 +23,14 @@ pub mod registry;
 pub mod sample;
 
 pub use auth::{set_userlists, AuthUser, AuthUserlist};
+pub use ibex_crypt::CryptHash;
 pub use cast::{can_cast, cast};
 pub use expr::Expr;
 pub use matcher::{IntOp, IntRange, Matcher};
 pub use registry::{
     check_converter_args, get_proc_var, not_implemented, not_implemented_message, sample_registry, set_proc_var, unset_proc_var, var_conds_hold, ConvDesc,
     ConvFn, CtxConvDesc, CtxConvFn, FetchDesc, FetchFn, FrontendCounter, ProxyState, Registry,
-    ServerState, SampleContext, SslFacts, StickData, StickGpc, StickOp, StickState, StreamFacts, CURRENT_VARS, STOPPING, GLOBAL_PROC_VARS, SAMPLE_REGISTRY,
+    ServerState, SampleContext, SslFacts, StickData, StickGpc, StickOp, StickState, StreamFacts, StreamTimeouts, TimeoutKind, CURRENT_VARS, STOPPING, GLOBAL_PROC_VARS, SAMPLE_REGISTRY,
 };
 pub use rawpayload::{check_args as check_raw_fetch_args, raw_may_change};
 pub use sample::{Sample, SampleType, TypeSpec, SAMPLE_TYPES_COUNT};

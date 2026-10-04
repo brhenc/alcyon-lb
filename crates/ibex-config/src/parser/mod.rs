@@ -8,7 +8,7 @@ use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
-use crate::ast::{ProxyKind, ServerExtras,
+use crate::ast::{LogForwardSection, RingSection, ProxyKind, ServerExtras,
     clear_http_errors_sections, clear_resolved_checks, clear_userlists, http_errors_section, http_errors_section_code,
     register_userlist, take_userlists, Userlist, UserlistUser,
     register_http_errors_section, register_resolved_check, register_resolved_check_for_addr,
@@ -83,6 +83,10 @@ pub(crate) enum CurrentSection {
     /// `http-errors <name>`: a named, independent set of `errorfile` entries referenced by
     /// proxies via `errorfiles <name> [<code>...]`.
     HttpErrors(String, std::collections::HashMap<u16, Vec<u8>>),
+    /// `ring <name>`.
+    Ring(RingSection),
+    /// `log-forward <name>`.
+    LogForward(LogForwardSection),
 }
 
 impl CurrentSection {
@@ -109,6 +113,7 @@ pub(crate) mod checks;
 pub(crate) use checks::*;
 pub(crate) mod server;
 pub(crate) use server::*;
+pub(crate) mod ring;
 pub(crate) mod bind_keywords;
 pub(crate) mod server_keywords;
 pub(crate) use server_keywords::*;
@@ -169,6 +174,8 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
     let mut listens = Vec::new();
     let mut frontends = Vec::new();
     let mut backends = Vec::new();
+    let mut rings: Vec<RingSection> = Vec::new();
+    let mut log_forwards: Vec<LogForwardSection> = Vec::new();
     let mut cur_section: Option<CurrentSection> = None;
     let mut sample_refs = Vec::new();
     // The proxy sections in the order written, and the explicit `id` of each, for the
@@ -199,6 +206,8 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut listens,
                     &mut frontends,
                     &mut backends,
+                    &mut rings,
+                    &mut log_forwards,
                 );
                 // HAProxy reads every `global` section into the same struct: a later one
                 // adds to the earlier ones, it does not replace them.
@@ -213,6 +222,8 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut listens,
                     &mut frontends,
                     &mut backends,
+                    &mut rings,
+                    &mut log_forwards,
                 );
                 check_inheritance(Inheritor::Defaults, tokens, &named_defaults, &defaults_lines, &mut defaults_users)?;
                 if tokens.len() >= 2 && !tokens[1].text.is_empty() && tokens[1].text != "from" {
@@ -265,6 +276,8 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut listens,
                     &mut frontends,
                     &mut backends,
+                    &mut rings,
+                    &mut log_forwards,
                 );
                 check_inheritance(Inheritor::Listen, tokens, &named_defaults, &defaults_lines, &mut defaults_users)?;
                 proxy_order.push((ProxyKind::Listen, listens.len()));
@@ -284,6 +297,8 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut listens,
                     &mut frontends,
                     &mut backends,
+                    &mut rings,
+                    &mut log_forwards,
                 );
                 check_inheritance(Inheritor::Frontend, tokens, &named_defaults, &defaults_lines, &mut defaults_users)?;
                 proxy_order.push((ProxyKind::Frontend, frontends.len()));
@@ -303,6 +318,8 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut listens,
                     &mut frontends,
                     &mut backends,
+                    &mut rings,
+                    &mut log_forwards,
                 );
                 check_inheritance(Inheritor::Backend, tokens, &named_defaults, &defaults_lines, &mut defaults_users)?;
                 if !tokens.iter().any(|t| t.text == "from") {
@@ -318,6 +335,34 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     defaults.as_ref(),
                 )?));
             }
+            "ring" => {
+                flush_current_section(
+                    &mut cur_section,
+                    &mut global,
+                    &mut defaults,
+                    &mut named_defaults,
+                    &mut listens,
+                    &mut frontends,
+                    &mut backends,
+                    &mut rings,
+                    &mut log_forwards,
+                );
+                cur_section = Some(CurrentSection::Ring(ring::parse_ring_header(tokens, kw, &rings)?));
+            }
+            "log-forward" => {
+                flush_current_section(
+                    &mut cur_section,
+                    &mut global,
+                    &mut defaults,
+                    &mut named_defaults,
+                    &mut listens,
+                    &mut frontends,
+                    &mut backends,
+                    &mut rings,
+                    &mut log_forwards,
+                );
+                cur_section = Some(CurrentSection::LogForward(ring::parse_log_forward_header(tokens, kw, &log_forwards)?));
+            }
             "resolvers" => {
                 flush_current_section(
                     &mut cur_section,
@@ -327,6 +372,8 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut listens,
                     &mut frontends,
                     &mut backends,
+                    &mut rings,
+                    &mut log_forwards,
                 );
                 cur_section = Some(CurrentSection::Resolvers);
             }
@@ -339,6 +386,8 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut listens,
                     &mut frontends,
                     &mut backends,
+                    &mut rings,
+                    &mut log_forwards,
                 );
                 let Some(name) = tokens.get(1).filter(|t| !t.text.is_empty()) else {
                     return Err(ConfigError::new(kw.line, kw.col, "'userlist' expects <name> as arguments."));
@@ -354,6 +403,8 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut listens,
                     &mut frontends,
                     &mut backends,
+                    &mut rings,
+                    &mut log_forwards,
                 );
                 if tokens.len() < 2 || tokens[1].text.is_empty() {
                     return Err(ConfigError::new(
@@ -405,6 +456,8 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
         &mut listens,
         &mut frontends,
         &mut backends,
+        &mut rings,
+        &mut log_forwards,
     );
 
     // HAProxy 3.5 accepts a config with no proxy sections -- including a completely
@@ -457,6 +510,8 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
         listens,
         frontends,
         backends,
+        rings,
+        log_forwards,
         sample_refs,
         userlists,
         proxy_order,
@@ -652,6 +707,8 @@ pub(crate) fn flush_current_section(
     listens: &mut Vec<ListenSection>,
     frontends: &mut Vec<FrontendSection>,
     backends: &mut Vec<BackendSection>,
+    rings: &mut Vec<RingSection>,
+    log_forwards: &mut Vec<LogForwardSection>,
 ) {
     if let Some(sec) = cur.take() {
         match sec {
@@ -668,6 +725,8 @@ pub(crate) fn flush_current_section(
             CurrentSection::Resolvers => {}
             CurrentSection::Userlist(u) => register_userlist(u),
             CurrentSection::HttpErrors(name, table) => register_http_errors_section(name, table),
+            CurrentSection::Ring(r) => rings.push(r),
+            CurrentSection::LogForward(l) => log_forwards.push(l),
         }
     }
 }
@@ -688,6 +747,8 @@ pub(crate) fn parse_section_directive(
         CurrentSection::Backend(b) => parse_backend_directive(b, tokens, kw),
         CurrentSection::Resolvers => parse_resolvers_directive(tokens, kw),
         CurrentSection::Userlist(u) => parse_userlist_directive(u, tokens, kw),
+        CurrentSection::Ring(r) => ring::parse_ring_directive(r, tokens, kw),
+        CurrentSection::LogForward(l) => ring::parse_log_forward_directive(l, tokens, kw),
         CurrentSection::HttpErrors(_, table) => match kw.text.as_str() {
             "errorfile" => parse_errorfile_directive(table, tokens, kw),
             other => Err(ConfigError::new(

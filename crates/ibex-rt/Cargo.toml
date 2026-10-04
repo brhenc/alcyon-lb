@@ -18,7 +18,7 @@ rustix = { version = "0.38", features = ["event", "net", "fs", "process", "std",
 ibex-mmsg = { path = "../ibex-mmsg" }
 ibex-quic = { path = "../ibex-quic" }
 ctrlc = "3.5.2"
-regex = { workspace = true }
+ibex-regex = { workspace = true }
 signal-hook = "0.3"
 
 [lints.rust]

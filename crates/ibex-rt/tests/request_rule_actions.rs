@@ -258,13 +258,20 @@ fn request_rules_haproxy_refuses_are_refused() {
     assert!(ok, "{text}");
 }
 
-/// A regex only a PCRE has (look-around, a back-reference) is refused at load with the
-/// regex and the reason, rather than loaded as a rule that never matches. `HAProxy` takes
-/// all of these (measured: `replace-header x '(?=a)' y`, `'(a)\1'`, `'(?<=a)b'` are
-/// accepted); Ibex's engine has none of them, and this is the known gap.
+/// A regex only a PCRE has: look-around and a back-reference load (`fancy-regex` runs them,
+/// T154, tested in `pcre_regex.rs`); one `fancy-regex` lacks -- recursion, a subroutine
+/// call -- is refused at load with the regex and the reason, rather than loaded as a rule
+/// that never matches. `HAProxy` takes all of these (measured: `replace-header x '(?=a)' y`,
+/// `'(a)\1'`, `'(?<=a)b'`, `'(?R)'`, `'(a)(?1)'` are accepted); that last pair is the known gap.
 #[test]
 fn a_regex_ibex_cannot_run_is_refused_with_its_reason() {
     for re in ["(?=a)", "(a)\\1", "(?<=a)b"] {
+        for kind in ["replace-header", "replace-value"] {
+            let (ok, text) = check(&format!("{DEFAULTS}listen l\n  bind 127.0.0.1:1\n  http-request {kind} x '{re}' y\n"));
+            assert!(ok, "{kind} {re} was refused: {text}");
+        }
+    }
+    for re in ["(?R)", "(a)(?1)"] {
         for kind in ["replace-header", "replace-value"] {
             let (ok, text) = check(&format!("{DEFAULTS}listen l\n  bind 127.0.0.1:1\n  http-request {kind} x '{re}' y\n"));
             assert!(!ok, "{kind} {re} was loaded");

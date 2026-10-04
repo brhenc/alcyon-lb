@@ -6,13 +6,20 @@ license = "GPL-2.0-or-later"
 description = "Ibex Sample / Converter / Matcher lattice (design/007-sample-lattice.md)"
 
 [dependencies]
+ibex-crypt = { path = "../ibex-crypt" }
 ibex-proto = { path = "../ibex-proto" }
 getrandom = "0.2"
-regex = { workspace = true }
+ibex-regex = { workspace = true }
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+ctr = "0.9"
+ghash = "0.5"
 serde_json = { workspace = true }
 
 [dev-dependencies]
 proptest.workspace = true
+# Cross-checks the GCM composition in src/aes.rs for the nonce lengths it supports.
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
 serde.workspace = true
 serde_json.workspace = true
 

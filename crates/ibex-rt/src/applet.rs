@@ -294,6 +294,16 @@ impl CliApplet {
             if self.interactive {
                 self.out_buf.extend_from_slice(b"\n> ");
             }
+        } else if cmd == "show events" || cmd.starts_with("show events ") {
+            let args: Vec<&str> = cmd["show events".len()..].split_whitespace().collect();
+            let events = crate::ring::show_events(&args);
+            self.out_buf.extend_from_slice(&events);
+            if self.interactive {
+                self.out_buf.extend_from_slice(b"\n> ");
+            } else {
+                self.out_buf.push(b'\n');
+                self.is_done = true;
+            }
         } else if cmd == "show info" || cmd.starts_with("show info ") {
             self.handle_show_info(ctx);
         } else if cmd == "show env" {
@@ -484,8 +494,8 @@ impl CliApplet {
             } else {
                 self.is_done = true;
             }
-        } else if let Some(target) = cmd.strip_prefix("get var ") {
-            self.handle_get_var(target.trim());
+        } else if cmd == "get var" || cmd.starts_with("get var ") {
+            self.handle_get_var(cmd["get var".len()..].trim());
         } else if let Some(target) = cmd.strip_prefix("set var ") {
             self.handle_set_var(target.trim());
         } else if cmd == "help" {
@@ -540,32 +550,27 @@ impl CliApplet {
         }
     }
 
+    /// `vars_parse_cli_get_var` (src/vars.c): the CLI has no stream, so only the `proc`
+    /// scope is looked in; any other name is not found.
     fn handle_get_var(&mut self, var_name: &str) {
-        let val_opt = if var_name.starts_with("proc.") {
-            ibex_sample::get_proc_var(var_name)
-        } else {
-            ibex_sample::CURRENT_VARS.with(|v| v.borrow().get(var_name).cloned())
+        if var_name.is_empty() {
+            self.finish_msg("Missing process-wide variable identifier.");
+            return;
+        }
+        let Some(val) = var_name.starts_with("proc.").then(|| ibex_sample::get_proc_var(var_name)).flatten() else {
+            self.finish_msg("Variable not found.");
+            return;
         };
-        if let Some(val) = val_opt {
-            let typ = if val.parse::<i64>().is_ok() {
-                "sint"
-            } else if val == "true" || val == "false" {
-                "bool"
-            } else if val.parse::<std::net::IpAddr>().is_ok() {
-                "ip"
-            } else {
-                "str"
-            };
-            let resp = format!("{var_name}: type={typ} value=<{val}>\n");
-            self.out_buf.extend_from_slice(resp.as_bytes());
+        let typ = if val.parse::<i64>().is_ok() {
+            "sint"
+        } else if val == "true" || val == "false" {
+            "bool"
+        } else if val.parse::<std::net::IpAddr>().is_ok() {
+            "ip"
         } else {
-            self.out_buf.extend_from_slice(b"Variable not found.\n");
-        }
-        if self.interactive {
-            self.out_buf.extend_from_slice(b"\n> ");
-        } else {
-            self.is_done = true;
-        }
+            "str"
+        };
+        self.finish_msg(&format!("{var_name}: type={typ} value=<{val}>"));
     }
 
     fn handle_set_var(&mut self, rest: &str) {
@@ -1294,6 +1299,7 @@ impl CliApplet {
                       prompt                                     : Switch session to interactive prompt mode\n\
                       quit                                       : Disconnect CLI session\n\
                       set timeout cli <sec>                      : Set CLI session idle timeout\n\
+                      show events [-0rsn] [<sink>]               : List the event sinks, or dump a ring\n\
                       show info                                  : Dump system statistics\n\
                       show pools                                 : Report information about the memory pools usage\n\
                       show stat [<iid> <type> <sid>]             : Dump CSV proxies and servers statistics\n\

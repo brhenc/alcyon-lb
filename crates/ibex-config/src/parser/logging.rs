@@ -63,6 +63,13 @@ pub(crate) fn parse_log(
                 i += 2;
             }
             "format" => {
+                if crate::ast::RingFormat::from_name(&tokens[i + 1].text).is_none() {
+                    return Err(ConfigError::new(
+                        tokens[i + 1].line,
+                        tokens[i + 1].col,
+                        format!("unknown log format '{}'", tokens[i + 1].text),
+                    ));
+                }
                 format = Some(tokens[i + 1].text.clone());
                 i += 2;
             }
@@ -130,6 +137,12 @@ pub(crate) fn parse_log_target(tok: &Token) -> Result<LogTarget, ConfigError> {
             ));
         }
         return Ok(LogTarget::Fd(fd));
+    }
+    if let Some(name) = t.strip_prefix("ring@") {
+        if name.is_empty() {
+            return Err(ConfigError::new(tok.line, tok.col, "missing ring name after 'ring@'"));
+        }
+        return Ok(LogTarget::Ring(name.to_string()));
     }
     if let Some(path) = t.strip_prefix("unix@") {
         return Ok(LogTarget::Unix(path.to_string()));

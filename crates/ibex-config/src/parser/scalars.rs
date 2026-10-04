@@ -89,7 +89,7 @@ pub(crate) fn parse_hex_binary(hex: &str) -> Result<Vec<u8>, String> {
 }
 
 pub(crate) fn validate_regex(token: &Token) -> Result<(), ConfigError> {
-    regex::Regex::new(&token.text).map_err(|e| {
+    ibex_regex::UserRegex::new(&token.text).map_err(|e| {
         ConfigError::new(
             token.line,
             token.col,

@@ -15,7 +15,7 @@ use crate::hash::{
 };
 use crate::sample::{Sample, SampleType, TypeSpec};
 use ibex_proto::htx::{Htx, HtxSliceRef};
-use regex::RegexBuilder;
+
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -23,12 +23,52 @@ use std::sync::{Arc, LazyLock, RwLock};
 
 thread_local! {
     pub static CURRENT_VARS: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
-    pub static CURRENT_TIMEOUTS: RefCell<HashMap<&'static str, u32>> = RefCell::new(HashMap::new());
+    /// The timeouts of the stream running on the thread, for the `*_timeout` fetches; set
+    /// by the engine for the length of one run of a stream, `None` outside one.
+    pub static CURRENT_TIMEOUTS: Cell<Option<StreamTimeouts>> = const { Cell::new(None) };
     pub static CURRENT_RES_HEADERS: RefCell<Vec<(String, String)>> = const { RefCell::new(Vec::new()) };
     pub static CURRENT_RES_STATUS: Cell<u16> = const { Cell::new(0) };
 }
 
-pub static GLOBAL_PROC_VARS: LazyLock<RwLock<HashMap<String, String>>> =
+/// The timeouts a `set-timeout` names, as indexes into [`StreamTimeouts`]' arrays.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimeoutKind {
+    Client = 0,
+    Server = 1,
+    Connect = 2,
+    Queue = 3,
+    Tunnel = 4,
+    Tarpit = 5,
+}
+
+impl TimeoutKind {
+    /// The kind `set-timeout <name>` names.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "client" => Self::Client,
+            "server" => Self::Server,
+            "connect" => Self::Connect,
+            "queue" => Self::Queue,
+            "tunnel" => Self::Tunnel,
+            "tarpit" => Self::Tarpit,
+            _ => return None,
+        })
+    }
+}
+
+/// One stream's timeouts, in ms (0: none), indexed by [`TimeoutKind`]: its frontend's
+/// (`fe_*_timeout`), its backend's (`be_*_timeout`, the frontend's until one is chosen) and
+/// the ones it runs on (`cur_*_timeout`: the backend's, or what `set-timeout` set). `Copy`:
+/// the engine computes it for each run of a stream, from the stream.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StreamTimeouts {
+    pub fe: [u32; 6],
+    pub be: [u32; 6],
+    pub cur: [u32; 6],
+}
+
+pub static GLOBAL_PROC_VARS:LazyLock<RwLock<HashMap<String, String>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
 pub static SAMPLE_REGISTRY: LazyLock<Registry> = LazyLock::new(Registry::new);
@@ -78,11 +118,6 @@ pub fn set_proc_var(name: &str, val: String) {
 #[allow(clippy::implicit_hasher)]
 pub fn set_current_vars(vars: HashMap<String, String>) {
     CURRENT_VARS.with(|v| *v.borrow_mut() = vars);
-}
-
-#[allow(clippy::implicit_hasher)]
-pub fn set_current_timeouts(timeouts: HashMap<&'static str, u32>) {
-    CURRENT_TIMEOUTS.with(|t| *t.borrow_mut() = timeouts);
 }
 
 pub fn set_current_res_headers(headers: Vec<(String, String)>) {
@@ -1993,7 +2028,7 @@ impl Registry {
 
         // --- 11. Timeout Fetches ---
         macro_rules! reg_timeout_fetch {
-            ($name:literal) => {
+            ($name:literal, $set:ident, $kind:expr) => {
                 self.register_fetch(FetchDesc {
                     name: $name,
                     out_type: SampleType::Sint,
@@ -2003,35 +2038,31 @@ impl Registry {
                                 return Some(Sample::Sint(i64::from(v)));
                             }
                         }
-                        CURRENT_TIMEOUTS.with(|t| {
-                            t.borrow()
-                                .get($name)
-                                .copied()
-                                .map(|v| Sample::Sint(i64::from(v)))
-                        })
+                        CURRENT_TIMEOUTS.get().map(|t| Sample::Sint(i64::from(t.$set[$kind as usize])))
                     },
                 });
             };
         }
 
-        reg_timeout_fetch!("fe_client_timeout");
-        reg_timeout_fetch!("cur_client_timeout");
-        reg_timeout_fetch!("be_server_timeout");
-        reg_timeout_fetch!("cur_server_timeout");
-        reg_timeout_fetch!("be_connect_timeout");
-        reg_timeout_fetch!("cur_connect_timeout");
-        reg_timeout_fetch!("be_queue_timeout");
-        reg_timeout_fetch!("cur_queue_timeout");
-        reg_timeout_fetch!("be_tunnel_timeout");
-        reg_timeout_fetch!("cur_tunnel_timeout");
-        reg_timeout_fetch!("be_tarpit_timeout");
-        reg_timeout_fetch!("cur_tarpit_timeout");
-        reg_timeout_fetch!("fe_connect_timeout");
-        reg_timeout_fetch!("fe_server_timeout");
-        reg_timeout_fetch!("fe_queue_timeout");
-        reg_timeout_fetch!("fe_tunnel_timeout");
-        reg_timeout_fetch!("fe_tarpit_timeout");
-        reg_timeout_fetch!("be_client_timeout");
+        use TimeoutKind::{Client, Connect, Queue, Server, Tarpit, Tunnel};
+        reg_timeout_fetch!("fe_client_timeout", fe, Client);
+        reg_timeout_fetch!("cur_client_timeout", cur, Client);
+        reg_timeout_fetch!("be_server_timeout", be, Server);
+        reg_timeout_fetch!("cur_server_timeout", cur, Server);
+        reg_timeout_fetch!("be_connect_timeout", be, Connect);
+        reg_timeout_fetch!("cur_connect_timeout", cur, Connect);
+        reg_timeout_fetch!("be_queue_timeout", be, Queue);
+        reg_timeout_fetch!("cur_queue_timeout", cur, Queue);
+        reg_timeout_fetch!("be_tunnel_timeout", be, Tunnel);
+        reg_timeout_fetch!("cur_tunnel_timeout", cur, Tunnel);
+        reg_timeout_fetch!("be_tarpit_timeout", be, Tarpit);
+        reg_timeout_fetch!("cur_tarpit_timeout", cur, Tarpit);
+        reg_timeout_fetch!("fe_connect_timeout", fe, Connect);
+        reg_timeout_fetch!("fe_server_timeout", fe, Server);
+        reg_timeout_fetch!("fe_queue_timeout", fe, Queue);
+        reg_timeout_fetch!("fe_tunnel_timeout", fe, Tunnel);
+        reg_timeout_fetch!("fe_tarpit_timeout", fe, Tarpit);
+        reg_timeout_fetch!("be_client_timeout", be, Client);
 
         self.register_fetch(FetchDesc {
             name: "be_max_retries",
@@ -2748,32 +2779,23 @@ impl Registry {
             in_type: TypeSpec::Exact(SampleType::Str),
             out_type: TypeSpec::Exact(SampleType::Str),
             func: |smp, _args| match smp {
-                Sample::Str(s) => {
-                    let host = if let Some(stripped) = s.strip_prefix('[') {
-                        stripped.split(']').next().unwrap_or(&s)
-                    } else if let Some((h, _)) = s.split_once(':') {
-                        h
-                    } else {
-                        &s
-                    };
-                    Some(Sample::Str(host.to_lowercase()))
-                }
+                Sample::Str(s) => Some(Sample::Str(split_host_port(&s).0.to_lowercase())),
                 _ => None,
             },
         });
 
+        // `port_only`: what follows the last colon, every byte of it taken as a digit (`abc`
+        // is 5451, a `-` wraps), in an unsigned 32-bit number; 0 when there is no port.
         self.register_converter(ConvDesc {
             name: "port_only",
             in_type: TypeSpec::Exact(SampleType::Str),
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: |smp, _args| match smp {
                 Sample::Str(s) => {
-                    let port_str = if s.starts_with('[') {
-                        s.split("]:").nth(1)
-                    } else {
-                        s.split_once(':').map(|(_, p)| p)
-                    }?;
-                    port_str.parse::<i64>().ok().map(Sample::Sint)
+                    let port = split_host_port(&s).1.unwrap_or("").bytes().fold(0u32, |acc, c| {
+                        acc.wrapping_mul(10).wrapping_add(u32::from(c).wrapping_sub(u32::from(b'0')))
+                    });
+                    Some(Sample::Sint(i64::from(port)))
                 }
                 _ => None,
             },
@@ -4050,10 +4072,15 @@ impl Registry {
             in_type: TypeSpec::Any,
             out_type: TypeSpec::Same,
             func: |smp, args| {
+                // A `proc.` variable is the process's, not the stream's (T156).
                 if let Some(var_name) = args.first() {
-                    CURRENT_VARS.with(|v| {
-                        v.borrow_mut().remove(var_name);
-                    });
+                    if var_name.starts_with("proc.") {
+                        unset_proc_var(var_name);
+                    } else {
+                        CURRENT_VARS.with(|v| {
+                            v.borrow_mut().remove(var_name);
+                        });
+                    }
                 }
                 Some(smp)
             },
@@ -4218,6 +4245,54 @@ impl Registry {
                 let mut outer: Vec<u8> = key.iter().map(|b| b ^ 0x5c).collect();
                 outer.extend_from_slice(&digest(&inner));
                 Some(Sample::Bin(digest(&outer)))
+            },
+        });
+
+        // `aes_cbc_enc(<bits>,<nonce>,<key>[,<aad>])`, `aes_cbc_dec` (same arguments),
+        // `aes_gcm_enc(<bits>,<nonce>,<key>,<tag var>[,<aad>])` and
+        // `aes_gcm_dec(<bits>,<nonce>,<key>,<tag>[,<aad>])`: `sample_conv_aes_cbc`
+        // and `sample_conv_aes_gcm` (src/sample.c). Nonce, key, aad and the decryption's
+        // tag are base64, as a variable's text or as a literal; the encryption's tag is
+        // written to its variable, base64 too. Anything that does not work (a variable
+        // that is not set, a key shorter than `bits`, a bad padding or tag) yields no sample.
+        self.register_converter(ConvDesc {
+            name: "aes_cbc_enc",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Bin),
+            func: |smp, args| aes_cbc(smp, args, true),
+        });
+        self.register_converter(ConvDesc {
+            name: "aes_cbc_dec",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Bin),
+            func: |smp, args| aes_cbc(smp, args, false),
+        });
+        self.register_converter(ConvDesc {
+            name: "aes_gcm_enc",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Bin),
+            func: |smp, args| aes_gcm(smp, args, true),
+        });
+        self.register_converter(ConvDesc {
+            name: "aes_gcm_dec",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Bin),
+            func: |smp, args| aes_gcm(smp, args, false),
+        });
+
+        // `language(<value>[;<value>...][,<default>])`: `sample_conv_q_prefered`. The
+        // input is an `Accept-Language` style header; the output is the listed value the
+        // header prefers.
+        self.register_converter(ConvDesc {
+            name: "language",
+            in_type: TypeSpec::Exact(SampleType::Str),
+            out_type: TypeSpec::Exact(SampleType::Str),
+            func: |smp, args| {
+                let header = sample_to_string(&smp);
+                match language_pick(&header, args.first()?) {
+                    Some(v) => Some(Sample::Str(v)),
+                    None => args.get(1).map(|d| Sample::Str(d.clone())),
+                }
             },
         });
 
@@ -4408,7 +4483,7 @@ pub enum MapMatchType {
 pub struct CachedMapEntry {
     pub key: String,
     pub val: String,
-    pub regex: Option<regex::Regex>,
+    pub regex: Option<ibex_regex::UserRegex>,
     pub int_val: Option<i64>,
 }
 
@@ -4443,7 +4518,7 @@ impl CachedMapTable {
             };
 
             let int_val = key.parse::<i64>().ok();
-            let regex = regex::Regex::new(&key).ok();
+            let regex = ibex_regex::UserRegex::new(&key).ok();
 
             if let Some(n) = int_val {
                 exact_int.entry(n).or_insert_with(|| (val.clone(), key.clone()));
@@ -4598,7 +4673,7 @@ pub fn match_map(path: &str, input: &str, match_type: MapMatchType) -> Option<(S
                         let mut result = entry.val.clone();
                         for i in 1..caps.len() {
                             let backref = format!("\\{i}");
-                            let captured = caps.get(i).map_or("", |m| m.as_str());
+                            let captured = caps.get(i).unwrap_or("");
                             result = result.replace(&backref, captured);
                         }
                         return Some((result, entry.key.clone()));
@@ -4722,10 +4797,7 @@ fn regsub_eval(input: &str, pattern: &str, repl: &str, flags: &str) -> Option<St
     let case_insensitive = flags.contains('i');
     let global = flags.contains('g');
 
-    let re = RegexBuilder::new(pattern)
-        .case_insensitive(case_insensitive)
-        .build()
-        .ok()?;
+    let re = ibex_regex::UserRegex::with_case(pattern, case_insensitive).ok()?;
 
     // Translate \1, \2 to ${1}, ${2} for Rust regex replacement
     let mut rust_repl = String::with_capacity(repl.len() + 4);
@@ -5385,6 +5457,206 @@ const HMAC_UNIMPLEMENTED: &[&str] = &[
 ];
 
 /// A key written as a variable name (scope prefix) rather than as base64 text.
+/// Splits `host[:port]` at its last colon, unless a `]` follows it (the colon is inside the
+/// brackets of an IPv6 address): `sample_conv_host_only` and `sample_conv_port_only`.
+fn split_host_port(s: &str) -> (&str, Option<&str>) {
+    match s.rfind(':') {
+        Some(i) if !s[i + 1..].contains(']') => (&s[..i], Some(&s[i + 1..])),
+        _ => (s, None),
+    }
+}
+
+/// The text a variable named `name` holds, in the scope its prefix names.
+fn read_var(name: &str) -> Option<String> {
+    if name.starts_with("proc.") {
+        get_proc_var(name)
+    } else {
+        CURRENT_VARS.with(|v| v.borrow().get(name).cloned())
+    }
+}
+
+/// Sets a variable from a converter: in the stream's map, which the engine hands back to
+/// the session when the step ends.
+fn write_var(name: &str, value: String) {
+    if name.starts_with("proc.") {
+        set_proc_var(name, value);
+        return;
+    }
+    CURRENT_VARS.with(|v| v.borrow_mut().insert(name.to_string(), value));
+}
+
+/// A base64 argument: the text of the variable it names, or the literal, decoded.
+fn b64_arg(arg: &str) -> Option<Vec<u8>> {
+    let arg = arg.trim();
+    let text = if hmac_key_is_var(arg) { read_var(arg)? } else { arg.to_string() };
+    base64_decode(&text, false, true)
+}
+
+fn aes_bits(arg: &str) -> Option<usize> {
+    arg.trim().parse::<i64>().ok().filter(|b| matches!(b, 128 | 192 | 256)).and_then(|b| usize::try_from(b / 8).ok())
+}
+
+fn aes_for(args: &[String], key_len: usize) -> Option<crate::aes::Aes> {
+    let key = b64_arg(args.get(2)?)?;
+    // A longer key is cut to the size asked for, a shorter one is no key.
+    crate::aes::Aes::new(key.get(..key_len)?)
+}
+
+fn aes_cbc(smp: Sample, args: &[String], encrypt: bool) -> Option<Sample> {
+    let Sample::Bin(msg) = smp else { return None };
+    let key_len = aes_bits(args.first()?)?;
+    let nonce = b64_arg(args.get(1)?)?;
+    let aes = aes_for(args, key_len)?;
+    // The aad has no use in CBC; HAProxy still reads it.
+    if let Some(aad) = args.get(3) {
+        b64_arg(aad)?;
+    }
+    // The nonce is the IV: zero padded when short, cut when long.
+    let mut iv = [0u8; 16];
+    let n = nonce.len().min(16);
+    iv[..n].copy_from_slice(&nonce[..n]);
+    if encrypt {
+        Some(Sample::Bin(crate::aes::cbc_encrypt(&aes, &iv, &msg)))
+    } else {
+        crate::aes::cbc_decrypt(&aes, &iv, &msg).map(Sample::Bin)
+    }
+}
+
+fn aes_gcm(smp: Sample, args: &[String], encrypt: bool) -> Option<Sample> {
+    let Sample::Bin(msg) = smp else { return None };
+    let key_len = aes_bits(args.first()?)?;
+    let nonce = b64_arg(args.get(1)?)?;
+    let aes = aes_for(args, key_len)?;
+    let tag_arg = args.get(3)?.trim();
+    let aad = match args.get(4) {
+        Some(a) => b64_arg(a)?,
+        None => Vec::new(),
+    };
+    if encrypt {
+        let (cipher, tag) = crate::aes::gcm_encrypt(&aes, &nonce, &aad, &msg)?;
+        write_var(tag_arg, base64_encode(&tag, false));
+        Some(Sample::Bin(cipher))
+    } else {
+        let tag = b64_arg(tag_arg)?;
+        crate::aes::gcm_decrypt(&aes, &nonce, &aad, &msg, &tag).map(Sample::Bin)
+    }
+}
+
+/// A q-value as `Accept-Language` writes it, in thousandths: what follows a leading `0`
+/// and a dot (three digits at most) is the fraction, a `0` followed by anything else is
+/// 0, and what does not start with `0` counts as 1.
+fn parse_qvalue(s: &str) -> u32 {
+    let b = s.as_bytes();
+    if b.first() != Some(&b'0') {
+        return 1000;
+    }
+    if b.get(1) != Some(&b'.') {
+        return 0;
+    }
+    let mut q = 0;
+    let mut scale = 100;
+    for d in b[2..].iter().take(3).take_while(|d| d.is_ascii_digit()) {
+        q += u32::from(d - b'0') * scale;
+        scale /= 10;
+    }
+    q
+}
+
+/// `language(<list>)` on the header `header`: the first entry of `list` (`;` separated)
+/// matching the language with the highest q-value, ties going to the first in the header.
+fn language_pick(header: &str, list: &str) -> Option<String> {
+    let entries: Vec<&str> = list.split(';').filter(|e| !e.is_empty()).collect();
+    let mut best: Option<(u32, &str)> = None;
+    for item in header.split(',') {
+        let item = item.trim_start();
+        let tok_end = item.find(|c: char| c.is_whitespace() || c == ';').unwrap_or(item.len());
+        let (token, rest) = item.split_at(tok_end);
+        if token.is_empty() {
+            continue;
+        }
+        let rest = rest.trim_start();
+        let q = if rest.is_empty() {
+            1000
+        } else if let Some(params) = rest.strip_prefix(';') {
+            let qv = params.trim_start().strip_prefix('q').and_then(|r| r.trim_start().strip_prefix('='));
+            qv.map_or(1000, |v| parse_qvalue(v.trim_start()))
+        } else {
+            // something other than ';' after the language: not a language
+            continue;
+        };
+        if q == 0 {
+            continue;
+        }
+        let hit = entries
+            .iter()
+            .find(|e| token == **e || token.strip_prefix(**e).is_some_and(|r| r.starts_with('-')));
+        if let Some(e) = hit {
+            if best.is_none_or(|(bq, _)| q > bq) {
+                best = Some((q, e));
+            }
+        }
+    }
+    best.map(|(_, e)| e.to_string())
+}
+
+/// What `check_converter_args` says about the `aes_*` converters: `bits` first, then the
+/// base64 arguments in the order HAProxy checks them.
+fn check_aes_args(name: &str, args: &[String]) -> Option<String> {
+    let gcm = name.starts_with("aes_gcm");
+    let (min, max) = if gcm { (4, 5) } else { (3, 4) };
+    let first = args.first().map_or("", |a| a.trim());
+    if first.is_empty() {
+        return Some(format!("invalid arg 1 in converter '{name}' : expected type 'integer' at position 1, but got nothing."));
+    }
+    let Ok(bits) = first.parse::<i64>() else {
+        return Some(format!("invalid arg 1 in converter '{name}' : failed to parse '{first}' as type 'integer' at position 1."));
+    };
+    if args.len() < min {
+        return Some(format!(
+            "invalid arg {} in converter '{name}' : missing arguments (got {}/{min}), type 'string' expected.",
+            args.len() + 1,
+            args.len()
+        ));
+    }
+    if args.len() > max {
+        return Some(format!("invalid arg {max} in converter '{name}' : expected ')' before ',{})'.", args[max..].join(",")));
+    }
+    if !matches!(bits, 128 | 192 | 256) {
+        return Some(format!("invalid args in converter '{name}' : key size must be 128, 192 or 256 (bits).."));
+    }
+    let b64_ok = |a: &str| hmac_key_is_var(a.trim()) || base64_decode(a.trim(), false, true).is_some();
+    let bad = |what: &str| {
+        format!(
+            "invalid args in converter '{name}' : failed to parse {what} : argument needs to be base64 encoded, and can either be a string or a variable."
+        )
+    };
+    if !b64_ok(&args[1]) {
+        return Some(bad("nonce"));
+    }
+    if !b64_ok(&args[2]) {
+        return Some(bad("key"));
+    }
+    let tag = args.get(3).map_or("", |t| t.trim());
+    if name == "aes_gcm_enc" {
+        // the tag is where the encryption leaves its result: a variable
+        if tag.is_empty() {
+            return Some(format!("invalid args in converter '{name}' : failed to parse aead_tag : Empty variable name cannot be accepted."));
+        }
+        if !hmac_key_is_var(tag) {
+            return Some(format!("invalid args in converter '{name}' : failed to parse aead_tag : (null)."));
+        }
+    } else if name == "aes_gcm_dec" && !b64_ok(tag) {
+        return Some(bad("aead_tag"));
+    }
+    let aad = if gcm { args.get(4) } else { args.get(3) };
+    if let Some(aad) = aad {
+        if !b64_ok(aad) {
+            return Some(bad("aad"));
+        }
+    }
+    None
+}
+
 fn hmac_key_is_var(key: &str) -> bool {
     ["txn.", "sess.", "req.", "res.", "proc."].iter().any(|p| key.starts_with(p))
 }
@@ -5427,6 +5699,7 @@ pub fn check_converter_args(name: &str, args: &[String]) -> Option<String> {
             )),
             _ => Some(format!("invalid args in converter 'set-var' : unknown condition \"{c}\".")),
         }),
+        "aes_cbc_enc" | "aes_cbc_dec" | "aes_gcm_enc" | "aes_gcm_dec" => check_aes_args(name, args),
         "url_enc" => match args {
             [] => None,
             [a] if a.is_empty() || a == "query" => None,
@@ -5462,6 +5735,30 @@ mod tests {
         let reg = Registry::new();
         assert!(reg.fetch_count() >= 50);
         assert!(reg.converter_count() >= 50);
+    }
+
+    /// `unset-var` removes a stream variable from the running stream's map, and only
+    /// from it; a `proc.` name is the process's (T156).
+    #[test]
+    fn unset_var_removes_a_stream_variable_from_the_running_stream() {
+        let reg = Registry::new();
+        let conv = reg.get_converter("unset-var").expect("unset-var is registered");
+        CURRENT_VARS.with(|v| v.borrow_mut().insert("txn.t156".to_string(), "v".to_string()));
+        set_proc_var("proc.t156", "p".to_string());
+        assert_eq!((conv.func)(Sample::Sint(1), &["txn.t156".to_string()]), Some(Sample::Sint(1)));
+        assert!(CURRENT_VARS.with(|v| !v.borrow().contains_key("txn.t156")));
+        assert_eq!(get_proc_var("proc.t156").as_deref(), Some("p"));
+        (conv.func)(Sample::Sint(1), &["proc.t156".to_string()]);
+        assert_eq!(get_proc_var("proc.t156"), None);
+        // Without a name (the load refuses it) the sample goes through untouched.
+        assert_eq!((conv.func)(Sample::Sint(2), &[]), Some(Sample::Sint(2)));
+    }
+
+    /// The names `set-timeout` takes; the parser refuses any other.
+    #[test]
+    fn timeout_kinds_by_name() {
+        assert_eq!(TimeoutKind::from_name("tarpit"), Some(TimeoutKind::Tarpit));
+        assert_eq!(TimeoutKind::from_name("http-request"), None);
     }
 
     #[test]

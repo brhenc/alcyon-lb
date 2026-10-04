@@ -701,6 +701,33 @@ pub fn check_sample_refs(config: &Config, registry: &Registry) -> Result<(), Str
             crate::rule_exprs::check_sample_expr(&r.expr, registry)
                 .map_err(|e| in_line(format!("failed to parse sample expression <{}> : {e}", r.expr)))?;
         }
+        // A fetch of the response where the stream has none would read the response of
+        // whatever stream ran last on the thread (T156): in a request rule, and for the
+        // headers in a log-format, rendered once they are gone. `HAProxy` refuses both.
+        // An ACL is only warned about there, and never matches.
+        if let Some(part) = (!r.acl).then(|| crate::rule_exprs::response_part(crate::rule_exprs::leading_fetch(&r.expr))).flatten() {
+            let fetch = crate::rule_exprs::leading_fetch(&r.expr);
+            let why = format!("sample fetch <{fetch}> may not be reliably used here because it needs '{part}' which is not available here.");
+            let headers = part == "HTTP response headers";
+            let refused = match r.directive.as_str() {
+                "http-request" => {
+                    let kind = match r.section {
+                        SectionKind::Frontend => "frontend",
+                        SectionKind::Backend => "backend",
+                        SectionKind::Listen => "proxy",
+                        SectionKind::Defaults => "defaults",
+                    };
+                    let what = r.proxy.as_deref().map_or_else(|| format!("{kind} section"), |n| format!("{kind} '{n}'"));
+                    Some(format!("error detected in {what} while parsing 'http-request {}' rule : {why}", r.action))
+                }
+                "log-format" | "error-log-format" if headers => Some(format!("failed to parse {} : {why}", r.directive)),
+                "unique-id-format" if headers => Some(format!("failed to parse unique-id : {why}")),
+                _ => None,
+            };
+            if let Some(e) = refused {
+                return Err(in_line(e));
+            }
+        }
         if let (SectionKind::Defaults, "unique-id-format" | "log-format") = (r.section, r.directive.as_str()) {
             // Resolved in each proxy that inherited it, as if written there.
             for (section, name) in format_users(config, &r.directive, &r.expr) {

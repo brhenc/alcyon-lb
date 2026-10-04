@@ -25,7 +25,7 @@ use ibex_config::LogLevel;
 use crate::txn::MsgState;
 use crate::proxy::{TcpSession, Timeouts};
 use crate::raw;
-use ibex_config::{regex, BalanceAlgorithm, Config, Mode, StickRule, UseBackendRule};
+use ibex_config::{BalanceAlgorithm, Config, Mode, StickRule, UseBackendRule};
 use ibex_proto::endpoint::ScState;
 use ibex_sample::{Expr, Registry, Sample, SampleContext};
 use ibex_sched::task::{state, Kind, TaskRef, WorkKind};
@@ -53,7 +53,7 @@ use std::time::{Duration, Instant};
 // yet" and renders `-`, where the old engine-local default reported a 200 that had
 // never been sent.
 use ibex_sample::registry::{
-    set_proc_var, CURRENT_RES_HEADERS, CURRENT_RES_STATUS, CURRENT_TIMEOUTS, CURRENT_VARS,
+    set_proc_var, TimeoutKind, CURRENT_RES_HEADERS, CURRENT_RES_STATUS, CURRENT_TIMEOUTS, CURRENT_VARS,
 };
 
 thread_local! {
@@ -584,6 +584,8 @@ pub struct Proxy {
     /// The per-transaction log line's format (`log-format`, `option httplog`/`tcplog`);
     /// frontends and listens only, as in `HAProxy`.
     pub log_format: Option<Arc<crate::logfmt::LogFormat>>,
+    /// `option dontlognull`: a connection that carried nothing logs nothing.
+    pub dont_log_null: bool,
     /// `unique-id-format`, compiled.
     pub unique_id_format: Option<Arc<crate::logfmt::LogFormat>>,
     /// `unique-id-header`: the request header the unique ID is sent to the server in.
@@ -799,7 +801,7 @@ pub struct SessionEntry {
     /// kept in the server's safe list (`http-reuse`).
     pub srv_served: u8,
     /// A finished transaction's log line, waiting to be sent to its frontend's targets.
-    pub log_line: Option<String>,
+    pub log_line: Option<Vec<u8>>,
 }
 
 /// Per-thread storage for active sessions.
@@ -1416,7 +1418,7 @@ fn session_log_data<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, pid: u3
 
 /// The stream's log line, when its frontend logs (`HAProxy` logs nothing without a
 /// `log` target).
-fn stream_log_line(entry: &SessionEntry, proxies: &[Proxy], pid: u32) -> Option<String> {
+fn stream_log_line(entry: &SessionEntry, proxies: &[Proxy], pid: u32) -> Option<Vec<u8>> {
     let fe = &proxies[entry.proxy_idx];
     let fmt = fe.log_format.as_ref()?;
     if fe.log_target_idx.is_empty() {
@@ -1425,9 +1427,39 @@ fn stream_log_line(entry: &SessionEntry, proxies: &[Proxy], pid: u32) -> Option<
     let be = proxies.get(entry.backend_idx).unwrap_or(fe);
     // `status` is the transaction's (`txn->status`, as `%ST`), not whatever response the
     // thread rewrote last (T152).
-    let line = fmt.render(&stream_log_data(entry, proxies, entry.proxy_idx, pid), sample_registry(), &SampleContext { at_log: true, res_status: entry.sess.txn.as_ref().map(|t| t.status).or(entry.sess.log.status).filter(|&s| s > 0), ..stream_sample_ctx(&entry.sess, fe, be, &ProxiesView(proxies), &StickView::new(proxies, &entry.sess.tracked_sc)) });
+    let line = fmt.render_bytes(&stream_log_data(entry, proxies, entry.proxy_idx, pid), sample_registry(), &SampleContext { at_log: true, res_status: entry.sess.txn.as_ref().map(|t| t.status).or(entry.sess.log.status).filter(|&s| s > 0), ..stream_sample_ctx(&entry.sess, fe, be, &ProxiesView(proxies), &StickView::new(proxies, &entry.sess.tracked_sc)) });
     fe.log_count.fetch_add(1, Ordering::Relaxed);
     Some(line)
+}
+
+/// Why a connection that was to open with a PROXY header did not get past it, if that is
+/// what happened: the parser's refusal, or the client closing, resetting or timing out
+/// before sending one.
+fn proxy_header_failure(s: &TcpSession) -> Option<crate::proxy::ProxyHdrError> {
+    use crate::proxy::{Ending, ProxyHdrError};
+    if s.proxy_hdr_err.is_some() {
+        return s.proxy_hdr_err;
+    }
+    if !s.accept_proxy || s.proxy_handshake_done {
+        return None;
+    }
+    // The header's reads end in `proxy_hdr_err` themselves; what is left is the timer.
+    matches!(s.ending?, Ending::Timeout(crate::proxy::Which::Client)).then_some(ProxyHdrError::Timeout)
+}
+
+/// `HAProxy`'s own line for a bad PROXY header (`session_kill_embryonic`): only for a
+/// frontend that logs, not in its log-format, and not for the empty cases under `option
+/// dontlognull`.
+fn proxy_header_error_line(entry: &SessionEntry, proxies: &[Proxy]) -> Option<String> {
+    let why = proxy_header_failure(&entry.sess)?;
+    let fe = &proxies[entry.proxy_idx];
+    if fe.log_format.is_none() || fe.log_target_idx.is_empty() || (fe.dont_log_null && why.is_null()) {
+        return None;
+    }
+    let s = &entry.sess;
+    let listener = s.so_name.as_deref().map_or_else(|| s.so_id.unwrap_or(0).to_string(), str::to_string);
+    fe.log_count.fetch_add(1, Ordering::Relaxed);
+    Some(crate::logfmt::connection_error_line(s.client_addr, s.log.date, &fe.name, &listener, why.message()))
 }
 
 fn syslog_tag(tag: &str) -> Arc<str> {
@@ -1836,6 +1868,7 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, list
         error_replies: listen.error_replies.clone(),
         log_tag: listen.log_tag.as_deref().map(syslog_tag),
         log_format: compile_log_format(listen.log_format.as_ref(), listen.mode == Mode::Http),
+        dont_log_null: listen.dontlognull,
         unique_id_format: listen.unique_id_format.as_deref().and_then(compile_unique_id_format),
         unique_id_header: listen.unique_id_header.clone(),
         req_capture_slots,
@@ -1955,6 +1988,7 @@ fn init_proxy_from_frontend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, fe
         error_replies: fe.error_replies.clone(),
         log_tag: fe.log_tag.as_deref().map(syslog_tag),
         log_format: compile_log_format(fe.log_format.as_ref(), fe.mode == Mode::Http),
+        dont_log_null: fe.dontlognull,
         unique_id_format: fe.unique_id_format.as_deref().and_then(compile_unique_id_format),
         unique_id_header: fe.unique_id_header.clone(),
         req_capture_slots,
@@ -2099,6 +2133,7 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, be:
         error_replies: be.error_replies.clone(),
         log_tag: be.log_tag.as_deref().map(syslog_tag),
         log_format: None,
+        dont_log_null: false,
         unique_id_format: be.unique_id_format.as_deref().and_then(compile_unique_id_format),
         unique_id_header: be.unique_id_header.clone(),
         req_capture_slots: Arc::from([]),
@@ -2315,6 +2350,7 @@ impl Engine {
         p.disabled_backends = Arc::clone(&disabled);
     }
     crate::track::attach(&mut proxies, config);
+    crate::logfwd::start(config)?;
     let _ = resolve_log_targets(config, &mut proxies);
     Ok(proxies)
 }
@@ -2342,7 +2378,13 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     users: l
                         .users
                         .iter()
-                        .map(|u| ibex_sample::AuthUser { name: u.name.clone(), password: u.password.clone(), groups: u.groups.clone() })
+                        .map(|u| ibex_sample::AuthUser {
+                            name: u.name.clone(),
+                            password: u.password.clone(),
+                            // The parser checked the hash; this is the verifier `http_auth` runs.
+                            crypt: u.password.as_deref().filter(|_| u.password_is_hash).and_then(|h| ibex_sample::CryptHash::parse(h).ok()),
+                            groups: u.groups.clone(),
+                        })
                         .collect(),
                 })
                 .collect(),
@@ -2440,6 +2482,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             proxy_idx += 1;
         }
 
+        crate::logfwd::start(config)?;
         let log_targets = resolve_log_targets(config, &mut proxies);
 
         let start_time = Instant::now();
@@ -4202,6 +4245,38 @@ fn stream_vars_leave(sess: Option<&mut TcpSession>) {
     });
 }
 
+/// The timeouts the `*_timeout` fetches report for a stream of frontend `fe` on backend
+/// `be` (the frontend until one is chosen), with what its `set-timeout` rules set (T156).
+///
+/// `cur_*` is the backend's timeout, the client's the frontend's, unless a rule set it,
+/// as `smp_fetch_cur_*_timeout` (src/stream.c) read the stream's own timers.
+fn stream_timeouts(fe: &Proxy, be: &Proxy, set: Option<&crate::proxy::TimeoutsSet>) -> ibex_sample::StreamTimeouts {
+    let ms = |p: &Proxy| {
+        let t = &p.stats_config.raw_timeouts;
+        [t.client, t.server, t.connect, t.queue, t.tunnel, t.tarpit].map(|v| v.map_or(0, millis_to_u32))
+    };
+    let fe_ms = ms(fe);
+    let mut be_ms = ms(be);
+    be_ms[TimeoutKind::Client as usize] = fe_ms[TimeoutKind::Client as usize];
+    let mut cur = be_ms;
+    if let Some(set) = set {
+        for (c, s) in cur.iter_mut().zip(set.ms) {
+            if s != 0 {
+                *c = s;
+            }
+        }
+    }
+    ibex_sample::StreamTimeouts { fe: fe_ms, be: be_ms, cur }
+}
+
+/// Puts the timeouts of the stream that runs now where its fetches read them
+/// ([`stream_timeouts`]). Like the variables ([`with_stream_vars`]) they are the thread's
+/// for one run of one stream only: `None` outside a run.
+fn stream_timeouts_enter(proxies: &[Proxy], fe_idx: usize, be_idx: usize, sess: &TcpSession) {
+    let pair = proxies.get(fe_idx).zip(proxies.get(be_idx));
+    CURRENT_TIMEOUTS.set(pair.map(|(fe, be)| stream_timeouts(fe, be, sess.timeouts_set.as_deref())));
+}
+
 /// Readies a TCP-mode stream for `proxy`'s `tcp-response content` rules, if it has any
 /// (`AN_RES_INSPECT`, set with the backend); they start when the server connects.
 fn arm_res_inspect(proxy: &Proxy, sess: &mut TcpSession) {
@@ -4531,7 +4606,10 @@ fn init_client_session(
     }
 
     let registry = sample_registry();
-    match with_stream_vars(&mut sess, |sess| eval_tcp_req_session_rules(&proxies[proxy_idx], proxies, registry, sess)) {
+    stream_timeouts_enter(proxies, proxy_idx, proxy_idx, &sess);
+    let session_rules = with_stream_vars(&mut sess, |sess| eval_tcp_req_session_rules(&proxies[proxy_idx], proxies, registry, sess));
+    CURRENT_TIMEOUTS.set(None);
+    match session_rules {
         SessionEvalOutcome::Accept => {}
         SessionEvalOutcome::Reject => {
             raw::abort_with_rst(sess.cli.as_fd());
@@ -5785,9 +5863,11 @@ impl EngineDispatcher<'_> {
     fn step_stream(&mut self, session_idx: u32) -> Outcome {
         if let Some(entry) = self.sessions.get_mut(session_idx) {
             stream_vars_enter(&mut entry.sess);
+            stream_timeouts_enter(self.proxies, entry.proxy_idx, entry.backend_idx, &entry.sess);
         }
         let out = self.step_stream_run(session_idx);
         stream_vars_leave(self.sessions.get_mut(session_idx).map(|e| &mut e.sess));
+        CURRENT_TIMEOUTS.set(None);
         out
     }
 
@@ -5951,7 +6031,7 @@ impl EngineDispatcher<'_> {
                 );
             }
 
-            let log_line = entry.log_line.take();
+            let log_line = entry.log_line.take().filter(|_| proxy_header_failure(&entry.sess).is_none());
 
             // Step 3.6: If in TCP mode and server not yet connected (e.g. deferred on accept-proxy or inspect), connect once ready
             if entry.sess.mode == Mode::Tcp
@@ -6011,6 +6091,11 @@ impl EngineDispatcher<'_> {
             // A TCP connection's line, and an HTTP transaction's that ended with the
             // connection rather than through `end_txn` (aborted, timed out).
             let line = self.sessions.get_mut(session_idx).and_then(|e| {
+                // A refused PROXY header has its own line, never the frontend's format.
+                if proxy_header_failure(&e.sess).is_some() {
+                    e.log_line = None;
+                    return proxy_header_error_line(e, self.proxies).map(|l| (e.proxy_idx, l.into_bytes()));
+                }
                 e.log_line
                     .take()
                     .or_else(|| (e.sess.mode == Mode::Tcp || e.sess.txn.is_some()).then(|| stream_log_line(e, self.proxies, self.pid)).flatten())
@@ -6617,6 +6702,7 @@ impl EngineDispatcher<'_> {
         checks: &mut [ServerCheckState],
         pid: u32,
         now: Tick,
+        serving: usize,
     ) -> Option<crate::stats_html::AdminAction> {
         let req_uri = entry.sess.req_uri.as_deref().unwrap_or("/");
 
@@ -6774,7 +6860,7 @@ impl EngineDispatcher<'_> {
                 return Some(cmd);
             }
 
-            let html = crate::stats_html::render_stats_html(proxies, checks, pid);
+            let html = crate::stats_html::render_stats_html_for(proxies, checks, pid, &proxies[serving].stats_config);
             let resp = format!(
                 "HTTP/1.1 200 OK\r\n\
                  Content-Type: text/html; charset=utf-8\r\n\
@@ -6791,7 +6877,7 @@ impl EngineDispatcher<'_> {
         }
 
         // 4. Default: Render full HTML dashboard
-        let html = crate::stats_html::render_stats_html(proxies, checks, pid);
+        let html = crate::stats_html::render_stats_html_for(proxies, checks, pid, &proxies[serving].stats_config);
         let resp = format!(
             "HTTP/1.1 200 OK\r\n\
              Content-Type: text/html; charset=utf-8\r\n\
@@ -6842,36 +6928,8 @@ impl EngineDispatcher<'_> {
         if resume.is_none() {
             begin_http_stream(entry, proxies, proxy_idx, pid);
         }
-        CURRENT_TIMEOUTS.with(|t| {
-            let mut map = t.borrow_mut();
-            map.clear();
-            let fe_client = proxies[proxy_idx].stats_config.raw_timeouts.client.map_or(0, millis_to_u32);
-            let fe_connect = proxies[proxy_idx].stats_config.raw_timeouts.connect.map_or(0, millis_to_u32);
-            let fe_server = proxies[proxy_idx].stats_config.raw_timeouts.server.map_or(0, millis_to_u32);
-            let fe_queue = proxies[proxy_idx].stats_config.raw_timeouts.queue.map_or(0, millis_to_u32);
-            let fe_tunnel = proxies[proxy_idx].stats_config.raw_timeouts.tunnel.map_or(0, millis_to_u32);
-            let fe_tarpit = proxies[proxy_idx].stats_config.raw_timeouts.tarpit.map_or(0, millis_to_u32);
-
-            map.insert("fe_client_timeout", fe_client);
-            map.insert("cur_client_timeout", fe_client);
-            map.insert("fe_connect_timeout", fe_connect);
-            map.insert("cur_connect_timeout", fe_connect);
-            map.insert("fe_server_timeout", fe_server);
-            map.insert("cur_server_timeout", fe_server);
-            map.insert("fe_queue_timeout", fe_queue);
-            map.insert("cur_queue_timeout", fe_queue);
-            map.insert("fe_tunnel_timeout", fe_tunnel);
-            map.insert("cur_tunnel_timeout", fe_tunnel);
-            map.insert("fe_tarpit_timeout", fe_tarpit);
-            map.insert("cur_tarpit_timeout", fe_tarpit);
-
-            map.insert("be_client_timeout", fe_client);
-            map.insert("be_server_timeout", fe_server);
-            map.insert("be_connect_timeout", fe_connect);
-            map.insert("be_queue_timeout", fe_queue);
-            map.insert("be_tunnel_timeout", fe_tunnel);
-            map.insert("be_tarpit_timeout", fe_tarpit);
-        });
+        // Until a backend is chosen the frontend's timeouts are the backend's too.
+        stream_timeouts_enter(proxies, proxy_idx, entry.backend_idx, &entry.sess);
         STRICT_MODE.set(true);
 
         // `monitor-uri`: answer the probe here, before any rule or backend sees it. The
@@ -6909,7 +6967,7 @@ impl EngineDispatcher<'_> {
                     && proxies[proxy_idx].default_backend.is_none()
                     && proxies[proxy_idx].use_backends.is_empty())
             {
-                return Self::handle_stats_request(entry, proxies, checks, pid, now);
+                return Self::handle_stats_request(entry, proxies, checks, pid, now, proxy_idx);
             }
         }
 
@@ -7113,10 +7171,7 @@ impl EngineDispatcher<'_> {
                             || {
                                 let t = &proxies[proxy_idx].stats_config.raw_timeouts;
                                 // `http-request set-timeout tarpit` of this stream wins.
-                                let set = CURRENT_TIMEOUTS.with(|m| {
-                                    let m = m.borrow();
-                                    (m.get("cur_tarpit_timeout_set").copied() == Some(1)).then(|| m.get("cur_tarpit_timeout").copied()).flatten()
-                                });
+                                let set = sess.timeouts_set.as_ref().map(|s| s.ms[TimeoutKind::Tarpit as usize]).filter(|&ms| ms != 0);
                                 let ms = set.unwrap_or_else(|| t.tarpit.or(t.connect).map_or(0, millis_to_u32));
                                 now.add(ms)
                             },
@@ -7191,7 +7246,7 @@ impl EngineDispatcher<'_> {
                             let current_uri = sess.req_uri.as_deref().unwrap_or("/");
                             let (pfx, path, query) = split_uri(current_uri);
                             let rust_repl = translate_backreferences(repl);
-                            if let Ok(re) = regex::Regex::new(regex) {
+                            if let Ok(re) = ibex_regex::UserRegex::new(regex) {
                                 let new_path = re.replace_all(path, &rust_repl).to_string();
                                 let rebuilt = rebuild_uri(pfx, &new_path, query);
                                 Some((new_path, rebuilt))
@@ -7226,7 +7281,7 @@ impl EngineDispatcher<'_> {
                             let (pfx, path, query) = split_uri(current_uri);
                             let pathq = if query.is_empty() { path.to_string() } else { format!("{path}?{query}") };
                             let rust_repl = translate_backreferences(repl);
-                            if let Ok(re) = regex::Regex::new(regex) {
+                            if let Ok(re) = ibex_regex::UserRegex::new(regex) {
                                 let new_pathq = re.replace_all(&pathq, &rust_repl).to_string();
                                 let rebuilt = format!("{pfx}{new_pathq}");
                                 Some(rebuilt)
@@ -7247,7 +7302,7 @@ impl EngineDispatcher<'_> {
                         let rebuilt = {
                             let current_uri = sess.req_uri.as_deref().unwrap_or("/");
                             let rust_repl = translate_backreferences(repl);
-                            regex::Regex::new(regex)
+                            ibex_regex::UserRegex::new(regex)
                                 .ok()
                                 .filter(|re| re.is_match(current_uri))
                                 .map(|re| re.replace(current_uri, &rust_repl).to_string())
@@ -7401,36 +7456,24 @@ impl EngineDispatcher<'_> {
                         } else {
                             parse_timeout_val(timeout_val)
                         };
-                        CURRENT_TIMEOUTS.with(|t| {
-                            let mut map = t.borrow_mut();
-                            match timeout_type.as_str() {
-                                "client" => {
-                                    map.insert("cur_client_timeout", ms);
-                                    map.insert("cur_client_timeout_set", 1);
-                                }
-                                "server" => {
-                                    map.insert("cur_server_timeout", ms);
-                                    map.insert("cur_server_timeout_set", 1);
-                                }
-                                "connect" => {
-                                    map.insert("cur_connect_timeout", ms);
-                                    map.insert("cur_connect_timeout_set", 1);
-                                }
-                                "queue" => {
-                                    map.insert("cur_queue_timeout", ms);
-                                    map.insert("cur_queue_timeout_set", 1);
-                                }
-                                "tunnel" => {
-                                    map.insert("cur_tunnel_timeout", ms);
-                                    map.insert("cur_tunnel_timeout_set", 1);
-                                }
-                                "tarpit" => {
-                                    map.insert("cur_tarpit_timeout", ms);
-                                    map.insert("cur_tarpit_timeout_set", 1);
-                                }
-                                _ => {}
+                        // `stream_set_timeout` (src/stream.c): the stream runs on it from here,
+                        // and `cur_*_timeout` reports it. 0 leaves the timeout as it was.
+                        if let Some(kind) = TimeoutKind::from_name(timeout_type).filter(|_| ms != 0) {
+                            let before = sess.timeouts;
+                            sess.timeouts_set.get_or_insert_with(|| Box::new(crate::proxy::TimeoutsSet { ms: [0; 6], before })).ms[kind as usize] = ms;
+                            match kind {
+                                TimeoutKind::Client => sess.timeouts.client = ms,
+                                TimeoutKind::Server => sess.timeouts.server = ms,
+                                TimeoutKind::Connect => sess.timeouts.connect = ms,
+                                // Ibex has no server queue nor tunnel timer: these change only
+                                // what the fetches report. The tarpit reads `timeouts_set`.
+                                TimeoutKind::Queue | TimeoutKind::Tunnel | TimeoutKind::Tarpit => {}
                             }
-                        });
+                            if let Some(mut t) = CURRENT_TIMEOUTS.get() {
+                                t.cur[kind as usize] = ms;
+                                CURRENT_TIMEOUTS.set(Some(t));
+                            }
+                        }
                     }
                     ibex_config::HttpReqAction::NormalizeUri { normalizer, full, strict } => {
                         let current_uri = sess.req_uri.as_deref().unwrap_or("/");
@@ -7565,12 +7608,21 @@ impl EngineDispatcher<'_> {
         if be_idx != proxy_idx && !resume_be {
             entry.sess.set_retries(proxies[be_idx].retries);
         }
-        // The server side runs on the backend's timeouts, as in HAProxy.
-        if be_idx != proxy_idx {
+        // The server side runs on the backend's timeouts, as in HAProxy: `stream_set_backend`
+        // drops what a frontend-side `set-timeout` set for it (the client's and the
+        // tarpit's stay). Not again on a stream resumed in the backend, whose own rules may
+        // have set them since.
+        if be_idx != proxy_idx && !resume_be {
             let t = proxies[be_idx].timeouts;
             entry.sess.timeouts.server = t.server;
             entry.sess.timeouts.connect = t.connect;
+            if let Some(set) = entry.sess.timeouts_set.as_mut() {
+                for k in [TimeoutKind::Server, TimeoutKind::Connect, TimeoutKind::Queue, TimeoutKind::Tunnel] {
+                    set.ms[k as usize] = 0;
+                }
+            }
         }
+        stream_timeouts_enter(proxies, proxy_idx, be_idx, &entry.sess);
 
         // Evaluate backend tcp-request content rules
         let inspect_wait = resume.filter(|w| w.inspect);
@@ -7620,29 +7672,6 @@ impl EngineDispatcher<'_> {
                 ContentEvalResult::Done | ContentEvalResult::Waiting => {}
             }
         }
-
-        // Update backend timeouts
-        CURRENT_TIMEOUTS.with(|t| {
-            let mut map = t.borrow_mut();
-            let be_server = proxies[be_idx].stats_config.raw_timeouts.server.map_or(0, millis_to_u32);
-            let be_connect = proxies[be_idx].stats_config.raw_timeouts.connect.map_or(0, millis_to_u32);
-            let be_queue = proxies[be_idx].stats_config.raw_timeouts.queue.map_or(0, millis_to_u32);
-            let be_tunnel = proxies[be_idx].stats_config.raw_timeouts.tunnel.map_or(0, millis_to_u32);
-            let be_tarpit = proxies[be_idx].stats_config.raw_timeouts.tarpit.map_or(0, millis_to_u32);
-
-            map.insert("be_server_timeout", be_server);
-            map.insert("be_connect_timeout", be_connect);
-            map.insert("be_queue_timeout", be_queue);
-            map.insert("be_tunnel_timeout", be_tunnel);
-            map.insert("be_tarpit_timeout", be_tarpit);
-
-            if be_idx != proxy_idx {
-                map.insert("cur_server_timeout", be_server);
-                map.insert("cur_connect_timeout", be_connect);
-                map.insert("cur_queue_timeout", be_queue);
-                map.insert("cur_tunnel_timeout", be_tunnel);
-            }
-        });
 
         // If be_idx != proxy_idx, execute backend rules
         if be_idx != proxy_idx && !proxies[be_idx].http_req_rules.is_empty() {
@@ -7696,7 +7725,7 @@ impl EngineDispatcher<'_> {
                 let in_except = xot_excepts.iter().any(|e| !e.is_empty() && ip_in_cidr(ip, e));
                 if !in_except {
                     let ip_str = ip.to_string();
-                    set_req_header(&mut entry.sess, "X-Original-To", &ip_str);
+                    add_req_header(&mut entry.sess, "X-Original-To", &ip_str);
                 }
             }
         }
@@ -7904,6 +7933,7 @@ impl EngineDispatcher<'_> {
         // already counted for the backend.
         let resumed = entry.sess.be_inspect;
         entry.backend_idx = be_idx;
+        stream_timeouts_enter(proxies, entry.proxy_idx, be_idx, &entry.sess);
         if !resumed {
             // `stream_set_backend` counts the stream for the backend (`proxy_inc_be_ctr`).
             proxies[be_idx].stats[worker_id()].be_sess_rate.tick();
@@ -8077,7 +8107,7 @@ impl EngineDispatcher<'_> {
             });
 
             if let Some(msg) = log {
-                self.send_log(proxy_idx, LogLevel::Notice, &msg);
+                self.send_log(proxy_idx, LogLevel::Notice, msg.as_bytes());
             }
 
             self.timer_updates.push(pending);
@@ -8092,11 +8122,11 @@ impl EngineDispatcher<'_> {
     /// Silent when the proxy has no targets, which is the common case: `HAProxy` logs
     /// nothing unless a `log` directive says where to.
     /// A transaction's or connection's log line, at `info` as `HAProxy` sends them.
-    fn send_log_line(&self, proxy_idx: usize, line: &str) {
+    fn send_log_line(&self, proxy_idx: usize, line: &[u8]) {
         self.send_log(proxy_idx, LogLevel::Info, line);
     }
 
-    fn send_log(&self, proxy_idx: usize, level: LogLevel, msg: &str) {
+    fn send_log(&self, proxy_idx: usize, level: LogLevel, msg: &[u8]) {
         let Some(proxy) = self.proxies.get(proxy_idx) else {
             return;
         };
@@ -8444,7 +8474,7 @@ fn header_name_matches(header_key: &str, pattern: &str) -> bool {
                 "beg" => header_key.to_lowercase().starts_with(&pat.to_lowercase()),
                 "end" => header_key.to_lowercase().ends_with(&pat.to_lowercase()),
                 "sub" => header_key.to_lowercase().contains(&pat.to_lowercase()),
-                "reg" => regex::Regex::new(pat).is_ok_and(|re| re.is_match(header_key)),
+                "reg" => ibex_regex::UserRegex::new(pat).is_ok_and(|re| re.is_match(header_key)),
                 _ => header_key.eq_ignore_ascii_case(pat),
             }
         } else {
@@ -8820,8 +8850,16 @@ fn wait_for_request_body(
 }
 
 fn del_req_header(sess: &mut TcpSession, name: &str) {
+    // `-m beg|end|sub|reg` names a set of headers: remove each that matches.
+    let names: Vec<String> = if name.starts_with('\0') {
+        sess.htx_slice().map_or_else(Vec::new, |h| h.headers().map(|(k, _)| k.to_string()).filter(|k| header_name_matches(k, name)).collect())
+    } else {
+        vec![name.to_string()]
+    };
     sess.with_htx_mut(|htx| {
-        let _ = htx.remove_header(name);
+        for n in &names {
+            let _ = htx.remove_header(n);
+        }
     });
     let mut hdrs = sess.req_headers.take().unwrap_or_default();
     hdrs.retain(|(k, _)| !header_name_matches(k, name));
@@ -8890,7 +8928,7 @@ fn replace_req_value(sess: &mut TcpSession, name: &str, regex: &str, repl: &str)
 /// `repl` is cut short and the request is in strict mode: header by header, the ones
 /// before it stay rewritten.
 fn rewrite_req_header_values(sess: &mut TcpSession, name: &str, regex: &str, repl: &str, per_value: bool) -> Result<(), ()> {
-    let re = regex::Regex::new(regex).map_err(|_| ())?;
+    let re = ibex_regex::UserRegex::new(regex).map_err(|_| ())?;
     let headers: Vec<(String, String)> = sess.htx_slice().map_or_else(Vec::new, |h| {
         h.headers().filter(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(k, v)| (k.to_string(), v.to_string())).collect()
     });
@@ -8922,7 +8960,7 @@ fn rewrite_req_header_values(sess: &mut TcpSession, name: &str, regex: &str, rep
         // edit is not rewritten again. A value is replaced whole and literally: `$` is the
         // only special character in a `regex` replacement.
         for (i, (old, _)) in edits.iter().enumerate() {
-            let _ = htx.replace_header(name, &format!("^{}$", regex::escape(old)), &format!("@@ibex-rewrite-{i}@@"));
+            let _ = htx.replace_header(name, &format!("^{}$", ibex_regex::UserRegex::escape(old)), &format!("@@ibex-rewrite-{i}@@"));
         }
         for (i, (_, new)) in edits.iter().enumerate() {
             let _ = htx.replace_header(name, &format!("^@@ibex-rewrite-{i}@@$"), &new.replace('$', "$$"));
@@ -9182,7 +9220,7 @@ fn res_htx_resize(free: usize, take: usize) -> bool {
 /// match (nothing for a group that did not take part), `\xHH` by that byte -- computed as
 /// `HAProxy` computes it, which takes any two characters -- and a backslash before
 /// anything else dropped. `None`, a failed rewrite, for a backslash or `\x` cut short.
-fn exp_replace(repl: &str, caps: &regex::Captures<'_>) -> Option<String> {
+fn exp_replace(repl: &str, caps: &ibex_regex::Captures<'_>) -> Option<String> {
     let nibble = |c: u8| {
         let n = c.to_ascii_uppercase().wrapping_sub(b'0');
         if n > 9 { n.wrapping_sub(b'A' - b'9' - 1) } else { n }
@@ -9199,7 +9237,7 @@ fn exp_replace(repl: &str, caps: &regex::Captures<'_>) -> Option<String> {
         s = rest;
         if e.is_ascii_digit() {
             if let Some(m) = caps.get(usize::from(e - b'0')) {
-                out.extend_from_slice(m.as_str().as_bytes());
+                out.extend_from_slice(m.as_bytes());
             }
         } else if e == b'x' {
             let (&[h1, h2], rest) = s.split_first_chunk::<2>()?;
@@ -9234,7 +9272,7 @@ fn hdr_value_end(v: &str) -> usize {
 /// matches is replaced, with the blanks around it, by [`exp_replace`]'s output; the
 /// commas and the values it does not match stay as they were (`http_replace_hdrs` with
 /// `full` unset, `http_replace_header_value`). `None` when [`exp_replace`] fails.
-fn replace_each_value(v: &str, re: &regex::Regex, repl: &str) -> Option<String> {
+fn replace_each_value(v: &str, re: &ibex_regex::UserRegex, repl: &str) -> Option<String> {
     let mut out = String::with_capacity(v.len());
     let mut rest = v;
     loop {
@@ -9353,7 +9391,7 @@ fn res_action(
         // `http_replace_hdrs`: header by header, the first that does not fit failing the
         // action with the ones before it rewritten.
         let Some((re_str, repl)) = act_fmt.split_once('\t') else { return Ok(true) };
-        let Ok(re) = regex::Regex::new(re_str) else { return Ok(true) };
+        let Ok(re) = ibex_regex::UserRegex::new(re_str) else { return Ok(true) };
         let mut result = Ok(true);
         for (k, v) in hdrs.iter_mut().filter(|(k, _)| k.eq_ignore_ascii_case(hdr_name)) {
             let new_v = if full {

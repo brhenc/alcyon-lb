@@ -26,7 +26,7 @@ pub use ast::{
     ErrorPageSource, Forwarded, ForwardedValue, FrontendSection, GlobalSection, GlobalSetVar, StatsSocket,
     HashPreserveAffinity, HashType,
     HeaderExp, HttpAfterResAction, HttpAfterResRule, HttpReqAction, HttpReqRule, HttpResAction, RedirectCookie,
-    HeaderCapture, HttpResRule, HttpReuse, ListenSection, LogConfig, LogFormatSpec, LogFacility, LogLevel, LogSample, LogTarget, Mode, RetriesValue,
+    HeaderCapture, HttpResRule, HttpReuse, ListenSection, LogConfig, LogFormatSpec, LogFacility, LogLevel, LogSample, LogTarget, LogForwardBind, LogForwardHost, LogForwardSection, Mode, RingFormat, RingSection, RingServer, RingServerAddr, RetriesValue,
     SampleRef, SectionKind, Server, ServerSsl, SslVerify, StatsConfig, StatusCodeSet, TlsVersion,
     StickRule, StickRuleType, StickTableConfigAst, TcpReqConnAction, TcpReqConnRule,
     TcpReqContentAction, TcpReqContentRule, TcpResAction, TcpResContentRule, TcpReqSessionAction, TcpReqSessionRule,
@@ -35,7 +35,6 @@ pub use ast::{
 pub use error::ConfigError;
 pub use parser::parse_str;
 pub use parser::parse_str as parse_config;
-pub use regex;
 
 
 /// Parses an `HAProxy` 1.0 configuration file from disk.

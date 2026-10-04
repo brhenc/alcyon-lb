@@ -5,7 +5,7 @@
 //! Client and server regex header rewrite engine (`cliexp` and `srvexp`).
 
 use crate::htx::{Htx, HtxBlock};
-use regex::Regex;
+use ibex_regex::UserRegex as Regex;
 
 /// A compiled regex rewrite rule.
 #[derive(Debug, Clone)]
@@ -19,7 +19,7 @@ impl CompiledExp {
     ///
     /// # Errors
     /// Returns a regex compilation error if `pattern` is invalid.
-    pub fn new(pattern: &str, replacement: impl Into<String>) -> Result<Self, regex::Error> {
+    pub fn new(pattern: &str, replacement: impl Into<String>) -> Result<Self, ibex_regex::Error> {
         let regex = Regex::new(pattern)?;
         let rep_str = replacement.into();
         let converted_rep = convert_haproxy_replacement(&rep_str);

@@ -6,7 +6,7 @@
 
 use crate::cast::cast;
 use crate::sample::{Sample, SampleType};
-use regex::Regex;
+use ibex_regex::UserRegex as Regex;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// Supported matcher methods.
