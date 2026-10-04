@@ -25,6 +25,7 @@ pub(crate) fn parse_defaults_directive(
         }
         "redisp" => {
             defaults.redisp = true;
+            defaults.redisp_after = -1;
             Ok(())
         }
         "maxconn" => {
@@ -198,7 +199,7 @@ pub(crate) fn parse_option_defaults(
     match tokens[1].text.as_str() {
         "forwardfor" => defaults.forwardfor = Some(parse_forward_option(tokens, kw)?),
         "originalto" => defaults.originalto = Some(parse_forward_option(tokens, kw)?),
-        "redispatch" => defaults.redisp = true,
+        "redispatch" => set_redispatch(&mut defaults.redisp, &mut defaults.redisp_after, tokens),
         "accept-unsafe-violations-in-http-request" => defaults.stats.accept_unsafe_request = true,
         "log-health-checks" => defaults.log_health_checks = true,
         "httpchk" => parse_httpchk_option(&mut defaults.httpchk, tokens, kw)?,
@@ -216,7 +217,7 @@ pub(crate) fn parse_no_defaults(defaults: &mut DefaultsSection, tokens: &[Token]
         return parse_no_directive(tokens, kw);
     }
     match check_no_option(OptSection::Defaults, tokens, kw)? {
-        Some("redispatch") => defaults.redisp = false,
+        Some("redispatch") => (defaults.redisp, defaults.redisp_after) = (false, -1),
         Some("accept-unsafe-violations-in-http-request") => defaults.stats.accept_unsafe_request = false,
         Some("log-health-checks") => defaults.log_health_checks = false,
         _ => {}

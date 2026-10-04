@@ -757,6 +757,36 @@ pub(crate) fn parse_timeout_directive(
     Ok(())
 }
 
+/// `option redispatch [<interval>]` (`cfgparse-listen.c`): the interval is read with
+/// `atol`, so a non-numeric one is 0, and 0 clears the option. Without one the default is
+/// -1, a redispatch on the last retry.
+pub(crate) fn set_redispatch(on: &mut bool, after: &mut i32, tokens: &[Token]) {
+    *after = -1;
+    *on = true;
+    if let Some(arg) = tokens.get(2) {
+        *after = atol(&arg.text);
+        if *after == 0 {
+            *on = false;
+        }
+    }
+}
+
+/// C `atol`: leading blanks, an optional sign, then digits; anything after is ignored and
+/// no digit is 0. Out-of-range values saturate.
+fn atol(s: &str) -> i32 {
+    let t = s.trim_start();
+    let (neg, digits) = match t.as_bytes().first() {
+        Some(b'-') => (true, &t[1..]),
+        Some(b'+') => (false, &t[1..]),
+        _ => (false, t),
+    };
+    let mut n: i64 = 0;
+    for b in digits.bytes().take_while(u8::is_ascii_digit) {
+        n = (n * 10 + i64::from(b - b'0')).min(i64::from(i32::MAX));
+    }
+    i32::try_from(if neg { -n } else { n }).unwrap_or(0)
+}
+
 pub(crate) fn parse_retries(retries: &mut u32, tokens: &[Token], kw: &Token) -> Result<(), ConfigError> {
     if tokens.len() < 2 || tokens[1].text.is_empty() {
         return Err(ConfigError::new(

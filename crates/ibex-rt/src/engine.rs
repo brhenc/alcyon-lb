@@ -139,6 +139,11 @@ pub struct Proxy {
     pub timeouts: Timeouts,
     pub retries: u16,
     pub redisp: bool,
+    /// `option redispatch <interval>` (`redispatch_after`), see [`crate::lb::redispatch_due`].
+    pub redisp_after: i32,
+    /// A server the next selection steers away from (the one a retry just left); set only
+    /// around that selection.
+    pub avoid_idx: Option<usize>,
     pub maxconn: u32,
     pub dispatch: Option<SocketAddr>,
     /// The `cookie` line (`ck_opts`, `cookie_*`): persistence by a cookie. Only a backend
@@ -238,7 +243,7 @@ impl Proxy {
     #[must_use]
     pub fn eligible_server_indices(&self) -> Vec<usize> {
         let is_server_available = |idx: usize| -> bool {
-            if idx >= self.servers.len() {
+            if idx >= self.servers.len() || self.avoid_idx == Some(idx) {
                 return false;
             }
             if let Some(status) = self.server_statuses.get(idx) {
@@ -1141,6 +1146,8 @@ fn init_proxy_from_listen(proxy_idx: usize, listen: &ibex_config::ListenSection,
         timeouts,
         retries,
         redisp: listen.redisp,
+        redisp_after: listen.redisp_after,
+        avoid_idx: None,
         maxconn: listen.maxconn,
         dispatch: listen.dispatch,
         cookie: listen.cookie.clone(),
@@ -1239,6 +1246,8 @@ fn init_proxy_from_frontend(proxy_idx: usize, fe: &ibex_config::FrontendSection,
         timeouts,
         retries: 3,
         redisp: false,
+        redisp_after: -1,
+        avoid_idx: None,
         maxconn: fe.maxconn,
         dispatch: None,
         cookie: None,
@@ -1355,6 +1364,8 @@ fn init_proxy_from_backend(proxy_idx: usize, be: &ibex_config::BackendSection, n
         timeouts,
         retries,
         redisp: be.redisp,
+        redisp_after: be.redisp_after,
+        avoid_idx: None,
         maxconn: 2000,
         dispatch: be.dispatch,
         cookie: be.cookie.clone(),
@@ -3862,7 +3873,8 @@ fn retry_server_connect(
         fdtab.remove(sfd);
     }
 
-    if let Some(old_idx) = entry.target_server_idx.take() {
+    let old_idx = entry.target_server_idx.take();
+    if let Some(old_idx) = old_idx {
         let old_be = entry.srv_backend_idx;
         if old_be < proxies.len() && old_idx < proxies[old_be].server_actconn.len() {
             proxies[old_be].server_actconn[old_idx].fetch_sub(1, Ordering::Relaxed);
@@ -3871,15 +3883,59 @@ fn retry_server_connect(
 
     let be_idx = EngineDispatcher::resolve_backend(entry, proxies);
     entry.backend_idx = be_idx;
-    proxies[be_idx].stats[worker_id()].retries_count.fetch_add(1, Ordering::Relaxed);
     let source_ip = entry.sess.client_addr.map(|a| a.ip());
-    let target = if proxies[be_idx].redisp {
-        proxies[be_idx].select_server_with_key(source_ip, entry.sess.req_uri.as_deref())
+    let be = &proxies[be_idx];
+    // `stream_choose_redispatch`: with `option redispatch` the retry may be balanced anew.
+    let redispatch = be.redisp && {
+        let status_of = |i: usize| be.server_statuses.get(i).map(|s| s.load(Ordering::Relaxed));
+        let running = old_idx.is_none_or(|i| {
+            status_of(i).is_some_and(|s| s == ServerStatus::Up as u8 || s == ServerStatus::Drain as u8)
+        });
+        let active = (0..be.servers.len())
+            .filter(|&i| !be.server_backups.get(i).copied().unwrap_or(false) && status_of(i) == Some(ServerStatus::Up as u8))
+            .count();
+        let hash = matches!(be.balance, BalanceAlgorithm::Source | BalanceAlgorithm::Uri);
+        let direct = entry.sess.txn.as_ref().is_some_and(|t| t.ck.direct);
+        crate::lb::redispatch_due(
+            be.redisp_after,
+            entry.sess.max_retries,
+            entry.sess.max_retries.saturating_sub(entry.sess.conn_retries),
+            running,
+            direct,
+            active,
+            hash,
+        )
+    };
+    let target = if redispatch {
+        let hash = matches!(proxies[be_idx].balance, BalanceAlgorithm::Source | BalanceAlgorithm::Uri);
+        // The balancing algorithm is asked to avoid the server that just failed, unless it
+        // is the only one left (`fwrr_get_next_server(.., prev_srv)` and the like).
+        // Only another active server counts: a backup is not a way out of the one active
+        // server, which is then asked again.
+        let others = proxies[be_idx].eligible_server_indices().len() > 1;
+        proxies[be_idx].avoid_idx = if hash || !others { None } else { old_idx };
+        let t = proxies[be_idx].select_server_with_key(source_ip, entry.sess.req_uri.as_deref());
+        proxies[be_idx].avoid_idx = None;
+        t
     } else {
         entry
             .target_addr
             .or_else(|| proxies[be_idx].select_server_with_key(source_ip, entry.sess.req_uri.as_deref()))
     };
+    // A different server is a redispatch (`wredis`), the same one a retry (`wretr`); the
+    // client's persistence cookie no longer holds (`SF_DIRECT` cleared, `TX_CK_DOWN`).
+    let moved = target.is_some() && entry.target_addr.is_some() && target != entry.target_addr;
+    let stats = &proxies[be_idx].stats[worker_id()];
+    if moved {
+        stats.redispatches.fetch_add(1, Ordering::Relaxed);
+        entry.sess.txn.iter_mut().for_each(|txn| {
+            txn.ck.direct = false;
+            // TX_CK_VALID (3) becomes TX_CK_DOWN (2).
+            txn.ck.ck = if txn.ck.ck == 3 { 2 } else { txn.ck.ck };
+        });
+    } else {
+        stats.retries_count.fetch_add(1, Ordering::Relaxed);
+    }
 
     let Some(target_addr) = target else {
         entry.sess.srv_state = ScState::Error;

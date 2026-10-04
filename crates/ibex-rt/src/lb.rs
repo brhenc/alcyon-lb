@@ -13,7 +13,8 @@ use std::sync::{RwLock, RwLockReadGuard};
 #[inline]
 #[must_use]
 pub fn is_server_available(proxy: &Proxy, idx: usize) -> bool {
-    if idx >= proxy.servers.len() {
+    // The server a retry has just left, while a redispatch looks for another one.
+    if idx >= proxy.servers.len() || proxy.avoid_idx == Some(idx) {
         return false;
     }
     if let Some(status) = proxy.server_statuses.get(idx) {
@@ -436,4 +437,40 @@ impl ChashRing {
         // between would have built the same ring from the same states.
         self.0.read().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+}
+
+/// Whether a failed connect is retried on a newly balanced server instead of the one that
+/// failed: `stream_choose_redispatch` (`include/haproxy/stream.h`), given that
+/// `option redispatch` is set and the stream is not `force-persist`.
+///
+/// * `after` is `redispatch_after`: `> 0` redispatches every `after`-th retry, `< 0` counts
+///   back from the last one (`-1`: on it).
+/// * `retries_done` is `s->conn_retries` after the failure being retried, `max_retries`
+///   the stream's budget.
+/// * `srv_running`: the failed server is still `SRV_ST_RUNNING`; one that is not goes at once.
+/// * `direct`: the server was chosen by persistence (`SF_DIRECT`).
+/// * `active_servers`: usable active servers (`srv_act`); `hash_kind`: a hash algorithm,
+///   which would choose the same server again.
+#[must_use]
+pub fn redispatch_due(
+    after: i32,
+    max_retries: u16,
+    retries_done: u16,
+    srv_running: bool,
+    direct: bool,
+    active_servers: usize,
+    hash_kind: bool,
+) -> bool {
+    if !srv_running {
+        return true;
+    }
+    let done = i32::from(retries_done);
+    if after > 0 && done % after == 0 {
+        return true;
+    }
+    // C's `%` with a zero divisor would fault; `checked_rem` makes that "no".
+    if after < 0 && done.checked_rem(i32::from(max_retries) + 1 + after) == Some(0) {
+        return true;
+    }
+    !direct && active_servers > 1 && !hash_kind
 }
