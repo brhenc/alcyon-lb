@@ -126,3 +126,33 @@ fn a_tcp_backend_silent_drop_ends_the_session() {
     });
     assert!(ended, "the session is still open");
 }
+
+/// A retry whose own connect is refused at once ends the request: `HAProxy` answers 503 at
+/// once and shows `wretr 1`, `econ 1` on the backend (measured with `retries 1` against
+/// 255.255.255.255:80).
+#[test]
+fn an_http_backend_retry_refused_at_once_ends_the_request() {
+    let body = format!(
+        "frontend fe\n    mode http\n    bind @FE@\n    default_backend be\n\
+         backend be\n    mode http\n    server s {UNREACHABLE}\n"
+    );
+    let (mut engine, fe) = start(&body);
+    let mut c = TcpStream::connect(fe).expect("connect");
+    let _ = c.write_all(GET);
+    c.set_nonblocking(true).expect("nonblocking");
+    let p = idx(&engine, "be");
+    let mut got = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline && !got.windows(4).any(|w| w == b"\r\n\r\n") {
+        let _ = engine.run_once();
+        let mut buf = [0u8; 4096];
+        if let Ok(n) = std::io::Read::read(&mut c, &mut buf) {
+            got.extend_from_slice(&buf[..n]);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert!(got.starts_with(b"HTTP/1.1 503"), "{}", String::from_utf8_lossy(&got));
+    let s = engine.proxies[p].counters();
+    assert_eq!(s.retries_count.load(Ordering::Relaxed), 1, "wretr");
+    assert_eq!(econ(s), 1, "econ");
+}
