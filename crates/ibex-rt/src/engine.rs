@@ -5678,16 +5678,10 @@ impl EngineDispatcher<'_> {
                     Some(cond) => {
                         let res = crate::proxy::combine_condition(cond, |term| {
                             let parsed = if proxies[be_idx].acls.contains_key(&term.name) { None } else { Expr::parse(&term.name).ok() };
-                            let Some(expr) = proxies[be_idx].acls.get(&term.name).or(parsed.as_ref()) else {
-                                return crate::proxy::AclEvalResult::NotMatched;
-                            };
-                            if expr.fetch_name == "wait_end" && !inspect_final {
-                                return crate::proxy::AclEvalResult::MissingData;
-                            }
-                            if expr.eval(registry, &tcp_ctx) != term.negated {
-                                crate::proxy::AclEvalResult::Matched
-                            } else {
-                                crate::proxy::AclEvalResult::NotMatched
+                            match proxies[be_idx].acls.get(&term.name).or(parsed.as_ref()) {
+                                Some(expr) if expr.fetch_name == "wait_end" && !inspect_final => crate::proxy::AclEvalResult::MissingData,
+                                Some(expr) if expr.eval(registry, &tcp_ctx) != term.negated => crate::proxy::AclEvalResult::Matched,
+                                _ => crate::proxy::AclEvalResult::NotMatched,
                             }
                         });
                         if res == crate::proxy::AclEvalResult::MissingData {
@@ -6949,15 +6943,14 @@ impl EngineDispatcher<'_> {
                 now,
             );
             entry.sess.inspect_exp = None;
-            if let Some(txn) = entry.sess.txn.as_mut() {
-                txn.body_wait = (res == ContentEvalResult::Waiting).then(|| crate::txn::BodyWait {
-                    backend: true,
-                    rule: 0,
-                    deadline: deadline.unwrap_or(Tick::ETERNITY),
-                    tarpit: false,
-                    inspect: true,
-                });
-            }
+            let wait = (res == ContentEvalResult::Waiting).then(|| crate::txn::BodyWait {
+                backend: true,
+                rule: 0,
+                deadline: deadline.unwrap_or(Tick::ETERNITY),
+                tarpit: false,
+                inspect: true,
+            });
+            entry.sess.txn.iter_mut().for_each(|txn| txn.body_wait = wait);
             if res == ContentEvalResult::Waiting {
                 // Held until the delay is over: back here then, past the rules and the
                 // routing that already ran.

@@ -1597,13 +1597,13 @@ impl TcpSession {
             self.cli_exp = Tick::ETERNITY;
         }
         if self.req_exp.is_expired(now) {
+            self.req_exp = Tick::ETERNITY;
             if self.head_pending() && self.cli_timer_live() {
                 // The head is not complete in time: the client's timeout, `408` and all.
                 self.cli_state = ScState::Error;
                 self.ending.get_or_insert(Ending::Timeout(Which::Client));
                 return true;
             }
-            self.req_exp = Tick::ETERNITY;
         }
         if self.srv_exp.is_expired(now) {
             if self.srv_timer_live() {

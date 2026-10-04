@@ -234,7 +234,7 @@ fn wait_end_holds_an_http_response_until_the_inspect_delay_is_over() {
     let (srv, _rx) = server();
     let cfg = "defaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n\
         frontend fe\n  bind {fe}\n  default_backend be\n\
-        backend be\n  tcp-response inspect-delay 500ms\n  tcp-response content accept if WAIT_END\n  server s {srv}\n";
+        backend be\n  tcp-response inspect-delay 500ms\n  tcp-response content reject if !WAIT_END\n  tcp-response content accept if WAIT_END\n  server s {srv}\n";
     let (_ibex, fe) = start(cfg, srv);
     let (took, resp) = timed(fe, GET);
     assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "{resp:?}");
