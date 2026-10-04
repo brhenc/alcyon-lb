@@ -7,7 +7,7 @@ use ibex_config::preproc::preprocess;
 #[test]
 fn test_preproc() {
     let input = "
-.if feature(THREAD)
+.if version_atleast(2.4)
   global
     thread-groups 1
 .endif
@@ -43,7 +43,7 @@ fn test_preproc_elif() {
     let input = "
 .if feature(UNKNOWN)
   a
-.elif feature(THREAD)
+.elif version_atleast(2.4)
   b
 .else
   c
@@ -58,8 +58,8 @@ fn test_preproc_elif() {
 #[test]
 fn test_preproc_nested() {
     let input = "
-.if feature(THREAD)
-  .if !feature(OPENSSL)
+.if version_atleast(2.4)
+  .if !feature(UNKNOWN)
     a
   .endif
 .endif
@@ -72,7 +72,7 @@ fn test_preproc_nested() {
 
 #[test]
 fn test_preproc_unterminated() {
-    let input = ".if feature(THREAD)\n a";
+    let input = ".if version_atleast(2.4)\n a";
     let lines = lex(input);
     let err = preprocess(lines).unwrap_err();
     assert_eq!(err.message, "non-terminated '.if' block.");
@@ -91,7 +91,7 @@ fn test_preproc_unknown_predicate() {
 fn test_balance_rr() {
     let input = "
     global
-    .if feature(THREAD)
+    .if version_atleast(2.4)
         thread-groups 1
     .endif
     defaults
