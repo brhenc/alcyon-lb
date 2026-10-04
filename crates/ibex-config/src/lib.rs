@@ -30,7 +30,7 @@ pub use ast::{
     SampleRef, SectionKind, Server, ServerSsl, SslVerify, StatsConfig, StatusCodeSet, TlsVersion,
     StickRule, StickRuleType, StickTableConfigAst, TcpReqConnAction, TcpReqConnRule,
     TcpReqContentAction, TcpReqContentRule, TcpResAction, TcpResContentRule, TcpReqSessionAction, TcpReqSessionRule,
-    TimeoutConfig, UseBackendRule, UseServerRule,
+    TimeoutConfig, UseBackendRule, UseServerRule, Userlist, UserlistUser,
 };
 pub use error::ConfigError;
 pub use parser::parse_str;

@@ -259,6 +259,121 @@ fn set_priority_class_and_offset_are_read_back_by_the_fetches() {
     assert_eq!(x_prio(fe, "/m", ""), "0/5");
 }
 
+const AUTH: &str = "defaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n\
+userlist ul\n  group admins users u1\n  group dev\n  group other\n  user u1 insecure-password pass1 groups dev\n\
+  user u2 insecure-password pass2 groups admins,dev\n  user u3 insecure-password pass3\n  user u4 insecure-password \"pass 4\" groups other\n\
+  user u5\n\
+frontend fe\n  bind {fe}\n  acl auth_ok http_auth(ul)\n  acl is_admin http_auth_group(ul) admins\n  acl is_dev http_auth_group(ul) dev\n\
+  http-request set-var(txn.user) http_auth_user\n  http-request set-var(txn.pass) http_auth_pass\n  http-request set-var(txn.type) http_auth_type\n\
+  http-request set-var(txn.ok) str(yes) if auth_ok\n  http-request set-var(txn.admin) str(yes) if is_admin\n  http-request set-var(txn.dev) str(yes) if is_dev\n\
+  http-request auth if { path /noreal } !auth_ok\n  http-request auth realm \"my realm\" if { path /real } !auth_ok\n\
+  http-request return status 200\n\
+  http-after-response set-header x-got \"%[var(txn.user)]|%[var(txn.pass)]|%[var(txn.type)]|%[var(txn.ok)]|%[var(txn.admin)]|%[var(txn.dev)]\"\n";
+
+fn b64(s: &str) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for c in s.as_bytes().chunks(3) {
+        let n = (u32::from(c[0]) << 16) | (u32::from(*c.get(1).unwrap_or(&0)) << 8) | u32::from(*c.get(2).unwrap_or(&0));
+        for i in 0..4 {
+            if i <= c.len() {
+                out.push(T[((n >> (18 - 6 * i)) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// The status line and the interesting headers the answer to `GET <path>` with `auth` as its
+/// `authorization` header carried.
+fn auth_get(fe: SocketAddr, path: &str, auth: Option<&str>) -> (String, String, String) {
+    let hdr = auth.map_or(String::new(), |a| format!("authorization: {a}\r\n"));
+    let got = send(fe, &format!("GET {path} HTTP/1.1\r\nHost: a\r\n{hdr}Connection: close\r\n\r\n"));
+    let find = |name: &str| {
+        got.lines()
+            .find_map(|l| l.to_ascii_lowercase().strip_prefix(&format!("{name}: ")).map(|_| l[name.len() + 2..].trim_end().to_string()))
+            .unwrap_or_default()
+    };
+    (got.lines().next().unwrap_or("").to_string(), find("x-got"), find("www-authenticate"))
+}
+
+#[test]
+fn http_auth_reads_the_userlist_and_the_credentials() {
+    let (_i, fe) = start(AUTH);
+    let basic = |c: &str| Some(format!("Basic {}", b64(c)));
+    // (credentials, "user|pass|type|ok|admin|dev"), measured on HAProxy 3.5-dev8-885761-29.
+    for (creds, want) in [
+        (None, "|||||".to_string()),
+        (basic("u1:pass1"), "u1|pass1|Basic|yes|yes|yes".to_string()),
+        (basic("u2:pass2"), "u2|pass2|Basic|yes|yes|yes".to_string()),
+        (basic("u3:pass3"), "u3|pass3|Basic|yes||".to_string()),
+        (basic("u4:pass 4"), "u4|pass 4|Basic|yes||".to_string()),
+        (basic("u1:wrong"), "u1|wrong|Basic|||".to_string()),
+        (basic("nouser:x"), "nouser|x|Basic|||".to_string()),
+        (basic("u1:"), "u1||Basic|||".to_string()),
+        (basic(":pass1"), "|pass1|Basic|||".to_string()),
+        (basic("u2:pa:ss"), "u2|pa:ss|Basic|||".to_string()),
+        // A user declared without a password never authenticates.
+        (basic("u5:"), "u5||Basic|||".to_string()),
+        (basic("u5:x"), "u5|x|Basic|||".to_string()),
+        (Some("Bearer abc".to_string()), "||Bearer|||".to_string()),
+        (Some("Foo abc".to_string()), "|||||".to_string()),
+        (Some("Basic !!!!".to_string()), "|||||".to_string()),
+        (Some(format!("Basic {}", b64("u1pass1"))), "|||||".to_string()),
+        (Some(format!("basic   {}", b64("u1:pass1"))), "u1|pass1|Basic|yes|yes|yes".to_string()),
+        (Some(format!("Basic\t{}", b64("u1:pass1"))), "|||||".to_string()),
+    ] {
+        let (status, got, _) = auth_get(fe, "/public", creds.as_deref());
+        assert_eq!(status, "HTTP/1.1 200 OK", "{creds:?}");
+        assert_eq!(got, want, "{creds:?}");
+    }
+}
+
+#[test]
+fn the_auth_action_answers_401_with_its_realm_and_the_default_page() {
+    let (_i, fe) = start(AUTH);
+    // The default realm is the name of the proxy the rule is in.
+    let (status, _, realm) = auth_get(fe, "/noreal", None);
+    assert_eq!((status.as_str(), realm.as_str()), ("HTTP/1.1 401 Unauthorized", "Basic realm=\"fe\""));
+    let (_, _, realm) = auth_get(fe, "/real", None);
+    assert_eq!(realm, "Basic realm=\"my realm\"");
+    let got = send(fe, "GET /real HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n");
+    assert!(got.to_ascii_lowercase().contains("content-length: 112"), "{got:?}");
+    assert!(got.contains("<h1>401 Unauthorized</h1>"), "{got:?}");
+    let wrong = format!("Basic {}", b64("u1:wrong"));
+    assert_eq!(auth_get(fe, "/real", Some(&wrong)).0, "HTTP/1.1 401 Unauthorized");
+    let right = format!("Basic {}", b64("u1:pass1"));
+    assert_eq!(auth_get(fe, "/real", Some(&right)).0, "HTTP/1.1 200 OK");
+}
+
+#[test]
+fn http_auth_names_a_userlist_that_exists() {
+    // Measured on HAProxy 3.5-dev8-885761-29: "unable to find userlist 'nope' referenced in
+    // arg 1 of ACL keyword 'http_auth' in proxy 'f'", "missing userlist name in arg 1 of ...".
+    let cfg = |acl: &str| {
+        format!(
+            "userlist ul\n  user u insecure-password p\ndefaults\n  mode http\n  timeout client 5s\n\
+             frontend f\n  bind 127.0.0.1:18082\n  acl x {acl}\n  http-request deny if x\n"
+        )
+    };
+    let check = |acl: &str| {
+        let config = ibex_config::parse_config(&cfg(acl)).expect("parses");
+        ibex_rt::proxy_state::check_sample_refs(&config, ibex_sample::sample_registry())
+    };
+    assert!(check("http_auth(ul)").is_ok());
+    assert!(check("http_auth_group(ul) g").is_ok());
+    for (acl, want) in [
+        ("http_auth(nope)", "unable to find userlist 'nope' referenced in arg 1 of ACL keyword 'http_auth' in proxy 'f'"),
+        ("http_auth_group(nope) g", "unable to find userlist 'nope' referenced in arg 1 of ACL keyword 'http_auth_group' in proxy 'f'"),
+        ("http_auth", "missing userlist name in arg 1 of ACL keyword 'http_auth' in proxy 'f'"),
+    ] {
+        let err = check(acl).expect_err(acl);
+        assert!(err.contains(want), "{acl}: {err}");
+    }
+}
+
 const ERR_FAIL: &str = "{global}defaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n\
 frontend fe\n  bind {fe}\n  http-request track-sc0 path\n\
   http-after-response add-header x-table err=%[sc0_http_err_cnt],fail=%[sc0_http_fail_cnt]\n\

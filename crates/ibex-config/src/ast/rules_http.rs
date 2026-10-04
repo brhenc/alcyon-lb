@@ -150,7 +150,10 @@ pub enum HttpReqAction {
         timeout_type: String,
         timeout_val: String,
     },
-    Auth,
+    /// `auth [realm <realm>]`: the 401 that asks for credentials; no realm is the proxy's name.
+    Auth {
+        realm: Option<String>,
+    },
     Capture {
         expr: String,
         len: Option<usize>,

@@ -37,3 +37,64 @@ fn the_priority_lines_haproxy_refuses_are_refused() {
         assert!(err.contains(want), "{line}: {err}");
     }
 }
+
+fn with_userlist(body: &str) -> Result<ibex_config::Config, String> {
+    parse_config(&format!(
+        "userlist ul\n{body}\ndefaults\n    mode http\n    timeout client 5s\nfrontend fe\n    bind 127.0.0.1:8080\n    http-request return status 200\n"
+    ))
+    .map_err(|e| e.to_string())
+}
+
+#[test]
+fn a_userlist_resolves_its_groups_both_ways() {
+    let c = with_userlist(
+        "    group admins users u1\n    group dev\n    user u1 insecure-password pass1 groups dev\n    \
+         user u2 insecure-password pass2 groups admins,dev\n    user u3",
+    )
+    .expect("accepted");
+    let ul = &c.userlists[0];
+    assert_eq!(ul.name, "ul");
+    let by = |n: &str| ul.users.iter().find(|u| u.name == n).expect(n).clone();
+    assert_eq!(by("u1").groups, ["dev", "admins"]);
+    assert_eq!(by("u2").groups, ["admins", "dev"]);
+    assert_eq!(by("u2").password.as_deref(), Some("pass2"));
+    assert_eq!((by("u3").password, by("u3").groups), (None, Vec::<String>::new()));
+}
+
+#[test]
+fn the_userlist_lines_haproxy_refuses_are_refused_with_its_messages() {
+    for (body, want) in [
+        ("    user", "'user' expects <name> as arguments."),
+        ("    group", "'group' expects <name> as arguments."),
+        ("    group a,b", "character ',' is not permitted in 'group' name 'a,b'."),
+        ("    user u1 insecure-password p extra", "'user' only supports 'password', 'insecure-password' and 'groups' options."),
+        ("    bogus x", "unknown keyword 'bogus' in 'userlist' section"),
+        ("    user u1 groups g", "userlist 'ul': no such group 'g' specified in user 'u1'"),
+        ("    group g users nou", "userlist 'ul': no such user 'nou' specified in group 'g'"),
+        // A crypt(3) hash cannot be checked by Ibex: refused rather than never matching.
+        ("    user u1 password $5$salt$abc", "not supported"),
+    ] {
+        let err = with_userlist(body).expect_err(body);
+        assert!(err.contains(want), "{body}: {err}");
+    }
+    // A duplicate is ignored (HAProxy warns), the first one stays.
+    let c = with_userlist("    user u1 insecure-password a\n    user u1 insecure-password b").expect("accepted");
+    assert_eq!(c.userlists[0].users.len(), 1);
+    assert_eq!(c.userlists[0].users[0].password.as_deref(), Some("a"));
+}
+
+#[test]
+fn the_auth_action_takes_a_realm() {
+    let c = parse_config(&cfg("frontend", "http-request auth realm \"my realm\" if TRUE")).expect("accepted");
+    assert!(matches!(&c.frontends[0].http_req_rules[0].action, HttpReqAction::Auth { realm: Some(r) } if r == "my realm"));
+    let c = parse_config(&cfg("frontend", "http-request auth")).expect("accepted");
+    assert!(matches!(&c.frontends[0].http_req_rules[0].action, HttpReqAction::Auth { realm: None }));
+    for (line, want) in [
+        ("http-request auth realm", "missing realm value."),
+        ("http-request auth foo", "expects either 'if' or 'unless' followed by a condition but found 'foo'"),
+        ("http-request auth realm a b", "found 'b'"),
+    ] {
+        let err = parse_config(&cfg("frontend", line)).expect_err(line).to_string();
+        assert!(err.contains(want), "{line}: {err}");
+    }
+}

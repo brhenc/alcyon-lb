@@ -1831,6 +1831,17 @@ fn count_http_status(tracked: &[Option<(usize, StickKey)>; 3], proxies: &[Proxy]
     }
 }
 
+/// `reply`, a whole response, with `header` as the first header line.
+fn with_header_after_status_line(reply: &[u8], header: &str) -> Vec<u8> {
+    let at = reply.windows(2).position(|w| w == b"\r\n").map_or(reply.len(), |p| p + 2);
+    let mut out = Vec::with_capacity(reply.len() + header.len() + 2);
+    out.extend_from_slice(&reply[..at]);
+    out.extend_from_slice(header.as_bytes());
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(&reply[at..]);
+    out
+}
+
 /// A sample as an integer, as a string converts to one: its leading digits, 0 when it has none.
 fn sample_as_sint(smp: &ibex_sample::Sample) -> i64 {
     let text = sample_to_string(smp);
@@ -1929,6 +1940,20 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         let applets = AppletArena::with_capacity(capacity);
 
         init_global_vars(config.global.as_ref());
+        ibex_sample::set_userlists(
+            config
+                .userlists
+                .iter()
+                .map(|l| ibex_sample::AuthUserlist {
+                    name: l.name.clone(),
+                    users: l
+                        .users
+                        .iter()
+                        .map(|u| ibex_sample::AuthUser { name: u.name.clone(), password: u.password.clone(), groups: u.groups.clone() })
+                        .collect(),
+                })
+                .collect(),
+        );
         HTTP_ERR_CODES.set(config.global.as_ref().and_then(|g| g.http_err_codes).unwrap_or_else(ibex_config::StatusCodeSet::default_err));
         HTTP_FAIL_CODES.set(config.global.as_ref().and_then(|g| g.http_fail_codes).unwrap_or_else(ibex_config::StatusCodeSet::default_fail));
         let bufsize = config.global.as_ref().and_then(|g| g.bufsize).unwrap_or(16384);
@@ -6353,7 +6378,7 @@ impl EngineDispatcher<'_> {
                     ibex_config::HttpReqAction::Return { .. }
                         | ibex_config::HttpReqAction::Deny { .. }
                         | ibex_config::HttpReqAction::Allow
-                        | ibex_config::HttpReqAction::Auth
+                        | ibex_config::HttpReqAction::Auth { .. }
                         | ibex_config::HttpReqAction::Redirect { .. }
                 ) {
                     note_last_rule(sess, rule.line);
@@ -6440,9 +6465,18 @@ impl EngineDispatcher<'_> {
                     ibex_config::HttpReqAction::Allow => {
                         return Ok(RuleFlow::Next);
                     }
-                    ibex_config::HttpReqAction::Auth => {
-                        let resp = "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"HAProxy\"\r\nContent-Type: text/plain\r\nContent-Length: 0\r\n\r\n";
-                        send_proxy_reply(sess, &proxies[..], proxy_idx, pages_idx, resp.as_bytes());
+                    ibex_config::HttpReqAction::Auth { realm } => {
+                        // The 401 page of the proxy with `WWW-Authenticate` added; with no
+                        // realm, the name of the proxy the rule is in (`http_action_auth`).
+                        let realm = realm.as_deref().or(if be_stage { be_name } else { fe_name }).unwrap_or_default();
+                        let page = match resolve_error_body(&proxies[pages_idx], &proxies[proxy_idx], 401, Some(&ibex_config::ErrorPageSource::DefaultErrorfiles), None, None) {
+                            ResolvedErrorBody::Raw(bytes) => bytes.to_vec(),
+                            ResolvedErrorBody::Custom { content_type, lf_string } => {
+                                build_templated_error_response(401, content_type, lf_string, &make_ctx!(sess), registry)
+                            }
+                        };
+                        let resp = with_header_after_status_line(&page, &format!("www-authenticate: Basic realm=\"{realm}\""));
+                        send_proxy_reply(sess, &proxies[..], proxy_idx, pages_idx, &resp);
                         return Ok(RuleFlow::Replied);
                     }
                     ibex_config::HttpReqAction::Redirect { location, prefix, code, .. } => {

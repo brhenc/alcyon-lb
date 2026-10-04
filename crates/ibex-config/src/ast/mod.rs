@@ -32,6 +32,9 @@ pub use acl::*;
 pub mod stick;
 pub use stick::*;
 
+pub mod userlist;
+pub use userlist::*;
+
 pub mod logging;
 pub use logging::*;
 
@@ -54,5 +57,7 @@ pub struct Config {
     /// Every ACL and log-format sample expression in the proxy and defaults sections, in
     /// the order written. Empty for a configuration not built by the parser.
     pub sample_refs: Vec<SampleRef>,
+    /// The `userlist` sections, in the order written.
+    pub userlists: Vec<Userlist>,
 }
 

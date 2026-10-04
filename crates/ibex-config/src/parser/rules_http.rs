@@ -867,14 +867,24 @@ fn parse_http_req_rule_at(
             line: 0,
         });
     } else if act_str == "auth" {
-        let cond_idx = find_cond_idx(tokens, 2);
-        let cond = if let Some(idx) = cond_idx {
-            parse_acl_condition_from_tokens(&tokens[idx..])?
+        // `parse_http_auth` (src/http_act.c): `auth [realm <realm>]`, then a condition.
+        let (realm, at) = if tokens.get(2).is_some_and(|t| t.text == "realm") {
+            match tokens.get(3) {
+                Some(r) if !matches!(r.text.as_str(), "" | "if" | "unless") => (Some(r.text.clone()), 4),
+                _ => {
+                    return Err(ConfigError::new(
+                        act_token.line,
+                        act_token.col,
+                        "error detected while parsing 'http-request auth' rule : missing realm value.",
+                    ))
+                }
+            }
         } else {
-            None
+            (None, 2)
         };
+        let cond = expect_cond_at(tokens, at, act_token)?;
         rules.push(HttpReqRule {
-            action: HttpReqAction::Auth,
+            action: HttpReqAction::Auth { realm },
             cond,
             line: 0,
         });

@@ -1677,6 +1677,8 @@ impl Registry {
         reg_stick!("kbytes_in", StickData::KbytesIn);
         reg_stick!("kbytes_out", StickData::KbytesOut);
 
+        crate::auth::register(self);
+
         // --- 11. Timeout Fetches ---
         macro_rules! reg_timeout_fetch {
             ($name:literal) => {
@@ -4333,6 +4335,11 @@ pub fn sample_to_string(smp: &Sample) -> String {
     }
 }
 
+/// The first `name` header of the request.
+pub(crate) fn request_header(ctx: &SampleContext, name: &str) -> Option<String> {
+    get_req_header(ctx, name)
+}
+
 fn get_req_header(ctx: &SampleContext, name: &str) -> Option<String> {
     if let Some(htx) = ctx.htx_slice {
         if let Some(v) = htx.get_header(name) {
@@ -4781,7 +4788,7 @@ fn base64_encode(data: &[u8], url_safe: bool) -> String {
 }
 
 #[allow(clippy::naive_bytecount)]
-fn base64_decode(input: &str, url_safe: bool, strict_padding: bool) -> Option<Vec<u8>> {
+pub(crate) fn base64_decode(input: &str, url_safe: bool, strict_padding: bool) -> Option<Vec<u8>> {
     fn decode_char(c: u8, url_safe: bool) -> Option<u8> {
         match c {
             b'A'..=b'Z' => Some(c - b'A'),

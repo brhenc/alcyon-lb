@@ -9,7 +9,8 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use crate::ast::{
-    clear_http_errors_sections, clear_resolved_checks, http_errors_section, http_errors_section_code,
+    clear_http_errors_sections, clear_resolved_checks, clear_userlists, http_errors_section, http_errors_section_code,
+    register_userlist, take_userlists, Userlist, UserlistUser,
     register_http_errors_section, register_resolved_check, register_resolved_check_for_addr,
     AclCondition, AclRule, AclTerm, BackendSection, BalanceAlgorithm, BindConfig, Config, CookieConfig,
     DefaultServerConfig, DefaultsSection, ErrorPageSource, FrontendSection, GlobalSection,
@@ -85,6 +86,8 @@ pub(crate) enum CurrentSection {
     Frontend(FrontendSection),
     Backend(BackendSection),
     Resolvers,
+    /// `userlist <name>`.
+    Userlist(Userlist),
     /// `http-errors <name>`: a named, independent set of `errorfile` entries referenced by
     /// proxies via `errorfiles <name> [<code>...]`.
     HttpErrors(String, std::collections::HashMap<u16, Vec<u8>>),
@@ -110,6 +113,8 @@ pub(crate) use rules_tcp::*;
 pub(crate) mod rules_http;
 pub(crate) use rules_http::*;
 pub(crate) mod stick;
+pub(crate) mod userlist;
+pub(crate) use userlist::*;
 pub(crate) use stick::*;
 pub(crate) mod logging;
 pub(crate) use logging::*;
@@ -152,6 +157,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
     // checks. Clear it first so a previous `parse_str` call in the same process -- tests
     // parse many configs -- cannot leak a section into this one.
     clear_http_errors_sections();
+    clear_userlists();
 
     let mut global: Option<GlobalSection> = None;
     let mut defaults: Option<DefaultsSection> = None;
@@ -311,6 +317,21 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                 );
                 cur_section = Some(CurrentSection::Resolvers);
             }
+            "userlist" => {
+                flush_current_section(
+                    &mut cur_section,
+                    &mut global,
+                    &mut defaults,
+                    &mut named_defaults,
+                    &mut listens,
+                    &mut frontends,
+                    &mut backends,
+                );
+                let Some(name) = tokens.get(1).filter(|t| !t.text.is_empty()) else {
+                    return Err(ConfigError::new(kw.line, kw.col, "'userlist' expects <name> as arguments."));
+                };
+                cur_section = Some(CurrentSection::Userlist(Userlist { name: name.text.clone(), line: kw.line, ..Userlist::default() }));
+            }
             "http-errors" => {
                 flush_current_section(
                     &mut cur_section,
@@ -394,6 +415,10 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
     }
 
     validate_config(global.as_ref(), &listens, &frontends, &backends)?;
+    let mut userlists = take_userlists();
+    for list in &mut userlists {
+        list.resolve().map_err(|(line, msg)| ConfigError::new(line, 1, msg))?;
+    }
 
     let config = Config {
         global,
@@ -402,6 +427,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
         frontends,
         backends,
         sample_refs,
+        userlists,
     };
     register_checks_from_config(&config);
 
@@ -507,6 +533,7 @@ pub(crate) fn flush_current_section(
             CurrentSection::Frontend(f) => frontends.push(f),
             CurrentSection::Backend(b) => backends.push(b),
             CurrentSection::Resolvers => {}
+            CurrentSection::Userlist(u) => register_userlist(u),
             CurrentSection::HttpErrors(name, table) => register_http_errors_section(name, table),
         }
     }
@@ -527,6 +554,7 @@ pub(crate) fn parse_section_directive(
         CurrentSection::Frontend(f) => parse_frontend_directive(f, tokens, kw),
         CurrentSection::Backend(b) => parse_backend_directive(b, tokens, kw),
         CurrentSection::Resolvers => parse_resolvers_directive(tokens, kw),
+        CurrentSection::Userlist(u) => parse_userlist_directive(u, tokens, kw),
         CurrentSection::HttpErrors(_, table) => match kw.text.as_str() {
             "errorfile" => parse_errorfile_directive(table, tokens, kw),
             other => Err(ConfigError::new(
