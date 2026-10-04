@@ -297,3 +297,24 @@ fn http_auth_bearer_reads_the_named_header() {
         assert_eq!(header(&r, "tok").unwrap_or_default(), *tok, "{hdr}: {r}");
     }
 }
+
+/// `meth(<name>)` is the constant method (HAProxy 3.5-dev8): the name as written, known or not.
+#[test]
+fn meth_with_an_argument_is_a_constant_method() {
+    let fe = common::reserve_addr();
+    let _ibex = start(
+        &format!(
+            "{DEFAULTS}frontend fe\n  bind {fe}\n  \
+             http-request return status 200 hdr x-m \"a=[%[meth(GET)]] b=[%[meth(POST)]] c=[%[meth(HEAD)]] d=[%[meth(OPTIONS)]] e=[%[meth(CONNECT)]] f=[%[meth(PURGE)]] g=[%[meth(get)]] h=[%[meth(GET),length]]\" \
+             hdr x-n \"%[meth(GET)]-%[meth(TRACE)]-%[meth(PUT)]-%[meth(DELETE)]-%[meth(PATCH)]\"\n"
+        ),
+        fe,
+    );
+    let r = get(fe, "");
+    assert_eq!(
+        header(&r, "x-m").as_deref(),
+        Some("a=[GET] b=[POST] c=[HEAD] d=[OPTIONS] e=[CONNECT] f=[PURGE] g=[get] h=[3]"),
+        "{r}"
+    );
+    assert_eq!(header(&r, "x-n").as_deref(), Some("GET-TRACE-PUT-DELETE-PATCH"), "{r}");
+}

@@ -828,6 +828,18 @@ impl Registry {
             },
         });
 
+        // `meth(<name>)`: the constant method `<name>` (`smp_fetch_meth` is `method`; this one
+        // is the constant `meth` of src/sample.c). A name outside the known methods is kept as
+        // it was written.
+        self.register_fetch(FetchDesc {
+            name: "meth",
+            out_type: SampleType::Meth,
+            func: |_ctx, args| {
+                let name = args.first()?;
+                Some(Sample::Meth(ibex_proto::htx::HttpMethod::from_bytes(name.as_bytes())))
+            },
+        });
+
         self.register_fetch(FetchDesc {
             name: "method",
             out_type: SampleType::Meth,
