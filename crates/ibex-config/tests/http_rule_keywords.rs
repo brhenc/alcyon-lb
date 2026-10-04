@@ -178,6 +178,8 @@ fn more_userlist_lines() {
         let err = parse_config(text).expect_err(text).to_string();
         assert!(err.contains(want), "{text}: {err}");
     }
+    // `users` with no list is accepted, as HAProxy accepts it.
+    assert!(parse_config("userlist ul\n  group g users\n").is_ok());
     // A duplicate group is ignored (HAProxy warns), and so is a second userlist of a name.
     let c = parse_config("userlist ul\n  group g\n  group g\n  user a insecure-password x\nuserlist ul\n  user b\n").expect("accepted");
     assert_eq!(c.userlists.len(), 1);
