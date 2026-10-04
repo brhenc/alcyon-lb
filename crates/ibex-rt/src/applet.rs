@@ -1218,6 +1218,42 @@ impl CliApplet {
                 self.finish_msg("");
             }
             Some("weight") => self.apply_weight(ctx, loc, parts.get(2).copied()),
+            Some("health") => {
+                // `cli_parse_set_server`: a tracker has no health of its own.
+                if !crate::track::tracked_label(&ctx.proxies[p_idx], s_idx).is_empty() {
+                    self.finish_msg("cannot change health on a tracking server.");
+                    return;
+                }
+                let up = match parts.get(2).copied() {
+                    Some("up") => true,
+                    Some("down") => false,
+                    // `NOLB` is a state Ibex does not have: refused, not taken for another.
+                    Some("stopping") => {
+                        self.finish_msg("'set server <srv> health stopping' is not supported: Ibex has no stopping state.");
+                        return;
+                    }
+                    _ => {
+                        self.finish_msg("'set server <srv> health' expects 'up', 'stopping', or 'down'.");
+                        return;
+                    }
+                };
+                // The operator's maintenance or drain is a state of its own in `HAProxy` and is
+                // left as it is; Ibex has one state per server, so only a server that is up or
+                // down is moved.
+                let cur = ServerStatus::from(ctx.proxies[p_idx].server_statuses[s_idx].load(std::sync::atomic::Ordering::Relaxed));
+                let status = if up { ServerStatus::Up } else { ServerStatus::Down };
+                if matches!(cur, ServerStatus::Up | ServerStatus::Down) {
+                    crate::track::set_status(ctx.proxies, p_idx, s_idx, status);
+                }
+                // The counter a check keeps: fully healthy, or at zero.
+                if let Some(check) = ctx.checks.iter_mut().find(|c| c.proxy_idx == p_idx && c.server_idx == s_idx) {
+                    check.health = if up { check.config.rise + check.config.fall - 1 } else { 0 };
+                    if matches!(cur, ServerStatus::Up | ServerStatus::Down) {
+                        check.status = status;
+                    }
+                }
+                self.finish_msg("");
+            }
             Some("addr") => {
                 let Some(&ip_s) = parts.get(2) else {
                     self.finish_msg("set server <b>/<s> addr requires an address and optionally a port.");
