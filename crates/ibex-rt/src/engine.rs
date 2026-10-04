@@ -702,6 +702,9 @@ pub struct Engine {
     pub applets: AppletArena,
     pub cli_listener: Option<UnixListener>,
     pub cli_socket_path: Option<PathBuf>,
+    /// The `stats socket` lines after the first, each with its own level (`HAProxy` binds
+    /// them all).
+    extra_cli: Vec<ExtraCli>,
     /// The `level` of the stats socket (`stats socket ... level`): what each new CLI connection
     /// may do. Unset means admin, as before the level was honoured.
     pub cli_level: crate::applet::CliLevel,
@@ -743,8 +746,22 @@ pub struct Engine {
     cli_socket_ident: Option<(u64, u64)>,
 }
 
+/// A `stats socket` beyond the first: the first one keeps its fields on [`Engine`].
+struct ExtraCli {
+    /// `None` once the engine stops accepting (soft stop); the path stays for the unlink.
+    listener: Option<UnixListener>,
+    path: PathBuf,
+    ident: Option<(u64, u64)>,
+    level: crate::applet::CliLevel,
+}
+
 impl Drop for Engine {
     fn drop(&mut self) {
+        for x in &self.extra_cli {
+            if socket_file_ident(&x.path) == x.ident {
+                let _ = std::fs::remove_file(&x.path);
+            }
+        }
         // Unlink the CLI socket only if the path still names the socket this engine
         // created. During a reload the new process binds the same path before the old one
         // exits; an unconditional unlink here deleted the new process's stats socket, so
@@ -2005,6 +2022,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             applets,
             cli_listener: None,
             cli_socket_path: None,
+            extra_cli: Vec::new(),
             cli_level: crate::applet::CliLevel::Admin,
             start_time,
             pid: std::process::id(),
@@ -2059,6 +2077,24 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         self.cli_listener = Some(listener);
         self.cli_socket_ident = socket_file_ident(&path_buf);
         self.cli_socket_path = Some(path_buf);
+        Ok(())
+    }
+
+    /// Binds one more CLI socket, with its own level (a second `stats socket` line).
+    ///
+    /// # Errors
+    /// Returns an error if binding or setting non-blocking mode fails.
+    pub fn bind_extra_cli_socket<P: AsRef<Path>>(&mut self, path: P, level: crate::applet::CliLevel) -> io::Result<()> {
+        let path_buf = path.as_ref().to_path_buf();
+        let _ = std::fs::remove_file(&path_buf);
+        let listener = UnixListener::bind(&path_buf)?;
+        listener.set_nonblocking(true)?;
+        let raw_fd = listener.as_raw_fd();
+        let idx = u32::try_from(self.extra_cli.len()).unwrap_or(u32::MAX);
+        self.fdtab.insert(raw_fd, FdState::CliExtra(idx), Interest::READ);
+        self.poller.add(listener.as_fd(), raw_fd_to_u64(raw_fd), true, false)?;
+        let ident = socket_file_ident(&path_buf);
+        self.extra_cli.push(ExtraCli { listener: Some(listener), path: path_buf, ident, level });
         Ok(())
     }
 
@@ -2260,7 +2296,10 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     }
                 }
                 FdState::CliListener => {
-                    self.accept_from_cli_listener();
+                    self.accept_from_cli_listener(None);
+                }
+                FdState::CliExtra(i) => {
+                    self.accept_from_cli_listener(Some(i as usize));
                 }
                 FdState::Conn { task, conn: _ } => {
                     // A hang-up or error is news for a reader too: the read that finds it
@@ -2348,18 +2387,25 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         Ok(tasks_run)
     }
 
-    fn accept_from_cli_listener(&mut self) {
-        let Some(listener) = self.cli_listener.as_ref() else {
-            return;
-        };
-
+    /// Accepts on the first CLI socket (`which` is `None`) or on the `which`th further one.
+    fn accept_from_cli_listener(&mut self, which: Option<usize>) {
         loop {
+            let (listener, level, path) = match which {
+                None => (self.cli_listener.as_ref(), self.cli_level, self.cli_socket_path.as_ref()),
+                Some(i) => match self.extra_cli.get(i) {
+                    Some(x) => (x.listener.as_ref(), x.level, Some(&x.path)),
+                    None => return,
+                },
+            };
+            let Some(listener) = listener else {
+                return;
+            };
             match listener.accept() {
                 Ok((stream, _)) => {
                     let _ = stream.set_nonblocking(true);
                     let mut applet = CliApplet::new(stream, self.now);
-                    applet.level = self.cli_level;
-                    applet.socket_path = self.cli_socket_path.as_ref().map(|p| p.display().to_string());
+                    applet.level = level;
+                    applet.socket_path = path.map(|p| p.display().to_string());
                     let raw_fd = applet.raw_fd;
 
                     let Some(applet_idx) = self.applets.alloc(applet) else {
@@ -2709,6 +2755,12 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         if let Some(cli) = self.cli_listener.take() {
             self.fdtab.remove(cli.as_raw_fd());
             let _ = self.poller.delete(cli.as_fd());
+        }
+        for x in &mut self.extra_cli {
+            if let Some(l) = x.listener.take() {
+                self.fdtab.remove(l.as_raw_fd());
+                let _ = self.poller.delete(l.as_fd());
+            }
         }
 
         // An HTTP session finishes the transaction it is in and then closes, instead of

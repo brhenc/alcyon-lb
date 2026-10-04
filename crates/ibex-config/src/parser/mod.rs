@@ -186,7 +186,9 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut frontends,
                     &mut backends,
                 );
-                cur_section = Some(CurrentSection::Global(GlobalSection::default()));
+                // HAProxy reads every `global` section into the same struct: a later one
+                // adds to the earlier ones, it does not replace them.
+                cur_section = Some(CurrentSection::Global(global.take().unwrap_or_default()));
             }
             "defaults" => {
                 flush_current_section(

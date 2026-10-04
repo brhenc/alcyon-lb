@@ -23,7 +23,7 @@ use std::path::Path;
 
 pub use ast::{
     AclCondition, AclRule, AclTerm, BackendSection, BalanceAlgorithm, Config, CookieConfig, DefaultsSection,
-    ErrorPageSource, FrontendSection, GlobalSection, GlobalSetVar,
+    ErrorPageSource, FrontendSection, GlobalSection, GlobalSetVar, StatsSocket,
     HashPreserveAffinity, HashType,
     HeaderExp, HttpAfterResAction, HttpAfterResRule, HttpReqAction, HttpReqRule, HttpResAction, RedirectCookie,
     HeaderCapture, HttpResRule, HttpReuse, ListenSection, LogConfig, LogFormatSpec, LogFacility, LogLevel, LogSample, LogTarget, Mode, RetriesValue,

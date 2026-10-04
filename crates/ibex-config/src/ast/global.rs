@@ -5,6 +5,16 @@
 #[allow(unused_imports)]
 use super::*;
 
+/// A `stats socket` line after the first (the first fills [`GlobalSection::stats_socket`]
+/// and its companions).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StatsSocket {
+    pub path: String,
+    pub mode: Option<u32>,
+    pub level: Option<String>,
+    pub expose_fd: bool,
+}
+
 /// Global section configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct GlobalSection {
@@ -19,6 +29,8 @@ pub struct GlobalSection {
     /// `stats socket ... expose-fd listeners`: the socket may hand this process's listening
     /// sockets to a new process during a reload (`_getsocks`, `-x`).
     pub stats_socket_expose_fd: bool,
+    /// The `stats socket` lines after the first, in order: `HAProxy` binds every one.
+    pub extra_stats_sockets: Vec<StatsSocket>,
     /// Maximum rewrite size in bytes.
     pub maxrewrite: Option<usize>,
     /// Buffer size in bytes (`tune.bufsize`).

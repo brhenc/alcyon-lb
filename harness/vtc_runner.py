@@ -1709,9 +1709,6 @@ class VtcExecutor:
             except Exception:
                 pass
 
-    def is_oracle(self) -> bool:
-        return "haproxy" in os.path.basename(self.target_binary)
-
     async def _execute_haproxy_cli(self, haproxy_id: str, block: str) -> None:
         cli_sock = os.path.join(self.tmpdir, f"{haproxy_id}.sock")
         reader, writer = None, None
@@ -2075,17 +2072,13 @@ class VtcExecutor:
                     os.makedirs(os.path.join(self.tmpdir, haproxy_id), exist_ok=True)
                     cfg_path = os.path.join(self.tmpdir, haproxy_id, "cfg")
                     with open(cfg_path, "w") as f:
-                        if self.is_oracle():
-                            # A worker-level admin socket, as vtest has: `-S` is the master
-                            # CLI, which refuses `show stat` and the rest (T138).
-                            f.write("global\n"
-                                    f"    stats socket {os.path.join(self.tmpdir, haproxy_id + '.sock')} level admin\n"
-                                    "# vtc_runner: vtest's third prelude line\n")
-                        else:
-                            # Ibex keeps `-S`: a second `global` section (every test that
-                            # opens its config with one) replaces the first instead of
-                            # merging with it, so the prelude's socket would vanish.
-                            f.write("# vtc_runner: vtest's three-line prelude would be here\n#\n#\n")
+                        # A worker-level admin socket, as vtest has, for both binaries:
+                        # `-S` is the master CLI, which refuses `show stat` and the rest
+                        # (T138). Several `global` sections merge (T146), so a test that
+                        # opens its config with its own `global` adds to this one.
+                        f.write("global\n"
+                                f"    stats socket {os.path.join(self.tmpdir, haproxy_id + '.sock')} level admin\n"
+                                "# vtc_runner: vtest's third prelude line\n")
                         f.write(rewritten_cfg)
                         if not rewritten_cfg.endswith("\n"):
                             f.write("\n")
@@ -2124,8 +2117,7 @@ class VtcExecutor:
                             # in the foreground, as vtest runs it.
                             mw = []
                             proc = subprocess.Popen(
-                                [self.target_binary, "-f", cfg_path, "-d",
-                                 *([] if self.is_oracle() else ["-S", cli_sock])],
+                                [self.target_binary, "-f", cfg_path, "-d"],
                                 stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE,
                             )

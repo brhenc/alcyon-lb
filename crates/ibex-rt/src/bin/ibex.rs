@@ -715,6 +715,8 @@ fn main() {
         config.global.as_ref().and_then(|g| g.stats_socket.as_ref()).map(PathBuf::from)
     });
     
+    let extra_sockets: Vec<ibex_config::StatsSocket> =
+        config.global.as_ref().map(|g| g.extra_stats_sockets.clone()).unwrap_or_default();
     let stats_socket_mode = config.global.as_ref().and_then(|g| g.stats_socket_mode);
     let stats_socket_level = config
         .global
@@ -755,6 +757,7 @@ fn main() {
         let config_clone = config.clone();
         let proxies_clone = shared_proxies.clone();
         let cli_socket_clone = cli_socket.clone();
+        let extra_sockets = extra_sockets.clone();
         let lifecycle_clone = lifecycle.clone();
         let ready_tx = ready_tx.clone();
 
@@ -779,6 +782,19 @@ fn main() {
                     if let Some(mode) = stats_socket_mode {
                         use std::os::unix::fs::PermissionsExt;
                         let _ = std::fs::set_permissions(sock_path, std::fs::Permissions::from_mode(mode));
+                    }
+                }
+                // The `stats socket` lines after the first (HAProxy binds every one), each
+                // with its own level and mode.
+                for x in &extra_sockets {
+                    let level = x.level.as_deref().and_then(ibex_rt::applet::CliLevel::parse).unwrap_or(ibex_rt::applet::CliLevel::Admin);
+                    if let Err(err) = engine.bind_extra_cli_socket(&x.path, level) {
+                        eprintln!("Failed to bind CLI / stats socket '{}': {}", x.path, err);
+                        process::exit(1);
+                    }
+                    if let Some(mode) = x.mode {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = std::fs::set_permissions(&x.path, std::fs::Permissions::from_mode(mode));
                     }
                 }
             }
