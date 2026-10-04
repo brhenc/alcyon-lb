@@ -5833,6 +5833,13 @@ fn url_encode(s: &str) -> String {
 mod tests {
     use super::*;
 
+    /// `url_ip` reads a dotted quad of exactly four parts; a fifth is not an address.
+    #[test]
+    fn url_ip_wants_exactly_four_octets() {
+        assert_eq!(url_ipv4_authority("http://1.2.3.4/"), Some((Ipv4Addr::new(1, 2, 3, 4), 80)));
+        assert_eq!(url_ipv4_authority("http://1.2.3.4.5/"), None);
+    }
+
     #[test]
     fn test_registry_fetches_and_converters_count() {
         let reg = Registry::new();

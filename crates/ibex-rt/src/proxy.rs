@@ -2338,7 +2338,62 @@ fn h3_log_line(line: &str, host: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::h3_log_line;
+    use super::{h3_log_line, pump_h2_body, H2ReqBody};
+    use crate::buf::Buf;
+    use ibex_proto::htx::{Htx, HtxBlock};
+
+    /// Pumps until the body is done, taking out what each pass wrote.
+    fn pump_all(msg: &Htx, st: &mut H2ReqBody, req: &mut Buf, out: &mut Vec<u8>) {
+        for _ in 0..64 {
+            pump_h2_body(msg, st, req);
+            out.extend_from_slice(req.readable());
+            let n = req.readable().len();
+            req.consume(n);
+            if st.done {
+                return;
+            }
+        }
+        panic!("the body never finished: {st:?}");
+    }
+
+    /// A body bigger than the room left goes out a piece at a time, as chunks when there
+    /// is no length; empty DATA frames and blocks that are not body are passed over, and the
+    /// last chunk waits until it fits.
+    #[test]
+    fn an_h2_request_body_is_pumped_in_pieces_that_fit() {
+        let mut msg = Htx::new();
+        msg.push(HtxBlock::Eoh);
+        msg.push(HtxBlock::Data(Vec::new()));
+        msg.push(HtxBlock::Data(b"abcdefghij".to_vec()));
+        msg.push(HtxBlock::Eom);
+
+        let mut st = H2ReqBody { chunked: true, ..H2ReqBody::default() };
+        let mut req = Buf::with_capacity(16);
+        let mut out = Vec::new();
+        pump_all(&msg, &mut st, &mut req, &mut out);
+        assert_eq!(out, b"4\r\nabcd\r\n4\r\nefgh\r\n2\r\nij\r\n0\r\n\r\n");
+
+        let mut st = H2ReqBody::default();
+        let mut req = Buf::with_capacity(4);
+        let mut out = Vec::new();
+        pump_all(&msg, &mut st, &mut req, &mut out);
+        assert_eq!(out, b"abcdefghij");
+    }
+
+    /// The last chunk is not split: with less than its five bytes of room, nothing is
+    /// written and the body is not done.
+    #[test]
+    fn the_last_chunk_waits_for_room() {
+        let mut msg = Htx::new();
+        msg.push(HtxBlock::Eom);
+        let mut st = H2ReqBody { chunked: true, ..H2ReqBody::default() };
+        let mut req = Buf::with_capacity(4);
+        assert!(!pump_h2_body(&msg, &mut st, &mut req));
+        assert!(!st.done);
+        let mut req = Buf::with_capacity(16);
+        assert!(pump_h2_body(&msg, &mut st, &mut req));
+        assert_eq!(req.readable(), b"0\r\n\r\n");
+    }
 
     #[test]
     fn the_h3_log_line_is_absolute_when_it_can_be() {

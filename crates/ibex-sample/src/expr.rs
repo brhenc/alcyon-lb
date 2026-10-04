@@ -192,7 +192,7 @@ impl Expr {
                     "matching method must be specified first (using '-m') when using a sample fetch of this type ('{fetch_name}')"
                 ));
             }
-            match_method = default_match_method(&fetch_name, converters.is_empty());
+            match_method = default_match_method(&fetch_name, &converters);
         }
 
         // A keyword's own match method only applies when there is something to match.
@@ -354,19 +354,31 @@ fn fetch_alias(name: &str) -> Option<&'static str> {
 }
 
 /// The match method a fetch takes when none is given (`parse_acl_expr` picks it from the
-/// type of the sample): integers for numbers, addresses for IPs, strings otherwise.
-fn default_match_method(fetch_name: &str, no_converter: bool) -> &'static str {
+/// type of the sample): integers for numbers, addresses for IPs, strings otherwise. With
+/// converters, it is the type the last one leaves.
+fn default_match_method(fetch_name: &str, converters: &[(String, Vec<String>)]) -> &'static str {
+    use crate::sample::{SampleType, TypeSpec};
+    let reg = crate::registry::sample_registry();
+    if let Some((name, _)) = converters.last() {
+        let out = reg
+            .get_converter(name)
+            .map(|c| c.out_type)
+            .or_else(|| reg.get_ctx_converter(name).map(|c| c.out_type));
+        return match out {
+            Some(TypeSpec::Exact(SampleType::Sint | SampleType::Bool)) => "int",
+            Some(TypeSpec::Exact(SampleType::Ipv4 | SampleType::Ipv6) | TypeSpec::Addr) => "ip",
+            Some(TypeSpec::Same | TypeSpec::Any) => default_match_method(fetch_name, &converters[..converters.len() - 1]),
+            _ => "str",
+        };
+    }
     if fetch_name == "src" || fetch_name == "dst" {
         "ip"
     } else if fetch_name.ends_with("_port") || fetch_name == "status" || fetch_name.starts_with("sc_") {
         "int"
-    } else if let Some(desc) = no_converter
-        .then(|| crate::registry::sample_registry().get_fetch(fetch_name))
-        .flatten()
-    {
+    } else if let Some(desc) = reg.get_fetch(fetch_name) {
         match desc.out_type {
-            crate::sample::SampleType::Sint => "int",
-            crate::sample::SampleType::Ipv4 | crate::sample::SampleType::Ipv6 => "ip",
+            SampleType::Sint => "int",
+            SampleType::Ipv4 | SampleType::Ipv6 => "ip",
             _ => "str",
         }
     } else {
@@ -694,6 +706,16 @@ mod tests {
     }
 
     use super::*;
+
+    /// The default match method follows the type the converters leave, not the fetch's:
+    /// `src,table_trackers(t) eq 1` compares integers (`unknown_key.vtc`).
+    #[test]
+    fn a_converter_sets_the_default_match_method() {
+        Expr::parse("src,table_trackers(test) eq 1").expect("an integer match");
+        Expr::parse("src,in_table(test) 1").expect("a boolean matched as an integer");
+        assert!(Expr::parse("src,lower 1.2.3.4").is_ok(), "a string match");
+        assert!(Expr::parse("src 1.2.3").is_err(), "an address match");
+    }
     use ibex_proto::htx::{HeaderField, HttpMethod, HttpVersion, Htx, HtxBlock, RequestLine};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
