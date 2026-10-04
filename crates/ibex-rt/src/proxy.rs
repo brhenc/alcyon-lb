@@ -1654,27 +1654,8 @@ pub fn find_eoh(buf: &[u8]) -> Option<(usize, usize)> {
 }
 
 #[must_use]
-pub fn status_reason(status: u16) -> &'static str {
-    match status {
-        200 => "OK",
-        201 => "Created",
-        204 => "No Content",
-        301 => "Moved Permanently",
-        302 => "Found",
-        304 => "Not Modified",
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        403 => "Forbidden",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        408 => "Request Timeout",
-        429 => "Too Many Requests",
-        500 => "Internal Server Error",
-        502 => "Bad Gateway",
-        503 => "Service Unavailable",
-        504 => "Gateway Timeout",
-        _ => "Unknown",
-    }
+pub const fn status_reason(status: u16) -> &'static str {
+    ibex_proto::status_reason_phrase(status)
 }
 
 #[must_use]

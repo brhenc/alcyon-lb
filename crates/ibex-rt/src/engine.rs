@@ -8016,26 +8016,7 @@ fn eval_condition(
 }
 
 const fn status_reason(status: u16) -> &'static str {
-    match status {
-        201 => "Created",
-        204 => "No Content",
-        301 => "Moved Permanently",
-        302 => "Found",
-        303 => "See Other",
-        304 => "Not Modified",
-        307 => "Temporary Redirect",
-        308 => "Permanent Redirect",
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        403 => "Forbidden",
-        404 => "Not Found",
-        429 => "Too Many Requests",
-        500 => "Internal Server Error",
-        502 => "Bad Gateway",
-        503 => "Service Unavailable",
-        504 => "Gateway Timeout",
-        _ => "OK",
-    }
+    ibex_proto::status_reason_phrase(status)
 }
 
 /// HAProxy's built-in error pages, transcribed byte-for-byte from `http_err_msgs` in

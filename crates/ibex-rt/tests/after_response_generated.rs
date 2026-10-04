@@ -366,3 +366,42 @@ fn the_log_line_reports_the_reply_the_rules_made() {
         assert_eq!(lines, [want], "{rules}");
     }
 }
+
+/// The reason phrase of a rewritten status is `http_get_reason`'s, class name included for
+/// the codes it does not list. Measured on 3.5-dev8 with `http-after-response set-status N`
+/// on an `http-request return status 200`.
+#[test]
+fn set_status_gives_the_reason_haproxy_gives() {
+    let expected: [(u16, &str); 14] = [
+        (101, "Switching Protocols"),
+        (208, "Success"),
+        (299, "Success"),
+        (306, "Redirection"),
+        (402, "Payment Required"),
+        (408, "Request Time-out"),
+        (416, "Requested range unsatisfiable"),
+        (418, "I'm a teapot"),
+        (419, "Client Error"),
+        (499, "client has closed connection"),
+        (502, "Bad Gateway or Proxy Error"),
+        (504, "Gateway Time-out"),
+        (505, "HTTP Version not supported"),
+        (599, "Server Error"),
+    ];
+    let mut cfg = format!("{DEFAULTS}listen l\n  bind {{fe}}\n  http-request set-var(txn.s) req.hdr(x-s)\n");
+    for (s, _) in expected {
+        cfg.push_str(&format!("  http-after-response set-status {s} if {{ var(txn.s) -m str {s} }}\n"));
+    }
+    cfg.push_str("  http-request return status 200\n");
+    let (_ibex, fe) = start(&cfg, None);
+    let mut wrong = Vec::new();
+    for (s, reason) in expected {
+        let req = format!("GET / HTTP/1.1\r\nHost: x\r\nx-s: {s}\r\nConnection: close\r\n\r\n");
+        let resp = exchange(fe, &req, Duration::from_millis(1500));
+        let line = resp.split("\r\n").next().unwrap_or("");
+        if line != format!("HTTP/1.1 {s} {reason}") {
+            wrong.push(format!("{s}: {line:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "reason phrases differ from HAProxy's:\n{}", wrong.join("\n"));
+}
