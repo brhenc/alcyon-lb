@@ -215,7 +215,7 @@ impl QuicConfig {
         }
 
         let mut rustls_config = ServerConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
+            .with_protocol_versions(&[&rustls::version::TLS13])
             .map_err(|e| QuicError::Tls(format!("TLS protocol version error: {e:?}")))?
             .with_no_client_auth()
             .with_cert_resolver(Arc::new(resolver));

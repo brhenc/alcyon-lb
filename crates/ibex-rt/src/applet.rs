@@ -731,16 +731,12 @@ impl CliApplet {
 
                 if let Ok(entries) = table.dump_entries() {
                     for (k, v) in entries {
+                        let fields = table.data_fields(&v);
                         if let (Some(ff), Some(fo), Some(fv)) = (filter_field, filter_op, filter_val) {
-                            let field_val = match ff {
-                                "conn_cnt" => v.conn_cnt as u64,
-                                "conn_cur" => v.conn_cur as u64,
-                                "gpc0" => v.gpc0,
-                                "gpc1" => v.gpc1,
-                                "gpt0" => v.gpt0 as u64,
-                                "conn_rate" => v.conn_rate.as_ref().map_or(0, |r| r.rate() as u64),
-                                "http_req_rate" => v.http_req_rate.as_ref().map_or(0, |r| r.rate() as u64),
-                                _ => 0,
+                            // An entry of a table that does not store the type has no value
+                            // to compare: it is left out.
+                            let Some(field_val) = fields.iter().find(|(n, _, _)| n == ff).map(|(_, _, x)| *x) else {
+                                continue;
                             };
                             let keep = match fo {
                                 "eq" => field_val == fv,
@@ -762,33 +758,35 @@ impl CliApplet {
                                 let mut s = String::new();
                                 for byte in b {
                                     use std::fmt::Write;
-                                    let _ = write!(s, "{:02X}", byte);
+                                    let _ = write!(s, "{byte:02x}");
                                 }
                                 s
                             }
                         };
 
-                        let _ = write!(out, "0x0: key={} use=0 exp=0", key_str);
-                        if v.conn_cnt > 0 {
-                            let _ = write!(out, " conn_cnt={}", v.conn_cnt);
-                        }
-                        if v.conn_cur > 0 {
-                            let _ = write!(out, " conn_cur={}", v.conn_cur);
-                        }
-                        if v.gpc0 > 0 {
-                            let _ = write!(out, " gpc0={}", v.gpc0);
-                        }
-                        if v.gpc1 > 0 {
-                            let _ = write!(out, " gpc1={}", v.gpc1);
-                        }
-                        if v.gpt0 > 0 {
-                            let _ = write!(out, " gpt0={}", v.gpt0);
-                        }
-                        if let Some(ref r) = v.conn_rate {
-                            let _ = write!(out, " conn_rate(10000)={}", r.rate());
-                        }
-                        if let Some(ref r) = v.http_req_rate {
-                            let _ = write!(out, " http_req_rate(10000)={}", r.rate());
+                        // `exp=` is what is left of `expire`; the address is only an identity.
+                        let left = cfg.expire.saturating_sub(v.last_updated.elapsed()).as_millis();
+                        let addr = {
+                            use std::hash::{Hash, Hasher};
+                            let mut h = std::collections::hash_map::DefaultHasher::new();
+                            key_str.hash(&mut h);
+                            h.finish() & 0xffff_ffff_f0
+                        };
+                        let _ = write!(out, "{addr:#x}: key={key_str} use={} exp={left} shard=0", v.trackers);
+                        for (name, period, val) in &fields {
+                            match period {
+                                Some(p) => {
+                                    let _ = write!(out, " {name}({p})={val}");
+                                }
+                                None if name == "server_key" => {
+                                    // The name of the server `server_id` stands for.
+                                    let sname = v.server_id.and_then(|id| (0..proxy.servers.len()).find(|&i| proxy.server_puid(i) == id)).and_then(|i| proxy.server_ids.get(i));
+                                    let _ = write!(out, " server_key={}", sname.map_or("", String::as_str));
+                                }
+                                None => {
+                                    let _ = write!(out, " {name}={val}");
+                                }
+                            }
                         }
                         out.push('\n');
                     }
@@ -1225,6 +1223,42 @@ impl CliApplet {
                 self.finish_msg("");
             }
             Some("weight") => self.apply_weight(ctx, loc, parts.get(2).copied()),
+            Some("health") => {
+                // `cli_parse_set_server`: a tracker has no health of its own.
+                if !crate::track::tracked_label(&ctx.proxies[p_idx], s_idx).is_empty() {
+                    self.finish_msg("cannot change health on a tracking server.");
+                    return;
+                }
+                let up = match parts.get(2).copied() {
+                    Some("up") => true,
+                    Some("down") => false,
+                    // `NOLB` is a state Ibex does not have: refused, not taken for another.
+                    Some("stopping") => {
+                        self.finish_msg("'set server <srv> health stopping' is not supported: Ibex has no stopping state.");
+                        return;
+                    }
+                    _ => {
+                        self.finish_msg("'set server <srv> health' expects 'up', 'stopping', or 'down'.");
+                        return;
+                    }
+                };
+                // The operator's maintenance or drain is a state of its own in `HAProxy` and is
+                // left as it is; Ibex has one state per server, so only a server that is up or
+                // down is moved.
+                let cur = ServerStatus::from(ctx.proxies[p_idx].server_statuses[s_idx].load(std::sync::atomic::Ordering::Relaxed));
+                let status = if up { ServerStatus::Up } else { ServerStatus::Down };
+                if matches!(cur, ServerStatus::Up | ServerStatus::Down) {
+                    crate::track::set_status(ctx.proxies, p_idx, s_idx, status);
+                }
+                // The counter a check keeps: fully healthy, or at zero.
+                if let Some(check) = ctx.checks.iter_mut().find(|c| c.proxy_idx == p_idx && c.server_idx == s_idx) {
+                    check.health = if up { check.config.rise + check.config.fall - 1 } else { 0 };
+                    if matches!(cur, ServerStatus::Up | ServerStatus::Down) {
+                        check.status = status;
+                    }
+                }
+                self.finish_msg("");
+            }
             Some("addr") => {
                 let Some(&ip_s) = parts.get(2) else {
                     self.finish_msg("set server <b>/<s> addr requires an address and optionally a port.");

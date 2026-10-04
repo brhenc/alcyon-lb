@@ -87,8 +87,6 @@ fn unimplemented_security_keywords_are_refused_in_both_sections() {
     let refused = [
         "ssl verify required ca-file /tmp/ca.pem",
         "ssl crt /tmp/c.pem ca-file /tmp/ca.pem",
-        "ssl crt /tmp/c.pem ssl-min-ver TLSv1.3",
-        "ssl crt /tmp/c.pem no-tlsv12",
         "ssl crt /tmp/c.pem strict-sni",
         "ssl crt /tmp/c.pem ciphers HIGH",
         "ssl crt-list /tmp/l",

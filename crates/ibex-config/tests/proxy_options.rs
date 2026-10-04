@@ -125,7 +125,6 @@ const IBEX_REFUSES: &[(&str, &str)] = &[
     ("log-separate-errors", "fld"),
     // Which server is used.
     ("allbackups", "bld"),
-    ("persist", "bld"),
 ];
 
 const SECTIONS: [char; 4] = ['f', 'b', 'l', 'd'];

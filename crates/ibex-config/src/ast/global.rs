@@ -177,6 +177,10 @@ pub struct GlobalSection {
     pub ssl_default_server_ciphers: Option<String>,
     /// Default SSL server options.
     pub ssl_default_server_options: Option<String>,
+    /// The version bounds `ssl-default-bind-options` sets: what a `bind` that names none gets.
+    pub ssl_default_bind_versions: TlsRange,
+    /// The version bounds `ssl-default-server-options` sets, for `server` lines.
+    pub ssl_default_server_versions: TlsRange,
     /// Syslog targets declared here. Proxy sections inherit these with `log global`,
     /// which is how the canonical `HAProxy` configuration declares logging.
     pub logs: Vec<LogConfig>,

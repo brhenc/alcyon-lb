@@ -35,6 +35,9 @@ pub struct TlsConfig {
     pub cert_resolver: Option<Arc<IbexCertResolver>>,
     /// Whether session tickets are enabled for session resumption.
     pub session_tickets_enabled: bool,
+    /// The protocol versions offered: `ssl-min-ver` / `ssl-max-ver` and their relatives
+    /// narrow the set rustls speaks (TLS 1.2 and 1.3).
+    pub versions: Vec<&'static rustls::SupportedProtocolVersion>,
 }
 
 impl Default for TlsConfig {
@@ -44,6 +47,7 @@ impl Default for TlsConfig {
             alpn_protocols: vec![b"h2".to_vec(), b"http/1.1".to_vec()],
             cert_resolver: None,
             session_tickets_enabled: true,
+            versions: rustls::DEFAULT_VERSIONS.to_vec(),
         }
     }
 }
@@ -69,6 +73,13 @@ impl TlsConfig {
         self
     }
 
+    /// Limits the protocol versions to those `min` to `max` allow.
+    #[must_use]
+    pub fn with_version_range(mut self, min: Option<ibex_config::TlsVersion>, max: Option<ibex_config::TlsVersion>) -> Self {
+        self.versions = versions_between(min, max);
+        self
+    }
+
     /// Builds a [`ServerConfig`] configured with the certificate resolver and ALPN protocols.
     ///
     /// # Errors
@@ -81,7 +92,7 @@ impl TlsConfig {
 
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let mut config = ServerConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
+            .with_protocol_versions(&self.versions)
             .map_err(|e| format!("Protocol version error: {e:?}"))?
             .with_no_client_auth()
             .with_cert_resolver(resolver);
@@ -104,7 +115,7 @@ impl TlsConfig {
     ) -> Result<Arc<ClientConfig>, String> {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let mut config = ClientConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
+            .with_protocol_versions(&self.versions)
             .map_err(|e| format!("Protocol version error: {e:?}"))?
             .with_root_certificates(root_store)
             .with_no_client_auth();
@@ -284,15 +295,21 @@ impl Default for BackendTlsOptions {
     }
 }
 
-/// The protocol versions a server line allows, out of those this build of rustls speaks
-/// (TLS 1.3, and TLS 1.2 when the `tls12` feature is on).
-fn protocol_versions(options: &BackendTlsOptions) -> Vec<&'static rustls::SupportedProtocolVersion> {
+/// The protocol versions between `min` and `max`, out of those this build of rustls speaks
+/// (TLS 1.3, and TLS 1.2 with the `tls12` feature, which the workspace turns on): what
+/// `ssl-min-ver`, `ssl-max-ver`, `no-tlsvN` and `force-tlsvN` ask a handshake to offer
+/// (`bind`) or to accept (`server`).
+#[must_use]
+pub fn versions_between(
+    min: Option<ibex_config::TlsVersion>,
+    max: Option<ibex_config::TlsVersion>,
+) -> Vec<&'static rustls::SupportedProtocolVersion> {
     use ibex_config::TlsVersion;
-    // What a `server` line can name, against what rustls calls it. A version this build
+    // What a line can name, against what rustls calls it. A version this build
     // of rustls does not speak is simply absent from `DEFAULT_VERSIONS`.
     const NAMED: &[(rustls::ProtocolVersion, TlsVersion)] =
         &[(rustls::ProtocolVersion::TLSv1_2, TlsVersion::Tls12), (rustls::ProtocolVersion::TLSv1_3, TlsVersion::Tls13)];
-    let allowed = |v: TlsVersion| options.min_ver.is_none_or(|m| m <= v) && options.max_ver.is_none_or(|m| v <= m);
+    let allowed = |v: TlsVersion| min.is_none_or(|m| m <= v) && max.is_none_or(|m| v <= m);
     rustls::DEFAULT_VERSIONS
         .iter()
         .copied()
@@ -476,7 +493,7 @@ pub fn build_backend_client_config(
     options: &BackendTlsOptions,
 ) -> Result<Arc<ClientConfig>, String> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let versions = protocol_versions(options);
+    let versions = versions_between(options.min_ver, options.max_ver);
     if versions.is_empty() {
         return Err(format!(
             "no TLS version is left between 'ssl-min-ver' and 'ssl-max-ver': this build speaks {}",
@@ -605,6 +622,18 @@ impl TlsConfig {
         }
 
         config = config.with_cert_resolver(Arc::new(resolver));
+        config = config.with_version_range(bind.min_ver, bind.max_ver);
+        if bind.quic {
+            // QUIC is TLS 1.3 by definition (RFC 9001): never offer 1.2 there, whatever
+            // the TCP binds of the proxy do.
+            if config.versions.iter().all(|v| v.version != rustls::ProtocolVersion::TLSv1_3) {
+                return Err(format!("bind {}: QUIC needs TLS 1.3, which 'ssl-max-ver' rules out", bind.addr));
+            }
+            config.versions = vec![&rustls::version::TLS13];
+        }
+        if config.versions.is_empty() {
+            return Err(format!("all SSL/TLS versions are disabled for bind '{}'", bind.addr));
+        }
         config.build_server_config()
     }
 }

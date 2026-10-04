@@ -497,8 +497,8 @@ fn without_sc_inc_gpc0_gpc0_remains_zero() {
         "table fe_no_gpc0 was not declared in show table output:\n{dump}"
     );
     assert!(
-        !dump.contains("gpc0=2") && !dump.contains("gpc0="),
-        "without sc-inc-gpc0, gpc0 must remain 0 and not appear in show table output, got:\n{dump}"
+        !dump.contains("gpc0=2") && dump.contains("gpc0=0"),
+        "without sc-inc-gpc0, gpc0 must remain 0 (HAProxy prints a stored type at zero), got:\n{dump}"
     );
 }
 

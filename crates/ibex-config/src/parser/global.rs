@@ -371,6 +371,7 @@ pub(crate) fn parse_global_directive(
             Ok(())
         }
         "ssl-default-bind-options" => {
+            global.ssl_default_bind_versions = super::tls_versions::default_options_range(tokens, "ssl-default-bind-options")?;
             if tokens.len() >= 2 {
                 global.ssl_default_bind_options = Some(tokens[1..].iter().map(|t| t.text.as_str()).collect::<Vec<_>>().join(" "));
             }
@@ -383,6 +384,7 @@ pub(crate) fn parse_global_directive(
             Ok(())
         }
         "ssl-default-server-options" => {
+            global.ssl_default_server_versions = super::tls_versions::default_options_range(tokens, "ssl-default-server-options")?;
             if tokens.len() >= 2 {
                 global.ssl_default_server_options = Some(tokens[1..].iter().map(|t| t.text.as_str()).collect::<Vec<_>>().join(" "));
             }

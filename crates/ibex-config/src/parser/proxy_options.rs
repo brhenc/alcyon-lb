@@ -162,6 +162,9 @@ const IMPLEMENTED: &[&str] = &[
     // Each request on its own server connection, asked to close (T149).
     "http-server-close",
     "http-keep-alive",
+    "httpclose",
+    // A server a cookie or stick table names is used when it is down (T149b).
+    "persist",
     "log-health-checks",
     // A connection that carried nothing is not logged (T128).
     "dontlognull",
