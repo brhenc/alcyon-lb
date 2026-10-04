@@ -57,9 +57,6 @@ use ibex_sample::registry::{
 };
 
 thread_local! {
-    /// What the engine's ticks count from, on this thread: set by every `step`, read by
-    /// [`fresh_tick`].
-    static TICK_EPOCH: Cell<Option<Instant>> = const { Cell::new(None) };
     pub static WORKER_ID: Cell<usize> = const { Cell::new(0) };
     static STRICT_MODE: Cell<bool> = const { Cell::new(true) };
     /// The line of the `http-response` rule that last ended the rules (`allow`, `deny`,
@@ -464,7 +461,9 @@ pub struct ProxyIdInfo {
     pub server_pool_max_conn: Vec<i32>,
     /// `option http-server-close`: the server connection carries one request. Read when a
     /// request goes to a server and when its response ends.
-    pub server_close: bool,
+    pub http_mode: ibex_config::ast::HttpMode,
+    /// `option persist`: a server named by a cookie or a stick table is used when it is down.
+    pub persist: bool,
 }
 
 /// A configured proxy instance.
@@ -1404,6 +1403,7 @@ fn session_log_data<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, pid: u3
         actconn: sum(fe),
         feconn: sum(fe),
         retries: i64::from(s.max_retries.saturating_sub(s.conn_retries)),
+        redispatched: s.log.redispatched,
         uniq_id: l.uniq_id,
         log_counter: fe.log_count.load(Ordering::Relaxed),
         pid,
@@ -1790,7 +1790,8 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, list
             server_init_health: server_init_health(listen.servers.len(), &listen.server_extras),
             listener_ids: ibex_config::ast::listener_ids(&listen.binds),
             server_pool_max_conn: pool_max_conns(&listen.servers),
-            server_close: listen.server_close,
+            http_mode: listen.http_mode,
+            persist: listen.persist,
             ..ProxyIdInfo::default()
         }),
         name: listen.name.clone(),
@@ -1912,7 +1913,7 @@ fn init_proxy_from_frontend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, fe
             server_forced_ids: Vec::new(),
             server_init_health: Vec::new(),
             listener_ids: ibex_config::ast::listener_ids(&frontend_binds(fe)),
-            server_close: fe.server_close,
+            http_mode: fe.http_mode,
             ..ProxyIdInfo::default()
         }),
         name: fe.name.clone(),
@@ -2059,7 +2060,8 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, be:
             server_init_health: server_init_health(be.servers.len(), &be.server_extras),
             listener_ids: Vec::new(),
             server_pool_max_conn: pool_max_conns(&be.servers),
-            server_close: be.server_close,
+            http_mode: be.http_mode,
+            persist: be.persist,
             ..ProxyIdInfo::default()
         }),
         name: be.name.clone(),
@@ -2319,7 +2321,15 @@ impl Engine {
     /// ([`crate::rule_exprs::validate_rule_exprs`]).
     #[allow(clippy::too_many_lines)]
     pub fn build_shared_state(config: &Config, nbthread: usize) -> io::Result<Vec<Proxy>> {
-    crate::globalconn::configure(config.global.as_ref().and_then(|g| g.maxconn));
+    {
+        // The listeners the file descriptor budget has to leave room for.
+        let stats_sockets = config.global.as_ref().map_or(0, |g| usize::from(g.stats_socket.is_some()) + g.extra_stats_sockets.len());
+        let listeners = stats_sockets
+            + config.listens.iter().map(|l| l.binds.len()).sum::<usize>()
+            + config.frontends.iter().map(|f| frontend_binds(f).len()).sum::<usize>();
+        let stats_socket = stats_sockets > 0;
+        crate::globalconn::configure(config.global.as_ref().and_then(|g| g.maxconn), listeners, stats_socket);
+    }
     // An action naming a fetch or converter the registry lacks would load and then do
     // nothing on every request; `HAProxy` refuses the configuration instead.
     crate::rule_exprs::validate_config(config)
@@ -2738,7 +2748,6 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
 
     pub fn step(&mut self, now: Tick) -> io::Result<usize> {
         self.now = now;
-        TICK_EPOCH.with(|e| e.set(Some(self.start_time)));
 
         // 1. Expire scheduler timers
         self.scheduler.set_now(now);
@@ -4567,6 +4576,7 @@ fn init_client_session(
     sess.accept_unsafe_request = fe.stats_config.accept_unsafe_request;
     sess.http_request_ms = fe.stats_config.raw_timeouts.http_request.map_or(0, millis_to_u32);
     sess.keep_alive_ms = fe.stats_config.raw_timeouts.http_keep_alive.map_or(0, millis_to_u32);
+    sess.close_client = client_close(proxies, proxy_idx);
     sess.arm_request(now);
     sess.keep_request_line = (!fe.log_target_idx.is_empty() && fe.log_format.as_ref().is_some_and(|f| f.uses_request_line()))
         || fe.unique_id_format.as_ref().is_some_and(|f| f.uses_request_line());
@@ -4643,7 +4653,7 @@ fn init_client_session(
         sess.tcp_inspect_done = false;
         if let Some(delay) = proxy.tcp_req_inspect_delay {
             let ms = u32::try_from(delay.as_millis()).unwrap_or(u32::MAX);
-            sess.inspect_exp = Some(fresh_tick(now).add(ms));
+            sess.inspect_exp = Some(now.add(ms));
         }
     }
 
@@ -4886,6 +4896,18 @@ fn reply_parse_error(entry: &mut SessionEntry, proxies: &[Proxy], status: u16) {
     let be = proxies.get(entry.backend_idx).unwrap_or(&proxies[entry.proxy_idx]);
     let page = proxy_error_response(&entry.sess, be, &proxies[entry.proxy_idx], proxies, status);
     entry.sess.write_reply(&page);
+    // The request that could not be parsed counts as a request and as the error or failure its
+    // status is (measured: `http_req_cnt=1 http_err_cnt=1` for a 400).
+    let (is_err, is_fail) = response_class(status);
+    for_tracked(proxies, &entry.sess, |data| {
+        data.count_request();
+        if is_err {
+            data.count_err();
+        }
+        if is_fail {
+            data.count_fail();
+        }
+    });
 }
 
 /// Detaches the server connection from the session: into the idle pool when it can carry
@@ -5034,6 +5056,7 @@ fn retry_server_connect(
             hash,
         )
     };
+    entry.sess.log.redispatched |= redispatch;
     let target = if resuming {
         entry.target_addr
     } else if redispatch {
@@ -5480,7 +5503,7 @@ impl EngineDispatcher<'_> {
                         // The server stored by its id, if it is still there and not stopped.
                         let i = entry.server_id.and_then(|id| (0..be.servers.len()).find(|&i| be.server_puid(i) == id));
                         let up = |i: usize| be.server_statuses.get(i).is_none_or(|s| !matches!(ServerStatus::from(s.load(Ordering::Relaxed)), ServerStatus::Down | ServerStatus::Maint));
-                        if let Some(i) = i.filter(|&i| up(i)) {
+                        if let Some(i) = i.filter(|&i| be.ids.persist || up(i)) {
                             found = Some(i);
                             assigned = true;
                         }
@@ -5715,6 +5738,8 @@ impl EngineDispatcher<'_> {
                     txn.close_after = true;
                     txn.aborted = true;
                     entry.sess.log.term = Some(*b"SD");
+                    // A response cut short is one failed request (`http_fail_cnt`).
+                    for_tracked(proxies, &entry.sess, |data| data.count_fail());
                 }
             }
         }
@@ -5836,7 +5861,7 @@ impl EngineDispatcher<'_> {
         entry.sess.reset_for_next_request();
         // The wait for the next request starts with the response's end
         // (`timeout http-keep-alive`).
-        entry.sess.arm_request(fresh_tick(now));
+        entry.sess.arm_request(now);
         // A next request already in the buffer has no socket event left to announce it:
         // run once more straight away. (Without one, the poller wakes the session.)
         if !entry.sess.req.is_empty() {
@@ -5851,7 +5876,7 @@ impl EngineDispatcher<'_> {
             entry.sess.tcp_inspect_done = false;
             entry.sess.inspect_exp = proxy
                 .tcp_req_inspect_delay
-                .map(|d| fresh_tick(now).add(u32::try_from(d.as_millis()).unwrap_or(u32::MAX)));
+                .map(|d| now.add(u32::try_from(d.as_millis()).unwrap_or(u32::MAX)));
         }
     }
 
@@ -5907,6 +5932,13 @@ impl EngineDispatcher<'_> {
             if !entry.sess.is_done() {
                 let _ = entry.sess.process(now);
             }
+            // The glitches the HTTP/2 connection counted since the last pass go to the entries
+            // its stream counters track (`glitch_cnt`, `glitch_rate`).
+            if let Some(n) = entry.sess.h2_ctx.as_ref().map(|h| h.glitch_count as u64).filter(|&n| n > entry.sess.glitches_credited) {
+                let due = n - entry.sess.glitches_credited;
+                entry.sess.glitches_credited = n;
+                for_tracked(self.proxies, &entry.sess, |data| data.add_glitches(due));
+            }
             // A TCP stream stores what its `stick` rules took once the server has accepted
             // the connection (`AN_RES_STORE_RULES` runs on the first event of the response
             // side); a server that refused stores nothing.
@@ -5954,6 +5986,9 @@ impl EngineDispatcher<'_> {
                     ContentEvalResult::Done => {
                         entry.sess.tcp_inspect_done = true;
                         entry.sess.inspect_exp = None;
+                        // `switch-mode http` made the first request's head a thing to wait
+                        // for: `timeout http-request` starts now, not at the next event.
+                        entry.sess.arm_request(now);
                     }
                     ContentEvalResult::Reject => {
                         raw::abort_with_rst(entry.sess.cli.as_fd());
@@ -6419,11 +6454,11 @@ impl EngineDispatcher<'_> {
             // `tcp-response inspect-delay` runs from the first pass over the head; with none,
             // the rules cannot wait (`tcp_inspect_response`).
             let inspect_exp = inspect_wait.map(|w| w.deadline).or_else(|| {
-                proxies[be_idx].tcp_res_inspect_delay.map(|d| fresh_tick(now).add(u32::try_from(d.as_millis()).unwrap_or(u32::MAX)))
+                proxies[be_idx].tcp_res_inspect_delay.map(|d| now.add(u32::try_from(d.as_millis()).unwrap_or(u32::MAX)))
             });
             // A server that closed after its response does not end the wait: measured, the
             // response still waits for the whole delay.
-            let inspect_final = rep_full || srv_timed_out || inspect_exp.is_none_or(|exp| exp.is_expired(fresh_tick(now)));
+            let inspect_final = rep_full || srv_timed_out || inspect_exp.is_none_or(|exp| exp.is_expired(now));
             for rule in proxies[be_idx].tcp_res_content_rules.iter().filter(|_| resume.is_none()) {
                 let matches = match &rule.cond {
                     None => true,
@@ -6489,7 +6524,6 @@ impl EngineDispatcher<'_> {
                 let rules = proxies[px].http_res_rules.iter().map(|r| (ResOp::of_res(&r.action), r.cond.as_ref(), r.line));
                 let caps = (!fe_res_slots.is_empty()).then_some((&mut res_caps, &fe_res_slots[..]));
                 let mut check = |rule: usize, time_ms: u32, at_least: u32| -> BodyWait {
-                    let now = fresh_tick(now);
                     let here = resume.filter(|w| w.list == list && w.rule == rule);
                     let deadline = here.map_or_else(
                         || if time_ms > 0 { now.add(time_ms) } else { Tick::ETERNITY },
@@ -7163,7 +7197,6 @@ impl EngineDispatcher<'_> {
                     ibex_config::HttpReqAction::Tarpit { deny_status, content_type, lf_string, error_page } => {
                         // The request is held until `timeout tarpit` (`timeout connect` when
                         // unset) has passed, then answered like a `deny` with status 500.
-                        let now = fresh_tick(now);
                         let held = sess.txn.as_ref().and_then(|t| t.body_wait).filter(|w| w.tarpit && w.backend == be_stage && w.rule == rule_idx);
                         let deadline = held.map_or_else(
                             || {
@@ -7611,7 +7644,7 @@ impl EngineDispatcher<'_> {
         if (!resume_be || inspect_wait.is_some()) && !proxies[be_idx].tcp_req_content_rules.is_empty() {
             // The backend's own `inspect-delay`, from the first pass over its rules.
             let deadline = inspect_wait.map(|w| w.deadline).or_else(|| {
-                proxies[be_idx].tcp_req_inspect_delay.map(|d| fresh_tick(now).add(u32::try_from(d.as_millis()).unwrap_or(u32::MAX)))
+                proxies[be_idx].tcp_req_inspect_delay.map(|d| now.add(u32::try_from(d.as_millis()).unwrap_or(u32::MAX)))
             });
             entry.sess.inspect_exp = deadline;
             let res = eval_tcp_req_content_rules(
@@ -7931,7 +7964,7 @@ impl EngineDispatcher<'_> {
                 // (`stream_set_backend` clears the analyser's expiry).
                 entry.sess.inspect_exp = proxies[be_idx]
                     .tcp_req_inspect_delay
-                    .map(|d| fresh_tick(now).add(u32::try_from(d.as_millis()).unwrap_or(u32::MAX)));
+                    .map(|d| now.add(u32::try_from(d.as_millis()).unwrap_or(u32::MAX)));
             }
             let res = eval_tcp_req_content_rules(
                 &proxies[be_idx],
@@ -8673,9 +8706,18 @@ fn commit_stick_stores(stores: impl Iterator<Item = (usize, StickKey)>, proxies:
     }
 }
 
-/// `option http-server-close` in the frontend or the backend (`PR_O_HTTP_SCL`).
+/// Whether the server is asked to close after this request: `option http-server-close` in
+/// the frontend, or `http-server-close` or `httpclose` in the backend (measured on HAProxy:
+/// a frontend's `httpclose` alone leaves the server connection alone).
 fn server_close(proxies: &[Proxy], fe_idx: usize, be_idx: usize) -> bool {
-    proxies.get(fe_idx).is_some_and(|p| p.ids.server_close) || proxies.get(be_idx).is_some_and(|p| p.ids.server_close)
+    use ibex_config::ast::HttpMode;
+    proxies.get(fe_idx).is_some_and(|p| p.ids.http_mode == HttpMode::ServerClose)
+        || proxies.get(be_idx).is_some_and(|p| p.ids.http_mode != HttpMode::KeepAlive)
+}
+
+/// `option httpclose` in the frontend: the client connection closes after each response.
+fn client_close(proxies: &[Proxy], fe_idx: usize) -> bool {
+    proxies.get(fe_idx).is_some_and(|p| p.ids.http_mode == ibex_config::ast::HttpMode::Close)
 }
 
 /// Whether the request's `Connection` header asks to upgrade the connection.
@@ -8711,16 +8753,6 @@ fn add_req_header(sess: &mut TcpSession, name: &str, val: &str) {
     hdrs.push((name.to_string(), val.to_string()));
     sess.req_headers = Some(hdrs);
     rebuild_req_buffer(sess);
-}
-
-/// The time now. `step` takes its tick before it waits in the poller, so a stream woken by a
-/// request after an idle second would arm a `wait-for-body` of 300 ms from a second ago;
-/// `now`, the pass's tick, stands in where no step has run on this thread.
-fn fresh_tick(now: Tick) -> Tick {
-    TICK_EPOCH.with(Cell::get).map_or(now, |start| {
-        let ms = u32::try_from(start.elapsed().as_millis() & 0xFFFF_FFFF).unwrap_or(u32::MAX);
-        Tick(if ms == 0 { 1 } else { ms })
-    })
 }
 
 /// What a pass over a list of `http-request` rules came to.
@@ -8775,7 +8807,6 @@ fn wait_for_request_body(
         if let MsgState::Head { body, .. } = t.req { body } else { crate::txn::Framing::None }
     });
     let held = sess.txn.as_ref().and_then(|t| t.body_wait).filter(|w| w.backend == backend && w.rule == rule);
-    let now = fresh_tick(now);
     let deadline = match held {
         Some(w) => w.deadline,
         None => {
@@ -9004,6 +9035,7 @@ fn manage_client_cookies(sess: &mut TcpSession, be: &Proxy) -> Option<usize> {
     let servers: Vec<crate::cookie::SrvCookie<'_>> = (0..be.servers.len())
         .map(|i| crate::cookie::SrvCookie {
             value: be.server_cookies.get(i).and_then(Option::as_deref).map(str::as_bytes),
+            persistent: be.ids.persist,
             usable: be
                 .server_statuses
                 .get(i)

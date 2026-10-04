@@ -532,6 +532,67 @@ impl StickTable {
         entry
     }
 
+    /// The data types this table stores, with `d`'s values, in the order `show table`
+    /// prints them (`stktable_data_types`): the name, the period of a rate in ms, and the
+    /// value. The arrays come after `http_fail_rate`, `glitch_*` last.
+    #[must_use]
+    pub fn data_fields(&self, d: &StickEntryData) -> Vec<(String, Option<u64>, u64)> {
+        let (f, x, c) = (&self.config.flags, &self.config.extra, &self.config);
+        let rate = |r: &Option<SlidingRate>| r.as_ref().map_or(0, SlidingRate::rate);
+        // Each is a counter (stored when its flag is set) or a rate (when it has a period).
+        let scalar = x.gpc_n == 0;
+        let types: [(&str, bool, Option<u64>, u64); 22] = [
+            // A table a `stick` rule fills keeps the server whether or not `store` says so.
+            ("server_id", f.server_id || d.server_id.is_some(), None, u64::from(d.server_id.unwrap_or(0))),
+            ("gpt0", f.gpt0 && x.gpt_n == 0, None, u64::from(d.gpt0)),
+            ("gpc0", f.gpc0 && scalar, None, d.gpc0),
+            ("gpc0_rate", false, x.gpc0_rate_ms, rate(&d.gpc0_rate)),
+            ("conn_cnt", f.conn_cnt, None, d.conn_cnt),
+            ("conn_rate", false, c.track_conn_rate_ms, rate(&d.conn_rate)),
+            ("conn_cur", f.conn_cur, None, u64::from(d.conn_cur)),
+            ("sess_cnt", f.sess_cnt, None, d.sess_cnt),
+            ("sess_rate", false, x.sess_rate_ms, rate(&d.sess_rate)),
+            ("http_req_cnt", f.http_req_cnt, None, d.http_req_cnt),
+            ("http_req_rate", false, c.track_http_req_rate_ms, rate(&d.http_req_rate)),
+            ("http_err_cnt", f.http_err_cnt, None, d.http_err_cnt),
+            ("http_err_rate", false, c.track_http_err_rate_ms, rate(&d.http_err_rate)),
+            ("bytes_in_cnt", f.bytes_in_cnt, None, d.bytes_in_cnt),
+            ("bytes_in_rate", false, x.bytes_in_rate_ms, rate(&d.bytes_in_rate)),
+            ("bytes_out_cnt", f.bytes_out_cnt, None, d.bytes_out_cnt),
+            ("bytes_out_rate", false, x.bytes_out_rate_ms, rate(&d.bytes_out_rate)),
+            ("gpc1", f.gpc1 && scalar, None, d.gpc1),
+            ("gpc1_rate", false, x.gpc1_rate_ms, rate(&d.gpc1_rate)),
+            // The value is the server's name, which only the proxy knows: `show table` fills it in.
+            ("server_key", d.server_id.is_some(), None, 0),
+            ("http_fail_cnt", f.http_fail_cnt, None, d.http_fail_cnt),
+            ("http_fail_rate", false, x.http_fail_rate_ms, rate(&d.http_fail_rate)),
+        ];
+        let mut out: Vec<(String, Option<u64>, u64)> = Vec::new();
+        for (name, counter, period, v) in types {
+            if counter {
+                out.push((name.to_string(), None, v));
+            } else if let Some(p) = period {
+                out.push((name.to_string(), Some(p), v));
+            }
+        }
+        for i in 0..x.gpt_n {
+            out.push((format!("gpt{i}"), None, u64::from(d.gpt.get(i).copied().unwrap_or(0))));
+        }
+        for i in 0..x.gpc_n {
+            out.push((format!("gpc{i}"), None, d.gpc.get(i).copied().unwrap_or(0)));
+        }
+        for i in 0..x.gpc_rate_n {
+            out.push((format!("gpc{i}_rate"), Some(x.gpc_rate_ms), d.gpc_rate.get(i).map_or(0, SlidingRate::rate)));
+        }
+        if f.glitch_cnt {
+            out.push(("glitch_cnt".to_string(), None, d.glitch_cnt));
+        }
+        if let Some(p) = x.glitch_rate_ms {
+            out.push(("glitch_rate".to_string(), Some(p), rate(&d.glitch_rate)));
+        }
+        out
+    }
+
     /// Table configuration.
     #[must_use]
     pub fn config(&self) -> &StickTableConfig {

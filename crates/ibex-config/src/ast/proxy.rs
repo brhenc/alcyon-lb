@@ -6,6 +6,19 @@
 use super::*;
 
 /// Defaults section configuration.
+/// The connection mode `option http-keep-alive`, `http-server-close` and `httpclose` choose
+/// (`PR_O_HTTP_MODE`); the last one in a section wins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HttpMode {
+    #[default]
+    KeepAlive,
+    /// Each request on its own server connection, asked to close; the client connection stays.
+    ServerClose,
+    /// As `ServerClose` on the server side, and the client connection closes after each
+    /// response when the frontend has it.
+    Close,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DefaultsSection {
     /// Operating mode (tcp, http).
@@ -44,9 +57,10 @@ pub struct DefaultsSection {
     /// `option http-buffer-request`: wait for the request body before the rules run (as
     /// an implicit `http-request wait-for-body` ahead of them).
     pub buffer_request: bool,
-    /// `option http-server-close`: each request goes on its own server connection, which
-    /// is asked to close; the client connection stays.
-    pub server_close: bool,
+    /// The last of `option http-keep-alive`, `http-server-close` and `httpclose`.
+    pub http_mode: HttpMode,
+    /// `option persist`: a server a cookie or stick table names is used even when it is down.
+    pub persist: bool,
     /// `option dontlognull`: no log line for a connection that carried nothing.
     pub dontlognull: bool,
     /// `option forwardfor` in `defaults`: the `except` network, empty for none.
@@ -224,9 +238,10 @@ pub struct ListenSection {
     /// `option http-buffer-request`: wait for the request body before the rules run (as
     /// an implicit `http-request wait-for-body` ahead of them).
     pub buffer_request: bool,
-    /// `option http-server-close`: each request goes on its own server connection, which
-    /// is asked to close; the client connection stays.
-    pub server_close: bool,
+    /// The last of `option http-keep-alive`, `http-server-close` and `httpclose`.
+    pub http_mode: HttpMode,
+    /// `option persist`: a server a cookie or stick table names is used even when it is down.
+    pub persist: bool,
     /// `option dontlognull`: no log line for a connection that carried nothing.
     pub dontlognull: bool,
     /// Client header regex rewrite rules (up to 10).
@@ -372,7 +387,8 @@ impl Default for ListenSection {
             res_header_captures: Vec::new(),
             log_health_checks: false,
             buffer_request: false,
-            server_close: false,
+            http_mode: HttpMode::KeepAlive,
+            persist: false,
             dontlognull: false,
             cliexp: Vec::new(),
             srvexp: Vec::new(),
@@ -472,9 +488,8 @@ pub struct FrontendSection {
     /// `option http-buffer-request`: wait for the request body before the rules run (as
     /// an implicit `http-request wait-for-body` ahead of them).
     pub buffer_request: bool,
-    /// `option http-server-close`: each request goes on its own server connection, which
-    /// is asked to close; the client connection stays.
-    pub server_close: bool,
+    /// The last of `option http-keep-alive`, `http-server-close` and `httpclose`.
+    pub http_mode: HttpMode,
     /// `option dontlognull`: no log line for a connection that carried nothing.
     pub dontlognull: bool,
     /// Stick table configuration.
@@ -542,7 +557,7 @@ impl Default for FrontendSection {
             res_header_captures: Vec::new(),
             log_health_checks: false,
             buffer_request: false,
-            server_close: false,
+            http_mode: HttpMode::KeepAlive,
             dontlognull: false,
             stick_table: None,
             stick_rules: Vec::new(),
@@ -587,9 +602,10 @@ pub struct BackendSection {
     /// `option http-buffer-request`: wait for the request body before the rules run (as
     /// an implicit `http-request wait-for-body` ahead of them).
     pub buffer_request: bool,
-    /// `option http-server-close`: each request goes on its own server connection, which
-    /// is asked to close; the client connection stays.
-    pub server_close: bool,
+    /// The last of `option http-keep-alive`, `http-server-close` and `httpclose`.
+    pub http_mode: HttpMode,
+    /// `option persist`: a server a cookie or stick table names is used even when it is down.
+    pub persist: bool,
     /// Operating mode (tcp, http, health).
     pub mode: Mode,
     /// Whether this backend is disabled.
@@ -694,7 +710,8 @@ impl Default for BackendSection {
             unique_id_header: None,
             log_health_checks: false,
             buffer_request: false,
-            server_close: false,
+            http_mode: HttpMode::KeepAlive,
+            persist: false,
             mode: Mode::Tcp,
             disabled: false,
             id: None,

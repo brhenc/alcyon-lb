@@ -178,6 +178,12 @@ impl StickEntryData {
         self.trackers += 1;
     }
 
+    /// `n` glitches of the connection (`glitch_cnt`, `glitch_rate`).
+    pub fn add_glitches(&mut self, n: u64) {
+        self.glitch_cnt += n;
+        tick(&mut self.glitch_rate, n);
+    }
+
     /// A stream stops tracking the entry.
     pub fn untrack(&mut self) {
         self.conn_cur = self.conn_cur.saturating_sub(1);

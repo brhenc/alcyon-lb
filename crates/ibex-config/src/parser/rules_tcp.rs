@@ -160,13 +160,8 @@ pub(crate) fn parse_tcp_req_session(
     } else if let Some(sc) = parse_sc_counter_action(act_str, "sc-set-gpt0", act_tok)? {
         let (cond_idx, cond) = parse_rule_condition(tokens, 4)?;
         let expr = join_tokens_until(tokens, 3, cond_idx);
-        if expr.is_empty() {
-            return Err(ConfigError::new(
-                act_tok.line,
-                act_tok.col,
-                "<tcp-request session sc-set-gpt0> expects value or expression",
-            ));
-        }
+        // No value is 0, as `HAProxy` reads it (`strtol` stops at the end of the line).
+        let expr = if expr.is_empty() { "0".to_string() } else { expr };
         rules.push(TcpReqSessionRule { action: TcpReqSessionAction::ScSetGpt0 { sc, expr }, cond });
     } else if let Some((idx, sc)) = parse_gpc_array_action(act_str, "sc-inc-gpc", act_tok)? {
         let (_, cond) = parse_rule_condition(tokens, 3)?;
@@ -436,13 +431,8 @@ fn parse_tcp_req_content_at(
     } else if let Some(sc) = parse_sc_counter_action(act_str, "sc-set-gpt0", act_tok)? {
         let (cond_idx, cond) = parse_rule_condition(tokens, 4)?;
         let expr = join_tokens_until(tokens, 3, cond_idx);
-        if expr.is_empty() {
-            return Err(ConfigError::new(
-                act_tok.line,
-                act_tok.col,
-                "<tcp-request content sc-set-gpt0> expects value or expression",
-            ));
-        }
+        // No value is 0, as `HAProxy` reads it (`strtol` stops at the end of the line).
+        let expr = if expr.is_empty() { "0".to_string() } else { expr };
         rules.push(TcpReqContentRule { action: TcpReqContentAction::ScSetGpt0 { sc, expr }, cond, line: 0 });
     } else if let Some((idx, sc)) = parse_gpc_array_action(act_str, "sc-inc-gpc", act_tok)? {
         let (_, cond) = parse_rule_condition(tokens, 3)?;

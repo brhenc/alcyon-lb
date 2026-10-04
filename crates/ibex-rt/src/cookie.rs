@@ -50,6 +50,8 @@ impl CookieTxn {
 pub struct SrvCookie<'a> {
     pub value: Option<&'a [u8]>,
     pub usable: bool,
+    /// `option persist`: a server that is down is still chosen (`TX_CK_DOWN`).
+    pub persistent: bool,
 }
 
 /// What to do with one `Cookie` header after its value went through [`client_side`].
@@ -308,10 +310,10 @@ fn client_value(cfg: &CookieConfig, now: i64, servers: &[SrvCookie<'_>], h: &mut
                 let wanted = &h[val_beg..delim];
                 for (i, s) in servers.iter().enumerate() {
                     if s.value == Some(wanted) {
-                        if s.usable {
+                        if s.usable || s.persistent {
                             *srv = Some(i);
                             st.direct = true;
-                            st.ck = 3;
+                            st.ck = if s.usable { 3 } else { 2 };
                             found = true;
                             break;
                         }
@@ -650,9 +652,9 @@ mod tests {
     }
 
     const SRVS: [SrvCookie<'static>; 3] = [
-        SrvCookie { value: Some(b"a"), usable: true },
-        SrvCookie { value: Some(b"b"), usable: true },
-        SrvCookie { value: None, usable: true },
+        SrvCookie { value: Some(b"a"), usable: true, persistent: false },
+        SrvCookie { value: Some(b"b"), usable: true, persistent: false },
+        SrvCookie { value: None, usable: true, persistent: false },
     ];
 
     fn client(opts: &str, now: i64, hdrs: &[&str]) -> (Option<usize>, CookieTxn, Vec<String>) {
@@ -699,7 +701,7 @@ mod tests {
         // A server that is not usable is passed over for the next one with the value.
         let mut down = SRVS;
         down[0].usable = false;
-        let dup = [down[0], SrvCookie { value: Some(b"a"), usable: true }];
+        let dup = [down[0], SrvCookie { value: Some(b"a"), usable: true, persistent: false }];
         let (srv, _, _) = client_side(&cfg("insert"), 0, &dup, &[b"SRV=a".to_vec()]);
         assert_eq!(srv, Some(1));
         let (srv, _, _) = client_side(&cfg("insert"), 0, &dup[..1], &[b"SRV=a".to_vec()]);

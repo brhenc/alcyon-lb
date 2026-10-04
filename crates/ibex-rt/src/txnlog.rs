@@ -63,6 +63,8 @@ pub struct StreamLog {
     /// The status of a reply sent with no transaction to carry it: the 408 for a request
     /// that never arrived, the 400 for one the client abandoned.
     pub status: Option<u16>,
+    /// A retry was balanced anew (`SF_REDISP`): `%rc` is written with a `+` in front.
+    pub redispatched: bool,
 }
 
 impl StreamLog {
@@ -91,6 +93,7 @@ impl StreamLog {
             uniq_id: STREAM_COUNTER.fetch_add(1, Ordering::Relaxed),
             term: None,
             status: None,
+            redispatched: false,
         }
     }
 

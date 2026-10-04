@@ -5160,6 +5160,25 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
+/// The ISO 8601 week of a day: its year and number (`%G`, `%V`). `yday` counts from 0 in
+/// year `y`, `wday` from Sunday = 0.
+fn iso_week(y: i64, yday: i64, wday: i64) -> (i64, i64) {
+    let iso_wday = if wday == 0 { 7 } else { wday };
+    let week = (yday + 1 - iso_wday + 10) / 7;
+    let weeks_in = |year: i64| {
+        let jan1 = (days_from_civil(year, 1, 1) + 4).rem_euclid(7);
+        let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+        if jan1 == 4 || (leap && jan1 == 3) { 53 } else { 52 }
+    };
+    if week < 1 {
+        (y - 1, weeks_in(y - 1))
+    } else if week > weeks_in(y) {
+        (y + 1, 1)
+    } else {
+        (y, week)
+    }
+}
+
 /// `epoch` seconds and `nanos` nanoseconds; `%N` prints the nanoseconds on 9 digits and
 /// `%<n>N` the first `n` of them, as the date converters in `HAProxy` do.
 fn format_time_ns(epoch: i64, nanos: u32, format: &str, local: bool) -> String {
@@ -5194,6 +5213,11 @@ fn format_time_ns(epoch: i64, nanos: u32, format: &str, local: bool) -> String {
     let hour = secs / 3600;
     let min = (secs % 3600) / 60;
     let sec = secs % 60;
+    // Sunday is 0 (`%w`); the week counts of `%U`, `%W`, and the ISO ones of `%V %G %g`.
+    let wday = (days + 4).rem_euclid(7);
+    let yday = days - days_from_civil(y, 1, 1);
+    let (iso_year, iso_week) = iso_week(y, yday, wday);
+    let hour12 = if hour % 12 == 0 { 12 } else { hour % 12 };
 
     let mut out = String::new();
     let mut chars = format.chars().peekable();
@@ -5215,7 +5239,28 @@ fn format_time_ns(epoch: i64, nanos: u32, format: &str, local: bool) -> String {
                     'B' => out.push_str(MONTHS_FULL[month_idx]),
                     'a' => out.push_str(DAYS[wday_idx]),
                     'A' => out.push_str(DAYS_FULL[wday_idx]),
-                    'T' => { let _ = write!(out, "{hour:02}:{min:02}:{sec:02}"); }
+                    'T' | 'X' => { let _ = write!(out, "{hour:02}:{min:02}:{sec:02}"); }
+                    'R' => { let _ = write!(out, "{hour:02}:{min:02}"); }
+                    'D' | 'x' => { let _ = write!(out, "{m:02}/{d:02}/{:02}", y % 100); }
+                    'C' => { let _ = write!(out, "{:02}", y.div_euclid(100)); }
+                    'e' => { let _ = write!(out, "{d:2}"); }
+                    'j' => { let _ = write!(out, "{:03}", yday + 1); }
+                    'k' => { let _ = write!(out, "{hour:2}"); }
+                    'l' => { let _ = write!(out, "{hour12:2}"); }
+                    'I' => { let _ = write!(out, "{hour12:02}"); }
+                    'p' => out.push_str(if hour < 12 { "AM" } else { "PM" }),
+                    'P' => out.push_str(if hour < 12 { "am" } else { "pm" }),
+                    'r' => { let _ = write!(out, "{hour12:02}:{min:02}:{sec:02} {}", if hour < 12 { "AM" } else { "PM" }); }
+                    'c' => { let _ = write!(out, "{} {} {d:2} {hour:02}:{min:02}:{sec:02} {y:04}", DAYS[wday_idx], MONTHS[month_idx]); }
+                    'u' => { let _ = write!(out, "{}", if wday == 0 { 7 } else { wday }); }
+                    'w' => { let _ = write!(out, "{wday}"); }
+                    'U' => { let _ = write!(out, "{:02}", (yday + 7 - wday) / 7); }
+                    'W' => { let _ = write!(out, "{:02}", (yday + 7 - (wday + 6) % 7) / 7); }
+                    'V' => { let _ = write!(out, "{iso_week:02}"); }
+                    'G' => { let _ = write!(out, "{iso_year:04}"); }
+                    'g' => { let _ = write!(out, "{:02}", iso_year.rem_euclid(100)); }
+                    'n' => out.push('\n'),
+                    't' => out.push('\t'),
                     'F' => { let _ = write!(out, "{y:04}-{m:02}-{d:02}"); }
                     's' => out.push_str(&epoch.to_string()),
                     'N' => { let _ = write!(out, "{nanos:09}"); }
@@ -6124,6 +6169,20 @@ mod oracle_tests {
             "allowlist entries no longer registered -- remove them\n  fetches: \
              {stale_f:?}\n  converters: {stale_c:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod iso_week_tests {
+    use super::format_time_ns;
+
+    /// ISO weeks at the turn of a year (`%G-%V`): 2021-01-01 is in 2020's week 53, 2024-12-30
+    /// in 2025's week 1, 2026-01-01 in 2026's week 1.
+    #[test]
+    fn the_iso_year_and_week_cross_the_new_year() {
+        for (epoch, want) in [(1_609_459_200, "2020-53"), (1_735_516_800, "2025-01"), (1_767_225_600, "2026-01")] {
+            assert_eq!(format_time_ns(epoch, 0, "%G-%V", false), want, "{epoch}");
+        }
     }
 }
 

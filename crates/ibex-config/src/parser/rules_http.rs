@@ -253,13 +253,8 @@ fn parse_http_req_rule_at(
     } else if let Some(sc) = parse_sc_counter_action(act_str, "sc-set-gpt0", act_token)? {
         let (cond_idx, cond) = parse_rule_condition(tokens, 3)?;
         let expr = join_tokens_until(tokens, 2, cond_idx);
-        if expr.is_empty() {
-            return Err(ConfigError::new(
-                act_token.line,
-                act_token.col,
-                "<http-request sc-set-gpt0> expects value or expression",
-            ));
-        }
+        // No value is 0, as `HAProxy` reads it (`strtol` stops at the end of the line).
+        let expr = if expr.is_empty() { "0".to_string() } else { expr };
         rules.push(HttpReqRule { action: HttpReqAction::ScSetGpt0 { sc, expr }, cond, line: 0 });
     } else if let Some((idx, sc)) = parse_gpc_array_action(act_str, "sc-inc-gpc", act_token)? {
         let (_, cond) = parse_rule_condition(tokens, 2)?;
