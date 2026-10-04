@@ -48,14 +48,13 @@ pub fn get_proc_var(name: &str) -> Option<String> {
 /// sample. `ifgt` and `iflt` are refused when the configuration loads.
 #[must_use]
 pub fn var_conds_hold(spec: &str, exists: bool, is_set: bool, empty: bool) -> bool {
-    spec.split(',').skip(1).all(|c| match c {
-        "ifexists" => exists,
-        "ifnotexists" => !exists,
-        "ifset" => is_set,
-        "ifnotset" => !is_set,
-        "ifempty" => empty,
-        "ifnotempty" => !empty,
-        _ => true,
+    spec.split(',').skip(1).all(|c| {
+        (c != "ifexists" || exists)
+            && (c != "ifnotexists" || !exists)
+            && (c != "ifset" || is_set)
+            && (c != "ifnotset" || !is_set)
+            && (c != "ifempty" || empty)
+            && (c != "ifnotempty" || !empty)
     })
 }
 

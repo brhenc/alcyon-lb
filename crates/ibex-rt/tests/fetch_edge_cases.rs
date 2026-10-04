@@ -438,3 +438,34 @@ backend be
         "{r}"
     );
 }
+
+/// The set-var converter's `ifempty` on an empty binary and on an empty string (HAProxy
+/// 3.5-dev8, same configuration).
+#[test]
+fn set_var_converter_ifempty_on_empty_binary_and_string() {
+    let be = backend();
+    let fe = common::reserve_addr();
+    let _ibex = start(
+        &format!(
+            r####"defaults
+  mode http
+  timeout connect 2s
+  timeout client 5s
+  timeout server 5s
+frontend fe
+  bind {fe}
+  http-request set-header x-t1 "%[str(),b64dec,set-var(txn.f,ifempty)]"
+  http-request set-header x-t2 "%[str(AAEC),b64dec,set-var(txn.g,ifempty)]"
+  http-request set-header x-t3 "%[str(abc),set-var(txn.h,ifempty)]"
+  http-request set-header x-t4 "%[str(),set-var(txn.i,ifempty)]"
+  http-response set-header x-z "f=[%[var(txn.f),length]] g=[%[var(txn.g),length]] h=[%[var(txn.h)]] i=[%[var(txn.i),length]]"
+  default_backend be
+backend be
+  server s {be}
+"####
+        ),
+        fe,
+    );
+    let r = get(fe, "");
+    assert_eq!(header(&r, "x-z").as_deref(), Some("f=[0] g=[] h=[] i=[0]"), "{r}");
+}
