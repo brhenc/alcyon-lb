@@ -673,16 +673,20 @@ impl RateCtr {
 
     /// Milliseconds since the first call; never 0, which marks a counter nothing was counted in.
     fn now() -> u32 {
-        static EPOCH: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
         // Wraps after 49 days, as `HAProxy`'s ticks do; every comparison is a wrapping difference.
-        (EPOCH.elapsed().as_millis() as u32).wrapping_add(1).max(1)
+        Self::at(crate::statcnt::now_ms())
+    }
+
+    /// The tick for a [`crate::statcnt::now_ms`] reading, so one clock read serves a whole stream's accounting.
+    pub fn at(now_ms: u64) -> u32 {
+        (now_ms as u32).max(1)
     }
 
     pub fn tick(&self) {
         self.tick_at(Self::now());
     }
 
-    fn tick_at(&self, now: u32) {
+    pub fn tick_at(&self, now: u32) {
         let head = self.head.load(Ordering::Relaxed);
         let (start, mut cur) = ((head >> 32) as u32, head as u32);
         let mut prev = self.prev.load(Ordering::Relaxed);
@@ -703,7 +707,7 @@ impl RateCtr {
         self.rate_at(Self::now())
     }
 
-    fn rate_at(&self, now: u32) -> u64 {
+    pub fn rate_at(&self, now: u32) -> u64 {
         let head = self.head.load(Ordering::Relaxed);
         let (start, cur) = ((head >> 32) as u32, u64::from(head as u32));
         if start == 0 {
@@ -1766,6 +1770,27 @@ fn stream_log_data<'a>(entry: &'a SessionEntry, proxies: &'a [Proxy], proxy_idx:
     }
 }
 
+fn stream_status(s: &TcpSession) -> i64 {
+    s.txn.as_ref().map(|t| t.status).or(s.log.status).map_or(-1, i64::from)
+}
+
+/// The HTX messages `HAProxy` parsed, where they were measured; the bytes that crossed
+/// the wire otherwise (an HTTP/2 client's request, a response the server did not make).
+fn stream_bytes_out(s: &TcpSession) -> u64 {
+    let l = &s.log;
+    s.txn.as_ref().and_then(|t| t.rsp_htx).filter(|_| l.bytes_from_server > 0).unwrap_or(l.bytes_from_server)
+}
+
+/// A request that never parsed counts nothing (`HAProxy`: `U=0` with `<BADREQ>`).
+fn stream_bytes_in(s: &TcpSession) -> u64 {
+    let l = &s.log;
+    if s.mode == Mode::Http && l.request.is_none() {
+        0
+    } else {
+        s.txn.as_ref().and_then(|t| t.req_htx).unwrap_or_else(|| s.bytes_in.saturating_sub(l.bytes_in_at_start))
+    }
+}
+
 /// What the session alone knows, before (or without) a server: what `unique-id-format`
 /// reads when a TCP stream's PROXY header is built at connect.
 fn session_log_data<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, pid: u32) -> crate::logfmt::LogData<'a> {
@@ -1789,16 +1814,9 @@ fn session_log_data<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, pid: u3
         t_connect: l.ms(l.connect),
         t_data: l.ms(l.data),
         t_close: l.ms(Some(std::time::Instant::now())),
-        status: s.txn.as_ref().map(|t| t.status).or(l.status).map_or(-1, i64::from),
-        // The HTX messages `HAProxy` parsed, where they were measured; the bytes that crossed
-        // the wire otherwise (an HTTP/2 client's request, a response the server did not make).
-        bytes_out: s.txn.as_ref().and_then(|t| t.rsp_htx).filter(|_| l.bytes_from_server > 0).unwrap_or(l.bytes_from_server),
-        // A request that never parsed counts nothing (`HAProxy`: `U=0` with `<BADREQ>`).
-        bytes_in: if s.mode == Mode::Http && l.request.is_none() {
-            0
-        } else {
-            s.txn.as_ref().and_then(|t| t.req_htx).unwrap_or_else(|| s.bytes_in.saturating_sub(l.bytes_in_at_start))
-        },
+        status: stream_status(s),
+        bytes_out: stream_bytes_out(s),
+        bytes_in: stream_bytes_in(s),
         // `%tsc`'s cookie characters: only a backend with a cookie mode shows them.
         cookie_state: match (&be.cookie, s.txn.as_ref()) {
             (Some(c), Some(t)) if c.rewrite || c.indirect || c.insert || c.prefix => t.ck.log_chars(),
@@ -1830,17 +1848,21 @@ fn account_stream(entry: &mut SessionEntry, proxies: &[Proxy]) {
     }
     entry.stats_done = true;
     let http = entry.sess.mode == Mode::Http;
-    let d = stream_log_data(entry, proxies, entry.proxy_idx, 0);
-    let term = d.term_state;
-    let routed = !http || (entry.sess.log.request.is_some() && !matches!(&term, b"PR" | b"LR"));
-    let status = d.status;
-    let (bin, bout) = (d.bytes_in, d.bytes_out);
-    let t_request = d.t_request.max(0);
-    let tw = if d.t_queue >= 0 { d.t_queue - t_request } else { -1 };
-    let tc = if d.t_connect >= 0 { d.t_connect - d.t_queue } else { -1 };
-    let tr = if d.t_data >= 0 { d.t_data - d.t_connect } else { -1 };
-    let ta = d.t_close;
-    let retries = u64::try_from(d.retries.max(0)).unwrap_or(0);
+    // Only what the counters need of the log line's data: the whole `LogData` costs a
+    // measurable share of a request (T172).
+    let s = &entry.sess;
+    let l = &s.log;
+    let term = term_state(entry);
+    let routed = !http || (l.request.is_some() && !matches!(&term, b"PR" | b"LR"));
+    let status = stream_status(s);
+    let (bin, bout) = (stream_bytes_in(s), stream_bytes_out(s));
+    let (t_queue, t_connect, t_data) = (l.ms(l.queue), l.ms(l.connect), l.ms(l.data));
+    let t_request = l.ms(l.request).max(0);
+    let tw = if t_queue >= 0 { t_queue - t_request } else { -1 };
+    let tc = if t_connect >= 0 { t_connect - t_queue } else { -1 };
+    let tr = if t_data >= 0 { t_data - t_connect } else { -1 };
+    let ta = l.ms(Some(std::time::Instant::now()));
+    let retries = u64::from(s.max_retries.saturating_sub(s.conn_retries));
     let answered = entry.sess.log.data.is_some();
     let srv_idx = entry.target_server_idx.filter(|_| routed);
     let be_idx = entry.backend_idx;
@@ -1860,6 +1882,8 @@ fn account_stream(entry: &mut SessionEntry, proxies: &[Proxy]) {
     if !routed {
         return;
     }
+    let now_ms = crate::statcnt::now_ms();
+    let now = RateCtr::at(now_ms);
     let one = |c: &crate::statcnt::TxnCounters, server: bool| {
         c.stot.fetch_add(if server { 1 + retries } else { 1 }, Ordering::Relaxed);
         c.bin.fetch_add(bin, Ordering::Relaxed);
@@ -1879,9 +1903,16 @@ fn account_stream(entry: &mut SessionEntry, proxies: &[Proxy]) {
             [b'C', _] => (1, 0, 0),
             _ => (0, 0, 0),
         };
-        c.cli_abrt.fetch_add(abrt_cli, Ordering::Relaxed);
-        c.srv_abrt.fetch_add(abrt_srv, Ordering::Relaxed);
-        c.eresp.fetch_add(eresp, Ordering::Relaxed);
+        // Most streams end cleanly: skip the locked add of a zero.
+        if abrt_cli != 0 {
+            c.cli_abrt.fetch_add(abrt_cli, Ordering::Relaxed);
+        }
+        if abrt_srv != 0 {
+            c.srv_abrt.fetch_add(abrt_srv, Ordering::Relaxed);
+        }
+        if eresp != 0 {
+            c.eresp.fetch_add(eresp, Ordering::Relaxed);
+        }
         // `econ` is counted where the last connect fails (`server_connect_failed`), as
         // `HAProxy` counts it in `back_handle_st_cer`, whatever the termination code.
         // Timings count once the connection is made and the response head has come
@@ -1894,12 +1925,15 @@ fn account_stream(entry: &mut SessionEntry, proxies: &[Proxy]) {
             c.rtime.add(if http { ms(tr) } else { 0 }, counted);
             c.ttime.add(ms(ta), counted);
         }
-        c.touch();
+        c.last_sess.store(now_ms, Ordering::Relaxed);
         // A server's rate counts the connections tried, retries included.
         for _ in 0..(if server { 1 + retries } else { 1 }) {
-            c.sess_rate.tick();
+            c.sess_rate.tick_at(now);
         }
-        c.rate_max.fetch_max(u32::try_from(c.sess_rate.rate()).unwrap_or(u32::MAX), Ordering::Relaxed);
+        let rate = u32::try_from(c.sess_rate.rate_at(now)).unwrap_or(u32::MAX);
+        if rate > c.rate_max.load(Ordering::Relaxed) {
+            c.rate_max.fetch_max(rate, Ordering::Relaxed);
+        }
     };
     let be = &proxies[be_idx];
     let c = &be.txn_counters().be;

@@ -49,6 +49,8 @@ impl TimeStat {
 
 /// The counters of one frontend, one backend or one server.
 #[derive(Default, Debug)]
+// One cache line boundary per set, so a frontend's counters and a backend's do not share lines.
+#[repr(align(64))]
 pub struct TxnCounters {
     /// Responses by class: 1xx to 5xx, then anything else (`hrsp_*`).
     pub hrsp: [AtomicU64; 6],
