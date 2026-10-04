@@ -2322,7 +2322,15 @@ impl Engine {
     /// ([`crate::rule_exprs::validate_rule_exprs`]).
     #[allow(clippy::too_many_lines)]
     pub fn build_shared_state(config: &Config, nbthread: usize) -> io::Result<Vec<Proxy>> {
-    crate::globalconn::configure(config.global.as_ref().and_then(|g| g.maxconn));
+    {
+        // The listeners the file descriptor budget has to leave room for.
+        let stats_sockets = config.global.as_ref().map_or(0, |g| usize::from(g.stats_socket.is_some()) + g.extra_stats_sockets.len());
+        let listeners = stats_sockets
+            + config.listens.iter().map(|l| l.binds.len()).sum::<usize>()
+            + config.frontends.iter().map(|f| frontend_binds(f).len()).sum::<usize>();
+        let stats_socket = stats_sockets > 0;
+        crate::globalconn::configure(config.global.as_ref().and_then(|g| g.maxconn), listeners, stats_socket);
+    }
     // An action naming a fetch or converter the registry lacks would load and then do
     // nothing on every request; `HAProxy` refuses the configuration instead.
     crate::rule_exprs::validate_config(config)

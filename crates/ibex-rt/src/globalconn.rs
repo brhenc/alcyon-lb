@@ -17,10 +17,27 @@ static MAX: AtomicU32 = AtomicU32::new(0);
 /// What the configuration said (`global.hardmaxconn`): `set maxconn global` stays below it.
 static HARD: AtomicU32 = AtomicU32::new(0);
 
-/// Called once per engine built from `config`: a configuration without `maxconn` has no
-/// limit, one with it starts counting from zero.
-pub fn configure(maxconn: Option<u32>) {
-    let v = maxconn.unwrap_or(0);
+/// The `global.maxconn` `HAProxy` computes for a configuration without one
+/// (`compute_ideal_maxconn`): half of what is left of the file descriptors after its own
+/// -- 12, one per listener, and 10 for a `stats socket` -- measured on 3.5-dev8-885761-29
+/// (it raises the soft limit to the hard one first, and one descriptor is not counted).
+#[must_use]
+pub fn ideal_maxconn(nofile_hard: Option<u64>, listeners: usize, stats_socket: bool) -> u32 {
+    // Unlimited is what the kernel allows a process: `fs.nr_open`'s default.
+    let nofile = nofile_hard.unwrap_or(1_048_576);
+    let overhead = 12 + listeners as u64 + if stats_socket { 10 } else { 0 };
+    u32::try_from((nofile.saturating_sub(1).saturating_sub(overhead)) / 2).unwrap_or(u32::MAX).max(1)
+}
+
+/// Called once per engine built from `config`: the limit is the configured `maxconn`, or the
+/// one `HAProxy` computes from the file descriptor limit; counting starts from zero when it
+/// is configured.
+pub fn configure(maxconn: Option<u32>, listeners: usize, stats_socket: bool) {
+    let hard_nofile = {
+        let l = rustix::process::getrlimit(rustix::process::Resource::Nofile);
+        l.maximum
+    };
+    let v = maxconn.unwrap_or_else(|| ideal_maxconn(hard_nofile, listeners, stats_socket));
     MAX.store(v, Ordering::Relaxed);
     HARD.store(v, Ordering::Relaxed);
     if maxconn.is_some() {
