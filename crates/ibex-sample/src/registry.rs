@@ -4534,20 +4534,6 @@ pub struct CachedMapTable {
 }
 
 impl CachedMapTable {
-    #[must_use]
-    pub fn parse(content: &str) -> Self {
-        let pairs: Vec<(String, String)> = content
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty() && !l.starts_with('#'))
-            .map(|l| {
-                let parts: Vec<&str> = l.split_whitespace().collect();
-                (parts[0].to_string(), parts[1..].join(" "))
-            })
-            .collect();
-        Self::from_pairs(&pairs)
-    }
-
     /// The table of `(key, value)` entries, in order.
     #[must_use]
     pub fn from_pairs(pairs: &[(String, String)]) -> Self {

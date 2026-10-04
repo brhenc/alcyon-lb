@@ -737,16 +737,14 @@ fn main() {
     //     so there is no moment where this process is serving and the signal is fatal.
     ibex_rt::systemd::init();
     let lifecycle = ibex_rt::lifecycle::Lifecycle::new();
-    if let Err(e) = lifecycle.install_signal_handlers() {
+    // Under -W / -Ws, SIGTERM is a stop that exits 0, as HAProxy's master does.
+    let master_worker = opts.master_worker;
+    let installed = lifecycle
+        .install_signal_handlers()
+        .and_then(|()| if master_worker { lifecycle.install_term_handler() } else { Ok(()) });
+    if let Err(e) = installed {
         eprintln!("Failed to install signal handlers: {e}");
         process::exit(1);
-    }
-    // Under -W / -Ws, SIGTERM is a stop that exits 0, as HAProxy's master does.
-    if opts.master_worker {
-        if let Err(e) = lifecycle.install_term_handler() {
-            eprintln!("Failed to install signal handlers: {e}");
-            process::exit(1);
-        }
     }
 
     // 12. Initialize Ibex soft-realtime engine

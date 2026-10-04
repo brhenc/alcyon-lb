@@ -67,6 +67,22 @@ fn check_missing_file() {
 }
 
 #[test]
+fn check_unreadable_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().expect("tmp dir");
+    let path = dir.path().join("secret.cfg");
+    std::fs::write(&path, "global\n").expect("write");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0)).expect("chmod");
+    if std::fs::read(&path).is_ok() {
+        return; // running as root: nothing is unreadable
+    }
+    let out = ibex().arg("-c").arg("-f").arg(&path).output().expect("run");
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains(" : config : Cannot open configuration file/directory ") && err.contains("secret.cfg"), "{err}");
+}
+
+#[test]
 fn check_valid_is_still_zero() {
     let (rc, err) = check(&[("ok.cfg", "global\n  nbthread 1\n")]);
     assert_eq!((rc, err.as_str()), (0, ""));

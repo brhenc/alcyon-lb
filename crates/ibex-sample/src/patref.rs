@@ -80,23 +80,18 @@ fn next_entry_id() -> u64 {
     NEXT_ENTRY.fetch_add(0x40, Ordering::Relaxed)
 }
 
-/// The lines of a pattern or map file as `(key, value)` (`#` comments and blank lines
-/// skipped; the value is what follows the first blank, blanks inside kept as one space).
-fn parse_lines(content: &str, with_values: bool) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if with_values {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            out.push((parts[0].to_string(), parts[1..].join(" ")));
-        } else {
-            out.push((line.to_string(), String::new()));
-        }
-    }
-    out
+/// The lines of a map file as `(key, value)`: `#` comments and blank lines skipped, the
+/// value is what follows the first blank (blanks inside it kept as one space).
+fn parse_lines(content: &str) -> Vec<(String, String)> {
+    content
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| {
+            let parts: Vec<&str> = l.split_whitespace().collect();
+            (parts[0].to_string(), parts[1..].join(" "))
+        })
+        .collect()
 }
 
 impl PatRef {
@@ -270,7 +265,7 @@ pub fn map_file(path: &str, keys: MapKeys, user: Option<String>) -> Option<Arc<P
         r
     } else {
         let text = std::fs::read_to_string(path).ok()?;
-        let r = Arc::new(PatRef::new(refs.len(), RefKind::Map, path, parse_lines(&text, true)));
+        let r = Arc::new(PatRef::new(refs.len(), RefKind::Map, path, parse_lines(&text)));
         if let Ok(mut m) = r.map_keys.lock() {
             *m = keys;
         }
@@ -464,7 +459,7 @@ fn run(verb: &str, kind: RefKind, args: &[&str], payload: Option<&str>) -> Resul
                 }
             }
             if !hit {
-                return Err("entry not found.".to_string());
+                return Err(if args[1].starts_with('#') { "key or pattern not found." } else { "entry not found." }.to_string());
             }
             r.changed();
             Ok(String::new())
@@ -561,5 +556,96 @@ impl FileMatcher {
     #[must_use]
     pub fn may_match_later(&self, ends_with_newline: bool) -> bool {
         self.compiled.read().is_ok_and(|c| c.1.iter().any(|m| m.may_match_later(ends_with_newline)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sample::Sample;
+
+    fn tmp(name: &str, text: &str) -> String {
+        let p = std::env::temp_dir().join(format!("ibex-t171-{}-{name}", std::process::id()));
+        std::fs::write(&p, text).expect("write");
+        p.display().to_string()
+    }
+
+    #[test]
+    fn a_file_matcher_follows_the_commands() {
+        let path = tmp("a.acl", "/x\n");
+        let r = acl_file(&path).expect("file");
+        let m = Matcher::File(Arc::new(FileMatcher::new(Arc::clone(&r), "beg", false).expect("matcher")));
+        let s = |t: &str| Sample::Str(t.to_string());
+        assert!(m.matches(&s("/x1")) && !m.matches(&s("/z")));
+        assert_eq!(m.min_pattern_len(), 2);
+        assert!(!m.may_match_later(false));
+        assert_eq!(command("add", RefKind::Acl, &[&path, "/z"], None), "");
+        assert!(m.matches(&s("/z1")));
+        // A pattern no reader can compile is refused, and the file is unchanged.
+        let ints = tmp("i.acl", "5\n");
+        let ri = acl_file(&ints).expect("file");
+        let mi = FileMatcher::new(Arc::clone(&ri), "int", false).expect("matcher");
+        assert!(command("add", RefKind::Acl, &[&ints, "x"], None).contains('x'));
+        assert_eq!(ri.entries().len(), 1);
+        assert!(!mi.is_empty());
+        // `del` by the id `show` prints.
+        let id = format!("#0x{:x}", r.entries()[0].id);
+        assert_eq!(command("del", RefKind::Acl, &[&path, &id], None), "");
+        assert!(!m.matches(&s("/x1")));
+        assert_eq!(command("del", RefKind::Acl, &[&path, "#0xdead"], None), "Key not found.\n");
+        // A reload of the file on disk is picked up by a new parse until the CLI has edited it.
+        let reread = tmp("r.acl", "/a\n");
+        let rr = acl_file(&reread).expect("file");
+        std::fs::write(&reread, "/a\n/bb\n").expect("write");
+        assert_eq!(acl_file(&reread).expect("file").entries().len(), 2);
+        assert_eq!(rr.entries().len(), 2);
+        assert_eq!(command("clear", RefKind::Acl, &[&reread], None), "");
+        std::fs::write(&reread, "/a\n/bb\n/ccc\n").expect("write");
+        assert!(acl_file(&reread).expect("file").entries().is_empty(), "edited by the CLI: kept");
+    }
+
+    #[test]
+    fn map_keys_are_checked_by_the_converter_that_reads_them() {
+        let ints = tmp("i.map", "1 one\n");
+        let ips = tmp("ip.map", "10.0.0.0/8 ten\n");
+        let regs = tmp("r.map", "^/a x\n");
+        let ri = map_file(&ints, MapKeys::Int, None).expect("map");
+        let rp = map_file(&ips, MapKeys::Ip, Some("map at file 'c' line 1".to_string())).expect("map");
+        let rr = map_file(&regs, MapKeys::Reg, None).expect("map");
+        let run = |r: &PatRef, key: &str| command("add", RefKind::Map, &[&format!("#{}", r.id), key, "v"], None);
+        assert_eq!(run(&ri, "7"), "");
+        assert_eq!(run(&ri, "5-9"), "");
+        assert_eq!(run(&ri, "x"), "'x' is not a number.\n");
+        assert_eq!(run(&rp, "1.2.3.0/24"), "");
+        assert_eq!(run(&rp, "foo"), "'foo' is not a valid IPv4 or IPv6 address.\n");
+        assert_eq!(run(&rr, "^/b.*"), "");
+        assert!(run(&rr, "[").starts_with("regex '[' is invalid"));
+        let sel = |r: &PatRef| format!("#{}", r.id);
+        let id = format!("#0x{:x}", ri.entries()[0].id);
+        assert_eq!(command("set", RefKind::Map, &[&sel(&ri), &id, "uno"], None), "");
+        assert_eq!(command("set", RefKind::Map, &[&sel(&ri), "#0xdead", "x"], None), "key or pattern not found.\n");
+        assert_eq!(command("del", RefKind::Map, &[&sel(&ri), &id], None), "");
+        assert_eq!(command("show", RefKind::Map, &[&sel(&ri)], None).lines().count(), 2);
+    }
+
+    #[test]
+    fn the_scan_registers_acl_and_map_files_in_the_order_written() {
+        let acl = tmp("s.acl", "/s\n");
+        let map = tmp("s.map", "k v\n");
+        let (mi, mp, mr) = (tmp("s_i.map", "1 a\n"), tmp("s_p.map", "1.1.1.1 a\n"), tmp("s_r.map", "^a b\n"));
+        let text = format!("frontend f\n  acl a path -f {acl}\n  http-request set-var(txn.x) path,map_beg({map},d)\n  use_backend b if {{ path -f {acl} }} # c\n  http-request set-var(txn.y) path,map_int({mi},0),map_ip({mp},0),map_reg({mr},0)\n");
+        scan_config(&text, &|l| ("c.cfg".to_string(), l));
+        let shown = command("show", RefKind::Acl, &[], None);
+        assert!(shown.contains("used by acl at file 'c.cfg' line 2, acl at file 'c.cfg' line 4"), "{shown}");
+        assert!(shown.contains("acl 'path' file 'c.cfg' line 2."), "{shown}");
+        let maps = command("show", RefKind::Map, &[], None);
+        for f in [&mi, &mp, &mr] {
+            assert!(maps.contains(&format!("({f}) pattern loaded from file '{f}' used by map at file 'c.cfg' line 5")), "{maps}");
+        }
+        assert!(maps.contains(&format!("({map}) pattern loaded from file '{map}' used by map at file 'c.cfg' line 3")), "{maps}");
+        // The inline patterns of an expression are not changeable: refused, not ignored.
+        let expr = list(RefKind::Acl).into_iter().find(|r| r.file.is_empty()).expect("an expression ref");
+        let out = command("add", RefKind::Acl, &[&format!("#{}", expr.id), "/q"], None);
+        assert!(out.contains("cannot be changed at runtime"), "{out}");
     }
 }
