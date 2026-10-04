@@ -390,3 +390,51 @@ fn tcp_request_content_runs_for_each_request_of_a_connection() {
         );
     }
 }
+
+/// `set-var-fmt` and `unset-var` in the session, content and HTTP rule sets, on every scope
+/// (HAProxy 3.5-dev8, same configuration).
+#[test]
+fn set_var_fmt_and_unset_var_in_every_rule_set() {
+    let be = backend();
+    let fe = common::reserve_addr();
+    let _ibex = start(
+        &format!(
+            r####"global
+  set-var proc.p1 int(1)
+defaults
+  mode http
+  timeout connect 2s
+  timeout client 5s
+  timeout server 5s
+frontend fe
+  bind {fe}
+  tcp-request session set-var-fmt(sess.a) "fa-%[str(1)]"
+  tcp-request session set-var(sess.b) str(b)
+  tcp-request session unset-var(sess.b)
+  tcp-request content set-var-fmt(txn.c) "fc-%[str(2)]"
+  tcp-request content set-var(txn.d) str(d)
+  tcp-request content unset-var(txn.d)
+  http-request set-var-fmt(proc.p2) "fp-%[str(3)]"
+  http-request set-var-fmt(proc.p3,ifnotset) "fp3-%[str(3)]"
+  http-request set-var(proc.p4) str(four)
+  http-request unset-var(proc.p4)
+  http-request set-var(txn.e,ifnotexists) hdr(x-e)
+  http-request set-var(txn.f,ifempty) str(),b64dec
+  http-request set-var(txn.g,ifnotempty) str(AAEC),b64dec
+  http-request set-var(txn.h) str(h)
+  http-request unset-var(txn.h)
+  http-response set-header x-w "a=%[var(sess.a)] b=%[var(sess.b)] c=%[var(txn.c)] d=%[var(txn.d)] p2=%[var(proc.p2)] p3=%[var(proc.p3)] p4=%[var(proc.p4)] f=[%[var(txn.f),length]] h=%[var(txn.h)]"
+  default_backend be
+backend be
+  server s {be}
+"####
+        ),
+        fe,
+    );
+    let r = get(fe, "x-e: abcd\r\n");
+    assert_eq!(
+        header(&r, "x-w").as_deref(),
+        Some("a=fa-1 b= c=fc-2 d= p2=fp-3 p3=fp3-3 p4= f=[0] h="),
+        "{r}"
+    );
+}

@@ -3096,12 +3096,9 @@ fn eval_tcp_req_session_rules(
             }
             ibex_config::TcpReqSessionAction::SetVar { var_name, expr } => {
                 // A sample that cannot be fetched sets nothing (`action_store`, src/vars.c).
-                let val = if let Ok(e) = Expr::parse(expr) {
-                    e.eval_sample(registry, &ctx).map(|smp| (sample_is_empty(&smp), sample_to_string(&smp)))
-                } else {
-                    let v = format_sample_string(expr, &ctx, registry);
-                    Some((v.is_empty(), v))
-                };
+                // The expression is a sample fetch, checked at load; one that cannot be parsed or
+                // fetched sets nothing.
+                let val = Expr::parse(expr).ok().and_then(|e| e.eval_sample(registry, &ctx)).map(|smp| (sample_is_empty(&smp), sample_to_string(&smp)));
                 if let Some((empty, val)) = val {
                     store_var_smp(&mut sess.sess_vars, &mut sess.req_vars, var_name, val, empty);
                 }
@@ -3372,12 +3369,9 @@ fn eval_tcp_req_content_rules(
             }
             ibex_config::TcpReqContentAction::SetVar { var_name, expr } => {
                 // A sample that cannot be fetched sets nothing (`action_store`, src/vars.c).
-                let val = if let Ok(e) = Expr::parse(expr) {
-                    e.eval_sample(registry, &ctx).map(|smp| (sample_is_empty(&smp), sample_to_string(&smp)))
-                } else {
-                    let v = format_sample_string(expr, &ctx, registry);
-                    Some((v.is_empty(), v))
-                };
+                // The expression is a sample fetch, checked at load; one that cannot be parsed or
+                // fetched sets nothing.
+                let val = Expr::parse(expr).ok().and_then(|e| e.eval_sample(registry, &ctx)).map(|smp| (sample_is_empty(&smp), sample_to_string(&smp)));
                 if let Some((empty, val)) = val {
                     store_var_smp(&mut sess.sess_vars, &mut sess.req_vars, var_name, val, empty);
                 }
@@ -6577,12 +6571,9 @@ impl EngineDispatcher<'_> {
                     }
                     ibex_config::HttpReqAction::SetVar { var_name, expr } => {
                         // A sample that cannot be fetched sets nothing (`action_store`, src/vars.c).
-                        let val = if let Ok(e) = Expr::parse(expr) {
-                            e.eval_sample(registry, &make_ctx!(sess)).map(|smp| (sample_is_empty(&smp), sample_to_string(&smp)))
-                        } else {
-                            let v = format_sample_string(expr, &make_ctx!(sess), registry);
-                            Some((v.is_empty(), v))
-                        };
+                        // The expression is a sample fetch, checked at load; one that cannot be parsed or
+                        // fetched sets nothing.
+                        let val = Expr::parse(expr).ok().and_then(|e| e.eval_sample(registry, &make_ctx!(sess))).map(|smp| (sample_is_empty(&smp), sample_to_string(&smp)));
                         if let Some((empty, val)) = val {
                             store_var_smp(&mut sess.sess_vars, &mut sess.req_vars, var_name, val, empty);
                         }
