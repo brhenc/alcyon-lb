@@ -26,6 +26,15 @@ thread_local! {
     pub static CURRENT_TIMEOUTS: RefCell<HashMap<&'static str, u32>> = RefCell::new(HashMap::new());
     pub static CURRENT_RES_HEADERS: RefCell<Vec<(String, String)>> = const { RefCell::new(Vec::new()) };
     pub static CURRENT_RES_STATUS: Cell<u16> = const { Cell::new(0) };
+    /// Variables a converter set while an expression was evaluated (`aes_gcm_enc`'s tag):
+    /// the engine moves them to the session's own maps when the rule that evaluated the
+    /// expression stores its result, so they outlive that rule.
+    static PENDING_VAR_WRITES: RefCell<Vec<(String, String)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Takes the variables converters have set since the last call, as `(name, value)`.
+pub fn take_pending_var_writes() -> Vec<(String, String)> {
+    PENDING_VAR_WRITES.with(|p| std::mem::take(&mut *p.borrow_mut()))
 }
 
 pub static GLOBAL_PROC_VARS: LazyLock<RwLock<HashMap<String, String>>> =
@@ -2748,32 +2757,23 @@ impl Registry {
             in_type: TypeSpec::Exact(SampleType::Str),
             out_type: TypeSpec::Exact(SampleType::Str),
             func: |smp, _args| match smp {
-                Sample::Str(s) => {
-                    let host = if let Some(stripped) = s.strip_prefix('[') {
-                        stripped.split(']').next().unwrap_or(&s)
-                    } else if let Some((h, _)) = s.split_once(':') {
-                        h
-                    } else {
-                        &s
-                    };
-                    Some(Sample::Str(host.to_lowercase()))
-                }
+                Sample::Str(s) => Some(Sample::Str(split_host_port(&s).0.to_lowercase())),
                 _ => None,
             },
         });
 
+        // `port_only`: what follows the last colon, every byte of it taken as a digit (`abc`
+        // is 5451, a `-` wraps), in an unsigned 32-bit number; 0 when there is no port.
         self.register_converter(ConvDesc {
             name: "port_only",
             in_type: TypeSpec::Exact(SampleType::Str),
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: |smp, _args| match smp {
                 Sample::Str(s) => {
-                    let port_str = if s.starts_with('[') {
-                        s.split("]:").nth(1)
-                    } else {
-                        s.split_once(':').map(|(_, p)| p)
-                    }?;
-                    port_str.parse::<i64>().ok().map(Sample::Sint)
+                    let port = split_host_port(&s).1.unwrap_or("").bytes().fold(0u32, |acc, c| {
+                        acc.wrapping_mul(10).wrapping_add(u32::from(c).wrapping_sub(u32::from(b'0')))
+                    });
+                    Some(Sample::Sint(i64::from(port)))
                 }
                 _ => None,
             },
@@ -4221,6 +4221,54 @@ impl Registry {
             },
         });
 
+        // `aes_cbc_enc(<bits>,<nonce>,<key>[,<aad>])`, `aes_cbc_dec` (same arguments),
+        // `aes_gcm_enc(<bits>,<nonce>,<key>,<tag var>[,<aad>])` and
+        // `aes_gcm_dec(<bits>,<nonce>,<key>,<tag>[,<aad>])`: `sample_conv_aes_cbc`
+        // and `sample_conv_aes_gcm` (src/sample.c). Nonce, key, aad and the decryption's
+        // tag are base64, as a variable's text or as a literal; the encryption's tag is
+        // written to its variable, base64 too. Anything that does not work (a variable
+        // that is not set, a key shorter than `bits`, a bad padding or tag) yields no sample.
+        self.register_converter(ConvDesc {
+            name: "aes_cbc_enc",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Bin),
+            func: |smp, args| aes_cbc(smp, args, true),
+        });
+        self.register_converter(ConvDesc {
+            name: "aes_cbc_dec",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Bin),
+            func: |smp, args| aes_cbc(smp, args, false),
+        });
+        self.register_converter(ConvDesc {
+            name: "aes_gcm_enc",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Bin),
+            func: |smp, args| aes_gcm(smp, args, true),
+        });
+        self.register_converter(ConvDesc {
+            name: "aes_gcm_dec",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Bin),
+            func: |smp, args| aes_gcm(smp, args, false),
+        });
+
+        // `language(<value>[;<value>...][,<default>])`: `sample_conv_q_prefered`. The
+        // input is an `Accept-Language` style header; the output is the listed value the
+        // header prefers.
+        self.register_converter(ConvDesc {
+            name: "language",
+            in_type: TypeSpec::Exact(SampleType::Str),
+            out_type: TypeSpec::Exact(SampleType::Str),
+            func: |smp, args| {
+                let header = sample_to_string(&smp);
+                match language_pick(&header, args.first()?) {
+                    Some(v) => Some(Sample::Str(v)),
+                    None => args.get(1).map(|d| Sample::Str(d.clone())),
+                }
+            },
+        });
+
         self.register_converter(ConvDesc {
             name: "secure_memcmp",
             in_type: TypeSpec::Exact(SampleType::Bin),
@@ -5385,6 +5433,207 @@ const HMAC_UNIMPLEMENTED: &[&str] = &[
 ];
 
 /// A key written as a variable name (scope prefix) rather than as base64 text.
+/// Splits `host[:port]` at its last colon, unless a `]` follows it (the colon is inside the
+/// brackets of an IPv6 address): `sample_conv_host_only` and `sample_conv_port_only`.
+fn split_host_port(s: &str) -> (&str, Option<&str>) {
+    match s.rfind(':') {
+        Some(i) if !s[i + 1..].contains(']') => (&s[..i], Some(&s[i + 1..])),
+        _ => (s, None),
+    }
+}
+
+/// The text a variable named `name` holds, in the scope its prefix names.
+fn read_var(name: &str) -> Option<String> {
+    if name.starts_with("proc.") {
+        get_proc_var(name)
+    } else {
+        CURRENT_VARS.with(|v| v.borrow().get(name).cloned())
+    }
+}
+
+/// Sets a variable from a converter. The engine stores it in the session when the rule
+/// that is evaluating the expression stores its own result.
+fn write_var(name: &str, value: String) {
+    if name.starts_with("proc.") {
+        set_proc_var(name, value);
+        return;
+    }
+    CURRENT_VARS.with(|v| v.borrow_mut().insert(name.to_string(), value.clone()));
+    PENDING_VAR_WRITES.with(|p| p.borrow_mut().push((name.to_string(), value)));
+}
+
+/// A base64 argument: the text of the variable it names, or the literal, decoded.
+fn b64_arg(arg: &str) -> Option<Vec<u8>> {
+    let arg = arg.trim();
+    let text = if hmac_key_is_var(arg) { read_var(arg)? } else { arg.to_string() };
+    base64_decode(&text, false, true)
+}
+
+fn aes_bits(arg: &str) -> Option<usize> {
+    arg.trim().parse::<i64>().ok().filter(|b| matches!(b, 128 | 192 | 256)).and_then(|b| usize::try_from(b / 8).ok())
+}
+
+fn aes_for(args: &[String], key_len: usize) -> Option<crate::aes::Aes> {
+    let key = b64_arg(args.get(2)?)?;
+    // A longer key is cut to the size asked for, a shorter one is no key.
+    crate::aes::Aes::new(key.get(..key_len)?)
+}
+
+fn aes_cbc(smp: Sample, args: &[String], encrypt: bool) -> Option<Sample> {
+    let Sample::Bin(msg) = smp else { return None };
+    let key_len = aes_bits(args.first()?)?;
+    let nonce = b64_arg(args.get(1)?)?;
+    let aes = aes_for(args, key_len)?;
+    // The aad has no use in CBC; HAProxy still reads it.
+    if let Some(aad) = args.get(3) {
+        b64_arg(aad)?;
+    }
+    // The nonce is the IV: zero padded when short, cut when long.
+    let mut iv = [0u8; 16];
+    let n = nonce.len().min(16);
+    iv[..n].copy_from_slice(&nonce[..n]);
+    if encrypt {
+        Some(Sample::Bin(crate::aes::cbc_encrypt(&aes, &iv, &msg)))
+    } else {
+        crate::aes::cbc_decrypt(&aes, &iv, &msg).map(Sample::Bin)
+    }
+}
+
+fn aes_gcm(smp: Sample, args: &[String], encrypt: bool) -> Option<Sample> {
+    let Sample::Bin(msg) = smp else { return None };
+    let key_len = aes_bits(args.first()?)?;
+    let nonce = b64_arg(args.get(1)?)?;
+    let aes = aes_for(args, key_len)?;
+    let tag_arg = args.get(3)?.trim();
+    let aad = match args.get(4) {
+        Some(a) => b64_arg(a)?,
+        None => Vec::new(),
+    };
+    if encrypt {
+        let (cipher, tag) = crate::aes::gcm_encrypt(&aes, &nonce, &aad, &msg)?;
+        write_var(tag_arg, base64_encode(&tag, false));
+        Some(Sample::Bin(cipher))
+    } else {
+        let tag = b64_arg(tag_arg)?;
+        crate::aes::gcm_decrypt(&aes, &nonce, &aad, &msg, &tag).map(Sample::Bin)
+    }
+}
+
+/// A q-value as `Accept-Language` writes it, in thousandths: what follows a leading `0`
+/// and a dot (three digits at most) is the fraction, a `0` followed by anything else is
+/// 0, and what does not start with `0` counts as 1.
+fn parse_qvalue(s: &str) -> u32 {
+    let b = s.as_bytes();
+    if b.first() != Some(&b'0') {
+        return 1000;
+    }
+    if b.get(1) != Some(&b'.') {
+        return 0;
+    }
+    let mut q = 0;
+    let mut scale = 100;
+    for d in b[2..].iter().take(3).take_while(|d| d.is_ascii_digit()) {
+        q += u32::from(d - b'0') * scale;
+        scale /= 10;
+    }
+    q
+}
+
+/// `language(<list>)` on the header `header`: the first entry of `list` (`;` separated)
+/// matching the language with the highest q-value, ties going to the first in the header.
+fn language_pick(header: &str, list: &str) -> Option<String> {
+    let entries: Vec<&str> = list.split(';').filter(|e| !e.is_empty()).collect();
+    let mut best: Option<(u32, &str)> = None;
+    for item in header.split(',') {
+        let item = item.trim_start();
+        let tok_end = item.find(|c: char| c.is_whitespace() || c == ';').unwrap_or(item.len());
+        let (token, rest) = item.split_at(tok_end);
+        if token.is_empty() {
+            continue;
+        }
+        let rest = rest.trim_start();
+        let q = if rest.is_empty() {
+            1000
+        } else if let Some(params) = rest.strip_prefix(';') {
+            let qv = params.trim_start().strip_prefix('q').and_then(|r| r.trim_start().strip_prefix('='));
+            qv.map_or(1000, |v| parse_qvalue(v.trim_start()))
+        } else {
+            // something other than ';' after the language: not a language
+            continue;
+        };
+        if q == 0 {
+            continue;
+        }
+        let hit = entries
+            .iter()
+            .find(|e| token == **e || token.strip_prefix(**e).is_some_and(|r| r.starts_with('-')));
+        if let Some(e) = hit {
+            if best.is_none_or(|(bq, _)| q > bq) {
+                best = Some((q, e));
+            }
+        }
+    }
+    best.map(|(_, e)| e.to_string())
+}
+
+/// What `check_converter_args` says about the `aes_*` converters: `bits` first, then the
+/// base64 arguments in the order HAProxy checks them.
+fn check_aes_args(name: &str, args: &[String]) -> Option<String> {
+    let gcm = name.starts_with("aes_gcm");
+    let (min, max) = if gcm { (4, 5) } else { (3, 4) };
+    let first = args.first().map_or("", |a| a.trim());
+    if first.is_empty() {
+        return Some(format!("invalid arg 1 in converter '{name}' : expected type 'integer' at position 1, but got nothing."));
+    }
+    let Ok(bits) = first.parse::<i64>() else {
+        return Some(format!("invalid arg 1 in converter '{name}' : failed to parse '{first}' as type 'integer' at position 1."));
+    };
+    if args.len() < min {
+        return Some(format!(
+            "invalid arg {} in converter '{name}' : missing arguments (got {}/{min}), type 'string' expected.",
+            args.len() + 1,
+            args.len()
+        ));
+    }
+    if args.len() > max {
+        return Some(format!("invalid arg {max} in converter '{name}' : expected ')' before ',{})'.", args[max..].join(",")));
+    }
+    if !matches!(bits, 128 | 192 | 256) {
+        return Some(format!("invalid args in converter '{name}' : key size must be 128, 192 or 256 (bits).."));
+    }
+    let b64_ok = |a: &str| hmac_key_is_var(a.trim()) || base64_decode(a.trim(), false, true).is_some();
+    let bad = |what: &str| {
+        format!(
+            "invalid args in converter '{name}' : failed to parse {what} : argument needs to be base64 encoded, and can either be a string or a variable."
+        )
+    };
+    if !b64_ok(&args[1]) {
+        return Some(bad("nonce"));
+    }
+    if !b64_ok(&args[2]) {
+        return Some(bad("key"));
+    }
+    let tag = args.get(3).map_or("", |t| t.trim());
+    if name == "aes_gcm_enc" {
+        // the tag is where the encryption leaves its result: a variable
+        if tag.is_empty() {
+            return Some(format!("invalid args in converter '{name}' : failed to parse aead_tag : Empty variable name cannot be accepted."));
+        }
+        if !hmac_key_is_var(tag) {
+            return Some(format!("invalid args in converter '{name}' : failed to parse aead_tag : (null)."));
+        }
+    } else if name == "aes_gcm_dec" && !b64_ok(tag) {
+        return Some(bad("aead_tag"));
+    }
+    let aad = if gcm { args.get(4) } else { args.get(3) };
+    if let Some(aad) = aad {
+        if !b64_ok(aad) {
+            return Some(bad("aad"));
+        }
+    }
+    None
+}
+
 fn hmac_key_is_var(key: &str) -> bool {
     ["txn.", "sess.", "req.", "res.", "proc."].iter().any(|p| key.starts_with(p))
 }
@@ -5427,6 +5676,7 @@ pub fn check_converter_args(name: &str, args: &[String]) -> Option<String> {
             )),
             _ => Some(format!("invalid args in converter 'set-var' : unknown condition \"{c}\".")),
         }),
+        "aes_cbc_enc" | "aes_cbc_dec" | "aes_gcm_enc" | "aes_gcm_dec" => check_aes_args(name, args),
         "url_enc" => match args {
             [] => None,
             [a] if a.is_empty() || a == "query" => None,

@@ -452,6 +452,7 @@ dependencies = [
  "ibex-proto",
  "proptest",
  "regex",
+ "ring",
  "serde",
  "serde_json",
 ]
