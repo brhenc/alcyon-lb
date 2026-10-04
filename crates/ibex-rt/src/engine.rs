@@ -1420,7 +1420,9 @@ fn stream_log_line(entry: &SessionEntry, proxies: &[Proxy], pid: u32) -> Option<
         return None;
     }
     let be = proxies.get(entry.backend_idx).unwrap_or(fe);
-    let line = fmt.render(&stream_log_data(entry, proxies, entry.proxy_idx, pid), sample_registry(), &SampleContext { at_log: true, ..stream_sample_ctx(&entry.sess, fe, be, &ProxiesView(proxies), &StickView::new(proxies, &entry.sess.tracked_sc)) });
+    // `status` is the transaction's (`txn->status`, as `%ST`), not whatever response the
+    // thread rewrote last (T152).
+    let line = fmt.render(&stream_log_data(entry, proxies, entry.proxy_idx, pid), sample_registry(), &SampleContext { at_log: true, res_status: entry.sess.txn.as_ref().map(|t| t.status).or(entry.sess.log.status).filter(|&s| s > 0), ..stream_sample_ctx(&entry.sess, fe, be, &ProxiesView(proxies), &StickView::new(proxies, &entry.sess.tracked_sc)) });
     fe.log_count.fetch_add(1, Ordering::Relaxed);
     Some(line)
 }
@@ -3529,17 +3531,6 @@ fn eval_tcp_req_session_rules(
         ..Default::default()
     };
 
-    ibex_sample::CURRENT_VARS.with(|v| {
-        let mut map = v.borrow_mut();
-        map.clear();
-        for (k, val) in &sess.sess_vars {
-            map.insert(k.clone(), val.clone());
-        }
-        for (k, val) in &sess.req_vars {
-            map.insert(k.clone(), val.clone());
-        }
-    });
-
     for rule in &proxy.tcp_req_session_rules {
         let matches = match &rule.cond {
             None => true,
@@ -3772,17 +3763,6 @@ fn eval_tcp_req_content_rules(
         captures_res_hdr: Some(&sess.log.res_captures),
         ..Default::default()
     };
-
-    ibex_sample::CURRENT_VARS.with(|v| {
-        let mut map = v.borrow_mut();
-        map.clear();
-        for (k, val) in &sess.sess_vars {
-            map.insert(k.clone(), val.clone());
-        }
-        for (k, val) in &sess.req_vars {
-            map.insert(k.clone(), val.clone());
-        }
-    });
 
     let mut has_missing_data = false;
     for rule in &proxy.tcp_req_content_rules {
@@ -4033,12 +4013,6 @@ fn eval_tcp_res_content_rules(proxy: &Proxy, proxies: &[Proxy], registry: &Regis
         captures_res_hdr: Some(&sess.log.res_captures),
         ..Default::default()
     };
-    ibex_sample::CURRENT_VARS.with(|v| {
-        let mut map = v.borrow_mut();
-        map.clear();
-        map.extend(sess.sess_vars.iter().map(|(k, val)| (k.clone(), val.clone())));
-        map.extend(sess.req_vars.iter().map(|(k, val)| (k.clone(), val.clone())));
-    });
     for rule in &proxy.tcp_res_content_rules {
         if let Some(cond) = &rule.cond {
             // `acl_exec_cond`: a sample that may change and does not match is a miss.
@@ -4166,6 +4140,54 @@ fn store_var_smp(
     let map = if name.starts_with("sess.") { sess_vars } else { req_vars };
     map.insert(name.to_string(), val.clone());
     ibex_sample::CURRENT_VARS.with(|v| v.borrow_mut().insert(name.to_string(), val));
+}
+
+/// Runs `f` with `sess`'s variables in the thread's `CURRENT_VARS`, where the fetches and
+/// converters read them, and puts them back in the session after (T152).
+///
+/// `CURRENT_VARS` is one map per thread, and every stream on the thread runs through it in
+/// turn: a stream that waits (for its server, its body, a tarpit) leaves the thread to the
+/// others, so the map holds a stream's variables only while that stream runs. It is filled
+/// here, for the length of one run and never across a wait, and emptied after, so a
+/// stream reads its own variables or none -- never those of the stream that ran last.
+///
+/// The variables are moved, not copied: the session's maps are empty while `f` runs and
+/// the thread's map is the one every write lands in (`store_var` writes both; the
+/// `set-var` converter, which has no session, writes only it). What it holds after `f` is
+/// what the session keeps. No allocation, whatever the number of variables.
+fn with_stream_vars<R>(sess: &mut TcpSession, f: impl FnOnce(&mut TcpSession) -> R) -> R {
+    stream_vars_enter(sess);
+    let out = f(sess);
+    stream_vars_leave(Some(sess));
+    out
+}
+
+/// The start of [`with_stream_vars`].
+fn stream_vars_enter(sess: &mut TcpSession) {
+    CURRENT_VARS.with(|v| {
+        let mut map = v.borrow_mut();
+        map.clear();
+        map.extend(sess.sess_vars.drain());
+        map.extend(sess.req_vars.drain());
+    });
+}
+
+/// The end of [`with_stream_vars`]: what the thread's map holds goes back to the scope it
+/// belongs to in `sess`, or is dropped with a stream that is gone.
+fn stream_vars_leave(sess: Option<&mut TcpSession>) {
+    CURRENT_VARS.with(|v| {
+        let mut map = v.borrow_mut();
+        let Some(sess) = sess else {
+            map.clear();
+            return;
+        };
+        sess.sess_vars.clear();
+        sess.req_vars.clear();
+        for (k, val) in map.drain() {
+            let scope = if k.starts_with("sess.") { &mut sess.sess_vars } else { &mut sess.req_vars };
+            scope.insert(k, val);
+        }
+    });
 }
 
 /// Readies a TCP-mode stream for `proxy`'s `tcp-response content` rules, if it has any
@@ -4496,7 +4518,7 @@ fn init_client_session(
     }
 
     let registry = sample_registry();
-    match eval_tcp_req_session_rules(&proxies[proxy_idx], proxies, registry, &mut sess) {
+    match with_stream_vars(&mut sess, |sess| eval_tcp_req_session_rules(&proxies[proxy_idx], proxies, registry, sess)) {
         SessionEvalOutcome::Accept => {}
         SessionEvalOutcome::Reject => {
             raw::abort_with_rst(sess.cli.as_fd());
@@ -5666,8 +5688,20 @@ impl EngineDispatcher<'_> {
         }
     }
 
-    #[allow(clippy::too_many_lines)] // one dispatch chain; splitting it would obscure the order
+    /// One run of a stream, with its variables where its rules read them
+    /// ([`with_stream_vars`]): everything a stream evaluates happens inside a run, and a
+    /// run never waits -- a stream that waits ends its run and is woken for another.
     fn step_stream(&mut self, session_idx: u32) -> Outcome {
+        if let Some(entry) = self.sessions.get_mut(session_idx) {
+            stream_vars_enter(&mut entry.sess);
+        }
+        let out = self.step_stream_run(session_idx);
+        stream_vars_leave(self.sessions.get_mut(session_idx).map(|e| &mut e.sess));
+        out
+    }
+
+    #[allow(clippy::too_many_lines)] // one dispatch chain; splitting it would obscure the order
+    fn step_stream_run(&mut self, session_idx: u32) -> Outcome {
         // The time now, not the time the pass started: `step` takes its tick before it waits
         // in the poller, so a stream woken by a request after an idle second would arm a
         // `wait-for-body` of 300 ms from a second ago.
@@ -6662,17 +6696,7 @@ impl EngineDispatcher<'_> {
             proxies[proxy_idx].stats[worker_id()].fe_req_rate.tick();
         }
 
-        // Initialize per-request thread locals
-        CURRENT_VARS.with(|v| {
-            let mut map = v.borrow_mut();
-            map.clear();
-            for (k, val) in &entry.sess.sess_vars {
-                map.insert(k.clone(), val.clone());
-            }
-            for (k, val) in &entry.sess.req_vars {
-                map.insert(k.clone(), val.clone());
-            }
-        });
+        // The stream's variables are in `CURRENT_VARS` for this whole run (`step_stream`).
         if resume.is_none() {
             begin_http_stream(entry, proxies, proxy_idx, pid);
         }
@@ -9422,13 +9446,8 @@ fn after_res_on_reply<'r>(
     CURRENT_RES_STATUS.set(status);
     CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = hdrs.clone());
     res_htx_init(sess.bufsize, None, &version, &reason, &hdrs, raw.len() - hdr_end - eoh_len);
-    // The variables are the session's own: a reply made after the request rules (502, 504)
-    // comes when other streams may have run theirs on this thread.
-    CURRENT_VARS.with(|v| {
-        let mut map = v.borrow_mut();
-        map.clear();
-        map.extend(sess.sess_vars.iter().chain(sess.req_vars.iter()).map(|(k, val)| (k.clone(), val.clone())));
-    });
+    // The variables are the session's own, in `CURRENT_VARS` for the run that makes the
+    // reply (`step_stream`).
     let mut sess_vars = std::mem::take(&mut sess.sess_vars);
     let mut req_vars = std::mem::take(&mut sess.req_vars);
     let mut res_caps = std::mem::take(&mut sess.log.res_captures);

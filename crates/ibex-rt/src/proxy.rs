@@ -697,6 +697,9 @@ impl TcpSession {
         self.clear_htx();
         self.h2_active_stream_id = None;
         self.req_vars.clear();
+        // The stream is running, so its variables are in the thread's map
+        // (`engine::with_stream_vars`): the transaction's go from there too.
+        ibex_sample::CURRENT_VARS.with(|v| v.borrow_mut().retain(|k, _| k.starts_with("sess.")));
         self.is_first_req = false;
         self.cli_state = ScState::Ready;
     }
