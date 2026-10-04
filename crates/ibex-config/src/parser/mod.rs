@@ -761,10 +761,6 @@ const OPTIONS_THAT_MUST_NOT_BE_IGNORED: &[(&str, &str)] = &[
         "log-separate-errors",
         "Ibex would write a failed request to the normal log instead of raising its level",
     ),
-    (
-        "persist",
-        "Ibex does not send a request with a persistence cookie to a server that is down",
-    ),
 ];
 
 

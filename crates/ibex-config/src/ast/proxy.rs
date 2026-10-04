@@ -59,6 +59,8 @@ pub struct DefaultsSection {
     pub buffer_request: bool,
     /// The last of `option http-keep-alive`, `http-server-close` and `httpclose`.
     pub http_mode: HttpMode,
+    /// `option persist`: a server a cookie or stick table names is used even when it is down.
+    pub persist: bool,
     /// `option dontlognull`: no log line for a connection that carried nothing.
     pub dontlognull: bool,
     /// `option forwardfor` in `defaults`: the `except` network, empty for none.
@@ -234,6 +236,8 @@ pub struct ListenSection {
     pub buffer_request: bool,
     /// The last of `option http-keep-alive`, `http-server-close` and `httpclose`.
     pub http_mode: HttpMode,
+    /// `option persist`: a server a cookie or stick table names is used even when it is down.
+    pub persist: bool,
     /// `option dontlognull`: no log line for a connection that carried nothing.
     pub dontlognull: bool,
     /// Client header regex rewrite rules (up to 10).
@@ -380,6 +384,7 @@ impl Default for ListenSection {
             log_health_checks: false,
             buffer_request: false,
             http_mode: HttpMode::KeepAlive,
+            persist: false,
             dontlognull: false,
             cliexp: Vec::new(),
             srvexp: Vec::new(),
@@ -595,6 +600,8 @@ pub struct BackendSection {
     pub buffer_request: bool,
     /// The last of `option http-keep-alive`, `http-server-close` and `httpclose`.
     pub http_mode: HttpMode,
+    /// `option persist`: a server a cookie or stick table names is used even when it is down.
+    pub persist: bool,
     /// Operating mode (tcp, http, health).
     pub mode: Mode,
     /// Whether this backend is disabled.
@@ -700,6 +707,7 @@ impl Default for BackendSection {
             log_health_checks: false,
             buffer_request: false,
             http_mode: HttpMode::KeepAlive,
+            persist: false,
             mode: Mode::Tcp,
             disabled: false,
             id: None,

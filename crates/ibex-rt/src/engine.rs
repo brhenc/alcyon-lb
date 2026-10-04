@@ -465,6 +465,8 @@ pub struct ProxyIdInfo {
     /// `option http-server-close`: the server connection carries one request. Read when a
     /// request goes to a server and when its response ends.
     pub http_mode: ibex_config::ast::HttpMode,
+    /// `option persist`: a server named by a cookie or a stick table is used when it is down.
+    pub persist: bool,
 }
 
 /// A configured proxy instance.
@@ -1789,6 +1791,7 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, list
             listener_ids: ibex_config::ast::listener_ids(&listen.binds),
             server_pool_max_conn: pool_max_conns(&listen.servers),
             http_mode: listen.http_mode,
+            persist: listen.persist,
             ..ProxyIdInfo::default()
         }),
         name: listen.name.clone(),
@@ -2058,6 +2061,7 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, be:
             listener_ids: Vec::new(),
             server_pool_max_conn: pool_max_conns(&be.servers),
             http_mode: be.http_mode,
+            persist: be.persist,
             ..ProxyIdInfo::default()
         }),
         name: be.name.clone(),
@@ -5440,7 +5444,7 @@ impl EngineDispatcher<'_> {
                         // The server stored by its id, if it is still there and not stopped.
                         let i = entry.server_id.and_then(|id| (0..be.servers.len()).find(|&i| be.server_puid(i) == id));
                         let up = |i: usize| be.server_statuses.get(i).is_none_or(|s| !matches!(ServerStatus::from(s.load(Ordering::Relaxed)), ServerStatus::Down | ServerStatus::Maint));
-                        if let Some(i) = i.filter(|&i| up(i)) {
+                        if let Some(i) = i.filter(|&i| be.ids.persist || up(i)) {
                             found = Some(i);
                             assigned = true;
                         }
@@ -9009,6 +9013,7 @@ fn manage_client_cookies(sess: &mut TcpSession, be: &Proxy) -> Option<usize> {
     let servers: Vec<crate::cookie::SrvCookie<'_>> = (0..be.servers.len())
         .map(|i| crate::cookie::SrvCookie {
             value: be.server_cookies.get(i).and_then(Option::as_deref).map(str::as_bytes),
+            persistent: be.ids.persist,
             usable: be
                 .server_statuses
                 .get(i)
