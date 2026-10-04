@@ -4009,6 +4009,8 @@ fn init_client_session(
     sess.h2_flood_config = global_h2_flood_config;
     let fe = &proxies[proxy_idx];
     sess.accept_unsafe_request = fe.stats_config.accept_unsafe_request;
+    sess.http_request_ms = fe.stats_config.raw_timeouts.http_request.map_or(0, millis_to_u32);
+    sess.arm_request(now);
     sess.keep_request_line = (!fe.log_target_idx.is_empty() && fe.log_format.as_ref().is_some_and(|f| f.uses_request_line()))
         || fe.unique_id_format.as_ref().is_some_and(|f| f.uses_request_line());
     // Use per-engine values rather than the global `BUFSIZE_STANDARD` atomic so that

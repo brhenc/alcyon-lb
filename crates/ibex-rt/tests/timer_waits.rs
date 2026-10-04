@@ -81,6 +81,88 @@ fn timed(fe: SocketAddr, req: &str) -> (Duration, String) {
 
 const GET: &str = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
 
+/// `timeout http-request 500ms` over `timeout client 5s`.
+fn http_request_cfg() -> &'static str {
+    "defaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n  timeout http-request 500ms\n\
+     frontend fe\n  bind {fe}\n  default_backend be\n\
+     backend be\n  server s {srv}\n"
+}
+
+/// Reads until `needle` shows or the connection ends, for at most `within`.
+fn read_until(c: &mut TcpStream, needle: &str, within: Duration) -> String {
+    let end = Instant::now() + within;
+    let mut all = Vec::new();
+    let mut buf = [0u8; 1024];
+    while Instant::now() < end && !String::from_utf8_lossy(&all).contains(needle) {
+        c.set_read_timeout(Some(Duration::from_millis(50))).ok();
+        match c.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => all.extend_from_slice(&buf[..n]),
+            Err(_) => {}
+        }
+    }
+    String::from_utf8_lossy(&all).into_owned()
+}
+
+#[test]
+fn timeout_http_request_answers_408_to_a_head_that_does_not_complete() {
+    // HAProxy: `timeout http-request 1s`, `timeout client 5s`, a partial head: `408` at
+    // +1.001 s (`cR` in the log); nothing sent at all: the same; a byte every 0.3 s: the
+    // same, at +1.2 s -- the client's trickle does not move it.
+    let (srv, _rx) = server();
+    let (_ibex, fe) = start(http_request_cfg(), srv);
+    let (took, resp) = timed(fe, "GET / HTTP/1.1\r\nHost: x\r\n");
+    assert!(resp.starts_with("HTTP/1.1 408 "), "{resp:?}");
+    assert!(took >= Duration::from_millis(480), "408 after {took:?}");
+    assert!(took < Duration::from_millis(3000), "408 after {took:?}");
+    let (took, resp) = timed(fe, "");
+    assert!(resp.starts_with("HTTP/1.1 408 "), "{resp:?}");
+    assert!(took >= Duration::from_millis(480), "408 after {took:?}");
+    assert!(took < Duration::from_millis(3000), "408 after {took:?}");
+
+    let mut c = TcpStream::connect(fe).expect("connect");
+    let t0 = Instant::now();
+    let mut got = String::new();
+    for b in b"GET / HTTP/1.1\r\nHost: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\r\n" {
+        if c.write_all(&[*b]).is_err() {
+            break;
+        }
+        got = read_until(&mut c, "408", Duration::from_millis(150));
+        if got.contains("408") {
+            break;
+        }
+    }
+    assert!(got.starts_with("HTTP/1.1 408 "), "{got:?}");
+    assert!(t0.elapsed() >= Duration::from_millis(480), "408 after {:?}", t0.elapsed());
+    assert!(t0.elapsed() < Duration::from_millis(3000), "408 after {:?}", t0.elapsed());
+}
+
+#[test]
+fn timeout_http_request_runs_from_the_first_byte_of_each_request_and_ends_with_the_head() {
+    // HAProxy: after a first request answered, a second whose head stops half way gets
+    // its `408` 1.0 s after its first byte, not after the first response; and a head that
+    // is complete in time is not cut short by a body that comes later than the timeout.
+    let (srv, _rx) = server();
+    let (_ibex, fe) = start(http_request_cfg(), srv);
+    let mut c = TcpStream::connect(fe).expect("connect");
+    c.write_all(GET.as_bytes()).expect("send");
+    assert!(read_until(&mut c, "ok", Duration::from_secs(3)).ends_with("ok"));
+    thread::sleep(Duration::from_millis(300));
+    let t0 = Instant::now();
+    c.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n").expect("send");
+    let got = read_until(&mut c, "Time-out", Duration::from_secs(4));
+    assert!(got.starts_with("HTTP/1.1 408 "), "{got:?}");
+    assert!(t0.elapsed() >= Duration::from_millis(480), "408 after {:?}", t0.elapsed());
+    assert!(t0.elapsed() < Duration::from_millis(3000), "408 after {:?}", t0.elapsed());
+
+    let mut c = TcpStream::connect(fe).expect("connect");
+    c.write_all(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n\r\n").expect("send");
+    thread::sleep(Duration::from_millis(900));
+    c.write_all(b"abcd").expect("send");
+    let got = read_until(&mut c, "ok", Duration::from_secs(3));
+    assert!(got.starts_with("HTTP/1.1 200 "), "{got:?}");
+}
+
 #[test]
 fn a_timeout_is_not_early_by_the_time_the_engine_was_idle() {
     // HAProxy: `timeout client 1s`, a head that stops half way, connections made at

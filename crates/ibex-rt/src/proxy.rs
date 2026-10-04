@@ -126,6 +126,11 @@ pub struct TcpSession {
     pub max_retries: u16,
     /// Deadline for the operation currently in flight on each side.
     pub cli_exp: Tick,
+    /// `timeout http-request`, in ms (0: none), and when it ends for the request head now
+    /// being received: from the connection for its first request, from the first byte of
+    /// a later one. It ends with the head, and does not move with the client's progress.
+    pub http_request_ms: u32,
+    pub req_exp: Tick,
     pub srv_exp: Tick,
     pub conn_exp: Tick,
     /// Earliest tick at which a failed connect may be retried.
@@ -257,6 +262,8 @@ impl TcpSession {
             max_retries: retries,
             retry_after: Tick::ETERNITY,
             cli_exp: Tick::ETERNITY,
+            http_request_ms: 0,
+            req_exp: Tick::ETERNITY,
             srv_exp: Tick::ETERNITY,
             conn_exp: Tick::ETERNITY,
             bytes_in: 0,
@@ -400,6 +407,25 @@ impl TcpSession {
         } else {
             now.add(self.timeouts.client)
         };
+    }
+
+    /// Whether the request head is still being received: no transaction yet, and either
+    /// the connection is new or part of a request is here.
+    fn head_pending(&self) -> bool {
+        self.mode == Mode::Http && self.txn.is_none() && (self.is_first_req || !self.req.is_empty())
+    }
+
+    /// Starts `timeout http-request` when a request head starts, and ends it when the head
+    /// is complete.
+    pub fn arm_request(&mut self, now: Tick) {
+        if self.http_request_ms == 0 {
+            return;
+        }
+        if !self.head_pending() {
+            self.req_exp = Tick::ETERNITY;
+        } else if !self.req_exp.is_set() {
+            self.req_exp = now.add(self.http_request_ms);
+        }
     }
 
     fn arm_server(&mut self, now: Tick) {
@@ -1544,6 +1570,7 @@ impl TcpSession {
                 self.arm_server(now);
             }
         }
+        self.arm_request(now);
         Ok(())
     }
 
@@ -1568,6 +1595,15 @@ impl TcpSession {
                 return true;
             }
             self.cli_exp = Tick::ETERNITY;
+        }
+        if self.req_exp.is_expired(now) {
+            if self.head_pending() && self.cli_timer_live() {
+                // The head is not complete in time: the client's timeout, `408` and all.
+                self.cli_state = ScState::Error;
+                self.ending.get_or_insert(Ending::Timeout(Which::Client));
+                return true;
+            }
+            self.req_exp = Tick::ETERNITY;
         }
         if self.srv_exp.is_expired(now) {
             if self.srv_timer_live() {
@@ -1617,7 +1653,7 @@ impl TcpSession {
     /// The earliest deadline across both sides, for the scheduler's wait queue.
     #[must_use]
     pub fn next_expiry(&self) -> Tick {
-        let mut exp = self.cli_exp.earliest(self.srv_exp).earliest(self.conn_exp).earliest(self.retry_after);
+        let mut exp = self.cli_exp.earliest(self.req_exp).earliest(self.srv_exp).earliest(self.conn_exp).earliest(self.retry_after);
         if let Some(i_exp) = self.inspect_exp {
             if !self.tcp_inspect_done || self.be_inspect {
                 exp = exp.earliest(i_exp);
