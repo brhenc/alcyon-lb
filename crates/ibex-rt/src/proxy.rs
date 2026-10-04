@@ -1543,6 +1543,10 @@ impl TcpSession {
     }
 
     fn cli_timer_live(&self) -> bool {
+        // A tarpitted request is held for `timeout tarpit` alone.
+        if self.txn.as_ref().is_some_and(|t| t.body_wait.is_some_and(|w| w.tarpit)) {
+            return false;
+        }
         // Once an HTTP request is complete the client owes nothing until its response
         // starts: the wait belongs to `timeout server`, as in HAProxy.
         let awaiting_server = self.mode == Mode::Http

@@ -4745,7 +4745,7 @@ impl EngineDispatcher<'_> {
         // `timeout client` while the request is held for its body: the 408 the wait's own
         // time-out gives.
         if entry.sess.ending == Some(crate::proxy::Ending::Timeout(crate::proxy::Which::Client))
-            && entry.sess.txn.as_ref().is_some_and(|t| t.body_wait.is_some())
+            && entry.sess.txn.as_ref().is_some_and(|t| t.body_wait.is_some_and(|w| !w.tarpit))
         {
             let fe = &proxies[entry.proxy_idx];
             let page = proxy_error_response(&entry.sess, fe, fe, proxies, 408);
@@ -6259,6 +6259,45 @@ impl EngineDispatcher<'_> {
                         };
                         // Denied by the proxy: `PR`, not a rule's answer (`LR`).
                         sess.log.term = Some(*b"PR");
+                        send_proxy_reply(sess, &proxies[..], proxy_idx, pages_idx, &resp);
+                        return Ok(RuleFlow::Replied);
+                    }
+                    ibex_config::HttpReqAction::Tarpit { deny_status, content_type, lf_string, error_page } => {
+                        // The request is held until `timeout tarpit` (`timeout connect` when
+                        // unset) has passed, then answered like a `deny` with status 500.
+                        let now = fresh_tick(now);
+                        let held = sess.txn.as_ref().and_then(|t| t.body_wait).filter(|w| w.tarpit && w.backend == be_stage && w.rule == rule_idx);
+                        let deadline = held.map_or_else(
+                            || {
+                                let t = &proxies[proxy_idx].stats_config.raw_timeouts;
+                                // `http-request set-timeout tarpit` of this stream wins.
+                                let set = CURRENT_TIMEOUTS.with(|m| {
+                                    let m = m.borrow();
+                                    (m.get("cur_tarpit_timeout_set").copied() == Some(1)).then(|| m.get("cur_tarpit_timeout").copied()).flatten()
+                                });
+                                let ms = set.unwrap_or_else(|| t.tarpit.or(t.connect).map_or(0, millis_to_u32));
+                                now.add(ms)
+                            },
+                            |w| w.deadline,
+                        );
+                        if !deadline.is_expired(now) {
+                            if let Some(t) = sess.txn.as_mut() {
+                                t.body_wait = Some(crate::txn::BodyWait { backend: be_stage, rule: rule_idx, deadline, tarpit: true });
+                            }
+                            return Ok(RuleFlow::Suspend);
+                        }
+                        if let Some(t) = sess.txn.as_mut() {
+                            t.body_wait = None;
+                        }
+                        let status_code = deny_status.unwrap_or(500);
+                        let body = resolve_error_body(&proxies[pages_idx], &proxies[proxy_idx], status_code, error_page.as_ref(), content_type.as_ref(), lf_string.as_ref());
+                        let resp: Vec<u8> = match body {
+                            ResolvedErrorBody::Raw(bytes) => bytes.to_vec(),
+                            ResolvedErrorBody::Custom { content_type, lf_string } => {
+                                build_templated_error_response(status_code, content_type, lf_string, &make_ctx!(sess), registry)
+                            }
+                        };
+                        sess.log.term = Some(*b"PT");
                         send_proxy_reply(sess, &proxies[..], proxy_idx, pages_idx, &resp);
                         return Ok(RuleFlow::Replied);
                     }
@@ -7840,7 +7879,7 @@ fn wait_for_request_body(
     let pending = matches!(outcome, BodyWait::Pending);
     let ready = matches!(outcome, BodyWait::Ready);
     for txn in sess.txn.as_mut() {
-        txn.body_wait = pending.then_some(crate::txn::BodyWait { backend, rule, deadline });
+        txn.body_wait = pending.then_some(crate::txn::BodyWait { backend, rule, deadline, tarpit: false });
         if ready {
             txn.req_body = Some(std::mem::take(&mut body));
         }

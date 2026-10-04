@@ -41,6 +41,14 @@ pub enum HttpReqAction {
         /// `deny_status`), so the parser sets it in that case too.
         error_page: Option<ErrorPageSource>,
     },
+    /// Holds the request for `timeout tarpit` (`timeout connect` when unset), then answers
+    /// as `Deny` does, with status 500 unless given.
+    Tarpit {
+        deny_status: Option<u16>,
+        content_type: Option<String>,
+        lf_string: Option<String>,
+        error_page: Option<ErrorPageSource>,
+    },
     Allow,
     SetHeader {
         name: String,

@@ -293,7 +293,9 @@ fn parse_http_req_rule_at(
             cond,
             line: 0,
         });
-    } else if act_str == "deny" {
+    } else if act_str == "deny" || act_str == "tarpit" {
+        // `tarpit` takes the arguments of `deny`; its default status is 500, not 403.
+        let default_status = if act_str == "tarpit" { 500 } else { 403 };
         let cond_idx = find_cond_idx(tokens, 2);
         let limit = cond_idx.unwrap_or(tokens.len());
 
@@ -306,14 +308,14 @@ fn parse_http_req_rule_at(
         }
 
         let (content_type, lf_string, mut error_page) =
-            parse_error_body_args(tokens, 2, limit, deny_status.unwrap_or(403))?;
+            parse_error_body_args(tokens, 2, limit, deny_status.unwrap_or(default_status))?;
 
         // HAProxy: "for compatibility purposes, when no argument is defined, or only
         // 'deny_status', the argument 'default-errorfiles' is implied" -- i.e. a bare
         // `deny` (or one with only a status) must still consult the proxy's configured
         // error page, not synthesize an empty body the way a bare `return` does.
         if error_page.is_none() && content_type.is_none() && lf_string.is_none() {
-            super::error_pages::check_default_errorfiles(deny_status.unwrap_or(403), act_token)?;
+            super::error_pages::check_default_errorfiles(deny_status.unwrap_or(default_status), act_token)?;
             error_page = Some(ErrorPageSource::DefaultErrorfiles);
         }
 
@@ -323,11 +325,10 @@ fn parse_http_req_rule_at(
             None
         };
         rules.push(HttpReqRule {
-            action: HttpReqAction::Deny {
-                deny_status,
-                content_type,
-                lf_string,
-                error_page,
+            action: if act_str == "tarpit" {
+                HttpReqAction::Tarpit { deny_status, content_type, lf_string, error_page }
+            } else {
+                HttpReqAction::Deny { deny_status, content_type, lf_string, error_page }
             },
             cond,
             line: 0,

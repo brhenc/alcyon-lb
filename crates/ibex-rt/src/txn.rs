@@ -305,6 +305,9 @@ pub struct BodyWait {
     pub backend: bool,
     pub rule: usize,
     pub deadline: ibex_sched::Tick,
+    /// A `tarpit`, not a `wait-for-body`: the request is held until `deadline` whatever the
+    /// client does, and `timeout client` does not apply meanwhile.
+    pub tarpit: bool,
 }
 
 /// Where `http-response` rules are held for a body: the rule list (the backend's, then
