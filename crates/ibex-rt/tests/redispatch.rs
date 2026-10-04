@@ -231,3 +231,39 @@ fn the_interval_follows_stream_choose_redispatch() {
     assert!(!redispatch_due(5, 3, 1, true, false, 2, true), "a hash would choose the same server");
     assert!(!redispatch_due(5, 3, 1, true, false, 1, false), "one active server");
 }
+
+/// A retry on the same server waits `MIN(1s, timeout connect)` after a refused connect
+/// (`SC_ST_TAR`, `src/backend.c`). Measured on the reference with one closed port,
+/// `timeout connect 300ms`: `retries 2` answers 503 after 0.60 s, `retries 3` after 0.90 s,
+/// one turnaround per retry (the attempts themselves are refused at once).
+#[test]
+fn a_retry_on_the_same_server_waits_a_turnaround() {
+    let dead = common::reserve_port();
+    let port = common::reserve_port();
+    let cfg = format!(
+        "defaults\n  mode http\n  timeout connect 300ms\n  timeout client 3s\n  timeout server 3s\n  retries 2\n\
+         frontend f\n  bind 127.0.0.1:{port}\n  default_backend be\n\
+         backend be\n  server dead 127.0.0.1:{dead}\n"
+    );
+    let path = std::env::temp_dir().join(format!("ibex_t131_tar_{}", std::process::id()));
+    std::fs::write(&path, cfg).expect("write config");
+    let child = Command::new(env!("CARGO_BIN_EXE_ibex"))
+        .arg("-f")
+        .arg(&path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn ibex");
+    let _d = Daemon(child, path);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(Instant::now() < deadline, "the daemon never listened on {port}");
+        thread::sleep(Duration::from_millis(25));
+    }
+    let t = Instant::now();
+    let head = get_head(port, "/", "");
+    let took = t.elapsed();
+    assert_eq!(status_of(&head), "503");
+    assert!(took >= Duration::from_millis(550), "two retries took {took:?}, the reference waits 0.60 s");
+    assert!(took < Duration::from_millis(1500), "two retries took {took:?}");
+}

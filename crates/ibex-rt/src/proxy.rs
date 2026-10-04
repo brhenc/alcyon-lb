@@ -1591,7 +1591,9 @@ impl TcpSession {
         let awaiting_server = self.mode == Mode::Http
             && self.txn.as_ref().is_some_and(|t| t.req.is_done() && !t.local && t.error.is_none())
             && !self.has_pending_output();
+        // So is the turnaround before a retry (`SC_ST_TAR`).
         !awaiting_server
+            && !self.retry_after.is_set()
             && matches!(
                 self.cli_state,
                 ScState::Ready | ScState::Established | ScState::ShutR | ScState::ShutW
@@ -1611,7 +1613,7 @@ impl TcpSession {
     /// The earliest deadline across both sides, for the scheduler's wait queue.
     #[must_use]
     pub fn next_expiry(&self) -> Tick {
-        let mut exp = self.cli_exp.earliest(self.srv_exp).earliest(self.conn_exp);
+        let mut exp = self.cli_exp.earliest(self.srv_exp).earliest(self.conn_exp).earliest(self.retry_after);
         if let Some(i_exp) = self.inspect_exp {
             if !self.tcp_inspect_done {
                 exp = exp.earliest(i_exp);

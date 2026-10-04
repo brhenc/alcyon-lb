@@ -4307,7 +4307,11 @@ fn retry_server_connect(
     let source_ip = entry.sess.client_addr.map(|a| a.ip());
     let be = &proxies[be_idx];
     // `stream_choose_redispatch`: with `option redispatch` the retry may be balanced anew.
-    let redispatch = be.redisp && {
+    // A retry that waited out its turnaround (`SC_ST_TAR`) resumes here: the server was
+    // chosen, and counted, when the wait began.
+    let resuming = entry.sess.retry_after.is_set();
+    entry.sess.retry_after = Tick::ETERNITY;
+    let redispatch = !resuming && be.redisp && {
         let status_of = |i: usize| be.server_statuses.get(i).map(|s| s.load(Ordering::Relaxed));
         let running = old_idx.is_none_or(|i| {
             status_of(i).is_some_and(|s| s == ServerStatus::Up as u8 || s == ServerStatus::Drain as u8)
@@ -4327,7 +4331,9 @@ fn retry_server_connect(
             hash,
         )
     };
-    let target = if redispatch {
+    let target = if resuming {
+        entry.target_addr
+    } else if redispatch {
         let hash = matches!(proxies[be_idx].balance, BalanceAlgorithm::Source | BalanceAlgorithm::Uri);
         // The balancing algorithm is asked to avoid the server that just failed, unless it
         // is the only one left (`fwrr_get_next_server(.., prev_srv)` and the like).
@@ -4347,7 +4353,8 @@ fn retry_server_connect(
     // client's persistence cookie no longer holds (`SF_DIRECT` cleared, `TX_CK_DOWN`).
     let moved = target.is_some() && entry.target_addr.is_some() && target != entry.target_addr;
     let stats = &proxies[be_idx].stats[worker_id()];
-    if moved {
+    if resuming {
+    } else if moved {
         stats.redispatches.fetch_add(1, Ordering::Relaxed);
         entry.sess.txn.iter_mut().for_each(|txn| {
             txn.ck.direct = false;
@@ -4362,6 +4369,13 @@ fn retry_server_connect(
         entry.sess.srv_state = ScState::Error;
         return;
     };
+
+    // The same server again: wait `MIN(1s, timeout connect)` first (`SC_ST_TAR`,
+    // `src/backend.c`). `check_timeouts_and_retry` resumes the connect when it is over.
+    if !resuming && entry.target_addr == Some(target_addr) {
+        entry.sess.retry_after = now.add(entry.sess.retry_delay_ms());
+        return;
+    }
 
     let s_idx = proxies[be_idx]
         .servers
@@ -5084,6 +5098,10 @@ impl EngineDispatcher<'_> {
 
             // Step 2: Check timeouts
             let _ = entry.sess.check_timeouts(now);
+            // A retry that waited out its turnaround connects now.
+            if entry.sess.retry_after.is_set() && entry.sess.retry_after.is_expired(now) && !entry.sess.is_done() {
+                retry_server_connect(entry, self.proxies, self.fdtab, self.poller, now);
+            }
 
             // Step 3: Stream engine process pass
             if !entry.sess.is_done() {
