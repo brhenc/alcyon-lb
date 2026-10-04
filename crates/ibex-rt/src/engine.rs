@@ -7719,7 +7719,7 @@ impl EngineDispatcher<'_> {
                 let in_except = xot_excepts.iter().any(|e| !e.is_empty() && ip_in_cidr(ip, e));
                 if !in_except {
                     let ip_str = ip.to_string();
-                    set_req_header(&mut entry.sess, "X-Original-To", &ip_str);
+                    add_req_header(&mut entry.sess, "X-Original-To", &ip_str);
                 }
             }
         }

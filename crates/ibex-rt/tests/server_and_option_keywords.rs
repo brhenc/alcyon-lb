@@ -307,6 +307,33 @@ fn option_originalto_in_a_frontend_reaches_the_server() {
     );
 }
 
+/// A client that sends its own `X-Original-To`: `HAProxy` 3.5-dev8 (2026-10-04) keeps it and
+/// adds a second `x-original-to: 127.0.0.1` line after it, as it does for `x-forwarded-for`.
+/// Ibex replaced the client's header.
+#[test]
+fn option_originalto_adds_a_line_after_the_clients_own() {
+    let a = Backend::spawn();
+    let port = common::reserve_port();
+    let _d = start(
+        "originalto_add.cfg",
+        &format!(
+            "{DEFAULTS}frontend f\n  bind 127.0.0.1:{port}\n  option originalto\n  default_backend be\n\
+             backend be\n  server a 127.0.0.1:{}\n",
+            a.port
+        ),
+        port,
+    );
+    assert!(get(port, "/", "X-Original-To: foo\r\n").contains("200"));
+    let reqs = a.requests();
+    let vals: Vec<String> = reqs[0]
+        .lines()
+        .filter_map(|l| l.split_once(':'))
+        .filter(|(k, _)| k.trim().eq_ignore_ascii_case("x-original-to"))
+        .map(|(_, v)| v.trim().to_string())
+        .collect();
+    assert_eq!(vals, ["foo", "127.0.0.1"], "{:?}", reqs[0]);
+}
+
 /// `option redispatch` in `defaults`, `retries 1`, a dead first server. `HAProxy`: 4 of 4
 /// requests answered 200 by the live server. Ibex ignored the option in `defaults` and
 /// answered 503 to every request that was first sent to the dead server.
