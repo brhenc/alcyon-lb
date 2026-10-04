@@ -369,10 +369,10 @@ pub(crate) fn parse_listen_directive(
             parse_track_rule(&mut proxy.stick_rules, tokens, kw)
         }
         "tcp-request" => parse_listen_tcp_request(proxy, tokens, kw),
-        "http-request" => parse_http_req_rule(&mut proxy.http_req_rules, tokens, kw),
-        "http-response" => parse_http_res_rule(&mut proxy.http_res_rules, tokens, kw),
+        "http-request" => in_section(parse_http_req_rule(&mut proxy.http_req_rules, tokens, kw), "proxy", &proxy.name),
+        "http-response" => in_section(parse_http_res_rule(&mut proxy.http_res_rules, tokens, kw), "proxy", &proxy.name),
         "http-after-response" => {
-            parse_http_after_res_rule(&mut proxy.http_after_res_rules, tokens, kw)
+            in_section(parse_http_after_res_rule(&mut proxy.http_after_res_rules, tokens, kw), "proxy", &proxy.name)
         }
         "stats" => parse_stats_directive(&mut proxy.stats, tokens, kw),
         "http-check" => {
@@ -475,10 +475,10 @@ pub(crate) fn parse_frontend_directive(
             tokens[1].col,
             "'set-retries' only available in backend or listen section",
         )),
-        "http-request" => parse_http_req_rule(&mut fe.http_req_rules, tokens, kw),
-        "http-response" => parse_http_res_rule(&mut fe.http_res_rules, tokens, kw),
+        "http-request" => in_section(parse_http_req_rule(&mut fe.http_req_rules, tokens, kw), "frontend", &fe.name),
+        "http-response" => in_section(parse_http_res_rule(&mut fe.http_res_rules, tokens, kw), "frontend", &fe.name),
         "http-after-response" => {
-            parse_http_after_res_rule(&mut fe.http_after_res_rules, tokens, kw)
+            in_section(parse_http_after_res_rule(&mut fe.http_after_res_rules, tokens, kw), "frontend", &fe.name)
         }
         "mode" => parse_mode(&mut fe.mode, tokens, kw),
         "disabled" => {
@@ -603,10 +603,10 @@ pub(crate) fn parse_backend_directive(
         "default-server" => parse_default_server(&mut be.default_server, tokens, kw),
         "server" => parse_server(&mut be.servers, be.default_server.as_ref(), tokens, kw),
         "tcp-request" => parse_backend_tcp_request(be, tokens, kw),
-        "http-request" => parse_http_req_rule(&mut be.http_req_rules, tokens, kw),
-        "http-response" => parse_http_res_rule(&mut be.http_res_rules, tokens, kw),
+        "http-request" => in_section(parse_http_req_rule(&mut be.http_req_rules, tokens, kw), "backend", &be.name),
+        "http-response" => in_section(parse_http_res_rule(&mut be.http_res_rules, tokens, kw), "backend", &be.name),
         "http-after-response" => {
-            parse_http_after_res_rule(&mut be.http_after_res_rules, tokens, kw)
+            in_section(parse_http_after_res_rule(&mut be.http_after_res_rules, tokens, kw), "backend", &be.name)
         }
         "option" => parse_option_backend(be, tokens, kw),
         "no" => parse_no_backend(be, tokens, kw),

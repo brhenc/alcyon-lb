@@ -787,30 +787,48 @@ pub(crate) fn parse_http_req_rule(
             cond,
         });
     } else if act_str == "capture" {
-        let cond_idx = find_cond_idx(tokens, 2);
-        let limit = cond_idx.unwrap_or(tokens.len());
-        let expr = if limit > 2 { tokens[2].text.clone() } else { String::new() };
+        // `parse_http_req_capture`: `capture <sample> [ len <n> | id <idx> ]`, then nothing but
+        // a condition. `len` is read by atoi(3), `id` by strtol with a full-string check.
+        let refuse = |what: String| {
+            ConfigError::new(act_token.line, act_token.col, format!("error detected while parsing 'http-request capture' rule : {what}"))
+        };
+        let word = |i: usize| tokens.get(i).map_or("", |t| t.text.as_str());
+        let usage = "expects <expression> [ 'len' <length> | id <idx> ].";
+        if word(2).is_empty() {
+            return Err(refuse(usage.to_string()));
+        }
         let mut len = None;
         let mut id = None;
-        let mut i = 3;
-        while i < limit {
-            if tokens[i].text == "len" && i + 1 < limit {
-                len = Some(tokens[i + 1].text.parse::<usize>().unwrap_or(64));
-                i += 2;
-            } else if tokens[i].text == "id" && i + 1 < limit {
-                id = Some(tokens[i + 1].text.parse::<usize>().unwrap_or(0));
-                i += 2;
-            } else {
-                i += 1;
+        match word(3) {
+            "len" if !word(4).is_empty() => {
+                let t = word(4).trim_start();
+                let (neg, digits) = t.strip_prefix('-').map_or((false, t.strip_prefix('+').unwrap_or(t)), |d| (true, d));
+                let end = digits.find(|c: char| !c.is_ascii_digit()).unwrap_or(digits.len());
+                let n = digits[..end].parse::<usize>().unwrap_or(if end == 0 { 0 } else { usize::MAX });
+                if neg || n == 0 {
+                    return Err(refuse("length must be > 0.".to_string()));
+                }
+                len = Some(n);
             }
+            "id" if !word(4).is_empty() => match word(4).parse::<usize>() {
+                Ok(n) if word(4).bytes().all(|c| c.is_ascii_digit()) => id = Some(n),
+                _ => return Err(refuse(format!("cannot parse id '{}'.", word(4)))),
+            },
+            _ => return Err(refuse(usage.to_string())),
         }
-        let cond = if let Some(idx) = cond_idx {
-            parse_acl_condition_from_tokens(&tokens[idx..])?
-        } else {
-            None
+        let cond = match tokens.get(5) {
+            None => None,
+            Some(t) if t.text == "if" || t.text == "unless" => parse_acl_condition_from_tokens(&tokens[5..])?,
+            Some(t) => {
+                return Err(ConfigError::new(
+                    t.line,
+                    t.col,
+                    format!("'http-request capture' expects either 'if' or 'unless' followed by a condition but found '{}'.", t.text),
+                ))
+            }
         };
         rules.push(HttpReqRule {
-            action: HttpReqAction::Capture { expr, len, id },
+            action: HttpReqAction::Capture { expr: tokens[2].text.clone(), len, id },
             cond,
         });
     } else if act_str == "wait-for-body" {
@@ -1363,3 +1381,14 @@ pub(crate) fn parse_http_after_res_rule(
     Ok(())
 }
 
+
+/// HAProxy words a rule's parse error "error detected in <kind> '<name>' while parsing ...";
+/// the rule parsers do not know the section, so the caller names it here.
+pub(crate) fn in_section(r: Result<(), ConfigError>, kind: &str, name: &str) -> Result<(), ConfigError> {
+    r.map_err(|mut e| {
+        if let Some(rest) = e.message.strip_prefix("error detected while parsing") {
+            e.message = format!("error detected in {kind} '{name}' while parsing{rest}");
+        }
+        e
+    })
+}

@@ -296,3 +296,42 @@ fn a_response_capture_is_cut_by_bytes_not_characters() {
         assert!(lines.iter().any(|l| l.ends_with(&format!("LOG {logged}"))), "slot of {len} bytes: the log lines are {lines:?}");
     }
 }
+
+/// `http-request capture` is as strict as `HAProxy`'s `parse_http_req_capture`, and each
+/// message names the proxy it was found in. Measured on `HAProxy 3.5-dev8-885761-29`
+/// (2026-10-04), same configurations through `haproxy -c`.
+#[test]
+fn the_http_request_capture_forms_haproxy_refuses_are_refused_and_name_the_proxy() {
+    let fe = |rule: &str| format!("frontend fe\n  mode http\n  bind 127.0.0.1:1\n  declare capture request len 20\n  http-request capture req.hdr(host){rule}\n");
+    let cond = "expects either 'if' or 'unless' followed by a condition but found";
+    let refused = [
+        (fe(" len 5 id 0 if TRUE"), format!("{cond} 'id'.")),
+        (fe(" id 0 len 5"), format!("{cond} 'len'.")),
+        (fe(" len 5 bogus"), format!("{cond} 'bogus'.")),
+        (fe(" id 0 bogus"), format!("{cond} 'bogus'.")),
+        (fe(""), "error detected in frontend 'fe' while parsing 'http-request capture' rule : expects <expression> [ 'len' <length> | id <idx> ].".to_string()),
+        (fe(" len 0"), "error detected in frontend 'fe' while parsing 'http-request capture' rule : length must be > 0.".to_string()),
+        (fe(" len abc"), "error detected in frontend 'fe' while parsing 'http-request capture' rule : length must be > 0.".to_string()),
+        (
+            "backend be\n  mode http\n  http-request capture req.hdr(host)\n".to_string(),
+            "error detected in backend 'be' while parsing 'http-request capture' rule : expects <expression> [ 'len' <length> | id <idx> ].".to_string(),
+        ),
+        (
+            "listen li\n  mode http\n  http-response capture str(a)\n".to_string(),
+            "error detected in proxy 'li' while parsing 'http-response capture' rule : expects <expression> id <idx>.".to_string(),
+        ),
+        (
+            "defaults dd\n  mode http\n  http-response capture str(a)\n".to_string(),
+            "error detected in defaults 'dd' while parsing 'http-response capture' rule : expects <expression> id <idx>.".to_string(),
+        ),
+    ];
+    for (cfg, want) in &refused {
+        let (ok, out) = check(cfg);
+        assert!(!ok && out.contains(want.as_str()), "`ibex -c` on\n{cfg}\nwanted a refusal with {want:?}; accepted={ok}, said {out:?}");
+    }
+    for rule in [" id 0", " len 5", " len 5 if TRUE", " id 0 unless TRUE"] {
+        let cfg = fe(rule);
+        let (ok, out) = check(&cfg);
+        assert!(ok, "`ibex -c` refused\n{cfg}\nwhich haproxy accepts: {out:?}");
+    }
+}
