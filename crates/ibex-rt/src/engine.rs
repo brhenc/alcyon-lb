@@ -4487,6 +4487,7 @@ fn init_client_session(
     let fe = &proxies[proxy_idx];
     sess.accept_unsafe_request = fe.stats_config.accept_unsafe_request;
     sess.http_request_ms = fe.stats_config.raw_timeouts.http_request.map_or(0, millis_to_u32);
+    sess.keep_alive_ms = fe.stats_config.raw_timeouts.http_keep_alive.map_or(0, millis_to_u32);
     sess.arm_request(now);
     sess.keep_request_line = (!fe.log_target_idx.is_empty() && fe.log_format.as_ref().is_some_and(|f| f.uses_request_line()))
         || fe.unique_id_format.as_ref().is_some_and(|f| f.uses_request_line());
@@ -5676,6 +5677,9 @@ impl EngineDispatcher<'_> {
         // A reusable server connection stays on the session for the next request, which
         // takes it if routing sends it to the same server (`connect_http_backend`).
         entry.sess.reset_for_next_request();
+        // The wait for the next request starts with the response's end
+        // (`timeout http-keep-alive`).
+        entry.sess.arm_request(fresh_tick(now));
         // A next request already in the buffer has no socket event left to announce it:
         // run once more straight away. (Without one, the poller wakes the session.)
         if !entry.sess.req.is_empty() {
