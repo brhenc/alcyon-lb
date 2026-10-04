@@ -464,9 +464,9 @@ backend be
 
     assert_eq!(execute_cmd("show servers state nonexistent\n"), "Can't find backend.\n");
     
-    assert_eq!(execute_cmd("set server nosuch/s1 state maint\n"), "No such backend.\n");
-    assert_eq!(execute_cmd("set server be/nosuch state maint\n"), "No such server.\n");
-    assert_eq!(execute_cmd("set server be/nosuch maxconn 10\n"), "");
+    assert_eq!(execute_cmd("set server nosuch/s1 state maint\n"), "No such backend.\n\n");
+    assert_eq!(execute_cmd("set server be/nosuch state maint\n"), "No such server.\n\n");
+    assert_eq!(execute_cmd("set server be/nosuch maxconn 10\n"), "No such server.\n\n");
 
     let table = execute_cmd("show table be\n");
     assert!(table.contains("# table: be, type: ip, size:1048576, used:0"));

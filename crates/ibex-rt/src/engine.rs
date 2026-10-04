@@ -342,6 +342,11 @@ pub struct Proxy {
     pub server_cookies: Vec<Option<String>>,
     pub server_statuses: Arc<Vec<AtomicU8>>,
     pub server_weights: Vec<u32>,
+    /// Each server's configured weight (`iweight`): what `set server ... weight <n>%` is a share
+    /// of, and the `initial` of `get weight`. `server_weights` is the current one. Saved by
+    /// [`Proxy::set_weight`] the first time a weight changes, so a proxy whose weights never
+    /// change (all but the odd one) pays nothing for it: `None` means they are the current ones.
+    pub server_iweights: Option<Box<Vec<u32>>>,
     pub next_server_idx: Arc<AtomicUsize>,
     pub stats: Arc<Vec<ProxyStats>>,
     pub stats_config: ibex_config::StatsConfig,
@@ -467,7 +472,8 @@ impl Proxy {
         let active_up: Vec<usize> = (0..self.servers.len())
             .filter(|&idx| {
                 let is_backup = self.server_backups.get(idx).copied().unwrap_or(false);
-                !is_backup && is_server_available(idx)
+                // A weight of 0 (`set server ... weight 0`) takes no balanced traffic.
+                !is_backup && is_server_available(idx) && self.server_weights.get(idx).copied().unwrap_or(1) > 0
             })
             .collect();
 
@@ -681,6 +687,9 @@ pub struct Engine {
     pub applets: AppletArena,
     pub cli_listener: Option<UnixListener>,
     pub cli_socket_path: Option<PathBuf>,
+    /// The `level` of the stats socket (`stats socket ... level`): what each new CLI connection
+    /// may do. Unset means admin, as before the level was honoured.
+    pub cli_level: crate::applet::CliLevel,
     pub start_time: Instant,
     /// This process's id, read once: `std::process::id()` is a `getpid` syscall, and the
     /// dispatcher wants it on every step. Nothing forks after an engine is built (`-D`
@@ -1442,6 +1451,7 @@ fn init_proxy_from_listen(proxy_idx: usize, listen: &ibex_config::ListenSection,
             .iter()
             .map(|s| s.weight.unwrap_or(1))
             .collect(),
+        server_iweights: None,
         next_server_idx: Arc::new(AtomicUsize::new(0)),
         stats: Arc::new((0..nbthread).map(|_| ProxyStats::default()).collect()),
         stats_config: {
@@ -1545,6 +1555,7 @@ fn init_proxy_from_frontend(proxy_idx: usize, fe: &ibex_config::FrontendSection,
         server_cookies: Vec::new(),
         server_statuses: std::sync::Arc::new(Vec::new()),
         server_weights: Vec::new(),
+        server_iweights: None,
         next_server_idx: Arc::new(AtomicUsize::new(0)),
         stats: Arc::new((0..nbthread).map(|_| ProxyStats::default()).collect()),
         stats_config: {
@@ -1671,6 +1682,7 @@ fn init_proxy_from_backend(proxy_idx: usize, be: &ibex_config::BackendSection, n
         server_cookies: be.servers.iter().map(|s| s.cookie.clone()).collect(),
         server_statuses: Arc::new(be.servers.iter().map(|s| AtomicU8::new(initial_status(s))).collect()),
         server_weights: be.servers.iter().map(|s| s.weight.unwrap_or(1)).collect(),
+        server_iweights: None,
         next_server_idx: Arc::new(AtomicUsize::new(0)),
         stats: Arc::new((0..nbthread).map(|_| ProxyStats::default()).collect()),
         stats_config: {
@@ -1959,6 +1971,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             applets,
             cli_listener: None,
             cli_socket_path: None,
+            cli_level: crate::applet::CliLevel::Admin,
             start_time,
             pid: std::process::id(),
             now,
@@ -2013,6 +2026,11 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         self.cli_socket_ident = socket_file_ident(&path_buf);
         self.cli_socket_path = Some(path_buf);
         Ok(())
+    }
+
+    /// Sets the level new CLI connections start at (`stats socket ... level`).
+    pub fn set_cli_level(&mut self, level: crate::applet::CliLevel) {
+        self.cli_level = level;
     }
 
     /// Computes the current monotonic tick.
@@ -2305,7 +2323,9 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             match listener.accept() {
                 Ok((stream, _)) => {
                     let _ = stream.set_nonblocking(true);
-                    let applet = CliApplet::new(stream, self.now);
+                    let mut applet = CliApplet::new(stream, self.now);
+                    applet.level = self.cli_level;
+                    applet.socket_path = self.cli_socket_path.as_ref().map(|p| p.display().to_string());
                     let raw_fd = applet.raw_fd;
 
                     let Some(applet_idx) = self.applets.alloc(applet) else {
@@ -5853,6 +5873,7 @@ impl EngineDispatcher<'_> {
 
                     for (p_idx, proxy) in proxies.iter_mut().enumerate() {
                         if target_backend.is_none() || target_backend == Some(proxy.name.as_str()) {
+                            let mut weight_changes = Vec::new();
                             for (s_idx, sid) in proxy.server_ids.iter().enumerate() {
                                 if target_server.is_none() || target_server == Some(sid.as_str()) {
                                     let new_status = match cmd.action.as_str() {
@@ -5871,9 +5892,7 @@ impl EngineDispatcher<'_> {
                                         }
                                     }
                                     if let Some(w) = cmd.weight {
-                                        if s_idx < proxy.server_weights.len() {
-                                            proxy.server_weights[s_idx] = w;
-                                        }
+                                        weight_changes.push((s_idx, w));
                                     }
                                     if let Some(mc) = cmd.maxconn {
                                         if s_idx < proxy.server_maxconn.len() {
@@ -5881,6 +5900,9 @@ impl EngineDispatcher<'_> {
                                         }
                                     }
                                 }
+                            }
+                            for (s_idx, w) in weight_changes {
+                                proxy.set_weight(s_idx, w);
                             }
                         }
                     }

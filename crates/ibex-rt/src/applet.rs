@@ -42,8 +42,91 @@ pub struct AppletContext<'a> {
     pub now: Tick,
 }
 
+/// The privilege level of a CLI connection: the socket's `level`, which `user` and `operator`
+/// commands can only lower (`HAProxy`'s `ACCESS_LVL_*`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CliLevel {
+    User,
+    Operator,
+    Admin,
+}
+
+impl CliLevel {
+    /// The level a `stats socket ... level <name>` names.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "user" => Some(Self::User),
+            "operator" => Some(Self::Operator),
+            "admin" => Some(Self::Admin),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Operator => "operator",
+            Self::Admin => "admin",
+        }
+    }
+
+    /// The level a command needs, measured on `HAProxy` 3.5-dev8 by running each at every
+    /// level. Commands not listed here are admin-only, as most of HAProxy's are.
+    #[must_use]
+    pub fn required_for(cmd: &str) -> Self {
+        let is = |p: &str| cmd == p || cmd.starts_with(&format!("{p} "));
+        for p in [
+            "show info", "show stat", "show servers state", "show table", "show pools", "show version",
+            "show cli", "show resolvers", "show events", "show servers conn", "help", "prompt", "quit",
+            "set severity-output", "set timeout", "user",
+        ] {
+            if is(p) {
+                return Self::User;
+            }
+        }
+        for p in [
+            "show env", "get var", "get weight", "show sess", "show activity", "show fd", "show startup-logs",
+            "show errors", "operator",
+        ] {
+            if is(p) {
+                return Self::Operator;
+            }
+        }
+        if cmd == "clear counters" {
+            return Self::Operator;
+        }
+        Self::Admin
+    }
+}
+
+impl Proxy {
+    /// Server `idx`'s configured weight, whatever it is now.
+    #[must_use]
+    pub fn initial_weight(&self, idx: usize) -> u32 {
+        let from = self.server_iweights.as_deref().unwrap_or(&self.server_weights);
+        from.get(idx).copied().unwrap_or(1)
+    }
+
+    /// Changes server `idx`'s current weight, keeping the configured one for
+    /// [`Self::initial_weight`].
+    pub fn set_weight(&mut self, idx: usize, weight: u32) {
+        if self.server_iweights.is_none() {
+            self.server_iweights = Some(Box::new(self.server_weights.clone()));
+        }
+        if let Some(slot) = self.server_weights.get_mut(idx) {
+            *slot = weight;
+        }
+    }
+}
+
 /// A CLI applet connection session.
 pub struct CliApplet {
+    /// What this connection may do; starts at the socket's level.
+    pub level: CliLevel,
+    /// The socket the connection came in on, for `show cli sockets`.
+    pub socket_path: Option<String>,
     pub stream: Option<UnixStream>,
     pub raw_fd: RawFd,
     pub task: TaskRef,
@@ -63,6 +146,8 @@ impl CliApplet {
     pub fn new(stream: UnixStream, now: Tick) -> Self {
         let raw_fd = stream.as_raw_fd();
         CliApplet {
+            level: CliLevel::Admin,
+            socket_path: None,
             stream: Some(stream),
             raw_fd,
             task: TaskRef::NONE,
@@ -168,7 +253,21 @@ impl CliApplet {
 
     #[allow(clippy::too_many_lines)]
     fn execute_command(&mut self, cmd: &str, ctx: &mut AppletContext) {
-        if cmd == "prompt" {
+        if self.level < CliLevel::required_for(cmd) {
+            self.finish_msg("Permission denied");
+        } else if cmd == "user" || cmd == "operator" {
+            // The levels only go down.
+            self.level = self.level.min(if cmd == "user" { CliLevel::User } else { CliLevel::Operator });
+            self.finish_msg("");
+        } else if cmd == "show cli level" {
+            self.finish_msg(self.level.name());
+        } else if cmd == "show cli sockets" {
+            let sock = self.socket_path.clone().unwrap_or_default();
+            let msg = format!("# socket lvl processes\nunix@{sock} {} all", self.level.name());
+            self.finish_msg(&msg);
+        } else if cmd == "show version" {
+            self.finish_msg(env!("CARGO_PKG_VERSION"));
+        } else if cmd == "prompt" {
             self.interactive = true;
             self.out_buf.extend_from_slice(b"\n> ");
         } else if cmd == "quit" {
@@ -246,10 +345,20 @@ impl CliApplet {
                 for (s_idx, s) in p.server_ids.iter().enumerate() {
                     let addr = p.servers.get(s_idx).map_or_else(|| "-".to_string(), |a| a.ip().to_string());
                     let port = p.servers.get(s_idx).map_or_else(|| "-".to_string(), |a| a.port().to_string());
-                    let op_state = match p.server_statuses.get(s_idx).map(|s| s.load(std::sync::atomic::Ordering::Relaxed)) {
-                        Some(0 /* Up */) => 2,
+                    let status = p.server_statuses.get(s_idx).map(|s| ServerStatus::from(s.load(std::sync::atomic::Ordering::Relaxed)));
+                    // srv_op_state: 2 running, 0 stopped (a draining server still runs).
+                    let op_state = match status {
+                        Some(ServerStatus::Up | ServerStatus::Drain) => 2,
                         _ => 0,
                     };
+                    // srv_admin_state: SRV_ADMF_FMAINT 1, SRV_ADMF_FDRAIN 8.
+                    let admin_state = match status {
+                        Some(ServerStatus::Maint) => 1,
+                        Some(ServerStatus::Drain) => 8,
+                        _ => 0,
+                    };
+                    let uweight = p.server_weights.get(s_idx).copied().unwrap_or(1);
+                    let iweight = p.initial_weight(s_idx);
                     
                     let mut check_status = 1;
                     let mut check_result = 0;
@@ -300,8 +409,8 @@ impl CliApplet {
 
                     self.out_buf.extend_from_slice(
                         format!(
-                            "{} {} {} {} {} {} 0 1 1 1 {} {} {} {} 0 0 0 - {} - 0 0 - - 0\n",
-                            p.id, p.name, s_idx + 1, s, addr, op_state, check_status, check_result, check_health, check_state, port
+                            "{} {} {} {} {} {} {} {} {} 1 {} {} {} {} 0 0 0 - {} - 0 0 - - 0\n",
+                            p.id, p.name, s_idx + 1, s, addr, op_state, admin_state, uweight, iweight, check_status, check_result, check_health, check_state, port
                         ).as_bytes()
                     );
                 }
@@ -343,11 +452,11 @@ impl CliApplet {
             self.handle_enable_server(target.trim(), ctx);
         } else if let Some(target) = cmd.strip_prefix("disable server ") {
             self.handle_disable_server(target.trim(), ctx);
-        } else if let Some(rest) = cmd.strip_prefix("set server ") {
+        } else if let Some(rest) = cmd.strip_prefix("set server").filter(|r| r.is_empty() || r.starts_with(' ')) {
             self.handle_set_server(rest.trim(), ctx);
-        } else if let Some(rest) = cmd.strip_prefix("get weight ") {
+        } else if let Some(rest) = cmd.strip_prefix("get weight").filter(|r| r.is_empty() || r.starts_with(' ')) {
             self.handle_get_weight(rest.trim(), ctx);
-        } else if let Some(rest) = cmd.strip_prefix("set weight ") {
+        } else if let Some(rest) = cmd.strip_prefix("set weight").filter(|r| r.is_empty() || r.starts_with(' ')) {
             self.handle_set_weight(rest.trim(), ctx);
         } else if let Some(rest) = cmd.strip_prefix("set maxconn ") {
             self.handle_set_maxconn(rest.trim(), ctx);
@@ -838,29 +947,43 @@ impl CliApplet {
 
     fn handle_set_maxconn(&mut self, rest: &str, ctx: &mut AppletContext) {
         let parts: Vec<&str> = rest.split_whitespace().collect();
-        let mut ok = false;
-        if parts.len() >= 3 && parts[0] == "server" {
-            if let Ok(val) = parts[2].parse::<u32>() {
-                if let Some((px, sv)) = parts[1].split_once('/') {
-                    ok = crate::engine::set_proxy_maxconn(ctx.proxies, px, Some(sv), val);
+        match parts.first().copied() {
+            Some(kind @ ("server" | "frontend" | "backend")) => {
+                let mut sv = None;
+                let px_name;
+                let target = parts.get(1).copied().unwrap_or("");
+                if kind == "server" {
+                    match Self::find_server(target, ctx) {
+                        Ok((p_idx, s_idx)) => {
+                            px_name = ctx.proxies[p_idx].name.clone();
+                            sv = Some(ctx.proxies[p_idx].server_ids[s_idx].clone());
+                        }
+                        Err(msg) => {
+                            self.finish_msg(msg);
+                            return;
+                        }
+                    }
+                } else if ctx.proxies.iter().any(|p| p.name == target) {
+                    px_name = target.to_string();
+                } else {
+                    self.finish_msg(if kind == "frontend" { "No such frontend." } else { "No such backend." });
+                    return;
                 }
+                let Some(val_s) = parts.get(2).copied() else {
+                    self.finish_msg("Require <maxconn>.");
+                    return;
+                };
+                let Ok(val) = val_s.parse::<u32>() else {
+                    self.finish_msg("maxconn string empty or preceded by garbage");
+                    return;
+                };
+                // `server_maxconn` and `Proxy::maxconn` are what admission reads.
+                let _ = crate::engine::set_proxy_maxconn(ctx.proxies, &px_name, sv.as_deref(), val);
+                self.finish_msg("");
             }
-        } else if parts.len() >= 3 && (parts[0] == "frontend" || parts[0] == "backend") {
-            if let Ok(val) = parts[2].parse::<u32>() {
-                ok = crate::engine::set_proxy_maxconn(ctx.proxies, parts[1], None, val);
-            }
-        } else if parts.len() >= 2 {
-            if let Ok(val) = parts[1].parse::<u32>() {
-                ok = crate::engine::set_proxy_maxconn(ctx.proxies, parts[0], None, val);
-            }
-        }
-        if !ok {
-            self.out_buf.extend_from_slice(b"No such target or invalid maxconn.\n");
-        }
-        if self.interactive {
-            self.out_buf.extend_from_slice(b"\n> ");
-        } else {
-            self.is_done = true;
+            // Not implemented: the global maxconn is not enforced anywhere, so accepting it
+            // would be accepting and dropping it.
+            _ => self.finish_msg("No such target or invalid maxconn."),
         }
     }
 
@@ -948,122 +1071,183 @@ impl CliApplet {
         }
     }
 
-    fn handle_set_server(&mut self, rest: &str, ctx: &mut AppletContext) {
-        let parts: Vec<&str> = rest.split_whitespace().collect();
-        if parts.len() >= 3 && parts[1] == "state" {
-            let target = parts[0];
-            let state = parts[2];
-            let Some((px_name, sv_name)) = target.split_once('/') else {
-                self.out_buf.extend_from_slice(b"Require 'backend/server'.\n");
-                if self.interactive {
-                    self.out_buf.extend_from_slice(b"\n> ");
-                } else {
-                    self.is_done = true;
-                }
-                return;
-            };
-            let new_status = match state {
-                "ready" => Some(ServerStatus::Up),
-                "maint" => Some(ServerStatus::Maint),
-                "drain" => Some(ServerStatus::Drain),
-                _ => None,
-            };
-
-            if let Some(status) = new_status {
-                let mut found_px = false;
-                let mut found_sv = false;
-                for (p_idx, proxy) in ctx.proxies.iter_mut().enumerate() {
-                    if proxy.name == px_name {
-                        found_px = true;
-                        for (s_idx, sid) in proxy.server_ids.iter().enumerate() {
-                            if sid == sv_name {
-                                found_sv = true;
-                                proxy.server_statuses[s_idx].store(status as u8, std::sync::atomic::Ordering::Relaxed);
-                                if let Some(check) = ctx
-                                    .checks
-                                    .iter_mut()
-                                    .find(|c| c.proxy_idx == p_idx && c.server_idx == s_idx)
-                                {
-                                    check.status = status;
-                                }
-                            }
-                        }
-                    }
-                }
-                if !found_px {
-                    self.out_buf.extend_from_slice(b"No such backend.\n");
-                } else if !found_sv {
-                    self.out_buf.extend_from_slice(b"No such server.\n");
-                }
-            }
-        } else if parts.len() >= 3 && parts[1] == "maxconn" {
-            let target = parts[0];
-            if let Ok(val) = parts[2].parse::<u32>() {
-                let (px_name, sv_name) = match target.split_once('/') {
-                    Some(pair) => pair,
-                    None => ("", target),
-                };
-                let _ = crate::engine::set_proxy_maxconn(ctx.proxies, px_name, Some(sv_name), val);
-            }
+    /// Ends a command that answers `msg` (empty for success): HAProxy's CLI prints the message
+    /// and one more empty line, so a command with nothing to say still answers `"\n"`.
+    fn finish_msg(&mut self, msg: &str) {
+        if !msg.is_empty() {
+            self.out_buf.extend_from_slice(msg.as_bytes());
+            self.out_buf.push(b'\n');
         }
         if self.interactive {
             self.out_buf.extend_from_slice(b"\n> ");
         } else {
+            self.out_buf.push(b'\n');
             self.is_done = true;
         }
     }
 
-    fn handle_get_weight(&mut self, target: &str, ctx: &mut AppletContext) {
-        let (px_name, sv_name) = match target.split_once('/') {
-            Some(pair) => pair,
-            None => ("", target),
+    /// Resolves `<backend>/<server>` to its indices, or the message HAProxy answers.
+    fn find_server(target: &str, ctx: &AppletContext) -> Result<(usize, usize), &'static str> {
+        let Some((px_name, sv_name)) = target.split_once('/') else {
+            return Err("Require 'backend/server'.");
         };
-        let mut found = false;
-        for proxy in ctx.proxies.iter() {
-            if px_name.is_empty() || proxy.name == px_name {
-                for (s_idx, sid) in proxy.server_ids.iter().enumerate() {
-                    if sid == sv_name {
-                        found = true;
-                        let w = proxy.server_weights.get(s_idx).copied().unwrap_or(1);
-                        self.out_buf.extend_from_slice(format!("{} (initial {})\n", w, w).as_bytes());
-                        break;
-                    }
+        let mut found_px = false;
+        for (p_idx, proxy) in ctx.proxies.iter().enumerate() {
+            if proxy.name == px_name {
+                found_px = true;
+                if let Some(s_idx) = proxy.server_ids.iter().position(|sid| sid == sv_name) {
+                    return Ok((p_idx, s_idx));
                 }
             }
         }
-        if !found {
-            self.out_buf.extend_from_slice(b"No such server.\n");
+        Err(if found_px { "No such server." } else { "No such backend." })
+    }
+
+    /// The new weight `arg` asks for (`<n>` or `<n>%` of `iweight`), or HAProxy's message
+    /// (`server_parse_weight_change_request`, `src/server.c`).
+    fn parse_weight_change(arg: &str, iweight: u32) -> Result<u32, &'static str> {
+        let digits_end = arg
+            .char_indices()
+            .find(|&(i, c)| !(c.is_ascii_digit() || (i == 0 && (c == '-' || c == '+'))))
+            .map_or(arg.len(), |(i, _)| i);
+        let (num, rest) = arg.split_at(digits_end);
+        if num.is_empty() || num == "-" || num == "+" {
+            return Err("Empty weight string empty or preceded by garbage");
         }
-        if self.interactive {
-            self.out_buf.extend_from_slice(b"\n> ");
+        let relative = rest.starts_with('%');
+        let trailing = if relative { &rest[1..] } else { rest };
+        if !trailing.is_empty() {
+            return Err("Trailing garbage in weight string");
+        }
+        let n: i64 = num.parse().unwrap_or(if num.starts_with('-') { i64::MIN } else { i64::MAX });
+        if relative {
+            if n < 0 {
+                return Err("Relative weight must be positive.");
+            }
+            let w = (i64::from(iweight).saturating_mul(n) / 100).min(256);
+            Ok(u32::try_from(w).unwrap_or(256))
+        } else if (0..=256).contains(&n) {
+            Ok(u32::try_from(n).unwrap_or(256))
         } else {
-            self.is_done = true;
+            Err("Absolute weight can only be between 0 and 256 inclusive.")
+        }
+    }
+
+    fn apply_weight(&mut self, ctx: &mut AppletContext, loc: (usize, usize), arg: Option<&str>) {
+        let Some(arg) = arg else {
+            self.finish_msg("Require <weight> or <weight%>.");
+            return;
+        };
+        let (p_idx, s_idx) = loc;
+        let iw = ctx.proxies[p_idx].initial_weight(s_idx);
+        match Self::parse_weight_change(arg, iw) {
+            Ok(w) => {
+                // Read by every balancing algorithm (`lb.rs`) and by `show stat`.
+                ctx.proxies[p_idx].set_weight(s_idx, w);
+                self.finish_msg("");
+            }
+            Err(msg) => self.finish_msg(msg),
+        }
+    }
+
+    fn handle_set_server(&mut self, rest: &str, ctx: &mut AppletContext) {
+        const USAGE: &str = "usage: set server <backend>/<server> addr | agent | agent-addr | agent-port | agent-send | check-addr | check-port | fqdn | health | name | ssl | state | weight";
+        let parts: Vec<&str> = rest.split_whitespace().collect();
+        let Some(&target) = parts.first() else {
+            self.finish_msg("Require 'backend/server'.");
+            return;
+        };
+        let loc = match Self::find_server(target, ctx) {
+            Ok(l) => l,
+            Err(msg) => {
+                self.finish_msg(msg);
+                return;
+            }
+        };
+        let (p_idx, s_idx) = loc;
+        match parts.get(1).copied() {
+            Some("state") => {
+                let status = match parts.get(2).copied() {
+                    Some("ready") => ServerStatus::Up,
+                    Some("maint") => ServerStatus::Maint,
+                    Some("drain") => ServerStatus::Drain,
+                    _ => {
+                        self.finish_msg("'set server <srv> state' expects 'ready', 'drain' and 'maint'.");
+                        return;
+                    }
+                };
+                ctx.proxies[p_idx].server_statuses[s_idx].store(status as u8, std::sync::atomic::Ordering::Relaxed);
+                if let Some(check) = ctx.checks.iter_mut().find(|c| c.proxy_idx == p_idx && c.server_idx == s_idx) {
+                    check.status = status;
+                }
+                self.finish_msg("");
+            }
+            Some("weight") => self.apply_weight(ctx, loc, parts.get(2).copied()),
+            Some("addr") => {
+                let Some(&ip_s) = parts.get(2) else {
+                    self.finish_msg("set server <b>/<s> addr requires an address and optionally a port.");
+                    return;
+                };
+                let Ok(ip) = ip_s.parse::<std::net::IpAddr>() else {
+                    self.finish_msg(&format!("Invalid addr '{ip_s}'"));
+                    return;
+                };
+                let old = ctx.proxies[p_idx].servers[s_idx];
+                let mut new_port = old.port();
+                if parts.get(3) == Some(&"port") {
+                    let p_s = parts.get(4).copied().unwrap_or("");
+                    match p_s.parse::<i64>() {
+                        // HAProxy keeps the low 16 bits of what it parsed.
+                        Ok(n) => new_port = (n & 0xffff) as u16,
+                        Err(_) => {
+                            self.finish_msg(&format!("problem converting port '{p_s}' to an int"));
+                            return;
+                        }
+                    }
+                }
+                let new = std::net::SocketAddr::new(ip, new_port);
+                let mut msg = String::new();
+                if new.ip() != old.ip() {
+                    msg.push_str(&format!("IP changed from '{}' to '{}'", old.ip(), new.ip()));
+                }
+                if new.port() != old.port() {
+                    let sep = if msg.is_empty() { "" } else { ", " };
+                    msg.push_str(&format!("{sep}port changed from '{}' to '{}'", old.port(), new.port()));
+                }
+                if msg.is_empty() {
+                    self.finish_msg("nothing changed");
+                    return;
+                }
+                msg.push_str(" by 'stats socket command'");
+                // `proxy.servers` is where every connection to this server takes its address.
+                ctx.proxies[p_idx].servers[s_idx] = new;
+                if let Some(check) = ctx.checks.iter_mut().find(|c| c.proxy_idx == p_idx && c.server_idx == s_idx) {
+                    check.addr = new;
+                }
+                self.finish_msg(&msg);
+            }
+            _ => self.finish_msg(USAGE),
+        }
+    }
+
+    fn handle_get_weight(&mut self, target: &str, ctx: &mut AppletContext) {
+        let target = target.split_whitespace().next().unwrap_or("");
+        match Self::find_server(target, ctx) {
+            Ok((p_idx, s_idx)) => {
+                let px = &ctx.proxies[p_idx];
+                let w = px.server_weights.get(s_idx).copied().unwrap_or(1);
+                let iw = px.initial_weight(s_idx);
+                self.finish_msg(&format!("{w} (initial {iw})"));
+            }
+            Err(msg) => self.finish_msg(msg),
         }
     }
 
     fn handle_set_weight(&mut self, rest: &str, ctx: &mut AppletContext) {
         let parts: Vec<&str> = rest.split_whitespace().collect();
-        if parts.len() >= 2 {
-            if let Ok(w) = parts[1].parse::<u32>() {
-                let (px_name, sv_name) = match parts[0].split_once('/') {
-                    Some(pair) => pair,
-                    None => ("", parts[0]),
-                };
-                for proxy in ctx.proxies.iter_mut() {
-                    if px_name.is_empty() || proxy.name == px_name {
-                        for (s_idx, sid) in proxy.server_ids.iter().enumerate() {
-                            if sid == sv_name && s_idx < proxy.server_weights.len() {
-                                proxy.server_weights[s_idx] = w;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        if self.interactive {
-            self.out_buf.extend_from_slice(b"\n> ");
-        } else {
-            self.is_done = true;
+        match Self::find_server(parts.first().copied().unwrap_or(""), ctx) {
+            Ok(loc) => self.apply_weight(ctx, loc, parts.get(1).copied()),
+            Err(msg) => self.finish_msg(msg),
         }
     }
 

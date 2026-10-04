@@ -35,6 +35,15 @@ pub fn is_server_available(proxy: &Proxy, idx: usize) -> bool {
     true
 }
 
+/// [`is_server_available`] and a weight above zero: the balancing algorithms never pick a
+/// server whose weight is 0 (`set server ... weight 0`, `weight 0` on the line), as in
+/// HAProxy, where it takes only what persistence or `use-server` sends it.
+#[inline]
+#[must_use]
+fn is_selectable(proxy: &Proxy, idx: usize) -> bool {
+    is_server_available(proxy, idx) && proxy.server_weights.get(idx).copied().unwrap_or(1) > 0
+}
+
 /// Determines whether a server at `idx` is UP, ignoring its connection load. Used to build
 /// the hash ring's candidate set: a consistent hash ring includes every UP server regardless
 /// of `maxconn`, and only `hash-preserve-affinity` decides whether a saturated server is
@@ -52,7 +61,7 @@ fn is_server_up(proxy: &Proxy, idx: usize) -> bool {
 /// `recount_servers`; Ibex refuses `option allbackups`, which would use them all).
 #[must_use]
 pub fn first_backup(proxy: &Proxy) -> Option<usize> {
-    (0..proxy.servers.len()).find(|&idx| proxy.server_backups.get(idx).copied().unwrap_or(false) && is_server_available(proxy, idx))
+    (0..proxy.servers.len()).find(|&idx| proxy.server_backups.get(idx).copied().unwrap_or(false) && is_selectable(proxy, idx))
 }
 
 /// First Available Server (`balance first`).
@@ -62,7 +71,7 @@ pub fn first_backup(proxy: &Proxy) -> Option<usize> {
 pub fn first(proxy: &Proxy) -> Option<usize> {
     for idx in 0..proxy.servers.len() {
         let is_backup = proxy.server_backups.get(idx).copied().unwrap_or(false);
-        if !is_backup && is_server_available(proxy, idx) {
+        if !is_backup && is_selectable(proxy, idx) {
             return Some(idx);
         }
     }
@@ -109,7 +118,7 @@ fn weighted_eligible(proxy: &Proxy) -> (Vec<(usize, u32)>, u32) {
     let mut eligible_primaries = Vec::new();
     for idx in 0..proxy.servers.len() {
         let is_backup = proxy.server_backups.get(idx).copied().unwrap_or(false);
-        if !is_backup && is_server_available(proxy, idx) {
+        if !is_backup && is_selectable(proxy, idx) {
             let w = proxy.server_weights.get(idx).copied().unwrap_or(1).max(1);
             total_weight = total_weight.saturating_add(w);
             eligible_primaries.push((idx, w));
@@ -184,7 +193,7 @@ pub fn leastconn(proxy: &Proxy) -> Option<usize> {
     // First pass: try primary (non-backup) servers
     for idx in 0..proxy.servers.len() {
         let is_backup = proxy.server_backups.get(idx).copied().unwrap_or(false);
-        if !is_backup && is_server_available(proxy, idx) {
+        if !is_backup && is_selectable(proxy, idx) {
             let conn = u64::from(proxy.server_actconn.get(idx).map_or(0, |a| a.load(Ordering::Relaxed)));
             let weight = u64::from(proxy.server_weights.get(idx).copied().unwrap_or(1).max(1));
 
@@ -223,7 +232,7 @@ pub fn static_rr(proxy: &Proxy) -> Option<usize> {
 
     for idx in 0..proxy.servers.len() {
         let is_backup = proxy.server_backups.get(idx).copied().unwrap_or(false);
-        if !is_backup && is_server_available(proxy, idx) {
+        if !is_backup && is_selectable(proxy, idx) {
             let w = proxy.server_weights.get(idx).copied().unwrap_or(1).max(1);
             total_weight = total_weight.saturating_add(w);
             eligible_primaries.push((idx, w));
@@ -277,7 +286,7 @@ pub fn balance_uri(proxy: &Proxy, uri: &str) -> Option<usize> {
 
     for idx in 0..proxy.servers.len() {
         let is_backup = proxy.server_backups.get(idx).copied().unwrap_or(false);
-        if !is_backup && is_server_available(proxy, idx) {
+        if !is_backup && is_selectable(proxy, idx) {
             let w = proxy.server_weights.get(idx).copied().unwrap_or(1).max(1);
             total_weight = total_weight.saturating_add(w);
             eligible_primaries.push((idx, w));

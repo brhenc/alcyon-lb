@@ -36,7 +36,7 @@ fn cli_commands_coverage() {
     cli1.set_nonblocking(true).unwrap();
     let mut out1 = String::new();
     let _ = cli1.read_to_string(&mut out1);
-    assert_eq!(out1, "1 (initial 1)\n");
+    assert_eq!(out1, "1 (initial 1)\n\n");
 
     // Command 2: show servers state
     let mut cli2 = UnixStream::connect(&cli_sock_path).unwrap();

@@ -62,6 +62,16 @@ pub(crate) fn parse_global_directive(
                         }
                         "level" if i + 1 < tokens.len() => {
                             i += 1;
+                            if !matches!(tokens[i].text.as_str(), "user" | "operator" | "admin") {
+                                return Err(ConfigError::new(
+                                    tokens[i].line,
+                                    tokens[i].col,
+                                    format!(
+                                        "'stats socket' : ''level' only supports 'user', 'operator', and 'admin' (got '{}')'",
+                                        tokens[i].text
+                                    ),
+                                ));
+                            }
                             global.stats_socket_level = Some(tokens[i].text.clone());
                         }
                         // Until this arm existed, `expose-fd listeners` fell into the

@@ -716,6 +716,11 @@ fn main() {
     });
     
     let stats_socket_mode = config.global.as_ref().and_then(|g| g.stats_socket_mode);
+    let stats_socket_level = config
+        .global
+        .as_ref()
+        .and_then(|g| g.stats_socket_level.as_deref())
+        .and_then(ibex_rt::applet::CliLevel::parse);
 
     // 12b. Hitless reload: take the listening sockets over from the old process rather
     //      than binding new ones, so the connections already queued on them survive it
@@ -764,6 +769,9 @@ fn main() {
 
             if worker_id == 0 {
                 if let Some(ref sock_path) = cli_socket_clone {
+                    if let Some(level) = stats_socket_level {
+                        engine.set_cli_level(level);
+                    }
                     if let Err(err) = engine.bind_cli_socket(sock_path) {
                         eprintln!("Failed to bind CLI / stats socket '{}': {}", sock_path.display(), err);
                         process::exit(1);
