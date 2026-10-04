@@ -6,6 +6,7 @@ use super::*;
 #[allow(clippy::too_many_lines)]
 pub(crate) fn parse_server(
     servers: &mut Vec<Server>,
+    extras: &mut ServerExtras,
     default_server: Option<&DefaultServerConfig>,
     tokens: &[Token],
     kw: &Token,
@@ -40,6 +41,12 @@ pub(crate) fn parse_server(
     let mut ssl = default_server.map(|d| d.ssl.clone()).unwrap_or_default();
     let mut disabled = default_server.is_some_and(|d| d.disabled);
     let mut track = default_server.and_then(|d| d.track.clone());
+    let mut puid = 0u32;
+    let index = u32::try_from(servers.len()).unwrap_or(u32::MAX);
+    // `srv_check_health` of a server nothing checks: the last `rise` given (`srv_settings_cpy`
+    // copies the one of `default-server`, `srv_parse_check_rise` sets it again), 0 when there
+    // is none, and for a server `disabled` after it.
+    let mut health = if disabled { 0 } else { default_server.and_then(|d| d.rise).unwrap_or(0) };
 
     // Every keyword HAProxy knows is either implemented here or listed, with what Ibex
     // does about it, in `server_keywords.rs`. A keyword's argument is consumed with it.
@@ -61,7 +68,9 @@ pub(crate) fn parse_server(
                 i += 1;
             }
             "rise" => {
-                rise = Some(parse_u32(server_kw_arg(tokens, i, who, "expects an integer argument.")?, "rise")?);
+                let value = parse_u32(server_kw_arg(tokens, i, who, "expects an integer argument.")?, "rise")?;
+                rise = Some(value);
+                health = value;
                 i += 1;
             }
             "send-proxy" => send_proxy = true,
@@ -100,10 +109,38 @@ pub(crate) fn parse_server(
                 i += 1;
                 proxy_v2_unique_id |= parse_proxy_v2_options(tokens.get(i), kw)?;
             }
+            "id" => {
+                // `srv_parse_id`: `atol`, then 1 to `u32::MAX`; a name is 0.
+                let arg = server_kw_arg(tokens, i, who, "expects an integer argument")?;
+                let digits: String = arg.text.chars().take_while(char::is_ascii_digit).collect();
+                let value = digits.parse::<u64>().unwrap_or(0);
+                let Some(id) = u32::try_from(value).ok().filter(|&v| v >= 1) else {
+                    return Err(ConfigError::new(
+                        arg.line,
+                        arg.col,
+                        format!("'server {}' : 'id' : custom id has to be between 1 and 4294967295.", tokens[1].text),
+                    ));
+                };
+                if let Some(other) = extras.puid.iter().find(|e| e.1 == id).and_then(|e| servers.get(e.0 as usize)) {
+                    return Err(ConfigError::new(
+                        arg.line,
+                        arg.col,
+                        format!("'server {}' : 'id' : custom id {id} already used by 'server {}'", tokens[1].text, other.id),
+                    ));
+                }
+                puid = id;
+                i += 1;
+            }
             "backup" => backup = true,
             "no-backup" => backup = false,
-            "disabled" => disabled = true,
-            "enabled" => disabled = false,
+            "disabled" => {
+                disabled = true;
+                health = 0;
+            }
+            "enabled" => {
+                disabled = false;
+                health = rise.unwrap_or(0);
+            }
             "track" => {
                 track = Some(server_kw_arg(tokens, i, who, "expects [<proxy>/]<server> as argument.")?.text.as_str().into());
                 i += 1;
@@ -117,6 +154,13 @@ pub(crate) fn parse_server(
     }
     validate_server_ssl(&ssl, check_port, kw, who)?;
 
+    // Kept apart from the server: a backend of 60,000 of them must stay small.
+    if health != 0 {
+        extras.init_health.push((index, health));
+    }
+    if puid != 0 {
+        extras.puid.push((index, puid));
+    }
     servers.push(Server {
         check_port,
         check_proto,

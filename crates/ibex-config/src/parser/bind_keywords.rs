@@ -50,7 +50,6 @@ pub(crate) const UNIMPLEMENTED_BIND_KEYWORDS: &[BindKeyword] = &[
     refuse!("gid", 1),
     refuse!("group", 1),
     ignore!("guid-prefix", 1, "a global identifier for the CLI and stats"),
-    ignore!("id", 1, "the listener's numeric id"),
     ignore!("idle-ping", 1, "idle connection pings"),
     refuse!("interface", 1),
     ignore!("label", 1, "a name for the stats"),

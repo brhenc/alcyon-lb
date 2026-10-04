@@ -8,7 +8,7 @@ use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
-use crate::ast::{
+use crate::ast::{ProxyKind, ServerExtras, 
     clear_http_errors_sections, clear_resolved_checks, http_errors_section, http_errors_section_code,
     register_http_errors_section, register_resolved_check, register_resolved_check_for_addr,
     AclCondition, AclRule, AclTerm, BackendSection, BalanceAlgorithm, BindConfig, Config, CookieConfig,
@@ -90,6 +90,18 @@ pub(crate) enum CurrentSection {
     HttpErrors(String, std::collections::HashMap<u16, Vec<u8>>),
 }
 
+impl CurrentSection {
+    /// The kind, the name and the `id` of a proxy section that has given one.
+    fn explicit_id(&self) -> Option<(&'static str, &str, u32)> {
+        match self {
+            Self::Listen(l) => l.id.map(|id| ("listen", l.name.as_str(), id)),
+            Self::Frontend(f) => f.id.map(|id| ("frontend", f.name.as_str(), id)),
+            Self::Backend(b) => b.id.map(|id| ("backend", b.name.as_str(), id)),
+            _ => None,
+        }
+    }
+}
+
 pub(crate) mod global;
 pub(crate) use global::*;
 pub(crate) mod defaults;
@@ -161,6 +173,10 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
     let mut backends = Vec::new();
     let mut cur_section: Option<CurrentSection> = None;
     let mut sample_refs = Vec::new();
+    // The proxy sections in the order written, and the explicit `id` of each, for the
+    // numbering of the others (`Config::proxy_ids`) and for refusing a reused one.
+    let mut proxy_order: Vec<(ProxyKind, usize)> = Vec::new();
+    let mut explicit_ids: Vec<(u32, &'static str, String, usize)> = Vec::new();
     // Where each named defaults section starts, and what kind of section first inherited
     // from it, for [`check_inheritance`].
     let mut defaults_lines: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
@@ -253,6 +269,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut backends,
                 );
                 check_inheritance(Inheritor::Listen, tokens, &named_defaults, &defaults_lines, &mut defaults_users)?;
+                proxy_order.push((ProxyKind::Listen, listens.len()));
                 cur_section = Some(CurrentSection::Listen(parse_listen_header(
                     tokens,
                     kw,
@@ -271,6 +288,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut backends,
                 );
                 check_inheritance(Inheritor::Frontend, tokens, &named_defaults, &defaults_lines, &mut defaults_users)?;
+                proxy_order.push((ProxyKind::Frontend, frontends.len()));
                 cur_section = Some(CurrentSection::Frontend(parse_frontend_header(
                     tokens,
                     kw,
@@ -294,6 +312,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                         d.backend_user = true;
                     }
                 }
+                proxy_order.push((ProxyKind::Backend, backends.len()));
                 cur_section = Some(CurrentSection::Backend(parse_backend_header(
                     tokens,
                     kw,
@@ -349,6 +368,18 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     }
                 }
                 parse_section_directive(section, tokens, kw)?;
+                if kw.text == "id" {
+                    for (kind, name, id) in section.explicit_id() {
+                        if let Some((_, okind, oname, oline)) = explicit_ids.iter().find(|e| e.0 == id) {
+                            return Err(ConfigError::new(
+                                kw.line,
+                                kw.col,
+                                format!("{kind} {name} reuses same custom id as {okind} {oname} (declared at line {oline})."),
+                            ));
+                        }
+                        explicit_ids.push((id, kind, name.to_string(), kw.line));
+                    }
+                }
             }
         }
     }
@@ -404,6 +435,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
         frontends,
         backends,
         sample_refs,
+        proxy_order,
     };
     register_checks_from_config(&config);
 
@@ -1255,6 +1287,15 @@ pub(crate) fn validate_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_proxy_section_gives_an_explicit_id() {
+        assert!(CurrentSection::Resolvers.explicit_id().is_none());
+        let mut be = BackendSection { name: "b".into(), ..Default::default() };
+        assert!(CurrentSection::Backend(be.clone()).explicit_id().is_none());
+        be.id = Some(4);
+        assert_eq!(CurrentSection::Backend(be).explicit_id(), Some(("backend", "b", 4)));
+    }
 
     #[test]
     fn test_parse_example_cfg() {

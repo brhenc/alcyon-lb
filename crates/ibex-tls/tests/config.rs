@@ -27,6 +27,7 @@ fn default_bind() -> BindConfig {
         accept_proxy: false,
         accept_proxy_v2: false,
         name: None,
+        id: None,
     }
 }
 
@@ -273,6 +274,7 @@ mod alpn {
             accept_proxy: false,
             accept_proxy_v2: false,
             name: None,
+            id: None,
         }
     }
 

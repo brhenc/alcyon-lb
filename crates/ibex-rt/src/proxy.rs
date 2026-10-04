@@ -102,6 +102,8 @@ pub struct TcpSession {
     pub client_addr: Option<SocketAddr>,
     /// The name of the bind that accepted this connection (`so_name`).
     pub so_name: Option<Arc<str>>,
+    /// The id of the bind that accepted this connection (`so_id`).
+    pub so_id: Option<u32>,
     pub cliexp: Vec<CompiledExp>,
     pub srvexp: Vec<CompiledExp>,
     pub req_uri: Option<String>,
@@ -248,6 +250,7 @@ impl TcpSession {
             mode,
             client_addr: None,
             so_name: None,
+            so_id: None,
             cliexp,
             srvexp,
             req_uri: None,

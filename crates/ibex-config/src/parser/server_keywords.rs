@@ -79,10 +79,7 @@ pub(crate) const UNIMPLEMENTED_SERVER_KEYWORDS: &[ServerKeyword] = &[
     not_for_default!("guid", Arg::Word, Ignore("a global identifier for the CLI and stats")),
     kw!("ws", Arg::Word, Ignore("the protocol for WebSocket; Ibex upgrades over HTTP/1.1")),
     kw!("hash-key", Arg::Word, ROUTE),
-    not_for_default!("id", Arg::Word, Refuse(
-        "Ibex does not implement it; the server's numeric id places it on the consistent-hash ring, \
-         so keys would hash to different servers",
-    )),
+    not_for_default!("id", Arg::Word, Ignore("handled with the other server keywords in parse_server")),
     kw!("idle-ping", Arg::Delay, Ignore("idle connection pings")),
     kw!("init-addr", Arg::Word, Ignore("how an unresolved address is handled at startup; Ibex refuses one")),
     kw!("init-state", Arg::Word, Refuse("Ibex does not implement it; the server would take traffic in a state it should not")),

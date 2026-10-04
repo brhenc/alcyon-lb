@@ -311,7 +311,30 @@ impl ProxyStats {
 // them into an enum would model a relationship that does not exist.
 #[allow(clippy::struct_excessive_bools)]
 pub struct Proxy {
+    /// The proxy's index in the engine's list, which the engine addresses it by. Not the
+    /// number `HAProxy` shows for it: that is [`Proxy::iid`].
     pub id: u32,
+    /// The proxy's numeric id (`uuid`): `iid` in `show stat`, `be_id` in `show servers
+    /// state`, what `fe_id` and `be_id` read. Numbered in the order the sections were
+    /// written, from 2, around the ones that asked for an `id` (`Config::proxy_ids`).
+    pub iid: u32,
+    /// Where the section was written among the proxies: `show stat` lists them in that order.
+    pub decl: u32,
+    /// The section has an `id` of its own (`bk_f_forced_id`).
+    pub forced_id: bool,
+    /// Each server's numeric id in this proxy (`puid`), what `srv_id`, the `sid` column of
+    /// `show stat` and `show servers state` report, and where the server's points on a
+    /// consistent-hash ring come from. Empty when no server has an `id` of its own: they are
+    /// then 1, 2, 3...; read it with [`Proxy::server_puid`].
+    pub server_puids: Vec<u32>,
+    /// Whether each server has an `id` of its own (`srv_f_forced_id`); empty when none does
+    /// (see [`Proxy::server_forced_id`]).
+    pub server_forced_ids: Vec<bool>,
+    /// What `show servers state` reports as each server's `srv_check_health` while no check
+    /// runs on it; empty when that is 0 for all (see [`Proxy::server_init_health`]).
+    pub server_init_health: Vec<u32>,
+    /// Each listener's numeric id (`luid`) by `bind` line, as `so_id` reads it.
+    pub listener_ids: Vec<u32>,
     pub name: String,
     /// A `frontend` or a `listen`: what `fe_exists` looks for.
     pub has_frontend: bool,
@@ -444,6 +467,24 @@ pub struct Proxy {
 }
 
 impl Proxy {
+    /// `srv_check_health` of the server at `idx` while no check runs on it.
+    #[must_use]
+    pub fn server_init_health(&self, idx: usize) -> u32 {
+        self.server_init_health.get(idx).copied().unwrap_or(0)
+    }
+
+    /// The numeric id of the server at `idx` (`puid`).
+    #[must_use]
+    pub fn server_puid(&self, idx: usize) -> u32 {
+        self.server_puids.get(idx).copied().unwrap_or_else(|| u32::try_from(idx + 1).unwrap_or(u32::MAX))
+    }
+
+    /// Whether the server at `idx` has an `id` of its own (`SRV_F_FORCED_ID`).
+    #[must_use]
+    pub fn server_forced_id(&self, idx: usize) -> bool {
+        self.server_forced_ids.get(idx).copied().unwrap_or(false)
+    }
+
     /// Returns the indices of eligible servers for request routing.
     ///
     /// Active (non-backup) servers that are UP and not saturated (actconn < maxconn) are prioritized.
@@ -1134,8 +1175,11 @@ fn stream_sample_ctx<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, view: 
         req_method: s.req_method.as_deref(),
         req_headers: s.req_headers.as_deref(),
         fe_name: Some(&fe.name),
+        fe_id: Some(fe.iid),
         be_name: Some(&be.name),
+        be_id: Some(be.iid),
         so_name: s.so_name.as_deref(),
+        so_id: s.so_id,
         captures_req_hdr: Some(&s.log.req_captures),
         captures_res_hdr: Some(&s.log.res_captures),
         unique_id: s.log.unique_id.as_deref(),
@@ -1445,7 +1489,59 @@ fn initial_status(s: &ibex_config::Server) -> u8 {
     if s.disabled { ServerStatus::Maint as u8 } else { ServerStatus::Up as u8 }
 }
 
-fn init_proxy_from_listen(proxy_idx: usize, listen: &ibex_config::ListenSection, nbthread: usize) -> Proxy {
+/// The `bind` lines of a frontend, as the engine opens them: the `bind` shorthand of a
+/// section built in code first, when no line has its address.
+fn frontend_binds(frontend: &ibex_config::FrontendSection) -> Vec<ibex_config::ast::BindConfig> {
+    let mut all_binds = frontend.binds.clone();
+    if let Some(ba) = frontend.bind {
+        if !all_binds.iter().any(|b| b.addr == ba) {
+            all_binds.insert(0, ibex_config::ast::BindConfig {
+                addr: ba,
+                quic: false,
+                ssl: false,
+                crt: vec![],
+                alpn: vec![],
+                proto: None,
+                accept_proxy: frontend.accept_proxy,
+                accept_proxy_v2: frontend.accept_proxy_v2,
+                name: None,
+                id: None,
+            });
+        }
+    }
+    all_binds
+}
+
+/// The ids of the servers for [`Proxy::server_puids`]: empty when none asked for one.
+fn server_puids(count: usize, extras: &ibex_config::ast::ServerExtras) -> Vec<u32> {
+    if extras.puid.is_empty() { Vec::new() } else { ibex_config::ast::server_puids(count, &extras.puid) }
+}
+
+/// The values for [`Proxy::server_init_health`]: empty when all are 0.
+fn server_init_health(count: usize, extras: &ibex_config::ast::ServerExtras) -> Vec<u32> {
+    let mut health = Vec::new();
+    for &(i, h) in &extras.init_health {
+        health.resize(count, 0);
+        if let Some(slot) = health.get_mut(i as usize) {
+            *slot = h;
+        }
+    }
+    health
+}
+
+/// The flags for [`Proxy::server_forced_ids`]: empty when none asked for an id.
+fn server_forced_ids(count: usize, extras: &ibex_config::ast::ServerExtras) -> Vec<bool> {
+    let mut forced = Vec::new();
+    for &(i, _) in &extras.puid {
+        forced.resize(count, false);
+        if let Some(slot) = forced.get_mut(i as usize) {
+            *slot = true;
+        }
+    }
+    forced
+}
+
+fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, listen: &ibex_config::ListenSection, nbthread: usize) -> Proxy {
     let mut http_req_rules = listen.http_req_rules.clone();
     with_buffered_request(&mut http_req_rules, listen.buffer_request);
     let req_capture_slots = capture_slots(&listen.req_header_captures, &mut http_req_rules);
@@ -1498,6 +1594,13 @@ fn init_proxy_from_listen(proxy_idx: usize, listen: &ibex_config::ListenSection,
 
     Proxy {
         id: usize_to_u32(proxy_idx),
+        iid: ids.iid,
+        decl: ids.decl,
+        forced_id: ids.forced,
+        server_puids: server_puids(listen.servers.len(), &listen.server_extras),
+        server_forced_ids: server_forced_ids(listen.servers.len(), &listen.server_extras),
+        server_init_health: server_init_health(listen.servers.len(), &listen.server_extras),
+        listener_ids: ibex_config::ast::listener_ids(&listen.binds),
         name: listen.name.clone(),
         has_frontend: true,
         has_backend: true,
@@ -1586,7 +1689,7 @@ fn init_proxy_from_listen(proxy_idx: usize, listen: &ibex_config::ListenSection,
     }
 }
 
-fn init_proxy_from_frontend(proxy_idx: usize, fe: &ibex_config::FrontendSection, nbthread: usize) -> Proxy {
+fn init_proxy_from_frontend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, fe: &ibex_config::FrontendSection, nbthread: usize) -> Proxy {
     let mut http_req_rules = fe.http_req_rules.clone();
     with_buffered_request(&mut http_req_rules, fe.buffer_request);
     let req_capture_slots = capture_slots(&fe.req_header_captures, &mut http_req_rules);
@@ -1606,6 +1709,13 @@ fn init_proxy_from_frontend(proxy_idx: usize, fe: &ibex_config::FrontendSection,
 
     Proxy {
         id: usize_to_u32(proxy_idx),
+        iid: ids.iid,
+        decl: ids.decl,
+        forced_id: ids.forced,
+        server_puids: Vec::new(),
+        server_forced_ids: Vec::new(),
+        server_init_health: Vec::new(),
+        listener_ids: ibex_config::ast::listener_ids(&frontend_binds(fe)),
         name: fe.name.clone(),
         has_frontend: true,
         has_backend: false,
@@ -1693,7 +1803,7 @@ fn init_proxy_from_frontend(proxy_idx: usize, fe: &ibex_config::FrontendSection,
     }
 }
 
-fn init_proxy_from_backend(proxy_idx: usize, be: &ibex_config::BackendSection, nbthread: usize) -> Proxy {
+fn init_proxy_from_backend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, be: &ibex_config::BackendSection, nbthread: usize) -> Proxy {
     let mut http_req_rules = be.http_req_rules.clone();
     with_buffered_request(&mut http_req_rules, be.buffer_request);
     let timeouts = section_timeouts(&be.timeouts, None, be.srvtimeout, be.contimeout);
@@ -1739,6 +1849,13 @@ fn init_proxy_from_backend(proxy_idx: usize, be: &ibex_config::BackendSection, n
 
     Proxy {
         id: usize_to_u32(proxy_idx),
+        iid: ids.iid,
+        decl: ids.decl,
+        forced_id: ids.forced,
+        server_puids: server_puids(be.servers.len(), &be.server_extras),
+        server_forced_ids: server_forced_ids(be.servers.len(), &be.server_extras),
+        server_init_health: server_init_health(be.servers.len(), &be.server_extras),
+        listener_ids: Vec::new(),
         name: be.name.clone(),
         has_frontend: false,
         has_backend: true,
@@ -1885,20 +2002,21 @@ impl Engine {
     crate::rule_exprs::validate_config(config)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     let mut proxies = Vec::new();
-    for listen in config.listens.iter().filter(|l| !l.disabled) {
-        let mut p = init_proxy_from_listen(proxies.len(), listen, nbthread);
+    let ids = config.proxy_ids();
+    for (i, listen) in config.listens.iter().enumerate().filter(|(_, l)| !l.disabled) {
+        let mut p = init_proxy_from_listen(proxies.len(), ids.listens[i], listen, nbthread);
         attach_server_tls(&mut p, &listen.servers, listen.mode == Mode::Http, &listen.name)?;
         proxies.push(p);
     }
-    for backend in &config.backends {
+    for (i, backend) in config.backends.iter().enumerate() {
         if !backend.disabled {
-            let mut p = init_proxy_from_backend(proxies.len(), backend, nbthread);
+            let mut p = init_proxy_from_backend(proxies.len(), ids.backends[i], backend, nbthread);
             attach_server_tls(&mut p, &backend.servers, backend.mode == Mode::Http, &backend.name)?;
             proxies.push(p);
         }
     }
-    for frontend in &config.frontends {
-        if !frontend.disabled { proxies.push(init_proxy_from_frontend(proxies.len(), frontend, nbthread)); }
+    for (i, frontend) in config.frontends.iter().enumerate() {
+        if !frontend.disabled { proxies.push(init_proxy_from_frontend(proxies.len(), ids.frontends[i], frontend, nbthread)); }
     }
     let disabled: Arc<Vec<String>> = Arc::new(
         config.listens.iter().map(|l| (l.disabled, &l.name))
@@ -1954,13 +2072,15 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     accept_proxy: listen.accept_proxy,
                     accept_proxy_v2: listen.accept_proxy_v2,
                     name: None,
+                    id: None,
                 }]
             } else {
                 listen.binds.clone()
             };
-            for b in &binds {
+            for (bind_idx, b) in binds.iter().enumerate() {
                 let tls = bind_tls(&listen.name, &binds, b.addr)?;
                 for mut listener in listeners_for(worker_id, b.addr, usize_to_u32(proxy_idx))? {
+                    listener.luid = proxies[proxy_idx].listener_ids.get(bind_idx).copied().unwrap_or(0);
                     listener.maxconn = listen.maxconn;
                     listener.name = b.name.as_deref().map(Into::into);
                     listener.tls.clone_from(&tls);
@@ -1979,23 +2099,8 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         }
         for frontend in &config.frontends {
             if frontend.disabled { continue; }
-            let mut all_binds = frontend.binds.clone();
-            if let Some(ba) = frontend.bind {
-                if !all_binds.iter().any(|b| b.addr == ba) {
-                    all_binds.insert(0, ibex_config::ast::BindConfig {
-                        addr: ba,
-                        quic: false,
-                        ssl: false,
-                        crt: vec![],
-                        alpn: vec![],
-                        proto: None,
-                        accept_proxy: frontend.accept_proxy,
-                        accept_proxy_v2: frontend.accept_proxy_v2,
-                        name: None,
-                    });
-                }
-            }
-            for b in &all_binds {
+            let all_binds = frontend_binds(frontend);
+            for (bind_idx, b) in all_binds.iter().enumerate() {
                 let bind_addr = b.addr;
                 if b.quic {
                     let tls = bind_tls(&frontend.name, &frontend.binds, bind_addr)?.expect("QUIC requires TLS");
@@ -2018,6 +2123,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 } else {
                     let tls = bind_tls(&frontend.name, &frontend.binds, bind_addr)?;
                     for mut listener in listeners_for(worker_id, bind_addr, usize_to_u32(proxy_idx))? {
+                        listener.luid = proxies[proxy_idx].listener_ids.get(bind_idx).copied().unwrap_or(0);
                         listener.maxconn = frontend.maxconn;
                         listener.name = b.name.as_deref().map(Into::into);
                         listener.tls.clone_from(&tls);
@@ -3076,6 +3182,8 @@ fn eval_tcp_req_session_rules(
         server_addr: sess.server_addr,
         fc_src: sess.fc_src,
         so_name: sess.so_name.as_deref(),
+        so_id: sess.so_id,
+        fe_id: Some(proxy.iid),
         fc_dst: sess.fc_dst,
         proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
         act_conn: proxy.stats[worker_id()].act_conn.load(Ordering::Relaxed),
@@ -3293,6 +3401,7 @@ fn eval_tcp_req_content_rules(
         server_addr: sess.server_addr,
         fc_src: sess.fc_src,
         so_name: sess.so_name.as_deref(),
+        so_id: sess.so_id,
         fc_dst: sess.fc_dst,
         proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
         req_body: if has_content { Some(req_bytes) } else { None },
@@ -3556,6 +3665,7 @@ fn eval_tcp_res_content_rules(proxy: &Proxy, proxies: &[Proxy], registry: &Regis
         server_addr: sess.server_addr,
         fc_src: sess.fc_src,
         so_name: sess.so_name.as_deref(),
+        so_id: sess.so_id,
         fc_dst: sess.fc_dst,
         proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
         res_body: Some(rep_bytes),
@@ -3706,6 +3816,7 @@ fn register_new_session(
     // Without a listener, the client is an HTTP/3 request stream (`adopt_quic_streams`).
     sess.h3 = listener_idx.is_none();
     sess.so_name = listener_idx.and_then(|i| engine.listeners.get(i)).and_then(|l| l.name.clone());
+    sess.so_id = listener_idx.and_then(|i| engine.listeners.get(i)).map(|l| l.luid).filter(|&id| id != 0);
 
     let proxy = &mut engine.proxies[proxy_idx];
 
@@ -4683,6 +4794,7 @@ impl EngineDispatcher<'_> {
             server_addr: sess.server_addr,
             fc_src: sess.fc_src,
             so_name: sess.so_name.as_deref(),
+            so_id: sess.so_id,
             fc_dst: sess.fc_dst,
             is_first_req: sess.is_first_req,
             proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
@@ -5567,6 +5679,7 @@ impl EngineDispatcher<'_> {
             server_addr: entry.sess.server_addr,
             fc_src: entry.sess.fc_src,
             so_name: entry.sess.so_name.as_deref(),
+            so_id: entry.sess.so_id,
             fc_dst: entry.sess.fc_dst,
             is_first_req: entry.sess.is_first_req,
             proxy_tlvs: entry.sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
@@ -5576,7 +5689,9 @@ impl EngineDispatcher<'_> {
             req_method: req_method_clone.as_deref(),
             req_headers: req_headers_clone.as_deref(),
             fe_name: Some(&proxies[fe_idx].name),
+            fe_id: Some(proxies[fe_idx].iid),
             be_name: Some(&proxies[be_idx].name),
+            be_id: Some(proxies[be_idx].iid),
             be_max_retries: Some(proxies[be_idx].retries),
             cur_max_retries: Some(entry.sess.max_retries),
             res_version: Some(&proto_version),
@@ -6204,6 +6319,7 @@ impl EngineDispatcher<'_> {
             server_addr: entry.sess.server_addr,
             fc_src: entry.sess.fc_src,
             so_name: entry.sess.so_name.as_deref(),
+            so_id: entry.sess.so_id,
             fc_dst: entry.sess.fc_dst,
             is_first_req: entry.sess.is_first_req,
             proxy_tlvs: entry.sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
@@ -6215,6 +6331,7 @@ impl EngineDispatcher<'_> {
             // rules below set its `tracked_sc`.
             htx_slice: entry.sess.has_htx.then(|| ibex_proto::htx::HtxSliceRef::new(entry.sess.htx_buf.raw_slice(), entry.sess.htx_blocks)),
             fe_name: Some(&proxies[proxy_idx].name),
+            fe_id: Some(proxies[proxy_idx].iid),
             act_conn: proxies[proxy_idx].stats[worker_id()].act_conn.load(Ordering::Relaxed),
             unique_id: entry.sess.log.unique_id.as_deref(),
             accept_date: Some(entry.sess.log.date),
@@ -6290,6 +6407,7 @@ impl EngineDispatcher<'_> {
                         server_addr: $s.server_addr,
                         fc_src: $s.fc_src,
                         so_name: $s.so_name.as_deref(),
+                        so_id: $s.so_id,
                         fc_dst: $s.fc_dst,
                         is_first_req: $s.is_first_req,
                         proxy_tlvs: $s.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
@@ -6301,6 +6419,8 @@ impl EngineDispatcher<'_> {
                         req_body: $s.txn.as_ref().and_then(|t| t.req_body.as_deref()),
                         fe_name,
                         be_name,
+                        fe_id: fe_name.and_then(|n| proxies.iter().find(|p| p.has_frontend && p.name == n)).map(|p| p.iid),
+                        be_id: be_name.and_then(|n| proxies.iter().find(|p| p.has_backend && p.name == n)).map(|p| p.iid),
                         captures_req_hdr: Some(&$s.log.req_captures),
                         unique_id: $s.log.unique_id.as_deref(),
                         accept_date: Some($s.log.date),
@@ -8822,6 +8942,7 @@ fn after_res_on_reply<'r>(
             server_addr: sess.server_addr,
             fc_src: sess.fc_src,
             so_name: sess.so_name.as_deref(),
+            so_id: sess.so_id,
             fc_dst: sess.fc_dst,
             is_first_req: sess.is_first_req,
             proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
@@ -8830,7 +8951,9 @@ fn after_res_on_reply<'r>(
             req_method: sess.req_method.as_deref(),
             req_headers: sess.req_headers.as_deref(),
             fe_name: Some(&proxies[fe_idx].name),
+            fe_id: Some(proxies[fe_idx].iid),
             be_name: Some(&proxies[be_idx].name),
+            be_id: Some(proxies[be_idx].iid),
             be_max_retries: Some(proxies[be_idx].retries),
             cur_max_retries: Some(sess.max_retries),
             res_version: Some(&version),
@@ -8883,6 +9006,7 @@ fn proxy_error_response(sess: &TcpSession, be: &Proxy, fe: &Proxy, proxies: &[Pr
                     client_addr: sess.client_addr,
                     fc_src: sess.fc_src,
                     so_name: sess.so_name.as_deref(),
+                    so_id: sess.so_id,
                     fc_dst: sess.fc_dst,
                     is_first_req: sess.is_first_req,
                     htx_slice: sess.htx_slice(),
@@ -8890,7 +9014,9 @@ fn proxy_error_response(sess: &TcpSession, be: &Proxy, fe: &Proxy, proxies: &[Pr
                     req_method: sess.req_method.as_deref(),
                     req_headers: sess.req_headers.as_deref(),
                     fe_name: Some(fe.name.as_str()),
+                    fe_id: Some(fe.iid),
                     be_name: Some(be.name.as_str()),
+                    be_id: Some(be.iid),
                     ..Default::default()
                 };
                 return Some(build_templated_error_response(

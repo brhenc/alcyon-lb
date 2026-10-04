@@ -142,6 +142,9 @@ pub struct BindConfig {
     pub accept_proxy_v2: bool,
     /// `name <n>`: what `so_name` reads on connections this bind accepted.
     pub name: Option<String>,
+    /// `id <n>`: the listener's explicit numeric id, what `so_id` reads. `None` takes the
+    /// next free one in the proxy.
+    pub id: Option<u32>,
 }
 
 /// A `listen` proxy section combining frontend and backend.
@@ -159,6 +162,8 @@ pub struct ListenSection {
     pub mode: Mode,
     /// Whether this proxy is disabled.
     pub disabled: bool,
+    /// `id <n>`: the proxy's explicit numeric id (`HAProxy` `PR_O_FORCED_ID`); `None` takes the next free one.
+    pub id: Option<u32>,
     /// The `cookie` line: HTTP session persistence.
     pub cookie: Option<CookieConfig>,
     /// Connect timeout in milliseconds / Duration.
@@ -184,6 +189,8 @@ pub struct ListenSection {
     pub dispatch: Option<SocketAddr>,
     /// Known backend servers.
     pub servers: Vec<Server>,
+    /// The explicit `id` and the initial health of some of the servers.
+    pub server_extras: ServerExtras,
     /// Syslog logging destinations (up to 2).
     pub logs: Vec<LogConfig>,
     /// `log global`: inherit the targets declared in the `global` section.
@@ -314,6 +321,7 @@ impl Default for ListenSection {
             binds: Vec::new(),
             mode: Mode::Tcp,
             disabled: false,
+            id: None,
             cookie: None,
             contimeout: None,
             clitimeout: None,
@@ -328,6 +336,7 @@ impl Default for ListenSection {
             default_server: None,
             use_servers: Vec::new(),
             servers: Vec::new(),
+            server_extras: ServerExtras::default(),
             logs: Vec::new(),
             log_global: false,
             log_format: None,
@@ -391,6 +400,8 @@ pub struct FrontendSection {
     pub mode: Mode,
     /// Whether this frontend is disabled.
     pub disabled: bool,
+    /// `id <n>`: the proxy's explicit numeric id (`HAProxy` `PR_O_FORCED_ID`); `None` takes the next free one.
+    pub id: Option<u32>,
     /// Client timeout in milliseconds / Duration.
     pub clitimeout: Option<Duration>,
     /// Structured timeouts.
@@ -475,6 +486,7 @@ impl Default for FrontendSection {
             binds: Vec::new(),
             mode: Mode::Tcp,
             disabled: false,
+            id: None,
             clitimeout: None,
             timeouts: TimeoutConfig::default(),
             maxconn: 2000,
@@ -539,6 +551,8 @@ pub struct BackendSection {
     pub mode: Mode,
     /// Whether this backend is disabled.
     pub disabled: bool,
+    /// `id <n>`: the proxy's explicit numeric id (`HAProxy` `PR_O_FORCED_ID`); `None` takes the next free one.
+    pub id: Option<u32>,
     /// Load balancing algorithm.
     pub balance: BalanceAlgorithm,
     /// The `cookie` line: HTTP session persistence.
@@ -564,6 +578,8 @@ pub struct BackendSection {
     pub use_servers: Vec<UseServerRule>,
     /// Known backend servers.
     pub servers: Vec<Server>,
+    /// The explicit `id` and the initial health of some of the servers.
+    pub server_extras: ServerExtras,
     /// Server header regex rewrite rules.
     pub srvexp: Vec<HeaderExp>,
     /// Declared ACL rules.
@@ -633,6 +649,7 @@ impl Default for BackendSection {
             buffer_request: false,
             mode: Mode::Tcp,
             disabled: false,
+            id: None,
             balance: BalanceAlgorithm::RoundRobin,
             cookie: None,
             contimeout: None,
@@ -645,6 +662,7 @@ impl Default for BackendSection {
             default_server: None,
             use_servers: Vec::new(),
             servers: Vec::new(),
+            server_extras: ServerExtras::default(),
             srvexp: Vec::new(),
             acls: Vec::new(),
             stick_table: None,

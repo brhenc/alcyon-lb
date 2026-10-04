@@ -61,7 +61,7 @@ const KEYWORDS: &[(&str, Ibex)] = &[
     ("guid g1", Accepts),
     ("ws auto", Accepts),
     ("hash-key id", Refuses),
-    ("id 7", Refuses),
+    ("id 7", Accepts),
     ("idle-ping 5s", Accepts),
     ("init-addr none", Accepts),
     ("init-state up", Refuses),

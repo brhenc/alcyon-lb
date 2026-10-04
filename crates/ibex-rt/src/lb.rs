@@ -636,9 +636,9 @@ impl ChashRing {
             let built_from: Vec<bool> = (0..proxy.servers.len()).map(in_ring).collect();
             ring.points.clear();
             for idx in (0..proxy.servers.len()).filter(|&i| built_from[i]) {
-                // `puid`: servers are numbered from 1 in declaration order (Ibex has no
-                // `id` keyword on servers), and `hash-key id` is the default.
-                let puid = u32::try_from(idx + 1).unwrap_or(u32::MAX);
+                // `puid`: the server's id, from 1 in declaration order around the ones
+                // with an `id`; `hash-key id` is the default.
+                let puid = proxy.server_puid(idx);
                 let base = puid.wrapping_mul(SRV_EWGHT_RANGE);
                 let nodes = proxy.server_weights.get(idx).copied().unwrap_or(1) * BE_WEIGHT_SCALE;
                 let server = u32::try_from(idx).unwrap_or(u32::MAX);
