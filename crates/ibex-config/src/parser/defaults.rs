@@ -2,6 +2,7 @@
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
 use super::*;
+use crate::ast::HttpMode;
 
 #[allow(clippy::too_many_lines)]
 pub(crate) fn parse_defaults_directive(
@@ -213,8 +214,9 @@ pub(crate) fn parse_option_defaults(
         "forwarded" => defaults.forwarded = Some(Box::new(parse_forwarded_option(tokens)?)),
         "redispatch" => set_redispatch(&mut defaults.redisp, &mut defaults.redisp_after, tokens),
         "http-buffer-request" => defaults.buffer_request = true,
-        "http-server-close" => defaults.server_close = true,
-        "http-keep-alive" => defaults.server_close = false,
+        "http-server-close" => defaults.http_mode = HttpMode::ServerClose,
+        "httpclose" => defaults.http_mode = HttpMode::Close,
+        "http-keep-alive" => defaults.http_mode = HttpMode::KeepAlive,
         "dontlognull" => defaults.dontlognull = true,
         "accept-unsafe-violations-in-http-request" => defaults.stats.accept_unsafe_request = true,
         "log-health-checks" => defaults.log_health_checks = true,
@@ -235,7 +237,8 @@ pub(crate) fn parse_no_defaults(defaults: &mut DefaultsSection, tokens: &[Token]
     match check_no_option(OptSection::Defaults, tokens, kw)? {
         Some("redispatch") => (defaults.redisp, defaults.redisp_after) = (false, -1),
         Some("http-buffer-request") => defaults.buffer_request = false,
-        Some("http-server-close") => defaults.server_close = false,
+        Some("http-server-close") if defaults.http_mode == HttpMode::ServerClose => defaults.http_mode = HttpMode::KeepAlive,
+        Some("httpclose") if defaults.http_mode == HttpMode::Close => defaults.http_mode = HttpMode::KeepAlive,
         Some("dontlognull") => defaults.dontlognull = false,
         Some("accept-unsafe-violations-in-http-request") => defaults.stats.accept_unsafe_request = false,
         Some("log-health-checks") => defaults.log_health_checks = false,

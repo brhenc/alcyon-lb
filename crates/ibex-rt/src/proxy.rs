@@ -192,6 +192,8 @@ pub struct TcpSession {
     /// request's first byte. Without it that wait is `timeout http-request`, then
     /// `timeout client`.
     pub keep_alive_ms: u32,
+    /// `option httpclose` in the frontend: each response closes the client connection.
+    pub close_client: bool,
     /// `req_exp` is the idle wait, not a request head's.
     pub req_idle: bool,
     pub req_exp: Tick,
@@ -338,6 +340,7 @@ impl TcpSession {
             cli_exp: Tick::ETERNITY,
             http_request_ms: 0,
             keep_alive_ms: 0,
+            close_client: false,
             req_idle: false,
             req_exp: Tick::ETERNITY,
             srv_exp: Tick::ETERNITY,
@@ -1309,7 +1312,7 @@ impl TcpSession {
                 // will be forwarded.
                 let framing = find_eoh(self.req.readable())
                     .map_or(txn::Framing::None, |(h, e)| txn::request_framing(&self.req.readable()[..h + e]));
-                let mut txn = HttpTxn::new(framing, close);
+                let mut txn = HttpTxn::new(framing, close || self.close_client);
                 // The client's own method: rules that rewrite it have not run yet.
                 txn.client_head = self.req_method.as_deref().is_some_and(|m| m.eq_ignore_ascii_case("HEAD"));
                 self.txn = Some(txn);

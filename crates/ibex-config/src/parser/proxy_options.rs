@@ -162,6 +162,7 @@ const IMPLEMENTED: &[&str] = &[
     // Each request on its own server connection, asked to close (T149).
     "http-server-close",
     "http-keep-alive",
+    "httpclose",
     "log-health-checks",
     // A connection that carried nothing is not logged (T128).
     "dontlognull",

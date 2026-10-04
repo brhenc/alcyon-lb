@@ -464,7 +464,7 @@ pub struct ProxyIdInfo {
     pub server_pool_max_conn: Vec<i32>,
     /// `option http-server-close`: the server connection carries one request. Read when a
     /// request goes to a server and when its response ends.
-    pub server_close: bool,
+    pub http_mode: ibex_config::ast::HttpMode,
 }
 
 /// A configured proxy instance.
@@ -1788,7 +1788,7 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, list
             server_init_health: server_init_health(listen.servers.len(), &listen.server_extras),
             listener_ids: ibex_config::ast::listener_ids(&listen.binds),
             server_pool_max_conn: pool_max_conns(&listen.servers),
-            server_close: listen.server_close,
+            http_mode: listen.http_mode,
             ..ProxyIdInfo::default()
         }),
         name: listen.name.clone(),
@@ -1910,7 +1910,7 @@ fn init_proxy_from_frontend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, fe
             server_forced_ids: Vec::new(),
             server_init_health: Vec::new(),
             listener_ids: ibex_config::ast::listener_ids(&frontend_binds(fe)),
-            server_close: fe.server_close,
+            http_mode: fe.http_mode,
             ..ProxyIdInfo::default()
         }),
         name: fe.name.clone(),
@@ -2057,7 +2057,7 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, be:
             server_init_health: server_init_health(be.servers.len(), &be.server_extras),
             listener_ids: Vec::new(),
             server_pool_max_conn: pool_max_conns(&be.servers),
-            server_close: be.server_close,
+            http_mode: be.http_mode,
             ..ProxyIdInfo::default()
         }),
         name: be.name.clone(),
@@ -4529,6 +4529,7 @@ fn init_client_session(
     sess.accept_unsafe_request = fe.stats_config.accept_unsafe_request;
     sess.http_request_ms = fe.stats_config.raw_timeouts.http_request.map_or(0, millis_to_u32);
     sess.keep_alive_ms = fe.stats_config.raw_timeouts.http_keep_alive.map_or(0, millis_to_u32);
+    sess.close_client = client_close(proxies, proxy_idx);
     sess.arm_request(now);
     sess.keep_request_line = (!fe.log_target_idx.is_empty() && fe.log_format.as_ref().is_some_and(|f| f.uses_request_line()))
         || fe.unique_id_format.as_ref().is_some_and(|f| f.uses_request_line());
@@ -8701,9 +8702,18 @@ fn commit_stick_stores(stores: impl Iterator<Item = (usize, StickKey)>, proxies:
     }
 }
 
-/// `option http-server-close` in the frontend or the backend (`PR_O_HTTP_SCL`).
+/// Whether the server is asked to close after this request: `option http-server-close` in
+/// the frontend, or `http-server-close` or `httpclose` in the backend (measured on HAProxy:
+/// a frontend's `httpclose` alone leaves the server connection alone).
 fn server_close(proxies: &[Proxy], fe_idx: usize, be_idx: usize) -> bool {
-    proxies.get(fe_idx).is_some_and(|p| p.ids.server_close) || proxies.get(be_idx).is_some_and(|p| p.ids.server_close)
+    use ibex_config::ast::HttpMode;
+    proxies.get(fe_idx).is_some_and(|p| p.ids.http_mode == HttpMode::ServerClose)
+        || proxies.get(be_idx).is_some_and(|p| p.ids.http_mode != HttpMode::KeepAlive)
+}
+
+/// `option httpclose` in the frontend: the client connection closes after each response.
+fn client_close(proxies: &[Proxy], fe_idx: usize) -> bool {
+    proxies.get(fe_idx).is_some_and(|p| p.ids.http_mode == ibex_config::ast::HttpMode::Close)
 }
 
 /// Whether the request's `Connection` header asks to upgrade the connection.
