@@ -99,5 +99,82 @@ class BlockBraces(unittest.TestCase):
         self.assertEqual(text[last:], "} -run\n")
 
 
+class FakeProxy:
+    """A stand-in binary: `-c -f cfg` exits 1 when the config holds the word BAD; any other
+    run copies argv and the config to files and exits, so the test sees what it was given."""
+
+    def __init__(self, name="fakeproxy"):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, name)
+        self.log = os.path.join(self.tmp.name, "log")
+        with open(self.path, "w") as f:
+            f.write("#!/bin/sh\n"
+                    f"echo \"$@\" >{self.log}.args\ncfg=\n"
+                    "while [ $# -gt 0 ]; do [ \"$1\" = -f ] && cfg=$2; shift; done\n"
+                    f"cp \"$cfg\" {self.log}.cfg\n"
+                    "if grep -q BAD \"$cfg\"; then exit 1; fi\n"
+                    "exit 0\n")
+        os.chmod(self.path, 0o755)
+
+
+class ConfBad(unittest.TestCase):
+    """`haproxy h1 -conf-BAD {expected stderr} {config}`: two blocks. The parser took the
+    first (empty) one for the config, so the check ran on nothing and "unexpectedly
+    succeeded" for startup/default_rules and converter/has_ctl, on every binary."""
+
+    def run_vtc(self, text):
+        fp = FakeProxy()
+        self.addCleanup(fp.tmp.cleanup)
+        ex = executor(text, fp.path)
+        return asyncio.run(ex.execute()), fp
+
+    def test_the_second_block_is_the_config(self):
+        res, fp = self.run_vtc('varnishtest "x"\nhaproxy h1 -conf-BAD {} {\n  BAD line\n}\n')
+        self.assertEqual(res.status, "PASS", res.error_message)
+        self.assertIn("BAD line", open(fp.log + ".cfg").read())
+
+    def test_a_good_config_is_still_reported_as_unexpectedly_good(self):
+        res, _ = self.run_vtc('varnishtest "x"\nhaproxy h1 -conf-BAD {} {\n  fine\n}\n')
+        self.assertEqual(res.status, "FAIL")
+        self.assertIn("unexpectedly succeeded", res.error_message or "")
+
+    def test_a_diagnostic_that_does_not_match_the_regex_fails(self):
+        res, _ = self.run_vtc('varnishtest "x"\nhaproxy h1 -conf-BAD {nothing like this} {\n  BAD\n}\n')
+        self.assertEqual(res.status, "FAIL")
+        self.assertIn("does not match", res.error_message or "")
+
+    def test_the_first_block_is_a_regex_for_the_diagnostic(self):
+        ex = executor('varnishtest "x"\nhaproxy h1 -conf-BAD {not in stderr} {\n  BAD\n}\n')
+        d = [d for d in ex.parser.directives if d.cmd == "haproxy"][0]
+        self.assertEqual(d.block_content.strip(), "BAD")
+
+
+class MasterCliVersusStatsSocket(unittest.TestCase):
+    """vtest puts `stats socket` ahead of the config; `-S` is HAProxy's *master* CLI, which
+    answers `Unknown command: 'show'` to worker commands, so ~18 reg-tests failed on HAProxy
+    itself (T138)."""
+
+    def test_ibex_keeps_the_master_socket_and_a_comment_prelude(self):
+        fp = FakeProxy()
+        self.addCleanup(fp.tmp.cleanup)
+        ex = executor('varnishtest "x"\nhaproxy h1 -conf {\n  defaults\n} -start\n', fp.path)
+        asyncio.run(ex.execute())
+        self.assertIn("-S", open(fp.log + ".args").read().split())
+        self.assertEqual(open(fp.log + ".cfg").read().splitlines()[0][:1], "#")
+
+    def test_config_has_a_stats_socket_admin_ahead_of_the_test_block(self):
+        fp = FakeProxy("haproxy")
+        self.addCleanup(fp.tmp.cleanup)
+        ex = executor('varnishtest "x"\nhaproxy h1 -conf {\n  defaults\n} -start\n', fp.path)
+        asyncio.run(ex.execute())
+        self.assertNotIn("-S", open(fp.log + ".args").read().split())
+        cfg = open(fp.log + ".cfg").read().splitlines()
+        self.assertEqual(cfg[0], "global")
+        self.assertRegex(cfg[1], r"^\s*stats socket \S+/h1\.sock level admin$")
+
+        self.assertEqual(cfg[2].lstrip()[:1], "#")
+        self.assertIn("defaults", cfg[3].strip() + "".join(cfg[4:]))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -366,6 +366,9 @@ class TopDirective:
     args: List[str]
     block_content: Optional[str] = None
     line_no: int = 0
+    # `haproxy hN -conf-BAD {regex} {config}`: the first block, which the diagnostic the
+    # check prints must match (empty: anything goes).
+    expect_stderr: Optional[str] = None
 
 
 def find_block_braces(s: str) -> Tuple[int, int]:
@@ -501,8 +504,15 @@ class VtcParser:
                 lb_all = -1
                 while j < len(normalized_lines):
                     acc.append(normalized_lines[j][1])
-                    fb_all, lb_all = find_block_braces("\n".join(acc))
+                    text = "\n".join(acc)
+                    fb_all, lb_all = find_block_braces(text)
                     if lb_all != -1:
+                        # `-conf-BAD {expected} {config}`: a second block follows.
+                        rest = text[lb_all + 1:].lstrip()
+                        if (text.startswith("haproxy") and "-conf-BAD" in text[:fb_all]
+                                and rest.startswith("{") and find_block_braces(rest)[1] == -1):
+                            j += 1
+                            continue
                         break
                     j += 1
 
@@ -553,6 +563,19 @@ class VtcParser:
             return
 
         cmd = before_tokens[0]
+        expect_stderr = None
+        if cmd == "haproxy" and "-conf-BAD" in before_tokens and after_brace.startswith("{"):
+            # Two blocks: the expected diagnostic, then the config. Taking the first for the
+            # config ran the check on nothing, which succeeds, for every binary.
+            expect_stderr = inside_brace
+            fb2, lb2 = find_block_braces(after_brace)
+            if fb2 != -1 and lb2 != -1:
+                inside_brace = after_brace[fb2 + 1:lb2]
+                after_brace = after_brace[lb2 + 1:].strip()
+                try:
+                    after_tokens = shlex.split(after_brace, comments=True)
+                except ValueError:
+                    after_tokens = after_brace.split()
         args = before_tokens[1:] + after_tokens
 
         self.directives.append(
@@ -561,6 +584,7 @@ class VtcParser:
                 args=args,
                 block_content=inside_brace,
                 line_no=line_no,
+                expect_stderr=expect_stderr,
             )
         )
 
@@ -1685,6 +1709,9 @@ class VtcExecutor:
             except Exception:
                 pass
 
+    def is_oracle(self) -> bool:
+        return "haproxy" in os.path.basename(self.target_binary)
+
     async def _execute_haproxy_cli(self, haproxy_id: str, block: str) -> None:
         cli_sock = os.path.join(self.tmpdir, f"{haproxy_id}.sock")
         reader, writer = None, None
@@ -2048,7 +2075,17 @@ class VtcExecutor:
                     os.makedirs(os.path.join(self.tmpdir, haproxy_id), exist_ok=True)
                     cfg_path = os.path.join(self.tmpdir, haproxy_id, "cfg")
                     with open(cfg_path, "w") as f:
-                        f.write("# vtc_runner: vtest's three-line prelude would be here\n#\n#\n")
+                        if self.is_oracle():
+                            # A worker-level admin socket, as vtest has: `-S` is the master
+                            # CLI, which refuses `show stat` and the rest (T138).
+                            f.write("global\n"
+                                    f"    stats socket {os.path.join(self.tmpdir, haproxy_id + '.sock')} level admin\n"
+                                    "# vtc_runner: vtest's third prelude line\n")
+                        else:
+                            # Ibex keeps `-S`: a second `global` section (every test that
+                            # opens its config with one) replaces the first instead of
+                            # merging with it, so the prelude's socket would vanish.
+                            f.write("# vtc_runner: vtest's three-line prelude would be here\n#\n#\n")
                         f.write(rewritten_cfg)
                         if not rewritten_cfg.endswith("\n"):
                             f.write("\n")
@@ -2066,23 +2103,29 @@ class VtcExecutor:
                         )
                         if res.returncode != 0:
                             raise AssertionError(f"Config check failed (-conf-OK):\n{res.stderr}")
+                        _note_assertion()
                     elif conf_type == "-conf-BAD":
                         res = subprocess.run(
                             [self.target_binary, "-c", "-f", cfg_path],
                             capture_output=True,
                             text=True,
                         )
-                        print(f"h1 debug: {res.returncode} {res.stdout} {res.stderr}")
                         if res.returncode == 0:
                             raise AssertionError(f"Config check unexpectedly succeeded (-conf-BAD) for {haproxy_id}")
+                        want = (directive.expect_stderr or "").strip()
+                        if want and not re.search(_posix_classes_to_python(self.macro_engine.expand(want)),
+                                                  res.stdout + res.stderr, re.MULTILINE):
+                            raise AssertionError(f"-conf-BAD diagnostic does not match {want!r}:\n{res.stderr}")
+                        _note_assertion()
                     else:
                         if start_imm:
                             cli_sock = os.path.join(self.tmpdir, f"{haproxy_id}.sock")
-                            # HAProxy only takes a master CLI (`-S`) in master-worker
-                            # mode; without `-W` the oracle refuses to start at all.
-                            mw = ["-W"] if "haproxy" in os.path.basename(self.target_binary) else []
+                            # The CLI is the config's `stats socket` (see the prelude above),
+                            # in the foreground, as vtest runs it.
+                            mw = []
                             proc = subprocess.Popen(
-                                [self.target_binary, "-f", cfg_path, "-S", cli_sock, "-d", *mw],
+                                [self.target_binary, "-f", cfg_path, "-d",
+                                 *([] if self.is_oracle() else ["-S", cli_sock])],
                                 stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE,
                             )
