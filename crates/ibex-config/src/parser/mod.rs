@@ -40,10 +40,6 @@ const IGNORED_GLOBAL_KEYWORDS: &[(&str, &str)] = &[
         "Directive allowing daemon fork under systemd; inert in Ibex single-process runtime",
     ),
     (
-        "tune.idle-pool.shared",
-        "Connection idle pool sharing across threads; inert in Ibex single-process runtime",
-    ),
-    (
         "tune.ssl.capture-buffer-size",
         "SSL capture buffer size tuning; inert in Ibex Rustls-based TLS subsystem",
     ),
