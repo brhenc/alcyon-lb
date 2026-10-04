@@ -6,6 +6,7 @@ license = "GPL-2.0-or-later"
 description = "HAProxy 1.0 configuration parser for Ibex"
 
 [dependencies]
+ibex-crypt = { path = "../ibex-crypt" }
 regex = "1.10"
 thiserror = "1.0"
 

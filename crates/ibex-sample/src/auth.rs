@@ -19,6 +19,9 @@ pub struct AuthUser {
     pub name: String,
     /// `insecure-password`; a user with none never authenticates.
     pub password: Option<String>,
+    /// `password <hash>`: the verifier of the `crypt(3)` hash, which `password` then holds
+    /// as text.
+    pub crypt: Option<ibex_crypt::CryptHash>,
     pub groups: Vec<String>,
 }
 
@@ -82,7 +85,13 @@ fn authenticated(ctx: &SampleContext, userlist: &str) -> Option<AuthUser> {
     let all = USERLISTS.read().ok()?;
     let list = all.iter().find(|l| l.name == userlist)?;
     let u = list.users.iter().find(|u| u.name == user)?;
-    (u.password.as_deref() == Some(pass.as_str())).then(|| u.clone())
+    // A hashed password is hashed again on every request that carries one, as HAProxy does
+    // (it caches nothing).
+    let ok = match &u.crypt {
+        Some(hash) => hash.verify(pass.as_bytes()),
+        None => u.password.as_deref() == Some(pass.as_str()),
+    };
+    ok.then(|| u.clone())
 }
 
 pub(crate) fn register(reg: &mut Registry) {

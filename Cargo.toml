@@ -7,6 +7,7 @@ members = [
     "crates/ibex-rt",
     "crates/ibex-config",
     "crates/ibex-sample",
+    "crates/ibex-crypt",
     "crates/ibex-stick-table",
     "crates/ibex-tls",
     "crates/ibex-alloc",
@@ -86,3 +87,15 @@ lto = "off"
 
 [profile.release]
 debug = true
+
+# Password hashing is deliberately slow; keep debug builds (tests) usable.
+[profile.dev.package.bcrypt]
+opt-level = 3
+[profile.dev.package.sha-crypt]
+opt-level = 3
+[profile.dev.package.md-5]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.ibex-crypt]
+opt-level = 3

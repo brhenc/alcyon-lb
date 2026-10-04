@@ -2342,7 +2342,13 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     users: l
                         .users
                         .iter()
-                        .map(|u| ibex_sample::AuthUser { name: u.name.clone(), password: u.password.clone(), groups: u.groups.clone() })
+                        .map(|u| ibex_sample::AuthUser {
+                            name: u.name.clone(),
+                            password: u.password.clone(),
+                            // The parser checked the hash; this is the verifier `http_auth` runs.
+                            crypt: u.password.as_deref().filter(|_| u.password_is_hash).and_then(|h| ibex_sample::CryptHash::parse(h).ok()),
+                            groups: u.groups.clone(),
+                        })
                         .collect(),
                 })
                 .collect(),

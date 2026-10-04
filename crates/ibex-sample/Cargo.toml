@@ -6,6 +6,7 @@ license = "GPL-2.0-or-later"
 description = "Ibex Sample / Converter / Matcher lattice (design/007-sample-lattice.md)"
 
 [dependencies]
+ibex-crypt = { path = "../ibex-crypt" }
 ibex-proto = { path = "../ibex-proto" }
 getrandom = "0.2"
 aes = "0.8"
