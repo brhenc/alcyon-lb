@@ -35,9 +35,7 @@ pub(crate) fn parse_userlist_directive(list: &mut Userlist, tokens: &[Token], kw
                 match arg.text.as_str() {
                     "users" => {
                         if let Some(users) = tokens.get(i + 1) {
-                            for u in names(&users.text) {
-                                list.members.push((name.text.clone(), u.to_string(), kw.line));
-                            }
+                            list.members.extend(names(&users.text).map(|u| (name.text.clone(), u.to_string(), kw.line)));
                         }
                         i += 2;
                     }

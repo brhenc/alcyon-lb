@@ -1807,30 +1807,33 @@ thread_local! {
 }
 
 /// Counts an error (`http_err_cnt`, `http_err_rate`) and/or a failure (`http_fail_cnt`) of
-/// the stream into the entries it tracks, per `http-err-codes` / `http-fail-codes`
-/// (`stream_inc_http_err_ctr` and `stream_inc_http_fail_ctr`, called as a response head
-/// comes in from the server).
+/// the stream into the entries it tracks.
+fn count_http(tracked: &[Option<(usize, StickKey)>; 3], proxies: &[Proxy], err: bool, fail: bool) {
+    for (t_idx, k) in tracked.iter().flatten() {
+        let Some(tbl) = proxies.get(*t_idx).and_then(|p| p.stick_table.as_ref()) else { continue };
+        let _ = tbl.update_entry(k, |d| {
+            d.http_err_cnt += u64::from(err);
+            d.http_fail_cnt += u64::from(fail);
+            if let Some(r) = d.http_err_rate.as_mut().filter(|_| err) {
+                r.tick(1);
+            }
+        });
+    }
+}
+
+/// The statuses of `http-err-codes` and `http-fail-codes` count as the response head comes in
+/// from the server (`stream_inc_http_err_ctr` and `stream_inc_http_fail_ctr`).
 fn count_http_status(tracked: &[Option<(usize, StickKey)>; 3], proxies: &[Proxy], status: u16) {
     let err = HTTP_ERR_CODES.with(|c| c.get().contains(status));
     let fail = HTTP_FAIL_CODES.with(|c| c.get().contains(status));
-    if !err && !fail {
-        return;
+    if err || fail {
+        count_http(tracked, proxies, err, fail);
     }
-    for (t_idx, k) in tracked.iter().flatten() {
-        if let Some(tbl) = proxies.get(*t_idx).and_then(|p| p.stick_table.as_ref()) {
-            let _ = tbl.update_entry(k, |d| {
-                if err {
-                    d.http_err_cnt += 1;
-                    if let Some(r) = d.http_err_rate.as_mut() {
-                        r.tick(1);
-                    }
-                }
-                if fail {
-                    d.http_fail_cnt += 1;
-                }
-            });
-        }
-    }
+}
+
+/// A denied or tarpitted request is an error of its client, whatever the status.
+fn count_http_err(tracked: &[Option<(usize, StickKey)>; 3], proxies: &[Proxy]) {
+    count_http(tracked, proxies, true, false);
 }
 
 /// The address of a `Forwarded` node: an IPv4 address as it is, an IPv6 one in brackets.
@@ -1932,20 +1935,6 @@ fn sample_as_sint(smp: &ibex_sample::Sample) -> i64 {
     let (neg, digits) = t.strip_prefix('-').map_or((false, t.strip_prefix('+').unwrap_or(t)), |d| (true, d));
     let n = digits.bytes().take_while(u8::is_ascii_digit).fold(0i64, |n, d| n.saturating_mul(10).saturating_add(i64::from(d - b'0')));
     if neg { -n } else { n }
-}
-
-/// An error of the client that does not depend on a status: what a `deny` or a `tarpit` rule counts.
-fn count_http_err(tracked: &[Option<(usize, StickKey)>; 3], proxies: &[Proxy]) {
-    for (t_idx, k) in tracked.iter().flatten() {
-        if let Some(tbl) = proxies.get(*t_idx).and_then(|p| p.stick_table.as_ref()) {
-            let _ = tbl.update_entry(k, |d| {
-                d.http_err_cnt += 1;
-                if let Some(r) = d.http_err_rate.as_mut() {
-                    r.tick(1);
-                }
-            });
-        }
-    }
 }
 
 fn init_global_vars(global: Option<&ibex_config::GlobalSection>) {

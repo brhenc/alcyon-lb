@@ -31,6 +31,12 @@ pub struct Userlist {
 }
 
 impl Userlist {
+    fn add_to_group(&mut self, user: &str, group: String) {
+        for u in self.users.iter_mut().filter(|u| u.name == user && !u.groups.contains(&group)) {
+            u.groups.push(group.clone());
+        }
+    }
+
     /// Resolves what the section's lines named: every group of a user must be declared, and
     /// every user of a group must exist (`HAProxy` refuses both at load).
     ///
@@ -41,19 +47,13 @@ impl Userlist {
             if !self.groups.contains(&group) {
                 return Err((self.line, format!("userlist '{}': no such group '{group}' specified in user '{user}'", self.name)));
             }
-            if let Some(u) = self.users.iter_mut().find(|u| u.name == user) {
-                if !u.groups.contains(&group) {
-                    u.groups.push(group);
-                }
-            }
+            self.add_to_group(&user, group);
         }
         for (group, user, _) in std::mem::take(&mut self.members) {
-            let Some(u) = self.users.iter_mut().find(|u| u.name == user) else {
+            if !self.users.iter().any(|u| u.name == user) {
                 return Err((self.line, format!("userlist '{}': no such user '{user}' specified in group '{group}'", self.name)));
-            };
-            if !u.groups.contains(&group) {
-                u.groups.push(group);
             }
+            self.add_to_group(&user, group);
         }
         Ok(())
     }

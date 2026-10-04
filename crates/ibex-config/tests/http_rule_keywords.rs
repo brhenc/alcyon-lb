@@ -162,6 +162,14 @@ fn errorloc_and_replace_uri_refusals() {
 }
 
 #[test]
+fn replace_uri_without_a_condition() {
+    let c = parse_config(&cfg("frontend", "http-request replace-uri ^/a /b")).expect("accepted");
+    let rule = &c.frontends[0].http_req_rules[0];
+    assert!(matches!(&rule.action, HttpReqAction::ReplaceUri { regex, repl } if regex == "^/a" && repl == "/b"));
+    assert!(rule.cond.is_none());
+}
+
+#[test]
 fn more_userlist_lines() {
     for (text, want) in [
         ("userlist\n  user a\n", "'userlist' expects <name> as arguments."),
