@@ -728,6 +728,7 @@ mod tests {
             hash_type: ibex_config::HashType::default(),
             hash_preserve_affinity: ibex_config::HashPreserveAffinity::default(),
             chash: std::sync::Arc::default(),
+            fwrr: std::sync::Arc::default(),
             log_format: None,
             unique_id_format: None,
             unique_id_header: None,

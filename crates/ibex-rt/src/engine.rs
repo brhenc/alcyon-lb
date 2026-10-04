@@ -437,6 +437,8 @@ pub struct Proxy {
     pub hash_preserve_affinity: ibex_config::HashPreserveAffinity,
     /// The `hash-type consistent` ring, built on first use and shared by the workers.
     pub chash: Arc<crate::lb::ChashRing>,
+    /// `balance roundrobin`'s weighted order, shared by the workers.
+    pub fwrr: Arc<crate::lb::Fwrr>,
 }
 
 impl Proxy {
@@ -519,6 +521,13 @@ impl Proxy {
             }
             BalanceAlgorithm::Random(draws) => {
                 if let Some(idx) = crate::lb::random(self, draws) {
+                    Some(self.servers[idx])
+                } else {
+                    self.dispatch
+                }
+            }
+            BalanceAlgorithm::RoundRobin => {
+                if let Some(idx) = crate::lb::round_robin(self) {
                     Some(self.servers[idx])
                 } else {
                     self.dispatch
@@ -1526,6 +1535,7 @@ fn init_proxy_from_listen(proxy_idx: usize, listen: &ibex_config::ListenSection,
         hash_type: listen.hash_type.unwrap_or_default(),
         hash_preserve_affinity: listen.hash_preserve_affinity.unwrap_or_default(),
         chash: Arc::default(),
+        fwrr: Arc::default(),
     }
 }
 
@@ -1631,6 +1641,7 @@ fn init_proxy_from_frontend(proxy_idx: usize, fe: &ibex_config::FrontendSection,
         hash_type: ibex_config::HashType::default(),
         hash_preserve_affinity: ibex_config::HashPreserveAffinity::default(),
         chash: Arc::default(),
+        fwrr: Arc::default(),
     }
 }
 
@@ -1759,6 +1770,7 @@ fn init_proxy_from_backend(proxy_idx: usize, be: &ibex_config::BackendSection, n
         hash_type: be.hash_type.unwrap_or_default(),
         hash_preserve_affinity: be.hash_preserve_affinity.unwrap_or_default(),
         chash: Arc::default(),
+        fwrr: Arc::default(),
     }
 }
 
