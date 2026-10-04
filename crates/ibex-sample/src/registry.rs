@@ -4076,10 +4076,15 @@ impl Registry {
             in_type: TypeSpec::Any,
             out_type: TypeSpec::Same,
             func: |smp, args| {
+                // A `proc.` variable is the process's, not the stream's (T156).
                 if let Some(var_name) = args.first() {
-                    CURRENT_VARS.with(|v| {
-                        v.borrow_mut().remove(var_name);
-                    });
+                    if var_name.starts_with("proc.") {
+                        unset_proc_var(var_name);
+                    } else {
+                        CURRENT_VARS.with(|v| {
+                            v.borrow_mut().remove(var_name);
+                        });
+                    }
                 }
                 Some(smp)
             },
