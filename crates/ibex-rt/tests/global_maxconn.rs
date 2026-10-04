@@ -72,6 +72,12 @@ fn start(maxconn: u32) -> (Ibex, SocketAddr) {
         Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(dir.join("cfg")).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn");
     let ibex = Ibex { child, sock, dir };
     assert!(common::wait_listening(fe));
+    // The stats socket is bound after the frontends are listening.
+    let end = std::time::Instant::now() + Duration::from_secs(10);
+    while UnixStream::connect(&ibex.sock).is_err() {
+        assert!(std::time::Instant::now() < end, "the stats socket never came up");
+        thread::sleep(Duration::from_millis(25));
+    }
     (ibex, fe)
 }
 
