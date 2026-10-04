@@ -16,7 +16,7 @@ pub struct DefaultServerConfig {
     pub send_proxy_v2: bool,
     pub maxconn: Option<u32>,
     pub check_port: Option<u16>,
-    pub check_proto: Option<String>,
+    pub check_proto: Option<&'static str>,
     /// The TLS keywords (`ssl`, `verify`, `sni`, `check-ssl`, ...).
     pub ssl: ServerSsl,
     /// `proxy-v2-options unique-id`.
@@ -200,7 +200,7 @@ pub struct Server {
     /// Custom port for health checks (`port`).
     pub check_port: Option<u16>,
     /// Protocol for health checks (`check-proto`).
-    pub check_proto: Option<String>,
+    pub check_proto: Option<&'static str>,
     /// The TLS keywords (`ssl`, `verify`, `sni`, `check-ssl`, ...), boxed and absent for
     /// a plaintext server so 60,000 of them stay cheap (`request_allocations`).
     pub ssl: Option<Box<ServerSsl>>,

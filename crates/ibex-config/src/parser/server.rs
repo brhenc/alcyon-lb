@@ -32,7 +32,7 @@ pub(crate) fn parse_server(
     let mut send_proxy_v2 = default_server.is_some_and(|d| d.send_proxy_v2);
     let mut maxconn = default_server.and_then(|d| d.maxconn);
     let mut check_port = default_server.and_then(|d| d.check_port);
-    let mut check_proto = default_server.and_then(|d| d.check_proto.clone());
+    let mut check_proto = default_server.and_then(|d| d.check_proto);
     let mut weight = default_server.and_then(|d| d.weight);
     let mut backup = default_server.is_some_and(|d| d.backup);
     let mut cookie = default_server.and_then(|d| d.cookie.clone());
@@ -340,12 +340,14 @@ fn validate_server_ssl(ssl: &ServerSsl, check_port: Option<u16>, kw: &Token, who
 /// speaks only h2 would refuse every request, and until T113 the keyword was a warning
 /// that two reg-tests passed through by having both ends ignore it. `HAProxy` refuses a
 /// protocol it has no mux for ("'proto' :  unknown MUX protocol 'h3'.").
-fn parse_server_proto(tokens: &[Token], i: usize, server: Option<&str>) -> Result<String, ConfigError> {
+fn parse_server_proto(tokens: &[Token], i: usize, server: Option<&str>) -> Result<&'static str, ConfigError> {
     let kw = &tokens[i];
     let value = &server_kw_arg(tokens, i, server, ": missing value.")?.text;
     let prefix = server_prefix(server);
     match value.as_str() {
-        "h1" => {}
+        // The one protocol Ibex speaks to servers; a `&'static str` so `Server` stays the
+        // size it was before `ssl` joined it (60,000 of them are measured).
+        "h1" => Ok("h1"),
         "h2" => {
             return Err(ConfigError::new(
                 kw.line,
@@ -364,15 +366,12 @@ fn parse_server_proto(tokens: &[Token], i: usize, server: Option<&str>) -> Resul
                 format!("{prefix}'{}' : '{value}' is not supported: Ibex speaks only HTTP/1.1 to servers.", kw.text),
             ));
         }
-        other => {
-            return Err(ConfigError::new(
-                kw.line,
-                kw.col,
-                format!("{prefix}'{}' :  unknown MUX protocol '{other}'.", kw.text),
-            ));
-        }
+        other => Err(ConfigError::new(
+            kw.line,
+            kw.col,
+            format!("{prefix}'{}' :  unknown MUX protocol '{other}'.", kw.text),
+        )),
     }
-    Ok(value.clone())
 }
 
 pub(crate) fn parse_default_server(
