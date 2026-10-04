@@ -264,3 +264,36 @@ fn binary_cast_to_string_stops_at_the_first_nul() {
     assert_eq!(header(&r, "x-l").as_deref(), Some("2 3 2 0 0 5 7"), "{r}");
     assert_eq!(header(&r, "x-u").as_deref(), Some("A"), "{r}");
 }
+
+/// `http_auth_bearer(<header>)` on a custom header and on `Authorization` (HAProxy 3.5-dev8,
+/// the same rules as reg-tests/sample_fetches/http_auth_bearer.vtc plus a token with a space).
+#[test]
+fn http_auth_bearer_reads_the_named_header() {
+    let fe = common::reserve_addr();
+    let _ibex = start(
+        &format!(
+            "{DEFAULTS}frontend fe\n  bind {fe}\n  \
+             http-request return status 200 hdr tok \"%[http_auth_bearer(x-tok)]\" if {{ http_auth_bearer(x-tok) -m found }}\n  \
+             http-request return status 201 hdr tok \"%[http_auth_bearer]\" if {{ http_auth_bearer -m found }}\n  \
+             http-request return status 404\n"
+        ),
+        fe,
+    );
+    let cases: &[(&str, &str, &str)] = &[
+        ("x-tok: Bearer a", "200", "a"),
+        ("x-tok: Bearer abcdef", "200", "abcdef"),
+        ("x-tok: Bearer abcdefg", "200", "abcdefg"),
+        ("x-tok: bearer   xyz123", "200", "xyz123"),
+        ("x-tok: BEARER abc def", "200", "abc def"),
+        ("x-tok: Bearer", "404", ""),
+        ("x-tok: Bearerabc", "404", ""),
+        ("x-tok: Basic abcdef", "404", ""),
+        ("authorization: Bearer abcdef", "201", "abcdef"),
+        ("authorization: Basic YTpi", "404", ""),
+    ];
+    for (hdr, status, tok) in cases {
+        let r = get(fe, &format!("{hdr}\r\n"));
+        assert!(r.starts_with(&format!("HTTP/1.1 {status}")), "{hdr}: {r}");
+        assert_eq!(header(&r, "tok").unwrap_or_default(), *tok, "{hdr}: {r}");
+    }
+}

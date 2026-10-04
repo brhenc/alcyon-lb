@@ -1035,6 +1035,27 @@ impl Registry {
             func: request_header_fetch,
         });
 
+        // `http_auth_bearer([<header>])` (`smp_fetch_http_auth_bearer`): the token of a
+        // `Bearer` credential in the first `<header>` (default `Authorization`). The scheme is
+        // matched without regard to case and needs at least one space before the token, which
+        // is the rest of the value; no token, another scheme or no header is no sample.
+        self.register_fetch(FetchDesc {
+            name: "http_auth_bearer",
+            out_type: SampleType::Str,
+            func: |ctx, args| {
+                let name = args.first().map_or("authorization", String::as_str);
+                let name = if name.is_empty() { "authorization" } else { name };
+                let hdrs = get_all_req_headers(ctx, name);
+                let value = hdrs.first()?;
+                let (scheme, rest) = value.split_at_checked(6)?;
+                if !scheme.eq_ignore_ascii_case("bearer") || !rest.starts_with(' ') {
+                    return None;
+                }
+                let token = rest.trim_start_matches(' ');
+                (!token.is_empty()).then(|| Sample::Str(token.to_string()))
+            },
+        });
+
         let response_header_fetch: FetchFn = |ctx, args| {
             let name = args.first()?;
             let occ: Option<i64> = args.get(1).and_then(|s| s.parse().ok());
