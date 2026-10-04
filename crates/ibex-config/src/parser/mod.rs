@@ -1097,6 +1097,65 @@ pub(crate) fn parse_default_backend(
 
 
 
+/// Where `track [<proxy>/]<server>` of a server of `px` points: the proxy name is what
+/// precedes the last `/`, and a bare name is a server of the same proxy.
+#[must_use]
+pub fn tracked_target<'a>(px: &'a str, spec: &'a str) -> (&'a str, &'a str) {
+    spec.rsplit_once('/').unwrap_or((px, spec))
+}
+
+/// `track` is resolved when the configuration loads, the servers taken in the order they
+/// are declared, as `srv_apply_track` does (`src/server.c`): the target must exist, must
+/// have a check or itself track something (a later server's `track` counts), and the chain
+/// it starts must not lead back to the server.
+fn validate_tracking(listens: &[ListenSection], backends: &[BackendSection]) -> Result<(), ConfigError> {
+    // Most configurations track nothing, and the bookkeeping below allocates per backend.
+    let tracks = |servers: &[Server]| servers.iter().any(|s| s.track.is_some());
+    if !listens.iter().any(|l| tracks(&l.servers)) && !backends.iter().any(|b| tracks(&b.servers)) {
+        return Ok(());
+    }
+    let all: Vec<(&str, &[Server])> = listens
+        .iter()
+        .map(|l| (l.name.as_str(), l.servers.as_slice()))
+        .chain(backends.iter().map(|b| (b.name.as_str(), b.servers.as_slice())))
+        .collect();
+    let find = |px: &str, sv: &str| -> Option<(usize, usize)> {
+        let p = all.iter().position(|(n, _)| *n == px)?;
+        Some((p, all[p].1.iter().position(|s| s.id == sv)?))
+    };
+    // The links applied so far.
+    let mut link: Vec<Vec<Option<(usize, usize)>>> = all.iter().map(|(_, s)| vec![None; s.len()]).collect();
+    for (p, (px, servers)) in all.iter().enumerate() {
+        for (s, server) in servers.iter().enumerate() {
+            let Some(spec) = &server.track else { continue };
+            let err = |msg: String| ConfigError::new(1, 1, format!("'server {px}/{}' : {msg}", server.id));
+            if server.check {
+                return Err(err("unable to enable checks and tracking at the same time!".to_string()));
+            }
+            let (tpx, tsv) = tracked_target(px, spec);
+            if !all.iter().any(|(n, _)| *n == tpx) {
+                return Err(err(format!("unable to find required proxy '{tpx}' for tracking.")));
+            }
+            let Some(t) = find(tpx, tsv) else {
+                return Err(err(format!("unable to find required server '{tsv}' for tracking.")));
+            };
+            let target = &all[t.0].1[t.1];
+            if !target.check && target.track.is_none() {
+                return Err(err(format!("unable to use {tpx}/{tsv} for tracking as it does not have any check nor agent enabled.")));
+            }
+            let mut at = Some(t);
+            while let Some(x) = at {
+                if x == (p, s) {
+                    return Err(err(format!("unable to track {tpx}/{tsv} as it belongs to a tracking chain looping back to {px}/{}.", server.id)));
+                }
+                at = link[x.0][x.1];
+            }
+            link[p][s] = Some(t);
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_config(
     global: Option<&GlobalSection>,
     listens: &[ListenSection],
@@ -1156,6 +1215,7 @@ pub(crate) fn validate_config(
             }
         }
     }
+    validate_tracking(listens, backends)?;
     for proxy in listens {
         if proxy.mode == Mode::Http && proxy.cookie.is_some() && proxy.servers.is_empty() {
             return Err(ConfigError::new(

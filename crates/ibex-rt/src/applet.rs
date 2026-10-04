@@ -358,7 +358,12 @@ impl CliApplet {
                         _ => 0,
                     };
                     // srv_admin_state: SRV_ADMF_FMAINT 1, SRV_ADMF_FDRAIN 8.
+                    // A tracker whose target is in maintenance or drain has the inherited flags
+                    // instead (SRV_ADMF_IMAINT 2, SRV_ADMF_IDRAIN 16).
+                    let inherited = crate::track::inherited(p, s_idx);
                     let admin_state = match status {
+                        Some(ServerStatus::Maint) if inherited => 2,
+                        Some(ServerStatus::Drain) if inherited => 16,
                         Some(ServerStatus::Maint) => 1,
                         Some(ServerStatus::Drain) => 8,
                         _ => 0,
@@ -1015,13 +1020,14 @@ impl CliApplet {
             return;
         };
         let mut found_px = false;
+        let mut track_changes = Vec::new();
         let mut found_sv = false;
         for (p_idx, proxy) in ctx.proxies.iter_mut().enumerate() {
             if proxy.name == px_name {
                 found_px = true;
                 for (s_idx, sid) in proxy.server_ids.iter().enumerate() {
                     if sid == sv_name {
-                        proxy.server_statuses[s_idx].store(0 /* Up */, std::sync::atomic::Ordering::Relaxed);
+                        track_changes.push((p_idx, s_idx, ServerStatus::Up));
                         found_sv = true;
                         if let Some(check) = ctx
                             .checks
@@ -1033,6 +1039,9 @@ impl CliApplet {
                     }
                 }
             }
+        }
+        for (p_idx, s_idx, st) in track_changes {
+            crate::track::set_status(ctx.proxies, p_idx, s_idx, st);
         }
         if !found_px {
             self.out_buf.extend_from_slice(b"No such backend.\n");
@@ -1057,13 +1066,14 @@ impl CliApplet {
             return;
         };
         let mut found_px = false;
+        let mut track_changes = Vec::new();
         let mut found_sv = false;
         for (p_idx, proxy) in ctx.proxies.iter_mut().enumerate() {
             if proxy.name == px_name {
                 found_px = true;
                 for (s_idx, sid) in proxy.server_ids.iter().enumerate() {
                     if sid == sv_name {
-                        proxy.server_statuses[s_idx].store(ServerStatus::Maint as u8, std::sync::atomic::Ordering::Relaxed);
+                        track_changes.push((p_idx, s_idx, ServerStatus::Maint));
                         found_sv = true;
                         if let Some(check) = ctx
                             .checks
@@ -1075,6 +1085,9 @@ impl CliApplet {
                     }
                 }
             }
+        }
+        for (p_idx, s_idx, st) in track_changes {
+            crate::track::set_status(ctx.proxies, p_idx, s_idx, st);
         }
         if !found_px {
             self.out_buf.extend_from_slice(b"No such backend.\n");
@@ -1193,7 +1206,7 @@ impl CliApplet {
                         return;
                     }
                 };
-                ctx.proxies[p_idx].server_statuses[s_idx].store(status as u8, std::sync::atomic::Ordering::Relaxed);
+                crate::track::set_status(ctx.proxies, p_idx, s_idx, status);
                 if let Some(check) = ctx.checks.iter_mut().find(|c| c.proxy_idx == p_idx && c.server_idx == s_idx) {
                     check.status = status;
                 }

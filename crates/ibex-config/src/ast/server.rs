@@ -26,6 +26,8 @@ pub struct DefaultServerConfig {
     pub cookie: Option<String>,
     /// `disabled` / `enabled`: servers declared after start in maintenance.
     pub disabled: bool,
+    /// `track [<proxy>/]<server>`, as written.
+    pub track: Option<Box<str>>,
 }
 
 /// `verify none|required` on a server line.
@@ -224,6 +226,8 @@ pub struct Server {
     /// `disabled`: the server starts in maintenance and takes no traffic until the CLI's
     /// `enable server` brings it back.
     pub disabled: bool,
+    /// `track [<proxy>/]<server>`, as written.
+    pub track: Option<Box<str>>,
 }
 
 impl Default for Server {
@@ -246,6 +250,7 @@ impl Default for Server {
             proxy_v2_unique_id: false,
             cookie: None,
             disabled: false,
+            track: None,
         }
     }
 }
@@ -271,6 +276,7 @@ impl Server {
             proxy_v2_unique_id: false,
             cookie: None,
             disabled: false,
+            track: None,
         }
     }
 }

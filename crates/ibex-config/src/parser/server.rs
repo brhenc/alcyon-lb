@@ -39,6 +39,7 @@ pub(crate) fn parse_server(
     let mut proxy_v2_unique_id = default_server.is_some_and(|d| d.proxy_v2_unique_id);
     let mut ssl = default_server.map(|d| d.ssl.clone()).unwrap_or_default();
     let mut disabled = default_server.is_some_and(|d| d.disabled);
+    let mut track = default_server.and_then(|d| d.track.clone());
 
     // Every keyword HAProxy knows is either implemented here or listed, with what Ibex
     // does about it, in `server_keywords.rs`. A keyword's argument is consumed with it.
@@ -103,6 +104,10 @@ pub(crate) fn parse_server(
             "no-backup" => backup = false,
             "disabled" => disabled = true,
             "enabled" => disabled = false,
+            "track" => {
+                track = Some(server_kw_arg(tokens, i, who, "expects [<proxy>/]<server> as argument.")?.text.as_str().into());
+                i += 1;
+            }
             // What these turn on, Ibex never does: they leave the server as Ibex runs it.
             "stick" | "no-agent-check" | "no-check-send-proxy" | "no-check-reuse-pool"
             | "no-send-proxy-v2-ssl" | "no-send-proxy-v2-ssl-cn" => {}
@@ -132,6 +137,7 @@ pub(crate) fn parse_server(
         backup,
         cookie,
         disabled,
+        track,
     });
     Ok(())
 }
@@ -445,6 +451,10 @@ pub(crate) fn parse_default_server(
             "no-backup" => cfg.backup = false,
             "disabled" => cfg.disabled = true,
             "enabled" => cfg.disabled = false,
+            "track" => {
+                cfg.track = Some(server_kw_arg(tokens, i, None, "expects [<proxy>/]<server> as argument.")?.text.as_str().into());
+                i += 1;
+            }
             "stick" | "no-agent-check" | "no-check-send-proxy" | "no-check-reuse-pool"
             | "no-send-proxy-v2-ssl" | "no-send-proxy-v2-ssl-cn" => {}
             _ => i = unimplemented_server_keyword(tokens, i, None)?,

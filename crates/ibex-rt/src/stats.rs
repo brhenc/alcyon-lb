@@ -476,7 +476,7 @@ fn write_server_row(
     let (status_str, chkfail, chkdown, check_status, check_code, check_duration) =
         if let Some(c) = check_state {
             (
-                c.status.as_str(),
+                c.status.as_str().to_string(),
                 c.failed_checks,
                 c.down_transitions,
                 c.last_status_code,
@@ -486,11 +486,17 @@ fn write_server_row(
         } else {
             let s = proxy
                 .server_statuses.get(s_idx).map(|s| ServerStatus::from(s.load(std::sync::atomic::Ordering::Relaxed))).unwrap_or(ServerStatus::Up);
+            let tracker = !crate::track::tracked_label(proxy, s_idx).is_empty();
             let s_str = match s {
-                ServerStatus::Up => "no check",
-                ServerStatus::Down => "DOWN",
-                ServerStatus::Drain => "DRAIN",
-                ServerStatus::Maint => "MAINT",
+                ServerStatus::Up if tracker => "UP".to_string(),
+                ServerStatus::Up => "no check".to_string(),
+                ServerStatus::Down => "DOWN".to_string(),
+                ServerStatus::Drain => "DRAIN".to_string(),
+                // The maintenance of a tracker's target says where it comes from.
+                ServerStatus::Maint if crate::track::inherited(proxy, s_idx) => {
+                    format!("MAINT (via {})", crate::track::tracked_label(proxy, s_idx))
+                }
+                ServerStatus::Maint => "MAINT".to_string(),
             };
             (s_str, 0, 0, "", 0, 0)
         };
@@ -525,6 +531,7 @@ fn write_server_row(
     r.set("wretr", wretr);
     r.set("wredis", wredis);
     r.set("status", status_str);
+    r.set("tracked", crate::track::tracked_label(proxy, s_idx));
     r.set("weight", weight);
     r.set("act", act);
     r.set("bck", bck);
@@ -685,6 +692,7 @@ mod tests {
             server_ids: vec!["srv1".into()],
             server_cookies: vec![None],
             server_statuses: std::sync::Arc::new(vec![std::sync::atomic::AtomicU8::new(0)]),
+            server_track: None,
             server_weights: vec![1],
             server_iweights: None,
             next_server_idx: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),

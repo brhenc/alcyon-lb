@@ -341,6 +341,8 @@ pub struct Proxy {
     /// without one is never chosen by a cookie, not even by its name.
     pub server_cookies: Vec<Option<String>>,
     pub server_statuses: Arc<Vec<AtomicU8>>,
+    /// `track` of each server (`None` for one that tracks nothing; empty when none does).
+    pub server_track: Option<Arc<Vec<Option<crate::track::Track>>>>,
     pub server_weights: Vec<u32>,
     /// Each server's configured weight (`iweight`): what `set server ... weight <n>%` is a share
     /// of, and the `initial` of `get weight`. `server_weights` is the current one. Saved by
@@ -1493,6 +1495,7 @@ fn init_proxy_from_listen(proxy_idx: usize, listen: &ibex_config::ListenSection,
         server_ids: listen.servers.iter().map(|s| s.id.clone()).collect(),
         server_cookies: listen.servers.iter().map(|s| s.cookie.clone()).collect(),
         server_statuses: Arc::new(listen.servers.iter().map(|s| AtomicU8::new(initial_status(s))).collect()),
+        server_track: None,
         server_weights: listen
             .servers
             .iter()
@@ -1603,6 +1606,7 @@ fn init_proxy_from_frontend(proxy_idx: usize, fe: &ibex_config::FrontendSection,
         server_ids: Vec::new(),
         server_cookies: Vec::new(),
         server_statuses: std::sync::Arc::new(Vec::new()),
+        server_track: None,
         server_weights: Vec::new(),
         server_iweights: None,
         next_server_idx: Arc::new(AtomicUsize::new(0)),
@@ -1732,6 +1736,7 @@ fn init_proxy_from_backend(proxy_idx: usize, be: &ibex_config::BackendSection, n
         server_ids: be.servers.iter().map(|s| s.id.clone()).collect(),
         server_cookies: be.servers.iter().map(|s| s.cookie.clone()).collect(),
         server_statuses: Arc::new(be.servers.iter().map(|s| AtomicU8::new(initial_status(s))).collect()),
+        server_track: None,
         server_weights: be.servers.iter().map(|s| s.weight.unwrap_or(1)).collect(),
         server_iweights: None,
         next_server_idx: Arc::new(AtomicUsize::new(0)),
@@ -1880,6 +1885,7 @@ impl Engine {
     for p in &mut proxies {
         p.disabled_backends = Arc::clone(&disabled);
     }
+    crate::track::attach(&mut proxies, config);
     let _ = resolve_log_targets(config, &mut proxies);
     Ok(proxies)
 }
@@ -6003,6 +6009,7 @@ impl EngineDispatcher<'_> {
                     let target_backend = cmd.backend.as_deref();
                     let target_server = cmd.server.as_deref();
 
+                    let mut status_changes = Vec::new();
                     for (p_idx, proxy) in proxies.iter_mut().enumerate() {
                         if target_backend.is_none() || target_backend == Some(proxy.name.as_str()) {
                             let mut weight_changes = Vec::new();
@@ -6015,7 +6022,7 @@ impl EngineDispatcher<'_> {
                                         _ => None,
                                     };
                                     if let Some(st) = new_status {
-                                        proxy.server_statuses[s_idx].store(st as u8, Ordering::Relaxed);
+                                        status_changes.push((p_idx, s_idx, st));
                                         if let Some(check) = checks
                                             .iter_mut()
                                             .find(|c| c.proxy_idx == p_idx && c.server_idx == s_idx)
@@ -6037,6 +6044,9 @@ impl EngineDispatcher<'_> {
                                 proxy.set_weight(s_idx, w);
                             }
                         }
+                    }
+                    for (p_idx, s_idx, st) in status_changes {
+                        crate::track::set_status(proxies, p_idx, s_idx, st);
                     }
                 }
             }
@@ -7280,7 +7290,7 @@ impl EngineDispatcher<'_> {
                 && proxy_idx < self.proxies.len()
                 && server_idx < self.proxies[proxy_idx].server_statuses.len()
             {
-                self.proxies[proxy_idx].server_statuses[server_idx].store(check.status as u8, Ordering::Relaxed);
+                crate::track::set_status(self.proxies, proxy_idx, server_idx, check.status);
             }
 
             // The message is built while `check` is still borrowed, then the borrow ends

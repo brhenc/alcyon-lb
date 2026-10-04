@@ -117,7 +117,6 @@ pub(crate) const UNIMPLEMENTED_SERVER_KEYWORDS: &[ServerKeyword] = &[
     kw!("source", Arg::Word, ROUTE),
     kw!("strict-maxconn", Arg::None, Ignore("whether idle connections count against maxconn")),
     kw!("tfo", Arg::None, Ignore("TCP Fast Open")),
-    kw!("track", Arg::Word, Refuse("Ibex does not implement it; the server would stay up when the server it tracks goes down")),
     kw!("socks4", Arg::Word, ROUTE),
     kw!("usesrc", Arg::None, ROUTE),
     // src/check.c
