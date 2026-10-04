@@ -589,6 +589,49 @@ class VtcParser:
         )
 
 
+def vtc_split(line: str) -> List[str]:
+    """Split a vtc command line the way varnishtest does: whitespace separates words,
+    "..." and '...' quote (backslash escapes inside double quotes), and {...} is one
+    word taken verbatim (nested braces balanced) with its quotes left alone. shlex
+    would strip the quotes inside `{Basic realm="protected area"}`."""
+    out: List[str] = []
+    i, n = 0, len(line)
+    while i < n:
+        c = line[i]
+        if c.isspace():
+            i += 1
+            continue
+        if c == "#":
+            break
+        word = ""
+        while i < n and not line[i].isspace():
+            c = line[i]
+            if c == "{" and not word:
+                depth, j = 1, i + 1
+                while j < n and depth:
+                    depth += (line[j] == "{") - (line[j] == "}")
+                    j += 1
+                if depth:
+                    raise ValueError("unbalanced brace")
+                word += line[i + 1:j - 1]
+                i = j
+            elif c in "\"'":
+                j = i + 1
+                while j < n and line[j] != c:
+                    if c == '"' and line[j] == "\\" and j + 1 < n:
+                        j += 1
+                    word += line[j]
+                    j += 1
+                if j >= n:
+                    raise ValueError("unbalanced quote")
+                i = j + 1
+            else:
+                word += c
+                i += 1
+        out.append(word)
+    return out
+
+
 def parse_inner_actions(block_content: str) -> List[ActionItem]:
     """Parse sequential commands inside server/client { ... } block."""
     actions: List[ActionItem] = []
@@ -617,7 +660,7 @@ def parse_inner_actions(block_content: str) -> List[ActionItem]:
             continue
 
         try:
-            tokens = shlex.split(trimmed, comments=True)
+            tokens = vtc_split(trimmed)
         except ValueError:
             tokens = trimmed.split()
 

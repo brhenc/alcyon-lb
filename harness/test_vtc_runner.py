@@ -179,5 +179,18 @@ class MasterCliVersusStatsSocket(unittest.TestCase):
         self.assertIn("defaults", cfg[3].strip() + "".join(cfg[4:]))
 
 
+class VtcQuotingTest(unittest.TestCase):
+    """`expect ... == {Basic realm="protected area"}` lost its quotes to shlex, so
+    http-rules/http_auth.vtc failed on the runner, not on the proxy (T151 item 4)."""
+
+    def test_braces_are_one_verbatim_word(self):
+        acts = vtc_runner.parse_inner_actions(
+            'expect resp.http.www-authenticate == {Basic realm="protected area"}\n'
+            'txreq -hdr "X-A: b c" -hdr \'X-B: d\'\n'
+        )
+        self.assertEqual(acts[0].args, ["resp.http.www-authenticate", "==", 'Basic realm="protected area"'])
+        self.assertEqual(acts[1].args, ["-hdr", "X-A: b c", "-hdr", "X-B: d"])
+
+
 if __name__ == "__main__":
     unittest.main()
