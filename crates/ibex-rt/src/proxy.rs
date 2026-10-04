@@ -741,7 +741,7 @@ impl TcpSession {
         let txn = self.txn.get_or_insert_with(|| HttpTxn::new(txn::Framing::None, false));
         let data = self.req.readable();
         let n = txn.req.window(data);
-        txn.req.consume(data, n);
+        txn.request_consumed(data, n);
         self.req.consume(n);
         let head_len = find_eoh(raw).map_or(raw.len(), |(h, e)| h + e);
         let head = String::from_utf8_lossy(&raw[..head_len]);
@@ -817,7 +817,7 @@ impl TcpSession {
         if let Some(t) = self.txn.as_mut().filter(|t| t.local && !t.req.is_done() && !t.close_after) {
             let data = self.req.readable();
             let n = t.req.window(data);
-            t.req.consume(data, n);
+            t.request_consumed(data, n);
             self.req.consume(n);
         }
     }
@@ -1193,6 +1193,10 @@ impl TcpSession {
                     return Ok(true);
                 }
 
+                // What `%U` counts of this head: the message as received, whatever the
+                // rules make of it afterwards.
+                let req_htx = txn::htx_head_size(&self.req.readable()[..total_hdr_len], true);
+
                 // Validate the head through the selected parser before anything below
                 // reads it.
                 //
@@ -1327,6 +1331,7 @@ impl TcpSession {
                 let framing = find_eoh(self.req.readable())
                     .map_or(txn::Framing::None, |(h, e)| txn::request_framing(&self.req.readable()[..h + e]));
                 let mut txn = HttpTxn::new(framing, close);
+                txn.req_htx = req_htx;
                 // The client's own method: rules that rewrite it have not run yet.
                 txn.client_head = self.req_method.as_deref().is_some_and(|m| m.eq_ignore_ascii_case("HEAD"));
                 self.txn = Some(txn);
@@ -1548,7 +1553,7 @@ impl TcpSession {
                 Io::Done(n) if n > 0 => {
                     if self.mode == Mode::Http {
                         if let Some(t) = self.txn.as_mut() {
-                            t.req.consume(self.req.readable(), n);
+                            t.request_consumed(self.req.readable(), n);
                         }
                     }
                     self.req.consume(n);

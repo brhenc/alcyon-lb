@@ -72,11 +72,15 @@ impl Chunk {
     /// Scans `data`; returns how many bytes belong to the body and the state after them:
     /// `Ok(Some(_))` wants more, `Ok(None)` is the end of the message, `Err` is a framing
     /// violation (the bytes counted are the valid ones before it).
-    fn scan(mut self, data: &[u8]) -> (usize, Result<Option<Chunk>, ()>) {
+    ///
+    /// `pay` gains what `HAProxy` counts of the body in its HTX message: the data bytes, and
+    /// one more for the end of the message (`HTX_BLK_EOT`).
+    fn scan(mut self, data: &[u8], pay: &mut u64) -> (usize, Result<Option<Chunk>, ()>) {
         let mut i = 0;
         while i < data.len() {
             if let Chunk::Data(n) = self {
                 let take = usize::try_from(n).unwrap_or(usize::MAX).min(data.len() - i);
+                *pay += take as u64;
                 i += take;
                 let left = n - take as u64;
                 self = if left == 0 { Chunk::DataCr } else { Chunk::Data(left) };
@@ -127,12 +131,18 @@ impl Chunk {
                 },
                 Chunk::Trailer { empty } => match b {
                     b'\r' => Ok(Chunk::TrailerLf { empty }),
-                    b'\n' if empty => return (i, Ok(None)),
+                    b'\n' if empty => {
+                        *pay += 1;
+                        return (i, Ok(None));
+                    }
                     b'\n' => Ok(Chunk::Trailer { empty: true }),
                     _ => Ok(Chunk::Trailer { empty: false }),
                 },
                 Chunk::TrailerLf { empty } => match b {
-                    b'\n' if empty => return (i, Ok(None)),
+                    b'\n' if empty => {
+                        *pay += 1;
+                        return (i, Ok(None));
+                    }
                     b'\n' => Ok(Chunk::Trailer { empty: true }),
                     _ => Err(()),
                 },
@@ -158,11 +168,21 @@ impl MsgState {
     /// position, and returns how many there were. The rest of `data` is not this
     /// message's.
     pub fn advance(&mut self, data: &[u8]) -> usize {
+        self.advance_counted(data, &mut 0)
+    }
+
+    /// [`Self::advance`], adding to `pay` the bytes of body `HAProxy` counts in the HTX
+    /// message (see [`htx_head_size`]): the payload without its framing.
+    pub fn advance_counted(&mut self, data: &[u8], pay: &mut u64) -> usize {
         let mut used = 0;
         loop {
             match *self {
                 MsgState::Waiting | MsgState::Done | MsgState::Error => return used,
-                MsgState::Tunnel | MsgState::Body(Body::UntilClose) => return data.len(),
+                MsgState::Tunnel => return data.len(),
+                MsgState::Body(Body::UntilClose) => {
+                    *pay += (data.len() - used) as u64;
+                    return data.len();
+                }
                 MsgState::Head { left, body } => {
                     let left = if left == 0 {
                         match find_eoh(&data[used..]) {
@@ -190,13 +210,15 @@ impl MsgState {
                     let avail = (data.len() - used) as u64;
                     if avail < n {
                         *self = MsgState::Body(Body::Length(n - avail));
+                        *pay += avail;
                         return data.len();
                     }
+                    *pay += n;
                     used += usize::try_from(n).unwrap_or(usize::MAX);
                     *self = MsgState::Done;
                 }
                 MsgState::Body(Body::Chunked(c)) => {
-                    let (n, next) = c.scan(&data[used..]);
+                    let (n, next) = c.scan(&data[used..], pay);
                     used += n;
                     *self = match next {
                         Ok(Some(c)) => MsgState::Body(Body::Chunked(c)),
@@ -245,7 +267,7 @@ impl MsgState {
                         c = if left == 0 { Chunk::DataCr } else { Chunk::Data(left) };
                         continue;
                     }
-                    let (n, next) = c.scan(&data[i..=i]);
+                    let (n, next) = c.scan(&data[i..=i], &mut 0);
                     i += n;
                     match next {
                         Ok(Some(next)) => c = next,
@@ -280,8 +302,13 @@ impl MsgState {
     /// current position and is what [`Self::window`] measured -- were forwarded. A head
     /// is measured on all of `data` first: a partial send may stop inside it.
     pub fn consume(&mut self, data: &[u8], n: usize) {
+        self.consume_counted(data, n, &mut 0);
+    }
+
+    /// [`Self::consume`], adding to `pay` what [`Self::advance_counted`] counts.
+    pub fn consume_counted(&mut self, data: &[u8], n: usize, pay: &mut u64) {
         self.measure_head(data);
-        let used = self.advance(&data[..n]);
+        let used = self.advance_counted(&data[..n], pay);
         debug_assert_eq!(used, n, "forwarded past the end of the message");
     }
 
@@ -426,6 +453,65 @@ pub fn status_of(head: &str) -> u16 {
         .unwrap_or(0)
 }
 
+/// The size `HAProxy` gives a message head in its HTX representation, which is what `%U`
+/// (request) and `%B` (response) count with the body that follows it: the 20 bytes of the
+/// start-line block, the three strings of the start line (method, target, version; or
+/// version, status, reason -- the reason as written, none if none), the name and value of
+/// each header (the value without its blanks: no colon, no CRLF), and one byte for the end
+/// of the headers. A `Connection` header loses its `close`, `keep-alive` and `upgrade`
+/// tokens, the others stay joined by `,`, and it is gone when none is left.
+///
+/// `None` if the head is not UTF-8, which the caller counts on the wire.
+#[must_use]
+pub fn htx_head_size(head: &[u8], request: bool) -> Option<u64> {
+    let head = std::str::from_utf8(head).ok()?;
+    let mut lines = head.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l));
+    let first = lines.next()?;
+    let strings = if request {
+        let (method, rest) = first.split_once(' ')?;
+        let (target, version) = rest.rsplit_once(' ').unwrap_or((rest, ""));
+        method.len() + target.trim().len() + version.trim().len()
+    } else {
+        let (version, rest) = first.split_once(' ').unwrap_or((first, ""));
+        let rest = rest.trim_start();
+        let (status, reason) = rest.split_at(rest.len().min(3));
+        version.len() + status.len() + reason.trim().len()
+    };
+    let mut size = 20 + strings as u64 + 1;
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        let Some((name, value)) = line.split_once(':') else { continue };
+        let (name, value) = (name.trim_end(), value.trim());
+        let len = if name.eq_ignore_ascii_case("connection") {
+            let known = |t: &str| ["close", "keep-alive", "upgrade"].iter().any(|k| t.eq_ignore_ascii_case(k));
+            let mut kept = 0;
+            let mut chars = 0;
+            let mut dropped = false;
+            for t in value.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+                if known(t) {
+                    dropped = true;
+                } else {
+                    kept += 1;
+                    chars += t.len();
+                }
+            }
+            if !dropped {
+                value.len()
+            } else if kept == 0 {
+                continue;
+            } else {
+                chars + kept - 1
+            }
+        } else {
+            value.len()
+        };
+        size += (name.len() + len) as u64;
+    }
+    Some(size)
+}
+
 /// One request and its response.
 #[derive(Debug)]
 #[allow(clippy::struct_excessive_bools)]
@@ -467,6 +553,11 @@ pub struct HttpTxn {
     /// What the request's cookies told the backend's `cookie` persistence, which the
     /// response needs (`SF_DIRECT`, `cookie_first_date`, `cookie_last_date`).
     pub ck: crate::cookie::CookieTxn,
+    /// What `%U` and `%B` count: the HTX message `HAProxy` parsed of the request and of
+    /// the server's response, as received (see [`htx_head_size`]). `None` until the head
+    /// has been measured, or where it is not (an HTTP/2 client's request).
+    pub req_htx: Option<u64>,
+    pub rsp_htx: Option<u64>,
 }
 
 impl HttpTxn {
@@ -490,6 +581,18 @@ impl HttpTxn {
             error: None,
             aborted: false,
             ck: crate::cookie::CookieTxn::default(),
+            req_htx: None,
+            rsp_htx: None,
+        }
+    }
+
+    /// Records that the first `n` bytes of `data` -- the request, from its current position --
+    /// were consumed, and what `%U` counts of them.
+    pub fn request_consumed(&mut self, data: &[u8], n: usize) {
+        let mut pay = 0;
+        self.req.consume_counted(data, n, &mut pay);
+        if let Some(t) = self.req_htx.as_mut() {
+            *t += pay;
         }
     }
 
@@ -516,7 +619,11 @@ impl HttpTxn {
     /// Records the first `n` bytes of `rep` as delivered to the client. An interim
     /// response, once delivered, makes room for the next head.
     pub fn response_sent(&mut self, rep: &[u8], n: usize) {
-        self.rsp.consume(rep, n);
+        let mut pay = 0;
+        self.rsp.consume_counted(rep, n, &mut pay);
+        if let Some(t) = self.rsp_htx.as_mut() {
+            *t += pay;
+        }
         if self.rsp.is_done() && self.rsp_interim {
             self.rsp = MsgState::Waiting;
             self.rsp_interim = false;

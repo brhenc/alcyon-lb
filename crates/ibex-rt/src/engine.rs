@@ -1389,12 +1389,14 @@ fn session_log_data<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, pid: u3
         t_data: l.ms(l.data),
         t_close: l.ms(Some(std::time::Instant::now())),
         status: s.txn.as_ref().map(|t| t.status).or(l.status).map_or(-1, i64::from),
-        bytes_out: l.bytes_from_server,
+        // The HTX messages `HAProxy` parsed, where they were measured; the bytes that crossed
+        // the wire otherwise (an HTTP/2 client's request, a response the server did not make).
+        bytes_out: s.txn.as_ref().and_then(|t| t.rsp_htx).filter(|_| l.bytes_from_server > 0).unwrap_or(l.bytes_from_server),
         // A request that never parsed counts nothing (`HAProxy`: `U=0` with `<BADREQ>`).
         bytes_in: if s.mode == Mode::Http && l.request.is_none() {
             0
         } else {
-            s.bytes_in.saturating_sub(l.bytes_in_at_start)
+            s.txn.as_ref().and_then(|t| t.req_htx).unwrap_or_else(|| s.bytes_in.saturating_sub(l.bytes_in_at_start))
         },
         // `%tsc`'s cookie characters: only a backend with a cookie mode shows them.
         cookie_state: match (&be.cookie, s.txn.as_ref()) {
@@ -5759,6 +5761,10 @@ impl EngineDispatcher<'_> {
         let mut state = txn.rsp;
         let used = state.take_body(data, h2.data_budget(stream_id), &mut out);
         let end = state.is_done();
+        if let Some(t) = txn.rsp_htx.as_mut() {
+            // The payload, and the chunked body's end (see `htx_head_size`).
+            *t += out.len() as u64 + u64::from(end && matches!(txn.rsp, MsgState::Body(crate::txn::Body::Chunked(_))));
+        }
         if !out.is_empty() || end {
             h2.send_data(stream_id, &out, end);
         }
@@ -6159,6 +6165,8 @@ impl EngineDispatcher<'_> {
         // The final response head: `t_data`, and `capture response header`.
         if wait.is_none() {
             entry.sess.log.data = Some(std::time::Instant::now());
+            // What `%B` counts of this head: the message as the server sent it.
+            txn.rsp_htx = crate::txn::htx_head_size(&entry.sess.rep.readable()[..total_hdr_len], false);
         }
         let fe_caps = &proxies[fe_idx].res_capture_slots;
         if wait.is_none() && !fe_caps.is_empty() {
