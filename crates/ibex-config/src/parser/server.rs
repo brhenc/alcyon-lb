@@ -33,6 +33,8 @@ pub(crate) fn parse_server(
     let mut send_proxy_v2 = default_server.is_some_and(|d| d.send_proxy_v2);
     let mut maxconn = default_server.and_then(|d| d.maxconn);
     let mut pool_max_conn = default_server.and_then(|d| d.pool_max_conn).unwrap_or(-1);
+    let mut pool_low_conn = default_server.and_then(|d| d.pool_low_conn).unwrap_or(0);
+    let mut pool_purge_delay = default_server.and_then(|d| d.pool_purge_delay).unwrap_or(5000);
     let mut check_port = default_server.and_then(|d| d.check_port);
     let mut check_proto = default_server.and_then(|d| d.check_proto);
     let mut weight = default_server.and_then(|d| d.weight);
@@ -92,6 +94,14 @@ pub(crate) fn parse_server(
             }
             "pool-max-conn" => {
                 pool_max_conn = parse_pool_max_conn(tokens, i, who)?;
+                i += 1;
+            }
+            "pool-low-conn" => {
+                pool_low_conn = parse_pool_low_conn(tokens, i, who)?;
+                i += 1;
+            }
+            "pool-purge-delay" => {
+                pool_purge_delay = parse_pool_purge_delay(tokens, i, who)?;
                 i += 1;
             }
             "port" => {
@@ -191,9 +201,12 @@ pub(crate) fn parse_server(
         send_proxy_v2,
         weight,
         maxconn,
-        pool_max_conn,
+        pool: {
+            let pool = crate::ast::server::ServerPool { max_conn: pool_max_conn, low_conn: pool_low_conn, purge_delay: pool_purge_delay };
+            (pool != crate::ast::server::ServerPool::default()).then(|| Box::new(pool))
+        },
         backup,
-        cookie,
+        cookie: cookie.map(String::into_boxed_str),
         disabled,
         track,
     });
@@ -459,6 +472,43 @@ fn parse_pool_max_conn(tokens: &[Token], i: usize, who: Option<&str>) -> Result<
     Ok(n.min(i64::from(i32::MAX)) as i32)
 }
 
+/// `pool-low-conn <max>` (`srv_parse_pool_low_conn`): `atoi` into an unsigned count, so text
+/// that is not a number reads as 0 and a negative number wraps.
+fn parse_pool_low_conn(tokens: &[Token], i: usize, who: Option<&str>) -> Result<u32, ConfigError> {
+    let arg = server_kw_arg(tokens, i, who, "expects <value> as argument.")?;
+    let t = arg.text.trim_start();
+    let (neg, digits) = match t.as_bytes().first() {
+        Some(b'-') => (true, &t[1..]),
+        Some(b'+') => (false, &t[1..]),
+        _ => (false, t),
+    };
+    let mut n: i64 = 0;
+    for b in digits.bytes().take_while(u8::is_ascii_digit) {
+        n = (n * 10 + i64::from(b - b'0')).min(i64::from(i32::MAX));
+    }
+    let n = if neg { -n } else { n };
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    Ok(n as i32 as u32)
+}
+
+/// `pool-purge-delay <delay>` (`srv_parse_pool_purge_delay`): a time in milliseconds by
+/// default, with `HAProxy`'s messages.
+fn parse_pool_purge_delay(tokens: &[Token], i: usize, who: Option<&str>) -> Result<u32, ConfigError> {
+    let arg = server_kw_arg(tokens, i, who, "expects <value> as argument.")?;
+    let prefix = server_keywords::server_prefix(who);
+    super::rules_http::parse_time_ms(&arg.text).map_err(|e| {
+        let msg = if e.starts_with("unexpected character") {
+            format!("{prefix}{} in argument to <pool-purge-delay>.", e.trim_end_matches('.'))
+        } else {
+            format!(
+                "{prefix}timer overflow in argument '{}' to 'pool-purge-delay' (maximum value is 2147483647 ms or ~24.8 days)",
+                arg.text
+            )
+        };
+        ConfigError::new(tokens[i].line, tokens[i].col, msg)
+    })
+}
+
 pub(crate) fn parse_default_server(
     def: &mut Option<DefaultServerConfig>,
     tokens: &[Token],
@@ -504,6 +554,14 @@ pub(crate) fn parse_default_server(
             }
             "pool-max-conn" => {
                 cfg.pool_max_conn = Some(parse_pool_max_conn(tokens, i, None)?);
+                i += 1;
+            }
+            "pool-low-conn" => {
+                cfg.pool_low_conn = Some(parse_pool_low_conn(tokens, i, None)?);
+                i += 1;
+            }
+            "pool-purge-delay" => {
+                cfg.pool_purge_delay = Some(parse_pool_purge_delay(tokens, i, None)?);
                 i += 1;
             }
             "port" => {

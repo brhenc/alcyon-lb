@@ -17,6 +17,10 @@ pub struct DefaultServerConfig {
     pub maxconn: Option<u32>,
     /// `pool-max-conn`.
     pub pool_max_conn: Option<i32>,
+    /// `pool-low-conn`.
+    pub pool_low_conn: Option<u32>,
+    /// `pool-purge-delay`, in milliseconds.
+    pub pool_purge_delay: Option<u32>,
     pub check_port: Option<u16>,
     pub check_proto: Option<&'static str>,
     /// The TLS keywords (`ssl`, `verify`, `sni`, `check-ssl`, ...).
@@ -261,9 +265,9 @@ pub struct Server {
     pub weight: Option<u32>,
     /// Server connection limit.
     pub maxconn: Option<u32>,
-    /// `pool-max-conn`: the most idle connections kept for this server; -1 is unlimited
-    /// (the default), 0 keeps none, not even for the next request of the same client.
-    pub pool_max_conn: i32,
+    /// `pool-max-conn`, `pool-low-conn` and `pool-purge-delay`; `None` when all three are
+    /// the defaults (boxed: `Server`'s size is bounded in `struct_sizes.rs`).
+    pub pool: Option<Box<ServerPool>>,
     /// Whether this server is a backup server.
     pub backup: bool,
     /// Custom port for health checks (`port`).
@@ -277,7 +281,7 @@ pub struct Server {
     /// (TLV `PP2_TYPE_UNIQUE_ID`).
     pub proxy_v2_unique_id: bool,
     /// The value of the persistence cookie that selects this server (`cookie <value>`).
-    pub cookie: Option<String>,
+    pub cookie: Option<Box<str>>,
     /// `disabled`: the server starts in maintenance and takes no traffic until the CLI's
     /// `enable server` brings it back.
     pub disabled: bool,
@@ -298,7 +302,7 @@ impl Default for Server {
             send_proxy_v2: false,
             weight: None,
             maxconn: None,
-            pool_max_conn: -1,
+            pool: None,
             backup: false,
             check_port: None,
             check_proto: None,
@@ -308,6 +312,26 @@ impl Default for Server {
             disabled: false,
             track: None,
         }
+    }
+}
+
+/// A server's idle connection settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerPool {
+    /// `pool-max-conn`: the most idle connections kept for this server; -1 is unlimited
+    /// (the default), 0 keeps none, not even for the next request of the same client.
+    pub max_conn: i32,
+    /// `pool-low-conn`: idle connections kept beyond what the server was seen to need
+    /// (`low_idle_conns`, 0 by default).
+    pub low_conn: u32,
+    /// `pool-purge-delay` in milliseconds: how often the idle connections beyond the need
+    /// are purged; 0 keeps none. 5000 by default.
+    pub purge_delay: u32,
+}
+
+impl Default for ServerPool {
+    fn default() -> Self {
+        Self { max_conn: -1, low_conn: 0, purge_delay: 5000 }
     }
 }
 
@@ -325,7 +349,7 @@ impl Server {
             send_proxy_v2: false,
             weight: None,
             maxconn: None,
-            pool_max_conn: -1,
+            pool: None,
             backup: false,
             check_port: None,
             check_proto: None,
