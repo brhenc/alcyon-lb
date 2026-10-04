@@ -402,3 +402,52 @@ fn set_status_gives_the_reason_haproxy_gives() {
     }
     assert!(wrong.is_empty(), "reason phrases differ from HAProxy's:\n{}", wrong.join("\n"));
 }
+
+/// The termination state of a reply the proxy made after a server error. Measured with
+/// `log-format "%HU ST=%ST ts=%ts"`:
+///
+/// ```text
+/// listen, no server                                   ST=503 ts=SC
+/// frontend + backend, no server                       ST=503 ts=SC
+/// `http-after-response` fails on the server's reply   ST=500 ts=PH
+/// ```
+#[test]
+fn the_termination_state_of_a_503_and_of_a_failed_rewrite() {
+    let big = "A".repeat(7000);
+    let fail = "  http-request set-var(txn.big) req.hdr(x)\n  \
+                http-after-response set-header h1 %[var(txn.big)] if { status 200 }\n  \
+                http-after-response set-header h2 %[var(txn.big)] if { status 200 }\n  \
+                http-after-response set-header h3 %[var(txn.big)] if { status 200 }\n  server s {srv}\n";
+    let cases = [
+        ("listen l\n  bind {fe}\n", String::new(), G.to_string(), "/ ST=503 ts=SC", None),
+        ("frontend f\n  bind {fe}\n  default_backend b\nbackend b\n", String::new(), G.to_string(), "/ ST=503 ts=SC", None),
+        (
+            "listen l\n  bind {fe}\n",
+            fail.to_string(),
+            format!("GET / HTTP/1.1\r\nHost: x\r\nx: {big}\r\n\r\n"),
+            "/ ST=500 ts=PH",
+            Some(Srv::Ok),
+        ),
+    ];
+    for (head_cfg, rules, req, want, srv) in cases {
+        let collector = UdpSocket::bind("127.0.0.1:0").expect("collector");
+        collector.set_read_timeout(Some(Duration::from_secs(3))).expect("timeout");
+        let cfg = format!(
+            "{DEFAULTS}  log {} local0\n  log-format \"%HU ST=%ST ts=%ts\"\n{head_cfg}{rules}",
+            collector.local_addr().expect("addr")
+        );
+        let (_ibex, fe) = start(&cfg, srv.map(server));
+        let _ = exchange(fe, &req, Duration::from_millis(1500));
+        let mut line = String::new();
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = collector.recv(&mut buf) {
+            let l = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let body = l.split_once("]: ").map_or("", |(_, b)| b.trim_end()).to_string();
+            if body.starts_with("/ ") {
+                line = body;
+                break;
+            }
+        }
+        assert_eq!(line, want, "{cfg}");
+    }
+}

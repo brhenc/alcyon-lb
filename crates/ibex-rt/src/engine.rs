@@ -5661,6 +5661,8 @@ impl EngineDispatcher<'_> {
             entry.sess.log.term.get_or_insert(*b"PH");
         }
         if let Some(stop) = failed {
+            // A rule refused or could not rewrite the server's response: `PH`.
+            entry.sess.log.term.get_or_insert(*b"PH");
             entry.sess.rep.clear();
             match stop {
                 ResStop::Page(st) => reply_error(entry, proxies, st),
@@ -6813,6 +6815,8 @@ impl EngineDispatcher<'_> {
 
         let Some(target_addr) = target else {
             proxies[be_idx].stats[worker_id()].failed_conn.fetch_add(1, Ordering::Relaxed);
+            // No server to connect to: `SC`, whatever the stream's progress.
+            entry.sess.log.term = Some(*b"SC");
             reply_error(entry, proxies, 503);
             return None;
         };
