@@ -82,6 +82,33 @@ fn timed(fe: SocketAddr, req: &str) -> (Duration, String) {
 const GET: &str = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
 
 #[test]
+fn a_timeout_is_not_early_by_the_time_the_engine_was_idle() {
+    // HAProxy: `timeout client 1s`, a head that stops half way, connections made at
+    // different phases of an idle engine -- the `408` always comes at +1.001 s (10 trials:
+    // 1.001 to 1.002). Timers armed from the tick taken before the poller wait came up to
+    // 100 ms early (0.906 to 0.993 on Ibex).
+    let (srv, _rx) = server();
+    let cfg = "defaults\n  mode http\n  timeout connect 1s\n  timeout client 1s\n  timeout server 5s\n\
+        frontend fe\n  bind {fe}\n  default_backend be\n\
+        backend be\n  server s {srv}\n";
+    let (_ibex, fe) = start(cfg, srv);
+    let trials: Vec<_> = (0..8u64)
+        .map(|i| {
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(60 + 37 * i));
+                timed(fe, "GET / HTTP/1.1\r\nHost: x\r\n")
+            })
+        })
+        .collect();
+    for t in trials {
+        let (took, resp) = t.join().expect("trial");
+        assert!(resp.starts_with("HTTP/1.1 408 "), "{resp:?}");
+        assert!(took >= Duration::from_millis(990), "408 after {took:?}");
+        assert!(took < Duration::from_millis(4000), "408 after {took:?}");
+    }
+}
+
+#[test]
 fn wait_end_holds_a_tcp_mode_backend_rule_until_the_inspect_delay_is_over() {
     // HAProxy (TCP mode), the same configuration with `mode tcp`: the client has the
     // answer at +0.502 s, and the server hears the request no sooner.

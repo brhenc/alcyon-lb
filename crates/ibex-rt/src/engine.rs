@@ -2303,6 +2303,16 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         events.clear();
         self.poller.poll(Some(poll_timeout), |ev| events.push(ev))?;
 
+        // The time now, not the time the pass started: everything below arms its timers from
+        // `now`, and a connection accepted or a request read after the poller waited would
+        // otherwise have its deadlines early by the time the engine was idle (up to the 100
+        // ms poll bound). One clock read per loop pass, as HAProxy's `tv_update_date` after
+        // its poller. The timers that expired during the wait are woken by it too.
+        let now = self.current_tick();
+        self.now = now;
+        self.scheduler.set_now(now);
+        let _ = self.scheduler.wake_expired_tasks();
+
         // 4. Process polled readiness events
         let mut quic_ready: Vec<usize> = Vec::new();
         for &ev in &events {
