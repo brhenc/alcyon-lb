@@ -53,7 +53,7 @@ fn set_src_dst_and_ports_from_every_rule_set() {
          \x20 http-request set-dst ipv4(10.0.0.6) if {{ path /http }}\n\
          \x20 http-request set-dst-port int(4005) if {{ path /http }}\n\
          \x20 http-request return status 200\n{hdrs}\
-         frontend fe4\n  bind {a4}\n  http-request set-src ipv4(10.0.0.7)\n\
+         frontend fe4\n  bind {a4}\n  http-request set-src str(garbage)\n  http-request set-src ipv4(10.0.0.7)\n\
          \x20 http-request set-dst ipv4(10.0.0.8)\n  http-request return status 200\n{hdrs}\
          frontend fe5\n  bind {a5}\n  tcp-request connection set-src-port int(5000)\n\
          \x20 tcp-request connection set-dst-port int(5001)\n  http-request return status 200\n{hdrs}\
