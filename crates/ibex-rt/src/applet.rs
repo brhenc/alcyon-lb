@@ -469,10 +469,8 @@ impl CliApplet {
             .or_else(|| cmd.strip_prefix("shutdown session backend "))
         {
             self.handle_shutdown_sessions_backend(target.trim(), ctx);
-        } else if cmd == "clear counters" || cmd == "clear counters all" {
-            self.handle_clear_counters(None, ctx);
-        } else if let Some(target) = cmd.strip_prefix("clear counters ") {
-            self.handle_clear_counters(Some(target.trim()), ctx);
+        } else if cmd == "clear counters" || cmd.starts_with("clear counters ") {
+            self.handle_clear_counters(cmd["clear counters".len()..].trim(), ctx);
         } else if let Some(target) = cmd.strip_prefix("enable health ") {
             self.handle_enable_health(target.trim(), ctx);
         } else if let Some(target) = cmd.strip_prefix("disable health ") {
@@ -872,41 +870,47 @@ impl CliApplet {
         }
     }
 
-    fn handle_clear_counters(&mut self, target: Option<&str>, ctx: &mut AppletContext) {
-        if let Some(t) = target {
-            if let Some(rest) = t.strip_prefix("server ") {
-                let rest = rest.strip_suffix(" force").unwrap_or(rest).trim();
-                let (px_name, sv_name) = match rest.split_once('/') {
-                    Some(pair) => pair,
-                    None => ("", rest),
-                };
-                let mut found_px = false;
-                let mut found_sv = false;
-                for p in ctx.proxies.iter() {
-                    if px_name.is_empty() || p.name == px_name {
-                        found_px = true;
-                        if p.server_ids.iter().any(|sid| sid == sv_name) {
-                            found_sv = true;
-                            break;
-                        }
+    /// `clear counters [all | server <be>/<sv> [force] | <anything>]` (`cli_parse_clear_counters`,
+    /// `src/stats.c`; measured on HAProxy 3.5-dev8-885761-29): `all` resets every counter of
+    /// every proxy, `server` those of one server, and anything else -- no word, or one that is
+    /// neither, there is no per-proxy form -- only the maxima of every proxy.
+    fn handle_clear_counters(&mut self, rest: &str, ctx: &mut AppletContext) {
+        let first = rest.split_whitespace().next();
+        if first == Some("server") {
+            let rest = rest["server".len()..].trim();
+            let rest = rest.strip_suffix(" force").unwrap_or(rest).trim();
+            let (px_name, sv_name) = match rest.split_once('/') {
+                Some(pair) => pair,
+                None => ("", rest),
+            };
+            let mut found_px = false;
+            let mut found = None;
+            for (p_idx, p) in ctx.proxies.iter().enumerate() {
+                if px_name.is_empty() || p.name == px_name {
+                    found_px = true;
+                    if let Some(s_idx) = p.server_ids.iter().position(|sid| sid == sv_name) {
+                        found = Some((p_idx, s_idx));
+                        break;
                     }
                 }
-                if !found_px && !px_name.is_empty() {
-                    self.out_buf.extend_from_slice(b"No such backend.
-");
-                } else if !found_sv {
-                    self.out_buf.extend_from_slice(b"No such server.
-");
-                } else {
-                    self.out_buf.extend_from_slice(b"Server counters cleared.
-");
-                }
-            } else if !crate::engine::clear_proxy_counters(ctx.proxies, Some(t)) {
-                self.out_buf.extend_from_slice(b"No such backend.
-");
             }
-        } else {
+            if !found_px && !px_name.is_empty() {
+                self.out_buf.extend_from_slice(b"No such backend.\n");
+            } else if let Some((p_idx, s_idx)) = found {
+                crate::engine::clear_server_counters(&ctx.proxies[p_idx], s_idx);
+                self.finish_msg("Server counters cleared.");
+                return;
+            } else {
+                self.out_buf.extend_from_slice(b"No such server.\n");
+            }
+        } else if first == Some("all") {
             crate::engine::clear_proxy_counters(ctx.proxies, None);
+            self.finish_msg("");
+            return;
+        } else {
+            crate::engine::clear_proxy_maxima(ctx.proxies);
+            self.finish_msg("");
+            return;
         }
         if self.interactive {
             self.out_buf.extend_from_slice(b"\n> ");

@@ -531,6 +531,7 @@ fn write_server_row(
         .unwrap_or_default();
     r.set("wretr", wretr);
     r.set("wredis", wredis);
+    r.set("econ", proxy.ids.server_econ.get(s_idx).map_or(0, |c| c.load(std::sync::atomic::Ordering::Relaxed)));
     r.set("status", status_str);
     r.set("tracked", crate::track::tracked_label(proxy, s_idx));
     r.set("weight", weight);
@@ -563,6 +564,7 @@ fn write_backend_row(out: &mut String, proxy: &Proxy, pid: u32, iid: u32) {
     r.set("bout", proxy.stats.iter().map(|s| s.bytes_out.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>());
     r.set("dreq", proxy.stats.iter().map(|s| s.denied_req.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>());
     r.set("dresp", proxy.stats.iter().map(|s| s.denied_resp.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>());
+    r.set("econ", proxy.stats.iter().map(|s| s.failed_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>());
     r.set("wretr", proxy.stats.iter().map(|s| s.retries_count.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>());
     r.set("wredis", proxy.stats.iter().map(|s| s.redispatches.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>());
     r.set("status", "UP");

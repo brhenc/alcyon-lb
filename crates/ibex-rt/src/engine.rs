@@ -414,6 +414,12 @@ pub struct ProxyStats {
 }
 
 impl ProxyStats {
+    /// `clear counters` without `all`: the maxima fall back to what is current now.
+    pub fn clear_max(&self) {
+        let act = self.act_conn.load(Ordering::Relaxed);
+        self.max_conn.store(act, Ordering::Relaxed);
+    }
+
     pub fn clear(&self) {
         self.cum_conn.store(0, Ordering::Relaxed);
         let act = self.act_conn.load(Ordering::Relaxed);
@@ -459,6 +465,9 @@ pub struct ProxyIdInfo {
     /// Which servers the configuration disabled (`SRV_ADMF_CMAINT`, 4 in `show servers state`
     /// whatever the CLI does afterwards); empty when none (see [`Proxy::server_cmaint`]).
     pub server_cmaint: Vec<bool>,
+    /// Each server's `econ`: the requests whose connection attempts all failed, the last
+    /// attempt having been to that server (see [`count_connect_failure`]).
+    pub server_econ: Arc<Vec<AtomicU64>>,
     /// Each listener's numeric id (`luid`) by `bind` line, as `so_id` reads it.
     pub listener_ids: Vec<u32>,
     /// `pool-max-conn` per server; empty when no server sets it (-1, unlimited, then).
@@ -1801,6 +1810,7 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, list
             server_forced_ids: server_forced_ids(listen.servers.len(), &listen.server_extras),
             server_init_health: server_init_health(listen.servers.len(), &listen.server_extras),
             server_cmaint: server_cmaint(&listen.servers),
+            server_econ: Arc::new((0..listen.servers.len()).map(|_| AtomicU64::new(0)).collect()),
             listener_ids: ibex_config::ast::listener_ids(&listen.binds),
             server_pool_max_conn: pool_max_conns(&listen.servers),
             server_close: listen.server_close,
@@ -2071,6 +2081,7 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, be:
             server_forced_ids: server_forced_ids(be.servers.len(), &be.server_extras),
             server_init_health: server_init_health(be.servers.len(), &be.server_extras),
             server_cmaint: server_cmaint(&be.servers),
+            server_econ: Arc::new((0..be.servers.len()).map(|_| AtomicU64::new(0)).collect()),
             listener_ids: Vec::new(),
             server_pool_max_conn: pool_max_conns(&be.servers),
             server_close: be.server_close,
@@ -4697,11 +4708,10 @@ fn init_client_session(
                 if immediate {
                     sess.server_connected(now);
                 }
-            } else {
-                proxy.stats[worker_id()].failed_conn.fetch_add(1, Ordering::Relaxed);
-                if !sess.server_failed() {
-                    sess.srv_state = ScState::Error;
-                }
+            } else if !sess.server_failed() {
+                // The first connect of a TCP stream failed with no retry left.
+                count_connect_failure(proxies, proxy_idx, s_idx_failed(proxy, target));
+                sess.srv_state = ScState::Error;
             }
         } else {
             sess.srv_state = ScState::Error;
@@ -4778,6 +4788,20 @@ pub fn shutdown_matching_sessions<'a>(
 fn clear_one(p: &Proxy) {
     p.stats.iter().for_each(|s| s.clear());
     p.server_retr.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+    p.ids.server_econ.iter().for_each(|c| c.store(0, Ordering::Relaxed));
+}
+
+/// `clear counters server`: the counters of server `idx` of `p`, and no other.
+pub fn clear_server_counters(p: &Proxy, idx: usize) {
+    p.server_retr.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&idx);
+    if let Some(c) = p.ids.server_econ.get(idx) {
+        c.store(0, Ordering::Relaxed);
+    }
+}
+
+/// `clear counters` without `all`: the maxima of every proxy, nothing else.
+pub fn clear_proxy_maxima(proxies: &[Proxy]) {
+    proxies.iter().for_each(|p| p.stats.iter().for_each(ProxyStats::clear_max));
 }
 
 /// Clears traffic and error counters for a specific proxy, or all proxies if `target` is `None` or `"all"`.
@@ -4998,6 +5022,23 @@ fn count_server_session(proxies: &[Proxy], be_idx: usize, addr: SocketAddr) {
         .inspect(|rate| rate.tick());
 }
 
+/// A request's connection attempts have all failed and no retry is left: `econ` of the
+/// backend, and of the server the last attempt went to. Counted once per request, not per
+/// attempt (measured on HAProxy 3.5-dev8-885761-29: `retries 2`, three refused connects,
+/// `econ` 1). A request that finds no server at all is counted on the backend alone, at the
+/// two places that answer it.
+fn count_connect_failure(proxies: &[Proxy], be_idx: usize, server: Option<usize>) {
+    proxies[be_idx].stats[worker_id()].failed_conn.fetch_add(1, Ordering::Relaxed);
+    if let Some(c) = server.and_then(|i| proxies[be_idx].ids.server_econ.get(i)) {
+        c.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The index in `proxy` of the server at `addr`.
+fn s_idx_failed(proxy: &Proxy, addr: SocketAddr) -> Option<usize> {
+    proxy.servers.iter().position(|&s| s == addr)
+}
+
 fn retry_server_connect(
     entry: &mut SessionEntry,
     proxies: &mut [Proxy],
@@ -5162,8 +5203,8 @@ fn retry_server_connect(
             }
         }
     } else {
-        proxies[be_idx].stats[worker_id()].failed_conn.fetch_add(1, Ordering::Relaxed);
         if !entry.sess.server_failed() {
+            count_connect_failure(proxies, be_idx, s_idx);
             entry.sess.srv_state = ScState::Error;
             if entry.sess.mode == Mode::Http {
                 reply_error(entry, proxies, 503);
@@ -5208,10 +5249,11 @@ fn check_srv_connect(
                     }
                 } else {
                     let be_idx = EngineDispatcher::resolve_backend(entry, proxies).unwrap_or(entry.proxy_idx);
-                    proxies[be_idx].stats[worker_id()].failed_conn.fetch_add(1, Ordering::Relaxed);
+                    let failed_server = entry.target_server_idx;
                     if entry.sess.server_failed() {
                         retry_server_connect(entry, proxies, fdtab, poller, now);
                     } else {
+                        count_connect_failure(proxies, be_idx, failed_server);
                         entry.sess.srv_state = ScState::Error;
                         if entry.sess.mode == Mode::Http {
                             reply_error(entry, proxies, 503);
@@ -5943,10 +5985,11 @@ impl EngineDispatcher<'_> {
                 entry.sess.srv_xprt = crate::xprt::ServerXprt::Plain;
                 entry.sess.ending = None;
                 let be_idx = Self::resolve_backend(entry, self.proxies).unwrap_or(entry.proxy_idx);
-                self.proxies[be_idx].stats[worker_id()].failed_conn.fetch_add(1, Ordering::Relaxed);
+                let failed_server = entry.target_server_idx;
                 if entry.sess.server_failed() {
                     retry_server_connect(entry, self.proxies, self.fdtab, self.poller, now);
                 } else {
+                    count_connect_failure(self.proxies, be_idx, failed_server);
                     entry.sess.srv_state = ScState::Error;
                     if entry.sess.mode == Mode::Http {
                         reply_error(entry, self.proxies, 503);
@@ -7958,7 +8001,6 @@ impl EngineDispatcher<'_> {
                 }
             }
         } else {
-            proxies[be_idx].stats[worker_id()].failed_conn.fetch_add(1, Ordering::Relaxed);
             retry_server_connect(entry, proxies, fdtab, poller, now);
         }
         None
@@ -8108,7 +8150,6 @@ impl EngineDispatcher<'_> {
                 }
             }
         } else {
-            proxies[be_idx].stats[worker_id()].failed_conn.fetch_add(1, Ordering::Relaxed);
             retry_server_connect(entry, proxies, fdtab, poller, now);
         }
     }
