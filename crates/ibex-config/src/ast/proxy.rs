@@ -27,6 +27,8 @@ pub struct DefaultsSection {
     pub timeouts: TimeoutConfig,
     /// Default retries count.
     pub retries: Option<u32>,
+    /// `retry-on`, as the `RE_*` bits; `None` is the default, `RE_CONN_FAILED`.
+    pub retry_on: Option<u32>,
     /// Default redispatch flag.
     pub redisp: bool,
     /// `option redispatch <interval>`: retries between redispatches (`redispatch_after`);
@@ -63,6 +65,9 @@ pub struct DefaultsSection {
     pub persist: bool,
     /// `option dontlognull`: no log line for a connection that carried nothing.
     pub dontlognull: bool,
+    /// `option dontlog-normal`, `option log-separate-errors` and `option logasap`, as the
+    /// `LOG_OPT_*` bits.
+    pub log_opts: u8,
     /// `option forwardfor` in `defaults`: the `except` network, empty for none.
     pub forwardfor: Option<String>,
     /// `option forwardfor ... if-none` (without it, `HAProxy` adds the header always).
@@ -203,6 +208,8 @@ pub struct ListenSection {
     pub timeouts: TimeoutConfig,
     /// Number of connection retries before failing over (default: 3).
     pub retries: u32,
+    /// `retry-on`, as the `RE_*` bits: what a failed attempt is retried on.
+    pub retry_on: u32,
     /// Whether reconnection to dispatch address is enabled on error.
     pub redisp: bool,
     /// `option redispatch <interval>`: retries between redispatches (`redispatch_after`);
@@ -244,6 +251,9 @@ pub struct ListenSection {
     pub persist: bool,
     /// `option dontlognull`: no log line for a connection that carried nothing.
     pub dontlognull: bool,
+    /// `option dontlog-normal`, `option log-separate-errors` and `option logasap`, as the
+    /// `LOG_OPT_*` bits.
+    pub log_opts: u8,
     /// Client header regex rewrite rules (up to 10).
     pub cliexp: Vec<HeaderExp>,
     /// Server header regex rewrite rules (up to 10).
@@ -369,6 +379,7 @@ impl Default for ListenSection {
             srvtimeout: None,
             timeouts: TimeoutConfig::default(),
             retries: 3,
+            retry_on: RE_CONN_FAILED,
             redisp: false,
             redisp_after: -1,
             maxconn: 2000,
@@ -390,6 +401,7 @@ impl Default for ListenSection {
             http_mode: HttpMode::KeepAlive,
             persist: false,
             dontlognull: false,
+            log_opts: 0,
             cliexp: Vec::new(),
             srvexp: Vec::new(),
             acls: Vec::new(),
@@ -492,6 +504,9 @@ pub struct FrontendSection {
     pub http_mode: HttpMode,
     /// `option dontlognull`: no log line for a connection that carried nothing.
     pub dontlognull: bool,
+    /// `option dontlog-normal`, `option log-separate-errors` and `option logasap`, as the
+    /// `LOG_OPT_*` bits.
+    pub log_opts: u8,
     /// Stick table configuration.
     pub stick_table: Option<StickTableConfigAst>,
     /// Stick rules.
@@ -559,6 +574,7 @@ impl Default for FrontendSection {
             buffer_request: false,
             http_mode: HttpMode::KeepAlive,
             dontlognull: false,
+            log_opts: 0,
             stick_table: None,
             stick_rules: Vec::new(),
             tcp_req_inspect_delay: None,
@@ -624,6 +640,8 @@ pub struct BackendSection {
     pub timeouts: TimeoutConfig,
     /// Number of connection retries before failing over (default: 3).
     pub retries: u32,
+    /// `retry-on`, as the `RE_*` bits: what a failed attempt is retried on.
+    pub retry_on: u32,
     /// Whether reconnection to dispatch address is enabled on error.
     pub redisp: bool,
     /// `option redispatch <interval>`: retries between redispatches (`redispatch_after`);
@@ -721,6 +739,7 @@ impl Default for BackendSection {
             srvtimeout: None,
             timeouts: TimeoutConfig::default(),
             retries: 3,
+            retry_on: RE_CONN_FAILED,
             redisp: false,
             redisp_after: -1,
             dispatch: None,
@@ -760,3 +779,49 @@ impl Default for BackendSection {
     }
 }
 
+
+/// `option dontlog-normal`: a stream that did not fail logs nothing.
+pub const LOG_OPT_DONTLOG_NORMAL: u8 = 1;
+/// `option log-separate-errors`: a failed stream is logged at level `err`.
+pub const LOG_OPT_SEPARATE_ERRORS: u8 = 2;
+/// `option logasap`: the line is sent when the response head is, not at the end.
+pub const LOG_OPT_ASAP: u8 = 4;
+
+/// The `LOG_OPT_*` bit of the option `name`, 0 for any other.
+#[must_use]
+pub fn log_opt_bit(name: &str) -> u8 {
+    match name {
+        "dontlog-normal" => LOG_OPT_DONTLOG_NORMAL,
+        "log-separate-errors" => LOG_OPT_SEPARATE_ERRORS,
+        "logasap" => LOG_OPT_ASAP,
+        _ => 0,
+    }
+}
+
+/// `retry-on` bits, `HAProxy`'s `PR_RE_*`.
+pub const RE_CONN_FAILED: u32 = 0x0000_0001;
+/// `empty-response`: the server closed with nothing sent back.
+pub const RE_DISCONNECTED: u32 = 0x0000_0002;
+/// `response-timeout`: `timeout server` ran out before any response.
+pub const RE_TIMEOUT: u32 = 0x0000_0004;
+/// `0rtt-rejected`.
+pub const RE_EARLY_ERROR: u32 = 0x0001_0000;
+/// `junk-response`: something that is not a complete HTTP response head.
+pub const RE_JUNK_RESPONSE: u32 = 0x0002_0000;
+/// The statuses `retry-on` takes, with their bits.
+pub const RE_STATUSES: [(u16, u32); 12] = [
+    (401, 0x0008),
+    (403, 0x0010),
+    (404, 0x0020),
+    (408, 0x0040),
+    (421, 0x0080),
+    (425, 0x0100),
+    (429, 0x0200),
+    (500, 0x0400),
+    (501, 0x0800),
+    (502, 0x1000),
+    (503, 0x2000),
+    (504, 0x4000),
+];
+/// Any of the status bits.
+pub const RE_STATUS_MASK: u32 = 0x7ff8;

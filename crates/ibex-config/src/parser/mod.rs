@@ -853,10 +853,6 @@ const OPTIONS_THAT_MUST_NOT_BE_IGNORED: &[(&str, &str)] = &[
         "allbackups",
         "Ibex sends traffic to the first available backup server only, not to all of them",
     ),
-    (
-        "log-separate-errors",
-        "Ibex would write a failed request to the normal log instead of raising its level",
-    ),
 ];
 
 
@@ -1161,6 +1157,41 @@ pub(crate) fn parse_retries(retries: &mut u32, tokens: &[Token], kw: &Token) -> 
     }
     let r = parse_u32(&tokens[1], "retries")?;
     *retries = r;
+    Ok(())
+}
+
+/// `retry-on <keyword>...`, replacing what was set before (`proxy_parse_retry_on`).
+pub(crate) fn parse_retry_on(retry_on: &mut u32, tokens: &[Token], kw: &Token) -> Result<(), ConfigError> {
+    use crate::ast::{RE_CONN_FAILED, RE_DISCONNECTED, RE_EARLY_ERROR, RE_JUNK_RESPONSE, RE_STATUSES, RE_TIMEOUT};
+    let words: Vec<&str> = tokens.iter().skip(1).map(|t| t.text.as_str()).take_while(|w| !w.is_empty()).collect();
+    if words.is_empty() {
+        return Err(ConfigError::new(kw.line, kw.col, "'retry-on' needs at least one keyword to specify when to retry"));
+    }
+    let mut bits = 0;
+    for (i, w) in words.iter().enumerate() {
+        bits |= match *w {
+            "conn-failure" => RE_CONN_FAILED,
+            "empty-response" => RE_DISCONNECTED,
+            "response-timeout" => RE_TIMEOUT,
+            "0rtt-rejected" => RE_EARLY_ERROR,
+            "junk-response" => RE_JUNK_RESPONSE,
+            "all-retryable-errors" => {
+                RE_CONN_FAILED | RE_DISCONNECTED | RE_TIMEOUT | RE_EARLY_ERROR | RE_JUNK_RESPONSE
+                    | RE_STATUSES.iter().filter(|(s, _)| matches!(s, 500 | 502 | 503 | 504)).fold(0, |a, (_, b)| a | b)
+            }
+            "none" => {
+                if i != 0 || words.len() > 1 {
+                    return Err(ConfigError::new(kw.line, kw.col, "'retry-on' 'none' keyword only usable alone"));
+                }
+                0
+            }
+            other => match other.parse::<u16>().ok().and_then(|n| RE_STATUSES.iter().find(|(s, _)| *s == n)) {
+                Some((_, b)) => *b,
+                None => return Err(ConfigError::new(kw.line, kw.col, format!("'retry-on': unknown keyword '{other}'"))),
+            },
+        };
+    }
+    *retry_on = bits;
     Ok(())
 }
 

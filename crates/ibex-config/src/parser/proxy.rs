@@ -78,6 +78,7 @@ pub(crate) fn parse_listen_header(
         srvtimeout: timeouts.server,
         timeouts,
         retries: defaults.and_then(|d| d.retries).unwrap_or(3),
+        retry_on: defaults.and_then(|d| d.retry_on).unwrap_or(crate::ast::RE_CONN_FAILED),
         redisp: defaults.map_or(false, |d| d.redisp),
         redisp_after: defaults.map_or(-1, |d| if d.redisp { d.redisp_after } else { -1 }),
         maxconn: defaults.and_then(|d| d.maxconn).unwrap_or(2000),
@@ -100,6 +101,7 @@ pub(crate) fn parse_listen_header(
         http_mode: defaults.map_or(HttpMode::KeepAlive, |d| d.http_mode),
         persist: defaults.is_some_and(|d| d.persist),
         dontlognull: defaults.is_some_and(|d| d.dontlognull),
+        log_opts: defaults.map_or(0, |d| d.log_opts),
         cliexp: Vec::new(),
         srvexp: Vec::new(),
         acls: Vec::new(),
@@ -197,6 +199,7 @@ pub(crate) fn parse_frontend_header(
         buffer_request: defaults.is_some_and(|d| d.buffer_request),
         http_mode: defaults.map_or(HttpMode::KeepAlive, |d| d.http_mode),
         dontlognull: defaults.is_some_and(|d| d.dontlognull),
+        log_opts: defaults.map_or(0, |d| d.log_opts),
         stick_table: None,
         stick_rules: Vec::new(),
         tcp_req_inspect_delay: defaults.and_then(|d| d.tcp_req_inspect_delay),
@@ -278,6 +281,7 @@ pub(crate) fn parse_backend_header(
         srvtimeout: timeouts.server,
         timeouts,
         retries: defaults.and_then(|d| d.retries).unwrap_or(3),
+        retry_on: defaults.and_then(|d| d.retry_on).unwrap_or(crate::ast::RE_CONN_FAILED),
         redisp: defaults.map_or(false, |d| d.redisp),
         redisp_after: defaults.map_or(-1, |d| if d.redisp { d.redisp_after } else { -1 }),
         dispatch: None,
@@ -345,6 +349,7 @@ pub(crate) fn parse_listen_directive(
         "srvtimeout" => parse_srvtimeout(kw),
         "timeout" => parse_timeout_directive(&mut proxy.timeouts, tokens, kw),
         "retries" => parse_retries(&mut proxy.retries, tokens, kw),
+        "retry-on" => super::parse_retry_on(&mut proxy.retry_on, tokens, kw),
         "redisp" => parse_redisp(kw),
         "maxconn" => parse_maxconn(&mut proxy.maxconn, tokens, kw),
         "grace" => parse_grace(&mut proxy.grace, tokens, kw),
@@ -600,6 +605,7 @@ pub(crate) fn parse_frontend_directive(
             let rule_slots = rule_capture_slots(&fe.http_req_rules);
             parse_capture(&mut fe.req_header_captures, &mut fe.res_header_captures, rule_slots, tokens, kw)
         }
+        "retry-on" => Err(ConfigError::new(kw.line, kw.col, "'retry-on' only available in backend or listen section")),
         other => Err(ConfigError::new(
             kw.line,
             kw.col,
@@ -641,6 +647,7 @@ pub(crate) fn parse_backend_directive(
         "srvtimeout" => parse_srvtimeout(kw),
         "timeout" => parse_timeout_directive(&mut be.timeouts, tokens, kw),
         "retries" => parse_retries(&mut be.retries, tokens, kw),
+        "retry-on" => super::parse_retry_on(&mut be.retry_on, tokens, kw),
         "redisp" => parse_redisp(kw),
         "dispatch" => parse_dispatch(kw),
         "default-server" => parse_default_server(&mut be.default_server, tokens, kw),
@@ -924,6 +931,7 @@ pub(crate) fn parse_option_listen(
         "persist" => proxy.persist = true,
         "http-keep-alive" => proxy.http_mode = HttpMode::KeepAlive,
         "dontlognull" => proxy.dontlognull = true,
+        "dontlog-normal" | "log-separate-errors" | "logasap" => proxy.log_opts |= crate::ast::log_opt_bit(&tokens[1].text),
         "accept-unsafe-violations-in-http-request" => proxy.stats.accept_unsafe_request = true,
         "log-health-checks" => proxy.log_health_checks = true,
         "httpchk" => {
@@ -973,6 +981,10 @@ pub(crate) fn parse_option_frontend(
     }
     if tokens[1].text == "dontlognull" {
         fe.dontlognull = true;
+        return Ok(());
+    }
+    if matches!(tokens[1].text.as_str(), "dontlog-normal" | "log-separate-errors" | "logasap") {
+        fe.log_opts |= crate::ast::log_opt_bit(&tokens[1].text);
         return Ok(());
     }
     let (except, if_none) = parse_forward_option(tokens, kw)?;
@@ -1038,6 +1050,7 @@ pub(crate) fn parse_no_listen(proxy: &mut ListenSection, tokens: &[Token], kw: &
         Some("httpclose") if proxy.http_mode == HttpMode::Close => proxy.http_mode = HttpMode::KeepAlive,
         Some("persist") => proxy.persist = false,
         Some("dontlognull") => proxy.dontlognull = false,
+        Some(n @ ("dontlog-normal" | "log-separate-errors" | "logasap")) => proxy.log_opts &= !crate::ast::log_opt_bit(n),
         Some("accept-unsafe-violations-in-http-request") => proxy.stats.accept_unsafe_request = false,
         Some("log-health-checks") => proxy.log_health_checks = false,
         Some("forwarded") => proxy.forwarded = None,
@@ -1056,6 +1069,7 @@ pub(crate) fn parse_no_frontend(fe: &mut FrontendSection, tokens: &[Token], kw: 
         Some("http-server-close") if fe.http_mode == HttpMode::ServerClose => fe.http_mode = HttpMode::KeepAlive,
         Some("httpclose") if fe.http_mode == HttpMode::Close => fe.http_mode = HttpMode::KeepAlive,
         Some("dontlognull") => fe.dontlognull = false,
+        Some(n @ ("dontlog-normal" | "log-separate-errors" | "logasap")) => fe.log_opts &= !crate::ast::log_opt_bit(n),
         _ => {}
     }
     Ok(())

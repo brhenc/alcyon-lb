@@ -4,9 +4,15 @@
 use crate::lexer::Line;
 use crate::error::ConfigError;
 
-fn parse_cond(s: &str) -> Result<bool, String> {
-    crate::cond::eval_if(s)
+fn parse_cond(s: &str, directive: &str, opts: &crate::cond::EnabledOpts) -> Result<bool, String> {
+    crate::cond::eval_if(s, directive, opts)
 }
+
+/// The words that open a section: what ends the `global` one.
+const SECTIONS: &[&str] = &[
+    "global", "defaults", "frontend", "backend", "listen", "userlist", "peers", "resolvers", "ring", "cache",
+    "mailers", "program", "http-errors", "fcgi-app", "log-forward", "crt-store", "acme", "traces", "vars",
+];
 
 /// Preprocesses the tokenized lines, resolving `.if`, `.elif`, `.else`, `.endif` blocks.
 ///
@@ -22,6 +28,9 @@ pub fn preprocess(lines: Vec<Line>) -> Result<Vec<Line>, ConfigError> {
     let mut if_done: Vec<bool> = Vec::new();
 
     let last_line = lines.last().map_or(1, |l| l.line_number);
+    // What `enabled()` reads: the `global` lines read so far, in the branches taken.
+    let mut opts = crate::cond::EnabledOpts::default();
+    let mut in_global = false;
 
     for line in lines {
         if line.tokens.is_empty() {
@@ -36,7 +45,7 @@ pub fn preprocess(lines: Vec<Line>) -> Result<Vec<Line>, ConfigError> {
                 let active = if_stack.last().copied().unwrap_or(true);
                 let mut cond_val = false;
                 if active {
-                    cond_val = parse_cond(&cond_str).map_err(|e| ConfigError::new(line.line_number, line.tokens[0].col, e))?;
+                    cond_val = parse_cond(&cond_str, ".if", &opts).map_err(|e| ConfigError::new(line.line_number, line.tokens[0].col, e))?;
                 }
                 if_stack.push(active && cond_val);
                 if_done.push(active && cond_val);
@@ -50,7 +59,7 @@ pub fn preprocess(lines: Vec<Line>) -> Result<Vec<Line>, ConfigError> {
                 
                 let mut cond_val = false;
                 if active_parent && !*done {
-                    cond_val = parse_cond(&cond_str).map_err(|e| ConfigError::new(line.line_number, line.tokens[0].col, e))?;
+                    cond_val = parse_cond(&cond_str, ".elif", &opts).map_err(|e| ConfigError::new(line.line_number, line.tokens[0].col, e))?;
                 }
                 
                 let Some(current_stack) = if_stack.last_mut() else {
@@ -92,6 +101,12 @@ pub fn preprocess(lines: Vec<Line>) -> Result<Vec<Line>, ConfigError> {
             }
             _ => {
                 if if_stack.last().copied().unwrap_or(true) {
+                    if SECTIONS.contains(&first.as_str()) {
+                        in_global = first == "global";
+                    } else if in_global {
+                        let words: Vec<&str> = line.tokens.iter().map(|t| t.text.as_str()).collect();
+                        opts.global_line(&words);
+                    }
                     out.push(line);
                 }
             }

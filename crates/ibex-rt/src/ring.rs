@@ -172,6 +172,52 @@ fn registry() -> &'static Registry {
     R.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+/// The built-in sinks `buf0` and `dpapi`: in-memory buffers that exist whatever the
+/// configuration says, and that `debug()` writes to by default. Their events carry the
+/// `timed` header (`<level>` and an ISO time), as `show events buf0` prints them.
+fn builtin(name: &str) -> Option<&'static Arc<Ring>> {
+    static B: OnceLock<[Arc<Ring>; 2]> = OnceLock::new();
+    let rings = B.get_or_init(|| {
+        let make = |name: &str, description: &str| {
+            Arc::new(Ring::new(&RingSection {
+                name: name.to_string(),
+                description: Some(description.to_string()),
+                format: RingFormat::Timed,
+                maxlen: None,
+                size: 16384,
+                timeout_connect: Duration::from_secs(5),
+                timeout_server: Duration::from_secs(5),
+                servers: Vec::new(),
+            }))
+        };
+        [make("buf0", "in-memory ring buffer"), make("dpapi", "DPAPI ring buffer")]
+    });
+    rings.iter().find(|r| r.name == name)
+}
+
+/// Whether `name` is a sink `debug()` can write to: `stdout`, `stderr`, a built-in buffer or
+/// a `ring` of the configuration.
+#[must_use]
+pub fn sink_exists(name: &str, rings: &[RingSection]) -> bool {
+    matches!(name, "stdout" | "stderr" | "buf0" | "dpapi") || rings.iter().any(|r| r.name == name)
+}
+
+/// `sink_write` of one `debug()` line to the sink `name` (nothing for a name that is none).
+pub fn debug_write(name: &str, line: &[u8]) {
+    match name {
+        "stdout" | "stderr" => {
+            let mut out = line.to_vec();
+            out.push(b'\n');
+            let _ = if name == "stdout" { io::stdout().write_all(&out) } else { io::stderr().write_all(&out) };
+        }
+        _ => {
+            if let Some(r) = builtin(name).cloned().or_else(|| find(name)) {
+                r.write(0, 0, &Meta::default(), usize::MAX, line);
+            }
+        }
+    }
+}
+
 /// The ring named `name`.
 #[must_use]
 pub fn find(name: &str) -> Option<Arc<Ring>> {
@@ -346,7 +392,7 @@ pub fn show_events(args: &[&str]) -> Vec<u8> {
         }
         return out.into_bytes();
     };
-    match find(&name) {
+    match builtin(&name).cloned().or_else(|| find(&name)) {
         Some(_) if req.from_end => Vec::new(),
         Some(r) => r.dump(req.delim, req.sanitize),
         None => format!("No such sink: {name}\n").into_bytes(),

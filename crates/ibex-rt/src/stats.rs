@@ -878,6 +878,7 @@ mod tests {
             fwrr: std::sync::Arc::default(),
             log_format: None,
             dont_log_null: false,
+            log_opts: 0,
             unique_id_format: None,
             unique_id_header: None,
             req_capture_slots: std::sync::Arc::new([]),

@@ -804,6 +804,17 @@ fn parse_http_req_rule_at(
             cond,
             line: 0,
         });
+    } else if act_str == "disable-l7-retry" {
+        let cond = if let Some(idx) = find_cond_idx(tokens, 2) {
+            parse_acl_condition_from_tokens(&tokens[idx..])?
+        } else {
+            None
+        };
+        rules.push(HttpReqRule {
+            action: HttpReqAction::DisableL7Retry,
+            cond,
+            line: 0,
+        });
     } else if act_str.starts_with("set-var(") || act_str.starts_with("set-var-fmt(") {
         let is_fmt = act_str.starts_with("set-var-fmt(");
         let var_name = act_token
