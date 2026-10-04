@@ -138,6 +138,8 @@ pub struct CliApplet {
     pub last_activity: Tick,
     pub is_done: bool,
     pub interest: Interest,
+    /// An `add map <id> <<` waiting for its payload: the command and the lines so far.
+    pub payload: Option<(String, String)>,
 }
 
 impl CliApplet {
@@ -159,6 +161,7 @@ impl CliApplet {
             last_activity: now,
             is_done: false,
             interest: Interest::READ,
+            payload: None,
         }
     }
 
@@ -233,7 +236,22 @@ impl CliApplet {
             let line = String::from_utf8_lossy(&line_bytes);
             let line = line.trim_end_matches('\r');
 
-            self.execute_line(line, ctx);
+            if let Some((_, body)) = self.payload.as_mut() {
+                if line.is_empty() {
+                    if let Some((cmd, body)) = self.payload.take() {
+                        self.run_patref(&cmd, Some(&body));
+                    }
+                } else {
+                    body.push_str(line);
+                    body.push('\n');
+                    continue;
+                }
+            } else {
+                self.execute_line(line, ctx);
+                if self.payload.is_some() {
+                    continue;
+                }
+            }
             // A connection that is not in `prompt` mode runs one command line and closes;
             // what came after it in the same write is never run (HAProxy, T146 item 4).
             if !self.interactive {
@@ -500,6 +518,12 @@ impl CliApplet {
             self.handle_set_var(target.trim());
         } else if cmd == "help" {
             self.handle_help();
+        } else if Self::is_patref_command(cmd) {
+            if cmd.ends_with(" <<") && cmd.starts_with("add map ") {
+                self.payload = Some((cmd.trim_end_matches('<').trim_end().to_string(), String::new()));
+            } else {
+                self.run_patref(cmd, None);
+            }
         } else {
             self.out_buf.extend_from_slice(
                 b"Unknown command. Please enter 'help' for a list of valid commands.\n",
@@ -510,6 +534,22 @@ impl CliApplet {
                 self.is_done = true;
             }
         }
+    }
+
+    /// `show|add|set|del|clear` of `map` or `acl`.
+    fn is_patref_command(cmd: &str) -> bool {
+        let mut it = cmd.split_whitespace();
+        matches!(it.next(), Some("show" | "add" | "set" | "del" | "clear")) && matches!(it.next(), Some("map" | "acl"))
+    }
+
+    /// Runs a map or ACL command on the process-wide pattern references
+    /// ([`ibex_sample::patref`]): every worker thread matches against what it leaves.
+    fn run_patref(&mut self, cmd: &str, payload: Option<&str>) {
+        let words: Vec<&str> = cmd.split_whitespace().collect();
+        let kind = if words[1] == "map" { ibex_sample::patref::RefKind::Map } else { ibex_sample::patref::RefKind::Acl };
+        let out = ibex_sample::patref::command(words[0], kind, &words[2..], payload);
+        self.out_buf.extend_from_slice(out.as_bytes());
+        self.finish_msg("");
     }
 
     fn handle_del_backend(&mut self, target: &str, ctx: &mut AppletContext) {

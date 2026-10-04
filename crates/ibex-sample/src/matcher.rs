@@ -45,6 +45,8 @@ pub enum Matcher {
     /// Matches if any of the patterns of the list matches (`pat_match_*` walks the whole
     /// pattern list of an expression, and the first hit wins).
     Any(Vec<Matcher>),
+    /// The patterns of an ACL's `-f` file, as the runtime CLI has left them.
+    File(std::sync::Arc<crate::patref::FileMatcher>),
     /// Matches IP address exact.
     Ip(IpAddr),
     /// Matches IPv4 CIDR network (`network_ip`, mask).
@@ -159,6 +161,7 @@ impl Matcher {
             Matcher::Sub { sub, .. } => sub.len(),
             Matcher::Bin(target) => target.len(),
             Matcher::Any(list) => list.iter().map(Matcher::min_pattern_len).min().unwrap_or(1),
+            Matcher::File(f) => f.min_pattern_len(),
             _ => 1,
         }
     }
@@ -171,6 +174,7 @@ impl Matcher {
             Matcher::Sub { .. } => !ends_with_newline,
             Matcher::End { .. } | Matcher::Reg(_) => true,
             Matcher::Any(list) => list.iter().any(|m| m.may_match_later(ends_with_newline)),
+            Matcher::File(f) => f.may_match_later(ends_with_newline),
             _ => false,
         }
     }
@@ -342,6 +346,7 @@ impl Matcher {
         match self {
             Matcher::Found => true,
             Matcher::Any(list) => list.iter().any(|m| m.matches(sample)),
+            Matcher::File(f) => f.matches(sample),
             Matcher::Word { pattern, delimiters, case_insensitive } => {
                 matches!(cast(sample.clone(), SampleType::Str),
                     Some(Sample::Str(s)) if match_word(s.as_bytes(), pattern, delimiters, *case_insensitive))

@@ -121,7 +121,7 @@ impl Expr {
         let mut forced = false;
         let mut case_insensitive = false;
         let mut files_loaded = false;
-        let mut file_patterns: Vec<String> = Vec::new();
+        let mut acl_files: Vec<std::sync::Arc<crate::patref::PatRef>> = Vec::new();
         let mut idx = 0;
         while idx < tokens.len() && tokens[idx].starts_with('-') {
             match tokens[idx].as_str() {
@@ -166,7 +166,7 @@ impl Expr {
                     let path = tokens
                         .get(idx)
                         .ok_or_else(|| "Missing file name after -f".to_string())?;
-                    file_patterns.extend(read_pattern_file(path)?);
+                    acl_files.push(crate::patref::acl_file(path)?);
                     files_loaded = true;
                 }
                 "--" => {
@@ -182,7 +182,7 @@ impl Expr {
             idx += 1;
         }
         let inline = &tokens[idx.min(tokens.len())..];
-        let has_patterns = !file_patterns.is_empty() || !inline.is_empty();
+        let has_patterns = !acl_files.is_empty() || !inline.is_empty();
 
         if has_patterns && match_method == "found" && !forced {
             // A binary sample has no default method: the payload fetches are ACL keywords
@@ -200,7 +200,7 @@ impl Expr {
             match_method = "found";
         }
 
-        let mut patterns = file_patterns;
+        let mut patterns: Vec<String> = Vec::new();
         if match_method == "int" {
             // `eq`, `ge`, `gt`, `le`, `lt` before a value make it a range (and stay in force
             // for the values after it), unless the value is a range already.
@@ -220,10 +220,15 @@ impl Expr {
 
         let matcher = if match_method == "found" {
             if forced { Some(Matcher::Found) } else { None }
-        } else if patterns.is_empty() {
+        } else if patterns.is_empty() && acl_files.is_empty() {
             Some(Matcher::compile_with_flags(match_method, "", case_insensitive)?)
         } else {
-            let mut list = Vec::with_capacity(patterns.len());
+            // The patterns of a `-f` file are read where they are, so that `add acl` and
+            // `del acl` on the stats socket change what the next request matches.
+            let mut list = Vec::with_capacity(patterns.len() + acl_files.len());
+            for file in acl_files {
+                list.push(Matcher::File(std::sync::Arc::new(crate::patref::FileMatcher::new(file, match_method, case_insensitive)?)));
+            }
             for pattern in &patterns {
                 list.push(Matcher::compile_with_flags(match_method, pattern, case_insensitive)?);
             }
@@ -384,22 +389,6 @@ fn default_match_method(fetch_name: &str, converters: &[(String, Vec<String>)]) 
     } else {
         "str"
     }
-}
-
-/// The patterns of a `-f` file (`pat_ref_read_from_file`): one per line, leading blanks
-/// and trailing blanks (as measured) dropped, the line ending at CR or LF; empty lines and lines starting with `#` are skipped.
-fn read_pattern_file(path: &str) -> Result<Vec<String>, String> {
-    let text = std::fs::read(path).map_err(|_| format!("failed to open pattern file <{path}>"))?;
-    let text = String::from_utf8_lossy(&text);
-    Ok(text
-        .split('\n')
-        .filter(|line| !line.starts_with('#'))
-        .map(|line| line.trim_start_matches([' ', '\t']))
-        .map(|line| line.split('\r').next().unwrap_or(line))
-        .map(|line| line.trim_end_matches([' ', '\t']))
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect())
 }
 
 /// `pat_parse_dotted_ver`: the patterns of `req.ssl_ver` are `<major>[.<minor>]` numbers, alone

@@ -721,6 +721,13 @@ fn main() {
         process::exit(0);
     }
 
+    // 9b. The ACL and map files the configuration reads become the objects `show map`,
+    //     `add acl` and the other runtime commands work on, numbered in the order written.
+    ibex_sample::patref::scan_config(&combined_config, &|line| {
+        let (file, l) = locate(&config_starts, line);
+        (file.to_string(), l)
+    });
+
     // 10. Enforce memory limits if requested (-m <megabytes>)
     if let Some(megs) = opts.memory_limit_mb {
         enforce_memory_limit(megs, opts.quiet);
