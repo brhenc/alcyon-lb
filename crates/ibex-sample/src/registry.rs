@@ -81,6 +81,20 @@ fn len_to_sint(len: usize) -> i64 {
     i64::try_from(len).unwrap_or(i64::MAX)
 }
 
+/// Set once the process is stopping (`when(stopping)`).
+pub static STOPPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The stream state `when()` conditions read (`sample_conv_when`, src/sample.c).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StreamFacts {
+    /// An error was met: a 5xx status, or a failed connection (the `dontlog-normal` rule).
+    pub error: bool,
+    /// A connection to a server was attempted for the request.
+    pub forwarded: bool,
+    /// An applet is serving the request.
+    pub toapplet: bool,
+}
+
 /// Runtime context passed into sample fetch functions during evaluation.
 #[derive(Debug, Clone, Default)]
 pub struct SampleContext<'a> {
@@ -130,6 +144,11 @@ pub struct SampleContext<'a> {
     pub last_rule: Option<(&'a str, u32)>,
     /// When the stream was accepted, as unix seconds and milliseconds: `accept_date`.
     pub accept_date: Option<(i64, u32)>,
+    /// What `when()` reads of the stream; `None` is a stream that has done nothing yet.
+    pub stream: Option<StreamFacts>,
+    /// The proxy's ACLs, for `when(acl,<name>)`; `None` where the caller has none, and the
+    /// condition then gives no sample.
+    pub acls: Option<&'a HashMap<String, crate::expr::Expr>>,
     pub is_first_req: bool,
     pub vars: Option<&'a HashMap<String, String>>,
     pub timeouts: Option<&'a HashMap<String, u32>>,
@@ -2639,47 +2658,29 @@ impl Registry {
             },
         });
 
-        self.register_converter(ConvDesc {
+        // `when(<condition>[,<args>])`: the input sample, or nothing, by a condition on the
+        // stream (`sample_conv_when`).
+        self.register_ctx_converter(CtxConvDesc {
             name: "when",
             in_type: TypeSpec::Any,
             out_type: TypeSpec::Same,
-            func: |smp, args| {
-                let op = args.first()?;
-                let val = args.get(1)?;
-                let matches = match op.as_str() {
-                    "eq" => sample_to_string(&smp) == *val,
-                    "ne" => sample_to_string(&smp) != *val,
-                    "gt" => {
-                        let a: i64 = sample_to_string(&smp).parse().ok()?;
-                        let b: i64 = val.parse().ok()?;
-                        a > b
+            func: |ctx, smp, args| {
+                let (neg, cond) = parse_when_cond(args)?;
+                let facts = ctx.stream.unwrap_or_default();
+                let (mut neg, ret) = match cond {
+                    WhenCond::Stopping => (neg, STOPPING.load(std::sync::atomic::Ordering::Relaxed)),
+                    WhenCond::Normal => (!neg, facts.error),
+                    WhenCond::Error => (neg, facts.error),
+                    WhenCond::Forwarded => (neg, facts.forwarded),
+                    WhenCond::ToApplet => (neg, facts.toapplet),
+                    WhenCond::Processed => (neg, facts.forwarded || facts.toapplet),
+                    WhenCond::Acl(name) => {
+                        let expr = ctx.acls?.get(name)?;
+                        (neg, expr.eval(&sample_registry(), ctx))
                     }
-                    "ge" => {
-                        let a: i64 = sample_to_string(&smp).parse().ok()?;
-                        let b: i64 = val.parse().ok()?;
-                        a >= b
-                    }
-                    "lt" => {
-                        let a: i64 = sample_to_string(&smp).parse().ok()?;
-                        let b: i64 = val.parse().ok()?;
-                        a < b
-                    }
-                    "le" => {
-                        let a: i64 = sample_to_string(&smp).parse().ok()?;
-                        let b: i64 = val.parse().ok()?;
-                        a <= b
-                    }
-                    _ => false,
                 };
-                if matches {
-                    if let Some(res) = args.get(2) {
-                        Some(Sample::Str(res.clone()))
-                    } else {
-                        Some(smp)
-                    }
-                } else {
-                    None
-                }
+                neg ^= ret;
+                neg.then_some(smp)
             },
         });
 
@@ -4847,6 +4848,34 @@ fn url_decode(s: &str, mut in_form: bool) -> String {
     String::from_utf8_lossy(&res).to_string()
 }
 
+/// A `when()` condition.
+enum WhenCond<'a> {
+    Stopping,
+    Normal,
+    Error,
+    Forwarded,
+    ToApplet,
+    Processed,
+    Acl(&'a str),
+}
+
+/// `check_when_cond`: an optional `!`, a keyword, and the ACL name `acl` takes.
+fn parse_when_cond(args: &[String]) -> Option<(bool, WhenCond<'_>)> {
+    let first = args.first()?;
+    let (neg, kw) = first.strip_prefix('!').map_or((false, first.as_str()), |k| (true, k));
+    let cond = match kw {
+        "stopping" => WhenCond::Stopping,
+        "normal" => WhenCond::Normal,
+        "error" => WhenCond::Error,
+        "forwarded" => WhenCond::Forwarded,
+        "toapplet" => WhenCond::ToApplet,
+        "processed" => WhenCond::Processed,
+        "acl" => WhenCond::Acl(args.get(1).filter(|a| !a.is_empty())?),
+        _ => return None,
+    };
+    Some((neg, cond))
+}
+
 /// The characters `has_ctl` looks for, as a mask: bit `n` is the character `n` (0-31), bit 32 is
 /// DEL. No argument or an empty one is every control character but tab; `any` is all of them,
 /// `http` only NUL, LF and CR; otherwise a number of at most 33 bits (`sample_conv_has_ctl`).
@@ -4874,6 +4903,9 @@ pub fn check_converter_args(name: &str, args: &[String]) -> Option<String> {
         "has_ctl" if has_ctl_mask(args.first().map_or("", String::as_str)).is_none() => {
             Some("invalid args in converter 'has_ctl' : expects 'any', 'http' or a mask of at most 33 bits".to_string())
         }
+        "when" if parse_when_cond(args).is_none() => Some(
+            "invalid args in converter 'when' : expects [!]error, forwarded, normal, processed, stopping, toapplet or acl,<name>".to_string(),
+        ),
         _ => None,
     }
 }

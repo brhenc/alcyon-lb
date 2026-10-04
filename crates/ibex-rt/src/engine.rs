@@ -1051,6 +1051,17 @@ fn note_last_rule(sess: &mut TcpSession, line: u32) {
     }
 }
 
+/// What `when()` reads of a stream (`sample_conv_when`): an error is a 5xx status; a
+/// connection attempt, once made, counts as forwarded. Retries and redispatches are not
+/// counted.
+fn stream_facts(log: &crate::txnlog::StreamLog, status: Option<u16>) -> ibex_sample::StreamFacts {
+    ibex_sample::StreamFacts {
+        error: status.is_some_and(|s| s >= 500),
+        forwarded: log.queue.is_some() || log.connect.is_some(),
+        toapplet: false,
+    }
+}
+
 /// The sample context a log line's `%[...]` reads.
 fn stream_sample_ctx<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, view: &'a ProxiesView<'a>, stick: &'a StickView<'a>) -> SampleContext<'a> {
     SampleContext {
@@ -2664,6 +2675,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             return;
         }
         self.stopping = true;
+        ibex_sample::STOPPING.store(true, Ordering::Relaxed);
         self.stop_deadline = self.hard_stop_after.map(|d| Instant::now() + d);
         crate::systemd::notify_stopping_once();
 
@@ -5512,6 +5524,7 @@ impl EngineDispatcher<'_> {
             res_body: has_wait.then_some(res_body.as_slice()),
             unique_id: entry.sess.log.unique_id.as_deref(),
             accept_date: Some(entry.sess.log.date),
+            stream: Some(stream_facts(&entry.sess.log, Some(status))),
             last_rule: last_rule_at(entry.sess.log.last_rule),
             captures_req_hdr: Some(&entry.sess.log.req_captures),
             captures_res_hdr: Some(&res_caps_in),
@@ -6245,6 +6258,7 @@ impl EngineDispatcher<'_> {
                         last_rule: last_rule_at($s.log.last_rule),
                         be_max_retries: Some(be_retries),
                         cur_max_retries: Some($s.max_retries),
+                        acls: Some(acls),
                         act_conn,
                         stick: Some(&stick),
                         ..Default::default()
@@ -8516,14 +8530,13 @@ fn run_res_rules<'a>(
     let start = wait.as_ref().map_or(0, |w| w.start);
     for (idx, (op, cond, line)) in rules.enumerate().skip(start) {
         // The slots as the earlier rules left them, for `capture.res.hdr`.
-        let with_caps;
-        let ctx = match &caps {
-            Some((slots, _)) => {
-                with_caps = SampleContext { captures_res_hdr: Some(slots.as_slice()), ..ctx.clone() };
-                &with_caps
-            }
-            None => ctx,
+        // and the proxy's ACLs, for `when(acl,<name>)`.
+        let with_caps = SampleContext {
+            captures_res_hdr: caps.as_ref().map(|(slots, _)| slots.as_slice()).or(ctx.captures_res_hdr),
+            acls: Some(acls),
+            ..ctx.clone()
         };
+        let ctx = &with_caps;
         if cond.is_some_and(|c| !eval_condition(c, ctx, acls, registry)) {
             continue;
         }
@@ -8696,6 +8709,7 @@ fn after_res_on_reply<'r>(
             res_version: Some(&version),
             unique_id: sess.log.unique_id.as_deref(),
             accept_date: Some(sess.log.date),
+            stream: Some(stream_facts(&sess.log, Some(status))),
             captures_req_hdr: Some(&sess.log.req_captures),
             captures_res_hdr: Some(&res_caps_in),
             ..Default::default()

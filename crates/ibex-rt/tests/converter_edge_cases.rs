@@ -371,6 +371,56 @@ fn has_ctl_refuses_bad_arguments() {
     }
 }
 
+/// `reg-tests/converter/when_debug.vtc` without the stats applet case (see the T136
+/// report): `when()` conditions on the stream's state, as `HAProxy` meets them.
+#[test]
+fn when_conditions_follow_the_streams_state() {
+    let ok = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = l.local_addr().expect("addr");
+        thread::spawn(move || {
+            for mut c in l.incoming().flatten() {
+                let mut buf = [0u8; 4096];
+                let _ = c.read(&mut buf);
+                let _ = c.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            }
+        });
+        addr
+    };
+    let dead = common::reserve_addr();
+    let rules = format!(
+        "  acl yes always_true\n\
+  http-request set-var(txn.dbg) str(hello),debug(mytag)\n\
+  use_backend dead if {{ path /dead }}\n\
+  default_backend be\n\
+  http-after-response set-header x-dbg \"%[var(txn.dbg)]\"\n\
+  http-after-response set-header x-when \"[%[str(v),when(error)]][%[str(v),when(normal)]][%[str(v),when(forwarded)]][%[str(v),when(processed)]][%[str(v),when(toapplet)]][%[str(v),when(stopping)]][%[str(v),when(acl,yes)]][%[str(v),when(!error)]]\"\n\
+backend be\n  server s1 {ok}\n\
+backend dead\n  retries 0\n  server s1 {dead}\n"
+    );
+    let got = run(&rules, &[&get("/srv"), &get("/dead")]);
+    assert_eq!(
+        got,
+        vec![
+            vec!["x-dbg: hello", "x-when: [][v][v][v][][][v][v]"],
+            vec!["x-dbg: hello", "x-when: [v][][v][v][][][v][]"],
+        ]
+    );
+}
+
+#[test]
+fn when_acl_evaluates_the_named_acl_inline() {
+    let rules = "  acl is_a path /a\n\
+  http-request set-var(txn.x) str(v),when(acl,is_a)\n\
+  http-request set-var(txn.y) str(v),when(!acl,is_a)\n\
+  http-request return status 200 hdr x-x \"[%[var(txn.x)]]\" hdr x-y \"[%[var(txn.y)]]\" hdr x-n \"[%[str(v),when(normal,forwarded)]]\"\n";
+    // Surplus arguments after a keyword are ignored (measured on HAProxy 3.5-dev8).
+    assert_eq!(
+        run(rules, &[&get("/a"), &get("/b")]),
+        vec![vec!["x-x: [v]", "x-y: []", "x-n: [v]"], vec!["x-x: []", "x-y: [v]", "x-n: [v]"]]
+    );
+}
+
 #[test]
 fn set_var_with_a_failing_converter_leaves_the_variable_alone() {
     let rules = "  http-request set-var(txn.a) str(one)\n\

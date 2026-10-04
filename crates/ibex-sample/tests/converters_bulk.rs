@@ -1196,36 +1196,36 @@ fn test_conv_iif() {
 
 #[test]
 fn test_conv_when() {
-    // 1. Documented behaviour (eq, ne, gt, ge, lt, le)
-    assert_eq!(
-        eval_conv("when", Sample::Sint(10), &["gt", "5"]),
-        Some(Sample::Sint(10))
-    );
-    assert_eq!(
-        eval_conv("when", Sample::Sint(3), &["gt", "5"]),
-        None
-    );
-    // 2. String comparison eq
-    assert_eq!(
-        eval_conv("when", Sample::Str("admin".into()), &["eq", "admin"]),
-        Some(Sample::Str("admin".into()))
-    );
-    assert_eq!(
-        eval_conv("when", Sample::Str("user".into()), &["eq", "admin"]),
-        None
-    );
-    // 3. Replacement result arg
-    assert_eq!(
-        eval_conv("when", Sample::Sint(10), &["gt", "5", "MATCHED"]),
-        Some(Sample::Str("MATCHED".into()))
-    );
-    // 4. Invalid condition op
-    assert_eq!(
-        eval_conv("when", Sample::Sint(10), &["unknown_op", "5"]),
-        None
-    );
-    // 5. Missing args
-    assert_eq!(eval_conv("when", Sample::Sint(10), &[]), None);
+    use ibex_sample::registry::{SampleContext, StreamFacts};
+    let reg = Registry::new();
+    let when = |facts: Option<StreamFacts>, args: &[&str]| {
+        let ctx = SampleContext { stream: facts, ..Default::default() };
+        let args: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
+        reg.eval("str", &["v".to_string()], &[("when", args)], &ctx)
+    };
+    let v = Some(Sample::Str("v".into()));
+    let err = Some(StreamFacts { error: true, forwarded: true, toapplet: false });
+    let app = Some(StreamFacts { error: false, forwarded: false, toapplet: true });
+    // a stream that has done nothing yet
+    assert_eq!(when(None, &["normal"]), v);
+    assert_eq!(when(None, &["error"]), None);
+    assert_eq!(when(None, &["!error"]), v);
+    assert_eq!(when(None, &["forwarded"]), None);
+    assert_eq!(when(None, &["stopping"]), None);
+    // an error on a forwarded request
+    assert_eq!(when(err, &["error"]), v);
+    assert_eq!(when(err, &["normal"]), None);
+    assert_eq!(when(err, &["forwarded"]), v);
+    assert_eq!(when(err, &["processed"]), v);
+    assert_eq!(when(err, &["toapplet"]), None);
+    // an applet
+    assert_eq!(when(app, &["toapplet"]), v);
+    assert_eq!(when(app, &["processed"]), v);
+    assert_eq!(when(app, &["forwarded"]), None);
+    // no ACLs known, unknown condition, missing arguments: no sample
+    assert_eq!(when(None, &["acl", "x"]), None);
+    assert_eq!(when(None, &["bogus"]), None);
+    assert_eq!(when(None, &[]), None);
 }
 
 #[test]
