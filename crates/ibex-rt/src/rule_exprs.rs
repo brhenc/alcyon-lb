@@ -80,7 +80,7 @@ pub fn check_sample_expr(expr: &str, registry: &Registry) -> Result<(), String> 
     if let Some(msg) = ibex_sample::not_implemented_message(fetch) {
         return Err(msg);
     }
-    if registry.get_fetch(fetch).is_none() {
+    if !registry.has_fetch(fetch) {
         return Err(format!("unknown fetch method '{fetch}'"));
     }
     for term in terms.filter(|t| !t.trim().is_empty()) {

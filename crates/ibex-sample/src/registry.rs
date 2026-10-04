@@ -2018,7 +2018,7 @@ impl Registry {
             },
         });
         self.register_fetch(FetchDesc {
-            name: "epoch",
+            name: "date",
             out_type: SampleType::Sint,
             func: date_fetch,
         });
@@ -5236,7 +5236,7 @@ mod oracle_tests {
     /// with `file:line` citations) and by grepping the `smp_fetch` registration tables in
     /// the reference tree directly.
     const NOT_IN_HAPROXY_FETCHES: &[&str] = &[
-        "be_client_timeout", "epoch", "fe_connect_timeout", "fe_queue_timeout",
+        "be_client_timeout", "fe_connect_timeout", "fe_queue_timeout",
         "fe_server_timeout", "fe_tunnel_timeout", "req.uri", "res.proto_http", "res.status",
         "res_ver", "ssl_fc_version",
     ];

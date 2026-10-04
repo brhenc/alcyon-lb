@@ -498,6 +498,15 @@ pub fn check_expr(config: &Config, registry: &Registry, at: Where<'_>, expr: &st
 pub fn check_sample_refs(config: &Config, registry: &Registry) -> Result<(), String> {
     for r in &config.sample_refs {
         let in_line = |e: String| format!("parsing [line {}]: {e}", r.line);
+        // A fetch or converter that does not exist would load and yield an empty value on
+        // every request; `sample_parse_expr` refuses it wherever the `%[...]` is written.
+        // (An ACL's expression is checked by `check_expr`, in `HAProxy`'s ACL wording.)
+        // `log-format`, `unique-id-format` and `error-log-format` are compiled, and refused
+        // in `HAProxy`'s "failed to parse log-format" words, by `validate_formats`.
+        if !r.acl && !matches!(r.directive.as_str(), "log-format" | "unique-id-format" | "error-log-format") {
+            crate::rule_exprs::check_sample_expr(&r.expr, registry)
+                .map_err(|e| in_line(format!("failed to parse sample expression <{}> : {e}", r.expr)))?;
+        }
         if let (SectionKind::Defaults, "unique-id-format" | "log-format") = (r.section, r.directive.as_str()) {
             // Resolved in each proxy that inherited it, as if written there.
             for (section, name) in format_users(config, &r.directive, &r.expr) {
