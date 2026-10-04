@@ -31,8 +31,8 @@ fn get(addr: SocketAddr, path: &str) -> (String, u16) {
 
 #[test]
 fn set_src_dst_and_ports_from_every_rule_set() {
-    let addrs: Vec<SocketAddr> = (0..4).map(|_| common::reserve_addr()).collect();
-    let (a1, a2, a3, a4) = (addrs[0], addrs[1], addrs[2], addrs[3]);
+    let addrs: Vec<SocketAddr> = (0..5).map(|_| common::reserve_addr()).collect();
+    let (a1, a2, a3, a4, a5) = (addrs[0], addrs[1], addrs[2], addrs[3], addrs[4]);
     let hdrs = "\x20 http-after-response set-header x-src \"%[src]:%[src_port]\"\n\
                 \x20 http-after-response set-header x-dst \"%[dst]:%[dst_port]\"\n";
     let cfg = format!(
@@ -54,7 +54,11 @@ fn set_src_dst_and_ports_from_every_rule_set() {
          \x20 http-request set-dst-port int(4005) if {{ path /http }}\n\
          \x20 http-request return status 200\n{hdrs}\
          frontend fe4\n  bind {a4}\n  http-request set-src ipv4(10.0.0.7)\n\
-         \x20 http-request set-dst ipv4(10.0.0.8)\n  http-request return status 200\n{hdrs}"
+         \x20 http-request set-dst ipv4(10.0.0.8)\n  http-request return status 200\n{hdrs}\
+         frontend fe5\n  bind {a5}\n  tcp-request connection set-src-port int(5000)\n\
+         \x20 tcp-request connection set-dst-port int(5001)\n  http-request return status 200\n{hdrs}\
+         \x20 http-after-response set-header x-fcsrc \"%[fc_src]:%[fc_src_port]\"\n\
+         \x20 http-after-response set-header x-fcdst \"%[fc_dst]:%[fc_dst_port]\"\n"
     );
     let mut f = NamedTempFile::new().expect("tmp");
     f.write_all(cfg.as_bytes()).expect("cfg");
@@ -72,6 +76,7 @@ fn set_src_dst_and_ports_from_every_rule_set() {
     let (r3a, _) = get(a3, "/tcp");
     let (r3b, _) = get(a3, "/http");
     let (r4, p4) = get(a4, "/");
+    let (r5, _) = get(a5, "/");
     common::stop(&mut child);
 
     assert!(r1.starts_with("http/1.1 200"), "{r1}");
@@ -93,4 +98,32 @@ fn set_src_dst_and_ports_from_every_rule_set() {
     // http-request set-src / set-dst keep the port, as the other rule sets do.
     assert!(r4.contains(&format!("x-src: 10.0.0.7:{p4}\r\n")), "{r4}");
     assert!(r4.contains(&format!("x-dst: 10.0.0.8:{}\r\n", a4.port())), "{r4}");
+
+    // connection level: the connection's own addresses follow, fc_* included.
+    assert!(r5.contains("x-src: 127.0.0.1:5000\r\n"), "{r5}");
+    assert!(r5.contains("x-dst: 127.0.0.1:5001\r\n"), "{r5}");
+    assert!(r5.contains("x-fcsrc: 127.0.0.1:5000\r\n"), "{r5}");
+    assert!(r5.contains("x-fcdst: 127.0.0.1:5001\r\n"), "{r5}");
+}
+
+#[test]
+fn port_rules_need_an_expression() {
+    // HAProxy: "missing fetch method" for each of these.
+    for rule in [
+        "tcp-request connection set-src-port",
+        "tcp-request connection set-dst-port",
+        "tcp-request session set-src-port",
+        "tcp-request session set-dst-port",
+        "tcp-request content set-src-port",
+        "tcp-request content set-dst-port",
+        "http-request set-src-port",
+    ] {
+        let cfg = format!("defaults\n  mode http\n  timeout client 5s\n  timeout server 5s\n  timeout connect 5s\nfrontend f\n  bind 127.0.0.1:18082\n  {rule}\n");
+        let mut f = NamedTempFile::new().expect("tmp");
+        f.write_all(cfg.as_bytes()).expect("cfg");
+        let out = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-c").arg("-f").arg(f.path()).output().expect("-c");
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert_ne!(out.status.code(), Some(0), "{rule}: {text}");
+        assert!(text.contains("missing fetch method"), "{rule}: {text}");
+    }
 }

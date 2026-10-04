@@ -93,6 +93,10 @@ fn expect_proxy_arguments_are_checked_at_load() {
     let (c, o) = check("tcp-request session expect-proxy layer4");
     assert_ne!(c, Some(0), "{o}");
     assert!(o.contains("'expect-proxy layer4' is not allowed in 'tcp-request session' rules"), "{o}");
+    // HAProxy: "only accepts 'if' or 'unless'" (got 'foo').
+    let (c, o) = check("tcp-request connection expect-proxy layer4 foo");
+    assert_ne!(c, Some(0), "{o}");
+    assert!(o.contains("only accepts 'if' or 'unless'"), "{o}");
     let (c, o) = check("tcp-request connection expect-proxy layer4 if { src 10.0.0.0/8 }");
     assert_eq!(c, Some(0), "{o}");
 }

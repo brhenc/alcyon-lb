@@ -81,3 +81,17 @@ fn base_arguments_are_checked() {
         assert!(o.contains(&format!("'{kw}' already specified.")), "{o}");
     }
 }
+
+#[test]
+fn bases_reach_server_crt_and_crl_file() {
+    let dir = certs();
+    let d = dir.path().display();
+    // The client certificate comes from crt-base, the CRL path from ca-base: with the bases
+    // the files are found (a CRL that is not one is then a different error from "no such file").
+    let be = "backend be\n  server s1 127.0.0.1:1 ssl verify required ca-file ca.pem crl-file ca.pem crt both.pem\n";
+    let (_, o) = check(&format!("global\n  ca-base {d}\n  crt-base {d}\n{DEFAULTS}{be}"));
+    assert!(!o.contains("No such file"), "{o}");
+    let (c, o) = check(&format!("{DEFAULTS}{be}"));
+    assert_ne!(c, Some(0), "{o}");
+    assert!(o.contains("No such file"), "{o}");
+}

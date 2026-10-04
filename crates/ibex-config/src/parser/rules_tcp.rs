@@ -51,7 +51,7 @@ pub(crate) fn parse_tcp_req_connection(
                 let (cond_idx, cond) = parse_rule_condition(tokens, 3)?;
                 let expr = join_tokens_until(tokens, 3, cond_idx);
                 if expr.is_empty() {
-                    return Err(ConfigError::new(act_tok.line, act_tok.col, "'set-src-port' expects an expression"));
+                    return Err(ConfigError::new(act_tok.line, act_tok.col, "missing fetch method"));
                 }
                 rules.push(TcpReqConnRule { action: TcpReqConnAction::SetSrcPort { expr }, cond });
             }
@@ -59,7 +59,7 @@ pub(crate) fn parse_tcp_req_connection(
                 let (cond_idx, cond) = parse_rule_condition(tokens, 3)?;
                 let expr = join_tokens_until(tokens, 3, cond_idx);
                 if expr.is_empty() {
-                    return Err(ConfigError::new(act_tok.line, act_tok.col, "'set-dst-port' expects an expression"));
+                    return Err(ConfigError::new(act_tok.line, act_tok.col, "missing fetch method"));
                 }
                 rules.push(TcpReqConnRule { action: TcpReqConnAction::SetDstPort { expr }, cond });
             }
@@ -218,7 +218,7 @@ pub(crate) fn parse_tcp_req_session(
                 let (cond_idx, cond) = parse_rule_condition(tokens, 3)?;
                 let expr = join_tokens_until(tokens, 3, cond_idx);
                 if expr.is_empty() {
-                    return Err(ConfigError::new(act_tok.line, act_tok.col, "'set-src-port' expects an expression"));
+                    return Err(ConfigError::new(act_tok.line, act_tok.col, "missing fetch method"));
                 }
                 rules.push(TcpReqSessionRule { action: TcpReqSessionAction::SetSrcPort { expr }, cond });
             }
@@ -226,7 +226,7 @@ pub(crate) fn parse_tcp_req_session(
                 let (cond_idx, cond) = parse_rule_condition(tokens, 3)?;
                 let expr = join_tokens_until(tokens, 3, cond_idx);
                 if expr.is_empty() {
-                    return Err(ConfigError::new(act_tok.line, act_tok.col, "'set-dst-port' expects an expression"));
+                    return Err(ConfigError::new(act_tok.line, act_tok.col, "missing fetch method"));
                 }
                 rules.push(TcpReqSessionRule { action: TcpReqSessionAction::SetDstPort { expr }, cond });
             }
@@ -499,7 +499,7 @@ fn parse_tcp_req_content_at(
                 let (cond_idx, cond) = parse_rule_condition(tokens, 3)?;
                 let expr = join_tokens_until(tokens, 3, cond_idx);
                 if expr.is_empty() {
-                    return Err(ConfigError::new(act_tok.line, act_tok.col, "'set-src-port' expects an expression"));
+                    return Err(ConfigError::new(act_tok.line, act_tok.col, "missing fetch method"));
                 }
                 rules.push(TcpReqContentRule { action: TcpReqContentAction::SetSrcPort { expr }, cond, line: 0 });
             }
@@ -507,7 +507,7 @@ fn parse_tcp_req_content_at(
                 let (cond_idx, cond) = parse_rule_condition(tokens, 3)?;
                 let expr = join_tokens_until(tokens, 3, cond_idx);
                 if expr.is_empty() {
-                    return Err(ConfigError::new(act_tok.line, act_tok.col, "'set-dst-port' expects an expression"));
+                    return Err(ConfigError::new(act_tok.line, act_tok.col, "missing fetch method"));
                 }
                 rules.push(TcpReqContentRule { action: TcpReqContentAction::SetDstPort { expr }, cond, line: 0 });
             }
