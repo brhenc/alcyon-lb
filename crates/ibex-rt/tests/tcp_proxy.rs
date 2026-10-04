@@ -448,6 +448,7 @@ fn sc_inc_gpc0_increments_counter_and_reports_via_show_table() {
         tcp_req_content_rules: vec![TcpReqContentRule {
             action: TcpReqContentAction::ScIncGpc0 { sc: 0 },
             cond: None,
+            line: 0,
         }],
         ..Default::default()
     };
@@ -916,6 +917,7 @@ fn test_tcp_request_content_reject_and_silent_drop() {
             tcp_req_content_rules: vec![TcpReqContentRule {
                 action: TcpReqContentAction::Reject,
                 cond: None,
+                line: 0,
             }],
             ..Default::default()
         }],
@@ -942,6 +944,7 @@ fn test_tcp_request_content_reject_and_silent_drop() {
             tcp_req_content_rules: vec![TcpReqContentRule {
                 action: TcpReqContentAction::SilentDrop,
                 cond: None,
+                line: 0,
             }],
             ..Default::default()
         }],

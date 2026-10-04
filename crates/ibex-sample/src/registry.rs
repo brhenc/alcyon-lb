@@ -120,6 +120,9 @@ pub struct SampleContext<'a> {
     pub captures_res_hdr: Option<&'a [Option<Vec<u8>>]>,
     /// The stream's unique ID (`unique-id-format`), for the `unique-id` fetch.
     pub unique_id: Option<&'a str>,
+    /// The file and line of the last rule that ended a rule set for the request
+    /// (`last_rule_file`, `last_rule_line`); `None` where no rule did.
+    pub last_rule: Option<(&'a str, u32)>,
     pub is_first_req: bool,
     pub vars: Option<&'a HashMap<String, String>>,
     pub timeouts: Option<&'a HashMap<String, u32>>,
@@ -1360,6 +1363,26 @@ impl Registry {
             name: "unique-id",
             out_type: SampleType::Str,
             func: |ctx, _args| ctx.unique_id.map(|u| Sample::Str(u.to_string())),
+        });
+        // `smp_fetch_wait_end` (src/payload.c): true once the rules may no longer wait. The
+        // tcp-request and tcp-response content rules hold a condition on it while they can
+        // wait (`inspect-delay` not over, the buffer not full, the peer not closed), so a
+        // sample is only ever asked for when they cannot.
+        self.register_fetch(FetchDesc {
+            name: "wait_end",
+            out_type: SampleType::Bool,
+            func: |_ctx, _args| Some(Sample::Bool(true)),
+        });
+        // `smp_fetch_last_rule_file` / `smp_fetch_last_rule_line` (src/stream.c).
+        self.register_fetch(FetchDesc {
+            name: "last_rule_file",
+            out_type: SampleType::Str,
+            func: |ctx, _args| ctx.last_rule.map(|(file, _)| Sample::Str(file.to_string())),
+        });
+        self.register_fetch(FetchDesc {
+            name: "last_rule_line",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| ctx.last_rule.map(|(_, line)| Sample::Sint(i64::from(line))),
         });
 
         // --- 7. Captures ---

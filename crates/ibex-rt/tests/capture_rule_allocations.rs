@@ -103,6 +103,7 @@ fn a_capture_rule_does_not_parse_its_expression_per_request() {
     let capture = |expr: &str| HttpReqRule {
         action: HttpReqAction::Capture { expr: expr.into(), len: Some(20), id: None },
         cond: None,
+        line: 0,
     };
     let without = allocations_of_one_request(Vec::new());
     let with = allocations_of_one_request(vec![capture("req.hdr(host)")]);

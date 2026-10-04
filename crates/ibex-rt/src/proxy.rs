@@ -1866,7 +1866,10 @@ pub fn eval_acl_term_extended<S: ::std::hash::BuildHasher>(
     };
 
     if can_wait {
-        if expr.fetch_name == "req.payload" || expr.fetch_name == "payload" {
+        if expr.fetch_name == "wait_end" {
+            // `smp_fetch_wait_end`: no sample until the rules cannot wait any longer.
+            return AclEvalResult::MissingData;
+        } else if expr.fetch_name == "req.payload" || expr.fetch_name == "payload" {
             let offset = expr
                 .fetch_args
                 .first()

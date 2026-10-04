@@ -170,6 +170,8 @@ pub enum RetriesValue {
 pub struct HttpReqRule {
     pub action: HttpReqAction,
     pub cond: Option<AclCondition>,
+    /// The configuration line the rule was written on, for `last_rule_line`.
+    pub line: u32,
 }
 
 /// Modern HTTP-response action.
@@ -187,6 +189,20 @@ pub enum HttpResAction {
     /// run once the response body is complete, or `at_least` bytes of it are here, or the
     /// buffer is full; after `time_ms` the client gets a 504.
     WaitForBody { time_ms: u32, at_least: u32 },
+    /// `http-response redirect location <fmt> [code <c>] [set-cookie <c>|clear-cookie <n>]`:
+    /// the response is replaced by an empty redirect to `location` (a log-format string).
+    /// `HAProxy` refuses the `prefix` and `scheme` types in a response.
+    Redirect { location: String, code: u16, cookie: Option<RedirectCookie> },
+}
+
+/// The cookie a redirect sets or clears: of `set-cookie` and `clear-cookie` the last one
+/// on the line stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RedirectCookie {
+    /// `set-cookie NAME[=VALUE]`: `set-cookie: NAME[=VALUE]; path=/;`.
+    Set(String),
+    /// `clear-cookie NAME`: `set-cookie: NAME; path=/; Max-Age=0;`.
+    Clear(String),
 }
 
 /// Rule pairing an HTTP-response action with an optional condition.
@@ -194,6 +210,8 @@ pub enum HttpResAction {
 pub struct HttpResRule {
     pub action: HttpResAction,
     pub cond: Option<AclCondition>,
+    /// The configuration line the rule was written on, for `last_rule_line`.
+    pub line: u32,
 }
 
 /// Modern HTTP-after-response action.

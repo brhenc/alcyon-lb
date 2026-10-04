@@ -469,9 +469,12 @@ fn parse_cli_args(args: &[String]) -> (String, CliOptions) {
 
 fn load_and_merge_configs(config_files: &[PathBuf]) -> String {
     let mut combined = String::new();
+    // Where each file starts in the text, for the `file:line` of `last_rule_file`.
+    let mut starts = Vec::new();
     for path in config_files {
         match std::fs::read_to_string(path) {
             Ok(content) => {
+                starts.push((u32::try_from(combined.matches('\n').count() + 1).unwrap_or(u32::MAX), path.display().to_string()));
                 combined.push_str(&content);
                 if !combined.ends_with('\n') {
                     combined.push('\n');
@@ -486,6 +489,7 @@ fn load_and_merge_configs(config_files: &[PathBuf]) -> String {
             }
         }
     }
+    ibex_rt::engine::set_config_files(starts);
     combined
 }
 

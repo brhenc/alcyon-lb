@@ -14,7 +14,7 @@ use crate::ast::{
     AclCondition, AclRule, AclTerm, BackendSection, BalanceAlgorithm, BindConfig, Config, CookieConfig,
     DefaultServerConfig, DefaultsSection, ErrorPageSource, FrontendSection, GlobalSection,
     GlobalSetVar, HashPreserveAffinity, HashType, HttpAfterResAction, HttpAfterResRule, HttpCheckAction, HttpCheckExpectPattern,
-    HttpChkConfig, HttpReqAction, HttpReqRule, HttpResAction, HttpResRule, HttpReuse, RetriesValue,
+    HttpChkConfig, HttpReqAction, HttpReqRule, HttpResAction, HttpResRule, HttpReuse, RedirectCookie, RetriesValue,
     HeaderCapture, ListenSection, LogConfig, LogFacility, LogFormatSpec, LogLevel, LogTarget, MatchType, Mode,
     MysqlCheckVersion, ProtoCheckConfig, ResolvedCheckConfig, ResolvedHttpCheck,
     ResolvedHttpExpectPattern, ResolvedHttpExpectRule, ResolvedTcpStep, SampleRef, SectionKind, Server, ServerSsl,

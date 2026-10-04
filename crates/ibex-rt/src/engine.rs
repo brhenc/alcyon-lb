@@ -62,6 +62,9 @@ thread_local! {
     static TICK_EPOCH: Cell<Option<Instant>> = const { Cell::new(None) };
     pub static WORKER_ID: Cell<usize> = const { Cell::new(0) };
     static STRICT_MODE: Cell<bool> = const { Cell::new(true) };
+    /// The line of the `http-response` rule that last ended the rules (`allow`, `deny`,
+    /// `redirect`), left by `run_res_rules` for its caller to take.
+    static LAST_RULE: Cell<Option<u32>> = const { Cell::new(None) };
     static REWRITE_ADDED_BYTES: Cell<usize> = const { Cell::new(0) };
     static MAX_REWRITE_LIMIT: Cell<usize> = const { Cell::new(8192) };
     /// The response being rewritten by `http-response`/`http-after-response`, as the HTX
@@ -758,9 +761,10 @@ fn socket_file_ident(path: &Path) -> Option<(u64, u64)> {
 }
 
 /// `HAProxy`'s predefined ACLs (`default_acl_list`, src/acl.c), by name. `RDP_COOKIE`
-/// (`req.rdp_cookie_cnt`) and `WAIT_END` (`wait_end`) are missing: Ibex has neither fetch.
+/// (`req.rdp_cookie_cnt`) is missing: Ibex has no such fetch.
 const PREDEFINED_ACLS:&[(&str, &str)] = &[
     ("TRUE", "always_true"),
+    ("WAIT_END", "wait_end"),
     ("FALSE", "always_false"),
     ("LOCALHOST", "src 127.0.0.1/8 ::1"),
     ("HTTP", "req.proto_http"),
@@ -905,7 +909,7 @@ fn compile_log_format(spec: Option<&ibex_config::LogFormatSpec>, mode_http: bool
 fn with_buffered_request(rules: &mut Vec<ibex_config::HttpReqRule>, on: bool) {
     if on {
         let action = ibex_config::HttpReqAction::WaitForBody { time_ms: None, at_least: 0 };
-        rules.insert(0, ibex_config::HttpReqRule { action, cond: None });
+        rules.insert(0, ibex_config::HttpReqRule { action, cond: None, line: 0 });
     }
 }
 
@@ -1009,6 +1013,31 @@ fn begin_http_stream(entry: &mut SessionEntry, proxies: &[Proxy], fe_idx: usize,
     }
 }
 
+static CONFIG_FILES: std::sync::OnceLock<Vec<(u32, String)>> = std::sync::OnceLock::new();
+
+/// Records the configuration files as they were read into one text: each file's path and
+/// the line of that text it starts at (the first is 1), so a rule's line can be told as
+/// `file:line` for `last_rule_file` and `last_rule_line`.
+pub fn set_config_files(files: Vec<(u32, String)>) {
+    let _ = CONFIG_FILES.set(files);
+}
+
+/// `last_rule`, a line of the configuration text, as the file it is in and its line there.
+fn last_rule_at(line: Option<u32>) -> Option<(&'static str, u32)> {
+    let line = line?;
+    let files = CONFIG_FILES.get()?;
+    let (first, path) = files.iter().rev().find(|(first, _)| *first <= line)?;
+    Some((path.as_str(), line - first + 1))
+}
+
+/// Notes `line` as the last rule that ended a rule set for the request: `0`, a rule the
+/// proxy made up, is not one.
+fn note_last_rule(sess: &mut TcpSession, line: u32) {
+    if line != 0 {
+        sess.log.last_rule = Some(line);
+    }
+}
+
 /// The sample context a log line's `%[...]` reads.
 fn stream_sample_ctx<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, view: &'a ProxiesView<'a>, stick: &'a StickView<'a>) -> SampleContext<'a> {
     SampleContext {
@@ -1030,6 +1059,7 @@ fn stream_sample_ctx<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, view: 
         captures_req_hdr: Some(&s.log.req_captures),
         captures_res_hdr: Some(&s.log.res_captures),
         unique_id: s.log.unique_id.as_deref(),
+        last_rule: last_rule_at(s.log.last_rule),
         ..Default::default()
     }
 }
@@ -3147,8 +3177,16 @@ fn eval_tcp_req_content_rules(
         fc_dst: sess.fc_dst,
         proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
         req_body: if has_content { Some(req_bytes) } else { None },
+        // In HTTP mode the request is parsed by the time these rules run, and `path`,
+        // `hdr()` and the like read it, as they do in `HAProxy`. Built from the fields: the
+        // rules change `sess_vars` while this borrows.
+        htx_slice: sess.has_htx.then(|| ibex_proto::htx::HtxSliceRef::new(sess.htx_buf.raw_slice(), sess.htx_blocks)),
+        req_uri: sess.req_uri.as_deref(),
+        req_method: sess.req_method.as_deref(),
+        req_headers: sess.req_headers.as_deref(),
         act_conn: proxy.stats[worker_id()].act_conn.load(Ordering::Relaxed),
         unique_id: sess.log.unique_id.as_deref(),
+        last_rule: last_rule_at(sess.log.last_rule),
         captures_req_hdr: Some(&sess.log.req_captures),
         captures_res_hdr: Some(&sess.log.res_captures),
         ..Default::default()
@@ -3190,12 +3228,15 @@ fn eval_tcp_req_content_rules(
         }
         match &rule.action {
             ibex_config::TcpReqContentAction::SilentDrop => {
+                note_last_rule(sess, rule.line);
                 return ContentEvalResult::SilentDrop;
             }
             ibex_config::TcpReqContentAction::Reject => {
+                note_last_rule(sess, rule.line);
                 return ContentEvalResult::Reject;
             }
             ibex_config::TcpReqContentAction::Accept => {
+                note_last_rule(sess, rule.line);
                 return ContentEvalResult::Done;
             }
             ibex_config::TcpReqContentAction::TrackSc0 { table, expr } => {
@@ -3457,6 +3498,9 @@ fn eval_tcp_res_content_rules(proxy: &Proxy, proxies: &[Proxy], registry: &Regis
             let res = crate::proxy::combine_condition(cond, |term| {
                 let parsed = if proxy.acls.contains_key(&term.name) { None } else { Expr::parse(&term.name).ok() };
                 let Some(expr) = proxy.acls.get(&term.name).or(parsed.as_ref()) else { return crate::proxy::AclEvalResult::NotMatched };
+                if expr.fetch_name == "wait_end" && !final_ {
+                    return crate::proxy::AclEvalResult::MissingData;
+                }
                 let matched = expr.eval(registry, &ctx);
                 if !matched && !final_ && res_sample_may_change(expr, rep_bytes) {
                     crate::proxy::AclEvalResult::MissingData
@@ -3473,9 +3517,18 @@ fn eval_tcp_res_content_rules(proxy: &Proxy, proxies: &[Proxy], registry: &Regis
             }
         }
         match &rule.action {
-            ibex_config::TcpResAction::Accept => return ContentEvalResult::Done,
-            ibex_config::TcpResAction::Reject => return ContentEvalResult::Reject,
-            ibex_config::TcpResAction::SilentDrop => return ContentEvalResult::SilentDrop,
+            ibex_config::TcpResAction::Accept => {
+                note_last_rule(sess, rule.line);
+                return ContentEvalResult::Done;
+            }
+            ibex_config::TcpResAction::Reject => {
+                note_last_rule(sess, rule.line);
+                return ContentEvalResult::Reject;
+            }
+            ibex_config::TcpResAction::SilentDrop => {
+                note_last_rule(sess, rule.line);
+                return ContentEvalResult::SilentDrop;
+            }
             ibex_config::TcpResAction::SetVar { var_name, expr } => {
                 set_var_from_expr(&mut sess.sess_vars, &mut sess.req_vars, var_name, expr, &ctx, registry);
             }
@@ -5416,6 +5469,7 @@ impl EngineDispatcher<'_> {
             res_version: Some(&proto_version),
             res_body: has_wait.then_some(res_body.as_slice()),
             unique_id: entry.sess.log.unique_id.as_deref(),
+            last_rule: last_rule_at(entry.sess.log.last_rule),
             captures_req_hdr: Some(&entry.sess.log.req_captures),
             captures_res_hdr: Some(&res_caps_in),
             ..Default::default()
@@ -5444,8 +5498,12 @@ impl EngineDispatcher<'_> {
                     continue;
                 }
                 match &rule.action {
-                    ibex_config::TcpResAction::Accept => break,
+                    ibex_config::TcpResAction::Accept => {
+                        entry.sess.log.last_rule = Some(rule.line);
+                        break;
+                    }
                     ibex_config::TcpResAction::Reject | ibex_config::TcpResAction::SilentDrop => {
+                        entry.sess.log.last_rule = Some(rule.line);
                         rejected = true;
                         break 'rules None;
                     }
@@ -5469,12 +5527,13 @@ impl EngineDispatcher<'_> {
             // `http-response capture` writes the frontend's slots, whichever proxy the rule is in.
             let fe_res_slots = &proxies[fe_idx].res_capture_slots;
             let mut stopped = None;
+            LAST_RULE.set(None);
             for (list, &px) in order.iter().enumerate() {
                 if resume.is_some_and(|w| list < w.list) {
                     continue;
                 }
                 let start = resume.filter(|w| w.list == list).map_or(0, |w| w.rule);
-                let rules = proxies[px].http_res_rules.iter().map(|r| (ResOp::of_res(&r.action), r.cond.as_ref()));
+                let rules = proxies[px].http_res_rules.iter().map(|r| (ResOp::of_res(&r.action), r.cond.as_ref(), r.line));
                 let caps = (!fe_res_slots.is_empty()).then_some((&mut res_caps, &fe_res_slots[..]));
                 let mut check = |rule: usize, time_ms: u32, at_least: u32| -> BodyWait {
                     let now = fresh_tick(now);
@@ -5523,6 +5582,9 @@ impl EngineDispatcher<'_> {
                     Ok(Some(_)) => break,
                     Ok(None) => {}
                 }
+            }
+            if let Some(line) = LAST_RULE.take() {
+                entry.sess.log.last_rule = Some(line);
             }
             // What the rules captured is what the log line shows, and what the rules after
             // them (`http-after-response`) read.
@@ -5604,6 +5666,10 @@ impl EngineDispatcher<'_> {
             match stop {
                 ResStop::Page(st) => reply_error(entry, proxies, st),
                 ResStop::Empty(st) => reply_empty(entry, proxies, st),
+                ResStop::Reply(raw) => {
+                    let be_idx = if entry.backend_idx < proxies.len() { entry.backend_idx } else { entry.proxy_idx };
+                    send_proxy_reply(&mut entry.sess, proxies, entry.proxy_idx, be_idx, &raw);
+                }
             }
             return;
         }
@@ -6130,6 +6196,7 @@ impl EngineDispatcher<'_> {
                         be_name,
                         captures_req_hdr: Some(&$s.log.req_captures),
                         unique_id: $s.log.unique_id.as_deref(),
+                        last_rule: last_rule_at($s.log.last_rule),
                         be_max_retries: Some(be_retries),
                         cur_max_retries: Some($s.max_retries),
                         act_conn,
@@ -6146,6 +6213,16 @@ impl EngineDispatcher<'_> {
                 };
                 if !matches {
                     continue;
+                }
+                if matches!(
+                    rule.action,
+                    ibex_config::HttpReqAction::Return { .. }
+                        | ibex_config::HttpReqAction::Deny { .. }
+                        | ibex_config::HttpReqAction::Allow
+                        | ibex_config::HttpReqAction::Auth
+                        | ibex_config::HttpReqAction::Redirect { .. }
+                ) {
+                    note_last_rule(sess, rule.line);
                 }
 
                 match &rule.action {
@@ -7944,7 +8021,10 @@ const fn status_reason(status: u16) -> &'static str {
         204 => "No Content",
         301 => "Moved Permanently",
         302 => "Found",
+        303 => "See Other",
         304 => "Not Modified",
+        307 => "Temporary Redirect",
+        308 => "Permanent Redirect",
         400 => "Bad Request",
         401 => "Unauthorized",
         403 => "Forbidden",
@@ -7991,10 +8071,12 @@ const BUILTIN_ERROR_PAGES: &[(u16, &str)] = &[
 /// `Page` is the proxy's page for the status (`deny`, `deny deny_status <code>`, a rewrite
 /// that fails in strict mode), `Empty` the status line and `content-length: 0` alone
 /// (`deny status <code>`, an `http_reply` with no body, `src/http_htx.c`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum ResStop {
     Page(u16),
     Empty(u16),
+    /// A whole reply the rule made (`http-response redirect`).
+    Reply(Vec<u8>),
 }
 
 /// One `http-response` or `http-after-response` action, whichever list it comes from.
@@ -8006,6 +8088,8 @@ enum ResOp<'a> {
     Add(&'a str, &'a str),
     Del(&'a str),
     Status(u16),
+    /// `http-response redirect location <fmt> code <c> [cookie]`.
+    Redirect(&'a str, u16, Option<&'a ibex_config::RedirectCookie>),
 }
 
 /// The `wait-for-body` of a response rule list: the rule the pass starts at, and the check a
@@ -8032,6 +8116,7 @@ impl<'a> ResOp<'a> {
             ibex_config::HttpResAction::AddHeader { name, fmt } => Self::Add(name, fmt),
             ibex_config::HttpResAction::DelHeader { name } => Self::Del(name),
             ibex_config::HttpResAction::SetStatus { status } => Self::Status(*status),
+            ibex_config::HttpResAction::Redirect { location, code, cookie } => Self::Redirect(location, *code, cookie.as_ref()),
             ibex_config::HttpResAction::Capture { expr, id } => return ResRule::Capture(expr, *id),
             ibex_config::HttpResAction::WaitForBody { time_ms, at_least } => return ResRule::Wait(*time_ms, *at_least),
         })
@@ -8183,6 +8268,21 @@ fn res_action(
     let failed = || if STRICT_MODE.get() { Err(ResStop::Page(500)) } else { Ok(true) };
     let publish = |hdrs: &Vec<(String, String)>| CURRENT_RES_HEADERS.with(|h| h.borrow_mut().clone_from(hdrs));
     let (act_name, act_fmt) = match op {
+        ResOp::Redirect(location, code, cookie) => {
+            // `http_apply_redirect_rule` (src/http_ana.c) for a `location` redirect: the
+            // answer to the client is the redirect, and the server's response is dropped.
+            let mut reply = format!("HTTP/1.1 {code} {}\r\ncontent-length: 0\r\nlocation: {}\r\n", status_reason(code), format_sample_string(location, ctx, registry));
+            if matches!(code, 302 | 303 | 307) {
+                reply.push_str("cache-control: no-cache\r\n");
+            }
+            match cookie {
+                Some(ibex_config::RedirectCookie::Set(c)) => reply.push_str(&format!("set-cookie: {c}; path=/;\r\n")),
+                Some(ibex_config::RedirectCookie::Clear(n)) => reply.push_str(&format!("set-cookie: {n}; path=/; Max-Age=0;\r\n")),
+                None => {}
+            }
+            reply.push_str("\r\n");
+            return Err(ResStop::Reply(reply.into_bytes()));
+        }
         ResOp::Status(st) => {
             let reason = status_reason(st);
             if !res_htx_resize(status_msg.len(), reason.len()) {
@@ -8300,7 +8400,7 @@ fn res_action(
 /// caller, once the list is done) read what it wrote.
 #[allow(clippy::too_many_arguments)]
 fn run_res_rules<'a>(
-    rules: impl Iterator<Item = (ResRule<'a>, Option<&'a ibex_config::AclCondition>)>,
+    rules: impl Iterator<Item = (ResRule<'a>, Option<&'a ibex_config::AclCondition>, u32)>,
     acls: &HashMap<String, Expr>,
     head: (&mut Vec<(String, String)>, &mut u16, &mut String),
     ctx: &SampleContext,
@@ -8314,7 +8414,7 @@ fn run_res_rules<'a>(
     STRICT_MODE.set(true);
     let mut result = Ok(None);
     let start = wait.as_ref().map_or(0, |w| w.start);
-    for (idx, (op, cond)) in rules.enumerate().skip(start) {
+    for (idx, (op, cond, line)) in rules.enumerate().skip(start) {
         // The slots as the earlier rules left them, for `capture.res.hdr`.
         let with_caps;
         let ctx = match &caps {
@@ -8355,6 +8455,10 @@ fn run_res_rules<'a>(
                 break;
             }
         };
+        // `allow`, `deny` and `redirect` end the rules: they are the last rule (`LAST_RULE`).
+        if line != 0 && matches!(op, ResOp::Redirect(..) | ResOp::Set("\0allow" | "\0deny", _)) {
+            LAST_RULE.set(Some(line));
+        }
         match res_action(op, hdrs, status, status_msg, ctx, registry, sess_vars, req_vars) {
             Ok(true) => {}
             Ok(false) => break,
@@ -8390,7 +8494,7 @@ fn eval_after_res_rules(
     CURRENT_VARS.with(|v| v.borrow_mut().retain(|k, _| !k.starts_with("req.")));
     let order: &[usize] = if fe_idx == be_idx { &[be_idx] } else { &[be_idx, fe_idx] };
     for &px in order {
-        let rules = proxies[px].http_after_res_rules.iter().map(|r| (ResOp::of_after_res(&r.action), r.cond.as_ref()));
+        let rules = proxies[px].http_after_res_rules.iter().map(|r| (ResOp::of_after_res(&r.action), r.cond.as_ref(), 0));
         // `http-after-response capture` writes the frontend's slots, whichever proxy the rule is in.
         let fe_slots = &proxies[fe_idx].res_capture_slots;
         let caps = res_caps.as_deref_mut().filter(|_| !fe_slots.is_empty()).map(|c| (c, &fe_slots[..]));

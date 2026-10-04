@@ -219,7 +219,7 @@ pub(crate) fn parse_tcp_content_var(
         } else {
             TcpReqContentAction::SetVar { var_name, expr }
         };
-        Ok(Some(TcpReqContentRule { action, cond }))
+        Ok(Some(TcpReqContentRule { action, cond, line: 0 }))
     } else if act_str.starts_with("unset-var(") {
         let var_name = act_str
             .trim_start_matches("unset-var(")
@@ -229,6 +229,7 @@ pub(crate) fn parse_tcp_content_var(
         Ok(Some(TcpReqContentRule {
             action: TcpReqContentAction::UnsetVar { var_name },
             cond,
+            line: 0,
         }))
     } else {
         Ok(None)
@@ -253,6 +254,7 @@ pub(crate) fn parse_tcp_content_switch_mode(
     Ok(TcpReqContentRule {
         action: TcpReqContentAction::SwitchModeHttp { proto },
         cond,
+        line: 0,
     })
 }
 
@@ -260,7 +262,22 @@ pub(crate) fn parse_tcp_content_switch_mode(
 /// the response side runs (`eval_tcp_res_content_rules` in ibex-rt). `HAProxy` takes a
 /// few more there, refused here until they run; the rest it refuses itself
 /// (`tcp_parse_tcp_rep`, `src/tcp_rules.c`).
+/// Parses one rule and gives what it pushed the line it was written on.
 pub(crate) fn parse_tcp_res_content(
+    rules: &mut Vec<TcpResContentRule>,
+    tokens: &[Token],
+    kw: &Token,
+) -> Result<(), ConfigError> {
+    let before = rules.len();
+    let res = parse_tcp_res_content_at(rules, tokens, kw);
+    let line = u32::try_from(kw.line).unwrap_or(u32::MAX);
+    for r in rules.iter_mut().skip(before) {
+        r.line = line;
+    }
+    res
+}
+
+fn parse_tcp_res_content_at(
     rules: &mut Vec<TcpResContentRule>,
     tokens: &[Token],
     kw: &Token,
@@ -278,7 +295,7 @@ pub(crate) fn parse_tcp_res_content(
     }
     let mut parsed = Vec::new();
     parse_tcp_req_content(&mut parsed, tokens, kw)?;
-    for TcpReqContentRule { action, cond } in parsed {
+    for TcpReqContentRule { action, cond, line } in parsed {
         let action = match action {
             TcpReqContentAction::Accept => TcpResAction::Accept,
             TcpReqContentAction::Reject => TcpResAction::Reject,
@@ -297,13 +314,28 @@ pub(crate) fn parse_tcp_res_content(
                 ))
             }
         };
-        rules.push(TcpResContentRule { action, cond });
+        rules.push(TcpResContentRule { action, cond, line });
     }
     Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
+/// Parses one rule and gives what it pushed the line it was written on.
 pub(crate) fn parse_tcp_req_content(
+    rules: &mut Vec<TcpReqContentRule>,
+    tokens: &[Token],
+    kw: &Token,
+) -> Result<(), ConfigError> {
+    let before = rules.len();
+    let res = parse_tcp_req_content_at(rules, tokens, kw);
+    let line = u32::try_from(kw.line).unwrap_or(u32::MAX);
+    for r in rules.iter_mut().skip(before) {
+        r.line = line;
+    }
+    res
+}
+
+fn parse_tcp_req_content_at(
     rules: &mut Vec<TcpReqContentRule>,
     tokens: &[Token],
     kw: &Token,
@@ -321,10 +353,10 @@ pub(crate) fn parse_tcp_req_content(
         rules.push(rule);
     } else if let Some(sc) = parse_sc_counter_action(act_str, "sc-inc-gpc0", act_tok)? {
         let (_, cond) = parse_rule_condition(tokens, 3)?;
-        rules.push(TcpReqContentRule { action: TcpReqContentAction::ScIncGpc0 { sc }, cond });
+        rules.push(TcpReqContentRule { action: TcpReqContentAction::ScIncGpc0 { sc }, cond, line: 0 });
     } else if let Some(sc) = parse_sc_counter_action(act_str, "sc-inc-gpc1", act_tok)? {
         let (_, cond) = parse_rule_condition(tokens, 3)?;
-        rules.push(TcpReqContentRule { action: TcpReqContentAction::ScIncGpc1 { sc }, cond });
+        rules.push(TcpReqContentRule { action: TcpReqContentAction::ScIncGpc1 { sc }, cond, line: 0 });
     } else if let Some(sc) = parse_sc_counter_action(act_str, "sc-set-gpt0", act_tok)? {
         let (cond_idx, cond) = parse_rule_condition(tokens, 4)?;
         let expr = join_tokens_until(tokens, 3, cond_idx);
@@ -335,7 +367,7 @@ pub(crate) fn parse_tcp_req_content(
                 "<tcp-request content sc-set-gpt0> expects value or expression",
             ));
         }
-        rules.push(TcpReqContentRule { action: TcpReqContentAction::ScSetGpt0 { sc, expr }, cond });
+        rules.push(TcpReqContentRule { action: TcpReqContentAction::ScSetGpt0 { sc, expr }, cond, line: 0 });
     } else if act_str.starts_with("lua.") {
         return Err(ConfigError::new(
             act_tok.line,
@@ -355,29 +387,29 @@ pub(crate) fn parse_tcp_req_content(
                     "track-sc2" => TcpReqContentAction::TrackSc2 { expr, table },
                     _ => TcpReqContentAction::TrackSc0 { expr, table },
                 };
-                rules.push(TcpReqContentRule { action, cond });
+                rules.push(TcpReqContentRule { action, cond, line: 0 });
             }
             "silent-drop" => {
                 let (_, cond) = parse_rule_condition(tokens, 3)?;
-                rules.push(TcpReqContentRule { action: TcpReqContentAction::SilentDrop, cond });
+                rules.push(TcpReqContentRule { action: TcpReqContentAction::SilentDrop, cond, line: 0 });
             }
             "reject" => {
                 let (_, cond) = parse_rule_condition(tokens, 3)?;
-                rules.push(TcpReqContentRule { action: TcpReqContentAction::Reject, cond });
+                rules.push(TcpReqContentRule { action: TcpReqContentAction::Reject, cond, line: 0 });
             }
             "accept" => {
                 let (_, cond) = parse_rule_condition(tokens, 3)?;
-                rules.push(TcpReqContentRule { action: TcpReqContentAction::Accept, cond });
+                rules.push(TcpReqContentRule { action: TcpReqContentAction::Accept, cond, line: 0 });
             }
             "set-src" => {
                 let (cond_idx, cond) = parse_rule_condition(tokens, 3)?;
                 let expr = join_tokens_until(tokens, 3, cond_idx);
-                rules.push(TcpReqContentRule { action: TcpReqContentAction::SetSrc { expr }, cond });
+                rules.push(TcpReqContentRule { action: TcpReqContentAction::SetSrc { expr }, cond, line: 0 });
             }
             "set-dst" => {
                 let (cond_idx, cond) = parse_rule_condition(tokens, 3)?;
                 let expr = join_tokens_until(tokens, 3, cond_idx);
-                rules.push(TcpReqContentRule { action: TcpReqContentAction::SetDst { expr }, cond });
+                rules.push(TcpReqContentRule { action: TcpReqContentAction::SetDst { expr }, cond, line: 0 });
             }
             "switch-mode" => {
                 rules.push(parse_tcp_content_switch_mode(tokens)?);

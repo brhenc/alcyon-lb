@@ -5,7 +5,7 @@ use super::{
     find_cond_idx, join_tokens_until, parse_acl_condition_from_tokens, parse_error_body_args,
     parse_rule_condition, parse_sc_counter_action, parse_u16, ConfigError, ErrorPageSource,
     AclCondition, HttpAfterResAction, HttpAfterResRule, HttpReqAction, HttpReqRule, HttpResAction,
-    HttpResRule, RetriesValue, Token,
+    HttpResRule, RedirectCookie, RetriesValue, Token,
 };
 
 /// The single sample expression at `tokens[2]` and the optional condition after it, as
@@ -179,7 +179,22 @@ fn parse_wait_for_body(
 }
 
 #[allow(clippy::too_many_lines)]
+/// Parses one rule and gives what it pushed the line it was written on.
 pub(crate) fn parse_http_req_rule(
+    rules: &mut Vec<HttpReqRule>,
+    tokens: &[Token],
+    kw: &Token,
+) -> Result<(), ConfigError> {
+    let before = rules.len();
+    let res = parse_http_req_rule_at(rules, tokens, kw);
+    let line = u32::try_from(kw.line).unwrap_or(u32::MAX);
+    for r in rules.iter_mut().skip(before) {
+        r.line = line;
+    }
+    res
+}
+
+fn parse_http_req_rule_at(
     rules: &mut Vec<HttpReqRule>,
     tokens: &[Token],
     kw: &Token,
@@ -228,13 +243,13 @@ pub(crate) fn parse_http_req_rule(
             "track-sc2" => HttpReqAction::TrackSc2 { expr, table },
             _ => HttpReqAction::TrackSc0 { expr, table },
         };
-        rules.push(HttpReqRule { action, cond });
+        rules.push(HttpReqRule { action, cond, line: 0 });
     } else if let Some(sc) = parse_sc_counter_action(act_str, "sc-inc-gpc0", act_token)? {
         let (_, cond) = parse_rule_condition(tokens, 2)?;
-        rules.push(HttpReqRule { action: HttpReqAction::ScIncGpc0 { sc }, cond });
+        rules.push(HttpReqRule { action: HttpReqAction::ScIncGpc0 { sc }, cond, line: 0 });
     } else if let Some(sc) = parse_sc_counter_action(act_str, "sc-inc-gpc1", act_token)? {
         let (_, cond) = parse_rule_condition(tokens, 2)?;
-        rules.push(HttpReqRule { action: HttpReqAction::ScIncGpc1 { sc }, cond });
+        rules.push(HttpReqRule { action: HttpReqAction::ScIncGpc1 { sc }, cond, line: 0 });
     } else if let Some(sc) = parse_sc_counter_action(act_str, "sc-set-gpt0", act_token)? {
         let (cond_idx, cond) = parse_rule_condition(tokens, 3)?;
         let expr = join_tokens_until(tokens, 2, cond_idx);
@@ -245,7 +260,7 @@ pub(crate) fn parse_http_req_rule(
                 "<http-request sc-set-gpt0> expects value or expression",
             ));
         }
-        rules.push(HttpReqRule { action: HttpReqAction::ScSetGpt0 { sc, expr }, cond });
+        rules.push(HttpReqRule { action: HttpReqAction::ScSetGpt0 { sc, expr }, cond, line: 0 });
     } else if act_str == "return" {
         let cond_idx = find_cond_idx(tokens, 2);
         let limit = cond_idx.unwrap_or(tokens.len());
@@ -276,6 +291,7 @@ pub(crate) fn parse_http_req_rule(
                 error_page,
             },
             cond,
+            line: 0,
         });
     } else if act_str == "deny" {
         let cond_idx = find_cond_idx(tokens, 2);
@@ -314,6 +330,7 @@ pub(crate) fn parse_http_req_rule(
                 error_page,
             },
             cond,
+            line: 0,
         });
     } else if act_str == "allow" {
         let cond_idx = find_cond_idx(tokens, 2);
@@ -325,6 +342,7 @@ pub(crate) fn parse_http_req_rule(
         rules.push(HttpReqRule {
             action: HttpReqAction::Allow,
             cond,
+            line: 0,
         });
     } else if act_str == "set-header" || act_str == "add-header" {
         if tokens.len() < 4 {
@@ -347,7 +365,7 @@ pub(crate) fn parse_http_req_rule(
         } else {
             HttpReqAction::AddHeader { name, fmt }
         };
-        rules.push(HttpReqRule { action, cond });
+        rules.push(HttpReqRule { action, cond, line: 0 });
     } else if act_str == "del-header" {
         if tokens.len() < 3 {
             return Err(ConfigError::new(
@@ -382,6 +400,7 @@ pub(crate) fn parse_http_req_rule(
         rules.push(HttpReqRule {
             action: HttpReqAction::DelHeader { name: encoded_name },
             cond,
+            line: 0,
         });
     } else if act_str == "replace-header" {
         if tokens.len() < 5 {
@@ -403,6 +422,7 @@ pub(crate) fn parse_http_req_rule(
         rules.push(HttpReqRule {
             action: HttpReqAction::ReplaceHeader { name, regex, repl },
             cond,
+            line: 0,
         });
     } else if act_str == "replace-value" {
         if tokens.len() < 5 {
@@ -424,6 +444,7 @@ pub(crate) fn parse_http_req_rule(
         rules.push(HttpReqRule {
             action: HttpReqAction::ReplaceValue { name, regex, repl },
             cond,
+            line: 0,
         });
     } else if act_str == "set-path" {
         if tokens.len() < 3 {
@@ -443,6 +464,7 @@ pub(crate) fn parse_http_req_rule(
         rules.push(HttpReqRule {
             action: HttpReqAction::SetPath { fmt },
             cond,
+            line: 0,
         });
     } else if act_str == "replace-path" {
         if tokens.len() < 4 {
@@ -463,6 +485,7 @@ pub(crate) fn parse_http_req_rule(
         rules.push(HttpReqRule {
             action: HttpReqAction::ReplacePath { regex, repl },
             cond,
+            line: 0,
         });
     } else if act_str == "set-pathq" {
         if tokens.len() < 3 {
@@ -482,6 +505,7 @@ pub(crate) fn parse_http_req_rule(
         rules.push(HttpReqRule {
             action: HttpReqAction::SetPathq { fmt },
             cond,
+            line: 0,
         });
     } else if act_str == "replace-pathq" {
         if tokens.len() < 4 {
@@ -502,6 +526,7 @@ pub(crate) fn parse_http_req_rule(
         rules.push(HttpReqRule {
             action: HttpReqAction::ReplacePathq { regex, repl },
             cond,
+            line: 0,
         });
     } else if act_str == "set-query" {
         if tokens.len() < 3 {
@@ -521,6 +546,7 @@ pub(crate) fn parse_http_req_rule(
         rules.push(HttpReqRule {
             action: HttpReqAction::SetQuery { fmt },
             cond,
+            line: 0,
         });
     } else if act_str == "set-uri" {
         if tokens.len() < 3 {
@@ -540,6 +566,7 @@ pub(crate) fn parse_http_req_rule(
         rules.push(HttpReqRule {
             action: HttpReqAction::SetUri { fmt },
             cond,
+            line: 0,
         });
     } else if act_str == "set-method" {
         if tokens.len() < 3 {
@@ -559,6 +586,7 @@ pub(crate) fn parse_http_req_rule(
         rules.push(HttpReqRule {
             action: HttpReqAction::SetMethod { fmt },
             cond,
+            line: 0,
         });
     } else if act_str == "set-src" {
         let cond_idx = find_cond_idx(tokens, 2);
@@ -572,6 +600,7 @@ pub(crate) fn parse_http_req_rule(
         rules.push(HttpReqRule {
             action: HttpReqAction::SetSrc { expr },
             cond,
+            line: 0,
         });
     } else if act_str == "set-dst" {
         let cond_idx = find_cond_idx(tokens, 2);
@@ -585,12 +614,14 @@ pub(crate) fn parse_http_req_rule(
         rules.push(HttpReqRule {
             action: HttpReqAction::SetDst { expr },
             cond,
+            line: 0,
         });
     } else if act_str == "set-dst-port" {
         let (expr, cond) = parse_one_expr_and_cond(tokens, act_token)?;
         rules.push(HttpReqRule {
             action: HttpReqAction::SetDstPort { expr },
             cond,
+            line: 0,
         });
     } else if act_str == "set-retries" {
         // `stream_parse_set_retries` (src/stream.c): an integer as `strtol(.., 0)` reads
@@ -619,6 +650,7 @@ pub(crate) fn parse_http_req_rule(
         rules.push(HttpReqRule {
             action: HttpReqAction::SetRetries { value },
             cond,
+            line: 0,
         });
     } else if act_str == "redirect" {
         let mut location = None;
@@ -664,6 +696,7 @@ pub(crate) fn parse_http_req_rule(
                 code,
             },
             cond,
+            line: 0,
         });
     } else if act_str == "strict-mode" {
         let on = tokens.get(2).is_none_or(|t| t.text == "on");
@@ -676,6 +709,7 @@ pub(crate) fn parse_http_req_rule(
         rules.push(HttpReqRule {
             action: HttpReqAction::StrictMode { on },
             cond,
+            line: 0,
         });
     } else if act_str.starts_with("set-var(") || act_str.starts_with("set-var-fmt(") {
         let is_fmt = act_str.starts_with("set-var-fmt(");
@@ -701,7 +735,7 @@ pub(crate) fn parse_http_req_rule(
         } else {
             HttpReqAction::SetVar { var_name, expr }
         };
-        rules.push(HttpReqRule { action, cond });
+        rules.push(HttpReqRule { action, cond, line: 0 });
     } else if act_str.starts_with("unset-var(") {
         let var_name = act_token
             .text
@@ -717,6 +751,7 @@ pub(crate) fn parse_http_req_rule(
         rules.push(HttpReqRule {
             action: HttpReqAction::UnsetVar { var_name },
             cond,
+            line: 0,
         });
     } else if act_str == "normalize-uri" {
         if tokens.len() < 3 {
@@ -750,6 +785,7 @@ pub(crate) fn parse_http_req_rule(
                 strict,
             },
             cond,
+            line: 0,
         });
     } else if act_str == "set-timeout" {
         if tokens.len() < 4 {
@@ -774,6 +810,7 @@ pub(crate) fn parse_http_req_rule(
                 timeout_val,
             },
             cond,
+            line: 0,
         });
     } else if act_str == "auth" {
         let cond_idx = find_cond_idx(tokens, 2);
@@ -785,6 +822,7 @@ pub(crate) fn parse_http_req_rule(
         rules.push(HttpReqRule {
             action: HttpReqAction::Auth,
             cond,
+            line: 0,
         });
     } else if act_str == "capture" {
         // `parse_http_req_capture`: `capture <sample> [ len <n> | id <idx> ]`, then nothing but
@@ -830,10 +868,11 @@ pub(crate) fn parse_http_req_rule(
         rules.push(HttpReqRule {
             action: HttpReqAction::Capture { expr: tokens[2].text.clone(), len, id },
             cond,
+            line: 0,
         });
     } else if act_str == "wait-for-body" {
         let (time, at_least, cond) = parse_wait_for_body(tokens, "http-request", act_token)?;
-        rules.push(HttpReqRule { action: HttpReqAction::WaitForBody { time_ms: Some(time), at_least }, cond });
+        rules.push(HttpReqRule { action: HttpReqAction::WaitForBody { time_ms: Some(time), at_least }, cond, line: 0 });
     } else {
         return Err(ConfigError::new(
             act_token.line,
@@ -845,7 +884,22 @@ pub(crate) fn parse_http_req_rule(
 }
 
 #[allow(clippy::too_many_lines)]
+/// Parses one rule and gives what it pushed the line it was written on.
 pub(crate) fn parse_http_res_rule(
+    rules: &mut Vec<HttpResRule>,
+    tokens: &[Token],
+    kw: &Token,
+) -> Result<(), ConfigError> {
+    let before = rules.len();
+    let res = parse_http_res_rule_at(rules, tokens, kw);
+    let line = u32::try_from(kw.line).unwrap_or(u32::MAX);
+    for r in rules.iter_mut().skip(before) {
+        r.line = line;
+    }
+    res
+}
+
+fn parse_http_res_rule_at(
     rules: &mut Vec<HttpResRule>,
     tokens: &[Token],
     kw: &Token,
@@ -881,7 +935,7 @@ pub(crate) fn parse_http_res_rule(
         } else {
             HttpResAction::AddHeader { name, fmt }
         };
-        rules.push(HttpResRule { action, cond });
+        rules.push(HttpResRule { action, cond, line: 0 });
     } else if act_str == "del-header" {
         if tokens.len() < 3 {
             return Err(ConfigError::new(
@@ -916,6 +970,7 @@ pub(crate) fn parse_http_res_rule(
         rules.push(HttpResRule {
             action: HttpResAction::DelHeader { name: encoded_name },
             cond,
+            line: 0,
         });
     } else if act_str == "set-status" {
         if tokens.len() < 3 {
@@ -935,10 +990,11 @@ pub(crate) fn parse_http_res_rule(
         rules.push(HttpResRule {
             action: HttpResAction::SetStatus { status },
             cond,
+            line: 0,
         });
     } else if act_str == "capture" {
         let (expr, id, cond) = parse_res_capture(tokens, act_token, "http-response")?;
-        rules.push(HttpResRule { action: HttpResAction::Capture { expr, id }, cond });
+        rules.push(HttpResRule { action: HttpResAction::Capture { expr, id }, cond, line: 0 });
     } else if act_str == "replace-header" {
         if tokens.len() < 5 {
             return Err(ConfigError::new(
@@ -965,6 +1021,7 @@ pub(crate) fn parse_http_res_rule(
                 fmt: format!("{regex}\t{repl}"),
             },
             cond,
+            line: 0,
         });
     } else if act_str == "replace-value" {
         if tokens.len() < 5 {
@@ -992,6 +1049,7 @@ pub(crate) fn parse_http_res_rule(
                 fmt: format!("{regex}\t{repl}"),
             },
             cond,
+            line: 0,
         });
     } else if act_str.starts_with("set-var(") || act_str.starts_with("set-var-fmt(") {
         // `set-var-fmt` takes a log-format string, `set-var` a sample expression; they are
@@ -1011,6 +1069,7 @@ pub(crate) fn parse_http_res_rule(
                 fmt: expr,
             },
             cond,
+            line: 0,
         });
     } else if act_str.starts_with("unset-var(") {
         let var_name = act_token
@@ -1029,6 +1088,7 @@ pub(crate) fn parse_http_res_rule(
                 name: format!("\0unset-var:{var_name}"),
             },
             cond,
+            line: 0,
         });
     } else if act_str == "strict-mode" {
         let on = tokens.get(2).is_none_or(|t| t.text == "on");
@@ -1044,6 +1104,7 @@ pub(crate) fn parse_http_res_rule(
                 fmt: if on { "on".into() } else { "off".into() },
             },
             cond,
+            line: 0,
         });
     } else if act_str == "allow" {
         let cond_idx = find_cond_idx(tokens, 2);
@@ -1058,6 +1119,7 @@ pub(crate) fn parse_http_res_rule(
                 fmt: String::new(),
             },
             cond,
+            line: 0,
         });
     } else if act_str == "deny" {
         // `parse_http_deny` (`src/http_act.c`): with nothing, or only `deny_status <code>`,
@@ -1114,10 +1176,14 @@ pub(crate) fn parse_http_res_rule(
                 fmt,
             },
             cond,
+            line: 0,
         });
+    } else if act_str == "redirect" {
+        let (action, cond) = parse_res_redirect(tokens)?;
+        rules.push(HttpResRule { action, cond, line: 0 });
     } else if act_str == "wait-for-body" {
         let (time_ms, at_least, cond) = parse_wait_for_body(tokens, "http-response", act_token)?;
-        rules.push(HttpResRule { action: HttpResAction::WaitForBody { time_ms, at_least }, cond });
+        rules.push(HttpResRule { action: HttpResAction::WaitForBody { time_ms, at_least }, cond, line: 0 });
     } else {
         return Err(ConfigError::new(
             act_token.line,
@@ -1126,6 +1192,89 @@ pub(crate) fn parse_http_res_rule(
         ));
     }
     Ok(())
+}
+
+/// `http-response redirect location <fmt> [code <c>] [set-cookie <c> | clear-cookie <n>]
+/// [drop-query | keep-query | append-slash] [if|unless <cond>]` (`http_parse_redirect_rule`,
+/// `src/http_act.c`). A response only takes the `location` type; the options that shape a
+/// `prefix` or `scheme` redirect do nothing to a location, so they are accepted and not
+/// kept. `set-cookie-fmt` and `ignore-empty` are not done by Ibex, and are refused.
+fn parse_res_redirect(tokens: &[Token]) -> Result<(HttpResAction, Option<AclCondition>), ConfigError> {
+    #[derive(PartialEq)]
+    enum Kind {
+        Location,
+        Other,
+    }
+    let cond_idx = find_cond_idx(tokens, 2);
+    let limit = cond_idx.unwrap_or(tokens.len());
+    let (mut kind, mut location, mut code, mut cookie) = (None, String::new(), 302, None);
+    let mut i = 2;
+    while i < limit {
+        let t = &tokens[i];
+        let word = t.text.as_str();
+        let arg = |word: &str| {
+            tokens
+                .get(i + 1)
+                .filter(|_| i + 1 < limit)
+                .ok_or_else(|| ConfigError::new(t.line, t.col, format!("missing argument for '{word}'.")))
+        };
+        match word {
+            "location" => {
+                location.clone_from(&arg(word)?.text);
+                kind = Some(Kind::Location);
+                i += 2;
+            }
+            "prefix" | "scheme" => {
+                arg(word)?;
+                kind = Some(Kind::Other);
+                i += 2;
+            }
+            "code" => {
+                let a = arg(word)?;
+                code = match a.text.parse::<u16>() {
+                    Ok(c @ (301 | 302 | 303 | 307 | 308)) => c,
+                    _ => {
+                        return Err(ConfigError::new(
+                            a.line,
+                            a.col,
+                            format!("'code': unsupported HTTP code '{}' (must be one of 301, 302, 303, 307 or 308).", a.text),
+                        ))
+                    }
+                };
+                i += 2;
+            }
+            "set-cookie" => {
+                cookie = Some(RedirectCookie::Set(arg(word)?.text.clone()));
+                i += 2;
+            }
+            "clear-cookie" => {
+                cookie = Some(RedirectCookie::Clear(arg(word)?.text.clone()));
+                i += 2;
+            }
+            "set-cookie-fmt" | "ignore-empty" => {
+                return Err(ConfigError::new(t.line, t.col, format!("'http-response redirect {word}' is not implemented.")));
+            }
+            "drop-query" | "keep-query" | "append-slash" => i += 1,
+            _ => {
+                return Err(ConfigError::new(
+                    t.line,
+                    t.col,
+                    format!(
+                        "expects 'code', 'prefix', 'location', 'scheme', 'set-cookie', 'set-cookie-fmt', 'clear-cookie', 'drop-query', 'keep-query', 'ignore-empty' or 'append-slash' (was '{word}')."
+                    ),
+                ))
+            }
+        }
+    }
+    let at = tokens.get(1).unwrap_or(&tokens[0]);
+    match kind {
+        None => Err(ConfigError::new(at.line, at.col, "redirection type expected ('prefix', 'location', or 'scheme').")),
+        Some(Kind::Other) => Err(ConfigError::new(at.line, at.col, "response only supports redirect type 'location'.")),
+        Some(Kind::Location) => {
+            let cond = cond_idx.map(|idx| parse_acl_condition_from_tokens(&tokens[idx..])).transpose()?.flatten();
+            Ok((HttpResAction::Redirect { location, code, cookie }, cond))
+        }
+    }
 }
 
 #[allow(clippy::too_many_lines)]
