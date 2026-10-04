@@ -165,6 +165,8 @@ const IMPLEMENTED: &[&str] = &[
     "redis-check",
     "mysql-check",
     "ldap-check",
+    // Read by the HTTP/1 request parser (T101).
+    "accept-unsafe-violations-in-http-request",
 ];
 
 fn find(name: &str) -> Option<&'static OptSpec> {

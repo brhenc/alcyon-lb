@@ -84,6 +84,9 @@ fn len_to_sint(len: usize) -> i64 {
 /// Runtime context passed into sample fetch functions during evaluation.
 #[derive(Debug, Clone, Default)]
 pub struct SampleContext<'a> {
+    /// Evaluated for the access log, after the request buffer is gone: `method` reads
+    /// only the transaction's method enum then, so a method outside it has no value.
+    pub at_log: bool,
     pub client_addr: Option<SocketAddr>,
     pub server_addr: Option<SocketAddr>,
     pub fc_src: Option<SocketAddr>,
@@ -113,8 +116,8 @@ pub struct SampleContext<'a> {
     pub bc_rtt: Option<u32>,
     pub bc_rttvar: Option<u32>,
     /// Capture slots: `None` where nothing was captured (a header that was absent).
-    pub captures_req_hdr: Option<&'a [Option<String>]>,
-    pub captures_res_hdr: Option<&'a [Option<String>]>,
+    pub captures_req_hdr: Option<&'a [Option<Vec<u8>>]>,
+    pub captures_res_hdr: Option<&'a [Option<Vec<u8>>]>,
     /// The stream's unique ID (`unique-id-format`), for the `unique-id` fetch.
     pub unique_id: Option<&'a str>,
     pub is_first_req: bool,
@@ -695,9 +698,16 @@ impl Registry {
             out_type: SampleType::Meth,
             func: |ctx, _args| {
                 if let Some(m_str) = get_context_method(ctx) {
-                    return Some(Sample::Meth(ibex_proto::htx::HttpMethod::from_bytes(
-                        m_str.as_bytes(),
-                    )));
+                    let m = ibex_proto::htx::HttpMethod::from_bytes(m_str.as_bytes());
+                    // `smp_fetch_meth` (src/http_fetch.c): `HTTP_METH_OTHER` is read from the
+                    // request buffer, which is gone when the log line is built. HAProxy
+                    // 3.5-dev8 logs `-` for `PATCH` and any other method outside its enum.
+                    if ctx.at_log
+                        && matches!(m, ibex_proto::htx::HttpMethod::Patch | ibex_proto::htx::HttpMethod::Other(_))
+                    {
+                        return None;
+                    }
+                    return Some(Sample::Meth(m));
                 }
                 ctx.htx?
                     .req_line()
@@ -1278,7 +1288,7 @@ impl Registry {
                 let idx_str = args.first()?;
                 let idx: usize = idx_str.parse().ok()?;
                 let caps = ctx.captures_req_hdr?;
-                caps.get(idx)?.clone().map(Sample::Str)
+                caps.get(idx)?.clone().map(capture_sample)
             },
         });
 
@@ -1289,7 +1299,7 @@ impl Registry {
                 let idx_str = args.first()?;
                 let idx: usize = idx_str.parse().ok()?;
                 let caps = ctx.captures_res_hdr?;
-                caps.get(idx)?.clone().map(Sample::Str)
+                caps.get(idx)?.clone().map(capture_sample)
             },
         });
 
@@ -5399,4 +5409,10 @@ mod date_tests {
         assert_eq!(format_http_date(784_111_777), "Sun, 06 Nov 1994 08:49:37 GMT");
         assert_eq!(format_http_date(1_709_164_800), "Thu, 29 Feb 2024 00:00:00 GMT");
     }
+}
+
+/// A header capture as a sample: a string, or the bytes when a capture length cut a
+/// multi-byte character (captures are bytes, as in `HAProxy`).
+fn capture_sample(bytes: Vec<u8>) -> Sample {
+    String::from_utf8(bytes).map_or_else(|e| Sample::Bin(e.into_bytes()), Sample::Str)
 }

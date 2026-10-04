@@ -209,6 +209,63 @@ impl MsgState {
         }
     }
 
+    /// For a body being re-framed (an HTTP/1 response sent as HTTP/2 DATA): moves this
+    /// state through `data`, which starts at the body's current position, appending the
+    /// payload bytes (chunk framing removed) to `out` until `out` holds `limit` of them,
+    /// and returns how many bytes of `data` were consumed. Framing bytes with no payload
+    /// after them, such as the last-chunk and trailer, are consumed even at the limit, so
+    /// a body whose payload has all been taken reaches [`MsgState::Done`] without more
+    /// room being made. Only a body state moves; any other consumes nothing.
+    pub fn take_body(&mut self, data: &[u8], limit: usize, out: &mut Vec<u8>) -> usize {
+        let start = out.len();
+        let room = |out: &Vec<u8>| limit.saturating_sub(out.len() - start);
+        match *self {
+            MsgState::Body(Body::UntilClose) => {
+                let n = data.len().min(room(out));
+                out.extend_from_slice(&data[..n]);
+                n
+            }
+            MsgState::Body(Body::Length(left)) => {
+                let n = usize::try_from(left).unwrap_or(usize::MAX).min(data.len()).min(room(out));
+                out.extend_from_slice(&data[..n]);
+                *self = if n as u64 == left { MsgState::Done } else { MsgState::Body(Body::Length(left - n as u64)) };
+                n
+            }
+            MsgState::Body(Body::Chunked(mut c)) => {
+                let mut i = 0;
+                while i < data.len() {
+                    if let Chunk::Data(left) = c {
+                        let n = usize::try_from(left).unwrap_or(usize::MAX).min(data.len() - i).min(room(out));
+                        if n == 0 {
+                            break;
+                        }
+                        out.extend_from_slice(&data[i..i + n]);
+                        i += n;
+                        let left = left - n as u64;
+                        c = if left == 0 { Chunk::DataCr } else { Chunk::Data(left) };
+                        continue;
+                    }
+                    let (n, next) = c.scan(&data[i..=i]);
+                    i += n;
+                    match next {
+                        Ok(Some(next)) => c = next,
+                        Ok(None) => {
+                            *self = MsgState::Done;
+                            return i;
+                        }
+                        Err(()) => {
+                            *self = MsgState::Error;
+                            return i;
+                        }
+                    }
+                }
+                *self = MsgState::Body(Body::Chunked(c));
+                i
+            }
+            _ => 0,
+        }
+    }
+
     /// Measures a head whose length is not known yet, once it is final, so the window is
     /// a subtraction from then on rather than a scan for the blank line on every query.
     pub fn measure_head(&mut self, data: &[u8]) {
@@ -345,6 +402,9 @@ pub struct HttpTxn {
     /// The response was cut short (the server went away mid-body, or a tunnel side
     /// closed): what arrived is delivered and the connection closes.
     pub aborted: bool,
+    /// What the request's cookies told the backend's `cookie` persistence, which the
+    /// response needs (`SF_DIRECT`, `cookie_first_date`, `cookie_last_date`).
+    pub ck: crate::cookie::CookieTxn,
 }
 
 impl HttpTxn {
@@ -364,6 +424,7 @@ impl HttpTxn {
             client_head: false,
             error: None,
             aborted: false,
+            ck: crate::cookie::CookieTxn::default(),
         }
     }
 
@@ -579,5 +640,51 @@ mod tests {
         t.response_sent(rep, 25);
         assert_eq!(t.rsp, MsgState::Waiting);
         assert!(!t.rsp_interim);
+    }
+
+    #[test]
+    fn take_body_unframes_a_chunked_body_and_stops_at_the_limit() {
+        let mut s = MsgState::Body(Body::Chunked(CHUNK_START));
+        let wire = b"5\r\nhello\r\n3\r\nabc\r\n0\r\n\r\n";
+        let mut out = Vec::new();
+        let n = s.take_body(wire, 6, &mut out);
+        assert_eq!(out, b"helloa");
+        assert!(matches!(s, MsgState::Body(Body::Chunked(Chunk::Data(2)))));
+        let n2 = s.take_body(&wire[n..], 100, &mut out);
+        assert_eq!(out, b"helloabc");
+        assert_eq!(n + n2, wire.len());
+        assert_eq!(s, MsgState::Done);
+    }
+
+    #[test]
+    fn take_body_with_no_room_still_consumes_the_closing_framing() {
+        let mut s = MsgState::Body(Body::Chunked(Chunk::DataCr));
+        let mut out = Vec::new();
+        assert_eq!(s.take_body(b"\r\n0\r\n\r\n", 0, &mut out), 7);
+        assert!(out.is_empty());
+        assert_eq!(s, MsgState::Done);
+    }
+
+    #[test]
+    fn take_body_refuses_a_malformed_chunk_and_moves_nothing_else() {
+        let mut s = MsgState::Body(Body::Chunked(CHUNK_START));
+        let mut out = Vec::new();
+        s.take_body(b"zz\r\n", 10, &mut out);
+        assert_eq!(s, MsgState::Error);
+        let mut w = MsgState::Waiting;
+        assert_eq!(w.take_body(b"abc", 10, &mut out), 0);
+    }
+
+    #[test]
+    fn take_body_length_and_until_close() {
+        let mut s = MsgState::Body(Body::Length(4));
+        let mut out = Vec::new();
+        assert_eq!(s.take_body(b"abcdefg", 100, &mut out), 4);
+        assert_eq!((out.as_slice(), s), (&b"abcd"[..], MsgState::Done));
+        let mut u = MsgState::Body(Body::UntilClose);
+        out.clear();
+        assert_eq!(u.take_body(b"xyz", 2, &mut out), 2);
+        assert_eq!(out, b"xy");
+        assert_eq!(u, MsgState::Body(Body::UntilClose));
     }
 }

@@ -11,7 +11,7 @@ use std::time::Duration;
 use crate::ast::{
     clear_http_errors_sections, clear_resolved_checks, http_errors_section, http_errors_section_code,
     register_http_errors_section, register_resolved_check, register_resolved_check_for_addr,
-    AclCondition, AclRule, AclTerm, BackendSection, BalanceAlgorithm, BindConfig, Config,
+    AclCondition, AclRule, AclTerm, BackendSection, BalanceAlgorithm, BindConfig, Config, CookieConfig,
     DefaultServerConfig, DefaultsSection, ErrorPageSource, FrontendSection, GlobalSection,
     GlobalSetVar, HashPreserveAffinity, HashType, HttpAfterResAction, HttpAfterResRule, HttpCheckAction, HttpCheckExpectPattern,
     HttpChkConfig, HttpReqAction, HttpReqRule, HttpResAction, HttpResRule, HttpReuse, RetriesValue,
@@ -141,7 +141,11 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
     // preprocessor module existed, was unit-tested, and was reached by nothing, so `.if`
     // still failed with "unknown keyword" and the harness went on stripping the blocks
     // itself.
-    let lines = crate::preproc::preprocess(lex(input))?;
+    let lexed = lex(input);
+    if let Some((line, (col, msg))) = lexed.iter().find_map(|l| Some((l.line_number, l.error.clone()?))) {
+        return Err(ConfigError::new(line, col, msg));
+    }
+    let lines = crate::preproc::preprocess(lexed)?;
 
     // `http-errors` sections are resolved eagerly into a process-wide registry as they are
     // parsed (see `crate::ast::rules_http`), the same way `crate::ast::checks` resolves
@@ -505,25 +509,40 @@ pub(crate) fn parse_no_directive(tokens: &[Token], _kw: &Token) -> Result<(), Co
     Ok(())
 }
 
-#[allow(clippy::unnecessary_wraps)]
-pub(crate) fn parse_declare(tokens: &[Token], _kw: &Token) -> Result<(), ConfigError> {
-    if tokens.len() >= 2 {
-        eprintln!("[ibex] warning: ignored declare directive '{}'", tokens[1].text);
-    }
-    Ok(())
+/// Where a `declare` line is, for the sections `HAProxy` refuses it in.
+#[derive(Clone, Copy)]
+pub(crate) enum DeclareIn {
+    Defaults,
+    Backend,
 }
 
+/// `declare` in a section that cannot have one: `HAProxy` refuses it in a `backend`
+/// ("'declare' only available in frontend or listen section") and in `defaults`
+/// ("'declare' not available in default section"), whatever follows it.
+pub(crate) fn refuse_declare(section: DeclareIn, kw: &Token) -> Result<(), ConfigError> {
+    let msg = match section {
+        DeclareIn::Defaults => "'declare' not available in default section",
+        DeclareIn::Backend => "'declare' only available in frontend or listen section",
+    };
+    Err(ConfigError::new(kw.line, kw.col, msg.to_string()))
+}
 
-
-
-
-
-
-
-
-
-
-
+/// A `declare` in a frontend or a listen that is not `declare capture` (that one has its own
+/// parser, `parse_declare_capture`): `HAProxy` supports `capture` only.
+pub(crate) fn parse_declare(tokens: &[Token], kw: &Token) -> Result<(), ConfigError> {
+    match tokens.get(1).map(|t| t.text.as_str()) {
+        None | Some("") => Err(ConfigError::new(
+            kw.line,
+            kw.col,
+            "'declare' needs a second keyword that specify the type of declaration ('capture')".to_string(),
+        )),
+        Some(other) => Err(ConfigError::new(
+            kw.line,
+            kw.col,
+            format!("unknown declaration type '{other}' (supports 'capture')"),
+        )),
+    }
+}
 
 pub(crate) fn parse_mode(mode: &mut Mode, tokens: &[Token], kw: &Token) -> Result<(), ConfigError> {
     if tokens.len() < 2 || tokens[1].text.is_empty() {
@@ -545,22 +564,145 @@ pub(crate) fn parse_mode(mode: &mut Mode, tokens: &[Token], kw: &Token) -> Resul
     Ok(())
 }
 
+/// `cookie <name> [options]`, as `cfg_parse_listen` reads it: every option HAProxy has,
+/// checked as HAProxy checks them, and the line replaces any earlier one whole (the
+/// defaults' included). `dynamic` is refused: Ibex has no `dynamic-cookie-key`.
 pub(crate) fn parse_cookie(
-    cookie: &mut Option<String>,
+    cookie: &mut Option<CookieConfig>,
     tokens: &[Token],
     kw: &Token,
 ) -> Result<(), ConfigError> {
+    let fail = |msg: String| Err(ConfigError::new(kw.line, kw.col, msg));
     if tokens.len() < 2 || tokens[1].text.is_empty() {
-        return Err(ConfigError::new(
-            kw.line,
-            kw.col,
-            "<cookie> expects <cookie_name> as argument.",
-        ));
+        return fail("'cookie' expects <cookie_name> as argument.".to_string());
     }
-    if cookie.is_none() {
-        *cookie = Some(tokens[1].text.clone());
+    let mut ck = CookieConfig { name: tokens[1].text.clone(), ..CookieConfig::default() };
+    let mut i = 2;
+    while let Some(opt) = tokens.get(i) {
+        let arg = tokens.get(i + 1).map(|t| t.text.as_str()).filter(|a| !a.is_empty());
+        match opt.text.as_str() {
+            "rewrite" => ck.rewrite = true,
+            "indirect" => ck.indirect = true,
+            "insert" => ck.insert = true,
+            "nocache" => ck.nocache = true,
+            "postonly" => ck.postonly = true,
+            "preserve" => ck.preserve = true,
+            "prefix" => ck.prefix = true,
+            "httponly" => ck.httponly = true,
+            "secure" => ck.secure = true,
+            "domain" => {
+                let Some(d) = arg else {
+                    return fail("'domain' expects <domain> as argument.".to_string());
+                };
+                if !d.contains('.') {
+                    eprintln!(
+                        "[ibex] warning: line {}: domain '{d}' contains no embedded dot, this configuration may not work properly (see RFC6265#5.2.3).",
+                        kw.line
+                    );
+                }
+                if let Some(c) = d.chars().find(|c| !c.is_ascii_alphanumeric() && !matches!(c, '.' | '_' | '-')) {
+                    return fail(format!("character '{c}' is not permitted in domain name '{d}'."));
+                }
+                ck.domain = Some(match ck.domain.take() {
+                    None => d.to_string(),
+                    Some(prev) => format!("{prev}; domain={d}"),
+                });
+                i += 1;
+            }
+            kw_name @ ("maxidle" | "maxlife") => {
+                let Some(v) = arg else {
+                    let what = if kw_name == "maxidle" { "idletime" } else { "lifetime" };
+                    return fail(format!("'{kw_name}' expects <{what}> in seconds as argument."));
+                };
+                let secs = match parse_time_secs(v) {
+                    Ok(s) => s,
+                    Err(TimeErr::Over) => {
+                        return fail(format!(
+                            "timer overflow in argument <{v}> to <{kw_name}>, maximum value is 2147483647 s (~68 years)."
+                        ))
+                    }
+                    Err(TimeErr::Char(c)) => {
+                        return fail(format!("unexpected character '{c}' in argument to <{kw_name}>."))
+                    }
+                };
+                if kw_name == "maxidle" {
+                    ck.maxidle = secs;
+                } else {
+                    ck.maxlife = secs;
+                }
+                i += 1;
+            }
+            "dynamic" => {
+                return fail(
+                    "'cookie ... dynamic' is not implemented: Ibex has no 'dynamic-cookie-key', and a server without a 'cookie' value would get no cookie.".to_string(),
+                )
+            }
+            "attr" => {
+                let Some(v) = arg else {
+                    return fail("'attr' expects <value> as argument.".to_string());
+                };
+                if let Some(b) = v.bytes().find(|b| b.is_ascii_control() || *b == b';') {
+                    return fail(format!("character '%x{b:02X}' is not permitted in attribute value."));
+                }
+                ck.attrs = Some(match ck.attrs.take() {
+                    None => v.to_string(),
+                    Some(prev) => format!("{prev}; {v}"),
+                });
+                i += 1;
+            }
+            _ => {
+                return fail(
+                    "'cookie' supports 'rewrite', 'insert', 'prefix', 'indirect', 'nocache', 'postonly', 'domain', 'maxidle', 'dynamic', 'maxlife' and 'attr' options.".to_string(),
+                )
+            }
+        }
+        i += 1;
     }
+    if ck.rewrite && ck.indirect {
+        return fail("cookie 'rewrite' and 'indirect' modes are incompatible.".to_string());
+    }
+    if u8::from(ck.rewrite) + u8::from(ck.insert) + u8::from(ck.prefix) > 1 {
+        return fail("cookie 'rewrite', 'insert' and 'prefix' modes are incompatible.".to_string());
+    }
+    if ck.preserve && !ck.insert && !ck.indirect {
+        return fail("cookie 'preserve' requires at least 'insert' or 'indirect'.".to_string());
+    }
+    *cookie = Some(ck);
     Ok(())
+}
+
+enum TimeErr {
+    Over,
+    Char(char),
+}
+
+/// A time in seconds as `parse_time_err(.., TIME_UNIT_S)` reads it: digits, then `us`,
+/// `ms`, `s`, `m`, `h` or `d` (none: seconds), rounded up to a whole second.
+fn parse_time_secs(text: &str) -> Result<u32, TimeErr> {
+    let digits = text.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 {
+        return Err(TimeErr::Char(text.chars().next().unwrap_or('\0')));
+    }
+    let value: u128 = text[..digits].parse().unwrap_or(u128::MAX);
+    let unit = &text[digits..];
+    // (multiplier, divisor) from the unit to seconds.
+    let (mul, div): (u128, u128) = if unit.is_empty() || unit.starts_with('s') {
+        (1, 1)
+    } else if unit.starts_with("us") {
+        (1, 1_000_000)
+    } else if unit.starts_with("ms") {
+        (1, 1000)
+    } else if unit.starts_with('m') {
+        (60, 1)
+    } else if unit.starts_with('h') {
+        (3600, 1)
+    } else if unit.starts_with('d') {
+        (86400, 1)
+    } else {
+        return Err(TimeErr::Char(unit.chars().next().unwrap_or('\0')));
+    };
+    let secs = value.saturating_mul(mul).saturating_add(div - 1) / div;
+    u32::try_from(secs).ok().filter(|s| *s < 0x8000_0000).ok_or(TimeErr::Over)
 }
 
 pub(crate) fn parse_contimeout(kw: &Token) -> Result<(), ConfigError> {
@@ -871,7 +1013,7 @@ listen health
         assert_eq!(config.listens.len(), 3);
         assert_eq!(config.listens[0].name, "proxy1");
         assert_eq!(config.listens[0].mode, Mode::Http);
-        assert_eq!(config.listens[0].cookie.as_deref(), Some("SERVERID"));
+        assert_eq!(config.listens[0].cookie.as_ref().map(|c| c.name.as_str()), Some("SERVERID"));
         assert_eq!(config.listens[0].servers.len(), 2);
         assert_eq!(config.listens[0].retries, 3);
         assert!(config.listens[0].redisp);

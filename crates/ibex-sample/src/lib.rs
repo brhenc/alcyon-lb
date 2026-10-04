@@ -19,7 +19,7 @@ pub mod sample;
 
 pub use cast::{can_cast, cast};
 pub use expr::Expr;
-pub use matcher::{IntOp, Matcher};
+pub use matcher::{IntOp, IntRange, Matcher};
 pub use registry::{
     get_proc_var, not_implemented, not_implemented_message, sample_registry, set_proc_var, ConvDesc,
     ConvFn, CtxConvDesc, CtxConvFn, FetchDesc, FetchFn, ProxyState, Registry, ServerState,

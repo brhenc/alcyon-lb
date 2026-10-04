@@ -18,7 +18,7 @@ fn addr(s: &str) -> Option<SocketAddr> {
     Some(s.parse().expect("addr"))
 }
 
-fn base<'a>(req_caps: &'a [Option<String>], res_caps: &'a [Option<String>]) -> LogData<'a> {
+fn base<'a>(req_caps: &'a [Option<Vec<u8>>], res_caps: &'a [Option<Vec<u8>>]) -> LogData<'a> {
     LogData {
         client: addr("127.0.0.1:40000"),
         frontend_addr: addr("127.0.0.1:29600"),
@@ -58,8 +58,8 @@ fn render(fmt: &str, d: &LogData) -> String {
 
 #[test]
 fn an_http_transaction_renders_as_haproxy_wrote_it() {
-    let req = [Some("127.0.0.1:29600".to_string()), Some("aaaaa".to_string())];
-    let res = [Some("rv".to_string())];
+    let req = [Some("127.0.0.1:29600".as_bytes().to_vec()), Some("aaaaa".as_bytes().to_vec())];
+    let res = [Some("rv".as_bytes().to_vec())];
     let d = base(&req, &res);
     assert_eq!(
         render(FORMAT_A, &d),
@@ -69,8 +69,8 @@ fn an_http_transaction_renders_as_haproxy_wrote_it() {
 
 #[test]
 fn a_missing_capture_is_empty_in_hr_and_a_dash_in_hrl() {
-    let req = [Some("127.0.0.1:29600".to_string()), None];
-    let res = [Some("rv".to_string())];
+    let req = [Some("127.0.0.1:29600".as_bytes().to_vec()), None];
+    let res = [Some("rv".as_bytes().to_vec())];
     let d = LogData { request_line: Some("POST /post HTTP/1.1"), uniq_id: 2, bytes_in: 152, ..base(&req, &res) };
     let line = render(FORMAT_A, &d);
     assert!(line.contains("|HQ=|HV=HTTP/1.1|"), "{line}");
@@ -128,7 +128,7 @@ fn global_options_apply_to_what_follows() {
 fn the_request_line_and_captures_are_encoded() {
     // `url_encode_map` for %r: `"` and `#` as #XX (h1_authority_fragment_char.vtc logs
     // `GET http://hostname#23frag HTTP/1.1`); `hdr_encode_map` adds `{|}` for captures.
-    let req = [Some("a{b}|c\"d#".to_string())];
+    let req = [Some("a{b}|c\"d#".as_bytes().to_vec())];
     let d = LogData { request_line: Some("GET http://hostname#frag HTTP/1.1"), ..base(&req, &[]) };
     assert_eq!(render("%r %hr", &d), "GET http://hostname#23frag HTTP/1.1 {a#7Bb#7D#7Cc#22d#23}");
     assert_eq!(render("%HPO %HP %HU", &LogData { request_line: Some("GET http://localhost/r/4?q=4 HTTP/1.1"), ..d.clone() }),
@@ -281,7 +281,7 @@ fn a_percent_before_anything_but_an_alias_name_is_dropped() {
 
 #[test]
 fn flags_without_a_sign_or_unknown_are_ignored_and_absent_values_quote_as_empty() {
-    let req = [None, Some("v".to_string())];
+    let req = [None, Some("v".as_bytes().to_vec())];
     let d = LogData { request_line: Some("GET /a/b?q HTTP/1.1"), redispatched: true, retries: 1, ..base(&req, &[]) };
     assert_eq!(
         render("a=%{Q}r|u=%{+foo}r|qh=%{+Q}[var(txn.none)]|hrl=%{+Q}hrl|rc=%rc", &d),
@@ -310,4 +310,23 @@ fn hpo_is_empty_for_a_target_with_no_path() {
     assert_eq!(render("HPO=%HPO|QHPO=%{+Q}HPO|HP=%HP", &d), "HPO=|QHPO=\"\"|HP=*");
     let d = LogData { request_line: Some("CONNECT host:443 HTTP/1.1"), ..d };
     assert_eq!(render("HPO=%HPO|HP=%HP", &d), "HPO=|HP=host:443");
+}
+
+/// `HAProxy` parses a `log-format` whether or not the proxy has a log address; only the
+/// "log format ignored ... since it has no log address" warning follows. `haproxy -c`
+/// (3.5-dev8-885761-29, 2026-10-03) on a frontend with no `log` line exits 1 for each of
+/// `abc%` ("truncated line after '%'"), `%zz` ("no such format alias 'zz'") and
+/// `%[nosuch]` ("unknown fetch method 'nosuch'"), and 0 for a good format. Ibex compiled
+/// it only for a proxy that logs, so these loaded.
+#[test]
+fn a_bad_log_format_is_refused_without_a_log_address_too() {
+    for sec in ["frontend f\n  bind 127.0.0.1:0", "listen l\n  bind 127.0.0.1:0"] {
+        for bad in ["abc%", "%zz", "%[nosuch]"] {
+            let cfg = ibex_config::parse_str(&format!("{sec}\n  mode http\n  log-format \"{bad}\"\n")).expect("parses");
+            let err = ibex_rt::Engine::new(&cfg, 4).err().map(|e| e.to_string()).unwrap_or_default();
+            assert!(err.contains("failed to parse log-format"), "{sec} with `{bad}` and no log address loaded: {err:?}");
+        }
+        let cfg = ibex_config::parse_str(&format!("{sec}\n  mode http\n  log-format \"%ci %[src]\"\n")).expect("parses");
+        ibex_rt::Engine::new(&cfg, 4).expect("a good format loads without a log address");
+    }
 }

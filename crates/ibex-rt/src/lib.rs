@@ -15,6 +15,7 @@ pub mod applet;
 pub mod buf;
 pub mod check;
 pub mod cond;
+pub mod cookie;
 pub mod cpu;
 pub mod dgram;
 pub mod engine;

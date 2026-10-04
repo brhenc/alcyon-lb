@@ -152,6 +152,12 @@ pub mod state {
     /// Computationally expensive (e.g. a TLS handshake): classified into `Heavy`,
     /// of which at most one runs per pass.
     pub const HEAVY: u32 = 1 << 5;
+    /// Linked into a tasklet list. `QUEUED` alone does not say which queue: a task in
+    /// the run queue is `QUEUED` too, and reading one as the other leaked tasks.
+    pub const IN_TL: u32 = 1 << 6;
+    /// The slot is on the arena's free list. Any scheduling operation on it is a stale
+    /// reference: linking it is how T100's lists were corrupted.
+    pub const FREED: u32 = 1 << 7;
 
     /// Woken because its timer expired.
     pub const WOKEN_TIMER: u32 = 1 << 8;
@@ -234,6 +240,18 @@ impl Task {
     pub const fn killed(&self) -> bool {
         self.state & state::KILLED != 0
     }
+
+    #[must_use]
+    #[inline]
+    pub const fn in_tasklet_list(&self) -> bool {
+        self.state & state::IN_TL != 0
+    }
+
+    #[must_use]
+    #[inline]
+    pub const fn freed(&self) -> bool {
+        self.state & state::FREED != 0
+    }
 }
 
 /// Per-thread task storage.
@@ -274,6 +292,11 @@ impl TaskArena {
     pub fn alloc(&mut self, kind: WorkKind) -> Option<TaskRef> {
         self.live += 1;
         if let Some(i) = self.free.pop() {
+            let old = &self.tasks[i as usize];
+            debug_assert!(
+                old.state == state::FREED && old.rq_ref.is_none() && old.wq_ref.is_none(),
+                "reusing a freed task slot that is still linked: {old:?}"
+            );
             self.tasks[i as usize] = Task::new(kind);
             return Some(TaskRef(i));
         }
@@ -296,10 +319,21 @@ impl TaskArena {
         let t = &mut self.tasks[r.0 as usize];
         debug_assert!(t.rq_ref.is_none(), "freeing a task still in the run queue");
         debug_assert!(t.wq_ref.is_none(), "freeing a task still in the wait queue");
-        t.state = 0;
+        debug_assert!(
+            !t.in_tasklet_list(),
+            "freeing a task still in a tasklet list"
+        );
+        t.state = state::FREED;
         t.tl_next = TaskRef::NONE;
         self.free.push(r.0);
         self.live = self.live.saturating_sub(1);
+    }
+
+    /// Whether `r` names an allocated task rather than a slot on the free list.
+    #[must_use]
+    #[inline]
+    pub fn is_live(&self, r: TaskRef) -> bool {
+        !r.is_none() && self.tasks.get(r.0 as usize).is_some_and(|t| !t.freed())
     }
 
     #[must_use]

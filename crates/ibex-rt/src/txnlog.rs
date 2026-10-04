@@ -45,8 +45,8 @@ pub struct StreamLog {
     pub request_line: Option<String>,
     /// Header capture slots: request (`capture request header`, `http-request capture`)
     /// and response.
-    pub req_captures: Vec<Option<String>>,
-    pub res_captures: Vec<Option<String>>,
+    pub req_captures: Vec<Option<Vec<u8>>>,
+    pub res_captures: Vec<Option<Vec<u8>>>,
     /// `unique-id-format`'s value for this stream.
     pub unique_id: Option<String>,
     /// `%rt`.

@@ -46,6 +46,14 @@ fn is_server_up(proxy: &Proxy, idx: usize) -> bool {
         .is_some_and(|status| status.load(Ordering::Relaxed) == ServerStatus::Up as u8)
 }
 
+/// The backup that takes the traffic when no active server is usable: the first one in
+/// declaration order that is UP and under its `maxconn` (`lbprm.fbck`, set by
+/// `recount_servers`; Ibex refuses `option allbackups`, which would use them all).
+#[must_use]
+pub fn first_backup(proxy: &Proxy) -> Option<usize> {
+    (0..proxy.servers.len()).find(|&idx| proxy.server_backups.get(idx).copied().unwrap_or(false) && is_server_available(proxy, idx))
+}
+
 /// First Available Server (`balance first`).
 /// Picks the first server, in declaration order, that is UP and has a free `maxconn` slot.
 /// Falls back to backup servers, in declaration order, if no primary server qualifies.
@@ -57,13 +65,7 @@ pub fn first(proxy: &Proxy) -> Option<usize> {
             return Some(idx);
         }
     }
-    for idx in 0..proxy.servers.len() {
-        let is_backup = proxy.server_backups.get(idx).copied().unwrap_or(false);
-        if is_backup && is_server_available(proxy, idx) {
-            return Some(idx);
-        }
-    }
-    None
+    first_backup(proxy)
 }
 
 /// Fast, non-cryptographic PRNG state for `balance random`. Seeded once from process-local
@@ -118,9 +120,7 @@ fn weighted_eligible(proxy: &Proxy) -> (Vec<(usize, u32)>, u32) {
 
     // No active server: the first usable backup alone (`lbprm.fbck`; Ibex has no
     // `option allbackups`). `HAProxy` 3.5 sent 30 of 30 requests to it under `random`.
-    match (0..proxy.servers.len()).find(|&idx| {
-        proxy.server_backups.get(idx).copied().unwrap_or(false) && is_server_available(proxy, idx)
-    }) {
+    match first_backup(proxy) {
         Some(idx) => (vec![(idx, 1)], 1),
         None => (Vec::new(), 0),
     }
@@ -209,30 +209,8 @@ pub fn leastconn(proxy: &Proxy) -> Option<usize> {
         return best_idx;
     }
 
-    // Second pass: backup servers fallback
-    for idx in 0..proxy.servers.len() {
-        let is_backup = proxy.server_backups.get(idx).copied().unwrap_or(false);
-        if is_backup && is_server_available(proxy, idx) {
-            let conn = u64::from(proxy.server_actconn.get(idx).map_or(0, |a| a.load(Ordering::Relaxed)));
-            let weight = u64::from(proxy.server_weights.get(idx).copied().unwrap_or(1).max(1));
-
-            if best_idx.is_none() {
-                best_idx = Some(idx);
-                best_load_metric = (conn.saturating_add(1), weight);
-            } else {
-                let (best_conn_plus_1, best_w) = best_load_metric;
-                let lhs = conn.saturating_add(1).saturating_mul(best_w);
-                let rhs = best_conn_plus_1.saturating_mul(weight);
-
-                if lhs < rhs || (lhs == rhs && weight > best_w) {
-                    best_idx = Some(idx);
-                    best_load_metric = (conn.saturating_add(1), weight);
-                }
-            }
-        }
-    }
-
-    best_idx
+    // No active server: the first usable backup alone.
+    first_backup(proxy)
 }
 
 /// Weighted Round Robin with static weights (`balance static-rr`).
@@ -265,33 +243,8 @@ pub fn static_rr(proxy: &Proxy) -> Option<usize> {
         return None;
     }
 
-    // Backup failover
-    let mut total_backup_weight = 0u32;
-    let mut eligible_backups = Vec::new();
-
-    for idx in 0..proxy.servers.len() {
-        let is_backup = proxy.server_backups.get(idx).copied().unwrap_or(false);
-        if is_backup && is_server_available(proxy, idx) {
-            let w = proxy.server_weights.get(idx).copied().unwrap_or(1).max(1);
-            total_backup_weight = total_backup_weight.saturating_add(w);
-            eligible_backups.push((idx, w));
-        }
-    }
-
-    if !eligible_backups.is_empty() {
-        let counter = proxy.next_server_idx.fetch_add(1, Ordering::Relaxed);
-        let pos = (counter % (total_backup_weight as usize)) as u32;
-
-        let mut acc = 0u32;
-        for (idx, w) in eligible_backups {
-            acc = acc.saturating_add(w);
-            if pos < acc {
-                return Some(idx);
-            }
-        }
-    }
-
-    None
+    // Backup failover: the first usable backup alone.
+    first_backup(proxy)
 }
 
 /// 64-bit FNV-1a deterministic hash function for URI path/query mapping.
@@ -342,31 +295,8 @@ pub fn balance_uri(proxy: &Proxy, uri: &str) -> Option<usize> {
         return None;
     }
 
-    // Backup failover
-    let mut total_backup_weight = 0u32;
-    let mut eligible_backups = Vec::new();
-
-    for idx in 0..proxy.servers.len() {
-        let is_backup = proxy.server_backups.get(idx).copied().unwrap_or(false);
-        if is_backup && is_server_available(proxy, idx) {
-            let w = proxy.server_weights.get(idx).copied().unwrap_or(1).max(1);
-            total_backup_weight = total_backup_weight.saturating_add(w);
-            eligible_backups.push((idx, w));
-        }
-    }
-
-    if !eligible_backups.is_empty() {
-        let pos = (hash % (total_backup_weight as usize)) as u32;
-        let mut acc = 0u32;
-        for (idx, w) in eligible_backups {
-            acc = acc.saturating_add(w);
-            if pos < acc {
-                return Some(idx);
-            }
-        }
-    }
-
-    None
+    // Backup failover: the first usable backup alone.
+    first_backup(proxy)
 }
 
 /// `balance uri` with `hash-type consistent` (`get_server_uh` + `chash_get_server_hash`,

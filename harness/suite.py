@@ -141,6 +141,9 @@ def target_dir() -> str:
     return os.environ.get("CARGO_TARGET_DIR") or os.path.join(REPO, "target")
 
 
+built_executables: set[str] = set()
+
+
 def test_targets() -> list[tuple[str, str, list[str], str, dict]] | None:
     """Builds every test target and lists them: (package, target, selector args for `cargo
     test`, executable, the package's metadata).
@@ -158,8 +161,12 @@ def test_targets() -> list[tuple[str, str, list[str], str, dict]] | None:
         print(p.stderr[-2000:])
         return None
     found = []
+    # covercheck reports on these and nothing else (older builds' binaries share deps/).
+    built_executables.clear()
     for line in p.stdout.splitlines():
         m = json.loads(line) if line.startswith("{") else {}
+        if m.get("reason") == "compiler-artifact" and m.get("executable"):
+            built_executables.add(m["executable"])
         if m.get("reason") != "compiler-artifact" or not m["profile"]["test"] or not m.get("executable"):
             continue
         kind, name = m["target"]["kind"][0], m["target"]["name"]
@@ -199,9 +206,10 @@ def cargo_env(p: dict) -> dict:
     return env
 
 
-def run_parallel() -> tuple[list[tuple[str, str, list[str]]], dict[str, set[str]], int, int] | None:
+def run_parallel(doc: bool = True) -> tuple[list[tuple[str, str, list[str]]], dict[str, set[str]], int, int] | None:
     """Runs every target, `JOBS` at once. Returns the failing targets, the failing tests of
-    each (keyed by target), and the totals of tests passed and failed."""
+    each (keyed by target), and the totals of tests passed and failed. `doc=False` leaves the
+    doc tests out (covercheck: `cargo llvm-cov` does not instrument them)."""
     targets = test_targets()
     if targets is None:
         print("suite: the workspace's tests do not build")
@@ -209,8 +217,9 @@ def run_parallel() -> tuple[list[tuple[str, str, list[str]]], dict[str, set[str]
     # (package, target, selector, command, cwd, env)
     jobs = [(pkg, key, sel, [exe], os.path.dirname(p["manifest_path"]), cargo_env(p))
             for pkg, key, sel, exe, p in targets]
-    jobs.append(("workspace", "doc", ["--doc"], ["cargo", "test", "--workspace", "--doc", "--no-fail-fast"],
-                 REPO, None))
+    if doc:
+        jobs.append(("workspace", "doc", ["--doc"], ["cargo", "test", "--workspace", "--doc", "--no-fail-fast"],
+                     REPO, None))
     # Longest first, from the last run's durations: the slowest target sets the floor.
     times_path = os.path.join(target_dir(), "suite-durations.json")
     try:

@@ -205,6 +205,14 @@ impl Scheduler {
         self.rq_total > 0 || self.tasklets.iter().any(|l| !l.is_empty())
     }
 
+    /// Whether `r` names a live task. A task the scheduler freed (its run returned
+    /// [`Outcome::Done`]) is not, and a caller holding its reference must drop it.
+    #[must_use]
+    #[inline]
+    pub fn is_live(&self, r: TaskRef) -> bool {
+        self.tasks.is_live(r)
+    }
+
     /// Total number of currently allocated tasks in the arena.
     #[must_use]
     #[inline]
@@ -220,10 +228,36 @@ impl Scheduler {
 
     // ---- queue membership --------------------------------------------------------
 
+    /// Marks `r` as linked into a tasklet list, first checking it is in none.
+    ///
+    /// The lists are singly linked and counted, so a task linked twice is not visible
+    /// where it happens: it shows up passes later as a cycle or as `pop_tasklet`
+    /// underflowing a length (T100). This is where it is caught instead.
+    fn mark_linked(tasks: &mut TaskArena, r: TaskRef) {
+        let t = tasks.get_mut(r);
+        debug_assert!(!t.freed(), "linking a freed task {r:?} into a tasklet list");
+        debug_assert!(
+            !t.in_tasklet_list(),
+            "task {r:?} linked twice into the tasklet lists"
+        );
+        t.state |= state::IN_TL;
+    }
+
+    /// Whether `r` may be scheduled: false for a freed slot, which no scheduling
+    /// operation may touch. A stale reference to one is a caller's bug (T100): debug
+    /// builds stop on it, and release builds refuse the operation rather than corrupt
+    /// the queues with it.
+    fn usable(&self, r: TaskRef, op: &str) -> bool {
+        let freed = self.tasks.get(r).freed();
+        debug_assert!(!freed, "{op} on freed task {r:?}");
+        !freed
+    }
+
     fn push_tasklet(&mut self, class: Class, r: TaskRef) {
         let Self {
             tasks, tasklets, ..
         } = self;
+        Self::mark_linked(tasks, r);
         tasks.get_mut(r).tl_next = TaskRef::NONE;
         let l = &mut tasklets[class.idx()];
         if l.tail.is_none() {
@@ -239,6 +273,7 @@ impl Scheduler {
         let Self {
             tasks, tasklets, ..
         } = self;
+        Self::mark_linked(tasks, r);
         let l = &mut tasklets[class.idx()];
         tasks.get_mut(r).tl_next = l.head;
         l.head = r;
@@ -262,8 +297,18 @@ impl Scheduler {
         if next.is_none() {
             l.tail = TaskRef::NONE;
         }
+        debug_assert!(
+            l.len > 0,
+            "tasklet list {class:?} non-empty with a length of 0"
+        );
         l.len -= 1;
-        tasks.get_mut(r).tl_next = TaskRef::NONE;
+        let t = tasks.get_mut(r);
+        debug_assert!(
+            t.in_tasklet_list(),
+            "popped task {r:?} was not marked as linked"
+        );
+        t.tl_next = TaskRef::NONE;
+        t.state &= !state::IN_TL;
         Some(r)
     }
 
@@ -276,6 +321,7 @@ impl Scheduler {
         self.rqueue.delete(node.0);
         let t = self.tasks.get_mut(r);
         t.rq_ref = NodeRef::NONE;
+
         if t.nice != 0 {
             self.niced_tasks = self.niced_tasks.saturating_sub(1);
         }
@@ -314,16 +360,18 @@ impl Scheduler {
 
     /// Destroys a task, unlinking it from every queue first.
     pub fn destroy(&mut self, r: TaskRef) {
-        if r.is_none() {
+        if r.is_none() || self.tasks.get(r).freed() {
             return;
         }
         self.unlink_rq(r);
         self.unlink_wq(r);
-        if self.tasks.get(r).queued() {
+        if self.tasks.get(r).in_tasklet_list() {
             // Still linked into a tasklet list; defer the free until it is popped.
             self.tasks.get_mut(r).state |= state::KILLED;
             return;
         }
+        // `QUEUED` without a tasklet list was the run queue, now left.
+        self.tasks.get_mut(r).state &= !state::QUEUED;
         self.tasks.free(r);
     }
 
@@ -333,6 +381,12 @@ impl Scheduler {
     /// `nice * RUNQUEUE_DEPTH`, which gets FIFO ordering among equal priorities and
     /// priority as a displacement, both out of one ordered structure.
     pub fn wakeup(&mut self, r: TaskRef, reason: u32, caller: CallSite) {
+        if self.usable(r, "wakeup") {
+            self.wakeup_live(r, reason, caller);
+        }
+    }
+
+    fn wakeup_live(&mut self, r: TaskRef, reason: u32, caller: CallSite) {
         {
             let t = self.tasks.get_mut(r);
             if t.state & (state::QUEUED | state::RUNNING) != 0 {
@@ -365,6 +419,12 @@ impl Scheduler {
     /// Schedules a task directly into a tasklet class, bypassing the run queue.
     /// This is the path I/O readiness callbacks take.
     pub fn tasklet_wakeup(&mut self, r: TaskRef, class: Class, reason: u32) {
+        if self.usable(r, "tasklet_wakeup") {
+            self.tasklet_wakeup_live(r, class, reason);
+        }
+    }
+
+    fn tasklet_wakeup_live(&mut self, r: TaskRef, class: Class, reason: u32) {
         {
             let t = self.tasks.get_mut(r);
             if t.state & state::QUEUED != 0 {
@@ -387,6 +447,12 @@ impl Scheduler {
     /// The stale key is repaired lazily by [`Self::wake_expired_tasks`], and only if
     /// that entry is ever actually examined.
     pub fn queue_timer(&mut self, r: TaskRef, expire: Tick) {
+        if self.usable(r, "queue_timer") {
+            self.queue_timer_live(r, expire);
+        }
+    }
+
+    fn queue_timer_live(&mut self, r: TaskRef, expire: Tick) {
         self.tasks.get_mut(r).expire = expire;
 
         if !expire.is_set() {
@@ -617,5 +683,164 @@ impl Scheduler {
         }
 
         done
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::task::Kind;
+
+    /// Runs every task, recording which ran, and returns the outcome the test chose.
+    struct Runner {
+        runs: Vec<u32>,
+        outcome: Outcome,
+    }
+
+    impl Dispatch for Runner {
+        fn run(&mut self, kind: WorkKind, _state: u32) -> Outcome {
+            self.runs.push(kind.index());
+            self.outcome
+        }
+    }
+
+    fn drain(s: &mut Scheduler, d: &mut Runner) {
+        for _ in 0..8 {
+            s.process_runnable_tasks(d);
+        }
+    }
+
+    /// A task that ran to `Outcome::Done`, so the scheduler freed it.
+    fn a_finished_task(s: &mut Scheduler, d: &mut Runner) -> TaskRef {
+        let a = s.create(WorkKind::new(Kind::Synthetic, 1)).expect("alloc");
+        s.tasklet_wakeup(a, Class::Urgent, state::WOKEN_IO);
+        drain(s, d);
+        assert_eq!(s.live_tasks(), 0);
+        a
+    }
+
+    /// The rest of T100's sequence at the scheduler: the caller queued the finished
+    /// task's timer anyway, the freed slot was woken into the run queue and handed to a
+    /// new task with that membership forgotten, and the next passes ran the new task
+    /// from two lists until `pop_tasklet` underflowed a length.
+    #[cfg(not(debug_assertions))]
+    fn stale_timer_on_a_freed_task(s: &mut Scheduler, d: &mut Runner) {
+        let a = a_finished_task(s, d);
+        s.queue_timer(a, s.now()); // the stale timer update
+        s.wakeup(a, state::WOKEN_MSG, CallSite::UNKNOWN); // and stale wakeups
+        s.tasklet_wakeup(a, Class::Urgent, state::WOKEN_IO);
+        s.set_now(Tick(s.now().0 + 10));
+        s.wake_expired_tasks();
+        let b = s.create(WorkKind::new(Kind::Synthetic, 2)).expect("alloc");
+        assert_eq!(a, b, "the freed slot is reused");
+        s.tasklet_wakeup(b, Class::Urgent, state::WOKEN_IO);
+        drain(s, d);
+    }
+
+    /// Queueing a freed task is the bug, and a debug build stops at it, not three
+    /// passes later when `pop_tasklet` underflows a list length.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "queue_timer on freed task")]
+    fn a_freed_task_is_never_queued() {
+        let mut s = Scheduler::with_capacity(4);
+        let mut d = Runner {
+            runs: Vec::new(),
+            outcome: Outcome::Done,
+        };
+        let a = a_finished_task(&mut s, &mut d);
+        s.queue_timer(a, s.now());
+    }
+
+    /// Nor woken, by either path.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "tasklet_wakeup on freed task")]
+    fn a_freed_task_is_never_woken_into_a_tasklet_list() {
+        let mut s = Scheduler::with_capacity(4);
+        let mut d = Runner {
+            runs: Vec::new(),
+            outcome: Outcome::Done,
+        };
+        let a = a_finished_task(&mut s, &mut d);
+        s.tasklet_wakeup(a, Class::Urgent, state::WOKEN_IO);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "wakeup on freed task")]
+    fn a_freed_task_is_never_woken_into_the_run_queue() {
+        let mut s = Scheduler::with_capacity(4);
+        let mut d = Runner {
+            runs: Vec::new(),
+            outcome: Outcome::Done,
+        };
+        let a = a_finished_task(&mut s, &mut d);
+        s.wakeup(a, state::WOKEN_MSG, CallSite::UNKNOWN);
+    }
+
+    /// In a release build the stale operation is refused: the lists stay consistent and
+    /// the new task runs once.
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn a_freed_task_is_never_queued() {
+        let mut s = Scheduler::with_capacity(4);
+        let mut d = Runner {
+            runs: Vec::new(),
+            outcome: Outcome::Done,
+        };
+        stale_timer_on_a_freed_task(&mut s, &mut d);
+        assert_eq!(d.runs, vec![1, 2]);
+        assert_eq!(s.run_queue_len(), 0);
+        assert_eq!(s.live_tasks(), 0);
+    }
+
+    /// A task is in at most one tasklet list, once. A second link is caught at the link.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "linked twice")]
+    fn a_task_is_never_linked_twice() {
+        let mut s = Scheduler::with_capacity(4);
+        let a = s.create(WorkKind::new(Kind::Synthetic, 1)).expect("alloc");
+        s.push_tasklet(Class::Urgent, a);
+        s.push_tasklet(Class::Normal, a);
+    }
+
+    /// `destroy` on a task waiting in the run queue (in no tasklet list) frees it. It
+    /// used to read `QUEUED` as "in a tasklet list", mark the task killed for a pop that
+    /// never came, and leak the slot.
+    #[test]
+    fn destroying_a_task_in_the_run_queue_frees_it() {
+        let mut s = Scheduler::with_capacity(4);
+        let a = s.create(WorkKind::new(Kind::Synthetic, 1)).expect("alloc");
+        s.wakeup(a, state::WOKEN_MSG, CallSite::UNKNOWN);
+        s.destroy(a);
+        assert_eq!(s.live_tasks(), 0, "the slot leaked");
+        assert_eq!(s.run_queue_len(), 0);
+        let mut d = Runner {
+            runs: Vec::new(),
+            outcome: Outcome::Keep,
+        };
+        drain(&mut s, &mut d);
+        assert!(d.runs.is_empty());
+    }
+
+    /// `destroy` on a task in a tasklet list defers the free to the pop, and the task
+    /// does not run.
+    #[test]
+    fn destroying_a_task_in_a_tasklet_list_defers_the_free() {
+        let mut s = Scheduler::with_capacity(4);
+        let a = s.create(WorkKind::new(Kind::Synthetic, 1)).expect("alloc");
+        s.tasklet_wakeup(a, Class::Urgent, state::WOKEN_IO);
+        s.destroy(a);
+        assert_eq!(s.live_tasks(), 1, "still linked: freed on the pop");
+        let mut d = Runner {
+            runs: Vec::new(),
+            outcome: Outcome::Keep,
+        };
+        drain(&mut s, &mut d);
+        assert!(d.runs.is_empty());
+        assert_eq!(s.live_tasks(), 0);
+        assert_eq!(s.run_queue_len(), 0);
     }
 }

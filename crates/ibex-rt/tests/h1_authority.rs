@@ -67,10 +67,15 @@ impl Drop for Ibex {
 }
 
 fn start(be: SocketAddr) -> (Ibex, SocketAddr) {
+    start_with(be, "")
+}
+
+/// `fe_lines` are extra lines (each ending in a newline) in the frontend.
+fn start_with(be: SocketAddr, fe_lines: &str) -> (Ibex, SocketAddr) {
     let fe = common::reserve_addr();
     let cfg = format!(
         "defaults\n  mode http\n  timeout connect 2s\n  timeout client 5s\n  timeout server 5s\n\
-         frontend fe\n  bind {fe}\n  default_backend be\n\
+         frontend fe\n  bind {fe}\n{fe_lines}  default_backend be\n\
          backend be\n  server s1 {be}\n"
     );
     let mut f = NamedTempFile::new().expect("tmp");
@@ -121,8 +126,12 @@ const fn bad(name: &'static str, method: &'static str, target: &'static str, hos
 /// Sends every case through one ibex and returns a description of each that differs from
 /// `HAProxy`, so a failure lists all of them at once.
 fn run(cases: &[Case]) -> Vec<String> {
+    run_with(cases, "")
+}
+
+fn run_with(cases: &[Case], fe_lines: &str) -> Vec<String> {
     let (be, seen) = backend();
-    let (_ibex, fe) = start(be);
+    let (_ibex, fe) = start_with(be, fe_lines);
     let mut wrong = Vec::new();
     for c in cases {
         seen.lock().unwrap().clear();
@@ -311,5 +320,149 @@ fn a_repeated_identical_host_is_forwarded_once() {
             ok("x13", "CONNECT", "hostname:80", &["hostname:80", "hostname:80"], "CONNECT hostname:80 HTTP/1.1", &["hostname"]),
         ],
         "repeated Host",
+    );
+}
+
+/// A `#` anywhere in the request-target is refused (`src/h1.c`, `http_msg_rquri2`: the
+/// request line is invalid unless `accept-unsafe-violations-in-http-request` is set), in
+/// every form of target and whatever the authority is (T101 item 1).
+#[test]
+fn a_fragment_in_the_target_is_refused() {
+    check(
+        &[
+            bad("f1", "GET", "http://hostname:80#frag", &["hostname"]),
+            bad("f2", "GET", "/a#b", &["h"]),
+            bad("f3", "GET", "http://hostname/a#b", &["hostname"]),
+            bad("f4", "GET", "/a?b#c", &["h"]),
+        ],
+        "fragment in the target",
+    );
+}
+
+/// `http_authority_has_forbidden_char`: the first `Host` of every request, and the
+/// authority of an absolute-form or CONNECT target, may hold no byte outside `!`..`~`,
+/// none of `, # / ? @ \`, and `[` or `]` only as the brackets of an IP literal (`[` first,
+/// `]` last or before a colon). A later `Host` is only compared with the first (T101
+/// item 3).
+#[test]
+fn forbidden_characters_in_the_authority_or_host_are_refused() {
+    check(
+        &[
+            bad("h1", "GET", "/x", &["a/b"]),
+            bad("h2", "GET", "/x", &["a,b"]),
+            bad("h3", "GET", "/x", &["[::1"]),
+            bad("h4", "GET", "/x", &["a?b"]),
+            bad("h5", "GET", "/x", &["u@a"]),
+            bad("h6", "GET", "/x", &["a\\b"]),
+            bad("h7", "GET", "/x", &["a b"]),
+            bad("h8", "GET", "/x", &["a]"]),
+            bad("h9", "GET", "/x", &["ok", "a/b"]),
+            bad("a1", "GET", "http://a,b/x", &["a,b"]),
+            bad("a2", "GET", "http://a\\b/x", &["a\\b"]),
+            bad("a3", "GET", "http://a,b/x", &[]),
+            bad("a4", "CONNECT", "a,b:80", &["a,b:80"]),
+            bad("a5", "CONNECT", "a,b:80", &[]),
+            ok("o1", "GET", "/x", &["[::1]:80"], "GET /x HTTP/1.1", &["[::1]:80"]),
+            ok("o2", "GET", "http://[::1]/x", &["[::1]"], "GET http://[::1]/x HTTP/1.1", &["[::1]"]),
+            ok("o3", "GET", "http://u@a/x", &["a"], "GET http://u@a/x HTTP/1.1", &["a"]),
+            ok("o4", "GET", "/x", &[""], "GET /x HTTP/1.1", &[""]),
+        ],
+        "forbidden characters",
+    );
+}
+
+/// Sends `req` and returns the head the server received and the client's status.
+fn one(req: &str) -> (String, u16) {
+    let (be, seen) = backend();
+    let (_ibex, fe) = start(be);
+    let mut s = TcpStream::connect(fe).expect("connect");
+    s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    s.write_all(req.as_bytes()).unwrap();
+    let mut resp = Vec::new();
+    let mut buf = [0u8; 4096];
+    while !resp.windows(2).any(|w| w == b"\r\n") {
+        match s.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => resp.extend_from_slice(&buf[..n]),
+        }
+    }
+    let resp = String::from_utf8_lossy(&resp).into_owned();
+    let status = resp.split(' ').nth(1).and_then(|v| v.parse().ok()).unwrap_or(0);
+    let head = seen.lock().unwrap().first().cloned().unwrap_or_default();
+    (head, status)
+}
+
+/// A head bigger than the 8 KiB the rebuild once had is normalised like any other
+/// (T101 item 2): the authority, the `Host`, and the `Content-Length` beside
+/// `Transfer-Encoding` of T89.
+#[test]
+fn a_head_over_8_kib_is_normalised_too() {
+    let pad = "a".repeat(9000);
+    let (head, status) = one(&format!(
+        "GET http://hostname:80/big HTTP/1.1\r\nhost: hostname:80\r\nx-pad: {pad}\r\n\r\n"
+    ));
+    assert_eq!(status, 200, "head: {head:.200}");
+    assert!(head.starts_with("GET http://hostname/big HTTP/1.1\r\n"), "request line: {:.80}", head);
+    assert!(head.contains("\r\nhost: hostname\r\n"), "Host not normalised");
+    assert!(head.contains(&pad), "padding lost");
+
+    let (head, status) = one(&format!(
+        "POST /big HTTP/1.1\r\nhost: h\r\ncontent-length: 5\r\ntransfer-encoding: chunked\r\nx-pad: {pad}\r\n\r\n0\r\n\r\n"
+    ));
+    assert_eq!(status, 200, "head: {head:.200}");
+    assert!(!head.to_ascii_lowercase().contains("content-length"), "Content-Length kept beside Transfer-Encoding");
+}
+
+/// `option accept-unsafe-violations-in-http-request` lets a `#` through in the target
+/// (`h1m->err_pos == -1`: captured, not refused); the authority stops at it, so a default
+/// port before it is still dropped. A forbidden character in `Host` stays refused, as does
+/// one in the authority when `Host` is sent (reg-tests `h1_authority_fragment_char.vtc`).
+/// `no option` in the same frontend turns it off again.
+#[test]
+fn accept_unsafe_violations_lets_a_fragment_through() {
+    let opt = "  option accept-unsafe-violations-in-http-request\n";
+    let cases = [
+        ok("u1", "GET", "http://hostname#frag", &["hostname"], "GET http://hostname#frag HTTP/1.1", &["hostname"]),
+        ok("u2", "GET", "http://hostname:80#frag", &["hostname"], "GET http://hostname#frag HTTP/1.1", &["hostname"]),
+        ok("u3", "GET", "/a#b", &["h"], "GET /a#b HTTP/1.1", &["h"]),
+        ok("u4", "GET", "http://hostname/abc#frag", &["hostname"], "GET http://hostname/abc#frag HTTP/1.1", &["hostname"]),
+        ok("u5", "GET", "http://a,b/x", &[], "GET http://a,b/x HTTP/1.1", &[]),
+        bad("u6", "GET", "/x", &["a/b"]),
+        bad("u7", "GET", "http://a,b/x", &["a,b"]),
+    ];
+    let wrong = run_with(&cases, opt);
+    assert!(wrong.is_empty(), "with the option:\n  {}", wrong.join("\n  "));
+    let off = format!("{opt}  no option accept-unsafe-violations-in-http-request\n");
+    let wrong = run_with(&[bad("u8", "GET", "/a#b", &["h"])], &off);
+    assert!(wrong.is_empty(), "with the option turned off:\n  {}", wrong.join("\n  "));
+}
+
+/// `%r` is the request line after the authority was normalised, not as received
+/// (`h1_host_normalization.vtc` expects `uri: GET http://toto:poue@hostname/c1 HTTP/1.1`
+/// for a target sent with `:80`; T101 item 4).
+#[test]
+fn the_logged_request_line_is_the_normalised_one() {
+    let collector = std::net::UdpSocket::bind("127.0.0.1:0").expect("collector");
+    collector.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let (be, _seen) = backend();
+    let lines = format!("  log {} local0\n  log-format \"uri: %r; host: %hr\"\n  http-request capture req.hdr(host) len 512\n", collector.local_addr().unwrap());
+    let (_ibex, fe) = start_with(be, &lines);
+    let mut s = TcpStream::connect(fe).expect("connect");
+    s.write_all(b"GET http://hostname:80/log HTTP/1.1\r\nhost: hostname:80\r\nconnection: close\r\n\r\n").unwrap();
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out);
+    let mut buf = [0u8; 2048];
+    // The connection `start` made to see ibex listening logs as `<BADREQ>` first.
+    let mut seen = Vec::new();
+    while let Ok(n) = collector.recv(&mut buf) {
+        let line = String::from_utf8_lossy(&buf[..n]).into_owned();
+        if !line.contains("<BADREQ>") {
+            seen.push(line);
+            break;
+        }
+    }
+    assert!(
+        seen.first().is_some_and(|l| l.ends_with("uri: GET http://hostname/log HTTP/1.1; host: {hostname}")),
+        "logged: {seen:?}"
     );
 }

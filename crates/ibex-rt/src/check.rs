@@ -2335,7 +2335,18 @@ fn progress_smtp_check(
         let mut last_code = None;
         let mut last_info = None;
 
-        for line in resp_str.lines() {
+        // T117: judge only lines that are complete. A reply `248\r\n` arriving as `2`,
+        // `4`, `8`, `\r\n` has the shape of a final line ("248", nothing after the code)
+        // as soon as the `8` is in; taking it then sent QUIT early and read the trailing
+        // CRLF as the QUIT answer. HAProxy's expect (`^(2xx-...\r\n)*2xx[ \r]`, no
+        // min-recv) keeps waiting while it cannot decide. At EOF the partial tail counts,
+        // as before.
+        let judged = if eof {
+            &resp_str[..]
+        } else {
+            &resp_str[..resp_str.rfind('\n').map_or(0, |i| i + 1)]
+        };
+        for line in judged.lines() {
             if line.len() >= 3
                 && line.as_bytes()[0].is_ascii_digit()
                 && line.as_bytes()[1].is_ascii_digit()

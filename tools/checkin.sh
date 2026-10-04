@@ -167,8 +167,17 @@ check "$CLIPPY_RC" "clippy"
 
 echo
 section "continuous measurement"
-tools/measure/run.sh --fast
-check "$?" "continuous measurement"
+# IBEX_GATE_SKIP_MEASURE=1 is for agents working in a worktree. With a dozen of them on
+# one machine the throughput samples are noise (T99's gate failed on -10% at load 24 with
+# no hot-path change, then passed unchanged), and each re-run costs the agent a whole gate.
+# The supervisor runs the full gate, measurement included, on main before a merge counts.
+if [ "${IBEX_GATE_SKIP_MEASURE:-}" = 1 ]; then
+  echo "skipped (IBEX_GATE_SKIP_MEASURE=1): measured on main at merge, not here"
+  SKIPPED_MEASURE=1
+else
+  tools/measure/run.sh --fast
+  check "$?" "continuous measurement"
+fi
 
 echo
 section "new surface since the nudge, and whether it came with tests"
@@ -187,9 +196,10 @@ git status --short | grep '^??' \
 
 echo
 section "verdict"
-printf '%s\t%s\n' "(whole gate)" $((SECONDS - GATE_T0)) >> "$GATE_HISTORY" 2>/dev/null || true
+# A gate without its measurement is shorter; its time would drag the "usually" hint down.
+[ -n "${SKIPPED_MEASURE:-}" ] || printf '%s\t%s\n' "(whole gate)" $((SECONDS - GATE_T0)) >> "$GATE_HISTORY" 2>/dev/null || true
 if [ ${#FAILED[@]} -eq 0 ]; then
-  echo "checkin: PASS"
+  echo "checkin: PASS${SKIPPED_MEASURE:+ (measurement skipped: not final until the gate on main has measured)}"
   exit 0
 fi
 echo "checkin: FAIL (${#FAILED[@]})"

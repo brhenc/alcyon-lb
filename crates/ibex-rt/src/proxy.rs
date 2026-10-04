@@ -29,7 +29,7 @@ use ibex_proto::htx::HtxBlock;
 use ibex_proto::h2::H2_CONN_PREFACE;
 use ibex_proto::mux::Mux;
 use ibex_proto::mux_h2::{H2MuxContext, MuxH2};
-use ibex_proto::{extract_cookie, rewrite_header_block, CompiledExp};
+use ibex_proto::{rewrite_header_block, CompiledExp};
 use ibex_sample::{Expr, Registry, SampleContext};
 use ibex_sched::Tick;
 use ibex_stick_table::StickKey;
@@ -99,8 +99,6 @@ pub struct TcpSession {
     pub srv_xprt: ServerXprt,
     pub mode: Mode,
     pub client_addr: Option<SocketAddr>,
-    pub cookie_name: Option<String>,
-    pub cookie_val: Option<String>,
     pub cliexp: Vec<CompiledExp>,
     pub srvexp: Vec<CompiledExp>,
     pub req_uri: Option<String>,
@@ -187,6 +185,8 @@ pub struct TcpSession {
     /// Keep each request line for the log (`txn->uri`): set when a format of the
     /// frontend reads it, so a frontend that does not log it does not pay for a copy.
     pub keep_request_line: bool,
+    /// `option accept-unsafe-violations-in-http-request` on the frontend.
+    pub accept_unsafe_request: bool,
 }
 
 impl TcpSession {
@@ -195,7 +195,6 @@ impl TcpSession {
         Self::new_with_mode(
             cli,
             Mode::Tcp,
-            None,
             Vec::new(),
             Vec::new(),
             timeouts,
@@ -209,7 +208,6 @@ impl TcpSession {
     pub fn new_with_mode(
         cli: OwnedFd,
         mode: Mode,
-        cookie_name: Option<String>,
         cliexp: Vec<CompiledExp>,
         srvexp: Vec<CompiledExp>,
         timeouts: Timeouts,
@@ -229,8 +227,6 @@ impl TcpSession {
             srv_xprt: ServerXprt::Plain,
             mode,
             client_addr: None,
-            cookie_name,
-            cookie_val: None,
             cliexp,
             srvexp,
             req_uri: None,
@@ -285,6 +281,7 @@ impl TcpSession {
             h2_flood_config: ibex_proto::H2FloodConfig::default(),
             is_first_req: true,
             keep_request_line: false,
+            accept_unsafe_request: false,
         };
         s.arm_client(now);
         s
@@ -646,6 +643,7 @@ impl TcpSession {
         let parser = ibex_proto::parser::build(self.parser_kind)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         let mut stream = parser.stream(false);
+        stream.set_accept_unsafe_request(self.accept_unsafe_request);
         let raw = self.htx_buf.raw_slice_mut();
         let mut slice = ibex_proto::htx::HtxSlice::new(raw);
         stream.parse(&self.req.readable()[..head_len], &mut slice)?;
@@ -941,16 +939,6 @@ impl TcpSession {
                     self.fail_request(400);
                     return Ok(true);
                 };
-                // `txn->uri`: the request line as received, before any rule rewrites it
-                // (`HAProxy` keeps its first `tune.http.logurilen`, 1024, bytes).
-                self.log.request = Some(std::time::Instant::now());
-                if self.keep_request_line {
-                    let head = &self.req.readable()[..total_hdr_len];
-                    let line_end = head.iter().position(|&b| b == b'\r' || b == b'\n').unwrap_or(head.len());
-                    let line = String::from_utf8_lossy(&head[..line_end.min(1024)]).into_owned();
-                    self.log.request_line = Some(line);
-                }
-
                 if self.has_htx {
                     let (req_m, req_u, conn_close, wire_replacement) = {
                         let htx = ibex_proto::htx::HtxSliceRef::new(
@@ -973,12 +961,8 @@ impl TcpSession {
                             conn_close = true;
                         }
                         let wire_replacement = if self.htx_modified {
-                            let mut wire_buf = [0u8; 8192];
-                            if let Ok(n) = htx.write_h1_wire(&mut wire_buf) {
-                                Some((wire_buf, n))
-                            } else {
-                                None
-                            }
+                            // Sized to the head, not a fixed buffer (tasks/T101).
+                            Some(htx.write_h1_wire_vec())
                         } else {
                             None
                         };
@@ -992,8 +976,8 @@ impl TcpSession {
                     }
                     close |= conn_close;
                     // Only regenerate wire buffer if HTX was actually modified
-                    if let Some((wire_buf, n)) = wire_replacement {
-                        self.req.replace_prefix(total_hdr_len, &wire_buf[..n]);
+                    if let Some(wire) = wire_replacement {
+                        self.req.replace_prefix(total_hdr_len, &wire);
                     }
                 } else {
                     let hdr_bytes = &self.req.readable()[..total_hdr_len];
@@ -1040,16 +1024,23 @@ impl TcpSession {
                     self.req_headers = Some(hdrs);
                 }
 
-                if self.cookie_name.is_some() || !self.cliexp.is_empty() {
+                // `txn->uri`: the request line once the parser has normalised the authority
+                // (`HAProxy` takes it from the HTX start line), before any rule rewrites it
+                // (and keeps its first `tune.http.logurilen`, 1024, bytes). The head forwarded
+                // may have been regenerated just above, so its length is read again.
+                self.log.request = Some(std::time::Instant::now());
+                if self.keep_request_line {
+                    let head = self.req.readable();
+                    let line_end = head.iter().position(|&b| b == b'\r' || b == b'\n').unwrap_or(head.len());
+                    let line = String::from_utf8_lossy(&head[..line_end.min(1024)]).into_owned();
+                    self.log.request_line = Some(line);
+                }
+
+                if !self.cliexp.is_empty() {
                     let hdr_bytes = &self.req.readable()[..total_hdr_len];
                     let hdr_str = String::from_utf8_lossy(hdr_bytes);
-                    if let Some(ref cname) = self.cookie_name {
-                        self.cookie_val = extract_cookie(&hdr_str, cname);
-                    }
-                    if !self.cliexp.is_empty() {
-                        let rewritten = rewrite_header_block(&hdr_str, &self.cliexp);
-                        self.req.replace_prefix(total_hdr_len, rewritten.as_bytes());
-                    }
+                    let rewritten = rewrite_header_block(&hdr_str, &self.cliexp);
+                    self.req.replace_prefix(total_hdr_len, rewritten.as_bytes());
                 }
 
                 // The head may have been rewritten above; its framing is read from what
@@ -1808,14 +1799,7 @@ pub fn eval_acl_term_extended<S: ::std::hash::BuildHasher>(
             let min_needed = if len > 0 {
                 offset.saturating_add(len)
             } else {
-                let pat_len = match &expr.matcher {
-                    Some(ibex_sample::Matcher::Str { target, .. }) => target.len(),
-                    Some(ibex_sample::Matcher::Beg { prefix, .. }) => prefix.len(),
-                    Some(ibex_sample::Matcher::End { suffix, .. }) => suffix.len(),
-                    Some(ibex_sample::Matcher::Sub { sub, .. }) => sub.len(),
-                    Some(ibex_sample::Matcher::Bin(target)) => target.len(),
-                    _ => 1,
-                };
+                let pat_len = expr.matcher.as_ref().map_or(1, ibex_sample::Matcher::min_pattern_len);
                 offset.saturating_add(pat_len)
             };
             if req_bytes.len() < min_needed {
@@ -1837,20 +1821,16 @@ pub fn eval_acl_term_extended<S: ::std::hash::BuildHasher>(
             .get(1)
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(0);
-        if len == 0 {
-            match &expr.matcher {
-                Some(ibex_sample::Matcher::Sub { .. }) => {
-                    // An unanchored substring non-match is not final while the payload can still grow,
-                    // unless a line delimiter indicates the write/message boundary has ended.
-                    if !req_bytes.ends_with(b"\n") {
-                        return AclEvalResult::MissingData;
-                    }
-                }
-                Some(ibex_sample::Matcher::End { .. } | ibex_sample::Matcher::Reg { .. }) => {
-                    return AclEvalResult::MissingData;
-                }
-                _ => {}
-            }
+        // A non-match is not final while the payload can still grow, for an unanchored
+        // substring unless a line delimiter says the message has ended, and for a suffix
+        // or a regex whatever the payload ends with.
+        if len == 0
+            && expr
+                .matcher
+                .as_ref()
+                .is_some_and(|m| m.may_match_later(req_bytes.ends_with(b"\n")))
+        {
+            return AclEvalResult::MissingData;
         }
     }
     let effective = if term.negated { !is_match } else { is_match };

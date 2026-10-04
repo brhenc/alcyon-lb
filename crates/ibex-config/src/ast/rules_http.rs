@@ -170,6 +170,10 @@ pub enum HttpResAction {
     AddHeader { name: String, fmt: String },
     DelHeader { name: String },
     SetStatus { status: u16 },
+    /// `http-response capture <sample> id <id>`: the sample into the frontend's response
+    /// capture slot `id` (a `declare capture response`, or a `capture response header`),
+    /// cut to that slot's length.
+    Capture { expr: String, id: usize },
 }
 
 /// Rule pairing an HTTP-response action with an optional condition.

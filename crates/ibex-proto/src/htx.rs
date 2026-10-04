@@ -888,12 +888,26 @@ impl<'a> HtxSliceRef<'a> {
         Ok(cursor)
     }
 
+    /// The HTTP/1 head of this message, in a buffer sized to fit it: it starts at 8 KiB and
+    /// doubles until the head is written. A fixed buffer silently skipped the rewrite of
+    /// every larger head (tasks/T101). The only way `write_h1_wire` fails is a buffer that
+    /// is too small, and a message is finite, so this ends.
+    #[must_use]
+    pub fn write_h1_wire_vec(&self) -> Vec<u8> {
+        let mut size = 8192;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Ok(n) = self.write_h1_wire(&mut out) {
+                out.truncate(n);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
     #[must_use]
     pub fn to_h1_wire(&self) -> Vec<u8> {
-        let mut out = vec![0u8; 8192];
-        let n = self.write_h1_wire(&mut out).unwrap_or(0);
-        out.truncate(n);
-        out
+        self.write_h1_wire_vec()
     }
 
     #[must_use]
@@ -971,6 +985,24 @@ impl<'a> HtxSliceRef<'a> {
             } else {
                 None
             }
+        })
+    }
+
+    /// The header blocks as `(block index, name, value)`. The index is what
+    /// `replace_block_value` and `remove_block` take, and stays valid while other
+    /// blocks are replaced or removed.
+    pub fn header_blocks(self) -> impl Iterator<Item = (usize, &'a str, &'a str)> + 'a {
+        (0..self.num_blocks).filter_map(move |i| {
+            let desc = self.read_desc(i);
+            if desc.blk_type != HtxBlockType::Header {
+                return None;
+            }
+            let name_start = desc.addr as usize;
+            let name_end = name_start + desc.name_len as usize;
+            let val_end = name_end + desc.value_len as usize;
+            let name = std::str::from_utf8(&self.buf[name_start..name_end]).ok()?;
+            let val = std::str::from_utf8(&self.buf[name_end..val_end]).ok()?;
+            Some((i, name, val))
         })
     }
 
@@ -2200,10 +2232,7 @@ impl HtxBuffer {
 
     #[must_use]
     pub fn to_h1_wire(&self) -> Vec<u8> {
-        let mut out = vec![0u8; 8192];
-        let n = self.as_slice().write_h1_wire(&mut out).unwrap_or(0);
-        out.truncate(n);
-        out
+        self.as_slice().to_h1_wire()
     }
 }
 

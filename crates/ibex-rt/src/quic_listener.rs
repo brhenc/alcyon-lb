@@ -29,6 +29,8 @@ const BATCH_SIZE: usize = 32;
 const DGRAM_BUF_SIZE: usize = 2048;
 /// Control message buffer capacity per datagram for `IP_PKTINFO`.
 const CMSG_BUF_SIZE: usize = 128;
+/// H3_NO_ERROR (RFC 9114 section 8.1), the application error code of a graceful close.
+const H3_NO_ERROR: u64 = 0x100;
 
 /// A QUIC listener managing datagram I/O on a nonblocking UDP socket and driving the QUIC transport.
 pub struct QuicListener {
@@ -44,6 +46,17 @@ pub struct QuicListener {
     backend: Option<SocketAddr>,
     /// Backend requests still in flight, one per answered request stream.
     legs: Vec<BackendLeg>,
+    /// Set by a soft stop: no new connection, and a connection is closed once it is idle.
+    stopping: bool,
+    /// Where each live connection's peer is, so a soft stop can pin its datagrams here.
+    peers: HashMap<ConnectionId, SocketAddr>,
+    /// Soft stop only: one connected UDP socket per peer still being served. See
+    /// [`QuicListener::begin_soft_stop`].
+    pinned: Vec<(SocketAddr, DgramSocket)>,
+    /// Descriptors of backend legs and pinned sockets that were dropped, for the engine to
+    /// forget: the number is free for the kernel to hand out again, and a stale table entry
+    /// under it would keep the next socket to get it out of the poller.
+    released: Vec<RawFd>,
 }
 
 /// One backend request in flight, driven without blocking the pump loop.
@@ -72,6 +85,13 @@ struct H3State {
     req: HashMap<StreamId, Vec<u8>>,
     /// Request streams already answered, so a second readable event does not answer twice.
     answered: Vec<StreamId>,
+    /// Responses written in full whose last byte the peer has not yet acknowledged. Closing
+    /// the connection before then abandons them.
+    unacked: Vec<StreamId>,
+    /// One past the highest request stream seen: the GOAWAY identifier.
+    next_request: u64,
+    /// A GOAWAY went out, or the connection was closed.
+    draining: bool,
 }
 
 impl QuicListener {
@@ -132,6 +152,10 @@ impl QuicListener {
             h3: HashMap::new(),
             backend: None,
             legs: Vec::new(),
+            stopping: false,
+            peers: HashMap::new(),
+            pinned: Vec::new(),
+            released: Vec::new(),
         })
     }
 
@@ -178,21 +202,33 @@ impl QuicListener {
             .collect();
 
         let n = self.socket.recv_batch(&mut dgram_bufs)?;
+        Self::dispatch(&mut self.endpoint, now, &dgram_bufs, n);
+        // Datagrams of the connections a soft stop pinned. A pinned socket is drained empty
+        // each time, like the listening one, so level-triggered readiness cannot spin.
+        let mut total = n;
+        for (_, sock) in &self.pinned {
+            loop {
+                // WouldBlock is "drained"; any other error on a socket we may drop is too.
+                let got = sock.recv_batch(&mut dgram_bufs).unwrap_or(0);
+                if got == 0 {
+                    break;
+                }
+                Self::dispatch(&mut self.endpoint, now, &dgram_bufs, got);
+                total += got;
+            }
+        }
+        Ok(total)
+    }
+
+    fn dispatch(endpoint: &mut QuicEndpoint, now: Instant, dgram_bufs: &[DgramBuf], n: usize) {
         for item in dgram_bufs.iter().take(n) {
             if item.truncated {
                 continue;
             }
             if let Some(src) = item.src_addr {
-                let _ = self.endpoint.handle_datagram(
-                    now,
-                    src,
-                    item.dst_addr,
-                    &item.buf[..item.len],
-                );
+                let _ = endpoint.handle_datagram(now, src, item.dst_addr, &item.buf[..item.len]);
             }
         }
-
-        Ok(n)
     }
 
     /// Drains outbound transmits from the QUIC transport and sends them in batch over the socket.
@@ -287,10 +323,20 @@ impl QuicListener {
                         self.open_control_stream(conn_id);
                     }
                 }
+                TransportEvent::NewConnection { conn_id, remote } => {
+                    self.peers.insert(conn_id, remote);
+                }
                 TransportEvent::StreamOpened { conn_id, stream_id, dir } => {
                     if dir == StreamDirection::Bidirectional {
-                        self.h3.entry(conn_id).or_default().req.entry(stream_id).or_default();
+                        let st = self.h3.entry(conn_id).or_default();
+                        st.req.entry(stream_id).or_default();
+                        st.next_request = st.next_request.max(stream_id.0 + 4);
                     }
+                    // A stream whose first flight already carries the whole request is
+                    // opened and readable at once, and quinn-proto raises no separate
+                    // `Readable` for data that arrived before the stream was accepted.
+                    // Waiting for one left such a request unanswered for ever.
+                    self.on_readable(conn_id, stream_id, &mut scratch);
                 }
                 TransportEvent::StreamReadable { conn_id, stream_id } => {
                     self.on_readable(conn_id, stream_id, &mut scratch);
@@ -301,18 +347,123 @@ impl QuicListener {
                 | TransportEvent::StreamReset { conn_id, stream_id, .. } => {
                     if let Some(st) = self.h3.get_mut(&conn_id) {
                         st.req.remove(&stream_id);
+                        st.unacked.retain(|s| *s != stream_id);
                     }
                 }
                 TransportEvent::ConnectionClosed { conn_id, .. } => {
                     self.h3.remove(&conn_id);
+                    self.peers.remove(&conn_id);
+                    self.release_pinned();
                 }
                 _ => {}
             }
         }
 
         self.advance_backends();
+        if self.stopping {
+            self.drain_idle_connections();
+        }
         self.send_batch(now)?;
         Ok(())
+    }
+
+    /// Soft stop, HAProxy's `soft_stop()` for a QUIC listener: refuse new connections, tell
+    /// every established HTTP/3 client with a GOAWAY that it will get no further request,
+    /// and close each connection as soon as the responses it owes have been delivered.
+    /// The UDP socket stays registered, because the datagrams of those connections arrive on it.
+    pub fn begin_soft_stop(&mut self) {
+        // Called once, by the engine, when the soft stop begins.
+        self.stopping = true;
+        self.endpoint.stop_accepting();
+        self.pin_peers();
+        for (conn_id, st) in &mut self.h3 {
+            Self::send_goaway(&mut self.endpoint, *conn_id, st);
+        }
+        self.drain_idle_connections();
+    }
+
+    /// Gives each remaining connection a UDP socket of its own, connected to its peer.
+    ///
+    /// The new process of a reload binds the same address with `SO_REUSEPORT`, and the kernel
+    /// then hashes every datagram to one of the two listening sockets, so about half of what
+    /// an old connection's client sends -- the acknowledgement of the response it was
+    /// waiting for included -- would reach a process that has never heard of the connection
+    /// and answers with a stateless reset. A connected socket is matched on the full four
+    /// tuple before the reuseport group is consulted, which is what keeps those datagrams
+    /// here. HAProxy does the same in `quic-socket connection` mode (`quic_sock.c`).
+    fn pin_peers(&mut self) {
+        let mut want: Vec<SocketAddr> = self.peers.values().copied().collect();
+        want.sort();
+        want.dedup();
+        for peer in want {
+            if let Ok(sock) = DgramSocket::bind(self.addr).and_then(|s| s.connect(peer).map(|()| s)) {
+                self.pinned.push((peer, sock));
+            }
+        }
+    }
+
+    /// Drops the pinned socket of a peer with no connection left.
+    fn release_pinned(&mut self) {
+        let live: Vec<SocketAddr> = self.peers.values().copied().collect();
+        let released = &mut self.released;
+        self.pinned.retain(|(peer, sock)| {
+            let keep = live.contains(peer);
+            if !keep {
+                released.push(sock.as_raw_fd());
+            }
+            keep
+        });
+    }
+
+    /// The pinned sockets (see `begin_soft_stop`), for the engine's poller. Read-only
+    /// interest: a UDP socket is always writable, so asking for that would spin the loop.
+    #[must_use]
+    pub fn pinned_borrowed_fds(&self) -> Vec<std::os::fd::BorrowedFd<'_>> {
+        self.pinned.iter().map(|(_, s)| s.borrowed_fd()).collect()
+    }
+
+    /// Descriptors of legs and pinned sockets dropped since the last call.
+    pub fn take_released_fds(&mut self) -> Vec<RawFd> {
+        std::mem::take(&mut self.released)
+    }
+
+    /// Whether this listener still has work a soft stop must wait for: a connection that has
+    /// not yet finished closing, or a backend request in flight.
+    #[must_use]
+    pub fn is_busy(&self) -> bool {
+        !self.legs.is_empty() || self.endpoint.connection_count() > 0
+    }
+
+    /// Sends GOAWAY once on a connection's control stream.
+    fn send_goaway(endpoint: &mut QuicEndpoint, conn_id: ConnectionId, st: &mut H3State) {
+        if let (Some(control), false) = (st.control, std::mem::replace(&mut st.draining, true)) {
+            let bytes = mux_h3::encode_goaway(st.next_request);
+            let _ = endpoint.write_stream(conn_id, control, &bytes, false);
+        }
+    }
+
+    /// Closes, with H3_NO_ERROR, every connection that owes no response.
+    fn drain_idle_connections(&mut self) {
+        let mut idle = Vec::new();
+        for (conn_id, st) in &self.h3 {
+            let owes = !st.unacked.is_empty()
+                || st.req.values().any(|b| !b.is_empty())
+                || self.legs.iter().any(|l| l.conn_id == *conn_id);
+            if !owes {
+                idle.push(*conn_id);
+            }
+        }
+        for conn_id in idle {
+            self.endpoint.close_connection(conn_id, H3_NO_ERROR, b"");
+        }
+    }
+
+    /// Writes a whole response and remembers that its delivery is still owed.
+    fn respond(&mut self, conn_id: ConnectionId, stream_id: StreamId, resp: &[u8]) {
+        let _ = self.endpoint.write_stream(conn_id, stream_id, resp, true);
+        if let Some(st) = self.h3.get_mut(&conn_id) {
+            st.unacked.push(stream_id);
+        }
     }
 
     /// The file descriptors of in-flight backend requests.
@@ -329,6 +480,7 @@ impl QuicListener {
     fn advance_backends(&mut self) {
         let mut finished: Vec<(ConnectionId, StreamId, Vec<u8>)> = Vec::new();
         let mut still = Vec::with_capacity(self.legs.len());
+        let before: Vec<RawFd> = self.legs.iter().map(|l| l.fd.as_raw_fd()).collect();
 
         for mut leg in std::mem::take(&mut self.legs) {
             if !leg.connected {
@@ -404,8 +556,13 @@ impl QuicListener {
         }
 
         self.legs = still;
+        for fd in before {
+            if !self.legs.iter().any(|l| l.fd.as_raw_fd() == fd) {
+                self.released.push(fd);
+            }
+        }
         for (conn_id, stream_id, resp) in finished {
-            let _ = self.endpoint.write_stream(conn_id, stream_id, &resp, true);
+            self.respond(conn_id, stream_id, &resp);
         }
     }
 
@@ -466,9 +623,7 @@ impl QuicListener {
         if let Some(be) = self.backend {
             match Self::start_backend(be, conn_id, stream_id, &field_section) {
                 Ok(leg) => self.legs.push(leg),
-                Err(resp) => {
-                    let _ = self.endpoint.write_stream(conn_id, stream_id, &resp, true);
-                }
+                Err(resp) => self.respond(conn_id, stream_id, &resp),
             }
         } else {
             let body = b"hello-from-ibex-h3".to_vec();
@@ -477,7 +632,7 @@ impl QuicListener {
                 &[("content-length".to_string(), body.len().to_string())],
                 &body,
             );
-            let _ = self.endpoint.write_stream(conn_id, stream_id, &resp, true);
+            self.respond(conn_id, stream_id, &resp);
         }
     }
 }

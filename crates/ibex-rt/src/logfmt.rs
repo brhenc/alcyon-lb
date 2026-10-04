@@ -75,8 +75,8 @@ pub struct LogData<'a> {
     /// The request line as received; `None` prints `<BADREQ>`.
     pub request_line: Option<&'a str>,
     /// Header captures, one per configured slot; `None` when the frontend has none.
-    pub req_captures: Option<&'a [Option<String>]>,
-    pub res_captures: Option<&'a [Option<String>]>,
+    pub req_captures: Option<&'a [Option<Vec<u8>>]>,
+    pub res_captures: Option<&'a [Option<Vec<u8>>]>,
     pub unique_id: Option<&'a str>,
 }
 
@@ -534,11 +534,11 @@ fn url_escaped(b: u8) -> bool {
 
 /// `lf_encode_string`: `s`, with every byte `escaped` selects written `#XX`, quoted if
 /// asked.
-fn encoded(out: &mut String, s: &str, escaped: fn(u8) -> bool, o: Opts) {
+fn encoded(out: &mut String, s: &[u8], escaped: fn(u8) -> bool, o: Opts) {
     if o.quote {
         out.push('"');
     }
-    for &c in s.as_bytes() {
+    for &c in s {
         if escaped(c) {
             let _ = write!(out, "#{c:02X}");
         } else {
@@ -774,7 +774,7 @@ fn alias(out: &mut String, a: Alias, o: Opts, d: &LogData) {
                 }
             }
         }
-        Alias::Req => encoded(out, d.request_line.unwrap_or("<BADREQ>"), url_escaped, o),
+        Alias::Req => encoded(out, d.request_line.unwrap_or("<BADREQ>").as_bytes(), url_escaped, o),
         Alias::HttpMethod | Alias::HttpUri | Alias::HttpPath | Alias::HttpPathOnly | Alias::HttpVersion => {
             let value = match d.request_line.and_then(line_parts) {
                 None => badreq(),
@@ -786,7 +786,7 @@ fn alias(out: &mut String, a: Alias, o: Opts, d: &LogData) {
                     _ => v.to_string(),
                 },
             };
-            encoded(out, &value, url_escaped, o);
+            encoded(out, value.as_bytes(), url_escaped, o);
         }
         Alias::HttpQuery => {
             let value = match d.request_line {
@@ -796,7 +796,7 @@ fn alias(out: &mut String, a: Alias, o: Opts, d: &LogData) {
                     q.split([' ', '\t']).next().unwrap_or("").to_string()
                 }
             };
-            encoded(out, &value, url_escaped, o);
+            encoded(out, value.as_bytes(), url_escaped, o);
         }
     }
 }

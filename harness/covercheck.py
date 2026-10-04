@@ -111,12 +111,130 @@ def changed_lines(base: str, repo: str = REPO) -> dict[str, set[int]]:
     return per
 
 
-def covered(paths: set[str]) -> tuple[dict[str, set[int]], dict[str, set[int]]] | None:
+def _llvm_env() -> dict:
     env = dict(os.environ)
     # Fedora-packaged Rust, no rustup, so llvm-tools-preview is not installable that way.
     env.setdefault("LLVM_COV", "/usr/bin/llvm-cov")
     env.setdefault("LLVM_PROFDATA", "/usr/bin/llvm-profdata")
     env["PATH"] = os.path.expanduser("~/.cargo/bin") + os.pathsep + env.get("PATH", "")
+    return env
+
+
+def covered(paths: set[str]) -> tuple[dict[str, set[int]], dict[str, set[int]]] | None:
+    if os.path.exists(LCOV):
+        os.unlink(LCOV)
+    ok = run_serial() if os.environ.get("COVERCHECK_SERIAL") == "1" else run_pooled()
+    if not ok:
+        return None
+    return read_lcov(paths)
+
+
+def run_pooled() -> bool:
+    """The tests, instrumented, through suite.py's pool (T116): `cargo llvm-cov` runs the
+    workspace's 130 test binaries one after another, which made this the slowest section
+    of the gate. Same build (`cargo llvm-cov show-env`), same target directory as
+    `cargo llvm-cov` uses, the same tests; failures are ignored as `--ignore-run-fail`
+    ignores them (the suite section judges them), a hung binary is not.
+
+    False when a test binary hung: a gate that cannot finish has not passed."""
+    env = _llvm_env()
+    # `cargo llvm-cov` builds into `<target>/llvm-cov-target`. `show-env` takes the
+    # directory as given and `report` appends `llvm-cov-target` itself, so each is told
+    # what makes them meet there.
+    outer = env.get("CARGO_TARGET_DIR") or os.path.join(REPO, "target")
+    env["CARGO_TARGET_DIR"] = os.path.join(outer, "llvm-cov-target")
+    # --no-rustc-wrapper: with cargo-llvm-cov's wrapper, a build into a directory it has not
+    # built before left most crates (ibex-sample, ibex-rt ...) uninstrumented: 22 of 148
+    # binaries wrote a profile, every changed line read as "not executed" or, worse, the
+    # report held none of them and covercheck passed. RUSTFLAGS instruments everything.
+    show = subprocess.run(["cargo", "llvm-cov", "show-env", "--sh", "--no-cfg-coverage",
+                           "--no-rustc-wrapper"],
+                          cwd=REPO, capture_output=True, text=True, env=env)
+    for line in show.stdout.splitlines():
+        m = re.match(r"export (\w+)='(.*)'$", line)
+        if m:
+            env[m.group(1)] = m.group(2)
+    # Old profiles would count lines an earlier tree's tests ran.
+    tdir = env["CARGO_TARGET_DIR"]
+    for f in os.listdir(tdir) if os.path.isdir(tdir) else []:
+        if f.endswith(".profraw"):
+            os.unlink(os.path.join(tdir, f))
+    os.environ.clear()
+    os.environ.update(env)
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import suite  # noqa: E402 -- reads os.environ when it runs, not when imported
+    print("covercheck: running every test target instrumented, "
+          f"{suite.JOBS} at a time, {suite.TARGET_TIMEOUT}s each at most", flush=True)
+    r = suite.run_parallel(doc=False)
+    if r is None:
+        print("covercheck: the instrumented tests do not build; skipping")
+        return True
+    _failing, failed_tests, passed, failed_n = r
+    print(f"covercheck: {passed} tests passed, {failed_n} failed (the suite section judges those)")
+    for target, names in sorted(failed_tests.items()):
+        print(f"   instrumented, failed: {target}: {', '.join(sorted(names))}")
+    if any("<hung>" in t for t in failed_tests.values()):
+        print("covercheck: a test binary hung (SUITE_TIMEOUT)")
+        return False
+    stale = prune_stale_binaries(os.path.join(tdir, "debug", "deps"), suite.built_executables)
+    if stale:
+        print(f"covercheck: removed {stale} test binaries an earlier build left in deps/")
+    profraws = sum(f.endswith(".profraw") for f in os.listdir(tdir))
+    binaries = _test_binaries(os.path.join(tdir, "debug", "deps"))
+    if not enough_profiles(profraws, binaries):
+        print(f"covercheck: only {profraws} profiles written by {binaries} test binaries: the "
+              "build was not instrumented, so this report cannot judge anything")
+        return False
+    rep = subprocess.run(["cargo", "llvm-cov", "report", "--lcov", "--output-path", LCOV],
+                         cwd=REPO, capture_output=True, text=True, env={**env, "CARGO_TARGET_DIR": outer})
+    if rep.returncode != 0:
+        print((rep.stderr or rep.stdout)[-600:])
+    return True
+
+
+def prune_stale_binaries(deps: str, current: set[str]) -> int:
+    """Deletes the executables in deps/ this build did not produce, and counts them.
+
+    `cargo llvm-cov report` reads every executable there. An earlier tree's test binary
+    (same target, another hash) carries that tree's line numbers, none executed in this run,
+    and the report then marks comments and blank lines of the current tree "not executed"."""
+    # By inode: cargo names a binary target by its uplifted copy (target/debug/ibex), a hard
+    # link of the one in deps/ that the report reads.
+    def inode(p):
+        st = os.stat(p)
+        return st.st_dev, st.st_ino
+    keep = {inode(p) for p in current if os.path.exists(p)}
+    n = 0
+    for f in os.listdir(deps) if os.path.isdir(deps) else []:
+        path = os.path.join(deps, f)
+        if ("." not in f and os.path.isfile(path) and os.access(path, os.X_OK)
+                and inode(path) not in keep):
+            os.unlink(path)
+            n += 1
+    return n
+
+
+def _test_binaries(deps: str) -> int:
+    """Executables in cargo's deps directory (hash-suffixed, no extension)."""
+    n = 0
+    for f in os.listdir(deps) if os.path.isdir(deps) else []:
+        path = os.path.join(deps, f)
+        if "." not in f and os.path.isfile(path) and os.access(path, os.X_OK):
+            n += 1
+    return n
+
+
+def enough_profiles(profraws: int, binaries: int) -> bool:
+    """An instrumented binary writes a profile when it exits; far fewer profiles than
+    binaries means most of the build was not instrumented. (Merge pools and build scripts
+    make the two counts differ a little, hence a half, not equality.)"""
+    return binaries == 0 or profraws * 2 >= binaries
+
+
+def run_serial() -> bool:
+    """`cargo llvm-cov` running the tests itself, one binary after another
+    (`COVERCHECK_SERIAL=1`)."""
+    env = _llvm_env()
     # --ignore-run-fail: the suite has two declared failures (data/suite_baseline.json).
     # Without it llvm-cov exits non-zero and writes no report, and this check silently
     # passes -- which is the failure mode that made suite.py green on everything once.
@@ -148,12 +266,18 @@ def covered(paths: set[str]) -> tuple[dict[str, set[int]], dict[str, set[int]]] 
                            timeout=int(os.environ.get("COVERCHECK_TIMEOUT", "1800")))
     except subprocess.TimeoutExpired:
         print("covercheck: cargo llvm-cov ran past COVERCHECK_TIMEOUT -- a test is hung")
-        return None
+        return False
     finally:
         stop.set()
     if not os.path.exists(LCOV):
         print("covercheck: cargo llvm-cov produced no report; skipping")
         print((r.stderr or r.stdout)[-400:])
+    return True
+
+
+def read_lcov(paths: set[str]) -> tuple[dict[str, set[int]], dict[str, set[int]]]:
+    if not os.path.exists(LCOV):
+        print("covercheck: no coverage report; skipping")
         return {}, {}
     # An lcov DA: record exists only for an *instrumented* line. A line with no record is
     # not executable -- a struct field, a `use`, a brace -- and must not be reported as

@@ -17,6 +17,9 @@ pub struct Expr {
     pub fetch_args: Vec<String>,
     pub converters: Vec<(String, Vec<String>)>,
     pub matcher: Option<Matcher>,
+    /// The other `acl` lines of the same name: an ACL declared several times matches if
+    /// any of its lines does (`find_acl_by_name` + `acl_exec_cond` walk the whole list).
+    pub alternates: Vec<Expr>,
 }
 
 /// `is_idchar` (include/haproxy/tools.h): what a fetch or converter name may contain.
@@ -40,6 +43,7 @@ impl Expr {
         }
 
         let (expr_part, matcher_part) = split_expr_and_matcher(input);
+        let m_tokens = matcher_part.map(tokenize_matcher_part).unwrap_or_default();
         let chain = split_call_chain(expr_part);
         if chain.is_empty() {
             return Err("Missing expression".to_string());
@@ -104,6 +108,8 @@ impl Expr {
                 "beg" => "beg",
                 "end" => "end",
                 "sub" => "sub",
+                "dir" => "dir",
+                "dom" => "dom",
                 "reg" => "reg",
                 _ => "found",
             };
@@ -113,6 +119,8 @@ impl Expr {
                 "beg" => "beg",
                 "end" => "end",
                 "sub" => "sub",
+                "dir" => "dir",
+                "dom" => "dom",
                 "reg" => "reg",
                 _ => "str",
             };
@@ -122,25 +130,38 @@ impl Expr {
             default_method = "str";
         }
 
-        // Optional matcher parts: e.g. `-m str pattern`, `-i pattern`, `pattern`, `gt 100`
-        let mut matcher = None;
+        // What follows the expression is `parse_acl_expr`'s: options (`-i`, `-n`, `-m <method>`,
+        // `-f <file>`, `--`) up to the first word that is not one, then patterns, every
+        // remaining word being one. Patterns read from a file join the inline ones.
+        let tokens = m_tokens;
         let mut match_method = default_method;
-        let mut pattern = String::new();
+        let mut forced = false;
         let mut case_insensitive = false;
-
-        if let Some(m_str) = matcher_part {
-            let tokens = tokenize_matcher_part(m_str);
-            let mut parts = tokens.into_iter();
-            while let Some(arg) = parts.next() {
-                if arg == "-m" {
-                    let m_method = parts
-                        .next()
+        let mut files_loaded = false;
+        let mut file_patterns: Vec<String> = Vec::new();
+        let mut idx = 0;
+        while idx < tokens.len() && tokens[idx].starts_with('-') {
+            match tokens[idx].as_str() {
+                "-i" => case_insensitive = true,
+                "-n" => {}
+                "-m" => {
+                    if files_loaded {
+                        return Err("'-m' must only be specified before patterns and files in parsing ACL expression".to_string());
+                    }
+                    if forced {
+                        return Err("only one explicit matching method can be defined with '-m' parameter".to_string());
+                    }
+                    idx += 1;
+                    let m_method = tokens
+                        .get(idx)
                         .ok_or_else(|| "Missing matcher method after -m".to_string())?;
                     match_method = match m_method.as_str() {
                         "str" => "str",
                         "beg" => "beg",
                         "end" => "end",
                         "sub" => "sub",
+                        "dir" => "dir",
+                        "dom" => "dom",
                         "reg" => "reg",
                         "int" => "int",
                         "gt" => "gt",
@@ -155,60 +176,73 @@ impl Expr {
                         "found" => "found",
                         other => return Err(format!("Unknown matcher method '{other}'")),
                     };
-                } else if arg == "-i" {
-                    case_insensitive = true;
-                } else if arg == "-n" {
-                    // Negative / no-op flag
-                } else if matches!(arg.as_str(), "gt" | "ge" | "lt" | "le" | "eq" | "ne") {
-                    match_method = match arg.as_str() {
-                        "gt" => "gt",
-                        "ge" => "ge",
-                        "lt" => "lt",
-                        "le" => "le",
-                        "eq" => "eq",
-                        "ne" => "ne",
-                        _ => "found",
-                    };
-                    if let Some(next_tok) = parts.next() {
-                        pattern = unescape_pattern(&next_tok);
-                    }
-                } else if pattern.is_empty() {
-                    pattern = unescape_pattern(&arg);
+                    forced = true;
+                }
+                "-f" => {
+                    idx += 1;
+                    let path = tokens
+                        .get(idx)
+                        .ok_or_else(|| "Missing file name after -f".to_string())?;
+                    file_patterns.extend(read_pattern_file(path)?);
+                    files_loaded = true;
+                }
+                "--" => {
+                    idx += 1;
+                    break;
+                }
+                other => {
+                    return Err(format!(
+                        "'{other}' is not a valid ACL option. Please use '--' before any pattern beginning with a '-'"
+                    ));
                 }
             }
+            idx += 1;
+        }
+        let inline = &tokens[idx.min(tokens.len())..];
+        let has_patterns = !file_patterns.is_empty() || !inline.is_empty();
+
+        if has_patterns && match_method == "found" && !forced {
+            match_method = default_match_method(&fetch_name, converters.is_empty());
         }
 
-        if !pattern.is_empty() {
-            if match_method == "found" {
-                if fetch_name == "src" || fetch_name == "dst" {
-                    match_method = "ip";
-                } else if fetch_name.ends_with("_port")
-                    || fetch_name == "status"
-                    || fetch_name.starts_with("sc_")
-                {
-                    match_method = "int";
-                } else {
-                    match_method = "str";
+        let mut patterns = file_patterns;
+        if match_method == "int" {
+            // `eq`, `ge`, `gt`, `le`, `lt` before a value make it a range (and stay in force
+            // for the values after it), unless the value is a range already.
+            let mut op = "eq";
+            for word in inline {
+                if matches!(word.as_str(), "eq" | "ge" | "gt" | "le" | "lt") {
+                    op = word.as_str();
+                    continue;
                 }
+                patterns.push(int_pattern_with_op(op, &unescape_pattern(word))?);
             }
-            matcher = Some(Matcher::compile_with_flags(
-                match_method,
-                &pattern,
-                case_insensitive,
-            )?);
-        } else if match_method != "found" {
-            matcher = Some(Matcher::compile_with_flags(
-                match_method,
-                &pattern,
-                case_insensitive,
-            )?);
+        } else {
+            patterns.extend(inline.iter().map(|w| unescape_pattern(w)));
         }
+
+        let matcher = if match_method == "found" {
+            if forced { Some(Matcher::Found) } else { None }
+        } else if patterns.is_empty() {
+            Some(Matcher::compile_with_flags(match_method, "", case_insensitive)?)
+        } else {
+            let mut list = Vec::with_capacity(patterns.len());
+            for pattern in &patterns {
+                list.push(Matcher::compile_with_flags(match_method, pattern, case_insensitive)?);
+            }
+            if list.len() == 1 {
+                list.pop()
+            } else {
+                Some(Matcher::Any(list))
+            }
+        };
 
         Ok(Expr {
             fetch_name,
             fetch_args,
             converters,
             matcher,
+            alternates: Vec::new(),
         })
     }
 
@@ -236,9 +270,14 @@ impl Expr {
         registry.eval_all(&self.fetch_name, &self.fetch_args, &conv_refs, ctx)
     }
 
-    /// Evaluates the expression condition, returning `true` if the condition matches.
+    /// Evaluates the expression condition, returning `true` if the condition matches
+    /// it or any of the other lines of its ACL.
     #[must_use]
     pub fn eval(&self, registry: &Registry, ctx: &SampleContext) -> bool {
+        self.eval_line(registry, ctx) || self.alternates.iter().any(|e| e.eval(registry, ctx))
+    }
+
+    fn eval_line(&self, registry: &Registry, ctx: &SampleContext) -> bool {
         let samples = self.eval_all_samples(registry, ctx);
         if samples.is_empty() {
             return false;
@@ -253,6 +292,61 @@ impl Expr {
             })
         }
     }
+}
+
+/// The match method a fetch takes when none is given (`parse_acl_expr` picks it from the
+/// type of the sample): integers for numbers, addresses for IPs, strings otherwise.
+fn default_match_method(fetch_name: &str, no_converter: bool) -> &'static str {
+    if fetch_name == "src" || fetch_name == "dst" {
+        "ip"
+    } else if fetch_name.ends_with("_port") || fetch_name == "status" || fetch_name.starts_with("sc_") {
+        "int"
+    } else if let Some(desc) = no_converter
+        .then(|| crate::registry::sample_registry().get_fetch(fetch_name))
+        .flatten()
+    {
+        match desc.out_type {
+            crate::sample::SampleType::Sint => "int",
+            crate::sample::SampleType::Ipv4 | crate::sample::SampleType::Ipv6 => "ip",
+            _ => "str",
+        }
+    } else {
+        "str"
+    }
+}
+
+/// The patterns of a `-f` file (`pat_ref_read_from_file`): one per line, leading blanks
+/// and trailing blanks (as measured) dropped, the line ending at CR or LF; empty lines and lines starting with `#` are skipped.
+fn read_pattern_file(path: &str) -> Result<Vec<String>, String> {
+    let text = std::fs::read(path).map_err(|_| format!("failed to open pattern file <{path}>"))?;
+    let text = String::from_utf8_lossy(&text);
+    Ok(text
+        .split('\n')
+        .filter(|line| !line.starts_with('#'))
+        .map(|line| line.trim_start_matches([' ', '\t']))
+        .map(|line| line.split('\r').next().unwrap_or(line))
+        .map(|line| line.trim_end_matches([' ', '\t']))
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// An integer pattern under the operator in force: `gt 5` is the range `6:`, `le 5` is
+/// `:5`; with `eq`, or a value that is a range already, it is taken as is.
+fn int_pattern_with_op(op: &str, value: &str) -> Result<String, String> {
+    if op == "eq" || value.contains([':', '-']) {
+        return Ok(value.to_string());
+    }
+    let digits = value.split('.').next().unwrap_or(value);
+    let n: i64 = digits
+        .parse()
+        .map_err(|_| format!("'{value}' is neither a number nor a supported operator"))?;
+    Ok(match op {
+        "gt" => format!("{}:", n.saturating_add(1)),
+        "ge" => format!("{n}:"),
+        "lt" => format!(":{}", n.saturating_sub(1)),
+        _ => format!(":{n}"),
+    })
 }
 
 fn split_expr_and_matcher(input: &str) -> (&str, Option<&str>) {
@@ -561,5 +655,150 @@ mod tests {
         let val = expr_var.eval_sample(&registry, &ctx);
         assert_eq!(val, Some(Sample::Str("this is also a string".to_string())));
     }
-}
 
+    /// T99: an expression holds every pattern it was given, `-i` and `-m` apply to all of
+    /// them, and a match on any one is a match.
+    fn holds(expr: &str, sample: Sample) -> bool {
+        let e = Expr::parse(expr).unwrap_or_else(|err| panic!("{expr}: {err}"));
+        let m = e.matcher.expect("a matcher");
+        m.matches(&sample)
+    }
+
+    #[test]
+    fn every_pattern_of_an_expression_is_kept() {
+        let s = |t: &str| Sample::Str(t.to_string());
+        for (expr, hits, misses) in [
+            ("path /a /b /c", vec!["/a", "/b", "/c"], vec!["/d", "/ab"]),
+            ("path -m beg /a /b", vec!["/a1", "/b1"], vec!["/c1"]),
+            ("path_beg /a /b", vec!["/a1", "/b1"], vec!["/c1"]),
+            ("path_end .x .y", vec!["/f.x", "/f.y"], vec!["/f.z"]),
+            ("path_sub aa bb", vec!["/1aa", "/1bb"], vec!["/1cc"]),
+            ("path_reg ^/a ^/b$", vec!["/a1", "/b"], vec!["/b1", "/c"]),
+            ("path -i /a /b", vec!["/A", "/B"], vec!["/c"]),
+            ("path_dir a b", vec!["/q/a/z", "/q/b?x"], vec!["/q/c/z", "/q/ab/z"]),
+            ("hdr_dir(host) a b", vec!["x/a"], vec!["x/c"]),
+            ("hdr_dom(host) a.com b.org", vec!["x.a.com", "y.b.org:80"], vec!["c.net", "xa.com"]),
+            ("path -m dom -i A.COM", vec!["x.a.com"], vec!["xa.com"]),
+            ("path -m len 2 4:5", vec!["ab", "abcd", "abcde"], vec!["a", "abc", "abcdef"]),
+            ("path -- /a /b", vec!["/a", "/b"], vec!["/c"]),
+            ("path -n /a /b", vec!["/a", "/b"], vec!["/c"]),
+            ("path -m str -i /a /b", vec!["/A", "/B"], vec!["/c"]),
+        ] {
+            for h in hits {
+                assert!(holds(expr, s(h)), "{expr} should match {h}");
+            }
+            for m in misses {
+                assert!(!holds(expr, s(m)), "{expr} should not match {m}");
+            }
+        }
+        // one pattern stays a bare matcher, several make a list
+        assert!(!matches!(Expr::parse("path /a").unwrap().matcher, Some(Matcher::Any(_))));
+        assert!(matches!(Expr::parse("path /a /b").unwrap().matcher, Some(Matcher::Any(_))));
+    }
+
+    #[test]
+    fn integer_patterns_are_ranges_and_operators_stay_in_force() {
+        let n = Sample::Sint;
+        for (expr, hits, misses) in [
+            ("sc_conn_rate(0) 1:5 10 20:30", vec![1, 3, 5, 10, 25, 30], vec![0, 6, 11, 31]),
+            ("status :2 100:", vec![1, 2, 100, 500], vec![3, 99]),
+            ("status gt 100 200", vec![101, 201], vec![100, 50]),
+            ("status lt 5 eq 7", vec![4, 7], vec![5, 8]),
+            ("status ge 5 le 1", vec![1, 5, 6], vec![2, 4]),
+            ("status -m int 1:5 10", vec![3, 10], vec![7]),
+            ("status gt 1.5", vec![2], vec![1]),
+            ("src_port -m gt 5", vec![6], vec![5]),
+        ] {
+            for h in hits {
+                assert!(holds(expr, n(h)), "{expr} should match {h}");
+            }
+            for m in misses {
+                assert!(!holds(expr, n(m)), "{expr} should not match {m}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_fetch_of_an_address_type_matches_addresses_by_default() {
+        let ip = |a: [u8; 4]| Sample::Ipv4(Ipv4Addr::from(a));
+        assert!(holds("req.hdr_ip(x-f) 10.0.0.0/8 192.168.0.0/16", ip([192, 168, 1, 1])));
+        assert!(!holds("req.hdr_ip(x-f) 10.0.0.0/8 192.168.0.0/16", ip([172, 16, 0, 1])));
+    }
+
+    #[test]
+    fn ip_patterns_are_all_networks() {
+        let ip = |a: [u8; 4]| Sample::Ipv4(Ipv4Addr::from(a));
+        assert!(holds("src 10.0.0.0/8 127.0.0.0/8", ip([127, 0, 0, 1])));
+        assert!(holds("src 10.0.0.0/8 192.168.0.1", ip([192, 168, 0, 1])));
+        assert!(!holds("src 10.0.0.0/8 192.168.0.1", ip([192, 168, 0, 2])));
+    }
+
+    #[test]
+    fn patterns_from_files_join_the_inline_ones() {
+        let path = std::env::temp_dir().join(format!("ibex-t99-{}.pat", std::process::id()));
+        std::fs::write(&path, "/f1\r\n# comment\n\n  /f2  \n\t/f3\n").expect("write");
+        let p = path.display();
+        let s = |t: &str| Sample::Str(t.to_string());
+        for hit in ["/f1", "/f2", "/f3", "/x"] {
+            assert!(holds(&format!("path -f {p} /x"), s(hit)), "{hit}");
+        }
+        assert!(!holds(&format!("path -f {p} /x"), s("# comment")));
+        assert!(!holds(&format!("path -f {p} /x"), s("/y")));
+        assert!(holds(&format!("path -m beg -f {p}"), s("/f1/more")));
+        assert!(holds(&format!("path -i -f {p}"), s("/F2")));
+        std::fs::remove_file(&path).expect("remove");
+        assert!(Expr::parse(&format!("path -f {p}")).is_err(), "a missing file is refused");
+    }
+
+    #[test]
+    fn bad_options_are_refused() {
+        for bad in [
+            "path -m",
+            "path -m nope /a",
+            "path -m str -m beg /a",
+            "path -f",
+            "path -z /a",
+            "status gt abc",
+            "status 5:1",
+            "status :",
+            "status x",
+            "path -m len x",
+        ] {
+            assert!(Expr::parse(bad).is_err(), "{bad} should be refused");
+        }
+        let file = std::env::temp_dir().join(format!("ibex-t99-m-{}.pat", std::process::id()));
+        std::fs::write(&file, "/a\n").expect("write");
+        assert!(Expr::parse(&format!("path -f {} -m beg", file.display())).is_err(), "-m after -f");
+        std::fs::remove_file(&file).expect("remove");
+    }
+
+    #[test]
+    fn an_acl_of_several_lines_matches_any_of_them() {
+        let registry = Registry::new();
+        let mut first = Expr::parse("path /a").unwrap();
+        first.alternates.push(Expr::parse("path /b").unwrap());
+        let mut htx = Htx::new();
+        htx.push(HtxBlock::ReqLine(RequestLine {
+            method: HttpMethod::Get,
+            uri: "/b".into(),
+            version: HttpVersion::Http11,
+        }));
+        htx.push(HtxBlock::Eoh);
+        htx.push(HtxBlock::Eom);
+        let ctx = SampleContext { htx: Some(&htx), ..Default::default() };
+        assert!(first.eval(&registry, &ctx));
+        assert!(!Expr::parse("path /a").unwrap().eval(&registry, &ctx));
+    }
+
+    #[test]
+    fn a_pattern_list_waits_for_the_payload_like_its_members() {
+        let list = Expr::parse("req.payload(0,0) -m sub abc de").unwrap().matcher.unwrap();
+        assert_eq!(list.min_pattern_len(), 2);
+        assert!(list.may_match_later(false));
+        assert!(!list.may_match_later(true));
+        let reg = Expr::parse("req.payload(0,0) -m reg ^a b$").unwrap().matcher.unwrap();
+        assert!(reg.may_match_later(true));
+        let beg = Expr::parse("req.payload(0,0) -m beg a b").unwrap().matcher.unwrap();
+        assert!(!beg.may_match_later(false));
+    }
+}

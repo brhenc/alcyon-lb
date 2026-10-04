@@ -309,6 +309,9 @@ impl Drop for Buf {
                     if !pushed {
                         BUF_STD_USED.fetch_sub(1, Ordering::Relaxed);
                     }
+                } else {
+                    // Grown by a head rewrite: not poolable, but no longer in use.
+                    BUF_STD_USED.fetch_sub(1, Ordering::Relaxed);
                 }
             }
             BufClass::Small => {
@@ -589,8 +592,30 @@ impl Buf {
         self.len = 0;
     }
 
+    /// Makes the backing store at least `min` bytes, readable data moved to index 0.
+    ///
+    /// A head rewrite can make the message longer than the buffer it was read into when the
+    /// peer filled it (head and the start of a body in one read). Dropping the bytes that no
+    /// longer fit would silently lose body bytes the socket already delivered, so the buffer
+    /// grows by what the rewrite added. Later reads then see the extra room as ordinary
+    /// space and the body behind the head stays intact.
+    fn grow_to(&mut self, min: usize) {
+        if self.class == BufClass::Small && min > self.data.len() {
+            self.promote_to_standard();
+        }
+        if min > self.data.len() {
+            let mut bigger = vec![0u8; min].into_boxed_slice();
+            bigger[..self.len].copy_from_slice(&self.data[self.head..self.head + self.len]);
+            self.data = bigger;
+            self.head = 0;
+        } else if self.head > 0 {
+            self.data.copy_within(self.head..self.head + self.len, 0);
+            self.head = 0;
+        }
+    }
+
     /// Replaces the leading `old_len` bytes in the readable portion of the buffer
-    /// with `new_data`.
+    /// with `new_data`. The remainder is never truncated: the buffer grows if needed.
     pub fn replace_prefix(&mut self, old_len: usize, new_data: &[u8]) {
         let old_len = old_len.min(self.len);
         let rem_len = self.len - old_len;
@@ -598,20 +623,19 @@ impl Buf {
         if needed > self.data.len() && self.class == BufClass::Small {
             self.promote_to_standard();
         }
-
-        let new_total = (new_data.len() + rem_len).min(self.data.len());
-        let rem_dest = new_data.len();
-        let rem_take = (new_total - rem_dest).min(rem_len);
-
-        if self.head + old_len != rem_dest && rem_take > 0 {
-            let src_start = self.head + old_len;
-            self.data
-                .copy_within(src_start..src_start + rem_take, rem_dest);
+        let rem_src = self.head + old_len;
+        if needed > self.data.len() {
+            // Not even a standard buffer holds it: grow, remainder after the new prefix.
+            let mut bigger = vec![0u8; needed].into_boxed_slice();
+            bigger[new_data.len()..].copy_from_slice(&self.data[rem_src..rem_src + rem_len]);
+            bigger[..new_data.len()].copy_from_slice(new_data);
+            self.data = bigger;
+        } else {
+            self.data.copy_within(rem_src..rem_src + rem_len, new_data.len());
+            self.data[..new_data.len()].copy_from_slice(new_data);
         }
-        let write_len = new_data.len().min(self.data.len());
-        self.data[..write_len].copy_from_slice(&new_data[..write_len]);
         self.head = 0;
-        self.len = new_total;
+        self.len = needed;
     }
 
     /// Injects or updates an HTTP header in the readable portion of the buffer.
@@ -620,14 +644,8 @@ impl Buf {
     /// tail capacity is available.
     /// Returns `true` if successful, or `false` if buffer capacity was exceeded or malformed.
     pub fn inject_http_header(&mut self, name: &str, value: &str) -> bool {
-        if self.head > 0 {
-            self.data.copy_within(self.head..self.head + self.len, 0);
-            self.head = 0;
-        }
         let added_approx = name.len() + value.len() + 4;
-        if self.len + added_approx > self.data.len() && self.class == BufClass::Small {
-            self.promote_to_standard();
-        }
+        self.grow_to(self.len + added_approx);
         if let Some(new_len) =
             ibex_proto::inject_http_header_with_len(&mut self.data, self.len, name, value)
         {
@@ -727,6 +745,53 @@ mod tests {
         // Shrink prefix
         b.replace_prefix(5, b"XYZ");
         assert_eq!(b.readable(), b"XYZrem");
+    }
+
+    #[test]
+    fn rewrite_of_a_full_buffer_keeps_every_byte() {
+        let mut b = Buf::with_capacity(32);
+        b.writable()[..32].copy_from_slice(b"HEAD\r\n\r\n0123456789abcdefghijklmn");
+        b.commit(32);
+        b.replace_prefix(8, b"LONGER-HEAD\r\n\r\n");
+        assert_eq!(b.readable(), b"LONGER-HEAD\r\n\r\n0123456789abcdefghijklmn");
+
+        let mut b = Buf::with_capacity(40);
+        let req = b"GET / HTTP/1.1\r\nHost: x\r\n\r\nBODYBODY";
+        b.writable()[..req.len()].copy_from_slice(req);
+        b.commit(req.len());
+        assert!(b.inject_http_header("X-Added", "1234567890"));
+        assert_eq!(b.readable(), b"GET / HTTP/1.1\r\nHost: x\r\nX-Added: 1234567890\r\n\r\nBODYBODY");
+    }
+
+    #[test]
+    fn rewrite_of_a_small_or_consumed_buffer_keeps_every_byte() {
+        let mut b = Buf::small();
+        let n = b.capacity();
+        let mut req = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n".to_vec();
+        req.resize(n, b'z');
+        b.writable()[..n].copy_from_slice(&req);
+        b.commit(n);
+        assert!(b.inject_http_header("X-Added", "1"));
+        assert_eq!(b.len(), n + "X-Added: 1\r\n".len());
+        assert!(b.readable().ends_with(&req[req.len() - 100..]));
+
+        // A full small buffer whose prefix grows is promoted to a standard one.
+        let mut b = Buf::small();
+        let n = b.capacity();
+        b.writable()[..n].fill(b'r');
+        b.commit(n);
+        b.replace_prefix(4, b"a-longer-prefix");
+        assert_eq!(b.len(), n - 4 + 15);
+        assert!(b.readable().starts_with(b"a-longer-prefixrrrr"));
+
+        // A buffer whose front was consumed is compacted, not truncated.
+        let mut b = Buf::with_capacity(64);
+        let req = b"junkGET / HTTP/1.1\r\nHost: x\r\n\r\nBODY";
+        b.writable()[..req.len()].copy_from_slice(req);
+        b.commit(req.len());
+        b.consume(4);
+        assert!(b.inject_http_header("X-Added", "1"));
+        assert_eq!(b.readable(), b"GET / HTTP/1.1\r\nHost: x\r\nX-Added: 1\r\n\r\nBODY");
     }
 
     #[test]

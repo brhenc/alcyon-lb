@@ -30,6 +30,7 @@ pub const STREAM_TYPE_QPACK_DECODER: u64 = 0x03;
 const FRAME_DATA: u64 = 0x00;
 const FRAME_HEADERS: u64 = 0x01;
 const FRAME_SETTINGS: u64 = 0x04;
+const FRAME_GOAWAY: u64 = 0x07;
 
 /// Settings identifiers, RFC 9114 §7.2.4.1 and RFC 9204 §5.
 const SETTINGS_QPACK_MAX_TABLE_CAPACITY: u64 = 0x01;
@@ -85,6 +86,17 @@ pub fn encode_control_stream_open() -> Vec<u8> {
     encode_varint(&mut out, STREAM_TYPE_CONTROL);
     out.extend_from_slice(&encode_settings());
     out
+}
+
+/// Encodes a GOAWAY frame (RFC 9114 section 5.2): the server will process no request stream
+/// at or above `stream_id`, so a client may retry those elsewhere.
+#[must_use]
+pub fn encode_goaway(stream_id: u64) -> Vec<u8> {
+    let mut payload = Vec::new();
+    encode_varint(&mut payload, stream_id);
+    let mut frame = Vec::new();
+    encode_frame(&mut frame, FRAME_GOAWAY, &payload);
+    frame
 }
 
 /// Finds a static-table entry matching both name and value.

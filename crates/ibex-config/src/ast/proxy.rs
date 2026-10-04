@@ -20,8 +20,8 @@ pub struct DefaultsSection {
     pub maxconn: Option<u32>,
     /// Default load balancing algorithm.
     pub balance: Option<BalanceAlgorithm>,
-    /// Default cookie name.
-    pub cookie: Option<String>,
+    /// The `cookie` line, inherited by the backends and listens that have none.
+    pub cookie: Option<CookieConfig>,
     /// Default server options.
     pub default_server: Option<DefaultServerConfig>,
     /// Default stats configuration.
@@ -86,6 +86,29 @@ pub struct DefaultsSection {
     pub log_tag: Option<std::sync::Arc<str>>,
 }
 
+/// A backend's `cookie <name> [options]` line (`ck_opts`, `cookie_*` in HAProxy's
+/// `struct proxy`). A later line replaces it whole, as HAProxy resets them all.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CookieConfig {
+    pub name: String,
+    pub rewrite: bool,
+    pub indirect: bool,
+    pub insert: bool,
+    pub prefix: bool,
+    pub nocache: bool,
+    pub postonly: bool,
+    pub preserve: bool,
+    pub httponly: bool,
+    pub secure: bool,
+    /// Every `domain`, joined as HAProxy joins them: `a; domain=b`.
+    pub domain: Option<String>,
+    /// Every `attr`, joined with `; `.
+    pub attrs: Option<String>,
+    /// Seconds; 0 is unset.
+    pub maxidle: u32,
+    pub maxlife: u32,
+}
+
 /// Unified timeouts configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TimeoutConfig {
@@ -128,8 +151,8 @@ pub struct ListenSection {
     pub mode: Mode,
     /// Whether this proxy is disabled.
     pub disabled: bool,
-    /// Cookie name for HTTP session persistence.
-    pub cookie: Option<String>,
+    /// The `cookie` line: HTTP session persistence.
+    pub cookie: Option<CookieConfig>,
     /// Connect timeout in milliseconds / Duration.
     pub contimeout: Option<Duration>,
     /// Client timeout in milliseconds / Duration.
@@ -255,6 +278,9 @@ pub struct StatsConfig {
     pub forwardfor: Option<String>,
     pub originalto: Option<String>,
     pub maxrewrite: Option<usize>,
+    /// `option accept-unsafe-violations-in-http-request`: a `#` in the request target (and a
+    /// forbidden character in an absolute-form authority) is let through, not refused.
+    pub accept_unsafe_request: bool,
 }
 
 impl Default for ListenSection {
@@ -476,8 +502,8 @@ pub struct BackendSection {
     pub disabled: bool,
     /// Load balancing algorithm.
     pub balance: BalanceAlgorithm,
-    /// Cookie name for HTTP session persistence.
-    pub cookie: Option<String>,
+    /// The `cookie` line: HTTP session persistence.
+    pub cookie: Option<CookieConfig>,
     /// Connect timeout in milliseconds / Duration.
     pub contimeout: Option<Duration>,
     /// Server timeout in milliseconds / Duration.
