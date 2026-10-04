@@ -7114,6 +7114,7 @@ impl EngineDispatcher<'_> {
                         | ibex_config::HttpReqAction::Allow
                         | ibex_config::HttpReqAction::Auth { .. }
                         | ibex_config::HttpReqAction::Redirect { .. }
+                        | ibex_config::HttpReqAction::Tarpit { .. }
                 ) {
                     note_last_rule(sess, rule.line);
                 }
