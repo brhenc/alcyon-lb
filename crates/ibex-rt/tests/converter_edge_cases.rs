@@ -181,6 +181,23 @@ fn reverse_dom_route_is_unset_when_the_host_has_no_reverse() {
     );
 }
 
+/// `reg-tests/converter/secure_memcmp.vtc`, the text form (frontend `fe`). The binary form
+/// (`fe2`, a `b64dec` value kept in a variable) needs variables that hold bytes; they hold
+/// `String`s (T136 report).
+#[test]
+fn secure_memcmp_compares_against_a_variable() {
+    let pair = |raw: &str, hash: &str| format!("GET / HTTP/1.1\r\nHost: x\r\nRaw: {raw}\r\nHash: {hash}\r\nConnection: close\r\n\r\n");
+    let text = "  http-request set-var(txn.hash) req.hdr(hash)\n\
+  http-request set-var(txn.raw) req.hdr(raw)\n\
+  acl is_match var(txn.raw),sha1,base64,secure_memcmp(txn.hash)\n\
+  http-request return status 200 hdr x-match true if is_match\n\
+  http-request return status 200 hdr x-match false\n";
+    let t = [("1", "NWoZK3kTsExUV00Ywo1G5jlUKKs="), ("2", "2kuSN7rMzfGcB2DKt67EqDWQELA="), ("2", "2kuSN7rMzfGcB2DKt67EqDWQELX="), ("3", "2kuSN7rMzfGcB2DKt67EqDWQELA=")];
+    let reqs: Vec<String> = t.iter().map(|(r, h)| pair(r, h)).collect();
+    let reqs: Vec<&str> = reqs.iter().map(String::as_str).collect();
+    assert_eq!(run(text, &reqs), ["true", "true", "false", "false"].map(|v| vec![format!("x-match: {v}")]));
+}
+
 #[test]
 fn set_var_with_a_failing_converter_leaves_the_variable_alone() {
     let rules = "  http-request set-var(txn.a) str(one)\n\
