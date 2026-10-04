@@ -213,6 +213,8 @@ pub(crate) fn parse_option_defaults(
         "forwarded" => defaults.forwarded = Some(Box::new(parse_forwarded_option(tokens)?)),
         "redispatch" => set_redispatch(&mut defaults.redisp, &mut defaults.redisp_after, tokens),
         "http-buffer-request" => defaults.buffer_request = true,
+        "http-server-close" => defaults.server_close = true,
+        "http-keep-alive" => defaults.server_close = false,
         "accept-unsafe-violations-in-http-request" => defaults.stats.accept_unsafe_request = true,
         "log-health-checks" => defaults.log_health_checks = true,
         "httpchk" => parse_httpchk_option(&mut defaults.httpchk, tokens, kw)?,
@@ -232,6 +234,7 @@ pub(crate) fn parse_no_defaults(defaults: &mut DefaultsSection, tokens: &[Token]
     match check_no_option(OptSection::Defaults, tokens, kw)? {
         Some("redispatch") => (defaults.redisp, defaults.redisp_after) = (false, -1),
         Some("http-buffer-request") => defaults.buffer_request = false,
+        Some("http-server-close") => defaults.server_close = false,
         Some("accept-unsafe-violations-in-http-request") => defaults.stats.accept_unsafe_request = false,
         Some("log-health-checks") => defaults.log_health_checks = false,
         Some("forwarded") => defaults.forwarded = None,

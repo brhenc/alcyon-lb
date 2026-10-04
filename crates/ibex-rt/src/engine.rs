@@ -462,6 +462,9 @@ pub struct ProxyIdInfo {
     /// Read when a server connection is released, so it lives here, off `Proxy`'s inline
     /// size (`struct_sizes.rs`).
     pub server_pool_max_conn: Vec<i32>,
+    /// `option http-server-close`: the server connection carries one request. Read when a
+    /// request goes to a server and when its response ends.
+    pub server_close: bool,
 }
 
 /// A configured proxy instance.
@@ -1753,6 +1756,7 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, list
             server_init_health: server_init_health(listen.servers.len(), &listen.server_extras),
             listener_ids: ibex_config::ast::listener_ids(&listen.binds),
             server_pool_max_conn: pool_max_conns(&listen.servers),
+            server_close: listen.server_close,
             ..ProxyIdInfo::default()
         }),
         name: listen.name.clone(),
@@ -1873,6 +1877,7 @@ fn init_proxy_from_frontend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, fe
             server_forced_ids: Vec::new(),
             server_init_health: Vec::new(),
             listener_ids: ibex_config::ast::listener_ids(&frontend_binds(fe)),
+            server_close: fe.server_close,
             ..ProxyIdInfo::default()
         }),
         name: fe.name.clone(),
@@ -2018,6 +2023,7 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, be:
             server_init_health: server_init_health(be.servers.len(), &be.server_extras),
             listener_ids: Vec::new(),
             server_pool_max_conn: pool_max_conns(&be.servers),
+            server_close: be.server_close,
             ..ProxyIdInfo::default()
         }),
         name: be.name.clone(),
@@ -5996,6 +6002,7 @@ impl EngineDispatcher<'_> {
         }
         txn.status = status;
         txn.srv_reusable = !srv_has_close
+            && !server_close(proxies, entry.proxy_idx, entry.backend_idx)
             && !matches!(framing, crate::txn::Framing::UntilClose | crate::txn::Framing::Tunnel);
         if framing == crate::txn::Framing::UntilClose {
             // The server's close is the only end the client can see.
@@ -7567,6 +7574,13 @@ impl EngineDispatcher<'_> {
             append_forwarded_element(&mut entry.sess, &element);
         }
 
+        // `option http-server-close` (frontend or backend): this request has the server
+        // connection to itself, and the server is asked to close it. A request that asks
+        // for an upgrade keeps its `Connection` header.
+        if server_close(proxies, proxy_idx, be_idx) && !request_upgrades(&entry.sess) {
+            set_req_header(&mut entry.sess, "Connection", "close");
+        }
+
         let source_ip = entry.sess.client_addr.map(|a| a.ip());
         // The backend's `cookie` line: the client's cookies are cut and may name the server.
         let cookie_server = manage_client_cookies(&mut entry.sess, &proxies[be_idx]);
@@ -8495,6 +8509,22 @@ fn apply_normalize_uri(
         }
         _ => Ok(uri.to_string()),
     }
+}
+
+/// `option http-server-close` in the frontend or the backend (`PR_O_HTTP_SCL`).
+fn server_close(proxies: &[Proxy], fe_idx: usize, be_idx: usize) -> bool {
+    proxies.get(fe_idx).is_some_and(|p| p.ids.server_close) || proxies.get(be_idx).is_some_and(|p| p.ids.server_close)
+}
+
+/// Whether the request's `Connection` header asks to upgrade the connection.
+fn request_upgrades(sess: &TcpSession) -> bool {
+    let buf = sess.req.readable();
+    let head = &buf[..crate::proxy::find_eoh(buf).map_or(buf.len(), |(h, _)| h)];
+    head.split(|&b| b == b'\n').skip(1).any(|l| {
+        l.iter().position(|&b| b == b':').is_some_and(|c| {
+            l[..c].eq_ignore_ascii_case(b"connection") && l[c + 1..].windows(7).any(|w| w.eq_ignore_ascii_case(b"upgrade"))
+        })
+    })
 }
 
 fn set_req_header(sess: &mut TcpSession, name: &str, val: &str) {
