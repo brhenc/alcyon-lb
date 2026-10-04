@@ -76,6 +76,36 @@ fn field_and_word_past_the_end_are_not_found() {
 }
 
 #[test]
+fn hmac_takes_a_base64_literal_or_a_variable_as_key() {
+    let rules = "  http-request set-var(txn.hash) req.hdr(hash)\n\
+  http-request set-var(txn.key) str(my_super_secret_long_key),base64\n\
+  http-request return status 200 hdr x-s1s \"%[var(txn.hash),hmac(sha1,a2V5),hex,lower]\" \
+hdr x-s1l \"%[var(txn.hash),hmac(sha1,txn.key),hex,lower]\" \
+hdr x-s2s \"%[var(txn.hash),hmac(sha256,a2V5),hex,lower]\" \
+hdr x-s2l \"%[var(txn.hash),hmac(sha256,txn.key),hex,lower]\" \
+hdr x-m5 \"%[var(txn.hash),hmac(md5,a2V5),hex,lower]\" \
+hdr x-s5 \"%[var(txn.hash),hmac(sha512,a2V5),hex,lower]\" \
+hdr x-s3 \"%[var(txn.hash),hmac(sha384,txn.key),hex,lower]\" \
+hdr x-s224 \"%[var(txn.hash),hmac(sha224,a2V5),hex,lower]\" \
+hdr x-un \"[%[var(txn.hash),hmac(sha1,txn.nokey),hex,lower]]\"\n";
+    let req = "GET / HTTP/1.1\r\nHost: x\r\nHash: 1\r\nConnection: close\r\n\r\n";
+    assert_eq!(
+        run(rules, &[req]),
+        vec![vec![
+            "x-s1s: e23feb105f9622241bf23db1638cd2b4208b1f53",
+            "x-s1l: 87b10ddcf39e26f6bd7c3b0e38e0125997b255be",
+            "x-s2s: 6da91fb91517be1f5cdcf3af91d7d40c717dd638a306157606fb2e584f7ae926",
+            "x-s2l: 2fb3de6a462c54d1803f946b52202f3a8cd46548ffb3f789b4ac11a4361ffef2",
+            "x-m5: 4af35dc1cd7f387546377a4f2b548d0c",
+            "x-s5: 54816905e95d0a740369d5fb40cc37ce13761d9f56e897508590faf2306152093147409290592b6aeddc694b2de4a816526be399e7bf50a971a1537df831ca4a",
+            "x-s3: 405a393d4c05b3cbcded664ffa0cd6c069469188bac89d1ae9d33460554f95a6384c6b19e32fc940f3cf722351e93ccb",
+            "x-s224: 2951c9326afebb8a223109f8e6d55ba654e52109c335170395b7c97d",
+            "x-un: []",
+        ]]
+    );
+}
+
+#[test]
 fn set_var_with_a_failing_converter_leaves_the_variable_alone() {
     let rules = "  http-request set-var(txn.a) str(one)\n\
   http-request set-var(txn.a) str(x),field(3,/)\n\

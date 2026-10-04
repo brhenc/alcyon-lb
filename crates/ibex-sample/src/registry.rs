@@ -3706,6 +3706,50 @@ impl Registry {
             },
         });
 
+        // `hmac(<alg>,<key>)`: `sample_conv_hmac` (src/sample.c). The key is a variable
+        // (scope-prefixed name) or, otherwise, a base64 string; a variable that is not
+        // set, a bad base64 key or an unknown algorithm yields no sample.
+        self.register_converter(ConvDesc {
+            name: "hmac",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Bin),
+            func: |smp, args| {
+                let Sample::Bin(msg) = smp else { return None };
+                let (digest, block): (fn(&[u8]) -> Vec<u8>, usize) = match args.first()?.to_ascii_lowercase().as_str() {
+                    "md5" => (|d| md5_digest(d).to_vec(), 64),
+                    "sha1" => (|d| sha1_digest(d).to_vec(), 64),
+                    "sha224" => (|d| sha224_digest(d).to_vec(), 64),
+                    "sha256" => (|d| sha256_digest(d).to_vec(), 64),
+                    "sha384" => (|d| sha384_digest(d).to_vec(), 128),
+                    "sha512" => (|d| sha512_digest(d).to_vec(), 128),
+                    _ => return None,
+                };
+                let key_arg = args.get(1)?.trim();
+                let is_var = ["txn.", "sess.", "req.", "res.", "proc."].iter().any(|p| key_arg.starts_with(p));
+                let key = if is_var {
+                    let v = if key_arg.starts_with("proc.") {
+                        get_proc_var(key_arg)
+                    } else {
+                        CURRENT_VARS.with(|v| v.borrow().get(key_arg).cloned())
+                    };
+                    v?
+                } else {
+                    key_arg.to_string()
+                };
+                // Either way the key is base64 text.
+                let mut key = base64_decode(&key, false, true)?;
+                if key.len() > block {
+                    key = digest(&key);
+                }
+                key.resize(block, 0);
+                let mut inner: Vec<u8> = key.iter().map(|b| b ^ 0x36).collect();
+                inner.extend_from_slice(&msg);
+                let mut outer: Vec<u8> = key.iter().map(|b| b ^ 0x5c).collect();
+                outer.extend_from_slice(&digest(&inner));
+                Some(Sample::Bin(digest(&outer)))
+            },
+        });
+
         self.register_converter(ConvDesc {
             name: "secure_memcmp",
             in_type: TypeSpec::Exact(SampleType::Bin),
