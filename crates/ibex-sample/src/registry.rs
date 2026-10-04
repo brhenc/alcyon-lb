@@ -5750,6 +5750,8 @@ mod tests {
         assert_eq!(get_proc_var("proc.t156").as_deref(), Some("p"));
         (conv.func)(Sample::Sint(1), &["proc.t156".to_string()]);
         assert_eq!(get_proc_var("proc.t156"), None);
+        // Without a name (the load refuses it) the sample goes through untouched.
+        assert_eq!((conv.func)(Sample::Sint(2), &[]), Some(Sample::Sint(2)));
     }
 
     /// The names `set-timeout` takes; the parser refuses any other.
