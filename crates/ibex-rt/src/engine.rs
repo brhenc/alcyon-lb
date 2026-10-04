@@ -4077,28 +4077,13 @@ fn clear_one(p: &Proxy) {
 
 /// Clears traffic and error counters for a specific proxy, or all proxies if `target` is `None` or `"all"`.
 pub fn clear_proxy_counters(proxies: &mut [Proxy], target: Option<&str>) -> bool {
-    if let Some(name) = target {
-        if name.eq_ignore_ascii_case("all") {
-            for p in proxies.iter_mut() {
-                clear_one(p);
-            }
-            true
-        } else {
-            let mut found = false;
-            for p in proxies.iter_mut() {
-                if p.name == name {
-                    clear_one(p);
-                    found = true;
-                }
-            }
-            found
-        }
-    } else {
-        for p in proxies.iter_mut() {
-            clear_one(p);
-        }
-        true
+    let all = target.is_none_or(|n| n.eq_ignore_ascii_case("all"));
+    let mut found = false;
+    for p in proxies.iter().filter(|p| all || Some(p.name.as_str()) == target) {
+        clear_one(p);
+        found = true;
     }
+    found || all
 }
 
 /// Dynamically enables or disables health checks for a server.
@@ -4376,8 +4361,7 @@ fn retry_server_connect(
             if redispatch { c.1 += 1 } else { c.0 += 1 }
         }
     };
-    if resuming {
-    } else if moved {
+    if !resuming && moved {
         count_on_server(true);
         stats.redispatches.fetch_add(1, Ordering::Relaxed);
         entry.sess.txn.iter_mut().for_each(|txn| {
@@ -4385,7 +4369,7 @@ fn retry_server_connect(
             // TX_CK_VALID (3) becomes TX_CK_DOWN (2).
             txn.ck.ck = if txn.ck.ck == 3 { 2 } else { txn.ck.ck };
         });
-    } else {
+    } else if !resuming {
         count_on_server(false);
         stats.retries_count.fetch_add(1, Ordering::Relaxed);
     }
