@@ -73,6 +73,27 @@ struct Seen {
     alpn: Option<Vec<u8>>,
     client_cert: bool,
     requests: usize,
+    /// The PROXY v2 header that preceded the handshake, in plaintext, when the server
+    /// expects one (`accept-proxy`).
+    proxy_v2: Option<Vec<u8>>,
+}
+
+/// The PROXY protocol v2 signature.
+const PP2_SIG: &[u8; 12] = b"\r\n\r\n\0\r\nQUIT\n";
+
+/// Reads a PROXY v2 header off the raw socket, as `accept-proxy` does before TLS.
+fn read_proxy_v2(s: &mut TcpStream) -> Option<Vec<u8>> {
+    let mut head = [0u8; 16];
+    s.read_exact(&mut head).ok()?;
+    if &head[..12] != PP2_SIG {
+        return None;
+    }
+    let len = usize::from(u16::from_be_bytes([head[14], head[15]]));
+    let mut rest = vec![0u8; len];
+    s.read_exact(&mut rest).ok()?;
+    let mut all = head.to_vec();
+    all.extend_from_slice(&rest);
+    Some(all)
 }
 
 struct Server {
@@ -122,6 +143,12 @@ fn read_request(r: &mut impl Read) -> Option<Vec<u8>> {
 /// A TLS (or, with `None`, plaintext) HTTP server that answers 200 to every request on
 /// a kept-alive connection and records each handshake.
 fn serve(cfg: Option<Arc<ServerConfig>>) -> Server {
+    serve_with(cfg, false)
+}
+
+/// [`serve`], expecting a PROXY v2 header in plaintext before the TLS handshake when
+/// `accept_proxy` is set, as `bind ... ssl accept-proxy` does.
+fn serve_with(cfg: Option<Arc<ServerConfig>>, accept_proxy: bool) -> Server {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -134,26 +161,36 @@ fn serve(cfg: Option<Arc<ServerConfig>>) -> Server {
             thread::spawn(move || {
                 stream.set_read_timeout(Some(Duration::from_secs(3))).ok();
                 let reply = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+                let proxy_v2 = if accept_proxy {
+                    let Some(h) = read_proxy_v2(&mut stream) else { return };
+                    Some(h)
+                } else {
+                    None
+                };
                 match cfg {
                     Some(cfg) => {
                         let mut conn = ServerConnection::new(cfg).expect("conn");
                         let mut tls = rustls::Stream::new(&mut conn, &mut stream);
-                        let mut idx = None;
-                        while read_request(&mut tls).is_some() {
-                            let mut s = seen.lock().unwrap();
-                            match idx {
-                                None => {
-                                    s.push(Seen {
-                                        sni: tls.conn.server_name().map(str::to_string),
-                                        alpn: tls.conn.alpn_protocol().map(<[u8]>::to_vec),
-                                        client_cert: tls.conn.peer_certificates().is_some_and(|c| !c.is_empty()),
-                                        requests: 1,
-                                    });
-                                    idx = Some(s.len() - 1);
-                                }
-                                Some(i) => s[i].requests += 1,
+                        // Record the handshake as soon as it completes: a bare connect
+                        // check sends no request, and still counts.
+                        while tls.conn.is_handshaking() {
+                            if tls.conn.complete_io(tls.sock).is_err() {
+                                return;
                             }
-                            drop(s);
+                        }
+                        let idx = {
+                            let mut s = seen.lock().unwrap();
+                            s.push(Seen {
+                                sni: tls.conn.server_name().map(str::to_string),
+                                alpn: tls.conn.alpn_protocol().map(<[u8]>::to_vec),
+                                client_cert: tls.conn.peer_certificates().is_some_and(|c| !c.is_empty()),
+                                requests: 0,
+                                proxy_v2,
+                            });
+                            s.len() - 1
+                        };
+                        while read_request(&mut tls).is_some() {
+                            seen.lock().unwrap()[idx].requests += 1;
                             if tls.write_all(reply).is_err() {
                                 break;
                             }
@@ -464,4 +501,146 @@ fn ibex_c_opens_the_ca_file_and_the_crt_and_parses_the_sni_expression() {
     assert!(text.contains("bogus"), "{text}");
     let (code, text) = check(&p.dir, &format!("{DEFAULTS}backend b\n  server s 127.0.0.1:443 ssl verify required ca-file {} sni str(x) alpn h2,http/1.1 check check-sni y\n", p.ca_pem));
     assert_eq!(code, Some(0), "{text}");
+}
+
+/// Accepts connections and never answers: a TLS handshake against it hangs until the
+/// check's timeout (`L6TOUT`, as HAProxy reports a handshake that times out).
+fn serve_silent() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    thread::spawn(move || {
+        let mut held = Vec::new();
+        for stream in listener.incoming() {
+            let Ok(s) = stream else { break };
+            held.push(s);
+        }
+    });
+    addr
+}
+
+/// A backend with one TLS server and one plaintext server: each connection takes the
+/// transport of its own server line, and the pool keys them apart.
+#[test]
+fn a_backend_mixes_tls_and_plaintext_servers() {
+    let p = pki();
+    let tls = serve(Some(server_config(&p.cert, &p.key, None, &[])));
+    let plain = serve(None);
+    let front = common::reserve_addr();
+    let cfg = config(&[(
+        front,
+        &format!("  balance roundrobin\n  server a {} ssl verify none\n  server b {}", tls.addr, plain.addr),
+    )]);
+    let _ibex = start(&p.dir, &cfg, &[front]);
+    let statuses: Vec<u16> = (0..4).map(|_| get(front, "www.test1.com").0).collect();
+    assert_eq!(statuses, [200, 200, 200, 200]);
+    // Two of the four reached the TLS server -- over one pooled connection, as the idle
+    // pool keeps TLS connections per server line.
+    assert!(
+        wait_for(Duration::from_secs(1), || tls.handshakes().iter().map(|h| h.requests).sum::<usize>() == 2),
+        "two of the four went to the TLS server: {:?}",
+        tls.handshakes()
+    );
+}
+
+/// The other check shapes over TLS: a bare connect check passes at layer 6, a tcp-check
+/// script runs over the TLS connection, an HTTP check against a plaintext server fails
+/// the handshake (L6RSP), and a server that accepts and never answers times the
+/// handshake out (L6TOUT). HAProxy measured: "Layer6 check passed", "Layer6 invalid
+/// response, SSL handshake failure".
+#[test]
+fn check_shapes_over_tls() {
+    let p = pki();
+    let srv = serve(Some(server_config(&p.cert, &p.key, None, &[])));
+    let srv2 = serve(Some(server_config(&p.cert, &p.key, None, &[])));
+    let plain = serve(None);
+    let silent = serve_silent();
+    let fronts: Vec<SocketAddr> = (0..4).map(|_| common::reserve_addr()).collect();
+    let chk = "inter 100ms fall 1 rise 1";
+    let cfg = config(&[
+        (fronts[0], &format!("  server s {} ssl verify none check {chk}", srv.addr)),
+        (fronts[1], &format!("  option tcp-check\n  tcp-check connect\n  tcp-check send \"GET / HTTP/1.1\\r\\nHost: tc.example\\r\\n\\r\\n\"\n  tcp-check expect string 200\n  server s {} ssl verify none check {chk}", srv2.addr)),
+        (fronts[2], &format!("  option httpchk GET /\n  server s {} ssl verify none check {chk}", plain.addr)),
+        (fronts[3], &format!("  server s {} ssl verify none check {chk}", silent)),
+    ]);
+    let _ibex = start(&p.dir, &cfg, &fronts);
+
+    assert!(wait_for(Duration::from_secs(3), || srv.count() >= 2), "L6 connect checks: {:?}", srv.handshakes());
+    assert_eq!(get(fronts[0], "www.test1.com").0, 200, "a connect check over TLS keeps the server UP");
+    assert!(wait_for(Duration::from_secs(3), || srv2.handshakes().iter().any(|h| h.requests >= 1)), "tcp-check over TLS: {:?}", srv2.handshakes());
+    assert_eq!(get(fronts[1], "www.test1.com").0, 200, "the tcp-check script passed over TLS");
+    assert!(wait_for(Duration::from_secs(3), || get(fronts[2], "x").0 == 503), "an http check over TLS against plaintext takes the server DOWN");
+    assert!(wait_for(Duration::from_secs(3), || get(fronts[3], "x").0 == 503), "a handshake that never completes times out and takes the server DOWN");
+}
+
+/// `send-proxy-v2` with `ssl`: the PROXY header goes on the wire in plaintext before the
+/// ClientHello, as `HAProxy`'s `xprt_handshake` layer sends it under `ssl_sock` -- the
+/// peer is `bind ... ssl accept-proxy`, which reads it before its own handshake
+/// (`reg-tests/connection/proxy_protocol_send_unique_id_alpn.vtc`). The unique-id TLV
+/// (type 0x05) carries the stream's ID.
+#[test]
+fn the_proxy_header_precedes_the_tls_handshake() {
+    let p = pki();
+    let srv = serve_with(Some(server_config(&p.cert, &p.key, None, &[])), true);
+    let front = common::reserve_addr();
+    let cfg = format!(
+        "{DEFAULTS}  unique-id-format TEST-%[req.hdr(in)]\nfrontend f\n  bind {front}\n  default_backend b\nbackend b\n  server s {} send-proxy-v2 proxy-v2-options unique-id ssl verify none\n",
+        srv.addr
+    );
+    let _ibex = start(&p.dir, &cfg, &[front]);
+    let mut s = TcpStream::connect(front).expect("connect");
+    s.set_read_timeout(Some(Duration::from_secs(10))).ok();
+    write!(s, "GET / HTTP/1.1\r\nHost: x\r\nin: foo\r\nConnection: close\r\n\r\n").expect("write");
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out);
+    assert!(out.starts_with(b"HTTP/1.1 200"), "{}", String::from_utf8_lossy(&out));
+    let seen = srv.handshakes();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    let hdr = seen[0].proxy_v2.as_deref().expect("a PROXY v2 header before the handshake");
+    assert!(hdr.starts_with(PP2_SIG));
+    let tlvs = &hdr[16 + 12..]; // v2 header, then the IPv4 addresses, then the TLVs
+    assert!(tlvs.windows(3 + 8).any(|w| w[0] == 0x05 && &w[3..3 + 8] == b"TEST-foo"), "unique-id TLV in {tlvs:02x?}");
+    assert_eq!(seen[0].sni.as_deref(), Some("x"), "and the handshake came after it");
+}
+
+/// The receiving half: `bind ... ssl accept-proxy` reads the PROXY header in plaintext
+/// before its own handshake, so an Ibex sender and an Ibex receiver interoperate the way
+/// `reg-tests/connection/proxy_protocol_send_unique_id_alpn.vtc` has HAProxy do it, and
+/// `fc_pp_unique_id` on the receiver is the sender's unique ID.
+#[test]
+fn accept_proxy_on_a_tls_bind_reads_the_header_before_the_handshake() {
+    let p = pki();
+    let (_, _, pem) = leaf(&p.ca, &["backend.example.com"], "x", false);
+    let crt = p.dir.path().join("srv.pem");
+    std::fs::write(&crt, pem).expect("write");
+    let front = common::reserve_addr();
+    let recv = common::reserve_addr();
+    let cfg = format!(
+        "{DEFAULTS}  unique-id-format TEST-%[req.hdr(in)]\n\
+         listen sender\n  bind {front}\n  server s {recv} send-proxy-v2 proxy-v2-options unique-id ssl verify none\n\
+         listen receiver\n  bind {recv} ssl crt {} accept-proxy\n  http-request set-var(txn.id) fc_pp_unique_id\n  \
+         http-after-response set-header x-id %[var(txn.id)]\n  http-request return status 200\n",
+        crt.display()
+    );
+    let _ibex = start(&p.dir, &cfg, &[front, recv]);
+    let mut s = TcpStream::connect(front).expect("connect");
+    s.set_read_timeout(Some(Duration::from_secs(10))).ok();
+    write!(s, "GET / HTTP/1.1\r\nHost: x\r\nin: foo\r\nConnection: close\r\n\r\n").expect("write");
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out);
+    let text = String::from_utf8_lossy(&out);
+    assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+    assert!(text.to_ascii_lowercase().contains("x-id: test-foo"), "the receiver must see the unique-id TLV:\n{text}");
+}
+
+/// `-c` refuses what the start refuses: a rule naming a fetch the registry lacks, on a
+/// configuration whose TLS is otherwise valid.
+#[test]
+fn ibex_c_refuses_a_bad_rule_expression_beside_a_valid_tls_server() {
+    let p = pki();
+    let (code, text) = check(
+        &p.dir,
+        &format!("{DEFAULTS}backend b\n  http-request set-var(txn.a) nosuchfetch\n  server s 127.0.0.1:443 ssl verify required ca-file {}\n", p.ca_pem),
+    );
+    assert_ne!(code, Some(0), "{text}");
+    assert!(text.contains("nosuchfetch"), "{text}");
 }

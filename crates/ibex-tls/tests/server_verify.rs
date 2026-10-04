@@ -124,3 +124,91 @@ fn the_client_config_offers_what_the_server_line_asked_for() {
     let err = build_backend_client_config(&BackendTlsOptions::default()).expect_err("no CA");
     assert!(err.contains("CA"), "{err}");
 }
+
+/// A `crl-file` revokes: the leaf whose serial it lists fails, one it does not list passes.
+#[test]
+fn a_crl_file_revokes_the_certificate_it_names() {
+    use rcgen::{CertificateRevocationListParams, KeyIdMethod, RevocationReason, RevokedCertParams, SerialNumber};
+    let ca = make_ca("CRL Root");
+    let mut params = CertificateParams::new(vec!["backend.example.com".to_string()]).expect("params");
+    params.serial_number = Some(SerialNumber::from(vec![0x42, 0x42]));
+    let key = KeyPair::generate().expect("key");
+    let revoked = params.signed_by(&key, &ca.cert, &ca.key).expect("sign").der().clone();
+    let other = leaf(&ca, &["backend.example.com"], "x");
+
+    let crl = CertificateRevocationListParams {
+        this_update: rcgen::date_time_ymd(2026, 1, 1),
+        next_update: rcgen::date_time_ymd(2036, 1, 1),
+        crl_number: SerialNumber::from(vec![1]),
+        issuing_distribution_point: None,
+        revoked_certs: vec![RevokedCertParams {
+            serial_number: SerialNumber::from(vec![0x42, 0x42]),
+            revocation_time: rcgen::date_time_ymd(2026, 1, 2),
+            reason_code: Some(RevocationReason::KeyCompromise),
+            invalidity_date: None,
+        }],
+        key_identifier_method: KeyIdMethod::Sha256,
+    }
+    .signed_by(&ca.cert, &ca.key)
+    .expect("crl");
+    let mut ca_f = tempfile::NamedTempFile::new().expect("tmp");
+    ca_f.write_all(ca.cert.pem().as_bytes()).expect("write");
+    let mut crl_f = tempfile::NamedTempFile::new().expect("tmp");
+    crl_f.write_all(crl.pem().expect("pem").as_bytes()).expect("write");
+    let v = ServerVerifier::from_options(&BackendTlsOptions {
+        ca_file: Some(ca_f.path().to_path_buf()),
+        crl_file: Some(crl_f.path().to_path_buf()),
+        ..Default::default()
+    })
+    .expect("verifier with CRL");
+    assert!(!verify(&v, &revoked, "backend.example.com"), "a revoked certificate must be refused");
+    assert!(verify(&v, &other, "backend.example.com"), "one the CRL does not name passes");
+
+    let err = ServerVerifier::from_options(&BackendTlsOptions {
+        ca_file: Some(ca_f.path().to_path_buf()),
+        crl_file: Some("/nonexistent/crl.pem".into()),
+        ..Default::default()
+    })
+    .expect_err("missing crl-file");
+    assert!(err.contains("/nonexistent/crl.pem"), "{err}");
+    let err = ServerVerifier::from_options(&BackendTlsOptions {
+        ca_file: Some(ca_f.path().to_path_buf()),
+        crl_file: Some(ca_f.path().to_path_buf()),
+        ..Default::default()
+    })
+    .expect_err("a PEM with no CRL in it");
+    assert!(err.contains("No CRL"), "{err}");
+}
+
+/// `ca-file @system-ca` loads the system bundle (`HAProxy` warns when it is empty and
+/// goes on); a test CA is not in it, so its certificate fails.
+#[test]
+fn system_ca_is_a_trust_store_that_knows_no_test_ca() {
+    let ca = make_ca("Not In The System");
+    let v = ServerVerifier::from_options(&BackendTlsOptions { ca_file: Some("@system-ca".into()), ..Default::default() })
+        .expect("system roots");
+    assert!(!verify(&v, &leaf(&ca, &["backend.example.com"], "x"), "backend.example.com"));
+}
+
+/// `ssl-min-ver` / `ssl-max-ver` narrow the offer; a range with nothing in it is refused
+/// and says what this build speaks. `no-ssl-reuse` builds a config without resumption.
+#[test]
+fn version_limits_and_no_reuse() {
+    use ibex_config::TlsVersion;
+    let ca = make_ca("Root");
+    let mut f = tempfile::NamedTempFile::new().expect("tmp");
+    f.write_all(ca.cert.pem().as_bytes()).expect("write");
+    let base = BackendTlsOptions { ca_file: Some(f.path().to_path_buf()), ..Default::default() };
+    build_backend_client_config(&BackendTlsOptions { min_ver: Some(TlsVersion::Tls13), ..base.clone() }).expect("TLS 1.3 only");
+    build_backend_client_config(&BackendTlsOptions { max_ver: Some(TlsVersion::Tls13), no_reuse: true, ..base.clone() })
+        .expect("up to 1.3, no reuse");
+    let err = build_backend_client_config(&BackendTlsOptions { min_ver: Some(TlsVersion::Tls13), max_ver: Some(TlsVersion::Tls12), ..base })
+        .expect_err("nothing left");
+    assert!(err.contains("no TLS version is left") && err.contains("TLSv1_3"), "{err}");
+}
+
+#[test]
+fn a_wildcard_needs_a_leftmost_label_long_enough_to_match() {
+    assert!(!hostcheck("abc*def.example", "ab.example"));
+    assert!(hostcheck("abc*def.example", "abcdef.example"));
+}

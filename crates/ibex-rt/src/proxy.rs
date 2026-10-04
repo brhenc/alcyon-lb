@@ -683,9 +683,84 @@ impl TcpSession {
         Ok(changed_io || changed_trans)
     }
 
+    /// Takes a parsed PROXY header as the connection's: the addresses it carries, its
+    /// TLVs, and the state that lets the request through. `false` when `accept-proxy`
+    /// was told to insist on v2 and this is not (the caller ends the connection).
+    fn apply_proxy_header(&mut self, info: ibex_proto::ProxyInfo, is_v2: bool) -> bool {
+        if self.accept_proxy_v2 && !is_v2 {
+            return false;
+        }
+        if let Some(src) = info.src_sockaddr() {
+            self.client_addr = Some(src);
+        }
+        if let Some(dst) = info.dst_sockaddr() {
+            self.server_addr = Some(dst);
+        }
+        self.proxy_info = Some(info);
+        self.proxy_handshake_done = true;
+        self.cli_state = if self.mode == Mode::Http { ScState::Ready } else { ScState::Established };
+        true
+    }
+
+    /// `accept-proxy` on a TLS bind: the PROXY header comes in plaintext, ahead of the
+    /// ClientHello (`HAProxy` reads it in `conn_recv_proxy` before `ssl_sock` sees a
+    /// byte; a `send-proxy ... ssl` server writes it from `xprt_handshake` under TLS).
+    /// So it is read off the socket raw -- peeked, parsed, then taken to exactly its
+    /// length -- before the transport's handshake consumes anything. `Ok(true)` once the
+    /// header is in, `Ok(false)` while it is still arriving.
+    fn read_proxy_header_before_tls(&mut self) -> io::Result<bool> {
+        let fd = self.cli.as_fd();
+        let mut peek = [0u8; 16384];
+        let n = match raw::peek(fd, &mut peek)? {
+            Io::Done(n) => n,
+            Io::WouldBlock => return Ok(false),
+            Io::Eof | Io::Closed => {
+                self.cli_state = ScState::Closed;
+                self.ending.get_or_insert(Ending::ClientAbort);
+                return Ok(false);
+            }
+        };
+        match ibex_proto::parse_proxy_header(&peek[..n]) {
+            Ok(Some((hdr, consumed))) => {
+                let (info, is_v2) = (hdr.to_owned(), hdr.version == ibex_proto::ProxyVersion::V2);
+                // The header is in `peek` already; this read only takes it off the socket.
+                let mut sink = vec![0u8; consumed];
+                let mut taken = 0;
+                while taken < consumed {
+                    match raw::recv(fd, &mut sink[taken..])? {
+                        Io::Done(k) if k > 0 => taken += k,
+                        _ => break,
+                    }
+                }
+                if taken != consumed || !self.apply_proxy_header(info, is_v2) {
+                    self.cli_state = ScState::Error;
+                    self.ending = Some(Ending::Error);
+                    return Ok(false);
+                }
+                Ok(true)
+            }
+            // Not all of it yet; a header this buffer cannot hold is not one.
+            Ok(None) if n < peek.len() => Ok(false),
+            Ok(None) | Err(_) => {
+                self.cli_state = ScState::Error;
+                self.ending = Some(Ending::Error);
+                Ok(false)
+            }
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     fn process_cli_io(&mut self) -> io::Result<bool> {
         let mut changed = false;
+
+        // A PROXY header to a TLS bind precedes the handshake: read it before the
+        // transport reads anything.
+        if self.accept_proxy && !self.proxy_handshake_done && self.cli_xprt.is_tls() {
+            if !self.read_proxy_header_before_tls()? {
+                return Ok(matches!(self.cli_state, ScState::Error | ScState::Closed));
+            }
+            changed = true;
+        }
 
         // Read from the client.
         // For H2 connections (negotiated via ALPN or active H2 context), decrypted bytes
@@ -781,25 +856,13 @@ impl TcpSession {
             if !self.req.is_empty() {
                 match ibex_proto::parse_proxy_header(self.req.readable()) {
                     Ok(Some((hdr, consumed))) => {
-                        if self.accept_proxy_v2 && hdr.version != ibex_proto::ProxyVersion::V2 {
+                        let (info, is_v2) = (hdr.to_owned(), hdr.version == ibex_proto::ProxyVersion::V2);
+                        if !self.apply_proxy_header(info, is_v2) {
                             self.cli_state = ScState::Error;
                             self.ending = Some(Ending::Error);
                             return Ok(true);
                         }
-                        if let Some(src) = hdr.src_sockaddr() {
-                            self.client_addr = Some(src);
-                        }
-                        if let Some(dst) = hdr.dst_sockaddr() {
-                            self.server_addr = Some(dst);
-                        }
-                        self.proxy_info = Some(hdr.to_owned());
                         self.req.consume(consumed);
-                        self.proxy_handshake_done = true;
-                        if self.mode == Mode::Http {
-                            self.cli_state = ScState::Ready;
-                        } else {
-                            self.cli_state = ScState::Established;
-                        }
                         changed = true;
                     }
                     Ok(None) => {

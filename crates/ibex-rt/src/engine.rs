@@ -111,7 +111,23 @@ fn attach_server_to(
     let sni = tls.sni(sample_registry(), &stream_sample_ctx(sess, fe, be, &ProxiesView(proxies)));
     let ip = s_idx.and_then(|i| be.servers.get(i)).map_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), SocketAddr::ip);
     match tls.connect(&srv_fd, sni.as_deref(), ip) {
-        Ok(xprt) => {
+        Ok(mut xprt) => {
+            // A PROXY header (`send-proxy*`) was put at the head of the request; to a TLS
+            // server it goes on the wire in plaintext, before the ClientHello, as
+            // HAProxy's xprt_handshake layer sends it and the peer's `accept-proxy`
+            // reads it. So it leaves the stream for the transport's prefix.
+            let n = sess.send_proxy_header.len();
+            if sess.send_proxy_prepended && n > 0 && sess.req.readable().get(..n) == Some(&sess.send_proxy_header[..]) {
+                let prefix = sess.req.readable()[..n].to_vec();
+                if xprt.set_plain_prefix(prefix) {
+                    sess.req.consume(n);
+                    if let Some(t) = sess.txn.as_mut() {
+                        if let MsgState::Head { left, body } = t.req {
+                            t.req = MsgState::Head { left: left.saturating_sub(n), body };
+                        }
+                    }
+                }
+            }
             sess.attach_server_with_xprt(srv_fd, xprt, now);
             true
         }

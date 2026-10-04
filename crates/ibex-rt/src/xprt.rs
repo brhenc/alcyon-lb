@@ -72,6 +72,12 @@ pub struct TlsConn {
     /// peer gone mid-handshake). For a server connection this is a connect failure:
     /// `HAProxy` retries it and answers 503 `SC` when the retries are spent.
     failed: bool,
+    /// Bytes that go on the wire in plaintext before the ClientHello: a PROXY protocol
+    /// header to a `send-proxy` server, which `HAProxy` writes from its `xprt_handshake`
+    /// layer under `ssl_sock`, and which the peer's `accept-proxy` reads before its own
+    /// handshake. `prefix_sent` is how much of it is out.
+    prefix: Vec<u8>,
+    prefix_sent: usize,
 }
 
 impl TlsConn {
@@ -82,12 +88,32 @@ impl TlsConn {
             peer_closed: false,
             truncated: false,
             failed: false,
+            prefix: Vec::new(),
+            prefix_sent: 0,
         }
     }
 
     #[must_use]
     pub const fn handshake_failed(&self) -> bool {
         self.failed
+    }
+
+    /// Sets the plaintext bytes written before the handshake. Only before it started.
+    pub fn set_plain_prefix(&mut self, bytes: Vec<u8>) {
+        self.prefix = bytes;
+        self.prefix_sent = 0;
+    }
+
+    /// Writes what is left of the plaintext prefix. `Ok(true)` once it is all out.
+    fn send_prefix(&mut self, fd: BorrowedFd<'_>) -> io::Result<bool> {
+        while self.prefix_sent < self.prefix.len() {
+            match raw::send(fd, &self.prefix[self.prefix_sent..])? {
+                Io::Done(n) => self.prefix_sent += n,
+                Io::WouldBlock => return Ok(false),
+                Io::Closed | Io::Eof => return Err(io::ErrorKind::ConnectionReset.into()),
+            }
+        }
+        Ok(true)
     }
 
     fn session(&mut self) -> Option<&mut TlsSession> {
@@ -101,11 +127,12 @@ impl TlsConn {
     /// asks to write when its response buffer is non-empty.
     #[must_use]
     pub fn wants_write(&self) -> bool {
-        match &self.ctx.session {
-            Some(TlsSession::Server(c)) => c.wants_write(),
-            Some(TlsSession::Client(c)) => c.wants_write(),
-            None => false,
-        }
+        self.prefix_sent < self.prefix.len()
+            || match &self.ctx.session {
+                Some(TlsSession::Server(c)) => c.wants_write(),
+                Some(TlsSession::Client(c)) => c.wants_write(),
+                None => false,
+            }
     }
 
     #[must_use]
@@ -219,7 +246,11 @@ impl TlsConn {
         if self.failed {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "TLS handshake failed"));
         }
-        let r = self.handshake_step(fd);
+        let r = match self.send_prefix(fd) {
+            Ok(true) => self.handshake_step(fd),
+            Ok(false) => Ok(false),
+            Err(e) => Err(e),
+        };
         if r.is_err() {
             self.failed = true;
         }
@@ -478,6 +509,19 @@ impl ServerXprt {
         match self {
             ServerXprt::Plain => false,
             ServerXprt::Tls(t) => t.handshake_failed(),
+        }
+    }
+
+    /// Plaintext bytes written before the TLS handshake (a PROXY header). On a plaintext
+    /// transport there is nothing to go before: the caller keeps them in the stream.
+    /// Returns whether they were taken.
+    pub fn set_plain_prefix(&mut self, bytes: Vec<u8>) -> bool {
+        match self {
+            ServerXprt::Plain => false,
+            ServerXprt::Tls(t) => {
+                t.set_plain_prefix(bytes);
+                true
+            }
         }
     }
 
