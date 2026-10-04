@@ -8444,7 +8444,15 @@ pub(crate) fn format_sample_string(fmt: &str, ctx: &SampleContext, registry: &Re
                 }
                 if let Ok(expr) = Expr::parse(&expr_str) {
                     if let Some(smp) = expr.eval_sample(registry, ctx) {
-                        out.push_str(&sample_to_string(&smp));
+                        match &smp {
+                            // Written as text, a binary is cast with `c_bin2str`: it ends at the
+                            // first NUL.
+                            Sample::Bin(b) => {
+                                let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+                                out.push_str(&String::from_utf8_lossy(&b[..end]));
+                            }
+                            _ => out.push_str(&sample_to_string(&smp)),
+                        }
                     }
                 }
             } else if chars.peek() == Some(&'c') {

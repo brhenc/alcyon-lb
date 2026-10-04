@@ -2836,7 +2836,8 @@ impl Registry {
                             && !(bytes.get(i + 1).is_some_and(u8::is_ascii_hexdigit)
                                 && bytes.get(i + 2).is_some_and(u8::is_ascii_hexdigit))
                     });
-                    if bad {
+                    // `%00` "cannot be represented in a string" (`url_decode`, `src/tools.c`).
+                    if bad || s.contains("%00") {
                         return None;
                     }
                     Some(Sample::Str(url_decode(&s, in_form)))
