@@ -96,6 +96,7 @@ pub(crate) fn parse_listen_header(
         res_header_captures: Vec::new(),
         log_health_checks: defaults.map_or(false, |d| d.log_health_checks),
         buffer_request: defaults.is_some_and(|d| d.buffer_request),
+        server_close: defaults.is_some_and(|d| d.server_close),
         cliexp: Vec::new(),
         srvexp: Vec::new(),
         acls: Vec::new(),
@@ -191,6 +192,7 @@ pub(crate) fn parse_frontend_header(
         res_header_captures: Vec::new(),
         log_health_checks: defaults.map_or(false, |d| d.log_health_checks),
         buffer_request: defaults.is_some_and(|d| d.buffer_request),
+        server_close: defaults.is_some_and(|d| d.server_close),
         stick_table: None,
         stick_rules: Vec::new(),
         tcp_req_inspect_delay: defaults.and_then(|d| d.tcp_req_inspect_delay),
@@ -261,6 +263,7 @@ pub(crate) fn parse_backend_header(
         unique_id_header: defaults.and_then(|d| d.unique_id_header.clone()),
         log_health_checks: defaults.map_or(false, |d| d.log_health_checks),
         buffer_request: defaults.is_some_and(|d| d.buffer_request),
+        server_close: defaults.is_some_and(|d| d.server_close),
         mode,
         disabled: false,
         id: None,
@@ -548,7 +551,11 @@ pub(crate) fn parse_frontend_directive(
         "monitor-uri" => parse_monitor_uri(&mut fe.monitor_uri, tokens, kw),
         "default_backend" => parse_default_backend(&mut fe.default_backend, tokens, kw),
         "stick-table" => parse_stick_table(&mut fe.stick_table, tokens, kw),
-        "stick" => parse_stick_rule(&mut fe.stick_rules, tokens, kw),
+        // A frontend has no backend capability: `HAProxy` warns and ignores the line.
+        "stick" => {
+            eprintln!("[ibex] warning: 'stick' ignored because frontend '{}' has no backend capability.", fe.name);
+            Ok(())
+        }
         "track-sc0" | "track-sc1" | "track-sc2" => {
             parse_track_rule(&mut fe.stick_rules, tokens, kw)
         }
@@ -885,6 +892,8 @@ pub(crate) fn parse_option_listen(
         "forwarded" => proxy.forwarded = Some(Box::new(parse_forwarded_option(tokens)?)),
         "redispatch" => set_redispatch(&mut proxy.redisp, &mut proxy.redisp_after, tokens),
         "http-buffer-request" => proxy.buffer_request = true,
+        "http-server-close" => proxy.server_close = true,
+        "http-keep-alive" => proxy.server_close = false,
         "accept-unsafe-violations-in-http-request" => proxy.stats.accept_unsafe_request = true,
         "log-health-checks" => proxy.log_health_checks = true,
         "httpchk" => {
@@ -924,6 +933,10 @@ pub(crate) fn parse_option_frontend(
         fe.buffer_request = true;
         return Ok(());
     }
+    if matches!(tokens[1].text.as_str(), "http-server-close" | "http-keep-alive") {
+        fe.server_close = tokens[1].text == "http-server-close";
+        return Ok(());
+    }
     let (except, if_none) = parse_forward_option(tokens, kw)?;
     if tokens[1].text == "forwardfor" {
         fe.forwardfor = Some(except);
@@ -958,6 +971,8 @@ pub(crate) fn parse_option_backend(
         "forwarded" => be.forwarded = Some(Box::new(parse_forwarded_option(tokens)?)),
         "redispatch" => set_redispatch(&mut be.redisp, &mut be.redisp_after, tokens),
         "http-buffer-request" => be.buffer_request = true,
+        "http-server-close" => be.server_close = true,
+        "http-keep-alive" => be.server_close = false,
         "log-health-checks" => be.log_health_checks = true,
         "httpchk" => {
             take_own_http_check(&mut be.http_check_own, &mut be.httpchk, &mut be.http_checks);
@@ -979,6 +994,7 @@ pub(crate) fn parse_no_listen(proxy: &mut ListenSection, tokens: &[Token], kw: &
     match check_no_option(OptSection::Listen, tokens, kw)? {
         Some("redispatch") => (proxy.redisp, proxy.redisp_after) = (false, -1),
         Some("http-buffer-request") => proxy.buffer_request = false,
+        Some("http-server-close") => proxy.server_close = false,
         Some("accept-unsafe-violations-in-http-request") => proxy.stats.accept_unsafe_request = false,
         Some("log-health-checks") => proxy.log_health_checks = false,
         Some("forwarded") => proxy.forwarded = None,
@@ -994,6 +1010,7 @@ pub(crate) fn parse_no_frontend(fe: &mut FrontendSection, tokens: &[Token], kw: 
     match check_no_option(OptSection::Frontend, tokens, kw)? {
         Some("accept-unsafe-violations-in-http-request") => fe.stats.accept_unsafe_request = false,
         Some("http-buffer-request") => fe.buffer_request = false,
+        Some("http-server-close") => fe.server_close = false,
         _ => {}
     }
     Ok(())
@@ -1006,6 +1023,7 @@ pub(crate) fn parse_no_backend(be: &mut BackendSection, tokens: &[Token], kw: &T
     match check_no_option(OptSection::Backend, tokens, kw)? {
         Some("redispatch") => (be.redisp, be.redisp_after) = (false, -1),
         Some("http-buffer-request") => be.buffer_request = false,
+        Some("http-server-close") => be.server_close = false,
         Some("log-health-checks") => be.log_health_checks = false,
         Some("forwarded") => be.forwarded = None,
         _ => {}

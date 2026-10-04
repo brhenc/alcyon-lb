@@ -1115,10 +1115,10 @@ fn test_conv_host_only() {
         eval_conv("host_only", Sample::Str("Example.COM:8080".into()), &[]),
         Some(Sample::Str("example.com".into()))
     );
-    // 2. IPv6 bracketed host
+    // 2. IPv6 bracketed host: the brackets stay (measured on HAProxy 3.5-dev8)
     assert_eq!(
         eval_conv("host_only", Sample::Str("[2001:db8::1]:443".into()), &[]),
-        Some(Sample::Str("2001:db8::1".into()))
+        Some(Sample::Str("[2001:db8::1]".into()))
     );
     // 3. Host without port
     assert_eq!(
@@ -1145,15 +1145,15 @@ fn test_conv_port_only() {
         eval_conv("port_only", Sample::Str("[::1]:443".into()), &[]),
         Some(Sample::Sint(443))
     );
-    // 2. No port returns 0 or None
+    // 2. No port is port 0 (measured on HAProxy 3.5-dev8)
     assert_eq!(
         eval_conv("port_only", Sample::Str("example.com".into()), &[]),
-        None
+        Some(Sample::Sint(0))
     );
     // 3. Empty input
     assert_eq!(
         eval_conv("port_only", Sample::Str(String::new()), &[]),
-        None
+        Some(Sample::Sint(0))
     );
     // 4. Port boundary (65535)
     assert_eq!(

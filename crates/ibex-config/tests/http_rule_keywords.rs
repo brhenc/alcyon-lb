@@ -71,8 +71,8 @@ fn the_userlist_lines_haproxy_refuses_are_refused_with_its_messages() {
         ("    bogus x", "unknown keyword 'bogus' in 'userlist' section"),
         ("    user u1 groups g", "userlist 'ul': no such group 'g' specified in user 'u1'"),
         ("    group g users nou", "userlist 'ul': no such user 'nou' specified in group 'g'"),
-        // A crypt(3) hash cannot be checked by Ibex: refused rather than never matching.
-        ("    user u1 password $5$salt$abc", "not supported"),
+        // A hash crypt(3) itself refuses (T155: the formats it can verify are in userlist_hashes.rs).
+        ("    user u1 password $9$salt$abc", "not supported"),
     ] {
         let err = with_userlist(body).expect_err(body);
         assert!(err.contains(want), "{body}: {err}");

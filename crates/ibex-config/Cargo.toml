@@ -7,6 +7,7 @@ description = "HAProxy 1.0 configuration parser for Ibex"
 
 [dependencies]
 ibex-regex = { workspace = true }
+ibex-crypt = { path = "../ibex-crypt" }
 thiserror = "1.0"
 
 [dev-dependencies]

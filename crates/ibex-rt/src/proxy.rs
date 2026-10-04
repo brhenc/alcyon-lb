@@ -132,6 +132,12 @@ pub struct TcpSession {
     /// being received: from the connection for its first request, from the first byte of
     /// a later one. It ends with the head, and does not move with the client's progress.
     pub http_request_ms: u32,
+    /// `timeout http-keep-alive`, in ms (0: none): the wait between a response and the next
+    /// request's first byte. Without it that wait is `timeout http-request`, then
+    /// `timeout client`.
+    pub keep_alive_ms: u32,
+    /// `req_exp` is the idle wait, not a request head's.
+    pub req_idle: bool,
     pub req_exp: Tick,
     pub srv_exp: Tick,
     pub conn_exp: Tick,
@@ -194,6 +200,9 @@ pub struct TcpSession {
     /// What this stream measured for its log line, and its captures and unique ID.
     pub log: crate::txnlog::StreamLog,
     pub tracked_sc: [Option<(usize, StickKey)>; 3],
+    /// The keys `stick on` and `stick store-request` took from the request, each with the
+    /// proxy whose table keeps it: stored with the server that answers.
+    pub stick_stores: Vec<(usize, StickKey)>,
     pub bufsize: usize,
     pub maxrewrite: usize,
     pub h2_ctx: Option<H2MuxContext>,
@@ -271,6 +280,8 @@ impl TcpSession {
             retry_after: Tick::ETERNITY,
             cli_exp: Tick::ETERNITY,
             http_request_ms: 0,
+            keep_alive_ms: 0,
+            req_idle: false,
             req_exp: Tick::ETERNITY,
             srv_exp: Tick::ETERNITY,
             conn_exp: Tick::ETERNITY,
@@ -305,6 +316,7 @@ impl TcpSession {
             req_vars: HashMap::new(),
             log: crate::txnlog::StreamLog::start(0, 0),
             tracked_sc: [None, None, None],
+            stick_stores: Vec::new(),
             h2_ctx: None,
             h2_active_stream_id: None,
             h2_flood_config: ibex_proto::H2FloodConfig::default(),
@@ -425,16 +437,36 @@ impl TcpSession {
         self.mode == Mode::Http && self.txn.is_none() && (self.is_first_req || !self.req.is_empty())
     }
 
+    /// Whether the connection waits for the first byte of its next request: a response has
+    /// gone, nothing has come.
+    fn idle_wait(&self) -> bool {
+        self.mode == Mode::Http && self.h2_ctx.is_none() && self.txn.is_none() && !self.is_first_req && self.req.is_empty()
+    }
+
     /// Starts `timeout http-request` when a request head starts, and ends it when the head
-    /// is complete.
+    /// is complete. Between requests the wait is `timeout http-keep-alive`, else
+    /// `timeout http-request`; a request's first byte ends it.
     pub fn arm_request(&mut self, now: Tick) {
-        if self.http_request_ms == 0 {
+        if self.http_request_ms == 0 && self.keep_alive_ms == 0 {
             return;
         }
-        if !self.head_pending() {
+        if self.head_pending() {
+            if self.req_idle {
+                self.req_idle = false;
+                self.req_exp = Tick::ETERNITY;
+            }
+            if self.http_request_ms != 0 && !self.req_exp.is_set() {
+                self.req_exp = now.add(self.http_request_ms);
+            }
+        } else if self.idle_wait() {
+            let ms = if self.keep_alive_ms != 0 { self.keep_alive_ms } else { self.http_request_ms };
+            if !self.req_exp.is_set() {
+                self.req_exp = now.add(ms);
+                self.req_idle = true;
+            }
+        } else {
             self.req_exp = Tick::ETERNITY;
-        } else if !self.req_exp.is_set() {
-            self.req_exp = now.add(self.http_request_ms);
+            self.req_idle = false;
         }
     }
 
@@ -697,6 +729,10 @@ impl TcpSession {
         self.clear_htx();
         self.h2_active_stream_id = None;
         self.req_vars.clear();
+        // The stream is running, so its variables are in the thread's map
+        // (`engine::with_stream_vars`): the transaction's go from there too.
+        ibex_sample::CURRENT_VARS.with(|v| v.borrow_mut().retain(|k, _| k.starts_with("sess.")));
+        self.stick_stores.clear();
         self.is_first_req = false;
         self.cli_state = ScState::Ready;
     }
@@ -1625,7 +1661,8 @@ impl TcpSession {
     /// client's timeout, `408` and all. Whether it fired.
     fn expire_request(&mut self) -> bool {
         self.req_exp = Tick::ETERNITY;
-        let live = self.head_pending() && self.cli_timer_live();
+        let live = (self.head_pending() || self.idle_wait()) && self.cli_timer_live();
+        self.req_idle = false;
         live.then(|| {
             self.cli_state = ScState::Error;
             self.ending.get_or_insert(Ending::Timeout(Which::Client));

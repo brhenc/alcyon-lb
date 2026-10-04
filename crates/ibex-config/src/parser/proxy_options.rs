@@ -159,6 +159,9 @@ const IMPLEMENTED: &[&str] = &[
     "redispatch",
     // Waits for the request body ahead of the rules (T119).
     "http-buffer-request",
+    // Each request on its own server connection, asked to close (T149).
+    "http-server-close",
+    "http-keep-alive",
     "log-health-checks",
     "httpchk",
     "tcp-check",

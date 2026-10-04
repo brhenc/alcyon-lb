@@ -242,10 +242,7 @@ fn an_unrelated_http_request_rule_does_not_switch_off_tracking() {
         clitimeout: Some(Duration::from_secs(3)),
         default_backend: Some("be_track".into()),
         stick_table: Some(table_config()),
-        stick_rules: vec![StickRule {
-            rule_type: StickRuleType::TrackSc0,
-            expr: "src".into(),
-        }],
+        stick_rules: vec![StickRule::new(StickRuleType::TrackSc0, "src".into())],
         ..Default::default()
     };
 

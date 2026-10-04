@@ -9,6 +9,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod aes;
 pub mod auth;
 pub mod cast;
 pub mod expr;
@@ -22,6 +23,7 @@ pub mod registry;
 pub mod sample;
 
 pub use auth::{set_userlists, AuthUser, AuthUserlist};
+pub use ibex_crypt::CryptHash;
 pub use cast::{can_cast, cast};
 pub use expr::Expr;
 pub use matcher::{IntOp, IntRange, Matcher};

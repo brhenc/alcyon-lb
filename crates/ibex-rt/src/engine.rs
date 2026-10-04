@@ -462,6 +462,9 @@ pub struct ProxyIdInfo {
     /// Read when a server connection is released, so it lives here, off `Proxy`'s inline
     /// size (`struct_sizes.rs`).
     pub server_pool_max_conn: Vec<i32>,
+    /// `option http-server-close`: the server connection carries one request. Read when a
+    /// request goes to a server and when its response ends.
+    pub server_close: bool,
 }
 
 /// A configured proxy instance.
@@ -1420,7 +1423,9 @@ fn stream_log_line(entry: &SessionEntry, proxies: &[Proxy], pid: u32) -> Option<
         return None;
     }
     let be = proxies.get(entry.backend_idx).unwrap_or(fe);
-    let line = fmt.render(&stream_log_data(entry, proxies, entry.proxy_idx, pid), sample_registry(), &SampleContext { at_log: true, ..stream_sample_ctx(&entry.sess, fe, be, &ProxiesView(proxies), &StickView::new(proxies, &entry.sess.tracked_sc)) });
+    // `status` is the transaction's (`txn->status`, as `%ST`), not whatever response the
+    // thread rewrote last (T152).
+    let line = fmt.render(&stream_log_data(entry, proxies, entry.proxy_idx, pid), sample_registry(), &SampleContext { at_log: true, res_status: entry.sess.txn.as_ref().map(|t| t.status).or(entry.sess.log.status).filter(|&s| s > 0), ..stream_sample_ctx(&entry.sess, fe, be, &ProxiesView(proxies), &StickView::new(proxies, &entry.sess.tracked_sc)) });
     fe.log_count.fetch_add(1, Ordering::Relaxed);
     Some(line)
 }
@@ -1751,6 +1756,7 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, list
             server_init_health: server_init_health(listen.servers.len(), &listen.server_extras),
             listener_ids: ibex_config::ast::listener_ids(&listen.binds),
             server_pool_max_conn: pool_max_conns(&listen.servers),
+            server_close: listen.server_close,
             ..ProxyIdInfo::default()
         }),
         name: listen.name.clone(),
@@ -1871,6 +1877,7 @@ fn init_proxy_from_frontend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, fe
             server_forced_ids: Vec::new(),
             server_init_health: Vec::new(),
             listener_ids: ibex_config::ast::listener_ids(&frontend_binds(fe)),
+            server_close: fe.server_close,
             ..ProxyIdInfo::default()
         }),
         name: fe.name.clone(),
@@ -2016,6 +2023,7 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, be:
             server_init_health: server_init_health(be.servers.len(), &be.server_extras),
             listener_ids: Vec::new(),
             server_pool_max_conn: pool_max_conns(&be.servers),
+            server_close: be.server_close,
             ..ProxyIdInfo::default()
         }),
         name: be.name.clone(),
@@ -2334,7 +2342,13 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     users: l
                         .users
                         .iter()
-                        .map(|u| ibex_sample::AuthUser { name: u.name.clone(), password: u.password.clone(), groups: u.groups.clone() })
+                        .map(|u| ibex_sample::AuthUser {
+                            name: u.name.clone(),
+                            password: u.password.clone(),
+                            // The parser checked the hash; this is the verifier `http_auth` runs.
+                            crypt: u.password.as_deref().filter(|_| u.password_is_hash).and_then(|h| ibex_sample::CryptHash::parse(h).ok()),
+                            groups: u.groups.clone(),
+                        })
                         .collect(),
                 })
                 .collect(),
@@ -3529,17 +3543,6 @@ fn eval_tcp_req_session_rules(
         ..Default::default()
     };
 
-    ibex_sample::CURRENT_VARS.with(|v| {
-        let mut map = v.borrow_mut();
-        map.clear();
-        for (k, val) in &sess.sess_vars {
-            map.insert(k.clone(), val.clone());
-        }
-        for (k, val) in &sess.req_vars {
-            map.insert(k.clone(), val.clone());
-        }
-    });
-
     for rule in &proxy.tcp_req_session_rules {
         let matches = match &rule.cond {
             None => true,
@@ -3772,17 +3775,6 @@ fn eval_tcp_req_content_rules(
         captures_res_hdr: Some(&sess.log.res_captures),
         ..Default::default()
     };
-
-    ibex_sample::CURRENT_VARS.with(|v| {
-        let mut map = v.borrow_mut();
-        map.clear();
-        for (k, val) in &sess.sess_vars {
-            map.insert(k.clone(), val.clone());
-        }
-        for (k, val) in &sess.req_vars {
-            map.insert(k.clone(), val.clone());
-        }
-    });
 
     let mut has_missing_data = false;
     for rule in &proxy.tcp_req_content_rules {
@@ -4033,12 +4025,6 @@ fn eval_tcp_res_content_rules(proxy: &Proxy, proxies: &[Proxy], registry: &Regis
         captures_res_hdr: Some(&sess.log.res_captures),
         ..Default::default()
     };
-    ibex_sample::CURRENT_VARS.with(|v| {
-        let mut map = v.borrow_mut();
-        map.clear();
-        map.extend(sess.sess_vars.iter().map(|(k, val)| (k.clone(), val.clone())));
-        map.extend(sess.req_vars.iter().map(|(k, val)| (k.clone(), val.clone())));
-    });
     for rule in &proxy.tcp_res_content_rules {
         if let Some(cond) = &rule.cond {
             // `acl_exec_cond`: a sample that may change and does not match is a miss.
@@ -4166,6 +4152,54 @@ fn store_var_smp(
     let map = if name.starts_with("sess.") { sess_vars } else { req_vars };
     map.insert(name.to_string(), val.clone());
     ibex_sample::CURRENT_VARS.with(|v| v.borrow_mut().insert(name.to_string(), val));
+}
+
+/// Runs `f` with `sess`'s variables in the thread's `CURRENT_VARS`, where the fetches and
+/// converters read them, and puts them back in the session after (T152).
+///
+/// `CURRENT_VARS` is one map per thread, and every stream on the thread runs through it in
+/// turn: a stream that waits (for its server, its body, a tarpit) leaves the thread to the
+/// others, so the map holds a stream's variables only while that stream runs. It is filled
+/// here, for the length of one run and never across a wait, and emptied after, so a
+/// stream reads its own variables or none -- never those of the stream that ran last.
+///
+/// The variables are moved, not copied: the session's maps are empty while `f` runs and
+/// the thread's map is the one every write lands in (`store_var` writes both; the
+/// `set-var` converter, which has no session, writes only it). What it holds after `f` is
+/// what the session keeps. No allocation, whatever the number of variables.
+fn with_stream_vars<R>(sess: &mut TcpSession, f: impl FnOnce(&mut TcpSession) -> R) -> R {
+    stream_vars_enter(sess);
+    let out = f(sess);
+    stream_vars_leave(Some(sess));
+    out
+}
+
+/// The start of [`with_stream_vars`].
+fn stream_vars_enter(sess: &mut TcpSession) {
+    CURRENT_VARS.with(|v| {
+        let mut map = v.borrow_mut();
+        map.clear();
+        map.extend(sess.sess_vars.drain());
+        map.extend(sess.req_vars.drain());
+    });
+}
+
+/// The end of [`with_stream_vars`]: what the thread's map holds goes back to the scope it
+/// belongs to in `sess`, or is dropped with a stream that is gone.
+fn stream_vars_leave(sess: Option<&mut TcpSession>) {
+    CURRENT_VARS.with(|v| {
+        let mut map = v.borrow_mut();
+        let Some(sess) = sess else {
+            map.clear();
+            return;
+        };
+        sess.sess_vars.clear();
+        sess.req_vars.clear();
+        for (k, val) in map.drain() {
+            let scope = if k.starts_with("sess.") { &mut sess.sess_vars } else { &mut sess.req_vars };
+            scope.insert(k, val);
+        }
+    });
 }
 
 /// Readies a TCP-mode stream for `proxy`'s `tcp-response content` rules, if it has any
@@ -4459,6 +4493,7 @@ fn init_client_session(
     let fe = &proxies[proxy_idx];
     sess.accept_unsafe_request = fe.stats_config.accept_unsafe_request;
     sess.http_request_ms = fe.stats_config.raw_timeouts.http_request.map_or(0, millis_to_u32);
+    sess.keep_alive_ms = fe.stats_config.raw_timeouts.http_keep_alive.map_or(0, millis_to_u32);
     sess.arm_request(now);
     sess.keep_request_line = (!fe.log_target_idx.is_empty() && fe.log_format.as_ref().is_some_and(|f| f.uses_request_line()))
         || fe.unique_id_format.as_ref().is_some_and(|f| f.uses_request_line());
@@ -4496,7 +4531,7 @@ fn init_client_session(
     }
 
     let registry = sample_registry();
-    match eval_tcp_req_session_rules(&proxies[proxy_idx], proxies, registry, &mut sess) {
+    match with_stream_vars(&mut sess, |sess| eval_tcp_req_session_rules(&proxies[proxy_idx], proxies, registry, sess)) {
         SessionEvalOutcome::Accept => {}
         SessionEvalOutcome::Reject => {
             raw::abort_with_rst(sess.cli.as_fd());
@@ -4513,6 +4548,18 @@ fn init_client_session(
 
     // `use-server` of a proxy that serves directly (a TCP `listen`).
     let use_server = EngineDispatcher::use_server(&sess, proxy_idx, proxies);
+    // `stick match` of a TCP `listen` that connects right here (`stick` rules wait for the
+    // inspection of the request otherwise: `connect_tcp_backend`).
+    let use_server = use_server.or_else(|| {
+        let p = &proxies[proxy_idx];
+        let direct = mode == Mode::Tcp
+            && !sess.accept_proxy
+            && p.tcp_req_inspect_delay.is_none()
+            && p.tcp_req_content_rules.is_empty()
+            && p.use_backends.is_empty()
+            && p.default_backend.is_none();
+        direct.then(|| EngineDispatcher::sticking_rules(&mut sess, proxy_idx, proxies, false)).flatten()
+    });
     let proxy = &mut proxies[proxy_idx];
 
     let has_inspect = proxy.tcp_req_inspect_delay.is_some() || !proxy.tcp_req_content_rules.is_empty();
@@ -5311,6 +5358,69 @@ impl EngineDispatcher<'_> {
         None
     }
 
+    /// `process_sticking_rules` (`src/stream.c`): the backend's `stick` rules on a request.
+    /// The server a `stick match` finds for the request is returned, unless `assigned`
+    /// (`use-server` or a persistence cookie chose already). The keys of `stick on` and
+    /// `stick store-request` are queued to be stored with the server that answers
+    /// ([`commit_stick_stores`]); the first of them for a table wins, and a rule that stores
+    /// for a table that has one is skipped whole, its match included.
+    fn sticking_rules(sess: &mut TcpSession, be_idx: usize, proxies: &[Proxy], mut assigned: bool) -> Option<usize> {
+        use ibex_config::StickRuleType::{StickMatch, StickOn, StickStoreRequest};
+        let be = &proxies[be_idx];
+        if be.stick_rules.is_empty() {
+            return None;
+        }
+        let view = ProxiesView(proxies);
+        let stick = StickView::new(proxies, &sess.tracked_sc);
+        let ctx = Self::request_ctx(sess, be, &view, &stick);
+        let registry = sample_registry();
+        let mut found = None;
+        let mut stores: Vec<(usize, StickKey)> = Vec::new();
+        for rule in &be.stick_rules {
+            let is_store = matches!(rule.rule_type, StickOn | StickStoreRequest);
+            let is_match = matches!(rule.rule_type, StickOn | StickMatch);
+            if !is_store && !is_match {
+                continue;
+            }
+            let t_idx = match &rule.table {
+                Some(name) => proxies.iter().position(|p| p.name == *name),
+                None => Some(be_idx),
+            };
+            let Some((t_idx, tbl)) = t_idx.and_then(|i| Some((i, proxies[i].stick_table.as_ref()?))) else {
+                continue;
+            };
+            if is_store && sess.stick_stores.iter().chain(stores.iter()).any(|(t, _)| *t == t_idx) {
+                continue;
+            }
+            if rule.cond.as_ref().is_some_and(|c| !crate::proxy::eval_acl_condition(c, &be.acls, registry, &ctx)) {
+                continue;
+            }
+            let Some(key) = resolve_sample_stick_key(&rule.expr, registry, &ctx, Some(tbl)) else {
+                continue;
+            };
+            if is_match {
+                if let Ok(Some(entry)) = tbl.get_entry(&key) {
+                    if !assigned {
+                        // The server stored by its id, if it is still there and not stopped.
+                        let i = entry.server_id.and_then(|id| (0..be.servers.len()).find(|&i| be.server_puid(i) == id));
+                        let up = |i: usize| be.server_statuses.get(i).is_none_or(|s| !matches!(ServerStatus::from(s.load(Ordering::Relaxed)), ServerStatus::Down | ServerStatus::Maint));
+                        if let Some(i) = i.filter(|&i| up(i)) {
+                            found = Some(i);
+                            assigned = true;
+                        }
+                    }
+                    // `stktable_touch_local`: the entry lives on.
+                    let _ = tbl.update_entry(&key, |_| {});
+                }
+            }
+            if is_store && stores.len() + sess.stick_stores.len() < 8 {
+                stores.push((t_idx, key));
+            }
+        }
+        sess.stick_stores.extend(stores);
+        found
+    }
+
     /// One pass over the HTTP transaction, after the byte layer has run: the reply owed
     /// for an unparsable request, request rules and routing (once per transaction), the
     /// response head, how each side ended, and the end of the transaction.
@@ -5648,6 +5758,9 @@ impl EngineDispatcher<'_> {
         // A reusable server connection stays on the session for the next request, which
         // takes it if routing sends it to the same server (`connect_http_backend`).
         entry.sess.reset_for_next_request();
+        // The wait for the next request starts with the response's end
+        // (`timeout http-keep-alive`).
+        entry.sess.arm_request(fresh_tick(now));
         // A next request already in the buffer has no socket event left to announce it:
         // run once more straight away. (Without one, the poller wakes the session.)
         if !entry.sess.req.is_empty() {
@@ -5666,8 +5779,20 @@ impl EngineDispatcher<'_> {
         }
     }
 
-    #[allow(clippy::too_many_lines)] // one dispatch chain; splitting it would obscure the order
+    /// One run of a stream, with its variables where its rules read them
+    /// ([`with_stream_vars`]): everything a stream evaluates happens inside a run, and a
+    /// run never waits -- a stream that waits ends its run and is woken for another.
     fn step_stream(&mut self, session_idx: u32) -> Outcome {
+        if let Some(entry) = self.sessions.get_mut(session_idx) {
+            stream_vars_enter(&mut entry.sess);
+        }
+        let out = self.step_stream_run(session_idx);
+        stream_vars_leave(self.sessions.get_mut(session_idx).map(|e| &mut e.sess));
+        out
+    }
+
+    #[allow(clippy::too_many_lines)] // one dispatch chain; splitting it would obscure the order
+    fn step_stream_run(&mut self, session_idx: u32) -> Outcome {
         // The time now, not the time the pass started: `step` takes its tick before it waits
         // in the poller, so a stream woken by a request after an idle second would arm a
         // `wait-for-body` of 300 ms from a second ago.
@@ -5703,6 +5828,16 @@ impl EngineDispatcher<'_> {
             // Step 3: Stream engine process pass
             if !entry.sess.is_done() {
                 let _ = entry.sess.process(now);
+            }
+            // A TCP stream stores what its `stick` rules took once the server has accepted
+            // the connection (`AN_RES_STORE_RULES` runs on the first event of the response
+            // side); a server that refused stores nothing.
+            if !entry.sess.stick_stores.is_empty()
+                && entry.sess.mode == Mode::Tcp
+                && entry.sess.log.connect.is_some()
+            {
+                let stores = std::mem::take(&mut entry.sess.stick_stores);
+                commit_stick_stores(stores.into_iter(), self.proxies, entry.srv_backend_idx, entry.target_server_idx);
             }
 
             // Step 3.1: a TLS handshake with the server that failed (certificate refused,
@@ -5962,6 +6097,7 @@ impl EngineDispatcher<'_> {
         }
         txn.status = status;
         txn.srv_reusable = !srv_has_close
+            && !server_close(proxies, entry.proxy_idx, entry.backend_idx)
             && !matches!(framing, crate::txn::Framing::UntilClose | crate::txn::Framing::Tunnel);
         if framing == crate::txn::Framing::UntilClose {
             // The server's close is the only end the client can see.
@@ -5998,7 +6134,18 @@ impl EngineDispatcher<'_> {
             }
         };
 
-        let has_rules = !proxies[be_idx].http_res_rules.is_empty()
+        // `stick store-response` reads the response head: it takes the slow path below, where
+        // the response's fetches are set up. Without one, the keys of the request are stored
+        // here, with the server that answered.
+        let store_rsp = wait.is_none()
+            && proxies[be_idx].stick_rules.iter().any(|r| r.rule_type == ibex_config::StickRuleType::StickStoreResponse);
+        if wait.is_none() && !store_rsp && !entry.sess.stick_stores.is_empty() {
+            let stores = std::mem::take(&mut entry.sess.stick_stores);
+            commit_stick_stores(stores.into_iter(), proxies, entry.srv_backend_idx, entry.target_server_idx);
+        }
+
+        let has_rules = store_rsp
+            || !proxies[be_idx].http_res_rules.is_empty()
             || !proxies[be_idx].http_after_res_rules.is_empty()
             || !proxies[fe_idx].http_res_rules.is_empty()
             || !proxies[fe_idx].http_after_res_rules.is_empty()
@@ -6100,6 +6247,8 @@ impl EngineDispatcher<'_> {
         let srv_ended = matches!(entry.sess.srv_state, ScState::ShutR | ScState::Closed | ScState::Error);
         let srv_timed_out = entry.sess.ending == Some(crate::proxy::Ending::Timeout(crate::proxy::Which::Server));
 
+        // The keys of the request, and the response's own, wait for the server's id.
+        let mut stick_stores = std::mem::take(&mut entry.sess.stick_stores);
         let stick = StickView::new(proxies, &entry.sess.tracked_sc);
         let ctx = SampleContext {
             proxies: Some(&ProxiesView(proxies)),
@@ -6142,6 +6291,33 @@ impl EngineDispatcher<'_> {
                 .map(String::as_str),
             ..Default::default()
         };
+
+        // `process_store_rules`: `stick store-response` takes a key from the response (the
+        // first per table, none where the request already stored one), and every key queued
+        // is stored with the server that sent it, ahead of the `http-response` rules.
+        if store_rsp {
+            let be = &proxies[be_idx];
+            let from_request = stick_stores.len();
+            for rule in be.stick_rules.iter().filter(|r| r.rule_type == ibex_config::StickRuleType::StickStoreResponse) {
+                let t_idx = match &rule.table {
+                    Some(name) => proxies.iter().position(|p| p.name == *name),
+                    None => Some(be_idx),
+                };
+                let Some((t_idx, tbl)) = t_idx.and_then(|i| Some((i, proxies[i].stick_table.as_ref()?))) else {
+                    continue;
+                };
+                if stick_stores[from_request..].iter().any(|(t, _)| *t == t_idx) || stick_stores.len() >= 8 {
+                    continue;
+                }
+                if rule.cond.as_ref().is_some_and(|c| !crate::proxy::eval_acl_condition(c, &be.acls, registry, &ctx)) {
+                    continue;
+                }
+                if let Some(key) = resolve_sample_stick_key(&rule.expr, registry, &ctx, Some(tbl)) {
+                    stick_stores.push((t_idx, key));
+                }
+            }
+        }
+        commit_stick_stores(stick_stores.drain(..), proxies, entry.srv_backend_idx, entry.target_server_idx);
 
         // `tcp-response content reject`: the response is dropped and the client connection
         // closed with nothing sent, as HAProxy does -- not answered with a 502.
@@ -6662,17 +6838,7 @@ impl EngineDispatcher<'_> {
             proxies[proxy_idx].stats[worker_id()].fe_req_rate.tick();
         }
 
-        // Initialize per-request thread locals
-        CURRENT_VARS.with(|v| {
-            let mut map = v.borrow_mut();
-            map.clear();
-            for (k, val) in &entry.sess.sess_vars {
-                map.insert(k.clone(), val.clone());
-            }
-            for (k, val) in &entry.sess.req_vars {
-                map.insert(k.clone(), val.clone());
-            }
-        });
+        // The stream's variables are in `CURRENT_VARS` for this whole run (`step_stream`).
         if resume.is_none() {
             begin_http_stream(entry, proxies, proxy_idx, pid);
         }
@@ -7543,12 +7709,22 @@ impl EngineDispatcher<'_> {
             append_forwarded_element(&mut entry.sess, &element);
         }
 
+        // `option http-server-close` (frontend or backend): this request has the server
+        // connection to itself, and the server is asked to close it. A request that asks
+        // for an upgrade keeps its `Connection` header.
+        if server_close(proxies, proxy_idx, be_idx) && !request_upgrades(&entry.sess) {
+            set_req_header(&mut entry.sess, "Connection", "close");
+        }
+
         let source_ip = entry.sess.client_addr.map(|a| a.ip());
         // The backend's `cookie` line: the client's cookies are cut and may name the server.
         let cookie_server = manage_client_cookies(&mut entry.sess, &proxies[be_idx]);
         // `use-server` comes first: a server it picked (SF_ASSIGNED) is not overridden by
         // the cookie, which is still cut as above.
         let cookie_server = Self::use_server(&entry.sess, be_idx, proxies).or(cookie_server);
+        // `stick match` after those (`SF_ASSIGNED`); the keys to store are queued either way.
+        let assigned = cookie_server.is_some();
+        let cookie_server = cookie_server.or(Self::sticking_rules(&mut entry.sess, be_idx, proxies, assigned));
         let target = if let Some(idx) = cookie_server {
             Some(proxies[be_idx].servers[idx])
         } else {
@@ -7781,7 +7957,9 @@ impl EngineDispatcher<'_> {
         }
 
         let source_ip = entry.sess.client_addr.map(|a| a.ip());
-        let target = match Self::use_server(&entry.sess, be_idx, proxies) {
+        let chosen = Self::use_server(&entry.sess, be_idx, proxies);
+        let assigned = chosen.is_some();
+        let target = match chosen.or(Self::sticking_rules(&mut entry.sess, be_idx, proxies, assigned)) {
             Some(i) => Some(proxies[be_idx].servers[i]),
             None => proxies[be_idx].select_server_with_key(source_ip, entry.sess.req_uri.as_deref()),
         };
@@ -8471,6 +8649,32 @@ fn apply_normalize_uri(
         }
         _ => Ok(uri.to_string()),
     }
+}
+
+/// `process_store_rules`: each key queued for a table is stored there with the id of the
+/// server of backend `be_idx` that answered (`server_idx`); with no server, they are dropped.
+fn commit_stick_stores(stores: impl Iterator<Item = (usize, StickKey)>, proxies: &[Proxy], be_idx: usize, server_idx: Option<usize>) {
+    let id = server_idx.map(|i| proxies[be_idx].server_puid(i));
+    for (t_idx, key) in stores {
+        let table = proxies.get(t_idx).and_then(|p| p.stick_table.as_ref());
+        table.zip(id).into_iter().for_each(|(tbl, id)| drop(tbl.update_entry(&key, |d| d.server_id = Some(id))));
+    }
+}
+
+/// `option http-server-close` in the frontend or the backend (`PR_O_HTTP_SCL`).
+fn server_close(proxies: &[Proxy], fe_idx: usize, be_idx: usize) -> bool {
+    proxies.get(fe_idx).is_some_and(|p| p.ids.server_close) || proxies.get(be_idx).is_some_and(|p| p.ids.server_close)
+}
+
+/// Whether the request's `Connection` header asks to upgrade the connection.
+fn request_upgrades(sess: &TcpSession) -> bool {
+    let buf = sess.req.readable();
+    let head = &buf[..crate::proxy::find_eoh(buf).map_or(buf.len(), |(h, _)| h)];
+    head.split(|&b| b == b'\n').skip(1).any(|l| {
+        l.iter().position(|&b| b == b':').is_some_and(|c| {
+            l[..c].eq_ignore_ascii_case(b"connection") && l[c + 1..].windows(7).any(|w| w.eq_ignore_ascii_case(b"upgrade"))
+        })
+    })
 }
 
 fn set_req_header(sess: &mut TcpSession, name: &str, val: &str) {
@@ -9430,13 +9634,8 @@ fn after_res_on_reply<'r>(
     CURRENT_RES_STATUS.set(status);
     CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = hdrs.clone());
     res_htx_init(sess.bufsize, None, &version, &reason, &hdrs, raw.len() - hdr_end - eoh_len);
-    // The variables are the session's own: a reply made after the request rules (502, 504)
-    // comes when other streams may have run theirs on this thread.
-    CURRENT_VARS.with(|v| {
-        let mut map = v.borrow_mut();
-        map.clear();
-        map.extend(sess.sess_vars.iter().chain(sess.req_vars.iter()).map(|(k, val)| (k.clone(), val.clone())));
-    });
+    // The variables are the session's own, in `CURRENT_VARS` for the run that makes the
+    // reply (`step_stream`).
     let mut sess_vars = std::mem::take(&mut sess.sess_vars);
     let mut req_vars = std::mem::take(&mut sess.req_vars);
     let mut res_caps = std::mem::take(&mut sess.log.res_captures);

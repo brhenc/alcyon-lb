@@ -19,6 +19,19 @@ pub struct StickTableConfigAst {
 pub struct StickRule {
     pub rule_type: StickRuleType,
     pub expr: String,
+    /// `table <name>` of `stick on|match|store-request|store-response`: the proxy whose
+    /// stick-table the rule uses; `None` is the section's own.
+    pub table: Option<String>,
+    /// `if|unless <cond>` of the same.
+    pub cond: Option<AclCondition>,
+}
+
+impl StickRule {
+    /// A rule with no `table` and no condition (what `track-sc*` takes).
+    #[must_use]
+    pub fn new(rule_type: StickRuleType, expr: String) -> Self {
+        Self { rule_type, expr, table: None, cond: None }
+    }
 }
 
 /// Type of stick rule.

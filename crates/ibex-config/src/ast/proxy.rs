@@ -44,6 +44,9 @@ pub struct DefaultsSection {
     /// `option http-buffer-request`: wait for the request body before the rules run (as
     /// an implicit `http-request wait-for-body` ahead of them).
     pub buffer_request: bool,
+    /// `option http-server-close`: each request goes on its own server connection, which
+    /// is asked to close; the client connection stays.
+    pub server_close: bool,
     /// `option forwardfor` in `defaults`: the `except` network, empty for none.
     pub forwardfor: Option<String>,
     /// `option forwardfor ... if-none` (without it, `HAProxy` adds the header always).
@@ -215,6 +218,9 @@ pub struct ListenSection {
     /// `option http-buffer-request`: wait for the request body before the rules run (as
     /// an implicit `http-request wait-for-body` ahead of them).
     pub buffer_request: bool,
+    /// `option http-server-close`: each request goes on its own server connection, which
+    /// is asked to close; the client connection stays.
+    pub server_close: bool,
     /// Client header regex rewrite rules (up to 10).
     pub cliexp: Vec<HeaderExp>,
     /// Server header regex rewrite rules (up to 10).
@@ -358,6 +364,7 @@ impl Default for ListenSection {
             res_header_captures: Vec::new(),
             log_health_checks: false,
             buffer_request: false,
+            server_close: false,
             cliexp: Vec::new(),
             srvexp: Vec::new(),
             acls: Vec::new(),
@@ -456,6 +463,9 @@ pub struct FrontendSection {
     /// `option http-buffer-request`: wait for the request body before the rules run (as
     /// an implicit `http-request wait-for-body` ahead of them).
     pub buffer_request: bool,
+    /// `option http-server-close`: each request goes on its own server connection, which
+    /// is asked to close; the client connection stays.
+    pub server_close: bool,
     /// Stick table configuration.
     pub stick_table: Option<StickTableConfigAst>,
     /// Stick rules.
@@ -521,6 +531,7 @@ impl Default for FrontendSection {
             res_header_captures: Vec::new(),
             log_health_checks: false,
             buffer_request: false,
+            server_close: false,
             stick_table: None,
             stick_rules: Vec::new(),
             tcp_req_inspect_delay: None,
@@ -564,6 +575,9 @@ pub struct BackendSection {
     /// `option http-buffer-request`: wait for the request body before the rules run (as
     /// an implicit `http-request wait-for-body` ahead of them).
     pub buffer_request: bool,
+    /// `option http-server-close`: each request goes on its own server connection, which
+    /// is asked to close; the client connection stays.
+    pub server_close: bool,
     /// Operating mode (tcp, http, health).
     pub mode: Mode,
     /// Whether this backend is disabled.
@@ -668,6 +682,7 @@ impl Default for BackendSection {
             unique_id_header: None,
             log_health_checks: false,
             buffer_request: false,
+            server_close: false,
             mode: Mode::Tcp,
             disabled: false,
             id: None,

@@ -11,10 +11,35 @@ fn names(list: &str) -> impl Iterator<Item = &str> {
     list.split(',').filter(|n| !n.is_empty())
 }
 
+/// What `HAProxy` does with `password <hash>` at load: `crypt("", hash)` must not fail, and a
+/// hash that takes 10 ms or more to verify is warned about.
+fn check_hash(hash: &str, user: &str) -> Result<(), String> {
+    match ibex_crypt::CryptHash::parse(hash) {
+        Ok(h) => {
+            let t = std::time::Instant::now();
+            let _ = h.verify(b"");
+            let ms = t.elapsed().as_millis();
+            if ms >= 10 {
+                eprintln!(
+                    "[ibex] warning: the hash algorithm used for this password takes {ms} milliseconds to verify, which can have devastating performance and stability impacts. Please hash this password using a lighter algorithm (one that is compatible with web usage)."
+                );
+            }
+            Ok(())
+        }
+        Err(ibex_crypt::Refusal::Invalid) => Err(format!("the encrypted password used for user '{user}' is not supported by crypt(3).")),
+        Err(ibex_crypt::Refusal::Format(f)) => Err(format!(
+            "the encrypted password used for user '{user}' is in the {f} format, which Ibex cannot verify \
+             (it verifies $1$, $5$, $6$, $2a$, $2b$ and $2y$); rehash it with one of those or use 'insecure-password'."
+        )),
+    }
+}
+
 /// One line of a `userlist` section. The messages are `HAProxy`'s (3.5-dev8-885761-29).
 ///
-/// A `password` (a `crypt(3)` hash) is refused: Ibex has no `crypt(3)`, and a user it could
-/// never authenticate would turn every request away without a word as to why.
+/// A `password` is a `crypt(3)` hash, read by `ibex-crypt`: `$1$`, `$5$`, `$6$` and
+/// `$2a$`/`$2b$`/`$2y$` load; what glibc itself refuses is refused with its message; DES,
+/// yescrypt and the other formats glibc verifies and Ibex cannot are refused naming the
+/// format (a user that could never authenticate would turn every request away unexplained).
 pub(crate) fn parse_userlist_directive(list: &mut Userlist, tokens: &[Token], kw: &Token) -> Result<(), ConfigError> {
     let err = |t: &Token, m: String| ConfigError::new(t.line, t.col, m);
     match kw.text.as_str() {
@@ -49,22 +74,21 @@ pub(crate) fn parse_userlist_directive(list: &mut Userlist, tokens: &[Token], kw
                 return Err(err(kw, "'user' expects <name> as arguments.".to_string()));
             };
             let mut password = None;
+            let mut is_hash = false;
             let mut groups = Vec::new();
             let mut i = 2;
             while let Some(arg) = tokens.get(i) {
                 match arg.text.as_str() {
                     "password" => {
-                        return Err(err(
-                            arg,
-                            format!(
-                                "the encrypted 'password' of user '{}' is not supported: Ibex has no crypt(3); \
-                                 use 'insecure-password'.",
-                                name.text
-                            ),
-                        ));
+                        let hash = tokens.get(i + 1).map_or("", |t| t.text.as_str());
+                        check_hash(hash, &name.text).map_err(|m| err(arg, m))?;
+                        password = Some(hash.to_string());
+                        is_hash = true;
+                        i += 2;
                     }
                     "insecure-password" => {
                         password = tokens.get(i + 1).map(|t| t.text.clone());
+                        is_hash = false;
                         i += 2;
                     }
                     "groups" => {
@@ -83,7 +107,7 @@ pub(crate) fn parse_userlist_directive(list: &mut Userlist, tokens: &[Token], kw
             for g in groups {
                 list.user_groups.push((name.text.clone(), g, kw.line));
             }
-            list.users.push(UserlistUser { name: name.text.clone(), password, groups: Vec::new() });
+            list.users.push(UserlistUser { name: name.text.clone(), password, password_is_hash: is_hash, groups: Vec::new() });
             Ok(())
         }
         other => Err(err(kw, format!("unknown keyword '{other}' in 'userlist' section"))),
