@@ -243,3 +243,24 @@ fn set_var_unknown_and_untyped_conditions_are_refused_at_load() {
         assert_eq!(code, Some(0), "{rule} refused: {out}");
     }
 }
+
+/// `length` and the string converters cast a binary with `c_bin2str`, which stops at the first
+/// NUL byte (HAProxy 3.5-dev8: `bin(41420043),length` is 2, `bin(00),length` 0,
+/// `bin(ff41),length` 2, `str(AAEC),b64dec,length` 0, `bin(41004243),upper` "A").
+#[test]
+fn binary_cast_to_string_stops_at_the_first_nul() {
+    let be = backend();
+    let fe = common::reserve_addr();
+    let _ibex = start(
+        &format!(
+            "{DEFAULTS}frontend fe\n  bind {fe}\n  default_backend be\n\
+             backend be\n  server s {be}\n  \
+             http-response set-header x-l \"%[bin(41420043),length] %[bin(414243),length] %[bin(ff41),length] %[bin(00),length] %[str(AAEC),b64dec,length] %[int(12345),length] %[ipv4(1.2.3.4),length]\"\n  \
+             http-response set-header x-u \"%[bin(41004243),upper]\"\n"
+        ),
+        fe,
+    );
+    let r = get(fe, "");
+    assert_eq!(header(&r, "x-l").as_deref(), Some("2 3 2 0 0 5 7"), "{r}");
+    assert_eq!(header(&r, "x-u").as_deref(), Some("A"), "{r}");
+}

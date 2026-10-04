@@ -2134,11 +2134,21 @@ impl Registry {
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: len_conv,
         });
+        // `length` takes a string: a binary is cast first, and the cast stops at the first NUL
+        // byte (`c_bin2str`), so the length of `\x00\x01...` is 0. The bytes are counted here,
+        // before they would have to be valid UTF-8 to become a `String`.
         self.register_converter(ConvDesc {
             name: "length",
-            in_type: TypeSpec::Exact(SampleType::Str),
+            in_type: TypeSpec::Any,
             out_type: TypeSpec::Exact(SampleType::Sint),
-            func: len_conv,
+            func: |smp, _args| {
+                let n = match &smp {
+                    Sample::Str(s) => s.len(),
+                    Sample::Bin(b) => b.iter().position(|&c| c == 0).unwrap_or(b.len()),
+                    other => sample_to_string(other).len(),
+                };
+                Some(Sample::Sint(i64::try_from(n).unwrap_or(i64::MAX)))
+            },
         });
 
         self.register_converter(ConvDesc {
