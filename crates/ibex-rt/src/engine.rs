@@ -1305,7 +1305,7 @@ fn stream_facts(log: &crate::txnlog::StreamLog, status: Option<u16>, retried: bo
     ibex_sample::StreamFacts {
         error: retried || status.is_some_and(|s| s >= 500),
         forwarded: log.queue.is_some() || log.connect.is_some(),
-        toapplet: false,
+        toapplet: log.applet,
     }
 }
 
@@ -1571,6 +1571,7 @@ fn resolve_log_targets(config: &Config, proxies: &mut [Proxy]) -> Vec<SyslogTarg
 /// The first bind whose certificates cannot be loaded, with the frontend and address
 /// named.
 pub fn validate_tls(config: &Config) -> io::Result<()> {
+    crate::logfwd::check_debug_sinks(config)?;
     for fe in &config.frontends {
         if fe.disabled {
             continue;
@@ -6697,6 +6698,7 @@ impl EngineDispatcher<'_> {
         pid: u32,
         now: Tick,
     ) -> Option<crate::stats_html::AdminAction> {
+        entry.sess.log.applet = true;
         let req_uri = entry.sess.req_uri.as_deref().unwrap_or("/");
 
         // 1. CSV telemetry
@@ -6713,7 +6715,7 @@ impl EngineDispatcher<'_> {
                 csv.len(),
                 csv
             );
-            entry.sess.write_reply(resp.as_bytes());
+            stats_write_reply(entry, proxies, resp.as_bytes());
             return None;
         }
 
@@ -6731,7 +6733,7 @@ impl EngineDispatcher<'_> {
                 json.len(),
                 json
             );
-            entry.sess.write_reply(resp.as_bytes());
+            stats_write_reply(entry, proxies, resp.as_bytes());
             return None;
         }
 
@@ -6849,7 +6851,7 @@ impl EngineDispatcher<'_> {
                     body.len(),
                     body
                 );
-                entry.sess.write_reply(resp.as_bytes());
+                stats_write_reply(entry, proxies, resp.as_bytes());
                 return Some(cmd);
             }
 
@@ -6865,7 +6867,7 @@ impl EngineDispatcher<'_> {
                 html.len(),
                 html
             );
-            entry.sess.write_reply(resp.as_bytes());
+            stats_write_reply(entry, proxies, resp.as_bytes());
             return Some(cmd);
         }
 
@@ -6882,7 +6884,7 @@ impl EngineDispatcher<'_> {
             html.len(),
             html
         );
-        entry.sess.write_reply(resp.as_bytes());
+        stats_write_reply(entry, proxies, resp.as_bytes());
         None
     }
 
@@ -7684,6 +7686,15 @@ impl EngineDispatcher<'_> {
                 Ok(RuleFlow::Suspend) => return None,
                 Ok(RuleFlow::Next) => {}
             }
+        }
+
+        // A backend's `stats enable` / `stats uri`: the stats applet answers a request for
+        // its URI after the backend's own rules (the frontend's was served above).
+        if be_idx != proxy_idx
+            && (proxies[be_idx].stats_config.enable || proxies[be_idx].stats_config.uri.is_some() || proxies[be_idx].stats_config.admin)
+            && Self::is_stats_request(entry.sess.req_uri.as_deref().unwrap_or("/"), proxies[be_idx].stats_config.uri.as_deref())
+        {
+            return Self::handle_stats_request(entry, proxies, checks, pid, now);
         }
 
         // Apply forwardfor & originalto header injection. As in HAProxy
@@ -9603,6 +9614,23 @@ fn stick_bytes_due(sess: &TcpSession, last: bool) -> (u64, u64) {
 /// A rule that fails turns the reply into the 500 page, which goes through the rules once
 /// more; if they fail on that too, or the failed reply was already a 500, the 500 goes out
 /// without them (`http_reply_and_close`, `TX_CONST_REPLY`).
+/// A stats page answer, with the `http-after-response` rules of its frontend and backend
+/// applied as they are to any other response.
+fn stats_write_reply(entry: &mut SessionEntry, proxies: &[Proxy], raw: &[u8]) {
+    let (fe, be) = (entry.proxy_idx, entry.backend_idx);
+    // The page is streamed by the applet, not held in the HTX message the rules edit: they
+    // see the head alone.
+    let head_len = crate::proxy::find_eoh(raw).map_or(raw.len(), |(h, e)| h + e);
+    match after_res_on_reply(&mut entry.sess, proxies, fe, be, &raw[..head_len]) {
+        Ok(head) => {
+            let mut out = head.into_owned();
+            out.extend_from_slice(&raw[head_len..]);
+            entry.sess.write_reply(&out);
+        }
+        Err(()) => entry.sess.write_reply(raw),
+    }
+}
+
 fn send_proxy_reply(sess: &mut TcpSession, proxies: &[Proxy], fe_idx: usize, be_idx: usize, raw: &[u8]) {
     if let Ok(out) = after_res_on_reply(sess, proxies, fe_idx, be_idx, raw) {
         sess.write_reply(&out);
