@@ -50,16 +50,6 @@ pub(crate) fn parse_u16(token: &Token, keyword: &str) -> Result<u16, ConfigError
     })
 }
 
-pub(crate) fn parse_usize(token: &Token, keyword: &str) -> Result<usize, ConfigError> {
-    token.text.parse::<usize>().map_err(|_| {
-        ConfigError::new(
-            token.line,
-            token.col,
-            format!("<{keyword}> expects a positive integer argument."),
-        )
-    })
-}
-
 pub(crate) fn parse_size(token: &Token) -> Result<usize, ConfigError> {
     let s = token.text.to_lowercase();
     let (num_str, multiplier) = if let Some(stripped) = s.strip_suffix('k') {
@@ -96,16 +86,6 @@ pub(crate) fn parse_hex_binary(hex: &str) -> Result<Vec<u8>, String> {
         bytes.push(byte);
     }
     Ok(bytes)
-}
-
-pub(crate) fn parse_match_type(s: &str) -> MatchType {
-    match s.to_ascii_lowercase().as_str() {
-        "beg" => MatchType::Beg,
-        "end" => MatchType::End,
-        "sub" => MatchType::Sub,
-        "reg" => MatchType::Reg,
-        _ => MatchType::Str,
-    }
 }
 
 pub(crate) fn validate_regex(token: &Token) -> Result<(), ConfigError> {

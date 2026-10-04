@@ -270,6 +270,10 @@ pub struct ListenSection {
     pub proto_check: Option<ProtoCheckConfig>,
     /// Custom HTTP check directives (`http-check`).
     pub http_checks: Vec<HttpCheckAction>,
+    /// This section has `http-check` rules or `option httpchk` of its own, so none of the
+    /// defaults' were kept (`HAProxy` hands a proxy the defaults' rule set only when it
+    /// has none).
+    pub http_check_own: bool,
     /// Custom TCP check directives (`tcp-check`).
     pub tcp_checks: Vec<TcpCheckAction>,
     /// TCP check mode enabled (`option tcp-check`).
@@ -363,6 +367,7 @@ impl Default for ListenSection {
             httpchk: None,
             proto_check: None,
             http_checks: Vec::new(),
+            http_check_own: false,
             tcp_checks: Vec::new(),
             tcp_check: false,
             error_files: HashMap::new(),
@@ -599,6 +604,10 @@ pub struct BackendSection {
     pub proto_check: Option<ProtoCheckConfig>,
     /// Custom HTTP check directives (`http-check`).
     pub http_checks: Vec<HttpCheckAction>,
+    /// This section has `http-check` rules or `option httpchk` of its own, so none of the
+    /// defaults' were kept (`HAProxy` hands a proxy the defaults' rule set only when it
+    /// has none).
+    pub http_check_own: bool,
     /// Custom TCP check directives (`tcp-check`).
     pub tcp_checks: Vec<TcpCheckAction>,
     /// TCP check mode enabled (`option tcp-check`).
@@ -656,6 +665,7 @@ impl Default for BackendSection {
             httpchk: None,
             proto_check: None,
             http_checks: Vec::new(),
+            http_check_own: false,
             tcp_checks: Vec::new(),
             tcp_check: false,
             error_files: HashMap::new(),

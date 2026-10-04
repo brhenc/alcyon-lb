@@ -435,6 +435,7 @@ dependencies = [
  "ibex-stick-table",
  "ibex-tls",
  "rcgen",
+ "regex",
  "rustix 0.38.44",
  "rustls",
  "serde",

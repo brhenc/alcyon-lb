@@ -62,6 +62,7 @@ pub(crate) fn parse_listen_header(
         httpchk: defaults.and_then(|d| d.httpchk.clone()),
         proto_check: defaults.and_then(|d| d.proto_check.clone()),
         http_checks: defaults.map_or_else(Vec::new, |d| d.http_checks.clone()),
+        http_check_own: false,
         tcp_checks: defaults.map_or_else(Vec::new, |d| d.tcp_checks.clone()),
         tcp_check: defaults.is_some_and(|d| d.tcp_check),
         name: id,
@@ -242,6 +243,7 @@ pub(crate) fn parse_backend_header(
         httpchk: defaults.and_then(|d| d.httpchk.clone()),
         proto_check: defaults.and_then(|d| d.proto_check.clone()),
         http_checks: defaults.map_or_else(Vec::new, |d| d.http_checks.clone()),
+        http_check_own: false,
         tcp_checks: defaults.map_or_else(Vec::new, |d| d.tcp_checks.clone()),
         tcp_check: defaults.is_some_and(|d| d.tcp_check),
         name: id,
@@ -372,6 +374,7 @@ pub(crate) fn parse_listen_directive(
         }
         "stats" => parse_stats_directive(&mut proxy.stats, tokens, kw),
         "http-check" => {
+            take_own_http_check(&mut proxy.http_check_own, &mut proxy.httpchk, &mut proxy.http_checks);
             parse_http_check_directive(&mut proxy.http_checks, tokens, kw)?;
             Ok(())
         }
@@ -618,6 +621,7 @@ pub(crate) fn parse_backend_directive(
         "log" => parse_log(&mut be.logs, tokens, kw).map(|g| be.log_global |= g),
         "log-tag" => parse_log_tag(tokens, kw).map(|t| be.log_tag = Some(t)),
         "http-check" => {
+            take_own_http_check(&mut be.http_check_own, &mut be.httpchk, &mut be.http_checks);
             parse_http_check_directive(&mut be.http_checks, tokens, kw)?;
             Ok(())
         }
@@ -817,7 +821,10 @@ pub(crate) fn parse_option_listen(
         "http-buffer-request" => proxy.buffer_request = true,
         "accept-unsafe-violations-in-http-request" => proxy.stats.accept_unsafe_request = true,
         "log-health-checks" => proxy.log_health_checks = true,
-        "httpchk" => parse_httpchk_option(&mut proxy.httpchk, tokens, kw)?,
+        "httpchk" => {
+            take_own_http_check(&mut proxy.http_check_own, &mut proxy.httpchk, &mut proxy.http_checks);
+            parse_httpchk_option(&mut proxy.httpchk, tokens, kw)?;
+        }
         "tcp-check" => proxy.tcp_check = true,
         _ => {
             parse_proto_check_option(&mut proxy.proto_check, tokens, kw)?;
@@ -880,7 +887,10 @@ pub(crate) fn parse_option_backend(
         "redispatch" => set_redispatch(&mut be.redisp, &mut be.redisp_after, tokens),
         "http-buffer-request" => be.buffer_request = true,
         "log-health-checks" => be.log_health_checks = true,
-        "httpchk" => parse_httpchk_option(&mut be.httpchk, tokens, kw)?,
+        "httpchk" => {
+            take_own_http_check(&mut be.http_check_own, &mut be.httpchk, &mut be.http_checks);
+            parse_httpchk_option(&mut be.httpchk, tokens, kw)?;
+        }
         "tcp-check" => be.tcp_check = true,
         _ => {
             parse_proto_check_option(&mut be.proto_check, tokens, kw)?;

@@ -18,6 +18,22 @@ pub(crate) fn refuse_if_check_option(name: &str, kw: &Token) -> Result<(), Confi
 }
 
 #[allow(clippy::unnecessary_wraps)]
+/// A section with `http-check` rules or `option httpchk` of its own does not inherit the
+/// defaults' (`HAProxy` hands a proxy the defaults' rule set only when it has none): the
+/// first of them drops what the section was given.
+pub(crate) fn take_own_http_check(
+    own: &mut bool,
+    httpchk: &mut Option<HttpChkConfig>,
+    http_checks: &mut Vec<HttpCheckAction>,
+) {
+    if !*own {
+        *own = true;
+        // Whether the checks are HTTP ones stays; the inherited request does not.
+        *httpchk = httpchk.as_ref().map(|_| HttpChkConfig { method: None, uri: None, version: None, host: None });
+        http_checks.clear();
+    }
+}
+
 pub(crate) fn parse_httpchk_option(
     httpchk: &mut Option<HttpChkConfig>,
     tokens: &[Token],
@@ -161,6 +177,77 @@ pub(crate) fn parse_proto_check_option(
     }
 }
 
+fn check_err(kw: &Token, msg: impl Into<String>) -> ConfigError {
+    ConfigError::new(kw.line, kw.col, msg.into())
+}
+
+/// `-m <str|beg|end|sub|reg>` after a header `name` or `value` keyword of `expect hdr`.
+/// Returns the pattern text and where parsing resumes.
+fn parse_hdr_pattern(
+    tokens: &[Token],
+    mut i: usize,
+    what: &str,
+    lf: bool,
+    kw: &Token,
+) -> Result<(HdrPattern, usize), ConfigError> {
+    let mut mt = MatchType::Str;
+    if tokens.get(i).is_some_and(|t| t.text == "-m") {
+        let Some(m) = tokens.get(i + 1) else {
+            return Err(check_err(
+                kw,
+                format!("'{what}' : '-m' expects at a matching pattern ('str', 'beg', 'end', 'sub' or 'reg')"),
+            ));
+        };
+        mt = match m.text.as_str() {
+            "str" => MatchType::Str,
+            "beg" => MatchType::Beg,
+            "end" => MatchType::End,
+            "sub" => MatchType::Sub,
+            "reg" => {
+                if lf {
+                    return Err(check_err(
+                        kw,
+                        format!("'{what}': log-format string is not supported with a regex matching method"),
+                    ));
+                }
+                MatchType::Reg
+            }
+            other => {
+                return Err(check_err(
+                    kw,
+                    format!("'{what}' : '-m' only supports 'str', 'beg', 'end', 'sub' or 'reg' (got '{other}')"),
+                ))
+            }
+        };
+        i += 2;
+    }
+    let Some(text) = tokens.get(i) else {
+        return Err(check_err(kw, format!("'{what}' expect a pattern with the value keyword")));
+    };
+    if mt == MatchType::Reg {
+        validate_regex(text)?;
+    }
+    Ok((HdrPattern { text: text.text.clone(), lf, mt }, i + 1))
+}
+
+/// `http-check expect`: the status list of `status 200-399,404`.
+fn parse_status_ranges(text: &str, kw: &Token) -> Result<Vec<(u16, u16)>, ConfigError> {
+    let mut out = Vec::new();
+    for part in text.split(',') {
+        let (lo, hi) = part.split_once('-').unwrap_or((part, part));
+        let parse = |s: &str| {
+            s.parse::<u16>()
+                .map_err(|_| check_err(kw, format!("invalid character in the list of status codes '{text}'")))
+        };
+        let (lo, hi) = (parse(lo)?, parse(hi)?);
+        if lo > hi {
+            return Err(check_err(kw, format!("invalid range of status codes '{text}'")));
+        }
+        out.push((lo, hi));
+    }
+    Ok(out)
+}
+
 #[allow(clippy::too_many_lines)]
 pub(crate) fn parse_http_check_directive(
     rules: &mut Vec<HttpCheckAction>,
@@ -168,62 +255,88 @@ pub(crate) fn parse_http_check_directive(
     kw: &Token,
 ) -> Result<(), ConfigError> {
     if tokens.len() < 2 {
-        return Err(ConfigError::new(
-            kw.line,
-            kw.col,
-            "http-check requires a subcommand",
-        ));
+        return Err(check_err(kw, "http-check requires a subcommand"));
     }
+    let sub = tokens[1].text.as_str();
+    let has_send = rules.iter().any(|r| matches!(r, HttpCheckAction::Send { .. }));
 
-    match tokens[1].text.as_str() {
+    match sub {
         "send" => {
+            // Ibex runs one request per check: a second `send` (a script of several
+            // requests, with their `expect` rules between) would have to be merged into
+            // the first, and `HAProxy` does not merge them.
+            if has_send {
+                return Err(check_err(
+                    kw,
+                    "a second 'http-check send' is not supported: Ibex runs one request per check",
+                ));
+            }
             let mut method = None;
             let mut uri = None;
             let mut uri_lf = false;
             let mut version = None;
-            let mut headers = Vec::new();
+            let mut headers: Vec<(String, String)> = Vec::new();
             let mut body = None;
             let mut body_lf = false;
 
             let mut i = 2;
             while i < tokens.len() {
-                match tokens[i].text.as_str() {
+                let key = tokens[i].text.as_str();
+                let arg = |n: usize| {
+                    tokens.get(i + n).map(|t| t.text.clone()).ok_or_else(|| {
+                        check_err(kw, format!("'{key}' expects a string as argument."))
+                    })
+                };
+                match key {
                     "meth" => {
+                        method = Some(arg(1)?);
                         i += 1;
-                        if i < tokens.len() {
-                            method = Some(tokens[i].text.clone());
-                        }
                     }
-                    kw @ ("uri" | "uri-lf") => {
-                        uri_lf = kw == "uri-lf";
+                    "uri" | "uri-lf" => {
+                        uri_lf = key == "uri-lf";
+                        uri = Some(arg(1)?);
                         i += 1;
-                        if i < tokens.len() {
-                            uri = Some(tokens[i].text.clone());
-                        }
                     }
                     "ver" => {
+                        version = Some(arg(1)?);
                         i += 1;
-                        if i < tokens.len() {
-                            version = Some(tokens[i].text.clone());
-                        }
                     }
-                    "hdr" | "hdr-lf" => {
-                        if i + 2 < tokens.len() {
-                            let hname = tokens[i + 1].text.clone();
-                            let hval = tokens[i + 2].text.clone();
-                            headers.push((hname, hval));
-                            i += 2;
+                    "hdr" => {
+                        if i + 2 >= tokens.len() {
+                            return Err(check_err(kw, "'hdr' expects <name> and <value> as arguments"));
                         }
+                        let (name, value) = (arg(1)?, arg(2)?);
+                        if name.eq_ignore_ascii_case("host")
+                            && headers.iter().any(|(n, _)| n.eq_ignore_ascii_case("host"))
+                        {
+                            return Err(check_err(kw, "'host' header already defined"));
+                        }
+                        // `HAProxy` drops these two: the length is its own.
+                        if !(name.eq_ignore_ascii_case("content-length")
+                            || name.eq_ignore_ascii_case("transfer-encoding"))
+                        {
+                            headers.push((name, value));
+                        }
+                        i += 2;
                     }
-                    kw @ ("body" | "body-lf") => {
-                        body_lf = kw == "body-lf";
+                    "body" | "body-lf" => {
+                        body_lf = key == "body-lf";
+                        body = Some(arg(1)?);
                         i += 1;
-                        if i < tokens.len() {
-                            body = Some(tokens[i].text.clone());
-                        }
+                    }
+                    "comment" => {
+                        // Only read back in messages about a failing `send`, which Ibex
+                        // does not word: the text is checked and dropped.
+                        arg(1)?;
+                        i += 1;
                     }
                     other => {
-                        eprintln!("[ibex] warning: ignored http-check send parameter '{other}'");
+                        return Err(check_err(
+                            kw,
+                            format!(
+                                "expects 'comment', 'meth', 'uri', 'uri-lf', 'ver', 'hdr', 'body' or 'body-lf' but got '{other}' as argument."
+                            ),
+                        ));
                     }
                 }
                 i += 1;
@@ -241,180 +354,131 @@ pub(crate) fn parse_http_check_directive(
             Ok(())
         }
         "expect" => {
-            if tokens.len() < 3 {
-                return Err(ConfigError::new(
-                    kw.line,
-                    kw.col,
-                    "http-check expect requires pattern",
-                ));
-            }
-
-            let mut i = 2;
             let mut negate = false;
-            if tokens[i].text == "!" {
-                negate = true;
-                i += 1;
-            }
-
-            if i >= tokens.len() {
-                return Err(ConfigError::new(
-                    kw.line,
-                    kw.col,
-                    "http-check expect requires pattern",
-                ));
-            }
-
-            let pat_token = &tokens[i];
-            let mut pat_name = pat_token.text.as_str();
-            if pat_name.starts_with('!') {
-                negate = true;
-                pat_name = &pat_name[1..];
-            }
-
-            let pattern = match pat_name {
-                "status" => {
-                    i += 1;
-                    if i >= tokens.len() {
-                        return Err(ConfigError::new(
-                            kw.line,
-                            kw.col,
-                            "http-check expect status requires status code or range",
-                        ));
-                    }
-                    let val = &tokens[i].text;
-                    if let Some((low, high)) = val.split_once('-') {
-                        let l = low.parse::<u16>().map_err(|_| {
-                            ConfigError::new(kw.line, kw.col, format!("invalid status '{low}'"))
-                        })?;
-                        let h = high.parse::<u16>().map_err(|_| {
-                            ConfigError::new(kw.line, kw.col, format!("invalid status '{high}'"))
-                        })?;
-                        HttpCheckExpectPattern::StatusRange(l, h)
-                    } else if val.contains(',') {
-                        let mut codes = Vec::new();
-                        for part in val.split(',') {
-                            let code = part.trim().parse::<u16>().map_err(|_| {
-                                ConfigError::new(kw.line, kw.col, format!("invalid status '{part}'"))
-                            })?;
-                            codes.push(code);
-                        }
-                        HttpCheckExpectPattern::Status(codes)
-                    } else {
-                        let code = val.parse::<u16>().map_err(|_| {
-                            ConfigError::new(kw.line, kw.col, format!("invalid status '{val}'"))
-                        })?;
-                        HttpCheckExpectPattern::Status(vec![code])
-                    }
-                }
-                "rstatus" => {
-                    i += 1;
-                    if i >= tokens.len() {
-                        return Err(ConfigError::new(
-                            kw.line,
-                            kw.col,
-                            "http-check expect rstatus requires regex pattern",
-                        ));
-                    }
-                    HttpCheckExpectPattern::RStatus(tokens[i].text.clone())
-                }
-                "string" => {
-                    i += 1;
-                    if i >= tokens.len() {
-                        return Err(ConfigError::new(
-                            kw.line,
-                            kw.col,
-                            "http-check expect string requires pattern",
-                        ));
-                    }
-                    HttpCheckExpectPattern::String(tokens[i].text.clone())
-                }
-                "rstring" => {
-                    i += 1;
-                    if i >= tokens.len() {
-                        return Err(ConfigError::new(
-                            kw.line,
-                            kw.col,
-                            "http-check expect rstring requires regex pattern",
-                        ));
-                    }
-                    HttpCheckExpectPattern::RString(tokens[i].text.clone())
-                }
-                "hdr" | "fhdr" => {
-                    let is_fhdr = pat_name == "fhdr";
-                    i += 1;
-                    let mut name = String::new();
-                    let mut match_type = MatchType::Str;
-                    let mut value = None;
-                    let mut value_match_type = MatchType::Str;
-
-                    while i < tokens.len() {
-                        match tokens[i].text.as_str() {
-                            "name" | "name-lf" => {
-                                i += 1;
-                                if i < tokens.len() && tokens[i].text == "-m" {
-                                    i += 1;
-                                    if i < tokens.len() {
-                                        match_type = parse_match_type(&tokens[i].text);
-                                        i += 1;
-                                    }
-                                }
-                                if i < tokens.len() {
-                                    name = tokens[i].text.clone();
-                                }
-                            }
-                            "-m" => {
-                                i += 1;
-                                if i < tokens.len() {
-                                    match_type = parse_match_type(&tokens[i].text);
-                                }
-                            }
-                            "value" | "value-lf" => {
-                                i += 1;
-                                if i < tokens.len() && tokens[i].text == "-m" {
-                                    i += 1;
-                                    if i < tokens.len() {
-                                        value_match_type = parse_match_type(&tokens[i].text);
-                                        i += 1;
-                                    }
-                                }
-                                if i < tokens.len() {
-                                    value = Some(tokens[i].text.clone());
-                                }
-                            }
-                            _ => {}
-                        }
-                        i += 1;
-                    }
-
-                    if is_fhdr {
-                        HttpCheckExpectPattern::Fhdr {
-                            name,
-                            match_type,
-                            value,
-                            value_match_type,
-                        }
-                    } else {
-                        HttpCheckExpectPattern::Hdr {
-                            name,
-                            match_type,
-                            value,
-                            value_match_type,
-                        }
-                    }
-                }
-                other => {
-                    return Err(ConfigError::new(
-                        kw.line,
-                        kw.col,
-                        format!("'http-check expect {other}' is not supported"),
-                    ));
+            let mut min_recv: i64 = -1;
+            let mut comment = None;
+            let mut pattern = None;
+            let mut i = 2;
+            let one_pattern = |pattern: &Option<HttpCheckExpectPattern>| {
+                if pattern.is_some() {
+                    Err(check_err(kw, "only one pattern expected"))
+                } else {
+                    Ok(())
                 }
             };
-
-            rules.push(HttpCheckAction::Expect { pattern, negate });
+            while i < tokens.len() {
+                let mut key = tokens[i].text.as_str();
+                let mut in_pattern = false;
+                while let Some(rest) = key.strip_prefix('!') {
+                    negate = !negate;
+                    in_pattern = true;
+                    key = rest;
+                }
+                if key.is_empty() {
+                    i += 1;
+                    key = tokens.get(i).map_or("", |t| t.text.as_str());
+                }
+                let arg = |n: usize, what: &str| {
+                    tokens.get(i + n).ok_or_else(|| check_err(kw, format!("'{key}' expects {what} as argument")))
+                };
+                match key {
+                    "min-recv" if !in_pattern => {
+                        let v = arg(1, "a integer")?;
+                        min_recv = v.text.parse::<i64>().ok().filter(|m| (-1..=i64::from(i32::MAX)).contains(m)).ok_or_else(
+                            || check_err(kw, "'min-recv' expects -1 or an integer from 0 to INT_MAX"),
+                        )?;
+                        i += 1;
+                    }
+                    "comment" if !in_pattern => {
+                        comment = Some(arg(1, "a string")?.text.clone());
+                        i += 1;
+                    }
+                    "status" | "rstatus" => {
+                        one_pattern(&pattern)?;
+                        let v = arg(1, "a <pattern>")?;
+                        pattern = Some(if key == "status" {
+                            HttpCheckExpectPattern::Status(parse_status_ranges(&v.text, kw)?)
+                        } else {
+                            validate_regex(v)?;
+                            HttpCheckExpectPattern::RStatus(v.text.clone())
+                        });
+                        i += 1;
+                    }
+                    "string" | "rstring" | "string-lf" => {
+                        one_pattern(&pattern)?;
+                        let v = arg(1, "a <pattern>")?;
+                        pattern = Some(match key {
+                            "string" => HttpCheckExpectPattern::String(v.text.clone()),
+                            "string-lf" => HttpCheckExpectPattern::StringLf(v.text.clone()),
+                            _ => {
+                                validate_regex(v)?;
+                                HttpCheckExpectPattern::RString(v.text.clone())
+                            }
+                        });
+                        i += 1;
+                    }
+                    "hdr" | "fhdr" => {
+                        one_pattern(&pattern)?;
+                        let what = key;
+                        let name_kw = tokens.get(i + 1).map(|t| t.text.as_str());
+                        if tokens.get(i + 2).is_none() || !matches!(name_kw, Some("name" | "name-lf")) {
+                            return Err(check_err(
+                                kw,
+                                format!("'{what}' expects at the name keyword as first argument followed by a pattern"),
+                            ));
+                        }
+                        let (name, next) = parse_hdr_pattern(tokens, i + 2, what, name_kw == Some("name-lf"), kw)?;
+                        i = next;
+                        let value = match tokens.get(i).map(|t| t.text.as_str()) {
+                            Some(v @ ("value" | "value-lf")) => {
+                                let (p, next) = parse_hdr_pattern(tokens, i + 1, what, v == "value-lf", kw)?;
+                                i = next;
+                                Some(p)
+                            }
+                            _ => None,
+                        };
+                        pattern = Some(HttpCheckExpectPattern::Hdr { full: what == "fhdr", name, value });
+                        // `i` is already past the pattern.
+                        continue;
+                    }
+                    "on-success" | "on-error" | "ok-status" | "error-status" | "tout-status" | "status-code"
+                    | "custom" => {
+                        return Err(check_err(
+                            kw,
+                            format!(
+                                "'http-check expect {key}' is not supported: Ibex does not implement it, and the rule would be evaluated without it"
+                            ),
+                        ));
+                    }
+                    other => {
+                        return Err(check_err(
+                            kw,
+                            format!(
+                                "'only supports min-recv, [!]string', '[!]rstring', '[!]string-lf', '[!]status', '[!]rstatus', [!]hdr, [!]fhdr or comment but got '{other}' as argument."
+                            ),
+                        ));
+                    }
+                }
+                i += 1;
+            }
+            let Some(pattern) = pattern else {
+                return Err(check_err(kw, "http-check expect requires pattern"));
+            };
+            rules.push(HttpCheckAction::Expect { pattern, negate, min_recv, comment });
             Ok(())
         }
         "connect" => {
+            // The connection options that change where or how Ibex connects are the ones
+            // implemented; each other is refused rather than dropped.
+            if rules
+                .iter()
+                .any(|r| !matches!(r, HttpCheckAction::Comment(_) | HttpCheckAction::SetVar { .. } | HttpCheckAction::UnsetVar { .. }))
+            {
+                return Err(check_err(
+                    kw,
+                    "only one 'http-check connect', before the request, is supported: Ibex runs one request per check",
+                ));
+            }
             let mut addr = None;
             let mut port = None;
             let mut send_proxy = false;
@@ -424,23 +488,38 @@ pub(crate) fn parse_http_check_directive(
                 match tokens[i].text.as_str() {
                     "addr" => {
                         i += 1;
-                        if i < tokens.len() {
-                            if let Ok(parsed_addr) = tokens[i].text.parse::<SocketAddr>() {
-                                addr = Some(parsed_addr);
-                                port = Some(parsed_addr.port());
-                            } else if let Ok(ip) = tokens[i].text.parse::<IpAddr>() {
-                                addr = Some(SocketAddr::new(ip, 0));
-                            }
+                        let Some(t) = tokens.get(i) else {
+                            return Err(check_err(kw, "'addr' expects an address as argument"));
+                        };
+                        if let Ok(sa) = t.text.parse::<SocketAddr>() {
+                            addr = Some(sa);
+                            port = Some(sa.port());
+                        } else if let Ok(ip) = t.text.parse::<IpAddr>() {
+                            addr = Some(SocketAddr::new(ip, 0));
+                        } else {
+                            return Err(check_err(kw, format!("'addr' : cannot parse address '{}'", t.text)));
                         }
                     }
                     "port" => {
                         i += 1;
-                        if i < tokens.len() {
-                            port = Some(parse_u16(&tokens[i], "port")?);
-                        }
+                        let Some(t) = tokens.get(i) else {
+                            return Err(check_err(kw, "'port' expects a port as argument"));
+                        };
+                        port = Some(parse_u16(t, "port")?);
                     }
                     "send-proxy" => send_proxy = true,
-                    _ => {}
+                    "comment" => {
+                        i += 1;
+                        if tokens.get(i).is_none() {
+                            return Err(check_err(kw, "'comment' expects a string as argument"));
+                        }
+                    }
+                    other => {
+                        return Err(check_err(
+                            kw,
+                            format!("'http-check connect {other}' is not supported: Ibex does not implement it"),
+                        ));
+                    }
                 }
                 i += 1;
             }
@@ -453,55 +532,45 @@ pub(crate) fn parse_http_check_directive(
             Ok(())
         }
         "comment" => {
-            let comment = if tokens.len() >= 3 {
-                tokens[2].text.clone()
-            } else {
-                String::new()
+            let Some(t) = tokens.get(2) else {
+                return Err(check_err(kw, "'comment' expects a string as argument"));
             };
-            rules.push(HttpCheckAction::Comment(comment));
-            Ok(())
-        }
-        "disable-on-404" => {
-            rules.push(HttpCheckAction::DisableOn404);
+            rules.push(HttpCheckAction::Comment(t.text.clone()));
             Ok(())
         }
         "send-state" => {
             rules.push(HttpCheckAction::SendState);
             Ok(())
         }
-        "set-var" => {
-            let var_name = tokens.get(2).map_or("", |t| t.text.as_str()).to_string();
-            let expr = tokens.get(3).map_or("", |t| t.text.as_str()).to_string();
-            rules.push(HttpCheckAction::SetVar { var_name, expr });
-            Ok(())
-        }
-        "unset-var" => {
-            let var_name = tokens.get(2).map_or("", |t| t.text.as_str()).to_string();
-            rules.push(HttpCheckAction::UnsetVar { var_name });
-            Ok(())
-        }
-        other if other.starts_with("set-var(") => {
-            let var_name = other
-                .trim_start_matches("set-var(")
-                .trim_end_matches(')')
-                .to_string();
-            let expr = tokens.get(2).map_or("", |t| t.text.as_str()).to_string();
-            rules.push(HttpCheckAction::SetVar { var_name, expr });
-            Ok(())
-        }
-        other if other.starts_with("unset-var(") => {
-            let var_name = other
-                .trim_start_matches("unset-var(")
-                .trim_end_matches(')')
-                .to_string();
-            rules.push(HttpCheckAction::UnsetVar { var_name });
-            Ok(())
-        }
-        other => Err(ConfigError::new(
-            kw.line,
-            kw.col,
-            format!("'http-check {other}' is not supported"),
+        "disable-on-404" => Err(check_err(
+            kw,
+            "'http-check disable-on-404' is not supported: Ibex does not implement it, and a 404 would fail the check",
         )),
+        other if other.starts_with("set-var(") || other.starts_with("unset-var(") => {
+            let set = other.starts_with("set-var(");
+            let Some(var_name) = other
+                .strip_prefix(if set { "set-var(" } else { "unset-var(" })
+                .and_then(|n| n.strip_suffix(')'))
+            else {
+                return Err(check_err(kw, format!("'{other}' : missing closing parenthesis")));
+            };
+            if !var_name.starts_with("check.") || var_name.contains(',') || var_name.len() == "check.".len() {
+                return Err(check_err(
+                    kw,
+                    format!("'{other}' : only variables of the 'check' scope are supported (check.<name>)"),
+                ));
+            }
+            if set {
+                let Some(expr) = tokens.get(2) else {
+                    return Err(check_err(kw, format!("'{other}' expects an expression")));
+                };
+                rules.push(HttpCheckAction::SetVar { var_name: var_name.to_string(), expr: expr.text.clone() });
+            } else {
+                rules.push(HttpCheckAction::UnsetVar { var_name: var_name.to_string() });
+            }
+            Ok(())
+        }
+        other => Err(check_err(kw, format!("'http-check {other}' is not supported"))),
     }
 }
 
@@ -523,26 +592,47 @@ pub(crate) fn parse_tcp_check_directive(
         "connect" => {
             let mut port = None;
             let mut send_proxy = false;
+            let mut comment = None;
 
             let mut i = 2;
             while i < tokens.len() {
                 match tokens[i].text.as_str() {
                     "port" => {
                         i += 1;
-                        if i < tokens.len() {
-                            port = Some(parse_u16(&tokens[i], "port")?);
-                        }
+                        let Some(t) = tokens.get(i) else {
+                            return Err(check_err(kw, "'port' expects a port as argument"));
+                        };
+                        port = Some(parse_u16(t, "port")?);
                     }
                     "send-proxy" => send_proxy = true,
-                    _ => {}
+                    "comment" => {
+                        i += 1;
+                        let Some(t) = tokens.get(i) else {
+                            return Err(check_err(kw, "'comment' expects a string as argument"));
+                        };
+                        comment = Some(t.text.clone());
+                    }
+                    other => {
+                        return Err(check_err(
+                            kw,
+                            format!("'tcp-check connect {other}' is not supported: Ibex does not implement it"),
+                        ));
+                    }
                 }
                 i += 1;
             }
 
-            rules.push(TcpCheckAction::Connect { port, send_proxy });
+            rules.push(TcpCheckAction::Connect { port, send_proxy, comment });
             Ok(())
         }
-        "send" | "send-lf" => {
+        "send-lf" | "send-binary-lf" => Err(check_err(
+            kw,
+            format!(
+                "'tcp-check {}' is not supported: Ibex does not implement log-format data, which would be sent as written",
+                tokens[1].text
+            ),
+        )),
+        "send" => {
             if tokens.len() < 3 {
                 return Err(ConfigError::new(
                     kw.line,
@@ -554,7 +644,7 @@ pub(crate) fn parse_tcp_check_directive(
             rules.push(TcpCheckAction::Send(data));
             Ok(())
         }
-        "send-binary" | "send-binary-lf" => {
+        "send-binary" => {
             if tokens.len() < 3 {
                 return Err(ConfigError::new(
                     kw.line,
@@ -593,7 +683,14 @@ pub(crate) fn parse_tcp_check_directive(
                 if token_text == "min-recv" {
                     i += 1;
                     if i < tokens.len() {
-                        min_recv = Some(parse_usize(&tokens[i], "min-recv")?);
+                        min_recv = Some(
+                            tokens[i]
+                                .text
+                                .parse::<i64>()
+                                .ok()
+                                .filter(|m| (-1..=i64::from(i32::MAX)).contains(m))
+                                .ok_or_else(|| check_err(kw, "'min-recv' expects -1 or an integer from 0 to INT_MAX"))?,
+                        );
                     }
                     i += 1;
                     continue;
@@ -632,11 +729,20 @@ pub(crate) fn parse_tcp_check_directive(
                     "rstring" => {
                         i += 1;
                         if i < tokens.len() {
+                            validate_regex(&tokens[i])?;
                             pattern = Some(TcpCheckExpectPattern::RString(tokens[i].text.clone()));
                         }
                     }
-                    "error-status" | "on-error" | "status-code" => {
-                        i += 1;
+                    "error-status" | "on-error" | "on-success" | "ok-status" | "status-code" | "tout-status"
+                    | "string-lf" | "binary-lf" | "rstring-lf" => {
+                        return Err(ConfigError::new(
+                            kw.line,
+                            kw.col,
+                            format!(
+                                "'tcp-check expect {ptext}' is not supported: Ibex does not implement it, and the \
+                                 rule would be evaluated without it"
+                            ),
+                        ));
                     }
                     other => {
                         return Err(ConfigError::new(
@@ -696,15 +802,22 @@ pub(crate) fn build_resolved_http_check(
     let mut version = httpchk
         .and_then(|h| h.version.clone())
         .unwrap_or_else(|| "HTTP/1.0".to_string());
-    let mut host = httpchk.and_then(|h| h.host.clone());
+    let host = httpchk.and_then(|h| h.host.clone());
     let mut headers = Vec::new();
     let mut uri_lf = false;
     let mut body = None;
     let mut body_lf = false;
     let mut send_state = false;
-    let mut expect_rules = Vec::new();
-    let check_port = server.check_port;
-    let send_proxy = server.send_proxy || server.send_proxy_v2;
+    // `option httpchk` carries a request; the empty one a section keeps from the defaults
+    // (see `take_own_http_check`) only says the checks are HTTP.
+    let mut has_send = httpchk.is_some_and(|h| h.method.is_some());
+    let mut pre_rules = Vec::new();
+    let mut rules = Vec::new();
+    let mut check_port = server.check_port;
+    let mut connect_addr = None;
+    let mut send_proxy = server.send_proxy || server.send_proxy_v2;
+    let mut pending_comment: Option<&String> = None;
+    let mut seen_expect = false;
 
     for act in http_checks {
         match act {
@@ -717,6 +830,7 @@ pub(crate) fn build_resolved_http_check(
                 body: req_body,
                 body_lf: req_body_lf,
             } => {
+                has_send = true;
                 if let Some(m) = req_method {
                     method.clone_from(m);
                 }
@@ -727,35 +841,54 @@ pub(crate) fn build_resolved_http_check(
                 if let Some(v) = req_version {
                     version.clone_from(v);
                 }
-                for (name, val) in req_headers {
-                    if name.eq_ignore_ascii_case("host") {
-                        host = Some(val.clone());
-                    }
-                    headers.push((name.clone(), val.clone()));
-                }
+                headers.extend(req_headers.iter().cloned());
                 if let Some(b) = req_body {
                     body = Some(b.clone());
                     body_lf = *req_body_lf;
                 }
             }
-            HttpCheckAction::Expect { pattern, negate } => {
-                expect_rules.push(ResolvedHttpExpectRule {
-                    pattern: pattern.into(),
+            HttpCheckAction::Expect { pattern, negate, min_recv, comment } => {
+                seen_expect = true;
+                rules.push(ResolvedHttpRule::Expect(ResolvedHttpExpectRule {
+                    pattern: pattern.clone(),
                     negate: *negate,
-                });
+                    min_recv: *min_recv,
+                    comment: comment.clone().or_else(|| pending_comment.cloned()),
+                }));
+            }
+            HttpCheckAction::SetVar { var_name, expr } => {
+                let rule = ResolvedHttpRule::SetVar { var_name: var_name.clone(), expr: expr.clone() };
+                if seen_expect { rules.push(rule) } else { pre_rules.push(rule) }
+            }
+            HttpCheckAction::UnsetVar { var_name } => {
+                let rule = ResolvedHttpRule::UnsetVar { var_name: var_name.clone() };
+                if seen_expect { rules.push(rule) } else { pre_rules.push(rule) }
+            }
+            HttpCheckAction::Connect { addr, port, send_proxy: sp } => {
+                connect_addr = *addr;
+                if port.is_some() {
+                    check_port = *port;
+                }
+                send_proxy |= *sp;
+            }
+            HttpCheckAction::Comment(c) => {
+                pending_comment = Some(c);
+                continue;
             }
             HttpCheckAction::SendState => {
                 send_state = true;
             }
-            _ => {}
         }
+        pending_comment = None;
     }
 
-    if expect_rules.is_empty() {
-        expect_rules.push(ResolvedHttpExpectRule {
-            pattern: ResolvedHttpExpectPattern::StatusRange(200, 399),
+    if !rules.iter().any(|r| matches!(r, ResolvedHttpRule::Expect(_))) {
+        rules.push(ResolvedHttpRule::Expect(ResolvedHttpExpectRule {
+            pattern: HttpCheckExpectPattern::Status(vec![(200, 399)]),
             negate: false,
-        });
+            min_recv: -1,
+            comment: None,
+        }));
     }
 
     ResolvedHttpCheck {
@@ -767,10 +900,13 @@ pub(crate) fn build_resolved_http_check(
         headers,
         body,
         body_lf,
+        has_send,
         send_state,
-        expect_rules,
+        pre_rules,
+        rules,
         check_port,
         send_proxy,
+        connect_addr,
     }
 }
 
@@ -779,23 +915,31 @@ pub(crate) fn build_resolved_tcp_steps(
     server: &Server,
 ) -> Vec<ResolvedTcpStep> {
     let mut steps = Vec::new();
+    // HAProxy adds a connect only when the first rule is not one.
     let has_connect = tcp_checks
         .iter()
-        .any(|a| matches!(a, TcpCheckAction::Connect { .. }));
+        .find(|a| !matches!(a, TcpCheckAction::Comment(_)))
+        .is_some_and(|a| matches!(a, TcpCheckAction::Connect { .. }));
 
     if !has_connect {
         steps.push(ResolvedTcpStep::Connect {
             port: server.check_port,
             send_proxy: server.send_proxy || server.send_proxy_v2,
+            implicit: true,
+            rule_port: None,
+            comment: None,
         });
     }
 
     for act in tcp_checks {
         match act {
-            TcpCheckAction::Connect { port, send_proxy } => {
+            TcpCheckAction::Connect { port, send_proxy, comment } => {
                 steps.push(ResolvedTcpStep::Connect {
                     port: port.or(server.check_port),
                     send_proxy: *send_proxy || server.send_proxy || server.send_proxy_v2,
+                    implicit: false,
+                    rule_port: *port,
+                    comment: comment.clone(),
                 });
             }
             TcpCheckAction::Send(data) => {
@@ -810,7 +954,7 @@ pub(crate) fn build_resolved_tcp_steps(
                 steps.push(ResolvedTcpStep::Expect {
                     pattern: pattern.into(),
                     negate: *negate,
-                    min_recv: min_recv.unwrap_or(0),
+                    min_recv: min_recv.unwrap_or(-1),
                     comment: comment.clone(),
                 });
             }
@@ -884,7 +1028,7 @@ pub(crate) fn register_section_checks(
         } else if tcp_check || !tcp_checks.is_empty() {
             let steps = build_resolved_tcp_steps(tcp_checks, server);
             ResolvedCheckConfig::TcpSteps(steps)
-        } else if httpchk.is_some() || !http_checks.is_empty() {
+        } else if httpchk.is_some() {
             let chk = build_resolved_http_check(httpchk, http_checks, server);
             ResolvedCheckConfig::Http(chk)
         } else {

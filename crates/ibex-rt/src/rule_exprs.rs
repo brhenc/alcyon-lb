@@ -442,6 +442,26 @@ pub fn validate_formats(config: &Config, registry: &Registry) -> Result<(), Stri
         .chain(config.listens.iter().map(|l| ("proxy", &l.name, &l.http_checks)));
     for (what, name, actions) in checks {
         for act in actions {
+            if let ibex_config::ast::HttpCheckAction::SetVar { var_name, expr } = act {
+                check_sample_expr(expr, registry)
+                    .map_err(|e| format!("{what} '{name}': error detected while parsing http-check set-var({var_name}) : {e}"))?;
+            }
+            if let ibex_config::ast::HttpCheckAction::Expect { pattern, .. } = act {
+                use ibex_config::ast::HttpCheckExpectPattern as P;
+                let lfs: Vec<&str> = match pattern {
+                    P::StringLf(t) => vec![t.as_str()],
+                    P::Hdr { name, value, .. } => [Some(name), value.as_ref()]
+                        .into_iter()
+                        .flatten()
+                        .filter(|p| p.lf)
+                        .map(|p| p.text.as_str())
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                for f in lfs {
+                    check(what, name, "http-check expect", f)?;
+                }
+            }
             if let ibex_config::ast::HttpCheckAction::Send { uri, uri_lf, headers, body, body_lf, .. } = act {
                 for (_, v) in headers {
                     check(what, name, "http-check send hdr", v)?;

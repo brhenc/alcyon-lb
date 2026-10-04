@@ -17,7 +17,7 @@ use crate::ast::{
     HttpChkConfig, HttpReqAction, HttpReqRule, HttpResAction, HttpResRule, HttpReuse, RedirectCookie, RetriesValue,
     HeaderCapture, ListenSection, LogConfig, LogFacility, LogFormatSpec, LogLevel, LogTarget, MatchType, Mode,
     MysqlCheckVersion, ProtoCheckConfig, ResolvedCheckConfig, ResolvedHttpCheck,
-    ResolvedHttpExpectPattern, ResolvedHttpExpectRule, ResolvedTcpStep, SampleRef, SectionKind, Server, ServerSsl,
+    HdrPattern, ResolvedHttpExpectRule, ResolvedHttpRule, ResolvedTcpStep, SampleRef, SectionKind, Server, ServerSsl,
     SslVerify, StatsConfig, TlsVersion,
     StickRule, StickRuleType, StickTableConfigAst, TcpCheckAction, TcpCheckExpectPattern,
     TcpReqConnAction, TcpReqConnRule, TcpReqContentAction, TcpReqContentRule, TcpResAction, TcpResContentRule,

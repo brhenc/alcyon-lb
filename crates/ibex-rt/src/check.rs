@@ -19,11 +19,12 @@ use crate::srv_tls::CheckTls;
 use crate::xprt::ServerXprt;
 use std::sync::Arc;
 use ibex_config::ast::{
-    get_resolved_check_config, MysqlCheckVersion, ResolvedCheckConfig, ResolvedHttpCheck,
-    ResolvedTcpStep,
+    get_resolved_check_config, HttpCheckExpectPattern, MatchType, MysqlCheckVersion, ResolvedCheckConfig,
+    ResolvedHttpCheck, ResolvedHttpExpectRule, ResolvedHttpRule, ResolvedTcpExpectPattern, ResolvedTcpStep,
 };
 use ibex_sched::task::TaskRef;
 use ibex_sched::Tick;
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io;
 use std::net::SocketAddr;
@@ -191,6 +192,8 @@ pub struct ServerCheckState {
     pub sub_state: CheckSubState,
     /// The `http-check send` log-formats, compiled once from `resolved_config`.
     pub http_send: Option<HttpSendFormats>,
+    /// The check's variables (`http-check set-var`, scope `check`), for the run in progress.
+    pub vars: HashMap<String, String>,
     pub check_duration_ms: u32,
     pub check_start_tick: Tick,
     pub total_checks: u64,
@@ -264,6 +267,7 @@ impl ServerCheckState {
             resolved_config,
             sub_state: CheckSubState::Idle,
             http_send,
+            vars: HashMap::new(),
             check_duration_ms: 0,
             check_start_tick: now,
             total_checks: 0,
@@ -473,6 +477,24 @@ fn render_check_formats(
     proxies: &[Proxy],
 ) -> RenderedSend {
     let reg = crate::engine::sample_registry();
+    with_check_ctx(check, px, proxies, &check.vars, None, |data, ctx| {
+        let render = |f: &LogFormat| f.render_value(data, reg, ctx);
+        (fmts.uri.as_ref().map(render), fmts.body.as_ref().map(render), fmts.hdrs.iter().map(|h| h.as_ref().map(render)).collect())
+    })
+}
+
+/// Runs `f` with the log data and sample context of a check: the backend as both frontend
+/// and backend, the server, the unique ID, the check's variables and, once a response is
+/// in, the response (`res.fhdr` and the like).
+fn with_check_ctx<R>(
+    check: &ServerCheckState,
+    px: &Proxy,
+    proxies: &[Proxy],
+    vars: &HashMap<String, String>,
+    resp: Option<&HttpResp>,
+    f: impl FnOnce(&LogData, &ibex_sample::SampleContext) -> R,
+) -> R {
+    let reg = crate::engine::sample_registry();
     let srv = px.server_ids.get(check.server_idx).map(String::as_str);
     let view = ProxiesView(proxies);
     let mut ctx = ibex_sample::SampleContext {
@@ -484,8 +506,15 @@ fn render_check_formats(
         srv_id: u32::try_from(check.server_idx + 1).ok(),
         server_addr: Some(check.addr),
         proxies: Some(&view),
+        vars: Some(vars),
         ..Default::default()
     };
+    if let Some(r) = resp {
+        ctx.res_status = Some(r.status);
+        ctx.res_version = Some(&r.version);
+        ctx.res_headers = Some(&r.headers);
+        ctx.res_body = Some(&r.body);
+    }
     let mut data = LogData {
         frontend: &px.name,
         backend: &px.name,
@@ -497,8 +526,40 @@ fn render_check_formats(
     let unique_id = px.unique_id_format.as_ref().map(|f| f.render(&data, reg, &ctx));
     ctx.unique_id = unique_id.as_deref();
     data.unique_id = unique_id.as_deref();
-    let render = |f: &LogFormat| f.render_value(&data, reg, &ctx);
-    (fmts.uri.as_ref().map(render), fmts.body.as_ref().map(render), fmts.hdrs.iter().map(|h| h.as_ref().map(render)).collect())
+    f(&data, &ctx)
+}
+
+/// Runs the `set-var` / `unset-var` rules among `rules` in order on `vars`; a `set-var`
+/// sees the response `resp` when there is one.
+fn run_var_rules(
+    check: &ServerCheckState,
+    proxies: &[Proxy],
+    rules: &[ResolvedHttpRule],
+    vars: &mut HashMap<String, String>,
+    resp: Option<&HttpResp>,
+) {
+    let Some(px) = proxies.get(check.proxy_idx) else { return };
+    let reg = crate::engine::sample_registry();
+    for rule in rules {
+        match rule {
+            ResolvedHttpRule::SetVar { var_name, expr } => {
+                let val = with_check_ctx(check, px, proxies, vars, resp, |_, ctx| {
+                    ibex_sample::Expr::parse(expr)
+                        .ok()
+                        .and_then(|e| e.eval_sample(reg, ctx))
+                        .map(|smp| crate::engine::sample_to_string(&smp))
+                });
+                // An expression that gives no sample leaves the variable as it was.
+                if let Some(v) = val {
+                    vars.insert(var_name.clone(), v);
+                }
+            }
+            ResolvedHttpRule::UnsetVar { var_name } => {
+                vars.remove(var_name);
+            }
+            ResolvedHttpRule::Expect(_) => {}
+        }
+    }
 }
 
 /// `uri-lf`, `body-lf` and each `hdr` as rendered for one check; `None` where the request
@@ -564,6 +625,12 @@ fn build_http_request_payload(chk: &ResolvedHttpCheck, target_addr: SocketAddr, 
         payload.extend_from_slice(line.as_bytes());
     }
 
+    // A rule set without a `send` (a backend with `http-check expect` rules only) connects
+    // and sends nothing, as `HAProxy` does.
+    if !chk.has_send {
+        return payload;
+    }
+
     let rendered = check.http_send.as_ref().zip(proxies.get(check.proxy_idx));
     let (uri, body, hdr_values) = rendered.map(|(fmts, px)| render_check_formats(fmts, check, px, proxies)).unwrap_or_default();
     // An `uri-lf` that renders empty sends `/`.
@@ -574,26 +641,35 @@ fn build_http_request_payload(chk: &ResolvedHttpCheck, target_addr: SocketAddr, 
     };
     let body = body.or_else(|| chk.body.clone());
 
+    // The headers, names in lower case as the HTX the request is built in keeps them; one
+    // whose value renders empty is left out.
+    let mut headers: Vec<(String, String)> = Vec::new();
+    for (i, (name, val)) in chk.headers.iter().enumerate() {
+        let val = hdr_values.get(i).and_then(Option::as_deref).unwrap_or(val);
+        if !val.is_empty() {
+            headers.push((name.to_ascii_lowercase(), val.to_string()));
+        }
+    }
+    let host_hdr = headers.iter().find(|(n, _)| n == "host").map(|(_, v)| v.clone());
+    // An absolute-form target takes the authority of the Host header, once there is one
+    // (`http_update_authority`).
+    let uri = match host_hdr {
+        Some(host) => replace_authority(&uri, &host).unwrap_or(uri),
+        None => uri,
+    };
+
     let req_line = format!("{} {} {}\r\n", chk.method, uri, chk.version);
     payload.extend_from_slice(req_line.as_bytes());
 
     let mut has_host = false;
     let mut has_connection = false;
-    let mut has_content_length = false;
 
-    for (i, (name, val)) in chk.headers.iter().enumerate() {
-        let val = hdr_values.get(i).and_then(Option::as_deref).unwrap_or(val);
-        if val.is_empty() {
-            continue;
-        }
-        if name.eq_ignore_ascii_case("host") {
+    for (name, val) in &headers {
+        if name == "host" {
             has_host = true;
         }
-        if name.eq_ignore_ascii_case("connection") {
+        if name == "connection" {
             has_connection = true;
-        }
-        if name.eq_ignore_ascii_case("content-length") {
-            has_content_length = true;
         }
         let hdr_line = format!("{name}: {val}\r\n");
         payload.extend_from_slice(hdr_line.as_bytes());
@@ -611,14 +687,15 @@ fn build_http_request_payload(chk: &ResolvedHttpCheck, target_addr: SocketAddr, 
         payload.extend_from_slice(state_line.as_bytes());
     }
 
-    if let Some(ref body) = body {
-        if !has_content_length {
-            let cl_line = format!("content-length: {}\r\n", body.len());
-            payload.extend_from_slice(cl_line.as_bytes());
-        }
+    // A body, or a method that has one by default: the length is always sent (`0` for
+    // an empty `POST`).
+    let body_len = body.as_ref().map_or(0, String::len);
+    if body_len > 0 || !matches!(chk.method.as_str(), "OPTIONS" | "GET" | "HEAD" | "DELETE") {
+        let cl_line = format!("content-length: {body_len}\r\n");
+        payload.extend_from_slice(cl_line.as_bytes());
     }
 
-    if chk.version.eq_ignore_ascii_case("HTTP/1.1") && !has_connection {
+    if http_version_at_least_11(&chk.version) && !has_connection {
         payload.extend_from_slice(b"connection: close\r\n");
     }
 
@@ -630,35 +707,291 @@ fn build_http_request_payload(chk: &ResolvedHttpCheck, target_addr: SocketAddr, 
     payload
 }
 
-/// Parses an HTTP status code, headers, and body from received data.
-#[allow(clippy::type_complexity)]
-fn parse_http_response(buf: &[u8]) -> Option<(u16, Vec<(String, String)>, Vec<u8>)> {
-    let header_end = if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-        pos + 4
-    } else {
-        buf.windows(2).position(|w| w == b"\n\n")? + 2
+/// `HTTP/1.1` and later (`HTTP/2` included): where a request carries `connection: close`.
+fn http_version_at_least_11(version: &str) -> bool {
+    let Some(v) = version.strip_prefix("HTTP/") else { return false };
+    let mut it = v.split('.');
+    let major: u32 = it.next().and_then(|m| m.parse().ok()).unwrap_or(0);
+    let minor: u32 = it.next().and_then(|m| m.parse().ok()).unwrap_or(0);
+    major > 1 || (major == 1 && minor >= 1)
+}
+
+/// `uri` with the authority of an absolute-form target (`scheme://authority/path`)
+/// replaced by `host`; `None` for any other form.
+fn replace_authority(uri: &str, host: &str) -> Option<String> {
+    let (scheme, rest) = uri.split_once("://")?;
+    if scheme.is_empty() || !scheme.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.')) {
+        return None;
+    }
+    let end = rest.find(['/', '?']).unwrap_or(rest.len());
+    Some(format!("{scheme}://{host}{}", &rest[end..]))
+}
+
+/// An HTTP response, as far as it has arrived.
+#[derive(Debug)]
+struct HttpResp {
+    status: u16,
+    reason: String,
+    version: String,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+    /// The message is complete: its length is reached, its last chunk is in, or it has
+    /// no body.
+    ended: bool,
+}
+
+/// Parses a response head and as much of the body as there is: `Ok(None)` while the head
+/// is incomplete, `Err` for one that is not HTTP.
+fn parse_http_response(buf: &[u8]) -> Result<Option<HttpResp>, ()> {
+    let Some(head_end) = buf
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|p| p + 4)
+        .or_else(|| buf.windows(2).position(|w| w == b"\n\n").map(|p| p + 2))
+    else {
+        // Not even a status line can start like this.
+        if buf.len() >= 5 && !buf.starts_with(b"HTTP/") {
+            return Err(());
+        }
+        return Ok(None);
     };
 
-    let header_str = String::from_utf8_lossy(&buf[..header_end]);
-    let mut lines = header_str.lines();
-    let status_line = lines.next()?;
-    let mut parts = status_line.split_whitespace();
-    let _proto = parts.next()?;
-    let code_str = parts.next()?;
-    let status_code = code_str.parse::<u16>().ok()?;
+    let head = String::from_utf8_lossy(&buf[..head_end]);
+    let mut lines = head.lines();
+    let status_line = lines.next().ok_or(())?;
+    let mut parts = status_line.splitn(3, ' ');
+    let version = parts.next().ok_or(())?;
+    if !version.starts_with("HTTP/") {
+        return Err(());
+    }
+    let code = parts.next().ok_or(())?;
+    if code.len() != 3 {
+        return Err(());
+    }
+    let status = code.parse::<u16>().map_err(|_| ())?;
+    let reason = parts.next().unwrap_or("").trim().to_string();
 
     let mut headers = Vec::new();
     for line in lines {
         if line.is_empty() {
             break;
         }
-        if let Some((name, val)) = line.split_once(':') {
-            headers.push((name.trim().to_string(), val.trim().to_string()));
-        }
+        let (name, val) = line.split_once(':').ok_or(())?;
+        headers.push((name.trim().to_string(), val.trim().to_string()));
     }
 
-    let body = buf[header_end..].to_vec();
-    Some((status_code, headers, body))
+    let raw_body = &buf[head_end..];
+    let header = |n: &str| headers.iter().find(|(h, _)| h.eq_ignore_ascii_case(n)).map(|(_, v)| v.as_str());
+    let (body, ended) = if status < 200 || status == 204 || status == 304 {
+        (Vec::new(), true)
+    } else if header("transfer-encoding").is_some_and(|v| v.to_ascii_lowercase().contains("chunked")) {
+        decode_chunked(raw_body)
+    } else if let Some(cl) = header("content-length").and_then(|v| v.parse::<usize>().ok()) {
+        let n = raw_body.len().min(cl);
+        (raw_body[..n].to_vec(), raw_body.len() >= cl)
+    } else {
+        (raw_body.to_vec(), false)
+    };
+    Ok(Some(HttpResp { status, reason, version: version.to_string(), headers, body, ended }))
+}
+
+/// The data of the chunks in `raw` and whether the last one is there.
+fn decode_chunked(raw: &[u8]) -> (Vec<u8>, bool) {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    loop {
+        let Some(eol) = raw[pos..].windows(2).position(|w| w == b"\r\n") else { return (out, false) };
+        let size_text = String::from_utf8_lossy(&raw[pos..pos + eol]);
+        let Ok(size) = usize::from_str_radix(size_text.split(';').next().unwrap_or("").trim(), 16) else {
+            return (out, false);
+        };
+        pos += eol + 2;
+        if size == 0 {
+            return (out, true);
+        }
+        let avail = raw.len().saturating_sub(pos).min(size);
+        out.extend_from_slice(&raw[pos..pos + avail]);
+        if avail < size {
+            return (out, false);
+        }
+        pos += size + 2;
+        if pos > raw.len() {
+            return (out, false);
+        }
+    }
+}
+
+/// What the rules say of a response so far.
+enum HttpVerdict {
+    /// More data is needed.
+    Wait,
+    Pass { status: u16 },
+    Fail { code: &'static str, desc: &'static str, status: Option<u16>, info: Option<String> },
+}
+
+fn fail_with(status: (&'static str, &'static str), resp: &HttpResp, info: String, comment: Option<&str>) -> HttpVerdict {
+    let info = match comment {
+        Some(c) => format!("{info} comment: {c}"),
+        None => info,
+    };
+    // The status is logged with a wrong status, not with an invalid response.
+    let status_code = (status.0 == "L7STS").then_some(resp.status);
+    HttpVerdict::Fail { code: status.0, desc: status.1, status: status_code, info: Some(info) }
+}
+
+/// Compiles a regular expression written in the configuration (checked when it was read).
+fn config_regex(pattern: &str, case_insensitive: bool) -> Option<regex::Regex> {
+    regex::RegexBuilder::new(pattern).case_insensitive(case_insensitive).build().ok()
+}
+
+/// The values of a header `hdr` looks at: the comma-separated elements, trimmed, or with
+/// `full` the whole value.
+fn header_values(value: &str, full: bool) -> Vec<&str> {
+    if full {
+        vec![value.trim()]
+    } else {
+        value.split(',').map(str::trim).filter(|v| !v.is_empty()).collect()
+    }
+}
+
+/// A header name or value pattern with its log-format, if any, rendered.
+#[derive(Clone, Copy)]
+struct Pat<'a> {
+    mt: MatchType,
+    text: &'a str,
+}
+
+/// `http-check expect hdr|fhdr`: whether a header of the response matches.
+fn hdr_expect_matches(resp: &HttpResp, full: bool, name: Pat, value: Option<Pat>) -> bool {
+    let name_re = (name.mt == MatchType::Reg).then(|| config_regex(name.text, true)).flatten();
+    let name_matches = |h: &str| match name.mt {
+        MatchType::Str => h.eq_ignore_ascii_case(name.text),
+        MatchType::Beg => h.to_ascii_lowercase().starts_with(&name.text.to_ascii_lowercase()),
+        MatchType::End => h.to_ascii_lowercase().ends_with(&name.text.to_ascii_lowercase()),
+        MatchType::Sub => h.to_ascii_lowercase().contains(&name.text.to_ascii_lowercase()),
+        MatchType::Reg => name_re.as_ref().is_some_and(|re| re.is_match(h)),
+    };
+    let val_re = value.and_then(|v| (v.mt == MatchType::Reg).then(|| config_regex(v.text, false)).flatten());
+    resp.headers.iter().filter(|(h, _)| name_matches(h)).any(|(_, v)| {
+        let Some(vp) = value else { return true };
+        header_values(v, full).into_iter().any(|e| match vp.mt {
+            MatchType::Str => e == vp.text,
+            MatchType::Beg => e.starts_with(vp.text),
+            MatchType::End => e.ends_with(vp.text),
+            MatchType::Sub => e.contains(vp.text),
+            MatchType::Reg => val_re.as_ref().is_some_and(|re| re.is_match(e)),
+        })
+    })
+}
+
+/// One `http-check expect` rule against the response so far (`tcpcheck_eval_expect_http`).
+/// `render` turns a log-format written in the rule into text, as the check renders it.
+fn http_expect(rule: &ResolvedHttpExpectRule, resp: &HttpResp, last_read: bool, render: &dyn Fn(&str) -> String) -> HttpVerdict {
+    let comment = rule.comment.as_deref();
+    let last_read = last_read || resp.ended;
+    let rsp = ("L7RSP", "Layer7 invalid response");
+    let empty_lf = || fail_with(rsp, resp, "log-format string evaluated to an empty string".to_string(), comment);
+    let matched = match &rule.pattern {
+        HttpCheckExpectPattern::Status(ranges) => ranges.iter().any(|(lo, hi)| (*lo..=*hi).contains(&resp.status)),
+        HttpCheckExpectPattern::RStatus(re) => {
+            config_regex(re, false).is_some_and(|re| re.is_match(&resp.status.to_string()))
+        }
+        HttpCheckExpectPattern::Hdr { full, name, value } => {
+            let name_text = if name.lf { render(&name.text) } else { name.text.clone() };
+            let value_text = value.as_ref().map(|v| if v.lf { render(&v.text) } else { v.text.clone() });
+            if name_text.is_empty() || value_text.as_ref().is_some_and(String::is_empty) {
+                return empty_lf();
+            }
+            let np = Pat { mt: name.mt, text: &name_text };
+            let vp = value.as_ref().zip(value_text.as_deref()).map(|(v, t)| Pat { mt: v.mt, text: t });
+            hdr_expect_matches(resp, *full, np, vp)
+        }
+        HttpCheckExpectPattern::String(_) | HttpCheckExpectPattern::StringLf(_) | HttpCheckExpectPattern::RString(_) => {
+            // The body so far; nothing to look at yet is a wait, until the message ends.
+            if resp.body.is_empty() {
+                if !last_read {
+                    return HttpVerdict::Wait;
+                }
+                return fail_with(rsp, resp, "HTTP content check could not find a response body".to_string(), comment);
+            }
+            let needle = match &rule.pattern {
+                HttpCheckExpectPattern::String(t) => Some(t.clone()),
+                HttpCheckExpectPattern::StringLf(t) => {
+                    let r = render(t);
+                    if r.is_empty() {
+                        return empty_lf();
+                    }
+                    Some(r)
+                }
+                _ => None,
+            };
+            let short = needle.as_ref().is_some_and(|n| resp.body.len() < n.len());
+            let min_short = rule.min_recv > 0 && i64::try_from(resp.body.len()).unwrap_or(i64::MAX) < rule.min_recv;
+            if !last_read && (short || min_short) {
+                return HttpVerdict::Wait;
+            }
+            let m = match (&needle, &rule.pattern) {
+                (Some(n), _) => resp.body.windows(n.len().max(1)).any(|w| w == n.as_bytes()),
+                (None, HttpCheckExpectPattern::RString(re)) => {
+                    config_regex(re, false).is_some_and(|re| re.is_match(&String::from_utf8_lossy(&resp.body)))
+                }
+                (None, _) => false,
+            };
+            // A mismatch is not conclusive before the message ends, unless `min-recv` says so.
+            if !m && !last_read && rule.min_recv == -1 {
+                return HttpVerdict::Wait;
+            }
+            if m != rule.negate {
+                return HttpVerdict::Pass { status: resp.status };
+            }
+            let info = if rule.negate { "HTTP check matched unwanted content" } else { "HTTP content check did not match" };
+            return fail_with(rsp, resp, info.to_string(), comment);
+        }
+    };
+    if matched != rule.negate {
+        HttpVerdict::Pass { status: resp.status }
+    } else {
+        fail_with(("L7STS", "Layer7 wrong status"), resp, resp.reason.clone(), comment)
+    }
+}
+
+/// What the rules of an HTTP check say of the bytes received so far (`last_read`: no more
+/// are coming).
+fn http_verdict(check: &ServerCheckState, chk: &ResolvedHttpCheck, buf: &[u8], last_read: bool, proxies: &[Proxy]) -> HttpVerdict {
+    let resp = match parse_http_response(buf) {
+        Ok(Some(r)) => r,
+        Ok(None) if !last_read => return HttpVerdict::Wait,
+        Ok(None) | Err(()) => {
+            // `HAProxy` calls both an HTTP response that never came and one that is not
+            // HTTP a socket error.
+            return HttpVerdict::Fail { code: "SOCKERR", desc: "Socket error", status: None, info: None };
+        }
+    };
+    let Some(px) = proxies.get(check.proxy_idx) else {
+        return HttpVerdict::Pass { status: resp.status };
+    };
+    let reg = crate::engine::sample_registry();
+    // The rules run in order from the same starting variables each time more of the
+    // response is in; what one sets is for the ones after it.
+    let mut vars = check.vars.clone();
+    for rule in &chk.rules {
+        match rule {
+            ResolvedHttpRule::Expect(e) => {
+                let render = |fmt: &str| {
+                    LogFormat::compile(fmt, reg).map_or_else(
+                        |_| String::new(),
+                        |f| with_check_ctx(check, px, proxies, &vars, Some(&resp), |data, ctx| f.render_value(data, reg, ctx)),
+                    )
+                };
+                match http_expect(e, &resp, last_read, &render) {
+                    HttpVerdict::Pass { .. } => {}
+                    other => return other,
+                }
+            }
+            other => run_var_rules(check, proxies, std::slice::from_ref(other), &mut vars, Some(&resp)),
+        }
+    }
+    HttpVerdict::Pass { status: resp.status }
 }
 
 /// The bare `strerror(errno)` text, without the `" (os error N)"` that Rust's
@@ -727,11 +1060,18 @@ pub fn step_check(
                 | CheckSubState::MysqlRunning { .. }
                 | CheckSubState::PgsqlRunning { .. } => ("L7TOUT", "Layer7 timeout", None),
                 CheckSubState::SslHelloRunning { .. } => ("L6TOUT", "Layer6 timeout", None),
-                CheckSubState::TcpRunning { step_idx, .. } => (
-                    "L7TOUT",
-                    "Layer7 timeout",
-                    Some(format!("at step {} of tcp-check", step_idx + 1)),
-                ),
+                CheckSubState::TcpRunning { step_idx, .. } => {
+                    let steps = match &check.resolved_config {
+                        Some(ResolvedCheckConfig::TcpSteps(steps)) => steps.as_slice(),
+                        _ => &[],
+                    };
+                    let info = Some(tcp_step_suffix(steps, *step_idx));
+                    if matches!(steps.get(*step_idx), Some(ResolvedTcpStep::Connect { .. })) {
+                        ("L4TOUT", "Layer4 timeout", info)
+                    } else {
+                        ("L7TOUT", "Layer7 timeout", info)
+                    }
+                }
             };
 
             cleanup_check_socket(check, fdtab, poller);
@@ -933,7 +1273,7 @@ pub fn step_check(
                         req_buf,
                         send_offset,
                     };
-                    progress_http_check(check, fdtab, poller, now, duration)
+                    progress_http_check(check, fdtab, poller, now, duration, proxies)
                 } else {
                     cleanup_check_socket(check, fdtab, poller);
                     let info = match connect_res {
@@ -957,7 +1297,7 @@ pub fn step_check(
                 }
             }
             CheckSubState::HttpSending { .. } | CheckSubState::HttpReceiving { .. } => {
-                progress_http_check(check, fdtab, poller, now, duration)
+                progress_http_check(check, fdtab, poller, now, duration, proxies)
             }
             CheckSubState::TcpRunning { .. } => {
                 progress_tcp_check(check, fdtab, poller, now, duration)
@@ -997,8 +1337,12 @@ pub fn step_check(
 
         match resolved {
             ResolvedCheckConfig::Http(chk) => {
-                let target_addr =
-                    SocketAddr::new(check.addr.ip(), chk.check_port.unwrap_or(check.addr.port()));
+                let base = chk.connect_addr.map_or(check.addr.ip(), |a| a.ip());
+                let target_addr = SocketAddr::new(base, chk.check_port.unwrap_or(check.addr.port()));
+                // The variables of this run: the rules before the request set them.
+                let mut vars = HashMap::new();
+                run_var_rules(check, proxies, &chk.pre_rules, &mut vars, None);
+                check.vars = vars;
                 let payload = build_http_request_payload(&chk, target_addr, check, proxies);
 
                 match connect_check(check, Some(target_addr)) {
@@ -1031,7 +1375,7 @@ pub fn step_check(
                                 req_buf: payload,
                                 send_offset: 0,
                             };
-                            progress_http_check(check, fdtab, poller, now, 0)
+                            progress_http_check(check, fdtab, poller, now, 0, proxies)
                         } else {
                             check.sub_state = CheckSubState::HttpConnecting {
                                 req_buf: payload,
@@ -1343,6 +1687,7 @@ fn progress_http_check(
     poller: &mut Poller,
     now: Tick,
     duration: u32,
+    proxies: &[Proxy],
 ) -> io::Result<CheckStep> {
     let Some(raw_fd) = check.check_fd else {
         cleanup_check_socket(check, fdtab, poller);
@@ -1404,7 +1749,7 @@ fn progress_http_check(
             check.sub_state = CheckSubState::HttpReceiving {
                 recv_buf: Vec::new(),
             };
-            progress_http_check(check, fdtab, poller, now, duration)
+            progress_http_check(check, fdtab, poller, now, duration, proxies)
         }
         CheckSubState::HttpReceiving { mut recv_buf } => {
             let Some(sock) = check.sock.as_ref() else {
@@ -1414,125 +1759,50 @@ fn progress_http_check(
             };
 
             let mut buf = [0u8; 4096];
+            let mut eof = false;
+            let mut broken = false;
             loop {
                 match check.xprt.recv(sock.as_fd(), &mut buf) {
-                    Ok(Io::Done(n)) => {
-                        recv_buf.extend_from_slice(&buf[..n]);
-                        if let Some((status_code, headers, body)) = parse_http_response(&recv_buf) {
-                            check.http_code = Some(status_code);
-                            let mut passed = true;
-                            for rule in &chk.expect_rules {
-                                if !rule.matches(status_code, &headers, &body) {
-                                    passed = false;
-                                    break;
-                                }
-                            }
-
-                            cleanup_check_socket(check, fdtab, poller);
-                            let event = if passed {
-                                check.on_success_full(
-                                    "L7OK",
-                                    "Layer7 check passed",
-                                    duration,
-                                    Some(status_code),
-                                    None,
-                                )
-                            } else {
-                                let code = if (200..400).contains(&status_code) {
-                                    "L7RSP"
-                                } else {
-                                    "L7STS"
-                                };
-                                let desc = if code == "L7STS" {
-                                    "Layer7 wrong status"
-                                } else {
-                                    "Layer7 invalid response"
-                                };
-                                check.on_failure_full(
-                                    code,
-                                    desc,
-                                    duration,
-                                    Some(status_code),
-                                    None,
-                                )
-                            };
-                            let next = check.schedule_next(now);
-                            check.next_check = next;
-                            return Ok(CheckStep {
-                                next: Some(next),
-                                event,
-                            });
-                        }
-                    }
-                    Ok(Io::WouldBlock) => {
-                        fdtab.clear_ready(raw_fd, true, false);
-                        check.sub_state = CheckSubState::HttpReceiving { recv_buf };
-                        return Ok(CheckStep::pending(Some(check.exp)));
-                    }
+                    Ok(Io::Done(n)) => recv_buf.extend_from_slice(&buf[..n]),
+                    Ok(Io::WouldBlock) => break,
                     Ok(Io::Eof) => {
-                        cleanup_check_socket(check, fdtab, poller);
-                        let event = if let Some((status_code, headers, body)) =
-                            parse_http_response(&recv_buf)
-                        {
-                            check.http_code = Some(status_code);
-                            let mut passed = true;
-                            for rule in &chk.expect_rules {
-                                if !rule.matches(status_code, &headers, &body) {
-                                    passed = false;
-                                    break;
-                                }
-                            }
-                            if passed {
-                                check.on_success_full(
-                                    "L7OK",
-                                    "Layer7 check passed",
-                                    duration,
-                                    Some(status_code),
-                                    None,
-                                )
-                            } else {
-                                check.on_failure_full(
-                                    "L7STS",
-                                    "Layer7 wrong status",
-                                    duration,
-                                    Some(status_code),
-                                    None,
-                                )
-                            }
-                        } else {
-                            check.on_failure_full(
-                                "L7RSP",
-                                "Layer7 invalid response",
-                                duration,
-                                None,
-                                None,
-                            )
-                        };
-                        let next = check.schedule_next(now);
-                        check.next_check = next;
-                        return Ok(CheckStep {
-                            next: Some(next),
-                            event,
-                        });
+                        eof = true;
+                        break;
                     }
                     Ok(Io::Closed) | Err(_) => {
-                        cleanup_check_socket(check, fdtab, poller);
-                        let event = check.on_failure_full(
-                            "L7RSP",
-                            "Layer7 invalid response",
-                            duration,
-                            None,
-                            None,
-                        );
-                        let next = check.schedule_next(now);
-                        check.next_check = next;
-                        return Ok(CheckStep {
-                            next: Some(next),
-                            event,
-                        });
+                        broken = true;
+                        break;
                     }
                 }
             }
+            // A connection that fails with nothing received is an invalid response; one
+            // that fails after some data is the end of what there is.
+            let last_read = eof || (broken && !recv_buf.is_empty());
+            let verdict = if broken && recv_buf.is_empty() {
+                HttpVerdict::Fail { code: "SOCKERR", desc: "Socket error", status: None, info: None }
+            } else {
+                http_verdict(check, &chk, &recv_buf, last_read, proxies)
+            };
+            let event = match verdict {
+                HttpVerdict::Wait => {
+                    fdtab.clear_ready(raw_fd, true, false);
+                    check.sub_state = CheckSubState::HttpReceiving { recv_buf };
+                    return Ok(CheckStep::pending(Some(check.exp)));
+                }
+                HttpVerdict::Pass { status } => {
+                    check.http_code = Some(status);
+                    cleanup_check_socket(check, fdtab, poller);
+                    check.on_success_full("L7OK", "Layer7 check passed", duration, Some(status), None)
+                }
+                HttpVerdict::Fail { code, desc, status, info } => {
+                    check.http_code = status;
+                    cleanup_check_socket(check, fdtab, poller);
+                    check.on_failure_full(code, desc, duration, status, info)
+                }
+            };
+            let next = check.schedule_next(now);
+            check.next_check = next;
+            Ok(CheckStep { next: Some(next), event })
         }
         _ => {
             cleanup_check_socket(check, fdtab, poller);
@@ -1542,6 +1812,113 @@ fn progress_http_check(
         }
     }
 }
+
+/// The step number `HAProxy` gives rule `idx` of a `tcp-check` script: rules count from 1,
+/// and the connect it adds itself, when the script does not start with one, is step 0 (so
+/// the first rule after it is step 1). Comment rules take an index too.
+fn tcp_step_id(steps: &[ResolvedTcpStep], idx: usize) -> usize {
+    if matches!(steps.first(), Some(ResolvedTcpStep::Connect { implicit: true, .. })) {
+        idx
+    } else {
+        idx + 1
+    }
+}
+
+/// The comment of a rule: its own, or that of the `tcp-check comment` just before it.
+fn tcp_step_comment(steps: &[ResolvedTcpStep], idx: usize) -> Option<&str> {
+    if let Some(ResolvedTcpStep::Expect { comment: Some(c), .. } | ResolvedTcpStep::Connect { comment: Some(c), .. }) =
+        steps.get(idx)
+    {
+        return Some(c);
+    }
+    match idx.checked_sub(1).and_then(|p| steps.get(p)) {
+        Some(ResolvedTcpStep::Comment(c)) => Some(c),
+        _ => None,
+    }
+}
+
+/// The first inverse `expect` of the run of `expect` rules `idx` belongs to, or `idx`
+/// itself: where `HAProxy` resumes (and which step it reports) when an `expect` has to
+/// wait for more data.
+fn tcp_expect_head(steps: &[ResolvedTcpStep], idx: usize) -> usize {
+    let mut head = idx;
+    for j in (0..idx).rev() {
+        match &steps[j] {
+            ResolvedTcpStep::Expect { negate: true, .. } => head = j,
+            ResolvedTcpStep::Expect { .. } | ResolvedTcpStep::Comment(_) => {}
+            _ => break,
+        }
+    }
+    head
+}
+
+/// What `HAProxy` appends to a timeout or connection error that hit rule `idx`
+/// (`chk_report_conn_err`): the step, what the rule was doing, its comment.
+fn tcp_step_suffix(steps: &[ResolvedTcpStep], idx: usize) -> String {
+    let id = tcp_step_id(steps, idx);
+    if id == 0 {
+        return " at initial connection step of tcp-check".to_string();
+    }
+    let mut s = format!(" at step {id} of tcp-check");
+    match steps.get(idx) {
+        Some(ResolvedTcpStep::Connect { rule_port: Some(p), .. }) => s.push_str(&format!(" (connect port {p})")),
+        Some(ResolvedTcpStep::Connect { .. }) => s.push_str(" (connect)"),
+        Some(ResolvedTcpStep::Send(_)) => s.push_str(" (send)"),
+        Some(ResolvedTcpStep::Expect { pattern, .. }) => match pattern {
+            ResolvedTcpExpectPattern::String(t) => s.push_str(&format!(" (expect string '{t}')")),
+            ResolvedTcpExpectPattern::Binary(b) => {
+                let hex: String = b.iter().map(|x| format!("{x:02X}")).collect();
+                s.push_str(&format!(" (expect binary '{hex}')"));
+            }
+            ResolvedTcpExpectPattern::RString(_) => s.push_str(" (expect regex)"),
+        },
+        _ => {}
+    }
+    if let Some(c) = tcp_step_comment(steps, idx) {
+        s.push_str(&format!(" comment: '{c}'"));
+    }
+    s
+}
+
+/// The info of a failed `expect` (`tcpcheck_expect_onerror_message`).
+fn tcp_expect_failure_info(steps: &[ResolvedTcpStep], idx: usize, empty: bool, matched: bool) -> String {
+    let id = tcp_step_id(steps, idx);
+    let mut s = if empty {
+        format!("TCPCHK got an empty response at step {id}")
+    } else {
+        let what = if matched { "TCPCHK matched unwanted content" } else { "TCPCHK did not match content" };
+        match steps.get(idx) {
+            Some(ResolvedTcpStep::Expect { pattern: ResolvedTcpExpectPattern::String(t), .. }) => {
+                format!("{what} '{t}' at step {id}")
+            }
+            Some(ResolvedTcpStep::Expect { pattern: ResolvedTcpExpectPattern::Binary(_), .. }) => {
+                format!("{what} (binary) at step {id}")
+            }
+            _ => format!("{what} (regex) at step {id}"),
+        }
+    };
+    if let Some(c) = tcp_step_comment(steps, idx) {
+        s.push_str(" comment: ");
+        s.push_str(c);
+    }
+    s
+}
+
+/// The info of a failed connection of a `tcp-check` script, as `HAProxy` words it:
+/// `ECONNREFUSED returned by OS (Connection refused) at step 2 of tcp-check (connect port 1)`.
+fn tcp_connect_failure_info(steps: &[ResolvedTcpStep], idx: usize, err: Option<&io::Error>) -> String {
+    let what = match err {
+        Some(e) if e.kind() == io::ErrorKind::ConnectionRefused || e.raw_os_error() == Some(111) => {
+            "ECONNREFUSED returned by OS (Connection refused)".to_string()
+        }
+        Some(e) => format_l4_connect_error(e),
+        None => "General socket error".to_string(),
+    };
+    format!("{what}{}", tcp_step_suffix(steps, idx))
+}
+
+/// `tune.bufsize`: an input buffer this full ends the wait for more data.
+const TCP_CHECK_BUFSIZE: usize = 16384;
 
 /// Starts execution of TCP multi-step check.
 fn progress_tcp_steps_start(
@@ -1563,7 +1940,8 @@ fn progress_tcp_steps_start(
 
     if let ResolvedTcpStep::Connect { port, .. } = &steps[0] {
             let target_addr = SocketAddr::new(check.addr.ip(), port.unwrap_or(check.addr.port()));
-            if let Ok((sock, immediate)) = connect_check(check, Some(target_addr)) {
+            let connected = connect_check(check, Some(target_addr));
+            if let Ok((sock, immediate)) = connected {
                     let raw_fd = sock.as_raw_fd();
                     check.check_fd = Some(raw_fd);
                     fdtab.insert(
@@ -1598,13 +1976,14 @@ fn progress_tcp_steps_start(
                         Ok(CheckStep::pending(Some(check.exp)))
                     }
                 } else {
+                    let connect_err = connected.err();
                     cleanup_check_socket(check, fdtab, poller);
                     let event = check.on_failure_full(
                         "L4CON",
-                        "Connection refused / error",
+                        "Layer4 connection problem",
                         0,
                         None,
-                        Some(format!("ECONNREFUSED returned by OS at step 1 of tcp-check (connect port {})", target_addr.port())),
+                        Some(tcp_connect_failure_info(steps, 0, connect_err.as_ref())),
                     );
                     let next = check.schedule_next(now);
                     check.next_check = next;
@@ -1681,14 +2060,13 @@ fn progress_tcp_check(
                         continue;
                     }
                     
+                    let connect_err = match &connect_res {
+                        Ok(Some(e)) => Some(e),
+                        _ => None,
+                    };
+                    let info = tcp_connect_failure_info(&steps, step_idx, connect_err);
                     cleanup_check_socket(check, fdtab, poller);
-                    let event = check.on_failure_full(
-                        "L4CON",
-                        "Connection refused / error",
-                        duration,
-                        None,
-                        Some(format!("ECONNREFUSED returned by OS at step {} of tcp-check (connect port {})", step_idx + 1, target_addr.port())),
-                    );
+                    let event = check.on_failure_full("L4CON", "Layer4 connection problem", duration, None, Some(info));
                     let next = check.schedule_next(now);
                     check.next_check = next;
                     return Ok(CheckStep {
@@ -1706,7 +2084,8 @@ fn progress_tcp_check(
                 recv_buf.clear();
                 send_offset = 0;
 
-                if let Ok((sock, immediate)) = connect_check(check, Some(target_addr)) {
+                let connected = connect_check(check, Some(target_addr));
+                if let Ok((sock, immediate)) = connected {
                         let raw_fd = sock.as_raw_fd();
                         check.check_fd = Some(raw_fd);
                         check.tcp_connect_step = Some(step_idx);
@@ -1738,14 +2117,9 @@ fn progress_tcp_check(
                         return Ok(CheckStep::pending(Some(check.exp)));
                 }
                 
+                let info = tcp_connect_failure_info(&steps, step_idx, connected.err().as_ref());
                 cleanup_check_socket(check, fdtab, poller);
-                let event = check.on_failure_full(
-                    "L4CON",
-                    "Connection refused / error",
-                    duration,
-                    None,
-                    Some(format!("ECONNREFUSED returned by OS at step {} of tcp-check (connect port {})", step_idx + 1, target_addr.port())),
-                );
+                let event = check.on_failure_full("L4CON", "Layer4 connection problem", duration, None, Some(info));
                 let next = check.schedule_next(now);
                 check.next_check = next;
                 return Ok(CheckStep {
@@ -1772,6 +2146,10 @@ fn progress_tcp_check(
                 };
 
                 let raw_fd = sock.as_raw_fd();
+                if send_offset == 0 {
+                    // The input buffer is released when a `send` is evaluated.
+                    recv_buf.clear();
+                }
                 while send_offset < data.len() {
                     match check.xprt.send(sock.as_fd(), &data[send_offset..]) {
                         Ok(Io::Done(n)) => {
@@ -1820,7 +2198,7 @@ fn progress_tcp_check(
                         "Layer7 invalid response",
                         duration,
                         None,
-                        Some(format!("at step {} of tcp-check", step_idx + 1)),
+                        Some(tcp_step_suffix(&steps, step_idx)),
                     );
                     let next = check.schedule_next(now);
                     check.next_check = next;
@@ -1837,7 +2215,7 @@ fn progress_tcp_check(
                 let mut buf = [0u8; 4096];
                 let mut eof = false;
 
-                loop {
+                while recv_buf.len() < TCP_CHECK_BUFSIZE {
                     match check.xprt.recv(sock.as_fd(), &mut buf) {
                         Ok(Io::Done(n)) => {
                             recv_buf.extend_from_slice(&buf[..n]);
@@ -1851,49 +2229,42 @@ fn progress_tcp_check(
                         }
                     }
                 }
+                // No more data is coming: the end of the response, or a full buffer.
+                let last_read = eof || recv_buf.len() >= TCP_CHECK_BUFSIZE;
 
-                if recv_buf.len() < *min_recv && !eof {
+                // `tcpcheck_eval_recv` / `tcpcheck_eval_expect`: nothing is evaluated on an
+                // empty buffer until the response ends, and an inconclusive rule waits and
+                // resumes from the head of its run of `expect` rules (which is also the step
+                // a timeout then names). Matched data is not consumed; a `send` or a new
+                // `connect` drops it.
+                let mut wait = recv_buf.is_empty() && !last_read;
+                let needed = match pattern {
+                    ResolvedTcpExpectPattern::String(t) => t.len(),
+                    ResolvedTcpExpectPattern::Binary(b) => b.len(),
+                    ResolvedTcpExpectPattern::RString(_) => 0,
+                };
+                if !wait && !last_read {
+                    wait = recv_buf.len() < needed || (*min_recv > 0 && (recv_buf.len() as i64) < *min_recv);
+                }
+                let matched = !wait && pattern.matches(&recv_buf);
+                if !wait && !matched && !last_read && *min_recv == -1 {
+                    wait = true;
+                }
+                if wait {
                     fdtab.clear_ready(raw_fd, true, false);
                     check.sub_state = CheckSubState::TcpRunning {
-                        step_idx,
+                        step_idx: tcp_expect_head(&steps, step_idx),
                         send_offset,
                         recv_buf,
                     };
                     return Ok(CheckStep::pending(Some(check.exp)));
                 }
-
-                let matches_pattern = pattern.matches(&recv_buf);
-                let passed = if *negate {
-                    !matches_pattern && (recv_buf.len() >= *min_recv || eof)
-                } else {
-                    matches_pattern
-                };
-
-                if passed {
-                    recv_buf.clear();
+                if matched != *negate {
                     step_idx += 1;
-                } else if !eof && !*negate {
-                    fdtab.clear_ready(raw_fd, true, false);
-                    check.sub_state = CheckSubState::TcpRunning {
-                        step_idx,
-                        send_offset,
-                        recv_buf,
-                    };
-                    return Ok(CheckStep::pending(Some(check.exp)));
                 } else {
+                    let info = tcp_expect_failure_info(&steps, step_idx, recv_buf.is_empty(), matched);
                     cleanup_check_socket(check, fdtab, poller);
-                    let (code, desc) = if *negate {
-                        ("L7STS", "Layer7 wrong status")
-                    } else {
-                        ("L7RSP", "Layer7 invalid response")
-                    };
-                    let event = check.on_failure_full(
-                        code,
-                        desc,
-                        duration,
-                        None,
-                        Some(format!("at step {} of tcp-check", step_idx + 1)),
-                    );
+                    let event = check.on_failure_full("L7RSP", "Layer7 invalid response", duration, None, Some(info));
                     let next = check.schedule_next(now);
                     check.next_check = next;
                     return Ok(CheckStep {

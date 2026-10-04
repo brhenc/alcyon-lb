@@ -46,9 +46,11 @@ pub enum HttpCheckAction {
     Expect {
         pattern: HttpCheckExpectPattern,
         negate: bool,
+        /// `min-recv`; -1 when not given.
+        min_recv: i64,
+        comment: Option<String>,
     },
     Comment(String),
-    DisableOn404,
     SendState,
     SetVar {
         var_name: String,
@@ -59,25 +61,31 @@ pub enum HttpCheckAction {
     },
 }
 
+/// A header name or value pattern of `http-check expect hdr` / `fhdr`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HdrPattern {
+    pub text: String,
+    /// `name-lf` / `value-lf`: `text` is a log-format, rendered when the rule runs.
+    pub lf: bool,
+    pub mt: MatchType,
+}
+
 /// Pattern to expect in an `http-check expect` rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HttpCheckExpectPattern {
-    Status(Vec<u16>),
-    StatusRange(u16, u16),
-    String(String),
+    /// `status`: inclusive ranges.
+    Status(Vec<(u16, u16)>),
     RStatus(String),
+    /// `string` / `rstring`: matched against the response body.
+    String(String),
+    StringLf(String),
     RString(String),
+    /// `hdr` (the comma-separated values of each header) or `fhdr` (`full`: each header's
+    /// whole value).
     Hdr {
-        name: String,
-        match_type: MatchType,
-        value: Option<String>,
-        value_match_type: MatchType,
-    },
-    Fhdr {
-        name: String,
-        match_type: MatchType,
-        value: Option<String>,
-        value_match_type: MatchType,
+        full: bool,
+        name: HdrPattern,
+        value: Option<HdrPattern>,
     },
 }
 
@@ -98,12 +106,13 @@ pub enum TcpCheckAction {
     Connect {
         port: Option<u16>,
         send_proxy: bool,
+        comment: Option<String>,
     },
     Send(Vec<u8>),
     Expect {
         pattern: TcpCheckExpectPattern,
         negate: bool,
-        min_recv: Option<usize>,
+        min_recv: Option<i64>,
         comment: Option<String>,
     },
     Comment(String),
@@ -176,39 +185,37 @@ pub struct ResolvedHttpCheck {
     pub body: Option<String>,
     /// `body` is a log-format (`body-lf`).
     pub body_lf: bool,
+    /// The rule set has a request to send. Without one `HAProxy` connects and sends
+    /// nothing (a backend that has `http-check expect` rules only).
+    pub has_send: bool,
     pub send_state: bool,
-    pub expect_rules: Vec<ResolvedHttpExpectRule>,
+    /// `set-var` / `unset-var` rules before the first `expect`: run when the request is
+    /// built, with no response to read (`HAProxy` runs them as it reaches them, and the
+    /// response is read by the first `expect`).
+    pub pre_rules: Vec<ResolvedHttpRule>,
+    /// The rules after the request, in order: run against the response.
+    pub rules: Vec<ResolvedHttpRule>,
     pub check_port: Option<u16>,
     pub send_proxy: bool,
+    /// `http-check connect addr`: where the check connects.
+    pub connect_addr: Option<SocketAddr>,
+}
+
+/// A rule run on a response, or a variable rule run before the request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedHttpRule {
+    Expect(ResolvedHttpExpectRule),
+    SetVar { var_name: String, expr: String },
+    UnsetVar { var_name: String },
 }
 
 /// Single expectation rule for an HTTP health check response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedHttpExpectRule {
-    pub pattern: ResolvedHttpExpectPattern,
+    pub pattern: HttpCheckExpectPattern,
     pub negate: bool,
-}
-
-/// Pattern to match against an HTTP health check response.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ResolvedHttpExpectPattern {
-    Status(Vec<u16>),
-    StatusRange(u16, u16),
-    String(String),
-    RStatus(String),
-    RString(String),
-    Hdr {
-        name: String,
-        match_type: MatchType,
-        value: Option<String>,
-        value_match_type: MatchType,
-    },
-    Fhdr {
-        name: String,
-        match_type: MatchType,
-        value: Option<String>,
-        value_match_type: MatchType,
-    },
+    pub min_recv: i64,
+    pub comment: Option<String>,
 }
 
 /// Single step in a multi-step TCP health check.
@@ -217,12 +224,21 @@ pub enum ResolvedTcpStep {
     Connect {
         port: Option<u16>,
         send_proxy: bool,
+        /// The `connect` HAProxy adds when the rules do not start with one: it is step 0
+        /// in the failure messages and the rules after it are numbered from 1.
+        implicit: bool,
+        /// The port of the `tcp-check connect port` rule itself, which the failure
+        /// message names (`port` also folds in the server's `port`/`check_port`).
+        rule_port: Option<u16>,
+        comment: Option<String>,
     },
     Send(Vec<u8>),
     Expect {
         pattern: ResolvedTcpExpectPattern,
         negate: bool,
-        min_recv: usize,
+        /// `min-recv`; -1 when not given: a mismatch is then never conclusive before the
+        /// end of the response.
+        min_recv: i64,
         comment: Option<String>,
     },
     Comment(String),
@@ -236,128 +252,12 @@ pub enum ResolvedTcpExpectPattern {
     RString(String),
 }
 
-impl From<&HttpCheckExpectPattern> for ResolvedHttpExpectPattern {
-    fn from(pattern: &HttpCheckExpectPattern) -> Self {
-        match pattern {
-            HttpCheckExpectPattern::Status(codes) => Self::Status(codes.clone()),
-            HttpCheckExpectPattern::StatusRange(low, high) => Self::StatusRange(*low, *high),
-            HttpCheckExpectPattern::String(s) => Self::String(s.clone()),
-            HttpCheckExpectPattern::RStatus(s) => Self::RStatus(s.clone()),
-            HttpCheckExpectPattern::RString(s) => Self::RString(s.clone()),
-            HttpCheckExpectPattern::Hdr {
-                name,
-                match_type,
-                value,
-                value_match_type,
-            } => Self::Hdr {
-                name: name.clone(),
-                match_type: *match_type,
-                value: value.clone(),
-                value_match_type: *value_match_type,
-            },
-            HttpCheckExpectPattern::Fhdr {
-                name,
-                match_type,
-                value,
-                value_match_type,
-            } => Self::Fhdr {
-                name: name.clone(),
-                match_type: *match_type,
-                value: value.clone(),
-                value_match_type: *value_match_type,
-            },
-        }
-    }
-}
-
 impl From<&TcpCheckExpectPattern> for ResolvedTcpExpectPattern {
     fn from(pattern: &TcpCheckExpectPattern) -> Self {
         match pattern {
             TcpCheckExpectPattern::String(s) => Self::String(s.clone()),
             TcpCheckExpectPattern::Binary(b) => Self::Binary(b.clone()),
             TcpCheckExpectPattern::RString(r) => Self::RString(r.clone()),
-        }
-    }
-}
-
-impl ResolvedHttpExpectRule {
-    #[must_use]
-    pub fn matches(&self, status: u16, headers: &[(String, String)], body: &[u8]) -> bool {
-        let pattern_matched = match &self.pattern {
-            ResolvedHttpExpectPattern::Status(codes) => codes.contains(&status),
-            ResolvedHttpExpectPattern::StatusRange(low, high) => status >= *low && status <= *high,
-            ResolvedHttpExpectPattern::RStatus(pattern) => {
-                let status_str = status.to_string();
-                regex::Regex::new(pattern).is_ok_and(|re| re.is_match(&status_str))
-            }
-            ResolvedHttpExpectPattern::String(s) => {
-                let body_str = String::from_utf8_lossy(body);
-                body_str.contains(s.as_str())
-            }
-            ResolvedHttpExpectPattern::RString(pattern) => {
-                let body_str = String::from_utf8_lossy(body);
-                regex::Regex::new(pattern).is_ok_and(|re| re.is_match(&body_str))
-            }
-            ResolvedHttpExpectPattern::Hdr {
-                name,
-                match_type,
-                value,
-                value_match_type,
-            }
-            | ResolvedHttpExpectPattern::Fhdr {
-                name,
-                match_type,
-                value,
-                value_match_type,
-            } => {
-                let name_matches = |hname: &str| -> bool {
-                    match match_type {
-                        MatchType::Str => hname.eq_ignore_ascii_case(name),
-                        MatchType::Beg => {
-                            hname.to_ascii_lowercase().starts_with(&name.to_ascii_lowercase())
-                        }
-                        MatchType::End => {
-                            hname.to_ascii_lowercase().ends_with(&name.to_ascii_lowercase())
-                        }
-                        MatchType::Sub => {
-                            hname.to_ascii_lowercase().contains(&name.to_ascii_lowercase())
-                        }
-                        MatchType::Reg => regex::Regex::new(name).is_ok_and(|re| re.is_match(hname)),
-                    }
-                };
-
-                let val_matches = |hval: &str, target_val: &str| -> bool {
-                    match value_match_type {
-                        MatchType::Str => {
-                            hval.split(',').any(|part| part.trim().eq_ignore_ascii_case(target_val))
-                                || hval.eq_ignore_ascii_case(target_val)
-                                || hval.contains(target_val)
-                        }
-                        MatchType::Beg => hval.split(',').any(|part| part.trim().starts_with(target_val)) || hval.starts_with(target_val),
-                        MatchType::End => hval.split(',').any(|part| part.trim().ends_with(target_val)) || hval.ends_with(target_val),
-                        MatchType::Sub => hval.contains(target_val),
-                        MatchType::Reg => regex::Regex::new(target_val).is_ok_and(|re| re.is_match(hval)),
-                    }
-                };
-
-                headers.iter().any(|(hname, hval)| {
-                    if name_matches(hname) {
-                        if let Some(target_val) = value {
-                            val_matches(hval, target_val)
-                        } else {
-                            true
-                        }
-                    } else {
-                        false
-                    }
-                })
-            }
-        };
-
-        if self.negate {
-            !pattern_matched
-        } else {
-            pattern_matched
         }
     }
 }
