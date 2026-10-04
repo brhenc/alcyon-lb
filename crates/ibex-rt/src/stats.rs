@@ -512,10 +512,15 @@ fn write_server_row(
     r.set("smax", 0);
     r.set("slim", &slim);
     r.set("stot", 0);
-    if let Some((wretr, wredis)) = proxy.server_retr.get(s_idx) {
-        r.set("wretr", wretr.load(std::sync::atomic::Ordering::Relaxed));
-        r.set("wredis", wredis.load(std::sync::atomic::Ordering::Relaxed));
-    }
+    let (wretr, wredis) = proxy
+        .server_retr
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&s_idx)
+        .copied()
+        .unwrap_or_default();
+    r.set("wretr", wretr);
+    r.set("wredis", wredis);
     r.set("status", status_str);
     r.set("weight", weight);
     r.set("act", act);
@@ -700,7 +705,7 @@ mod tests {
             server_backups: vec![false],
             server_maxconn: vec![None],
             server_actconn: std::sync::Arc::new(vec![std::sync::atomic::AtomicU32::new(0)]),
-            server_retr: std::sync::Arc::new(vec![(std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0))]),
+            server_retr: Default::default(),
             server_sess_rates: std::sync::Arc::new(vec![crate::engine::RateCtr::default()]),
             server_check_configs: vec![None],
             server_tls: vec![None],

@@ -374,7 +374,7 @@ pub struct Proxy {
     pub server_maxconn: Vec<Option<u32>>,
     pub server_actconn: Arc<Vec<AtomicU32>>,
     /// Per server `(wretr, wredis)`: retries on it and redispatches away from it.
-    pub server_retr: Arc<Vec<(AtomicU64, AtomicU64)>>,
+    pub server_retr: Arc<std::sync::Mutex<std::collections::HashMap<usize, (u64, u64)>>>,
     /// Streams assigned to each server per second (`srv_sess_rate`).
     pub server_sess_rates: Arc<Vec<RateCtr>>,
     pub server_check_configs: Vec<Option<ServerCheckConfig>>,
@@ -544,10 +544,8 @@ impl Proxy {
         }
         match self.balance {
             BalanceAlgorithm::Source if self.hash_type == ibex_config::HashType::Consistent && source_ip.is_some() => {
-                match crate::lb::balance_source_consistent(self, source_ip.unwrap_or(IpAddr::from([0, 0, 0, 0]))) {
-                    Some(idx) => Some(self.servers[idx]),
-                    None => self.dispatch,
-                }
+                let ip = source_ip?;
+                crate::lb::balance_source_consistent(self, ip).map(|idx| self.servers[idx]).or(self.dispatch)
             }
             BalanceAlgorithm::Source => {
                 let eligible = self.eligible_server_indices();
@@ -1486,7 +1484,7 @@ fn init_proxy_from_listen(proxy_idx: usize, listen: &ibex_config::ListenSection,
         server_backups: listen.servers.iter().map(|s| s.backup).collect(),
         server_maxconn: listen.servers.iter().map(|s| s.maxconn).collect(),
         server_actconn: Arc::new((0..server_count).map(|_| AtomicU32::new(0)).collect()),
-        server_retr: Arc::new((0..server_count).map(|_| (AtomicU64::new(0), AtomicU64::new(0))).collect()),
+        server_retr: Arc::default(),
         server_sess_rates: Arc::new((0..server_count).map(|_| RateCtr::default()).collect()),
         server_check_configs,
         server_tls: Vec::new(),
@@ -1591,7 +1589,7 @@ fn init_proxy_from_frontend(proxy_idx: usize, fe: &ibex_config::FrontendSection,
         server_backups: Vec::new(),
         server_maxconn: Vec::new(),
         server_actconn: std::sync::Arc::new(Vec::new()),
-        server_retr: std::sync::Arc::new(Vec::new()),
+        server_retr: Arc::default(),
         server_sess_rates: std::sync::Arc::new(Vec::new()),
         server_check_configs: Vec::new(),
         server_tls: Vec::new(),
@@ -1719,7 +1717,7 @@ fn init_proxy_from_backend(proxy_idx: usize, be: &ibex_config::BackendSection, n
         server_backups: be.servers.iter().map(|s| s.backup).collect(),
         server_maxconn: be.servers.iter().map(|s| s.maxconn).collect(),
         server_actconn: Arc::new((0..server_count).map(|_| AtomicU32::new(0)).collect()),
-        server_retr: Arc::new((0..server_count).map(|_| (AtomicU64::new(0), AtomicU64::new(0))).collect()),
+        server_retr: Arc::default(),
         server_sess_rates: Arc::new((0..server_count).map(|_| RateCtr::default()).collect()),
         server_check_configs,
         server_tls: Vec::new(),
@@ -4074,10 +4072,7 @@ pub fn shutdown_matching_sessions<'a>(
 
 fn clear_one(p: &Proxy) {
     p.stats.iter().for_each(|s| s.clear());
-    for (wretr, wredis) in p.server_retr.iter() {
-        wretr.store(0, Ordering::Relaxed);
-        wredis.store(0, Ordering::Relaxed);
-    }
+    p.server_retr.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
 }
 
 /// Clears traffic and error counters for a specific proxy, or all proxies if `target` is `None` or `"all"`.
@@ -4374,10 +4369,16 @@ fn retry_server_connect(
     // client's persistence cookie no longer holds (`SF_DIRECT` cleared, `TX_CK_DOWN`).
     let moved = target.is_some() && entry.target_addr.is_some() && target != entry.target_addr;
     let stats = &proxies[be_idx].stats[worker_id()];
-    let failed_srv = proxies[be_idx].server_retr.get(old_idx.unwrap_or(usize::MAX));
+    let count_on_server = |redispatch: bool| {
+        if let Some(i) = old_idx {
+            let mut m = proxies[be_idx].server_retr.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let c = m.entry(i).or_default();
+            if redispatch { c.1 += 1 } else { c.0 += 1 }
+        }
+    };
     if resuming {
     } else if moved {
-        failed_srv.inspect(|c| _ = c.1.fetch_add(1, Ordering::Relaxed));
+        count_on_server(true);
         stats.redispatches.fetch_add(1, Ordering::Relaxed);
         entry.sess.txn.iter_mut().for_each(|txn| {
             txn.ck.direct = false;
@@ -4385,7 +4386,7 @@ fn retry_server_connect(
             txn.ck.ck = if txn.ck.ck == 3 { 2 } else { txn.ck.ck };
         });
     } else {
-        failed_srv.inspect(|c| _ = c.0.fetch_add(1, Ordering::Relaxed));
+        count_on_server(false);
         stats.retries_count.fetch_add(1, Ordering::Relaxed);
     }
 

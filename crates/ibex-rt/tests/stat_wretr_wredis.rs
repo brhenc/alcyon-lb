@@ -129,4 +129,15 @@ fn wretr_and_wredis_are_counted_per_server_and_backend() {
     assert_eq!(be_d, "2");
     assert_eq!(dead_d, "2", "a redispatch is counted on the server that failed");
     assert_eq!(live_d, "0");
+
+    // `clear counters` zeroes the per-server ones as well.
+    let mut c = UnixStream::connect(&sock).expect("connect cli");
+    c.write_all(b"clear counters all\n").expect("write");
+    let mut ack = String::new();
+    c.read_to_string(&mut ack).expect("read");
+    let rows = columns(&sock);
+    for (px, sv) in [("plain", "dead"), ("plain", "BACKEND"), ("redis", "dead"), ("redis", "BACKEND")] {
+        let r = rows.iter().find(|r| r.0 == px && r.1 == sv).expect("row");
+        assert_eq!((r.2.as_str(), r.3.as_str()), ("0", "0"), "{px}/{sv} after clear counters");
+    }
 }
