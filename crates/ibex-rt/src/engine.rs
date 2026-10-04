@@ -458,6 +458,10 @@ pub struct ProxyIdInfo {
     pub server_init_health: Vec<u32>,
     /// Each listener's numeric id (`luid`) by `bind` line, as `so_id` reads it.
     pub listener_ids: Vec<u32>,
+    /// `pool-max-conn` per server; empty when no server sets it (-1, unlimited, then).
+    /// Read when a server connection is released, so it lives here, off `Proxy`'s inline
+    /// size (`struct_sizes.rs`).
+    pub server_pool_max_conn: Vec<i32>,
 }
 
 /// A configured proxy instance.
@@ -535,8 +539,6 @@ pub struct Proxy {
     pub server_pp_unique_id: Vec<bool>,
     pub server_backups: Vec<bool>,
     pub server_maxconn: Vec<Option<u32>>,
-    /// `pool-max-conn` per server; empty when no server sets it (-1, unlimited, then).
-    pub server_pool_max_conn: Vec<i32>,
     pub server_actconn: Arc<Vec<AtomicU32>>,
     /// Per server `(wretr, wredis)`: retries on it and redispatches away from it.
     pub server_retr: Arc<std::sync::Mutex<std::collections::HashMap<usize, (u64, u64)>>>,
@@ -1745,6 +1747,7 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, list
             server_forced_ids: server_forced_ids(listen.servers.len(), &listen.server_extras),
             server_init_health: server_init_health(listen.servers.len(), &listen.server_extras),
             listener_ids: ibex_config::ast::listener_ids(&listen.binds),
+            server_pool_max_conn: pool_max_conns(&listen.servers),
             ..ProxyIdInfo::default()
         }),
         name: listen.name.clone(),
@@ -1801,7 +1804,6 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, list
         server_pp_unique_id: listen.servers.iter().map(|s| s.proxy_v2_unique_id).collect(),
         server_backups: listen.servers.iter().map(|s| s.backup).collect(),
         server_maxconn: listen.servers.iter().map(|s| s.maxconn).collect(),
-        server_pool_max_conn: pool_max_conns(&listen.servers),
         server_actconn: Arc::new((0..server_count).map(|_| AtomicU32::new(0)).collect()),
         server_retr: Arc::default(),
         server_sess_rates: Arc::new((0..server_count).map(|_| RateCtr::default()).collect()),
@@ -1919,7 +1921,6 @@ fn init_proxy_from_frontend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, fe
         server_pp_unique_id: Vec::new(),
         server_backups: Vec::new(),
         server_maxconn: Vec::new(),
-        server_pool_max_conn: Vec::new(),
         server_actconn: std::sync::Arc::new(Vec::new()),
         server_retr: Arc::default(),
         server_sess_rates: std::sync::Arc::new(Vec::new()),
@@ -2008,6 +2009,7 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, be:
             server_forced_ids: server_forced_ids(be.servers.len(), &be.server_extras),
             server_init_health: server_init_health(be.servers.len(), &be.server_extras),
             listener_ids: Vec::new(),
+            server_pool_max_conn: pool_max_conns(&be.servers),
             ..ProxyIdInfo::default()
         }),
         name: be.name.clone(),
@@ -2060,7 +2062,6 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, be:
         server_pp_unique_id: be.servers.iter().map(|s| s.proxy_v2_unique_id).collect(),
         server_backups: be.servers.iter().map(|s| s.backup).collect(),
         server_maxconn: be.servers.iter().map(|s| s.maxconn).collect(),
-        server_pool_max_conn: pool_max_conns(&be.servers),
         server_actconn: Arc::new((0..server_count).map(|_| AtomicU32::new(0)).collect()),
         server_retr: Arc::default(),
         server_sess_rates: Arc::new((0..server_count).map(|_| RateCtr::default()).collect()),
@@ -4619,7 +4620,7 @@ fn release_server(
             let sni = xprt.sni().map(str::to_string);
             let key = idle_key(proxies, addr, entry.srv_backend_idx, entry.target_server_idx, sni);
             let be = proxies.get(entry.srv_backend_idx);
-            let max_idle = entry.target_server_idx.and_then(|i| be?.server_pool_max_conn.get(i)).copied().unwrap_or(-1);
+            let max_idle = entry.target_server_idx.and_then(|i| be?.ids.server_pool_max_conn.get(i)).copied().unwrap_or(-1);
             let used = entry.target_server_idx.and_then(|i| be?.server_actconn.get(i)).map_or(0, |a| a.load(Ordering::Relaxed));
             if let Err(IdleConn { fd, mut xprt }) =
                 idle_pool.keep(key, IdleConn { fd: srv_fd, xprt }, entry.srv_served >= 2, max_idle, used, Instant::now())
@@ -7345,7 +7346,7 @@ impl EngineDispatcher<'_> {
                 || (idle_pool.is_empty()
                     && cookie_server
                         .or(entry.target_server_idx)
-                        .and_then(|i| proxies[be_idx].server_pool_max_conn.get(i))
+                        .and_then(|i| proxies[be_idx].ids.server_pool_max_conn.get(i))
                         .is_none_or(|&m| m != 0));
             if same
                 && alone
