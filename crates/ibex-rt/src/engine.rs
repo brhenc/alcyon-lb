@@ -5092,14 +5092,16 @@ impl EngineDispatcher<'_> {
         if !entry.sess.req.is_empty() {
             wake_queue.push(entry.task);
         }
-        if !proxies[entry.proxy_idx].tcp_req_content_rules.is_empty() {
-            let _ = eval_tcp_req_content_rules(
-                &proxies[entry.proxy_idx],
-                proxies,
-                sample_registry(),
-                &mut entry.sess,
-                now,
-            );
+        // `tcp-request content` rules run again for every request of a kept-alive connection
+        // (a request is a stream in HAProxy): arm them for the next one, and the stream step
+        // runs them once its head is in. Their result for a request that has not arrived
+        // yet used to be thrown away here, and they never ran again after the first request.
+        let proxy = &proxies[entry.proxy_idx];
+        if !proxy.tcp_req_content_rules.is_empty() {
+            entry.sess.tcp_inspect_done = false;
+            entry.sess.inspect_exp = proxy
+                .tcp_req_inspect_delay
+                .map(|d| fresh_tick(now).add(u32::try_from(d.as_millis()).unwrap_or(u32::MAX)));
         }
     }
 

@@ -353,3 +353,40 @@ fn tcp_info_counters_are_refused_with_a_reason() {
         assert!(out.contains("not implemented in Ibex"), "{f}: {out}");
     }
 }
+
+/// `tcp-request content` runs for every request of a kept-alive connection, so a `req.` variable
+/// it sets is there in each request's `http-request` rules (HAProxy 3.5-dev8: the same three
+/// lines for three requests). It used to run for the first request only.
+#[test]
+fn tcp_request_content_runs_for_each_request_of_a_connection() {
+    let fe = common::reserve_addr();
+    let _ibex = start(
+        &format!(
+            "{DEFAULTS}frontend fe\n  bind {fe}\n  \
+             tcp-request session set-var(sess.str3) str(\"this is a string\")\n  \
+             tcp-request content set-var-fmt(req.str4) \"%[var(sess.str3),regsub(is a,is also a)]\"\n  \
+             tcp-request content set-var(req.s6) str(six)\n  \
+             http-request set-var-fmt(txn.str5) \"%[var(req.str4)]\"\n  \
+             http-request set-var(txn.s7) var(req.s6)\n  \
+             http-request return status 200 hdr x-var \"str3=%[var(sess.str3)] str4=%[var(req.str4)] str5=%[var(txn.str5)] s6=%[var(req.s6)] s7=%[var(txn.s7)]\"\n"
+        ),
+        fe,
+    );
+    let mut s = TcpStream::connect(fe).expect("connect");
+    s.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
+    for i in 0..3 {
+        write!(s, "GET /r{i} HTTP/1.1\r\nHost: x\r\n\r\n").expect("send");
+        let mut head = Vec::new();
+        let mut b = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            assert_eq!(s.read(&mut b).expect("read"), 1, "closed on request {i}");
+            head.push(b[0]);
+        }
+        let head = String::from_utf8_lossy(&head).into_owned();
+        assert_eq!(
+            header(&head, "x-var").as_deref(),
+            Some("str3=this is a string str4=this is also a string str5=this is also a string s6=six s7=six"),
+            "request {i}: {head}"
+        );
+    }
+}
