@@ -954,3 +954,57 @@ fn test_proxy_v2_crc32c_wire_validation() {
         other => panic!("expected CrcMismatch error, got {other:?}"),
     }
 }
+
+/// `tcp-request content` rules run once the PROXY header is in, never over a part of it
+/// (T157). A client that writes the header in pieces used to have the rules run on the
+/// first piece -- `fc_pp_tlv` empty, the condition false, the rules done -- so a
+/// `set-var(sess.*)` taken from a TLV was never set. `HAProxy` reads the header in the
+/// connection's handshake, before the stream and its rules exist (measured with
+/// `reg-tests/sample_fetches/tlvs.vtc`, whose `sendhex` writes are this test's pieces).
+#[test]
+fn test_tcp_content_rules_wait_for_a_fragmented_proxy_v2_header() {
+    let fe = common::reserve_addr();
+    let cfg = format!(
+        "defaults\n    mode http\n    timeout connect 3s\n    timeout client 3s\n    timeout server 3s\n\n\
+         frontend fe\n    bind {fe} accept-proxy\n    \
+         tcp-request content set-var(sess.aws) fc_pp_tlv(0xEA),bytes(1) if {{ fc_pp_tlv(0xEA),bytes(0,1),hex eq 01 }}\n    \
+         http-after-response set-header echo1 %[var(sess.aws)]\n    \
+         http-request return status 200\n"
+    );
+    let mut engine = Engine::new(&ibex_config::parse_str(&cfg).expect("parse"), 64).expect("Engine::new");
+
+    // Signature, version, family, length (12 + 14), addresses, then one AWS TLV.
+    let pieces: [&[u8]; 6] = [
+        b"\r\n\r\n\x00\r\nQUIT\n",
+        b"\x21",
+        b"\x11",
+        b"\x00\x1a",
+        b"\x7f\x00\x00\x01\x7f\x00\x00\x01\x00\x2a\x05\x39",
+        b"\xea\x00\x0b\x01aws-vpc-id",
+    ];
+    let mut client = TcpStream::connect(fe).expect("connect");
+    for piece in pieces {
+        client.write_all(piece).expect("write piece");
+        // Each piece reaches the engine on runs of its own.
+        for _ in 0..5 {
+            let _ = engine.run_once();
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+    client.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").expect("write request");
+
+    client.set_nonblocking(true).expect("nonblocking");
+    let start = Instant::now();
+    let mut response = Vec::new();
+    let mut buf = [0u8; 1024];
+    while start.elapsed() < Duration::from_secs(2) && !response.windows(4).any(|w| w == b"\r\n\r\n") {
+        let _ = engine.run_once();
+        if let Ok(n) = client.read(&mut buf) {
+            response.extend_from_slice(&buf[..n]);
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    let response = String::from_utf8_lossy(&response).to_ascii_lowercase();
+    assert!(response.starts_with("http/1.1 200"), "{response}");
+    assert!(response.contains("\r\necho1: aws-vpc-id\r\n"), "{response}");
+}

@@ -3717,6 +3717,12 @@ fn eval_tcp_req_content_rules(
     if proxy.tcp_req_content_rules.is_empty() {
         return ContentEvalResult::Done;
     }
+    // `accept-proxy`: the PROXY header is the connection's handshake, and `HAProxy` has no
+    // stream, so no rules, before it is whole. Bytes of a header that is still coming are
+    // not content: run on them, the rules saw no `fc_pp_tlv` and were done (T157).
+    if sess.accept_proxy && !sess.proxy_handshake_done {
+        return ContentEvalResult::Waiting;
+    }
 
     let req_bytes = sess.req.readable();
     let has_content = !req_bytes.is_empty();
