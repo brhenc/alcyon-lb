@@ -312,6 +312,12 @@ pub struct CtxConvDesc {
 /// (`ibex-rt`'s load-time checks), rather than evaluated to a constant: each of these used
 /// to load and return 0 or 1, which an ACL then compared as if it were the state.
 pub const NOT_IMPLEMENTED: &[(&str, &str)] = &[
+    ("fc_unacked", "Ibex does not read TCP_INFO"),
+    ("fc_sacked", "Ibex does not read TCP_INFO"),
+    ("fc_lost", "Ibex does not read TCP_INFO"),
+    ("fc_retrans", "Ibex does not read TCP_INFO"),
+    ("fc_fackets", "Ibex does not read TCP_INFO"),
+    ("fc_reordering", "Ibex does not read TCP_INFO"),
     ("queue", "Ibex has no server queues"),
     ("avg_queue", "Ibex has no server queues"),
     ("srv_queue", "Ibex has no server queues"),

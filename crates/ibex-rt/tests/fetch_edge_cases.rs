@@ -205,7 +205,10 @@ backend be
 /// `haproxy -c` on one rule; the exit code and what it printed.
 fn load(rule: &str) -> (Option<i32>, String) {
     let cfg = format!("{DEFAULTS}frontend fe\n  bind 127.0.0.1:18081\n  {rule}\n  default_backend be\nbackend be\n  server s1 127.0.0.1:1\n");
-    let path = std::env::temp_dir().join(format!("ibex_t137_{}_{}.cfg", std::process::id(), rule.len()));
+    let path = std::env::temp_dir().join(format!("ibex_t137_{}_{}.cfg", std::process::id(), {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }));
     std::fs::write(&path, cfg).expect("write config");
     let out = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-c").arg("-f").arg(&path).output().expect("run ibex -c");
     let _ = std::fs::remove_file(&path);
@@ -338,4 +341,15 @@ fn srv_id_and_srv_name_in_http_response() {
     let r2 = get(fe, "");
     assert_eq!((header(&r1, "srv-id").as_deref(), header(&r1, "srv-name").as_deref()), (Some("1"), Some("srv1")), "{r1}");
     assert_eq!((header(&r2, "srv-id").as_deref(), header(&r2, "srv-name").as_deref()), (Some("2"), Some("srv2")), "{r2}");
+}
+
+/// The TCP_INFO counters need `getsockopt(TCP_INFO)`, which the memory-safe crates cannot call.
+/// They are refused with a reason, rather than loaded and left empty on every request.
+#[test]
+fn tcp_info_counters_are_refused_with_a_reason() {
+    for f in ["fc_unacked", "fc_sacked", "fc_lost", "fc_retrans", "fc_fackets", "fc_reordering"] {
+        let (code, out) = load(&format!("http-request set-header x \"%[{f}]\""));
+        assert_ne!(code, Some(0), "{f} loaded: {out}");
+        assert!(out.contains("not implemented in Ibex"), "{f}: {out}");
+    }
 }
