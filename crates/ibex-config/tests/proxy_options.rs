@@ -114,7 +114,6 @@ const IBEX_REFUSES: &[(&str, &str)] = &[
     ("spop-check", "bld"),
     // What reaches the server or the client.
     ("forwarded", "bld"),
-    ("http-buffer-request", "fbld"),
     ("http-restrict-req-hdr-names reject", "fbld"),
     ("http-drop-request-trailers", "bld"),
     ("http-drop-response-trailers", "fld"),

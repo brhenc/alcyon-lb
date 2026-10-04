@@ -90,6 +90,7 @@ pub(crate) fn parse_listen_header(
         req_header_captures: Vec::new(),
         res_header_captures: Vec::new(),
         log_health_checks: defaults.map_or(false, |d| d.log_health_checks),
+        buffer_request: defaults.is_some_and(|d| d.buffer_request),
         cliexp: Vec::new(),
         srvexp: Vec::new(),
         acls: Vec::new(),
@@ -179,6 +180,7 @@ pub(crate) fn parse_frontend_header(
         req_header_captures: Vec::new(),
         res_header_captures: Vec::new(),
         log_health_checks: defaults.map_or(false, |d| d.log_health_checks),
+        buffer_request: defaults.is_some_and(|d| d.buffer_request),
         stick_table: None,
         stick_rules: Vec::new(),
         tcp_req_inspect_delay: defaults.and_then(|d| d.tcp_req_inspect_delay),
@@ -246,6 +248,7 @@ pub(crate) fn parse_backend_header(
         unique_id_format: defaults.and_then(|d| d.unique_id_format.clone()),
         unique_id_header: defaults.and_then(|d| d.unique_id_header.clone()),
         log_health_checks: defaults.map_or(false, |d| d.log_health_checks),
+        buffer_request: defaults.is_some_and(|d| d.buffer_request),
         mode,
         disabled: false,
         balance: defaults.and_then(|d| d.balance).unwrap_or(BalanceAlgorithm::RoundRobin),
@@ -791,6 +794,7 @@ pub(crate) fn parse_option_listen(
         "forwardfor" => proxy.forwardfor = Some(parse_forward_option(tokens, kw)?),
         "originalto" => proxy.originalto = Some(parse_forward_option(tokens, kw)?),
         "redispatch" => proxy.redisp = true,
+        "http-buffer-request" => proxy.buffer_request = true,
         "accept-unsafe-violations-in-http-request" => proxy.stats.accept_unsafe_request = true,
         "log-health-checks" => proxy.log_health_checks = true,
         "httpchk" => parse_httpchk_option(&mut proxy.httpchk, tokens, kw)?,
@@ -823,6 +827,10 @@ pub(crate) fn parse_option_frontend(
         fe.stats.accept_unsafe_request = true;
         return Ok(());
     }
+    if tokens[1].text == "http-buffer-request" {
+        fe.buffer_request = true;
+        return Ok(());
+    }
     let except = Some(parse_forward_option(tokens, kw)?);
     if tokens[1].text == "forwardfor" {
         fe.forwardfor = except;
@@ -850,6 +858,7 @@ pub(crate) fn parse_option_backend(
         "forwardfor" => be.forwardfor = Some(parse_forward_option(tokens, kw)?),
         "originalto" => be.originalto = Some(parse_forward_option(tokens, kw)?),
         "redispatch" => be.redisp = true,
+        "http-buffer-request" => be.buffer_request = true,
         "log-health-checks" => be.log_health_checks = true,
         "httpchk" => parse_httpchk_option(&mut be.httpchk, tokens, kw)?,
         "tcp-check" => be.tcp_check = true,
@@ -867,6 +876,7 @@ pub(crate) fn parse_no_listen(proxy: &mut ListenSection, tokens: &[Token], kw: &
     }
     match check_no_option(OptSection::Listen, tokens, kw)? {
         Some("redispatch") => proxy.redisp = false,
+        Some("http-buffer-request") => proxy.buffer_request = false,
         Some("accept-unsafe-violations-in-http-request") => proxy.stats.accept_unsafe_request = false,
         Some("log-health-checks") => proxy.log_health_checks = false,
         _ => {}
@@ -878,8 +888,10 @@ pub(crate) fn parse_no_frontend(fe: &mut FrontendSection, tokens: &[Token], kw: 
     if tokens.get(1).is_none_or(|t| t.text != "option") {
         return parse_no_directive(tokens, kw);
     }
-    if let Some("accept-unsafe-violations-in-http-request") = check_no_option(OptSection::Frontend, tokens, kw)? {
-        fe.stats.accept_unsafe_request = false;
+    match check_no_option(OptSection::Frontend, tokens, kw)? {
+        Some("accept-unsafe-violations-in-http-request") => fe.stats.accept_unsafe_request = false,
+        Some("http-buffer-request") => fe.buffer_request = false,
+        _ => {}
     }
     Ok(())
 }
@@ -890,6 +902,7 @@ pub(crate) fn parse_no_backend(be: &mut BackendSection, tokens: &[Token], kw: &T
     }
     match check_no_option(OptSection::Backend, tokens, kw)? {
         Some("redispatch") => be.redisp = false,
+        Some("http-buffer-request") => be.buffer_request = false,
         Some("log-health-checks") => be.log_health_checks = false,
         _ => {}
     }

@@ -57,6 +57,9 @@ use ibex_sample::registry::{
 };
 
 thread_local! {
+    /// What the engine's ticks count from, on this thread: set by every `step`, read by
+    /// [`fresh_tick`].
+    static TICK_EPOCH: Cell<Option<Instant>> = const { Cell::new(None) };
     pub static WORKER_ID: Cell<usize> = const { Cell::new(0) };
     static STRICT_MODE: Cell<bool> = const { Cell::new(true) };
     static REWRITE_ADDED_BYTES: Cell<usize> = const { Cell::new(0) };
@@ -682,6 +685,15 @@ fn compile_log_format(spec: Option<&ibex_config::LogFormatSpec>, mode_http: bool
 /// without `id` writes: `HAProxy` numbers both in declaration order, and the header
 /// captures recorded theirs, so the rules take the rest in order. A rule's slot is as long
 /// as the rule's `len`, which a later rule writing it by `id` is cut to.
+/// `option http-buffer-request` is a `wait-for-body` ahead of the proxy's request rules
+/// (`time` unset: the wait `wait_for_request_body` gives it).
+fn with_buffered_request(rules: &mut Vec<ibex_config::HttpReqRule>, on: bool) {
+    if on {
+        let action = ibex_config::HttpReqAction::WaitForBody { time_ms: None, at_least: 0 };
+        rules.insert(0, ibex_config::HttpReqRule { action, cond: None });
+    }
+}
+
 fn capture_slots(
     headers: &[ibex_config::HeaderCapture],
     rules: &mut [ibex_config::HttpReqRule],
@@ -1080,6 +1092,7 @@ fn section_timeouts(
 #[allow(clippy::too_many_lines)] // a field-by-field mirror of the section
 fn init_proxy_from_listen(proxy_idx: usize, listen: &ibex_config::ListenSection, nbthread: usize) -> Proxy {
     let mut http_req_rules = listen.http_req_rules.clone();
+    with_buffered_request(&mut http_req_rules, listen.buffer_request);
     let req_capture_slots = capture_slots(&listen.req_header_captures, &mut http_req_rules);
     let timeouts = section_timeouts(&listen.timeouts, listen.clitimeout, listen.srvtimeout, listen.contimeout);
 
@@ -1208,6 +1221,7 @@ fn init_proxy_from_listen(proxy_idx: usize, listen: &ibex_config::ListenSection,
 
 fn init_proxy_from_frontend(proxy_idx: usize, fe: &ibex_config::FrontendSection, nbthread: usize) -> Proxy {
     let mut http_req_rules = fe.http_req_rules.clone();
+    with_buffered_request(&mut http_req_rules, fe.buffer_request);
     let req_capture_slots = capture_slots(&fe.req_header_captures, &mut http_req_rules);
     let timeouts = section_timeouts(&fe.timeouts, fe.clitimeout, None, None);
 
@@ -1301,6 +1315,8 @@ fn init_proxy_from_frontend(proxy_idx: usize, fe: &ibex_config::FrontendSection,
 }
 
 fn init_proxy_from_backend(proxy_idx: usize, be: &ibex_config::BackendSection, nbthread: usize) -> Proxy {
+    let mut http_req_rules = be.http_req_rules.clone();
+    with_buffered_request(&mut http_req_rules, be.buffer_request);
     let timeouts = section_timeouts(&be.timeouts, None, be.srvtimeout, be.contimeout);
 
     let retries = u16::try_from(be.retries).unwrap_or(u16::MAX);
@@ -1395,8 +1411,8 @@ fn init_proxy_from_backend(proxy_idx: usize, be: &ibex_config::BackendSection, n
         tcp_req_inspect_delay: be.tcp_req_inspect_delay,
         tcp_res_content_rules: be.tcp_res_content_rules.clone(),
         tcp_res_inspect_delay: be.tcp_res_inspect_delay,
-        http_req_capture_exprs: compile_capture_exprs(&be.http_req_rules),
-        http_req_rules: be.http_req_rules.clone(),
+        http_req_capture_exprs: compile_capture_exprs(&http_req_rules),
+        http_req_rules,
         http_res_rules: be.http_res_rules.clone(),
         http_after_res_rules: be.http_after_res_rules.clone(),
         http_reuse: be.http_reuse.unwrap_or_default(),
@@ -1797,6 +1813,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
 
     pub fn step(&mut self, now: Tick) -> io::Result<usize> {
         self.now = now;
+        TICK_EPOCH.with(|e| e.set(Some(self.start_time)));
 
         // 1. Expire scheduler timers
         self.scheduler.set_now(now);
@@ -4105,10 +4122,11 @@ impl EngineDispatcher<'_> {
             fc_dst: entry.sess.fc_dst,
             is_first_req: entry.sess.is_first_req,
             proxy_tlvs: entry.sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
-            req_body: if entry.sess.req.readable().is_empty() {
-                None
-            } else {
-                Some(entry.sess.req.readable())
+            // The body a `wait-for-body` saw; otherwise the bytes in the buffer.
+            req_body: match entry.sess.txn.as_ref().and_then(|t| t.req_body.as_deref()) {
+                Some(body) => Some(body),
+                None if entry.sess.req.readable().is_empty() => None,
+                None => Some(entry.sess.req.readable()),
             },
             htx: None,
             htx_slice: entry.sess.htx_slice(),
@@ -4205,16 +4223,37 @@ impl EngineDispatcher<'_> {
             reply_parse_error(entry, proxies, status);
         }
 
+        // `timeout client` while the request is held for its body: the 408 the wait's own
+        // time-out gives.
+        if entry.sess.ending == Some(crate::proxy::Ending::Timeout(crate::proxy::Which::Client))
+            && entry.sess.txn.as_ref().is_some_and(|t| t.body_wait.is_some())
+        {
+            let fe = &proxies[entry.proxy_idx];
+            let page = proxy_error_response(&entry.sess, fe, fe, proxies, 408);
+            entry.sess.send_before_close(&page);
+            entry.sess.log.status = Some(408);
+            entry.sess.log.term = Some(*b"cR");
+            entry.sess.log.request = None;
+            entry.log_line = stream_log_line(entry, proxies, pid);
+            close_http_session(entry, proxies, fdtab, poller, idle_pool, true);
+            return None;
+        }
+
         let mut admin = None;
         if entry.sess.txn.as_ref().is_some_and(|t| !t.req_rules_done) && entry.sess.tcp_inspect_done {
             if let Some(t) = entry.sess.txn.as_mut() {
                 t.req_rules_done = true;
             }
             admin = Self::connect_http_backend(entry, proxies, checks, pid, fdtab, poller, idle_pool, now);
-            // The rules have had their way with the head; it is final now.
             let sess = &mut entry.sess;
             if let Some(t) = sess.txn.as_mut() {
-                t.req.measure_head(sess.req.readable());
+                if t.body_wait.is_some() {
+                    // Held for the body: the rules go on from the wait when it is here.
+                    t.req_rules_done = false;
+                } else {
+                    // The rules have had their way with the head; it is final now.
+                    t.req.measure_head(sess.req.readable());
+                }
             }
         }
 
@@ -4475,6 +4514,9 @@ impl EngineDispatcher<'_> {
 
     #[allow(clippy::too_many_lines)] // one dispatch chain; splitting it would obscure the order
     fn step_stream(&mut self, session_idx: u32) -> Outcome {
+        // The time now, not the time the pass started: `step` takes its tick before it waits
+        // in the poller, so a stream woken by a request after an idle second would arm a
+        // `wait-for-body` of 300 ms from a second ago.
         let now = self.now;
         let (is_done, pending_admin, log_line) = {
             let Some(entry) = self.sessions.get_mut(session_idx) else {
@@ -4677,7 +4719,7 @@ impl EngineDispatcher<'_> {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn apply_http_response_rules(entry: &mut SessionEntry, proxies: &[Proxy], _now: Tick) {
+    fn apply_http_response_rules(entry: &mut SessionEntry, proxies: &[Proxy], now: Tick) {
         let threshold = entry.sess.bufsize.saturating_sub(entry.sess.maxrewrite);
         let Some((hdr_len, eoh_len)) = crate::proxy::find_eoh(entry.sess.rep.readable()) else {
             if entry.sess.rep.readable().len() > threshold {
@@ -4712,10 +4754,15 @@ impl EngineDispatcher<'_> {
             txn.rsp_interim = true;
             return;
         }
+        // A response held for its body (`wait-for-body`) comes back here with its head as
+        // the rules before the wait left it, and goes on from the wait.
+        let resume = txn.rsp_wait.take();
         // The final response head: `t_data`, and `capture response header`.
-        entry.sess.log.data = Some(std::time::Instant::now());
+        if resume.is_none() {
+            entry.sess.log.data = Some(std::time::Instant::now());
+        }
         let fe_caps = &proxies[fe_idx].res_capture_slots;
-        if !fe_caps.is_empty() {
+        if resume.is_none() && !fe_caps.is_empty() {
             let head = String::from_utf8_lossy(&entry.sess.rep.readable()[..total_hdr_len]).into_owned();
             let headers: Vec<(&str, &str)> = head.split("\r\n").skip(1).filter_map(|l| l.split_once(':')).collect();
             entry.sess.log.res_captures = capture_values(fe_caps.iter().map(|(n, l)| (n.as_str(), *l)), &headers);
@@ -4827,6 +4874,27 @@ impl EngineDispatcher<'_> {
             None
         };
 
+        // The rules of a proxy that waits for the response body read what is in the buffer
+        // as `res.body`, as `HAProxy` gives them: the rules after a `wait-for-body` the whole
+        // of it (or what the wait settled for).
+        let order: &[usize] = if fe_idx == be_idx { &[be_idx] } else { &[be_idx, fe_idx] };
+        let has_wait = order.iter().any(|&px| {
+            proxies[px].http_res_rules.iter().any(|r| matches!(r.action, ibex_config::HttpResAction::WaitForBody { .. }))
+        });
+        let limit = entry.sess.bufsize.saturating_sub(entry.sess.maxrewrite);
+        let mut res_body = Vec::new();
+        let body_progress = if has_wait {
+            let data = entry.sess.rep.readable();
+            let progress = crate::txn::read_body(framing, &data[total_hdr_len..], &mut res_body);
+            res_body.truncate(limit.saturating_sub(total_hdr_len));
+            progress
+        } else {
+            crate::txn::BodyProgress::Complete
+        };
+        let rep_full = entry.sess.rep.len() >= limit;
+        let srv_ended = matches!(entry.sess.srv_state, ScState::ShutR | ScState::Closed | ScState::Error);
+        let srv_timed_out = entry.sess.ending == Some(crate::proxy::Ending::Timeout(crate::proxy::Which::Server));
+
         let ctx = SampleContext {
             proxies: Some(&ProxiesView(proxies)),
             client_addr: entry.sess.client_addr,
@@ -4845,6 +4913,7 @@ impl EngineDispatcher<'_> {
             be_max_retries: Some(proxies[be_idx].retries),
             cur_max_retries: Some(entry.sess.max_retries),
             res_version: Some(&proto_version),
+            res_body: has_wait.then_some(res_body.as_slice()),
             unique_id: entry.sess.log.unique_id.as_deref(),
             captures_req_hdr: Some(&entry.sess.log.req_captures),
             captures_res_hdr: Some(&res_caps_in),
@@ -4854,6 +4923,10 @@ impl EngineDispatcher<'_> {
         // `tcp-response content reject`: the response is dropped and the client connection
         // closed with nothing sent, as HAProxy does -- not answered with a 502.
         let mut rejected = false;
+        // Where a `wait-for-body` holds the response: the list and the rule, and until when.
+        let mut held: Option<crate::txn::RspWait> = None;
+        let mut timed_out = false;
+        let mut malformed = false;
         let failed: Option<ResStop> = 'rules: {
             // 0. Apply be.tcp_res_content_rules. They run before the response is analysed
             // as HTTP (`AN_RES_INSPECT` ahead of `AN_RES_WAIT_HTTP`), so its status and
@@ -4861,7 +4934,7 @@ impl EngineDispatcher<'_> {
             CURRENT_RES_STATUS.set(0);
             CURRENT_RES_HEADERS.with(|h| h.borrow_mut().clear());
             let tcp_ctx = SampleContext { res_version: None, ..ctx.clone() };
-            for rule in &proxies[be_idx].tcp_res_content_rules {
+            for rule in proxies[be_idx].tcp_res_content_rules.iter().filter(|_| resume.is_none()) {
                 let matches = match &rule.cond {
                     None => true,
                     Some(cond) => eval_condition(cond, &tcp_ctx, &proxies[be_idx].acls, registry),
@@ -4892,14 +4965,46 @@ impl EngineDispatcher<'_> {
 
             // 1. The backend's `http-response` rules, then the frontend's when it is another
             // proxy; an `allow` ends only its own list.
-            let order: &[usize] = if fe_idx == be_idx { &[be_idx] } else { &[be_idx, fe_idx] };
             // `http-response capture` writes the frontend's slots, whichever proxy the rule is in.
             let fe_res_slots = &proxies[fe_idx].res_capture_slots;
             let mut stopped = None;
-            for &px in order {
+            for (list, &px) in order.iter().enumerate() {
+                if resume.is_some_and(|w| list < w.list) {
+                    continue;
+                }
+                let start = resume.filter(|w| w.list == list).map_or(0, |w| w.rule);
                 let rules = proxies[px].http_res_rules.iter().map(|r| (ResOp::of_res(&r.action), r.cond.as_ref()));
                 let caps = (!fe_res_slots.is_empty()).then_some((&mut res_caps, &fe_res_slots[..]));
-                if let Err(stop) = run_res_rules(
+                let mut check = |rule: usize, time_ms: u32, at_least: u32| -> BodyWait {
+                    let now = fresh_tick(now);
+                    let here = resume.filter(|w| w.list == list && w.rule == rule);
+                    let deadline = here.map_or_else(
+                        || if time_ms > 0 { now.add(time_ms) } else { Tick::ETERNITY },
+                        |w| w.deadline,
+                    );
+                    let enough = at_least > 0 && res_body.len() >= at_least as usize;
+                    let outcome = if body_progress == crate::txn::BodyProgress::Error {
+                        BodyWait::Malformed
+                    } else if body_progress == crate::txn::BodyProgress::Complete || enough || rep_full {
+                        BodyWait::Ready
+                    } else if srv_timed_out || (!srv_ended && deadline.is_expired(now)) {
+                        BodyWait::TimedOut
+                    } else if srv_ended {
+                        // Cut short: what is here goes on, and the forwarding tells the
+                        // client the response is incomplete.
+                        BodyWait::Ready
+                    } else {
+                        BodyWait::Pending
+                    };
+                    match outcome {
+                        BodyWait::Pending => held = Some(crate::txn::RspWait { list, rule, deadline }),
+                        BodyWait::TimedOut => timed_out = true,
+                        BodyWait::Malformed => malformed = true,
+                        _ => {}
+                    }
+                    outcome
+                };
+                match run_res_rules(
                     rules,
                     &proxies[px].acls,
                     (&mut hdrs, &mut status, &mut status_msg),
@@ -4908,9 +5013,14 @@ impl EngineDispatcher<'_> {
                     registry,
                     &mut entry.sess.sess_vars,
                     &mut entry.sess.req_vars,
+                    Some(ResWait { start, check: &mut check }),
                 ) {
-                    stopped = Some(stop);
-                    break;
+                    Err(stop) => {
+                        stopped = Some(stop);
+                        break;
+                    }
+                    Ok(Some(_)) => break,
+                    Ok(None) => {}
                 }
             }
             // What the rules captured is what the log line shows, and what the rules after
@@ -4964,6 +5074,27 @@ impl EngineDispatcher<'_> {
                 txn.aborted = true;
             }
             return;
+        }
+        if let Some(wait) = held {
+            // Held for the body: the head as the rules so far left it goes back into the
+            // buffer, and the rules go on from the wait when the body is here.
+            let mut new_hdr = format!("{proto_version} {status} {status_msg}\r\n");
+            for (k, v) in &hdrs {
+                let _ = write!(new_hdr, "{k}: {v}\r\n");
+            }
+            new_hdr.push_str("\r\n");
+            entry.sess.rep.replace_prefix(total_hdr_len, new_hdr.as_bytes());
+            entry.sess.log.res_captures.clone_from(&res_caps);
+            if let Some(txn) = entry.sess.txn.as_mut() {
+                txn.rsp_wait = Some(wait);
+            }
+            return;
+        }
+        if timed_out {
+            entry.sess.log.term.get_or_insert(*b"sH");
+        }
+        if malformed {
+            entry.sess.log.term.get_or_insert(*b"PH");
         }
         if let Some(stop) = failed {
             entry.sess.rep.clear();
@@ -5242,12 +5373,19 @@ impl EngineDispatcher<'_> {
         now: Tick,
     ) -> Option<crate::stats_html::AdminAction> {
         let proxy_idx = entry.proxy_idx;
-        // Until a backend is chosen the frontend stands in for it, as `s->be` does in
-        // HAProxy: an error page picked before routing comes from the frontend.
-        entry.backend_idx = proxy_idx;
-        // Each request is a new stream in HAProxy, with the retry budget of its proxy
-        // (`stream_new`); what the last request spent or `set-retries` does not carry over.
-        entry.sess.set_retries(proxies[proxy_idx].retries);
+        // A request held for its body (`wait-for-body`) comes back here when the body is
+        // here, and goes on from the rule it stopped at: what ran before it (routing the
+        // request, counting it, the rules ahead of the wait) is not run again.
+        let resume = entry.sess.txn.as_ref().and_then(|t| t.body_wait);
+        let resume_be = resume.is_some_and(|w| w.backend);
+        if resume.is_none() {
+            // Until a backend is chosen the frontend stands in for it, as `s->be` does in
+            // HAProxy: an error page picked before routing comes from the frontend.
+            entry.backend_idx = proxy_idx;
+            // Each request is a new stream in HAProxy, with the retry budget of its proxy
+            // (`stream_new`); what the last request spent or `set-retries` does not carry over.
+            entry.sess.set_retries(proxies[proxy_idx].retries);
+        }
 
         // Initialize per-request thread locals
         CURRENT_VARS.with(|v| {
@@ -5260,7 +5398,9 @@ impl EngineDispatcher<'_> {
                 map.insert(k.clone(), val.clone());
             }
         });
-        begin_http_stream(entry, proxies, proxy_idx, pid);
+        if resume.is_none() {
+            begin_http_stream(entry, proxies, proxy_idx, pid);
+        }
         CURRENT_TIMEOUTS.with(|t| {
             let mut map = t.borrow_mut();
             map.clear();
@@ -5299,7 +5439,7 @@ impl EngineDispatcher<'_> {
         // `monitor-uri`: answer the probe here, before any rule or backend sees it. The
         // response is HAProxy's, byte for byte (`src/http_ana.c`), and matches the path of
         // an absolute-form request too.
-        if let Some(m_uri) = proxies[proxy_idx].monitor_uri.as_deref() {
+        if let Some(m_uri) = proxies[proxy_idx].monitor_uri.as_deref().filter(|_| resume.is_none()) {
             let req_uri = entry.sess.req_uri.as_deref().unwrap_or("/");
             let path = if m_uri.starts_with('/') && req_uri.contains("://") {
                 split_uri(req_uri).1
@@ -5322,9 +5462,10 @@ impl EngineDispatcher<'_> {
         // as never used. The effect was that every request to `stats uri` fell through
         // to normal backend routing and returned 503, so the stats page and the whole
         // web admin stopped working.
-        if proxies[proxy_idx].stats_config.enable
-            || proxies[proxy_idx].stats_config.uri.is_some()
-            || proxies[proxy_idx].stats_config.admin
+        if resume.is_none()
+            && (proxies[proxy_idx].stats_config.enable
+                || proxies[proxy_idx].stats_config.uri.is_some()
+                || proxies[proxy_idx].stats_config.admin)
         {
             let req_uri = entry.sess.req_uri.as_deref().unwrap_or("/");
             let configured_uri = proxies[proxy_idx].stats_config.uri.as_deref();
@@ -5363,7 +5504,7 @@ impl EngineDispatcher<'_> {
             ..Default::default()
         };
 
-        for rule in &proxies[proxy_idx].http_req_rules {
+        for rule in proxies[proxy_idx].http_req_rules.iter().filter(|_| resume.is_none()) {
             let matches = match &rule.cond {
                 None => true,
                 Some(cond) => eval_condition(cond, &http_sample_ctx, &proxies[proxy_idx].acls, registry),
@@ -5443,7 +5584,7 @@ impl EngineDispatcher<'_> {
         }
 
         // Count HTTP request into all active tracked slots
-        for (t_idx, ref k) in entry.sess.tracked_sc.iter().flatten() {
+        for (t_idx, ref k) in entry.sess.tracked_sc.iter().flatten().filter(|_| resume.is_none()) {
             if *t_idx < proxies.len() {
                 if let Some(ref tbl) = proxies[*t_idx].stick_table {
                     let _ = tbl.update_entry(k, |data| {
@@ -5476,7 +5617,7 @@ impl EngineDispatcher<'_> {
 
         let act_conn = proxies[proxy_idx].stats[worker_id()].act_conn.load(Ordering::Relaxed);
         let cum_conn = proxies[proxy_idx].stats[worker_id()].cum_conn.load(Ordering::Relaxed);
-        let eval_http_rules = |rules: &[ibex_config::HttpReqRule], capture_exprs: &[Option<Expr>], acls: &HashMap<String, Expr>, sess: &mut TcpSession, be_retries: u16, fe_name: Option<&str>, be_name: Option<&str>, pages_idx: usize| -> Result<Option<()>, u16> {
+        let eval_http_rules = |rules: &[ibex_config::HttpReqRule], capture_exprs: &[Option<Expr>], acls: &HashMap<String, Expr>, sess: &mut TcpSession, be_retries: u16, fe_name: Option<&str>, be_name: Option<&str>, pages_idx: usize, be_stage: bool, start: usize| -> Result<RuleFlow, u16> {
             macro_rules! make_ctx {
                 ($s:expr) => {
                     SampleContext {
@@ -5492,6 +5633,7 @@ impl EngineDispatcher<'_> {
                         req_uri: $s.req_uri.as_deref(),
                         req_method: $s.req_method.as_deref(),
                         req_headers: $s.req_headers.as_deref(),
+                        req_body: $s.txn.as_ref().and_then(|t| t.req_body.as_deref()),
                         fe_name,
                         be_name,
                         captures_req_hdr: Some(&$s.log.req_captures),
@@ -5507,7 +5649,7 @@ impl EngineDispatcher<'_> {
                 };
             }
 
-            for (rule_idx, rule) in rules.iter().enumerate() {
+            for (rule_idx, rule) in rules.iter().enumerate().skip(start) {
                 let matches = match &rule.cond {
                     None => true,
                     Some(cond) => eval_condition(cond, &make_ctx!(sess), acls, registry),
@@ -5531,7 +5673,7 @@ impl EngineDispatcher<'_> {
                             }
                         };
                         send_proxy_reply(sess, &proxies[..], proxy_idx, pages_idx, &full_resp);
-                        return Ok(Some(()));
+                        return Ok(RuleFlow::Replied);
                     }
                     ibex_config::HttpReqAction::Deny {
                         deny_status,
@@ -5550,15 +5692,15 @@ impl EngineDispatcher<'_> {
                         // Denied by the proxy: `PR`, not a rule's answer (`LR`).
                         sess.log.term = Some(*b"PR");
                         send_proxy_reply(sess, &proxies[..], proxy_idx, pages_idx, &resp);
-                        return Ok(Some(()));
+                        return Ok(RuleFlow::Replied);
                     }
                     ibex_config::HttpReqAction::Allow => {
-                        return Ok(None);
+                        return Ok(RuleFlow::Next);
                     }
                     ibex_config::HttpReqAction::Auth => {
                         let resp = "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"HAProxy\"\r\nContent-Type: text/plain\r\nContent-Length: 0\r\n\r\n";
                         send_proxy_reply(sess, &proxies[..], proxy_idx, pages_idx, resp.as_bytes());
-                        return Ok(Some(()));
+                        return Ok(RuleFlow::Replied);
                     }
                     ibex_config::HttpReqAction::Redirect { location, prefix, code, .. } => {
                         let status_code = code.unwrap_or(302);
@@ -5569,7 +5711,7 @@ impl EngineDispatcher<'_> {
                             "HTTP/1.1 {status_code} {reason}\r\nLocation: {formatted_loc}\r\nContent-Length: 0\r\n\r\n"
                         );
                         send_proxy_reply(sess, &proxies[..], proxy_idx, pages_idx, resp.as_bytes());
-                        return Ok(Some(()));
+                        return Ok(RuleFlow::Replied);
                     }
                     ibex_config::HttpReqAction::SetPath { fmt } => {
                         let new_path = format_sample_string(fmt, &make_ctx!(sess), registry);
@@ -5905,6 +6047,21 @@ impl EngineDispatcher<'_> {
                             }
                         }
                     }
+                    ibex_config::HttpReqAction::WaitForBody { time_ms, at_least } => {
+                        match wait_for_request_body(sess, &proxies[proxy_idx], be_stage, rule_idx, *time_ms, *at_least, now) {
+                            BodyWait::Ready => {}
+                            BodyWait::Pending => return Ok(RuleFlow::Suspend),
+                            BodyWait::TimedOut => {
+                                sess.log.term.get_or_insert(*b"cR");
+                                return Err(408);
+                            }
+                            BodyWait::ClientGone => {
+                                sess.log.term.get_or_insert(*b"CR");
+                                return Err(400);
+                            }
+                            BodyWait::Malformed => return Err(400),
+                        }
+                    }
                     ibex_config::HttpReqAction::Capture { len, id, .. } => {
                         // No sample, no capture: the slot stays empty (`-` in `%hrl`).
                         // The expression was checked when the configuration loaded.
@@ -5927,15 +6084,16 @@ impl EngineDispatcher<'_> {
                     _ => {}
                 }
             }
-            Ok(None)
+            Ok(RuleFlow::Next)
         };
 
         // Execute frontend rules
-        if !proxies[proxy_idx].http_req_rules.is_empty() {
+        if !resume_be && !proxies[proxy_idx].http_req_rules.is_empty() {
             let fe_rules = &proxies[proxy_idx].http_req_rules;
             let fe_acls = &proxies[proxy_idx].acls;
-            match eval_http_rules(fe_rules, &proxies[proxy_idx].http_req_capture_exprs, fe_acls, &mut entry.sess, proxies[proxy_idx].retries, Some(&proxies[proxy_idx].name), None, proxy_idx) {
-                Ok(Some(())) => {
+            let start = resume.map_or(0, |w| w.rule);
+            match eval_http_rules(fe_rules, &proxies[proxy_idx].http_req_capture_exprs, fe_acls, &mut entry.sess, proxies[proxy_idx].retries, Some(&proxies[proxy_idx].name), None, proxy_idx, false, start) {
+                Ok(RuleFlow::Replied) => {
                     entry.sess.log.term.get_or_insert(*b"LR");
                     return None;
                 }
@@ -5944,16 +6102,18 @@ impl EngineDispatcher<'_> {
                     reply_error(entry, proxies, status);
                     return None;
                 }
-                Ok(None) => {}
+                // Held for the body: back here when it is.
+                Ok(RuleFlow::Suspend) => return None,
+                Ok(RuleFlow::Next) => {}
             }
         }
 
         // 3. Resolve backend and server
-        let be_idx = Self::resolve_backend(entry, proxies);
+        let be_idx = if resume_be { entry.backend_idx } else { Self::resolve_backend(entry, proxies) };
         entry.backend_idx = be_idx;
         // `stream_set_backend` (src/stream.c): switching to a backend takes its retry
         // budget, whatever a frontend-side `set-retries` set.
-        if be_idx != proxy_idx {
+        if be_idx != proxy_idx && !resume_be {
             entry.sess.set_retries(proxies[be_idx].retries);
         }
         // The server side runs on the backend's timeouts, as in HAProxy.
@@ -5964,7 +6124,7 @@ impl EngineDispatcher<'_> {
         }
 
         // Evaluate backend tcp-request content rules
-        if !proxies[be_idx].tcp_req_content_rules.is_empty() {
+        if !resume_be && !proxies[be_idx].tcp_req_content_rules.is_empty() {
             let res = eval_tcp_req_content_rules(
                 &proxies[be_idx],
                 proxies,
@@ -6019,8 +6179,9 @@ impl EngineDispatcher<'_> {
         if be_idx != proxy_idx && !proxies[be_idx].http_req_rules.is_empty() {
             let be_rules = &proxies[be_idx].http_req_rules;
             let be_acls = &proxies[be_idx].acls;
-            match eval_http_rules(be_rules, &proxies[be_idx].http_req_capture_exprs, be_acls, &mut entry.sess, proxies[be_idx].retries, Some(&proxies[proxy_idx].name), Some(&proxies[be_idx].name), be_idx) {
-                Ok(Some(())) => {
+            let start = resume.filter(|w| w.backend).map_or(0, |w| w.rule);
+            match eval_http_rules(be_rules, &proxies[be_idx].http_req_capture_exprs, be_acls, &mut entry.sess, proxies[be_idx].retries, Some(&proxies[proxy_idx].name), Some(&proxies[be_idx].name), be_idx, true, start) {
+                Ok(RuleFlow::Replied) => {
                     entry.sess.log.term.get_or_insert(*b"LR");
                     return None;
                 }
@@ -6029,7 +6190,8 @@ impl EngineDispatcher<'_> {
                     reply_error(entry, proxies, status);
                     return None;
                 }
-                Ok(None) => {}
+                Ok(RuleFlow::Suspend) => return None,
+                Ok(RuleFlow::Next) => {}
             }
         }
 
@@ -6978,6 +7140,134 @@ fn add_req_header(sess: &mut TcpSession, name: &str, val: &str) {
     rebuild_req_buffer(sess);
 }
 
+/// The time now. `step` takes its tick before it waits in the poller, so a stream woken by a
+/// request after an idle second would arm a `wait-for-body` of 300 ms from a second ago;
+/// `now`, the pass's tick, stands in where no step has run on this thread.
+fn fresh_tick(now: Tick) -> Tick {
+    TICK_EPOCH.with(Cell::get).map_or(now, |start| {
+        let ms = u32::try_from(start.elapsed().as_millis() & 0xFFFF_FFFF).unwrap_or(u32::MAX);
+        Tick(if ms == 0 { 1 } else { ms })
+    })
+}
+
+/// What a pass over a list of `http-request` rules came to.
+#[derive(Debug, PartialEq, Eq)]
+enum RuleFlow {
+    /// Every rule ran; go on to what follows.
+    Next,
+    /// A rule answered the request itself.
+    Replied,
+    /// A `wait-for-body` holds the request: the pass resumes at it when the body is here.
+    Suspend,
+}
+
+/// Where a `wait-for-body` stands.
+enum BodyWait {
+    /// The body is here (or enough of it, or the buffer is full): the rules go on.
+    Ready,
+    /// Not yet; `txn.body_wait` says where to resume and until when.
+    Pending,
+    /// The time ran out: `408`, as `http_wait_for_msg_body` does.
+    TimedOut,
+    /// The client closed before the end of the request: `400`, flagged `CR`.
+    ClientGone,
+    /// The body does not follow its framing.
+    Malformed,
+}
+
+/// `http-request wait-for-body time <t> [at-least <bytes>]`, or the wait `option
+/// http-buffer-request` stands for (`time_ms` unset: `timeout http-request`, else `timeout
+/// client`, of the frontend), reached at rule `rule` of the frontend's list or, with
+/// `backend`, the backend's.
+///
+/// The request stays in `req` until its rules are done, so the body arrives there and is
+/// read in place: the wait is over when the body is complete, `at_least` bytes of it are
+/// here, or `req` is as full as `HAProxy` lets a request get (`tune.bufsize` less
+/// `tune.maxrewrite`); then `req.body` is what is there, chunk framing removed.
+fn wait_for_request_body(
+    sess: &mut TcpSession,
+    fe: &Proxy,
+    backend: bool,
+    rule: usize,
+    time_ms: Option<u32>,
+    at_least: u32,
+    now: Tick,
+) -> BodyWait {
+    // An HTTP/2 client's body does not pass through `req`: there is nothing to wait for.
+    if sess.h2_ctx.is_some() {
+        return BodyWait::Ready;
+    }
+    let Some(txn) = sess.txn.as_ref() else {
+        return BodyWait::Ready;
+    };
+    let framing = match txn.req {
+        MsgState::Head { body, .. } => body,
+        _ => crate::txn::Framing::None,
+    };
+    let held = txn.body_wait.filter(|w| w.backend == backend && w.rule == rule);
+    let now = fresh_tick(now);
+    let deadline = match held {
+        Some(w) => w.deadline,
+        None => {
+            // `Expect: 100-continue`: the client is invited to send its body now, and the
+            // server, which was not asked, is not told to.
+            let asks = |name: &str, value: &str| name.eq_ignore_ascii_case("expect") && value.trim().eq_ignore_ascii_case("100-continue");
+            let expects = if let Some(htx) = sess.htx_slice() {
+                htx.headers().any(|(name, value)| asks(name, value))
+            } else {
+                sess.req_headers.as_ref().is_some_and(|h| h.iter().any(|(name, value)| asks(name, value)))
+            };
+            if expects {
+                sess.send_before_close(b"HTTP/1.1 100 Continue\r\n\r\n");
+                del_req_header(sess, "expect");
+            }
+            let timeouts = &fe.stats_config.raw_timeouts;
+            let wait_ms = time_ms.or_else(|| timeouts.http_request.or(timeouts.client).map(millis_to_u32));
+            wait_ms.filter(|ms| *ms > 0).map_or(Tick::ETERNITY, |ms| now.add(ms))
+        }
+    };
+    let data = sess.req.readable();
+    let head = crate::proxy::find_eoh(data).map_or(data.len(), |(h, e)| h + e);
+    let mut body = Vec::new();
+    let progress = crate::txn::read_body(framing, &data[head..], &mut body);
+    // The buffer is full when `tune.maxrewrite` is all that is left of it, and what a rule
+    // sees of the body is what fits before that.
+    let limit = sess.bufsize.saturating_sub(sess.maxrewrite);
+    let full = sess.req.len() >= limit;
+    body.truncate(limit.saturating_sub(head));
+    let enough = at_least > 0 && body.len() >= at_least as usize;
+    let outcome = if progress == crate::txn::BodyProgress::Error {
+        BodyWait::Malformed
+    } else if progress == crate::txn::BodyProgress::Complete || enough || full {
+        BodyWait::Ready
+    } else if !matches!(sess.cli_state, ScState::Ready | ScState::Established) {
+        BodyWait::ClientGone
+    } else if deadline.is_expired(now) {
+        BodyWait::TimedOut
+    } else {
+        BodyWait::Pending
+    };
+    // The request is complete for the log when its body is here (`Tq`), and never was when
+    // the wait ends otherwise.
+    match outcome {
+        BodyWait::Ready if held.is_some() => sess.log.request = Some(std::time::Instant::now()),
+        BodyWait::TimedOut | BodyWait::ClientGone | BodyWait::Malformed => sess.log.request = None,
+        _ => {}
+    }
+    let Some(txn) = sess.txn.as_mut() else {
+        return outcome;
+    };
+    if matches!(outcome, BodyWait::Pending) {
+        txn.body_wait = Some(crate::txn::BodyWait { backend, rule, deadline });
+    } else {
+        txn.body_wait = None;
+        if matches!(outcome, BodyWait::Ready) {
+            txn.req_body = Some(body);
+        }
+    }
+    outcome
+}
+
 fn del_req_header(sess: &mut TcpSession, name: &str) {
     sess.with_htx_mut(|htx| {
         let _ = htx.remove_header(name);
@@ -7218,12 +7508,21 @@ enum ResOp<'a> {
     Status(u16),
 }
 
+/// The `wait-for-body` of a response rule list: the rule the pass starts at, and the check a
+/// `wait-for-body` rule (its index in the list, `time` in ms, `at-least`) is put to.
+struct ResWait<'a> {
+    start: usize,
+    check: &'a mut dyn FnMut(usize, u32, u32) -> BodyWait,
+}
+
 /// An entry of a response rule list: a [`ResOp`] on the response head, or -- `capture` only
 /// being in `http-response` -- a sample (a fetch expression) written to a capture slot.
 #[derive(Clone, Copy)]
 enum ResRule<'a> {
     Op(ResOp<'a>),
     Capture(&'a str, usize),
+    /// `wait-for-body time <ms> at-least <bytes>`.
+    Wait(u32, u32),
 }
 
 impl<'a> ResOp<'a> {
@@ -7234,6 +7533,7 @@ impl<'a> ResOp<'a> {
             ibex_config::HttpResAction::DelHeader { name } => Self::Del(name),
             ibex_config::HttpResAction::SetStatus { status } => Self::Status(*status),
             ibex_config::HttpResAction::Capture { expr, id } => return ResRule::Capture(expr, *id),
+            ibex_config::HttpResAction::WaitForBody { time_ms, at_least } => return ResRule::Wait(*time_ms, *at_least),
         })
     }
 
@@ -7507,11 +7807,13 @@ fn run_res_rules<'a>(
     registry: &Registry,
     sess_vars: &mut HashMap<String, String>,
     req_vars: &mut HashMap<String, String>,
-) -> Result<(), ResStop> {
+    mut wait: Option<ResWait<'_>>,
+) -> Result<Option<usize>, ResStop> {
     let (hdrs, status, status_msg) = head;
     STRICT_MODE.set(true);
-    let mut result = Ok(());
-    for (op, cond) in rules {
+    let mut result = Ok(None);
+    let start = wait.as_ref().map_or(0, |w| w.start);
+    for (idx, (op, cond)) in rules.enumerate().skip(start) {
         // The slots as the earlier rules left them, for `capture.res.hdr`.
         let with_caps;
         let ctx = match &caps {
@@ -7536,6 +7838,20 @@ fn run_res_rules<'a>(
                     }
                 }
                 continue;
+            }
+            ResRule::Wait(time_ms, at_least) => {
+                let Some(w) = wait.as_mut() else { continue };
+                match (w.check)(idx, time_ms, at_least) {
+                    BodyWait::Ready => continue,
+                    // Held: the pass resumes at this rule.
+                    BodyWait::Pending => {
+                        STRICT_MODE.set(true);
+                        return Ok(Some(idx));
+                    }
+                    BodyWait::TimedOut => result = Err(ResStop::Page(504)),
+                    BodyWait::Malformed | BodyWait::ClientGone => result = Err(ResStop::Page(502)),
+                }
+                break;
             }
         };
         match res_action(op, hdrs, status, status_msg, ctx, registry, sess_vars, req_vars) {
@@ -7573,7 +7889,7 @@ fn eval_after_res_rules(
     let order: &[usize] = if fe_idx == be_idx { &[be_idx] } else { &[be_idx, fe_idx] };
     for &px in order {
         let rules = proxies[px].http_after_res_rules.iter().map(|r| (ResOp::of_after_res(&r.action), r.cond.as_ref()));
-        run_res_rules(rules, &proxies[px].acls, (&mut *hdrs, &mut *status, &mut *status_msg), ctx, None, registry, sess_vars, req_vars)?;
+        run_res_rules(rules, &proxies[px].acls, (&mut *hdrs, &mut *status, &mut *status_msg), ctx, None, registry, sess_vars, req_vars, None)?;
     }
     Ok(())
 }

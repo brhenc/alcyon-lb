@@ -298,6 +298,52 @@ impl MsgState {
     }
 }
 
+/// Where `http-request` rules are held for a body: the rule list (the frontend's or the
+/// backend's), the rule to run next, and when the wait ends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BodyWait {
+    pub backend: bool,
+    pub rule: usize,
+    pub deadline: ibex_sched::Tick,
+}
+
+/// Where `http-response` rules are held for a body: the rule list (the backend's, then
+/// the frontend's), the rule to run next, and when the wait ends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RspWait {
+    pub list: usize,
+    pub rule: usize,
+    pub deadline: ibex_sched::Tick,
+}
+
+/// How much of a message body `data` holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BodyProgress {
+    /// The body goes on beyond `data`.
+    Partial,
+    /// `data` holds the whole body (and perhaps what follows it).
+    Complete,
+    /// The body violates its framing.
+    Error,
+}
+
+/// Reads the body of a message framed `framing` from `data`, the bytes after its head:
+/// the body's own bytes, chunk framing removed, are appended to `out`.
+pub fn read_body(framing: Framing, data: &[u8], out: &mut Vec<u8>) -> BodyProgress {
+    let mut state = match framing {
+        Framing::None | Framing::Length(0) | Framing::Tunnel => return BodyProgress::Complete,
+        Framing::Length(n) => MsgState::Body(Body::Length(n)),
+        Framing::Chunked => MsgState::Body(Body::Chunked(CHUNK_START)),
+        Framing::UntilClose => MsgState::Body(Body::UntilClose),
+    };
+    state.take_body(data, usize::MAX, out);
+    match state {
+        MsgState::Done => BodyProgress::Complete,
+        MsgState::Error => BodyProgress::Error,
+        _ => BodyProgress::Partial,
+    }
+}
+
 /// Header value of `name` in a raw head, the first occurrence.
 fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
     head.split('\n').skip(1).find_map(|l| {
@@ -383,6 +429,13 @@ pub struct HttpTxn {
     pub status: u16,
     /// `http-request` rules have run and the request is routed (or answered).
     pub req_rules_done: bool,
+    /// A `wait-for-body` the request rules are held at: where they resume, and until when.
+    pub body_wait: Option<BodyWait>,
+    /// The request body as it was when the wait ended (decoded: chunk framing removed),
+    /// what `req.body` reads in the rules after the wait.
+    pub req_body: Option<Vec<u8>>,
+    /// A `wait-for-body` the response rules are held at.
+    pub rsp_wait: Option<RspWait>,
     /// The proxy is answering this request itself; nothing is read from a server.
     pub local: bool,
     /// The one decision to close the client connection once this transaction ends.
@@ -417,6 +470,9 @@ impl HttpTxn {
             rsp_interim: false,
             status: 0,
             req_rules_done: false,
+            body_wait: None,
+            req_body: None,
+            rsp_wait: None,
             local: false,
             close_after,
             srv_reusable: true,
@@ -497,6 +553,37 @@ mod tests {
         let mut s = state;
         let n = s.advance(data);
         (n, s)
+    }
+
+    #[test]
+    fn a_body_is_read_as_far_as_it_is_here() {
+        let mut out = Vec::new();
+        assert_eq!(read_body(Framing::Length(10), b"abcde", &mut out), BodyProgress::Partial);
+        assert_eq!(out, b"abcde");
+        out.clear();
+        assert_eq!(read_body(Framing::Length(4), b"abcdNEXT", &mut out), BodyProgress::Complete);
+        assert_eq!(out, b"abcd");
+        out.clear();
+        assert_eq!(read_body(Framing::None, b"NEXT", &mut out), BodyProgress::Complete);
+        assert!(out.is_empty());
+        out.clear();
+        assert_eq!(read_body(Framing::UntilClose, b"abc", &mut out), BodyProgress::Partial);
+        assert_eq!(out, b"abc");
+    }
+
+    #[test]
+    fn a_chunked_body_is_read_without_its_framing() {
+        let mut out = Vec::new();
+        assert_eq!(read_body(Framing::Chunked, b"5\r\nhello\r\n3\r\nab", &mut out), BodyProgress::Partial);
+        assert_eq!(out, b"helloab");
+        out.clear();
+        assert_eq!(
+            read_body(Framing::Chunked, b"5;x=1\r\nhello\r\n0\r\nT: 1\r\n\r\nNEXT", &mut out),
+            BodyProgress::Complete
+        );
+        assert_eq!(out, b"hello");
+        out.clear();
+        assert_eq!(read_body(Framing::Chunked, b"zz\r\n", &mut out), BodyProgress::Error);
     }
 
     #[test]

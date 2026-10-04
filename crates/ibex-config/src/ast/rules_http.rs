@@ -146,6 +146,15 @@ pub enum HttpReqAction {
         sc: u8,
         expr: String,
     },
+    /// `http-request wait-for-body time <t> [at-least <bytes>]`: the rules after this one
+    /// run once the request body is complete, or `at_least` bytes of it are here, or the
+    /// buffer is full; `time_ms` after the rule is reached, the client gets a 408. `None`
+    /// is the wait `option http-buffer-request` stands for: `timeout http-request`, else
+    /// `timeout client`.
+    WaitForBody {
+        time_ms: Option<u32>,
+        at_least: u32,
+    },
 }
 
 /// The argument of `set-retries`: an integer from 0 to 100, or an expression evaluated per
@@ -174,6 +183,10 @@ pub enum HttpResAction {
     /// capture slot `id` (a `declare capture response`, or a `capture response header`),
     /// cut to that slot's length.
     Capture { expr: String, id: usize },
+    /// `http-response wait-for-body time <t> [at-least <bytes>]`: the rules after this one
+    /// run once the response body is complete, or `at_least` bytes of it are here, or the
+    /// buffer is full; after `time_ms` the client gets a 504.
+    WaitForBody { time_ms: u32, at_least: u32 },
 }
 
 /// Rule pairing an HTTP-response action with an optional condition.

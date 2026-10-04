@@ -1209,6 +1209,11 @@ impl Registry {
             out_type: SampleType::Sint,
             func: response_body_len_fetch,
         });
+        self.register_fetch(FetchDesc {
+            name: "res.body_len",
+            out_type: SampleType::Sint,
+            func: response_body_len_fetch,
+        });
 
         let request_payload_fetch: FetchFn = |ctx, args| {
             let offset = args.first().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);

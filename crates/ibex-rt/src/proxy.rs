@@ -1484,6 +1484,14 @@ impl TcpSession {
         if let (true, Some(r_exp)) = (self.res_inspect_pending, self.res_inspect_exp) {
             exp = exp.earliest(r_exp);
         }
+        // A request held for its body (`wait-for-body`) answers 408 when the time is up.
+        if let Some(wait) = self.txn.as_ref().and_then(|t| t.body_wait) {
+            exp = exp.earliest(wait.deadline);
+        }
+        // So is a response, held for its body: `504`.
+        if let Some(wait) = self.txn.as_ref().and_then(|t| t.rsp_wait) {
+            exp = exp.earliest(wait.deadline);
+        }
         exp
     }
 

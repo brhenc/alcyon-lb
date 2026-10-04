@@ -80,6 +80,104 @@ fn strtol0(s: &str) -> Option<i64> {
     Some(if neg { -n } else { n })
 }
 
+/// A time in milliseconds as `parse_time_err(.., TIME_UNIT_MS)` reads it: digits, then
+/// `us`, `ms`, `s`, `m`, `h` or `d` (none: milliseconds), `us` rounded up. The messages
+/// are `HAProxy`'s.
+fn parse_time_ms(text: &str) -> Result<u32, String> {
+    const OVERFLOW: &str = "time overflow (maximum value is 2147483647 ms or ~24.8 days).";
+    let digits = text.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 {
+        return Err(format!("unexpected character '{}'.", text.chars().next().unwrap_or('\0')));
+    }
+    let value: u128 = text[..digits].parse().unwrap_or(u128::MAX);
+    let unit = &text[digits..];
+    let (mul, div): (u128, u128) = match unit {
+        "" | "ms" => (1, 1),
+        "us" => (1, 1000),
+        "s" => (1000, 1),
+        "m" => (60_000, 1),
+        "h" => (3_600_000, 1),
+        "d" => (86_400_000, 1),
+        other => return Err(format!("unexpected character '{}'.", other.chars().next().unwrap_or('\0'))),
+    };
+    let ms = value.saturating_mul(mul).saturating_add(div - 1) / div;
+    u32::try_from(ms).ok().filter(|m| *m < 0x8000_0000).ok_or_else(|| OVERFLOW.to_string())
+}
+
+/// A size as `parse_size_err` reads it: digits, then an optional `k`, `m` or `g` (either
+/// case), the result within 32 bits. An overflow names the character that overflowed.
+fn parse_size_u32(text: &str) -> Result<u32, String> {
+    if !text.starts_with(|c: char| c.is_ascii_digit()) {
+        return Err(format!("unexpected character '{}'.", text.chars().next().unwrap_or('\0')));
+    }
+    let mut value: u32 = 0;
+    let mut chars = text.chars();
+    let mut unit = None;
+    for c in chars.by_ref() {
+        let Some(d) = c.to_digit(10) else {
+            unit = Some(c);
+            break;
+        };
+        value = value
+            .checked_mul(10)
+            .and_then(|v| v.checked_add(d))
+            .ok_or_else(|| format!("unexpected character '{c}'."))?;
+    }
+    let Some(unit) = unit else { return Ok(value) };
+    let shift = match unit.to_ascii_lowercase() {
+        'k' => 10,
+        'm' => 20,
+        'g' => 30,
+        other => return Err(format!("unexpected character '{other}'.")),
+    };
+    if let Some(extra) = chars.next() {
+        return Err(format!("unexpected character '{extra}'."));
+    }
+    value.checked_mul(1 << shift).ok_or_else(|| format!("unexpected character '{unit}'."))
+}
+
+/// `wait-for-body time <time> [ at-least <bytes> ] [ if|unless <cond> ]` for
+/// `http-request` and `http-response` (`side`): the arguments come in either order and a
+/// repeated one replaces the one before; `time` is required.
+fn parse_wait_for_body(
+    tokens: &[Token],
+    side: &str,
+    act_token: &Token,
+) -> Result<(u32, u32, Option<AclCondition>), ConfigError> {
+    let fail = |t: &Token, msg: String| ConfigError::new(t.line, t.col, msg);
+    let mut time = None;
+    let mut at_least = 0;
+    let mut i = 2;
+    while let Some(t) = tokens.get(i).filter(|t| matches!(t.text.as_str(), "time" | "at-least")) {
+        let Some(arg) = tokens.get(i + 1).filter(|a| !a.text.is_empty()) else {
+            return Err(fail(t, format!("missing argument for '{}'.", t.text)));
+        };
+        if t.text == "time" {
+            time = Some(parse_time_ms(&arg.text).map_err(|m| fail(arg, m))?);
+        } else {
+            at_least = parse_size_u32(&arg.text).map_err(|m| fail(arg, m))?;
+        }
+        i += 2;
+    }
+    let Some(time) = time else {
+        return Err(fail(act_token, "expects time <time> [ at-least <bytes> ].".to_string()));
+    };
+    let cond = match tokens.get(i) {
+        None => None,
+        Some(t) if t.text == "if" || t.text == "unless" => parse_acl_condition_from_tokens(&tokens[i..])?,
+        Some(t) => {
+            return Err(fail(
+                t,
+                format!(
+                    "'{side} {}' expects either 'if' or 'unless' followed by a condition but found '{}'.",
+                    act_token.text, t.text
+                ),
+            ));
+        }
+    };
+    Ok((time, at_least, cond))
+}
+
 #[allow(clippy::too_many_lines)]
 pub(crate) fn parse_http_req_rule(
     rules: &mut Vec<HttpReqRule>,
@@ -715,6 +813,9 @@ pub(crate) fn parse_http_req_rule(
             action: HttpReqAction::Capture { expr, len, id },
             cond,
         });
+    } else if act_str == "wait-for-body" {
+        let (time, at_least, cond) = parse_wait_for_body(tokens, "http-request", act_token)?;
+        rules.push(HttpReqRule { action: HttpReqAction::WaitForBody { time_ms: Some(time), at_least }, cond });
     } else {
         return Err(ConfigError::new(
             act_token.line,
@@ -1024,6 +1125,9 @@ pub(crate) fn parse_http_res_rule(
             },
             cond,
         });
+    } else if act_str == "wait-for-body" {
+        let (time_ms, at_least, cond) = parse_wait_for_body(tokens, "http-response", act_token)?;
+        rules.push(HttpResRule { action: HttpResAction::WaitForBody { time_ms, at_least }, cond });
     } else {
         return Err(ConfigError::new(
             act_token.line,
