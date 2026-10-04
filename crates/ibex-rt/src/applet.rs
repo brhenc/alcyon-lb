@@ -981,8 +981,19 @@ impl CliApplet {
                 let _ = crate::engine::set_proxy_maxconn(ctx.proxies, &px_name, sv.as_deref(), val);
                 self.finish_msg("");
             }
-            // Not implemented: the global maxconn is not enforced anywhere, so accepting it
-            // would be accepting and dropping it.
+            // `global.maxconn`, enforced by `globalconn` (listeners stop accepting at it).
+            Some("global") => {
+                let Some(v) = parts.get(1) else {
+                    self.finish_msg("Expects an integer value.");
+                    return;
+                };
+                // `atoi`: digits after an optional sign, anything else counts as 0.
+                let v = crate::applet::atoi(v);
+                match crate::globalconn::set(v) {
+                    Ok(()) => self.finish_msg(""),
+                    Err(msg) => self.finish_msg(msg),
+                }
+            }
             _ => self.finish_msg("No such target or invalid maxconn."),
         }
     }
@@ -1271,6 +1282,7 @@ impl CliApplet {
                       set server <backend>/<server> state ...    : Set server state (ready, maint, drain)\n\
                       set server <backend>/<server> maxconn <n>  : Set server maxconn\n\
                       set maxconn server <backend>/<server> <n>  : Set server maxconn\n\
+                      set maxconn global <value>                : Set the process maxconn\n\
                       set maxconn frontend <frontend> <n>        : Set frontend maxconn\n\
                       set maxconn backend <backend> <n>          : Set backend maxconn\n\
                       set weight <backend>/<server> <weight>     : Set server weight\n";
@@ -1363,4 +1375,16 @@ impl AppletArena {
     pub const fn live(&self) -> usize {
         self.live
     }
+}
+
+/// C's `atoi` on the leading integer of `s`: 0 when there is none.
+fn atoi(s: &str) -> i64 {
+    let t = s.trim_start();
+    let (neg, digits) = match t.as_bytes().first() {
+        Some(b'-') => (true, &t[1..]),
+        Some(b'+') => (false, &t[1..]),
+        _ => (false, t),
+    };
+    let n: i64 = digits.bytes().take_while(u8::is_ascii_digit).fold(0i64, |a, d| a.saturating_mul(10).saturating_add(i64::from(d - b'0')));
+    if neg { -n } else { n }
 }

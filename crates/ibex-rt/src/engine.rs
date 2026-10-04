@@ -705,6 +705,8 @@ pub struct Engine {
     /// The `stats socket` lines after the first, each with its own level (`HAProxy` binds
     /// them all).
     extra_cli: Vec<ExtraCli>,
+    /// The listeners were stopped because `global maxconn` was reached (`globalconn`).
+    global_paused: bool,
     /// The `level` of the stats socket (`stats socket ... level`): what each new CLI connection
     /// may do. Unset means admin, as before the level was honoured.
     pub cli_level: crate::applet::CliLevel,
@@ -1847,6 +1849,7 @@ impl Engine {
     /// ([`crate::rule_exprs::validate_rule_exprs`]).
     #[allow(clippy::too_many_lines)]
     pub fn build_shared_state(config: &Config, nbthread: usize) -> io::Result<Vec<Proxy>> {
+    crate::globalconn::configure(config.global.as_ref().and_then(|g| g.maxconn));
     // An action naming a fetch or converter the registry lacks would load and then do
     // nothing on every request; `HAProxy` refuses the configuration instead.
     crate::rule_exprs::validate_config(config)
@@ -2023,6 +2026,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             cli_listener: None,
             cli_socket_path: None,
             extra_cli: Vec::new(),
+            global_paused: false,
             cli_level: crate::applet::CliLevel::Admin,
             start_time,
             pid: std::process::id(),
@@ -2269,6 +2273,10 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             }
         };
 
+        // While the listeners are stopped for `global maxconn`, a connection closed by
+        // another worker is only noticed by looking: do not sleep through it.
+        let poll_timeout = if self.global_paused { poll_timeout.min(Duration::from_millis(5)) } else { poll_timeout };
+
         // A QUIC transport's next deadline can be sooner than the scheduler's. Waiting past
         // it would delay loss recovery; the shortest of the two wins.
         let now_inst = Instant::now();
@@ -2279,6 +2287,10 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             .fold(poll_timeout, |acc, deadline| {
                 acc.min(deadline.saturating_duration_since(now_inst))
             });
+
+        if self.global_paused && !crate::globalconn::full() {
+            self.resume_listeners_after_global();
+        }
 
         // 3. Poll readiness events
         let mut events = std::mem::take(&mut self.events);
@@ -2460,6 +2472,11 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             return;
         }
 
+        if crate::globalconn::full() {
+            self.pause_listeners_for_global();
+            return;
+        }
+
         let lfd = self.listeners[l_idx].raw_fd();
         if self.listeners[l_idx].is_full() {
             let _ = self.poller.modify(
@@ -2472,7 +2489,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             return;
         }
 
-        while !self.listeners[l_idx].is_full() {
+        while !self.listeners[l_idx].is_full() && !crate::globalconn::full() {
             let accept_res = self.listeners[l_idx].accept();
             let Some((cli_fd, peer_addr)) = (match accept_res {
                 Ok(Some(pair)) => Some(pair),
@@ -2482,6 +2499,30 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             };
             let local_addr = self.listeners[l_idx].addr();
             self.admit_connection(proxy_idx, Some(l_idx), cli_fd, peer_addr, local_addr);
+        }
+    }
+
+    /// `global maxconn` is reached: stop polling every listener. The connections wait in
+    /// the backlog; `step` resumes the listeners once the count is back under the limit.
+    fn pause_listeners_for_global(&mut self) {
+        for l in &self.listeners {
+            let lfd = l.raw_fd();
+            let _ = self.poller.modify(l.borrowed_fd(), raw_fd_to_u64(lfd), false, false);
+            self.fdtab.set_interest(lfd, Interest::NONE);
+        }
+        self.global_paused = true;
+    }
+
+    /// Undoes [`Self::pause_listeners_for_global`] for the listeners that have room of
+    /// their own.
+    fn resume_listeners_after_global(&mut self) {
+        self.global_paused = false;
+        for l in &self.listeners {
+            let lfd = l.raw_fd();
+            if !l.is_full() && self.fdtab.interest(lfd).is_none() {
+                let _ = self.poller.modify(l.borrowed_fd(), raw_fd_to_u64(lfd), true, false);
+                self.fdtab.set_interest(lfd, Interest::READ);
+            }
         }
     }
 
@@ -2658,6 +2699,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             proxy.stats[worker_id()].cum_conn.fetch_add(1, Ordering::Relaxed);
             proxy.stats[worker_id()].fe_sess_rate.tick();
             proxy.stats[worker_id()].act_conn.fetch_add(1, Ordering::Relaxed);
+            crate::globalconn::acquire();
             if proxy.stats[worker_id()].act_conn.load(Ordering::Relaxed) > proxy.stats[worker_id()].max_conn.load(Ordering::Relaxed) {
                 proxy.stats[worker_id()].max_conn.store(proxy.stats[worker_id()].act_conn.load(Ordering::Relaxed), Ordering::Relaxed);
             }
@@ -4084,6 +4126,7 @@ pub fn shutdown_session_entry(
         let proxy_idx = entry.proxy_idx;
         if proxy_idx < proxies.len() {
             proxies[proxy_idx].stats[worker_id()].act_conn.fetch_sub(1, Ordering::Relaxed);
+            crate::globalconn::release();
         }
         if let Some(s_idx) = entry.target_server_idx {
             let be_idx = entry.srv_backend_idx;
@@ -4622,6 +4665,7 @@ fn cleanup_done(
     proxies[proxy_idx].stats[worker_id()].bytes_out.fetch_add(entry.sess.bytes_out, Ordering::Relaxed);
     if !entry.actconn_reclaimed {
         proxies[proxy_idx].stats[worker_id()].act_conn.fetch_sub(1, Ordering::Relaxed);
+        crate::globalconn::release();
 
         if let Some(s_idx) = entry.target_server_idx {
             let be_idx = entry.srv_backend_idx;

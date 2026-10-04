@@ -245,6 +245,9 @@ pub fn format_show_info(
     max_conns: u32
     
 ) -> String {
+    // `global maxconn` and its configured ceiling, when there is one.
+    let maxconn = if crate::globalconn::max() > 0 { crate::globalconn::max() } else { max_conns };
+    let hard_maxconn = if crate::globalconn::hard() > 0 { crate::globalconn::hard() } else { max_conns };
     let elapsed = start_time.elapsed();
     let total_secs = elapsed.as_secs();
     let days = total_secs / 86400;
@@ -284,9 +287,9 @@ format!(
 \
          Maxsock: 0
 \
-         Maxconn: {max_conns}
+         Maxconn: {maxconn}
 \
-         Hard_maxconn: {max_conns}
+         Hard_maxconn: {hard_maxconn}
 \
          CurrConns: {active_conns}
 \

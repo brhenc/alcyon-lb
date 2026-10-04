@@ -17,6 +17,7 @@ pub mod check;
 pub use ibex_config::cond;
 pub mod cookie;
 pub mod cpu;
+pub mod globalconn;
 pub mod dgram;
 pub mod engine;
 pub mod fdtab;
