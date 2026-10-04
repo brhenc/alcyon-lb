@@ -58,14 +58,17 @@ fn server(delay: Duration) -> SocketAddr {
 }
 
 fn start(table: &str, rules: &str, delay: Duration) -> (Ibex, SocketAddr) {
+    start_full(table, "  http-request track-sc0 req.hdr(x-k)\n", rules, server(delay))
+}
+
+fn start_full(table: &str, track: &str, rules: &str, be: SocketAddr) -> (Ibex, SocketAddr) {
     let fe = common::reserve_addr();
     static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let sock = std::env::temp_dir().join(format!("ibex_t149b_st_{}_{n}.sock", std::process::id()));
-    let be = server(delay);
     let text = format!(
         "global\n  nbthread 1\n  stats socket {sock} mode 600 level admin\ndefaults\n  mode http\n  timeout connect 2s\n  timeout client 5s\n  timeout server 5s\n\
-         frontend f\n  bind {fe}\n  stick-table {table}\n  http-request track-sc0 req.hdr(x-k)\n{rules}  default_backend b\nbackend b\n  server s1 {be}\n",
+         frontend f\n  bind {fe}\n  stick-table {table}\n{track}{rules}  default_backend b\nbackend b\n  server s1 {be}\n",
         sock = sock.display()
     );
     let mut f = NamedTempFile::new().expect("tmp");
@@ -231,5 +234,62 @@ fn each_request_of_a_connection_tracks_its_own_key() {
         entries,
         ["key=aaa use=0 exp=N shard=0 gpc0=1 conn_cnt=1 http_req_cnt=1", "key=bbb use=0 exp=N shard=0 gpc0=1 conn_cnt=1 http_req_cnt=1"],
         "{out}"
+    );
+}
+
+/// A server that promises 100 bytes, sends 7 and closes.
+fn aborting_server() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    thread::spawn(move || {
+        for mut c in listener.incoming().flatten() {
+            thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                let _ = c.read(&mut buf);
+                let _ = c.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\npartial");
+                thread::sleep(Duration::from_millis(200));
+            });
+        }
+    });
+    addr
+}
+
+const IP_TABLE: &str = "type ip size 100 expire 60s store http_req_cnt,http_err_cnt,http_err_rate(10s),http_fail_cnt,http_fail_rate(10s)";
+
+/// Measured with `tcp-request connection track-sc0 src`: a request that cannot be parsed
+/// (answered 400) counts as a request and an error.
+#[test]
+fn a_parse_error_400_counts_in_http_err() {
+    let (ibex, fe) = start_full(IP_TABLE, "  tcp-request connection track-sc0 src\n", "", server(Duration::ZERO));
+    let mut c = TcpStream::connect(fe).expect("connect");
+    c.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
+    c.write_all(b"GARBAGE\r\n\r\n").expect("send");
+    let mut got = Vec::new();
+    let _ = c.read_to_end(&mut got);
+    assert!(String::from_utf8_lossy(&got).starts_with("HTTP/1.1 400"), "{got:?}");
+    thread::sleep(Duration::from_millis(300));
+    let (lines, _) = normalise(&cli(&ibex, "show table f"));
+    assert_eq!(
+        lines[1],
+        "key=127.0.0.1 use=0 exp=N shard=0 http_req_cnt=1 http_err_cnt=1 http_err_rate(10000)=1 http_fail_cnt=0 http_fail_rate(10000)=0",
+        "{lines:?}"
+    );
+}
+
+/// Measured: a server that closes in the middle of the body is one failed request, not an error.
+#[test]
+fn a_server_that_aborts_mid_body_counts_in_http_fail() {
+    let (ibex, fe) = start_full(IP_TABLE, "  tcp-request connection track-sc0 src\n", "", aborting_server());
+    let mut c = TcpStream::connect(fe).expect("connect");
+    c.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
+    c.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").expect("send");
+    let mut got = Vec::new();
+    let _ = c.read_to_end(&mut got);
+    thread::sleep(Duration::from_millis(300));
+    let (lines, _) = normalise(&cli(&ibex, "show table f"));
+    assert_eq!(
+        lines[1],
+        "key=127.0.0.1 use=0 exp=N shard=0 http_req_cnt=1 http_err_cnt=0 http_err_rate(10000)=0 http_fail_cnt=1 http_fail_rate(10000)=1",
+        "{lines:?}"
     );
 }

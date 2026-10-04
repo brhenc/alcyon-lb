@@ -211,6 +211,8 @@ pub struct TcpSession {
     /// What the stick-table entries this session tracks have been credited of `bytes_in`
     /// (`flush_stick_bytes`).
     pub stick_acct_in: u64,
+    /// The HTTP/2 glitches already credited to the tracked entries (`glitch_cnt`).
+    pub glitches_credited: u64,
     /// What the servers sent in the requests that are over and not credited yet.
     pub stick_out_pending: u64,
     pub ending: Option<Ending>,
@@ -348,6 +350,7 @@ impl TcpSession {
             bytes_in: 0,
             bytes_out: 0,
             stick_acct_in: 0,
+            glitches_credited: 0,
             stick_out_pending: 0,
             ending: None,
             accept_proxy: false,

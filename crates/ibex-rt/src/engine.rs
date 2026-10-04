@@ -4850,6 +4850,18 @@ fn reply_parse_error(entry: &mut SessionEntry, proxies: &[Proxy], status: u16) {
     let be = proxies.get(entry.backend_idx).unwrap_or(&proxies[entry.proxy_idx]);
     let page = proxy_error_response(&entry.sess, be, &proxies[entry.proxy_idx], proxies, status);
     entry.sess.write_reply(&page);
+    // The request that could not be parsed counts as a request and as the error or failure its
+    // status is (measured: `http_req_cnt=1 http_err_cnt=1` for a 400).
+    let (is_err, is_fail) = response_class(status);
+    for_tracked(proxies, &entry.sess, |data| {
+        data.count_request();
+        if is_err {
+            data.count_err();
+        }
+        if is_fail {
+            data.count_fail();
+        }
+    });
 }
 
 /// Detaches the server connection from the session: into the idle pool when it can carry
@@ -5679,6 +5691,8 @@ impl EngineDispatcher<'_> {
                     txn.close_after = true;
                     txn.aborted = true;
                     entry.sess.log.term = Some(*b"SD");
+                    // A response cut short is one failed request (`http_fail_cnt`).
+                    for_tracked(proxies, &entry.sess, |data| data.count_fail());
                 }
             }
         }
@@ -5868,6 +5882,13 @@ impl EngineDispatcher<'_> {
             // Step 3: Stream engine process pass
             if !entry.sess.is_done() {
                 let _ = entry.sess.process(now);
+            }
+            // The glitches the HTTP/2 connection counted since the last pass go to the entries
+            // its stream counters track (`glitch_cnt`, `glitch_rate`).
+            if let Some(n) = entry.sess.h2_ctx.as_ref().map(|h| h.glitch_count as u64).filter(|&n| n > entry.sess.glitches_credited) {
+                let due = n - entry.sess.glitches_credited;
+                entry.sess.glitches_credited = n;
+                for_tracked(self.proxies, &entry.sess, |data| data.add_glitches(due));
             }
             // A TCP stream stores what its `stick` rules took once the server has accepted
             // the connection (`AN_RES_STORE_RULES` runs on the first event of the response
