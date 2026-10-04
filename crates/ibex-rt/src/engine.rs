@@ -3924,7 +3924,7 @@ fn init_client_session(
         sess.tcp_inspect_done = false;
         if let Some(delay) = proxy.tcp_req_inspect_delay {
             let ms = u32::try_from(delay.as_millis()).unwrap_or(u32::MAX);
-            sess.inspect_exp = Some(now.add(ms));
+            sess.inspect_exp = Some(fresh_tick(now).add(ms));
         }
     }
 
