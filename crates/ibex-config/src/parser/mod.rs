@@ -602,6 +602,10 @@ const OPTIONS_THAT_MUST_NOT_BE_IGNORED: &[(&str, &str)] = &[
         "Ibex sends traffic to the first available backup server only, not to all of them",
     ),
     (
+        "log-separate-errors",
+        "Ibex would write a failed request to the normal log instead of raising its level",
+    ),
+    (
         "persist",
         "Ibex does not send a request with a persistence cookie to a server that is down",
     ),
