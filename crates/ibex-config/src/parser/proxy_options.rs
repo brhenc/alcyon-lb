@@ -155,6 +155,7 @@ const IMPLEMENTED: &[&str] = &[
     "tcplog",
     "forwardfor",
     "originalto",
+    "forwarded",
     "redispatch",
     // Waits for the request body ahead of the rules (T119).
     "http-buffer-request",
@@ -320,4 +321,50 @@ pub(crate) fn parse_forward_option(tokens: &[Token], kw: &Token) -> Result<(Stri
         }
     }
     Ok((except, if_none))
+}
+
+/// `option forwarded [proto] [host[-expr <e>]] [by[-expr <e>]] [by_port[-expr <e>]]
+/// [for[-expr <e>]] [for_port[-expr <e>]]`: no parameter is `proto for`; a parameter given
+/// twice keeps its last form. The messages are `HAProxy`'s (3.5-dev8-885761-29).
+pub(crate) fn parse_forwarded_option(tokens: &[Token]) -> Result<crate::ast::Forwarded, ConfigError> {
+    use crate::ast::{Forwarded, ForwardedValue::{Default as Plain, Expr}};
+    if tokens.len() < 3 {
+        return Ok(Forwarded::plain());
+    }
+    let mut f = Forwarded::default();
+    let mut i = 2;
+    while let Some(arg) = tokens.get(i) {
+        let name = arg.text.as_str();
+        let slot = match name {
+            "proto" => {
+                f.proto = true;
+                i += 1;
+                continue;
+            }
+            "host" | "host-expr" => &mut f.host,
+            "by" | "by-expr" => &mut f.by,
+            "by_port" | "by_port-expr" => &mut f.by_port,
+            "for" | "for-expr" => &mut f.for_,
+            "for_port" | "for_port-expr" => &mut f.for_port,
+            _ => {
+                return Err(err(
+                    arg,
+                    "'option forwarded' only supports optional values: 'proto', 'host', 'host-expr', 'by', \
+                     'by-expr', 'by_port', 'by_port-expr', 'for', 'for-expr', 'for_port' and 'for_port-expr'."
+                        .to_string(),
+                ));
+            }
+        };
+        if name.ends_with("-expr") {
+            let Some(e) = tokens.get(i + 1).filter(|t| !t.text.is_empty()) else {
+                return Err(err(arg, format!("'{name}' expects <expr> as argument.")));
+            };
+            *slot = Expr(e.text.clone());
+            i += 2;
+        } else {
+            *slot = Plain;
+            i += 1;
+        }
+    }
+    Ok(f)
 }

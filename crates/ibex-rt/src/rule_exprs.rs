@@ -321,6 +321,20 @@ pub fn validate_rule_exprs(config: &Config, registry: &Registry) -> Result<(), S
             tcp_res_content: &b.tcp_res_content_rules,
         });
     }
+    // `option forwarded ... for-expr <expr>` and the other `-expr` parameters; a `defaults`
+    // option is checked in each proxy that inherited it.
+    let proxies = config
+        .listens
+        .iter()
+        .map(|l| (format!("proxy '{}'", l.name), SectionKind::Listen, &l.name, &l.forwarded))
+        .chain(config.backends.iter().map(|b| (format!("backend '{}'", b.name), SectionKind::Backend, &b.name, &b.forwarded)));
+    for (what, section, name, forwarded) in proxies {
+        for (_, expr) in forwarded.iter().flat_map(ibex_config::Forwarded::exprs) {
+            check_sample_expr(expr, registry)
+                .and_then(|()| check_expr(config, registry, Where { section, proxy: Some(name) }, expr, false))
+                .map_err(|e| format!("{what}: failed to parse 'option forwarded' expression '{expr}' in : {e}"))?;
+        }
+    }
     sections.iter().try_for_each(|s| s.check(config, registry))
 }
 

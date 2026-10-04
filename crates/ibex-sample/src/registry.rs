@@ -1678,6 +1678,7 @@ impl Registry {
         reg_stick!("kbytes_out", StickData::KbytesOut);
 
         crate::auth::register(self);
+        crate::rfc7239::register(self);
 
         // --- 11. Timeout Fetches ---
         macro_rules! reg_timeout_fetch {

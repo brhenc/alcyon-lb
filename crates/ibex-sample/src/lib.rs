@@ -17,6 +17,7 @@ pub mod hash;
 pub mod localtime;
 pub mod matcher;
 pub mod rawpayload;
+pub mod rfc7239;
 pub mod registry;
 pub mod sample;
 

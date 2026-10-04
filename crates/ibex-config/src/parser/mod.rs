@@ -612,11 +612,6 @@ const CHECK_OPTIONS_THAT_MUST_NOT_BE_IGNORED: &[&str] = &[
 ///
 /// None of these appears in a reg-test that passed before T94.
 const OPTIONS_THAT_MUST_NOT_BE_IGNORED: &[(&str, &str)] = &[
-    (
-        "forwarded",
-        "Ibex does not add the RFC 7239 'Forwarded' header, and the server would trust whatever \
-         'Forwarded' header the client sent",
-    ),
     ("http-drop-request-trailers", "Ibex does not drop request trailers; the server would receive them"),
     ("http-drop-response-trailers", "Ibex does not drop response trailers; the client would receive them"),
     (

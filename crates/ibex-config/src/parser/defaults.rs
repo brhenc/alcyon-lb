@@ -209,6 +209,7 @@ pub(crate) fn parse_option_defaults(
             defaults.forwardfor_if_none = if_none;
         }
         "originalto" => defaults.originalto = Some(parse_forward_option(tokens, kw)?.0),
+        "forwarded" => defaults.forwarded = Some(parse_forwarded_option(tokens)?),
         "redispatch" => set_redispatch(&mut defaults.redisp, &mut defaults.redisp_after, tokens),
         "http-buffer-request" => defaults.buffer_request = true,
         "accept-unsafe-violations-in-http-request" => defaults.stats.accept_unsafe_request = true,
@@ -232,6 +233,7 @@ pub(crate) fn parse_no_defaults(defaults: &mut DefaultsSection, tokens: &[Token]
         Some("http-buffer-request") => defaults.buffer_request = false,
         Some("accept-unsafe-violations-in-http-request") => defaults.stats.accept_unsafe_request = false,
         Some("log-health-checks") => defaults.log_health_checks = false,
+        Some("forwarded") => defaults.forwarded = None,
         _ => {}
     }
     Ok(())

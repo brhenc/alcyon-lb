@@ -374,6 +374,126 @@ fn http_auth_names_a_userlist_that_exists() {
     }
 }
 
+/// Backends of the `option forwarded` test, each with the options HAProxy was measured with.
+const FORWARDED: &str = "defaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n\
+frontend fe\n  bind {fe}\n  http-request set-src hdr(x-src)\n  http-request set-dst hdr(x-dst)\n\
+  use_backend b1 if { path /b1 }\n  use_backend b2 if { path /b2 }\n  use_backend b3 if { path /b3 }\n  use_backend b4 if { path /b4 }\n\
+  use_backend b5 if { path /b5 }\n  use_backend b6 if { path /b6 }\n  use_backend b7 if { path /b7 }\n  use_backend off if { path /off }\n\
+backend b1\n  option forwarded\n  server s {srv}\n\
+backend b2\n  option forwarded proto host by by_port for for_port\n  server s {srv}\n\
+backend b3\n  option forwarded host-expr str(override) proto\n  server s {srv}\n\
+backend b4\n  option forwarded for-expr str(abc) by-expr str(my_obf)\n  server s {srv}\n\
+backend b5\n  option forwarded for-expr str(a:b) by-expr str(\"x y\") host-expr str(\"a;b\")\n  server s {srv}\n\
+backend b6\n  option forwarded for-expr str(unknown) for_port-expr str(_p) by-expr ipv6(::1) by_port-expr int(65535)\n  server s {srv}\n\
+backend b7\n  option forwarded for-expr str(abc) for_port-expr int(70000) by-expr dst by_port-expr str(80)\n  server s {srv}\n\
+backend off\n  server s {srv}\n";
+
+/// The `forwarded` header lines the server got, and the local port of the client socket.
+fn forwarded_seen(fe: SocketAddr, path: &str, hdrs: &str) -> (Vec<String>, u16) {
+    let mut c = TcpStream::connect(fe).expect("connect");
+    let port = c.local_addr().expect("addr").port();
+    let src = if hdrs.contains("x-src") { "" } else { "x-src: 10.1.2.3\r\n" };
+    c.write_all(format!("GET {path} HTTP/1.1\r\nHost: example.com:8080\r\n{src}x-dst: 192.168.0.9\r\n{hdrs}Connection: close\r\n\r\n").as_bytes())
+        .expect("send");
+    c.set_read_timeout(Some(Duration::from_millis(800))).ok();
+    let mut got = Vec::new();
+    let mut chunk = [0u8; 4096];
+    while let Ok(n) = c.read(&mut chunk) {
+        if n == 0 {
+            break;
+        }
+        got.extend_from_slice(&chunk[..n]);
+    }
+    let text = String::from_utf8_lossy(&got).into_owned();
+    let body = text.split("\r\n\r\n").nth(1).unwrap_or("");
+    let lines = body.lines().filter(|l| l.to_ascii_lowercase().starts_with("forwarded:")).map(|l| l[10..].trim().to_string()).collect();
+    (lines, port)
+}
+
+#[test]
+fn option_forwarded_writes_what_haproxy_writes() {
+    let (_i, fe) = start(FORWARDED);
+    let one = |path: &str| {
+        let (lines, _) = forwarded_seen(fe, path, "");
+        assert_eq!(lines.len(), 1, "{path}: {lines:?}");
+        lines[0].clone()
+    };
+    // Measured on HAProxy 3.5-dev8-885761-29 with the same backends, and `x-src`/`x-dst` as
+    // `set-src`/`set-dst`.
+    assert_eq!(one("/b1"), "proto=http;for=10.1.2.3");
+    assert_eq!(one("/b3"), "proto=http;host=\"override\"");
+    assert_eq!(one("/b4"), "by=_my_obf;for=_abc");
+    assert_eq!(one("/b5"), "host=\"\";by=unknown;for=unknown");
+    assert_eq!(one("/b6"), "by=\"[::1]:65535\";for=\"unknown:_p\"");
+    assert_eq!(one("/b7"), "by=\"192.168.0.9:80\";for=\"_abc:_70000\"");
+    // The default `host` is the Host header, the ports are the connection's.
+    let (lines, client_port) = forwarded_seen(fe, "/b2", "");
+    assert_eq!(
+        lines,
+        [format!("proto=http;host=\"example.com:8080\";by=\"192.168.0.9:{}\";for=\"10.1.2.3:{client_port}\"", fe.port())]
+    );
+    // An address of the other family is bracketed.
+    let (lines, _) = forwarded_seen(fe, "/b1", "x-src: 2001:db8::1\r\n");
+    assert_eq!(lines, ["proto=http;for=\"[2001:db8::1]\""]);
+    // No option, no header.
+    assert_eq!(forwarded_seen(fe, "/off", "").0.len(), 0);
+}
+
+#[test]
+fn option_forwarded_appends_to_the_last_forwarded_header() {
+    let (_i, fe) = start(FORWARDED);
+    let (lines, _) = forwarded_seen(fe, "/b1", "forwarded: for=1.1.1.1\r\n");
+    assert_eq!(lines, ["for=1.1.1.1,proto=http;for=10.1.2.3"]);
+    let (lines, _) = forwarded_seen(fe, "/b1", "forwarded: for=1.1.1.1\r\nforwarded: for=2.2.2.2\r\n");
+    assert_eq!(lines, ["for=1.1.1.1", "for=2.2.2.2,proto=http;for=10.1.2.3"]);
+}
+
+#[test]
+fn the_rfc7239_converters_answer_what_haproxy_answers() {
+    let cfg = "defaults\n  mode http\n  timeout client 5s\n\
+frontend fe\n  bind {fe}\n  http-request set-var(req.f) req.hdr(x-f)\n\
+  http-request return status 200 hdr valid \"%[var(req.f),rfc7239_is_valid]\" hdr ffor \"%[var(req.f),rfc7239_field(for)]\" \
+hdr n2nn \"%[var(req.f),rfc7239_field(for),rfc7239_n2nn]\" hdr n2np \"%[var(req.f),rfc7239_field(for),rfc7239_n2np]\" \
+hdr nn4 \"%[ipv4(127.9.0.1),rfc7239_nn]\" hdr nn6 \"%[ipv6(ab:cd::1),rfc7239_nn]\" hdr nns \"%[var(req.f),rfc7239_nn]\" \
+hdr npi \"%[int(12),rfc7239_np]\" hdr nps \"%[var(req.f),rfc7239_np]\"\n";
+    let (_i, fe) = start(cfg);
+    let get = |v: &str| {
+        let got = send(fe, &format!("GET / HTTP/1.1\r\nHost: a\r\nx-f: {v}\r\nConnection: close\r\n\r\n"));
+        let h = |n: &str| {
+            got.lines().find_map(|l| l.to_ascii_lowercase().strip_prefix(&format!("{n}: ")).map(|_| l[n.len() + 2..].trim_end().to_string())).unwrap_or_default()
+        };
+        ["valid", "ffor", "n2nn", "n2np", "nn4", "nn6", "nns", "npi", "nps"].map(|n| h(n)).join("|")
+    };
+    let tail = "127.9.0.1|[ab:cd::1]";
+    // Measured on HAProxy 3.5-dev8-885761-29 with the same config.
+    assert_eq!(get(r#"for="unknown:132";host="[::1]:65535";by="_obfs:_port";proto=https"#), format!("1|unknown:132|unknown|132|{tail}||12|"));
+    assert_eq!(get("fore=\"unknown:132\""), format!("0||||{tail}||12|"));
+    assert_eq!(get(r#"proto=http;for="[::1]:_id""#), format!("1|[::1]:_id|::1|_id|{tail}||12|"));
+    assert_eq!(get("for=127.9.0.1"), format!("1|127.9.0.1|127.9.0.1||{tail}||12|"));
+    assert_eq!(get("id"), format!("0||||{tail}|_id|12|_id"));
+}
+
+#[test]
+fn option_forwarded_expressions_are_checked_at_load() {
+    // HAProxy: "failed to parse 'option forwarded' expression 'foo(1)' in : unknown fetch method 'foo'."
+    let check = |opt: &str| {
+        let config = ibex_config::parse_config(&format!(
+            "defaults\n  mode http\n  timeout client 5s\n  timeout connect 5s\n  timeout server 5s\nbackend b\n  {opt}\n  server s 127.0.0.1:9\n"
+        ))
+        .expect("parses");
+        ibex_rt::rule_exprs::validate_rule_exprs(&config, ibex_sample::sample_registry())
+    };
+    assert!(check("option forwarded for-expr req.hdr(x),lower").is_ok());
+    for (opt, want) in [
+        ("option forwarded for-expr foo(1)", "failed to parse 'option forwarded' expression 'foo(1)' in : unknown fetch method 'foo'"),
+        ("option forwarded host-expr nosuchconv,x", "unknown fetch method 'nosuchconv'"),
+        ("option forwarded by-expr str(a),nosuchconv", "unknown converter 'nosuchconv'"),
+    ] {
+        let err = check(opt).expect_err(opt);
+        assert!(err.contains(want), "{opt}: {err}");
+    }
+}
+
 const ERR_FAIL: &str = "{global}defaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n\
 frontend fe\n  bind {fe}\n  http-request track-sc0 path\n\
   http-after-response add-header x-table err=%[sc0_http_err_cnt],fail=%[sc0_http_fail_cnt]\n\

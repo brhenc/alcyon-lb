@@ -1481,6 +1481,7 @@ fn init_proxy_from_listen(proxy_idx: usize, listen: &ibex_config::ListenSection,
             sc.raw_timeouts = listen.timeouts;
             sc.forwardfor.clone_from(&listen.forwardfor);
             sc.forwardfor_if_none = listen.forwardfor_if_none;
+            sc.forwarded.clone_from(&listen.forwarded);
             sc.originalto.clone_from(&listen.originalto);
             sc
         },
@@ -1716,6 +1717,7 @@ fn init_proxy_from_backend(proxy_idx: usize, be: &ibex_config::BackendSection, n
             sc.raw_timeouts = be.timeouts;
             sc.forwardfor.clone_from(&be.forwardfor);
             sc.forwardfor_if_none = be.forwardfor_if_none;
+            sc.forwarded.clone_from(&be.forwarded);
             sc.originalto.clone_from(&be.originalto);
             sc
         },
@@ -1827,6 +1829,87 @@ fn count_http_status(tracked: &[Option<(usize, StickKey)>; 3], proxies: &[Proxy]
                     d.http_fail_cnt += 1;
                 }
             });
+        }
+    }
+}
+
+/// The address of a `Forwarded` node: an IPv4 address as it is, an IPv6 one in brackets.
+fn node_text(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(a) => a.to_string(),
+        IpAddr::V6(a) => format!("[{a}]"),
+    }
+}
+
+/// The element `option forwarded` adds: `proto`, `host`, `by` and `for`, in that order, each
+/// from its sample expression or from the connection.
+fn forwarded_element(fwd: &ibex_config::Forwarded, sess: &TcpSession, ctx: &SampleContext) -> String {
+    use ibex_config::ForwardedValue::{Default as Plain, Expr as Expression, Off};
+    use ibex_sample::rfc7239::{node_from_sample, port_from_sample, valid_host};
+    let registry = sample_registry();
+    let eval = |e: &str| Expr::parse(e).ok().and_then(|e| e.eval_sample(registry, ctx));
+    let mut parts: Vec<String> = Vec::new();
+    if fwd.proto {
+        parts.push(format!("proto={}", if sess.cli_xprt.is_tls() { "https" } else { "http" }));
+    }
+    match &fwd.host {
+        Off => {}
+        v => {
+            let host = match v {
+                Expression(e) => eval(e).map(|s| sample_to_string(&s)),
+                _ => sess.htx_slice().and_then(|h| h.get_header("host")).map(str::to_string),
+            };
+            parts.push(format!("host=\"{}\"", host.filter(|h| valid_host(h)).unwrap_or_default()));
+        }
+    }
+    // The address of the stream (`set-src`/`set-dst` change it), and the port of the connection.
+    let src = sess.client_addr.map(|a| (a.ip(), if a.port() == 0 { sess.fc_src.map_or(0, |c| c.port()) } else { a.port() }));
+    let dst_port = sess.fc_dst.map_or(0, |c| c.port());
+    let dst = sess.server_addr.map(|a| a.ip()).or(sess.fc_dst.map(|a| a.ip())).map(|ip| (ip, dst_port));
+    for (name, node, port, addr) in [("by", &fwd.by, &fwd.by_port, dst), ("for", &fwd.for_, &fwd.for_port, src)] {
+        if *node == Off {
+            continue;
+        }
+        let name_text = match node {
+            Expression(e) => node_from_sample(eval(e).as_ref()),
+            _ => addr.map_or_else(|| "unknown".to_string(), |(ip, _)| node_text(ip)),
+        };
+        let port_text = match port {
+            Off => None,
+            Plain => addr.map(|(_, p)| p).filter(|p| *p != 0).map(|p| p.to_string()),
+            Expression(e) => port_from_sample(eval(e).as_ref()),
+        };
+        let quoted = *port != Off || name_text.contains([':', '[']);
+        let value = port_text.map_or_else(|| name_text.clone(), |p| format!("{name_text}:{p}"));
+        parts.push(if quoted { format!("{name}=\"{value}\"") } else { format!("{name}={value}") });
+    }
+    parts.join(";")
+}
+
+/// Adds `element` at the end of the request's last `Forwarded` header, or as a header of its
+/// own when it has none.
+fn append_forwarded_element(sess: &mut TcpSession, element: &str) {
+    let existing: Vec<String> = sess
+        .htx_slice()
+        .map(|s| s.headers().filter(|(n, _)| n.eq_ignore_ascii_case("forwarded")).map(|(_, v)| v.to_string()).collect())
+        .unwrap_or_default();
+    match existing.as_slice() {
+        [] => add_req_header(sess, "forwarded", element),
+        [only] => set_req_header(sess, "forwarded", &format!("{only},{element}")),
+        many => {
+            let last = many.len() - 1;
+            let values: Vec<String> = many.iter().enumerate().map(|(i, v)| if i == last { format!("{v},{element}") } else { v.clone() }).collect();
+            sess.with_htx_mut(|htx| {
+                htx.remove_header("forwarded");
+                for v in &values {
+                    let _ = htx.add_header("forwarded", v);
+                }
+            });
+            let mut hdrs = sess.req_headers.take().unwrap_or_default();
+            hdrs.retain(|(k, _)| !k.eq_ignore_ascii_case("forwarded"));
+            hdrs.extend(values.into_iter().map(|v| ("forwarded".to_string(), v)));
+            sess.req_headers = Some(hdrs);
+            rebuild_req_buffer(sess);
         }
     }
 }
@@ -7033,6 +7116,14 @@ impl EngineDispatcher<'_> {
                     set_req_header(&mut entry.sess, "X-Original-To", &ip_str);
                 }
             }
+        }
+
+        // `option forwarded` (`http_handle_7239_header`): the backend's, as one more element
+        // at the end of the last `Forwarded` header.
+        if let Some(fwd) = proxies[be_idx].stats_config.forwarded.clone() {
+            let stick = StickView::new(proxies, &entry.sess.tracked_sc);
+            let element = forwarded_element(&fwd, &entry.sess, &stream_sample_ctx(&entry.sess, &proxies[proxy_idx], &proxies[be_idx], &ProxiesView(proxies), &stick));
+            append_forwarded_element(&mut entry.sess, &element);
         }
 
         let source_ip = entry.sess.client_addr.map(|a| a.ip());

@@ -120,6 +120,7 @@ pub(crate) fn parse_listen_header(
         hash_preserve_affinity: defaults.and_then(|d| d.hash_preserve_affinity),
         forwardfor: defaults.and_then(|d| d.forwardfor.clone()),
         forwardfor_if_none: defaults.is_some_and(|d| d.forwardfor_if_none),
+        forwarded: defaults.and_then(|d| d.forwarded.clone()),
         originalto: defaults.and_then(|d| d.originalto.clone()),
         stats: defaults.map_or_else(StatsConfig::default, |d| d.stats.clone()),
         error_files: defaults.map_or_else(HashMap::new, |d| d.error_files.clone()),
@@ -287,6 +288,7 @@ pub(crate) fn parse_backend_header(
         hash_preserve_affinity: defaults.and_then(|d| d.hash_preserve_affinity),
         forwardfor: defaults.and_then(|d| d.forwardfor.clone()),
         forwardfor_if_none: defaults.is_some_and(|d| d.forwardfor_if_none),
+        forwarded: defaults.and_then(|d| d.forwarded.clone()),
         originalto: defaults.and_then(|d| d.originalto.clone()),
         stats: defaults.map_or_else(StatsConfig::default, |d| d.stats.clone()),
         error_files: defaults.map_or_else(HashMap::new, |d| d.error_files.clone()),
@@ -824,6 +826,7 @@ pub(crate) fn parse_option_listen(
             proxy.forwardfor_if_none = if_none;
         }
         "originalto" => proxy.originalto = Some(parse_forward_option(tokens, kw)?.0),
+        "forwarded" => proxy.forwarded = Some(parse_forwarded_option(tokens)?),
         "redispatch" => set_redispatch(&mut proxy.redisp, &mut proxy.redisp_after, tokens),
         "http-buffer-request" => proxy.buffer_request = true,
         "accept-unsafe-violations-in-http-request" => proxy.stats.accept_unsafe_request = true,
@@ -896,6 +899,7 @@ pub(crate) fn parse_option_backend(
             be.forwardfor_if_none = if_none;
         }
         "originalto" => be.originalto = Some(parse_forward_option(tokens, kw)?.0),
+        "forwarded" => be.forwarded = Some(parse_forwarded_option(tokens)?),
         "redispatch" => set_redispatch(&mut be.redisp, &mut be.redisp_after, tokens),
         "http-buffer-request" => be.buffer_request = true,
         "log-health-checks" => be.log_health_checks = true,
@@ -921,6 +925,7 @@ pub(crate) fn parse_no_listen(proxy: &mut ListenSection, tokens: &[Token], kw: &
         Some("http-buffer-request") => proxy.buffer_request = false,
         Some("accept-unsafe-violations-in-http-request") => proxy.stats.accept_unsafe_request = false,
         Some("log-health-checks") => proxy.log_health_checks = false,
+        Some("forwarded") => proxy.forwarded = None,
         _ => {}
     }
     Ok(())
@@ -946,6 +951,7 @@ pub(crate) fn parse_no_backend(be: &mut BackendSection, tokens: &[Token], kw: &T
         Some("redispatch") => (be.redisp, be.redisp_after) = (false, -1),
         Some("http-buffer-request") => be.buffer_request = false,
         Some("log-health-checks") => be.log_health_checks = false,
+        Some("forwarded") => be.forwarded = None,
         _ => {}
     }
     Ok(())

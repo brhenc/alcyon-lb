@@ -35,6 +35,9 @@ pub use stick::*;
 pub mod userlist;
 pub use userlist::*;
 
+pub mod forwarded;
+pub use forwarded::*;
+
 pub mod logging;
 pub use logging::*;
 

@@ -98,3 +98,51 @@ fn the_auth_action_takes_a_realm() {
         assert!(err.contains(want), "{line}: {err}");
     }
 }
+
+fn forwarded(opt: &str) -> Result<Option<ibex_config::Forwarded>, String> {
+    parse_config(&format!(
+        "defaults\n    mode http\n    timeout client 5s\n    timeout connect 5s\n    timeout server 5s\n\
+         backend be\n    {opt}\n    server s 127.0.0.1:9\n"
+    ))
+    .map(|c| c.backends[0].forwarded.clone())
+    .map_err(|e| e.to_string())
+}
+
+#[test]
+fn option_forwarded_keeps_the_parameters_it_names() {
+    use ibex_config::ForwardedValue::{Default as Plain, Expr, Off};
+    // No parameter is `proto for`.
+    let f = forwarded("option forwarded").expect("accepted").expect("set");
+    assert!(f.proto && f.for_ == Plain && f.host == Off && f.by == Off && f.by_port == Off && f.for_port == Off);
+    // Parameters replace that default, a later form of the same parameter wins.
+    let f = forwarded("option forwarded for-expr src for_port-expr str(id) by by_port-expr int(10)").expect("accepted").expect("set");
+    assert!(!f.proto);
+    assert_eq!((f.for_, f.for_port, f.by, f.by_port), (Expr("src".into()), Expr("str(id)".into()), Plain, Expr("int(10)".into())));
+    let f = forwarded("option forwarded for-expr str(abc) for").expect("accepted").expect("set");
+    assert_eq!(f.for_, Plain);
+    let f = forwarded("option forwarded host-expr str(override)").expect("accepted").expect("set");
+    assert_eq!((f.proto, f.host, f.for_), (false, Expr("str(override)".into()), Off));
+    // `no option forwarded` turns off what `defaults` set.
+    let c = parse_config(
+        "defaults\n    mode http\n    timeout client 5s\n    timeout connect 5s\n    timeout server 5s\n    option forwarded\n\
+         backend a\n    server s 127.0.0.1:9\nbackend b\n    no option forwarded\n    server s 127.0.0.1:9\n",
+    )
+    .expect("accepted");
+    assert!(c.backends[0].forwarded.is_some());
+    assert!(c.backends[1].forwarded.is_none());
+}
+
+#[test]
+fn option_forwarded_refusals_are_haproxys() {
+    let list = "'option forwarded' only supports optional values: 'proto', 'host', 'host-expr', 'by', 'by-expr', \
+                'by_port', 'by_port-expr', 'for', 'for-expr', 'for_port' and 'for_port-expr'.";
+    for (line, want) in [
+        ("option forwarded for-expr", "'for-expr' expects <expr> as argument."),
+        ("option forwarded bogus", list),
+        ("option forwarded proto-expr str(a)", list),
+        ("option forwarded for-expr str(a) bogus", list),
+    ] {
+        let err = forwarded(line).expect_err(line);
+        assert!(err.contains(want), "{line}: {err}");
+    }
+}
