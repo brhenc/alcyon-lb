@@ -1529,6 +1529,24 @@ impl Registry {
             out_type: SampleType::Str,
             func: |ctx, _args| ctx.srv_name.map(|n| Sample::Str(n.to_string())),
         });
+        // `acl(<name>[,<name>...])`: true when every named ACL matches, each one optionally
+        // negated by a leading `!` (`smp_fetch_acl`, src/acl.c). An ACL that does not exist
+        // gives no sample.
+        self.register_fetch(FetchDesc {
+            name: "acl",
+            out_type: SampleType::Bool,
+            func: |ctx, args| {
+                let acls = ctx.acls?;
+                let reg = sample_registry();
+                for a in args {
+                    let (neg, name) = a.strip_prefix('!').map_or((false, a.as_str()), |n| (true, n));
+                    if acls.get(name)?.eval(reg, ctx) == neg {
+                        return Some(Sample::Bool(false));
+                    }
+                }
+                Some(Sample::Bool(true))
+            },
+        });
         // The server and backend state fetches (`src/backend.c`). Their arguments are
         // resolved when the configuration loads; `queue`, `avg_queue`, `srv_queue` and
         // `be_conn` are refused there instead (see [`NOT_IMPLEMENTED`]).
