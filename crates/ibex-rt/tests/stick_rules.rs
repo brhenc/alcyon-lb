@@ -101,9 +101,13 @@ fn servers(s: &[SocketAddr; 3]) -> String {
 
 /// A `listen` with `rules` and the three servers; the server each request reached.
 fn run_listen(rules: &str, reqs: &[&str]) -> Vec<String> {
+    run_listen_named("l", rules, reqs)
+}
+
+fn run_listen_named(name: &str, rules: &str, reqs: &[&str]) -> Vec<String> {
     let s = http_servers();
     let fe = common::reserve_addr();
-    run_cfg(&format!("{HEAD}listen l\n  bind {fe}\n  balance roundrobin\n{rules}{}", servers(&s)), fe, reqs)
+    run_cfg(&format!("{HEAD}listen {name}\n  bind {fe}\n  balance roundrobin\n{rules}{}", servers(&s)), fe, reqs)
 }
 
 fn run_cfg(cfg: &str, fe: SocketAddr, reqs: &[&str]) -> Vec<String> {
@@ -265,5 +269,36 @@ fn what_cannot_work_is_refused_at_load() {
     refused("http", &format!("{t}  stick foo src\n"), "expects 'on', 'match', or 'store'");
     // The response is not inspected in TCP mode, so a key from it could not be stored.
     refused("tcp", &format!("{t}  stick store-response src\n"), "stick store-response");
+    refused("http", &format!("{t}  stick\n"), "expects 'on', 'match', or 'store'");
     check("http", &format!("{t}  stick on src\n  stick store-response res.hdr(x)\n")).expect("valid rules refused");
+    check("http", &format!("{t}  track-sc0 src\n  stick on src\n")).expect("track-sc0 beside stick refused");
+}
+
+/// `store-response` with a named table, a false condition and a second rule for the same
+/// table (skipped), then the same table by name from a match (measured: s1 s2 s2 s1).
+#[test]
+fn store_response_rules_with_a_table_a_condition_and_a_second_rule() {
+    let rules = format!(
+        "{TABLE}  stick match hdr(x-sess)\n  stick store-response res.hdr(x-id) table b if {{ res.hdr(x-never) -m found }}\n\
+         stick store-response res.hdr(x-id) table b\n  stick store-response res.hdr(nosuch)\n"
+    );
+    let got = run_listen_named("b", &rules, &["", "", "X-Sess: id-s2\r\n", "X-Sess: id-s1\r\n"]);
+    assert_eq!(got, ["s1", "s2", "s2", "s1"]);
+}
+
+/// A `table` naming a disabled backend: Ibex builds no table for it, so the rules that use
+/// it do nothing and the servers keep taking turns. (Not measured on HAProxy: the same
+/// configuration does not even listen there.)
+#[test]
+fn a_table_of_a_disabled_backend_is_no_table() {
+    let s = http_servers();
+    let fe = common::reserve_addr();
+    let cfg = format!(
+        "{HEAD}frontend f\n  bind {fe}\n  default_backend b\n\
+         backend t\n  disabled\n{TABLE}  server s1 {}\n\
+         backend b\n  balance roundrobin\n  stick on hdr(x-user) table t\n  stick store-response res.hdr(x-id) table t\n{}",
+        s[0],
+        servers(&s)
+    );
+    assert_eq!(run_cfg(&cfg, fe, &[A, A, A, A]), ["s1", "s2", "s3", "s1"]);
 }
