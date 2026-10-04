@@ -288,15 +288,15 @@ impl Default for BackendTlsOptions {
 /// (TLS 1.3, and TLS 1.2 when the `tls12` feature is on).
 fn protocol_versions(options: &BackendTlsOptions) -> Vec<&'static rustls::SupportedProtocolVersion> {
     use ibex_config::TlsVersion;
+    // What a `server` line can name, against what rustls calls it. A version this build
+    // of rustls does not speak is simply absent from `DEFAULT_VERSIONS`.
+    const NAMED: &[(rustls::ProtocolVersion, TlsVersion)] =
+        &[(rustls::ProtocolVersion::TLSv1_2, TlsVersion::Tls12), (rustls::ProtocolVersion::TLSv1_3, TlsVersion::Tls13)];
     let allowed = |v: TlsVersion| options.min_ver.is_none_or(|m| m <= v) && options.max_ver.is_none_or(|m| v <= m);
     rustls::DEFAULT_VERSIONS
         .iter()
         .copied()
-        .filter(|v| match v.version {
-            rustls::ProtocolVersion::TLSv1_2 => allowed(TlsVersion::Tls12),
-            rustls::ProtocolVersion::TLSv1_3 => allowed(TlsVersion::Tls13),
-            _ => false,
-        })
+        .filter(|v| NAMED.iter().any(|&(p, t)| p == v.version && allowed(t)))
         .collect()
 }
 

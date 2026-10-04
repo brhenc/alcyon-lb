@@ -677,6 +677,19 @@ fn accept_proxy_on_a_tls_bind_reads_the_header_before_the_handshake() {
     drop(TcpStream::connect(recv).expect("connect and leave"));
     thread::sleep(Duration::from_millis(100));
     assert_eq!(get(front, "x").0, 200, "the receiver still serves after those");
+
+    // `accept-proxy-v2`: a v1 header is a complete, valid PROXY header of the wrong
+    // version, and is refused before the handshake.
+    let strict = common::reserve_addr();
+    let cfg = format!(
+        "{DEFAULTS}listen strict\n  bind {strict} ssl crt {} accept-proxy-v2\n  http-request return status 200\n",
+        crt.display()
+    );
+    let _ibex2 = start(&p.dir, &cfg, &[strict]);
+    let mut v1 = TcpStream::connect(strict).expect("connect");
+    v1.set_read_timeout(Some(Duration::from_secs(3))).ok();
+    v1.write_all(b"PROXY TCP4 10.0.0.1 10.0.0.2 1234 443\r\n").expect("write");
+    assert!(matches!(v1.read(&mut b), Ok(0) | Err(_)), "a v1 header to accept-proxy-v2 must close the connection");
 }
 
 /// `-c` refuses what the start refuses: a rule naming a fetch the registry lacks, on a

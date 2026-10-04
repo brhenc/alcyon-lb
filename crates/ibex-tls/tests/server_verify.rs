@@ -207,6 +207,59 @@ fn version_limits_and_no_reuse() {
     assert!(err.contains("no TLS version is left") && err.contains("TLSv1_3"), "{err}");
 }
 
+/// A TLS 1.2 handshake through the verifier. The `ibex` binary's rustls speaks TLS 1.3
+/// only (no `tls12` feature in the workspace dependency); this crate's test build has
+/// TLS 1.2 through the `tokio-rustls` dev-dependency, so here is where
+/// `ssl-max-ver TLSv1.2` and `ServerVerifier::verify_tls12_signature` are exercised.
+#[test]
+fn a_tls12_handshake_verifies_the_servers_signature() {
+    use ibex_config::TlsVersion;
+    use std::io::{Read as _, Write as _};
+    use std::net::{TcpListener, TcpStream};
+    let ca = make_ca("TLS12 Root");
+    let mut params = CertificateParams::new(vec!["backend.example.com".to_string()]).expect("params");
+    params.distinguished_name.push(DnType::CommonName, "backend.example.com");
+    let key = KeyPair::generate().expect("key");
+    let cert = params.signed_by(&key, &ca.cert, &ca.key).expect("sign");
+    let server_cfg = rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS12])
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![cert.der().clone()],
+            rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(key.serialize_der())),
+        )
+        .expect("server config");
+    let mut f = tempfile::NamedTempFile::new().expect("tmp");
+    f.write_all(ca.cert.pem().as_bytes()).expect("write");
+    let client_cfg = build_backend_client_config(&BackendTlsOptions {
+        ca_file: Some(f.path().to_path_buf()),
+        max_ver: Some(TlsVersion::Tls12),
+        ..Default::default()
+    })
+    .expect("client config");
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let server = std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().expect("accept");
+        let mut conn = rustls::ServerConnection::new(Arc::new(server_cfg)).expect("server conn");
+        let mut tls = rustls::Stream::new(&mut conn, &mut sock);
+        let mut b = [0u8; 4];
+        tls.read_exact(&mut b).expect("read");
+        tls.write_all(b"pong").expect("write");
+        b
+    });
+    let mut sock = TcpStream::connect(addr).expect("connect");
+    let name = ServerName::try_from("backend.example.com".to_string()).expect("name");
+    let mut conn = rustls::ClientConnection::new(client_cfg, name).expect("client conn");
+    let mut tls = rustls::Stream::new(&mut conn, &mut sock);
+    tls.write_all(b"ping").expect("write");
+    let mut b = [0u8; 4];
+    tls.read_exact(&mut b).expect("read");
+    assert_eq!(&b, b"pong");
+    assert_eq!(tls.conn.protocol_version(), Some(rustls::ProtocolVersion::TLSv1_2), "the handshake must have been TLS 1.2");
+    assert_eq!(&server.join().expect("server thread"), b"ping");
+}
+
 #[test]
 fn a_wildcard_needs_a_leftmost_label_long_enough_to_match() {
     assert!(!hostcheck("abc*def.example", "ab.example"));

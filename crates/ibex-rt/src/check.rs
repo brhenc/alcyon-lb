@@ -177,6 +177,9 @@ pub struct ServerCheckState {
     pub xprt: ServerXprt,
     /// The server line's check TLS (`check-ssl`, or `ssl` inherited), `None` for plaintext.
     pub tls: Option<Arc<CheckTls>>,
+    /// The `tcp-check connect` step (after the first) whose connection is being opened:
+    /// while it is set, the socket in `sock` is that step's, not the previous step's.
+    pub tcp_connect_step: Option<usize>,
     pub check_fd: Option<RawFd>,
     pub exp: Tick,
     pub next_check: Tick,
@@ -244,6 +247,7 @@ impl ServerCheckState {
             sock: None,
             xprt: ServerXprt::Plain,
             tls: None,
+            tcp_connect_step: None,
             check_fd: None,
             exp: Tick::ETERNITY,
             next_check: now,
@@ -1650,7 +1654,15 @@ fn progress_tcp_check(
             ResolvedTcpStep::Connect { port, .. } => {
                 let target_addr =
                     SocketAddr::new(check.addr.ip(), port.unwrap_or(check.addr.port()));
-                if let Some(sock) = check.sock.as_ref() {
+                // The socket in hand is this step's own connection only for the first
+                // step (opened by `progress_tcp_steps_start`) or when this step's connect
+                // is the one in flight. Otherwise it is the previous step's, and a
+                // `tcp-check connect` mid-script means a new connection (HAProxy drops
+                // the buffers too: "Always release input and output buffer when a new
+                // connect is evaluated"). Treating the old socket as the new connection
+                // made the next `expect` read the old server's end of stream.
+                let this_steps_socket = step_idx == 0 || check.tcp_connect_step == Some(step_idx);
+                if let (true, Some(sock)) = (this_steps_socket, check.sock.as_ref()) {
                     let raw_fd = sock.as_raw_fd();
                     let ready = fdtab.ready(raw_fd);
                     if !ready.writable && !ready.readable {
@@ -1664,6 +1676,7 @@ fn progress_tcp_check(
                     fdtab.clear_ready(raw_fd, true, true);
                     let connect_res = raw::check_connect_error(sock.as_fd());
                     if let Ok(None) = connect_res {
+                        check.tcp_connect_step = None;
                         step_idx += 1;
                         continue;
                     }
@@ -1690,10 +1703,13 @@ fn progress_tcp_check(
                 let timeout_ms =
                     u32::try_from(check.config.timeout.as_millis()).unwrap_or(u32::MAX);
                 check.exp = now.add(timeout_ms);
+                recv_buf.clear();
+                send_offset = 0;
 
                 if let Ok((sock, immediate)) = connect_check(check, Some(target_addr)) {
                         let raw_fd = sock.as_raw_fd();
                         check.check_fd = Some(raw_fd);
+                        check.tcp_connect_step = Some(step_idx);
                         fdtab.insert(
                             raw_fd,
                             FdState::Conn {
@@ -1899,12 +1915,14 @@ fn progress_tcp_check(
     } else {
         "L7OK"
     };
-    let desc = if code == "L4OK" {
-        "Layer4 check passed"
+    // HAProxy's tcp-check success carries `info: "(tcp-check)"` (measured: a two-connect
+    // script logs `Layer7 check passed, code: 0, info: "(tcp-check)"`).
+    let (desc, info) = if code == "L4OK" {
+        ("Layer4 check passed", None)
     } else {
-        "Layer7 check passed"
+        ("Layer7 check passed", Some("(tcp-check)".to_string()))
     };
-    let event = check.on_success_full(code, desc, duration, None, None);
+    let event = check.on_success_full(code, desc, duration, None, info);
     let next = check.schedule_next(now);
     check.next_check = next;
     Ok(CheckStep {
@@ -1914,6 +1932,25 @@ fn progress_tcp_check(
 }
 
 /// Cleans up any open sockets or poller registrations for a check in progress.
+/// `cut_crlf`: the bytes before the first CR or LF.
+fn cut_crlf(b: &[u8]) -> &[u8] {
+    let end = b.iter().position(|&c| c == b'\r' || c == b'\n').unwrap_or(b.len());
+    &b[..end]
+}
+
+/// `chunk_asciiencode` (src/chunk.c): printable ASCII as is, every other byte as `<XX>`.
+fn ascii_encode(b: &[u8]) -> String {
+    let mut out = String::with_capacity(b.len());
+    for &c in b {
+        if (0x20..0x7f).contains(&c) {
+            out.push(char::from(c));
+        } else {
+            let _ = write!(out, "<{c:02X}>");
+        }
+    }
+    out
+}
+
 /// Connects a check to `addr` (the server's unless given) and, when the server line asks
 /// for it (`check-ssl`, or `ssl` inherited), puts the check's TLS over the socket. This
 /// is where `check-ssl` reaches the check (T113). A TLS check never takes the immediate
@@ -2005,6 +2042,7 @@ pub fn cleanup_check_socket(check: &mut ServerCheckState, fdtab: &mut FdTab, pol
         let _ = poller.delete(sock.as_fd());
     }
     check.xprt = ServerXprt::Plain;
+    check.tcp_connect_step = None;
     if let Some(raw_fd) = check.check_fd.take() {
         fdtab.remove(raw_fd);
     }
@@ -2111,10 +2149,11 @@ fn progress_redis_check(
         }
 
         cleanup_check_socket(check, fdtab, poller);
-        let resp_str = String::from_utf8_lossy(&recv_buf)
-            .trim_end_matches(&['\r', '\n'][..])
-            .to_string();
-        let event = if resp_str.starts_with("+PONG") {
+        // HAProxy's rule: `expect string +PONG error-status L7STS on-error
+        // %[res.payload(0,0),cut_crlf]` (src/tcpcheck.c): anything but a PONG is "Layer7
+        // wrong status", with the reply up to its first CR/LF, non-printables as `<XX>`.
+        // Measured: an LDAP answer gives `info: "0<0C><02><01><01>a<07>"`.
+        let event = if recv_buf.starts_with(b"+PONG") {
             check.on_success_full(
                 "L7OK",
                 "Layer7 check passed",
@@ -2122,21 +2161,13 @@ fn progress_redis_check(
                 None,
                 Some("Redis server is ok".to_string()),
             )
-        } else if resp_str.starts_with('-') {
+        } else {
             check.on_failure_full(
                 "L7STS",
                 "Layer7 wrong status",
                 duration,
                 None,
-                Some(resp_str),
-            )
-        } else {
-            check.on_failure_full(
-                "L7RSP",
-                "Layer7 invalid response",
-                duration,
-                None,
-                Some(resp_str),
+                Some(ascii_encode(cut_crlf(&recv_buf))),
             )
         };
         let next = check.schedule_next(now);

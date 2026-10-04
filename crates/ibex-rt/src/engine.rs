@@ -4984,7 +4984,7 @@ impl EngineDispatcher<'_> {
                 }
                 entry.sess.srv_xprt = crate::xprt::ServerXprt::Plain;
                 entry.sess.ending = None;
-                let be_idx = Self::resolve_backend(entry, self.proxies);
+                let be_idx = Self::resolve_backend(entry, self.proxies).unwrap_or(entry.proxy_idx);
                 self.proxies[be_idx].stats[worker_id()].failed_conn.fetch_add(1, Ordering::Relaxed);
                 if entry.sess.server_failed() {
                     retry_server_connect(entry, self.proxies, self.fdtab, self.poller, now);
