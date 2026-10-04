@@ -654,19 +654,22 @@ impl std::fmt::Debug for ServerXprt {
 /// The recorded SNI is the name that goes on the wire: a DNS name when the config sends
 /// SNI, nothing for an IP address (rustls never sends one) or when `enable_sni` is off.
 ///
-/// # Errors
-/// Propagates rustls client session setup failure.
+/// rustls refuses a session only for a client config that asks for something this
+/// proxy never configures (Encrypted Client Hello), so setup has no failure of its own
+/// to report here: a session that did not come up is a transport already marked failed,
+/// and the first handshake step reports it as every other handshake failure -- a connect
+/// failure that `HAProxy` retries and answers 503 `SC` for.
 pub fn connect_tls(
     fd: &impl AsRawFd,
     config: std::sync::Arc<rustls::ClientConfig>,
     server_name: rustls::pki_types::ServerName<'static>,
-) -> io::Result<ServerXprt> {
+) -> ServerXprt {
     let sni_str = match &server_name {
         rustls::pki_types::ServerName::DnsName(dns) if config.enable_sni => Some(dns.as_ref().to_string()),
         _ => None,
     };
-    let conn = rustls::ClientConnection::new(config, server_name).map_err(io::Error::other)?;
-    Ok(ServerXprt::Tls(Box::new(TlsConn::new(
-        RustlsContext::new_client(fd.as_raw_fd(), conn, sni_str),
-    ))))
+    let conn = rustls::ClientConnection::new(config, server_name).ok();
+    let mut tls = TlsConn::new(RustlsContext::new_client_session(fd.as_raw_fd(), conn, sni_str));
+    tls.failed = tls.ctx.session.is_none();
+    ServerXprt::Tls(Box::new(tls))
 }

@@ -554,7 +554,8 @@ fn check_shapes_over_tls() {
     let srv2 = serve(Some(server_config(&p.cert, &p.key, None, &[])));
     let plain = serve(None);
     let silent = serve_silent();
-    let fronts: Vec<SocketAddr> = (0..4).map(|_| common::reserve_addr()).collect();
+    let fronts: Vec<SocketAddr> = (0..7).map(|_| common::reserve_addr()).collect();
+    let ca = &p.ca_pem;
     // The check results, as `option log-health-checks` reports them (HAProxy's words,
     // measured: "Layer6 check passed", "Layer6 invalid response, info: \"SSL handshake
     // failure\"", "Layer6 timeout").
@@ -564,9 +565,16 @@ fn check_shapes_over_tls() {
     let chk = "inter 100ms fall 1 rise 1";
     let cfg = config(&[
         (fronts[0], &format!("{log}  server s {} ssl verify none check {chk}", srv.addr)),
-        (fronts[1], &format!("  option tcp-check\n  tcp-check connect\n  tcp-check send \"GET / HTTP/1.1\\r\\nHost: tc.example\\r\\n\\r\\n\"\n  tcp-check expect string 200\n  server s {} ssl verify none check {chk}", srv2.addr)),
+        (fronts[1], &format!("{log}  option tcp-check\n  tcp-check connect\n  tcp-check send \"GET / HTTP/1.1\\r\\nHost: tc.example\\r\\n\\r\\n\"\n  tcp-check expect string 200\n  server s {} ssl verify none check {chk}", srv2.addr)),
         (fronts[2], &format!("{log}  option httpchk GET /\n  server s {} ssl verify none check {chk}", plain.addr)),
         (fronts[3], &format!("{log}  timeout check 150ms\n  server s {} ssl verify none check {chk}", silent)),
+        // A protocol check over TLS drives the handshake from its own connect state.
+        (fronts[4], &format!("{log}  option redis-check\n  server s {} ssl verify none check {chk}", plain.addr)),
+        // A bare tcp-check connect is a layer-4 pass.
+        (fronts[6], &format!("{log}  option tcp-check\n  tcp-check connect\n  server s {} check {chk}", plain.addr)),
+        // A certificate the name check refuses is reported apart (HAProxy's
+        // `conn_err_code_str`, measured on 3.5-dev8).
+        (fronts[5], &format!("{log}  server s {} ssl verify required ca-file {ca} verifyhost other.example.com no-sni-auto check {chk}", srv.addr)),
     ]);
     let _ibex = start(&p.dir, &cfg, &fronts);
 
@@ -582,7 +590,13 @@ fn check_shapes_over_tls() {
     let deadline = Instant::now() + Duration::from_secs(4);
     let mut buf = [0u8; 2048];
     let want = |lines: &[String]| {
-        ["Layer6 invalid response, info: \"SSL handshake failure\"", "Layer6 timeout"]
+        [
+            "Layer6 invalid response, info: \"SSL handshake failure\"",
+            "Layer6 timeout",
+            "Layer4 check passed, info: \"(tcp-check)\"",
+            "Layer7 check passed, code: 0, info: \"(tcp-check)\"",
+            "Layer6 invalid response, info: \"Server presented an SSL certificate different from the configured one\"",
+        ]
             .iter()
             .all(|w| lines.iter().any(|l| l.contains(w)))
     };

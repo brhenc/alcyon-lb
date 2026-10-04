@@ -132,8 +132,7 @@ fn backend_tls_handshake_completes_and_data_flows_both_ways() {
 
     let (client_cfg, _ca_file) = backend_client_config_with_ca(&pem);
     let name = ServerName::try_from("localhost").expect("name");
-    let mut xprt = ibex_rt::connect_tls(&client_sock, client_cfg, name)
-        .expect("connect_tls");
+    let mut xprt = ibex_rt::connect_tls(&client_sock, client_cfg, name);
 
     let fd = client_sock.as_fd();
     let mut buf = [0u8; 256];
@@ -205,8 +204,7 @@ fn backend_tls_verify_required_refuses_untrusted_certificate() {
     // Default verify required without custom ca_file uses system roots -> untrusted self-signed cert is rejected
     let client_cfg = backend_client_config_system_ca();
     let name = ServerName::try_from("localhost").expect("name");
-    let mut xprt = ibex_rt::connect_tls(&client_sock, client_cfg, name)
-        .expect("connect_tls");
+    let mut xprt = ibex_rt::connect_tls(&client_sock, client_cfg, name);
 
     let fd = client_sock.as_fd();
     let mut buf = [0u8; 256];
@@ -241,8 +239,7 @@ fn backend_tls_verify_none_accepts_self_signed_certificate() {
 
     let client_cfg = backend_client_config_verify_none();
     let name = ServerName::try_from("localhost").expect("name");
-    let mut xprt = ibex_rt::connect_tls(&client_sock, client_cfg, name)
-        .expect("connect_tls");
+    let mut xprt = ibex_rt::connect_tls(&client_sock, client_cfg, name);
 
     let fd = client_sock.as_fd();
     let mut buf = [0u8; 256];
@@ -274,8 +271,7 @@ fn backend_tls_sni_mismatch_is_rejected() {
     // Client trusts the CA/cert, but connects with SNI "wrong.example.com"
     let (client_cfg, _ca_file) = backend_client_config_with_ca(&pem);
     let name = ServerName::try_from("wrong.example.com").expect("name");
-    let mut xprt = ibex_rt::connect_tls(&client_sock, client_cfg, name)
-        .expect("connect_tls");
+    let mut xprt = ibex_rt::connect_tls(&client_sock, client_cfg, name);
 
     let fd = client_sock.as_fd();
     let mut buf = [0u8; 256];
@@ -312,8 +308,7 @@ fn tcp_session_end_to_end_with_tls_backend() {
 
     let (client_cfg, _ca_file) = backend_client_config_with_ca(&pem);
     let name = ServerName::try_from("localhost").expect("name");
-    let srv_xprt = ibex_rt::connect_tls(&srv_local, client_cfg, name)
-        .expect("connect_tls");
+    let srv_xprt = ibex_rt::connect_tls(&srv_local, client_cfg, name);
 
     let mut sess = TcpSession::new(
         cli_local.into(),

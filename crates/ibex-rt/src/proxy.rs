@@ -730,13 +730,8 @@ impl TcpSession {
                 let (info, is_v2) = (hdr.to_owned(), hdr.version == ibex_proto::ProxyVersion::V2);
                 // The header is in `peek` already; this read only takes it off the socket.
                 let mut sink = vec![0u8; consumed];
-                let mut taken = 0;
-                while taken < consumed {
-                    match raw::recv(fd, &mut sink[taken..])? {
-                        Io::Done(k) if k > 0 => taken += k,
-                        _ => break,
-                    }
-                }
+                // What the peek showed is on the socket, so one read takes all of it.
+                let taken = if let Io::Done(k) = raw::recv(fd, &mut sink)? { k } else { 0 };
                 if taken != consumed || !self.apply_proxy_header(info, is_v2) {
                     self.cli_state = ScState::Error;
                     self.ending = Some(Ending::Error);

@@ -125,11 +125,18 @@ impl RustlsContext {
     /// Creates a new client-side TLS context.
     #[must_use]
     pub fn new_client(fd: RawFd, conn: ClientConnection, sni: Option<String>) -> Self {
+        Self::new_client_session(fd, Some(conn), sni)
+    }
+
+    /// As [`Self::new_client`], for a session that may not have come up: `None` leaves a
+    /// context with no session, which the caller marks failed.
+    #[must_use]
+    pub fn new_client_session(fd: RawFd, conn: Option<ClientConnection>, sni: Option<String>) -> Self {
         Self {
             fd,
             is_server: false,
             handshake_done: false,
-            session: Some(TlsSession::Client(conn)),
+            session: conn.map(TlsSession::Client),
             client_sni: sni,
             tls_info: RustlsTlsInfo {
                 peer_verify: VerifyResult::NotRequested,

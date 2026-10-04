@@ -101,40 +101,35 @@ fn attach_server_to(
     s_idx: Option<usize>,
     srv_fd: OwnedFd,
     now: Tick,
-) -> bool {
+) {
     let tls = s_idx.and_then(|i| proxies.get(be_idx).and_then(|p| p.server_tls.get(i)).and_then(Option::as_ref));
     let Some(tls) = tls else {
         sess.attach_server(srv_fd, now);
-        return true;
+        return;
     };
     let (fe, be) = (&proxies[fe_idx], &proxies[be_idx]);
     let stick = StickView::new(proxies, &sess.tracked_sc);
     let sni = tls.sni(sample_registry(), &stream_sample_ctx(sess, fe, be, &ProxiesView(proxies), &stick));
     let ip = s_idx.and_then(|i| be.servers.get(i)).map_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), SocketAddr::ip);
-    match tls.connect(&srv_fd, sni.as_deref(), ip) {
-        Ok(mut xprt) => {
-            // A PROXY header (`send-proxy*`) was put at the head of the request; to a TLS
-            // server it goes on the wire in plaintext, before the ClientHello, as
-            // HAProxy's xprt_handshake layer sends it and the peer's `accept-proxy`
-            // reads it. So it leaves the stream for the transport's prefix.
-            let n = sess.send_proxy_header.len();
-            if let (true, crate::xprt::ServerXprt::Tls(t)) = (
-                sess.send_proxy_prepended && n > 0 && sess.req.readable().get(..n) == Some(&sess.send_proxy_header[..]),
-                &mut xprt,
-            ) {
-                t.set_plain_prefix(sess.req.readable()[..n].to_vec());
-                sess.req.consume(n);
-                if let Some(t) = sess.txn.as_mut() {
-                    if let MsgState::Head { left, body } = t.req {
-                        t.req = MsgState::Head { left: left.saturating_sub(n), body };
-                    }
-                }
+    let mut xprt = tls.connect(&srv_fd, sni.as_deref(), ip);
+    // A PROXY header (`send-proxy*`) was put at the head of the request; to a TLS
+    // server it goes on the wire in plaintext, before the ClientHello, as
+    // HAProxy's xprt_handshake layer sends it and the peer's `accept-proxy`
+    // reads it. So it leaves the stream for the transport's prefix.
+    let n = sess.send_proxy_header.len();
+    if let (true, crate::xprt::ServerXprt::Tls(t)) = (
+        sess.send_proxy_prepended && n > 0 && sess.req.readable().get(..n) == Some(&sess.send_proxy_header[..]),
+        &mut xprt,
+    ) {
+        t.set_plain_prefix(sess.req.readable()[..n].to_vec());
+        sess.req.consume(n);
+        sess.txn.iter_mut().for_each(|t| {
+            if let MsgState::Head { left, body } = t.req {
+                t.req = MsgState::Head { left: left.saturating_sub(n), body };
             }
-            sess.attach_server_with_xprt(srv_fd, xprt, now);
-            true
-        }
-        Err(_) => false,
+        });
     }
+    sess.attach_server_with_xprt(srv_fd, xprt, now);
 }
 
 /// The SNI a request on `sess` would send to `proxies[be_idx].servers[s_idx]`, for the
@@ -1744,12 +1739,10 @@ impl Engine {
     crate::rule_exprs::validate_config(config)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     let mut proxies = Vec::new();
-    for listen in &config.listens {
-        if !listen.disabled {
-            let mut p = init_proxy_from_listen(proxies.len(), listen, nbthread);
-            attach_server_tls(&mut p, &listen.servers, listen.mode == Mode::Http, &listen.name)?;
-            proxies.push(p);
-        }
+    for listen in config.listens.iter().filter(|l| !l.disabled) {
+        let mut p = init_proxy_from_listen(proxies.len(), listen, nbthread);
+        attach_server_tls(&mut p, &listen.servers, listen.mode == Mode::Http, &listen.name)?;
+        proxies.push(p);
     }
     for backend in &config.backends {
         if !backend.disabled {
@@ -3879,13 +3872,10 @@ fn init_client_session(
             if let Ok((srv_fd, immediate)) = raw::connect(connect_addr(target, sess.server_addr)) {
                 let sfd = srv_fd.as_raw_fd();
                 let s_idx = proxy.servers.iter().position(|&s| s == target);
-                if attach_server_to(&mut sess, proxies, proxy_idx, proxy_idx, s_idx, srv_fd, now) {
-                    srv_raw_fd = Some(sfd);
-                    if immediate {
-                        sess.server_connected(now);
-                    }
-                } else {
-                    sess.srv_state = ScState::Error;
+                attach_server_to(&mut sess, proxies, proxy_idx, proxy_idx, s_idx, srv_fd, now);
+                srv_raw_fd = Some(sfd);
+                if immediate {
+                    sess.server_connected(now);
                 }
             } else {
                 proxy.stats[worker_id()].failed_conn.fetch_add(1, Ordering::Relaxed);
@@ -4283,13 +4273,7 @@ fn retry_server_connect(
     entry.target_addr = Some(target_addr);
     if let Ok((srv_fd, immediate)) = raw::connect(connect_addr(target_addr, entry.sess.server_addr)) {
         let sfd = srv_fd.as_raw_fd();
-        if !attach_server_to(&mut entry.sess, proxies, entry.proxy_idx, be_idx, s_idx, srv_fd, now) {
-            entry.sess.srv_state = ScState::Error;
-            if entry.sess.mode == Mode::Http {
-                reply_error(entry, proxies, 503);
-            }
-            return;
-        }
+        attach_server_to(&mut entry.sess, proxies, entry.proxy_idx, be_idx, s_idx, srv_fd, now);
         entry.srv_raw_fd = Some(sfd);
         if immediate {
             entry.sess.server_connected(now);
@@ -6658,11 +6642,7 @@ impl EngineDispatcher<'_> {
             }
         } else if let Ok((srv_fd, immediate)) = raw::connect(connect_addr(target_addr, entry.sess.server_addr)) {
             let sfd = srv_fd.as_raw_fd();
-            if !attach_server_to(&mut entry.sess, proxies, entry.proxy_idx, be_idx, s_idx, srv_fd, now) {
-                proxies[be_idx].stats[worker_id()].failed_conn.fetch_add(1, Ordering::Relaxed);
-                retry_server_connect(entry, proxies, fdtab, poller, now);
-                return None;
-            }
+            attach_server_to(&mut entry.sess, proxies, entry.proxy_idx, be_idx, s_idx, srv_fd, now);
             entry.srv_raw_fd = Some(sfd);
             if immediate {
                 entry.sess.server_connected(now);
@@ -6787,10 +6767,7 @@ impl EngineDispatcher<'_> {
         entry.target_addr = Some(target_addr);
         if let Ok((srv_fd, immediate)) = raw::connect(connect_addr(target_addr, entry.sess.server_addr)) {
             let sfd = srv_fd.as_raw_fd();
-            if !attach_server_to(&mut entry.sess, proxies, entry.proxy_idx, be_idx, s_idx, srv_fd, now) {
-                entry.sess.srv_state = ScState::Error;
-                return;
-            }
+            attach_server_to(&mut entry.sess, proxies, entry.proxy_idx, be_idx, s_idx, srv_fd, now);
             entry.srv_raw_fd = Some(sfd);
             if immediate {
                 entry.sess.server_connected(now);

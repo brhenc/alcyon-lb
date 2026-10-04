@@ -64,7 +64,7 @@ impl Configs {
 
     /// Opens the TLS transport over the connected `fd`: `sni` is sent and checked when
     /// given, else `verifyhost` is checked without being sent, else no name is checked.
-    fn connect(&self, fd: &impl AsRawFd, sni: Option<&str>, server_ip: IpAddr) -> io::Result<ServerXprt> {
+    fn connect(&self, fd: &impl AsRawFd, sni: Option<&str>, server_ip: IpAddr) -> ServerXprt {
         let dns = |name: &str| ServerName::try_from(name.to_string()).ok().filter(|n| matches!(n, ServerName::DnsName(_)));
         if let Some(name) = sni.filter(|s| !s.is_empty()).and_then(dns) {
             return xprt::connect_tls(fd, Arc::clone(&self.with_sni), name);
@@ -128,10 +128,7 @@ impl ServerTls {
     }
 
     /// Opens the TLS transport over the connected `fd`.
-    ///
-    /// # Errors
-    /// rustls could not set the session up.
-    pub fn connect(&self, fd: &impl AsRawFd, sni: Option<&str>, server_ip: IpAddr) -> io::Result<ServerXprt> {
+    pub fn connect(&self, fd: &impl AsRawFd, sni: Option<&str>, server_ip: IpAddr) -> ServerXprt {
         self.configs.connect(fd, sni, server_ip)
     }
 }
@@ -166,10 +163,7 @@ impl CheckTls {
 
     /// Opens the TLS transport of one check over the connected `fd`. `host` is the Host
     /// header the check sends, if any, with its port stripped as `HAProxy` strips it.
-    ///
-    /// # Errors
-    /// rustls could not set the session up.
-    pub fn connect(&self, fd: &impl AsRawFd, host: Option<&str>, server_ip: IpAddr) -> io::Result<ServerXprt> {
+    pub fn connect(&self, fd: &impl AsRawFd, host: Option<&str>, server_ip: IpAddr) -> ServerXprt {
         let auto = host.filter(|_| self.auto_sni).map(strip_port);
         let sni = self.sni.as_deref().or(auto);
         self.configs.connect(fd, sni, server_ip)

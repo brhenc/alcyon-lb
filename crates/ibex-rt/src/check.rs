@@ -712,9 +712,9 @@ pub fn step_check(
         let timed_out = check.exp.is_expired(now);
 
         if timed_out {
-            let (code, desc, info) = if check.xprt.is_tls() && !check.xprt.is_ready() {
-                ("L6TOUT", "Layer6 timeout", None)
-            } else { match &check.sub_state {
+            let handshaking = check.xprt.is_tls() && !check.xprt.is_ready();
+            let (code, desc, info) = match &check.sub_state {
+                _ if handshaking => ("L6TOUT", "Layer6 timeout", None),
                 CheckSubState::TcpConnecting
                 | CheckSubState::HttpConnecting { .. }
                 | CheckSubState::ProtoConnecting { .. }
@@ -732,7 +732,7 @@ pub fn step_check(
                     "Layer7 timeout",
                     Some(format!("at step {} of tcp-check", step_idx + 1)),
                 ),
-            } };
+            };
 
             cleanup_check_socket(check, fdtab, poller);
             let event = check.on_failure_full(code, desc, duration, None, info);
@@ -1917,12 +1917,12 @@ fn progress_tcp_check(
     };
     // HAProxy's tcp-check success carries `info: "(tcp-check)"` (measured: a two-connect
     // script logs `Layer7 check passed, code: 0, info: "(tcp-check)"`).
-    let (desc, info) = if code == "L4OK" {
-        ("Layer4 check passed", None)
+    let (desc, http_code, info) = if code == "L4OK" {
+        ("Layer4 check passed", None, Some("(tcp-check)".to_string()))
     } else {
-        ("Layer7 check passed", Some("(tcp-check)".to_string()))
+        ("Layer7 check passed", Some(0), Some("(tcp-check)".to_string()))
     };
-    let event = check.on_success_full(code, desc, duration, None, info);
+    let event = check.on_success_full(code, desc, duration, http_code, info);
     let next = check.schedule_next(now);
     check.next_check = next;
     Ok(CheckStep {
@@ -1963,7 +1963,7 @@ fn connect_check(check: &mut ServerCheckState, addr: Option<SocketAddr>) -> io::
         return Ok((sock, immediate));
     };
     let host = check_host(check);
-    check.xprt = tls.connect(&sock, host.as_deref(), addr.ip())?;
+    check.xprt = tls.connect(&sock, host.as_deref(), addr.ip());
     Ok((sock, false))
 }
 
@@ -1993,15 +1993,17 @@ fn drive_check_handshake(check: &mut ServerCheckState, fdtab: &mut FdTab, poller
     if !check.xprt.is_tls() || check.xprt.is_ready() {
         return Handshake::Ready;
     }
-    let Some(sock) = check.sock.as_ref() else {
-        return Handshake::Failed("SSL handshake failure".to_string());
-    };
-    match check.xprt.handshake(sock.as_fd()) {
+    // A check past its connect always has its socket; a missing one reads as a failed
+    // handshake, through the arm below.
+    let step = check.sock.as_ref().map_or_else(|| Err(io::ErrorKind::NotConnected.into()), |s| check.xprt.handshake(s.as_fd()));
+    match step {
         Ok(true) => Handshake::Ready,
         Ok(false) => {
             let interest = Interest { readable: true, writable: check.xprt.wants_write() };
             fdtab.set_interest(raw_fd, interest);
-            let _ = poller.modify(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), interest.readable, interest.writable);
+            if let Some(sock) = check.sock.as_ref() {
+                let _ = poller.modify(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), interest.readable, interest.writable);
+            }
             Handshake::Pending
         }
         Err(e) => {

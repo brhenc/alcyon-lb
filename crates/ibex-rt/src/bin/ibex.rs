@@ -663,13 +663,6 @@ fn main() {
             eprintln!("Configuration error: {e}");
             process::exit(1);
         }
-        // What `Engine::build_shared_state` refuses at start -- a rule, log-format or
-        // server `sni` expression naming a fetch or converter the registry lacks -- is
-        // refused here too, so `-c` and the start agree (T113: `sni bogus(` said valid).
-        if let Err(e) = ibex_rt::rule_exprs::validate_config(&config) {
-            eprintln!("Configuration error: {e}");
-            process::exit(1);
-        }
         if !opts.quiet {
             if opts.verbose {
                 println!("Configuration file(s) are valid.");
