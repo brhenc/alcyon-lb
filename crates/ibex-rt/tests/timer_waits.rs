@@ -81,6 +81,48 @@ fn timed(fe: SocketAddr, req: &str) -> (Duration, String) {
 
 const GET: &str = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
 
+/// A server that answers one request per connection and closes.
+fn closing_server() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    thread::spawn(move || {
+        for mut c in listener.incoming().flatten() {
+            thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                if c.read(&mut buf).is_ok_and(|n| n > 0) {
+                    c.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").ok();
+                }
+            });
+        }
+    });
+    addr
+}
+
+#[test]
+fn a_server_that_closed_behind_its_response_does_not_cut_the_wait_short() {
+    // HAProxy: `tcp-response inspect-delay 300ms`, the server closing right after its
+    // response: `accept if WAIT_END` -- the client has the response at +0.30 s;
+    // `reject if WAIT_END` -- the client gets a close, no data, at +0.30 s (a 502 is not
+    // sent behind a rejected response).
+    for (action, rejected) in [("accept", false), ("reject", true)] {
+        let srv = closing_server();
+        let cfg = format!(
+            "defaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n\
+             frontend fe\n  bind {{fe}}\n  default_backend be\n\
+             backend be\n  tcp-response inspect-delay 300ms\n  tcp-response content {action} if WAIT_END\n  server s {{srv}}\n"
+        );
+        let (_ibex, fe) = start(&cfg, srv);
+        let (took, resp) = timed(fe, GET);
+        if rejected {
+            assert_eq!(resp, "", "{action}: {resp:?}");
+        } else {
+            assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "{action}: {resp:?}");
+        }
+        assert!(took >= Duration::from_millis(280), "{action}: answered after {took:?}");
+        assert!(took < Duration::from_millis(3000), "{action}: answered after {took:?}");
+    }
+}
+
 /// `timeout http-request 500ms` over `timeout client 5s`.
 fn http_request_cfg() -> &'static str {
     "defaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n  timeout http-request 500ms\n\

@@ -5018,7 +5018,9 @@ impl EngineDispatcher<'_> {
         let Some(txn) = entry.sess.txn.as_mut() else {
             return;
         };
-        if !(srv_eof || srv_err) || !txn.req_rules_done || txn.local || txn.rsp.is_done() {
+        // A response held by its rules (`WAIT_END`, `wait-for-body`) is here, and one they
+        // rejected is not owed; the server closing behind either changes nothing.
+        if !(srv_eof || srv_err) || !txn.req_rules_done || txn.local || txn.rsp.is_done() || txn.rsp_wait.is_some() || txn.aborted {
             return;
         }
         match txn.rsp {
@@ -5671,7 +5673,9 @@ impl EngineDispatcher<'_> {
             let inspect_exp = inspect_wait.map(|w| w.deadline).or_else(|| {
                 proxies[be_idx].tcp_res_inspect_delay.map(|d| fresh_tick(now).add(u32::try_from(d.as_millis()).unwrap_or(u32::MAX)))
             });
-            let inspect_final = srv_ended || rep_full || srv_timed_out || inspect_exp.is_none_or(|exp| exp.is_expired(fresh_tick(now)));
+            // A server that closed after its response does not end the wait: measured, the
+            // response still waits for the whole delay.
+            let inspect_final = rep_full || srv_timed_out || inspect_exp.is_none_or(|exp| exp.is_expired(fresh_tick(now)));
             for rule in proxies[be_idx].tcp_res_content_rules.iter().filter(|_| resume.is_none()) {
                 let matches = match &rule.cond {
                     None => true,
