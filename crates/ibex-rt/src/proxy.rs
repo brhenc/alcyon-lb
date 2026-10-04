@@ -2149,7 +2149,10 @@ pub fn combine_condition(
 ) -> AclEvalResult {
     let mut any_missing = false;
     let mut passed = false;
-    for suite in cond.suites() {
+    // An alternative with no term in it (`if` and nothing, `if !`, a trailing `||`) is not
+    // one: `HAProxy` builds no suite for it, so `if` is false and `unless` true when none
+    // is left (measured: `http-request deny if` lets the request through).
+    for suite in cond.suites().filter(|s| !s.is_empty()) {
         let mut suite_res = AclEvalResult::Matched;
         for t in suite {
             match term(t) {
