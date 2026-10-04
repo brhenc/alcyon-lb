@@ -462,7 +462,7 @@ fn the_logged_request_line_is_the_normalised_one() {
         }
     }
     assert!(
-        seen.first().is_some_and(|l| l.ends_with("uri: GET http://hostname/log HTTP/1.1; host: {hostname}")),
+        seen.first().is_some_and(|l| l.trim_end_matches('\n').ends_with("uri: GET http://hostname/log HTTP/1.1; host: {hostname}")),
         "logged: {seen:?}"
     );
 }

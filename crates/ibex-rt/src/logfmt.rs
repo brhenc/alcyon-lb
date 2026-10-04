@@ -35,6 +35,9 @@ pub struct LogData<'a> {
     pub frontend: &'a str,
     /// The frontend accepted over TLS (`%ft` appends `~`).
     pub frontend_ssl: bool,
+    /// The client connection's TLS cipher and protocol (`%sslc`, `%sslv`).
+    pub ssl_cipher: Option<&'a str>,
+    pub ssl_version: Option<&'a str>,
     /// The backend, or the frontend when none was chosen.
     pub backend: &'a str,
     /// HTTP-mode backend (`%Td` measures from the response).
@@ -88,6 +91,8 @@ impl Default for LogData<'_> {
             server_addr: None,
             frontend: "",
             frontend_ssl: false,
+            ssl_cipher: None,
+            ssl_version: None,
             backend: "",
             backend_http: false,
             server: None,
@@ -126,6 +131,8 @@ impl Default for LogData<'_> {
 
 /// `HAProxy`'s `option httplog` format (`default_http_log_format`).
 pub const DEFAULT_HTTP_LOG_FORMAT: &str = "%ci:%cp [%tr] %ft %b/%s %TR/%Tw/%Tc/%Tr/%Ta %ST %B %CC %CS %tsc %ac/%fc/%bc/%sc/%rc %sq/%bq %hr %hs %{+Q}r";
+/// `option httpslog` (`default_https_log_format`).
+pub const DEFAULT_HTTPS_LOG_FORMAT: &str = "%ci:%cp [%tr] %ft %b/%s %TR/%Tw/%Tc/%Tr/%Ta %ST %B %CC %CS %tsc %ac/%fc/%bc/%sc/%rc %sq/%bq %hr %hs %{+Q}r %[fc_err]/%[ssl_fc_err,hex]/%[ssl_c_err]/%[ssl_c_ca_err]/%[ssl_fc_is_resumed] %[ssl_fc_sni]/%sslv/%sslc";
 /// `option tcplog` (`default_tcp_log_format`).
 pub const DEFAULT_TCP_LOG_FORMAT: &str = "%ci:%cp [%t] %ft %b/%s %Tw/%Tc/%Tt %B %ts %ac/%fc/%bc/%sc/%rc %sq/%bq";
 /// `option httplog clf` (`clf_http_log_format`).
@@ -143,6 +150,8 @@ pub fn format_string(spec: &ibex_config::LogFormatSpec, mode_http: bool) -> &str
         LogFormatSpec::Custom(s) => s,
         LogFormatSpec::Http { clf: false } if mode_http => DEFAULT_HTTP_LOG_FORMAT,
         LogFormatSpec::Http { clf: true } if mode_http => CLF_HTTP_LOG_FORMAT,
+        LogFormatSpec::Https if mode_http => DEFAULT_HTTPS_LOG_FORMAT,
+        LogFormatSpec::Https => DEFAULT_TCP_LOG_FORMAT,
         LogFormatSpec::Http { clf } | LogFormatSpec::Tcp { clf } => {
             if *clf {
                 CLF_TCP_LOG_FORMAT
@@ -210,6 +219,8 @@ enum Alias {
     FrontendIp,
     FrontendPort,
     FrontendXprt,
+    SslCipher,
+    SslVersion,
     HdrReq,
     HdrReqList,
     HdrRes,
@@ -299,8 +310,8 @@ const ALIASES: &[(&str, Option<Alias>)] = &[
     ("si", Some(Alias::ServerIp)),
     ("sp", Some(Alias::ServerPort)),
     ("sq", Some(Alias::SrvQueue)),
-    ("sslc", None),
-    ("sslv", None),
+    ("sslc", Some(Alias::SslCipher)),
+    ("sslv", Some(Alias::SslVersion)),
     ("t", Some(Alias::Date)),
     ("tr", Some(Alias::ReqDate)),
     ("trg", Some(Alias::ReqDateGmt)),
@@ -573,6 +584,10 @@ impl LogFormat {
                 }
             }
         }
+        // A format's trailing blanks are not kept: the parser adds a separator only when
+        // something follows it (measured: `log-format "%ci x "` sends no trailing space).
+        let kept = text.trim_end_matches(' ').len();
+        text.truncate(kept);
         flush(&mut text, &mut nodes);
         for n in &mut nodes {
             match n {
@@ -641,11 +656,29 @@ impl LogFormat {
             cbor_put(out, &[0xBF], g.bin);
         }
         let mut first = true;
+        // `last_isspace` of `sess_build_logline`: a blank is written only after something
+        // that is not one, and an empty `%hr`/`%hs`/`%hrl`/`%hsl` leaves it as it was, so
+        // that it takes the blank after it away (measured: `x %hr y` sends `x y`).
+        let mut last_space = true;
         for n in &self.nodes {
             let (o, named, value) = match n {
                 Node::Text(t) => {
                     if !g.encoded() {
-                        out.push_str(t);
+                        if log {
+                            for ch in t.chars() {
+                                if ch == ' ' {
+                                    if !last_space {
+                                        out.push(' ');
+                                        last_space = true;
+                                    }
+                                } else {
+                                    out.push(ch);
+                                    last_space = false;
+                                }
+                            }
+                        } else {
+                            out.push_str(t);
+                        }
                     }
                     continue;
                 }
@@ -697,6 +730,9 @@ impl LogFormat {
                         alias(out, a, o, d);
                     }
                 }
+            }
+            if out.0.len() != value_beg || !matches!(value, Value::Alias(Alias::HdrReq | Alias::HdrRes | Alias::HdrReqList | Alias::HdrResList)) {
+                last_space = false;
             }
             // A value that wrote nothing is `null` in JSON and the null primitive in CBOR, so
             // that the key before it has a value (`sess_build_logline`, `next_fmt`).
@@ -1172,6 +1208,8 @@ fn alias(out: &mut Out, a: Alias, o: Opts, d: &LogData) {
                 out.push(char::from(*c));
             }
         }
+        Alias::SslCipher => text(out, Some(d.ssl_cipher.unwrap_or("-")), o),
+        Alias::SslVersion => text(out, Some(d.ssl_version.unwrap_or("-")), o),
         Alias::HdrReq | Alias::HdrRes => {
             let caps = if a == Alias::HdrReq { d.req_captures } else { d.res_captures };
             if let Some(caps) = caps.filter(|c| !c.is_empty()) {

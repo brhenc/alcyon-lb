@@ -20,7 +20,7 @@
 use crate::check::{ServerCheckState, ServerStatus};
 use crate::engine::{Proxy, SessionArena};
 use crate::fdtab::Interest;
-use crate::stats::{format_show_info, format_show_stat_filtered};
+use crate::stats::format_show_stat_filtered;
 use ibex_sched::task::TaskRef;
 use ibex_sched::Tick;
 use std::fmt::Write as FmtWrite;
@@ -611,13 +611,17 @@ impl CliApplet {
     fn handle_show_info(&mut self, ctx: &AppletContext) {
         let active_conns: u32 = ctx.proxies.iter().map(|p| p.stats.iter().map(|s| s.act_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u32>()).sum();
         let max_conns: u32 = ctx.proxies.iter().map(|p| p.maxconn).sum();
-        let info = format_show_info(
+        let cum_conns: u64 = ctx.proxies.iter().map(|p| p.stats.iter().map(|s| s.cum_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()).sum();
+        let cum_reqs: u64 = ctx.proxies.iter().filter_map(|p| p.ids.tc.get()).map(|c| c.fe.req_tot.load(std::sync::atomic::Ordering::Relaxed)).sum();
+        let info = crate::stats::format_show_info_counts(
             ctx.start_time,
             ctx.pid,
             ctx.total_tasks,
             ctx.run_queue_len,
             active_conns,
             max_conns,
+            cum_conns,
+            cum_reqs,
         );
         self.out_buf.extend_from_slice(info.as_bytes());
         if self.interactive {

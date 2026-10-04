@@ -245,6 +245,8 @@ pub struct SslFacts<'a> {
     pub protocol: Option<&'a str>,
     /// The peer sent a certificate (`ssl_c_used`).
     pub has_crt: bool,
+    /// The handshake resumed an earlier session (`ssl_fc_is_resumed`).
+    pub resumed: bool,
 }
 
 /// One server's live state, as the server fetches read it.
@@ -2115,6 +2117,26 @@ impl Registry {
             name: "ssl_fc_protocol",
             out_type: SampleType::Str,
             func: |ctx, _args| ctx.ssl_fc.protocol.map(|v| Sample::Str(v.to_string())),
+        });
+        // The error fetches the `option httpslog` line reads. `fc_err` is 0 here: Ibex does not
+        // keep the error code of a connection that failed. The `ssl_*` ones have a value on a
+        // TLS connection only, and no certificate error is recorded, so it is 0.
+        self.register_fetch(FetchDesc {
+            name: "fc_err",
+            out_type: SampleType::Sint,
+            func: |_ctx, _args| Some(Sample::Sint(0)),
+        });
+        for name in ["ssl_fc_err", "ssl_c_err", "ssl_c_ca_err"] {
+            self.register_fetch(FetchDesc {
+                name,
+                out_type: SampleType::Sint,
+                func: |ctx, _args| ctx.ssl_fc.used.then_some(Sample::Sint(0)),
+            });
+        }
+        self.register_fetch(FetchDesc {
+            name: "ssl_fc_is_resumed",
+            out_type: SampleType::Bool,
+            func: |ctx, _args| Some(Sample::Bool(ctx.ssl_fc.used && ctx.ssl_fc.resumed)),
         });
         self.register_fetch(FetchDesc {
             name: "ssl_c_used",

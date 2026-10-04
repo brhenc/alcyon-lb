@@ -410,6 +410,13 @@ pub struct ProxyStats {
     pub denied_resp: AtomicU64,
 }
 
+impl Proxy {
+    /// The proxy's transaction counters, made when first needed.
+    pub fn counters(&self) -> &crate::statcnt::ProxyCounters {
+        self.ids.tc.get_or_init(|| Arc::new(crate::statcnt::ProxyCounters::new(self.servers.len())))
+    }
+}
+
 impl ProxyStats {
     pub fn clear(&self) {
         self.cum_conn.store(0, Ordering::Relaxed);
@@ -434,6 +441,9 @@ impl ProxyStats {
 /// What [`Proxy::ids`] holds.
 #[derive(Debug, Clone, Default)]
 pub struct ProxyIdInfo {
+    /// The transaction counters `show stat` prints (T165), made on first use. Here, in the
+    /// box, because `Proxy` is held to its size.
+    pub tc: std::sync::OnceLock<Arc<crate::statcnt::ProxyCounters>>,
     /// The proxy's numeric id (`uuid`): `iid` in `show stat`, `be_id` in `show servers
     /// state`, what `fe_id` and `be_id` read. Numbered in the order the sections were
     /// written, from 2, around the ones that asked for an `id` (`Config::proxy_ids`).
@@ -796,6 +806,11 @@ pub struct SessionEntry {
     pub cli_interest: Interest,
     pub srv_interest: Interest,
     pub actconn_reclaimed: bool,
+    /// The stream's counters were added to `show stat`'s (once per transaction).
+    pub stats_done: bool,
+    /// The `Connect from` line of a frontend with no `log-format` is still to be sent: it goes
+    /// once the connection has its PROXY header and TLS handshake behind it.
+    pub connect_log_due: bool,
     /// Requests the server connection has carried (saturating at 2): from the second it is
     /// kept in the server's safe list (`http-reuse`).
     pub srv_served: u8,
@@ -1377,6 +1392,8 @@ fn session_log_data<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, pid: u3
         frontend: &fe.name,
         // QUIC is TLS, though the relayed stream the engine reads is not (T130).
         frontend_ssl: s.cli_xprt.is_tls() || s.h3,
+        ssl_cipher: s.cli_xprt.ssl_facts().cipher,
+        ssl_version: s.cli_xprt.ssl_facts().protocol,
         backend: &be.name,
         backend_http: be.mode == Mode::Http,
         accept_date: l.date,
@@ -1418,6 +1435,105 @@ fn session_log_data<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, pid: u3
     }
 }
 
+/// Adds a finished stream to the counters `show stat` prints (T165), once. Called where the
+/// stream's log line is made, whether or not it logs: the frontend counts every request it
+/// took (the one it could not parse included), the backend the ones routed to it, and the
+/// server the ones it was given.
+fn account_stream(entry: &mut SessionEntry, proxies: &[Proxy]) {
+    if entry.stats_done {
+        return;
+    }
+    entry.stats_done = true;
+    let http = entry.sess.mode == Mode::Http;
+    let d = stream_log_data(entry, proxies, entry.proxy_idx, 0);
+    let term = d.term_state;
+    let routed = !http || (entry.sess.log.request.is_some() && !matches!(&term, b"PR" | b"LR"));
+    let status = d.status;
+    let (bin, bout) = (d.bytes_in, d.bytes_out);
+    let t_request = d.t_request.max(0);
+    let tw = if d.t_queue >= 0 { d.t_queue - t_request } else { -1 };
+    let tc = if d.t_connect >= 0 { d.t_connect - d.t_queue } else { -1 };
+    let tr = if d.t_data >= 0 { d.t_data - d.t_connect } else { -1 };
+    let ta = d.t_close;
+    let retries = u64::try_from(d.retries.max(0)).unwrap_or(0);
+    let answered = entry.sess.log.data.is_some();
+    let srv_idx = entry.target_server_idx.filter(|_| routed);
+    let be_idx = entry.backend_idx;
+    let srv_be = entry.srv_backend_idx;
+
+    let fe = &proxies[entry.proxy_idx].counters().fe;
+    if http {
+        fe.req_tot.fetch_add(1, Ordering::Relaxed);
+        fe.count_status(status);
+        if entry.sess.log.request.is_none() {
+            fe.ereq.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    fe.bin.fetch_add(bin, Ordering::Relaxed);
+    fe.bout.fetch_add(bout, Ordering::Relaxed);
+
+    if !routed {
+        return;
+    }
+    let one = |c: &crate::statcnt::TxnCounters, server: bool| {
+        c.stot.fetch_add(if server { 1 + retries } else { 1 }, Ordering::Relaxed);
+        c.bin.fetch_add(bin, Ordering::Relaxed);
+        c.bout.fetch_add(bout, Ordering::Relaxed);
+        if http && (!server || answered) {
+            c.req_tot.fetch_add(1, Ordering::Relaxed);
+            c.count_status(status);
+        }
+        // Which side's fault, as `HAProxy`'s termination code counts it (measured on
+        // 3.5-dev8-885761-29: `SH` adds two to `eresp`, `sH` one, `SD` one to `eresp` and
+        // one to `srv_abrt`, `sD` one to `srv_abrt`, `PH` two to `eresp`).
+        let (abrt_cli, abrt_srv, eresp) = match &term {
+            b"SH" | b"PH" => (0, 0, 2),
+            b"sH" => (0, 0, 1),
+            b"SD" => (0, 1, 1),
+            b"sD" => (0, 1, 0),
+            [b'C', _] => (1, 0, 0),
+            _ => (0, 0, 0),
+        };
+        c.cli_abrt.fetch_add(abrt_cli, Ordering::Relaxed);
+        c.srv_abrt.fetch_add(abrt_srv, Ordering::Relaxed);
+        c.eresp.fetch_add(eresp, Ordering::Relaxed);
+        if &term == b"SC" {
+            c.econ.fetch_add(1, Ordering::Relaxed);
+        }
+        // Timings count once the connection is made and the response head has come
+        // (`stream_update_time_stats`).
+        if tc >= 0 && (tr >= 0 || !http) {
+            let ms = |v: i64| u64::try_from(v).unwrap_or(0);
+            let counted = if http { c.req_tot.load(Ordering::Relaxed) } else { c.lbtot.load(Ordering::Relaxed) };
+            c.qtime.add(ms(tw), counted);
+            c.ctime.add(ms(tc), counted);
+            c.rtime.add(if http { ms(tr) } else { 0 }, counted);
+            c.ttime.add(ms(ta), counted);
+        }
+        c.touch();
+        // A server's rate counts the connections tried, retries included.
+        for _ in 0..(if server { 1 + retries } else { 1 }) {
+            c.sess_rate.tick();
+        }
+        c.rate_max.fetch_max(u32::try_from(c.sess_rate.rate()).unwrap_or(u32::MAX), Ordering::Relaxed);
+    };
+    let be = &proxies[be_idx];
+    let c = &be.counters().be;
+    if srv_idx.is_some() {
+        c.lbtot.fetch_add(1, Ordering::Relaxed);
+    }
+    one(c, false);
+    let on_server: u32 = be.server_actconn.iter().map(|a| a.load(Ordering::Relaxed)).sum();
+    c.smax.fetch_max(on_server, Ordering::Relaxed);
+    let srv = srv_idx.and_then(|i| Some((i, proxies[srv_be].counters().srv.get(i)?)));
+    for (i, c) in srv {
+        c.lbtot.fetch_add(1, Ordering::Relaxed);
+        one(c, true);
+        let now_on = proxies[srv_be].server_actconn.get(i).map_or(0, |a| a.load(Ordering::Relaxed));
+        c.smax.fetch_max(now_on, Ordering::Relaxed);
+    }
+}
+
 /// The stream's log line, when its frontend logs (`HAProxy` logs nothing without a
 /// `log` target).
 fn stream_log_line(entry: &SessionEntry, proxies: &[Proxy], pid: u32) -> Option<Vec<u8>> {
@@ -1429,7 +1545,13 @@ fn stream_log_line(entry: &SessionEntry, proxies: &[Proxy], pid: u32) -> Option<
     let be = proxies.get(entry.backend_idx).unwrap_or(fe);
     // `status` is the transaction's (`txn->status`, as `%ST`), not whatever response the
     // thread rewrote last (T152).
-    let line = fmt.render_bytes(&stream_log_data(entry, proxies, entry.proxy_idx, pid), sample_registry(), &SampleContext { at_log: true, res_status: entry.sess.txn.as_ref().map(|t| t.status).or(entry.sess.log.status).filter(|&s| s > 0), ..stream_sample_ctx(&entry.sess, fe, be, &ProxiesView(proxies), &StickView::new(proxies, &entry.sess.tracked_sc)) });
+    // `%sc` counts the other streams on the server: `HAProxy` logs after this one has
+    // let go of it (measured: `1/1/0/0/0` for a lone request on a one-server backend).
+    let mut data = stream_log_data(entry, proxies, entry.proxy_idx, pid);
+    if entry.target_server_idx.is_some() && !entry.actconn_reclaimed {
+        data.srvconn = data.srvconn.saturating_sub(1);
+    }
+    let line = fmt.render_bytes(&data, sample_registry(), &SampleContext { at_log: true, res_status: entry.sess.txn.as_ref().map(|t| t.status).or(entry.sess.log.status).filter(|&s| s > 0), ..stream_sample_ctx(&entry.sess, fe, be, &ProxiesView(proxies), &StickView::new(proxies, &entry.sess.tracked_sc)) });
     fe.log_count.fetch_add(1, Ordering::Relaxed);
     Some(line)
 }
@@ -2324,6 +2446,8 @@ impl Engine {
     #[allow(clippy::too_many_lines)]
     pub fn build_shared_state(config: &Config, nbthread: usize) -> io::Result<Vec<Proxy>> {
     {
+        // The clock of `lastchg` and `lastsess` (`show stat`) starts with the proxies.
+        let _ = crate::statcnt::now_ms();
         // The listeners the file descriptor budget has to leave room for.
         let stats_sockets = config.global.as_ref().map_or(0, |g| usize::from(g.stats_socket.is_some()) + g.extra_stats_sockets.len());
         let listeners = stats_sockets
@@ -2619,13 +2743,17 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         let pid = std::process::id();
         let active_conns: u32 = self.proxies.iter().map(|p| p.stats.iter().map(|s| s.act_conn.load(Ordering::Relaxed)).sum::<u32>()).sum();
         let max_conns: u32 = self.proxies.iter().map(|p| p.maxconn).sum();
-        crate::stats::format_show_info(
+        let cum_conns: u64 = self.proxies.iter().map(|p| p.stats.iter().map(|s| s.cum_conn.load(Ordering::Relaxed)).sum::<u64>()).sum();
+        let cum_reqs: u64 = self.proxies.iter().filter_map(|p| p.ids.tc.get()).map(|c| c.fe.req_tot.load(Ordering::Relaxed)).sum();
+        crate::stats::format_show_info_counts(
             self.start_time,
             pid,
             self.scheduler.live_tasks(),
             self.scheduler.run_queue_len(),
             active_conns,
             max_conns,
+            cum_conns,
+            cum_reqs,
         )
     }
 
@@ -3183,6 +3311,8 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             let proxy = &mut self.proxies[proxy_idx];
             proxy.stats[worker_id()].cum_conn.fetch_add(1, Ordering::Relaxed);
             proxy.stats[worker_id()].fe_sess_rate.tick();
+            let rate: u64 = proxy.stats.iter().map(|s| s.fe_sess_rate.rate()).sum();
+            proxy.counters().fe.rate_max.fetch_max(u32::try_from(rate).unwrap_or(u32::MAX), Ordering::Relaxed);
             proxy.stats[worker_id()].act_conn.fetch_add(1, Ordering::Relaxed);
             crate::globalconn::acquire();
             if proxy.stats[worker_id()].act_conn.load(Ordering::Relaxed) > proxy.stats[worker_id()].max_conn.load(Ordering::Relaxed) {
@@ -4392,6 +4522,8 @@ fn register_new_session(
         cli_interest,
         srv_interest: Interest::NONE,
         actconn_reclaimed: false,
+        stats_done: false,
+        connect_log_due: proxy.log_format.is_none() && !proxy.log_target_idx.is_empty(),
         srv_served: 0,
         log_line: None,
     }) else {
@@ -4809,6 +4941,11 @@ pub fn shutdown_matching_sessions<'a>(
 
 fn clear_one(p: &Proxy) {
     p.stats.iter().for_each(|s| s.clear());
+    if let Some(c) = p.ids.tc.get() {
+        c.fe.clear();
+        c.be.clear();
+        c.srv.iter().for_each(crate::statcnt::TxnCounters::clear);
+    }
     p.server_retr.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
 }
 
@@ -5019,6 +5156,7 @@ fn close_http_session(
     // A transaction that ends with its connection, not through `end_txn` (cut short by
     // either side), logs here, while its request and response are still known.
     if entry.sess.txn.is_some() && entry.log_line.is_none() {
+        account_stream(entry, proxies);
         entry.log_line = stream_log_line(entry, proxies, std::process::id());
     }
     release_server(entry, proxies, fdtab, poller, idle_pool, reusable);
@@ -5596,6 +5734,7 @@ impl EngineDispatcher<'_> {
                     entry.sess.log.term = Some(*b"CR");
                 }
                 if entry.sess.log.status.is_some() {
+                    account_stream(entry, proxies);
                     entry.log_line = stream_log_line(entry, proxies, pid);
                 }
                 close_http_session(entry, proxies, fdtab, poller, idle_pool, true);
@@ -5625,6 +5764,7 @@ impl EngineDispatcher<'_> {
             entry.sess.log.status = Some(408);
             entry.sess.log.term = Some(*b"cR");
             entry.sess.log.request = None;
+            account_stream(entry, proxies);
             entry.log_line = stream_log_line(entry, proxies, pid);
             close_http_session(entry, proxies, fdtab, poller, idle_pool, true);
             return None;
@@ -5772,7 +5912,10 @@ impl EngineDispatcher<'_> {
                     // closes, the only way left to tell it the response is incomplete.
                     txn.close_after = true;
                     txn.aborted = true;
-                    entry.sess.log.term = Some(*b"SD");
+                    // `sD` when the server stopped sending and `timeout server` ran out,
+                    // `SD` when it closed.
+                    let timed_out = entry.sess.ending == Some(crate::proxy::Ending::Timeout(crate::proxy::Which::Server));
+                    entry.sess.log.term = Some(if timed_out { *b"sD" } else { *b"SD" });
                     // A response cut short is one failed request (`http_fail_cnt`).
                     for_tracked(proxies, &entry.sess, |data| data.count_fail());
                 }
@@ -5868,6 +6011,7 @@ impl EngineDispatcher<'_> {
     ) {
         // The transaction's line, while its request and response are still here.
         if entry.sess.txn.is_some() {
+            account_stream(entry, proxies);
             entry.log_line = stream_log_line(entry, proxies, pid);
         }
         let Some(txn) = entry.sess.txn.take() else {
@@ -5898,6 +6042,7 @@ impl EngineDispatcher<'_> {
         // A reusable server connection stays on the session for the next request, which
         // takes it if routing sends it to the same server (`connect_http_backend`).
         entry.sess.reset_for_next_request();
+        entry.stats_done = false;
         // The wait for the next request starts with the response's end
         // (`timeout http-keep-alive`).
         entry.sess.arm_request(now);
@@ -5939,10 +6084,32 @@ impl EngineDispatcher<'_> {
         // in the poller, so a stream woken by a request after an idle second would arm a
         // `wait-for-body` of 300 ms from a second ago.
         let now = self.now;
+        let mut connect_line: Option<(usize, String)> = None;
         let (is_done, pending_admin, log_line) = {
             let Some(entry) = self.sessions.get_mut(session_idx) else {
                 return Outcome::Done;
             };
+
+            // A frontend that logs and has no `log-format` (no `option httplog`, `tcplog`) says
+            // only that it took the connection, once, and nothing when the request or the
+            // connection ends (`frontend_accept`, `frontend.c`): after the PROXY header and
+            // the TLS handshake, which a connection that fails never gets past.
+            if entry.connect_log_due && (!entry.sess.accept_proxy || entry.sess.proxy_handshake_done) && entry.sess.cli_xprt.is_ready() {
+                entry.connect_log_due = false;
+                let fe = &self.proxies[entry.proxy_idx];
+                let unknown = SocketAddr::from(([0, 0, 0, 0], 0));
+                let (src, dst) = (entry.sess.client_addr.unwrap_or(unknown), entry.sess.server_addr.unwrap_or(unknown));
+                let line = format!(
+                    "Connect from {}:{} to {}:{} ({}/{})",
+                    src.ip(),
+                    src.port(),
+                    dst.ip(),
+                    dst.port(),
+                    fe.name,
+                    if fe.mode == Mode::Http { "HTTP" } else { "TCP" }
+                );
+                connect_line = Some((entry.proxy_idx, line));
+            }
 
             // Step 1: Server connect check if connecting
             check_srv_connect(entry, self.proxies, self.fdtab, self.poller, now);
@@ -6140,6 +6307,9 @@ impl EngineDispatcher<'_> {
             (entry.sess.is_done(), pending_admin, log_line)
         };
 
+        if let Some((fe, line)) = connect_line {
+            self.send_log_line(fe, line.as_bytes());
+        }
         if let Some(line) = log_line {
             let fe = self.sessions.get(session_idx).map_or(0, |e| e.proxy_idx);
             self.send_log_line(fe, &line);
@@ -6170,6 +6340,9 @@ impl EngineDispatcher<'_> {
                 if proxy_header_failure(&e.sess).is_some() {
                     e.log_line = None;
                     return proxy_header_error_line(e, self.proxies).map(|l| (e.proxy_idx, l.into_bytes()));
+                }
+                if e.sess.mode == Mode::Tcp || e.sess.txn.is_some() {
+                    account_stream(e, self.proxies);
                 }
                 e.log_line
                     .take()
@@ -6218,6 +6391,9 @@ impl EngineDispatcher<'_> {
         };
         if total_hdr_len > threshold || status < 100 {
             entry.sess.rep.clear();
+            // A response that is not HTTP: `PH`, and nothing of it counts as sent.
+            entry.sess.log.term.get_or_insert(*b"PH");
+            entry.sess.log.bytes_from_server = 0;
             reply_error(entry, proxies, 502);
             return;
         }
@@ -6998,6 +7174,8 @@ impl EngineDispatcher<'_> {
         // `proxy_inc_fe_req_ctr`: the request counts for the frontend before any rule sees it.
         if resume.is_none() {
             proxies[proxy_idx].stats[worker_id()].fe_req_rate.tick();
+            let rate: u64 = proxies[proxy_idx].stats.iter().map(|s| s.fe_req_rate.rate()).sum();
+            proxies[proxy_idx].counters().fe.req_rate_max.fetch_max(u32::try_from(rate).unwrap_or(u32::MAX), Ordering::Relaxed);
         }
 
         // The stream's variables are in `CURRENT_VARS` for this whole run (`step_stream`).
@@ -7235,6 +7413,8 @@ impl EngineDispatcher<'_> {
                         };
                         // Denied by the proxy: `PR`, not a rule's answer (`LR`).
                         sess.log.term = Some(*b"PR");
+                        // `dreq` of the proxy whose rule denied (`http_req_get_intercept_rule`).
+                        proxies[proxy_idx].stats[worker_id()].denied_req.fetch_add(1, Ordering::Relaxed);
                         for_tracked(proxies, sess, |data| data.count_err());
                         send_proxy_reply(sess, &proxies[..], proxy_idx, pages_idx, &resp);
                         return Ok(RuleFlow::Replied);
@@ -7865,6 +8045,9 @@ impl EngineDispatcher<'_> {
                 && entry.sess.rep.is_empty()
             {
                 // Its server timer is the last transaction's; this one starts its own.
+                // The connection is already there, so `%Tw` and `%Tc` are both 0, not
+                // -1 and the time from the request to now.
+                entry.sess.log.queue.get_or_insert_with(Instant::now);
                 entry.sess.server_connected(now);
                 if let Some(txn) = entry.sess.txn.as_mut() {
                     txn.srv_reused = true;

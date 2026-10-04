@@ -23,6 +23,7 @@
 use ibex_config::{LogConfig, LogFacility, LogLevel, LogSample, LogTarget, RingFormat};
 use std::cell::RefCell;
 use std::net::{SocketAddr, UdpSocket};
+use std::os::unix::net::UnixDatagram;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -34,10 +35,19 @@ thread_local! {
     static LINE: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Writes `line` and a line feed to a descriptor, and flushes.
+/// Writes `line` (which already ends with its line feed) to a descriptor, and flushes.
 fn write_line(out: &mut impl std::io::Write, line: &mut Vec<u8>) -> bool {
-    line.push(b'\n');
     out.write_all(line).is_ok() && out.flush().is_ok()
+}
+
+/// Sends `line` to the unix datagram socket at `path` (`@name`: the abstract namespace).
+fn send_unix(sock: &UnixDatagram, path: &str, line: &[u8]) -> bool {
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::net::SocketAddr as UnixAddr;
+    match path.strip_prefix('@') {
+        Some(name) => UnixAddr::from_abstract_name(name).and_then(|a| sock.send_to_addr(line, &a)).is_ok(),
+        None => sock.send_to(line, path).is_ok(),
+    }
 }
 
 /// Splits the `name[pid]` tag the engine hands over into its two header fields.
@@ -110,14 +120,16 @@ pub const fn priority(f: LogFacility, l: LogLevel) -> u8 {
 enum Sink {
     /// A syslog server over UDP.
     Udp(SocketAddr, Option<UdpSocket>),
+    /// A syslog daemon's unix datagram socket (`log /dev/log local0`): the path as written
+    /// (`@name` is an abstract one), and the socket the lines leave from.
+    Unix(String, Option<UnixDatagram>),
     /// The process's own standard output.
     Stdout,
     /// The process's own standard error.
     Stderr,
     /// A `ring` section's buffer (`ring@<name>`).
     Ring(Arc<Ring>),
-    /// Configured but unwritable: `fd@<n>` for some other descriptor, or a unix socket
-    /// path. Lines are dropped rather than sent somewhere they were not addressed to.
+    /// Configured but unwritable: `fd@<n>` for some other descriptor. Lines are dropped rather than sent somewhere they were not addressed to.
     ///
     /// Writing to an arbitrary inherited descriptor needs `BorrowedFd::borrow_raw`, which
     /// is unsafe, and this crate forbids unsafe. `stdout` and `stderr` are the cases that
@@ -184,11 +196,11 @@ impl SyslogTarget {
                 Sink::Discard
             }
             LogTarget::Unix(path) => {
-                eprintln!(
-                    "[ibex] warning: log target '{path}' is a unix socket, which is not \
-                     implemented; these lines are dropped"
-                );
-                Sink::Discard
+                let sock = UnixDatagram::unbound().ok().and_then(|s| {
+                    s.set_nonblocking(true).ok()?;
+                    Some(s)
+                });
+                Sink::Unix(path.clone(), sock)
             }
         };
         SyslogTarget {
@@ -238,7 +250,8 @@ impl SyslogTarget {
             }
             // A UDP target whose socket would not bind, and anything configured but
             // unwritable.
-            Sink::Discard | Sink::Udp(_, None) => false,
+            Sink::Discard | Sink::Udp(_, None) | Sink::Unix(_, None) => false,
+            Sink::Unix(path, Some(sock)) => self.with_line(level, facility, meta, msg, |line| send_unix(sock, path, line)),
             Sink::Udp(addr, Some(sock)) => self.with_line(level, facility, meta, msg, |line| sock.send_to(line, *addr).is_ok()),
             // A descriptor is a stream, so unlike a datagram there is no frame boundary to mark
             // the end of the line: a newline terminates the record.
@@ -259,7 +272,12 @@ impl SyslogTarget {
             line.clear();
             build_header(&mut line, self.format, facility, level, meta);
             line.extend_from_slice(msg);
-            line.truncate(self.max_len);
+            // The datagram or line ends with a line feed that `len` counts
+            // (measured on 3.5-dev8-885761-29: `len 80` sends 79 bytes and `\n`).
+            line.truncate(self.max_len.saturating_sub(1));
+            // One line feed, not two for a forwarded message that came with its own (measured:
+            // `HAProxy` forwards `hello` and `hello\n` alike as `hello\n`).
+            if line.last() != Some(&b'\n') { line.push(b'\n'); }
             f(&mut line)
         })
     }
@@ -286,6 +304,7 @@ impl SyslogTarget {
         }
         match (&self.sink, &cfg.target) {
             (Sink::Udp(a, _), LogTarget::Udp(b)) => a == b,
+            (Sink::Unix(a, _), LogTarget::Unix(b)) => a == b,
             (Sink::Stdout, LogTarget::Fd(1)) | (Sink::Stderr, LogTarget::Fd(2)) => true,
             (Sink::Ring(r), LogTarget::Ring(n)) => r.name == *n,
             _ => false,

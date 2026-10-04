@@ -75,6 +75,30 @@ fn propagate(proxies: &[Proxy], p: usize, s: usize) {
 /// For a tracker, the state is what the operator forced on it (`Up` for nothing), and the
 /// server's own is that combined with its target's.
 pub fn set_status(proxies: &[Proxy], p: usize, s: usize, st: ServerStatus) {
+    let status_of = || proxies.get(p).and_then(|px| px.server_statuses.get(s)).map_or(0, |a| a.load(Ordering::Relaxed));
+    let before = status_of();
+    set_status_inner(proxies, p, s, st);
+    // `lastchg`, `downtime` and `chkdown` of `show stat` follow the server's state.
+    let after = status_of();
+    if before != after {
+        let px = &proxies[p];
+        let (was_down, down) = (before == ServerStatus::Down as u8, after == ServerStatus::Down as u8);
+        let pc = px.counters();
+        if let Some(c) = pc.srv.get(s) {
+            c.state_changed(was_down, down);
+        }
+        // The backend is down when no server of it is up; its own `lastchg`, `downtime` and
+        // `chkdown` move when that flips (measured: `disable server` on the only server
+        // turns the backend `DOWN`, `chkdown` 1).
+        let be_down = !px.server_statuses.iter().any(|a| a.load(Ordering::Relaxed) == ServerStatus::Up as u8);
+        let was_be_down = pc.be.down_since.load(Ordering::Relaxed) != 0;
+        if be_down != was_be_down {
+            pc.be.state_changed(was_be_down, be_down);
+        }
+    }
+}
+
+fn set_status_inner(proxies: &[Proxy], p: usize, s: usize, st: ServerStatus) {
     if let Some(tr) = track_of(proxies, p, s) {
         tr.own.store(st as u8, Ordering::Relaxed);
         let (tp, ts) = tr.target;

@@ -12,6 +12,8 @@ use super::*;
 pub enum LogFormatSpec {
     Custom(String),
     Http { clf: bool },
+    /// `option httpslog`: `httplog` and the TLS fields.
+    Https,
     Tcp { clf: bool },
 }
 

@@ -111,3 +111,20 @@ million steps on a real header is a pattern to rewrite.
 
 The plain pattern `^/(a+)+$`, with no PCRE-only feature, is not backtracking at all on Ibex
 (it runs in `regex`, linear time) and gives the answer PCRE2 gives.
+
+## Logs and `show stat` (T165)
+
+Same as HAProxy (measured, 3.5-dev8-885761-29): `option httplog`, `httpslog`, `tcplog` and the default format (one `Connect from` line per connection) byte for byte except timings; a datagram or line ends with one line feed that `len` counts; `show stat` frontend, backend and server rows for `status scur stot bin bout dreq ereq econ eresp wretr wredis weight act bck chkfail chkdown lastchg downtime qcur rate rate_max hrsp_* req_tot lbtot cli_abrt srv_abrt lastsess qtime ctime rtime ttime *_max mode`.
+
+Different, and what to do instead:
+
+| what | HAProxy | Ibex |
+|---|---|---|
+| `fc_err` (in `option httpslog`) | the connection error code (48 for a client that reset) | always `0` |
+| `ssl_c_err`, `ssl_c_ca_err`, `ssl_fc_err` | the verify error and the last TLS error | `0` on a TLS connection, no sample otherwise |
+| `show stat` `h1_*`, `h2_*`, `ssl_*`, `connect`, `reuse`, `srv_icur`, `idle_conn_cur`, `req_rate` windows, `agg_*`, `reqbin`.. | filled | empty (not counted) |
+| `smax` of a server or backend | the peak when a stream started | the peak seen when a stream ended (the same for a request that overlaps another, never above it) |
+| `show info` `CumConns`, `CumReq` | count the CLI connection too | do not |
+| `log` to a unix datagram socket | works | works (`unix@/path`, `/path`, `unix@@abstract`); not compared with HAProxy, whose `sendmsg()` to a socket bound in the test failed with ENOENT |
+| a client that closes during the TLS handshake | session gone at once | counted in `scur` until its timeout (found, not fixed) |
+| `%fi`, `Connect from ... to` on a wildcard bind | the accepted socket's address | the listener's configured address |

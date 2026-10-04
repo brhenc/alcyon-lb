@@ -41,6 +41,7 @@ pub mod raw;
 pub mod rule_exprs;
 pub mod srv_tls;
 pub mod stats;
+pub mod statcnt;
 pub mod xprt;
 pub mod stats_html;
 pub mod systemd;
@@ -60,7 +61,7 @@ pub use ibex_proto::{
     remove_http_header_with_len, status_reason_phrase,
 };
 pub use listener::Listener;
-pub use logfmt::{format_string, LogData, LogFormat, CLF_HTTP_LOG_FORMAT, CLF_TCP_LOG_FORMAT, DEFAULT_HTTP_LOG_FORMAT, DEFAULT_TCP_LOG_FORMAT};
+pub use logfmt::{format_string, LogData, LogFormat, CLF_HTTP_LOG_FORMAT, CLF_TCP_LOG_FORMAT, DEFAULT_HTTPS_LOG_FORMAT, DEFAULT_HTTP_LOG_FORMAT, DEFAULT_TCP_LOG_FORMAT};
 pub use syslog::{format_rfc3164, priority, SyslogTarget};
 pub use poller::{Event, Poller};
 pub use proxy::{find_eoh, Ending, TcpSession, Timeouts, Want, Which};
