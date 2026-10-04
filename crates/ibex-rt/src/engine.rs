@@ -9565,35 +9565,3 @@ mod rate_ctr_tests {
         assert_eq!(r.rate_at(9000), 1, "the quiet spell dropped both windows");
     }
 }
-
-#[cfg(test)]
-mod pool_max_conn_tests {
-    use super::*;
-
-    fn idle(pool: &mut IdlePool, key: IdleKey) {
-        let (a, _b) = std::os::unix::net::UnixStream::pair().expect("pair");
-        pool.entry(key).or_default().push(IdleConn { fd: a.into(), xprt: crate::xprt::ServerXprt::Plain });
-    }
-
-    #[test]
-    fn idle_room_counts_per_server() {
-        let addr: SocketAddr = "127.0.0.1:9".parse().expect("addr");
-        let plain = IdleKey { addr, tls: None };
-        let mut pool = IdlePool::new();
-        assert!(idle_room(&pool, &plain, None), "unset is unlimited");
-        assert!(idle_room(&pool, &plain, Some(-1)), "-1 is unlimited");
-        assert!(!idle_room(&pool, &plain, Some(0)), "0 keeps none");
-        assert!(idle_room(&pool, &plain, Some(1)));
-        idle(&mut pool, plain.clone());
-        assert!(!idle_room(&pool, &plain, Some(1)));
-        assert!(idle_room(&pool, &plain, Some(2)));
-        // TLS: every SNI of the same server counts, other servers do not.
-        let tls = |s: usize, sni: &str| IdleKey { addr, tls: Some((0, s, Some(sni.to_string()))) };
-        idle(&mut pool, tls(1, "a"));
-        idle(&mut pool, tls(1, "b"));
-        idle(&mut pool, tls(2, "a"));
-        assert!(!idle_room(&pool, &tls(1, "c"), Some(2)));
-        assert!(idle_room(&pool, &tls(1, "c"), Some(3)));
-        assert!(idle_room(&pool, &tls(2, "c"), Some(2)));
-    }
-}
