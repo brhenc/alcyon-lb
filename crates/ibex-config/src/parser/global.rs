@@ -388,6 +388,19 @@ pub(crate) fn parse_global_directive(
             }
             Ok(())
         }
+        // Options that switch a poller or a kernel feature off. Ibex always polls with epoll and
+        // does not splice, so they change nothing it does; what they change is the answer of
+        // `enabled(...)` in the `.if` lines that follow them (`preproc.rs`).
+        "noepoll" | "nopoll" | "nokqueue" | "noevports" | "nosplice" | "nogetaddrinfo" | "noreuseport" | "tune.disable-fast-forward" => {
+            if let Some(extra) = tokens.get(1).filter(|t| !t.text.is_empty()) {
+                return Err(ConfigError::new(
+                    extra.line,
+                    extra.col,
+                    format!("'{}' cannot handle unexpected argument '{}'.", kw.text, extra.text),
+                ));
+            }
+            Ok(())
+        }
         "ssl-server-verify" => {
             // `ssl_parse_global_ssl_server_verify` (`src/cfgparse-ssl.c`): the messages of a
             // missing argument and of a wrong one are HAProxy's, odd as the first is.
