@@ -434,7 +434,11 @@ pub fn format_show_stat(proxies: &[Proxy], checks: &[ServerCheckState], pid: u32
     format_show_stat_filtered(proxies, checks, pid, None, None, None)
 }
 
-fn write_frontend_row(out: &mut String, proxy: &Proxy, pid: u32, iid: u32) {
+/// The `pid` column: the process number, 1 with a single process (HAProxy 3.5-dev8), not
+/// the operating-system process id.
+const PROCESS_NUM: u32 = 1;
+
+fn write_frontend_row(out: &mut String, proxy: &Proxy, _pid: u32, iid: u32) {
     let mut r = StatRow::new();
     r.set("pxname", &proxy.name);
     r.set("svname", "FRONTEND");
@@ -452,7 +456,7 @@ fn write_frontend_row(out: &mut String, proxy: &Proxy, pid: u32, iid: u32) {
     r.set("ereq", 0);
     r.set("status", "OPEN");
     r.set("act", 1);
-    r.set("pid", pid);
+    r.set("pid", PROCESS_NUM);
     r.set("iid", iid);
     r.set("sid", 0);
     r.set("type", 0);
@@ -464,7 +468,7 @@ fn write_server_row(
     proxy: &Proxy,
     s_idx: usize,
     check_state: Option<&ServerCheckState>,
-    pid: u32,
+    _pid: u32,
     iid: u32,
     sid: u32,
 ) {
@@ -538,7 +542,7 @@ fn write_server_row(
     r.set("bck", bck);
     r.set("chkfail", chkfail);
     r.set("chkdown", chkdown);
-    r.set("pid", pid);
+    r.set("pid", PROCESS_NUM);
     r.set("iid", iid);
     r.set("sid", sid);
     r.set("type", 2);
@@ -549,7 +553,7 @@ fn write_server_row(
     out.push_str(&r.finish());
 }
 
-fn write_backend_row(out: &mut String, proxy: &Proxy, pid: u32, iid: u32) {
+fn write_backend_row(out: &mut String, proxy: &Proxy, _pid: u32, iid: u32) {
     let mut r = StatRow::new();
     r.set("pxname", &proxy.name);
     r.set("svname", "BACKEND");
@@ -568,7 +572,7 @@ fn write_backend_row(out: &mut String, proxy: &Proxy, pid: u32, iid: u32) {
     r.set("status", "UP");
     r.set("weight", 1);
     r.set("act", 1);
-    r.set("pid", pid);
+    r.set("pid", PROCESS_NUM);
     r.set("iid", iid);
     r.set("sid", 0);
     r.set("type", 1);
