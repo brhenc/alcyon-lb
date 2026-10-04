@@ -2345,15 +2345,15 @@ mod tests {
     /// Pumps until the body is done, taking out what each pass wrote.
     fn pump_all(msg: &Htx, st: &mut H2ReqBody, req: &mut Buf, out: &mut Vec<u8>) {
         for _ in 0..64 {
+            if st.done {
+                break;
+            }
             pump_h2_body(msg, st, req);
             out.extend_from_slice(req.readable());
             let n = req.readable().len();
             req.consume(n);
-            if st.done {
-                return;
-            }
         }
-        panic!("the body never finished: {st:?}");
+        assert!(st.done, "the body never finished: {st:?}");
     }
 
     /// A body bigger than the room left goes out a piece at a time, as chunks when there

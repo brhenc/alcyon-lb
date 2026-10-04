@@ -713,8 +713,10 @@ mod tests {
     fn a_converter_sets_the_default_match_method() {
         Expr::parse("src,table_trackers(test) eq 1").expect("an integer match");
         Expr::parse("src,in_table(test) 1").expect("a boolean matched as an integer");
-        assert!(Expr::parse("src,lower 1.2.3.4").is_ok(), "a string match");
-        assert!(Expr::parse("src 1.2.3").is_err(), "an address match");
+        assert!(Expr::parse("src,lower 300.1.1.1").is_ok(), "a string match");
+        assert!(Expr::parse("src 300.1.1.1").is_err(), "an address match");
+        assert!(Expr::parse("src,ipmask(24) 300.1.1.1").is_err(), "a converter that leaves an address");
+        assert!(Expr::parse("src,debug 300.1.1.1").is_err(), "a converter that keeps the fetch's type");
     }
     use ibex_proto::htx::{HeaderField, HttpMethod, HttpVersion, Htx, HtxBlock, RequestLine};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
