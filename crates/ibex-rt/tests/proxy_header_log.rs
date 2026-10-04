@@ -241,3 +241,29 @@ fn dontlognull_silences_a_client_that_closes_resets_or_times_out() {
     });
     assert_eq!(reset.line, None);
 }
+
+/// A v2 header from 10.1.2.3:42 with nothing after it.
+const V2_FROM_10_1_2_3: &[u8] = b"\r\n\r\n\0\r\nQUIT\n\x21\x11\x00\x0c\x0a\x01\x02\x03\x7f\x00\x00\x02\x00\x2a\x05\x39";
+
+/// `tcp-request session` rules wait for the header and run on its addresses (T157). When
+/// they refuse the connection, `conn_complete_session` fails with no error code and
+/// `session_kill_embryonic` logs the header's source and "Success". Measured on `HAProxy`
+/// with `tcp-request session reject if { src 10.1.2.3 }`, and the same with
+/// `silent-drop`: `10.1.2.3:42 [04/Oct/2026:21:13:20.808] fe/1: Success`.
+#[test]
+fn session_rules_that_refuse_after_the_header_log_success() {
+    for action in ["reject", "silent-drop"] {
+        let fe = format!("option httplog\n  tcp-request session {action} if {{ src 10.1.2.3 }}");
+        let seen = scenario(&fe, "", WAIT, sends(V2_FROM_10_1_2_3));
+        let line = seen.line.as_deref().unwrap_or_else(|| panic!("{action}: a line was logged"));
+        let rest = line.strip_prefix("10.1.2.3:42 [").unwrap_or_else(|| panic!("{action}: the header's source: {line:?}"));
+        assert!(rest.ends_with("] fe/1: Success"), "{action}: {line:?}");
+    }
+}
+
+/// And under `option dontlognull`, nothing (measured: no line).
+#[test]
+fn dontlognull_silences_session_rules_that_refuse_after_the_header() {
+    let fe = "option httplog\n  option dontlognull\n  tcp-request session reject if { src 10.1.2.3 }";
+    assert_eq!(scenario(fe, "", Duration::from_millis(1500), sends(V2_FROM_10_1_2_3)).line, None);
+}

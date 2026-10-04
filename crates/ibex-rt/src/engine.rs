@@ -3449,6 +3449,32 @@ enum SessionEvalOutcome {
     SilentDrop,
 }
 
+/// `tcp-request session` rules of a connection that opened with a PROXY header, once the
+/// header is in (T157): `HAProxy` runs them in `conn_complete_session`, after the
+/// handshake, so `src` and `fc_pp_tlv` read the header's values. Ibex ran them at accept,
+/// before a byte of it. Runs inside the stream's run (`step_stream`), where its variables
+/// and timeouts are. A refusal has the connection-error line of a bad header, with the
+/// text "Success" (`ProxyHdrError::SessionRefused`).
+fn run_deferred_session_rules(proxy_idx: usize, proxies: &[Proxy], sess: &mut TcpSession) {
+    if !sess.session_rules_pending || !sess.proxy_handshake_done || sess.is_done() {
+        return;
+    }
+    sess.session_rules_pending = false;
+    match eval_tcp_req_session_rules(&proxies[proxy_idx], proxies, sample_registry(), sess) {
+        SessionEvalOutcome::Accept => return,
+        SessionEvalOutcome::Reject => raw::abort_with_rst(sess.cli.as_fd()),
+        SessionEvalOutcome::SilentDrop => {
+            let is_ipv6 = sess.fc_src.or(sess.client_addr).is_some_and(|a| a.is_ipv6());
+            raw::silent_drop(sess.cli.as_fd(), is_ipv6);
+        }
+    }
+    proxies[proxy_idx].stats[worker_id()].denied_req.fetch_add(1, Ordering::Relaxed);
+    sess.proxy_hdr_err = Some(crate::proxy::ProxyHdrError::SessionRefused);
+    sess.cli_state = ScState::Closed;
+    sess.srv_state = ScState::Closed;
+    sess.tcp_inspect_done = true;
+}
+
 #[allow(clippy::too_many_lines)]
 fn eval_tcp_req_conn_rules(
     proxy: &Proxy,
@@ -4614,9 +4640,16 @@ fn init_client_session(
     }
 
     let registry = sample_registry();
-    stream_timeouts_enter(proxies, proxy_idx, proxy_idx, &sess);
-    let session_rules = with_stream_vars(&mut sess, |sess| eval_tcp_req_session_rules(&proxies[proxy_idx], proxies, registry, sess));
-    CURRENT_TIMEOUTS.set(None);
+    // With a PROXY header to come, the rules wait for it (`run_deferred_session_rules`).
+    let session_rules = if sess.accept_proxy {
+        sess.session_rules_pending = true;
+        SessionEvalOutcome::Accept
+    } else {
+        stream_timeouts_enter(proxies, proxy_idx, proxy_idx, &sess);
+        let out = with_stream_vars(&mut sess, |sess| eval_tcp_req_session_rules(&proxies[proxy_idx], proxies, registry, sess));
+        CURRENT_TIMEOUTS.set(None);
+        out
+    };
     match session_rules {
         SessionEvalOutcome::Accept => {}
         SessionEvalOutcome::Reject => {
@@ -5972,6 +6005,9 @@ impl EngineDispatcher<'_> {
                     }
                 }
             }
+
+            // Step 3.3: `tcp-request session` rules that waited for the PROXY header.
+            run_deferred_session_rules(entry.proxy_idx, self.proxies, &mut entry.sess);
 
             // Step 3.4: Content inspection for TCP rules (or before HTTP request parsing)
             if !entry.sess.tcp_inspect_done && !entry.sess.is_done() {
