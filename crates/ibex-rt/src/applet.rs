@@ -234,6 +234,12 @@ impl CliApplet {
             let line = line.trim_end_matches('\r');
 
             self.execute_line(line, ctx);
+            // A connection that is not in `prompt` mode runs one command line and closes;
+            // what came after it in the same write is never run (HAProxy, T146 item 4).
+            if !self.interactive {
+                self.in_buf.clear();
+                break;
+            }
         }
     }
 

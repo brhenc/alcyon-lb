@@ -1709,19 +1709,20 @@ class VtcExecutor:
             except Exception:
                 pass
 
-    async def _execute_haproxy_cli(self, haproxy_id: str, block: str) -> None:
-        cli_sock = os.path.join(self.tmpdir, f"{haproxy_id}.sock")
-        reader, writer = None, None
+    async def _cli_connect(self, cli_sock: str):
         for _ in range(50):
             if os.path.exists(cli_sock):
                 try:
-                    reader, writer = await asyncio.open_unix_connection(cli_sock)
-                    break
+                    return await asyncio.open_unix_connection(cli_sock)
                 except Exception:
                     pass
             await asyncio.sleep(0.05)
-        if not writer or not reader:
-            raise RuntimeError(f"Could not connect to HAProxy CLI socket {cli_sock}")
+        raise RuntimeError(f"Could not connect to HAProxy CLI socket {cli_sock}")
+
+    async def _execute_haproxy_cli(self, haproxy_id: str, block: str) -> None:
+        cli_sock = os.path.join(self.tmpdir, f"{haproxy_id}.sock")
+        # Like vtest, a new connection for every `send`: a non-interactive stats-socket
+        # connection runs one command line and closes, on HAProxy and on Ibex alike (T146).
 
         lines = block.splitlines()
         last_resp = ""
@@ -1733,21 +1734,28 @@ class VtcExecutor:
                 cmd = line[5:].strip()
                 if (cmd.startswith('"') and cmd.endswith('"')) or (cmd.startswith("'") and cmd.endswith("'")):
                     cmd = cmd[1:-1]
+                reader, writer = await self._cli_connect(cli_sock)
                 writer.write((cmd + "\n").encode("utf-8"))
                 await writer.drain()
-                await asyncio.sleep(0.05)
                 resp_bytes = bytearray()
                 while True:
                     try:
-                        chunk = await asyncio.wait_for(reader.read(4096), timeout=0.1)
-                        if not chunk:
-                            break
-                        resp_bytes.extend(chunk)
-                        if len(chunk) < 4096:
-                            break
+                        # The answer ends with the close; an idle second ends a connection
+                        # that stays open (`prompt`).
+                        chunk = await asyncio.wait_for(reader.read(4096), timeout=1.0)
                     except asyncio.TimeoutError:
                         break
+                    except ConnectionError:
+                        break
+                    if not chunk:
+                        break
+                    resp_bytes.extend(chunk)
                 last_resp = resp_bytes.decode("utf-8", errors="replace")
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
             elif line.startswith("barrier "):
                 parts = line.split()
                 if len(parts) >= 3 and parts[2] == "sync":
@@ -1772,11 +1780,6 @@ class VtcExecutor:
                     pat = _posix_classes_to_python(self.macro_engine.expand(pat))
                     if not re.search(pat, last_resp, re.MULTILINE):
                         raise AssertionError(f"CLI expect pattern {pat!r} failed to match: {last_resp!r}")
-        writer.close()
-        try:
-            await writer.wait_closed()
-        except Exception:
-            pass
 
     async def execute(self) -> TestResult:
         start_time = time.monotonic()
