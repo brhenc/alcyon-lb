@@ -1596,14 +1596,8 @@ impl TcpSession {
             }
             self.cli_exp = Tick::ETERNITY;
         }
-        if self.req_exp.is_expired(now) {
-            self.req_exp = Tick::ETERNITY;
-            if self.head_pending() && self.cli_timer_live() {
-                // The head is not complete in time: the client's timeout, `408` and all.
-                self.cli_state = ScState::Error;
-                self.ending.get_or_insert(Ending::Timeout(Which::Client));
-                return true;
-            }
+        if self.req_exp.is_expired(now) && self.expire_request() {
+            return true;
         }
         if self.srv_exp.is_expired(now) {
             if self.srv_timer_live() {
@@ -1614,6 +1608,18 @@ impl TcpSession {
             self.srv_exp = Tick::ETERNITY;
         }
         false
+    }
+
+    /// `timeout http-request` is over: if the head is still not complete, that is the
+    /// client's timeout, `408` and all. Whether it fired.
+    fn expire_request(&mut self) -> bool {
+        self.req_exp = Tick::ETERNITY;
+        let live = self.head_pending() && self.cli_timer_live();
+        live.then(|| {
+            self.cli_state = ScState::Error;
+            self.ending.get_or_insert(Ending::Timeout(Which::Client));
+        })
+        .is_some()
     }
 
     fn conn_timer_live(&self) -> bool {
