@@ -8786,10 +8786,6 @@ fn wait_for_request_body(
     at_least: u32,
     now: Tick,
 ) -> BodyWait {
-    // An HTTP/2 client's body does not pass through `req`: there is nothing to wait for.
-    if sess.h2_ctx.is_some() {
-        return BodyWait::Ready;
-    }
     // The request is in `Head` until its rules are done, which is where this runs.
     let framing = sess.txn.as_ref().map_or(crate::txn::Framing::None, |t| {
         if let MsgState::Head { body, .. } = t.req { body } else { crate::txn::Framing::None }
@@ -8804,7 +8800,11 @@ fn wait_for_request_body(
             let asks = |name: &str, value: &str| name.eq_ignore_ascii_case("expect") && value.trim().eq_ignore_ascii_case("100-continue");
             let expects = sess.htx_slice().is_some_and(|htx| htx.headers().any(|(name, value)| asks(name, value)));
             if expects {
-                sess.send_before_close(b"HTTP/1.1 100 Continue\r\n\r\n");
+                // (An HTTP/2 client is not sent the interim response: raw bytes would be no
+                // HTTP/2.)
+                if sess.h2_ctx.is_none() {
+                    sess.send_before_close(b"HTTP/1.1 100 Continue\r\n\r\n");
+                }
                 del_req_header(sess, "expect");
             }
             let timeouts = &fe.stats_config.raw_timeouts;
