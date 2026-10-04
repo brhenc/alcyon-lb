@@ -204,6 +204,9 @@ pub struct ListenSection {
     pub acls: Vec<AclRule>,
     /// Dynamic switching rules (`use_backend <name> [if|unless <acl_cond>]`).
     pub use_backends: Vec<UseBackendRule>,
+    /// `force-be-switch if|unless <cond>`: when one matches, `use_backend` and
+    /// `default_backend` may pick a backend that is disabled.
+    pub force_be_switch: Vec<AclCondition>,
     /// `monitor-uri <uri>`: requests for this URI are answered by the proxy itself, for
     /// an external load balancer's health probe (`src/http_ana.c`).
     pub monitor_uri: Option<String>,
@@ -243,6 +246,8 @@ pub struct ListenSection {
     pub originalto: Option<String>,
     /// Default server options applied to all servers in this listen section.
     pub default_server: Option<DefaultServerConfig>,
+    /// `use-server <server> if|unless <cond>` rules, in order.
+    pub use_servers: Vec<UseServerRule>,
     /// HTTP connection reuse strategy (`http-reuse`).
     pub http_reuse: Option<HttpReuse>,
     /// Hashing method for hash-based balancing algorithms (`hash-type`).
@@ -309,6 +314,7 @@ impl Default for ListenSection {
             grace: None,
             dispatch: None,
             default_server: None,
+            use_servers: Vec::new(),
             servers: Vec::new(),
             logs: Vec::new(),
             log_global: false,
@@ -322,6 +328,7 @@ impl Default for ListenSection {
             srvexp: Vec::new(),
             acls: Vec::new(),
             use_backends: Vec::new(),
+            force_be_switch: Vec::new(),
             monitor_uri: None,
             default_backend: None,
             balance: BalanceAlgorithm::RoundRobin,
@@ -380,6 +387,9 @@ pub struct FrontendSection {
     pub default_backend: Option<String>,
     /// Dynamic switching rules (`use_backend <name> [if|unless <acl_cond>]`).
     pub use_backends: Vec<UseBackendRule>,
+    /// `force-be-switch if|unless <cond>`: when one matches, `use_backend` and
+    /// `default_backend` may pick a backend that is disabled.
+    pub force_be_switch: Vec<AclCondition>,
     /// `monitor-uri <uri>`: requests for this URI are answered by the proxy itself, for
     /// an external load balancer's health probe (`src/http_ana.c`).
     pub monitor_uri: Option<String>,
@@ -453,6 +463,7 @@ impl Default for FrontendSection {
             maxconn: 2000,
             default_backend: None,
             use_backends: Vec::new(),
+            force_be_switch: Vec::new(),
             monitor_uri: None,
             acls: Vec::new(),
             cliexp: Vec::new(),
@@ -528,6 +539,8 @@ pub struct BackendSection {
     pub dispatch: Option<SocketAddr>,
     /// Default server options applied to all servers.
     pub default_server: Option<DefaultServerConfig>,
+    /// `use-server <server> if|unless <cond>` rules, in order.
+    pub use_servers: Vec<UseServerRule>,
     /// Known backend servers.
     pub servers: Vec<Server>,
     /// Server header regex rewrite rules.
@@ -604,6 +617,7 @@ impl Default for BackendSection {
             redisp_after: -1,
             dispatch: None,
             default_server: None,
+            use_servers: Vec::new(),
             servers: Vec::new(),
             srvexp: Vec::new(),
             acls: Vec::new(),

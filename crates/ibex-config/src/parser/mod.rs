@@ -21,7 +21,7 @@ use crate::ast::{
     SslVerify, StatsConfig, TlsVersion,
     StickRule, StickRuleType, StickTableConfigAst, TcpCheckAction, TcpCheckExpectPattern,
     TcpReqConnAction, TcpReqConnRule, TcpReqContentAction, TcpReqContentRule, TcpResAction, TcpResContentRule,
-    TcpReqSessionAction, TcpReqSessionRule, TimeoutConfig, UseBackendRule,
+    TcpReqSessionAction, TcpReqSessionRule, TimeoutConfig, UseBackendRule, UseServerRule,
 };
 use crate::error::ConfigError;
 use crate::lexer::{lex, Token};
@@ -1001,6 +1001,56 @@ pub(crate) fn parse_use_backend(
     Ok(())
 }
 
+/// `use-server <server> if|unless <cond>` (`src/cfgparse-listen.c`). The condition is
+/// required. A name that is a log-format expression chooses the server per request, which
+/// Ibex does not do, so it is refused rather than read as a literal name.
+pub(crate) fn parse_use_server(
+    rules: &mut Vec<UseServerRule>,
+    tokens: &[Token],
+    kw: &Token,
+) -> Result<(), ConfigError> {
+    if tokens.len() < 2 || tokens[1].text.is_empty() {
+        return Err(ConfigError::new(kw.line, kw.col, "'use-server' expects a server name."));
+    }
+    if !matches!(tokens.get(2).map(|t| t.text.as_str()), Some("if" | "unless")) {
+        return Err(ConfigError::new(
+            kw.line,
+            kw.col,
+            "'use-server' requires either 'if' or 'unless' followed by a condition.",
+        ));
+    }
+    if tokens[1].text.contains("%[") || tokens[1].text.contains('%') {
+        return Err(ConfigError::new(
+            tokens[1].line,
+            tokens[1].col,
+            "'use-server' with a log-format server name is not implemented by Ibex; \
+             the rule would pick no server",
+        ));
+    }
+    // The check above leaves a condition to parse, so this never yields `None`.
+    let server = tokens[1].text.clone();
+    rules.extend(parse_acl_condition_from_tokens(&tokens[2..])?.map(|cond| UseServerRule { server, cond }));
+    Ok(())
+}
+
+/// `force-be-switch if|unless <cond>`, in a frontend or a listen section.
+pub(crate) fn parse_force_be_switch(
+    rules: &mut Vec<AclCondition>,
+    tokens: &[Token],
+    kw: &Token,
+) -> Result<(), ConfigError> {
+    if !matches!(tokens.get(1).map(|t| t.text.as_str()), Some("if" | "unless")) {
+        return Err(ConfigError::new(
+            kw.line,
+            kw.col,
+            "'force-be-switch' requires either 'if' or 'unless' followed by a condition.",
+        ));
+    }
+    // The check above leaves a condition to parse, so this never yields `None`.
+    rules.extend(parse_acl_condition_from_tokens(&tokens[1..])?);
+    Ok(())
+}
+
 pub(crate) fn parse_default_backend(
     def: &mut Option<String>,
     tokens: &[Token],
@@ -1080,6 +1130,23 @@ pub(crate) fn validate_config(
         ));
     }
 
+    // `use-server` names are resolved when the configuration loads (`check_config_validity`).
+    for l in listens {
+        for r in &l.use_servers {
+            if !l.servers.iter().any(|s| s.id == r.server) {
+                return Err(ConfigError::new(1, 1, format!(
+                    "listen '{}' : unable to find server '{}' referenced in a 'use-server' rule.", l.name, r.server)));
+            }
+        }
+    }
+    for b in backends {
+        for r in &b.use_servers {
+            if !b.servers.iter().any(|s| s.id == r.server) {
+                return Err(ConfigError::new(1, 1, format!(
+                    "backend '{}' : unable to find server '{}' referenced in a 'use-server' rule.", b.name, r.server)));
+            }
+        }
+    }
     for proxy in listens {
         if proxy.mode == Mode::Http && proxy.cookie.is_some() && proxy.servers.is_empty() {
             return Err(ConfigError::new(
