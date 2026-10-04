@@ -4355,11 +4355,12 @@ fn retry_server_connect(
     let moved = target.is_some() && entry.target_addr.is_some() && target != entry.target_addr;
     let stats = &proxies[be_idx].stats[worker_id()];
     let count_on_server = |redispatch: bool| {
-        if let Some(i) = old_idx {
-            let mut m = proxies[be_idx].server_retr.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut m = proxies[be_idx].server_retr.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        old_idx.into_iter().for_each(|i| {
             let c = m.entry(i).or_default();
-            if redispatch { c.1 += 1 } else { c.0 += 1 }
-        }
+            c.0 += u64::from(!redispatch);
+            c.1 += u64::from(redispatch);
+        });
     };
     if !resuming && moved {
         count_on_server(true);
