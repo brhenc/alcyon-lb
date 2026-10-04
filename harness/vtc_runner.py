@@ -618,13 +618,18 @@ def vtc_split(line: str) -> List[str]:
             elif c in "\"'":
                 j = i + 1
                 while j < n and line[j] != c:
-                    if c == '"' and line[j] == "\\" and j + 1 < n:
+                    if c == '"' and line[j] == "\\" and j + 1 < n and line[j + 1] in '"\\':
                         j += 1
                     word += line[j]
                     j += 1
                 if j >= n:
                     raise ValueError("unbalanced quote")
                 i = j + 1
+            elif c == "\\" and i + 1 < n:
+                word += line[i + 1]
+                i += 2
+            elif c == "#":
+                i = n
             else:
                 word += c
                 i += 1
