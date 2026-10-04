@@ -8650,9 +8650,8 @@ fn apply_normalize_uri(
 fn commit_stick_stores(stores: impl Iterator<Item = (usize, StickKey)>, proxies: &[Proxy], be_idx: usize, server_idx: Option<usize>) {
     let id = server_idx.map(|i| proxies[be_idx].server_puid(i));
     for (t_idx, key) in stores {
-        if let (Some(id), Some(tbl)) = (id, proxies.get(t_idx).and_then(|p| p.stick_table.as_ref())) {
-            let _ = tbl.update_entry(&key, |d| d.server_id = Some(id));
-        }
+        let table = proxies.get(t_idx).and_then(|p| p.stick_table.as_ref());
+        table.zip(id).into_iter().for_each(|(tbl, id)| drop(tbl.update_entry(&key, |d| d.server_id = Some(id))));
     }
 }
 
