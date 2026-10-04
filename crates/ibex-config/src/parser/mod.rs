@@ -54,10 +54,6 @@ const IGNORED_GLOBAL_KEYWORDS: &[(&str, &str)] = &[
         "ssl-server-verify",
         "SSL server certificate verification mode default",
     ),
-    (
-        "crt-base",
-        "SSL certificate directory path prefix",
-    ),
 ];
 
 /// `HAProxy` keywords in `defaults` section that are deliberately inert or accepted.
@@ -426,6 +422,10 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
         b.stats.maxrewrite = maxrewrite;
     }
 
+    if let Some(g) = global.as_ref() {
+        apply_ssl_bases(g, &mut listens, &mut frontends, &mut backends);
+    }
+
     validate_config(global.as_ref(), &listens, &frontends, &backends)?;
 
     let config = Config {
@@ -440,6 +440,60 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
     register_checks_from_config(&config);
 
     Ok(config)
+}
+
+/// `path` under `base` when it is relative (`ssl_sock_load_cert_file`, `ssl_store_load_locations_file`
+/// join them with a `/`); an absolute path is kept.
+fn under_base(base: Option<&str>, path: &mut String) {
+    if let Some(base) = base.filter(|_| !path.starts_with('/')) {
+        *path = format!("{base}/{path}");
+    }
+}
+
+fn rebase_server_ssl(ssl: &mut ServerSsl, crt_base: Option<&str>, ca_base: Option<&str>) {
+    if let Some(p) = ssl.crt.as_mut() {
+        under_base(crt_base, p);
+    }
+    // `@system-ca` is not a path.
+    if let Some(p) = ssl.ca_file.as_mut().filter(|p| !p.starts_with('@')) {
+        under_base(ca_base, p);
+    }
+    if let Some(p) = ssl.crl_file.as_mut() {
+        under_base(ca_base, p);
+    }
+}
+
+/// Global `crt-base` / `ca-base`: HAProxy applies them when it loads the files, after the
+/// whole configuration is read, so the keyword may follow the sections that use it. Ibex
+/// loads from the paths the AST carries, so they are rewritten here.
+fn apply_ssl_bases(
+    global: &GlobalSection,
+    listens: &mut [ListenSection],
+    frontends: &mut [FrontendSection],
+    backends: &mut [BackendSection],
+) {
+    let (crt_base, ca_base) = (global.crt_base.as_deref(), global.ca_base.as_deref());
+    if crt_base.is_none() && ca_base.is_none() {
+        return;
+    }
+    let binds = listens.iter_mut().flat_map(|l| l.binds.iter_mut()).chain(frontends.iter_mut().flat_map(|f| f.binds.iter_mut()));
+    for bind in binds {
+        for crt in &mut bind.crt {
+            under_base(crt_base, crt);
+        }
+    }
+    let mut servers: Vec<&mut Server> = Vec::new();
+    servers.extend(listens.iter_mut().flat_map(|l| l.servers.iter_mut()));
+    servers.extend(backends.iter_mut().flat_map(|b| b.servers.iter_mut()));
+    for srv in servers {
+        if let Some(ssl) = srv.ssl.as_mut() {
+            rebase_server_ssl(ssl, crt_base, ca_base);
+        }
+    }
+    let defaults = listens.iter_mut().filter_map(|l| l.default_server.as_mut()).chain(backends.iter_mut().filter_map(|b| b.default_server.as_mut()));
+    for ds in defaults {
+        rebase_server_ssl(&mut ds.ssl, crt_base, ca_base);
+    }
 }
 
 /// An unnamed `defaults` section, and what its `http-check` rules need to be resolved.

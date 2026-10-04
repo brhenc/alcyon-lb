@@ -74,6 +74,10 @@ pub struct GlobalSection {
     pub logs: Vec<LogConfig>,
     /// Global variables initialized at startup via `set-var` and `set-var-fmt`.
     pub set_vars: Vec<GlobalSetVar>,
+    /// `crt-base <dir>`: where a relative `crt` path of a `bind` or `server` is read.
+    pub crt_base: Option<String>,
+    /// `ca-base <dir>`: where a relative `ca-file` / `crl-file` path of a `server` is read.
+    pub ca_base: Option<String>,
     /// Global log tag (`log-tag`). Defaults to "haproxy".
     pub log_tag: Option<std::sync::Arc<str>>,
 }

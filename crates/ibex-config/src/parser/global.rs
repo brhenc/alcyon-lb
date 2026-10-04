@@ -365,6 +365,28 @@ pub(crate) fn parse_global_directive(
             }
             Ok(())
         }
+        "crt-base" | "ca-base" => {
+            let Some(dir) = tokens.get(1) else {
+                return Err(ConfigError::new(
+                    kw.line,
+                    kw.col,
+                    format!("global statement '{}' expects a directory path as an argument.", kw.text),
+                ));
+            };
+            if let Some(extra) = tokens.get(2) {
+                return Err(ConfigError::new(
+                    extra.line,
+                    extra.col,
+                    format!("'{}' cannot handle unexpected argument '{}'.", kw.text, extra.text),
+                ));
+            }
+            let slot = if kw.text == "crt-base" { &mut global.crt_base } else { &mut global.ca_base };
+            if slot.is_some() {
+                return Err(ConfigError::new(kw.line, kw.col, format!("'{}' already specified.", kw.text)));
+            }
+            *slot = Some(dir.text.clone());
+            Ok(())
+        }
         "set-var" => {
             if tokens.len() >= 3 {
                 let var_name = tokens[1].text.clone();
