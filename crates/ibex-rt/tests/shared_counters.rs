@@ -356,3 +356,45 @@ fn a_tcp_backend_retry_after_a_refused_connect_waits_the_turnaround() {
     assert_eq!(stat(&engine, "li", "BACKEND", "wretr"), "1", "wretr");
     assert_eq!(stat(&engine, "li", "BACKEND", "econ"), "1", "econ");
 }
+
+const BLACKHOLE: &str = "10.255.255.1:80";
+
+/// A server that never answers: each connect ends at `timeout connect`, with no turnaround
+/// between attempts (`HAProxy` 3.5-dev8, `timeout connect` 300 ms: `retries 0` 503 after
+/// 0.31 s, `retries 1` after 0.65 s, `retries 2` after 0.92 s; `econ` 1 on the backend and
+/// the server whatever the retries, `wretr` = retries, server `stot` = retries + 1; with
+/// 100 ms and `retries 2`, 0.31 s).
+fn blackhole(retries: u32) -> (Engine, Vec<u8>, std::time::Duration) {
+    let body = format!(
+        "frontend fe\n    mode http\n    bind @FE@\n    default_backend be\n\
+         backend be\n    mode http\n    timeout connect 200ms\n    retries {retries}\n    server s {BLACKHOLE}\n"
+    );
+    let (mut engine, fe) = start(&body);
+    let (got, took) = answer(&mut engine, fe);
+    (engine, got, took)
+}
+
+#[test]
+fn a_connect_timeout_without_retries_answers_503_and_counts_econ() {
+    let (engine, got, took) = blackhole(0);
+    assert!(got.starts_with(b"HTTP/1.1 503"), "{}", String::from_utf8_lossy(&got));
+    assert!(took >= std::time::Duration::from_millis(190), "503 after {took:?}");
+    for sv in ["BACKEND", "s"] {
+        assert_eq!(stat(&engine, "be", sv, "econ"), "1", "{sv} econ");
+        assert_eq!(stat(&engine, "be", sv, "wretr"), "0", "{sv} wretr");
+    }
+    assert_eq!(stat(&engine, "be", "s", "stot"), "1");
+}
+
+#[test]
+fn a_connect_timeout_is_retried_without_a_turnaround() {
+    let (engine, got, took) = blackhole(2);
+    assert!(got.starts_with(b"HTTP/1.1 503"), "{}", String::from_utf8_lossy(&got));
+    assert!(took >= std::time::Duration::from_millis(590), "503 after {took:?}");
+    assert!(took < std::time::Duration::from_millis(900), "503 after {took:?}");
+    for sv in ["BACKEND", "s"] {
+        assert_eq!(stat(&engine, "be", sv, "econ"), "1", "{sv} econ");
+        assert_eq!(stat(&engine, "be", sv, "wretr"), "2", "{sv} wretr");
+    }
+    assert_eq!(stat(&engine, "be", "s", "stot"), "3");
+}

@@ -6578,7 +6578,18 @@ impl EngineDispatcher<'_> {
             }
 
             // Step 2: Check timeouts
-            let _ = entry.sess.check_timeouts(now);
+            let timed_out = entry.sess.check_timeouts(now);
+            // `timeout connect` expired: a failed connect like any other (`back_handle_st_cer`),
+            // retried at once -- no turnaround, which only follows an asynchronous error --
+            // and counted in `econ` once the retries are spent.
+            if timed_out
+                && matches!(entry.sess.ending, Some(crate::proxy::Ending::Timeout(crate::proxy::Which::Connect)))
+                && entry.srv_raw_fd.is_some()
+                && !entry.sess.is_done()
+            {
+                entry.sess.ending = None;
+                server_connect_failed(entry, self.proxies, self.fdtab, self.poller, now, false);
+            }
             // A retry that waited out its turnaround connects now.
             if entry.sess.retry_after.is_set() && entry.sess.retry_after.is_expired(now) && !entry.sess.is_done() {
                 retry_now(entry, self.proxies, self.fdtab, self.poller, now);
