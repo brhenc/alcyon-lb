@@ -111,3 +111,27 @@ million steps on a real header is a pattern to rewrite.
 
 The plain pattern `^/(a+)+$`, with no PCRE-only feature, is not backtracking at all on Ibex
 (it runs in `regex`, linear time) and gives the answer PCRE2 gives.
+
+## Out of Milestone 1 scope: refused at load (T164)
+
+These are refused by the parser with `'<keyword>' is not supported by Ibex (out of scope, see
+docs/differences.md)`, so a configuration that relies on one fails to load instead of running
+without it. HAProxy accepts them (when built with the feature).
+
+| family | refused keywords |
+|---|---|
+| Lua | `lua-load`, `lua-load-per-thread`, `lua-prepend-path`, `tune.lua.*`, `http-request` / `http-response` actions `lua.<name>`, `tcp-request ... lua.<name>` ("lua actions require Lua support"), `lua.<name>` fetches and converters in `%[...]`, `use-service` |
+| SPOE and filters | `filter spoe`, `filter compression`, any `filter` line |
+| Compression | `compression algo/type/offload/...` |
+| Peers | `peers` sections, `stick-table ... peers <name>` |
+| Cache | `cache` sections, `http-request cache-use`, `http-response cache-store` |
+| FastCGI | `fcgi-app` sections, `use-fcgi-app`; `server ... proto fcgi` is refused too |
+| OpenSSL-only | `ssl-engine`, `ssl-mode-async`, `ssl-propquery`, `ssl-provider`, `ssl-provider-path`, `tune.ssl.async` |
+
+Not refused, on purpose:
+
+- QUIC / HTTP/3 (`quic4@`, `quic6@`, `proto quic`, `alpn h3`): Ibex has a QUIC listener
+  (`ibex-quic`, exercised by `crates/ibex-config/tests/quic_bind.rs`); it is experimental.
+  The reference HAProxy binary here is built without QUIC and refuses these.
+- `resolvers` sections: accepted, their keywords are not used by the data path; a server's
+  `resolvers` keyword and `server-template` are refused (see `server_keywords.rs`).
