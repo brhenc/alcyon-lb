@@ -146,3 +146,33 @@ fn option_forwarded_refusals_are_haproxys() {
         assert!(err.contains(want), "{line}: {err}");
     }
 }
+
+#[test]
+fn errorloc_and_replace_uri_refusals() {
+    for (line, want) in [
+        ("errorloc 503", "errorloc : expects <status_code> and <url> as arguments."),
+        ("errorloc 503 /x extra", "errorloc : expects exactly two arguments."),
+        ("errorloc 999 /x", "errorloc : status code '999' not handled."),
+        ("errorloc302 abc /x", "errorloc302 : status code '0' not handled."),
+        ("http-request replace-uri a", "expects <regex> and <replace>"),
+    ] {
+        let err = parse_config(&cfg("frontend", line)).expect_err(line).to_string();
+        assert!(err.contains(want), "{line}: {err}");
+    }
+}
+
+#[test]
+fn more_userlist_lines() {
+    for (text, want) in [
+        ("userlist\n  user a\n", "'userlist' expects <name> as arguments."),
+        ("userlist ul\n  group g bogus\n", "'group' only supports 'users' option."),
+    ] {
+        let err = parse_config(text).expect_err(text).to_string();
+        assert!(err.contains(want), "{text}: {err}");
+    }
+    // A duplicate group is ignored (HAProxy warns), and so is a second userlist of a name.
+    let c = parse_config("userlist ul\n  group g\n  group g\n  user a insecure-password x\nuserlist ul\n  user b\n").expect("accepted");
+    assert_eq!(c.userlists.len(), 1);
+    assert_eq!(c.userlists[0].groups, ["g"]);
+    assert_eq!(c.userlists[0].users.len(), 1);
+}

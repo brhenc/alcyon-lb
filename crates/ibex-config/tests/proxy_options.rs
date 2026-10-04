@@ -113,7 +113,6 @@ const IBEX_REFUSES: &[(&str, &str)] = &[
     // Checks Ibex cannot run: the server would get a bare TCP connect and be reported UP.
     ("spop-check", "bld"),
     // What reaches the server or the client.
-    ("forwarded", "bld"),
     ("http-restrict-req-hdr-names reject", "fbld"),
     ("http-drop-request-trailers", "bld"),
     ("http-drop-response-trailers", "fld"),

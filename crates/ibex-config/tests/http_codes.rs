@@ -24,6 +24,7 @@ fn the_lines_haproxy_refuses_are_refused_with_its_messages() {
         ("http-err-codes 99", "Invalid status codes range '99' in 'http-err-codes'.".to_string()),
         ("http-err-codes 600", "Invalid status codes range '600' in 'http-err-codes'.".to_string()),
         ("http-err-codes 500-400", "Invalid status codes range '500-400' in 'http-err-codes'.".to_string()),
+        ("http-err-codes 400x", format!("Invalid status codes range '400x' in 'http-err-codes' at position 3. {form}")),
         ("http-fail-codes 1000", "Invalid status codes range '1000' in 'http-fail-codes'.".to_string()),
     ] {
         let err = global(line).expect_err(line);

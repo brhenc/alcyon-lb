@@ -494,10 +494,23 @@ fn option_forwarded_expressions_are_checked_at_load() {
     }
 }
 
+#[test]
+fn the_auth_action_uses_the_401_page_the_proxy_has() {
+    // Measured on HAProxy 3.5-dev8-885761-29: the `http-error status 401` page, with
+    // `www-authenticate` added.
+    let cfg = "defaults\n  mode http\n  timeout client 5s\n\
+frontend fe\n  bind {fe}\n  http-error status 401 content-type text/plain string \"need login\"\n  http-request auth realm r\n";
+    let (_i, fe) = start(cfg);
+    let got = send(fe, "GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n").to_ascii_lowercase();
+    assert!(got.starts_with("http/1.1 401 unauthorized\r\n"), "{got:?}");
+    assert!(got.contains("www-authenticate: basic realm=\"r\"\r\n") && got.contains("content-type: text/plain"), "{got:?}");
+    assert!(got.ends_with("\r\n\r\nneed login"), "{got:?}");
+}
+
 const ERR_FAIL: &str = "{global}defaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n\
 frontend fe\n  bind {fe}\n  http-request track-sc0 path\n\
   http-after-response add-header x-table err=%[sc0_http_err_cnt],fail=%[sc0_http_fail_cnt]\n\
-  stick-table type string size 100 store http_err_cnt,http_fail_cnt\n\
+  stick-table type string size 100 store http_err_cnt,http_fail_cnt,http_err_rate(10s)\n\
   http-request deny if { path /deny }\n  http-request return status 404 if { path /ret404 }\n\
   http-request return status 500 if { path /ret500 }\n  default_backend be\n\
 backend be\n  server s {status}\n";

@@ -278,37 +278,25 @@ pub(crate) fn register(reg: &mut Registry) {
         name: "rfc7239_is_valid",
         in_type: TypeSpec::Exact(SampleType::Str),
         out_type: TypeSpec::Exact(SampleType::Bool),
-        func: |smp, _| match smp {
-            Sample::Str(s) => Some(Sample::Bool(is_valid(&s))),
-            _ => None,
-        },
+        func: |smp, _| if let Sample::Str(s) = smp { Some(Sample::Bool(is_valid(&s))) } else { None },
     });
     reg.register_converter(ConvDesc {
         name: "rfc7239_field",
         in_type: TypeSpec::Exact(SampleType::Str),
         out_type: TypeSpec::Exact(SampleType::Str),
-        func: |smp, args| match smp {
-            Sample::Str(s) => field(&s, args.first()?).map(Sample::Str),
-            _ => None,
-        },
+        func: |smp, args| if let Sample::Str(s) = smp { field(&s, args.first()?).map(Sample::Str) } else { None },
     });
     reg.register_converter(ConvDesc {
         name: "rfc7239_n2nn",
         in_type: TypeSpec::Exact(SampleType::Str),
         out_type: TypeSpec::Exact(SampleType::Str),
-        func: |smp, _| match smp {
-            Sample::Str(s) => n2nn(&s).map(Sample::Str),
-            _ => None,
-        },
+        func: |smp, _| if let Sample::Str(s) = smp { n2nn(&s).map(Sample::Str) } else { None },
     });
     reg.register_converter(ConvDesc {
         name: "rfc7239_n2np",
         in_type: TypeSpec::Exact(SampleType::Str),
         out_type: TypeSpec::Exact(SampleType::Str),
-        func: |smp, _| match smp {
-            Sample::Str(s) => n2np(&s).map(Sample::Str),
-            _ => None,
-        },
+        func: |smp, _| if let Sample::Str(s) = smp { n2np(&s).map(Sample::Str) } else { None },
     });
     reg.register_converter(ConvDesc {
         name: "rfc7239_nn",
