@@ -108,6 +108,7 @@ fn main() {
         http_req_rules.push(HttpReqRule {
             action: HttpReqAction::Capture { expr: "req.hdr(host)".into(), len: Some(20), id: None },
             cond: None,
+            line: 0,
         });
     }
     let cfg = Config {
