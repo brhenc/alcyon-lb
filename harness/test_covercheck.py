@@ -194,3 +194,69 @@ class StaleBinaries(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CorruptProfiles(unittest.TestCase):
+    """T143: one corrupt .profraw made `llvm-profdata merge` fail, no report was written,
+    and covercheck printed "skipping" -- the gate counted the section as passed."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        src = os.path.join(cls.tmp.name, "p.rs")
+        with open(src, "w") as f:
+            f.write("fn main() { println!(\"x\"); }\n")
+        exe = os.path.join(cls.tmp.name, "p")
+        subprocess.run(["rustc", "-C", "instrument-coverage", "-o", exe, src], check=True,
+                       capture_output=True)
+        cls.good = os.path.join(cls.tmp.name, "good.profraw")
+        subprocess.run([exe], check=True, capture_output=True,
+                       env={**os.environ, "LLVM_PROFILE_FILE": cls.good})
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def dir_with(self, n_good: int, n_bad: int) -> tempfile.TemporaryDirectory:
+        d = tempfile.TemporaryDirectory()
+        data = open(self.good, "rb").read()
+        for i in range(n_good):
+            with open(os.path.join(d.name, f"g{i}.profraw"), "wb") as f:
+                f.write(data)
+        for i in range(n_bad):
+            with open(os.path.join(d.name, f"b{i}.profraw"), "wb") as f:
+                f.write(b"\0" * 64 + data[:20])  # header is corrupt
+        return d
+
+    def test_corrupt_profiles_are_dropped_and_counted(self):
+        d = self.dir_with(3, 2)
+        self.addCleanup(d.cleanup)
+        dropped = covercheck.drop_corrupt_profiles(d.name, covercheck._llvm_env())
+        self.assertEqual(sorted(dropped), ["b0.profraw", "b1.profraw"])
+        self.assertEqual(sorted(os.listdir(d.name)), ["g0.profraw", "g1.profraw", "g2.profraw"])
+
+    def test_clean_profiles_are_left_alone(self):
+        d = self.dir_with(2, 0)
+        self.addCleanup(d.cleanup)
+        self.assertEqual(covercheck.drop_corrupt_profiles(d.name, covercheck._llvm_env()), [])
+        self.assertEqual(len(os.listdir(d.name)), 2)
+
+    def test_no_usable_profile_is_a_failure_not_a_skip(self):
+        d = self.dir_with(0, 2)
+        self.addCleanup(d.cleanup)
+        self.assertEqual(len(covercheck.drop_corrupt_profiles(d.name, covercheck._llvm_env())), 2)
+        self.assertFalse(covercheck.has_profiles(d.name))
+
+
+class MissingReport(unittest.TestCase):
+    def test_no_lcov_file_is_a_failure_not_a_skip(self):
+        old = covercheck.LCOV
+        with tempfile.TemporaryDirectory() as t:
+            covercheck.LCOV = os.path.join(t, "none.lcov")
+            orig = covercheck.run_pooled
+            covercheck.run_pooled = lambda: True  # tests "ran" and wrote nothing
+            try:
+                self.assertIsNone(covercheck.covered({"a.rs"}))
+            finally:
+                covercheck.run_pooled = orig
+                covercheck.LCOV = old

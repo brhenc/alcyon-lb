@@ -126,6 +126,11 @@ def covered(paths: set[str]) -> tuple[dict[str, set[int]], dict[str, set[int]]] 
     ok = run_serial() if os.environ.get("COVERCHECK_SERIAL") == "1" else run_pooled()
     if not ok:
         return None
+    if not os.path.exists(LCOV):
+        # T143: no report is not "nothing to judge". The gate once passed this section with
+        # a corrupt profile and no report at all.
+        print("covercheck: no coverage report was produced; FAILING, not skipping")
+        return None
     return read_lcov(paths)
 
 
@@ -185,11 +190,43 @@ def run_pooled() -> bool:
         print(f"covercheck: only {profraws} profiles written by {binaries} test binaries: the "
               "build was not instrumented, so this report cannot judge anything")
         return False
+    dropped = drop_corrupt_profiles(tdir, env)
+    if dropped:
+        print(f"covercheck: dropped {len(dropped)} corrupt profile(s) of {profraws}: "
+              + ", ".join(dropped[:8]) + (" ..." if len(dropped) > 8 else ""))
+    if not has_profiles(tdir):
+        print("covercheck: no usable profile: no report can be made")
+        return False
     rep = subprocess.run(["cargo", "llvm-cov", "report", "--lcov", "--output-path", LCOV],
                          cwd=REPO, capture_output=True, text=True, env={**env, "CARGO_TARGET_DIR": outer})
     if rep.returncode != 0:
         print((rep.stderr or rep.stdout)[-600:])
+        return False
     return True
+
+
+def has_profiles(tdir: str) -> bool:
+    return any(f.endswith(".profraw") for f in os.listdir(tdir))
+
+
+def drop_corrupt_profiles(tdir: str, env: dict) -> list[str]:
+    """Deletes the `.profraw` files `llvm-profdata` cannot read (T143) and returns their
+    names. One bad file fails the whole merge `cargo llvm-cov report` does. The common case,
+    all good, costs one merge."""
+    prof = env.get("LLVM_PROFDATA", "llvm-profdata")
+    names = sorted(f for f in os.listdir(tdir) if f.endswith(".profraw"))
+
+    def ok(files: list[str]) -> bool:
+        r = subprocess.run([prof, "merge", "-o", os.devnull, *[os.path.join(tdir, f) for f in files]],
+                           capture_output=True, env=env)
+        return r.returncode == 0
+
+    if not names or ok(names):
+        return []
+    bad = [f for f in names if not ok([f])]
+    for f in bad:
+        os.unlink(os.path.join(tdir, f))
+    return bad
 
 
 def prune_stale_binaries(deps: str, current: set[str]) -> int:
@@ -270,7 +307,7 @@ def run_serial() -> bool:
     finally:
         stop.set()
     if not os.path.exists(LCOV):
-        print("covercheck: cargo llvm-cov produced no report; skipping")
+        print("covercheck: cargo llvm-cov produced no report")
         print((r.stderr or r.stdout)[-400:])
     return True
 
