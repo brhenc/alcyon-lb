@@ -1658,11 +1658,6 @@ pub fn find_eoh(buf: &[u8]) -> Option<(usize, usize)> {
 }
 
 #[must_use]
-pub const fn status_reason(status: u16) -> &'static str {
-    ibex_proto::status_reason_phrase(status)
-}
-
-#[must_use]
 pub fn format_log_fmt(fmt: &str, client_addr: Option<SocketAddr>, elapsed_ms: u64) -> String {
     let mut out = String::with_capacity(fmt.len() + 16);
     let mut chars = fmt.chars().peekable();
@@ -1793,7 +1788,7 @@ pub fn update_http_response_status(raw: &str, status: u16) -> String {
         return raw.to_string();
     };
     let version = first_line.split_whitespace().next().unwrap_or("HTTP/1.1");
-    let reason = status_reason(status);
+    let reason = ibex_proto::status_reason_phrase(status);
     let new_first_line = format!("{version} {status} {reason}");
     format!("{new_first_line}\r\n{rest}")
 }
