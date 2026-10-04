@@ -56,7 +56,7 @@ const GET: &[u8] = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n";
 #[test]
 fn a_tcp_listen_counts_a_connect_refused_at_once() {
     let body = format!("listen li\n    mode tcp\n    bind @FE@\n    server s {UNREACHABLE}\n");
-    // `HAProxy` counts 1; Ibex counts the retry's failure too (2), a separate defect.
+    // `HAProxy` counts 1, once the retries are spent (see the `retries 2` cases below).
     assert!(counted(&body, b"x", "li", econ) >= 1);
 }
 
@@ -155,4 +155,204 @@ fn an_http_backend_retry_refused_at_once_ends_the_request() {
     let s = engine.proxies[p].counters();
     assert_eq!(s.retries_count.load(Ordering::Relaxed), 1, "wretr");
     assert_eq!(econ(s), 1, "econ");
+}
+
+/// Sends a GET and steps the engine until a whole response head is back (or 5 s pass).
+/// Returns what came back and how long it took.
+fn answer(engine: &mut Engine, fe: std::net::SocketAddr) -> (Vec<u8>, std::time::Duration) {
+    let started = std::time::Instant::now();
+    let mut c = TcpStream::connect(fe).expect("connect");
+    let _ = c.write_all(GET);
+    c.set_nonblocking(true).expect("nonblocking");
+    let mut got = Vec::new();
+    while started.elapsed() < std::time::Duration::from_secs(5) && !got.windows(4).any(|w| w == b"\r\n\r\n") {
+        let _ = engine.run_once();
+        let mut buf = [0u8; 4096];
+        if let Ok(n) = c.read(&mut buf) {
+            got.extend_from_slice(&buf[..n]);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    (got, started.elapsed())
+}
+
+/// Field `field` of the `show stat` row `px`/`sv`.
+fn stat(engine: &Engine, px: &str, sv: &str, field: &str) -> String {
+    let csv = ibex_rt::stats::format_show_stat(&engine.proxies, &engine.checks, 1);
+    let mut lines = csv.lines();
+    let head: Vec<&str> = lines.next().expect("header").trim_start_matches("# ").split(',').collect();
+    let col = head.iter().position(|h| *h == field).expect("field");
+    let row = lines
+        .map(|l| l.split(',').collect::<Vec<_>>())
+        .find(|r| r.first() == Some(&px) && r.get(1) == Some(&sv))
+        .expect("row");
+    row[col].to_string()
+}
+
+/// `retries 0`: the one connect refused at once is the end, a 503 at once (`HAProxy`:
+/// < 1 ms, `econ` 1 and `wretr` 0 on the backend and the server).
+#[test]
+fn an_http_backend_without_retries_refused_at_once_answers_503_at_once() {
+    let body = format!(
+        "frontend fe\n    mode http\n    bind @FE@\n    default_backend be\n\
+         backend be\n    mode http\n    retries 0\n    server s {UNREACHABLE}\n"
+    );
+    let (mut engine, fe) = start(&body);
+    let (got, took) = answer(&mut engine, fe);
+    assert!(got.starts_with(b"HTTP/1.1 503"), "{}", String::from_utf8_lossy(&got));
+    assert!(took < std::time::Duration::from_millis(500), "503 after {took:?}");
+    for sv in ["BACKEND", "s"] {
+        assert_eq!(stat(&engine, "be", sv, "econ"), "1", "{sv} econ");
+        assert_eq!(stat(&engine, "be", sv, "wretr"), "0", "{sv} wretr");
+    }
+}
+
+/// `retries 2` against a server refused at once: both retries run at once, without the
+/// turnaround, and the last failure alone counts in `econ` (`HAProxy`: 503 in < 1 ms,
+/// `wretr` 2, `econ` 1 on the backend and the server).
+#[test]
+fn an_http_backend_two_retries_refused_at_once_answer_503_at_once() {
+    let body = format!(
+        "frontend fe\n    mode http\n    bind @FE@\n    default_backend be\n\
+         backend be\n    mode http\n    retries 2\n    server s {UNREACHABLE}\n"
+    );
+    let (mut engine, fe) = start(&body);
+    let (got, took) = answer(&mut engine, fe);
+    assert!(got.starts_with(b"HTTP/1.1 503"), "{}", String::from_utf8_lossy(&got));
+    assert!(took < std::time::Duration::from_millis(500), "503 after {took:?}");
+    for sv in ["BACKEND", "s"] {
+        assert_eq!(stat(&engine, "be", sv, "econ"), "1", "{sv} econ");
+        assert_eq!(stat(&engine, "be", sv, "wretr"), "2", "{sv} wretr");
+        assert_eq!(stat(&engine, "be", sv, "wredis"), "0", "{sv} wredis");
+    }
+}
+
+/// `mode tcp`, `retries 2`: the client is closed once the retries are spent (`HAProxy`:
+/// `wretr` 2, `econ` 1 on the backend and the server).
+#[test]
+fn a_tcp_backend_two_retries_refused_at_once_close_the_client() {
+    let body = format!("listen li\n    mode tcp\n    bind @FE@\n    retries 2\n    server s {UNREACHABLE}\n");
+    let (mut engine, fe) = start(&body);
+    let mut c = TcpStream::connect(fe).expect("connect");
+    let _ = c.write_all(b"x");
+    c.set_nonblocking(true).expect("nonblocking");
+    let mut buf = [0u8; 16];
+    let closed = common::drive_until(&mut engine, |_| match c.read(&mut buf) {
+        Ok(0) => true,
+        Err(e) => e.kind() != std::io::ErrorKind::WouldBlock,
+        Ok(_) => false,
+    });
+    assert!(closed, "the client is still open");
+    for sv in ["BACKEND", "s"] {
+        assert_eq!(stat(&engine, "li", sv, "econ"), "1", "{sv} econ");
+        assert_eq!(stat(&engine, "li", sv, "wretr"), "2", "{sv} wretr");
+    }
+}
+
+/// `mode tcp`, `retries 0`: the connect made at accept, refused at once, is the end
+/// (`HAProxy`: the client closed at once; `econ` 1, `wretr` 0 on the backend and the server).
+#[test]
+fn a_tcp_backend_without_retries_refused_at_once_closes_the_client() {
+    let body = format!("listen li\n    mode tcp\n    bind @FE@\n    retries 0\n    server s {UNREACHABLE}\n");
+    assert!(closes_the_client_of(&body));
+}
+
+/// A retry that finds no server left -- the one server went down while its connect was
+/// under way, and `option redispatch` asks the balancer again -- ends the stream (the
+/// client is closed) rather than leaving it waiting.
+#[test]
+fn a_tcp_backend_retry_with_no_server_left_ends_the_stream() {
+    let dead = common::reserve_addr();
+    let body = format!(
+        "listen li\n    mode tcp\n    bind @FE@\n    option redispatch\n    server s {dead}\n"
+    );
+    let (mut engine, fe) = start(&body);
+    let p = idx(&engine, "li");
+    let mut c = TcpStream::connect(fe).expect("connect");
+    let _ = c.write_all(b"x");
+    c.set_nonblocking(true).expect("nonblocking");
+    // The stream is accepted, its connect under way; the server goes down before the
+    // refusal comes back.
+    let accepted = common::drive_until(&mut engine, |e| e.proxies[p].counters().cum_conn.load(Ordering::Relaxed) == 1);
+    assert!(accepted, "not accepted");
+    engine.proxies[p].server_statuses[0].store(ibex_rt::check::ServerStatus::Down as u8, Ordering::Relaxed);
+    let mut buf = [0u8; 16];
+    let closed = common::drive_until(&mut engine, |_| match c.read(&mut buf) {
+        Ok(0) => true,
+        Err(e) => e.kind() != std::io::ErrorKind::WouldBlock,
+        Ok(_) => false,
+    });
+    assert!(closed, "the client is still open");
+}
+
+/// Whether the client of a `mode tcp` proxy is closed, and the backend and server rows
+/// then show `econ` 1, `wretr` 0.
+fn closes_the_client_of(body: &str) -> bool {
+    let (mut engine, fe) = start(body);
+    let mut c = TcpStream::connect(fe).expect("connect");
+    let _ = c.write_all(b"x");
+    c.set_nonblocking(true).expect("nonblocking");
+    let mut buf = [0u8; 16];
+    let closed = common::drive_until(&mut engine, |_| match c.read(&mut buf) {
+        Ok(0) => true,
+        Err(e) => e.kind() != std::io::ErrorKind::WouldBlock,
+        Ok(_) => false,
+    });
+    for sv in ["BACKEND", "s"] {
+        assert_eq!(stat(&engine, "li", sv, "econ"), "1", "{sv} econ");
+        assert_eq!(stat(&engine, "li", sv, "wretr"), "0", "{sv} wretr");
+    }
+    closed
+}
+
+/// `option redispatch`, two servers both refused at once, `retries 2`: every retry is a
+/// redispatch to the other server, and only the server tried last counts the failure
+/// (`HAProxy`: 503 in < 1 ms; backend `wredis` 2, `wretr` 0, `econ` 1; each server
+/// `wredis` 1; `econ` 1 on the one tried last, 0 on the other).
+#[test]
+fn an_http_backend_redispatch_refused_at_once_answers_503_at_once() {
+    let body = format!(
+        "frontend fe\n    mode http\n    bind @FE@\n    default_backend be\n\
+         backend be\n    mode http\n    retries 2\n    option redispatch\n    balance roundrobin\n\
+         \x20   server s {UNREACHABLE}\n    server s2 255.255.255.255:81\n"
+    );
+    let (mut engine, fe) = start(&body);
+    let (got, took) = answer(&mut engine, fe);
+    assert!(got.starts_with(b"HTTP/1.1 503"), "{}", String::from_utf8_lossy(&got));
+    assert!(took < std::time::Duration::from_millis(500), "503 after {took:?}");
+    assert_eq!(stat(&engine, "be", "BACKEND", "econ"), "1", "backend econ");
+    assert_eq!(stat(&engine, "be", "BACKEND", "wredis"), "2", "backend wredis");
+    assert_eq!(stat(&engine, "be", "BACKEND", "wretr"), "0", "backend wretr");
+    for sv in ["s", "s2"] {
+        assert_eq!(stat(&engine, "be", sv, "wredis"), "1", "{sv} wredis");
+        assert_eq!(stat(&engine, "be", sv, "wretr"), "0", "{sv} wretr");
+    }
+    let mut econ: Vec<String> = ["s", "s2"].iter().map(|sv| stat(&engine, "be", sv, "econ")).collect();
+    econ.sort();
+    assert_eq!(econ, ["0", "1"], "server econ");
+}
+
+/// `mode tcp`, a connect refused later by the poller (an asynchronous error, a closed port
+/// on 127.0.0.1): the retry to the same server waits out the turnaround, `MIN(1s, timeout
+/// connect)` (`HAProxy`, `retries 1`: the client is closed after 1.0 s; `wretr` 1, `econ` 1).
+#[test]
+fn a_tcp_backend_retry_after_a_refused_connect_waits_the_turnaround() {
+    let dead = common::reserve_addr();
+    let body = format!("listen li\n    mode tcp\n    bind @FE@\n    server s {dead}\n");
+    let (mut engine, fe) = start(&body);
+    let started = std::time::Instant::now();
+    let mut c = TcpStream::connect(fe).expect("connect");
+    let _ = c.write_all(b"x");
+    c.set_nonblocking(true).expect("nonblocking");
+    let mut buf = [0u8; 16];
+    let closed = common::drive_until(&mut engine, |_| match c.read(&mut buf) {
+        Ok(0) => true,
+        Err(e) => e.kind() != std::io::ErrorKind::WouldBlock,
+        Ok(_) => false,
+    });
+    assert!(closed, "the client is still open");
+    let took = started.elapsed();
+    assert!(took >= std::time::Duration::from_millis(900), "closed after {took:?}");
+    assert_eq!(stat(&engine, "li", "BACKEND", "wretr"), "1", "wretr");
+    assert_eq!(stat(&engine, "li", "BACKEND", "econ"), "1", "econ");
 }

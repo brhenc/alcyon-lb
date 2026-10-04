@@ -702,8 +702,9 @@ pub struct Proxy {
     pub server_backups: Vec<bool>,
     pub server_maxconn: Vec<Option<u32>>,
     pub server_actconn: Arc<Vec<AtomicU32>>,
-    /// Per server `(wretr, wredis)`: retries on it and redispatches away from it.
-    pub server_retr: Arc<std::sync::Mutex<std::collections::HashMap<usize, (u64, u64)>>>,
+    /// Per server `(wretr, wredis, econ)`: retries on it, redispatches away from it, and
+    /// streams whose last connect attempt, out of retries, failed on it.
+    pub server_retr: Arc<std::sync::Mutex<std::collections::HashMap<usize, (u64, u64, u64)>>>,
     /// Streams assigned to each server per second (`srv_sess_rate`).
     pub server_sess_rates: Arc<Vec<RateCtr>>,
     pub server_check_configs: Vec<Option<Box<ServerCheckConfig>>>,
@@ -4907,11 +4908,14 @@ fn init_client_session(
                 if immediate {
                     sess.server_connected(now);
                 }
-            } else {
+            } else if !sess.server_failed() {
+                // Out of retries already: `econ` counts this one (`server_connect_failed`
+                // counts the failures of the retries).
                 proxy.counters().failed_conn.fetch_add(1, Ordering::Relaxed);
-                if !sess.server_failed() {
-                    sess.srv_state = ScState::Error;
+                if let Some(i) = proxy.servers.iter().position(|&s| s == target) {
+                    proxy.server_retr.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entry(i).or_default().2 += 1;
                 }
+                sess.srv_state = ScState::Error;
             }
         } else {
             sess.srv_state = ScState::Error;
@@ -5220,13 +5224,60 @@ fn count_server_session(proxies: &[Proxy], be_idx: usize, addr: SocketAddr) {
         .inspect(|rate| rate.tick());
 }
 
+/// A connect attempt to the stream's server failed (`back_handle_st_cer`): while retries
+/// remain, connect again -- after the turnaround (`SC_ST_TAR`) when `wait`, an asynchronous
+/// connect error, and the server is the same one; at once after a connect refused at once.
+/// Out of retries, the failure counts in `econ` on the backend and on the server tried
+/// last (once per stream, not per attempt: measured on `HAProxy`, `retries 2` shows
+/// `wretr` 2, `econ` 1) and the stream ends, with a 503 in HTTP.
+fn server_connect_failed(
+    entry: &mut SessionEntry,
+    proxies: &[Proxy],
+    fdtab: &mut FdTab,
+    poller: &mut Poller,
+    now: Tick,
+    mut wait: bool,
+) {
+    loop {
+        if !entry.sess.server_failed() {
+            let be = &proxies[entry.srv_backend_idx];
+            be.counters().failed_conn.fetch_add(1, Ordering::Relaxed);
+            if let Some(i) = entry.target_server_idx {
+                be.server_retr.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entry(i).or_default().2 += 1;
+            }
+            entry.sess.srv_state = ScState::Error;
+            if entry.sess.mode == Mode::Http {
+                reply_error(entry, proxies, 503);
+            }
+            return;
+        }
+        if !retry_server_connect(entry, proxies, fdtab, poller, now, wait) {
+            return;
+        }
+        wait = false;
+    }
+}
+
+/// Connects again now, the retry of a connect that failed (a turnaround over, or the
+/// connect made at accept refused at once); a refusal at once is the next failure.
+fn retry_now(entry: &mut SessionEntry, proxies: &[Proxy], fdtab: &mut FdTab, poller: &mut Poller, now: Tick) {
+    if retry_server_connect(entry, proxies, fdtab, poller, now, false) {
+        server_connect_failed(entry, proxies, fdtab, poller, now, false);
+    }
+}
+
+/// Connects the stream again after a failed attempt, to the same server or, redispatched,
+/// another. Returns `true` when this connect is refused at once, which the caller handles
+/// as the next failure ([`server_connect_failed`]); a turnaround armed or a connect under
+/// way returns `false`.
 fn retry_server_connect(
     entry: &mut SessionEntry,
     proxies: &[Proxy],
     fdtab: &mut FdTab,
     poller: &mut Poller,
     now: Tick,
-) {
+    wait: bool,
+) -> bool {
     if let (Some(srv_fd), Some(sfd)) = (entry.sess.srv.take(), entry.srv_raw_fd.take()) {
         let _ = poller.delete(srv_fd.as_fd());
         fdtab.remove(sfd);
@@ -5317,14 +5368,15 @@ fn retry_server_connect(
 
     let Some(target_addr) = target else {
         entry.sess.srv_state = ScState::Error;
-        return;
+        return false;
     };
 
-    // The same server again: wait `MIN(1s, timeout connect)` first (`SC_ST_TAR`,
-    // `src/backend.c`). `check_timeouts_and_retry` resumes the connect when it is over.
-    if !resuming && entry.target_addr == Some(target_addr) {
+    // The same server again after an asynchronous connect error: wait `MIN(1s, timeout
+    // connect)` first (`SC_ST_TAR`, `src/backend.c`). `check_timeouts_and_retry` resumes the
+    // connect when it is over. A connect refused at once is retried at once.
+    if wait && !resuming && entry.target_addr == Some(target_addr) {
         entry.sess.retry_after = now.add(entry.sess.retry_delay_ms());
-        return;
+        return false;
     }
 
     let s_idx = proxies[be_idx]
@@ -5385,14 +5437,9 @@ fn retry_server_connect(
             }
         }
     } else {
-        proxies[be_idx].counters().failed_conn.fetch_add(1, Ordering::Relaxed);
-        if !entry.sess.server_failed() {
-            entry.sess.srv_state = ScState::Error;
-            if entry.sess.mode == Mode::Http {
-                reply_error(entry, proxies, 503);
-            }
-        }
+        return true;
     }
+    false
 }
 
 fn check_srv_connect(
@@ -5430,16 +5477,7 @@ fn check_srv_connect(
                         entry.srv_interest = new_interest;
                     }
                 } else {
-                    let be_idx = EngineDispatcher::resolve_backend(entry, proxies).unwrap_or(entry.proxy_idx);
-                    proxies[be_idx].counters().failed_conn.fetch_add(1, Ordering::Relaxed);
-                    if entry.sess.server_failed() {
-                        retry_server_connect(entry, proxies, fdtab, poller, now);
-                    } else {
-                        entry.sess.srv_state = ScState::Error;
-                        if entry.sess.mode == Mode::Http {
-                            reply_error(entry, proxies, 503);
-                        }
-                    }
+                    server_connect_failed(entry, proxies, fdtab, poller, now, true);
                 }
             }
         }
@@ -6142,7 +6180,7 @@ impl EngineDispatcher<'_> {
             let _ = entry.sess.check_timeouts(now);
             // A retry that waited out its turnaround connects now.
             if entry.sess.retry_after.is_set() && entry.sess.retry_after.is_expired(now) && !entry.sess.is_done() {
-                retry_server_connect(entry, self.proxies, self.fdtab, self.poller, now);
+                retry_now(entry, self.proxies, self.fdtab, self.poller, now);
             }
 
             // Step 3: Stream engine process pass
@@ -6178,16 +6216,7 @@ impl EngineDispatcher<'_> {
                 }
                 entry.sess.srv_xprt = crate::xprt::ServerXprt::Plain;
                 entry.sess.ending = None;
-                let be_idx = Self::resolve_backend(entry, self.proxies).unwrap_or(entry.proxy_idx);
-                self.proxies[be_idx].counters().failed_conn.fetch_add(1, Ordering::Relaxed);
-                if entry.sess.server_failed() {
-                    retry_server_connect(entry, self.proxies, self.fdtab, self.poller, now);
-                } else {
-                    entry.sess.srv_state = ScState::Error;
-                    if entry.sess.mode == Mode::Http {
-                        reply_error(entry, self.proxies, 503);
-                    }
-                }
+                server_connect_failed(entry, self.proxies, self.fdtab, self.poller, now, true);
             }
 
             // Step 3.3: `tcp-request session` rules that waited for the PROXY header.
@@ -6292,8 +6321,16 @@ impl EngineDispatcher<'_> {
                 && (!entry.sess.accept_proxy || entry.sess.proxy_handshake_done)
                 && entry.sess.tcp_inspect_done
                 && !entry.sess.is_done()
+                // A retry waiting out its turnaround connects in step 2 when it is over.
+                && !entry.sess.retry_after.is_set()
             {
-                Self::connect_tcp_backend(entry, self.proxies, self.fdtab, self.poller, now);
+                if entry.target_addr.is_some() {
+                    // The connect made at accept was refused at once, retries remain: this
+                    // is the retry (`wretr`, or `wredis` redispatched), at once.
+                    retry_now(entry, self.proxies, self.fdtab, self.poller, now);
+                } else {
+                    Self::connect_tcp_backend(entry, self.proxies, self.fdtab, self.poller, now);
+                }
             }
 
             // Step 4: Update interests
@@ -8149,8 +8186,7 @@ impl EngineDispatcher<'_> {
                 }
             }
         } else {
-            proxies[be_idx].counters().failed_conn.fetch_add(1, Ordering::Relaxed);
-            retry_server_connect(entry, proxies, fdtab, poller, now);
+            server_connect_failed(entry, proxies, fdtab, poller, now, false);
         }
         None
     }
@@ -8299,8 +8335,7 @@ impl EngineDispatcher<'_> {
                 }
             }
         } else {
-            proxies[be_idx].counters().failed_conn.fetch_add(1, Ordering::Relaxed);
-            retry_server_connect(entry, proxies, fdtab, poller, now);
+            server_connect_failed(entry, proxies, fdtab, poller, now, false);
         }
     }
 

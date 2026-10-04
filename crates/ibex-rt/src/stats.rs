@@ -526,13 +526,14 @@ fn write_server_row(
     r.set("smax", 0);
     r.set("slim", &slim);
     r.set("stot", 0);
-    let (wretr, wredis) = proxy
+    let (wretr, wredis, econ) = proxy
         .server_retr
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(&s_idx)
         .copied()
         .unwrap_or_default();
+    r.set("econ", econ);
     r.set("wretr", wretr);
     r.set("wredis", wredis);
     r.set("status", status_str);
@@ -567,6 +568,7 @@ fn write_backend_row(out: &mut String, proxy: &Proxy, _pid: u32, iid: u32) {
     r.set("bout", proxy.stats.iter().map(|s| s.bytes_out.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>());
     r.set("dreq", proxy.stats.iter().map(|s| s.denied_req.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>());
     r.set("dresp", proxy.stats.iter().map(|s| s.denied_resp.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>());
+    r.set("econ", proxy.stats.iter().map(|s| s.failed_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>());
     r.set("wretr", proxy.stats.iter().map(|s| s.retries_count.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>());
     r.set("wredis", proxy.stats.iter().map(|s| s.redispatches.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>());
     r.set("status", "UP");
