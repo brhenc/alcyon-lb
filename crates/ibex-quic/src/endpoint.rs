@@ -292,9 +292,11 @@ impl QuicEndpoint {
                     });
                 }
                 quinn_proto::Event::Stream(stream_evt) => match stream_evt {
+                    // "One or more" streams: a client that opens several requests in one
+                    // flight raises a single `Opened`. Accepting only the first left the
+                    // others unanswered for ever (T130).
                     quinn_proto::StreamEvent::Opened { dir } => {
-                        let stream_id = conn.streams().accept(dir);
-                        if let Some(sid) = stream_id {
+                        while let Some(sid) = conn.streams().accept(dir) {
                             self.event_queue.push_back(TransportEvent::StreamOpened {
                                 conn_id: primary_cid,
                                 stream_id: StreamId::from(sid),
@@ -660,11 +662,17 @@ impl QuicTransport for QuicEndpoint {
             .ok_or_else(|| QuicError::ConnectionNotFound(conn_id.to_string()))?;
 
         let mut send = conn.send_stream(stream_id.into());
+        // Flow control or the send buffer full is not an error: nothing was taken, and the
+        // caller keeps the bytes until the stream is writable again.
         let written = send
             .write(buf)
+            .or_else(|e| if e == quinn_proto::WriteError::Blocked { Ok(0) } else { Err(e) })
             .map_err(|e| QuicError::Transport(format!("stream write error: {e}")))?;
 
-        if fin {
+        // Finishing after a partial write would end the stream on what fitted, which is how
+        // an HTTP/3 response larger than the window arrived truncated (T108, T130). The
+        // stream is finished only once the last byte has been taken.
+        if fin && written == buf.len() {
             let _ = send.finish();
         }
 
