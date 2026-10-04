@@ -157,7 +157,15 @@ pub(crate) fn parse_server(
         }
         i += 1;
     }
-    validate_server_ssl(&ssl, check_port, kw, who)?;
+    if let Some(prefix) = validate_server_ssl(&ssl, check_port, kw, who)? {
+        // Whether this is an error waits for the global `ssl-server-verify` (`apply_ssl_server_verify`).
+        extras.no_ca.push(crate::ast::NoCa {
+            line: kw.line,
+            col: kw.col,
+            prefix,
+            explicit: ssl.verify == Some(SslVerify::Required),
+        });
+    }
 
     // Kept apart from the server: a backend of 60,000 of them must stay small.
     if health != 0 {
@@ -367,21 +375,16 @@ fn parse_tls_version(t: &Token, who: Option<&str>) -> Result<TlsVersion, ConfigE
 
 /// What `HAProxy` checks once a server line is complete (`ssl_sock_prepare_srv_ctx`):
 /// a TLS server, or a TLS check, verifies the certificate unless told not to, and that
-/// needs trust anchors. The alert is `HAProxy`'s.
-fn validate_server_ssl(ssl: &ServerSsl, check_port: Option<u16>, kw: &Token, who: Option<&str>) -> Result<(), ConfigError> {
+/// needs trust anchors. The alert is `HAProxy`'s, and whether it is raised depends on the
+/// global `ssl-server-verify`, which may come later in the file: `Ok(Some(start))` is a
+/// line that needs a CA it has not got, with the start of the alert for
+/// `apply_ssl_server_verify` to finish.
+fn validate_server_ssl(ssl: &ServerSsl, check_port: Option<u16>, kw: &Token, who: Option<&str>) -> Result<Option<String>, ConfigError> {
     let prefix = server_prefix(who);
+    let mut no_ca = None;
     if (ssl.ssl || ssl.check_uses_tls(check_port)) && ssl.verify != Some(SslVerify::None) && ssl.ca_file.is_none() {
         let turned_on = if ssl.ssl { "ssl" } else { "check-ssl" };
-        return Err(ConfigError::new(
-            kw.line,
-            kw.col,
-            format!(
-                "{prefix}'{turned_on}' : verify is enabled by default but no CA file specified. If you're running on a LAN where \
-                 you're certain to trust the server's certificate, please set an explicit 'verify none' statement \
-                 on the 'server' line, or use 'ssl-server-verify none' in the global section to disable \
-                 server-side verifications by default."
-            ),
-        ));
+        no_ca = Some(format!("{prefix}'{turned_on}' : "));
     }
     if let (Some(min), Some(max)) = (ssl.min_ver, ssl.max_ver) {
         if min > max {
@@ -392,7 +395,7 @@ fn validate_server_ssl(ssl: &ServerSsl, check_port: Option<u16>, kw: &Token, who
             ));
         }
     }
-    Ok(())
+    Ok(no_ca)
 }
 
 /// `proto <mux>` and `check-proto <mux>`: the protocol spoken to the server. Ibex speaks

@@ -199,6 +199,21 @@ pub struct ServerExtras {
     /// What `show servers state` reports as `srv_check_health` while no check runs on the
     /// server, when that is not 0; see `parse_server`.
     pub init_health: Vec<(u32, u32)>,
+    /// TLS servers with no CA file to verify against, whose refusal waits for the global
+    /// `ssl-server-verify`, which may come later in the file; see [`NoCa`].
+    pub no_ca: Vec<NoCa>,
+}
+
+/// A TLS server line that needs a CA file it has not got; see [`ServerExtras::no_ca`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoCa {
+    /// Where its line was.
+    pub line: usize,
+    pub col: usize,
+    /// The alert's start as `HAProxy` writes it: `'server b/s' : 'ssl' : `.
+    pub prefix: String,
+    /// `verify required` was said on the server line (or its `default-server`).
+    pub explicit: bool,
 }
 
 /// Backend server definition.

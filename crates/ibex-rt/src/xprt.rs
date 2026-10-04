@@ -284,6 +284,35 @@ impl TlsConn {
     }
 }
 
+/// The suite as `HAProxy` names it (`SSL_CIPHER_get_name`, OpenSSL's) from rustls's name for it:
+/// the TLS 1.3 ones carry the IANA name there (rustls writes it `TLS13_...`), the TLS 1.2 ones
+/// are OpenSSL's own spelling. A suite not
+/// in the table keeps the name rustls gave it.
+fn openssl_cipher_name(iana: &str) -> &str {
+    match iana {
+        "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256" => "ECDHE-ECDSA-AES128-GCM-SHA256",
+        "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384" => "ECDHE-ECDSA-AES256-GCM-SHA384",
+        "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256" => "ECDHE-ECDSA-CHACHA20-POLY1305",
+        "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256" => "ECDHE-RSA-AES128-GCM-SHA256",
+        "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384" => "ECDHE-RSA-AES256-GCM-SHA384",
+        "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256" => "ECDHE-RSA-CHACHA20-POLY1305",
+        "TLS13_AES_128_GCM_SHA256" => "TLS_AES_128_GCM_SHA256",
+        "TLS13_AES_256_GCM_SHA384" => "TLS_AES_256_GCM_SHA384",
+        "TLS13_CHACHA20_POLY1305_SHA256" => "TLS_CHACHA20_POLY1305_SHA256",
+        other => other,
+    }
+}
+
+fn facts_of(info: &ibex_tls::RustlsTlsInfo) -> ibex_sample::SslFacts<'_> {
+    ibex_sample::SslFacts {
+        used: true,
+        sni: info.sni.as_deref(),
+        cipher: info.cipher.as_deref().map(openssl_cipher_name),
+        protocol: info.protocol_version.as_deref(),
+        has_crt: info.peer_has_cert,
+    }
+}
+
 /// The transport under a client connection.
 ///
 /// `Plain` costs nothing: the arms below compile to the same `raw::recv`/`raw::send` the
@@ -299,6 +328,16 @@ impl ClientXprt {
     #[must_use]
     pub const fn is_tls(&self) -> bool {
         matches!(self, ClientXprt::Tls(_))
+    }
+
+    /// What the `ssl_fc*` fetches read of the session: nothing for plaintext, and for TLS
+    /// what the handshake settled. Borrows only; no allocation.
+    #[must_use]
+    pub fn ssl_facts(&self) -> ibex_sample::SslFacts<'_> {
+        match self {
+            ClientXprt::Plain => ibex_sample::SslFacts::default(),
+            ClientXprt::Tls(t) => facts_of(&t.ctx.tls_info),
+        }
     }
 
     #[must_use]
@@ -471,6 +510,23 @@ pub fn accept_tls(
     ))))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::openssl_cipher_name;
+
+    /// The names `HAProxy` (OpenSSL) reports for the TLS 1.2 suites rustls can negotiate;
+    /// the TLS 1.3 names are the same in both.
+    #[test]
+    fn cipher_names_are_openssls() {
+        assert_eq!(openssl_cipher_name("TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256"), "ECDHE-ECDSA-AES128-GCM-SHA256");
+        assert_eq!(openssl_cipher_name("TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"), "ECDHE-RSA-AES256-GCM-SHA384");
+        assert_eq!(openssl_cipher_name("TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256"), "ECDHE-RSA-CHACHA20-POLY1305");
+        assert_eq!(openssl_cipher_name("TLS13_AES_256_GCM_SHA384"), "TLS_AES_256_GCM_SHA384");
+        // One the table does not know keeps rustls's name.
+        assert_eq!(openssl_cipher_name("TLS_FUTURE_SUITE"), "TLS_FUTURE_SUITE");
+    }
+}
+
 /// The transport under a backend server connection.
 ///
 /// `Plain` costs nothing: the arms compile to the same `raw::recv`/`raw::send` calls
@@ -484,6 +540,15 @@ impl ServerXprt {
     #[must_use]
     pub const fn is_tls(&self) -> bool {
         matches!(self, ServerXprt::Tls(_))
+    }
+
+    /// What the `ssl_bc*` fetches read of the session; `None` for a plaintext connection.
+    #[must_use]
+    pub fn ssl_facts(&self) -> Option<ibex_sample::SslFacts<'_>> {
+        match self {
+            ServerXprt::Plain => None,
+            ServerXprt::Tls(t) => Some(facts_of(&t.ctx.tls_info)),
+        }
     }
 
     #[must_use]

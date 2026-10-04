@@ -51,10 +51,6 @@ const IGNORED_GLOBAL_KEYWORDS: &[(&str, &str)] = &[
         "tune.ssl.default-dh-param",
         "SSL DH parameter size; inert in Ibex Rustls-based TLS subsystem",
     ),
-    (
-        "ssl-server-verify",
-        "SSL server certificate verification mode default",
-    ),
 ];
 
 /// `HAProxy` keywords in `defaults` section that are deliberately inert or accepted.
@@ -446,6 +442,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
     if let Some(g) = global.as_ref() {
         apply_ssl_bases(g, &mut listens, &mut frontends, &mut backends);
     }
+    apply_ssl_server_verify(global.as_ref().and_then(|g| g.ssl_server_verify), &mut listens, &mut backends)?;
 
     validate_config(global.as_ref(), &listens, &frontends, &backends)?;
     let mut userlists = take_userlists();
@@ -520,6 +517,53 @@ fn apply_ssl_bases(
     for ds in defaults {
         rebase_server_ssl(&mut ds.ssl, crt_base, ca_base);
     }
+}
+
+/// Global `ssl-server-verify`: what a `server` line's `verify` is when it does not say
+/// (`ssl_sock_prepare_srv_ctx`). `none` turns verification off for those, and it is also
+/// what decides whether a TLS server with no CA file is refused: only one that verifies is.
+/// Done once the whole file is read, because the keyword may come after the servers.
+///
+/// # Errors
+/// The first TLS server that verifies without a CA file, in `HAProxy`'s words.
+fn apply_ssl_server_verify(
+    default: Option<SslVerify>,
+    listens: &mut [ListenSection],
+    backends: &mut [BackendSection],
+) -> Result<(), ConfigError> {
+    let none = default == Some(SslVerify::None);
+    let mut sections: Vec<(&mut Vec<Server>, &ServerExtras)> = Vec::new();
+    for l in listens.iter_mut() {
+        sections.push((&mut l.servers, &l.server_extras));
+    }
+    for b in backends.iter_mut() {
+        sections.push((&mut b.servers, &b.server_extras));
+    }
+    for (servers, extras) in sections {
+        for e in &extras.no_ca {
+            if e.explicit && none {
+                return Err(ConfigError::new(e.line, e.col, format!("{}verify is enabled but no CA file specified.", e.prefix)));
+            }
+            if !none {
+                return Err(ConfigError::new(
+                    e.line,
+                    e.col,
+                    format!(
+                        "{}verify is enabled by default but no CA file specified. If you're running on a LAN where you're certain to trust \
+                         the server's certificate, please set an explicit 'verify none' statement on the 'server' line, or use \
+                         'ssl-server-verify none' in the global section to disable server-side verifications by default.",
+                        e.prefix
+                    ),
+                ));
+            }
+        }
+        if none {
+            for ssl in servers.iter_mut().filter_map(|s| s.ssl.as_mut()).filter(|s| s.verify.is_none()) {
+                ssl.verify = Some(SslVerify::None);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// An unnamed `defaults` section, and what its `http-check` rules need to be resolved.

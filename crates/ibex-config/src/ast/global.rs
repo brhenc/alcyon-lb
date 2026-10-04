@@ -186,6 +186,9 @@ pub struct GlobalSection {
     pub crt_base: Option<String>,
     /// `ca-base <dir>`: where a relative `ca-file` / `crl-file` path of a `server` is read.
     pub ca_base: Option<String>,
+    /// `ssl-server-verify`: the `verify` of a `server` line that does not say; `None` is
+    /// the keyword absent, which is `required`.
+    pub ssl_server_verify: Option<crate::SslVerify>,
     /// Global log tag (`log-tag`). Defaults to "haproxy".
     pub log_tag: Option<std::sync::Arc<str>>,
 }

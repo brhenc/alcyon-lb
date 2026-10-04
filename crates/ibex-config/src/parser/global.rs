@@ -388,6 +388,19 @@ pub(crate) fn parse_global_directive(
             }
             Ok(())
         }
+        "ssl-server-verify" => {
+            // `ssl_parse_global_ssl_server_verify` (`src/cfgparse-ssl.c`): the messages of a
+            // missing argument and of a wrong one are HAProxy's, odd as the first is.
+            let Some(v) = tokens.get(1) else {
+                return Err(ConfigError::new(kw.line, kw.col, "'ssl-server-verify' expects an integer argument."));
+            };
+            global.ssl_server_verify = Some(match v.text.as_str() {
+                "none" => SslVerify::None,
+                "required" => SslVerify::Required,
+                _ => return Err(ConfigError::new(v.line, v.col, "'ssl-server-verify' expects 'none' or 'required' as argument.")),
+            });
+            Ok(())
+        }
         "crt-base" | "ca-base" => {
             let Some(dir) = tokens.get(1) else {
                 return Err(ConfigError::new(

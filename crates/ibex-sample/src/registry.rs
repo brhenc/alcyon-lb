@@ -181,10 +181,12 @@ pub struct SampleContext<'a> {
     /// The stream's retry budget, for `cur_max_retries`: what `set-retries` changes.
     pub cur_max_retries: Option<u16>,
     pub act_conn: u32,
-    pub ssl_sni: Option<&'a str>,
-    pub ssl_cipher: Option<&'a str>,
-    pub ssl_version: Option<&'a str>,
-    pub ssl_used: bool,
+    /// The client connection's TLS session, for `ssl_fc*` and `ssl_c_used`; the default
+    /// (`used` false, nothing else) for a plaintext one.
+    pub ssl_fc: SslFacts<'a>,
+    /// The server connection's TLS session, for `ssl_bc*`; `None` where there is no TLS
+    /// server connection (a plaintext one, or none yet).
+    pub ssl_bc: Option<SslFacts<'a>>,
     /// The proxies' live state, for the fetches and converters that read it (`nbsrv`,
     /// `srv_is_up`, `srv_conn`, `fe_exists`, `in_table`, ...). `None` where the caller
     /// has none to give, and those fetches then return no sample -- never a guess.
@@ -192,6 +194,22 @@ pub struct SampleContext<'a> {
     /// The stream's tracked stick-table entries, for the `sc_*` and `src_*` fetches. `None`
     /// where the caller has none, and those fetches then give no sample.
     pub stick: Option<&'a dyn StickState>,
+}
+
+/// What a TLS session tells the `ssl_*` fetches, as the transport knows it once the
+/// handshake is done (`TlsInfo`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SslFacts<'a> {
+    /// The connection is TLS (`ssl_fc`; for the server side, it is the `Some` of the field).
+    pub used: bool,
+    /// The server name the client sent (`ssl_fc_sni`).
+    pub sni: Option<&'a str>,
+    /// The negotiated cipher suite, in OpenSSL's name for it (`ssl_fc_cipher`).
+    pub cipher: Option<&'a str>,
+    /// The negotiated protocol, `TLSv1.3` (`ssl_fc_protocol`).
+    pub protocol: Option<&'a str>,
+    /// The peer sent a certificate (`ssl_c_used`).
+    pub has_crt: bool,
 }
 
 /// One server's live state, as the server fetches read it.
@@ -2027,35 +2045,48 @@ impl Registry {
         });
 
         // --- 12. SSL Fetches ---
-        self.register_fetch(FetchDesc {
-            name: "ssl_fc_sni",
-            out_type: SampleType::Str,
-            func: |ctx, _args| ctx.ssl_sni.map(|sni| Sample::Str(sni.to_string())),
-        });
+        // From the TLS session of the client connection (`ctx.ssl_fc`) or of the server
+        // connection (`ctx.ssl_bc`); a plaintext connection has none, and `ssl_fc` is then 0.
+        // `ssl_fc_version` is not a `HAProxy` fetch (`ssl_fc_protocol` is) and is not here.
         self.register_fetch(FetchDesc {
             name: "ssl_fc",
             out_type: SampleType::Bool,
-            func: |ctx, _args| Some(Sample::Bool(ctx.ssl_used || ctx.ssl_sni.is_some())),
+            func: |ctx, _args| Some(Sample::Bool(ctx.ssl_fc.used)),
         });
         self.register_fetch(FetchDesc {
-            name: "ssl_c_used",
-            out_type: SampleType::Bool,
-            func: |ctx, _args| Some(Sample::Bool(ctx.ssl_used || ctx.ssl_sni.is_some())),
+            name: "ssl_fc_sni",
+            out_type: SampleType::Str,
+            func: |ctx, _args| ctx.ssl_fc.sni.map(|v| Sample::Str(v.to_string())),
         });
         self.register_fetch(FetchDesc {
             name: "ssl_fc_cipher",
             out_type: SampleType::Str,
-            func: |ctx, _args| ctx.ssl_cipher.map(|c| Sample::Str(c.to_string())),
+            func: |ctx, _args| ctx.ssl_fc.cipher.map(|v| Sample::Str(v.to_string())),
         });
         self.register_fetch(FetchDesc {
             name: "ssl_fc_protocol",
             out_type: SampleType::Str,
-            func: |ctx, _args| ctx.ssl_version.map(|v| Sample::Str(v.to_string())),
+            func: |ctx, _args| ctx.ssl_fc.protocol.map(|v| Sample::Str(v.to_string())),
         });
         self.register_fetch(FetchDesc {
-            name: "ssl_fc_version",
+            name: "ssl_c_used",
+            out_type: SampleType::Bool,
+            func: |ctx, _args| Some(Sample::Bool(ctx.ssl_fc.has_crt)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "ssl_bc",
+            out_type: SampleType::Bool,
+            func: |ctx, _args| Some(Sample::Bool(ctx.ssl_bc.is_some())),
+        });
+        self.register_fetch(FetchDesc {
+            name: "ssl_bc_cipher",
             out_type: SampleType::Str,
-            func: |ctx, _args| ctx.ssl_version.map(|v| Sample::Str(v.to_string())),
+            func: |ctx, _args| ctx.ssl_bc.and_then(|f| f.cipher).map(|v| Sample::Str(v.to_string())),
+        });
+        self.register_fetch(FetchDesc {
+            name: "ssl_bc_protocol",
+            out_type: SampleType::Str,
+            func: |ctx, _args| ctx.ssl_bc.and_then(|f| f.protocol).map(|v| Sample::Str(v.to_string())),
         });
 
         // --- 13. System, Primitive & Time Fetches ---
@@ -5728,7 +5759,7 @@ mod oracle_tests {
     /// `HAProxy`, so it cannot be migrated back, and an operator who writes `res.status`
     /// or `hex2bin` gets no warning that they have written something only Ibex
     /// understands. Several here are near-misses for a real fetch -- `res_ver` for
-    /// `res.ver`, `ssl_fc_version` for `ssl_fc_protocol`, `sc0_bytes_in_cnt` for
+    /// `res.ver`, `sc0_bytes_in_cnt` for
     /// `sc0_bytes_in_rate` -- which is exactly the kind of typo that looks like it works.
     ///
     /// Verified absent two ways: against `data/sample_fetches.json` (extracted from 3.5
@@ -5737,7 +5768,7 @@ mod oracle_tests {
     const NOT_IN_HAPROXY_FETCHES: &[&str] = &[
         "be_client_timeout", "fe_connect_timeout", "fe_queue_timeout",
         "fe_server_timeout", "fe_tunnel_timeout", "req.uri", "res.proto_http", "res.status",
-        "res_ver", "ssl_fc_version",
+        "res_ver",
     ];
 
     const NOT_IN_HAPROXY_CONVERTERS: &[&str] = &[
