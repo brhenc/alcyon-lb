@@ -837,6 +837,13 @@ impl TcpSession {
     /// body has come). The connection closes after an empty reply (the `errorfile
     /// /dev/null` idiom) and one that says `Connection: close`.
     pub fn write_reply(&mut self, raw: &[u8]) {
+        self.write_reply_with(raw, true);
+    }
+
+    /// [`Self::write_reply`], `announce_close` telling whether a reply that closes the
+    /// connection says so (`Connection: close`) when the page does not. HAProxy's 431 for
+    /// an oversized request head does not (measured on 3.5-dev8, `tasks/T87`).
+    pub fn write_reply_with(&mut self, raw: &[u8], announce_close: bool) {
         let txn = self.txn.get_or_insert_with(|| HttpTxn::new(txn::Framing::None, false));
         let data = self.req.readable();
         let n = txn.req.window(data);
@@ -858,7 +865,7 @@ impl TcpSession {
         // an opaque run of bytes, and says nothing about `Connection`.
         let raw = if h2 && txn.client_head { &raw[..head_len.min(raw.len())] } else { raw };
         let mut out;
-        let raw = if !h2 && txn.close_after && !raw.is_empty() && !has_header(&head, "connection") {
+        let raw = if announce_close && !h2 && txn.close_after && !raw.is_empty() && !has_header(&head, "connection") {
             // The client is told, as for a server's response: last in the head, as
             // `inject_connection_close_header_zero_alloc` places it.
             let at = find_eoh(raw).map_or(0, |(h, e)| h + e / 2);
@@ -1308,9 +1315,10 @@ impl TcpSession {
             if let Some((hdr_len, eoh_len)) = find_eoh(self.req.readable()) {
                 let total_hdr_len = hdr_len + eoh_len;
 
-                // Enforce tune.bufsize - tune.maxrewrite limit: headers exceeding threshold produce 400
-                if total_hdr_len > threshold {
-                    self.fail_request(400);
+                // The head, parsed into HTX, has to fit in tune.bufsize - tune.maxrewrite:
+                // HAProxy answers 431 (tasks/T87; `txn::htx_head_cost`).
+                if txn::htx_head_cost(&self.req.readable()[..total_hdr_len]) > threshold {
+                    self.fail_request(431);
                     return Ok(true);
                 }
 
@@ -1458,8 +1466,11 @@ impl TcpSession {
                 self.txn = Some(txn);
                 self.cli_state = ScState::Established;
                 changed = true;
-            } else if self.req.readable().len() > threshold {
-                self.fail_request(400);
+            } else if self.req.readable().len() + 56 >= self.bufsize {
+                // No end of head and the buffer is full: 431 as well. Measured on 3.5-dev8,
+                // a partial head draws it from `bufsize - 56` bytes on (the 40 of `struct
+                // htx` and two blocks), whatever `tune.maxrewrite` is.
+                self.fail_request(431);
                 return Ok(true);
             }
         }

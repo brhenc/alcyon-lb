@@ -27,6 +27,28 @@ fn parse_one_expr_and_cond(
 
 /// The optional `if`/`unless` condition starting at `tokens[at]`; any other word there is
 /// refused, as `HAProxy` refuses it.
+/// The `reason <text>` of `set-status <code> reason <text>` (`tokens[3]`, `tokens[4]`), as
+/// `HAProxy`'s `parse_http_set_status` takes it: `reason` followed by anything but `if` or
+/// `unless`. The text is literal (measured: `%[...]` is not expanded).
+fn set_status_reason(tokens: &[Token], what: &str) -> Result<Option<String>, ConfigError> {
+    let reason = match (tokens.get(3), tokens.get(4)) {
+        (Some(k), Some(t)) if k.text == "reason" && t.text != "if" && t.text != "unless" => Some(t.text.clone()),
+        _ => None,
+    };
+    // Whatever follows has to be the condition, or nothing (`HAProxy`: "expects either 'if'
+    // or 'unless' followed by a condition but found ...").
+    if let Some(t) = tokens.get(if reason.is_some() { 5 } else { 3 }) {
+        if t.text != "if" && t.text != "unless" {
+            return Err(ConfigError::new(
+                t.line,
+                t.col,
+                format!("'{what} set-status' expects either 'if' or 'unless' followed by a condition but found '{}'.", t.text),
+            ));
+        }
+    }
+    Ok(reason)
+}
+
 fn expect_cond_at(tokens: &[Token], at: usize, act_token: &Token) -> Result<Option<AclCondition>, ConfigError> {
     match tokens.get(at) {
         None => Ok(None),
@@ -1081,14 +1103,15 @@ fn parse_http_res_rule_at(
             ));
         }
         let status = parse_u16(&tokens[2], "set-status")?;
-        let cond_idx = find_cond_idx(tokens, 3);
+        let reason = set_status_reason(tokens, "http-response")?;
+        let cond_idx = find_cond_idx(tokens, if reason.is_some() { 5 } else { 3 });
         let cond = if let Some(idx) = cond_idx {
             parse_acl_condition_from_tokens(&tokens[idx..])?
         } else {
             None
         };
         rules.push(HttpResRule {
-            action: HttpResAction::SetStatus { status },
+            action: HttpResAction::SetStatus { status, reason },
             cond,
             line: 0,
         });
@@ -1460,7 +1483,8 @@ pub(crate) fn parse_http_after_res_rule(
             ));
         }
         let status = parse_u16(&tokens[2], "set-status")?;
-        let cond_idx = find_cond_idx(tokens, 3);
+        let reason = set_status_reason(tokens, "http-after-response")?;
+        let cond_idx = find_cond_idx(tokens, if reason.is_some() { 5 } else { 3 });
         let cond = if let Some(idx) = cond_idx {
             parse_acl_condition_from_tokens(&tokens[idx..])?
         } else {
@@ -1469,7 +1493,11 @@ pub(crate) fn parse_http_after_res_rule(
         rules.push(HttpAfterResRule {
             action: HttpAfterResAction::SetHeader {
                 name: "\0set-status".to_string(),
-                fmt: status.to_string(),
+                // Read back by `res_action` (`engine.rs`): `<code>` or `<code>\0<reason>`.
+                fmt: match reason {
+                    Some(r) => format!("{status}\0{r}"),
+                    None => status.to_string(),
+                },
             },
             cond,
         });

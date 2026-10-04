@@ -453,6 +453,21 @@ pub fn status_of(head: &str) -> u16 {
         .unwrap_or(0)
 }
 
+/// What a request head takes of `HAProxy`'s buffer once parsed into HTX, which is what
+/// `tune.bufsize - tune.maxrewrite` is held against: the data (`htx_head_size`), the 40
+/// bytes of `struct htx`, and an 8-byte `struct htx_blk` for each of the start line, the
+/// headers and the end of headers (`HTX_BUF_OVERHEAD` and `struct htx_blk`,
+/// `include/haproxy/htx-t.h`). Measured by bisecting the size of the head on 3.5-dev8
+/// (`tasks/T87`): with `bufsize 4096` and `maxrewrite 1024`, `GET / HTTP/1.1` and one
+/// 2953-byte header is the largest accepted. A head that is not UTF-8 is counted on the
+/// wire, plus the 40 bytes.
+#[must_use]
+pub fn htx_head_cost(head: &[u8]) -> usize {
+    let blocks = 2 + head.split(|&b| b == b'\n').skip(1).take_while(|l| !l.is_empty() && *l != b"\r").count();
+    let data = htx_head_size(head, true).map_or(head.len(), |n| usize::try_from(n).unwrap_or(usize::MAX));
+    data.saturating_add(40 + 8 * blocks)
+}
+
 /// The size `HAProxy` gives a message head in its HTX representation, which is what `%U`
 /// (request) and `%B` (response) count with the body that follows it: the 20 bytes of the
 /// start-line block, the three strings of the start line (method, target, version; or

@@ -223,7 +223,8 @@ pub enum HttpResAction {
     SetHeader { name: String, fmt: String },
     AddHeader { name: String, fmt: String },
     DelHeader { name: String },
-    SetStatus { status: u16 },
+    /// `set-status <code> [reason <text>]`; the reason is literal (measured: no log-format).
+    SetStatus { status: u16, reason: Option<String> },
     /// `http-response capture <sample> id <id>`: the sample into the frontend's response
     /// capture slot `id` (a `declare capture response`, or a `capture response header`),
     /// cut to that slot's length.
