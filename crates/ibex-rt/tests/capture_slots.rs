@@ -391,3 +391,24 @@ fn the_http_after_response_capture_forms_haproxy_refuses_are_refused() {
         assert!(ok, "`ibex -c` refused\n{cfg}\nwhich haproxy accepts: {out:?}");
     }
 }
+
+/// A response header that is not UTF-8 is captured as the bytes the server sent: `HAProxy`
+/// with `X-S: b<E9><FF>` from the server and a slot of 8 gave `capture.res.hdr(0)` (hex)
+/// `62E9FF` and `%hs` `{b#E9#FF}` (2026-10-04).
+#[test]
+fn a_response_capture_keeps_the_bytes_of_a_header_that_is_not_utf8() {
+    let collector = UdpSocket::bind("127.0.0.1:0").expect("collector");
+    collector.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
+    let cfg = format!(
+        "{DEFAULTS}frontend fe\n  bind {{fe}}\n  log {} local0\n  log-format \"LOG %hs\"\n  \
+         capture response header x-s len 8\n  \
+         http-response set-header x-r0 \"%[capture.res.hdr(0),hex]\"\n  \
+         default_backend be\nbackend be\n  server s1 {{srv}}\n",
+        collector.local_addr().expect("addr")
+    );
+    let (_ibex, fe) = start(&cfg, server(b"X-S: b\xe9\xff\r\n"), None);
+    let r = exchange(fe, b"GET / HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n");
+    assert_eq!(header(&r, "x-r0").as_deref(), Some("62E9FF"), "{}", String::from_utf8_lossy(&r));
+    let lines = log_lines(&collector);
+    assert!(lines.iter().any(|l| l.ends_with("LOG {b#E9#FF}")), "the log lines are {lines:?}");
+}

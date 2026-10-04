@@ -956,14 +956,18 @@ pub(crate) fn log_hostname() -> &'static str {
 
 /// The values of `slots` (`None` for a slot a rule fills) in a message head: the last
 /// occurrence of each header, cut to its length (`capture_headers`, src/http_ana.c).
-fn capture_values<'a>(slots: impl Iterator<Item = (&'a str, usize)>, headers: &[(&str, &str)]) -> Vec<Option<Vec<u8>>> {
+fn capture_values<'a>(slots: impl Iterator<Item = (&'a str, usize)>, headers: &[(&[u8], &[u8])]) -> Vec<Option<Vec<u8>>> {
     slots
         .map(|(name, len)| {
             // A slot no header fills (`declare capture`, a rule's) has no name.
             if name.is_empty() {
                 return None;
             }
-            headers.iter().rev().find(|(k, _)| k.trim().eq_ignore_ascii_case(name)).map(|(_, v)| cut_at(v.trim(), len).to_vec())
+            // Bytes, not text: a header that is not UTF-8 is captured as the server sent it.
+            headers.iter().rev().find(|(k, _)| k.trim_ascii().eq_ignore_ascii_case(name.as_bytes())).map(|(_, v)| {
+                let v = v.trim_ascii();
+                v[..len.min(v.len())].to_vec()
+            })
         })
         .collect()
 }
@@ -980,7 +984,8 @@ fn begin_http_stream(entry: &mut SessionEntry, proxies: &[Proxy], fe_idx: usize,
     let fe = &proxies[fe_idx];
     if !fe.req_capture_slots.is_empty() {
         // A request that reached here was parsed into HTX (H1 and H2 alike).
-        let headers: Vec<(&str, &str)> = entry.sess.htx_slice().map(|htx| htx.headers().collect()).unwrap_or_default();
+        let headers: Vec<(&[u8], &[u8])> =
+            entry.sess.htx_slice().map(|htx| htx.headers().map(|(k, v)| (k.as_bytes(), v.as_bytes())).collect()).unwrap_or_default();
         entry.sess.log.req_captures = capture_values(fe.req_capture_slots.iter().map(|(n, l)| (n.as_str(), *l)), &headers);
     }
     // The response's slots exist from here on, empty until a response fills them: `%hs`
@@ -5248,8 +5253,16 @@ impl EngineDispatcher<'_> {
         }
         let fe_caps = &proxies[fe_idx].res_capture_slots;
         if resume.is_none() && !fe_caps.is_empty() {
-            let head = String::from_utf8_lossy(&entry.sess.rep.readable()[..total_hdr_len]).into_owned();
-            let headers: Vec<(&str, &str)> = head.split("\r\n").skip(1).filter_map(|l| l.split_once(':')).collect();
+            // From the bytes of the head, not a lossy copy of them.
+            let head = &entry.sess.rep.readable()[..total_hdr_len];
+            let headers: Vec<(&[u8], &[u8])> = head
+                .split(|&b| b == b'\n')
+                .skip(1)
+                .filter_map(|l| {
+                    let colon = l.iter().position(|&b| b == b':')?;
+                    Some((&l[..colon], l[colon + 1..].strip_suffix(b"\r").unwrap_or(&l[colon + 1..])))
+                })
+                .collect();
             entry.sess.log.res_captures = capture_values(fe_caps.iter().map(|(n, l)| (n.as_str(), *l)), &headers);
         }
         txn.status = status;
