@@ -822,7 +822,7 @@ mod tests {
     fn ssl_ver_of_an_sslv2_hello() {
         let v2 = [&[0x80u8, 0x1c, 1, 3, 0, 0, 3, 0, 0, 0, 0x10, 1, 0, 0x80][..], &(0x11..0x21u8).collect::<Vec<_>>()].concat();
         assert_eq!(ssl_ver(&v2), Raw::Found(0x0003_0000));
-        assert_eq!(ssl_ver(&v2[..11]), Raw::TooShort, "the fixed fields are not all there");
+        assert_eq!(ssl_ver(&v2[..10]), Raw::TooShort, "the fixed fields are not all there");
         assert_eq!(ssl_ver(&v2[..v2.len() - 1]), Raw::TooShort, "the challenge is not all there");
         assert_eq!(ssl_ver(&[0x80, 0x1c, 2, 3, 0, 0, 3, 0, 0, 0, 0x10]), Raw::No, "not a CLIENT-HELLO");
     }
