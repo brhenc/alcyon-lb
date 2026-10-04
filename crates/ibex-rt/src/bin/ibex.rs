@@ -14,6 +14,15 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process;
 
+/// `println!` that does not panic when stdout is closed (`ibex -h | head`): the output is
+/// best effort, and an EPIPE is the reader's choice, not an error of ours.
+macro_rules! println {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stdout(), $($arg)*);
+    }};
+}
+
 /// Command-line parsed options for Ibex runtime.
 #[derive(Debug, Default)]
 struct CliOptions {
@@ -134,7 +143,7 @@ fn expand_config_paths(inputs: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
     for path in inputs {
         if !path.exists() {
             return Err(format!(
-                "Cannot open configuration file/directory '{}': No such file or directory",
+                "Cannot open configuration file/directory {} : No such file or directory",
                 path.display()
             ));
         }
@@ -467,7 +476,40 @@ fn parse_cli_args(args: &[String]) -> (String, CliOptions) {
     (program, opts)
 }
 
-fn load_and_merge_configs(config_files: &[PathBuf]) -> String {
+/// `HAProxy`'s alert line: `[ALERT]    (<pid>) : config : <text>`.
+fn config_alert(text: &str) {
+    eprintln!("[ALERT]    ({}) : config : {text}", process::id());
+}
+
+/// The file a line of the merged configuration text is in, and its line there.
+fn locate(starts: &[(u32, String)], line: usize) -> (&str, usize) {
+    let line = u32::try_from(line).unwrap_or(u32::MAX);
+    starts
+        .iter()
+        .rev()
+        .find(|(first, _)| *first <= line)
+        .map_or(("", line as usize), |(first, path)| (path.as_str(), (line - first + 1) as usize))
+}
+
+/// Reports a configuration that does not load as `HAProxy` does and exits 1: the alerts, then
+/// the file the errors are in.
+fn config_failed(starts: &[(u32, String)], at: Option<usize>, msg: &str) -> ! {
+    match at.map(|line| locate(starts, line)) {
+        Some((file, line)) => {
+            config_alert(&format!("parsing [{file}:{line}] : {msg}"));
+            config_alert(&format!("Error(s) found in configuration file : {file}"));
+        }
+        None => {
+            config_alert(msg);
+            let files: Vec<&str> = starts.iter().map(|(_, f)| f.as_str()).collect();
+            config_alert(&format!("Error(s) found in configuration file : {}", files.join(", ")));
+        }
+    }
+    config_alert("Fatal errors found in configuration.");
+    process::exit(1);
+}
+
+fn load_and_merge_configs(config_files: &[PathBuf]) -> (String, Vec<(u32, String)>) {
     let mut combined = String::new();
     // Where each file starts in the text, for the `file:line` of `last_rule_file`.
     let mut starts = Vec::new();
@@ -481,16 +523,13 @@ fn load_and_merge_configs(config_files: &[PathBuf]) -> String {
                 }
             }
             Err(err) => {
-                eprintln!(
-                    "Cannot read configuration file '{}': {err}",
-                    path.display()
-                );
+                config_alert(&format!("Cannot open configuration file/directory {} : {err}", path.display()));
                 process::exit(1);
             }
         }
     }
-    ibex_rt::engine::set_config_files(starts);
-    combined
+    ibex_rt::engine::set_config_files(starts.clone());
+    (combined, starts)
 }
 
 fn report_diagnostics(opts: &CliOptions) {
@@ -574,20 +613,19 @@ fn main() {
     let config_files = match expand_config_paths(&opts.config_paths) {
         Ok(files) => files,
         Err(err) => {
-            eprintln!("{err}");
+            config_alert(&err);
             process::exit(1);
         }
     };
 
     // 4. Read and concatenate all configuration files
-    let combined_config = load_and_merge_configs(&config_files);
+    let (combined_config, config_starts) = load_and_merge_configs(&config_files);
 
     // 5. Parse unified configuration AST
     let mut config = match ibex_config::parse_str(&combined_config) {
         Ok(cfg) => cfg,
         Err(err) => {
-            eprintln!("Configuration parsing error: {err}");
-            process::exit(1);
+            config_failed(&config_starts, Some(err.line), &err.message);
         }
     };
 
@@ -595,8 +633,7 @@ fn main() {
     //     `HAProxy` refuses the configuration otherwise; checked here so that `-c` reports
     //     it and a start fails before anything is daemonized, signalled or bound.
     if let Err(e) = ibex_rt::rule_exprs::validate_config(&config) {
-        eprintln!("Configuration error: {e}");
-        process::exit(1);
+        config_failed(&config_starts, None, &e);
     }
 
     // 5b. TLS is wired now: `Engine::new` builds a rustls config per `bind ... ssl crt`
@@ -696,6 +733,13 @@ fn main() {
     if let Err(e) = lifecycle.install_signal_handlers() {
         eprintln!("Failed to install signal handlers: {e}");
         process::exit(1);
+    }
+    // Under -W / -Ws, SIGTERM is a stop that exits 0, as HAProxy's master does.
+    if opts.master_worker {
+        if let Err(e) = lifecycle.install_term_handler() {
+            eprintln!("Failed to install signal handlers: {e}");
+            process::exit(1);
+        }
     }
 
     // 12. Initialize Ibex soft-realtime engine
@@ -1002,6 +1046,12 @@ fn supervise(
     let mut reload: Option<Reload> = None;
     let mut handed_over = false;
     loop {
+        if lifecycle.term_requested() {
+            // HAProxy's worker is killed by SIGTERM on the spot; the master, which is what
+            // systemd supervises, then exits 0. Connections are dropped, not drained.
+            ibex_rt::systemd::notify_stopping_once();
+            process::exit(0);
+        }
         if lifecycle.take_reload_request() {
             if !reloadable {
                 if !quiet {

@@ -21,8 +21,6 @@ ExecReload=/bin/kill -USR2 $MAINPID
 # SIGTERM to the main process only, then SIGKILL to the rest after TimeoutStopSec.
 KillMode=mixed
 Restart=always
-# Ibex dies of SIGTERM (exit status 143) on `systemctl stop`; that is a clean stop.
-SuccessExitStatus=143
 Type=notify
 
 # Sandboxing, as in HAProxy's unit; uncomment what your setup allows.

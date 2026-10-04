@@ -9,9 +9,11 @@ here=$(cd "$(dirname "$0")" && pwd)
 unit=$here/ibex.service
 fail=0
 for want in 'Type=notify' ' -Ws ' 'ExecReload=.*-c' 'ExecReload=/bin/kill -USR2 \$MAINPID' \
-            'KillMode=mixed' 'SuccessExitStatus=143'; do
+            'KillMode=mixed'; do
     grep -Eq -- "$want" "$unit" || { echo "FAIL: ibex.service lacks /$want/"; fail=1; }
 done
+# SIGTERM exits 0 under -Ws, as HAProxy's master does; the unit must not paper over a status.
+if grep -q '^SuccessExitStatus' "$unit"; then echo "FAIL: ibex.service carries SuccessExitStatus"; fail=1; fi
 if command -v systemd-analyze >/dev/null 2>&1; then
     # verify wants ExecStart to exist: point a copy of the unit at a stub binary.
     tmp=$(mktemp -d)

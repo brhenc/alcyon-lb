@@ -6,9 +6,10 @@
 //!
 //! `HAProxy`'s standalone mode registers exactly one lifecycle handler, `SIGUSR1`, for the soft
 //! stop (`src/haproxy.c:2609`, `sig_soft_stop`). `SIGTERM` and `SIGINT` are left at the
-//! default action, which is why `admin/systemd/haproxy.service.in` carries
-//! `SuccessExitStatus=143`. Ibex matches that: a handler here is a behaviour change an
-//! operator would notice, so there is one only where `HAProxy` has one.
+//! default action standalone (status 143 and 130); under `-W` the master exits 0 on
+//! `SIGTERM` (measured), which Ibex matches with [`Lifecycle::install_term_handler`].
+//! A handler here is a behaviour change an operator would notice, so there is one only
+//! where `HAProxy` has one.
 //!
 //! The handlers only set an [`AtomicBool`]; everything else happens on the engine's own
 //! thread when it next wakes, at most one poll timeout (100 ms) later. `signal-hook` is what
@@ -24,6 +25,7 @@ use std::sync::Arc;
 pub struct Lifecycle {
     soft_stop: Arc<AtomicBool>,
     reload: Arc<AtomicBool>,
+    terminate: Arc<AtomicBool>,
 }
 
 impl Lifecycle {
@@ -44,6 +46,25 @@ impl Lifecycle {
         // acts on it only under `-W` / `-Ws`.
         signal_hook::flag::register(signal_hook::consts::SIGUSR2, Arc::clone(&self.reload))?;
         Ok(())
+    }
+
+    /// Makes `SIGTERM` a clean, immediate stop that exits 0, as it is for `HAProxy`'s master
+    /// under `-W` (the worker dies of it at once, the master reports 143 for it and exits
+    /// 0, which is why the stock unit needs no `SuccessExitStatus=143`). Standalone,
+    /// `HAProxy` dies of `SIGTERM` (status 143) and so does Ibex: this is only called for
+    /// `-W` and `-Ws`.
+    ///
+    /// # Errors
+    /// Propagates a failure to register the handler.
+    pub fn install_term_handler(&self) -> io::Result<()> {
+        signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&self.terminate))?;
+        Ok(())
+    }
+
+    /// Whether `SIGTERM` arrived with the handler of [`Self::install_term_handler`] installed.
+    #[must_use]
+    pub fn term_requested(&self) -> bool {
+        self.terminate.load(Ordering::Relaxed)
     }
 
     /// Consumes a pending reload request (`SIGUSR2`), if there is one.

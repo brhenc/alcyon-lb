@@ -32,7 +32,7 @@ systemctl enable --now ibex
 
 `contrib/systemd/ibex.service` is HAProxy's unit with the names changed: `Type=notify`,
 `ExecStart=ibex -Ws -f $CONFIG -p $PIDFILE $EXTRAOPTS`, `KillMode=mixed`,
-`SuccessExitStatus=143`, the same commented sandboxing options. Differences from HAProxy's:
+the same commented sandboxing options. Differences from HAProxy's:
 
 - No `-S /run/haproxy-master.sock` in `EXTRAOPTS` and no `conf.d` directory by default (`-S` is
   accepted but serves nothing useful, see below). `-f` accepts a directory, as in HAProxy
@@ -98,7 +98,7 @@ binary replaced on disk is picked up).
 | signal | effect (measured) |
 |---|---|
 | `SIGUSR1` | soft stop. The listeners close at once (a new connection is refused), a request in flight completes (a 3 s one did), then the process exits 0. Sends `STOPPING=1`. |
-| `SIGTERM` | fast stop. The process dies of the signal: exit status 143. The unit lists 143 in `SuccessExitStatus`. HAProxy (`-W`) exited 0 for the same signal on the same machine; the status is the only difference measured. |
+| `SIGTERM` | fast stop. Under `-W`/`-Ws` the process exits 0 at once, as HAProxy's master does (connections are dropped, not drained); the unit needs no `SuccessExitStatus`. Without `-W` the signal is left at its default and the process dies of it (143), as HAProxy standalone does. |
 | `SIGINT` | left at the default: terminates. |
 
 `systemctl stop ibex` sends SIGTERM (fast). For a graceful stop use
