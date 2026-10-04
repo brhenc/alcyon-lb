@@ -138,6 +138,7 @@ pub(crate) mod scalars;
 pub(crate) use scalars::*;
 pub(crate) mod error_pages;
 pub(crate) mod sample_refs;
+pub(crate) mod scope;
 pub use sample_refs::log_format_exprs;
 pub(crate) use error_pages::*;
 
@@ -196,6 +197,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
             continue;
         }
 
+        scope::check(tokens)?;
         let kw = &tokens[0];
         match kw.text.as_str() {
             "global" => {
