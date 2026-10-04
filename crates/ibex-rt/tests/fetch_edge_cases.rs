@@ -318,3 +318,24 @@ fn meth_with_an_argument_is_a_constant_method() {
     );
     assert_eq!(header(&r, "x-n").as_deref(), Some("GET-TRACE-PUT-DELETE-PATCH"), "{r}");
 }
+
+/// `srv_id` and `srv_name` in `http-response` name the server that answered (HAProxy 3.5-dev8:
+/// round robin over `srv1`, `srv2` gives `1 srv1` then `2 srv2`).
+#[test]
+fn srv_id_and_srv_name_in_http_response() {
+    let b1 = backend();
+    let b2 = backend();
+    let fe = common::reserve_addr();
+    let _ibex = start(
+        &format!(
+            "{DEFAULTS}frontend fe\n  bind {fe}\n  \
+             http-response set-header srv-id \"%[srv_id]\"\n  http-response set-header srv-name \"%[srv_name]\"\n  \
+             default_backend be\nbackend be\n  balance roundrobin\n  server srv1 {b1}\n  server srv2 {b2}\n"
+        ),
+        fe,
+    );
+    let r1 = get(fe, "");
+    let r2 = get(fe, "");
+    assert_eq!((header(&r1, "srv-id").as_deref(), header(&r1, "srv-name").as_deref()), (Some("1"), Some("srv1")), "{r1}");
+    assert_eq!((header(&r2, "srv-id").as_deref(), header(&r2, "srv-name").as_deref()), (Some("2"), Some("srv2")), "{r2}");
+}

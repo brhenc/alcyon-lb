@@ -5549,6 +5549,12 @@ impl EngineDispatcher<'_> {
             last_rule: last_rule_at(entry.sess.log.last_rule),
             captures_req_hdr: Some(&entry.sess.log.req_captures),
             captures_res_hdr: Some(&res_caps_in),
+            // The server that answered, for `srv_id` and `srv_name`.
+            srv_id: entry.target_server_idx.and_then(|i| u32::try_from(i + 1).ok()),
+            srv_name: entry
+                .target_server_idx
+                .and_then(|i| proxies.get(entry.srv_backend_idx)?.server_ids.get(i))
+                .map(String::as_str),
             ..Default::default()
         };
 
