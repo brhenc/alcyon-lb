@@ -311,6 +311,15 @@ fn the_http_request_capture_forms_haproxy_refuses_are_refused_and_name_the_proxy
         (fe(" id 0 bogus"), format!("{cond} 'bogus'.")),
         (fe(""), "error detected in frontend 'fe' while parsing 'http-request capture' rule : expects <expression> [ 'len' <length> | id <idx> ].".to_string()),
         (fe(" len 0"), "error detected in frontend 'fe' while parsing 'http-request capture' rule : length must be > 0.".to_string()),
+        (fe(" id abc"), "error detected in frontend 'fe' while parsing 'http-request capture' rule : cannot parse id 'abc'.".to_string()),
+        (
+            "frontend fe\n  mode http\n  bind 127.0.0.1:1\n  http-request capture\n".to_string(),
+            "error detected in frontend 'fe' while parsing 'http-request capture' rule : expects <expression> [ 'len' <length> | id <idx> ].".to_string(),
+        ),
+        (
+            "defaults dd\n  mode http\n  http-after-response capture str(a)\n".to_string(),
+            "error detected in defaults 'dd' while parsing 'http-after-response capture' rule : expects <expression> id <idx>.".to_string(),
+        ),
         (fe(" len abc"), "error detected in frontend 'fe' while parsing 'http-request capture' rule : length must be > 0.".to_string()),
         (
             "backend be\n  mode http\n  http-request capture req.hdr(host)\n".to_string(),
