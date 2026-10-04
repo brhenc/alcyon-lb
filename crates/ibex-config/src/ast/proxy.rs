@@ -49,7 +49,7 @@ pub struct DefaultsSection {
     /// `option forwardfor ... if-none` (without it, `HAProxy` adds the header always).
     pub forwardfor_if_none: bool,
     /// `option forwarded`: the RFC 7239 header parameters to add; `None` when it is off.
-    pub forwarded: Option<Forwarded>,
+    pub forwarded: Option<Box<Forwarded>>,
     /// `option originalto` in `defaults`: the `except` network, empty for none.
     pub originalto: Option<String>,
     /// Default TCP request inspection delay.
@@ -264,7 +264,7 @@ pub struct ListenSection {
     /// `option forwardfor ... if-none` (without it, `HAProxy` adds the header always).
     pub forwardfor_if_none: bool,
     /// `option forwarded`: the RFC 7239 header parameters to add; `None` when it is off.
-    pub forwarded: Option<Forwarded>,
+    pub forwarded: Option<Box<Forwarded>>,
     /// Originalto header options.
     pub originalto: Option<String>,
     /// Default server options applied to all servers in this listen section.
@@ -317,7 +317,7 @@ pub struct StatsConfig {
     /// `option forwardfor ... if-none` (without it, `HAProxy` adds the header always).
     pub forwardfor_if_none: bool,
     /// `option forwarded`: the RFC 7239 header parameters to add; `None` when it is off.
-    pub forwarded: Option<Forwarded>,
+    pub forwarded: Option<Box<Forwarded>>,
     pub originalto: Option<String>,
     pub maxrewrite: Option<usize>,
     /// `option accept-unsafe-violations-in-http-request`: a `#` in the request target (and a
@@ -624,7 +624,7 @@ pub struct BackendSection {
     /// `option forwardfor ... if-none` (without it, `HAProxy` adds the header always).
     pub forwardfor_if_none: bool,
     /// `option forwarded`: the RFC 7239 header parameters to add; `None` when it is off.
-    pub forwarded: Option<Forwarded>,
+    pub forwarded: Option<Box<Forwarded>>,
     /// Originalto header options.
     pub originalto: Option<String>,
     /// HTTP connection reuse strategy (`http-reuse`).

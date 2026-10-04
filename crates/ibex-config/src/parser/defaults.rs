@@ -210,7 +210,7 @@ pub(crate) fn parse_option_defaults(
             defaults.forwardfor_if_none = if_none;
         }
         "originalto" => defaults.originalto = Some(parse_forward_option(tokens, kw)?.0),
-        "forwarded" => defaults.forwarded = Some(parse_forwarded_option(tokens)?),
+        "forwarded" => defaults.forwarded = Some(Box::new(parse_forwarded_option(tokens)?)),
         "redispatch" => set_redispatch(&mut defaults.redisp, &mut defaults.redisp_after, tokens),
         "http-buffer-request" => defaults.buffer_request = true,
         "accept-unsafe-violations-in-http-request" => defaults.stats.accept_unsafe_request = true,

@@ -882,7 +882,7 @@ pub(crate) fn parse_option_listen(
             proxy.forwardfor_if_none = if_none;
         }
         "originalto" => proxy.originalto = Some(parse_forward_option(tokens, kw)?.0),
-        "forwarded" => proxy.forwarded = Some(parse_forwarded_option(tokens)?),
+        "forwarded" => proxy.forwarded = Some(Box::new(parse_forwarded_option(tokens)?)),
         "redispatch" => set_redispatch(&mut proxy.redisp, &mut proxy.redisp_after, tokens),
         "http-buffer-request" => proxy.buffer_request = true,
         "accept-unsafe-violations-in-http-request" => proxy.stats.accept_unsafe_request = true,
@@ -955,7 +955,7 @@ pub(crate) fn parse_option_backend(
             be.forwardfor_if_none = if_none;
         }
         "originalto" => be.originalto = Some(parse_forward_option(tokens, kw)?.0),
-        "forwarded" => be.forwarded = Some(parse_forwarded_option(tokens)?),
+        "forwarded" => be.forwarded = Some(Box::new(parse_forwarded_option(tokens)?)),
         "redispatch" => set_redispatch(&mut be.redisp, &mut be.redisp_after, tokens),
         "http-buffer-request" => be.buffer_request = true,
         "log-health-checks" => be.log_health_checks = true,

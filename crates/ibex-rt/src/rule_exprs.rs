@@ -335,7 +335,7 @@ pub fn validate_rule_exprs(config: &Config, registry: &Registry) -> Result<(), S
         .map(|l| (format!("proxy '{}'", l.name), SectionKind::Listen, &l.name, &l.forwarded))
         .chain(config.backends.iter().map(|b| (format!("backend '{}'", b.name), SectionKind::Backend, &b.name, &b.forwarded)));
     for (what, section, name, forwarded) in proxies {
-        for (_, expr) in forwarded.iter().flat_map(ibex_config::Forwarded::exprs) {
+        for (_, expr) in forwarded.iter().flat_map(|f| f.exprs()) {
             check_sample_expr(expr, registry)
                 .and_then(|()| check_expr(config, registry, Where { section, proxy: Some(name) }, expr, false))
                 .map_err(|e| format!("{what}: failed to parse 'option forwarded' expression '{expr}' in : {e}"))?;

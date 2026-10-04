@@ -104,7 +104,7 @@ fn forwarded(opt: &str) -> Result<Option<ibex_config::Forwarded>, String> {
         "defaults\n    mode http\n    timeout client 5s\n    timeout connect 5s\n    timeout server 5s\n\
          backend be\n    {opt}\n    server s 127.0.0.1:9\n"
     ))
-    .map(|c| c.backends[0].forwarded.clone())
+    .map(|c| c.backends[0].forwarded.clone().map(|f| *f))
     .map_err(|e| e.to_string())
 }
 
