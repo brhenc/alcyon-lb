@@ -572,6 +572,22 @@ mod tests {
         assert!(Expr::parse("bad name").is_err() || Expr::parse("bad name").map(|e| e.fetch_name).as_deref() != Ok("bad name"));
     }
 
+    /// A stream that tracks an entry in slot 0 only.
+    #[derive(Debug)]
+    struct Slot0;
+    impl crate::StickState for Slot0 {
+        fn tracked(&self, slot: usize, _table: Option<&str>, data: crate::StickData) -> Option<i64> {
+            match (slot, data) {
+                (0, crate::StickData::ConnRate) => Some(150),
+                (0, crate::StickData::HttpReqRate) => Some(75),
+                _ => None,
+            }
+        }
+        fn source(&self, _addr: IpAddr, _tables: &[&str], _data: crate::StickData) -> Option<i64> {
+            None
+        }
+    }
+
     use super::*;
     use ibex_proto::htx::{HeaderField, HttpMethod, HttpVersion, Htx, HtxBlock, RequestLine};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -601,7 +617,6 @@ mod tests {
             server_addr: Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 80)),
             htx: Some(&htx),
             act_conn: 1,
-            cum_conn: 1,
             ..Default::default()
         };
 
@@ -629,10 +644,9 @@ mod tests {
         let expr_path_beg = Expr::parse("{ path_beg /test/ }").unwrap();
         assert!(expr_path_beg.eval(&registry, &ctx));
 
-        // Rate limit expressions
+        // Rate limit expressions, on a stream that tracks an entry in slot 0 only.
         let mut ctx_rates = ctx.clone();
-        ctx_rates.sc_conn_rates[0] = 150;
-        ctx_rates.sc_http_req_rates[0] = 75;
+        ctx_rates.stick = Some(&Slot0);
 
         let expr_rate1 = Expr::parse("{ sc_conn_rate(0) gt 100 }").unwrap();
         assert!(expr_rate1.eval(&registry, &ctx_rates));
@@ -642,6 +656,17 @@ mod tests {
 
         let expr_rate_false = Expr::parse("{ sc_http_req_rate(0) gt 100 }").unwrap();
         assert!(!expr_rate_false.eval(&registry, &ctx_rates));
+
+        // Nothing is tracked in slot 1: no sample, so no condition on it holds.
+        let expr_empty_slot = Expr::parse("{ sc_conn_rate(1) ge 0 }").unwrap();
+        assert!(!expr_empty_slot.eval(&registry, &ctx_rates));
+
+        // `src_*` looks the client's address up in a table: the one it names, or else the
+        // current proxy's (none here); this stream's view has no entry for it.
+        let expr_src = Expr::parse("{ src_conn_cnt(t) ge 0 }").unwrap();
+        assert!(!expr_src.eval(&registry, &ctx_rates));
+        let expr_src_own = Expr::parse("{ src_conn_cnt ge 0 }").unwrap();
+        assert!(!expr_src_own.eval(&registry, &ctx_rates));
 
         // Shorthand 2: hdr(Host) -i example.com
         let expr_shorthand2 = Expr::parse("hdr(Host) -i example.com").unwrap();

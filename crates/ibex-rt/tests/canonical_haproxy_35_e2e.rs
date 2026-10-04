@@ -543,7 +543,9 @@ fn test_canonical_haproxy_35_security_rate_limiting() {
     assert!(normal_resp.starts_with("HTTP/1.1 200 OK"));
 
     // 2. Exceed L7 request rate threshold: `http-request deny deny_status 429 if { sc_http_req_rate(0) gt 50 }`
-    let key = StickKey::Ip(IpAddr::V4(attacker_ip.parse::<Ipv4Addr>().unwrap()));
+    // `st_rate_limit` is an `ipv6` table, so `track-sc0 src` keys it by the `::ffff:` form of
+    // the client's address, as HAProxy does (measured: `src,in_table` finds it there).
+    let key = StickKey::Ip(IpAddr::V6(attacker_ip.parse::<Ipv4Addr>().unwrap().to_ipv6_mapped()));
     st.update_entry(&key, |data| {
         if let Some(ref mut rate) = data.http_req_rate {
             rate.tick(60);
@@ -567,7 +569,7 @@ fn test_canonical_haproxy_35_security_rate_limiting() {
     );
 
     // 3. Exceed L4 connection rate threshold: `tcp-request connection silent-drop if { sc_conn_rate(0) gt 100 }`
-    let peer_key = StickKey::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    let peer_key = StickKey::Ip(IpAddr::V6(Ipv4Addr::LOCALHOST.to_ipv6_mapped()));
     st.update_entry(&peer_key, |data| {
         if let Some(ref mut rate) = data.conn_rate {
             rate.tick(120);

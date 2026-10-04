@@ -34,11 +34,14 @@ pub enum KeyType {
 pub struct TrackFlags {
     pub conn_cnt: bool,
     pub conn_cur: bool,
+    pub sess_cnt: bool,
     pub http_req_cnt: bool,
     pub http_err_cnt: bool,
     pub bytes_in_cnt: bool,
     pub bytes_out_cnt: bool,
     pub gpc0: bool,
+    pub gpc1: bool,
+    pub gpt0: bool,
 }
 
 /// Stick Table configuration options
@@ -64,11 +67,14 @@ impl Default for StickTableConfig {
             flags: TrackFlags {
                 conn_cnt: true,
                 conn_cur: true,
+                sess_cnt: true,
                 http_req_cnt: true,
                 http_err_cnt: true,
                 bytes_in_cnt: true,
                 bytes_out_cnt: true,
                 gpc0: true,
+                gpc1: true,
+                gpt0: true,
             },
             track_conn_rate_ms: Some(10_000),
             track_http_req_rate_ms: Some(10_000),
@@ -412,6 +418,68 @@ impl StickTable {
     pub fn config(&self) -> &StickTableConfig {
         &self.config
     }
+
+    /// `key` converted to this table's key type, as `HAProxy` converts the sample that
+    /// tracks or looks up a key (`smp_to_stkey`, through the sample casts): the table
+    /// decides the key's type, not the sample. `None` where the cast does not exist or
+    /// fails: no key, so nothing is tracked and nothing is found.
+    ///
+    /// The conversions are the ones measured on `HAProxy` 3.5-dev8-885761-29: an integer
+    /// to a string table is its decimal text, to an `ip` table the address with that
+    /// 32-bit value, to a `binary` table its eight bytes (never the bytes of its text); a
+    /// string to an integer table is its leading number (0 if it has none), to an `ip`
+    /// table an IPv4 address and to an `ipv6` table an IPv6 address (`"10.0.0.1"` is not
+    /// one); an IPv4 address to an `ipv6` table is its `::ffff:` form, to a string table
+    /// its text and to a `binary` table its four bytes. An address to an integer table is
+    /// refused when the configuration loads.
+    #[must_use]
+    pub fn coerce_key(&self, key: StickKey) -> Option<StickKey> {
+        coerce_key(self.config.key_type, key)
+    }
+}
+
+/// [`StickTable::coerce_key`] for a table of key type `ty`.
+#[must_use]
+// `i as u32` is the cast `HAProxy` makes (`htonl((uint32_t)sint)`): the low 32 bits.
+#[allow(clippy::cast_possible_truncation)]
+pub fn coerce_key(ty: KeyType, key: StickKey) -> Option<StickKey> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    match (ty, key) {
+        (KeyType::Ip, k @ StickKey::Ip(IpAddr::V4(_)))
+        | (KeyType::Ipv6, k @ StickKey::Ip(IpAddr::V6(_)))
+        | (KeyType::Integer, k @ StickKey::Integer(_))
+        | (KeyType::String, k @ StickKey::String(_))
+        | (KeyType::Binary, k @ StickKey::Binary(_)) => Some(k),
+        (KeyType::Ip, StickKey::Ip(IpAddr::V6(v6))) => v6.to_ipv4_mapped().map(|v4| StickKey::Ip(IpAddr::V4(v4))),
+        (KeyType::Ip, StickKey::Integer(i)) => {
+            // The low 32 bits, as `htonl((uint32_t)sint)` takes them.
+            Some(StickKey::Ip(IpAddr::V4(Ipv4Addr::from(i as u32))))
+        }
+        (KeyType::Ip, StickKey::String(s)) => s.parse::<Ipv4Addr>().ok().map(|v4| StickKey::Ip(IpAddr::V4(v4))),
+        (KeyType::Ip, StickKey::Binary(b)) => <[u8; 4]>::try_from(b.as_slice()).ok().map(|o| StickKey::Ip(IpAddr::V4(Ipv4Addr::from(o)))),
+        (KeyType::Ipv6, StickKey::Ip(IpAddr::V4(v4))) => Some(StickKey::Ip(IpAddr::V6(v4.to_ipv6_mapped()))),
+        (KeyType::Ipv6, StickKey::Integer(i)) => Some(StickKey::Ip(IpAddr::V6(Ipv4Addr::from(i as u32).to_ipv6_mapped()))),
+        (KeyType::Ipv6, StickKey::String(s)) => s.parse::<Ipv6Addr>().ok().map(|v6| StickKey::Ip(IpAddr::V6(v6))),
+        (KeyType::Ipv6, StickKey::Binary(b)) => <[u8; 16]>::try_from(b.as_slice()).ok().map(|o| StickKey::Ip(IpAddr::V6(Ipv6Addr::from(o)))),
+        (KeyType::Integer, StickKey::String(s)) => Some(StickKey::Integer(leading_number(&s).cast_unsigned())),
+        (KeyType::Integer, _) => None,
+        (KeyType::String, StickKey::Integer(i)) => Some(StickKey::String(i.cast_signed().to_string())),
+        (KeyType::String, StickKey::Ip(ip)) => Some(StickKey::String(ip.to_string())),
+        (KeyType::String, StickKey::Binary(b)) => Some(StickKey::String(String::from_utf8_lossy(&b).into_owned())),
+        (KeyType::Binary, StickKey::String(s)) => Some(StickKey::Binary(s.into_bytes())),
+        (KeyType::Binary, StickKey::Integer(i)) => Some(StickKey::Binary(i.to_ne_bytes().to_vec())),
+        (KeyType::Binary, StickKey::Ip(IpAddr::V4(v4))) => Some(StickKey::Binary(v4.octets().to_vec())),
+        (KeyType::Binary, StickKey::Ip(IpAddr::V6(v6))) => Some(StickKey::Binary(v6.octets().to_vec())),
+    }
+}
+
+/// The number a string starts with (`c_str2int`): an optional sign and the digits that
+/// follow, 0 if there are none.
+fn leading_number(s: &str) -> i64 {
+    let t = s.trim_start();
+    let (neg, digits) = t.strip_prefix('-').map_or((false, t.strip_prefix('+').unwrap_or(t)), |d| (true, d));
+    let n = digits.bytes().take_while(u8::is_ascii_digit).fold(0i64, |n, d| n.wrapping_mul(10).wrapping_add(i64::from(d - b'0')));
+    if neg { n.wrapping_neg() } else { n }
 }
 
 #[cfg(test)]
@@ -494,5 +562,57 @@ mod tests {
         assert!(table.get_entry(&k1).unwrap().is_some());
         assert!(table.get_entry(&k2).unwrap().is_none()); // Evicted
         assert!(table.get_entry(&k3).unwrap().is_some());
+    }
+
+    /// The conversions measured on `HAProxy` 3.5-dev8-885761-29 (see `tests/stick_key_types.rs`
+    /// in `ibex-rt` for the traffic they were measured with).
+    #[test]
+    fn coerce_key_converts_to_the_type_of_the_table() {
+        use std::net::{Ipv4Addr, Ipv6Addr};
+        let v4 = |a: [u8; 4]| StickKey::Ip(IpAddr::V4(Ipv4Addr::from(a)));
+        let s = |t: &str| StickKey::String(t.into());
+        // Same type: unchanged.
+        assert_eq!(coerce_key(KeyType::Integer, StickKey::Integer(7)), Some(StickKey::Integer(7)));
+        // To a string table: an integer is its decimal text, an address its text.
+        assert_eq!(coerce_key(KeyType::String, StickKey::Integer(1)), Some(s("1")));
+        assert_eq!(coerce_key(KeyType::String, v4([127, 0, 0, 1])), Some(s("127.0.0.1")));
+        // To an integer table: a string is its leading number (0 without one); an address has no cast.
+        assert_eq!(coerce_key(KeyType::Integer, s("2")), Some(StickKey::Integer(2)));
+        assert_eq!(coerce_key(KeyType::Integer, s("abc")), Some(StickKey::Integer(0)));
+        assert_eq!(coerce_key(KeyType::Integer, s("12ab")), Some(StickKey::Integer(12)));
+        assert_eq!(coerce_key(KeyType::Integer, v4([1, 2, 3, 4])), None);
+        // To an ip table: the 32 bits of an integer, a dotted string; not a binary of another length.
+        assert_eq!(coerce_key(KeyType::Ip, StickKey::Integer(3)), Some(v4([0, 0, 0, 3])));
+        assert_eq!(coerce_key(KeyType::Ip, s("10.0.0.9")), Some(v4([10, 0, 0, 9])));
+        assert_eq!(coerce_key(KeyType::Ip, s("nope")), None);
+        assert_eq!(coerce_key(KeyType::Ip, StickKey::Binary(vec![1, 2, 3])), None);
+        // To an ipv6 table: an IPv4 address is mapped; a dotted string is not an IPv6 address.
+        let mapped = StickKey::Ip(IpAddr::V6(Ipv6Addr::from([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 1])));
+        assert_eq!(coerce_key(KeyType::Ipv6, v4([127, 0, 0, 1])), Some(mapped));
+        assert_eq!(coerce_key(KeyType::Ipv6, s("10.0.0.11")), None);
+        assert!(coerce_key(KeyType::Ipv6, s("2001:db8::1")).is_some());
+        // An IPv4-mapped IPv6 address is an IPv4 key for an `ip` table; another is not.
+        let mapped_v6 = |last: [u8; 4]| {
+            StickKey::Ip(IpAddr::V6(Ipv6Addr::from([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, last[0], last[1], last[2], last[3]])))
+        };
+        assert_eq!(coerce_key(KeyType::Ip, mapped_v6([1, 2, 3, 4])), Some(v4([1, 2, 3, 4])));
+        assert_eq!(coerce_key(KeyType::Ip, StickKey::Ip(IpAddr::V6(Ipv6Addr::LOCALHOST))), None);
+        // An integer or 16 raw bytes make an ipv6 key.
+        assert_eq!(coerce_key(KeyType::Ipv6, StickKey::Integer(0x0a00_0001)), Some(mapped_v6([10, 0, 0, 1])));
+        assert_eq!(
+            coerce_key(KeyType::Ipv6, StickKey::Binary(vec![0; 16])),
+            Some(StickKey::Ip(IpAddr::V6(Ipv6Addr::UNSPECIFIED)))
+        );
+        assert_eq!(coerce_key(KeyType::Ipv6, StickKey::Binary(vec![0; 4])), None);
+        // Binary to a string table is its text.
+        assert_eq!(coerce_key(KeyType::String, StickKey::Binary(b"abc".to_vec())), Some(s("abc")));
+        assert_eq!(
+            coerce_key(KeyType::Binary, StickKey::Ip(IpAddr::V6(Ipv6Addr::LOCALHOST))),
+            Some(StickKey::Binary(Ipv6Addr::LOCALHOST.octets().to_vec()))
+        );
+        // To a binary table: text bytes, never the text of an integer; an address's octets.
+        assert_eq!(coerce_key(KeyType::Binary, s("4")), Some(StickKey::Binary(vec![b'4'])));
+        assert_ne!(coerce_key(KeyType::Binary, StickKey::Integer(7)), Some(StickKey::Binary(vec![b'7'])));
+        assert_eq!(coerce_key(KeyType::Binary, v4([1, 2, 3, 4])), Some(StickKey::Binary(vec![1, 2, 3, 4])));
     }
 }

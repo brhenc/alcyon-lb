@@ -71,6 +71,11 @@ pub(crate) fn parse_defaults_directive(
                     defaults.tcp_req_inspect_delay = Some(parse_timeout(&tokens[2], "tcp-request inspect-delay")?);
                     Ok(())
                 }
+                sub @ ("connection" | "session" | "content") if defaults.name.is_none() => Err(ConfigError::new(
+                    kw.line,
+                    kw.col,
+                    format!("tcp-request {sub} is not allowed in anonymous 'defaults' sections"),
+                )),
                 "connection" => parse_tcp_req_connection(&mut defaults.tcp_req_conn_rules, tokens, kw),
                 "session" => parse_tcp_req_session(&mut defaults.tcp_req_session_rules, tokens, kw),
                 "content" => parse_tcp_req_content(&mut defaults.tcp_req_content_rules, tokens, kw),
@@ -113,6 +118,11 @@ pub(crate) fn parse_defaults_directive(
                     format!("unknown tcp-response subcommand <{other}>, expects 'inspect-delay' or 'content'"),
                 )),
             }
+        }
+        // `HAProxy` keeps no rule of an unnamed `defaults` section: the sections that follow
+        // do not inherit them (`src/cfgparse-listen.c`).
+        kw_name @ ("http-request" | "http-response" | "http-after-response") if defaults.name.is_none() => {
+            Err(ConfigError::new(kw.line, kw.col, format!("'{kw_name}' not allowed in anonymous 'defaults' section.")))
         }
         "http-request" if tokens.get(1).is_some_and(|t| t.text == "set-retries") => Err(ConfigError::new(
             tokens[1].line,
