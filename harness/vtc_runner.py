@@ -202,6 +202,9 @@ async def parse_http_request(reader: asyncio.StreamReader) -> Optional[HttpReque
     te_hdr = req.get_header("Transfer-Encoding")
 
     if te_hdr and "chunked" in te_hdr.lower():
+        # What the header read took past the blank line is the start of the chunk stream.
+        reader._buffer[:0] = body_bytes  # type: ignore[attr-defined]
+        body_bytes = bytearray()
         while True:
             line = await reader.readline()
             if not line:
@@ -275,6 +278,9 @@ async def parse_http_response(reader: asyncio.StreamReader, req_method: str = "G
     te_hdr = resp.get_header("Transfer-Encoding")
 
     if te_hdr and "chunked" in te_hdr.lower():
+        # What the header read took past the blank line is the start of the chunk stream.
+        reader._buffer[:0] = body_bytes  # type: ignore[attr-defined]
+        body_bytes = bytearray()
         while True:
             line = await reader.readline()
             if not line:
@@ -379,7 +385,9 @@ def find_block_braces(s: str) -> Tuple[int, int]:
         if c == "\\" and i + 1 < len(s):
             i += 2
             continue
-        if c == '"':
+        if c == '"' and brace_count == 0:
+            # vtest's tokenizer counts braces and nothing else inside a { } block, so a
+            # lone `"` in a shell script (`-cc 'streq(a,"a)'`) does not open a string.
             in_quote = not in_quote
         elif not in_quote:
             if c == "#" and first_brace == -1:
@@ -1603,6 +1611,25 @@ class TestResult:
     unexpected_pass: bool = False
 
 
+def vtest_builtin_macros() -> Dict[str, str]:
+    """Macros vtest itself defines (vtc_main.c), beyond `testdir`/`tmpdir`.
+
+    `bad_backend` is an address nothing listens on, `bad_ip` an address that is not
+    routable. They were left undefined, so `server s1 ${bad_backend}` reached the proxy as
+    `server s1` and the config was refused before the test began.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return {
+        "localhost": "127.0.0.1",
+        "bad_backend": f"127.0.0.1:{port}",
+        "bad_ip": "192.0.2.255",
+        "pwd": os.getcwd(),
+    }
+
+
 class VtcExecutor:
     """Executes a parsed VTC test script against a target binary."""
 
@@ -1618,6 +1645,7 @@ class VtcExecutor:
             "testdir": self.testdir,
             "tmpdir": self.tmpdir,
             "HAPROXY_TEST_TIMEOUT": "5s",
+            **vtest_builtin_macros(),
         })
 
         self.barriers: Dict[str, asyncio.Barrier] = {}
@@ -1626,6 +1654,13 @@ class VtcExecutor:
         self.clients: Dict[str, MockClientRunner] = {}
         self.proxies: Dict[str, subprocess.Popen] = {}
         self.temp_cfgs: List[str] = []
+
+    def shell_env(self) -> Dict[str, str]:
+        """Environment of `shell` blocks and `feature cmd`: vtest runs them with the
+        proxy under test in $HAPROXY_PROGRAM (reg-tests/README)."""
+        env = dict(os.environ)
+        env["HAPROXY_PROGRAM"] = self.target_binary
+        return env
 
     def cleanup(self) -> None:
         for p in self.proxies.values():
@@ -1738,7 +1773,8 @@ class VtcExecutor:
                         cmd_str = cmd_str[1:-1]
                     cmd_expanded = cmd_str.replace("$HAPROXY_PROGRAM", self.target_binary)
                     cmd_expanded = self.macro_engine.expand(cmd_expanded)
-                    res = subprocess.run(cmd_expanded, shell=True, capture_output=True)
+                    res = subprocess.run(cmd_expanded, shell=True, capture_output=True,
+                                         env=self.shell_env())
                     if res.returncode != 0:
                         return TestResult(
                             test_name=test_title,
@@ -1855,9 +1891,16 @@ class VtcExecutor:
             elif cmd == "shell":
                 sh_cmd = block if block is not None else (args[0] if args else "")
                 sh_expanded = self.macro_engine.expand(sh_cmd)
-                res = subprocess.run(sh_expanded, shell=True, capture_output=True, text=True)
+                res = subprocess.run(sh_expanded, shell=True, capture_output=True, text=True,
+                                     env=self.shell_env())
                 if res.returncode != 0:
                     raise RuntimeError(f"Shell command failed (exit code {res.returncode}):\n{res.stderr}")
+                # A shell block's exit status is vtest's assertion (default -expectexit 0),
+                # and startup/check_condition.vtc asserts nothing else. But a shell block
+                # that only prepares a test whose proxy never ran must not turn that into
+                # a PASS, so it counts only where no proxy is started at all.
+                if not any(d.cmd == "haproxy" for d in self.parser.directives):
+                    _note_assertion()
 
             elif cmd == "setenv":
                 if len(args) >= 2:
