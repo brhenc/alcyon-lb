@@ -1151,6 +1151,10 @@ impl TcpSession {
         ibex_sample::CURRENT_VARS.with(|v| v.borrow_mut().retain(|k, _| k.starts_with("sess.")));
         self.stick_stores.clear();
         self.is_first_req = false;
+        // How the last transaction ended is not how the next one will: a 503 after refused
+        // connects left `ConnectFailed`, and the next request's client leaving was then
+        // taken for a stream already over, not aborted (T227, devtest7).
+        self.ending = None;
         self.cli_state = ScState::Ready;
         self.release_idle_buffers();
     }

@@ -360,3 +360,43 @@ fn a_connecting_request_is_dropped_only_with_abortonclose() {
     let o = run("  no option abortonclose\n", "", Phase::Connect, Leave::Close);
     assert_eq!(o.log, None, "still connecting");
 }
+
+/// On devtest7 (vegeta keeps its connections alive), streams whose client left stayed at the
+/// server until `timeout server`: an earlier request on the same connection had ended in a
+/// 503 (its connect refused), and what ended that one was still taken for how this one ended.
+#[test]
+fn a_request_after_a_503_on_the_same_connection_is_still_aborted() {
+    // Nothing listens on the server's port for the first request: refused, a 503.
+    let port = common::reserve_port();
+    let srv_addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let fe = common::reserve_addr();
+    let cfg = format!(
+        "defaults\n  mode http\n  retries 0\n  timeout client 5s\n  timeout connect 2s\n  timeout server 5s\n\
+         frontend f\n  bind {fe}\n  default_backend b\nbackend b\n  server s {srv_addr}\n"
+    );
+    let path = std::env::temp_dir().join(format!("ibex-aoc-503-{}.cfg", std::process::id()));
+    std::fs::write(&path, cfg).expect("write cfg");
+    let child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn ibex");
+    let _ibex = Ibex { child, sock: PathBuf::from("/nonexistent") };
+    assert!(common::wait_listening(fe), "ibex never listened");
+    let _ = std::fs::remove_file(&path);
+
+    let mut c = TcpStream::connect(fe).expect("connect");
+    c.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
+    c.write_all(b"GET /1 HTTP/1.1\r\nHost: x\r\n\r\n").expect("send");
+    let mut got = Vec::new();
+    let mut b = [0u8; 4096];
+    while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+        let n = c.read(&mut b).expect("the first answer");
+        assert!(n > 0, "closed instead of answering");
+        got.extend_from_slice(&b[..n]);
+    }
+    assert!(got.starts_with(b"HTTP/1.1 503"), "{:?}", String::from_utf8_lossy(&got));
+    // HAProxy keeps the connection after this 503 too (measured): the next request on it.
+    let listener = TcpListener::bind(srv_addr).expect("the server comes up");
+    c.write_all(b"GET /2 HTTP/1.1\r\nHost: x\r\n\r\n").expect("send");
+    let (mut s, _) = listener.accept().expect("the second request reaches the server");
+    read_head(&mut s);
+    drop(c);
+    assert_eq!(watch(&mut s, Duration::from_millis(1000)), Saw::Reset, "the client left; abortonclose resets the server");
+}
