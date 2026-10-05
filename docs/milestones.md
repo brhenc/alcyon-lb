@@ -188,7 +188,7 @@ date, command and result; every finding fixed or filed as a task.
 R1 runs alongside all of these. Dates are targets, not promises; each milestone gets its
 detailed scope and exit criteria written when it starts, as M1's were.
 
-### M3 — peers (week after M2, target weekend of 2026-10-17)
+### M3 — peers and reproducible builds (week after M2, target weekend of 2026-10-17)
 
 Stick-table synchronisation between nodes, moved forward from M4 by the user.
 
@@ -209,6 +209,38 @@ Stick-table synchronisation between nodes, moved forward from M4 by the user.
   HAProxy's sync lags, measured with both on the same machine, and no update is lost.
 - Practical topology: two Ibex nodes plus one HAProxy node behind a client that alternates
   between them; stickiness and `sc_*` counters agree on all three.
+
+**Reproducible builds (added by the user, 2026-10-05).** This is a must-have for a
+modern proxy, and it is cheapest to start early, before M4 packaging depends on it.
+Anyone who builds a given commit with the pinned toolchain gets a bit-identical `ibex`
+binary, and can check that a released binary came from the published source.
+
+- **Pinned inputs.**
+  - `Cargo.lock` is already committed.
+  - Add a `rust-toolchain.toml` that names an exact version, not a channel.
+  - Vendor the dependencies (`cargo vendor`, or check them by hash) so a build needs no
+    network.
+- **No build-environment leakage.**
+  - Paths: `--remap-path-prefix` for the source tree, `~/.cargo/registry` and the target
+    dir.
+  - No timestamps, hostnames or usernames in the binary. The `-vv` / `show info` build
+    date comes from `SOURCE_DATE_EPOCH` (the commit time), as HAProxy's `BUILD_DATE`
+    could.
+  - `codegen-units` and LTO settings fixed in the release profile.
+  - sccache must not change the output.
+- **The release binary contains no C.** The only build script, `crates/ibex-h1-sys` (the
+  test-only `haproxy-ffi` feature, which compiles HAProxy's `h1.c` from
+  `/home/bhenc/reference/haproxy`), stays out of release builds. A check in the script
+  proves it.
+- **Verification.** A script, `tools/repro-check.sh`:
+  - builds the same commit twice, in two different directories with different
+    `CARGO_TARGET_DIR`s, users or containers, and at different times;
+  - compares the binaries' sha256;
+  - on a mismatch, runs `diffoscope` (if installed) and names the cause.
+- **Exit:** two builds from different paths on different days are identical, from a
+  clean checkout without network. The check runs in the gate (or in CI once M4 has CI).
+  The RPM and container image of M4 are built the same way and record the sha256 and
+  the toolchain version. Later: an SBOM (CycloneDX) and signed release checksums.
 
 ### M4 — deployable
 
