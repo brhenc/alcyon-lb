@@ -1040,6 +1040,11 @@ pub(crate) fn parse_option_backend(
 
 /// `no option <name>` in a proxy section: turns off an option this section inherited.
 pub(crate) fn parse_no_listen(proxy: &mut ListenSection, tokens: &[Token], kw: &Token) -> Result<(), ConfigError> {
+    if tokens.get(1).is_some_and(|t| t.text == "log") {
+        proxy.logs.clear();
+        proxy.log_global = false;
+        return Ok(());
+    }
     if tokens.get(1).is_none_or(|t| t.text != "option") {
         return parse_no_directive(tokens, kw);
     }
@@ -1060,6 +1065,11 @@ pub(crate) fn parse_no_listen(proxy: &mut ListenSection, tokens: &[Token], kw: &
 }
 
 pub(crate) fn parse_no_frontend(fe: &mut FrontendSection, tokens: &[Token], kw: &Token) -> Result<(), ConfigError> {
+    if tokens.get(1).is_some_and(|t| t.text == "log") {
+        fe.logs.clear();
+        fe.log_global = false;
+        return Ok(());
+    }
     if tokens.get(1).is_none_or(|t| t.text != "option") {
         return parse_no_directive(tokens, kw);
     }
@@ -1076,6 +1086,11 @@ pub(crate) fn parse_no_frontend(fe: &mut FrontendSection, tokens: &[Token], kw: 
 }
 
 pub(crate) fn parse_no_backend(be: &mut BackendSection, tokens: &[Token], kw: &Token) -> Result<(), ConfigError> {
+    if tokens.get(1).is_some_and(|t| t.text == "log") {
+        be.logs.clear();
+        be.log_global = false;
+        return Ok(());
+    }
     if tokens.get(1).is_none_or(|t| t.text != "option") {
         return parse_no_directive(tokens, kw);
     }
