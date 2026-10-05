@@ -112,6 +112,27 @@ fn scan(pattern: &str) -> Scan {
     out
 }
 
+thread_local! {
+    static COMPILES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many patterns this thread has compiled ([`UserRegex::with_case`]): a test reads it
+/// around a request to show that the data path compiles none.
+#[must_use]
+pub fn compiles_on_this_thread() -> u64 {
+    COMPILES.with(std::cell::Cell::get)
+}
+
+/// How many different patterns one thread keeps compiled ([`UserRegex::cached`]): every
+/// one is configuration text; the bound only stops other text from growing the cache.
+const REGEX_CACHE_MAX: usize = 4096;
+
+type RegexCache = std::collections::HashMap<Box<str>, Result<std::rc::Rc<UserRegex>, Error>>;
+
+thread_local! {
+    static REGEX_CACHE: std::cell::RefCell<RegexCache> = std::cell::RefCell::new(RegexCache::new());
+}
+
 /// A regular expression from the configuration.
 #[derive(Clone)]
 pub enum UserRegex {
@@ -190,11 +211,33 @@ impl UserRegex {
         Self::with_case(pattern, false)
     }
 
+    /// [`UserRegex::new`], once per pattern and thread: the regex compiled the first time
+    /// a rule uses it, as `HAProxy` compiles it once when the configuration loads
+    /// (`regex_comp`). The data path calls this with configuration text, so after the first
+    /// request nothing is compiled.
+    ///
+    /// # Errors
+    /// As [`UserRegex::new`], the error remembered as well.
+    pub fn cached(pattern: &str) -> Result<std::rc::Rc<Self>, Error> {
+        if let Some(hit) = REGEX_CACHE.with(|c| c.borrow().get(pattern).cloned()) {
+            return hit;
+        }
+        let compiled = Self::new(pattern).map(std::rc::Rc::new);
+        REGEX_CACHE.with(|c| {
+            let mut c = c.borrow_mut();
+            if c.len() < REGEX_CACHE_MAX {
+                c.insert(pattern.into(), compiled.clone());
+            }
+        });
+        compiled
+    }
+
     /// As [`UserRegex::new`], matching without regard to case if `case_insensitive`.
     ///
     /// # Errors
     /// As [`UserRegex::new`].
     pub fn with_case(pattern: &str, case_insensitive: bool) -> Result<Self, Error> {
+        COMPILES.with(|n| n.set(n.get() + 1));
         let scan = scan(pattern);
         if let Some(what) = scan.unsupported {
             return Err(Error(format!("PCRE feature not supported by Ibex: {what} (see docs/differences.md)")));
