@@ -686,12 +686,12 @@ fn main() {
     // 6. Apply command-line maxconn override (-n <maxconn>)
     if let Some(mc) = opts.maxconn {
         for listen in &mut config.listens {
-            if listen.maxconn > mc {
+            if listen.maxconn == 0 || listen.maxconn > mc {
                 listen.maxconn = mc;
             }
         }
         for frontend in &mut config.frontends {
-            if frontend.maxconn > mc {
+            if frontend.maxconn == 0 || frontend.maxconn > mc {
                 frontend.maxconn = mc;
             }
         }

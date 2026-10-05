@@ -215,7 +215,7 @@ pub struct ListenSection {
     /// `option redispatch <interval>`: retries between redispatches (`redispatch_after`);
     /// negative counts back from the last retry, the default `-1` redispatches on it.
     pub redisp_after: i32,
-    /// Maximum concurrent connections for this proxy (default: 2000).
+    /// Maximum concurrent connections for this proxy; 0 when not set, which is the global `maxconn`.
     pub maxconn: u32,
     /// Grace time in milliseconds / Duration before stopping.
     pub grace: Option<Duration>,
@@ -382,7 +382,7 @@ impl Default for ListenSection {
             retry_on: RE_CONN_FAILED,
             redisp: false,
             redisp_after: -1,
-            maxconn: 2000,
+            maxconn: 0,
             grace: None,
             dispatch: None,
             default_server: None,
@@ -464,7 +464,7 @@ pub struct FrontendSection {
     pub clitimeout: Option<Duration>,
     /// Structured timeouts.
     pub timeouts: TimeoutConfig,
-    /// Maximum concurrent connections for this proxy (default: 2000).
+    /// Maximum concurrent connections for this proxy; 0 when not set, which is the global `maxconn`.
     pub maxconn: u32,
     /// Default backend name to forward traffic to.
     pub default_backend: Option<String>,
@@ -556,7 +556,7 @@ impl Default for FrontendSection {
             id: None,
             clitimeout: None,
             timeouts: TimeoutConfig::default(),
-            maxconn: 2000,
+            maxconn: 0,
             default_backend: None,
             use_backends: Vec::new(),
             force_be_switch: Vec::new(),

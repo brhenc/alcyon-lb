@@ -36,9 +36,7 @@ pub struct Listener {
     /// Per-listener connection cap. Zero means unlimited. Shared with the proxy's
     /// `maxconn`, so `set maxconn frontend` reaches every worker's listeners (T177), as
     /// `cli_parse_set_maxconn_frontend` sets every listener's.
-    pub maxconn: crate::srv_rt::SharedU32,
-    /// Connections currently alive on this listener.
-    pub nbconn: u32,
+    pub maxconn: crate::srv_rt::ConnLimit,
     /// Server-side TLS for this bind, from `bind ... ssl crt <file>`.
     ///
     /// Per listener rather than per proxy because that is how `HAProxy` scopes it: one
@@ -110,8 +108,7 @@ impl Listener {
             fd,
             addr: bound_addr,
             proxy,
-            maxconn: crate::srv_rt::SharedU32::default(),
-            nbconn: 0,
+            maxconn: crate::srv_rt::ConnLimit::default(),
             tls: None,
             name: None,
             accept_proxy: false,
@@ -158,8 +155,7 @@ impl Listener {
             fd,
             addr,
             proxy,
-            maxconn: crate::srv_rt::SharedU32::default(),
-            nbconn: 0,
+            maxconn: crate::srv_rt::ConnLimit::default(),
             tls: None,
             name: None,
             accept_proxy: false,
@@ -189,8 +185,7 @@ impl Listener {
     /// so the backlog applies backpressure instead of the proxy burning syscalls.
     #[must_use]
     pub fn is_full(&self) -> bool {
-        let maxconn = self.maxconn.get();
-        maxconn != 0 && self.nbconn >= maxconn
+        self.maxconn.is_full()
     }
 
     /// Accepts one connection.
@@ -287,11 +282,11 @@ mod tests {
     #[test]
     fn maxconn_zero_means_unlimited() {
         let mut l = Listener::bind(loopback0(), 128, 0).expect("bind");
-        l.nbconn = 1_000_000;
+        (0..1_000_000).for_each(|_| l.maxconn.inc());
         assert!(!l.is_full(), "maxconn 0 must never report full");
-        l.maxconn.set(10);
+        l.maxconn.set(1_000_000);
         assert!(l.is_full());
-        l.nbconn = 9;
+        l.maxconn.dec();
         assert!(!l.is_full());
     }
 

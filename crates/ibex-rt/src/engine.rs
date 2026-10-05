@@ -896,7 +896,7 @@ pub struct Proxy {
     pub redisp_after: i32,
     /// `maxconn`: shared by every worker and by the proxy's listeners, which stop
     /// accepting at it, so `set maxconn frontend` reaches all of them (T177).
-    pub maxconn: crate::srv_rt::SharedU32,
+    pub maxconn: crate::srv_rt::ConnLimit,
     pub dispatch: Option<SocketAddr>,
     /// The `cookie` line (`ck_opts`, `cookie_*`): persistence by a cookie. Only a backend
     /// (or a `listen`) has one.
@@ -1349,6 +1349,9 @@ pub struct Engine {
     extra_cli: Vec<ExtraCli>,
     /// The listeners were stopped because `global maxconn` was reached (`globalconn`).
     global_paused: bool,
+    /// A listener stopped polling because its frontend reached `maxconn`: the limit is shared
+    /// by every worker, so a slot freed or a limit raised elsewhere is noticed by looking.
+    fe_paused: bool,
     /// The `level` of the stats socket (`stats socket ... level`): what each new CLI connection
     /// may do. Unset means admin, as before the level was honoured.
     pub cli_level: crate::applet::CliLevel,
@@ -2383,7 +2386,7 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, list
         retries,
         redisp: listen.redisp,
         redisp_after: listen.redisp_after,
-        maxconn: listen.maxconn.into(),
+        maxconn: effective_fe_maxconn(listen.maxconn).into(),
         dispatch: listen.dispatch,
         cookie: listen.cookie.clone(),
         cliexp,
@@ -2506,7 +2509,7 @@ fn init_proxy_from_frontend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, fe
         retries: 3,
         redisp: false,
         redisp_after: -1,
-        maxconn: fe.maxconn.into(),
+        maxconn: effective_fe_maxconn(fe.maxconn).into(),
         dispatch: None,
         cookie: None,
         cliexp,
@@ -3111,6 +3114,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             cli_socket_path: None,
             extra_cli: Vec::new(),
             global_paused: false,
+            fe_paused: false,
             cli_level: crate::applet::CliLevel::Admin,
             start_time,
             pid: std::process::id(),
@@ -3399,7 +3403,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
 
         // While the listeners are stopped for `global maxconn`, a connection closed by
         // another worker is only noticed by looking: do not sleep through it.
-        let poll_timeout = if self.global_paused { poll_timeout.min(Duration::from_millis(5)) } else { poll_timeout };
+        let poll_timeout = if self.global_paused || self.fe_paused { poll_timeout.min(Duration::from_millis(5)) } else { poll_timeout };
 
         // A QUIC transport's next deadline can be sooner than the scheduler's. Waiting past
         // it would delay loss recovery; the shortest of the two wins.
@@ -3425,6 +3429,9 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
 
         if self.global_paused && !crate::globalconn::full() {
             self.resume_listeners_after_global();
+        }
+        if self.fe_paused && !self.global_paused {
+            self.resume_listeners_after_frontend_limit();
         }
 
         // 3. Poll readiness events
@@ -3631,15 +3638,26 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 false,
             );
             self.fdtab.set_interest(lfd, Interest::NONE);
+            self.fe_paused = true;
             return;
         }
 
-        while !self.listeners[l_idx].is_full() && !crate::globalconn::full() {
+        // The slot of `global maxconn` is taken before accepting, atomically: workers
+        // checking `full()` and then counting would overshoot it by up to one each. The
+        // connection's slot is then `admit_connection`'s to release if it refuses it.
+        // The frontend's `maxconn` slot is taken the same way (`ConnLimit::try_inc`).
+        while self.listeners[l_idx].maxconn.try_inc() {
+            if !crate::globalconn::try_acquire() {
+                self.listeners[l_idx].maxconn.dec();
+                break;
+            }
             let accept_res = self.listeners[l_idx].accept();
             let Some((cli_fd, peer_addr)) = (match accept_res {
                 Ok(Some(pair)) => Some(pair),
                 Ok(None) | Err(_) => None,
             }) else {
+                crate::globalconn::release();
+                self.listeners[l_idx].maxconn.dec();
                 break;
             };
             let local_addr = self.listeners[l_idx].addr();
@@ -3656,6 +3674,25 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             self.fdtab.set_interest(lfd, Interest::NONE);
         }
         self.global_paused = true;
+    }
+
+    /// Re-arms the listeners stopped at their frontend's `maxconn` whose frontend has room
+    /// again (a connection closed on another worker, or `set maxconn frontend` raised it).
+    fn resume_listeners_after_frontend_limit(&mut self) {
+        let mut still_full = false;
+        for l in &self.listeners {
+            let lfd = l.raw_fd();
+            if !self.fdtab.interest(lfd).is_none() {
+                continue;
+            }
+            if l.is_full() {
+                still_full = true;
+            } else {
+                let _ = self.poller.modify(l.borrowed_fd(), raw_fd_to_u64(lfd), true, false);
+                self.fdtab.set_interest(lfd, Interest::READ);
+            }
+        }
+        self.fe_paused = still_full;
     }
 
     /// Undoes [`Self::pause_listeners_for_global`] for the listeners that have room of
@@ -3800,6 +3837,10 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                         }
                     }
                     drop(cli_fd);
+                    if let Some(l_idx) = l_idx {
+                        crate::globalconn::release();
+                        self.listeners[l_idx].maxconn.dec();
+                    }
                     return;
                 }
                 ConnEvalOutcome::SilentDrop => {
@@ -3813,20 +3854,25 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                         }
                     }
                     drop(cli_fd);
+                    if let Some(l_idx) = l_idx {
+                        crate::globalconn::release();
+                        self.listeners[l_idx].maxconn.dec();
+                    }
                     return;
                 }
             };
 
-            if let Some(l_idx) = l_idx {
-                self.listeners[l_idx].nbconn += 1;
-            }
             let proxy = &self.proxies[proxy_idx];
             proxy.counters().cum_conn.fetch_add(1, Ordering::Relaxed);
             proxy.counters().fe_sess_rate.tick();
             let rate = proxy.counters().fe_sess_rate.rate();
             proxy.txn_counters().fe.rate_max.fetch_max(u32::try_from(rate).unwrap_or(u32::MAX), Ordering::Relaxed);
             proxy.counters().act_conn.fetch_add(1, Ordering::Relaxed);
-            crate::globalconn::acquire();
+            // From the accept loop the slot is already taken (`try_acquire`); an HTTP/3
+            // request stream arrives without one.
+            if l_idx.is_none() {
+                crate::globalconn::acquire();
+            }
             if proxy.counters().act_conn.load(Ordering::Relaxed) > proxy.counters().max_conn.load(Ordering::Relaxed) {
                 proxy.counters().max_conn.store(proxy.counters().act_conn.load(Ordering::Relaxed), Ordering::Relaxed);
             }
@@ -3840,6 +3886,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     false,
                 );
                 self.fdtab.set_interest(lfd, Interest::NONE);
+                self.fe_paused = true;
             }
 
             register_new_session(
@@ -5597,6 +5644,12 @@ pub fn set_health_check_enabled(
     }
 }
 
+/// A frontend without a `maxconn` (0 in the parsed configuration) is limited by the global
+/// one, as in `HAProxy` (`show stat` `slim` of such a frontend is `Maxconn` of `show info`).
+fn effective_fe_maxconn(configured: u32) -> u32 {
+    if configured == 0 { crate::globalconn::hard() } else { configured }
+}
+
 /// Dynamically configures `maxconn` on a proxy or a specific server within a proxy.
 pub fn set_proxy_maxconn(
     proxies: &[Proxy],
@@ -6131,7 +6184,7 @@ fn cleanup_done(
 
     // An HTTP/3 request stream took no listener slot (`admit_connection`).
     if let Some(l) = listeners.iter_mut().filter(|_| !entry.sess.h3).find(|l| l.proxy == usize_to_u32(proxy_idx)) {
-        l.nbconn = l.nbconn.saturating_sub(1);
+        l.maxconn.dec();
         let lfd = l.raw_fd();
         if !l.is_full() && fdtab.interest(lfd).is_none() {
             let _ = poller.modify(l.borrowed_fd(), raw_fd_to_u64(lfd), true, false);
