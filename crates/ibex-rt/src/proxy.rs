@@ -345,6 +345,9 @@ pub struct TcpSession {
     /// The same for the client socket. Without it every pass over the session read the
     /// client again, eight `EAGAIN` reads per keep-alive request (`performance.md`).
     pub cli_cant_recv: bool,
+    /// The last [`Self::process`] stopped at its bound with its passes still making
+    /// progress: there is more to do, and maybe no socket event to say so.
+    pub passes_ran_out: bool,
     pub created_at: Instant,
     pub pending_resp: Option<Box<(Vec<u8>, usize)>>,
     pub fc_src: Option<SocketAddr>,
@@ -621,6 +624,7 @@ impl TcpSession {
             txn: None,
             srv_cant_recv: false,
             cli_cant_recv: false,
+            passes_ran_out: false,
             created_at: Instant::now(),
             bufsize: crate::buf::get_bufsize(),
             maxrewrite: 1024,
@@ -725,6 +729,12 @@ impl TcpSession {
         self.rep_window() > 0
             || self.pending_resp.as_deref().is_some_and(|(d, o)| *o < d.len())
             || self.h2_ctx.as_ref().is_some_and(|h| h.tx_consumed < h.tx_buf.len())
+    }
+
+    /// Whether the session must be run again with no socket event to wake it.
+    #[must_use]
+    pub fn wants_rerun(&self) -> bool {
+        self.passes_ran_out || self.has_undispatched_h2_streams()
     }
 
     /// A stream with its request in, waiting for its turn, and the turn free: streams
@@ -2110,18 +2120,23 @@ impl TcpSession {
     ///
     /// Mirrors 1.0's `process_task()`. The iteration bound is not decoration: each pass
     /// is driven by data the peer controls, so an unbounded loop here is a
-    /// denial-of-service primitive. On exhaustion we return normally and the scheduler
-    /// re-queues us, which costs a little latency and cannot hang the thread.
+    /// denial-of-service primitive. On exhaustion we return normally and the engine
+    /// requeues us ([`Self::wants_rerun`]), which costs a little latency and cannot hang the
+    /// thread. The requeue is needed: what a pass would have moved on next may wait on no
+    /// socket event at all, an HTTP/2 request body held in its stream's message with the
+    /// server-bound buffer emptied and the client's socket drained (T221).
     ///
     /// # Errors
     /// Propagates unexpected I/O failures.
     pub fn process(&mut self, now: Tick) -> io::Result<()> {
-        for _ in 0..16 {
+        self.passes_ran_out = false;
+        for pass in 0..16 {
             let a = self.process_cli()?;
             let b = self.process_srv()?;
             if !a && !b {
                 break;
             }
+            self.passes_ran_out = pass == 15;
             if matches!(
                 self.cli_state,
                 ScState::Ready | ScState::Established | ScState::ShutR | ScState::ShutW
@@ -2699,6 +2714,84 @@ mod tests {
         let mut out = Vec::new();
         pump_all(&mut msg.clone(), &mut st, &mut req, &mut out);
         assert_eq!(out, b"abcdefghij");
+    }
+
+    /// T221: `process` stops after 16 passes, so a pass cannot be driven forever by a peer.
+    /// An HTTP/2 request body held in the stream's message is moved on only by a pass; when
+    /// the passes run out with body still held, the server-bound buffer emptied and the
+    /// client's socket drained, no socket event is coming, and the session must ask to be
+    /// run again. It did not: the upload stalled until `timeout client` (1 in ~150 runs of
+    /// `h2_large_request_body` under load).
+    #[test]
+    fn an_h2_body_left_when_the_passes_run_out_runs_the_session_again() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+        let frame = |kind: u8, flags: u8, sid: u32, pl: &[u8]| {
+            let len = pl.len() as u32;
+            let mut f = vec![(len >> 16) as u8, (len >> 8) as u8, len as u8, kind, flags];
+            f.extend_from_slice(&sid.to_be_bytes());
+            f.extend_from_slice(pl);
+            f
+        };
+        let body_len = 1_000_000usize;
+        let mut head = Vec::new();
+        for (n, v) in [(":method", "POST"), (":scheme", "http"), (":authority", "x"), (":path", "/up"), ("content-length", &body_len.to_string())] {
+            head.extend_from_slice(&[0, n.len() as u8]);
+            head.extend_from_slice(n.as_bytes());
+            head.push(v.len() as u8);
+            head.extend_from_slice(v.as_bytes());
+        }
+        let (cli, mut client) = UnixStream::pair().expect("pair");
+        cli.set_nonblocking(true).expect("nonblocking");
+        client.write_all(super::H2_CONN_PREFACE).expect("preface");
+        client.write_all(&frame(4, 0, 0, &[])).expect("settings");
+        client.write_all(&frame(1, 4, 1, &head)).expect("headers");
+        let mut s = super::TcpSession::new_with_mode(cli.into(), super::Mode::Http, Vec::new(), Vec::new(), super::Timeouts::default(), 0, ibex_sched::Tick(1000));
+        s.cli_cant_recv = false;
+        s.process(ibex_sched::Tick(1000)).expect("process");
+        assert_eq!(s.h2_active_stream_id, Some(1), "the request is dispatched");
+        s.txn.as_mut().expect("txn").req_rules_done = true;
+
+        // The body, as the mux would have stored it from DATA frames: more than 16 passes
+        // move on (one buffer each), so the passes run out before it is all gone.
+        let h2 = s.h2_ctx.as_mut().expect("h2");
+        let st = h2.streams.get_mut(&1).expect("stream");
+        for _ in 0..body_len / 10_000 {
+            st.rx_htx.push(HtxBlock::Data(vec![b'b'; 10_000]));
+        }
+        st.rx_htx.push(HtxBlock::Eom);
+
+        // A server that reads everything at once.
+        let (srv, mut server) = UnixStream::pair().expect("pair");
+        srv.set_nonblocking(true).expect("nonblocking");
+        let reader = std::thread::spawn(move || {
+            let mut got = 0usize;
+            let mut buf = vec![0u8; 1 << 16];
+            while let Ok(n) = server.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                got += n;
+            }
+            got
+        });
+        s.attach_server(srv.into(), ibex_sched::Tick(1000));
+        s.server_connected(ibex_sched::Tick(1000));
+
+        // Run the session as the engine does: again only on a socket event (the server
+        // writable while `req` holds bytes; the client has nothing more to send) or when
+        // it asks to be. It must not be left with body held and nothing to wake it.
+        for run in 0..1000 {
+            s.process(ibex_sched::Tick(1000)).expect("process");
+            if s.h2_body.done && s.req.is_empty() {
+                break;
+            }
+            let woken = !s.req.is_empty() || s.wants_rerun();
+            assert!(woken, "run {run}: {} body bytes moved on, the rest held with nothing to run the session again", s.h2_body.consumed);
+        }
+        assert!(s.h2_body.done, "the body was moved on whole");
+        drop(s);
+        assert!(reader.join().expect("reader") > body_len, "the server got the head and the body");
     }
 
     /// Found by T195: the DATA of an HTTP/2 request stayed in the stream's message after it

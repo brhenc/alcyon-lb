@@ -7533,7 +7533,7 @@ impl EngineDispatcher<'_> {
             // Pending output needs no requeue: Step 4 asked the (level-triggered) poller
             // for writability, and requeueing it here spun a CPU against a client that
             // reads slowly.
-            if entry.sess.has_undispatched_h2_streams() && !entry.sess.is_done() {
+            if entry.sess.wants_rerun() && !entry.sess.is_done() {
                 self.wake_queue.push(entry.task);
             }
 
