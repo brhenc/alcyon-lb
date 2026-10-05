@@ -56,7 +56,7 @@ impl Cfg {
             gen: 1,
             tcp: false,
             h2: false,
-            nbthread: None,
+            nbthread: Some(1), // T208: the default is now every CPU
             timeout_client: "30s",
             hard_stop_after: "2s",
             response_rule: false,

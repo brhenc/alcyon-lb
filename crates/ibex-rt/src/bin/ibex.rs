@@ -795,7 +795,16 @@ fn main() {
     // 12. Initialize Ibex soft-realtime engine
     
     let capacity = opts.maxconn.unwrap_or(65536) as usize;
-    let nbthread = config.global.as_ref().and_then(|g| g.nbthread).unwrap_or(1) as usize;
+    // HAProxy: without `nbthread`, one thread per CPU in the affinity mask, capped at
+    // MAX_THREADS_DEFAULT (64); an explicit value is taken as is. `available_parallelism`
+    // reads sched_getaffinity on Linux (also cgroup quotas).
+    let nbthread = config
+        .global
+        .as_ref()
+        .and_then(|g| g.nbthread)
+        .map(|n| n as usize)
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 64));
+    ibex_rt::stats::NBTHREAD.store(nbthread as u32, std::sync::atomic::Ordering::Relaxed);
 
     let shared_proxies = match Engine::build_shared_state(&config) {
         Ok(p) => p,

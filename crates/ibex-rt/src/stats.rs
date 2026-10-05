@@ -236,6 +236,9 @@ impl StatRow {
 /// Formats the `show info` output for `HATop` and CLI consumers.
 #[must_use]
 #[allow(clippy::too_many_lines)]
+/// Worker threads this process runs, for `show info` `Nbthread`; set once at startup.
+pub static NBTHREAD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
 pub fn format_show_info(start_time: Instant, pid: u32, total_tasks: usize, run_queue_len: usize, active_conns: u32, max_conns: u32) -> String {
     format_show_info_counts(start_time, pid, total_tasks, run_queue_len, active_conns, max_conns, 0, 0)
 }
@@ -259,6 +262,7 @@ pub fn format_show_info_counts(
     // `global maxconn` and its configured ceiling, when there is one.
     let maxconn = if crate::globalconn::max() > 0 { crate::globalconn::max() } else { max_conns };
     let hard_maxconn = if crate::globalconn::hard() > 0 { crate::globalconn::hard() } else { max_conns };
+    let nbthread = NBTHREAD.load(std::sync::atomic::Ordering::Relaxed).max(1);
     let elapsed = start_time.elapsed();
     let total_secs = elapsed.as_secs();
     let days = total_secs / 86400;
@@ -274,7 +278,7 @@ format!(
 \
          Release_date: 2026/09/21
 \
-         Nbthread: 1
+         Nbthread: {nbthread}
 \
          Nbproc: 1
 \

@@ -58,7 +58,7 @@ impl Ibex {
         let tcp = common::reserve_addr();
         let quic = common::reserve_addr();
         let cfg = format!(
-            "global\n{global}\
+            "global\n  nbthread 1\n{global}\
              defaults\n  mode http\n  timeout connect 2s\n  timeout client 10s\n  timeout server 10s\n\
              frontend fe\n  bind {tcp}\n  bind quic4@{quic} ssl crt {crt}\n  default_backend be\n\
              backend be\n  server s1 {be}\n"
