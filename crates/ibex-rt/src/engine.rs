@@ -1549,6 +1549,8 @@ pub struct Engine {
     /// The `level` of the stats socket (`stats socket ... level`): what each new CLI connection
     /// may do. Unset means admin, as before the level was honoured.
     pub cli_level: crate::applet::CliLevel,
+    /// `stats timeout`, in ms: how long a CLI connection may stay idle.
+    pub cli_timeout_ms: u32,
     pub start_time: Instant,
     /// This process's id, read once: `std::process::id()` is a `getpid` syscall, and the
     /// dispatcher wants it on every step. Nothing forks after an engine is built (`-D`
@@ -3369,6 +3371,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             global_paused: false,
             fe_paused: false,
             cli_level: crate::applet::CliLevel::Admin,
+            cli_timeout_ms: crate::applet::DEFAULT_CLI_TIMEOUT_MS,
             start_time,
             pid: std::process::id(),
             now,
@@ -3450,6 +3453,11 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
     /// Sets the level new CLI connections start at (`stats socket ... level`).
     pub fn set_cli_level(&mut self, level: crate::applet::CliLevel) {
         self.cli_level = level;
+    }
+
+    /// `stats timeout`, for every CLI connection this worker accepts from now on.
+    pub fn set_cli_timeout(&mut self, timeout: std::time::Duration) {
+        self.cli_timeout_ms = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
     }
 
     /// Makes this engine worker `wid` of `pools`, the idle server connections all workers
@@ -3999,6 +4007,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 Ok((stream, _)) => {
                     let _ = stream.set_nonblocking(true);
                     let mut applet = CliApplet::new(stream, self.now);
+                    applet.timeout_ms = self.cli_timeout_ms;
                     applet.level = level;
                     applet.socket_path = path.map(|p| p.display().to_string());
                     let raw_fd = applet.raw_fd;
@@ -9864,7 +9873,7 @@ impl EngineDispatcher<'_> {
             return Outcome::Done;
         };
 
-        if applet.is_done {
+        if applet.is_finished() {
             if let Some(applet) = self.applets.free(applet_id) {
                 if let Some(ref stream) = applet.stream {
                     let _ = self.poller.delete(stream.as_fd());
@@ -9876,7 +9885,11 @@ impl EngineDispatcher<'_> {
 
         let now = self.now;
         if applet.interest.readable && self.fdtab.ready(applet.raw_fd).readable {
+            let had = applet.in_buf.len();
             applet.read_input();
+            if applet.in_buf.len() > had {
+                applet.last_activity = now;
+            }
         }
 
         let mut applet_ctx = AppletContext {
@@ -9897,10 +9910,20 @@ impl EngineDispatcher<'_> {
         applet.process_commands(&mut applet_ctx);
 
         if !applet.out_buf.is_empty() {
+            let left = applet.out_buf.len() - applet.out_offset;
             applet.write_output();
+            // A long answer read slowly is activity, as `HAProxy`'s `timeout client` on
+            // the CLI stream sees it.
+            if applet.out_buf.len() - applet.out_offset < left {
+                applet.last_activity = now;
+            }
         }
 
-        if applet.is_done {
+        // Ended once its answer is out, not on the client's EOF nor before the workers
+        // have answered; and at `stats timeout` when it sends nothing or reads nothing of
+        // what is queued (`HAProxy` closes it then too), so a forgotten connection does not
+        // hold its descriptor for ever (T226).
+        if applet.is_finished() || applet.last_activity.add(applet.timeout_ms).is_expired(now) {
             if let Some(applet) = self.applets.free(applet_id) {
                 if let Some(ref stream) = applet.stream {
                     let _ = self.poller.delete(stream.as_fd());
@@ -9910,14 +9933,7 @@ impl EngineDispatcher<'_> {
             return Outcome::Done;
         }
 
-        let new_interest = if applet.out_buf.is_empty() {
-            Interest::READ
-        } else {
-            Interest {
-                readable: true,
-                writable: true,
-            }
-        };
+        let new_interest = applet.wants();
 
         if new_interest != applet.interest {
             applet.interest = new_interest;

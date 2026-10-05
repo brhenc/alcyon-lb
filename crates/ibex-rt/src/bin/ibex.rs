@@ -829,6 +829,7 @@ fn main() {
         expose_fd: true,
     }));
     let stats_socket_mode = config.global.as_ref().and_then(|g| g.stats_socket_mode);
+    let stats_timeout = config.global.as_ref().and_then(|g| g.stats_timeout);
     // A `stats socket` without `level` is operator, as in HAProxy (`bind_conf->level |=
     // ACCESS_LVL_OPER`, src/cli.c); the master socket `-S` is admin.
     let default_level = if opts.stats_socket.is_some() {
@@ -949,6 +950,9 @@ fn main() {
             };
             engine.share_idle_pools(&idle_pools, worker_id);
 
+            if let Some(t) = stats_timeout {
+                engine.set_cli_timeout(t);
+            }
             if let Some((listener, path)) = cli_pre {
                 if let Some(level) = stats_socket_level {
                     engine.set_cli_level(level);

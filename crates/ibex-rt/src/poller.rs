@@ -45,15 +45,19 @@ impl Poller {
 
     fn flags(readable: bool, writable: bool) -> epoll::EventFlags {
         let mut f = epoll::EventFlags::empty();
+        // RDHUP distinguishes "peer closed its write side" from a plain readable
+        // event, which is what makes half-close detectable without a read syscall.
+        // It is asked for with IN only, as `HAProxy` does (`_do_poll`): the peer's FIN
+        // stays pending, so on a descriptor we no longer read (a client that left while
+        // its request is at the server) a level-triggered RDHUP wakes the thread on
+        // every wait, and every worker spins (T226).
         if readable {
-            f |= epoll::EventFlags::IN;
+            f |= epoll::EventFlags::IN | epoll::EventFlags::RDHUP;
         }
         if writable {
             f |= epoll::EventFlags::OUT;
         }
-        // RDHUP distinguishes "peer closed its write side" from a plain readable
-        // event, which is what makes half-close detectable without a read syscall.
-        f | epoll::EventFlags::RDHUP | epoll::EventFlags::ERR | epoll::EventFlags::HUP
+        f | epoll::EventFlags::ERR | epoll::EventFlags::HUP
     }
 
     /// Registers a descriptor. `data` is echoed back on every event for this fd.

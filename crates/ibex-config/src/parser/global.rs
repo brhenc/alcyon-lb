@@ -42,6 +42,21 @@ pub(crate) fn parse_global_directive(
             Ok(())
         }
         "stats" => {
+            // `HAProxy`'s texts (`cli_parse_global`, src/cli.c): until this arm existed the
+            // line was accepted and dropped, and every CLI connection kept 60 s (T226).
+            if tokens.len() >= 2 && tokens[1].text == "timeout" {
+                let empty = Token { text: String::new(), ..tokens[1].clone() };
+                let tok = tokens.get(2).unwrap_or(&empty);
+                let d = parse_timeout(tok, "stats timeout").map_err(|_| {
+                    let bad = tok.text.chars().find(|c| !c.is_ascii_digit()).map_or(String::new(), String::from);
+                    ConfigError::new(tok.line, tok.col, format!("'stats timeout' : unexpected character '{bad}'"))
+                })?;
+                if d.is_zero() {
+                    return Err(ConfigError::new(tok.line, tok.col, "'stats timeout' expects a positive value".to_string()));
+                }
+                global.stats_timeout = Some(d);
+                return Ok(());
+            }
             if tokens.len() >= 3 && tokens[1].text == "socket" {
                 let mut sock = crate::ast::StatsSocket { path: tokens[2].text.clone(), ..Default::default() };
                 let mut i = 3;

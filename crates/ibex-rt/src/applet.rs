@@ -180,6 +180,10 @@ impl Proxy {
     }
 }
 
+/// `HAProxy`'s CLI idle timeout when `stats timeout` is not set (`cli_fe->timeout.client`,
+/// src/cli.c).
+pub const DEFAULT_CLI_TIMEOUT_MS: u32 = 10_000;
+
 /// A CLI applet connection session.
 pub struct CliApplet {
     /// What this connection may do; starts at the socket's level.
@@ -196,6 +200,10 @@ pub struct CliApplet {
     pub timeout_ms: u32,
     pub last_activity: Tick,
     pub is_done: bool,
+    /// The client shut its write side. What it sent is still run and answered, as
+    /// `HAProxy` does: `echo "show sess" | socat - UNIX-CONNECT:...` stops writing before
+    /// the workers have answered (T226).
+    pub read_shut: bool,
     pub interest: Interest,
     /// An `add map <id> <<` waiting for its payload: the command and the lines so far.
     pub payload: Option<(String, String)>,
@@ -221,9 +229,10 @@ impl CliApplet {
             out_buf: Vec::with_capacity(4096),
             out_offset: 0,
             interactive: false,
-            timeout_ms: 60_000,
+            timeout_ms: DEFAULT_CLI_TIMEOUT_MS,
             last_activity: now,
             is_done: false,
+            read_shut: false,
             interest: Interest::READ,
             payload: None,
             created: Instant::now(),
@@ -242,7 +251,7 @@ impl CliApplet {
         loop {
             match stream.read(&mut buf) {
                 Ok(0) => {
-                    self.is_done = true;
+                    self.read_shut = true;
                     break;
                 }
                 Ok(n) => {
@@ -269,6 +278,8 @@ impl CliApplet {
             match stream.write(&self.out_buf[self.out_offset..]) {
                 Ok(0) => {
                     self.is_done = true;
+                    self.out_buf.clear();
+                    self.out_offset = 0;
                     break;
                 }
                 Ok(n) => {
@@ -282,8 +293,11 @@ impl CliApplet {
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                     break;
                 }
+                // The client is gone: what was left of the answer has nowhere to go.
                 Err(_) => {
                     self.is_done = true;
+                    self.out_buf.clear();
+                    self.out_offset = 0;
                     break;
                 }
             }
@@ -292,9 +306,6 @@ impl CliApplet {
 
     /// Executes complete command lines available in `in_buf`.
     pub fn process_commands(&mut self, ctx: &mut AppletContext) {
-        if !self.in_buf.is_empty() {
-            self.last_activity = ctx.now;
-        }
         if let Some(p) = self.pending.take() {
             if !self.resume_pending(p, ctx) {
                 return;
@@ -1608,33 +1619,23 @@ impl CliApplet {
         }
     }
 
-    /// Steps the applet: reads input, processes commands, writes output, checks timeout.
-    pub fn step(&mut self, ctx: &mut AppletContext) {
-        self.read_input();
-        self.process_commands(ctx);
-        self.write_output();
-
-        if self.last_activity.add(self.timeout_ms).is_expired(ctx.now) {
-            self.is_done = true;
+    /// What the connection waits for: the client's next bytes until it shuts its side or
+    /// the connection ends, and room for the answer while some of it is unsent. Neither,
+    /// while a command waits for the workers after the client shut its side.
+    #[must_use]
+    pub fn wants(&self) -> Interest {
+        Interest {
+            readable: !self.read_shut && !self.is_done,
+            writable: self.out_offset < self.out_buf.len(),
         }
-
-        self.interest = if self.out_offset < self.out_buf.len() {
-            Interest {
-                readable: true,
-                writable: true,
-            }
-        } else {
-            Interest {
-                readable: true,
-                writable: false,
-            }
-        };
     }
 
-    /// Returns `true` if the applet session has finished and should be terminated.
+    /// Whether the connection is over: its answer is all written, and it has ended
+    /// (`quit`, one command out of `prompt` mode, the client gone) or the client shut its
+    /// side and nothing it sent is left to answer.
     #[must_use]
     pub fn is_finished(&self) -> bool {
-        self.is_done && self.out_buf.is_empty()
+        self.out_buf.is_empty() && (self.is_done || (self.read_shut && self.pending.is_none()))
     }
 }
 
