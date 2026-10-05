@@ -315,6 +315,30 @@ pub enum Frame {
     },
 }
 
+/// A decode error that is FRAME_SIZE_ERROR rather than PROTOCOL_ERROR on the wire
+/// (`io::ErrorKind::InvalidInput`; the mux maps it).
+fn frame_size_error(msg: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, msg)
+}
+
+/// Removes the pad length byte and the trailing padding of a PADDED frame (RFC 9113
+/// sections 6.1/6.2). `fixed` is the number of mandatory bytes that follow the pad length
+/// byte. A pad length that leaves no room for them is PROTOCOL_ERROR; a PADDED frame with
+/// no pad length byte is FRAME_SIZE_ERROR (both measured on HAProxy 3.5-dev8).
+fn strip_padding(flags: u8, payload: &[u8], fixed: usize) -> io::Result<&[u8]> {
+    if (flags & frame_flags::PADDED) == 0 {
+        return Ok(payload);
+    }
+    let Some((&pad, rest)) = payload.split_first() else {
+        return Err(frame_size_error("PADDED frame without a pad length"));
+    };
+    let pad = usize::from(pad);
+    if pad + fixed > rest.len() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "pad length exceeds the frame payload"));
+    }
+    Ok(&rest[..rest.len() - pad])
+}
+
 impl Frame {
     /// Encodes the complete frame (header + payload) into wire bytes.
     #[must_use]
@@ -501,13 +525,31 @@ impl Frame {
             FrameType::Data => Ok(Frame::Data {
                 flags: header.flags,
                 stream_id: header.stream_id,
-                data: payload.to_vec(),
+                data: strip_padding(header.flags, payload, 0)?.to_vec(),
             }),
-            FrameType::Headers => Ok(Frame::Headers {
-                flags: header.flags,
-                stream_id: header.stream_id,
-                header_block: payload.to_vec(),
-            }),
+            FrameType::Headers => {
+                // RFC 9113 section 6.2: [pad length] [E + stream dependency + weight] block [padding].
+                let mut body = strip_padding(header.flags, payload, if (header.flags & frame_flags::PRIORITY) != 0 { 5 } else { 0 })?;
+                if (header.flags & frame_flags::PRIORITY) != 0 {
+                    if body.len() < 5 {
+                        return Err(frame_size_error("HEADERS priority field truncated"));
+                    }
+                    let dep = u32::from_be_bytes([body[0], body[1], body[2], body[3]]) & 0x7fff_ffff;
+                    if dep == header.stream_id {
+                        // Measured on HAProxy 3.5-dev8: GOAWAY PROTOCOL_ERROR.
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "HEADERS stream depends on itself",
+                        ));
+                    }
+                    body = &body[5..];
+                }
+                Ok(Frame::Headers {
+                    flags: header.flags,
+                    stream_id: header.stream_id,
+                    header_block: body.to_vec(),
+                })
+            }
             FrameType::Priority => {
                 if payload.len() != 5 {
                     return Err(io::Error::new(
@@ -565,20 +607,17 @@ impl Frame {
                 })
             }
             FrameType::PushPromise => {
-                if payload.len() < 4 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "PUSH_PROMISE frame payload too short",
-                    ));
+                let body = strip_padding(header.flags, payload, 4)?;
+                if body.len() < 4 {
+                    return Err(frame_size_error("PUSH_PROMISE frame payload too short"));
                 }
                 let promised_stream_id =
-                    u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]])
-                        & 0x7fff_ffff;
+                    u32::from_be_bytes([body[0], body[1], body[2], body[3]]) & 0x7fff_ffff;
                 Ok(Frame::PushPromise {
                     flags: header.flags,
                     stream_id: header.stream_id,
                     promised_stream_id,
-                    header_block: payload[4..].to_vec(),
+                    header_block: body[4..].to_vec(),
                 })
             }
             FrameType::Ping => {
@@ -1730,5 +1769,101 @@ mod tests {
             let dec = Frame::decode(&hdr, &bytes[9..]).unwrap();
             prop_assert_eq!(dec, frame);
         }
+    }
+
+    fn dec(kind: FrameType, flags: u8, sid: u32, payload: &[u8]) -> io::Result<Frame> {
+        let h = FrameHeader { length: payload.len() as u32, frame_type: kind, flags, stream_id: sid };
+        Frame::decode(&h, payload)
+    }
+
+    fn block_of(f: io::Result<Frame>) -> Vec<u8> {
+        let Ok(Frame::Headers { header_block, .. }) = f else { panic!("not a decoded HEADERS: {f:?}") };
+        header_block
+    }
+
+    /// RFC 9113 section 6.2, Chrome's request: PRIORITY set, the 5 bytes are not HPACK.
+    #[test]
+    fn headers_priority_field_is_not_part_of_the_block() {
+        let flags = frame_flags::END_HEADERS | frame_flags::END_STREAM | frame_flags::PRIORITY;
+        let got = block_of(dec(FrameType::Headers, flags, 1, &[0x80, 0, 0, 0, 0xff, 0x82, 0x87]));
+        assert_eq!(got, [0x82, 0x87]);
+    }
+
+    #[test]
+    fn headers_padding_is_stripped() {
+        let flags = frame_flags::END_HEADERS | frame_flags::PADDED;
+        let got = block_of(dec(FrameType::Headers, flags, 1, &[3, 0x82, 0x87, 0, 0, 0]));
+        assert_eq!(got, [0x82, 0x87]);
+    }
+
+    #[test]
+    fn headers_padded_and_priority_together() {
+        let flags = frame_flags::END_HEADERS | frame_flags::PADDED | frame_flags::PRIORITY;
+        let got = block_of(dec(FrameType::Headers, flags, 1, &[2, 0, 0, 0, 0, 16, 0x82, 0, 0]));
+        assert_eq!(got, [0x82]);
+        // A pad length of exactly what is left is fine: an empty block.
+        let got = block_of(dec(FrameType::Headers, flags, 1, &[2, 0, 0, 0, 0, 16, 0, 0]));
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn headers_pad_length_too_large_is_protocol_error() {
+        let flags = frame_flags::END_HEADERS | frame_flags::PADDED;
+        let e = dec(FrameType::Headers, flags, 1, &[3, 0x82, 0x87]).expect_err("pad > data");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        // Pad length eating into the priority field.
+        let flags = flags | frame_flags::PRIORITY;
+        let e = dec(FrameType::Headers, flags, 1, &[1, 0, 0, 0, 0, 16]).expect_err("pad into priority");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// HAProxy answers FRAME_SIZE_ERROR (6) to these; InvalidInput is the marker for it.
+    #[test]
+    fn headers_truncated_fields_are_frame_size_errors() {
+        let e = dec(FrameType::Headers, frame_frags_padded(), 1, &[]).expect_err("no pad length");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        let e = dec(FrameType::Headers, frame_flags::PRIORITY, 1, &[0, 0]).expect_err("short priority");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    fn frame_frags_padded() -> u8 {
+        frame_flags::PADDED
+    }
+
+    /// HAProxy: GOAWAY PROTOCOL_ERROR for a HEADERS that depends on its own stream.
+    #[test]
+    fn headers_depending_on_itself_is_protocol_error() {
+        let e = dec(FrameType::Headers, frame_flags::PRIORITY, 5, &[0, 0, 0, 5, 16]).expect_err("self");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        // The exclusive bit does not hide it.
+        let e = dec(FrameType::Headers, frame_flags::PRIORITY, 5, &[0x80, 0, 0, 5, 16]).expect_err("self excl");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn data_padding_is_stripped_and_checked() {
+        let f = dec(FrameType::Data, frame_flags::PADDED, 1, &[4, b'a', b'b', b'c', 0, 0, 0, 0]).expect("ok");
+        assert!(matches!(f, Frame::Data { ref data, .. } if data == b"abc"));
+        let f = dec(FrameType::Data, frame_flags::PADDED, 1, &[3, 0, 0, 0]).expect("all padding");
+        assert!(matches!(f, Frame::Data { ref data, .. } if data.is_empty()));
+        let e = dec(FrameType::Data, frame_flags::PADDED, 1, &[9, b'a']).expect_err("pad > data");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        let e = dec(FrameType::Data, frame_flags::PADDED, 1, &[]).expect_err("no pad length");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn push_promise_too_short_is_frame_size_error() {
+        let e = dec(FrameType::PushPromise, frame_flags::PADDED, 1, &[1, 0, 0, 2, 0]).expect_err("short");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData, "pad 1 leaves 3 of 4 id bytes");
+        let e = dec(FrameType::PushPromise, 0, 1, &[0, 0, 2]).expect_err("short");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn push_promise_padding_is_stripped() {
+        let f = dec(FrameType::PushPromise, frame_flags::PADDED | frame_flags::END_HEADERS, 1, &[2, 0, 0, 0, 2, 0x82, 0, 0])
+            .expect("ok");
+        assert!(matches!(f, Frame::PushPromise { promised_stream_id: 2, ref header_block, .. } if header_block == &[0x82]));
     }
 }

@@ -1320,7 +1320,9 @@ impl TcpSession {
                     }
                     Io::Done(n) if n > 0 => {
                         let h2 = self.h2_ctx.as_mut().unwrap();
-                        let _ = MuxH2.parse(h2, &raw_buf[..n])?;
+                        // A connection error leaves its GOAWAY queued; it is flushed and the
+                        // connection closed below, as HAProxy does, not dropped unsent.
+                        let _ = MuxH2.parse(h2, &raw_buf[..n]).map_err(|_| h2.ensure_goaway());
                         self.bytes_in += n as u64;
                         self.log.first_byte_now();
                         changed = true;
@@ -1369,7 +1371,7 @@ impl TcpSession {
                 let mut h2 = H2MuxContext::new(ibex_proto::conn::ConnId(0), true);
                 h2.flood_config = self.h2_flood_config;
                 let to_parse = self.req.readable().to_vec();
-                let _ = MuxH2.parse(&mut h2, &to_parse)?;
+                let _ = MuxH2.parse(&mut h2, &to_parse).map_err(|_| h2.ensure_goaway());
                 self.req.clear();
                 self.h2_ctx = Some(h2);
                 changed = true;
