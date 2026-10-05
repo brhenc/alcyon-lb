@@ -745,6 +745,44 @@ impl Buf {
 mod tests {
     use super::Buf;
 
+    /// T183: a buffer of a pooled class holds memory only between a write and the release
+    /// that follows its draining; its capacity is its class's either way.
+    #[test]
+    fn an_unallocated_buffer_takes_memory_on_write_and_gives_it_back_empty() {
+        use super::{get_bufsize, get_bufsize_large, get_bufsize_small, BufClass};
+        for (class, cap) in [
+            (BufClass::Standard, get_bufsize()),
+            (BufClass::Small, get_bufsize_small()),
+            (BufClass::Large, get_bufsize_large().unwrap_or(65536)),
+        ] {
+            let mut b = Buf::unallocated(class);
+            assert!(!b.is_allocated());
+            assert_eq!(b.capacity(), cap);
+            assert!(!b.is_full());
+            b.ensure_writable(2)[..2].copy_from_slice(b"ab");
+            b.commit(2);
+            assert!(b.is_allocated());
+            b.release();
+            assert!(b.is_allocated(), "a buffer holding data keeps it");
+            b.consume(2);
+            b.release();
+            assert!(!b.is_allocated());
+            assert_eq!(b.class(), class);
+        }
+        // A small one with no memory yet is promoted without taking any.
+        let mut b = Buf::unallocated(BufClass::Small);
+        assert!(b.promote_to_standard());
+        assert!(!b.is_allocated());
+        assert_eq!(b.capacity(), get_bufsize());
+        // A buffer of no class is never released, and has no memory to take.
+        let mut c = Buf::with_capacity(3);
+        c.release();
+        assert!(c.is_allocated());
+        let mut z = Buf::unallocated(BufClass::Custom);
+        assert_eq!(z.capacity(), 0);
+        assert!(z.writable().is_empty());
+    }
+
     #[test]
     fn fills_drains_and_resets() {
         let mut b = Buf::with_capacity(8);
