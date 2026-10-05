@@ -17,7 +17,6 @@ use std::os::fd::{AsFd, AsRawFd as _, OwnedFd};
 use ibex_proto::htx::{HtxBlock, HtxSlice};
 use ibex_proto::mux_h3;
 use ibex_proto::qpack;
-use ibex_quic::quinn_proto;
 use ibex_quic::{
     ConnectionId, QuicConfig, QuicEndpoint, QuicTransport, StreamDirection, StreamId,
     TransportEvent,
@@ -31,6 +30,38 @@ const DGRAM_BUF_SIZE: usize = 2048;
 const CMSG_BUF_SIZE: usize = 128;
 /// H3_NO_ERROR (RFC 9114 section 8.1), the application error code of a graceful close.
 const H3_NO_ERROR: u64 = 0x100;
+
+/// The QUIC sockets bound by [`prebind`] before the workers start, one per worker and
+/// address, each waiting for its worker to take it.
+static PREBOUND: std::sync::Mutex<Vec<(SocketAddr, usize, DgramSocket)>> = std::sync::Mutex::new(Vec::new());
+
+/// Binds every worker's `SO_REUSEPORT` socket on `addr` now, on the calling thread (T210).
+///
+/// The kernel hashes a datagram's four-tuple over the sockets in the reuseport group *at the
+/// time it arrives*. Bound one by one from inside the worker threads, while the first workers
+/// already served, the group grew under a client that came early: its first datagrams went
+/// to one worker, its later ones to another that had never heard of the connection, and the
+/// handshake stalled (`h3_many_threads.rs`: 9 of 20 at `nbthread 64`). HAProxy binds every
+/// listener, QUIC included, in the startup path before the first thread is created
+/// (strace: all `bind`s precede the first `clone3`).
+///
+/// # Errors
+/// The first socket that cannot be bound; none of this address's sockets are kept then.
+pub fn prebind(addr: SocketAddr, workers: usize) -> io::Result<()> {
+    let mut socks = Vec::with_capacity(workers);
+    for worker in 0..workers {
+        socks.push((addr, worker, DgramSocket::bind(addr)?));
+    }
+    PREBOUND.lock().unwrap_or_else(std::sync::PoisonError::into_inner).extend(socks);
+    Ok(())
+}
+
+/// The socket [`prebind`] bound on `addr` for `worker`, if there is one.
+fn take_prebound(addr: SocketAddr, worker: usize) -> Option<DgramSocket> {
+    let mut all = PREBOUND.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let i = all.iter().position(|(a, w, _)| *a == addr && *w == worker)?;
+    Some(all.swap_remove(i).2)
+}
 
 /// A QUIC listener managing datagram I/O on a nonblocking UDP socket and driving the QUIC transport.
 pub struct QuicListener {
@@ -155,6 +186,20 @@ impl QuicListener {
         tls_server_config: &rustls::ServerConfig,
         quic_config: Option<QuicConfig>,
     ) -> io::Result<Self> {
+        Self::bind_for_worker(addr, tls_server_config, quic_config, None)
+    }
+
+    /// [`QuicListener::bind`] for a worker: it takes the socket [`prebind`] bound for it on
+    /// `addr`, and binds one only if there is none (an engine built without `prebind`).
+    ///
+    /// # Errors
+    /// As [`QuicListener::bind`].
+    pub fn bind_for_worker(
+        addr: SocketAddr,
+        tls_server_config: &rustls::ServerConfig,
+        quic_config: Option<QuicConfig>,
+        worker: Option<usize>,
+    ) -> io::Result<Self> {
         let config = quic_config.unwrap_or_default();
         let server_config = config
             .build_server_config(tls_server_config)
@@ -168,32 +213,22 @@ impl QuicListener {
             config.require_retry,
             config.anti_amplification_factor,
         );
-        Self::from_endpoint(addr, endpoint)
+        let socket = match worker.and_then(|w| take_prebound(addr, w)) {
+            Some(s) => s,
+            None => DgramSocket::bind(addr)?,
+        };
+        Ok(Self::from_socket(addr, socket, endpoint))
     }
 
-    /// Binds a UDP socket on `addr` and initializes with a pre-built `quinn_proto::ServerConfig`.
-    ///
-    /// # Errors
-    /// Returns an error if the UDP socket cannot be bound or if endpoint initialization fails.
-    pub fn bind_with_server_config(
-        addr: SocketAddr,
-        server_config: Arc<quinn_proto::ServerConfig>,
-    ) -> io::Result<Self> {
-        let endpoint = QuicEndpoint::with_server_config(server_config)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
-        Self::from_endpoint(addr, endpoint)
-    }
-
-    /// Binds the UDP socket and wraps an already-configured endpoint.
-    fn from_endpoint(addr: SocketAddr, endpoint: QuicEndpoint) -> io::Result<Self> {
-        let socket = DgramSocket::bind(addr)?;
+    /// Wraps a bound UDP socket and an already-configured endpoint.
+    fn from_socket(addr: SocketAddr, socket: DgramSocket, endpoint: QuicEndpoint) -> Self {
         let bound_addr = socket.local_addr().unwrap_or(addr);
 
         let recv_raw_bufs = vec![vec![0u8; DGRAM_BUF_SIZE]; BATCH_SIZE];
         let recv_cmsg_bufs = vec![vec![0u8; CMSG_BUF_SIZE]; BATCH_SIZE];
         let send_raw_bufs = vec![vec![0u8; DGRAM_BUF_SIZE]; BATCH_SIZE];
 
-        Ok(Self {
+        Self {
             socket,
             endpoint,
             addr: bound_addr,
@@ -212,7 +247,7 @@ impl QuicListener {
             peers: HashMap::new(),
             pinned: Vec::new(),
             released: Vec::new(),
-        })
+        }
     }
 
 

@@ -2270,6 +2270,30 @@ fn initial_status(s: &ibex_config::Server) -> u8 {
 
 /// The `bind` lines of a frontend, as the engine opens them: the `bind` shorthand of a
 /// section built in code first, when no line has its address.
+/// Binds the QUIC sockets of all `workers` for every enabled frontend's `quic` bind, before any
+/// worker is started; each worker's `Engine::new_worker` then takes its own
+/// ([`crate::quic_listener::prebind`] says why).
+///
+/// # Errors
+/// The first address that cannot be bound.
+pub fn prebind_quic(config: &Config, workers: usize) -> io::Result<()> {
+    for frontend in config.frontends.iter().filter(|f| !f.disabled) {
+        for b in frontend_binds(frontend).iter().filter(|b| b.quic) {
+            crate::quic_listener::prebind(b.addr, workers).map_err(|e| {
+                // HAProxy's alert (`protocol_bind_all`), without its `[file:line]`.
+                let why = e.to_string();
+                let why = why.split(" (os error").next().unwrap_or(&why).to_string();
+                let proto = if b.addr.is_ipv4() { "quic4" } else { "quic6" };
+                io::Error::new(
+                    e.kind(),
+                    format!("Binding for frontend {}: protocol {proto}: cannot bind socket ({why}) for [{}].", frontend.name, b.addr),
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
 fn frontend_binds(frontend: &ibex_config::FrontendSection) -> Vec<ibex_config::ast::BindConfig> {
     let mut all_binds = frontend.binds.clone();
     if let Some(ba) = frontend.bind {
@@ -3083,7 +3107,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     // Each request is handed to this frontend's stream engine (T130). It
                     // used to go straight to the first server of the default backend, and
                     // no rule, `use_backend`, balancing or log line ever saw it.
-                    let mut ql = crate::quic_listener::QuicListener::bind(bind_addr, &tls, None)?;
+                    let mut ql = crate::quic_listener::QuicListener::bind_for_worker(bind_addr, &tls, None, Some(worker_id))?;
                     ql.set_frontend(proxy_idx);
 
                     let l_idx = quic_listeners.len();
