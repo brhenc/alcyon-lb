@@ -1112,17 +1112,12 @@ impl Proxy {
     /// How many queued requests the servers can take now (`usize::MAX`: no limit).
     #[must_use]
     pub fn queue_headroom(&self) -> usize {
-        let mut free = 0usize;
-        for i in self.eligible_server_indices() {
-            match self.server_maxconn.get(i).copied().flatten() {
-                Some(mc) if mc > 0 => {
-                    let act = self.server_actconn.get(i).map_or(0, |a| a.load(Ordering::Relaxed));
-                    free += mc.saturating_sub(act) as usize;
-                }
-                _ => return usize::MAX,
-            }
-        }
-        free
+        self.eligible_server_indices().into_iter().fold(0usize, |free, i| {
+            let room = self.server_maxconn.get(i).copied().flatten().filter(|&mc| mc > 0).map_or(usize::MAX, |mc| {
+                mc.saturating_sub(self.server_actconn.get(i).map_or(0, |a| a.load(Ordering::Relaxed))) as usize
+            });
+            free.saturating_add(room)
+        })
     }
 
     /// Selects the target backend server using the configured load balancing algorithm,
@@ -7234,7 +7229,6 @@ impl EngineDispatcher<'_> {
                 txn.rsp.measure_head(sess.rep.readable());
                 if framing == crate::txn::Framing::Tunnel && txn.req.is_done() {
                     txn.req = MsgState::Tunnel;
-                    sess.enter_tunnel(now);
                 }
             }
             // `option logasap`: the line goes out with the response head (`http_process_res_common`),

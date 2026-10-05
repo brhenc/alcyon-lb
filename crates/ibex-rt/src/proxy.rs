@@ -755,8 +755,7 @@ impl TcpSession {
         let ms = if set != 0 { set } else { self.be_tunnel_ms };
         let on = match self.mode {
             Mode::Tcp => self.srv_state == ScState::Established,
-            Mode::Http => self.txn.as_ref().is_some_and(|t| t.rsp == txn::MsgState::Tunnel && t.req == txn::MsgState::Tunnel),
-            Mode::Health => false,
+            _ => self.mode == Mode::Http && self.txn.as_ref().is_some_and(|t| t.rsp == txn::MsgState::Tunnel && t.req == txn::MsgState::Tunnel),
         };
         (ms != 0 && on).then_some(ms)
     }
@@ -774,14 +773,6 @@ impl TcpSession {
     pub fn queue_ms(&self) -> u32 {
         let set = self.timeouts_set.as_ref().map_or(0, |s| s.ms[ibex_sample::TimeoutKind::Queue as usize]);
         if set != 0 { set } else { self.be_queue_ms }
-    }
-
-    /// The stream became a tunnel (`101`, `CONNECT`): both timers restart on `timeout tunnel`.
-    pub fn enter_tunnel(&mut self, now: Tick) {
-        if self.tunnel_ms().is_some() {
-            self.arm_client(now);
-            self.arm_server(now);
-        }
     }
 
     /// Whether the request head is still being received: no transaction yet, and either
