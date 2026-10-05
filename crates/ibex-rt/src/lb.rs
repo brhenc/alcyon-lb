@@ -47,10 +47,10 @@ pub fn is_server_available(proxy: &Proxy, idx: usize) -> bool {
     } else {
         return false;
     }
-    if let Some(Some(mc)) = proxy.server_maxconn.get(idx) {
-        if *mc > 0 {
+    if let Some(mc) = proxy.server_maxconn.get(idx) {
+        if mc > 0 {
             let act = proxy.server_actconn.get(idx).map_or(0, |a| a.load(Ordering::Relaxed));
-            if act >= *mc {
+            if act >= mc {
                 return false;
             }
         }
@@ -64,7 +64,7 @@ pub fn is_server_available(proxy: &Proxy, idx: usize) -> bool {
 #[inline]
 #[must_use]
 fn is_selectable(proxy: &Proxy, idx: usize) -> bool {
-    is_server_available(proxy, idx) && proxy.server_weights.get(idx).copied().unwrap_or(1) > 0
+    is_server_available(proxy, idx) && proxy.server_weights.get(idx).unwrap_or(1) > 0
 }
 
 /// Determines whether a server at `idx` is UP, ignoring its connection load. Used to build
@@ -85,8 +85,8 @@ pub fn any_full(proxy: &Proxy) -> bool {
     (0..proxy.servers.len()).any(|idx| {
         is_server_up(proxy, idx)
             && !avoided(proxy, idx)
-            && proxy.server_weights.get(idx).copied().unwrap_or(1) > 0
-            && proxy.server_maxconn.get(idx).copied().flatten().is_some_and(|mc| {
+            && proxy.server_weights.get(idx).unwrap_or(1) > 0
+            && proxy.server_maxconn.get(idx).is_some_and(|mc| {
                 mc > 0 && proxy.server_actconn.get(idx).map_or(0, |a| a.load(Ordering::Relaxed)) >= mc
             })
     })
@@ -171,7 +171,7 @@ impl FwrrState {
     fn eweight(proxy: &Proxy, idx: usize) -> u32 {
         let backup = proxy.server_backups.get(idx).copied().unwrap_or(false);
         let up = proxy.server_statuses.get(idx).is_some_and(|s| s.load(Ordering::Relaxed) == ServerStatus::Up as u8);
-        let w = proxy.server_weights.get(idx).copied().unwrap_or(1).min(256);
+        let w = proxy.server_weights.get(idx).unwrap_or(1).min(256);
         if backup || !up { 0 } else { w * BE_WEIGHT_SCALE }
     }
 
@@ -443,7 +443,7 @@ fn weighted_eligible(proxy: &Proxy) -> (Vec<(usize, u32)>, u32) {
     for idx in 0..proxy.servers.len() {
         let is_backup = proxy.server_backups.get(idx).copied().unwrap_or(false);
         if !is_backup && is_selectable(proxy, idx) {
-            let w = proxy.server_weights.get(idx).copied().unwrap_or(1).max(1);
+            let w = proxy.server_weights.get(idx).unwrap_or(1).max(1);
             total_weight = total_weight.saturating_add(w);
             eligible_primaries.push((idx, w));
         }
@@ -491,8 +491,8 @@ pub fn random(proxy: &Proxy, draws: u32) -> Option<usize> {
         if candidate == best {
             continue;
         }
-        let best_weight = u64::from(proxy.server_weights.get(best).copied().unwrap_or(1).max(1));
-        let cand_weight = u64::from(proxy.server_weights.get(candidate).copied().unwrap_or(1).max(1));
+        let best_weight = u64::from(proxy.server_weights.get(best).unwrap_or(1).max(1));
+        let cand_weight = u64::from(proxy.server_weights.get(candidate).unwrap_or(1).max(1));
         let best_load = u64::from(proxy.server_actconn.get(best).map_or(0, |a| a.load(Ordering::Relaxed)));
         let cand_load = u64::from(proxy.server_actconn.get(candidate).map_or(0, |a| a.load(Ordering::Relaxed)));
         // Cross-multiplied comparison of (load / weight): keep whichever is less loaded
@@ -519,7 +519,7 @@ pub fn leastconn(proxy: &Proxy) -> Option<usize> {
         let is_backup = proxy.server_backups.get(idx).copied().unwrap_or(false);
         if !is_backup && is_selectable(proxy, idx) {
             let conn = u64::from(proxy.server_actconn.get(idx).map_or(0, |a| a.load(Ordering::Relaxed)));
-            let weight = u64::from(proxy.server_weights.get(idx).copied().unwrap_or(1).max(1));
+            let weight = u64::from(proxy.server_weights.get(idx).unwrap_or(1).max(1));
 
             // Load metric comparison: (conn + 1) / weight vs (best_conn + 1) / best_weight
             // Cross-multiplied: (conn + 1) * best_weight vs (best_conn + 1) * weight
@@ -557,7 +557,7 @@ pub fn static_rr(proxy: &Proxy) -> Option<usize> {
     for idx in 0..proxy.servers.len() {
         let is_backup = proxy.server_backups.get(idx).copied().unwrap_or(false);
         if !is_backup && is_selectable(proxy, idx) {
-            let w = proxy.server_weights.get(idx).copied().unwrap_or(1).max(1);
+            let w = proxy.server_weights.get(idx).unwrap_or(1).max(1);
             total_weight = total_weight.saturating_add(w);
             eligible_primaries.push((idx, w));
         }
@@ -611,7 +611,7 @@ pub fn balance_uri(proxy: &Proxy, uri: &str) -> Option<usize> {
     for idx in 0..proxy.servers.len() {
         let is_backup = proxy.server_backups.get(idx).copied().unwrap_or(false);
         if !is_backup && is_selectable(proxy, idx) {
-            let w = proxy.server_weights.get(idx).copied().unwrap_or(1).max(1);
+            let w = proxy.server_weights.get(idx).unwrap_or(1).max(1);
             total_weight = total_weight.saturating_add(w);
             eligible_primaries.push((idx, w));
         }
@@ -752,7 +752,7 @@ impl ChashRing {
         let in_ring = |idx: usize| {
             !proxy.server_backups.get(idx).copied().unwrap_or(false)
                 && is_server_up(proxy, idx)
-                && proxy.server_weights.get(idx).copied().unwrap_or(1) > 0
+                && proxy.server_weights.get(idx).unwrap_or(1) > 0
         };
         {
             let ring = self.0.read().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -771,7 +771,7 @@ impl ChashRing {
                 // with an `id`; `hash-key id` is the default.
                 let puid = proxy.server_puid(idx);
                 let base = puid.wrapping_mul(SRV_EWGHT_RANGE);
-                let nodes = proxy.server_weights.get(idx).copied().unwrap_or(1) * BE_WEIGHT_SCALE;
+                let nodes = proxy.server_weights.get(idx).unwrap_or(1) * BE_WEIGHT_SCALE;
                 let server = u32::try_from(idx).unwrap_or(u32::MAX);
                 ring.points.extend((0..nodes).map(|j| (full_hash(base.wrapping_add(j)), server)));
             }

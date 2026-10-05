@@ -429,7 +429,7 @@ pub fn render(stats: &StatsSnapshot, out: &mut String) {
                 "haproxy_server_weight{{proxy=\"{0}\",server=\"{1}\"}} {2}",
                 proxy.name,
                 srv_name,
-                proxy.server_weights.get(s_idx).copied().unwrap_or(1)
+                proxy.server_weights.get(s_idx).unwrap_or(1)
             );
         }
     }
@@ -508,7 +508,7 @@ pub fn render(stats: &StatsSnapshot, out: &mut String) {
             } else {
                 "srv"
             };
-            if let Some(m) = proxy.server_maxconn.get(s_idx).copied().flatten() {
+            if let Some(m) = proxy.server_maxconn.get(s_idx) {
                 let _ = writeln!(
                     out,
                     "haproxy_server_limit_sessions{{proxy=\"{0}\",server=\"{1}\"}} {2}",

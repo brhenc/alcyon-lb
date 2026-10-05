@@ -27,8 +27,8 @@ backend test_be
     server s2 127.0.0.1:8002 weight 2 maxconn 100
     server s3 127.0.0.1:8003 weight 1 maxconn 100
 ";
-    let mut eng = get_proxy(cfg);
-    let proxy = &mut eng.proxies.make_mut()[0];
+    let eng = get_proxy(cfg);
+    let proxy = &eng.proxies[0];
     
     for s in proxy.server_statuses.iter() {
         s.store(check::ServerStatus::Up as u8, Ordering::Relaxed);
@@ -40,7 +40,7 @@ backend test_be
     
     assert_eq!(lb::leastconn(proxy), Some(1));
     
-    proxy.server_weights[2] = 2;
+    proxy.set_weight(2, 2);
     assert_eq!(lb::leastconn(proxy), Some(2));
     
     proxy.server_actconn[1].store(2, Ordering::Relaxed);
@@ -55,8 +55,8 @@ backend test_be
     server s1 127.0.0.1:8001 weight 2
     server s2 127.0.0.1:8002 weight 1
 ";
-    let mut eng = get_proxy(cfg);
-    let proxy = &mut eng.proxies.make_mut()[0];
+    let eng = get_proxy(cfg);
+    let proxy = &eng.proxies[0];
     
     for s in proxy.server_statuses.iter() {
         s.store(check::ServerStatus::Up as u8, Ordering::Relaxed);
@@ -82,8 +82,8 @@ backend test_be
     server s2 127.0.0.1:8002 weight 1
     server s3 127.0.0.1:8003 weight 1
 ";
-    let mut eng = get_proxy(cfg);
-    let proxy = &mut eng.proxies.make_mut()[0];
+    let eng = get_proxy(cfg);
+    let proxy = &eng.proxies[0];
     
     for s in proxy.server_statuses.iter() {
         s.store(check::ServerStatus::Up as u8, Ordering::Relaxed);
@@ -118,8 +118,8 @@ backend test_be
     server s2 127.0.0.1:8002 weight 1
     server s3 127.0.0.1:8003 weight 1
 ";
-    let mut eng = get_proxy(cfg);
-    let proxy = &mut eng.proxies.make_mut()[0];
+    let eng = get_proxy(cfg);
+    let proxy = &eng.proxies[0];
     
     for s in proxy.server_statuses.iter() {
         s.store(check::ServerStatus::Up as u8, Ordering::Relaxed);
@@ -130,7 +130,7 @@ backend test_be
         let uri = format!("/api/v1/resource/{}", i);
         // Drive the engine's real selection path -- not lb::balance_uri
         let target = proxy.select_server_with_key(None, Some(&uri)).unwrap();
-        let idx = proxy.servers.iter().position(|&s| s == target).unwrap();
+        let idx = proxy.servers.position(target).unwrap();
         counts[idx] += 1;
     }
     
@@ -153,8 +153,8 @@ backend test_be
     server s2 127.0.0.1:8002
     server s3 127.0.0.1:8003
 ";
-    let mut eng = get_proxy(cfg);
-    let proxy = &mut eng.proxies.make_mut()[0];
+    let eng = get_proxy(cfg);
+    let proxy = &eng.proxies[0];
 
     for s in proxy.server_statuses.iter() {
         s.store(check::ServerStatus::Up as u8, Ordering::Relaxed);
@@ -162,7 +162,7 @@ backend test_be
 
     for _ in 0..20 {
         let target = proxy.select_server_with_key(None, None).unwrap();
-        assert_eq!(target, proxy.servers[0], "balance first must always pick the earliest server with a free slot");
+        assert_eq!(target, proxy.servers.at(0), "balance first must always pick the earliest server with a free slot");
     }
 }
 
@@ -178,8 +178,8 @@ backend test_be
     server s1 127.0.0.1:8001 maxconn 1
     server s2 127.0.0.1:8002 maxconn 1
 ";
-    let mut eng = get_proxy(cfg);
-    let proxy = &mut eng.proxies.make_mut()[0];
+    let eng = get_proxy(cfg);
+    let proxy = &eng.proxies[0];
 
     for s in proxy.server_statuses.iter() {
         s.store(check::ServerStatus::Up as u8, Ordering::Relaxed);
@@ -187,7 +187,7 @@ backend test_be
     proxy.server_actconn[0].store(1, Ordering::Relaxed); // s1 (index 0) is full
 
     let target = proxy.select_server_with_key(None, None).unwrap();
-    assert_eq!(target, proxy.servers[1], "a full earlier server must be skipped in favour of the next one");
+    assert_eq!(target, proxy.servers.at(1), "a full earlier server must be skipped in favour of the next one");
 }
 
 /// Verified against the reference binary: three real HTTP servers behind `balance random`,
@@ -204,8 +204,8 @@ backend test_be
     server s2 127.0.0.1:8002
     server s3 127.0.0.1:8003
 ";
-    let mut eng = get_proxy(cfg);
-    let proxy = &mut eng.proxies.make_mut()[0];
+    let eng = get_proxy(cfg);
+    let proxy = &eng.proxies[0];
 
     for s in proxy.server_statuses.iter() {
         s.store(check::ServerStatus::Up as u8, Ordering::Relaxed);
@@ -214,7 +214,7 @@ backend test_be
     let mut counts = vec![0; 3];
     for _ in 0..300 {
         let target = proxy.select_server_with_key(None, None).unwrap();
-        let idx = proxy.servers.iter().position(|&s| s == target).unwrap();
+        let idx = proxy.servers.position(target).unwrap();
         counts[idx] += 1;
     }
 
@@ -235,8 +235,8 @@ backend test_be
     server s1 127.0.0.1:8001 maxconn 1
     server s2 127.0.0.1:8002 maxconn 5
 ";
-    let mut eng = get_proxy(cfg);
-    let proxy = &mut eng.proxies.make_mut()[0];
+    let eng = get_proxy(cfg);
+    let proxy = &eng.proxies[0];
 
     for s in proxy.server_statuses.iter() {
         s.store(check::ServerStatus::Up as u8, Ordering::Relaxed);
@@ -245,7 +245,7 @@ backend test_be
 
     for _ in 0..50 {
         let target = proxy.select_server_with_key(None, None).unwrap();
-        assert_eq!(target, proxy.servers[1], "a saturated server must never be drawn");
+        assert_eq!(target, proxy.servers.at(1), "a saturated server must never be drawn");
     }
 }
 
@@ -264,24 +264,24 @@ backend test_be
     server s1 127.0.0.1:8001 maxconn 1
     server s2 127.0.0.1:8002 maxconn 1
 ";
-    let mut eng = get_proxy(cfg);
-    let proxy = &mut eng.proxies.make_mut()[0];
+    let eng = get_proxy(cfg);
+    let proxy = &eng.proxies[0];
     for s in proxy.server_statuses.iter() {
         s.store(check::ServerStatus::Up as u8, Ordering::Relaxed);
     }
 
     let uri = "/test-url";
     let natural = proxy.select_server_with_key(None, Some(uri)).unwrap();
-    let natural_idx = proxy.servers.iter().position(|&s| s == natural).unwrap();
+    let natural_idx = proxy.servers.position(natural).unwrap();
 
     // Saturate the natural target and confirm the ring moves to the other server.
     proxy.server_actconn[natural_idx].store(1, Ordering::Relaxed);
     let other_idx = 1 - natural_idx;
     let target = proxy.select_server_with_key(None, Some(uri)).unwrap();
-    assert_eq!(target, proxy.servers[other_idx], "hash-preserve-affinity maxconn must skip a full natural target");
+    assert_eq!(target, proxy.servers.at(other_idx), "hash-preserve-affinity maxconn must skip a full natural target");
 }
 
-fn all_up(proxy: &mut engine::Proxy) {
+fn all_up(proxy: &engine::Proxy) {
     for s in proxy.server_statuses.iter() {
         s.store(check::ServerStatus::Up as u8, Ordering::Relaxed);
     }
@@ -293,14 +293,14 @@ fn all_up(proxy: &mut engine::Proxy) {
 #[test]
 fn random_and_first_fall_back_to_the_first_backup_only() {
     for algo in ["random", "first"] {
-        let mut eng = get_proxy(&format!(
+        let eng = get_proxy(&format!(
             "backend b\n    balance {algo}\n    server a 127.0.0.1:8001\n    server b1 127.0.0.1:8002 backup\n    server b2 127.0.0.1:8003 backup\n"
         ));
-        let proxy = &mut eng.proxies.make_mut()[0];
+        let proxy = &eng.proxies[0];
         all_up(proxy);
         proxy.server_statuses[0].store(check::ServerStatus::Down as u8, Ordering::Relaxed);
         for _ in 0..50 {
-            assert_eq!(proxy.select_server_with_key(None, None), Some(proxy.servers[1]), "balance {algo}");
+            assert_eq!(proxy.select_server_with_key(None, None), Some(proxy.servers.at(1)), "balance {algo}");
         }
         // And nothing at all once the backups are down too.
         proxy.server_statuses[1].store(check::ServerStatus::Down as u8, Ordering::Relaxed);
@@ -313,10 +313,36 @@ fn random_and_first_fall_back_to_the_first_backup_only() {
 /// busy server wins only when every draw lands on it.
 #[test]
 fn random_draws_prefer_the_less_loaded_server() {
-    let mut eng = get_proxy("backend b\n    balance random(10)\n    server s1 127.0.0.1:8001\n    server s2 127.0.0.1:8002\n");
-    let proxy = &mut eng.proxies.make_mut()[0];
+    let eng = get_proxy("backend b\n    balance random(10)\n    server s1 127.0.0.1:8001\n    server s2 127.0.0.1:8002\n");
+    let proxy = &eng.proxies[0];
     all_up(proxy);
     proxy.server_actconn[0].store(50, Ordering::Relaxed);
-    let to_s2 = (0..1000).filter(|_| proxy.select_server_with_key(None, None) == Some(proxy.servers[1])).count();
+    let to_s2 = (0..1000).filter(|_| proxy.select_server_with_key(None, None) == Some(proxy.servers.at(1))).count();
     assert!(to_s2 > 950, "{to_s2}/1000 to the idle server");
+}
+
+/// The shared runtime values (T177): a `maxconn` set at run time keeps a full server out of
+/// `balance source` without a source address (and of `select_server`, its fallback), and a
+/// weight set to 0 takes the server out, on the very `Proxy` every worker reads.
+#[test]
+fn runtime_maxconn_and_weight_reach_the_fallback_selections() {
+    for algo in ["source", "uri"] {
+        let eng = get_proxy(&format!(
+            "backend b\n    balance {algo}\n    server s1 127.0.0.1:8001\n    server s2 127.0.0.1:8002\n"
+        ));
+        let proxy = &eng.proxies[0];
+        all_up(proxy);
+        assert!(proxy.server_maxconn.set(0, Some(1)));
+        proxy.server_actconn[0].store(1, Ordering::Relaxed);
+        for _ in 0..10 {
+            assert_eq!(proxy.select_server_with_key(None, None), Some(proxy.servers.at(1)), "balance {algo}");
+            assert_eq!(proxy.select_server(), Some(proxy.servers.at(1)), "balance {algo}");
+        }
+        proxy.server_actconn[0].store(0, Ordering::Relaxed);
+        proxy.set_weight(1, 0);
+        assert_eq!(proxy.initial_weight(1), 1);
+        for _ in 0..10 {
+            assert_eq!(proxy.select_server_with_key(None, None), Some(proxy.servers.at(0)), "balance {algo}");
+        }
+    }
 }

@@ -445,19 +445,19 @@ fn test_maxconn_tuning_web_and_cli() {
     let mut engine = Engine::new(&config, 64).expect("engine");
     engine.bind_cli_socket(&socket_path).expect("bind cli");
 
-    assert_eq!(engine.proxies[0].server_maxconn[0], Some(10));
+    assert_eq!(engine.proxies[0].server_maxconn.get(0), Some(10));
 
     // 1. Set server maxconn via Web Admin
     let post_req = b"POST /stats HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 52\r\n\r\naction=maxconn&backend=maxconn_proxy&server=srv1&maxconn=42";
     let resp = send_http_request(proxy_addr, &mut engine, post_req);
     assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "Got: {resp}");
-    assert_eq!(engine.proxies[0].server_maxconn[0], Some(42));
+    assert_eq!(engine.proxies[0].server_maxconn.get(0), Some(42));
 
     // 2. Set proxy maxconn via Web Admin
     let post_req2 = b"POST /stats HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 43\r\n\r\naction=maxconn&backend=maxconn_proxy&maxconn=999";
     let resp2 = send_http_request(proxy_addr, &mut engine, post_req2);
     assert!(resp2.starts_with("HTTP/1.1 200 OK\r\n"), "Got: {resp2}");
-    assert_eq!(engine.proxies[0].maxconn, 999);
+    assert_eq!(engine.proxies[0].maxconn.get(), 999);
 
     // 3. Set server maxconn via CLI socket
     let mut client = UnixStream::connect(&socket_path).expect("connect cli");
@@ -469,10 +469,10 @@ fn test_maxconn_tuning_web_and_cli() {
         .expect("write");
     step_engine_until(
         &mut engine,
-        |eng| eng.proxies[0].server_maxconn[0] == Some(75),
+        |eng| eng.proxies[0].server_maxconn.get(0) == Some(75),
         20,
     );
-    assert_eq!(engine.proxies[0].server_maxconn[0], Some(75));
+    assert_eq!(engine.proxies[0].server_maxconn.get(0), Some(75));
 
     // 4. Set backend maxconn via CLI socket
     let mut client2 = UnixStream::connect(&socket_path).expect("connect cli 2");
@@ -484,16 +484,16 @@ fn test_maxconn_tuning_web_and_cli() {
         .expect("write");
     step_engine_until(
         &mut engine,
-        |eng| eng.proxies[0].maxconn == 1200,
+        |eng| eng.proxies[0].maxconn.get() == 1200,
         20,
     );
-    assert_eq!(engine.proxies[0].maxconn, 1200);
+    assert_eq!(engine.proxies[0].maxconn.get(), 1200);
 
     // 5. Test direct engine API
     assert!(engine.set_maxconn("maxconn_proxy", Some("srv1"), 88));
-    assert_eq!(engine.proxies[0].server_maxconn[0], Some(88));
+    assert_eq!(engine.proxies[0].server_maxconn.get(0), Some(88));
     assert!(engine.set_maxconn("maxconn_proxy", None, 2000));
-    assert_eq!(engine.proxies[0].maxconn, 2000);
+    assert_eq!(engine.proxies[0].maxconn.get(), 2000);
 }
 
 #[test]

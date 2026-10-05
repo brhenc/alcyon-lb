@@ -38,7 +38,7 @@ fn status(p: &Proxy, i: usize) -> ServerStatus {
 /// `srv_currently_usable`: running, and with a weight to take traffic (a server drained
 /// from the CLI has its weight taken away in `HAProxy`).
 fn usable(p: &Proxy, i: usize) -> bool {
-    status(p, i) == ServerStatus::Up && p.server_weights.get(i).copied().unwrap_or(1) > 0
+    status(p, i) == ServerStatus::Up && p.server_weights.get(i).unwrap_or(1) > 0
 }
 
 fn is_backup(p: &Proxy, i: usize) -> bool {
@@ -84,7 +84,7 @@ pub fn usable_servers(p: &Proxy) -> i64 {
 /// when there are none (`update_backend_weight`).
 #[must_use]
 pub fn total_weight(p: &Proxy) -> u32 {
-    let weight = |i: usize| p.server_weights.get(i).copied().unwrap_or(1);
+    let weight = |i: usize| p.server_weights.get(i).unwrap_or(1);
     match recount(p) {
         (0, Some(b)) => weight(b),
         (0, None) => 0,
@@ -105,7 +105,7 @@ impl ProxyState for ProxiesView<'_> {
             if !usable(p, i) || (is_backup(p, i) && (act > 0 || fbck != Some(i))) {
                 continue;
             }
-            match p.server_maxconn.get(i).copied().flatten() {
+            match p.server_maxconn.get(i) {
                 None | Some(0) => return Some(-1),
                 Some(mc) => free += i64::from(mc.saturating_sub(cur_sess(p, i))),
             }
@@ -119,7 +119,7 @@ impl ProxyState for ProxiesView<'_> {
         Some(ServerState {
             is_up: is_up(p, i),
             cur_sess: cur_sess(p, i),
-            maxconn: p.server_maxconn.get(i).copied().flatten(),
+            maxconn: p.server_maxconn.get(i),
             sess_rate: p.server_sess_rates.get(i).map_or(0, |r| to_i64(r.rate())),
         })
     }

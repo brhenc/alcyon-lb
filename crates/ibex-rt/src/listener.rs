@@ -33,8 +33,10 @@ pub struct Listener {
     addr: SocketAddr,
     /// Index of the proxy configuration this listener belongs to.
     pub proxy: u32,
-    /// Per-listener connection cap. Zero means unlimited.
-    pub maxconn: u32,
+    /// Per-listener connection cap. Zero means unlimited. Shared with the proxy's
+    /// `maxconn`, so `set maxconn frontend` reaches every worker's listeners (T177), as
+    /// `cli_parse_set_maxconn_frontend` sets every listener's.
+    pub maxconn: crate::srv_rt::SharedU32,
     /// Connections currently alive on this listener.
     pub nbconn: u32,
     /// Server-side TLS for this bind, from `bind ... ssl crt <file>`.
@@ -103,7 +105,7 @@ impl Listener {
             fd,
             addr: bound_addr,
             proxy,
-            maxconn: 0,
+            maxconn: crate::srv_rt::SharedU32::default(),
             nbconn: 0,
             tls: None,
             name: None,
@@ -149,7 +151,7 @@ impl Listener {
             fd,
             addr,
             proxy,
-            maxconn: 0,
+            maxconn: crate::srv_rt::SharedU32::default(),
             nbconn: 0,
             tls: None,
             name: None,
@@ -177,8 +179,9 @@ impl Listener {
     /// accepting. `HAProxy` stops polling the listener rather than accepting and closing,
     /// so the backlog applies backpressure instead of the proxy burning syscalls.
     #[must_use]
-    pub const fn is_full(&self) -> bool {
-        self.maxconn != 0 && self.nbconn >= self.maxconn
+    pub fn is_full(&self) -> bool {
+        let maxconn = self.maxconn.get();
+        maxconn != 0 && self.nbconn >= maxconn
     }
 
     /// Accepts one connection.
@@ -272,7 +275,7 @@ mod tests {
         let mut l = Listener::bind(loopback0(), 128, 0).expect("bind");
         l.nbconn = 1_000_000;
         assert!(!l.is_full(), "maxconn 0 must never report full");
-        l.maxconn = 10;
+        l.maxconn.set(10);
         assert!(l.is_full());
         l.nbconn = 9;
         assert!(!l.is_full());

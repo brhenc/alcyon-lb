@@ -498,7 +498,7 @@ fn write_frontend_row(out: &mut String, proxy: &Proxy, _pid: u32, iid: u32) {
     r.set("svname", "FRONTEND");
     r.set("scur", proxy.stats.iter().map(|s| s.act_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u32>());
     r.set("smax", proxy.stats.iter().map(|s| s.max_conn.load(std::sync::atomic::Ordering::Relaxed)).max().unwrap_or(0));
-    r.set("slim", proxy.maxconn);
+    r.set("slim", proxy.maxconn.get());
     let stot = proxy.stats.iter().map(|s| s.cum_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>();
     r.set("stot", stot);
     r.set("dreq", proxy.stats.iter().map(|s| s.denied_req.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>());
@@ -552,7 +552,7 @@ fn write_server_row(
     } else {
         "srv"
     };
-    let srv_addr = proxy.servers[s_idx];
+    let srv_addr = proxy.servers.at(s_idx);
     let (status_str, chkfail, chkdown, check_status, check_code, check_duration) =
         if let Some(c) = check_state {
             (
@@ -585,12 +585,10 @@ fn write_server_row(
     let is_backup = proxy.server_backups.get(s_idx).copied().unwrap_or(false);
     let (act, bck) = if is_backup { (0, 1) } else { (1, 0) };
     let scur = proxy.server_actconn.get(s_idx).map(|a| a.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0);
-    let weight = proxy.server_weights.get(s_idx).copied().unwrap_or(1);
+    let weight = proxy.server_weights.get(s_idx).unwrap_or(1);
     let slim = proxy
         .server_maxconn
         .get(s_idx)
-        .copied()
-        .flatten()
         .map_or(String::new(), |m| m.to_string());
 
     let mut r = StatRow::new();
@@ -658,7 +656,7 @@ fn write_backend_row(out: &mut String, proxy: &Proxy, _pid: u32, iid: u32) {
     let backup = |i: usize| proxy.server_backups.get(i).copied().unwrap_or(false);
     let act = (0..proxy.servers.len()).filter(|&i| !backup(i) && up(i)).count();
     let bck = (0..proxy.servers.len()).filter(|&i| backup(i) && up(i)).count();
-    let weight: u32 = (0..proxy.servers.len()).filter(|&i| !backup(i) && up(i)).map(|i| proxy.server_weights.get(i).copied().unwrap_or(1)).sum();
+    let weight: u32 = (0..proxy.servers.len()).filter(|&i| !backup(i) && up(i)).map(|i| proxy.server_weights.get(i).unwrap_or(1)).sum();
     let scur: u32 = (0..proxy.servers.len()).map(|i| proxy.server_actconn.get(i).map_or(0, |a| a.load(Relaxed))).sum();
     let be_down = !proxy.servers.is_empty() && act + bck == 0 && proxy.ids.tc.get().is_some_and(|p| p.be.down_since.load(Relaxed) != 0);
     let mut r = StatRow::new();
@@ -668,7 +666,7 @@ fn write_backend_row(out: &mut String, proxy: &Proxy, _pid: u32, iid: u32) {
     r.set("qmax", proxy.stats[0].queue_max.load(Relaxed));
     r.set("scur", scur);
     r.set("smax", c.smax.load(Relaxed).max(scur));
-    r.set("slim", proxy.maxconn);
+    r.set("slim", proxy.maxconn.get());
     r.set("stot", ld(&c.stot));
     r.set("dreq", proxy.counters().denied_req.load(Relaxed));
     r.set("dresp", proxy.counters().denied_resp.load(Relaxed));
@@ -819,18 +817,17 @@ mod tests {
             retries: 3,
             redisp: false,
             redisp_after: -1,
-            maxconn: 1000,
+            maxconn: 1000.into(),
             dispatch: None,
             cookie: None,
             cliexp: Vec::new(),
             srvexp: Vec::new(),
-            servers: vec![addr],
+            servers: vec![addr].into(),
             server_ids: vec!["srv1".into()],
             server_cookies: vec![None],
             server_statuses: std::sync::Arc::new(vec![std::sync::atomic::AtomicU8::new(0)]),
             server_track: None,
-            server_weights: vec![1],
-            server_iweights: None,
+            server_weights: [1].into_iter().collect(),
             next_server_idx: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             stats: std::sync::Arc::new(vec![crate::engine::ProxyStats::default()]),
             stats_config: ibex_config::StatsConfig::default(),
@@ -850,7 +847,7 @@ mod tests {
             server_send_proxy_v2: vec![false],
             server_pp_unique_id: vec![false],
             server_backups: vec![false],
-            server_maxconn: vec![None],
+            server_maxconn: [None].into_iter().collect(),
             server_actconn: std::sync::Arc::new(vec![std::sync::atomic::AtomicU32::new(0)]),
             server_retr: Default::default(),
             server_sess_rates: std::sync::Arc::new(vec![crate::engine::RateCtr::default()]),
