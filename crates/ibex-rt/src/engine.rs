@@ -588,8 +588,13 @@ mod shared_pool_tests {
         let (c, _p) = alive();
         assert!(w.keep(key(), c, false, CFG, 5, t0).is_ok());
         assert_eq!(pools.srv_seen(key().srv, 0).1, 5);
+        // A second server, kept later, is not due at that purge: its peak stays.
+        let (c2, _p2) = alive();
+        let other = IdleKey { srv: (0, 1), ..key() };
+        assert!(w.keep(other.clone(), c2, false, CFG, 7, t0 + Duration::from_millis(300)).is_ok());
         w.purge(t0 + Duration::from_millis(500), |_| 2);
         assert_eq!(pools.srv_seen(key().srv, 0).1, 2);
+        assert_eq!(pools.srv_seen(other.srv, 0).1, 7);
     }
 
     /// A sweep closes the idle connections whose peer closed, or sent bytes, and keeps the
@@ -7219,10 +7224,10 @@ impl EngineDispatcher<'_> {
                 // Idle, it is not one of the server's connections in use (`scur`, and
                 // what the lists' rule weighs); the peak in use is noted first, as the
                 // lists would have (`srv_add_to_idle_list` raising `max_used_conns`).
-                if let Some(i) = entry.target_server_idx {
-                    let used = proxies.get(entry.srv_backend_idx).and_then(|p| p.server_actconn.get(i)).map_or(0, |a| a.load(Ordering::Relaxed));
-                    idle_pool.note_used((entry.srv_backend_idx, i), used);
-                }
+                // (`keeps` above holds only with a server, so there is one.)
+                let i = entry.target_server_idx.unwrap_or_default();
+                let used = proxies.get(entry.srv_backend_idx).and_then(|p| p.server_actconn.get(i)).map_or(0, |a| a.load(Ordering::Relaxed));
+                idle_pool.note_used((entry.srv_backend_idx, i), used);
                 server_actconn_add(entry, proxies, false);
             } else {
                 release_server(entry, proxies, fdtab, poller, idle_pool, true);
@@ -11931,6 +11936,11 @@ mod actconn_tests {
         assert_eq!(in_use(proxies), 1);
         server_actconn_add(entry, proxies, false);
         assert_eq!(in_use(proxies), 0);
+        entry.actconn_reclaimed = false;
+        let idx = entry.target_server_idx.take();
+        server_actconn_add(entry, proxies, true);
+        assert_eq!(in_use(proxies), 0, "no server, nothing to count");
+        entry.target_server_idx = idx;
         entry.actconn_reclaimed = true;
         server_actconn_add(entry, proxies, true);
         assert_eq!(in_use(proxies), 0, "a reclaimed session adds nothing");

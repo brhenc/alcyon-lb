@@ -2740,6 +2740,11 @@ mod tests {
         s.release_idle_buffers();
         assert!(s.htx_buf.raw_slice().is_empty());
         assert_eq!(s.htx_buf.class(), crate::buf::BufClass::Standard);
+        // an HTX still holding a message is kept
+        s.htx_buf.alloc_if_needed();
+        s.has_htx = true;
+        s.release_idle_buffers();
+        assert!(!s.htx_buf.raw_slice().is_empty());
     }
 
     /// The last chunk is not split: with less than its five bytes of room, nothing is
