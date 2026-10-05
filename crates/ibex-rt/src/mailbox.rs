@@ -77,6 +77,8 @@ pub struct SessSnap {
     pub srv_fd: i32,
     pub cli_rex: Option<i64>,
     pub srv_rex: Option<i64>,
+    /// The client side's send-blocked timer (`scf` `wex=`); `None` when nothing waits on the client.
+    pub cli_wex: Option<i64>,
     pub exp: Option<i64>,
     pub c_exp: Option<i64>,
     /// Connection retries done (`s->conn_retries`, which counts up in HAProxy 3.x).

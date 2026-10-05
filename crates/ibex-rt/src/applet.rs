@@ -1087,7 +1087,7 @@ impl CliApplet {
 
     /// One stream as HAProxy's `show sess` prints it. The fields Ibex has no value for --
     /// `ts`, `epoch`, `calls`, `rate`, `cpu`, `lat`, the channel and stream-connector flag
-    /// words and analysers, `ax`, `wex` -- are printed in their place with a neutral value.
+    /// words and analysers, `ax`, the server side's `wex` -- are printed in their place with a neutral value.
     fn sess_line(s: &SessSnap, opts: &SessOpts, ctx: &AppletContext, now: Instant) -> String {
         let name = |i: Option<usize>, none: &str| {
             i.and_then(|i| ctx.proxies.get(i)).map_or_else(|| none.to_string(), |p| p.name.clone())
@@ -1102,7 +1102,7 @@ impl CliApplet {
         let mut l = format!(
             "0x{:x}: proto={} src={src} fe={} be={} srv={srv} ts=00 epoch=0 age={} calls=0 rate=0 cpu=0 lat=0 \
              rq[f=000000h,i={},an=00h,ax=] rp[f=000000h,i={},an=00h,ax=] \
-             scf=[8,0h,fd=1/{},rex={},wex=] scb=[{scb_state},0h,fd=1/{},rex={},wex=] exp={} rc={} c_exp={}",
+             scf=[8,0h,fd=1/{},rex={},wex={}] scb=[{scb_state},0h,fd=1/{},rex={},wex=] exp={} rc={} c_exp={}",
             s.id,
             s.proto,
             name(s.fe, "GLOBAL"),
@@ -1112,6 +1112,7 @@ impl CliApplet {
             s.rep_in,
             s.cli_fd,
             sess_timer(s.cli_rex),
+            sess_timer(s.cli_wex),
             s.srv_fd,
             sess_timer(s.srv_rex),
             sess_timer(s.exp),

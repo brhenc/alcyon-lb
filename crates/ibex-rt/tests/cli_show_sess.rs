@@ -433,3 +433,214 @@ fn the_cli_worker_keeps_serving_while_show_sess_waits() {
     drop(cli_worker);
     let _ = std::fs::remove_file(&sock);
 }
+
+// ---- the stream-connector timers (T219) ----------------------------------------------
+//
+// Measured on HAProxy 3.5-dev8-885761-29 on 2026-10-05, `nbthread 4`, `timeout client 30s`,
+// `timeout server 40s`, `timeout connect 5s`, 3 s after each stream began. `sc_ep_rcv_ex`
+// is the last read activity plus the timeout while the side may still receive;
+// `sc_ep_snd_ex` the first send-blocked time plus the timeout while a send is blocked.
+//
+// ```text
+// state                         scf rex  scf wex  scb rex  scb wex  c_exp
+// idle keep-alive               (no stream is listed)
+// request headers partly sent   (no stream is listed)
+// request done, slow server     -        -        ~37s     -        -
+// response to a slow reader     -        ~27s     -        -        -
+// request body uploaded slowly  ~27s     -        -        -        -
+// server connect in progress    -        -        -        -        ~2s
+// ```
+
+/// The server of the timer tests: `/fast` is answered, `/big` gets a body no socket buffer
+/// holds, anything else is read and never answered.
+fn timer_server() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind backend");
+    let addr = listener.local_addr().expect("addr");
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut conn) = conn else { continue };
+            std::thread::spawn(move || {
+                let mut head = Vec::new();
+                let mut buf = [0u8; 4096];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match conn.read(&mut buf) {
+                        Ok(n) if n > 0 => head.extend_from_slice(&buf[..n]),
+                        _ => return,
+                    }
+                }
+                if head.starts_with(b"GET /fast") {
+                    let _ = conn.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok");
+                } else if head.starts_with(b"GET /big") {
+                    let n = 30_000_000usize;
+                    let _ = conn.write_all(format!("HTTP/1.1 200 OK\r\ncontent-length: {n}\r\n\r\n").as_bytes());
+                    let _ = conn.write_all(&vec![b'x'; n]);
+                }
+                while matches!(conn.read(&mut buf), Ok(n) if n > 0) {}
+            });
+        }
+    });
+    addr
+}
+
+fn start_timers() -> Ibex {
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    let tmp = std::env::temp_dir();
+    let tag = format!("ibex_t219_{}_{n}", std::process::id());
+    let (sock, cfg) = (tmp.join(format!("{tag}.sock")), tmp.join(format!("{tag}.cfg")));
+    let (fh, srv) = (common::reserve_addr(), timer_server());
+    let text = format!(
+        "global\n  stats socket {sock} mode 600 level admin\n  nbthread 4\n\
+         defaults\n  mode http\n  timeout connect 5s\n  timeout client 30s\n  timeout server 40s\n\
+         frontend fh\n  bind {fh}\n  use_backend bc if {{ path_beg /conn }}\n  default_backend bh\n\
+         backend bh\n  server h1 {srv}\n\
+         backend bc\n  server c1 10.255.255.1:80\n",
+        sock = sock.display(),
+    );
+    std::fs::write(&cfg, &text).expect("cfg");
+    let child = Command::new(env!("CARGO_BIN_EXE_ibex"))
+        .arg("-f")
+        .arg(&cfg)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn ibex");
+    let ibex = Ibex { child, sock, cfg, fe: fh, fh };
+    assert!(common::wait_listening(fh), "ibex never listened with:\n{text}");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !ibex.sock.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    ibex
+}
+
+/// `human_time` text as seconds (`26s`, `1m2s`, `300ms`).
+fn secs_of(t: &str) -> f64 {
+    let mut total = 0.0;
+    let mut rest = t;
+    while !rest.is_empty() {
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        rest = &rest[digits.len()..];
+        let unit: String = rest.chars().take_while(|c| !c.is_ascii_digit()).collect();
+        rest = &rest[unit.len()..];
+        let v: f64 = digits.parse().unwrap_or_else(|_| panic!("time `{t}`"));
+        total += match unit.as_str() {
+            "ms" => v / 1000.0,
+            "s" => v,
+            "m" => v * 60.0,
+            "h" => v * 3600.0,
+            "d" => v * 86400.0,
+            u => panic!("unit `{u}` in `{t}`"),
+        };
+    }
+    total
+}
+
+/// The text of `key=` in `line` (after `scope`, when given), up to the next `,` / `]` / space.
+fn field<'a>(line: &'a str, scope: &str, key: &str) -> &'a str {
+    let from = if scope.is_empty() { line } else { line.split(scope).nth(1).unwrap_or_else(|| panic!("{scope} in {line}")) };
+    let v = from.split(&format!("{key}=")).nth(1).unwrap_or_else(|| panic!("{key}= in {line}"));
+    v.split([',', ']', ' ']).next().expect("value")
+}
+
+/// What one timer must show: nothing, or about that many seconds left.
+#[derive(Clone, Copy)]
+enum Want {
+    Empty,
+    About(f64),
+}
+
+fn check(line: &str, scope: &str, key: &str, want: Want) {
+    let got = field(line, scope, key);
+    match want {
+        Want::Empty => assert!(got.is_empty(), "{scope} {key} must be empty, got `{got}` in:\n{line}"),
+        Want::About(exp) => {
+            assert!(!got.is_empty(), "{scope} {key} must be about {exp}s, got nothing in:\n{line}");
+            let v = secs_of(got);
+            assert!((v - exp).abs() <= 6.0, "{scope} {key}={got} is not about {exp}s in:\n{line}");
+        }
+    }
+}
+
+/// The `show sess` line of `c`'s stream after `wait`; `None` if it is not listed.
+fn timer_line(ibex: &Ibex, c: &TcpStream, wait: Duration) -> Option<String> {
+    let needle = format!(" src={} ", c.local_addr().expect("addr"));
+    std::thread::sleep(wait);
+    let out = cli(ibex, "show sess");
+    out.lines().find(|l| l.contains(&needle)).map(str::to_string)
+}
+
+fn timer_client(ibex: &Ibex, payload: &[u8]) -> TcpStream {
+    let mut c = TcpStream::connect(ibex.fh).expect("connect");
+    c.write_all(payload).expect("send");
+    c
+}
+
+#[test]
+fn timers_idle_keepalive_connection_is_not_listed() {
+    let ibex = start_timers();
+    let mut c = timer_client(&ibex, b"GET /fast HTTP/1.1\r\nhost: x\r\n\r\n");
+    let mut buf = [0u8; 256];
+    let _ = c.read(&mut buf).expect("response");
+    assert!(timer_line(&ibex, &c, Duration::from_millis(500)).is_none(), "idle connection listed");
+}
+
+#[test]
+fn timers_partial_request_headers_have_no_stream() {
+    let ibex = start_timers();
+    let c = timer_client(&ibex, b"GET /x HTTP/1.1\r\nhost: x\r\n");
+    let line = timer_line(&ibex, &c, Duration::from_secs(2));
+    assert!(line.is_none(), "HAProxy creates the stream when the head is complete, listed: {line:?}");
+}
+
+#[test]
+fn timers_request_done_waiting_on_slow_server() {
+    let ibex = start_timers();
+    let c = timer_client(&ibex, b"GET /x HTTP/1.1\r\nhost: x\r\n\r\n");
+    let line = timer_line(&ibex, &c, Duration::from_secs(2)).expect("listed");
+    check(&line, "scf=[", "rex", Want::Empty);
+    check(&line, "scf=[", "wex", Want::Empty);
+    check(&line, "scb=[", "rex", Want::About(38.0));
+    check(&line, "scb=[", "wex", Want::Empty);
+    check(&line, "", "c_exp", Want::Empty);
+    assert_eq!(cli(&ibex, "shutdown sessions server bh/h1"), "\n");
+}
+
+#[test]
+fn timers_response_to_a_slow_reader() {
+    let ibex = start_timers();
+    let c = timer_client(&ibex, b"GET /big HTTP/1.1\r\nhost: x\r\n\r\n");
+    let line = timer_line(&ibex, &c, Duration::from_secs(2)).expect("listed");
+    check(&line, "scf=[", "rex", Want::Empty);
+    check(&line, "scf=[", "wex", Want::About(28.0));
+    check(&line, "scb=[", "rex", Want::Empty);
+    check(&line, "scb=[", "wex", Want::Empty);
+    check(&line, "", "c_exp", Want::Empty);
+    assert_eq!(cli(&ibex, "shutdown sessions server bh/h1"), "\n");
+}
+
+#[test]
+fn timers_request_body_uploaded_slowly() {
+    let ibex = start_timers();
+    let c = timer_client(&ibex, b"POST /x HTTP/1.1\r\nhost: x\r\ncontent-length: 1000000\r\n\r\nyyyy");
+    let line = timer_line(&ibex, &c, Duration::from_secs(2)).expect("listed");
+    check(&line, "scf=[", "rex", Want::About(28.0));
+    check(&line, "scf=[", "wex", Want::Empty);
+    check(&line, "scb=[", "rex", Want::Empty);
+    check(&line, "scb=[", "wex", Want::Empty);
+    check(&line, "", "c_exp", Want::Empty);
+    assert_eq!(cli(&ibex, "shutdown sessions server bh/h1"), "\n");
+}
+
+#[test]
+fn timers_server_connect_in_progress() {
+    let ibex = start_timers();
+    let c = timer_client(&ibex, b"GET /conn HTTP/1.1\r\nhost: x\r\n\r\n");
+    let line = timer_line(&ibex, &c, Duration::from_secs(2)).expect("listed");
+    check(&line, "scf=[", "rex", Want::Empty);
+    check(&line, "scf=[", "wex", Want::Empty);
+    check(&line, "scb=[", "rex", Want::Empty);
+    check(&line, "scb=[", "wex", Want::Empty);
+    check(&line, "", "c_exp", Want::About(3.0));
+    assert_eq!(cli(&ibex, "shutdown sessions backend bc"), "\n");
+}
