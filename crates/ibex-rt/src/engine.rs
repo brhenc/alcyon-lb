@@ -160,21 +160,32 @@ impl WorkerPool {
     /// the connection is itself safe or its idle list is empty, or the server is not keeping
     /// more than it was seen to need plus `pool-low-conn` (`used` is the server's
     /// connections in use, this one included). Otherwise it is given back for closing.
+    #[cfg(test)]
     fn keep(&mut self, key: IdleKey, conn: IdleConn, is_safe: bool, cfg: SrvPoolCfg, used: u32, now: Instant) -> Result<(), IdleConn> {
+        self.keep_with(key, conn, is_safe, cfg, used, (0, used), now)
+    }
+
+    /// [`WorkerPool::keep`], with what the other workers know of the server: its idle
+    /// connections on them, and the most connections it was seen to use at once on any
+    /// (`srv->curr_idle_conns`, `srv->max_used_conns`: server-wide in `HAProxy`; only the
+    /// empty-lists clause is this worker's own, `srv->per_thr[tid]`).
+    #[allow(clippy::too_many_arguments)]
+    fn keep_with(&mut self, key: IdleKey, conn: IdleConn, is_safe: bool, cfg: SrvPoolCfg, used: u32, (others, peak): (usize, u32), now: Instant) -> Result<(), IdleConn> {
         if cfg.purge_delay_ms == 0 {
             return Err(conn);
         }
         let s = self.servers.entry(key.srv).or_default();
         // `srv_use_conn` raises both with every connection in use; seen from here, the
         // peak is at least the connections in use at a release.
-        s.max_used = s.max_used.max(used);
-        s.est_need = s.est_need.max(used);
+        s.max_used = s.max_used.max(used).max(peak);
+        s.est_need = s.est_need.max(used).max(peak);
         let curr_idle = s.conns.len();
-        if usize::try_from(cfg.max_conn).is_ok_and(|m| m <= curr_idle) {
+        let all_idle = curr_idle + others;
+        if usize::try_from(cfg.max_conn).is_ok_and(|m| m <= all_idle) {
             return Err(conn);
         }
         let idle_empty = curr_idle == s.safe;
-        let curr = u32::try_from(curr_idle).unwrap_or(u32::MAX);
+        let curr = u32::try_from(all_idle).unwrap_or(u32::MAX);
         if !((s.safe == 0 && (is_safe || idle_empty)) || used.saturating_add(curr) <= used.max(s.est_need).saturating_add(cfg.low_conn)) {
             return Err(conn);
         }
@@ -278,6 +289,16 @@ pub struct IdlePools {
     /// The slot the next takeover starts from (`srv->per_tgrp[].next_takeover`, here one for
     /// all servers).
     next_takeover: AtomicUsize,
+    /// Each server's idle connections in all slots (`srv->curr_idle_conns`).
+    srv_idle: std::sync::RwLock<HashMap<(usize, usize), SrvIdleCount>>,
+}
+
+/// A server's idle connections in all slots, and the most it was seen to use at once
+/// since a purge last looked at it.
+#[derive(Debug, Default)]
+struct SrvIdleCount {
+    idle: AtomicUsize,
+    peak: std::sync::atomic::AtomicU32,
 }
 
 impl IdlePools {
@@ -293,7 +314,33 @@ impl IdlePools {
             slots: (0..workers.max(1)).map(|_| IdleSlot::default()).collect(),
             shared,
             next_takeover: AtomicUsize::new(0),
+            srv_idle: std::sync::RwLock::default(),
         })
+    }
+
+    /// Runs `f` on server `srv`'s counts, made on first use.
+    fn with_count<R>(&self, srv: (usize, usize), f: impl Fn(&SrvIdleCount) -> R) -> R {
+        if let Some(n) = self.srv_idle.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(&srv) {
+            return f(n);
+        }
+        f(self.srv_idle.write().unwrap_or_else(std::sync::PoisonError::into_inner).entry(srv).or_default())
+    }
+
+    /// Server `srv`'s idle connections in every slot, and its peak of connections in use
+    /// raised to `used`.
+    fn srv_seen(&self, srv: (usize, usize), used: u32) -> (usize, u32) {
+        self.with_count(srv, |n| (n.idle.load(Ordering::Relaxed), n.peak.fetch_max(used, Ordering::Relaxed).max(used)))
+    }
+
+    /// Counts `added` connections into server `srv`'s idle ones and `removed` out.
+    fn count_idle(&self, srv: (usize, usize), added: usize, removed: usize) {
+        if added == removed {
+            return;
+        }
+        self.with_count(srv, |n| {
+            n.idle.fetch_add(added, Ordering::Relaxed);
+            let _ = n.idle.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(removed)));
+        });
     }
 
     /// Worker `wid`'s handle.
@@ -348,11 +395,18 @@ impl IdlePool {
 
     /// See [`WorkerPool::keep`]; into this worker's slot.
     fn keep(&mut self, key: IdleKey, conn: IdleConn, is_safe: bool, cfg: SrvPoolCfg, used: u32, now: Instant) -> Result<(), IdleConn> {
+        let srv = key.srv;
         let slot = &self.pools.slots[self.wid];
         let mut pool = IdlePools::lock(slot);
-        let r = pool.keep(key, conn, is_safe, cfg, used, now);
+        let own = pool.servers.get(&srv).map_or(0, |s| s.conns.len());
+        let (all, peak) = self.pools.srv_seen(srv, used);
+        let r = pool.keep_with(key, conn, is_safe, cfg, used, (all.saturating_sub(own), peak), now);
         slot.conns.store(pool.conns, Ordering::Relaxed);
         self.next_purge = pool.next_purge();
+        drop(pool);
+        if r.is_ok() {
+            self.pools.count_idle(srv, 1, 0);
+        }
         r
     }
 
@@ -365,9 +419,11 @@ impl IdlePool {
         let own = &pools.slots[self.wid];
         if own.conns.load(Ordering::Relaxed) != 0 {
             let mut pool = IdlePools::lock(own);
+            let before = pool.conns;
             let found = pool.take(key, first_req, mode);
             own.conns.store(pool.conns, Ordering::Relaxed);
             self.next_purge = pool.next_purge();
+            pools.count_idle(key.srv, 0, before - pool.conns);
             if found.is_some() {
                 return found;
             }
@@ -384,9 +440,12 @@ impl IdlePool {
             }
             // A busy slot is skipped, and so is a poisoned one: its worker panicked.
             let Ok(mut pool) = slot.pool.try_lock() else { continue };
+            let before = pool.conns;
             let found = pool.take(key, first_req, mode);
             slot.conns.store(pool.conns, Ordering::Relaxed);
+            let removed = before - pool.conns;
             drop(pool);
+            pools.count_idle(key.srv, 0, removed);
             if found.is_some() {
                 pools.next_takeover.store(i + 1, Ordering::Relaxed);
                 return found;
@@ -408,8 +467,18 @@ impl IdlePool {
         }
         let slot = &self.pools.slots[self.wid];
         let mut pool = IdlePools::lock(slot);
-        pool.purge(now, used);
+        let before: Vec<((usize, usize), usize, Option<Instant>)> = pool.servers.iter().map(|(&k, s)| (k, s.conns.len(), s.purge_at)).collect();
+        pool.purge(now, &used);
         slot.conns.store(pool.conns, Ordering::Relaxed);
+        for (srv, n, at) in before {
+            let after = pool.servers.get(&srv).map_or(0, |s| s.conns.len());
+            self.pools.count_idle(srv, 0, n.saturating_sub(after));
+            // The peak restarts from the connections in use with each purge of the server.
+            if at.is_some_and(|t| t <= now) {
+                let in_use = used(srv);
+                self.pools.with_count(srv, |c| c.peak.store(in_use, Ordering::Relaxed));
+            }
+        }
         self.next_purge = pool.next_purge();
     }
 }
@@ -472,6 +541,27 @@ mod shared_pool_tests {
         assert!(w2.take(&key(), true, Always, true).is_some());
         assert!(w1.is_empty() && !w0.is_empty());
         assert!(w2.take(&key(), true, Always, true).is_none());
+    }
+
+    /// `srv_add_to_idle_list` compares `pool-max-conn` and the need estimate with the
+    /// server's idle connections on every thread (`srv->curr_idle_conns`), not this
+    /// worker's: with `pool-max-conn 1` and one idle on worker 0, worker 1 keeps none
+    /// (`http_reuse_safe.vtc` at `nbthread 64`: c2's second request gets c1's
+    /// connection). Taking or purging one counts it out again.
+    #[test]
+    fn pool_max_conn_counts_the_idle_connections_of_every_worker() {
+        use ibex_config::HttpReuse::Always;
+        let t0 = Instant::now();
+        let one = SrvPoolCfg { max_conn: 1, ..CFG };
+        let pools = IdlePools::with(2, true);
+        let (mut w0, mut w1) = (pools.worker(0), pools.worker(1));
+        let (c0, _p0) = alive();
+        let (c1, _p1) = alive();
+        let (c2, _p2) = alive();
+        assert!(w0.keep(key(), c0, true, one, 1, t0).is_ok());
+        assert!(w1.keep(key(), c1, true, one, 1, t0).is_err(), "a second idle connection on another worker");
+        assert!(w1.take(&key(), false, Always, true).is_some());
+        assert!(w1.keep(key(), c2, true, one, 1, t0).is_ok(), "the one idle connection was taken");
     }
 }
 
