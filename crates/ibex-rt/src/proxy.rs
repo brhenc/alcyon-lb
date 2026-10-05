@@ -405,6 +405,10 @@ pub struct H2ReqBody {
     pub trailing: bool,
     /// What the trailers add to `%U`: each name and value, and the byte of their end.
     pub trailer_bytes: u64,
+    /// DATA bytes moved into the server-bound buffer, and how many of them the client has
+    /// been given stream window for (T195: the window is granted as the body is consumed).
+    pub consumed: u64,
+    pub credited: u64,
 }
 
 /// What `%U` counts of an HTTP/2 request's head (`HAProxy`'s HTX: 20 bytes for the start
@@ -457,6 +461,7 @@ fn pump_h2_body(msg: &ibex_proto::htx::Htx, st: &mut H2ReqBody, req: &mut Buf) -
                 req.commit(len);
                 wrote = true;
                 st.off += n;
+                st.consumed += n as u64;
                 if st.off >= d.len() {
                     st.cursor += 1;
                     st.off = 0;
@@ -1480,6 +1485,16 @@ impl TcpSession {
                     let before = self.h2_body.trailer_bytes;
                     if pump_h2_body(&stream.rx_htx, &mut self.h2_body, &mut self.req) {
                         changed = true;
+                    }
+                    // The client may send as much again as has moved on towards the server:
+                    // a backed-up server stops the grants, and so the client.
+                    let pending = self.h2_body.consumed - self.h2_body.credited;
+                    if pending >= 16384 && !self.h2_body.done {
+                        if let Some(id) = self.h2_active_stream_id {
+                            self.h2_body.credited += pending;
+                            h2.send_window_update(id, pending as u32);
+                            changed = true;
+                        }
                     }
                     // What the trailers add to `%U`.
                     let added = self.h2_body.trailer_bytes - before;
