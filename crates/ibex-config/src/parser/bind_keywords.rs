@@ -6,11 +6,15 @@
 //!
 //! `parse_bind` in `proxy.rs` handles the keywords that reach Ibex's data path (`ssl`,
 //! `crt`, `alpn`, `proto`, `accept-proxy`, `accept-proxy-v2`, and since T207 `backlog`,
-//! `v6only`, `v4v6`, `tcp-ut`, `cc`, `thread all`). Everything else lands here and is
+//! `v6only`, `v4v6`, `tcp-ut`, `cc`, `thread all`, and since T209 `mss`). Everything else lands here and is
 //! **refused**: a keyword the parser accepts and the data path drops is worse than one
 //! it never heard of (AGENTS.md section 5). `bind :443 ssl crt c.pem verify required
 //! ca-file ca.pem` would otherwise load and accept any client, and `tfo` would leave the
-//! operator believing Fast Open was on.
+//! operator believing Fast Open was on. `tfo` (the listener TCP_FASTOPEN queue) and
+//! `defer-accept` (TCP_DEFER_ACCEPT) stay refused in T209: no safe setter exists in rustix
+//! 0.38/1.1, nix 0.31 or socket2 0.6 (nix has only TCP_FASTOPEN_CONNECT, the client side). `tfo` (server-side `TCP_FASTOPEN` queue) and
+//! `defer-accept` (`TCP_DEFER_ACCEPT`) stay refused in T209: no safe setter exists in
+//! rustix 0.38/1.1, nix 0.31 or socket2 0.6 (only `TCP_FASTOPEN_CONNECT`, the client side).
 //!
 //! A keyword that is not in the list is unknown, as `HAProxy` reports it. `args` is the
 //! number of arguments the keyword takes.
@@ -44,7 +48,6 @@ pub(crate) const UNIMPLEMENTED_BIND_KEYWORDS: &[BindKeyword] = &[
     refuse!("level", 1),
     refuse!("maxconn", 1),
     refuse!("mode", 1),
-    refuse!("mss", 1),
     refuse!("namespace", 1),
     refuse!("nbconn", 1),
     refuse!("nice", 1),

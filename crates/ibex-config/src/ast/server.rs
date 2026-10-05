@@ -33,6 +33,8 @@ pub struct DefaultServerConfig {
     pub proxy_v2_unique_id: bool,
     pub weight: Option<u32>,
     pub backup: bool,
+    /// `tfo` / `no-tfo`: TCP Fast Open on the connection to the server.
+    pub tfo: bool,
     pub cookie: Option<String>,
     /// `disabled` / `enabled`: servers declared after start in maintenance.
     pub disabled: bool,
@@ -274,6 +276,8 @@ pub struct Server {
     pub pool: Option<Box<ServerPool>>,
     /// Whether this server is a backup server.
     pub backup: bool,
+    /// `tfo` / `no-tfo`: TCP Fast Open on the connection to the server.
+    pub tfo: bool,
     /// Custom port for health checks (`port`).
     pub check_port: Option<u16>,
     /// Protocol for health checks (`check-proto`).
@@ -308,6 +312,7 @@ impl Default for Server {
             maxconn: None,
             pool: None,
             backup: false,
+            tfo: false,
             check_port: None,
             check_proto: None,
             ssl: None,
@@ -373,6 +378,7 @@ impl Server {
             maxconn: None,
             pool: None,
             backup: false,
+            tfo: false,
             check_port: None,
             check_proto: None,
             ssl: None,

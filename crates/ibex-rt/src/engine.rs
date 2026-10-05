@@ -940,6 +940,8 @@ pub struct Proxy {
     pub stick_table: Option<Arc<StickTable>>,
     pub stick_rules: Vec<StickRule>,
     pub server_send_proxy: Vec<bool>,
+    /// `tfo` per server, in `servers` order.
+    pub server_tfo: Vec<bool>,
     pub server_send_proxy_v2: Vec<bool>,
     /// `proxy-v2-options unique-id`, per server.
     pub server_pp_unique_id: Vec<bool>,
@@ -1023,6 +1025,11 @@ pub struct Proxy {
 }
 
 impl Proxy {
+    /// Whether server `tfo` applies to the server at `addr`.
+    fn server_tfo_of(&self, addr: SocketAddr) -> bool {
+        self.servers.iter().position(|s| s == addr).and_then(|i| self.server_tfo.get(i).copied()).unwrap_or(false)
+    }
+
     /// The counters this worker counts into (see [`Proxy::stats`]).
     #[inline]
     #[must_use]
@@ -2439,6 +2446,7 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, list
         stick_table,
         stick_rules: listen.stick_rules.clone(),
         server_send_proxy: listen.servers.iter().map(|s| s.send_proxy).collect(),
+        server_tfo: listen.servers.iter().map(|s| s.tfo).collect(),
         server_send_proxy_v2: listen.servers.iter().map(|s| s.send_proxy_v2).collect(),
         server_pp_unique_id: listen.servers.iter().map(|s| s.proxy_v2_unique_id).collect(),
         server_backups: listen.servers.iter().map(|s| s.backup).collect(),
@@ -2557,6 +2565,7 @@ fn init_proxy_from_frontend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, fe
         stick_table,
         stick_rules: fe.stick_rules.clone(),
         server_send_proxy: Vec::new(),
+        server_tfo: Vec::new(),
         server_send_proxy_v2: Vec::new(),
         server_pp_unique_id: Vec::new(),
         server_backups: Vec::new(),
@@ -2704,6 +2713,7 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, be:
         stick_table,
         stick_rules: be.stick_rules.clone(),
         server_send_proxy: be.servers.iter().map(|s| s.send_proxy).collect(),
+        server_tfo: be.servers.iter().map(|s| s.tfo).collect(),
         server_send_proxy_v2: be.servers.iter().map(|s| s.send_proxy_v2).collect(),
         server_pp_unique_id: be.servers.iter().map(|s| s.proxy_v2_unique_id).collect(),
         server_backups: be.servers.iter().map(|s| s.backup).collect(),
@@ -5504,7 +5514,7 @@ fn init_client_session(
             arm_res_inspect(proxy, &mut sess);
             sess.set_backend_timeouts(proxy);
 
-            if let Ok((srv_fd, immediate)) = raw::connect(connect_addr(target, sess.server_addr)) {
+            if let Ok((srv_fd, immediate)) = raw::connect_opts(connect_addr(target, sess.server_addr), proxy.server_tfo_of(target)) {
                 let sfd = srv_fd.as_raw_fd();
                 let s_idx = proxy.servers.iter().position(|s| s == target);
                 attach_server_to(&mut sess, proxies, proxy_idx, proxy_idx, s_idx, srv_fd, now);
@@ -6039,7 +6049,7 @@ fn retry_server_connect(
     maybe_prepend_send_proxy(&proxies[entry.proxy_idx], &proxies[be_idx], proxies, &mut entry.sess, target_addr);
 
     entry.target_addr = Some(target_addr);
-    if let Ok((srv_fd, immediate)) = raw::connect(connect_addr(target_addr, entry.sess.server_addr)) {
+    if let Ok((srv_fd, immediate)) = raw::connect_opts(connect_addr(target_addr, entry.sess.server_addr), proxies[be_idx].server_tfo_of(target_addr)) {
         let sfd = srv_fd.as_raw_fd();
         attach_server_to(&mut entry.sess, proxies, entry.proxy_idx, be_idx, s_idx, srv_fd, now);
         entry.srv_raw_fd = Some(sfd);
@@ -9066,7 +9076,7 @@ impl EngineDispatcher<'_> {
                     new_interest.writable,
                 );
             }
-        } else if let Ok((srv_fd, immediate)) = raw::connect(connect_addr(target_addr, entry.sess.server_addr)) {
+        } else if let Ok((srv_fd, immediate)) = raw::connect_opts(connect_addr(target_addr, entry.sess.server_addr), proxies[be_idx].server_tfo_of(target_addr)) {
             let sfd = srv_fd.as_raw_fd();
             attach_server_to(&mut entry.sess, proxies, entry.proxy_idx, be_idx, s_idx, srv_fd, now);
             entry.srv_raw_fd = Some(sfd);
@@ -9236,7 +9246,7 @@ impl EngineDispatcher<'_> {
         maybe_prepend_send_proxy(&proxies[entry.proxy_idx], &proxies[be_idx], proxies, &mut entry.sess, target_addr);
 
         entry.target_addr = Some(target_addr);
-        if let Ok((srv_fd, immediate)) = raw::connect(connect_addr(target_addr, entry.sess.server_addr)) {
+        if let Ok((srv_fd, immediate)) = raw::connect_opts(connect_addr(target_addr, entry.sess.server_addr), proxies[be_idx].server_tfo_of(target_addr)) {
             let sfd = srv_fd.as_raw_fd();
             attach_server_to(&mut entry.sess, proxies, entry.proxy_idx, be_idx, s_idx, srv_fd, now);
             entry.srv_raw_fd = Some(sfd);

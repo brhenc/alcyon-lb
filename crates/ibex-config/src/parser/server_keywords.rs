@@ -89,7 +89,6 @@ pub(crate) const UNIMPLEMENTED_SERVER_KEYWORDS: &[ServerKeyword] = &[
     kw!("max-reuse", Arg::Word, Ignore("how many requests a connection carries")),
     kw!("minconn", Arg::Word, Ignore("the dynamic connection limit")),
     kw!("namespace", Arg::Word, ROUTE),
-    kw!("no-tfo", Arg::None, Ignore("TCP Fast Open")),
     kw!("non-stick", Arg::None, ROUTE),
     kw!("observe", Arg::Word, CHECK),
     kw!("on-error", Arg::Word, CHECK),
@@ -110,7 +109,6 @@ pub(crate) const UNIMPLEMENTED_SERVER_KEYWORDS: &[ServerKeyword] = &[
     kw!("slowstart", Arg::Delay, Ignore("the warm-up of a server coming back up")),
     kw!("source", Arg::Word, ROUTE),
     kw!("strict-maxconn", Arg::None, Ignore("whether idle connections count against maxconn")),
-    kw!("tfo", Arg::None, Ignore("TCP Fast Open")),
     kw!("socks4", Arg::Word, ROUTE),
     kw!("usesrc", Arg::None, ROUTE),
     // src/check.c

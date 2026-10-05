@@ -60,14 +60,20 @@ pub struct Listener {
 fn apply_tuning(fd: &OwnedFd, tuning: &ibex_config::ast::SocketTuning) {
     if let Some(ut) = tuning.tcp_user_timeout {
         let ms = u32::try_from(ut.as_millis()).unwrap_or(u32::MAX);
-        if let Err(e) = net::sockopt::set_tcp_user_timeout(fd, ms) {
-            eprintln!("[WARNING] bind: cannot set the TCP user timeout: {e}");
-        }
+        warn_if_refused("the TCP user timeout", net::sockopt::set_tcp_user_timeout(fd, ms));
+    }
+    if let Some(mss) = tuning.mss {
+        warn_if_refused("the MSS", nix::sys::socket::setsockopt(fd, nix::sys::socket::sockopt::TcpMaxSeg, &mss));
     }
     if let Some(algo) = &tuning.congestion {
-        if let Err(e) = net::sockopt::set_tcp_congestion(fd, algo) {
-            eprintln!("[WARNING] bind: cannot set the congestion control '{algo}': {e}");
-        }
+        warn_if_refused("the congestion control", net::sockopt::set_tcp_congestion(fd, algo));
+    }
+}
+
+/// The one place a refused socket option is reported (HAProxy: a warning, the listener is kept).
+fn warn_if_refused<E: std::fmt::Display>(what: &str, r: Result<(), E>) {
+    if let Err(e) = r {
+        eprintln!("[WARNING] bind: cannot set {what}: {e}");
     }
 }
 

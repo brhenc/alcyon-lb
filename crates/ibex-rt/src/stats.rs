@@ -842,6 +842,7 @@ mod tests {
             stick_table: None,
             stick_rules: Vec::new(),
             server_send_proxy: vec![false],
+            server_tfo: vec![false],
             server_send_proxy_v2: vec![false],
             server_pp_unique_id: vec![false],
             server_backups: vec![false],

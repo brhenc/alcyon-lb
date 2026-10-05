@@ -133,7 +133,7 @@ fn frontend_quic_bind_defaults_its_alpn_to_h3() {
 #[test]
 fn bind_keywords_that_would_be_dropped_are_refused() {
     for kw in [
-        "tfo", "defer-accept", "mss 1000", "process 1", "thread 1", "nbconn 1", "nice 5", "shards 2", "tcp-ss 1",
+        "tfo", "defer-accept", "process 1", "thread 1", "nbconn 1", "nice 5", "shards 2", "tcp-ss 1",
         "idle-ping 1s", "label foo", "guid-prefix g",
     ] {
         let name = kw.split(' ').next().unwrap();
@@ -159,4 +159,17 @@ fn bind_socket_keywords_need_valid_arguments() {
     for b in ["backlog", "backlog x", "tcp-ut", "tcp-ut x", "cc"] {
         assert!(in_frontend(&format!("bind 127.0.0.1:8080 {b}")).is_err(), "{b}");
     }
+}
+
+#[test]
+fn bind_mss_takes_an_absolute_value_between_1_and_65535() {
+    for ok in ["1", "1200", "65535", "-1"] {
+        in_frontend(&format!("bind 127.0.0.1:8080 mss {ok}")).unwrap_or_else(|e| panic!("mss {ok}: {e}"));
+    }
+    for bad in ["0", "65536", "abc"] {
+        let err = in_frontend(&format!("bind 127.0.0.1:8080 mss {bad}")).expect_err(bad).to_string();
+        assert!(err.contains("'mss' : expects an MSS with and absolute value between 1 and 65535"), "{bad}: {err}");
+    }
+    let err = in_frontend("bind 127.0.0.1:8080 mss").expect_err("missing").to_string();
+    assert!(err.contains("'mss' : missing MSS value"), "{err}");
 }
