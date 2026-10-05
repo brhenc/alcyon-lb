@@ -67,6 +67,9 @@ pub struct StreamLog {
     pub redispatched: bool,
     /// The stream was answered by an applet (the stats page): `when(toapplet)`.
     pub applet: bool,
+    /// How many requests were in the backend's queue, this one among them, when it joined
+    /// it (`%bq`); 0 for one that never queued.
+    pub be_queue: u64,
     /// `option logasap`: the line went out with the response head; none follows.
     pub asap_done: bool,
 }
@@ -100,6 +103,7 @@ impl StreamLog {
             redispatched: false,
             applet: false,
             asap_done: false,
+            be_queue: 0,
         }
     }
 

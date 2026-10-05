@@ -664,8 +664,8 @@ fn write_backend_row(out: &mut String, proxy: &Proxy, _pid: u32, iid: u32) {
     let mut r = StatRow::new();
     r.set("pxname", &proxy.name);
     r.set("svname", "BACKEND");
-    r.set("qcur", 0);
-    r.set("qmax", 0);
+    r.set("qcur", proxy.stats[0].queue_cur.load(Relaxed));
+    r.set("qmax", proxy.stats[0].queue_max.load(Relaxed));
     r.set("scur", scur);
     r.set("smax", c.smax.load(Relaxed).max(scur));
     r.set("slim", proxy.maxconn);
