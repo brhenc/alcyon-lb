@@ -228,6 +228,29 @@ impl WorkerPool {
         None
     }
 
+    /// Closes every idle connection whose peer has gone: EOF, a reset, or bytes nobody asked
+    /// for (`HAProxy` subscribes an idle connection for reads and closes it on any of them).
+    /// Returns the number closed per server.
+    fn drop_dead(&mut self) -> Vec<((usize, usize), usize)> {
+        let mut gone = Vec::new();
+        for (&srv, s) in &mut self.servers {
+            let before = s.conns.len();
+            s.conns.retain(|p| {
+                let alive = raw::is_idle_conn_alive(p.conn.fd.as_fd());
+                if !alive {
+                    s.safe -= usize::from(p.safe);
+                }
+                alive
+            });
+            let n = before - s.conns.len();
+            if n > 0 {
+                self.conns -= n;
+                gone.push((srv, n));
+            }
+        }
+        gone
+    }
+
     /// `srv_cleanup_idle_conns`, for every server whose purge is due at `now`: half the
     /// idle connections beyond what the server needs, rounded up, plus one, are closed,
     /// oldest first; the estimate of the need moves halfway to the peak seen since the last
@@ -346,13 +369,16 @@ impl IdlePools {
     /// Worker `wid`'s handle.
     #[must_use]
     pub fn worker(self: &Arc<Self>, wid: usize) -> IdlePool {
-        IdlePool { pools: Arc::clone(self), wid: wid % self.slots.len(), next_purge: None }
+        IdlePool { pools: Arc::clone(self), wid: wid % self.slots.len(), next_purge: None, next_sweep: None }
     }
 
     fn lock(slot: &IdleSlot) -> std::sync::MutexGuard<'_, WorkerPool> {
         slot.pool.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
+
+/// How often a worker looks for idle server connections their server has closed.
+const IDLE_SWEEP: Duration = Duration::from_millis(50);
 
 /// A worker's handle on [`IdlePools`]: what the engine keeps, takes and purges through.
 #[derive(Debug)]
@@ -362,6 +388,8 @@ pub struct IdlePool {
     /// When this worker's purge next has work: kept here so that a step with nothing to purge
     /// does not take the lock.
     next_purge: Option<Instant>,
+    /// When this worker next looks for idle connections their server has closed.
+    next_sweep: Option<Instant>,
 }
 
 impl Default for IdlePool {
@@ -393,6 +421,31 @@ impl IdlePool {
         self.next_purge
     }
 
+    /// When [`IdlePool::sweep`] next has work: none while this worker holds no idle connection.
+    #[must_use]
+    pub fn next_sweep(&self) -> Option<Instant> {
+        self.next_sweep
+    }
+
+    /// Closes this worker's idle connections whose server has closed or reset them, or sent
+    /// data, at most every [`IDLE_SWEEP`]. A peek on each: the cost is per idle connection per
+    /// interval, none on the request path.
+    pub fn sweep(&mut self, now: Instant) {
+        if self.next_sweep.is_none_or(|t| t > now) {
+            return;
+        }
+        let slot = &self.pools.slots[self.wid];
+        let mut pool = IdlePools::lock(slot);
+        let gone = pool.drop_dead();
+        slot.conns.store(pool.conns, Ordering::Relaxed);
+        self.next_purge = pool.next_purge();
+        self.next_sweep = (pool.conns != 0).then(|| now + IDLE_SWEEP);
+        drop(pool);
+        for (srv, n) in gone {
+            self.pools.count_idle(srv, 0, n);
+        }
+    }
+
     /// See [`WorkerPool::keep`]; into this worker's slot.
     fn keep(&mut self, key: IdleKey, conn: IdleConn, is_safe: bool, cfg: SrvPoolCfg, used: u32, now: Instant) -> Result<(), IdleConn> {
         let srv = key.srv;
@@ -405,6 +458,7 @@ impl IdlePool {
         self.next_purge = pool.next_purge();
         drop(pool);
         if r.is_ok() {
+            self.next_sweep.get_or_insert(now + IDLE_SWEEP);
             self.pools.count_idle(srv, 1, 0);
         }
         r
@@ -528,6 +582,31 @@ mod shared_pool_tests {
             w0.purge(t0 + Duration::from_secs(1), |_| 0);
             assert_eq!(w0.next_purge().is_none(), shared);
         }
+    }
+
+    /// A sweep closes the idle connections whose peer closed, or sent bytes, and keeps the
+    /// rest; the counts the pool and the servers hold follow, and with nothing left the
+    /// sweep is no longer scheduled.
+    #[test]
+    fn a_sweep_closes_the_idle_connections_the_peer_closed() {
+        use std::io::Write;
+        let t0 = Instant::now();
+        let pools = IdlePools::with(1, true);
+        let mut w = pools.worker(0);
+        let (c0, p0) = alive();
+        let (c1, mut p1) = alive();
+        let (c2, _p2) = alive();
+        assert!(w.keep(key(), c0, false, CFG, 3, t0).is_ok());
+        assert!(w.keep(IdleKey { srv: (0, 1), ..key() }, c1, false, CFG, 3, t0).is_ok());
+        assert!(w.keep(IdleKey { srv: (0, 2), ..key() }, c2, false, CFG, 3, t0).is_ok());
+        assert_eq!(w.next_sweep(), Some(t0 + IDLE_SWEEP));
+        w.sweep(t0);
+        assert_eq!(w.total(), 3, "not due yet");
+        drop(p0);
+        p1.write_all(b"x").expect("unexpected bytes");
+        w.sweep(t0 + IDLE_SWEEP);
+        assert_eq!(w.total(), 1);
+        assert_eq!(w.next_sweep(), Some(t0 + IDLE_SWEEP * 2));
     }
 
     /// Another worker's connection to another server is not taken; the search goes on to
@@ -3571,6 +3650,11 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         self.idle_backend_pool.purge(now_inst, |(be, s)| {
             proxies.get(be).and_then(|p| p.server_actconn.get(s)).map_or(0, |a| a.load(Ordering::Relaxed))
         });
+        self.idle_backend_pool.sweep(now_inst);
+        let poll_timeout = self
+            .idle_backend_pool
+            .next_sweep()
+            .map_or(poll_timeout, |t| poll_timeout.min(t.saturating_duration_since(now_inst)));
         let poll_timeout = self
             .idle_backend_pool
             .next_purge()
