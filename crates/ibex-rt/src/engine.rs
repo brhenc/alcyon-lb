@@ -10056,9 +10056,6 @@ fn replace_uri_part(
     ctx: &SampleContext,
     registry: &Registry,
 ) -> Option<Result<String, ()>> {
-    if part.is_empty() {
-        return None;
-    }
     let re = ibex_regex::UserRegex::new(regex).ok()?;
     let caps = re.captures(part)?;
     let fmt = format_sample_string(repl, ctx, registry);

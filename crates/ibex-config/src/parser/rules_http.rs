@@ -1349,7 +1349,7 @@ fn parse_req_redirect(tokens: &[Token]) -> Result<(RedirectRule, Option<AclCondi
 /// [drop-query | keep-query | append-slash] [if|unless <cond>]` (`http_parse_redirect_rule`,
 /// `src/http_act.c`). A response only takes the `location` type; the options that shape a
 /// `prefix` or `scheme` redirect do nothing to a location, so they are accepted and not
-/// kept. `set-cookie-fmt` and `ignore-empty` are not done by Ibex, and are refused.
+/// kept. `ignore-empty` is not done by Ibex, and is refused.
 fn parse_res_redirect(tokens: &[Token]) -> Result<(HttpResAction, Option<AclCondition>), ConfigError> {
     #[derive(PartialEq)]
     enum Kind {
@@ -1402,7 +1402,11 @@ fn parse_res_redirect(tokens: &[Token]) -> Result<(HttpResAction, Option<AclCond
                 cookie = Some(RedirectCookie::Clear(arg(word)?.text.clone()));
                 i += 2;
             }
-            "set-cookie-fmt" | "ignore-empty" => {
+            "set-cookie-fmt" => {
+                cookie = Some(RedirectCookie::SetFmt(arg(word)?.text.clone()));
+                i += 2;
+            }
+            "ignore-empty" => {
                 return Err(ConfigError::new(t.line, t.col, format!("'http-response redirect {word}' is not implemented.")));
             }
             "drop-query" | "keep-query" | "append-slash" => i += 1,

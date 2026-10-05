@@ -84,7 +84,7 @@ pub fn preprocess_with_messages(lines: Vec<Line>) -> Result<(Vec<Line>, Vec<Dire
 
         match first {
             ".if" => {
-                if blocks.len() >= MAX_NESTED_CONDS {
+                if blocks.len() + 1 >= MAX_NESTED_CONDS {
                     return Err(at(line.tokens[0].col, format!("too many nested '.if', max is {MAX_NESTED_CONDS}.")));
                 }
                 // Inside a block that is left out, the condition is not evaluated.

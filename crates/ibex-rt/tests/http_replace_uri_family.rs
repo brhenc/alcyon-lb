@@ -19,8 +19,16 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 use tempfile::NamedTempFile;
 
+const BAD: &str = "<html><body><h1>500 Internal Server Error</h1>\nAn internal server error occurred.\n</body></html>";
+
 /// `(tag, action, regex, replacement, request target, "path|query|url|pathq|method")`.
 const CASES: &[(&str, &str, &str, &str, &str, &str)] = &[
+    // A match the replacement cannot be expanded for (a trailing or cut-short backslash
+    // escape) fails the request with a 500; a pathq no match leaves alone.
+    ("X1", "replace-pathq", "nomatch", "Z", "/ab?q=1", "/ab|q=1|/ab?q=1|/ab?q=1|GET"),
+    ("X2", "replace-path", "^/a", r"\\", "/ab?q=1", BAD),
+    ("X3", "replace-pathq", "^/a", r"\\x", "/ab?q=1", BAD),
+    ("X4", "replace-uri", "^/a", r"\\x4", "/ab?q=1", BAD),
     ("A", "replace-path", "^/a", "/Z", "/ab?q=1", "/Z|q=1|/Z?q=1|/Z?q=1|GET"),
     ("B", "replace-path", "a", "Y", "/ab?q=1", "|q=1|Y?q=1||GET"),
     ("C", "replace-path", "^/(.*)", r"/pre/\1", "/x/y?q=1", "/pre/x/y|q=1|/pre/x/y?q=1|/pre/x/y?q=1|GET"),

@@ -881,14 +881,14 @@ impl CliApplet {
         if first == Some("server") {
             let rest = rest["server".len()..].trim();
             let rest = rest.strip_suffix(" force").unwrap_or(rest).trim();
-            let (px_name, sv_name) = match rest.split_once('/') {
-                Some(pair) => pair,
-                None => ("", rest),
+            let Some((px_name, sv_name)) = rest.split_once('/') else {
+                self.finish_msg("Require 'backend/server'.");
+                return;
             };
             let mut found_px = false;
             let mut found = None;
             for (p_idx, p) in ctx.proxies.iter().enumerate() {
-                if px_name.is_empty() || p.name == px_name {
+                if p.name == px_name {
                     found_px = true;
                     if let Some(s_idx) = p.server_ids.iter().position(|sid| sid == sv_name) {
                         found = Some((p_idx, s_idx));
@@ -896,15 +896,15 @@ impl CliApplet {
                     }
                 }
             }
-            if !found_px && !px_name.is_empty() {
-                self.out_buf.extend_from_slice(b"No such backend.\n");
+            if !found_px {
+                self.finish_msg("No such backend.");
             } else if let Some((p_idx, s_idx)) = found {
                 crate::engine::clear_server_counters(&ctx.proxies[p_idx], s_idx);
                 self.finish_msg("Server counters cleared.");
-                return;
             } else {
-                self.out_buf.extend_from_slice(b"No such server.\n");
+                self.finish_msg("No such server.");
             }
+            return;
         } else if first == Some("all") {
             crate::engine::clear_proxy_counters(ctx.proxies, None);
             self.finish_msg("");
@@ -913,11 +913,6 @@ impl CliApplet {
             crate::engine::clear_proxy_maxima(ctx.proxies);
             self.finish_msg("");
             return;
-        }
-        if self.interactive {
-            self.out_buf.extend_from_slice(b"\n> ");
-        } else {
-            self.is_done = true;
         }
     }
 

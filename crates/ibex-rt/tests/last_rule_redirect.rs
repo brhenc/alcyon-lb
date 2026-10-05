@@ -191,6 +191,7 @@ backend be\n\
   http-response redirect location /ck1 set-cookie ck if { var(txn.p) -m beg /ck1 }\n\
   http-response redirect location /ck2 set-cookie ck=v=w if { var(txn.p) -m beg /ck2 }\n\
   http-response redirect location /ck3 set-cookie a=1 clear-cookie b if { var(txn.p) -m beg /ck3 }\n\
+  http-response redirect location /ckf set-cookie-fmt ck=%[var(txn.p)] if { var(txn.p) -m beg /ckf }\n\
   http-response redirect location /unl unless { var(txn.p) -m beg /zzz /b }\n\
   server s {srv}\n";
 
@@ -209,6 +210,7 @@ fn the_redirect_is_the_response_whatever_the_server_said() {
         ("/ck1", head("302 Found", &format!("location: /ck1\r\n{nc}set-cookie: ck; path=/;\r\n"))),
         ("/ck2", head("302 Found", &format!("location: /ck2\r\n{nc}set-cookie: ck=v=w; path=/;\r\n"))),
         ("/ck3", head("302 Found", &format!("location: /ck3\r\n{nc}set-cookie: b; path=/; Max-Age=0;\r\n"))),
+        ("/ckf", head("302 Found", &format!("location: /ckf\r\n{nc}set-cookie: ck=/ckf; path=/;\r\n"))),
         ("/unl", head("302 Found", &format!("location: /unl\r\n{nc}"))),
     ] {
         let mut c = TcpStream::connect(fe).expect("connect");

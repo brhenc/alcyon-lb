@@ -140,6 +140,11 @@ fn clear_counters_resets_the_maxima_all_resets_everything_and_the_rest_is_ignore
     assert_eq!(cli(&sock, "clear counters server bd/d"), "Server counters cleared.\n\n");
     assert_eq!(value(&sock, "econ", "bd", "d"), "0");
     assert_ne!(value(&sock, "econ", "bd", "BACKEND"), "0", "the backend keeps its own");
+    // The wrong forms, as HAProxy answers them (measured on 3.5-dev8-885761-29): a bare
+    // server name is not enough, and each miss is a message and a blank line.
+    assert_eq!(cli(&sock, "clear counters server d"), "Require 'backend/server'.\n\n");
+    assert_eq!(cli(&sock, "clear counters server nobe/d"), "No such backend.\n\n");
+    assert_eq!(cli(&sock, "clear counters server bd/nosuch"), "No such server.\n\n");
 
     // `all`, with or without something after it: everything, in every proxy.
     traffic();

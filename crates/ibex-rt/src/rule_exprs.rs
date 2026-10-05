@@ -123,6 +123,79 @@ pub fn response_part(fetch: &str) -> Option<&'static str> {
     }
 }
 
+const REQUEST_HEADER_FETCHES: &[&str] = &[
+    "base",
+    "base32",
+    "base32+src",
+    "baseq",
+    "cook",
+    "cook_cnt",
+    "cook_val",
+    "hdr_cnt",
+    "hdr_ip",
+    "hdr_val",
+    "http_auth_type",
+    "http_auth_user",
+    "http_auth_pass",
+    "http_auth_bearer",
+    "http_auth",
+    "http_auth_group",
+    "path",
+    "pathq",
+    "query",
+    "req.body",
+    "req.body_len",
+    "req.body_size",
+    "req.body_param",
+    "req.hdrs",
+    "req.hdrs_bin",
+    "req.cook",
+    "req.cook_cnt",
+    "req.cook_val",
+    "req.cook_names",
+    "req.fhdr",
+    "req.fhdr_cnt",
+    "req.hdr",
+    "req.hdr_cnt",
+    "req.hdr_ip",
+    "req.hdr_names",
+    "req.hdr_val",
+    "url",
+    "url32",
+    "url32+src",
+    "url_ip",
+    "url_port",
+    "url_param",
+    "urlp",
+    "urlp_val",
+    "req.timer.idle",
+    "req.timer.tq",
+    "req.timer.hdr",
+    "fcgi.docroot",
+    "fcgi.index",
+];
+
+
+const REQUEST_BUFFER_FETCHES: &[&str] = &[
+    "req.len",
+    "req_len",
+    "req.payload",
+    "req.payload_lv",
+    "req.ssl_hello_type",
+    "req_ssl_hello_type",
+    "req.ssl_sni",
+    "req_ssl_sni",
+    "req.ssl_ver",
+    "req_ssl_ver",
+    "req.rdp_cookie",
+    "rdp_cookie",
+    "req.rdp_cookie_cnt",
+    "rdp_cookie_cnt",
+    "req.ssl_alpn",
+    "req.ssl_ec_ext",
+    "req.ssl_st_ext",
+];
+
 /// What a fetch that reads only the request needs of it, which a response rule no longer
 /// has (`SMP_USE_HRQHV` without `SMP_USE_HRSHV`, `src/http_fetch.c`): "HTTP request
 /// headers" -- and, with `raw`, for a `tcp-response` rule, the raw request (`SMP_USE_L6REQ`,
@@ -130,20 +203,12 @@ pub fn response_part(fetch: &str) -> Option<&'static str> {
 /// here; the request line's persistent facts (`method`, `req.ver`) are still there.
 #[must_use]
 pub fn request_part(fetch: &str, raw: bool) -> Option<&'static str> {
-    match fetch {
-        "base" | "base32" | "base32+src" | "baseq" | "cook" | "cook_cnt" | "cook_val" | "hdr_cnt" | "hdr_ip"
-        | "hdr_val" | "http_auth_type" | "http_auth_user" | "http_auth_pass" | "http_auth_bearer" | "http_auth"
-        | "http_auth_group" | "path" | "pathq" | "query" | "req.body" | "req.body_len" | "req.body_size"
-        | "req.body_param" | "req.hdrs" | "req.hdrs_bin" | "req.cook" | "req.cook_cnt" | "req.cook_val"
-        | "req.cook_names" | "req.fhdr" | "req.fhdr_cnt" | "req.hdr" | "req.hdr_cnt" | "req.hdr_ip"
-        | "req.hdr_names" | "req.hdr_val" | "url" | "url32" | "url32+src" | "url_ip" | "url_port" | "url_param"
-        | "urlp" | "urlp_val" | "req.timer.idle" | "req.timer.tq" | "req.timer.hdr" | "fcgi.docroot"
-        | "fcgi.index" => Some("HTTP request headers"),
-        "req.len" | "req_len" | "req.payload" | "req.payload_lv" | "req.ssl_hello_type" | "req_ssl_hello_type"
-        | "req.ssl_sni" | "req_ssl_sni" | "req.ssl_ver" | "req_ssl_ver" | "req.rdp_cookie" | "rdp_cookie"
-        | "req.rdp_cookie_cnt" | "rdp_cookie_cnt" | "req.ssl_alpn" | "req.ssl_ec_ext" | "req.ssl_st_ext"
-            if raw => Some("request buffer"),
-        _ => None,
+    if REQUEST_HEADER_FETCHES.contains(&fetch) {
+        Some("HTTP request headers")
+    } else if raw && REQUEST_BUFFER_FETCHES.contains(&fetch) {
+        Some("request buffer")
+    } else {
+        None
     }
 }
 
@@ -321,8 +386,7 @@ impl Section<'_> {
                         response_part(fetch)
                     }
                     "http-response" | "http-after-response" => request_part(fetch, false),
-                    "tcp-response content" => request_part(fetch, true),
-                    _ => None,
+                    _ => request_part(fetch, true), // "tcp-response content", the last of the seven
                 };
                 if let Some(part) = part {
                     let name = if action.starts_with("set-var(") {
