@@ -732,9 +732,17 @@ impl TcpSession {
     }
 
     /// Whether the session must be run again with no socket event to wake it.
+    ///
+    /// A TLS handshake with the server that failed in a pass after the engine's check for
+    /// it (`process` runs again in the content and HTTP steps) is retried on the next pass.
+    /// The server's FIN behind its alert used to be that wakeup, through an EPOLLRDHUP
+    /// armed with no read interest; since T226 it is not, and the retry waited for
+    /// `timeout connect`.
     #[must_use]
     pub fn wants_rerun(&self) -> bool {
-        self.passes_ran_out || self.has_undispatched_h2_streams()
+        self.passes_ran_out
+            || self.has_undispatched_h2_streams()
+            || (self.srv_state == ScState::Error && self.srv_xprt.handshake_failed())
     }
 
     /// A stream with its request in, waiting for its turn, and the turn free: streams
