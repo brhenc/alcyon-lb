@@ -60,3 +60,21 @@ run ends with the `show stat` status changes over time. Ports 23001-23003 (nodes
 4. Add cases with `record NAME 0|1 "detail"`; keep each case one short block.
 5. Run with and without `--haproxy`. File every difference as `tasks/T17x-practical-*.md`
    with the exact command, HAProxy's output and Ibex's.
+
+## 03-httpd: proxy -> httpd (mod_proxy) -> node.js, plus static files and CGI
+
+Needs `node`, `curl`, `sha256sum`, `/usr/sbin/httpd` (2.4, modules in `/usr/lib64/httpd/modules`),
+`python3` (the CGI scripts) and `~/.local/bin/wrk2`. Build Ibex with
+`CARGO_TARGET_DIR=/home/bhenc/ibex-targets/t201 CARGO_INCREMENTAL=0 cargo build --release --bin ibex`.
+
+    cd tools/practical/03-httpd
+    ./run.sh               # against Ibex
+    ./run.sh --haproxy     # against HAProxy (oracle)
+
+Takes about 40 s. httpd runs unprivileged in the foreground from `httpd.conf` (filled in under
+`$WORK`); `/static/` and `/cgi-bin/` go to httpd directly, everything else is `ProxyPass`ed to node.
+Cases: keep-alive through both hops, 50 MB static sha256, `Range` (206), CGI GET with query string,
+CGI POST echo (sha256), dynamic via httpd -> node, 50 MB chunked upload (sha256 at node),
+`X-Forwarded-For` as node sees it (`127.0.0.2, 127.0.0.1`: `option forwardfor` plus httpd's append),
+httpd 404 and CGI 500 passthrough, 3 s CGI under `timeout server 10s`, `wrk2 -t2 -c20 -d10s -R500`
+(0 socket errors, 0 non-2xx; p99 printed, not judged). Ports 25001 (httpd), 25002 (node), 25080 (proxy).
