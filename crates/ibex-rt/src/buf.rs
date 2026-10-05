@@ -656,6 +656,13 @@ impl Buf {
         }
     }
 
+    /// Cuts `start..end` (offsets in the readable data) out of the buffer.
+    pub fn cut(&mut self, start: usize, end: usize) {
+        let (a, b) = (self.head + start.min(self.len), self.head + end.min(self.len));
+        self.data.copy_within(b..self.head + self.len, a);
+        self.len -= b - a;
+    }
+
     /// Removes all occurrences of an HTTP header from the readable portion of the buffer.
     ///
     /// Returns `true` if successful, or `false` if the buffer is malformed.
