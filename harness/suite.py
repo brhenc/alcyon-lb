@@ -134,6 +134,8 @@ SERIAL_TARGETS = {
     "ibex-rt/request_allocations",     # counts allocations and bytes per request
     "ibex-rt/canonical_haproxy_35_e2e",  # stick counters read across scopes on a timer
     "ibex-rt/cli_applet",              # `show pools` waits a fixed 20 engine steps (T116)
+    # Failed only in gates that shared the machine with another gate, passed alone (2026-10-05):
+    "ibex-rt/fd_hygiene",              # counts /proc/<pid>/fd after the server closes (T217)
 }
 
 
