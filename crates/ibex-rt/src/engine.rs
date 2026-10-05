@@ -2110,8 +2110,17 @@ fn resolve_log_targets(config: &Config, proxies: &mut [Proxy]) -> Vec<SyslogTarg
         own.push((b.name.clone(), idx, b.log_global));
     }
 
+    // First section of a name wins, as the linear `find` this replaces did: sorting by
+    // (name, position) puts it first among equals.
+    let mut by_name: Vec<(&str, usize)> = own.iter().enumerate().map(|(i, (n, _, _))| (n.as_str(), i)).collect();
+    by_name.sort_unstable();
     for proxy in proxies.iter_mut() {
-        let Some((_, idx, log_global)) = own.iter().find(|(n, _, _)| *n == proxy.name) else {
+        let at = by_name.partition_point(|&(n, _)| n < proxy.name.as_str());
+        let Some((_, idx, log_global)) = by_name
+            .get(at)
+            .filter(|&&(n, _)| n == proxy.name.as_str())
+            .map(|&(_, i)| &own[i])
+        else {
             continue;
         };
         let mut resolved = idx.clone();
