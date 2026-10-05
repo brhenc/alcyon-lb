@@ -98,6 +98,7 @@ pub(crate) fn parse_listen_header(
         res_header_captures: Vec::new(),
         log_health_checks: defaults.map_or(false, |d| d.log_health_checks),
         buffer_request: defaults.is_some_and(|d| d.buffer_request),
+        abortonclose: defaults.and_then(|d| d.abortonclose),
         http_mode: defaults.map_or(HttpMode::KeepAlive, |d| d.http_mode),
         persist: defaults.is_some_and(|d| d.persist),
         dontlognull: defaults.is_some_and(|d| d.dontlognull),
@@ -270,6 +271,7 @@ pub(crate) fn parse_backend_header(
         unique_id_header: defaults.and_then(|d| d.unique_id_header.clone()),
         log_health_checks: defaults.map_or(false, |d| d.log_health_checks),
         buffer_request: defaults.is_some_and(|d| d.buffer_request),
+        abortonclose: defaults.and_then(|d| d.abortonclose),
         http_mode: defaults.map_or(HttpMode::KeepAlive, |d| d.http_mode),
         persist: defaults.is_some_and(|d| d.persist),
         mode,
@@ -954,6 +956,7 @@ pub(crate) fn parse_option_listen(
         "forwarded" => proxy.forwarded = Some(Box::new(parse_forwarded_option(tokens)?)),
         "redispatch" => set_redispatch(&mut proxy.redisp, &mut proxy.redisp_after, tokens),
         "http-buffer-request" => proxy.buffer_request = true,
+        "abortonclose" => proxy.abortonclose = Some(true),
         "http-server-close" => proxy.http_mode = HttpMode::ServerClose,
         "httpclose" => proxy.http_mode = HttpMode::Close,
         "persist" => proxy.persist = true,
@@ -997,6 +1000,12 @@ pub(crate) fn parse_option_frontend(
     }
     if tokens[1].text == "http-buffer-request" {
         fe.buffer_request = true;
+        return Ok(());
+    }
+    if tokens[1].text == "abortonclose" {
+        // A frontend's own `abortonclose` decides only whether a TLS handshake goes on once
+        // the client has shut its side (`ssl_sock_to_buf`); Ibex does not look (T227).
+        eprintln!("[ibex] warning: 'option abortonclose' in a frontend is not implemented and is ignored.");
         return Ok(());
     }
     if matches!(tokens[1].text.as_str(), "http-server-close" | "http-keep-alive" | "httpclose") {
@@ -1049,6 +1058,7 @@ pub(crate) fn parse_option_backend(
         "forwarded" => be.forwarded = Some(Box::new(parse_forwarded_option(tokens)?)),
         "redispatch" => set_redispatch(&mut be.redisp, &mut be.redisp_after, tokens),
         "http-buffer-request" => be.buffer_request = true,
+        "abortonclose" => be.abortonclose = Some(true),
         "http-server-close" => be.http_mode = HttpMode::ServerClose,
         "httpclose" => be.http_mode = HttpMode::Close,
         "persist" => be.persist = true,
@@ -1079,6 +1089,7 @@ pub(crate) fn parse_no_listen(proxy: &mut ListenSection, tokens: &[Token], kw: &
     match check_no_option(OptSection::Listen, tokens, kw)? {
         Some("redispatch") => (proxy.redisp, proxy.redisp_after) = (false, -1),
         Some("http-buffer-request") => proxy.buffer_request = false,
+        Some("abortonclose") => proxy.abortonclose = Some(false),
         Some("http-server-close") if proxy.http_mode == HttpMode::ServerClose => proxy.http_mode = HttpMode::KeepAlive,
         Some("httpclose") if proxy.http_mode == HttpMode::Close => proxy.http_mode = HttpMode::KeepAlive,
         Some("persist") => proxy.persist = false,
@@ -1125,6 +1136,7 @@ pub(crate) fn parse_no_backend(be: &mut BackendSection, tokens: &[Token], kw: &T
     match check_no_option(OptSection::Backend, tokens, kw)? {
         Some("redispatch") => (be.redisp, be.redisp_after) = (false, -1),
         Some("http-buffer-request") => be.buffer_request = false,
+        Some("abortonclose") => be.abortonclose = Some(false),
         Some("http-server-close") if be.http_mode == HttpMode::ServerClose => be.http_mode = HttpMode::KeepAlive,
         Some("httpclose") if be.http_mode == HttpMode::Close => be.http_mode = HttpMode::KeepAlive,
         Some("persist") => be.persist = false,

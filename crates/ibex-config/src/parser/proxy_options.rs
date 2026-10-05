@@ -182,6 +182,8 @@ const IMPLEMENTED: &[&str] = &[
     "ldap-check",
     // Read by the HTTP/1 request parser (T101).
     "accept-unsafe-violations-in-http-request",
+    // A client that leaves aborts its request, unless `no option abortonclose` (T227).
+    "abortonclose",
 ];
 
 fn find(name: &str) -> Option<&'static OptSpec> {

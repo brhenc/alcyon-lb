@@ -220,6 +220,7 @@ pub(crate) fn parse_option_defaults(
         "forwarded" => defaults.forwarded = Some(Box::new(parse_forwarded_option(tokens)?)),
         "redispatch" => set_redispatch(&mut defaults.redisp, &mut defaults.redisp_after, tokens),
         "http-buffer-request" => defaults.buffer_request = true,
+        "abortonclose" => defaults.abortonclose = Some(true),
         "http-server-close" => defaults.http_mode = HttpMode::ServerClose,
         "httpclose" => defaults.http_mode = HttpMode::Close,
         "persist" => defaults.persist = true,
@@ -250,6 +251,7 @@ pub(crate) fn parse_no_defaults(defaults: &mut DefaultsSection, tokens: &[Token]
     match check_no_option(OptSection::Defaults, tokens, kw)? {
         Some("redispatch") => (defaults.redisp, defaults.redisp_after) = (false, -1),
         Some("http-buffer-request") => defaults.buffer_request = false,
+        Some("abortonclose") => defaults.abortonclose = Some(false),
         Some("http-server-close") if defaults.http_mode == HttpMode::ServerClose => defaults.http_mode = HttpMode::KeepAlive,
         Some("httpclose") if defaults.http_mode == HttpMode::Close => defaults.http_mode = HttpMode::KeepAlive,
         Some("persist") => defaults.persist = false,

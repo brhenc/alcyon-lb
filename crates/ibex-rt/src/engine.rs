@@ -1169,6 +1169,10 @@ pub struct Proxy {
     pub log_health_checks: bool,
     /// HTTP connection reuse strategy (`http-reuse`).
     pub http_reuse: ibex_config::HttpReuse,
+    /// Whether a client that leaves aborts its request at the server, in the queue or while
+    /// connecting (`option abortonclose`, on for HTTP unless `no option abortonclose`). A
+    /// backend's: the stream's backend decides, as `proxy_abrt_close(s->be)`.
+    pub abortonclose: bool,
     /// Custom error pages (`errorfile`/`errorfiles`), keyed by status code.
     pub error_files: HashMap<u16, Vec<u8>>,
     /// `http-error` overrides, keyed by status code; consulted before `error_files`.
@@ -1989,8 +1993,10 @@ fn stream_log_data<'a>(entry: &'a SessionEntry, proxies: &'a [Proxy], proxy_idx:
     }
 }
 
+/// `%ST`: -1 for a transaction that has no status (`txn->status` starts at -1), as one the
+/// client left before it reached a server (`CQ`, `CC`).
 fn stream_status(s: &TcpSession) -> i64 {
-    s.txn.as_ref().map(|t| t.status).or(s.log.status).map_or(-1, i64::from)
+    s.txn.as_ref().map(|t| t.status).filter(|&st| st > 0).or(s.log.status).map_or(-1, i64::from)
 }
 
 /// The HTX messages `HAProxy` parsed, where they were measured; the bytes that crossed
@@ -2076,6 +2082,7 @@ fn account_stream(entry: &mut SessionEntry, proxies: &[Proxy]) {
     let term = term_state(entry);
     let routed = !http || (l.request.is_some() && !matches!(&term, b"PR" | b"LR"));
     let status = stream_status(s);
+    let client_reset = s.ending == Some(crate::proxy::Ending::ClientAbort);
     let (bin, bout) = (stream_bytes_in(s), stream_bytes_out(s));
     let (t_queue, t_connect, t_data) = (l.ms(l.queue), l.ms(l.connect), l.ms(l.data));
     let t_request = l.ms(l.request).max(0);
@@ -2115,12 +2122,18 @@ fn account_stream(entry: &mut SessionEntry, proxies: &[Proxy]) {
         }
         // Which side's fault, as `HAProxy`'s termination code counts it (measured on
         // 3.5-dev8-885761-29: `SH` adds two to `eresp`, `sH` one, `SD` one to `eresp` and
-        // one to `srv_abrt`, `sD` one to `srv_abrt`, `PH` two to `eresp`).
+        // one to `srv_abrt`, `sD` one to `srv_abrt`, `PH` two to `eresp`). A client that
+        // leaves (T227): `CC` and a closed `CQ` count nothing, a reset `CQ` one; a reset
+        // while the response head was awaited (`CD` 400) counts twice, once by the request
+        // analyser and once by the response's.
         let (abrt_cli, abrt_srv, eresp) = match &term {
             b"SH" | b"PH" => (0, 0, 2),
             b"sH" => (0, 0, 1),
             b"SD" => (0, 1, 1),
             b"sD" => (0, 1, 0),
+            b"CC" => (0, 0, 0),
+            b"CQ" => (u64::from(client_reset), 0, 0),
+            b"CD" if status == 400 => (2, 0, 0),
             [b'C', _] => (1, 0, 0),
             _ => (0, 0, 0),
         };
@@ -2687,6 +2700,7 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, list
         http_res_rules: listen.http_res_rules.clone(),
         http_after_res_rules: listen.http_after_res_rules.clone(),
         http_reuse: listen.http_reuse.unwrap_or_default(),
+        abortonclose: listen.abortonclose.unwrap_or(true),
         error_files: listen.error_files.clone(),
         error_replies: listen.error_replies.clone(),
         log_tag: listen.log_tag.as_deref().map(syslog_tag),
@@ -2806,6 +2820,7 @@ fn init_proxy_from_frontend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, fe
         http_res_rules: fe.http_res_rules.clone(),
         http_after_res_rules: fe.http_after_res_rules.clone(),
         http_reuse: ibex_config::HttpReuse::default(),
+        abortonclose: true,
         error_files: fe.error_files.clone(),
         error_replies: fe.error_replies.clone(),
         log_tag: fe.log_tag.as_deref().map(syslog_tag),
@@ -2954,6 +2969,7 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, be:
         http_res_rules: be.http_res_rules.clone(),
         http_after_res_rules: be.http_after_res_rules.clone(),
         http_reuse: be.http_reuse.unwrap_or_default(),
+        abortonclose: be.abortonclose.unwrap_or(true),
         error_files: be.error_files.clone(),
         error_replies: be.error_replies.clone(),
         log_tag: be.log_tag.as_deref().map(syslog_tag),
@@ -7016,6 +7032,10 @@ impl EngineDispatcher<'_> {
             }
         }
 
+        if Self::client_left(entry, proxies, fdtab, poller, idle_pool) {
+            return admin;
+        }
+        let abortonclose = proxies.get(entry.backend_idx).is_none_or(|p| p.abortonclose);
         let Some(txn) = entry.sess.txn.as_mut() else {
             return admin;
         };
@@ -7030,6 +7050,11 @@ impl EngineDispatcher<'_> {
                 txn.aborted = true;
             }
             ScState::ShutR if txn.req.is_done() || txn.local => {
+                txn.close_after = true;
+            }
+            // `no option abortonclose`: a whole request still queued or connecting goes on
+            // to the server.
+            ScState::ShutR if !abortonclose && matches!(txn.req, MsgState::Head { body: crate::txn::Framing::None, .. }) => {
                 txn.close_after = true;
             }
             _ => {
@@ -7048,6 +7073,78 @@ impl EngineDispatcher<'_> {
             Self::end_txn(entry, proxies, fdtab, poller, idle_pool, wake_queue, now, pid);
         }
         admin
+    }
+
+    /// The client left before its response was complete: what `abortonclose` does with the
+    /// request (`proxy_abrt_close`, T227). `true` when the session is closed.
+    ///
+    /// Measured on `HAProxy` 3.5-dev8 (`tests/abortonclose.rs`): with the option, on by
+    /// default in HTTP, a client's FIN resets the server connection; waiting for the
+    /// response head, the client is sent a 400 (`CH`); during the body, the response stops
+    /// (`CD`); queued or connecting, the request is dropped (`CQ`, `CC`, status -1). A
+    /// client's reset does all that whatever the option (`CD` 400 waiting for the head).
+    /// Without the option, a FIN changes nothing until the response is complete.
+    fn client_left(
+        entry: &mut SessionEntry,
+        proxies: &[Proxy],
+        fdtab: &mut FdTab,
+        poller: &mut Poller,
+        idle_pool: &mut IdlePool,
+    ) -> bool {
+        if matches!(entry.sess.cli_state, ScState::Ready | ScState::Established) || entry.sess.h2_ctx.is_some() {
+            return false;
+        }
+        let Some(txn) = entry.sess.txn.as_ref() else {
+            return false;
+        };
+        if txn.local || txn.aborted || txn.req == MsgState::Tunnel || txn.rsp.is_done() {
+            return false;
+        }
+        // A FIN leaves no ending, a reset `ClientAbort`; any other ending (a timeout, an
+        // error) already decided how the stream ends.
+        let reset = match entry.sess.ending {
+            None => false,
+            Some(crate::proxy::Ending::ClientAbort) => true,
+            Some(_) => return false,
+        };
+        if !reset && !proxies.get(entry.backend_idx).is_none_or(|p| p.abortonclose) {
+            return false;
+        }
+        if !txn.req.is_done() {
+            // Not at the server yet: queued, or connecting. Only a whole request; one whose
+            // body was still coming is cut short, as before.
+            if !matches!(txn.req, MsgState::Head { body: crate::txn::Framing::None, .. }) {
+                return false;
+            }
+            let queued = entry.sess.queue.take().is_some();
+            if queued {
+                entry.sess.log.queue.get_or_insert_with(Instant::now);
+            }
+            entry.sess.log.term = Some([b'C', if queued { b'Q' } else { b'C' }]);
+            if let Some(srv) = entry.sess.srv.as_ref() {
+                raw::abort_with_rst(srv.as_fd());
+            }
+            close_http_session(entry, proxies, fdtab, poller, idle_pool, false);
+            return true;
+        }
+        let waiting = txn.rsp == MsgState::Waiting;
+        // `SC_FL_NOLINGER`: the server connection is reset when it is closed, with the
+        // session, which keeps it until then for the log and the server's counters.
+        if let Some(srv) = entry.sess.srv.as_ref() {
+            raw::abort_with_rst(srv.as_fd());
+        }
+        if waiting {
+            entry.sess.log.term = Some(if reset { *b"CD" } else { *b"CH" });
+            // Nothing more is read from the server, nor sent to it.
+            entry.sess.srv_state = ScState::Closed;
+            entry.sess.rep.clear();
+            reply_error(entry, proxies, 400);
+            // A half-closed client is sent it, as a local reply; a reset one is closed below.
+            return false;
+        }
+        entry.sess.log.term = Some(*b"CD");
+        close_http_session(entry, proxies, fdtab, poller, idle_pool, false);
+        true
     }
 
     /// How the server side ended, if it has, for a response the server is sending.

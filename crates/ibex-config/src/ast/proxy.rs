@@ -59,6 +59,9 @@ pub struct DefaultsSection {
     /// `option http-buffer-request`: wait for the request body before the rules run (as
     /// an implicit `http-request wait-for-body` ahead of them).
     pub buffer_request: bool,
+    /// `option abortonclose` (`Some(true)`), `no option abortonclose` (`Some(false)`), or
+    /// neither: then on for an HTTP stream, as `HAProxy` has it (`proxy_abrt_close_def`).
+    pub abortonclose: Option<bool>,
     /// The last of `option http-keep-alive`, `http-server-close` and `httpclose`.
     pub http_mode: HttpMode,
     /// `option persist`: a server a cookie or stick table names is used even when it is down.
@@ -263,6 +266,9 @@ pub struct ListenSection {
     /// `option http-buffer-request`: wait for the request body before the rules run (as
     /// an implicit `http-request wait-for-body` ahead of them).
     pub buffer_request: bool,
+    /// `option abortonclose` (`Some(true)`), `no option abortonclose` (`Some(false)`), or
+    /// neither: then on for an HTTP stream, as `HAProxy` has it (`proxy_abrt_close_def`).
+    pub abortonclose: Option<bool>,
     /// The last of `option http-keep-alive`, `http-server-close` and `httpclose`.
     pub http_mode: HttpMode,
     /// `option persist`: a server a cookie or stick table names is used even when it is down.
@@ -416,6 +422,7 @@ impl Default for ListenSection {
             res_header_captures: Vec::new(),
             log_health_checks: false,
             buffer_request: false,
+            abortonclose: None,
             http_mode: HttpMode::KeepAlive,
             persist: false,
             dontlognull: false,
@@ -636,6 +643,9 @@ pub struct BackendSection {
     /// `option http-buffer-request`: wait for the request body before the rules run (as
     /// an implicit `http-request wait-for-body` ahead of them).
     pub buffer_request: bool,
+    /// `option abortonclose` (`Some(true)`), `no option abortonclose` (`Some(false)`), or
+    /// neither: then on for an HTTP stream, as `HAProxy` has it (`proxy_abrt_close_def`).
+    pub abortonclose: Option<bool>,
     /// The last of `option http-keep-alive`, `http-server-close` and `httpclose`.
     pub http_mode: HttpMode,
     /// `option persist`: a server a cookie or stick table names is used even when it is down.
@@ -746,6 +756,7 @@ impl Default for BackendSection {
             unique_id_header: None,
             log_health_checks: false,
             buffer_request: false,
+            abortonclose: None,
             http_mode: HttpMode::KeepAlive,
             persist: false,
             mode: Mode::Tcp,
