@@ -3412,10 +3412,16 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
     /// # Errors
     /// Returns an error if binding or setting non-blocking mode fails.
     pub fn bind_cli_socket<P: AsRef<Path>>(&mut self, path: P) -> io::Result<()> {
-        let path_buf = path.as_ref().to_path_buf();
-        let _ = std::fs::remove_file(&path_buf);
-        let listener = UnixListener::bind(&path_buf)?;
-        listener.set_nonblocking(true)?;
+        let (listener, path_buf) = bind_unix_listener(path.as_ref())?;
+        self.adopt_cli_listener(listener, path_buf)
+    }
+
+    /// Serves the CLI on `listener`, already bound (by the main thread, before any worker
+    /// served: T220).
+    ///
+    /// # Errors
+    /// Returns an error if registering with the poller fails.
+    pub fn adopt_cli_listener(&mut self, listener: UnixListener, path_buf: PathBuf) -> io::Result<()> {
         let raw_fd = listener.as_raw_fd();
         self.fdtab
             .insert(raw_fd, FdState::CliListener, Interest::READ);
@@ -3427,15 +3433,11 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         Ok(())
     }
 
-    /// Binds one more CLI socket, with its own level (a second `stats socket` line).
+    /// Serves one more CLI socket on `listener`, already bound (see `adopt_cli_listener`).
     ///
     /// # Errors
-    /// Returns an error if binding or setting non-blocking mode fails.
-    pub fn bind_extra_cli_socket<P: AsRef<Path>>(&mut self, path: P, level: crate::applet::CliLevel) -> io::Result<()> {
-        let path_buf = path.as_ref().to_path_buf();
-        let _ = std::fs::remove_file(&path_buf);
-        let listener = UnixListener::bind(&path_buf)?;
-        listener.set_nonblocking(true)?;
+    /// Returns an error if registering with the poller fails.
+    pub fn adopt_extra_cli_listener(&mut self, listener: UnixListener, path_buf: PathBuf, level: crate::applet::CliLevel) -> io::Result<()> {
         let raw_fd = listener.as_raw_fd();
         let idx = u32::try_from(self.extra_cli.len()).unwrap_or(u32::MAX);
         self.fdtab.insert(raw_fd, FdState::CliExtra(idx), Interest::READ);
@@ -3987,7 +3989,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         loop {
             let (listener, level, path) = match which {
                 None => (self.cli_listener.as_ref(), self.cli_level, self.cli_socket_path.as_ref()),
-                // `FdState::CliExtra(i)` is registered by `bind_extra_cli_socket` with `i` its index.
+                // `FdState::CliExtra(i)` is registered by `adopt_extra_cli_listener` with `i` its index.
                 Some(i) => (self.extra_cli[i].listener.as_ref(), self.extra_cli[i].level, Some(&self.extra_cli[i].path)),
             };
             let Some(listener) = listener else {
@@ -11971,4 +11973,16 @@ mod actconn_tests {
         server_actconn_add(entry, proxies, true);
         assert_eq!(in_use(proxies), 0, "a reclaimed session adds nothing");
     }
+}
+
+/// Binds a non-blocking CLI listener at `path`, replacing a stale socket file.
+///
+/// # Errors
+/// Returns an error if binding or setting non-blocking mode fails.
+pub fn bind_unix_listener(path: &Path) -> io::Result<(UnixListener, PathBuf)> {
+    let path_buf = path.to_path_buf();
+    let _ = std::fs::remove_file(&path_buf);
+    let listener = UnixListener::bind(&path_buf)?;
+    listener.set_nonblocking(true)?;
+    Ok((listener, path_buf))
 }

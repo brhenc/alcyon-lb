@@ -880,6 +880,39 @@ fn main() {
         process::exit(1);
     }
 
+    // 12d. Every stats socket is bound here too (T220), so the file exists before any worker
+    //      accepts a client and an unbindable path stops the start before any port listens
+    //      (HAProxy: `protocol_bind_all`). Worker 0 serves them.
+    let bind_cli = |path: &Path, mode: Option<u32>| -> (std::os::unix::net::UnixListener, PathBuf) {
+        match ibex_rt::engine::bind_unix_listener(path) {
+            Ok(r) => {
+                if let Some(mode) = mode {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+                }
+                r
+            }
+            Err(err) => {
+                let why = err.to_string();
+                let why = why.split(" (os error").next().unwrap_or(&why);
+                eprintln!("[ALERT] Binding for frontend GLOBAL: protocol unix_stream: cannot bind UNIX socket ({why}) [{}].", path.display());
+                eprintln!("[ALERT] [haproxy.main()] Some protocols failed to start their listeners! Exiting.");
+                process::exit(1);
+            }
+        }
+    };
+    let mut cli_pre = cli_socket.as_deref().map(|p| bind_cli(p, stats_socket_mode));
+    let mut extra_pre: Option<Vec<_>> = Some(
+        extra_sockets
+            .iter()
+            .map(|x| {
+                let level = x.level.as_deref().and_then(ibex_rt::applet::CliLevel::parse).unwrap_or(ibex_rt::applet::CliLevel::Operator);
+                let (l, p) = bind_cli(Path::new(&x.path), x.mode);
+                (l, p, level)
+            })
+            .collect(),
+    );
+
     // Each worker reports once it is listening. `-sf` and READY=1 wait for all of them.
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
     let mut threads = Vec::new();
@@ -897,8 +930,7 @@ fn main() {
         let proxies_clone = shared_proxies.clone();
         let idle_pools = std::sync::Arc::clone(&idle_pools);
         let mailboxes = mailboxes.clone();
-        let cli_socket_clone = cli_socket.clone();
-        let extra_sockets = extra_sockets.clone();
+        let (cli_pre, extra_pre) = if worker_id == 0 { (cli_pre.take(), extra_pre.take()) } else { (None, None) };
         let lifecycle_clone = lifecycle.clone();
         let ready_tx = ready_tx.clone();
 
@@ -917,33 +949,15 @@ fn main() {
             };
             engine.share_idle_pools(&idle_pools, worker_id);
 
-            if worker_id == 0 {
-                if let Some(ref sock_path) = cli_socket_clone {
-                    if let Some(level) = stats_socket_level {
-                        engine.set_cli_level(level);
-                    }
-                    if let Err(err) = engine.bind_cli_socket(sock_path) {
-                        eprintln!("Failed to bind CLI / stats socket '{}': {}", sock_path.display(), err);
-                        process::exit(1);
-                    }
-                    if let Some(mode) = stats_socket_mode {
-                        use std::os::unix::fs::PermissionsExt;
-                        let _ = std::fs::set_permissions(sock_path, std::fs::Permissions::from_mode(mode));
-                    }
+            if let Some((listener, path)) = cli_pre {
+                if let Some(level) = stats_socket_level {
+                    engine.set_cli_level(level);
                 }
-                // The `stats socket` lines after the first (HAProxy binds every one), each
-                // with its own level and mode.
-                for x in &extra_sockets {
-                    let level = x.level.as_deref().and_then(ibex_rt::applet::CliLevel::parse).unwrap_or(ibex_rt::applet::CliLevel::Operator);
-                    if let Err(err) = engine.bind_extra_cli_socket(&x.path, level) {
-                        eprintln!("Failed to bind CLI / stats socket '{}': {}", x.path, err);
-                        process::exit(1);
-                    }
-                    if let Some(mode) = x.mode {
-                        use std::os::unix::fs::PermissionsExt;
-                        let _ = std::fs::set_permissions(&x.path, std::fs::Permissions::from_mode(mode));
-                    }
-                }
+                // Only an epoll_ctl failure on a fresh descriptor can fail here.
+                engine.adopt_cli_listener(listener, path).unwrap_or_else(|e| { eprintln!("Failed to serve a CLI / stats socket: {e}"); process::exit(1) });
+            }
+            for (listener, path, level) in extra_pre.into_iter().flatten() {
+                engine.adopt_extra_cli_listener(listener, path, level).unwrap_or_else(|e| { eprintln!("Failed to serve a CLI / stats socket: {e}"); process::exit(1) });
             }
             engine.set_lifecycle(lifecycle_clone);
             let _ = ready_tx.send(());
