@@ -3530,14 +3530,38 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             let http = matches!(s.mode, Mode::Http);
             // HTTP/1 creates no stream before a request (`HAProxy` lists none for an idle
             // connection).
-            if http && s.txn.is_none() && s.req.is_empty() && s.h2_ctx.is_none() {
+            // Nor for a request whose head is not complete.
+            if http && s.txn.is_none() && s.h2_ctx.is_none() {
                 continue;
             }
             let fe = self.proxies.get(e.proxy_idx);
             let be = self.proxies.get(e.backend_idx).filter(|p| p.has_backend).map(|_| e.backend_idx);
             let srv = e.target_server_idx.filter(|_| e.srv_backend_idx == e.backend_idx);
-            let cli_rex = if s.cli_exp.is_set() { s.cli_exp } else { s.req_exp };
-            let timers = [cli_rex, s.srv_exp, s.conn_exp];
+            // What each side's timer means (`sc_ep_rcv_ex` / `sc_ep_snd_ex`): a receive timer
+            // while that side may still send us data, a send timer while ours to it is
+            // blocked. An HTTP/1 request in hand is not read from the client any more (the
+            // client's timer waits only for a body or, once the response flows, for its
+            // reader), and the server is not read while the response backs up or the request
+            // has not been sent whole.
+            let (cli_rex, cli_wex, srv_rex) = match s.txn.as_ref().filter(|_| http && s.h2_ctx.is_none()) {
+                Some(t) => {
+                    let pending = s.has_pending_output();
+                    let cli = if s.cli_exp.is_set() { s.cli_exp } else { Tick::ETERNITY };
+                    // Received whole: forwarded already, or all of it waits in the buffer.
+                    let req_done = {
+                        let mut m = t.req;
+                        m.advance(s.req.readable());
+                        m.is_done()
+                    };
+                    (
+                        if req_done || pending { Tick::ETERNITY } else { cli },
+                        if pending { cli } else { Tick::ETERNITY },
+                        if req_done && !pending { s.srv_exp } else { Tick::ETERNITY },
+                    )
+                }
+                None => (if s.cli_exp.is_set() { s.cli_exp } else { s.req_exp }, Tick::ETERNITY, s.srv_exp),
+            };
+            let timers = [cli_rex, cli_wex, srv_rex, s.conn_exp];
             let exp = timers.iter().copied().filter(|t| t.is_set()).reduce(Tick::earliest);
             out.push(SessSnap {
                 id: crate::mailbox::sess_id(wid, idx),
@@ -3554,7 +3578,8 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 cli_fd: e.cli_raw_fd,
                 srv_fd: e.srv_raw_fd.unwrap_or(-1),
                 cli_rex: rel(cli_rex),
-                srv_rex: rel(s.srv_exp),
+                srv_rex: rel(srv_rex),
+                cli_wex: rel(cli_wex),
                 exp: exp.and_then(rel),
                 c_exp: rel(s.conn_exp),
                 retries: s.max_retries.saturating_sub(s.conn_retries),
@@ -3578,6 +3603,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 srv_fd: -1,
                 cli_rex: exp,
                 srv_rex: None,
+                cli_wex: None,
                 exp,
                 c_exp: None,
                 retries: 0,
