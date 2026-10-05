@@ -126,3 +126,16 @@ fn rewrite_regexes_are_not_compiled_per_request() {
                  http-request del-header X-Foo -m reg ^x-f";
     assert_eq!(compiles_per_request(rules, "/api/t", "HTTP/1.1 200"), (0, 0));
 }
+
+#[test]
+fn session_and_counter_expressions_are_not_parsed_per_request() {
+    // Measured on HAProxy 3.5-dev8: x-src 10.9.8.7, x-dst 10.1.2.3, x-g 8.
+    let rules = "  stick-table type ip size 10 store gpt0\n  \
+                 tcp-request session set-src str(10.9.8.7)\n  \
+                 tcp-request session set-dst str(10.1.2.3)\n  \
+                 http-request track-sc0 src\n  \
+                 http-request sc-set-gpt0(0) int(7),add(1)\n  \
+                 http-request return status 200 hdr x-src %[src] hdr x-dst %[dst] hdr x-g %[sc_get_gpt0(0)]";
+    let want = "HTTP/1.1 200 OK\r\nx-src: 10.9.8.7\r\nx-dst: 10.1.2.3\r\nx-g: 8\r\n";
+    assert_eq!(compiles_per_request(rules, "/", want), (0, 0));
+}
