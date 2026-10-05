@@ -11,8 +11,11 @@ mod common;
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::os::unix::net::UnixStream;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::{NamedTempFile, TempDir};
@@ -31,13 +34,16 @@ fn pattern(n: usize) -> Vec<u8> {
 
 /// An HTTP/1 server: reads the head, waits `stall`, reads `content-length` bytes of body,
 /// answers `ok` and sends the body to the test.
-fn server(stall: Duration) -> (SocketAddr, Receiver<Vec<u8>>) {
+fn server(stall: Duration) -> (SocketAddr, Receiver<Vec<u8>>, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
     let (tx, rx) = channel();
+    let seen = Arc::new(AtomicUsize::new(0));
+    let seen2 = seen.clone();
     thread::spawn(move || {
         for mut c in listener.incoming().flatten() {
             let tx = tx.clone();
+            let seen = seen2.clone();
             thread::spawn(move || {
                 c.set_read_timeout(Some(Duration::from_secs(10))).ok();
                 let mut got = Vec::new();
@@ -61,6 +67,7 @@ fn server(stall: Duration) -> (SocketAddr, Receiver<Vec<u8>>) {
                         break;
                     }
                     got.extend_from_slice(&buf[..n]);
+                    seen.store(got.len(), Ordering::SeqCst);
                 }
                 let at = got.windows(4).position(|w| w == b"\r\n\r\n").map_or(got.len(), |a| a + 4);
                 let _ = tx.send(got[at..].to_vec());
@@ -68,20 +75,28 @@ fn server(stall: Duration) -> (SocketAddr, Receiver<Vec<u8>>) {
             });
         }
     });
-    (addr, rx)
+    (addr, rx, seen)
 }
 
 fn start(stall: Duration) -> (Ibex, SocketAddr, SocketAddr, Receiver<Vec<u8>>) {
+    let (i, p, t, rx, _) = start_seen(stall);
+    (i, p, t, rx)
+}
+
+/// `start`, with the count of request bytes the server has read so far (head included).
+fn start_seen(stall: Duration) -> (Ibex, SocketAddr, SocketAddr, Receiver<Vec<u8>>, Arc<AtomicUsize>) {
     let dir = TempDir::new().expect("dir");
     let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("cert");
     let pem = dir.path().join("c.pem");
     std::fs::write(&pem, format!("{}{}", ck.cert.pem(), ck.key_pair.serialize_pem())).expect("pem");
     let (plain, tls) = (common::reserve_addr(), common::reserve_addr());
-    let (srv, rx) = server(stall);
+    let (srv, rx, seen) = server(stall);
+    let sock = dir.path().join("s.sock");
     let cfg = format!(
-        "defaults\n  mode http\n  timeout connect 1s\n  timeout client 3s\n  timeout server 3s\n\
+        "global\n  stats socket {} level admin\ndefaults\n  mode http\n  timeout connect 1s\n  timeout client 3s\n  timeout server 3s\n\
          frontend fe\n  bind {plain} proto h2\n  bind {tls} ssl crt {} alpn h2,http/1.1\n  default_backend be\n\
          backend be\n  server s {srv}\n",
+        sock.display(),
         pem.display()
     );
     let mut f = NamedTempFile::new().expect("tmp");
@@ -94,7 +109,17 @@ fn start(stall: Duration) -> (Ibex, SocketAddr, SocketAddr, Receiver<Vec<u8>>) {
     let child = cmd.arg("-f").arg(f.path()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn");
     let ibex = Ibex(child, f, dir);
     assert!(common::wait_listening(plain) && common::wait_listening(tls), "never listened:\n{cfg}");
-    (ibex, plain, tls, rx)
+    (ibex, plain, tls, rx, seen)
+}
+
+/// `show sess` on the instance's stats socket.
+fn show_sess(i: &Ibex) -> String {
+    let Ok(mut s) = UnixStream::connect(i.2.path().join("s.sock")) else { return "no stats socket".into() };
+    s.set_read_timeout(Some(Duration::from_secs(2))).ok();
+    let _ = s.write_all(b"show sess\n");
+    let mut out = String::new();
+    let _ = s.read_to_string(&mut out);
+    out
 }
 
 fn frame(kind: u8, flags: u8, sid: u32, payload: &[u8]) -> Vec<u8> {
@@ -117,11 +142,20 @@ fn literal(name: &str, value: &str) -> Vec<u8> {
 struct Outcome {
     ok: bool,
     sent_at_probe: usize,
+    /// Why the client stopped: `200`, `deadline`, `eof`, `rst <code>`, `goaway <code>`,
+    /// or the first HPACK byte of a HEADERS that was not `:status 200`.
+    why: String,
 }
 
 /// POST `body` over cleartext h2, sending DATA only as far as the server's windows allow.
 /// `my_window` is the SETTINGS_INITIAL_WINDOW_SIZE the client advertises (None: default).
 fn post(fe: SocketAddr, body: &[u8], my_window: Option<u32>, probe: Duration) -> Outcome {
+    post_snap(fe, body, my_window, probe, &String::new)
+}
+
+/// `post`, calling `snap` once at 2.5 s if no answer has come by then (before `timeout
+/// client` ends the connection), its text added to the reason.
+fn post_snap(fe: SocketAddr, body: &[u8], my_window: Option<u32>, probe: Duration, snap: &dyn Fn() -> String) -> Outcome {
     let mut s = TcpStream::connect(fe).expect("connect");
     s.set_read_timeout(Some(Duration::from_millis(20))).ok();
     s.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").expect("preface");
@@ -134,10 +168,16 @@ fn post(fe: SocketAddr, body: &[u8], my_window: Option<u32>, probe: Duration) ->
     s.write_all(&frame(1, 4, 1, &h)).expect("head");
     let (mut conn_win, mut stream_win, mut initial) = (65535i64, 65535i64, 65535i64);
     let (mut sent, mut at_probe, mut ok) = (0usize, None, false);
+    let mut why = String::from("deadline");
+    let mut seen = String::new();
     let (t0, deadline) = (Instant::now(), Instant::now() + Duration::from_secs(20));
     let mut buf: Vec<u8> = Vec::new();
     let mut tmp = vec![0u8; 65536];
+    let mut snapped = String::new();
     while Instant::now() < deadline && !ok {
+        if snapped.is_empty() && t0.elapsed() >= Duration::from_millis(2500) {
+            snapped = format!(" [at 2.5 s: {}]", snap());
+        }
         if at_probe.is_none() && t0.elapsed() >= probe {
             at_probe = Some(sent);
         }
@@ -152,7 +192,10 @@ fn post(fe: SocketAddr, body: &[u8], my_window: Option<u32>, probe: Duration) ->
             stream_win -= n as i64;
         }
         match s.read(&mut tmp) {
-            Ok(0) => break,
+            Ok(0) => {
+                why = "eof".into();
+                break;
+            }
             Ok(n) => buf.extend_from_slice(&tmp[..n]),
             Err(_) => {}
         }
@@ -164,6 +207,7 @@ fn post(fe: SocketAddr, body: &[u8], my_window: Option<u32>, probe: Duration) ->
             let (kind, flags, sid) = (buf[3], buf[4], u32::from_be_bytes([buf[5] & 0x7f, buf[6], buf[7], buf[8]]));
             let pl = buf[9..9 + len].to_vec();
             buf.drain(..9 + len);
+            seen.push_str(&format!("{kind}/{flags:x}/{sid}/{len}@{}ms ", t0.elapsed().as_millis()));
             match kind {
                 4 if flags & 1 == 0 => {
                     for c in pl.chunks(6) {
@@ -183,13 +227,34 @@ fn post(fe: SocketAddr, body: &[u8], my_window: Option<u32>, probe: Duration) ->
                         stream_win += inc;
                     }
                 }
-                1 if sid == 1 && pl.first() == Some(&0x88) => ok = true,
-                3 | 7 => return Outcome { ok: false, sent_at_probe: at_probe.unwrap_or(sent) },
+                1 if sid == 1 && pl.first() == Some(&0x88) => {
+                    ok = true;
+                    why = "200".into();
+                }
+                1 => why = format!("headers sid {sid} first byte {:?}", pl.first()),
+                3 | 7 => {
+                    let code = if kind == 3 { &pl[..4] } else { &pl[4..8] };
+                    let code = u32::from_be_bytes([code[0], code[1], code[2], code[3]]);
+                    let name = if kind == 3 { "rst" } else { "goaway" };
+                    let why = format!("{name} sid {sid} code {code} at {} ms; sent {sent}; frames: {seen}{snapped}", t0.elapsed().as_millis());
+                    return Outcome { ok: false, sent_at_probe: at_probe.unwrap_or(sent), why };
+                }
                 _ => {}
             }
         }
     }
-    Outcome { ok, sent_at_probe: at_probe.unwrap_or(sent) }
+    if !ok {
+        why = format!("{why} at {} ms; sent {sent}; conn_win {conn_win} stream_win {stream_win}; frames: {seen}{snapped}", t0.elapsed().as_millis());
+    }
+    Outcome { ok, sent_at_probe: at_probe.unwrap_or(sent), why }
+}
+
+/// On a failure: how much body the test's server had received, if it finished reading.
+fn server_saw(rx: &Receiver<Vec<u8>>) -> String {
+    match rx.try_recv() {
+        Ok(b) => format!("received {} body bytes and answered", b.len()),
+        Err(_) => "had not finished reading the body".into(),
+    }
 }
 
 fn expect_body(rx: &Receiver<Vec<u8>>, want: &[u8]) {
@@ -200,19 +265,21 @@ fn expect_body(rx: &Receiver<Vec<u8>>, want: &[u8]) {
 
 #[test]
 fn one_megabyte_cleartext_default_window() {
-    let (_i, plain, _tls, rx) = start(Duration::ZERO);
+    let (i, plain, _tls, rx, seen) = start_seen(Duration::ZERO);
     let body = pattern(1_000_000);
-    let o = post(plain, &body, None, Duration::from_secs(1));
-    assert!(o.ok, "no 200 (client had sent {} bytes at 1 s)", o.sent_at_probe);
+    let snap = || format!("server read {} bytes; show sess: {}", seen.load(Ordering::SeqCst), show_sess(&i));
+    let o = post_snap(plain, &body, None, Duration::from_secs(1), &snap);
+    assert!(o.ok, "no 200 (client had sent {} bytes at 1 s): {}; server: {}", o.sent_at_probe, o.why, server_saw(&rx));
     expect_body(&rx, &body);
 }
 
 #[test]
 fn one_megabyte_cleartext_small_client_window() {
-    let (_i, plain, _tls, rx) = start(Duration::ZERO);
+    let (i, plain, _tls, rx, seen) = start_seen(Duration::ZERO);
     let body = pattern(1_000_000);
-    let o = post(plain, &body, Some(1000), Duration::from_secs(1));
-    assert!(o.ok, "no 200 (client had sent {} bytes at 1 s)", o.sent_at_probe);
+    let snap = || format!("server read {} bytes; show sess: {}", seen.load(Ordering::SeqCst), show_sess(&i));
+    let o = post_snap(plain, &body, Some(1000), Duration::from_secs(1), &snap);
+    assert!(o.ok, "no 200 (client had sent {} bytes at 1 s): {}; server: {}", o.sent_at_probe, o.why, server_saw(&rx));
     expect_body(&rx, &body);
 }
 
@@ -239,11 +306,12 @@ fn one_megabyte_over_tls() {
 /// bounded), then the whole body still arrives.
 #[test]
 fn slow_server_applies_backpressure() {
-    let (_i, plain, _tls, rx) = start(Duration::from_millis(1500));
+    let (i, plain, _tls, rx, seen) = start_seen(Duration::from_millis(1500));
     let body = pattern(32_000_000);
-    let o = post(plain, &body, None, Duration::from_secs(1));
+    let snap = || format!("server read {} bytes; show sess: {}", seen.load(Ordering::SeqCst), show_sess(&i));
+    let o = post_snap(plain, &body, None, Duration::from_secs(1), &snap);
     eprintln!("sent at the 1 s probe, server not reading: {}", o.sent_at_probe);
     assert!(o.sent_at_probe < 16_000_000, "{} bytes buffered while the server did not read", o.sent_at_probe);
-    assert!(o.ok, "no 200");
+    assert!(o.ok, "no 200: {}", o.why);
     expect_body(&rx, &body);
 }
