@@ -272,13 +272,24 @@ pub(crate) fn parse_error_body_args(
                 content_type = Some(tokens[i + 1].text.clone());
                 i += 2;
             }
-            "lf-string" | "string" if i + 1 < limit => {
+            "lf-string" if i + 1 < limit => {
                 lf_string = Some(tokens[i + 1].text.clone());
                 i += 2;
             }
-            "file" | "lf-file" if i + 1 < limit => {
+            // `string` and `file` are literal in HAProxy: only the `lf-` forms are log-formats.
+            // The body is kept as a format, so a literal one has its `%` doubled.
+            "string" if i + 1 < limit => {
+                lf_string = Some(tokens[i + 1].text.replace('%', "%%"));
+                i += 2;
+            }
+            "lf-file" if i + 1 < limit => {
                 let path = &tokens[i + 1].text;
                 lf_string = Some(std::fs::read_to_string(path).unwrap_or_default());
+                i += 2;
+            }
+            "file" if i + 1 < limit => {
+                let path = &tokens[i + 1].text;
+                lf_string = Some(std::fs::read_to_string(path).unwrap_or_default().replace('%', "%%"));
                 i += 2;
             }
             "hdr" if i + 2 < limit => {
