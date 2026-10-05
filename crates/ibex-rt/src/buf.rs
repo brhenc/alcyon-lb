@@ -290,6 +290,10 @@ pub struct Buf {
 
 impl Drop for Buf {
     fn drop(&mut self) {
+        // Never allocated, or released: nothing to give back.
+        if self.data.is_empty() {
+            return;
+        }
         match self.class {
             BufClass::Standard => {
                 let data = std::mem::replace(&mut self.data, Box::new([]));
@@ -419,6 +423,53 @@ impl Buf {
         }
     }
 
+    /// A buffer of `class` that takes its memory from the pool only when something is
+    /// written to it (`b_alloc` on demand): a connection that has nothing in transit holds
+    /// none.
+    #[must_use]
+    pub fn unallocated(class: BufClass) -> Self {
+        Buf { data: Box::new([]), head: 0, len: 0, class }
+    }
+
+    /// Whether the buffer holds memory now.
+    #[must_use]
+    #[inline]
+    pub fn is_allocated(&self) -> bool {
+        !self.data.is_empty()
+    }
+
+    /// Gives the memory of an empty pooled buffer back to the thread's pool
+    /// (`b_free` once a mux's buffer is drained); the next write takes one again. A buffer
+    /// holding data, or of no pool class, is left alone.
+    pub fn release(&mut self) {
+        if self.len == 0 && !self.data.is_empty() && self.class != BufClass::Custom {
+            drop(std::mem::replace(self, Buf::unallocated(self.class)));
+        }
+    }
+
+    /// The capacity of the class: what the buffer holds once it has memory.
+    fn nominal(&self) -> usize {
+        match self.class {
+            BufClass::Standard => get_bufsize(),
+            BufClass::Small => get_bufsize_small(),
+            BufClass::Large => get_bufsize_large().unwrap_or(65536),
+            BufClass::Custom => 0,
+        }
+    }
+
+    #[inline]
+    pub fn alloc_if_needed(&mut self) {
+        if self.data.is_empty() {
+            self.data = match self.class {
+                BufClass::Standard => alloc_standard(),
+                BufClass::Small => alloc_small(),
+                BufClass::Large => alloc_large(),
+                BufClass::Custom => return,
+            };
+            self.head = 0;
+        }
+    }
+
     /// Returns the pool size class this buffer belongs to.
     #[must_use]
     #[inline]
@@ -434,6 +485,10 @@ impl Buf {
     pub fn promote_to_standard(&mut self) -> bool {
         if self.class != BufClass::Small {
             return false;
+        }
+        if self.data.is_empty() {
+            self.class = BufClass::Standard;
+            return true;
         }
 
         let mut new_data = alloc_standard();
@@ -470,6 +525,7 @@ impl Buf {
     /// Appends `bytes` to the buffer, automatically promoting from [`BufClass::Small`]
     /// to [`BufClass::Standard`] if needed to prevent truncation.
     pub fn put(&mut self, bytes: &[u8]) -> bool {
+        self.alloc_if_needed();
         if self.head > 0 && self.head + self.len + bytes.len() > self.data.len() {
             self.compact();
         }
@@ -499,13 +555,17 @@ impl Buf {
     #[must_use]
     #[inline]
     pub fn capacity(&self) -> usize {
-        self.data.len()
+        if self.data.is_empty() {
+            self.nominal()
+        } else {
+            self.data.len()
+        }
     }
 
     #[must_use]
     #[inline]
     pub fn is_full(&self) -> bool {
-        self.len == self.data.len()
+        self.len == self.capacity()
     }
 
     /// Returns a shared slice of the entire underlying buffer allocation.
@@ -519,6 +579,7 @@ impl Buf {
     #[must_use]
     #[inline]
     pub fn raw_slice_mut(&mut self) -> &mut [u8] {
+        self.alloc_if_needed();
         &mut self.data
     }
 
@@ -541,6 +602,7 @@ impl Buf {
 
     /// Contiguous space available to write into, compacting or promoting if necessary.
     pub fn writable(&mut self) -> &mut [u8] {
+        self.alloc_if_needed();
         if self.head > 0 && self.head + self.len == self.data.len() {
             self.compact();
         }
@@ -554,6 +616,7 @@ impl Buf {
     /// Ensures contiguous writable space of at least `needed` bytes exists,
     /// compacting and/or promoting a small buffer to standard if necessary.
     pub fn ensure_writable(&mut self, needed: usize) -> &mut [u8] {
+        self.alloc_if_needed();
         if self.head > 0 && self.data.len().saturating_sub(self.head + self.len) < needed {
             self.compact();
         }
@@ -600,6 +663,7 @@ impl Buf {
     /// grows by what the rewrite added. Later reads then see the extra room as ordinary
     /// space and the body behind the head stays intact.
     fn grow_to(&mut self, min: usize) {
+        self.alloc_if_needed();
         if self.class == BufClass::Small && min > self.data.len() {
             self.promote_to_standard();
         }
@@ -617,6 +681,7 @@ impl Buf {
     /// Replaces the leading `old_len` bytes in the readable portion of the buffer
     /// with `new_data`. The remainder is never truncated: the buffer grows if needed.
     pub fn replace_prefix(&mut self, old_len: usize, new_data: &[u8]) {
+        self.alloc_if_needed();
         let old_len = old_len.min(self.len);
         let rem_len = self.len - old_len;
         let needed = new_data.len() + rem_len;
@@ -660,6 +725,7 @@ impl Buf {
     ///
     /// Returns `true` if successful, or `false` if the buffer is malformed.
     pub fn remove_http_header(&mut self, name: &str) -> bool {
+        self.alloc_if_needed();
         if self.head > 0 {
             self.data.copy_within(self.head..self.head + self.len, 0);
             self.head = 0;

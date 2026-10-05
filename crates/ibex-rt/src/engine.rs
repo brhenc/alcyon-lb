@@ -5719,8 +5719,9 @@ fn release_server(
             && entry.sess.srv_xprt.is_ready()
             && proxies
                 .get(entry.srv_backend_idx)
-                .is_some_and(|p| p.http_reuse != ibex_config::HttpReuse::Never)
-            && raw::is_idle_conn_alive(srv_fd.as_fd());
+                .is_some_and(|p| p.http_reuse != ibex_config::HttpReuse::Never);
+        // Whether the server has closed it since is checked when it is taken
+        // (`WorkerPool::take`): not here as well, a syscall on every response.
         // The pool is keyed by server; a server that maps the destination may have been
         // connected anywhere, so its connections are not pooled.
         let xprt = std::mem::replace(&mut entry.sess.srv_xprt, crate::xprt::ServerXprt::Plain);
@@ -6712,11 +6713,19 @@ impl EngineDispatcher<'_> {
             close_http_session(entry, proxies, fdtab, poller, idle_pool, reusable);
             return;
         }
-        if !reusable {
-            release_server(entry, proxies, fdtab, poller, idle_pool, false);
+        // The server connection leaves the session with the response (`h1_detach`): into
+        // the server's lists, which may close it (`srv_add_to_idle_list`), so a client that
+        // idles holds no server connection (T187: 10 idle clients, one backend connection
+        // in HAProxy). A next request already in the buffer keeps it: it is not a first
+        // request, and the pool would hand it straight back (`connect_http_backend`).
+        // Under `http-reuse never` the connection is the session's own (`session_add_conn`)
+        // and stays on it; so does one opened with a PROXY header, whose reuse key is the
+        // header (it names this client's addresses), which the pool does not key by.
+        let private = entry.sess.send_proxy_prepended
+            || proxies.get(entry.srv_backend_idx).is_some_and(|p| p.http_reuse == ibex_config::HttpReuse::Never);
+        if !reusable || (entry.sess.req.is_empty() && !private) {
+            release_server(entry, proxies, fdtab, poller, idle_pool, reusable);
         }
-        // A reusable server connection stays on the session for the next request, which
-        // takes it if routing sends it to the same server (`connect_http_backend`).
         entry.sess.reset_for_next_request();
         entry.stats_done = false;
         // The wait for the next request starts with the response's end

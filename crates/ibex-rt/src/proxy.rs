@@ -323,7 +323,7 @@ pub struct TcpSession {
     /// them in `conn_complete_session`, after the handshake, so `src` and `fc_pp_tlv`
     /// read the header.
     pub session_rules_pending: bool,
-    pub proxy_info: Option<ibex_proto::ProxyInfo>,
+    pub proxy_info: Option<Box<ibex_proto::ProxyInfo>>,
     pub server_addr: Option<SocketAddr>,
     pub send_proxy_prepended: bool,
     /// The PROXY header the server connection opened with, if any: a later request reuses
@@ -369,7 +369,7 @@ pub struct TcpSession {
     pub stick_stores: Vec<(usize, StickKey)>,
     pub bufsize: usize,
     pub maxrewrite: usize,
-    pub h2_ctx: Option<H2MuxContext>,
+    pub h2_ctx: Option<Box<H2MuxContext>>,
     /// The first GOAWAY of an HTTP/2 `timeout client` has gone: the next expiry closes.
     pub h2_idle_goaway: bool,
     pub h2_active_stream_id: Option<u32>,
@@ -568,15 +568,15 @@ impl TcpSession {
             req_uri: None,
             req_method: None,
             req_headers: None,
-            htx_buf: Buf::standard(),
+            htx_buf: Buf::unallocated(crate::buf::BufClass::Standard),
             htx_tail: 0,
             htx_blocks: 0,
             has_htx: false,
             htx_modified: false,
             cli_state,
             srv_state: ScState::Init,
-            req: Buf::standard(),
-            rep: Buf::standard(),
+            req: Buf::unallocated(crate::buf::BufClass::Standard),
+            rep: Buf::unallocated(crate::buf::BufClass::Standard),
             timeouts,
             timeouts_set: None,
             be_tunnel_ms: 0,
@@ -684,6 +684,7 @@ impl TcpSession {
     /// descriptors at the end, as they were.
     pub fn htx_reserve(&mut self, bytes: usize) {
         use ibex_proto::htx::HTX_DESC_SIZE;
+        self.htx_buf.alloc_if_needed();
         let len = self.htx_buf.raw_slice().len();
         let descs = self.htx_blocks * HTX_DESC_SIZE;
         let free = len.saturating_sub(descs).saturating_sub(self.htx_tail);
@@ -1109,6 +1110,22 @@ impl TcpSession {
         self.stick_stores.clear();
         self.is_first_req = false;
         self.cli_state = ScState::Ready;
+        self.release_idle_buffers();
+    }
+
+    /// Gives back the buffers that hold nothing (`h1_release_buf`): a connection waiting
+    /// for its next request holds no buffer (T183). An HTX grown past its class goes too;
+    /// the next message starts from a pooled one.
+    pub fn release_idle_buffers(&mut self) {
+        self.req.release();
+        self.rep.release();
+        if !self.has_htx {
+            if self.htx_buf.class() == crate::buf::BufClass::Custom {
+                self.htx_buf = Buf::unallocated(crate::buf::BufClass::Standard);
+            } else {
+                self.htx_buf.release();
+            }
+        }
     }
 
     /// Discards the body of a request the proxy has already answered, as it arrives, up
@@ -1195,7 +1212,7 @@ impl TcpSession {
         if let Some(dst) = info.dst_sockaddr() {
             self.server_addr = Some(dst);
         }
-        self.proxy_info = Some(info);
+        self.proxy_info = Some(Box::new(info));
         self.proxy_handshake_done = true;
         self.cli_state = if self.mode == Mode::Http { ScState::Ready } else { ScState::Established };
         true
@@ -1282,7 +1299,7 @@ impl TcpSession {
             if self.h2_ctx.is_none() {
                 let mut h2 = H2MuxContext::new(ibex_proto::conn::ConnId(0), true);
                 h2.flood_config = self.h2_flood_config;
-                self.h2_ctx = Some(h2);
+                self.h2_ctx = Some(Box::new(h2));
             }
             if self.cli_state.can_read() && !self.cli_cant_recv {
                 let mut raw_buf = [0u8; 16384];
@@ -1345,7 +1362,9 @@ impl TcpSession {
                         self.log.first_byte_now();
                         changed = true;
                     }
-                    Io::Done(_) | Io::WouldBlock => {}
+                    // Nothing came: the buffer taken for the read goes back
+                    // (`h1_release_buf`), so a connection that has sent nothing yet holds none.
+                    Io::Done(_) | Io::WouldBlock => self.req.release(),
                 }
             }
 
@@ -1356,7 +1375,7 @@ impl TcpSession {
                 let to_parse = self.req.readable().to_vec();
                 let _ = MuxH2.parse(&mut h2, &to_parse)?;
                 self.req.clear();
-                self.h2_ctx = Some(h2);
+                self.h2_ctx = Some(Box::new(h2));
                 changed = true;
             }
         }

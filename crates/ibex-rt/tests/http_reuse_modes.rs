@@ -502,3 +502,86 @@ fn pool_purge_delay_and_pool_low_conn_are_checked_at_load_and_not_called_ignored
         }
     }
 }
+
+/// `n` client connections one after the other, each sending one request and then staying
+/// open and idle; then a second request on the first of them. Returns the backend
+/// connections still open while the clients idle, and the backend connection that carried
+/// each request.
+fn idle_clients(nbthread: usize, n: usize) -> (usize, Vec<usize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind backend");
+    let be = listener.local_addr().expect("addr");
+    let open = Arc::new(AtomicUsize::new(0));
+    let open2 = Arc::clone(&open);
+    thread::spawn(move || {
+        let count = AtomicUsize::new(0);
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let id = count.fetch_add(1, Ordering::SeqCst) + 1;
+            let open = Arc::clone(&open2);
+            open.fetch_add(1, Ordering::SeqCst);
+            thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = s.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    let rsp = format!("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nX-Conn: {id}\r\n\r\n");
+                    if s.write_all(rsp.as_bytes()).is_err() {
+                        break;
+                    }
+                }
+                open.fetch_sub(1, Ordering::SeqCst);
+            });
+        }
+    });
+    let fe = common::reserve_addr();
+    let _ibex = start(
+        &format!(
+            "global\n  nbthread {nbthread}\ndefaults\n  mode http\n  timeout connect 2s\n  timeout client 30s\n  timeout server 30s\n\
+             listen sender\n  bind {fe}\n  server srv {be}\n"
+        ),
+        fe,
+    );
+    let ask = |c: &mut TcpStream| -> usize {
+        c.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        let mut resp = Vec::new();
+        let mut buf = [0u8; 4096];
+        while !resp.windows(4).any(|w| w == b"\r\n\r\n") {
+            match c.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => resp.extend_from_slice(&buf[..n]),
+            }
+        }
+        let resp = String::from_utf8_lossy(&resp).to_ascii_lowercase();
+        resp.split("x-conn: ").nth(1).and_then(|r| r.split("\r\n").next()).and_then(|n| n.trim().parse().ok()).expect("answer")
+    };
+    let mut clients = Vec::new();
+    let mut ids = Vec::new();
+    for _ in 0..n {
+        let mut c = TcpStream::connect(fe).expect("connect");
+        c.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        ids.push(ask(&mut c));
+        clients.push(c);
+        thread::sleep(Duration::from_millis(20));
+    }
+    thread::sleep(Duration::from_millis(300));
+    let still_open = open.load(Ordering::SeqCst);
+    ids.push(ask(&mut clients[0]));
+    (still_open, ids)
+}
+
+/// T187, measured on HAProxy (`http-reuse safe`, 10 sequential clients, each one request
+/// then idle): every first request opens its own connection, but after its response the
+/// connection goes back to the server's lists, which keep one per thread
+/// (`srv_add_to_idle_list`) and close the rest: 1 backend connection left at `nbthread 1`
+/// (the first, which the first client's next request takes), at most 4 at `nbthread 4`.
+/// A client that idles does not hold a server connection.
+#[test]
+fn an_idle_client_does_not_hold_a_server_connection() {
+    let (open, ids) = idle_clients(1, 10);
+    assert_eq!(ids, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 1]);
+    assert_eq!(open, 1);
+    let (open, ids) = idle_clients(4, 10);
+    assert_eq!(&ids[..10], [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    assert!(open <= 4, "{open} backend connections held by 10 idle clients");
+}
