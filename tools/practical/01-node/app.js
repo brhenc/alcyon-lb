@@ -27,6 +27,11 @@ const server = http.createServer((req, res) => {
   if (p === '/ka') {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     res.end('hello from node\n');
+  } else if (p === '/headers') {
+    // Echo what the app saw (used by topologies 02 and 04).
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ xff: req.headers['x-forwarded-for'] || null,
+      host: req.headers['host'] || null, peer: req.socket.remoteAddress }) + '\n');
   } else if (p === '/upload') {
     // Reads the whole body (any framing), answers with its sha256 and size.
     const h = crypto.createHash('sha256'); let n = 0;
