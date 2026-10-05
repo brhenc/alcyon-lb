@@ -717,8 +717,15 @@ impl TcpSession {
             || self.h2_ctx.as_ref().is_some_and(|h| h.tx_consumed < h.tx_buf.len())
     }
 
+    /// A stream with its request in, waiting for its turn, and the turn free: streams
+    /// go one at a time, so while one is served the others wait for its end (`end_txn`
+    /// runs the session again then). Counting them while one was at the server had the
+    /// session requeue itself on every pass, a busy loop as long as the server took (T186).
     #[must_use]
     pub fn has_undispatched_h2_streams(&self) -> bool {
+        if self.h2_active_stream_id.is_some() || self.txn.is_some() {
+            return false;
+        }
         if let Some(ref h2) = self.h2_ctx {
             h2.streams.values().any(|st| {
                 !st.dispatched
@@ -1000,8 +1007,10 @@ impl TcpSession {
     }
 
     /// Whether the client side keeps `cli_cant_recv` (see `srv_cant_recv` for the rule).
+    /// Over TLS too, since T186: the transport knows whether its socket was emptied
+    /// ([`crate::xprt::ClientXprt::drained`]).
     fn polls_cli(&self) -> bool {
-        self.mode == Mode::Http && !self.cli_xprt.is_tls()
+        self.mode == Mode::Http
     }
 
     /// Writes `raw` to the client once, best effort, on a connection about to be closed:
@@ -1096,6 +1105,12 @@ impl TcpSession {
         self.req_uri = None;
         self.req_headers = None;
         self.clear_htx();
+        // The streams that are over are let go, as `HAProxy` frees a stream when it closes
+        // (`h2s_destroy`). Kept, each held its request for the life of the connection and
+        // every request walked all of them: 88% of the CPU of an h2 request (T186).
+        if let Some(h2) = self.h2_ctx.as_mut() {
+            h2.streams.retain(|_, s| !matches!(s.state, ibex_proto::H2StreamState::Closed | ibex_proto::H2StreamState::Reset(_)));
+        }
         self.h2_active_stream_id = None;
         self.h2_body = H2ReqBody::default();
         self.h2_chunk_out = false;
@@ -1287,7 +1302,7 @@ impl TcpSession {
             if self.cli_state.can_read() && !self.cli_cant_recv {
                 let mut raw_buf = [0u8; 16384];
                 let r = self.cli_xprt.recv(self.cli.as_fd(), &mut raw_buf)?;
-                self.cli_cant_recv = self.polls_cli() && drained(r, raw_buf.len());
+                self.cli_cant_recv = self.polls_cli() && self.cli_xprt.drained(r, raw_buf.len());
                 match r {
                     Io::Eof => {
                         raw::shutdown_read(self.cli.as_fd());
@@ -1320,7 +1335,7 @@ impl TcpSession {
                 let dst = self.req.writable();
                 let asked = dst.len();
                 let r = self.cli_xprt.recv(self.cli.as_fd(), dst)?;
-                self.cli_cant_recv = self.polls_cli() && drained(r, asked);
+                self.cli_cant_recv = self.polls_cli() && self.cli_xprt.drained(r, asked);
                 match r {
                     // The client left before a byte of the PROXY header.
                     Io::Eof if self.awaiting_proxy_header() => self.refuse_proxy_header(ProxyHdrError::Empty),
