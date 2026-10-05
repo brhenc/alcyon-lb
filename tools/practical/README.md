@@ -31,6 +31,24 @@ Cases: keep-alive (one connection for two requests), 100 MB chunked upload (sha2
 download (sha256), SSE (events arrive one per second, first byte at once), WebSocket echo
 (text and 1 MB binary), 5 s slow response, backend 503 passthrough, backend-made gzip.
 
+## 05-node-cluster: 3 x node.js, roundrobin + health checks
+
+Needs `node`, `curl`, `socat` (no npm packages, no wrk: the load is `load.js`). Build Ibex with
+`CARGO_TARGET_DIR=/home/bhenc/ibex-targets/t181 CARGO_INCREMENTAL=0 cargo build --release --bin ibex`.
+
+    cd tools/practical/05-node-cluster
+    ./run.sh               # against Ibex
+    ./run.sh --haproxy     # against HAProxy (oracle)
+
+Takes about 80 s. `proxy.cfg`: `option httpchk`, `inter 500ms fall 2 rise 2`, `retries 3` and
+`option redispatch 1`, and a second backend with `cookie SRV insert indirect nocache`. Cases: baseline
+under load, kill one node by PID (DOWN within inter*fall + 500 ms, no errors from requests started
+after that, only the two others serve), start it again (UP within inter*rise + 500 ms, no traffic
+before UP, no errors), rolling restart of all three, cookie persistence (sessions stay; those of a
+killed server move once and stay; nobody moves back; new sessions use the returned server). The
+run ends with the `show stat` status changes over time. Ports 23001-23003 (nodes), 23080-23081
+(proxy); other agents' HAProxy processes bind 180xx with SO_REUSEPORT, so avoid those.
+
 ## Adding a topology (nginx, apache2, ...)
 
 1. Copy `01-node` to `NN-name`; keep `app.js` if node stays at the back.
