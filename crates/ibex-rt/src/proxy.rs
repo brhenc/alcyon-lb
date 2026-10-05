@@ -1318,13 +1318,12 @@ impl TcpSession {
         // For H2 connections (negotiated via ALPN or active H2 context), decrypted bytes
         // are fed directly into the H2 mux so they do not contaminate `self.req` (which
         // holds the HTTP/1 wire request forwarded to the backend server).
-        let is_h2 = self.h2_ctx.is_some() || self.cli_xprt.alpn() == Some(b"h2");
+        // The H2 context is created when the client's preface is seen (below), as `HAProxy`
+        // starts its mux with it: after ALPN `h2`, a client that has sent nothing is sent
+        // nothing either (measured). The creation on ALPN alone that stood here no test could
+        // reach, and it changed nothing a client could see (T217).
+        let is_h2 = self.h2_ctx.is_some();
         if is_h2 {
-            if self.h2_ctx.is_none() {
-                let mut h2 = H2MuxContext::new(ibex_proto::conn::ConnId(0), true);
-                h2.flood_config = self.h2_flood_config;
-                self.h2_ctx = Some(Box::new(h2));
-            }
             if self.cli_state.can_read() && !self.cli_cant_recv {
                 let mut raw_buf = [0u8; 16384];
                 let r = self.cli_xprt.recv(self.cli.as_fd(), &mut raw_buf)?;
@@ -2735,6 +2734,12 @@ mod tests {
         s.release_idle_buffers();
         assert_eq!(s.htx_buf.class(), crate::buf::BufClass::Standard);
         assert!(s.htx_buf.raw_slice().is_empty(), "the replacement holds no memory");
+        // a pooled one that was used is emptied in place and keeps its class
+        s.htx_buf.alloc_if_needed();
+        assert!(!s.htx_buf.raw_slice().is_empty());
+        s.release_idle_buffers();
+        assert!(s.htx_buf.raw_slice().is_empty());
+        assert_eq!(s.htx_buf.class(), crate::buf::BufClass::Standard);
     }
 
     /// The last chunk is not split: with less than its five bytes of room, nothing is

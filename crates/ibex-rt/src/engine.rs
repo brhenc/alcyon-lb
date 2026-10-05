@@ -230,9 +230,8 @@ impl WorkerPool {
 
     /// Closes every idle connection whose peer has gone: EOF, a reset, or bytes nobody asked
     /// for (`HAProxy` subscribes an idle connection for reads and closes it on any of them).
-    /// Returns the number closed per server.
-    fn drop_dead(&mut self) -> Vec<((usize, usize), usize)> {
-        let mut gone = Vec::new();
+    /// Reports the number closed per server to `gone`: nothing is allocated.
+    fn drop_dead(&mut self, mut gone: impl FnMut((usize, usize), usize)) {
         for (&srv, s) in &mut self.servers {
             let before = s.conns.len();
             s.conns.retain(|p| {
@@ -245,10 +244,9 @@ impl WorkerPool {
             let n = before - s.conns.len();
             if n > 0 {
                 self.conns -= n;
-                gone.push((srv, n));
+                gone(srv, n);
             }
         }
-        gone
     }
 
     /// `srv_cleanup_idle_conns`, for every server whose purge is due at `now`: half the
@@ -436,14 +434,10 @@ impl IdlePool {
         }
         let slot = &self.pools.slots[self.wid];
         let mut pool = IdlePools::lock(slot);
-        let gone = pool.drop_dead();
+        pool.drop_dead(|srv, n| self.pools.count_idle(srv, 0, n));
         slot.conns.store(pool.conns, Ordering::Relaxed);
         self.next_purge = pool.next_purge();
         self.next_sweep = (pool.conns != 0).then(|| now + IDLE_SWEEP);
-        drop(pool);
-        for (srv, n) in gone {
-            self.pools.count_idle(srv, 0, n);
-        }
     }
 
     /// See [`WorkerPool::keep`]; into this worker's slot.
@@ -582,6 +576,20 @@ mod shared_pool_tests {
             w0.purge(t0 + Duration::from_secs(1), |_| 0);
             assert_eq!(w0.next_purge().is_none(), shared);
         }
+    }
+
+    /// The purge of a server restarts its peak of connections in use from the connections in
+    /// use at that moment (`srv->max_used_conns = srv->curr_used_conns`).
+    #[test]
+    fn a_purge_restarts_the_servers_peak_from_the_connections_in_use() {
+        let t0 = Instant::now();
+        let pools = IdlePools::with(1, true);
+        let mut w = pools.worker(0);
+        let (c, _p) = alive();
+        assert!(w.keep(key(), c, false, CFG, 5, t0).is_ok());
+        assert_eq!(pools.srv_seen(key().srv, 0).1, 5);
+        w.purge(t0 + Duration::from_millis(500), |_| 2);
+        assert_eq!(pools.srv_seen(key().srv, 0).1, 2);
     }
 
     /// A sweep closes the idle connections whose peer closed, or sent bytes, and keeps the
