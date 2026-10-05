@@ -50,6 +50,12 @@ pub fn acquire() {
     CURR.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Takes a slot if there is one, atomically: false when `global maxconn` is reached.
+pub fn try_acquire() -> bool {
+    let max = MAX.load(Ordering::Relaxed);
+    CURR.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| (max == 0 || c < max).then_some(c + 1)).is_ok()
+}
+
 /// A client connection closed.
 pub fn release() {
     let _ = CURR.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| Some(c.saturating_sub(1)));

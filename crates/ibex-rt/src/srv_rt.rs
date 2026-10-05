@@ -11,6 +11,65 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::atomic::{fence, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
+/// A frontend's connection limit and the connections it holds, shared by every worker and
+/// listener of the proxy: `maxconn N` is a total over all threads (`feconn` against
+/// `maxconn` in `HAProxy`), and `set maxconn frontend` changes it for all of them.
+#[derive(Debug, Clone, Default)]
+pub struct ConnLimit(Arc<(AtomicU32, AtomicU32)>);
+
+impl ConnLimit {
+    #[must_use]
+    pub fn get(&self) -> u32 {
+        self.0 .0.load(Ordering::Relaxed)
+    }
+
+    pub fn set(&self, v: u32) {
+        self.0 .0.store(v, Ordering::Relaxed);
+    }
+
+    /// Connections currently counted against the limit, over all workers.
+    #[must_use]
+    pub fn conns(&self) -> u32 {
+        self.0 .1.load(Ordering::Relaxed)
+    }
+
+    pub fn inc(&self) {
+        self.0 .1.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Takes a slot if there is one, atomically (workers racing on a check then an `inc`
+    /// would overshoot the limit by one each).
+    pub fn try_inc(&self) -> bool {
+        let max = self.get();
+        self.0 .1.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| (max == 0 || c < max).then_some(c + 1)).is_ok()
+    }
+
+    pub fn dec(&self) {
+        let _ = self.0 .1.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| Some(c.saturating_sub(1)));
+    }
+
+    /// True when the limit is set (non-zero) and reached.
+    #[must_use]
+    pub fn is_full(&self) -> bool {
+        let max = self.get();
+        max != 0 && self.conns() >= max
+    }
+}
+
+impl std::fmt::Display for ConnLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.get().fmt(f)
+    }
+}
+
+impl From<u32> for ConnLimit {
+    fn from(v: u32) -> Self {
+        let l = Self::default();
+        l.set(v);
+        l
+    }
+}
+
 /// One `u32` shared by every worker: a proxy's `maxconn`, which its listeners read too.
 #[derive(Debug, Clone, Default)]
 pub struct SharedU32(Arc<AtomicU32>);
