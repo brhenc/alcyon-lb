@@ -46,6 +46,12 @@ fn a_condition_nested_too_deep_is_unparsable() {
     assert!(check(parens(340).as_bytes()).0);
     let (ok, err) = check(parens(341).as_bytes());
     assert!(!ok && err.contains("unparsable conditional sub-expression '1)))") && err.contains("in '.if' at position 342:"), "{err}");
+    // Shifted by one `&&`, the 341st parenthesis is entered with no depth left for its `expr`.
+    let shifted = |n: usize| format!(".if 1&&{}1{}\n.alert hit\n.endif\n", "(".repeat(n), ")".repeat(n));
+    let (ok, err) = check(shifted(340).as_bytes());
+    assert!(!ok && err.contains("'hit'."), "{err}");
+    let (ok, err) = check(shifted(341).as_bytes());
+    assert!(!ok && err.contains("unparsable conditional expression '1)))") && err.contains("in '.if' at position 345:"), "{err}");
     for op in ["||", "&&"] {
         assert!(check(chain(op, 1022).as_bytes()).0, "{op} x1022");
         let (ok, err) = check(chain(op, 1023).as_bytes());
@@ -68,6 +74,13 @@ fn a_backslash_escape_in_an_argument_is_the_control_character() {
     assert!(hit("streq(a\\\\ b,\"a b\")"), "an escaped space");
     assert!(hit("streq(a\\\\\\\\b,a\\\\b)"), "an escaped backslash");
     assert!(hit("streq(a\\\\zb,a\\\\zb)"), "a lone backslash");
+    // Quotes the tokenizer let through (`\"` and `\'` in the file): a quoted comma or space
+    // does not end the argument, and the other kind of quote is an ordinary character.
+    assert!(hit("streq(a\\\"b,c\\\",a\\\"b,c\\\")"), "double quotes");
+    assert!(hit("streq(a\\\"b,c\\\",\\'ab,c\\')"), "a double-quoted comma against a single-quoted one");
+    assert!(hit("streq(\\'a\\\"b,c\\',\\'a\\\"b,c\\')"), "a double quote inside single quotes");
+    assert!(hit("streq(a\\\"b c\\\",\\'ab c\\')"), "a quoted space");
+    assert!(!hit("streq(a\\'b,c\\',ab)"), "a single-quoted comma is part of the argument");
     assert!(!hit("streq(a,b)"), "different strings");
 }
 

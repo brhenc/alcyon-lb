@@ -456,8 +456,8 @@ backend be
         String::from_utf8_lossy(&resp).into_owned()
     };
 
-    assert_eq!(execute_cmd("clear counters server nosuch/s1\n"), "No such backend.\n");
-    assert_eq!(execute_cmd("clear counters server be/nosuch\n"), "No such server.\n");
+    assert_eq!(execute_cmd("clear counters server nosuch/s1\n"), "No such backend.\n\n");
+    assert_eq!(execute_cmd("clear counters server be/nosuch\n"), "No such server.\n\n");
     
     let info = execute_cmd("show info nonexistent\n");
     assert!(info.starts_with("Name: Ibex"), "show info nonexistent should return info dump");

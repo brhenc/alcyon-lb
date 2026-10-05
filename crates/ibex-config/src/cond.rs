@@ -192,10 +192,9 @@ impl<'a> Parser<'a> {
         if depth <= 0 {
             return Err(self.err(format!("unparsable conditional sub-expression '{}'", self.rest(i)), i));
         }
-        let left = self.term(&mut i, depth - 1)?;
-        let Some(left) = left else {
-            return Err(self.err(format!("unparsable conditional sub-expression '{}'", self.rest(i)), i));
-        };
+        let left = self
+            .term(&mut i, depth - 1)?
+            .ok_or_else(|| self.err(format!("unparsable conditional sub-expression '{}'", self.rest(i)), i))?;
         i = self.blanks(i);
         *text = i;
         if !self.rest(i).starts_with("&&") {
