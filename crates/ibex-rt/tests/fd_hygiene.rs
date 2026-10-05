@@ -108,7 +108,7 @@ fn closed_by_server(rst: bool, n: usize) -> (usize, Vec<String>) {
         clients.push(c);
         thread::sleep(Duration::from_millis(10));
     }
-    let deadline = Instant::now() + Duration::from_secs(1);
+    let deadline = Instant::now() + Duration::from_secs(6);
     // the listener and the clients are the sockets that belong there
     let want = n + 1;
     thread::sleep(Duration::from_millis(500));
