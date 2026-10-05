@@ -10,6 +10,10 @@ use super::*;
 pub struct DefaultServerConfig {
     pub check: bool,
     pub inter: Option<Duration>,
+    /// `fastinter`: the interval while the server changes state.
+    pub fastinter: Option<Duration>,
+    /// `downinter`: the interval while the server is down.
+    pub downinter: Option<Duration>,
     pub fall: Option<u32>,
     pub rise: Option<u32>,
     pub send_proxy: bool,
@@ -315,7 +319,8 @@ impl Default for Server {
     }
 }
 
-/// A server's idle connection settings.
+/// A server's idle connection settings and check pacing (`fastinter`, `downinter`): the
+/// per-server settings most servers leave alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ServerPool {
     /// `pool-max-conn`: the most idle connections kept for this server; -1 is unlimited
@@ -327,15 +332,32 @@ pub struct ServerPool {
     /// `pool-purge-delay` in milliseconds: how often the idle connections beyond the need
     /// are purged; 0 keeps none. 5000 by default.
     pub purge_delay: u32,
+    /// `fastinter` in milliseconds: the check interval while the server changes state; 0 is
+    /// `inter`. Kept here, boxed, because `Server`'s size is bounded (`struct_sizes.rs`).
+    pub fastinter_ms: u32,
+    /// `downinter` in milliseconds: the check interval while the server is down; 0 is `inter`.
+    pub downinter_ms: u32,
 }
 
 impl Default for ServerPool {
     fn default() -> Self {
-        Self { max_conn: -1, low_conn: 0, purge_delay: 5000 }
+        Self { max_conn: -1, low_conn: 0, purge_delay: 5000, fastinter_ms: 0, downinter_ms: 0 }
     }
 }
 
 impl Server {
+    /// `fastinter`, 0 when unset.
+    #[must_use]
+    pub fn fastinter_ms(&self) -> u32 {
+        self.pool.as_ref().map_or(0, |p| p.fastinter_ms)
+    }
+
+    /// `downinter`, 0 when unset.
+    #[must_use]
+    pub fn downinter_ms(&self) -> u32 {
+        self.pool.as_ref().map_or(0, |p| p.downinter_ms)
+    }
+
     #[must_use]
     pub fn new(id: impl Into<String>, addr: SocketAddr) -> Self {
         Self {

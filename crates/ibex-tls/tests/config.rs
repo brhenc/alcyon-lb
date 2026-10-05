@@ -19,6 +19,7 @@ fn generate_pem(sans: Vec<String>) -> (String, rustls::pki_types::CertificateDer
 
 fn default_bind() -> BindConfig {
     BindConfig {
+        sock: None,
         addr: "127.0.0.1:443".parse().unwrap(),
         quic: false, ssl: true,
         crt: vec![],
@@ -268,6 +269,7 @@ mod alpn {
 
     fn bind_with(alpn: Vec<String>, crt: String) -> BindConfig {
         BindConfig {
+            sock: None,
             addr: "127.0.0.1:8443".parse().expect("addr"),
             quic: false, ssl: true,
             crt: vec![crt],
@@ -336,6 +338,7 @@ mod versions {
         let path = dir.path().join("c.pem");
         std::fs::write(&path, super::common::generate_test_cert_bundle_pem(vec!["localhost".to_string()])).expect("write");
         let b = BindConfig {
+            sock: None,
             addr: "127.0.0.1:8443".parse().expect("addr"),
             quic,
             ssl: true,

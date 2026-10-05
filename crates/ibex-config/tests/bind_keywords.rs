@@ -12,8 +12,9 @@
 //! * `bind 127.0.0.1:1 ssl` with no `crt` loads (the failure comes at start).
 //!
 //! `haproxy -dKall` lists the other keywords; Ibex refuses those it does not implement
-//! when running without them would change security or who may connect, and ignores the
-//! rest with a warning.
+//! when running without them would change security or who may connect. T207: the rest
+//! are refused too, unless they reach the socket (`backlog`, `v6only`, `v4v6`, `tcp-ut`,
+//! `cc`) or are a no-op (`thread all`).
 
 use ibex_config::{parse_str, Config, ConfigError};
 
@@ -105,16 +106,20 @@ fn unimplemented_security_keywords_are_refused_in_both_sections() {
 }
 
 #[test]
-fn tuning_keywords_are_accepted_and_their_argument_is_skipped() {
+fn tuning_keywords_are_read_and_their_argument_is_skipped() {
     // `name` and `backlog` take an argument: `ssl` after it must still be read.
     for f in [in_listen, in_frontend] {
-        let cfg = f("bind 127.0.0.1:8080 name web backlog 100 tfo defer-accept ssl crt /tmp/c.pem").unwrap();
+        let cfg = f("bind 127.0.0.1:8080 name web backlog 100 v4v6 tcp-ut 5s cc reno thread all ssl crt /tmp/c.pem").unwrap();
         let b = match (cfg.listens.first(), cfg.frontends.first()) {
             (Some(l), _) => l.binds[0].clone(),
             (_, Some(fe)) => fe.binds[0].clone(),
             _ => unreachable!(),
         };
-        assert!(b.ssl, "'ssl' after an ignored keyword's argument must still be parsed");
+        assert!(b.ssl, "'ssl' after a keyword's argument must still be parsed");
+        assert_eq!(b.sock.as_ref().expect("tuning").backlog, Some(100));
+        assert_eq!(b.sock.as_ref().expect("tuning").v6only, Some(false));
+        assert_eq!(b.sock.as_ref().expect("tuning").tcp_user_timeout, Some(std::time::Duration::from_secs(5)));
+        assert_eq!(b.sock.as_ref().expect("tuning").congestion.as_deref(), Some("reno"));
         assert_eq!(b.crt, vec!["/tmp/c.pem".to_string()]);
     }
 }
@@ -123,4 +128,35 @@ fn tuning_keywords_are_accepted_and_their_argument_is_skipped() {
 fn frontend_quic_bind_defaults_its_alpn_to_h3() {
     let cfg = in_frontend("bind quic4@127.0.0.1:8443 ssl crt /tmp/c.pem").unwrap();
     assert_eq!(cfg.frontends[0].binds[0].alpn, vec!["h3".to_string()]);
+}
+
+#[test]
+fn bind_keywords_that_would_be_dropped_are_refused() {
+    for kw in [
+        "tfo", "defer-accept", "mss 1000", "process 1", "thread 1", "nbconn 1", "nice 5", "shards 2", "tcp-ss 1",
+        "idle-ping 1s", "label foo", "guid-prefix g",
+    ] {
+        let name = kw.split(' ').next().unwrap();
+        for f in [in_listen, in_frontend] {
+            let err = f(&format!("bind 127.0.0.1:8080 {kw}")).expect_err(kw).to_string();
+            assert!(err.contains(&format!("'{name}'")), "{kw}: {err}");
+        }
+    }
+}
+
+#[test]
+fn standalone_accept_proxy_is_an_unknown_keyword() {
+    for sect in ["listen", "frontend"] {
+        for kw in ["accept-proxy", "accept-proxy-v2"] {
+            let err = parse_str(&format!("{DEFAULTS}{sect} x\n  bind 127.0.0.1:8080\n  {kw}\n")).unwrap_err().to_string();
+            assert!(err.contains(&format!("unknown keyword '{kw}' in '{sect}' section")), "{err}");
+        }
+    }
+}
+
+#[test]
+fn bind_socket_keywords_need_valid_arguments() {
+    for b in ["backlog", "backlog x", "tcp-ut", "tcp-ut x", "cc"] {
+        assert!(in_frontend(&format!("bind 127.0.0.1:8080 {b}")).is_err(), "{b}");
+    }
 }

@@ -73,6 +73,11 @@ impl From<u8> for ServerStatus {
 pub struct ServerCheckConfig {
     /// Time between consecutive health checks.
     pub inter: Duration,
+    /// `fastinter` in ms: the interval while the server is changing state; 0 is `inter`, as in
+    /// `srv_getinter()`.
+    pub fastinter_ms: u32,
+    /// `downinter` in ms: the interval while the server is down; 0 is `inter`.
+    pub downinter_ms: u32,
     /// Consecutive successful checks required to transition from `Down` to `Up`.
     pub rise: u32,
     /// Consecutive failed checks required to transition from `Up` to `Down`.
@@ -85,6 +90,8 @@ impl Default for ServerCheckConfig {
     fn default() -> Self {
         ServerCheckConfig {
             inter: Duration::from_millis(2000),
+            fastinter_ms: 0,
+            downinter_ms: 0,
             rise: 2,
             fall: 3,
             timeout: Duration::from_millis(2000),
@@ -424,8 +431,23 @@ impl ServerCheckState {
     /// Computes the interval until the next check as a [`Tick`].
     #[must_use]
     pub fn schedule_next(&self, now: Tick) -> Tick {
-        let ms = u32::try_from(self.config.inter.as_millis()).unwrap_or(u32::MAX);
+        let ms = u32::try_from(self.interval().as_millis()).unwrap_or(u32::MAX);
         now.add(ms)
+    }
+
+    /// `srv_getinter()` (`src/check.c`): `inter` while fully healthy, `downinter` once the
+    /// counter is at zero and the server is down, `fastinter` in between (UP but failing,
+    /// or DOWN but succeeding). An unset `fastinter` or `downinter` is `inter`.
+    #[must_use]
+    pub fn interval(&self) -> Duration {
+        let inter = self.config.inter;
+        if self.health >= self.full_health() {
+            inter
+        } else if self.health == 0 && self.status == ServerStatus::Down {
+            if self.config.downinter_ms == 0 { inter } else { Duration::from_millis(u64::from(self.config.downinter_ms)) }
+        } else {
+            if self.config.fastinter_ms == 0 { inter } else { Duration::from_millis(u64::from(self.config.fastinter_ms)) }
+        }
     }
 }
 

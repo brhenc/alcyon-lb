@@ -54,12 +54,37 @@ pub struct Listener {
     pub accept_proxy_v2: bool,
 }
 
+/// `tcp-ut` and `cc` of a `bind` line. A refusal by the kernel (an algorithm that is not
+/// loaded, say) is reported and the socket is served without the option, as `HAProxy` does
+/// (`tcp_bind_listener` warns and keeps the listener).
+fn apply_tuning(fd: &OwnedFd, tuning: &ibex_config::ast::SocketTuning) {
+    if let Some(ut) = tuning.tcp_user_timeout {
+        let ms = u32::try_from(ut.as_millis()).unwrap_or(u32::MAX);
+        if let Err(e) = net::sockopt::set_tcp_user_timeout(fd, ms) {
+            eprintln!("[WARNING] bind: cannot set the TCP user timeout: {e}");
+        }
+    }
+    if let Some(algo) = &tuning.congestion {
+        if let Err(e) = net::sockopt::set_tcp_congestion(fd, algo) {
+            eprintln!("[WARNING] bind: cannot set the congestion control '{algo}': {e}");
+        }
+    }
+}
+
 impl Listener {
     /// Binds a listening socket with `SO_REUSEPORT` and `SO_REUSEADDR`.
     ///
     /// # Errors
     /// Propagates socket creation, bind or listen failure.
     pub fn bind(addr: SocketAddr, backlog: i32, proxy: u32) -> io::Result<Self> {
+        Self::bind_tuned(addr, backlog, proxy, &ibex_config::ast::SocketTuning::default())
+    }
+
+    /// [`Listener::bind`] with the socket options of a `bind` line.
+    ///
+    /// # Errors
+    /// Propagates socket creation, bind or listen failure.
+    pub fn bind_tuned(addr: SocketAddr, backlog: i32, proxy: u32, tuning: &ibex_config::ast::SocketTuning) -> io::Result<Self> {
         let family = match addr {
             SocketAddr::V4(_) => AddressFamily::INET,
             SocketAddr::V6(_) => AddressFamily::INET6,
@@ -76,12 +101,14 @@ impl Listener {
         // distributes connections across them.
         net::sockopt::set_socket_reuseport(&fd, true)?;
         if family == AddressFamily::INET6 {
-            let _ = net::sockopt::set_ipv6_v6only(&fd, true);
+            // `v6only` / `v4v6` on the bind line; otherwise Ibex's own default (v6 only).
+            let _ = net::sockopt::set_ipv6_v6only(&fd, tuning.v6only.unwrap_or(true));
         }
+        apply_tuning(&fd, tuning);
 
         let any = to_any(addr);
         net::bind_any(&fd, &any)?;
-        net::listen(&fd, backlog)?;
+        net::listen(&fd, tuning.backlog.map_or(backlog, |b| i32::try_from(b).unwrap_or(i32::MAX)))?;
 
         let bound_addr = if addr.port() == 0 {
             net::getsockname(&fd)
@@ -128,7 +155,13 @@ impl Listener {
     ///
     /// # Errors
     /// Refuses a descriptor that is not a listening TCP socket on `addr`.
-    pub fn adopt(fd: OwnedFd, addr: SocketAddr, backlog: i32, proxy: u32) -> io::Result<Self> {
+    pub fn adopt(
+        fd: OwnedFd,
+        addr: SocketAddr,
+        backlog: i32,
+        proxy: u32,
+        tuning: &ibex_config::ast::SocketTuning,
+    ) -> io::Result<Self> {
         let bad = |why: &str| io::Error::new(io::ErrorKind::InvalidInput, format!("inherited socket for {addr}: {why}"));
         if net::sockopt::get_socket_type(&fd)? != SocketType::STREAM {
             return Err(bad("not a stream socket"));
@@ -150,7 +183,8 @@ impl Listener {
             return Err(bad(&format!("bound to {local}")));
         }
         rustix::io::ioctl_fionbio(&fd, true)?;
-        net::listen(&fd, backlog)?;
+        apply_tuning(&fd, tuning);
+        net::listen(&fd, tuning.backlog.map_or(backlog, |b| i32::try_from(b).unwrap_or(i32::MAX)))?;
         Ok(Listener {
             fd,
             addr,
@@ -298,7 +332,7 @@ mod tests {
         let orig = Listener::bind(loopback0(), 16, 0).expect("bind");
         let addr = orig.addr();
         let fd = orig.borrowed_fd().try_clone_to_owned().expect("dup");
-        let adopted = Listener::adopt(fd, addr, 16, 7).expect("adopt");
+        let adopted = Listener::adopt(fd, addr, 16, 7, &ibex_config::ast::SocketTuning::default()).expect("adopt");
         assert_eq!(adopted.addr(), addr);
         assert_eq!(adopted.proxy, 7);
         let _c = std::net::TcpStream::connect(addr).expect("connect");
@@ -318,7 +352,7 @@ mod tests {
         let orig = Listener::bind(loopback0(), 16, 0).expect("bind");
         let other = Listener::bind(loopback0(), 16, 0).expect("bind other");
         let fd = orig.borrowed_fd().try_clone_to_owned().expect("dup");
-        let err = Listener::adopt(fd, other.addr(), 16, 0).err().expect("must refuse");
+        let err = Listener::adopt(fd, other.addr(), 16, 0, &ibex_config::ast::SocketTuning::default()).err().expect("must refuse");
         assert!(err.to_string().contains("bound to"), "{err}");
     }
 
@@ -326,7 +360,7 @@ mod tests {
     fn adopt_refuses_a_socket_that_is_not_listening() {
         let fd = net::socket_with(AddressFamily::INET, SocketType::STREAM, SocketFlags::CLOEXEC, None)
             .expect("socket");
-        let err = Listener::adopt(fd, loopback0(), 16, 0).err().expect("must refuse");
+        let err = Listener::adopt(fd, loopback0(), 16, 0, &ibex_config::ast::SocketTuning::default()).err().expect("must refuse");
         assert!(err.to_string().contains("not listening"), "{err}");
     }
 
@@ -334,7 +368,7 @@ mod tests {
     fn adopt_refuses_a_datagram_socket() {
         let fd = net::socket_with(AddressFamily::INET, SocketType::DGRAM, SocketFlags::CLOEXEC, None)
             .expect("socket");
-        let err = Listener::adopt(fd, loopback0(), 16, 0).err().expect("must refuse");
+        let err = Listener::adopt(fd, loopback0(), 16, 0, &ibex_config::ast::SocketTuning::default()).err().expect("must refuse");
         assert!(err.to_string().contains("not a stream socket"), "{err}");
     }
 
@@ -345,7 +379,7 @@ mod tests {
         };
         let addr = orig.addr();
         let fd = orig.borrowed_fd().try_clone_to_owned().expect("dup");
-        let adopted = Listener::adopt(fd, addr, 16, 0).expect("adopt v6");
+        let adopted = Listener::adopt(fd, addr, 16, 0, &ibex_config::ast::SocketTuning::default()).expect("adopt v6");
         assert_eq!(adopted.addr(), addr);
     }
 }

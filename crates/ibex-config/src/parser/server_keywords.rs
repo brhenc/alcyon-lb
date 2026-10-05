@@ -124,8 +124,7 @@ pub(crate) const UNIMPLEMENTED_SERVER_KEYWORDS: &[ServerKeyword] = &[
     kw!("check-reuse-pool", Arg::None, Ignore("health checks reusing idle connections")),
     kw!("check-send-proxy", Arg::None, CHECK),
     kw!("check-via-socks4", Arg::None, CHECK),
-    kw!("fastinter", Arg::Delay, Ignore("the check interval while a server changes state")),
-    kw!("downinter", Arg::Delay, Ignore("the check interval while a server is down")),
+    // `fastinter` and `downinter` are read in `server.rs` (T207) and paced in `check.rs`.
     // src/cfgparse-ssl.c: the rest is implemented in `server.rs` (`parse_server_ssl_keyword`).
     kw!("allow-0rtt", Arg::None, TLS),
     kw!("ciphers", Arg::Word, TLS),

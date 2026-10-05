@@ -157,9 +157,25 @@ pub struct TimeoutConfig {
     pub tarpit: Option<Duration>,
 }
 
+/// The socket options a `bind` line sets on its listening sockets (T207).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SocketTuning {
+    /// `backlog <n>`: the `listen()` backlog; `None` keeps the runtime default.
+    pub backlog: Option<u32>,
+    /// `v6only` (`Some(true)`) / `v4v6` (`Some(false)`): `IPV6_V6ONLY` on an IPv6 address.
+    pub v6only: Option<bool>,
+    /// `tcp-ut <delay>`: `TCP_USER_TIMEOUT`.
+    pub tcp_user_timeout: Option<Duration>,
+    /// `cc <algo>`: `TCP_CONGESTION`.
+    pub congestion: Option<String>,
+}
+
 /// Bind configuration for frontend listeners.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BindConfig {
+    /// Socket options from the `bind` line; `None` when it sets none (boxed: a frontend
+    /// and a bind are paid for 60,000 times over in `request_allocations`).
+    pub sock: Option<Box<SocketTuning>>,
     pub addr: SocketAddr,
     pub quic: bool,
     pub ssl: bool,
