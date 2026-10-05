@@ -362,19 +362,18 @@ fn parse_cli_args(args: &[String]) -> (String, CliOptions) {
                     opts.st_pids.push(parse_arg_u32(&args[i], "-st"));
                 }
             }
-            "-S" => {
+            "-S" | "-s" | "--stats-socket" => {
                 i += 1;
                 if i >= args.len() {
                     eprintln!("Option -S expects a socket path argument.");
                     process::exit(1);
                 }
-                opts.master_socket = Some(args[i].clone());
-            }
-            "-s" | "--stats-socket" => {
-                i += 1;
-                if i >= args.len() {
-                    eprintln!("Option -s expects a socket path argument.");
-                    process::exit(1);
+                // `-S` is the master CLI (see master.rs); `-s` / `--stats-socket` are Ibex's
+                // command-line stats socket.
+                if arg == "-S" {
+                    opts.master_socket = Some(args[i].clone());
+                    i += 1;
+                    continue;
                 }
                 let raw = &args[i];
                 let sock_str = raw.split(',').next().unwrap_or(raw);

@@ -477,9 +477,7 @@ impl Master {
                 drop(st);
                 self.exit_code = code;
                 self.stopping = true;
-                for p in self.children.keys() {
-                    signal(*p, Signal::Term);
-                }
+                self.children.keys().for_each(|p| signal(*p, Signal::Term));
             } else {
                 shared.log(&mut st, "WARNING", &format!("Former worker ({pid}) exited with code {code} ({why})"));
             }

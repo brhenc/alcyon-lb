@@ -257,6 +257,7 @@ fn show_proc_reload_and_forwarding_on_the_master_socket() {
     assert_eq!(master(&sock, "show version;;show version"), format!("{VERSION}\n\n\n{VERSION}\n\n"));
     assert_eq!(master(&sock, ""), "\n");
     assert_eq!(master(&sock, "show env NOPE_T200"), "Variable not found\n\n");
+    assert!(master(&sock, "show env PATH").starts_with("PATH=/"));
     assert!(master(&sock, "show env").ends_with("\n\n"));
     assert_eq!(master(&sock, "show proc foo"), "'show proc' only supports 'debug' as argument\n\n");
     assert_eq!(
@@ -430,7 +431,7 @@ fn a_reload_while_one_is_loading_is_refused() {
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn");
-    let _m = Master { child, dir: dir.clone() };
+    let mut m = Master { child, dir: dir.clone() };
     wait_for_socket(&sock);
     assert!(common::wait_listening(std::net::SocketAddr::from(([127, 0, 0, 1], port))));
     let s2 = sock.clone();
@@ -443,7 +444,15 @@ fn a_reload_while_one_is_loading_is_refused() {
             "{out:?}"
         );
     }
-    assert_eq!(get(port).unwrap(), "v1");
+    assert_eq!(served_eventually(port, "v1"), "v1");
+    // SIGTERM on the master: every worker is stopped at once and the master exits 0, as
+    // HAProxy's (and Ibex's single process under -W) does.
+    let w = show_proc(&master(&sock, "show proc")).1[0].pid;
+    sig(m.child.id(), rustix::process::Signal::Term);
+    let st = wait_exit(&mut m.child, Duration::from_secs(5));
+    assert!(st.is_some_and(|s| s.success()), "SIGTERM on the master: {st:?}");
+    assert!(!alive(w), "SIGTERM on the master stops the workers");
+    assert!(!sock.exists(), "the master removes its socket");
 }
 
 /// Runs a start that must fail; one that does not is stopped after five seconds.
@@ -552,13 +561,11 @@ fn under_systemd_the_master_stays_the_main_pid_across_reloads() {
     assert!(recv().starts_with("RELOADING=1\n"));
     let failed = recv();
     assert!(failed.contains("STATUS=Reload failed!"), "{failed:?}");
-    // SIGTERM: STOPPING=1, the workers are stopped and the master exits 0.
-    let w = show_proc(&master(&sock, "show proc")).2[0].pid;
-    sig(mpid, rustix::process::Signal::Term);
+    // SIGUSR1: STOPPING=1, the workers soft-stop and the master exits 0.
+    sig(mpid, rustix::process::Signal::Usr1);
     assert!(recv().contains("STOPPING=1"));
     let st = wait_exit(&mut m.child, Duration::from_secs(5));
-    assert!(st.is_some_and(|s| s.success()), "SIGTERM on the master: {st:?}");
-    assert!(!alive(w), "SIGTERM on the master stops the workers");
+    assert!(st.is_some_and(|s| s.success()), "SIGUSR1 on the master: {st:?}");
     assert!(!sock.exists(), "the master removes its socket");
 }
 
