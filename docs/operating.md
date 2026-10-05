@@ -9,15 +9,21 @@ HAProxy it says so. What Ibex refuses to load is in [differences.md](differences
 
 ## How the process is laid out
 
-Ibex is one process with worker threads, not HAProxy's master plus worker processes. Consequences
-you will see:
+Two layouts, depending on whether the master CLI is asked for:
 
-- `-W` / `-Ws` do not create a master process. The main thread supervises the worker threads, and
-  a reload starts a **new Ibex process**, which takes the listening sockets over from the old one
-  and then tells the old one to soft-stop.
-- The PID in `-p <pidfile>` is that one process (one line). After a reload the file holds the new
-  PID. HAProxy lists master and workers.
-- The master CLI (`-S`) and `show proc` / `reload` on it do not exist (see the end).
+- `-W -S <socket>` / `-Ws -S <socket>` (the shipped unit, as HAProxy's): **a master process and
+  a worker process**, as in HAProxy. The master runs no proxy; it holds the `-S` socket and
+  starts the worker (the same binary). A reload (`reload` on the master socket, or SIGUSR2 to
+  the master) starts a new worker, which takes the listening sockets over from the serving one
+  and soft-stops it. The master's PID never changes: it is in the pidfile and it is systemd's
+  `MAINPID`. `show proc` lists master and workers. See "Master CLI" below.
+- `-W` / `-Ws` without `-S`: one process with worker threads. A reload starts a **new Ibex
+  process**, which takes the listening sockets over from the old one and then tells the old one
+  to soft-stop; the pidfile and systemd's `MAINPID` move to the new process.
+- `-S` without `-W` is refused, as by HAProxy (`a master CLI socket was defined, but
+  master-worker mode (-W) is not enabled.`, exit 1).
+
+The worker itself is one process with threads (`nbthread`), not several processes.
 
 ## Install
 
@@ -34,8 +40,8 @@ systemctl enable --now ibex
 `ExecStart=ibex -Ws -f $CONFIG -p $PIDFILE $EXTRAOPTS`, `KillMode=mixed`,
 the same commented sandboxing options. Differences from HAProxy's:
 
-- No `-S /run/haproxy-master.sock` in `EXTRAOPTS` and no `conf.d` directory by default (`-S` is
-  accepted but serves nothing useful, see below). `-f` accepts a directory, as in HAProxy
+- `EXTRAOPTS=-S /run/ibex-master.sock` (HAProxy's: `/run/haproxy-master.sock`), so the service
+  runs as master + worker. No `conf.d` directory by default. `-f` accepts a directory, as in HAProxy
   (`*.cfg` files, lexical order, dot-files skipped); add `-f /etc/ibex/conf.d` to `ExecStart` if
   you use one.
 - Put overrides in `/etc/default/ibex` or `/etc/sysconfig/ibex`: `CONFIG=`, `PIDFILE=`,
@@ -44,6 +50,12 @@ the same commented sandboxing options. Differences from HAProxy's:
   if `systemd-analyze` is missing).
 
 ### What `-Ws` sends to systemd (read from `crates/ibex-rt/src/systemd.rs`, observed on a `NOTIFY_SOCKET`)
+
+With `-S` (the shipped unit) the master sends everything, and `MAINPID` is always the master:
+`READY=1` once the first worker listens, `RELOADING=1` at each reload, `READY=1` when the new
+worker listens (`STATUS=Reload failed!` with it if the new worker exited), `STOPPING=1` on
+SIGUSR1 / SIGTERM (test: `master_cli.rs`, `under_systemd_the_master_stays_the_main_pid...`).
+Without `-S`:
 
 | moment | message |
 |---|---|
@@ -79,7 +91,14 @@ before any signal is sent.
 
 ```
 systemctl reload ibex          # ExecReload: ibex -c, then kill -USR2 $MAINPID
+echo reload | socat - /run/ibex-master.sock     # the same, with the result (master CLI)
 ```
+
+With the master (`-S`, the shipped unit), `$MAINPID` is the master and SIGUSR2 makes it start a
+new worker; the paragraphs below describe the single-process layout (`-W` without `-S`), which is
+what T166 measured under load. The master layout was tested with requests sent in a loop
+through a valid and a failed reload (none failed; `crates/ibex-rt/tests/master_cli.rs`), not
+with the 100-reload measurement.
 
 Needs `-W` or `-Ws`. Verified on one reload with the `-Ws` command line: the new process took the
 listening socket over (`[NOTICE] took over 1 listening socket(s) from ...`), systemd got
@@ -165,13 +184,40 @@ weight 5 and admin state 1.
 Runtime changes are not persisted. `server-state-file` is **not** claimed to work here; I did
 not test it.
 
+## Master CLI
+
+`ibex -W -S /run/ibex-master.sock[,mode,600] -f ...`, then `socat - /run/ibex-master.sock`. The
+commands and their output are HAProxy 3.5's master CLI (measured side by side; see
+`tasks/T200-master-cli.md`): `help`, `show proc`, `reload`, `hard-reload`,
+`show startup-logs`, `show version`, `echo`, `show cli level`, `operator`, `user`,
+`show env [var]`, `prompt`, `quit`, and `@1 <cmd>` / `@!<pid> <cmd>` / `@master <cmd>`, which
+run a command on the serving worker's own CLI (`@1 show info`, `@1 show stat`, ...).
+
+```
+$ echo "show proc" | socat - /run/ibex-master.sock
+#<PID>          <type>          <reloads>       <uptime>        <version>
+4120            master          1 [failed: 0]   0d00h05m12s     0.1.0
+# workers
+4388            worker          0               0d00h00m03s     0.1.0
+# old workers
+4122            worker          1               0d00h05m12s     0.1.0
+```
+
+`reload` answers `Success=1` or `Success=0`, `--`, and the startup logs of the new worker (its
+configuration errors on a failure). A failed reload leaves the serving worker serving; as in
+HAProxy, `show proc` then lists it under "old workers" until the next successful reload, and
+`@1` still reaches it. The master exits when the serving worker dies on its own (HAProxy's
+default `exit-on-failure`), with the worker's code. A worker exits when its master is gone.
+
+`-S` options: `mode <octal>` only; any other (`level`, `user`, ...) is refused at startup with
+`Can't create the master's CLI.` Not done: `show proc debug` prints the plain table; `@1` with
+no command (HAProxy's worker interactive mode) prints nothing.
+
 ## Does not work yet
 
 - Runtime map and ACL commands (`add map`, `show map`, `show acl`, ...): "Unknown command". The
   milestone lists them.
 - `show sess`, `show servers conn`: "Unknown command".
-- The master CLI: `-S <path>` creates the socket but it answers `show proc` and `reload`
-  with "Unknown command". Reload through systemd (SIGUSR2) is the way.
 - Error messages from `-c` do not name the file.
 - A connection refused by a server is reported only after the connect timeout (3 s in my test
   where HAProxy answers 503 at once): T170.

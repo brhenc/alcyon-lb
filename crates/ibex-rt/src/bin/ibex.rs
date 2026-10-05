@@ -7,6 +7,9 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::struct_excessive_bools)]
 
+#[path = "ibex/master.rs"]
+mod master;
+
 use ibex_rt::Engine;
 use rustix::process::{kill_process, Pid, Resource, Rlimit, setrlimit, Signal};
 use std::env;
@@ -28,6 +31,8 @@ macro_rules! println {
 struct CliOptions {
     config_paths: Vec<PathBuf>,
     stats_socket: Option<PathBuf>,
+    /// `-S <path>[,<opts>]`: the master CLI, raw (see `master::parse_socket`).
+    master_socket: Option<String>,
     check_only: bool,
     /// `-cc <condition>`: evaluated once the whole command line is read, the last one wins.
     check_condition: Option<String>,
@@ -357,10 +362,18 @@ fn parse_cli_args(args: &[String]) -> (String, CliOptions) {
                     opts.st_pids.push(parse_arg_u32(&args[i], "-st"));
                 }
             }
-            "-S" | "-s" | "--stats-socket" => {
+            "-S" => {
                 i += 1;
                 if i >= args.len() {
                     eprintln!("Option -S expects a socket path argument.");
+                    process::exit(1);
+                }
+                opts.master_socket = Some(args[i].clone());
+            }
+            "-s" | "--stats-socket" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Option -s expects a socket path argument.");
                     process::exit(1);
                 }
                 let raw = &args[i];
@@ -476,6 +489,11 @@ fn parse_cli_args(args: &[String]) -> (String, CliOptions) {
     (program, opts)
 }
 
+/// `HAProxy`'s alert line without a subsystem: `[ALERT]    (<pid>) : <text>`.
+fn config_alert_plain(text: &str) {
+    eprintln!("[ALERT]    ({}) : {text}", process::id());
+}
+
 /// `HAProxy`'s alert line: `[ALERT]    (<pid>) : config : <text>`.
 fn config_alert(text: &str) {
     eprintln!("[ALERT]    ({}) : config : {text}", process::id());
@@ -587,6 +605,22 @@ fn main() {
             }
         }
     }
+    // `-S` is HAProxy's master CLI: it needs master-worker mode, and an option it does not
+    // apply stops the start rather than being dropped.
+    let master_sock = opts.master_socket.as_deref().map(|raw| {
+        if !opts.master_worker {
+            config_alert_plain("a master CLI socket was defined, but master-worker mode (-W) is not enabled.");
+            process::exit(1);
+        }
+        master::parse_socket(raw).unwrap_or_else(|e| {
+            config_alert_plain(&e);
+            config_alert_plain("Can't create the master's CLI.");
+            process::exit(1);
+        })
+    });
+    // Set by the master that started this process as one of its workers.
+    let master_dir = std::env::var_os(master::MASTER_DIR_ENV).map(PathBuf::from);
+    std::env::remove_var(master::MASTER_DIR_ENV);
     // A reload restarts this binary with these same arguments; relative paths in them are
     // relative to where it was started, not to wherever `-C` moved it.
     let start_dir = std::env::current_dir().ok();
@@ -699,7 +733,7 @@ fn main() {
     //    until it has taken over: if its configuration fails to load, the pidfile must go
     //    on naming the process that is still serving.
     if let Some(ref pidfile) = opts.pid_file {
-        if !reload_child {
+        if !reload_child && master_dir.is_none() {
             handle_pid_file(pidfile);
         }
     }
@@ -728,6 +762,11 @@ fn main() {
         }
         process::exit(0);
     }
+
+    // 9a. `-W -S`: this process becomes the master, and the proxy runs in worker processes
+    //     it starts (see master.rs).
+    if let Some(ms) = master_sock.as_ref().filter(|_| master_dir.is_none()) {
+        master::run(ms, &raw_args[1..], start_dir, opts.systemd_notify) }
 
     // 9b. The ACL and map files the configuration reads become the objects `show map`,
     //     `add acl` and the other runtime commands work on, numbered in the order written.
@@ -772,8 +811,16 @@ fn main() {
         config.global.as_ref().and_then(|g| g.stats_socket.as_ref()).map(PathBuf::from)
     });
     
-    let extra_sockets: Vec<ibex_config::StatsSocket> =
+    let mut extra_sockets: Vec<ibex_config::StatsSocket> =
         config.global.as_ref().map(|g| g.extra_stats_sockets.clone()).unwrap_or_default();
+    // A master's worker: one more admin socket, which the master forwards `@1 <cmd>` to and
+    // the next worker takes the listening sockets from (see master.rs).
+    extra_sockets.extend(master_dir.as_ref().map(|d| ibex_config::StatsSocket {
+        path: d.join(format!("{}.sock", process::id())).display().to_string(),
+        mode: None,
+        level: Some("admin".into()),
+        expose_fd: true,
+    }));
     let stats_socket_mode = config.global.as_ref().and_then(|g| g.stats_socket_mode);
     // A `stats socket` without `level` is operator, as in HAProxy (`bind_conf->level |=
     // ACCESS_LVL_OPER`, src/cli.c); the master socket `-S` is admin.
@@ -906,6 +953,10 @@ fn main() {
     if !opts.st_pids.is_empty() {
         send_signals_to_pids(&opts.st_pids, Signal::Term, opts.quiet);
     }
+    if master_dir.is_some() {
+        // To the master, on the stderr pipe it reads: loaded (see master.rs).
+        eprintln!("{}", master::READY_MARK);
+    }
     if reload_child {
         if let Some(ref pidfile) = opts.pid_file {
             handle_pid_file(pidfile);
@@ -914,7 +965,7 @@ fn main() {
     // A reload child does not announce itself: it is not systemd's main PID yet, and under
     // the default `NotifyAccess=main` systemd would drop the message. The process it
     // replaces names it with `MAINPID=` instead (see `supervise`).
-    if opts.systemd_notify && !reload_child {
+    if opts.systemd_notify && !reload_child && master_dir.is_none() {
         // crates/ibex-rt/src/systemd.rs, not a local copy: `Path` cannot address the
         // abstract socket systemd hands out as `@name`, and the module sends the full
         // READY=1/MAINPID/STATUS message HAProxy does (src/cli.c:3087).
@@ -924,7 +975,9 @@ fn main() {
     }
 
     let respawn = Respawn { args: raw_args[1..].to_vec(), dir: start_dir };
-    supervise(threads, &lifecycle, opts.master_worker, &respawn, opts.quiet);
+    // A master's worker leaves reloads to the master, and goes when the master does.
+    let master_ppid = master_dir.as_ref().map(|_| rustix::process::Pid::as_raw(rustix::process::getppid()));
+    supervise(threads, &lifecycle, opts.master_worker && master_ppid.is_none(), &respawn, opts.quiet, master_ppid);
 }
 
 /// How to start the process that replaces this one on reload.
@@ -1058,6 +1111,7 @@ fn supervise(
     reloadable: bool,
     respawn: &Respawn,
     quiet: bool,
+    master_ppid: Option<i32>,
 ) -> ! {
     let mut reload: Option<Reload> = None;
     let mut handed_over = false;
@@ -1067,6 +1121,13 @@ fn supervise(
             // systemd supervises, then exits 0. Connections are dropped, not drained.
             ibex_rt::systemd::notify_stopping_once();
             process::exit(0);
+        }
+        if let Some(pp) = master_ppid {
+            if rustix::process::Pid::as_raw(rustix::process::getppid()) != pp {
+                // The master is gone; HAProxy's workers leave with it.
+                process::exit(0);
+            }
+            let _ = lifecycle.take_reload_request();
         }
         if lifecycle.take_reload_request() {
             if !reloadable {
