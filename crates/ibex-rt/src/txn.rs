@@ -443,6 +443,172 @@ pub fn head_wants_close(head: &str) -> bool {
     has("close") || (first.contains("HTTP/1.0") && !has("keep-alive"))
 }
 
+/// Whether a `Connection` value lists `token`.
+#[must_use]
+pub fn connection_has(value: &str, token: &str) -> bool {
+    value.split(',').any(|t| t.trim().eq_ignore_ascii_case(token))
+}
+
+/// The tokens of the `Connection` headers of a message that `HAProxy` acts on.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ConnTokens {
+    pub keep_alive: bool,
+    pub close: bool,
+    pub upgrade: bool,
+}
+
+/// What `HAProxy` leaves of one `Connection` value (`h1_parse_connection_header`, with
+/// `H1_MF_CLEAN_CONN_HDR`): the `keep-alive` and `close` tokens are taken out, the others
+/// stay, joined by `,`. `None` when nothing is left and the header goes; a value without
+/// either token is returned as it was. With `drop_upgrade`, an `upgrade` token goes too (a
+/// request without an `Upgrade` header). `tokens` collects what was seen.
+#[must_use]
+pub fn clean_connection_value(value: &str, drop_upgrade: bool, tokens: &mut ConnTokens) -> Option<String> {
+    let mut kept: Vec<&str> = Vec::new();
+    let mut changed = false;
+    for t in value.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+        if t.eq_ignore_ascii_case("keep-alive") {
+            tokens.keep_alive = true;
+            changed = true;
+        } else if t.eq_ignore_ascii_case("close") {
+            tokens.close = true;
+            changed = true;
+        } else if t.eq_ignore_ascii_case("upgrade") && drop_upgrade {
+            changed = true;
+        } else {
+            tokens.upgrade |= t.eq_ignore_ascii_case("upgrade");
+            kept.push(t);
+        }
+    }
+    if !changed {
+        return Some(value.trim().to_string());
+    }
+    (!kept.is_empty()).then(|| kept.join(","))
+}
+
+/// The `Connection` token `HAProxy` adds to a request it forwards to a server
+/// (`h1_update_req_conn_value`): `close` for an HTTP/1.1 request whose server connection is
+/// to close, `keep-alive` for an HTTP/1.0 one whose connection is not. Nothing for a
+/// request that upgrades.
+#[must_use]
+pub fn request_connection_token(close: bool, http11: bool, upgrade: bool) -> Option<&'static str> {
+    match (upgrade, close, http11) {
+        (true, ..) | (false, true, false) | (false, false, true) => None,
+        (false, true, true) => Some("close"),
+        (false, false, false) => Some("keep-alive"),
+    }
+}
+
+/// The `Connection` token added to a response sent to the client
+/// (`h1_update_res_conn_value`): `keep-alive` when the connection stays open and either the
+/// server's response or the client's request is not HTTP/1.1, `close` when it is to close
+/// and the response is HTTP/1.1. Nothing for a tunnel or a response that upgrades.
+#[must_use]
+pub fn response_connection_token(close: bool, rsp_http11: bool, req_http11: bool, upgrade: bool) -> Option<&'static str> {
+    if upgrade {
+        return None;
+    }
+    if close {
+        rsp_http11.then_some("close")
+    } else {
+        (!(rsp_http11 && req_http11)).then_some("keep-alive")
+    }
+}
+
+/// Whether a `Connection` value holds nothing but `keep-alive` and `close` tokens, which
+/// all go: the header is removed whole.
+#[must_use]
+pub fn connection_is_plain(value: &str) -> bool {
+    value.split(',').map(str::trim).all(|t| t.is_empty() || t.eq_ignore_ascii_case("keep-alive") || t.eq_ignore_ascii_case("close"))
+}
+
+/// What the `Connection` headers of a head are, without copying it: whether there is one,
+/// and whether every one of them is plain ([`connection_is_plain`]).
+#[must_use]
+pub fn head_connection(head: &[u8]) -> (bool, bool) {
+    let (mut any, mut plain) = (false, true);
+    for l in head.split(|&b| b == b'\n').skip(1) {
+        let name = b"connection";
+        if l.len() > name.len() && l[..name.len()].eq_ignore_ascii_case(name) && l[name.len()..].trim_ascii_start().first() == Some(&b':') {
+            any = true;
+            let value = &l[name.len()..].trim_ascii_start()[1..];
+            plain &= std::str::from_utf8(value).is_ok_and(connection_is_plain);
+        }
+    }
+    (any, plain)
+}
+
+/// [`rewrite_response_connection`] on a list of headers.
+pub fn apply_response_connection(hdrs: &mut Vec<(String, String)>, rsp_http11: bool, close: bool, req_http11: bool, tunnel: bool) {
+    let mut tokens = ConnTokens::default();
+    hdrs.retain_mut(|(k, v)| {
+        if !k.eq_ignore_ascii_case("connection") {
+            return true;
+        }
+        match clean_connection_value(v, false, &mut tokens) {
+            Some(c) => {
+                *v = c;
+                true
+            }
+            None => false,
+        }
+    });
+    if !tunnel {
+        if let Some(tok) = response_connection_token(close, rsp_http11, req_http11, tokens.upgrade) {
+            hdrs.push(("Connection".to_string(), tok.to_string()));
+        }
+    }
+}
+
+/// The head of a response with its `Connection` headers as `HAProxy` forwards them:
+/// `keep-alive` and `close` taken out of each, and the token the connection's state calls
+/// for ([`response_connection_token`]) added as a last header. `None` if the head stays as
+/// it is.
+#[must_use]
+pub fn rewrite_response_connection(head: &str, close: bool, req_http11: bool, tunnel: bool) -> Option<String> {
+    let rsp_http11 = head.starts_with("HTTP/1.1");
+    let mut out = String::with_capacity(head.len() + 24);
+    let mut tokens = ConnTokens::default();
+    let mut changed = false;
+    let mut end = usize::MAX;
+    for (i, line) in head.split_inclusive('\n').enumerate() {
+        let bare = line.trim_end_matches(['\r', '\n']);
+        if i > 0 && bare.is_empty() {
+            end = out.len();
+            out.push_str(line);
+            break;
+        }
+        match bare.split_once(':') {
+            Some((name, value)) if i > 0 && name.trim().eq_ignore_ascii_case("connection") => {
+                let eol = &line[bare.len()..];
+                match clean_connection_value(value, false, &mut tokens) {
+                    Some(v) if v == value.trim() => out.push_str(line),
+                    Some(v) => {
+                        out.push_str(name);
+                        out.push_str(": ");
+                        out.push_str(&v);
+                        out.push_str(eol);
+                        changed = true;
+                    }
+                    None => changed = true,
+                }
+            }
+            _ => out.push_str(line),
+        }
+    }
+    if end == usize::MAX {
+        return None; // no end of head
+    }
+    if !tunnel {
+        if let Some(tok) = response_connection_token(close, rsp_http11, req_http11, tokens.upgrade) {
+            let nl = if head.contains("\r\n") { "\r\n" } else { "\n" };
+            out.insert_str(end, &format!("Connection: {tok}{nl}"));
+            changed = true;
+        }
+    }
+    changed.then_some(out)
+}
+
 /// The status of a response head, 0 if the status line does not parse.
 #[must_use]
 pub fn status_of(head: &str) -> u16 {
@@ -550,6 +716,8 @@ pub struct HttpTxn {
     pub local: bool,
     /// The one decision to close the client connection once this transaction ends.
     pub close_after: bool,
+    /// The client's request is HTTP/1.1 (the response's `Connection` header depends on it).
+    pub req_http11: bool,
     /// The server may keep its connection once this response is done.
     pub srv_reusable: bool,
     /// The client asked for a HEAD. The response is framed by the method the server
@@ -616,6 +784,7 @@ impl HttpTxn {
             rsp_wait: None,
             local: false,
             close_after,
+            req_http11: true,
             srv_reusable: true,
             srv_reused: false,
             client_head: false,
@@ -932,5 +1101,70 @@ mod tests {
         assert_eq!(u.take_body(b"xyz", 2, &mut out), 2);
         assert_eq!(out, b"xy");
         assert_eq!(u, MsgState::Body(Body::UntilClose));
+    }
+
+    #[test]
+    fn a_close_is_added_as_the_last_header_with_the_line_ends_the_head_has() {
+        // Exact bytes: `contains` passed while the header was glued onto the previous one
+        // ("Content-Length: 2Connection: close") and a blank line was added.
+        assert_eq!(
+            rewrite_response_connection("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n", true, true, false).as_deref(),
+            Some("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n")
+        );
+        assert_eq!(
+            rewrite_response_connection("HTTP/1.1 200 OK\nContent-Length: 2\n\n", true, true, false).as_deref(),
+            Some("HTTP/1.1 200 OK\nContent-Length: 2\nConnection: close\n\n")
+        );
+    }
+
+    #[test]
+    fn keep_alive_is_taken_out_of_a_response_and_the_others_stay() {
+        let head = "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nKeep-Alive: timeout=5\r\n\r\n";
+        assert_eq!(rewrite_response_connection(head, false, true, false).as_deref(), Some("HTTP/1.1 200 OK\r\nKeep-Alive: timeout=5\r\n\r\n"));
+        let head = "HTTP/1.1 200 OK\r\nConnection: x-foo, Keep-Alive\r\n\r\n";
+        assert_eq!(rewrite_response_connection(head, false, true, false).as_deref(), Some("HTTP/1.1 200 OK\r\nConnection: x-foo\r\n\r\n"));
+        // Nothing to take out, nothing to add: the head is left alone.
+        assert_eq!(rewrite_response_connection("HTTP/1.1 200 OK\r\nConnection: upgrade\r\n\r\n", false, true, false), None);
+    }
+
+    #[test]
+    fn the_connection_token_added_follows_the_versions_and_the_state() {
+        assert_eq!(response_connection_token(false, true, true, false), None);
+        assert_eq!(response_connection_token(false, true, false, false), Some("keep-alive"));
+        assert_eq!(response_connection_token(false, false, true, false), Some("keep-alive"));
+        assert_eq!(response_connection_token(true, true, true, false), Some("close"));
+        assert_eq!(response_connection_token(true, false, true, false), None);
+        assert_eq!(request_connection_token(true, true, false), Some("close"));
+        assert_eq!(request_connection_token(false, false, false), Some("keep-alive"));
+        assert_eq!(request_connection_token(true, false, false), None);
+        assert_eq!(request_connection_token(true, true, true), None);
+    }
+
+    #[test]
+    fn a_connection_header_of_keep_alive_and_close_only_is_plain() {
+        assert!(connection_is_plain(" Keep-Alive , close"));
+        assert!(!connection_is_plain("keep-alive, upgrade"));
+        assert_eq!(head_connection(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"), (false, true));
+        assert_eq!(head_connection(b"HTTP/1.1 200 OK\r\nconnection : close\r\n\r\n"), (true, true));
+        assert_eq!(head_connection(b"HTTP/1.1 200 OK\r\nConnection: close\r\nConnection: te\r\n\r\n"), (true, false));
+    }
+
+    #[test]
+    fn a_list_of_headers_is_cleaned_like_a_head() {
+        let mut h = vec![("Connection".to_string(), "x-foo, keep-alive".to_string()), ("Connection".to_string(), "close".to_string())];
+        apply_response_connection(&mut h, true, false, true, false);
+        assert_eq!(h, vec![("Connection".to_string(), "x-foo".to_string())]);
+        let mut h = vec![("Connection".to_string(), "upgrade".to_string())];
+        apply_response_connection(&mut h, true, false, true, false);
+        assert_eq!(h, vec![("Connection".to_string(), "upgrade".to_string())], "an upgrade is left alone");
+        let mut h = Vec::new();
+        apply_response_connection(&mut h, true, true, true, false);
+        assert_eq!(h, vec![("Connection".to_string(), "close".to_string())]);
+        apply_response_connection(&mut Vec::new(), true, false, true, true);
+    }
+
+    #[test]
+    fn a_head_without_an_end_is_left_alone() {
+        assert_eq!(rewrite_response_connection("HTTP/1.1 200 OK\r\nConnection: keep-alive\r\n", false, true, false), None);
     }
 }

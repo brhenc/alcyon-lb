@@ -1675,7 +1675,8 @@ fn begin_http_stream(entry: &mut SessionEntry, proxies: &[Proxy], fe_idx: usize,
             fmt.render(&data, sample_registry(), &ctx)
         };
         if let Some(h) = fe.unique_id_header.as_deref() {
-            entry.sess.req.inject_http_header(&h.to_ascii_lowercase(), &id);
+            // Into the HTX too: the head is written again from it whenever a later step edits a header.
+            add_req_header(&mut entry.sess, &h.to_ascii_lowercase(), &id);
         }
         entry.sess.log.unique_id = Some(id);
     }
@@ -6143,24 +6144,33 @@ const MONITOR_URI_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-length: 58\r\n\
 cache-control: no-cache\r\ncontent-type: text/html\r\n\r\n\
 <html><body><h1>200 OK</h1>\nService ready.\n</body></html>\n";
 
-fn inject_connection_close_header_zero_alloc(buf: &mut crate::buf::Buf) {
-    if let Some((eoh_pos, eoh_len)) = crate::find_eoh(buf.readable()) {
-        let inject = b"Connection: close\r\n";
-        let total_old = eoh_pos + eoh_len;
-        let total_new = total_old + inject.len();
-        // `find_eoh` points at the start of the blank-line pair; the last header's own
-        // line terminator is its first half. The new header goes after that, not before.
-        let at = eoh_pos + eoh_len / 2;
-        if total_new <= 4096 {
-            let mut stack_hdr = [0u8; 4096];
-            let readable = buf.readable();
-            stack_hdr[..at].copy_from_slice(&readable[..at]);
-            stack_hdr[at..at + inject.len()].copy_from_slice(inject);
-            stack_hdr[at + inject.len()..total_new].copy_from_slice(&readable[at..total_old]);
-            buf.replace_prefix(total_old, &stack_hdr[..total_new]);
-        } else {
-            buf.inject_http_header("Connection", "close");
-        }
+/// Adds `Connection: <token>` as the last header of the head at the front of `buf`, with the
+/// line ends the head has. The head is copied through the stack (no allocation) when it fits.
+fn inject_connection_token_zero_alloc(buf: &mut crate::buf::Buf, token: &str) {
+    let Some((eoh_pos, eoh_len)) = crate::find_eoh(buf.readable()) else { return };
+    let crlf = buf.readable()[..eoh_pos + eoh_len].windows(2).any(|w| w == b"\r\n");
+    // `token` is `close` or `keep-alive`: the line is 24 bytes at most.
+    let mut line = [0u8; 40];
+    let mut n = 0;
+    for part in [b"Connection: ".as_slice(), token.as_bytes(), if crlf { b"\r\n" } else { b"\n" }] {
+        line[n..n + part.len()].copy_from_slice(part);
+        n += part.len();
+    }
+    let inject = &line[..n];
+    let total_old = eoh_pos + eoh_len;
+    let total_new = total_old + inject.len();
+    // `find_eoh` points at the start of the blank-line pair; the last header's own
+    // line terminator is its first half. The new header goes after that, not before.
+    let at = eoh_pos + eoh_len / 2;
+    if total_new <= 4096 {
+        let mut stack_hdr = [0u8; 4096];
+        let readable = buf.readable();
+        stack_hdr[..at].copy_from_slice(&readable[..at]);
+        stack_hdr[at..at + inject.len()].copy_from_slice(inject);
+        stack_hdr[at + inject.len()..total_new].copy_from_slice(&readable[at..total_old]);
+        buf.replace_prefix(total_old, &stack_hdr[..total_new]);
+    } else {
+        buf.inject_http_header("Connection", token);
     }
 }
 
@@ -7139,11 +7149,11 @@ impl EngineDispatcher<'_> {
         let total_hdr_len = hdr_len + eoh_len;
         // Read in place: the head is borrowed from `rep` (no copy for a UTF-8 head, which is
         // every head on the fast path) and the borrow ends before `rep` is edited.
-        let (status, framing, srv_has_close) = {
+        let (status, framing, srv_has_close, srv_http11) = {
             let head = String::from_utf8_lossy(&entry.sess.rep.readable()[..total_hdr_len]);
             let status = crate::txn::status_of(&head);
             let framing = crate::txn::response_framing(&head, entry.sess.req_method.as_deref(), status);
-            (status, framing, crate::txn::head_wants_close(&head))
+            (status, framing, crate::txn::head_wants_close(&head), head.starts_with("HTTP/1.1"))
         };
         if total_hdr_len > threshold || status < 100 {
             entry.sess.rep.clear();
@@ -7198,6 +7208,7 @@ impl EngineDispatcher<'_> {
             txn.close_after = true;
         }
         let client_close = txn.close_after;
+        let req_http11 = txn.req_http11;
         let cookie_txn = txn.ck;
         // Only an error changes a counter: a response that is not one costs the tracked entries no update.
         let (is_err, is_fail) = response_class(status);
@@ -7212,11 +7223,7 @@ impl EngineDispatcher<'_> {
             });
         }
 
-        if !client_close && srv_has_close {
-            entry.sess.rep.remove_http_header("connection");
-        } else if client_close && !srv_has_close && framing != crate::txn::Framing::Tunnel {
-            inject_connection_close_header_zero_alloc(&mut entry.sess.rep);
-        }
+        let tunnel = framing == crate::txn::Framing::Tunnel;
         let set_rsp = |entry: &mut SessionEntry| {
             let sess = &mut entry.sess;
             if let Some(txn) = sess.txn.as_mut() {
@@ -7254,6 +7261,26 @@ impl EngineDispatcher<'_> {
             || !proxies[be_idx].srvexp.is_empty();
 
         if !has_rules {
+            // `keep-alive` and `close` out of the server's `Connection`, the one this
+            // connection's state calls for in (`h1_update_res_conn_value`).
+            let (h, e) = crate::find_eoh(entry.sess.rep.readable()).unwrap_or_default();
+            let (any, plain) = crate::txn::head_connection(&entry.sess.rep.readable()[..h + e]);
+            let token = if tunnel { None } else { crate::txn::response_connection_token(client_close, srv_http11, req_http11, false) };
+            if !any || plain {
+                // The usual response: no `Connection`, or one that is all `keep-alive` and
+                // `close`; the head is edited where it is, with no copy.
+                if any {
+                    entry.sess.rep.remove_http_header("connection");
+                }
+                if let Some(tok) = token {
+                    inject_connection_token_zero_alloc(&mut entry.sess.rep, tok);
+                }
+            } else {
+                let head = String::from_utf8_lossy(&entry.sess.rep.readable()[..h + e]).into_owned();
+                if let Some(new) = crate::txn::rewrite_response_connection(&head, client_close, req_http11, tunnel) {
+                    entry.sess.rep.replace_prefix(h + e, new.as_bytes());
+                }
+            }
             set_rsp(entry);
             return;
         }
@@ -7645,15 +7672,8 @@ impl EngineDispatcher<'_> {
             return;
         }
 
-        // Connection header policy:
-        if !client_close {
-            // Client is in keep-alive mode: strip hop-by-hop Connection: close
-            hdrs.retain(|(k, v)| {
-                !(k.eq_ignore_ascii_case("connection") && v.to_ascii_lowercase().contains("close"))
-            });
-        } else if !hdrs.iter().any(|(k, _v)| k.eq_ignore_ascii_case("connection")) {
-            hdrs.push(("Connection".to_string(), "close".to_string()));
-        }
+        // The same `Connection` handling as without rules, on the headers the rules left.
+        crate::txn::apply_response_connection(&mut hdrs, srv_http11, client_close, req_http11, tunnel);
 
         let mut new_hdr = format!("{proto_version} {status} {status_msg}\r\n");
         for (k, v) in hdrs {
@@ -8812,9 +8832,7 @@ impl EngineDispatcher<'_> {
         // `option http-server-close` (frontend or backend): this request has the server
         // connection to itself, and the server is asked to close it. A request that asks
         // for an upgrade keeps its `Connection` header.
-        if server_close(proxies, proxy_idx, be_idx) && !request_upgrades(&entry.sess) {
-            set_req_header(&mut entry.sess, "Connection", "close");
-        }
+        rewrite_request_connection(&mut entry.sess, server_close(proxies, proxy_idx, be_idx));
 
         // The backend's `cookie` line: the client's cookies are cut and may name the server.
         let cookie_server = manage_client_cookies(&mut entry.sess, &proxies[be_idx]);
@@ -9842,15 +9860,66 @@ fn client_close(proxies: &[Proxy], fe_idx: usize) -> bool {
     proxies.get(fe_idx).is_some_and(|p| p.ids.http_mode == ibex_config::ast::HttpMode::Close)
 }
 
-/// Whether the request's `Connection` header asks to upgrade the connection.
-fn request_upgrades(sess: &TcpSession) -> bool {
-    let buf = sess.req.readable();
-    let head = &buf[..crate::proxy::find_eoh(buf).map_or(buf.len(), |(h, _)| h)];
-    head.split(|&b| b == b'\n').skip(1).any(|l| {
-        l.iter().position(|&b| b == b':').is_some_and(|c| {
-            l[..c].eq_ignore_ascii_case(b"connection") && l[c + 1..].windows(7).any(|w| w.eq_ignore_ascii_case(b"upgrade"))
-        })
-    })
+/// The request's `Connection` headers as `HAProxy` forwards them to a server: `keep-alive`
+/// and `close` taken out, an `upgrade` too when there is no `Upgrade` header, and the token
+/// the server connection's state calls for added (`close` when it is not to be reused,
+/// `keep-alive` for an HTTP/1.0 request that keeps it; [`crate::txn::request_connection_token`]).
+fn rewrite_request_connection(sess: &mut TcpSession, close: bool) {
+    let http11 = sess.txn.as_ref().is_none_or(|t| t.req_http11);
+    // One look at the headers, no copy: how many `Connection` there are, whether all of them are
+    // plain (nothing but `keep-alive` and `close`), and whether there is an `Upgrade`.
+    let (mut count, mut plain, mut has_upgrade) = (0usize, true, false);
+    let mut scan = |k: &str, v: &str| {
+        if k.eq_ignore_ascii_case("connection") {
+            count += 1;
+            plain &= crate::txn::connection_is_plain(v);
+        } else if k.eq_ignore_ascii_case("upgrade") {
+            has_upgrade = true;
+        }
+    };
+    // A request that reaches a server was parsed into HTX (H1 and H2 alike).
+    sess.htx_slice().into_iter().flat_map(ibex_proto::htx::HtxSliceRef::headers).for_each(|(k, v)| scan(k, v));
+    if count == 0 || plain {
+        // The usual request: no `Connection`, or one that goes whole.
+        if count > 0 {
+            remove_req_header_in_place(sess, "connection");
+        }
+        if let Some(tok) = crate::txn::request_connection_token(close, http11, false) {
+            add_req_header(sess, "Connection", tok);
+        }
+        return;
+    }
+    let hdrs: Vec<(String, String)> =
+        sess.htx_slice().map_or_else(Vec::new, |h| h.headers().map(|(k, v)| (k.to_string(), v.to_string())).collect());
+    let mut tokens = crate::txn::ConnTokens::default();
+    let old: Vec<&str> = hdrs.iter().filter(|(k, _)| k.eq_ignore_ascii_case("connection")).map(|(_, v)| v.trim()).collect();
+    let new: Vec<String> = old.iter().filter_map(|v| crate::txn::clean_connection_value(v, !has_upgrade, &mut tokens)).collect();
+    let unchanged = new.len() == old.len() && new.iter().zip(&old).all(|(a, b)| a == b);
+    if !unchanged {
+        if let ([_], [value]) = (old.as_slice(), new.as_slice()) {
+            set_req_header(sess, "Connection", value);
+        } else {
+            del_req_header(sess, "Connection");
+            if !new.is_empty() {
+                add_req_header(sess, "Connection", &new.join(","));
+            }
+        }
+    }
+    if let Some(tok) = crate::txn::request_connection_token(close, http11, tokens.upgrade) {
+        add_req_header(sess, "Connection", tok);
+    }
+}
+
+/// Removes the header from the request, in the HTX and in the list of headers, and writes the
+/// head again; the few allocations of [`del_req_header`] are not needed for one plain name.
+fn remove_req_header_in_place(sess: &mut TcpSession, name: &str) {
+    sess.with_htx_mut(|htx| {
+        let _ = htx.remove_header(name);
+    });
+    if let Some(hdrs) = sess.req_headers.as_mut() {
+        hdrs.retain(|(k, _)| !k.eq_ignore_ascii_case(name));
+    }
+    rebuild_req_buffer(sess);
 }
 
 fn set_req_header(sess: &mut TcpSession, name: &str, val: &str) {
@@ -10202,18 +10271,28 @@ fn rebuild_req_buffer(sess: &mut TcpSession) {
         return;
     };
     if let Some(htx) = sess.htx_slice() {
-        let mut wire = htx.write_h1_wire_vec();
-        // An HTTP/2 request without a length goes out chunked: the header is written with the
-        // head, after the rules, which never saw it.
-        if sess.h2_chunk_out && !wire.is_empty() {
-            if let Some((h, _)) = crate::proxy::find_eoh(&wire) {
-                let mut v = wire[..h].to_vec();
-                v.extend_from_slice(b"\r\ntransfer-encoding: chunked");
-                v.extend_from_slice(&wire[h..]);
-                wire = v;
+        if sess.h2_chunk_out {
+            let mut wire = htx.write_h1_wire_vec();
+            // An HTTP/2 request without a length goes out chunked: the header is written with
+            // the head, after the rules, which never saw it.
+            if !wire.is_empty() {
+                if let Some((h, _)) = crate::proxy::find_eoh(&wire) {
+                    let mut v = wire[..h].to_vec();
+                    v.extend_from_slice(b"\r\ntransfer-encoding: chunked");
+                    v.extend_from_slice(&wire[h..]);
+                    wire = v;
+                }
+            }
+            sess.req.replace_prefix(hdr_len + eoh_len, &wire);
+        } else {
+            // Through the stack when the head fits; the head is only larger than this with a
+            // Vec (`write_h1_wire_vec` grows until it fits).
+            let mut stack = [0u8; 8192];
+            match htx.write_h1_wire(&mut stack) {
+                Ok(n) => sess.req.replace_prefix(hdr_len + eoh_len, &stack[..n]),
+                Err(_) => sess.req.replace_prefix(hdr_len + eoh_len, &htx.write_h1_wire_vec()),
             }
         }
-        sess.req.replace_prefix(hdr_len + eoh_len, &wire);
     } else {
         let method = sess.req_method.as_deref().unwrap_or("GET");
         let uri = sess.req_uri.as_deref().unwrap_or("/");
@@ -11143,7 +11222,7 @@ fn build_templated_error_response(
 #[cfg(test)]
 mod registry_tests {
     use super::{
-        build_sample_registry, inject_connection_close_header_zero_alloc,
+        build_sample_registry,
         CURRENT_RES_STATUS, CURRENT_VARS,
     };
     use ibex_sample::{Expr, Sample, SampleContext};
@@ -11209,6 +11288,31 @@ mod registry_tests {
         );
     }
 
+    #[test]
+    fn a_connection_token_goes_in_as_the_last_header_whatever_the_head_and_its_line_ends() {
+        let put = |raw: &[u8], tok: &str| {
+            let mut b = crate::buf::Buf::standard();
+            b.writable()[..raw.len()].copy_from_slice(raw);
+            b.commit(raw.len());
+            super::inject_connection_token_zero_alloc(&mut b, tok);
+            String::from_utf8(b.readable().to_vec()).unwrap()
+        };
+        assert_eq!(
+            put(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok", "close"),
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+        );
+        assert_eq!(
+            put(b"HTTP/1.1 200 OK\nContent-Length: 2\n\nok", "keep-alive"),
+            "HTTP/1.1 200 OK\nContent-Length: 2\nConnection: keep-alive\n\nok"
+        );
+        // A head too big for the stack copy.
+        let big = format!("HTTP/1.1 200 OK\r\nX-Big: {}\r\n\r\n", "a".repeat(4200));
+        let out = put(big.as_bytes(), "close");
+        assert!(out.to_ascii_lowercase().contains("connection: close"), "{}", &out[out.len() - 40..]);
+        // No end of head: nothing is added.
+        assert_eq!(put(b"HTTP/1.1 200 OK\r\nContent-Le", "close"), "HTTP/1.1 200 OK\r\nContent-Le");
+    }
+
     /// The shared `CURRENT_RES_STATUS` starts at 0, meaning "no response yet".
     ///
     /// The engine's old private copy defaulted to 200, so `status` reported a response
@@ -11220,35 +11324,6 @@ mod registry_tests {
         let ctx = SampleContext::default();
         let expr = Expr::parse("status").expect("status must parse");
         assert_eq!(expr.eval_sample(&reg, &ctx), None);
-    }
-
-    #[test]
-    fn test_inject_connection_close_zero_alloc() {
-        let mut b = crate::buf::Buf::standard();
-        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
-        b.writable()[..raw.len()].copy_from_slice(raw);
-        b.commit(raw.len());
-        inject_connection_close_header_zero_alloc(&mut b);
-        // Exact bytes. `contains` passed while the header was glued onto the previous one
-        // ("Content-Length: 2Connection: close") and a blank line was added -- every
-        // response Ibex closed after went out that way.
-        assert_eq!(
-            std::str::from_utf8(b.readable()).unwrap(),
-            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
-        );
-    }
-
-    #[test]
-    fn test_inject_connection_close_bare_lf() {
-        let mut b = crate::buf::Buf::standard();
-        let raw = b"HTTP/1.1 200 OK\nContent-Length: 2\n\nok";
-        b.writable()[..raw.len()].copy_from_slice(raw);
-        b.commit(raw.len());
-        inject_connection_close_header_zero_alloc(&mut b);
-        assert_eq!(
-            std::str::from_utf8(b.readable()).unwrap(),
-            "HTTP/1.1 200 OK\nContent-Length: 2\nConnection: close\r\n\nok"
-        );
     }
 }
 
