@@ -1575,12 +1575,12 @@ impl TcpSession {
                             req_m = Some(req.method.to_string());
                             req_u = Some(req.uri.to_string());
                             if req.version == "HTTP/1.0"
-                                && !htx.headers().any(|(k, v)| k.eq_ignore_ascii_case("connection") && v.eq_ignore_ascii_case("keep-alive"))
+                                && !htx.headers().any(|(k, v)| k.eq_ignore_ascii_case("connection") && txn::connection_has(v, "keep-alive"))
                             {
                                 conn_close = true;
                             }
                         }
-                        if htx.headers().any(|(k, v)| k.eq_ignore_ascii_case("connection") && v.eq_ignore_ascii_case("close")) {
+                        if htx.headers().any(|(k, v)| k.eq_ignore_ascii_case("connection") && txn::connection_has(v, "close")) {
                             conn_close = true;
                         }
                         let wire_replacement = if self.htx_modified {
@@ -1678,6 +1678,7 @@ impl TcpSession {
                     .map_or(txn::Framing::None, |(h, e)| txn::request_framing(&self.req.readable()[..h + e]));
                 let mut txn = HttpTxn::new(framing, close || self.close_client);
                 txn.req_htx = req_htx;
+                txn.req_http11 = self.req.readable().split(|&b| b == b'\n').next().is_some_and(|l| l.trim_ascii_end().ends_with(b"HTTP/1.1"));
                 // The client's own method: rules that rewrite it have not run yet.
                 txn.client_head = self.req_method.as_deref().is_some_and(|m| m.eq_ignore_ascii_case("HEAD"));
                 self.txn = Some(txn);
