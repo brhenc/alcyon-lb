@@ -299,6 +299,7 @@ fn first_check_result_is_reported_even_when_the_health_counter_does_not_move() {
         rise: 1,
         fall: 1,
         timeout: Duration::from_millis(2000),
+        ..Default::default()
     };
     let addr: SocketAddr = "127.0.0.1:1".parse().expect("addr");
     let mut check = ServerCheckState::new(0, 0, addr, config, Tick(0));

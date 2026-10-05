@@ -27,6 +27,8 @@ pub(crate) fn parse_server(
     let who = Some(tokens[1].text.as_str());
     let mut check = default_server.is_some_and(|d| d.check);
     let mut inter = default_server.and_then(|d| d.inter);
+    let mut fastinter = default_server.and_then(|d| d.fastinter);
+    let mut downinter = default_server.and_then(|d| d.downinter);
     let mut fall = default_server.and_then(|d| d.fall);
     let mut rise = default_server.and_then(|d| d.rise);
     let mut send_proxy = default_server.is_some_and(|d| d.send_proxy);
@@ -64,6 +66,14 @@ pub(crate) fn parse_server(
             "no-check" => check = false,
             "inter" => {
                 inter = Some(parse_timeout(server_kw_arg(tokens, i, who, "expects a delay as argument.")?, "inter")?);
+                i += 1;
+            }
+            "fastinter" => {
+                fastinter = Some(parse_timeout(server_kw_arg(tokens, i, who, "expects a delay as argument.")?, "fastinter")?);
+                i += 1;
+            }
+            "downinter" => {
+                downinter = Some(parse_timeout(server_kw_arg(tokens, i, who, "expects a delay as argument.")?, "downinter")?);
                 i += 1;
             }
             "fall" => {
@@ -202,7 +212,13 @@ pub(crate) fn parse_server(
         weight,
         maxconn,
         pool: {
-            let pool = crate::ast::server::ServerPool { max_conn: pool_max_conn, low_conn: pool_low_conn, purge_delay: pool_purge_delay };
+            let pool = crate::ast::server::ServerPool {
+                max_conn: pool_max_conn,
+                low_conn: pool_low_conn,
+                purge_delay: pool_purge_delay,
+                fastinter_ms: fastinter.map_or(0, |d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX)),
+                downinter_ms: downinter.map_or(0, |d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX)),
+            };
             (pool != crate::ast::server::ServerPool::default()).then(|| Box::new(pool))
         },
         backup,
@@ -526,6 +542,14 @@ pub(crate) fn parse_default_server(
             "no-check" => cfg.check = false,
             "inter" => {
                 cfg.inter = Some(parse_timeout(server_kw_arg(tokens, i, None, "expects a delay as argument.")?, "inter")?);
+                i += 1;
+            }
+            "fastinter" => {
+                cfg.fastinter = Some(parse_timeout(server_kw_arg(tokens, i, None, "expects a delay as argument.")?, "fastinter")?);
+                i += 1;
+            }
+            "downinter" => {
+                cfg.downinter = Some(parse_timeout(server_kw_arg(tokens, i, None, "expects a delay as argument.")?, "downinter")?);
                 i += 1;
             }
             "fall" => {

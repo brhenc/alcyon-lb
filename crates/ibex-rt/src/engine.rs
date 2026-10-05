@@ -1421,16 +1421,21 @@ impl Drop for Engine {
 /// The listening sockets for one bind on one worker: whatever the previous process handed
 /// over through `-x` (see [`crate::handover`]), or one freshly bound socket if nothing was.
 /// Each is registered for `_getsocks`, so the *next* reload can take it over in turn.
-fn listeners_for(worker_id: usize, addr: SocketAddr, proxy: u32) -> io::Result<Vec<Listener>> {
+fn listeners_for(
+    worker_id: usize,
+    addr: SocketAddr,
+    proxy: u32,
+    tuning: &ibex_config::ast::SocketTuning,
+) -> io::Result<Vec<Listener>> {
     let mut out = Vec::new();
     for fd in crate::handover::take_inherited(worker_id, addr) {
-        match Listener::adopt(fd, addr, 128, proxy) {
+        match Listener::adopt(fd, addr, 128, proxy, tuning) {
             Ok(l) => out.push(l),
             Err(e) => eprintln!("[WARNING] {e}; binding a fresh socket instead"),
         }
     }
     if out.is_empty() {
-        out.push(Listener::bind(addr, 128, proxy)?);
+        out.push(Listener::bind_tuned(addr, 128, proxy, tuning)?);
     }
     for l in &out {
         crate::handover::expose(l.addr(), l.borrowed_fd())?;
@@ -2251,6 +2256,7 @@ fn frontend_binds(frontend: &ibex_config::FrontendSection) -> Vec<ibex_config::a
     if let Some(ba) = frontend.bind {
         if !all_binds.iter().any(|b| b.addr == ba) {
             all_binds.insert(0, ibex_config::ast::BindConfig {
+                sock: None,
                 addr: ba,
                 quic: false,
                 ssl: false,
@@ -2337,6 +2343,8 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, list
             if let Some(inter) = s.inter {
                 cfg.inter = inter;
             }
+            cfg.fastinter_ms = s.fastinter_ms();
+            cfg.downinter_ms = s.downinter_ms();
             if let Some(fall) = s.fall {
                 cfg.fall = fall;
             }
@@ -2604,6 +2612,8 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, be:
             if let Some(inter) = s.inter {
                 cfg.inter = inter;
             }
+            cfg.fastinter_ms = s.fastinter_ms();
+            cfg.downinter_ms = s.downinter_ms();
             if let Some(fall) = s.fall {
                 cfg.fall = fall;
             }
@@ -3001,6 +3011,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             // A section built in code with `addr` alone is one plaintext bind on it.
             let binds = if listen.binds.is_empty() {
                 vec![ibex_config::ast::BindConfig {
+                    sock: None,
                     addr: listen.addr,
                     quic: false,
                     ssl: false,
@@ -3019,7 +3030,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             };
             for (bind_idx, b) in binds.iter().enumerate() {
                 let tls = bind_tls(&listen.name, &binds, b.addr)?;
-                for mut listener in listeners_for(worker_id, b.addr, usize_to_u32(proxy_idx))? {
+                for mut listener in listeners_for(worker_id, b.addr, usize_to_u32(proxy_idx), b.sock.as_deref().unwrap_or(&ibex_config::ast::SocketTuning::default()))? {
                     listener.luid = proxies[proxy_idx].ids.listener_ids.get(bind_idx).copied().unwrap_or(0);
                     listener.maxconn = proxies[proxy_idx].maxconn.clone();
                     listener.name = b.name.as_deref().map(Into::into);
@@ -3064,7 +3075,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     quic_listeners.push(ql);
                 } else {
                     let tls = bind_tls(&frontend.name, &frontend.binds, bind_addr)?;
-                    for mut listener in listeners_for(worker_id, bind_addr, usize_to_u32(proxy_idx))? {
+                    for mut listener in listeners_for(worker_id, bind_addr, usize_to_u32(proxy_idx), b.sock.as_deref().unwrap_or(&ibex_config::ast::SocketTuning::default()))? {
                         listener.luid = proxies[proxy_idx].ids.listener_ids.get(bind_idx).copied().unwrap_or(0);
                         listener.maxconn = proxies[proxy_idx].maxconn.clone();
                         listener.name = b.name.as_deref().map(Into::into);

@@ -394,15 +394,6 @@ pub(crate) fn parse_listen_directive(
         }
         "declare" => parse_declare(tokens, kw),
         "bind" => parse_listen_bind(proxy, tokens, kw),
-        "accept-proxy" => {
-            proxy.accept_proxy = true;
-            Ok(())
-        }
-        "accept-proxy-v2" => {
-            proxy.accept_proxy = true;
-            proxy.accept_proxy_v2 = true;
-            Ok(())
-        }
         "stick-table" => parse_stick_table(&mut proxy.stick_table, tokens, kw),
         "stick" => parse_stick_rule(&mut proxy.stick_rules, tokens, kw),
         "track-sc0" | "track-sc1" | "track-sc2" => {
@@ -498,15 +489,6 @@ pub(crate) fn parse_frontend_directive(
                 "[ibex] warning: line {}: 'cookie' ignored because frontend '{}' has no backend capability.",
                 kw.line, fe.name
             );
-            Ok(())
-        }
-        "accept-proxy" => {
-            fe.accept_proxy = true;
-            Ok(())
-        }
-        "accept-proxy-v2" => {
-            fe.accept_proxy = true;
-            fe.accept_proxy_v2 = true;
             Ok(())
         }
         "tcp-request" => parse_frontend_tcp_request(fe, tokens, kw),
@@ -750,8 +732,8 @@ pub(crate) fn parse_backend_directive(
 /// honoured or refused the same way in either (T110).
 ///
 /// A keyword Ibex handles is read here; every other one goes to
-/// `bind_keywords::unimplemented_bind_keyword`, which refuses it or skips it and its
-/// argument with a warning, and refuses an unknown one as `HAProxy` does.
+/// `bind_keywords::unimplemented_bind_keyword`, which refuses it (or an unknown one, as
+/// `HAProxy` does): a keyword that is accepted must reach the data path.
 pub(crate) fn parse_bind(tokens: &[Token], kw: &Token, section: &str) -> Result<BindConfig, ConfigError> {
     if tokens.len() < 2 || tokens[1].text.is_empty() {
         return Err(ConfigError::new(
@@ -762,6 +744,7 @@ pub(crate) fn parse_bind(tokens: &[Token], kw: &Token, section: &str) -> Result<
     }
     let (addr, quic) = parse_socket_addr(&tokens[1], None)?;
     let mut bind = BindConfig {
+        sock: None,
         addr,
         quic,
         ssl: false,
@@ -828,7 +811,39 @@ pub(crate) fn parse_bind(tokens: &[Token], kw: &Token, section: &str) -> Result<
                 bind.accept_proxy = true;
                 bind.accept_proxy_v2 = true;
             }
-            _ => i = super::bind_keywords::unimplemented_bind_keyword(tokens, i, section)?,
+            // Socket options: `Listener::bind_tuned` applies them to the listening socket.
+            "backlog" => {
+                let a = arg(i, "expects an integer argument")?;
+                bind.sock.get_or_insert_with(Default::default).backlog = Some(a.text.parse::<u32>().map_err(|_| {
+                    ConfigError::new(a.line, a.col, format!("{prefix} : 'backlog' : expects an integer argument, found '{}'", a.text))
+                })?);
+                i += 1;
+            }
+            "v6only" => bind.sock.get_or_insert_with(Default::default).v6only = Some(true),
+            "v4v6" => bind.sock.get_or_insert_with(Default::default).v6only = Some(false),
+            "tcp-ut" => {
+                let a = arg(i, "expects a delay as argument")?;
+                bind.sock.get_or_insert_with(Default::default).tcp_user_timeout = Some(parse_timeout(a, "tcp-ut")?);
+                i += 1;
+            }
+            "cc" => {
+                bind.sock.get_or_insert_with(Default::default).congestion = Some(arg(i, "expects a congestion control algorithm")?.text.clone());
+                i += 1;
+            }
+            // Threads are not numbered in Ibex: the kernel spreads connections over the
+            // workers (`SO_REUSEPORT`). `thread all` is what that already does.
+            "thread" => {
+                let a = arg(i, "expects a thread set")?;
+                if a.text != "all" {
+                    return Err(ConfigError::new(
+                        a.line,
+                        a.col,
+                        format!("{prefix} : 'thread' : only 'thread all' is supported by Ibex, found '{}'", a.text),
+                    ));
+                }
+                i += 1;
+            }
+            _ => return Err(super::bind_keywords::unimplemented_bind_keyword(tokens, i, section)),
         }
         i += 1;
     }
