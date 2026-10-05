@@ -154,7 +154,7 @@ fn errorloc_and_replace_uri_refusals() {
         ("errorloc 503 /x extra", "errorloc : expects exactly two arguments."),
         ("errorloc 999 /x", "errorloc : status code '999' not handled."),
         ("errorloc302 abc /x", "errorloc302 : status code '0' not handled."),
-        ("http-request replace-uri a", "expects <regex> and <replace>"),
+        ("http-request replace-uri a", "expects exactly 2 arguments <match-regex> and <replace-format>"),
     ] {
         let err = parse_config(&cfg("frontend", line)).expect_err(line).to_string();
         assert!(err.contains(want), "{line}: {err}");

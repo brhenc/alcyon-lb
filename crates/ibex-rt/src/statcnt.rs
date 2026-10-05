@@ -135,6 +135,14 @@ impl TxnCounters {
         (self.downtime_ms.load(Ordering::Relaxed) + open) / 1000
     }
 
+    /// Zeroes the maxima only (`clear counters` without `all`); `smax` shows at least the
+    /// current sessions again.
+    pub fn clear_max(&self) {
+        self.rate_max.store(0, Ordering::Relaxed);
+        self.smax.store(0, Ordering::Relaxed);
+        self.req_rate_max.store(0, Ordering::Relaxed);
+    }
+
     /// Zeroes everything (`clear counters`).
     pub fn clear(&self) {
         for h in &self.hrsp {

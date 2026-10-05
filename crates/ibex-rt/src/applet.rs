@@ -393,13 +393,14 @@ impl CliApplet {
                     // A tracker whose target is in maintenance or drain has the inherited flags
                     // instead (SRV_ADMF_IMAINT 2, SRV_ADMF_IDRAIN 16).
                     let inherited = crate::track::inherited(p, s_idx);
+                    // A server the file disabled keeps SRV_ADMF_CMAINT (4) for good.
                     let admin_state = match status {
                         Some(ServerStatus::Maint) if inherited => 2,
                         Some(ServerStatus::Drain) if inherited => 16,
                         Some(ServerStatus::Maint) => 1,
                         Some(ServerStatus::Drain) => 8,
                         _ => 0,
-                    };
+                    } | if p.server_cmaint(s_idx) { 4 } else { 0 };
                     let uweight = p.server_weights.get(s_idx).copied().unwrap_or(1);
                     let iweight = p.initial_weight(s_idx);
                     
@@ -486,10 +487,8 @@ impl CliApplet {
             .or_else(|| cmd.strip_prefix("shutdown session backend "))
         {
             self.handle_shutdown_sessions_backend(target.trim(), ctx);
-        } else if cmd == "clear counters" || cmd == "clear counters all" {
-            self.handle_clear_counters(None, ctx);
-        } else if let Some(target) = cmd.strip_prefix("clear counters ") {
-            self.handle_clear_counters(Some(target.trim()), ctx);
+        } else if cmd == "clear counters" || cmd.starts_with("clear counters ") {
+            self.handle_clear_counters(cmd["clear counters".len()..].trim(), ctx);
         } else if let Some(target) = cmd.strip_prefix("enable health ") {
             self.handle_enable_health(target.trim(), ctx);
         } else if let Some(target) = cmd.strip_prefix("disable health ") {
@@ -913,46 +912,47 @@ impl CliApplet {
         }
     }
 
-    fn handle_clear_counters(&mut self, target: Option<&str>, ctx: &mut AppletContext) {
-        if let Some(t) = target {
-            if let Some(rest) = t.strip_prefix("server ") {
-                let rest = rest.strip_suffix(" force").unwrap_or(rest).trim();
-                let (px_name, sv_name) = match rest.split_once('/') {
-                    Some(pair) => pair,
-                    None => ("", rest),
-                };
-                let mut found_px = false;
-                let mut found_sv = false;
-                for p in ctx.proxies.iter() {
-                    if px_name.is_empty() || p.name == px_name {
-                        found_px = true;
-                        if p.server_ids.iter().any(|sid| sid == sv_name) {
-                            found_sv = true;
-                            break;
-                        }
+    /// `clear counters [all | server <be>/<sv> [force] | <anything>]` (`cli_parse_clear_counters`,
+    /// `src/stats.c`; measured on HAProxy 3.5-dev8-885761-29): `all` resets every counter of
+    /// every proxy, `server` those of one server, and anything else -- no word, or one that is
+    /// neither, there is no per-proxy form -- only the maxima of every proxy.
+    fn handle_clear_counters(&mut self, rest: &str, ctx: &mut AppletContext) {
+        let first = rest.split_whitespace().next();
+        if first == Some("server") {
+            let rest = rest["server".len()..].trim();
+            let rest = rest.strip_suffix(" force").unwrap_or(rest).trim();
+            let Some((px_name, sv_name)) = rest.split_once('/') else {
+                self.finish_msg("Require 'backend/server'.");
+                return;
+            };
+            let mut found_px = false;
+            let mut found = None;
+            for (p_idx, p) in ctx.proxies.iter().enumerate() {
+                if p.name == px_name {
+                    found_px = true;
+                    if let Some(s_idx) = p.server_ids.iter().position(|sid| sid == sv_name) {
+                        found = Some((p_idx, s_idx));
+                        break;
                     }
                 }
-                if !found_px && !px_name.is_empty() {
-                    self.out_buf.extend_from_slice(b"No such backend.
-");
-                } else if !found_sv {
-                    self.out_buf.extend_from_slice(b"No such server.
-");
-                } else {
-                    self.out_buf.extend_from_slice(b"Server counters cleared.
-");
-                }
-            } else if !crate::engine::clear_proxy_counters(ctx.proxies, Some(t)) {
-                self.out_buf.extend_from_slice(b"No such backend.
-");
             }
-        } else {
+            if !found_px {
+                self.finish_msg("No such backend.");
+            } else if let Some((p_idx, s_idx)) = found {
+                crate::engine::clear_server_counters(&ctx.proxies[p_idx], s_idx);
+                self.finish_msg("Server counters cleared.");
+            } else {
+                self.finish_msg("No such server.");
+            }
+            return;
+        } else if first == Some("all") {
             crate::engine::clear_proxy_counters(ctx.proxies, None);
-        }
-        if self.interactive {
-            self.out_buf.extend_from_slice(b"\n> ");
+            self.finish_msg("");
+            return;
         } else {
-            self.is_done = true;
+            crate::engine::clear_proxy_maxima(ctx.proxies);
+            self.finish_msg("");
+            return;
         }
     }
 

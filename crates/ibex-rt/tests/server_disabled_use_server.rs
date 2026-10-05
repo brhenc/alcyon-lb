@@ -381,3 +381,31 @@ fn use_server_resolves_servers_declared_after_it_and_in_listens() {
     assert_ne!(code, Some(0));
     assert!(out.contains("listen 'l' : unable to find server 's9' referenced in a 'use-server' rule."), "{out}");
 }
+
+/// `<op_state> <admin_state>` of a server in `show servers state b`.
+fn state_of(ibex: &Ibex, sv: &str) -> String {
+    let out = cli(ibex, "show servers state b");
+    out.lines()
+        .map(|l| l.split(' ').collect::<Vec<_>>())
+        .find(|f| f.get(3) == Some(&sv))
+        .map_or_else(|| format!("<no {sv} in {out:?}>"), |f| format!("{} {}", f[5], f[6]))
+}
+
+/// T146b item 6, measured on HAProxy 3.5-dev8-885761-29: a server the configuration
+/// disables carries `SRV_ADMF_CMAINT` (4) as well as `FMAINT` (1), and the CLI never clears
+/// the 4: `enable server` leaves 4, `disable server` goes back to 5. A server disabled over
+/// the CLI has only 1.
+#[test]
+fn show_servers_state_admin_flags_of_a_config_disabled_server() {
+    let (ibex, _fe) = start(&backend("", "  server s1 {s1} disabled\n  server s2 {s2}\n"));
+    assert_eq!(state_of(&ibex, "s1"), "0 5");
+    assert_eq!(state_of(&ibex, "s2"), "2 0");
+    cli(&ibex, "enable server b/s1");
+    assert_eq!(state_of(&ibex, "s1"), "2 4");
+    cli(&ibex, "disable server b/s1");
+    assert_eq!(state_of(&ibex, "s1"), "0 5");
+    cli(&ibex, "disable server b/s2");
+    assert_eq!(state_of(&ibex, "s2"), "0 1");
+    cli(&ibex, "enable server b/s2");
+    assert_eq!(state_of(&ibex, "s2"), "2 0");
+}
