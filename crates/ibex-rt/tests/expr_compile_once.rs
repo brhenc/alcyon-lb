@@ -47,7 +47,13 @@ fn compiles_per_request(rules: &str, path: &str, want: &str) -> (u64, u64) {
 
 /// As [`compiles_per_request`], with `added` put in the `@LIST@` pattern file (`add acl`)
 /// between the warm-up request and the measured one.
+/// One measurement at a time: building an engine starts a new expression generation
+/// (`Expr::new_generation`), which empties every thread's cache, so a test that builds its
+/// engine while another is between its two requests would make that one parse again.
+static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn compiles_per_request_after(rules: &str, warm: (&str, &str), added: Option<&str>, (path, want): (&str, &str)) -> (u64, u64) {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let sl = TcpListener::bind("127.0.0.1:0").expect("bind");
     let sa = sl.local_addr().expect("addr");
     let fl = TcpListener::bind("127.0.0.1:0").expect("bind");
