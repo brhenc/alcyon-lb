@@ -31,11 +31,20 @@ use std::os::fd::{AsRawFd, BorrowedFd};
 ///
 /// rustls needs `WouldBlock` reported as an error of that kind, which is the one place
 /// the project wants the errno rather than [`Io`].
-struct Sock<'a>(BorrowedFd<'a>);
+///
+/// `drained` is whether the last read left the socket empty: shorter than asked, or
+/// `EAGAIN` (see [`TlsConn::sock_drained`]).
+struct Sock<'a>(BorrowedFd<'a>, bool);
 
 impl Read for Sock<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match raw::recv(self.0, buf)? {
+        let r = raw::recv(self.0, buf)?;
+        self.1 = match r {
+            Io::Done(n) => n < buf.len(),
+            Io::WouldBlock => true,
+            Io::Eof | Io::Closed => false,
+        };
+        match r {
             Io::Done(n) => Ok(n),
             Io::Eof => Ok(0),
             Io::WouldBlock => Err(io::ErrorKind::WouldBlock.into()),
@@ -58,6 +67,7 @@ impl Write for Sock<'_> {
 }
 
 /// Per-connection TLS state.
+#[allow(clippy::struct_excessive_bools)] // independent facts about the stream, not a state machine
 pub struct TlsConn {
     ctx: RustlsContext,
     /// The peer sent `close_notify`: the stream ended where it said it would.
@@ -78,6 +88,11 @@ pub struct TlsConn {
     /// handshake. `prefix_sent` is how much of it is out.
     prefix: Vec<u8>,
     prefix_sent: usize,
+    /// The last read of the socket left it empty (a read shorter than asked, or
+    /// `EAGAIN`). With no plaintext left in rustls either, there is nothing to read until
+    /// the poller says so, as for a plaintext socket (`fd_cant_recv`). Not knowing this,
+    /// the TLS side read until `EAGAIN` on every pass: 7 of 9 reads a request (T186).
+    sock_drained: bool,
 }
 
 impl TlsConn {
@@ -90,6 +105,7 @@ impl TlsConn {
             failed: false,
             prefix: Vec::new(),
             prefix_sent: 0,
+            sock_drained: false,
         }
     }
 
@@ -155,7 +171,7 @@ impl TlsConn {
     /// Called from both directions. A partial write is not an error: rustls keeps the
     /// remainder and [`Self::wants_write`] stays true, so the poller brings us back.
     fn flush(&mut self, fd: BorrowedFd<'_>) -> io::Result<()> {
-        let mut sock = Sock(fd);
+        let mut sock = Sock(fd, false);
         loop {
             let wants = match self.ctx.session.as_ref() {
                 Some(TlsSession::Server(c)) => c.wants_write(),
@@ -186,7 +202,14 @@ impl TlsConn {
     ///
     /// Returns `Ok(false)` at end of stream.
     fn fill(&mut self, fd: BorrowedFd<'_>) -> io::Result<bool> {
-        let mut sock = Sock(fd);
+        let mut sock = Sock(fd, false);
+        let r = self.fill_from(&mut sock);
+        self.sock_drained = sock.1;
+        r
+    }
+
+    fn fill_from(&mut self, sock: &mut Sock<'_>) -> io::Result<bool> {
+        let fd = sock.0;
         loop {
             let wants = match self.ctx.session.as_ref() {
                 Some(TlsSession::Server(c)) => c.wants_read(),
@@ -197,8 +220,8 @@ impl TlsConn {
                 return Ok(true);
             }
             let res = match self.ctx.session.as_mut() {
-                Some(TlsSession::Server(c)) => c.read_tls(&mut sock),
-                Some(TlsSession::Client(c)) => c.read_tls(&mut sock),
+                Some(TlsSession::Server(c)) => c.read_tls(sock),
+                Some(TlsSession::Client(c)) => c.read_tls(sock),
                 None => return Ok(true),
             };
             match res {
@@ -434,6 +457,23 @@ impl ClientXprt {
                     Err(e) => Err(e),
                 }
             }
+        }
+    }
+
+    /// Whether the read that returned `r` for `asked` bytes left nothing to read until
+    /// the poller reports the socket again: a short read or `EAGAIN` for plaintext; for
+    /// TLS, that and a socket the last ciphertext read emptied too (rustls holds no
+    /// plaintext once a read of it comes back short).
+    #[must_use]
+    pub fn drained(&self, r: Io, asked: usize) -> bool {
+        let plain = match r {
+            Io::WouldBlock => true,
+            Io::Done(n) => n < asked,
+            Io::Eof | Io::Closed => false,
+        };
+        match self {
+            ClientXprt::Plain => plain,
+            ClientXprt::Tls(t) => plain && t.sock_drained,
         }
     }
 

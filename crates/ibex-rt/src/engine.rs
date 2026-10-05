@@ -6628,6 +6628,12 @@ impl EngineDispatcher<'_> {
             if h2.send_h1_head(stream_id, &data[..h], end_stream) {
                 txn.rsp.consume(data, h + e);
                 sess.rep.consume(h + e);
+                // The body that came with the head goes out with it, in the same write: on
+                // its own, a poller round later, it is a second write, and a second small
+                // segment Nagle holds until the client's delayed ACK, ~40 ms a request (T186).
+                if !end_stream {
+                    Self::h2_forward_response(entry);
+                }
             }
             return;
         }

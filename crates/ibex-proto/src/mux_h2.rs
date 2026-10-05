@@ -112,6 +112,10 @@ pub struct H2MuxContext {
     pub total_streams: usize,
     pub glitch_count: usize,
     pub graceful_goaway_sent: bool,
+    /// The highest stream id that has had an entry in `streams`. A closed stream is taken
+    /// out of the map when its transaction ends; an id at or below this one and not in the
+    /// map is a closed stream, not a new one.
+    pub highest_opened: u32,
 }
 
 impl H2MuxContext {
@@ -154,6 +158,7 @@ impl H2MuxContext {
             total_streams: 0,
             glitch_count: 0,
             graceful_goaway_sent: false,
+            highest_opened: 0,
         }
     }
 
@@ -641,6 +646,13 @@ impl MuxH2 {
             return Ok(());
         }
 
+        if !ctx.streams.contains_key(&stream_id) && stream_id <= ctx.highest_opened {
+            // Closed, and let go: answered as while closed streams were kept (the block is
+            // decoded above all the same, so the HPACK table stays in step).
+            ctx.send_rst_stream(stream_id, H2Error::StreamClosed);
+            return Ok(());
+        }
+
         let abs_prefix = {
             let get = |n: &str| decoded_headers.iter().find(|h| h.name == n).map(|h| h.value.as_str());
             get(":scheme").zip(get(":authority")).map(|(s, a)| format!("{s}://{a}"))
@@ -655,6 +667,7 @@ impl MuxH2 {
 
         stream.state = H2StreamState::Open;
         stream.abs_prefix = abs_prefix;
+        ctx.highest_opened = ctx.highest_opened.max(stream_id);
 
         // Extract pseudo-headers and construct HTX blocks
         match crate::htx::pseudo_headers_to_htx(decoded_headers, HttpVersion::Http20) {
@@ -1095,5 +1108,36 @@ mod tests {
         ctx.streams.get_mut(&5).unwrap().state = H2StreamState::HalfClosedRemote;
         assert_eq!(ctx.send_data(5, &[], true), 0);
         assert_eq!(ctx.streams.get(&5).unwrap().state, H2StreamState::Closed);
+    }
+
+    /// A closed stream is taken out of the map when its transaction ends (T186). HEADERS
+    /// on its id again is still a closed stream's (RST_STREAM STREAM_CLOSED, as while it
+    /// was kept), not a new request, and the HPACK table stays in step: the next new
+    /// stream decodes.
+    #[test]
+    fn headers_on_a_closed_stream_let_go_are_refused_as_closed() {
+        let mux = MuxH2;
+        let mut ctx = mux.init(ConnId(1), true).expect("init");
+        let mut hello = H2_CONN_PREFACE.to_vec();
+        hello.extend_from_slice(&Frame::Settings { flags: 0, settings: vec![] }.encode());
+        mux.parse(&mut ctx, &hello).expect("handshake");
+        let mut enc = HpackEncoder::new();
+        let get = |enc: &mut HpackEncoder, path: &str, id: u32| {
+            let block = enc.encode(&[
+                HeaderField { name: ":method".into(), value: "GET".into() },
+                HeaderField { name: ":path".into(), value: path.into() },
+            ]);
+            Frame::Headers { flags: frame_flags::END_HEADERS | frame_flags::END_STREAM, stream_id: id, header_block: block }.encode()
+        };
+        mux.parse(&mut ctx, &get(&mut enc, "/one", 1)).expect("stream 1");
+        assert!(ctx.streams.contains_key(&1));
+        ctx.streams.remove(&1);
+        let sent = ctx.tx_buf.len();
+        mux.parse(&mut ctx, &get(&mut enc, "/again", 1)).expect("stream 1 again");
+        assert!(!ctx.streams.contains_key(&1), "a closed stream was opened again");
+        let rst = &ctx.tx_buf[sent..];
+        assert_eq!((rst[3], &rst[5..9], &rst[9..13]), (0x3, &[0, 0, 0, 1][..], &[0, 0, 0, 5][..]), "{rst:?}");
+        mux.parse(&mut ctx, &get(&mut enc, "/three", 3)).expect("stream 3");
+        assert_eq!(ctx.streams.get(&3).and_then(|s| s.rx_htx.req_line()).map(|r| r.uri.clone()).as_deref(), Some("/three"));
     }
 }

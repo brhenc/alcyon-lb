@@ -30,6 +30,15 @@ pub enum Io {
 thread_local! {
     static READS: Cell<u64> = const { Cell::new(0) };
     static READS_BLOCKED: Cell<u64> = const { Cell::new(0) };
+    static WRITES: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Write syscalls [`send`] has made on this thread. A response that leaves in several
+/// writes when one would do costs a syscall each, and on a client that waits for the whole
+/// response, a delayed-ACK round trip for the segments Nagle holds back (T186).
+#[must_use]
+pub fn write_counters() -> u64 {
+    WRITES.with(Cell::get)
 }
 
 /// Read syscalls [`recv`] has made on this thread, and how many of them the kernel
@@ -95,6 +104,7 @@ pub fn send(fd: BorrowedFd<'_>, buf: &[u8]) -> io::Result<Io> {
     if buf.is_empty() {
         return Ok(Io::Done(0));
     }
+    WRITES.with(|c| c.set(c.get() + 1));
     match rustix::io::write(fd, buf) {
         Ok(n) => Ok(Io::Done(n)),
         Err(Errno::AGAIN | Errno::INTR) => Ok(Io::WouldBlock),
