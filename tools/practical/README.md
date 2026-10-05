@@ -49,6 +49,39 @@ killed server move once and stay; nobody moves back; new sessions use the return
 run ends with the `show stat` status changes over time. Ports 23001-23003 (nodes), 23080-23081
 (proxy); other agents' HAProxy processes bind 180xx with SO_REUSEPORT, so avoid those.
 
+## 02-nginx-h2: client -> proxy (TLS, h2) -> nginx -> node.js
+
+Needs `nginx` (`/usr/sbin/nginx`, run unprivileged inside the work dir), `h2load`, `openssl`, `curl`,
+`node`. `app.js` is reused from `01-node` (its `npm ci` runs there). Ibex build:
+`CARGO_TARGET_DIR=/home/bhenc/ibex-targets/t193 CARGO_INCREMENTAL=0 cargo build --release --bin ibex`.
+The self-signed certificate and the 20 MB static file are generated into the work dir (nothing committed).
+
+    ./tools/practical/02-nginx-h2/run.sh [--haproxy]
+
+`use_backend static if { path_beg /static/ }`: nginx block 1 serves the static files, block 2 proxies to
+node. Cases: h2 via ALPN, 20 MB static sha256, dynamic request, 50 MB POST over h2 (sha256 echoed by
+node), `h2load -n 2000 -c 10 -m 10` (0 failed/errored; req/s informational), `option forwardfor`,
+backend 503 passthrough. Ports 24001 (node), 24011/24012 (nginx), 24080 (proxy). About 25 s.
+
+## 04-nginx-front: client -> nginx -> proxy -> node.js
+
+nginx's http module cannot send the PROXY protocol to an upstream; its `stream` module can
+(`nginx-mod-stream`, a dynamic module). `run.sh` picks the mode: `stream` (`proxy_protocol on;` into the
+proxy's `bind ... accept-proxy`) if `/usr/lib64/nginx/modules/ngx_stream_module.so` exists, otherwise
+`http` (nginx builds the XFF chain, expected values differ and are set by the script). **On this machine
+the stream module is not installed, so only the `http` mode has been run**; `ppclient.js` stands in for
+nginx's stream module (sends a PROXY v1 line) so `accept-proxy` is still exercised (case
+proxy-v1-direct). Install with `sudo dnf install nginx-mod-stream` and the PROXY path through real nginx
+runs automatically (extra case log-source-nginx; untested).
+
+    ./tools/practical/04-nginx-front/run.sh [--haproxy]
+
+Clients use source 127.0.0.2 so the "real client" differs from nginx's 127.0.0.1. Cases: XFF with the
+real client, XFF chain with a client-sent `X-Forwarded-For: 1.2.3.4`, PROXY v1 straight into
+`accept-proxy`, keep-alive through nginx, 100 MB download sha256, WebSocket echo, proxy log line
+shows the PROXY source (`log stdout format raw`). Ports 24040 (nginx), 24041 (node), 24042 (proxy plain),
+24043 (proxy accept-proxy).
+
 ## Adding a topology (nginx, apache2, ...)
 
 1. Copy `01-node` to `NN-name`; keep `app.js` if node stays at the back.
