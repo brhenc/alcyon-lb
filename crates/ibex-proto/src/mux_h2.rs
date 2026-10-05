@@ -108,6 +108,8 @@ pub struct H2MuxContext {
     pub continuation_flags: u8,
     pub continuation_buf: Vec<u8>,
     pub continuation_count: u32,
+    /// Payload length of the frame being handled, padding included: what flow control counts.
+    pub rx_frame_len: u32,
     pub flood_config: H2FloodConfig,
     pub total_streams: usize,
     pub glitch_count: usize,
@@ -154,6 +156,7 @@ impl H2MuxContext {
             continuation_flags: 0,
             continuation_buf: Vec::new(),
             continuation_count: 0,
+            rx_frame_len: 0,
             flood_config: H2FloodConfig::default(),
             total_streams: 0,
             glitch_count: 0,
@@ -182,6 +185,15 @@ impl H2MuxContext {
         };
         self.enqueue_frame(&frame);
         self.conn_state = H2ConnState::GoAwaySent;
+    }
+
+    /// After `parse` failed: makes sure the connection error is announced. Most errors have
+    /// sent their GOAWAY already; one that has not gets INTERNAL_ERROR. The GOAWAY stays
+    /// queued so the owner can flush it before closing.
+    pub fn ensure_goaway(&mut self) {
+        if self.conn_state != H2ConnState::GoAwaySent {
+            self.send_goaway(self.last_client_stream_id, H2Error::InternalError, b"connection error");
+        }
     }
 
     /// Announces a graceful shutdown: GOAWAY with `NO_ERROR` and last-stream-id 2^31-1, so
@@ -456,16 +468,19 @@ impl Mux for MuxH2 {
             let frame = match Frame::decode(&header, payload) {
                 Ok(f) => f,
                 Err(e) => {
-                    ctx.send_goaway(
-                        header.stream_id,
-                        H2Error::ProtocolError,
-                        b"frame decode error",
-                    );
+                    // InvalidInput marks FRAME_SIZE_ERROR (see `h2::strip_padding`).
+                    let code = if e.kind() == io::ErrorKind::InvalidInput {
+                        H2Error::FrameSizeError
+                    } else {
+                        H2Error::ProtocolError
+                    };
+                    ctx.send_goaway(header.stream_id, code, b"frame decode error");
                     return Err(e);
                 }
             };
 
             consumed += total_frame_len;
+            ctx.rx_frame_len = header.length;
             Self::handle_frame(ctx, frame)?;
         }
 
@@ -851,7 +866,8 @@ impl MuxH2 {
                     ));
                 }
 
-                let data_len = data.len() as i32;
+                // Padding counts toward flow control (RFC 9113 section 6.1).
+                let data_len = ctx.rx_frame_len.max(data.len() as u32).min(i32::MAX as u32) as i32;
                 ctx.conn_recv_window = ctx.conn_recv_window.saturating_sub(data_len);
 
                 if let Some(stream) = ctx.streams.get_mut(&stream_id) {
@@ -1139,5 +1155,62 @@ mod tests {
         assert_eq!((rst[3], &rst[5..9], &rst[9..13]), (0x3, &[0, 0, 0, 1][..], &[0, 0, 0, 5][..]), "{rst:?}");
         mux.parse(&mut ctx, &get(&mut enc, "/three", 3)).expect("stream 3");
         assert_eq!(ctx.streams.get(&3).and_then(|s| s.rx_htx.req_line()).map(|r| r.uri.clone()).as_deref(), Some("/three"));
+    }
+
+    fn open_conn() -> (MuxH2, H2MuxContext) {
+        let mux = MuxH2;
+        let mut ctx = mux.init(ConnId(1), true).expect("init");
+        let mut hello = H2_CONN_PREFACE.to_vec();
+        hello.extend_from_slice(&Frame::Settings { flags: 0, settings: vec![] }.encode());
+        mux.parse(&mut ctx, &hello).expect("handshake");
+        (mux, ctx)
+    }
+
+    fn post_headers(id: u32) -> Vec<u8> {
+        let block = HpackEncoder::new().encode(&[
+            HeaderField { name: ":method".into(), value: "POST".into() },
+            HeaderField { name: ":path".into(), value: "/".into() },
+        ]);
+        Frame::Headers { flags: frame_flags::END_HEADERS, stream_id: id, header_block: block }.encode()
+    }
+
+    /// RFC 9113 section 6.1: padding counts toward flow control; only the data reaches the stream.
+    #[test]
+    fn padded_data_counts_its_padding_in_the_windows() {
+        let (mux, mut ctx) = open_conn();
+        mux.parse(&mut ctx, &post_headers(1)).expect("open");
+        // Pad length 4, "abc", 4 bytes of padding: 8 bytes on the wire.
+        let mut raw = vec![0, 0, 8, 0, frame_flags::PADDED, 0, 0, 0, 1, 4, b'a', b'b', b'c', 0, 0, 0, 0];
+        mux.parse(&mut ctx, &raw).expect("padded data");
+        assert_eq!(ctx.conn_recv_window, DEFAULT_INITIAL_WINDOW_SIZE - 8);
+        assert_eq!(ctx.streams.get(&1).map(|s| s.recv_window), Some(DEFAULT_INITIAL_WINDOW_SIZE - 8));
+        // A pad length that does not fit is a connection error, PROTOCOL_ERROR.
+        raw = vec![0, 0, 2, 0, frame_flags::PADDED, 0, 0, 0, 1, 9, b'a'];
+        assert!(mux.parse(&mut ctx, &raw).is_err());
+        let goaway = ctx.tx_buf.windows(9).any(|w| w[3] == 7);
+        assert!(goaway, "no GOAWAY sent");
+    }
+
+    #[test]
+    fn ensure_goaway_announces_an_unannounced_error_once() {
+        let (_mux, mut ctx) = open_conn();
+        ctx.ensure_goaway();
+        let n = ctx.tx_buf.len();
+        assert_eq!(ctx.conn_state, H2ConnState::GoAwaySent);
+        assert!(ctx.tx_buf.windows(9).any(|w| w[3] == 7));
+        ctx.ensure_goaway();
+        assert_eq!(ctx.tx_buf.len(), n, "a second GOAWAY was queued");
+    }
+
+    /// A padded frame that cannot hold its pad length byte is FRAME_SIZE_ERROR (HAProxy).
+    #[test]
+    fn padded_frame_without_pad_length_is_goaway_frame_size_error() {
+        let (mux, mut ctx) = open_conn();
+        let sent = ctx.tx_buf.len();
+        let raw = [0, 0, 0, 1, frame_flags::PADDED | frame_flags::END_HEADERS, 0, 0, 0, 1];
+        assert!(mux.parse(&mut ctx, &raw).is_err());
+        let g = &ctx.tx_buf[sent..];
+        let at = g.windows(9).position(|w| w[3] == 7).expect("GOAWAY");
+        assert_eq!(&g[at + 9 + 4..at + 9 + 8], &[0, 0, 0, 6], "{g:?}");
     }
 }
