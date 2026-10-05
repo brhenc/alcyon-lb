@@ -118,6 +118,13 @@ rustup toolchain install nightly
 cargo install cargo-fuzz
 ```
 
+On this machine both are installed (2026-10-05) under `~/.cargo/bin`, which is not on
+`PATH` (the system `cargo` in `/usr/bin` is the stable one the gate uses). Call it as
+`~/.cargo/bin/cargo +nightly fuzz …`, or `export PATH=$HOME/.cargo/bin:$PATH` in the
+shell you fuzz from. Every command below runs **from the repository root** with
+`--fuzz-dir fuzz/libfuzzer`; run from inside `fuzz/libfuzzer`, cargo-fuzz looks for
+`fuzz/libfuzzer/fuzz/Cargo.toml` and fails.
+
 (`cargo-fuzz` is a Cargo plugin; libFuzzer itself is fetched as the `libfuzzer-sys`
 crate on the first build.) Use a target directory on a big disk, not /tmp:
 
@@ -128,39 +135,41 @@ export CARGO_TARGET_DIR=$HOME/ibex-targets/fuzz CARGO_INCREMENTAL=0
 ## Run one target for a minute
 
 ```
-cd fuzz/libfuzzer
-cargo +nightly fuzz run hpack -- -max_total_time=60
+cargo +nightly fuzz run --fuzz-dir fuzz/libfuzzer hpack -- -max_total_time=60
 ```
 
 It prints a line per new coverage find (`#12345 NEW cov: ... exec/s: ...`) and stops
 after 60 s with "Done". No `crash-` line means nothing was found. Drop `-- -max_total_time=60`
-to run until you press Ctrl-C. List the targets: `cargo +nightly fuzz list`.
+to run until you press Ctrl-C. List the targets: `cargo +nightly fuzz list --fuzz-dir fuzz/libfuzzer`.
 
 ## Run all targets for N hours
 
 ```
-cd fuzz/libfuzzer
 N=2    # hours in total
-for t in $(cargo +nightly fuzz list); do
-  cargo +nightly fuzz run $t -- -max_total_time=$(( N*3600/9 )) 2>&1 | tee /tmp/fuzz-$t.log
+F="--fuzz-dir fuzz/libfuzzer"
+for t in $(cargo +nightly fuzz list $F); do
+  cargo +nightly fuzz run $F $t -- -max_total_time=$(( N*3600/9 )) 2>&1 | tee /tmp/fuzz-$t.log
 done
 ```
 
 Each target gets N/9 hours. Add `-- -max_total_time=S -rss_limit_mb=2048 -timeout=10` to
 bound memory and treat inputs slower than 10 s as hangs. To use all cores on one target:
-`cargo +nightly fuzz run <t> --jobs 8 -- -max_total_time=S`.
+`cargo +nightly fuzz run --fuzz-dir fuzz/libfuzzer <t> --jobs 8 -- -max_total_time=S`.
 
 ## Where results land
 
 - New interesting inputs: `fuzz/libfuzzer/corpus/<target>/` (seeds are committed; commit
-  only ones that add coverage you care about, or run `cargo +nightly fuzz cmin <t>` first).
+  only ones that add coverage you care about, or run `cargo +nightly fuzz cmin --fuzz-dir fuzz/libfuzzer <t>` first).
+- First run, 2026-10-05: all nine targets 60 s each, no crash, hang or OOM. Rough
+  speed: proxy_protocol 340k exec/s, h2_frames 52k, sample_expr 26k, h1_response 24k,
+  h1_request 21k, hpack 18k, logfmt 13k, config 6k, regex 1k.
 - A crash, hang or OOM: `fuzz/libfuzzer/artifacts/<target>/crash-<hash>` (or `timeout-`,
   `oom-`). The run prints the panic message and the path.
 
 ## Turn a crash into a test
 
-1. Replay it: `cargo +nightly fuzz run <target> artifacts/<target>/crash-<hash>`
-   (or `cargo +nightly fuzz fmt <target> artifacts/<target>/crash-<hash>` to print it).
+1. Replay it: `cargo +nightly fuzz run --fuzz-dir fuzz/libfuzzer <target> fuzz/libfuzzer/artifacts/<target>/crash-<hash>`
+   (or `fuzz fmt` with the same arguments to print it).
 2. Copy the file under `fuzz/libfuzzer/artifacts/` into git (it is a small binary).
 3. Write a regular `#[test]` in the crate that owns the code (see the table), calling
    the same function with the bytes (`include_bytes!` of the artifact, or an escaped
