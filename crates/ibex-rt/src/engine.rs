@@ -11721,9 +11721,7 @@ mod actconn_tests {
                 std::thread::spawn(move || {
                     let mut b = [0u8; 1024];
                     while s.read(&mut b).is_ok_and(|n| n > 0) {
-                        if s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").is_err() {
-                            return;
-                        }
+                        let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
                     }
                 });
             }
