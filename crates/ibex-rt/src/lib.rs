@@ -22,6 +22,7 @@ pub mod dgram;
 pub mod engine;
 pub mod fdtab;
 pub mod lb;
+pub mod mailbox;
 pub mod listener;
 pub use ibex_sample::localtime;
 pub mod logfmt;

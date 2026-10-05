@@ -1493,6 +1493,10 @@ pub struct Engine {
     /// The identity (device, inode) of the CLI socket file this engine created, so that on
     /// exit it only unlinks a path that is still its own. See the `Drop` impl.
     cli_socket_ident: Option<(u64, u64)>,
+    /// Requests from the other workers, and this one's way to ask them (`show sess`).
+    mailboxes: Arc<crate::mailbox::Mailboxes>,
+    /// This engine's mailbox among `mailboxes`: its worker id once `share_mailboxes` ran.
+    mailbox_wid: usize,
 }
 
 /// A `stats socket` beyond the first: the first one keeps its fields on [`Engine`].
@@ -1506,6 +1510,8 @@ struct ExtraCli {
 
 impl Drop for Engine {
     fn drop(&mut self) {
+        // Whatever the other workers still ask of this one is answered empty.
+        self.mailboxes.close(self.mailbox_wid);
         for x in &self.extra_cli {
             if socket_file_ident(&x.path) == x.ident {
                 let _ = std::fs::remove_file(&x.path);
@@ -3249,6 +3255,12 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         };
 
 
+        // A worker on its own answers itself; `share_mailboxes` joins it to the others.
+        let mailboxes = crate::mailbox::Mailboxes::new(1)?;
+        let mb_fd = mailboxes.fd(0).as_raw_fd();
+        fdtab.insert(mb_fd, FdState::Mailbox, Interest::READ);
+        poller.add(mailboxes.fd(0), raw_fd_to_u64(mb_fd), true, false)?;
+
         Ok(Engine {
             quic_listeners,
             poller,
@@ -3298,6 +3310,8 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             hard_stop_after: config.global.as_ref().and_then(|g| g.hard_stop_after),
             stop_deadline: None,
             cli_socket_ident: None,
+            mailboxes,
+            mailbox_wid: 0,
         })
     }
 
@@ -3349,6 +3363,142 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
     /// a pool of its own.
     pub fn share_idle_pools(&mut self, pools: &Arc<IdlePools>, wid: usize) {
         self.idle_backend_pool = pools.worker(wid);
+    }
+
+    /// Makes this engine worker `wid` of `boxes`, the mailboxes every worker shares: `show
+    /// sess` and `shutdown session(s)` reach the streams of all of them. Called before the
+    /// engine runs.
+    ///
+    /// # Errors
+    /// `epoll_ctl` failure.
+    pub fn share_mailboxes(&mut self, boxes: &Arc<crate::mailbox::Mailboxes>, wid: usize) -> io::Result<()> {
+        let old = self.mailboxes.fd(self.mailbox_wid);
+        let _ = self.poller.delete(old);
+        self.fdtab.remove(old.as_raw_fd());
+        self.mailboxes.close(self.mailbox_wid);
+        let fd = boxes.fd(wid);
+        self.fdtab.insert(fd.as_raw_fd(), FdState::Mailbox, Interest::READ);
+        self.poller.add(fd, raw_fd_to_u64(fd.as_raw_fd()), true, false)?;
+        self.mailboxes = Arc::clone(boxes);
+        self.mailbox_wid = wid;
+        Ok(())
+    }
+
+    /// Answers what the other workers asked: a snapshot of this worker's streams, a shutdown
+    /// of some of them, or the wakeup of a task whose request they all answered.
+    fn serve_mailbox(&mut self) {
+        let wid = self.mailbox_wid;
+        for msg in self.mailboxes.take(wid) {
+            match msg {
+                crate::mailbox::Msg::ShowSess(g) => g.reply(wid, self.snapshot_streams()),
+                crate::mailbox::Msg::Shutdown(f, g) => {
+                    let mut wake = Vec::new();
+                    let n = self.shutdown_filtered(*f, &mut wake);
+                    for t in wake {
+                        if self.scheduler.is_live(t) {
+                            self.scheduler.tasklet_wakeup(t, Class::Urgent, state::WOKEN_IO);
+                        }
+                    }
+                    g.reply(wid, n);
+                }
+                crate::mailbox::Msg::Wake(t) => {
+                    if self.scheduler.is_live(t) {
+                        self.scheduler.tasklet_wakeup(t, Class::Urgent, state::WOKEN_IO);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Shuts down this worker's streams `f` names; how many.
+    fn shutdown_filtered(&mut self, f: crate::mailbox::SessFilter, wake: &mut Vec<TaskRef>) -> usize {
+        use crate::mailbox::SessFilter;
+        let wid = self.mailbox_wid;
+        let proxies = &self.proxies;
+        let mut n = 0;
+        for (idx, e) in self.sessions.iter_mut() {
+            let hit = match f {
+                SessFilter::Server { be, srv } => e.srv_backend_idx == be && e.target_server_idx == Some(srv),
+                SessFilter::Backend(be) => e.srv_backend_idx == be,
+                SessFilter::Id(id) => crate::mailbox::sess_id(wid, idx) == id,
+            };
+            if hit {
+                shutdown_session_entry(e, proxies, wake);
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// This worker's streams as `show sess` lists them, and its CLI connections (`HAProxy`
+    /// lists the CLI's own stream too).
+    fn snapshot_streams(&self) -> Vec<crate::mailbox::SessSnap> {
+        use crate::mailbox::SessSnap;
+        let now = self.current_tick();
+        let rel = |t: Tick| t.is_set().then(|| i64::from(t.0.wrapping_sub(now.0).cast_signed()));
+        let wid = self.mailbox_wid;
+        let mut out = Vec::new();
+        for (idx, e) in self.sessions.iter() {
+            let s = &e.sess;
+            let http = matches!(s.mode, Mode::Http);
+            // HTTP/1 creates no stream before a request (`HAProxy` lists none for an idle
+            // connection).
+            if http && s.txn.is_none() && s.req.is_empty() && s.h2_ctx.is_none() {
+                continue;
+            }
+            let fe = self.proxies.get(e.proxy_idx);
+            let be = self.proxies.get(e.backend_idx).filter(|p| p.has_backend).map(|_| e.backend_idx);
+            let srv = e.target_server_idx.filter(|_| e.srv_backend_idx == e.backend_idx);
+            let cli_rex = if s.cli_exp.is_set() { s.cli_exp } else { s.req_exp };
+            let timers = [cli_rex, s.srv_exp, s.conn_exp];
+            let exp = timers.iter().copied().filter(|t| t.is_set()).reduce(Tick::earliest);
+            out.push(SessSnap {
+                id: crate::mailbox::sess_id(wid, idx),
+                created: s.created_at,
+                since: if http { s.log.first_byte.unwrap_or(s.log.start) } else { s.log.start },
+                // The listener's protocol in HAProxy; a stream here is TCP over the client's family.
+                proto: if s.client_addr.is_some_and(|a| a.is_ipv6()) { "tcpv6" } else { "tcpv4" },
+                src: s.client_addr,
+                fe: fe.map(|_| e.proxy_idx),
+                be,
+                srv,
+                req_in: s.req.len(),
+                rep_in: s.rep.len(),
+                cli_fd: e.cli_raw_fd,
+                srv_fd: e.srv_raw_fd.unwrap_or(-1),
+                cli_rex: rel(cli_rex),
+                srv_rex: rel(s.srv_exp),
+                exp: exp.and_then(rel),
+                c_exp: rel(s.conn_exp),
+                retries: s.max_retries.saturating_sub(s.conn_retries),
+                uri: s.txn.as_ref().and(s.req_uri.clone()),
+            });
+        }
+        for (aidx, a) in self.applets.iter() {
+            let exp = rel(a.last_activity.add(a.timeout_ms));
+            out.push(SessSnap {
+                id: crate::mailbox::sess_id(wid, 0x8000_0000 | aidx),
+                created: a.created,
+                since: a.created,
+                proto: "unix_stream",
+                src: None,
+                fe: None,
+                be: None,
+                srv: None,
+                req_in: 0,
+                rep_in: 0,
+                cli_fd: a.raw_fd,
+                srv_fd: -1,
+                cli_rex: exp,
+                srv_rex: None,
+                exp,
+                c_exp: None,
+                retries: 0,
+                uri: None,
+            });
+        }
+        out.sort_by_key(|x| x.created);
+        out
     }
 
     /// Computes the current monotonic tick.
@@ -3600,6 +3750,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
 
         // 4. Process polled readiness events
         let mut quic_ready: Vec<usize> = Vec::new();
+        let mut mail = false;
         for &ev in &events {
             match self.fdtab.state(ev.fd) {
                 FdState::Listener { listener: l_idx } => {
@@ -3629,10 +3780,14 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     // listener, which is why they share an arm.
                     quic_ready.push(q_idx as usize);
                 }
+                FdState::Mailbox => mail = true,
                 FdState::Closed => {}
             }
         }
         self.events = events;
+        if mail {
+            self.serve_mailbox();
+        }
 
         // Drive every QUIC listener that had readiness, and every one whose transport timer
         // has expired. `poll_timeout` is asked rather than calling `handle_timeout` on each
@@ -3677,6 +3832,8 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             log_targets: &self.log_targets,
             log_tag: &self.log_tag,
             idle_backend_pool: &mut self.idle_backend_pool,
+            mailboxes: &self.mailboxes,
+            worker_id: self.mailbox_wid,
         };
 
         let tasks_run = self.scheduler.process_runnable_tasks(&mut dispatcher);
@@ -5841,6 +5998,8 @@ struct EngineDispatcher<'a> {
     log_targets: &'a [SyslogTarget],
     log_tag: &'a str,
     idle_backend_pool: &'a mut IdlePool,
+    mailboxes: &'a Arc<crate::mailbox::Mailboxes>,
+    worker_id: usize,
 }
 
 /// Answers the current request with the page for `status`, chosen as HAProxy's
@@ -9605,6 +9764,9 @@ impl EngineDispatcher<'_> {
             total_tasks: self.total_tasks,
             run_queue_len: self.run_queue_len,
             now,
+            mailboxes: self.mailboxes,
+            worker_id: self.worker_id,
+            task: applet.task,
         };
 
         applet.process_commands(&mut applet_ctx);
