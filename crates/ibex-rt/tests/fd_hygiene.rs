@@ -74,7 +74,7 @@ fn sockets(pid: u32) -> usize {
 }
 
 fn ask(c: &mut TcpStream) -> String {
-    c.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").expect("send");
+    let _ = c.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
     let mut resp = Vec::new();
     let mut buf = [0u8; 4096];
     while !resp.ends_with(b"ok") {
@@ -129,4 +129,270 @@ fn an_idle_server_connection_the_server_closed_is_closed() {
         assert_eq!(extra, 0, "rst={rst}: {extra} server sockets open after the server closed them");
         assert!(answers.iter().all(|a| a.starts_with("HTTP/1.1 200")), "rst={rst}: {answers:?}");
     }
+}
+
+// ---- T217 churn: a few thousand mixed operations, then the descriptors are back ----
+
+use std::collections::BTreeMap;
+use std::net::Shutdown;
+use std::os::unix::net::UnixStream;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
+/// A keep-alive backend on a fixed port that can be stopped (every connection it holds is
+/// closed) and started again: the soak's server restart. `/slow` is answered after 3 s,
+/// `/big` with 20 MB.
+struct Restartable {
+    port: u16,
+    run: Arc<AtomicBool>,
+    held: Arc<Mutex<Vec<TcpStream>>>,
+}
+
+impl Restartable {
+    fn new(port: u16) -> Self {
+        let mut b = Self { port, run: Arc::new(AtomicBool::new(false)), held: Arc::default() };
+        b.start();
+        b
+    }
+
+    fn start(&mut self) {
+        let listener = TcpListener::bind(("127.0.0.1", self.port)).expect("bind backend");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let run = Arc::new(AtomicBool::new(true));
+        self.run = Arc::clone(&run);
+        let held = Arc::clone(&self.held);
+        thread::spawn(move || {
+            while run.load(Ordering::Relaxed) {
+                let Ok((s, _)) = listener.accept() else {
+                    thread::sleep(Duration::from_millis(2));
+                    continue;
+                };
+                s.set_nonblocking(false).expect("blocking");
+                if let Ok(c) = s.try_clone() {
+                    held.lock().expect("held").push(c);
+                }
+                thread::spawn(move || backend_conn(s));
+            }
+        });
+    }
+
+    fn stop(&mut self) {
+        self.run.store(false, Ordering::Relaxed);
+        thread::sleep(Duration::from_millis(20));
+        for c in self.held.lock().expect("held").drain(..) {
+            let _ = c.shutdown(Shutdown::Both);
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn backend_conn(mut s: TcpStream) {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 65536];
+    loop {
+        let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+            match s.read(&mut chunk) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            }
+            continue;
+        };
+        let head = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+        let len: usize = head.split("content-length:").nth(1).and_then(|r| r.lines().next()).and_then(|n| n.trim().parse().ok()).unwrap_or(0);
+        while buf.len() < end + 4 + len {
+            match s.read(&mut chunk) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            }
+        }
+        buf.drain(..end + 4 + len);
+        if head.contains("/slow") {
+            thread::sleep(Duration::from_secs(3));
+        }
+        if head.contains("/big") {
+            if s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 20000000\r\n\r\n").is_err() {
+                return;
+            }
+            for _ in 0..305 {
+                if s.write_all(&[b'x'; 65536]).is_err() {
+                    return;
+                }
+            }
+        } else if s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").is_err() {
+            return;
+        }
+    }
+}
+
+/// The process's descriptors by kind (`/proc/<pid>/fd`).
+fn fd_breakdown(pid: u32) -> BTreeMap<String, usize> {
+    let mut m = BTreeMap::new();
+    for e in std::fs::read_dir(format!("/proc/{pid}/fd")).expect("fd dir").filter_map(Result::ok) {
+        let Ok(l) = std::fs::read_link(e.path()) else { continue };
+        let l = l.to_string_lossy().to_string();
+        let kind = if l.starts_with('/') { "file" } else { l.split(':').next().unwrap_or("?") };
+        *m.entry(kind.to_string()).or_default() += 1;
+    }
+    m
+}
+
+/// A command on the stats socket: the whole answer.
+fn cli(path: &std::path::Path, cmd: &str) -> String {
+    let mut s = UnixStream::connect(path).expect("stats socket");
+    s.write_all(format!("{cmd}\n").as_bytes()).expect("send");
+    let mut out = String::new();
+    s.read_to_string(&mut out).expect("answer");
+    out
+}
+
+fn curr_conns(path: &std::path::Path) -> usize {
+    cli(path, "show info").lines().find_map(|l| l.strip_prefix("CurrConns: ")).and_then(|n| n.trim().parse().ok()).expect("CurrConns")
+}
+
+/// What a client of the soak does to the proxy, one way or another.
+fn churn_op(kind: usize, fe: SocketAddr, tls: SocketAddr) {
+    let get = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    let connect = |a: SocketAddr| {
+        let c = TcpStream::connect(a).expect("connect");
+        c.set_read_timeout(Some(Duration::from_secs(3))).expect("timeout");
+        c
+    };
+    match kind % 10 {
+        0 => {
+            let mut c = connect(fe);
+            for _ in 0..2 {
+                let _ = ask(&mut c);
+            }
+        }
+        1 => {
+            // aborts in the middle of the request head
+            let mut c = connect(fe);
+            let _ = c.write_all(b"GET / HTTP/1.1\r\nHost: x\r\nX-Part: ");
+        }
+        2 => {
+            // resets in the middle of the response
+            let mut c = connect(fe);
+            let _ = c.write_all(b"GET /big HTTP/1.1\r\nHost: x\r\n\r\n");
+            let mut b = [0u8; 1000];
+            let _ = c.read(&mut b);
+            let _ = rustix::net::sockopt::set_socket_linger(&c, Some(Duration::ZERO));
+        }
+        3 => {
+            // aborts a slow upload
+            let mut c = connect(fe);
+            let _ = c.write_all(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 100000\r\n\r\n");
+            let _ = c.write_all(&[b'a'; 5000]);
+        }
+        4 => {
+            // half-closed: FIN after the request, still reading
+            let mut c = connect(fe);
+            let _ = c.write_all(get.as_bytes());
+            let _ = c.shutdown(Shutdown::Write);
+            let mut r = Vec::new();
+            let _ = c.read_to_end(&mut r);
+        }
+        5 => {
+            // half-closed before the answer to a slow request
+            let mut c = connect(fe);
+            let _ = c.write_all(b"GET /slow HTTP/1.1\r\nHost: x\r\n\r\n");
+            let _ = c.shutdown(Shutdown::Write);
+        }
+        6 => {
+            // aborts during the TLS handshake
+            let mut c = connect(tls);
+            let _ = c.write_all(&[0x16, 3, 1, 0, 0xc8, 1, 0, 0]);
+        }
+        7 => {
+            // clear text on a TLS port
+            let mut c = connect(tls);
+            let _ = c.write_all(b"GET / HTTP/1.0\r\n\r\n");
+            let mut r = Vec::new();
+            let _ = c.read_to_end(&mut r);
+        }
+        8 => {
+            // `timeout server`: the answer comes later than the proxy waits
+            let mut c = connect(fe);
+            let _ = c.write_all(b"GET /slow HTTP/1.1\r\nHost: x\r\n\r\n");
+            let mut r = Vec::new();
+            let _ = c.read_to_end(&mut r);
+        }
+        _ => {
+            // `timeout http-keep-alive` / `timeout client`: idles after an answer, or sends nothing
+            let mut c = connect(fe);
+            if kind % 20 == 9 {
+                let _ = ask(&mut c);
+            }
+            let mut r = Vec::new();
+            let _ = c.read_to_end(&mut r);
+        }
+    }
+}
+
+/// A few thousand mixed operations (clients that abort or reset at every stage, half-closed
+/// clients, every timeout, TLS handshakes cut short, a health check against a dead server, the
+/// backend restarted every so often with keep-alive clients holding connections), then the
+/// descriptors of the process, by kind, are what they were before, and so are its connections
+/// (`show info` `CurrConns`). Measured on HAProxy with the same operations: back to baseline
+/// after the idle period, sockets 4 -> 4 (three listeners and the stats socket).
+#[test]
+fn descriptors_are_back_to_baseline_after_a_churn() {
+    let be_port = common::reserve_addr().port();
+    let fe = common::reserve_addr();
+    let tls = common::reserve_addr();
+    let dead = common::reserve_addr();
+    let dead_fe = common::reserve_addr();
+    let dir = tempfile::tempdir().expect("dir");
+    let stats = dir.path().join("stats.sock");
+    let cert = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/certs/localhost.pem");
+    let mut backend = Restartable::new(be_port);
+    let ibex = start(
+        &format!(
+            "global\n  nbthread 1\n  stats socket {stats}\ndefaults\n  mode http\n  timeout connect 1s\n  timeout client 500ms\n  \
+             timeout server 500ms\n  timeout http-keep-alive 500ms\n  timeout http-request 500ms\n\
+             listen l\n  bind {fe}\n  server s 127.0.0.1:{be_port}\n\
+             listen t\n  bind {tls} ssl crt {cert}\n  server s 127.0.0.1:{be_port}\n\
+             listen d\n  bind {dead_fe}\n  server d {dead} check inter 100ms\n",
+            stats = stats.display()
+        ),
+        fe,
+    );
+    let pid = ibex.0.id();
+    // the probe that waited for the listener has been timed out by then
+    thread::sleep(Duration::from_millis(1500));
+    let base = fd_breakdown(pid);
+    let base_conns = curr_conns(&stats);
+    // 40 clients of 50 operations each: 2000 in all, while the backend is restarted every
+    // second under keep-alive clients that idle between answers.
+    let n = 40 * 50;
+    let workers: Vec<_> = (0..40usize).map(|w| thread::spawn(move || (0..50usize).for_each(|i| churn_op(w * 7 + i * 3 + w * i, fe, tls)))).collect();
+    let mut held: Vec<TcpStream> = Vec::new();
+    while !workers.iter().all(thread::JoinHandle::is_finished) {
+        for _ in 0..2 {
+            let mut c = TcpStream::connect(fe).expect("connect");
+            c.set_read_timeout(Some(Duration::from_secs(3))).expect("timeout");
+            let _ = ask(&mut c);
+            held.push(c);
+        }
+        thread::sleep(Duration::from_millis(500));
+        backend.stop();
+        backend.start();
+        for c in held.iter_mut().take(2) {
+            let _ = ask(c);
+        }
+        if held.len() > 6 {
+            held.drain(..2);
+        }
+    }
+    for w in workers {
+        w.join().expect("worker");
+    }
+    drop(held);
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut now = fd_breakdown(pid);
+    while Instant::now() < deadline && (now != base || curr_conns(&stats) != base_conns) {
+        thread::sleep(Duration::from_millis(200));
+        now = fd_breakdown(pid);
+    }
+    assert_eq!(now, base, "descriptors by kind after {n} operations and an idle period");
+    assert_eq!(curr_conns(&stats), base_conns, "CurrConns after the churn");
 }
