@@ -74,9 +74,12 @@ Topologies:
 6. Real browsers: Firefox and Chromium through Ibex to a node.js single-page app
    (h2, WebSocket, SSE); look at the developer tools for errors.
 
-Load tools: `curl`, `wrk` (h1), `h2load` (nghttp2, h2), `websocat`, a small node.js
-WebSocket load script. Not installed today: `nginx`, `httpd`, `wrk`, `nghttp2`
-(`sudo dnf install nginx httpd wrk nghttp2 websocat` — the user runs it).
+Load tools: `curl`, `wrk2` (h1, constant rate, latency histogram; built from source
+into `~/.local/bin/wrk2`, rebuild steps with `~/src/wrk2-local.patch`), `h2load`
+(nghttp2, h2), node.js scripts for WebSocket (no `websocat`: the node scripts and the
+browsers in topology 6 cover it). Not installed yet: `nginx`, `httpd`, `nghttp2`
+(`sudo dnf install nginx httpd nghttp2` — the user runs it; `wrk` and `websocat` are not
+in Fedora's repositories, which made the first `dnf install` fail as a whole).
 
 ### M1 exit criteria
 
