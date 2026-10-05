@@ -84,8 +84,13 @@ echo "== topology 03 via $PROXY ($PROXY_BIN), size ${SIZE_MB} MB, work dir $WORK
 
 # 1. keep-alive through both hops: one client connection for two requests, and the same
 #    connection seen behind each hop (CGI REMOTE_PORT = proxy->httpd; node's remotePort = httpd->node)
-c=$(curl -s -o /dev/null -o /dev/null -w '%{num_connects} ' "$BASE/cgi-bin/echo.cgi" "$BASE/cgi-bin/echo.cgi")
-set -- $(curl -s "$BASE/cgi-bin/echo.cgi" "$BASE/cgi-bin/echo.cgi" | sed -n 's/.* port=//p')
+# One curl for both, and the first of the run: a second client connection finds the first
+# one's server connection in the pool, and what it takes from there depends on the thread
+# it lands on (HAProxy spreads clients over all CPUs by default; Ibex runs one thread unless
+# `nbthread` says otherwise, T202), so the ports are only comparable from an empty pool.
+ka=$(curl -s -w '\nnum_connects=%{num_connects}\n' "$BASE/cgi-bin/echo.cgi" "$BASE/cgi-bin/echo.cgi")
+c=$(echo "$ka" | sed -n 's/^num_connects=//p' | tr '\n' ' ')
+set -- $(echo "$ka" | sed -n 's/.* port=//p')
 p1=$1; p2=$2
 set -- $(curl -s "$BASE/ka" "$BASE/ka" | jfield port)
 [ "$c" = "1 0 " ] && [ -n "$p1" ] && [ "$p1" = "$p2" ] && [ -n "$1" ] && [ "$1" = "$2" ] \
