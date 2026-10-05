@@ -826,6 +826,19 @@ pub(crate) fn parse_bind(tokens: &[Token], kw: &Token, section: &str) -> Result<
                 bind.sock.get_or_insert_with(Default::default).tcp_user_timeout = Some(parse_timeout(a, "tcp-ut")?);
                 i += 1;
             }
+            "mss" => {
+                let a = arg(i, "missing MSS value")?;
+                let v = a.text.parse::<i64>().unwrap_or(0).unsigned_abs();
+                if !(1..=65535).contains(&v) {
+                    return Err(ConfigError::new(
+                        a.line,
+                        a.col,
+                        format!("{prefix} : 'mss' : expects an MSS with and absolute value between 1 and 65535"),
+                    ));
+                }
+                bind.sock.get_or_insert_with(Default::default).mss = u32::try_from(v).ok();
+                i += 1;
+            }
             "cc" => {
                 bind.sock.get_or_insert_with(Default::default).congestion = Some(arg(i, "expects a congestion control algorithm")?.text.clone());
                 i += 1;

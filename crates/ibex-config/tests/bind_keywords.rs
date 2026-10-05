@@ -133,7 +133,7 @@ fn frontend_quic_bind_defaults_its_alpn_to_h3() {
 #[test]
 fn bind_keywords_that_would_be_dropped_are_refused() {
     for kw in [
-        "tfo", "defer-accept", "mss 1000", "process 1", "thread 1", "nbconn 1", "nice 5", "shards 2", "tcp-ss 1",
+        "tfo", "defer-accept", "process 1", "thread 1", "nbconn 1", "nice 5", "shards 2", "tcp-ss 1",
         "idle-ping 1s", "label foo", "guid-prefix g",
     ] {
         let name = kw.split(' ').next().unwrap();

@@ -18,6 +18,7 @@ rustix = { version = "0.38", features = ["event", "net", "fs", "process", "std",
 ibex-mmsg = { path = "../ibex-mmsg" }
 ibex-quic = { path = "../ibex-quic" }
 ctrlc = "3.5.2"
+nix = { version = "0.31", default-features = false, features = ["net"] }
 ibex-regex = { workspace = true }
 signal-hook = "0.3"
 

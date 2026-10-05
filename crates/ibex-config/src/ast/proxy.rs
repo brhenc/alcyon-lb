@@ -168,6 +168,8 @@ pub struct SocketTuning {
     pub tcp_user_timeout: Option<Duration>,
     /// `cc <algo>`: `TCP_CONGESTION`.
     pub congestion: Option<String>,
+    /// `mss <n>`: `TCP_MAXSEG`.
+    pub mss: Option<u32>,
 }
 
 /// Bind configuration for frontend listeners.

@@ -64,6 +64,11 @@ fn apply_tuning(fd: &OwnedFd, tuning: &ibex_config::ast::SocketTuning) {
             eprintln!("[WARNING] bind: cannot set the TCP user timeout: {e}");
         }
     }
+    if let Some(mss) = tuning.mss {
+        if let Err(e) = nix::sys::socket::setsockopt(fd, nix::sys::socket::sockopt::TcpMaxSeg, &mss) {
+            eprintln!("[WARNING] bind: cannot set the MSS {mss}: {e}");
+        }
+    }
     if let Some(algo) = &tuning.congestion {
         if let Err(e) = net::sockopt::set_tcp_congestion(fd, algo) {
             eprintln!("[WARNING] bind: cannot set the congestion control '{algo}': {e}");

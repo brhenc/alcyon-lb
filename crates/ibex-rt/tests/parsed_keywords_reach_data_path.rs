@@ -107,6 +107,76 @@ fn tcp_ut_reaches_the_listening_socket() {
     assert_eq!(rustix::net::sockopt::get_tcp_user_timeout(plain.borrowed_fd()).expect("get"), 0);
 }
 
+/// T209: `mss` is `TCP_MAXSEG` on the listening socket (HAProxy: `setsockopt(TCP_MAXSEG, [1200])`).
+/// Read back from the socket `Listener` opens for a bind line.
+#[test]
+fn mss_reaches_the_listening_socket() {
+    use nix::sys::socket::{getsockopt, sockopt::TcpMaxSeg};
+    let tuning = SocketTuning { mss: Some(1200), ..SocketTuning::default() };
+    let l = Listener::bind_tuned(common::reserve_addr(), 128, 0, &tuning).expect("bind");
+    assert_eq!(getsockopt(&l.borrowed_fd(), TcpMaxSeg).expect("get"), 1200);
+    let plain = Listener::bind(common::reserve_addr(), 128, 0).expect("bind");
+    assert_ne!(getsockopt(&plain.borrowed_fd(), TcpMaxSeg).expect("get"), 1200);
+}
+
+/// `setsockopt` calls (as strace prints them) made by an Ibex running `cfg` while one
+/// client connection to `probe` is served.
+fn strace_setsockopt(cfg: &str, probe: SocketAddr) -> String {
+    let mut f = NamedTempFile::new().expect("tmp");
+    f.write_all(cfg.as_bytes()).expect("cfg");
+    let log = NamedTempFile::new().expect("tmp");
+    let mut child = Command::new("strace")
+        .args(["-f", "-e", "trace=setsockopt", "-o"])
+        .arg(log.path())
+        .arg(env!("CARGO_BIN_EXE_ibex"))
+        .arg("-f")
+        .arg(f.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn strace");
+    assert!(common::wait_listening(probe));
+    if let Ok(mut c) = std::net::TcpStream::connect(probe) {
+        let _ = c.write_all(b"x");
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    // SIGUSR1 goes to ibex, not strace: find it as strace's child.
+    let kids = std::fs::read_to_string(format!("/proc/{0}/task/{0}/children", child.id())).unwrap_or_default();
+    let ibex_pid: i32 = kids.split_whitespace().next().and_then(|p| p.parse().ok()).expect("ibex pid");
+    let _ = Command::new("kill").args(["-USR1", &ibex_pid.to_string()]).status();
+    let _ = child.wait();
+    std::fs::read_to_string(log.path()).unwrap_or_default()
+}
+
+#[test]
+fn bind_mss_is_set_by_the_engine_listener() {
+    if Command::new("strace").arg("-V").output().is_err() {
+        return;
+    }
+    let a = common::reserve_addr();
+    let cfg = format!("{DEFAULTS}frontend fe\n  bind {a} mss 1200\n  default_backend be\nbackend be\n  server s 127.0.0.1:9\n");
+    let log = strace_setsockopt(&cfg, a);
+    assert!(log.contains("TCP_MAXSEG, [1200]"), "{log}");
+}
+
+/// Server `tfo`: HAProxy sends the first bytes in the SYN (`MSG_FASTOPEN`); Ibex's safe
+/// equivalent is `TCP_FASTOPEN_CONNECT` on the connecting socket.
+#[test]
+fn server_tfo_sets_fastopen_on_the_connecting_socket() {
+    if Command::new("strace").arg("-V").output().is_err() {
+        return;
+    }
+    let backend = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let bp = backend.local_addr().expect("addr").port();
+    let a = common::reserve_addr();
+    let cfg = format!("{DEFAULTS}frontend fe\n  bind {a}\n  default_backend be\nbackend be\n  server s 127.0.0.1:{bp} tfo\n");
+    let log = strace_setsockopt(&cfg, a);
+    assert!(log.contains("TCP_FASTOPEN_CONNECT"), "{log}");
+    let cfg = format!("{DEFAULTS}frontend fe\n  bind {a}\n  default_backend be\nbackend be\n  server s 127.0.0.1:{bp}\n");
+    let log = strace_setsockopt(&cfg, a);
+    assert!(!log.contains("TCP_FASTOPEN_CONNECT"), "{log}");
+}
+
 /// Runs `ibex -c` on `cfg`: the exit status and its output.
 fn check(cfg: &str) -> (bool, String) {
     let mut f = NamedTempFile::new().expect("tmp");
@@ -129,7 +199,7 @@ fn standalone_accept_proxy_is_refused_like_haproxy() {
 #[test]
 fn bind_keywords_without_a_safe_implementation_are_refused() {
     for kw in [
-        "tfo", "defer-accept", "mss 1000", "process 1", "thread 1", "nbconn 1", "nice 5", "shards 2", "tcp-ss 1",
+        "tfo", "defer-accept", "process 1", "thread 1", "nbconn 1", "nice 5", "shards 2", "tcp-ss 1",
         "idle-ping 1s", "label foo", "guid-prefix g",
     ] {
         let (ok, msg) = check(&format!("{DEFAULTS}frontend x\n  bind 127.0.0.1:1 {kw}\n"));

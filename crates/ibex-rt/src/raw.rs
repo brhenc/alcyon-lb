@@ -162,6 +162,15 @@ pub fn from_any(a: &SocketAddrAny) -> Option<SocketAddr> {
 /// # Errors
 /// Returns an error if socket creation fails or if `connect` fails immediately with an error other than `EINPROGRESS`.
 pub fn connect(addr: SocketAddr) -> io::Result<(OwnedFd, bool)> {
+    connect_opts(addr, false)
+}
+
+/// [`connect`], with TCP Fast Open when `tfo` (server `tfo`): `TCP_FASTOPEN_CONNECT`, which
+/// makes the kernel send the first write in the SYN, as `HAProxy`'s `MSG_FASTOPEN` does.
+///
+/// # Errors
+/// As [`connect`].
+pub fn connect_opts(addr: SocketAddr, tfo: bool) -> io::Result<(OwnedFd, bool)> {
     let family = match addr {
         SocketAddr::V4(_) => AddressFamily::INET,
         SocketAddr::V6(_) => AddressFamily::INET6,
@@ -175,6 +184,10 @@ pub fn connect(addr: SocketAddr) -> io::Result<(OwnedFd, bool)> {
 
     // Disable Nagle's algorithm matching HAProxy
     let _ = net::sockopt::set_tcp_nodelay(&fd, true);
+    if tfo {
+        // Best effort, like HAProxy: without kernel support the connect is a plain one.
+        let _ = nix::sys::socket::setsockopt(&fd, nix::sys::socket::sockopt::TcpFastOpenConnect, &true);
+    }
 
     let any = to_any(addr);
     match net::connect_any(&fd, &any) {

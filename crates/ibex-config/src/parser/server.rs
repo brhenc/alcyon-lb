@@ -41,6 +41,7 @@ pub(crate) fn parse_server(
     let mut check_proto = default_server.and_then(|d| d.check_proto);
     let mut weight = default_server.and_then(|d| d.weight);
     let mut backup = default_server.is_some_and(|d| d.backup);
+    let mut tfo = default_server.is_some_and(|d| d.tfo);
     let mut cookie = default_server.and_then(|d| d.cookie.clone());
     let mut proxy_v2_unique_id = default_server.is_some_and(|d| d.proxy_v2_unique_id);
     let mut ssl = default_server.map(|d| d.ssl.clone()).unwrap_or_default();
@@ -156,6 +157,8 @@ pub(crate) fn parse_server(
                 puid = id;
                 i += 1;
             }
+            "tfo" => tfo = true,
+            "no-tfo" => tfo = false,
             "backup" => backup = true,
             "no-backup" => backup = false,
             "disabled" => {
@@ -222,6 +225,7 @@ pub(crate) fn parse_server(
             (pool != crate::ast::server::ServerPool::default()).then(|| Box::new(pool))
         },
         backup,
+        tfo,
         cookie: cookie.map(String::into_boxed_str),
         disabled,
         track,
@@ -608,6 +612,8 @@ pub(crate) fn parse_default_server(
                 i += 1;
                 cfg.proxy_v2_unique_id |= parse_proxy_v2_options(tokens.get(i), kw)?;
             }
+            "tfo" => cfg.tfo = true,
+            "no-tfo" => cfg.tfo = false,
             "backup" => cfg.backup = true,
             "no-backup" => cfg.backup = false,
             "disabled" => cfg.disabled = true,
