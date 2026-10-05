@@ -327,3 +327,57 @@ fn queued_request_is_served_when_the_slot_frees() {
     // 1.8 s for the first answer to leave, 2 s for the second one's own backend delay.
     assert!(d >= Duration::from_millis(3500) && d < Duration::from_millis(4600), "{d:?}");
 }
+
+#[test]
+fn two_queued_requests_are_both_served_in_turn() {
+    let be = backend(Be::Slow);
+    let t = "  timeout connect 1500ms\n  timeout client 10s\n  timeout server 10s\n  timeout queue 9s\n";
+    let out = with_ibex(t, "http", "", be, |fe, _| {
+        let hs: Vec<_> = (0..3)
+            .map(|i| {
+                thread::spawn(move || {
+                    thread::sleep(Duration::from_millis(150 * i));
+                    let mut s = TcpStream::connect(fe).expect("c");
+                    s.write_all(b"GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n").expect("w");
+                    s.set_read_timeout(Some(Duration::from_secs(10))).expect("rt");
+                    let mut r = String::new();
+                    let _ = s.read_to_string(&mut r);
+                    r.lines().next().unwrap_or("").to_string()
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().expect("join")).collect::<Vec<_>>()
+    });
+    assert_eq!(out, vec!["HTTP/1.1 200 OK"; 3]);
+}
+
+/// The 101 comes late (1 s, `timeout client`/`server` 5 s): the tunnel runs on
+/// `timeout tunnel` from the 101, so it closes about 0.7 s after it.
+#[test]
+fn timeout_tunnel_starts_at_a_late_101() {
+    let l = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let be = l.local_addr().expect("addr");
+    thread::spawn(move || {
+        for mut c in l.incoming().flatten() {
+            thread::spawn(move || {
+                let mut b = [0u8; 4096];
+                let _ = c.read(&mut b);
+                thread::sleep(Duration::from_secs(1));
+                let _ = c.write_all(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: x\r\n\r\n");
+                while c.read(&mut b).is_ok_and(|n| n > 0) {}
+            });
+        }
+    });
+    let t = "  timeout connect 2s\n  timeout client 5s\n  timeout server 5s\n  timeout tunnel 700ms\n";
+    let (d, eof) = with_ibex(t, "http", "", be, |fe, _| {
+        let mut s = TcpStream::connect(fe).expect("c");
+        s.write_all(b"GET /ws HTTP/1.1\r\nHost: t\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n").expect("w");
+        let t0 = Instant::now();
+        let mut b = [0u8; 1024];
+        s.set_read_timeout(Some(Duration::from_secs(3))).expect("rt");
+        let _ = s.read(&mut b);
+        let (d, eof) = until_eof(&mut s, Duration::from_secs(4), None);
+        { let _ = d; (t0.elapsed(), eof) }
+    });
+    assert!(eof && d >= Duration::from_millis(1550) && d <= Duration::from_millis(2000), "closed at {d:?}");
+}
