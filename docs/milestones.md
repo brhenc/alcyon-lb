@@ -127,7 +127,7 @@ and as a script under `tools/measure/`.
 - **Failure behaviour**: a backend down is detected within `inter × fall`, traffic moves
   away, comes back after `rise`; all servers down gives HAProxy's 503 page.
 
-## M2 — HTTP/3 and QUIC (next)
+## M2 — HTTP/3 and QUIC (next; M3 peers follows, see below)
 
 Planned for the weekend of 2026-10-10. Scope to be written then: QUIC listener parity with
 HAProxy built with QUIC (`quic4@`/`quic6@`, `alpn h3`, `proto quic`), HTTP/3 to clients,
@@ -179,6 +179,53 @@ or `fuzz/`, kept outside the workspace if it needs `unsafe` or a non-Rust depend
 
 R1 exit criteria: all eight run, documented in `docs/robustness.md` with the last run's
 date, command and result; every finding fixed or filed as a task.
+
+## Sequence after M1, M2 and R1 (user, 2026-10-05)
+
+R1 runs alongside all of these. Dates are targets, not promises; each milestone gets its
+detailed scope and exit criteria written when it starts, as M1's were.
+
+### M3 — peers (week after M2, target weekend of 2026-10-17)
+
+Stick-table synchronisation between nodes, moved forward from M4 by the user.
+
+- **Wire-compatible with HAProxy's peers protocol**: an Ibex node and an HAProxy node in
+  one `peers` section exchange table updates both ways. That is what makes a mixed
+  cluster (and a migration one node at a time) possible, and it lets HAProxy serve as the
+  oracle peer in tests.
+- **Config**: the `peers` section (`peer`, `server`, `bind`, `table`, `shards`,
+  `disabled`), `localpeer` / `-L`, `stick-table … peers <name>`; the M1 refusal of these
+  keywords is removed only as each one reaches the data path (AGENTS.md §5).
+- **Reload**: the old process hands its tables to the new one through the local peer, as
+  HAProxy does, so counters and stickiness survive SIGUSR2.
+- **Multi-threaded sync — the reason to do it early.** In HAProxy a peer session runs on
+  one thread, so a busy cluster's table sync is bounded by one core (the user's
+  observation; measure it on the reference binary first and record the numbers). Ibex
+  spreads sync across worker threads (per table shard, or per peer) while keeping the
+  wire protocol unchanged. Exit: under the same update rate, Ibex peers keep up where
+  HAProxy's sync lags, measured with both on the same machine, and no update is lost.
+- Practical topology: two Ibex nodes plus one HAProxy node behind a client that alternates
+  between them; stickiness and `sc_*` counters agree on all three.
+
+### M4 — deployable
+
+The step from "works here" to "someone else can run it": RPM and container image,
+versioned releases with a changelog, a migration guide for HAProxy users (what is
+refused, what differs — from `docs/differences.md`), a security policy, and CI running
+the gate and the reg-test board on every push. Also what a presentation needs.
+
+### M5 — feature breadth
+
+Turn M1's remaining refusals into support, in order of how often real configs use them
+(the smoke corpus of 529 configs shows which): compression, cache, SPOE, FastCGI. Lua last
+or never: an embedded Lua means a C library or a pure-Rust Lua engine, and that is a
+memory-safety decision for the user to make.
+
+### M6 — scale
+
+Large deployments: 100k+ concurrent connections, 32–64 threads and thread groups,
+splice / zero-copy forwarding, kTLS, CPU per request at or below HAProxy's. Only once
+M1–M5 are stable.
 
 ## M1 work plan and budget rules
 
