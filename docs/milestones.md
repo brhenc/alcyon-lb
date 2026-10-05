@@ -41,10 +41,14 @@ produced it.
 
 ### Scope (out, refused clearly by the parser)
 
-HTTP/3 and QUIC (overdesigned for this milestone; later), Lua, SPOE, peers sync,
+Lua, SPOE, peers sync,
 compression (unless T162 shows it is nearly done), cache, FastCGI, DNS-resolved servers
 beyond what already works, OpenSSL-specific engines/keywords. Each refusal names the
 keyword and says it is unsupported (AGENTS.md §5); listed in `docs/differences.md`.
+
+HTTP/3 and QUIC are **not** in M1 and not refused either: Ibex has an experimental QUIC
+listener with tests (`ibex-quic`). They are the next milestone, **M2**, planned for the
+weekend of 2026-10-10 (user, 2026-10-05).
 
 ### Practical testing (the point of the milestone)
 
@@ -122,6 +126,14 @@ and as a script under `tools/measure/`.
   `Type=forking`/master-worker), `ExecReload` with SIGUSR2; documented in `docs/`.
 - **Failure behaviour**: a backend down is detected within `inter × fall`, traffic moves
   away, comes back after `rise`; all servers down gives HAProxy's 503 page.
+
+## M2 — HTTP/3 and QUIC (next)
+
+Planned for the weekend of 2026-10-10. Scope to be written then: QUIC listener parity with
+HAProxy built with QUIC (`quic4@`/`quic6@`, `alpn h3`, `proto quic`), HTTP/3 to clients,
+the QUIC part of T162 (reg-tests hidden by feature flags), and the practical topologies
+over h3 (curl `--http3`, browsers). The reference binary here is built without QUIC, so the
+oracle for M2 needs a QUIC-enabled HAProxy build first.
 
 ## R1 — robustness (orthogonal)
 
