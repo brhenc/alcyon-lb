@@ -6982,6 +6982,11 @@ impl EngineDispatcher<'_> {
 
             // Step 4: Update interests
             update_interests(entry, self.fdtab, self.poller);
+            // A direction with nothing in transit holds no buffer between two runs
+            // (`h1_release_buf` after each send/recv): a forwarded request's buffer goes
+            // back while its answer is stuck behind a slow client (T184).
+            entry.sess.req.release();
+            entry.sess.rep.release();
 
             // Step 4b: undispatched H2 streams have no socket event to wake them; run again.
             // Pending output needs no requeue: Step 4 asked the (level-triggered) poller

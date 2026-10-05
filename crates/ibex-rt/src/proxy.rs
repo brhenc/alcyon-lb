@@ -425,9 +425,11 @@ fn h2_head_size(msg: &ibex_proto::htx::Htx, abs_prefix: Option<&str>) -> u64 {
 
 /// Writes what has come of an HTTP/2 request's body into `req`, as much as there is room
 /// for: each DATA frame as it is, or as a chunk when the request has no length, and the
-/// end as the last chunk. True if anything was written.
-fn pump_h2_body(msg: &ibex_proto::htx::Htx, st: &mut H2ReqBody, req: &mut Buf) -> bool {
-    let blocks = msg.blocks();
+/// end as the last chunk. True if anything was written. A DATA block written out whole
+/// is released: the stream holds only what is still to go (T195's 50 MB upload was held
+/// until the stream ended).
+fn pump_h2_body(msg: &mut ibex_proto::htx::Htx, st: &mut H2ReqBody, req: &mut Buf) -> bool {
+    let blocks = msg.blocks_mut();
     let mut wrote = false;
     while !st.done && st.cursor < blocks.len() {
         match &blocks[st.cursor] {
@@ -463,6 +465,9 @@ fn pump_h2_body(msg: &ibex_proto::htx::Htx, st: &mut H2ReqBody, req: &mut Buf) -
                 st.off += n;
                 st.consumed += n as u64;
                 if st.off >= d.len() {
+                    if let HtxBlock::Data(d) | HtxBlock::RawData(d) = &mut blocks[st.cursor] {
+                        *d = Vec::new();
+                    }
                     st.cursor += 1;
                     st.off = 0;
                 }
@@ -1500,9 +1505,9 @@ impl TcpSession {
                     }
                 }
                 // The DATA frames of the request being served that have come since.
-                if let Some(stream) = self.h2_active_stream_id.and_then(|id| h2.streams.get(&id)) {
+                if let Some(stream) = self.h2_active_stream_id.and_then(|id| h2.streams.get_mut(&id)) {
                     let before = self.h2_body.trailer_bytes;
-                    if pump_h2_body(&stream.rx_htx, &mut self.h2_body, &mut self.req) {
+                    if pump_h2_body(&mut stream.rx_htx, &mut self.h2_body, &mut self.req) {
                         changed = true;
                     }
                     // The client may send as much again as has moved on towards the server:
@@ -2639,7 +2644,7 @@ mod tests {
     use ibex_proto::htx::{Htx, HtxBlock};
 
     /// Pumps until the body is done, taking out what each pass wrote.
-    fn pump_all(msg: &Htx, st: &mut H2ReqBody, req: &mut Buf, out: &mut Vec<u8>) {
+    fn pump_all(msg: &mut Htx, st: &mut H2ReqBody, req: &mut Buf, out: &mut Vec<u8>) {
         for _ in 0..64 {
             if st.done {
                 break;
@@ -2666,14 +2671,35 @@ mod tests {
         let mut st = H2ReqBody { chunked: true, ..H2ReqBody::default() };
         let mut req = Buf::with_capacity(16);
         let mut out = Vec::new();
-        pump_all(&msg, &mut st, &mut req, &mut out);
+        pump_all(&mut msg.clone(), &mut st, &mut req, &mut out);
         assert_eq!(out, b"4\r\nabcd\r\n4\r\nefgh\r\n2\r\nij\r\n0\r\n\r\n");
 
         let mut st = H2ReqBody::default();
         let mut req = Buf::with_capacity(4);
         let mut out = Vec::new();
-        pump_all(&msg, &mut st, &mut req, &mut out);
+        pump_all(&mut msg.clone(), &mut st, &mut req, &mut out);
         assert_eq!(out, b"abcdefghij");
+    }
+
+    /// Found by T195: the DATA of an HTTP/2 request stayed in the stream's message after it
+    /// was written towards the server, so a 50 MB upload was held whole until the stream
+    /// ended. A block written out is released; what is still to go stays.
+    #[test]
+    fn a_forwarded_h2_body_is_released() {
+        let mut msg = Htx::new();
+        msg.push(HtxBlock::Eoh);
+        msg.push(HtxBlock::Data(vec![b'x'; 100]));
+        msg.push(HtxBlock::Data(vec![b'y'; 100]));
+        let held = |m: &Htx| -> usize { m.blocks().iter().map(|b| if let HtxBlock::Data(d) = b { d.len() } else { 0 }).sum() };
+        let mut st = H2ReqBody { cursor: 1, ..H2ReqBody::default() };
+        let mut req = Buf::with_capacity(150);
+        assert!(pump_h2_body(&mut msg, &mut st, &mut req));
+        assert_eq!(req.readable().len(), 150);
+        assert_eq!(held(&msg), 100, "the first block went out whole, the second in part");
+        req.consume(150);
+        assert!(pump_h2_body(&mut msg, &mut st, &mut req));
+        assert_eq!(req.readable(), [b'y'; 50]);
+        assert_eq!(held(&msg), 0);
     }
 
     /// The last chunk is not split: with less than its five bytes of room, nothing is
@@ -2684,10 +2710,10 @@ mod tests {
         msg.push(HtxBlock::Eom);
         let mut st = H2ReqBody { chunked: true, ..H2ReqBody::default() };
         let mut req = Buf::with_capacity(4);
-        assert!(!pump_h2_body(&msg, &mut st, &mut req));
+        assert!(!pump_h2_body(&mut msg, &mut st, &mut req));
         assert!(!st.done);
         let mut req = Buf::with_capacity(16);
-        assert!(pump_h2_body(&msg, &mut st, &mut req));
+        assert!(pump_h2_body(&mut msg, &mut st, &mut req));
         assert_eq!(req.readable(), b"0\r\n\r\n");
     }
 
@@ -2704,11 +2730,12 @@ mod tests {
         msg.push(HtxBlock::Eom);
         for (cap, passes) in [(15, 2), (17, 2), (64, 1)] {
             let mut st = H2ReqBody { chunked: true, ..H2ReqBody::default() };
+            let mut msg = msg.clone();
             let mut req = Buf::with_capacity(cap);
             let mut out = Vec::new();
             let mut n = 0;
             while !st.done {
-                pump_h2_body(&msg, &mut st, &mut req);
+                pump_h2_body(&mut msg, &mut st, &mut req);
                 n += 1;
                 out.extend_from_slice(req.readable());
                 let len = req.readable().len();
@@ -2722,7 +2749,7 @@ mod tests {
         let mut st = H2ReqBody::default();
         let mut req = Buf::with_capacity(64);
         let mut out = Vec::new();
-        pump_all(&msg, &mut st, &mut req, &mut out);
+        pump_all(&mut msg.clone(), &mut st, &mut req, &mut out);
         assert_eq!(out, b"ab");
         assert_eq!(st.trailer_bytes, 3);
     }

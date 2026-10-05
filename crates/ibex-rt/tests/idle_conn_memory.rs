@@ -132,6 +132,89 @@ fn per_idle_conn(request: bool) -> usize {
     per
 }
 
+/// A backend answering every request with a body it never finishes (1 GB announced),
+/// written for as long as the connection takes it.
+fn endless_backend(running: Arc<AtomicBool>) -> SocketAddr {
+    let l = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = l.local_addr().expect("addr");
+    l.set_nonblocking(true).expect("nonblocking");
+    thread::spawn(move || {
+        while running.load(Ordering::Relaxed) {
+            let Ok((mut s, _)) = l.accept() else {
+                thread::sleep(Duration::from_millis(1));
+                continue;
+            };
+            s.set_nonblocking(false).expect("blocking");
+            thread::spawn(move || {
+                let chunk = vec![b'x'; 65536];
+                let mut buf = [0u8; 4096];
+                let mut got = Vec::new();
+                while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match s.read(&mut buf) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => got.extend_from_slice(&buf[..n]),
+                    }
+                }
+                if s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1073741824\r\n\r\n").is_err() {
+                    return;
+                }
+                while s.write_all(&chunk).is_ok() {}
+            });
+        }
+    });
+    addr
+}
+
+/// A client whose receive buffer is 4 KB, as `m1_active_conn_rss.py`'s.
+fn slow_client(fe: SocketAddr) -> TcpStream {
+    use rustix::net::{AddressFamily, SocketType};
+    let fd = rustix::net::socket(AddressFamily::INET, SocketType::STREAM, None).expect("socket");
+    rustix::net::sockopt::set_socket_recv_buffer_size(&fd, 4096).expect("SO_RCVBUF");
+    let SocketAddr::V4(v4) = fe else { panic!("v4") };
+    rustix::net::connect_v4(&fd, &v4).expect("connect");
+    TcpStream::from(fd)
+}
+
+/// T184: clients that ask for a large answer and never read it. HAProxy holds about one
+/// buffer per direction that has data in transit and none for one that is empty (4.5 KB
+/// of RSS per such client with a 1 MB answer, T180). Here, once every answer is stuck
+/// behind its client: the request, forwarded long ago, holds no buffer; the response
+/// holds one (full), the request's HTX one (kept for the transaction's rules and log):
+/// two per client, where each held three.
+#[test]
+fn a_slow_client_holds_no_buffer_for_a_forwarded_request() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    const N: usize = 10;
+    let running = Arc::new(AtomicBool::new(true));
+    let srv = endless_backend(Arc::clone(&running));
+    let fe = TcpListener::bind("127.0.0.1:0").expect("bind").local_addr().expect("addr");
+    let mut engine = engine(srv, fe);
+    let used = || ibex_rt::buf::buffer_pool_stats().map_or(0, |p| p.used);
+    for _ in 0..10 {
+        let _ = engine.run_once();
+    }
+    let base = used();
+    let mut clients = Vec::new();
+    for _ in 0..N {
+        let mut c = slow_client(fe);
+        c.write_all(b"GET /big HTTP/1.1\r\nHost: x\r\n\r\n").expect("send");
+        clients.push(c);
+        let _ = engine.run_once();
+    }
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(2) {
+        let _ = engine.run_once();
+    }
+    let held = used().saturating_sub(base);
+    println!("standard buffers in use for {N} slow clients: {held}");
+    assert!(held <= 2 * N, "{N} slow clients hold {held} buffers");
+    running.store(false, Ordering::Relaxed);
+    drop(clients);
+    for _ in 0..20 {
+        let _ = engine.run_once();
+    }
+}
+
 /// HAProxy keeps ~1 KB of RSS per idle client, request or not; T183's target is at most
 /// twice that. The session itself (its arena slot is preallocated here) is not counted:
 /// what is held is what the connection allocated -- its buffers above all.
