@@ -11700,3 +11700,71 @@ mod rate_ctr_tests {
         assert_eq!(r.rate_at(9000), 1, "the quiet spell dropped both windows");
     }
 }
+
+#[cfg(test)]
+mod actconn_tests {
+    use super::*;
+    use ibex_config::ast::{BackendSection, Config, FrontendSection, Mode, Server};
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+
+    /// A response ends: the server connection is parked on its session and leaves the
+    /// server's connections in use; a session whose count was already reclaimed (shut down)
+    /// is counted neither out nor in again.
+    #[test]
+    fn a_parked_connection_leaves_the_servers_count_and_a_reclaimed_session_is_not_counted_again() {
+        let l = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let srv = l.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            for s in l.incoming() {
+                let Ok(mut s) = s else { continue };
+                std::thread::spawn(move || {
+                    let mut b = [0u8; 1024];
+                    while s.read(&mut b).is_ok_and(|n| n > 0) {
+                        if s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        let fe = TcpListener::bind("127.0.0.1:0").expect("bind").local_addr().expect("addr");
+        let config = Config {
+            frontends: vec![FrontendSection {
+                name: "fe".into(),
+                bind: Some(fe),
+                mode: Mode::Http,
+                default_backend: Some("be".into()),
+                ..Default::default()
+            }],
+            backends: vec![BackendSection { name: "be".into(), mode: Mode::Http, servers: vec![Server::new("s1", srv)], ..Default::default() }],
+            ..Default::default()
+        };
+        let mut engine = Engine::new(&config, 1024).expect("Engine::new");
+        let mut c = TcpStream::connect(fe).expect("connect");
+        c.set_nonblocking(true).expect("nonblocking");
+        let _ = engine.run_once();
+        c.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").expect("send");
+        let start = Instant::now();
+        let mut got = Vec::new();
+        let mut buf = [0u8; 512];
+        while !got.ends_with(b"ok") {
+            assert!(start.elapsed() < Duration::from_secs(5), "no answer");
+            let _ = engine.run_once();
+            if let Ok(n) = c.read(&mut buf) {
+                got.extend_from_slice(&buf[..n]);
+            }
+        }
+        let proxies = &engine.proxies;
+        let in_use = |p: &[Proxy]| p.iter().map(|p| p.server_actconn.iter().map(|a| a.load(Ordering::Relaxed)).sum::<u32>()).sum::<u32>();
+        let (_, entry) = engine.sessions.iter_mut().find(|(_, e)| e.sess.srv_park_exp.is_set()).expect("a parked connection");
+        assert_eq!(in_use(proxies), 0, "parked: out of the connections in use");
+        server_actconn_add(entry, proxies, true);
+        assert_eq!(in_use(proxies), 1);
+        server_actconn_add(entry, proxies, false);
+        assert_eq!(in_use(proxies), 0);
+        entry.actconn_reclaimed = true;
+        server_actconn_add(entry, proxies, true);
+        assert_eq!(in_use(proxies), 0, "a reclaimed session adds nothing");
+    }
+}
