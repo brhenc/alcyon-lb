@@ -573,6 +573,32 @@ pub struct HttpTxn {
     /// has been measured, or where it is not (an HTTP/2 client's request).
     pub req_htx: Option<u64>,
     pub rsp_htx: Option<u64>,
+    /// `http-request disable-l7-retry` ran for this request (`TX_D_L7_RETRY`).
+    pub l7_off: bool,
+    /// A retry on the server's answer (`retry-on <status>`): the request as it was sent.
+    pub l7: L7Retry,
+}
+
+/// Where a request stands for a retry on what the server answers (`TX_L7_RETRY` and the
+/// `l7_buffer`).
+#[derive(Debug, Default)]
+pub enum L7Retry {
+    /// Not a candidate: the backend does not retry on a response, or nothing armed it.
+    #[default]
+    Off,
+    /// A candidate; the request is copied when it is first sent.
+    Armed,
+    /// The request did not fit, or was not whole when it was first sent: no retry.
+    Dead,
+    /// The request as it was sent, and where its message state stood before.
+    Saved(Box<L7Snapshot>),
+}
+
+/// What a retry on a response replays.
+#[derive(Debug)]
+pub struct L7Snapshot {
+    pub bytes: Vec<u8>,
+    pub req_state: MsgState,
 }
 
 impl HttpTxn {
@@ -598,6 +624,8 @@ impl HttpTxn {
             ck: crate::cookie::CookieTxn::default(),
             req_htx: None,
             rsp_htx: None,
+            l7_off: false,
+            l7: L7Retry::Off,
         }
     }
 

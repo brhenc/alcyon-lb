@@ -118,8 +118,6 @@ const IBEX_REFUSES: &[(&str, &str)] = &[
     ("http-drop-response-trailers", "fld"),
     ("checkcache", "bld"),
     ("disable-h2-upgrade", "fld"),
-    // Which log a failed request goes to: Ibex would write it to the normal log.
-    ("log-separate-errors", "fld"),
     // Which server is used.
     ("allbackups", "bld"),
 ];

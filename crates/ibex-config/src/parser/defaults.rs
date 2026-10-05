@@ -24,6 +24,12 @@ pub(crate) fn parse_defaults_directive(
             defaults.retries = Some(r);
             Ok(())
         }
+        "retry-on" => {
+            let mut r = defaults.retry_on.unwrap_or(crate::ast::RE_CONN_FAILED);
+            super::parse_retry_on(&mut r, tokens, kw)?;
+            defaults.retry_on = Some(r);
+            Ok(())
+        }
         "redisp" => parse_redisp(kw),
         "maxconn" => {
             let mut mc = defaults.maxconn.unwrap_or(0);
@@ -219,6 +225,7 @@ pub(crate) fn parse_option_defaults(
         "persist" => defaults.persist = true,
         "http-keep-alive" => defaults.http_mode = HttpMode::KeepAlive,
         "dontlognull" => defaults.dontlognull = true,
+        "dontlog-normal" | "log-separate-errors" | "logasap" => defaults.log_opts |= crate::ast::log_opt_bit(&tokens[1].text),
         "accept-unsafe-violations-in-http-request" => defaults.stats.accept_unsafe_request = true,
         "log-health-checks" => defaults.log_health_checks = true,
         "httpchk" => parse_httpchk_option(&mut defaults.httpchk, tokens, kw)?,
@@ -242,6 +249,7 @@ pub(crate) fn parse_no_defaults(defaults: &mut DefaultsSection, tokens: &[Token]
         Some("httpclose") if defaults.http_mode == HttpMode::Close => defaults.http_mode = HttpMode::KeepAlive,
         Some("persist") => defaults.persist = false,
         Some("dontlognull") => defaults.dontlognull = false,
+        Some(n @ ("dontlog-normal" | "log-separate-errors" | "logasap")) => defaults.log_opts &= !crate::ast::log_opt_bit(n),
         Some("accept-unsafe-violations-in-http-request") => defaults.stats.accept_unsafe_request = false,
         Some("log-health-checks") => defaults.log_health_checks = false,
         Some("forwarded") => defaults.forwarded = None,

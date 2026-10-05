@@ -106,11 +106,6 @@ impl TxnCounters {
         self.hrsp[class].fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Notes a stream that ended now.
-    pub fn touch(&self) {
-        self.last_sess.store(now_ms(), Ordering::Relaxed);
-    }
-
     /// Seconds since `stamp` (a [`now_ms`] value), or `None` when it was never set.
     #[must_use]
     pub fn since_secs(stamp: u64) -> Option<u64> {

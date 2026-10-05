@@ -171,12 +171,29 @@ pub fn start(config: &Config) -> io::Result<()> {
         crate::ring::start(ring);
     }
     check_ring_targets(config)?;
+    check_debug_sinks(config)?;
     for section in &config.log_forwards {
         let key = format!("{section:?}");
         if !started().lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(key) {
             continue;
         }
         start_section(config, section)?;
+    }
+    Ok(())
+}
+
+/// Every sink a `debug()` converter named while the configuration was read must exist
+/// (`smp_check_debug`: "debug converter: sink 'x' doesn't exist."). It also points `debug()`
+/// at the runtime's sinks.
+///
+/// # Errors
+/// The first destination that is neither `stdout`, `stderr`, `buf0`, `dpapi` nor a `ring`.
+pub fn check_debug_sinks(config: &Config) -> io::Result<()> {
+    ibex_sample::set_debug_sink(crate::ring::debug_write);
+    for dest in ibex_sample::take_debug_destinations() {
+        if !crate::ring::sink_exists(&dest, &config.rings) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("debug converter: sink '{dest}' doesn't exist.")));
+        }
     }
     Ok(())
 }

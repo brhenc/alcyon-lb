@@ -814,6 +814,8 @@ pub struct ProxyIdInfo {
     pub http_mode: ibex_config::ast::HttpMode,
     /// `option persist`: a server named by a cookie or a stick table is used when it is down.
     pub persist: bool,
+    /// `retry-on`, as the `ibex_config::RE_*` bits: what a failed attempt is retried on.
+    pub retry_on: u32,
 }
 
 impl ProxyIdInfo {
@@ -975,6 +977,9 @@ pub struct Proxy {
     pub log_format: Option<Arc<crate::logfmt::LogFormat>>,
     /// `option dontlognull`: a connection that carried nothing logs nothing.
     pub dont_log_null: bool,
+    /// `option dontlog-normal`, `option log-separate-errors`, `option logasap`: the
+    /// `ibex_config::LOG_OPT_*` bits.
+    pub log_opts: u8,
     /// `unique-id-format`, compiled.
     pub unique_id_format: Option<Arc<crate::logfmt::LogFormat>>,
     /// `unique-id-header`: the request header the unique ID is sent to the server in.
@@ -1203,6 +1208,8 @@ pub struct SessionEntry {
     pub srv_served: u8,
     /// A finished transaction's log line, waiting to be sent to its frontend's targets.
     pub log_line: Option<Vec<u8>>,
+    /// `log_line` is a failed stream's: `option log-separate-errors` sends it at `err`.
+    pub log_err: bool,
 }
 
 /// Per-thread storage for active sessions.
@@ -1704,11 +1711,15 @@ fn note_last_rule(sess: &mut TcpSession, line: u32) {
 /// connection attempt, once made, counts as forwarded. A connection retry (`retried`) is an
 /// error too (`conn_retries` with no error flag); a redispatch is one retry, so it is
 /// covered.
-fn stream_facts(log: &crate::txnlog::StreamLog, status: Option<u16>, retried: bool) -> ibex_sample::StreamFacts {
+fn stream_facts(sess: &TcpSession, status: Option<u16>) -> ibex_sample::StreamFacts {
+    let log = &sess.log;
+    let used = sess.max_retries.saturating_sub(sess.conn_retries);
     ibex_sample::StreamFacts {
-        error: retried || status.is_some_and(|s| s >= 500),
+        error: used > 0 || status.is_some_and(|s| s >= 500),
         forwarded: log.queue.is_some() || log.connect.is_some(),
-        toapplet: false,
+        toapplet: log.applet,
+        retries: u32::from(used),
+        redispatched: sess.redispatched,
     }
 }
 
@@ -1813,7 +1824,8 @@ fn session_log_data<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, pid: u3
         t_queue: l.ms(l.queue),
         t_connect: l.ms(l.connect),
         t_data: l.ms(l.data),
-        t_close: l.ms(Some(std::time::Instant::now())),
+        t_close: if l.asap_done || fe.log_opts & ibex_config::LOG_OPT_ASAP != 0 { l.ms(l.data.or(Some(std::time::Instant::now()))) } else { l.ms(Some(std::time::Instant::now())) },
+        plus: fe.log_opts & ibex_config::LOG_OPT_ASAP != 0,
         status: stream_status(s),
         bytes_out: stream_bytes_out(s),
         bytes_in: stream_bytes_in(s),
@@ -1954,24 +1966,54 @@ fn account_stream(entry: &mut SessionEntry, proxies: &[Proxy]) {
 
 /// The stream's log line, when its frontend logs (`HAProxy` logs nothing without a
 /// `log` target).
-fn stream_log_line(entry: &SessionEntry, proxies: &[Proxy], pid: u32) -> Option<Vec<u8>> {
+///
+/// With it, whether the stream failed (`strm_log`'s `err`): a redispatch or a retry, a
+/// termination state that names a fault (anything but `-` and `L`), or a 5xx status. A
+/// stream that did not fail has no line under `option dontlog-normal`.
+fn stream_log_line(entry: &SessionEntry, proxies: &[Proxy], pid: u32) -> Option<(Vec<u8>, bool)> {
     let fe = &proxies[entry.proxy_idx];
     let fmt = fe.log_format.as_ref()?;
-    if fe.log_target_idx.is_empty() {
+    if fe.log_target_idx.is_empty() || entry.sess.log.asap_done {
         return None;
     }
     let be = proxies.get(entry.backend_idx).unwrap_or(fe);
     // `status` is the transaction's (`txn->status`, as `%ST`), not whatever response the
     // thread rewrote last (T152).
+    // A stream that never had a transaction (an aborted or timed-out connection, a bad
+    // request) has no status for a fetch: `%[status]` and `%[txn.status]` are empty there,
+    // while `%ST` still reports the 400 or 408.
+    let txn_status = entry.sess.txn.as_ref().map(|t| t.status).filter(|&s| s > 0);
+    let status = txn_status.or(entry.sess.log.status.filter(|&s| s > 0));
+    let term = term_state(entry);
+    let err = (term[0] != b'-' && term[0] != b'L')
+        || (term[0] == b'-' && entry.sess.max_retries > entry.sess.conn_retries)
+        || (entry.sess.mode == Mode::Http && status.is_some_and(|s| s >= 500));
+    if !err && fe.log_opts & ibex_config::LOG_OPT_DONTLOG_NORMAL != 0 {
+        return None;
+    }
     // `%sc` counts the other streams on the server: `HAProxy` logs after this one has
     // let go of it (measured: `1/1/0/0/0` for a lone request on a one-server backend).
     let mut data = stream_log_data(entry, proxies, entry.proxy_idx, pid);
     if entry.target_server_idx.is_some() && !entry.actconn_reclaimed {
         data.srvconn = data.srvconn.saturating_sub(1);
     }
-    let line = fmt.render_bytes(&data, sample_registry(), &SampleContext { at_log: true, res_status: entry.sess.txn.as_ref().map(|t| t.status).or(entry.sess.log.status).filter(|&s| s > 0), ..stream_sample_ctx(&entry.sess, fe, be, &ProxiesView(proxies), &StickView::new(proxies, &entry.sess.tracked_sc)) });
+    let line = fmt.render_bytes(&data, sample_registry(), &SampleContext { at_log: true, res_status: txn_status, ..stream_sample_ctx(&entry.sess, fe, be, &ProxiesView(proxies), &StickView::new(proxies, &entry.sess.tracked_sc)) });
     fe.log_count.fetch_add(1, Ordering::Relaxed);
-    Some(line)
+    Some((line, err))
+}
+
+/// Queues the stream's log line, with the level it goes out at, on `entry`.
+fn set_stream_log(entry: &mut SessionEntry, proxies: &[Proxy], pid: u32) {
+    account_stream(entry, proxies);
+    // `option logasap` sent this stream's line with its response head; it may not have gone
+    // out yet, and nothing replaces it.
+    if entry.sess.log.asap_done {
+        return;
+    }
+    match stream_log_line(entry, proxies, pid) {
+        Some((line, err)) => (entry.log_line, entry.log_err) = (Some(line), err),
+        None => entry.log_line = None,
+    }
 }
 
 /// Why a connection that was to open with a PROXY header did not get past it, if that is
@@ -2112,6 +2154,7 @@ fn resolve_log_targets(config: &Config, proxies: &mut [Proxy]) -> Vec<SyslogTarg
 /// The first bind whose certificates cannot be loaded, with the frontend and address
 /// named.
 pub fn validate_tls(config: &Config) -> io::Result<()> {
+    crate::logfwd::check_debug_sinks(config)?;
     for fe in &config.frontends {
         if fe.disabled {
             continue;
@@ -2333,6 +2376,7 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, list
             server_pool: pool_cfgs(&listen.servers),
             http_mode: listen.http_mode,
             persist: listen.persist,
+            retry_on: listen.retry_on,
             ..ProxyIdInfo::default()
         }),
         name: listen.name.clone(),
@@ -2412,6 +2456,7 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, list
         log_tag: listen.log_tag.as_deref().map(syslog_tag),
         log_format: compile_log_format(listen.log_format.as_ref(), listen.mode == Mode::Http),
         dont_log_null: listen.dontlognull,
+        log_opts: listen.log_opts,
         unique_id_format: listen.unique_id_format.as_deref().and_then(compile_unique_id_format),
         unique_id_header: listen.unique_id_header.clone(),
         req_capture_slots,
@@ -2454,6 +2499,7 @@ fn init_proxy_from_frontend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, fe
             server_init_health: Vec::new(),
             listener_ids: ibex_config::ast::listener_ids(&frontend_binds(fe)),
             http_mode: fe.http_mode,
+            retry_on: ibex_config::RE_CONN_FAILED,
             ..ProxyIdInfo::default()
         }),
         name: fe.name.clone(),
@@ -2531,6 +2577,7 @@ fn init_proxy_from_frontend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, fe
         log_tag: fe.log_tag.as_deref().map(syslog_tag),
         log_format: compile_log_format(fe.log_format.as_ref(), fe.mode == Mode::Http),
         dont_log_null: fe.dontlognull,
+        log_opts: fe.log_opts,
         unique_id_format: fe.unique_id_format.as_deref().and_then(compile_unique_id_format),
         unique_id_header: fe.unique_id_header.clone(),
         req_capture_slots,
@@ -2601,6 +2648,7 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, be:
             server_pool: pool_cfgs(&be.servers),
             http_mode: be.http_mode,
             persist: be.persist,
+            retry_on: be.retry_on,
             ..ProxyIdInfo::default()
         }),
         name: be.name.clone(),
@@ -2676,6 +2724,7 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, be:
         log_tag: be.log_tag.as_deref().map(syslog_tag),
         log_format: None,
         dont_log_null: false,
+        log_opts: 0,
         unique_id_format: be.unique_id_format.as_deref().and_then(compile_unique_id_format),
         unique_id_header: be.unique_id_header.clone(),
         req_capture_slots: Arc::from([]),
@@ -4960,6 +5009,7 @@ fn register_new_session(
         connect_log_due: proxy.log_format.is_none() && !proxy.log_target_idx.is_empty(),
         srv_served: 0,
         log_line: None,
+        log_err: false,
     }) else {
         if let Some(idx) = target_server_idx {
             if idx < proxy.server_actconn.len() {
@@ -5606,8 +5656,7 @@ fn close_http_session(
     // A transaction that ends with its connection, not through `end_txn` (cut short by
     // either side), logs here, while its request and response are still known.
     if entry.sess.txn.is_some() && entry.log_line.is_none() {
-        account_stream(entry, proxies);
-        entry.log_line = stream_log_line(entry, proxies, std::process::id());
+        set_stream_log(entry, proxies, std::process::id());
     }
     release_server(entry, proxies, fdtab, poller, idle_pool, reusable);
     if matches!(entry.sess.cli_state, ScState::Ready | ScState::Established | ScState::ShutR) {
@@ -5727,6 +5776,9 @@ fn retry_server_connect(
         )
     };
     entry.sess.log.redispatched |= redispatch;
+    if redispatch {
+        entry.sess.redispatched = true;
+    }
     let target = if resuming {
         entry.target_addr
     } else if redispatch {
@@ -6196,6 +6248,9 @@ impl EngineDispatcher<'_> {
             // Between requests. A client that goes away here ends the session; a server
             // connection kept from the last transaction goes back to the pool.
             if !matches!(entry.sess.cli_state, ScState::Ready | ScState::Established) {
+                // `option dontlognull`: a connection that sent nothing is not logged, whether
+                // the client left or `timeout client` ran out.
+                let mut quiet = false;
                 // `timeout client` before a request head is complete: HAProxy answers 408
                 // (`h1_handle_req_tout`, `src/mux_h1.c`) from the frontend's pages, also on
                 // a new connection that sent nothing. Only a keep-alive connection waiting
@@ -6208,6 +6263,7 @@ impl EngineDispatcher<'_> {
                     entry.sess.send_before_close(&page);
                     entry.sess.log.status = Some(408);
                     entry.sess.log.term = Some(*b"cR");
+                    quiet = entry.sess.req.is_empty() && proxies[entry.proxy_idx].dont_log_null;
                 } else if !entry.sess.req.is_empty()
                     || (entry.sess.is_first_req && matches!(entry.sess.ending, None | Some(crate::proxy::Ending::ClientAbort)))
                 {
@@ -6216,10 +6272,14 @@ impl EngineDispatcher<'_> {
                     // (`CR`).
                     entry.sess.log.status = Some(400);
                     entry.sess.log.term = Some(*b"CR");
+                    quiet = entry.sess.req.is_empty() && proxies[entry.proxy_idx].dont_log_null;
                 }
                 if entry.sess.log.status.is_some() {
-                    account_stream(entry, proxies);
-                    entry.log_line = stream_log_line(entry, proxies, pid);
+                    if quiet {
+                        account_stream(entry, proxies);
+                    } else {
+                        set_stream_log(entry, proxies, pid);
+                    }
                 }
                 close_http_session(entry, proxies, fdtab, poller, idle_pool, true);
             } else if entry.sess.srv.is_some()
@@ -6248,8 +6308,7 @@ impl EngineDispatcher<'_> {
             entry.sess.log.status = Some(408);
             entry.sess.log.term = Some(*b"cR");
             entry.sess.log.request = None;
-            account_stream(entry, proxies);
-            entry.log_line = stream_log_line(entry, proxies, pid);
+            set_stream_log(entry, proxies, pid);
             close_http_session(entry, proxies, fdtab, poller, idle_pool, true);
             return None;
         }
@@ -6281,7 +6340,13 @@ impl EngineDispatcher<'_> {
             if entry.sess.txn.as_ref().is_some_and(|t| t.rsp == MsgState::Waiting && t.reads_server())
                 && !entry.sess.rep.is_empty()
             {
+                if Self::l7_retry(entry, proxies, fdtab, poller, now) {
+                    continue;
+                }
                 Self::apply_http_response_rules(entry, proxies, now);
+            }
+            if Self::l7_retry_failure(entry, proxies, fdtab, poller, now) {
+                continue;
             }
             Self::h2_forward_response(entry);
             Self::http_server_side(entry, proxies);
@@ -6495,8 +6560,7 @@ impl EngineDispatcher<'_> {
     ) {
         // The transaction's line, while its request and response are still here.
         if entry.sess.txn.is_some() {
-            account_stream(entry, proxies);
-            entry.log_line = stream_log_line(entry, proxies, pid);
+            set_stream_log(entry, proxies, pid);
         }
         let Some(txn) = entry.sess.txn.take() else {
             return;
@@ -6759,7 +6823,7 @@ impl EngineDispatcher<'_> {
                 );
             }
 
-            let log_line = entry.log_line.take().filter(|_| proxy_header_failure(&entry.sess).is_none());
+            let log_line = entry.log_line.take().filter(|_| proxy_header_failure(&entry.sess).is_none()).map(|l| (l, entry.log_err));
 
             // Step 3.6: If in TCP mode and server not yet connected (e.g. deferred on accept-proxy or inspect), connect once ready
             if entry.sess.mode == Mode::Tcp
@@ -6804,9 +6868,9 @@ impl EngineDispatcher<'_> {
         if let Some((fe, line)) = connect_line {
             self.send_log_line(fe, line.as_bytes());
         }
-        if let Some(line) = log_line {
+        if let Some((line, err)) = log_line {
             let fe = self.sessions.get(session_idx).map_or(0, |e| e.proxy_idx);
-            self.send_log_line(fe, &line);
+            self.send_stream_log(fe, err, &line);
         }
 
         if let Some(cmd) = pending_admin {
@@ -6833,18 +6897,20 @@ impl EngineDispatcher<'_> {
                 // A refused PROXY header has its own line, never the frontend's format.
                 if proxy_header_failure(&e.sess).is_some() {
                     e.log_line = None;
-                    return proxy_header_error_line(e, self.proxies).map(|l| (e.proxy_idx, l.into_bytes()));
+                    // `session_kill_embryonic`: `err` with `log-separate-errors`, else `info`.
+                    let err = self.proxies[e.proxy_idx].log_opts & ibex_config::LOG_OPT_SEPARATE_ERRORS != 0;
+                    return proxy_header_error_line(e, self.proxies).map(|l| (e.proxy_idx, l.into_bytes(), err));
                 }
                 if e.sess.mode == Mode::Tcp || e.sess.txn.is_some() {
                     account_stream(e, self.proxies);
                 }
-                e.log_line
-                    .take()
+                let queued = e.log_line.take().map(|l| (l, e.log_err));
+                queued
                     .or_else(|| (e.sess.mode == Mode::Tcp || e.sess.txn.is_some()).then(|| stream_log_line(e, self.proxies, self.pid)).flatten())
-                    .map(|l| (e.proxy_idx, l))
+                    .map(|(l, err)| (e.proxy_idx, l, err))
             });
-            if let Some((fe, line)) = line {
-                self.send_log_line(fe, &line);
+            if let Some((fe, line, err)) = line {
+                self.send_stream_log(fe, err, &line);
             }
             if let Some(entry) = self.sessions.free(session_idx) {
                 cleanup_done(
@@ -6859,6 +6925,85 @@ impl EngineDispatcher<'_> {
         } else {
             Outcome::Keep
         }
+    }
+
+    /// `retry-on <status>` and `junk-response`: the server's final answer carries a status
+    /// the backend retries on (or a status line that is none), the request was copied whole
+    /// when it was sent, and a retry is left: the answer is dropped and the request sent
+    /// again (`l7_replay`). `true` when it was.
+    fn l7_retry(entry: &mut SessionEntry, proxies: &[Proxy], fdtab: &mut FdTab, poller: &mut Poller, now: Tick) -> bool {
+        let retry_on = proxies[entry.backend_idx].ids.retry_on;
+        if retry_on & (ibex_config::RE_STATUS_MASK | ibex_config::RE_JUNK_RESPONSE) == 0 {
+            return false;
+        }
+        let Some((h, e)) = crate::proxy::find_eoh(entry.sess.rep.readable()) else {
+            return false;
+        };
+        let status = crate::txn::status_of(&String::from_utf8_lossy(&entry.sess.rep.readable()[..h + e]));
+        let due = if status < 100 {
+            retry_on & ibex_config::RE_JUNK_RESPONSE != 0
+        } else {
+            ibex_config::RE_STATUSES.iter().any(|&(s, bit)| s == status && retry_on & bit != 0)
+        };
+        due && Self::l7_replay(entry, proxies, fdtab, poller, now)
+    }
+
+    /// `retry-on empty-response`, `response-timeout` and `junk-response`: the server ended
+    /// the connection, or `timeout server` ran out, before a response head, and the backend
+    /// retries on that.
+    fn l7_retry_failure(entry: &mut SessionEntry, proxies: &[Proxy], fdtab: &mut FdTab, poller: &mut Poller, now: Tick) -> bool {
+        let retry_on = proxies[entry.backend_idx].ids.retry_on;
+        let timeout = entry.sess.ending == Some(crate::proxy::Ending::Timeout(crate::proxy::Which::Server));
+        let srv_eof = matches!(entry.sess.srv_state, ScState::ShutR | ScState::Closed);
+        let waiting = entry.sess.txn.as_ref().is_some_and(|t| {
+            t.rsp == MsgState::Waiting && t.req_rules_done && !t.local && t.rsp_wait.is_none() && !t.aborted
+        });
+        if !waiting || !(srv_eof || timeout) || entry.sess.ending == Some(crate::proxy::Ending::Timeout(crate::proxy::Which::Connect)) {
+            return false;
+        }
+        let kind = if timeout {
+            ibex_config::RE_TIMEOUT
+        } else if entry.sess.rep.is_empty() {
+            ibex_config::RE_DISCONNECTED
+        } else {
+            ibex_config::RE_JUNK_RESPONSE
+        };
+        retry_on & kind != 0 && Self::l7_replay(entry, proxies, fdtab, poller, now)
+    }
+
+    /// `do_l7_retry`: one retry is spent, the answer so far dropped, the server connection
+    /// closed, and the request, as it was sent, put back to go out again to the server the
+    /// balancing picks (redispatching under `option redispatch`). `false` when no retry is
+    /// left or the request was not kept.
+    fn l7_replay(entry: &mut SessionEntry, proxies: &[Proxy], fdtab: &mut FdTab, poller: &mut Poller, now: Tick) -> bool {
+        if entry.sess.conn_retries == 0 {
+            return false;
+        }
+        let Some(snap) = entry.sess.txn.as_ref().and_then(|t| match &t.l7 {
+            crate::txn::L7Retry::Saved(s) => Some((s.bytes.clone(), s.req_state)),
+            _ => None,
+        }) else {
+            return false;
+        };
+        entry.sess.rep.clear();
+        entry.sess.req.replace_prefix(0, &snap.0);
+        if let Some(t) = entry.sess.txn.as_mut() {
+            t.req = snap.1;
+            t.rsp = MsgState::Waiting;
+            t.rsp_interim = false;
+            t.status = 0;
+        }
+        if let (Some(srv_fd), Some(sfd)) = (entry.sess.srv.take(), entry.srv_raw_fd.take()) {
+            let _ = poller.delete(srv_fd.as_fd());
+            fdtab.remove(sfd);
+        }
+        entry.sess.srv_xprt = crate::xprt::ServerXprt::Plain;
+        entry.sess.ending = None;
+        entry.sess.l7_retried();
+        // The connect that follows is any other retry's: a refusal at once is the next
+        // failure (`server_connect_failed`: `econ` once, retries without turnaround).
+        retry_now(entry, proxies, fdtab, poller, now);
+        true
     }
 
     #[allow(clippy::too_many_lines)]
@@ -6963,6 +7108,12 @@ impl EngineDispatcher<'_> {
                 if framing == crate::txn::Framing::Tunnel && txn.req.is_done() {
                     txn.req = MsgState::Tunnel;
                 }
+            }
+            // `option logasap`: the line goes out with the response head (`http_process_res_common`),
+            // with what has come from the server so far, and the end of the stream logs nothing.
+            if proxies[fe_idx].log_opts & ibex_config::LOG_OPT_ASAP != 0 && !entry.sess.log.asap_done {
+                set_stream_log(entry, proxies, std::process::id());
+                entry.sess.log.asap_done = true;
             }
         };
 
@@ -7110,7 +7261,7 @@ impl EngineDispatcher<'_> {
             res_body: has_wait.then_some(res_body.as_slice()),
             unique_id: entry.sess.log.unique_id.as_deref(),
             accept_date: Some(entry.sess.log.date),
-            stream: Some(stream_facts(&entry.sess.log, Some(status), entry.sess.max_retries > entry.sess.conn_retries)),
+            stream: Some(stream_facts(&entry.sess, Some(status))),
             last_rule: last_rule_at(entry.sess.log.last_rule),
             prio: (entry.sess.log.prio_class, entry.sess.log.prio_offset),
             captures_req_hdr: Some(&entry.sess.log.req_captures),
@@ -7450,6 +7601,7 @@ impl EngineDispatcher<'_> {
         now: Tick,
         serving: usize,
     ) -> Option<crate::stats_html::AdminAction> {
+        entry.sess.log.applet = true;
         let req_uri = entry.sess.req_uri.as_deref().unwrap_or("/");
 
         // 1. CSV telemetry
@@ -7466,7 +7618,7 @@ impl EngineDispatcher<'_> {
                 csv.len(),
                 csv
             );
-            entry.sess.write_reply(resp.as_bytes());
+            stats_write_reply(entry, proxies, resp.as_bytes());
             return None;
         }
 
@@ -7484,7 +7636,7 @@ impl EngineDispatcher<'_> {
                 json.len(),
                 json
             );
-            entry.sess.write_reply(resp.as_bytes());
+            stats_write_reply(entry, proxies, resp.as_bytes());
             return None;
         }
 
@@ -7603,7 +7755,7 @@ impl EngineDispatcher<'_> {
                     body.len(),
                     body
                 );
-                entry.sess.write_reply(resp.as_bytes());
+                stats_write_reply(entry, proxies, resp.as_bytes());
                 return Some(cmd);
             }
 
@@ -7619,7 +7771,7 @@ impl EngineDispatcher<'_> {
                 html.len(),
                 html
             );
-            entry.sess.write_reply(resp.as_bytes());
+            stats_write_reply(entry, proxies, resp.as_bytes());
             return Some(cmd);
         }
 
@@ -7636,7 +7788,7 @@ impl EngineDispatcher<'_> {
             html.len(),
             html
         );
-        entry.sess.write_reply(resp.as_bytes());
+        stats_write_reply(entry, proxies, resp.as_bytes());
         None
     }
 
@@ -8177,6 +8329,12 @@ impl EngineDispatcher<'_> {
                     ibex_config::HttpReqAction::StrictMode { on } => {
                         STRICT_MODE.set(*on);
                     }
+                    ibex_config::HttpReqAction::DisableL7Retry => {
+                        if let Some(t) = sess.txn.as_mut() {
+                            t.l7_off = true;
+                            t.l7 = crate::txn::L7Retry::Off;
+                        }
+                    }
                     ibex_config::HttpReqAction::SetTimeout { timeout_type, timeout_val } => {
                         let ms = if let Ok(expr) = Expr::parse(timeout_val) {
                             if let Some(smp) = expr.eval_sample(registry, &make_ctx!(sess)) {
@@ -8336,6 +8494,7 @@ impl EngineDispatcher<'_> {
             return None;
         };
         entry.backend_idx = be_idx;
+        entry.sess.retry_conn = proxies[be_idx].ids.retry_on & ibex_config::RE_CONN_FAILED != 0;
         // `stream_set_backend` counts the stream for the backend (`proxy_inc_be_ctr`).
         proxies[be_idx].counters().be_sess_rate.tick();
         // `stream_set_backend` (src/stream.c): switching to a backend takes its retry
@@ -8426,6 +8585,25 @@ impl EngineDispatcher<'_> {
                 Ok(RuleFlow::Suspend) => return None,
                 Ok(RuleFlow::Next) => {}
             }
+        }
+
+        // `retry-on <status>`: the request is kept, once it is sent, to be sent again on an
+        // answer the backend retries on (`TX_L7_RETRY`, set when a connection is requested
+        // unless `http-request disable-l7-retry` ran). It reaches the data path in
+        // `process_srv_io` (the copy) and `l7_retry` (the replay).
+        if !resume_be && proxies[be_idx].ids.retry_on & !ibex_config::RE_CONN_FAILED != 0 {
+            if let Some(t) = entry.sess.txn.as_mut().filter(|t| !t.l7_off && matches!(t.l7, crate::txn::L7Retry::Off)) {
+                t.l7 = crate::txn::L7Retry::Armed;
+            }
+        }
+
+        // A backend's `stats enable` / `stats uri`: the stats applet answers a request for
+        // its URI after the backend's own rules (the frontend's was served above).
+        if be_idx != proxy_idx
+            && (proxies[be_idx].stats_config.enable || proxies[be_idx].stats_config.uri.is_some() || proxies[be_idx].stats_config.admin)
+            && Self::is_stats_request(entry.sess.req_uri.as_deref().unwrap_or("/"), proxies[be_idx].stats_config.uri.as_deref())
+        {
+            return Self::handle_stats_request(entry, proxies, checks, pid, now, be_idx);
         }
 
         // Apply forwardfor & originalto header injection. As in HAProxy
@@ -8673,6 +8851,7 @@ impl EngineDispatcher<'_> {
         // already counted for the backend.
         let resumed = entry.sess.be_inspect;
         entry.backend_idx = be_idx;
+        entry.sess.retry_conn = proxies[be_idx].ids.retry_on & ibex_config::RE_CONN_FAILED != 0;
         stream_timeouts_enter(proxies, entry.proxy_idx, be_idx, &entry.sess);
         if !resumed {
             // `stream_set_backend` counts the stream for the backend (`proxy_inc_be_ctr`).
@@ -8863,6 +9042,13 @@ impl EngineDispatcher<'_> {
     /// A transaction's or connection's log line, at `info` as `HAProxy` sends them.
     fn send_log_line(&self, proxy_idx: usize, line: &[u8]) {
         self.send_log(proxy_idx, LogLevel::Info, line);
+    }
+
+    /// A stream's line: `info`, or `err` when it failed and the frontend has `option
+    /// log-separate-errors` (`strm_log`).
+    fn send_stream_log(&self, proxy_idx: usize, err: bool, line: &[u8]) {
+        let separate = self.proxies.get(proxy_idx).is_some_and(|p| p.log_opts & ibex_config::LOG_OPT_SEPARATE_ERRORS != 0);
+        self.send_log(proxy_idx, if err && separate { LogLevel::Err } else { LogLevel::Info }, line);
     }
 
     fn send_log(&self, proxy_idx: usize, level: LogLevel, msg: &[u8]) {
@@ -10386,6 +10572,25 @@ fn stick_bytes_due(sess: &TcpSession, last: bool) -> (u64, u64) {
 /// A rule that fails turns the reply into the 500 page, which goes through the rules once
 /// more; if they fail on that too, or the failed reply was already a 500, the 500 goes out
 /// without them (`http_reply_and_close`, `TX_CONST_REPLY`).
+/// A stats page answer, with the `http-after-response` rules of its frontend and backend
+/// applied as they are to any other response.
+fn stats_write_reply(entry: &mut SessionEntry, proxies: &[Proxy], raw: &[u8]) {
+    let (fe, be) = (entry.proxy_idx, entry.backend_idx);
+    // The page is streamed by the applet, not held in the HTX message the rules edit: they
+    // see the head alone.
+    let head_len = crate::proxy::find_eoh(raw).map_or(raw.len(), |(h, e)| h + e);
+    match after_res_on_reply(&mut entry.sess, proxies, fe, be, &raw[..head_len]) {
+        Ok(head) => {
+            let mut out = head.into_owned();
+            out.extend_from_slice(&raw[head_len..]);
+            entry.sess.write_reply(&out);
+        }
+        // A rule that fails (strict mode, a rewrite that does not fit) makes the reply the 500
+        // page, as it does any other (`http_reply_and_close`).
+        Err(()) => reply_error(entry, proxies, 500),
+    }
+}
+
 fn send_proxy_reply(sess: &mut TcpSession, proxies: &[Proxy], fe_idx: usize, be_idx: usize, raw: &[u8]) {
     if let Ok(out) = after_res_on_reply(sess, proxies, fe_idx, be_idx, raw) {
         sess.write_reply(&out);
@@ -10478,7 +10683,7 @@ fn after_res_on_reply<'r>(
             res_version: Some(&version),
             unique_id: sess.log.unique_id.as_deref(),
             accept_date: Some(sess.log.date),
-            stream: Some(stream_facts(&sess.log, Some(status), sess.max_retries > sess.conn_retries)),
+            stream: Some(stream_facts(sess, Some(status))),
             captures_req_hdr: Some(&sess.log.req_captures),
             captures_res_hdr: Some(&res_caps_in),
             ..Default::default()

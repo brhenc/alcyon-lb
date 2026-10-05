@@ -65,6 +65,10 @@ pub struct StreamLog {
     pub status: Option<u16>,
     /// A retry was balanced anew (`SF_REDISP`): `%rc` is written with a `+` in front.
     pub redispatched: bool,
+    /// The stream was answered by an applet (the stats page): `when(toapplet)`.
+    pub applet: bool,
+    /// `option logasap`: the line went out with the response head; none follows.
+    pub asap_done: bool,
 }
 
 impl StreamLog {
@@ -94,6 +98,8 @@ impl StreamLog {
             term: None,
             status: None,
             redispatched: false,
+            applet: false,
+            asap_done: false,
         }
     }
 

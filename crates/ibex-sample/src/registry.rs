@@ -105,6 +105,27 @@ pub fn unset_proc_var(name: &str) {
     }
 }
 
+/// Where `debug()` writes a line: the runtime's event sinks, given the sink's name.
+pub type DebugSinkFn = fn(&str, &[u8]);
+
+static DEBUG_SINK: std::sync::OnceLock<DebugSinkFn> = std::sync::OnceLock::new();
+
+/// Sets the writer `debug()` sends its lines to.
+pub fn set_debug_sink(f: DebugSinkFn) {
+    let _ = DEBUG_SINK.set(f);
+}
+
+thread_local! {
+    /// The destinations named by the `debug()` converters checked on this thread since the
+    /// last `take_debug_destinations`, for the runtime to check against its sinks.
+    static DEBUG_DESTS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The destinations `debug()` converters named while their arguments were checked.
+pub fn take_debug_destinations() -> Vec<String> {
+    DEBUG_DESTS.with(|d| std::mem::take(&mut *d.borrow_mut()))
+}
+
 pub fn set_proc_var(name: &str, val: String) {
     if let Ok(mut lock) = GLOBAL_PROC_VARS.write() {
         lock.insert(name.to_string(), val);
@@ -150,6 +171,10 @@ pub struct StreamFacts {
     pub forwarded: bool,
     /// An applet is serving the request.
     pub toapplet: bool,
+    /// Connection retries spent on the stream (`txn.conn_retries`).
+    pub retries: u32,
+    /// The stream was redispatched (`txn.redispatched`).
+    pub redispatched: bool,
 }
 
 /// Runtime context passed into sample fetch functions during evaluation.
@@ -1040,6 +1065,24 @@ impl Registry {
         });
         self.register_fetch(FetchDesc {
             name: "res.status",
+            out_type: SampleType::Sint,
+            func: status_fetch,
+        });
+        // `txn.conn_retries` and `txn.redispatched` (`smp_fetch_conn_retries`,
+        // `smp_fetch_redispatched`): what the stream has spent on reaching a server.
+        self.register_fetch(FetchDesc {
+            name: "txn.conn_retries",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| ctx.stream.map(|f| Sample::Sint(i64::from(f.retries))),
+        });
+        self.register_fetch(FetchDesc {
+            name: "txn.redispatched",
+            out_type: SampleType::Bool,
+            func: |ctx, _args| ctx.stream.map(|f| Sample::Bool(f.redispatched)),
+        });
+        // `txn.status`: the status the log reports, `status` where a response is read.
+        self.register_fetch(FetchDesc {
+            name: "txn.status",
             out_type: SampleType::Sint,
             func: status_fetch,
         });
@@ -4071,7 +4114,33 @@ impl Registry {
             name: "debug",
             in_type: TypeSpec::Any,
             out_type: TypeSpec::Same,
-            func: |smp, _args| Some(smp),
+            func: |smp, args| {
+                // `sample_conv_debug`: `[debug] <prefix>: type=<type> <printable text>`, to the
+                // destination (`buf0` when none is named).
+                let prefix = args.first().map_or("", String::as_str);
+                let sink = args.get(1).map_or("buf0", String::as_str);
+                let sink = if sink.is_empty() { "buf0" } else { sink };
+                let kind = match &smp {
+                    Sample::Bool(_) => "bool",
+                    Sample::Sint(_) => "sint",
+                    Sample::Ipv4(_) => "ipv4",
+                    Sample::Ipv6(_) => "ipv6",
+                    Sample::Str(_) => "str",
+                    Sample::Bin(_) => "bin",
+                    Sample::Meth(_) => "meth",
+                };
+                let text = match &smp {
+                    Sample::Bin(b) => b.clone(),
+                    other => sample_to_string(other).into_bytes(),
+                };
+                let mut line = format!("[debug] {prefix}: type={kind} <").into_bytes();
+                line.extend(text.iter().map(|&c| if (0x20..0x7f).contains(&c) { c } else { b'.' }));
+                line.push(b'>');
+                if let Some(write) = DEBUG_SINK.get() {
+                    write(sink, &line);
+                }
+                Some(smp)
+            },
         });
 
         self.register_converter(ConvDesc {
@@ -5828,6 +5897,12 @@ pub fn check_converter_args(name: &str, args: &[String]) -> Option<String> {
             [_, rest @ ..] if !rest.is_empty() => Some(format!("invalid arg 2 in converter 'url_enc' : expected ')' before ',{})'.", rest.join(","))),
             _ => Some("invalid args in converter 'url_enc' : Unexpected encode type. Allowed value is 'query'.".to_string()),
         },
+        "debug" => {
+            if let Some(dest) = args.get(1).filter(|d| !d.is_empty()) {
+                DEBUG_DESTS.with(|d| d.borrow_mut().push(dest.clone()));
+            }
+            None
+        }
         "when" if parse_when_cond(args).is_none() => Some(
             "invalid args in converter 'when' : expects [!]error, forwarded, normal, processed, stopping, toapplet or acl,<name>".to_string(),
         ),

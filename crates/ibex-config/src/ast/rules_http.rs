@@ -134,6 +134,8 @@ pub enum HttpReqAction {
     StrictMode {
         on: bool,
     },
+    /// `http-request disable-l7-retry`: no retry on the server's answer for this request.
+    DisableL7Retry,
     SetVar {
         var_name: String,
         expr: String,
