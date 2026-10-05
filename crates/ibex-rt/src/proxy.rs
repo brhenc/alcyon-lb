@@ -302,6 +302,9 @@ pub struct TcpSession {
     /// server, because an instant retry almost always reproduces the same error and
     /// just burns the retry budget. See `src/backend.c:2890`.
     pub retry_after: Tick,
+    /// When the server connection kept after a response goes back to the server's lists
+    /// if no next request has taken it (T187; unset while none is kept).
+    pub srv_park_exp: Tick,
     /// The backend retries a failed connection (`retry-on conn-failure`, the default).
     pub retry_conn: bool,
     /// The stream was redispatched (`SF_REDISP`): what `txn.redispatched` reads.
@@ -323,7 +326,7 @@ pub struct TcpSession {
     /// them in `conn_complete_session`, after the handshake, so `src` and `fc_pp_tlv`
     /// read the header.
     pub session_rules_pending: bool,
-    pub proxy_info: Option<ibex_proto::ProxyInfo>,
+    pub proxy_info: Option<Box<ibex_proto::ProxyInfo>>,
     pub server_addr: Option<SocketAddr>,
     pub send_proxy_prepended: bool,
     /// The PROXY header the server connection opened with, if any: a later request reuses
@@ -343,7 +346,7 @@ pub struct TcpSession {
     /// client again, eight `EAGAIN` reads per keep-alive request (`performance.md`).
     pub cli_cant_recv: bool,
     pub created_at: Instant,
-    pub pending_resp: Option<(Vec<u8>, usize)>,
+    pub pending_resp: Option<Box<(Vec<u8>, usize)>>,
     pub fc_src: Option<SocketAddr>,
     pub fc_dst: Option<SocketAddr>,
     pub tcp_inspect_done: bool,
@@ -369,7 +372,7 @@ pub struct TcpSession {
     pub stick_stores: Vec<(usize, StickKey)>,
     pub bufsize: usize,
     pub maxrewrite: usize,
-    pub h2_ctx: Option<H2MuxContext>,
+    pub h2_ctx: Option<Box<H2MuxContext>>,
     /// The first GOAWAY of an HTTP/2 `timeout client` has gone: the next expiry closes.
     pub h2_idle_goaway: bool,
     pub h2_active_stream_id: Option<u32>,
@@ -425,9 +428,11 @@ fn h2_head_size(msg: &ibex_proto::htx::Htx, abs_prefix: Option<&str>) -> u64 {
 
 /// Writes what has come of an HTTP/2 request's body into `req`, as much as there is room
 /// for: each DATA frame as it is, or as a chunk when the request has no length, and the
-/// end as the last chunk. True if anything was written.
-fn pump_h2_body(msg: &ibex_proto::htx::Htx, st: &mut H2ReqBody, req: &mut Buf) -> bool {
-    let blocks = msg.blocks();
+/// end as the last chunk. True if anything was written. A DATA block written out whole
+/// is released: the stream holds only what is still to go (T195's 50 MB upload was held
+/// until the stream ended).
+fn pump_h2_body(msg: &mut ibex_proto::htx::Htx, st: &mut H2ReqBody, req: &mut Buf) -> bool {
+    let blocks = msg.blocks_mut();
     let mut wrote = false;
     while !st.done && st.cursor < blocks.len() {
         match &blocks[st.cursor] {
@@ -463,6 +468,9 @@ fn pump_h2_body(msg: &ibex_proto::htx::Htx, st: &mut H2ReqBody, req: &mut Buf) -
                 st.off += n;
                 st.consumed += n as u64;
                 if st.off >= d.len() {
+                    if let HtxBlock::Data(d) | HtxBlock::RawData(d) = &mut blocks[st.cursor] {
+                        *d = Vec::new();
+                    }
                     st.cursor += 1;
                     st.off = 0;
                 }
@@ -568,15 +576,15 @@ impl TcpSession {
             req_uri: None,
             req_method: None,
             req_headers: None,
-            htx_buf: Buf::standard(),
+            htx_buf: Buf::unallocated(crate::buf::BufClass::Standard),
             htx_tail: 0,
             htx_blocks: 0,
             has_htx: false,
             htx_modified: false,
             cli_state,
             srv_state: ScState::Init,
-            req: Buf::standard(),
-            rep: Buf::standard(),
+            req: Buf::unallocated(crate::buf::BufClass::Standard),
+            rep: Buf::unallocated(crate::buf::BufClass::Standard),
             timeouts,
             timeouts_set: None,
             be_tunnel_ms: 0,
@@ -585,6 +593,7 @@ impl TcpSession {
             conn_retries: retries,
             max_retries: retries,
             retry_after: Tick::ETERNITY,
+            srv_park_exp: Tick::ETERNITY,
             retry_conn: true,
             redispatched: false,
             cli_exp: Tick::ETERNITY,
@@ -684,6 +693,7 @@ impl TcpSession {
     /// descriptors at the end, as they were.
     pub fn htx_reserve(&mut self, bytes: usize) {
         use ibex_proto::htx::HTX_DESC_SIZE;
+        self.htx_buf.alloc_if_needed();
         let len = self.htx_buf.raw_slice().len();
         let descs = self.htx_blocks * HTX_DESC_SIZE;
         let free = len.saturating_sub(descs).saturating_sub(self.htx_tail);
@@ -713,7 +723,7 @@ impl TcpSession {
     #[must_use]
     pub fn has_pending_output(&self) -> bool {
         self.rep_window() > 0
-            || self.pending_resp.as_ref().is_some_and(|(d, o)| *o < d.len())
+            || self.pending_resp.as_deref().is_some_and(|(d, o)| *o < d.len())
             || self.h2_ctx.as_ref().is_some_and(|h| h.tx_consumed < h.tx_buf.len())
     }
 
@@ -1092,7 +1102,7 @@ impl TcpSession {
         let n = raw.len().min(w.len());
         w[..n].copy_from_slice(&raw[..n]);
         self.rep.commit(n);
-        self.pending_resp = (n < raw.len()).then(|| (raw.to_vec(), n));
+        self.pending_resp = (n < raw.len()).then(|| Box::new((raw.to_vec(), n)));
     }
 
     /// Clears what belonged to the transaction that just ended, so the next request on
@@ -1124,6 +1134,22 @@ impl TcpSession {
         self.stick_stores.clear();
         self.is_first_req = false;
         self.cli_state = ScState::Ready;
+        self.release_idle_buffers();
+    }
+
+    /// Gives back the buffers that hold nothing (`h1_release_buf`): a connection waiting
+    /// for its next request holds no buffer (T183). An HTX grown past its class goes too;
+    /// the next message starts from a pooled one.
+    pub fn release_idle_buffers(&mut self) {
+        self.req.release();
+        self.rep.release();
+        if !self.has_htx {
+            if self.htx_buf.class() == crate::buf::BufClass::Custom {
+                self.htx_buf = Buf::unallocated(crate::buf::BufClass::Standard);
+            } else {
+                self.htx_buf.release();
+            }
+        }
     }
 
     /// Discards the body of a request the proxy has already answered, as it arrives, up
@@ -1210,7 +1236,7 @@ impl TcpSession {
         if let Some(dst) = info.dst_sockaddr() {
             self.server_addr = Some(dst);
         }
-        self.proxy_info = Some(info);
+        self.proxy_info = Some(Box::new(info));
         self.proxy_handshake_done = true;
         self.cli_state = if self.mode == Mode::Http { ScState::Ready } else { ScState::Established };
         true
@@ -1297,7 +1323,7 @@ impl TcpSession {
             if self.h2_ctx.is_none() {
                 let mut h2 = H2MuxContext::new(ibex_proto::conn::ConnId(0), true);
                 h2.flood_config = self.h2_flood_config;
-                self.h2_ctx = Some(h2);
+                self.h2_ctx = Some(Box::new(h2));
             }
             if self.cli_state.can_read() && !self.cli_cant_recv {
                 let mut raw_buf = [0u8; 16384];
@@ -1362,7 +1388,9 @@ impl TcpSession {
                         self.log.first_byte_now();
                         changed = true;
                     }
-                    Io::Done(_) | Io::WouldBlock => {}
+                    // Nothing came: the buffer taken for the read goes back
+                    // (`h1_release_buf`), so a connection that has sent nothing yet holds none.
+                    Io::Done(_) | Io::WouldBlock => self.req.release(),
                 }
             }
 
@@ -1373,7 +1401,7 @@ impl TcpSession {
                 let to_parse = self.req.readable().to_vec();
                 let _ = MuxH2.parse(&mut h2, &to_parse).map_err(|_| h2.ensure_goaway());
                 self.req.clear();
-                self.h2_ctx = Some(h2);
+                self.h2_ctx = Some(Box::new(h2));
                 changed = true;
             }
         }
@@ -1498,9 +1526,9 @@ impl TcpSession {
                     }
                 }
                 // The DATA frames of the request being served that have come since.
-                if let Some(stream) = self.h2_active_stream_id.and_then(|id| h2.streams.get(&id)) {
+                if let Some(stream) = self.h2_active_stream_id.and_then(|id| h2.streams.get_mut(&id)) {
                     let before = self.h2_body.trailer_bytes;
-                    if pump_h2_body(&stream.rx_htx, &mut self.h2_body, &mut self.req) {
+                    if pump_h2_body(&mut stream.rx_htx, &mut self.h2_body, &mut self.req) {
                         changed = true;
                     }
                     // The client may send as much again as has moved on towards the server:
@@ -1726,7 +1754,7 @@ impl TcpSession {
         }
 
         // Drain pending synthetic response into rep if space is available
-        if let Some((ref data, ref mut offset)) = self.pending_resp {
+        if let Some((ref data, ref mut offset)) = self.pending_resp.as_deref_mut() {
             if self.rep.writable().is_empty() && self.rep.len() < self.rep.capacity() {
                 self.rep.compact();
             }
@@ -2214,7 +2242,7 @@ impl TcpSession {
     /// The earliest deadline across both sides, for the scheduler's wait queue.
     #[must_use]
     pub fn next_expiry(&self) -> Tick {
-        let mut exp = self.cli_exp.earliest(self.req_exp).earliest(self.srv_exp).earliest(self.conn_exp).earliest(self.retry_after);
+        let mut exp = self.cli_exp.earliest(self.req_exp).earliest(self.srv_exp).earliest(self.conn_exp).earliest(self.retry_after).earliest(self.srv_park_exp);
         if let Some(q) = self.queue.as_ref() {
             exp = exp.earliest(q.deadline);
         }
@@ -2637,7 +2665,7 @@ mod tests {
     use ibex_proto::htx::{Htx, HtxBlock};
 
     /// Pumps until the body is done, taking out what each pass wrote.
-    fn pump_all(msg: &Htx, st: &mut H2ReqBody, req: &mut Buf, out: &mut Vec<u8>) {
+    fn pump_all(msg: &mut Htx, st: &mut H2ReqBody, req: &mut Buf, out: &mut Vec<u8>) {
         for _ in 0..64 {
             if st.done {
                 break;
@@ -2664,14 +2692,35 @@ mod tests {
         let mut st = H2ReqBody { chunked: true, ..H2ReqBody::default() };
         let mut req = Buf::with_capacity(16);
         let mut out = Vec::new();
-        pump_all(&msg, &mut st, &mut req, &mut out);
+        pump_all(&mut msg.clone(), &mut st, &mut req, &mut out);
         assert_eq!(out, b"4\r\nabcd\r\n4\r\nefgh\r\n2\r\nij\r\n0\r\n\r\n");
 
         let mut st = H2ReqBody::default();
         let mut req = Buf::with_capacity(4);
         let mut out = Vec::new();
-        pump_all(&msg, &mut st, &mut req, &mut out);
+        pump_all(&mut msg.clone(), &mut st, &mut req, &mut out);
         assert_eq!(out, b"abcdefghij");
+    }
+
+    /// Found by T195: the DATA of an HTTP/2 request stayed in the stream's message after it
+    /// was written towards the server, so a 50 MB upload was held whole until the stream
+    /// ended. A block written out is released; what is still to go stays.
+    #[test]
+    fn a_forwarded_h2_body_is_released() {
+        let mut msg = Htx::new();
+        msg.push(HtxBlock::Eoh);
+        msg.push(HtxBlock::Data(vec![b'x'; 100]));
+        msg.push(HtxBlock::Data(vec![b'y'; 100]));
+        let held = |m: &Htx| -> usize { m.blocks().iter().map(|b| if let HtxBlock::Data(d) = b { d.len() } else { 0 }).sum() };
+        let mut st = H2ReqBody { cursor: 1, ..H2ReqBody::default() };
+        let mut req = Buf::with_capacity(150);
+        assert!(pump_h2_body(&mut msg, &mut st, &mut req));
+        assert_eq!(req.readable().len(), 150);
+        assert_eq!(held(&msg), 100, "the first block went out whole, the second in part");
+        req.consume(150);
+        assert!(pump_h2_body(&mut msg, &mut st, &mut req));
+        assert_eq!(req.readable(), [b'y'; 50]);
+        assert_eq!(held(&msg), 0);
     }
 
     /// The last chunk is not split: with less than its five bytes of room, nothing is
@@ -2682,10 +2731,10 @@ mod tests {
         msg.push(HtxBlock::Eom);
         let mut st = H2ReqBody { chunked: true, ..H2ReqBody::default() };
         let mut req = Buf::with_capacity(4);
-        assert!(!pump_h2_body(&msg, &mut st, &mut req));
+        assert!(!pump_h2_body(&mut msg, &mut st, &mut req));
         assert!(!st.done);
         let mut req = Buf::with_capacity(16);
-        assert!(pump_h2_body(&msg, &mut st, &mut req));
+        assert!(pump_h2_body(&mut msg, &mut st, &mut req));
         assert_eq!(req.readable(), b"0\r\n\r\n");
     }
 
@@ -2702,11 +2751,12 @@ mod tests {
         msg.push(HtxBlock::Eom);
         for (cap, passes) in [(15, 2), (17, 2), (64, 1)] {
             let mut st = H2ReqBody { chunked: true, ..H2ReqBody::default() };
+            let mut msg = msg.clone();
             let mut req = Buf::with_capacity(cap);
             let mut out = Vec::new();
             let mut n = 0;
             while !st.done {
-                pump_h2_body(&msg, &mut st, &mut req);
+                pump_h2_body(&mut msg, &mut st, &mut req);
                 n += 1;
                 out.extend_from_slice(req.readable());
                 let len = req.readable().len();
@@ -2720,7 +2770,7 @@ mod tests {
         let mut st = H2ReqBody::default();
         let mut req = Buf::with_capacity(64);
         let mut out = Vec::new();
-        pump_all(&msg, &mut st, &mut req, &mut out);
+        pump_all(&mut msg.clone(), &mut st, &mut req, &mut out);
         assert_eq!(out, b"ab");
         assert_eq!(st.trailer_bytes, 3);
     }

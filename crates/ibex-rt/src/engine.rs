@@ -160,21 +160,32 @@ impl WorkerPool {
     /// the connection is itself safe or its idle list is empty, or the server is not keeping
     /// more than it was seen to need plus `pool-low-conn` (`used` is the server's
     /// connections in use, this one included). Otherwise it is given back for closing.
+    #[cfg(test)]
     fn keep(&mut self, key: IdleKey, conn: IdleConn, is_safe: bool, cfg: SrvPoolCfg, used: u32, now: Instant) -> Result<(), IdleConn> {
+        self.keep_with(key, conn, is_safe, cfg, used, (0, used), now)
+    }
+
+    /// [`WorkerPool::keep`], with what the other workers know of the server: its idle
+    /// connections on them, and the most connections it was seen to use at once on any
+    /// (`srv->curr_idle_conns`, `srv->max_used_conns`: server-wide in `HAProxy`; only the
+    /// empty-lists clause is this worker's own, `srv->per_thr[tid]`).
+    #[allow(clippy::too_many_arguments)]
+    fn keep_with(&mut self, key: IdleKey, conn: IdleConn, is_safe: bool, cfg: SrvPoolCfg, used: u32, (others, peak): (usize, u32), now: Instant) -> Result<(), IdleConn> {
         if cfg.purge_delay_ms == 0 {
             return Err(conn);
         }
         let s = self.servers.entry(key.srv).or_default();
         // `srv_use_conn` raises both with every connection in use; seen from here, the
         // peak is at least the connections in use at a release.
-        s.max_used = s.max_used.max(used);
-        s.est_need = s.est_need.max(used);
+        s.max_used = s.max_used.max(used).max(peak);
+        s.est_need = s.est_need.max(used).max(peak);
         let curr_idle = s.conns.len();
-        if usize::try_from(cfg.max_conn).is_ok_and(|m| m <= curr_idle) {
+        let all_idle = curr_idle + others;
+        if usize::try_from(cfg.max_conn).is_ok_and(|m| m <= all_idle) {
             return Err(conn);
         }
         let idle_empty = curr_idle == s.safe;
-        let curr = u32::try_from(curr_idle).unwrap_or(u32::MAX);
+        let curr = u32::try_from(all_idle).unwrap_or(u32::MAX);
         if !((s.safe == 0 && (is_safe || idle_empty)) || used.saturating_add(curr) <= used.max(s.est_need).saturating_add(cfg.low_conn)) {
             return Err(conn);
         }
@@ -278,6 +289,16 @@ pub struct IdlePools {
     /// The slot the next takeover starts from (`srv->per_tgrp[].next_takeover`, here one for
     /// all servers).
     next_takeover: AtomicUsize,
+    /// Each server's idle connections in all slots (`srv->curr_idle_conns`).
+    srv_idle: std::sync::RwLock<HashMap<(usize, usize), SrvIdleCount>>,
+}
+
+/// A server's idle connections in all slots, and the most it was seen to use at once
+/// since a purge last looked at it.
+#[derive(Debug, Default)]
+struct SrvIdleCount {
+    idle: AtomicUsize,
+    peak: std::sync::atomic::AtomicU32,
 }
 
 impl IdlePools {
@@ -293,7 +314,33 @@ impl IdlePools {
             slots: (0..workers.max(1)).map(|_| IdleSlot::default()).collect(),
             shared,
             next_takeover: AtomicUsize::new(0),
+            srv_idle: std::sync::RwLock::default(),
         })
+    }
+
+    /// Runs `f` on server `srv`'s counts, made on first use.
+    fn with_count<R>(&self, srv: (usize, usize), f: impl Fn(&SrvIdleCount) -> R) -> R {
+        if let Some(n) = self.srv_idle.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(&srv) {
+            return f(n);
+        }
+        f(self.srv_idle.write().unwrap_or_else(std::sync::PoisonError::into_inner).entry(srv).or_default())
+    }
+
+    /// Server `srv`'s idle connections in every slot, and its peak of connections in use
+    /// raised to `used`.
+    fn srv_seen(&self, srv: (usize, usize), used: u32) -> (usize, u32) {
+        self.with_count(srv, |n| (n.idle.load(Ordering::Relaxed), n.peak.fetch_max(used, Ordering::Relaxed).max(used)))
+    }
+
+    /// Counts `added` connections into server `srv`'s idle ones and `removed` out.
+    fn count_idle(&self, srv: (usize, usize), added: usize, removed: usize) {
+        if added == removed {
+            return;
+        }
+        self.with_count(srv, |n| {
+            n.idle.fetch_add(added, Ordering::Relaxed);
+            let _ = n.idle.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(removed)));
+        });
     }
 
     /// Worker `wid`'s handle.
@@ -348,11 +395,18 @@ impl IdlePool {
 
     /// See [`WorkerPool::keep`]; into this worker's slot.
     fn keep(&mut self, key: IdleKey, conn: IdleConn, is_safe: bool, cfg: SrvPoolCfg, used: u32, now: Instant) -> Result<(), IdleConn> {
+        let srv = key.srv;
         let slot = &self.pools.slots[self.wid];
         let mut pool = IdlePools::lock(slot);
-        let r = pool.keep(key, conn, is_safe, cfg, used, now);
+        let own = pool.servers.get(&srv).map_or(0, |s| s.conns.len());
+        let (all, peak) = self.pools.srv_seen(srv, used);
+        let r = pool.keep_with(key, conn, is_safe, cfg, used, (all.saturating_sub(own), peak), now);
         slot.conns.store(pool.conns, Ordering::Relaxed);
         self.next_purge = pool.next_purge();
+        drop(pool);
+        if r.is_ok() {
+            self.pools.count_idle(srv, 1, 0);
+        }
         r
     }
 
@@ -365,9 +419,11 @@ impl IdlePool {
         let own = &pools.slots[self.wid];
         if own.conns.load(Ordering::Relaxed) != 0 {
             let mut pool = IdlePools::lock(own);
+            let before = pool.conns;
             let found = pool.take(key, first_req, mode);
             own.conns.store(pool.conns, Ordering::Relaxed);
             self.next_purge = pool.next_purge();
+            pools.count_idle(key.srv, 0, before - pool.conns);
             if found.is_some() {
                 return found;
             }
@@ -384,9 +440,12 @@ impl IdlePool {
             }
             // A busy slot is skipped, and so is a poisoned one: its worker panicked.
             let Ok(mut pool) = slot.pool.try_lock() else { continue };
+            let before = pool.conns;
             let found = pool.take(key, first_req, mode);
             slot.conns.store(pool.conns, Ordering::Relaxed);
+            let removed = before - pool.conns;
             drop(pool);
+            pools.count_idle(key.srv, 0, removed);
             if found.is_some() {
                 pools.next_takeover.store(i + 1, Ordering::Relaxed);
                 return found;
@@ -401,6 +460,11 @@ impl IdlePool {
         self.pools.slots.iter().map(|s| s.conns.load(Ordering::Relaxed)).sum()
     }
 
+    /// Raises server `srv`'s peak of connections in use to `used`.
+    fn note_used(&self, srv: (usize, usize), used: u32) {
+        let _ = self.pools.srv_seen(srv, used);
+    }
+
     /// See [`WorkerPool::purge`]; this worker's slot, when its purge is due.
     pub fn purge(&mut self, now: Instant, used: impl Fn((usize, usize)) -> u32) {
         if self.next_purge.is_none_or(|t| t > now) {
@@ -408,8 +472,18 @@ impl IdlePool {
         }
         let slot = &self.pools.slots[self.wid];
         let mut pool = IdlePools::lock(slot);
-        pool.purge(now, used);
+        let before: Vec<((usize, usize), usize, Option<Instant>)> = pool.servers.iter().map(|(&k, s)| (k, s.conns.len(), s.purge_at)).collect();
+        pool.purge(now, &used);
         slot.conns.store(pool.conns, Ordering::Relaxed);
+        for (srv, n, at) in before {
+            let after = pool.servers.get(&srv).map_or(0, |s| s.conns.len());
+            self.pools.count_idle(srv, 0, n.saturating_sub(after));
+            // The peak restarts from the connections in use with each purge of the server.
+            if at.is_some_and(|t| t <= now) {
+                let in_use = used(srv);
+                self.pools.with_count(srv, |c| c.peak.store(in_use, Ordering::Relaxed));
+            }
+        }
         self.next_purge = pool.next_purge();
     }
 }
@@ -472,6 +546,27 @@ mod shared_pool_tests {
         assert!(w2.take(&key(), true, Always, true).is_some());
         assert!(w1.is_empty() && !w0.is_empty());
         assert!(w2.take(&key(), true, Always, true).is_none());
+    }
+
+    /// `srv_add_to_idle_list` compares `pool-max-conn` and the need estimate with the
+    /// server's idle connections on every thread (`srv->curr_idle_conns`), not this
+    /// worker's: with `pool-max-conn 1` and one idle on worker 0, worker 1 keeps none
+    /// (`http_reuse_safe.vtc` at `nbthread 64`: c2's second request gets c1's
+    /// connection). Taking or purging one counts it out again.
+    #[test]
+    fn pool_max_conn_counts_the_idle_connections_of_every_worker() {
+        use ibex_config::HttpReuse::Always;
+        let t0 = Instant::now();
+        let one = SrvPoolCfg { max_conn: 1, ..CFG };
+        let pools = IdlePools::with(2, true);
+        let (mut w0, mut w1) = (pools.worker(0), pools.worker(1));
+        let (c0, _p0) = alive();
+        let (c1, _p1) = alive();
+        let (c2, _p2) = alive();
+        assert!(w0.keep(key(), c0, true, one, 1, t0).is_ok());
+        assert!(w1.keep(key(), c1, true, one, 1, t0).is_err(), "a second idle connection on another worker");
+        assert!(w1.take(&key(), false, Always, true).is_some());
+        assert!(w1.keep(key(), c2, true, one, 1, t0).is_ok(), "the one idle connection was taken");
     }
 }
 
@@ -5583,7 +5678,7 @@ pub fn shutdown_session_entry(
             proxies[proxy_idx].counters().act_conn.fetch_sub(1, Ordering::Relaxed);
             crate::globalconn::release();
         }
-        if let Some(s_idx) = entry.target_server_idx {
+        if let Some(s_idx) = entry.target_server_idx.filter(|_| !entry.sess.srv_park_exp.is_set()) {
             let be_idx = entry.srv_backend_idx;
             if be_idx < proxies.len() && s_idx < proxies[be_idx].server_actconn.len() {
                 proxies[be_idx].server_actconn[s_idx].fetch_sub(1, Ordering::Relaxed);
@@ -5803,6 +5898,25 @@ fn reply_parse_error(entry: &mut SessionEntry, proxies: &[Proxy], status: u16) {
     });
 }
 
+/// Counts the session's server connection into (`add`) or out of its server's connections
+/// in use.
+fn server_actconn_add(entry: &SessionEntry, proxies: &[Proxy], add: bool) {
+    if entry.actconn_reclaimed {
+        return;
+    }
+    if let Some(a) = entry.target_server_idx.and_then(|i| proxies.get(entry.srv_backend_idx)?.server_actconn.get(i)) {
+        if add {
+            a.fetch_add(1, Ordering::Relaxed);
+        } else {
+            a.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// How long a server connection stays on its session after a response, for that client's
+/// next request, before it goes to the server's lists (ms).
+const SRV_PARK_MS: u32 = 100;
+
 /// Detaches the server connection from the session: into the idle pool when it can carry
 /// another request, closed otherwise. The server slot it held is released either way.
 fn release_server(
@@ -5813,6 +5927,8 @@ fn release_server(
     idle_pool: &mut IdlePool,
     reusable: bool,
 ) {
+    // A parked connection has already left the server's count of connections in use.
+    let parked = entry.sess.srv_park_exp.is_set();
     if let Some(srv_fd) = entry.sess.srv.take() {
         let _ = poller.delete(srv_fd.as_fd());
         if let Some(sfd) = entry.srv_raw_fd.take() {
@@ -5826,8 +5942,9 @@ fn release_server(
             && entry.sess.srv_xprt.is_ready()
             && proxies
                 .get(entry.srv_backend_idx)
-                .is_some_and(|p| p.http_reuse != ibex_config::HttpReuse::Never)
-            && raw::is_idle_conn_alive(srv_fd.as_fd());
+                .is_some_and(|p| p.http_reuse != ibex_config::HttpReuse::Never);
+        // Whether the server has closed it since is checked when it is taken
+        // (`WorkerPool::take`): not here as well, a syscall on every response.
         // The pool is keyed by server; a server that maps the destination may have been
         // connected anywhere, so its connections are not pooled.
         let xprt = std::mem::replace(&mut entry.sess.srv_xprt, crate::xprt::ServerXprt::Plain);
@@ -5838,7 +5955,7 @@ fn release_server(
             .and_then(|addr| idle_key(addr, entry.srv_backend_idx, entry.target_server_idx, xprt.sni().map(str::to_string)));
         if let (Some(key), Some(be)) = (key, proxies.get(entry.srv_backend_idx)) {
             let cfg = be.ids.server_pool(key.srv.1);
-            let used = be.server_actconn.get(key.srv.1).map_or(0, |a| a.load(Ordering::Relaxed));
+            let used = be.server_actconn.get(key.srv.1).map_or(0, |a| a.load(Ordering::Relaxed)) + u32::from(parked);
             if let Err(conn) = idle_pool.keep(key, IdleConn { fd: srv_fd, xprt }, entry.srv_served >= 2, cfg, used, Instant::now()) {
                 conn.close();
             }
@@ -5848,10 +5965,11 @@ fn release_server(
         }
     }
     entry.srv_raw_fd = None;
+    entry.sess.srv_park_exp = Tick::ETERNITY;
     entry.sess.srv_xprt = crate::xprt::ServerXprt::Plain;
     if let Some(s_idx) = entry.target_server_idx.take() {
         let be = entry.srv_backend_idx;
-        if !entry.actconn_reclaimed && be < proxies.len() && s_idx < proxies[be].server_actconn.len() {
+        if !entry.actconn_reclaimed && !parked && be < proxies.len() && s_idx < proxies[be].server_actconn.len() {
             proxies[be].server_actconn[s_idx].fetch_sub(1, Ordering::Relaxed);
         }
     }
@@ -6222,7 +6340,7 @@ fn cleanup_done(
         proxies[proxy_idx].counters().act_conn.fetch_sub(1, Ordering::Relaxed);
         crate::globalconn::release();
 
-        if let Some(s_idx) = entry.target_server_idx {
+        if let Some(s_idx) = entry.target_server_idx.filter(|_| !entry.sess.srv_park_exp.is_set()) {
             let be_idx = entry.srv_backend_idx;
             if be_idx < proxies.len() && s_idx < proxies[be_idx].server_actconn.len() {
                 proxies[be_idx].server_actconn[s_idx].fetch_sub(1, Ordering::Relaxed);
@@ -6825,11 +6943,40 @@ impl EngineDispatcher<'_> {
             close_http_session(entry, proxies, fdtab, poller, idle_pool, reusable);
             return;
         }
+        // The server connection leaves the session with the response (`h1_detach`): into
+        // the server's lists, which may close it (`srv_add_to_idle_list`), so a client that
+        // idles holds no server connection (T187: 10 idle clients, one backend connection
+        // in HAProxy). A next request already in the buffer keeps it: it is not a first
+        // request, and the pool would hand it straight back (`connect_http_backend`).
+        // While the lists hold nothing, and the server keeps idle connections at all, it
+        // would be kept there and be the one the client's next request takes: it stays
+        // parked on the session for `SRV_PARK_MS` instead, so a keep-alive client that asks
+        // again at once takes it back without the pool round trip (two `epoll_ctl` and a
+        // peek per request: -25% requests/s at 50 clients), and one that idles has given
+        // it back before another request could tell.
+        // Under `http-reuse never` the connection is the session's own (`session_add_conn`)
+        // and stays on it; so does one opened with a PROXY header, whose reuse key is the
+        // header (it names this client's addresses), which the pool does not key by.
+        let private = entry.sess.send_proxy_prepended
+            || proxies.get(entry.srv_backend_idx).is_some_and(|p| p.http_reuse == ibex_config::HttpReuse::Never);
         if !reusable {
             release_server(entry, proxies, fdtab, poller, idle_pool, false);
+        } else if entry.sess.req.is_empty() && !private {
+            let keeps = entry.target_server_idx.is_some_and(|i| proxies.get(entry.srv_backend_idx).is_some_and(|p| p.ids.server_pool(i).keeps_any()));
+            if keeps && idle_pool.total() == 0 && entry.sess.srv.is_some() {
+                entry.sess.srv_park_exp = now.add(SRV_PARK_MS);
+                // Idle, it is not one of the server's connections in use (`scur`, and
+                // what the lists' rule weighs); the peak in use is noted first, as the
+                // lists would have (`srv_add_to_idle_list` raising `max_used_conns`).
+                if let Some(i) = entry.target_server_idx {
+                    let used = proxies.get(entry.srv_backend_idx).and_then(|p| p.server_actconn.get(i)).map_or(0, |a| a.load(Ordering::Relaxed));
+                    idle_pool.note_used((entry.srv_backend_idx, i), used);
+                }
+                server_actconn_add(entry, proxies, false);
+            } else {
+                release_server(entry, proxies, fdtab, poller, idle_pool, true);
+            }
         }
-        // A reusable server connection stays on the session for the next request, which
-        // takes it if routing sends it to the same server (`connect_http_backend`).
         entry.sess.reset_for_next_request();
         entry.stats_done = false;
         // The wait for the next request starts with the response's end
@@ -7084,8 +7231,19 @@ impl EngineDispatcher<'_> {
                 }
             }
 
+            // A server connection parked after a response that no request has taken back
+            // goes to the server's lists (`end_txn`).
+            if entry.sess.srv_park_exp.is_expired(now) {
+                release_server(entry, self.proxies, self.fdtab, self.poller, self.idle_backend_pool, true);
+            }
+
             // Step 4: Update interests
             update_interests(entry, self.fdtab, self.poller);
+            // A direction with nothing in transit holds no buffer between two runs
+            // (`h1_release_buf` after each send/recv): a forwarded request's buffer goes
+            // back while its answer is stuck behind a slow client (T184).
+            entry.sess.req.release();
+            entry.sess.rep.release();
 
             // Step 4b: undispatched H2 streams have no socket event to wake them; run again.
             // Pending output needs no requeue: Step 4 asked the (level-triggered) poller
@@ -9033,6 +9191,10 @@ impl EngineDispatcher<'_> {
                 // The connection is already there, so `%Tw` and `%Tc` are both 0, not
                 // -1 and the time from the request to now.
                 entry.sess.log.queue.get_or_insert_with(Instant::now);
+                if entry.sess.srv_park_exp.is_set() {
+                    entry.sess.srv_park_exp = Tick::ETERNITY;
+                    server_actconn_add(entry, proxies, true);
+                }
                 entry.sess.server_connected(now);
                 if let Some(txn) = entry.sess.txn.as_mut() {
                     txn.srv_reused = true;

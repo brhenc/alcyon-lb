@@ -39,3 +39,12 @@ fn server_check_state_stays_small() {
     let n = size_of::<ibex_rt::check::ServerCheckState>();
     assert!(n <= 464, "ServerCheckState grew to {n} bytes (bound 464): one is held per checked server, box the new field");
 }
+
+/// A session is held for every client connection, idle ones included, in the worker's
+/// arena (T183: HAProxy keeps ~1 KB per idle client). Box what only some connections use
+/// (`h2_ctx`, `proxy_info`, `pending_resp` are).
+#[test]
+fn session_entry_stays_small() {
+    let n = size_of::<ibex_rt::engine::SessionEntry>();
+    assert!(n <= 1592, "SessionEntry grew to {n} bytes (bound 1592): one is held per client connection, box the new field");
+}
