@@ -1712,6 +1712,9 @@ class TestResult:
     unexpected_pass: bool = False
 
 
+_BAD_BACKEND_SOCK: Optional[socket.socket] = None
+
+
 def vtest_builtin_macros() -> Dict[str, str]:
     """Macros vtest itself defines (vtc_main.c), beyond `testdir`/`tmpdir`.
 
@@ -1719,10 +1722,13 @@ def vtest_builtin_macros() -> Dict[str, str]:
     routable. They were left undefined, so `server s1 ${bad_backend}` reached the proxy as
     `server s1` and the config was refused before the test began.
     """
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
+    global _BAD_BACKEND_SOCK
+    if _BAD_BACKEND_SOCK is None:
+        # Bound and never listened on, and kept for the life of the runner as vtest does:
+        # a connect is refused, and no other test running in parallel can take the port.
+        _BAD_BACKEND_SOCK = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        _BAD_BACKEND_SOCK.bind(("127.0.0.1", 0))
+    port = _BAD_BACKEND_SOCK.getsockname()[1]
     return {
         "localhost": "127.0.0.1",
         "bad_backend": f"127.0.0.1:{port}",

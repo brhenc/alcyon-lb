@@ -41,6 +41,19 @@ class BuiltinMacros(unittest.TestCase):
         with self.assertRaises(ConnectionRefusedError):
             socket.create_connection((host, int(port)), timeout=2).close()
 
+    def test_bad_backend_port_stays_reserved(self):
+        # The board runs tests in parallel. A port that was only probed and released can be
+        # bound by another test's server, and then `${bad_backend}` answers (when_debug.vtc
+        # got a 504 instead of a 503). vtest keeps the socket bound, without listen().
+        ex = executor('varnishtest "x"\n')
+        host, port = ex.macro_engine.expand("${bad_backend}").rsplit(":", 1)
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            with self.assertRaises(OSError):
+                s.bind((host, int(port)))
+        finally:
+            s.close()
+
     def test_bad_ip_and_localhost_are_defined(self):
         ex = executor('varnishtest "x"\n')
         for m in ("bad_ip", "localhost"):
