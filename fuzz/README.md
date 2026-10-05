@@ -118,10 +118,12 @@ rustup toolchain install nightly
 cargo install cargo-fuzz
 ```
 
-On this machine both are installed (2026-10-05) under `~/.cargo/bin`, which is not on
-`PATH` (the system `cargo` in `/usr/bin` is the stable one the gate uses). Call it as
-`~/.cargo/bin/cargo +nightly fuzz …`, or `export PATH=$HOME/.cargo/bin:$PATH` in the
-shell you fuzz from. Every command below runs **from the repository root** with
+On this machine (2026-10-05) rustup's `cargo`/`rustc` are in `~/.local/rustup-bin`, not
+on `PATH`; `cargo-fuzz` itself is in `~/.cargo/bin`. Do not put rustup's shims in
+`~/.cargo/bin`: the gate's coverage step puts that directory first on `PATH`, and must get
+the system `cargo` (`/usr/bin`, matching `llvm-profdata`). Call it as
+`~/.local/rustup-bin/cargo +nightly fuzz …`, or `export PATH=$HOME/.local/rustup-bin:$PATH`
+in the shell you fuzz from only. Every command below runs **from the repository root** with
 `--fuzz-dir fuzz/libfuzzer`; run from inside `fuzz/libfuzzer`, cargo-fuzz looks for
 `fuzz/libfuzzer/fuzz/Cargo.toml` and fails.
 
