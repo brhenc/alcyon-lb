@@ -302,6 +302,9 @@ pub struct TcpSession {
     /// server, because an instant retry almost always reproduces the same error and
     /// just burns the retry budget. See `src/backend.c:2890`.
     pub retry_after: Tick,
+    /// When the server connection kept after a response goes back to the server's lists
+    /// if no next request has taken it (T187; unset while none is kept).
+    pub srv_park_exp: Tick,
     /// The backend retries a failed connection (`retry-on conn-failure`, the default).
     pub retry_conn: bool,
     /// The stream was redispatched (`SF_REDISP`): what `txn.redispatched` reads.
@@ -343,7 +346,7 @@ pub struct TcpSession {
     /// client again, eight `EAGAIN` reads per keep-alive request (`performance.md`).
     pub cli_cant_recv: bool,
     pub created_at: Instant,
-    pub pending_resp: Option<(Vec<u8>, usize)>,
+    pub pending_resp: Option<Box<(Vec<u8>, usize)>>,
     pub fc_src: Option<SocketAddr>,
     pub fc_dst: Option<SocketAddr>,
     pub tcp_inspect_done: bool,
@@ -590,6 +593,7 @@ impl TcpSession {
             conn_retries: retries,
             max_retries: retries,
             retry_after: Tick::ETERNITY,
+            srv_park_exp: Tick::ETERNITY,
             retry_conn: true,
             redispatched: false,
             cli_exp: Tick::ETERNITY,
@@ -719,7 +723,7 @@ impl TcpSession {
     #[must_use]
     pub fn has_pending_output(&self) -> bool {
         self.rep_window() > 0
-            || self.pending_resp.as_ref().is_some_and(|(d, o)| *o < d.len())
+            || self.pending_resp.as_deref().is_some_and(|(d, o)| *o < d.len())
             || self.h2_ctx.as_ref().is_some_and(|h| h.tx_consumed < h.tx_buf.len())
     }
 
@@ -1089,7 +1093,7 @@ impl TcpSession {
         let n = raw.len().min(w.len());
         w[..n].copy_from_slice(&raw[..n]);
         self.rep.commit(n);
-        self.pending_resp = (n < raw.len()).then(|| (raw.to_vec(), n));
+        self.pending_resp = (n < raw.len()).then(|| Box::new((raw.to_vec(), n)));
     }
 
     /// Clears what belonged to the transaction that just ended, so the next request on
@@ -1733,7 +1737,7 @@ impl TcpSession {
         }
 
         // Drain pending synthetic response into rep if space is available
-        if let Some((ref data, ref mut offset)) = self.pending_resp {
+        if let Some((ref data, ref mut offset)) = self.pending_resp.as_deref_mut() {
             if self.rep.writable().is_empty() && self.rep.len() < self.rep.capacity() {
                 self.rep.compact();
             }
@@ -2221,7 +2225,7 @@ impl TcpSession {
     /// The earliest deadline across both sides, for the scheduler's wait queue.
     #[must_use]
     pub fn next_expiry(&self) -> Tick {
-        let mut exp = self.cli_exp.earliest(self.req_exp).earliest(self.srv_exp).earliest(self.conn_exp).earliest(self.retry_after);
+        let mut exp = self.cli_exp.earliest(self.req_exp).earliest(self.srv_exp).earliest(self.conn_exp).earliest(self.retry_after).earliest(self.srv_park_exp);
         if let Some(q) = self.queue.as_ref() {
             exp = exp.earliest(q.deadline);
         }
