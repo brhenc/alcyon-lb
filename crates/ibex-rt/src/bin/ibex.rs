@@ -886,6 +886,9 @@ fn main() {
     // The idle server connections, one slot per worker, taken across workers unless
     // `tune.idle-pool.shared off`.
     let idle_pools = ibex_rt::engine::IdlePools::new(nbthread, &config);
+    // One mailbox per worker: the CLI's `show sess` and `shutdown session(s)` ask them all.
+    // A failure is reported by each worker as its engine's.
+    let mailboxes = ibex_rt::mailbox::Mailboxes::new(nbthread).map_err(|e| e.to_string());
     // One configuration for every worker, as the proxies are (T160): a worker reads it
     // while it starts, and a copy each held it for the life of the process.
     let config = std::sync::Arc::new(config);
@@ -893,13 +896,19 @@ fn main() {
         let config_clone = std::sync::Arc::clone(&config);
         let proxies_clone = shared_proxies.clone();
         let idle_pools = std::sync::Arc::clone(&idle_pools);
+        let mailboxes = mailboxes.clone();
         let cli_socket_clone = cli_socket.clone();
         let extra_sockets = extra_sockets.clone();
         let lifecycle_clone = lifecycle.clone();
         let ready_tx = ready_tx.clone();
 
         let t = std::thread::spawn(move || {
-            let mut engine = match Engine::new_worker(&config_clone, capacity, worker_id, proxies_clone) {
+            let started = Engine::new_worker(&config_clone, capacity, worker_id, proxies_clone).and_then(|mut eng| {
+                let boxes = mailboxes.as_ref().map_err(|m| std::io::Error::other(m.clone()))?;
+                eng.share_mailboxes(boxes, worker_id)?;
+                Ok(eng)
+            });
+            let mut engine = match started {
                 Ok(eng) => eng,
                 Err(err) => {
                     eprintln!("Failed to initialize Ibex engine (worker {}): {}", worker_id, err);

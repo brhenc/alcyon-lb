@@ -63,6 +63,8 @@ pub enum FdState {
     QuicListener { listener: u32 },
     /// A backend socket opened by a QUIC request. Readiness advances that listener's legs.
     QuicBackend { listener: u32 },
+    /// This worker's mailbox (`crate::mailbox`): another worker asked something.
+    Mailbox,
 }
 
 #[derive(Copy, Clone, Debug)]

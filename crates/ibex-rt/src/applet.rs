@@ -20,6 +20,7 @@
 use crate::check::{ServerCheckState, ServerStatus};
 use crate::engine::{Proxy, SessionArena};
 use crate::fdtab::Interest;
+use crate::mailbox::{Gather, Mailboxes, Msg, SessFilter, SessSnap};
 use crate::stats::format_show_stat_filtered;
 use ibex_sched::task::TaskRef;
 use ibex_sched::Tick;
@@ -27,6 +28,7 @@ use std::fmt::Write as FmtWrite;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
+use std::sync::Arc;
 use std::time::Instant;
 
 /// Runtime context passed to CLI applet command handlers.
@@ -40,6 +42,68 @@ pub struct AppletContext<'a> {
     pub total_tasks: usize,
     pub run_queue_len: usize,
     pub now: Tick,
+    /// Every worker's mailbox: `show sess` and `shutdown session(s)` ask them all.
+    pub mailboxes: &'a Arc<Mailboxes>,
+    /// The worker serving this CLI connection, and the connection's task, woken when every
+    /// worker has answered.
+    pub worker_id: usize,
+    pub task: TaskRef,
+}
+
+/// A command waiting for every worker's answer (`crate::mailbox`). The connection reads no
+/// further command until it is answered.
+enum Pending {
+    Sess(Arc<Gather<Vec<SessSnap>>>, SessOpts),
+    /// `shutdown session(s)`; `by_id` answers HAProxy's message when nothing matched.
+    Shut(Arc<Gather<usize>>, bool),
+}
+
+/// `show sess` options (`cli_parse_show_sess`).
+#[derive(Default)]
+struct SessOpts {
+    fe: Option<usize>,
+    be: Option<usize>,
+    srv: Option<(usize, usize)>,
+    uri: bool,
+}
+
+/// `show sess help`, as HAProxy answers it.
+const SHOW_SESS_HELP: &str = "Usage: show sess [<id> | all | help] [<options>*]\n\
+Dumps active streams (formerly called 'sessions'). Available selectors:\n   \
+<id>         dump only this stream identifier (0x...)\n   \
+all          dump all matching streams in large format\n   \
+help         show this message\n   \
+susp         report streams considered suspicious\n\
+Available options: \n   \
+show-uri     also display the transaction URI, if available\n   \
+older <age>  only display streams older than <age> seconds\n   \
+server <b/s> only show streams attached to this backend+server\n   \
+backend <b>  only show streams attached to this backend\n   \
+frontend <f> only show streams attached to this frontend\n\
+Without any argument, all streams are dumped in a shorter format.";
+
+/// C's `strtoul(s, NULL, 0)`: the leading number in base 16 (`0x`), 8 (`0`) or 10; 0 when
+/// there is none.
+fn strtoul0(s: &str) -> u64 {
+    let t = s.trim_start();
+    let (radix, digits) = if let Some(h) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        (16, h)
+    } else if let Some(o) = t.strip_prefix('0') {
+        (8, o)
+    } else {
+        (10, t)
+    };
+    let end = digits.find(|c: char| !c.is_digit(radix)).unwrap_or(digits.len());
+    u64::from_str_radix(&digits[..end], radix).unwrap_or(if end == 0 { 0 } else { u64::MAX })
+}
+
+/// A timer of `show sess`: `HAProxy`'s `human_time(TICKS_TO_MS(exp - now_ms), 1000)`.
+fn sess_timer(ms: Option<i64>) -> String {
+    match ms {
+        None => String::new(),
+        Some(ms) if ms < 0 => "?".into(),
+        Some(ms) => crate::mailbox::human_time(ms / 1000),
+    }
 }
 
 /// The privilege level of a CLI connection: the socket's `level`, which `user` and `operator`
@@ -135,6 +199,11 @@ pub struct CliApplet {
     pub interest: Interest,
     /// An `add map <id> <<` waiting for its payload: the command and the lines so far.
     pub payload: Option<(String, String)>,
+    /// When the connection was accepted, for its own `show sess` line.
+    pub created: Instant,
+    /// A command waiting for the other workers, and what followed it on its line.
+    pending: Option<Pending>,
+    pending_rest: Option<String>,
 }
 
 impl CliApplet {
@@ -157,6 +226,9 @@ impl CliApplet {
             is_done: false,
             interest: Interest::READ,
             payload: None,
+            created: Instant::now(),
+            pending: None,
+            pending_rest: None,
         }
     }
 
@@ -223,6 +295,22 @@ impl CliApplet {
         if !self.in_buf.is_empty() {
             self.last_activity = ctx.now;
         }
+        if let Some(p) = self.pending.take() {
+            if !self.resume_pending(p, ctx) {
+                return;
+            }
+            if let Some(rest) = self.pending_rest.take() {
+                self.execute_line(&rest, ctx);
+                if self.pending.is_some() {
+                    return;
+                }
+            }
+            // Out of `prompt` mode, the line that waited was the connection's only one.
+            if !self.interactive {
+                self.in_buf.clear();
+                return;
+            }
+        }
 
         while let Some(newline_pos) = self.in_buf.iter().position(|&b| b == b'\n') {
             let line_bytes = self.in_buf[..newline_pos].to_vec();
@@ -243,6 +331,10 @@ impl CliApplet {
                 }
             } else {
                 self.execute_line(line, ctx);
+                if self.pending.is_some() {
+                    // Answered once every worker has; what follows waits until then.
+                    return;
+                }
                 if self.payload.is_some() {
                     continue;
                 }
@@ -258,7 +350,7 @@ impl CliApplet {
 
     fn execute_line(&mut self, line: &str, ctx: &mut AppletContext) {
         let sub_commands: Vec<&str> = line.split(';').collect();
-        for raw_cmd in sub_commands {
+        for (i, raw_cmd) in sub_commands.iter().enumerate() {
             let cmd = raw_cmd.trim();
             if cmd.is_empty() {
                 if self.interactive {
@@ -267,6 +359,11 @@ impl CliApplet {
                 continue;
             }
             self.execute_command(cmd, ctx);
+            if self.pending.is_some() {
+                // The rest of the line runs once this command is answered.
+                self.pending_rest = Some(sub_commands[i + 1..].join(";")).filter(|r| !r.is_empty());
+                return;
+            }
         }
     }
 
@@ -474,6 +571,8 @@ impl CliApplet {
             } else {
                 self.is_done = true;
             }
+        } else if cmd == "show sess" || cmd.starts_with("show sess ") {
+            self.handle_show_sess(&cmd["show sess".len()..], ctx);
         } else if let Some(target) = cmd.strip_prefix("shutdown sessions server ")
             .or_else(|| cmd.strip_prefix("shutdown session server "))
         {
@@ -482,6 +581,8 @@ impl CliApplet {
             .or_else(|| cmd.strip_prefix("shutdown session backend "))
         {
             self.handle_shutdown_sessions_backend(target.trim(), ctx);
+        } else if cmd == "shutdown session" || cmd.starts_with("shutdown session ") {
+            self.handle_shutdown_session(cmd["shutdown session".len()..].trim(), ctx);
         } else if cmd == "clear counters" || cmd.starts_with("clear counters ") {
             self.handle_clear_counters(cmd["clear counters".len()..].trim(), ctx);
         } else if let Some(target) = cmd.strip_prefix("enable health ") {
@@ -845,66 +946,185 @@ impl CliApplet {
         }
     }
 
+    /// `shutdown sessions server <be>/<srv>` (`cli_parse_shutdown_sessions_server`): every
+    /// stream on the server, on every worker.
     fn handle_shutdown_sessions_server(&mut self, target: &str, ctx: &mut AppletContext) {
-        let (px_name, sv_name) = match target.split_once('/') {
-            Some(pair) => pair,
-            None => ("", target),
-        };
-        let mut found_px = false;
-        let mut found_sv = false;
-        for proxy in ctx.proxies.iter() {
-            if px_name.is_empty() || proxy.name == px_name {
-                found_px = true;
-                if proxy.server_ids.iter().any(|sid| sid == sv_name) {
-                    found_sv = true;
-                    break;
-                }
-            }
-        }
-        if !found_px && !px_name.is_empty() {
-            self.out_buf.extend_from_slice(b"No such backend.\n");
-        } else if !found_sv {
-            self.out_buf.extend_from_slice(b"No such server.\n");
-        } else if let (Some(sessions), Some(wake_queue)) =
-            (ctx.sessions.as_deref_mut(), ctx.wake_queue.as_deref_mut())
-        {
-            let be_opt = if px_name.is_empty() { None } else { Some(px_name) };
-            let _ = crate::engine::shutdown_matching_sessions(
-                sessions.iter_mut().map(|(_, e)| e),
-                ctx.proxies,
-                be_opt,
-                Some(sv_name),
-                wake_queue,
-            );
-        }
-        if self.interactive {
-            self.out_buf.extend_from_slice(b"\n> ");
-        } else {
-            self.is_done = true;
+        match Self::find_server(target, ctx) {
+            Err(msg) => self.finish_msg(msg),
+            Ok((be, srv)) => self.ask_shutdown(SessFilter::Server { be, srv }, false, ctx),
         }
     }
 
+    /// `shutdown sessions backend <be>` (Ibex's; HAProxy has no such command): every stream
+    /// on the backend's servers, on every worker.
     fn handle_shutdown_sessions_backend(&mut self, target: &str, ctx: &mut AppletContext) {
-        let px_name = target.trim();
-        let found = ctx.proxies.iter().any(|p| p.name == px_name);
-        if !found {
-            self.out_buf.extend_from_slice(b"No such backend.\n");
-        } else if let (Some(sessions), Some(wake_queue)) =
-            (ctx.sessions.as_deref_mut(), ctx.wake_queue.as_deref_mut())
-        {
-            let _ = crate::engine::shutdown_matching_sessions(
-                sessions.iter_mut().map(|(_, e)| e),
-                ctx.proxies,
-                Some(px_name),
-                None,
-                wake_queue,
-            );
+        match ctx.proxies.iter().position(|p| p.name == target.trim()) {
+            None => self.finish_msg("No such backend."),
+            Some(be) => self.ask_shutdown(SessFilter::Backend(be), false, ctx),
         }
-        if self.interactive {
-            self.out_buf.extend_from_slice(b"\n> ");
+    }
+
+    /// `shutdown session <id>` (`cli_parse_shutdown_session`): the stream `show sess` listed
+    /// as `<id>`, on whichever worker it is.
+    fn handle_shutdown_session(&mut self, arg: &str, ctx: &mut AppletContext) {
+        let id = strtoul0(arg.split_whitespace().next().unwrap_or(""));
+        if id == 0 {
+            self.finish_msg("Session pointer expected (use 'show sess').");
         } else {
-            self.is_done = true;
+            self.ask_shutdown(SessFilter::Id(id), true, ctx);
         }
+    }
+
+    /// Asks every worker to shut down the streams `f` names; answered in `resume_pending`.
+    fn ask_shutdown(&mut self, f: SessFilter, by_id: bool, ctx: &mut AppletContext) {
+        let g = Gather::new(ctx.mailboxes, ctx.worker_id, ctx.task);
+        let f = Arc::new(f);
+        ctx.mailboxes.broadcast(|| Msg::Shutdown(Arc::clone(&f), Arc::clone(&g)));
+        self.pending = Some(Pending::Shut(g, by_id));
+    }
+
+    /// `show sess [<options>]` (`cli_parse_show_sess`, `src/stream.c`), the one-line-per-stream
+    /// format only: the forms that select the long format answer an explicit refusal.
+    fn handle_show_sess(&mut self, rest: &str, ctx: &mut AppletContext) {
+        let args: Vec<&str> = rest.split_whitespace().collect();
+        let mut i = 0;
+        match args.first().copied() {
+            Some("help") => return self.finish_msg(SHOW_SESS_HELP),
+            Some(a @ ("all" | "older")) => {
+                return self.finish_msg(&format!(
+                    "'show sess {a}' is not supported by Ibex: it prints the long format, of which Ibex has only the one-line form."
+                ));
+            }
+            Some(a) if strtoul0(a) != 0 => {
+                return self.finish_msg(
+                    "'show sess <id>' is not supported by Ibex: it prints the long format, of which Ibex has only the one-line form.",
+                );
+            }
+            _ => {}
+        }
+        let mut opts = SessOpts::default();
+        let one_of = "Only one of backend, frontend or server may be set.";
+        while let Some(&a) = args.get(i) {
+            let set = opts.fe.is_some() || opts.be.is_some() || opts.srv.is_some();
+            let next = args.get(i + 1).copied();
+            match a {
+                "show-uri" => opts.uri = true,
+                "susp" => return self.finish_msg("'show sess susp' is not supported by Ibex."),
+                "server" | "backend" | "frontend" if set => return self.finish_msg(one_of),
+                "server" => {
+                    let Some(t) = next else {
+                        return self.finish_msg("Missing server name (<backend>/<server>).");
+                    };
+                    match Self::find_server(t, ctx) {
+                        Ok(bs) => opts.srv = Some(bs),
+                        Err(msg) => return self.finish_msg(msg),
+                    }
+                    i += 1;
+                }
+                "backend" => {
+                    let Some(n) = next else {
+                        return self.finish_msg("Missing backend name.");
+                    };
+                    let Some(be) = ctx.proxies.iter().position(|p| p.has_backend && p.name == n) else {
+                        return self.finish_msg("No such backend.");
+                    };
+                    opts.be = Some(be);
+                    i += 1;
+                }
+                "frontend" => {
+                    let Some(n) = next else {
+                        return self.finish_msg("Missing frontend name.");
+                    };
+                    let Some(fe) = ctx.proxies.iter().position(|p| p.has_frontend && p.name == n) else {
+                        return self.finish_msg("No such frontend.");
+                    };
+                    opts.fe = Some(fe);
+                    i += 1;
+                }
+                _ => return self.finish_msg(&format!("Unsupported option '{a}', try 'help' for more info.")),
+            }
+            i += 1;
+        }
+        let g = Gather::new(ctx.mailboxes, ctx.worker_id, ctx.task);
+        ctx.mailboxes.broadcast(|| Msg::ShowSess(Arc::clone(&g)));
+        self.pending = Some(Pending::Sess(g, opts));
+    }
+
+    /// Answers the command waiting for the workers once all have replied; `false` while it
+    /// still waits.
+    fn resume_pending(&mut self, p: Pending, ctx: &AppletContext) -> bool {
+        match p {
+            Pending::Shut(g, by_id) => {
+                let Some(counts) = g.take() else {
+                    self.pending = Some(Pending::Shut(g, by_id));
+                    return false;
+                };
+                let hit = counts.iter().sum::<usize>() > 0;
+                self.finish_msg(if by_id && !hit { "No such session (use 'show sess')." } else { "" });
+                true
+            }
+            Pending::Sess(g, opts) => {
+                let Some(per_worker) = g.take() else {
+                    self.pending = Some(Pending::Sess(g, opts));
+                    return false;
+                };
+                let now = Instant::now();
+                for snap in per_worker.iter().flatten() {
+                    if opts.fe.is_some_and(|f| snap.fe != Some(f))
+                        || opts.be.is_some_and(|b| snap.be != Some(b))
+                        || opts.srv.is_some_and(|(b, s)| snap.be != Some(b) || snap.srv != Some(s))
+                    {
+                        continue;
+                    }
+                    let line = Self::sess_line(snap, &opts, ctx, now);
+                    self.out_buf.extend_from_slice(line.as_bytes());
+                }
+                self.finish_msg("");
+                true
+            }
+        }
+    }
+
+    /// One stream as HAProxy's `show sess` prints it. The fields Ibex has no value for --
+    /// `ts`, `epoch`, `calls`, `rate`, `cpu`, `lat`, the channel and stream-connector flag
+    /// words and analysers, `ax`, `wex` -- are printed in their place with a neutral value.
+    fn sess_line(s: &SessSnap, opts: &SessOpts, ctx: &AppletContext, now: Instant) -> String {
+        let name = |i: Option<usize>, none: &str| {
+            i.and_then(|i| ctx.proxies.get(i)).map_or_else(|| none.to_string(), |p| p.name.clone())
+        };
+        let srv = s
+            .srv
+            .and_then(|sv| s.be.and_then(|b| ctx.proxies.get(b)).and_then(|p| p.server_ids.get(sv)))
+            .map_or("<none>", String::as_str);
+        let src = s.src.map_or_else(|| "unix:1".to_string(), |a| a.to_string());
+        let age = i64::try_from(now.saturating_duration_since(s.since).as_secs()).unwrap_or(i64::MAX);
+        let scb_state = if s.srv_fd >= 0 || s.src.is_none() { 8 } else { 0 };
+        let mut l = format!(
+            "0x{:x}: proto={} src={src} fe={} be={} srv={srv} ts=00 epoch=0 age={} calls=0 rate=0 cpu=0 lat=0 \
+             rq[f=000000h,i={},an=00h,ax=] rp[f=000000h,i={},an=00h,ax=] \
+             scf=[8,0h,fd=1/{},rex={},wex=] scb=[{scb_state},0h,fd=1/{},rex={},wex=] exp={} rc={} c_exp={}",
+            s.id,
+            s.proto,
+            name(s.fe, "GLOBAL"),
+            name(s.be, "<NONE>"),
+            crate::mailbox::human_time(age),
+            s.req_in,
+            s.rep_in,
+            s.cli_fd,
+            sess_timer(s.cli_rex),
+            s.srv_fd,
+            sess_timer(s.srv_rex),
+            sess_timer(s.exp),
+            s.retries,
+            sess_timer(s.c_exp),
+        );
+        if opts.uri {
+            if let Some(u) = &s.uri {
+                let _ = write!(l, " uri=\"{u}\"");
+            }
+        }
+        l.push('\n');
+        l
     }
 
     /// `clear counters [all | server <be>/<sv> [force] | <anything>]` (`cli_parse_clear_counters`,
@@ -1361,10 +1581,12 @@ impl CliApplet {
                       show events [-0rsn] [<sink>]               : List the event sinks, or dump a ring\n\
                       show info                                  : Dump system statistics\n\
                       show pools                                 : Report information about the memory pools usage\n\
+                      show sess [help|<id>|all] [opts...]     : report the list of current streams or dump this exact stream\n\
                       show stat [<iid> <type> <sid>]             : Dump CSV proxies and servers statistics\n\
                       show table [<name>]                        : Dump stick table contents\n\
                       shutdown sessions server <backend>/<server>: Terminate active sessions on server\n\
                       shutdown sessions backend <backend>        : Terminate active sessions on backend\n\
+                      shutdown session [id]                   : kill a specific session\n\
                       clear counters [all|<backend>]             : Clear accumulated statistics counters\n\
                       enable health <backend>/<server>           : Resume active health check\n\
                       disable health <backend>/<server>          : Pause active health check\n\
@@ -1465,6 +1687,10 @@ impl AppletArena {
     #[must_use]
     pub const fn live(&self) -> usize {
         self.live
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (u32, &CliApplet)> {
+        self.entries.iter().enumerate().filter_map(|(i, a)| Some((u32::try_from(i).ok()?, a.as_ref()?)))
     }
 }
 
