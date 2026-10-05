@@ -508,7 +508,22 @@ fn the_master_cli_needs_master_worker_mode() {
         assert_eq!(out.status.code(), Some(1), "-S {bad}: {err}");
         assert!(err.contains("Can't create the master's CLI."), "-S {bad}: {err:?}");
     }
-    // `-s` (Ibex's command-line stats socket) needs its path.
+    // `-s <path>` (Ibex's command-line stats socket, not the master CLI) is an admin stats
+    // socket in a single process.
+    let stats = dir.join("s.sock");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ibex"))
+        .arg("-f")
+        .arg(&cfg)
+        .arg("-s")
+        .arg(&stats)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn");
+    wait_for_socket(&stats);
+    assert_eq!(master(&stats, "show cli level"), "admin\n\n");
+    common::stop(&mut child);
+    // `-s` needs its path.
     let out = run_briefly(Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(&cfg).arg("-s"));
     assert_eq!(out.status.code(), Some(1));
     let _ = std::fs::remove_dir_all(&dir);

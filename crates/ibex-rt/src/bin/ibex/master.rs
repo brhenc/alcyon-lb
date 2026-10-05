@@ -486,9 +486,8 @@ impl Master {
 
     /// SIGTERM: every worker is stopped at once, and the master exits 0.
     fn terminate(&mut self) -> ! {
-        if self.systemd {
-            ibex_rt::systemd::notify_stopping_once();
-        }
+        // Sends nothing without a NOTIFY_SOCKET.
+        ibex_rt::systemd::notify_stopping_once();
         for p in self.children.keys() {
             signal(*p, Signal::Term);
         }

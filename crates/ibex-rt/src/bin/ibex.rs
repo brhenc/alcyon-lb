@@ -370,15 +370,14 @@ fn parse_cli_args(args: &[String]) -> (String, CliOptions) {
                 }
                 // `-S` is the master CLI (see master.rs); `-s` / `--stats-socket` are Ibex's
                 // command-line stats socket.
-                if arg == "-S" {
-                    opts.master_socket = Some(args[i].clone());
-                    i += 1;
-                    continue;
-                }
                 let raw = &args[i];
                 let sock_str = raw.split(',').next().unwrap_or(raw);
                 let sock_str = sock_str.strip_prefix("unix@").unwrap_or(sock_str);
-                opts.stats_socket = Some(PathBuf::from(sock_str));
+                if arg == "-S" {
+                    opts.master_socket = Some(raw.clone());
+                } else {
+                    opts.stats_socket = Some(PathBuf::from(sock_str));
+                }
             }
             "-n" => {
                 i += 1;
