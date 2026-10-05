@@ -213,6 +213,11 @@ impl Listener {
                     .as_ref()
                     .and_then(from_any)
                     .unwrap_or_else(|| SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0));
+                // HAProxy sets TCP_NODELAY on every accepted TCP socket (session_accept_fd).
+                // Without it a response written in several segments (anything over the
+                // initial window, e.g. 64 KB) stalls ~40 ms on Nagle + the client's delayed
+                // ACK (T185). Failure is ignored: UNIX sockets have no such option.
+                let _ = net::sockopt::set_tcp_nodelay(&fd, true);
                 Ok(Some((fd, peer)))
             }
             // Two distinct meanings, one response.
