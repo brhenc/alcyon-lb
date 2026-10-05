@@ -1,0 +1,4 @@
+HTTP/1.0 404 Not Found
+Server: x
+
+body until close

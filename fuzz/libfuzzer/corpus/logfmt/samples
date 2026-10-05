@@ -1,0 +1,1 @@
+%[req.hdr(host)] %[res.hdr(content-type)] %[var(txn.foo)] %hr %hs %HM %HP %HQ %HU %HV

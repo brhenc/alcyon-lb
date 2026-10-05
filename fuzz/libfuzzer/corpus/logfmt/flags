@@ -1,0 +1,1 @@
+%{+Q,+E}[capture.req.hdr(0)] %[src,ipmask(24)] %% %Ts %ms %pid %rt

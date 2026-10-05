@@ -1,0 +1,4 @@
+GET http://h/x HTTP/1.0
+Connection: keep-alive
+Cookie: a=b
+

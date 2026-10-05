@@ -1,0 +1,19 @@
+frontend fe
+    mode http
+    bind 127.0.0.1:8080
+    option httplog
+    log-format "%ci:%cp [%t] %ft %b/%s %ST %B %hr"
+    acl is_api path_beg /api
+    acl bad hdr(user-agent) -i -m sub curl
+    http-request deny if bad
+    http-request set-header X-Forwarded-Proto https if { ssl_fc }
+    http-response set-header Server ibex
+    use_backend api if is_api
+    default_backend web
+backend api
+    balance roundrobin
+    server a 127.0.0.1:9001 weight 10
+backend web
+    stick-table type ip size 1m expire 30s store conn_cur
+    tcp-request content track-sc0 src
+    server w 127.0.0.1:9002

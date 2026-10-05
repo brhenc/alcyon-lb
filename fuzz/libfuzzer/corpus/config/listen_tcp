@@ -1,0 +1,6 @@
+listen l
+    bind :1
+    mode tcp
+    server s 127.0.0.1:2 check inter 2s
+
+# comment

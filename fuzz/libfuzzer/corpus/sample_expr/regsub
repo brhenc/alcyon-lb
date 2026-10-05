@@ -1,0 +1,1 @@
+path,regsub(^/api,/v2,i),url_dec

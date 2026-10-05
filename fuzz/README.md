@@ -88,3 +88,81 @@ cargo run --manifest-path fuzz/Cargo.toml -- \
 
 - `fuzz/FINDINGS.md`: Comprehensive markdown report documenting every distinct discrepancy with hex dumps, parser behaviors, and root cause analysis.
 - `fuzz/corpus/`: Verbatim binary files (`finding_*.bin`) for every discovered discrepancy, suitable for regression testing and offline replay.
+
+---
+
+# libFuzzer targets (`fuzz/libfuzzer/`) — crash-finding, no oracle
+
+The harness above compares Ibex with HAProxy. The nine targets below only look for
+**panics, hangs and out-of-memory** on arbitrary input (task R1, `docs/milestones.md`).
+They are a separate crate, `fuzz/libfuzzer/` (its own `[workspace]`, not a member of the
+Ibex workspace); libFuzzer links only into those binaries, never into Ibex. The normal
+`cargo build --workspace` and `tools/checkin.sh` do not build it and need no nightly.
+
+| target | what it feeds |
+|---|---|
+| `h1_request` | HTTP/1 request head: `find_eoh`, `request_framing`, `H1Parser` (whole and split) |
+| `h1_response` | HTTP/1 response head: `H1Parser` in response mode |
+| `h2_frames` | HTTP/2 frame decoder, frames then fed to a server `H2Multiplexer` |
+| `hpack` | HPACK decoder (two blocks on one decoder) and the Huffman decoder |
+| `proxy_protocol` | PROXY protocol v1 and v2 header + TLV accessors |
+| `config` | `ibex_config::parse_str` |
+| `logfmt` | log-format compiler (`LogFormat::compile`, `compile_unique_id`) |
+| `sample_expr` | `ibex_sample::Expr::parse` |
+| `regex` | `ibex_regex::UserRegex::new` |
+
+## One-time setup (needs internet, once)
+
+```
+rustup toolchain install nightly
+cargo install cargo-fuzz
+```
+
+(`cargo-fuzz` is a Cargo plugin; libFuzzer itself is fetched as the `libfuzzer-sys`
+crate on the first build.) Use a target directory on a big disk, not /tmp:
+
+```
+export CARGO_TARGET_DIR=$HOME/ibex-targets/fuzz CARGO_INCREMENTAL=0
+```
+
+## Run one target for a minute
+
+```
+cd fuzz/libfuzzer
+cargo +nightly fuzz run hpack -- -max_total_time=60
+```
+
+It prints a line per new coverage find (`#12345 NEW cov: ... exec/s: ...`) and stops
+after 60 s with "Done". No `crash-` line means nothing was found. Drop `-- -max_total_time=60`
+to run until you press Ctrl-C. List the targets: `cargo +nightly fuzz list`.
+
+## Run all targets for N hours
+
+```
+cd fuzz/libfuzzer
+N=2    # hours in total
+for t in $(cargo +nightly fuzz list); do
+  cargo +nightly fuzz run $t -- -max_total_time=$(( N*3600/9 )) 2>&1 | tee /tmp/fuzz-$t.log
+done
+```
+
+Each target gets N/9 hours. Add `-- -max_total_time=S -rss_limit_mb=2048 -timeout=10` to
+bound memory and treat inputs slower than 10 s as hangs. To use all cores on one target:
+`cargo +nightly fuzz run <t> --jobs 8 -- -max_total_time=S`.
+
+## Where results land
+
+- New interesting inputs: `fuzz/libfuzzer/corpus/<target>/` (seeds are committed; commit
+  only ones that add coverage you care about, or run `cargo +nightly fuzz cmin <t>` first).
+- A crash, hang or OOM: `fuzz/libfuzzer/artifacts/<target>/crash-<hash>` (or `timeout-`,
+  `oom-`). The run prints the panic message and the path.
+
+## Turn a crash into a test
+
+1. Replay it: `cargo +nightly fuzz run <target> artifacts/<target>/crash-<hash>`
+   (or `cargo +nightly fuzz fmt <target> artifacts/<target>/crash-<hash>` to print it).
+2. Copy the file under `fuzz/libfuzzer/artifacts/` into git (it is a small binary).
+3. Write a regular `#[test]` in the crate that owns the code (see the table), calling
+   the same function with the bytes (`include_bytes!` of the artifact, or an escaped
+   literal), and run it: **it must fail first** (AGENTS.md section 1). Then fix the code and
+   watch it pass. Ask an agent to do this; give it the artifact path and the panic text.
