@@ -7094,12 +7094,11 @@ impl EngineDispatcher<'_> {
         if matches!(entry.sess.cli_state, ScState::Ready | ScState::Established) || entry.sess.h2_ctx.is_some() {
             return false;
         }
-        let Some(txn) = entry.sess.txn.as_ref() else {
+        // Not a transaction a client's leaving can abort: none, a reply of the proxy's own,
+        // one already ending, a tunnel, or a response that is all in.
+        let Some(txn) = entry.sess.txn.as_ref().filter(|t| !(t.local || t.aborted || t.req == MsgState::Tunnel || t.rsp.is_done())) else {
             return false;
         };
-        if txn.local || txn.aborted || txn.req == MsgState::Tunnel || txn.rsp.is_done() {
-            return false;
-        }
         // A FIN leaves no ending, a reset `ClientAbort`; any other ending (a timeout, an
         // error) already decided how the stream ends.
         let reset = match entry.sess.ending {

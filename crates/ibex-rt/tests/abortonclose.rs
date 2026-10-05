@@ -196,7 +196,7 @@ fn run(defaults_extra: &str, backend_extra: &str, phase: Phase, how: Leave) -> O
     let maxconn = if phase == Phase::Queue { " maxconn 1" } else { "" };
     let cfg = format!(
         "global\n  stats socket {} level admin\n\
-         defaults\n  mode http\n  timeout client 10s\n  timeout connect 10s\n  timeout server 10s\n  timeout queue 10s\n{defaults_extra}\
+         defaults\n  mode http\n  timeout client 2s\n  timeout connect 2s\n  timeout server 2s\n  timeout queue 2s\n{defaults_extra}\
          frontend f\n  bind {fe}\n  log {} local0\n  log-format \"%HU ts=%ts ST=%ST\"\n  default_backend b\n\
          backend b\n{backend_extra}  server s {srv_addr}{maxconn}\n",
         sock.display(),
@@ -275,6 +275,8 @@ fn run(defaults_extra: &str, backend_extra: &str, phase: Phase, how: Leave) -> O
         }
     }
     let cli_abrt = cli_abrt(&ibex.sock);
+    // The timeouts are short so that a stream still waiting (without abortonclose) has ended
+    // by the soft stop's deadline: a binary killed after it writes no coverage profile.
     drop(holder);
     Outcome { server, client, log, cli_abrt }
 }
@@ -312,7 +314,8 @@ fn without_abortonclose_the_server_keeps_the_request() {
         for how in [Leave::Close, Leave::HalfClose] {
             let o = run(defaults, backend, Phase::Server, how);
             assert_eq!(o.server, Saw::Nothing, "defaults {defaults:?} backend {backend:?}");
-            assert_eq!(o.log, None, "the stream is still waiting for the server");
+            // Still waiting for the server, or, read late enough, ended by `timeout server`.
+            assert!(matches!(o.log.as_deref(), None | Some("/ ts=sH ST=504")), "{:?}", o.log);
             assert_eq!(o.client, b"", "nothing is sent to a half-closed client");
         }
     }
