@@ -151,6 +151,74 @@ pub struct TimeoutsSet {
     pub before: Timeouts,
 }
 
+/// A request waiting in its backend's queue because every server is at its `maxconn`
+/// (`pendconn`, src/queue.c). It leaves the queue when it is given a slot, when `deadline`
+/// (`timeout queue`) passes (`503`, `sQ`), or with the session; dropping it is leaving.
+pub struct QueueWait {
+    /// When `timeout queue` ends (`ETERNITY`: it does not).
+    pub deadline: Tick,
+    /// The backend's queue length, this request in it, for `%bq` in the log.
+    pub pos: u32,
+    task: ibex_sched::TaskRef,
+    stats: Arc<Vec<crate::engine::ProxyStats>>,
+    be_idx: usize,
+}
+
+thread_local! {
+    /// The requests queued on this thread, oldest first, with the backend each waits for:
+    /// what `Engine::wake_queued` hands slots to. (A session never leaves its thread.)
+    static QUEUED: std::cell::RefCell<Vec<(ibex_sched::TaskRef, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+impl QueueWait {
+    /// Puts the request of `task` in the queue of backend `be_idx`; `stats` are the
+    /// backend's, where `qcur` and `qmax` are kept.
+    #[must_use]
+    pub fn enter(task: ibex_sched::TaskRef, be_idx: usize, stats: Arc<Vec<crate::engine::ProxyStats>>, deadline: Tick) -> Box<QueueWait> {
+        let st = &stats[0];
+        let pos = st.queue_cur.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        st.queue_max.fetch_max(pos, std::sync::atomic::Ordering::Relaxed);
+        QUEUED.with(|q| q.borrow_mut().push((task, be_idx)));
+        Box::new(QueueWait { deadline, pos, task, stats, be_idx })
+    }
+
+    /// Whether anything is queued on this thread.
+    #[must_use]
+    pub fn any() -> bool {
+        QUEUED.with(|q| !q.borrow().is_empty())
+    }
+
+    /// The tasks to wake: for each backend, the oldest `free(be)` of those waiting on it.
+    pub fn take_due(mut free: impl FnMut(usize) -> usize) -> Vec<ibex_sched::TaskRef> {
+        QUEUED.with(|q| {
+            let q = q.borrow();
+            let mut left: Vec<(usize, usize)> = Vec::new();
+            let mut due = Vec::new();
+            for &(task, be) in q.iter() {
+                let slot = if let Some(i) = left.iter().position(|(b, _)| *b == be) {
+                    i
+                } else {
+                    left.push((be, free(be)));
+                    left.len() - 1
+                };
+                if left[slot].1 > 0 {
+                    left[slot].1 -= 1;
+                    due.push(task);
+                }
+            }
+            due
+        })
+    }
+}
+
+impl Drop for QueueWait {
+    fn drop(&mut self) {
+        self.stats[0].queue_cur.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        let (task, be) = (self.task, self.be_idx);
+        let _ = QUEUED.try_with(|q| q.borrow_mut().retain(|&(t, b)| !(t == task && b == be)));
+    }
+}
+
 /// One TCP / HTTP session: two connections, two buffers, two state machines.
 #[allow(clippy::struct_excessive_bools)]
 pub struct TcpSession {
@@ -197,6 +265,14 @@ pub struct TcpSession {
     /// What `http-request set-timeout` set for the stream in progress; `None` until a rule
     /// sets one, so a stream that sets none allocates nothing.
     pub timeouts_set: Option<Box<TimeoutsSet>>,
+    /// The chosen backend's `timeout tunnel` and `timeout queue`, in ms (0: none). The queue
+    /// one is `timeout connect` where the backend has no `timeout queue` of its own (the
+    /// value `HAProxy` is configured with). What `set-timeout` set for the stream is in
+    /// `timeouts_set` and wins; see [`TcpSession::tunnel_ms`] and [`TcpSession::queue_ms`].
+    pub be_tunnel_ms: u32,
+    pub be_queue_ms: u32,
+    /// The request waits for a server slot (`maxconn`): see [`QueueWait`].
+    pub queue: Option<Box<QueueWait>>,
     /// Connect attempts left before giving up.
     pub conn_retries: u16,
     /// The retry budget this stream started with, `s->max_retries` in HAProxy: what
@@ -441,6 +517,9 @@ impl TcpSession {
             rep: Buf::standard(),
             timeouts,
             timeouts_set: None,
+            be_tunnel_ms: 0,
+            be_queue_ms: 0,
+            queue: None,
             conn_retries: retries,
             max_retries: retries,
             retry_after: Tick::ETERNITY,
@@ -603,11 +682,48 @@ impl TcpSession {
     }
 
     fn arm_client(&mut self, now: Tick) {
-        self.cli_exp = if self.timeouts.client == 0 {
-            Tick::ETERNITY
-        } else {
-            now.add(self.timeouts.client)
+        let ms = self.tunnel_ms().unwrap_or(self.timeouts.client);
+        self.cli_exp = if ms == 0 { Tick::ETERNITY } else { now.add(ms) };
+    }
+
+    /// `timeout tunnel` for this stream, the backend's or the one `set-timeout tunnel` gave
+    /// it (`s->tunnel_timeout`), while it is a tunnel: a TCP stream once its server is
+    /// connected, an HTTP one once both its request and its response are one (a `101`, or
+    /// a `2xx` to `CONNECT`). Then it replaces `timeout client` and `timeout server` on both
+    /// sides; without it those two go on.
+    #[must_use]
+    pub fn tunnel_ms(&self) -> Option<u32> {
+        let set = self.timeouts_set.as_ref().map_or(0, |s| s.ms[ibex_sample::TimeoutKind::Tunnel as usize]);
+        let ms = if set != 0 { set } else { self.be_tunnel_ms };
+        let on = match self.mode {
+            Mode::Tcp => self.srv_state == ScState::Established,
+            Mode::Http => self.txn.as_ref().is_some_and(|t| t.rsp == txn::MsgState::Tunnel && t.req == txn::MsgState::Tunnel),
+            Mode::Health => false,
         };
+        (ms != 0 && on).then_some(ms)
+    }
+
+    /// The chosen backend's `timeout tunnel` and `timeout queue` apply from here (`stream_set_backend`).
+    pub fn set_backend_timeouts(&mut self, be: &crate::engine::Proxy) {
+        let t = &be.stats_config.raw_timeouts;
+        let ms = |d: std::time::Duration| u32::try_from(d.as_millis()).unwrap_or(u32::MAX);
+        self.be_tunnel_ms = t.tunnel.map_or(0, ms);
+        self.be_queue_ms = t.queue.or(t.connect).map_or(0, ms);
+    }
+
+    /// `timeout queue` for this stream, in ms (0: none).
+    #[must_use]
+    pub fn queue_ms(&self) -> u32 {
+        let set = self.timeouts_set.as_ref().map_or(0, |s| s.ms[ibex_sample::TimeoutKind::Queue as usize]);
+        if set != 0 { set } else { self.be_queue_ms }
+    }
+
+    /// The stream became a tunnel (`101`, `CONNECT`): both timers restart on `timeout tunnel`.
+    pub fn enter_tunnel(&mut self, now: Tick) {
+        if self.tunnel_ms().is_some() {
+            self.arm_client(now);
+            self.arm_server(now);
+        }
     }
 
     /// Whether the request head is still being received: no transaction yet, and either
@@ -650,11 +766,8 @@ impl TcpSession {
     }
 
     fn arm_server(&mut self, now: Tick) {
-        self.srv_exp = if self.timeouts.server == 0 {
-            Tick::ETERNITY
-        } else {
-            now.add(self.timeouts.server)
-        };
+        let ms = self.tunnel_ms().unwrap_or(self.timeouts.server);
+        self.srv_exp = if ms == 0 { Tick::ETERNITY } else { now.add(ms) };
     }
 
     /// Attaches a server-side connection that is still connecting.
@@ -688,6 +801,10 @@ impl TcpSession {
             self.conn_exp = Tick::ETERNITY;
         }
         self.arm_server(now);
+        // A TCP stream is a tunnel from here: the client's timer, armed at accept, restarts.
+        if self.mode == Mode::Tcp && self.tunnel_ms().is_some() {
+            self.arm_client(now);
+        }
         self.log.connect = Some(std::time::Instant::now());
         // `AN_RES_INSPECT` runs from here, before any of the response has arrived.
         if let Some(delay) = self.res_inspect_armed.take() {
@@ -1986,6 +2103,9 @@ impl TcpSession {
     #[must_use]
     pub fn next_expiry(&self) -> Tick {
         let mut exp = self.cli_exp.earliest(self.req_exp).earliest(self.srv_exp).earliest(self.conn_exp).earliest(self.retry_after);
+        if let Some(q) = self.queue.as_ref() {
+            exp = exp.earliest(q.deadline);
+        }
         if let Some(i_exp) = self.inspect_exp {
             if !self.tcp_inspect_done || self.be_inspect {
                 exp = exp.earliest(i_exp);

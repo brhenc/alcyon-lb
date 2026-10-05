@@ -737,6 +737,9 @@ pub struct ProxyStats {
     pub cum_conn: AtomicU64,
     pub act_conn: AtomicU32,
     pub max_conn: AtomicU32,
+    /// Requests waiting for a server slot (`qcur`) and the most there were (`qmax`).
+    pub queue_cur: AtomicU32,
+    pub queue_max: AtomicU32,
     pub bytes_in: AtomicU64,
     pub bytes_out: AtomicU64,
     pub retries_count: AtomicU64,
@@ -761,12 +764,14 @@ impl ProxyStats {
     pub fn clear_max(&self) {
         let act = self.act_conn.load(Ordering::Relaxed);
         self.max_conn.store(act, Ordering::Relaxed);
+        self.queue_max.store(self.queue_cur.load(Ordering::Relaxed), Ordering::Relaxed);
     }
 
     pub fn clear(&self) {
         self.cum_conn.store(0, Ordering::Relaxed);
         let act = self.act_conn.load(Ordering::Relaxed);
         self.max_conn.store(act, Ordering::Relaxed);
+        self.queue_max.store(self.queue_cur.load(Ordering::Relaxed), Ordering::Relaxed);
         self.bytes_in.store(0, Ordering::Relaxed);
         self.bytes_out.store(0, Ordering::Relaxed);
         self.retries_count.store(0, Ordering::Relaxed);
@@ -1095,6 +1100,29 @@ impl Proxy {
 
         // 2. No active server: the first usable backup alone (`lbprm.fbck`).
         crate::lb::first_backup(self).into_iter().collect()
+    }
+
+    /// Whether no server can take a connection only because each one that is UP is at its
+    /// `maxconn`: the request is queued then, not refused.
+    #[must_use]
+    pub fn all_servers_full(&self) -> bool {
+        self.dispatch.is_none() && crate::lb::any_full(self) && self.eligible_server_indices().is_empty()
+    }
+
+    /// How many queued requests the servers can take now (`usize::MAX`: no limit).
+    #[must_use]
+    pub fn queue_headroom(&self) -> usize {
+        let mut free = 0usize;
+        for i in self.eligible_server_indices() {
+            match self.server_maxconn.get(i).copied().flatten() {
+                Some(mc) if mc > 0 => {
+                    let act = self.server_actconn.get(i).map_or(0, |a| a.load(Ordering::Relaxed));
+                    free += mc.saturating_sub(act) as usize;
+                }
+                _ => return usize::MAX,
+            }
+        }
+        free
     }
 
     /// Selects the target backend server using the configured load balancing algorithm,
@@ -1814,6 +1842,7 @@ fn session_log_data<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, pid: u3
         retries: i64::from(s.max_retries.saturating_sub(s.conn_retries)),
         redispatched: s.log.redispatched,
         uniq_id: l.uniq_id,
+        be_queue: l.be_queue,
         log_counter: fe.log_count.load(Ordering::Relaxed),
         pid,
         hostname: log_hostname(),
@@ -3326,8 +3355,35 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         }
     }
 
+    /// Wakes the requests waiting in a backend's queue for as many slots as it has free,
+    /// oldest first (`process_srv_queue`). A slot another thread frees is seen here too.
+    fn wake_queued(&mut self) {
+        if !crate::proxy::QueueWait::any() {
+            return;
+        }
+        // At most one wake per millisecond: a queued request that cannot take the slot the
+        // headroom count promised (a server the balancing passes over) must not spin the loop.
+        thread_local! {
+            static LAST_WAKE: std::cell::Cell<Option<Tick>> = const { std::cell::Cell::new(None) };
+        }
+        if LAST_WAKE.get() == Some(self.now) {
+            return;
+        }
+        let proxies = &self.proxies;
+        let due = crate::proxy::QueueWait::take_due(|be| proxies.get(be).map_or(0, Proxy::queue_headroom));
+        if !due.is_empty() {
+            LAST_WAKE.set(Some(self.now));
+        }
+        for t in due {
+            if self.scheduler.is_live(t) {
+                self.scheduler.tasklet_wakeup(t, Class::Urgent, state::WOKEN_IO);
+            }
+        }
+    }
+
     pub fn step(&mut self, now: Tick) -> io::Result<usize> {
         self.now = now;
+        self.wake_queued();
 
         // 1. Expire scheduler timers
         self.scheduler.set_now(now);
@@ -3341,10 +3397,13 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             Duration::from_millis(0)
         } else {
             let next_timer = self.scheduler.next_expiry();
+            // A slot freed by another thread wakes nothing here: while requests queue,
+            // look again soon.
+            let cap = if crate::proxy::QueueWait::any() { 2 } else { 100 };
             if let Some(remain_ms) = next_timer.remaining(now) {
-                Duration::from_millis(u64::from(remain_ms.min(100)))
+                Duration::from_millis(u64::from(remain_ms.min(cap)))
             } else {
-                Duration::from_millis(100)
+                Duration::from_millis(cap.into())
             }
         };
 
@@ -3492,6 +3551,8 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             }
         }
         self.timer_updates = dispatcher.timer_updates;
+        // Slots this pass freed go to the queue now, not on the next poll's timeout.
+        self.wake_queued();
         Ok(tasks_run)
     }
 
@@ -5379,6 +5440,7 @@ fn init_client_session(
             let proxy = &proxies[proxy_idx];
             maybe_prepend_send_proxy(proxy, proxy, proxies, &mut sess, target);
             arm_res_inspect(proxy, &mut sess);
+            sess.set_backend_timeouts(proxy);
 
             if let Ok((srv_fd, immediate)) = raw::connect(connect_addr(target, sess.server_addr)) {
                 let sfd = srv_fd.as_raw_fd();
@@ -6374,6 +6436,11 @@ impl EngineDispatcher<'_> {
         }
 
         let mut admin = None;
+        // A request in the queue goes on when a slot is free, or ends when its time is up.
+        if entry.sess.queue.is_some() {
+            let be_idx = entry.backend_idx;
+            admin = Self::route_to_server(entry, proxies, fdtab, poller, idle_pool, now, be_idx, None);
+        }
         if entry.sess.txn.as_ref().is_some_and(|t| !t.req_rules_done) && entry.sess.tcp_inspect_done {
             if let Some(t) = entry.sess.txn.as_mut() {
                 t.req_rules_done = true;
@@ -7167,6 +7234,7 @@ impl EngineDispatcher<'_> {
                 txn.rsp.measure_head(sess.rep.readable());
                 if framing == crate::txn::Framing::Tunnel && txn.req.is_done() {
                     txn.req = MsgState::Tunnel;
+                    sess.enter_tunnel(now);
                 }
             }
             // `option logasap`: the line goes out with the response head (`http_process_res_common`),
@@ -8458,8 +8526,9 @@ impl EngineDispatcher<'_> {
                                 TimeoutKind::Client => sess.timeouts.client = ms,
                                 TimeoutKind::Server => sess.timeouts.server = ms,
                                 TimeoutKind::Connect => sess.timeouts.connect = ms,
-                                // Ibex has no server queue nor tunnel timer: these change only
-                                // what the fetches report. The tarpit reads `timeouts_set`.
+                                // Queue and tunnel are read from `timeouts_set` when the request
+                                // is queued (`TcpSession::queue_ms`) and while it is a tunnel
+                                // (`TcpSession::tunnel_ms`); so is the tarpit.
                                 TimeoutKind::Queue | TimeoutKind::Tunnel | TimeoutKind::Tarpit => {}
                             }
                             if let Some(mut t) = CURRENT_TIMEOUTS.get() {
@@ -8616,6 +8685,7 @@ impl EngineDispatcher<'_> {
                 }
             }
         }
+        entry.sess.set_backend_timeouts(&proxies[be_idx]);
         stream_timeouts_enter(proxies, proxy_idx, be_idx, &entry.sess);
 
         // Evaluate backend tcp-request content rules
@@ -8758,7 +8828,6 @@ impl EngineDispatcher<'_> {
             set_req_header(&mut entry.sess, "Connection", "close");
         }
 
-        let source_ip = entry.sess.client_addr.map(|a| a.ip());
         // The backend's `cookie` line: the client's cookies are cut and may name the server.
         let cookie_server = manage_client_cookies(&mut entry.sess, &proxies[be_idx]);
         // `use-server` comes first: a server it picked (SF_ASSIGNED) is not overridden by
@@ -8767,6 +8836,25 @@ impl EngineDispatcher<'_> {
         // `stick match` after those (`SF_ASSIGNED`); the keys to store are queued either way.
         let assigned = cookie_server.is_some();
         let cookie_server = cookie_server.or(Self::sticking_rules(&mut entry.sess, be_idx, proxies, assigned));
+        Self::route_to_server(entry, proxies, fdtab, poller, idle_pool, now, be_idx, cookie_server)
+    }
+
+    /// Picks the server for the request and connects to it. When every server is at its
+    /// `maxconn` the request waits in the backend's queue (`pendconn_add`), and this runs
+    /// again each time a slot frees up (`Engine::wake_queued`) and when `timeout queue`
+    /// ends: `503`, `sQ`. `cookie_server` is the server persistence picked, if any.
+    #[allow(clippy::too_many_arguments)]
+    fn route_to_server(
+        entry: &mut SessionEntry,
+        proxies: &mut Proxies,
+        fdtab: &mut FdTab,
+        poller: &mut Poller,
+        idle_pool: &mut IdlePool,
+        now: Tick,
+        be_idx: usize,
+        cookie_server: Option<usize>,
+    ) -> Option<crate::stats_html::AdminAction> {
+        let source_ip = entry.sess.client_addr.map(|a| a.ip());
         let target = if let Some(idx) = cookie_server {
             Some(proxies[be_idx].servers[idx])
         } else {
@@ -8774,12 +8862,17 @@ impl EngineDispatcher<'_> {
         };
 
         let Some(target_addr) = target else {
+            if cookie_server.is_none() && proxies[be_idx].all_servers_full() {
+                return Self::wait_in_queue(entry, proxies, now, be_idx);
+            }
             proxies[be_idx].counters().failed_conn.fetch_add(1, Ordering::Relaxed);
             // No server to connect to: `SC`, whatever the stream's progress.
             entry.sess.log.term = Some(*b"SC");
             reply_error(entry, proxies, 503);
             return None;
         };
+        // Given a slot: out of the queue.
+        entry.sess.queue = None;
         count_server_session(proxies, be_idx, target_addr);
 
         // The connection kept from this session's last transaction, if this request goes
@@ -8935,6 +9028,27 @@ impl EngineDispatcher<'_> {
         None
     }
 
+    /// The request found every server full: it waits for a slot, or, once there, gives up
+    /// when `timeout queue` is over (`503`, `sQ`; `econ` counts it, as for a failed connect).
+    fn wait_in_queue(entry: &mut SessionEntry, proxies: &Proxies, now: Tick, be_idx: usize) -> Option<crate::stats_html::AdminAction> {
+        if let Some(q) = entry.sess.queue.as_ref() {
+            if q.deadline.is_expired(now) {
+                entry.sess.queue = None;
+                proxies[be_idx].counters().failed_conn.fetch_add(1, Ordering::Relaxed);
+                entry.sess.log.term = Some(*b"sQ");
+                entry.sess.log.queue.get_or_insert_with(Instant::now);
+                reply_error(entry, proxies, 503);
+            }
+            return None;
+        }
+        let ms = entry.sess.queue_ms();
+        let deadline = if ms == 0 { Tick::ETERNITY } else { now.add(ms) };
+        let q = crate::proxy::QueueWait::enter(entry.task, be_idx, proxies[be_idx].stats.clone(), deadline);
+        entry.sess.log.be_queue = u64::from(q.pos);
+        entry.sess.queue = Some(q);
+        None
+    }
+
     fn connect_tcp_backend(
         entry: &mut SessionEntry,
         proxies: &[Proxy],
@@ -8952,6 +9066,7 @@ impl EngineDispatcher<'_> {
         let resumed = entry.sess.be_inspect;
         entry.backend_idx = be_idx;
         entry.sess.retry_conn = proxies[be_idx].ids.retry_on & ibex_config::RE_CONN_FAILED != 0;
+        entry.sess.set_backend_timeouts(&proxies[be_idx]);
         stream_timeouts_enter(proxies, entry.proxy_idx, be_idx, &entry.sess);
         if !resumed {
             // `stream_set_backend` counts the stream for the backend (`proxy_inc_be_ctr`).

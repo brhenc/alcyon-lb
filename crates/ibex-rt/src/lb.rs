@@ -79,6 +79,19 @@ fn is_server_up(proxy: &Proxy, idx: usize) -> bool {
         .is_some_and(|status| status.load(Ordering::Relaxed) == ServerStatus::Up as u8)
 }
 
+/// Whether some server is UP, not avoided and taking balanced traffic, but at its `maxconn`.
+#[must_use]
+pub fn any_full(proxy: &Proxy) -> bool {
+    (0..proxy.servers.len()).any(|idx| {
+        is_server_up(proxy, idx)
+            && !avoided(proxy, idx)
+            && proxy.server_weights.get(idx).copied().unwrap_or(1) > 0
+            && proxy.server_maxconn.get(idx).copied().flatten().is_some_and(|mc| {
+                mc > 0 && proxy.server_actconn.get(idx).map_or(0, |a| a.load(Ordering::Relaxed)) >= mc
+            })
+    })
+}
+
 /// The backup that takes the traffic when no active server is usable: the first one in
 /// declaration order that is UP and under its `maxconn` (`lbprm.fbck`, set by
 /// `recount_servers`; Ibex refuses `option allbackups`, which would use them all).
