@@ -10574,7 +10574,9 @@ fn stats_write_reply(entry: &mut SessionEntry, proxies: &[Proxy], raw: &[u8]) {
             out.extend_from_slice(&raw[head_len..]);
             entry.sess.write_reply(&out);
         }
-        Err(()) => entry.sess.write_reply(raw),
+        // A rule that fails (strict mode, a rewrite that does not fit) makes the reply the 500
+        // page, as it does any other (`http_reply_and_close`).
+        Err(()) => reply_error(entry, proxies, 500),
     }
 }
 

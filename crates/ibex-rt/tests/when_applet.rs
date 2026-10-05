@@ -82,3 +82,36 @@ fn when_tells_forwarded_error_and_applet_streams_apart() {
         assert_eq!((g.0.as_str(), g.1.as_deref()), (w.0, Some(w.1)), "{got:?}");
     }
 }
+
+/// A failing `http-after-response` rule (strict mode, a header that does not fit) turns the
+/// stats page into the 500 page too (measured on `HAProxy`: `HTTP/1.1 500 Internal Server
+/// Error`; `IBEX_TEST_BIN=/path/to/haproxy cargo test --test when_applet` runs it there).
+#[test]
+fn a_failing_after_response_rule_turns_the_stats_page_into_a_500() {
+    let port = common::reserve_port();
+    let big = "a".repeat(900);
+    let cfg = format!(
+        "global\n  tune.bufsize 1024\n  tune.maxrewrite 256\n\
+         defaults\n  mode http\n  timeout client 3s\n  timeout server 3s\n  timeout connect 1s\n\
+         frontend fe\n  bind 127.0.0.1:{port}\n  stats enable\n  stats uri /stats\n  \
+         http-after-response strict-mode on\n  http-after-response set-header x-big \"{big}\"\n"
+    );
+    let path = std::env::temp_dir().join(format!("ibex_whenapplet_500_{}", std::process::id()));
+    std::fs::write(&path, cfg).expect("write config");
+    let mut child = Command::new(std::env::var("IBEX_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ibex").to_string()))
+        .arg("-f")
+        .arg(&path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn ibex");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(Instant::now() < deadline, "the daemon never listened on {port}");
+        thread::sleep(Duration::from_millis(25));
+    }
+    let h = head(port, "/stats");
+    common::stop(&mut child);
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(h.lines().next(), Some("HTTP/1.1 500 Internal Server Error"), "{h}");
+}

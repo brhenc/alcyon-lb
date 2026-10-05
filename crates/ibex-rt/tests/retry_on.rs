@@ -117,6 +117,10 @@ fn misbehaving(what: &'static str) -> u16 {
                 "junk" => {
                     let _ = c.write_all(b"garbage garbage\r\n\r\n");
                 }
+                // The head ends before it is whole: a response that is cut short.
+                "partial" => {
+                    let _ = c.write_all(b"HTTP/1.1 200 OK\r\nCont");
+                }
                 "stall" => thread::sleep(Duration::from_millis(1500)),
                 _ => {}
             }
@@ -131,7 +135,7 @@ fn misbehaving(what: &'static str) -> u16 {
 #[test]
 fn retry_on_empty_response_junk_response_and_response_timeout() {
     let good = server("200 OK", "").0;
-    let cases = [("empty-response", "close", "502"), ("junk-response", "junk", "502"), ("response-timeout", "stall", "504")];
+    let cases = [("empty-response", "close", "502"), ("junk-response", "junk", "502"), ("junk-response", "partial", "502"), ("response-timeout", "stall", "504")];
     for (keyword, what, plain) in cases {
         let bad = misbehaving(what);
         let port = common::reserve_port();
@@ -145,7 +149,7 @@ fn retry_on_empty_response_junk_response_and_response_timeout() {
             )
         };
         for (retry, want) in [(format!("  retry-on {keyword}\n"), ("200", "1", "1")), (String::new(), (plain, "0", "0"))] {
-            let path = std::env::temp_dir().join(format!("ibex_retryon_{}_{keyword}", std::process::id()));
+            let path = std::env::temp_dir().join(format!("ibex_retryon_{}_{keyword}_{what}", std::process::id()));
             std::fs::write(&path, build(&retry)).expect("write config");
             let mut child = Command::new(std::env::var("IBEX_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ibex").to_string()))
                 .arg("-f")
@@ -170,4 +174,43 @@ fn retry_on_empty_response_junk_response_and_response_timeout() {
             );
         }
     }
+}
+
+/// A retry on a status is not made when no retry is left (`retries 0`), nor when the request
+/// was not whole when it was first sent (a body still to come): the 503 is the answer.
+#[test]
+fn retry_on_a_status_needs_a_retry_left_and_a_request_that_was_kept() {
+    let (bad, bad_hits) = server("503 Service Unavailable", "");
+    let (bad2, _) = server("503 Service Unavailable", "");
+    let good = server("200 OK", "").0;
+    let port = common::reserve_port();
+    let cfg = format!(
+        "defaults\n  mode http\n  timeout connect 200ms\n  timeout client 5s\n  timeout server 5s\n\
+         frontend fe\n  bind 127.0.0.1:{port}\n  use_backend nor if {{ path /nor }}\n  default_backend body\n\
+         backend nor\n  balance first\n  retries 0\n  retry-on 503\n  option redispatch\n  server bad 127.0.0.1:{bad}\n  server good 127.0.0.1:{good}\n\
+         backend body\n  balance first\n  retries 1\n  retry-on 503\n  option redispatch\n  server bad 127.0.0.1:{bad2}\n  server good 127.0.0.1:{good}\n"
+    );
+    let path = std::env::temp_dir().join(format!("ibex_retryon_left_{}", std::process::id()));
+    std::fs::write(&path, cfg).expect("write config");
+    let mut child = Command::new(std::env::var("IBEX_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ibex").to_string())).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn ibex");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(Instant::now() < deadline, "the daemon never listened on {port}");
+        thread::sleep(Duration::from_millis(25));
+    }
+    let nor = head(port, "/nor");
+    // The head goes first, the body 300 ms later.
+    let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    s.set_read_timeout(Some(Duration::from_secs(8))).ok();
+    write!(s, "POST /body HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nConnection: close\r\n\r\n").expect("write");
+    thread::sleep(Duration::from_millis(300));
+    let _ = s.write_all(b"hello");
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out);
+    common::stop(&mut child);
+    let _ = std::fs::remove_file(&path);
+    let body = String::from_utf8_lossy(&out).lines().next().unwrap_or("").to_string();
+    assert_eq!(nor.lines().next(), Some("HTTP/1.1 503 Service Unavailable"), "no retry left: {nor}");
+    assert_eq!(bad_hits.load(Ordering::Relaxed), 1);
+    assert_eq!(body, "HTTP/1.1 503 Service Unavailable", "the request was not whole when it was sent");
 }

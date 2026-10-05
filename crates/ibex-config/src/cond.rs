@@ -252,9 +252,8 @@ impl<'a> Parser<'a> {
         if at >= self.s.len() {
             return Ok(None);
         }
-        let Some(left) = self.term(&mut at)? else {
-            return Err(self.unparsable("sub-expression", at));
-        };
+        // `term` finds nothing only past the end, which the check above has ruled out.
+        let Some(left) = self.term(&mut at)? else { return Err(self.unparsable("sub-expression", at)) };
         at = self.blanks(at);
         *text = at;
         if !self.s[at..].starts_with("&&") {

@@ -45,6 +45,9 @@ fn the_caret_points_at_the_first_bad_character() {
         ("1 ||", "unparsable conditional expression '1 ||' in '.if' at position 3:\n  .if 1 ||\n        ^"),
         ("1 2", "unexpected character '2' at the end of conditional expression '1 2' in '.if' at position 3:\n  .if 1 2\n        ^"),
         ("(1) x", "unexpected character 'x' at the end of conditional expression '(1) x' in '.if' at position 5:\n  .if (1) x\n          ^"),
+        ("1 && || 1", "unparsable conditional expression '|| 1' in '.if' at position 6:\n  .if 1 && || 1\n           ^"),
+        ("&& 1", "unparsable conditional expression '&& 1' in '.if' at position 1:\n  .if && 1\n      ^"),
+        ("( )", "unparsable conditional expression ')' in '.if' at position 3:\n  .if ( )\n        ^"),
         ("!", "unparsable conditional expression '!' in '.if' at position 1:\n  .if !\n      ^"),
     ];
     for (cond, want) in cases {

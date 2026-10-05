@@ -75,3 +75,10 @@ fn disable_l7_retry_takes_a_condition() {
     assert_eq!(rules.len(), 2);
     assert!(rules[0].cond.is_some() && rules[1].cond.is_none());
 }
+
+#[test]
+fn log_option_bits_are_zero_for_any_other_option() {
+    use ibex_config::ast::{log_opt_bit, LOG_OPT_ASAP};
+    assert_eq!(log_opt_bit("logasap"), LOG_OPT_ASAP);
+    assert_eq!(log_opt_bit("httplog"), 0);
+}

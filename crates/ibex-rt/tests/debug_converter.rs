@@ -146,3 +146,57 @@ fn debug_to_stdout_and_stderr_writes_the_line_there() {
     assert!(err.lines().any(|l| l == "[debug] tb: type=str <bye>"), "{err:?}");
     assert!(!out.contains("tb:") && !err.contains("tg:"), "each line goes to its own stream: {out:?} {err:?}");
 }
+
+/// What `debug()` prints for each sample type: `type=<name> <text>`, a binary sample as
+/// its bytes. Measured on `HAProxy` (`IBEX_TEST_BIN=/path/to/haproxy cargo test --test
+/// debug_converter` runs it there).
+#[test]
+fn debug_names_the_sample_type() {
+    let (port, port6) = (common::reserve_port(), common::reserve_port());
+    let out_path = std::env::temp_dir().join(format!("ibex_debugconv_types_out_{}", std::process::id()));
+    let cfg = format!(
+        "defaults\n  mode http\n  timeout connect 1s\n  timeout client 3s\n  timeout server 3s\n\
+         frontend fe\n  bind 127.0.0.1:{port}\n  bind [::1]:{port6}\n  \
+         http-request set-var(txn.a) src,debug(ip,stdout)\n  \
+         http-request set-var(txn.b) method,debug(me,stdout)\n  \
+         http-request set-var(txn.c) int(1),bool,debug(bo,stdout)\n  \
+         http-request set-var(txn.d) str(aGk=),b64dec,debug(bi,stdout)\n  \
+         http-request return status 200\n"
+    );
+    let path = std::env::temp_dir().join(format!("ibex_debugconv_types_{}", std::process::id()));
+    std::fs::write(&path, cfg).expect("write config");
+    let mut child = Command::new(std::env::var("IBEX_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ibex").to_string()))
+        .arg("-f")
+        .arg(&path)
+        .stdout(Stdio::from(std::fs::File::create(&out_path).expect("stdout file")))
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn ibex");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while TcpStream::connect(("127.0.0.1", port)).is_err() || TcpStream::connect(("::1", port6)).is_err() {
+        assert!(Instant::now() < deadline, "the daemon never listened");
+        thread::sleep(Duration::from_millis(25));
+    }
+    for mut s in [TcpStream::connect(("127.0.0.1", port)).expect("connect"), TcpStream::connect(("::1", port6)).expect("connect")] {
+        s.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        write!(s, "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").expect("write");
+        let mut resp = Vec::new();
+        let _ = s.read_to_end(&mut resp);
+    }
+    common::stop(&mut child);
+    let out = std::fs::read_to_string(&out_path).unwrap_or_default();
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&out_path);
+    let lines: Vec<&str> = out.lines().filter(|l| l.starts_with("[debug]")).collect();
+    let want = [
+        "[debug] ip: type=ipv4 <127.0.0.1>",
+        "[debug] me: type=meth <GET>",
+        "[debug] bo: type=bool <1>",
+        "[debug] bi: type=bin <hi>",
+        "[debug] ip: type=ipv6 <::1>",
+        "[debug] me: type=meth <GET>",
+        "[debug] bo: type=bool <1>",
+        "[debug] bi: type=bin <hi>",
+    ];
+    assert_eq!(lines, want, "{out:?}");
+}
