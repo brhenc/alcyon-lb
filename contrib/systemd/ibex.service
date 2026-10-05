@@ -12,7 +12,7 @@ Wants=network-online.target
 [Service]
 EnvironmentFile=-/etc/default/ibex
 EnvironmentFile=-/etc/sysconfig/ibex
-Environment="CONFIG=/etc/ibex/ibex.cfg" "PIDFILE=/run/ibex.pid"
+Environment="CONFIG=/etc/ibex/ibex.cfg" "PIDFILE=/run/ibex.pid" "EXTRAOPTS=-S /run/ibex-master.sock"
 # -Ws: reload on SIGUSR2, and report READY=1 / RELOADING=1 / MAINPID= / STOPPING=1 to systemd.
 ExecStart=/usr/local/sbin/ibex -Ws -f $CONFIG -p $PIDFILE $EXTRAOPTS
 # Refuse the reload when the new configuration does not parse, then ask for it.

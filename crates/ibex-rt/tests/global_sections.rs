@@ -88,12 +88,13 @@ fn config(dir: &Path, stats: &str) -> PathBuf {
 
 #[test]
 fn the_master_socket_is_admin_whatever_the_configuration_says() {
-    // `-S` (the master CLI) keeps admin; the configuration's own socket, with no `level`,
-    // is operator.
+    // `-S` (the master CLI, which needs `-W` as in HAProxy) is admin, and so is the worker
+    // CLI it forwards `@1` to; the configuration's own socket, with no `level`, is operator.
     let dir = std::env::temp_dir().join(format!("ibex_t146m_{}", std::process::id()));
     let (conf_sock, master) = (dir.join("c.sock"), dir.join("m.sock"));
     let cfg = config(&dir, &format!("  stats socket {}\n", conf_sock.display()));
     let mut child = Command::new(env!("CARGO_BIN_EXE_ibex"))
+        .arg("-W")
         .arg("-f")
         .arg(&cfg)
         .arg("-S")
@@ -103,7 +104,11 @@ fn the_master_socket_is_admin_whatever_the_configuration_says() {
         .spawn()
         .expect("spawn");
     wait_for_socket(&master);
-    assert!(!cli(&master, "disable server be/s").contains("Permission denied"));
+    wait_for_socket(&conf_sock);
+    assert_eq!(cli(&master, "show cli level"), "admin\n\n");
+    assert_eq!(cli(&master, "@1 show cli level"), "admin\n\n");
+    assert!(!cli(&master, "@1 disable server be/s").contains("Permission denied"));
+    assert_eq!(cli(&conf_sock, "show cli level"), "operator\n\n");
     common::stop(&mut child);
     let _ = std::fs::remove_dir_all(&dir);
 }
