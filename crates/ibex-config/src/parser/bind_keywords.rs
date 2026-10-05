@@ -10,7 +10,9 @@
 //! **refused**: a keyword the parser accepts and the data path drops is worse than one
 //! it never heard of (AGENTS.md section 5). `bind :443 ssl crt c.pem verify required
 //! ca-file ca.pem` would otherwise load and accept any client, and `tfo` would leave the
-//! operator believing Fast Open was on. `tfo` (server-side `TCP_FASTOPEN` queue) and
+//! operator believing Fast Open was on. `tfo` (the listener TCP_FASTOPEN queue) and
+//! `defer-accept` (TCP_DEFER_ACCEPT) stay refused in T209: no safe setter exists in rustix
+//! 0.38/1.1, nix 0.31 or socket2 0.6 (nix has only TCP_FASTOPEN_CONNECT, the client side). `tfo` (server-side `TCP_FASTOPEN` queue) and
 //! `defer-accept` (`TCP_DEFER_ACCEPT`) stay refused in T209: no safe setter exists in
 //! rustix 0.38/1.1, nix 0.31 or socket2 0.6 (only `TCP_FASTOPEN_CONNECT`, the client side).
 //!

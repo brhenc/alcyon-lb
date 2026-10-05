@@ -177,6 +177,27 @@ fn server_tfo_sets_fastopen_on_the_connecting_socket() {
     assert!(!log.contains("TCP_FASTOPEN_CONNECT"), "{log}");
 }
 
+/// HAProxy (`cc no_such_algo`): a warning per listener, and the listener still serves.
+#[test]
+fn a_refused_socket_option_warns_and_the_listener_still_serves() {
+    let a = common::reserve_addr();
+    let mut f = NamedTempFile::new().expect("tmp");
+    let cfg = format!("{DEFAULTS}frontend fe\n  bind {a} cc no_such_algo\n  default_backend be\nbackend be\n  server s 127.0.0.1:9\n");
+    f.write_all(cfg.as_bytes()).expect("cfg");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ibex"))
+        .arg("-f")
+        .arg(f.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    assert!(common::wait_listening(a), "the listener must serve despite the refused option");
+    common::stop(&mut child);
+    let mut err = String::new();
+    child.stderr.take().expect("stderr").read_to_string(&mut err).expect("read");
+    assert!(err.contains("cannot set the congestion control"), "{err}");
+}
+
 /// Runs `ibex -c` on `cfg`: the exit status and its output.
 fn check(cfg: &str) -> (bool, String) {
     let mut f = NamedTempFile::new().expect("tmp");

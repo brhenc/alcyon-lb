@@ -160,3 +160,16 @@ fn bind_socket_keywords_need_valid_arguments() {
         assert!(in_frontend(&format!("bind 127.0.0.1:8080 {b}")).is_err(), "{b}");
     }
 }
+
+#[test]
+fn bind_mss_takes_an_absolute_value_between_1_and_65535() {
+    for ok in ["1", "1200", "65535", "-1"] {
+        in_frontend(&format!("bind 127.0.0.1:8080 mss {ok}")).unwrap_or_else(|e| panic!("mss {ok}: {e}"));
+    }
+    for bad in ["0", "65536", "abc"] {
+        let err = in_frontend(&format!("bind 127.0.0.1:8080 mss {bad}")).expect_err(bad).to_string();
+        assert!(err.contains("'mss' : expects an MSS with and absolute value between 1 and 65535"), "{bad}: {err}");
+    }
+    let err = in_frontend("bind 127.0.0.1:8080 mss").expect_err("missing").to_string();
+    assert!(err.contains("'mss' : missing MSS value"), "{err}");
+}
