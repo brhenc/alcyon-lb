@@ -862,6 +862,15 @@ fn main() {
         }
     }
 
+    // 12c. Every worker's QUIC socket is bound here, before the first worker starts, so the
+    //      reuseport group a client's datagrams are hashed over is whole from its first
+    //      datagram on (T210). HAProxy binds all its listeners before creating its threads.
+    if let Err(err) = ibex_rt::engine::prebind_quic(&config, nbthread) {
+        eprintln!("[ALERT] {err}");
+        eprintln!("[ALERT] [haproxy.main()] Some protocols failed to start their listeners! Exiting.");
+        process::exit(1);
+    }
+
     // Each worker reports once it is listening. `-sf` and READY=1 wait for all of them.
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
     let mut threads = Vec::new();
