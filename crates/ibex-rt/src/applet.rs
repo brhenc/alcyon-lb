@@ -276,13 +276,7 @@ impl CliApplet {
 
         while self.out_offset < self.out_buf.len() {
             match stream.write(&self.out_buf[self.out_offset..]) {
-                Ok(0) => {
-                    self.is_done = true;
-                    self.out_buf.clear();
-                    self.out_offset = 0;
-                    break;
-                }
-                Ok(n) => {
+                Ok(n) if n > 0 => {
                     self.out_offset += n;
                     if self.out_offset >= self.out_buf.len() {
                         self.out_buf.clear();
@@ -293,8 +287,9 @@ impl CliApplet {
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                     break;
                 }
-                // The client is gone: what was left of the answer has nowhere to go.
-                Err(_) => {
+                // The client is gone (an error, or a socket that takes nothing): what was
+                // left of the answer has nowhere to go.
+                _ => {
                     self.is_done = true;
                     self.out_buf.clear();
                     self.out_offset = 0;

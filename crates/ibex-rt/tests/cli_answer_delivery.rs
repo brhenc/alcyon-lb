@@ -122,3 +122,36 @@ fn a_stats_timeout_that_is_not_a_positive_delay_is_refused() {
         assert!(err.contains(expected), "`stats timeout {arg}`: {err}");
     }
 }
+
+fn open_fds(pid: u32) -> usize {
+    std::fs::read_dir(format!("/proc/{pid}/fd")).map(Iterator::count).unwrap_or(0)
+}
+
+/// A client that asks for a long answer and leaves without reading it: the write fails, and
+/// the connection is freed then, not at `stats timeout` (10 s by default).
+#[test]
+fn a_client_that_leaves_during_a_long_answer_is_freed_at_once() {
+    let servers: String = (0..2000).map(|i| format!("  server s{i} 127.0.0.1:9 disabled\n")).collect();
+    let ibex = start("", &format!("  default_backend b\nbackend b\n{servers}"));
+    let pid = ibex.child.id();
+    // A first answer, read in full, so that what the CLI allocates once is in the baseline.
+    let mut c = UnixStream::connect(&ibex.sock).expect("connect cli");
+    c.write_all(b"show info\n").expect("send");
+    read_all(&mut c);
+    drop(c);
+    std::thread::sleep(Duration::from_millis(200));
+    let before = open_fds(pid);
+    for _ in 0..5 {
+        let mut c = UnixStream::connect(&ibex.sock).expect("connect cli");
+        c.write_all(b"show stat\n").expect("send");
+        // Long enough for the answer to fill the socket buffer, then gone unread.
+        std::thread::sleep(Duration::from_millis(100));
+        drop(c);
+    }
+    let t0 = Instant::now();
+    while open_fds(pid) > before && t0.elapsed() < Duration::from_secs(3) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let left = open_fds(pid);
+    assert!(left <= before, "{} CLI connections still open {:?} after their clients left", left - before, t0.elapsed());
+}

@@ -350,7 +350,12 @@ fn sni_expression_no_sni_auto_alpn_and_tcp_mode() {
     assert_eq!(get(fronts[1], "www.test1.com").0, 200);
     assert_eq!(get(fronts[2], "www.test1.com").0, 200);
     assert_eq!(get(fronts[3], "www.test1.com").0, 200, "mode tcp");
-    let seen = srv.handshakes();
+    // `start` probes each listener with a connect and close. On the `mode tcp` listener the
+    // probe is forwarded and may reach the server as a handshake with no request; HAProxy
+    // completes one for every probe (20 of 20 measured), Ibex usually not. Count the
+    // handshakes that carried a request.
+    let mut seen = srv.handshakes();
+    seen.retain(|s| s.requests > 0);
     assert_eq!(seen.len(), 4, "{seen:?}");
     assert_eq!(seen[0].sni.as_deref(), Some("explicit.example"), "`sni str(...)`");
     assert_eq!(seen[1].sni, None, "`no-sni-auto`");
