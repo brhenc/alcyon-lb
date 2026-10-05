@@ -31,6 +31,21 @@ Cases: keep-alive (one connection for two requests), 100 MB chunked upload (sha2
 download (sha256), SSE (events arrive one per second, first byte at once), WebSocket echo
 (text and 1 MB binary), 5 s slow response, backend 503 passthrough, backend-made gzip.
 
+## 06-browsers: Chrome / Firefox (headless) -> proxy (TLS, h2) -> node.js SPA
+
+Needs `node` 22 (built-in WebSocket/fetch), `openssl`, `/usr/bin/google-chrome`, `/usr/bin/firefox`; no npm
+packages (`app.js` hand-rolls the WebSocket echo). Ibex build:
+`CARGO_TARGET_DIR=/home/bhenc/ibex-targets/t212 CARGO_INCREMENTAL=0 cargo build --release --bin ibex`.
+
+    ./tools/practical/06-browsers/run.sh [--haproxy]     # BROWSERS=chrome to run one; KEEP=1 keeps /tmp/practical06-*
+
+`driver.js` drives Chrome over CDP and Firefox over WebDriver BiDi (temporary profiles, cert accepted by
+`--ignore-certificate-errors` / `acceptInsecureCerts`; the system trust store is untouched). Per browser, for
+the first load and for a reload: every request h2, all 11 assets 200, no console errors, no failed requests,
+API JSON, WebSocket text and 70 KB binary echo, SSE 5 events in order, `X-Forwarded-For`; plus
+`nextHopProtocol` and (Chrome only; Firefox: SKIP, not observable) reload reuses the connection.
+Ports 26001 (node), 26080 (proxy), 26010/26011 (browser debug). About 25 s.
+
 ## 05-node-cluster: 3 x node.js, roundrobin + health checks
 
 Needs `node`, `curl`, `socat` (no npm packages, no wrk: the load is `load.js`). Build Ibex with
