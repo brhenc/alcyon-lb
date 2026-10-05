@@ -3751,6 +3751,15 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
     /// # Errors
     /// Propagates polling errors.
     pub fn run_loop(&mut self) -> io::Result<()> {
+        // Whether the last step found nothing to run. HAProxy closes the idle front
+        // connections of a stopping process only when a thread has nothing left to do
+        // (`run_poll_loop`, `src/haproxy.c`, wakes `mux_stopping_data`). Under constant
+        // keep-alive load that moment rarely comes, so a client is answered with
+        // `Connection: close` instead of having its connection closed between two
+        // requests -- the race it can only survive by retrying. Closing them at once, on
+        // every turn of the loop, made 311 requests in 100 reloads hit a closed connection
+        // where HAProxy has 23 (T166, `tools/measure/reload_under_load.py`).
+        let mut quiet = true;
         while self.is_running {
             if !self.stopping
                 && self
@@ -3761,7 +3770,9 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 self.begin_soft_stop();
             }
             if self.stopping {
-                self.close_idle_http_sessions();
+                if quiet {
+                    self.close_idle_http_sessions();
+                }
                 if self.sessions.live() == 0 && !self.quic_listeners.iter().any(crate::quic_listener::QuicListener::is_busy) {
                     break;
                 }
@@ -3770,7 +3781,8 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 }
             }
             let now = self.current_tick();
-            let _ = self.step(now)?;
+            let ran = self.step(now)?;
+            quiet = ran == 0 && self.scheduler.run_queue_len() == 0;
         }
         Ok(())
     }
@@ -3828,6 +3840,12 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 if let Some(t) = e.sess.txn.as_mut() {
                     t.close_after = true;
                 }
+                // And so does every transaction it starts from here on: a request read
+                // after the stop is answered with `Connection: close`, as HAProxy switches
+                // a keep-alive stream to close mode once its frontend is stopping
+                // (`src/mux_h1.c`, `h1_set_cli_conn_mode`). Without it the client is told
+                // to reuse a connection the next loop closes under it (T166).
+                e.sess.close_client = true;
                 if let Some(ref mut h2_ctx) = e.sess.h2_ctx {
                     h2_ctx.send_graceful_goaway();
                     // Wake up the task so the mux can flush the frame.

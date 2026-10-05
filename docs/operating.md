@@ -86,8 +86,32 @@ listening socket over (`[NOTICE] took over 1 listening socket(s) from ...`), sys
 `MAINPID=` of the new PID, the old process exited 0 and the pidfile changed, with a request served
 by each. Connections already open finish on the old process. `hard-stop-after <t>` in `global`
 bounds how long the old one lingers (measured on a plain soft stop: a request in flight with `hard-stop-after 2s` was cut
-about 2 s after SIGUSR1). The "zero failed requests under constant load, repeated 100 times"
-criterion of the milestone has **not** been measured for this page.
+about 2 s after SIGUSR1).
+
+Under load (T166): `tools/measure/reload_under_load.py`, 8 keep-alive clients, 2 long
+downloads, one WebSocket, `hard-stop-after 4s`, SIGUSR2 every second, 100 reloads, nbthread 1,
+release build, same machine:
+
+| | HAProxy 3.5-dev8 | Ibex |
+|---|---|---|
+| failed requests / resets | 0 / 0 | 0 / 0 |
+| requests that met a closed keep-alive connection (client retried) | 23 | 0 |
+| responses with `Connection: close` from the old process | 777 | 800 |
+| long downloads cut | 0 | 0 |
+| WebSocket on the old process closed after its reload | 3.2-4.3 s (FIN) | 4.0-4.1 s (FIN or RST) |
+| old process gone after its reload, max / median | 4.35 s / 1.85 s | 4.15 s / 1.70 s |
+| reload time (SIGUSR2 to new process) max | 0.04 s | 0.05 s |
+| RSS master (HAProxy) / serving process (Ibex), reload 10 -> 100 | 20984 -> 20844 kB | 8184 -> 8148 kB |
+| all processes' RSS, peak during reloads | 377 MB | 33 MB |
+| fds, net of TCP connections, reload 10 -> 100 | 10 -> 12 (one per live worker) | 6 -> 6 |
+| SIGUSR1 with a download in flight | completes, exit | completes, exit |
+
+As in HAProxy, a stopping process answers every request it reads with `Connection: close` and
+closes idle connections only when it has nothing else to run, so a client under constant load is
+told to reconnect rather than having its connection closed between two requests. A client that is
+idle when the stop comes is closed; a request it sends at that instant can meet the close (the
+retried case above), as with HAProxy. `crates/ibex-rt/tests/reload_under_load.rs` runs 10 reloads
+in the gate and 100 with `--ignored`.
 
 The handover socket lives in a private (0700) directory under `$TMPDIR` (default `/tmp`), so
 no `expose-fd listeners` is needed. The new process is started from the same binary path (a
