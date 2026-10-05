@@ -17,6 +17,9 @@ use ibex_rt::engine::Engine;
 thread_local! {
     static IN_ALLOC: Cell<bool> = const { Cell::new(false) };
     static ARMED: Cell<bool> = const { Cell::new(false) };
+    // `ALLOCPROFILE_DEPTH`: how many ibex frames name a site (default 1).
+    static DEPTH: Cell<usize> = Cell::new(
+        std::env::var("ALLOCPROFILE_DEPTH").ok().and_then(|v| v.parse().ok()).unwrap_or(1));
     static SITES: RefCell<HashMap<String, (usize, usize)>> = RefCell::new(HashMap::new());
 }
 
@@ -30,16 +33,19 @@ unsafe impl GlobalAlloc for Attributing {
             let _ = IN_ALLOC.try_with(|b| b.set(true));
             let bt = format!("{}", std::backtrace::Backtrace::force_capture());
             let mut site = String::from("<no ibex frame>");
+            let depth = DEPTH.try_with(|d| d.get()).unwrap_or(1);
+            let mut found = Vec::new();
             for line in bt.lines() {
                 let l = line.trim();
                 if (l.contains("ibex_rt::") || l.contains("ibex_sample::")
                     || l.contains("ibex_config::") || l.contains("ibex_proto::"))
                     && !l.contains("Attributing")
                 {
-                    site = l.split_whitespace().skip(1).collect::<Vec<_>>().join(" ");
-                    break;
+                    found.push(l.split_whitespace().skip(1).collect::<Vec<_>>().join(" "));
+                    if found.len() == depth { break; }
                 }
             }
+            if !found.is_empty() { site = found.join(" <- "); }
             let _ = SITES.try_with(|s| {
                 let mut m = s.borrow_mut();
                 let e = m.entry(site).or_insert((0, 0));
@@ -96,7 +102,38 @@ fn drive(fe: SocketAddr, e: &mut Engine) {
     );
 }
 
+/// `ALLOCPROFILE_BACKENDS=N`: attribute the bytes `build_shared_state` allocates for N
+/// backends of one server each (T175), ranked by bytes. Frees are not subtracted, so a
+/// temporary shows up too; compare with `tests/backend_memory.rs`, which counts live bytes.
+fn startup(n: usize) {
+    let mut text = String::from(
+        "global\n    maxconn 1000\ndefaults\n    mode http\n    timeout connect 5s\n    timeout client 5s\n    timeout server 5s\n\
+         frontend fe\n    bind 127.0.0.1:0\n    default_backend b0\n",
+    );
+    for i in 0..n {
+        text.push_str(&format!("backend b{i}\n    server s{i} 127.0.0.1:{}\n", 20_000 + i % 1_000));
+    }
+    let cfg = ibex_config::parse_str(&text).unwrap();
+    ARMED.with(|a| a.set(true));
+    let p = Engine::build_shared_state(&cfg).unwrap();
+    ARMED.with(|a| a.set(false));
+    SITES.with(|s| {
+        let m = s.borrow();
+        let mut v: Vec<_> = m.iter().collect();
+        v.sort_by(|a, b| b.1.1.cmp(&a.1.1));
+        let tb: usize = m.values().map(|x| x.1).sum();
+        println!("\n===== {n} backends: {} bytes per backend, ranked by call site =====", tb / n);
+        for (site, (c, bytes)) in v.iter().take(40) {
+            println!("{:8}B/be {:6}/be  {site}", bytes / n, c / n);
+        }
+    });
+    drop(p);
+}
+
 fn main() {
+    if let Some(n) = std::env::var("ALLOCPROFILE_BACKENDS").ok().and_then(|v| v.parse().ok()) {
+        return startup(n);
+    }
     let (sl, sa) = loopback0();
     let (fl, fa) = loopback0(); drop(fl);
     let run = Arc::new(AtomicBool::new(true));

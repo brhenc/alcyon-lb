@@ -232,7 +232,7 @@ pub struct SampleContext<'a> {
     pub stream: Option<StreamFacts>,
     /// The proxy's ACLs, for `when(acl,<name>)`; `None` where the caller has none, and the
     /// condition then gives no sample.
-    pub acls: Option<&'a HashMap<String, crate::expr::Expr>>,
+    pub acls: Option<&'a crate::acls::Acls>,
     pub is_first_req: bool,
     pub vars: Option<&'a HashMap<String, String>>,
     pub timeouts: Option<&'a HashMap<String, u32>>,
