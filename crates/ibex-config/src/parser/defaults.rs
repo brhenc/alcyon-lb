@@ -239,6 +239,11 @@ pub(crate) fn parse_option_defaults(
 
 /// `no option <name>` in `defaults`.
 pub(crate) fn parse_no_defaults(defaults: &mut DefaultsSection, tokens: &[Token], kw: &Token) -> Result<(), ConfigError> {
+    if tokens.get(1).is_some_and(|t| t.text == "log") {
+        defaults.logs.clear();
+        defaults.log_global = false;
+        return Ok(());
+    }
     if tokens.get(1).is_none_or(|t| t.text != "option") {
         return parse_no_directive(tokens, kw);
     }

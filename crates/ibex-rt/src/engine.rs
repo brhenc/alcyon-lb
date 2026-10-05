@@ -2083,13 +2083,6 @@ fn resolve_log_targets(config: &Config, proxies: &mut [Proxy]) -> Vec<SyslogTarg
         .flat_map(|g| g.logs.iter())
         .map(|c| intern(c, &mut targets))
         .collect();
-    let defaults: Vec<usize> = config
-        .defaults
-        .iter()
-        .flat_map(|d| d.logs.iter())
-        .map(|c| intern(c, &mut targets))
-        .collect();
-    let defaults_log_global = config.defaults.as_ref().is_some_and(|d| d.log_global);
     let defaults_log_health = config
         .defaults
         .as_ref()
@@ -2118,14 +2111,8 @@ fn resolve_log_targets(config: &Config, proxies: &mut [Proxy]) -> Vec<SyslogTarg
         if *log_global {
             resolved.extend_from_slice(&global);
         }
-        // `defaults` applies only where the section declared nothing of its own, which
-        // is how every other defaults-inherited setting behaves.
-        if resolved.is_empty() && defaults_log_global {
-            resolved.extend_from_slice(&global);
-        }
-        if resolved.is_empty() {
-            resolved.extend_from_slice(&defaults);
-        }
+        // The parser copied `defaults`' `log` lines into the section (and `no log` cleared
+        // them), so nothing is inherited here.
         resolved.sort_unstable();
         resolved.dedup();
         // Kept when already there, so the cursors stay the ones every user shares.
@@ -3860,6 +3847,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     break;
                 }
                 if self.stop_deadline.is_some_and(|d| Instant::now() >= d) {
+                    self.linger_close_sessions();
                     break;
                 }
             }
@@ -3945,6 +3933,52 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
     /// connection; clients retry that case, and HAProxy has the same window. An idle
     /// HTTP/2 connection is told first, with a graceful GOAWAY, and closed once that has
     /// been written (`src/mux_h2.c:5501`).
+    /// The end of `hard-stop-after`: every connection still open gets a FIN, then what its
+    /// peer is still sending is read and discarded until the peer closes or 200 ms pass.
+    /// Leaving with bytes unread in a socket makes the kernel answer the close with a RST,
+    /// which a client that kept sending through a WebSocket saw as a reset, not an EOF.
+    fn linger_close_sessions(&mut self) {
+        use std::os::fd::AsFd;
+        for (_, e) in self.sessions.iter_mut() {
+            raw::shutdown_write(e.sess.cli.as_fd());
+            if let Some(srv) = e.sess.srv.as_ref() {
+                raw::shutdown_write(srv.as_fd());
+            }
+        }
+        let end = Instant::now() + Duration::from_millis(200);
+        let mut buf = [0u8; 16384];
+        let mut done: std::collections::HashSet<std::os::fd::RawFd> = std::collections::HashSet::new();
+        loop {
+            let mut pending = 0usize;
+            for (_, e) in self.sessions.iter_mut() {
+                for fd in std::iter::once(e.sess.cli.as_fd()).chain(e.sess.srv.as_ref().map(|s| s.as_fd())) {
+                    if done.contains(&std::os::fd::AsRawFd::as_raw_fd(&fd)) {
+                        continue;
+                    }
+                    // Whatever is queued is read away; EOF or an error ends this one.
+                    let mut rounds = 0;
+                    loop {
+                        match raw::recv(fd, &mut buf) {
+                            Ok(raw::Io::Done(_)) if rounds < 64 => rounds += 1,
+                            Ok(raw::Io::WouldBlock | raw::Io::Done(_)) => {
+                                pending += 1;
+                                break;
+                            }
+                            _ => {
+                                done.insert(std::os::fd::AsRawFd::as_raw_fd(&fd));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if pending == 0 || Instant::now() >= end {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
     fn close_idle_http_sessions(&mut self) {
         use ibex_proto::h2::H2StreamState;
         use ibex_proto::mux::Mux;
@@ -8161,19 +8195,17 @@ impl EngineDispatcher<'_> {
                         }
                     }
                     ibex_config::HttpReqAction::ReplacePath { regex, repl } => {
-                        let result = {
+                        // The whole path is replaced by the format when the regex matches it;
+                        // a target with no path (`*`, `http://h?q=1`) is left alone.
+                        let rebuilt = {
                             let current_uri = sess.req_uri.as_deref().unwrap_or("/");
-                            let (pfx, path, query) = split_uri(current_uri);
-                            let rust_repl = translate_backreferences(repl);
-                            if let Ok(re) = ibex_regex::UserRegex::new(regex) {
-                                let new_path = re.replace_all(path, &rust_repl).to_string();
-                                let rebuilt = rebuild_uri(pfx, &new_path, query);
-                                Some((new_path, rebuilt))
-                            } else {
-                                None
-                            }
+                            target_parts(current_uri)
+                                .filter(|(_, path, _)| !path.is_empty())
+                                .and_then(|(pfx, path, query)| {
+                                    replace_whole(regex, repl, path).map(|np| rebuild_uri(pfx, &np, query))
+                                })
                         };
-                        if let Some((new_path, rebuilt)) = result {
+                        if let Some(rebuilt) = rebuilt {
                             if !req_set_uri(sess, rebuilt) && STRICT_MODE.get() {
                                 return Err(500);
                             }
@@ -8191,34 +8223,26 @@ impl EngineDispatcher<'_> {
                         }
                     }
                     ibex_config::HttpReqAction::ReplacePathq { regex, repl } => {
-                        let result = {
+                        // Path and query as one; replaced whole by the format on a match.
+                        let rebuilt = {
                             let current_uri = sess.req_uri.as_deref().unwrap_or("/");
-                            let (pfx, path, query) = split_uri(current_uri);
-                            let pathq = if query.is_empty() { path.to_string() } else { format!("{path}?{query}") };
-                            let rust_repl = translate_backreferences(repl);
-                            if let Ok(re) = ibex_regex::UserRegex::new(regex) {
-                                let new_pathq = re.replace_all(&pathq, &rust_repl).to_string();
-                                let rebuilt = format!("{pfx}{new_pathq}");
-                                Some(rebuilt)
-                            } else {
-                                None
-                            }
+                            target_parts(current_uri).and_then(|(pfx, path, query)| {
+                                let pathq = if query.is_empty() { path.to_string() } else { format!("{path}?{query}") };
+                                replace_whole(regex, repl, &pathq).map(|n| format!("{pfx}{n}"))
+                            })
                         };
-                        if let Some(rebuilt) = result {
+                        if let Some(rebuilt) = rebuilt {
                             if !req_set_uri(sess, rebuilt) && STRICT_MODE.get() {
                                 return Err(500);
                             }
                         }
                     }
                     ibex_config::HttpReqAction::ReplaceUri { regex, repl } => {
-                        // The whole target, scheme and authority included; the first match only.
+                        // The whole target, scheme and authority included, replaced by the
+                        // format on a match.
                         let rebuilt = {
                             let current_uri = sess.req_uri.as_deref().unwrap_or("/");
-                            let rust_repl = translate_backreferences(repl);
-                            ibex_regex::UserRegex::new(regex)
-                                .ok()
-                                .filter(|re| re.is_match(current_uri))
-                                .map(|re| re.replace(current_uri, &rust_repl).to_string())
+                            replace_whole(regex, repl, current_uri)
                         };
                         if let Some(rebuilt) = rebuilt {
                             if !req_set_uri(sess, rebuilt) && STRICT_MODE.get() {
@@ -9297,6 +9321,37 @@ fn split_uri(uri: &str) -> (&str, &str, &str) {
     };
 
     (prefix, path, query)
+}
+
+/// A request target as (scheme and authority, path, query), for the rules that rewrite the
+/// path. `None` for `*` (`OPTIONS *` has no path). The path is empty for `http://h?q=1`
+/// and is `/` for `http://h`, as `HAProxy` normalizes it.
+fn target_parts(uri: &str) -> Option<(&str, &str, &str)> {
+    if uri == "*" {
+        return None;
+    }
+    let after_scheme = uri.find("://").map(|i| i + 3);
+    let (pfx, rest) = match after_scheme {
+        Some(i) => {
+            let end = uri[i..].find(['/', '?']).map_or(uri.len(), |e| i + e);
+            (&uri[..end], &uri[end..])
+        }
+        None => ("", uri),
+    };
+    let rest = if after_scheme.is_some() && rest.is_empty() { "/" } else { rest };
+    let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
+    Some((pfx, path, query))
+}
+
+/// `replace-path`, `replace-pathq` and `replace-uri`: when `regex` matches `text` anywhere,
+/// the result is `repl` with its `\N` expanded from that first match, replacing the whole
+/// of `text`. `None` when it does not match.
+fn replace_whole(regex: &str, repl: &str, text: &str) -> Option<String> {
+    let re = ibex_regex::UserRegex::new(regex).ok()?;
+    let caps = re.captures(text)?;
+    let mut out = String::new();
+    caps.expand(&translate_backreferences(repl), &mut out);
+    Some(out)
 }
 
 fn rebuild_uri(prefix: &str, path: &str, query: &str) -> String {
