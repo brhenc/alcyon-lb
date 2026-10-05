@@ -522,20 +522,43 @@ pub fn connection_is_plain(value: &str) -> bool {
     value.split(',').map(str::trim).all(|t| t.is_empty() || t.eq_ignore_ascii_case("keep-alive") || t.eq_ignore_ascii_case("close"))
 }
 
-/// What the `Connection` headers of a head are, without copying it: whether there is one,
-/// and whether every one of them is plain ([`connection_is_plain`]).
+/// The `Connection` headers of a head, found without copying it.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ConnScan {
+    /// How many there are.
+    pub count: usize,
+    /// Every one of them is plain ([`connection_is_plain`]).
+    pub plain: bool,
+    /// Where the first one is: from the start of its line to the start of the next.
+    pub first: (usize, usize),
+}
+
+/// Looks for the `Connection` headers of a head (one pass over the bytes, no allocation).
 #[must_use]
-pub fn head_connection(head: &[u8]) -> (bool, bool) {
-    let (mut any, mut plain) = (false, true);
-    for l in head.split(|&b| b == b'\n').skip(1) {
-        let name = b"connection";
-        if l.len() > name.len() && l[..name.len()].eq_ignore_ascii_case(name) && l[name.len()..].trim_ascii_start().first() == Some(&b':') {
-            any = true;
-            let value = &l[name.len()..].trim_ascii_start()[1..];
-            plain &= std::str::from_utf8(value).is_ok_and(connection_is_plain);
+pub fn scan_connection(head: &[u8]) -> ConnScan {
+    const NAME: &[u8] = b"connection";
+    let mut out = ConnScan { plain: true, ..ConnScan::default() };
+    let Some(first_eol) = head.iter().position(|&b| b == b'\n') else { return out };
+    let mut at = first_eol + 1;
+    while at < head.len() {
+        let end = head[at..].iter().position(|&b| b == b'\n').map_or(head.len(), |n| at + n + 1);
+        let line = &head[at..end];
+        if line.len() > NAME.len() && (line[0] | 0x20) == b'c' && line[..NAME.len()].eq_ignore_ascii_case(NAME) {
+            let rest = line[NAME.len()..].trim_ascii_start();
+            if rest.first() == Some(&b':') {
+                if out.count == 0 {
+                    out.first = (at, end);
+                }
+                out.count += 1;
+                out.plain &= std::str::from_utf8(&rest[1..]).is_ok_and(connection_is_plain);
+            }
         }
+        if matches!(line[0], b'\r' | b'\n') {
+            break; // the blank line that ends the head
+        }
+        at = end;
     }
-    (any, plain)
+    out
 }
 
 /// [`rewrite_response_connection`] on a list of headers.
@@ -1144,9 +1167,18 @@ mod tests {
     fn a_connection_header_of_keep_alive_and_close_only_is_plain() {
         assert!(connection_is_plain(" Keep-Alive , close"));
         assert!(!connection_is_plain("keep-alive, upgrade"));
-        assert_eq!(head_connection(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"), (false, true));
-        assert_eq!(head_connection(b"HTTP/1.1 200 OK\r\nconnection : close\r\n\r\n"), (true, true));
-        assert_eq!(head_connection(b"HTTP/1.1 200 OK\r\nConnection: close\r\nConnection: te\r\n\r\n"), (true, false));
+        let none = scan_connection(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert_eq!((none.count, none.plain), (0, true));
+        let one = b"HTTP/1.1 200 OK\r\nA: b\r\nconnection : close\r\nC: d\r\n\r\n";
+        let s = scan_connection(one);
+        assert_eq!((s.count, s.plain), (1, true));
+        assert_eq!(&one[s.first.0..s.first.1], b"connection : close\r\n");
+        let two = scan_connection(b"HTTP/1.1 200 OK\r\nConnection: close\r\nConnection: te\r\n\r\n");
+        assert_eq!((two.count, two.plain), (2, false));
+        // Another header that starts with the name is not one.
+        assert_eq!(scan_connection(b"HTTP/1.1 200 OK\r\nConnection-Id: close\r\n\r\n").count, 0);
+        // A body that looks like a header is not one.
+        assert_eq!(scan_connection(b"HTTP/1.1 200 OK\r\n\r\nConnection: close\r\n").count, 0);
     }
 
     #[test]

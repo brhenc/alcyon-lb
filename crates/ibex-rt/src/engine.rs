@@ -2117,8 +2117,17 @@ fn resolve_log_targets(config: &Config, proxies: &mut [Proxy]) -> Vec<SyslogTarg
         own.push((b.name.clone(), idx, b.log_global));
     }
 
+    // First section of a name wins, as the linear `find` this replaces did: sorting by
+    // (name, position) puts it first among equals.
+    let mut by_name: Vec<(&str, usize)> = own.iter().enumerate().map(|(i, (n, _, _))| (n.as_str(), i)).collect();
+    by_name.sort_unstable();
     for proxy in proxies.iter_mut() {
-        let Some((_, idx, log_global)) = own.iter().find(|(n, _, _)| *n == proxy.name) else {
+        let at = by_name.partition_point(|&(n, _)| n < proxy.name.as_str());
+        let Some((_, idx, log_global)) = by_name
+            .get(at)
+            .filter(|&&(n, _)| n == proxy.name.as_str())
+            .map(|&(_, i)| &own[i])
+        else {
             continue;
         };
         let mut resolved = idx.clone();
@@ -7339,13 +7348,13 @@ impl EngineDispatcher<'_> {
             // `keep-alive` and `close` out of the server's `Connection`, the one this
             // connection's state calls for in (`h1_update_res_conn_value`).
             let (h, e) = crate::find_eoh(entry.sess.rep.readable()).unwrap_or_default();
-            let (any, plain) = crate::txn::head_connection(&entry.sess.rep.readable()[..h + e]);
+            let scan = crate::txn::scan_connection(&entry.sess.rep.readable()[..h + e]);
             let token = if tunnel { None } else { crate::txn::response_connection_token(client_close, srv_http11, req_http11, false) };
-            if !any || plain {
+            if scan.count == 0 || (scan.count == 1 && scan.plain) {
                 // The usual response: no `Connection`, or one that is all `keep-alive` and
                 // `close`; the head is edited where it is, with no copy.
-                if any {
-                    entry.sess.rep.remove_http_header("connection");
+                if scan.count == 1 {
+                    entry.sess.rep.cut(scan.first.0, scan.first.1);
                 }
                 if let Some(tok) = token {
                     inject_connection_token_zero_alloc(&mut entry.sess.rep, tok);
@@ -9941,23 +9950,19 @@ fn client_close(proxies: &[Proxy], fe_idx: usize) -> bool {
 /// `keep-alive` for an HTTP/1.0 request that keeps it; [`crate::txn::request_connection_token`]).
 fn rewrite_request_connection(sess: &mut TcpSession, close: bool) {
     let http11 = sess.txn.as_ref().is_none_or(|t| t.req_http11);
-    // One look at the headers, no copy: how many `Connection` there are, whether all of them are
-    // plain (nothing but `keep-alive` and `close`), and whether there is an `Upgrade`.
-    let (mut count, mut plain, mut has_upgrade) = (0usize, true, false);
-    let mut scan = |k: &str, v: &str| {
-        if k.eq_ignore_ascii_case("connection") {
-            count += 1;
-            plain &= crate::txn::connection_is_plain(v);
-        } else if k.eq_ignore_ascii_case("upgrade") {
-            has_upgrade = true;
-        }
-    };
-    // A request that reaches a server was parsed into HTX (H1 and H2 alike).
-    sess.htx_slice().into_iter().flat_map(ibex_proto::htx::HtxSliceRef::headers).for_each(|(k, v)| scan(k, v));
-    if count == 0 || plain {
-        // The usual request: no `Connection`, or one that goes whole.
-        if count > 0 {
-            remove_req_header_in_place(sess, "connection");
+    // One look at the head, no copy. The usual request has no `Connection`, or one that is
+    // all `keep-alive` and `close` and goes whole, cut out of the head where it is.
+    let scan = crate::find_eoh(sess.req.readable()).map(|(h, e)| crate::txn::scan_connection(&sess.req.readable()[..h + e]));
+    let scan = scan.unwrap_or_default();
+    if scan.count == 0 || (scan.count == 1 && scan.plain) {
+        if scan.count == 1 {
+            sess.with_htx_mut(|htx| {
+                let _ = htx.remove_header("connection");
+            });
+            if let Some(hdrs) = sess.req_headers.as_mut() {
+                hdrs.retain(|(k, _)| !k.eq_ignore_ascii_case("connection"));
+            }
+            sess.req.cut(scan.first.0, scan.first.1);
         }
         if let Some(tok) = crate::txn::request_connection_token(close, http11, false) {
             add_req_header(sess, "Connection", tok);
@@ -9966,6 +9971,7 @@ fn rewrite_request_connection(sess: &mut TcpSession, close: bool) {
     }
     let hdrs: Vec<(String, String)> =
         sess.htx_slice().map_or_else(Vec::new, |h| h.headers().map(|(k, v)| (k.to_string(), v.to_string())).collect());
+    let has_upgrade = hdrs.iter().any(|(k, _)| k.eq_ignore_ascii_case("upgrade"));
     let mut tokens = crate::txn::ConnTokens::default();
     let old: Vec<&str> = hdrs.iter().filter(|(k, _)| k.eq_ignore_ascii_case("connection")).map(|(_, v)| v.trim()).collect();
     let new: Vec<String> = old.iter().filter_map(|v| crate::txn::clean_connection_value(v, !has_upgrade, &mut tokens)).collect();
@@ -9983,18 +9989,6 @@ fn rewrite_request_connection(sess: &mut TcpSession, close: bool) {
     if let Some(tok) = crate::txn::request_connection_token(close, http11, tokens.upgrade) {
         add_req_header(sess, "Connection", tok);
     }
-}
-
-/// Removes the header from the request, in the HTX and in the list of headers, and writes the
-/// head again; the few allocations of [`del_req_header`] are not needed for one plain name.
-fn remove_req_header_in_place(sess: &mut TcpSession, name: &str) {
-    sess.with_htx_mut(|htx| {
-        let _ = htx.remove_header(name);
-    });
-    if let Some(hdrs) = sess.req_headers.as_mut() {
-        hdrs.retain(|(k, _)| !k.eq_ignore_ascii_case(name));
-    }
-    rebuild_req_buffer(sess);
 }
 
 fn set_req_header(sess: &mut TcpSession, name: &str, val: &str) {
