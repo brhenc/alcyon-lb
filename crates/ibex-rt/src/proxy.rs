@@ -2723,6 +2723,20 @@ mod tests {
         assert_eq!(held(&msg), 0);
     }
 
+    /// An HTX grown past its class for a large request head is replaced, once the
+    /// transaction is over, by an unallocated pooled one (T183): it does not stay at its
+    /// size for the connection's idle time.
+    #[test]
+    fn a_grown_htx_is_released_with_the_transaction() {
+        let (a, _b) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let mut s = super::TcpSession::new(std::os::fd::OwnedFd::from(a), Default::default(), 0, ibex_sched::Tick::ETERNITY);
+        s.htx_reserve(20_000);
+        assert_eq!(s.htx_buf.class(), crate::buf::BufClass::Custom);
+        s.release_idle_buffers();
+        assert_eq!(s.htx_buf.class(), crate::buf::BufClass::Standard);
+        assert!(s.htx_buf.raw_slice().is_empty(), "the replacement holds no memory");
+    }
+
     /// The last chunk is not split: with less than its five bytes of room, nothing is
     /// written and the body is not done.
     #[test]
