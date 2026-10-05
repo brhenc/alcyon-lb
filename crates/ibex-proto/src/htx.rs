@@ -1639,7 +1639,7 @@ impl<'a> HtxSlice<'a> {
     }
 
     pub fn replace_header(&mut self, name: &str, regex: &str, repl: &str) -> Result<usize, HtxError> {
-        let re = ibex_regex::UserRegex::new(regex).map_err(|_| HtxError::InvalidData)?;
+        let re = ibex_regex::UserRegex::cached(regex).map_err(|_| HtxError::InvalidData)?;
         let mut count = 0;
 
         for i in 0..self.num_blocks {

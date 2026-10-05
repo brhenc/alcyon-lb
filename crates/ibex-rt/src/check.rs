@@ -543,7 +543,7 @@ fn run_var_rules(
     for rule in rules {
         if let ResolvedHttpRule::SetVar { var_name, expr } = rule {
             let val = with_check_ctx(check, px, proxies, vars, resp, |_, ctx| {
-                ibex_sample::Expr::parse(expr)
+                ibex_sample::Expr::cached(expr)
                     .ok()
                     .and_then(|e| e.eval_sample(reg, ctx))
                     .map(|smp| crate::engine::sample_to_string(&smp))

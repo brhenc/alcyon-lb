@@ -27,13 +27,81 @@ fn is_idchar(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+' | ':')
 }
 
+thread_local! {
+    static PARSES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times [`Expr::parse`] has run on this thread: a test reads it around a request
+/// to show that the data path parses nothing once the configuration is compiled.
+#[must_use]
+pub fn parses_on_this_thread() -> u64 {
+    PARSES.with(std::cell::Cell::get)
+}
+
+/// Bumped by [`new_generation`]: the expressions a thread has cached belong to the
+/// configuration that was current when it parsed them.
+static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many different texts one thread keeps compiled. Every text cached is configuration
+/// text, so a real configuration stays far below it; the bound only keeps a caller that
+/// passed other text from growing the cache.
+const CACHE_MAX: usize = 16_384;
+
+type ExprCache = std::collections::HashMap<Box<str>, Result<std::rc::Rc<Expr>, String>>;
+
+thread_local! {
+    static CACHE: std::cell::RefCell<(u64, ExprCache)> = std::cell::RefCell::new((0, ExprCache::new()));
+}
+
+/// A new configuration is being built: every thread forgets the expressions it compiled
+/// for the previous one (a `-f` file read again, a map reloaded) on its next lookup.
+pub fn new_generation() {
+    GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 impl Expr {
+    /// [`Expr::parse`], once per text and thread: the expression compiled the first time
+    /// `input` is evaluated, as `HAProxy` compiles it once when the configuration loads
+    /// (`sample_parse_expr`). The data path calls this with configuration text (a rule's
+    /// expression, an anonymous ACL, a `%[...]`), so after the first request nothing is
+    /// parsed, and an ACL's `-f` file is not looked at again.
+    ///
+    /// A `-f` pattern list still follows `add acl` / `del acl` and the like: the compiled
+    /// matcher holds the shared reference and recompiles when its version changes
+    /// ([`crate::patref::FileMatcher`]).
+    ///
+    /// # Errors
+    /// As [`Expr::parse`], the error remembered as well.
+    pub fn cached(input: &str) -> Result<std::rc::Rc<Self>, String> {
+        let generation = GENERATION.load(std::sync::atomic::Ordering::Relaxed);
+        let hit = CACHE.with(|c| {
+            let mut c = c.borrow_mut();
+            if c.0 != generation {
+                c.1.clear();
+                c.0 = generation;
+            }
+            c.1.get(input).cloned()
+        });
+        if let Some(hit) = hit {
+            return hit;
+        }
+        let parsed = Self::parse(input).map(std::rc::Rc::new);
+        CACHE.with(|c| {
+            let mut c = c.borrow_mut();
+            if c.0 == generation && c.1.len() < CACHE_MAX {
+                c.1.insert(input.into(), parsed.clone());
+            }
+        });
+        parsed
+    }
+
     /// Parses an expression string into an [`Expr`].
     ///
     /// # Errors
     /// Returns an error if the expression syntax or matcher compilation fails.
     #[allow(clippy::too_many_lines)]
     pub fn parse(input: &str) -> Result<Self, String> {
+        PARSES.with(|n| n.set(n.get() + 1));
         let mut input = input.trim();
         if input.starts_with('{') && input.ends_with('}') {
             input = input[1..input.len() - 1].trim();

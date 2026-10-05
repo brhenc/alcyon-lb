@@ -2794,7 +2794,7 @@ fn forwarded_element(fwd: &ibex_config::Forwarded, sess: &TcpSession, ctx: &Samp
     use ibex_config::ForwardedValue::{Default as Plain, Expr as Expression, Off};
     use ibex_sample::rfc7239::{node_from_sample, port_from_sample, valid_host};
     let registry = sample_registry();
-    let eval = |e: &str| Expr::parse(e).ok().and_then(|e| e.eval_sample(registry, ctx));
+    let eval = |e: &str| Expr::cached(e).ok().and_then(|e| e.eval_sample(registry, ctx));
     let mut parts: Vec<String> = Vec::new();
     if fwd.proto {
         parts.push(format!("proto={}", if sess.cli_xprt.is_tls() { "https" } else { "http" }));
@@ -2888,7 +2888,7 @@ fn init_global_vars(global: Option<&ibex_config::GlobalSection>) {
         for set_var in &global.set_vars {
             let val = if set_var.is_fmt {
                 format_sample_string(&set_var.expr, &sample_ctx, sample_reg)
-            } else if let Ok(e) = Expr::parse(&set_var.expr) {
+            } else if let Ok(e) = Expr::cached(&set_var.expr) {
                 e.eval_sample(sample_reg, &sample_ctx)
                     .map_or_else(|| set_var.expr.clone(), |smp| sample_to_string(&smp))
             } else {
@@ -2908,6 +2908,8 @@ impl Engine {
     /// ([`crate::rule_exprs::validate_rule_exprs`]).
     #[allow(clippy::too_many_lines)]
     pub fn build_shared_state(config: &Config) -> io::Result<Proxies> {
+    // Expressions and ACL files compiled for a previous configuration are not reused.
+    ibex_sample::expr::new_generation();
     {
         // The clock of `lastchg` and `lastsess` (`show stat`) starts with the proxies.
         let _ = crate::statcnt::now_ms();
@@ -4054,7 +4056,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
 /// `htons(smp->data.u.sint)` does (`tcp_action_req_set_src_port`, src/tcp_act.c). `None`
 /// when the sample cannot be fetched: the rule then changes nothing.
 fn eval_port_expr(expr: &str, registry: &Registry, ctx: &SampleContext<'_>) -> Option<u16> {
-    let smp = Expr::parse(expr).ok()?.eval_sample(registry, ctx)?;
+    let smp = Expr::cached(expr).ok()?.eval_sample(registry, ctx)?;
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let port = |n: i64| n as u16;
     ibex_sample::cast::cast(smp, ibex_sample::SampleType::Sint).and_then(|s| if let ibex_sample::Sample::Sint(n) = s { Some(port(n)) } else { None })
@@ -4178,7 +4180,7 @@ fn eval_tcp_req_conn_rules(
                 }
             }
             ibex_config::TcpReqConnAction::SetSrc { expr } => {
-                let val = if let Ok(e) = Expr::parse(expr) {
+                let val = if let Ok(e) = Expr::cached(expr) {
                     e.eval_sample(registry, &ctx)
                         .map(|smp| sample_to_string(&smp))
                         .unwrap_or_default()
@@ -4198,7 +4200,7 @@ fn eval_tcp_req_conn_rules(
                 }
             }
             ibex_config::TcpReqConnAction::SetDst { expr } => {
-                let val = if let Ok(e) = Expr::parse(expr) {
+                let val = if let Ok(e) = Expr::cached(expr) {
                     e.eval_sample(registry, &ctx)
                         .map(|smp| sample_to_string(&smp))
                         .unwrap_or_default()
@@ -4327,7 +4329,7 @@ fn eval_tcp_req_session_rules(
                 }
             }
             ibex_config::TcpReqSessionAction::SetSrc { expr } => {
-                let val = if let Ok(e) = Expr::parse(expr) {
+                let val = if let Ok(e) = Expr::cached(expr) {
                     e.eval_sample(registry, &ctx)
                         .map(|smp| sample_to_string(&smp))
                         .unwrap_or_default()
@@ -4345,7 +4347,7 @@ fn eval_tcp_req_session_rules(
                 }
             }
             ibex_config::TcpReqSessionAction::SetDst { expr } => {
-                let val = if let Ok(e) = Expr::parse(expr) {
+                let val = if let Ok(e) = Expr::cached(expr) {
                     e.eval_sample(registry, &ctx)
                         .map(|smp| sample_to_string(&smp))
                         .unwrap_or_default()
@@ -4380,7 +4382,7 @@ fn eval_tcp_req_session_rules(
                 // A sample that cannot be fetched sets nothing (`action_store`, src/vars.c).
                 // The expression is a sample fetch, checked at load; one that cannot be parsed or
                 // fetched sets nothing.
-                let val = Expr::parse(expr).ok().and_then(|e| e.eval_sample(registry, &ctx)).map(|smp| (sample_is_empty(&smp), sample_to_string(&smp)));
+                let val = Expr::cached(expr).ok().and_then(|e| e.eval_sample(registry, &ctx)).map(|smp| (sample_is_empty(&smp), sample_to_string(&smp)));
                 if let Some((empty, val)) = val {
                     store_var_smp(&mut sess.sess_vars, &mut sess.req_vars, var_name, val, empty);
                 }
@@ -4573,7 +4575,7 @@ fn eval_tcp_req_content_rules(
                 }
             }
             ibex_config::TcpReqContentAction::SetSrc { expr } => {
-                let val = if let Ok(e) = Expr::parse(expr) {
+                let val = if let Ok(e) = Expr::cached(expr) {
                     e.eval_sample(registry, &ctx)
                         .map(|smp| sample_to_string(&smp))
                         .unwrap_or_default()
@@ -4591,7 +4593,7 @@ fn eval_tcp_req_content_rules(
                 }
             }
             ibex_config::TcpReqContentAction::SetDst { expr } => {
-                let val = if let Ok(e) = Expr::parse(expr) {
+                let val = if let Ok(e) = Expr::cached(expr) {
                     e.eval_sample(registry, &ctx)
                         .map(|smp| sample_to_string(&smp))
                         .unwrap_or_default()
@@ -4626,7 +4628,7 @@ fn eval_tcp_req_content_rules(
                 // A sample that cannot be fetched sets nothing (`action_store`, src/vars.c).
                 // The expression is a sample fetch, checked at load; one that cannot be parsed or
                 // fetched sets nothing.
-                let val = Expr::parse(expr).ok().and_then(|e| e.eval_sample(registry, &ctx)).map(|smp| (sample_is_empty(&smp), sample_to_string(&smp)));
+                let val = Expr::cached(expr).ok().and_then(|e| e.eval_sample(registry, &ctx)).map(|smp| (sample_is_empty(&smp), sample_to_string(&smp)));
                 if let Some((empty, val)) = val {
                     store_var_smp(&mut sess.sess_vars, &mut sess.req_vars, var_name, val, empty);
                 }
@@ -4738,8 +4740,8 @@ fn eval_tcp_res_content_rules(proxy: &Proxy, proxies: &[Proxy], registry: &Regis
         if let Some(cond) = &rule.cond {
             // `acl_exec_cond`: a sample that may change and does not match is a miss.
             let res = crate::proxy::combine_condition(cond, |term| {
-                let parsed = if proxy.acls.contains_key(&term.name) { None } else { Expr::parse(&term.name).ok() };
-                let Some(expr) = proxy.acls.get(&term.name).or(parsed.as_ref()) else { return crate::proxy::AclEvalResult::NotMatched };
+                let parsed = if proxy.acls.contains_key(&term.name) { None } else { Expr::cached(&term.name).ok() };
+                let Some(expr) = proxy.acls.get(&term.name).or(parsed.as_deref()) else { return crate::proxy::AclEvalResult::NotMatched };
                 if expr.fetch_name == "wait_end" && !final_ {
                     return crate::proxy::AclEvalResult::MissingData;
                 }
@@ -4793,7 +4795,7 @@ fn set_var_from_expr(
     ctx: &SampleContext,
     registry: &Registry,
 ) {
-    if let Some(val) = Expr::parse(expr).ok().and_then(|e| e.eval_sample(registry, ctx)) {
+    if let Some(val) = Expr::cached(expr).ok().and_then(|e| e.eval_sample(registry, ctx)) {
         store_var_smp(sess_vars, req_vars, name, sample_to_string(&val), sample_is_empty(&val));
     }
 }
@@ -7347,8 +7349,8 @@ impl EngineDispatcher<'_> {
                     None => true,
                     Some(cond) => {
                         let res = crate::proxy::combine_condition(cond, |term| {
-                            let parsed = if proxies[be_idx].acls.contains_key(&term.name) { None } else { Expr::parse(&term.name).ok() };
-                            match proxies[be_idx].acls.get(&term.name).or(parsed.as_ref()) {
+                            let parsed = if proxies[be_idx].acls.contains_key(&term.name) { None } else { Expr::cached(&term.name).ok() };
+                            match proxies[be_idx].acls.get(&term.name).or(parsed.as_deref()) {
                                 Some(expr) if expr.fetch_name == "wait_end" && !inspect_final => crate::proxy::AclEvalResult::MissingData,
                                 Some(expr) if expr.eval(registry, &tcp_ctx) != term.negated => crate::proxy::AclEvalResult::Matched,
                                 _ => crate::proxy::AclEvalResult::NotMatched,
@@ -8165,7 +8167,7 @@ impl EngineDispatcher<'_> {
                             let current_uri = sess.req_uri.as_deref().unwrap_or("/");
                             let (pfx, path, query) = split_uri(current_uri);
                             let rust_repl = translate_backreferences(repl);
-                            if let Ok(re) = ibex_regex::UserRegex::new(regex) {
+                            if let Ok(re) = ibex_regex::UserRegex::cached(regex) {
                                 let new_path = re.replace_all(path, &rust_repl).to_string();
                                 let rebuilt = rebuild_uri(pfx, &new_path, query);
                                 Some((new_path, rebuilt))
@@ -8196,7 +8198,7 @@ impl EngineDispatcher<'_> {
                             let (pfx, path, query) = split_uri(current_uri);
                             let pathq = if query.is_empty() { path.to_string() } else { format!("{path}?{query}") };
                             let rust_repl = translate_backreferences(repl);
-                            if let Ok(re) = ibex_regex::UserRegex::new(regex) {
+                            if let Ok(re) = ibex_regex::UserRegex::cached(regex) {
                                 let new_pathq = re.replace_all(&pathq, &rust_repl).to_string();
                                 let rebuilt = format!("{pfx}{new_pathq}");
                                 Some(rebuilt)
@@ -8215,7 +8217,7 @@ impl EngineDispatcher<'_> {
                         let rebuilt = {
                             let current_uri = sess.req_uri.as_deref().unwrap_or("/");
                             let rust_repl = translate_backreferences(repl);
-                            ibex_regex::UserRegex::new(regex)
+                            ibex_regex::UserRegex::cached(regex)
                                 .ok()
                                 .filter(|re| re.is_match(current_uri))
                                 .map(|re| re.replace(current_uri, &rust_repl).to_string())
@@ -8250,7 +8252,7 @@ impl EngineDispatcher<'_> {
                         }
                     }
                     ibex_config::HttpReqAction::SetSrc { expr } => {
-                        let val = if let Ok(e) = Expr::parse(expr) {
+                        let val = if let Ok(e) = Expr::cached(expr) {
                             e.eval_sample(registry, &make_ctx!(sess))
                                 .map(|smp| sample_to_string(&smp))
                                 .unwrap_or_default()
@@ -8272,7 +8274,7 @@ impl EngineDispatcher<'_> {
                         // `http_action_set_priority` (src/http_act.c): the sample as an
                         // integer (a string that is not a number is 0), clamped; a sample that
                         // cannot be fetched changes nothing.
-                        let value = Expr::parse(expr)
+                        let value = Expr::cached(expr)
                             .ok()
                             .and_then(|e| e.eval_sample(registry, &make_ctx!(sess)))
                             .map(|smp| sample_as_sint(&smp));
@@ -8288,7 +8290,7 @@ impl EngineDispatcher<'_> {
                         // `tcp_action_req_set_dst_port` (src/tcp_act.c): the value as an
                         // integer, truncated to 16 bits, on the stream's destination; an
                         // address of another family becomes 0.0.0.0.
-                        let port = Expr::parse(expr)
+                        let port = Expr::cached(expr)
                             .ok()
                             .and_then(|e| e.eval_sample(registry, &make_ctx!(sess)))
                             .and_then(|smp| ibex_sample::cast::cast(smp, ibex_sample::SampleType::Sint));
@@ -8305,7 +8307,7 @@ impl EngineDispatcher<'_> {
                         match value {
                             ibex_config::RetriesValue::Fixed(n) => sess.set_retries(*n),
                             ibex_config::RetriesValue::Expr(expr) => {
-                                let n = Expr::parse(expr)
+                                let n = Expr::cached(expr)
                                     .ok()
                                     .and_then(|e| e.eval_sample(registry, &make_ctx!(sess)))
                                     .and_then(|smp| ibex_sample::cast::cast(smp, ibex_sample::SampleType::Sint));
@@ -8316,7 +8318,7 @@ impl EngineDispatcher<'_> {
                         }
                     }
                     ibex_config::HttpReqAction::SetDst { expr } => {
-                        let val = if let Ok(e) = Expr::parse(expr) {
+                        let val = if let Ok(e) = Expr::cached(expr) {
                             e.eval_sample(registry, &make_ctx!(sess))
                                 .map(|smp| sample_to_string(&smp))
                                 .unwrap_or_default()
@@ -8332,7 +8334,7 @@ impl EngineDispatcher<'_> {
                         // A sample that cannot be fetched sets nothing (`action_store`, src/vars.c).
                         // The expression is a sample fetch, checked at load; one that cannot be parsed or
                         // fetched sets nothing.
-                        let val = Expr::parse(expr).ok().and_then(|e| e.eval_sample(registry, &make_ctx!(sess))).map(|smp| (sample_is_empty(&smp), sample_to_string(&smp)));
+                        let val = Expr::cached(expr).ok().and_then(|e| e.eval_sample(registry, &make_ctx!(sess))).map(|smp| (sample_is_empty(&smp), sample_to_string(&smp)));
                         if let Some((empty, val)) = val {
                             store_var_smp(&mut sess.sess_vars, &mut sess.req_vars, var_name, val, empty);
                         }
@@ -8354,7 +8356,7 @@ impl EngineDispatcher<'_> {
                         }
                     }
                     ibex_config::HttpReqAction::SetTimeout { timeout_type, timeout_val } => {
-                        let ms = if let Ok(expr) = Expr::parse(timeout_val) {
+                        let ms = if let Ok(expr) = Expr::cached(timeout_val) {
                             if let Some(smp) = expr.eval_sample(registry, &make_ctx!(sess)) {
                                 match smp {
                                     Sample::Sint(n) => u32::try_from(n).unwrap_or(0),
@@ -9241,7 +9243,7 @@ pub(crate) fn resolve_gpt0_val(
             return n;
         }
     }
-    if let Ok(e) = Expr::parse(expr_str) {
+    if let Ok(e) = Expr::cached(expr_str) {
         if let Some(smp) = e.eval_sample(registry, ctx) {
             return match smp {
                 Sample::Sint(n) => u32::try_from(n).unwrap_or(0),
@@ -9264,7 +9266,7 @@ pub(crate) fn resolve_sample_stick_key(
     table: Option<&Arc<ibex_stick_table::StickTable>>,
 ) -> Option<StickKey> {
     // An expression that gives no sample (a header that is absent) tracks nothing.
-    let smp = Expr::parse(expr_str).ok()?.eval_sample(registry, ctx)?;
+    let smp = Expr::cached(expr_str).ok()?.eval_sample(registry, ctx)?;
     let key = crate::proxy_state::sample_stick_key(smp);
     table.map_or(Some(key.clone()), |t| t.coerce_key(key))
 }
@@ -9338,7 +9340,7 @@ pub(crate) fn format_sample_string(fmt: &str, ctx: &SampleContext, registry: &Re
                         expr_str.push(ec);
                     }
                 }
-                if let Ok(expr) = Expr::parse(&expr_str) {
+                if let Ok(expr) = Expr::cached(&expr_str) {
                     if let Some(smp) = expr.eval_sample(registry, ctx) {
                         out.push_str(&sample_to_string(&smp));
                     }
@@ -9417,7 +9419,7 @@ fn header_name_matches(header_key: &str, pattern: &str) -> bool {
                 "beg" => header_key.to_lowercase().starts_with(&pat.to_lowercase()),
                 "end" => header_key.to_lowercase().ends_with(&pat.to_lowercase()),
                 "sub" => header_key.to_lowercase().contains(&pat.to_lowercase()),
-                "reg" => ibex_regex::UserRegex::new(pat).is_ok_and(|re| re.is_match(header_key)),
+                "reg" => ibex_regex::UserRegex::cached(pat).is_ok_and(|re| re.is_match(header_key)),
                 _ => header_key.eq_ignore_ascii_case(pat),
             }
         } else {
@@ -9902,7 +9904,7 @@ fn replace_req_value(sess: &mut TcpSession, name: &str, regex: &str, repl: &str)
 /// `repl` is cut short and the request is in strict mode: header by header, the ones
 /// before it stay rewritten.
 fn rewrite_req_header_values(sess: &mut TcpSession, name: &str, regex: &str, repl: &str, per_value: bool) -> Result<(), ()> {
-    let re = ibex_regex::UserRegex::new(regex).map_err(|_| ())?;
+    let re = ibex_regex::UserRegex::cached(regex).map_err(|_| ())?;
     let headers: Vec<(String, String)> = sess.htx_slice().map_or_else(Vec::new, |h| {
         h.headers().filter(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(k, v)| (k.to_string(), v.to_string())).collect()
     });
@@ -10037,7 +10039,7 @@ fn eval_condition(
             false
         } else if let Some(expr) = acls.get(&term.name) {
             expr.eval(registry, ctx)
-        } else if let Ok(expr) = Expr::parse(&term.name) {
+        } else if let Ok(expr) = Expr::cached(&term.name) {
             expr.eval(registry, ctx)
         } else {
             false
@@ -10371,7 +10373,7 @@ fn res_action(
         // `http_replace_hdrs`: header by header, the first that does not fit failing the
         // action with the ones before it rewritten.
         let Some((re_str, repl)) = act_fmt.split_once('\t') else { return Ok(true) };
-        let Ok(re) = ibex_regex::UserRegex::new(re_str) else { return Ok(true) };
+        let Ok(re) = ibex_regex::UserRegex::cached(re_str) else { return Ok(true) };
         let mut result = Ok(true);
         for (k, v) in hdrs.iter_mut().filter(|(k, _)| k.eq_ignore_ascii_case(hdr_name)) {
             let new_v = if full {
@@ -10452,7 +10454,7 @@ fn run_res_rules<'a>(
             ResRule::Capture(expr, id) => {
                 // No sample, no capture (the slot keeps what it had); an `id` past the frontend's
                 // slots captures nothing (`http_action_res_capture_by_id`: `id >= fe->nb_rsp_cap`).
-                let val = Expr::parse(expr).ok().and_then(|e| e.eval_sample(registry, ctx)).map(|smp| sample_to_string(&smp));
+                let val = Expr::cached(expr).ok().and_then(|e| e.eval_sample(registry, ctx)).map(|smp| sample_to_string(&smp));
                 if let (Some(val), Some((slots, lens))) = (val, caps.as_mut()) {
                     if let (Some(slot), Some((_, len))) = (slots.get_mut(id), lens.get(id)) {
                         *slot = Some(cut_at(&val, *len).to_vec());

@@ -2185,7 +2185,7 @@ pub fn eval_acl_term<S: ::std::hash::BuildHasher>(
 ) -> bool {
     let res = if let Some(expr) = acls.get(&term.name) {
         expr.eval(registry, ctx)
-    } else if let Ok(expr) = Expr::parse(&term.name) {
+    } else if let Ok(expr) = Expr::cached(&term.name) {
         expr.eval(registry, ctx)
     } else {
         false
@@ -2217,9 +2217,9 @@ pub fn eval_acl_term_extended<S: ::std::hash::BuildHasher>(
     let parsed_expr;
     let expr = if let Some(e) = expr_opt {
         e
-    } else if let Ok(e) = Expr::parse(&term.name) {
+    } else if let Ok(e) = Expr::cached(&term.name) {
         parsed_expr = e;
-        &parsed_expr
+        &*parsed_expr
     } else {
         return if term.negated {
             AclEvalResult::Matched
