@@ -533,8 +533,8 @@ tr:hover td {{ background: rgba(255, 255, 255, 0.02); }}
             let srv_status = proxy
                 .server_statuses.get(s_idx).map(|s| ServerStatus::from(s.load(std::sync::atomic::Ordering::Relaxed))).unwrap_or(ServerStatus::Up);
             let is_backup = proxy.server_backups.get(s_idx).copied().unwrap_or(false);
-            let weight = proxy.server_weights.get(s_idx).copied().unwrap_or(1);
-            let srv_maxconn = proxy.server_maxconn.get(s_idx).copied().flatten().unwrap_or(0);
+            let weight = proxy.server_weights.get(s_idx).unwrap_or(1);
+            let srv_maxconn = proxy.server_maxconn.get(s_idx).unwrap_or(0);
             let actconn = proxy.server_actconn.get(s_idx).map(|a| a.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0);
 
             let check_state = checks
@@ -1041,8 +1041,8 @@ pub fn render_stats_json(proxies: &[Proxy], checks: &[ServerCheckState], pid: u3
             let srv_id = proxy.server_ids.get(s_idx).map_or("srv", String::as_str);
             let srv_status = proxy
                 .server_statuses.get(s_idx).map(|s| ServerStatus::from(s.load(std::sync::atomic::Ordering::Relaxed))).unwrap_or(ServerStatus::Up);
-            let weight = proxy.server_weights.get(s_idx).copied().unwrap_or(1);
-            let srv_maxconn = proxy.server_maxconn.get(s_idx).copied().flatten().unwrap_or(0);
+            let weight = proxy.server_weights.get(s_idx).unwrap_or(1);
+            let srv_maxconn = proxy.server_maxconn.get(s_idx).unwrap_or(0);
             let actconn = proxy.server_actconn.get(s_idx).map(|a| a.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0);
 
             let check_state = checks

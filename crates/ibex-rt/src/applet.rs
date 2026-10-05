@@ -105,19 +105,14 @@ impl Proxy {
     /// Server `idx`'s configured weight, whatever it is now.
     #[must_use]
     pub fn initial_weight(&self, idx: usize) -> u32 {
-        let from = self.server_iweights.as_deref().unwrap_or(&self.server_weights);
-        from.get(idx).copied().unwrap_or(1)
+        self.server_weights.initial(idx).unwrap_or(1)
     }
 
     /// Changes server `idx`'s current weight, keeping the configured one for
-    /// [`Self::initial_weight`].
-    pub fn set_weight(&mut self, idx: usize, weight: u32) {
-        if self.server_iweights.is_none() {
-            self.server_iweights = Some(Box::new(self.server_weights.clone()));
-        }
-        if let Some(slot) = self.server_weights.get_mut(idx) {
-            *slot = weight;
-        }
+    /// [`Self::initial_weight`]. The weights are shared: every worker's next balancing
+    /// decision sees it.
+    pub fn set_weight(&self, idx: usize, weight: u32) {
+        self.server_weights.set(idx, weight);
     }
 }
 
@@ -401,7 +396,7 @@ impl CliApplet {
                         Some(ServerStatus::Drain) => 8,
                         _ => 0,
                     } | if p.server_cmaint(s_idx) { 4 } else { 0 };
-                    let uweight = p.server_weights.get(s_idx).copied().unwrap_or(1);
+                    let uweight = p.server_weights.get(s_idx).unwrap_or(1);
                     let iweight = p.initial_weight(s_idx);
                     
                     let mut check_status = 1;
@@ -649,7 +644,7 @@ impl CliApplet {
 
     fn handle_show_info(&mut self, ctx: &AppletContext) {
         let active_conns: u32 = ctx.proxies.iter().map(|p| p.stats.iter().map(|s| s.act_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u32>()).sum();
-        let max_conns: u32 = ctx.proxies.iter().map(|p| p.maxconn).sum();
+        let max_conns: u32 = ctx.proxies.iter().map(|p| p.maxconn.get()).sum();
         let cum_conns: u64 = ctx.proxies.iter().map(|p| p.stats.iter().map(|s| s.cum_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()).sum();
         let cum_reqs: u64 = ctx.proxies.iter().filter_map(|p| p.ids.tc.get()).map(|c| c.fe.req_tot.load(std::sync::atomic::Ordering::Relaxed)).sum();
         let info = crate::stats::format_show_info_counts(
@@ -1043,7 +1038,7 @@ impl CliApplet {
                     return;
                 };
                 // `server_maxconn` and `Proxy::maxconn` are what admission reads.
-                let _ = crate::engine::set_proxy_maxconn(ctx.proxies.make_mut(), &px_name, sv.as_deref(), val);
+                let _ = crate::engine::set_proxy_maxconn(ctx.proxies, &px_name, sv.as_deref(), val);
                 self.finish_msg("");
             }
             // `global.maxconn`, enforced by `globalconn` (listeners stop accepting at it).
@@ -1065,12 +1060,7 @@ impl CliApplet {
 
     fn handle_enable_server(&mut self, target: &str, ctx: &mut AppletContext) {
         let Some((px_name, sv_name)) = target.split_once('/') else {
-            self.out_buf.extend_from_slice(b"Require 'backend/server'.\n");
-            if self.interactive {
-                self.out_buf.extend_from_slice(b"\n> ");
-            } else {
-                self.is_done = true;
-            }
+            self.finish_msg("Require 'backend/server'.");
             return;
         };
         let mut found_px = false;
@@ -1097,26 +1087,19 @@ impl CliApplet {
         for (p_idx, s_idx, st) in track_changes {
             crate::track::set_status(ctx.proxies, p_idx, s_idx, st);
         }
-        if !found_px {
-            self.out_buf.extend_from_slice(b"No such backend.\n");
+        // `HAProxy` ends every answer, an empty one too, with an empty line.
+        self.finish_msg(if !found_px {
+            "No such backend."
         } else if !found_sv {
-            self.out_buf.extend_from_slice(b"No such server.\n");
-        }
-        if self.interactive {
-            self.out_buf.extend_from_slice(b"\n> ");
+            "No such server."
         } else {
-            self.is_done = true;
-        }
+            ""
+        });
     }
 
     fn handle_disable_server(&mut self, target: &str, ctx: &mut AppletContext) {
         let Some((px_name, sv_name)) = target.split_once('/') else {
-            self.out_buf.extend_from_slice(b"Require 'backend/server'.\n");
-            if self.interactive {
-                self.out_buf.extend_from_slice(b"\n> ");
-            } else {
-                self.is_done = true;
-            }
+            self.finish_msg("Require 'backend/server'.");
             return;
         };
         let mut found_px = false;
@@ -1143,16 +1126,14 @@ impl CliApplet {
         for (p_idx, s_idx, st) in track_changes {
             crate::track::set_status(ctx.proxies, p_idx, s_idx, st);
         }
-        if !found_px {
-            self.out_buf.extend_from_slice(b"No such backend.\n");
+        // `HAProxy` ends every answer, an empty one too, with an empty line.
+        self.finish_msg(if !found_px {
+            "No such backend."
         } else if !found_sv {
-            self.out_buf.extend_from_slice(b"No such server.\n");
-        }
-        if self.interactive {
-            self.out_buf.extend_from_slice(b"\n> ");
+            "No such server."
         } else {
-            self.is_done = true;
-        }
+            ""
+        });
     }
 
     /// Ends a command that answers `msg` (empty for success): HAProxy's CLI prints the message
@@ -1227,7 +1208,7 @@ impl CliApplet {
         match Self::parse_weight_change(arg, iw) {
             Ok(w) => {
                 // Read by every balancing algorithm (`lb.rs`) and by `show stat`.
-                ctx.proxies.make_mut()[p_idx].set_weight(s_idx, w);
+                ctx.proxies[p_idx].set_weight(s_idx, w);
                 self.finish_msg("");
             }
             Err(msg) => self.finish_msg(msg),
@@ -1312,7 +1293,7 @@ impl CliApplet {
                     self.finish_msg(&format!("Invalid addr '{ip_s}'"));
                     return;
                 };
-                let old = ctx.proxies[p_idx].servers[s_idx];
+                let old = ctx.proxies[p_idx].servers.at(s_idx);
                 let mut new_port = old.port();
                 if parts.get(3) == Some(&"port") {
                     let p_s = parts.get(4).copied().unwrap_or("");
@@ -1340,7 +1321,7 @@ impl CliApplet {
                 }
                 msg.push_str(" by 'stats socket command'");
                 // `proxy.servers` is where every connection to this server takes its address.
-                ctx.proxies.make_mut()[p_idx].servers[s_idx] = new;
+                ctx.proxies[p_idx].servers.set(s_idx, new);
                 if let Some(check) = ctx.checks.iter_mut().find(|c| c.proxy_idx == p_idx && c.server_idx == s_idx) {
                     check.addr = new;
                 }
@@ -1355,7 +1336,7 @@ impl CliApplet {
         match Self::find_server(target, ctx) {
             Ok((p_idx, s_idx)) => {
                 let px = &ctx.proxies[p_idx];
-                let w = px.server_weights.get(s_idx).copied().unwrap_or(1);
+                let w = px.server_weights.get(s_idx).unwrap_or(1);
                 let iw = px.initial_weight(s_idx);
                 self.finish_msg(&format!("{w} (initial {iw})"));
             }

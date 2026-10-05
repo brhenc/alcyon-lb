@@ -39,6 +39,7 @@ pub mod quic_listener;
 pub mod h3_relay;
 pub mod raw;
 pub mod rule_exprs;
+pub mod srv_rt;
 pub mod srv_tls;
 pub mod stats;
 pub mod statcnt;

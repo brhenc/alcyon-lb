@@ -585,7 +585,7 @@ fn server_state_header(check: &ServerCheckState, proxies: &[Proxy]) -> String {
     };
     let Some(px) = proxies.get(check.proxy_idx) else { return out };
     let i = check.server_idx;
-    let addr = px.servers.get(i).copied().unwrap_or(check.addr);
+    let addr = px.servers.get(i).unwrap_or(check.addr);
     let cur = |j: usize| px.server_actconn.get(j).map_or(0, |a| a.load(Ordering::Relaxed));
     let be_streams: u32 = (0..px.servers.len()).map(cur).sum();
     let _ = write!(
@@ -596,7 +596,7 @@ fn server_state_header(check: &ServerCheckState, proxies: &[Proxy]) -> String {
         px.name,
         px.server_ids.get(i).map_or("", String::as_str),
         crate::engine::log_hostname(),
-        px.server_weights.get(i).copied().unwrap_or(1),
+        px.server_weights.get(i).unwrap_or(1),
         total_weight(px),
         cur(i),
         be_streams,

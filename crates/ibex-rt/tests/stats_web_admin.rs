@@ -223,7 +223,7 @@ fn test_stats_server_state_and_weight_mutations() {
 
     // 1. Initial status is UP
     assert_eq!(engine.proxies[0].server_statuses[0].load(std::sync::atomic::Ordering::Relaxed), ServerStatus::Up as u8);
-    assert_eq!(engine.proxies[0].server_weights[0], 10);
+    assert_eq!(engine.proxies[0].server_weights.get(0).unwrap(), 10);
 
     // 2. Mutate state to DRAIN via POST
     let drain_body = "action=drain&backend=cluster_px&server=web1";
@@ -315,7 +315,7 @@ fn test_stats_server_state_and_weight_mutations() {
         weight_resp.starts_with("HTTP/1.1 200 OK\r\n"),
         "Got: {weight_resp}"
     );
-    assert_eq!(engine.proxies[0].server_weights[0], 64);
+    assert_eq!(engine.proxies[0].server_weights.get(0).unwrap(), 64);
 
     // CSV shows new weight
     let csv_w = send_http_request(
