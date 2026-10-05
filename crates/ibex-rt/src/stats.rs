@@ -841,8 +841,6 @@ mod tests {
             acls: ibex_sample::Acls::default(),
             stick_table: None,
             stick_rules: Vec::new(),
-            accept_proxy: false,
-            accept_proxy_v2: false,
             server_send_proxy: vec![false],
             server_send_proxy_v2: vec![false],
             server_pp_unique_id: vec![false],

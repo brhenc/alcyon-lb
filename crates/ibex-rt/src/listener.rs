@@ -49,6 +49,11 @@ pub struct Listener {
     pub name: Option<Arc<str>>,
     /// The listener's numeric id (`luid`), what `so_id` reads; 0 until the engine sets it.
     pub luid: u32,
+    /// `bind ... accept-proxy` (or `accept-proxy-v2`): connections this bind accepts start
+    /// with a PROXY header. Per bind, as in `HAProxy` (`BC_O_ACC_PROXY`).
+    pub accept_proxy: bool,
+    /// `accept-proxy-v2`: the header must be v2.
+    pub accept_proxy_v2: bool,
 }
 
 impl Listener {
@@ -109,6 +114,8 @@ impl Listener {
             nbconn: 0,
             tls: None,
             name: None,
+            accept_proxy: false,
+            accept_proxy_v2: false,
             luid: 0,
         })
     }
@@ -155,6 +162,8 @@ impl Listener {
             nbconn: 0,
             tls: None,
             name: None,
+            accept_proxy: false,
+            accept_proxy_v2: false,
             luid: 0,
         })
     }

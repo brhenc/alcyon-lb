@@ -939,8 +939,6 @@ pub struct Proxy {
     pub acls: ibex_sample::Acls,
     pub stick_table: Option<Arc<StickTable>>,
     pub stick_rules: Vec<StickRule>,
-    pub accept_proxy: bool,
-    pub accept_proxy_v2: bool,
     pub server_send_proxy: Vec<bool>,
     pub server_send_proxy_v2: Vec<bool>,
     /// `proxy-v2-options unique-id`, per server.
@@ -2419,8 +2417,6 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, list
         acls: compile_acls(&listen.acls),
         stick_table,
         stick_rules: listen.stick_rules.clone(),
-        accept_proxy: listen.accept_proxy,
-        accept_proxy_v2: listen.accept_proxy_v2,
         server_send_proxy: listen.servers.iter().map(|s| s.send_proxy).collect(),
         server_send_proxy_v2: listen.servers.iter().map(|s| s.send_proxy_v2).collect(),
         server_pp_unique_id: listen.servers.iter().map(|s| s.proxy_v2_unique_id).collect(),
@@ -2539,8 +2535,6 @@ fn init_proxy_from_frontend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, fe
         acls: compile_acls(&fe.acls),
         stick_table,
         stick_rules: fe.stick_rules.clone(),
-        accept_proxy: fe.accept_proxy || fe.binds.iter().any(|b| b.accept_proxy),
-        accept_proxy_v2: fe.accept_proxy_v2 || fe.binds.iter().any(|b| b.accept_proxy_v2),
         server_send_proxy: Vec::new(),
         server_send_proxy_v2: Vec::new(),
         server_pp_unique_id: Vec::new(),
@@ -2686,8 +2680,6 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, be:
         acls: compile_acls(&be.acls),
         stick_table,
         stick_rules: be.stick_rules.clone(),
-        accept_proxy: false,
-        accept_proxy_v2: false,
         server_send_proxy: be.servers.iter().map(|s| s.send_proxy).collect(),
         server_send_proxy_v2: be.servers.iter().map(|s| s.send_proxy_v2).collect(),
         server_pp_unique_id: be.servers.iter().map(|s| s.proxy_v2_unique_id).collect(),
@@ -3030,6 +3022,8 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     listener.luid = proxies[proxy_idx].ids.listener_ids.get(bind_idx).copied().unwrap_or(0);
                     listener.maxconn = proxies[proxy_idx].maxconn.clone();
                     listener.name = b.name.as_deref().map(Into::into);
+                    listener.accept_proxy = b.accept_proxy || b.accept_proxy_v2;
+                    listener.accept_proxy_v2 = b.accept_proxy_v2;
                     listener.tls.clone_from(&tls);
                     let l_idx = listeners.len();
                     let lfd = listener.raw_fd();
@@ -3073,6 +3067,8 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                         listener.luid = proxies[proxy_idx].ids.listener_ids.get(bind_idx).copied().unwrap_or(0);
                         listener.maxconn = proxies[proxy_idx].maxconn.clone();
                         listener.name = b.name.as_deref().map(Into::into);
+                    listener.accept_proxy = b.accept_proxy || b.accept_proxy_v2;
+                    listener.accept_proxy_v2 = b.accept_proxy_v2;
                         listener.tls.clone_from(&tls);
                         let l_idx = listeners.len();
                         let lfd = listener.raw_fd();
@@ -5065,6 +5061,9 @@ fn register_new_session(
         engine.global_maxrewrite,
         engine.global_h2_flood_config,
         expect_proxy,
+        listener_idx
+            .and_then(|i| engine.listeners.get(i))
+            .map_or((false, false), |l| (l.accept_proxy, l.accept_proxy_v2)),
     ) else {
         // TLS setup failed; the fd is dropped with the session and the connection closes.
         return;
@@ -5291,6 +5290,7 @@ fn init_client_session(
     global_maxrewrite: usize,
     global_h2_flood_config: ibex_proto::H2FloodConfig,
     expect_proxy: bool,
+    bind_proxy: (bool, bool),
 ) -> Option<(TcpSession, Option<SocketAddr>, Option<RawFd>)> {
     let mode = proxies[proxy_idx].mode;
     let timeouts = proxies[proxy_idx].timeouts;
@@ -5347,8 +5347,9 @@ fn init_client_session(
             }
         }
     }
-    if proxies[proxy_idx].accept_proxy || proxies[proxy_idx].accept_proxy_v2 {
-        sess.enable_accept_proxy(proxies[proxy_idx].accept_proxy_v2);
+    // `accept-proxy` belongs to the bind that accepted, not to the frontend.
+    if bind_proxy.0 {
+        sess.enable_accept_proxy(bind_proxy.1);
     } else if expect_proxy {
         // `tcp-request connection expect-proxy layer4` matched: v1 or v2, as `accept-proxy`.
         sess.enable_accept_proxy(false);
