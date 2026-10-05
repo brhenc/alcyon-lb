@@ -10099,7 +10099,18 @@ fn rebuild_req_buffer(sess: &mut TcpSession) {
         return;
     };
     if let Some(htx) = sess.htx_slice() {
-        sess.req.replace_prefix(hdr_len + eoh_len, &htx.write_h1_wire_vec());
+        let mut wire = htx.write_h1_wire_vec();
+        // An HTTP/2 request without a length goes out chunked: the header is written with the
+        // head, after the rules, which never saw it.
+        if sess.h2_chunk_out && !wire.is_empty() {
+            if let Some((h, _)) = crate::proxy::find_eoh(&wire) {
+                let mut v = wire[..h].to_vec();
+                v.extend_from_slice(b"\r\ntransfer-encoding: chunked");
+                v.extend_from_slice(&wire[h..]);
+                wire = v;
+            }
+        }
+        sess.req.replace_prefix(hdr_len + eoh_len, &wire);
     } else {
         let method = sess.req_method.as_deref().unwrap_or("GET");
         let uri = sess.req_uri.as_deref().unwrap_or("/");

@@ -299,6 +299,10 @@ pub struct TcpSession {
     pub h2_active_stream_id: Option<u32>,
     /// How much of the active HTTP/2 stream's request body has been written to `req`.
     pub h2_body: H2ReqBody,
+    /// The head forwarded for the HTTP/2 request in flight has to carry `transfer-encoding:
+    /// chunked` (no length was given); it is added when the head is written, not in the HTX
+    /// the rules see.
+    pub h2_chunk_out: bool,
     pub h2_flood_config: ibex_proto::H2FloodConfig,
     pub is_first_req: bool,
     /// Keep each request line for the log (`txn->uri`): set when a format of the
@@ -321,6 +325,22 @@ pub struct H2ReqBody {
     pub off: usize,
     pub chunked: bool,
     pub done: bool,
+    /// The last chunk has been written with trailers after it.
+    pub trailing: bool,
+    /// What the trailers add to `%U`: each name and value, and the byte of their end.
+    pub trailer_bytes: u64,
+}
+
+/// What `%U` counts of an HTTP/2 request's head (`HAProxy`'s HTX: 20 bytes for the start
+/// line, its three strings -- the target is `scheme://authority` and the path when the
+/// request had both -- and each header's name and value, then the end of the headers).
+fn h2_head_size(msg: &ibex_proto::htx::Htx, abs_prefix: Option<&str>) -> u64 {
+    let Some(r) = msg.req_line() else { return 0 };
+    let mut size = 20 + (r.method.as_str().len() + abs_prefix.map_or(0, str::len) + r.uri.len() + "HTTP/2.0".len()) as u64 + 1;
+    for h in msg.headers() {
+        size += (h.name.len() + h.value.len()) as u64;
+    }
+    size
 }
 
 /// Writes what has come of an HTTP/2 request's body into `req`, as much as there is room
@@ -366,8 +386,45 @@ fn pump_h2_body(msg: &ibex_proto::htx::Htx, st: &mut H2ReqBody, req: &mut Buf) -
                     st.off = 0;
                 }
             }
-            HtxBlock::Eom => {
+            HtxBlock::Trailer(h) => {
+                // Trailers can follow only a chunked body: with a length they are dropped.
                 if st.chunked {
+                    let mut line = Vec::with_capacity(h.name.len() + h.value.len() + 7);
+                    if !st.trailing {
+                        line.extend_from_slice(b"0\r\n");
+                    }
+                    line.extend_from_slice(h.name.as_bytes());
+                    line.extend_from_slice(b": ");
+                    line.extend_from_slice(h.value.as_bytes());
+                    line.extend_from_slice(b"\r\n");
+                    let room = req.writable();
+                    if room.len() < line.len() {
+                        break;
+                    }
+                    room[..line.len()].copy_from_slice(&line);
+                    req.commit(line.len());
+                    wrote = true;
+                    st.trailing = true;
+                }
+                // Dropped or forwarded, `HAProxy` counts them.
+                st.trailer_bytes += (h.name.len() + h.value.len()) as u64;
+                st.cursor += 1;
+            }
+            HtxBlock::Eot => {
+                if st.chunked && st.trailing {
+                    let room = req.writable();
+                    if room.len() < 2 {
+                        break;
+                    }
+                    room[..2].copy_from_slice(b"\r\n");
+                    req.commit(2);
+                    wrote = true;
+                }
+                st.trailer_bytes += 1;
+                st.cursor += 1;
+            }
+            HtxBlock::Eom => {
+                if st.chunked && !st.trailing {
                     let room = req.writable();
                     if room.len() < 5 {
                         break;
@@ -492,6 +549,7 @@ impl TcpSession {
             h2_idle_goaway: false,
             h2_active_stream_id: None,
             h2_body: H2ReqBody::default(),
+            h2_chunk_out: false,
             h2_flood_config: ibex_proto::H2FloodConfig::default(),
             is_first_req: true,
             keep_request_line: false,
@@ -927,6 +985,7 @@ impl TcpSession {
         self.clear_htx();
         self.h2_active_stream_id = None;
         self.h2_body = H2ReqBody::default();
+        self.h2_chunk_out = false;
         self.req_vars.clear();
         if let Some(set) = self.timeouts_set.take() {
             self.timeouts = set.before;
@@ -1247,20 +1306,41 @@ impl TcpSession {
                             // The head goes to the server as HTTP/1.1, and the body follows
                             // as the DATA frames come (`pump_h2_body`): with the length the
                             // client gave, else chunked, as `HAProxy` writes it.
-                            let has_data = stream.rx_htx.blocks().iter().any(|b| matches!(b, HtxBlock::Data(_) | HtxBlock::RawData(_)));
+                            let has_data = stream.rx_htx.blocks().iter().any(|b| matches!(b, HtxBlock::Data(_) | HtxBlock::RawData(_) | HtxBlock::Trailer(_)));
                             let chunked = stream.rx_htx.get_header("content-length").is_none() && (has_data || !stream.rx_htx.is_eom());
-                            if chunked {
-                                stream.rx_htx.set_header("transfer-encoding", "chunked");
-                            }
                             let first_body = stream.rx_htx.blocks().iter().position(|b| matches!(b, HtxBlock::Eoh)).map_or(stream.rx_htx.blocks().len(), |i| i + 1);
-                            self.h2_body = H2ReqBody { cursor: first_body, off: 0, chunked, done: false };
+                            self.h2_body = H2ReqBody { cursor: first_body, off: 0, chunked, ..H2ReqBody::default() };
+                            // `%U`, and the line `%r` prints, are those of the message the
+                            // client sent: `transfer-encoding: chunked` is added on output only,
+                            // so the rules do not see it either (only the forwarded head has it).
+                            // The chunked end the forwarded body is counted with (+1 when it is
+                            // consumed) is not in `HAProxy`'s message unless trailers precede it.
+                            let req_htx = h2_head_size(&stream.rx_htx, stream.abs_prefix.as_deref()).saturating_sub(u64::from(chunked));
+                            if self.keep_request_line {
+                                self.log.request_line = stream.rx_htx.req_line().map(|r| {
+                                    format!("{} {}{} HTTP/2.0", r.method.as_str(), stream.abs_prefix.as_deref().unwrap_or(""), r.uri)
+                                });
+                            }
+                            self.log.request = Some(std::time::Instant::now());
                             let full_req = stream.rx_htx.to_h1_wire();
-                            let wire_req = find_eoh(&full_req).map_or(&full_req[..], |(h, e)| &full_req[..h + e]);
+                            let head_only = find_eoh(&full_req).map_or(&full_req[..], |(h, e)| &full_req[..h + e]);
+                            let wire_req_buf: Vec<u8>;
+                            let wire_req: &[u8] = if chunked {
+                                let at = find_eoh(head_only).map_or(head_only.len(), |(h, _)| h);
+                                let mut v = head_only[..at].to_vec();
+                                v.extend_from_slice(b"\r\ntransfer-encoding: chunked");
+                                v.extend_from_slice(&head_only[at..]);
+                                wire_req_buf = v;
+                                &wire_req_buf
+                            } else {
+                                head_only
+                            };
+                            self.h2_chunk_out = chunked;
                             if let Ok(parser) = ibex_proto::parser::build(ibex_proto::parser::ParserKind::H1) {
                                 let mut p_stream = parser.stream(false);
                                 let raw = self.htx_buf.raw_slice_mut();
                                 let mut slice = ibex_proto::htx::HtxSlice::new(raw);
-                                if p_stream.parse(wire_req, &mut slice).is_ok() {
+                                if p_stream.parse(head_only, &mut slice).is_ok() {
                                     self.htx_tail = slice.tail_addr();
                                     self.htx_blocks = slice.num_blocks();
                                     self.has_htx = true;
@@ -1279,7 +1359,9 @@ impl TcpSession {
                             self.req.commit(n);
                             let framing = find_eoh(wire_req)
                                 .map_or(txn::Framing::None, |(h, e)| txn::request_framing(&wire_req[..h + e]));
-                            self.txn = Some(HttpTxn::new(framing, false));
+                            let mut txn = HttpTxn::new(framing, false);
+                            txn.req_htx = Some(req_htx);
+                            self.txn = Some(txn);
                             self.cli_state = ScState::Established;
                             changed = true;
                         }
@@ -1287,8 +1369,14 @@ impl TcpSession {
                 }
                 // The DATA frames of the request being served that have come since.
                 if let Some(stream) = self.h2_active_stream_id.and_then(|id| h2.streams.get(&id)) {
+                    let before = self.h2_body.trailer_bytes;
                     if pump_h2_body(&stream.rx_htx, &mut self.h2_body, &mut self.req) {
                         changed = true;
+                    }
+                    // What the trailers add to `%U`.
+                    let added = self.h2_body.trailer_bytes - before;
+                    if let Some(t) = self.txn.as_mut().and_then(|t| t.req_htx.as_mut()) {
+                        *t += added;
                     }
                 }
 
@@ -2455,6 +2543,42 @@ mod tests {
         let mut req = Buf::with_capacity(16);
         assert!(pump_h2_body(&msg, &mut st, &mut req));
         assert_eq!(req.readable(), b"0\r\n\r\n");
+    }
+
+    /// Trailers follow the last chunk as `name: value` lines and a blank one, each written
+    /// only when it fits; with a length they are dropped, and counted either way.
+    #[test]
+    fn trailers_are_written_when_they_fit_and_counted_either_way() {
+        use ibex_proto::htx::HeaderField;
+        let mut msg = Htx::new();
+        msg.push(HtxBlock::Eoh);
+        msg.push(HtxBlock::Data(b"ab".to_vec()));
+        msg.push(HtxBlock::Trailer(HeaderField { name: "x".into(), value: "y".into() }));
+        msg.push(HtxBlock::Eot);
+        msg.push(HtxBlock::Eom);
+        for (cap, passes) in [(15, 2), (17, 2), (64, 1)] {
+            let mut st = H2ReqBody { chunked: true, ..H2ReqBody::default() };
+            let mut req = Buf::with_capacity(cap);
+            let mut out = Vec::new();
+            let mut n = 0;
+            while !st.done {
+                pump_h2_body(&msg, &mut st, &mut req);
+                n += 1;
+                out.extend_from_slice(req.readable());
+                let len = req.readable().len();
+                req.consume(len);
+                assert!(n <= 5, "{st:?}");
+            }
+            assert_eq!(out, b"2\r\nab\r\n0\r\nx: y\r\n\r\n", "capacity {cap}");
+            assert_eq!(n, passes, "capacity {cap}");
+            assert_eq!(st.trailer_bytes, 3);
+        }
+        let mut st = H2ReqBody::default();
+        let mut req = Buf::with_capacity(64);
+        let mut out = Vec::new();
+        pump_all(&msg, &mut st, &mut req, &mut out);
+        assert_eq!(out, b"ab");
+        assert_eq!(st.trailer_bytes, 3);
     }
 
     #[test]

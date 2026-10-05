@@ -47,6 +47,9 @@ pub struct H2StreamCtx {
     pub reset_reason: Option<H2Error>,
     pub is_shut: bool,
     pub dispatched: bool,
+    /// `scheme://authority` of a request that carried both pseudo-headers: what `HAProxy`
+    /// puts before the path in the start line it logs and counts (`GET http://x/g HTTP/2.0`).
+    pub abs_prefix: Option<String>,
 }
 
 impl H2StreamCtx {
@@ -61,6 +64,7 @@ impl H2StreamCtx {
             reset_reason: None,
             is_shut: false,
             dispatched: false,
+            abs_prefix: None,
         }
     }
 }
@@ -611,6 +615,36 @@ impl MuxH2 {
             io::Error::new(io::ErrorKind::InvalidData, "HPACK compression error")
         })?;
 
+        // A second HEADERS on a stream whose head is complete is the request's trailers
+        // (RFC 9113 section 8.1): they end the stream, carry no pseudo-header, and are kept
+        // as trailer blocks for the data path to forward.
+        if ctx.is_server
+            && ctx.streams.get(&stream_id).is_some_and(|s| s.rx_htx.blocks().iter().any(|b| matches!(b, HtxBlock::Eoh)))
+        {
+            let ended = ctx.streams.get(&stream_id).is_some_and(|s| s.rx_htx.is_eom());
+            if ended {
+                ctx.send_rst_stream(stream_id, H2Error::StreamClosed);
+                return Ok(());
+            }
+            if (flags & frame_flags::END_STREAM) == 0 || decoded_headers.iter().any(|h| h.name.starts_with(':')) {
+                ctx.send_rst_stream(stream_id, H2Error::ProtocolError);
+                return Ok(());
+            }
+            ctx.streams.entry(stream_id).and_modify(|stream| {
+                for h in decoded_headers {
+                    stream.rx_htx.push(HtxBlock::Trailer(h));
+                }
+                stream.rx_htx.push(HtxBlock::Eot);
+                stream.rx_htx.push(HtxBlock::Eom);
+                stream.state = H2StreamState::HalfClosedRemote;
+            });
+            return Ok(());
+        }
+
+        let abs_prefix = {
+            let get = |n: &str| decoded_headers.iter().find(|h| h.name == n).map(|h| h.value.as_str());
+            get(":scheme").zip(get(":authority")).map(|(s, a)| format!("{s}://{a}"))
+        };
         let stream = ctx.streams.entry(stream_id).or_insert_with(|| {
             H2StreamCtx::new(
                 stream_id,
@@ -620,6 +654,7 @@ impl MuxH2 {
         });
 
         stream.state = H2StreamState::Open;
+        stream.abs_prefix = abs_prefix;
 
         // Extract pseudo-headers and construct HTX blocks
         match crate::htx::pseudo_headers_to_htx(decoded_headers, HttpVersion::Http20) {
