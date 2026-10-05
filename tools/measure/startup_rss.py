@@ -43,7 +43,7 @@ def free_port():
 def config(backends, nbthread, port):
     out = [
         "global",
-        f"    nbthread {nbthread}",
+        f"    nbthread {nbthread}" if nbthread else "    # no nbthread line: the default (T208; --nbthread 0)",
         "    maxconn 1000",
         "defaults",
         "    mode http",

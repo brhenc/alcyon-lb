@@ -103,7 +103,7 @@ fn wait_exit(child: &mut Child, within: Duration) -> Option<std::process::ExitSt
 
 fn config(port: u16, body: &str) -> String {
     format!(
-        "global\ndefaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n\
+        "global\n  nbthread 1\ndefaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n\
          frontend fe\n  bind 127.0.0.1:{port}\n  http-request return status 200 content-type text/plain string {body}\n"
     )
 }

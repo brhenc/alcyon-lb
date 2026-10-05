@@ -111,7 +111,7 @@ impl Ibex {
         let tcp = common::reserve_addr();
         let quic = common::reserve_addr();
         let cfg = format!(
-            "global\n  log {log_addr} local0\n\
+            "global\n  nbthread 1\n  log {log_addr} local0\n\
              defaults\n  mode http\n  log global\n  option httplog\n  timeout connect 2s\n  timeout client 10s\n  timeout server 10s\n\
              frontend fe\n  bind {tcp}\n  bind quic4@{quic} ssl crt {crt} alpn h3\n\
              \x20 http-request deny if {{ path /deny }}\n\

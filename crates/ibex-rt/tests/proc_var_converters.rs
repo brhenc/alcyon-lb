@@ -46,7 +46,7 @@ fn the_var_converters_change_the_process_variable() {
     std::fs::write(
         &cfg,
         format!(
-            "global\n  set-var proc.u str(start)\n\
+            "global\n  nbthread 1\n  set-var proc.u str(start)\n\
              defaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 1s\n\
              frontend f\n  bind {fe}\n\
              \x20 http-request set-header x1 %[str(conv),set-var(proc.x)] if {{ path /set }}\n\
