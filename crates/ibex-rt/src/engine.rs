@@ -32,7 +32,7 @@ use ibex_sched::task::{state, Kind, TaskRef, WorkKind};
 use ibex_sched::{Class, Dispatch, Outcome, Scheduler, Tick};
 use ibex_stick_table::{Gpc, GpcOp, KeyType, StickKey, StickTable, StickTableConfig};
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -921,7 +921,7 @@ pub struct Proxy {
     /// server to give).
     pub disabled_backends: Arc<Vec<String>>,
     pub monitor_uri: Option<Box<str>>,
-    pub acls: HashMap<String, Expr>,
+    pub acls: ibex_sample::Acls,
     pub stick_table: Option<Arc<StickTable>>,
     pub stick_rules: Vec<StickRule>,
     pub accept_proxy: bool,
@@ -1404,53 +1404,11 @@ fn socket_file_ident(path: &Path) -> Option<(u64, u64)> {
     std::fs::symlink_metadata(path).ok().map(|m| (m.dev(), m.ino()))
 }
 
-/// `HAProxy`'s predefined ACLs (`default_acl_list`, src/acl.c), by name.
-const PREDEFINED_ACLS:&[(&str, &str)] = &[
-    ("TRUE", "always_true"),
-    ("WAIT_END", "wait_end"),
-    ("FALSE", "always_false"),
-    ("LOCALHOST", "src 127.0.0.1/8 ::1"),
-    ("HTTP", "req.proto_http"),
-    ("HTTP_1.0", "req.ver 1.0"),
-    ("HTTP_1.1", "req.ver 1.1"),
-    ("HTTP_2.0", "req.ver 2.0"),
-    ("HTTP_3.0", "req.ver 3.0"),
-    ("METH_CONNECT", "method CONNECT"),
-    ("METH_DELETE", "method DELETE"),
-    ("METH_GET", "method GET HEAD"),
-    ("METH_HEAD", "method HEAD"),
-    ("METH_OPTIONS", "method OPTIONS"),
-    ("METH_POST", "method POST"),
-    ("METH_PUT", "method PUT"),
-    ("METH_TRACE", "method TRACE"),
-    ("HTTP_URL_ABS", "url -m reg ^[^/:]*://"),
-    ("HTTP_URL_SLASH", "url -m beg /"),
-    ("HTTP_URL_STAR", "url *"),
-    ("HTTP_CONTENT", "req.hdr_val(content-length) gt 0"),
-    ("REQ_CONTENT", "req.len gt 0"),
-    ("RDP_COOKIE", "req.rdp_cookie_cnt gt 0"),
-];
-
-/// A proxy's ACLs by name: the predefined ones, then its own (`find_acl_by_name` is
-/// searched before `find_acl_default`, so an ACL of the same name replaces one).
-fn compile_acls(acl_rules: &[ibex_config::AclRule]) -> HashMap<String, Expr> {
-    let mut acls: HashMap<String, Expr> = PREDEFINED_ACLS
-        .iter()
-        .filter_map(|&(name, expr)| Some((name.to_string(), Expr::parse(expr).ok()?)))
-        .collect();
-    // A name declared on several lines is one ACL matching if any line does; the first of
-    // them replaces a predefined ACL of that name.
-    let mut own: HashSet<&str> = HashSet::new();
-    for (rule, expr) in acl_rules.iter().filter_map(|r| Some((r, Expr::parse(&r.expr).ok()?))) {
-        match acls.get_mut(&rule.name) {
-            Some(first) if own.contains(rule.name.as_str()) => first.alternates.push(expr),
-            _ => {
-                own.insert(rule.name.as_str());
-                acls.insert(rule.name.clone(), expr);
-            }
-        }
-    }
-    acls
+/// A proxy's ACLs by name: its own, then the predefined ones, shared by every proxy
+/// (`find_acl_by_name` is searched before `find_acl_default`, so an ACL of the same name
+/// replaces one). T175: compiling the predefined ACLs into each proxy took 20 KB a backend.
+fn compile_acls(acl_rules: &[ibex_config::AclRule]) -> ibex_sample::Acls {
+    ibex_sample::Acls::compile(acl_rules.iter().map(|r| (r.name.as_str(), r.expr.as_str())))
 }
 
 fn init_stick_table(ast: &ibex_config::StickTableConfigAst, name: &str) -> StickTable {
@@ -2923,7 +2881,13 @@ impl Engine {
     // nothing on every request; `HAProxy` refuses the configuration instead.
     crate::rule_exprs::validate_config(config)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    let mut proxies = Vec::new();
+    // Exactly the proxies built below: a doubling Vec of 1.6 KB proxies left up to half of
+    // it unused, 2.7 KB a backend at 10,000 (T175).
+    let mut proxies = Vec::with_capacity(
+        config.listens.iter().filter(|l| !l.disabled).count()
+            + config.backends.iter().filter(|b| !b.disabled).count()
+            + config.frontends.iter().filter(|f| !f.disabled).count(),
+    );
     let ids = config.proxy_ids();
     for (i, listen) in config.listens.iter().enumerate().filter(|(_, l)| !l.disabled) {
         let mut p = init_proxy_from_listen(proxies.len(), ids.listens[i], listen);
@@ -7981,7 +7945,7 @@ impl EngineDispatcher<'_> {
 
         let stick = StickView::new(proxies, &entry.sess.tracked_sc);
         let act_conn = proxies[proxy_idx].counters().act_conn.load(Ordering::Relaxed);
-        let eval_http_rules = |rules: &[ibex_config::HttpReqRule], capture_exprs: &[Option<Expr>], acls: &HashMap<String, Expr>, sess: &mut TcpSession, be_retries: u16, fe_name: Option<&str>, be_name: Option<&str>, pages_idx: usize, be_stage: bool, start: usize| -> Result<RuleFlow, u16> {
+        let eval_http_rules = |rules: &[ibex_config::HttpReqRule], capture_exprs: &[Option<Expr>], acls: &ibex_sample::Acls, sess: &mut TcpSession, be_retries: u16, fe_name: Option<&str>, be_name: Option<&str>, pages_idx: usize, be_stage: bool, start: usize| -> Result<RuleFlow, u16> {
             macro_rules! make_ctx {
                 ($s:expr) => {
                     SampleContext {
@@ -10027,7 +9991,7 @@ fn rebuild_req_buffer(sess: &mut TcpSession) {
 fn eval_condition(
     cond: &ibex_config::AclCondition,
     ctx: &SampleContext,
-    acls: &HashMap<String, Expr>,
+    acls: &ibex_sample::Acls,
     registry: &Registry,
 ) -> bool {
     crate::proxy::combine_condition(cond, |term| {
@@ -10422,7 +10386,7 @@ fn res_action(
 #[allow(clippy::too_many_arguments)]
 fn run_res_rules<'a>(
     rules: impl Iterator<Item = (ResRule<'a>, Option<&'a ibex_config::AclCondition>, u32)>,
-    acls: &HashMap<String, Expr>,
+    acls: &ibex_sample::Acls,
     head: (&mut Vec<(String, String)>, &mut u16, &mut String),
     ctx: &SampleContext,
     mut caps: Option<(&mut Vec<Option<Vec<u8>>>, &[(String, usize)])>,

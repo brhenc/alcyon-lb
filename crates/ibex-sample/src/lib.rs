@@ -9,6 +9,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod acls;
 pub mod aes;
 pub mod auth;
 pub mod cast;
@@ -23,6 +24,7 @@ pub mod rfc7239;
 pub mod registry;
 pub mod sample;
 
+pub use acls::Acls;
 pub use auth::{set_userlists, AuthUser, AuthUserlist};
 pub use ibex_crypt::CryptHash;
 pub use cast::{can_cast, cast};

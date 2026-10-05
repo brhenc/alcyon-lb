@@ -841,7 +841,7 @@ mod tests {
             force_be_switch: Vec::new(),
             disabled_backends: std::sync::Arc::default(),
             monitor_uri: None,
-            acls: std::collections::HashMap::new(),
+            acls: ibex_sample::Acls::default(),
             stick_table: None,
             stick_rules: Vec::new(),
             accept_proxy: false,

@@ -2177,9 +2177,9 @@ pub fn apply_del_header(hdr_str: &str, name: &str) -> String {
 }
 
 #[must_use]
-pub fn eval_acl_term<S: ::std::hash::BuildHasher>(
+pub fn eval_acl_term(
     term: &ibex_config::AclTerm,
-    acls: &HashMap<String, Expr, S>,
+    acls: &ibex_sample::Acls,
     registry: &Registry,
     ctx: &SampleContext,
 ) -> bool {
@@ -2205,9 +2205,9 @@ pub enum AclEvalResult {
 }
 
 #[must_use]
-pub fn eval_acl_term_extended<S: ::std::hash::BuildHasher>(
+pub fn eval_acl_term_extended(
     term: &ibex_config::AclTerm,
-    acls: &HashMap<String, Expr, S>,
+    acls: &ibex_sample::Acls,
     registry: &Registry,
     ctx: &SampleContext,
     req_bytes: &[u8],
@@ -2293,9 +2293,9 @@ pub fn eval_acl_term_extended<S: ::std::hash::BuildHasher>(
 }
 
 #[must_use]
-pub fn eval_acl_condition_extended<S: ::std::hash::BuildHasher>(
+pub fn eval_acl_condition_extended(
     cond: &ibex_config::AclCondition,
-    acls: &HashMap<String, Expr, S>,
+    acls: &ibex_sample::Acls,
     registry: &Registry,
     ctx: &SampleContext,
     req_bytes: &[u8],
@@ -2349,9 +2349,9 @@ pub fn combine_condition(
 }
 
 #[must_use]
-pub fn eval_acl_condition<S: ::std::hash::BuildHasher>(
+pub fn eval_acl_condition(
     cond: &ibex_config::AclCondition,
-    acls: &HashMap<String, Expr, S>,
+    acls: &ibex_sample::Acls,
     registry: &Registry,
     ctx: &SampleContext,
 ) -> bool {

@@ -1,0 +1,108 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
+
+//! A proxy's named ACLs.
+//!
+//! `HAProxy` looks a name up in the proxy's own ACLs first (`find_acl_by_name`) and then
+//! in the predefined ones (`find_acl_default`, `default_acl_list` in src/acl.c), which
+//! exist once for the process. Ibex used to compile the 23 predefined ACLs into every
+//! proxy, about 20 KB each: 200 MB at 10,000 backends (T175). They are now compiled once
+//! and shared, and a proxy holds only the ACLs it declares.
+
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
+use crate::expr::Expr;
+
+/// `HAProxy`'s predefined ACLs (`default_acl_list`, src/acl.c), by name.
+pub const PREDEFINED_ACLS: &[(&str, &str)] = &[
+    ("TRUE", "always_true"),
+    ("WAIT_END", "wait_end"),
+    ("FALSE", "always_false"),
+    ("LOCALHOST", "src 127.0.0.1/8 ::1"),
+    ("HTTP", "req.proto_http"),
+    ("HTTP_1.0", "req.ver 1.0"),
+    ("HTTP_1.1", "req.ver 1.1"),
+    ("HTTP_2.0", "req.ver 2.0"),
+    ("HTTP_3.0", "req.ver 3.0"),
+    ("METH_CONNECT", "method CONNECT"),
+    ("METH_DELETE", "method DELETE"),
+    ("METH_GET", "method GET HEAD"),
+    ("METH_HEAD", "method HEAD"),
+    ("METH_OPTIONS", "method OPTIONS"),
+    ("METH_POST", "method POST"),
+    ("METH_PUT", "method PUT"),
+    ("METH_TRACE", "method TRACE"),
+    ("HTTP_URL_ABS", "url -m reg ^[^/:]*://"),
+    ("HTTP_URL_SLASH", "url -m beg /"),
+    ("HTTP_URL_STAR", "url *"),
+    ("HTTP_CONTENT", "req.hdr_val(content-length) gt 0"),
+    ("REQ_CONTENT", "req.len gt 0"),
+    ("RDP_COOKIE", "req.rdp_cookie_cnt gt 0"),
+];
+
+/// The predefined ACLs, compiled on first use and shared by every proxy and thread.
+fn predefined() -> &'static HashMap<&'static str, Expr> {
+    static PREDEFINED: OnceLock<HashMap<&'static str, Expr>> = OnceLock::new();
+    PREDEFINED.get_or_init(|| {
+        PREDEFINED_ACLS
+            .iter()
+            .filter_map(|&(name, expr)| Some((name, Expr::parse(expr).ok()?)))
+            .collect()
+    })
+}
+
+/// A proxy's ACLs by name: its own, then the predefined ones.
+#[derive(Debug, Clone, Default)]
+pub struct Acls {
+    own: HashMap<String, Expr>,
+}
+
+impl Acls {
+    /// The proxy's own ACLs from its `acl <name> <expr>` lines, in order. A name declared
+    /// on several lines is one ACL matching if any line does; it replaces a predefined ACL
+    /// of that name. A line whose expression does not parse is skipped (the configuration
+    /// check refuses it first).
+    pub fn compile<'a>(lines: impl IntoIterator<Item = (&'a str, &'a str)>) -> Self {
+        // Compiled with the configuration, so that no request pays for it.
+        let _ = predefined();
+        let mut own: HashMap<String, Expr> = HashMap::new();
+        for (name, text) in lines {
+            let Ok(expr) = Expr::parse(text) else { continue };
+            match own.get_mut(name) {
+                Some(first) => first.alternates.push(expr),
+                None => {
+                    own.insert(name.to_string(), expr);
+                }
+            }
+        }
+        Self { own }
+    }
+
+    /// The ACL named `name`: the proxy's own, else the predefined one.
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<&Expr> {
+        self.own.get(name).or_else(|| predefined().get(name))
+    }
+
+    /// Whether `name` names an ACL, the proxy's own or a predefined one.
+    #[must_use]
+    pub fn contains_key(&self, name: &str) -> bool {
+        self.get(name).is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn own_acls_replace_predefined_ones_and_alternate() {
+        let acls = Acls::compile([("TRUE", "always_false"), ("TRUE", "always_true"), ("x", "src 10.0.0.1")]);
+        assert_eq!(acls.get("TRUE").map(|e| e.alternates.len()), Some(1));
+        assert!(acls.contains_key("x"));
+        assert!(acls.contains_key("METH_GET"));
+        assert!(!acls.contains_key("nope"));
+        assert!(Acls::default().get("HTTP_1.1").is_some());
+    }
+}
