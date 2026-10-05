@@ -757,6 +757,12 @@ impl Proxy {
 }
 
 impl ProxyStats {
+    /// `clear counters` without `all`: the maxima fall back to what is current now.
+    pub fn clear_max(&self) {
+        let act = self.act_conn.load(Ordering::Relaxed);
+        self.max_conn.store(act, Ordering::Relaxed);
+    }
+
     pub fn clear(&self) {
         self.cum_conn.store(0, Ordering::Relaxed);
         let act = self.act_conn.load(Ordering::Relaxed);
@@ -802,6 +808,11 @@ pub struct ProxyIdInfo {
     /// What `show servers state` reports as each server's `srv_check_health` while no check
     /// runs on it; empty when that is 0 for all (see [`Proxy::server_init_health`]).
     pub server_init_health: Vec<u32>,
+    /// Which servers the configuration disabled (`SRV_ADMF_CMAINT`, 4 in `show servers state`
+    /// whatever the CLI does afterwards); empty when none (see [`Proxy::server_cmaint`]).
+    pub server_cmaint: Vec<bool>,
+    /// Each server's `econ`: the requests whose connection attempts all failed, the last
+    /// attempt having been to that server (see [`count_connect_failure`]).
     /// Each listener's numeric id (`luid`) by `bind` line, as `so_id` reads it.
     pub listener_ids: Vec<u32>,
     /// `pool-max-conn`, `pool-low-conn` and `pool-purge-delay` per server; empty when every
@@ -1025,6 +1036,12 @@ impl Proxy {
     #[must_use]
     pub fn server_puid(&self, idx: usize) -> u32 {
         self.ids.server_puids.get(idx).copied().unwrap_or_else(|| u32::try_from(idx + 1).unwrap_or(u32::MAX))
+    }
+
+    /// Whether the configuration disabled the server at `idx` (`SRV_ADMF_CMAINT`).
+    #[must_use]
+    pub fn server_cmaint(&self, idx: usize) -> bool {
+        self.ids.server_cmaint.get(idx).copied().unwrap_or(false)
     }
 
     /// Whether the server at `idx` has an `id` of its own (`SRV_F_FORCED_ID`).
@@ -2300,6 +2317,11 @@ fn server_init_health(count: usize, extras: &ibex_config::ast::ServerExtras) -> 
     health
 }
 
+/// The flags for [`Proxy::server_cmaint`]: empty when no server is `disabled` in the file.
+fn server_cmaint(servers: &[ibex_config::Server]) -> Vec<bool> {
+    if servers.iter().any(|s| s.disabled) { servers.iter().map(|s| s.disabled).collect() } else { Vec::new() }
+}
+
 /// The flags for [`Proxy::server_forced_ids`]: empty when none asked for an id.
 fn server_forced_ids(count: usize, extras: &ibex_config::ast::ServerExtras) -> Vec<bool> {
     let mut forced = Vec::new();
@@ -2372,6 +2394,7 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, list
             server_puids: server_puids(listen.servers.len(), &listen.server_extras),
             server_forced_ids: server_forced_ids(listen.servers.len(), &listen.server_extras),
             server_init_health: server_init_health(listen.servers.len(), &listen.server_extras),
+            server_cmaint: server_cmaint(&listen.servers),
             listener_ids: ibex_config::ast::listener_ids(&listen.binds),
             server_pool: pool_cfgs(&listen.servers),
             http_mode: listen.http_mode,
@@ -2644,6 +2667,7 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, be:
             server_puids: server_puids(be.servers.len(), &be.server_extras),
             server_forced_ids: server_forced_ids(be.servers.len(), &be.server_extras),
             server_init_health: server_init_health(be.servers.len(), &be.server_extras),
+            server_cmaint: server_cmaint(&be.servers),
             listener_ids: Vec::new(),
             server_pool: pool_cfgs(&be.servers),
             http_mode: be.http_mode,
@@ -2861,9 +2885,10 @@ fn append_forwarded_element(sess: &mut TcpSession, element: &str) {
     }
 }
 
-/// `reply`, a whole response, with `header` as the first header line.
-fn with_header_after_status_line(reply: &[u8], header: &str) -> Vec<u8> {
-    let at = reply.windows(2).position(|w| w == b"\r\n").map_or(reply.len(), |p| p + 2);
+/// `reply`, a whole response, with `header` as the last header line of its head
+/// (`http_action_auth` adds `www-authenticate` after the page's own headers).
+fn with_header_at_end_of_head(reply: &[u8], header: &str) -> Vec<u8> {
+    let at = reply.windows(4).position(|w| w == b"\r\n\r\n").map_or(reply.len(), |p| p + 2);
     let mut out = Vec::with_capacity(reply.len() + header.len() + 2);
     out.extend_from_slice(&reply[..at]);
     out.extend_from_slice(header.as_bytes());
@@ -5454,6 +5479,23 @@ fn clear_one(p: &Proxy) {
         c.srv.iter().for_each(crate::statcnt::TxnCounters::clear);
     }
     p.server_retr.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+}
+
+/// `clear counters server`: the counters of server `idx` of `p`, and no other.
+pub fn clear_server_counters(p: &Proxy, idx: usize) {
+    p.server_retr.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&idx);
+}
+
+/// `clear counters` without `all`: the maxima of every proxy, nothing else.
+pub fn clear_proxy_maxima(proxies: &[Proxy]) {
+    for p in proxies {
+        p.stats.iter().for_each(ProxyStats::clear_max);
+        if let Some(c) = p.ids.tc.get() {
+            c.fe.clear_max();
+            c.be.clear_max();
+            c.srv.iter().for_each(crate::statcnt::TxnCounters::clear_max);
+        }
+    }
 }
 
 /// Clears traffic and error counters for a specific proxy, or all proxies if `target` is `None` or `"all"`.
@@ -8135,20 +8177,62 @@ impl EngineDispatcher<'_> {
                                 build_templated_error_response(401, content_type, lf_string, &make_ctx!(sess), registry)
                             }
                         };
-                        let resp = with_header_after_status_line(&page, &format!("www-authenticate: Basic realm=\"{realm}\""));
+                        let resp = with_header_at_end_of_head(&page, &format!("www-authenticate: Basic realm=\"{realm}\""));
                         for_tracked(proxies, sess, |data| data.count_err());
                         send_proxy_reply(sess, &proxies[..], proxy_idx, pages_idx, &resp);
                         return Ok(RuleFlow::Replied);
                     }
-                    ibex_config::HttpReqAction::Redirect { location, prefix, code, .. } => {
-                        let status_code = code.unwrap_or(302);
-                        let loc = location.as_deref().or(prefix.as_deref()).unwrap_or("/");
-                        let formatted_loc = format_sample_string(loc, &make_ctx!(sess), registry);
-                        let reason = status_reason(status_code);
-                        let resp = format!(
-                            "HTTP/1.1 {status_code} {reason}\r\nLocation: {formatted_loc}\r\nContent-Length: 0\r\n\r\n"
+                    ibex_config::HttpReqAction::Redirect(r) => {
+                        // `http_apply_redirect_rule` (src/http_ana.c).
+                        let ctx = make_ctx!(sess);
+                        let target = format_sample_string(&r.target, &ctx, registry);
+                        let uri = sess.req_uri.as_deref().unwrap_or("/");
+                        let (pfx, path, query) = split_uri(uri);
+                        let query_part = if query.is_empty() { String::new() } else { format!("?{query}") };
+                        let mut loc = match r.kind {
+                            ibex_config::RedirectKind::Location => {
+                                let mut l = target;
+                                if r.keep_query && !query.is_empty() {
+                                    l.push(if l.contains('?') { '&' } else { '?' });
+                                    l.push_str(query);
+                                }
+                                l
+                            }
+                            ibex_config::RedirectKind::Prefix => {
+                                format!("{target}{path}{}", if r.drop_query { "" } else { &query_part })
+                            }
+                            ibex_config::RedirectKind::Scheme => {
+                                let mut host = format_sample_string("%[req.hdr(host)]", &ctx, registry);
+                                if host.is_empty() {
+                                    host = pfx.split_once("://").map(|(_, a)| a.to_string()).unwrap_or_default();
+                                }
+                                format!("{target}://{host}{path}{}", if r.drop_query { "" } else { &query_part })
+                            }
+                        };
+                        if r.append_slash && r.kind != ibex_config::RedirectKind::Location && !loc.ends_with('/') {
+                            loc.push('/');
+                        }
+                        if loc.is_empty() && r.ignore_empty {
+                            continue;
+                        }
+                        let mut reply = format!(
+                            "HTTP/1.1 {} {}\r\ncontent-length: 0\r\nlocation: {loc}\r\n",
+                            r.code,
+                            status_reason(r.code)
                         );
-                        send_proxy_reply(sess, &proxies[..], proxy_idx, pages_idx, resp.as_bytes());
+                        if matches!(r.code, 302 | 303 | 307) {
+                            reply.push_str("cache-control: no-cache\r\n");
+                        }
+                        match &r.cookie {
+                            Some(ibex_config::RedirectCookie::Set(c)) => reply.push_str(&format!("set-cookie: {c}; path=/;\r\n")),
+                            Some(ibex_config::RedirectCookie::SetFmt(f)) => {
+                                reply.push_str(&format!("set-cookie: {}; path=/;\r\n", format_sample_string(f, &ctx, registry)));
+                            }
+                            Some(ibex_config::RedirectCookie::Clear(n)) => reply.push_str(&format!("set-cookie: {n}; path=/; Max-Age=0;\r\n")),
+                            None => {}
+                        }
+                        reply.push_str("\r\n");
+                        send_proxy_reply(sess, &proxies[..], proxy_idx, pages_idx, reply.as_bytes());
                         return Ok(RuleFlow::Replied);
                     }
                     ibex_config::HttpReqAction::SetPath { fmt } => {
@@ -8163,21 +8247,19 @@ impl EngineDispatcher<'_> {
                         }
                     }
                     ibex_config::HttpReqAction::ReplacePath { regex, repl } => {
-                        let result = {
+                        let step = {
                             let current_uri = sess.req_uri.as_deref().unwrap_or("/");
                             let (pfx, path, query) = split_uri(current_uri);
-                            let rust_repl = translate_backreferences(repl);
-                            if let Ok(re) = ibex_regex::UserRegex::cached(regex) {
-                                let new_path = re.replace_all(path, &rust_repl).to_string();
-                                let rebuilt = rebuild_uri(pfx, &new_path, query);
-                                Some((new_path, rebuilt))
-                            } else {
-                                None
-                            }
+                            replace_uri_part(path, regex, repl, &make_ctx!(sess), registry)
+                                .map(|r| r.map(|new_path| rebuild_uri(pfx, &new_path, query)))
                         };
-                        if let Some((new_path, rebuilt)) = result {
-                            if !req_set_uri(sess, rebuilt) && STRICT_MODE.get() {
-                                return Err(500);
+                        match step {
+                            None => {}
+                            Some(Err(())) => return Err(500),
+                            Some(Ok(rebuilt)) => {
+                                if !req_set_uri(sess, rebuilt) && STRICT_MODE.get() {
+                                    return Err(500);
+                                }
                             }
                         }
                     }
@@ -8193,38 +8275,35 @@ impl EngineDispatcher<'_> {
                         }
                     }
                     ibex_config::HttpReqAction::ReplacePathq { regex, repl } => {
-                        let result = {
+                        let step = {
                             let current_uri = sess.req_uri.as_deref().unwrap_or("/");
                             let (pfx, path, query) = split_uri(current_uri);
                             let pathq = if query.is_empty() { path.to_string() } else { format!("{path}?{query}") };
-                            let rust_repl = translate_backreferences(repl);
-                            if let Ok(re) = ibex_regex::UserRegex::cached(regex) {
-                                let new_pathq = re.replace_all(&pathq, &rust_repl).to_string();
-                                let rebuilt = format!("{pfx}{new_pathq}");
-                                Some(rebuilt)
-                            } else {
-                                None
-                            }
+                            replace_uri_part(&pathq, regex, repl, &make_ctx!(sess), registry).map(|r| r.map(|n| format!("{pfx}{n}")))
                         };
-                        if let Some(rebuilt) = result {
-                            if !req_set_uri(sess, rebuilt) && STRICT_MODE.get() {
-                                return Err(500);
+                        match step {
+                            None => {}
+                            Some(Err(())) => return Err(500),
+                            Some(Ok(rebuilt)) => {
+                                if !req_set_uri(sess, rebuilt) && STRICT_MODE.get() {
+                                    return Err(500);
+                                }
                             }
                         }
                     }
                     ibex_config::HttpReqAction::ReplaceUri { regex, repl } => {
-                        // The whole target, scheme and authority included; the first match only.
-                        let rebuilt = {
+                        // The whole target, scheme and authority included.
+                        let step = {
                             let current_uri = sess.req_uri.as_deref().unwrap_or("/");
-                            let rust_repl = translate_backreferences(repl);
-                            ibex_regex::UserRegex::cached(regex)
-                                .ok()
-                                .filter(|re| re.is_match(current_uri))
-                                .map(|re| re.replace(current_uri, &rust_repl).to_string())
+                            replace_uri_part(current_uri, regex, repl, &make_ctx!(sess), registry)
                         };
-                        if let Some(rebuilt) = rebuilt {
-                            if !req_set_uri(sess, rebuilt) && STRICT_MODE.get() {
-                                return Err(500);
+                        match step {
+                            None => {}
+                            Some(Err(())) => return Err(500),
+                            Some(Ok(rebuilt)) => {
+                                if !req_set_uri(sess, rebuilt) && STRICT_MODE.get() {
+                                    return Err(500);
+                                }
                             }
                         }
                     }
@@ -9342,7 +9421,15 @@ pub(crate) fn format_sample_string(fmt: &str, ctx: &SampleContext, registry: &Re
                 }
                 if let Ok(expr) = Expr::cached(&expr_str) {
                     if let Some(smp) = expr.eval_sample(registry, ctx) {
-                        out.push_str(&sample_to_string(&smp));
+                        match &smp {
+                            // Written as text, a binary is cast with `c_bin2str`: it ends at the
+                            // first NUL.
+                            Sample::Bin(b) => {
+                                let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+                                out.push_str(&String::from_utf8_lossy(&b[..end]));
+                            }
+                            _ => out.push_str(&sample_to_string(&smp)),
+                        }
                     }
                 }
             } else if chars.peek() == Some(&'c') {
@@ -9391,25 +9478,6 @@ fn parse_timeout_val(s: &str) -> u32 {
         (s, 1u32)
     };
     num_str.parse::<u32>().unwrap_or(0).saturating_mul(factor)
-}
-
-fn translate_backreferences(repl: &str) -> String {
-    let mut out = String::with_capacity(repl.len());
-    let mut chars = repl.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            if let Some(&next_c) = chars.peek() {
-                if next_c.is_ascii_digit() {
-                    chars.next();
-                    out.push('$');
-                    out.push(next_c);
-                    continue;
-                }
-            }
-        }
-        out.push(c);
-    }
-    out
 }
 
 fn header_name_matches(header_key: &str, pattern: &str) -> bool {
@@ -10193,6 +10261,24 @@ fn res_htx_resize(free: usize, take: usize) -> bool {
     true
 }
 
+/// `http_action_replace_uri` (`src/http_act.c`) on `part` (the path, the path and query, or
+/// the whole target): `None` when `part` is empty or the regex does not match it; otherwise
+/// the replacement, a log-format string, expanded by [`exp_replace`] -- *all* of `part`
+/// becomes that, not only the matched text. `Err` for a replacement `exp_replace` cannot
+/// expand (a backslash cut short).
+fn replace_uri_part(
+    part: &str,
+    regex: &str,
+    repl: &str,
+    ctx: &SampleContext,
+    registry: &Registry,
+) -> Option<Result<String, ()>> {
+    let re = ibex_regex::UserRegex::cached(regex).ok()?;
+    let caps = re.captures(part)?;
+    let fmt = format_sample_string(repl, ctx, registry);
+    Some(exp_replace(&fmt, &caps).ok_or(()))
+}
+
 /// `exp_replace` (`src/regex.c`): `repl` with `\0`..`\9` replaced by that group of the
 /// match (nothing for a group that did not take part), `\xHH` by that byte -- computed as
 /// `HAProxy` computes it, which takes any two characters -- and a backslash before
@@ -10295,6 +10381,9 @@ fn res_action(
             }
             match cookie {
                 Some(ibex_config::RedirectCookie::Set(c)) => reply.push_str(&format!("set-cookie: {c}; path=/;\r\n")),
+                Some(ibex_config::RedirectCookie::SetFmt(f)) => {
+                    reply.push_str(&format!("set-cookie: {}; path=/;\r\n", format_sample_string(f, ctx, registry)));
+                }
                 Some(ibex_config::RedirectCookie::Clear(n)) => reply.push_str(&format!("set-cookie: {n}; path=/; Max-Age=0;\r\n")),
                 None => {}
             }

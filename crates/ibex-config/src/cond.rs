@@ -36,8 +36,9 @@ pub const REPORTED_VERSION: &str = "3.5.0";
 fn feature(name: &str) -> bool {
     // OPENSSL is answered true because the suite uses it to mean "this build terminates
     // TLS", not "OpenSSL is linked in" -- see the module comment. RUSTLS names the
-    // backend so a condition can ask which one directly.
-    matches!(name, "OPENSSL" | "RUSTLS")
+    // backend so a condition can ask which one directly. THREAD is what `-vv` of the
+    // reference says ("+THREAD"): Ibex runs worker threads.
+    matches!(name, "OPENSSL" | "RUSTLS" | "THREAD")
 }
 
 /// Compares dotted version strings, ignoring any `-dev`/`-rc` suffix.
@@ -175,149 +176,169 @@ fn predicate(name: &str, args: &[String], opts: &EnabledOpts) -> bool {
     }
 }
 
+/// Why a condition did not parse: `HAProxy`'s message and `errptr`, the byte of the
+/// expression it was reading when it gave up (`.if` prints it as "at position N" and under a
+/// caret).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CondError {
+    pub msg: String,
+    pub pos: usize,
+}
+
+/// `MAX_CFG_RECURSION` (`include/haproxy/defaults.h`).
+const MAX_RECURSION: i32 = 1024;
+
+/// `Ok(None)` is `HAProxy`'s "return 0": there is nothing here to parse, and whoever called
+/// reports it. `Err` carries a finished message and where it happened.
+type Parsed = Result<Option<bool>, CondError>;
+
 /// A recursive-descent parser over `!`, `&&`, `||`, parentheses, integers and predicates,
-/// shaped like `cfg_parse_cond_expr` in `src/cfgcond.c`. Spaces and tabs separate tokens;
-/// `&&` binds tighter than `||`. A term is evaluated as it is parsed and the whole
-/// expression is always parsed, so a malformed right-hand side is an error even when the
-/// left one decides the result.
+/// a port of `cfg_parse_cond_expr`, `cfg_parse_cond_and` and `cfg_parse_cond_term`
+/// (`src/cfgcond.c`) down to what each leaves in the text pointer when it fails, which is
+/// where the error is reported. Spaces and tabs separate tokens; `&&` binds tighter than
+/// `||`. A term is evaluated as it is parsed and the whole expression is always parsed, so a
+/// malformed right-hand side is an error even when the left one decides the result.
 struct Parser<'a> {
     s: &'a str,
-    i: usize,
     opts: EnabledOpts,
 }
 
-/// A parse failure: `HAProxy`'s message, and the byte offset it points at (`errptr`).
-struct CondErr {
-    msg: String,
-    at: usize,
-}
-
-/// `Ok(None)` is `HAProxy`'s "return 0": there is nothing here to parse, and whoever called
-/// reports the whole expression as unparsable. `Err` carries a finished message.
-type Parsed = Result<Option<bool>, CondErr>;
-
 impl<'a> Parser<'a> {
     fn new(s: &'a str, opts: EnabledOpts) -> Self {
-        Self { s, i: 0, opts }
+        Self { s, opts }
     }
 
-    fn rest(&self) -> &'a str {
-        &self.s[self.i..]
+    fn byte(&self, i: usize) -> Option<u8> {
+        self.s.as_bytes().get(i).copied()
     }
 
-    fn eat(&mut self, tok: &str) -> bool {
-        if self.rest().starts_with(tok) {
-            self.i += tok.len();
-            return true;
+    fn rest(&self, i: usize) -> &'a str {
+        self.s.get(i..).unwrap_or("")
+    }
+
+    fn blanks(&self, mut i: usize) -> usize {
+        while matches!(self.byte(i), Some(b' ' | b'\t')) {
+            i += 1;
         }
-        false
+        i
     }
 
-    /// `at`, moved past any spaces and tabs.
-    fn blanks(&self, mut at: usize) -> usize {
-        while matches!(self.s.as_bytes().get(at), Some(b' ' | b'\t')) {
-            at += 1;
-        }
-        at
+    fn err(&self, msg: String, pos: usize) -> CondError {
+        CondError { msg, pos }
     }
 
-    fn unparsable(&self, what: &str, at: usize) -> CondErr {
-        CondErr { msg: format!("unparsable conditional {what} '{}'", &self.s[at..]), at }
-    }
-
-    /// `expr := and ( '||' expr )?` (`cfg_parse_cond_expr`). `text` is where the expression
-    /// starts and, on success, the first character it did not take.
-    fn expr(&mut self, text: &mut usize) -> Parsed {
-        let mut at = *text;
-        if at >= self.s.len() {
+    /// `expr := and ( '||' expr )?`
+    fn expr(&self, text: &mut usize, depth: i32) -> Parsed {
+        let mut i = *text;
+        if i >= self.s.len() {
             return Ok(None);
         }
-        let Some(left) = self.and(&mut at)? else {
-            return Err(self.unparsable("expression", at));
+        if depth <= 0 {
+            return Err(self.err(format!("unparsable conditional expression '{}'", self.rest(i)), i));
+        }
+        let left = self.and(&mut i, depth - 1)?;
+        let Some(left) = left else {
+            return Err(self.err(format!("unparsable conditional expression '{}'", self.rest(i)), i));
         };
-        at = self.blanks(at);
-        *text = at;
-        if !self.s[at..].starts_with("||") {
+        i = self.blanks(i);
+        *text = i;
+        if !self.rest(i).starts_with("||") {
             return Ok(Some(left));
         }
-        at = self.blanks(at + 2);
-        let Some(right) = self.expr(&mut at)? else { return Ok(None) };
-        *text = at;
+        i = self.blanks(i + 2);
+        let Some(right) = self.expr(&mut i, depth - 1)? else { return Ok(None) };
+        *text = i;
         Ok(Some(left || right))
     }
 
-    /// `and := term ( '&&' and )?` (`cfg_parse_cond_and`).
-    fn and(&mut self, text: &mut usize) -> Parsed {
-        let mut at = *text;
-        if at >= self.s.len() {
+    /// `and := term ( '&&' and )?`
+    fn and(&self, text: &mut usize, depth: i32) -> Parsed {
+        let mut i = *text;
+        if i >= self.s.len() {
             return Ok(None);
         }
-        // `term` finds nothing only past the end, which the check above has ruled out.
-        let Some(left) = self.term(&mut at)? else { return Err(self.unparsable("sub-expression", at)) };
-        at = self.blanks(at);
-        *text = at;
-        if !self.s[at..].starts_with("&&") {
+        if depth <= 0 {
+            return Err(self.err(format!("unparsable conditional sub-expression '{}'", self.rest(i)), i));
+        }
+        let left = self
+            .term(&mut i, depth - 1)?
+            .ok_or_else(|| self.err(format!("unparsable conditional sub-expression '{}'", self.rest(i)), i))?;
+        i = self.blanks(i);
+        *text = i;
+        if !self.rest(i).starts_with("&&") {
             return Ok(Some(left));
         }
-        at = self.blanks(at + 2);
-        let Some(right) = self.and(&mut at)? else { return Ok(None) };
-        *text = at;
+        i = self.blanks(i + 2);
+        let Some(right) = self.and(&mut i, depth - 1)? else { return Ok(None) };
+        *text = i;
         Ok(Some(left && right))
     }
 
-    /// `term := '!'* ( integer | '(' expr ')' | predicate )` (`cfg_parse_cond_term`).
-    fn term(&mut self, text: &mut usize) -> Parsed {
+    /// `term := '!'* ( integer | '(' expr ')' | predicate )`
+    fn term(&self, text: &mut usize, depth: i32) -> Parsed {
         let start = *text;
-        let mut at = self.blanks(start);
-        if at >= self.s.len() {
+        let mut i = self.blanks(start);
+        if i >= self.s.len() {
             return Ok(None);
         }
+        let unparsable = || self.err(format!("unparsable conditional expression '{}'", self.rest(start)), start);
+        if depth <= 0 {
+            return Err(unparsable());
+        }
         let mut neg = false;
-        while self.s[at..].starts_with('!') {
+        while self.byte(i) == Some(b'!') {
             neg = !neg;
-            at = self.blanks(at + 1);
+            i = self.blanks(i + 1);
         }
 
-        self.i = at;
-        if let Some(v) = self.integer() {
-            *text = self.i;
+        if let Some((v, end)) = self.integer(i) {
+            *text = end;
             return Ok(Some((v != 0) != neg));
         }
 
-        if self.s[at..].starts_with('(') {
-            at = self.blanks(at + 1);
-            let Some(v) = self.expr(&mut at)? else { return Err(self.unparsable("expression", start)) };
-            at = self.blanks(at);
-            if !self.s[at..].starts_with(')') {
-                return Err(CondErr {
-                    msg: format!("expected ')' after conditional expression '{}'", &self.s[start..]),
-                    at: start,
-                });
+        if self.byte(i) == Some(b'(') {
+            i = self.blanks(i + 1);
+            let Some(v) = self.expr(&mut i, depth - 1)? else { return Err(unparsable()) };
+            i = self.blanks(i);
+            if self.byte(i) != Some(b')') {
+                return Err(self.err(format!("expected ')' after conditional expression '{}'", self.rest(start)), start));
             }
-            *text = self.blanks(at + 1);
+            *text = self.blanks(i + 1);
             return Ok(Some(v != neg));
         }
 
         // The word ends at a blank or a parenthesis, and must be a predicate as a whole.
-        let end = self.s[at..].find([' ', '(']).unwrap_or(self.s.len() - at);
-        let word = &self.s[at..at + end];
+        let word_len = self.rest(i).find([' ', '(']).unwrap_or(self.rest(i).len());
+        let word = &self.rest(i)[..word_len];
         let Some(&(name, nargs)) = PREDICATES.iter().find(|(n, _)| *n == word) else {
-            return Err(self.unparsable("expression", start));
+            return Err(unparsable());
         };
-        self.i = at + end;
-        let args = self.args(name, nargs)?;
-        *text = self.i;
-        Ok(Some(predicate(name, &args, &self.opts) != neg))
+        match self.arg_list(i + word_len, nargs) {
+            Ok((args, end)) => {
+                *text = end;
+                Ok(Some(predicate(name, &args, &self.opts) != neg))
+            }
+            Err((msg, err_arg, end)) => Err(self.err(
+                format!("{msg} in argument {err_arg} of predicate '{name}' used in conditional expression"),
+                end,
+            )),
+        }
     }
 
-    /// `strtol(s, &end, 0)`: optional sign, then `0x` hex, leading-`0` octal or decimal.
-    /// Nothing is consumed when there are no digits.
-    fn integer(&mut self) -> Option<i64> {
+    /// `strtol(s, &end, 0)` at `i`: optional sign, then `0x` hex, leading-`0` octal or decimal,
+    /// and where it ends. `None` when there are no digits.
+    fn integer(&self, i: usize) -> Option<(i64, usize)> {
         let b = self.s.as_bytes();
-        let mut j = self.i;
+        let mut j = i;
         let neg = match b.get(j) {
-            Some(b'-') => { j += 1; true }
-            Some(b'+') => { j += 1; false }
+            Some(b'-') => {
+                j += 1;
+                true
+            }
+            Some(b'+') => {
+                j += 1;
+                false
+            }
             _ => false,
         };
         let (radix, digits_at) = if b.get(j) == Some(&b'0')
@@ -340,54 +361,86 @@ impl<'a> Parser<'a> {
             return None;
         }
         let v = i64::from_str_radix(&self.s[digits_at..k], radix).unwrap_or(i64::MAX);
-        self.i = k;
-        Some(if neg { -v } else { v })
+        Some((if neg { -v } else { v }, k))
     }
 
-    /// The `( a, b )` after a predicate name: raw strings, split on `,`, closed by `)`, and
-    /// never trimmed. Without a `(` the predicate gets empty strings.
-    fn args(&mut self, name: &str, nargs: usize) -> Result<Vec<String>, CondErr> {
-        let unclosed = |p: &Self, arg: usize| {
-            let msg = if p.rest().is_empty() {
-                format!("expected ')' in argument {arg} of predicate '{name}' used in conditional expression")
-            } else {
-                format!("expected ')' before '{}' in argument {arg} of predicate '{name}' used in conditional expression", p.rest())
-            };
-            CondErr { msg, at: p.i }
-        };
-        if !self.eat("(") {
-            return Ok(vec![String::new(); nargs]);
+    /// `make_arg_list` (`src/arg.c`) for a predicate of `nbarg` string arguments, all of them
+    /// mandatory: the `( a, b )` after its name, where an argument runs to the next `,` or
+    /// `)` outside quotes and `\` `'` `"` and a space can be escaped. Without a `(` the
+    /// arguments are empty. Returns the arguments and where the list ends, or HAProxy's
+    /// message, the number of the argument it names, and where it stopped.
+    fn arg_list(&self, from: usize, nbarg: usize) -> Result<(Vec<String>, usize), (String, usize, usize)> {
+        let b = self.s.as_bytes();
+        let mut i = from;
+        let empty = self.byte(i) != Some(b'(');
+        if !empty {
+            i += 1;
         }
-        let mut args = Vec::new();
-        if nargs == 0 {
-            if self.eat(")") {
-                return Ok(args);
+        let mut pos = 0;
+        let mut args: Vec<String> = Vec::new();
+        while nbarg > 0 && pos < nbarg {
+            let mut out: Vec<u8> = Vec::new();
+            let (mut squote, mut dquote) = (false, false);
+            while !empty && i < b.len() {
+                let c = b[i];
+                if c == b'"' && !squote {
+                    dquote = !dquote;
+                    i += 1;
+                } else if c == b'\'' && !dquote {
+                    squote = !squote;
+                    i += 1;
+                } else if c == b'\\' && !squote && i + 1 < b.len() {
+                    match b[i + 1] {
+                        e @ (b'\\' | b' ' | b'"' | b'\'') => {
+                            out.push(e);
+                            i += 2;
+                        }
+                        b'r' => {
+                            out.push(b'\r');
+                            i += 2;
+                        }
+                        b'n' => {
+                            out.push(b'\n');
+                            i += 2;
+                        }
+                        b't' => {
+                            out.push(b'\t');
+                            i += 2;
+                        }
+                        _ => {
+                            // A lone backslash.
+                            out.push(b'\\');
+                            i += 1;
+                        }
+                    }
+                } else if !squote && !dquote && (c == b',' || c == b')') {
+                    break;
+                } else {
+                    out.push(c);
+                    i += 1;
+                }
             }
-            return Err(unclosed(self, 0));
-        }
-        loop {
-            let end = self.rest().find([',', ')']).unwrap_or(self.rest().len());
-            args.push(self.rest()[..end].to_string());
-            self.i += end;
-            if self.eat(")") {
+            args.push(String::from_utf8_lossy(&out).into_owned());
+            pos += 1;
+            if empty || i >= b.len() || b[i] == b')' || pos >= nbarg {
                 break;
             }
-            if args.len() >= nargs || self.rest().is_empty() {
-                return Err(unclosed(self, 1));
+            i += 1; // the comma
+        }
+        if pos < nbarg {
+            return Err((format!("missing arguments (got {pos}/{nbarg}), type 'string' expected"), pos, i));
+        }
+        if !empty {
+            if b.get(i) == Some(&b')') {
+                i += 1;
+            } else {
+                let word = self.rest(i);
+                let msg = if word.is_empty() { "expected ')'".to_string() } else { format!("expected ')' before '{word}'") };
+                // The empty argument before a missing parenthesis already counted for one.
+                return Err((msg, if pos > 1 { pos - 1 } else { pos }, i));
             }
-            self.eat(",");
         }
-        if args.len() < nargs {
-            return Err(CondErr {
-                msg: format!(
-                    "missing arguments (got {}/{nargs}), type 'string' expected in argument {} of predicate '{name}' used in conditional expression",
-                    args.len(),
-                    args.len()
-                ),
-                at: self.i - 1,
-            });
-        }
-        Ok(args)
+        Ok((args, i))
     }
 }
 
@@ -401,21 +454,27 @@ pub fn eval(expr: &str) -> Option<bool> {
     eval_checked(expr, &EnabledOpts::default()).ok()
 }
 
-/// [`eval`] with the message `HAProxy` prints, and where it points.
-fn eval_checked(expr: &str, opts: &EnabledOpts) -> Result<bool, CondErr> {
-    let mut p = Parser::new(expr, *opts);
+/// `cfg_eval_condition`, with the message `HAProxy` prints and where it stopped. An empty
+/// expression is false here; [`eval_checked`] refuses it.
+fn eval_condition(expr: &str, opts: &EnabledOpts) -> Result<bool, CondError> {
+    let p = Parser::new(expr, *opts);
     let mut text = 0;
-    let Some(v) = p.expr(&mut text)? else {
-        return Err(CondErr { msg: format!("unparsable conditional expression '{expr}'"), at: text });
+    let Some(v) = p.expr(&mut text, MAX_RECURSION)? else {
+        return Err(p.err(format!("unparsable conditional expression '{expr}'"), text));
     };
-    let at = p.blanks(text);
-    if let Some(c) = expr[at..].chars().next() {
-        return Err(CondErr {
-            msg: format!("unexpected character '{c}' at the end of conditional expression '{expr}'"),
-            at,
-        });
+    text = p.blanks(text);
+    if let Some(c) = p.rest(text).chars().next() {
+        return Err(p.err(format!("unexpected character '{c}' at the end of conditional expression '{expr}'"), text));
     }
     Ok(v)
+}
+
+/// [`eval`] with the message `HAProxy` prints.
+fn eval_checked(expr: &str, opts: &EnabledOpts) -> Result<bool, String> {
+    if expr.is_empty() {
+        return Err("unparsable conditional expression ''".to_string());
+    }
+    eval_condition(expr, opts).map_err(|e| e.msg)
 }
 
 /// A `.if` / `.elif` condition (`cfg_eval_condition`): the words of the line, already split
@@ -424,20 +483,56 @@ fn eval_checked(expr: &str, opts: &EnabledOpts) -> Result<bool, CondErr> {
 ///
 /// # Errors
 ///
-/// The message `HAProxy` prints, when the condition does not parse: the problem, the position
-/// of the first bad character, the line again and a caret under that character.
-pub fn eval_if(expr: &str, directive: &str, opts: &EnabledOpts) -> Result<bool, String> {
+/// What `HAProxy` prints, when the condition does not parse: the message, and the byte
+/// of `expr` it stopped at.
+pub fn eval_if(expr: &str, opts: &EnabledOpts) -> Result<bool, CondError> {
     if expr.is_empty() {
         return Ok(false);
     }
-    eval_checked(expr, opts).map_err(|e| {
-        format!(
-            "{} in '{directive}' at position {}:\n  {directive} {expr}\n  {}^",
-            e.msg,
-            e.at + 1,
-            " ".repeat(e.at + directive.len() + 1)
-        )
-    })
+    eval_condition(expr, opts)
+}
+
+/// `sanitize_for_printing` (`src/tools.c`): `line` cut to `width` characters around `pos`,
+/// blanks as spaces and anything unprintable as `?`; the text, and where `pos` is in it.
+fn sanitize_for_printing(line: &str, pos: usize, width: usize) -> (String, usize) {
+    let bytes = line.as_bytes();
+    let (mut shift, mut start, mut limit) = (0, 0, width);
+    let mut out = String::new();
+    if pos >= width {
+        // Out of context: put `pos` in the middle.
+        shift = pos - width / 2;
+        start = shift + 3;
+        limit = width - 3;
+        out.push_str("...");
+    }
+    for &c in bytes.iter().skip(start) {
+        if out.len() >= limit {
+            break;
+        }
+        out.push(if c.is_ascii_whitespace() {
+            ' '
+        } else if c.is_ascii_graphic() {
+            char::from(c)
+        } else {
+            '?'
+        });
+    }
+    if limit < width {
+        out.push_str("...");
+    }
+    (out, pos - shift)
+}
+
+/// The text `HAProxy` prints for a `.if` or `.elif` (`word`, with the leading dot) whose
+/// condition `expr` failed to parse: the message, the position, the line and a caret under
+/// the byte it stopped at (`cfg_parse` in `src/cfgparse.c`).
+#[must_use]
+pub fn describe_error(word: &str, expr: &str, e: &CondError) -> String {
+    // `.if` shows 76 characters, `.elif` 74: what is left of an 80-column line.
+    let width = if word == ".if" { 76 } else { 74 };
+    let (shown, newpos) = sanitize_for_printing(expr, e.pos, width);
+    let indent = newpos + word.len() + 2;
+    format!("{} in '{word}' at position {}:\n  {word} {shown}\n  {:>indent$}", e.msg, e.pos + 1, "^")
 }
 
 /// The command-line half of `-cc`: what `parse_line` (`src/tools.c`) does to the argument
@@ -586,7 +681,7 @@ pub fn eval_cc(raw: &str) -> Result<bool, String> {
     if expr.is_empty() {
         return Ok(false);
     }
-    eval_checked(&expr, &EnabledOpts::default()).map_err(|e| format!("Failed to evaluate condition: {}", e.msg))
+    eval_checked(&expr, &EnabledOpts::default()).map_err(|e| format!("Failed to evaluate condition: {e}"))
 }
 
 #[cfg(test)]
@@ -614,6 +709,15 @@ mod tests {
         assert_eq!(eval("ssllib_name_startswith(wolfSSL)"), Some(false));
         assert_eq!(eval("ssllib_name_startswith(rustls)"), Some(true));
         assert_eq!(eval("openssl_version_atleast(1.1.1)"), Some(false));
+    }
+
+    /// `haproxy -cc 'feature(THREAD)'` exits 0 on the reference binary (3.5-dev8-885761-29,
+    /// "+THREAD" in `-vv`), and Ibex is multi-threaded: 407 lines of the reg-tests are
+    /// `.if feature(THREAD)` around `thread-groups`, which Ibex accepts (T146 item 17).
+    #[test]
+    fn threads_are_reported_present() {
+        assert_eq!(eval("feature(THREAD)"), Some(true));
+        assert_eq!(eval("feature(THREAD) && feature(OPENSSL)"), Some(true));
     }
 
     #[test]

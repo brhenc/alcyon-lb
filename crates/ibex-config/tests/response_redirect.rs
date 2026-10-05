@@ -71,8 +71,8 @@ fn the_lines_haproxy_refuses_are_refused_with_its_message() {
             "http-response redirect location /x bogus",
             "expects 'code', 'prefix', 'location', 'scheme', 'set-cookie', 'set-cookie-fmt', 'clear-cookie', 'drop-query', 'keep-query', 'ignore-empty' or 'append-slash' (was 'bogus').",
         ),
+        ("http-response redirect location /x set-cookie-fmt", "missing argument for 'set-cookie-fmt'."),
         // Accepted by HAProxy, not done by Ibex: refused rather than ignored.
-        ("http-response redirect location /x set-cookie-fmt a=%[var(txn.a)]", "not implemented"),
         ("http-response redirect location /x ignore-empty", "not implemented"),
     ] {
         let err = parse_config(&cfg(line)).err().unwrap_or_else(|| panic!("{line}: accepted")).to_string();
