@@ -21,7 +21,7 @@ use crate::check::{ServerCheckState, ServerStatus};
 use crate::engine::{Proxy, SessionArena};
 use crate::fdtab::Interest;
 use crate::mailbox::{Gather, Mailboxes, Msg, SessFilter, SessSnap};
-use crate::stats::format_show_stat_filtered;
+use crate::stats::format_show_stat_as;
 use ibex_sched::task::TaskRef;
 use ibex_sched::Tick;
 use std::fmt::Write as FmtWrite;
@@ -494,7 +494,7 @@ impl CliApplet {
                 self.is_done = true;
             }
         } else if cmd == "show info" || cmd.starts_with("show info ") {
-            self.handle_show_info(ctx);
+            self.handle_show_info(cmd, ctx);
         } else if cmd == "show env" {
             for (k, v) in std::env::vars() {
                 self.out_buf.extend_from_slice(format!("{k}={v}\n").as_bytes());
@@ -822,12 +822,21 @@ impl CliApplet {
         }
     }
 
-    fn handle_show_info(&mut self, ctx: &AppletContext) {
+    /// `show info [typed|json]`. `desc` and `float` change the output in ways Ibex does not
+    /// implement: they are refused rather than ignored.
+    fn handle_show_info(&mut self, cmd: &str, ctx: &AppletContext) {
+        let args: Vec<&str> = cmd.split_whitespace().skip(2).collect();
+        let fmt = Self::stat_format(&args);
+        if let Some(a) = args.iter().find(|a| matches!(**a, "desc" | "float")) {
+            self.finish_msg(&format!("'show info {a}' is not supported by Ibex."));
+            return;
+        }
         let active_conns: u32 = ctx.proxies.iter().map(|p| p.stats.iter().map(|s| s.act_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u32>()).sum();
         let max_conns: u32 = ctx.proxies.iter().map(|p| p.maxconn.get()).sum();
         let cum_conns: u64 = ctx.proxies.iter().map(|p| p.stats.iter().map(|s| s.cum_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()).sum();
         let cum_reqs: u64 = ctx.proxies.iter().filter_map(|p| p.ids.tc.get()).map(|c| c.fe.req_tot.load(std::sync::atomic::Ordering::Relaxed)).sum();
-        let info = crate::stats::format_show_info_counts(
+        let info = crate::stats::format_show_info_as(
+            fmt,
             ctx.start_time,
             ctx.pid,
             ctx.total_tasks,
@@ -838,9 +847,27 @@ impl CliApplet {
             cum_reqs,
         );
         self.out_buf.extend_from_slice(info.as_bytes());
+        self.end_stat_answer();
+    }
+
+    /// The format a `show info` / `show stat` command asks for (`json` wins over `typed`).
+    fn stat_format(args: &[&str]) -> crate::stats::StatFormat {
+        if args.contains(&"json") {
+            crate::stats::StatFormat::Json
+        } else if args.contains(&"typed") {
+            crate::stats::StatFormat::Typed
+        } else {
+            crate::stats::StatFormat::Csv
+        }
+    }
+
+    /// Ends a `show info` / `show stat` answer: the prompt in interactive mode, otherwise the
+    /// empty line `HAProxy` sends after the last row.
+    fn end_stat_answer(&mut self) {
         if self.interactive {
             self.out_buf.extend_from_slice(b"\n> ");
         } else {
+            self.out_buf.push(b'\n');
             self.is_done = true;
         }
     }
@@ -850,10 +877,16 @@ impl CliApplet {
         let mut type_filter = None;
         let mut sid_filter = None;
 
-        let parts: Vec<&str> = cmd.split_whitespace().collect();
-        // HAProxy answers `typed` and `json` in those formats; Ibex has neither (T222), and
-        // CSV in their place would look like an answer to the question.
-        let unsupported = parts.iter().skip(2).any(|p| matches!(*p, "typed" | "json"));
+        // `show stat [domain <d>] [{<iid>|<proxy>} <type> <sid>] [typed|json] [desc] [up|no-maint]`:
+        // the keywords can come anywhere after `stat`; what is left are the three filters.
+        let all: Vec<&str> = cmd.split_whitespace().skip(2).collect();
+        let fmt = Self::stat_format(&all);
+        if all.contains(&"desc") {
+            self.finish_msg("'show stat desc' is not supported by Ibex.");
+            return;
+        }
+        let mut parts: Vec<&str> = vec!["show", "stat"];
+        parts.extend(all.iter().copied().filter(|p| !matches!(*p, "typed" | "json")));
         // parts = ["show", "stat", "be", "4", "-1"]
         if parts.len() >= 3 {
             if let Ok(id) = parts[2].parse::<i32>() {
@@ -873,19 +906,9 @@ impl CliApplet {
             sid_filter = parts[4].parse::<i32>().ok();
         }
 
-        let stat_csv = if unsupported {
-            "'show stat typed' and 'show stat json' are not supported by Ibex.\n".to_string()
-        } else {
-            format_show_stat_filtered(ctx.proxies, ctx.checks, ctx.pid, iid_filter, type_filter, sid_filter)
-        };
+        let stat_csv = format_show_stat_as(ctx.proxies, ctx.checks, ctx.pid, iid_filter, type_filter, sid_filter, fmt);
         self.out_buf.extend_from_slice(stat_csv.as_bytes());
-        if self.interactive {
-            self.out_buf.extend_from_slice(b"\n> ");
-        } else {
-            // The empty line that ends an answer (`HAProxy` sends it after the last row).
-            self.out_buf.push(b'\n');
-            self.is_done = true;
-        }
+        self.end_stat_answer();
     }
 
     fn handle_show_table(&mut self, cmd: &str, ctx: &AppletContext) {

@@ -48,6 +48,7 @@ pub mod stats;
 pub mod statcnt;
 pub mod xprt;
 pub mod stats_html;
+pub mod stats_typed;
 pub mod systemd;
 pub mod lifecycle;
 pub mod handover;
@@ -73,7 +74,7 @@ pub use raw::Io;
 pub use rule_exprs::validate_rule_exprs;
 pub use xprt::{accept_tls, connect_tls, ClientXprt, ServerXprt, TlsConn};
 pub use stats::{
-    format_show_info, format_show_stat, format_show_stat_filtered, stats_csv_header, StatRow,
+    format_show_info, format_show_stat, format_show_stat_as, format_show_stat_filtered, stats_csv_header, StatRow,
     STAT_FIELDS, STAT_FIELD_COUNT,
 };
 pub use stats_html::{parse_admin_action, render_stats_html, render_stats_html_for, render_stats_json, AdminAction};

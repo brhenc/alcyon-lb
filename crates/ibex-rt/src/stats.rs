@@ -13,6 +13,7 @@ use crate::engine::Proxy;
 pub use crate::stats_html::render_stats_html;
 use std::time::Instant;
 use crate::cpu;
+pub use crate::stats_typed::StatFormat;
 
 /// Global CPU usage threshold for flood detection (tune.glitches.kill.cpu-usage)
 pub static GLITCHES_KILL_CPU_USAGE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
@@ -225,6 +226,80 @@ impl StatRow {
         }
     }
 
+    /// Sets `name` to `value` unless the row already has one.
+    fn default_to(&mut self, name: &str, value: &str) {
+        if let Some(i) = STAT_FIELDS.iter().position(|f| *f == name) {
+            if self.fields[i].is_empty() {
+                self.fields[i] = value.to_string();
+            }
+        }
+    }
+
+    /// The columns `HAProxy` prints for an object and Ibex does not track: the per-protocol
+    /// and TLS module counters (`h1_*`, `h2_*`, `ssl_*`), the byte counters by direction,
+    /// the connection-pool gauges of a server, `lastsess`, `srid`, the session and request
+    /// counts by protocol, `intercepted` and the backend's `agg_*`. They get what `HAProxy`
+    /// prints for an object that has seen nothing (0, `lastsess` -1), so a consumer that
+    /// reads them by name finds them (T245). `obj` is `F`, `B` or `S`.
+    fn default_untracked(&mut self, obj: char, http: bool, algo: &str) {
+        for n in ["reqbin", "reqbout", "resbin", "resbout"] {
+            self.default_to(n, "0");
+        }
+        // Module counters: every column after the `-` separator.
+        let module: Vec<&str> = STAT_FIELDS[120..].to_vec();
+        match obj {
+            'F' => {
+                for n in &module {
+                    self.default_to(n, "0");
+                }
+                for n in ["sess_other", "h1sess", "h2sess", "h3sess", "req_other", "h1req", "h2req", "h3req"] {
+                    self.default_to(n, "0");
+                }
+                if http {
+                    self.default_to("cache_hint_hits", "0");
+                    self.default_to("intercepted", "0");
+                }
+            }
+            'B' => {
+                for n in &module {
+                    self.default_to(n, "0");
+                }
+                for n in ["agg_server_status", "agg_server_check_status", "agg_check_status"] {
+                    self.default_to(n, "0");
+                }
+                self.default_to("lastsess", "-1");
+                self.default_to("algo", algo);
+                if http {
+                    self.default_to("cache_hint_hits", "0");
+                }
+            }
+            _ => {
+                for n in module.iter().filter(|n| n.starts_with("ssl_")) {
+                    self.default_to(n, "0");
+                }
+                self.default_to("lastsess", "-1");
+                for n in ["srid", "priv_idle_cur", "srv_icur", "idle_conn_cur", "safe_conn_cur", "used_conn_cur", "need_conn_est"] {
+                    self.default_to(n, "0");
+                }
+            }
+        }
+    }
+
+    /// Appends the row in `fmt`; the CSV row is what [`StatRow::finish`] returns.
+    pub(crate) fn emit(&self, out: &mut String, fmt: StatFormat) {
+        match fmt {
+            StatFormat::Csv => {
+                // `HAProxy` ends every row with a comma after the last column.
+                let mut row = self.finish();
+                if !row.ends_with(",\n") {
+                    row.insert(row.len() - 1, ',');
+                }
+                out.push_str(&row);
+            }
+            _ => crate::stats_typed::emit_stat_row(out, &self.fields, fmt),
+        }
+    }
+
     #[must_use]
     pub fn finish(&self) -> String {
         let mut s = self.fields.join(",");
@@ -257,6 +332,52 @@ pub fn format_show_info_counts(
     cum_conns: u64,
     cum_reqs: u64,
 ) -> String {
+    let pairs = show_info_pairs(start_time, pid, total_tasks, run_queue_len, active_conns, max_conns, cum_conns, cum_reqs);
+    crate::stats_typed::render_info(&pairs, StatFormat::Csv)
+}
+
+/// [`format_show_info_counts`] as `typed` lines or JSON (`show info typed|json`).
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn format_show_info_as(
+    fmt: StatFormat,
+    start_time: Instant,
+    pid: u32,
+    total_tasks: usize,
+    run_queue_len: usize,
+    active_conns: u32,
+    max_conns: u32,
+    cum_conns: u64,
+    cum_reqs: u64,
+) -> String {
+    let pairs = show_info_pairs(start_time, pid, total_tasks, run_queue_len, active_conns, max_conns, cum_conns, cum_reqs);
+    crate::stats_typed::render_info(&pairs, fmt)
+}
+
+/// This worker's identifier (`Worker_id`): a random UUID, drawn once.
+fn worker_id() -> &'static str {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        std::fs::read_to_string("/proc/sys/kernel/random/uuid").map(|u| u.trim().to_string()).unwrap_or_else(|_| "00000000-0000-4000-8000-000000000000".to_string())
+    })
+}
+
+/// The `show info` fields in HAProxy's order. Fields HAProxy leaves out when unset
+/// (`description`, `Master_id`) are left out: Ibex has no `global description` and no
+/// master process. Fields Ibex does not track (`Memmax_*`, the pool sizes, `Jobs`,
+/// `Listeners`, `TotalBytesOut`, the SSL and compression rates, ...) print 0 where
+/// HAProxy prints a measurement.
+#[allow(clippy::too_many_arguments)]
+fn show_info_pairs(
+    start_time: Instant,
+    pid: u32,
+    total_tasks: usize,
+    run_queue_len: usize,
+    active_conns: u32,
+    max_conns: u32,
+    cum_conns: u64,
+    cum_reqs: u64,
+) -> Vec<(&'static str, String)> {
     // `Ulimit-n` and `Maxsock`: as the startup settled them (`globalconn::apply_nofile_limit`),
     // or else the descriptors the process may hold (`getrlimit`).
     let nofile = rustix::process::getrlimit(rustix::process::Resource::Nofile).current.unwrap_or(0);
@@ -266,185 +387,98 @@ pub fn format_show_info_counts(
     let maxconn = if crate::globalconn::max() > 0 { crate::globalconn::max() } else { max_conns };
     let hard_maxconn = if crate::globalconn::hard() > 0 { crate::globalconn::hard() } else { max_conns };
     let nbthread = NBTHREAD.load(std::sync::atomic::Ordering::Relaxed).max(1);
-    let elapsed = start_time.elapsed();
-    let total_secs = elapsed.as_secs();
-    let days = total_secs / 86400;
-    let hours = (total_secs % 86400) / 3600;
+    let total_secs = start_time.elapsed().as_secs();
+    let (days, hours, mins, secs) = (total_secs / 86400, (total_secs % 86400) / 3600, (total_secs % 3600) / 60, total_secs % 60);
+    let start_sec = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs().saturating_sub(total_secs));
     let idle_pct = cpu::get_idle_pct();
-    let mins = (total_secs % 3600) / 60;
-    let secs = total_secs % 60;
-
-    let dropped_logs = crate::syslog::dropped_logs();
-    format!(
-        "Name: Ibex
-\
-         Version: 0.1.0
-\
-         Release_date: 2026/09/21
-\
-         Nbthread: {nbthread}
-\
-         Nbproc: 1
-\
-         Process_num: 1
-\
-         Pid: {pid}
-\
-         Uptime: {days}d {hours}h{mins:02}m{secs:02}s
-\
-         Uptime_sec: {total_secs}
-\
-         Memmax_MB: 0
-\
-         PoolAlloc_MB: 0
-\
-         PoolUsed_MB: 0
-\
-         PoolFailed: 0
-\
-         Ulimit-n: {ulimit_n}
-\
-         Maxsock: {maxsock}
-\
-         Maxconn: {maxconn}
-\
-         Hard_maxconn: {hard_maxconn}
-\
-         CurrConns: {active_conns}
-\
-         CumConns: {cum_conns}
-\
-         CumReq: {cum_reqs}
-\
-         MaxSslConns: 0
-\
-         CurrSslConns: 0
-\
-         CumSslConns: 0
-\
-         Maxpipes: 0
-\
-         PipesUsed: 0
-\
-         PipesFree: 0
-\
-         ConnRate: 0
-\
-         ConnRateLimit: 0
-\
-         MaxConnRate: 0
-\
-         SessRate: 0
-\
-         SessRateLimit: 0
-\
-         MaxSessRate: 0
-\
-         SslRate: 0
-\
-         SslRateLimit: 0
-\
-         MaxSslRate: 0
-\
-         SslFrontendKeyRate: 0
-\
-         SslFrontendMaxKeyRate: 0
-\
-         SslFrontendSessionReuse_pct: 0
-\
-         SslBackendKeyRate: 0
-\
-         SslBackendMaxKeyRate: 0
-\
-         SslCacheLookups: 0
-\
-         SslCacheMisses: 0
-\
-         CompressBpsIn: 0
-\
-         CompressBpsOut: 0
-\
-         CompressBpsRateLim: 0
-\
-         ZlibMemUsage: 0
-\
-         MaxZlibMemUsage: 0
-\
-         Tasks: {total_tasks}
-\
-         Run_queue: {run_queue_len}
-\
-         Idle_pct: {idle_pct}
-\
-         node: ibex
-\
-         description: Ibex Router
-\
-         Stopping: 0
-\
-         Jobs: 0
-\
-         Unstoppable Jobs: 0
-\
-         Listeners: 0
-\
-         ActivePeers: 0
-\
-         ConnectedPeers: 0
-\
-         DroppedLogs: {dropped_logs}
-\
-         BusyPolling: 0
-\
-         FailedResolutions: 0
-\
-         TotalBytesOut: 0
-\
-         TotalSplicedBytesOut: 0
-\
-         BytesOutRate: 0
-\
-         DebugCommandsIssued: 0
-\
-         CumRecvLogs: 0
-\
-         Build info: 0.1.0
-\
-         Memmax_bytes: 0
-\
-         PoolAlloc_bytes: 0
-\
-         PoolUsed_bytes: 0
-\
-         Start_time_sec: 0
-\
-         Tainted: 0
-\
-         TotalWarnings: 0
-\
-         MaxconnReached: 0
-\
-         BootTime_ms: 0
-\
-         Niced_tasks: 0
-\
-         CurrStreams: 0
-\
-         CumStreams: 0
-\
-         BlockedTrafficWarnings: 0
-\
-         PatternsAdded: 0
-\
-         PatternsFreed: 0
-\
-         NbThreadGroups: 0
-\
-         Master_id: master
-\
-         Worker_id: worker
-"
-    )
+    let node = std::fs::read_to_string("/proc/sys/kernel/hostname").map(|h| h.trim().to_string()).unwrap_or_default();
+    let zero = || "0".to_string();
+    vec![
+        ("Name", "Ibex".to_string()),
+        ("Version", "0.1.0".to_string()),
+        ("Release_date", "2026/09/21".to_string()),
+        ("Nbthread", nbthread.to_string()),
+        ("Nbproc", "1".to_string()),
+        ("Process_num", "1".to_string()),
+        ("Pid", pid.to_string()),
+        ("Uptime", format!("{days}d {hours}h{mins:02}m{secs:02}s")),
+        ("Uptime_sec", total_secs.to_string()),
+        ("Memmax_MB", zero()),
+        ("PoolAlloc_MB", zero()),
+        ("PoolUsed_MB", zero()),
+        ("PoolFailed", zero()),
+        ("Ulimit-n", ulimit_n.to_string()),
+        ("Maxsock", maxsock.to_string()),
+        ("Maxconn", maxconn.to_string()),
+        ("Hard_maxconn", hard_maxconn.to_string()),
+        ("CurrConns", active_conns.to_string()),
+        ("CumConns", cum_conns.to_string()),
+        ("CumReq", cum_reqs.to_string()),
+        ("MaxSslConns", zero()),
+        ("CurrSslConns", zero()),
+        ("CumSslConns", zero()),
+        ("Maxpipes", zero()),
+        ("PipesUsed", zero()),
+        ("PipesFree", zero()),
+        ("ConnRate", zero()),
+        ("ConnRateLimit", zero()),
+        ("MaxConnRate", zero()),
+        ("SessRate", zero()),
+        ("SessRateLimit", zero()),
+        ("MaxSessRate", zero()),
+        ("SslRate", zero()),
+        ("SslRateLimit", zero()),
+        ("MaxSslRate", zero()),
+        ("SslFrontendKeyRate", zero()),
+        ("SslFrontendMaxKeyRate", zero()),
+        ("SslFrontendSessionReuse_pct", zero()),
+        ("SslBackendKeyRate", zero()),
+        ("SslBackendMaxKeyRate", zero()),
+        ("SslCacheLookups", zero()),
+        ("SslCacheMisses", zero()),
+        ("CompressBpsIn", zero()),
+        ("CompressBpsOut", zero()),
+        ("CompressBpsRateLim", zero()),
+        ("ZlibMemUsage", zero()),
+        ("MaxZlibMemUsage", zero()),
+        ("Tasks", total_tasks.to_string()),
+        ("Run_queue", run_queue_len.to_string()),
+        ("Idle_pct", idle_pct.to_string()),
+        ("node", node),
+        ("Stopping", zero()),
+        ("Jobs", zero()),
+        ("Unstoppable Jobs", zero()),
+        ("Listeners", zero()),
+        ("ActivePeers", zero()),
+        ("ConnectedPeers", zero()),
+        ("DroppedLogs", crate::syslog::dropped_logs().to_string()),
+        ("BusyPolling", zero()),
+        ("FailedResolutions", zero()),
+        ("TotalBytesOut", zero()),
+        ("TotalSplicedBytesOut", zero()),
+        ("BytesOutRate", zero()),
+        ("DebugCommandsIssued", zero()),
+        ("CumRecvLogs", zero()),
+        ("Build info", "0.1.0".to_string()),
+        ("Memmax_bytes", zero()),
+        ("PoolAlloc_bytes", zero()),
+        ("PoolUsed_bytes", zero()),
+        ("Start_time_sec", start_sec.to_string()),
+        ("Tainted", zero()),
+        ("TotalWarnings", zero()),
+        ("MaxconnReached", zero()),
+        ("BootTime_ms", zero()),
+        ("Niced_tasks", zero()),
+        ("CurrStreams", zero()),
+        ("CumStreams", zero()),
+        ("BlockedTrafficWarnings", zero()),
+        ("PatternsAdded", zero()),
+        ("PatternsFreed", zero()),
+        ("NbThreadGroups", "1".to_string()),
+        ("Worker_id", worker_id().to_string()),
+    ]
 }
 
 /// Generates the full `show stat` CSV text for all configured proxies and servers.
@@ -498,7 +532,23 @@ fn fill_counters(r: &mut StatRow, c: &crate::statcnt::TxnCounters, http: bool, t
     }
 }
 
-fn write_frontend_row(out: &mut String, proxy: &Proxy, _pid: u32, iid: u32) {
+/// `algo`: the balance algorithm as `HAProxy` names it. `random` and the default
+/// (no `balance` line) print `unknown` on HAProxy; Ibex does not tell the default from an
+/// explicit `roundrobin`, and prints `roundrobin`.
+fn balance_name(proxy: &Proxy) -> &'static str {
+    use ibex_config::BalanceAlgorithm as B;
+    match proxy.balance {
+        B::RoundRobin => "roundrobin",
+        B::Source => "source",
+        B::Uri => "uri",
+        B::Leastconn => "leastconn",
+        B::StaticRr => "static-rr",
+        B::First => "first",
+        B::Random(_) => "unknown",
+    }
+}
+
+fn write_frontend_row(out: &mut String, fmt: StatFormat, proxy: &Proxy, _pid: u32, iid: u32) {
     let c = proxy.ids.tc.get().map_or(&*EMPTY, |p| &p.fe);
     let http = proxy.mode == ibex_config::Mode::Http;
     let mut r = StatRow::new();
@@ -543,11 +593,13 @@ fn write_frontend_row(out: &mut String, proxy: &Proxy, _pid: u32, iid: u32) {
     r.set("eint", 0);
     r.set("dses", 0);
     r.set("wrew", 0);
-    out.push_str(&r.finish());
+    r.default_untracked('F', http, "");
+    r.emit(out, fmt);
 }
 
 fn write_server_row(
     out: &mut String,
+    fmt: StatFormat,
     proxy: &Proxy,
     s_idx: usize,
     check_state: Option<&ServerCheckState>,
@@ -650,10 +702,11 @@ fn write_server_row(
         r.set("check_duration", check_duration);
     }
     r.set("addr", srv_addr);
-    out.push_str(&r.finish());
+    r.default_untracked('S', proxy.mode == ibex_config::Mode::Http, "");
+    r.emit(out, fmt);
 }
 
-fn write_backend_row(out: &mut String, proxy: &Proxy, _pid: u32, iid: u32) {
+fn write_backend_row(out: &mut String, fmt: StatFormat, proxy: &Proxy, _pid: u32, iid: u32) {
     use std::sync::atomic::Ordering::Relaxed;
     let c = proxy.ids.tc.get().map_or(&*EMPTY, |p| &p.be);
     let http = proxy.mode == ibex_config::Mode::Http;
@@ -710,7 +763,8 @@ fn write_backend_row(out: &mut String, proxy: &Proxy, _pid: u32, iid: u32) {
         r.set("cache_hits", 0);
     }
     fill_counters(&mut r, c, http, true);
-    out.push_str(&r.finish());
+    r.default_untracked('B', http, balance_name(proxy));
+    r.emit(out, fmt);
 }
 
 /// Generates `show stat` CSV text with optional filtering by proxy iid, type bitmask, and server sid.
@@ -723,8 +777,24 @@ pub fn format_show_stat_filtered(
     type_filter: Option<i32>,
     sid_filter: Option<i32>,
 ) -> String {
+    format_show_stat_as(proxies, checks, pid, iid_filter, type_filter, sid_filter, StatFormat::Csv)
+}
+
+/// [`format_show_stat_filtered`] in the given format: CSV, `typed` lines or JSON.
+#[must_use]
+pub fn format_show_stat_as(
+    proxies: &[Proxy],
+    checks: &[ServerCheckState],
+    pid: u32,
+    iid_filter: Option<i32>,
+    type_filter: Option<i32>,
+    sid_filter: Option<i32>,
+    fmt: StatFormat,
+) -> String {
     let mut out = String::with_capacity(4096);
-    out.push_str(&stats_csv_header());
+    if fmt == StatFormat::Csv {
+        out.push_str(&stats_csv_header());
+    }
 
     let match_type = |type_val: i32| -> bool {
         match type_filter {
@@ -749,7 +819,7 @@ pub fn format_show_stat_filtered(
             && match_type(0)
             && (sid_filter.is_none() || sid_filter == Some(-1) || sid_filter == Some(0))
         {
-            write_frontend_row(&mut out, proxy, pid, iid);
+            write_frontend_row(&mut out, fmt, proxy, pid, iid);
         }
 
         if match_type(2) {
@@ -763,7 +833,7 @@ pub fn format_show_stat_filtered(
                 let check_state = checks
                     .iter()
                     .find(|c| c.proxy_idx == p_idx && c.server_idx == s_idx);
-                write_server_row(&mut out, proxy, s_idx, check_state, pid, iid, sid);
+                write_server_row(&mut out, fmt, proxy, s_idx, check_state, pid, iid, sid);
             }
         }
 
@@ -771,10 +841,13 @@ pub fn format_show_stat_filtered(
             && match_type(1)
             && (sid_filter.is_none() || sid_filter == Some(-1) || sid_filter == Some(0))
         {
-            write_backend_row(&mut out, proxy, pid, iid);
+            write_backend_row(&mut out, fmt, proxy, pid, iid);
         }
     }
 
+    if fmt == StatFormat::Json {
+        return format!("[{out}]\n");
+    }
     out
 }
 
