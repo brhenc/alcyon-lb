@@ -245,6 +245,9 @@ pub struct TcpSession {
     pub so_id: Option<u32>,
     /// Set when the PROXY header was refused: the connection logs that, not a request.
     pub proxy_hdr_err: Option<ProxyHdrError>,
+    /// Why the client's TLS handshake failed: the session ends without a transaction, and
+    /// logs the connection error, not a request (`session_kill_embryonic`).
+    pub hs_fail: Option<crate::xprt::HsFail>,
     pub cliexp: Vec<CompiledExp>,
     pub srvexp: Vec<CompiledExp>,
     pub req_uri: Option<String>,
@@ -581,6 +584,7 @@ impl TcpSession {
             so_name: None,
             so_id: None,
             proxy_hdr_err: None,
+            hs_fail: None,
             cliexp,
             srvexp,
             req_uri: None,
@@ -1256,6 +1260,7 @@ impl TcpSession {
             Err(_) if self.cli_xprt.handshake_failed() && self.cli_state.can_read() => {
                 self.cli_state = ScState::Closed;
                 self.ending.get_or_insert(Ending::ClientAbort);
+                self.hs_fail = self.cli_xprt.failure().cloned();
                 true
             }
             r => r?,

@@ -1098,6 +1098,8 @@ pub struct ProxyStats {
     /// Streams switched to the backend per second (`be_sess_rate`).
     pub be_sess_rate: RateCtr,
     pub cum_conn: AtomicU64,
+    /// Client TLS handshakes that failed (`ssl_failed_handshake`).
+    pub ssl_failed_hs: AtomicU64,
     pub act_conn: AtomicU32,
     /// Streams the backend has been given and not finished with (`beconn`, `%bc`).
     pub be_streams: AtomicU32,
@@ -2487,19 +2489,28 @@ fn proxy_header_failure(s: &TcpSession) -> Option<crate::proxy::ProxyHdrError> {
     matches!(s.ending?, Ending::Timeout(crate::proxy::Which::Client)).then_some(ProxyHdrError::Timeout)
 }
 
-/// `HAProxy`'s own line for a bad PROXY header (`session_kill_embryonic`): only for a
-/// frontend that logs, not in its log-format, and not for the empty cases under `option
-/// dontlognull`.
+/// Why a connection ended before a session began, if that is what happened: a bad PROXY
+/// header, or a TLS handshake that failed (the message of `HAProxy`'s line, and whether
+/// `option dontlognull` drops it).
+fn embryonic_failure(s: &TcpSession) -> Option<(String, bool)> {
+    proxy_header_failure(s)
+        .map(|why| (why.message().to_string(), why.is_null()))
+        .or_else(|| s.hs_fail.as_ref().map(|f| (f.message(), f.is_null())))
+}
+
+/// `HAProxy`'s own line for a connection that failed before its session began
+/// (`session_kill_embryonic`): only for a frontend that logs, not in its log-format, and not
+/// for the empty cases under `option dontlognull`.
 fn proxy_header_error_line(entry: &SessionEntry, proxies: &[Proxy]) -> Option<String> {
-    let why = proxy_header_failure(&entry.sess)?;
+    let (message, null) = embryonic_failure(&entry.sess)?;
     let fe = &proxies[entry.proxy_idx];
-    if fe.log_format.is_none() || fe.log_target_idx.is_empty() || (fe.dont_log_null && why.is_null()) {
+    if fe.log_format.is_none() || fe.log_target_idx.is_empty() || (fe.dont_log_null && null) {
         return None;
     }
     let s = &entry.sess;
     let listener = s.so_name.as_deref().map_or_else(|| s.so_id.unwrap_or(0).to_string(), str::to_string);
     fe.log_count.fetch_add(1, Ordering::Relaxed);
-    Some(crate::logfmt::connection_error_line(s.client_addr, s.log.date, &fe.name, &listener, why.message()))
+    Some(crate::logfmt::connection_error_line(s.client_addr, s.log.date, &fe.name, &listener, &message))
 }
 
 fn syslog_tag(tag: &str) -> Arc<str> {
@@ -7387,6 +7398,12 @@ impl EngineDispatcher<'_> {
             // Between requests. A client that goes away here ends the session; a server
             // connection kept from the last transaction goes back to the pool.
             if !matches!(entry.sess.cli_state, ScState::Ready | ScState::Established) {
+                // A TLS handshake that failed is no request, bad or not: it logs its own
+                // line when the session ends, and counts no 400 (T262).
+                if entry.sess.hs_fail.is_some() {
+                    close_http_session(entry, proxies, fdtab, poller, idle_pool, true);
+                    return None;
+                }
                 // `option dontlognull`: a connection that sent nothing is not logged, whether
                 // the client left or `timeout client` ran out.
                 let mut quiet = false;
@@ -8123,7 +8140,7 @@ impl EngineDispatcher<'_> {
                 );
             }
 
-            let log_line = entry.log_line.take().filter(|_| proxy_header_failure(&entry.sess).is_none()).map(|l| (l, entry.log_err));
+            let log_line = entry.log_line.take().filter(|_| embryonic_failure(&entry.sess).is_none()).map(|l| (l, entry.log_err));
 
             // Step 3.6: If in TCP mode and server not yet connected (e.g. deferred on accept-proxy or inspect), connect once ready
             if entry.sess.mode == Mode::Tcp
@@ -8206,8 +8223,11 @@ impl EngineDispatcher<'_> {
             // connection rather than through `end_txn` (aborted, timed out).
             let line = self.sessions.get_mut(session_idx).and_then(|e| {
                 // A refused PROXY header has its own line, never the frontend's format.
-                if proxy_header_failure(&e.sess).is_some() {
+                if embryonic_failure(&e.sess).is_some() {
                     e.log_line = None;
+                    if e.sess.hs_fail.is_some() {
+                        self.proxies[e.proxy_idx].counters().ssl_failed_hs.fetch_add(1, Ordering::Relaxed);
+                    }
                     // `session_kill_embryonic`: `err` with `log-separate-errors`, else `info`.
                     let err = self.proxies[e.proxy_idx].log_opts & ibex_config::LOG_OPT_SEPARATE_ERRORS != 0;
                     return proxy_header_error_line(e, self.proxies).map(|l| (e.proxy_idx, l.into_bytes(), err));
