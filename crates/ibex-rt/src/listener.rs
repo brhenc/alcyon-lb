@@ -231,13 +231,14 @@ impl Listener {
     /// Accepts one connection.
     ///
     /// `Ok(None)` means the queue is drained, which is the normal loop-termination
-    /// condition rather than an error. Transient per-connection errors — a client that
-    /// vanished between `epoll` and `accept`, or a momentary resource shortage — are
-    /// also reported as `None` rather than failing the listener, matching `HAProxy`:
-    /// one bad connection must never take down a listening socket.
+    /// condition rather than an error. A client that vanished between `epoll` and
+    /// `accept` is also `None`: one bad connection must never take down a listening socket.
     ///
     /// # Errors
-    /// Propagates non-transient accept failures.
+    /// Every other failure, among them running out of descriptors or memory (`EMFILE`,
+    /// `ENFILE`, `ENOBUFS`, `ENOMEM`): the connection is still queued and the listener
+    /// still ready, so the caller must stop polling it for a while (`HAProxy`'s
+    /// `CO_AC_PAUSE`) rather than call again at once (T237).
     pub fn accept(&self) -> io::Result<Option<(OwnedFd, SocketAddr)>> {
         match net::acceptfrom_with(
             self.fd.as_fd(),
@@ -261,23 +262,12 @@ impl Listener {
             //   (EWOULDBLOCK is not listed separately: on Linux it is the same value,
             //   and naming both makes the second arm unreachable.)
             //
-            // CONNABORTED/INTR/MFILE/NFILE/NOBUFS/NOMEM: this *connection* failed --
-            //   a client that vanished between epoll and accept, or a momentary
-            //   resource shortage. The listener itself is fine, and failing it would
-            //   let one bad connection take down a bind. HAProxy makes the same
-            //   distinction for the same reason.
-            // Kept as one arm because the bodies are identical; the distinction is
-            // documented above rather than encoded, since clippy is right that two
-            // arms returning the same value is noise.
-            Err(
-                Errno::AGAIN
-                | Errno::CONNABORTED
-                | Errno::INTR
-                | Errno::MFILE
-                | Errno::NFILE
-                | Errno::NOBUFS
-                | Errno::NOMEM,
-            ) => Ok(None),
+            // CONNABORTED/INTR: this *connection* failed -- a client that vanished
+            //   between epoll and accept, or a signal. The listener itself is fine.
+            //   Out of fds or memory is not here: the connection stays queued, and
+            //   reporting "drained" left the caller polling a listener that is ready
+            //   again at once (T237).
+            Err(Errno::AGAIN | Errno::CONNABORTED | Errno::INTR) => Ok(None),
             Err(e) => Err(e.into()),
         }
     }

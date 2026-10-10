@@ -1726,6 +1726,13 @@ pub struct Engine {
     extra_cli: Vec<ExtraCli>,
     /// The listeners were stopped because `global maxconn` was reached (`globalconn`).
     global_paused: bool,
+    /// `accept` failed for want of a resource (`EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM`):
+    /// the listeners are stopped as for `global maxconn` until this instant, or until a
+    /// client connection of the process closes (the `actconn` recorded here drops), as
+    /// `HAProxy`'s `CO_AC_PAUSE` puts the listener in the global listener queue for 100 ms
+    /// (`listener_accept`, `transient_error`). Without it the level-triggered listener
+    /// reported ready again at once: a CPU spent in `accept4` (T237).
+    accept_limited: Option<(Instant, u32)>,
     /// A listener stopped polling because its frontend reached `maxconn`: the limit is shared
     /// by every worker, so a slot freed or a limit raised elsewhere is noticed by looking.
     fe_paused: bool,
@@ -3597,6 +3604,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             cli_socket_path: None,
             extra_cli: Vec::new(),
             global_paused: false,
+            accept_limited: None,
             fe_paused: false,
             backlog_waits: false,
             cli_level: crate::applet::CliLevel::Admin,
@@ -4112,7 +4120,12 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             .next_purge()
             .map_or(poll_timeout, |t| poll_timeout.min(t.saturating_duration_since(now_inst)));
 
-        if self.global_paused && !crate::globalconn::full() {
+        if let Some((until, actconn)) = self.accept_limited {
+            if now_inst >= until || crate::globalconn::current() < actconn {
+                self.accept_limited = None;
+            }
+        }
+        if self.global_paused && self.accept_limited.is_none() && !crate::globalconn::full() {
             self.resume_listeners_after_global();
         }
         if self.fe_paused && !self.global_paused {
@@ -4353,7 +4366,13 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             let accept_res = self.listeners[l_idx].accept();
             let Some((cli_fd, peer_addr)) = (match accept_res {
                 Ok(Some(pair)) => Some(pair),
-                Ok(None) | Err(_) => None,
+                Ok(None) => None,
+                Err(_) => {
+                    crate::globalconn::release();
+                    self.listeners[l_idx].maxconn.dec();
+                    self.pause_listeners_for_accept_error();
+                    return;
+                }
             }) else {
                 crate::globalconn::release();
                 self.listeners[l_idx].maxconn.dec();
@@ -4364,6 +4383,13 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             let local_addr = self.listeners[l_idx].addr();
             self.admit_connection(proxy_idx, Some(l_idx), cli_fd, peer_addr, local_addr);
         }
+    }
+
+    /// `accept` failed other than with an empty queue -- out of fds or memory: stop polling
+    /// every listener for 100 ms, or until a client connection closes (`accept_limited`).
+    fn pause_listeners_for_accept_error(&mut self) {
+        self.accept_limited = Some((Instant::now() + Duration::from_millis(100), crate::globalconn::current()));
+        self.pause_listeners_for_global();
     }
 
     /// `global maxconn` is reached: stop polling every listener. The connections wait in
