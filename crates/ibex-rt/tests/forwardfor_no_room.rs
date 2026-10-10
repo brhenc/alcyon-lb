@@ -7,6 +7,11 @@
 //! header of `n` bytes is answered up to `n` = 16211, gets a 500 from 16240 and a 431 from
 //! 16272. (`http-request return` in the backend answers before the header is added: measured
 //! 200 there up to 16183 -- the server is a real one here.)
+//!
+//! `option originalto` and `option forwarded` (backend) the same way, measured on the same
+//! binary the same day: `X-Original-To` gets a 500 from 16250 (200 at 16240). `Forwarded`
+//! gets a 500 at 16240 with no `Forwarded` header in the request and with one (200 at 16180),
+//! and at 16170 with three (200 at 16140).
 
 mod common;
 
@@ -32,12 +37,18 @@ fn server() -> std::net::SocketAddr {
 }
 
 fn status(extra: &str, n: usize) -> String {
+    status_with(extra, "", 0, n)
+}
+
+/// `fe_extra` and `be_extra` go in the frontend and the backend; the request carries
+/// `forwarded` `Forwarded` headers before the `X-a` header of `n` bytes.
+fn status_with(fe_extra: &str, be_extra: &str, forwarded: usize, n: usize) -> String {
     let fe = common::reserve_addr();
     let mut f = tempfile::NamedTempFile::new().expect("tmp");
     write!(
         f,
         "global\n  tune.maxrewrite 0\ndefaults\n  mode http\n  timeout client 5s\n  timeout connect 1s\n  timeout server 5s\n\
-         frontend f\n  bind {fe}\n  {extra}\n  default_backend be\nbackend be\n  server s {}\n",
+         frontend f\n  bind {fe}\n  {fe_extra}\n  default_backend be\nbackend be\n  {be_extra}\n  server s {}\n",
         server()
     )
     .expect("cfg");
@@ -45,7 +56,8 @@ fn status(extra: &str, n: usize) -> String {
     assert!(common::wait_listening(fe));
     let mut s = TcpStream::connect(fe).expect("connect");
     s.set_read_timeout(Some(std::time::Duration::from_secs(5))).expect("timeout");
-    write!(s, "GET / HTTP/1.1\r\nHost: x\r\nX-a: {}\r\n\r\n", "a".repeat(n)).expect("send");
+    let fwd: String = (0..forwarded).map(|i| format!("Forwarded: for=10.0.0.{i}\r\n")).collect();
+    write!(s, "GET / HTTP/1.1\r\nHost: x\r\n{fwd}X-a: {}\r\n\r\n", "a".repeat(n)).expect("send");
     let mut out = Vec::new();
     let mut chunk = [0u8; 4096];
     while !out.windows(4).any(|w| w == b"\r\n\r\n") {
@@ -67,4 +79,24 @@ fn forwardfor_that_does_not_fit_fails_the_request() {
 #[test]
 fn without_the_option_the_same_request_is_served() {
     assert_eq!(status("", 16240), "HTTP/1.1 200 OK");
+}
+
+#[test]
+fn originalto_that_does_not_fit_fails_the_request() {
+    assert_eq!(status("option originalto", 16240), "HTTP/1.1 200 OK");
+    assert_eq!(status("option originalto", 16250), "HTTP/1.1 500 Internal Server Error");
+}
+
+/// The element is appended to the last `Forwarded` header, so each shape of the request takes
+/// its own path: no header (one is added), one header, several.
+#[test]
+fn forwarded_that_does_not_fit_fails_the_request() {
+    for (headers, fits, fails) in [(0, 16180, 16240), (1, 16180, 16240), (3, 16140, 16170)] {
+        assert_eq!(status_with("", "option forwarded", headers, fits), "HTTP/1.1 200 OK", "{headers} headers, {fits} bytes");
+        assert_eq!(
+            status_with("", "option forwarded", headers, fails),
+            "HTTP/1.1 500 Internal Server Error",
+            "{headers} headers, {fails} bytes"
+        );
+    }
 }
