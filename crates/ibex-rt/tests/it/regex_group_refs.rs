@@ -20,7 +20,7 @@
 //!
 //! `T277_ORACLE=<haproxy binary>` runs the load assertions against that binary instead.
 
-mod common;
+use crate::common;
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;

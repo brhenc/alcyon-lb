@@ -182,6 +182,7 @@ mod proxy_protocol;
 mod proxy_v2_unique_id;
 mod reads_per_request;
 mod redispatch;
+mod regex_group_refs;
 mod reload;
 mod reload_robustness;
 mod reload_under_load;
