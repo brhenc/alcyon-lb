@@ -91,6 +91,14 @@ lto = "off"
 [profile.release]
 debug = true
 
+# Debug builds (and the tests) keep line tables only: backtraces still name the function and
+# the line, but the ~350 test binaries are half the size and link several times faster
+# (measured 2026-10-10: 26 GB -> 13-14 GB per target; with mold, relinking every test after a
+# change to ibex-rt costs ~180 s of CPU instead of ~1,140 s). Coverage is unaffected: it
+# comes from the instrumentation, not the debug info.
+[profile.dev]
+debug = "line-tables-only"
+
 # Password hashing is deliberately slow; keep debug builds (tests) usable.
 [profile.dev.package.bcrypt]
 opt-level = 3

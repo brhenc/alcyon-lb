@@ -1,2 +1,5 @@
 [alias]
 build-livepatch = ["build", "--profile", "livepatch", "--config", "build.rustflags=[\"-C\",\"llvm-args=-align-all-functions=4\",\"-C\",\"force-frame-pointers=yes\"]"]
+
+[target.x86_64-unknown-linux-gnu]
+linker = "tools/cc-mold"

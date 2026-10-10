@@ -1,0 +1,11 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
+# Development linker: cc with mold when it is installed (several times less CPU than GNU ld
+# for the ~350 test binaries), plain cc otherwise. Release builds for distributions use their
+# own toolchain. Set in .cargo/config.toml as the linker, not through RUSTFLAGS, which
+# `cargo llvm-cov` replaces.
+if command -v mold >/dev/null 2>&1; then
+    exec cc -fuse-ld=mold "$@"
+fi
+exec cc "$@"
