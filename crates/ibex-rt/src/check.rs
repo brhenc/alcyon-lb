@@ -892,6 +892,10 @@ pub(crate) struct HttpResp {
     /// The message is complete: its length is reached, its last chunk is in, or it has
     /// no body.
     ended: bool,
+    /// A `Transfer-Encoding` other than a lone `chunked`: `HAProxy`'s HTTP/1 parser marks
+    /// such a reply a parsing error (`HTX_FL_PARSING_ERROR`) and the first `expect` fails
+    /// on it whatever it asks.
+    parse_error: bool,
 }
 
 /// Parses a response head and as much of the body as there is: `Ok(None)` while the head
@@ -934,19 +938,65 @@ pub(crate) fn parse_http_response(buf: &[u8]) -> Result<Option<HttpResp>, ()> {
         headers.push((name.trim().to_string(), val.trim().to_string()));
     }
 
+    // Every `Transfer-Encoding` and `Content-Length` line frames the body, as on the
+    // proxied path (T276, T281): the first line alone read `gzip` / `chunked` on two lines,
+    // or two different lengths, as a reply that passed.
+    let te = ibex_proto::h1::TransferCodings::of(headers.iter().map(|(n, v)| (n.as_str(), v.as_str())), true);
+    if te.invalid {
+        return Err(());
+    }
+    let parse_error = te.present && (te.other || !te.chunked_last);
+    let content_length = if te.present { None } else { reply_content_length(&headers)? };
     let raw_body = &buf[head_end..];
-    let header = |n: &str| headers.iter().find(|(h, _)| h.eq_ignore_ascii_case(n)).map(|(_, v)| v.as_str());
     let (body, ended) = if status < 200 || status == 204 || status == 304 {
         (Vec::new(), true)
-    } else if header("transfer-encoding").is_some_and(|v| v.to_ascii_lowercase().contains("chunked")) {
+    } else if te.present {
         decode_chunked(raw_body)
-    } else if let Some(cl) = header("content-length").and_then(|v| v.parse::<usize>().ok()) {
+    } else if let Some(cl) = content_length {
+        let cl = usize::try_from(cl).unwrap_or(usize::MAX);
         let n = raw_body.len().min(cl);
         (raw_body[..n].to_vec(), raw_body.len() >= cl)
     } else {
         (raw_body.to_vec(), false)
     };
-    Ok(Some(HttpResp { status, reason, version: version.to_string(), headers, body, ended }))
+    Ok(Some(HttpResp { status, reason, version: version.to_string(), headers, body, ended, parse_error }))
+}
+
+/// The length every `Content-Length` line of a reply gives, as `HAProxy` reads them
+/// (`http_parse_cont_len_header`): digits only, a comma list of one repeated number, and
+/// the same number on every line. `Err` for anything else, which `HAProxy`'s parser
+/// refuses outright (a socket error for the check).
+fn reply_content_length(headers: &[(String, String)]) -> Result<Option<u64>, ()> {
+    let mut len = None;
+    for (_, v) in headers.iter().filter(|(n, _)| n.eq_ignore_ascii_case("content-length")) {
+        for word in v.split(',').map(|w| w.trim_matches([' ', '\t'])) {
+            if word.is_empty() || !word.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(());
+            }
+            let n: u64 = word.parse().map_err(|_| ())?;
+            if len.is_some_and(|l| l != n) {
+                return Err(());
+            }
+            len = Some(n);
+        }
+    }
+    Ok(len)
+}
+
+/// What the first `expect` says of a reply `HAProxy` could not parse into a message: the
+/// generic message of its kind and step (`tcpcheck_expect_onerror_message`).
+fn unparsed_reply_failure(rule: &ResolvedHttpExpectRule, resp: &HttpResp) -> HttpVerdict {
+    let kind = match &rule.pattern {
+        HttpCheckExpectPattern::Status(_) => "(status codes)".to_string(),
+        HttpCheckExpectPattern::String(t) => format!(" '{t}'"),
+        HttpCheckExpectPattern::StringLf(_) => " (log-format string)".to_string(),
+        HttpCheckExpectPattern::RStatus(_) | HttpCheckExpectPattern::RString(_) => " (regex)".to_string(),
+        HttpCheckExpectPattern::Hdr { .. } => " (header pattern)".to_string(),
+    };
+    // `HAProxy` reaches this through its `error:` label, which always words it as a miss,
+    // negated rule or not.
+    let info = format!("TCPCHK did not match content{kind} at step {}", rule.step);
+    fail_with(("L7RSP", "Layer7 invalid response"), resp, info, rule.comment.as_deref())
 }
 
 /// The data of the chunks in `raw` and whether the last one is there.
@@ -1119,6 +1169,14 @@ fn http_verdict(check: &ServerCheckState, chk: &ResolvedHttpCheck, buf: &[u8], l
             return HttpVerdict::Fail { code: "SOCKERR", desc: "Socket error", status: None, info: None };
         }
     };
+    if resp.parse_error {
+        if let Some(rule) = chk.rules.iter().find_map(|r| match r {
+            ResolvedHttpRule::Expect(e) => Some(e),
+            _ => None,
+        }) {
+            return unparsed_reply_failure(rule, &resp);
+        }
+    }
     let px = &proxies[check.proxy_idx];
     let reg = crate::engine::sample_registry();
     // The rules run in order from the same starting variables each time more of the
@@ -3639,6 +3697,7 @@ mod tests {
             headers: vec![("X-Abc".into(), "one, two".into())],
             body: Vec::new(),
             ended: true,
+            parse_error: false,
         };
         let p = |mt, text| Pat { mt, text };
         let any = |full, n: Pat, v: Option<Pat>| hdr_expect_matches(&resp, full, n, v);

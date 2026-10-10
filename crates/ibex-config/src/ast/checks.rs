@@ -216,6 +216,9 @@ pub struct ResolvedHttpExpectRule {
     pub negate: bool,
     pub min_recv: i64,
     pub comment: Option<String>,
+    /// The step `HAProxy` names in this rule's failure messages: its index among the
+    /// section's `http-check` lines plus one; 2 for the expect added when there is none.
+    pub step: usize,
 }
 
 /// Single step in a multi-step TCP health check.

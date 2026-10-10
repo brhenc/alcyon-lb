@@ -826,8 +826,15 @@ pub(crate) fn build_resolved_http_check(
     let mut send_proxy = server.send_proxy || server.send_proxy_v2;
     let mut pending_comment: Option<&String> = None;
     let mut seen_expect = false;
+    // `HAProxy` numbers each `http-check` line it keeps as a rule (all but `send-state`
+    // and `disable-on-404`, which are flags) from 0, in order.
+    let mut rule_index = 0usize;
 
     for act in http_checks {
+        let index = rule_index;
+        if !matches!(act, HttpCheckAction::SendState) {
+            rule_index += 1;
+        }
         match act {
             HttpCheckAction::Send {
                 method: req_method,
@@ -862,6 +869,7 @@ pub(crate) fn build_resolved_http_check(
                     negate: *negate,
                     min_recv: *min_recv,
                     comment: comment.clone().or_else(|| pending_comment.cloned()),
+                    step: index + 1,
                 }));
             }
             HttpCheckAction::SetVar { var_name, expr } => {
@@ -896,6 +904,9 @@ pub(crate) fn build_resolved_http_check(
             negate: false,
             min_recv: -1,
             comment: None,
+            // After the request: the implicit send of `option httpchk` is rule 0 when
+            // the section has no `http-check` line.
+            step: rule_index.max(1) + 1,
         }));
     }
 

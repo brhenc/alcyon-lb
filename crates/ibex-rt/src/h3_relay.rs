@@ -19,6 +19,8 @@ use ibex_proto::htx::HtxBlock;
 use ibex_proto::mux_h3;
 use ibex_proto::qpack;
 
+use crate::txn::Framing;
+
 const FRAME_DATA: u64 = 0x00;
 const FRAME_HEADERS: u64 = 0x01;
 
@@ -108,14 +110,15 @@ pub fn request_head(field_section: &[u8], known_body: Option<u64>) -> Result<Req
                     return Err(400);
                 }
                 if name == "content-length" {
-                    let v: u64 = h.value.trim().parse().map_err(|_| 400u16)?;
+                    let v = content_length_value(&h.value).ok_or(400u16)?;
                     if content_length.is_some_and(|c| c != v) {
                         return Err(400);
                     }
-                    if content_length.is_some() {
-                        continue;
-                    }
+                    // Written once, as the number it stands for, after the other fields:
+                    // the server reads the length the DATA frames are held to, not a
+                    // spelling of it (`HAProxy` keeps the cleaned value).
                     content_length = Some(v);
+                    continue;
                 }
                 // HTTP/3 may split cookies over several fields; HTTP/1 wants one
                 // (RFC 9114 section 4.2.1).
@@ -136,7 +139,10 @@ pub fn request_head(field_section: &[u8], known_body: Option<u64>) -> Result<Req
     }
     let body = match (content_length, known_body) {
         (Some(cl), Some(n)) if cl != n => return Err(400),
-        (Some(cl), _) => ReqBody::Length(cl),
+        (Some(cl), _) => {
+            head.extend_from_slice(format!("content-length: {cl}\r\n").as_bytes());
+            ReqBody::Length(cl)
+        }
         (None, Some(0)) => ReqBody::Length(0),
         (None, Some(n)) => {
             head.extend_from_slice(format!("content-length: {n}\r\n").as_bytes());
@@ -149,6 +155,24 @@ pub fn request_head(field_section: &[u8], known_body: Option<u64>) -> Result<Req
     };
     head.extend_from_slice(b"\r\n");
     Ok(RequestHead { head, body, method_head })
+}
+
+/// A `content-length` value as `HAProxy`'s `http_parse_cont_len_header` reads it: digits
+/// only, or a comma list of one repeated number. `+5`, `0x5`, an empty element or two
+/// different numbers are not a length.
+fn content_length_value(v: &str) -> Option<u64> {
+    let mut len = None;
+    for word in v.split(',').map(|w| w.trim_matches([' ', '\t'])) {
+        if word.is_empty() || !word.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let n: u64 = word.parse().ok()?;
+        if len.is_some_and(|l| l != n) {
+            return None;
+        }
+        len = Some(n);
+    }
+    len
 }
 
 fn valid_token(s: &str) -> bool {
@@ -215,6 +239,13 @@ impl BodyState {
             let Ok(ty) = parse_varint(rx, &mut off) else { break };
             let Ok(len) = parse_varint(rx, &mut off) else { break };
             used = off;
+            // A DATA frame is held to the `content-length` when its header arrives, before
+            // any of its payload goes on (`HAProxy` adds the frame length to the total
+            // first): the part of an oversized frame that would complete the length must
+            // not reach the server as a whole request (RFC 9114 section 4.1.2).
+            if ty == FRAME_DATA && matches!(self.mode, ReqBody::Length(left) if len > left) {
+                return Err(());
+            }
             self.frame = (len > 0).then_some((ty == FRAME_DATA, len));
         }
         rx.drain(..used);
@@ -418,38 +449,32 @@ impl ResponseConv {
             return Ok(RespState::Head);
         }
         let mut fields = vec![(":status".to_string(), status.to_string())];
-        let mut chunked = false;
-        let mut length: Option<u64> = None;
         for line in lines {
             let Some((n, v)) = line.split_once(':') else { return Err(()) };
             let name = n.trim().to_ascii_lowercase();
             let value = v.trim();
-            match name.as_str() {
-                "transfer-encoding" => chunked = value.to_ascii_lowercase().contains("chunked"),
-                "content-length" => length = Some(value.parse().map_err(|_| ())?),
-                _ => {}
+            if name == "content-length" && content_length_value(value).is_none() {
+                return Err(());
             }
             if HOP_BY_HOP.contains(&name.as_str()) {
                 continue;
             }
             fields.push((name, value.to_string()));
         }
-        if chunked {
+        // Framed as the engine framed it for its HTTP/1 client: every `Transfer-Encoding`
+        // line as one list, chunked only when `chunked` is the last coding (T281).
+        let method = head_request.then_some("HEAD");
+        let framing = crate::txn::response_framing(head, method, status);
+        if !matches!(framing, Framing::Length(_) | Framing::None) {
             fields.retain(|(n, _)| n != "content-length");
         }
         let section = mux_h3::encode_field_section(&fields);
         mux_h3::encode_frame(out, FRAME_HEADERS, &section);
-        let bodyless = head_request || status == 204 || status == 304;
-        Ok(if bodyless {
-            RespState::Done
-        } else if chunked {
-            RespState::ChunkSize
-        } else {
-            match length {
-                Some(0) => RespState::Done,
-                Some(n) => RespState::Length(n),
-                None => RespState::UntilClose,
-            }
+        Ok(match framing {
+            Framing::None | Framing::Length(0) => RespState::Done,
+            Framing::Length(n) => RespState::Length(n),
+            Framing::Chunked => RespState::ChunkSize,
+            Framing::UntilClose | Framing::Tunnel => RespState::UntilClose,
         })
     }
 }
