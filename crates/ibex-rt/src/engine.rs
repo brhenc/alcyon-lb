@@ -6392,16 +6392,7 @@ fn reply_parse_error(entry: &mut SessionEntry, proxies: &[Proxy], status: u16) {
     let mut page = proxy_error_response(&entry.sess, be, &proxies[entry.proxy_idx], proxies, status);
     // The H1 mux's own error reply goes through HTX, which writes the header names in lower
     // case (measured on 3.5-dev8: `content-length: 105`, `cache-control: ...`).
-    {
-        let head = crate::proxy::find_eoh(&page).map_or(0, |(h, _)| h);
-        let mut at = page[..head].iter().position(|&b| b == b'\n').map_or(head, |i| i + 1);
-        while at < head {
-            let end = page[at..head].iter().position(|&b| b == b'\n').map_or(head, |i| at + i + 1);
-            let colon = page[at..end].iter().position(|&b| b == b':').map_or(at, |i| at + i);
-            page[at..colon].make_ascii_lowercase();
-            at = end;
-        }
-    }
+    lowercase_header_names(&mut page);
     // HAProxy's 431 does not say `Connection: close`, though it closes.
     entry.sess.write_reply_with(&page, status != 431);
     // The request that could not be parsed counts as a request and as the error or failure its
@@ -7168,7 +7159,8 @@ impl EngineDispatcher<'_> {
                     && (!entry.sess.req.is_empty() || entry.sess.is_first_req)
                 {
                     let fe = &proxies[entry.proxy_idx];
-                    let page = proxy_error_response(&entry.sess, fe, fe, proxies, 408);
+                    let mut page = proxy_error_response(&entry.sess, fe, fe, proxies, 408);
+                    lowercase_header_names(&mut page);
                     entry.sess.send_before_close(&page);
                     entry.sess.log.status = Some(408);
                     entry.sess.log.term = Some(*b"cR");
@@ -7212,7 +7204,8 @@ impl EngineDispatcher<'_> {
             && entry.sess.txn.as_ref().is_some_and(|t| t.body_wait.is_some_and(|w| !w.tarpit && !w.inspect))
         {
             let fe = &proxies[entry.proxy_idx];
-            let page = proxy_error_response(&entry.sess, fe, fe, proxies, 408);
+            let mut page = proxy_error_response(&entry.sess, fe, fe, proxies, 408);
+                    lowercase_header_names(&mut page);
             entry.sess.send_before_close(&page);
             entry.sess.log.status = Some(408);
             entry.sess.log.term = Some(*b"cR");
@@ -11844,7 +11837,44 @@ fn stats_write_reply(entry: &mut SessionEntry, proxies: &[Proxy], raw: &[u8]) {
     }
 }
 
+/// The header names of the response or request head at the start of `buf` in lower case, as
+/// `HAProxy` writes anything that went through HTX (measured on 3.5-dev8). Values, the first
+/// line and the body are left as they are.
+fn lowercase_header_names(buf: &mut [u8]) {
+    let head = crate::proxy::find_eoh(buf).map_or(0, |(h, _)| h);
+    let mut at = buf[..head].iter().position(|&b| b == b'\n').map_or(head, |i| i + 1);
+    while at < head {
+        let end = buf[at..head].iter().position(|&b| b == b'\n').map_or(head, |i| at + i + 1);
+        // A folded line has no name of its own.
+        if !matches!(buf[at], b' ' | b'\t') {
+            let colon = buf[at..end].iter().position(|&b| b == b':').map_or(at, |i| at + i);
+            buf[at..colon].make_ascii_lowercase();
+        }
+        at = end;
+    }
+}
+
+/// The reply the proxy generates as `HAProxy` sends it: header names in lower case, and the
+/// built-in 400 and 408 pages with `connection: close` after their other headers (a page
+/// from `errorfile` keeps the order of its file; the request-parsing path has its own).
+fn htx_reply(raw: &[u8]) -> Vec<u8> {
+    let mut out = raw.to_vec();
+    let status = crate::txn::status_of(&String::from_utf8_lossy(&raw[..crate::proxy::find_eoh(raw).map_or(raw.len(), |(h, _)| h)]));
+    if matches!(status, 400 | 408) && builtin_error_page(status) == Some(raw) {
+        const CLOSE: &[u8] = b"Connection: close\r\n";
+        if let Some(i) = out.windows(CLOSE.len()).position(|w| w == CLOSE) {
+            out.drain(i..i + CLOSE.len());
+            if let Some((h, _)) = crate::proxy::find_eoh(&out) {
+                out.splice(h..h, b"\r\nConnection: close".iter().copied());
+            }
+        }
+    }
+    lowercase_header_names(&mut out);
+    out
+}
+
 fn send_proxy_reply(sess: &mut TcpSession, proxies: &[Proxy], fe_idx: usize, be_idx: usize, raw: &[u8]) {
+    let raw = &htx_reply(raw)[..];
     if let Ok(out) = after_res_on_reply(sess, proxies, fe_idx, be_idx, raw) {
         sess.write_reply(&out);
         return;

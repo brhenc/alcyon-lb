@@ -117,7 +117,7 @@ fn the_proxys_own_503_uses_the_backends_errorfile_then_the_frontends() {
             page("HTTP/1.1 503 Service Unavailable\r\nContent-Length: 6\r\nX-Page: custom503\r\n\r\nsorry\n"),
         ],
     );
-    for (path, want) in [("/own", "X-Page: custom503"), ("/bare", "X-Page: fe")] {
+    for (path, want) in [("/own", "x-page: custom503"), ("/bare", "x-page: fe")] {
         let mut c = TcpStream::connect(fe).expect("connect");
         let (resp, _) = get(&mut c, path, Duration::from_millis(300));
         assert!(resp.starts_with("HTTP/1.1 503"), "{path}: {resp:?}");
@@ -139,7 +139,7 @@ fn return_with_an_errorfile_keeps_the_connection() {
     let mut c = TcpStream::connect(fe).expect("connect");
     for i in 0..3 {
         let (resp, closed) = get(&mut c, &format!("/{i}"), Duration::from_millis(300));
-        assert_eq!(resp.matches("X-Page: ret200").count(), 1, "request {i}: {resp:?}");
+        assert_eq!(resp.matches("x-page: ret200").count(), 1, "request {i}: {resp:?}");
         assert!(!closed, "request {i} closed the connection: {resp:?}");
     }
 }
