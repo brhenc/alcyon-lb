@@ -809,6 +809,8 @@ impl CliApplet {
         if self.interactive {
             self.out_buf.extend_from_slice(b"\n> ");
         } else {
+            // The empty line that ends an answer (`HAProxy` sends it after the last row).
+            self.out_buf.push(b'\n');
             self.is_done = true;
         }
     }
