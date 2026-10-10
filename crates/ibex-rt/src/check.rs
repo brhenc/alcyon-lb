@@ -143,7 +143,6 @@ pub enum CheckSubState {
         phase: u8,
         user: Option<String>,
         version: MysqlCheckVersion,
-        server_version: String,
         send_offset: usize,
         req_buf: Vec<u8>,
         recv_buf: Vec<u8>,
@@ -1197,7 +1196,6 @@ pub fn step_check(
                                 phase: 0,
                                 user,
                                 version,
-                                server_version: String::new(),
                                 send_offset: 0,
                                 req_buf,
                                 recv_buf: Vec::new(),
@@ -1531,7 +1529,6 @@ pub fn step_check(
                                 phase: 0,
                                 user,
                                 version,
-                                server_version: String::new(),
                                 send_offset: 0,
                                 req_buf,
                                 recv_buf: Vec::new(),
@@ -2857,6 +2854,156 @@ fn progress_smtp_check(
     Ok(CheckStep::pending(Some(next)))
 }
 
+/// How a protocol check's reply ends the check: `HAProxy`'s statuses for the custom
+/// `expect` rules of `ldap-check` and `mysql-check` (src/tcpcheck.c). `None` from a parser
+/// is "wait for more data".
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProtoReply {
+    /// L7OK, code 0.
+    Passed(Option<String>),
+    /// L7RSP.
+    Invalid(Option<String>),
+    /// L7STS, with the server's code.
+    WrongStatus(u16, Option<String>),
+}
+
+/// Byte `i` of a reply, 0 past its end. `HAProxy` reads past the end of the data in places
+/// (into whatever its buffer held before); Ibex reads zeros there, which is what a fresh
+/// buffer holds.
+fn byte_at(buf: &[u8], i: usize) -> u8 {
+    buf.get(i).copied().unwrap_or(0)
+}
+
+/// The bytes from `from` to the first NUL or the end, as `HAProxy` prints a C string;
+/// `None` when that is empty.
+fn c_string_at(buf: &[u8], from: usize) -> Option<String> {
+    let rest = buf.get(from..).unwrap_or_default();
+    let s = &rest[..rest.iter().position(|&b| b == 0).unwrap_or(rest.len())];
+    (!s.is_empty()).then(|| String::from_utf8_lossy(s).into_owned())
+}
+
+const NOT_LDAPV3: &str = "Not LDAPv3 protocol";
+
+/// `option ldap-check`'s reply: `expect rbinary ^30 min-recv 14 on-error "Not LDAPv3
+/// protocol"`, then `tcpcheck_ldap_expect_bindrsp`. `last_read`: no more data is coming.
+fn ldap_bind_reply(buf: &[u8], last_read: bool) -> Option<ProtoReply> {
+    if !last_read && buf.len() < 14 {
+        return None;
+    }
+    if buf.first() != Some(&0x30) {
+        return Some(ProtoReply::Invalid(Some(NOT_LDAPV3.into())));
+    }
+    let too_short = || last_read.then_some(ProtoReply::Invalid(None));
+    let at = |i| byte_at(buf, i);
+    // The LDAPMessage length: one byte, or 0x82 / 0x84 and two or four.
+    let mut nbytes = 0;
+    let msglen = if at(1) & 0x80 == 0 {
+        usize::from(at(1))
+    } else {
+        nbytes = usize::from(at(1) & 0x7f);
+        if buf.len() - 1 < 1 + nbytes {
+            return too_short();
+        }
+        match nbytes {
+            4 => u32::from_be_bytes([at(2), at(3), at(4), at(5)]) as usize,
+            2 => usize::from(u16::from_be_bytes([at(2), at(3)])),
+            _ => return Some(ProtoReply::Invalid(Some(NOT_LDAPV3.into()))),
+        }
+    };
+    let mut ptr = 2 + nbytes;
+    // `end - ptr < msglen` in C compares unsigned: never true once `ptr` is past the end.
+    if buf.len() >= ptr && buf.len() - ptr < msglen {
+        return too_short();
+    }
+    // messageID 1, bindResponse.
+    if [at(ptr), at(ptr + 1), at(ptr + 2), at(ptr + 3)] != [0x02, 0x01, 0x01, 0x61] {
+        return Some(ProtoReply::Invalid(Some(NOT_LDAPV3.into())));
+    }
+    ptr += 4;
+    let nbytes = if at(ptr) & 0x80 == 0 { 0 } else { usize::from(at(ptr) & 0x7f) };
+    // Four real bytes matched above, so `ptr` is within the reply.
+    if buf.len() - ptr < 1 + nbytes + 2 + 1 {
+        return too_short();
+    }
+    ptr += 1 + nbytes;
+    if [at(ptr), at(ptr + 1)] != [0x0a, 0x01] {
+        return Some(ProtoReply::Invalid(Some(NOT_LDAPV3.into())));
+    }
+    Some(match at(ptr + 2) {
+        0 => ProtoReply::Passed(Some("Success".into())),
+        code => ProtoReply::WrongStatus(
+            u16::from(code),
+            Some("See RFC: http://tools.ietf.org/html/rfc4511#section-4.1.9".into()),
+        ),
+    })
+}
+
+/// `option mysql-check`'s reply (`tcpcheck_mysql_expect_iniths`, then with `user`
+/// `tcpcheck_mysql_expect_ok` on the packet after the greeting). The info on success is the
+/// server version from the greeting; on an error packet, the rest of the data.
+fn mysql_reply(buf: &[u8], last_read: bool, with_user: bool) -> Option<ProtoReply> {
+    if buf.is_empty() {
+        // A custom rule is not evaluated on an empty buffer: the generic message, at the
+        // step of the first `expect` (after `connect`, and `send` with a user).
+        let step = if with_user { 3 } else { 2 };
+        return last_read.then(|| ProtoReply::Invalid(Some(format!("TCPCHK got an empty response at step {step}"))));
+    }
+    let packet = |offset: usize, last_rule: bool| -> Option<Option<ProtoReply>> {
+        let at = |i| byte_at(buf, i);
+        let plen = usize::from(at(offset)) | usize::from(at(offset + 1)) << 8 | usize::from(at(offset + 2)) << 16;
+        if buf.len() < offset + 4 || buf.len() < offset + plen + 4 {
+            return Some(last_read.then_some(ProtoReply::Invalid(None)));
+        }
+        if at(offset + 4) == 0xff {
+            let code = u16::from(at(offset + 5)) | u16::from(at(offset + 6)) << 8;
+            return Some(Some(ProtoReply::WrongStatus(code, c_string_at(buf, offset + 7))));
+        }
+        last_rule.then(|| Some(ProtoReply::Passed(c_string_at(buf, 5))))
+    };
+    if let Some(verdict) = packet(0, !with_user) {
+        return verdict;
+    }
+    let hslen = 4 + (usize::from(buf[0]) | usize::from(byte_at(buf, 1)) << 8 | usize::from(byte_at(buf, 2)) << 16);
+    packet(hslen, true).flatten()
+}
+
+/// Reads what has arrived into `recv_buf`, never past `TCP_CHECK_BUFSIZE` (`HAProxy` reads
+/// one buffer). True once no more is coming: the peer closed, or the buffer is full.
+fn recv_check_reply(xprt: &mut ServerXprt, fd: std::os::fd::BorrowedFd<'_>, recv_buf: &mut Vec<u8>) -> bool {
+    let mut buf = [0u8; 4096];
+    while recv_buf.len() < TCP_CHECK_BUFSIZE {
+        let room = (TCP_CHECK_BUFSIZE - recv_buf.len()).min(buf.len());
+        match xprt.recv(fd, &mut buf[..room]) {
+            Ok(Io::Done(n)) => recv_buf.extend_from_slice(&buf[..n]),
+            Ok(Io::WouldBlock) => return false,
+            Ok(Io::Eof | Io::Closed) | Err(_) => return true,
+        }
+    }
+    true
+}
+
+/// Ends a protocol check on its reply's verdict.
+fn end_proto_check(
+    check: &mut ServerCheckState,
+    fdtab: &mut FdTab,
+    poller: &mut Poller,
+    now: Tick,
+    duration: u32,
+    reply: ProtoReply,
+) -> CheckStep {
+    cleanup_check_socket(check, fdtab, poller);
+    let event = match reply {
+        ProtoReply::Passed(info) => check.on_success_full("L7OK", "Layer7 check passed", duration, Some(0), info),
+        ProtoReply::Invalid(info) => check.on_failure_full("L7RSP", "Layer7 invalid response", duration, None, info),
+        ProtoReply::WrongStatus(code, info) => {
+            check.on_failure_full("L7STS", "Layer7 wrong status", duration, Some(code), info)
+        }
+    };
+    let next = check.schedule_next(now);
+    check.next_check = next;
+    CheckStep { next: Some(next), event }
+}
+
 #[allow(clippy::too_many_lines, clippy::unnecessary_wraps)]
 fn progress_ldap_check(
     check: &mut ServerCheckState,
@@ -2931,198 +3078,13 @@ fn progress_ldap_check(
     }
 
     if phase == 1 {
-        let mut buf = [0u8; 4096];
-        let mut eof = false;
-        loop {
-            match check.xprt.recv(sock.as_fd(), &mut buf) {
-                Ok(Io::Done(n)) => {
-                    recv_buf.extend_from_slice(&buf[..n]);
-                }
-                Ok(Io::WouldBlock) => break,
-                Ok(Io::Eof | Io::Closed) | Err(_) => {
-                    eof = true;
-                    break;
-                }
-            }
-        }
-
-        if recv_buf.is_empty() && !eof {
+        let last_read = recv_check_reply(&mut check.xprt, sock.as_fd(), &mut recv_buf);
+        let Some(reply) = ldap_bind_reply(&recv_buf, last_read) else {
             fdtab.clear_ready(raw_fd, true, false);
-            check.sub_state = CheckSubState::LdapRunning {
-                phase,
-                send_offset,
-                recv_buf,
-            };
+            check.sub_state = CheckSubState::LdapRunning { phase, send_offset, recv_buf };
             return Ok(CheckStep::pending(Some(check.exp)));
-        }
-
-        if recv_buf.first() != Some(&0x30) {
-            cleanup_check_socket(check, fdtab, poller);
-            let event = check.on_failure_full(
-                "L7RSP",
-                "Layer7 invalid response",
-                duration,
-                None,
-                Some("Not LDAPv3 protocol".to_string()),
-            );
-            let next = check.schedule_next(now);
-            check.next_check = next;
-            return Ok(CheckStep {
-                next: Some(next),
-                event,
-            });
-        }
-
-        if recv_buf.len() < 2 {
-            if !eof {
-                fdtab.clear_ready(raw_fd, true, false);
-                check.sub_state = CheckSubState::LdapRunning {
-                    phase,
-                    send_offset,
-                    recv_buf,
-                };
-                return Ok(CheckStep::pending(Some(check.exp)));
-            }
-        }
-
-        let mut ptr = 1;
-        let msglen: usize;
-        if recv_buf[ptr] & 0x80 != 0 {
-            let nbytes = (recv_buf[ptr] & 0x7f) as usize;
-            ptr += 1;
-            if recv_buf.len() < ptr + nbytes {
-                if !eof {
-                    fdtab.clear_ready(raw_fd, true, false);
-                    check.sub_state = CheckSubState::LdapRunning {
-                        phase,
-                        send_offset,
-                        recv_buf,
-                    };
-                    return Ok(CheckStep::pending(Some(check.exp)));
-                }
-            }
-            if nbytes == 4 && recv_buf.len() >= ptr + 4 {
-                msglen = u32::from_be_bytes([
-                    recv_buf[ptr],
-                    recv_buf[ptr + 1],
-                    recv_buf[ptr + 2],
-                    recv_buf[ptr + 3],
-                ]) as usize;
-            } else if nbytes == 2 && recv_buf.len() >= ptr + 2 {
-                msglen = u16::from_be_bytes([recv_buf[ptr], recv_buf[ptr + 1]]) as usize;
-            } else if nbytes == 1 && recv_buf.len() >= ptr + 1 {
-                msglen = recv_buf[ptr] as usize;
-            } else {
-                cleanup_check_socket(check, fdtab, poller);
-                let event = check.on_failure_full(
-                    "L7RSP",
-                    "Layer7 invalid response",
-                    duration,
-                    None,
-                    Some("Not LDAPv3 protocol".to_string()),
-                );
-                let next = check.schedule_next(now);
-                check.next_check = next;
-                return Ok(CheckStep {
-                    next: Some(next),
-                    event,
-                });
-            }
-            ptr += nbytes;
-        } else {
-            msglen = recv_buf[ptr] as usize;
-            ptr += 1;
-        }
-
-        if recv_buf.len() < ptr + msglen && !eof {
-            fdtab.clear_ready(raw_fd, true, false);
-            check.sub_state = CheckSubState::LdapRunning {
-                phase,
-                send_offset,
-                recv_buf,
-            };
-            return Ok(CheckStep::pending(Some(check.exp)));
-        }
-
-        if recv_buf.len() < ptr + 4 || &recv_buf[ptr..ptr + 4] != &[0x02, 0x01, 0x01, 0x61] {
-            cleanup_check_socket(check, fdtab, poller);
-            let event = check.on_failure_full(
-                "L7RSP",
-                "Layer7 invalid response",
-                duration,
-                None,
-                Some("Not LDAPv3 protocol".to_string()),
-            );
-            let next = check.schedule_next(now);
-            check.next_check = next;
-            return Ok(CheckStep {
-                next: Some(next),
-                event,
-            });
-        }
-        ptr += 4;
-
-        if ptr >= recv_buf.len() {
-            if !eof {
-                fdtab.clear_ready(raw_fd, true, false);
-                check.sub_state = CheckSubState::LdapRunning {
-                    phase,
-                    send_offset,
-                    recv_buf,
-                };
-                return Ok(CheckStep::pending(Some(check.exp)));
-            }
-        }
-        if recv_buf[ptr] & 0x80 != 0 {
-            let nbytes = (recv_buf[ptr] & 0x7f) as usize;
-            ptr += 1 + nbytes;
-        } else {
-            ptr += 1;
-        }
-
-        if recv_buf.len() < ptr + 3 || &recv_buf[ptr..ptr + 2] != &[0x0a, 0x01] {
-            cleanup_check_socket(check, fdtab, poller);
-            let event = check.on_failure_full(
-                "L7RSP",
-                "Layer7 invalid response",
-                duration,
-                None,
-                Some("Not LDAPv3 protocol".to_string()),
-            );
-            let next = check.schedule_next(now);
-            check.next_check = next;
-            return Ok(CheckStep {
-                next: Some(next),
-                event,
-            });
-        }
-        ptr += 2;
-        let result_code = recv_buf[ptr];
-
-        cleanup_check_socket(check, fdtab, poller);
-        let event = if result_code == 0 {
-            check.on_success_full(
-                "L7OK",
-                "Layer7 check passed",
-                duration,
-                None,
-                Some("Success".to_string()),
-            )
-        } else {
-            check.on_failure_full(
-                "L7STS",
-                "Layer7 wrong status",
-                duration,
-                Some(u16::from(result_code)),
-                Some("See RFC: http://tools.ietf.org/html/rfc4511#section-4.1.9".to_string()),
-            )
         };
-        let next = check.schedule_next(now);
-        check.next_check = next;
-        return Ok(CheckStep {
-            next: Some(next),
-            event,
-        });
+        return Ok(end_proto_check(check, fdtab, poller, now, duration, reply));
     }
 
     cleanup_check_socket(check, fdtab, poller);
@@ -3226,7 +3188,6 @@ fn progress_mysql_check(
         mut phase,
         user,
         version,
-        mut server_version,
         mut send_offset,
         req_buf,
         mut recv_buf,
@@ -3250,7 +3211,6 @@ fn progress_mysql_check(
                             phase,
                             user,
                             version,
-                            server_version,
                             send_offset,
                             req_buf,
                             recv_buf,
@@ -3284,260 +3244,20 @@ fn progress_mysql_check(
     }
 
     if phase == 1 {
-        let mut buf = [0u8; 4096];
-        let mut eof = false;
-        loop {
-            match check.xprt.recv(sock.as_fd(), &mut buf) {
-                Ok(Io::Done(n)) => {
-                    recv_buf.extend_from_slice(&buf[..n]);
-                }
-                Ok(Io::WouldBlock) => break,
-                Ok(Io::Eof | Io::Closed) | Err(_) => {
-                    eof = true;
-                    break;
-                }
-            }
-        }
-
-        if recv_buf.len() < 4 {
-            if !eof {
-                fdtab.clear_ready(raw_fd, true, false);
-                check.sub_state = CheckSubState::MysqlRunning {
-                    phase,
-                    user,
-                    version,
-                    server_version,
-                    send_offset,
-                    req_buf,
-                    recv_buf,
-                };
-                return Ok(CheckStep::pending(Some(check.exp)));
-            }
-            cleanup_check_socket(check, fdtab, poller);
-            let event = check.on_failure_full(
-                "L7RSP",
-                "Layer7 invalid response",
-                duration,
-                None,
-                None,
-            );
-            let next = check.schedule_next(now);
-            check.next_check = next;
-            return Ok(CheckStep {
-                next: Some(next),
-                event,
-            });
-        }
-
-        let plen_hs = recv_buf[0] as usize
-            | ((recv_buf[1] as usize) << 8)
-            | ((recv_buf[2] as usize) << 16);
-        if recv_buf.len() < 4 + plen_hs {
-            if !eof {
-                fdtab.clear_ready(raw_fd, true, false);
-                check.sub_state = CheckSubState::MysqlRunning {
-                    phase,
-                    user,
-                    version,
-                    server_version,
-                    send_offset,
-                    req_buf,
-                    recv_buf,
-                };
-                return Ok(CheckStep::pending(Some(check.exp)));
-            }
-            cleanup_check_socket(check, fdtab, poller);
-            let event = check.on_failure_full(
-                "L7RSP",
-                "Layer7 invalid response",
-                duration,
-                None,
-                None,
-            );
-            let next = check.schedule_next(now);
-            check.next_check = next;
-            return Ok(CheckStep {
-                next: Some(next),
-                event,
-            });
-        }
-
-        if recv_buf.len() < 5 {
-            cleanup_check_socket(check, fdtab, poller);
-            let event = check.on_failure_full(
-                "L7RSP",
-                "Layer7 invalid response",
-                duration,
-                None,
-                None,
-            );
-            let next = check.schedule_next(now);
-            check.next_check = next;
-            return Ok(CheckStep {
-                next: Some(next),
-                event,
-            });
-        }
-
-        if recv_buf[4] == 0xff {
-            let err_code = if recv_buf.len() >= 7 {
-                recv_buf[5] as u16 | ((recv_buf[6] as u16) << 8)
-            } else {
-                0
+        let last_read = recv_check_reply(&mut check.xprt, sock.as_fd(), &mut recv_buf);
+        let Some(reply) = mysql_reply(&recv_buf, last_read, user.is_some()) else {
+            fdtab.clear_ready(raw_fd, true, false);
+            check.sub_state = CheckSubState::MysqlRunning {
+                phase,
+                user,
+                version,
+                send_offset,
+                req_buf,
+                recv_buf,
             };
-            let info = if recv_buf.len() >= 8 {
-                let msg_bytes = &recv_buf[7..4 + plen_hs];
-                let null_end = msg_bytes.iter().position(|&b| b == 0).unwrap_or(msg_bytes.len());
-                String::from_utf8_lossy(&msg_bytes[..null_end]).to_string()
-            } else {
-                "Error".to_string()
-            };
-            cleanup_check_socket(check, fdtab, poller);
-            let event = check.on_failure_full(
-                "L7STS",
-                "Layer7 wrong status",
-                duration,
-                Some(err_code),
-                Some(info),
-            );
-            let next = check.schedule_next(now);
-            check.next_check = next;
-            return Ok(CheckStep {
-                next: Some(next),
-                event,
-            });
-        }
-
-        let srv_ver_bytes = &recv_buf[5..4 + plen_hs];
-        let null_pos = srv_ver_bytes
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(srv_ver_bytes.len());
-        server_version = String::from_utf8_lossy(&srv_ver_bytes[..null_pos]).to_string();
-
-        if user.is_some() {
-            let offset = 4 + plen_hs;
-            if recv_buf.len() < offset + 4 {
-                if !eof {
-                    fdtab.clear_ready(raw_fd, true, false);
-                    check.sub_state = CheckSubState::MysqlRunning {
-                        phase,
-                        user,
-                        version,
-                        server_version,
-                        send_offset,
-                        req_buf,
-                        recv_buf,
-                    };
-                    return Ok(CheckStep::pending(Some(check.exp)));
-                }
-                cleanup_check_socket(check, fdtab, poller);
-                let event = check.on_failure_full(
-                    "L7RSP",
-                    "Layer7 invalid response",
-                    duration,
-                    None,
-                    None,
-                );
-                let next = check.schedule_next(now);
-                check.next_check = next;
-                return Ok(CheckStep {
-                    next: Some(next),
-                    event,
-                });
-            }
-
-            let plen_res = recv_buf[offset] as usize
-                | ((recv_buf[offset + 1] as usize) << 8)
-                | ((recv_buf[offset + 2] as usize) << 16);
-            if recv_buf.len() < offset + 4 + plen_res {
-                if !eof {
-                    fdtab.clear_ready(raw_fd, true, false);
-                    check.sub_state = CheckSubState::MysqlRunning {
-                        phase,
-                        user,
-                        version,
-                        server_version,
-                        send_offset,
-                        req_buf,
-                        recv_buf,
-                    };
-                    return Ok(CheckStep::pending(Some(check.exp)));
-                }
-                cleanup_check_socket(check, fdtab, poller);
-                let event = check.on_failure_full(
-                    "L7RSP",
-                    "Layer7 invalid response",
-                    duration,
-                    None,
-                    None,
-                );
-                let next = check.schedule_next(now);
-                check.next_check = next;
-                return Ok(CheckStep {
-                    next: Some(next),
-                    event,
-                });
-            }
-
-            let res_type = recv_buf[offset + 4];
-            cleanup_check_socket(check, fdtab, poller);
-            let event = if res_type == 0xff {
-                let err_code = if recv_buf.len() >= offset + 7 {
-                    recv_buf[offset + 5] as u16 | ((recv_buf[offset + 6] as u16) << 8)
-                } else {
-                    0
-                };
-                let mut msg_offset = offset + 7;
-                if recv_buf.len() > msg_offset && recv_buf[msg_offset] == b'#' {
-                    msg_offset += 6;
-                }
-                let err_msg = if recv_buf.len() > msg_offset {
-                    let end_pos = (offset + 4 + plen_res).min(recv_buf.len());
-                    String::from_utf8_lossy(&recv_buf[msg_offset..end_pos])
-                        .trim_end_matches(&['\r', '\n', '\0'][..])
-                        .to_string()
-                } else {
-                    String::new()
-                };
-                check.on_failure_full(
-                    "L7STS",
-                    "Layer7 wrong status",
-                    duration,
-                    Some(err_code),
-                    Some(err_msg),
-                )
-            } else {
-                check.on_success_full(
-                    "L7OK",
-                    "Layer7 check passed",
-                    duration,
-                    None,
-                    Some(server_version),
-                )
-            };
-            let next = check.schedule_next(now);
-            check.next_check = next;
-            return Ok(CheckStep {
-                next: Some(next),
-                event,
-            });
-        }
-
-        cleanup_check_socket(check, fdtab, poller);
-        let event = check.on_success_full(
-            "L7OK",
-            "Layer7 check passed",
-            duration,
-            None,
-            Some(server_version),
-        );
-        let next = check.schedule_next(now);
-        check.next_check = next;
-        return Ok(CheckStep {
-            next: Some(next),
-            event,
-        });
+            return Ok(CheckStep::pending(Some(check.exp)));
+        };
+        return Ok(end_proto_check(check, fdtab, poller, now, duration, reply));
     }
 
     cleanup_check_socket(check, fdtab, poller);
@@ -4069,5 +3789,138 @@ mod tests {
         assert!(any(false, n, Some(p(MatchType::Reg, "^t.o$"))));
         assert!(!any(true, n, Some(p(MatchType::Str, "two"))));
         assert!(any(true, n, Some(p(MatchType::Str, "one, two"))));
+    }
+
+    fn unhex(s: &str) -> Vec<u8> {
+        let s: String = s.split_whitespace().collect();
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    }
+
+    fn not_ldapv3() -> Option<ProtoReply> {
+        Some(ProtoReply::Invalid(Some(NOT_LDAPV3.into())))
+    }
+
+    /// Each reply measured on HAProxy 3.5-dev8 (T238), sent whole and the connection closed.
+    #[test]
+    fn ldap_replies_as_haproxy_judges_them() {
+        let ok = Some(ProtoReply::Passed(Some("Success".into())));
+        let short = Some(ProtoReply::Invalid(None));
+        for (hex, want) in [
+            ("", not_ldapv3()),
+            ("0a", not_ldapv3()),
+            ("30", not_ldapv3()),
+            ("3000", not_ldapv3()),
+            ("30020201", not_ldapv3()),
+            ("300402010161", short.clone()),
+            ("30050201016100", short.clone()),
+            ("3000020101610a0a01", short.clone()),
+            ("3007020101610a0a01", short.clone()),
+            ("308200", short.clone()),
+            ("30ff02010161070a010004000400", short.clone()),
+            ("30200201016107 0a010004000400", short.clone()),
+            ("300c020101618f0a01000400040000", short.clone()),
+            ("300c02010161870a010004000400", short.clone()),
+            ("30810c02010161070a010004000400", not_ldapv3()),
+            ("300c02010261070a010004000400", not_ldapv3()),
+            ("300c02010161070b010004000400", not_ldapv3()),
+            ("300c02010161070a010004000400", ok.clone()),
+            ("300802010161000a0100", ok.clone()),
+            ("30820000020101610a0a0100040004000000", ok.clone()),
+            ("3084000000000201016107 0a010004000400", ok.clone()),
+            (
+                "300c02010161070a013104000400",
+                Some(ProtoReply::WrongStatus(49, Some("See RFC: http://tools.ietf.org/html/rfc4511#section-4.1.9".into()))),
+            ),
+        ] {
+            assert_eq!(ldap_bind_reply(&unhex(hex), true), want, "{hex}");
+        }
+        // Before the end of the reply: 14 bytes are awaited, and a length that runs past
+        // what has arrived waits for the rest.
+        assert_eq!(ldap_bind_reply(&unhex("30"), false), None);
+        assert_eq!(ldap_bind_reply(&unhex("30ff02010161070a010004000400"), false), None);
+        assert_eq!(ldap_bind_reply(&unhex("0a0c02010161070a010004000400"), false), not_ldapv3());
+    }
+
+    #[test]
+    fn mysql_replies_as_haproxy_judges_them() {
+        let greeting = "0c000000 0a 352e372e302d66616b65 00";
+        let version = Some(ProtoReply::Passed(Some("5.7.0-fake".into())));
+        let short = Some(ProtoReply::Invalid(None));
+        let sts = |code, info: Option<&str>| Some(ProtoReply::WrongStatus(code, info.map(Into::into)));
+        let host_blocked = format!("10000000ff6a04{}", "486f737420626c6f636b656421");
+        for (hex, want) in [
+            ("01000000ff000000", sts(0, None)),
+            ("01000000ff", sts(0, None)),
+            ("02000000ff15", sts(21, None)),
+            ("03000000ff1504", sts(1045, None)),
+            (host_blocked.as_str(), sts(1130, Some("Host blocked!"))),
+            ("07000000ff1504410142 43440045", sts(1045, Some("A\u{1}BCD"))),
+            ("00000000", Some(ProtoReply::Passed(None))),
+            ("0000000000", Some(ProtoReply::Passed(None))),
+            (greeting, version.clone()),
+            ("050000000a3500", short.clone()),
+            ("0c0000000a352e37", short.clone()),
+            ("ff", short.clone()),
+            ("", Some(ProtoReply::Invalid(Some("TCPCHK got an empty response at step 2".into())))),
+        ] {
+            assert_eq!(mysql_reply(&unhex(hex), true, false), want, "{hex}");
+        }
+        let access = "4163636573732064656e696564";
+        for (second, want) in [
+            ("01000002ff", sts(0, None)),
+            ("00000002", version.clone()),
+            ("0000000200", version.clone()),
+            ("0700000200000002000000", version.clone()),
+            ("03000002ff1504", sts(1045, None)),
+            (&format!("16000002ff1504 23 3238303030 {access}"), sts(1045, Some("#28000Access denied"))),
+            (&format!("11000002ff1504 {access} 00"), sts(1045, Some("Access denied"))),
+            ("0300000200", short.clone()),
+            ("05000002ff", short.clone()),
+            ("01000002", short.clone()),
+            ("ff", short.clone()),
+            ("", short.clone()),
+        ] {
+            let hex = format!("{greeting}{second}");
+            assert_eq!(mysql_reply(&unhex(&hex), true, true), want, "{hex}");
+        }
+        assert_eq!(
+            mysql_reply(&[], true, true),
+            Some(ProtoReply::Invalid(Some("TCPCHK got an empty response at step 3".into())))
+        );
+        assert_eq!(mysql_reply(&unhex(greeting), false, true), None);
+        assert_eq!(mysql_reply(&unhex("0c00"), false, false), None);
+    }
+
+    /// No reply of up to four bytes, nor any prefix of a well-formed one, panics either
+    /// parser (the T238 panics were all of this kind).
+    #[test]
+    fn short_and_truncated_replies_never_panic() {
+        let interesting = [0x00, 0x01, 0x02, 0x04, 0x0a, 0x30, 0x61, 0x7f, 0x80, 0x81, 0x82, 0x84, 0xff];
+        let mut replies: Vec<Vec<u8>> = vec![Vec::new()];
+        for len in 1..=4 {
+            let mut next = Vec::new();
+            for r in replies.iter().filter(|r| r.len() == len - 1) {
+                for b in interesting {
+                    let mut r = r.clone();
+                    r.push(b);
+                    next.push(r);
+                }
+            }
+            replies.extend(next);
+        }
+        let wellformed = [
+            unhex("3084000000000201016107 0a010004000400"),
+            unhex("0c0000000a352e372e302d66616b65 00 16000002ff1504 23 3238303030 4163636573"),
+        ];
+        for w in &wellformed {
+            replies.extend((0..=w.len()).map(|n| w[..n].to_vec()));
+        }
+        for r in &replies {
+            for last_read in [false, true] {
+                let _ = ldap_bind_reply(r, last_read);
+                let _ = mysql_reply(r, last_read, false);
+                let _ = mysql_reply(r, last_read, true);
+            }
+        }
     }
 }
