@@ -84,6 +84,13 @@ impl Poller {
     ///
     /// # Errors
     /// Propagates `epoll_ctl` failure.
+    ///
+    /// A descriptor that waits for nothing leaves the epoll set, and one that waits for
+    /// something again rejoins it, as `HAProxy`'s poller does (`_update_fd`: no active
+    /// event is `EPOLL_CTL_DEL`). Kept in the set with an empty mask it is still reported
+    /// for `EPOLLHUP` and `EPOLLERR`, which epoll always delivers: a client reset while
+    /// nothing is read or written on its socket woke the thread on every wait, a core
+    /// spinning until the session ended (T269).
     pub fn modify(
         &self,
         fd: BorrowedFd<'_>,
@@ -91,22 +98,33 @@ impl Poller {
         readable: bool,
         writable: bool,
     ) -> io::Result<()> {
-        epoll::modify(
-            self.epfd.as_fd(),
-            fd,
-            epoll::EventData::new_u64(data),
-            Self::flags(readable, writable),
-        )?;
-        Ok(())
+        if !readable && !writable {
+            return match epoll::delete(self.epfd.as_fd(), fd) {
+                Ok(()) | Err(Errno::NOENT) => Ok(()),
+                Err(e) => Err(e.into()),
+            };
+        }
+        let flags = Self::flags(readable, writable);
+        match epoll::modify(self.epfd.as_fd(), fd, epoll::EventData::new_u64(data), flags) {
+            Ok(()) => Ok(()),
+            Err(Errno::NOENT) => {
+                epoll::add(self.epfd.as_fd(), fd, epoll::EventData::new_u64(data), flags)?;
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Unregisters a descriptor.
     ///
     /// # Errors
     /// Propagates `epoll_ctl` failure.
+    /// One that waits for nothing is out of the set already ([`Self::modify`]).
     pub fn delete(&self, fd: BorrowedFd<'_>) -> io::Result<()> {
-        epoll::delete(self.epfd.as_fd(), fd)?;
-        Ok(())
+        match epoll::delete(self.epfd.as_fd(), fd) {
+            Ok(()) | Err(Errno::NOENT) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Waits for readiness, calling `f` once per ready descriptor.

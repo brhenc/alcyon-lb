@@ -7589,7 +7589,10 @@ impl EngineDispatcher<'_> {
         poller: &mut Poller,
         idle_pool: &mut IdlePool,
     ) -> bool {
-        if matches!(entry.sess.cli_state, ScState::Ready | ScState::Established) || entry.sess.h2_ctx.is_some() {
+        if entry.sess.h2_ctx.is_some() {
+            return Self::h2_client_left(entry, proxies, fdtab, poller, idle_pool);
+        }
+        if matches!(entry.sess.cli_state, ScState::Ready | ScState::Established) {
             return false;
         }
         // Not a transaction a client's leaving can abort: none, a reply of the proxy's own,
@@ -7644,6 +7647,50 @@ impl EngineDispatcher<'_> {
             return false;
         }
         entry.sess.log.term = Some(*b"CD");
+        close_http_session(entry, proxies, fdtab, poller, idle_pool, false);
+        true
+    }
+
+    /// An HTTP/2 client's FIN ends every stream on its connection, whatever
+    /// `abortonclose` says: `HAProxy`'s H2 mux reports the read0 to each stream as an
+    /// error (`h2_wake_some_streams`). Measured on 3.5-dev8 with the stream's window at 0
+    /// and a 10 MB body behind it: `CD--`, `Tt` the FIN's time, the server connection let
+    /// go; waiting for the response head, `400 ... CH--` with nothing sent. The
+    /// connection, with nothing left it could carry, is closed at once (`HAProxy` closes an
+    /// idle one at once too; after an aborted stream it waits for `timeout client`).
+    /// Kept instead, the stream held its server connection for `timeout client`, then
+    /// the connection a second one after its GOAWAY (T269).
+    fn h2_client_left(
+        entry: &mut SessionEntry,
+        proxies: &[Proxy],
+        fdtab: &mut FdTab,
+        poller: &mut Poller,
+        idle_pool: &mut IdlePool,
+    ) -> bool {
+        if entry.sess.cli_state != ScState::ShutR {
+            return false;
+        }
+        // A request still coming is cut short by the caller; a reply of the proxy's own, a
+        // response all in, or one already ending have nothing to abort.
+        let Some(txn) = entry
+            .sess
+            .txn
+            .as_ref()
+            .filter(|t| t.req.is_done() && !(t.local || t.aborted || t.req == MsgState::Tunnel || t.rsp.is_done()))
+        else {
+            return false;
+        };
+        let waiting = txn.rsp == MsgState::Waiting;
+        if let Some(srv) = entry.sess.srv.as_ref() {
+            raw::abort_with_rst(srv.as_fd());
+        }
+        if waiting {
+            entry.sess.log.status = Some(400);
+            entry.sess.log.term = Some(*b"CH");
+        } else {
+            entry.sess.log.term = Some(*b"CD");
+        }
+        entry.sess.rep.clear();
         close_http_session(entry, proxies, fdtab, poller, idle_pool, false);
         true
     }
