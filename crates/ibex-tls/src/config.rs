@@ -556,17 +556,16 @@ impl TlsConfig {
         // Every worker thread asks for the config of every bind. Identical binds (same
         // files as they are now on disk, same options) share one `ServerConfig` so a
         // large `crt` directory is held in memory once, not once per thread per bind.
-        let key = shared_key(bind);
-        if let Some(live) = key.as_ref().and_then(|k| shared_cache().lock().ok()?.get(k)?.upgrade()) {
+        // A bind whose files cannot be inspected gets the empty key; it cannot build
+        // either, so nothing is ever stored under it.
+        let key = shared_key(bind).unwrap_or_default();
+        let mut cache = shared_cache().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(live) = cache.get(&key).and_then(std::sync::Weak::upgrade) {
             return Ok(live);
         }
         let built = Self::build_from_bind(bind)?;
-        if let Some(k) = key {
-            if let Ok(mut cache) = shared_cache().lock() {
-                cache.retain(|_, w| w.strong_count() > 0);
-                cache.insert(k, Arc::downgrade(&built));
-            }
-        }
+        cache.retain(|_, w| w.strong_count() > 0);
+        cache.insert(key, Arc::downgrade(&built));
         Ok(built)
     }
 
