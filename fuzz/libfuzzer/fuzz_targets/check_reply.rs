@@ -16,8 +16,11 @@ fuzz_target!(|data: &[u8]| {
             let _ = cr::redis(rest, eof);
         }
         1 => {
-            let _ = cr::smtp_status_line(rest);
+            // The greeting, the EHLO reply and the QUIT reply (T273 A replaced smtp_status_line).
+            let _ = cr::smtp_greeting(rest);
             let _ = cr::smtp_reply(rest, eof);
+            let _ = cr::smtp_quit(rest, eof);
+            let _ = cr::smtp_codeless_info(rest);
         }
         2 => {
             let _ = cr::pgsql(rest, eof);
