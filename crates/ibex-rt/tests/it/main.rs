@@ -187,6 +187,7 @@ mod reload;
 mod reload_robustness;
 mod reload_under_load;
 mod replace_path_targets;
+mod request_framing_smuggling;
 mod request_head_limit;
 mod request_rule_actions;
 mod response_fetch_in_request;

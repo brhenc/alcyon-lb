@@ -14,7 +14,7 @@
 //! The expected values were measured on `HAProxy` 3.5-dev8. Set
 //! `T276_ORACLE=/path/to/haproxy` to run the same cases against it: it passes all.
 
-mod common;
+use crate::common;
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
