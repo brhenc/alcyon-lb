@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
+#
+# Tests for tools/gate.sh (T253). Runs fake gates (IBEX_GATE_CMD) on locks and targets
+# under a private /tmp/t253-test.XXXX directory; never touches /tmp/ibex-gate*.lock.
+#
+#   tools/test_gate.sh            test tools/gate.sh
+#   T253_LEGACY=1 tools/test_gate.sh disowned
+#                                 run the disowned-child case against the old form,
+#                                 `flock <lock> <cmd>`, which it must fail
+#
+# Cases: disowned, overlap, serial, exclusive, disk, report, env, rc (default: all).
+set -uo pipefail
+cd "$(dirname "$0")/.." || exit 2
+GATE=$(pwd)/tools/gate.sh
+W=$(mktemp -d /tmp/t253-test.XXXXXX)
+STRAY=()   # PIDs of background processes this test started; killed by PID at the end
+cleanup() {
+  local p
+  for p in "${STRAY[@]}"; do kill "$p" 2>/dev/null; done
+  for p in $(cat "$W"/*.pid 2>/dev/null); do kill "$p" 2>/dev/null; done
+  rm -rf "$W"
+}
+trap cleanup EXIT
+
+export IBEX_GATE_LOCK_PREFIX=$W/gate
+export IBEX_GATE_TARGET_BASE=$W/targets
+export IBEX_GATE_MIN_FREE_GB=0
+export IBEX_GATE_POLL_SECS=0.2
+unset IBEX_GATE_SKIP_MEASURE CARGO_TARGET_DIR
+
+PASS=0; FAIL=0
+ok()   { echo "ok   $1"; PASS=$((PASS + 1)); }
+bad()  { echo "FAIL $1"; FAIL=$((FAIL + 1)); }
+now()  { date +%s.%N; }
+
+# A fake gate: records its start and end time in $W/<name>.{start,end}.
+fake() { echo "now(){ date +%s.%N; }; now > $W/$1.start; sleep $2; now > $W/$1.end; ${3:-true}"; }
+# Start a gate in the background, output to $W/<name>.log.
+bg_gate() {
+  local name=$1; shift
+  "$@" > "$W/$name.log" 2>&1 &
+  echo $! > "$W/$name.gatepid"
+}
+wait_gate() { wait "$(cat "$W/$1.gatepid")"; }
+before() { awk -v a="$(cat "$1")" -v b="$(cat "$2")" 'BEGIN { exit !(a <= b) }'; }
+
+t_disowned() {
+  # The gate's command leaves a daemon behind. The next gate must not wait for it.
+  local cmd="sleep 30 </dev/null >/dev/null 2>&1 & echo \$! > $W/daemon.pid; disown; exit 0"
+  local t0 rc
+  if [ "${T253_LEGACY:-}" = 1 ]; then
+    flock "$IBEX_GATE_LOCK_PREFIX.lock" bash -c "$cmd"
+    t0=$SECONDS
+    timeout 5 flock "$IBEX_GATE_LOCK_PREFIX.lock" true; rc=$?
+  else
+    IBEX_GATE_SLOTS=1 IBEX_GATE_CMD="$cmd" "$GATE" > "$W/d1.log" 2>&1
+    t0=$SECONDS
+    IBEX_GATE_SLOTS=1 IBEX_GATE_CMD=true timeout 5 "$GATE" > "$W/d2.log" 2>&1; rc=$?
+  fi
+  if [ $rc -eq 0 ] && kill -0 "$(cat "$W/daemon.pid")" 2>/dev/null; then
+    ok "disowned: next gate ran in $((SECONDS - t0))s while the daemon (pid $(cat "$W/daemon.pid")) still lives"
+  else
+    bad "disowned: next gate blocked (rc=$rc) by a daemon the previous gate left behind"
+  fi
+  kill "$(cat "$W/daemon.pid")" 2>/dev/null
+}
+
+t_overlap() {
+  export IBEX_GATE_SLOTS=2
+  bg_gate o1 env IBEX_GATE_CMD="$(fake o1 2)" "$GATE"
+  sleep 0.5
+  bg_gate o2 env IBEX_GATE_CMD="$(fake o2 2)" "$GATE"
+  wait_gate o1; wait_gate o2
+  unset IBEX_GATE_SLOTS
+  if before "$W/o2.start" "$W/o1.end" && grep -q 'slot=1$' "$W/o1.log" && grep -q 'slot=2$' "$W/o2.log"; then
+    ok "overlap: two gates ran side by side on slots 1 and 2"
+  else
+    bad "overlap: gates did not overlap on two slots"; cat "$W/o1.log" "$W/o2.log"
+  fi
+}
+
+t_serial() {
+  export IBEX_GATE_SLOTS=1
+  bg_gate s1 env IBEX_GATE_CMD="$(fake s1 1.5)" "$GATE"
+  sleep 0.5
+  bg_gate s2 env IBEX_GATE_CMD="$(fake s2 0.1)" "$GATE"
+  wait_gate s1; wait_gate s2
+  unset IBEX_GATE_SLOTS
+  if before "$W/s1.end" "$W/s2.start"; then ok "serial: with one slot the second gate waited"
+  else bad "serial: second gate started before the first ended"; fi
+}
+
+t_exclusive() {
+  export IBEX_GATE_SLOTS=2
+  bg_gate x1 env IBEX_GATE_CMD="$(fake x1 2)" "$GATE"
+  sleep 0.3
+  bg_gate x2 env IBEX_GATE_CMD="$(fake x2 3)" "$GATE"
+  sleep 0.3
+  bg_gate xe env IBEX_GATE_CMD="$(fake xe 0.5)" "$GATE" --exclusive
+  sleep 0.3
+  # Arrives while the exclusive gate waits: must not take slot 1 when x1 frees it.
+  bg_gate x3 env IBEX_GATE_CMD="$(fake x3 0.1)" "$GATE"
+  wait_gate x1; wait_gate x2; wait_gate xe; wait_gate x3
+  unset IBEX_GATE_SLOTS
+  if before "$W/x1.end" "$W/xe.start" && before "$W/x2.end" "$W/xe.start" \
+     && before "$W/xe.end" "$W/x3.start" && grep -q 'slot=1,2$' "$W/xe.log"; then
+    ok "exclusive: waited for both slots, held both, and a later gate did not jump ahead"
+  else
+    bad "exclusive: ordering wrong"; tail -n 3 "$W"/x?.log
+  fi
+}
+
+t_disk() {
+  local rc
+  IBEX_GATE_MIN_FREE_GB=999999999 IBEX_GATE_CMD="touch $W/ran" "$GATE" > "$W/disk.log" 2>&1; rc=$?
+  if [ $rc -eq 3 ] && [ ! -e "$W/ran" ] && grep -q 'REFUSED' "$W/disk.log"; then
+    ok "disk: refused at once (rc=3) and ran nothing"
+  else bad "disk: rc=$rc"; cat "$W/disk.log"; fi
+}
+
+t_report() {
+  # Slot 1 held the old way by a process that is not a gate; the waiting gate names it.
+  flock "$IBEX_GATE_LOCK_PREFIX.lock" sleep 30 </dev/null >/dev/null 2>&1 &
+  local holder=$! child
+  STRAY+=("$holder")
+  sleep 0.3
+  child=$(ps -o pid= --ppid "$holder" | tr -d ' ')
+  STRAY+=($child)
+  IBEX_GATE_SLOTS=1 IBEX_GATE_REPORT_SECS=1 IBEX_GATE_CMD=true timeout 3 "$GATE" > "$W/rep.log" 2>&1
+  kill "$holder" $child 2>/dev/null; wait "$holder" 2>/dev/null
+  if grep -q "HELD BY PID $holder, WHICH IS NOT A GATE" "$W/rep.log"; then
+    ok "report: a non-gate holder is named in capitals with its PID"
+  else bad "report: holder $holder not reported"; cat "$W/rep.log"; fi
+  # A gate holding the slot is reported as a gate, in lower case.
+  bg_gate r1 env IBEX_GATE_SLOTS=1 IBEX_GATE_CMD="sleep 2.5" "$GATE"
+  sleep 0.3
+  IBEX_GATE_SLOTS=1 IBEX_GATE_REPORT_SECS=1 IBEX_GATE_CMD=true "$GATE" > "$W/rep2.log" 2>&1
+  wait_gate r1
+  if grep -q "held by pid $(cat "$W/r1.gatepid") " "$W/rep2.log" && ! grep -q 'NOT A GATE' "$W/rep2.log"; then
+    ok "report: a gate holding the slot is reported as a gate"
+  else bad "report: gate holder misreported"; cat "$W/rep2.log"; fi
+}
+
+t_env() {
+  local o
+  o=$(IBEX_GATE_SLOTS=1 IBEX_GATE_CMD='echo "M=$IBEX_GATE_SKIP_MEASURE T=$CARGO_TARGET_DIR X=$FOO"' \
+      "$GATE" FOO=bar 2>&1)
+  if grep -q "^M=1 T=$W/targets/gate-slot1 X=bar$" <<<"$o"; then ok "env: skip-measure forced, slot target, extra env passed"
+  else bad "env"; echo "$o"; fi
+  o=$(IBEX_GATE_SLOTS=1 IBEX_GATE_CMD='echo "M=${IBEX_GATE_SKIP_MEASURE:-unset}"' "$GATE" --exclusive 2>&1)
+  if grep -q "^M=unset$" <<<"$o"; then ok "env: --exclusive does not force skip-measure"
+  else bad "env exclusive"; echo "$o"; fi
+}
+
+t_rc() {
+  local o rc
+  o=$(IBEX_GATE_CMD='exit 7' "$GATE" 2>&1); rc=$?
+  if [ $rc -eq 7 ] && grep -q 'rc=7 slot=1$' <<<"$o"; then ok "rc: the command's exit status is printed and returned"
+  else bad "rc: got $rc"; echo "$o"; fi
+}
+
+CASES=${*:-disowned overlap serial exclusive disk report env rc}
+for c in $CASES; do "t_$c"; done
+echo "test_gate: $PASS passed, $FAIL failed"
+[ $FAIL -eq 0 ]
