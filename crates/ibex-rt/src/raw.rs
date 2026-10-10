@@ -226,6 +226,14 @@ pub fn abort_with_rst(fd: BorrowedFd<'_>) {
     let _ = net::sockopt::set_socket_linger(fd, Some(std::time::Duration::ZERO));
 }
 
+/// Whether the connection has been reset by its peer, without consuming the error.
+#[must_use]
+pub fn reset_pending(fd: BorrowedFd<'_>) -> bool {
+    use rustix::event::{poll, PollFd, PollFlags};
+    let mut fds = [PollFd::new(&fd, PollFlags::empty())];
+    matches!(poll(&mut fds, 0), Ok(n) if n > 0) && fds[0].revents().contains(PollFlags::ERR)
+}
+
 /// Discards the connection quietly: sets TTL to 1 (so emitted RST packets expire
 /// at the first hop and do not reach the client) and linger 0.
 pub fn silent_drop(fd: BorrowedFd<'_>, is_ipv6: bool) {

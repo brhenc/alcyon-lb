@@ -391,6 +391,9 @@ pub struct TcpSession {
     pub h2_chunk_out: bool,
     pub h2_flood_config: ibex_proto::H2FloodConfig,
     pub is_first_req: bool,
+    /// The client's reset was reported with the first bytes of its request, before any
+    /// transaction: it left while its connection waited to be accepted.
+    pub reset_with_request: bool,
     /// Keep each request line for the log (`txn->uri`): set when a format of the
     /// frontend reads it, so a frontend that does not log it does not pay for a copy.
     pub keep_request_line: bool,
@@ -654,6 +657,7 @@ impl TcpSession {
             h2_chunk_out: false,
             h2_flood_config: ibex_proto::H2FloodConfig::default(),
             is_first_req: true,
+            reset_with_request: false,
             keep_request_line: false,
             accept_unsafe_request: false,
             h3: false,

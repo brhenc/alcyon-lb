@@ -1725,6 +1725,9 @@ pub struct Engine {
     /// A listener stopped polling because its frontend reached `maxconn`: the limit is shared
     /// by every worker, so a slot freed or a limit raised elsewhere is noticed by looking.
     fe_paused: bool,
+    /// Connections may have waited in a listener's backlog, for it was stopped at a
+    /// `maxconn` and has not been drained since: their clients may have left (T231).
+    backlog_waits: bool,
     /// The `level` of the stats socket (`stats socket ... level`): what each new CLI connection
     /// may do. Unset means admin, as before the level was honoured.
     pub cli_level: crate::applet::CliLevel,
@@ -2317,7 +2320,7 @@ fn account_stream(entry: &mut SessionEntry, proxies: &[Proxy]) {
             b"sD" => (0, 1, 0),
             b"CC" => (0, 0, 0),
             b"CQ" => (u64::from(client_reset), 0, 0),
-            b"CD" if status == 400 => (2, 0, 0),
+            b"CD" | b"CL" if status == 400 => (2, 0, 0),
             [b'C', _] => (1, 0, 0),
             _ => (0, 0, 0),
         };
@@ -3583,6 +3586,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             extra_cli: Vec::new(),
             global_paused: false,
             fe_paused: false,
+            backlog_waits: false,
             cli_level: crate::applet::CliLevel::Admin,
             cli_timeout_ms: crate::applet::DEFAULT_CLI_TIMEOUT_MS,
             start_time,
@@ -4292,6 +4296,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             );
             self.fdtab.set_interest(lfd, Interest::NONE);
             self.fe_paused = true;
+            self.backlog_waits = true;
             return;
         }
 
@@ -4311,6 +4316,8 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             }) else {
                 crate::globalconn::release();
                 self.listeners[l_idx].maxconn.dec();
+                // The backlog is drained: what is accepted next has not waited.
+                self.backlog_waits &= self.fe_paused || self.global_paused;
                 break;
             };
             let local_addr = self.listeners[l_idx].addr();
@@ -4327,6 +4334,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             self.fdtab.set_interest(lfd, Interest::NONE);
         }
         self.global_paused = true;
+        self.backlog_waits = true;
     }
 
     /// Re-arms the listeners stopped at their frontend's `maxconn` whose frontend has room
@@ -4540,6 +4548,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 );
                 self.fdtab.set_interest(lfd, Interest::NONE);
                 self.fe_paused = true;
+                self.backlog_waits = true;
             }
 
             register_new_session(
@@ -5746,6 +5755,9 @@ fn register_new_session(
         .and_then(|i| engine.listeners.get(i))
         .and_then(|l| l.tls.clone());
     let cli_raw_fd = cli_fd.as_raw_fd();
+    // A client that reset while its connection waited at `maxconn`: `HAProxy` finds the
+    // reset with the request, and the stream's state tells it (`client_left`, T231).
+    let reset_pending = engine.backlog_waits && crate::raw::reset_pending(cli_fd.as_fd());
     let Some((mut sess, target_addr, srv_raw_fd)) = init_client_session(
         &mut engine.proxies,
         proxy_idx,
@@ -5770,6 +5782,7 @@ fn register_new_session(
         return;
     };
     // Without a listener, the client is an HTTP/3 request stream (`adopt_quic_streams`).
+    sess.reset_with_request = reset_pending;
     sess.h3 = listener_idx.is_none();
     sess.so_name = listener_idx.and_then(|i| engine.listeners.get(i)).and_then(|l| l.name.clone());
     sess.so_id = listener_idx.and_then(|i| engine.listeners.get(i)).map(|l| l.luid).filter(|&id| id != 0);
@@ -7372,7 +7385,11 @@ impl EngineDispatcher<'_> {
             raw::abort_with_rst(srv.as_fd());
         }
         if waiting {
-            entry.sess.log.term = Some(if reset { *b"CD" } else { *b"CH" });
+            // A reset that came with the request (the client left while its connection
+            // waited to be accepted, at `maxconn`) is the last phase for `HAProxy`: the 400
+            // it answers is a whole response (`CL`, T231).
+            let phase = if entry.sess.reset_with_request { b'L' } else { b'D' };
+            entry.sess.log.term = Some(if reset { [b'C', phase] } else { *b"CH" });
             // Nothing more is read from the server, nor sent to it.
             entry.sess.srv_state = ScState::Closed;
             entry.sess.rep.clear();
