@@ -256,6 +256,8 @@ before this is run anywhere real.**
 | **Status** | **measured** — verified and pinned to ≤ 20 MB bound (without checks) and ≤ 35 MB bound (with checks) in `crates/ibex-rt/tests/request_allocations.rs` (`sixty_thousand_backends_memory_bounded` and `sixty_thousand_backends_with_checks_memory_bounded`). |
 | **Revisit if** | Backends require heavy embedded state that cannot be modeled compactly or shared across worker contexts. |
 
+**Tripwire (T255, 2026-10-10):** `sixty_thousand_backends_with_checks_no_further_growth` in the same file pins the current cost (54,034,102 bytes, 180,072 allocations; +5% / +1%) so the baselined failure cannot grow silently; the 35 MB test stays the target.
+
 **2026-09-23: the with-checks figure moved to 47.09 MB and the bound was deliberately not
 raised.** Implementing `option httpchk`, `http-check` and `tcp-check` (T36) took the
 60,000-backend-with-checks measurement from 29.75 MB to 49,375,208 bytes:

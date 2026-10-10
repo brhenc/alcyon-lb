@@ -544,4 +544,60 @@ fn sixty_thousand_backends_with_checks_memory_bounded() {
     drop(engine);
 }
 
+/// Builds an engine over 60,000 servers with health checks and returns
+/// `(allocations, bytes)` allocated while constructing it.
+#[allow(clippy::cast_possible_truncation)]
+fn sixty_thousand_with_checks_cost() -> (usize, usize) {
+    let before = ibex_alloc::alloc_counters();
+    let mut servers = Vec::with_capacity(60_000);
+    for i in 0..60_000u32 {
+        let port = (1024 + (i % 60000)) as u16;
+        let addr = SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, (i / 256) as u8, (i % 256) as u8)),
+            port,
+        );
+        let mut s = Server::new(format!("s_{i}"), addr);
+        s.check = true;
+        s.inter = Some(Duration::from_millis(2000));
+        s.fall = Some(3);
+        s.rise = Some(2);
+        servers.push(s);
+    }
+
+    let config = Config {
+        backends: vec![BackendSection {
+            name: "be_60k_checks".into(),
+            mode: Mode::Http,
+            servers,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let engine = Engine::new(&config, 64).expect("Engine::new 60k backends with checks");
+    let after = ibex_alloc::alloc_counters();
+    let diff = before.diff(&after);
+    drop(engine);
+    (diff.alloc_count as usize, diff.bytes_allocated as usize)
+}
+
+/// Tripwire under the baselined failure of `sixty_thousand_backends_with_checks_memory_bounded`
+/// (T255). That test fails its 35 MB bound on purpose (tradeoff.md 6.5) and the gate only checks
+/// that it still fails, so growth from 54 MB to 500 MB would pass unnoticed. This one pins the
+/// current cost: measured 2026-10-10 on main 5175acc, 180,072 allocations and 54,034,102 bytes.
+/// Bounds: bytes <= measured + 5%, allocations <= measured + 1%. It is a ceiling on regression,
+/// not a target: the 35 MB test remains the target.
+#[test]
+fn sixty_thousand_backends_with_checks_no_further_growth() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let (allocs, bytes) = sixty_thousand_with_checks_cost();
+    println!("[MEASUREMENT] 60,000 backends WITH checks (tripwire): {allocs} allocs, {bytes} bytes");
+
+    let max_bytes: usize = 54_034_102 / 100 * 105;
+    let max_allocs: usize = 180_072 / 100 * 101;
+    assert!(bytes <= max_bytes, "60k with checks allocated {bytes} bytes (> {max_bytes}, measured 54034102 + 5%)");
+    assert!(allocs <= max_allocs, "60k with checks made {allocs} allocations (> {max_allocs}, measured 180072 + 1%)");
+}
+
 
