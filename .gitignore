@@ -89,3 +89,10 @@ __pycache__/
 flame-*.svg
 /tools/parity-bench/*.svg
 /tools/measure/*.svg
+
+# ---------------------------------------------------------------------------
+# Fuzzing (cargo fuzz in fuzz/libfuzzer): the corpus grows by thousands of files
+# per run and its own Cargo.lock is generated; neither belongs in the index.
+# ---------------------------------------------------------------------------
+fuzz/libfuzzer/corpus/
+fuzz/libfuzzer/Cargo.lock
