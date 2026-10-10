@@ -7392,8 +7392,16 @@ impl EngineDispatcher<'_> {
         // rules just released, a response head they just processed, a reply, or the final
         // head queued behind an interim one. It moves now rather than on the next poller
         // round. Bounded, and it stops as soon as a byte pass makes no progress (a full
-        // socket), so it cannot spin.
+        // socket), so it cannot spin. If it is still moving when the bound runs out (a run
+        // of interim heads in one read: each takes a turn), the session is run again at once
+        // (`wants_rerun`): nothing else wakes it, as everything is already read, and the
+        // heads behind waited for `timeout server`, or for ever (T248).
+        let mut ran_out = true;
+        let snapshot = |entry: &SessionEntry| {
+            (entry.sess.req.len(), entry.sess.rep.len(), entry.sess.txn.as_ref().map(|t| (t.req, t.rsp)))
+        };
         for _ in 0..4 {
+            let top = snapshot(entry);
             if entry.sess.txn.as_ref().is_some_and(|t| t.rsp == MsgState::Waiting && t.reads_server())
                 && !entry.sess.rep.is_empty()
             {
@@ -7408,24 +7416,29 @@ impl EngineDispatcher<'_> {
             }
             Self::h2_forward_response(entry);
             Self::http_server_side(entry, proxies);
+            // An HTTP/2 client's interim response is dropped right here, in
+            // `h2_forward_response`, leaving no output: the next head behind it is the next
+            // turn's.
+            let next_head = entry.sess.txn.as_ref().is_some_and(|t| t.rsp == MsgState::Waiting)
+                && !entry.sess.rep.is_empty()
+                && snapshot(entry) != top;
             let movable = entry.sess.has_pending_output() || entry.sess.req_window() > 0;
-            if !movable || entry.sess.is_done() {
+            if entry.sess.is_done() || (!movable && !next_head) {
+                ran_out = false;
                 break;
             }
-            let before = (
-                entry.sess.req.len(),
-                entry.sess.rep.len(),
-                entry.sess.txn.as_ref().map(|t| (t.req, t.rsp)),
-            );
+            if !movable {
+                continue;
+            }
+            let before = snapshot(entry);
             let _ = entry.sess.process(now);
-            let after = (
-                entry.sess.req.len(),
-                entry.sess.rep.len(),
-                entry.sess.txn.as_ref().map(|t| (t.req, t.rsp)),
-            );
-            if before == after {
+            if before == snapshot(entry) {
+                ran_out = false;
                 break;
             }
+        }
+        if ran_out {
+            entry.sess.passes_ran_out = true;
         }
 
         if Self::client_left(entry, proxies, fdtab, poller, idle_pool) {
