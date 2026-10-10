@@ -739,6 +739,21 @@ mod tests {
         assert_eq!(table.len(), 0);
     }
 
+    /// A deleted entry leaves an empty slot; a dump passes over it and still gives the
+    /// entries after it.
+    #[test]
+    fn a_dump_skips_the_slot_a_deleted_entry_left() {
+        let table = StickTable::new(StickTableConfig { key_type: KeyType::Ip, ..Default::default() });
+        let first = StickKey::Ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let second = StickKey::Ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        table.update_entry(&first, |e| e.conn_cnt += 1).expect("update");
+        table.update_entry(&second, |e| e.conn_cnt += 1).expect("update");
+        assert!(table.delete_entry(&first).expect("delete"));
+        let (dumped, next) = table.dump_from(0, 10);
+        assert_eq!(dumped.iter().map(|(k, _)| k).collect::<Vec<_>>(), [&second]);
+        assert!(next.is_none());
+    }
+
     #[test]
     fn test_stick_table_tracking() {
         let config = StickTableConfig {
