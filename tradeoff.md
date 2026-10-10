@@ -383,3 +383,12 @@ Status: **resolved and measured** — cached lookups verified in `crates/ibex-sa
 | **Revisit if** | Upstream HAProxy changes C header parsing function signatures in future 3.x releases. |
 
 
+
+### 6.12 `str` samples and variables stay UTF-8 (`String`), not arbitrary bytes — **decided 2026-10-10: leave unimplemented**
+
+| | |
+|---|---|
+| **Gained** | Every `str` sample, variable and log field is a Rust `String`: valid UTF-8 by construction, so no converter, regex or log writer has to handle invalid sequences, and `fancy-regex` (which has no byte API) can match every subject. No migration of ~1,200 lines of sample/variable code and ~290 test sites (cost measured by T272 D2, `tasks/T272-progress.md` on agy/T272D f6652b4). |
+| **Gave up** | Byte-exact parity where HAProxy cuts or carries non-UTF-8 data in a `str`: `concat` past 16383 bytes keeps exactly 16383 bytes in HAProxy (a cut inside a multi-byte character), Ibex backs up to the character boundary (16382 or 16383, measured by T265). `str` converters fed non-UTF-8 input do not see the raw bytes HAProxy would. |
+| **Status** | **measured** — the 1-byte `concat` difference by T265 (`tasks/T265-progress.md`); the cost by T272 D2. No workload is known to depend on non-UTF-8 `str` samples. |
+| **Revisit if** | An operator's configuration demonstrably needs raw non-UTF-8 bytes in `str` samples or variables (e.g. a binary header value round-tripped through a variable), or a reg-test on the board fails because of it. Then do it as one dedicated task after T260, with the regex question (lossy match or refuse) decided first. If everything works, leaving it unimplemented is the safer choice: a byte-string data path removes a guarantee the rest of the code relies on. |
