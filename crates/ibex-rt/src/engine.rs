@@ -1402,7 +1402,7 @@ pub struct Proxy {
     pub stats: Arc<Vec<ProxyStats>>,
     pub stats_config: ibex_config::StatsConfig,
     /// The section's `description`, shown on the stats page.
-    pub desc: Option<String>,
+    pub desc: Option<Box<str>>,
     pub default_backend: Option<String>,
     pub use_backends: Vec<UseBackendRule>,
     /// `use-server` rules (backends and listens), in order.
@@ -2606,7 +2606,7 @@ fn proxy_header_failure(s: &TcpSession) -> Option<crate::proxy::ProxyHdrError> {
 fn embryonic_failure(s: &TcpSession) -> Option<(String, bool)> {
     proxy_header_failure(s)
         .map(|why| (why.message().to_string(), why.is_null()))
-        .or_else(|| s.hs_fail.as_ref().map(|f| (f.message(), f.is_null())))
+        .or_else(|| s.hs_fail().map(|f| (f.message(), f.is_null())))
 }
 
 /// `HAProxy`'s own line for a connection that failed before its session began
@@ -3044,7 +3044,7 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, list
             .collect(),
         next_server_idx: Arc::new(AtomicUsize::new(0)),
         stats: Arc::new(vec![ProxyStats::default()]),
-        desc: listen.description.clone(),
+        desc: listen.description.as_deref().map(Box::from),
         stats_config: {
             let mut sc = listen.stats.clone();
             sc.raw_timeouts = listen.timeouts;
@@ -3168,7 +3168,7 @@ fn init_proxy_from_frontend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, fe
         server_weights: std::iter::empty().collect(),
         next_server_idx: Arc::new(AtomicUsize::new(0)),
         stats: Arc::new(vec![ProxyStats::default()]),
-        desc: fe.description.clone(),
+        desc: fe.description.as_deref().map(Box::from),
         stats_config: {
             let mut sc = fe.stats.clone();
             sc.raw_timeouts = fe.timeouts;
@@ -3319,7 +3319,7 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, be:
         server_weights: be.servers.iter().map(|s| s.weight.unwrap_or(1)).collect(),
         next_server_idx: Arc::new(AtomicUsize::new(0)),
         stats: Arc::new(vec![ProxyStats::default()]),
-        desc: be.description.clone(),
+        desc: be.description.as_deref().map(Box::from),
         stats_config: {
             let mut sc = be.stats.clone();
             sc.raw_timeouts = be.timeouts;
@@ -7515,7 +7515,7 @@ impl EngineDispatcher<'_> {
             if !matches!(entry.sess.cli_state, ScState::Ready | ScState::Established) {
                 // A TLS handshake that failed is no request, bad or not: it logs its own
                 // line when the session ends, and counts no 400 (T262).
-                if entry.sess.hs_fail.is_some() {
+                if entry.sess.hs_fail().is_some() {
                     close_http_session(entry, proxies, fdtab, poller, idle_pool, true);
                     return None;
                 }
@@ -8387,7 +8387,7 @@ impl EngineDispatcher<'_> {
                 // A refused PROXY header has its own line, never the frontend's format.
                 if embryonic_failure(&e.sess).is_some() {
                     e.log_line = None;
-                    if e.sess.hs_fail.is_some() {
+                    if e.sess.hs_fail().is_some() {
                         // `HAProxy` builds the session after the handshake: this connection
                         // is a `conn_tot` and a `ssl_failed_handshake`, not an `stot` or a `rate`.
                         let c = self.proxies[e.proxy_idx].counters();

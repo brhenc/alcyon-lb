@@ -245,9 +245,6 @@ pub struct TcpSession {
     pub so_id: Option<u32>,
     /// Set when the PROXY header was refused: the connection logs that, not a request.
     pub proxy_hdr_err: Option<ProxyHdrError>,
-    /// Why the client's TLS handshake failed: the session ends without a transaction, and
-    /// logs the connection error, not a request (`session_kill_embryonic`).
-    pub hs_fail: Option<crate::xprt::HsFail>,
     pub cliexp: Vec<CompiledExp>,
     pub srvexp: Vec<CompiledExp>,
     pub req_uri: Option<String>,
@@ -584,7 +581,6 @@ impl TcpSession {
             so_name: None,
             so_id: None,
             proxy_hdr_err: None,
-            hs_fail: None,
             cliexp,
             srvexp,
             req_uri: None,
@@ -1258,6 +1254,15 @@ impl TcpSession {
 
     // ---- the two state machines --------------------------------------------------
 
+    /// Why the client's TLS handshake failed, if it did: the session ends without a
+    /// transaction and logs the connection error, not a request (`session_kill_embryonic`,
+    /// T262). Read from the transport, which keeps it for the session's life, so the
+    /// per-connection session does not carry a copy (struct_sizes).
+    #[must_use]
+    pub fn hs_fail(&self) -> Option<&crate::xprt::HsFail> {
+        self.cli_xprt.failure()
+    }
+
     /// Advances the client side. Returns `true` if anything changed.
     fn process_cli(&mut self) -> bool {
         // Every error here is the client connection's: a TLS handshake that failed or
@@ -1280,10 +1285,6 @@ impl TcpSession {
             self.cli_state = ScState::Closed;
         }
         self.ending.get_or_insert(Ending::ClientAbort);
-        // A failed TLS handshake is logged as HAProxy's connection error, not a request (T262).
-        if self.hs_fail.is_none() {
-            self.hs_fail = self.cli_xprt.failure().cloned();
-        }
     }
 
     /// The server connection failed. A TLS handshake that failed, wherever it was driven
