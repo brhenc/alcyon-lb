@@ -1088,12 +1088,7 @@ impl CliApplet {
     /// is then due again at once, so that one dump does not hold the worker).
     pub fn pump_table(&mut self, ctx: &AppletContext) {
         let mut sent = 0usize;
-        while self.table_dump.is_some() && sent < PUMP_BUDGET {
-            if self.is_done {
-                // The client is gone: the rest of the dump has nowhere to go.
-                self.table_dump = None;
-                return;
-            }
+        while self.table_dump.is_some() && sent < PUMP_BUDGET && !self.is_done {
             if self.out_buf.is_empty() {
                 self.out_offset = 0;
                 // The last chunk ends the answer, so it is never empty.
@@ -1103,9 +1098,14 @@ impl CliApplet {
             self.write_output();
             let left = if self.out_buf.is_empty() { 0 } else { self.out_buf.len() - self.out_offset };
             sent += before - left;
-            if left > 0 || self.is_done {
+            if left > 0 {
                 return;
             }
+        }
+        // The client is gone (a write failed, or it left before this call): the rest of the
+        // dump has nowhere to go.
+        if self.is_done {
+            self.table_dump = None;
         }
     }
 
