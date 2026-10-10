@@ -311,6 +311,32 @@ impl StatRow {
 #[must_use]
 #[allow(clippy::too_many_lines)]
 /// Worker threads this process runs, for `show info` `Nbthread`; set once at startup.
+/// `global node` and `global description`, set once at startup by [`set_identity`].
+static IDENTITY: std::sync::RwLock<(Option<String>, Option<String>)> = std::sync::RwLock::new((None, None));
+
+/// Records `global node` and `global description` (`global.node`, `global.desc`).
+pub fn set_identity(node: Option<&str>, description: Option<&str>) {
+    if let Ok(mut id) = IDENTITY.write() {
+        *id = (node.map(str::to_string), description.map(str::to_string));
+    }
+}
+
+/// `global node`, or the host name (HAProxy: `gethostname()`) when none was given.
+#[must_use]
+pub fn node_name() -> String {
+    if let Some(n) = IDENTITY.read().ok().and_then(|id| id.0.clone()) {
+        return n;
+    }
+    // uname(2), not /proc, which is not there in a chroot (T240).
+    rustix::system::uname().nodename().to_string_lossy().trim().to_string()
+}
+
+/// `global description`, if one was given.
+#[must_use]
+pub fn description() -> Option<String> {
+    IDENTITY.read().ok().and_then(|id| id.1.clone())
+}
+
 pub static NBTHREAD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
 pub fn format_show_info(start_time: Instant, pid: u32, total_tasks: usize, run_queue_len: usize, active_conns: u32, max_conns: u32) -> String {
@@ -362,8 +388,8 @@ fn worker_id() -> &'static str {
 }
 
 /// The `show info` fields in HAProxy's order. Fields HAProxy leaves out when unset
-/// (`description`, `Master_id`) are left out: Ibex has no `global description` and no
-/// master process. Fields Ibex does not track (`Memmax_*`, the pool sizes, `Jobs`,
+/// (`Master_id`) is left out: Ibex has no master process; `description` is there when
+/// `global description` is set. Fields Ibex does not track (`Memmax_*`, the pool sizes, `Jobs`,
 /// `Listeners`, `TotalBytesOut`, the SSL and compression rates, ...) print 0 where
 /// HAProxy prints a measurement.
 #[allow(clippy::too_many_arguments)]
@@ -392,9 +418,9 @@ fn show_info_pairs(
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs().saturating_sub(total_secs));
     let idle_pct = cpu::get_idle_pct();
-    let node = std::fs::read_to_string("/proc/sys/kernel/hostname").map(|h| h.trim().to_string()).unwrap_or_default();
+    let node = node_name();
     let zero = || "0".to_string();
-    vec![
+    let mut pairs = vec![
         ("Name", "Ibex".to_string()),
         ("Version", "0.1.0".to_string()),
         ("Release_date", "2026/09/21".to_string()),
@@ -477,7 +503,13 @@ fn show_info_pairs(
         ("PatternsFreed", zero()),
         ("NbThreadGroups", "1".to_string()),
         ("Worker_id", worker_id().to_string()),
-    ]
+    ];
+    // `description` is only there when one was configured, right after `node`.
+    if let Some(d) = description() {
+        let at = pairs.iter().position(|(k, _)| *k == "node").map_or(pairs.len(), |p| p + 1);
+        pairs.insert(at, ("description", d));
+    }
+    pairs
 }
 
 /// Generates the full `show stat` CSV text for all configured proxies and servers.
@@ -915,6 +947,7 @@ mod tests {
             next_server_idx: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             stats: std::sync::Arc::new(vec![crate::engine::ProxyStats::default()]),
             stats_config: ibex_config::StatsConfig::default(),
+            desc: None,
             balance: ibex_config::BalanceAlgorithm::RoundRobin,
             default_backend: None,
             use_backends: Vec::new(),

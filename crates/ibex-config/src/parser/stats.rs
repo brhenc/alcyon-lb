@@ -49,16 +49,8 @@ pub(crate) fn parse_stats_directive(
             Ok(())
         }
         "show-desc" => {
-            if tokens.len() >= 3 {
-                stats.show_desc = Some(
-                    tokens[2..]
-                        .iter()
-                        .map(|t| t.text.as_str())
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                        .into(),
-                );
-            }
+            // No text: `global description`, which the stats page looks up (stored as "").
+            stats.show_desc = Some(tokens[2.min(tokens.len())..].iter().map(|t| t.text.as_str()).collect::<Vec<_>>().join(" ").into());
             Ok(())
         }
         "show-node" => {

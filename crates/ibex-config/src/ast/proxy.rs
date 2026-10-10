@@ -220,6 +220,8 @@ pub struct ListenSection {
     pub mode: Mode,
     /// Whether this proxy is disabled.
     pub disabled: bool,
+    /// `description <text>`: free text shown on the stats page above the proxy's table (`px->desc`).
+    pub description: Option<String>,
     /// `id <n>`: the proxy's explicit numeric id (`HAProxy` `PR_O_FORCED_ID`); `None` takes the next free one.
     pub id: Option<u32>,
     /// The `cookie` line: HTTP session persistence.
@@ -402,6 +404,7 @@ impl Default for ListenSection {
             mode: Mode::Tcp,
             disabled: false,
             id: None,
+            description: None,
             cookie: None,
             contimeout: None,
             clitimeout: None,
@@ -488,6 +491,8 @@ pub struct FrontendSection {
     pub mode: Mode,
     /// Whether this frontend is disabled.
     pub disabled: bool,
+    /// `description <text>`: free text shown on the stats page above the proxy's table (`px->desc`).
+    pub description: Option<String>,
     /// `id <n>`: the proxy's explicit numeric id (`HAProxy` `PR_O_FORCED_ID`); `None` takes the next free one.
     pub id: Option<u32>,
     /// Client timeout in milliseconds / Duration.
@@ -586,6 +591,7 @@ impl Default for FrontendSection {
             mode: Mode::Tcp,
             disabled: false,
             id: None,
+            description: None,
             clitimeout: None,
             timeouts: TimeoutConfig::default(),
             maxconn: 0,
@@ -664,6 +670,8 @@ pub struct BackendSection {
     pub mode: Mode,
     /// Whether this backend is disabled.
     pub disabled: bool,
+    /// `description <text>`: free text shown on the stats page above the proxy's table (`px->desc`).
+    pub description: Option<String>,
     /// `id <n>`: the proxy's explicit numeric id (`HAProxy` `PR_O_FORCED_ID`); `None` takes the next free one.
     pub id: Option<u32>,
     /// Load balancing algorithm.
@@ -773,6 +781,7 @@ impl Default for BackendSection {
             mode: Mode::Tcp,
             disabled: false,
             id: None,
+            description: None,
             balance: BalanceAlgorithm::RoundRobin,
             cookie: None,
             contimeout: None,
