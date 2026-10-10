@@ -235,6 +235,19 @@ class TestAttemptHistory(StateCase):
         self.assertIn("attempt 1 FAIL", line)
         self.assertIn("ibex-rt/idle_pool_shared::burst (flaky: parallel run only)", line)
 
+    def test_the_new_failures_are_the_detail_not_the_baselined_ones(self):
+        # Gate 1 of the demonstration: the detail named three baselined failures and not
+        # the one test that failed the stage.
+        with open(self.log, "w") as f:
+            f.write("   slz/t267_demo: fails alone in 3/3 runs\n"
+                    "   ibex-dns/resolver_behavior: fails alone in 1/1 runs\n"
+                    "suite: 3 confirmed failing, 0 flaky, 2 + 2 baselined\n"
+                    "suite: NEW FAILURES\n"
+                    "   slz/t267_demo::t267_demo\n"
+                    "!! FAILED: workspace suite\n")
+        a = self.rec("suite", "fail", ["workspace suite"])
+        self.assertEqual(a["detail"], "NEW FAILURES: slz/t267_demo::t267_demo")
+
     def test_every_failed_attempt_is_listed(self):
         self.rec("lint", "fail", ["clippy"])
         self.rec("lint", "fail", ["clippy"])

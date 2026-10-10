@@ -53,6 +53,7 @@ PROFILES_MARK = "gate-tree.json"
 SUITE_RUN = "suite-run.json"
 
 EXCERPT_LINES = 300
+LIST_RE = re.compile(r"NEW FAILURES|NO test executes")
 DETAIL_RE = re.compile(r"FAIL|NO test|panicked|hung|flaky|error|fails alone|regression")
 
 
@@ -115,6 +116,18 @@ def _detail(log: str) -> str:
         lines = open(log, errors="replace").read().splitlines()
     except OSError:
         return ""
+    # The list under suite's "NEW FAILURES" or covercheck's "NO test executes" is what failed
+    # the stage; the lines above it name baselined failures too.
+    for i, x in enumerate(lines):
+        m = LIST_RE.search(x)
+        if m:
+            items = []
+            for y in lines[i + 1:]:
+                if not y.startswith(" "):
+                    break
+                items.append(y.strip())
+            if items:
+                return f"{m.group(0)}: " + "; ".join(items[:6])[:400]
     picked = [x.strip() for x in lines
               if DETAIL_RE.search(x) and not x.startswith(("!! FAILED", "==="))]
     return "; ".join(picked[:4])[:400]
