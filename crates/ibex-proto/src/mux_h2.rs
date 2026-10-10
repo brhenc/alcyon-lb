@@ -31,6 +31,10 @@ use crate::mux::{mux_flags, Mux, MuxFlags, MuxOps, ShutMode};
 use std::collections::BTreeMap;
 use std::io;
 
+/// Output waiting for the client past which the demux stops: what a client that reads
+/// nothing can make the connection queue in replies (RST_STREAM, PING and SETTINGS ACKs).
+pub const TX_ROOM: usize = 65536;
+
 static H2_OPS: MuxOps = MuxOps {
     name: "h2",
     alpn: Some(b"h2"),
@@ -496,6 +500,11 @@ impl Mux for MuxH2 {
             if ctx.conn_state == H2ConnState::GoAwaySent {
                 break;
             }
+            if ctx.tx_buf.len() - ctx.tx_consumed > TX_ROOM {
+                // The output the client has not read is full: no frame is processed, so
+                // none is answered, until it reads (`H2_CF_DEM_MROOM`, T235).
+                break;
+            }
             let slice = &ctx.rx_buf[consumed..];
             let header = FrameHeader::decode(slice)?;
             if header.length > DEFAULT_MAX_FRAME_SIZE {
@@ -682,6 +691,14 @@ impl MuxH2 {
         flags: u8,
         header_block: &[u8],
     ) -> io::Result<()> {
+        if !ctx.streams.contains_key(&stream_id) && stream_id <= ctx.highest_opened {
+            // HEADERS on a stream that is closed, or that was skipped and so can no longer
+            // be opened: a connection error STREAM_CLOSED (RFC 9113 section 5.1.1; HAProxy
+            // measured: GOAWAY with the highest stream id seen, then close). It was a stream
+            // error, and a client that reads nothing had a reply queued for each (T235).
+            ctx.send_goaway(ctx.highest_opened, H2Error::StreamClosed, b"HEADERS on a closed stream");
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "HEADERS on a closed stream"));
+        }
         if !ctx.streams.contains_key(&stream_id) {
             let active = ctx
                 .streams
@@ -722,13 +739,6 @@ impl MuxH2 {
                 stream.rx_htx.push(HtxBlock::Eom);
                 stream.state = H2StreamState::HalfClosedRemote;
             });
-            return Ok(());
-        }
-
-        if !ctx.streams.contains_key(&stream_id) && stream_id <= ctx.highest_opened {
-            // Closed, and let go: answered as while closed streams were kept (the block is
-            // decoded above all the same, so the HPACK table stays in step).
-            ctx.send_rst_stream(stream_id, H2Error::StreamClosed);
             return Ok(());
         }
 
@@ -1262,11 +1272,11 @@ mod tests {
     }
 
     /// A closed stream is taken out of the map when its transaction ends (T186). HEADERS
-    /// on its id again is still a closed stream's (RST_STREAM STREAM_CLOSED, as while it
-    /// was kept), not a new request, and the HPACK table stays in step: the next new
-    /// stream decodes.
+    /// on its id again is still a closed stream's, not a new request: a connection error
+    /// STREAM_CLOSED naming the highest stream seen (HAProxy measured: GOAWAY last 1,
+    /// STREAM_CLOSED, close; T235 -- it was an RST_STREAM, queued for every such frame).
     #[test]
-    fn headers_on_a_closed_stream_let_go_are_refused_as_closed() {
+    fn headers_on_a_closed_stream_let_go_are_goaway_stream_closed() {
         let mux = MuxH2;
         let mut ctx = mux.init(ConnId(1), true).expect("init");
         let mut hello = H2_CONN_PREFACE.to_vec();
@@ -1284,12 +1294,26 @@ mod tests {
         assert!(ctx.streams.contains_key(&1));
         ctx.streams.remove(&1);
         let sent = ctx.tx_buf.len();
-        mux.parse(&mut ctx, &get(&mut enc, "/again", 1)).expect("stream 1 again");
+        assert!(mux.parse(&mut ctx, &get(&mut enc, "/again", 1)).is_err());
         assert!(!ctx.streams.contains_key(&1), "a closed stream was opened again");
-        let rst = &ctx.tx_buf[sent..];
-        assert_eq!((rst[3], &rst[5..9], &rst[9..13]), (0x3, &[0, 0, 0, 1][..], &[0, 0, 0, 5][..]), "{rst:?}");
-        mux.parse(&mut ctx, &get(&mut enc, "/three", 3)).expect("stream 3");
-        assert_eq!(ctx.streams.get(&3).and_then(|s| s.rx_htx.req_line()).map(|r| r.uri.clone()).as_deref(), Some("/three"));
+        let g = &ctx.tx_buf[sent..];
+        assert_eq!((g[3], &g[9..13], &g[13..17]), (0x7, &[0, 0, 0, 1][..], &[0, 0, 0, 5][..]), "{g:?}");
+        assert_eq!(ctx.conn_state, H2ConnState::GoAwaySent);
+    }
+
+    /// While more than [`TX_ROOM`] of output waits for the client, no frame is processed,
+    /// so none is answered: a client that reads nothing cannot make replies pile up (T235).
+    #[test]
+    fn a_full_output_holds_the_demux_until_the_client_reads() {
+        let (mux, mut ctx) = open_conn();
+        ctx.tx_buf.resize(TX_ROOM + 1, 0);
+        let ping = Frame::Ping { flags: 0, opaque_data: [7; 8] }.encode();
+        let before = ctx.tx_buf.len();
+        mux.parse(&mut ctx, &ping).expect("ping");
+        assert_eq!(ctx.tx_buf.len(), before, "a PING was answered past a full output");
+        mux.consume_output(&mut ctx, TX_ROOM + 1);
+        ctx.resume();
+        assert_eq!(ctx.tx_buf.len(), 17, "the PING is answered once the client has read");
     }
 
     fn open_conn() -> (MuxH2, H2MuxContext) {

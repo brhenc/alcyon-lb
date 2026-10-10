@@ -1593,6 +1593,8 @@ impl TcpSession {
                 match self.cli_xprt.send(self.cli.as_fd(), &h2.tx_buf[h2.tx_consumed..])? {
                     Io::Done(n) if n > 0 => {
                         MuxH2.consume_output(h2, n);
+                        // Room for replies again: a demux held on a full output goes on.
+                        h2.resume();
                         self.bytes_out += n as u64;
                         changed = true;
                     }
