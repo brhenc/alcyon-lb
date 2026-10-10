@@ -103,6 +103,7 @@ pub(crate) fn parse_listen_header(
         http_mode: defaults.map_or(HttpMode::KeepAlive, |d| d.http_mode),
         persist: defaults.is_some_and(|d| d.persist),
         dontlognull: defaults.is_some_and(|d| d.dontlognull),
+        http_ignore_probes: defaults.is_some_and(|d| d.http_ignore_probes),
         log_opts: defaults.map_or(0, |d| d.log_opts),
         cliexp: Vec::new(),
         srvexp: Vec::new(),
@@ -202,6 +203,7 @@ pub(crate) fn parse_frontend_header(
         buffer_request: defaults.is_some_and(|d| d.buffer_request),
         http_mode: defaults.map_or(HttpMode::KeepAlive, |d| d.http_mode),
         dontlognull: defaults.is_some_and(|d| d.dontlognull),
+        http_ignore_probes: defaults.is_some_and(|d| d.http_ignore_probes),
         h1_adjust: defaults.map_or(0, |d| d.h1_adjust & crate::ast::H1_ADJ_CLIENT),
         log_opts: defaults.map_or(0, |d| d.log_opts),
         stick_table: None,
@@ -982,6 +984,7 @@ pub(crate) fn parse_option_listen(
         "persist" => proxy.persist = true,
         "http-keep-alive" => proxy.http_mode = HttpMode::KeepAlive,
         "dontlognull" => proxy.dontlognull = true,
+        "http-ignore-probes" => proxy.http_ignore_probes = true,
         "h1-case-adjust-bogus-client" => proxy.h1_adjust |= crate::ast::H1_ADJ_CLIENT,
         "h1-case-adjust-bogus-server" => proxy.h1_adjust |= crate::ast::H1_ADJ_SERVER,
         "dontlog-normal" | "log-separate-errors" | "logasap" => proxy.log_opts |= crate::ast::log_opt_bit(&tokens[1].text),
@@ -1040,6 +1043,10 @@ pub(crate) fn parse_option_frontend(
     }
     if tokens[1].text == "dontlognull" {
         fe.dontlognull = true;
+        return Ok(());
+    }
+    if tokens[1].text == "http-ignore-probes" {
+        fe.http_ignore_probes = true;
         return Ok(());
     }
     if tokens[1].text == "h1-case-adjust-bogus-client" {
@@ -1121,6 +1128,7 @@ pub(crate) fn parse_no_listen(proxy: &mut ListenSection, tokens: &[Token], kw: &
         Some("httpclose") if proxy.http_mode == HttpMode::Close => proxy.http_mode = HttpMode::KeepAlive,
         Some("persist") => proxy.persist = false,
         Some("dontlognull") => proxy.dontlognull = false,
+        Some("http-ignore-probes") => proxy.http_ignore_probes = false,
         Some("h1-case-adjust-bogus-client") => proxy.h1_adjust &= !crate::ast::H1_ADJ_CLIENT,
         Some("h1-case-adjust-bogus-server") => proxy.h1_adjust &= !crate::ast::H1_ADJ_SERVER,
         Some(n @ ("dontlog-normal" | "log-separate-errors" | "logasap")) => proxy.log_opts &= !crate::ast::log_opt_bit(n),
@@ -1147,6 +1155,7 @@ pub(crate) fn parse_no_frontend(fe: &mut FrontendSection, tokens: &[Token], kw: 
         Some("http-server-close") if fe.http_mode == HttpMode::ServerClose => fe.http_mode = HttpMode::KeepAlive,
         Some("httpclose") if fe.http_mode == HttpMode::Close => fe.http_mode = HttpMode::KeepAlive,
         Some("dontlognull") => fe.dontlognull = false,
+        Some("http-ignore-probes") => fe.http_ignore_probes = false,
         Some("h1-case-adjust-bogus-client") => fe.h1_adjust &= !crate::ast::H1_ADJ_CLIENT,
         Some(n @ ("dontlog-normal" | "log-separate-errors" | "logasap")) => fe.log_opts &= !crate::ast::log_opt_bit(n),
         _ => {}

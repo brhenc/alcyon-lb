@@ -14,11 +14,13 @@
 //! |------------------------------|-----------:|--------------------------------------|
 //! | nothing (HTTP/1.1)           | 0.0 s      | `400 ... CR-- ... "<BADREQ>"`        |
 //! | a request, server silent     | 0.0 s      | `b/s ... 400 ... CD-- ... "GET / ..."` |
-//! | the HTTP/2 preface, SETTINGS | 0.0 s      | `0 ... PR-- ... "<BADREQ>"`          |
+//! | the HTTP/2 preface, SETTINGS | 0.0 s      | none                                 |
 //!
 //! Ibex held all three for the 30 s of a timeout (`408 cR--`, `504 sH--`, `408 cR--`). Now
-//! it closes them at once, with `HAProxy`'s log for the first two; the HTTP/2 one is logged
-//! `400 CR--`, as `HAProxy` logs an HTTP/2 client's reset at that point.
+//! it closes them at once, with `HAProxy`'s log. (T261 first recorded `0 PR--` for the
+//! HTTP/2 row; T272 measured it again, 5 runs with this test's client, and `HAProxy` logs
+//! nothing: an HTTP/2 connection with no stream is logged only for a protocol error, see
+//! `h2_connection_end_log.rs`.)
 
 mod common;
 
@@ -214,12 +216,19 @@ fn a_bad_record_on_an_http2_connection_closes_it() {
     let ibex = start(be);
     let preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\0\0\0\x04\0\0\0\0\0";
     let port = assert_prompt(bad_record_after(&ibex, b"h2", preface));
-    // Logged once. HAProxy logs it `0 ... PR--`; Ibex logs `400 ... CR--`, which is what
-    // HAProxy logs for an HTTP/2 client that resets or half-closes at this point: the
-    // flags are not this test's subject (see the report of T261).
-    let log = log_of(&ibex, port);
-    assert!(log.ends_with("\"<BADREQ>\""), "{log}");
     assert_eq!(scur(&ibex, "t", "FRONTEND"), "0");
+    // Not logged: no stream was opened (T272). An HTTP/1 connection's bad record after it
+    // is logged; nothing from the first connection comes before that line.
+    let from = format!("127.0.0.1:{port} ");
+    let next = assert_prompt(bad_record_after(&ibex, b"http/1.1", b""));
+    let next_from = format!("127.0.0.1:{next} ");
+    loop {
+        let line = ibex.logs.recv_timeout(PROMPT).expect("no log line");
+        assert!(!line.starts_with(&from), "logged: {line}");
+        if line.starts_with(&next_from) {
+            break;
+        }
+    }
 }
 
 /// A socket error the transport does not map (here `ECONNREFUSED`, as an ICMP error leaves on
