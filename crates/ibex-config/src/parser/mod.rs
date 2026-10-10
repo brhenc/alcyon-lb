@@ -1094,27 +1094,56 @@ pub(crate) fn parse_timeout_directive(
     tokens: &[Token],
     kw: &Token,
 ) -> Result<(), ConfigError> {
-    if tokens.len() < 3 || tokens[1].text.is_empty() || tokens[2].text.is_empty() {
+    // `proxy_parse_timeout` (src/proxy.c), measured on 3.5-dev8: the word first, then the
+    // value. `handshake` is in HAProxy's list and refused by it all the same.
+    let target = tokens.get(1).map_or("", |t| t.text.as_str());
+    let slot = match target {
+        "connect" => &mut timeouts.connect,
+        "client" => &mut timeouts.client,
+        "server" => &mut timeouts.server,
+        "http-request" => &mut timeouts.http_request,
+        "http-keep-alive" => &mut timeouts.http_keep_alive,
+        "check" => &mut timeouts.check,
+        "queue" => &mut timeouts.queue,
+        "tunnel" => &mut timeouts.tunnel,
+        "tarpit" => &mut timeouts.tarpit,
+        // HAProxy's, which Ibex has no use for: refused rather than dropped (T240).
+        "client-fin" | "server-fin" | "client-hs" => &mut None,
+        _ => {
+            return Err(ConfigError::new(
+                kw.line,
+                kw.col,
+                format!(
+                    "'timeout' supports 'client', 'server', 'connect', 'check', 'queue', 'handshake', 'http-keep-alive', \
+                     'http-request', 'tunnel', 'tarpit', 'client-fin' and 'server-fin' (got '{target}')"
+                ),
+            ));
+        }
+    };
+    let Some(value) = tokens.get(2).filter(|t| !t.text.is_empty()) else {
+        return Err(ConfigError::new(kw.line, kw.col, format!("'timeout {target}' expects an integer value (in milliseconds)")));
+    };
+    let dur = parse_timer(value, "timeout", |a| format!("timer overflow in argument '{a}' to 'timeout {target}' {TIMER_LIMIT}"))
+        .map_err(|e| {
+            if e.message.starts_with("timer overflow") {
+                return e;
+            }
+            let rest = value.text.trim_start_matches(|c: char| c.is_ascii_digit());
+            let unit = ["ms", "s", "m", "h", "d"].into_iter().find(|u| rest.starts_with(u)).map_or(0, str::len);
+            let bad = rest[unit..].chars().next().unwrap_or_default();
+            ConfigError::new(value.line, value.col, format!("unexpected character '{bad}' in 'timeout {target}'"))
+        })?;
+    if let Some(extra) = tokens.get(3) {
         return Err(ConfigError::new(
-            kw.line,
-            kw.col,
-            "<timeout> expects <target> and <time_in_ms> as arguments.",
+            extra.line,
+            extra.col,
+            format!("'timeout {target}' : unexpected extra argument '{}' after value '{}'.", extra.text, value.text),
         ));
     }
-    let target = &tokens[1].text;
-    let dur = parse_timer(&tokens[2], "timeout", |a| format!("timer overflow in argument '{a}' to 'timeout {target}' {TIMER_LIMIT}"))?;
-    match target.as_str() {
-        "connect" => timeouts.connect = Some(dur),
-        "client" => timeouts.client = Some(dur),
-        "server" => timeouts.server = Some(dur),
-        "http-request" => timeouts.http_request = Some(dur),
-        "http-keep-alive" => timeouts.http_keep_alive = Some(dur),
-        "check" => timeouts.check = Some(dur),
-        "queue" => timeouts.queue = Some(dur),
-        "tunnel" => timeouts.tunnel = Some(dur),
-        "tarpit" => timeouts.tarpit = Some(dur),
-        _ => {}
+    if matches!(target, "client-fin" | "server-fin" | "client-hs") {
+        return Err(ConfigError::new(kw.line, kw.col, format!("'timeout {target}' is not implemented in Ibex")));
     }
+    *slot = Some(dur);
     Ok(())
 }
 
@@ -1211,21 +1240,9 @@ pub(crate) fn parse_maxconn(maxconn: &mut u32, tokens: &[Token], kw: &Token) -> 
 
 
 
-pub(crate) fn parse_grace(
-    grace: &mut Option<Duration>,
-    tokens: &[Token],
-    kw: &Token,
-) -> Result<(), ConfigError> {
-    if tokens.len() < 2 || tokens[1].text.is_empty() {
-        return Err(ConfigError::new(
-            kw.line,
-            kw.col,
-            "<grace> expects a time in milliseconds.",
-        ));
-    }
-    let g = parse_timeout(&tokens[1], "grace")?;
-    *grace = Some(g);
-    Ok(())
+/// `grace`, removed from HAProxy in 2.5: refused in every proxy section with its text.
+pub(crate) fn parse_grace(kw: &Token) -> Result<(), ConfigError> {
+    Err(ConfigError::new(kw.line, kw.col, "the 'grace' keyword is not supported any more since HAProxy version 2.5."))
 }
 
 pub(crate) fn parse_redisp(kw: &Token) -> Result<(), ConfigError> {
@@ -1561,7 +1578,6 @@ listen proxy1
 	maxconn 60000
 	option redispatch
 	retries	3
-	grace 3000
 
 listen proxy2
 	bind 0.0.0.0:3129
@@ -1571,7 +1587,6 @@ listen proxy2
 	timeout server	150000
 	maxconn 60000
 	retries	3
-	grace 3000
 
 listen health
 	bind 0.0.0.0:3130
@@ -1579,7 +1594,6 @@ listen health
 	timeout client	1500
 	timeout server	1500
 	maxconn 4
-	grace 0
 ";
         let config = parse_str(sample).unwrap();
         assert_eq!(config.listens.len(), 3);

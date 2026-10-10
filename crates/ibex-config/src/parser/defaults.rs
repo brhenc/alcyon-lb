@@ -160,6 +160,7 @@ pub(crate) fn parse_defaults_directive(
             defaults.hash_preserve_affinity = Some(a);
             Ok(())
         }
+        "grace" => parse_grace(kw),
         "cliexp" => parse_cliexp(kw),
         "srvexp" => parse_srvexp(kw),
         "http-check" => {

@@ -243,8 +243,6 @@ pub struct ListenSection {
     pub redisp_after: i32,
     /// Maximum concurrent connections for this proxy; 0 when not set, which is the global `maxconn`.
     pub maxconn: u32,
-    /// Grace time in milliseconds / Duration before stopping.
-    pub grace: Option<Duration>,
     /// Default dispatch address to connect to.
     pub dispatch: Option<SocketAddr>,
     /// Known backend servers.
@@ -414,7 +412,6 @@ impl Default for ListenSection {
             redisp: false,
             redisp_after: -1,
             maxconn: 0,
-            grace: None,
             dispatch: None,
             default_server: None,
             use_servers: Vec::new(),
