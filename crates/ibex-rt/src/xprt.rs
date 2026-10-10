@@ -576,6 +576,15 @@ mod tests {
         // One the table does not know keeps rustls's name.
         assert_eq!(openssl_cipher_name("TLS_FUTURE_SUITE"), "TLS_FUTURE_SUITE");
     }
+
+    /// A plaintext client has no handshake to fail: a read error on it is an ordinary
+    /// close, never the TLS-handshake-failure path in `proxy.rs`.
+    #[test]
+    fn a_plain_client_never_fails_a_handshake() {
+        let x = super::ClientXprt::Plain;
+        assert!(x.is_ready());
+        assert!(!x.handshake_failed());
+    }
 }
 
 /// The transport under a backend server connection.
