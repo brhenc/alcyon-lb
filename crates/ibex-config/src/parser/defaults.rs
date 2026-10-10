@@ -17,6 +17,7 @@ pub(crate) fn parse_defaults_directive(
             defaults.mode = Some(mode);
             Ok(())
         }
+        "default_backend" => parse_default_backend(&mut defaults.default_backend, tokens, kw),
         "timeout" => parse_timeout_directive(&mut defaults.timeouts, tokens, kw),
         "retries" => {
             let mut r = defaults.retries.unwrap_or(0);
@@ -203,6 +204,9 @@ pub(crate) fn parse_option_defaults(
     tokens: &[Token],
     kw: &Token,
 ) -> Result<(), ConfigError> {
+    if let Some(renamed) = rename_deprecated_option(OptSection::Defaults, tokens, kw)? {
+        return parse_option_defaults(defaults, &renamed, kw);
+    }
     // `option httplog`/`tcplog` (and `clf`) are the log format (T53), ahead of the option
     // table: the table would otherwise warn and drop them.
     if let Some(spec) = parse_log_option(tokens, kw) {

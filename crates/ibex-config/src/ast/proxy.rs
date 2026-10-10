@@ -36,6 +36,8 @@ pub struct DefaultsSection {
     pub redisp_after: i32,
     /// Default maxconn.
     pub maxconn: Option<u32>,
+    /// `default_backend`, inherited by the frontends and listens that name none.
+    pub default_backend: Option<String>,
     /// Default load balancing algorithm.
     pub balance: Option<BalanceAlgorithm>,
     /// The `cookie` line, inherited by the backends and listens that have none.

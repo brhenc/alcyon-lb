@@ -452,7 +452,7 @@ pub(crate) fn parse_global_directive(
             }
             let dir = tokens.get(1).map_or("", |t| t.text.as_str());
             if global.chroot.is_some() {
-                global.load_warnings.push(LoadWarning { line: kw.line, alert: false, text: "'chroot' is already specified. Continuing.".into() });
+                global.load_warnings.push(LoadWarning { line: kw.line, alert: false, text: "'chroot' is already specified. Continuing.".into(), style: crate::ast::global::WarnStyle::SpacedBlank });
                 return Ok(());
             }
             if dir.is_empty() {
@@ -875,7 +875,7 @@ fn parse_identity(global: &mut GlobalSection, tokens: &[Token], kw: &Token) -> R
     let arg = tokens.get(1).map_or("", |t| t.text.as_str());
     let is_user = matches!(name, "user" | "uid");
     let slot = if is_user { global.uid } else { global.gid };
-    let mut note = |alert: bool, text: String| global.load_warnings.push(LoadWarning { line: kw.line, alert, text });
+    let mut note = |alert: bool, text: String| global.load_warnings.push(LoadWarning { line: kw.line, alert, text, style: crate::ast::global::WarnStyle::Spaced });
     if slot.is_some() {
         note(true, match name {
             "user" | "uid" => "user/uid already specified. Continuing.".into(),

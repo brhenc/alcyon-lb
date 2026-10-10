@@ -5,6 +5,7 @@ use std::collections::HashMap;
 
 use super::*;
 use crate::ast::HttpMode;
+use crate::ast::global::WarnStyle;
 
 pub(crate) fn parse_listen_header(
     tokens: &[Token],
@@ -111,7 +112,7 @@ pub(crate) fn parse_listen_header(
         use_backends: Vec::new(),
         force_be_switch: Vec::new(),
         monitor_uri: None,
-        default_backend: None,
+        default_backend: defaults.and_then(|d| d.default_backend.clone()),
         balance: defaults.and_then(|d| d.balance).unwrap_or(BalanceAlgorithm::RoundRobin),
         stick_table: None,
         stick_rules: Vec::new(),
@@ -185,7 +186,7 @@ pub(crate) fn parse_frontend_header(
         clitimeout: timeouts.client,
         timeouts,
         maxconn: defaults.and_then(|d| d.maxconn).unwrap_or(0),
-        default_backend: None,
+        default_backend: defaults.and_then(|d| d.default_backend.clone()),
         use_backends: Vec::new(),
         force_be_switch: Vec::new(),
         monitor_uri: None,
@@ -498,10 +499,7 @@ pub(crate) fn parse_frontend_directive(
         // backend's (`warnifnotcap(curproxy, PR_CAP_BE, ...)`).
         "cookie" => {
             parse_cookie(&mut None, tokens, kw)?;
-            eprintln!(
-                "[ibex] warning: line {}: 'cookie' ignored because frontend '{}' has no backend capability.",
-                kw.line, fe.name
-            );
+            warn::push(kw.line, WarnStyle::Spaced, &format!("'cookie' ignored because frontend '{}' has no backend capability.", fe.name));
             Ok(())
         }
         "tcp-request" => parse_frontend_tcp_request(fe, tokens, kw),
@@ -568,7 +566,7 @@ pub(crate) fn parse_frontend_directive(
         "stick-table" => parse_stick_table(&mut fe.stick_table, tokens, kw),
         // A frontend has no backend capability: `HAProxy` warns and ignores the line.
         "stick" => {
-            eprintln!("[ibex] warning: 'stick' ignored because frontend '{}' has no backend capability.", fe.name);
+            warn::push(kw.line, WarnStyle::Spaced, &format!("'stick' ignored because frontend '{}' has no backend capability.", fe.name));
             Ok(())
         }
         "track-sc0" | "track-sc1" | "track-sc2" => {
@@ -959,6 +957,9 @@ pub(crate) fn parse_option_listen(
     tokens: &[Token],
     kw: &Token,
 ) -> Result<(), ConfigError> {
+    if let Some(renamed) = rename_deprecated_option(OptSection::Listen, tokens, kw)? {
+        return parse_option_listen(proxy, &renamed, kw);
+    }
     // `option httplog`/`tcplog` (and `clf`) are the log format (T53), ahead of the option
     // table: the table would otherwise warn and drop them.
     if let Some(spec) = parse_log_option(tokens, kw) {
@@ -1007,6 +1008,9 @@ pub(crate) fn parse_option_frontend(
     tokens: &[Token],
     kw: &Token,
 ) -> Result<(), ConfigError> {
+    if let Some(renamed) = rename_deprecated_option(OptSection::Frontend, tokens, kw)? {
+        return parse_option_frontend(fe, &renamed, kw);
+    }
     // `option httplog`/`tcplog` (and `clf`) are the log format (T53), ahead of the option
     // table: the table would otherwise warn and drop them.
     if let Some(spec) = parse_log_option(tokens, kw) {
@@ -1072,6 +1076,9 @@ pub(crate) fn parse_option_backend(
     tokens: &[Token],
     kw: &Token,
 ) -> Result<(), ConfigError> {
+    if let Some(renamed) = rename_deprecated_option(OptSection::Backend, tokens, kw)? {
+        return parse_option_backend(be, &renamed, kw);
+    }
     // Parsed (an error in it is still an error) and ignored in backends, as `HAProxy`
     // ignores it ("'option httplog' directive is ignored in backends").
     if let Some(spec) = parse_log_option(tokens, kw) {

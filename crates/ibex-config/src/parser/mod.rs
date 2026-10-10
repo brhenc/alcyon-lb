@@ -135,6 +135,8 @@ pub(crate) use scalars::*;
 pub(crate) mod error_pages;
 pub(crate) mod sample_refs;
 pub(crate) mod scope;
+pub(crate) mod warn;
+pub(crate) mod refs;
 pub use sample_refs::log_format_exprs;
 pub(crate) use error_pages::*;
 
@@ -165,8 +167,10 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
     // parse many configs -- cannot leak a section into this one.
     clear_http_errors_sections();
     clear_userlists();
+    warn::reset();
 
     let mut global: Option<GlobalSection> = None;
+    let mut proxy_warnings: Vec<crate::ast::global::LoadWarning> = Vec::new();
     let mut defaults: Option<DefaultsSection> = None;
     let mut named_defaults: std::collections::HashMap<String, DefaultsSection> = std::collections::HashMap::new();
     let mut listens = Vec::new();
@@ -430,6 +434,28 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                         d.httpchk = true;
                     }
                 }
+                // `stats show-desc` with no text and no `global description` yet: a warning,
+                // and nothing is set (src/cfgparse-listen.c).
+                if kw.text == "stats"
+                    && tokens.len() == 2
+                    && tokens[1].text == "show-desc"
+                    && matches!(section, CurrentSection::Defaults(_) | CurrentSection::Listen(_) | CurrentSection::Frontend(_) | CurrentSection::Backend(_))
+                    && !global.as_ref().is_some_and(|g| g.description.is_some())
+                {
+                    proxy_warnings.push(crate::ast::global::LoadWarning {
+                        line: kw.line,
+                        alert: false,
+                        text: "'show-desc' requires a parameter or 'desc' to be set in the global section.".into(),
+                        style: crate::ast::global::WarnStyle::Tight,
+                    });
+                    continue;
+                }
+                match &*section {
+                    CurrentSection::Listen(l) => warn::set_proxy(&l.name),
+                    CurrentSection::Frontend(f) => warn::set_proxy(&f.name),
+                    CurrentSection::Backend(b) => warn::set_proxy(&b.name),
+                    _ => warn::set_proxy(""),
+                }
                 parse_section_directive(section, tokens, kw)?;
                 if kw.text == "id" {
                     for (kind, name, id) in section.explicit_id() {
@@ -518,6 +544,11 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
         userlists,
         proxy_order,
         directive_messages,
+        proxy_warnings: {
+            proxy_warnings.extend(warn::take());
+            proxy_warnings.sort_by_key(|w| w.line);
+            proxy_warnings
+        },
     };
     register_checks_from_config(&config);
 
@@ -955,9 +986,10 @@ pub(crate) fn parse_cookie(
                     return fail("'domain' expects <domain> as argument.".to_string());
                 };
                 if !d.contains('.') {
-                    eprintln!(
-                        "[ibex] warning: line {}: domain '{d}' contains no embedded dot, this configuration may not work properly (see RFC6265#5.2.3).",
-                        kw.line
+                    warn::push(
+                        kw.line,
+                        crate::ast::global::WarnStyle::Tight,
+                        &format!("domain '{d}' contains no embedded dot, this configuration may not work properly (see RFC6265#5.2.3)."),
                     );
                 }
                 if let Some(c) = d.chars().find(|c| !c.is_ascii_alphanumeric() && !matches!(c, '.' | '_' | '-')) {
@@ -1294,6 +1326,17 @@ pub(crate) fn parse_use_backend(
             "<use_backend> expects <backend_name> as argument.",
         ));
     }
+    // HAProxy builds the name from a log-format string when it holds `%`; Ibex looks the
+    // written text up as a name, never finds it and sends the request to the default
+    // backend, as if the rule had not matched.
+    if tokens[1].text.contains('%') {
+        return Err(ConfigError::new(
+            tokens[1].line,
+            tokens[1].col,
+            "'use_backend' with a log-format backend name is not implemented by Ibex; \
+             the rule would never match",
+        ));
+    }
     let backend = tokens[1].text.clone();
     let cond = if tokens.len() >= 3 {
         parse_acl_condition_from_tokens(&tokens[2..])?
@@ -1414,6 +1457,7 @@ fn validate_tracking(listens: &[ListenSection], backends: &[BackendSection]) -> 
         .map(|l| (l.name.as_str(), l.servers.as_slice()))
         .chain(backends.iter().map(|b| (b.name.as_str(), b.servers.as_slice())))
         .collect();
+    let extras: Vec<&ServerExtras> = listens.iter().map(|l| &l.server_extras).chain(backends.iter().map(|b| &b.server_extras)).collect();
     let find = |px: &str, sv: &str| -> Option<(usize, usize)> {
         let p = all.iter().position(|(n, _)| *n == px)?;
         Some((p, all[p].1.iter().position(|s| s.id == sv)?))
@@ -1423,7 +1467,9 @@ fn validate_tracking(listens: &[ListenSection], backends: &[BackendSection]) -> 
     for (p, (px, servers)) in all.iter().enumerate() {
         for (s, server) in servers.iter().enumerate() {
             let Some(spec) = &server.track else { continue };
-            let err = |msg: String| ConfigError::new(1, 1, format!("'server {px}/{}' : {msg}", server.id));
+            // HAProxy prints these after the parse, with the `server` line's place and no frame.
+            let at = extras[p].track_line.iter().find(|e| e.0 as usize == s).map_or(0, |e| e.1 as usize);
+            let err = |msg: String| ConfigError::alerts(vec![(at, format!("{{at}} : 'server {px}/{}' : {msg}", server.id))]);
             if server.check {
                 return Err(err("unable to enable checks and tracking at the same time!".to_string()));
             }
@@ -1499,16 +1545,16 @@ pub(crate) fn validate_config(
     for l in listens {
         for r in &l.use_servers {
             if !l.servers.iter().any(|s| s.id == r.server) {
-                return Err(ConfigError::new(1, 1, format!(
-                    "listen '{}' : unable to find server '{}' referenced in a 'use-server' rule.", l.name, r.server)));
+                return Err(ConfigError::alerts(vec![(0, format!(
+                    "proxy '{}' : unable to find server '{}' referenced in a 'use-server' rule.", l.name, r.server))]));
             }
         }
     }
     for b in backends {
         for r in &b.use_servers {
             if !b.servers.iter().any(|s| s.id == r.server) {
-                return Err(ConfigError::new(1, 1, format!(
-                    "backend '{}' : unable to find server '{}' referenced in a 'use-server' rule.", b.name, r.server)));
+                return Err(ConfigError::alerts(vec![(0, format!(
+                    "backend '{}' : unable to find server '{}' referenced in a 'use-server' rule.", b.name, r.server))]));
             }
         }
     }

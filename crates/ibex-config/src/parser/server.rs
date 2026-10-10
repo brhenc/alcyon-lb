@@ -197,6 +197,9 @@ pub(crate) fn parse_server(
     if puid != 0 {
         extras.puid.push((index, puid));
     }
+    if track.is_some() {
+        extras.track_line.push((index, u32::try_from(kw.line).unwrap_or(u32::MAX)));
+    }
     servers.push(Server {
         check_port,
         check_proto,
@@ -260,7 +263,7 @@ fn parse_server_ssl_keyword(
     };
     // HAProxy skips these on a default-server line with an alert; the configuration is valid.
     if who.is_none() && matches!(kw.text.as_str(), "no-sslv3" | "no-tlsv10" | "no-tlsv11" | "no-tlsv12" | "no-tlsv13") {
-        eprintln!("[ibex] warning: '{}' option is not accepted in default-server sections; ignored", kw.text);
+        super::warn::push_alert(kw.line, crate::ast::global::WarnStyle::At, &format!("'{}' option is not accepted in default-server sections", kw.text));
         return Ok(Some(i));
     }
     let last = match kw.text.as_str() {

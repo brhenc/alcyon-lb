@@ -199,7 +199,7 @@ pub(crate) fn unimplemented_server_keyword(tokens: &[Token], i: usize, server: O
         return Ok(last);
     }
     if server.is_none() && !k.default_ok {
-        eprintln!("[ibex] warning: '{}' option is not accepted in default-server sections; ignored", k.name);
+        super::warn::push_alert(tok.line, crate::ast::global::WarnStyle::At, &format!("'{}' option is not accepted in default-server sections", k.name));
         return Ok(last);
     }
     match k.outcome {

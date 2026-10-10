@@ -646,12 +646,31 @@ fn main() {
         eprintln!("[{sev}]{pad} ({}) : config : parsing [{file}:{}]: '{}'.", process::id(), m.line, m.text);
     }
 
-    // 5-ter. What `global` keywords printed while they were parsed and went on (a second
-    //     `user`, a `uid` that is not a number).
-    for w in config.global.iter().flat_map(|g| &g.load_warnings) {
+    // 5-ter. What the keywords printed while they were parsed and went on (a second `user`,
+    //     a `uid` that is not a number, `cookie` in a frontend), in the order of the lines,
+    //     each in the frame HAProxy gives it; then what it finds once everything is read
+    //     (no `bind`, missing timeouts).
+    let mut load_msgs: Vec<&ibex_config::ast::global::LoadWarning> =
+        config.global.iter().flat_map(|g| &g.load_warnings).chain(&config.proxy_warnings).collect();
+    load_msgs.sort_by_key(|w| w.line);
+    let mut warned = config.directive_messages.iter().any(|m| m.warning);
+    for w in load_msgs {
+        use ibex_config::ast::global::WarnStyle;
         let (file, line) = locate(&config_starts, w.line);
         let sev = if w.alert { "[ALERT]   " } else { "[WARNING] " };
-        eprintln!("{sev} ({}) : config : parsing [{file}:{line}] : {}", process::id(), w.text);
+        let pid = process::id();
+        match w.style {
+            WarnStyle::Spaced => eprintln!("{sev} ({pid}) : config : parsing [{file}:{line}] : {}", w.text),
+            WarnStyle::SpacedBlank => eprintln!("{sev} ({pid}) : config : parsing [{file}:{line}] : {}\n", w.text),
+            WarnStyle::Tight => eprintln!("{sev} ({pid}) : config : parsing [{file}:{line}]: {}", w.text),
+            WarnStyle::At => eprintln!("{sev} ({pid}) : config : [{file}:{line}] : {}", w.text),
+            WarnStyle::Bare => eprintln!("{sev} ({pid}) : {}", w.text),
+        }
+        warned |= !w.alert;
+    }
+    for text in config.check_warnings() {
+        eprintln!("[WARNING]  ({}) : {text}", process::id());
+        warned = true;
     }
 
     // 5a. Every rule action's expression must name fetches and converters that exist.
@@ -659,6 +678,15 @@ fn main() {
     //     it and a start fails before anything is daemonized, signalled or bound.
     if let Err(e) = ibex_rt::rule_exprs::validate_config(&config) {
         config_failed(&config_starts, None, &e);
+    }
+
+    // 5a-bis. `default_backend`, `use_backend` and `track-sc` tables that name nothing: what
+    //     `HAProxy` checks once everything is read, after the rules' expressions.
+    if let Err(err) = config.check_references() {
+        for (_, text) in &err.alerts {
+            eprintln!("[ALERT]    ({}) : {text}", process::id());
+        }
+        process::exit(1);
     }
 
     // 5b. TLS is wired now: `Engine::new` builds a rustls config per `bind ... ssl crt`
@@ -728,6 +756,9 @@ fn main() {
         if let Err(e) = ibex_rt::validate_tls(&config) {
             eprintln!("Configuration error: {e}");
             process::exit(1);
+        }
+        if warned {
+            println!("Warnings were found.");
         }
         if !opts.quiet {
             if opts.verbose {

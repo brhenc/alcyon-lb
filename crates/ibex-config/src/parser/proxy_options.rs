@@ -210,7 +210,7 @@ fn err(kw: &Token, msg: String) -> ConfigError {
 /// Only a frontend lacks a backend, and only a backend lacks a frontend.
 fn missing_capability(spec: &OptSpec) -> String {
     let (section, lacks) = if matches!(spec.cap, Cap::Be) { ("frontend", "backend") } else { ("backend", "frontend") };
-    format!("'{}' ignored because {section} has no {lacks} capability", spec.name)
+    format!("'{}' ignored because {section} '{{px}}' has no {lacks} capability", spec.name)
 }
 
 /// Decides an `option` line. `Ok(true)`: the caller implements the option and applies it.
@@ -233,9 +233,9 @@ pub(crate) fn check_option(section: OptSection, tokens: &[Token], kw: &Token) ->
     if !applies(spec, section) {
         let why = missing_capability(spec);
         if spec.kind == Kind::Table {
-            return Err(err(kw, format!("{why}: unknown option '{name}'.")));
+            return Err(err(kw, format!("{}: unknown option '{name}'.", why.replace(" '{px}'", ""))));
         }
-        eprintln!("[ibex] warning: {why}.");
+        super::warn::push(kw.line, crate::ast::global::WarnStyle::Spaced, &format!("{why}."));
         return Ok(false);
     }
     if IMPLEMENTED.contains(&name) {
@@ -247,6 +247,13 @@ pub(crate) fn check_option(section: OptSection, tokens: &[Token], kw: &Token) ->
     }
     if let Some((_, why)) = OPTIONS_THAT_MUST_NOT_BE_IGNORED.iter().find(|(o, _)| *o == name) {
         return Err(err(kw, format!("'option {name}' is not supported: {why}.")));
+    }
+    if name == "accept-unsafe-violations-in-http-response" {
+        // HAProxy answers 502 to a response with an invalid header name or a NUL in a value
+        // unless this is set. Ibex does not validate the response head, so there is nothing
+        // to relax (docs/differences.md, "Server responses are not validated").
+        eprintln!("[ibex] notice: 'option {name}' has nothing to relax: Ibex does not reject invalid HTTP responses.");
+        return Ok(false);
     }
     eprintln!("[ibex] warning: 'option {name}' is not implemented and is ignored.");
     Ok(false)
@@ -286,12 +293,12 @@ pub(crate) fn check_no_option<'t>(section: OptSection, tokens: &'t [Token], kw: 
         Kind::Removed(msg) => return Err(err(kw, msg.to_string())),
         Kind::Plain => return Err(err(kw, format!("negation/default is not supported for option '{name}'."))),
         Kind::Table if !applies(spec, section) => {
-            return Err(err(kw, format!("{}: unknown option '{name}'.", missing_capability(spec))));
+            return Err(err(kw, format!("{}: unknown option '{name}'.", missing_capability(spec).replace(" '{px}'", ""))));
         }
         Kind::Table | Kind::Negatable => {}
     }
     if !applies(spec, section) {
-        eprintln!("[ibex] warning: {}.", missing_capability(spec));
+        super::warn::push(kw.line, crate::ast::global::WarnStyle::Spaced, &format!("{}.", missing_capability(spec)));
         return Ok(None);
     }
     if IMPLEMENTED.contains(&name) {
@@ -386,4 +393,35 @@ pub(crate) fn parse_forwarded_option(tokens: &[Token]) -> Result<crate::ast::For
         }
     }
     Ok(f)
+}
+
+/// `option accept-invalid-http-request` and `-response` are the deprecated names of
+/// `accept-unsafe-violations-in-http-request` and `-response` (`src/cfgparse-listen.c`): they set
+/// the same flag and print a warning. Returns the line with the new name when `tokens` is
+/// one of them in a section where it applies (elsewhere `check_option` says it is ignored,
+/// under the name written), and `None` for any other option.
+///
+/// # Errors
+/// An argument after the option.
+pub(crate) fn rename_deprecated_option(section: OptSection, tokens: &[Token], kw: &Token) -> Result<Option<Vec<Token>>, ConfigError> {
+    let Some(name) = tokens.get(1).map(|t| t.text.as_str()) else { return Ok(None) };
+    let new = match name {
+        "accept-invalid-http-request" => "accept-unsafe-violations-in-http-request",
+        "accept-invalid-http-response" => "accept-unsafe-violations-in-http-response",
+        _ => return Ok(None),
+    };
+    if !find(name).is_some_and(|spec| applies(spec, section)) {
+        return Ok(None);
+    }
+    if let Some(extra) = tokens.get(2) {
+        return Err(err(kw, format!("'option {name}' cannot handle unexpected argument '{}'.", extra.text)));
+    }
+    super::warn::push(
+        tokens[1].line,
+        crate::ast::global::WarnStyle::Tight,
+        &format!("option '{name}' is deprecated. please use 'option {new}' if absolutely needed."),
+    );
+    let mut renamed = tokens.to_vec();
+    renamed[1].text = new.to_string();
+    Ok(Some(renamed))
 }

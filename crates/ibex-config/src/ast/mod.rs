@@ -76,6 +76,9 @@ pub struct Config {
     /// The `.warning` and `.notice` lines of the configuration (an `.alert` fails the
     /// parse), for the caller to print as `HAProxy` does while it loads.
     pub directive_messages: Vec<DirectiveMessage>,
+    /// Warnings of the proxy sections' keywords (`stats show-desc` without text), printed
+    /// by the caller as `HAProxy` prints them while it loads.
+    pub proxy_warnings: Vec<crate::ast::global::LoadWarning>,
 }
 
 /// A `.warning` or `.notice` directive that was in force.
@@ -124,6 +127,84 @@ pub struct ProxyIds {
 }
 
 impl Config {
+    /// The references `HAProxy` resolves once the whole configuration is read and refuses
+    /// when they dangle: `default_backend`, `use_backend` and the table of a `track-sc`
+    /// rule. Run after the checks of the rules' expressions, which `HAProxy` makes while it
+    /// parses and so reports first.
+    ///
+    /// # Errors
+    /// The alerts for the first proxy in error, in [`ConfigError::alerts`].
+    pub fn check_references(&self) -> Result<(), crate::error::ConfigError> {
+        let order: Vec<(ProxyKind, usize)> = if self.proxy_order.is_empty() {
+            (0..self.listens.len())
+                .map(|i| (ProxyKind::Listen, i))
+                .chain((0..self.frontends.len()).map(|i| (ProxyKind::Frontend, i)))
+                .chain((0..self.backends.len()).map(|i| (ProxyKind::Backend, i)))
+                .collect()
+        } else {
+            self.proxy_order.clone()
+        };
+        crate::parser::refs::validate_references(&order, &self.listens, &self.frontends, &self.backends)
+    }
+
+    /// What `HAProxy` warns about once the whole configuration is read, in proxy order
+    /// (`proxy_finalize`): a frontend with no `bind`, a proxy missing the timeouts it needs
+    /// (`client` for a frontend side; `connect` and `server`, or `tunnel` in `tcp` mode, for a
+    /// backend side with servers) and `tcp-check` rules no `option tcp-check` uses. Disabled
+    /// proxies and modes other than `tcp` and `http` are skipped.
+    #[must_use]
+    pub fn check_warnings(&self) -> Vec<String> {
+        use crate::ast::server::Mode;
+        let order: Vec<(ProxyKind, usize)> = if self.proxy_order.is_empty() {
+            (0..self.listens.len())
+                .map(|i| (ProxyKind::Listen, i))
+                .chain((0..self.backends.len()).map(|i| (ProxyKind::Backend, i)))
+                .chain((0..self.frontends.len()).map(|i| (ProxyKind::Frontend, i)))
+                .collect()
+        } else {
+            self.proxy_order.clone()
+        };
+        let mut out = Vec::new();
+        for (kind, i) in order {
+            // (type word, name, disabled, mode, has frontend cap, has servers, timeouts, unused tcp-check rules)
+            let (word, name, disabled, mode, fe, servers, t, unused_rules) = match kind {
+                ProxyKind::Listen => {
+                    let l = &self.listens[i];
+                    ("proxy", &l.name, l.disabled, l.mode, !l.binds.is_empty(), !l.servers.is_empty(), l.timeouts, !l.tcp_checks.is_empty() && !l.tcp_check)
+                }
+                ProxyKind::Frontend => {
+                    let f = &self.frontends[i];
+                    ("frontend", &f.name, f.disabled, f.mode, !f.binds.is_empty(), false, f.timeouts, false)
+                }
+                ProxyKind::Backend => {
+                    let b = &self.backends[i];
+                    ("backend", &b.name, b.disabled, b.mode, false, !b.servers.is_empty(), b.timeouts, !b.tcp_checks.is_empty() && !b.tcp_check)
+                }
+            };
+            if disabled {
+                continue;
+            }
+            let has_fe_cap = kind != ProxyKind::Backend;
+            let has_be_cap = kind != ProxyKind::Frontend;
+            if has_fe_cap && !fe {
+                out.push(format!("{word} '{name}' has no 'bind' directive. Please declare it as a backend if this was intended."));
+            }
+            let set = |d: Option<std::time::Duration>| d.is_some_and(|d| !d.is_zero());
+            if matches!(mode, Mode::Tcp | Mode::Http)
+                && ((has_fe_cap && !set(t.client))
+                    || (has_be_cap && servers && (!set(t.connect) || (!set(t.server) && (mode == Mode::Http || !set(t.tunnel))))))
+            {
+                out.push(format!(
+                    "missing timeouts for {word} '{name}'.\n   | While not properly invalid, you will certainly encounter various problems\n   | with such a configuration. To fix this, please ensure that all following\n   | timeouts are set to a non-zero value: 'client', 'connect', 'server'."
+                ));
+            }
+            if unused_rules {
+                out.push(format!("{word} '{name}' uses tcp-check rules without 'option tcp-check', so the rules are ignored."));
+            }
+        }
+        out
+    }
+
     /// Numbers the proxies as `check_config_validity` does (`src/cfgparse.c`): the
     /// explicit `id`s are kept, and each other proxy, in the order written, takes the first
     /// id not in use from a counter that starts at 2 (1 is skipped unless asked for: "an
