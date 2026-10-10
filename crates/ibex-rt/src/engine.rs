@@ -2605,6 +2605,18 @@ fn set_stream_log(entry: &mut SessionEntry, proxies: &[Proxy], pid: u32) {
 /// (not a zero `WINDOW_UPDATE` increment); Ibex logs every one. Before the whole preface (ALPN
 /// `h2`): a close or reset is logged, except with nothing received under `option
 /// dontlognull` or `option http-ignore-probes`; a failed connection or a timeout is not.
+/// The length of the empty lines (CRLF or LF) at the start of `buf`.
+fn leading_empty_lines(buf: &[u8]) -> usize {
+    let mut i = 0;
+    loop {
+        match buf.get(i..) {
+            Some([b'\n', ..]) => i += 1,
+            Some([b'\r', b'\n', ..]) => i += 2,
+            _ => return i,
+        }
+    }
+}
+
 fn h2_no_stream_end(s: &TcpSession, fe: &Proxy) -> Option<bool> {
     if let Some(h2) = s.h2_ctx.as_ref() {
         if h2.highest_opened != 0 || !h2.streams.is_empty() {
@@ -8646,6 +8658,12 @@ impl EngineDispatcher<'_> {
     #[allow(clippy::too_many_lines)]
     fn apply_http_response_rules(entry: &mut SessionEntry, proxies: &[Proxy], now: Tick) {
         let threshold = entry.sess.bufsize.saturating_sub(entry.sess.maxrewrite);
+        // Empty lines ahead of a status line are skipped (`H1_MSG_RPBEFORE`), so that the
+        // end of the head is not looked for in them (T275).
+        let blank = leading_empty_lines(entry.sess.rep.readable());
+        if blank > 0 {
+            entry.sess.rep.replace_prefix(blank, b"");
+        }
         let Some((hdr_len, eoh_len)) = crate::proxy::find_eoh(entry.sess.rep.readable()) else {
             // No end of head and no room for more: as for a request, from `bufsize - 56`
             // (T265).
@@ -8658,18 +8676,45 @@ impl EngineDispatcher<'_> {
         let be_idx = entry.backend_idx;
         let fe_idx = entry.proxy_idx;
 
-        let total_hdr_len = hdr_len + eoh_len;
+        let mut total_hdr_len = hdr_len + eoh_len;
+        // The head as `HAProxy` parses it (T275): refused with a 502 (`PH`), or written again
+        // as `HAProxy` writes what it parsed. `option accept-unsafe-violations-in-http-response`
+        // of the backend relaxes what it relaxes. A head back from a wait was checked when it
+        // arrived, and the rules have edited it since.
+        let mut close_server = false;
+        // What `%B` counts of the head: what HTX holds of it.
+        let mut held: Option<Vec<u8>> = None;
+        if entry.sess.txn.as_ref().is_some_and(|t| t.rsp_wait.is_none()) {
+            let accept = proxies[be_idx].stats_config.accept_unsafe_response;
+            match ibex_proto::response_head::check_response_head(&entry.sess.rep.readable()[..total_hdr_len], accept) {
+                ibex_proto::response_head::ResponseHead::Invalid => {
+                    entry.sess.rep.clear();
+                    entry.sess.log.term.get_or_insert(*b"PH");
+                    entry.sess.log.bytes_from_server = 0;
+                    reply_error(entry, proxies, 502);
+                    return;
+                }
+                ibex_proto::response_head::ResponseHead::Valid { rewrite, close_server: close, .. } => {
+                    close_server = close;
+                    if let Some(r) = rewrite {
+                        entry.sess.rep.replace_prefix(total_hdr_len, &r.head);
+                        total_hdr_len = r.head.len();
+                        held = Some(r.held);
+                    }
+                }
+            }
+        }
         // Read in place: the head is borrowed from `rep` (no copy for a UTF-8 head, which is
         // every head on the fast path) and the borrow ends before `rep` is edited.
         let (status, framing, srv_has_close, srv_http11) = {
             let head = String::from_utf8_lossy(&entry.sess.rep.readable()[..total_hdr_len]);
             let status = crate::txn::status_of(&head);
             let framing = crate::txn::response_framing(&head, entry.sess.req_method.as_deref(), status);
-            (status, framing, crate::txn::head_wants_close(&head), head.starts_with("HTTP/1.1"))
+            (status, framing, crate::txn::head_wants_close(&head), ibex_proto::response_head::is_http11(head.as_bytes()))
         };
         // The head counts what its HTX holds (T265): the data, 40 bytes and 8 per block, not the
         // wire length.
-        if crate::txn::htx_response_head_cost(&entry.sess.rep.readable()[..total_hdr_len]) > threshold || status < 100 {
+        if crate::txn::htx_response_head_cost(&entry.sess.rep.readable()[..total_hdr_len]) > threshold {
             entry.sess.rep.clear();
             // A response that is not HTTP: `PH`, and nothing of it counts as sent.
             entry.sess.log.term.get_or_insert(*b"PH");
@@ -8697,7 +8742,7 @@ impl EngineDispatcher<'_> {
         if wait.is_none() {
             entry.sess.log.data = Some(std::time::Instant::now());
             // What `%B` counts of this head: the message as the server sent it.
-            txn.rsp_htx = crate::txn::htx_head_size(&entry.sess.rep.readable()[..total_hdr_len], false);
+            txn.rsp_htx = crate::txn::htx_head_size(held.as_deref().unwrap_or(&entry.sess.rep.readable()[..total_hdr_len]), false);
         }
         let fe_caps = &proxies[fe_idx].res_capture_slots;
         if wait.is_none() && !fe_caps.is_empty() {
@@ -8715,6 +8760,7 @@ impl EngineDispatcher<'_> {
         }
         txn.status = status;
         txn.srv_reusable = !srv_has_close
+            && !close_server
             && !server_close(proxies, entry.proxy_idx, entry.backend_idx)
             && !matches!(framing, crate::txn::Framing::UntilClose | crate::txn::Framing::Tunnel);
         if framing == crate::txn::Framing::UntilClose {
@@ -8779,7 +8825,13 @@ impl EngineDispatcher<'_> {
             // connection's state calls for in (`h1_update_res_conn_value`).
             let (h, e) = crate::find_eoh(entry.sess.rep.readable()).unwrap_or_default();
             let scan = crate::txn::scan_connection(&entry.sess.rep.readable()[..h + e]);
-            let token = if tunnel { None } else { crate::txn::response_connection_token(client_close, srv_http11, req_http11, false) };
+            // Under 200, `HAProxy` writes no `Connection` (`H1S_F_HAVE_O_CONN`), also for a
+            // final status under 100.
+            let token = if tunnel || status < 100 {
+                None
+            } else {
+                crate::txn::response_connection_token(client_close, srv_http11, req_http11, false)
+            };
             if scan.count == 0 || (scan.count == 1 && scan.plain) {
                 // The usual response: no `Connection`, or one that is all `keep-alive` and
                 // `close`; the head is edited where it is, with no copy.
@@ -9187,7 +9239,7 @@ impl EngineDispatcher<'_> {
         }
 
         // The same `Connection` handling as without rules, on the headers the rules left.
-        crate::txn::apply_response_connection(&mut hdrs, srv_http11, client_close, req_http11, tunnel);
+        crate::txn::apply_response_connection(&mut hdrs, srv_http11, client_close, req_http11, tunnel || status < 100);
 
         let mut new_hdr = format!("{proto_version} {status} {status_msg}\r\n");
         for (k, v) in hdrs {

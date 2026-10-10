@@ -990,6 +990,9 @@ pub(crate) fn parse_option_listen(
         "h1-case-adjust-bogus-server" => proxy.h1_adjust |= crate::ast::H1_ADJ_SERVER,
         "dontlog-normal" | "log-separate-errors" | "logasap" => proxy.log_opts |= crate::ast::log_opt_bit(&tokens[1].text),
         "accept-unsafe-violations-in-http-request" => proxy.stats.accept_unsafe_request = true,
+        "accept-unsafe-violations-in-http-response" | "accept-invalid-http-response" => {
+            proxy.stats.accept_unsafe_response = true;
+        }
         "log-health-checks" => proxy.log_health_checks = true,
         "httpchk" => {
             take_own_http_check(&mut proxy.http_check_own, &mut proxy.httpchk, &mut proxy.http_checks);
@@ -1104,6 +1107,9 @@ pub(crate) fn parse_option_backend(
         "persist" => be.persist = true,
         "h1-case-adjust-bogus-server" => be.h1_adjust |= crate::ast::H1_ADJ_SERVER,
         "http-keep-alive" => be.http_mode = HttpMode::KeepAlive,
+        "accept-unsafe-violations-in-http-response" | "accept-invalid-http-response" => {
+            be.stats.accept_unsafe_response = true;
+        }
         "log-health-checks" => be.log_health_checks = true,
         "httpchk" => {
             take_own_http_check(&mut be.http_check_own, &mut be.httpchk, &mut be.http_checks);
@@ -1140,6 +1146,7 @@ pub(crate) fn parse_no_listen(proxy: &mut ListenSection, tokens: &[Token], kw: &
         Some("h1-case-adjust-bogus-server") => proxy.h1_adjust &= !crate::ast::H1_ADJ_SERVER,
         Some(n @ ("dontlog-normal" | "log-separate-errors" | "logasap")) => proxy.log_opts &= !crate::ast::log_opt_bit(n),
         Some("accept-unsafe-violations-in-http-request") => proxy.stats.accept_unsafe_request = false,
+        Some("accept-unsafe-violations-in-http-response") => proxy.stats.accept_unsafe_response = false,
         Some("log-health-checks") => proxy.log_health_checks = false,
         Some("forwarded") => proxy.forwarded = None,
         _ => {}
@@ -1189,6 +1196,7 @@ pub(crate) fn parse_no_backend(be: &mut BackendSection, tokens: &[Token], kw: &T
         Some("h1-case-adjust-bogus-server") => be.h1_adjust &= !crate::ast::H1_ADJ_SERVER,
         Some("log-health-checks") => be.log_health_checks = false,
         Some("forwarded") => be.forwarded = None,
+        Some("accept-unsafe-violations-in-http-response") => be.stats.accept_unsafe_response = false,
         _ => {}
     }
     Ok(())

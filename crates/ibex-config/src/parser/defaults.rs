@@ -237,6 +237,9 @@ pub(crate) fn parse_option_defaults(
         "h1-case-adjust-bogus-server" => defaults.h1_adjust |= crate::ast::H1_ADJ_SERVER,
         "dontlog-normal" | "log-separate-errors" | "logasap" => defaults.log_opts |= crate::ast::log_opt_bit(&tokens[1].text),
         "accept-unsafe-violations-in-http-request" => defaults.stats.accept_unsafe_request = true,
+        "accept-unsafe-violations-in-http-response" | "accept-invalid-http-response" => {
+            defaults.stats.accept_unsafe_response = true;
+        }
         "log-health-checks" => defaults.log_health_checks = true,
         "httpchk" => parse_httpchk_option(&mut defaults.httpchk, tokens, kw)?,
         "tcp-check" => defaults.tcp_check = true,
@@ -270,6 +273,7 @@ pub(crate) fn parse_no_defaults(defaults: &mut DefaultsSection, tokens: &[Token]
         Some("h1-case-adjust-bogus-server") => defaults.h1_adjust &= !crate::ast::H1_ADJ_SERVER,
         Some(n @ ("dontlog-normal" | "log-separate-errors" | "logasap")) => defaults.log_opts &= !crate::ast::log_opt_bit(n),
         Some("accept-unsafe-violations-in-http-request") => defaults.stats.accept_unsafe_request = false,
+        Some("accept-unsafe-violations-in-http-response") => defaults.stats.accept_unsafe_response = false,
         Some("log-health-checks") => defaults.log_health_checks = false,
         Some("forwarded") => defaults.forwarded = None,
         _ => {}

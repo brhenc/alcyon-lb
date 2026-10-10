@@ -70,6 +70,7 @@ pub mod exp;
 pub mod ffi_h1;
 pub mod h1;
 pub mod parser;
+pub mod response_head;
 pub mod h2;
 pub mod h3;
 pub mod hpack;
