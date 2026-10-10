@@ -9,8 +9,9 @@ and a module file nothing declares is not compiled either. A `tests/<name>.rs` a
 way it always was -- or a `tests/it/<name>.rs` left out of `main.rs` -- then builds
 nothing, runs nothing and fails nothing, silently: the T48 failure mode (a test that exists
 and never runs). `unreached()` names every `.rs` file under a crate's `tests/` that no test
-target reaches through `mod` declarations; harness/test_layout.py fails the gate's
-harness-tests stage on any.
+target reaches through `mod` declarations, and `autotests()` every crate with tests/ that
+still makes a binary of each file; harness/test_layout.py fails the gate's harness-tests
+stage on either.
 
 Usage:  python3 harness/layout.py          # list unreached test files, exit 1 if any
 """
@@ -47,6 +48,15 @@ def test_roots(crate: str) -> list[str]:
             elif os.path.isfile(os.path.join(p, "main.rs")):
                 roots.append(os.path.join(p, "main.rs"))
     return [os.path.normpath(r) for r in roots]
+
+
+def autotests(crate: str) -> bool:
+    """Whether the crate has tests/ and lets cargo make a binary of each tests/*.rs: then a
+    new file is a new binary, linking everything again, instead of a module of `it`."""
+    if not os.path.isdir(os.path.join(crate, "tests")):
+        return False
+    with open(os.path.join(crate, "Cargo.toml"), "rb") as f:
+        return tomllib.load(f).get("package", {}).get("autotests", True)
 
 
 def declared_modules(path: str, root: bool = False) -> list[str]:
@@ -155,10 +165,15 @@ def resolve_key(key: str) -> str | None:
 
 
 def main() -> int:
-    bad = [f for c in crates() for f in unreached(c)]
-    for f in bad:
-        print(f"layout: {os.path.relpath(f, REPO)} is compiled by no test target: declare it "
-              f"`mod` in its crate's tests/it/main.rs (or give it its own [[test]])")
+    bad = 0
+    for c in crates():
+        if autotests(c):
+            bad += 1
+            print(f"layout: {os.path.relpath(c, REPO)} has tests/ but not `autotests = false`")
+        for f in unreached(c):
+            bad += 1
+            print(f"layout: {os.path.relpath(f, REPO)} is compiled by no test target: declare it "
+                  f"`mod` in its crate's tests/it/main.rs (or give it its own [[test]])")
     return 1 if bad else 0
 
 

@@ -50,6 +50,15 @@ class Unreached(unittest.TestCase):
                    "tests/common/mod.rs": "", "tests/orphan/x.rs": ""})
         self.assertEqual(self.names(d), ["tests/orphan/x.rs"])
 
+    def test_a_crate_with_tests_and_autotests_is_named(self):
+        # With autotests on, a new tests/x.rs is a new binary: not lost, but the layout is.
+        self.assertTrue(layout.autotests(crate({"Cargo.toml": '[package]\nname = "x"\n', "tests/a.rs": ""})))
+        self.assertFalse(layout.autotests(crate({"Cargo.toml": ONE_BINARY, "tests/it/main.rs": ""})))
+        self.assertFalse(layout.autotests(crate({"Cargo.toml": '[package]\nname = "x"\n'})))
+
+    def test_every_crate_with_tests_has_autotests_off(self):
+        self.assertEqual([os.path.basename(c) for c in layout.crates() if layout.autotests(c)], [])
+
     def test_the_workspace_compiles_every_test_file(self):
         bad = [os.path.relpath(f, layout.REPO) for c in layout.crates() for f in layout.unreached(c)]
         self.assertEqual(bad, [], "test files no test target compiles (declare them in tests/it/main.rs)")
