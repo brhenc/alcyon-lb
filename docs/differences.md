@@ -171,3 +171,20 @@ Different, and what to do instead:
 | `log` to a unix datagram socket | works | works (`unix@/path`, `/path`, `unix@@abstract`); not compared with HAProxy, whose `sendmsg()` to a socket bound in the test failed with ENOENT |
 | a client that closes during the TLS handshake | session gone at once | counted in `scur` until its timeout (found, not fixed) |
 | `%fi`, `Connect from ... to` on a wildcard bind | the accepted socket's address | the listener's configured address |
+
+## TLS handshake failures: what is not matched (T272B)
+
+Measured on HAProxy 3.5-dev8-885761-29; pinned in `crates/ibex-rt/tests/tls_handshake_log.rs`.
+
+- Frontend `smax` after probes that fail the handshake: HAProxy reports 1 to 6 for the same
+  sequential probes, run after run, so it is not a concurrency maximum there (it looks like a
+  sum over threads). Ibex reports the real maximum of concurrent sessions: 1 at most, since a
+  failed handshake never makes a session.
+- `strict-sni` is refused at load (HAProxy answers a ClientHello with no or an unknown SNI with
+  alert `unrecognized_name` and logs `callback failed`). Implementing it needs the certificate
+  resolver to refuse instead of falling back to the default certificate: a feature, not scheduled.
+- Whether a client that leaves mid-handshake is `Connection closed during SSL handshake` or a
+  bare `SSL handshake failure` depends in HAProxy on whether the FIN came with the bytes or
+  alone. Ibex follows the same rule (a whole handshake record read, then a FIN in a read of its
+  own, not queued behind the data at `MSG_PEEK` time) and so can differ from HAProxy on a
+  race between the two.

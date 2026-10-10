@@ -34,7 +34,7 @@ use std::os::fd::{AsRawFd, BorrowedFd};
 ///
 /// `drained` is whether the last read left the socket empty: shorter than asked, or
 /// `EAGAIN` (see [`TlsConn::sock_drained`]).
-struct Sock<'a>(BorrowedFd<'a>, bool, Vec<u8>);
+struct Sock<'a>(BorrowedFd<'a>, bool, Vec<u8>, usize);
 
 impl Read for Sock<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
@@ -49,6 +49,7 @@ impl Read for Sock<'_> {
                 // The first bytes a client sends tell a TLS handshake from a stranger's bytes.
                 let room = HEAD_LEN.saturating_sub(self.2.len());
                 self.2.extend_from_slice(&buf[..n.min(room)]);
+                self.3 += n;
                 Ok(n)
             }
             Io::Eof => Ok(0),
@@ -59,7 +60,7 @@ impl Read for Sock<'_> {
 }
 
 /// How many of a connection's first bytes are kept to tell why its handshake failed.
-const HEAD_LEN: usize = 8;
+const HEAD_LEN: usize = 11;
 
 /// Why a client's TLS handshake failed, as `HAProxy` words it in the log
 /// (`session_embryonic_build_legacy_err`).
@@ -71,13 +72,16 @@ pub enum HsFail {
     Abort,
     /// The bytes were not an acceptable handshake: the OpenSSL-style error text.
     Error(String),
+    /// The client sent at least the start of a handshake message in whole records and then
+    /// left, its FIN arriving alone: `SSL handshake failure`, with no error text.
+    Bare,
 }
 
 impl HsFail {
     /// `option dontlognull` does not log a client that left (`session_kill_embryonic`).
     #[must_use]
     pub const fn is_null(&self) -> bool {
-        !matches!(self, Self::Error(_))
+        !matches!(self, Self::Error(_) | Self::Bare)
     }
 
     /// The message of `HAProxy`'s log line.
@@ -86,6 +90,7 @@ impl HsFail {
         match self {
             Self::Empty | Self::Abort => "Connection closed during SSL handshake".to_string(),
             Self::Error(e) => format!("SSL handshake failure ({e})"),
+            Self::Bare => "SSL handshake failure".to_string(),
         }
     }
 }
@@ -157,6 +162,14 @@ pub struct TlsConn {
     fail: Option<HsFail>,
     /// The first bytes the client sent.
     head: Vec<u8>,
+    /// Bytes the client has sent in all, and whether its end of stream came in a read of its
+    /// own, after those bytes (not with them).
+    rx_total: usize,
+    late_eof: bool,
+    /// The FIN was already queued behind the bytes of a read (`MSG_PEEK` saw it).
+    eof_with_data: bool,
+    /// The `legacy_version` of the ClientHello has been looked at.
+    legacy_checked: bool,
     /// OpenSSL's text for the error rustls refused the handshake with, when it has one.
     ossl_text: Option<&'static str>,
     /// Bytes that go on the wire in plaintext before the ClientHello: a PROXY protocol
@@ -182,6 +195,10 @@ impl TlsConn {
             failed: false,
             fail: None,
             head: Vec::new(),
+            rx_total: 0,
+            late_eof: false,
+            eof_with_data: false,
+            legacy_checked: false,
             ossl_text: None,
             prefix: Vec::new(),
             prefix_sent: 0,
@@ -257,7 +274,7 @@ impl TlsConn {
     /// Called from both directions. A partial write is not an error: rustls keeps the
     /// remainder and [`Self::wants_write`] stays true, so the poller brings us back.
     fn flush(&mut self, fd: BorrowedFd<'_>) -> io::Result<()> {
-        let mut sock = Sock(fd, false, Vec::new());
+        let mut sock = Sock(fd, false, Vec::new(), 0);
         loop {
             let wants = match self.ctx.session.as_ref() {
                 Some(TlsSession::Server(c)) => c.wants_write(),
@@ -288,9 +305,17 @@ impl TlsConn {
     ///
     /// Returns `Ok(false)` at end of stream.
     fn fill(&mut self, fd: BorrowedFd<'_>) -> io::Result<bool> {
-        let mut sock = Sock(fd, false, Vec::new());
+        let mut sock = Sock(fd, false, Vec::new(), 0);
+        let prior = self.rx_total;
         let r = self.fill_from(&mut sock);
         self.sock_drained = sock.1;
+        self.rx_total += sock.3;
+        if matches!(r, Ok(true)) && sock.3 > 0 && !self.ctx.handshake_done && matches!(raw::peek(fd, &mut [0u8; 1]), Ok(Io::Eof)) {
+            self.eof_with_data = true;
+        }
+        if matches!(r, Ok(false)) && sock.3 == 0 && prior > 0 && !self.eof_with_data {
+            self.late_eof = true;
+        }
         let room = HEAD_LEN.saturating_sub(self.head.len());
         self.head.extend_from_slice(&sock.2[..sock.2.len().min(room)]);
         r
@@ -314,7 +339,11 @@ impl TlsConn {
             };
             match res {
                 Ok(0) => return Ok(false),
-                Ok(_) => {}
+                Ok(_) => {
+                    if let Some(e) = self.refuse_old_legacy_version(fd, &sock.2) {
+                        return Err(e);
+                    }
+                }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(true),
                 // A reset peer is an end of stream, not a failure. `raw::recv` already
                 // maps ECONNRESET to `Io::Closed` and the plaintext path treats that as
@@ -362,6 +391,30 @@ impl TlsConn {
         }
     }
 
+    /// OpenSSL refuses a ClientHello whose `legacy_version` is below TLS 1.0 (`bad legacy
+    /// version`), which rustls takes: it answers with a fatal alert in a record of that version,
+    /// `protocol_version` below SSL 3.0 and `handshake_failure` for SSL 3.0 (measured on
+    /// `HAProxy`). `fresh` is what this fill has read so far, the first bytes of it.
+    fn refuse_old_legacy_version(&mut self, fd: BorrowedFd<'_>, fresh: &[u8]) -> Option<io::Error> {
+        if self.legacy_checked || self.ctx.handshake_done || !matches!(self.ctx.session, Some(TlsSession::Server(_))) {
+            return None;
+        }
+        let mut head = self.head.clone();
+        head.extend_from_slice(&fresh[..fresh.len().min(HEAD_LEN.saturating_sub(head.len()))]);
+        if head.len() < HEAD_LEN {
+            return None;
+        }
+        self.legacy_checked = true;
+        // A handshake record whose first message is a ClientHello: version at byte 9.
+        if head[0] != 0x16 || head[5] != 0x01 || head[9] > 0x03 || (head[9] == 0x03 && head[10] >= 0x01) {
+            return None;
+        }
+        let alert = if head[9] == 0x03 { 40 } else { 70 };
+        self.ossl_text = Some("error:0A000124:SSL routines::bad legacy version");
+        let _ = raw::send(fd, &[0x15, head[9], head[10], 0x00, 0x02, 0x02, alert]);
+        Some(io::Error::new(io::ErrorKind::InvalidData, "bad legacy version"))
+    }
+
     /// Drives the handshake. `Ok(true)` once it is complete.
     fn handshake(&mut self, fd: BorrowedFd<'_>) -> io::Result<bool> {
         if self.ctx.handshake_done {
@@ -378,7 +431,19 @@ impl TlsConn {
         if let Err(e) = &r {
             self.failed = true;
             self.fail = Some(if e.kind() == io::ErrorKind::UnexpectedEof {
-                if self.head.is_empty() { HsFail::Empty } else { HsFail::Abort }
+                // The first record was a whole handshake record with a message header in it, and
+                // the FIN came after it, alone: OpenSSL was waiting in the middle of a message.
+                let whole_record = self.head.len() >= 5 && self.head[0] == 0x16 && {
+                    let len = usize::from(u16::from_be_bytes([self.head[3], self.head[4]]));
+                    len >= 4 && self.rx_total >= 5 + len
+                };
+                if self.head.is_empty() {
+                    HsFail::Empty
+                } else if self.late_eof && whole_record {
+                    HsFail::Bare
+                } else {
+                    HsFail::Abort
+                }
             } else if let Some(text) = self.ossl_text {
                 HsFail::Error(text.to_string())
             } else if looks_like_tls(&self.head) {
