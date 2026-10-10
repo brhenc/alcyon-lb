@@ -34,6 +34,11 @@ and parallel invocations queue behind it.) Doc tests run through `cargo test --d
 failing target is re-run alone through `cargo test`, as before. `SUITE_SERIAL=1` runs the
 single `cargo test --workspace` of before.
 
+The tests run once per gate, instrumented (T257): in the build `cargo llvm-cov` makes
+(`<target>/llvm-cov-target`, covercheck.instrumented_env), and the profiles they write are
+left for covercheck, which then only merges and judges them. `COVERCHECK=0` runs the plain
+build instead, the quick loop.
+
 Usage:  python3 harness/suite.py            # gate
         python3 harness/suite.py --accept   # rewrite the baseline from this run
 """
@@ -42,6 +47,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -107,6 +113,8 @@ JOBS = int(os.environ.get("SUITE_JOBS", "8"))
 # about 13 s; `SUITE_TIMEOUT` raises it.
 TARGET_TIMEOUT = int(os.environ.get("SUITE_TIMEOUT", "300"))
 HEARTBEAT = 15
+# Set by covercheck.instrumented_env to the instrumented target directory.
+INSTRUMENTED_KEY = "IBEX_INSTRUMENTED"
 
 
 def say(msg: str) -> None:
@@ -144,6 +152,8 @@ def target_dir() -> str:
 
 
 built_executables: set[str] = set()
+# Whether the last `test_targets` build rebuilt nothing (cargo reports every artifact fresh).
+build_fresh = False
 
 
 def test_targets() -> list[tuple[str, str, list[str], str, dict]] | None:
@@ -165,8 +175,12 @@ def test_targets() -> list[tuple[str, str, list[str], str, dict]] | None:
     found = []
     # covercheck reports on these and nothing else (older builds' binaries share deps/).
     built_executables.clear()
+    global build_fresh
+    build_fresh = True
     for line in p.stdout.splitlines():
         m = json.loads(line) if line.startswith("{") else {}
+        if m.get("reason") == "compiler-artifact" and not m.get("fresh", True):
+            build_fresh = False
         if m.get("reason") == "compiler-artifact" and m.get("executable"):
             built_executables.add(m["executable"])
         if m.get("reason") != "compiler-artifact" or not m["profile"]["test"] or not m.get("executable"):
@@ -221,7 +235,7 @@ def run_parallel(doc: bool = True) -> tuple[list[tuple[str, str, list[str]]], di
             for pkg, key, sel, exe, p in targets]
     if doc:
         jobs.append(("workspace", "doc", ["--doc"], ["cargo", "test", "--workspace", "--doc", "--no-fail-fast"],
-                     REPO, None))
+                     REPO, doc_env()))
     # Longest first, from the last run's durations: the slowest target sets the floor.
     times_path = os.path.join(target_dir(), "suite-durations.json")
     try:
@@ -286,6 +300,43 @@ def run_parallel(doc: bool = True) -> tuple[list[tuple[str, str, list[str]]], di
     return failing, failed_tests, passed, failed_n
 
 
+def doc_env() -> dict | None:
+    """The doc tests' environment. Instrumented (T257), their profiles go to a directory of
+    their own that covercheck does not read: `cargo llvm-cov` without `--doctests`, which
+    covercheck judged with before, does not count what a doc test runs."""
+    tdir = os.environ.get(INSTRUMENTED_KEY)
+    if not tdir:
+        return None
+    return dict(os.environ, LLVM_PROFILE_FILE=os.path.join(tdir, "doctest-profiles", "%p-%m.profraw"))
+
+
+def instrument() -> str | None:
+    """Switches this process to the instrumented build, `cargo llvm-cov`'s (T257), so the one
+    run of the tests both judges them and leaves the profiles covercheck reads; the gate
+    used to build and run every target a second time for that. Returns the instrumented
+    target directory, or None when `COVERCHECK=0` asks for the plain build (the quick loop)."""
+    if os.environ.get("COVERCHECK", "1") != "1":
+        return None
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import covercheck  # noqa: E402
+    env = covercheck.instrumented_env(dict(os.environ))
+    os.environ.clear()
+    os.environ.update(env)
+    tdir = env["CARGO_TARGET_DIR"]
+    os.makedirs(tdir, exist_ok=True)
+    covercheck.clear_profiles(tdir)
+    shutil.rmtree(os.path.join(tdir, "doctest-profiles"), ignore_errors=True)
+    return tdir
+
+
+def record_run(tdir: str, failed_tests: dict[str, set[str]], passed: int, failed_n: int) -> None:
+    """Tells covercheck which executables wrote the profiles in `tdir` (covercheck.SUITE_RUN)."""
+    rec = {"executables": sorted(built_executables), "passed": passed, "failed_n": failed_n,
+           "failed": {k: sorted(v) for k, v in failed_tests.items()}}
+    with open(os.path.join(tdir, "suite-run.json"), "w") as f:
+        json.dump(rec, f, indent=1)
+
+
 def confirm_cmd(cmd: list[str], runs: int) -> tuple[set[str], int]:
     """Re-runs one target alone `runs` times.
 
@@ -323,12 +374,19 @@ def main() -> int:
         in_parallel = failed_by_target(out)
         commands = {(pkg, t): ["cargo", "test", "-p", pkg, "--test", t, "--no-fail-fast"] for pkg, t in targets}
     else:
+        tdir = instrument()
         say(f"suite: running every test target in the workspace, {JOBS} at a time, "
-            f"{TARGET_TIMEOUT}s each at most")
+            f"{TARGET_TIMEOUT}s each at most, "
+            + ("instrumented (the profiles are covercheck's)" if tdir else "not instrumented (COVERCHECK=0)"))
         r = run_parallel()
         if r is None:
             return 1
         failing, in_parallel, passed, failed_n = r
+        if tdir:
+            # Before the reruns below: they run instrumented too, and write profiles of
+            # their own beside the parallel run's. That is harmless -- llvm-profdata sums
+            # the counts, and covercheck asks only whether a line's count is zero.
+            record_run(tdir, in_parallel, passed, failed_n)
         print(f"suite: {passed} tests passed, {failed_n} failed, in the parallel run")
         targets = [(pkg, key) for pkg, key, _ in failing]
         commands = {(pkg, key): (["cargo", "test", "--workspace", "--doc", "--no-fail-fast"] if key == "doc"

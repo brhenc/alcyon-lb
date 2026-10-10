@@ -30,7 +30,9 @@ included. To audit a range of merges, set the base explicitly:
 from __future__ import annotations
 
 import hashlib
+import json
 import os
+import shlex
 import re
 import subprocess
 import sys
@@ -142,15 +144,25 @@ def covered(paths: set[str]) -> tuple[dict[str, set[int]], dict[str, set[int]]] 
     return read_lcov(paths)
 
 
-def run_pooled() -> bool:
-    """The tests, instrumented, through suite.py's pool (T116): `cargo llvm-cov` runs the
-    workspace's 130 test binaries one after another, which made this the slowest section
-    of the gate. Same build (`cargo llvm-cov show-env`), same target directory as
-    `cargo llvm-cov` uses, the same tests; failures are ignored as `--ignore-run-fail`
-    ignores them (the suite section judges them), a hung binary is not.
+# Set in the environment `instrumented_env` returns, to the instrumented target directory:
+# a second call (suite.py after tools/checkin.sh exported it) returns it unchanged rather than
+# nesting `llvm-cov-target` inside itself.
+INSTRUMENTED = "IBEX_INSTRUMENTED"
+# What suite.py leaves in the instrumented target directory after its run (T257): the test
+# executables it built and ran. Its presence means the profiles beside it are that run's.
+SUITE_RUN = "suite-run.json"
 
-    False when a test binary hung: a gate that cannot finish has not passed."""
-    env = _llvm_env()
+
+def instrumented_env(base: dict | None = None) -> dict:
+    """The environment of the instrumented build: `cargo llvm-cov show-env`, building into
+    `<target>/llvm-cov-target` as `cargo llvm-cov` does. suite.py runs the tests in it and
+    leaves their profiles for covercheck (T257); tools/checkin.sh exports it for the whole
+    gate (`--print-env`), so every section builds into one target directory."""
+    env = _llvm_env() if base is None else dict(base)
+    if env.get(INSTRUMENTED):
+        return env
+    env.setdefault("LLVM_COV", "/usr/bin/llvm-cov")
+    env.setdefault("LLVM_PROFDATA", "/usr/bin/llvm-profdata")
     # `cargo llvm-cov` builds into `<target>/llvm-cov-target`. `show-env` takes the
     # directory as given and `report` appends `llvm-cov-target` itself, so each is told
     # what makes them meet there.
@@ -167,18 +179,65 @@ def run_pooled() -> bool:
         m = re.match(r"export (\w+)='(.*)'$", line)
         if m:
             env[m.group(1)] = m.group(2)
-    # Old profiles would count lines an earlier tree's tests ran.
-    tdir = env["CARGO_TARGET_DIR"]
+    if "LLVM_PROFILE_FILE" not in env or "RUSTFLAGS" not in env:
+        raise SystemExit("covercheck: `cargo llvm-cov show-env` failed: "
+                         + (show.stderr or show.stdout).strip()[-400:])
+    env[INSTRUMENTED] = env["CARGO_TARGET_DIR"]
+    return env
+
+
+def clear_profiles(tdir: str) -> None:
+    """Old profiles would count lines an earlier tree's tests ran; an old suite-run record
+    would vouch for profiles this run has not written."""
     for f in os.listdir(tdir) if os.path.isdir(tdir) else []:
-        if f.endswith(".profraw"):
+        if f.endswith(".profraw") or f == SUITE_RUN:
             os.unlink(os.path.join(tdir, f))
+
+
+def suite_run_reusable(tdir: str, suite) -> dict | None:
+    """The record suite.py left, when its profiles are this tree's: every test executable is
+    still the one it ran. `cargo test --no-run` rebuilds nothing then (a few seconds) and
+    reports every artifact fresh; a source changed since, and it rebuilds (`fresh: false`)
+    or names other executables, and the profiles are not this tree's."""
+    try:
+        rec = json.load(open(os.path.join(tdir, SUITE_RUN)))
+    except (OSError, ValueError):
+        return None
+    if suite.test_targets() is None or not suite.build_fresh:
+        return None
+    if set(rec.get("executables", [])) != suite.built_executables:
+        return None
+    return rec
+
+
+def run_pooled() -> bool:
+    """The tests, instrumented, through suite.py's pool (T116): `cargo llvm-cov` runs the
+    workspace's 130 test binaries one after another, which made this the slowest section
+    of the gate. Same build (`cargo llvm-cov show-env`), same target directory as
+    `cargo llvm-cov` uses, the same tests; failures are ignored as `--ignore-run-fail`
+    ignores them (the suite section judges them), a hung binary is not.
+
+    In the gate the suite section has already run every test in this build (T257): its
+    profiles are used as they are, and nothing is built or run here again.
+
+    False when a test binary hung: a gate that cannot finish has not passed."""
+    env = instrumented_env()
+    tdir = env["CARGO_TARGET_DIR"]
     os.environ.clear()
     os.environ.update(env)
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import suite  # noqa: E402 -- reads os.environ when it runs, not when imported
-    print("covercheck: running every test target instrumented, "
-          f"{suite.JOBS} at a time, {suite.TARGET_TIMEOUT}s each at most", flush=True)
-    r = suite.run_parallel(doc=False)
+    rec = suite_run_reusable(tdir, suite)
+    if rec is not None:
+        print("covercheck: using the profiles of the suite section's run (no second build or run)",
+              flush=True)
+        failed_tests = rec.get("failed", {})
+        r = ([], failed_tests, rec.get("passed", 0), rec.get("failed_n", 0))
+    else:
+        clear_profiles(tdir)
+        print("covercheck: running every test target instrumented, "
+              f"{suite.JOBS} at a time, {suite.TARGET_TIMEOUT}s each at most", flush=True)
+        r = suite.run_parallel(doc=False)
     if r is None:
         print("covercheck: the instrumented tests do not build; skipping")
         return True
@@ -456,7 +515,19 @@ def read_lcov(paths: set[str]) -> tuple[dict[str, set[int]], dict[str, set[int]]
     return execd, hit
 
 
+def print_env() -> int:
+    """`--print-env`: the instrumented build's environment as shell `export`s, for
+    tools/checkin.sh to `eval` so the whole gate builds into one target directory (T257)."""
+    env = instrumented_env()
+    for k in sorted(env):
+        if os.environ.get(k) != env[k]:
+            print(f"export {k}={shlex.quote(env[k])}")
+    return 0
+
+
 def main() -> int:
+    if sys.argv[1:] == ["--print-env"]:
+        return print_env()
     if len(sys.argv) > 1:
         base = default_base(REPO, {"IBEX_COVERCHECK_BASE": sys.argv[1]})
     else:

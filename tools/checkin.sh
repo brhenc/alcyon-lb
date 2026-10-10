@@ -18,6 +18,19 @@ if [ -z "${CARGO_TARGET_DIR:-}" ] && [ "$(git rev-parse --git-dir)" != "$(git re
 fi
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-/tmp/ibex-checkin-target}
 
+# One build, one run of the tests (T257). Every section below builds and runs in the
+# instrumented build `cargo llvm-cov` makes (<target>/llvm-cov-target): the suite section's
+# run judges the tests and leaves the profiles covercheck reads. The gate used to build and
+# run every test target twice, plain and then instrumented, ~4.5 minutes of a 15-minute gate
+# and a second target directory. COVERCHECK=0 keeps the quick loop: plain build, no profiles.
+if [ "${COVERCHECK:-1}" = "1" ]; then
+  if ! INSTRUMENTED_ENV=$(python3 harness/covercheck.py --print-env); then
+    echo "checkin: cannot set up the instrumented build (cargo llvm-cov show-env); COVERCHECK=0 skips it" >&2
+    exit 2
+  fi
+  eval "$INSTRUMENTED_ENV"
+fi
+
 # Every step below pipes into grep, and a pipeline's exit status is the last command's.
 # `pipefail` does not help when nothing checks the result: this script had no exit-code
 # handling at all, so it returned 0 whatever happened. It printed
@@ -91,6 +104,13 @@ else
 fi
 
 echo
+section "the harness's own tests"
+# The gate's verdicts come from harness/*.py; their tests ran only when someone remembered
+# (T254 found test_covercheck.py half-skipped). A few seconds.
+python3 -m unittest discover -s harness -p 'test_*.py' 2>&1 | grep -E "^(Ran |OK|FAILED|FAIL:|ERROR:)"
+check "${PIPESTATUS[0]}" "harness tests"
+
+echo
 section "the eight findings"
 cargo test -p ibex-sample --test sample_semantics 2>&1 | grep -E "^test |test result"
 check "${PIPESTATUS[0]}" "sample_semantics"
@@ -131,8 +151,9 @@ section "did a test execute what changed"
 # two reviewers and a green check-in. T40's module was never called. T26 never measured Ibex.
 # T51's first attempt changed nothing and reported SUCCESS.
 #
-# All four are the same mechanical question. Costs several minutes because it builds the
-# workspace instrumented and runs every test; set COVERCHECK=0 to skip it on a quick loop.
+# All four are the same mechanical question. The suite section above ran every test in the
+# instrumented build; this merges those profiles and judges the diff (T257). Set COVERCHECK=0
+# to skip it on a quick loop.
 if [ "${COVERCHECK:-1}" = "1" ]; then
   python3 harness/covercheck.py 2>&1 | grep -vE "^$"
   check "${PIPESTATUS[0]}" "covercheck"
@@ -146,9 +167,17 @@ section "the regressions no unit test can see"
 # strict about unknown keywords took the reg-test board from 7 passing to 1 -- `thread-groups`
 # appears in nearly every HAProxy reg-test -- and it survived two hours because every unit
 # test stayed green. This runs in about two seconds.
+#
+# In the instrumented build this is the ibex the suite already built (T257), not a second
+# plain build (~20 s and a second target directory): its verdicts
+# match the plain one's (192/529 configs, 6/6 tests on 2026-10-10; 4.6 s against 3.2 s).
+# Its profiles go to a directory of their own, removed after: the
+# smoke run is not a test, and what it executes must not count as tested.
 cargo build -q --bin ibex 2>/dev/null
-python3 harness/smoke.py 2>&1 | grep -vE "^$"
+SMOKE_PROFILES=$(mktemp -d /tmp/ibex-smoke-profiles.XXXXXX)
+LLVM_PROFILE_FILE="$SMOKE_PROFILES/smoke-%4m.profraw" python3 harness/smoke.py 2>&1 | grep -vE "^$"
 check "${PIPESTATUS[0]}" "smoke"
+rm -rf "$SMOKE_PROFILES"
 
 echo
 section "does HAProxy still behave as the tests record"

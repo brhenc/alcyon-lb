@@ -416,5 +416,96 @@ class ParallelExport(unittest.TestCase):
         self.assertIn(self.common, execd)
 
 
+class OneRunOfTheTests(unittest.TestCase):
+    """T257: the suite section runs the tests instrumented and leaves its profiles; covercheck
+    then builds and runs nothing when they are this tree's, and runs everything when not."""
+
+    class FakeSuite:
+        JOBS = 1
+        TARGET_TIMEOUT = 1
+
+        def __init__(self, executables, fresh):
+            self.built_executables = set()
+            self.build_fresh = False
+            self._exes, self._fresh = set(executables), fresh
+            self.ran = 0
+
+        def test_targets(self):
+            self.built_executables = set(self._exes)
+            self.build_fresh = self._fresh
+            return []
+
+        def run_parallel(self, doc=True):
+            self.ran += 1
+            return [], {}, 0, 0
+
+    def run_pooled(self, record, executables, fresh):
+        import json
+        with tempfile.TemporaryDirectory() as tdir:
+            if record is not None:
+                with open(os.path.join(tdir, covercheck.SUITE_RUN), "w") as f:
+                    json.dump(record, f)
+            open(os.path.join(tdir, "old.profraw"), "w").close()
+            fake = self.FakeSuite(executables, fresh)
+            saved_env, saved_mod = dict(os.environ), sys.modules.get("suite")
+            orig = covercheck.instrumented_env
+            covercheck.instrumented_env = lambda base=None: dict(os.environ, CARGO_TARGET_DIR=tdir)
+            sys.modules["suite"] = fake
+            try:
+                covercheck.run_pooled()
+            finally:
+                covercheck.instrumented_env = orig
+                os.environ.clear()
+                os.environ.update(saved_env)
+                if saved_mod is None:
+                    sys.modules.pop("suite", None)
+                else:
+                    sys.modules["suite"] = saved_mod
+            return fake.ran
+
+    def test_the_suite_runs_profiles_are_used_and_nothing_runs_again(self):
+        rec = {"executables": ["/t/a", "/t/b"], "failed": {}, "passed": 3, "failed_n": 0}
+        self.assertEqual(self.run_pooled(rec, ["/t/a", "/t/b"], fresh=True), 0)
+
+    def test_a_rebuild_since_the_suite_ran_runs_the_tests_again(self):
+        rec = {"executables": ["/t/a"], "failed": {}}
+        self.assertEqual(self.run_pooled(rec, ["/t/a"], fresh=False), 1)
+
+    def test_other_executables_than_the_suite_ran_run_the_tests_again(self):
+        rec = {"executables": ["/t/a"], "failed": {}}
+        self.assertEqual(self.run_pooled(rec, ["/t/a", "/t/new"], fresh=True), 1)
+
+    def test_no_suite_run_runs_the_tests(self):
+        self.assertEqual(self.run_pooled(None, ["/t/a"], fresh=True), 1)
+
+    def test_the_instrumented_environment_is_not_nested_twice(self):
+        env = {"CARGO_TARGET_DIR": "/x/llvm-cov-target", covercheck.INSTRUMENTED: "/x/llvm-cov-target"}
+        self.assertEqual(covercheck.instrumented_env(env), env)
+
+    def test_covercheck_0_keeps_the_suite_plain(self):
+        import suite
+        saved = dict(os.environ)
+        os.environ["COVERCHECK"] = "0"
+        try:
+            self.assertIsNone(suite.instrument())
+            self.assertNotIn("RUSTFLAGS", os.environ) if "RUSTFLAGS" not in saved else None
+            self.assertEqual(os.environ.get("CARGO_TARGET_DIR"), saved.get("CARGO_TARGET_DIR"))
+        finally:
+            os.environ.clear()
+            os.environ.update(saved)
+
+    def test_doc_test_profiles_are_not_beside_the_ones_covercheck_reads(self):
+        import suite
+        saved = dict(os.environ)
+        os.environ[suite.INSTRUMENTED_KEY] = "/x/llvm-cov-target"
+        try:
+            path = suite.doc_env()["LLVM_PROFILE_FILE"]
+        finally:
+            os.environ.clear()
+            os.environ.update(saved)
+        self.assertNotEqual(os.path.dirname(path), "/x/llvm-cov-target")
+        self.assertTrue(path.startswith("/x/llvm-cov-target/"))
+
+
 if __name__ == "__main__":
     unittest.main()
