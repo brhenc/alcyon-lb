@@ -1394,6 +1394,9 @@ mod tests {
         ctx.streams.get_mut(&3).expect("3").state = H2StreamState::HalfClosedLocal;
         mux.parse(&mut ctx, &data(3, 1000, 0)).expect("data 3");
         assert_eq!(ctx.streams.get(&3).map(|s| (s.rx_buffered, s.rx_htx.body_bytes().len())), Some((0, 0)));
+        // Its END_STREAM closes it.
+        mux.parse(&mut ctx, &data(3, 0, frame_flags::END_STREAM)).expect("end 3");
+        assert_eq!(ctx.streams.get(&3).map(|s| s.state), Some(H2StreamState::Closed));
     }
 
     /// A reset stream no transaction has taken is let go at once, whichever side reset it;

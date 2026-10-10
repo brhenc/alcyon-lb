@@ -449,6 +449,11 @@ fn test_rt_http2_socket_stream_reset_and_goaway() {
     let open_n = server_sock.read(&mut buf).unwrap();
     mux.parse(&mut server_ctx, &buf[..open_n]).unwrap();
     assert_eq!(mux.used_streams(&server_ctx), 2);
+    // Both are being served: a reset stream no transaction has taken is let go at once
+    // instead (T235, rapid reset), and there would be no state left to check.
+    for id in [1, 3] {
+        server_ctx.streams.get_mut(&id).unwrap().dispatched = true;
+    }
 
     // Client resets stream 1 with RST_STREAM (CANCEL)
     let rst = Frame::RstStream {
