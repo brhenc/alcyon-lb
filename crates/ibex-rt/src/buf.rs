@@ -140,6 +140,7 @@ pub fn init_buffer_sizes(standard: usize, small: usize, large: Option<usize>) {
     let standard = (standard + 15) & !15;
     let small = (small + 15) & !15;
     BUFSIZE_STANDARD.store(standard, Ordering::SeqCst);
+    ibex_sample::registry::set_trash_size(standard);
     BUFSIZE_SMALL.store(small, Ordering::SeqCst);
     if let Some(l) = large {
         let large_rounded = (l + 15) & !15;

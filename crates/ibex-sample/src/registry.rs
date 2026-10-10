@@ -2593,9 +2593,17 @@ impl Registry {
                         resolve_var_str(var_name)
                     };
 
+                    // `alloc_best_trash_chunk`: parts larger than the trash pool (bufsize
+                    // plus the 32-byte buffer header) are no sample; the result is cut at
+                    // bufsize - 1.
+                    let trash = trash_size();
+                    if s.len() + start.len() + var_val.len() + end.len() > trash + 32 {
+                        return None;
+                    }
                     s.push_str(start);
                     s.push_str(&var_val);
                     s.push_str(end);
+                    truncate_to_trash(&mut s);
                     Some(Sample::Str(s))
                 }
                 _ => None,
@@ -4578,6 +4586,33 @@ fn fetch_req_cook(ctx: &SampleContext, args: &[String]) -> Option<Sample> {
         }
     }
     None
+}
+
+/// `tune.bufsize`: the size of the trash chunks converters write into.
+static TRASH_SIZE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(16_384);
+
+/// Sets the size of the converters' trash chunks (`tune.bufsize`).
+pub fn set_trash_size(n: usize) {
+    TRASH_SIZE.store(n.max(2), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The size of the converters' trash chunks (`tune.bufsize`).
+#[must_use]
+pub fn trash_size() -> usize {
+    TRASH_SIZE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Cuts `s` to what a trash chunk holds (`bufsize - 1` bytes and its NUL), at a character
+/// boundary.
+pub fn truncate_to_trash(s: &mut String) {
+    let max = trash_size() - 1;
+    if s.len() > max {
+        let mut at = max;
+        while !s.is_char_boundary(at) {
+            at -= 1;
+        }
+        s.truncate(at);
+    }
 }
 
 // --- Map Matching Internals ---

@@ -101,7 +101,7 @@ const TOO_BIG: &str = "The payload is too big. Please change 'tune.cli.max-paylo
 fn a_payload_up_to_the_cap_is_applied() {
     let ibex = start();
     let body = payload(131_070);
-    let lines = body.iter().filter(|&&b| b == b'\n').count();
+    let lines = body.split(|&b| b == b'\n').count() - 1;
     let mut input = format!("add map {} <<\n", ibex.map).into_bytes();
     input.extend_from_slice(&body);
     input.push(b'\n');
@@ -134,5 +134,20 @@ fn a_payload_over_the_cap_closes_a_prompt_session() {
     let tail = &out[out.len().saturating_sub(300)..];
     assert!(out.ends_with(TOO_BIG), "{tail:?}");
     assert!(!out.contains("k0 v0"), "nothing runs after the refusal: {tail:?}");
+    assert_eq!(entries(&ibex), 1);
+}
+
+#[test]
+fn a_payload_line_without_lf_is_capped_too() {
+    let ibex = start();
+    let mut s = UnixStream::connect(&ibex.sock).expect("connect to the stats socket");
+    s.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
+    s.write_all(format!("add map {} <<\nk ", ibex.map).as_bytes()).expect("send");
+    // No LF: the line is held until it ends, but not past the cap; the client keeps the
+    // connection open for writing.
+    let _ = s.write_all(&vec![b'v'; 200_000]);
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out);
+    assert_eq!(String::from_utf8_lossy(&out), TOO_BIG);
     assert_eq!(entries(&ibex), 1);
 }

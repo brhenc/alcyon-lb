@@ -355,13 +355,7 @@ impl CliApplet {
                     body.push_str(line);
                     body.push('\n');
                     if body.len() > CLI_MAX_PAYLOAD {
-                        // Refused whole, and the connection closed, in `prompt` mode too.
-                        self.payload = None;
-                        self.in_buf.clear();
-                        self.out_buf.extend_from_slice(
-                            b"The payload is too big. Please change 'tune.cli.max-payload-size' in the configuration to use a bigger payload.\n",
-                        );
-                        self.is_done = true;
+                        self.refuse_payload();
                         return;
                     }
                     continue;
@@ -383,6 +377,21 @@ impl CliApplet {
                 break;
             }
         }
+        // A payload line that has not ended yet counts as well.
+        if self.payload.as_ref().is_some_and(|(_, body)| body.len() + self.in_buf.len() > CLI_MAX_PAYLOAD) {
+            self.refuse_payload();
+        }
+    }
+
+    /// A payload over [`CLI_MAX_PAYLOAD`]: refused whole, and the connection closed, in
+    /// `prompt` mode too.
+    fn refuse_payload(&mut self) {
+        self.payload = None;
+        self.in_buf.clear();
+        self.out_buf.extend_from_slice(
+            b"The payload is too big. Please change 'tune.cli.max-payload-size' in the configuration to use a bigger payload.\n",
+        );
+        self.is_done = true;
     }
 
     fn execute_line(&mut self, line: &str, ctx: &mut AppletContext) {

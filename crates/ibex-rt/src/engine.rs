@@ -5763,7 +5763,11 @@ fn sample_is_empty(smp: &Sample) -> bool {
 }
 
 /// Stores a variable where its scope lives, and where the rules after it read it.
-fn store_var(sess_vars: &mut HashMap<String, String>, req_vars: &mut HashMap<String, String>, name: &str, val: String) {
+///
+/// `set-var-fmt(<name>) <fmt>`: the format is built in a trash chunk, so the value is cut
+/// at `tune.bufsize - 1` bytes (T251).
+fn store_var(sess_vars: &mut HashMap<String, String>, req_vars: &mut HashMap<String, String>, name: &str, mut val: String) {
+    ibex_sample::registry::truncate_to_trash(&mut val);
     let empty = val.is_empty();
     store_var_smp(sess_vars, req_vars, name, val, empty);
 }
