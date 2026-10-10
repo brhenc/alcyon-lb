@@ -83,3 +83,11 @@ Ibex better or equal: everything else; h2_flood costs Ibex 5% CPU against 266% (
 | be_reset | RSS 24M->24M, cpu 32%/41%, fds 126->22, p99 0.7ms, ok 3024 bad 0 err 0, mid 6/6, recovered y (0.0s) | RSS 14M->14M, cpu 26%/33%, fds 128->23, p99 0.8ms, ok 3041 bad 0 err 0, mid 6/6, recovered y (0.0s) |
 
 Against 36c022b: h2_rapid_reset fixed (RSS 173M -> 13M, no legit errors, mid 6/6). Still worse than HAProxy: h2_window0 (cpu 148%/403% vs 13%/70%, not recovered within 45 s; T269) and hdr_storm (average cpu now equal, 57% vs 55%, but peak 401% vs 128% and 56 fds left vs recovered at 4.1 s; T270). Everything else equal or better; no crash or panic.
+
+## Results, integration branch batch/1011 a65fedf (main + T269 + T270 + the night batch) vs HAProxy 3.5-dev8 (2026-10-11, 60 s)
+| scenario | haproxy | ibex |
+|---|---|---|
+| h2_window0 | RSS 148M->120M, cpu 12%/59%, fds 2723->21, p99 11.5ms, ok 3037 bad 0 err 0, mid 6/6, recovered y (27.7s) | RSS 22M->22M, cpu 3%/10%, fds 228->27, p99 0.8ms, ok 3051 bad 0 err 0, mid 6/6, recovered y (0.0s) |
+| hdr_storm | RSS 56M->56M, cpu 40%/60%, fds 1656->31, p99 0.8ms, ok 3047 bad 0 err 0, mid 6/6, recovered y (4.1s) | RSS 26M->26M, cpu 56%/100%, fds 92->28, p99 3.4ms, ok 3026 bad 0 err 0, mid 6/6, recovered y (0.0s) |
+
+Both now recover: h2_window0 cpu 3%/10% (was 148%/403% on 94cc644), fds released at once (HAProxy 27.7 s); hdr_storm no more 4-core spin (peak 100% vs HAProxy 60%, average 56% vs 40%: roughly comparable), fds back to baseline at once (HAProxy 4.1 s). T269 (h2 FIN with window 0, epoll removal of idle fds) and T270 (server-wide idle-connection purge).
