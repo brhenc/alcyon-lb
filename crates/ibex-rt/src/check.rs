@@ -408,8 +408,13 @@ impl ServerCheckState {
             self.last_status_desc
         );
 
-        if let Some(code) = self.http_code {
-            let _ = write!(out, ", code: {code}");
+        // `check_append_info` (src/check.c): every status from L57DATA on prints a code,
+        // 0 when the check set none.
+        if matches!(
+            self.last_status_code,
+            "L57DATA" | "L7OK" | "L7OKD" | "L7OKC" | "L7OKCD" | "L7STS" | "PROCERR" | "PROCTOUT" | "PROCOK"
+        ) {
+            let _ = write!(out, ", code: {}", self.http_code.unwrap_or(0));
         }
 
         if let Some(ref info) = self.last_status_info {
@@ -2567,8 +2572,7 @@ fn progress_smtp_check(
         // True once nothing more is coming: the server closed, or one buffer is full.
         let eof = recv_check_reply(&mut check.xprt, sock.as_fd(), &mut recv_buf);
 
-        let reply = check_reply::smtp_reply(&recv_buf, eof);
-        let Some((last_code, last_info)) = reply else {
+        let Some(reply) = check_reply::smtp_reply(&recv_buf, eof) else {
             fdtab.clear_ready(raw_fd, true, false);
             check.sub_state = CheckSubState::SmtpRunning {
                 phase,
@@ -2579,39 +2583,17 @@ fn progress_smtp_check(
             return Ok(CheckStep::pending(Some(check.exp)));
         };
 
-        match last_code {
-            Some(code) if (200..300).contains(&code) => {
+        match reply {
+            check_reply::SmtpEhlo::Accepted => {
                 phase = 3;
                 send_offset = 0;
                 recv_buf.clear();
                 fdtab.set_interest(raw_fd, Interest::WRITE);
                 let _ = poller.modify(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), false, true);
             }
-            Some(code) => {
+            check_reply::SmtpEhlo::Failed(code, info) => {
                 cleanup_check_socket(check, fdtab, poller);
-                let event = check.on_failure_full(
-                    "L7STS",
-                    "Layer7 wrong status",
-                    duration,
-                    Some(code),
-                    last_info,
-                );
-                let next = check.schedule_next(now);
-                check.next_check = next;
-                return Ok(CheckStep {
-                    next: Some(next),
-                    event,
-                });
-            }
-            None => {
-                cleanup_check_socket(check, fdtab, poller);
-                let event = check.on_failure_full(
-                    "L7STS",
-                    "Layer7 wrong status",
-                    duration,
-                    Some(0),
-                    check_reply::smtp_codeless_info(&recv_buf),
-                );
+                let event = check.on_failure_full("L7STS", "Layer7 wrong status", duration, Some(code), info);
                 let next = check.schedule_next(now);
                 check.next_check = next;
                 return Ok(CheckStep {
