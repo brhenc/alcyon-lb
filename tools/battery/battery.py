@@ -149,7 +149,7 @@ def run_one(binary, label, outdir, secs, name):
         res["mid_probe_ok"] = f"{sum(mid)}/{len(mid)}"
         # recovery: attack is over; a probe works on both binds and fds are back near the baseline
         t1 = time.time(); rec = None
-        while time.time() - t1 < 45:
+        while time.time() - t1 < int(os.environ.get("RECOVER_MAX", 45)):
             s = stat(pid)
             if s is None: break
             if probe(H1, False) and probe(H2, True) and s[2] <= base[2] + 30:

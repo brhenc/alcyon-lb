@@ -62,7 +62,7 @@ Anything where Ibex is clearly worse than HAProxy gets a minimal command under
 | be_reset | RSS 23M->23M, cpu 23%/30%, fds 126->20, p99 1.2ms, ok 3026 bad 0 err 0, mid 6/6, recovered y (0.0s) | RSS 18M->18M, cpu 19%/30%, fds 128->24, p99 1.5ms, ok 3037 bad 0 err 0, mid 6/6, recovered y (0.0s) |
 
 Ibex clearly worse (reproducers in `repro/`):
-- h2_window0: 379% CPU during the attack (HAProxy 12%); 824 fds still open 45 s after the clients left (HAProxy back to baseline in 27 s).
+- h2_window0: 379% CPU during the attack (HAProxy 13%). The 824 fds at +45 s are not a leak: re-run with `RECOVER_MAX=150` shows Ibex fds back to baseline 57.5 s after the clients left (about 2x timeout client, matching T248), HAProxy at 27.8 s. So the fd finding is slower release; the CPU burn is the real difference. Reproducer in `repro/`.
 - hdr_storm: 362% CPU (HAProxy 29%); 55 fds left after 45 s (HAProxy 28).
 - h2_rapid_reset: peak RSS 173 MB (HAProxy 32 MB), 10 legit connection errors and 2/6 mid-attack probes failed (HAProxy none).
 Ibex better or equal: everything else; h2_flood costs Ibex 5% CPU against 266% (it presumably drops the connection early; not checked). No crashes or panics in either.
