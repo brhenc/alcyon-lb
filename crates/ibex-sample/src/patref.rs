@@ -192,7 +192,10 @@ impl PatRef {
             RefKind::Acl => {
                 let readers = read(&self.entries).reader_methods();
                 for (method, ci) in readers {
-                    Matcher::compile_with_flags(&method, key, ci)?;
+                    Matcher::compile_with_flags(&method, key, ci).map_err(|e| {
+                        // `HAProxy`'s answer to `add acl` with a regex PCRE2 refuses.
+                        if method == "reg" { format!("regex '{key}' is invalid (error={e}).") } else { e }
+                    })?;
                 }
                 Ok(())
             }
@@ -263,6 +266,19 @@ fn acl_expr(desc: String) {
     let r = Arc::new(PatRef::new(refs.len(), RefKind::Acl, "", Vec::new()));
     r.add_user(desc);
     refs.push(r);
+}
+
+/// The first key of map file `path` that does not compile as a regex, as `HAProxy` words it
+/// when it loads a `map_reg` or `map_regm` file: `regex '<key>' is invalid (error=<why>).`
+/// `None` when every key compiles, or the file cannot be read (reported elsewhere). Keys are
+/// otherwise compiled only when a lookup first reaches them, and one that does not compile
+/// then never matches (T277).
+#[must_use]
+pub fn reg_map_file_error(path: &str) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    parse_lines(&text).into_iter().find_map(|(key, _)| {
+        ibex_regex::UserRegex::new(&key).err().map(|e| format!("regex '{key}' is invalid (error={e})."))
+    })
 }
 
 /// The reference of map file `path`, created (and read) when none is registered; `keys` and

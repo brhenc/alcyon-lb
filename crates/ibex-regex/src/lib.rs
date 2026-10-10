@@ -118,8 +118,67 @@ fn scan(pattern: &str) -> Scan {
     out
 }
 
+/// PCRE2's text for a reference to a group the pattern does not have.
+const NONEXISTENT_GROUP: &str = "reference to non-existent subpattern";
+
+/// Refuses the conditionals `fancy-regex` compiles but cannot run, or runs with another
+/// meaning than PCRE2's (T277).
+///
+/// `fancy-regex` 0.19.2 checks that a back-reference names a group the pattern has, but not
+/// a conditional: `(?(2))` compiles, and the first match indexes past the end of the
+/// matcher's slots, a panic that aborts the process. PCRE2 refuses it ("reference to
+/// non-existent subpattern"), as it does `(?(0)...)`.
+///
+/// A condition that is not a group reference, `(?(n)...)`, `(?(R)...)`, `(?(VERSION>=10)...)`,
+/// is to `fancy-regex` a pattern that must match there; to PCRE2 a test on group `n`, on
+/// recursion or on its version. Refused rather than run with the other meaning.
+fn check_conditions(pattern: &str, captures_len: usize) -> Result<(), Error> {
+    use fancy_regex::Expr;
+    // It has just compiled, so it parses.
+    let tree = Expr::parse_tree(pattern).map_err(|e| Error(e.to_string()))?;
+    let mut stack = vec![&tree.expr];
+    while let Some(e) = stack.pop() {
+        match e {
+            Expr::BackrefExistsCondition { group, .. }
+            | Expr::Backref { group, .. }
+            | Expr::BackrefWithRelativeRecursionLevel { group, .. }
+                if *group == 0 || *group >= captures_len =>
+            {
+                return Err(Error(NONEXISTENT_GROUP.to_string()));
+            }
+            Expr::Conditional { condition, .. } if !matches!(**condition, Expr::BackrefExistsCondition { .. }) => {
+                let text = literal_text(condition).unwrap_or_default();
+                if text.starts_with('R') || text.starts_with("VERSION") {
+                    return Err(Error(
+                        "PCRE feature not supported by Ibex: recursion and version conditions (see docs/differences.md)".to_string(),
+                    ));
+                }
+                if tree.named_groups.contains_key(&text) {
+                    return Err(Error(format!(
+                        "PCRE feature not supported by Ibex: a condition on a bare group name, `(?({text})`; write `(?(<{text}>)` (see docs/differences.md)"
+                    )));
+                }
+                return Err(Error(NONEXISTENT_GROUP.to_string()));
+            }
+            _ => {}
+        }
+        stack.extend(e.children_iter());
+    }
+    Ok(())
+}
+
+/// The text of a condition `fancy-regex` read as literal characters.
+fn literal_text(e: &fancy_regex::Expr) -> Option<String> {
+    use fancy_regex::Expr;
+    match e {
+        Expr::Literal { val, .. } => Some(val.clone()),
+        Expr::Concat(parts) => parts.iter().map(literal_text).collect(),
+        _ => None,
+    }
+}
+
 thread_local! {
-    static COMPILES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static COMPILES:std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// How many patterns this thread has compiled ([`UserRegex::with_case`]): a test reads it
@@ -255,15 +314,16 @@ impl UserRegex {
                 return Ok(UserRegex::Linear(re));
             }
         }
-        fancy_regex::RegexBuilder::new(pattern)
+        let re = fancy_regex::RegexBuilder::new(pattern)
             .case_insensitive(case_insensitive)
             .backtrack_limit(BACKTRACK_LIMIT)
             .build()
-            .map(UserRegex::Backtracking)
             // `fancy-regex` parses a superset of what `regex` does, so its message is the one
             // that says what is wrong with the pattern (`regex`'s would say that look-around
             // is not supported, of a pattern that fails for another reason).
-            .map_err(|e| Error(e.to_string()))
+            .map_err(|e| Error(e.to_string()))?;
+        check_conditions(pattern, re.captures_len())?;
+        Ok(UserRegex::Backtracking(re))
     }
 
     /// The pattern.

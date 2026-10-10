@@ -5684,6 +5684,10 @@ fn hmac_key_is_var(key: &str) -> bool {
 #[must_use]
 pub fn check_converter_args(name: &str, args: &[String]) -> Option<String> {
     match name {
+        "map_reg" | "map_reg_int" | "map_reg_ip" | "map_reg_key" | "map_regm" | "map_regm_int" | "map_regm_ip" => {
+            let path = args.first()?.trim_matches(['"', '\'']);
+            crate::patref::reg_map_file_error(path).map(|e| format!("invalid args in converter '{name}' : {e}"))
+        }
         "has_ctl" if has_ctl_mask(args.first().map_or("", String::as_str)).is_none() => {
             Some("invalid args in converter 'has_ctl' : expects 'any', 'http' or a mask of at most 33 bits".to_string())
         }
