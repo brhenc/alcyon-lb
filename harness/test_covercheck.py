@@ -192,10 +192,6 @@ class StaleBinaries(unittest.TestCase):
                                     + ["libibex_rt-5555555555555555.rlib"]))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class CorruptProfiles(unittest.TestCase):
     """T143: one corrupt .profraw made `llvm-profdata merge` fail, no report was written,
     and covercheck printed "skipping" -- the gate counted the section as passed."""
@@ -260,3 +256,165 @@ class MissingReport(unittest.TestCase):
             finally:
                 covercheck.run_pooled = orig
                 covercheck.LCOV = old
+
+
+class OneMergeForCorruptProfiles(unittest.TestCase):
+    """T254: with one bad profile among 3557, the fallback merged every file alone, one after
+    another: 270 s of a gate. `llvm-profdata merge --failure-mode=warn` names every file it
+    cannot read in one pass, so the cost no longer grows with the number of profiles."""
+
+    def setUp(self):
+        self.prof = CorruptProfiles()
+        CorruptProfiles.setUpClass()
+        self.addCleanup(CorruptProfiles.tearDownClass)
+
+    def counted(self):
+        calls = []
+        real = covercheck.subprocess.run
+
+        def run(cmd, *a, **kw):
+            if "merge" in cmd:
+                calls.append(cmd)
+            return real(cmd, *a, **kw)
+        covercheck.subprocess.run = run
+        self.addCleanup(setattr, covercheck.subprocess, "run", real)
+        return calls
+
+    def test_one_bad_profile_among_many_costs_two_merges_at_most(self):
+        d = self.prof.dir_with(40, 0)
+        self.addCleanup(d.cleanup)
+        data = open(CorruptProfiles.good, "rb").read()
+        with open(os.path.join(d.name, "trunc.profraw"), "wb") as f:
+            f.write(data[:len(data) // 2])  # a process killed while writing its profile
+        calls = self.counted()
+        out = os.path.join(d.name, "merged.profdata")
+        dropped = covercheck.drop_corrupt_profiles(d.name, covercheck._llvm_env(), out)
+        self.assertEqual(dropped, ["trunc.profraw"])
+        self.assertLessEqual(len(calls), 2)
+        self.assertEqual(sum(f.endswith(".profraw") for f in os.listdir(d.name)), 40)
+        self.assertGreater(os.path.getsize(out), 0)  # the merge the report reads
+
+    def test_all_good_costs_one_merge(self):
+        d = self.prof.dir_with(5, 0)
+        self.addCleanup(d.cleanup)
+        calls = self.counted()
+        self.assertEqual(covercheck.drop_corrupt_profiles(d.name, covercheck._llvm_env()), [])
+        self.assertEqual(len(calls), 1)
+
+
+class ParallelExport(unittest.TestCase):
+    """T254: `cargo llvm-cov report` runs one `llvm-cov export` over all 343 objects on one
+    core (43 s). covercheck exports each object on its own, in parallel, and adds the line
+    counts of a source file that several objects carry. Its verdict must be the one export's
+    verdict: the same instrumented lines, the same executed lines."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        t = cls.tmp.name
+        os.mkdir(os.path.join(t, "src"))
+        with open(os.path.join(t, "src", "common.rs"), "w") as f:
+            f.write("pub fn used(x: u32) -> u32 {\n"
+                    "    if x > 1 {\n"
+                    "        x * 2\n"
+                    "    } else {\n"
+                    "        x\n"
+                    "    }\n"
+                    "}\n"
+                    "pub fn unused() -> u32 {\n"
+                    "    7\n"
+                    "}\n")
+        progs = {"a": "mod common;\nfn main() { println!(\"{}\", common::used(3)); }\n",
+                 "b": "mod common;\nfn main() { println!(\"{}\", common::used(0)); }\n",
+                 "c": "#[allow(dead_code)] mod common;\nfn main() {}\n"}
+        cls.objects = []
+        for name, body in progs.items():
+            src = os.path.join(t, "src", f"{name}.rs")
+            with open(src, "w") as f:
+                f.write(body)
+            exe = os.path.join(t, name)
+            subprocess.run(["rustc", "-C", "instrument-coverage", "-o", exe, src], check=True,
+                           capture_output=True, cwd=t)
+            cls.objects.append(exe)
+        # b never runs: its copy of common.rs reports 0 everywhere, a's does not.
+        os.mkdir(os.path.join(t, "prof"))
+        subprocess.run([cls.objects[0]], check=True, capture_output=True,
+                       env={**os.environ, "LLVM_PROFILE_FILE": os.path.join(t, "prof", "a.profraw")})
+        cls.env = covercheck._llvm_env()
+        cls.profdata = os.path.join(t, "all.profdata")
+        covercheck.drop_corrupt_profiles(os.path.join(t, "prof"), cls.env, cls.profdata)
+        cls.common = os.path.join(t, "src", "common.rs")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def lcov_of(self, path):
+        execd, hit = {}, {}
+        cur = None
+        for line in open(path):
+            if line.startswith("SF:"):
+                cur = line[3:].strip()
+            elif line.startswith("DA:"):
+                ln, _, cnt = line[3:].strip().partition(",")
+                execd.setdefault(cur, set()).add(int(ln))
+                if cnt not in ("0", ""):
+                    hit.setdefault(cur, set()).add(int(ln))
+        return execd, hit
+
+    def test_same_verdict_as_one_export_over_every_object(self):
+        one = os.path.join(self.tmp.name, "one.lcov")
+        cmd = [self.env["LLVM_COV"], "export", "-format=lcov",
+               f"-instr-profile={self.profdata}", self.objects[0]]
+        for o in self.objects[1:]:
+            cmd += ["-object", o]
+        with open(one, "w") as f:
+            subprocess.run(cmd, check=True, stdout=f, cwd=self.tmp.name)
+        par = os.path.join(self.tmp.name, "par.lcov")
+        covercheck.export_lcov(self.profdata, self.objects, [self.common], par, self.env)
+        ref_execd, ref_hit = self.lcov_of(one)
+        execd, hit = self.lcov_of(par)
+        self.assertEqual(set(execd), {self.common})  # only the sources asked for
+        self.assertEqual(execd[self.common], ref_execd[self.common])
+        self.assertEqual(hit[self.common], ref_hit[self.common])
+        self.assertIn(3, hit[self.common])        # a ran `x * 2`
+        self.assertNotIn(9, hit[self.common])     # nobody called unused()
+
+    def test_counts_of_one_line_in_several_objects_are_added(self):
+        par = os.path.join(self.tmp.name, "dup.lcov")
+        # The same object twice: every count of a line it runs doubles.
+        covercheck.export_lcov(self.profdata, [self.objects[0], self.objects[0]],
+                               [self.common], par, self.env, jobs=2)
+        single = os.path.join(self.tmp.name, "single.lcov")
+        covercheck.export_lcov(self.profdata, [self.objects[0]], [self.common], single, self.env)
+
+        def counts(p):
+            return {int(l[3:].split(",")[0]): int(l.strip().split(",")[1])
+                    for l in open(p) if l.startswith("DA:")}
+        one, two = counts(single), counts(par)
+        self.assertEqual(set(one), set(two))
+        self.assertTrue(any(one.values()))
+        self.assertEqual({k: 2 * v for k, v in one.items()}, two)
+
+    def test_an_object_that_carries_none_of_the_sources_adds_nothing(self):
+        # llvm-cov exports every file when none of the -sources given is in the object.
+        other = os.path.join(self.tmp.name, "src", "a.rs")
+        par = os.path.join(self.tmp.name, "none.lcov")
+        covercheck.export_lcov(self.profdata, self.objects, [other], par, self.env)
+        execd, _ = self.lcov_of(par)
+        self.assertLessEqual(set(execd), {other})
+
+    def test_an_object_without_coverage_is_skipped_like_the_one_export_skips_it(self):
+        plain = os.path.join(self.tmp.name, "plain")
+        src = os.path.join(self.tmp.name, "plain.rs")
+        with open(src, "w") as f:
+            f.write("fn main() {}\n")
+        subprocess.run(["rustc", "-o", plain, src], check=True, capture_output=True)
+        par = os.path.join(self.tmp.name, "plain.lcov")
+        covercheck.export_lcov(self.profdata, self.objects + [plain], [self.common], par, self.env)
+        execd, _ = self.lcov_of(par)
+        self.assertIn(self.common, execd)
+
+
+if __name__ == "__main__":
+    unittest.main()

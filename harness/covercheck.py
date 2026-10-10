@@ -37,6 +37,7 @@ import sys
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # One report per checkout: agy runs several worktrees at once, and a shared path let one
@@ -45,6 +46,11 @@ LCOV = os.path.join(tempfile.gettempdir(),
                     f"ibex-covercheck-{hashlib.sha1(REPO.encode()).hexdigest()[:10]}.lcov")
 # Only source. Tests are expected to run; that is not the question being asked.
 SRC = re.compile(r"^crates/[^/]+/src/.*\.rs$")
+# What `cargo llvm-cov report` leaves out of its report (its --ignore-filename-regex, made
+# relative to the workspace): a changed line in src/foo/tests.rs was never judged.
+IGNORED = re.compile(r"^(.*/)?(tests|examples|benches)/|^(.*/)?(tests\.rs|[0-9a-zA-Z_-]+[_-]tests\.rs)$")
+# The changed source files the report is asked about (set by `covered`).
+_wanted: set[str] = set()
 
 
 def _git(repo: str, *args: str) -> subprocess.CompletedProcess:
@@ -123,6 +129,8 @@ def _llvm_env() -> dict:
 def covered(paths: set[str]) -> tuple[dict[str, set[int]], dict[str, set[int]]] | None:
     if os.path.exists(LCOV):
         os.unlink(LCOV)
+    _wanted.clear()
+    _wanted.update(paths)
     ok = run_serial() if os.environ.get("COVERCHECK_SERIAL") == "1" else run_pooled()
     if not ok:
         return None
@@ -190,18 +198,31 @@ def run_pooled() -> bool:
         print(f"covercheck: only {profraws} profiles written by {binaries} test binaries: the "
               "build was not instrumented, so this report cannot judge anything")
         return False
-    dropped = drop_corrupt_profiles(tdir, env)
+    t0 = time.monotonic()
+    profdata = os.path.join(tdir, "covercheck.profdata")
+    if os.path.exists(profdata):
+        os.unlink(profdata)
+    dropped = drop_corrupt_profiles(tdir, env, profdata)
     if dropped:
         print(f"covercheck: dropped {len(dropped)} corrupt profile(s) of {profraws}: "
               + ", ".join(dropped[:8]) + (" ..." if len(dropped) > 8 else ""))
     if not has_profiles(tdir):
         print("covercheck: no usable profile: no report can be made")
         return False
-    rep = subprocess.run(["cargo", "llvm-cov", "report", "--lcov", "--output-path", LCOV],
-                         cwd=REPO, capture_output=True, text=True, env={**env, "CARGO_TARGET_DIR": outer})
-    if rep.returncode != 0:
-        print((rep.stderr or rep.stdout)[-600:])
+    if not os.path.exists(profdata):
+        print("covercheck: llvm-profdata merge wrote no profile")
         return False
+    t1 = time.monotonic()
+    objects = report_objects(os.path.join(tdir, "debug"))
+    sources = sorted(os.path.join(REPO, p) for p in _wanted
+                     if not IGNORED.match(p) and os.path.exists(os.path.join(REPO, p)))
+    try:
+        export_lcov(profdata, objects, sources, LCOV, env)
+    except RuntimeError as e:
+        print(str(e)[-600:])
+        return False
+    print(f"covercheck: report from {profraws - len(dropped)} profiles and {len(objects)} "
+          f"objects: merge {t1 - t0:.1f}s, export {time.monotonic() - t1:.1f}s")
     return True
 
 
@@ -209,24 +230,125 @@ def has_profiles(tdir: str) -> bool:
     return any(f.endswith(".profraw") for f in os.listdir(tdir))
 
 
-def drop_corrupt_profiles(tdir: str, env: dict) -> list[str]:
-    """Deletes the `.profraw` files `llvm-profdata` cannot read (T143) and returns their
-    names. One bad file fails the whole merge `cargo llvm-cov report` does. The common case,
-    all good, costs one merge."""
+def drop_corrupt_profiles(tdir: str, env: dict, out: str = os.devnull) -> list[str]:
+    """Merges the `.profraw` files in `tdir` into `out`, deletes the ones `llvm-profdata`
+    cannot read (T143) and returns their names. One bad file used to fail the whole merge
+    `cargo llvm-cov report` does.
+
+    One merge whatever the number of bad files (T254): `--failure-mode=warn` merges what it
+    can read and names every file it cannot (`warning: <path>: <reason>`). The fallback this
+    replaces merged each of 3557 files alone, one after another: 270 s. A file that fails
+    part-way may have added the records read before the failure; those are counts a test
+    really made, so the merge is not repeated without it."""
     prof = env.get("LLVM_PROFDATA", "llvm-profdata")
     names = sorted(f for f in os.listdir(tdir) if f.endswith(".profraw"))
-
-    def ok(files: list[str]) -> bool:
-        r = subprocess.run([prof, "merge", "-o", os.devnull, *[os.path.join(tdir, f) for f in files]],
-                           capture_output=True, env=env)
-        return r.returncode == 0
-
-    if not names or ok(names):
+    if not names:
         return []
-    bad = [f for f in names if not ok([f])]
+    paths = {os.path.join(tdir, f): f for f in names}
+    with tempfile.NamedTemporaryFile("w", prefix="covercheck-profraws-", suffix=".txt") as lst:
+        lst.write("".join(p + "\n" for p in paths))
+        lst.flush()
+        r = subprocess.run([prof, "merge", "-sparse", "--failure-mode=warn",
+                            f"--input-files={lst.name}", "-o", out],
+                           capture_output=True, text=True, env=env)
+    bad = []
+    for line in r.stderr.splitlines():
+        m = re.match(r"(?:warning|error): (.+?): ", line)
+        if m and m.group(1) in paths and paths[m.group(1)] not in bad:
+            bad.append(paths[m.group(1)])
+    if r.returncode != 0 and len(bad) < len(names):
+        # Not a bad input: the merge itself failed. No profile is written and the caller
+        # says so; deleting good profiles here would hide it.
+        print(f"covercheck: llvm-profdata merge failed: {r.stderr.strip()[-600:]}")
     for f in bad:
         os.unlink(os.path.join(tdir, f))
-    return bad
+    return sorted(bad)
+
+
+def report_objects(debug: str) -> list[str]:
+    """The executables `cargo llvm-cov report` reads: those in debug/deps, debug/ and
+    debug/examples. Each once: debug/ibex is a hard link of a file in deps/."""
+    seen, objects = set(), []
+    for sub in ("deps", "", "examples"):
+        d = os.path.join(debug, sub)
+        for f in sorted(os.listdir(d)) if os.path.isdir(d) else []:
+            path = os.path.join(d, f)
+            if "." in f or not os.path.isfile(path) or not os.access(path, os.X_OK):
+                continue
+            st = os.stat(path)
+            if (st.st_dev, st.st_ino) not in seen:
+                seen.add((st.st_dev, st.st_ino))
+                objects.append(path)
+    return objects
+
+
+_SF = re.compile(rb"^SF:(.*)$", re.M)
+_DA = re.compile(rb"^DA:(\d+),(\d+)", re.M)
+
+
+def export_lcov(profdata: str, objects: list[str], sources: list[str], out: str, env: dict,
+                jobs: int | None = None) -> None:
+    """Writes an lcov report of `sources` to `out`: `jobs` `llvm-cov export`s in parallel,
+    each over a share of the objects, with the counts of a line several exports carry added.
+
+    `cargo llvm-cov report` runs one export over all objects, single-threaded (43 s for 342
+    objects); this takes a few seconds. A function linked into several objects has one set
+    of counters in the merged profile, so a line's sum is a multiple of the one export's
+    count: zero where it is zero, which is all covercheck asks. Raises RuntimeError when an
+    export fails for another reason than an object without coverage, which the one export
+    skips too."""
+    real = {os.path.realpath(s) for s in sources}
+    counts: dict[str, dict[bytes, int]] = {}
+    if not sources or not objects:
+        open(out, "w").close()
+        return
+    cov = env.get("LLVM_COV", "llvm-cov")
+
+    def one(group: list[str]) -> tuple[str, subprocess.CompletedProcess]:
+        cmd = [cov, "export", "-format=lcov", f"-instr-profile={profdata}", group[0]]
+        for o in group[1:]:
+            cmd += ["-object", o]
+        return group[0], subprocess.run([*cmd, "-sources", *sources], capture_output=True, env=env)
+
+    # One export per worker over a group of objects, largest first round the groups so they
+    # take about as long. Within a group llvm-cov counts a function once, as the one export
+    # does; across groups the counts are added. Fewer, larger exports: the lcov text each
+    # writes for engine.rs is what costs, not the export.
+    jobs = min(jobs or os.cpu_count() or 8, len(objects))
+    by_size = sorted(objects, key=lambda o: -os.path.getsize(o))
+    groups = [by_size[i::jobs] for i in range(jobs)]
+    with ThreadPoolExecutor(max_workers=jobs) as pool:
+        results = list(pool.map(one, groups))
+    for obj, r in results:
+        if r.returncode != 0:
+            if b"no coverage data found" in r.stderr:
+                continue
+            raise RuntimeError(f"covercheck: llvm-cov export {obj} failed: "
+                               + r.stderr.decode(errors="replace"))
+        # llvm-cov exports *every* file of an object when none of the -sources is in it.
+        # Such an output holds none of them, so its first file says which case this is.
+        first = r.stdout.find(b"SF:")
+        if first < 0:
+            continue
+        end = r.stdout.find(b"\n", first)
+        if os.path.realpath(r.stdout[first + 3:end].decode()) not in real:
+            continue
+        for block in r.stdout.split(b"end_of_record"):
+            m = _SF.search(block)
+            if not m:
+                continue
+            sf = m.group(1).decode()
+            if os.path.realpath(sf) not in real:
+                continue
+            cur = counts.setdefault(sf, {})
+            for ln, cnt in _DA.findall(block):
+                cur[ln] = cur.get(ln, 0) + int(cnt)
+    with open(out, "w") as f:
+        for sf in sorted(counts):
+            f.write(f"SF:{sf}\n")
+            for ln in sorted(counts[sf], key=int):
+                f.write(f"DA:{int(ln)},{counts[sf][ln]}\n")
+            f.write("end_of_record\n")
 
 
 def prune_stale_binaries(deps: str, current: set[str]) -> int:
