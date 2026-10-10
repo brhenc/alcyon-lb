@@ -1614,8 +1614,8 @@ pub struct SessionEntry {
     pub actconn_reclaimed: bool,
     /// The stream's counters were added to `show stat`'s (once per transaction).
     pub stats_done: bool,
-    /// The backend whose `be_streams` count this stream (`stream_set_backend`).
-    pub be_counted: std::cell::Cell<Option<usize>>,
+    /// The backend whose `be_streams` count this stream (`stream_set_backend`), [`NO_BACKEND`] for none.
+    pub be_counted: std::cell::Cell<u32>,
     /// The `Connect from` line of a frontend with no `log-format` is still to be sent: it goes
     /// once the connection has its PROXY header and TLS handshake behind it.
     pub connect_log_due: bool,
@@ -2167,7 +2167,7 @@ fn stream_log_data<'a>(entry: &'a SessionEntry, proxies: &'a [Proxy], proxy_idx:
         term_state: term_state(entry),
         // The stream has let go of its backend when the line is made: only the others count.
         beconn: {
-            let own = entry.be_counted.get().and_then(|i| proxies.get(i)).is_some_and(|p| std::ptr::eq(p, be));
+            let own = counted_backend(entry).and_then(|i| proxies.get(i)).is_some_and(|p| std::ptr::eq(p, be));
             be.stats.iter().map(|st| u64::from(st.be_streams.load(Ordering::Relaxed))).sum::<u64>().saturating_sub(u64::from(own))
         },
         srvconn: entry
@@ -5827,7 +5827,7 @@ fn register_new_session(
         srv_interest: Interest::NONE,
         actconn_reclaimed: false,
         stats_done: false,
-        be_counted: std::cell::Cell::new(None),
+        be_counted: std::cell::Cell::new(NO_BACKEND),
         connect_log_due: proxy.log_format.is_none() && !proxy.log_target_idx.is_empty(),
         srv_served: 0,
         log_line: None,
@@ -6558,22 +6558,31 @@ fn count_server_session(proxies: &[Proxy], be_idx: usize, addr: SocketAddr) {
         .inspect(|rate| rate.tick());
 }
 
+/// `SessionEntry::be_counted` of a stream no backend counts.
+const NO_BACKEND: u32 = u32::MAX;
+
+/// The index of the backend counting the stream.
+fn counted_backend(entry: &SessionEntry) -> Option<usize> {
+    Some(entry.be_counted.get()).filter(|&i| i != NO_BACKEND).map(|i| i as usize)
+}
+
 /// The stream belongs to backend `be_idx` (`stream_set_backend`: `beconn` counts it).
 fn enter_backend(entry: &SessionEntry, proxies: &[Proxy], be_idx: usize) {
-    if entry.be_counted.get() == Some(be_idx) {
+    if counted_backend(entry) == Some(be_idx) {
         return;
     }
     leave_backend(entry, proxies);
     if let Some(p) = proxies.get(be_idx) {
         p.counters().be_streams.fetch_add(1, Ordering::Relaxed);
-        entry.be_counted.set(Some(be_idx));
+        entry.be_counted.set(u32::try_from(be_idx).unwrap_or(NO_BACKEND));
     }
 }
 
 /// The stream is done with its backend (`stream_free`): when its transaction is logged, or
 /// the session ends.
 fn leave_backend(entry: &SessionEntry, proxies: &[Proxy]) {
-    if let Some(p) = entry.be_counted.take().and_then(|i| proxies.get(i)) {
+    if let Some(p) = counted_backend(entry).and_then(|i| proxies.get(i)) {
+        entry.be_counted.set(NO_BACKEND);
         let _ = p.counters().be_streams.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| Some(c.saturating_sub(1)));
     }
 }
