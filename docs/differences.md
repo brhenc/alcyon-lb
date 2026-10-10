@@ -79,6 +79,9 @@ bad regular expression <(?R)>: PCRE feature not supported by Ibex: recursion and
 
 - recursion and subroutine calls: `(?R)`, `(?1)`, `(?-1)`, `(?+1)`, `(?&name)`, `(?P>name)`, `\g<n>`, `\g'n'` (and `\gN`, which `fancy-regex` would compile as a call, not a back-reference),
 - callouts `(?C)`,
+- the conditions `(?(R)..)`, `(?(R1)..)`, `(?(R&name)..)`, `(?(VERSION>=10)..)`, and a condition on a
+  bare group name `(?(name)..)` (write `(?(<name>)..)`): `fancy-regex` would read each as "this
+  text matches here", not as PCRE2's test (T277),
 - branch reset groups `(?|..)`,
 - `\X` (extended grapheme cluster),
 - `\Q..\E` literal quoting,
@@ -91,6 +94,11 @@ tables, not PCRE2's; a name PCRE2 knows and `regex` does not is refused as a syn
 
 An ACL pattern is now checked at load too, in `acl` lines and in inline `{ ... }` terms
 (before T154 an inline ACL with a bad regex loaded and never matched).
+
+A conditional on a group the pattern does not have, `(?(2))` with no group 2 or `(?(0)..)`, is
+refused as PCRE2 refuses it ("reference to non-existent subpattern"): `fancy-regex` 0.19.2
+compiles it and then panics at the first match, which aborted Ibex before T277. So are the
+keys of a `map_reg`/`map_regm` file, at load, and `add map`/`add acl` on the CLI.
 
 ### One difference in what loads
 
