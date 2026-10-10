@@ -329,7 +329,7 @@ impl ServerCheckState {
         self.last_status_code = code;
         self.last_status_desc = desc;
         self.http_code = http_code;
-        self.last_status_info = info;
+        self.last_status_info = info.map(cut_check_desc);
         self.check_duration_ms = duration_ms;
 
         if self.health >= self.full_health() {
@@ -368,7 +368,7 @@ impl ServerCheckState {
         self.last_status_code = code;
         self.last_status_desc = desc;
         self.http_code = http_code;
-        self.last_status_info = info;
+        self.last_status_info = info.map(cut_check_desc);
         self.check_duration_ms = duration_ms;
 
         if self.health == 0 {
@@ -2400,20 +2400,8 @@ fn progress_redis_check(
     }
 
     if phase == 1 {
-        let mut buf = [0u8; 4096];
-        let mut eof = false;
-        loop {
-            match check.xprt.recv(sock.as_fd(), &mut buf) {
-                Ok(Io::Done(n)) => {
-                    recv_buf.extend_from_slice(&buf[..n]);
-                }
-                Ok(Io::WouldBlock) => break,
-                Ok(Io::Eof | Io::Closed) | Err(_) => {
-                    eof = true;
-                    break;
-                }
-            }
-        }
+        // True once nothing more is coming: the server closed, or one buffer is full.
+        let eof = recv_check_reply(&mut check.xprt, sock.as_fd(), &mut recv_buf);
 
         let Some(v) = check_reply::redis(&recv_buf, eof) else {
             fdtab.clear_ready(raw_fd, true, false);
@@ -2465,20 +2453,8 @@ fn progress_smtp_check(
         fdtab.set_interest(raw_fd, Interest::READ);
         let _ = poller.modify(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), true, false);
 
-        let mut buf = [0u8; 4096];
-        let mut eof = false;
-        loop {
-            match check.xprt.recv(sock.as_fd(), &mut buf) {
-                Ok(Io::Done(n)) => {
-                    recv_buf.extend_from_slice(&buf[..n]);
-                }
-                Ok(Io::WouldBlock) => break,
-                Ok(Io::Eof | Io::Closed) | Err(_) => {
-                    eof = true;
-                    break;
-                }
-            }
-        }
+        // True once nothing more is coming: the server closed, or one buffer is full.
+        let eof = recv_check_reply(&mut check.xprt, sock.as_fd(), &mut recv_buf);
 
         if find_crlf(&recv_buf).is_none() && !eof {
             fdtab.clear_ready(raw_fd, true, false);
@@ -2588,20 +2564,8 @@ fn progress_smtp_check(
     }
 
     if phase == 2 {
-        let mut buf = [0u8; 4096];
-        let mut eof = false;
-        loop {
-            match check.xprt.recv(sock.as_fd(), &mut buf) {
-                Ok(Io::Done(n)) => {
-                    recv_buf.extend_from_slice(&buf[..n]);
-                }
-                Ok(Io::WouldBlock) => break,
-                Ok(Io::Eof | Io::Closed) | Err(_) => {
-                    eof = true;
-                    break;
-                }
-            }
-        }
+        // True once nothing more is coming: the server closed, or one buffer is full.
+        let eof = recv_check_reply(&mut check.xprt, sock.as_fd(), &mut recv_buf);
 
         let reply = check_reply::smtp_reply(&recv_buf, eof);
         let Some((last_code, last_info)) = reply else {
@@ -2641,13 +2605,12 @@ fn progress_smtp_check(
             }
             None => {
                 cleanup_check_socket(check, fdtab, poller);
-                let info = String::from_utf8_lossy(&recv_buf).trim().to_string();
                 let event = check.on_failure_full(
-                    "L7RSP",
-                    "Layer7 invalid response",
+                    "L7STS",
+                    "Layer7 wrong status",
                     duration,
-                    None,
-                    if info.is_empty() { None } else { Some(info) },
+                    Some(0),
+                    check_reply::smtp_codeless_info(&recv_buf),
                 );
                 let next = check.schedule_next(now);
                 check.next_check = next;
@@ -2710,20 +2673,8 @@ fn progress_smtp_check(
     }
 
     if phase == 4 {
-        let mut buf = [0u8; 4096];
-        let mut eof = false;
-        loop {
-            match check.xprt.recv(sock.as_fd(), &mut buf) {
-                Ok(Io::Done(n)) => {
-                    recv_buf.extend_from_slice(&buf[..n]);
-                }
-                Ok(Io::WouldBlock) => break,
-                Ok(Io::Eof | Io::Closed) | Err(_) => {
-                    eof = true;
-                    break;
-                }
-            }
-        }
+        // True once nothing more is coming: the server closed, or one buffer is full.
+        let eof = recv_check_reply(&mut check.xprt, sock.as_fd(), &mut recv_buf);
 
         if find_crlf(&recv_buf).is_none() && !eof {
             fdtab.clear_ready(raw_fd, true, false);
@@ -2760,11 +2711,11 @@ fn progress_smtp_check(
                 )
             }
             None => check.on_failure_full(
-                "L7RSP",
-                "Layer7 invalid response",
+                "L7STS",
+                "Layer7 wrong status",
                 duration,
-                None,
-                Some(line),
+                Some(0),
+                check_reply::smtp_codeless_info(&recv_buf),
             ),
         };
         let next = check.schedule_next(now);
@@ -2891,6 +2842,22 @@ pub(crate) fn mysql_reply(buf: &[u8], last_read: bool, with_user: bool) -> Optio
     }
     let hslen = 4 + (usize::from(buf[0]) | usize::from(byte_at(buf, 1)) << 8 | usize::from(byte_at(buf, 2)) << 16);
     packet(hslen, true).flatten()
+}
+
+/// `HAProxy` keeps a check's info in `char desc[HCHK_DESC_LEN]` (128) and copies it with
+/// `strncpy(.., HCHK_DESC_LEN - 1)` (src/check.c): what a server put in its reply is cut to
+/// 127 bytes. Cut on a character boundary here, since the info is a `String`.
+const HCHK_DESC_MAX: usize = 127;
+
+fn cut_check_desc(mut info: String) -> String {
+    if info.len() > HCHK_DESC_MAX {
+        let mut end = HCHK_DESC_MAX;
+        while !info.is_char_boundary(end) {
+            end -= 1;
+        }
+        info.truncate(end);
+    }
+    info
 }
 
 /// Reads what has arrived into `recv_buf`, never past `TCP_CHECK_BUFSIZE` (`HAProxy` reads
@@ -3276,20 +3243,8 @@ fn progress_pgsql_check(
     }
 
     if phase == 1 {
-        let mut buf = [0u8; 4096];
-        let mut eof = false;
-        loop {
-            match check.xprt.recv(sock.as_fd(), &mut buf) {
-                Ok(Io::Done(n)) => {
-                    recv_buf.extend_from_slice(&buf[..n]);
-                }
-                Ok(Io::WouldBlock) => break,
-                Ok(Io::Eof | Io::Closed) | Err(_) => {
-                    eof = true;
-                    break;
-                }
-            }
-        }
+        // True once nothing more is coming: the server closed, or one buffer is full.
+        let eof = recv_check_reply(&mut check.xprt, sock.as_fd(), &mut recv_buf);
 
         let Some(v) = check_reply::pgsql(&recv_buf, eof) else {
             fdtab.clear_ready(raw_fd, true, false);
@@ -3395,20 +3350,8 @@ fn progress_ssl_hello_check(
     }
 
     if phase == 1 {
-        let mut buf = [0u8; 4096];
-        let mut eof = false;
-        loop {
-            match check.xprt.recv(sock.as_fd(), &mut buf) {
-                Ok(Io::Done(n)) => {
-                    recv_buf.extend_from_slice(&buf[..n]);
-                }
-                Ok(Io::WouldBlock) => break,
-                Ok(Io::Eof | Io::Closed) | Err(_) => {
-                    eof = true;
-                    break;
-                }
-            }
-        }
+        // True once nothing more is coming: the server closed, or one buffer is full.
+        let eof = recv_check_reply(&mut check.xprt, sock.as_fd(), &mut recv_buf);
 
         let Some(v) = check_reply::ssl_hello(&recv_buf, eof) else {
             fdtab.clear_ready(raw_fd, true, false);
