@@ -3314,16 +3314,26 @@ fn forwarded_element(fwd: &ibex_config::Forwarded, sess: &TcpSession, ctx: &Samp
 }
 
 /// Adds `element` at the end of the request's last `Forwarded` header, or as a header of its
-/// own when it has none.
-fn append_forwarded_element(sess: &mut TcpSession, element: &str) {
+/// own when it has none. False, nothing changed, when it does not fit ([`add_req_header_fit`]).
+fn append_forwarded_element(sess: &mut TcpSession, element: &str) -> bool {
     let existing: Vec<String> = sess
         .htx_slice()
         .map(|s| s.headers().filter(|(n, _)| n.eq_ignore_ascii_case("forwarded")).map(|(_, v)| v.to_string()).collect())
         .unwrap_or_default();
     match existing.as_slice() {
-        [] => add_req_header(sess, "forwarded", element),
-        [only] => set_req_header(sess, "forwarded", &format!("{only},{element}")),
+        [] => return add_req_header_fit(sess, "forwarded", element),
+        [only] => {
+            if !res_htx_resize(0, element.len() + 1) {
+                return false;
+            }
+            sess.htx_reserve(element.len() + 1);
+            set_req_header(sess, "forwarded", &format!("{only},{element}"));
+        }
         many => {
+            if !res_htx_resize(0, element.len() + 1) {
+                return false;
+            }
+            sess.htx_reserve(element.len() + 1);
             let last = many.len() - 1;
             let values: Vec<String> = many.iter().enumerate().map(|(i, v)| if i == last { format!("{v},{element}") } else { v.clone() }).collect();
             sess.with_htx_mut(|htx| {
@@ -3339,6 +3349,7 @@ fn append_forwarded_element(sess: &mut TcpSession, element: &str) {
             rebuild_req_buffer(sess);
         }
     }
+    true
 }
 
 /// `reply`, a whole response, with `header` as the last header line of its head
@@ -9824,6 +9835,9 @@ impl EngineDispatcher<'_> {
         // sets it, and it is not applied to an address in the `except` network of any
         // proxy that sets it.
         let fe_be = [proxy_idx, be_idx];
+        // These headers are added to the request as it stands after the rules; one that does
+        // not fit fails the request (`http_process_request`, `return_int_err`).
+        req_htx_init(&entry.sess);
         let xff_excepts: Vec<&str> = fe_be.iter().filter_map(|&i| proxies[i].stats_config.forwardfor.as_deref()).collect();
         if !xff_excepts.is_empty() {
             // `if-none` only counts when no proxy that sets the option leaves it out
@@ -9839,7 +9853,9 @@ impl EngineDispatcher<'_> {
                 if !in_except {
                     let ip_str = ip.to_string();
                     // A new line after the client's own, as `HAProxy` writes it.
-                    add_req_header(&mut entry.sess, "X-Forwarded-For", &ip_str);
+                    if !add_req_header_fit(&mut entry.sess, "X-Forwarded-For", &ip_str) {
+                        return Self::request_no_room(entry, proxies);
+                    }
                 }
             }
         }
@@ -9851,7 +9867,9 @@ impl EngineDispatcher<'_> {
                 let in_except = xot_excepts.iter().any(|e| !e.is_empty() && ip_in_cidr(ip, e));
                 if !in_except {
                     let ip_str = ip.to_string();
-                    add_req_header(&mut entry.sess, "X-Original-To", &ip_str);
+                    if !add_req_header_fit(&mut entry.sess, "X-Original-To", &ip_str) {
+                        return Self::request_no_room(entry, proxies);
+                    }
                 }
             }
         }
@@ -9861,7 +9879,9 @@ impl EngineDispatcher<'_> {
         if let Some(fwd) = proxies[be_idx].stats_config.forwarded.clone() {
             let stick = StickView::new(proxies, &entry.sess.tracked_sc);
             let element = forwarded_element(&fwd, &entry.sess, &stream_sample_ctx(&entry.sess, &proxies[proxy_idx], &proxies[be_idx], &ProxiesView(proxies), &stick));
-            append_forwarded_element(&mut entry.sess, &element);
+            if !append_forwarded_element(&mut entry.sess, &element) {
+                return Self::request_no_room(entry, proxies);
+            }
         }
 
         // `option http-server-close` (frontend or backend): this request has the server
@@ -9881,6 +9901,13 @@ impl EngineDispatcher<'_> {
         // writes them (HTX). The request line and the values are the client's.
         lowercase_header_names(entry.sess.req.readable_mut());
         Self::route_to_server(entry, proxies, fdtab, poller, idle_pool, now, be_idx, cookie_server)
+    }
+
+    /// A header `HAProxy` fails the request over (`return_int_err`) did not fit: the 500.
+    fn request_no_room<T>(entry: &mut SessionEntry, proxies: &[Proxy]) -> Option<T> {
+        entry.sess.log.term.get_or_insert(*b"PR");
+        reply_error(entry, proxies, 500);
+        None
     }
 
     /// Picks the server for the request and connects to it. When every server is at its
@@ -10988,6 +11015,19 @@ fn set_req_header(sess: &mut TcpSession, name: &str, val: &str) {
     }
     sess.req_headers = Some(hdrs);
     rebuild_req_buffer(sess);
+}
+
+/// [`add_req_header`] for a header `HAProxy` adds with `http_add_header` and fails the request
+/// over when it does not fit (`return_int_err`: `X-Forwarded-For`, `X-Original-To`,
+/// `Forwarded`): false, nothing added, when the request as it is now (the model of
+/// [`req_htx_init`]) has no room for it.
+fn add_req_header_fit(sess: &mut TcpSession, name: &str, val: &str) -> bool {
+    if !res_htx_resize(0, htx_hdr_size(name, val)) {
+        return false;
+    }
+    sess.htx_reserve(name.len() + val.len());
+    add_req_header(sess, name, val);
+    true
 }
 
 fn add_req_header(sess: &mut TcpSession, name: &str, val: &str) {
