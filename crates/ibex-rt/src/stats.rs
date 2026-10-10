@@ -609,6 +609,8 @@ fn write_server_row(
     r.set("dresp", 0);
     r.set("eresp", ld(&c.eresp));
     r.set("lbtot", ld(&c.lbtot));
+    r.set("connect", ld(&c.connect));
+    r.set("reuse", ld(&c.reuse));
     r.set("rate", c.sess_rate.rate());
     r.set("rate_max", c.rate_max.load(std::sync::atomic::Ordering::Relaxed));
     r.set("lastchg", crate::statcnt::TxnCounters::since_secs(c.last_chg.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or_else(|| crate::statcnt::now_ms() / 1000));
@@ -687,6 +689,8 @@ fn write_backend_row(out: &mut String, proxy: &Proxy, _pid: u32, iid: u32) {
     r.set("lastchg", crate::statcnt::TxnCounters::since_secs(c.last_chg.load(Relaxed)).unwrap_or_else(|| crate::statcnt::now_ms() / 1000));
     r.set("downtime", c.downtime_secs());
     r.set("lbtot", ld(&c.lbtot));
+    r.set("connect", ld(&c.connect));
+    r.set("reuse", ld(&c.reuse));
     r.set("rate", c.sess_rate.rate());
     r.set("rate_max", c.rate_max.load(Relaxed));
     r.set("pid", PROCESS_NUM);

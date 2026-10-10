@@ -1098,6 +1098,8 @@ pub struct ProxyStats {
     pub be_sess_rate: RateCtr,
     pub cum_conn: AtomicU64,
     pub act_conn: AtomicU32,
+    /// Streams the backend has been given and not finished with (`beconn`, `%bc`).
+    pub be_streams: AtomicU32,
     pub max_conn: AtomicU32,
     /// Requests waiting for a server slot (`qcur`) and the most there were (`qmax`).
     pub queue_cur: AtomicU32,
@@ -1612,6 +1614,8 @@ pub struct SessionEntry {
     pub actconn_reclaimed: bool,
     /// The stream's counters were added to `show stat`'s (once per transaction).
     pub stats_done: bool,
+    /// The backend whose `be_streams` count this stream (`stream_set_backend`).
+    pub be_counted: std::cell::Cell<Option<usize>>,
     /// The `Connect from` line of a frontend with no `log-format` is still to be sent: it goes
     /// once the connection has its PROXY header and TLS handshake behind it.
     pub connect_log_due: bool,
@@ -2157,12 +2161,15 @@ fn term_state(entry: &SessionEntry) -> [u8; 2] {
 fn stream_log_data<'a>(entry: &'a SessionEntry, proxies: &'a [Proxy], proxy_idx: usize, pid: u32) -> crate::logfmt::LogData<'a> {
     let fe = &proxies[proxy_idx];
     let be = proxies.get(entry.backend_idx).filter(|_| proxies.len() > 1).unwrap_or(fe);
-    let sum = |p: &Proxy| p.stats.iter().map(|st| u64::from(st.act_conn.load(Ordering::Relaxed))).sum::<u64>();
     crate::logfmt::LogData {
         server_addr: entry.target_addr.map(|t| connect_addr(t, entry.sess.server_addr)),
         server: entry.target_server_idx.and_then(|i| proxies.get(entry.srv_backend_idx)?.server_ids.get(i)).map(String::as_str),
         term_state: term_state(entry),
-        beconn: if std::ptr::eq(be, fe) { 0 } else { sum(be) },
+        // The stream has let go of its backend when the line is made: only the others count.
+        beconn: {
+            let own = entry.be_counted.get().and_then(|i| proxies.get(i)).is_some_and(|p| std::ptr::eq(p, be));
+            be.stats.iter().map(|st| u64::from(st.be_streams.load(Ordering::Relaxed))).sum::<u64>().saturating_sub(u64::from(own))
+        },
         srvconn: entry
             .target_server_idx
             .and_then(|i| proxies.get(entry.srv_backend_idx)?.server_actconn.get(i))
@@ -2226,7 +2233,7 @@ fn session_log_data<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, pid: u3
             (Some(c), Some(t)) if c.rewrite || c.indirect || c.insert || c.prefix => t.ck.log_chars(),
             _ => *b"--",
         },
-        actconn: sum(fe),
+        actconn: u64::from(crate::globalconn::current()),
         feconn: sum(fe),
         retries: i64::from(s.max_retries.saturating_sub(s.conn_retries)),
         redispatched: s.log.redispatched,
@@ -2428,6 +2435,7 @@ fn set_stream_log(entry: &mut SessionEntry, proxies: &[Proxy], pid: u32) {
         Some((line, err)) => (entry.log_line, entry.log_err) = (Some(line), err),
         None => entry.log_line = None,
     }
+    leave_backend(entry, proxies);
 }
 
 /// Why a connection that was to open with a PROXY header did not get past it, if that is
@@ -5790,6 +5798,9 @@ fn register_new_session(
     let proxy = &engine.proxies[proxy_idx];
 
     let target_server_idx = target_addr.and_then(|t| proxy.servers.iter().position(|s| s == t));
+    if target_addr.is_some() {
+        count_connect(&engine.proxies, proxy_idx, target_server_idx, false);
+    }
     if let Some(idx) = target_server_idx {
         if idx < proxy.server_actconn.len() {
             proxy.server_actconn[idx].fetch_add(1, Ordering::Relaxed);
@@ -5816,6 +5827,7 @@ fn register_new_session(
         srv_interest: Interest::NONE,
         actconn_reclaimed: false,
         stats_done: false,
+        be_counted: std::cell::Cell::new(None),
         connect_log_due: proxy.log_format.is_none() && !proxy.log_target_idx.is_empty(),
         srv_served: 0,
         log_line: None,
@@ -6189,6 +6201,7 @@ pub fn shutdown_session_entry(
     if let Some(ref srv) = entry.sess.srv {
         raw::shutdown_both(srv.as_fd());
     }
+    leave_backend(entry, proxies);
     if !entry.actconn_reclaimed {
         entry.actconn_reclaimed = true;
         let proxy_idx = entry.proxy_idx;
@@ -6545,6 +6558,39 @@ fn count_server_session(proxies: &[Proxy], be_idx: usize, addr: SocketAddr) {
         .inspect(|rate| rate.tick());
 }
 
+/// The stream belongs to backend `be_idx` (`stream_set_backend`: `beconn` counts it).
+fn enter_backend(entry: &SessionEntry, proxies: &[Proxy], be_idx: usize) {
+    if entry.be_counted.get() == Some(be_idx) {
+        return;
+    }
+    leave_backend(entry, proxies);
+    if let Some(p) = proxies.get(be_idx) {
+        p.counters().be_streams.fetch_add(1, Ordering::Relaxed);
+        entry.be_counted.set(Some(be_idx));
+    }
+}
+
+/// The stream is done with its backend (`stream_free`): when its transaction is logged, or
+/// the session ends.
+fn leave_backend(entry: &SessionEntry, proxies: &[Proxy]) {
+    if let Some(p) = entry.be_counted.take().and_then(|i| proxies.get(i)) {
+        let _ = p.counters().be_streams.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| Some(c.saturating_sub(1)));
+    }
+}
+
+/// `connect_server`: an attempt to reach the server counts in `reuse` on the server and the
+/// backend when the stream uses a connection that exists already, in `connect` when it makes
+/// one (failed attempts included).
+fn count_connect(proxies: &[Proxy], be_idx: usize, srv_idx: Option<usize>, reused: bool) {
+    let Some(px) = proxies.get(be_idx) else { return };
+    let tc = px.txn_counters();
+    let pick = |c: &crate::statcnt::TxnCounters| if reused { c.reuse.fetch_add(1, Ordering::Relaxed) } else { c.connect.fetch_add(1, Ordering::Relaxed) };
+    pick(&tc.be);
+    if let Some(c) = srv_idx.and_then(|i| tc.srv.get(i)) {
+        pick(c);
+    }
+}
+
 /// `srv_inc_sess_ctr` for a connect attempt that failed: the server's `stot` and session
 /// rate count it, as they count the attempt that ends the stream ([`account_stream`]).
 fn count_failed_attempt(proxies: &[Proxy], be_idx: usize, srv_idx: usize) {
@@ -6657,10 +6703,6 @@ fn retry_server_connect(
             hash,
         )
     };
-    entry.sess.log.redispatched |= redispatch;
-    if redispatch {
-        entry.sess.redispatched = true;
-    }
     let target = if resuming {
         entry.target_addr
     } else if redispatch {
@@ -6693,7 +6735,11 @@ fn retry_server_connect(
             c.1 += u64::from(redispatch);
         });
     };
+    // `SF_REDISP` is set when the server changed, not when a redispatch was due and the
+    // balancer gave the same one again (`assign_server_and_queue`).
     if !resuming && moved {
+        entry.sess.log.redispatched = true;
+        entry.sess.redispatched = true;
         count_on_server(true);
         stats.redispatches.fetch_add(1, Ordering::Relaxed);
         // The server left was a pick too, if the balancer made it (`cum_lbconn` counts each
@@ -6739,6 +6785,7 @@ fn retry_server_connect(
     }
     entry.target_server_idx = s_idx;
     entry.srv_backend_idx = be_idx;
+    count_connect(proxies, be_idx, s_idx, false);
 
     maybe_prepend_send_proxy(&proxies[entry.proxy_idx], &proxies[be_idx], proxies, &mut entry.sess, target_addr);
 
@@ -6885,6 +6932,7 @@ fn cleanup_done(
         fdtab.remove(sfd);
     }
 
+    leave_backend(entry, proxies);
     let proxy_idx = entry.proxy_idx;
     proxies[proxy_idx].counters().bytes_in.fetch_add(entry.sess.bytes_in, Ordering::Relaxed);
     proxies[proxy_idx].counters().bytes_out.fetch_add(entry.sess.bytes_out, Ordering::Relaxed);
@@ -9582,6 +9630,7 @@ impl EngineDispatcher<'_> {
             return None;
         };
         entry.backend_idx = be_idx;
+        enter_backend(entry, proxies, be_idx);
         entry.sess.retry_conn = proxies[be_idx].ids.retry_on & ibex_config::RE_CONN_FAILED != 0;
         // `stream_set_backend` counts the stream for the backend (`proxy_inc_be_ctr`).
         proxies[be_idx].counters().be_sess_rate.tick();
@@ -9842,6 +9891,7 @@ impl EngineDispatcher<'_> {
                 if let Some(txn) = entry.sess.txn.as_mut() {
                     txn.srv_reused = true;
                 }
+                count_connect(proxies, be_idx, entry.target_server_idx, true);
                 return None;
             }
             release_server(entry, proxies, fdtab, poller, idle_pool, true);
@@ -9885,6 +9935,7 @@ impl EngineDispatcher<'_> {
             }
         }
 
+        count_connect(proxies, be_idx, s_idx, reused.is_some());
         if let Some(IdleConn { fd: srv_fd, xprt }) = reused {
             let sfd = srv_fd.as_raw_fd();
             entry.srv_raw_fd = Some(sfd);
@@ -10000,6 +10051,7 @@ impl EngineDispatcher<'_> {
         // already counted for the backend.
         let resumed = entry.sess.be_inspect;
         entry.backend_idx = be_idx;
+        enter_backend(entry, proxies, be_idx);
         entry.sess.retry_conn = proxies[be_idx].ids.retry_on & ibex_config::RE_CONN_FAILED != 0;
         entry.sess.set_backend_timeouts(&proxies[be_idx]);
         stream_timeouts_enter(proxies, entry.proxy_idx, be_idx, &entry.sess);
@@ -10081,6 +10133,7 @@ impl EngineDispatcher<'_> {
                 proxies[be_idx].server_actconn[idx].fetch_add(1, Ordering::Relaxed);
             }
         }
+        count_connect(proxies, be_idx, s_idx, false);
         entry.target_server_idx = s_idx;
         entry.srv_backend_idx = be_idx;
 

@@ -85,6 +85,12 @@ pub fn release() {
     let _ = CURR.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| Some(c.saturating_sub(1)));
 }
 
+/// The client connections open in the process (`actconn`, `%ac`).
+#[must_use]
+pub fn current() -> u32 {
+    CURR.load(Ordering::Relaxed)
+}
+
 /// True when no further connection may be accepted.
 #[must_use]
 pub fn full() -> bool {

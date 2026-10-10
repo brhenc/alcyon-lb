@@ -60,6 +60,10 @@ pub struct TxnCounters {
     pub stot: AtomicU64,
     /// Times the load balancer chose it (`lbtot`).
     pub lbtot: AtomicU64,
+    /// Attempts that made a new server connection, failed ones included (`connect`), and
+    /// attempts that used one that already existed (`reuse`).
+    pub connect: AtomicU64,
+    pub reuse: AtomicU64,
     /// Request bytes as parsed, response bytes as the server sent them (`bin`, `bout`).
     pub bin: AtomicU64,
     pub bout: AtomicU64,
@@ -148,7 +152,7 @@ impl TxnCounters {
         for h in &self.hrsp {
             h.store(0, Ordering::Relaxed);
         }
-        for c in [&self.req_tot, &self.stot, &self.lbtot, &self.bin, &self.bout, &self.cli_abrt, &self.srv_abrt, &self.eresp, &self.ereq] {
+        for c in [&self.req_tot, &self.stot, &self.lbtot, &self.connect, &self.reuse, &self.bin, &self.bout, &self.cli_abrt, &self.srv_abrt, &self.eresp, &self.ereq] {
             c.store(0, Ordering::Relaxed);
         }
         for t in [&self.qtime, &self.ctime, &self.rtime, &self.ttime] {
