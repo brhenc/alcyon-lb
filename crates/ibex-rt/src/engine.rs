@@ -120,6 +120,20 @@ struct Pooled {
     conn: IdleConn,
 }
 
+/// The fds in use and the two counts they are weighed against (`ha_used_fds`,
+/// `tune.pool_low_count`, `tune.pool_high_count`).
+#[derive(Clone, Copy, Debug)]
+struct FdUse {
+    used: usize,
+    low: usize,
+    high: usize,
+}
+
+impl FdUse {
+    #[cfg(test)]
+    const UNLIMITED: Self = Self { used: 0, low: usize::MAX, high: usize::MAX };
+}
+
 /// What a server keeps idle in one worker. `HAProxy` has two lists: a connection that has
 /// carried one request waits in `idle`, one that has carried two or more in `safe` (it
 /// proved the server reuses connections); both are also on `idle_conn_list`, oldest first,
@@ -156,13 +170,14 @@ impl WorkerPool {
     }
 
     /// `srv_add_to_idle_list`: the server keeps a released connection if it keeps any
-    /// (`pool-purge-delay` not 0), `pool-max-conn` allows, and its safe list is empty and
-    /// the connection is itself safe or its idle list is empty, or the server is not keeping
-    /// more than it was seen to need plus `pool-low-conn` (`used` is the server's
+    /// (`pool-purge-delay` not 0), the process holds fewer fds than `pool_high_count`,
+    /// `pool-max-conn` allows, and its safe list is empty and the connection is itself safe
+    /// or its idle list is empty, or -- under `pool_low_count` fds -- the server is not
+    /// keeping more than it was seen to need plus `pool-low-conn` (`used` is the server's
     /// connections in use, this one included). Otherwise it is given back for closing.
     #[cfg(test)]
     fn keep(&mut self, key: IdleKey, conn: IdleConn, is_safe: bool, cfg: SrvPoolCfg, used: u32, now: Instant) -> Result<(), IdleConn> {
-        self.keep_with(key, conn, is_safe, cfg, used, (0, used), now)
+        self.keep_with(key, conn, is_safe, cfg, used, (0, used), FdUse::UNLIMITED, now)
     }
 
     /// [`WorkerPool::keep`], with what the other workers know of the server: its idle
@@ -170,8 +185,8 @@ impl WorkerPool {
     /// (`srv->curr_idle_conns`, `srv->max_used_conns`: server-wide in `HAProxy`; only the
     /// empty-lists clause is this worker's own, `srv->per_thr[tid]`).
     #[allow(clippy::too_many_arguments)]
-    fn keep_with(&mut self, key: IdleKey, conn: IdleConn, is_safe: bool, cfg: SrvPoolCfg, used: u32, (others, peak): (usize, u32), now: Instant) -> Result<(), IdleConn> {
-        if cfg.purge_delay_ms == 0 {
+    fn keep_with(&mut self, key: IdleKey, conn: IdleConn, is_safe: bool, cfg: SrvPoolCfg, used: u32, (others, peak): (usize, u32), fds: FdUse, now: Instant) -> Result<(), IdleConn> {
+        if cfg.purge_delay_ms == 0 || fds.used >= fds.high {
             return Err(conn);
         }
         let s = self.servers.entry(key.srv).or_default();
@@ -186,7 +201,7 @@ impl WorkerPool {
         }
         let idle_empty = curr_idle == s.safe;
         let curr = u32::try_from(all_idle).unwrap_or(u32::MAX);
-        if !((s.safe == 0 && (is_safe || idle_empty)) || used.saturating_add(curr) <= used.max(s.est_need).saturating_add(cfg.low_conn)) {
+        if !((s.safe == 0 && (is_safe || idle_empty)) || (fds.used < fds.low && used.saturating_add(curr) <= used.max(s.est_need).saturating_add(cfg.low_conn))) {
             return Err(conn);
         }
         s.conns.push_back(Pooled { addr: key.addr, name: key.name, safe: is_safe, conn });
@@ -226,6 +241,16 @@ impl WorkerPool {
             }
         }
         None
+    }
+
+    /// Closes server `srv`'s oldest idle connection, safe or not (`idle_conn_list`'s head).
+    fn close_oldest(&mut self, srv: (usize, usize)) -> bool {
+        let Some(s) = self.servers.get_mut(&srv) else { return false };
+        let Some(p) = s.conns.pop_front() else { return false };
+        s.safe -= usize::from(p.safe);
+        self.conns -= 1;
+        p.conn.close();
+        true
     }
 
     /// Closes every idle connection whose peer has gone: EOF, a reset, or bytes nobody asked
@@ -312,6 +337,13 @@ pub struct IdlePools {
     next_takeover: AtomicUsize,
     /// Each server's idle connections in all slots (`srv->curr_idle_conns`).
     srv_idle: std::sync::RwLock<HashMap<(usize, usize), SrvIdleCount>>,
+    /// `tune.pool_low_count`: past these fds in use, a server keeps no more idle
+    /// connections than it was seen to need, and a worker takes another's even when the
+    /// server has few (`tune.pool-low-fd-ratio` of `maxsock`).
+    pool_low: usize,
+    /// `tune.pool_high_count`: past these, no released connection is kept, and a new one
+    /// closes an idle one first (`tune.pool-high-fd-ratio` of `maxsock`).
+    pool_high: usize,
 }
 
 /// A server's idle connections in all slots, and the most it was seen to use at once
@@ -323,20 +355,41 @@ struct SrvIdleCount {
 }
 
 impl IdlePools {
-    /// The pools of `workers` workers, `tune.idle-pool.shared` read from `config`.
+    /// The pools of `workers` workers, `tune.idle-pool.shared` read from `config`, with
+    /// `tune.pool-low-fd-ratio` and `tune.pool-high-fd-ratio` of the `maxsock` the
+    /// configuration gives (`global maxconn` as [`crate::globalconn`] settled it).
     #[must_use]
     pub fn new(workers: usize, config: &Config) -> Arc<Self> {
-        let unshared = config.global.as_ref().is_some_and(|g| g.idle_pool_unshared);
-        Self::with(workers, !unshared)
+        let g = config.global.as_ref();
+        let unshared = g.is_some_and(|g| g.idle_pool_unshared);
+        let (listeners, stats_socket) = listener_count(config);
+        let checks = config.backends.iter().flat_map(|b| &b.servers).chain(config.listens.iter().flat_map(|l| &l.servers)).filter(|s| s.check).count();
+        let maxsock = crate::globalconn::maxsock(crate::globalconn::hard(), listeners, stats_socket, checks, workers.max(1));
+        let low = crate::globalconn::pool_count(maxsock, g.and_then(|g| g.pool_low_fd_ratio).unwrap_or(20));
+        let high = crate::globalconn::pool_count(maxsock, g.and_then(|g| g.pool_high_fd_ratio).unwrap_or(25));
+        Self::with_counts(workers, !unshared, low, high)
     }
 
+    /// No limit from the fds in use.
     fn with(workers: usize, shared: bool) -> Arc<Self> {
+        Self::with_counts(workers, shared, usize::MAX, usize::MAX)
+    }
+
+    fn with_counts(workers: usize, shared: bool, pool_low: usize, pool_high: usize) -> Arc<Self> {
         Arc::new(Self {
             slots: (0..workers.max(1)).map(|_| IdleSlot::default()).collect(),
             shared,
             next_takeover: AtomicUsize::new(0),
             srv_idle: std::sync::RwLock::default(),
+            pool_low,
+            pool_high,
         })
+    }
+
+    /// `ha_used_fds`: the fds in the workers' tables, and the idle connections, which leave
+    /// their worker's table when they go idle.
+    fn fds_used(&self) -> usize {
+        crate::fdtab::used().saturating_add(self.slots.iter().map(|s| s.conns.load(Ordering::Relaxed)).sum::<usize>())
     }
 
     /// Runs `f` on server `srv`'s counts, made on first use.
@@ -447,7 +500,10 @@ impl IdlePool {
         let mut pool = IdlePools::lock(slot);
         let own = pool.servers.get(&srv).map_or(0, |s| s.conns.len());
         let (all, peak) = self.pools.srv_seen(srv, used);
-        let r = pool.keep_with(key, conn, is_safe, cfg, used, (all.saturating_sub(own), peak), now);
+        // `HAProxy` weighs a connection it may keep with its fd still counted; this one has
+        // left the worker's table already.
+        let fds = FdUse { used: self.pools.fds_used().saturating_add(1), low: self.pools.pool_low, high: self.pools.pool_high };
+        let r = pool.keep_with(key, conn, is_safe, cfg, used, (all.saturating_sub(own), peak), fds, now);
         slot.conns.store(pool.conns, Ordering::Relaxed);
         self.next_purge = pool.next_purge();
         drop(pool);
@@ -460,8 +516,8 @@ impl IdlePool {
 
     /// `conn_backend_get`: this worker's lists first; when they hold nothing that matches,
     /// with sharing on and unless the server keeps fewer idle connections than its
-    /// `pool-low-conn` (`steal` false), every other worker's whose lock is free, from the
-    /// one after the last taken from (`HA_SPIN_TRYLOCK`: a busy one is skipped).
+    /// `pool-low-conn` (`steal` false), every other worker's, from the one after the last
+    /// taken from (waiting for a busy one, where `HAProxy` skips it: see below).
     fn take(&mut self, key: &IdleKey, first_req: bool, mode: ibex_config::HttpReuse, steal: bool) -> Option<(IdleConn, bool)> {
         let pools = &*self.pools;
         let own = &pools.slots[self.wid];
@@ -486,8 +542,12 @@ impl IdlePool {
             if i == self.wid || slot.conns.load(Ordering::Relaxed) == 0 {
                 continue;
             }
-            // A busy slot is skipped, and so is a poisoned one: its worker panicked.
-            let Ok(mut pool) = slot.pool.try_lock() else { continue };
+            // `HAProxy` skips a busy list (`HA_SPIN_TRYLOCK`), held there for a few
+            // instructions; this lock is also held by the owner's sweep, a peek per idle
+            // connection, and skipping it opened a connection while the slot held idle ones
+            // (T224: a ninth where eight serve, 8 in 72 runs under load; 1 in 72 waiting).
+            // No worker holds its own slot while it locks another's: no lock order to break.
+            let mut pool = IdlePools::lock(slot);
             let before = pool.conns;
             let found = pool.take(key, first_req, mode);
             slot.conns.store(pool.conns, Ordering::Relaxed);
@@ -502,10 +562,52 @@ impl IdlePool {
         None
     }
 
-    /// Idle connections in every worker's slot: what `pool-low-conn` is compared with
-    /// before taking another worker's (`srv->curr_idle_conns`, here for all servers).
+    /// Idle connections in every worker's slot.
     fn total(&self) -> usize {
         self.pools.slots.iter().map(|s| s.conns.load(Ordering::Relaxed)).sum()
+    }
+
+    /// `conn_backend_get`: whether a worker may take server `srv`'s idle connections from
+    /// another worker. Not while the server keeps fewer than its `pool-low-conn` (`low`)
+    /// and the process holds fewer fds than `pool_low_count`: a new connection is cheap then.
+    fn may_steal(&self, srv: (usize, usize), low: u32) -> bool {
+        let idle = self.pools.with_count(srv, |n| n.idle.load(Ordering::Relaxed));
+        !(idle < usize::try_from(low).unwrap_or(usize::MAX) && self.pools.fds_used() < self.pools.pool_low)
+    }
+
+    /// `connect_server`: past `pool_high_count` fds in use, closes server `srv`'s oldest idle
+    /// connection, this worker's first, then another's whose lock is free (with sharing on;
+    /// off, only the next worker is tried, as `HAProxy` stops after one).
+    fn close_one_over_high(&mut self, srv: (usize, usize)) {
+        let pools = &*self.pools;
+        if pools.fds_used() <= pools.pool_high {
+            return;
+        }
+        let n = pools.slots.len();
+        for i in (self.wid..n).chain(0..self.wid) {
+            let slot = &pools.slots[i];
+            if slot.conns.load(Ordering::Relaxed) == 0 {
+                if i != self.wid && !pools.shared {
+                    break;
+                }
+                continue;
+            }
+            let pool = if i == self.wid { Some(IdlePools::lock(slot)) } else { slot.pool.try_lock().ok() };
+            let Some(mut pool) = pool else { continue };
+            let closed = pool.close_oldest(srv);
+            slot.conns.store(pool.conns, Ordering::Relaxed);
+            if i == self.wid {
+                self.next_purge = pool.next_purge();
+            }
+            drop(pool);
+            if closed {
+                pools.count_idle(srv, 0, 1);
+                return;
+            }
+            if i != self.wid && !pools.shared {
+                break;
+            }
+        }
     }
 
     /// Raises server `srv`'s peak of connections in use to `used`.
@@ -552,7 +654,7 @@ mod shared_pool_tests {
     const CFG: SrvPoolCfg = SrvPoolCfg { max_conn: -1, low_conn: 0, purge_delay_ms: 500 };
 
     /// A connection worker 0 released is taken by worker 1 when shared, not when not, nor
-    /// when the lock is held, nor when `pool-low-conn` forbids it.
+    /// when `pool-low-conn` forbids it; worker 0's lock held a while is waited for (T224).
     #[test]
     fn another_worker_takes_an_idle_connection_only_when_shared() {
         use ibex_config::HttpReuse::Always;
@@ -565,17 +667,90 @@ mod shared_pool_tests {
             assert!(!w1.is_empty() || w1.may_find() == shared);
             assert_eq!(w1.total(), 1);
             assert!(w1.take(&key(), true, Always, false).is_none());
-            {
-                let _held = IdlePools::lock(&pools.slots[0]);
-                assert!(w1.take(&key(), true, Always, true).is_none());
+            let (tx, rx) = std::sync::mpsc::channel();
+            let p = Arc::clone(&pools);
+            let holder = std::thread::spawn(move || {
+                let _held = IdlePools::lock(&p.slots[0]);
+                tx.send(()).expect("signal");
+                std::thread::sleep(Duration::from_millis(100));
+            });
+            rx.recv().expect("the lock is held");
+            let asked = Instant::now();
+            let took = w1.take(&key(), true, Always, true).is_some();
+            holder.join().expect("holder");
+            assert_eq!(took, shared);
+            if shared {
+                assert!(asked.elapsed() >= Duration::from_millis(50), "the busy slot was skipped");
             }
-            assert_eq!(w1.take(&key(), true, Always, true).is_some(), shared);
             assert_eq!(w0.is_empty(), shared);
             // The worker the connection was taken from purges nothing and is unscheduled;
             // one that still holds it purges again later.
             w0.purge(t0 + Duration::from_secs(1), |_| 0);
             assert_eq!(w0.next_purge().is_none(), shared);
         }
+    }
+
+    /// Past `pool_high_count` fds no released connection is kept; past `pool_low_count` only
+    /// the one an empty list takes (`srv_add_to_idle_list`).
+    #[test]
+    fn the_fds_in_use_limit_what_is_kept() {
+        let t0 = Instant::now();
+        let fds = |used| FdUse { used, low: 5, high: 20 };
+        for (used, first, second) in [(3, true, true), (10, true, false), (20, false, false)] {
+            let mut pool = WorkerPool::default();
+            let (c0, _p0) = alive();
+            let (c1, _p1) = alive();
+            assert_eq!(pool.keep_with(key(), c0, false, CFG, 2, (0, 2), fds(used), t0).is_ok(), first, "{used} fds, the first");
+            assert_eq!(pool.keep_with(key(), c1, false, CFG, 1, (0, 2), fds(used), t0).is_ok(), second, "{used} fds, the second");
+        }
+    }
+
+    /// Past `pool_high_count` a new connection closes the server's oldest idle one: this
+    /// worker's, else another's while sharing; unshared, only the next worker is looked at.
+    #[test]
+    fn over_the_high_count_a_connect_closes_an_idle_connection() {
+        use std::io::Read;
+        let t0 = Instant::now();
+        // (sharing, the worker holding server (0, 0)'s connection, `pool_high_count`,
+        // whether worker 1 holds one of another server's, whether (0, 0)'s is closed)
+        let cases = [
+            (true, 0, 0, false, true),
+            (false, 0, 0, false, true),
+            (true, 2, 0, false, true),
+            (false, 2, 0, false, false),
+            (true, 2, 0, true, true),
+            (false, 2, 0, true, false),
+            (true, 0, usize::MAX, false, false),
+        ];
+        for (shared, holder, high, other_on_1, closed) in cases {
+            let pools = IdlePools::with_counts(3, shared, usize::MAX, high);
+            let (c, mut peer) = alive();
+            let (c_other, _peer_other) = alive();
+            let other = IdleKey { srv: (0, 1), ..key() };
+            for (wid, k, conn) in [(holder, key(), Some(c)), (1, other, other_on_1.then_some(c_other))] {
+                let Some(conn) = conn else { continue };
+                let mut pool = IdlePools::lock(&pools.slots[wid]);
+                assert!(pool.keep(k.clone(), conn, false, CFG, 1, t0).is_ok());
+                pools.slots[wid].conns.store(pool.conns, Ordering::Relaxed);
+                pools.count_idle(k.srv, 1, 0);
+            }
+            pools.worker(0).close_one_over_high(key().srv);
+            peer.set_nonblocking(true).expect("nonblocking");
+            let eof = matches!(peer.read(&mut [0u8; 1]), Ok(0));
+            assert_eq!(eof, closed, "shared {shared}, held by worker {holder}, high {high}, another server's on worker 1 {other_on_1}");
+            assert_eq!(pools.slots[holder].conns.load(Ordering::Relaxed) == 0, closed);
+        }
+    }
+
+    /// Another worker's idle connection is not taken while the server keeps fewer than its
+    /// `pool-low-conn` and the fds in use are under `pool_low_count`.
+    #[test]
+    fn under_the_low_count_a_server_with_few_idle_connections_is_not_stolen_from() {
+        let w = IdlePools::with_counts(1, true, usize::MAX, usize::MAX).worker(0);
+        assert!(w.may_steal(key().srv, 0));
+        assert!(!w.may_steal(key().srv, 2));
+        let w = IdlePools::with_counts(1, true, 0, usize::MAX).worker(0);
+        assert!(w.may_steal(key().srv, 2));
     }
 
     /// The purge of a server restarts its peak of connections in use from the connections in
@@ -2514,6 +2689,16 @@ pub fn prebind_quic(config: &Config, workers: usize) -> io::Result<()> {
     Ok(())
 }
 
+/// The listeners a configuration opens, stats sockets included, and whether it has a stats
+/// socket: what `maxconn` and `maxsock` leave room for.
+fn listener_count(config: &Config) -> (usize, bool) {
+    let stats_sockets = config.global.as_ref().map_or(0, |g| usize::from(g.stats_socket.is_some()) + g.extra_stats_sockets.len());
+    let listeners = stats_sockets
+        + config.listens.iter().map(|l| l.binds.len()).sum::<usize>()
+        + config.frontends.iter().map(|f| frontend_binds(f).len()).sum::<usize>();
+    (listeners, stats_sockets > 0)
+}
+
 fn frontend_binds(frontend: &ibex_config::FrontendSection) -> Vec<ibex_config::ast::BindConfig> {
     let mut all_binds = frontend.binds.clone();
     if let Some(ba) = frontend.bind {
@@ -3178,11 +3363,7 @@ impl Engine {
         // The clock of `lastchg` and `lastsess` (`show stat`) starts with the proxies.
         let _ = crate::statcnt::now_ms();
         // The listeners the file descriptor budget has to leave room for.
-        let stats_sockets = config.global.as_ref().map_or(0, |g| usize::from(g.stats_socket.is_some()) + g.extra_stats_sockets.len());
-        let listeners = stats_sockets
-            + config.listens.iter().map(|l| l.binds.len()).sum::<usize>()
-            + config.frontends.iter().map(|f| frontend_binds(f).len()).sum::<usize>();
-        let stats_socket = stats_sockets > 0;
+        let (listeners, stats_socket) = listener_count(config);
         crate::globalconn::configure(config.global.as_ref().and_then(|g| g.maxconn), listeners, stats_socket);
     }
     // An action naming a fetch or converter the registry lacks would load and then do
@@ -6250,6 +6431,7 @@ fn release_server(
 ) {
     // A parked connection has already left the server's count of connections in use.
     let parked = entry.sess.srv_park_exp.is_set();
+    let mut actconn_released = false;
     if let Some(srv_fd) = entry.sess.srv.take() {
         let _ = poller.delete(srv_fd.as_fd());
         if let Some(sfd) = entry.srv_raw_fd.take() {
@@ -6277,6 +6459,12 @@ fn release_server(
         if let (Some(key), Some(be)) = (key, proxies.get(entry.srv_backend_idx)) {
             let cfg = be.ids.server_pool(key.srv.1);
             let used = be.server_actconn.get(key.srv.1).map_or(0, |a| a.load(Ordering::Relaxed)) + u32::from(parked);
+            // Out of use before it counts as idle (`srv_add_to_idle_list` moves it from one
+            // count to the other at once): in use and idle at the same time, another worker
+            // weighing a release saw one connection more than there were and closed one the
+            // next burst needed (T224). `used` above still counts it, as `HAProxy`'s does.
+            release_server_actconn(entry, proxies, parked);
+            actconn_released = true;
             if let Err(conn) = idle_pool.keep(key, IdleConn { fd: srv_fd, xprt }, entry.srv_served >= 2, cfg, used, Instant::now()) {
                 conn.close();
             }
@@ -6288,18 +6476,27 @@ fn release_server(
     entry.srv_raw_fd = None;
     entry.sess.srv_park_exp = Tick::ETERNITY;
     entry.sess.srv_xprt = crate::xprt::ServerXprt::Plain;
-    if let Some(s_idx) = entry.target_server_idx.take() {
-        let be = entry.srv_backend_idx;
-        if !entry.actconn_reclaimed && !parked && be < proxies.len() && s_idx < proxies[be].server_actconn.len() {
-            proxies[be].server_actconn[s_idx].fetch_sub(1, Ordering::Relaxed);
-        }
+    if !actconn_released {
+        release_server_actconn(entry, proxies, parked);
     }
+    entry.target_server_idx = None;
     entry.target_addr = None;
     entry.srv_served = 0;
     entry.sess.srv_state = ScState::Init;
     // The next server connection is a new one and gets its own PROXY header.
     if entry.sess.mode == Mode::Http {
         entry.sess.send_proxy_prepended = false;
+    }
+}
+
+/// The stream no longer uses its server: out of the server's connections in use (a parked
+/// connection left them already, and a reclaimed stream was taken out by the CLI).
+fn release_server_actconn(entry: &SessionEntry, proxies: &[Proxy], parked: bool) {
+    let be = entry.srv_backend_idx;
+    if let Some(s_idx) = entry.target_server_idx {
+        if !entry.actconn_reclaimed && !parked && be < proxies.len() && s_idx < proxies[be].server_actconn.len() {
+            proxies[be].server_actconn[s_idx].fetch_sub(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -9607,11 +9804,6 @@ impl EngineDispatcher<'_> {
         }
 
         let s_idx = cookie_server.or_else(|| proxies[be_idx].servers.iter().position(|s| s == target_addr));
-        if let Some(idx) = s_idx {
-            if idx < proxies[be_idx].server_actconn.len() {
-                proxies[be_idx].server_actconn[idx].fetch_add(1, Ordering::Relaxed);
-            }
-        }
         entry.target_server_idx = s_idx;
         entry.srv_backend_idx = be_idx;
 
@@ -9625,12 +9817,27 @@ impl EngineDispatcher<'_> {
             let sni = server_sni(&entry.sess, proxies, entry.proxy_idx, be_idx, s_idx);
             let key = idle_key(target_addr, be_idx, s_idx, sni);
             // `conn_backend_get` takes none of another thread's while the server keeps fewer
-            // idle connections than its `pool-low-conn` (and few fds are in use).
+            // idle connections than its `pool-low-conn` and few fds are in use.
             let low = s_idx.map_or(0, |i| proxies[be_idx].ids.server_pool(i).low_conn);
-            let steal = low == 0 || idle_pool.total() >= usize::try_from(low).unwrap_or(usize::MAX);
+            let steal = key.as_ref().is_none_or(|k| idle_pool.may_steal(k.srv, low));
+            let srv = key.as_ref().map(|k| k.srv);
             if let Some((conn, safe)) = key.and_then(|k| idle_pool.take(&k, entry.sess.is_first_req, proxies[be_idx].http_reuse, steal)) {
                 entry.srv_served = if safe { 2 } else { 1 };
                 reused = Some(conn);
+            }
+            // `connect_server`: past `pool_high_count` fds, one of the server's idle
+            // connections is closed, whether or not one was reused.
+            if let Some(srv) = srv {
+                idle_pool.close_one_over_high(srv);
+            }
+        }
+        // In use from here (`srv_use_conn`, after the takeover): counted before the take, a
+        // connection taken from the pool was in use and idle at once, and another worker
+        // weighing a release (`srv_add_to_idle_list`) saw one more than there were and closed
+        // a connection the next burst needed (T224: 9 server connections where 8 serve).
+        if let Some(idx) = s_idx {
+            if idx < proxies[be_idx].server_actconn.len() {
+                proxies[be_idx].server_actconn[idx].fetch_add(1, Ordering::Relaxed);
             }
         }
 

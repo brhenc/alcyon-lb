@@ -85,10 +85,27 @@ impl Entry {
     };
 }
 
+/// The fds every worker's table holds (`ha_used_fds`, which `fd_insert` and `fd_delete`
+/// count): what the idle server connections are weighed against (T230).
+static USED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The fds in every worker's table.
+#[must_use]
+pub fn used() -> usize {
+    USED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Per-thread fd table, indexed by fd number.
 pub struct FdTab {
     entries: Vec<Entry>,
     live: usize,
+}
+
+impl Drop for FdTab {
+    /// A table that goes (an engine rebuilt or dropped) takes its fds out of the count.
+    fn drop(&mut self) {
+        USED.fetch_sub(self.live, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 impl FdTab {
@@ -125,6 +142,7 @@ impl FdTab {
         let e = self.slot(fd);
         if e.state == FdState::Closed {
             self.live += 1;
+            USED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         let e = self.slot(fd);
         e.state = state;
@@ -137,6 +155,7 @@ impl FdTab {
         let e = self.slot(fd);
         if e.state != FdState::Closed {
             self.live -= 1;
+            USED.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
         *self.slot(fd) = Entry::EMPTY;
     }

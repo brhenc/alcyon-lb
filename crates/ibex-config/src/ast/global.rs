@@ -147,6 +147,12 @@ pub struct GlobalSection {
     /// `tune.idle-pool.shared off`: each worker takes only the idle server connections it
     /// released itself (the default, `on` or `full`, lets it take another worker's).
     pub idle_pool_unshared: bool,
+    /// `tune.pool-high-fd-ratio`: the percentage of `maxsock` in use past which no released
+    /// server connection is kept idle (25 when unset).
+    pub pool_high_fd_ratio: Option<u8>,
+    /// `tune.pool-low-fd-ratio`: the percentage of `maxsock` in use past which a server keeps
+    /// no more idle connections than it was seen to need (20 when unset).
+    pub pool_low_fd_ratio: Option<u8>,
     /// Buffer size in bytes (`tune.bufsize`).
     pub bufsize: Option<usize>,
     /// Small buffer size in bytes (`tune.bufsize.small`).

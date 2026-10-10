@@ -138,6 +138,36 @@ pub(crate) fn parse_global_directive(
             };
             Ok(())
         }
+        // `cfg_parse_pool_fd_ratio` (src/server.c): `atoi`, so text that is not a number is 0.
+        "tune.pool-high-fd-ratio" | "tune.pool-low-fd-ratio" => {
+            let name = kw.text.as_str();
+            if let Some(extra) = tokens.get(2) {
+                return Err(ConfigError::new(kw.line, kw.col, format!("'{name}' cannot handle unexpected argument '{}'.", extra.text)));
+            }
+            let arg = tokens.get(1).map(|t| t.text.as_str());
+            let ratio = arg.map_or(-1, |a| {
+                let t = a.trim_start();
+                let (neg, digits) = match t.as_bytes().first() {
+                    Some(b'-') => (true, &t[1..]),
+                    Some(b'+') => (false, &t[1..]),
+                    _ => (false, t),
+                };
+                let mut n: i64 = 0;
+                for b in digits.bytes().take_while(u8::is_ascii_digit) {
+                    n = (n * 10 + i64::from(b - b'0')).min(i64::from(i32::MAX));
+                }
+                if neg { -n } else { n }
+            });
+            let Ok(ratio) = u8::try_from(ratio).map_err(|_| ()).and_then(|r| if r <= 100 { Ok(r) } else { Err(()) }) else {
+                return Err(ConfigError::new(kw.line, kw.col, format!("'{name}' expects an integer argument between 0 and 100.")));
+            };
+            if name == "tune.pool-high-fd-ratio" {
+                global.pool_high_fd_ratio = Some(ratio);
+            } else {
+                global.pool_low_fd_ratio = Some(ratio);
+            }
+            Ok(())
+        }
         "tune.maxrewrite" => {
             if tokens.len() < 2 {
                 return Err(ConfigError::new(kw.line, kw.col, "'tune.maxrewrite' expects an integer argument."));
