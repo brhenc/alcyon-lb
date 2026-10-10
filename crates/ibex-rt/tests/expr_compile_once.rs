@@ -134,6 +134,19 @@ fn rewrite_regexes_are_not_compiled_per_request() {
 }
 
 #[test]
+fn a_replace_header_that_rewrites_compiles_no_pattern_from_the_value() {
+    // The value is the client's text: it must not become a pattern, compiled per request and
+    // kept in the 4096-entry per-thread cache (T241 item 2). The value changes between the
+    // two requests (it is the path), so a cache hit on the first one's cannot hide it.
+    let rules = "  http-request set-header X-P %[path]\n  \
+                 http-request replace-header X-P (.*) y\\1\n  \
+                 http-request set-header X-Q a,%[path],c\n  \
+                 http-request replace-value X-Q ([a-z/]+) <\\1>";
+    let got = compiles_per_request_after(rules, ("/one", "HTTP/1.1 200"), None, ("/two", "HTTP/1.1 200"));
+    assert_eq!(got, (0, 0));
+}
+
+#[test]
 fn session_and_counter_expressions_are_not_parsed_per_request() {
     // Measured on HAProxy 3.5-dev8: x-src 10.9.8.7, x-dst 10.1.2.3, x-g 8.
     let rules = "  stick-table type ip size 10 store gpt0\n  \

@@ -11260,12 +11260,14 @@ fn replace_req_value(sess: &mut TcpSession, name: &str, regex: &str, repl: &str)
 /// before it stay rewritten.
 fn rewrite_req_header_values(sess: &mut TcpSession, name: &str, regex: &str, repl: &str, per_value: bool) -> Result<(), ()> {
     let re = ibex_regex::UserRegex::cached(regex).map_err(|_| ())?;
-    let headers: Vec<(String, String)> = sess.htx_slice().map_or_else(Vec::new, |h| {
-        h.headers().filter(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    // Block index, name and value of each header: a value is written back by its block, never
+    // turned into a pattern (it is the client's text, and a compiled pattern is kept).
+    let headers: Vec<(usize, String, String)> = sess.htx_slice().map_or_else(Vec::new, |h| {
+        h.header_blocks().filter(|(_, k, _)| k.eq_ignore_ascii_case(name)).map(|(i, k, v)| (i, k.to_string(), v.to_string())).collect()
     });
-    let mut edits: Vec<(String, String)> = Vec::new();
+    let mut edits: Vec<(usize, String, String)> = Vec::new();
     let mut failed = false;
-    for (k, v) in &headers {
+    for (i, k, v) in &headers {
         let new = if per_value {
             replace_each_value(v, &re, repl)
         } else {
@@ -11276,25 +11278,19 @@ fn rewrite_req_header_values(sess: &mut TcpSession, name: &str, regex: &str, rep
         };
         match new {
             Some(n) if n == *v => {}
-            Some(n) if res_htx_resize(htx_hdr_size(k, v), htx_hdr_size(k, &n)) => edits.push((v.clone(), n)),
+            Some(n) if res_htx_resize(htx_hdr_size(k, v), htx_hdr_size(k, &n)) => edits.push((*i, v.clone(), n)),
             _ => {
                 failed = true;
                 break;
             }
         }
     }
-    // Each value is written at the end of the HTX, twice (the marker and the new value), the
-    // old ones staying where they were until the message is defragmented.
-    sess.htx_reserve(edits.iter().map(|(old, new)| old.len() + new.len() + 64).sum());
+    // Each value is written at the end of the HTX, the old ones staying where they were until
+    // the message is defragmented.
+    sess.htx_reserve(edits.iter().map(|(_, old, new)| old.len() + new.len() + 64).sum());
     sess.with_htx_mut(|htx| {
-        // Two steps through a marker, so that a new value equal to the old value of a later
-        // edit is not rewritten again. A value is replaced whole and literally: `$` is the
-        // only special character in a `regex` replacement.
-        for (i, (old, _)) in edits.iter().enumerate() {
-            let _ = htx.replace_header(name, &format!("^{}$", ibex_regex::UserRegex::escape(old)), &format!("@@ibex-rewrite-{i}@@"));
-        }
-        for (i, (_, new)) in edits.iter().enumerate() {
-            let _ = htx.replace_header(name, &format!("^@@ibex-rewrite-{i}@@$"), &new.replace('$', "$$"));
+        for (i, _, new) in &edits {
+            let _ = htx.replace_block_value(*i, new.as_bytes());
         }
     });
     rebuild_req_buffer(sess);
@@ -11305,7 +11301,6 @@ fn rewrite_req_header_values(sess: &mut TcpSession, name: &str, regex: &str, rep
     }
 }
 
-/// Seconds since the epoch (`date.tv_sec`).
 fn unix_now() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
