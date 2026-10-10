@@ -709,6 +709,13 @@ impl MuxH2 {
             ctx.send_goaway(ctx.highest_opened, H2Error::StreamClosed, b"HEADERS on a closed stream");
             return Err(io::Error::new(io::ErrorKind::InvalidData, "HEADERS on a closed stream"));
         }
+        // Decoded before anything may refuse the stream: the client's encoder has added
+        // these fields to its table whatever becomes of the stream (T235).
+        let decoded_headers = ctx.decoder.decode(header_block).map_err(|e| {
+            ctx.send_goaway(stream_id, e, b"HPACK compression error");
+            io::Error::new(io::ErrorKind::InvalidData, "HPACK compression error")
+        })?;
+
         if !ctx.streams.contains_key(&stream_id) {
             let active = ctx
                 .streams
@@ -720,11 +727,6 @@ impl MuxH2 {
                 return Ok(());
             }
         }
-
-        let decoded_headers = ctx.decoder.decode(header_block).map_err(|e| {
-            ctx.send_goaway(stream_id, e, b"HPACK compression error");
-            io::Error::new(io::ErrorKind::InvalidData, "HPACK compression error")
-        })?;
 
         // A second HEADERS on a stream whose head is complete is the request's trailers
         // (RFC 9113 section 8.1): they end the stream, carry no pseudo-header, and are kept
@@ -1427,6 +1429,33 @@ mod tests {
         let s = Frame::Settings { flags: 0, settings: vec![(SettingsParameter::HeaderTableSize, 256)] };
         mux.parse(&mut ctx, &s.encode()).expect("settings");
         assert_eq!(ctx.encoder.dynamic_table.max_size(), 256);
+    }
+
+    /// HEADERS refused over the stream limit are HPACK-decoded all the same: the client's
+    /// encoder has added their fields to its table, and the next request refers to them.
+    /// Not decoded, the tables parted and that request was a COMPRESSION_ERROR (T235).
+    #[test]
+    fn a_refused_stream_keeps_the_hpack_table_in_step() {
+        let (mux, mut ctx) = open_conn();
+        let mut enc = HpackEncoder::new();
+        let mut get = |id: u32, extra: &str| {
+            let block = enc.encode(&[
+                HeaderField { name: ":method".into(), value: "GET".into() },
+                HeaderField { name: ":path".into(), value: "/".into() },
+                HeaderField { name: "x-extra".into(), value: extra.into() },
+            ]);
+            Frame::Headers { flags: frame_flags::END_HEADERS | frame_flags::END_STREAM, stream_id: id, header_block: block }.encode()
+        };
+        for i in 0..100 {
+            mux.parse(&mut ctx, &get(2 * i + 1, "a")).expect("open");
+        }
+        let sent = ctx.tx_buf.len();
+        mux.parse(&mut ctx, &get(201, "refused")).expect("refused");
+        assert_eq!(ctx.tx_buf[sent + 3], 0x3, "not refused with RST_STREAM");
+        ctx.streams.remove(&1);
+        mux.parse(&mut ctx, &get(203, "refused")).expect("the next request decodes");
+        let x = ctx.streams.get(&203).and_then(|s| s.rx_htx.get_header("x-extra").map(str::to_owned));
+        assert_eq!(x.as_deref(), Some("refused"));
     }
 
     /// RFC 9113 section 6.1: padding counts toward flow control; only the data reaches the stream.
