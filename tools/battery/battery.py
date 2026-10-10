@@ -14,8 +14,12 @@ import glob, json, os, re, signal, subprocess, sys, threading, time, urllib.requ
 
 D = os.path.dirname(os.path.abspath(__file__))
 HATERM, HALOAD = "/root/ibex-test/haterm", "/root/ibex-test/haload"
-H1, H2 = 10080, 10081
-# name: (attack processes [(client scenario, port, workers)], legit protocol)
+H1, H2, TLS = 10080, 10081, 10443
+CRT = os.environ.get("BATTERY_CRT", "/root/ibex-test/lab.pem")  # TLS bind only if this exists
+# name: (attack processes, legit protocol).  An attack process is either
+#   (client scenario, port, workers)            -> clients.py attack ... (one Python process)
+#   ("haload", port, scheme, [haload args])     -> haload as a rate-capped flood engine (-R)
+# legit protocol: h1 / h2c (clear) / h1s / h2s (over the TLS bind).
 SCEN = {
     "slowloris":      ([("slowloris", H1, 0)], "h1"),
     "slow_post":      ([("slow_post", H1, 0)], "h1"),
@@ -29,6 +33,34 @@ SCEN = {
     "be_drip":        ([("be_drip", H1, 0)], "h1"),
     "be_reset":       ([("be_reset", H1, 0)], "h1"),
 }
+HL = lambda port, scheme, *a: ("haload", port, scheme, list(a))
+# protocol-spam scenarios (red team, 2026-10-11); rates are caps, see README
+SCEN.update({
+    "hoic_h1_ka":        ([HL(H1, "http", "-h1", "-t", "4", "-u", "200", "-R", "20000")], "h1"),
+    "hoic_h1_conn":      ([HL(H1, "http", "-h1", "-t", "4", "-u", "200", "-r", "1", "-R", "5000")], "h1"),
+    "hoic_h2":           ([HL(H2, "http", "-h2c", "-t", "4", "-u", "50", "-m", "50", "-R", "20000")], "h2c"),
+    "hoic_rand":         ([("hoic_rand", H1, 32)] * 4, "h1"),
+    "h1_pipeline":       ([("h1_pipeline", H1, 32)] * 2, "h1"),
+    "h1_range":          ([("h1_range", H1, 64)], "h1"),
+    "h2_continuation":   ([("h2_continuation", H2, 16)] * 2, "h2c"),
+    "h2_cont_drip":      ([("h2_cont_drip", H2, 400)], "h2c"),
+    "h2_hpack_bomb":     ([("h2_hpack_bomb", H2, 16)] * 2, "h2c"),
+    "h2_madeyoureset":   ([("h2_madeyoureset", H2, 4)], "h2c"),
+    "h2_priority_flood": ([("h2_priority_flood", H2, 8)], "h2c"),
+    "h2_empty_data":     ([("h2_empty_data", H2, 8)], "h2c"),
+    "h2_wu_storm":       ([("h2_wu_storm", H2, 8)], "h2c"),
+    "h2_streams":        ([("h2_streams", H2, 200)], "h2c"),
+    "h2_preface_idle":   ([("h2_preface_idle", H2, 3000)], "h2c"),
+    "tls_hs_full":       ([HL(TLS, "https", "-h1", "-t", "4", "-u", "200", "-r", "1", "-R", "2000", "--server", "no-ssl-reuse")], "h2s"),
+    "tls_hs_resume":     ([HL(TLS, "https", "-h1", "-t", "4", "-u", "200", "-r", "1", "-R", "4000")], "h2s"),
+    "tls_hello_only":    ([("tls_hello_only", TLS, 2500)], "h2s"),
+    "tls_reneg":         ([("tls_reneg", TLS, 50)], "h2s"),
+    "maxconn_full":      ([("maxconn_full", H1, 2500)], "h1"),
+    "mixed":             ([("slowloris", H1, 1000), ("h2_rapid_reset", H2, 2),
+                           HL(H1, "http", "-h1", "-t", "2", "-u", "100", "-R", "5000"),
+                           HL(TLS, "https", "-h1", "-t", "2", "-u", "50", "-r", "1", "-R", "500", "--server", "no-ssl-reuse")], "h1"),
+})
+LEGIT = {"h1": (H1, "-h1", "http"), "h2c": (H2, "-h2c", "http"), "h1s": (TLS, "-h1", "https"), "h2s": (TLS, "-h2", "https")}
 CFG = """global
     nbthread 4
     maxconn 2000
@@ -42,7 +74,7 @@ defaults
 frontend f
     bind 127.0.0.1:{h1}
     bind 127.0.0.1:{h2} proto h2
-    use_backend hang if {{ path_beg /hang }}
+{tlsbind}    use_backend hang if {{ path_beg /hang }}
     use_backend drip if {{ path_beg /drip }}
     use_backend reset if {{ path_beg /reset }}
     default_backend b
@@ -81,11 +113,12 @@ def stat(pid):
         return None
 
 
-def probe(port, h2):
-    cmd = ["curl", "-s", "-o", "/dev/null", "--max-time", "3", "-w", "%{http_code}"]
-    if h2: cmd.append("--http2-prior-knowledge")
-    r = subprocess.run(cmd + [f"http://127.0.0.1:{port}/?s=1k"], capture_output=True, text=True)
-    return r.stdout.strip() == "200"
+def probe(port, h2, tls=False, detail=False):
+    cmd = ["curl", "-s", "-k", "-o", "/dev/null", "--max-time", "3", "-w", "%{http_code}"]
+    if h2: cmd.append("--http2" if tls else "--http2-prior-knowledge")
+    r = subprocess.run(cmd + [f"{'https' if tls else 'http'}://127.0.0.1:{port}/?s=1k"], capture_output=True, text=True)
+    ok = r.stdout.strip() == "200"
+    return (ok, r.stdout.strip() if r.returncode == 0 else f"curl{r.returncode}") if detail else ok
 
 
 def wait_port(port):
@@ -111,7 +144,8 @@ def parse_haload(text):
 def run_one(binary, label, outdir, secs, name):
     run = f"/tmp/battery-{label}-{name}"
     subprocess.run(["rm", "-rf", run]); os.makedirs(run)
-    open(f"{run}/proxy.cfg", "w").write(CFG.format(run=run, h1=H1, h2=H2))
+    tlsbind = f"    bind 127.0.0.1:{TLS} ssl crt {CRT} alpn h2,http/1.1\n" if os.path.exists(CRT) else ""
+    open(f"{run}/proxy.cfg", "w").write(CFG.format(run=run, h1=H1, h2=H2, tlsbind=tlsbind))
     procs = []
     try:
         procs.append(spawn([HATERM, "-L", "127.0.0.1:8888", "-G", "nbthread 8"], "16-31", open(f"{run}/haterm.log", "w")))
@@ -121,7 +155,8 @@ def run_one(binary, label, outdir, secs, name):
         wait_port(H1); time.sleep(0.5)
         pid = proxy.pid
         base = stat(pid) or (0, 0, 0)
-        res = dict(label=label, scenario=name, secs=secs, base_rss=base[0], base_fds=base[2])
+        ver = subprocess.run([binary, "-v"], capture_output=True, text=True).stdout.splitlines()
+        res = dict(label=label, scenario=name, secs=secs, base_rss=base[0], base_fds=base[2], version=ver[0] if ver else "")
         samples = []; stopflag = []
         def sampler():
             last = stat(pid)
@@ -131,28 +166,39 @@ def run_one(binary, label, outdir, secs, name):
                 samples.append((s[0], (s[1] - last[1]) * 100, s[2])); last = s
         th = threading.Thread(target=sampler); th.start()
         attacks, proto = SCEN[name]
-        lport, lopt = (H2, "-h2c") if proto == "h2c" else (H1, "-h1")
+        lport, lopt, lscheme = LEGIT[proto]
+        ltls = lscheme == "https"
         legit = spawn([HALOAD, "-t", "2", "-u", "4", "-R", "50", "-d", str(secs), "-hs", "-P", lopt,
-                       f"http://127.0.0.1:{lport}/?s=1k"], "32-35", subprocess.PIPE)
+                       f"{lscheme}://127.0.0.1:{lport}/?s=1k"], "32-35", subprocess.PIPE)
         time.sleep(3)  # let the legit load establish itself before the attack starts
         t0 = time.time()
-        aps = [spawn([sys.executable, f"{D}/clients.py", "attack", a, "127.0.0.1", str(port), str(max(secs - 3, 1)), str(n)],
-                     "40-47", open(f"{run}/attack-{a}.log", "w")) for a, port, n in attacks]
-        mid = []
+        aps = []
+        for k, a in enumerate(attacks):
+            if a[0] == "haload":
+                _, port, scheme, args = a
+                cmd = [HALOAD, "-d", str(max(secs - 3, 1)), "-hs"] + args + [f"{scheme}://127.0.0.1:{port}/?s=1k"]
+                aps.append(spawn(cmd, "40-47", open(f"{run}/attack-{k}-haload.log", "w")))
+            else:
+                sc, port, n = a
+                aps.append(spawn([sys.executable, f"{D}/clients.py", "attack", sc, "127.0.0.1", str(port), str(max(secs - 3, 1)), str(n)],
+                                 "40-47", open(f"{run}/attack-{k}-{sc}.log", "w")))
+        mid = []; mid_detail = []
         while time.time() - t0 < secs - 3:
             time.sleep(10)  # mid-attack probe: can a new client get served at all
-            mid.append(probe(lport, proto == "h2c"))
+            ok, det = probe(lport, proto in ("h2c", "h2s"), ltls, detail=True)
+            mid.append(ok); mid_detail.append(det)
         for a in aps: stop(a)
         out = legit.communicate(timeout=60)[0].decode(errors="replace")
         open(f"{run}/haload.out", "w").write(out)
         res.update(parse_haload(out))
         res["mid_probe_ok"] = f"{sum(mid)}/{len(mid)}"
+        res["mid_probe_detail"] = mid_detail
         # recovery: attack is over; a probe works on both binds and fds are back near the baseline
         t1 = time.time(); rec = None
         while time.time() - t1 < int(os.environ.get("RECOVER_MAX", 45)):
             s = stat(pid)
             if s is None: break
-            if probe(H1, False) and probe(H2, True) and s[2] <= base[2] + 30:
+            if probe(H1, False) and probe(H2, True) and (not tlsbind or probe(TLS, True, True)) and s[2] <= base[2] + 30:
                 rec = round(time.time() - t1, 1); break
             time.sleep(1)
         stopflag.append(1); th.join()
