@@ -119,6 +119,7 @@ fn the_global_keywords_are_checked_like_haproxy() {
         ("h1-case-adjust a b", "<from> and <to> must not differ except the case"),
         ("h1-case-adjust a A\n  h1-case-adjust a A", "duplicate entry 'a'"),
         ("h1-case-adjust-file", "'h1-case-adjust-file' expects <file> as argument."),
+        ("h1-case-adjust-file /tmp/x y", "'h1-case-adjust-file' cannot handle unexpected argument 'y'."),
         ("h1-case-adjust-file /nonexistent/t244", "h1-headers-case-adjust-file '/nonexistent/t244': failed to open file."),
     ];
     for (cfg, text) in cases {

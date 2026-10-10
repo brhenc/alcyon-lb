@@ -43,6 +43,9 @@ fn a_server_maxqueue_limit_is_refused_and_zero_loads() {
     assert!(m.contains("'maxqueue' is not supported: Ibex has no per-server queue"), "{m}");
     assert!(parse_str("backend b\n server s 127.0.0.1:1 maxqueue 0\n").is_ok());
     assert!(parse_str("backend b\n default-server maxqueue 0\n server s 127.0.0.1:1\n").is_ok());
+    // `atol` takes a leading `+`: `+5` is a limit of 5, refused as well.
+    let m = refusal("backend b\n server s 127.0.0.1:1 maxqueue +5\n");
+    assert!(m.contains("'maxqueue' is not supported"), "{m}");
     let m = refusal("backend b\n default-server maxqueue 5\n server s 127.0.0.1:1\n");
     assert!(m.contains("'maxqueue' is not supported"), "{m}");
 }

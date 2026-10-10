@@ -383,10 +383,8 @@ impl StickTable {
         let expire_dur = self.config.expire;
         let mut purged = 0;
         while let Some(head) = inner.head_lru {
-            let Some(slot) = inner.slots[head as usize].as_mut() else {
-                inner.evict_slot(head);
-                continue;
-            };
+            // The LRU list links occupied slots only: `evict_slot` unlinks before it frees.
+            let Some(slot) = inner.slots[head as usize].as_mut() else { break };
             if now.duration_since(slot.data.last_updated) < expire_dur {
                 break;
             }
@@ -723,6 +721,23 @@ fn leading_number(s: &str) -> i64 {
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
+
+    /// An entry past its expiry is not dumped, though not purged yet; the purge then
+    /// takes it.
+    #[test]
+    fn an_expired_entry_is_not_dumped_and_is_purged() {
+        let config = StickTableConfig { key_type: KeyType::Ip, expire: Duration::from_millis(30), ..Default::default() };
+        let table = StickTable::new(config);
+        let key = StickKey::Ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        table.update_entry(&key, |e| e.conn_cnt += 1).expect("update");
+        assert_eq!(table.dump_from(0, 10).0.len(), 1);
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(table.len(), 1, "not purged yet");
+        let (dumped, next) = table.dump_from(0, 10);
+        assert!(dumped.is_empty() && next.is_none(), "{dumped:?}");
+        assert_eq!(table.purge_expired().expect("purge"), 1);
+        assert_eq!(table.len(), 0);
+    }
 
     #[test]
     fn test_stick_table_tracking() {

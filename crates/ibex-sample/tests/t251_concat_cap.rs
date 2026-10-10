@@ -34,3 +34,14 @@ fn concat_larger_than_the_trash_is_no_sample() {
     assert_eq!(concat_len(16000, 1000), None);
     assert_eq!(concat_len(1_000_000, 1), None);
 }
+
+/// The cut at bufsize - 1 falls inside a two-byte character: Ibex keeps its strings valid
+/// UTF-8 and cuts before that character (16382 bytes). `HAProxy` cuts the bytes (16383, half
+/// a character); that is not measured here, and is a deliberate difference.
+#[test]
+fn concat_is_cut_before_a_character_the_buffer_size_splits() {
+    let reg = Registry::new();
+    let ctx = SampleContext::default();
+    let got = reg.eval("str", &["A".repeat(16382)], &[("concat", vec!["\u{e9}".to_string()])], &ctx);
+    assert_eq!(got, Some(Sample::Str("A".repeat(16382))));
+}

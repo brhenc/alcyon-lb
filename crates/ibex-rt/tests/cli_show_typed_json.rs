@@ -15,6 +15,11 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 fn answers(cmds: &[&str]) -> Vec<String> {
+    answers_with("backend be\n  server s1 127.0.0.1:18091\n  server s2 127.0.0.1:18092\n", cmds)
+}
+
+/// The CLI answers to `cmds` of an Ibex with a frontend `fe` (default backend `be`) and `proxies`.
+fn answers_with(proxies: &str, cmds: &[&str]) -> Vec<String> {
     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let id = format!("{}-{}", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
     let sock = format!("/tmp/ibex-typed-{id}.sock");
@@ -24,8 +29,7 @@ fn answers(cmds: &[&str]) -> Vec<String> {
         &cfg,
         format!(
             "global\n  stats socket {sock} level admin\ndefaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n\
-             frontend fe\n  bind {fe}\n  default_backend be\n\
-             backend be\n  server s1 127.0.0.1:18091\n  server s2 127.0.0.1:18092\n"
+             frontend fe\n  bind {fe}\n  default_backend be\n{proxies}"
         ),
     )
     .expect("write cfg");
@@ -172,4 +176,29 @@ fn show_stat_type_filter_uses_haproxy_bits() {
     assert_eq!(kinds(&a[1]), "B");
     assert_eq!(kinds(&a[2]), "S");
     assert_eq!(kinds(&a[3]), "FS");
+}
+
+/// The `algo` column names the backend's balance algorithm as HAProxy does; `random`
+/// prints `unknown` (measured on HAProxy 3.5-dev8 with one backend per algorithm). A
+/// backend with no `balance` line is left out: HAProxy prints `unknown` (its default is
+/// `random`), Ibex `roundrobin`.
+#[test]
+fn show_stat_algo_names_each_balance_algorithm_as_haproxy() {
+    let algos = ["roundrobin", "source", "uri", "leastconn", "static-rr", "first", "random"];
+    let mut proxies = String::from("backend be\n  server s1 127.0.0.1:18091\n");
+    for a in algos {
+        proxies.push_str(&format!("backend b_{a}\n  balance {a}\n  server s1 127.0.0.1:18091\n"));
+    }
+    let a = answers_with(&proxies, &["show stat"]);
+    let mut lines = a[0].lines();
+    let head: Vec<&str> = lines.next().unwrap_or_default().trim_start_matches("# ").split(',').collect();
+    let col = head.iter().position(|h| *h == "algo").expect("algo column");
+    let got: Vec<(String, String)> = lines
+        .map(|l| l.split(',').collect::<Vec<_>>())
+        .filter(|r| r.len() > col && r[1] == "BACKEND" && r[0].starts_with("b_"))
+        .map(|r| (r[0].to_string(), r[col].to_string()))
+        .collect();
+    let want: Vec<(String, String)> =
+        algos.iter().map(|a| (format!("b_{a}"), if *a == "random" { "unknown" } else { *a }.to_string())).collect();
+    assert_eq!(got, want, "{:.400}", a[0]);
 }

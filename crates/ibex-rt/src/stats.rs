@@ -228,10 +228,9 @@ impl StatRow {
 
     /// Sets `name` to `value` unless the row already has one.
     fn default_to(&mut self, name: &str, value: &str) {
-        if let Some(i) = STAT_FIELDS.iter().position(|f| *f == name) {
-            if self.fields[i].is_empty() {
-                self.fields[i] = value.to_string();
-            }
+        let field = STAT_FIELDS.iter().position(|f| *f == name).and_then(|i| self.fields.get_mut(i));
+        if let Some(f) = field.filter(|f| f.is_empty()) {
+            *f = value.to_string();
         }
     }
 

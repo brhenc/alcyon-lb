@@ -35,12 +35,6 @@ impl From<UnixListener> for CliListener {
     }
 }
 
-impl From<TcpListener> for CliListener {
-    fn from(l: TcpListener) -> Self {
-        Self::Tcp(l)
-    }
-}
-
 impl From<UnixStream> for CliStream {
     fn from(s: UnixStream) -> Self {
         Self::Unix(s)

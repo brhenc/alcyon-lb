@@ -270,13 +270,11 @@ fn nature_name(c: u8) -> &'static str {
     match c {
         b'G' => "Gauge",
         b'L' => "Limit",
-        b'm' => "Min",
         b'M' => "Max",
         b'R' => "Rate",
         b'C' => "Counter",
         b'D' => "Duration",
         b'A' => "Age",
-        b'T' => "Time",
         b'N' => "Name",
         b'O' => "Output",
         _ => "Avg",
@@ -285,10 +283,10 @@ fn nature_name(c: u8) -> &'static str {
 
 fn scope_name(c: u8) -> &'static str {
     match c {
+        // Every tag in `STAT_TAGS` / `INFO_TAGS` is Process or Service
+        // (`every_tag_letter_is_named`).
         b'P' => "Process",
-        b'S' => "Service",
-        b's' => "System",
-        _ => "Cluster",
+        _ => "Service",
     }
 }
 
@@ -330,11 +328,12 @@ fn json_tags_value(out: &mut String, tags: &str, ty: &str, value: &str) {
 /// that does not apply to the object.
 pub(crate) fn emit_stat_row(out: &mut String, fields: &[String], fmt: StatFormat) {
     let col = |name: &str| STAT_FIELDS.iter().position(|f| *f == name).and_then(|i| fields.get(i)).map_or("", String::as_str);
+    // `stats.rs` writes frontend (0), backend (1) and server (2) rows; Ibex has no
+    // listener rows (`option socket-stats`, type 3).
     let (obj, obj_name) = match col("type") {
         "0" => ('F', "Frontend"),
-        "1" => ('B', "Backend"),
         "2" => ('S', "Server"),
-        _ => ('L', "Listener"),
+        _ => ('B', "Backend"),
     };
     let (iid, sid) = (col("iid"), col("sid"));
     let mut first = true;
@@ -413,6 +412,27 @@ mod tests {
             let name = chunk.split('"').next().unwrap();
             assert!(STAT_TAGS.iter().any(|(n, _, _)| *n == name), "{name} has no entry in STAT_TAGS");
         }
+    }
+
+    /// `nature_name` and `scope_name` name only the letters the tables use; a new letter
+    /// must be added to them, not printed as the default.
+    #[test]
+    fn every_tag_letter_is_named() {
+        let tags = STAT_TAGS.iter().map(|(_, t, _)| *t).chain(INFO_TAGS.iter().map(|(_, _, t, _)| *t));
+        for t in tags {
+            let b = t.as_bytes();
+            assert!(b"GLMRCDANOa".contains(&b[1]), "nature of {t}");
+            assert!(b"PS".contains(&b[2]), "scope of {t}");
+        }
+    }
+
+    /// No field Ibex prints can hold these characters today (proxy and server names are
+    /// checked at load); a string value is still escaped as JSON (RFC 8259) would have it.
+    #[test]
+    fn a_json_string_value_is_escaped() {
+        let mut out = String::new();
+        json_escape(&mut out, "q\"b\\c\nd\re\tf\u{1}g");
+        assert_eq!(out, r#""q\"b\\c\nd\re\tf\u0001g""#);
     }
 
     #[test]
