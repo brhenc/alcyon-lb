@@ -257,13 +257,6 @@ pub(crate) fn check_option(section: OptSection, tokens: &[Token], kw: &Token) ->
     if let Some((_, why)) = OPTIONS_THAT_MUST_NOT_BE_IGNORED.iter().find(|(o, _)| *o == name) {
         return Err(err(kw, format!("'option {name}' is not supported: {why}.")));
     }
-    if name == "accept-unsafe-violations-in-http-response" {
-        // HAProxy answers 502 to a response with an invalid header name or a NUL in a value
-        // unless this is set. Ibex does not validate the response head, so there is nothing
-        // to relax (docs/differences.md, "Server responses are not validated").
-        eprintln!("[ibex] notice: 'option {name}' has nothing to relax: Ibex does not reject invalid HTTP responses.");
-        return Ok(false);
-    }
     eprintln!("[ibex] warning: 'option {name}' is not implemented and is ignored.");
     Ok(false)
 }

@@ -449,14 +449,11 @@ fn use_server_and_stick_table_alerts_have_no_frame() {
     );
 }
 
-// T274 G2: Ibex does not validate response heads, so the option has nothing to relax and
-// says so instead of "not implemented and is ignored" (docs/differences.md).
+// T274 G2, then T275: Ibex validates response heads, so the option is implemented and,
+// as on HAProxy, `-c` says nothing about it (no notice, no "not implemented").
 #[test]
-fn accept_unsafe_violations_in_http_response_says_it_has_nothing_to_relax() {
-    if std::env::var("T273D_ORACLE").is_ok() {
-        return;
-    }
+fn accept_unsafe_violations_in_http_response_prints_no_notice() {
     let (text, _, rc) = check_any(&defaults_then("backend b\n    option accept-unsafe-violations-in-http-response\n    server s 127.0.0.1:1\n"));
     assert_eq!(rc, 0);
-    assert!(text.contains("nothing to relax") && !text.contains("not implemented"), "{text}");
+    assert!(!text.contains("accept-unsafe-violations-in-http-response"), "{text}");
 }

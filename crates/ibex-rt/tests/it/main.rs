@@ -189,6 +189,7 @@ mod replace_path_targets;
 mod request_head_limit;
 mod request_rule_actions;
 mod response_fetch_in_request;
+mod response_head_validation;
 mod response_rule_actions;
 mod retry_on;
 mod roundrobin_after_direct;
