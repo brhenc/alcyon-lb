@@ -66,3 +66,20 @@ Ibex clearly worse (reproducers in `repro/`):
 - hdr_storm: 362% CPU (HAProxy 29%); 55 fds left after 45 s (HAProxy 28).
 - h2_rapid_reset: peak RSS 173 MB (HAProxy 32 MB), 10 legit connection errors and 2/6 mid-attack probes failed (HAProxy none).
 Ibex better or equal: everything else; h2_flood costs Ibex 5% CPU against 266% (it presumably drops the connection early; not checked). No crashes or panics in either.
+
+## Results, Ibex main 94cc644 vs HAProxy 3.5-dev8 (2026-10-10 night, 60 s)
+| scenario | haproxy | ibex |
+|---|---|---|
+| slowloris | RSS 56M->56M, cpu 5%/17%, fds 1823->20, p99 1.7ms, ok 3040 bad 0 err 0, mid 6/6, recovered y (0.0s) | RSS 44M->44M, cpu 4%/9%, fds 1828->24, p99 1.0ms, ok 3053 bad 0 err 0, mid 6/6, recovered y (0.0s) |
+| slow_post | RSS 25M->25M, cpu 4%/9%, fds 1022->20, p99 2.1ms, ok 3027 bad 0 err 0, mid 6/6, recovered y (0.0s) | RSS 25M->25M, cpu 7%/23%, fds 1030->23, p99 4.8ms, ok 3044 bad 0 err 0, mid 6/6, recovered y (0.0s) |
+| nonreader | RSS 28M->28M, cpu 2%/58%, fds 626->21, p99 0.8ms, ok 3052 bad 0 err 0, mid 6/6, recovered y (0.0s) | RSS 22M->22M, cpu 3%/74%, fds 628->29, p99 1.4ms, ok 3032 bad 0 err 0, mid 6/6, recovered y (0.0s) |
+| h2_rapid_reset | RSS 32M->32M, cpu 176%/239%, fds 30->20, p99 4.6ms, ok 3041 bad 0 err 0, mid 6/6, recovered y (0.0s) | RSS 13M->13M, cpu 58%/71%, fds 36->23, p99 2.8ms, ok 3053 bad 0 err 0, mid 6/6, recovered y (0.0s) |
+| h2_flood | RSS 25M->25M, cpu 247%/302%, fds 34->23, p99 25.0ms, ok 3035 bad 0 err 0, mid 6/6, recovered y (0.0s) | RSS 15M->15M, cpu 6%/9%, fds 29->22, p99 1.2ms, ok 3040 bad 0 err 0, mid 6/6, recovered y (0.0s) |
+| h2_window0 | RSS 149M->142M, cpu 13%/70%, fds 2722->20, p99 19.6ms, ok 3017 bad 0 err 0, mid 6/6, recovered y (27.6s) | RSS 73M->73M, cpu 148%/403%, fds 2428->823, p99 4.0ms, ok 3022 bad 0 err 0, mid 6/6, recovered N |
+| hdr_storm | RSS 57M->57M, cpu 55%/128%, fds 1656->30, p99 5.1ms, ok 3054 bad 0 err 0, mid 6/6, recovered y (4.1s) | RSS 33M->33M, cpu 57%/401%, fds 92->56, p99 1.2ms, ok 3053 bad 0 err 0, mid 6/6, recovered N |
+| churn | RSS 27M->27M, cpu 6%/31%, fds 2018->36, p99 2.0ms, ok 3046 bad 0 err 0, mid 1/5, recovered y (0.0s) | RSS 20M->20M, cpu 9%/96%, fds 2024->30, p99 1.0ms, ok 3035 bad 0 err 0, mid 6/6, recovered y (0.0s) |
+| be_hang | RSS 27M->27M, cpu 3%/13%, fds 826->20, p99 1.1ms, ok 3041 bad 0 err 0, mid 6/6, recovered y (0.0s) | RSS 24M->24M, cpu 4%/13%, fds 829->24, p99 1.7ms, ok 3026 bad 0 err 0, mid 6/6, recovered y (0.0s) |
+| be_drip | RSS 26M->26M, cpu 3%/7%, fds 826->21, p99 0.8ms, ok 3033 bad 0 err 0, mid 6/6, recovered y (0.0s) | RSS 19M->19M, cpu 4%/9%, fds 829->24, p99 0.8ms, ok 3051 bad 0 err 0, mid 6/6, recovered y (0.0s) |
+| be_reset | RSS 24M->24M, cpu 32%/41%, fds 126->22, p99 0.7ms, ok 3024 bad 0 err 0, mid 6/6, recovered y (0.0s) | RSS 14M->14M, cpu 26%/33%, fds 128->23, p99 0.8ms, ok 3041 bad 0 err 0, mid 6/6, recovered y (0.0s) |
+
+Against 36c022b: h2_rapid_reset fixed (RSS 173M -> 13M, no legit errors, mid 6/6). Still worse than HAProxy: h2_window0 (cpu 148%/403% vs 13%/70%, not recovered within 45 s; T269) and hdr_storm (average cpu now equal, 57% vs 55%, but peak 401% vs 128% and 56 fds left vs recovered at 4.1 s; T270). Everything else equal or better; no crash or panic.
