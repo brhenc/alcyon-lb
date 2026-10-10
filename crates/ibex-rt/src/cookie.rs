@@ -124,6 +124,13 @@ fn cookie_value_end(h: &[u8], mut s: usize) -> usize {
 fn del_hdr_value(h: &mut Vec<u8>, from: &mut usize, mut next: usize) -> isize {
     let end = h.len();
     let mut prev = *from;
+    // Walk back over the blanks, but not off the front of the value: `http_del_hdr_value`
+    // reads before the buffer there. A value that is blank up to here has no value before
+    // this one, and is cut like the first.
+    while prev > 0 && spht(h[prev - 1]) {
+        prev -= 1;
+    }
+    *from = prev;
     if prev == 0 {
         // The first value: eat the semicolon, if there is one.
         if next < end {
@@ -133,10 +140,6 @@ fn del_hdr_value(h: &mut Vec<u8>, from: &mut usize, mut next: usize) -> isize {
             next += 1;
         }
     } else {
-        while spht(h[prev - 1]) {
-            prev -= 1;
-        }
-        *from = prev;
         // Every caller passes the delimiter that follows the value, never the end.
         debug_assert!(next < end);
         h[prev] = h[next];
@@ -727,6 +730,21 @@ mod tests {
         for (hdrs, want) in cases {
             let (_, _, out) = client("insert indirect", 1000, hdrs);
             assert_eq!(out.join("|"), want, "{hdrs:?}");
+        }
+    }
+
+    #[test]
+    fn indirect_with_a_leading_blank_does_not_walk_off_the_header() {
+        // `http-request set-header Cookie` can leave blanks first; `http_del_hdr_value` walks
+        // back over blanks and must stop at the start of the value (it panicked).
+        let cases: [(&str, &str); 3] = [
+            ("   \t;SRV=b; c=d", "c=d"),
+            (" SRV=b; o=1", "o=1"),
+            (" o=1; SRV=a; p=2", " o=1; p=2"),
+        ];
+        for (h, want) in cases {
+            let (_, _, out) = client("insert indirect", 1000, &[h]);
+            assert_eq!(out.join("|"), want, "{h:?}");
         }
     }
 
