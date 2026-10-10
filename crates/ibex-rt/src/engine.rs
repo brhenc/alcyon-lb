@@ -4847,7 +4847,14 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 // this closed nothing, and an idle client held the soft stop open until
                 // `timeout client` -- which a test missed for as long as the client
                 // connection was being closed after its first response anyway.
-                && matches!(e.sess.cli_state, ScState::Established | ScState::Ready);
+                && matches!(e.sess.cli_state, ScState::Established | ScState::Ready)
+                // A connection that has not sent its first request yet is not between
+                // requests: its request may already be in the socket, unread. HAProxy
+                // releases only a connection waiting for its *next* request
+                // (`H1C_F_WAIT_NEXT_REQ`, `src/mux_h1.c`) and serves the first one with
+                // `connection: close`; closing it lost requests on every reload under
+                // load (T252). An HTTP/2 connection is told with a GOAWAY either way.
+                && (!e.sess.is_first_req || e.sess.h2_ctx.is_some());
             if !idle {
                 continue;
             }

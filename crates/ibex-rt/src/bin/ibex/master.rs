@@ -22,7 +22,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::process::{self, Child, Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rustix::process::{kill_process, Pid, Signal};
 
@@ -267,6 +267,9 @@ pub fn run(sock: &MasterSocket, args: &[String], start_dir: Option<PathBuf>, sys
         exit_code: 0,
         first: true,
         sock_path: sock.path.clone(),
+        released: false,
+        loading_since: None,
+        load_timeout: load_timeout(),
     };
     m.start_worker(false);
 
@@ -274,8 +277,10 @@ pub fn run(sock: &MasterSocket, args: &[String], start_dir: Option<PathBuf>, sys
         if lifecycle.term_requested() {
             m.terminate();
         }
-        if lifecycle.soft_stop_requested() && !m.stopping {
+        if lifecycle.take_soft_stop_request() && !m.stopping {
             m.stopping = true;
+            // The workers close their listeners on SIGUSR1: none is left to hand over.
+            m.released = true;
             if systemd {
                 ibex_rt::systemd::notify_stopping_once();
             }
@@ -297,11 +302,15 @@ pub fn run(sock: &MasterSocket, args: &[String], start_dir: Option<PathBuf>, sys
             if st.loading.is_none() { st.requested.take() } else { None }
         };
         if let Some(hard) = wanted {
-            if !m.stopping {
-                m.start_worker(hard);
-            }
+            // A reload while stopping is served, and the master runs on with the new
+            // worker: HAProxy's re-executes and forgets it was stopping (measured on
+            // 3.5-dev8: `Success=1`, the master stays). Not serving it left the `reload`
+            // session waiting until the master exited (T252).
+            m.stopping = false;
+            m.start_worker(hard);
         }
         m.check_loaded();
+        m.check_load_timeout();
         m.reap();
         if m.stopping && m.children.is_empty() {
             let mut st = shared.lock();
@@ -331,6 +340,26 @@ struct Master {
     exit_code: i32,
     first: bool,
     sock_path: PathBuf,
+    /// The workers were told to stop, so they closed their listeners: the next one binds
+    /// its own instead of asking for theirs with `-x`.
+    released: bool,
+    /// When the loading worker was started, and whether it was killed for taking too long.
+    loading_since: Option<(Instant, bool)>,
+    load_timeout: Duration,
+}
+
+/// How long a reloaded worker may take to become ready before it is killed and the reload
+/// reported failed, so that one that hangs (a configuration that opens a FIFO, a stalled
+/// filesystem) does not block every later reload. HAProxy has no such bound: its master
+/// waits for ever and answers every later `reload` "Another reload is still in progress."
+/// `IBEX_WORKER_LOAD_TIMEOUT_MS` overrides it (the tests use it).
+const LOAD_TIMEOUT: Duration = Duration::from_secs(120);
+
+fn load_timeout() -> Duration {
+    std::env::var("IBEX_WORKER_LOAD_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map_or(LOAD_TIMEOUT, Duration::from_millis)
 }
 
 impl Master {
@@ -349,7 +378,7 @@ impl Master {
                 ibex_rt::systemd::notify_reloading();
             }
         }
-        if let Some(s) = st.serving {
+        if let Some(s) = st.serving.filter(|_| !self.released) {
             args.push("-x".into());
             args.push(shared.link(s).display().to_string());
         }
@@ -383,6 +412,8 @@ impl Master {
         st.workers.push(WorkerInfo { pid, reloads: 0, started: now_secs(), leaving: false });
         st.loading = Some(pid);
         st.loaded = false;
+        self.loading_since = Some((Instant::now(), false));
+        self.released = false;
         drop(st);
         let shared = Arc::clone(&self.shared);
         let reader = child.stderr.take().map(|err| std::thread::spawn(move || read_worker_stderr(&shared, pid, err)));
@@ -403,6 +434,24 @@ impl Master {
                 let _ = ibex_rt::systemd::notify_ready();
             }
         }
+    }
+
+    /// A reloaded worker that has neither become ready nor exited within the load timeout
+    /// is killed; [`Self::reap`] then reports the load failed and the old worker serves on.
+    /// The first worker is not timed: the master has nothing to fall back to.
+    fn check_load_timeout(&mut self) {
+        let Some((since, killed)) = self.loading_since else { return };
+        if killed || self.first || since.elapsed() < self.load_timeout {
+            return;
+        }
+        let shared = Arc::clone(&self.shared);
+        let mut st = shared.lock();
+        let Some(pid) = st.loading.filter(|_| !st.loaded) else { return };
+        let secs = self.load_timeout.as_secs_f64();
+        shared.log(&mut st, "ALERT", &format!("New worker ({pid}) not ready after {secs}s, killing it."));
+        drop(st);
+        self.loading_since = Some((since, true));
+        signal(pid, Signal::Kill);
     }
 
     /// The new worker did not load. The first one takes the master with it, with its code;

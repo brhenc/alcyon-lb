@@ -73,6 +73,13 @@ impl Lifecycle {
         self.reload.swap(false, Ordering::Relaxed)
     }
 
+    /// Consumes a pending soft-stop request (`SIGUSR1`), if there is one. The master uses
+    /// it, because a `reload` can take it out of stopping again.
+    #[must_use]
+    pub fn take_soft_stop_request(&self) -> bool {
+        self.soft_stop.swap(false, Ordering::Relaxed)
+    }
+
     /// Whether a soft stop has been requested.
     #[must_use]
     pub fn soft_stop_requested(&self) -> bool {
