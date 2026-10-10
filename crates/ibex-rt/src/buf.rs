@@ -590,6 +590,13 @@ impl Buf {
         &self.data[self.head..self.head + self.len]
     }
 
+    /// Bytes available to read, for changing them in place.
+    #[must_use]
+    #[inline]
+    pub fn readable_mut(&mut self) -> &mut [u8] {
+        &mut self.data[self.head..self.head + self.len]
+    }
+
     /// Moves readable data to index 0 so full remaining capacity is contiguous at the tail.
     pub fn compact(&mut self) {
         if self.head > 0 {

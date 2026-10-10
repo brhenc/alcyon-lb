@@ -9753,6 +9753,9 @@ impl EngineDispatcher<'_> {
         // `stick match` after those (`SF_ASSIGNED`); the keys to store are queued either way.
         let assigned = cookie_server.is_some();
         let cookie_server = cookie_server.or(Self::sticking_rules(&mut entry.sess, be_idx, proxies, assigned));
+        // The head is final: its header names go to the server in lower case, as `HAProxy`
+        // writes them (HTX). The request line and the values are the client's.
+        lowercase_header_names(entry.sess.req.readable_mut());
         Self::route_to_server(entry, proxies, fdtab, poller, idle_pool, now, be_idx, cookie_server)
     }
 
