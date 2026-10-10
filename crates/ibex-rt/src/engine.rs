@@ -4002,9 +4002,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         // behind makes the next socket given that descriptor number look already registered,
         // so it is never polled and its leg waits for an unrelated wakeup.
         for ql in &mut self.quic_listeners {
-            for fd in ql.take_released_fds() {
-                self.fdtab.remove(fd);
-            }
+            forget_quic_fds(&mut self.fdtab, ql.take_released_fds());
         }
         // Sockets pinned to connections by a soft stop: readable interest only.
         let mut pinned_add: Vec<(usize, RawFd)> = Vec::new();
@@ -12450,6 +12448,34 @@ mod registry_tests {
         let ctx = SampleContext::default();
         let expr = Expr::parse("status").expect("status must parse");
         assert_eq!(expr.eval_sample(&reg, &ctx), None);
+    }
+}
+
+/// Takes the table slots of descriptors a QUIC listener closed. The listener reports them a
+/// pass after closing them, and the number may have been given to another socket in between
+/// (an accepted client, a server connection): that socket's slot is not ours to clear.
+fn forget_quic_fds(fdtab: &mut FdTab, fds: Vec<RawFd>) {
+    for fd in fds {
+        if matches!(fdtab.state(fd), FdState::QuicBackend { .. }) {
+            fdtab.remove(fd);
+        }
+    }
+}
+
+#[cfg(test)]
+mod quic_fd_reuse_tests {
+    use super::*;
+
+    #[test]
+    fn a_closed_quic_fd_reused_by_another_socket_keeps_its_slot() {
+        let mut t = FdTab::with_capacity(64);
+        let conn = FdState::Conn { task: ibex_sched::TaskRef(7), conn: 1 };
+        t.insert(40, FdState::QuicBackend { listener: 0 }, Interest::READ);
+        t.insert(41, conn, Interest::READ);
+        forget_quic_fds(&mut t, vec![40, 41, 42]);
+        assert!(matches!(t.state(40), FdState::Closed), "a QUIC leg's slot is cleared");
+        assert!(matches!(t.state(41), FdState::Conn { .. }), "a slot another socket took over is kept");
+        assert!(matches!(t.state(42), FdState::Closed));
     }
 }
 
