@@ -747,6 +747,7 @@ pub(crate) fn parse_bind(tokens: &[Token], kw: &Token, section: &str) -> Result<
     let (addr, quic) = parse_socket_addr(&tokens[1], None)?;
     let mut bind = BindConfig {
         sock: None,
+        line: kw.line,
         addr,
         quic,
         ssl: false,

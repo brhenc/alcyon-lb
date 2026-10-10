@@ -15,6 +15,11 @@ pub struct ConfigError {
     pub col: usize,
     /// Detailed, actionable description of what went wrong.
     pub message: String,
+    /// Alerts that name their own place, as some of `HAProxy`'s checks after the parse do
+    /// (`HTTP frontend 'f' enables HTTP/2 via ALPN at [cfg:9], ...`): each a line of the
+    /// configuration and a text where `{at}` stands for `[file:line]`. When there are any,
+    /// they are printed as they are, one per line, in place of `message`.
+    pub alerts: Vec<(usize, String)>,
 }
 
 impl ConfigError {
@@ -25,7 +30,15 @@ impl ConfigError {
             line,
             col,
             message: message.into(),
+            alerts: Vec::new(),
         }
+    }
+
+    /// An error reported as `alerts` (see the field), the first one's line as its own.
+    #[must_use]
+    pub fn alerts(alerts: Vec<(usize, String)>) -> Self {
+        let (line, message) = alerts.first().cloned().unwrap_or_default();
+        Self { line, col: 1, message, alerts }
     }
 }
 

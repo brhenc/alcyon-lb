@@ -656,6 +656,16 @@ fn main() {
     // 5. Parse unified configuration AST
     let mut config = match ibex_config::parse_str(&combined_config) {
         Ok(cfg) => cfg,
+        Err(err) if !err.alerts.is_empty() => {
+            // Checks that name their own place print as `HAProxy`'s do: one alert each, its
+            // `[file:line]` in the text, and no other line (`src/proxy.c`'s check of the
+            // buffer size for HTTP/2).
+            for (line, text) in &err.alerts {
+                let (file, line) = locate(&config_starts, *line);
+                eprintln!("[ALERT]    ({}) : {}", process::id(), text.replace("{at}", &format!("[{file}:{line}]")));
+            }
+            process::exit(1);
+        }
         Err(err) => {
             config_failed(&config_starts, Some(err.line), &err.message);
         }

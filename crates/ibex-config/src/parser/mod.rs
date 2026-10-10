@@ -1441,39 +1441,41 @@ pub(crate) fn validate_config(
     backends: &[BackendSection],
 ) -> Result<(), ConfigError> {
     let bufsize = global.and_then(|g| g.bufsize).unwrap_or(16384);
-    let mut h2_configured = false;
-    for l in listens {
-        if l.tcp_req_content_rules.iter().any(|r| {
-            matches!(
-                &r.action,
-                TcpReqContentAction::SwitchModeHttp { proto: Some(p) } if p == "h2"
-            )
-        }) {
-            h2_configured = true;
-        }
-    }
-    for f in frontends {
-        for b in &f.binds {
-            if b.alpn.iter().any(|a| a == "h2") || b.proto.as_deref() == Some("h2") {
-                h2_configured = true;
-                break;
+    if bufsize < 16384 {
+        // `src/proxy.c`: an HTTP proxy (frontend or listen) whose `bind` offers `h2` by ALPN
+        // needs a buffer a whole HTTP/2 frame fits in; one alert per such bind, naming it.
+        let proxies = listens.iter().map(|l| (&l.name, l.mode, &l.binds)).chain(frontends.iter().map(|f| (&f.name, f.mode, &f.binds)));
+        let mut alerts = Vec::new();
+        for (name, mode, binds) in proxies {
+            if mode != Mode::Http {
+                continue;
+            }
+            for b in binds.iter().filter(|b| b.alpn.iter().any(|a| a == "h2")) {
+                alerts.push((
+                    b.line,
+                    format!("HTTP frontend '{name}' enables HTTP/2 via ALPN at {{at}}, so global.tune.bufsize must be at least 16384 bytes ({bufsize} now)."),
+                ));
             }
         }
-        if f.tcp_req_content_rules.iter().any(|r| {
-            matches!(
-                &r.action,
-                TcpReqContentAction::SwitchModeHttp { proto: Some(p) } if p == "h2"
-            )
-        }) {
-            h2_configured = true;
+        if !alerts.is_empty() {
+            return Err(ConfigError::alerts(alerts));
         }
-    }
-    if h2_configured && bufsize < 16384 {
-        return Err(ConfigError::new(
-            1,
-            1,
-            format!("'tune.bufsize' must be at least 16384 bytes when HTTP/2 is configured (got {bufsize})"),
-        ));
+        // Ibex's own refusal, where `HAProxy` loads the configuration: cleartext HTTP/2
+        // (`proto h2`, `switch-mode http proto h2`) with a buffer a frame does not fit in.
+        // `HAProxy` then fails every HTTP/2 request on that bind (T223); Ibex does not start
+        // a listener that cannot serve.
+        let switch_h2 = |rules: &[TcpReqContentRule]| {
+            rules.iter().any(|r| matches!(&r.action, TcpReqContentAction::SwitchModeHttp { proto: Some(p) } if p == "h2"))
+        };
+        let cleartext = listens.iter().any(|l| l.binds.iter().any(|b| b.proto.as_deref() == Some("h2")) || switch_h2(&l.tcp_req_content_rules))
+            || frontends.iter().any(|f| f.binds.iter().any(|b| b.proto.as_deref() == Some("h2")) || switch_h2(&f.tcp_req_content_rules));
+        if cleartext {
+            return Err(ConfigError::new(
+                1,
+                1,
+                format!("'tune.bufsize' must be at least 16384 bytes when HTTP/2 is configured (got {bufsize})"),
+            ));
+        }
     }
 
     // `use-server` names are resolved when the configuration loads (`check_config_validity`).

@@ -181,6 +181,9 @@ pub struct BindConfig {
     /// Socket options from the `bind` line; `None` when it sets none (boxed: a frontend
     /// and a bind are paid for 60,000 times over in `request_allocations`).
     pub sock: Option<Box<SocketTuning>>,
+    /// The configuration line of the `bind` (0 for one made in code), for the messages that
+    /// name it.
+    pub line: usize,
     pub addr: SocketAddr,
     pub quic: bool,
     pub ssl: bool,
