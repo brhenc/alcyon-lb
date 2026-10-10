@@ -2334,7 +2334,10 @@ impl TcpSession {
         // throughout one, so without this the connection is never polled for writability
         // and the handshake never finishes. It is always false for a plaintext session.
         let cli = Want {
-            read: self.cli_state.can_read() && !self.req.is_full(),
+            // An HTTP/2 demux that is held reads nothing (`H2MuxContext::wants_input`): asked
+            // for readability then, the level-triggered poller woke the session for the
+            // bytes left in the socket over and over, a core spinning (T235).
+            read: self.cli_state.can_read() && !self.req.is_full() && self.h2_ctx.as_ref().is_none_or(|h| h.wants_input()),
             write: self.cli_state.can_write() && (has_pending || self.cli_xprt.wants_write()),
         };
         let srv = match self.srv_state {

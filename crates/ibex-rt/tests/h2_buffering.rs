@@ -286,3 +286,29 @@ fn reset_streams_are_let_go_at_once() {
     let grown = rss_kib(&ibex) - before;
     assert!(grown < 2048, "the proxy grew by {grown} KiB for {taken} of {} bytes of reset streams", wire.len());
 }
+
+/// CPU time (utime + stime, clock ticks) the proxy has used.
+fn cpu_ticks(i: &Ibex) -> u64 {
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", i.child.id())).expect("stat");
+    let f: Vec<&str> = stat.rsplit_once(')').expect("comm").1.split_whitespace().collect();
+    f[11].parse::<u64>().expect("utime") + f[12].parse::<u64>().expect("stime")
+}
+
+/// While a stream's buffer is full the client socket is not read, and not polled for
+/// reading either: HAProxy uses no CPU then (0 ticks in 2 s, measured). Polled, the
+/// level-triggered poller woke the session for the unread bytes without end (198 ticks
+/// in 2 s, a core).
+#[test]
+fn a_held_demux_does_not_spin() {
+    let (ibex, fe) = start();
+    let mut c = connect(fe);
+    c.set_nonblocking(false).expect("blocking");
+    c.write_all(&frame(1, END_HEADERS, 1, &head("POST"))).expect("headers");
+    c.set_nonblocking(true).expect("nonblocking");
+    let data = frame(0, 0, 1, &[b'a'; 16384]);
+    offer(&mut c, &data, 24 << 20, 2, true);
+    let before = cpu_ticks(&ibex);
+    std::thread::sleep(Duration::from_secs(1));
+    let used = cpu_ticks(&ibex) - before;
+    assert!(used < 20, "the proxy used {used} ticks in 1 s with nothing to do");
+}
