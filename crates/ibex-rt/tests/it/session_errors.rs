@@ -22,7 +22,7 @@
 //! nothing: an HTTP/2 connection with no stream is logged only for a protocol error, see
 //! `h2_connection_end_log.rs`.)
 
-mod common;
+use crate::common;
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};

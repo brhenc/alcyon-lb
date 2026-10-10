@@ -24,7 +24,7 @@
 //! connection until `timeout server`, and kept the connection's next stream waiting
 //! behind it.
 
-mod common;
+use crate::common;
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};

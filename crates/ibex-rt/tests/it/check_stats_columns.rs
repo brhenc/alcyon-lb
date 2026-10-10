@@ -16,7 +16,7 @@
 //!
 //! Only statuses from L57DATA on carry a `check_code`; `last_chk` is the check's info text.
 
-mod common;
+use crate::common;
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener};

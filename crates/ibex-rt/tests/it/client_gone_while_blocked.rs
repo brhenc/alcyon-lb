@@ -14,7 +14,7 @@
 //!   nothing (0 ticks in 2 s, measured). Ibex was woken by the reset's level-triggered
 //!   `EPOLLHUP` on every poll, a core for as long as the server took.
 
-mod common;
+use crate::common;
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};

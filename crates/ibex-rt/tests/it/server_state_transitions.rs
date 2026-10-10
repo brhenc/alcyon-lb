@@ -25,7 +25,7 @@
 //!
 //! Set `T274E_BIN` to a `haproxy` binary to run these against the oracle.
 
-mod common;
+use crate::common;
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};

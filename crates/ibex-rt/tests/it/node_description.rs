@@ -15,7 +15,7 @@
 //!   `Statistics Report for pid N on gnode: gdesc one` (the global ones) and puts the
 //!   proxy's `description` unescaped in a `<th class="desc">` of its table (Ibex's page has its own layout: a `class="desc"` element beside the proxy name); `<title>` has the node.
 
-mod common;
+use crate::common;
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};

@@ -21,7 +21,7 @@
 //! is sent, and the next 16 KB, all `A`, fail the EHLO rule with code 0. The info is cut to
 //! 127 bytes (`HCHK_DESC_LEN` - 1, src/check.c).
 
-mod common;
+use crate::common;
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, UdpSocket};

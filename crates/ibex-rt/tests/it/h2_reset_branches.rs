@@ -7,7 +7,7 @@
 //! flight. Expected values measured on `HAProxy 3.5-dev8-885761-29` (set
 //! `H2RST_BIN=/path/to/haproxy` to run this file against it).
 
-mod common;
+use crate::common;
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};

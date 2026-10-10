@@ -15,7 +15,7 @@
 //!   `hrsp_4xx` or `req_tot`.
 
 // Set `T262_ORACLE=/path/to/haproxy` to run these tests against HAProxy: it passes all five.
-mod common;
+use crate::common;
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream, UdpSocket};

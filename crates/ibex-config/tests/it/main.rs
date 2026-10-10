@@ -35,6 +35,7 @@ mod lexer_hex_escape;
 mod log_format_config;
 mod log_tag_sample;
 mod m1_scope_refusals;
+mod node_description;
 mod preproc;
 mod proxy_ids;
 mod proxy_options;

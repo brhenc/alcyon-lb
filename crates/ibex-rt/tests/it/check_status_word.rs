@@ -17,7 +17,7 @@
 //! `NOLB` needs the stopping state, which Ibex does not have (`set server health stopping`
 //! is refused).
 
-mod common;
+use crate::common;
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener};

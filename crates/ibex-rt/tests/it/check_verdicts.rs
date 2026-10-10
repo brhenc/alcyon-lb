@@ -21,7 +21,7 @@
 //!   what follows the first four, up to the line end, left out when empty.
 //! * Every status from `L57DATA` on prints `code: N`, `0` when nothing set one.
 
-mod common;
+use crate::common;
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, UdpSocket};

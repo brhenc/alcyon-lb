@@ -7,7 +7,7 @@
 //! `[NOTICE]` version lines are dropped), `Warnings were found.` on stdout and the exit code.
 //! Set `T273D_ORACLE=/path/to/haproxy` to run the cases against HAProxy: it passes them all.
 
-mod common;
+use crate::common;
 
 use std::io::Write;
 use std::process::Command;

@@ -12,7 +12,7 @@
 //! 2 -> 16213, 3 -> 16184, 6 -> 16097, and one byte more is a 431 each time.
 //! `X-b: for=10.0.0.<i>` repeated: 2 -> 16225, 3 -> 16202.
 
-mod common;
+use crate::common;
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
