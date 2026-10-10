@@ -622,15 +622,7 @@ impl CliApplet {
                             "PROCOK" => 20,
                             _ => 1,
                         };
-                        check_result = if check.last_status_code.starts_with("L7OKC") {
-                            4 // CHK_RES_CONDPASS
-                        } else if check.last_status_code.contains("OK") {
-                            3 // CHK_RES_PASSED
-                        } else if check.last_status_code != "INI" {
-                            2 // CHK_RES_FAILED
-                        } else {
-                            0 // CHK_RES_UNKNOWN
-                        };
+                        check_result = crate::check::check_result_of(check.last_status_code);
                     }
 
                     let puid = p.server_puid(s_idx);
@@ -1471,7 +1463,7 @@ impl CliApplet {
                             .iter_mut()
                             .find(|c| c.proxy_idx == p_idx && c.server_idx == s_idx)
                         {
-                            check.status = ServerStatus::Up;
+                            check.set_admin_status(ServerStatus::Up);
                         }
                     }
                 }
@@ -1510,7 +1502,7 @@ impl CliApplet {
                             .iter_mut()
                             .find(|c| c.proxy_idx == p_idx && c.server_idx == s_idx)
                         {
-                            check.status = ServerStatus::Maint;
+                            check.set_admin_status(ServerStatus::Maint);
                         }
                     }
                 }
@@ -1636,7 +1628,7 @@ impl CliApplet {
                 };
                 crate::track::set_status(ctx.proxies, p_idx, s_idx, status);
                 if let Some(check) = ctx.checks.iter_mut().find(|c| c.proxy_idx == p_idx && c.server_idx == s_idx) {
-                    check.status = status;
+                    check.set_admin_status(status);
                 }
                 self.finish_msg("");
             }

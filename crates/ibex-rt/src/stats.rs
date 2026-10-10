@@ -623,7 +623,7 @@ fn write_server_row(
             };
             let check_code = if c.carries_code() { c.http_code.unwrap_or(0).to_string() } else { String::new() };
             (
-                c.status.as_str().to_string(),
+                c.status_word(),
                 c.failed_checks,
                 c.down_transitions,
                 check_status,
@@ -704,7 +704,8 @@ fn write_server_row(
     r.set("iid", iid);
     r.set("sid", sid);
     r.set("type", 2);
-    if has_check {
+    // A server in maintenance has its checks paused: no check column (`CHK_ST_PAUSED`).
+    if has_check && !check_state.is_some_and(|c| c.status == ServerStatus::Maint) {
         r.set("check_status", check_status);
         r.set("check_code", check_code);
         r.set("check_duration", check_duration);

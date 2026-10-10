@@ -240,7 +240,6 @@ impl ServerCheckState {
         config: ServerCheckConfig,
         now: Tick,
     ) -> Self {
-        let config_rise = config.rise;
         let resolved_config = get_resolved_check_config(proxy_idx, server_idx, addr);
         let http_send = HttpSendFormats::for_config(resolved_config.as_ref()).map(Box::new);
         ServerCheckState {
@@ -252,7 +251,9 @@ impl ServerCheckState {
             enabled: true,
             rise_count: 0,
             fall_count: 0,
-            health: config_rise,
+            // A new server runs with its counter at zero, as `HAProxy` allocates it: the
+            // first successes climb to `rise` and a failure before that takes it down.
+            health: 0,
             in_progress: false,
             sock: None,
             xprt: ServerXprt::Plain,
@@ -372,6 +373,13 @@ impl ServerCheckState {
         self.check_duration_ms = duration_ms;
 
         if self.health == 0 {
+            // `check_notify_failure`: a running server whose counter is already at zero (a
+            // new one) goes down on its first failure.
+            if self.status == ServerStatus::Up {
+                self.status = ServerStatus::Down;
+                self.down_transitions += 1;
+                return Some(CheckEvent::WentDown);
+            }
             return if status_changed {
                 Some(CheckEvent::Failed)
             } else {
@@ -388,6 +396,35 @@ impl ServerCheckState {
             }
         }
         Some(CheckEvent::Failed)
+    }
+
+    /// An operator's `disable server`, `enable server` or `set server state`: entering
+    /// maintenance zeroes the counter, leaving it restores `rise` -- "start OK but check
+    /// immediately" (`_srv_update_status_adm`, `src/server.c`).
+    pub fn set_admin_status(&mut self, to: ServerStatus) {
+        if to == ServerStatus::Maint && self.status != ServerStatus::Maint {
+            self.health = 0;
+        } else if to != ServerStatus::Maint && self.status == ServerStatus::Maint {
+            self.health = self.config.rise;
+        }
+        self.status = to;
+    }
+
+    /// The `status` column of `show stat` (`stats_fill_sv_computestate`): `UP`, or `UP n/fall`
+    /// while the counter is short of full health (`n` is signed and starts negative), `DRAIN`
+    /// likewise, `DOWN`, or `DOWN n/rise` while a down server climbs.
+    #[must_use]
+    pub fn status_word(&self) -> String {
+        let (health, rise, fall) = (i64::from(self.health), i64::from(self.config.rise), i64::from(self.config.fall));
+        let full = self.health >= self.full_health();
+        match self.status {
+            ServerStatus::Maint => "MAINT".to_string(),
+            ServerStatus::Down if self.health > 0 => format!("DOWN {health}/{rise}"),
+            ServerStatus::Down => "DOWN".to_string(),
+            ServerStatus::Up if !self.enabled => "no check".to_string(),
+            st @ (ServerStatus::Up | ServerStatus::Drain) if full => st.as_str().to_string(),
+            st => format!("{} {}/{fall}", st.as_str(), health - rise + 1),
+        }
     }
 
     /// True for the statuses from L57DATA on, the ones that have a `code` (log line and
@@ -595,6 +632,20 @@ fn run_var_rules(
 /// `uri-lf`, `body-lf` and each `hdr` as rendered for one check; `None` where the request
 /// uses the configured text.
 type RenderedSend = (Option<String>, Option<String>, Vec<Option<String>>);
+
+/// `srv_check_result` of `show servers state` for a check status code: the `result` column
+/// of `check_statuses` in `src/check.c` (`CHK_RES_*`: UNKNOWN 0, NEUTRAL 1, FAILED 2,
+/// PASSED 3, CONDPASS 4).
+#[must_use]
+pub fn check_result_of(code: &str) -> u8 {
+    match code {
+        "UNK" | "INI" | "START" => 0,
+        "CHECKED" => 1,
+        "L7OKC" | "L7OKCD" => 4,
+        "L4OK" | "L6OK" | "L7OK" | "L7OKD" | "PROCOK" => 3,
+        _ => 2,
+    }
+}
 
 /// `httpchk_build_status_header` (`src/check.c`): the value of `X-Haproxy-Server-State`.
 ///
@@ -1057,6 +1108,18 @@ pub fn step_check(
             cleanup_check_socket(check, fdtab, poller);
         }
         let next = check.schedule_next(now);
+        check.next_check = next;
+        return Ok(CheckStep::pending(Some(next)));
+    }
+
+    // `CHK_ST_PAUSED`: a server in maintenance is not checked. The task only looks again
+    // after a second at most, so that `enable server` has its check soon (HAProxy runs it
+    // at once).
+    if check.status == ServerStatus::Maint {
+        if check.in_progress {
+            cleanup_check_socket(check, fdtab, poller);
+        }
+        let next = now.add(u32::try_from(check.config.inter.as_millis().min(1000)).unwrap_or(1000));
         check.next_check = next;
         return Ok(CheckStep::pending(Some(next)));
     }
@@ -3354,6 +3417,22 @@ mod tests {
             event.is_some(),
             "the first successful check after boot must be reported under option log-health-checks"
         );
+    }
+
+    /// `srv_check_result` of `show servers state`: `check_statuses[].result` in
+    /// `src/check.c`, from the table (T274 D2). `HANA` needs `observe`/`on-error` and
+    /// `CHECKED` is only an internal marker, and `L7OKC` needs `ok-status`: Ibex refuses
+    /// all three at parse time, so these three rows are checked here and unreachable from
+    /// a configuration.
+    #[test]
+    fn check_result_follows_the_status_table() {
+        let r = |c| check_result_of(c);
+        // UNKNOWN 0, NEUTRAL 1, FAILED 2, PASSED 3, CONDPASS 4
+        assert_eq!([r("UNK"), r("INI"), r("CHECKED")], [0, 0, 1]);
+        assert_eq!([r("HANA"), r("SOCKERR"), r("L4TOUT"), r("L4CON"), r("L6TOUT"), r("L6RSP")], [2; 6]);
+        assert_eq!([r("L7TOUT"), r("L7RSP"), r("L7STS"), r("PROCERR"), r("PROCTOUT")], [2; 5]);
+        assert_eq!([r("L4OK"), r("L6OK"), r("L7OK"), r("L7OKD"), r("PROCOK")], [3; 5]);
+        assert_eq!([r("L7OKC"), r("L7OKCD")], [4; 2]);
     }
 
     /// The state word of `X-Haproxy-Server-State` (`httpchk_build_status_header`) across
