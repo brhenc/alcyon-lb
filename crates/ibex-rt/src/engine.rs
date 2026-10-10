@@ -10706,37 +10706,16 @@ impl EngineDispatcher<'_> {
         maybe_prepend_send_proxy(&proxies[entry.proxy_idx], &proxies[be_idx], proxies, &mut entry.sess, target_addr);
 
         entry.target_addr = Some(target_addr);
-        if let Ok((srv_fd, immediate)) = raw::connect_opts(connect_addr(target_addr, entry.sess.server_addr), proxies[be_idx].server_tfo_of(target_addr)) {
+        // A connect that completed at once (`connect()` returning 0, which a TCP socket on
+        // Linux never does: it is EINPROGRESS even on loopback) takes the same path: the
+        // socket is reported writable on the next poll and completes there. Only INET
+        // servers exist (`unix@` is refused at parse time), so no test could reach a
+        // separate branch for it.
+        if let Ok((srv_fd, _immediate)) = raw::connect_opts(connect_addr(target_addr, entry.sess.server_addr), proxies[be_idx].server_tfo_of(target_addr)) {
             let sfd = srv_fd.as_raw_fd();
             attach_server_to(&mut entry.sess, proxies, entry.proxy_idx, be_idx, s_idx, srv_fd, now);
             entry.srv_raw_fd = Some(sfd);
-            if immediate {
-                entry.sess.server_connected(now);
-                fdtab.set_ready(sfd, false, true);
-                entry.sess.advance(now);
-                let (_, srv_want) = entry.sess.interests();
-                let new_interest = Interest {
-                    readable: srv_want.read,
-                    writable: srv_want.write,
-                };
-                entry.srv_interest = new_interest;
-                fdtab.insert(
-                    sfd,
-                    FdState::Conn {
-                        task: entry.task,
-                        conn: 1,
-                    },
-                    new_interest,
-                );
-                if let Some(ref srv) = entry.sess.srv {
-                    let _ = poller.add(
-                        srv.as_fd(),
-                        raw_fd_to_u64(sfd),
-                        new_interest.readable,
-                        new_interest.writable,
-                    );
-                }
-            } else {
+            {
                 entry.srv_interest = Interest::WRITE;
                 fdtab.insert(
                     sfd,
