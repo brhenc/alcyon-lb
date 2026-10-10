@@ -136,6 +136,7 @@ pub(crate) mod error_pages;
 pub(crate) mod sample_refs;
 pub(crate) mod scope;
 pub(crate) mod warn;
+pub(crate) mod refs;
 pub use sample_refs::log_format_exprs;
 pub(crate) use error_pages::*;
 
@@ -1323,6 +1324,17 @@ pub(crate) fn parse_use_backend(
             kw.line,
             kw.col,
             "<use_backend> expects <backend_name> as argument.",
+        ));
+    }
+    // HAProxy builds the name from a log-format string when it holds `%`; Ibex looks the
+    // written text up as a name, never finds it and sends the request to the default
+    // backend, as if the rule had not matched.
+    if tokens[1].text.contains('%') {
+        return Err(ConfigError::new(
+            tokens[1].line,
+            tokens[1].col,
+            "'use_backend' with a log-format backend name is not implemented by Ibex; \
+             the rule would never match",
         ));
     }
     let backend = tokens[1].text.clone();

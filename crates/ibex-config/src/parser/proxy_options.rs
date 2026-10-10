@@ -385,3 +385,34 @@ pub(crate) fn parse_forwarded_option(tokens: &[Token]) -> Result<crate::ast::For
     }
     Ok(f)
 }
+
+/// `option accept-invalid-http-request` and `-response` are the deprecated names of
+/// `accept-unsafe-violations-in-http-request` and `-response` (`src/cfgparse-listen.c`): they set
+/// the same flag and print a warning. Returns the line with the new name when `tokens` is
+/// one of them in a section where it applies (elsewhere `check_option` says it is ignored,
+/// under the name written), and `None` for any other option.
+///
+/// # Errors
+/// An argument after the option.
+pub(crate) fn rename_deprecated_option(section: OptSection, tokens: &[Token], kw: &Token) -> Result<Option<Vec<Token>>, ConfigError> {
+    let Some(name) = tokens.get(1).map(|t| t.text.as_str()) else { return Ok(None) };
+    let new = match name {
+        "accept-invalid-http-request" => "accept-unsafe-violations-in-http-request",
+        "accept-invalid-http-response" => "accept-unsafe-violations-in-http-response",
+        _ => return Ok(None),
+    };
+    if !find(name).is_some_and(|spec| applies(spec, section)) {
+        return Ok(None);
+    }
+    if let Some(extra) = tokens.get(2) {
+        return Err(err(kw, format!("'option {name}' cannot handle unexpected argument '{}'.", extra.text)));
+    }
+    super::warn::push(
+        tokens[1].line,
+        crate::ast::global::WarnStyle::Tight,
+        &format!("option '{name}' is deprecated. please use 'option {new}' if absolutely needed."),
+    );
+    let mut renamed = tokens.to_vec();
+    renamed[1].text = new.to_string();
+    Ok(Some(renamed))
+}

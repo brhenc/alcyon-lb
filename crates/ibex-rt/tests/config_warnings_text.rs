@@ -7,6 +7,8 @@
 //! `[NOTICE]` version lines are dropped), `Warnings were found.` on stdout and the exit code.
 //! Set `T273D_ORACLE=/path/to/haproxy` to run the cases against HAProxy: it passes them all.
 
+mod common;
+
 use std::io::Write;
 use std::process::Command;
 use tempfile::NamedTempFile;
@@ -150,4 +152,187 @@ fn default_server_ssl_version_is_an_alert_that_does_not_fail() {
     assert_eq!(text, "[ALERT]    (PID) : config : [F:5] : 'no-sslv3' option is not accepted in default-server sections");
     assert!(!flag);
     assert_eq!(rc, 0);
+}
+
+// ---------------------------------------------------------------------------------------------
+// T274 A: references HAProxy resolves when the configuration loads (`check_config_validity`).
+// Measured the same way; the ALERT lines of stderr, pid replaced, and exit code 1.
+
+fn alerts(cfg: &str) -> (Vec<String>, i32) {
+    let (text, _, rc) = check_any(cfg);
+    (text.lines().filter(|l| l.starts_with("[ALERT]")).map(String::from).collect(), rc)
+}
+
+/// [`check`] without asserting on the exit code.
+fn check_any(cfg: &str) -> (String, bool, i32) {
+    check(cfg)
+}
+
+fn refuses(cfg: &str, lines: &[&str]) {
+    let (got, rc) = alerts(cfg);
+    let want: Vec<String> = lines.iter().map(|l| format!("[ALERT]    (PID) : {l}")).collect();
+    assert_eq!(got, want, "ALERT lines for:\n{cfg}");
+    assert_eq!(rc, 1, "exit code for:\n{cfg}");
+}
+
+fn accepts(cfg: &str) {
+    let (got, rc) = alerts(cfg);
+    assert!(got.is_empty() && rc == 0, "expected to load, got {got:?} rc={rc} for:\n{cfg}");
+}
+
+/// A configuration whose only fault is `extra`, put in frontend `f` (HTTP, `bind`, timeouts).
+fn fe(extra: &str) -> String {
+    format!("frontend f\n    bind 127.0.0.1:18090\n    mode http\n    timeout client 1s\n{extra}backend b\n    mode http\n    timeout server 1s\n    timeout connect 1s\n    server s 127.0.0.1:1\n")
+}
+
+#[test]
+fn use_backend_of_a_backend_that_does_not_exist() {
+    refuses(&fe("    use_backend nosuch if { path /x }\n    default_backend b\n"), &["Proxy 'f': unable to find required use_backend: 'nosuch'."]);
+}
+
+#[test]
+fn default_backend_of_a_backend_that_does_not_exist() {
+    refuses(&fe("    default_backend nosuch\n"), &["Proxy 'f': unable to find required default_backend: 'nosuch'."]);
+}
+
+#[test]
+fn default_backend_comes_first_then_the_use_backend_rules_in_order() {
+    refuses(
+        &fe("    use_backend nosuch1 if { path /a }\n    use_backend nosuch2 if { path /b }\n    default_backend nosuch3\n"),
+        &[
+            "Proxy 'f': unable to find required default_backend: 'nosuch3'.",
+            "Proxy 'f': unable to find required use_backend: 'nosuch1'.",
+            "Proxy 'f': unable to find required use_backend: 'nosuch2'.",
+        ],
+    );
+}
+
+#[test]
+fn a_frontend_is_not_a_backend_and_a_listen_is() {
+    refuses(&fe("    use_backend f\n"), &["Proxy 'f': unable to find required use_backend: 'f'."]);
+    accepts(&format!(
+        "listen l\n    bind 127.0.0.1:18091\n    mode http\n{TIMEOUTS}    server s 127.0.0.1:1\n{}",
+        fe("    use_backend l\n    default_backend b\n")
+    ));
+}
+
+#[test]
+fn a_disabled_backend_is_still_a_target_and_a_disabled_frontend_is_not_checked() {
+    accepts(&format!("backend d\n    disabled\n    mode http\n{TIMEOUTS}    server s 127.0.0.1:1\n{}", fe("    use_backend d\n    default_backend b\n")));
+    accepts(&format!(
+        "frontend g\n    disabled\n    bind 127.0.0.1:18092\n    mode http\n{TIMEOUTS}    use_backend zz\n    http-request track-sc0 src table zz\n{}",
+        fe("    default_backend b\n")
+    ));
+}
+
+#[test]
+fn only_the_first_proxy_in_error_is_reported() {
+    let cfg = format!(
+        "frontend f1\n    bind 127.0.0.1:18093\n    mode http\n{TIMEOUTS}    use_backend u1\nfrontend f2\n    bind 127.0.0.1:18094\n    mode http\n{TIMEOUTS}    use_backend u2\n"
+    );
+    refuses(&cfg, &["Proxy 'f1': unable to find required use_backend: 'u1'."]);
+}
+
+#[test]
+fn track_sc_names_a_table_that_exists() {
+    for (rule, n) in [
+        ("http-request track-sc0 src table nosuch", 0),
+        ("tcp-request connection track-sc1 src table nosuch", 1),
+        ("tcp-request session track-sc2 src table nosuch", 2),
+        ("tcp-request content track-sc0 src table nosuch", 0),
+    ] {
+        refuses(&fe(&format!("    {rule}\n    default_backend b\n")), &[&format!("Proxy 'f': unable to find table 'nosuch' referenced by track-sc{n}.")]);
+    }
+    // In a backend, and with no `table`: the proxy's own, which has none.
+    let cfg = format!("{}    http-request track-sc1 src table nosuch\n", fe("    default_backend b\n"));
+    refuses(&cfg, &["Proxy 'b': unable to find table 'nosuch' referenced by track-sc1."]);
+    refuses(&fe("    http-request track-sc0 src\n    default_backend b\n"), &["Proxy 'f': unable to find table 'f' referenced by track-sc0."]);
+}
+
+#[test]
+fn track_sc_finds_the_own_table_and_one_in_another_proxy() {
+    accepts(&fe("    stick-table type ip size 1k\n    http-request track-sc0 src\n    default_backend b\n"));
+    // (A table in a disabled backend crashes HAProxy 3.5-dev8 with SIGSEGV at `-c`; not tested.)
+    accepts(&format!(
+        "backend t\n    mode http\n    stick-table type ip size 1k\n{}",
+        fe("    http-request track-sc0 src table t\n    default_backend b\n")
+    ));
+}
+
+/// Ibex only: HAProxy builds the backend name of a `use_backend` from a log-format string;
+/// Ibex looks the written text up as a name, never finds it and sends the request to the
+/// default backend, so it refuses.
+#[test]
+fn a_log_format_use_backend_is_refused_by_ibex() {
+    if std::env::var("T273D_ORACLE").is_ok() {
+        return;
+    }
+    let (got, rc) = alerts(&fe("    use_backend %[req.hdr(x)]\n    default_backend b\n"));
+    assert_eq!(rc, 1, "{got:?}");
+}
+
+#[test]
+fn accept_invalid_http_request_is_the_deprecated_name_of_the_unsafe_option() {
+    let dep = |name: &str, new: &str, line: usize| {
+        format!("[WARNING]  (PID) : config : parsing [F:{line}]: option '{name}' is deprecated. please use 'option {new}' if absolutely needed.")
+    };
+    let line = fe("").lines().position(|l| l.starts_with("backend")).unwrap() + 1; // the line after the frontend
+    let mut cfg = fe("");
+    cfg = cfg.replacen("backend b\n", "    option accept-invalid-http-request\nbackend b\n", 1);
+    expect(&cfg, &dep("accept-invalid-http-request", "accept-unsafe-violations-in-http-request", line));
+    // The response side, in a backend.
+    let cfg = format!("{}    option accept-invalid-http-response\n", fe(""));
+    let n = cfg.lines().count();
+    // (Ibex also prints its own notice that the response option is not implemented.)
+    let (text, flag, rc) = check(&cfg);
+    let got: Vec<&str> = text.lines().filter(|l| l.starts_with("[WARNING]")).collect();
+    assert_eq!(got, [dep("accept-invalid-http-response", "accept-unsafe-violations-in-http-response", n)], "{text}");
+    assert!(flag);
+    assert_eq!(rc, 0);
+}
+
+#[test]
+fn accept_invalid_http_request_has_no_negation() {
+    let cfg = fe("    no option accept-invalid-http-request\n");
+    // (Ibex words the frame of this alert `parsing [F:5] :`, HAProxy `parsing [F:5]:`: T274 B.)
+    let (text, _, rc) = check(&cfg);
+    let alert = text.lines().find(|l| l.starts_with("[ALERT]")).unwrap_or("");
+    assert!(alert.ends_with("negation/default is not supported for option 'accept-invalid-http-request'."), "{text}");
+    assert_eq!(rc, 1);
+}
+
+/// The option acts: a `#` in the request target is a 400 without it and is served with it,
+/// under either name (`accept-invalid-http-request` sets what the new name sets).
+#[test]
+fn accept_invalid_http_request_acts_on_the_request_parser() {
+    use std::io::Read;
+    if std::env::var("T273D_ORACLE").is_ok() {
+        return;
+    }
+    let status = |option: &str| -> String {
+        let addr = common::reserve_addr();
+        let cfg = format!(
+            "frontend f\n    bind {addr}\n    mode http\n{TIMEOUTS}{option}    http-request return status 200\n"
+        );
+        let mut f = NamedTempFile::new().expect("tmp");
+        f.write_all(cfg.as_bytes()).expect("write");
+        let child = Command::new(env!("CARGO_BIN_EXE_ibex"))
+            .arg("-f")
+            .arg(f.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn");
+        let _ibex = common::Ibex(child);
+        assert!(common::wait_listening(addr), "ibex did not listen");
+        let mut s = std::net::TcpStream::connect(addr).expect("connect");
+        s.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        s.write_all(b"GET /a#b HTTP/1.1\r\nhost: h\r\nconnection: close\r\n\r\n").unwrap();
+        let mut out = Vec::new();
+        let _ = s.read_to_end(&mut out);
+        String::from_utf8_lossy(&out).lines().next().unwrap_or("").to_string()
+    };
+    assert_eq!(status(""), "HTTP/1.1 400 Bad request");
+    assert_eq!(status("    option accept-unsafe-violations-in-http-request\n"), "HTTP/1.1 200 OK");
+    assert_eq!(status("    option accept-invalid-http-request\n"), "HTTP/1.1 200 OK");
 }

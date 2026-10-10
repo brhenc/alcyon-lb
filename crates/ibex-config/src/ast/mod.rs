@@ -127,6 +127,26 @@ pub struct ProxyIds {
 }
 
 impl Config {
+    /// The references `HAProxy` resolves once the whole configuration is read and refuses
+    /// when they dangle: `default_backend`, `use_backend` and the table of a `track-sc`
+    /// rule. Run after the checks of the rules' expressions, which `HAProxy` makes while it
+    /// parses and so reports first.
+    ///
+    /// # Errors
+    /// The alerts for the first proxy in error, in [`ConfigError::alerts`].
+    pub fn check_references(&self) -> Result<(), crate::error::ConfigError> {
+        let order: Vec<(ProxyKind, usize)> = if self.proxy_order.is_empty() {
+            (0..self.listens.len())
+                .map(|i| (ProxyKind::Listen, i))
+                .chain((0..self.frontends.len()).map(|i| (ProxyKind::Frontend, i)))
+                .chain((0..self.backends.len()).map(|i| (ProxyKind::Backend, i)))
+                .collect()
+        } else {
+            self.proxy_order.clone()
+        };
+        crate::parser::refs::validate_references(&order, &self.listens, &self.frontends, &self.backends)
+    }
+
     /// What `HAProxy` warns about once the whole configuration is read, in proxy order
     /// (`proxy_finalize`): a frontend with no `bind`, a proxy missing the timeouts it needs
     /// (`client` for a frontend side; `connect` and `server`, or `tunnel` in `tcp` mode, for a

@@ -955,6 +955,9 @@ pub(crate) fn parse_option_listen(
     tokens: &[Token],
     kw: &Token,
 ) -> Result<(), ConfigError> {
+    if let Some(renamed) = rename_deprecated_option(OptSection::Listen, tokens, kw)? {
+        return parse_option_listen(proxy, &renamed, kw);
+    }
     // `option httplog`/`tcplog` (and `clf`) are the log format (T53), ahead of the option
     // table: the table would otherwise warn and drop them.
     if let Some(spec) = parse_log_option(tokens, kw) {
@@ -1002,6 +1005,9 @@ pub(crate) fn parse_option_frontend(
     tokens: &[Token],
     kw: &Token,
 ) -> Result<(), ConfigError> {
+    if let Some(renamed) = rename_deprecated_option(OptSection::Frontend, tokens, kw)? {
+        return parse_option_frontend(fe, &renamed, kw);
+    }
     // `option httplog`/`tcplog` (and `clf`) are the log format (T53), ahead of the option
     // table: the table would otherwise warn and drop them.
     if let Some(spec) = parse_log_option(tokens, kw) {
@@ -1063,6 +1069,9 @@ pub(crate) fn parse_option_backend(
     tokens: &[Token],
     kw: &Token,
 ) -> Result<(), ConfigError> {
+    if let Some(renamed) = rename_deprecated_option(OptSection::Backend, tokens, kw)? {
+        return parse_option_backend(be, &renamed, kw);
+    }
     // Parsed (an error in it is still an error) and ignored in backends, as `HAProxy`
     // ignores it ("'option httplog' directive is ignored in backends").
     if let Some(spec) = parse_log_option(tokens, kw) {

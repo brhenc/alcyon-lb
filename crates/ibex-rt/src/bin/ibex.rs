@@ -680,6 +680,15 @@ fn main() {
         config_failed(&config_starts, None, &e);
     }
 
+    // 5a-bis. `default_backend`, `use_backend` and `track-sc` tables that name nothing: what
+    //     `HAProxy` checks once everything is read, after the rules' expressions.
+    if let Err(err) = config.check_references() {
+        for (_, text) in &err.alerts {
+            eprintln!("[ALERT]    ({}) : {text}", process::id());
+        }
+        process::exit(1);
+    }
+
     // 5b. TLS is wired now: `Engine::new` builds a rustls config per `bind ... ssl crt`
     // and refuses to start if one cannot be loaded, so the blanket guard that used to
     // live here is gone. What it protected against has not changed -- a listener on :443
