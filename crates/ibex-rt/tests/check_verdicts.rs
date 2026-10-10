@@ -239,3 +239,98 @@ fn smtp_ehlo_reply_that_is_not_2xx_is_judged_only_when_the_reply_ends() {
         false,
     );
 }
+
+// ---- the greeting and the QUIT answer (T273 A, measured on HAProxy 3.5-dev8) ----
+//
+// greeting rules: `^[0-9]{3}[ \r]` min-recv 4 (L7RSP, info = reply up to the line end), then
+// `^2[0-9]{2}[ \r]` min-recv 4 (L7STS, code = first three bytes, info from offset 4). A
+// multi-line greeting (`220-x`) therefore fails as "invalid response". QUIT answer:
+// `^2[0-9]{2}[- \r]` min-recv 4, judged as soon as 4 bytes are in, no CRLF needed.
+
+/// Greets, reads EHLO, answers it, reads QUIT, answers it, then holds the connection.
+fn fake_smtp(greet: &'static [u8], ehlo: &'static [u8], quit: &'static [u8]) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    thread::spawn(move || {
+        for s in listener.incoming() {
+            let Ok(mut s) = s else { break };
+            thread::spawn(move || {
+                let mut b = [0u8; 4096];
+                s.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                let _ = s.write_all(greet);
+                let _ = s.read(&mut b);
+                let _ = s.write_all(ehlo);
+                let _ = s.read(&mut b);
+                let _ = s.write_all(quit);
+                thread::sleep(Duration::from_secs(5));
+            });
+        }
+    });
+    addr
+}
+
+fn expect_smtp(greet: &'static [u8], ehlo: &'static [u8], quit: &'static [u8], want: &str, slow: bool) {
+    let (line, took) = verdict(SMTP, fake_smtp(greet, ehlo, quit));
+    assert_eq!(line, want, "quit reply {quit:?}");
+    if slow {
+        assert!(took >= Duration::from_millis(1700), "must wait for timeout check, took {took:?}: {line}");
+    } else {
+        assert!(took < Duration::from_millis(1200), "must be judged at once, took {took:?}: {line}");
+    }
+}
+
+#[test]
+fn smtp_quit_answer_is_judged_on_four_bytes() {
+    let pass = |info: &str| {
+        format!("Health check for server b/s succeeded, reason: Layer7 check passed, code: 221, info: \"{info}\"")
+    };
+    expect_smtp(GREET, b"250 hi\r\n", b"221 b", &pass("b"), false);
+    expect_smtp(GREET, b"250 hi\r\n", b"221-b", &pass("b"), false);
+    expect_smtp(GREET, b"250 hi\r\n", b"221 by\r\n", &pass("by"), false);
+    expect_smtp(GREET, b"250 hi\r\n", b"221", TIMEOUT, true);
+    expect_smtp(
+        GREET,
+        b"250 hi\r\n",
+        b"421 x\r\n",
+        "Health check for server b/s failed, reason: Layer7 wrong status, code: 421, info: \"x\"",
+        false,
+    );
+    expect_smtp(
+        GREET,
+        b"250 hi\r\n",
+        b"XYZXYZ",
+        "Health check for server b/s failed, reason: Layer7 wrong status, code: 0, info: \"YZ\"",
+        false,
+    );
+}
+
+#[test]
+fn smtp_greeting_without_crlf_is_enough() {
+    expect_smtp(
+        b"220 ok",
+        b"250 hi\r\n",
+        b"221 by\r\n",
+        "Health check for server b/s succeeded, reason: Layer7 check passed, code: 221, info: \"by\"",
+        false,
+    );
+}
+
+#[test]
+fn smtp_greeting_verdicts() {
+    let invalid = |info: &str| format!("Health check for server b/s failed, reason: Layer7 invalid response, info: \"{info}\"");
+    for close in [false, true] {
+        expect(SMTP, b"220-x\r\n", b"", close, &invalid("220-x"), false);
+        expect(SMTP, b"450-x\r\n", b"", close, &invalid("450-x"), false);
+        expect(SMTP, b"XYZ\r\n", b"", close, &invalid("XYZ"), false);
+        expect(
+            SMTP,
+            b"450\r\n",
+            b"",
+            close,
+            "Health check for server b/s failed, reason: Layer7 wrong status, code: 450",
+            false,
+        );
+        // Under 4 bytes nothing is judged, even after the close.
+        expect(SMTP, b"45", b"", close, TIMEOUT, true);
+    }
+}

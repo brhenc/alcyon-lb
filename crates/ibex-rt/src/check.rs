@@ -390,6 +390,16 @@ impl ServerCheckState {
         Some(CheckEvent::Failed)
     }
 
+    /// True for the statuses from L57DATA on, the ones that have a `code` (log line and
+    /// `show stat` `check_code`).
+    #[must_use]
+    pub fn carries_code(&self) -> bool {
+        matches!(
+            self.last_status_code,
+            "L57DATA" | "L7OK" | "L7OKD" | "L7OKC" | "L7OKCD" | "L7STS" | "PROCERR" | "PROCTOUT" | "PROCOK"
+        )
+    }
+
     /// Formats the check result as `HAProxy` does.
     #[must_use]
     pub fn log_line(&self, backend: &str, server: &str, event: CheckEvent) -> String {
@@ -410,10 +420,7 @@ impl ServerCheckState {
 
         // `check_append_info` (src/check.c): every status from L57DATA on prints a code,
         // 0 when the check set none.
-        if matches!(
-            self.last_status_code,
-            "L57DATA" | "L7OK" | "L7OKD" | "L7OKC" | "L7OKCD" | "L7STS" | "PROCERR" | "PROCTOUT" | "PROCOK"
-        ) {
+        if self.carries_code() {
             let _ = write!(out, ", code: {}", self.http_code.unwrap_or(0));
         }
 
@@ -2452,16 +2459,14 @@ fn progress_smtp_check(
         return Ok(CheckStep::pending(Some(next)));
     };
 
-    let find_crlf = |b: &[u8]| b.windows(2).position(|w| w == b"\r\n");
-
     if phase == 0 {
         fdtab.set_interest(raw_fd, Interest::READ);
         let _ = poller.modify(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), true, false);
 
         // True once nothing more is coming: the server closed, or one buffer is full.
-        let eof = recv_check_reply(&mut check.xprt, sock.as_fd(), &mut recv_buf);
+        let _eof = recv_check_reply(&mut check.xprt, sock.as_fd(), &mut recv_buf);
 
-        if find_crlf(&recv_buf).is_none() && !eof {
+        let Some(greeting) = check_reply::smtp_greeting(&recv_buf) else {
             fdtab.clear_ready(raw_fd, true, false);
             check.sub_state = CheckSubState::SmtpRunning {
                 phase,
@@ -2470,50 +2475,29 @@ fn progress_smtp_check(
                 recv_buf,
             };
             return Ok(CheckStep::pending(Some(check.exp)));
-        }
+        };
 
-        let (code_res, line) = check_reply::smtp_status_line(&recv_buf);
-        match code_res {
-            Some(code) if (200..300).contains(&code) => {
+        match greeting {
+            check_reply::SmtpGreeting::Accepted => {
                 phase = 1;
                 send_offset = 0;
                 recv_buf.clear();
                 fdtab.set_interest(raw_fd, Interest::WRITE);
                 let _ = poller.modify(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), false, true);
             }
-            Some(code) => {
+            check_reply::SmtpGreeting::Failed(code, info) => {
                 cleanup_check_socket(check, fdtab, poller);
-                let info = line.get(4..).unwrap_or("").trim().to_string();
-                let event = check.on_failure_full(
-                    "L7STS",
-                    "Layer7 wrong status",
-                    duration,
-                    Some(code),
-                    if info.is_empty() { None } else { Some(info) },
-                );
+                let event = check.on_failure_full("L7STS", "Layer7 wrong status", duration, Some(code), info);
                 let next = check.schedule_next(now);
                 check.next_check = next;
-                return Ok(CheckStep {
-                    next: Some(next),
-                    event,
-                });
+                return Ok(CheckStep { next: Some(next), event });
             }
-            None => {
+            check_reply::SmtpGreeting::Invalid(info) => {
                 cleanup_check_socket(check, fdtab, poller);
-                let info = line.trim().to_string();
-                let event = check.on_failure_full(
-                    "L7RSP",
-                    "Layer7 invalid response",
-                    duration,
-                    None,
-                    if info.is_empty() { None } else { Some(info) },
-                );
+                let event = check.on_failure_full("L7RSP", "Layer7 invalid response", duration, None, info);
                 let next = check.schedule_next(now);
                 check.next_check = next;
-                return Ok(CheckStep {
-                    next: Some(next),
-                    event,
-                });
+                return Ok(CheckStep { next: Some(next), event });
             }
         }
     }
@@ -2655,10 +2639,10 @@ fn progress_smtp_check(
     }
 
     if phase == 4 {
-        // True once nothing more is coming: the server closed, or one buffer is full.
+        // The reply is judged on four bytes (the QUIT answer needs no CRLF).
         let eof = recv_check_reply(&mut check.xprt, sock.as_fd(), &mut recv_buf);
 
-        if find_crlf(&recv_buf).is_none() && !eof {
+        let Some(answer) = check_reply::smtp_quit(&recv_buf, eof) else {
             fdtab.clear_ready(raw_fd, true, false);
             check.sub_state = CheckSubState::SmtpRunning {
                 phase,
@@ -2667,38 +2651,12 @@ fn progress_smtp_check(
                 recv_buf,
             };
             return Ok(CheckStep::pending(Some(check.exp)));
-        }
+        };
 
         cleanup_check_socket(check, fdtab, poller);
-        let (code_res, line) = check_reply::smtp_status_line(&recv_buf);
-        let event = match code_res {
-            Some(code) if (200..300).contains(&code) => {
-                let info = line.get(4..).unwrap_or("").trim().to_string();
-                check.on_success_full(
-                    "L7OK",
-                    "Layer7 check passed",
-                    duration,
-                    Some(code),
-                    if info.is_empty() { None } else { Some(info) },
-                )
-            }
-            Some(code) => {
-                let info = line.get(4..).unwrap_or("").trim().to_string();
-                check.on_failure_full(
-                    "L7STS",
-                    "Layer7 wrong status",
-                    duration,
-                    Some(code),
-                    if info.is_empty() { None } else { Some(info) },
-                )
-            }
-            None => check.on_failure_full(
-                "L7STS",
-                "Layer7 wrong status",
-                duration,
-                Some(0),
-                check_reply::smtp_codeless_info(&recv_buf),
-            ),
+        let event = match answer {
+            Ok((code, info)) => check.on_success_full("L7OK", "Layer7 check passed", duration, Some(code), info),
+            Err((code, info)) => check.on_failure_full("L7STS", "Layer7 wrong status", duration, Some(code), info),
         };
         let next = check.schedule_next(now);
         check.next_check = next;

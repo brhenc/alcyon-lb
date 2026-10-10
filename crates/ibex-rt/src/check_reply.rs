@@ -67,14 +67,6 @@ pub fn redis(b: &[u8], eof: bool) -> Option<Verdict> {
     Some(Verdict::fail("L7STS", "Layer7 wrong status", Some(0), Some(ascii_encode(cut_crlf(b)))))
 }
 
-/// One SMTP status line (the greeting, or the answer to QUIT): its three-digit code if it
-/// starts with one, and the line without its trailing CR/LF.
-pub fn smtp_status_line(b: &[u8]) -> (Option<u16>, String) {
-    let line = String::from_utf8_lossy(b).trim_end_matches(&['\r', '\n'][..]).to_string();
-    let code = line.get(0..3).and_then(|s| s.parse::<u16>().ok());
-    (code, line)
-}
-
 /// The info of a failed SMTP `EHLO` or `QUIT` reply that has no status code: `HAProxy`'s rules
 /// end on `error-status L7STS on-error "%[res.payload(4,0),ltrim(' '),cut_crlf]"
 /// status-code "res.payload(0,3)"` (src/tcpcheck.c), so the status is "wrong status", the
@@ -85,6 +77,55 @@ pub fn smtp_codeless_info(b: &[u8]) -> Option<String> {
     let start = rest.iter().position(|&c| c != b' ').unwrap_or(rest.len());
     let info = cut_crlf(&rest[start..]);
     (!info.is_empty()).then(|| String::from_utf8_lossy(info).into_owned())
+}
+
+/// The first three bytes as a number, 0 if they are not three digits (`res.payload(0,3)`).
+fn smtp_code(b: &[u8]) -> u16 {
+    b.get(0..3)
+        .filter(|d| d.iter().all(u8::is_ascii_digit))
+        .map_or(0, |d| d.iter().fold(0u16, |n, &c| n * 10 + u16::from(c - b'0')))
+}
+
+/// The verdict on the SMTP greeting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SmtpGreeting {
+    /// A 2xx greeting: send the HELO/EHLO.
+    Accepted,
+    /// Not `NNN` followed by a space or CR (L7RSP), with the reply up to its line end.
+    Invalid(Option<String>),
+    /// Another status (L7STS): code and info.
+    Failed(u16, Option<String>),
+}
+
+/// The SMTP greeting: `expect rstring ^[0-9]{3}[ \r] min-recv 4` (L7RSP, info = the reply
+/// up to the line end), then `^2[0-9]{2}[ \r] min-recv 4` (L7STS). Four bytes decide, a CRLF
+/// is not needed, and a multi-line greeting (`220-x`) is "invalid response". Under four bytes
+/// nothing is judged, even after the close.
+pub fn smtp_greeting(b: &[u8]) -> Option<SmtpGreeting> {
+    if b.len() < 4 {
+        return None;
+    }
+    if !(b[..3].iter().all(u8::is_ascii_digit) && matches!(b[3], b' ' | b'\r')) {
+        let line = cut_crlf(b);
+        return Some(SmtpGreeting::Invalid((!line.is_empty()).then(|| ascii_encode(line))));
+    }
+    Some(if b[0] == b'2' {
+        SmtpGreeting::Accepted
+    } else {
+        SmtpGreeting::Failed(smtp_code(b), smtp_codeless_info(b))
+    })
+}
+
+/// The answer to QUIT: `expect rstring ^2[0-9]{2}[- \r] min-recv 4`. `Ok((code, info))` passes,
+/// `Err((code, info))` is "wrong status" (also a reply cut short by the close, measured as
+/// code 0); `None` waits for four bytes.
+pub fn smtp_quit(b: &[u8], eof: bool) -> Option<Result<(u16, Option<String>), (u16, Option<String>)>> {
+    if b.len() < 4 && !eof {
+        return None;
+    }
+    let r = (smtp_code(b), smtp_codeless_info(b));
+    let ok = b.len() >= 4 && b[0] == b'2' && b[1].is_ascii_digit() && b[2].is_ascii_digit() && matches!(b[3], b'-' | b' ' | b'\r');
+    Some(if ok { Ok(r) } else { Err(r) })
 }
 
 /// The verdict on the answer to HELO/EHLO.
@@ -133,11 +174,7 @@ pub fn smtp_reply(b: &[u8], eof: bool) -> Option<SmtpEhlo> {
     if !eof {
         return None;
     }
-    let code = b
-        .get(0..3)
-        .filter(|d| d.iter().all(u8::is_ascii_digit))
-        .map_or(0, |d| d.iter().fold(0u16, |n, &c| n * 10 + u16::from(c - b'0')));
-    Some(SmtpEhlo::Failed(code, smtp_codeless_info(b)))
+    Some(SmtpEhlo::Failed(smtp_code(b), smtp_codeless_info(b)))
 }
 
 /// `option ldap-check`: the reply to an anonymous bind must be an LDAPv3 BindResponse;

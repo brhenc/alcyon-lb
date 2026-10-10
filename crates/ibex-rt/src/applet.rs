@@ -599,6 +599,7 @@ impl CliApplet {
                         }
 
                         check_status = match check.last_status_code {
+                            "UNK" => 0,
                             "INI" => 1,
                             "START" => 2,
                             "CHECKED" => 3,
@@ -613,15 +614,17 @@ impl CliApplet {
                             "L7TOUT" => 12,
                             "L7RSP" => 13,
                             "L57DATA" => 14,
-                            "L7OKD" => 15,
-                            "L7OKCD" => 16,
+                            "L7OK" | "L7OKD" => 15,
+                            "L7OKC" | "L7OKCD" => 16,
                             "L7STS" => 17,
                             "PROCERR" => 18,
                             "PROCTOUT" => 19,
                             "PROCOK" => 20,
                             _ => 1,
                         };
-                        check_result = if check.last_status_code.contains("OK") {
+                        check_result = if check.last_status_code.starts_with("L7OKC") {
+                            4 // CHK_RES_CONDPASS
+                        } else if check.last_status_code.contains("OK") {
                             3 // CHK_RES_PASSED
                         } else if check.last_status_code != "INI" {
                             2 // CHK_RES_FAILED
