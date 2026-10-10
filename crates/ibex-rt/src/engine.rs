@@ -1754,6 +1754,11 @@ pub struct Engine {
     cli_maxconn: usize,
     /// The CLI listeners are out of the poller because `cli_maxconn` was reached.
     cli_paused: bool,
+    /// `accept` on a CLI socket failed for want of a resource (`EMFILE`, `ENFILE`,
+    /// `ENOBUFS`, `ENOMEM`): the CLI listeners stay stopped until this instant, as
+    /// `HAProxy`'s `CO_AC_PAUSE` stops a listener for 100 ms. Left armed, the
+    /// level-triggered listener was ready again at once and the worker spun (T246).
+    cli_accept_retry: Option<Instant>,
     pub start_time: Instant,
     /// This process's id, read once: `std::process::id()` is a `getpid` syscall, and the
     /// dispatcher wants it on every step. Nothing forks after an engine is built (`-D`
@@ -3656,6 +3661,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             cli_timeout_ms: crate::applet::DEFAULT_CLI_TIMEOUT_MS,
             cli_maxconn: crate::applet::DEFAULT_CLI_MAXCONN,
             cli_paused: false,
+            cli_accept_retry: None,
             start_time,
             pid: std::process::id(),
             now,
@@ -3778,7 +3784,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
 
     /// Re-arms the CLI listeners once a connection closed below `stats maxconn`.
     fn resume_cli_after_close(&mut self) {
-        if self.cli_paused && self.applets.live() < self.cli_maxconn {
+        if self.cli_paused && self.cli_accept_retry.is_none() && self.applets.live() < self.cli_maxconn {
             self.set_cli_listening(true);
         }
     }
@@ -4188,6 +4194,15 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         if self.global_paused && self.accept_limited.is_none() && !crate::globalconn::full() {
             self.resume_listeners_after_global();
         }
+        let poll_timeout = match self.cli_accept_retry {
+            Some(t) if t <= now_inst => {
+                self.cli_accept_retry = None;
+                self.resume_cli_after_close();
+                poll_timeout
+            }
+            Some(t) => poll_timeout.min(t.saturating_duration_since(now_inst)),
+            None => poll_timeout,
+        };
         if self.fe_paused && !self.global_paused {
             self.resume_listeners_after_frontend_limit();
         }
@@ -4380,7 +4395,13 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                     break;
                 }
-                Err(_) => {
+                Err(e) => {
+                    use rustix::io::Errno;
+                    let out_of = [Errno::MFILE, Errno::NFILE, Errno::NOBUFS, Errno::NOMEM].map(Errno::raw_os_error);
+                    if e.raw_os_error().is_some_and(|n| out_of.contains(&n)) {
+                        self.set_cli_listening(false);
+                        self.cli_accept_retry = Some(Instant::now() + Duration::from_millis(100));
+                    }
                     break;
                 }
             }
