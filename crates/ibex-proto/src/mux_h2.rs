@@ -890,7 +890,10 @@ impl MuxH2 {
                                 ctx.max_frame_size = val;
                             }
                             SettingsParameter::HeaderTableSize => {
-                                ctx.encoder.dynamic_table.set_max_size(val as usize);
+                                // The peer's decoder may hold this much; the encoder uses no
+                                // more than the 4096 it starts with (a larger table would need
+                                // a size update, and grows with every header sent; T235).
+                                ctx.encoder.dynamic_table.set_max_size((val as usize).min(4096));
                             }
                             _ => {}
                         }
@@ -1410,6 +1413,20 @@ mod tests {
         mux.parse(&mut ctx, &post_headers(5)).expect("open 5");
         ctx.send_rst_stream(5, H2Error::ProtocolError);
         assert!(!ctx.streams.contains_key(&5));
+    }
+
+    /// SETTINGS_HEADER_TABLE_SIZE bounds the table our encoder may use, it does not size it:
+    /// the encoder stays at 4096 (the default, which no size update has changed), whatever
+    /// larger value the peer announces -- 2^32-1 let the table grow to all a client asked (T235).
+    #[test]
+    fn a_huge_header_table_size_leaves_the_encoder_at_4096() {
+        let (mux, mut ctx) = open_conn();
+        let s = Frame::Settings { flags: 0, settings: vec![(SettingsParameter::HeaderTableSize, u32::MAX)] };
+        mux.parse(&mut ctx, &s.encode()).expect("settings");
+        assert_eq!(ctx.encoder.dynamic_table.max_size(), 4096);
+        let s = Frame::Settings { flags: 0, settings: vec![(SettingsParameter::HeaderTableSize, 256)] };
+        mux.parse(&mut ctx, &s.encode()).expect("settings");
+        assert_eq!(ctx.encoder.dynamic_table.max_size(), 256);
     }
 
     /// RFC 9113 section 6.1: padding counts toward flow control; only the data reaches the stream.
