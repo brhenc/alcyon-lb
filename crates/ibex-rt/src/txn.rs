@@ -671,8 +671,19 @@ pub fn status_of(head: &str) -> u16 {
 /// wire, plus the 40 bytes.
 #[must_use]
 pub fn htx_head_cost(head: &[u8]) -> usize {
+    head_cost(head, true)
+}
+
+/// `htx_head_cost` of a response head (T265): the same accounting, with the start line read
+/// as a status line.
+#[must_use]
+pub fn htx_response_head_cost(head: &[u8]) -> usize {
+    head_cost(head, false)
+}
+
+fn head_cost(head: &[u8], request: bool) -> usize {
     let blocks = 2 + head.split(|&b| b == b'\n').skip(1).take_while(|l| !l.is_empty() && *l != b"\r").count();
-    let data = htx_head_size(head, true).map_or(head.len(), |n| usize::try_from(n).unwrap_or(usize::MAX));
+    let data = htx_head_size(head, request).map_or(head.len(), |n| usize::try_from(n).unwrap_or(usize::MAX));
     data.saturating_add(40 + 8 * blocks)
 }
 
