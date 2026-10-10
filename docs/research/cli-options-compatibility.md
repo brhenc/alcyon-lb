@@ -237,7 +237,7 @@ if let Some(megs) = cli_opts.memory_limit_mb {
 
 ## 5. Integration Verification Matrix
 
-The integration test suite in `crates/ibex-rt/tests/cli_options.rs` validates all core operational paths:
+The integration test suite in `crates/ibex-rt/tests/it/cli_options.rs` validates all core operational paths:
 
 1. **Check Mode (`-c`)**:
    - Valid config returns exit code `0` and outputs validation confirmation.

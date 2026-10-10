@@ -106,7 +106,7 @@ reloads done by hand as `ibex -f cfg -x <sock> -sf <pid>`.
 
 ### Evidence
 
-`crates/ibex-rt/tests/soft_stop.rs` and `tests/reload.rs` drive the real binary.
+`crates/ibex-rt/tests/it/soft_stop.rs` and `tests/reload.rs` drive the real binary.
 `harness/systemd_reload.sh` drives `admin/systemd/ibex.service` through `systemctl --user`
 under continuous load: three reloads, a reload onto a broken config (refused, `MainPID`
 unchanged, `Reload failed!`), a recovering reload, and a stop. Four runs, 27,002 requests,

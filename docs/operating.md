@@ -97,7 +97,7 @@ echo reload | socat - /run/ibex-master.sock     # the same, with the result (mas
 With the master (`-S`, the shipped unit), `$MAINPID` is the master and SIGUSR2 makes it start a
 new worker; the paragraphs below describe the single-process layout (`-W` without `-S`), which is
 what T166 measured under load. The master layout was tested with requests sent in a loop
-through a valid and a failed reload (none failed; `crates/ibex-rt/tests/master_cli.rs`), not
+through a valid and a failed reload (none failed; `crates/ibex-rt/tests/it/master_cli.rs`), not
 with the 100-reload measurement.
 
 Needs `-W` or `-Ws`. Verified on one reload with the `-Ws` command line: the new process took the
@@ -129,7 +129,7 @@ As in HAProxy, a stopping process answers every request it reads with `Connectio
 closes idle connections only when it has nothing else to run, so a client under constant load is
 told to reconnect rather than having its connection closed between two requests. A client that is
 idle when the stop comes is closed; a request it sends at that instant can meet the close (the
-retried case above), as with HAProxy. `crates/ibex-rt/tests/reload_under_load.rs` runs 10 reloads
+retried case above), as with HAProxy. `crates/ibex-rt/tests/it/reload_under_load.rs` runs 10 reloads
 in the gate and 100 with `--ignored`.
 
 The handover socket lives in a private (0700) directory under `$TMPDIR` (default `/tmp`), so

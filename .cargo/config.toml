@@ -3,3 +3,12 @@ build-livepatch = ["build", "--profile", "livepatch", "--config", "build.rustfla
 
 [target.x86_64-unknown-linux-gnu]
 linker = "tools/cc-mold"
+
+[env]
+# T260: each crate's integration tests are one binary, so `cargo test` runs all of a crate's
+# tests in one process at once. At libtest's default (one thread per core) a 64-core
+# machine ran 64 at once, each starting ibex processes, and timing tests failed under the
+# load (health_check, fd_hygiene); at 16 the ibex-rt binary ran clean in ~60 s on 64
+# cores and on 8 (8 threads on 8 cores: ~115 s). An environment variable or
+# `-- --test-threads=N` overrides it. The gate's suite runs one test per process.
+RUST_TEST_THREADS = "16"
