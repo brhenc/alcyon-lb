@@ -2307,7 +2307,17 @@ impl TcpSession {
     /// buffer fills, and TCP slows the sender.
     #[must_use]
     pub fn interests(&self) -> (Want, Want) {
-        let has_pending = self.has_pending_output();
+        // An HTTP/2 client is written only what is framed in `tx_buf`: the response in
+        // `rep` goes there as the flow-control windows allow (`h2_forward_response`), and
+        // what they hold back cannot be written. Counting it asked the level-triggered
+        // poller for writability with nothing to write, and a client whose window stayed
+        // at 0 had a core spin on EPOLLOUT (T248). A `WINDOW_UPDATE` arrives as a read.
+        let has_pending = if self.h2_ctx.is_some() {
+            self.pending_resp.as_deref().is_some_and(|(d, o)| *o < d.len())
+                || self.h2_ctx.as_ref().is_some_and(|h| h.tx_consumed < h.tx_buf.len())
+        } else {
+            self.has_pending_output()
+        };
         // `cli_xprt.wants_write()` is the TLS term. A handshake is mostly the server
         // talking, and the condition below it -- "we have a response queued" -- is false
         // throughout one, so without this the connection is never polled for writability
