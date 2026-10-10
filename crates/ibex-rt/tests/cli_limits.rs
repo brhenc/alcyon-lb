@@ -78,7 +78,21 @@ const TOO_BIG: &str = "The command line is too big for the buffer size.";
 fn a_command_line_longer_than_the_buffer_is_refused_and_not_stored() {
     let ibex = start("");
     let pid = ibex.child.id();
-    let before = rss_kb(pid);
+    // Ibex still touches a few MB of startup memory after its listener answers; the
+    // baseline is taken once that has settled (a CLI round trip, then RSS steady),
+    // or the startup growth is counted against the long line.
+    let mut w = connect(&ibex);
+    w.write_all(b"show info\n").expect("send");
+    while read_some(&mut w).is_some_and(|b| !b.is_empty()) {}
+    let mut before = rss_kb(pid);
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(50));
+        let now = rss_kb(pid);
+        if now == before {
+            break;
+        }
+        before = now;
+    }
     let mut c = connect(&ibex);
     // 8 MiB with no line feed: the connection is answered and closed long before.
     let chunk = vec![b'x'; 64 * 1024];
