@@ -273,10 +273,8 @@ pub fn take_inherited(worker: usize, addr: SocketAddr) -> Vec<OwnedFd> {
 /// `log-forward` listener is served by its own thread, not by the workers.
 #[must_use]
 pub fn take_inherited_all(kind: Kind, addr: SocketAddr) -> Vec<OwnedFd> {
-    INHERITED.lock().map_or_else(
-        |_| Vec::new(),
-        |mut g| g.iter_mut().filter_map(|m| m.remove(&(kind, addr))).flatten().collect(),
-    )
+    // A poisoned lock gives nothing (a panic aborts the process, so it is not seen).
+    INHERITED.lock().map(|mut g| g.iter_mut().filter_map(|m| m.remove(&(kind, addr))).flatten().collect()).unwrap_or_default()
 }
 
 /// Closes inherited sockets no listener claimed -- an address the new config no longer

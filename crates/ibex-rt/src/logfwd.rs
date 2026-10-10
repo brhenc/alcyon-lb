@@ -356,9 +356,7 @@ fn serve_tcp(name: &str, listener: TcpListener, fwd: Arc<Forwarder>, tls: Option
                     continue;
                 }
             };
-            if conn.set_nonblocking(false).is_err() {
-                continue;
-            }
+            let Ok(()) = conn.set_nonblocking(false) else { continue };
             let Some(slot) = fwd.admit() else { continue };
             let (fwd, tls) = (Arc::clone(&fwd), tls.clone());
             let _ = spawn("logfwd-conn", move || {
@@ -444,9 +442,7 @@ fn start_section(config: &Config, section: &LogForwardSection) -> io::Result<()>
                                 continue;
                             }
                         };
-                        if conn.set_nonblocking(false).is_err() {
-                            continue;
-                        }
+                        let Ok(()) = conn.set_nonblocking(false) else { continue };
                         let Some(slot) = fwd.admit() else { continue };
                         let fwd = Arc::clone(&fwd);
                         let _ = spawn("logfwd-conn", move || {

@@ -669,3 +669,56 @@ fn a_reload_that_drops_a_bind_closes_its_socket() {
     let _ = std::fs::remove_file(&sock);
     let _ = std::fs::remove_file(&pidfile);
 }
+
+/// The listening inodes of `port` in `/proc/net/<table>` (`udp` or `tcp`; for tcp only
+/// the sockets in LISTEN).
+fn socket_inodes(table: &str, port: u16) -> Vec<String> {
+    let text = std::fs::read_to_string(format!("/proc/net/{table}")).expect("proc net");
+    let mut out: Vec<String> = text
+        .lines()
+        .skip(1)
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            let local_port = f.get(1)?.rsplit(':').next()?;
+            let listening = table == "udp" || f.get(3) == Some(&"0A");
+            (u16::from_str_radix(local_port, 16).ok() == Some(port) && listening).then(|| f[9].to_string())
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// A `log-forward` section's `dgram-bind` and `bind` sockets are taken over by `-x` like a
+/// proxy's: measured on HAProxy 3.5-dev8 (`expose-fd listeners`, then `-x <sock> -sf
+/// <old>`), the sockets on those ports have the same inodes after the reload.
+#[test]
+fn a_reload_with_x_takes_over_the_log_forward_sockets() {
+    let fe = common::reserve_addr();
+    let udp = common::reserve_port();
+    let tcp = common::reserve_port();
+    let sink = std::net::UdpSocket::bind("127.0.0.1:0").expect("sink");
+    let sock = short_sock("logfwd");
+    let text = format!(
+        "global\n  stats socket {} mode 600 level admin expose-fd listeners\n\
+         defaults\n  mode http\n  timeout connect 2s\n  timeout client 10s\n  timeout server 10s\n\
+         frontend fe\n  bind {fe}\n  http-request return status 200\n\
+         log-forward lf\n  dgram-bind 127.0.0.1:{udp}\n  bind 127.0.0.1:{tcp}\n  log {} format raw local0\n",
+        sock.display(),
+        sink.local_addr().expect("sink addr")
+    );
+    let cfg = write_cfg(&text);
+    let mut old = Proc::start(cfg.path(), &[]);
+    wait_listening(fe);
+    wait_listening(SocketAddr::from(([127, 0, 0, 1], tcp)));
+    let before = (socket_inodes("udp", udp), socket_inodes("tcp", tcp));
+    assert_eq!((before.0.len(), before.1.len()), (1, 1), "{before:?}");
+
+    let mut new = Proc::start(cfg.path(), &["-x".into(), sock.display().to_string(), "-sf".into(), old.pid().to_string()]);
+    let st = old.wait_exit(Duration::from_secs(5));
+    assert!(st.is_some_and(|s| s.success()), "old process: {st:?}");
+    wait_listening(fe);
+    let after = (socket_inodes("udp", udp), socket_inodes("tcp", tcp));
+    let _ = std::fs::remove_file(&sock);
+    new.stop();
+    assert_eq!(after, before, "the new process bound sockets of its own instead of taking the old ones over");
+}

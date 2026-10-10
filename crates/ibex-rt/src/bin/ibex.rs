@@ -796,13 +796,6 @@ fn main() {
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 64));
     ibex_rt::stats::NBTHREAD.store(nbthread as u32, std::sync::atomic::Ordering::Relaxed);
 
-    let shared_proxies = match Engine::build_shared_state(&config) {
-        Ok(p) => p,
-        Err(err) => {
-            eprintln!("Failed to build shared state: {err}");
-            process::exit(1);
-        }
-    };
     // The soft limit on open files goes up to `maxsock` before any socket is opened.
     let maxsock = ibex_rt::engine::config_maxsock(&config, nbthread);
     // A `maxconn` computed from the hard limit fits it: only a configured one is refused.
@@ -877,6 +870,16 @@ fn main() {
             }
         }
     }
+
+    // After 12b: `build_shared_state` binds the `log-forward` sockets, which take the ones
+    // handed over by `-x` and are exposed for the next reload only once 12b has run.
+    let shared_proxies = match Engine::build_shared_state(&config) {
+        Ok(p) => p,
+        Err(err) => {
+            eprintln!("Failed to build shared state: {err}");
+            process::exit(1);
+        }
+    };
 
     // 12c. Every worker's QUIC socket is bound here, before the first worker starts, so the
     //      reuseport group a client's datagrams are hashed over is whole from its first
