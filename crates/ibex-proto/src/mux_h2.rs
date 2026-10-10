@@ -23,6 +23,7 @@ use crate::endpoint::{Endpoint, SeDesc};
 use crate::h2::{
     frame_flags, Frame, FrameHeader, H2ConnState, H2Error, H2StreamState, SettingsParameter,
     DEFAULT_INITIAL_WINDOW_SIZE, DEFAULT_MAX_FRAME_SIZE, FRAME_HEADER_LEN, H2_CONN_PREFACE,
+    MAX_MAX_FRAME_SIZE, MAX_WINDOW_SIZE, MIN_MAX_FRAME_SIZE,
 };
 use crate::hpack::{HpackDecoder, HpackEncoder};
 use crate::htx::{HeaderField, HttpVersion, Htx, HtxBlock};
@@ -338,6 +339,10 @@ impl H2MuxContext {
                 break;
             }
             let n = (data.len() - sent).min(win as usize).min(self.max_frame_size as usize);
+            if n == 0 {
+                // Never true once SETTINGS are validated; a zero-size chunk would spin here.
+                break;
+            }
             let last = end_stream && sent + n == data.len();
             self.enqueue_frame(&Frame::Data {
                 flags: if last { frame_flags::END_STREAM } else { 0 },
@@ -369,6 +374,10 @@ impl H2MuxContext {
         });
     }
 }
+
+/// Header fields a request may carry once converted (HAProxy's `tune.http.maxhdr` 101,
+/// less one: measured, host + 99 headers pass and host + 100 are refused).
+const MAX_REQUEST_HEADERS: usize = 100;
 
 /// HTTP/2 Multiplexer.
 #[derive(Debug, Clone, Copy, Default)]
@@ -409,6 +418,10 @@ impl Mux for MuxH2 {
     fn parse(&self, ctx: &mut Self::Ctx, input: &[u8]) -> io::Result<usize> {
         if input.is_empty() {
             return Ok(0);
+        }
+        if ctx.conn_state == H2ConnState::GoAwaySent {
+            // No frame is processed after a connection error: do not keep what follows.
+            return Ok(input.len());
         }
 
         ctx.rx_buf.extend_from_slice(input);
@@ -457,6 +470,13 @@ impl Mux for MuxH2 {
             }
             let slice = &ctx.rx_buf[consumed..];
             let header = FrameHeader::decode(slice)?;
+            if header.length > DEFAULT_MAX_FRAME_SIZE {
+                // Longer than the SETTINGS_MAX_FRAME_SIZE we advertise (we send none, so the
+                // default 16384): refused on its header, before the payload is buffered
+                // (RFC 9113 section 4.2; HAProxy: GOAWAY FRAME_SIZE_ERROR, last stream processed).
+                ctx.send_goaway(ctx.last_client_stream_id, H2Error::FrameSizeError, b"frame too large");
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "HTTP/2 frame larger than max frame size"));
+            }
 
             let total_frame_len = FRAME_HEADER_LEN + header.length as usize;
             if slice.len() < total_frame_len {
@@ -668,6 +688,13 @@ impl MuxH2 {
             return Ok(());
         }
 
+        // HAProxy keeps at most tune.http.maxhdr - 1 (100) header fields in a request,
+        // counting the host made from :authority; more is a stream error PROTOCOL_ERROR.
+        let regular = decoded_headers.iter().filter(|h| !h.name.starts_with(':')).count();
+        let host_from_authority = decoded_headers.iter().any(|h| h.name == ":authority")
+            && !decoded_headers.iter().any(|h| h.name == "host");
+        let too_many = ctx.is_server && regular + usize::from(host_from_authority) > MAX_REQUEST_HEADERS;
+
         let abs_prefix = {
             let get = |n: &str| decoded_headers.iter().find(|h| h.name == n).map(|h| h.value.as_str());
             get(":scheme").zip(get(":authority")).map(|(s, a)| format!("{s}://{a}"))
@@ -685,7 +712,12 @@ impl MuxH2 {
         ctx.highest_opened = ctx.highest_opened.max(stream_id);
 
         // Extract pseudo-headers and construct HTX blocks
-        match crate::htx::pseudo_headers_to_htx(decoded_headers, HttpVersion::Http20) {
+        let converted = if too_many {
+            Err(())
+        } else {
+            crate::htx::pseudo_headers_to_htx(decoded_headers, HttpVersion::Http20).map_err(|_| ())
+        };
+        match converted {
             Ok(blocks) => {
                 for b in blocks {
                     stream.rx_htx.push(b);
@@ -756,6 +788,25 @@ impl MuxH2 {
                     if ctx.settings_count > 100 {
                         ctx.send_goaway(0, H2Error::EnhanceYourCalm, b"SETTINGS flood detected");
                         return Ok(());
+                    }
+                    // Peer sent settings: validate them all before applying any (RFC 9113
+                    // section 6.5.2). HAProxy answers GOAWAY with the last stream processed and
+                    // does not acknowledge.
+                    let invalid = settings.iter().find_map(|(param, val)| match param {
+                        SettingsParameter::EnablePush if *val > 1 => Some(H2Error::ProtocolError),
+                        SettingsParameter::InitialWindowSize if *val > MAX_WINDOW_SIZE as u32 => {
+                            Some(H2Error::FlowControlError)
+                        }
+                        SettingsParameter::MaxFrameSize
+                            if !(MIN_MAX_FRAME_SIZE..=MAX_MAX_FRAME_SIZE).contains(val) =>
+                        {
+                            Some(H2Error::ProtocolError)
+                        }
+                        _ => None,
+                    });
+                    if let Some(code) = invalid {
+                        ctx.send_goaway(ctx.last_client_stream_id, code, b"invalid SETTINGS value");
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid HTTP/2 SETTINGS value"));
                     }
                     // Peer sent settings: apply parameters
                     for (param, val) in settings {
@@ -1124,6 +1175,36 @@ mod tests {
         ctx.streams.get_mut(&5).unwrap().state = H2StreamState::HalfClosedRemote;
         assert_eq!(ctx.send_data(5, &[], true), 0);
         assert_eq!(ctx.streams.get(&5).unwrap().state, H2StreamState::Closed);
+    }
+
+    /// Defence in depth behind SETTINGS validation (T234): a zero max frame size sends
+    /// nothing instead of looping on empty DATA frames.
+    #[test]
+    fn send_data_with_a_zero_max_frame_size_sends_nothing() {
+        let mut ctx = MuxH2.init(ConnId(1), true).expect("init");
+        ctx.streams.insert(1, H2StreamCtx::new(1, 100, 100));
+        ctx.max_frame_size = 0;
+        let before = ctx.tx_buf.len();
+        assert_eq!(ctx.send_data(1, &[7; 25], true), 0);
+        assert_eq!(ctx.tx_buf.len(), before);
+    }
+
+    /// Settings are validated before any is applied (T234); nothing is buffered after the
+    /// GOAWAY.
+    #[test]
+    fn an_invalid_setting_applies_none_of_the_frame() {
+        let mut ctx = MuxH2.init(ConnId(1), true).expect("init");
+        let mut wire = H2_CONN_PREFACE.to_vec();
+        // MAX_CONCURRENT_STREAMS 7 then MAX_FRAME_SIZE 0.
+        wire.extend_from_slice(&[0, 0, 12, 4, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 7, 0, 5, 0, 0, 0, 0]);
+        let mcs = ctx.max_concurrent_streams;
+        assert!(MuxH2.parse(&mut ctx, &wire).is_err());
+        assert_eq!(ctx.max_frame_size, DEFAULT_MAX_FRAME_SIZE);
+        assert_eq!(ctx.max_concurrent_streams, mcs);
+        assert_eq!(ctx.goaway_sent, Some((0, H2Error::ProtocolError)));
+        let buffered = ctx.rx_buf.len();
+        assert!(MuxH2.parse(&mut ctx, &[0; 64]).is_ok());
+        assert_eq!(ctx.rx_buf.len(), buffered);
     }
 
     /// A closed stream is taken out of the map when its transaction ends (T186). HEADERS

@@ -757,6 +757,11 @@ pub fn decode_string_literal(src: &[u8], offset: &mut usize) -> Result<String, H
     }
 }
 
+/// Header fields one block may decode to. HAProxy decodes into a list of
+/// `2 * tune.http.maxhdr` (202) entries, one of them the end marker: 201 fields pass, the
+/// 202nd is a connection error COMPRESSION_ERROR (measured). Bounds the memory a block costs.
+pub const MAX_DECODED_FIELDS: usize = 201;
+
 /// HPACK Header Block Decoder (RFC 7541).
 #[derive(Debug, Default)]
 pub struct HpackDecoder {
@@ -799,6 +804,9 @@ impl HpackDecoder {
         let mut allowed_table_size_update = true;
 
         while offset < block.len() {
+            if headers.len() >= MAX_DECODED_FIELDS {
+                return Err(H2Error::CompressionError);
+            }
             let b = block[offset];
 
             if (b & 0x80) != 0 {
