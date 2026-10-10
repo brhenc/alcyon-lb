@@ -1215,6 +1215,13 @@ impl TcpSession {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         let mut stream = parser.stream(false);
         stream.set_accept_unsafe_request(self.accept_unsafe_request);
+        // The head HAProxy holds in `tune.bufsize` may not fit this HTX, whose descriptors
+        // are twice as large: the buffer is made large enough for the head and one
+        // descriptor per line (and the two of the start line and the end of the head).
+        self.htx_tail = 0;
+        self.htx_blocks = 0;
+        let lines = self.req.readable()[..head_len].iter().filter(|&&b| b == b'\n').count();
+        self.htx_reserve(head_len + ibex_proto::htx::HTX_DESC_SIZE * (lines + 2));
         let raw = self.htx_buf.raw_slice_mut();
         let mut slice = ibex_proto::htx::HtxSlice::new(raw);
         stream.parse(&self.req.readable()[..head_len], &mut slice)?;
