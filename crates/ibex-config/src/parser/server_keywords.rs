@@ -19,7 +19,9 @@
 //! The list is `srv_kws` in `src/server.c`, `src/check.c`, `src/cfgparse-ssl.c`,
 //! `src/cfgparse-tcp.c` and `src/tcpcheck.c` of `HAProxy` 3.5-dev8.
 
-use super::{parse_timeout, ConfigError, Token};
+use std::time::Duration;
+
+use super::{parse_timer, ConfigError, Token, TIMER_LIMIT};
 
 /// What Ibex does with a keyword it does not implement.
 #[derive(Clone, Copy)]
@@ -188,7 +190,7 @@ pub(crate) fn unimplemented_server_keyword(tokens: &[Token], i: usize, server: O
         Arg::Word => server_kw_arg(tokens, i, server, "expects an argument.").map(|_| i + 1)?,
         Arg::Delay => {
             let arg = server_kw_arg(tokens, i, server, "expects a delay as argument.")?;
-            parse_timeout(arg, k.name)?;
+            parse_server_delay(arg, k.name, server)?;
             i + 1
         }
     };
@@ -203,4 +205,18 @@ pub(crate) fn unimplemented_server_keyword(tokens: &[Token], i: usize, server: O
             Ok(last)
         }
     }
+}
+
+/// A server keyword's delay, refused over 2^31-1 ms with `HAProxy`'s text for it
+/// (`srv_parse_*`, src/server.c, src/check.c; measured on 3.5-dev8).
+pub(crate) fn parse_server_delay(arg: &Token, kw: &str, server: Option<&str>) -> Result<Duration, ConfigError> {
+    parse_timer(arg, kw, |a| {
+        let prefix = server_prefix(server);
+        if kw == "tcp-ut" {
+            return format!("{prefix}timer overflow in argument '{a}' to 'tcp-ut' {TIMER_LIMIT}.");
+        }
+        let what = if kw == "slowstart" { "overflow" } else { "timer overflow" };
+        let name = server.unwrap_or("(null)");
+        format!("{prefix}{what} in argument <{a}> to <{kw}> of server {name}, maximum value is 2147483647 ms (~24.8 days)..")
+    })
 }

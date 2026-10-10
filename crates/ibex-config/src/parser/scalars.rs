@@ -3,7 +3,22 @@
 
 use super::*;
 
+/// The largest timer `HAProxy` takes: ticks are signed 32-bit milliseconds
+/// (`parse_time_err` returns `PARSE_TIME_OVER` above it).
+pub(crate) const TIMER_MAX_MS: u64 = 0x7fff_ffff;
+
+/// `(maximum value is ...)`, as most keywords word the overflow.
+pub(crate) const TIMER_LIMIT: &str = "(maximum value is 2147483647 ms or ~24.8 days)";
+
+/// A delay in milliseconds, refusing one over [`TIMER_MAX_MS`] with the generic text
+/// `timer overflow in argument '<arg>' to '<keyword>' (maximum value is ...)`.
 pub(crate) fn parse_timeout(token: &Token, keyword: &str) -> Result<Duration, ConfigError> {
+    parse_timer(token, keyword, |arg| format!("timer overflow in argument '{arg}' to '{keyword}' {TIMER_LIMIT}"))
+}
+
+/// [`parse_timeout`] with the keyword's own overflow text (`overflow(arg)`): the server
+/// keywords, `stick-table expire`, `inspect-delay`... word it differently.
+pub(crate) fn parse_timer(token: &Token, keyword: &str, overflow: impl FnOnce(&str) -> String) -> Result<Duration, ConfigError> {
     let s = &token.text;
     let (num_str, factor) = if let Some(stripped) = s.strip_suffix("ms") {
         (stripped, 1u64)
@@ -19,15 +34,29 @@ pub(crate) fn parse_timeout(token: &Token, keyword: &str) -> Result<Duration, Co
         (s.as_str(), 1u64)
     };
 
-    let ms: u64 = num_str.parse().map_err(|_| {
-        ConfigError::new(
-            token.line,
-            token.col,
-            format!("<{keyword}> expects an integer <time_in_ms> as argument."),
-        )
-    })?;
+    let all_digits = !num_str.is_empty() && num_str.bytes().all(|b| b.is_ascii_digit());
+    let ms = match num_str.parse::<u64>() {
+        Ok(n) => n.checked_mul(factor),
+        // Digits only, too many for 64 bits: an overflow too.
+        Err(_) if all_digits => None,
+        Err(_) => {
+            return Err(ConfigError::new(token.line, token.col, format!("<{keyword}> expects an integer <time_in_ms> as argument.")));
+        }
+    };
+    match ms.filter(|ms| *ms <= TIMER_MAX_MS) {
+        Some(ms) => Ok(Duration::from_millis(ms)),
+        None => Err(ConfigError::new(token.line, token.col, overflow(s))),
+    }
+}
 
-    Ok(Duration::from_millis(ms.saturating_mul(factor)))
+/// `tcp-request|tcp-response inspect-delay` in `<kind> '<name>'` (`proxy` or `defaults`).
+pub(crate) fn parse_inspect_delay(token: &Token, dir: &str, kind: &str, name: &str) -> Result<Duration, ConfigError> {
+    let kw = format!("tcp-{dir} inspect-delay");
+    parse_timer(token, &kw, |a| {
+        format!(
+            "'{kw}' expects a positive delay in milliseconds, in {kind} '{name}' (timer overflow in '{a}', maximum value is 2147483647 ms or ~24.8 days)"
+        )
+    })
 }
 
 pub(crate) fn parse_u32(token: &Token, keyword: &str) -> Result<u32, ConfigError> {

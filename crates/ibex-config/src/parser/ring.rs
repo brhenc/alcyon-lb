@@ -80,7 +80,10 @@ pub(crate) fn parse_ring_directive(ring: &mut RingSection, tokens: &[Token], kw:
                 let Some(t) = tokens.get(2).filter(|t| !t.text.is_empty()) else {
                     return Err(err(kw, format!("'timeout {}' expects <time> as argument.", which.unwrap_or(""))));
                 };
-                let d = parse_timeout(t, "timeout")?;
+                let w = which.unwrap_or_default();
+                let d = parse_timer(t, "timeout", |a| {
+                    format!("timer overflow in argument <{a}> to <timeout {w}>, maximum value is 2147483647 ms (~24.8 days).")
+                })?;
                 if which == Some("connect") {
                     ring.timeout_connect = d;
                 } else {
@@ -241,7 +244,9 @@ pub(crate) fn parse_log_forward_directive(
                 let Some(t) = tokens.get(2).filter(|t| !t.text.is_empty()) else {
                     return Err(err(kw, "'timeout client' expects <time> as argument."));
                 };
-                lf.timeout_client = Some(parse_timeout(t, "timeout client")?);
+                lf.timeout_client = Some(parse_timer(t, "timeout client", |a| {
+                    format!("timeout : timer overflow in argument '{a}' to 'timeout client' {TIMER_LIMIT}")
+                })?);
             } else {
                 return Err(err(kw, "'timeout' other than 'client' is not implemented in a log-forward section"));
             }

@@ -66,15 +66,15 @@ pub(crate) fn parse_server(
             "check" => check = true,
             "no-check" => check = false,
             "inter" => {
-                inter = Some(parse_timeout(server_kw_arg(tokens, i, who, "expects a delay as argument.")?, "inter")?);
+                inter = Some(parse_server_delay(server_kw_arg(tokens, i, who, "expects a delay as argument.")?, "inter", who)?);
                 i += 1;
             }
             "fastinter" => {
-                fastinter = Some(parse_timeout(server_kw_arg(tokens, i, who, "expects a delay as argument.")?, "fastinter")?);
+                fastinter = Some(parse_server_delay(server_kw_arg(tokens, i, who, "expects a delay as argument.")?, "fastinter", who)?);
                 i += 1;
             }
             "downinter" => {
-                downinter = Some(parse_timeout(server_kw_arg(tokens, i, who, "expects a delay as argument.")?, "downinter")?);
+                downinter = Some(parse_server_delay(server_kw_arg(tokens, i, who, "expects a delay as argument.")?, "downinter", who)?);
                 i += 1;
             }
             "fall" => {
@@ -545,15 +545,15 @@ pub(crate) fn parse_default_server(
             "check" => cfg.check = true,
             "no-check" => cfg.check = false,
             "inter" => {
-                cfg.inter = Some(parse_timeout(server_kw_arg(tokens, i, None, "expects a delay as argument.")?, "inter")?);
+                cfg.inter = Some(parse_server_delay(server_kw_arg(tokens, i, None, "expects a delay as argument.")?, "inter", None)?);
                 i += 1;
             }
             "fastinter" => {
-                cfg.fastinter = Some(parse_timeout(server_kw_arg(tokens, i, None, "expects a delay as argument.")?, "fastinter")?);
+                cfg.fastinter = Some(parse_server_delay(server_kw_arg(tokens, i, None, "expects a delay as argument.")?, "fastinter", None)?);
                 i += 1;
             }
             "downinter" => {
-                cfg.downinter = Some(parse_timeout(server_kw_arg(tokens, i, None, "expects a delay as argument.")?, "downinter")?);
+                cfg.downinter = Some(parse_server_delay(server_kw_arg(tokens, i, None, "expects a delay as argument.")?, "downinter", None)?);
                 i += 1;
             }
             "fall" => {

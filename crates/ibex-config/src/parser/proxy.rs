@@ -433,7 +433,7 @@ pub(crate) fn parse_listen_directive(
                             "<tcp-response inspect-delay> expects delay timeout",
                         ));
                     }
-                    proxy.tcp_res_inspect_delay = Some(parse_timeout(&tokens[2], "tcp-response inspect-delay")?);
+                    proxy.tcp_res_inspect_delay = Some(parse_inspect_delay(&tokens[2], "response", "proxy", &proxy.name)?);
                     Ok(())
                 }
                 "content" => parse_tcp_res_content(&mut proxy.tcp_res_content_rules, tokens, kw),
@@ -689,7 +689,7 @@ pub(crate) fn parse_backend_directive(
                             "<tcp-response inspect-delay> expects delay timeout",
                         ));
                     }
-                    be.tcp_res_inspect_delay = Some(parse_timeout(&tokens[2], "tcp-response inspect-delay")?);
+                    be.tcp_res_inspect_delay = Some(parse_inspect_delay(&tokens[2], "response", "proxy", &be.name)?);
                     Ok(())
                 }
                 "content" => parse_tcp_res_content(&mut be.tcp_res_content_rules, tokens, kw),

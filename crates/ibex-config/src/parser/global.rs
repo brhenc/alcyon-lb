@@ -48,7 +48,10 @@ pub(crate) fn parse_global_directive(
             if tokens.len() >= 2 && tokens[1].text == "timeout" {
                 let empty = Token { text: String::new(), ..tokens[1].clone() };
                 let tok = tokens.get(2).unwrap_or(&empty);
-                let d = parse_timeout(tok, "stats timeout").map_err(|_| {
+                let d = parse_timeout(tok, "stats timeout").map_err(|e| {
+                    if e.message.starts_with("timer overflow") {
+                        return e;
+                    }
                     let bad = tok.text.chars().find(|c| !c.is_ascii_digit()).map_or(String::new(), String::from);
                     ConfigError::new(tok.line, tok.col, format!("'stats timeout' : unexpected character '{bad}'"))
                 })?;

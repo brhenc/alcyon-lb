@@ -558,7 +558,7 @@ pub(crate) fn parse_listen_tcp_request(
                     "<tcp-request inspect-delay> expects delay timeout",
                 ));
             }
-            listen.tcp_req_inspect_delay = Some(parse_timeout(&tokens[2], "tcp-request inspect-delay")?);
+            listen.tcp_req_inspect_delay = Some(parse_inspect_delay(&tokens[2], "request", "proxy", &listen.name)?);
             Ok(())
         }
         "connection" => parse_tcp_req_connection(&mut listen.tcp_req_conn_rules, tokens, kw),
@@ -593,7 +593,7 @@ pub(crate) fn parse_frontend_tcp_request(
                     "<tcp-request inspect-delay> expects delay timeout",
                 ));
             }
-            fe.tcp_req_inspect_delay = Some(parse_timeout(&tokens[2], "tcp-request inspect-delay")?);
+            fe.tcp_req_inspect_delay = Some(parse_inspect_delay(&tokens[2], "request", "proxy", &fe.name)?);
             Ok(())
         }
         "connection" => parse_tcp_req_connection(&mut fe.tcp_req_conn_rules, tokens, kw),
@@ -628,7 +628,7 @@ pub(crate) fn parse_backend_tcp_request(
                     "<tcp-request inspect-delay> expects delay timeout",
                 ));
             }
-            be.tcp_req_inspect_delay = Some(parse_timeout(&tokens[2], "tcp-request inspect-delay")?);
+            be.tcp_req_inspect_delay = Some(parse_inspect_delay(&tokens[2], "request", "proxy", &be.name)?);
             Ok(())
         }
         "content" => parse_tcp_req_content(&mut be.tcp_req_content_rules, tokens, kw),

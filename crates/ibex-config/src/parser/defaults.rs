@@ -72,7 +72,7 @@ pub(crate) fn parse_defaults_directive(
                             "<tcp-request inspect-delay> expects delay timeout",
                         ));
                     }
-                    defaults.tcp_req_inspect_delay = Some(parse_timeout(&tokens[2], "tcp-request inspect-delay")?);
+                    defaults.tcp_req_inspect_delay = Some(parse_inspect_delay(&tokens[2], "request", "defaults", defaults.name.as_deref().unwrap_or_default())?);
                     Ok(())
                 }
                 sub @ ("connection" | "session" | "content") if defaults.name.is_none() => Err(ConfigError::new(
@@ -107,7 +107,7 @@ pub(crate) fn parse_defaults_directive(
                             "<tcp-response inspect-delay> expects delay timeout",
                         ));
                     }
-                    defaults.tcp_res_inspect_delay = Some(parse_timeout(&tokens[2], "tcp-response inspect-delay")?);
+                    defaults.tcp_res_inspect_delay = Some(parse_inspect_delay(&tokens[2], "response", "defaults", defaults.name.as_deref().unwrap_or_default())?);
                     Ok(())
                 }
                 "content" if defaults.name.is_none() => Err(ConfigError::new(

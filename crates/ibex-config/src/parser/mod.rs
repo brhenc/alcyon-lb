@@ -1102,7 +1102,7 @@ pub(crate) fn parse_timeout_directive(
         ));
     }
     let target = &tokens[1].text;
-    let dur = parse_timeout(&tokens[2], "timeout")?;
+    let dur = parse_timer(&tokens[2], "timeout", |a| format!("timer overflow in argument '{a}' to 'timeout {target}' {TIMER_LIMIT}"))?;
     match target.as_str() {
         "connect" => timeouts.connect = Some(dur),
         "client" => timeouts.client = Some(dur),

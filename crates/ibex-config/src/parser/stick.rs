@@ -31,7 +31,9 @@ pub(crate) fn parse_stick_table(
             "expire" => {
                 i += 1;
                 if i < tokens.len() {
-                    expire = parse_timeout(&tokens[i], "expire")?;
+                    expire = parse_timer(&tokens[i], "expire", |a| {
+                        format!("stick-table: timer overflow in argument <{a}> to <expire>, maximum value is 2147483647 ms (~24.8 days).")
+                    })?;
                 }
             }
             "store" => {
