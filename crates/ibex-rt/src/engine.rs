@@ -8333,7 +8333,9 @@ impl EngineDispatcher<'_> {
     fn apply_http_response_rules(entry: &mut SessionEntry, proxies: &[Proxy], now: Tick) {
         let threshold = entry.sess.bufsize.saturating_sub(entry.sess.maxrewrite);
         let Some((hdr_len, eoh_len)) = crate::proxy::find_eoh(entry.sess.rep.readable()) else {
-            if entry.sess.rep.readable().len() > threshold {
+            // No end of head and no room for more: as for a request, from `bufsize - 56`
+            // (T265).
+            if entry.sess.rep.readable().len() > threshold || entry.sess.rep.readable().len() + 56 >= entry.sess.bufsize {
                 entry.sess.rep.clear();
                 reply_error(entry, proxies, 502);
             }
@@ -8351,7 +8353,9 @@ impl EngineDispatcher<'_> {
             let framing = crate::txn::response_framing(&head, entry.sess.req_method.as_deref(), status);
             (status, framing, crate::txn::head_wants_close(&head), head.starts_with("HTTP/1.1"))
         };
-        if total_hdr_len > threshold || status < 100 {
+        // The head counts what its HTX holds (T265): the data, 40 bytes and 8 per block, not the
+        // wire length.
+        if crate::txn::htx_response_head_cost(&entry.sess.rep.readable()[..total_hdr_len]) > threshold || status < 100 {
             entry.sess.rep.clear();
             // A response that is not HTTP: `PH`, and nothing of it counts as sent.
             entry.sess.log.term.get_or_insert(*b"PH");

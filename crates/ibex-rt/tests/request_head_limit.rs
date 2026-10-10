@@ -59,3 +59,57 @@ fn repeated_headers_leave_the_same_room_as_haproxy() {
         );
     }
 }
+
+/// A server answering with `repeated` `name` headers and an `X-a` header of `n` bytes.
+fn response_status(name: &'static str, repeated: usize, n: usize) -> String {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let srv = l.local_addr().expect("addr");
+    std::thread::spawn(move || {
+        if let Ok((mut c, _)) = l.accept() {
+            let mut b = [0u8; 4096];
+            let _ = c.read(&mut b);
+            let rep: String = (0..repeated).map(|i| format!("{name}: for=10.0.0.{i}\r\n")).collect();
+            let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n{rep}X-a: {}\r\n\r\nok", "a".repeat(n));
+        }
+    });
+    let fe = common::reserve_addr();
+    let mut f = tempfile::NamedTempFile::new().expect("tmp");
+    write!(
+        f,
+        "global\n  tune.maxrewrite 0\ndefaults\n  mode http\n  timeout client 5s\n  timeout connect 1s\n  timeout server 2s\n\
+         frontend f\n  bind {fe}\n  default_backend b\nbackend b\n  server s {srv}\n"
+    )
+    .expect("cfg");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(f.path()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn");
+    assert!(common::wait_listening(fe));
+    let mut s = TcpStream::connect(fe).expect("connect");
+    s.set_read_timeout(Some(std::time::Duration::from_secs(5))).expect("timeout");
+    write!(s, "GET / HTTP/1.1\r\nHost: x\r\n\r\n").expect("send");
+    let mut out = [0u8; 64];
+    let got = s.read(&mut out).unwrap_or(0);
+    common::stop(&mut child);
+    String::from_utf8_lossy(&out[..got]).lines().next().unwrap_or("").to_string()
+}
+
+/// The response head: measured the same way on the same binary (the server's head carries
+/// `Content-Length: 2`, then the repeated headers, then `X-a`), one byte more is a 502.
+#[test]
+fn response_head_limit_is_haproxys() {
+    for (name, repeated, largest) in [
+        ("Forwarded", 0, 16260),
+        ("Forwarded", 1, 16231),
+        ("Forwarded", 2, 16202),
+        ("Forwarded", 3, 16173),
+        ("Forwarded", 6, 16086),
+        ("X-b", 2, 16214),
+        ("X-b", 3, 16191),
+    ] {
+        assert_eq!(response_status(name, repeated, largest), "HTTP/1.1 200 OK", "{repeated} x {name}, {largest} bytes");
+        assert_eq!(
+            response_status(name, repeated, largest + 1),
+            "HTTP/1.1 502 Bad Gateway",
+            "{repeated} x {name}, {} bytes",
+            largest + 1
+        );
+    }
+}
