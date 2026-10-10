@@ -31,6 +31,11 @@ use crate::cli_listener::CliStream;
 use std::sync::Arc;
 use std::time::Instant;
 
+/// The largest payload a CLI command takes (`tune.cli.max-payload-size`, 128 kB by
+/// default, which Ibex does not let the configuration change): measured on `HAProxy
+/// 3.5-dev8-885761-29`, 131070 bytes of lines with their LFs pass and 131071 are refused.
+const CLI_MAX_PAYLOAD: usize = 131_070;
+
 /// Runtime context passed to CLI applet command handlers.
 pub struct AppletContext<'a> {
     pub proxies: &'a mut crate::engine::Proxies,
@@ -349,6 +354,16 @@ impl CliApplet {
                 } else {
                     body.push_str(line);
                     body.push('\n');
+                    if body.len() > CLI_MAX_PAYLOAD {
+                        // Refused whole, and the connection closed, in `prompt` mode too.
+                        self.payload = None;
+                        self.in_buf.clear();
+                        self.out_buf.extend_from_slice(
+                            b"The payload is too big. Please change 'tune.cli.max-payload-size' in the configuration to use a bigger payload.\n",
+                        );
+                        self.is_done = true;
+                        return;
+                    }
                     continue;
                 }
             } else {

@@ -9,15 +9,18 @@
 //! One process-wide registry holds them, so a change made on the stats socket by one thread
 //! is what every worker thread matches against on its next request:
 //!
-//! * a map file's entries live here and are published to the converters' table cache
-//!   ([`crate::registry::publish_map_table`]) on every change;
-//! * an ACL file's entries are read by [`Matcher::File`], which rebuilds its compiled
-//!   patterns when the reference's version moves.
+//! * a map file's entries live here, indexed for each way a converter matches them
+//!   ([`PatTable`]), and [`crate::registry::match_map`] reads them in place;
+//! * an ACL file's patterns are compiled once per `(method, -i)` in the same table and read
+//!   by [`Matcher::File`].
+//!
+//! A change on the CLI changes one entry and its indexes, never the whole file (T251).
 //!
 //! The CLI answers are those measured on `HAProxy 3.5-dev8-885761-29` (see
 //! `tests/ops_patref_cli.rs`).
 
 use crate::matcher::Matcher;
+use crate::pattable::PatTable;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -66,10 +69,8 @@ pub struct PatRef {
     /// Modification time and size of the file when it was read.
     stamp: Mutex<Option<(Option<std::time::SystemTime>, u64)>>,
     map_keys: Mutex<MapKeys>,
-    /// The `(method, case-insensitive)` of every ACL expression reading this file, so that
-    /// an entry no reader could compile is refused at `add acl`.
-    readers: Mutex<Vec<(String, bool)>>,
-    entries: RwLock<Vec<PatEntry>>,
+    /// The entries, their indexes, and the patterns compiled for every ACL reader.
+    entries: RwLock<PatTable>,
     version: AtomicU64,
 }
 
@@ -89,6 +90,14 @@ fn write<T>(l: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
 
 static REFS: Mutex<Vec<Arc<PatRef>>> = Mutex::new(Vec::new());
 static NEXT_ENTRY: AtomicU64 = AtomicU64::new(0x5581_0000);
+
+fn table_of(pairs: Vec<(String, String)>) -> PatTable {
+    let mut t = PatTable::new();
+    for (key, val) in pairs {
+        t.insert(next_entry_id(), &key, &val);
+    }
+    t
+}
 
 fn next_entry_id() -> u64 {
     NEXT_ENTRY.fetch_add(0x40, Ordering::Relaxed)
@@ -110,7 +119,6 @@ fn parse_lines(content: &str) -> Vec<(String, String)> {
 
 impl PatRef {
     fn new(id: usize, kind: RefKind, file: &str, pairs: Vec<(String, String)>) -> Self {
-        let entries = pairs.into_iter().map(|(key, val)| PatEntry { id: next_entry_id(), key, val }).collect();
         Self {
             id,
             kind,
@@ -118,8 +126,7 @@ impl PatRef {
             users: Mutex::new(Vec::new()),
             stamp: Mutex::new(None),
             map_keys: Mutex::new(MapKeys::Str),
-            readers: Mutex::new(Vec::new()),
-            entries: RwLock::new(entries),
+            entries: RwLock::new(table_of(pairs)),
             version: AtomicU64::new(1),
         }
     }
@@ -133,7 +140,12 @@ impl PatRef {
     /// A copy of the entries, in the order they were added.
     #[must_use]
     pub fn entries(&self) -> Vec<PatEntry> {
-        read(&self.entries).clone()
+        read(&self.entries).iter().map(|(id, e)| PatEntry { id, key: e.key.to_string(), val: e.val.to_string() }).collect()
+    }
+
+    /// The entries and their indexes, for a lookup.
+    pub fn table(&self) -> std::sync::RwLockReadGuard<'_, PatTable> {
+        read(&self.entries)
     }
 
     /// Records a reader of this file: what `show` says it is "used by".
@@ -146,9 +158,6 @@ impl PatRef {
 
     fn changed(&self) {
         self.version.fetch_add(1, Ordering::AcqRel);
-        if self.kind == RefKind::Map {
-            crate::registry::publish_map_table(&self.file, &self.entries());
-        }
     }
 
     fn writable(&self) -> Result<(), String> {
@@ -181,9 +190,9 @@ impl PatRef {
                     .map_err(|e| format!("regex '{key}' is invalid (error={e}).")),
             },
             RefKind::Acl => {
-                let readers = lock(&self.readers).clone();
+                let readers = read(&self.entries).reader_methods();
                 for (method, ci) in readers {
-                    Matcher::compile_with_flags(&method, key, ci).map_err(|e| format!("{e}"))?;
+                    Matcher::compile_with_flags(&method, key, ci)?;
                 }
                 Ok(())
             }
@@ -192,17 +201,9 @@ impl PatRef {
 
     fn add(&self, key: &str, val: &str) -> Result<(), String> {
         self.check_key(key)?;
-        write(&self.entries).push(PatEntry { id: next_entry_id(), key: key.to_string(), val: val.to_string() });
+        write(&self.entries).insert(next_entry_id(), key, val);
         self.changed();
         Ok(())
-    }
-
-    /// Entries whose key is `key`, or whose id is `#<hex id>`.
-    fn matches(e: &PatEntry, key: &str) -> bool {
-        key.strip_prefix('#').map_or_else(
-            || e.key == key,
-            |id| u64::from_str_radix(id.trim_start_matches("0x"), 16).is_ok_and(|n| n == e.id),
-        )
     }
 }
 
@@ -220,7 +221,12 @@ pub fn acl_file(path: &str) -> Result<Arc<PatRef>, String> {
         let stale = *lock(&r.stamp) != Some(stamp);
         if stale && r.version() == 1 {
             let pairs = read_acl_file(path).ok_or_else(failed)?;
-            *write(&r.entries) = pairs.into_iter().map(|(key, val)| PatEntry { id: next_entry_id(), key, val }).collect();
+            let mut t = write(&r.entries);
+            t.clear();
+            for (key, val) in pairs {
+                t.insert(next_entry_id(), &key, &val);
+            }
+            drop(t);
             *lock(&r.stamp) = Some(stamp);
         }
         return Ok(Arc::clone(r));
@@ -451,11 +457,14 @@ fn run(verb: &str, kind: RefKind, args: &[&str], payload: Option<&str>) -> Resul
                 return Err("'set map' expects three parameters: map identifier, key and value.".to_string());
             }
             let r = find(kind, args[0])?;
-            let mut hit = false;
-            for entry in write(&r.entries).iter_mut().filter(|e| PatRef::matches(e, args[1])) {
-                entry.val = args[2].to_string();
-                hit = true;
-            }
+            let hit = {
+                let mut t = write(&r.entries);
+                let ids = t.ids(args[1]);
+                for id in &ids {
+                    t.set_val(*id, args[2]);
+                }
+                !ids.is_empty()
+            };
             if !hit {
                 return Err(if args[1].starts_with('#') { "key or pattern not found." } else { "entry not found." }.to_string());
             }
@@ -473,10 +482,8 @@ fn run(verb: &str, kind: RefKind, args: &[&str], payload: Option<&str>) -> Resul
             r.writable()?;
             let by_ref = args[1].starts_with('#');
             let removed = {
-                let mut e = write(&r.entries);
-                let before = e.len();
-                e.retain(|x| !PatRef::matches(x, args[1]));
-                before - e.len()
+                let mut t = write(&r.entries);
+                t.ids(args[1]).into_iter().filter(|id| t.remove(*id)).count()
             };
             if removed == 0 && by_ref {
                 return Err("Key not found.".to_string());
@@ -488,56 +495,27 @@ fn run(verb: &str, kind: RefKind, args: &[&str], payload: Option<&str>) -> Resul
     }
 }
 
-/// An ACL's `-f` file as a matcher: the patterns of the file, compiled with the ACL's
-/// method, and compiled again when the CLI changes the file.
+/// An ACL's `-f` file as a matcher: the patterns of the file, compiled once per method in
+/// the file's table and kept up to date entry by entry when the CLI changes the file.
 #[derive(Debug)]
 pub struct FileMatcher {
     pat: Arc<PatRef>,
-    method: String,
-    case_insensitive: bool,
-    compiled: RwLock<(u64, Vec<Matcher>)>,
+    /// The reader's index in the table.
+    reader: usize,
 }
 
 impl FileMatcher {
     /// # Errors
     /// A pattern of the file does not compile with `method`.
     pub fn new(pat: Arc<PatRef>, method: &str, case_insensitive: bool) -> Result<Self, String> {
-        {
-            let mut r = lock(&pat.readers);
-            if !r.iter().any(|(m, c)| m == method && *c == case_insensitive) {
-                r.push((method.to_string(), case_insensitive));
-            }
-        }
-        let version = pat.version();
-        let mut list = Vec::new();
-        for e in pat.entries() {
-            list.push(Matcher::compile_with_flags(method, &e.key, case_insensitive)?);
-        }
-        Ok(Self { pat, method: method.to_string(), case_insensitive, compiled: RwLock::new((version, list)) })
+        let reader = write(&pat.entries).reader(method, case_insensitive)?;
+        Ok(Self { pat, reader })
     }
 
     /// Whether any pattern of the file matches `sample`, as the file is now.
     #[must_use]
     pub fn matches(&self, sample: &crate::sample::Sample) -> bool {
-        let version = self.pat.version();
-        {
-            let c = read(&self.compiled);
-            if c.0 == version {
-                return c.1.iter().any(|m| m.matches(sample));
-            }
-        }
-        let list: Vec<Matcher> = self
-            .pat
-            .entries()
-            .iter()
-            .filter_map(|e| Matcher::compile_with_flags(&self.method, &e.key, self.case_insensitive).ok())
-            .collect();
-        let hit = list.iter().any(|m| m.matches(sample));
-        let mut c = write(&self.compiled);
-        if c.0 < version {
-            *c = (version, list);
-        }
-        hit
+        read(&self.pat.entries).compiled(self.reader).any(|m| m.matches(sample))
     }
 
     /// Whether the file has no pattern now.
@@ -549,13 +527,13 @@ impl FileMatcher {
     /// The shortest pattern (for payload waiting decisions).
     #[must_use]
     pub fn min_pattern_len(&self) -> usize {
-        read(&self.compiled).1.iter().map(Matcher::min_pattern_len).min().unwrap_or(1)
+        read(&self.pat.entries).compiled(self.reader).map(Matcher::min_pattern_len).min().unwrap_or(1)
     }
 
     /// Whether a miss may become a hit with more payload.
     #[must_use]
     pub fn may_match_later(&self, ends_with_newline: bool) -> bool {
-        read(&self.compiled).1.iter().any(|m| m.may_match_later(ends_with_newline))
+        read(&self.pat.entries).compiled(self.reader).any(|m| m.may_match_later(ends_with_newline))
     }
 }
 

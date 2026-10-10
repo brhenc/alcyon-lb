@@ -98,8 +98,10 @@ fn map_match_type_longest_match() {
     let mut file_end = std::fs::File::create(path_end).unwrap();
     writeln!(file_end, "bar short\nobar long").unwrap();
 
+    // `map_end` walks the file in order and takes the first entry that matches, not the
+    // longest (HAProxy 3.5-dev8-885761-29 answers `short`, T251).
     let res_end = reg.eval("str", &["foobar".to_string()], &[("map_end", vec![path_end.to_string()])], &ctx);
-    assert_eq!(res_end, Some(Sample::Str("long".to_string())));
+    assert_eq!(res_end, Some(Sample::Str("short".to_string())));
 }
 
 #[test]
