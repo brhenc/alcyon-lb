@@ -6,7 +6,8 @@
 //! Before T238 a panicking worker unwound alone: the process served on without it, or, with
 //! one worker, exited 0 so that `Restart=on-failure` did not restart it. The reproducer was
 //! an `option ldap-check` backend answering `30` and closing, which indexed past the end of
-//! the reply (fixed since; the hook is tested on its own below).
+//! the reply: with the hook, ibex died of SIGABRT within one check interval. That panic is
+//! fixed (tests/check_malformed_replies.rs), so the hook is tested on its own below.
 //!
 //! (Plain `-W` is one process here, reloading in place: the hook aborts it, and the service
 //! manager sees SIGABRT.) Measured on `HAProxy` 3.5-dev8-885761-29 (2026-10-10), `-W -db`,
@@ -17,12 +18,16 @@
 //! [ALERT]    (M) : exit-on-failure: killing every processes with SIGTERM
 //! [WARNING]  (M) : All workers exited. Exiting... (134)
 //! ```
-//! and the master's exit status is 134 (139 for SIGSEGV).
+//! and the master's exit status is 134 (139 for SIGSEGV, 137 with `Killed` for SIGKILL).
+//!
+//! No test here makes a process die of SIGABRT: every such death is a crash report on the
+//! developer's desktop (systemd-coredump journals it even with `RLIMIT_CORE` 0). The master
+//! test kills its worker with SIGKILL, which dumps nothing and goes through the same path;
+//! the hook test runs its child with `LLVM_PROFILE_FILE` set, under which the hook exits
+//! 134 instead of aborting (see `crash::die`). The abort itself was checked by hand.
 
 mod common;
 
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
@@ -38,10 +43,6 @@ impl Drop for Ibex {
     }
 }
 
-/// Aborted, or, in a coverage-instrumented run (which must write its profile), exit 134.
-fn aborted(st: ExitStatus) -> bool {
-    st.signal() == Some(6) || st.code() == Some(134)
-}
 
 /// No core files: an aborting debug build would spend seconds writing one (and fill
 /// `coredumpctl`). Inherited by the processes this test starts.
@@ -75,15 +76,20 @@ fn a_panic_on_any_thread_aborts_the_process() {
         std::process::exit(0);
     }
     no_core_dumps();
+    // An instrumented run keeps its own profile path; otherwise any path will do, nothing
+    // is written to it.
+    let profile = std::env::var_os("LLVM_PROFILE_FILE").unwrap_or_else(|| "/tmp/ibex-t238-%p.profraw".into());
     let out = Command::new(std::env::current_exe().expect("exe"))
         .args(["--exact", "a_panic_on_any_thread_aborts_the_process", "--nocapture", "--test-threads=1"])
         .env(CHILD, "1")
+        .env("LLVM_PROFILE_FILE", profile)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .output()
         .expect("re-run this test");
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(aborted(out.status), "not aborted: {:?}\n{err}", out.status);
+    assert_eq!(out.status.code(), Some(134), "the process did not go down: {:?}\n{err}", out.status);
+    assert_eq!(out.status.signal(), None);
     assert!(err.contains("t238 deliberate panic"), "the standard panic message is kept:\n{err}");
     assert!(err.contains("[ALERT] ibex: a thread panicked"), "{err}");
 }
@@ -103,10 +109,10 @@ fn worker_of(master: u32) -> Option<u32> {
 }
 
 /// Under -W with a master CLI (-S) ibex runs a master process and a worker process, as
-/// `HAProxy` does; the master treats a worker that died of SIGABRT as `HAProxy`'s does: it stops
-/// everything and exits 134.
+/// `HAProxy` does; the master treats a worker killed by a signal as `HAProxy`'s does: it
+/// stops everything and exits 128 + the signal.
 #[test]
-fn master_exits_134_when_its_worker_aborts() {
+fn master_exits_when_its_worker_dies_of_a_signal() {
     let dir = tempfile::TempDir::new().expect("tmp");
     let front = common::reserve_addr();
     let cfg = format!(
@@ -146,57 +152,14 @@ fn master_exits_134_when_its_worker_aborts() {
     assert!(err.contains("Loading success."), "the worker never loaded:\n{err}");
     let worker = worker_of(ibex.0.id()).expect("the master has a worker");
     let pid = rustix::process::Pid::from_raw(i32::try_from(worker).unwrap()).unwrap();
-    rustix::process::kill_process(pid, rustix::process::Signal::Abort).expect("kill -ABRT");
+    rustix::process::kill_process(pid, rustix::process::Signal::Kill).expect("kill -KILL");
     let st = wait_exit(&mut ibex.0, Duration::from_secs(5)).expect("the master exits");
     while let Ok(l) = rx.recv_timeout(Duration::from_millis(500)) {
         err.push_str(&l);
         err.push('\n');
     }
-    assert_eq!(st.code(), Some(134), "{err}");
-    assert!(err.contains(&format!("Current worker ({worker}) exited with code 134 (Aborted)")), "{err}");
-    assert!(err.contains("All workers exited. Exiting... (134)"), "{err}");
-}
-
-/// The T238 reproducer, end to end: an LDAP server that answers `30` and closes.
-fn ldap_answers_30(mut s: TcpStream) {
-    s.set_read_timeout(Some(Duration::from_secs(1))).ok();
-    let mut b = [0u8; 256];
-    let _ = s.read(&mut b);
-    let _ = s.write_all(&[0x30]);
-}
-
-#[test]
-fn a_worker_panic_aborts_ibex() {
-    let backend = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let baddr = backend.local_addr().unwrap();
-    thread::spawn(move || {
-        for s in backend.incoming().flatten() {
-            thread::spawn(move || ldap_answers_30(s));
-        }
-    });
-    let dir = tempfile::TempDir::new().expect("tmp");
-    let front = common::reserve_addr();
-    let cfg = format!(
-        "global\n  nbthread 2\ndefaults\n  mode tcp\n  timeout connect 1s\n  timeout client 2s\n  timeout server 2s\n  \
-         timeout check 1s\nfrontend f\n  bind {front}\n  default_backend b\nbackend b\n  option ldap-check\n  \
-         server s {baddr} check inter 200ms\n"
-    );
-    let path = dir.path().join("ibex.cfg");
-    std::fs::write(&path, cfg).expect("write cfg");
-    no_core_dumps();
-    let child = Command::new(env!("CARGO_BIN_EXE_ibex"))
-        .arg("-f")
-        .arg(&path)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn ibex");
-    let mut ibex = Ibex(child);
-    let st = wait_exit(&mut ibex.0, Duration::from_secs(5));
-    let mut err = String::new();
-    if st.is_some() {
-        let _ = ibex.0.stderr.take().map(|mut e| e.read_to_string(&mut err));
-    }
-    let st = st.expect("ibex still running 5s after a worker panicked");
-    assert!(aborted(st), "not aborted: {st:?}\n{err}");
+    assert_eq!(st.code(), Some(137), "{err}");
+    assert!(err.contains(&format!("Current worker ({worker}) exited with code 137 (Killed)")), "{err}");
+    assert!(err.contains("exit-on-failure: killing every processes with SIGTERM"), "{err}");
+    assert!(err.contains("All workers exited. Exiting... (137)"), "{err}");
 }
