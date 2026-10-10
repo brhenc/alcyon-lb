@@ -75,14 +75,21 @@ fn propagate(proxies: &[Proxy], p: usize, s: usize) {
 /// For a tracker, the state is what the operator forced on it (`Up` for nothing), and the
 /// server's own is that combined with its target's.
 pub fn set_status(proxies: &[Proxy], p: usize, s: usize, st: ServerStatus) {
+    set_raw(proxies, p, s, st as u8);
+}
+
+/// [`set_status`] with a `Proxy::server_statuses` value, [`crate::check::DRAIN_DOWN`]
+/// included.
+pub fn set_raw(proxies: &[Proxy], p: usize, s: usize, raw: u8) {
     let status_of = || proxies.get(p).and_then(|px| px.server_statuses.get(s)).map_or(0, |a| a.load(Ordering::Relaxed));
     let before = status_of();
-    set_status_inner(proxies, p, s, st);
+    set_status_inner(proxies, p, s, raw);
     // `lastchg`, `downtime` and `chkdown` of `show stat` follow the server's state.
     let after = status_of();
     if before != after {
         let px = &proxies[p];
-        let (was_down, down) = (before == ServerStatus::Down as u8, after == ServerStatus::Down as u8);
+        let down_of = |v: u8| ServerStatus::from(v) == ServerStatus::Down;
+        let (was_down, down) = (down_of(before), down_of(after));
         let pc = px.txn_counters();
         if let Some(c) = pc.srv.get(s) {
             c.state_changed(was_down, down);
@@ -98,14 +105,15 @@ pub fn set_status(proxies: &[Proxy], p: usize, s: usize, st: ServerStatus) {
     }
 }
 
-fn set_status_inner(proxies: &[Proxy], p: usize, s: usize, st: ServerStatus) {
+fn set_status_inner(proxies: &[Proxy], p: usize, s: usize, raw: u8) {
     if let Some(tr) = track_of(proxies, p, s) {
+        let st = ServerStatus::from(raw);
         tr.own.store(st as u8, Ordering::Relaxed);
         let (tp, ts) = tr.target;
         let eff = combine(st, load(proxies, tp, ts));
         proxies[p].server_statuses[s].store(eff as u8, Ordering::Relaxed);
     } else if let Some(a) = proxies.get(p).and_then(|px| px.server_statuses.get(s)) {
-        a.store(st as u8, Ordering::Relaxed);
+        a.store(raw, Ordering::Relaxed);
     }
     propagate(proxies, p, s);
 }
@@ -182,4 +190,31 @@ pub fn inherited(proxy: &Proxy, s: usize) -> bool {
     let status = proxy.server_statuses.get(s).map_or(ServerStatus::Up, |a| ServerStatus::from(a.load(Ordering::Relaxed)));
     let own = ServerStatus::from(tr.own.load(Ordering::Relaxed));
     matches!(status, ServerStatus::Maint | ServerStatus::Drain) && own != status
+}
+
+/// The operator sets the admin state of server `s` of proxy `p` to `to` (`Up` for `ready`,
+/// `Drain` or `Maint`): `enable`/`disable server`, `set server state`, the stats page's
+/// admin form. It moves the admin state only: what the checks found (`cur_state`) is kept,
+/// so `ready` does not send traffic to a server they found dead (T274 E1).
+pub fn apply_admin(proxies: &[Proxy], checks: &mut [crate::check::ServerCheckState], p: usize, s: usize, to: ServerStatus) {
+    let check = checks.iter_mut().find(|c| c.proxy_idx == p && c.server_idx == s);
+    if track_of(proxies, p, s).is_some() {
+        set_status(proxies, p, s, to);
+    } else if let Some(c) = check {
+        c.set_admin_status(to);
+        set_raw(proxies, p, s, c.published());
+    } else if let Some(cur) = proxies.get(p).and_then(|px| px.server_statuses.get(s)) {
+        set_raw(proxies, p, s, crate::check::admin_transition(cur.load(Ordering::Relaxed), to));
+    }
+}
+
+/// `set server health up|down` on server `s` of proxy `p` (not a tracker: refused before):
+/// the operational state moves, the admin state stays.
+pub fn apply_health(proxies: &[Proxy], checks: &mut [crate::check::ServerCheckState], p: usize, s: usize, up: bool) {
+    if let Some(c) = checks.iter_mut().find(|c| c.proxy_idx == p && c.server_idx == s) {
+        c.set_health(up);
+        set_raw(proxies, p, s, c.published());
+    } else if let Some(cur) = proxies.get(p).and_then(|px| px.server_statuses.get(s)) {
+        set_raw(proxies, p, s, crate::check::health_transition(cur.load(Ordering::Relaxed), up));
+    }
 }

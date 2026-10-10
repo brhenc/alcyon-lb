@@ -562,7 +562,8 @@ impl CliApplet {
                 for (s_idx, s) in p.server_ids.iter().enumerate() {
                     let addr = p.servers.get(s_idx).map_or_else(|| "-".to_string(), |a| a.ip().to_string());
                     let port = p.servers.get(s_idx).map_or_else(|| "-".to_string(), |a| a.port().to_string());
-                    let status = p.server_statuses.get(s_idx).map(|s| ServerStatus::from(s.load(std::sync::atomic::Ordering::Relaxed)));
+                    let raw = p.server_statuses.get(s_idx).map(|s| s.load(std::sync::atomic::Ordering::Relaxed));
+                    let status = raw.map(ServerStatus::from);
                     // srv_op_state: 2 running, 0 stopped (a draining server still runs).
                     let op_state = match status {
                         Some(ServerStatus::Up | ServerStatus::Drain) => 2,
@@ -578,6 +579,8 @@ impl CliApplet {
                         Some(ServerStatus::Drain) if inherited => 16,
                         Some(ServerStatus::Maint) => 1,
                         Some(ServerStatus::Drain) => 8,
+                        // Drained, and found dead by its checks.
+                        _ if raw == Some(crate::check::DRAIN_DOWN) => 8,
                         _ => 0,
                     } | if p.server_cmaint(s_idx) { 4 } else { 0 };
                     let uweight = p.server_weights.get(s_idx).unwrap_or(1);
@@ -1458,19 +1461,12 @@ impl CliApplet {
                     if sid == sv_name {
                         track_changes.push((p_idx, s_idx, ServerStatus::Up));
                         found_sv = true;
-                        if let Some(check) = ctx
-                            .checks
-                            .iter_mut()
-                            .find(|c| c.proxy_idx == p_idx && c.server_idx == s_idx)
-                        {
-                            check.set_admin_status(ServerStatus::Up);
-                        }
                     }
                 }
             }
         }
         for (p_idx, s_idx, st) in track_changes {
-            crate::track::set_status(ctx.proxies, p_idx, s_idx, st);
+            crate::track::apply_admin(ctx.proxies, ctx.checks, p_idx, s_idx, st);
         }
         // `HAProxy` ends every answer, an empty one too, with an empty line.
         self.finish_msg(if !found_px {
@@ -1497,19 +1493,12 @@ impl CliApplet {
                     if sid == sv_name {
                         track_changes.push((p_idx, s_idx, ServerStatus::Maint));
                         found_sv = true;
-                        if let Some(check) = ctx
-                            .checks
-                            .iter_mut()
-                            .find(|c| c.proxy_idx == p_idx && c.server_idx == s_idx)
-                        {
-                            check.set_admin_status(ServerStatus::Maint);
-                        }
                     }
                 }
             }
         }
         for (p_idx, s_idx, st) in track_changes {
-            crate::track::set_status(ctx.proxies, p_idx, s_idx, st);
+            crate::track::apply_admin(ctx.proxies, ctx.checks, p_idx, s_idx, st);
         }
         // `HAProxy` ends every answer, an empty one too, with an empty line.
         self.finish_msg(if !found_px {
@@ -1626,10 +1615,7 @@ impl CliApplet {
                         return;
                     }
                 };
-                crate::track::set_status(ctx.proxies, p_idx, s_idx, status);
-                if let Some(check) = ctx.checks.iter_mut().find(|c| c.proxy_idx == p_idx && c.server_idx == s_idx) {
-                    check.set_admin_status(status);
-                }
+                crate::track::apply_admin(ctx.proxies, ctx.checks, p_idx, s_idx, status);
                 self.finish_msg("");
             }
             Some("weight") => self.apply_weight(ctx, loc, parts.get(2).copied()),
@@ -1652,21 +1638,9 @@ impl CliApplet {
                         return;
                     }
                 };
-                // The operator's maintenance or drain is a state of its own in `HAProxy` and is
-                // left as it is; Ibex has one state per server, so only a server that is up or
-                // down is moved.
-                let cur = ServerStatus::from(ctx.proxies[p_idx].server_statuses[s_idx].load(std::sync::atomic::Ordering::Relaxed));
-                let status = if up { ServerStatus::Up } else { ServerStatus::Down };
-                if matches!(cur, ServerStatus::Up | ServerStatus::Down) {
-                    crate::track::set_status(ctx.proxies, p_idx, s_idx, status);
-                }
-                // The counter a check keeps: fully healthy, or at zero.
-                if let Some(check) = ctx.checks.iter_mut().find(|c| c.proxy_idx == p_idx && c.server_idx == s_idx) {
-                    check.health = if up { check.config.rise + check.config.fall - 1 } else { 0 };
-                    if matches!(cur, ServerStatus::Up | ServerStatus::Down) {
-                        check.status = status;
-                    }
-                }
+                // The operator's maintenance or drain is kept: the operational state moves
+                // under it (`DRAIN` becomes `DOWN`, `MAINT` keeps only the counter).
+                crate::track::apply_health(ctx.proxies, ctx.checks, p_idx, s_idx, up);
                 self.finish_msg("");
             }
             Some("addr") => {

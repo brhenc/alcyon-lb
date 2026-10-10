@@ -629,7 +629,8 @@ fn write_server_row(
                 check_status,
                 check_code,
                 c.last_status_info.clone().unwrap_or_default(),
-                c.check_duration_ms,
+                // From the first completed check on (`HCHK_STATUS_CHECKED`), not while `INI`.
+                if c.last_status_code == "INI" { String::new() } else { c.check_duration_ms.to_string() },
             )
         } else {
             let s = proxy
@@ -646,7 +647,7 @@ fn write_server_row(
                 }
                 ServerStatus::Maint => "MAINT".to_string(),
             };
-            (s_str, 0, 0, String::new(), String::new(), String::new(), 0)
+            (s_str, 0, 0, String::new(), String::new(), String::new(), String::new())
         };
     let has_check = check_state.is_some();
 

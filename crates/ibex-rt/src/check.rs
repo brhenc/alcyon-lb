@@ -58,6 +58,42 @@ impl ServerStatus {
     }
 }
 
+/// The value of `Proxy::server_statuses` for a server the operator drains and the checks
+/// found dead: [`ServerStatus::from`] reads it as `Down` (it takes no traffic, `show stat`
+/// prints `DOWN`), and `show servers state` still prints the drain (`srv_admin_state` 8).
+/// `HAProxy` keeps the two apart as `srv->cur_admin` and `srv->cur_state`.
+pub const DRAIN_DOWN: u8 = 4;
+
+/// The state of a server that is `cur` (a `Proxy::server_statuses` value) once the operator
+/// sets its admin state to `to` (`Up` for `ready`, `Drain` or `Maint`), for a server with no
+/// check of its own: leaving maintenance starts it running, as `_srv_update_status_adm`
+/// does; otherwise a stopped server stays stopped and a running one stays running.
+#[must_use]
+pub fn admin_transition(cur: u8, to: ServerStatus) -> u8 {
+    let cur_st = ServerStatus::from(cur);
+    match to {
+        ServerStatus::Maint => ServerStatus::Maint as u8,
+        _ if cur_st == ServerStatus::Maint => to as u8,
+        ServerStatus::Drain if cur_st == ServerStatus::Down => DRAIN_DOWN,
+        _ if cur_st == ServerStatus::Down => ServerStatus::Down as u8,
+        _ => to as u8,
+    }
+}
+
+/// The state of a server that is `cur` once `set server health up|down` moves its
+/// operational state: maintenance is kept, a drain is kept.
+#[must_use]
+pub fn health_transition(cur: u8, up: bool) -> u8 {
+    let drain = cur == DRAIN_DOWN || cur == ServerStatus::Drain as u8;
+    match ServerStatus::from(cur) {
+        ServerStatus::Maint => cur,
+        _ if up && drain => ServerStatus::Drain as u8,
+        _ if up => ServerStatus::Up as u8,
+        _ if drain => DRAIN_DOWN,
+        _ => ServerStatus::Down as u8,
+    }
+}
+
 impl From<u8> for ServerStatus {
     fn from(v: u8) -> Self {
         match v {
@@ -169,7 +205,11 @@ pub struct ServerCheckState {
     pub server_idx: usize,
     pub addr: SocketAddr,
     pub config: ServerCheckConfig,
+    /// What the server is: the operator's admin state combined with the checks' verdict.
+    /// `Down` under a drain is the server the checks found dead ([`Self::published`]).
     pub status: ServerStatus,
+    /// The operator's admin state alone (`cur_admin`): `Up` for ready, `Drain` or `Maint`.
+    pub admin: ServerStatus,
     pub enabled: bool,
     /// Consecutive successes and failures, kept for the stats page's "pass N"/"fails N".
     pub rise_count: u32,
@@ -248,6 +288,7 @@ impl ServerCheckState {
             addr,
             config,
             status: ServerStatus::Up,
+            admin: ServerStatus::Up,
             enabled: true,
             rise_count: 0,
             fall_count: 0,
@@ -344,7 +385,7 @@ impl ServerCheckState {
         if self.health >= self.config.rise {
             self.health = self.full_health();
             if self.status == ServerStatus::Down {
-                self.status = ServerStatus::Up;
+                self.status = self.running();
                 return Some(CheckEvent::WentUp);
             }
         }
@@ -375,7 +416,7 @@ impl ServerCheckState {
         if self.health == 0 {
             // `check_notify_failure`: a running server whose counter is already at zero (a
             // new one) goes down on its first failure.
-            if self.status == ServerStatus::Up {
+            if matches!(self.status, ServerStatus::Up | ServerStatus::Drain) {
                 self.status = ServerStatus::Down;
                 self.down_transitions += 1;
                 return Some(CheckEvent::WentDown);
@@ -389,7 +430,7 @@ impl ServerCheckState {
         self.health -= 1;
         if self.health < self.config.rise {
             self.health = 0;
-            if self.status == ServerStatus::Up {
+            if matches!(self.status, ServerStatus::Up | ServerStatus::Drain) {
                 self.status = ServerStatus::Down;
                 self.down_transitions += 1;
                 return Some(CheckEvent::WentDown);
@@ -398,16 +439,48 @@ impl ServerCheckState {
         Some(CheckEvent::Failed)
     }
 
+    /// The running state under the operator's admin state: `Drain` or `Up`.
+    const fn running(&self) -> ServerStatus {
+        if matches!(self.admin, ServerStatus::Drain) { ServerStatus::Drain } else { ServerStatus::Up }
+    }
+
     /// An operator's `disable server`, `enable server` or `set server state`: entering
-    /// maintenance zeroes the counter, leaving it restores `rise` -- "start OK but check
-    /// immediately" (`_srv_update_status_adm`, `src/server.c`).
+    /// maintenance zeroes the counter, leaving it restores `rise` and starts the server
+    /// running (`_srv_update_status_adm`, `src/server.c`). `ready` and `drain` otherwise move
+    /// the admin state only: a server the checks found dead stays down (measured).
     pub fn set_admin_status(&mut self, to: ServerStatus) {
-        if to == ServerStatus::Maint && self.status != ServerStatus::Maint {
-            self.health = 0;
-        } else if to != ServerStatus::Maint && self.status == ServerStatus::Maint {
+        self.admin = to;
+        if to == ServerStatus::Maint {
+            if self.status != ServerStatus::Maint {
+                self.health = 0;
+            }
+            self.status = ServerStatus::Maint;
+        } else if self.status == ServerStatus::Maint {
             self.health = self.config.rise;
+            self.status = self.running();
+        } else if self.status != ServerStatus::Down {
+            self.status = self.running();
         }
-        self.status = to;
+    }
+
+    /// `set server health up|down`: the counter goes to full health or zero, and the
+    /// operational state follows unless the server is in maintenance (measured: `MAINT`
+    /// stays, the counter moves).
+    pub fn set_health(&mut self, up: bool) {
+        self.health = if up { self.full_health() } else { 0 };
+        if self.status != ServerStatus::Maint {
+            self.status = if up { self.running() } else { ServerStatus::Down };
+        }
+    }
+
+    /// The value published in `Proxy::server_statuses`: the status, or [`DRAIN_DOWN`].
+    #[must_use]
+    pub fn published(&self) -> u8 {
+        if self.status == ServerStatus::Down && self.admin == ServerStatus::Drain {
+            DRAIN_DOWN
+        } else {
+            self.status as u8
+        }
     }
 
     /// The `status` column of `show stat` (`stats_fill_sv_computestate`): `UP`, or `UP n/fall`
