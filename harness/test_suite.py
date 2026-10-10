@@ -82,3 +82,47 @@ test sixty ... FAILED
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class KnownFlaky(unittest.TestCase):
+    """A test in `known_flaky` that fails alone in some runs, not all, is the flake its entry
+    excuses, not a new failure; one that fails every alone run is."""
+
+    def run_main(self, bad_runs: int, flaky_key: str, failures: dict | None = None):
+        import io
+        import json
+        import tempfile
+        from contextlib import redirect_stdout
+        from unittest import mock
+        base = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+        json.dump({"known_failures": failures or {}, "known_flaky": {flaky_key: "a reason"}}, base)
+        base.close()
+        job = ("ibex-rt", "lib", "proxy::tests::t", ["/fake/bin", "--exact", "proxy::tests::t"], "/", None)
+
+        def confirm(cmd, runs, cwd=None, env=None, test=None):
+            n = min(runs, bad_runs)
+            confirm.left = getattr(confirm, "left", bad_runs)
+            return ({test} if n else set()), n
+        out = io.StringIO()
+        with mock.patch.object(suite, "BASELINE", base.name), \
+                mock.patch.object(suite, "instrument", return_value=None), \
+                mock.patch.object(suite, "run_parallel", return_value=([job], {"lib": {"proxy::tests::t"}}, 10, 1)), \
+                mock.patch.object(suite, "confirm_cmd", side_effect=confirm), \
+                mock.patch.dict(os.environ, {"SUITE_SERIAL": "0"}), redirect_stdout(out):
+            rc = suite.main()
+        os.unlink(base.name)
+        return rc, out.getvalue()
+
+    def test_failing_alone_1_of_3_is_the_excused_flake(self):
+        rc, out = self.run_main(1, "ibex-rt/lib::proxy::tests::t")
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("NEW FAILURES", out)
+
+    def test_failing_alone_3_of_3_is_new(self):
+        rc, out = self.run_main(3, "ibex-rt/lib::proxy::tests::t")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("NEW FAILURES", out)
+
+    def test_another_tests_flaky_entry_excuses_nothing(self):
+        rc, out = self.run_main(1, "ibex-rt/lib::proxy::tests::other")
+        self.assertEqual(rc, 1, out)

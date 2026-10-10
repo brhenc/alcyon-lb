@@ -482,6 +482,14 @@ def main() -> int:
     doc = json.load(open(BASELINE)) if os.path.exists(BASELINE) else {}
     base = doc.get("known_failures", {})
     base_flaky = doc.get("known_flaky", {})
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import layout  # noqa: E402
+        for k in sorted({**base, **base_flaky}):
+            if layout.resolve_key(k) is None:
+                print(f"suite: baseline entry names no test in the sources: {k}")
+    except Exception as e:  # informational; harness/test_layout.py fails on these
+        print(f"suite: could not check the baseline's names: {e}")
 
     if os.environ.get("SUITE_SERIAL") == "1":
         print("suite: running every test target in the workspace (serial)")
@@ -527,13 +535,24 @@ def main() -> int:
             still |= more
             bad_runs += more_bad
             runs = ALONE_RUNS
+        # A test whose `known_flaky` entry excuses it and that failed in some alone runs but
+        # not all is that flake (the lib proxy test fails alone 1 run in 3 under load); one
+        # that fails every alone run is a failure like any other.
+        excused: set[str] = set()
+        if 0 < bad_runs < runs:
+            excused = {n for n in still if f"{pkg}/{target}::{n}" in base_flaky}
+            for name in sorted(excused):
+                flaky[f"{pkg}/{target}::{name}"] = ""
+                print(f"   {pkg}/{target}::{name}: fails alone in {bad_runs}/{runs} runs -- "
+                      "known flaky")
+            still -= excused
         for name in still:
             confirmed[f"{pkg}/{target}::{name}"] = ""
         if still:
             print(f"   {pkg}/{target}" + (f"::{test}" if test else "") + f": fails alone in {bad_runs}/{runs} runs")
         # A target whose parallel results could not be read: flaky only if it then passed
         # alone every time.
-        only_parallel = (seen or (set() if still else {"<target>"})) - still
+        only_parallel = (seen or (set() if still or excused else {"<target>"})) - still - excused
         for name in sorted(only_parallel):
             flaky[f"{pkg}/{target}::{name}"] = ""
             print(f"   {pkg}/{target}::{name}: failed in the parallel run, passes alone "

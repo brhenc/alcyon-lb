@@ -53,9 +53,12 @@ impl Drop for Ibex {
 fn start(cfg: &str, fe: SocketAddr) -> Ibex {
     let mut f = NamedTempFile::new().expect("tmp");
     f.write_all(cfg.as_bytes()).expect("write cfg");
+    // stdin too: inherited, it is whatever ran the test (a socket under an agent's shell),
+    // and `sockets` would count it as one ibex left open.
     let child = Command::new(env!("CARGO_BIN_EXE_ibex"))
         .arg("-f")
         .arg(f.path())
+        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
