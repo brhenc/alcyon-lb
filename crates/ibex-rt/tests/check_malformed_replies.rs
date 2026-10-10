@@ -50,6 +50,11 @@ impl Drop for Ibex {
 /// A server that sends `reply` and closes; after reading the check's request first when
 /// `wait_request` (a MySQL check without `user` sends none).
 fn fake(reply: Vec<u8>, wait_request: bool) -> SocketAddr {
+    fake_holding(reply, wait_request, Duration::ZERO)
+}
+
+/// As [`fake`], keeping the connection open for `hold` after the reply.
+fn fake_holding(reply: Vec<u8>, wait_request: bool, hold: Duration) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
     thread::spawn(move || {
@@ -63,6 +68,7 @@ fn fake(reply: Vec<u8>, wait_request: bool) -> SocketAddr {
                     let _ = s.read(&mut b);
                 }
                 let _ = s.write_all(&reply);
+                thread::sleep(hold);
             });
         }
     });
@@ -81,7 +87,10 @@ fn greeting() -> Vec<u8> {
 
 /// The first health-check log line for b/s, with ibex checked to be still running after it.
 fn check_line(check_lines: &str, reply: Vec<u8>, wait_request: bool) -> String {
-    let server = fake(reply, wait_request);
+    check_line_at(check_lines, fake(reply, wait_request))
+}
+
+fn check_line_at(check_lines: &str, server: SocketAddr) -> String {
     let dir = tempfile::TempDir::new().expect("tmp");
     let syslog = UdpSocket::bind("127.0.0.1:0").expect("udp");
     syslog.set_read_timeout(Some(Duration::from_millis(200))).ok();
@@ -215,4 +224,21 @@ fn mysql_user_second_packet_error_of_one_byte() {
     let line = check_line(MYSQL_USER, reply, true);
     assert_line(&line, &["failed, reason: Layer7 wrong status, code: 0,"]);
     assert_no_info(&line);
+}
+
+/// A reply longer than the 16 KiB buffer, the connection kept open: a full buffer ends the
+/// read, and the packet it cuts is a truncated response (measured on `HAProxy`, both checks:
+/// "Layer7 invalid response", no info, in 0-1 ms). Waiting for the rest would have ended in
+/// a check timeout.
+#[test]
+fn a_reply_that_fills_the_buffer_is_judged_on_it() {
+    let mut mysql = hex("00 00 01 00 0a");
+    mysql.extend(std::iter::repeat_n(b'a', 20000));
+    let mut ldap = hex("30 84 00 01 00 00");
+    ldap.extend(std::iter::repeat_n(b'a', 20000));
+    for (lines, reply, wait) in [(MYSQL, mysql, false), (LDAP, ldap, true)] {
+        let line = check_line_at(lines, fake_holding(reply, wait, Duration::from_secs(3)));
+        assert_line(&line, &["failed, reason: Layer7 invalid response,"]);
+        assert_no_info(&line);
+    }
 }
