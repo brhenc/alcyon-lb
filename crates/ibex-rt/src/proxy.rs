@@ -349,7 +349,7 @@ pub struct TcpSession {
     /// The same for the client socket. Without it every pass over the session read the
     /// client again, eight `EAGAIN` reads per keep-alive request (`performance.md`).
     pub cli_cant_recv: bool,
-    /// The last [`Self::process`] stopped at its bound with its passes still making
+    /// The last [`Self::advance`] stopped at its bound with its passes still making
     /// progress: there is more to do, and maybe no socket event to say so.
     pub passes_ran_out: bool,
     pub created_at: Instant,
@@ -1248,20 +1248,42 @@ impl TcpSession {
     // ---- the two state machines --------------------------------------------------
 
     /// Advances the client side. Returns `true` if anything changed.
-    fn process_cli(&mut self) -> io::Result<bool> {
-        let changed_io = match self.process_cli_io() {
-            // A TLS handshake that failed, or that the client left, ends the client side now,
-            // as it does on HAProxy (EOF at once, measured). The error went to the engine's
-            // process pass, which drops it, and the session waited out `timeout client` (T259).
-            Err(_) if self.cli_xprt.handshake_failed() && self.cli_state.can_read() => {
-                self.cli_state = ScState::Closed;
-                self.ending.get_or_insert(Ending::ClientAbort);
-                true
-            }
-            r => r?,
-        };
+    fn process_cli(&mut self) -> bool {
+        // Every error here is the client connection's: a TLS handshake that failed or
+        // that the client left (T259), a TLS record that does not decrypt after it, a
+        // socket error the transport does not map. It ends the client side now, as a
+        // reset does, and as HAProxy does (EOF at once; `CR`, `CD` or `PR` by what was
+        // under way, measured). Propagated, it ended nothing: the engine dropped it and
+        // the session waited out a timeout (T261).
+        let changed_io = self.process_cli_io().unwrap_or_else(|_| {
+            self.client_conn_failed();
+            true
+        });
         let changed_trans = self.process_cli_transitions();
-        Ok(changed_io || changed_trans)
+        changed_io || changed_trans
+    }
+
+    /// The client connection failed: it is closed, as one the client reset.
+    fn client_conn_failed(&mut self) {
+        if !matches!(self.cli_state, ScState::Closed | ScState::Error) {
+            self.cli_state = ScState::Closed;
+        }
+        self.ending.get_or_insert(Ending::ClientAbort);
+    }
+
+    /// The server connection failed. A TLS handshake that failed, wherever it was driven
+    /// from, is a connect failure: `Error`, which the engine retries (`handshake_failed`).
+    /// Anything else is the server hanging up, as a reset is.
+    fn server_conn_failed(&mut self) {
+        if matches!(self.srv_state, ScState::Closed | ScState::Error) {
+            return;
+        }
+        if self.srv_xprt.handshake_failed() {
+            self.srv_state = ScState::Error;
+        } else {
+            self.srv_state = ScState::Closed;
+            self.ending.get_or_insert(Ending::ServerAbort);
+        }
     }
 
     /// Takes a parsed PROXY header as the connection's: the addresses it carries, its
@@ -2168,13 +2190,18 @@ impl TcpSession {
     /// socket event at all, an HTTP/2 request body held in its stream's message with the
     /// server-bound buffer emptied and the client's socket drained (T221).
     ///
-    /// # Errors
-    /// Propagates unexpected I/O failures.
-    pub fn process(&mut self, now: Tick) -> io::Result<()> {
+    /// An error on either connection ends that side here (its state and `ending`), for the
+    /// engine's close paths to act on in the same pass: nothing is returned for a caller to
+    /// drop. The engine dropped every error `process` returned, and an error ended nothing
+    /// until a timeout fired (T261).
+    pub fn advance(&mut self, now: Tick) {
         self.passes_ran_out = false;
         for pass in 0..16 {
-            let a = self.process_cli()?;
-            let b = self.process_srv()?;
+            let a = self.process_cli();
+            let b = self.process_srv().unwrap_or_else(|_| {
+                self.server_conn_failed();
+                true
+            });
             if !a && !b {
                 break;
             }
@@ -2193,6 +2220,14 @@ impl TcpSession {
             }
         }
         self.arm_request(now);
+    }
+
+    /// [`Self::advance`], for callers written when it returned an error.
+    ///
+    /// # Errors
+    /// None: an error ends its side of the session instead (T261).
+    pub fn process(&mut self, now: Tick) -> io::Result<()> {
+        self.advance(now);
         Ok(())
     }
 

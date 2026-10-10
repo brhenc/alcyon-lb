@@ -7520,7 +7520,7 @@ impl EngineDispatcher<'_> {
                 continue;
             }
             let before = snapshot(entry);
-            let _ = entry.sess.process(now);
+            entry.sess.advance(now);
             if before == snapshot(entry) {
                 ran_out = false;
                 break;
@@ -7995,7 +7995,7 @@ impl EngineDispatcher<'_> {
 
             // Step 3: Stream engine process pass
             if !entry.sess.is_done() {
-                let _ = entry.sess.process(now);
+                entry.sess.advance(now);
             }
             // The glitches the HTTP/2 connection counted since the last pass go to the entries
             // its stream counters track (`glitch_cnt`, `glitch_rate`).
@@ -8080,7 +8080,7 @@ impl EngineDispatcher<'_> {
                     ContentEvalResult::Waiting => {}
                     // Released: forward what was held.
                     ContentEvalResult::Done => {
-                        let _ = entry.sess.process(now);
+                        entry.sess.advance(now);
                     }
                     // `reject` (src/tcp_rules.c): the server connection is killed, the
                     // client's closed with nothing forwarded.
@@ -10401,7 +10401,7 @@ impl EngineDispatcher<'_> {
             if immediate {
                 entry.sess.server_connected(now);
                 fdtab.set_ready(sfd, false, true);
-                let _ = entry.sess.process(now);
+                entry.sess.advance(now);
                 let (_, srv_want) = entry.sess.interests();
                 let new_interest = Interest {
                     readable: srv_want.read,
