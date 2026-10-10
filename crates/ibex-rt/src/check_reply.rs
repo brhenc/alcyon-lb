@@ -54,56 +54,127 @@ pub fn ascii_encode(b: &[u8]) -> String {
 /// status", with the reply up to its first CR/LF, non-printables as `<XX>`. Measured: an
 /// LDAP answer gives `info: "0<0C><02><01><01>a<07>"`.
 pub fn redis(b: &[u8], eof: bool) -> Option<Verdict> {
-    if !eof && !b.windows(2).any(|w| w == b"\r\n") {
+    // `expect string +PONG\r\n`: a mismatch is not final while more data may come, so a
+    // `-ERR\r\n` reply waits for the close (or a full buffer) like HAProxy.
+    if b.starts_with(b"+PONG\r\n") {
+        return Some(Verdict::pass("L7OK", "Layer7 check passed", Some("Redis server is ok".to_string())));
+    }
+    if !eof {
         return None;
     }
-    Some(if b.starts_with(b"+PONG") {
-        Verdict::pass("L7OK", "Layer7 check passed", Some("Redis server is ok".to_string()))
+    // L7OK and L7STS always print a code in HAProxy's log line (src/check.c); the rule
+    // sets none, so it is 0.
+    Some(Verdict::fail("L7STS", "Layer7 wrong status", Some(0), Some(ascii_encode(cut_crlf(b)))))
+}
+
+/// The info of a failed SMTP `EHLO` or `QUIT` reply that has no status code: `HAProxy`'s rules
+/// end on `error-status L7STS on-error "%[res.payload(4,0),ltrim(' '),cut_crlf]"
+/// status-code "res.payload(0,3)"` (src/tcpcheck.c), so the status is "wrong status", the
+/// code is 0, and the info is what follows the first four bytes, up to the line end.
+#[must_use]
+pub fn smtp_codeless_info(b: &[u8]) -> Option<String> {
+    let rest = b.get(4..).unwrap_or(&[]);
+    let start = rest.iter().position(|&c| c != b' ').unwrap_or(rest.len());
+    let info = cut_crlf(&rest[start..]);
+    (!info.is_empty()).then(|| String::from_utf8_lossy(info).into_owned())
+}
+
+/// The first three bytes as a number, 0 if they are not three digits (`res.payload(0,3)`).
+fn smtp_code(b: &[u8]) -> u16 {
+    b.get(0..3)
+        .filter(|d| d.iter().all(u8::is_ascii_digit))
+        .map_or(0, |d| d.iter().fold(0u16, |n, &c| n * 10 + u16::from(c - b'0')))
+}
+
+/// The verdict on the SMTP greeting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SmtpGreeting {
+    /// A 2xx greeting: send the HELO/EHLO.
+    Accepted,
+    /// Not `NNN` followed by a space or CR (L7RSP), with the reply up to its line end.
+    Invalid(Option<String>),
+    /// Another status (L7STS): code and info.
+    Failed(u16, Option<String>),
+}
+
+/// The SMTP greeting: `expect rstring ^[0-9]{3}[ \r] min-recv 4` (L7RSP, info = the reply
+/// up to the line end), then `^2[0-9]{2}[ \r] min-recv 4` (L7STS). Four bytes decide, a CRLF
+/// is not needed, and a multi-line greeting (`220-x`) is "invalid response". Under four bytes
+/// nothing is judged, even after the close.
+pub fn smtp_greeting(b: &[u8]) -> Option<SmtpGreeting> {
+    if b.len() < 4 {
+        return None;
+    }
+    if !(b[..3].iter().all(u8::is_ascii_digit) && matches!(b[3], b' ' | b'\r')) {
+        let line = cut_crlf(b);
+        return Some(SmtpGreeting::Invalid((!line.is_empty()).then(|| ascii_encode(line))));
+    }
+    Some(if b[0] == b'2' {
+        SmtpGreeting::Accepted
     } else {
-        Verdict::fail("L7STS", "Layer7 wrong status", None, Some(ascii_encode(cut_crlf(b))))
+        SmtpGreeting::Failed(smtp_code(b), smtp_codeless_info(b))
     })
 }
 
-/// One SMTP status line (the greeting, or the answer to QUIT): its three-digit code if it
-/// starts with one, and the line without its trailing CR/LF.
-pub fn smtp_status_line(b: &[u8]) -> (Option<u16>, String) {
-    let line = String::from_utf8_lossy(b).trim_end_matches(&['\r', '\n'][..]).to_string();
-    let code = line.get(0..3).and_then(|s| s.parse::<u16>().ok());
-    (code, line)
+/// The answer to QUIT: `expect rstring ^2[0-9]{2}[- \r] min-recv 4`. `Ok((code, info))` passes,
+/// `Err((code, info))` is "wrong status" (also a reply cut short by the close, measured as
+/// code 0); `None` waits for four bytes.
+pub fn smtp_quit(b: &[u8], eof: bool) -> Option<Result<(u16, Option<String>), (u16, Option<String>)>> {
+    if b.len() < 4 && !eof {
+        return None;
+    }
+    let r = (smtp_code(b), smtp_codeless_info(b));
+    let ok = b.len() >= 4 && b[0] == b'2' && b[1].is_ascii_digit() && b[2].is_ascii_digit() && matches!(b[3], b'-' | b' ' | b'\r');
+    Some(if ok { Ok(r) } else { Err(r) })
+}
+
+/// The verdict on the answer to HELO/EHLO.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SmtpEhlo {
+    /// The reply matches the rule: go on to QUIT.
+    Accepted,
+    /// The rule failed: its status code (0 if the first three bytes are not a number) and info.
+    Failed(u16, Option<String>),
 }
 
 /// The SMTP answer to HELO/EHLO, possibly multi-line (`250-...` lines then `250 ...`).
-/// `None`: no final line yet. Otherwise the final line's code (if it parsed) and info.
 ///
-/// T117: judge only lines that are complete. A reply `248\r\n` arriving as `2`, `4`, `8`,
-/// `\r\n` has the shape of a final line ("248", nothing after the code) as soon as the `8`
-/// is in; taking it then sent QUIT early and read the trailing CRLF as the QUIT answer.
-/// HAProxy's expect (`^(2xx-...\r\n)*2xx[ \r]`, no min-recv) keeps waiting while it cannot
-/// decide. At EOF the partial tail counts, as before.
-pub fn smtp_reply(b: &[u8], eof: bool) -> Option<(Option<u16>, Option<String>)> {
-    let resp_str = String::from_utf8_lossy(b);
-    let mut completed = false;
-    let mut last_code = None;
-    let mut last_info = None;
-    let judged = if eof { &resp_str[..] } else { &resp_str[..resp_str.rfind('\n').map_or(0, |i| i + 1)] };
-    for line in judged.lines() {
-        if line.len() >= 3
-            && line.as_bytes()[0].is_ascii_digit()
-            && line.as_bytes()[1].is_ascii_digit()
-            && line.as_bytes()[2].is_ascii_digit()
-        {
-            let code = line[0..3].parse::<u16>().ok();
-            if line.len() == 3 || line.as_bytes().get(3) == Some(&b' ') {
-                completed = true;
-                last_code = code;
-                last_info = Some(line.get(4..).unwrap_or("").trim().to_string());
-            }
+/// `HAProxy`'s rule is the regex `^(2[0-9]{2}-[^\r]*\r\n)*2[0-9]{2}[ \r]` with no `min-recv`
+/// (src/tcpcheck.c). A reply that does not match yet is not judged while more data may come,
+/// and one that never matches (`450\r\n`, `XYZ\r\n`, a lone `250`) is judged only when the server
+/// closes or a buffer fills: measured on HAProxy 3.5-dev8, `450\r\n` with the connection
+/// held open is "Layer7 timeout". Then the code is the first three bytes if they are a
+/// number, the info what follows the first four, up to the line end.
+///
+/// T117: this also keeps `2`, `4`, `8`, `\r\n` arriving separately from being taken for a
+/// final `248` before the line ends.
+pub fn smtp_reply(b: &[u8], eof: bool) -> Option<SmtpEhlo> {
+    let is_2xx = |l: &[u8]| l.len() >= 3 && l[0] == b'2' && l[1].is_ascii_digit() && l[2].is_ascii_digit();
+    let mut at = 0;
+    let matched = loop {
+        let l = &b[at..];
+        if !is_2xx(l) {
+            break false;
         }
+        match l.get(3) {
+            Some(b' ' | b'\r') => break true,
+            Some(b'-') => {
+                // `[^\r]*\r\n`: the line must end in CRLF.
+                match l.iter().position(|&c| c == b'\r').and_then(|i| l.get(i + 1).map(|&n| (i, n))) {
+                    Some((i, b'\n')) => at += i + 2,
+                    _ => break false,
+                }
+            }
+            _ => break false,
+        }
+    };
+    if matched {
+        return Some(SmtpEhlo::Accepted);
     }
-    if !completed && !eof {
+    if !eof {
         return None;
     }
-    Some((last_code, last_info))
+    Some(SmtpEhlo::Failed(smtp_code(b), smtp_codeless_info(b)))
 }
 
 /// `option ldap-check`: the reply to an anonymous bind must be an LDAPv3 BindResponse;
@@ -129,25 +200,30 @@ impl From<crate::check::ProtoReply> for Verdict {
     }
 }
 
-/// `option pgsql-check`: an `R` (authentication request) passes, an `E` (error) fails
-/// with its first field.
+/// `option pgsql-check` (src/tcpcheck.c): `expect !rstring ^E min-recv 5` fails with the
+/// reply from offset 6 as info, then `expect rbinary ^52000000XX000000(00|02|03|04|05|06|07|09|0A)
+/// min-recv 9` passes only an authentication request (`R`, length, then one of those types).
+/// Anything else is "wrong status ... unknown error"; under 9 bytes nothing is decided until
+/// the server closes.
 pub fn pgsql(b: &[u8], eof: bool) -> Option<Verdict> {
-    if b.len() < 5 && !eof {
+    if b.first() == Some(&b'E') && (b.len() >= 5 || eof) {
+        let rest = b.get(6..).unwrap_or(&[]);
+        let rest = &rest[..rest.iter().position(|&c| c == 0).unwrap_or(rest.len())];
+        let info = (!rest.is_empty()).then(|| ascii_encode(rest));
+        return Some(Verdict::fail("L7RSP", "Layer7 invalid response", None, info));
+    }
+    if b.len() < 9 && !eof {
         return None;
     }
-    Some(if b.first() == Some(&b'R') {
+    let auth_request = b.len() >= 9
+        && b[0] == b'R'
+        && b[1..4] == [0, 0, 0]
+        && b[5..8] == [0, 0, 0]
+        && matches!(b[8], 0 | 2..=7 | 9 | 10);
+    Some(if auth_request {
         Verdict::pass("L7OK", "Layer7 check passed", Some("PostgreSQL server is ok".to_string()))
-    } else if b.first() == Some(&b'E') {
-        let info = if b.len() > 6 {
-            let s_bytes = &b[6..];
-            let null_pos = s_bytes.iter().position(|&c| c == 0).unwrap_or(s_bytes.len());
-            String::from_utf8_lossy(&s_bytes[..null_pos]).to_string()
-        } else {
-            "Error".to_string()
-        };
-        Verdict::fail("L7RSP", "Layer7 invalid response", None, Some(info))
     } else {
-        Verdict::fail("L7STS", "Layer7 wrong status", None, Some("PostgreSQL unknown error".to_string()))
+        Verdict::fail("L7STS", "Layer7 wrong status", Some(0), Some("PostgreSQL unknown error".to_string()))
     })
 }
 

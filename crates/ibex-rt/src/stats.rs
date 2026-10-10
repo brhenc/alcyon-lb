@@ -647,15 +647,25 @@ fn write_server_row(
         "srv"
     };
     let srv_addr = proxy.servers.at(s_idx);
-    let (status_str, chkfail, chkdown, check_status, check_code, check_duration) =
+    let (status_str, chkfail, chkdown, check_status, check_code, last_chk, check_duration) =
         if let Some(c) = check_state {
+            // A star while a check is running; the code only for the statuses that carry
+            // data (L57DATA and above); the info text as `last_chk`.
+            let check_status = if c.in_progress {
+                format!("* {}", c.last_status_code)
+            } else {
+                c.last_status_code.to_string()
+            };
+            let check_code = if c.carries_code() { c.http_code.unwrap_or(0).to_string() } else { String::new() };
             (
-                c.status.as_str().to_string(),
+                c.status_word(),
                 c.failed_checks,
                 c.down_transitions,
-                c.last_status_code,
-                if c.status == ServerStatus::Up { 200 } else { 0 },
-                c.check_duration_ms,
+                check_status,
+                check_code,
+                c.last_status_info.clone().unwrap_or_default(),
+                // From the first completed check on (`HCHK_STATUS_CHECKED`), not while `INI`.
+                if c.last_status_code == "INI" { String::new() } else { c.check_duration_ms.to_string() },
             )
         } else {
             let s = proxy
@@ -672,7 +682,7 @@ fn write_server_row(
                 }
                 ServerStatus::Maint => "MAINT".to_string(),
             };
-            (s_str, 0, 0, "", 0, 0)
+            (s_str, 0, 0, String::new(), String::new(), String::new(), String::new())
         };
     let has_check = check_state.is_some();
 
@@ -730,10 +740,12 @@ fn write_server_row(
     r.set("iid", iid);
     r.set("sid", sid);
     r.set("type", 2);
-    if has_check {
+    // A server in maintenance has its checks paused: no check column (`CHK_ST_PAUSED`).
+    if has_check && !check_state.is_some_and(|c| c.status == ServerStatus::Maint) {
         r.set("check_status", check_status);
         r.set("check_code", check_code);
         r.set("check_duration", check_duration);
+        r.set("last_chk", last_chk);
     }
     r.set("addr", srv_addr);
     r.default_untracked('S', proxy.mode == ibex_config::Mode::Http, "");

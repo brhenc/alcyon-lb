@@ -3430,7 +3430,7 @@ fn init_checks(proxies: &[Proxy], scheduler: &mut Scheduler, now: Tick) -> Vec<S
             check.tls = proxy.server_check_tls.get(server_idx).cloned().flatten();
             // A `disabled` server stays in maintenance whatever its checks find.
             if proxy.server_statuses.get(server_idx).is_some_and(|s| s.load(Ordering::Relaxed) == ServerStatus::Maint as u8) {
-                check.status = ServerStatus::Maint;
+                check.set_admin_status(ServerStatus::Maint);
             }
             let check_idx = usize_to_u32(checks.len());
             if let Some(task_ref) = scheduler.create(WorkKind::new(Kind::Check, check_idx)) {
@@ -9353,12 +9353,6 @@ impl EngineDispatcher<'_> {
                                     };
                                     if let Some(st) = new_status {
                                         status_changes.push((p_idx, s_idx, st));
-                                        if let Some(check) = checks
-                                            .iter_mut()
-                                            .find(|c| c.proxy_idx == p_idx && c.server_idx == s_idx)
-                                        {
-                                            check.status = st;
-                                        }
                                     }
                                     if let Some(w) = cmd.weight {
                                         weight_changes.push((s_idx, w));
@@ -9374,7 +9368,7 @@ impl EngineDispatcher<'_> {
                         }
                     }
                     for (p_idx, s_idx, st) in status_changes {
-                        crate::track::set_status(proxies, p_idx, s_idx, st);
+                        crate::track::apply_admin(proxies, checks, p_idx, s_idx, st);
                     }
                 }
             }
@@ -10760,7 +10754,7 @@ impl EngineDispatcher<'_> {
                 && proxy_idx < self.proxies.len()
                 && server_idx < self.proxies[proxy_idx].server_statuses.len()
             {
-                crate::track::set_status(self.proxies, proxy_idx, server_idx, check.status);
+                crate::track::set_raw(self.proxies, proxy_idx, server_idx, check.published());
             }
 
             // The message is built while `check` is still borrowed, then the borrow ends

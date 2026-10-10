@@ -58,6 +58,42 @@ impl ServerStatus {
     }
 }
 
+/// The value of `Proxy::server_statuses` for a server the operator drains and the checks
+/// found dead: [`ServerStatus::from`] reads it as `Down` (it takes no traffic, `show stat`
+/// prints `DOWN`), and `show servers state` still prints the drain (`srv_admin_state` 8).
+/// `HAProxy` keeps the two apart as `srv->cur_admin` and `srv->cur_state`.
+pub const DRAIN_DOWN: u8 = 4;
+
+/// The state of a server that is `cur` (a `Proxy::server_statuses` value) once the operator
+/// sets its admin state to `to` (`Up` for `ready`, `Drain` or `Maint`), for a server with no
+/// check of its own: leaving maintenance starts it running, as `_srv_update_status_adm`
+/// does; otherwise a stopped server stays stopped and a running one stays running.
+#[must_use]
+pub fn admin_transition(cur: u8, to: ServerStatus) -> u8 {
+    let cur_st = ServerStatus::from(cur);
+    match to {
+        ServerStatus::Maint => ServerStatus::Maint as u8,
+        _ if cur_st == ServerStatus::Maint => to as u8,
+        ServerStatus::Drain if cur_st == ServerStatus::Down => DRAIN_DOWN,
+        _ if cur_st == ServerStatus::Down => ServerStatus::Down as u8,
+        _ => to as u8,
+    }
+}
+
+/// The state of a server that is `cur` once `set server health up|down` moves its
+/// operational state: maintenance is kept, a drain is kept.
+#[must_use]
+pub fn health_transition(cur: u8, up: bool) -> u8 {
+    let drain = cur == DRAIN_DOWN || cur == ServerStatus::Drain as u8;
+    match ServerStatus::from(cur) {
+        ServerStatus::Maint => cur,
+        _ if up && drain => ServerStatus::Drain as u8,
+        _ if up => ServerStatus::Up as u8,
+        _ if drain => DRAIN_DOWN,
+        _ => ServerStatus::Down as u8,
+    }
+}
+
 impl From<u8> for ServerStatus {
     fn from(v: u8) -> Self {
         match v {
@@ -169,7 +205,11 @@ pub struct ServerCheckState {
     pub server_idx: usize,
     pub addr: SocketAddr,
     pub config: ServerCheckConfig,
+    /// What the server is: the operator's admin state combined with the checks' verdict.
+    /// `Down` under a drain is the server the checks found dead ([`Self::published`]).
     pub status: ServerStatus,
+    /// The operator's admin state alone (`cur_admin`): `Up` for ready, `Drain` or `Maint`.
+    pub admin: ServerStatus,
     pub enabled: bool,
     /// Consecutive successes and failures, kept for the stats page's "pass N"/"fails N".
     pub rise_count: u32,
@@ -240,7 +280,6 @@ impl ServerCheckState {
         config: ServerCheckConfig,
         now: Tick,
     ) -> Self {
-        let config_rise = config.rise;
         let resolved_config = get_resolved_check_config(proxy_idx, server_idx, addr);
         let http_send = HttpSendFormats::for_config(resolved_config.as_ref()).map(Box::new);
         ServerCheckState {
@@ -249,10 +288,13 @@ impl ServerCheckState {
             addr,
             config,
             status: ServerStatus::Up,
+            admin: ServerStatus::Up,
             enabled: true,
             rise_count: 0,
             fall_count: 0,
-            health: config_rise,
+            // A new server runs with its counter at zero, as `HAProxy` allocates it: the
+            // first successes climb to `rise` and a failure before that takes it down.
+            health: 0,
             in_progress: false,
             sock: None,
             xprt: ServerXprt::Plain,
@@ -329,7 +371,7 @@ impl ServerCheckState {
         self.last_status_code = code;
         self.last_status_desc = desc;
         self.http_code = http_code;
-        self.last_status_info = info;
+        self.last_status_info = info.map(cut_check_desc);
         self.check_duration_ms = duration_ms;
 
         if self.health >= self.full_health() {
@@ -343,7 +385,7 @@ impl ServerCheckState {
         if self.health >= self.config.rise {
             self.health = self.full_health();
             if self.status == ServerStatus::Down {
-                self.status = ServerStatus::Up;
+                self.status = self.running();
                 return Some(CheckEvent::WentUp);
             }
         }
@@ -368,10 +410,17 @@ impl ServerCheckState {
         self.last_status_code = code;
         self.last_status_desc = desc;
         self.http_code = http_code;
-        self.last_status_info = info;
+        self.last_status_info = info.map(cut_check_desc);
         self.check_duration_ms = duration_ms;
 
         if self.health == 0 {
+            // `check_notify_failure`: a running server whose counter is already at zero (a
+            // new one) goes down on its first failure.
+            if matches!(self.status, ServerStatus::Up | ServerStatus::Drain) {
+                self.status = ServerStatus::Down;
+                self.down_transitions += 1;
+                return Some(CheckEvent::WentDown);
+            }
             return if status_changed {
                 Some(CheckEvent::Failed)
             } else {
@@ -381,13 +430,84 @@ impl ServerCheckState {
         self.health -= 1;
         if self.health < self.config.rise {
             self.health = 0;
-            if self.status == ServerStatus::Up {
+            if matches!(self.status, ServerStatus::Up | ServerStatus::Drain) {
                 self.status = ServerStatus::Down;
                 self.down_transitions += 1;
                 return Some(CheckEvent::WentDown);
             }
         }
         Some(CheckEvent::Failed)
+    }
+
+    /// The running state under the operator's admin state: `Drain` or `Up`.
+    const fn running(&self) -> ServerStatus {
+        if matches!(self.admin, ServerStatus::Drain) { ServerStatus::Drain } else { ServerStatus::Up }
+    }
+
+    /// An operator's `disable server`, `enable server` or `set server state`: entering
+    /// maintenance zeroes the counter, leaving it restores `rise` and starts the server
+    /// running (`_srv_update_status_adm`, `src/server.c`). `ready` and `drain` otherwise move
+    /// the admin state only: a server the checks found dead stays down (measured).
+    pub fn set_admin_status(&mut self, to: ServerStatus) {
+        self.admin = to;
+        if to == ServerStatus::Maint {
+            if self.status != ServerStatus::Maint {
+                self.health = 0;
+            }
+            self.status = ServerStatus::Maint;
+        } else if self.status == ServerStatus::Maint {
+            self.health = self.config.rise;
+            self.status = self.running();
+        } else if self.status != ServerStatus::Down {
+            self.status = self.running();
+        }
+    }
+
+    /// `set server health up|down`: the counter goes to full health or zero, and the
+    /// operational state follows unless the server is in maintenance (measured: `MAINT`
+    /// stays, the counter moves).
+    pub fn set_health(&mut self, up: bool) {
+        self.health = if up { self.full_health() } else { 0 };
+        if self.status != ServerStatus::Maint {
+            self.status = if up { self.running() } else { ServerStatus::Down };
+        }
+    }
+
+    /// The value published in `Proxy::server_statuses`: the status, or [`DRAIN_DOWN`].
+    #[must_use]
+    pub fn published(&self) -> u8 {
+        if self.status == ServerStatus::Down && self.admin == ServerStatus::Drain {
+            DRAIN_DOWN
+        } else {
+            self.status as u8
+        }
+    }
+
+    /// The `status` column of `show stat` (`stats_fill_sv_computestate`): `UP`, or `UP n/fall`
+    /// while the counter is short of full health (`n` is signed and starts negative), `DRAIN`
+    /// likewise, `DOWN`, or `DOWN n/rise` while a down server climbs.
+    #[must_use]
+    pub fn status_word(&self) -> String {
+        let (health, rise, fall) = (i64::from(self.health), i64::from(self.config.rise), i64::from(self.config.fall));
+        let full = self.health >= self.full_health();
+        match self.status {
+            ServerStatus::Maint => "MAINT".to_string(),
+            ServerStatus::Down if self.health > 0 => format!("DOWN {health}/{rise}"),
+            ServerStatus::Down => "DOWN".to_string(),
+            ServerStatus::Up if !self.enabled => "no check".to_string(),
+            st @ (ServerStatus::Up | ServerStatus::Drain) if full => st.as_str().to_string(),
+            st => format!("{} {}/{fall}", st.as_str(), health - rise + 1),
+        }
+    }
+
+    /// True for the statuses from L57DATA on, the ones that have a `code` (log line and
+    /// `show stat` `check_code`).
+    #[must_use]
+    pub fn carries_code(&self) -> bool {
+        matches!(
+            self.last_status_code,
+            "L57DATA" | "L7OK" | "L7OKD" | "L7OKC" | "L7OKCD" | "L7STS" | "PROCERR" | "PROCTOUT" | "PROCOK"
+        )
     }
 
     /// Formats the check result as `HAProxy` does.
@@ -408,8 +528,10 @@ impl ServerCheckState {
             self.last_status_desc
         );
 
-        if let Some(code) = self.http_code {
-            let _ = write!(out, ", code: {code}");
+        // `check_append_info` (src/check.c): every status from L57DATA on prints a code,
+        // 0 when the check set none.
+        if self.carries_code() {
+            let _ = write!(out, ", code: {}", self.http_code.unwrap_or(0));
         }
 
         if let Some(ref info) = self.last_status_info {
@@ -583,6 +705,20 @@ fn run_var_rules(
 /// `uri-lf`, `body-lf` and each `hdr` as rendered for one check; `None` where the request
 /// uses the configured text.
 type RenderedSend = (Option<String>, Option<String>, Vec<Option<String>>);
+
+/// `srv_check_result` of `show servers state` for a check status code: the `result` column
+/// of `check_statuses` in `src/check.c` (`CHK_RES_*`: UNKNOWN 0, NEUTRAL 1, FAILED 2,
+/// PASSED 3, CONDPASS 4).
+#[must_use]
+pub fn check_result_of(code: &str) -> u8 {
+    match code {
+        "UNK" | "INI" | "START" => 0,
+        "CHECKED" => 1,
+        "L7OKC" | "L7OKCD" => 4,
+        "L4OK" | "L6OK" | "L7OK" | "L7OKD" | "PROCOK" => 3,
+        _ => 2,
+    }
+}
 
 /// `httpchk_build_status_header` (`src/check.c`): the value of `X-Haproxy-Server-State`.
 ///
@@ -1045,6 +1181,18 @@ pub fn step_check(
             cleanup_check_socket(check, fdtab, poller);
         }
         let next = check.schedule_next(now);
+        check.next_check = next;
+        return Ok(CheckStep::pending(Some(next)));
+    }
+
+    // `CHK_ST_PAUSED`: a server in maintenance is not checked. The task only looks again
+    // after a second at most, so that `enable server` has its check soon (HAProxy runs it
+    // at once).
+    if check.status == ServerStatus::Maint {
+        if check.in_progress {
+            cleanup_check_socket(check, fdtab, poller);
+        }
+        let next = now.add(u32::try_from(check.config.inter.as_millis().min(1000)).unwrap_or(1000));
         check.next_check = next;
         return Ok(CheckStep::pending(Some(next)));
     }
@@ -2400,20 +2548,8 @@ fn progress_redis_check(
     }
 
     if phase == 1 {
-        let mut buf = [0u8; 4096];
-        let mut eof = false;
-        loop {
-            match check.xprt.recv(sock.as_fd(), &mut buf) {
-                Ok(Io::Done(n)) => {
-                    recv_buf.extend_from_slice(&buf[..n]);
-                }
-                Ok(Io::WouldBlock) => break,
-                Ok(Io::Eof | Io::Closed) | Err(_) => {
-                    eof = true;
-                    break;
-                }
-            }
-        }
+        // True once nothing more is coming: the server closed, or one buffer is full.
+        let eof = recv_check_reply(&mut check.xprt, sock.as_fd(), &mut recv_buf);
 
         let Some(v) = check_reply::redis(&recv_buf, eof) else {
             fdtab.clear_ready(raw_fd, true, false);
@@ -2459,28 +2595,14 @@ fn progress_smtp_check(
         return Ok(CheckStep::pending(Some(next)));
     };
 
-    let find_crlf = |b: &[u8]| b.windows(2).position(|w| w == b"\r\n");
-
     if phase == 0 {
         fdtab.set_interest(raw_fd, Interest::READ);
         let _ = poller.modify(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), true, false);
 
-        let mut buf = [0u8; 4096];
-        let mut eof = false;
-        loop {
-            match check.xprt.recv(sock.as_fd(), &mut buf) {
-                Ok(Io::Done(n)) => {
-                    recv_buf.extend_from_slice(&buf[..n]);
-                }
-                Ok(Io::WouldBlock) => break,
-                Ok(Io::Eof | Io::Closed) | Err(_) => {
-                    eof = true;
-                    break;
-                }
-            }
-        }
+        // True once nothing more is coming: the server closed, or one buffer is full.
+        let _eof = recv_check_reply(&mut check.xprt, sock.as_fd(), &mut recv_buf);
 
-        if find_crlf(&recv_buf).is_none() && !eof {
+        let Some(greeting) = check_reply::smtp_greeting(&recv_buf) else {
             fdtab.clear_ready(raw_fd, true, false);
             check.sub_state = CheckSubState::SmtpRunning {
                 phase,
@@ -2489,50 +2611,29 @@ fn progress_smtp_check(
                 recv_buf,
             };
             return Ok(CheckStep::pending(Some(check.exp)));
-        }
+        };
 
-        let (code_res, line) = check_reply::smtp_status_line(&recv_buf);
-        match code_res {
-            Some(code) if (200..300).contains(&code) => {
+        match greeting {
+            check_reply::SmtpGreeting::Accepted => {
                 phase = 1;
                 send_offset = 0;
                 recv_buf.clear();
                 fdtab.set_interest(raw_fd, Interest::WRITE);
                 let _ = poller.modify(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), false, true);
             }
-            Some(code) => {
+            check_reply::SmtpGreeting::Failed(code, info) => {
                 cleanup_check_socket(check, fdtab, poller);
-                let info = line.get(4..).unwrap_or("").trim().to_string();
-                let event = check.on_failure_full(
-                    "L7STS",
-                    "Layer7 wrong status",
-                    duration,
-                    Some(code),
-                    if info.is_empty() { None } else { Some(info) },
-                );
+                let event = check.on_failure_full("L7STS", "Layer7 wrong status", duration, Some(code), info);
                 let next = check.schedule_next(now);
                 check.next_check = next;
-                return Ok(CheckStep {
-                    next: Some(next),
-                    event,
-                });
+                return Ok(CheckStep { next: Some(next), event });
             }
-            None => {
+            check_reply::SmtpGreeting::Invalid(info) => {
                 cleanup_check_socket(check, fdtab, poller);
-                let info = line.trim().to_string();
-                let event = check.on_failure_full(
-                    "L7RSP",
-                    "Layer7 invalid response",
-                    duration,
-                    None,
-                    if info.is_empty() { None } else { Some(info) },
-                );
+                let event = check.on_failure_full("L7RSP", "Layer7 invalid response", duration, None, info);
                 let next = check.schedule_next(now);
                 check.next_check = next;
-                return Ok(CheckStep {
-                    next: Some(next),
-                    event,
-                });
+                return Ok(CheckStep { next: Some(next), event });
             }
         }
     }
@@ -2588,23 +2689,10 @@ fn progress_smtp_check(
     }
 
     if phase == 2 {
-        let mut buf = [0u8; 4096];
-        let mut eof = false;
-        loop {
-            match check.xprt.recv(sock.as_fd(), &mut buf) {
-                Ok(Io::Done(n)) => {
-                    recv_buf.extend_from_slice(&buf[..n]);
-                }
-                Ok(Io::WouldBlock) => break,
-                Ok(Io::Eof | Io::Closed) | Err(_) => {
-                    eof = true;
-                    break;
-                }
-            }
-        }
+        // True once nothing more is coming: the server closed, or one buffer is full.
+        let eof = recv_check_reply(&mut check.xprt, sock.as_fd(), &mut recv_buf);
 
-        let reply = check_reply::smtp_reply(&recv_buf, eof);
-        let Some((last_code, last_info)) = reply else {
+        let Some(reply) = check_reply::smtp_reply(&recv_buf, eof) else {
             fdtab.clear_ready(raw_fd, true, false);
             check.sub_state = CheckSubState::SmtpRunning {
                 phase,
@@ -2615,40 +2703,17 @@ fn progress_smtp_check(
             return Ok(CheckStep::pending(Some(check.exp)));
         };
 
-        match last_code {
-            Some(code) if (200..300).contains(&code) => {
+        match reply {
+            check_reply::SmtpEhlo::Accepted => {
                 phase = 3;
                 send_offset = 0;
                 recv_buf.clear();
                 fdtab.set_interest(raw_fd, Interest::WRITE);
                 let _ = poller.modify(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), false, true);
             }
-            Some(code) => {
+            check_reply::SmtpEhlo::Failed(code, info) => {
                 cleanup_check_socket(check, fdtab, poller);
-                let event = check.on_failure_full(
-                    "L7STS",
-                    "Layer7 wrong status",
-                    duration,
-                    Some(code),
-                    last_info,
-                );
-                let next = check.schedule_next(now);
-                check.next_check = next;
-                return Ok(CheckStep {
-                    next: Some(next),
-                    event,
-                });
-            }
-            None => {
-                cleanup_check_socket(check, fdtab, poller);
-                let info = String::from_utf8_lossy(&recv_buf).trim().to_string();
-                let event = check.on_failure_full(
-                    "L7RSP",
-                    "Layer7 invalid response",
-                    duration,
-                    None,
-                    if info.is_empty() { None } else { Some(info) },
-                );
+                let event = check.on_failure_full("L7STS", "Layer7 wrong status", duration, Some(code), info);
                 let next = check.schedule_next(now);
                 check.next_check = next;
                 return Ok(CheckStep {
@@ -2710,22 +2775,10 @@ fn progress_smtp_check(
     }
 
     if phase == 4 {
-        let mut buf = [0u8; 4096];
-        let mut eof = false;
-        loop {
-            match check.xprt.recv(sock.as_fd(), &mut buf) {
-                Ok(Io::Done(n)) => {
-                    recv_buf.extend_from_slice(&buf[..n]);
-                }
-                Ok(Io::WouldBlock) => break,
-                Ok(Io::Eof | Io::Closed) | Err(_) => {
-                    eof = true;
-                    break;
-                }
-            }
-        }
+        // The reply is judged on four bytes (the QUIT answer needs no CRLF).
+        let eof = recv_check_reply(&mut check.xprt, sock.as_fd(), &mut recv_buf);
 
-        if find_crlf(&recv_buf).is_none() && !eof {
+        let Some(answer) = check_reply::smtp_quit(&recv_buf, eof) else {
             fdtab.clear_ready(raw_fd, true, false);
             check.sub_state = CheckSubState::SmtpRunning {
                 phase,
@@ -2734,38 +2787,12 @@ fn progress_smtp_check(
                 recv_buf,
             };
             return Ok(CheckStep::pending(Some(check.exp)));
-        }
+        };
 
         cleanup_check_socket(check, fdtab, poller);
-        let (code_res, line) = check_reply::smtp_status_line(&recv_buf);
-        let event = match code_res {
-            Some(code) if (200..300).contains(&code) => {
-                let info = line.get(4..).unwrap_or("").trim().to_string();
-                check.on_success_full(
-                    "L7OK",
-                    "Layer7 check passed",
-                    duration,
-                    Some(code),
-                    if info.is_empty() { None } else { Some(info) },
-                )
-            }
-            Some(code) => {
-                let info = line.get(4..).unwrap_or("").trim().to_string();
-                check.on_failure_full(
-                    "L7STS",
-                    "Layer7 wrong status",
-                    duration,
-                    Some(code),
-                    if info.is_empty() { None } else { Some(info) },
-                )
-            }
-            None => check.on_failure_full(
-                "L7RSP",
-                "Layer7 invalid response",
-                duration,
-                None,
-                Some(line),
-            ),
+        let event = match answer {
+            Ok((code, info)) => check.on_success_full("L7OK", "Layer7 check passed", duration, Some(code), info),
+            Err((code, info)) => check.on_failure_full("L7STS", "Layer7 wrong status", duration, Some(code), info),
         };
         let next = check.schedule_next(now);
         check.next_check = next;
@@ -2891,6 +2918,22 @@ pub(crate) fn mysql_reply(buf: &[u8], last_read: bool, with_user: bool) -> Optio
     }
     let hslen = 4 + (usize::from(buf[0]) | usize::from(byte_at(buf, 1)) << 8 | usize::from(byte_at(buf, 2)) << 16);
     packet(hslen, true).flatten()
+}
+
+/// `HAProxy` keeps a check's info in `char desc[HCHK_DESC_LEN]` (128) and copies it with
+/// `strncpy(.., HCHK_DESC_LEN - 1)` (src/check.c): what a server put in its reply is cut to
+/// 127 bytes. Cut on a character boundary here, since the info is a `String`.
+const HCHK_DESC_MAX: usize = 127;
+
+fn cut_check_desc(mut info: String) -> String {
+    if info.len() > HCHK_DESC_MAX {
+        let mut end = HCHK_DESC_MAX;
+        while !info.is_char_boundary(end) {
+            end -= 1;
+        }
+        info.truncate(end);
+    }
+    info
 }
 
 /// Reads what has arrived into `recv_buf`, never past `TCP_CHECK_BUFSIZE` (`HAProxy` reads
@@ -3276,20 +3319,8 @@ fn progress_pgsql_check(
     }
 
     if phase == 1 {
-        let mut buf = [0u8; 4096];
-        let mut eof = false;
-        loop {
-            match check.xprt.recv(sock.as_fd(), &mut buf) {
-                Ok(Io::Done(n)) => {
-                    recv_buf.extend_from_slice(&buf[..n]);
-                }
-                Ok(Io::WouldBlock) => break,
-                Ok(Io::Eof | Io::Closed) | Err(_) => {
-                    eof = true;
-                    break;
-                }
-            }
-        }
+        // True once nothing more is coming: the server closed, or one buffer is full.
+        let eof = recv_check_reply(&mut check.xprt, sock.as_fd(), &mut recv_buf);
 
         let Some(v) = check_reply::pgsql(&recv_buf, eof) else {
             fdtab.clear_ready(raw_fd, true, false);
@@ -3395,20 +3426,8 @@ fn progress_ssl_hello_check(
     }
 
     if phase == 1 {
-        let mut buf = [0u8; 4096];
-        let mut eof = false;
-        loop {
-            match check.xprt.recv(sock.as_fd(), &mut buf) {
-                Ok(Io::Done(n)) => {
-                    recv_buf.extend_from_slice(&buf[..n]);
-                }
-                Ok(Io::WouldBlock) => break,
-                Ok(Io::Eof | Io::Closed) | Err(_) => {
-                    eof = true;
-                    break;
-                }
-            }
-        }
+        // True once nothing more is coming: the server closed, or one buffer is full.
+        let eof = recv_check_reply(&mut check.xprt, sock.as_fd(), &mut recv_buf);
 
         let Some(v) = check_reply::ssl_hello(&recv_buf, eof) else {
             fdtab.clear_ready(raw_fd, true, false);
@@ -3471,6 +3490,22 @@ mod tests {
             event.is_some(),
             "the first successful check after boot must be reported under option log-health-checks"
         );
+    }
+
+    /// `srv_check_result` of `show servers state`: `check_statuses[].result` in
+    /// `src/check.c`, from the table (T274 D2). `HANA` needs `observe`/`on-error` and
+    /// `CHECKED` is only an internal marker, and `L7OKC` needs `ok-status`: Ibex refuses
+    /// all three at parse time, so these three rows are checked here and unreachable from
+    /// a configuration.
+    #[test]
+    fn check_result_follows_the_status_table() {
+        let r = |c| check_result_of(c);
+        // UNKNOWN 0, NEUTRAL 1, FAILED 2, PASSED 3, CONDPASS 4
+        assert_eq!([r("UNK"), r("INI"), r("CHECKED")], [0, 0, 1]);
+        assert_eq!([r("HANA"), r("SOCKERR"), r("L4TOUT"), r("L4CON"), r("L6TOUT"), r("L6RSP")], [2; 6]);
+        assert_eq!([r("L7TOUT"), r("L7RSP"), r("L7STS"), r("PROCERR"), r("PROCTOUT")], [2; 5]);
+        assert_eq!([r("L4OK"), r("L6OK"), r("L7OK"), r("L7OKD"), r("PROCOK")], [3; 5]);
+        assert_eq!([r("L7OKC"), r("L7OKCD")], [4; 2]);
     }
 
     /// The state word of `X-Haproxy-Server-State` (`httpchk_build_status_header`) across
