@@ -613,6 +613,11 @@ fn test_stream_reset_rst_stream_handling_and_graceful_shutdown() {
     mux.parse(&mut ctx, &s1_open.encode()).expect("open 1");
     mux.parse(&mut ctx, &s3_open.encode()).expect("open 3");
     assert_eq!(mux.used_streams(&ctx), 2);
+    // Both are being served: a reset stream no transaction has taken is let go at once
+    // instead (T235, rapid reset), and there would be no state left to check.
+    for id in [1, 3] {
+        ctx.streams.get_mut(&id).unwrap().dispatched = true;
+    }
 
     // Client sends RST_STREAM on stream 1 with CANCEL
     let rst1 = Frame::RstStream {

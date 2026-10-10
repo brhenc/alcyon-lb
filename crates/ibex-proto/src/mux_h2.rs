@@ -272,7 +272,17 @@ impl H2MuxContext {
             error_code,
         };
         self.enqueue_frame(&frame);
-        if let Some(stream) = self.streams.get_mut(&stream_id) {
+        self.stream_reset(stream_id, error_code);
+    }
+
+    /// A stream reset either way: one no transaction has taken is let go at once, as
+    /// HAProxy frees an h2s no stream is attached to; the one being served is marked, for
+    /// the data path to see. Kept, every reset stream held its decoded request until the
+    /// transaction on the connection ended -- rapid reset grew without bound (T235).
+    fn stream_reset(&mut self, stream_id: u32, error_code: H2Error) {
+        if self.streams.get(&stream_id).is_some_and(|s| !s.dispatched) {
+            self.streams.remove(&stream_id);
+        } else if let Some(stream) = self.streams.get_mut(&stream_id) {
             stream.state = H2StreamState::Reset(error_code);
             stream.reset_reason = Some(error_code);
             stream.is_shut = true;
@@ -984,18 +994,23 @@ impl MuxH2 {
                     ctx.send_rst_stream(stream_id, H2Error::StreamClosed);
                 } else if let Some(stream) = ctx.streams.get_mut(&stream_id) {
                     stream.recv_window = stream.recv_window.saturating_sub(data_len);
-                    // Once the response is over (half-closed local) nothing will take the
-                    // body any more: it is counted and dropped, not kept.
-                    if !data.is_empty() && stream.state != H2StreamState::HalfClosedLocal {
+                    // Kept only while the stream receives: once the response is over (half-
+                    // closed local) or the stream reset, nothing will take the body any more,
+                    // so it is counted and dropped.
+                    if !data.is_empty() && stream.state == H2StreamState::Open {
                         stream.rx_buffered += data.len();
                         stream.rx_htx.push(HtxBlock::Data(data));
                     }
                     if (flags & frame_flags::END_STREAM) != 0 {
-                        stream.rx_htx.push(HtxBlock::Eom);
-                        stream.state = match stream.state {
-                            H2StreamState::HalfClosedLocal => H2StreamState::Closed,
-                            _ => H2StreamState::HalfClosedRemote,
-                        };
+                        match stream.state {
+                            H2StreamState::HalfClosedLocal => stream.state = H2StreamState::Closed,
+                            H2StreamState::Open => {
+                                stream.rx_htx.push(HtxBlock::Eom);
+                                stream.state = H2StreamState::HalfClosedRemote;
+                            }
+                            // A reset stream stays reset.
+                            _ => {}
+                        }
                     }
                 }
 
@@ -1057,11 +1072,7 @@ impl MuxH2 {
                     }
                 }
 
-                if let Some(stream) = ctx.streams.get_mut(&stream_id) {
-                    stream.state = H2StreamState::Reset(error_code);
-                    stream.reset_reason = Some(error_code);
-                    stream.is_shut = true;
-                }
+                ctx.stream_reset(stream_id, error_code);
             }
 
             Frame::GoAway {
@@ -1371,12 +1382,34 @@ mod tests {
         mux.parse(&mut ctx, &data(1, 1000, 0)).expect("after end");
         let rst = &ctx.tx_buf[sent..];
         assert_eq!((rst.len(), rst[3], &rst[9..13]), (13, 0x3, &[0, 0, 0, 5][..]), "{rst:?}");
-        assert_eq!(ctx.streams.get(&1).map(|s| s.rx_htx.body_bytes().len()), Some(10));
+        // No transaction had taken it: the reset stream is let go, its request with it.
+        assert!(!ctx.streams.contains_key(&1));
         // Stream 3's response is over: what it still sends is counted and dropped.
         mux.parse(&mut ctx, &post_headers(3)).expect("open 3");
         ctx.streams.get_mut(&3).expect("3").state = H2StreamState::HalfClosedLocal;
         mux.parse(&mut ctx, &data(3, 1000, 0)).expect("data 3");
         assert_eq!(ctx.streams.get(&3).map(|s| (s.rx_buffered, s.rx_htx.body_bytes().len())), Some((0, 0)));
+    }
+
+    /// A reset stream no transaction has taken is let go at once, whichever side reset it;
+    /// the one being served stays, marked, for the data path to see (T235, rapid reset).
+    #[test]
+    fn a_reset_stream_not_taken_is_let_go() {
+        let (mux, mut ctx) = open_conn();
+        mux.parse(&mut ctx, &post_headers(1)).expect("open 1");
+        mux.parse(&mut ctx, &post_headers(3)).expect("open 3");
+        ctx.streams.get_mut(&1).expect("1").dispatched = true;
+        let rst = |id: u32| Frame::RstStream { stream_id: id, error_code: H2Error::Cancel }.encode();
+        mux.parse(&mut ctx, &rst(1)).expect("rst 1");
+        mux.parse(&mut ctx, &rst(3)).expect("rst 3");
+        assert_eq!(ctx.streams.get(&1).map(|s| s.state), Some(H2StreamState::Reset(H2Error::Cancel)));
+        assert!(!ctx.streams.contains_key(&3));
+        // DATA on the reset stream being served is counted and dropped, END_STREAM too.
+        mux.parse(&mut ctx, &data(1, 100, frame_flags::END_STREAM)).expect("data 1");
+        assert_eq!(ctx.streams.get(&1).map(|s| (s.state, s.rx_buffered)), Some((H2StreamState::Reset(H2Error::Cancel), 0)));
+        mux.parse(&mut ctx, &post_headers(5)).expect("open 5");
+        ctx.send_rst_stream(5, H2Error::ProtocolError);
+        assert!(!ctx.streams.contains_key(&5));
     }
 
     /// RFC 9113 section 6.1: padding counts toward flow control; only the data reaches the stream.

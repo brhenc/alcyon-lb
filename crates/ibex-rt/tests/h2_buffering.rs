@@ -259,3 +259,30 @@ fn rss_kib(i: &Ibex) -> i64 {
         .and_then(|v| v.split_whitespace().next()?.parse().ok())
         .expect("VmRSS")
 }
+
+/// Rapid reset (CVE-2023-44487): HEADERS then RST_STREAM on new ids while a request is at a
+/// server that answers nothing. HAProxy measured: 100 000 pairs taken in 0.3 s, RSS +1.5 MB,
+/// no GOAWAY (`tune.h2.fe.glitches-threshold` is 0 by default), a reset stream freed at once.
+/// Ibex before T235 kept every reset stream with its decoded request until the transaction
+/// on the connection ended: 14 000 pairs, RSS +12.4 MB, each pair slower than the last.
+#[test]
+fn reset_streams_are_let_go_at_once() {
+    let (ibex, fe) = start();
+    let mut c = connect(fe);
+    c.set_nonblocking(false).expect("blocking");
+    c.write_all(&frame(1, END_HEADERS | END_STREAM, 1, &head("GET"))).expect("request 1");
+    c.set_nonblocking(true).expect("nonblocking");
+    std::thread::sleep(Duration::from_millis(200));
+    let mut block = head("GET");
+    block.extend(lit("x-pad", &"y".repeat(100)));
+    let mut wire = Vec::new();
+    for i in 0..20_000u32 {
+        wire.extend(frame(1, END_HEADERS | END_STREAM, 3 + 2 * i, &block));
+        wire.extend(frame(3, 0, 3 + 2 * i, &8u32.to_be_bytes()));
+    }
+    let before = rss_kib(&ibex);
+    let taken = offer(&mut c, &wire, wire.len(), 3, true);
+    std::thread::sleep(Duration::from_secs(1));
+    let grown = rss_kib(&ibex) - before;
+    assert!(grown < 2048, "the proxy grew by {grown} KiB for {taken} of {} bytes of reset streams", wire.len());
+}
