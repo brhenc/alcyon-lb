@@ -257,8 +257,11 @@ pub fn format_show_info_counts(
     cum_conns: u64,
     cum_reqs: u64,
 ) -> String {
-    // `Ulimit-n` and `Maxsock`: the descriptors the process may hold (`getrlimit`).
+    // `Ulimit-n` and `Maxsock`: as the startup settled them (`globalconn::apply_nofile_limit`),
+    // or else the descriptors the process may hold (`getrlimit`).
     let nofile = rustix::process::getrlimit(rustix::process::Resource::Nofile).current.unwrap_or(0);
+    let ulimit_n = crate::globalconn::ulimit_n().unwrap_or(nofile);
+    let maxsock = crate::globalconn::maxsock_value().unwrap_or(nofile);
     // `global maxconn` and its configured ceiling, when there is one.
     let maxconn = if crate::globalconn::max() > 0 { crate::globalconn::max() } else { max_conns };
     let hard_maxconn = if crate::globalconn::hard() > 0 { crate::globalconn::hard() } else { max_conns };
@@ -299,9 +302,9 @@ pub fn format_show_info_counts(
 \
          PoolFailed: 0
 \
-         Ulimit-n: {nofile}
+         Ulimit-n: {ulimit_n}
 \
-         Maxsock: {nofile}
+         Maxsock: {maxsock}
 \
          Maxconn: {maxconn}
 \

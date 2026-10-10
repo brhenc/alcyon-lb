@@ -362,9 +362,7 @@ impl IdlePools {
     pub fn new(workers: usize, config: &Config) -> Arc<Self> {
         let g = config.global.as_ref();
         let unshared = g.is_some_and(|g| g.idle_pool_unshared);
-        let (listeners, stats_socket) = listener_count(config);
-        let checks = config.backends.iter().flat_map(|b| &b.servers).chain(config.listens.iter().flat_map(|l| &l.servers)).filter(|s| s.check).count();
-        let maxsock = crate::globalconn::maxsock(crate::globalconn::hard(), listeners, stats_socket, checks, workers.max(1));
+        let maxsock = config_maxsock(config, workers);
         let low = crate::globalconn::pool_count(maxsock, g.and_then(|g| g.pool_low_fd_ratio).unwrap_or(20));
         let high = crate::globalconn::pool_count(maxsock, g.and_then(|g| g.pool_high_fd_ratio).unwrap_or(25));
         Self::with_counts(workers, !unshared, low, high)
@@ -2715,6 +2713,15 @@ pub fn prebind_quic(config: &Config, workers: usize) -> io::Result<()> {
 
 /// The listeners a configuration opens, stats sockets included, and whether it has a stats
 /// socket: what `maxconn` and `maxsock` leave room for.
+/// `global.maxsock` for `config` run by `workers` threads, `global maxconn` as
+/// [`crate::globalconn::configure`] settled it.
+#[must_use]
+pub fn config_maxsock(config: &Config, workers: usize) -> usize {
+    let (listeners, stats_socket) = listener_count(config);
+    let checks = config.backends.iter().flat_map(|b| &b.servers).chain(config.listens.iter().flat_map(|l| &l.servers)).filter(|s| s.check).count();
+    crate::globalconn::maxsock(crate::globalconn::hard(), listeners, stats_socket, checks, workers.max(1))
+}
+
 fn listener_count(config: &Config) -> (usize, bool) {
     let stats_sockets = config.global.as_ref().map_or(0, |g| usize::from(g.stats_socket.is_some()) + g.extra_stats_sockets.len());
     let listeners = stats_sockets

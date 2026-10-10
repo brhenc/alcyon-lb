@@ -823,6 +823,18 @@ fn main() {
             process::exit(1);
         }
     };
+    // The soft limit on open files goes up to `maxsock` before any socket is opened.
+    let maxsock = ibex_rt::engine::config_maxsock(&config, nbthread);
+    // A `maxconn` computed from the hard limit fits it: only a configured one is refused.
+    let strict = config.global.as_ref().is_some_and(|g| g.maxconn.is_some() && !g.no_strict_limits);
+    match ibex_rt::globalconn::apply_nofile_limit(u64::try_from(maxsock).unwrap_or(u64::MAX), strict) {
+        Ok(None) => {}
+        Ok(Some(warning)) => eprintln!("[WARNING]  ({}) : {warning}", process::id()),
+        Err(alert) => {
+            config_alert_plain(&alert);
+            process::exit(1);
+        }
+    }
 
     let cli_socket: Option<PathBuf> = opts.stats_socket.clone().or_else(|| {
         config.global.as_ref().and_then(|g| g.stats_socket.as_ref()).map(PathBuf::from)

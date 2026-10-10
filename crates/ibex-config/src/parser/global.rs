@@ -378,6 +378,14 @@ pub(crate) fn parse_global_directive(
                 format!("'{}' is not supported (HTTP client resolvers are not implemented)", kw.text),
             ))
         }
+        "strict-limits" => {
+            global.no_strict_limits = false;
+            Ok(())
+        }
+        "no" if tokens.get(1).is_some_and(|t| t.text == "strict-limits") => {
+            global.no_strict_limits = true;
+            Ok(())
+        }
         "maxconn" => {
             if tokens.len() < 2 {
                 return Err(ConfigError::new(

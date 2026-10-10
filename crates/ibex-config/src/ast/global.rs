@@ -150,6 +150,10 @@ pub struct GlobalSection {
     /// `tune.idle-pool.shared off`: each worker takes only the idle server connections it
     /// released itself (the default, `on` or `full`, lets it take another worker's).
     pub idle_pool_unshared: bool,
+    /// `no strict-limits`: when the soft limit on open files cannot be raised to `maxsock`,
+    /// warn and run with the hard limit instead of refusing to start (`strict-limits`, the
+    /// default).
+    pub no_strict_limits: bool,
     /// `tune.pool-high-fd-ratio`: the percentage of `maxsock` in use past which no released
     /// server connection is kept idle (25 when unset).
     pub pool_high_fd_ratio: Option<u8>,

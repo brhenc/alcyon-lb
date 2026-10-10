@@ -9,23 +9,86 @@
 //! own `maxconn`. The stats socket is not counted. State is process-wide, set when an
 //! engine is built from a configuration that has a `maxconn`.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 static CURR: AtomicU32 = AtomicU32::new(0);
 /// The limit in force (`set maxconn global`); 0 is no limit.
 static MAX: AtomicU32 = AtomicU32::new(0);
 /// What the configuration said (`global.hardmaxconn`): `set maxconn global` stays below it.
 static HARD: AtomicU32 = AtomicU32::new(0);
+/// `global.maxsock` and `global.rlimit_nofile` as [`apply_nofile_limit`] settled them
+/// (`show info` `Maxsock` and `Ulimit-n`); 0 before it ran.
+static MAXSOCK: AtomicU64 = AtomicU64::new(0);
+static ULIMIT_N: AtomicU64 = AtomicU64::new(0);
+
+/// Raises the soft limit on open files to `maxsock` when it is lower, as `HAProxy` does at
+/// startup (`apply_nofile_limit`, src/limits.c): the hard limit is raised along with it when
+/// it is lower too (which only a privileged process may do); a higher soft limit is left
+/// alone. When that fails, `strict` (the default `strict-limits`) makes it an error, the
+/// alert `HAProxy` exits with; otherwise the soft limit goes to the hard one and the
+/// returned warning says so. Records `Maxsock` and `Ulimit-n` for `show info`.
+///
+/// Without it the process kept the soft limit it was started with -- 1024 under systemd --
+/// while `maxconn` came from the hard one: `EMFILE` at ~500 sessions (T237).
+///
+/// # Errors
+/// The alert, when the limit cannot be raised and `strict` is set.
+pub fn apply_nofile_limit(maxsock: u64, strict: bool) -> Result<Option<String>, String> {
+    use rustix::process::{getrlimit, setrlimit, Resource, Rlimit};
+    MAXSOCK.store(maxsock, Ordering::Relaxed);
+    ULIMIT_N.store(maxsock, Ordering::Relaxed);
+    let cur = getrlimit(Resource::Nofile);
+    if cur.current.is_none_or(|c| c >= maxsock) {
+        return Ok(None);
+    }
+    let maximum = cur.maximum.map(|m| m.max(maxsock));
+    if setrlimit(Resource::Nofile, Rlimit { current: Some(maxsock), maximum }).is_ok() {
+        return Ok(None);
+    }
+    let soft = cur.current.unwrap_or(0);
+    let hard = cur.maximum.map_or_else(|| "unlimited".to_string(), |m| m.to_string());
+    let msg = format!(
+        "Cannot raise FD limit to {maxsock}, current limit is {soft} and hard limit is {hard}. You may prefer to let \
+         Ibex adjust the limit by itself; for this, please just drop any 'maxconn' from the global section. You may \
+         also force a new 'maxconn' value that is a bit lower than half of the hard limit minus listeners and checks."
+    );
+    if strict {
+        return Err(msg);
+    }
+    // `no strict-limits`: as much as the hard limit allows.
+    let _ = setrlimit(Resource::Nofile, Rlimit { current: cur.maximum, maximum: cur.maximum });
+    let now = getrlimit(Resource::Nofile).current.unwrap_or(soft);
+    ULIMIT_N.store(now, Ordering::Relaxed);
+    Ok(Some(format!("{msg} Running with a limit of {now}.")))
+}
+
+/// `show info` `Maxsock`: what [`apply_nofile_limit`] was given, `None` before it ran.
+#[must_use]
+pub fn maxsock_value() -> Option<u64> {
+    Some(MAXSOCK.load(Ordering::Relaxed)).filter(|&v| v != 0)
+}
+
+/// `show info` `Ulimit-n`: the limit [`apply_nofile_limit`] settled, `None` before it ran.
+#[must_use]
+pub fn ulimit_n() -> Option<u64> {
+    Some(ULIMIT_N.load(Ordering::Relaxed)).filter(|&v| v != 0)
+}
 
 /// The `global.maxconn` `HAProxy` computes for a configuration without one
 /// (`compute_ideal_maxconn`): half of what is left of the file descriptors after its own
 /// -- 12, one per listener, and 10 for a `stats socket` -- measured on 3.5-dev8-885761-29
 /// (it raises the soft limit to the hard one first, and one descriptor is not counted).
+///
+/// Each thread past the first takes three more (its poller and wake-up pipe, as in
+/// [`maxsock`]): 2031 for `nbthread 4` under a hard limit of 4096 where `nbthread 1` gets
+/// 2035, measured. Without them `maxsock` overran the hard limit the soft one is raised to
+/// (T237).
 #[must_use]
-pub fn ideal_maxconn(nofile_hard: Option<u64>, listeners: usize, stats_socket: bool) -> u32 {
+pub fn ideal_maxconn(nofile_hard: Option<u64>, listeners: usize, stats_socket: bool, nbthread: usize) -> u32 {
     // Unlimited is what the kernel allows a process: `fs.nr_open`'s default.
     let nofile = nofile_hard.unwrap_or(1_048_576);
-    let overhead = 12 + listeners as u64 + if stats_socket { 10 } else { 0 };
+    let threads = 3 * (nbthread.max(1) as u64 - 1);
+    let overhead = 12 + listeners as u64 + if stats_socket { 10 } else { 0 } + threads;
     u32::try_from((nofile.saturating_sub(1).saturating_sub(overhead)) / 2).unwrap_or(u32::MAX).max(1)
 }
 
@@ -37,7 +100,7 @@ pub fn configure(maxconn: Option<u32>, listeners: usize, stats_socket: bool) {
         let l = rustix::process::getrlimit(rustix::process::Resource::Nofile);
         l.maximum
     };
-    let v = maxconn.unwrap_or_else(|| ideal_maxconn(hard_nofile, listeners, stats_socket));
+    let v = maxconn.unwrap_or_else(|| ideal_maxconn(hard_nofile, listeners, stats_socket, crate::stats::NBTHREAD.load(Ordering::Relaxed) as usize));
     MAX.store(v, Ordering::Relaxed);
     HARD.store(v, Ordering::Relaxed);
     if maxconn.is_some() {
