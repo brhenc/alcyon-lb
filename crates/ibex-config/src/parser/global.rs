@@ -57,7 +57,41 @@ pub(crate) fn parse_global_directive(
                 global.stats_timeout = Some(d);
                 return Ok(());
             }
-            if tokens.len() >= 3 && tokens[1].text == "socket" {
+            let sub = tokens.get(1).map_or("", |t| t.text.as_str());
+            let arg = tokens.get(2).map_or("", |t| t.text.as_str());
+            let at = tokens.get(2).or_else(|| tokens.get(1)).map_or((kw.line, kw.col), |t| (t.line, t.col));
+            let refuse = |msg: String| Err(ConfigError::new(at.0, at.1, msg));
+            match sub {
+                "socket" if arg.is_empty() => {
+                    return refuse("'stats socket' in global section expects an address or a path to a UNIX socket".to_string());
+                }
+                "socket" => {}
+                // The same refusals as `HAProxy` (`atol`: a prefix of digits counts). Ibex has no
+                // limit on CLI connections to apply, so a valid value is refused as well.
+                "maxconn" => {
+                    let digits: String = arg.trim_start().chars().take_while(char::is_ascii_digit).collect();
+                    if digits.parse::<i64>().map_or(true, |n| n <= 0) {
+                        return refuse("'stats maxconn' expects a positive value".to_string());
+                    }
+                    return refuse("'stats maxconn' is not supported by Ibex".to_string());
+                }
+                "calculate-max-counters" => {
+                    return if arg.eq_ignore_ascii_case("on") {
+                        Ok(()) // what HAProxy does without the line
+                    } else if arg.eq_ignore_ascii_case("off") {
+                        refuse("'stats calculate-max-counters off' is not supported by Ibex".to_string())
+                    } else {
+                        refuse(format!("'calculate-max-counters' only supports 'on' and 'off', received '{arg}'"))
+                    };
+                }
+                "bind-process" => return refuse("'stats bind-process' is not supported anymore.".to_string()),
+                _ => {
+                    return refuse(format!(
+                        "'stats' only supports 'socket', 'maxconn', 'bind-process', 'calculate-max-counters'  and 'timeout' (got '{sub}')"
+                    ));
+                }
+            }
+            if tokens.len() >= 3 {
                 let path = stats_socket_path(&tokens[2])?;
                 let mut sock = crate::ast::StatsSocket { path, ..Default::default() };
                 let mut i = 3;
