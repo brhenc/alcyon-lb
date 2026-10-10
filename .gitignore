@@ -96,3 +96,11 @@ flame-*.svg
 # ---------------------------------------------------------------------------
 fuzz/libfuzzer/corpus/
 fuzz/libfuzzer/Cargo.lock
+
+# ---------------------------------------------------------------------------
+# Local only: the operator's agent-session launchers, and the old WIP patch
+# exports (2026-09-27; their work is on main or in the agy/T* branches).
+# ---------------------------------------------------------------------------
+/agy-resume.sh
+/mythos-resume.sh
+/patches/
