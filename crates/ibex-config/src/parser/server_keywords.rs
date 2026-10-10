@@ -87,7 +87,8 @@ pub(crate) const UNIMPLEMENTED_SERVER_KEYWORDS: &[ServerKeyword] = &[
     kw!("init-state", Arg::Word, Refuse("Ibex does not implement it; the server would take traffic in a state it should not")),
     kw!("log-bufsize", Arg::Word, Ignore("log servers only")),
     kw!("log-proto", Arg::Word, Ignore("log servers only")),
-    kw!("maxqueue", Arg::Word, Ignore("the server's queue length; Ibex has no server queue")),
+    // `atol`: 0 (or a word) is no limit, which is what Ibex does; see `parse_unimplemented`.
+    kw!("maxqueue", Arg::Word, Refuse("Ibex has no per-server queue (a request waits in its backend's queue); only 'maxqueue 0' is accepted")),
     kw!("max-reuse", Arg::Word, Ignore("how many requests a connection carries")),
     kw!("minconn", Arg::Word, Ignore("the dynamic connection limit")),
     kw!("namespace", Arg::Word, ROUTE),
@@ -194,6 +195,9 @@ pub(crate) fn unimplemented_server_keyword(tokens: &[Token], i: usize, server: O
             i + 1
         }
     };
+    if k.name == "maxqueue" && atol(&tokens[i + 1].text) <= 0 {
+        return Ok(last);
+    }
     if server.is_none() && !k.default_ok {
         eprintln!("[ibex] warning: '{}' option is not accepted in default-server sections; ignored", k.name);
         return Ok(last);
@@ -219,4 +223,16 @@ pub(crate) fn parse_server_delay(arg: &Token, kw: &str, server: Option<&str>) ->
         let name = server.unwrap_or("(null)");
         format!("{prefix}{what} in argument <{a}> to <{kw}> of server {name}, maximum value is 2147483647 ms (~24.8 days)..")
     })
+}
+
+/// C's `atol`: leading blanks, a sign, then the digits there are; anything else is 0.
+pub(crate) fn atol(s: &str) -> i64 {
+    let t = s.trim_start();
+    let (neg, rest) = match t.as_bytes().first() {
+        Some(b'-') => (true, &t[1..]),
+        Some(b'+') => (false, &t[1..]),
+        _ => (false, t),
+    };
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).fold(0i64, |n, d| n.saturating_mul(10).saturating_add(i64::from(d - b'0')));
+    if neg { -digits } else { digits }
 }

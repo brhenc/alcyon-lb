@@ -475,11 +475,24 @@ pub(crate) fn parse_global_directive(
             }
             Ok(())
         }
+        // `HAProxy` limits concurrent TLS connections with it; Ibex has no such count, so a
+        // limit is refused (T240). 0 (`atol`, so also a word) is no limit and loads.
         "maxsslconn" => {
-            if tokens.len() >= 2 {
-                global.maxsslconn = tokens[1].text.parse::<u32>().ok();
+            if let Some(extra) = tokens.get(2) {
+                return Err(ConfigError::new(extra.line, extra.col, format!("'maxsslconn' cannot handle unexpected argument '{}'.", extra.text)));
             }
-            Ok(())
+            let Some(arg) = tokens.get(1).filter(|t| !t.text.is_empty()) else {
+                return Err(ConfigError::new(kw.line, kw.col, "'maxsslconn' expects an integer argument."));
+            };
+            match super::server_keywords::atol(&arg.text) {
+                0 => Ok(()),
+                n if n < 0 => Err(ConfigError::new(arg.line, arg.col, "'maxsslconn' expects a positive numeric value.")),
+                _ => Err(ConfigError::new(
+                    arg.line,
+                    arg.col,
+                    "'maxsslconn' is not implemented in Ibex: TLS connections are limited by 'maxconn' only",
+                )),
+            }
         }
         "ssl-default-bind-ciphers" => {
             if tokens.len() >= 2 {

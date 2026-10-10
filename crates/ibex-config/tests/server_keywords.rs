@@ -68,7 +68,9 @@ const KEYWORDS: &[(&str, Ibex)] = &[
     ("log-bufsize 1024", Accepts),
     ("log-proto legacy", Accepts),
     ("maxconn 10", Accepts),
-    ("maxqueue 10", Accepts),
+    // T240: a limit Ibex cannot apply is refused; 0, no limit, is what Ibex does.
+    ("maxqueue 10", Refuses),
+    ("maxqueue 0", Accepts),
     ("max-reuse 10", Accepts),
     ("minconn 5", Accepts),
     ("namespace ns1", Refuses),

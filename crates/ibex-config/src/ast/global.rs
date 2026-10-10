@@ -233,8 +233,6 @@ pub struct GlobalSection {
     pub pidfile: Option<String>,
     /// Hard stop timeout on reload/exit.
     pub hard_stop_after: Option<Duration>,
-    /// Max SSL connection limit.
-    pub maxsslconn: Option<u32>,
     /// Default SSL bind ciphers.
     pub ssl_default_bind_ciphers: Option<String>,
     /// Default SSL bind options.
