@@ -2736,6 +2736,15 @@ pub fn prebind_quic(config: &Config, workers: usize) -> io::Result<()> {
     Ok(())
 }
 
+/// Settles `global maxconn` for `config` ([`crate::globalconn::configure`]), leaving room for
+/// its listeners. Startup calls it before [`config_maxsock`] raises the file descriptor
+/// limit, which `build_shared_state` now follows (it binds the `log-forward` sockets after
+/// the old process handed them over); `build_shared_state` calls it again for a reload.
+pub fn configure_maxconn(config: &Config) {
+    let (listeners, stats_socket) = listener_count(config);
+    crate::globalconn::configure(config.global.as_ref().and_then(|g| g.maxconn), listeners, stats_socket);
+}
+
 /// The listeners a configuration opens, stats sockets included, and whether it has a stats
 /// socket: what `maxconn` and `maxsock` leave room for.
 /// `global.maxsock` for `config` run by `workers` threads, `global maxconn` as
@@ -3433,13 +3442,9 @@ impl Engine {
     pub fn build_shared_state(config: &Config) -> io::Result<Proxies> {
     // Expressions and ACL files compiled for a previous configuration are not reused.
     ibex_sample::expr::new_generation();
-    {
-        // The clock of `lastchg` and `lastsess` (`show stat`) starts with the proxies.
-        let _ = crate::statcnt::now_ms();
-        // The listeners the file descriptor budget has to leave room for.
-        let (listeners, stats_socket) = listener_count(config);
-        crate::globalconn::configure(config.global.as_ref().and_then(|g| g.maxconn), listeners, stats_socket);
-    }
+    // The clock of `lastchg` and `lastsess` (`show stat`) starts with the proxies.
+    let _ = crate::statcnt::now_ms();
+    configure_maxconn(config);
     // An action naming a fetch or converter the registry lacks would load and then do
     // nothing on every request; `HAProxy` refuses the configuration instead.
     crate::rule_exprs::validate_config(config)

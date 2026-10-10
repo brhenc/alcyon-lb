@@ -796,7 +796,9 @@ fn main() {
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 64));
     ibex_rt::stats::NBTHREAD.store(nbthread as u32, std::sync::atomic::Ordering::Relaxed);
 
-    // The soft limit on open files goes up to `maxsock` before any socket is opened.
+    // The soft limit on open files goes up to `maxsock` before any socket is opened;
+    // `maxsock` counts `maxconn`, settled first.
+    ibex_rt::engine::configure_maxconn(&config);
     let maxsock = ibex_rt::engine::config_maxsock(&config, nbthread);
     // A `maxconn` computed from the hard limit fits it: only a configured one is refused.
     let strict = config.global.as_ref().is_some_and(|g| g.maxconn.is_some() && !g.no_strict_limits);
