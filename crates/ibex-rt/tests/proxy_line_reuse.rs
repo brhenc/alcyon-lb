@@ -104,7 +104,7 @@ fn run(options: &str, first: &str, second: &str) -> Seen {
         .arg(f.path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
+        .spawn().map(common::Ibex)
         .expect("spawn ibex");
     assert!(common::wait_listening(fe), "ibex never listened on {fe}");
     let mut c = TcpStream::connect(fe).expect("connect");

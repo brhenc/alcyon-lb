@@ -15,7 +15,7 @@ mod common;
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -50,12 +50,12 @@ fn run(rule: &str) -> Vec<String> {
     );
     let mut f = NamedTempFile::new().expect("tmp");
     f.write_all(cfg.as_bytes()).expect("write");
-    let mut child: Child = Command::new(env!("CARGO_BIN_EXE_ibex"))
+    let mut child: common::Ibex = Command::new(env!("CARGO_BIN_EXE_ibex"))
         .arg("-f")
         .arg(f.path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
+        .spawn().map(common::Ibex)
         .expect("spawn");
     assert!(common::wait_listening(fe), "ibex never listened");
     let mut seen = Vec::new();

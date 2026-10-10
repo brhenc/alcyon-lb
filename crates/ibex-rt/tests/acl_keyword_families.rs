@@ -182,7 +182,7 @@ fn acl_keyword_shorthands_match_as_haproxy() {
         .arg(&path)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
+        .spawn().map(common::Ibex)
         .expect("spawn ibex");
     assert!(common::wait_listening(fe), "ibex did not listen");
     let (a_req, a_res) = hits(fe, REQ_A);

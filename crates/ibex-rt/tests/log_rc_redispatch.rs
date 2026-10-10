@@ -52,7 +52,7 @@ fn run(backend_opts: &str) -> Vec<String> {
     );
     let mut f = NamedTempFile::new().expect("tmp");
     f.write_all(cfg.as_bytes()).expect("write cfg");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(f.path()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn ibex");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(f.path()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map(common::Ibex).expect("spawn ibex");
     assert!(common::wait_listening(fe), "ibex never listened");
     for _ in 0..6 {
         let mut c = TcpStream::connect(fe).expect("connect");

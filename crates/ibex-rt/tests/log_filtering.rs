@@ -65,7 +65,7 @@ fn the_log_options_filter_and_raise_the_level() {
     );
     let path = std::env::temp_dir().join(format!("ibex_logfilter_{}", std::process::id()));
     std::fs::write(&path, cfg).expect("write config");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn ibex");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map(common::Ibex).expect("spawn ibex");
     let deadline = Instant::now() + Duration::from_secs(5);
     while TcpStream::connect(("127.0.0.1", probe)).is_err() {
         assert!(Instant::now() < deadline, "the daemon never listened on {probe}");

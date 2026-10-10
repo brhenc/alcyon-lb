@@ -22,7 +22,7 @@ fn show_stat_ends_with_an_empty_line() {
         format!("global\n  stats socket {sock} level admin\ndefaults\n  mode http\nfrontend f\n  bind {fe}\n"),
     )
     .expect("write cfg");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(&cfg).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(&cfg).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map(common::Ibex).expect("spawn");
     assert!(common::wait_listening(fe), "ibex never listened");
     let mut c = UnixStream::connect(&sock).expect("connect cli");
     c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();

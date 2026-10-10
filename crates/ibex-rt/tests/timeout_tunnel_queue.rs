@@ -103,7 +103,7 @@ fn with_ibex<T>(timeouts: &str, mode: &str, listen_body: &str, be: SocketAddr, f
     );
     let mut file = NamedTempFile::new().expect("tmp");
     file.write_all(cfg.as_bytes()).expect("write");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(file.path()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(file.path()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map(common::Ibex).expect("spawn");
     assert!(common::wait_listening(fe), "never listened:\n{cfg}");
     let out = f(fe, &lines);
     common::stop(&mut child);

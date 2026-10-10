@@ -47,7 +47,7 @@ fn startup_rss_kb(backends: usize, nbthread: usize) -> u64 {
         .arg(&path)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .spawn()
+        .spawn().map(common::Ibex)
         .expect("spawn ibex");
     // Ten thousand backends take a debug build a while to load.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);

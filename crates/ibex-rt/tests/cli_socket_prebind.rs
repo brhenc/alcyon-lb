@@ -49,7 +49,7 @@ fn stats_sockets_exist_when_the_frontend_port_first_accepts() {
             .arg(f.path())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .spawn()
+            .spawn().map(common::Ibex)
             .expect("spawn ibex");
         // No sleep: the point is the first instant the port answers.
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -76,7 +76,7 @@ fn an_unbindable_stats_socket_stops_the_start_before_any_port_listens() {
         .arg(f.path())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn().map(common::Ibex)
         .expect("spawn ibex");
     let mut stderr = child.stderr.take().expect("stderr");
     let deadline = Instant::now() + Duration::from_secs(10);

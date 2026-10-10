@@ -56,7 +56,7 @@ fn run_case(c: &Case, files: &str) {
         .arg(f.path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
+        .spawn().map(common::Ibex)
         .expect("spawn ibex");
     let up = common::wait_listening(fe);
     let mut bad = Vec::new();

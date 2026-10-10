@@ -194,7 +194,7 @@ fn the_daemon_does_not_start_on_an_unknown_fetch() {
         .arg(&path)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn().map(common::Ibex)
         .expect("spawn ibex");
     let deadline = Instant::now() + Duration::from_secs(5);
     let status = loop {

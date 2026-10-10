@@ -56,7 +56,7 @@ fn get_var_answers_from_the_process_scope_only() {
         .arg(&cfg)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
+        .spawn().map(common::Ibex)
         .expect("spawn ibex");
     assert!(common::wait_listening(fe), "ibex never listened on {fe}");
     // A stream that set txn.x and sess.y, kept open while the CLI is asked.

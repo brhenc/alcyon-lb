@@ -72,7 +72,7 @@ fn retry_on_statuses_conn_failures_and_the_l7_retry_switch() {
     );
     let path = std::env::temp_dir().join(format!("ibex_retryon_{}", std::process::id()));
     std::fs::write(&path, cfg).expect("write config");
-    let mut child = Command::new(std::env::var("IBEX_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ibex").to_string())).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn ibex");
+    let mut child = Command::new(std::env::var("IBEX_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ibex").to_string())).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map(common::Ibex).expect("spawn ibex");
     let deadline = Instant::now() + Duration::from_secs(5);
     while TcpStream::connect(("127.0.0.1", port)).is_err() {
         assert!(Instant::now() < deadline, "the daemon never listened on {port}");
@@ -156,7 +156,7 @@ fn retry_on_empty_response_junk_response_and_response_timeout() {
                 .arg(&path)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
-                .spawn()
+                .spawn().map(common::Ibex)
                 .expect("spawn ibex");
             let deadline = Instant::now() + Duration::from_secs(5);
             while TcpStream::connect(("127.0.0.1", port)).is_err() {
@@ -192,7 +192,7 @@ fn retry_on_a_status_needs_a_retry_left_and_a_request_that_was_kept() {
     );
     let path = std::env::temp_dir().join(format!("ibex_retryon_left_{}", std::process::id()));
     std::fs::write(&path, cfg).expect("write config");
-    let mut child = Command::new(std::env::var("IBEX_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ibex").to_string())).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn ibex");
+    let mut child = Command::new(std::env::var("IBEX_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ibex").to_string())).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map(common::Ibex).expect("spawn ibex");
     let deadline = Instant::now() + Duration::from_secs(5);
     while TcpStream::connect(("127.0.0.1", port)).is_err() {
         assert!(Instant::now() < deadline, "the daemon never listened on {port}");

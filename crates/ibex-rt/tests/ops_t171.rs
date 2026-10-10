@@ -95,7 +95,7 @@ fn term(flags: &[&str], sig: rustix::process::Signal) -> (Option<i32>, Option<i3
     let fe = common::reserve_addr();
     let mut f = tempfile::NamedTempFile::new().expect("tmp");
     write!(f, "defaults\n  mode http\n  timeout client 2s\nfrontend f\n  bind {fe}\n  http-request return status 200\n").expect("cfg");
-    let mut child = ibex().args(flags).arg("-f").arg(f.path()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn");
+    let mut child = ibex().args(flags).arg("-f").arg(f.path()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map(common::Ibex).expect("spawn");
     assert!(common::wait_listening(fe), "ibex never listened");
     std::thread::sleep(Duration::from_millis(300));
     let pid = rustix::process::Pid::from_raw(i32::try_from(child.id()).expect("pid")).expect("pid");

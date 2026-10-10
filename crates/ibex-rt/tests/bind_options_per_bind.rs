@@ -27,7 +27,7 @@ fn body(resp: &str) -> &str {
     resp.split("\r\n\r\n").nth(1).unwrap_or("")
 }
 
-fn run(cfg: &str, first: SocketAddr) -> (NamedTempFile, std::process::Child) {
+fn run(cfg: &str, first: SocketAddr) -> (NamedTempFile, common::Ibex) {
     let mut f = NamedTempFile::new().expect("tmp");
     f.write_all(cfg.as_bytes()).expect("cfg");
     let child = Command::new(env!("CARGO_BIN_EXE_ibex"))
@@ -35,7 +35,7 @@ fn run(cfg: &str, first: SocketAddr) -> (NamedTempFile, std::process::Child) {
         .arg(f.path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
+        .spawn().map(common::Ibex)
         .expect("spawn");
     assert!(common::wait_listening(first));
     (f, child)

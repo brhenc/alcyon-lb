@@ -354,7 +354,7 @@ fn run(rule: &str) {
     }
     let mut f = NamedTempFile::new().expect("tmp");
     f.write_all(cfg.as_bytes()).expect("write cfg");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(f.path()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn ibex");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(f.path()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map(common::Ibex).expect("spawn ibex");
     let deadline = Instant::now() + Duration::from_secs(5);
     for (_, fe) in &fes {
         while TcpStream::connect(fe).is_err() {

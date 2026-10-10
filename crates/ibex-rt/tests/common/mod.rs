@@ -137,3 +137,28 @@ pub fn stop(child: &mut std::process::Child) {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+/// A spawned `ibex` that is stopped when it goes out of scope, also when the test panics
+/// before it reaches its own `stop` call. Derefs to `Child`, so `common::stop(&mut ibex)`,
+/// `ibex.id()` and `ibex.stdout.take()` keep working. `stop` is a no-op on a child that has
+/// already exited, so an explicit `common::stop` followed by the drop is harmless.
+pub struct Ibex(pub std::process::Child);
+
+impl std::ops::Deref for Ibex {
+    type Target = std::process::Child;
+    fn deref(&self) -> &std::process::Child {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Ibex {
+    fn deref_mut(&mut self) -> &mut std::process::Child {
+        &mut self.0
+    }
+}
+
+impl Drop for Ibex {
+    fn drop(&mut self) {
+        stop(&mut self.0);
+    }
+}

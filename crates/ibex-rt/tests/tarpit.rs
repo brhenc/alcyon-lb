@@ -33,7 +33,7 @@ fn with_ibex<T>(cfg: &str, f: impl FnOnce(SocketAddr) -> T) -> T {
         .arg(file.path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
+        .spawn().map(common::Ibex)
         .expect("spawn ibex");
     assert!(common::wait_listening(fe), "ibex never listened with:\n{cfg}");
     let out = f(fe);

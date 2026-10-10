@@ -58,7 +58,7 @@ fn when_tells_forwarded_error_and_applet_streams_apart() {
     );
     let path = std::env::temp_dir().join(format!("ibex_whenapplet_{}", std::process::id()));
     std::fs::write(&path, cfg).expect("write config");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn ibex");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map(common::Ibex).expect("spawn ibex");
     let deadline = Instant::now() + Duration::from_secs(5);
     while TcpStream::connect(("127.0.0.1", port)).is_err() {
         assert!(Instant::now() < deadline, "the daemon never listened on {port}");
@@ -103,7 +103,7 @@ fn a_failing_after_response_rule_turns_the_stats_page_into_a_500() {
         .arg(&path)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
+        .spawn().map(common::Ibex)
         .expect("spawn ibex");
     let deadline = Instant::now() + Duration::from_secs(5);
     while TcpStream::connect(("127.0.0.1", port)).is_err() {

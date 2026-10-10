@@ -73,7 +73,7 @@ fn the_whole_part_is_replaced_by_the_expanded_log_format() {
         .arg(f.path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
+        .spawn().map(common::Ibex)
         .expect("spawn ibex");
     assert!(common::wait_listening(fe), "ibex never listened");
     let mut wrong = Vec::new();

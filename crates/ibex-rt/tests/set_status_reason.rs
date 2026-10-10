@@ -55,7 +55,7 @@ fn status_line(rule: &str) -> String {
         .arg(f.path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
+        .spawn().map(common::Ibex)
         .expect("spawn");
     assert!(common::wait_listening(fe), "never listened with:\n{cfg}");
     let mut c = TcpStream::connect(fe).expect("connect");

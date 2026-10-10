@@ -60,7 +60,7 @@ fn debug_copies_the_sample_to_buf0_and_to_a_named_sink() {
     );
     let path = std::env::temp_dir().join(format!("ibex_debugconv_{}", std::process::id()));
     std::fs::write(&path, cfg).expect("write config");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn ibex");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map(common::Ibex).expect("spawn ibex");
     let deadline = Instant::now() + Duration::from_secs(5);
     while TcpStream::connect(("127.0.0.1", port)).is_err() || !sock.exists() {
         assert!(Instant::now() < deadline, "the daemon never listened on {port}");
@@ -125,7 +125,7 @@ fn debug_to_stdout_and_stderr_writes_the_line_there() {
         .arg(&path)
         .stdout(Stdio::from(std::fs::File::create(&out_path).expect("stdout file")))
         .stderr(Stdio::from(std::fs::File::create(&err_path).expect("stderr file")))
-        .spawn()
+        .spawn().map(common::Ibex)
         .expect("spawn ibex");
     let deadline = Instant::now() + Duration::from_secs(5);
     while TcpStream::connect(("127.0.0.1", port)).is_err() {
@@ -170,7 +170,7 @@ fn debug_names_the_sample_type() {
         .arg(&path)
         .stdout(Stdio::from(std::fs::File::create(&out_path).expect("stdout file")))
         .stderr(Stdio::null())
-        .spawn()
+        .spawn().map(common::Ibex)
         .expect("spawn ibex");
     let deadline = Instant::now() + Duration::from_secs(5);
     while TcpStream::connect(("127.0.0.1", port)).is_err() || TcpStream::connect(("::1", port6)).is_err() {

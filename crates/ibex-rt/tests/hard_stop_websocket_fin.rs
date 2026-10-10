@@ -123,7 +123,7 @@ fn hard_stop_after_closes_an_upgraded_connection_with_a_fin() {
         .arg(f.path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
+        .spawn().map(common::Ibex)
         .expect("spawn ibex");
     assert!(common::wait_listening(fe), "ibex never listened");
     thread::sleep(Duration::from_millis(500));

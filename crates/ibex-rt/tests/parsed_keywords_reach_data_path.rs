@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tempfile::NamedTempFile;
 
-fn spawn(cfg: &str) -> (std::process::Child, NamedTempFile) {
+fn spawn(cfg: &str) -> (common::Ibex, NamedTempFile) {
     let mut f = NamedTempFile::new().expect("tmp");
     f.write_all(cfg.as_bytes()).expect("cfg");
     let child = Command::new(env!("CARGO_BIN_EXE_ibex"))
@@ -29,7 +29,7 @@ fn spawn(cfg: &str) -> (std::process::Child, NamedTempFile) {
         .arg(f.path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
+        .spawn().map(common::Ibex)
         .expect("spawn");
     (child, f)
 }
@@ -189,7 +189,7 @@ fn a_refused_socket_option_warns_and_the_listener_still_serves() {
         .arg(f.path())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn().map(common::Ibex)
         .expect("spawn");
     assert!(common::wait_listening(a), "the listener must serve despite the refused option");
     common::stop(&mut child);

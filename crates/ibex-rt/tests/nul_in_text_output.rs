@@ -37,7 +37,7 @@ fn a_binary_written_as_text_stops_at_the_first_nul() {
         .arg(f.path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
+        .spawn().map(common::Ibex)
         .expect("spawn ibex");
     assert!(common::wait_listening(fe), "ibex never listened");
     // The probe connection of `wait_listening` leaves a log line: drop what is there.

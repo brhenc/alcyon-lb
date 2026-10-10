@@ -54,7 +54,7 @@ fn origin(size: usize) -> SocketAddr {
     addr
 }
 
-fn spawn_ibex(tag: &str, be: SocketAddr) -> (std::process::Child, SocketAddr, std::path::PathBuf) {
+fn spawn_ibex(tag: &str, be: SocketAddr) -> (common::Ibex, SocketAddr, std::path::PathBuf) {
     let fe = common::reserve_addr();
     let path = std::env::temp_dir().join(format!("ibex_lrl_{tag}_{}.cfg", std::process::id()));
     let cfg = format!(
@@ -66,7 +66,7 @@ fn spawn_ibex(tag: &str, be: SocketAddr) -> (std::process::Child, SocketAddr, st
         .arg(&path)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
+        .spawn().map(common::Ibex)
         .expect("spawn ibex");
     assert!(common::wait_listening(fe), "ibex did not listen");
     (child, fe, path)

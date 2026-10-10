@@ -53,7 +53,7 @@ fn expect_proxy_is_per_connection() {
         .arg(f.path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
+        .spawn().map(common::Ibex)
         .expect("spawn");
     assert!(common::wait_listening(a));
     let r1 = talk(a, b"PROXY TCP4 192.168.0.1 10.0.0.2 1234 81\r\n", true).to_ascii_lowercase();

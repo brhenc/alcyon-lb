@@ -67,7 +67,7 @@ fn set_src_dst_and_ports_from_every_rule_set() {
         .arg(f.path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
+        .spawn().map(common::Ibex)
         .expect("spawn");
     assert!(common::wait_listening(a1));
     assert!(common::wait_listening(a4));

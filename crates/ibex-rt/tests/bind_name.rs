@@ -36,7 +36,7 @@ fn so_name_reads_the_bind_name() {
         .arg(f.path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
+        .spawn().map(common::Ibex)
         .expect("spawn");
     assert!(common::wait_listening(a));
     let (ra, rb, rc) = (get(a), get(b), get(c));

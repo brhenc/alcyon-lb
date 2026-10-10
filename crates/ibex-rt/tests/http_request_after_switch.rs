@@ -25,7 +25,7 @@ fn the_first_request_after_switch_mode_has_the_http_request_timeout() {
     );
     let mut f = NamedTempFile::new().expect("tmp");
     f.write_all(cfg.as_bytes()).expect("write cfg");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(f.path()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn ibex");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(f.path()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map(common::Ibex).expect("spawn ibex");
     assert!(common::wait_listening(fe), "ibex never listened");
     let mut c = TcpStream::connect(fe).expect("connect");
     c.set_read_timeout(Some(Duration::from_secs(6))).expect("timeout");

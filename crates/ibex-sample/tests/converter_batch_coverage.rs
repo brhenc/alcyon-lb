@@ -84,7 +84,8 @@ fn json_query_extracts() {
 
 #[test]
 fn map_match_type_longest_match() {
-    let path = "/tmp/map_beg_table.txt";
+    let path_buf = format!("/tmp/map_beg_table.{}.txt", std::process::id());
+    let path = path_buf.as_str();
     let mut file = std::fs::File::create(path).unwrap();
     writeln!(file, "foo short\nfoob long").unwrap();
 
@@ -94,7 +95,8 @@ fn map_match_type_longest_match() {
     let res = reg.eval("str", &["foobaz".to_string()], &[("map_beg", vec![path.to_string()])], &ctx);
     assert_eq!(res, Some(Sample::Str("long".to_string())));
 
-    let path_end = "/tmp/map_end_table.txt";
+    let path_end_buf = format!("/tmp/map_end_table.{}.txt", std::process::id());
+    let path_end = path_end_buf.as_str();
     let mut file_end = std::fs::File::create(path_end).unwrap();
     writeln!(file_end, "bar short\nobar long").unwrap();
 

@@ -26,7 +26,7 @@ fn reply_head(cfg: &str, errorfile: &str, req: &[u8]) -> String {
         .arg(f.path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
+        .spawn().map(common::Ibex)
         .expect("spawn ibex");
     assert!(common::wait_listening(fe), "ibex never listened on {fe}");
     let mut c = TcpStream::connect(fe).expect("connect");

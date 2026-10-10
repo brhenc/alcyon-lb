@@ -71,7 +71,7 @@ fn answers_from(extra: &str, s1_dead: bool, v6: bool) -> String {
         .arg(&path)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
+        .spawn().map(common::Ibex)
         .expect("spawn ibex");
     let deadline = Instant::now() + Duration::from_secs(5);
     while TcpStream::connect((if v6 { "::1" } else { "127.0.0.1" }, port)).is_err() {

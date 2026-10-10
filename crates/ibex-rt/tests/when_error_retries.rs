@@ -70,7 +70,7 @@ fn heads(tag: &str, dead_first: bool) -> Vec<String> {
         .arg(&path)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
+        .spawn().map(common::Ibex)
         .expect("spawn ibex");
     let deadline = Instant::now() + Duration::from_secs(5);
     while TcpStream::connect(("127.0.0.1", port)).is_err() {

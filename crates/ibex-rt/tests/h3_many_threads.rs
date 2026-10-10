@@ -19,7 +19,7 @@ mod common;
 
 use std::io::Write;
 use std::net::SocketAddr;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use tempfile::NamedTempFile;
 
 const NBTHREAD: usize = 64;
@@ -35,7 +35,7 @@ fn require_curl_http3() {
 
 /// Starts Ibex (or `IBEX_TEST_BIN`, to run this against HAProxy) with an HTTP/3 frontend
 /// that answers every request itself, and waits only for its TCP port.
-fn start() -> (Child, NamedTempFile, SocketAddr) {
+fn start() -> (common::Ibex, NamedTempFile, SocketAddr) {
     let crt = format!("{}/../../examples/certs/localhost.pem", env!("CARGO_MANIFEST_DIR"));
     let tcp = common::reserve_addr();
     let quic = common::reserve_addr();
@@ -52,7 +52,7 @@ fn start() -> (Child, NamedTempFile, SocketAddr) {
         .arg(f.path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
+        .spawn().map(common::Ibex)
         .expect("spawn ibex");
     assert!(common::wait_listening(tcp), "ibex never started listening on {tcp}");
     (child, f, quic)

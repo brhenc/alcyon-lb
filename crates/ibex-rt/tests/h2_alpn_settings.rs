@@ -38,7 +38,7 @@ fn an_h2_alpn_client_that_sends_nothing_is_sent_nothing() {
         .arg(&cfg)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
+        .spawn().map(common::Ibex)
         .expect("spawn ibex");
     assert!(common::wait_listening(tls), "ibex never listened");
 

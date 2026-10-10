@@ -82,7 +82,7 @@ fn unix_prefix_binds_the_path_without_the_prefix() {
         .arg(f.path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
+        .spawn().map(common::Ibex)
         .expect("spawn");
     let end = Instant::now() + Duration::from_secs(10);
     let sock = dir.path().join("s.sock");
@@ -103,7 +103,7 @@ fn show_stat_typed_and_json_with_no_proxy_answer_as_haproxy() {
     let dir = TempDir::new().expect("dir");
     let sock = dir.path().join("s.sock");
     let f = cfg(&sock.display().to_string());
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(f.path()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(f.path()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map(common::Ibex).expect("spawn");
     let end = Instant::now() + Duration::from_secs(10);
     while UnixStream::connect(&sock).is_err() {
         assert!(Instant::now() < end, "socket never accepted");

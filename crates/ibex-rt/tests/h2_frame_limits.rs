@@ -42,19 +42,8 @@ struct Ibex {
 
 impl Drop for Ibex {
     fn drop(&mut self) {
-        // A worker wedged in a send loop (the defect) does not act on SIGUSR1 and grows by
-        // gigabytes: give it one second, then kill it by PID rather than wait common::stop's 5 s.
-        if let Some(pid) = i32::try_from(self.child.id()).ok().and_then(rustix::process::Pid::from_raw) {
-            let _ = rustix::process::kill_process(pid, rustix::process::Signal::Usr1);
-        }
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while Instant::now() < deadline {
-            if matches!(self.child.try_wait(), Ok(Some(_))) {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let _ = self.child.kill();
+        // SIGUSR1, then SIGKILL only after common::stop's 5 s: a process killed while it writes
+        // its coverage profile leaves a corrupt .profraw.
         common::stop(&mut self.child);
     }
 }

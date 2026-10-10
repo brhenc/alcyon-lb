@@ -48,7 +48,7 @@ fn monitor_uri_is_answered_by_the_proxy_with_haproxys_response() {
         .arg(cfg.path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
+        .spawn().map(common::Ibex)
         .expect("spawn ibex");
     let deadline = Instant::now() + Duration::from_secs(5);
     while TcpStream::connect(fe).is_err() {
@@ -83,7 +83,7 @@ fn monitor_uri_keeps_the_connection_alive() {
         .arg(cfg.path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
+        .spawn().map(common::Ibex)
         .expect("spawn ibex");
     assert!(common::wait_listening(fe), "ibex never started listening");
     let mut c = TcpStream::connect(fe).expect("connect");

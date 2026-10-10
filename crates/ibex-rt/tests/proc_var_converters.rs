@@ -60,7 +60,7 @@ fn the_var_converters_change_the_process_variable() {
         .arg(&cfg)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
+        .spawn().map(common::Ibex)
         .expect("spawn ibex");
     assert!(common::wait_listening(fe), "ibex never listened on {fe}");
     let got: Vec<_> = ["/set", "/", "/unset", "/"].into_iter().map(|p| (p, get(fe, p))).collect();

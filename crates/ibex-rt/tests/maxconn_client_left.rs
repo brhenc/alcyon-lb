@@ -46,7 +46,7 @@ fn waiting_client(sent: &[u8], how: Leave) -> Option<String> {
     );
     let path = std::env::temp_dir().join(format!("ibex-t231-{}-{}.cfg", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
     std::fs::write(&path, cfg).expect("write cfg");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn ibex");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map(common::Ibex).expect("spawn ibex");
     assert!(common::wait_listening(fe), "ibex never listened");
     let _ = std::fs::remove_file(&path);
     // `wait_listening` connected and left: that connection has a line of its own.
