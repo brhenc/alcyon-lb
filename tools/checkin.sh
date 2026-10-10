@@ -23,6 +23,8 @@ export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-/tmp/ibex-checkin-target}
 # run judges the tests and leaves the profiles covercheck reads. The gate used to build and
 # run every test target twice, plain and then instrumented, ~4.5 minutes of a 15-minute gate
 # and a second target directory. COVERCHECK=0 keeps the quick loop: plain build, no profiles.
+# The measurement builds and times a plain release ibex: it keeps the target from before.
+PLAIN_TARGET_DIR=$CARGO_TARGET_DIR
 if [ "${COVERCHECK:-1}" = "1" ]; then
   if ! INSTRUMENTED_ENV=$(python3 harness/covercheck.py --print-env); then
     echo "checkin: cannot set up the instrumented build (cargo llvm-cov show-env); COVERCHECK=0 skips it" >&2
@@ -204,7 +206,7 @@ if [ "${IBEX_GATE_SKIP_MEASURE:-}" = 1 ]; then
   echo "skipped (IBEX_GATE_SKIP_MEASURE=1): measured on main at merge, not here"
   SKIPPED_MEASURE=1
 else
-  tools/measure/run.sh --fast
+  env -u RUSTFLAGS -u LLVM_PROFILE_FILE -u IBEX_INSTRUMENTED CARGO_TARGET_DIR="$PLAIN_TARGET_DIR" tools/measure/run.sh --fast
   check "$?" "continuous measurement"
 fi
 
