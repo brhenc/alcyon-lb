@@ -3445,6 +3445,9 @@ impl Engine {
     // The clock of `lastchg` and `lastsess` (`show stat`) starts with the proxies.
     let _ = crate::statcnt::now_ms();
     configure_maxconn(config);
+    // `global` `set-var` lines: once per process, before any worker serves. Run again in each
+    // worker, a `set-var-fmt` reading its own variable saw what the others had appended.
+    init_global_vars(config.global.as_ref());
     // An action naming a fetch or converter the registry lacks would load and then do
     // nothing on every request; `HAProxy` refuses the configuration instead.
     crate::rule_exprs::validate_config(config)
@@ -3508,7 +3511,6 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         let sessions = SessionArena::with_capacity(capacity);
         let applets = AppletArena::with_capacity(capacity);
 
-        init_global_vars(config.global.as_ref());
         ibex_sample::set_userlists(
             config
                 .userlists
