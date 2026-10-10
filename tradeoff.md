@@ -337,14 +337,13 @@ Gave up: an `RwLock` read acquisition per sample evaluation, which is lock conte
 on the data path (though avoiding any syscall).
 Status: **resolved and measured** — cached lookups verified in `crates/ibex-sample/tests/sample_semantics.rs`.
 
-### 6.7 Request header size limit differs from HAProxy (3072 vs 2997 bytes)
+### 6.7 Request and response header size limit -- **resolved 2026-10-10 (T265): Ibex matches HAProxy**
 
 | | |
 |---|---|
-| **Gained** | Literal implementation of documented formula `tune.bufsize - tune.maxrewrite` (3072 bytes with bufsize 4096 and maxrewrite 1024) with zero artificial magic numbers. Simple bounds checking on H1 data path |
-| **Gave up** | 75-byte divergence against HAProxy 3.5 (2997 bytes) and 68-byte divergence against HAProxy 3.0.23 (3004 bytes) |
-| **Status** | **measured** — with identical binary search and config (`tune.bufsize 4096`, `tune.maxrewrite 1024`): HAProxy 3.5-dev accepts max 2997 bytes, HAProxy 3.0.23 accepts max 3004 bytes, Ibex accepts 3072 bytes |
-| **Revisit if** | HTX lands on the data path. HAProxy loses ~68–75 bytes because it stores the message in HTX, where per-block descriptors (`struct htx_blk`) and the start-line block consume buffer space before the wire header block can use it. The divergence is a natural property of the buffer representation and must not be hardcoded. |
+| **Was** | Ibex compared the wire length with `tune.bufsize - tune.maxrewrite` (3072 bytes at 4096/1024); HAProxy 3.5 accepts 2997, because its HTX block descriptors and start line take buffer space first. |
+| **Now** | T265 models HAProxy's HTX cost for request and response heads (`txn::htx_head_cost`, `htx_response_head_cost`): 2997 bytes at 4096/1024, and the same per-repeated-header cost, measured to the byte against HAProxy 3.5-dev8 (crates/ibex-rt/tests/request_head_limit.rs; tcp_proxy's boundary test corrected to the measured 2997/2998). A response head too large now gets 502 at once instead of a 504 after `timeout server`. With the default maxrewrite both give the same clean step (T272 D1). |
+| **Revisit if** | HAProxy changes its HTX layout (the model is a byte count per block, not a copy of HTX). |
 
 ### 6.8 HTTP/2 flood mitigation knobs off by default for HAProxy compatibility
 
