@@ -94,11 +94,11 @@ fn unix_prefix_binds_the_path_without_the_prefix() {
     common::stop(&mut child);
 }
 
-/// `show stat ... typed|json` is answered in those formats by HAProxy (`F.2.0.0.pxname.1:KNSV:str:f`
-/// / `[[{"objType":...`). Ibex does not implement them: it must say so, not print CSV as if
-/// the option had been honoured (T222 item 4; the formats themselves are not done).
+/// T222 item 4 had `typed` and `json` refused; T245 had `typed` and `json` refused; T245 implemented them (populated output is
+/// checked against HAProxy in `cli_show_typed_json.rs`). With no proxy at all, HAProxy
+/// 3.5 answers `typed` with an empty line and `json` with an empty array (measured).
 #[test]
-fn show_stat_typed_and_json_say_they_are_not_implemented_instead_of_printing_csv() {
+fn show_stat_typed_and_json_with_no_proxy_answer_as_haproxy() {
     use std::io::{Read, Write};
     let dir = TempDir::new().expect("dir");
     let sock = dir.path().join("s.sock");
@@ -116,10 +116,13 @@ fn show_stat_typed_and_json_say_they_are_not_implemented_instead_of_printing_csv
         s.read_to_string(&mut out).expect("read");
         out
     };
-    for c in ["show stat typed", "show stat -1 1 -1 typed", "show stat json", "show stat -1 4 -1 json"] {
-        let out = ask(c);
-        assert!(!out.starts_with("# pxname"), "`{c}` printed CSV: {out}");
-        assert!(out.contains("not supported"), "`{c}` should say it is not supported: {out}");
+    for (c, want) in [
+        ("show stat typed", "\n"),
+        ("show stat -1 1 -1 typed", "\n"),
+        ("show stat json", "[]\n\n"),
+        ("show stat -1 4 -1 json", "[]\n\n"),
+    ] {
+        assert_eq!(ask(c), want, "`{c}`");
     }
     assert!(ask("show stat").starts_with("# pxname"), "plain show stat is still CSV");
     common::stop(&mut child);
