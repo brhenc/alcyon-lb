@@ -7492,6 +7492,10 @@ impl EngineDispatcher<'_> {
             return None;
         }
 
+        if Self::h2_stream_reset(entry, proxies, fdtab, poller, idle_pool, wake_queue, now, pid) {
+            return None;
+        }
+
         let mut admin = None;
         // A request in the queue goes on when a slot is free, or ends when its time is up.
         if entry.sess.queue.is_some() {
@@ -7730,6 +7734,65 @@ impl EngineDispatcher<'_> {
         }
         entry.sess.rep.clear();
         close_http_session(entry, proxies, fdtab, poller, idle_pool, false);
+        true
+    }
+
+    /// The HTTP/2 stream being served was reset, by the client's `RST_STREAM` or by the mux
+    /// for a stream error in the rest of its request (trailers without `END_STREAM`, say):
+    /// the transaction ends here and the connection's next stream goes on. `true` when it
+    /// ended.
+    ///
+    /// Measured on `HAProxy` 3.5-dev8 (`tests/h2_no_frames_after_rst.rs`): nothing more is
+    /// sent on the stream, the server connection is reset at once, and the log reads
+    /// `400 ... CH--` waiting for the response head, `CD--` during the body. Left to run,
+    /// the transaction sent the server's HEADERS on the reset stream (a frame on a closed
+    /// stream, RFC 9113 5.1), held the server connection until `timeout server`, and the
+    /// connection's next stream waited behind it (T273 B).
+    #[allow(clippy::too_many_arguments)]
+    fn h2_stream_reset(
+        entry: &mut SessionEntry,
+        proxies: &[Proxy],
+        fdtab: &mut FdTab,
+        poller: &mut Poller,
+        idle_pool: &mut IdlePool,
+        wake_queue: &mut Vec<TaskRef>,
+        now: Tick,
+        pid: u32,
+    ) -> bool {
+        let sess = &mut entry.sess;
+        let (Some(h2), Some(id), Some(txn)) = (sess.h2_ctx.as_ref(), sess.h2_active_stream_id, sess.txn.as_mut()) else {
+            return false;
+        };
+        if !h2.streams.get(&id).is_some_and(|s| matches!(s.state, ibex_proto::h2::H2StreamState::Reset(_))) {
+            return false;
+        }
+        let response_done = txn.rsp.is_done();
+        let waiting = txn.rsp == MsgState::Waiting;
+        txn.srv_reusable = false;
+        txn.rsp = MsgState::Done;
+        if !response_done {
+            // `SC_FL_NOLINGER`: closed by `end_txn` below, the server connection is reset.
+            if let Some(srv) = sess.srv.as_ref() {
+                raw::abort_with_rst(srv.as_fd());
+            }
+            if sess.queue.take().is_some() {
+                sess.log.queue.get_or_insert_with(Instant::now);
+                sess.log.term = Some(*b"CQ");
+            } else if txn.local {
+                // A reply of the proxy's own keeps the status and ending it was given.
+            } else if waiting {
+                sess.log.status = Some(400);
+                sess.log.term = Some(*b"CH");
+            } else {
+                sess.log.term = Some(*b"CD");
+            }
+        }
+        // Nothing more of the response goes to the client, nor of the request to the
+        // server: what is left of either would be taken for the next stream's.
+        sess.rep.clear();
+        sess.req.clear();
+        sess.srv_state = ScState::Closed;
+        Self::end_txn(entry, proxies, fdtab, poller, idle_pool, wake_queue, now, pid);
         true
     }
 

@@ -329,6 +329,11 @@ impl H2MuxContext {
     /// [`Self::send_data`]. `end_stream` is for a response without a body. Returns false
     /// if `head` is not a response head.
     pub fn send_h1_head(&mut self, stream_id: u32, head: &[u8], end_stream: bool) -> bool {
+        // A reset stream takes nothing more (RFC 9113 5.1): the head is discarded, as
+        // [`Self::send_data`] discards a body (T273 B).
+        if self.streams.get(&stream_id).is_some_and(|s| matches!(s.state, H2StreamState::Reset(_))) {
+            return true;
+        }
         let head_str = String::from_utf8_lossy(head);
         let mut lines = head_str.lines();
         let Some(status_line) = lines.next() else { return false };
@@ -1429,6 +1434,20 @@ mod tests {
         mux.parse(&mut ctx, &post_headers(5)).expect("open 5");
         ctx.send_rst_stream(5, H2Error::ProtocolError);
         assert!(!ctx.streams.contains_key(&5));
+    }
+
+    /// Nothing goes out on a stream once it is reset, the response head no more than its
+    /// body (RFC 9113 5.1; T273 B).
+    #[test]
+    fn a_reset_stream_is_sent_no_response() {
+        let (mux, mut ctx) = open_conn();
+        mux.parse(&mut ctx, &post_headers(1)).expect("open 1");
+        ctx.streams.get_mut(&1).expect("1").dispatched = true;
+        mux.parse(&mut ctx, &Frame::RstStream { stream_id: 1, error_code: H2Error::Cancel }.encode()).expect("rst 1");
+        let before = mux.pending_output(&ctx).len();
+        assert!(ctx.send_h1_head(1, b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n", false), "taken and dropped");
+        ctx.send_data(1, b"ok", true);
+        assert_eq!(mux.pending_output(&ctx).len(), before, "no frame on the reset stream");
     }
 
     /// SETTINGS_HEADER_TABLE_SIZE bounds the table our encoder may use, it does not size it:
