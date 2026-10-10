@@ -169,6 +169,9 @@ fn server_tfo_sets_fastopen_on_the_connecting_socket() {
     let backend = TcpListener::bind("127.0.0.1:0").expect("bind");
     let bp = backend.local_addr().expect("addr").port();
     let a = common::reserve_addr();
+    // The backend never answers nor closes: the tunnel ends with `timeout server`, and the
+    // soft stop waits for it -- 500 ms here rather than DEFAULTS' 5 s (T259).
+    const DEFAULTS: &str = "defaults\n  mode tcp\n  timeout client 500ms\n  timeout server 500ms\n  timeout connect 5s\n";
     let cfg = format!("{DEFAULTS}frontend fe\n  bind {a}\n  default_backend be\nbackend be\n  server s 127.0.0.1:{bp} tfo\n");
     let log = strace_setsockopt(&cfg, a);
     assert!(log.contains("TCP_FASTOPEN_CONNECT"), "{log}");

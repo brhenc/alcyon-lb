@@ -639,6 +639,46 @@ fn test_canonical_haproxy_35_backup_server_failover() {
     );
 }
 
+/// Steps the engine until `client` has its answer, then until two passes in a row run no
+/// task (each waits out the poller's timeout), so a rule that counted twice has done so.
+/// Thirty fixed passes of ~100 ms each took 3 s a request (T259).
+fn answered_then_idle(engine: &mut Engine, client: &mut TcpStream) {
+    client.set_nonblocking(true).expect("nonblocking");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut buf = [0u8; 4096];
+    while !matches!(client.read(&mut buf), Ok(n) if n > 0) {
+        assert!(Instant::now() < deadline, "no answer");
+        let _ = engine.step(ibex_sched::Tick(100));
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let mut idle = 0;
+    for _ in 0..30 {
+        idle = if engine.step(ibex_sched::Tick(100)).unwrap_or(1) == 0 { idle + 1 } else { 0 };
+        if idle == 2 {
+            break;
+        }
+    }
+}
+
+/// Steps the engine until the CLI closes `cli` after its answer; returns the answer.
+fn cli_answer(engine: &mut Engine, cli: &mut std::os::unix::net::UnixStream) -> String {
+    cli.set_nonblocking(true).expect("nonblocking");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut out = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match cli.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => out.extend_from_slice(&buf[..n]),
+            Err(_) => {
+                assert!(Instant::now() < deadline, "the CLI never closed: {:?}", String::from_utf8_lossy(&out));
+                let _ = engine.step(ibex_sched::Tick(100));
+            }
+        }
+    }
+    String::from_utf8(out).expect("utf-8 dump")
+}
+
 #[test]
 fn test_stick_counter_actions_execution_across_scopes() {
     let mock_be = MockServer::start("be_mock");
@@ -726,10 +766,7 @@ backend be_test
     client
         .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
         .expect("write request");
-    for _ in 0..30 {
-        let _ = engine.step(ibex_sched::Tick(100));
-        std::thread::sleep(Duration::from_millis(2));
-    }
+    answered_then_idle(&mut engine, &mut client);
     let entry_content = engine.proxies[p_content]
         .stick_table
         .as_ref()
@@ -755,10 +792,7 @@ backend be_test
     client2
         .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
         .expect("write request");
-    for _ in 0..30 {
-        let _ = engine.step(ibex_sched::Tick(100));
-        std::thread::sleep(Duration::from_millis(2));
-    }
+    answered_then_idle(&mut engine, &mut client2);
     let entry_session = engine.proxies[p_session]
         .stick_table
         .as_ref()
@@ -784,10 +818,7 @@ backend be_test
     client3
         .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
         .expect("write request");
-    for _ in 0..30 {
-        let _ = engine.step(ibex_sched::Tick(100));
-        std::thread::sleep(Duration::from_millis(2));
-    }
+    answered_then_idle(&mut engine, &mut client3);
     let entry_http = engine.proxies[p_http]
         .stick_table
         .as_ref()
@@ -804,10 +835,7 @@ backend be_test
     client4
         .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
         .expect("write request");
-    for _ in 0..30 {
-        let _ = engine.step(ibex_sched::Tick(100));
-        std::thread::sleep(Duration::from_millis(2));
-    }
+    answered_then_idle(&mut engine, &mut client4);
     let entry_ctrl = engine.proxies[p_ctrl]
         .stick_table
         .as_ref()
@@ -825,11 +853,7 @@ backend be_test
     cli_client
         .write_all(b"show table fe_tcp_content\n")
         .expect("write show table");
-    for _ in 0..10 {
-        let _ = engine.step(ibex_sched::Tick(100));
-    }
-    let mut dump = String::new();
-    cli_client.read_to_string(&mut dump).expect("read dump");
+    let dump = cli_answer(&mut engine, &mut cli_client);
     assert!(
         dump.contains("gpc0=1"),
         "show table should output gpc0=1: {dump}"
@@ -847,11 +871,7 @@ backend be_test
     cli_ctrl
         .write_all(b"show table fe_control\n")
         .expect("write show table");
-    for _ in 0..10 {
-        let _ = engine.step(ibex_sched::Tick(100));
-    }
-    let mut ctrl_dump = String::new();
-    cli_ctrl.read_to_string(&mut ctrl_dump).expect("read dump");
+    let ctrl_dump = cli_answer(&mut engine, &mut cli_ctrl);
     // HAProxy prints every type the table stores, zero included; what the control
     // frontend must not show is a value the other frontends' rules set.
     assert!(

@@ -361,10 +361,12 @@ fn descriptors_are_back_to_baseline_after_a_churn() {
     thread::sleep(Duration::from_millis(1500));
     let base = fd_breakdown(pid);
     let base_conns = curr_conns(&stats);
-    // 40 clients of 50 operations each: 2000 in all, while the backend is restarted every
-    // second under keep-alive clients that idle between answers.
-    let n = 40 * 50;
-    let workers: Vec<_> = (0..40usize).map(|w| thread::spawn(move || (0..50usize).for_each(|i| churn_op(w * 7 + i * 3 + w * i, fe, tls)))).collect();
+    // 100 clients of 20 operations each: 2000 in all, while the backend is restarted every
+    // second under keep-alive clients that idle between answers. (40 of 50 took 30 s, most
+    // of it waiting out timeouts one after the other; this split has the same mix of
+    // operations to within six of 2000, T259.)
+    let n = 100 * 20;
+    let workers: Vec<_> = (0..100usize).map(|w| thread::spawn(move || (0..20usize).for_each(|i| churn_op(w * 7 + i * 3 + w * i, fe, tls)))).collect();
     let mut held: Vec<TcpStream> = Vec::new();
     while !workers.iter().all(thread::JoinHandle::is_finished) {
         for _ in 0..2 {

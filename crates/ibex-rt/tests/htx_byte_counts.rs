@@ -103,25 +103,23 @@ fn log_of(fe: SocketAddr, logs: &UdpSocket, req: &str) -> String {
     let mut c = TcpStream::connect(fe).expect("connect");
     c.set_read_timeout(Some(Duration::from_millis(1500))).ok();
     c.write_all(req.as_bytes()).expect("send");
-    let mut got = Vec::new();
-    let mut chunk = [0u8; 4096];
-    loop {
-        match c.read(&mut chunk) {
-            Ok(n) if n > 0 => got.extend_from_slice(&chunk[..n]),
-            _ => break,
-        }
-    }
-    assert!(!got.is_empty(), "no answer to {req:?}");
+    // The line is logged when the transaction ends, after the answer was sent: wait for it,
+    // then for the answer, instead of reading a keep-alive connection until it times out
+    // (1.5 s a request, T259).
     let mut buf = [0u8; 2048];
-    loop {
+    let line = loop {
         let n = logs.recv(&mut buf).unwrap_or_else(|e| panic!("no log line for {req:?}: {e}"));
         let line = String::from_utf8_lossy(&buf[..n]).into_owned();
         let line = line[line.find("B=").expect("a B= in the log line")..].trim_end().to_string();
         // The line of the harness's probe connection, which sent nothing.
         if line != "B=0 U=0 ST=400" {
-            return line;
+            break line;
         }
-    }
+    };
+    let mut chunk = [0u8; 4096];
+    let got = c.read(&mut chunk).unwrap_or(0);
+    assert!(got > 0, "no answer to {req:?}");
+    line
 }
 
 fn responses() -> HashMap<&'static str, &'static str> {

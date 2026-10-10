@@ -1249,7 +1249,17 @@ impl TcpSession {
 
     /// Advances the client side. Returns `true` if anything changed.
     fn process_cli(&mut self) -> io::Result<bool> {
-        let changed_io = self.process_cli_io()?;
+        let changed_io = match self.process_cli_io() {
+            // A TLS handshake that failed, or that the client left, ends the client side now,
+            // as it does on HAProxy (EOF at once, measured). The error went to the engine's
+            // process pass, which drops it, and the session waited out `timeout client` (T259).
+            Err(_) if self.cli_xprt.handshake_failed() && self.cli_state.can_read() => {
+                self.cli_state = ScState::Closed;
+                self.ending.get_or_insert(Ending::ClientAbort);
+                true
+            }
+            r => r?,
+        };
         let changed_trans = self.process_cli_transitions();
         Ok(changed_io || changed_trans)
     }

@@ -85,8 +85,11 @@ fn heads(tag: &str, lines: &str, (dead_opts, a_opts): (&str, &str), hdr: &str, n
     let live = live_backend();
     let dead = common::reserve_port();
     let port = common::reserve_port();
+    // `timeout connect` under 1 s is also the turnaround before a retry of the same server,
+    // on HAProxy as on Ibex (measured: six requests, `retries 3`, 12.1 s at `1s`, 2.5 s at
+    // `200ms`); the dead server refuses at once, so nothing else here depends on it (T259).
     let cfg = format!(
-        "defaults\n  mode http\n  timeout connect 1s\n  timeout client 3s\n  timeout server 3s\n\
+        "defaults\n  mode http\n  timeout connect 200ms\n  timeout client 3s\n  timeout server 3s\n\
          frontend f\n  bind 127.0.0.1:{port}\n  default_backend be\n\
          backend be\n{lines}  server dead 127.0.0.1:{dead}{dead_opts}\n  server a 127.0.0.1:{live}{a_opts}\n"
     );

@@ -161,15 +161,22 @@ fn after_response_rules_run_on_every_reply_the_proxy_makes() {
         ("http-response deny", listen("  http-response deny\n  server s {srv}\n"), Some(Srv::Ok), "HTTP/1.1 502 "),
         ("monitor-uri", listen("  monitor-uri /\n"), None, "HTTP/1.1 200 "),
     ];
-    let mut wrong = Vec::new();
-    for (what, cfg, srv, status) in cases {
-        let (_ibex, fe) = start(&cfg, srv.map(server));
-        let resp = exchange(fe, G, Duration::from_millis(1500));
-        let last = head(&resp).rsplit("\r\n").next().unwrap_or("");
-        if !resp.starts_with(status) || last != "static: yes" {
-            wrong.push(format!("{what}: {resp:?}"));
-        }
-    }
+    // Each case has its own daemon, and each waits out `exchange`'s quiet time on a kept-alive
+    // connection: run them together (T259).
+    let wrong: Vec<String> = thread::scope(|sc| {
+        let runs: Vec<_> = cases
+            .into_iter()
+            .map(|(what, cfg, srv, status)| {
+                sc.spawn(move || {
+                    let (_ibex, fe) = start(&cfg, srv.map(server));
+                    let resp = exchange(fe, G, Duration::from_millis(1500));
+                    let last = head(&resp).rsplit("\r\n").next().unwrap_or("");
+                    (!resp.starts_with(status) || last != "static: yes").then(|| format!("{what}: {resp:?}"))
+                })
+            })
+            .collect();
+        runs.into_iter().filter_map(|r| r.join().expect("case")).collect()
+    });
     assert!(
         wrong.is_empty(),
         "`http-after-response set-header static yes` did not reach these replies (HAProxy \

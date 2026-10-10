@@ -135,13 +135,31 @@ fn get(fe: SocketAddr, headers: &[&str]) -> String {
     c.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
     let extra: String = headers.iter().map(|h| format!("{h}\r\n")).collect();
     c.write_all(format!("GET / HTTP/1.1\r\nHost: x\r\n{extra}Connection: close\r\n\r\n").as_bytes()).expect("send");
+    // Read the response, not to EOF: in `mode tcp` the server keeps the connection and the
+    // tunnel waits out `timeout server` (2 s a request, T259).
     let mut got = Vec::new();
-    let _ = c.read_to_end(&mut got);
+    let mut buf = [0u8; 4096];
+    while !response_complete(&got) {
+        match c.read(&mut buf) {
+            Ok(n) if n > 0 => got.extend_from_slice(&buf[..n]),
+            _ => break,
+        }
+    }
     let text = String::from_utf8_lossy(&got).into_owned();
     text.split("\r\n")
         // Header names are case-insensitive; HAProxy emits them lowercase (T244).
         .find_map(|l| l.split_once(": ").filter(|(n, _)| n.eq_ignore_ascii_case("X-Server")).map(|(_, v)| v))
         .map_or_else(|| text.lines().next().unwrap_or("<nothing>").to_string(), str::to_string)
+}
+
+/// A head and as much body as its `Content-Length` says.
+fn response_complete(got: &[u8]) -> bool {
+    let Some(end) = got.windows(4).position(|w| w == b"\r\n\r\n") else { return false };
+    let head = String::from_utf8_lossy(&got[..end]).to_ascii_lowercase();
+    head.lines()
+        .find_map(|l| l.strip_prefix("content-length:"))
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .is_some_and(|len| got.len() >= end + 4 + len)
 }
 
 fn gets(fe: SocketAddr, headers: &[&str], n: usize) -> Vec<String> {

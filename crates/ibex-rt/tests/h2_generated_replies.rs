@@ -65,13 +65,17 @@ fn server() -> SocketAddr {
 }
 
 fn start() -> (Ibex, SocketAddr, SocketAddr) {
+    start_with_client_timeout("5s")
+}
+
+fn start_with_client_timeout(client: &str) -> (Ibex, SocketAddr, SocketAddr) {
     let dir = TempDir::new().expect("dir");
     let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("cert");
     let pem = dir.path().join("c.pem");
     std::fs::write(&pem, format!("{}{}", ck.cert.pem(), ck.key_pair.serialize_pem())).expect("pem");
     let (plain, tls, srv) = (common::reserve_addr(), common::reserve_addr(), server());
     let cfg = format!(
-        "defaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 1s\n  timeout tarpit 1s\n\
+        "defaults\n  mode http\n  timeout connect 1s\n  timeout client {client}\n  timeout server 1s\n  timeout tarpit 1s\n\
          frontend fe\n  bind {plain} proto h2\n  bind {tls} ssl crt {} alpn h2,http/1.1\n  monitor-uri /mon\n\
          \x20 http-after-response set-header static yes\n\
          \x20 http-request return status 200 content-type text/plain string hello if {{ path /ret }}\n\
@@ -196,10 +200,12 @@ fn tarpit_over_h2_waits_for_timeout_tarpit() {
 /// the H2 mux closes it, it does not write the H1 `408` page into the frame stream.
 #[test]
 fn client_timeout_on_h2_writes_no_http1_page() {
-    let (_ibex, plain, _) = start();
+    // Measured: the connection ends 2 x `timeout client` after the preface, on HAProxy as on
+    // Ibex (10 s at 5 s, 2 s at 1 s); 1 s here (T259).
+    let (_ibex, plain, _) = start_with_client_timeout("1s");
     let mut c = std::net::TcpStream::connect(plain).expect("connect");
     c.set_read_timeout(Some(Duration::from_secs(8))).expect("timeout");
-    // The preface and a SETTINGS frame, then silence; `timeout client` is 5 s.
+    // The preface and a SETTINGS frame, then silence; `timeout client` is 1 s.
     c.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\x00\x00\x00\x04\x00\x00\x00\x00\x00").expect("preface");
     let mut got = Vec::new();
     let _ = c.read_to_end(&mut got);

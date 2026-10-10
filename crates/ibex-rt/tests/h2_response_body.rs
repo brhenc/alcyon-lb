@@ -13,11 +13,8 @@ mod common;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
-
-static TEST_MUTEX: Mutex<()> = Mutex::new(());
 
 struct Daemon(Child);
 impl Drop for Daemon {
@@ -193,6 +190,16 @@ impl Client {
         }
     }
 
+    /// Reads until stream `sid` is reset or ended (or `dur` passes), then a further 300 ms
+    /// for anything the daemon sends after that, which the caller's checks would see.
+    fn pump_until_closed(&mut self, dur: Duration, sid: u32) {
+        let deadline = Instant::now() + dur;
+        while Instant::now() < deadline && !self.streams.get(&sid).is_some_and(|s| s.reset || s.ended) {
+            self.pump(Duration::from_millis(50), &[]);
+        }
+        self.pump(Duration::from_millis(300), &[]);
+    }
+
     fn drain(&mut self) {
         while self.buf.len() >= 9 {
             let len = (usize::from(self.buf[0]) << 16) | (usize::from(self.buf[1]) << 8) | usize::from(self.buf[2]);
@@ -252,7 +259,6 @@ fn check(c: &Client, sid: u32, salt: u8, len: usize) {
 }
 
 fn single(len: usize, mode: &str) {
-    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let backend = spawn_backend();
     let (_d, port, cfg) = start(backend);
     let mut c = Client::connect(port, true);
@@ -287,12 +293,11 @@ fn h2_body_without_length_ends_with_the_server_close() {
 /// by an END_STREAM that says the truncated body is complete.
 #[test]
 fn h2_body_cut_short_is_reset_not_ended() {
-    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let backend = spawn_backend();
     let (_d, port, cfg) = start(backend);
     let mut c = Client::connect(port, true);
     c.get(1, "/50000/7/cut");
-    c.pump(Duration::from_secs(5), &[]);
+    c.pump_until_closed(Duration::from_secs(5), 1);
     let _ = std::fs::remove_file(&cfg);
     let st = c.streams.get(&1).expect("stream 1 answered");
     assert!(st.reset, "no RST_STREAM for a body cut short: {st:?}");
@@ -312,7 +317,6 @@ fn h2_body_1m_chunked() {
 /// Two streams opened together, each with a large body: both arrive whole.
 #[test]
 fn h2_two_concurrent_large_bodies() {
-    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let backend = spawn_backend();
     let (_d, port, cfg) = start(backend);
     let mut c = Client::connect(port, true);
@@ -329,7 +333,6 @@ fn h2_two_concurrent_large_bodies() {
 /// rest once it does.
 #[test]
 fn h2_body_respects_client_flow_control() {
-    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let backend = spawn_backend();
     let (_d, port, cfg) = start(backend);
     let mut c = Client::connect(port, false);
@@ -354,7 +357,6 @@ fn h2_body_respects_client_flow_control() {
 /// arrives, in order, when the client reads.
 #[test]
 fn h2_body_to_a_client_that_stops_reading_arrives_whole() {
-    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let backend = spawn_backend();
     let (_d, port, cfg) = start(backend);
     let len = 8 << 20;
@@ -371,12 +373,11 @@ fn h2_body_to_a_client_that_stops_reading_arrives_whole() {
 /// The server's chunked body is malformed: the stream is reset, never ended as if whole.
 #[test]
 fn h2_malformed_chunked_body_is_reset_not_ended() {
-    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let backend = spawn_backend();
     let (_d, port, cfg) = start(backend);
     let mut c = Client::connect(port, true);
     c.get(1, "/30000/7/badchunk");
-    c.pump(Duration::from_secs(5), &[]);
+    c.pump_until_closed(Duration::from_secs(5), 1);
     let _ = std::fs::remove_file(&cfg);
     let st = c.streams.get(&1).expect("stream 1 answered");
     assert!(st.reset, "no RST_STREAM for a malformed chunked body: {st:?}");

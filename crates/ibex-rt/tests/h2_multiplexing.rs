@@ -19,8 +19,6 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-static TEST_MUTEX: Mutex<()> = Mutex::new(());
-
 fn ibex_bin() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_BIN_EXE_ibex"))
 }
@@ -135,7 +133,6 @@ fn hpack_get(path: &str) -> Vec<u8> {
 /// `curl --http2` passes against this daemon because it sends one request.
 #[test]
 fn each_h2_stream_carries_its_own_request() {
-    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let (backend_port, seen) = spawn_backend();
     let port = common::reserve_port();
     let cfg = std::env::temp_dir().join(format!("ibex_h2mux_{}.cfg", std::process::id()));
@@ -208,7 +205,6 @@ fn each_h2_stream_carries_its_own_request() {
 /// All ten streams must reach the backend as normalized HTTP/1.1 requests without loss or replay.
 #[test]
 fn ten_h2_streams_burst_reach_backend_without_loss() {
-    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let (backend_port, seen) = spawn_backend();
     let port = common::reserve_port();
     let cfg = std::env::temp_dir().join(format!("ibex_h2burst_{}.cfg", std::process::id()));
@@ -274,7 +270,6 @@ fn ten_h2_streams_burst_reach_backend_without_loss() {
 /// Rapid Reset flood (CVE-2023-44487) triggers GOAWAY with `ENHANCE_YOUR_CALM` (0xb).
 #[test]
 fn rapid_reset_flood_triggers_goaway_enhance_your_calm() {
-    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let (backend_port, _) = spawn_backend();
     let port = common::reserve_port();
     let cfg = std::env::temp_dir().join(format!("ibex_h2rstflood_{}.cfg", std::process::id()));
@@ -336,7 +331,6 @@ fn rapid_reset_flood_triggers_goaway_enhance_your_calm() {
 /// PING flood triggers GOAWAY with `ENHANCE_YOUR_CALM` (0xb).
 #[test]
 fn ping_flood_triggers_goaway_enhance_your_calm() {
-    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let (backend_port, _) = spawn_backend();
     let port = common::reserve_port();
     let cfg = std::env::temp_dir().join(format!("ibex_h2pingflood_{}.cfg", std::process::id()));
@@ -395,7 +389,6 @@ fn ping_flood_triggers_goaway_enhance_your_calm() {
 /// SETTINGS flood triggers GOAWAY with `ENHANCE_YOUR_CALM` (0xb).
 #[test]
 fn settings_flood_triggers_goaway_enhance_your_calm() {
-    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let (backend_port, _) = spawn_backend();
     let port = common::reserve_port();
     let cfg = std::env::temp_dir().join(format!("ibex_h2setflood_{}.cfg", std::process::id()));
@@ -587,7 +580,6 @@ fn recv_h2_frames(s: &mut TcpStream, timeout: Duration) -> Vec<(u8, u8, u32, Vec
 /// and zero pseudo-headers (starting with ':') reach the backend.
 #[test]
 fn exactly_one_host_matching_authority_and_no_colon_headers_reach_backend() {
-    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let (backend_port, seen) = spawn_backend_full();
     let port = common::reserve_port();
     let cfg = std::env::temp_dir().join(format!("ibex_h2pseudo_norm_{}.cfg", std::process::id()));
@@ -684,7 +676,6 @@ fn exactly_one_host_matching_authority_and_no_colon_headers_reach_backend() {
 /// Agreeing Host and :authority is accepted and forwarded with a single Host header.
 #[test]
 fn agreeing_host_and_authority_is_accepted_and_forwarded_with_single_host() {
-    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let (backend_port, seen) = spawn_backend_full();
     let port = common::reserve_port();
     let cfg = std::env::temp_dir().join(format!("ibex_h2agree_{}.cfg", std::process::id()));
@@ -754,7 +745,6 @@ fn agreeing_host_and_authority_is_accepted_and_forwarded_with_single_host() {
 /// Disagreeing Host vs :authority is rejected with `RST_STREAM` (RFC 9113 §8.3.1).
 #[test]
 fn disagreeing_host_and_authority_is_rejected_with_rst_stream() {
-    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let (backend_port, seen) = spawn_backend_full();
     let port = common::reserve_port();
     let cfg = std::env::temp_dir().join(format!("ibex_h2disagree_{}.cfg", std::process::id()));
@@ -814,7 +804,6 @@ fn disagreeing_host_and_authority_is_rejected_with_rst_stream() {
 /// Unknown pseudo-header (e.g. :custom) is rejected with `RST_STREAM` (RFC 9113 §8.3).
 #[test]
 fn unknown_pseudo_header_is_rejected_with_rst_stream() {
-    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let (backend_port, seen) = spawn_backend_full();
     let port = common::reserve_port();
     let cfg = std::env::temp_dir().join(format!("ibex_h2unknown_pseudo_{}.cfg", std::process::id()));
@@ -870,7 +859,6 @@ fn unknown_pseudo_header_is_rejected_with_rst_stream() {
 /// Pseudo-header appearing after regular header is rejected with `RST_STREAM` (RFC 9113 §8.3).
 #[test]
 fn pseudo_header_after_regular_header_is_rejected_with_rst_stream() {
-    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let (backend_port, seen) = spawn_backend_full();
     let port = common::reserve_port();
     let cfg = std::env::temp_dir().join(format!("ibex_h2pseudo_after_reg_{}.cfg", std::process::id()));
@@ -926,7 +914,6 @@ fn pseudo_header_after_regular_header_is_rejected_with_rst_stream() {
 /// Duplicate pseudo-header (e.g. duplicate :method) is rejected with `RST_STREAM` (RFC 9113 §8.3).
 #[test]
 fn duplicate_pseudo_header_is_rejected_with_rst_stream() {
-    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let (backend_port, seen) = spawn_backend_full();
     let port = common::reserve_port();
     let cfg = std::env::temp_dir().join(format!("ibex_h2dup_pseudo_{}.cfg", std::process::id()));
@@ -982,7 +969,6 @@ fn duplicate_pseudo_header_is_rejected_with_rst_stream() {
 /// Compares received backend headers between HAProxy oracle and Ibex for an identical HTTP/2 request.
 #[test]
 fn h2_backend_headers_match_haproxy_reference_oracle() {
-    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let oracle_bin = std::path::PathBuf::from("/home/bhenc/reference/haproxy-quic/haproxy");
     let haproxy_bin = if oracle_bin.exists() {
         oracle_bin
@@ -1189,7 +1175,6 @@ fn status_200_and_data(frames: &[(u8, u8, u32, Vec<u8>)]) -> (bool, Vec<u8>) {
 /// `BUG_ON` at `src/htx.c:391`, fixed upstream by 76454cbbf.)
 #[test]
 fn an_interim_response_ahead_of_the_final_one_reaches_an_h2_client() {
-    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let be = raw_backend(b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
     let frames = h2_get_through(be);
     let (ok, data) = status_200_and_data(&frames);
@@ -1207,7 +1192,6 @@ fn an_interim_response_ahead_of_the_final_one_reaches_an_h2_client() {
 /// transactions (design 010 step 5) and is reported, not fixed here.
 #[test]
 fn a_response_cut_short_delivers_what_arrived_to_an_h2_client() {
-    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let be = raw_backend(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nhello");
     let frames = h2_get_through(be);
     let (ok, data) = status_200_and_data(&frames);

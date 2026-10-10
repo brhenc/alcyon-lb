@@ -138,9 +138,10 @@ def run_bounded(cmd: list[str], cwd: str, env: dict | None) -> tuple[int, str]:
 # pool, on a machine as quiet as the serial suite left it. Each was seen failing only under
 # the pool's load and passing alone (2026-10-03); a name here is not an excuse -- a failure
 # in the serial pass is a failure like any other.
+# canonical_haproxy_35_e2e left the list (T259): its stick counters are read once the
+# answer has arrived and the engine is idle, no longer after a fixed number of passes.
 SERIAL_TARGETS = {
     "ibex-rt/request_allocations",     # counts allocations and bytes per request
-    "ibex-rt/canonical_haproxy_35_e2e",  # stick counters read across scopes on a timer
     "ibex-rt/cli_applet",              # `show pools` waits a fixed 20 engine steps (T116)
     # Failed only in gates that shared the machine with another gate, passed alone (2026-10-05):
     "ibex-rt/fd_hygiene",              # counts /proc/<pid>/fd after the server closes (T217)
@@ -297,6 +298,7 @@ def run_parallel(doc: bool = True) -> tuple[list[tuple[str, str, list[str]]], di
         json.dump(durations, open(times_path, "w"))
     except OSError:
         pass
+    say(slow_targets_line(durations))
     return failing, failed_tests, passed, failed_n
 
 
@@ -335,6 +337,18 @@ def record_run(tdir: str, failed_tests: dict[str, set[str]], passed: int, failed
            "failed": {k: sorted(v) for k, v in failed_tests.items()}}
     with open(os.path.join(tdir, "suite-run.json"), "w") as f:
         json.dump(rec, f, indent=1)
+
+
+# A target slower than this is named after every run (informational, not a failure), so a
+# new slow test is seen the day it lands: the pool's wall time is its slowest target.
+SLOW_TARGET = 10.0
+
+
+def slow_targets_line(durations: dict[str, float]) -> str:
+    slow = sorted(((s, n) for n, s in durations.items() if s > SLOW_TARGET), reverse=True)
+    if not slow:
+        return f"suite: slow targets (over {SLOW_TARGET:.0f}s): none"
+    return f"suite: slow targets (over {SLOW_TARGET:.0f}s): " + ", ".join(f"{n} {s:.1f}s" for s, n in slow)
 
 
 def confirm_cmd(cmd: list[str], runs: int) -> tuple[set[str], int]:

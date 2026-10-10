@@ -106,8 +106,14 @@ fn open_idle(engine: &mut Engine, fe: SocketAddr, n: usize, request: bool, keep:
         }
         keep.push(c);
     }
+    // Settled: two passes in a row that ran no task, each having waited out the poller's
+    // timeout with nothing to do. Fifty passes of that wait were 5 s per batch (T259).
+    let mut idle = 0;
     for _ in 0..50 {
-        let _ = engine.run_once();
+        idle = if engine.run_once().unwrap_or(1) == 0 { idle + 1 } else { 0 };
+        if idle == 2 {
+            break;
+        }
         thread::sleep(Duration::from_millis(1));
     }
 }

@@ -392,6 +392,16 @@ impl ClientXprt {
         }
     }
 
+    /// True once the handshake has failed (a protocol error, or the client gone before it
+    /// completed): the connection is not, and will not be, usable.
+    #[must_use]
+    pub fn handshake_failed(&self) -> bool {
+        match self {
+            ClientXprt::Plain => false,
+            ClientXprt::Tls(t) => t.handshake_failed(),
+        }
+    }
+
     /// True when the stream ended without `close_notify`.
     #[must_use]
     pub fn was_truncated(&self) -> bool {

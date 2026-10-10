@@ -63,8 +63,8 @@ fn run(rule: &str) -> Vec<String> {
         let mut c = TcpStream::connect(fe).expect("connect");
         c.set_read_timeout(Some(Duration::from_secs(3))).expect("timeout");
         c.write_all(format!("{r} HTTP/1.1\r\nHost: h\r\n\r\n").as_bytes()).expect("send");
-        let mut out = Vec::new();
-        let _ = c.read_to_end(&mut out);
+        // The request line the server saw is the result; the client connection is kept
+        // alive, so reading it to its end would wait out the 3 s read timeout (T259).
         seen.push(rx.recv_timeout(Duration::from_secs(3)).unwrap_or_else(|_| "<none>".into()));
     }
     common::stop(&mut child);
