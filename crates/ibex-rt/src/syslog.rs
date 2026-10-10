@@ -61,9 +61,9 @@ pub(crate) fn write_fd_nonblocking(fd: i32, line: &[u8]) -> bool {
     let (bit, owned) = if fd == 2 { (2, err.as_fd()) } else { (1, out.as_fd()) };
     if PREPARED.load(Ordering::Relaxed) & bit == 0 {
         let tty = if fd == 2 { std::io::stderr().is_terminal() } else { std::io::stdout().is_terminal() };
-        if !tty {
-            let _ = rustix::fs::fcntl_getfl(owned).and_then(|f| rustix::fs::fcntl_setfl(owned, f | rustix::fs::OFlags::NONBLOCK));
-        }
+        // A terminal keeps its flags (set back unchanged); anything else becomes non-blocking.
+        let extra = if tty { rustix::fs::OFlags::empty() } else { rustix::fs::OFlags::NONBLOCK };
+        let _ = rustix::fs::fcntl_getfl(owned).and_then(|f| rustix::fs::fcntl_setfl(owned, f | extra));
         PREPARED.fetch_or(bit, Ordering::Relaxed);
     }
     let res = rustix::io::write(owned, line);
