@@ -7553,6 +7553,26 @@ impl EngineDispatcher<'_> {
         let Some(txn) = entry.sess.txn.as_mut() else {
             return;
         };
+        // A response body that breaks its framing, or a chunk extension or trailer section
+        // past its cap: what came before the violation is delivered and nothing after it.
+        // The rest is never going to be relayed, so waiting for more of it (`timeout server`,
+        // or for ever against a server that keeps talking) is pointless; the server is let
+        // go now and the client connection closed behind the valid bytes. `HAProxy` 3.5-dev8
+        // closes at once on a trailer flood and logs `PH` (T248).
+        if !(srv_eof || srv_err) && !txn.local && !txn.aborted && matches!(txn.rsp, MsgState::Body(_)) {
+            let mut probe = txn.rsp;
+            probe.advance(entry.sess.rep.readable());
+            if probe == MsgState::Error {
+                txn.srv_reusable = false;
+                txn.close_after = true;
+                txn.aborted = true;
+                entry.sess.srv_state = ScState::Error;
+                entry.sess.ending.get_or_insert(crate::proxy::Ending::ServerAbort);
+                entry.sess.log.term = Some(*b"PH");
+                for_tracked(proxies, &entry.sess, |data| data.count_fail());
+                return;
+            }
+        }
         // A response held by its rules (`WAIT_END`, `wait-for-body`) is here, and one they
         // rejected is not owed; the server closing behind either changes nothing.
         if !(srv_eof || srv_err) || !txn.req_rules_done || txn.local || txn.rsp.is_done() || txn.rsp_wait.is_some() || txn.aborted {
