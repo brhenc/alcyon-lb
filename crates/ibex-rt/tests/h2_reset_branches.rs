@@ -12,9 +12,13 @@ mod common;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::NamedTempFile;
+
+/// How the `/stall` connection ended at the server: 1 closed, 2 reset, 3 other, 0 not yet.
+static STALL_END: AtomicU8 = AtomicU8::new(0);
 
 struct Ibex {
     child: Child,
@@ -42,6 +46,17 @@ fn server() -> SocketAddr {
                         Ok(0) | Err(_) => return,
                         Ok(n) => got.extend_from_slice(&buf[..n]),
                     }
+                }
+                if got.starts_with(b"GET /stall ") {
+                    // The head and 2 of 10 body bytes, then silence until the connection ends.
+                    let _ = c.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nab");
+                    let end = match c.read(&mut buf) {
+                        Ok(_) => 1,
+                        Err(e) if e.kind() == ErrorKind::ConnectionReset => 2,
+                        Err(_) => 3,
+                    };
+                    STALL_END.store(end, Ordering::SeqCst);
+                    return;
                 }
                 if got.starts_with(b"GET /a ") {
                     thread::sleep(Duration::from_millis(500));
@@ -206,4 +221,27 @@ fn client_fin_while_the_request_is_still_coming() {
     assert!(frames.contains(&(1, 1)) && frames.contains(&(0, 1)), "stream 1 is answered: {frames:?}");
     let line = log_line(&log);
     assert!(line.contains(" 200 51 - - ") && line.contains("POST http://x/b"), "{line}");
+}
+
+#[test]
+fn reset_stream_during_the_response_body() {
+    let (_ibex, fe, log) = start("", "");
+    let mut s = connect(fe, &[]);
+    s.write_all(&frame(1, 5, 1, &head("GET", "/stall"))).expect("stream 1");
+    // The head and 2 bytes arrive, the server then stalls: the response is under way.
+    let frames = frames_for(&mut s, Duration::from_millis(400));
+    assert!(frames.contains(&(1, 1)) && frames.contains(&(0, 1)), "head and part of the body: {frames:?}");
+    s.write_all(&frame(3, 0, 1, &8u32.to_be_bytes())).expect("rst_stream cancel");
+    // HAProxy: `200 52 - - CD--`; the server connection is reset at once.
+    let line = log_line(&log);
+    assert!(line.contains(" 200 52 - - CD-- ") && line.contains("/stall HTTP/2.0"), "{line}");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while STALL_END.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_ne!(STALL_END.load(Ordering::SeqCst), 0, "the server connection was let go");
+    // The next stream of the connection is answered at once.
+    s.write_all(&frame(1, 5, 3, &head("GET", "/b"))).expect("stream 3");
+    let frames = frames_for(&mut s, Duration::from_millis(500));
+    assert!(frames.contains(&(0, 3)), "stream 3 answered: {frames:?}");
 }
