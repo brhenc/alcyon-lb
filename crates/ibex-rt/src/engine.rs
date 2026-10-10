@@ -11864,11 +11864,13 @@ fn htx_reply(raw: &[u8]) -> Vec<u8> {
     let status = crate::txn::status_of(&String::from_utf8_lossy(&raw[..crate::proxy::find_eoh(raw).map_or(raw.len(), |(h, _)| h)]));
     if matches!(status, 400 | 408) && builtin_error_page(status) == Some(raw) {
         const CLOSE: &[u8] = b"Connection: close\r\n";
-        if let Some(i) = out.windows(CLOSE.len()).position(|w| w == CLOSE) {
+        // The built-in page has the header; the position is always there.
+        let at = out.windows(CLOSE.len()).position(|w| w == CLOSE);
+        at.into_iter().for_each(|i| {
             out.drain(i..i + CLOSE.len());
             let h = crate::proxy::find_eoh(&out).map_or(out.len(), |(h, _)| h);
             out.splice(h..h, b"\r\nConnection: close".iter().copied());
-        }
+        });
     }
     lowercase_header_names(&mut out);
     out
