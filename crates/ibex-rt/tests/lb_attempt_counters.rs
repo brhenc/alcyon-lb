@@ -14,7 +14,8 @@
 //!   counted every attempt on the server that answered (s1 `stot=19`), and s2 none.
 //! - `cookie SRV insert indirect nocache`, 5 requests with `SRV=s1`, then 4 without: s1
 //!   `stot=5` and no `lbtot`, s2 `stot=4 lbtot=4`, BACKEND `lbtot=4`. Ibex counted all 9 in
-//!   `lbtot`.
+//!   `lbtot`. The s1/s2 split of the 4 is an artefact of the oracle's 8 thread groups, each
+//!   with its own fwrr tree; with one group it is s1 2, s2 2 (T233), so only the sum is checked.
 //! - one server down, `retries 2`, 3 requests: s1 `stot=9 lbtot=3 wretr=6 econ=3`. Ibex
 //!   already matched.
 //!
@@ -179,7 +180,7 @@ fn a_server_the_cookie_chose_is_not_counted_as_balanced() {
     let st = run(&format!("  balance roundrobin\n  cookie SRV insert indirect nocache\n  server s1 {s1} cookie s1\n  server s2 {s2} cookie s2\n"), &reqs);
     let balanced = get(&st, "s1", "lbtot") + get(&st, "s2", "lbtot");
     assert_eq!(get(&st, "s1", "stot") + get(&st, "s2", "stot"), 9, "stot of s1 and s2");
-    assert_eq!(balanced, 4, "only the 4 requests without the cookie were balanced (HAProxy: s1 0, s2 4)");
+    assert_eq!(balanced, 4, "only the 4 requests without the cookie were balanced ");
     assert_eq!(get(&st, "BACKEND", "lbtot"), 4, "BACKEND lbtot");
 }
 
