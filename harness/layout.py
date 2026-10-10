@@ -92,6 +92,68 @@ def crates(repo: str = REPO) -> list[str]:
                   if os.path.isfile(os.path.join(root, c, "Cargo.toml")))
 
 
+def package_dirs(repo: str = REPO) -> dict[str, str]:
+    """Package name -> crate directory."""
+    out = {}
+    for c in crates(repo):
+        with open(os.path.join(c, "Cargo.toml"), "rb") as f:
+            out[tomllib.load(f)["package"]["name"]] = c
+    return out
+
+
+def own_targets(crate: str) -> dict[str, str]:
+    """The crate's test targets other than `it`, name -> source file."""
+    with open(os.path.join(crate, "Cargo.toml"), "rb") as f:
+        manifest = tomllib.load(f)
+    return {t["name"]: os.path.join(crate, t.get("path", f"tests/{t['name']}.rs"))
+            for t in manifest.get("test", []) if t["name"] != "it"}
+
+
+def migrate_key(old: str) -> str:
+    """A suite key (`crate/target::test`) from before T260 in today's layout: a test file
+    that became a module of `it` is `crate/it::file::test`; a unit test (`lib`), the doc
+    tests and a file that kept its own binary keep their name."""
+    pkg, rest = old.split("/", 1)
+    target, _, test = rest.partition("::")
+    crate = package_dirs().get(pkg)
+    if crate is None or target in ("lib", "doc", "it") or ":" in target or target in own_targets(crate):
+        return old
+    return f"{pkg}/it::{target}::{test}"
+
+
+def _defines(paths: list[str], fn: str) -> bool:
+    pat = re.compile(r"\bfn\s+" + re.escape(fn) + r"\b")
+    return any(pat.search(open(p, encoding="utf-8").read()) for p in paths if os.path.isfile(p))
+
+
+def resolve_key(key: str) -> str | None:
+    """The source file that defines the test a suite key names, or None when it names none.
+    A key ending in `::` names a target or a module of `it` (SERIAL_TARGETS' prefixes)."""
+    pkg, _, rest = key.partition("/")
+    target, _, test = rest.partition("::")
+    crate = package_dirs().get(pkg)
+    if crate is None:
+        return None
+    parts = test.split("::")
+    if target == "lib":
+        files = [os.path.join(d, f) for d, _, fs in os.walk(os.path.join(crate, "src")) for f in fs
+                 if f.endswith(".rs")]
+    elif target == "it":
+        base = os.path.join(crate, "tests", "it", parts[0])
+        files = [base + ".rs"] + [os.path.join(d, f) for d, _, fs in os.walk(base) for f in fs]
+        parts = parts[1:] or [""]
+    elif target in own_targets(crate):
+        files = [own_targets(crate)[target]]
+    else:
+        return None
+    files = [f for f in files if os.path.isfile(f)]
+    if not files:
+        return None
+    if parts[-1] == "":
+        return files[0]
+    return next((f for f in files if _defines([f], parts[-1])), None)
+
+
 def main() -> int:
     bad = [f for c in crates() for f in unreached(c)]
     for f in bad:

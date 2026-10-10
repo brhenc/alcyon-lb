@@ -25,14 +25,21 @@ Two things make this usable as a gate rather than noise:
     fails the gate. A baselined entry that no longer fails is reported too, so the
     baseline gets tightened instead of quietly protecting a test that no longer needs it.
 
-The targets run in parallel (T116): `cargo test` runs its test binaries one after another,
-and with 129 of them the gate spent 100 s on a 64-core machine mostly idle. The suite builds
-with `cargo test --no-run` and runs each test binary itself, `SUITE_JOBS` at once, longest
-first, as cargo would: from the package's directory, with cargo's `CARGO_*` variables. (Not
-`cargo test -p` per target: cargo holds the build directory's lock while the tests run,
-and parallel invocations queue behind it.) Doc tests run through `cargo test --doc`, and a
-failing target is re-run alone through `cargo test`, as before. `SUITE_SERIAL=1` runs the
-single `cargo test --workspace` of before.
+The tests run in parallel (T116), each in a process of its own (T260). Each crate has one
+integration-test binary since T260 (`tests/it/main.rs`, plus the few files that need their
+own process), so a process per binary would no longer bound a hung test, isolate one test
+from another or spread the work: the suite builds with `cargo test --no-run`, lists each
+test binary's tests (`--list`), and runs every test as `<binary> --exact <name>`,
+`SUITE_JOBS` at once, longest first, as cargo would: from the package's directory, with
+cargo's `CARGO_*` variables. (Not `cargo test -p`: cargo holds the build directory's lock
+while the tests run, and parallel invocations queue behind it.) Each test is killed after
+`SUITE_TIMEOUT` seconds. Doc tests run through one `cargo test --doc`. A failing test is
+re-run alone the same way. `SUITE_SERIAL=1` runs the single `cargo test --workspace` of
+before.
+
+Keys are `crate/target::test`, as the baseline names them: `ibex-rt/it::h3_end_to_end::x`
+for a test of tests/it/h3_end_to_end.rs, `ibex-rt/request_allocations::x` for a file with
+a binary of its own, `ibex-rt/lib::proxy::tests::x` for a unit test.
 
 The tests run once per gate, instrumented (T257): in the build `cargo llvm-cov` makes
 (`<target>/llvm-cov-target`, covercheck.instrumented_env), and the profiles they write are
@@ -62,8 +69,9 @@ BASELINE = os.path.join(REPO, "data", "suite_baseline.json")
 # failure is silently reclassified as a flake. That made the gate pass everything once.
 TARGET_RE = re.compile(r"^\s+`?-p ([^\s`]+) --test ([^\s`]+)`?\s*$")
 FAIL_RE = re.compile(r"^test (\S+) \.\.\. FAILED\s*$", re.M)
-# `     Running tests/foo.rs (target/debug/deps/foo-0123abcd)`, one per test binary.
-RUNNING_RE = re.compile(r"^\s+Running (?:unittests )?(?:\S+/)?([^/\s]+?)(?:\.rs)? \(\S+\)\s*$")
+# `     Running tests/foo.rs (target/debug/deps/foo-0123abcd)`, one per test binary; a test
+# target is named by its binary (`tests/it/main.rs` is `it`), a unit-test one by its source.
+RUNNING_RE = re.compile(r"^\s+Running (unittests )?(?:\S+/)?([^/\s]+?)(?:\.rs)? \((\S+)\)\s*$")
 ALONE_RUNS = 3
 
 
@@ -98,7 +106,9 @@ def failed_by_target(out: str) -> dict[str, set[str]]:
     for line in out.splitlines():
         m = RUNNING_RE.match(line)
         if m:
-            target = m.group(1)
+            target = m.group(2)
+            if not m.group(1):
+                target = re.sub(r"-[0-9a-f]+$", "", os.path.basename(m.group(3)))
             continue
         f = FAIL_RE.match(line)
         if f and target:
@@ -108,9 +118,8 @@ def failed_by_target(out: str) -> dict[str, set[str]]:
 
 RESULT_RE = re.compile(r"^test result: \w+\. (\d+) passed; (\d+) failed", re.M)
 JOBS = int(os.environ.get("SUITE_JOBS", "8"))
-# A test binary that runs longer than this is killed and reported as failing, so a deadlock
-# shows up as a named failure instead of a gate that never ends. The slowest binary takes
-# about 13 s; `SUITE_TIMEOUT` raises it.
+# A test that runs longer than this is killed and reported as failing, so a deadlock shows
+# up as a named failure instead of a gate that never ends. `SUITE_TIMEOUT` raises it.
 TARGET_TIMEOUT = int(os.environ.get("SUITE_TIMEOUT", "300"))
 HEARTBEAT = 15
 # Set by covercheck.instrumented_env to the instrumented target directory.
@@ -134,18 +143,58 @@ def run_bounded(cmd: list[str], cwd: str, env: dict | None) -> tuple[int, str]:
         os.killpg(p.pid, 9)
         out, _ = p.communicate()
         return -9, out or ""
-# Targets that measure the process or race the clock: run one at a time after the parallel
+# Tests that measure the process or race the clock: run one at a time after the parallel
 # pool, on a machine as quiet as the serial suite left it. Each was seen failing only under
 # the pool's load and passing alone (2026-10-03); a name here is not an excuse -- a failure
-# in the serial pass is a failure like any other.
+# in the serial pass is a failure like any other. An entry is a target (`crate/target`,
+# every test of it) or a module of one (`crate/it::module`), matched on `::` boundaries.
 # canonical_haproxy_35_e2e left the list (T259): its stick counters are read once the
 # answer has arrived and the engine is idle, no longer after a fixed number of passes.
 SERIAL_TARGETS = {
     "ibex-rt/request_allocations",     # counts allocations and bytes per request
     "ibex-rt/cli_applet",              # `show pools` waits a fixed 20 engine steps (T116)
     # Failed only in gates that shared the machine with another gate, passed alone (2026-10-05):
-    "ibex-rt/fd_hygiene",              # counts /proc/<pid>/fd after the server closes (T217)
+    "ibex-rt/it::fd_hygiene",          # counts /proc/<pid>/fd after the server closes (T217)
 }
+
+
+def is_serial(key: str) -> bool:
+    """Whether the test `crate/target::test` is in `SERIAL_TARGETS`."""
+    return any(key == s or key.startswith(s + "::") for s in SERIAL_TARGETS)
+
+
+def listed_tests(listed: str, ignored: str) -> list[str]:
+    """The tests a binary runs by default: `--list --format terse` less `--ignored`'s."""
+    def names(out: str) -> list[str]:
+        return [ln[:-len(": test")] for ln in out.splitlines() if ln.endswith(": test")]
+    skip = set(names(ignored))
+    return [n for n in names(listed) if n not in skip]
+
+
+def test_verdict(rc: int, out: str) -> str:
+    """One test's process: "ok", "failed", "hung" (killed after `TARGET_TIMEOUT`), or "not
+    run" -- `--exact <name>` matching nothing runs nothing and exits 0, and counting that as a
+    pass is how a renamed test would go silently unrun."""
+    if rc == -9:
+        return "hung"
+    counts = RESULT_RE.findall(out)
+    if rc == 0:
+        return "ok" if any(int(p) + int(f) == 1 for p, f in counts) else "not run"
+    return "failed"
+
+
+# The pool of profiles the instrumented test processes merge into, per binary (`%Nm`).
+PROFILE_POOL = 16
+
+
+def pooled_profile(path: str) -> str:
+    """`LLVM_PROFILE_FILE` for one process per test: `cargo llvm-cov`'s `%p` (a profile per
+    process) would write one file per test, thousands of megabytes-large files; a `%Nm`
+    pool merges the processes of one binary online into at most N files."""
+    path = re.sub(r"%p-?", "", path)
+    path = re.sub(r"%\d*m", "", path)
+    stem, ext = os.path.splitext(path)
+    return f"{stem.rstrip('-')}-%{PROFILE_POOL}m{ext}"
 
 
 def target_dir() -> str:
@@ -223,47 +272,67 @@ def cargo_env(p: dict) -> dict:
     return env
 
 
-def run_parallel(doc: bool = True) -> tuple[list[tuple[str, str, list[str]]], dict[str, set[str]], int, int] | None:
-    """Runs every target, `JOBS` at once. Returns the failing targets, the failing tests of
-    each (keyed by target), and the totals of tests passed and failed. `doc=False` leaves the
-    doc tests out (covercheck: `cargo llvm-cov` does not instrument them)."""
+def list_jobs(targets) -> list[tuple]:
+    """One job per test: (package, target, test, command, cwd, env). The binaries are listed
+    in parallel; a binary that cannot list its tests is one failing job named `<list>`."""
+    def one(t):
+        pkg, key, _sel, exe, p = t
+        cwd, env = os.path.dirname(p["manifest_path"]), cargo_env(p)
+        if env.get("LLVM_PROFILE_FILE"):
+            env["LLVM_PROFILE_FILE"] = pooled_profile(env["LLVM_PROFILE_FILE"])
+        outs = []
+        for extra in ([], ["--ignored"]):
+            r = subprocess.run([exe, "--list", "--format", "terse", *extra], cwd=cwd, env=env,
+                               capture_output=True, text=True, timeout=120)
+            if r.returncode != 0:
+                return [(pkg, key, "<list>", [exe, "--list"], cwd, env)]
+            outs.append(r.stdout)
+        return [(pkg, key, name, [exe, "--exact", name], cwd, env) for name in listed_tests(*outs)]
+    with ThreadPoolExecutor(max_workers=max(JOBS, 8)) as pool:
+        return [j for js in pool.map(one, targets) for j in js]
+
+
+def run_parallel(doc: bool = True) -> tuple[list[tuple], dict[str, set[str]], int, int] | None:
+    """Runs every test, each in its own process, `JOBS` at once. Returns the failing jobs
+    (package, target, test, command, cwd, env), the failing tests of each target (keyed by
+    target), and the totals of tests passed and failed. `doc=False` leaves the doc tests out
+    (covercheck: `cargo llvm-cov` does not instrument them)."""
     targets = test_targets()
     if targets is None:
         print("suite: the workspace's tests do not build")
         return None
-    # (package, target, selector, command, cwd, env)
-    jobs = [(pkg, key, sel, [exe], os.path.dirname(p["manifest_path"]), cargo_env(p))
-            for pkg, key, sel, exe, p in targets]
+    jobs = list_jobs(targets)
     if doc:
-        jobs.append(("workspace", "doc", ["--doc"], ["cargo", "test", "--workspace", "--doc", "--no-fail-fast"],
+        jobs.append(("workspace", "doc", "<doc>", ["cargo", "test", "--workspace", "--doc", "--no-fail-fast"],
                      REPO, doc_env()))
-    # Longest first, from the last run's durations: the slowest target sets the floor.
+    say(f"suite: {len(jobs)} tests in {len(targets)} test binaries" + (" and the doc tests" if doc else ""))
+    # Longest first, from the last run's durations: the slowest test sets the floor.
     times_path = os.path.join(target_dir(), "suite-durations.json")
     try:
         last = json.load(open(times_path))
     except (OSError, ValueError):
         last = {}
-    jobs.sort(key=lambda j: -last.get(f"{j[0]}/{j[1]}", 1000.0))
+    key = lambda j: f"{j[0]}/{j[1]}::{j[2]}"  # noqa: E731
+    jobs.sort(key=lambda j: -last.get(key(j), 1000.0))
 
     running: dict[str, float] = {}
     done = [0]
     lock = threading.Lock()
 
     def one(job):
-        name = f"{job[0]}/{job[1]}"
+        name = key(job)
         t0 = time.monotonic()
         with lock:
             running[name] = t0
         rc, out = run_bounded(job[3], job[4], job[5])
         if rc == -9:
-            # A hang names no failing test: the target fails.
             say(f"   {name}: killed after {TARGET_TIMEOUT}s (SUITE_TIMEOUT) -- hung")
         with lock:
             del running[name]
             done[0] += 1
         return job, rc, out, time.monotonic() - t0
 
-    # Progress: how many targets are done and which are running for how long, so a stuck
+    # Progress: how many tests are done and which are running for how long, so a stuck
     # test is visible while it is stuck rather than when the gate is given up on.
     stop = threading.Event()
 
@@ -273,11 +342,11 @@ def run_parallel(doc: bool = True) -> tuple[list[tuple[str, str, list[str]]], di
                 now = time.monotonic()
                 slow = sorted(running.items(), key=lambda kv: kv[1])[:4]
                 busy = ", ".join(f"{n} {now - t:.0f}s" for n, t in slow)
-                say(f"   ... {done[0]}/{len(jobs)} targets done; running: {busy or '-'}")
+                say(f"   ... {done[0]}/{len(jobs)} tests done; running: {busy or '-'}")
 
     threading.Thread(target=heartbeat, daemon=True).start()
-    pooled = [j for j in jobs if f"{j[0]}/{j[1]}" not in SERIAL_TARGETS]
-    serial = [j for j in jobs if f"{j[0]}/{j[1]}" in SERIAL_TARGETS]
+    pooled = [j for j in jobs if not is_serial(key(j))]
+    serial = [j for j in jobs if is_serial(key(j))]
     try:
         with ThreadPoolExecutor(max_workers=JOBS) as pool:
             results = list(pool.map(one, pooled))
@@ -285,15 +354,27 @@ def run_parallel(doc: bool = True) -> tuple[list[tuple[str, str, list[str]]], di
     finally:
         stop.set()
     failing, failed_tests, passed, failed_n, durations = [], {}, 0, 0, {}
-    for (pkg, key, sel, _cmd, _cwd, _env), rc, out, secs in results:
-        durations[f"{pkg}/{key}"] = round(secs, 2)
-        for p_, f_ in RESULT_RE.findall(out):
-            passed += int(p_)
-            failed_n += int(f_)
-        if rc != 0:
-            # Re-run alone through `cargo test`, as the serial suite does.
-            failing.append((pkg, key, sel))
-            failed_tests[key] = set(FAIL_RE.findall(out)) or ({"<hung>"} if rc == -9 else {"<target>"})
+    for job, rc, out, secs in results:
+        pkg, tgt, test = job[0], job[1], job[2]
+        durations[key(job)] = round(secs, 2)
+        if tgt == "doc":
+            for p_, f_ in RESULT_RE.findall(out):
+                passed += int(p_)
+                failed_n += int(f_)
+            if rc != 0:
+                failing.append(job)
+                failed_tests["doc"] = set(FAIL_RE.findall(out)) or {"<hung>" if rc == -9 else "<target>"}
+            continue
+        verdict = test_verdict(rc, out)
+        if verdict == "ok":
+            passed += 1
+            continue
+        failed_n += 1
+        failing.append(job)
+        if verdict != "failed":
+            say(f"   {key(job)}: {verdict}")
+        # `<hung>` beside the name: covercheck fails on a hung test (its profile is lost).
+        failed_tests.setdefault(tgt, set()).update({test} | ({"<hung>"} if verdict == "hung" else set()))
     try:
         json.dump(durations, open(times_path, "w"))
     except OSError:
@@ -339,27 +420,38 @@ def record_run(tdir: str, failed_tests: dict[str, set[str]], passed: int, failed
         json.dump(rec, f, indent=1)
 
 
-# A target slower than this is named after every run (informational, not a failure), so a
-# new slow test is seen the day it lands: the pool's wall time is its slowest target.
+# A test slower than this is named after every run (informational, not a failure), so a
+# new slow test is seen the day it lands: the pool's wall time is at least its slowest test.
 SLOW_TARGET = 10.0
 
 
 def slow_targets_line(durations: dict[str, float]) -> str:
     slow = sorted(((s, n) for n, s in durations.items() if s > SLOW_TARGET), reverse=True)
     if not slow:
-        return f"suite: slow targets (over {SLOW_TARGET:.0f}s): none"
-    return f"suite: slow targets (over {SLOW_TARGET:.0f}s): " + ", ".join(f"{n} {s:.1f}s" for s, n in slow)
+        return f"suite: slow tests (over {SLOW_TARGET:.0f}s): none"
+    return f"suite: slow tests (over {SLOW_TARGET:.0f}s): " + ", ".join(f"{n} {s:.1f}s" for s, n in slow)
 
 
-def confirm_cmd(cmd: list[str], runs: int) -> tuple[set[str], int]:
-    """Re-runs one target alone `runs` times.
+def confirm_cmd(cmd: list[str], runs: int, cwd: str = REPO, env: dict | None = None,
+                test: str | None = None) -> tuple[set[str], int]:
+    """Re-runs one test (`test`, the command running it alone) or one target alone `runs`
+    times.
 
-    Returns the tests that failed in any of those runs, and how many runs failed. A run that
-    fails without naming a test (a crash, a timeout) counts as the whole target failing."""
+    Returns the tests that failed in any of those runs, and how many runs failed. A run of a
+    target that fails without naming a test (a crash, a timeout) counts as the whole target
+    failing."""
     failed: set[str] = set()
     bad_runs = 0
     for _ in range(runs):
-        rc, out = run_bounded(cmd, REPO, None)
+        rc, out = run_bounded(cmd, cwd, env)
+        if test is not None:
+            verdict = test_verdict(rc, out)
+            if verdict != "ok":
+                bad_runs += 1
+                failed.add(test)
+                if verdict != "failed":
+                    say(f"   {test}: {verdict} alone")
+            continue
         if rc == -9:
             say(f"   {' '.join(cmd)}: killed after {TARGET_TIMEOUT}s alone -- hung")
             bad_runs += 1
@@ -386,10 +478,12 @@ def main() -> int:
             print("suite: could not parse cargo's failing-target list; treating as failure")
             return 1
         in_parallel = failed_by_target(out)
-        commands = {(pkg, t): ["cargo", "test", "-p", pkg, "--test", t, "--no-fail-fast"] for pkg, t in targets}
+        # (package, target, failed in the run, command, cwd, env, test)
+        units = [(pkg, t, in_parallel.get(t, set()), ["cargo", "test", "-p", pkg, "--test", t, "--no-fail-fast"],
+                  REPO, None, None) for pkg, t in targets]
     else:
         tdir = instrument()
-        say(f"suite: running every test target in the workspace, {JOBS} at a time, "
+        say(f"suite: running every test in the workspace in a process of its own, {JOBS} at a time, "
             f"{TARGET_TIMEOUT}s each at most, "
             + ("instrumented (the profiles are covercheck's)" if tdir else "not instrumented (COVERCHECK=0)"))
         r = run_parallel()
@@ -402,32 +496,31 @@ def main() -> int:
             # the counts, and covercheck asks only whether a line's count is zero.
             record_run(tdir, in_parallel, passed, failed_n)
         print(f"suite: {passed} tests passed, {failed_n} failed, in the parallel run")
-        targets = [(pkg, key) for pkg, key, _ in failing]
-        commands = {(pkg, key): (["cargo", "test", "--workspace", "--doc", "--no-fail-fast"] if key == "doc"
-                                 else ["cargo", "test", "-p", pkg, *args, "--no-fail-fast"])
-                    for pkg, key, args in failing}
+        units = [(pkg, tgt, in_parallel.get("doc", set()) if tgt == "doc" else {test}, cmd, cwd, env,
+                  None if tgt == "doc" else test)
+                 for pkg, tgt, test, cmd, cwd, env in failing]
 
     confirmed: dict[str, str] = {}
     flaky: dict[str, str] = {}
-    for pkg, target in targets:
-        # A target whose parallel failures are all declared known failures is confirmed by
-        # one alone run that reproduces them; anything else gets the full `ALONE_RUNS`.
-        seen = in_parallel.get(target, set())
+    for pkg, target, seen, cmd, cwd, env, test in units:
+        # A test (or target) whose parallel failures are all declared known failures is
+        # confirmed by one alone run that reproduces them; anything else gets the full
+        # `ALONE_RUNS`.
         all_known = bool(seen) and all(f"{pkg}/{target}::{n}" in base for n in seen)
-        still, bad_runs = confirm_cmd(commands[(pkg, target)], 1 if all_known else ALONE_RUNS)
+        still, bad_runs = confirm_cmd(cmd, 1 if all_known else ALONE_RUNS, cwd, env, test)
         runs = 1 if all_known else ALONE_RUNS
         if all_known and still != seen:
-            more, more_bad = confirm_cmd(commands[(pkg, target)], ALONE_RUNS - 1)
+            more, more_bad = confirm_cmd(cmd, ALONE_RUNS - 1, cwd, env, test)
             still |= more
             bad_runs += more_bad
             runs = ALONE_RUNS
         for name in still:
             confirmed[f"{pkg}/{target}::{name}"] = ""
         if still:
-            print(f"   {pkg}/{target}: fails alone in {bad_runs}/{runs} runs")
+            print(f"   {pkg}/{target}" + (f"::{test}" if test else "") + f": fails alone in {bad_runs}/{runs} runs")
         # A target whose parallel results could not be read: flaky only if it then passed
         # alone every time.
-        only_parallel = in_parallel.get(target, set() if still else {"<target>"}) - still
+        only_parallel = (seen or (set() if still else {"<target>"})) - still
         for name in sorted(only_parallel):
             flaky[f"{pkg}/{target}::{name}"] = ""
             print(f"   {pkg}/{target}::{name}: failed in the parallel run, passes alone "

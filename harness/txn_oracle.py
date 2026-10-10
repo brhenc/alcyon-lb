@@ -44,9 +44,12 @@ def main() -> int:
     print(f"txn oracle: baseline measured on {base['measured_on']}")
 
     env = dict(os.environ, IBEX_TXN_BIN=haproxy)
-    p = subprocess.run(["cargo", "test", "-p", "ibex-rt", "--test", "http_txn", "--no-fail-fast"],
+    # http_txn.rs is the module `http_txn` of ibex-rt's test binary `it` (T260); its cases
+    # keep their bare names in the baseline.
+    p = subprocess.run(["cargo", "test", "-p", "ibex-rt", "--test", "it", "--no-fail-fast", "--", "http_txn::"],
                        cwd=REPO, env=env, capture_output=True, text=True, timeout=1800)
-    results = dict(RESULT_RE.findall(p.stdout + p.stderr))
+    results = {t.removeprefix("http_txn::"): r for t, r in RESULT_RE.findall(p.stdout + p.stderr)
+               if t.startswith("http_txn::")}
     if not results:
         print("txn oracle: no test results parsed; treating as failure")
         print((p.stdout + p.stderr)[-2000:])

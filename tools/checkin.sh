@@ -211,9 +211,9 @@ stage_harness-tests() {
 stage_findings() {
   cargo test -p ibex-sample --test sample_semantics 2>&1 | grep -E "^test |test result"
   check "${PIPESTATUS[0]}" "sample_semantics"
-  cargo test -p ibex-rt --test tcp_request_rules 2>&1 | grep -E "^test |test result"
+  cargo test -p ibex-rt --test it tcp_request_rules:: 2>&1 | grep -E "^test |test result"
   check "${PIPESTATUS[0]}" "tcp_request_rules"
-  cargo test -p ibex-rt --test tcp_request_tracking 2>&1 | grep -E "^test |test result"
+  cargo test -p ibex-rt --test it tcp_request_tracking:: 2>&1 | grep -E "^test |test result"
   check "${PIPESTATUS[0]}" "tcp_request_tracking"
 }
 
@@ -223,7 +223,7 @@ stage_oracles() {
   # panicked on `serde_json::from_str` before comparing a single vector -- the struct named
   # `_in_len` where data/slz_vectors.json has `in_len`. It had never been run against the
   # oracle it exists for. A test nobody runs is a test nobody has.
-  cargo test -p slz --test test_slz -- --nocapture 2>&1 | grep -E "EXACT MATCHES|ROUND TRIPS|test result"
+  cargo test -p slz --test it -- --nocapture 2>&1 | grep -E "EXACT MATCHES|ROUND TRIPS|test result"
   check "${PIPESTATUS[0]}" "slz oracle"
 }
 
