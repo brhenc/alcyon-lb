@@ -99,3 +99,60 @@ fn an_expired_entry_leaves_the_table() {
     let out = show_table(&ibex);
     assert!(out.contains("used:0"), "{out}");
 }
+
+/// Sends `n` requests, each with its own key of `klen` characters, on one connection.
+fn fill(fe: SocketAddr, n: usize, klen: usize) {
+    let mut c = TcpStream::connect(fe).expect("connect");
+    let mut r = c.try_clone().expect("clone");
+    let drain = thread::spawn(move || {
+        let mut buf = vec![0u8; 1 << 16];
+        let mut total = 0usize;
+        while let Ok(k) = r.read(&mut buf) {
+            if k == 0 {
+                break;
+            }
+            total += k;
+        }
+        total
+    });
+    let mut batch = String::new();
+    for i in 0..n {
+        let key = format!("{i:0>klen$}");
+        batch.push_str(&format!("GET / HTTP/1.1\r\nHost: x\r\nx-k: {key}\r\n\r\n"));
+        if batch.len() > 1 << 20 || i + 1 == n {
+            c.write_all(batch.as_bytes()).expect("send");
+            batch.clear();
+        }
+    }
+    c.write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").expect("send");
+    let _ = drain.join();
+}
+
+fn rss_kb(pid: u32) -> u64 {
+    let s = std::fs::read_to_string(format!("/proc/{pid}/status")).expect("status");
+    let l = s.lines().find(|l| l.starts_with("VmRSS:")).expect("VmRSS");
+    l.split_whitespace().nth(1).expect("kb").parse().expect("number")
+}
+
+/// 40000 entries of 450-byte keys make a reply of about 20 MB; read 100 bytes of it and stop
+/// reading: the process must not have built the rest in memory (T250, review item 10).
+#[test]
+fn show_table_is_streamed_not_built() {
+    let (ibex, fe) = start("stick-table type string len 500 size 100000 expire 60s");
+    fill(fe, 40_000, 450);
+    thread::sleep(Duration::from_millis(300));
+    let before = rss_kb(ibex.0.id());
+    let mut s = UnixStream::connect(&ibex.2).expect("connect");
+    s.set_read_timeout(Some(Duration::from_secs(3))).expect("timeout");
+    s.write_all(b"show table t\n").expect("send");
+    let mut head = [0u8; 100];
+    s.read_exact(&mut head).expect("first bytes");
+    thread::sleep(Duration::from_millis(800));
+    let grown = rss_kb(ibex.0.id()).saturating_sub(before);
+    assert!(grown < 5_000, "RSS grew {grown} KB while one client held a show table");
+    // and the whole of it comes out, once the client reads
+    let mut rest = Vec::new();
+    s.read_to_end(&mut rest).expect("rest");
+    let all = String::from_utf8_lossy(&rest);
+    assert_eq!(all.lines().filter(|l| l.contains("key=")).count() + 1, 40_000, "entries (one is in the head)");
+}

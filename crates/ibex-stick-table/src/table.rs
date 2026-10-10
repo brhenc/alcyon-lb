@@ -484,6 +484,27 @@ impl StickTable {
         Ok(result)
     }
 
+    /// Up to `max` live entries of the slots from `from` on, and the slot to continue from
+    /// (`None` once the end is reached). The lock is taken for this call only: an entry
+    /// created or removed between two calls may be missed, none is given twice.
+    pub fn dump_from(&self, from: usize, max: usize) -> (Vec<(StickKey, StickEntryData)>, Option<usize>) {
+        let Ok(inner) = self.inner.read() else { return (Vec::new(), None) };
+        let now = Instant::now();
+        let mut out = Vec::new();
+        let mut i = from;
+        while i < inner.slots.len() && out.len() < max {
+            if let Some(slot) = &inner.slots[i] {
+                if now.duration_since(slot.data.last_updated) < self.config.expire {
+                    if let Some(key) = StickKey::decode_bytes(inner.tree.key_of(slot.node_idx)) {
+                        out.push((key, slot.data.clone()));
+                    }
+                }
+            }
+            i += 1;
+        }
+        (out, (i < inner.slots.len()).then_some(i))
+    }
+
     /// Applies `op` to the counter or tag `which` of the entry `key`, which is created when
     /// `create` (`stktable_get_entry`; a lookup otherwise). `None` where the table does not
     /// store that counter, `Some(0)` where the entry is not there and is not created.

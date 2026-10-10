@@ -10570,6 +10570,13 @@ impl EngineDispatcher<'_> {
         };
 
         applet.process_commands(&mut applet_ctx);
+        if applet.table_pending() {
+            let left = applet.out_buf.len() - applet.out_offset;
+            applet.pump_table(&applet_ctx);
+            if applet.out_buf.len() - applet.out_offset < left || applet.out_buf.is_empty() {
+                applet.last_activity = now;
+            }
+        }
 
         if !applet.out_buf.is_empty() {
             let left = applet.out_buf.len() - applet.out_offset;
@@ -10610,8 +10617,10 @@ impl EngineDispatcher<'_> {
             }
         }
 
-        self.timer_updates
-            .push((applet.task, applet.last_activity.add(applet.timeout_ms)));
+        // A `show table` that stopped for its budget with the socket still taking data is
+        // due again now; one blocked on the socket waits for it.
+        let due = if applet.table_pending() && applet.out_buf.is_empty() { now } else { applet.last_activity.add(applet.timeout_ms) };
+        self.timer_updates.push((applet.task, due));
         Outcome::Keep
     }
 }

@@ -221,7 +221,24 @@ pub struct CliApplet {
     /// A command waiting for the other workers, and what followed it on its line.
     pending: Option<Pending>,
     pending_rest: Option<String>,
+    /// A `show table` being written, a chunk at a time (`pump_table`).
+    table_dump: Option<TableDump>,
 }
+
+/// Where a `show table` is: the filters, the proxy and the slot of its table to read next.
+struct TableDump {
+    target: Option<String>,
+    filter: Option<(String, String, u64)>,
+    proxy: usize,
+    slot: usize,
+    /// The `# table:` line of the current table is out.
+    header: bool,
+}
+
+/// About how much of a `show table` is put in the output buffer at a time.
+const TABLE_CHUNK: usize = 64 * 1024;
+/// How much of a `show table` one turn of the connection writes before it yields.
+const PUMP_BUDGET: usize = 1024 * 1024;
 
 impl CliApplet {
     /// Creates a new `CliApplet` for an accepted CLI connection.
@@ -248,6 +265,7 @@ impl CliApplet {
             created: Instant::now(),
             pending: None,
             pending_rest: None,
+            table_dump: None,
         }
     }
 
@@ -331,6 +349,10 @@ impl CliApplet {
 
     /// Executes complete command lines available in `in_buf`.
     pub fn process_commands(&mut self, ctx: &mut AppletContext) {
+        // Nothing new runs while a `show table` is still being written.
+        if self.table_dump.is_some() {
+            return;
+        }
         if let Some(p) = self.pending.take() {
             if !self.resume_pending(p, ctx) {
                 return;
@@ -897,19 +919,61 @@ impl CliApplet {
             }
         }
 
+        let found = ctx
+            .proxies
+            .iter()
+            .any(|p| p.stick_table.as_ref().is_some_and(|t| table_name.is_none_or(|n| t.config().name == n || p.name == n)));
+        if table_name.is_some() && !found {
+            self.out_buf.extend_from_slice(b"No such table\n");
+            if self.interactive {
+                self.out_buf.extend_from_slice(b"\n> ");
+            } else {
+                self.is_done = true;
+            }
+            return;
+        }
+        // The dump is written in chunks by `pump_table` (T250), not built here.
+        self.table_dump = Some(TableDump {
+            target: table_name.map(str::to_string),
+            filter: match (filter_field, filter_op, filter_val) {
+                (Some(f), Some(o), Some(v)) => Some((f.to_string(), o.to_string(), v)),
+                _ => None,
+            },
+            proxy: 0,
+            slot: 0,
+            header: false,
+        });
+    }
+
+    /// Writes the next chunk of a `show table` into `out_buf`, until about `budget` bytes are
+    /// out or the dump is over; `false` once it is over. The table is read a few entries at a
+    /// time and its lock is never held across a write: a table of millions of entries
+    /// neither sits in memory twice nor stops the data path (`HAProxy`'s applet does the
+    /// same).
+    fn table_chunk(&mut self, ctx: &AppletContext, budget: usize) -> bool {
+        use std::fmt::Write;
+        let Some(mut dump) = self.table_dump.take() else { return false };
         let mut out = String::new();
-        let mut found_table = false;
-
-        for proxy in ctx.proxies.iter() {
-            if let Some(ref table) = proxy.stick_table {
-                let cfg = table.config();
-                if let Some(target) = table_name {
-                    if cfg.name != target && proxy.name != target {
-                        continue;
-                    }
+        let mut scanned = 0usize;
+        // Also bounded by the entries looked at: a filter that keeps none must not read a
+        // whole table in one turn.
+        while out.len() < budget && scanned < 4096 {
+            let Some(proxy) = ctx.proxies.get(dump.proxy) else {
+                // Past the last proxy: the dump is over.
+                self.out_buf.extend_from_slice(out.as_bytes());
+                if self.interactive {
+                    self.out_buf.extend_from_slice(b"\n> ");
+                } else {
+                    self.is_done = true;
                 }
-                found_table = true;
-
+                return false;
+            };
+            let Some(table) = proxy.stick_table.as_ref().filter(|t| dump.target.as_deref().is_none_or(|n| t.config().name == n || proxy.name == n)) else {
+                dump.proxy += 1;
+                continue;
+            };
+            let cfg = table.config();
+            if !dump.header {
                 let key_type_str = match cfg.key_type {
                     ibex_stick_table::table::KeyType::Ip => "ip",
                     ibex_stick_table::table::KeyType::Ipv6 => "ipv6",
@@ -917,92 +981,114 @@ impl CliApplet {
                     ibex_stick_table::table::KeyType::String => "string",
                     ibex_stick_table::table::KeyType::Binary => "binary",
                 };
-
-                let _ = writeln!(
-                    out,
-                    "# table: {}, type: {}, size:{}, used:{}",
-                    cfg.name,
-                    key_type_str,
-                    cfg.max_size,
-                    table.len()
-                );
-
-                if let Ok(entries) = table.dump_entries() {
-                    for (k, v) in entries {
-                        let fields = table.data_fields(&v);
-                        if let (Some(ff), Some(fo), Some(fv)) = (filter_field, filter_op, filter_val) {
-                            // An entry of a table that does not store the type has no value
-                            // to compare: it is left out.
-                            let Some(field_val) = fields.iter().find(|(n, _, _)| n == ff).map(|(_, _, x)| *x) else {
-                                continue;
-                            };
-                            let keep = match fo {
-                                "eq" => field_val == fv,
-                                "ne" => field_val != fv,
-                                "le" => field_val <= fv,
-                                "ge" => field_val >= fv,
-                                "lt" => field_val < fv,
-                                "gt" => field_val > fv,
-                                _ => true,
-                            };
-                            if !keep { continue; }
-                        }
-
-                        let key_str = match k {
-                            ibex_stick_table::entry::StickKey::Ip(ip) => ip.to_string(),
-                            ibex_stick_table::entry::StickKey::Integer(i) => i.to_string(),
-                            ibex_stick_table::entry::StickKey::String(s) => s,
-                            ibex_stick_table::entry::StickKey::Binary(b) => {
-                                let mut s = String::new();
-                                for byte in b {
-                                    use std::fmt::Write;
-                                    let _ = write!(s, "{byte:02x}");
-                                }
-                                s
-                            }
-                        };
-
-                        // `exp=` is what is left of `expire`; the address is only an identity.
-                        let left = cfg.expire.saturating_sub(v.last_updated.elapsed()).as_millis();
-                        let addr = {
-                            use std::hash::{Hash, Hasher};
-                            let mut h = std::collections::hash_map::DefaultHasher::new();
-                            key_str.hash(&mut h);
-                            h.finish() & 0xffff_ffff_f0
-                        };
-                        let _ = write!(out, "{addr:#x}: key={key_str} use={} exp={left} shard=0", v.trackers);
-                        for (name, period, val) in &fields {
-                            match period {
-                                Some(p) => {
-                                    let _ = write!(out, " {name}({p})={val}");
-                                }
-                                None if name == "server_key" => {
-                                    // The name of the server `server_id` stands for.
-                                    let sname = v.server_id.and_then(|id| (0..proxy.servers.len()).find(|&i| proxy.server_puid(i) == id)).and_then(|i| proxy.server_ids.get(i));
-                                    let _ = write!(out, " server_key={}", sname.map_or("", String::as_str));
-                                }
-                                None => {
-                                    let _ = write!(out, " {name}={val}");
-                                }
-                            }
-                        }
-                        out.push('\n');
+                let _ = writeln!(out, "# table: {}, type: {}, size:{}, used:{}", cfg.name, key_type_str, cfg.max_size, table.len());
+                dump.header = true;
+            }
+            let (entries, next) = table.dump_from(dump.slot, 64);
+            let Some(next) = next else {
+                dump.proxy += 1;
+                dump.slot = 0;
+                dump.header = false;
+                continue;
+            };
+            dump.slot = next;
+            scanned += 64;
+            for (k, v) in entries {
+                let fields = table.data_fields(&v);
+                if let Some((ff, fo, fv)) = dump.filter.as_ref().map(|(f, o, v)| (f.as_str(), o.as_str(), *v)) {
+                    // An entry of a table that does not store the type has no value
+                    // to compare: it is left out.
+                    let Some(field_val) = fields.iter().find(|(n, _, _)| n == ff).map(|(_, _, x)| *x) else {
+                        continue;
+                    };
+                    let keep = match fo {
+                        "eq" => field_val == fv,
+                        "ne" => field_val != fv,
+                        "le" => field_val <= fv,
+                        "ge" => field_val >= fv,
+                        "lt" => field_val < fv,
+                        "gt" => field_val > fv,
+                        _ => true,
+                    };
+                    if !keep {
+                        continue;
                     }
                 }
+                let key_str = match k {
+                    ibex_stick_table::entry::StickKey::Ip(ip) => ip.to_string(),
+                    ibex_stick_table::entry::StickKey::Integer(i) => i.to_string(),
+                    ibex_stick_table::entry::StickKey::String(s) => s,
+                    ibex_stick_table::entry::StickKey::Binary(b) => {
+                        let mut s = String::new();
+                        for byte in b {
+                            let _ = write!(s, "{byte:02x}");
+                        }
+                        s
+                    }
+                };
+                // `exp=` is what is left of `expire`; the address is only an identity.
+                let left = cfg.expire.saturating_sub(v.last_updated.elapsed()).as_millis();
+                let addr = {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    key_str.hash(&mut h);
+                    h.finish() & 0xffff_ffff_f0
+                };
+                let _ = write!(out, "{addr:#x}: key={key_str} use={} exp={left} shard=0", v.trackers);
+                for (name, period, val) in &fields {
+                    match period {
+                        Some(p) => {
+                            let _ = write!(out, " {name}({p})={val}");
+                        }
+                        None if name == "server_key" => {
+                            // The name of the server `server_id` stands for.
+                            let sname = v.server_id.and_then(|id| (0..proxy.servers.len()).find(|&i| proxy.server_puid(i) == id)).and_then(|i| proxy.server_ids.get(i));
+                            let _ = write!(out, " server_key={}", sname.map_or("", String::as_str));
+                        }
+                        None => {
+                            let _ = write!(out, " {name}={val}");
+                        }
+                    }
+                }
+                out.push('\n');
             }
         }
+        self.out_buf.extend_from_slice(out.as_bytes());
+        self.table_dump = Some(dump);
+        true
+    }
 
-        if table_name.is_some() && !found_table {
-            self.out_buf.extend_from_slice(b"No such table\n");
-        } else {
-            self.out_buf.extend_from_slice(out.as_bytes());
+    /// Fills `out_buf` from a running `show table` and writes it, until the socket takes
+    /// no more, the dump is over, or [`PUMP_BUDGET`] bytes have gone (the connection's task
+    /// is then due again at once, so that one dump does not hold the worker).
+    pub fn pump_table(&mut self, ctx: &AppletContext) {
+        let mut sent = 0usize;
+        while self.table_dump.is_some() && sent < PUMP_BUDGET {
+            if self.is_done {
+                // The client is gone: the rest of the dump has nowhere to go.
+                self.table_dump = None;
+                return;
+            }
+            if self.out_buf.is_empty() {
+                self.out_offset = 0;
+                if !self.table_chunk(ctx, TABLE_CHUNK) && self.out_buf.is_empty() {
+                    return;
+                }
+            }
+            let before = self.out_buf.len() - self.out_offset;
+            self.write_output();
+            let left = if self.out_buf.is_empty() { 0 } else { self.out_buf.len() - self.out_offset };
+            sent += before - left;
+            if left > 0 || self.is_done {
+                return;
+            }
         }
+    }
 
-        if self.interactive {
-            self.out_buf.extend_from_slice(b"\n> ");
-        } else {
-            self.is_done = true;
-        }
+    /// Whether a `show table` has more to send once what is queued is written.
+    #[must_use]
+    pub fn table_pending(&self) -> bool {
+        self.table_dump.is_some()
     }
 
     /// `shutdown sessions server <be>/<srv>` (`cli_parse_shutdown_sessions_server`): every
@@ -1683,7 +1769,7 @@ impl CliApplet {
     /// side and nothing it sent is left to answer.
     #[must_use]
     pub fn is_finished(&self) -> bool {
-        self.out_buf.is_empty() && (self.is_done || (self.read_shut && self.pending.is_none()))
+        self.out_buf.is_empty() && self.table_dump.is_none() && (self.is_done || (self.read_shut && self.pending.is_none()))
     }
 }
 
