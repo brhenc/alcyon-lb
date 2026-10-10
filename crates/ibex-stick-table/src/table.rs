@@ -134,7 +134,6 @@ impl Default for StickTableConfig {
 
 #[derive(Debug, Clone)]
 struct StickSlot {
-    key: StickKey,
     node_idx: u32,
     data: StickEntryData,
     prev_lru: Option<u32>,
@@ -234,6 +233,8 @@ impl StickTableInner {
 #[derive(Debug)]
 pub struct StickTable {
     config: StickTableConfig,
+    /// The longest `string` or `binary` key kept (`len`); longer ones are cut to it.
+    key_len: usize,
     inner: RwLock<StickTableInner>,
 }
 
@@ -244,7 +245,33 @@ impl StickTable {
         let cap = config.max_size;
         Self {
             config,
+            key_len: usize::MAX,
             inner: RwLock::new(StickTableInner::with_capacity(cap)),
+        }
+    }
+
+    /// The table keeping `string` and `binary` keys to at most `len` bytes (`stick-table ...
+    /// len`; `HAProxy` cuts the key, it does not refuse it).
+    #[must_use]
+    pub fn with_key_len(mut self, len: usize) -> Self {
+        self.key_len = len;
+        self
+    }
+
+    /// `key` as the table keeps it: a long `string` or `binary` key is cut to `len` bytes
+    /// (a string at the last character that fits).
+    fn cut<'a>(&self, key: &'a StickKey) -> std::borrow::Cow<'a, StickKey> {
+        let n = self.key_len;
+        match key {
+            StickKey::String(s) if s.len() > n => {
+                let mut end = n;
+                while !s.is_char_boundary(end) {
+                    end -= 1;
+                }
+                std::borrow::Cow::Owned(StickKey::String(s[..end].to_string()))
+            }
+            StickKey::Binary(b) if b.len() > n => std::borrow::Cow::Owned(StickKey::Binary(b[..n].to_vec())),
+            _ => std::borrow::Cow::Borrowed(key),
         }
     }
 
@@ -263,7 +290,7 @@ impl StickTable {
             .write()
             .map_err(|e| StickTableError::LockPoisoned(e.to_string()))?;
 
-        let enc_key = key.encode_bytes();
+        let enc_key = self.cut(key).encode_bytes();
 
         if let Some(node_idx) = inner.tree.lookup_node(&enc_key) {
             let slot_idx = inner.tree.data_of(node_idx);
@@ -308,7 +335,6 @@ impl StickTable {
 
         let node_idx = inner.tree.insert(&enc_key, slot_idx);
         inner.slots[slot_idx as usize] = Some(StickSlot {
-            key: key.clone(),
             node_idx,
             data,
             prev_lru: None,
@@ -330,7 +356,7 @@ impl StickTable {
             .read()
             .map_err(|e| StickTableError::LockPoisoned(e.to_string()))?;
 
-        let enc_key = key.encode_bytes();
+        let enc_key = self.cut(key).encode_bytes();
         if let Some(node_idx) = inner.tree.lookup_node(&enc_key) {
             let slot_idx = inner.tree.data_of(node_idx);
             if let Some(ref slot) = inner.slots[slot_idx as usize] {
@@ -357,14 +383,21 @@ impl StickTable {
         let expire_dur = self.config.expire;
         let mut purged = 0;
         while let Some(head) = inner.head_lru {
-            let is_expired = inner.slots[head as usize]
-                .as_ref()
-                .is_none_or(|s| now.duration_since(s.data.last_updated) >= expire_dur);
-            if is_expired {
+            let Some(slot) = inner.slots[head as usize].as_mut() else {
+                inner.evict_slot(head);
+                continue;
+            };
+            if now.duration_since(slot.data.last_updated) < expire_dur {
+                break;
+            }
+            if slot.data.trackers > 0 {
+                // An entry a session still tracks stays, its time renewed (`HAProxy` keeps
+                // an entry that has references and arms its expiry again).
+                slot.data.last_updated = now;
+                inner.touch_lru(head);
+            } else {
                 inner.evict_slot(head);
                 purged += 1;
-            } else {
-                break;
             }
         }
         Ok(purged)
@@ -398,7 +431,7 @@ impl StickTable {
             .write()
             .map_err(|e| StickTableError::LockPoisoned(e.to_string()))?;
 
-        let enc_key = key.encode_bytes();
+        let enc_key = self.cut(key).encode_bytes();
         if let Some(node_idx) = inner.tree.lookup_node(&enc_key) {
             let slot_idx = inner.tree.data_of(node_idx);
             inner.evict_slot(slot_idx);
@@ -438,7 +471,10 @@ impl StickTable {
         while let Some(idx) = cur {
             if let Some(ref slot) = inner.slots[idx as usize] {
                 if now.duration_since(slot.data.last_updated) < expire_dur {
-                    result.push((slot.key.clone(), slot.data.clone()));
+                    // The key is kept once, in the tree.
+                    if let Some(key) = StickKey::decode_bytes(inner.tree.key_of(slot.node_idx)) {
+                        result.push((key, slot.data.clone()));
+                    }
                 }
                 cur = slot.next_lru;
             } else {
@@ -712,6 +748,36 @@ mod tests {
         let purged = table.purge_expired().unwrap();
         assert_eq!(purged, 1);
         assert_eq!(table.len(), 0);
+    }
+
+    #[test]
+    fn keys_are_cut_to_len_and_dumped_whole() {
+        let table = StickTable::new(StickTableConfig { key_type: KeyType::String, ..Default::default() }).with_key_len(4);
+        table.update_entry(&StickKey::String("abcdefgh".into()), |e| e.conn_cnt = 1).unwrap();
+        // a multi-byte character that straddles the limit is dropped whole
+        table.update_entry(&StickKey::String("abc\u{e9}x".into()), |e| e.conn_cnt = 1).unwrap();
+        assert_eq!(table.get_entry(&StickKey::String("abcd".into())).unwrap().map(|e| e.conn_cnt), Some(1));
+        assert_eq!(table.get_entry(&StickKey::String("abcdzzz".into())).unwrap().map(|e| e.conn_cnt), Some(1));
+        assert!(table.delete_entry(&StickKey::String("abcdq".into())).unwrap());
+        let bin = StickTable::new(StickTableConfig { key_type: KeyType::Binary, ..Default::default() }).with_key_len(2);
+        bin.update_entry(&StickKey::Binary(vec![1, 2, 3]), |e| e.conn_cnt = 1).unwrap();
+        bin.update_entry(&StickKey::Binary(vec![1, 2, 9]), |e| e.conn_cnt += 1).unwrap();
+        let dump = bin.dump_entries().unwrap();
+        assert_eq!(dump.len(), 1);
+        assert_eq!(dump[0].0, StickKey::Binary(vec![1, 2]));
+        assert_eq!(dump[0].1.conn_cnt, 2);
+    }
+
+    #[test]
+    fn purge_keeps_an_expired_entry_a_session_tracks() {
+        let config = StickTableConfig { key_type: KeyType::Integer, expire: Duration::from_millis(10), ..Default::default() };
+        let table = StickTable::new(config);
+        table.update_entry(&StickKey::Integer(1), |e| e.track(false)).unwrap();
+        table.update_entry(&StickKey::Integer(2), |e| e.conn_cnt = 1).unwrap();
+        std::thread::sleep(Duration::from_millis(25));
+        assert_eq!(table.purge_expired().unwrap(), 1);
+        assert_eq!(table.len(), 1);
+        assert!(table.get_entry(&StickKey::Integer(1)).unwrap().is_some());
     }
 
     #[test]

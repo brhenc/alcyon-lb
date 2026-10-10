@@ -47,6 +47,21 @@ impl From<&str> for StickKey {
 }
 
 impl StickKey {
+    /// The key [`encode_bytes`](Self::encode_bytes) made `bytes` from; `None` if they are not
+    /// the encoding of one.
+    #[must_use]
+    pub fn decode_bytes(bytes: &[u8]) -> Option<StickKey> {
+        let (tag, rest) = bytes.split_first()?;
+        Some(match tag {
+            0x01 => StickKey::Ip(IpAddr::V4(Ipv4Addr::from(<[u8; 4]>::try_from(rest).ok()?))),
+            0x02 => StickKey::Ip(IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(rest).ok()?))),
+            0x03 => StickKey::Integer(u64::from_be_bytes(<[u8; 8]>::try_from(rest).ok()?)),
+            0x04 => StickKey::String(String::from_utf8(rest.to_vec()).ok()?),
+            0x05 => StickKey::Binary(rest.to_vec()),
+            _ => return None,
+        })
+    }
+
     /// Encodes key into bytes for indexing in `EbMbTree`.
     #[must_use]
     pub fn encode_bytes(&self) -> Vec<u8> {
@@ -214,5 +229,28 @@ impl StickEntryData {
     pub fn count_fail(&mut self) {
         self.http_fail_cnt += 1;
         tick(&mut self.http_fail_rate, 1);
+    }
+}
+
+#[cfg(test)]
+mod key_codec_tests {
+    use super::*;
+
+    #[test]
+    fn decode_undoes_encode() {
+        let keys = [
+            StickKey::Ip("10.0.0.1".parse().unwrap()),
+            StickKey::Ip("::1".parse().unwrap()),
+            StickKey::Integer(42),
+            StickKey::String("abc".into()),
+            StickKey::Binary(vec![0, 1, 255]),
+        ];
+        for k in keys {
+            assert_eq!(StickKey::decode_bytes(&k.encode_bytes()), Some(k));
+        }
+        assert_eq!(StickKey::decode_bytes(&[]), None);
+        assert_eq!(StickKey::decode_bytes(&[9, 1]), None);
+        assert_eq!(StickKey::decode_bytes(&[1, 1, 2]), None);
+        assert_eq!(StickKey::decode_bytes(&[4, 0xff]), None);
     }
 }

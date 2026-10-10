@@ -68,7 +68,7 @@ pub(crate) fn parse_stick_table(
 
     *table = Some(StickTableConfigAst {
         key_type,
-        key_len: None,
+        key_len,
         size,
         expire,
         store_fields,

@@ -429,6 +429,9 @@ impl IdlePools {
 /// How often a worker looks for idle server connections their server has closed.
 const IDLE_SWEEP: Duration = Duration::from_millis(50);
 
+/// How often a worker drops the expired entries of the stick tables.
+const STICK_PURGE: Duration = Duration::from_millis(250);
+
 /// A worker's handle on [`IdlePools`]: what the engine keeps, takes and purges through.
 #[derive(Debug)]
 pub struct IdlePool {
@@ -1783,6 +1786,8 @@ pub struct Engine {
     pub global_h2_flood_config: ibex_proto::H2FloodConfig,
     /// Shared idle backend connection pool across sessions (`http-reuse`).
     pub idle_backend_pool: IdlePool,
+    /// When this worker next drops the expired entries of the stick tables.
+    next_stick_purge: Option<Instant>,
     /// Stop requests from signals, shared by every worker. `None` in tests and embeddings
     /// that drive the engine directly and stop it with [`Engine::stop`].
     lifecycle: Option<crate::lifecycle::Lifecycle>,
@@ -1955,7 +1960,8 @@ fn init_stick_table(ast: &ibex_config::StickTableConfigAst, name: &str) -> Stick
         extra,
     };
 
-    StickTable::new(config)
+    // `len` of a `string` or `binary` table, 32 where the configuration does not say.
+    StickTable::new(config).with_key_len(ast.key_len.unwrap_or(32))
 }
 
 
@@ -3691,6 +3697,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     .unwrap_or(0),
             },
             idle_backend_pool: IdlePool::default(),
+            next_stick_purge: None,
             lifecycle: None,
             stopping: false,
             hard_stop_after: config.global.as_ref().and_then(|g| g.hard_stop_after),
@@ -4130,6 +4137,21 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         }
     }
 
+    /// Drops the expired entries of every stick table, at most every [`STICK_PURGE`] (the
+    /// expire task of `HAProxy`'s tables): without it an entry stays, and counts as used,
+    /// until the table is full.
+    fn purge_stick_tables(&mut self, now: Instant) {
+        if self.next_stick_purge.is_some_and(|t| t > now) {
+            return;
+        }
+        self.next_stick_purge = Some(now + STICK_PURGE);
+        for p in self.proxies.iter() {
+            if let Some(t) = p.stick_table.as_ref() {
+                let _ = t.purge_expired();
+            }
+        }
+    }
+
     pub fn step(&mut self, now: Tick) -> io::Result<usize> {
         self.now = now;
         self.wake_queued();
@@ -4178,6 +4200,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             proxies.get(be).and_then(|p| p.server_actconn.get(s)).map_or(0, |a| a.load(Ordering::Relaxed))
         });
         self.idle_backend_pool.sweep(now_inst);
+        self.purge_stick_tables(now_inst);
         let poll_timeout = self
             .idle_backend_pool
             .next_sweep()
