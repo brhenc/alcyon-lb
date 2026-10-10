@@ -107,8 +107,11 @@ fn get(fe: SocketAddr, header: &str) -> (String, Option<String>) {
     let mut got = Vec::new();
     let _ = c.read_to_end(&mut got);
     let text = String::from_utf8_lossy(&got).into_owned();
-    let line = |p: &str| text.split("\r\n").find_map(|l| l.strip_prefix(p)).map(str::to_string);
-    (line("X-Server: ").unwrap_or_else(|| text.lines().next().unwrap_or("<nothing>").to_string()), line("Set-Cookie: "))
+    // Header names are case-insensitive; HAProxy emits them lowercase.
+    let line = |name: &str| {
+        text.split("\r\n").find_map(|l| l.split_once(": ").filter(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, v)| v.to_string()))
+    };
+    (line("X-Server").unwrap_or_else(|| text.lines().next().unwrap_or("<nothing>").to_string()), line("Set-Cookie"))
 }
 
 const STICK: &str = "  stick-table type string len 20 size 100\n  stick on req.hdr(x-k)\n";

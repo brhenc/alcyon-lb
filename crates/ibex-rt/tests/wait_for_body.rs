@@ -804,6 +804,8 @@ fn response_rules_run_in_order_around_a_wait_in_either_proxy_and_none_runs_twice
     let (resp, first) = part(mid);
     assert_eq!(res_header(&resp, "x-pre").as_deref(), Some("5"), "{resp}");
     assert_eq!(res_header(&resp, "x-len").as_deref(), Some("10"), "{resp}");
-    assert_eq!(resp.matches("X-Dup: 1").count(), 1, "{resp}");
+    // Header names are case-insensitive; HAProxy emits them lowercase (T244).
+    let dups = resp.split("\r\n").filter(|l| l.split_once(": ").is_some_and(|(n, v)| n.eq_ignore_ascii_case("X-Dup") && v == "1")).count();
+    assert_eq!(dups, 1, "{resp}");
     assert!(first >= Duration::from_millis(450));
 }

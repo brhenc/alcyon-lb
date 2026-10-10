@@ -323,7 +323,10 @@ fn legacy_cliexp_srvexp_rewriting_no_longer_applies() {
         "the response must still be proxied verbatim: {res_str}"
     );
     assert!(
-        res_str.contains("Location: http://internal:8080/login"),
+        // Header names are case-insensitive; HAProxy emits them lowercase (T244).
+        res_str.split("\r\n").any(|l| l
+            .split_once(": ")
+            .is_some_and(|(n, v)| n.eq_ignore_ascii_case("Location") && v == "http://internal:8080/login")),
         "legacy srvexp rewriting must no longer occur: {res_str}"
     );
     assert!(

@@ -90,7 +90,8 @@ fn get(fe: SocketAddr) -> String {
     c.write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").expect("send");
     let mut got = Vec::new();
     let _ = c.read_to_end(&mut got);
-    String::from_utf8_lossy(&got).split("\r\n").find_map(|l| l.strip_prefix("X-Server: ")).unwrap_or("?").to_string()
+    // Header names are case-insensitive; HAProxy emits them lowercase (T244).
+    String::from_utf8_lossy(&got).split("\r\n").find_map(|l| l.split_once(": ").filter(|(n, _)| n.eq_ignore_ascii_case("X-Server")).map(|(_, v)| v)).unwrap_or("?").to_string()
 }
 
 enum Step {

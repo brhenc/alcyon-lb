@@ -139,7 +139,8 @@ fn get(fe: SocketAddr, headers: &[&str]) -> String {
     let _ = c.read_to_end(&mut got);
     let text = String::from_utf8_lossy(&got).into_owned();
     text.split("\r\n")
-        .find_map(|l| l.strip_prefix("X-Server: "))
+        // Header names are case-insensitive; HAProxy emits them lowercase (T244).
+        .find_map(|l| l.split_once(": ").filter(|(n, _)| n.eq_ignore_ascii_case("X-Server")).map(|(_, v)| v))
         .map_or_else(|| text.lines().next().unwrap_or("<nothing>").to_string(), str::to_string)
 }
 

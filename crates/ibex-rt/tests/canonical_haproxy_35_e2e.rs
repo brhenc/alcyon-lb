@@ -510,12 +510,18 @@ fn test_canonical_haproxy_35_header_injection() {
     );
 
     // 2. Validate client response security headers & latency tagging
+    // Header names are case-insensitive; HAProxy emits them lowercase (T244).
+    let has = |name: &str, value: Option<&str>| {
+        client_resp.split("\r\n").any(|l| {
+            l.split_once(':').is_some_and(|(n, v)| n.eq_ignore_ascii_case(name) && value.is_none_or(|want| v.trim_start() == want))
+        })
+    };
     assert!(
-        client_resp.contains("Strict-Transport-Security: max-age=31536000; includeSubDomains"),
+        has("Strict-Transport-Security", Some("max-age=31536000; includeSubDomains")),
         "Client missing Strict-Transport-Security header, got: {client_resp}"
     );
     assert!(
-        client_resp.contains("X-Response-Time:"),
+        has("X-Response-Time", None),
         "Client missing X-Response-Time header, got: {client_resp}"
     );
 }
