@@ -27,7 +27,7 @@ use ibex_sched::Tick;
 use std::fmt::Write as FmtWrite;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
-use std::os::unix::net::UnixStream;
+use crate::cli_listener::CliStream;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -191,9 +191,10 @@ pub const DEFAULT_CLI_TIMEOUT_MS: u32 = 10_000;
 pub struct CliApplet {
     /// What this connection may do; starts at the socket's level.
     pub level: CliLevel,
-    /// The socket the connection came in on, for `show cli sockets`.
-    pub socket_path: Option<String>,
-    pub stream: Option<UnixStream>,
+    /// The name of the socket the connection came in on (`unix@/p`, `ipv4@a:p`, `abns@n`),
+    /// for `show cli sockets`.
+    pub socket_name: Option<String>,
+    pub stream: Option<CliStream>,
     pub raw_fd: RawFd,
     pub task: TaskRef,
     pub in_buf: Vec<u8>,
@@ -218,13 +219,14 @@ pub struct CliApplet {
 }
 
 impl CliApplet {
-    /// Creates a new `CliApplet` for the accepted Unix socket stream.
+    /// Creates a new `CliApplet` for an accepted CLI connection.
     #[must_use]
-    pub fn new(stream: UnixStream, now: Tick) -> Self {
+    pub fn new(stream: impl Into<CliStream>, now: Tick) -> Self {
+        let stream = stream.into();
         let raw_fd = stream.as_raw_fd();
         CliApplet {
             level: CliLevel::Admin,
-            socket_path: None,
+            socket_name: None,
             stream: Some(stream),
             raw_fd,
             task: TaskRef::NONE,
@@ -398,8 +400,8 @@ impl CliApplet {
         } else if cmd == "show cli level" {
             self.finish_msg(self.level.name());
         } else if cmd == "show cli sockets" {
-            let sock = self.socket_path.clone().unwrap_or_default();
-            let msg = format!("# socket lvl processes\nunix@{sock} {} all", self.level.name());
+            let sock = self.socket_name.clone().unwrap_or_default();
+            let msg = format!("# socket lvl processes\n{sock} {} all", self.level.name());
             self.finish_msg(&msg);
         } else if cmd == "show version" {
             self.finish_msg(env!("CARGO_PKG_VERSION"));
@@ -411,7 +413,9 @@ impl CliApplet {
         } else if cmd == "_getsocks" {
             // Answered on the stream itself: the listening sockets travel as SCM_RIGHTS,
             // which the buffered output path cannot carry. See crate::handover.
-            if let Some(stream) = self.stream.as_ref() {
+            // Over TCP no descriptor can travel (`SCM_RIGHTS` is unix-only; HAProxy's sendmsg
+            // goes out without them): the connection is closed with nothing sent.
+            if let Some(stream) = self.stream.as_ref().and_then(CliStream::as_unix) {
                 if let Err(e) = crate::handover::serve_getsocks(stream) {
                     self.out_buf.extend_from_slice(format!("{e}\n").as_bytes());
                 }

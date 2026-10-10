@@ -14,6 +14,7 @@
 pub mod applet;
 pub mod buf;
 pub mod check;
+pub mod cli_listener;
 pub mod crash;
 pub use ibex_config::cond;
 pub mod cookie;

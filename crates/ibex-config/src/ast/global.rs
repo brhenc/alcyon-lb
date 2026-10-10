@@ -113,10 +113,45 @@ impl StatusCodeSet {
 /// and its companions).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StatsSocket {
+    /// The unix socket path; for the other forms, [`StatsAddr::name`].
     pub path: String,
+    /// What the socket listens on.
+    pub addr: StatsAddr,
     pub mode: Option<u32>,
     pub level: Option<String>,
     pub expose_fd: bool,
+}
+
+/// What a `stats socket` listens on (`str2sa_range`, src/tools.c, with the forms Ibex serves).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatsAddr {
+    /// A unix socket file (`/path`, `unix@path`, `uxst@path`).
+    Unix(String),
+    /// A Linux abstract socket: `abns@name` binds the name zero-padded to the whole
+    /// `sun_path`, as `HAProxy` does; `abnsz@name` (`padded == false`) binds it as written.
+    Abstract { name: String, padded: bool },
+    /// A TCP listener (`ipv4@`, `ipv6@`, `tcp@`, `ip@`, `host:port`).
+    Tcp(std::net::SocketAddr),
+}
+
+impl Default for StatsAddr {
+    fn default() -> Self {
+        Self::Unix(String::new())
+    }
+}
+
+impl StatsAddr {
+    /// The name `HAProxy`'s `show cli sockets` prints for it: `unix@/p`, `abns@n` (for
+    /// `abnsz@` too), `ipv4@1.2.3.4:5`, `ipv6@[::1]:5`.
+    #[must_use]
+    pub fn name(&self) -> String {
+        match self {
+            Self::Unix(p) => format!("unix@{p}"),
+            Self::Abstract { name, .. } => format!("abns@{name}"),
+            Self::Tcp(a @ std::net::SocketAddr::V4(_)) => format!("ipv4@{a}"),
+            Self::Tcp(a @ std::net::SocketAddr::V6(_)) => format!("ipv6@{a}"),
+        }
+    }
 }
 
 /// Global section configuration.
@@ -131,8 +166,10 @@ pub struct GlobalSection {
     pub http_fail_codes: Option<StatusCodeSet>,
     /// Number of worker threads.
     pub nbthread: Option<u32>,
-    /// Runtime admin socket path.
+    /// Runtime admin socket path (for a TCP or abstract socket, [`StatsAddr::name`]).
     pub stats_socket: Option<String>,
+    /// What the first `stats socket` listens on; set whenever `stats_socket` is.
+    pub stats_socket_addr: Option<StatsAddr>,
     /// Permissions mode for admin socket.
     pub stats_socket_mode: Option<u32>,
     /// Privilege level for admin socket.

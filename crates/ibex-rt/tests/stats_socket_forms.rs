@@ -13,7 +13,8 @@
 //! 'abns@' > 107     'stats socket' : socket path '<arg>' too long (max 107)
 //! 'unix@s.sock'     accepted, binds `s.sock` (relative allowed with the prefix)
 //! ```
-//! TCP, abstract and `fd@` stats sockets are not implemented in Ibex: the parser refuses them.
+//! `fd@` stats sockets are not implemented in Ibex: the parser refuses them. TCP and abstract
+//! sockets are served since T246.
 
 mod common;
 
@@ -63,7 +64,8 @@ fn a_path_over_97_bytes_is_refused_and_97_is_accepted() {
 
 #[test]
 fn forms_ibex_does_not_implement_are_refused_not_bound_as_files() {
-    for a in ["127.0.0.1:19999", "ipv4@127.0.0.1:19999", "[::1]:19999", "ipv6@[::1]:19999", "tcp@127.0.0.1:19999", "*:19999", "abns@foo", "fd@3", "sockpair@3"] {
+    // TCP and abstract sockets are served since T246 (tests/stats_socket_tcp_abns.rs).
+    for a in ["fd@3", "sockpair@3"] {
         refused(a, "'stats socket' :");
         let (_, err) = check(a);
         assert!(err.contains("not supported"), "`{a}` should say it is not supported: {err}");

@@ -1722,8 +1722,11 @@ pub struct Engine {
     pub checks: Vec<ServerCheckState>,
     pub sessions: SessionArena,
     pub applets: AppletArena,
-    pub cli_listener: Option<UnixListener>,
+    pub cli_listener: Option<crate::cli_listener::CliListener>,
+    /// The first CLI socket's file, unlinked on exit; `None` for TCP and abstract sockets.
     pub cli_socket_path: Option<PathBuf>,
+    /// The first CLI socket's name for `show cli sockets` (`unix@/p`, `ipv4@a:p`, ...).
+    cli_socket_name: Option<String>,
     /// The `stats socket` lines after the first, each with its own level (`HAProxy` binds
     /// them all).
     extra_cli: Vec<ExtraCli>,
@@ -1796,8 +1799,11 @@ pub struct Engine {
 /// A `stats socket` beyond the first: the first one keeps its fields on [`Engine`].
 struct ExtraCli {
     /// `None` once the engine stops accepting (soft stop); the path stays for the unlink.
-    listener: Option<UnixListener>,
-    path: PathBuf,
+    listener: Option<crate::cli_listener::CliListener>,
+    /// The socket file, unlinked on exit; `None` for TCP and abstract sockets.
+    path: Option<PathBuf>,
+    /// For `show cli sockets`.
+    name: String,
     ident: Option<(u64, u64)>,
     level: crate::applet::CliLevel,
 }
@@ -1807,8 +1813,10 @@ impl Drop for Engine {
         // Whatever the other workers still ask of this one is answered empty.
         self.mailboxes.close(self.mailbox_wid);
         for x in &self.extra_cli {
-            if socket_file_ident(&x.path) == x.ident {
-                let _ = std::fs::remove_file(&x.path);
+            if let Some(path) = x.path.as_ref() {
+                if x.ident.is_some() && socket_file_ident(path) == x.ident {
+                    let _ = std::fs::remove_file(path);
+                }
             }
         }
         // Unlink the CLI socket only if the path still names the socket this engine
@@ -3638,6 +3646,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             applets,
             cli_listener: None,
             cli_socket_path: None,
+            cli_socket_name: None,
             extra_cli: Vec::new(),
             global_paused: false,
             accept_limited: None,
@@ -3700,28 +3709,45 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
     /// # Errors
     /// Returns an error if registering with the poller fails.
     pub fn adopt_cli_listener(&mut self, listener: UnixListener, path_buf: PathBuf) -> io::Result<()> {
+        let name = format!("unix@{}", path_buf.display());
+        self.adopt_cli(listener.into(), name, Some(path_buf))
+    }
+
+    /// Serves the CLI on `listener` of any kind (T246), already bound. `name` is what `show
+    /// cli sockets` prints; `file` the socket file to unlink on exit, if it is one.
+    ///
+    /// # Errors
+    /// Returns an error if registering with the poller fails.
+    pub fn adopt_cli(&mut self, listener: crate::cli_listener::CliListener, name: String, file: Option<PathBuf>) -> io::Result<()> {
         let raw_fd = listener.as_raw_fd();
         self.fdtab
             .insert(raw_fd, FdState::CliListener, Interest::READ);
         self.poller
             .add(listener.as_fd(), raw_fd_to_u64(raw_fd), true, false)?;
         self.cli_listener = Some(listener);
-        self.cli_socket_ident = socket_file_ident(&path_buf);
-        self.cli_socket_path = Some(path_buf);
+        self.cli_socket_ident = file.as_deref().and_then(socket_file_ident);
+        self.cli_socket_path = file;
+        self.cli_socket_name = Some(name);
         Ok(())
     }
 
-    /// Serves one more CLI socket on `listener`, already bound (see `adopt_cli_listener`).
+    /// Serves one more CLI socket of any kind (see `adopt_cli`).
     ///
     /// # Errors
     /// Returns an error if registering with the poller fails.
-    pub fn adopt_extra_cli_listener(&mut self, listener: UnixListener, path_buf: PathBuf, level: crate::applet::CliLevel) -> io::Result<()> {
+    pub fn adopt_extra_cli(
+        &mut self,
+        listener: crate::cli_listener::CliListener,
+        name: String,
+        file: Option<PathBuf>,
+        level: crate::applet::CliLevel,
+    ) -> io::Result<()> {
         let raw_fd = listener.as_raw_fd();
         let idx = u32::try_from(self.extra_cli.len()).unwrap_or(u32::MAX);
         self.fdtab.insert(raw_fd, FdState::CliExtra(idx), Interest::READ);
         self.poller.add(listener.as_fd(), raw_fd_to_u64(raw_fd), true, false)?;
-        let ident = socket_file_ident(&path_buf);
-        self.extra_cli.push(ExtraCli { listener: Some(listener), path: path_buf, ident, level });
+        let ident = file.as_deref().and_then(socket_file_ident);
+        self.extra_cli.push(ExtraCli { listener: Some(listener), path: file, name, ident, level });
         Ok(())
     }
 
@@ -4300,21 +4326,20 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 self.set_cli_listening(false);
                 return;
             }
-            let (listener, level, path) = match which {
-                None => (self.cli_listener.as_ref(), self.cli_level, self.cli_socket_path.as_ref()),
-                // `FdState::CliExtra(i)` is registered by `adopt_extra_cli_listener` with `i` its index.
-                Some(i) => (self.extra_cli[i].listener.as_ref(), self.extra_cli[i].level, Some(&self.extra_cli[i].path)),
+            let (listener, level, name) = match which {
+                None => (self.cli_listener.as_ref(), self.cli_level, self.cli_socket_name.as_ref()),
+                // `FdState::CliExtra(i)` is registered by `adopt_extra_cli` with `i` its index.
+                Some(i) => (self.extra_cli[i].listener.as_ref(), self.extra_cli[i].level, Some(&self.extra_cli[i].name)),
             };
             let Some(listener) = listener else {
                 return;
             };
             match listener.accept() {
-                Ok((stream, _)) => {
-                    let _ = stream.set_nonblocking(true);
+                Ok(stream) => {
                     let mut applet = CliApplet::new(stream, self.now);
                     applet.timeout_ms = self.cli_timeout_ms;
                     applet.level = level;
-                    applet.socket_path = path.map(|p| p.display().to_string());
+                    applet.socket_name = name.cloned();
                     let raw_fd = applet.raw_fd;
 
                     let Some(applet_idx) = self.applets.alloc(applet) else {

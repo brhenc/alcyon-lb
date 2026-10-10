@@ -838,9 +838,11 @@ fn main() {
         }
     }
 
-    let cli_socket: Option<PathBuf> = opts.stats_socket.clone().or_else(|| {
-        config.global.as_ref().and_then(|g| g.stats_socket.as_ref()).map(PathBuf::from)
-    });
+    let cli_socket: Option<ibex_config::StatsAddr> = opts
+        .stats_socket
+        .as_ref()
+        .map(|p| ibex_config::StatsAddr::Unix(p.display().to_string()))
+        .or_else(|| config.global.as_ref().and_then(|g| g.stats_socket_addr.clone()));
     
     let mut extra_sockets: Vec<ibex_config::StatsSocket> =
         config.global.as_ref().map(|g| g.extra_stats_sockets.clone()).unwrap_or_default();
@@ -848,6 +850,7 @@ fn main() {
     // the next worker takes the listening sockets from (see master.rs).
     extra_sockets.extend(master_dir.as_ref().map(|d| ibex_config::StatsSocket {
         path: d.join(format!("{}.sock", process::id())).display().to_string(),
+        addr: ibex_config::StatsAddr::Unix(d.join(format!("{}.sock", process::id())).display().to_string()),
         mode: None,
         level: Some("admin".into()),
         expose_fd: true,
@@ -909,32 +912,51 @@ fn main() {
     // 12d. Every stats socket is bound here too (T220), so the file exists before any worker
     //      accepts a client and an unbindable path stops the start before any port listens
     //      (HAProxy: `protocol_bind_all`). Worker 0 serves them.
-    let bind_cli = |path: &Path, mode: Option<u32>| -> (std::os::unix::net::UnixListener, PathBuf) {
-        match ibex_rt::engine::bind_unix_listener(path) {
-            Ok(r) => {
-                if let Some(mode) = mode {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+    // A TCP or abstract stats socket (T246) is bound here the same way; `mode` applies to
+    // socket files only, as on the oracle, which accepts it on the others and ignores it.
+    let bind_cli = |addr: &ibex_config::StatsAddr, mode: Option<u32>| -> (ibex_rt::cli_listener::CliListener, String, Option<PathBuf>) {
+        use ibex_config::StatsAddr;
+        use ibex_rt::cli_listener::CliListener;
+        let name = addr.name();
+        let fail = |proto: &str, what: &str, err: std::io::Error, at: &str| -> ! {
+            let why = err.to_string();
+            let why = why.split(" (os error").next().unwrap_or(&why).to_string();
+            eprintln!("[ALERT] Binding for frontend GLOBAL: protocol {proto}: {what} ({why}) [{at}].");
+            eprintln!("[ALERT] [haproxy.main()] Some protocols failed to start their listeners! Exiting.");
+            process::exit(1);
+        };
+        match addr {
+            StatsAddr::Unix(p) => {
+                let path = Path::new(p);
+                match ibex_rt::engine::bind_unix_listener(path) {
+                    Ok((l, path)) => {
+                        if let Some(mode) = mode {
+                            use std::os::unix::fs::PermissionsExt;
+                            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode));
+                        }
+                        (l.into(), name, Some(path))
+                    }
+                    Err(err) => fail("unix_stream", "cannot bind UNIX socket", err, p),
                 }
-                r
             }
-            Err(err) => {
-                let why = err.to_string();
-                let why = why.split(" (os error").next().unwrap_or(&why);
-                eprintln!("[ALERT] Binding for frontend GLOBAL: protocol unix_stream: cannot bind UNIX socket ({why}) [{}].", path.display());
-                eprintln!("[ALERT] [haproxy.main()] Some protocols failed to start their listeners! Exiting.");
-                process::exit(1);
-            }
+            StatsAddr::Abstract { name: n, padded } => match CliListener::bind_abstract(n, *padded) {
+                Ok(l) => (l, name, None),
+                Err(err) => fail("abns", "cannot bind UNIX socket", err, &name),
+            },
+            StatsAddr::Tcp(a) => match CliListener::bind_tcp(*a) {
+                Ok(l) => (l, name, None),
+                Err(err) => fail(if a.is_ipv4() { "tcpv4" } else { "tcpv6" }, "cannot bind socket", err, &a.to_string()),
+            },
         }
     };
-    let mut cli_pre = cli_socket.as_deref().map(|p| bind_cli(p, stats_socket_mode));
+    let mut cli_pre = cli_socket.as_ref().map(|a| bind_cli(a, stats_socket_mode));
     let mut extra_pre: Option<Vec<_>> = Some(
         extra_sockets
             .iter()
             .map(|x| {
                 let level = x.level.as_deref().and_then(ibex_rt::applet::CliLevel::parse).unwrap_or(ibex_rt::applet::CliLevel::Operator);
-                let (l, p) = bind_cli(Path::new(&x.path), x.mode);
-                (l, p, level)
+                let (l, name, file) = bind_cli(&x.addr, x.mode);
+                (l, name, file, level)
             })
             .collect(),
     );
@@ -981,15 +1003,15 @@ fn main() {
             if let Some(n) = stats_maxconn {
                 engine.set_cli_maxconn(n as usize);
             }
-            if let Some((listener, path)) = cli_pre {
+            if let Some((listener, name, file)) = cli_pre {
                 if let Some(level) = stats_socket_level {
                     engine.set_cli_level(level);
                 }
                 // Only an epoll_ctl failure on a fresh descriptor can fail here.
-                engine.adopt_cli_listener(listener, path).unwrap_or_else(|e| { eprintln!("Failed to serve a CLI / stats socket: {e}"); process::exit(1) });
+                engine.adopt_cli(listener, name, file).unwrap_or_else(|e| { eprintln!("Failed to serve a CLI / stats socket: {e}"); process::exit(1) });
             }
-            for (listener, path, level) in extra_pre.into_iter().flatten() {
-                engine.adopt_extra_cli_listener(listener, path, level).unwrap_or_else(|e| { eprintln!("Failed to serve a CLI / stats socket: {e}"); process::exit(1) });
+            for (listener, name, file, level) in extra_pre.into_iter().flatten() {
+                engine.adopt_extra_cli(listener, name, file, level).unwrap_or_else(|e| { eprintln!("Failed to serve a CLI / stats socket: {e}"); process::exit(1) });
             }
             engine.set_lifecycle(lifecycle_clone);
             let _ = ready_tx.send(());

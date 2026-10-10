@@ -94,8 +94,12 @@ pub(crate) fn parse_global_directive(
                 }
             }
             if tokens.len() >= 3 {
-                let path = stats_socket_path(&tokens[2])?;
-                let mut sock = crate::ast::StatsSocket { path, ..Default::default() };
+                let addr = stats_socket_addr(&tokens[2])?;
+                let path = match &addr {
+                    crate::ast::StatsAddr::Unix(p) => p.clone(),
+                    other => other.name(),
+                };
+                let mut sock = crate::ast::StatsSocket { path, addr, ..Default::default() };
                 let mut i = 3;
                 while i < tokens.len() {
                     match tokens[i].text.as_str() {
@@ -149,6 +153,7 @@ pub(crate) fn parse_global_directive(
                 // later one (in this section or another) is kept beside it.
                 if global.stats_socket.is_none() {
                     global.stats_socket = Some(sock.path);
+                    global.stats_socket_addr = Some(sock.addr);
                     global.stats_socket_mode = sock.mode;
                     global.stats_socket_level = sock.level;
                     global.stats_socket_expose_fd = sock.expose_fd;
@@ -609,37 +614,181 @@ pub(crate) fn parse_global_directive(
 }
 
 
-/// The unix path a `stats socket` address names, refusing what HAProxy refuses and what Ibex
-/// does not implement (`str2sa_range`, src/tools.c; T222). Measured on 3.5-dev8-885761-29:
-/// a name with no leading `/` and no `unix@` prefix is `host:port` (so `./x.sock` has "no
-/// port specification"); the 97 byte limit counts after `unix@`; `abns@` allows 107.
-/// TCP, abstract and `fd@` stats sockets are accepted by HAProxy; Ibex serves the CLI on
-/// unix socket files only, so those are refused here rather than bound as a file named
-/// after the address (AGENTS.md section 5).
-fn stats_socket_path(tok: &Token) -> Result<String, ConfigError> {
+/// What a `stats socket` address names, with `HAProxy`'s refusals (`str2sa_range`,
+/// src/tools.c, called with `PA_O_RESOLVE | PA_O_PORT_OK | PA_O_PORT_MAND | PA_O_PORT_RANGE
+/// | PA_O_STREAM`; T222, T246). Measured on 3.5-dev8-885761-29: a name with no leading `/`
+/// and no `unix@` prefix is `host:port` (so `./x.sock` has "no port specification"); the 97
+/// byte limit counts after `unix@`; `abns@` allows 107; the port is checked before the
+/// address (`nosuchhost.invalid:0` is an "invalid port"). Port ranges, `fd@`, `sockpair@`
+/// and `mptcp` are accepted by `HAProxy` and refused here, rather than bound as something
+/// else (AGENTS.md section 5).
+#[allow(clippy::too_many_lines)]
+fn stats_socket_addr(tok: &Token) -> Result<crate::ast::StatsAddr, ConfigError> {
+    use crate::ast::StatsAddr;
+    use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+    #[derive(Clone, Copy, PartialEq)]
+    enum Fam {
+        Unix,
+        Abns(bool),
+        Any,
+        V4,
+        V6,
+    }
     let arg = tok.text.as_str();
     let err = |m: String| ConfigError::new(tok.line, tok.col, format!("'stats socket' : {m}"));
-    let too_long = |max: usize| err(format!("socket path '{arg}' too long (max {max})"));
-    if let Some(rest) = arg.strip_prefix("unix@") {
-        return if rest.len() > 97 { Err(too_long(97)) } else { Ok(rest.to_string()) };
+    let unsupported = |what: &str| err(format!("{what} are not supported by Ibex for 'stats socket' in '{arg}'"));
+    let mut rest = arg;
+    let mut dgram = false;
+    if let Some(r) = rest.strip_prefix("stream+") {
+        rest = r;
+    } else if let Some(r) = rest.strip_prefix("dgram+") {
+        rest = r;
+        dgram = true;
+    } else if rest.starts_with("quic+") {
+        return Err(unsupported("QUIC addresses"));
     }
-    if let Some(rest) = arg.strip_prefix("abns@") {
-        if rest.len() > 107 {
-            return Err(too_long(107));
+    let prefixes: [(&str, Option<Fam>, bool); 20] = [
+        ("unix@", Some(Fam::Unix), false),
+        ("uxdg@", Some(Fam::Unix), true),
+        ("uxst@", Some(Fam::Unix), false),
+        ("abns@", Some(Fam::Abns(true)), false),
+        ("abnsz@", Some(Fam::Abns(false)), false),
+        ("ip@", Some(Fam::Any), false),
+        ("ipv4@", Some(Fam::V4), false),
+        ("ipv6@", Some(Fam::V6), false),
+        ("tcp4@", Some(Fam::V4), false),
+        ("udp4@", Some(Fam::V4), true),
+        ("tcp6@", Some(Fam::V6), false),
+        ("udp6@", Some(Fam::V6), true),
+        ("tcp@", Some(Fam::Any), false),
+        ("udp@", Some(Fam::Any), true),
+        ("mptcp4@", None, false),
+        ("mptcp6@", None, false),
+        ("mptcp@", None, false),
+        ("fd@", None, false),
+        ("sockpair@", None, false),
+        ("rhttp@", None, false),
+    ];
+    let mut fam = Fam::Any;
+    let mut prefixed = false;
+    for (p, f, dg) in prefixes {
+        if let Some(r) = rest.strip_prefix(p) {
+            let Some(f) = f else {
+                return Err(match p {
+                    "fd@" | "sockpair@" => unsupported("file descriptor addresses"),
+                    "rhttp@" => unsupported("reverse HTTP addresses"),
+                    _ => unsupported("MPTCP addresses"),
+                });
+            };
+            rest = r;
+            fam = f;
+            dgram |= dg;
+            prefixed = true;
+            break;
         }
-        return Err(err(format!("abstract unix sockets are not supported by Ibex in '{arg}'")));
     }
-    if arg.starts_with('/') {
-        return if arg.len() > 97 { Err(too_long(97)) } else { Ok(arg.to_string()) };
+    if rest.starts_with("quic4@") || rest.starts_with("quic6@") {
+        return Err(unsupported("QUIC addresses"));
     }
-    let spec = arg.split_once('@').map_or(arg, |(_, r)| r);
-    if arg.starts_with("fd@") || arg.starts_with("sockpair@") {
-        return Err(err(format!("file descriptor addresses are not supported by Ibex in '{arg}'")));
+    if !prefixed && rest.starts_with('/') {
+        fam = Fam::Unix;
     }
-    if !spec.contains(':') {
+    let not_acceptable = || err(format!("dgram-type address not acceptable in '{arg}'"));
+    match fam {
+        Fam::Unix | Fam::Abns(_) => {
+            let max = if fam == Fam::Unix { 97 } else { 107 };
+            if rest.len() > max {
+                return Err(err(format!("socket path '{arg}' too long (max {max})")));
+            }
+            if dgram {
+                return Err(not_acceptable());
+            }
+            return Ok(match fam {
+                Fam::Abns(padded) => StatsAddr::Abstract { name: rest.to_string(), padded },
+                _ => StatsAddr::Unix(rest.to_string()),
+            });
+        }
+        Fam::Any | Fam::V4 | Fam::V6 => {}
+    }
+    // The port separator: the last ':' unless a ']' comes after it.
+    let sep = rest.rfind([':', ']']).map(|i| (i, rest.as_bytes()[i]));
+    let Some((colon, b':')) = sep else {
         return Err(err(format!("missing port specification in '{arg}'")));
+    };
+    let (host, port1) = (&rest[..colon], &rest[colon + 1..]);
+    // `strtol`: digits only here (the first byte is checked), saturating like LONG_MAX.
+    let strtol = |s: &str| -> Result<u64, ConfigError> {
+        let digits = s.bytes().take_while(u8::is_ascii_digit).count();
+        if let Some(c) = s[digits..].chars().next() {
+            return Err(err(format!("invalid character '{c}' in port number '{s}' in '{arg}'")));
+        }
+        Ok(s.bytes().fold(0u64, |n, b| n.saturating_mul(10).saturating_add(u64::from(b - b'0'))))
+    };
+    let port = match port1.bytes().next() {
+        None => return Err(err(format!("missing port specification in '{arg}'"))),
+        Some(b'-' | b'+') => return Err(err(format!("port offset not permitted here in '{arg}'"))),
+        Some(c) if !c.is_ascii_digit() => {
+            let c = port1.chars().next().unwrap_or_default();
+            return Err(err(format!("invalid character '{c}' in port number '{port1}' in '{arg}'")));
+        }
+        Some(_) => {
+            let (lo, hi) = port1.split_once('-').unwrap_or((port1, port1));
+            let (portl, porth) = (strtol(lo)?, strtol(hi)?);
+            if !(1..=65535).contains(&portl) {
+                return Err(err(format!("invalid port '{lo}'")));
+            }
+            if !(1..=65535).contains(&porth) {
+                return Err(err(format!("invalid port '{hi}'")));
+            }
+            if portl > porth {
+                return Err(err(format!("invalid port range '{portl}-{porth}'")));
+            }
+            if portl != porth || port1.contains('-') {
+                return Err(unsupported("port ranges"));
+            }
+            u16::try_from(portl).unwrap_or(u16::MAX)
+        }
+    };
+    let invalid = || err(format!("invalid address: '{host}' in '{arg}'"));
+    // `str2ip2`: brackets, `::`, `*`/empty, literals, then a resolution.
+    let lit = if host.starts_with('[') {
+        if host.len() < 4 || !host.ends_with(']') {
+            return Err(invalid());
+        }
+        &host[1..host.len() - 1]
+    } else {
+        host
+    };
+    let ip: IpAddr = if lit.is_empty() || lit == "*" {
+        if fam == Fam::V6 { IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED) } else { IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED) }
+    } else if let Ok(ip) = lit.parse::<IpAddr>() {
+        ip
+    } else {
+        let valid_name = lit.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.' || b == b'_');
+        if !valid_name {
+            return Err(invalid());
+        }
+        let found: Vec<SocketAddr> = (lit, 0).to_socket_addrs().map(Iterator::collect).unwrap_or_default();
+        // `getaddrinfo` (`GTUNE_USE_GAI`, on by default): the first answer of the family.
+        let pick = match fam {
+            Fam::V4 => found.iter().find(|a| a.is_ipv4()),
+            Fam::V6 => found.iter().find(|a| a.is_ipv6()),
+            _ => found.first(),
+        };
+        pick.map(SocketAddr::ip).ok_or_else(invalid)?
+    };
+    let fits = match fam {
+        Fam::V4 => ip.is_ipv4(),
+        Fam::V6 => ip.is_ipv6(),
+        _ => true,
+    };
+    if !fits {
+        return Err(invalid());
     }
-    Err(err(format!("TCP addresses are not supported by Ibex (the CLI listens on unix sockets only) in '{arg}'")))
+    if dgram {
+        return Err(not_acceptable());
+    }
+    Ok(StatsAddr::Tcp(SocketAddr::new(ip, port)))
 }
 
 /// `add_hdr_case_adjust` (src/mux_h1.c): `to` differs from `from` in case only, `from` is new.
