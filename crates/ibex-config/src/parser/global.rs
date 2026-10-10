@@ -66,14 +66,16 @@ pub(crate) fn parse_global_directive(
                     return refuse("'stats socket' in global section expects an address or a path to a UNIX socket".to_string());
                 }
                 "socket" => {}
-                // The same refusals as `HAProxy` (`atol`: a prefix of digits counts). Ibex has no
-                // limit on CLI connections to apply, so a valid value is refused as well.
+                // The same refusals as `HAProxy` (`atol`: a prefix of digits counts). The value
+                // limits the live CLI connections (`Engine::set_cli_maxconn`, T239).
                 "maxconn" => {
                     let digits: String = arg.trim_start().chars().take_while(char::is_ascii_digit).collect();
-                    if digits.parse::<i64>().map_or(true, |n| n <= 0) {
+                    let n = digits.parse::<i64>().unwrap_or(0);
+                    if n <= 0 {
                         return refuse("'stats maxconn' expects a positive value".to_string());
                     }
-                    return refuse("'stats maxconn' is not supported by Ibex".to_string());
+                    global.stats_maxconn = Some(u32::try_from(n).unwrap_or(u32::MAX));
+                    return Ok(());
                 }
                 "calculate-max-counters" => {
                     return if arg.eq_ignore_ascii_case("on") {

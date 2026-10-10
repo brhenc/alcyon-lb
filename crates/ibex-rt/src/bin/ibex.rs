@@ -840,6 +840,7 @@ fn main() {
     }));
     let stats_socket_mode = config.global.as_ref().and_then(|g| g.stats_socket_mode);
     let stats_timeout = config.global.as_ref().and_then(|g| g.stats_timeout);
+    let stats_maxconn = config.global.as_ref().and_then(|g| g.stats_maxconn);
     // A `stats socket` without `level` is operator, as in HAProxy (`bind_conf->level |=
     // ACCESS_LVL_OPER`, src/cli.c); the master socket `-S` is admin.
     let default_level = if opts.stats_socket.is_some() {
@@ -962,6 +963,9 @@ fn main() {
 
             if let Some(t) = stats_timeout {
                 engine.set_cli_timeout(t);
+            }
+            if let Some(n) = stats_maxconn {
+                engine.set_cli_maxconn(n as usize);
             }
             if let Some((listener, path)) = cli_pre {
                 if let Some(level) = stats_socket_level {

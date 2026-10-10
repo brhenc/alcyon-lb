@@ -140,6 +140,9 @@ pub struct GlobalSection {
     /// `stats timeout`: how long a CLI connection may stay idle, on every stats socket
     /// (`HAProxy`'s CLI frontend `timeout client`, 10 s when unset).
     pub stats_timeout: Option<Duration>,
+    /// `stats maxconn`: how many CLI connections are served at once, on every stats socket
+    /// (10 when unset, `HAProxy`'s default).
+    pub stats_maxconn: Option<u32>,
     /// The `stats socket` lines after the first, in order: `HAProxy` binds every one.
     pub extra_stats_sockets: Vec<StatsSocket>,
     /// Maximum rewrite size in bytes.

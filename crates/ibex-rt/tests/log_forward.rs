@@ -546,3 +546,44 @@ fn two_proxies_logging_to_one_ring_share_it() {
     ibex_rt::Engine::new(&cfg, 64).expect("engine");
     assert!(ibex_rt::ring::find("shared_ring").is_some());
 }
+
+/// `HAProxy` 3.5-dev8-885761-29, `tune.bufsize` 16384, 2026-10-10: a TCP connection whose line
+/// has no line feed in its first 16384 bytes is closed, and so is one whose octet-counted
+/// frame announces more than 16384 bytes (it does not wait for the bytes). A frame of 16384
+/// and a line of 16300 are forwarded. Idle connections are not closed without `timeout client`
+/// (30 s measured), which is what Ibex does.
+#[test]
+fn a_tcp_line_or_frame_longer_than_the_buffer_closes_the_connection() {
+    let (col, cp) = collector();
+    let tcp = free_tcp();
+    start(&format!("log-forward fwd_cap\n  bind 127.0.0.1:{tcp}\n  log 127.0.0.1:{cp} local0\n"));
+    // Closed means the read ends at once with 0 bytes or a reset, not by our timeout.
+    let closed = |c: &mut TcpStream| {
+        c.set_read_timeout(Some(Duration::from_secs(3))).expect("timeout");
+        let mut b = [0u8; 16];
+        match c.read(&mut b) {
+            Ok(n) => n == 0,
+            Err(e) => !matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut),
+        }
+    };
+    // A line with no line feed, 2 MiB of it.
+    let mut c = TcpStream::connect(("127.0.0.1", tcp)).expect("connect");
+    let chunk = vec![b'x'; 64 * 1024];
+    for _ in 0..32 {
+        if c.write_all(&chunk).is_err() {
+            break;
+        }
+    }
+    assert!(closed(&mut c), "a 2 MiB line without a line feed kept the connection open");
+    // An octet-counted frame that announces 5,000,000 bytes and sends 3.
+    let mut c = TcpStream::connect(("127.0.0.1", tcp)).expect("connect");
+    c.write_all(b"5000000 <14>abc").expect("write");
+    assert!(closed(&mut c), "a 5 MB frame announcement kept the connection open");
+    let mut c = TcpStream::connect(("127.0.0.1", tcp)).expect("connect");
+    c.write_all(b"16385 <14>abc").expect("write");
+    assert!(closed(&mut c), "a frame of 16385 bytes kept the connection open");
+    // What fits is still forwarded.
+    let mut c = TcpStream::connect(("127.0.0.1", tcp)).expect("connect");
+    c.write_all(b"<14>fine\n").expect("write");
+    assert!(recv(&col).expect("a message").ends_with(" 127.0.0.1 fine"));
+}

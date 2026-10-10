@@ -36,11 +36,18 @@ fn a_stats_word_haproxy_refuses_is_refused() {
 /// `HAProxy` accepts these; Ibex does not act on them and says so, rather than dropping them.
 #[test]
 fn a_stats_word_ibex_does_not_act_on_is_refused_as_such() {
-    for line in ["stats maxconn 5", "stats calculate-max-counters off"] {
+    for line in ["stats calculate-max-counters off"] {
         let (ok, err) = check(line);
         assert!(!ok, "`{line}` was accepted and dropped");
         assert!(err.contains("is not supported by Ibex"), "`{line}`: {err}");
     }
+}
+
+/// `stats maxconn` limits CLI connections (T239; `cli_limits.rs` checks it does).
+#[test]
+fn stats_maxconn_with_a_positive_value_is_accepted() {
+    let (ok, err) = check("stats maxconn 5");
+    assert!(ok, "{err}");
 }
 
 /// `on` is what `HAProxy` does without the line.

@@ -98,6 +98,9 @@ impl Forwarder {
     fn serve_stream(&self, stream: impl Read, peer: Option<IpAddr>) {
         let mut r = BufReader::new(stream);
         let mut buf = Vec::new();
+        // A message is at most one buffer (`tune.bufsize`); a longer one ends the connection,
+        // as it does in HAProxy (measured, T239).
+        let cap = crate::buf::get_bufsize();
         loop {
             let first = match r.fill_buf() {
                 Ok(b) if !b.is_empty() => b[0],
@@ -118,14 +121,20 @@ impl Forwarder {
                         _ => return,
                     }
                 }
+                if len > cap {
+                    return;
+                }
                 buf.resize(len, 0);
                 if r.read_exact(&mut buf).is_err() {
                     return;
                 }
             } else {
                 // An error leaves nothing to forward: the next read ends the connection.
-                let n = r.read_until(b'\n', &mut buf).unwrap_or(0);
+                let n = (&mut r).take(cap as u64).read_until(b'\n', &mut buf).unwrap_or(0);
                 buf.truncate(n);
+                if n >= cap && buf.last() != Some(&b'\n') {
+                    return;
+                }
             }
             self.process(peer, &buf);
         }

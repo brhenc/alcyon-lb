@@ -1737,6 +1737,10 @@ pub struct Engine {
     pub cli_level: crate::applet::CliLevel,
     /// `stats timeout`, in ms: how long a CLI connection may stay idle.
     pub cli_timeout_ms: u32,
+    /// `stats maxconn`: CLI connections served at once; the listeners stop accepting at it.
+    cli_maxconn: usize,
+    /// The CLI listeners are out of the poller because `cli_maxconn` was reached.
+    cli_paused: bool,
     pub start_time: Instant,
     /// This process's id, read once: `std::process::id()` is a `getpid` syscall, and the
     /// dispatcher wants it on every step. Nothing forks after an engine is built (`-D`
@@ -3597,6 +3601,8 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             backlog_waits: false,
             cli_level: crate::applet::CliLevel::Admin,
             cli_timeout_ms: crate::applet::DEFAULT_CLI_TIMEOUT_MS,
+            cli_maxconn: crate::applet::DEFAULT_CLI_MAXCONN,
+            cli_paused: false,
             start_time,
             pid: std::process::id(),
             now,
@@ -3683,6 +3689,28 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
     /// `stats timeout`, for every CLI connection this worker accepts from now on.
     pub fn set_cli_timeout(&mut self, timeout: std::time::Duration) {
         self.cli_timeout_ms = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
+    }
+
+    /// `stats maxconn`: with that many CLI connections open, the stats sockets are not
+    /// accepted from until one closes (the others wait in the kernel's backlog, as in HAProxy).
+    pub fn set_cli_maxconn(&mut self, n: usize) {
+        self.cli_maxconn = n.max(1);
+    }
+
+    /// Arms (`on`) or disarms the CLI listeners in the poller.
+    fn set_cli_listening(&mut self, on: bool) {
+        for l in self.cli_listener.iter().chain(self.extra_cli.iter().filter_map(|x| x.listener.as_ref())) {
+            let fd = l.as_raw_fd();
+            let _ = self.poller.modify(l.as_fd(), raw_fd_to_u64(fd), on, false);
+        }
+        self.cli_paused = !on;
+    }
+
+    /// Re-arms the CLI listeners once a connection closed below `stats maxconn`.
+    fn resume_cli_after_close(&mut self) {
+        if self.cli_paused && self.applets.live() < self.cli_maxconn {
+            self.set_cli_listening(true);
+        }
     }
 
     /// Makes this engine worker `wid` of `pools`, the idle server connections all workers
@@ -4214,12 +4242,17 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         self.timer_updates = dispatcher.timer_updates;
         // Slots this pass freed go to the queue now, not on the next poll's timeout.
         self.wake_queued();
+        self.resume_cli_after_close();
         Ok(tasks_run)
     }
 
     /// Accepts on the first CLI socket (`which` is `None`) or on the `which`th further one.
     fn accept_from_cli_listener(&mut self, which: Option<usize>) {
         loop {
+            if self.applets.live() >= self.cli_maxconn {
+                self.set_cli_listening(false);
+                return;
+            }
             let (listener, level, path) = match which {
                 None => (self.cli_listener.as_ref(), self.cli_level, self.cli_socket_path.as_ref()),
                 // `FdState::CliExtra(i)` is registered by `adopt_extra_cli_listener` with `i` its index.

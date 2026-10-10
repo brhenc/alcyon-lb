@@ -180,6 +180,9 @@ impl Proxy {
     }
 }
 
+/// `stats maxconn` when unset (`HAProxy`: 10, measured).
+pub const DEFAULT_CLI_MAXCONN: usize = 10;
+
 /// `HAProxy`'s CLI idle timeout when `stats timeout` is not set (`cli_fe->timeout.client`,
 /// src/cli.c).
 pub const DEFAULT_CLI_TIMEOUT_MS: u32 = 10_000;
@@ -256,6 +259,17 @@ impl CliApplet {
                 }
                 Ok(n) => {
                     self.in_buf.extend_from_slice(&buf[..n]);
+                    // A command line is at most one buffer (`tune.bufsize`): HAProxy answers
+                    // this and closes (measured, T239). Nothing longer is kept.
+                    let tail = self.in_buf.iter().rposition(|&b| b == b'\n').map_or(self.in_buf.len(), |p| self.in_buf.len() - p - 1);
+                    if tail >= crate::buf::get_bufsize() {
+                        self.in_buf.clear();
+                        self.out_buf.extend_from_slice(
+                            b"The command line is too big for the buffer size. Please change 'tune.bufsize' in the configuration to use a bigger command.\n",
+                        );
+                        self.is_done = true;
+                        break;
+                    }
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                     break;
