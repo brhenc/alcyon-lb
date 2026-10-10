@@ -39,10 +39,13 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The kernel accepts at most 253 descriptors in one `SCM_RIGHTS` message.
 const BATCH: usize = 200;
+
+/// How long `_getsocks` waits, in all, for a client to take what it is sent.
+const SEND_BUDGET: Duration = Duration::from_secs(1);
 
 static EXPOSE_ENABLED: AtomicBool = AtomicBool::new(false);
 static EXPOSED: Mutex<Vec<(SocketAddr, OwnedFd)>> = Mutex::new(Vec::new());
@@ -92,7 +95,14 @@ pub fn serve_getsocks(stream: &UnixStream) -> io::Result<usize> {
             "_getsocks requires 'expose-fd listeners' on the stats socket",
         ));
     }
-    let exposed = EXPOSED.lock().map_err(|_| io::Error::other("poisoned"))?;
+    // Duplicates, so that the registry is not held while a client that does not read keeps
+    // the send waiting: listeners registering or withdrawing would wait with it.
+    let exposed: Vec<(SocketAddr, OwnedFd)> = {
+        let reg = EXPOSED.lock().map_err(|_| io::Error::other("poisoned"))?;
+        reg.iter().map(|(a, fd)| fd.try_clone().map(|fd| (*a, fd))).collect::<io::Result<_>>()?
+    };
+    // The whole answer gets this long, not each message.
+    let deadline = Instant::now() + SEND_BUDGET;
     for chunk in exposed.chunks(BATCH) {
         let mut text = format!("IBEXFD {}\n", chunk.len());
         for (addr, _) in chunk {
@@ -104,7 +114,7 @@ pub fn serve_getsocks(stream: &UnixStream) -> io::Result<usize> {
         if !control.push(SendAncillaryMessage::ScmRights(&fds)) {
             return Err(io::Error::other("ancillary buffer too small"));
         }
-        send_all_with(stream, text.as_bytes(), &mut control)?;
+        send_all_with(stream, text.as_bytes(), &mut control, deadline)?;
     }
     let mut end = stream;
     end.write_all(b"END\n")?;
@@ -116,8 +126,9 @@ fn send_all_with(
     stream: &UnixStream,
     data: &[u8],
     control: &mut SendAncillaryBuffer<'_, '_, '_>,
+    deadline: Instant,
 ) -> io::Result<()> {
-    let n = retry_eagain(|| {
+    let n = retry_eagain(deadline, || {
         rustix::net::sendmsg(stream, &[IoSlice::new(data)], control, SendFlags::empty())
     })?;
     // The descriptors went with the first byte; any remainder is plain data.
@@ -125,8 +136,8 @@ fn send_all_with(
     rest.write_all(&data[n..])
 }
 
-fn retry_eagain<T>(mut f: impl FnMut() -> rustix::io::Result<T>) -> io::Result<T> {
-    for _ in 0..200 {
+fn retry_eagain<T>(deadline: Instant, mut f: impl FnMut() -> rustix::io::Result<T>) -> io::Result<T> {
+    while Instant::now() < deadline {
         match f() {
             Err(rustix::io::Errno::AGAIN | rustix::io::Errno::INTR) => {
                 std::thread::sleep(Duration::from_millis(5));
