@@ -146,7 +146,9 @@ async def nonreader(i, dl, host, port, path=b"/?s=1g"):
 
 def h2_conn(host, port, init_settings=()):
     s = socket.create_connection((host, port))
-    s.settimeout(5)  # a proxy that stops reading must not hang the attacker: the send fails and we reconnect
+    # a proxy that stops reading must not hang the attacker: the send fails and we reconnect.
+    # H2_SEND_TIMEOUT=0 restores the stalling client (MY-3 reproducer).
+    s.settimeout(float(os.environ.get("H2_SEND_TIMEOUT", "5")) or None)
     s.sendall(PREFACE + settings(init_settings))
     COUNT["conns"] += 1
     return s
