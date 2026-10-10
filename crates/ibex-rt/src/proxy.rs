@@ -309,6 +309,10 @@ pub struct TcpSession {
     pub retry_conn: bool,
     /// The stream was redispatched (`SF_REDISP`): what `txn.redispatched` reads.
     pub redispatched: bool,
+    /// The load balancer picked the stream's server (`assign_server`'s balancing branch),
+    /// where `use-server`, a persistence cookie or `stick match` did not (`SF_DIRECT`):
+    /// only a pick counts in `lbtot` (T225).
+    pub lb_picked: bool,
     pub bytes_in: u64,
     pub bytes_out: u64,
     /// What the stick-table entries this session tracks have been credited of `bytes_in`
@@ -599,6 +603,7 @@ impl TcpSession {
             srv_park_exp: Tick::ETERNITY,
             retry_conn: true,
             redispatched: false,
+            lb_picked: false,
             cli_exp: Tick::ETERNITY,
             http_request_ms: 0,
             keep_alive_ms: 0,

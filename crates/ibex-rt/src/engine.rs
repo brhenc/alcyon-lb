@@ -2268,7 +2268,6 @@ fn account_stream(entry: &mut SessionEntry, proxies: &[Proxy]) {
     let tc = if t_connect >= 0 { t_connect - t_queue } else { -1 };
     let tr = if t_data >= 0 { t_data - t_connect } else { -1 };
     let ta = l.ms(Some(std::time::Instant::now()));
-    let retries = u64::from(s.max_retries.saturating_sub(s.conn_retries));
     let answered = entry.sess.log.data.is_some();
     let srv_idx = entry.target_server_idx.filter(|_| routed);
     let be_idx = entry.backend_idx;
@@ -2292,8 +2291,11 @@ fn account_stream(entry: &mut SessionEntry, proxies: &[Proxy]) {
     }
     let now_ms = crate::statcnt::now_ms();
     let now = RateCtr::at(now_ms);
+    // A server counts each attempt made on it where it is made (`srv_inc_sess_ctr`): the
+    // retries that failed on other servers, or on this one, were counted there already
+    // ([`count_failed_attempt`]); this is the last attempt.
     let one = |c: &crate::statcnt::TxnCounters, server: bool| {
-        c.stot.fetch_add(if server { 1 + retries } else { 1 }, Ordering::Relaxed);
+        c.stot.fetch_add(1, Ordering::Relaxed);
         c.bin.fetch_add(bin, Ordering::Relaxed);
         c.bout.fetch_add(bout, Ordering::Relaxed);
         if http && (!server || answered) && !keepalive_lost {
@@ -2342,10 +2344,7 @@ fn account_stream(entry: &mut SessionEntry, proxies: &[Proxy]) {
             c.ttime.add(ms(ta), counted);
         }
         c.last_sess.store(now_ms, Ordering::Relaxed);
-        // A server's rate counts the connections tried, retries included.
-        for _ in 0..(if server { 1 + retries } else { 1 }) {
-            c.sess_rate.tick_at(now);
-        }
+        c.sess_rate.tick_at(now);
         let rate = u32::try_from(c.sess_rate.rate_at(now)).unwrap_or(u32::MAX);
         if rate > c.rate_max.load(Ordering::Relaxed) {
             c.rate_max.fetch_max(rate, Ordering::Relaxed);
@@ -2353,7 +2352,8 @@ fn account_stream(entry: &mut SessionEntry, proxies: &[Proxy]) {
     };
     let be = &proxies[be_idx];
     let c = &be.txn_counters().be;
-    if srv_idx.is_some() {
+    let picked = srv_idx.is_some() && entry.sess.lb_picked;
+    if picked {
         c.lbtot.fetch_add(1, Ordering::Relaxed);
     }
     one(c, false);
@@ -2361,7 +2361,9 @@ fn account_stream(entry: &mut SessionEntry, proxies: &[Proxy]) {
     c.smax.fetch_max(on_server, Ordering::Relaxed);
     let srv = srv_idx.and_then(|i| Some((i, proxies[srv_be].txn_counters().srv.get(i)?)));
     for (i, c) in srv {
-        c.lbtot.fetch_add(1, Ordering::Relaxed);
+        if picked {
+            c.lbtot.fetch_add(1, Ordering::Relaxed);
+        }
         one(c, true);
         let now_on = proxies[srv_be].server_actconn.get(i).map_or(0, |a| a.load(Ordering::Relaxed));
         c.smax.fetch_max(now_on, Ordering::Relaxed);
@@ -6122,6 +6124,7 @@ fn init_client_session(
         && proxy.use_backends.is_empty()
         && proxy.default_backend.is_none()
     {
+        sess.lb_picked = use_server.is_none();
         target_addr = match use_server {
             Some(i) => Some(proxy.servers.at(i)),
             None => proxy.select_server_with_key(sess.client_addr.map(|a| a.ip()), sess.req_uri.as_deref()),
@@ -6536,6 +6539,15 @@ fn count_server_session(proxies: &[Proxy], be_idx: usize, addr: SocketAddr) {
         .inspect(|rate| rate.tick());
 }
 
+/// `srv_inc_sess_ctr` for a connect attempt that failed: the server's `stot` and session
+/// rate count it, as they count the attempt that ends the stream ([`account_stream`]).
+fn count_failed_attempt(proxies: &[Proxy], be_idx: usize, srv_idx: usize) {
+    if let Some(c) = proxies.get(be_idx).and_then(|p| p.txn_counters().srv.get(srv_idx)) {
+        c.stot.fetch_add(1, Ordering::Relaxed);
+        c.sess_rate.tick_at(RateCtr::at(crate::statcnt::now_ms()));
+    }
+}
+
 /// A connect attempt to the stream's server failed (`back_handle_st_cer`): while retries
 /// remain, connect again -- after the turnaround (`SC_ST_TAR`) when `wait`, an asynchronous
 /// connect error, and the server is the same one; at once after a connect refused at once.
@@ -6612,6 +6624,13 @@ fn retry_server_connect(
     // chosen, and counted, when the wait began.
     let resuming = entry.sess.retry_after.is_set();
     entry.sess.retry_after = Tick::ETERNITY;
+    // The attempt that failed counts on the server it was made on, once (a turnaround that
+    // resumes is the same attempt's retry).
+    if !resuming {
+        if let Some(i) = old_idx {
+            count_failed_attempt(proxies, entry.srv_backend_idx, i);
+        }
+    }
     let redispatch = !resuming && be.redisp && {
         let status_of = |i: usize| be.server_statuses.get(i).map(|s| s.load(Ordering::Relaxed));
         let running = old_idx.is_none_or(|i| {
@@ -6671,6 +6690,15 @@ fn retry_server_connect(
     if !resuming && moved {
         count_on_server(true);
         stats.redispatches.fetch_add(1, Ordering::Relaxed);
+        // The server left was a pick too, if the balancer made it (`cum_lbconn` counts each
+        // pick of a server other than the last); the next one is the balancer's.
+        if entry.sess.lb_picked {
+            proxies[be_idx].txn_counters().be.lbtot.fetch_add(1, Ordering::Relaxed);
+            if let Some(c) = old_idx.and_then(|i| proxies[entry.srv_backend_idx].txn_counters().srv.get(i)) {
+                c.lbtot.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        entry.sess.lb_picked = true;
         entry.sess.txn.iter_mut().for_each(|txn| {
             txn.ck.direct = false;
             // TX_CK_VALID (3) becomes TX_CK_DOWN (2).
@@ -9732,6 +9760,7 @@ impl EngineDispatcher<'_> {
         cookie_server: Option<usize>,
     ) -> Option<crate::stats_html::AdminAction> {
         let source_ip = entry.sess.client_addr.map(|a| a.ip());
+        entry.sess.lb_picked = cookie_server.is_none();
         let target = if let Some(idx) = cookie_server {
             Some(proxies[be_idx].servers.at(idx))
         } else {
@@ -10014,7 +10043,9 @@ impl EngineDispatcher<'_> {
         let source_ip = entry.sess.client_addr.map(|a| a.ip());
         let chosen = Self::use_server(&entry.sess, be_idx, proxies);
         let assigned = chosen.is_some();
-        let target = match chosen.or(Self::sticking_rules(&mut entry.sess, be_idx, proxies, assigned)) {
+        let direct = chosen.or(Self::sticking_rules(&mut entry.sess, be_idx, proxies, assigned));
+        entry.sess.lb_picked = direct.is_none();
+        let target = match direct {
             Some(i) => Some(proxies[be_idx].servers.at(i)),
             None => proxies[be_idx].select_server_with_key(source_ip, entry.sess.req_uri.as_deref()),
         };
