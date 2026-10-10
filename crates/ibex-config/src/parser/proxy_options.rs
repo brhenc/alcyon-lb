@@ -425,3 +425,19 @@ pub(crate) fn rename_deprecated_option(section: OptSection, tokens: &[Token], kw
     renamed[1].text = new.to_string();
     Ok(Some(renamed))
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::parser::parse_str;
+
+    /// HAProxy 3.5-dev8-885761-29: `option accept-invalid-http-request foo` is refused with
+    /// `'option accept-invalid-http-request' cannot handle unexpected argument 'foo'.`
+    #[test]
+    fn a_deprecated_option_name_takes_no_argument() {
+        for name in ["accept-invalid-http-request", "accept-invalid-http-response"] {
+            let e = parse_str(&format!("defaults\n mode http\nlisten l\n bind :8080\n option {name} foo\n")).unwrap_err();
+            assert_eq!(e.line, 5);
+            assert_eq!(e.message, format!("'option {name}' cannot handle unexpected argument 'foo'."));
+        }
+    }
+}

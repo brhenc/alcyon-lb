@@ -1568,6 +1568,10 @@ mod tests {
             block.extend(std::iter::repeat_n(0xbe, 95));
             wire.extend(Frame::Headers { flags: frame_flags::END_HEADERS | frame_flags::END_STREAM, stream_id: id, header_block: block }.encode());
         }
+        // A control that fits: two references (8 KB), so that the sum below counts something.
+        let mut block = vec![0x82, 0x86, 0x84];
+        block.extend(std::iter::repeat_n(0xbe, 2));
+        wire.extend(Frame::Headers { flags: frame_flags::END_HEADERS | frame_flags::END_STREAM, stream_id: 125, header_block: block }.encode());
         let _ = mux.parse(&mut ctx, &wire);
         let held: usize = ctx
             .streams
@@ -1578,6 +1582,7 @@ mod tests {
                 _ => 0,
             })
             .sum();
+        assert!(held >= 8000, "the control request is held: {held}");
         assert!(held <= 2 << 20, "{} streams hold {held} bytes of headers from {} bytes", ctx.streams.len(), wire.len());
     }
 

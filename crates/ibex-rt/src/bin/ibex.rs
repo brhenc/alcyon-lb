@@ -664,7 +664,6 @@ fn main() {
             WarnStyle::SpacedBlank => eprintln!("{sev} ({pid}) : config : parsing [{file}:{line}] : {}\n", w.text),
             WarnStyle::Tight => eprintln!("{sev} ({pid}) : config : parsing [{file}:{line}]: {}", w.text),
             WarnStyle::At => eprintln!("{sev} ({pid}) : config : [{file}:{line}] : {}", w.text),
-            WarnStyle::Bare => eprintln!("{sev} ({pid}) : {}", w.text),
         }
         warned |= !w.alert;
     }

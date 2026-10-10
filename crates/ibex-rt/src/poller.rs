@@ -171,3 +171,34 @@ impl Poller {
         Ok(n)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::File;
+
+    /// `epoll_ctl` refuses a descriptor that cannot be polled (a regular file, `/dev/null`)
+    /// with `EPERM`; that error, unlike `ENOENT`, reaches the caller from every operation.
+    #[test]
+    fn epoll_errors_other_than_enoent_are_returned() {
+        let poller = Poller::new(4).unwrap();
+        let file = File::open("/dev/null").unwrap();
+        let fd = file.as_fd();
+        assert_eq!(poller.modify(fd, 1, true, false).unwrap_err().raw_os_error(), Some(Errno::PERM.raw_os_error()));
+        assert_eq!(poller.modify(fd, 1, false, false).unwrap_err().raw_os_error(), Some(Errno::PERM.raw_os_error()));
+        assert_eq!(poller.delete(fd).unwrap_err().raw_os_error(), Some(Errno::PERM.raw_os_error()));
+    }
+
+    /// A descriptor that is not registered: waiting for nothing and deleting are no-ops,
+    /// and waiting for something again adds it.
+    #[test]
+    fn modify_and_delete_tolerate_a_descriptor_that_is_not_registered() {
+        let poller = Poller::new(4).unwrap();
+        let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        poller.modify(a.as_fd(), 1, false, false).unwrap();
+        poller.delete(a.as_fd()).unwrap();
+        poller.modify(a.as_fd(), 1, true, false).unwrap();
+        poller.modify(a.as_fd(), 1, false, false).unwrap();
+        poller.delete(a.as_fd()).unwrap();
+    }
+}

@@ -289,3 +289,91 @@ pub fn http_response(buf: &[u8]) -> bool {
         _ => false,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::check::ProtoReply;
+
+    #[test]
+    fn smtp_multiline_reply_must_end_each_line_in_crlf() {
+        // `250-` followed by a bare LF: not a reply line, the EHLO is refused at EOF.
+        assert!(matches!(smtp_reply(b"250-a\nb", true), Some(SmtpEhlo::Failed(..))));
+        assert!(matches!(smtp_reply(b"250-a\r\n250 b\r\n", false), Some(SmtpEhlo::Accepted)));
+    }
+
+    #[test]
+    fn ldap_and_mysql_replies_become_verdicts() {
+        let v = ldap(b"X", true).expect("decided");
+        assert!(!v.ok);
+        assert_eq!(v.status, "L7RSP");
+        assert_eq!(ldap(b"", false), None);
+        let v = mysql(b"", true, false).expect("decided");
+        assert_eq!(v.status, "L7RSP");
+        assert_eq!(v.info.as_deref(), Some("TCPCHK got an empty response at step 2"));
+        assert_eq!(mysql(b"", false, false), None);
+    }
+
+    #[test]
+    fn protocol_reply_conversion_keeps_status_code_and_info() {
+        let v = Verdict::from(ProtoReply::Passed(Some("ok".into())));
+        assert!(v.ok);
+        assert_eq!((v.status, v.desc, v.code), ("L7OK", "Layer7 check passed", None));
+        assert_eq!(v.info.as_deref(), Some("ok"));
+        let v = Verdict::from(ProtoReply::Invalid(None));
+        assert!(!v.ok);
+        assert_eq!((v.status, v.desc, v.code, v.info), ("L7RSP", "Layer7 invalid response", None, None));
+        let v = Verdict::from(ProtoReply::WrongStatus(3, Some("x".into())));
+        assert!(!v.ok);
+        assert_eq!((v.status, v.desc, v.code), ("L7STS", "Layer7 wrong status", Some(3)));
+        assert_eq!(v.info.as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn pgsql_replies() {
+        let ok = pgsql(b"R\0\0\0\x08\0\0\0\0", false).expect("decided");
+        assert!(ok.ok);
+        assert_eq!(ok.info.as_deref(), Some("PostgreSQL server is ok"));
+        assert_eq!(pgsql(b"R\0\0", false), None);
+        let bad = pgsql(b"Rxxxxxxxxx", false).expect("decided");
+        assert_eq!((bad.status, bad.code), ("L7STS", Some(0)));
+        assert_eq!(bad.info.as_deref(), Some("PostgreSQL unknown error"));
+    }
+
+    #[test]
+    fn ssl_hello_replies() {
+        let empty = ssl_hello(b"", true).expect("decided");
+        assert_eq!(empty.status, "L6RSP");
+        assert_eq!(empty.info.as_deref(), Some("TCPCHK got an empty response at step 2"));
+        assert_eq!(ssl_hello(b"", false), None);
+        for first in [0x15u8, 0x16] {
+            let v = ssl_hello(&[first, 3, 3], false).expect("decided");
+            assert!(v.ok);
+            assert_eq!((v.status, v.desc), ("L6OK", "Layer6 check passed"));
+        }
+        let v = ssl_hello(b"H", false).expect("decided");
+        assert!(!v.ok);
+        assert_eq!(v.status, "L6RSP");
+    }
+
+    #[test]
+    fn tcp_expect_waits_and_decides() {
+        use ibex_config::ast::ResolvedTcpExpectPattern as P;
+        let s = P::String("OK".into());
+        assert_eq!(tcp_expect(&s, 0, b"", false), None);
+        assert_eq!(tcp_expect(&s, 0, b"O", false), None);
+        assert_eq!(tcp_expect(&s, 0, b"OK", false), Some(true));
+        assert_eq!(tcp_expect(&s, 0, b"NO", false), Some(false));
+        assert_eq!(tcp_expect(&s, 0, b"", true), Some(false));
+        assert_eq!(tcp_expect(&s, 5, b"OK", false), None);
+        assert_eq!(tcp_expect(&s, -1, b"NO", false), None);
+        assert_eq!(tcp_expect(&s, -1, b"NO", true), Some(false));
+    }
+
+    #[test]
+    fn http_response_reports_a_complete_head_only() {
+        assert!(http_response(b"HTTP/1.1 200 OK\r\nX: a, b\r\n\r\n"));
+        assert!(!http_response(b"HTTP/1.1 200 OK\r\nX: a"));
+        assert!(!http_response(b"garbage\r\n\r\n"));
+    }
+}

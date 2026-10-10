@@ -305,6 +305,4 @@ pub enum WarnStyle {
     Tight,
     /// `config : [file:line] : text`
     At,
-    /// `text`, no location: the checks run after the whole configuration is read.
-    Bare,
 }

@@ -3791,4 +3791,60 @@ mod tests {
             }
         }
     }
+
+    /// `set server health down` on a drained server, and on one in maintenance
+    /// (`health_transition`): the drain is kept as `DRAIN_DOWN` and maintenance is kept.
+    #[test]
+    fn health_transition_keeps_drain_and_maintenance() {
+        let (up, drain, down) = (ServerStatus::Up as u8, ServerStatus::Drain as u8, ServerStatus::Down as u8);
+        assert_eq!(health_transition(ServerStatus::Maint as u8, true), ServerStatus::Maint as u8);
+        assert_eq!(health_transition(ServerStatus::Maint as u8, false), ServerStatus::Maint as u8);
+        assert_eq!(health_transition(drain, false), DRAIN_DOWN);
+        assert_eq!(health_transition(DRAIN_DOWN, false), DRAIN_DOWN);
+        assert_eq!(health_transition(DRAIN_DOWN, true), drain);
+        assert_eq!(health_transition(down, true), up);
+        assert_eq!(health_transition(up, false), down);
+    }
+
+    /// The `status` column of a server whose check is off but which runs: `no check`.
+    #[test]
+    fn status_word_of_a_running_server_without_a_check() {
+        let config = ServerCheckConfig { rise: 2, fall: 2, ..ServerCheckConfig::default() };
+        let mut s = ServerCheckState::new(0, 0, "127.0.0.1:1".parse().unwrap(), config, Tick(0));
+        s.status = ServerStatus::Up;
+        s.health = 3;
+        s.enabled = false;
+        assert_eq!(s.status_word(), "no check");
+        s.status = ServerStatus::Down;
+        s.health = 0;
+        assert_eq!(s.status_word(), "DOWN");
+    }
+
+    /// A check cut short by maintenance drops its connection: the task does not look at it
+    /// again, and the state is idle when the server comes back.
+    #[test]
+    fn maintenance_closes_a_check_in_progress() {
+        let config = ServerCheckConfig { rise: 2, fall: 2, ..ServerCheckConfig::default() };
+        let mut s = ServerCheckState::new(0, 0, "127.0.0.1:1".parse().unwrap(), config, Tick(0));
+        s.enabled = true;
+        s.status = ServerStatus::Maint;
+        s.in_progress = true;
+        s.sub_state = CheckSubState::TcpConnecting;
+        let mut fdtab = FdTab::with_capacity(16);
+        let mut poller = Poller::new(4).unwrap();
+        let step = step_check(&mut s, &mut fdtab, &mut poller, Tick(100), &[]).unwrap();
+        assert!(!s.in_progress);
+        assert!(matches!(s.sub_state, CheckSubState::Idle));
+        assert!(step.next.is_some());
+    }
+
+    /// `info:` is cut at 127 bytes, backing up to a character boundary.
+    #[test]
+    fn check_description_is_cut_on_a_character_boundary() {
+        let long = format!("{}é{}", "a".repeat(126), "b".repeat(10));
+        let cut = cut_check_desc(long);
+        assert_eq!(cut, "a".repeat(126));
+        let ascii = cut_check_desc("x".repeat(300));
+        assert_eq!(ascii.len(), HCHK_DESC_MAX);
+    }
 }
