@@ -10,7 +10,7 @@
 #                                 run the disowned-child case against the old form,
 #                                 `flock <lock> <cmd>`, which it must fail
 #
-# Cases: disowned, overlap, serial, exclusive, disk, report, env, rc (default: all).
+# Cases: disowned, overlap, serial, exclusive, disk, report, env, rc, args, touch (default: all).
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 2
 GATE=$(pwd)/tools/gate.sh
@@ -161,7 +161,41 @@ t_rc() {
   else bad "rc: got $rc"; echo "$o"; fi
 }
 
-CASES=${*:-disowned overlap serial exclusive disk report env rc}
+t_args() {
+  # --only / --rerun-failed reach checkin.sh (T267); the lock and slot rules are unchanged.
+  local o
+  o=$(IBEX_GATE_SLOTS=1 IBEX_GATE_CMD='echo "A=$* M=$IBEX_GATE_SKIP_MEASURE"' "$GATE" --rerun-failed 2>&1)
+  if grep -q "^A=--rerun-failed M=1$" <<<"$o"; then ok "args: --rerun-failed passed through"
+  else bad "args: --rerun-failed"; echo "$o"; fi
+  o=$(IBEX_GATE_SLOTS=1 IBEX_GATE_CMD='echo "A=$*"' "$GATE" --only suite,covercheck -- FOO=1 2>&1)
+  if grep -q "^A=--only suite,covercheck$" <<<"$o"; then ok "args: --only passed through"
+  else bad "args: --only"; echo "$o"; fi
+}
+
+t_touch() {
+  # The slot's target is touched unless the last gate in it was this worktree's and
+  # nothing has built in it since: a rerun of covercheck alone must find the suite's build
+  # fresh, or covercheck rebuilds and reruns every test.
+  local o t=$W/targets/gate-slot1
+  rm -rf "$t"
+  o=$(IBEX_GATE_SLOTS=1 IBEX_GATE_CMD=true "$GATE" 2>&1)
+  if grep -q "gate: touching" <<<"$o"; then ok "touch: a target this worktree has not built is touched"
+  else bad "touch: first"; echo "$o"; fi
+  o=$(IBEX_GATE_SLOTS=1 IBEX_GATE_CMD=true "$GATE" 2>&1)
+  if grep -q "gate: not touching" <<<"$o"; then ok "touch: the same worktree again is not touched"
+  else bad "touch: second"; echo "$o"; fi
+  sleep 1.1
+  mkdir -p "$t/llvm-cov-target/debug/.fingerprint/other-1234" && : > "$t/llvm-cov-target/debug/.fingerprint/other-1234/x"
+  o=$(IBEX_GATE_SLOTS=1 IBEX_GATE_CMD=true "$GATE" 2>&1)
+  if grep -q "gate: touching" <<<"$o"; then ok "touch: a build since (another gate) makes it touch"
+  else bad "touch: after another build"; echo "$o"; fi
+  echo other > "$t/.gate-last-tree"
+  o=$(IBEX_GATE_SLOTS=1 IBEX_GATE_CMD=true "$GATE" 2>&1)
+  if grep -q "gate: touching" <<<"$o"; then ok "touch: another worktree's marker makes it touch"
+  else bad "touch: other marker"; echo "$o"; fi
+}
+
+CASES=${*:-disowned overlap serial exclusive disk report env rc args touch}
 for c in $CASES; do "t_$c"; done
 echo "test_gate: $PASS passed, $FAIL failed"
 [ $FAIL -eq 0 ]

@@ -2,10 +2,11 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 #
-# tools/gate.sh [--exclusive] [--log FILE] [--] [VAR=value ...]
+# tools/gate.sh [--exclusive] [--log FILE] [--only ID[,ID..] | --rerun-failed] [--] [VAR=value ...]
 #
 # The one way to run the gate (./tools/checkin.sh). It takes the gate lock itself, and
-# nothing it starts holds that lock (T253).
+# nothing it starts holds that lock (T253). --only and --rerun-failed go to checkin.sh
+# (T267: rerun only the stages that failed on this tree); the lock and slot rules are the same.
 #
 # Why: the gate used to be run as `flock /tmp/ibex-gate.lock ./tools/checkin.sh`. flock hands
 # the locked fd to its command and to everything that command starts. On 2026-10-10 cargo
@@ -21,7 +22,11 @@
 #   slot K:  /tmp/ibex-gate.slot<K>.lock
 #   target:  ~/ibex-targets/gate-slot<K>
 # Inside the slot the worktree's *.rs and *.toml are touched, so the slot's target never
-# trusts mtimes another worktree left in it.
+# trusts mtimes another worktree left in it -- unless the last gate in the slot was this
+# worktree's and nothing has built in the target since (<target>/.gate-last-tree, written
+# when a gate ends, older than every fingerprint): then cargo's mtimes are this worktree's
+# own, and not touching keeps the suite's build fresh, which is what lets covercheck rerun
+# alone on the suite's profiles (T267).
 #
 # --exclusive (the supervisor's measuring gate on main) takes every slot, in order, after
 # announcing itself on /tmp/ibex-gate.exclusive.lock so non-exclusive gates stop taking
@@ -44,15 +49,18 @@
 #   IBEX_GATE_POLL_SECS    (default 5) how often a waiting gate retries the slots
 set -uo pipefail
 
-usage() { sed -n '5,5p;7,8p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+usage() { sed -n '5,5p;7,10p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 
 EXCLUSIVE=0
 LOG=""
 EXTRA_ENV=()
+CHECKIN_ARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --exclusive) EXCLUSIVE=1 ;;
     --log) [ $# -ge 2 ] || usage; LOG=$2; shift ;;
+    --only) [ $# -ge 2 ] || usage; CHECKIN_ARGS+=(--only "$2"); shift ;;
+    --rerun-failed) CHECKIN_ARGS+=(--rerun-failed) ;;
     --) shift; break ;;
     -h|--help) usage ;;
     *=*) break ;;
@@ -202,14 +210,31 @@ mkdir -p "$CARGO_TARGET_DIR"
 [ $EXCLUSIVE = 1 ] || export IBEX_GATE_SKIP_MEASURE=1
 echo "gate: CARGO_TARGET_DIR=$CARGO_TARGET_DIR IBEX_GATE_SKIP_MEASURE=${IBEX_GATE_SKIP_MEASURE:-} ${EXTRA_ENV[*]}"
 
-# The slot's target is shared with other worktrees; make cargo rebuild from this one's sources.
-git ls-files -z -- '*.rs' '*.toml' | run_closed xargs -0 touch
+# The slot's target is shared with other worktrees; make cargo rebuild from this one's
+# sources, unless the last gate here was this worktree's and nothing has built since.
+MARK=$CARGO_TARGET_DIR/.gate-last-tree
+built_since() {
+  local d
+  for d in "$CARGO_TARGET_DIR"/*/.fingerprint "$CARGO_TARGET_DIR"/llvm-cov-target/*/.fingerprint; do
+    [ -d "$d" ] || continue
+    [ -z "$(find "$d" -newer "$MARK" -print -quit 2>/dev/null)" ] || return 0
+  done
+  return 1
+}
+if [ -f "$MARK" ] && [ "$(cat "$MARK")" = "$REPO" ] && ! built_since; then
+  echo "gate: not touching sources: the last gate in this slot was this worktree's, and nothing has built here since"
+else
+  echo "gate: touching sources: this slot's target was last built from another worktree, or by an unfinished gate"
+  git ls-files -z -- '*.rs' '*.toml' | run_closed xargs -0 touch
+fi
+rm -f "$MARK"   # an interrupted gate leaves no mark
 
 if [ -n "${IBEX_GATE_CMD:-}" ]; then
-  run_closed env "${EXTRA_ENV[@]}" bash -c "$IBEX_GATE_CMD"
+  run_closed env "${EXTRA_ENV[@]}" bash -c "$IBEX_GATE_CMD" gate "${CHECKIN_ARGS[@]}"
 else
-  run_closed env "${EXTRA_ENV[@]}" ./tools/checkin.sh
+  run_closed env "${EXTRA_ENV[@]}" ./tools/checkin.sh "${CHECKIN_ARGS[@]}"
 fi
 RC=$?
+echo "$REPO" > "$MARK"
 echo "gate: $(ts) rc=$RC slot=$SLOT_LABEL"
 exit $RC
