@@ -584,6 +584,7 @@ version = "0.1.0"
 dependencies = [
  "ibex-crypt",
  "ibex-regex",
+ "nix",
  "thiserror 1.0.69",
 ]
 

@@ -221,7 +221,8 @@ fn private_dir() -> io::Result<PathBuf> {
 }
 
 /// Becomes the master. Never returns.
-pub fn run(sock: &MasterSocket, args: &[String], start_dir: Option<PathBuf>, systemd: bool) -> ! {
+/// Without `sock` (plain `-W` with `user`/`group`/`chroot`), there is no master CLI.
+pub fn run(sock: Option<&MasterSocket>, args: &[String], start_dir: Option<PathBuf>, systemd: bool) -> ! {
     // Reads NOTIFY_SOCKET and takes it out of the environment the workers inherit.
     ibex_rt::systemd::init();
     let lifecycle = ibex_rt::lifecycle::Lifecycle::new();
@@ -230,23 +231,27 @@ pub fn run(sock: &MasterSocket, args: &[String], start_dir: Option<PathBuf>, sys
         .and_then(|()| lifecycle.install_term_handler())
         .and_then(|()| private_dir())
         .and_then(|dir| {
+            let Some(sock) = sock else { return Ok((dir, None)) };
             let _ = std::fs::remove_file(&sock.path);
             let bound = UnixListener::bind(&sock.path);
             if bound.is_err() {
                 let _ = std::fs::remove_dir_all(&dir);
             }
-            bound.map(|l| (dir, l))
+            bound.map(|l| (dir, Some(l)))
         });
     let (dir, listener) = setup.unwrap_or_else(|e| {
-        let _ = writeln!(io::stderr(), "[ALERT]    ({}) : cannot bind '{}': {e}", process::id(), sock.path.display());
+        let path = sock.map(|s| s.path.display().to_string()).unwrap_or_default();
+        let _ = writeln!(io::stderr(), "[ALERT]    ({}) : cannot bind '{path}': {e}", process::id());
         let _ = writeln!(io::stderr(), "[ALERT]    ({}) : Can't create the master's CLI.", process::id());
         process::exit(1);
     });
-    if let Some(mode) = sock.mode {
+    if let Some((path, mode)) = sock.and_then(|s| s.mode.map(|m| (&s.path, m))) {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&sock.path, std::fs::Permissions::from_mode(mode));
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
     }
-    let _ = listener.set_nonblocking(true);
+    if let Some(l) = listener.as_ref() {
+        let _ = l.set_nonblocking(true);
+    }
 
     let shared = Arc::new(Shared {
         state: Mutex::new(State::default()),
@@ -266,7 +271,7 @@ pub fn run(sock: &MasterSocket, args: &[String], start_dir: Option<PathBuf>, sys
         stopping: false,
         exit_code: 0,
         first: true,
-        sock_path: sock.path.clone(),
+        sock_path: sock.map(|s| s.path.clone()),
         released: false,
         loading_since: None,
         load_timeout: load_timeout(),
@@ -320,7 +325,7 @@ pub fn run(sock: &MasterSocket, args: &[String], start_dir: Option<PathBuf>, sys
             m.cleanup();
             process::exit(code);
         }
-        while let Ok((stream, _)) = listener.accept() {
+        while let Some(Ok((stream, _))) = listener.as_ref().map(UnixListener::accept) {
             let shared = Arc::clone(&shared);
             std::thread::spawn(move || session(&shared, stream));
         }
@@ -339,7 +344,7 @@ struct Master {
     stopping: bool,
     exit_code: i32,
     first: bool,
-    sock_path: PathBuf,
+    sock_path: Option<PathBuf>,
     /// The workers were told to stop, so they closed their listeners: the next one binds
     /// its own instead of asking for theirs with `-x`.
     released: bool,
@@ -550,7 +555,9 @@ impl Master {
     }
 
     fn cleanup(&self) {
-        let _ = std::fs::remove_file(&self.sock_path);
+        if let Some(p) = self.sock_path.as_ref() {
+            let _ = std::fs::remove_file(p);
+        }
         let _ = std::fs::remove_dir_all(&self.shared.dir);
     }
 }

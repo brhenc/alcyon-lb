@@ -1965,8 +1965,9 @@ fn init_stick_table(ast: &ibex_config::StickTableConfigAst, name: &str) -> Stick
 /// anything unreadable becomes "-", which is what a collector expects for "unknown"
 /// rather than an empty field that would shift every following token.
 fn hostname() -> String {
-    std::fs::read_to_string("/proc/sys/kernel/hostname")
-        .ok()
+    // uname(2), as HAProxy's gethostname(): a file under /proc is not there in a chroot,
+    // and this is first read when the first line is logged, after the chroot (T240).
+    Some(rustix::system::uname().nodename().to_string_lossy().into_owned())
         .map(|h| h.trim().to_string())
         .filter(|h| !h.is_empty() && !h.contains(' '))
         .map_or_else(|| "-".to_string(), |h| {

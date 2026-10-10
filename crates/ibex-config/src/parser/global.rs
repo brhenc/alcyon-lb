@@ -2,6 +2,7 @@
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
 use super::*;
+use crate::ast::LoadWarning;
 
 #[allow(clippy::too_many_lines)]
 pub(crate) fn parse_global_directive(
@@ -417,22 +418,23 @@ pub(crate) fn parse_global_directive(
             global.master_worker = true;
             Ok(())
         }
-        "user" => {
-            if tokens.len() >= 2 {
-                global.user = Some(tokens[1].text.clone());
-            }
-            Ok(())
-        }
-        "group" => {
-            if tokens.len() >= 2 {
-                global.group = Some(tokens[1].text.clone());
-            }
-            Ok(())
-        }
+        // `HAProxy`'s `cfg_parse_global` (src/cfgparse-global.c): the names are resolved
+        // here, so an unknown one fails `-c` as well; the ids are applied in `ibex-rt`
+        // (`bin/ibex/identity.rs`) once every listener is bound.
+        "user" | "group" | "uid" | "gid" => parse_identity(global, tokens, kw),
         "chroot" => {
-            if tokens.len() >= 2 {
-                global.chroot = Some(tokens[1].text.clone());
+            if let Some(extra) = tokens.get(2) {
+                return Err(ConfigError::new(extra.line, extra.col, format!("'chroot' cannot handle unexpected argument '{}'.", extra.text)));
             }
+            let dir = tokens.get(1).map_or("", |t| t.text.as_str());
+            if global.chroot.is_some() {
+                global.load_warnings.push(LoadWarning { line: kw.line, alert: false, text: "'chroot' is already specified. Continuing.".into() });
+                return Ok(());
+            }
+            if dir.is_empty() {
+                return Err(ConfigError::new(kw.line, kw.col, "'chroot' expects a directory as an argument."));
+            }
+            global.chroot = Some(dir.to_string());
             Ok(())
         }
         "pidfile" => {
@@ -823,4 +825,81 @@ fn load_h1_case_adjust_file(table: &mut Vec<(String, String)>, path: &str) -> Re
         add_h1_case_adjust(table, key, value).map_err(|m| format!("h1-headers-case-adjust-file '{path}' : {m} at line {}.", i + 1))?;
     }
     Ok(())
+}
+
+/// `user`, `group`, `uid` and `gid`. A second one of a pair is an alert that does not fail
+/// the load and keeps the first; a `uid` that is not a number is a warning and no uid.
+#[allow(clippy::cast_possible_wrap)] // `(int)ha_user->pw_uid`, as HAProxy.
+fn parse_identity(global: &mut GlobalSection, tokens: &[Token], kw: &Token) -> Result<(), ConfigError> {
+    let name = kw.text.as_str();
+    if let Some(extra) = tokens.get(2) {
+        return Err(ConfigError::new(extra.line, extra.col, format!("'{name}' cannot handle unexpected argument '{}'.", extra.text)));
+    }
+    let arg = tokens.get(1).map_or("", |t| t.text.as_str());
+    let is_user = matches!(name, "user" | "uid");
+    let slot = if is_user { global.uid } else { global.gid };
+    let mut note = |alert: bool, text: String| global.load_warnings.push(LoadWarning { line: kw.line, alert, text });
+    if slot.is_some() {
+        note(true, match name {
+            "user" | "uid" => "user/uid already specified. Continuing.".into(),
+            "group" => "gid/group was already specified. Continuing.".into(),
+            _ => "group/gid already specified. Continuing.".into(),
+        });
+        return Ok(());
+    }
+    let id = match name {
+        "uid" | "gid" => {
+            if arg.is_empty() {
+                return Err(ConfigError::new(kw.line, kw.col, format!("'{name}' expects an integer argument.")));
+            }
+            let Some(id) = strl2irc(arg) else {
+                let (what, instead) = if is_user { ("uid", "user") } else { ("gid", "group") };
+                note(false, format!(
+                    " {what}: string '{arg}' is not a number.\n   | You might want to use the '{instead}' parameter to use a system {instead} name."
+                ));
+                return Ok(());
+            };
+            id
+        }
+        _ => {
+            // `getpwnam` / `getgrnam` with errno cleared: not found is `(0:Success)`.
+            let found = if is_user {
+                nix::unistd::User::from_name(arg).map(|u| u.map(|u| u.uid.as_raw()))
+            } else {
+                nix::unistd::Group::from_name(arg).map(|g| g.map(|g| g.gid.as_raw()))
+            };
+            if let Ok(Some(id)) = found {
+                id as i32
+            } else {
+                let (errno, why) = found.err().map_or((0, "Success"), |e| (e as i32, e.desc()));
+                let what = if is_user { "user" } else { "group" };
+                return Err(ConfigError::new(kw.line, kw.col, format!("cannot find {what} id for '{arg}' ({errno}:{why})")));
+            }
+        }
+    };
+    if is_user {
+        global.uid = Some(id);
+    } else {
+        global.gid = Some(id);
+    }
+    Ok(())
+}
+
+/// `strl2irc` (src/tools.c): an optional `-`, then digits, within an `int`. As there, a
+/// byte below `'0'` is not refused (`j > 9` is the only test).
+fn strl2irc(s: &str) -> Option<i32> {
+    let (neg, digits) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s),
+    };
+    let mut i: i32 = 0;
+    for b in digits.bytes() {
+        let j = i32::from(b) - i32::from(b'0');
+        if j > 9 {
+            return None;
+        }
+        i = i.checked_mul(10)?;
+        i = if neg { i.checked_sub(j)? } else { i.checked_add(j)? };
+    }
+    Some(i)
 }

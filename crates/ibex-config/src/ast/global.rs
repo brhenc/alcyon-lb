@@ -220,8 +220,15 @@ pub struct GlobalSection {
     pub user: Option<String>,
     /// Group name for privilege dropping.
     pub group: Option<String>,
-    /// Chroot directory.
+    /// Chroot directory (`chroot`), entered once the listeners are bound.
     pub chroot: Option<String>,
+    /// The uid to switch to, from `uid` or `user` (resolved with `getpwnam` while parsing,
+    /// as `HAProxy` does). Applied only when above 0 (`set_identity`, src/haproxy.c).
+    pub uid: Option<i32>,
+    /// The gid to switch to, from `gid` or `group`. Applied only when above 0.
+    pub gid: Option<i32>,
+    /// Non-fatal messages of the `global` keywords, printed while the configuration loads.
+    pub load_warnings: Vec<LoadWarning>,
     /// Pidfile path.
     pub pidfile: Option<String>,
     /// Hard stop timeout on reload/exit.
@@ -267,3 +274,15 @@ pub struct GlobalSetVar {
     pub is_fmt: bool,
 }
 
+
+/// A message `HAProxy` prints while it parses a line and then goes on (`ERR_WARN`, or an
+/// `ERR_ALERT` that is not fatal).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadWarning {
+    /// 1-based line of the merged configuration text.
+    pub line: usize,
+    /// `true` for `[ALERT]`, `false` for `[WARNING]`.
+    pub alert: bool,
+    /// The text after `parsing [file:line] :`.
+    pub text: String,
+}

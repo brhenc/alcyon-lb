@@ -7,6 +7,8 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::struct_excessive_bools)]
 
+#[path = "ibex/identity.rs"]
+mod identity;
 #[path = "ibex/master.rs"]
 mod master;
 
@@ -56,11 +58,6 @@ struct CliOptions {
     disable_poll: bool,
     dump_memory_pools: bool,
     dump_libs: bool,
-    user: Option<String>,
-    group: Option<String>,
-    uid: Option<u32>,
-    gid: Option<u32>,
-    chroot: Option<PathBuf>,
     overrides: Vec<String>,
 }
 
@@ -90,8 +87,6 @@ fn print_help(program: &str) {
     println!("        -sf/-st [pid ]* finishes/terminates old pids.");
     println!("        -S <bind>[,<bind options>...] master CLI / stats socket");
     println!("        -e <setting> override configuration directives");
-    println!("        -u <user> / -g <group> / -U <uid> / -G <gid> run as user/group");
-    println!("        -ch <dir> chroot to directory");
     println!("        -h, --help show this help message");
 }
 
@@ -418,36 +413,6 @@ fn parse_cli_args(args: &[String]) -> (String, CliOptions) {
             "-dM" => {
                 opts.dump_memory_pools = true;
             }
-            "-u" => {
-                i += 1;
-                if i < args.len() {
-                    opts.user = Some(args[i].clone());
-                }
-            }
-            "-g" => {
-                i += 1;
-                if i < args.len() {
-                    opts.group = Some(args[i].clone());
-                }
-            }
-            "-U" => {
-                i += 1;
-                if i < args.len() {
-                    opts.uid = args[i].parse::<u32>().ok();
-                }
-            }
-            "-G" => {
-                i += 1;
-                if i < args.len() {
-                    opts.gid = args[i].parse::<u32>().ok();
-                }
-            }
-            "-ch" => {
-                i += 1;
-                if i < args.len() {
-                    opts.chroot = Some(PathBuf::from(&args[i]));
-                }
-            }
             "-e" => {
                 i += 1;
                 if i < args.len() {
@@ -681,6 +646,14 @@ fn main() {
         eprintln!("[{sev}]{pad} ({}) : config : parsing [{file}:{}]: '{}'.", process::id(), m.line, m.text);
     }
 
+    // 5-ter. What `global` keywords printed while they were parsed and went on (a second
+    //     `user`, a `uid` that is not a number).
+    for w in config.global.iter().flat_map(|g| &g.load_warnings) {
+        let (file, line) = locate(&config_starts, w.line);
+        let sev = if w.alert { "[ALERT]   " } else { "[WARNING] " };
+        eprintln!("{sev} ({}) : config : parsing [{file}:{line}] : {}", process::id(), w.text);
+    }
+
     // 5a. Every rule action's expression must name fetches and converters that exist.
     //     `HAProxy` refuses the configuration otherwise; checked here so that `-c` reports
     //     it and a start fails before anything is daemonized, signalled or bound.
@@ -775,8 +748,13 @@ fn main() {
 
     // 9a. `-W -S`: this process becomes the master, and the proxy runs in worker processes
     //     it starts (see master.rs).
-    if let Some(ms) = master_sock.as_ref().filter(|_| master_dir.is_none()) {
-        master::run(ms, &raw_args[1..], start_dir, opts.systemd_notify) }
+    //     Plain `-W` is a process of its own that reloads by starting the binary again,
+    //     which it could no longer do once it has given up root or entered a chroot: with
+    //     `user`/`group`/`chroot` it becomes a master as well, which keeps its privileges
+    //     while its workers drop theirs, as `HAProxy`'s does.
+    let identity = identity::Identity::from_config(&config);
+    if master_dir.is_none() && (master_sock.is_some() || (opts.master_worker && identity.any())) {
+        master::run(master_sock.as_ref(), &raw_args[1..], start_dir, opts.systemd_notify) }
 
     // 9b. The ACL and map files the configuration reads become the objects `show map`,
     //     `add acl` and the other runtime commands work on, numbered in the order written.
@@ -963,6 +941,9 @@ fn main() {
 
     // Each worker reports once it is listening. `-sf` and READY=1 wait for all of them.
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+    // And then waits for `go` before it accepts anything: the process changes root, group
+    // and user in between (see identity.rs), and nothing is served before it has.
+    let go = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
     let mut threads = Vec::new();
     // The idle server connections, one slot per worker, taken across workers unless
     // `tune.idle-pool.shared off`.
@@ -981,6 +962,7 @@ fn main() {
         let (cli_pre, extra_pre) = if worker_id == 0 { (cli_pre.take(), extra_pre.take()) } else { (None, None) };
         let lifecycle_clone = lifecycle.clone();
         let ready_tx = ready_tx.clone();
+        let go = std::sync::Arc::clone(&go);
 
         let t = std::thread::spawn(move || {
             let started = Engine::new_worker(&config_clone, capacity, worker_id, proxies_clone).and_then(|mut eng| {
@@ -1016,6 +998,12 @@ fn main() {
             engine.set_lifecycle(lifecycle_clone);
             let _ = ready_tx.send(());
             drop(ready_tx);
+            let (lock, cvar) = &*go;
+            let mut released = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            while !*released {
+                released = cvar.wait(released).unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            drop(released);
             if let Err(err) = engine.run_loop() {
                 eprintln!("Engine error (worker {}): {}", worker_id, err);
                 process::exit(1);
@@ -1040,20 +1028,30 @@ fn main() {
     if unused > 0 && !opts.quiet {
         eprintln!("[NOTICE] closed {unused} inherited socket(s) that no bind in this configuration uses");
     }
+    // `HAProxy`'s order (src/haproxy.c `main`): the pidfile is written before the chroot,
+    // the old processes are signalled before the user changes (it may no longer be allowed
+    // to), and a chroot or identity that fails exits 1 before anything is served.
+    if reload_child {
+        if let Some(ref pidfile) = opts.pid_file {
+            handle_pid_file(pidfile);
+        }
+    }
+    identity::chroot(&program, &identity);
     if !opts.sf_pids.is_empty() {
         send_signals_to_pids(&opts.sf_pids, Signal::Usr1, opts.quiet);
     }
     if !opts.st_pids.is_empty() {
         send_signals_to_pids(&opts.st_pids, Signal::Term, opts.quiet);
     }
+    identity::set_identity(&program, &identity);
+    {
+        let (lock, cvar) = &*go;
+        *lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        cvar.notify_all();
+    }
     if master_dir.is_some() {
         // To the master, on the stderr pipe it reads: loaded (see master.rs).
         eprintln!("{}", master::READY_MARK);
-    }
-    if reload_child {
-        if let Some(ref pidfile) = opts.pid_file {
-            handle_pid_file(pidfile);
-        }
     }
     // A reload child does not announce itself: it is not systemd's main PID yet, and under
     // the default `NotifyAccess=main` systemd would drop the message. The process it

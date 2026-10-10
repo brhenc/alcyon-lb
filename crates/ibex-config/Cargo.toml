@@ -9,6 +9,8 @@ description = "HAProxy 1.0 configuration parser for Ibex"
 ibex-regex = { workspace = true }
 ibex-crypt = { path = "../ibex-crypt" }
 thiserror = "1.0"
+# `getpwnam_r` / `getgrnam_r` for `user` and `group`, as HAProxy resolves them while parsing.
+nix = { version = "0.31", default-features = false, features = ["user"] }
 
 [dev-dependencies]
 

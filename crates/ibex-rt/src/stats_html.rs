@@ -40,9 +40,8 @@ pub fn render_stats_html(proxies: &[Proxy], checks: &[ServerCheckState], pid: u3
 
 /// The host name `stats show-node` without a name reports (HAProxy: `gethostname()`).
 fn host_name() -> String {
-    std::fs::read_to_string("/proc/sys/kernel/hostname")
-        .map(|h| h.trim().to_string())
-        .unwrap_or_default()
+    // uname(2), not /proc, which is not there in a chroot (T240).
+    rustix::system::uname().nodename().to_string_lossy().trim().to_string()
 }
 
 /// [`render_stats_html`] for the page served by the proxy whose `stats` section is
