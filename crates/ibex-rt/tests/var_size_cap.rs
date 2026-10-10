@@ -17,6 +17,16 @@ use std::net::TcpStream;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+/// Stops ibex (SIGUSR1) and removes its configuration, also when an assertion fails.
+struct Guard(std::process::Child, std::path::PathBuf);
+
+impl Drop for Guard {
+    fn drop(&mut self) {
+        common::stop(&mut self.0);
+        let _ = std::fs::remove_file(&self.1);
+    }
+}
+
 #[test]
 fn a_variable_stops_growing_at_the_buffer_size() {
     let fe = common::reserve_addr();
@@ -32,13 +42,14 @@ fn a_variable_stops_growing_at_the_buffer_size() {
          \x20 http-request return status 200 hdr x-len %[var(sess.x),length] hdr x-fmt %[var(txn.f),length]\n"
     );
     std::fs::write(&cfg, &text).expect("cfg");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ibex"))
+    let child = Command::new(env!("CARGO_BIN_EXE_ibex"))
         .arg("-f")
         .arg(&cfg)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn ibex");
+    let _guard = Guard(child, cfg);
     assert!(common::wait_listening(fe), "ibex never listened");
     let mut c = TcpStream::connect(fe).expect("connect");
     c.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
@@ -66,8 +77,6 @@ fn a_variable_stops_growing_at_the_buffer_size() {
         assert_eq!(fmt, "16383", "set-var-fmt is cut at bufsize - 1");
         seen.push(len);
     }
-    common::stop(&mut child);
-    let _ = std::fs::remove_file(&cfg);
     let want: Vec<String> = (1..=20).map(|i: usize| (i.min(16) * 1000 + 1).to_string()).collect();
     assert_eq!(seen, want);
 }
