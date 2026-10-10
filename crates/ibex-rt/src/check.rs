@@ -9,6 +9,7 @@
 //! or error, the server's health counters (`rise_count`, `fall_count`, `health`) are updated,
 //! and server availability transitions between `Up` and `Down`.
 
+use crate::check_reply;
 use crate::engine::Proxy;
 use crate::fdtab::{FdState, FdTab, Interest};
 use crate::logfmt::{LogData, LogFormat};
@@ -2215,24 +2216,25 @@ fn progress_tcp_check(
     })
 }
 
-/// Cleans up any open sockets or poller registrations for a check in progress.
-/// `cut_crlf`: the bytes before the first CR or LF.
-fn cut_crlf(b: &[u8]) -> &[u8] {
-    let end = b.iter().position(|&c| c == b'\r' || c == b'\n').unwrap_or(b.len());
-    &b[..end]
-}
-
-/// `chunk_asciiencode` (src/chunk.c): printable ASCII as is, every other byte as `<XX>`.
-fn ascii_encode(b: &[u8]) -> String {
-    let mut out = String::with_capacity(b.len());
-    for &c in b {
-        if (0x20..0x7f).contains(&c) {
-            out.push(char::from(c));
-        } else {
-            let _ = write!(out, "<{c:02X}>");
-        }
-    }
-    out
+/// Ends a check on a reply verdict from [`check_reply`]: closes the socket, records the
+/// result and schedules the next check.
+fn finish_reply(
+    check: &mut ServerCheckState,
+    fdtab: &mut FdTab,
+    poller: &mut Poller,
+    now: Tick,
+    duration: u32,
+    v: check_reply::Verdict,
+) -> CheckStep {
+    cleanup_check_socket(check, fdtab, poller);
+    let event = if v.ok {
+        check.on_success_full(v.status, v.desc, duration, v.code, v.info)
+    } else {
+        check.on_failure_full(v.status, v.desc, duration, v.code, v.info)
+    };
+    let next = check.schedule_next(now);
+    check.next_check = next;
+    CheckStep { next: Some(next), event }
 }
 
 /// Connects a check to `addr` (the server's unless given) and, when the server line asks
@@ -2423,45 +2425,12 @@ fn progress_redis_check(
             }
         }
 
-        let has_crlf = recv_buf.windows(2).any(|w| w == b"\r\n");
-        if !has_crlf && !eof {
+        let Some(v) = check_reply::redis(&recv_buf, eof) else {
             fdtab.clear_ready(raw_fd, true, false);
-            check.sub_state = CheckSubState::RedisRunning {
-                phase,
-                send_offset,
-                recv_buf,
-            };
+            check.sub_state = CheckSubState::RedisRunning { phase, send_offset, recv_buf };
             return Ok(CheckStep::pending(Some(check.exp)));
-        }
-
-        cleanup_check_socket(check, fdtab, poller);
-        // HAProxy's rule: `expect string +PONG error-status L7STS on-error
-        // %[res.payload(0,0),cut_crlf]` (src/tcpcheck.c): anything but a PONG is "Layer7
-        // wrong status", with the reply up to its first CR/LF, non-printables as `<XX>`.
-        // Measured: an LDAP answer gives `info: "0<0C><02><01><01>a<07>"`.
-        let event = if recv_buf.starts_with(b"+PONG") {
-            check.on_success_full(
-                "L7OK",
-                "Layer7 check passed",
-                duration,
-                None,
-                Some("Redis server is ok".to_string()),
-            )
-        } else {
-            check.on_failure_full(
-                "L7STS",
-                "Layer7 wrong status",
-                duration,
-                None,
-                Some(ascii_encode(cut_crlf(&recv_buf))),
-            )
         };
-        let next = check.schedule_next(now);
-        check.next_check = next;
-        return Ok(CheckStep {
-            next: Some(next),
-            event,
-        });
+        return Ok(finish_reply(check, fdtab, poller, now, duration, v));
     }
 
     cleanup_check_socket(check, fdtab, poller);
@@ -2532,10 +2501,7 @@ fn progress_smtp_check(
             return Ok(CheckStep::pending(Some(check.exp)));
         }
 
-        let line = String::from_utf8_lossy(&recv_buf)
-            .trim_end_matches(&['\r', '\n'][..])
-            .to_string();
-        let code_res = line.get(0..3).and_then(|s| s.parse::<u16>().ok());
+        let (code_res, line) = check_reply::smtp_status_line(&recv_buf);
         match code_res {
             Some(code) if (200..300).contains(&code) => {
                 phase = 1;
@@ -2647,38 +2613,8 @@ fn progress_smtp_check(
             }
         }
 
-        let resp_str = String::from_utf8_lossy(&recv_buf);
-        let mut completed = false;
-        let mut last_code = None;
-        let mut last_info = None;
-
-        // T117: judge only lines that are complete. A reply `248\r\n` arriving as `2`,
-        // `4`, `8`, `\r\n` has the shape of a final line ("248", nothing after the code)
-        // as soon as the `8` is in; taking it then sent QUIT early and read the trailing
-        // CRLF as the QUIT answer. HAProxy's expect (`^(2xx-...\r\n)*2xx[ \r]`, no
-        // min-recv) keeps waiting while it cannot decide. At EOF the partial tail counts,
-        // as before.
-        let judged = if eof {
-            &resp_str[..]
-        } else {
-            &resp_str[..resp_str.rfind('\n').map_or(0, |i| i + 1)]
-        };
-        for line in judged.lines() {
-            if line.len() >= 3
-                && line.as_bytes()[0].is_ascii_digit()
-                && line.as_bytes()[1].is_ascii_digit()
-                && line.as_bytes()[2].is_ascii_digit()
-            {
-                let code = line[0..3].parse::<u16>().ok();
-                if line.len() == 3 || line.as_bytes().get(3) == Some(&b' ') {
-                    completed = true;
-                    last_code = code;
-                    last_info = Some(line.get(4..).unwrap_or("").trim().to_string());
-                }
-            }
-        }
-
-        if !completed && !eof {
+        let reply = check_reply::smtp_reply(&recv_buf, eof);
+        let Some((last_code, last_info)) = reply else {
             fdtab.clear_ready(raw_fd, true, false);
             check.sub_state = CheckSubState::SmtpRunning {
                 phase,
@@ -2687,7 +2623,7 @@ fn progress_smtp_check(
                 recv_buf,
             };
             return Ok(CheckStep::pending(Some(check.exp)));
-        }
+        };
 
         match last_code {
             Some(code) if (200..300).contains(&code) => {
@@ -2715,7 +2651,7 @@ fn progress_smtp_check(
             }
             None => {
                 cleanup_check_socket(check, fdtab, poller);
-                let info = resp_str.trim().to_string();
+                let info = String::from_utf8_lossy(&recv_buf).trim().to_string();
                 let event = check.on_failure_full(
                     "L7RSP",
                     "Layer7 invalid response",
@@ -2811,10 +2747,7 @@ fn progress_smtp_check(
         }
 
         cleanup_check_socket(check, fdtab, poller);
-        let line = String::from_utf8_lossy(&recv_buf)
-            .trim_end_matches(&['\r', '\n'][..])
-            .to_string();
-        let code_res = line.get(0..3).and_then(|s| s.parse::<u16>().ok());
+        let (code_res, line) = check_reply::smtp_status_line(&recv_buf);
         let event = match code_res {
             Some(code) if (200..300).contains(&code) => {
                 let info = line.get(4..).unwrap_or("").trim().to_string();
@@ -2861,7 +2794,7 @@ fn progress_smtp_check(
 /// `expect` rules of `ldap-check` and `mysql-check` (src/tcpcheck.c). `None` from a parser
 /// is "wait for more data".
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum ProtoReply {
+pub(crate) enum ProtoReply {
     /// L7OK, code 0.
     Passed(Option<String>),
     /// L7RSP.
@@ -2889,7 +2822,7 @@ const NOT_LDAPV3: &str = "Not LDAPv3 protocol";
 
 /// `option ldap-check`'s reply: `expect rbinary ^30 min-recv 14 on-error "Not LDAPv3
 /// protocol"`, then `tcpcheck_ldap_expect_bindrsp`. `last_read`: no more data is coming.
-fn ldap_bind_reply(buf: &[u8], last_read: bool) -> Option<ProtoReply> {
+pub(crate) fn ldap_bind_reply(buf: &[u8], last_read: bool) -> Option<ProtoReply> {
     if !last_read && buf.len() < 14 {
         return None;
     }
@@ -2944,7 +2877,7 @@ fn ldap_bind_reply(buf: &[u8], last_read: bool) -> Option<ProtoReply> {
 /// `option mysql-check`'s reply (`tcpcheck_mysql_expect_iniths`, then with `user`
 /// `tcpcheck_mysql_expect_ok` on the packet after the greeting). The info on success is the
 /// server version from the greeting; on an error packet, the rest of the data.
-fn mysql_reply(buf: &[u8], last_read: bool, with_user: bool) -> Option<ProtoReply> {
+pub(crate) fn mysql_reply(buf: &[u8], last_read: bool, with_user: bool) -> Option<ProtoReply> {
     if buf.is_empty() {
         // A custom rule is not evaluated on an empty buffer: the generic message, at the
         // step of the first `expect` (after `connect`, and `send` with a user).
@@ -3368,60 +3301,12 @@ fn progress_pgsql_check(
             }
         }
 
-        if recv_buf.len() < 5 && !eof {
+        let Some(v) = check_reply::pgsql(&recv_buf, eof) else {
             fdtab.clear_ready(raw_fd, true, false);
-            check.sub_state = CheckSubState::PgsqlRunning {
-                phase,
-                user,
-                send_offset,
-                req_buf,
-                recv_buf,
-            };
+            check.sub_state = CheckSubState::PgsqlRunning { phase, user, send_offset, req_buf, recv_buf };
             return Ok(CheckStep::pending(Some(check.exp)));
-        }
-
-        cleanup_check_socket(check, fdtab, poller);
-        let event = if recv_buf.first() == Some(&b'R') {
-            check.on_success_full(
-                "L7OK",
-                "Layer7 check passed",
-                duration,
-                None,
-                Some("PostgreSQL server is ok".to_string()),
-            )
-        } else if recv_buf.first() == Some(&b'E') {
-            let info = if recv_buf.len() > 6 {
-                let s_bytes = &recv_buf[6..];
-                let null_pos = s_bytes
-                    .iter()
-                    .position(|&b| b == 0)
-                    .unwrap_or(s_bytes.len());
-                String::from_utf8_lossy(&s_bytes[..null_pos]).to_string()
-            } else {
-                "Error".to_string()
-            };
-            check.on_failure_full(
-                "L7RSP",
-                "Layer7 invalid response",
-                duration,
-                None,
-                Some(info),
-            )
-        } else {
-            check.on_failure_full(
-                "L7STS",
-                "Layer7 wrong status",
-                duration,
-                None,
-                Some("PostgreSQL unknown error".to_string()),
-            )
         };
-        let next = check.schedule_next(now);
-        check.next_check = next;
-        return Ok(CheckStep {
-            next: Some(next),
-            event,
-        });
+        return Ok(finish_reply(check, fdtab, poller, now, duration, v));
     }
 
     cleanup_check_socket(check, fdtab, poller);
@@ -3535,57 +3420,12 @@ fn progress_ssl_hello_check(
             }
         }
 
-        if recv_buf.is_empty() {
-            if !eof {
-                fdtab.clear_ready(raw_fd, true, false);
-                check.sub_state = CheckSubState::SslHelloRunning {
-                    phase,
-                    send_offset,
-                    recv_buf,
-                };
-                return Ok(CheckStep::pending(Some(check.exp)));
-            }
-            cleanup_check_socket(check, fdtab, poller);
-            let event = check.on_failure_full(
-                "L6RSP",
-                "Layer6 invalid response",
-                duration,
-                None,
-                Some("TCPCHK got an empty response at step 2".to_string()),
-            );
-            let next = check.schedule_next(now);
-            check.next_check = next;
-            return Ok(CheckStep {
-                next: Some(next),
-                event,
-            });
-        }
-
-        cleanup_check_socket(check, fdtab, poller);
-        let first_byte = recv_buf[0];
-        let event = if first_byte == 0x15 || first_byte == 0x16 {
-            check.on_success_full(
-                "L6OK",
-                "Layer6 check passed",
-                duration,
-                None,
-                None,
-            )
-        } else {
-            check.on_failure_full(
-                "L6RSP",
-                "Layer6 invalid response",
-                duration,
-                None,
-                None,
-            )
+        let Some(v) = check_reply::ssl_hello(&recv_buf, eof) else {
+            fdtab.clear_ready(raw_fd, true, false);
+            check.sub_state = CheckSubState::SslHelloRunning { phase, send_offset, recv_buf };
+            return Ok(CheckStep::pending(Some(check.exp)));
         };
-        let next = check.schedule_next(now);
-        check.next_check = next;
-        return Ok(CheckStep {
-            next: Some(next),
-            event,
-        });
+        return Ok(finish_reply(check, fdtab, poller, now, duration, v));
     }
 
     cleanup_check_socket(check, fdtab, poller);
