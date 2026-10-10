@@ -101,6 +101,24 @@ fn non_tls_error(head: &[u8]) -> String {
     }
 }
 
+/// What OpenSSL says, and sends, for a handshake that rustls refused (measured on `HAProxy`
+/// 3.5-dev8). `first` is the first byte the client sent. Returns the error text and the alert
+/// description OpenSSL puts on the wire (`None`: it sends nothing). Errors with no OpenSSL
+/// equivalent mapped here keep rustls's own words (`error:0A000000`) and rustls's alert.
+fn openssl_error(e: &rustls::Error, first: Option<u8>) -> Option<(&'static str, Option<u8>)> {
+    use rustls::{Error, InvalidMessage, PeerIncompatible};
+    match e {
+        Error::PeerIncompatible(PeerIncompatible::NoCipherSuitesInCommon) => Some(("error:0A0000C1:SSL routines::no shared cipher", Some(40))),
+        Error::InappropriateMessage { .. } | Error::InappropriateHandshakeMessage { .. } | Error::InvalidMessage(InvalidMessage::HandshakePayloadTooLarge) => {
+            Some(("error:0A0000F4:SSL routines::unexpected message", Some(10)))
+        }
+        // The client's first record is an alert: the handshake wanted a ClientHello.
+        Error::AlertReceived(_) if first == Some(0x15) => Some(("error:0A0000F4:SSL routines::unexpected message", Some(10))),
+        Error::InvalidMessage(InvalidMessage::UnknownProtocolVersion) => Some(("error:0A00010B:SSL routines::wrong version number", None)),
+        _ => None,
+    }
+}
+
 /// The first byte of a TLS record is its content type, 20 to 23.
 fn looks_like_tls(head: &[u8]) -> bool {
     head.first().is_some_and(|b| (0x14..=0x17).contains(b))
@@ -139,6 +157,8 @@ pub struct TlsConn {
     fail: Option<HsFail>,
     /// The first bytes the client sent.
     head: Vec<u8>,
+    /// OpenSSL's text for the error rustls refused the handshake with, when it has one.
+    ossl_text: Option<&'static str>,
     /// Bytes that go on the wire in plaintext before the ClientHello: a PROXY protocol
     /// header to a `send-proxy` server, which `HAProxy` writes from its `xprt_handshake`
     /// layer under `ssl_sock`, and which the peer's `accept-proxy` reads before its own
@@ -162,6 +182,7 @@ impl TlsConn {
             failed: false,
             fail: None,
             head: Vec::new(),
+            ossl_text: None,
             prefix: Vec::new(),
             prefix_sent: 0,
             sock_drained: false,
@@ -319,10 +340,20 @@ impl TlsConn {
                     }
                 }
                 Err(e) => {
-                    // A rustls error carries an alert that the peer is owed. Flush it
-                    // before the socket goes away, then report.
-                    // Not to a stranger's bytes: OpenSSL sends nothing to those either.
-                    if looks_like_tls(&self.head) || self.ctx.handshake_done {
+                    // The bytes of this read are not in `head` yet.
+                    let first = self.head.first().or_else(|| sock.2.first()).copied();
+                    let tls = first.is_some_and(|b| (0x14..=0x17).contains(&b));
+                    let mapped = if tls && !self.ctx.handshake_done { openssl_error(&e, first) } else { None };
+                    if let Some((text, alert)) = mapped {
+                        // OpenSSL's alert, not rustls's: send it before the socket goes away.
+                        self.ossl_text = Some(text);
+                        if let Some(a) = alert {
+                            let _ = raw::send(fd, &[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, a]);
+                        }
+                    } else if tls || self.ctx.handshake_done {
+                        // A rustls error carries an alert that the peer is owed. Flush it
+                        // before the socket goes away, then report. Not to a stranger's
+                        // bytes: OpenSSL sends nothing to those either.
                         let _ = self.flush(fd);
                     }
                     return Err(io::Error::new(io::ErrorKind::InvalidData, e));
@@ -348,6 +379,8 @@ impl TlsConn {
             self.failed = true;
             self.fail = Some(if e.kind() == io::ErrorKind::UnexpectedEof {
                 if self.head.is_empty() { HsFail::Empty } else { HsFail::Abort }
+            } else if let Some(text) = self.ossl_text {
+                HsFail::Error(text.to_string())
             } else if looks_like_tls(&self.head) {
                 HsFail::Error(format!("error:0A000000:SSL routines::{e}"))
             } else {

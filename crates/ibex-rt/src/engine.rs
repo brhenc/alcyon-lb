@@ -1064,6 +1064,17 @@ impl RateCtr {
         self.head.store((u64::from(start_new) << 32) | u64::from(cur.saturating_add(1)), Ordering::Relaxed);
     }
 
+    /// Takes back one event just counted, for a session that turned out not to be one
+    /// (a client whose TLS handshake failed: `HAProxy` creates the session after it).
+    pub fn untick(&self) {
+        let head = self.head.load(Ordering::Relaxed);
+        if head as u32 > 0 {
+            self.head.store(head - 1, Ordering::Relaxed);
+        } else {
+            let _ = self.prev.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |p| p.checked_sub(1));
+        }
+    }
+
     /// The events over the last second.
     #[must_use]
     pub fn rate(&self) -> u64 {
@@ -1093,6 +1104,9 @@ impl RateCtr {
 pub struct ProxyStats {
     /// Sessions accepted by the frontend per second (`fe_sess_rate`).
     pub fe_sess_rate: RateCtr,
+    /// Connections accepted by the frontend per second (`conn_rate`): the sessions, and the
+    /// connections whose TLS handshake failed before there was one.
+    pub fe_conn_rate: RateCtr,
     /// HTTP requests received by the frontend per second (`fe_req_rate`).
     pub fe_req_rate: RateCtr,
     /// Streams switched to the backend per second (`be_sess_rate`).
@@ -1136,6 +1150,7 @@ impl ProxyStats {
 
     pub fn clear(&self) {
         self.cum_conn.store(0, Ordering::Relaxed);
+        self.ssl_failed_hs.store(0, Ordering::Relaxed);
         let act = self.act_conn.load(Ordering::Relaxed);
         self.max_conn.store(act, Ordering::Relaxed);
         self.queue_max.store(self.queue_cur.load(Ordering::Relaxed), Ordering::Relaxed);
@@ -4715,6 +4730,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             let proxy = &self.proxies[proxy_idx];
             proxy.counters().cum_conn.fetch_add(1, Ordering::Relaxed);
             proxy.counters().fe_sess_rate.tick();
+            proxy.counters().fe_conn_rate.tick();
             let rate = proxy.counters().fe_sess_rate.rate();
             proxy.txn_counters().fe.rate_max.fetch_max(u32::try_from(rate).unwrap_or(u32::MAX), Ordering::Relaxed);
             proxy.counters().act_conn.fetch_add(1, Ordering::Relaxed);
@@ -8226,7 +8242,11 @@ impl EngineDispatcher<'_> {
                 if embryonic_failure(&e.sess).is_some() {
                     e.log_line = None;
                     if e.sess.hs_fail.is_some() {
-                        self.proxies[e.proxy_idx].counters().ssl_failed_hs.fetch_add(1, Ordering::Relaxed);
+                        // `HAProxy` builds the session after the handshake: this connection
+                        // is a `conn_tot` and a `ssl_failed_handshake`, not an `stot` or a `rate`.
+                        let c = self.proxies[e.proxy_idx].counters();
+                        c.ssl_failed_hs.fetch_add(1, Ordering::Relaxed);
+                        c.fe_sess_rate.untick();
                     }
                     // `session_kill_embryonic`: `err` with `log-separate-errors`, else `info`.
                     let err = self.proxies[e.proxy_idx].log_opts & ibex_config::LOG_OPT_SEPARATE_ERRORS != 0;
