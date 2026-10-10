@@ -62,6 +62,10 @@ fn repeated_headers_leave_the_same_room_as_haproxy() {
 
 /// A server answering with `repeated` `name` headers and an `X-a` header of `n` bytes.
 fn response_status(name: &'static str, repeated: usize, n: usize) -> String {
+    response_status_with(name, repeated, n, "tune.maxrewrite 0")
+}
+
+fn response_status_with(name: &'static str, repeated: usize, n: usize, tune: &str) -> String {
     let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let srv = l.local_addr().expect("addr");
     std::thread::spawn(move || {
@@ -76,7 +80,7 @@ fn response_status(name: &'static str, repeated: usize, n: usize) -> String {
     let mut f = tempfile::NamedTempFile::new().expect("tmp");
     write!(
         f,
-        "global\n  tune.maxrewrite 0\ndefaults\n  mode http\n  timeout client 5s\n  timeout connect 1s\n  timeout server 2s\n\
+        "global\n  {tune}\ndefaults\n  mode http\n  timeout client 5s\n  timeout connect 1s\n  timeout server 2s\n\
          frontend f\n  bind {fe}\n  default_backend b\nbackend b\n  server s {srv}\n"
     )
     .expect("cfg");
@@ -109,6 +113,24 @@ fn response_head_limit_is_haproxys() {
             response_status(name, repeated, largest + 1),
             "HTTP/1.1 502 Bad Gateway",
             "{repeated} x {name}, {} bytes",
+            largest + 1
+        );
+    }
+}
+
+/// With the default `tune.maxrewrite` (T272 D1): measured on `HAProxy 3.5-dev8-885761-29`,
+/// one fresh connection per case, the limit is not erratic. It is a clean step, the same
+/// whether the server sends the head in one segment or several, and over keep-alive
+/// connections: `Forwarded` repeated 0/1/2 times, `X-a` of 15236/15207/15178 bytes is the
+/// largest answered and one more is a 502 (29 bytes less per repeated header).
+#[test]
+fn response_head_limit_with_default_maxrewrite() {
+    for (repeated, largest) in [(0, 15236), (1, 15207), (2, 15178)] {
+        assert_eq!(response_status_with("Forwarded", repeated, largest, "tune.bufsize 16384"), "HTTP/1.1 200 OK", "{repeated} x Forwarded, {largest}");
+        assert_eq!(
+            response_status_with("Forwarded", repeated, largest + 1, "tune.bufsize 16384"),
+            "HTTP/1.1 502 Bad Gateway",
+            "{repeated} x Forwarded, {}",
             largest + 1
         );
     }
