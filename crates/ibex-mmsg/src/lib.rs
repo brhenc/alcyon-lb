@@ -72,6 +72,17 @@ fn parse_sockaddr(storage: &libc::sockaddr_storage, len: usize) -> Option<Socket
     }
 }
 
+/// The part of `buf` a control message can be written to: `cmsghdr` is read through a
+/// pointer, which needs the alignment of the type, and a `&mut [u8]` has none.
+#[doc(hidden)]
+pub fn align_cmsg(buf: &mut [u8]) -> &mut [u8] {
+    let skip = buf.as_ptr().align_offset(std::mem::align_of::<libc::cmsghdr>());
+    if skip > buf.len() {
+        return &mut [];
+    }
+    &mut buf[skip..]
+}
+
 fn extract_dst_addr(hdr: &libc::msghdr) -> Option<IpAddr> {
     if hdr.msg_control.is_null() || hdr.msg_controllen == 0 {
         return None;
@@ -141,9 +152,10 @@ pub fn recvmmsg(fd: BorrowedFd<'_>, msgs: &mut [RecvMsg]) -> io::Result<usize> {
         msg.msg_hdr.msg_iov = iov;
         msg.msg_hdr.msg_iovlen = 1;
 
-        if !msgs[i].cmsg_buf.is_empty() {
-            msg.msg_hdr.msg_control = msgs[i].cmsg_buf.as_mut_ptr().cast::<libc::c_void>();
-            msg.msg_hdr.msg_controllen = msgs[i].cmsg_buf.len() as libc::size_t;
+        let cmsg_buf = align_cmsg(msgs[i].cmsg_buf);
+        if !cmsg_buf.is_empty() {
+            msg.msg_hdr.msg_control = cmsg_buf.as_mut_ptr().cast::<libc::c_void>();
+            msg.msg_hdr.msg_controllen = cmsg_buf.len() as libc::size_t;
         }
     }
 
