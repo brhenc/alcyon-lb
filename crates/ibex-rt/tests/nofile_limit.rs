@@ -224,7 +224,7 @@ fn a_maxconn_the_hard_limit_cannot_hold_is_refused_unless_no_strict_limits() {
         return;
     }
     let fe = common::reserve_addr();
-    let (global, sock) = stats_global("strict", fe, "  maxconn 2000\n");
+    let (global, sock) = stats_global("strict", fe, "  maxconn 2000\n  strict-limits\n");
     let mut ibex = spawn_with("strict", "1024:1024", &global, fe, Stdio::piped());
     let end = Instant::now() + Duration::from_secs(10);
     let status = loop {
