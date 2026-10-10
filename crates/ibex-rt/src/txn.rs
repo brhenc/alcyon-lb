@@ -55,17 +55,28 @@ pub enum Body {
 /// Position inside a chunked body.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Chunk {
+    /// In the chunk size, `digits` hex digits of it read so far.
     Size { size: u64, digits: u8 },
-    /// In a chunk extension, `len` bytes of it so far.
-    Ext { size: u64, len: u16 },
+    /// Blanks after the size.
+    SizeWs { size: u64 },
+    /// In a chunk extension, `len` bytes of it so far; inside a quoted string, and just
+    /// after a backslash in one.
+    Ext { size: u64, len: u16, quote: bool, escape: bool },
     SizeLf { size: u64 },
     Data(u64),
     DataCr,
     DataLf,
-    /// In the trailer section; `empty` while the current line has no bytes yet. `len` is
-    /// the section's bytes so far, `fields` its complete lines.
-    Trailer { empty: bool, len: u16, fields: u8 },
-    TrailerLf { empty: bool, len: u16, fields: u8 },
+    /// At the start of a line of the trailer section, `fields` complete fields and `len`
+    /// bytes of it so far.
+    Trailer { len: u16, fields: u8 },
+    /// In a trailer field's name, `pos` bytes of it; `forbidden` the names of
+    /// [`FORBIDDEN_TRAILERS`] it may still be.
+    TrailerName { len: u16, fields: u8, pos: u8, forbidden: u8 },
+    TrailerValue { len: u16, fields: u8 },
+    /// A CR ended a trailer field's value.
+    TrailerValueLf { len: u16, fields: u8 },
+    /// A CR began the blank line that ends the trailer section.
+    TrailerEndLf,
 }
 
 const CHUNK_START: Chunk = Chunk::Size { size: 0, digits: 0 };
@@ -82,15 +93,48 @@ const MAX_CHUNK_LINE: u16 = 16 * 1024;
 /// `HAProxy` 3.5-dev8 relays 100 and answers 502 to 101.
 const MAX_TRAILER_FIELDS: u8 = 100;
 
+/// The fields that frame or route a message, which `HAProxy` refuses in a trailer section
+/// (`http_trailers_to_htx`, src/http_htx.c). At most 8, one bit each.
+const FORBIDDEN_TRAILERS: [&[u8]; 8] =
+    [b"host", b"content-length", b"connection", b"proxy-connection", b"keep-alive", b"upgrade", b"te", b"transfer-encoding"];
+
+/// A chunk size of 2^52 or more: `HAProxy`'s `h1_parse_chunk_size` refuses it, so that a
+/// peer reading sizes as floating-point numbers is never fed one it rounds.
+const CHUNK_SIZE_LIMIT: u64 = 1 << 52;
+
+/// A token character (RFC 9110 section 5.6.2), as a field name is made of.
+fn is_tchar(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
+}
+
 impl Chunk {
+    /// Whether forwarding may stop here: the start of a line, or inside chunk data. A
+    /// chunk-size line or a trailer field is forwarded only once it is complete, as
+    /// `HAProxy` parses each only once it is all in its buffer.
+    fn at_boundary(self) -> bool {
+        matches!(self, Chunk::Size { digits: 0, .. } | Chunk::Data(_) | Chunk::DataCr | Chunk::Trailer { .. })
+    }
+
     /// Scans `data`; returns how many bytes belong to the body and the state after them:
     /// `Ok(Some(_))` wants more, `Ok(None)` is the end of the message, `Err` is a framing
     /// violation (the bytes counted are the valid ones before it).
     ///
+    /// With `whole_lines`, the bytes counted stop at the last line boundary
+    /// ([`Self::at_boundary`]) and the state is the one there: the rest is scanned again
+    /// when more has arrived. A violation counts only up to the boundary before it.
+    ///
+    /// The syntax is `HAProxy`'s (`h1_parse_chunk_size`, and the header parser for the
+    /// trailer section): the size 1 or more hex digits, below 2^52, then blanks, then an
+    /// extension of non-control characters with balanced quotes, ended by CRLF; data then
+    /// CRLF; trailer fields with a token name, a colon and no NUL or lone CR in the value,
+    /// none of [`FORBIDDEN_TRAILERS`], each line ended by CRLF or LF (tasks/T276, V&V VV-2).
+    ///
     /// `pay` gains what `HAProxy` counts of the body in its HTX message: the data bytes, and
     /// one more for the end of the message (`HTX_BLK_EOT`).
-    fn scan(mut self, data: &[u8], pay: &mut u64) -> (usize, Result<Option<Chunk>, ()>) {
+    #[allow(clippy::too_many_lines)]
+    fn scan(mut self, data: &[u8], pay: &mut u64, whole_lines: bool) -> (usize, Result<Option<Chunk>, ()>) {
         let mut i = 0;
+        let mut commit = (0, self, *pay);
         while i < data.len() {
             if let Chunk::Data(n) = self {
                 let take = usize::try_from(n).unwrap_or(usize::MAX).min(data.len() - i);
@@ -98,81 +142,140 @@ impl Chunk {
                 i += take;
                 let left = n - take as u64;
                 self = if left == 0 { Chunk::DataCr } else { Chunk::Data(left) };
+                commit = (i, self, *pay);
                 continue;
             }
             let b = data[i];
             i += 1;
-            let end_of_size = |size: u64, digits: u8| -> Result<Chunk, ()> {
-                match (digits, size) {
-                    (0, _) => Err(()),
-                    (_, 0) => Ok(Chunk::Trailer { empty: true, len: 0, fields: 0 }),
-                    (_, n) => Ok(Chunk::Data(n)),
-                }
-            };
+            let end_of_size = |size: u64| if size == 0 { Chunk::Trailer { len: 0, fields: 0 } } else { Chunk::Data(size) };
             let next = match self {
                 Chunk::Size { size, digits } => match b {
                     b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F' => {
-                        // 16 hex digits fill a u64; one more is an overflow, not a size.
-                        if digits >= 16 {
+                        let size = (size << 4) | u64::from(char::from(b).to_digit(16).unwrap_or(0));
+                        if size >= CHUNK_SIZE_LIMIT {
                             Err(())
                         } else {
-                            let d = u64::from(char::from(b).to_digit(16).unwrap_or(0));
-                            Ok(Chunk::Size { size: (size << 4) | d, digits: digits + 1 })
+                            Ok(Chunk::Size { size, digits: digits.saturating_add(1) })
                         }
                     }
-                    b';' | b' ' | b'\t' if digits > 0 => Ok(Chunk::Ext { size, len: 1 }),
-                    b'\r' if digits > 0 => Ok(Chunk::SizeLf { size }),
-                    b'\n' => end_of_size(size, digits),
+                    _ if digits == 0 => Err(()),
+                    b' ' | b'\t' => Ok(Chunk::SizeWs { size }),
+                    b';' => Ok(Chunk::Ext { size, len: 1, quote: false, escape: false }),
+                    b'\r' => Ok(Chunk::SizeLf { size }),
                     _ => Err(()),
                 },
-                Chunk::Ext { size, len } => match b {
+                Chunk::SizeWs { size } => match b {
+                    b' ' | b'\t' => Ok(Chunk::SizeWs { size }),
+                    b';' => Ok(Chunk::Ext { size, len: 1, quote: false, escape: false }),
                     b'\r' => Ok(Chunk::SizeLf { size }),
-                    b'\n' => end_of_size(size, 1),
-                    _ if len >= MAX_CHUNK_LINE => Err(()),
-                    _ => Ok(Chunk::Ext { size, len: len + 1 }),
+                    _ => Err(()),
+                },
+                Chunk::Ext { len, .. } if len >= MAX_CHUNK_LINE => Err(()),
+                Chunk::Ext { size, len, quote, escape } => match b {
+                    // A control character ends the extension: it must be the CR of its
+                    // CRLF, outside any quoted string.
+                    b'\r' if !quote && !escape => Ok(Chunk::SizeLf { size }),
+                    _ if (b < 0x20 && b != b'\t') || b == 0x7f => Err(()),
+                    _ if escape => Ok(Chunk::Ext { size, len: len + 1, quote, escape: false }),
+                    b'\\' if quote => Ok(Chunk::Ext { size, len: len + 1, quote, escape: true }),
+                    b'\\' => Err(()),
+                    b'"' => Ok(Chunk::Ext { size, len: len + 1, quote: !quote, escape: false }),
+                    _ => Ok(Chunk::Ext { size, len: len + 1, quote, escape }),
                 },
                 Chunk::SizeLf { size } => match b {
-                    b'\n' => end_of_size(size, 1),
+                    b'\n' => Ok(end_of_size(size)),
                     _ => Err(()),
                 },
                 Chunk::DataCr => match b {
                     b'\r' => Ok(Chunk::DataLf),
-                    b'\n' => Ok(CHUNK_START),
                     _ => Err(()),
                 },
                 Chunk::DataLf => match b {
                     b'\n' => Ok(CHUNK_START),
                     _ => Err(()),
                 },
-                // A trailer section past its cap, or one field more than allowed, is a
-                // violation like a broken framing.
-                Chunk::Trailer { len, .. } | Chunk::TrailerLf { len, .. } if len >= MAX_CHUNK_LINE => Err(()),
-                Chunk::Trailer { empty: true, fields, .. } if fields >= MAX_TRAILER_FIELDS && b != b'\r' && b != b'\n' => Err(()),
-                Chunk::Trailer { empty, len, fields } => match b {
-                    b'\r' => Ok(Chunk::TrailerLf { empty, len: len + 1, fields }),
-                    b'\n' if empty => {
+                Chunk::Trailer { len, .. }
+                | Chunk::TrailerName { len, .. }
+                | Chunk::TrailerValue { len, .. }
+                | Chunk::TrailerValueLf { len, .. }
+                    if len >= MAX_CHUNK_LINE =>
+                {
+                    Err(())
+                }
+                Chunk::Trailer { len, fields } => match b {
+                    b'\r' => Ok(Chunk::TrailerEndLf),
+                    b'\n' => {
                         *pay += 1;
                         return (i, Ok(None));
                     }
-                    b'\n' => Ok(Chunk::Trailer { empty: true, len: len + 1, fields: fields + 1 }),
-                    _ => Ok(Chunk::Trailer { empty: false, len: len + 1, fields }),
+                    // An obs-fold continues the field before it.
+                    b' ' | b'\t' if fields > 0 => Ok(Chunk::TrailerValue { len: len + 1, fields: fields - 1 }),
+                    _ if fields >= MAX_TRAILER_FIELDS => Err(()),
+                    _ if is_tchar(b) => Ok(Chunk::TrailerName { len: len + 1, fields, pos: 0, forbidden: 0xff }.name_byte(b)),
+                    _ => Err(()),
                 },
-                Chunk::TrailerLf { empty, len, fields } => match b {
-                    b'\n' if empty => {
+                Chunk::TrailerName { len, fields, pos, forbidden } => match b {
+                    b':' => {
+                        let exact = FORBIDDEN_TRAILERS.iter().enumerate().any(|(k, n)| forbidden & (1 << k) != 0 && n.len() == usize::from(pos));
+                        if exact {
+                            Err(())
+                        } else {
+                            Ok(Chunk::TrailerValue { len: len + 1, fields })
+                        }
+                    }
+                    _ if is_tchar(b) => Ok(Chunk::TrailerName { len: len + 1, fields, pos, forbidden }.name_byte(b)),
+                    _ => Err(()),
+                },
+                Chunk::TrailerValue { len, fields } => match b {
+                    b'\r' => Ok(Chunk::TrailerValueLf { len: len + 1, fields }),
+                    b'\n' => Ok(Chunk::Trailer { len: len + 1, fields: fields + 1 }),
+                    0 => Err(()),
+                    _ => Ok(Chunk::TrailerValue { len: len + 1, fields }),
+                },
+                Chunk::TrailerValueLf { len, fields } => match b {
+                    b'\n' => Ok(Chunk::Trailer { len: len + 1, fields: fields + 1 }),
+                    _ => Err(()),
+                },
+                Chunk::TrailerEndLf => match b {
+                    b'\n' => {
                         *pay += 1;
                         return (i, Ok(None));
                     }
-                    b'\n' => Ok(Chunk::Trailer { empty: true, len: len + 1, fields: fields + 1 }),
                     _ => Err(()),
                 },
                 Chunk::Data(_) => unreachable!("handled above"),
             };
             match next {
-                Ok(c) => self = c,
+                Ok(c) => {
+                    self = c;
+                    if c.at_boundary() {
+                        commit = (i, c, *pay);
+                    }
+                }
+                Err(()) if whole_lines => {
+                    *pay = commit.2;
+                    return (commit.0, Err(()));
+                }
                 Err(()) => return (i - 1, Err(())),
             }
         }
+        if whole_lines {
+            *pay = commit.2;
+            return (commit.0, Ok(Some(commit.1)));
+        }
         (i, Ok(Some(self)))
+    }
+
+    /// A trailer name that has just gained `b`: the forbidden names it may still be.
+    fn name_byte(self, b: u8) -> Chunk {
+        let Chunk::TrailerName { len, fields, pos, mut forbidden } = self else { return self };
+        let lower = b.to_ascii_lowercase();
+        for (k, n) in FORBIDDEN_TRAILERS.iter().enumerate() {
+            if n.get(usize::from(pos)) != Some(&lower) {
+                forbidden &= !(1 << k);
+            }
+        }
+        Chunk::TrailerName { len, fields, pos: pos.saturating_add(1), forbidden }
     }
 }
 
@@ -237,7 +340,7 @@ impl MsgState {
                     *self = MsgState::Done;
                 }
                 MsgState::Body(Body::Chunked(c)) => {
-                    let (n, next) = c.scan(&data[used..], pay);
+                    let (n, next) = c.scan(&data[used..], pay, true);
                     used += n;
                     *self = match next {
                         Ok(Some(c)) => MsgState::Body(Body::Chunked(c)),
@@ -286,7 +389,7 @@ impl MsgState {
                         c = if left == 0 { Chunk::DataCr } else { Chunk::Data(left) };
                         continue;
                     }
-                    let (n, next) = c.scan(&data[i..=i], &mut 0);
+                    let (n, next) = c.scan(&data[i..=i], &mut 0, false);
                     i += n;
                     match next {
                         Ok(Some(next)) => c = next,
@@ -341,6 +444,40 @@ impl MsgState {
     #[must_use]
     pub fn is_done(&self) -> bool {
         *self == MsgState::Done
+    }
+
+    /// Where in `data` -- which starts at this message's current position -- the first
+    /// trailer line ended by a lone LF is, if any. `HAProxy` accepts such a line and
+    /// forwards it ended by CRLF; the proxy rewrites it before forwarding, so the next hop
+    /// is never handed line ends it may read otherwise (tasks/T276).
+    #[must_use]
+    pub fn trailer_bare_lf(&self, data: &[u8]) -> Option<usize> {
+        let mut i = 0;
+        let mut c = match *self {
+            MsgState::Head { left, body: Framing::Chunked } => {
+                i = if left == 0 { find_eoh(data).map(|(h, e)| h + e)? } else { left };
+                CHUNK_START
+            }
+            MsgState::Body(Body::Chunked(c)) => c,
+            _ => return None,
+        };
+        while i < data.len() {
+            if let Chunk::Data(n) = c {
+                let take = usize::try_from(n).unwrap_or(usize::MAX).min(data.len() - i);
+                i += take;
+                c = if take as u64 == n { Chunk::DataCr } else { Chunk::Data(n - take as u64) };
+                continue;
+            }
+            if data[i] == b'\n' && matches!(c, Chunk::Trailer { .. } | Chunk::TrailerValue { .. }) {
+                return Some(i);
+            }
+            match c.scan(&data[i..=i], &mut 0, false) {
+                (1, Ok(Some(next))) => c = next,
+                _ => return None,
+            }
+            i += 1;
+        }
+        None
     }
 }
 
@@ -399,29 +536,72 @@ pub fn read_body(framing: Framing, data: &[u8], out: &mut Vec<u8>) -> BodyProgre
     }
 }
 
-/// Header value of `name` in a raw head, the first occurrence.
-fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
-    head.split('\n').skip(1).find_map(|l| {
-        let (k, v) = l.split_once(':')?;
-        k.trim().eq_ignore_ascii_case(name).then(|| v.trim())
-    })
+/// The header fields of a raw head, in order, an obs-fold continuation line joined to the
+/// field it continues.
+fn fields(head: &str) -> Vec<(&str, String)> {
+    let mut out: Vec<(&str, String)> = Vec::new();
+    for l in head.split('\n').skip(1) {
+        let l = l.strip_suffix('\r').unwrap_or(l);
+        if l.starts_with([' ', '\t']) {
+            if let Some((_, v)) = out.last_mut() {
+                v.push(' ');
+                v.push_str(l.trim());
+            }
+        } else if let Some((k, v)) = l.split_once(':') {
+            out.push((k.trim(), v.trim().to_string()));
+        }
+    }
+    out
 }
 
-fn chunked(head: &str) -> bool {
-    header(head, "transfer-encoding")
-        .is_some_and(|v| v.rsplit(',').next().is_some_and(|last| last.trim().eq_ignore_ascii_case("chunked")))
+/// The body length every `Content-Length` line of a head gives, read as `HAProxy`'s
+/// `http_parse_cont_len_header` reads it: each line a comma-separated list of decimal
+/// values, all equal. `None` without one, or when they do not agree on one value (a head
+/// the parser refuses).
+fn content_length(fields: &[(&str, String)]) -> Option<u64> {
+    let mut len = None;
+    for (_, v) in fields.iter().filter(|(k, _)| k.eq_ignore_ascii_case("content-length")) {
+        if v.ends_with(',') {
+            return None;
+        }
+        for word in v.split(',').map(|w| w.trim_matches([' ', '\t'])) {
+            if word.is_empty() || !word.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let n = word.parse::<u64>().ok()?;
+            if len.is_some_and(|l| l != n) {
+                return None;
+            }
+            len = Some(n);
+        }
+    }
+    len
+}
+
+/// The `Transfer-Encoding` lines of a head, all of them, as one list.
+fn codings(fields: &[(&str, String)], is_response: bool) -> ibex_proto::h1::TransferCodings {
+    ibex_proto::h1::TransferCodings::of(fields.iter().map(|(k, v)| (*k, v.as_str())), is_response)
 }
 
 /// How a request body is framed, from its head. A request without a length has no body
 /// (RFC 9112 section 6.3, rule 7). `Transfer-Encoding` wins over `Content-Length`; the
 /// proxy removes the `Content-Length` of such a request before this is asked.
+///
+/// Every `Transfer-Encoding` and `Content-Length` line counts, as for the next hop: the
+/// first one alone framed `gzip` and `chunked` on two lines as a request without a body,
+/// and its body as the client's next request (tasks/T276, V&V VV-1). A head whose lines
+/// disagree is refused by the parser before this is asked.
 #[must_use]
 pub fn request_framing(head: &[u8]) -> Framing {
     let head = String::from_utf8_lossy(head);
-    if chunked(&head) {
+    let fields = fields(&head);
+    let te = codings(&fields, false);
+    if te.present {
+        // Without a final `chunked` the request has no length and is refused (400);
+        // were it to get here, chunked is the reading that forwards nothing unframed.
         return Framing::Chunked;
     }
-    match header(&head, "content-length").and_then(|v| v.parse::<u64>().ok()) {
+    match content_length(&fields) {
         Some(0) | None => Framing::None,
         Some(n) => Framing::Length(n),
     }
@@ -437,10 +617,12 @@ pub fn response_framing(head: &str, req_method: Option<&str>, status: u16) -> Fr
     if is("HEAD") || (100..200).contains(&status) || status == 204 || status == 304 {
         return Framing::None;
     }
-    if header(head, "transfer-encoding").is_some() {
-        return if chunked(head) { Framing::Chunked } else { Framing::UntilClose };
+    let fields = fields(head);
+    let te = codings(&fields, true);
+    if te.present {
+        return if te.chunked_last { Framing::Chunked } else { Framing::UntilClose };
     }
-    match header(head, "content-length").and_then(|v| v.parse::<u64>().ok()) {
+    match content_length(&fields) {
         Some(n) => Framing::Length(n),
         None => Framing::UntilClose,
     }
@@ -1013,14 +1195,26 @@ mod tests {
 
     #[test]
     fn a_chunked_body_one_byte_at_a_time() {
+        // As the proxy feeds it: what has arrived and not been forwarded, one byte more
+        // each time. A chunk-size line moves only once it is complete (T276).
         let body = b"H\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
         let mut s = MsgState::head(Framing::Chunked);
-        assert_eq!(s.advance(body.as_slice().split_at(5).0), 5);
-        for (i, b) in body[5..].iter().enumerate() {
-            assert!(!s.is_done(), "done early at byte {i}");
-            assert_eq!(s.advance(std::slice::from_ref(b)), 1);
+        let mut at = 0;
+        for end in 1..=body.len() {
+            assert!(!s.is_done(), "done early at byte {end}");
+            at += s.advance(&body[at..end]);
         }
         assert!(s.is_done());
+        assert_eq!(at, body.len());
+    }
+
+    #[test]
+    fn a_chunk_size_line_moves_only_once_complete() {
+        let mut s = MsgState::head(Framing::Chunked);
+        assert_eq!(s.advance(b"H\r\n\r\n5;ext"), 5);
+        assert_eq!(s.advance(b"5;ext\r"), 0);
+        assert_eq!(s.advance(b"5;ext\r\nhel"), 10);
+        assert_eq!(s, MsgState::Body(Body::Chunked(Chunk::Data(2))));
     }
 
     #[test]
@@ -1032,17 +1226,61 @@ mod tests {
     }
 
     #[test]
-    fn bare_lf_chunk_framing_is_accepted() {
-        // Sizes, data ends and the last line ended by LF alone; an extension ended by LF; a
-        // trailer line ended by LF before the blank one.
-        for body in [
-            &b"H\r\n\r\n5\nhello\n0\n\nNEXT"[..],
-            b"H\r\n\r\n5;x\nhello\r\n0\r\n\r\nNEXT",
-            b"H\r\n\r\n0\r\nX: y\n\nNEXT",
-        ] {
+    fn bare_lf_is_refused_but_in_the_trailer_section() {
+        // HAProxy 3.5-dev8 answers 400 to a size line, an extension or a chunk's data ended
+        // by LF alone, and accepts a trailer line and the blank line after the trailers
+        // ended so (T276, V&V VV-2).
+        for bad in [&b"H\r\n\r\n5\nhello\r\n0\r\n\r\n"[..], b"H\r\n\r\n5;x\nhello\r\n0\r\n\r\n", b"H\r\n\r\n5\r\nhello\n0\r\n\r\n", b"H\r\n\r\n0\n\n"] {
+            let (_, s) = fwd(MsgState::head(Framing::Chunked), bad);
+            assert_eq!(s, MsgState::Error, "{:?}", String::from_utf8_lossy(bad));
+        }
+        for body in [&b"H\r\n\r\n0\r\nX: y\n\nNEXT"[..], b"H\r\n\r\n0\r\n\nNEXT"] {
             let (n, s) = fwd(MsgState::head(Framing::Chunked), body);
             assert_eq!((&body[n..], s), (&b"NEXT"[..], MsgState::Done), "{:?}", String::from_utf8_lossy(body));
         }
+    }
+
+    #[test]
+    fn chunk_syntax_is_haproxys() {
+        let ok: [&[u8]; 6] = [b"0005\r\nhello\r\n0\r\n\r\n", b"5 \t;a=\"b \\\" c\";d\r\nhello\r\n0\r\n\r\n", b"fffffffffffff\r\n", b"0\r\nX-T: 1\r\n  more\r\n\r\n", b"0\r\nHosts: y\r\n\r\n", b"0\r\nTE-x: y\r\n\r\n"];
+        for body in ok {
+            let data = [&b"H\r\n\r\n"[..], body].concat();
+            let (_, s) = fwd(MsgState::head(Framing::Chunked), &data);
+            assert_ne!(s, MsgState::Error, "{:?}", String::from_utf8_lossy(body));
+        }
+        let bad: [&[u8]; 14] = [
+            b"10000000000000\r\n", b"+5\r\n", b"0x5\r\n", b"5 x\r\n", b"5;a\x01\r\n", b"5;\"a\r\n", b"5;a\\b\r\n",
+            b"5\r\nhelloX", b"0\r\nbogus\r\n\r\n", b"0\r\n: v\r\n\r\n", b"0\r\nX T: 1\r\n\r\n",
+            b"0\r\ncontent-LENGTH: 1\r\n\r\n", b"0\r\nTE: x\r\n\r\n", b"0\r\nX: a\rb\r\n\r\n",
+        ];
+        for body in bad {
+            let data = [&b"H\r\n\r\n"[..], body].concat();
+            let (_, s) = fwd(MsgState::head(Framing::Chunked), &data);
+            assert_eq!(s, MsgState::Error, "{:?}", String::from_utf8_lossy(body));
+        }
+    }
+
+    #[test]
+    fn a_trailer_line_ended_by_lf_is_found() {
+        let s = MsgState::head(Framing::Chunked);
+        assert_eq!(s.trailer_bare_lf(b"H\r\n\r\n1\r\n\n\r\n0\r\nX: 1\n\r\n"), Some(18));
+        assert_eq!(s.trailer_bare_lf(b"H\r\n\r\n0\r\n\n"), Some(8));
+        assert_eq!(s.trailer_bare_lf(b"H\r\n\r\n0\r\nX: 1\r\n\r\n"), None);
+    }
+
+    #[test]
+    fn framing_reads_every_line() {
+        let req = |h: &str| request_framing(format!("POST / HTTP/1.1\r\n{h}\r\n").as_bytes());
+        assert_eq!(req("Transfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n"), Framing::Chunked);
+        assert_eq!(req("Content-Length: 3, 3\r\n"), Framing::Length(3));
+        assert_eq!(req("Content-Length: 3\r\nContent-Length: 3\r\n"), Framing::Length(3));
+        assert_eq!(req("Transfer-Encoding:\r\n chunked\r\n"), Framing::Chunked);
+        let rsp = |h: &str| response_framing(&format!("HTTP/1.1 200 OK\r\n{h}\r\n"), Some("GET"), 200);
+        assert_eq!(rsp("Transfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n"), Framing::Chunked);
+        assert_eq!(rsp("Transfer-Encoding: chunked\r\nTransfer-Encoding: gzip\r\n"), Framing::UntilClose);
+        assert_eq!(rsp("Content-Length: 5, 5\r\n"), Framing::Length(5));
+        assert_eq!(rsp("Content-Length: 5\r\nContent-Length: 2\r\n"), Framing::UntilClose);
+        assert_eq!(rsp("Transfer-Encoding:\r\n chunked\r\n"), Framing::Chunked);
     }
 
     #[test]

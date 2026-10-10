@@ -26,6 +26,93 @@ pub enum H1Phase {
     Error,
 }
 
+/// An HTTP/1 message refused with a status other than 400, carried inside the
+/// `io::Error` of a parse: `HAProxy` answers 413 and 422 to some requests its parser
+/// accepts (`h1_process_input` in mux_h1.c).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Refusal(pub u16);
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "refused with {}", self.0)
+    }
+}
+
+impl std::error::Error for Refusal {}
+
+/// A [`Refusal`] with what caused it, as the payload of an `io::Error`.
+#[derive(Debug)]
+struct RefusalWhy(u16, &'static str);
+
+impl std::fmt::Display for RefusalWhy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} (refused with {})", self.1, self.0)
+    }
+}
+
+impl std::error::Error for RefusalWhy {}
+
+impl Refusal {
+    #[must_use]
+    pub fn error(status: u16, why: &'static str) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidData, RefusalWhy(status, why))
+    }
+
+    /// The status an error from a parse asks for: its own, or 400.
+    #[must_use]
+    pub fn status_of(e: &io::Error) -> u16 {
+        e.get_ref().and_then(|e| e.downcast_ref::<RefusalWhy>()).map_or(400, |r| r.0)
+    }
+}
+
+/// The `Transfer-Encoding` lines of a head, read as one list in order, by the rules of
+/// `HAProxy`'s `h1_parse_xfer_enc_header` (src/h1.c).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct TransferCodings {
+    /// At least one `Transfer-Encoding` line.
+    pub present: bool,
+    /// The last coding of the list is `chunked`: the message is chunked.
+    pub chunked_last: bool,
+    /// A coding other than `chunked` (`H1_MF_TE_OTHER`).
+    pub other: bool,
+    /// Every such coding is `gzip`, `deflate` or `compress`.
+    pub other_known: bool,
+    /// An empty line or element, a trailing comma, `chunked` twice, or (in a request) a
+    /// coding after `chunked`.
+    pub invalid: bool,
+}
+
+impl TransferCodings {
+    pub fn of<'a>(headers: impl Iterator<Item = (&'a str, &'a str)>, is_response: bool) -> Self {
+        let lws = |c: char| c == ' ' || c == '\t';
+        let mut t = TransferCodings { other_known: true, ..TransferCodings::default() };
+        let mut chunked_seen = false;
+        for (_, value) in headers.filter(|(n, _)| n.eq_ignore_ascii_case("transfer-encoding")) {
+            t.present = true;
+            let v = value.trim_matches(lws);
+            if v.is_empty() || v.ends_with(',') {
+                t.invalid = true;
+            }
+            for word in v.split(',').map(|w| w.trim_matches(lws)) {
+                t.chunked_last = false;
+                if word.is_empty() {
+                    t.invalid = true;
+                } else if word.eq_ignore_ascii_case("chunked") {
+                    t.invalid |= chunked_seen;
+                    chunked_seen = true;
+                    t.chunked_last = true;
+                } else {
+                    t.invalid |= chunked_seen && !is_response;
+                    t.other = true;
+                    t.other_known &= ["gzip", "deflate", "compress"].iter().any(|k| word.eq_ignore_ascii_case(k));
+                }
+            }
+        }
+        t
+    }
+}
+
 /// HTTP/1.1 Parser state.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
@@ -49,6 +136,9 @@ pub struct H1Parser {
     /// `option accept-unsafe-violations-in-http-request`: a `#` in the request target, and
     /// a forbidden character in an authority, are let through. Kept across `reset`.
     pub accept_unsafe_request: bool,
+    /// The status a message that parsed must still be refused with (422: a request with a
+    /// transfer coding other than chunked). Cleared by `reset`.
+    pub refusal: Option<u16>,
 }
 
 impl H1Parser {
@@ -66,6 +156,7 @@ impl H1Parser {
             prev_delim_len: 2,
             head_rewritten: false,
             accept_unsafe_request: false,
+            refusal: None,
         }
     }
 
@@ -80,6 +171,7 @@ impl H1Parser {
         self.saw_bare_cr = false;
         self.prev_delim_len = 2;
         self.head_rewritten = false;
+        self.refusal = None;
     }
 
     /// Finalizes parsing on connection close / EOF (for HTTP/1.0 close delimiter fallback).
@@ -255,6 +347,8 @@ impl H1Parser {
                         "obs-fold continuation with no preceding header",
                     )
                 })?;
+                // Forwarded unfolded, from the HTX, as HAProxy does (tasks/T276).
+                self.head_rewritten = true;
                 self.prev_delim_len = delim_len;
                 return Ok(line_end + delim_len);
             }
@@ -406,6 +500,8 @@ impl H1Parser {
 
 
         if duplicate_cl || comma_cl {
+            // Forwarded as the one value it stands for (tasks/T276).
+            self.head_rewritten = true;
             let first_idx = first_cl_idx.unwrap();
             let mut val_buf = [0u8; 20];
             let val_bytes = {
@@ -434,45 +530,54 @@ impl H1Parser {
             }
         }
 
-        if let Some(te) = htx.get_header("transfer-encoding") {
-            let mut unknown = false;
-            let mut chunked_count = 0;
-            let mut last_coding: Option<&str> = None;
-
-            for coding in te.split(',').map(str::trim) {
-                if coding.is_empty() {
-                    continue;
-                }
-                last_coding = Some(coding);
-                if coding.eq_ignore_ascii_case("chunked") {
-                    chunked_count += 1;
-                } else if !coding.eq_ignore_ascii_case("gzip")
-                    && !coding.eq_ignore_ascii_case("deflate")
-                    && !coding.eq_ignore_ascii_case("compress")
-                {
-                    unknown = true;
-                }
-            }
-
-            let chunked_last = last_coding.is_some_and(|c| c.eq_ignore_ascii_case("chunked"));
-
-            if unknown || chunked_count > 1 || (chunked_count == 1 && !chunked_last) {
-                self.phase = H1Phase::Error;
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "invalid Transfer-Encoding",
-                ));
-            }
-            if chunked_last {
-                self.is_chunked = true;
-            }
+        // `Transfer-Encoding` on every line, in order, as one list (RFC 9110 section 5.3),
+        // read the way HAProxy's `h1_parse_xfer_enc_header` reads it: reading only the
+        // first line framed `gzip` + `chunked` on two lines as a request without a body,
+        // while the next hop read a chunked one (tasks/T276, V&V VV-1).
+        let te = TransferCodings::of(htx.headers(), self.is_response);
+        if te.invalid {
+            self.phase = H1Phase::Error;
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid Transfer-Encoding"));
         }
-
-        if self.is_chunked && self.content_length.is_some() {
+        self.is_chunked = te.chunked_last;
+        if te.present && self.content_length.is_some() {
+            // T-E + C-L: the length goes and the connection closes (`h1_parse_msg_hdrs`).
             self.content_length = None;
             htx.remove_header("content-length");
             self.framing_conflict = true;
             self.connection_close = true;
+        }
+        let is_http11 = htx.req_line().map_or_else(|| htx.res_line().is_some_and(|r| r.version == "HTTP/1.1"), |r| r.version == "HTTP/1.1");
+        if te.present && !is_http11 {
+            // T-E in HTTP/1.0: the connection closes after this message.
+            self.connection_close = true;
+        }
+        if !self.is_response {
+            // A request whose last coding is not chunked has no length (RFC 9112 section
+            // 6.3): 400, as `h1_parse_msg_hdrs` refuses it.
+            if te.present && !te.chunked_last {
+                self.phase = H1Phase::Error;
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "request Transfer-Encoding without final chunked"));
+            }
+            // `h1_process_input` in mux_h1.c, in this order: an HTTP/1.0 GET, HEAD or
+            // DELETE with a body is 413, then any coding but chunked is 422.
+            let method = htx.req_line().map(|r| r.method);
+            let body = self.is_chunked || self.content_length.is_some_and(|n| n > 0);
+            if !is_http11 && body && method.is_some_and(|m| ["GET", "HEAD", "DELETE"].contains(&m)) {
+                self.phase = H1Phase::Error;
+                return Err(Refusal::error(413, "HTTP/1.0 GET/HEAD/DELETE with a body"));
+            }
+            if te.other {
+                // Refused with 422 either way. A coding Ibex has never heard of is a parse
+                // error; `gzip`, `deflate` and `compress` parse (crates/ibex-proto/tests/
+                // h1_strictness.rs holds this parser to that) and the proxy refuses the
+                // request on `refusal`, before anything is forwarded.
+                if !te.other_known {
+                    self.phase = H1Phase::Error;
+                    return Err(Refusal::error(422, "transfer coding other than chunked"));
+                }
+                self.refusal = Some(422);
+            }
         }
 
         let is_http10 = htx
