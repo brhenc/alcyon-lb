@@ -70,6 +70,7 @@ fn test_stick_table_tracking_and_cli_show_table() {
             default_backend: Some("be_track".into()),
             stick_table: Some(StickTableConfigAst {
                 key_type: "ip".into(),
+                key_len: None,
                 size: 1000,
                 expire: Duration::from_secs(60),
                 store_fields: vec![

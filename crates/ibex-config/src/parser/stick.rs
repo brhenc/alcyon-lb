@@ -8,49 +8,67 @@ pub(crate) fn parse_stick_table(
     tokens: &[Token],
     _kw: &Token,
 ) -> Result<(), ConfigError> {
-    let mut key_type = "ip".to_string();
-    let mut size = 100_000usize;
+    // `HAProxy`'s words (`parse_stick_table`, `stktable_parse_type`, `src/stick_table.c`).
+    let fail = |at: &Token, msg: String| Err(ConfigError::new(at.line, at.col, msg));
+    let mut key_type: Option<String> = None;
+    let mut key_len = None;
+    let mut size = 0usize;
     let mut expire = Duration::from_secs(300);
     let mut store_fields = Vec::new();
 
     let mut i = 1;
     while i < tokens.len() {
-        match tokens[i].text.as_str() {
+        let word = tokens[i].text.as_str();
+        match word {
             "type" => {
-                i += 1;
-                if i < tokens.len() {
-                    key_type.clone_from(&tokens[i].text);
+                let ty = tokens.get(i + 1).map_or("", |t| t.text.as_str());
+                let ty = if ty == "ipv4" { "ip" } else { ty };
+                if !matches!(ty, "ip" | "ipv6" | "integer" | "string" | "binary") {
+                    return fail(tokens.get(i + 1).unwrap_or(_kw), format!("stick-table: unknown type '{ty}'."));
                 }
-            }
-            "size" => {
-                i += 1;
-                if i < tokens.len() {
-                    size = parse_size(&tokens[i])?;
+                key_type = Some(ty.to_string());
+                i += 2;
+                if matches!(ty, "string" | "binary") && tokens.get(i).is_some_and(|t| t.text == "len") {
+                    let arg = tokens.get(i + 1);
+                    match arg.and_then(|t| t.text.parse::<usize>().ok()).filter(|n| *n > 0) {
+                        Some(n) => key_len = Some(n),
+                        None => return fail(arg.unwrap_or(&tokens[i]), "'len' expects a positive integer argument.".to_string()),
+                    }
+                    i += 2;
                 }
+                continue;
             }
-            "expire" => {
-                i += 1;
-                if i < tokens.len() {
-                    expire = parse_timer(&tokens[i], "expire", |a| {
-                        format!("stick-table: timer overflow in argument <{a}> to <expire>, maximum value is 2147483647 ms (~24.8 days).")
-                    })?;
+            "size" | "expire" | "store" => {
+                let Some(arg) = tokens.get(i + 1) else {
+                    return fail(&tokens[i], format!("stick-table: missing argument after '{word}'."));
+                };
+                match word {
+                    "size" => size = parse_size(arg)?,
+                    "expire" => {
+                        expire = parse_timer(arg, "expire", |a| {
+                            format!("stick-table: timer overflow in argument <{a}> to <expire>, maximum value is 2147483647 ms (~24.8 days).")
+                        })?;
+                    }
+                    _ => store_fields.extend(split_store_fields(&arg.text)),
                 }
+                i += 2;
+                continue;
             }
-            "store" => {
-                i += 1;
-                if i < tokens.len() {
-                    store_fields.extend(split_store_fields(&tokens[i].text));
-                }
-            }
-            _ => {}
+            _ => return fail(&tokens[i], format!("stick-table: unknown argument '{word}'.")),
         }
-        i += 1;
     }
+    if size == 0 {
+        return fail(_kw, "stick-table: missing size.".to_string());
+    }
+    let Some(key_type) = key_type else {
+        return fail(_kw, "stick-table: missing type.".to_string());
+    };
 
     check_store_fields(&store_fields).map_err(|m| ConfigError::new(_kw.line, _kw.col, format!("stick-table: {m}")))?;
 
     *table = Some(StickTableConfigAst {
         key_type,
+        key_len: None,
         size,
         expire,
         store_fields,

@@ -50,8 +50,10 @@ pub(crate) fn check(tokens: &[Token]) -> Result<(), ConfigError> {
             }
         }
         "stick-table" => {
-            if let Some(tok) = tokens.iter().skip(1).find(|t| t.text == "peers") {
-                return Err(refuse(tok, "stick-table ... peers"));
+            // Keywords of `stick-table` Ibex does not implement (T250).
+            let words = ["peers", "nopurge", "recv-only", "srvkey", "write-to", "brates-factor"];
+            if let Some(tok) = tokens.iter().skip(1).find(|t| words.contains(&t.text.as_str())) {
+                return Err(refuse(tok, &format!("stick-table ... {}", tok.text)));
             }
         }
         _ => {}

@@ -434,6 +434,7 @@ fn sc_inc_gpc0_increments_counter_and_reports_via_show_table() {
         default_backend: Some("be_track".into()),
         stick_table: Some(StickTableConfigAst {
             key_type: "ip".into(),
+            key_len: None,
             size: 100,
             expire: Duration::from_secs(60),
             store_fields: vec!["gpc0".into()],
@@ -475,6 +476,7 @@ fn without_sc_inc_gpc0_gpc0_remains_zero() {
         default_backend: Some("be_track".into()),
         stick_table: Some(StickTableConfigAst {
             key_type: "ip".into(),
+            key_len: None,
             size: 100,
             expire: Duration::from_secs(60),
             store_fields: vec!["gpc0".into()],
@@ -512,6 +514,7 @@ fn session_scope_tracking_populates_stick_table() {
         default_backend: Some("be_track".into()),
         stick_table: Some(StickTableConfigAst {
             key_type: "ip".into(),
+            key_len: None,
             size: 100,
             expire: Duration::from_secs(60),
             store_fields: vec!["conn_cnt".into()],

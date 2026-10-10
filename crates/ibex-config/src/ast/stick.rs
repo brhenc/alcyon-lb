@@ -9,6 +9,8 @@ use super::*;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StickTableConfigAst {
     pub key_type: String,
+    /// `len <n>` of a `string` or `binary` type: the longest key kept; `None` is the default (32).
+    pub key_len: Option<usize>,
     pub size: usize,
     pub expire: Duration,
     pub store_fields: Vec<String>,

@@ -75,6 +75,7 @@ fn start_dummy_backend(
 fn table_config() -> StickTableConfigAst {
     StickTableConfigAst {
         key_type: "ip".into(),
+        key_len: None,
         size: 1000,
         expire: Duration::from_secs(60),
         store_fields: vec![
