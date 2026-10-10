@@ -178,3 +178,57 @@ fn add_acl_compiles_the_new_pattern_once_for_every_reader() {
     assert!(!a.matches(&smp) && !b.matches(&smp), "the deleted pattern is gone");
     assert!(a.matches(&ibex_sample::Sample::Str("/p19999/".to_string())));
 }
+
+/// `map_dir` and `map_dom` find the key as a whole `/`- or `.`-delimited word anywhere in
+/// the input, the key's own leading and trailing delimiters left out (`match_word`), as
+/// measured on `HAProxy` 3.5-dev8 with `http-request return ... %[req.hdr(x-in),map_dir(...)]`.
+#[test]
+fn map_dir_and_map_dom_match_a_delimited_word_anywhere() {
+    let dir = tmp("dir.map", "/a/b ab\n/c/ c_slash\nx x\n");
+    let dom = tmp("dom.map", "example.com ex\n.org dotorg\nfoo foo\n");
+    let dirs = [
+        ("/a/b", Some("ab")),
+        ("/a/b/c", Some("ab")),
+        ("/a/bc", None),
+        ("/y/a/b/z", Some("ab")),
+        ("/c/d", Some("c_slash")),
+        ("/c", Some("c_slash")),
+        ("/q/x/r", Some("x")),
+        ("x", Some("x")),
+        ("/xx", None),
+    ];
+    for (input, want) in dirs {
+        assert_eq!(val(&dir, input, MapMatchType::Dir).as_deref(), want, "map_dir {input}");
+    }
+    let doms = [
+        ("a.example.com", Some("ex")),
+        ("example.com.au", Some("ex")),
+        ("www.example.com", Some("ex")),
+        ("example.comx", None),
+        ("myexample.com", None),
+        ("a.org", Some("dotorg")),
+        ("org", Some("dotorg")),
+        ("b.foo.c", Some("foo")),
+        ("foo", Some("foo")),
+    ];
+    for (input, want) in doms {
+        assert_eq!(val(&dom, input, MapMatchType::Dom).as_deref(), want, "map_dom {input}");
+    }
+}
+
+/// Entries that share a network or a key length are taken out one at a time; the others
+/// still answer (v4 and v6).
+#[test]
+fn deleting_one_of_two_entries_of_a_network_keeps_the_other() {
+    let path = tmp("ipdup.map", "10.0.0.0/8 first\n10.0.0.0/8 second\n11.0.0.0/8 other\n2001:db8::/32 v6\n");
+    assert_eq!(val(&path, "10.1.2.3", MapMatchType::Ip).as_deref(), Some("first"));
+    let show = patref::command("show", RefKind::Map, &[&path], None);
+    let first = show.lines().next().expect("an entry").split(' ').next().expect("id").to_string();
+    assert_eq!(patref::command("del", RefKind::Map, &[&path, &format!("#{first}")], None), "");
+    assert_eq!(val(&path, "10.1.2.3", MapMatchType::Ip).as_deref(), Some("second"));
+    assert_eq!(patref::command("del", RefKind::Map, &[&path, "11.0.0.0/8"], None), "");
+    assert_eq!(val(&path, "11.1.2.3", MapMatchType::Ip), None);
+    assert_eq!(val(&path, "10.1.2.3", MapMatchType::Ip).as_deref(), Some("second"));
+    assert_eq!(patref::command("del", RefKind::Map, &[&path, "2001:db8::/32"], None), "");
+    assert_eq!(val(&path, "2001:db8::1", MapMatchType::Ip), None);
+}

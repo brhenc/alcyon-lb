@@ -155,22 +155,15 @@ impl PatTable {
     /// Removes entry `id`; whether there was one.
     pub fn remove(&mut self, id: u64) -> bool {
         let Some(e) = self.entries.remove(&id) else { return false };
-        if let Some(ids) = self.by_key.get_mut(&e.key) {
-            ids.retain(|x| *x != id);
-            if ids.is_empty() {
-                self.by_key.remove(&e.key);
-                dec(&mut self.key_lens, &e.key.len());
-            }
+        // Every entry is in `by_key`, and an ip one in `by_ip` (`insert`).
+        if take_id(&mut self.by_key, &e.key, id) {
+            dec(&mut self.key_lens, &e.key.len());
         }
         if let Some(ip) = ip_key(&e.key) {
-            if let Some(ids) = self.by_ip.get_mut(&ip) {
-                ids.retain(|x| *x != id);
-                if ids.is_empty() {
-                    self.by_ip.remove(&ip);
-                    match ip {
-                        IpKey::V4(l, _) => dec(&mut self.v4_lens, &l),
-                        IpKey::V6(l, _) => dec(&mut self.v6_lens, &l),
-                    }
+            if take_id(&mut self.by_ip, &ip, id) {
+                match ip {
+                    IpKey::V4(l, _) => dec(&mut self.v4_lens, &l),
+                    IpKey::V6(l, _) => dec(&mut self.v6_lens, &l),
                 }
             }
         }
@@ -263,28 +256,17 @@ impl PatTable {
         self.walk(|e| input.contains(&*e.key))
     }
 
-    /// `dir`: the first entry whose key is `input` or a `/`-delimited start of it.
+    /// `dir`: the first entry whose key, its own leading and trailing `/` left out, is a
+    /// whole `/`-delimited word of `input`, anywhere in it (`HAProxy` `pat_match_dir`).
     #[must_use]
     pub fn match_dir(&self, input: &str) -> Option<(String, String)> {
-        self.walk(|e| {
-            let key = &*e.key;
-            input == key
-                || (input.starts_with(key)
-                    && (key.ends_with('/') || input.get(key.len()..).is_some_and(|rest| rest.starts_with('/'))))
-        })
+        self.walk(|e| crate::matcher::match_word(input.as_bytes(), e.key.as_bytes(), b"/", false))
     }
 
-    /// `dom`: the first entry whose key is `input` or a `.`-delimited end of it.
+    /// `dom`: the same with `.` as the delimiter (`HAProxy` `pat_match_dom`).
     #[must_use]
     pub fn match_dom(&self, input: &str) -> Option<(String, String)> {
-        self.walk(|e| {
-            let key = &*e.key;
-            input == key
-                || (key.starts_with('.') && input.ends_with(key))
-                || (input.len() > key.len()
-                    && input.ends_with(key)
-                    && input.as_bytes()[input.len() - key.len() - 1] == b'.')
-        })
+        self.walk(|e| crate::matcher::match_word(input.as_bytes(), e.key.as_bytes(), b".", false))
     }
 
     /// `int`: the first entry whose integer or range holds `input`.
@@ -356,6 +338,16 @@ impl PatTable {
     pub fn compiled(&self, i: usize) -> impl Iterator<Item = &Matcher> {
         self.readers.get(i).into_iter().flat_map(|r| r.compiled.values())
     }
+}
+
+/// Takes `id` out of the ids under `k`, and `k` out of `m` once it has none left; whether
+/// it went.
+fn take_id<K: Eq + std::hash::Hash>(m: &mut HashMap<K, Vec<u64>>, k: &K, id: u64) -> bool {
+    let emptied = m.get_mut(k).is_some_and(|ids| {
+        ids.retain(|x| *x != id);
+        ids.is_empty()
+    });
+    emptied && m.remove(k).is_some()
 }
 
 fn dec<K: Ord>(m: &mut BTreeMap<K, usize>, k: &K) {

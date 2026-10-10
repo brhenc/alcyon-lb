@@ -113,7 +113,7 @@ impl IntRange {
 
 /// `match_word` (`src/pattern.c`): `pattern`, stripped of delimiters at both ends, must be
 /// a whole word of `smp`, a word being what lies between two delimiters.
-fn match_word(smp: &[u8], pattern: &[u8], delimiters: &[u8], icase: bool) -> bool {
+pub(crate) fn match_word(smp: &[u8], pattern: &[u8], delimiters: &[u8], icase: bool) -> bool {
     let mut p = pattern;
     while let [first, rest @ ..] = p {
         if !delimiters.contains(first) {
