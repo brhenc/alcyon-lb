@@ -289,8 +289,11 @@ fn a_rule_that_edits_the_head_does_not_lose_the_chunked_framing() {
     assert_eq!(got, "POST /n HTTP/1.1\r\nhost: x\r\nx-added: 1\r\ntransfer-encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n");
 }
 
-/// RST_STREAM error codes seen on the wire for each way a second HEADERS can be wrong:
-/// trailers without END_STREAM, with a pseudo-header, and after the stream has ended.
+/// Error codes seen on the wire for each way a second HEADERS can be wrong: trailers
+/// without END_STREAM, with a pseudo-header (RST_STREAM), and after the stream has closed.
+/// The last: HAProxy 3.5-dev8 answers HEADERS on a stream whose response has ended with
+/// GOAWAY(STREAM_CLOSED), measured 2026-10-11; so the test reads stream 5's response to
+/// its end before sending the HEADERS (sent at once, HAProxy's answer is GOAWAY(PROTOCOL_ERROR)).
 #[test]
 fn malformed_trailers_reset_the_stream() {
     let (_ibex, fe, _rx, _log) = start("");
@@ -306,6 +309,11 @@ fn malformed_trailers_reset_the_stream() {
     s.write_all(&frame(1, 5, 3, &block(&[(":path", "/z")]))).expect("trailers with a pseudo-header");
     assert_eq!(rst(&mut s, 3), Some(1), "PROTOCOL_ERROR");
     s.write_all(&frame(1, 5, 5, &head("GET", "/c", &[]))).expect("get");
+    assert!(is_200(&read_until_end(&mut s, 5)), "stream 5 answered before its HEADERS come");
     s.write_all(&frame(1, 5, 5, &block(&[("x", "y")]))).expect("headers after the end");
-    assert_eq!(rst(&mut s, 5), Some(5), "STREAM_CLOSED");
+    let goaway = read_until_end(&mut s, 1005)
+        .iter()
+        .find(|f| f.0 == 7)
+        .map(|f| u32::from_be_bytes([f.3[4], f.3[5], f.3[6], f.3[7]]));
+    assert_eq!(goaway, Some(5), "GOAWAY(STREAM_CLOSED)");
 }

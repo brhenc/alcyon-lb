@@ -321,7 +321,7 @@ fn first_check_result_is_reported_even_when_the_health_counter_does_not_move() {
     assert_eq!(
         check.log_line("be1", "srv", event.expect("event")),
         "Health check for server be1/srv succeeded, reason: Layer7 check passed, \
-         info: \"Redis server is ok\", check duration: 0ms, status: 1/1 UP."
+         code: 0, info: \"Redis server is ok\", check duration: 0ms, status: 1/1 UP."
     );
 
     // A second identical result moves nothing and repeats the same status code, so

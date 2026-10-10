@@ -398,7 +398,7 @@ fn use_server_resolves_servers_declared_after_it_and_in_listens() {
     let bad = ok.replace("use-server s2", "use-server s9");
     let (code, out) = check(101, &bad);
     assert_ne!(code, Some(0));
-    assert!(out.contains("listen 'l' : unable to find server 's9' referenced in a 'use-server' rule."), "{out}");
+    assert!(out.contains("proxy 'l' : unable to find server 's9' referenced in a 'use-server' rule."), "{out}");
 }
 
 /// `<op_state> <admin_state>` of a server in `show servers state b`.
