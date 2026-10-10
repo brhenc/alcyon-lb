@@ -1000,21 +1000,21 @@ fn test_header_size_boundary_against_bufsize_minus_maxrewrite() {
                 let mode = response_mode_clone.load(std::sync::atomic::Ordering::Relaxed);
                 let resp_body = match mode {
                     1 => {
-                        // Response below threshold: 3071 bytes header
+                        // Response below threshold: 2996 bytes header
                         // HTTP/1.1 200 OK\r\n (17) + X-Padding:  (11) + \r\n\r\n (4) = 32 bytes
-                        let pad_len = 3071 - 32;
+                        let pad_len = 2996 - 32;
                         let pad = "X".repeat(pad_len);
                         format!("HTTP/1.1 200 OK\r\nX-Padding: {pad}\r\n\r\nOK").into_bytes()
                     }
                     2 => {
-                        // Response at threshold: 3072 bytes header
-                        let pad_len = 3072 - 32;
+                        // Response at threshold: 2997 bytes header
+                        let pad_len = 2997 - 32;
                         let pad = "X".repeat(pad_len);
                         format!("HTTP/1.1 200 OK\r\nX-Padding: {pad}\r\n\r\nOK").into_bytes()
                     }
                     3 => {
-                        // Response above threshold: 3073 bytes header
-                        let pad_len = 3073 - 32;
+                        // Response above threshold: 2998 bytes header
+                        let pad_len = 2998 - 32;
                         let pad = "X".repeat(pad_len);
                         format!("HTTP/1.1 200 OK\r\nX-Padding: {pad}\r\n\r\nOK").into_bytes()
                     }
@@ -1134,7 +1134,7 @@ fn test_header_size_boundary_against_bufsize_minus_maxrewrite() {
         );
     }
 
-    // 4. Response below threshold (3071 bytes header)
+    // 4. Response below threshold (2996 bytes header)
     response_mode.store(1, std::sync::atomic::Ordering::Relaxed);
     let resp4 = drive_req(&mut engine, b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
     assert!(
@@ -1142,7 +1142,7 @@ fn test_header_size_boundary_against_bufsize_minus_maxrewrite() {
         "response below threshold must succeed, got: {resp4}"
     );
 
-    // 5. Response at threshold (3072 bytes header)
+    // 5. Response at threshold (2997 bytes header)
     response_mode.store(2, std::sync::atomic::Ordering::Relaxed);
     let resp5 = drive_req(&mut engine, b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
     assert!(
@@ -1150,7 +1150,7 @@ fn test_header_size_boundary_against_bufsize_minus_maxrewrite() {
         "response at threshold must succeed, got: {resp5}"
     );
 
-    // 6. Response above threshold (3073 bytes header) -> 502 Bad Gateway
+    // 6. Response above threshold (2998 bytes header) -> 502 Bad Gateway
     response_mode.store(3, std::sync::atomic::Ordering::Relaxed);
     let resp6 = drive_req(&mut engine, b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
     assert!(
