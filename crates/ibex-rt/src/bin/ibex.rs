@@ -794,6 +794,10 @@ fn main() {
         .and_then(|g| g.nbthread)
         .map(|n| n as usize)
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 64));
+    ibex_rt::stats::set_identity(
+        config.global.as_ref().and_then(|g| g.node.as_deref()),
+        config.global.as_ref().and_then(|g| g.description.as_deref()),
+    );
     ibex_rt::stats::NBTHREAD.store(nbthread as u32, std::sync::atomic::Ordering::Relaxed);
 
     // The soft limit on open files goes up to `maxsock` before any socket is opened;

@@ -72,6 +72,7 @@ pub(crate) fn parse_listen_header(
         mode,
         disabled: false,
         id: None,
+        description: None,
         cookie: defaults.and_then(|d| d.cookie.clone()),
         contimeout: timeouts.connect,
         clitimeout: timeouts.client,
@@ -179,6 +180,7 @@ pub(crate) fn parse_frontend_header(
         mode,
         disabled: false,
         id: None,
+        description: None,
         clitimeout: timeouts.client,
         timeouts,
         maxconn: defaults.and_then(|d| d.maxconn).unwrap_or(0),
@@ -279,6 +281,7 @@ pub(crate) fn parse_backend_header(
         mode,
         disabled: false,
         id: None,
+        description: None,
         balance: defaults.and_then(|d| d.balance).unwrap_or(BalanceAlgorithm::RoundRobin),
         cookie: defaults.and_then(|d| d.cookie.clone()),
         contimeout: timeouts.connect,
@@ -342,6 +345,10 @@ pub(crate) fn parse_listen_directive(
 ) -> Result<(), ConfigError> {
     match kw.text.as_str() {
         "mode" => parse_mode(&mut proxy.mode, tokens, kw),
+        "description" => {
+            proxy.description = Some(super::global::parse_description(tokens, kw)?);
+            Ok(())
+        }
         "disabled" => {
             proxy.disabled = true;
             Ok(())
@@ -513,6 +520,10 @@ pub(crate) fn parse_frontend_directive(
             in_section(parse_http_after_res_rule(&mut fe.http_after_res_rules, tokens, kw), "frontend", &fe.name)
         }
         "mode" => parse_mode(&mut fe.mode, tokens, kw),
+        "description" => {
+            fe.description = Some(super::global::parse_description(tokens, kw)?);
+            Ok(())
+        }
         "id" => parse_proxy_id(&mut fe.id, tokens, kw),
         "disabled" => {
             fe.disabled = true;
@@ -608,6 +619,10 @@ pub(crate) fn parse_backend_directive(
 ) -> Result<(), ConfigError> {
     match kw.text.as_str() {
         "mode" => parse_mode(&mut be.mode, tokens, kw),
+        "description" => {
+            be.description = Some(super::global::parse_description(tokens, kw)?);
+            Ok(())
+        }
         "id" => parse_proxy_id(&mut be.id, tokens, kw),
         "disabled" => {
             be.disabled = true;

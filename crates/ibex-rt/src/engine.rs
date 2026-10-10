@@ -1290,6 +1290,8 @@ pub struct Proxy {
     /// summed by its readers, so thread groups can slot in.
     pub stats: Arc<Vec<ProxyStats>>,
     pub stats_config: ibex_config::StatsConfig,
+    /// The section's `description`, shown on the stats page.
+    pub desc: Option<String>,
     pub default_backend: Option<String>,
     pub use_backends: Vec<UseBackendRule>,
     /// `use-server` rules (backends and listens), in order.
@@ -2922,6 +2924,7 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, list
             .collect(),
         next_server_idx: Arc::new(AtomicUsize::new(0)),
         stats: Arc::new(vec![ProxyStats::default()]),
+        desc: listen.description.clone(),
         stats_config: {
             let mut sc = listen.stats.clone();
             sc.raw_timeouts = listen.timeouts;
@@ -3045,6 +3048,7 @@ fn init_proxy_from_frontend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, fe
         server_weights: std::iter::empty().collect(),
         next_server_idx: Arc::new(AtomicUsize::new(0)),
         stats: Arc::new(vec![ProxyStats::default()]),
+        desc: fe.description.clone(),
         stats_config: {
             let mut sc = fe.stats.clone();
             sc.raw_timeouts = fe.timeouts;
@@ -3195,6 +3199,7 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, be:
         server_weights: be.servers.iter().map(|s| s.weight.unwrap_or(1)).collect(),
         next_server_idx: Arc::new(AtomicUsize::new(0)),
         stats: Arc::new(vec![ProxyStats::default()]),
+        desc: be.description.clone(),
         stats_config: {
             let mut sc = be.stats.clone();
             sc.raw_timeouts = be.timeouts;

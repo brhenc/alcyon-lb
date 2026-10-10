@@ -157,6 +157,10 @@ impl StatsAddr {
 /// Global section configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct GlobalSection {
+    /// `node <name>`: the name `show info` and the stats page report (`global.node`); `None` is the host name.
+    pub node: Option<String>,
+    /// `description <text>`: `show info`'s `description` and the stats page's `show-desc` text (`global.desc`).
+    pub description: Option<String>,
     /// `h1-case-adjust` and `h1-case-adjust-file`: `(from, to)` pairs in the order given, `from`
     /// unique (`add_hdr_case_adjust`).
     pub h1_case_adjust: Vec<(String, String)>,

@@ -413,6 +413,27 @@ pub(crate) fn parse_global_directive(
             global.maxconn = Some(val);
             Ok(())
         }
+        // `cfg_parse_global` (src/cfgparse-global.c); reaches `show info` and the stats page
+        // through `GlobalSection::node` / `description` (`ibex-rt` `stats.rs`).
+        "node" => {
+            if let Some(extra) = tokens.get(2) {
+                return Err(ConfigError::new(extra.line, extra.col, format!("'node' cannot handle unexpected argument '{}'.", extra.text)));
+            }
+            let name = tokens.get(1).map_or("", |t| t.text.as_str());
+            if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')) {
+                return Err(ConfigError::new(
+                    kw.line,
+                    kw.col,
+                    "'node' requires valid node name - non-empty string with digits(0-9), letters(A-Z, a-z), dot(.), hyphen(-) or underscode(_).",
+                ));
+            }
+            global.node = Some(name.to_string());
+            Ok(())
+        }
+        "description" => {
+            global.description = Some(parse_description(tokens, kw)?);
+            Ok(())
+        }
         "daemon" => {
             global.daemon = true;
             Ok(())
@@ -918,4 +939,13 @@ fn strl2irc(s: &str) -> Option<i32> {
         i = if neg { i.checked_sub(j)? } else { i.checked_add(j)? };
     }
     Some(i)
+}
+
+/// The text of a `description` line: the words joined by one space (`HAProxy` rebuilds it
+/// from `args[]`), and an error when there are none.
+pub(crate) fn parse_description(tokens: &[Token], kw: &Token) -> Result<String, ConfigError> {
+    if tokens.len() < 2 {
+        return Err(ConfigError::new(kw.line, kw.col, "'description' expects a string argument."));
+    }
+    Ok(tokens[1..].iter().map(|t| t.text.as_str()).collect::<Vec<_>>().join(" "))
 }

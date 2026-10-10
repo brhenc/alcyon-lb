@@ -38,10 +38,9 @@ pub fn render_stats_html(proxies: &[Proxy], checks: &[ServerCheckState], pid: u3
     render_stats_html_for(proxies, checks, pid, &ibex_config::StatsConfig::default())
 }
 
-/// The host name `stats show-node` without a name reports (HAProxy: `gethostname()`).
-fn host_name() -> String {
-    // uname(2), not /proc, which is not there in a chroot (T240).
-    rustix::system::uname().nodename().to_string_lossy().trim().to_string()
+/// A proxy's `description` for the page, unescaped as HAProxy prints it (`px->desc`).
+fn proxy_desc(proxy: &Proxy) -> String {
+    proxy.desc.as_deref().map_or(String::new(), |d| format!(r#"<div class="desc">{d}</div>"#))
 }
 
 /// [`render_stats_html`] for the page served by the proxy whose `stats` section is
@@ -58,10 +57,15 @@ pub fn render_stats_html_for(
     let node = serving
         .show_node
         .as_deref()
-        .map(|n| if n.is_empty() { host_name() } else { n.to_string() })
+        .map(|n| if n.is_empty() { crate::stats::node_name() } else { n.to_string() })
         .filter(|n| !n.is_empty());
     let on_node = node.as_deref().map_or(String::new(), |n| format!(" on {n}"));
-    let desc = serving.show_desc.as_deref().map_or(String::new(), |d| format!(": {d}"));
+    // `stats show-desc` without text shows `global description` (`uri->desc ? uri->desc : global.desc`).
+    let desc = serving
+        .show_desc
+        .as_deref()
+        .map(|d| if d.is_empty() { crate::stats::description().unwrap_or_default() } else { d.to_string() })
+        .map_or(String::new(), |d| format!(": {d}"));
     let heading = format!("Statistics Report for pid {pid}{on_node}{desc}");
     let mut out = String::with_capacity(32768);
 
@@ -423,7 +427,7 @@ tr:hover td {{ background: rgba(255, 255, 255, 0.02); }}
             let _ = write!(
                 out,
                 r#"          <tr id="fe-row-{name}">
-            <td><strong>{name}</strong></td>
+            <td><strong>{name}</strong>{desc}</td>
             <td><span class="tag">{mode:?}</span></td>
             <td class="mono">{addr}</td>
             <td><span class="badge badge-up">OPEN</span></td>
@@ -442,6 +446,7 @@ tr:hover td {{ background: rgba(255, 255, 255, 0.02); }}
           </tr>
 "#,
                 name = proxy.name,
+                desc = proxy_desc(proxy),
                 mode = proxy.mode,
                 addr = proxy.addr,
                 act_conn = proxy.stats.iter().map(|s| s.act_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u32>(),
@@ -488,7 +493,7 @@ tr:hover td {{ background: rgba(255, 255, 255, 0.02); }}
         <div style="display: flex; align-items: center; gap: 8px;">
           <span style="font-weight: 700; font-size: 15px;">Backend: {name}</span>
           <span class="tag">{mode:?}</span>
-          <span class="tag">{algo:?}</span>
+          <span class="tag">{algo:?}</span>{desc}
           <form class="admin-form kill-form" method="POST" action="" style="display:inline;" onsubmit="return confirm('Terminate all active sessions on backend {name}?');">
             <input type="hidden" name="action" value="shutdown_sessions">
             <input type="hidden" name="backend" value="{name}">
@@ -519,6 +524,7 @@ tr:hover td {{ background: rgba(255, 255, 255, 0.02); }}
         <tbody>
 "#,
             name = proxy.name,
+            desc = proxy_desc(proxy),
             mode = proxy.mode,
             algo = proxy.balance,
             act_conn = proxy.stats.iter().map(|s| s.act_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u32>(),
