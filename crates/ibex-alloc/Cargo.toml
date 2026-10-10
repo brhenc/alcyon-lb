@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Allocation counting oracle and fixed-size memory pools for Project Ibex"
+autotests = false
 
 [dependencies]
 
@@ -13,3 +14,8 @@ unsafe_code = "allow"
 [lints.clippy]
 all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
+
+# Own process: installs a counting #[global_allocator] and asserts on the test process's allocation counters
+[[test]]
+name = "thread_counters"
+path = "tests/thread_counters.rs"

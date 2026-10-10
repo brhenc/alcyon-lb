@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
+// Own binary (T260): lowers the test process's RLIMIT_NOFILE (other tests would get EMFILE)
 
 //! A `log-forward` `bind` (TCP and unix) whose client arrives while the process is out of
 //! descriptors: the listener thread retries after a pause (`accept_failed`) and takes the

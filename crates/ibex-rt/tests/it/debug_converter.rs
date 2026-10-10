@@ -1,0 +1,202 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
+
+//! The `debug([prefix][,destination])` converter copies its input to an event sink, `buf0`
+//! by default, read back with `show events` (`converter/when_debug.vtc`, T131 item 6).
+//!
+//! Measured against `HAProxy` 3.5-dev8-885761-29: after one request through
+//! `http-request set-var(txn.dbg) str(hello),debug(mytag)`, `show events buf0 -0` answers
+//! `<0>2026-10-04T20:45:31.823886+02:00 [debug] mytag: type=str <hello>\0`. A sink the
+//! converter names must exist (`debug converter: sink 'mysink' doesn't exist.` at load); a
+//! `ring` without a format takes the bare line `[debug] num: type=sint <42>\0`, and the
+//! sample is passed on unchanged.
+
+use crate::common;
+
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::os::unix::net::UnixStream;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+
+fn live_backend() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind backend");
+    let port = listener.local_addr().expect("addr").port();
+    thread::spawn(move || {
+        for mut c in listener.incoming().flatten() {
+            let mut buf = [0u8; 4096];
+            let _ = c.read(&mut buf);
+            let _ = c.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+        }
+    });
+    port
+}
+
+fn cli(sock: &std::path::Path, cmd: &str) -> String {
+    let mut c = UnixStream::connect(sock).expect("connect cli");
+    c.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    writeln!(c, "{cmd}").expect("write");
+    let mut out = Vec::new();
+    let _ = c.read_to_end(&mut out);
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[test]
+fn debug_copies_the_sample_to_buf0_and_to_a_named_sink() {
+    let live = live_backend();
+    let port = common::reserve_port();
+    let sock = std::path::PathBuf::from(format!("/tmp/ibex_test_debugconv_{}.sock", std::process::id()));
+    let cfg = format!(
+        "global\n  stats socket {}\n\
+         defaults\n  mode http\n  timeout connect 1s\n  timeout client 3s\n  timeout server 3s\n\
+         frontend fe\n  bind 127.0.0.1:{port}\n  \
+         http-request set-var(txn.dbg) str(hello),debug(mytag)\n  \
+         http-request set-var(txn.dbg2) int(42),debug(num,mysink)\n  \
+         http-response set-header x-dbg \"%[var(txn.dbg)]\"\n  default_backend be\n\
+         backend be\n  server s1 127.0.0.1:{live}\n\
+         ring mysink\n  description \"my sink\"\n  size 4096\n",
+        sock.display()
+    );
+    let path = std::env::temp_dir().join(format!("ibex_debugconv_{}", std::process::id()));
+    std::fs::write(&path, cfg).expect("write config");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map(common::Ibex).expect("spawn ibex");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while TcpStream::connect(("127.0.0.1", port)).is_err() || !sock.exists() {
+        assert!(Instant::now() < deadline, "the daemon never listened on {port}");
+        thread::sleep(Duration::from_millis(25));
+    }
+    let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    s.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    write!(s, "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").expect("write");
+    let mut resp = Vec::new();
+    let _ = s.read_to_end(&mut resp);
+    let resp = String::from_utf8_lossy(&resp).into_owned();
+    let buf0 = cli(&sock, "show events buf0 -0");
+    let named = cli(&sock, "show events mysink -0");
+    common::stop(&mut child);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&sock);
+
+    assert!(resp.to_ascii_lowercase().contains("x-dbg: hello"), "the sample is passed through: {resp}");
+    assert!(buf0.starts_with("<0>"), "{buf0:?}");
+    assert!(buf0.contains(" [debug] mytag: type=str <hello>\0"), "{buf0:?}");
+    assert_eq!(named, "[debug] num: type=sint <42>\0\n", "a ring with no format keeps the bare line");
+}
+
+/// `debug(x,nosuch)`: HAProxy refuses the configuration, "debug converter: sink 'nosuch'
+/// doesn't exist." (measured, `haproxy -c`).
+#[test]
+fn debug_to_an_unknown_sink_is_refused() {
+    let path = std::env::temp_dir().join(format!("ibex_debugconv_bad_{}", std::process::id()));
+    std::fs::write(
+        &path,
+        "defaults\n  mode http\n  timeout client 1s\n  timeout server 1s\n  timeout connect 1s\n\
+         frontend fe\n  bind 127.0.0.1:0\n  http-request set-var(txn.d) str(a),debug(x,nosuch)\n  default_backend be\n\
+         backend be\n  server s1 127.0.0.1:9\n",
+    )
+    .expect("write config");
+    let out = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-c").arg("-f").arg(&path).output().expect("run ibex -c");
+    let _ = std::fs::remove_file(&path);
+    let text = String::from_utf8_lossy(&out.stderr).into_owned() + &String::from_utf8_lossy(&out.stdout);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("debug converter: sink 'nosuch' doesn't exist."), "{text}");
+}
+
+/// `debug(tag,stdout)` and `debug(tag,stderr)` write the line to the process's own stdout and
+/// stderr (measured: `[debug] tg: type=str <hello>` on stdout, `[debug] tb: type=str <bye>` on
+/// stderr, each followed by a newline).
+#[test]
+fn debug_to_stdout_and_stderr_writes_the_line_there() {
+    let port = common::reserve_port();
+    let dir = std::env::temp_dir();
+    let (out_path, err_path) = (dir.join(format!("ibex_debugconv_out_{}", std::process::id())), dir.join(format!("ibex_debugconv_err_{}", std::process::id())));
+    let cfg = format!(
+        "defaults\n  mode http\n  timeout connect 1s\n  timeout client 3s\n  timeout server 3s\n\
+         frontend fe\n  bind 127.0.0.1:{port}\n  \
+         http-request set-var(txn.a) str(hello),debug(tg,stdout)\n  \
+         http-request set-var(txn.b) str(bye),debug(tb,stderr)\n  \
+         http-request return status 200\n"
+    );
+    let path = dir.join(format!("ibex_debugconv_std_{}", std::process::id()));
+    std::fs::write(&path, cfg).expect("write config");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ibex"))
+        .arg("-f")
+        .arg(&path)
+        .stdout(Stdio::from(std::fs::File::create(&out_path).expect("stdout file")))
+        .stderr(Stdio::from(std::fs::File::create(&err_path).expect("stderr file")))
+        .spawn().map(common::Ibex)
+        .expect("spawn ibex");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(Instant::now() < deadline, "the daemon never listened on {port}");
+        thread::sleep(Duration::from_millis(25));
+    }
+    let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    s.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    write!(s, "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").expect("write");
+    let mut resp = Vec::new();
+    let _ = s.read_to_end(&mut resp);
+    common::stop(&mut child);
+    let (out, err) = (std::fs::read_to_string(&out_path).unwrap_or_default(), std::fs::read_to_string(&err_path).unwrap_or_default());
+    for p in [&path, &out_path, &err_path] {
+        let _ = std::fs::remove_file(p);
+    }
+    assert!(out.lines().any(|l| l == "[debug] tg: type=str <hello>"), "{out:?}");
+    assert!(err.lines().any(|l| l == "[debug] tb: type=str <bye>"), "{err:?}");
+    assert!(!out.contains("tb:") && !err.contains("tg:"), "each line goes to its own stream: {out:?} {err:?}");
+}
+
+/// What `debug()` prints for each sample type: `type=<name> <text>`, a binary sample as
+/// its bytes. Measured on `HAProxy` (`IBEX_TEST_BIN=/path/to/haproxy cargo test --test
+/// debug_converter` runs it there).
+#[test]
+fn debug_names_the_sample_type() {
+    let (port, port6) = (common::reserve_port(), common::reserve_port());
+    let out_path = std::env::temp_dir().join(format!("ibex_debugconv_types_out_{}", std::process::id()));
+    let cfg = format!(
+        "defaults\n  mode http\n  timeout connect 1s\n  timeout client 3s\n  timeout server 3s\n\
+         frontend fe\n  bind 127.0.0.1:{port}\n  bind [::1]:{port6}\n  \
+         http-request set-var(txn.a) src,debug(ip,stdout)\n  \
+         http-request set-var(txn.b) method,debug(me,stdout)\n  \
+         http-request set-var(txn.c) int(1),bool,debug(bo,stdout)\n  \
+         http-request set-var(txn.d) str(aGk=),b64dec,debug(bi,stdout)\n  \
+         http-request return status 200\n"
+    );
+    let path = std::env::temp_dir().join(format!("ibex_debugconv_types_{}", std::process::id()));
+    std::fs::write(&path, cfg).expect("write config");
+    let mut child = Command::new(std::env::var("IBEX_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ibex").to_string()))
+        .arg("-f")
+        .arg(&path)
+        .stdout(Stdio::from(std::fs::File::create(&out_path).expect("stdout file")))
+        .stderr(Stdio::null())
+        .spawn().map(common::Ibex)
+        .expect("spawn ibex");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while TcpStream::connect(("127.0.0.1", port)).is_err() || TcpStream::connect(("::1", port6)).is_err() {
+        assert!(Instant::now() < deadline, "the daemon never listened");
+        thread::sleep(Duration::from_millis(25));
+    }
+    for mut s in [TcpStream::connect(("127.0.0.1", port)).expect("connect"), TcpStream::connect(("::1", port6)).expect("connect")] {
+        s.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        write!(s, "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").expect("write");
+        let mut resp = Vec::new();
+        let _ = s.read_to_end(&mut resp);
+    }
+    common::stop(&mut child);
+    let out = std::fs::read_to_string(&out_path).unwrap_or_default();
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&out_path);
+    let lines: Vec<&str> = out.lines().filter(|l| l.starts_with("[debug]")).collect();
+    let want = [
+        "[debug] ip: type=ipv4 <127.0.0.1>",
+        "[debug] me: type=meth <GET>",
+        "[debug] bo: type=bool <1>",
+        "[debug] bi: type=bin <hi>",
+        "[debug] ip: type=ipv6 <::1>",
+        "[debug] me: type=meth <GET>",
+        "[debug] bo: type=bool <1>",
+        "[debug] bi: type=bin <hi>",
+    ];
+    assert_eq!(lines, want, "{out:?}");
+}

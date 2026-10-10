@@ -103,7 +103,7 @@ Notes
   so the "0 failed" criterion is met by both only for a client that retries an idle close; for
   wrk2 HAProxy itself does not meet it. At 10k backends HAProxy showed no closures in 3 runs.
 - "Uneven load" metric: connections the backend accepts; the T159 B scenario of
-  `crates/ibex-rt/tests/idle_pool_shared.rs` (burst of 16 concurrent /slow clients, 20 sequential
+  `crates/ibex-rt/tests/it/idle_pool_shared.rs` (burst of 16 concurrent /slow clients, 20 sequential
   ones, 10 s of cycles, `http-reuse always`, one server) needs at least 16. Ibex opens fewer than
   HAProxy at both thread counts (HAProxy at nbthread 16 opens about twice the minimum), so it is
   within the target read as "no more than HAProxy + 10%"; read two-sided it is outside by

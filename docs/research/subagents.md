@@ -27,7 +27,7 @@ This document records the work, findings, and deliverables produced by all backg
 | `958c8b16` | CLI & HAProxy 3.5 Compatibility Engineer | `self` | Runtime & CLI Compatibility | **Complete** | Complete HAProxy 3.5 CLI flag audit, memory-safe parser in `ibex-rt` (`bin/ibex.rs`), multi-config directory expansion, reload signal dispatching, and integration test suite recorded in `docs/research/cli-options-compatibility.md`. |
 | `fb2023df` | Build Automation Engineer | `self` | Developer Experience & Tooling | **Complete** | Root `Makefile` with standard Unix build, test, lint, format, difftest, vtc, install, and uninstall targets. |
 | `ce267c7a` | HAProxy 3.5 Keyword Cataloger | `research` | Compatibility & Roadmap | **Complete** | Exhaustive catalog of all sections, keywords, L4-L7 actions, sample fetches, and converters in HAProxy 3.5 recorded in `docs/research/haproxy-35-keywords-complete-catalog.md`. |
-| `3dfc9706` | Stats Admin & Session Management Engineer | `self` | Runtime Administration & Management | **Complete** | Full connection handling and admin controls (`kill_sessions`/`shutdown_sessions`, `enable_health`/`disable_health`, `clear_counters`, `set_maxconn`) in Web Admin UI, CLI applet, and `Engine` (`crates/ibex-rt/tests/stats_admin_sessions.rs`). |
+| `3dfc9706` | Stats Admin & Session Management Engineer | `self` | Runtime Administration & Management | **Complete** | Full connection handling and admin controls (`kill_sessions`/`shutdown_sessions`, `enable_health`/`disable_health`, `clear_counters`, `set_maxconn`) in Web Admin UI, CLI applet, and `Engine` (`crates/ibex-rt/tests/it/stats_admin_sessions.rs`). |
 | `fa9404f9` | Server-Sent Events (SSE) Architect | `research` | Low-Latency Streaming Protocols | **Complete** | SSE protocol mechanics, HAProxy 3.5 streaming audit, unbuffered pipeline bypass, same-pass event flush, and disconnect cancellation recorded in `docs/research/server-sent-events.md`. |
 | `08c6d33d` | HTTP QUERY Method Architect | `research` | Modern Protocol Standards | **Complete** | RFC 10008 HTTP `QUERY` method analysis, HAProxy cache collision vulnerability discovery, composite cache key hashing, and Ibex integration blueprint recorded in `docs/research/http-query-method.md`. |
 | `189118e6` | WebSocket Protocol Architect | `research` | Real-Time & Multiplexing Protocols | **Complete** | RFC 6455 & RFC 8441 Extended CONNECT WebSocket architecture, `#![forbid(unsafe_code)]` SHA-1/base64 accept engine, tunnel transition, `timeout tunnel` scheduler integration, and cross-protocol bridging recorded in `docs/research/websocket-support.md`. |
@@ -95,7 +95,7 @@ This document records the work, findings, and deliverables produced by all backg
 - **Deferred Backend Handshake in TCP Mode**: In `Engine::init_client_session` and `step_stream`, deferred upstream connection until the PROXY header is received and parsed, guaranteeing that source IP load balancing (`balance source`) and stick tables track the real client IP rather than the intermediary proxy IP.
 - **Backend Transmission (`send-proxy` & `send-proxy-v2`)**: Implemented `maybe_prepend_send_proxy` in `crates/ibex-rt/src/engine.rs` to generate PROXY v1 (ASCII) and PROXY v2 (binary with TLVs) headers, prefixing them directly to upstream connection request buffers for both TCP and HTTP modes without double-prepending on connection retries.
 - **Chained PROXY Architecture**: Validated multi-hop chained proxying (`Client -> Ibex 1 [accept-proxy, send-proxy-v2] -> Ibex 2 [accept-proxy] -> Backend Server`), verifying that original client metadata and custom TLVs are preserved and relayed end-to-end.
-- **Comprehensive E2E Test Suite**: 11 end-to-end integration tests in `crates/ibex-rt/tests/proxy_protocol.rs` covering PROXY v1 HTTP, PROXY v2 TCP, strict v2 rejection of v1, malformed header rejection, upstream v1/v2 generation, source hashing with PROXY client IP, fragmented chunk streaming, TLV forwarding, and CRC32c wire validation.
+- **Comprehensive E2E Test Suite**: 11 end-to-end integration tests in `crates/ibex-rt/tests/it/proxy_protocol.rs` covering PROXY v1 HTTP, PROXY v2 TCP, strict v2 rejection of v1, malformed header rejection, upstream v1/v2 generation, source hashing with PROXY client IP, fragmented chunk streaming, TLV forwarding, and CRC32c wire validation.
 - **Quality & Parity**: 100% test pass rate across the workspace (`cargo test --workspace`), zero compiler warnings, and zero Clippy warnings under `cargo clippy --workspace --all-targets -- -D warnings`.
  
 ### 10. HAProxy 1.0 -> 3.5 Keyword Compatibility & Syntax Modernization (`4355d1b6`)
@@ -137,7 +137,7 @@ This document records the work, findings, and deliverables produced by all backg
   - Graceful soft reload (`-sf <pids...>`) via `SIGUSR1` and immediate termination (`-st <pids...>`) via `SIGTERM` using safe `rustix::process::kill_process`.
   - Resource and tuning overrides: global connection limit (`-n <maxconn>`), per-proxy default limit (`-N <maxsock>`), and virtual memory limits (`-m <megabytes>`) using `rustix::process::setrlimit`.
   - Master CLI socket binding (`-S <socket>`) and diagnostic reporting for specialized tuning flags (`-dr`, `-de`, `-dp`, `-dM`, `-dL`, `-u`, `-g`, `-U`, `-G`, `-ch`, `-e`).
-- **Verification & Test Coverage**: Written integration test suite in `crates/ibex-rt/tests/cli_options.rs` verifying `-c`, `-v`, `-vv`, `-h`, multiple `-f` files and directory expansion, `-p` PID creation, and `-n` parameter overrides.
+- **Verification & Test Coverage**: Written integration test suite in `crates/ibex-rt/tests/it/cli_options.rs` verifying `-c`, `-v`, `-vv`, `-h`, multiple `-f` files and directory expansion, `-p` PID creation, and `-n` parameter overrides.
 - **Deliverable**: Recorded in `docs/research/cli-options-compatibility.md`.
 
 ### 13. Unix Build Automation & Makefile Parity (`fb2023df`)
@@ -150,7 +150,7 @@ This document records the work, findings, and deliverables produced by all backg
 - **Health Check Control (`enable_health` / `disable_health`)**: Added `enabled: bool` to `ServerCheckState` in `crates/ibex-rt/src/check.rs`, enabling dynamic pausing/resuming of active health checks via Web UI and CLI socket while preserving administrative state.
 - **Stats Counter Clearing (`clear_counters`)**: Added `ProxyStats::clear` zeroing traffic and error counters (`bytes_in`, `bytes_out`, `cum_conn`, `failed_conn`, `hrsp_5xx`) and resetting `max_conn` via Web Admin and CLI socket.
 - **Dynamic Maxconn Tuning (`set_maxconn`)**: Added live tuning of frontend, backend, and server connection limits from the Web Admin table and CLI applet.
-- **Verification**: Created comprehensive integration suite in `crates/ibex-rt/tests/stats_admin_sessions.rs` (6/6 tests passing).
+- **Verification**: Created comprehensive integration suite in `crates/ibex-rt/tests/it/stats_admin_sessions.rs` (6/6 tests passing).
 
 ### 15. Server-Sent Events (SSE) Protocol & Unbuffered Pipeline Architecture (`fa9404f9`)
 - **HAProxy 3.5 Streaming Audit**: Audited `src/http_ana.c`, `src/mux_h1.c`, `src/mux_h2.c`, and `src/flt_http_comp.c`.

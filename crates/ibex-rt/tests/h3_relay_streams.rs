@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
+// Own binary (T260): lowers the test process's RLIMIT_NOFILE for one test (other tests would get EMFILE)
 
 //! The QUIC listener's side of the HTTP/3 relay (T130), driven without the engine: the test
 //! plays both the client (a `quinn-proto` connection, so it can send a request in pieces,

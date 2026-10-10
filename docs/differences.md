@@ -66,7 +66,7 @@ Look-ahead and look-behind (`(?=..)`, `(?!..)`, `(?<=..)`, `(?<!..)`), back-refe
 `a*+`, `a?+`, `a{1,2}+`), named groups (`(?<n>..)`, `(?P<n>..)`), inline flags (`(?i)`,
 `(?s)`, `(?m)`, `(?x)`), conditionals (`(?(1)a|b)`), `\K`, `\G`, `\Z`, `\h`, `\R`, `\N`.
 Each of the first group was measured on HAProxy and is a test in
-`crates/ibex-rt/tests/pcre_regex.rs`, in an ACL, in `replace-header` and in `regsub`.
+`crates/ibex-rt/tests/it/pcre_regex.rs`, in an ACL, in `replace-header` and in `regsub`.
 
 ### What is refused at load
 
@@ -150,7 +150,7 @@ without it. HAProxy accepts them (when built with the feature).
 Not refused, on purpose:
 
 - QUIC / HTTP/3 (`quic4@`, `quic6@`, `proto quic`, `alpn h3`): Ibex has a QUIC listener
-  (`ibex-quic`, exercised by `crates/ibex-config/tests/quic_bind.rs`); it is experimental.
+  (`ibex-quic`, exercised by `crates/ibex-config/tests/it/quic_bind.rs`); it is experimental.
   The reference HAProxy binary here is built without QUIC and refuses these.
 - `resolvers` sections: accepted, their keywords are not used by the data path; a server's
   `resolvers` keyword and `server-template` are refused (see `server_keywords.rs`).

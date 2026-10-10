@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
+// Own binary (T260): counts the test process's allocations (#[global_allocator])
 
 //! `http-request capture <expr>` compiles its expression when the proxy is built, not on
 //! every request (T105). Measured with `tools/allocprofile` (`ALLOCPROFILE_CAPTURE=1`),

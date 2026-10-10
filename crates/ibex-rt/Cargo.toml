@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Ibex runtime: thread-per-core poller, listeners, and the accept path"
+autotests = false
 
 [dependencies]
 ibex-sched = { path = "../ibex-sched" }
@@ -34,3 +35,88 @@ tempfile = "3"
 rcgen = "0.13"
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+# One integration-test binary (T260): tests/it/main.rs declares each test file as a module.
+[[test]]
+name = "it"
+path = "tests/it/main.rs"
+
+# Own process: counts the test process's allocations (#[global_allocator]) and RSS
+[[test]]
+name = "backend_memory"
+path = "tests/backend_memory.rs"
+
+# Own process: counts the test process's allocations (#[global_allocator])
+[[test]]
+name = "capture_rule_allocations"
+path = "tests/capture_rule_allocations.rs"
+
+# Own process: lowers the test process's RLIMIT_NOFILE (other tests would get EMFILE)
+[[test]]
+name = "cli_accept_emfile"
+path = "tests/cli_accept_emfile.rs"
+
+# Own process: measures the CPU use of the test process, which every other test in a shared binary adds to
+[[test]]
+name = "cpu_measurement"
+path = "tests/cpu_measurement.rs"
+
+# Own process: sets the process-global tune.bufsize through in-process engines and asserts on it
+[[test]]
+name = "cli_applet"
+path = "tests/cli_applet.rs"
+
+# Own process: counts the test process's allocations (#[global_allocator])
+[[test]]
+name = "h2_per_request_work"
+path = "tests/h2_per_request_work.rs"
+
+# Own process: lowers the test process's RLIMIT_NOFILE for one test (other tests would get EMFILE)
+[[test]]
+name = "h3_relay_streams"
+path = "tests/h3_relay_streams.rs"
+
+# Own process: counts the test process's allocations (#[global_allocator]) and RSS
+[[test]]
+name = "idle_conn_memory"
+path = "tests/idle_conn_memory.rs"
+
+# Own process: lowers the test process's RLIMIT_NOFILE (other tests would get EMFILE)
+[[test]]
+name = "logfwd_accept_emfile"
+path = "tests/logfwd_accept_emfile.rs"
+
+# Own process: raises the test process's RLIMIT_NOFILE, which the ibex processes of other tests inherit (global_maxconn_default predicts maxconn from it)
+[[test]]
+name = "maxconn_limits"
+path = "tests/maxconn_limits.rs"
+
+# Own process: sets RLIMIT_CORE 0 for the test process and re-executes itself by test name
+[[test]]
+name = "panic_policy"
+path = "tests/panic_policy.rs"
+
+# Own process: installs its own #[global_allocator] (and includes src/promex.rs by path)
+[[test]]
+name = "promex"
+path = "tests/promex.rs"
+
+# Own process: counts the test process's allocations and bytes (#[global_allocator])
+[[test]]
+name = "request_allocations"
+path = "tests/request_allocations.rs"
+
+# Own process: counts the test process's allocations (#[global_allocator])
+[[test]]
+name = "ring_log_allocations"
+path = "tests/ring_log_allocations.rs"
+
+# Own process: runs an in-process engine with tune.bufsize 4096, which is process-global (every other in-process engine sets 16384)
+[[test]]
+name = "tcp_proxy"
+path = "tests/tcp_proxy.rs"
+
+# Own process: counts the test process's allocations (#[global_allocator]) and RSS
+[[test]]
+name = "worker_proxy_memory"
+path = "tests/worker_proxy_memory.rs"

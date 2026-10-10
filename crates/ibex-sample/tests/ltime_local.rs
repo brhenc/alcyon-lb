@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
+// Own binary (T260): sets the process's TZ environment variable, which local-time formatting in every other test reads
 
 //! `ltime`, `ms_ltime` and `us_ltime` format in the process's local time zone (`localtime_r`),
 //! with `%z` the numeric offset and `%Z` the zone's abbreviation; `utime` stays in GMT

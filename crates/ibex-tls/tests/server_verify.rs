@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
+// Own binary (T260): installs a process-wide default rustls CryptoProvider, which every other test in a shared binary would see
 
 //! How a server's certificate is checked (T113): `HAProxy`'s rules, not webpki's.
 //!

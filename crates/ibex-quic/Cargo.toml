@@ -6,6 +6,7 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+autotests = false
 
 [dependencies]
 quinn-proto = { version = "0.11", default-features = false, features = ["rustls-ring"] }
@@ -23,3 +24,7 @@ rustix = { version = "0.38", features = ["event", "net", "std"] }
 [lints]
 workspace = true
 
+# One integration-test binary (T260): tests/it/main.rs declares each test file as a module.
+[[test]]
+name = "it"
+path = "tests/it/main.rs"
