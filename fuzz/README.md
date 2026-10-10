@@ -93,7 +93,7 @@ cargo run --manifest-path fuzz/Cargo.toml -- \
 
 # libFuzzer targets (`fuzz/libfuzzer/`) — crash-finding, no oracle
 
-The harness above compares Ibex with HAProxy. The nine targets below only look for
+The harness above compares Ibex with HAProxy. The targets below only look for
 **panics, hangs and out-of-memory** on arbitrary input (task R1, `docs/milestones.md`).
 They are a separate crate, `fuzz/libfuzzer/` (its own `[workspace]`, not a member of the
 Ibex workspace); libFuzzer links only into those binaries, never into Ibex. The normal
@@ -110,6 +110,12 @@ Ibex workspace); libFuzzer links only into those binaries, never into Ibex. The 
 | `logfmt` | log-format compiler (`LogFormat::compile`, `compile_unique_id`) |
 | `sample_expr` | `ibex_sample::Expr::parse` |
 | `regex` | `ibex_regex::UserRegex::new` |
+| `check_reply` | health-check replies: Redis, SMTP, PgSQL, SSL hello, http-check, tcp-check expect (`ibex_rt::check_reply`) |
+| `check_ldap_mysql` | LDAP and MySQL check replies (apart: known panics, review #7) |
+| `cookie` | `cookie::client_side` and `process_response` over hostile Cookie / Set-Cookie values |
+| `syslog` | log-forward stream framing (`logfwd::read_frame`), RFC 5424/3164 parse, header rebuild |
+| `cli` | stats socket command lines at user/operator level (`CliApplet::process_commands`) |
+| `h2_mux` | server `MuxH2` fed a client byte stream; asserts it holds at most 2 MiB |
 
 ## One-time setup (needs internet, once)
 

@@ -51,6 +51,12 @@ fn scan(pattern: &str) -> Scan {
                 if matches!(b.get(i + 1), Some(b'X')) {
                     out.unsupported.get_or_insert("the \\X extended grapheme cluster");
                 }
+                // `fancy-regex` compiles every `\\g<n>`, `\\g'n'` and `\\gN` as a subroutine call,
+                // inlined: two `\\g0` took gigabytes (T242). PCRE2 reads the first two as
+                // recursion, refused here as `(?R)` is.
+                if b.get(i + 1) == Some(&b'g') && b.get(i + 2).is_some_and(|c| matches!(c, b'<' | b'\'' | b'0'..=b'9')) {
+                    out.unsupported.get_or_insert("recursion and subroutine calls");
+                }
                 i += 2;
                 prev = b'a';
                 continue;
@@ -402,6 +408,18 @@ mod tests {
         }
         for p in ["[a]++b", "[[:alpha:]]++b", "[^]a]*+b", r"[\]]++b", r"\++"] {
             assert!(UserRegex::new(p).unwrap().is_backtracking() || p == r"\++", "{p}");
+        }
+    }
+
+    /// T242 (fuzz regex): `fancy-regex` reads every `\\g<n>`, `\\g'n'` and `\\gN` as a
+    /// subroutine call and inlines it at compile time, so a 53-byte pattern with two `\\g0`
+    /// took over 2 GB. PCRE2 (HAProxy) accepts `\\g<0>` as recursion, which Ibex refuses
+    /// in its other spellings; `\\g0` it rejects outright.
+    #[test]
+    fn subroutine_calls_by_backslash_g_are_refused() {
+        for p in [r"x\g<0>?", r"(a)\g'1'", r"(?<n>a)\g<n>", r"\g0", r"(a)|b\g1"] {
+            let e = UserRegex::new(p).unwrap_err().to_string();
+            assert!(e.contains("recursion"), "{p}: {e}");
         }
     }
 

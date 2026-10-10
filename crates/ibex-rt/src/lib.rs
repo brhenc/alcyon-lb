@@ -16,6 +16,7 @@ pub mod buf;
 pub mod check;
 pub mod cli_listener;
 pub mod crash;
+pub mod check_reply;
 pub use ibex_config::cond;
 pub mod cookie;
 pub mod cpu;

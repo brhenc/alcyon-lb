@@ -1,0 +1,3 @@
+show table be data.conn_cur gt 0
+get var proc.x
+show sess

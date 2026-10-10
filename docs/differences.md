@@ -77,7 +77,7 @@ A pattern with a PCRE feature `fancy-regex` lacks is refused when the configurat
 bad regular expression <(?R)>: PCRE feature not supported by Ibex: recursion and subroutine calls (see docs/differences.md)
 ```
 
-- recursion and subroutine calls: `(?R)`, `(?1)`, `(?-1)`, `(?+1)`, `(?&name)`, `(?P>name)`,
+- recursion and subroutine calls: `(?R)`, `(?1)`, `(?-1)`, `(?+1)`, `(?&name)`, `(?P>name)`, `\g<n>`, `\g'n'` (and `\gN`, which `fancy-regex` would compile as a call, not a back-reference),
 - callouts `(?C)`,
 - branch reset groups `(?|..)`,
 - `\X` (extended grapheme cluster),

@@ -1690,3 +1690,71 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 ---
 
+
+---
+
+## libFuzzer, T242 (2026-10-10): what a hostile client, server or log sender controls
+
+Six new targets in `fuzz/libfuzzer` (seed corpora committed, generated corpora not):
+`check_reply` (Redis, SMTP, PgSQL, SSL hello, http-check response, tcp-check expect, through
+the pure functions now in `crates/ibex-rt/src/check_reply.rs`), `check_ldap_mysql` (apart,
+because of the known review #7 panics), `cookie` (`client_side` + `process_response`),
+`syslog` (`logfwd::read_frame` RFC 6587 framing, `loghdr::parse`, `build_header` in every
+format), `cli` (`CliApplet::process_commands` at user/operator level) and `h2_mux` (a
+server-side `MuxH2` fed as proxy.rs feeds it, asserting it holds at most 2 MiB).
+
+Every target 900 s, `-rss_limit_mb=2048 -timeout=5 -max_len=65536`, at most 4 at once.
+The machine was paused (SIGSTOP) 12:00-12:06: proxy_protocol, config and sample_expr lost
+about 6 minutes of their 900 s; their slow-unit files and a logfmt "timeout" were the pause
+(each input reruns in under 0.5 s); logfmt, cookie and regex were run again in full.
+
+| target | execs | exec/s | cov | result |
+|---|---|---|---|---|
+| h1_request | 10.9 M | 12 k | 1570 | clean |
+| h1_response | 8.6 M | 9.5 k | 759 | clean |
+| h2_frames | 9.7 M | 10.7 k | 986 | clean |
+| hpack | 10.7 M | 11.9 k | 490 | clean |
+| proxy_protocol | 221 M | 245 k | 491 | clean |
+| config | 3.3 M | 3.6 k | 14714 | clean |
+| sample_expr | 1.3 M | 1.5 k | 12629 | clean |
+| logfmt | 231 k | 256 | 11694 | clean (rerun) |
+| regex | 625 k | 687 | 13160 | first run: OOM, fixed (1); rerun clean |
+| check_reply | 1.4 M | 1.5 k | 17698 | clean |
+| h2_mux | 6.5 M | 7.3 k | 1440 | clean after fix (2) |
+| cookie | 8.0 M | 8.9 k | 915 | first run: panic, fixed (3); rerun clean |
+| syslog | 2.0 M | 2.2 k | 614 | clean |
+| cli | 1.7 M | 1.9 k | 6832 | clean |
+| check_ldap_mysql | 175 k (fork mode) | - | 169 | 1901 crashes, all review #7 (4) |
+
+1. **regex: `\g` subroutine calls compile without bound.** `fancy-regex` reads every
+   `\g<n>`, `\g'n'` and `\gN` as a subroutine call and inlines it: a 53-byte pattern with two
+   `\g0` passed 2 GB in `UserRegex::new`. Configuration-controlled (patterns come from the
+   config or the admin CLI), but `haproxy -c` style checking would hang. Fixed: refused as
+   "recursion and subroutine calls", as `(?R)` already was (PCRE2 takes `\g<0>` as
+   recursion; HAProxy's `\gN` is a back-reference it rejects without named groups).
+   Test `ibex-regex` `subroutine_calls_by_backslash_g_are_refused`.
+2. **h2: HPACK references amplify what a connection holds.** Found while writing `h2_mux`:
+   one-byte references (`0xbe`) to a 4000-byte dynamic-table entry made 10.5 KB of HEADERS
+   hold 23 MB in 61 streams. HAProxy 3.5-dev8 (measured): four 3800-byte fields answered,
+   four 3850-byte fields RST_STREAM PROTOCOL_ERROR, past about 20 KB decoded GOAWAY
+   COMPRESSION_ERROR. Fixed: a request head whose decoded names and values pass
+   16384 - 1024 bytes is a stream error PROTOCOL_ERROR (the GOAWAY tier is not copied).
+   Tests `mux_h2::tests::hpack_references_do_not_amplify_what_the_connection_holds`,
+   `a_request_head_past_the_buffer_is_a_stream_error`. Left: trailers have no byte bound
+   (202 fields of 4 KB per stream); HAProxy, with a silent backend, neither resets nor
+   answers 40 KB of trailers.
+3. **cookie: removing a value after leading blanks walked below 0.** `del_hdr_value`'s
+   `while spht(h[prev - 1])` ran past the start of a value that begins with blanks
+   (subtract overflow; an index panic without overflow checks). HAProxy's walk stops at the
+   header's `:`. Fixed with `prev > 0`. Test `cookie::tests::removing_a_cookie_after_leading_blanks_stops_at_the_start`.
+4. **LDAP / MySQL check replies (review #7, T238 fixes them; not fixed here).** Panic sites
+   in `check_reply.rs` at this branch, from 300 of the 1901 crashes: MySQL `&b[5..4 + plen_hs]`
+   with a handshake length under 1 (215), MySQL error packet `&b[7..4 + plen_hs]` (62), MySQL
+   `b[offset + 4]` with a zero result length (8), MySQL `&b[msg_offset..end_pos]` (7), LDAP
+   `b[1]` on a one-byte reply at EOF (7), LDAP `b[ptr]` after the bind header at EOF (1).
+
+Not found by fuzzing (a cursor never streams forever) and owned by T239: log-forward's LF
+framing reads a line without bound and octet counting allocates up to ~10 MB from the
+prefix; the CLI's `in_buf` likewise. Also noticed: the Redis, SMTP, LDAP, MySQL, PgSQL and
+SSL-hello checks read their reply without a cap (tcp-check stops at 16384), so a server that
+streams without CRLF grows the check's buffer until the check times out.

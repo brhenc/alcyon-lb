@@ -417,6 +417,10 @@ impl H2MuxContext {
     }
 }
 
+/// Bytes of decoded header names and values a request may carry: `tune.bufsize` (16384)
+/// less `tune.maxrewrite` (1024), the room HAProxy's request buffer gives a head.
+const MAX_REQUEST_HEAD_BYTES: usize = 16384 - 1024;
+
 /// Header fields a request may carry once converted (HAProxy's `tune.http.maxhdr` 101,
 /// less one: measured, host + 99 headers pass and host + 100 are refused).
 const MAX_REQUEST_HEADERS: usize = 100;
@@ -760,6 +764,13 @@ impl MuxH2 {
         let host_from_authority = decoded_headers.iter().any(|h| h.name == ":authority")
             && !decoded_headers.iter().any(|h| h.name == "host");
         let too_many = ctx.is_server && regular + usize::from(host_from_authority) > MAX_REQUEST_HEADERS;
+        // The decoded request must fit HAProxy's request buffer less its rewrite reserve
+        // (tune.bufsize 16384 - tune.maxrewrite 1024): one-byte HPACK references to a large
+        // table entry otherwise decode to megabytes per request (T242, fuzz h2_mux).
+        // Measured: four 3800-byte fields pass, four 3850-byte fields are RST_STREAM
+        // PROTOCOL_ERROR.
+        let too_big = ctx.is_server
+            && decoded_headers.iter().map(|h| h.name.len() + h.value.len()).sum::<usize>() > MAX_REQUEST_HEAD_BYTES;
 
         let abs_prefix = {
             let get = |n: &str| decoded_headers.iter().find(|h| h.name == n).map(|h| h.value.as_str());
@@ -778,7 +789,7 @@ impl MuxH2 {
         ctx.highest_opened = ctx.highest_opened.max(stream_id);
 
         // Extract pseudo-headers and construct HTX blocks
-        let converted = if too_many {
+        let converted = if too_many || too_big {
             Err(())
         } else {
             crate::htx::pseudo_headers_to_htx(decoded_headers, HttpVersion::Http20).map_err(|_| ())
@@ -1500,4 +1511,67 @@ mod tests {
         let at = g.windows(9).position(|w| w[3] == 7).expect("GOAWAY");
         assert_eq!(&g[at + 9 + 4..at + 9 + 8], &[0, 0, 0, 6], "{g:?}");
     }
+
+    /// T242 (fuzz h2_mux): an HPACK block of one-byte references to a 4000-byte dynamic
+    /// table entry decodes to ~380 KB per request; requests a slow backend has not taken
+    /// stay in their streams. What sixty such requests (10 KB on the wire) hold must stay
+    /// bounded.
+    #[test]
+    fn hpack_references_do_not_amplify_what_the_connection_holds() {
+        let (mux, mut ctx) = open_conn();
+        let mut first = vec![0x82, 0x86, 0x84, 0x40, 0x01, b'x', 0x7f];
+        let mut n = 4000 - 127;
+        while n >= 128 {
+            first.push((n & 0x7f) as u8 | 0x80);
+            n >>= 7;
+        }
+        first.push(n as u8);
+        first.extend(std::iter::repeat_n(b'a', 4000));
+        first.extend(std::iter::repeat_n(0xbe, 90));
+        let mut wire = Frame::Headers { flags: frame_flags::END_HEADERS | frame_flags::END_STREAM, stream_id: 1, header_block: first }.encode();
+        for id in (3..123).step_by(2) {
+            let mut block = vec![0x82, 0x86, 0x84];
+            block.extend(std::iter::repeat_n(0xbe, 95));
+            wire.extend(Frame::Headers { flags: frame_flags::END_HEADERS | frame_flags::END_STREAM, stream_id: id, header_block: block }.encode());
+        }
+        let _ = mux.parse(&mut ctx, &wire);
+        let held: usize = ctx
+            .streams
+            .values()
+            .flat_map(|s| s.rx_htx.blocks())
+            .map(|b| match b {
+                HtxBlock::Header(h) => h.name.len() + h.value.len(),
+                _ => 0,
+            })
+            .sum();
+        assert!(held <= 2 << 20, "{} streams hold {held} bytes of headers from {} bytes", ctx.streams.len(), wire.len());
+    }
+
+    /// The edge HAProxy shows (measured on 3.5-dev8): `:method GET`, `:scheme http`,
+    /// `:path /`, `:authority a` and four `x` fields of 3800 bytes are answered; of 3850
+    /// bytes, the stream is reset with PROTOCOL_ERROR and the connection lives on.
+    #[test]
+    fn a_request_head_past_the_buffer_is_a_stream_error() {
+        for (len, refused) in [(3800usize, false), (3850, true)] {
+            let (mux, mut ctx) = open_conn();
+            let mut block = vec![0x82, 0x86, 0x84, 0x41, 0x01, b'a', 0x40, 0x01, b'x', 0x7f];
+            let mut n = len - 127;
+            while n >= 128 {
+                block.push((n & 0x7f) as u8 | 0x80);
+                n >>= 7;
+            }
+            block.push(n as u8);
+            block.extend(std::iter::repeat_n(b'a', len));
+            block.extend([0xbe; 3]);
+            let sent = ctx.tx_buf.len();
+            let wire = Frame::Headers { flags: frame_flags::END_HEADERS | frame_flags::END_STREAM, stream_id: 1, header_block: block }.encode();
+            mux.parse(&mut ctx, &wire).expect("no connection error");
+            let rst = ctx.tx_buf[sent..].windows(13).any(|w| w[3] == 3 && w[5..9] == [0, 0, 0, 1] && w[9..13] == [0, 0, 0, 1]);
+            assert_eq!(rst, refused, "len {len}");
+            let kept = ctx.streams.get(&1).is_some_and(|s| s.rx_htx.blocks().iter().any(|b| matches!(b, HtxBlock::Eoh)));
+            assert_eq!(kept, !refused, "len {len}");
+            assert!(ctx.goaway_sent.is_none());
+        }
+    }
 }
+

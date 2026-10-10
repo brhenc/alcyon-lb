@@ -936,4 +936,17 @@ mod tests {
         let h = [("Cache-Control".to_string(), "no-cache".to_string()), ("Expires".to_string(), "x".to_string())];
         assert!(!response_cacheable(GET, 200, &h));
     }
+
+    /// T242 (fuzz cookie): a value removed after a run of blanks that starts the header
+    /// walked `prev - 1` below 0 (subtract overflow, a panic in a checked build). HAProxy's
+    /// walk stops at the header's `:`; here at the value's start.
+    #[test]
+    fn removing_a_cookie_after_leading_blanks_stops_at_the_start() {
+        for opts in ["insert indirect", "prefix", "rewrite", "insert indirect preserve"] {
+            for h in ["\t\t;SRV=a", " ;SRV=a, x=1", "\t ,SRV=b"] {
+                let _ = client(opts, 1000, &[h]);
+            }
+        }
+    }
 }
+
