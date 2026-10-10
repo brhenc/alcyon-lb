@@ -1021,6 +1021,21 @@ impl TcpSession {
         }
     }
 
+    /// Rewrites each trailer line of the request in `req` ended by a lone LF to end by
+    /// CRLF, before any of it is forwarded (see [`txn::MsgState::trailer_bare_lf`]).
+    fn end_req_trailer_lines_with_crlf(&mut self) {
+        if self.mode != Mode::Http {
+            return;
+        }
+        let Some(t) = &self.txn else { return };
+        while let Some(at) = t.req.trailer_bare_lf(self.req.readable()) {
+            let mut fixed = Vec::with_capacity(at + 2);
+            fixed.extend_from_slice(&self.req.readable()[..at]);
+            fixed.extend_from_slice(b"\r\n");
+            self.req.replace_prefix(at + 1, &fixed);
+        }
+    }
+
     /// How much of `req` may go to the server now: in HTTP, the current request and
     /// nothing after it. A pipelined request waits in `req` for this transaction to end,
     /// and is then routed on its own.
@@ -1230,6 +1245,9 @@ impl TcpSession {
         let raw = self.htx_buf.raw_slice_mut();
         let mut slice = ibex_proto::htx::HtxSlice::new(raw);
         stream.parse(&self.req.readable()[..head_len], &mut slice)?;
+        if let Some(status) = stream.refusal() {
+            return Err(ibex_proto::h1::Refusal::error(status, "refused after parsing"));
+        }
         let mut close = stream.connection_close();
         // `Content-Length` beside `Transfer-Encoding`: forwarded as HAProxy does
         // (`src/h1.c`, `h1_parse_msg_hdrs`, "T-E + C-L: force close and remove C-L"). The
@@ -1477,6 +1495,7 @@ impl TcpSession {
                     }
                     Io::Done(n) if n > 0 => {
                         self.req.commit(n);
+                        self.end_req_trailer_lines_with_crlf();
                         self.bytes_in += n as u64;
                         self.log.first_byte_now();
                         changed = true;
@@ -1732,9 +1751,13 @@ impl TcpSession {
                 // stream needs no state across calls. One allocation per request head
                 // for the trait object; it buys the framing rules and the seam that lets
                 // the parser be swapped.
-                let Ok(mut close) = self.validate_request_head(total_hdr_len) else {
-                    self.fail_request(400);
-                    return Ok(true);
+                let mut close = match self.validate_request_head(total_hdr_len) {
+                    Ok(close) => close,
+                    Err(e) => {
+                        // 400, or the 413 / 422 HAProxy answers to some heads (T276).
+                        self.fail_request(ibex_proto::h1::Refusal::status_of(&e));
+                        return Ok(true);
+                    }
                 };
                 if self.has_htx {
                     let (req_m, req_u, conn_close, wire_replacement) = {
@@ -1850,12 +1873,26 @@ impl TcpSession {
                 // will be forwarded.
                 let framing = find_eoh(self.req.readable())
                     .map_or(txn::Framing::None, |(h, e)| txn::request_framing(&self.req.readable()[..h + e]));
+                // The chunked body already received with the head is checked before any of
+                // the request is forwarded: HAProxy parses what is in its buffer into HTX
+                // first, and answers a malformed chunk with 400 without contacting the
+                // server. Forwarded, the bytes Ibex refuses mid-body reached the server
+                // verbatim (tasks/T276, V&V VV-2).
+                if framing == txn::Framing::Chunked {
+                    let mut body = txn::MsgState::head(framing);
+                    body.advance(self.req.readable());
+                    if body == txn::MsgState::Error {
+                        self.fail_request(400);
+                        return Ok(true);
+                    }
+                }
                 let mut txn = HttpTxn::new(framing, close || self.close_client);
                 txn.req_htx = req_htx;
                 txn.req_http11 = self.req.readable().split(|&b| b == b'\n').next().is_some_and(|l| l.trim_ascii_end().ends_with(b"HTTP/1.1"));
                 // The client's own method: rules that rewrite it have not run yet.
                 txn.client_head = self.req_method.as_deref().is_some_and(|m| m.eq_ignore_ascii_case("HEAD"));
                 self.txn = Some(txn);
+                self.end_req_trailer_lines_with_crlf();
                 self.cli_state = ScState::Established;
                 changed = true;
             } else if self.req.readable().len() + 56 >= self.bufsize {

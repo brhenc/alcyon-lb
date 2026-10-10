@@ -145,6 +145,12 @@ pub trait HttpStream: Send {
     /// `option accept-unsafe-violations-in-http-request`: let a `#` in the request target
     /// through. Only the built-in parser reads it.
     fn set_accept_unsafe_request(&mut self, _on: bool) {}
+
+    /// A status the message that parsed must still be refused with (see
+    /// [`crate::h1::H1Parser::refusal`]).
+    fn refusal(&self) -> Option<u16> {
+        None
+    }
 }
 
 /// A parser implementation. One per process.
@@ -201,6 +207,10 @@ impl HttpStream for H1Parser {
 
     fn set_accept_unsafe_request(&mut self, on: bool) {
         self.accept_unsafe_request = on;
+    }
+
+    fn refusal(&self) -> Option<u16> {
+        self.refusal
     }
 }
 
@@ -392,6 +402,10 @@ impl HttpStream for DifferentialStream {
     fn set_accept_unsafe_request(&mut self, on: bool) {
         self.primary.set_accept_unsafe_request(on);
         self.candidate.set_accept_unsafe_request(on);
+    }
+
+    fn refusal(&self) -> Option<u16> {
+        self.primary.refusal().or_else(|| self.candidate.refusal())
     }
 }
 
