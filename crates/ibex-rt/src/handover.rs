@@ -130,9 +130,9 @@ pub fn serve_getsocks(stream: &UnixStream) -> io::Result<usize> {
     }
     // Duplicates, so that the registry is not held while a client that does not read keeps
     // the send waiting: listeners registering or withdrawing would wait with it.
-    let exposed: Vec<(SocketAddr, OwnedFd)> = {
+    let exposed: Vec<(Kind, SocketAddr, OwnedFd)> = {
         let reg = EXPOSED.lock().map_err(|_| io::Error::other("poisoned"))?;
-        reg.iter().map(|(a, fd)| fd.try_clone().map(|fd| (*a, fd))).collect::<io::Result<_>>()?
+        reg.iter().map(|(k, a, fd)| fd.try_clone().map(|fd| (*k, *a, fd))).collect::<io::Result<_>>()?
     };
     // The whole answer gets this long, not each message.
     let deadline = Instant::now() + SEND_BUDGET;
