@@ -268,7 +268,7 @@ def run_one(binary, label, outdir, secs, name):
                    cpu_s=round(sum(s[1] for s in live[:secs]) / 100, 1),
                    cpu_peak_pct=round(max([s[1] for s in live] or [0])),
                    peak_fds=max([s[2] for s in live] or [0]), end_fds=end[2] if end else None,
-                   cpu_series=[round(s[1]) for s in live], fds_series=[s[2] for s in live],
+                   cpu_series=[round(s[1]) for s in live], fds_series=[s[2] for s in live], rss_series=[s[0] // 1024 for s in live],
                    exit=proxy.returncode)
         res["panics"] = len(re.findall(r"panic|SIGSEGV|abort", open(f"{run}/proxy.log").read(), re.I))
         json.dump(res, open(f"{outdir}/{label}-{name}.json", "w"))
