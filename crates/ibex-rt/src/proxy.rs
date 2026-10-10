@@ -352,6 +352,10 @@ pub struct TcpSession {
     /// The last [`Self::advance`] stopped at its bound with its passes still making
     /// progress: there is more to do, and maybe no socket event to say so.
     pub passes_ran_out: bool,
+    /// The client connection failed (a TLS record that does not decrypt, a socket error),
+    /// as opposed to the client closing or resetting it: an HTTP/2 connection that ends so
+    /// before its preface is not logged (`HAProxy` only logs a read0 there, T272).
+    pub cli_failed: bool,
     pub created_at: Instant,
     pub pending_resp: Option<Box<(Vec<u8>, usize)>>,
     pub fc_src: Option<SocketAddr>,
@@ -633,6 +637,7 @@ impl TcpSession {
             srv_cant_recv: false,
             cli_cant_recv: false,
             passes_ran_out: false,
+            cli_failed: false,
             created_at: Instant::now(),
             bufsize: crate::buf::get_bufsize(),
             maxrewrite: 1024,
@@ -1279,8 +1284,16 @@ impl TcpSession {
         changed_io || changed_trans
     }
 
+    /// The client negotiated HTTP/2 (ALPN `h2`) and its preface is not all in yet: the
+    /// connection is `HAProxy`'s h2 mux's, waiting for the preface, not an HTTP/1 one.
+    #[must_use]
+    pub fn h2_preface_pending(&self) -> bool {
+        self.h2_ctx.is_none() && self.cli_xprt.alpn() == Some(b"h2".as_slice())
+    }
+
     /// The client connection failed: it is closed, as one the client reset.
     fn client_conn_failed(&mut self) {
+        self.cli_failed = true;
         if !matches!(self.cli_state, ScState::Closed | ScState::Error) {
             self.cli_state = ScState::Closed;
         }
@@ -1482,6 +1495,18 @@ impl TcpSession {
                 let _ = MuxH2.parse(&mut h2, &to_parse).map_err(|_| h2.ensure_goaway());
                 self.req.clear();
                 self.h2_ctx = Some(Box::new(h2));
+                changed = true;
+            } else if self.h2_preface_pending() && !self.req.is_empty() && !H2_CONN_PREFACE.starts_with(self.req.readable()) {
+                // ALPN `h2` and not the preface: `HAProxy`'s h2 mux fails the connection
+                // ("invalid preface received"), logs it and closes, sending nothing (the
+                // GOAWAY may be omitted); it is no HTTP/1 request. The mux holds the error,
+                // as one it raised itself, for the log (T272).
+                self.req.clear();
+                let mut h2 = H2MuxContext::new(ibex_proto::conn::ConnId(0), true);
+                h2.goaway_sent = Some((0, ibex_proto::h2::H2Error::ProtocolError));
+                self.h2_ctx = Some(Box::new(h2));
+                self.cli_state = ScState::Closed;
+                self.ending.get_or_insert(Ending::ClientAbort);
                 changed = true;
             }
         }

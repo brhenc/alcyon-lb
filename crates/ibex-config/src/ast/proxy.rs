@@ -70,6 +70,9 @@ pub struct DefaultsSection {
     pub persist: bool,
     /// `option dontlognull`: no log line for a connection that carried nothing.
     pub dontlognull: bool,
+    /// `option http-ignore-probes`: a connection that sends nothing before it closes or
+    /// times out is sent nothing, not logged and not counted.
+    pub http_ignore_probes: bool,
     /// `option dontlog-normal`, `option log-separate-errors` and `option logasap`, as the
     /// `LOG_OPT_*` bits.
     pub log_opts: u8,
@@ -282,6 +285,9 @@ pub struct ListenSection {
     pub persist: bool,
     /// `option dontlognull`: no log line for a connection that carried nothing.
     pub dontlognull: bool,
+    /// `option http-ignore-probes`: a connection that sends nothing before it closes or
+    /// times out is sent nothing, not logged and not counted.
+    pub http_ignore_probes: bool,
     /// `option dontlog-normal`, `option log-separate-errors` and `option logasap`, as the
     /// `LOG_OPT_*` bits.
     pub log_opts: u8,
@@ -434,6 +440,7 @@ impl Default for ListenSection {
             http_mode: HttpMode::KeepAlive,
             persist: false,
             dontlognull: false,
+            http_ignore_probes: false,
             log_opts: 0,
             cliexp: Vec::new(),
             srvexp: Vec::new(),
@@ -539,6 +546,9 @@ pub struct FrontendSection {
     pub http_mode: HttpMode,
     /// `option dontlognull`: no log line for a connection that carried nothing.
     pub dontlognull: bool,
+    /// `option http-ignore-probes`: a connection that sends nothing before it closes or
+    /// times out is sent nothing, not logged and not counted.
+    pub http_ignore_probes: bool,
     /// `option h1-case-adjust-bogus-client` ([`H1_ADJ_CLIENT`]).
     pub h1_adjust: u8,
     /// `option dontlog-normal`, `option log-separate-errors` and `option logasap`, as the
@@ -612,6 +622,7 @@ impl Default for FrontendSection {
             buffer_request: false,
             http_mode: HttpMode::KeepAlive,
             dontlognull: false,
+            http_ignore_probes: false,
             h1_adjust: 0,
             log_opts: 0,
             stick_table: None,

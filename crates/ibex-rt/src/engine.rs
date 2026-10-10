@@ -1481,6 +1481,9 @@ pub struct Proxy {
     pub log_format: Option<Arc<crate::logfmt::LogFormat>>,
     /// `option dontlognull`: a connection that carried nothing logs nothing.
     pub dont_log_null: bool,
+    /// `option http-ignore-probes`: a connection that sends nothing before it closes or
+    /// times out is sent nothing and neither logged nor counted (T272).
+    pub ignore_probes: bool,
     /// `option dontlog-normal`, `option log-separate-errors`, `option logasap`: the
     /// `ibex_config::LOG_OPT_*` bits.
     pub log_opts: u8,
@@ -2585,6 +2588,32 @@ fn set_stream_log(entry: &mut SessionEntry, proxies: &[Proxy], pid: u32) {
     leave_backend(entry, proxies);
 }
 
+/// How an HTTP/2 connection that ends without ever opening a stream is logged, as
+/// `HAProxy`'s h2 mux logs it (`h2_sess_log_conn`, `src/mux_h2.c`, measured in
+/// `tests/h2_connection_end_log.rs`): `None` for any other connection, `Some(true)` for a
+/// `0 PR--` line, `Some(false)` for none.
+///
+/// After the preface, only a connection error the mux raised is logged (Ibex's GOAWAY with
+/// an error code: a malformed SETTINGS, HEADERS on an even stream; a bad preface after ALPN
+/// `h2`, which `process_cli_io` records the same way); a close, a reset, a failed TLS
+/// record or `timeout client` is not. `HAProxy` logs most of its connection errors, not all
+/// (not a zero `WINDOW_UPDATE` increment); Ibex logs every one. Before the whole preface (ALPN
+/// `h2`): a close or reset is logged, except with nothing received under `option
+/// dontlognull` or `option http-ignore-probes`; a failed connection or a timeout is not.
+fn h2_no_stream_end(s: &TcpSession, fe: &Proxy) -> Option<bool> {
+    if let Some(h2) = s.h2_ctx.as_ref() {
+        if h2.highest_opened != 0 || !h2.streams.is_empty() {
+            return None;
+        }
+        return Some(h2.goaway_sent.is_some_and(|(_, e)| e != ibex_proto::h2::H2Error::NoError));
+    }
+    if !s.h2_preface_pending() {
+        return None;
+    }
+    let read0 = !s.cli_failed && matches!(s.ending, None | Some(crate::proxy::Ending::ClientAbort));
+    Some(read0 && !(s.req.is_empty() && (fe.dont_log_null || fe.ignore_probes)))
+}
+
 /// Why a connection that was to open with a PROXY header did not get past it, if that is
 /// what happened: the parser's refusal, or the client closing, resetting or timing out
 /// before sending one.
@@ -3094,6 +3123,7 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, list
         log_tag: listen.log_tag.as_deref().map(syslog_tag),
         log_format: compile_log_format(listen.log_format.as_ref(), listen.mode == Mode::Http),
         dont_log_null: listen.dontlognull,
+        ignore_probes: listen.http_ignore_probes,
         log_opts: listen.log_opts,
         unique_id_format: listen.unique_id_format.as_deref().and_then(compile_unique_id_format),
         unique_id_header: listen.unique_id_header.clone(),
@@ -3217,6 +3247,7 @@ fn init_proxy_from_frontend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, fe
         log_tag: fe.log_tag.as_deref().map(syslog_tag),
         log_format: compile_log_format(fe.log_format.as_ref(), fe.mode == Mode::Http),
         dont_log_null: fe.dontlognull,
+        ignore_probes: fe.http_ignore_probes,
         log_opts: fe.log_opts,
         unique_id_format: fe.unique_id_format.as_deref().and_then(compile_unique_id_format),
         unique_id_header: fe.unique_id_header.clone(),
@@ -3369,6 +3400,7 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, be:
         log_tag: be.log_tag.as_deref().map(syslog_tag),
         log_format: None,
         dont_log_null: false,
+        ignore_probes: false,
         log_opts: 0,
         unique_id_format: be.unique_id_format.as_deref().and_then(compile_unique_id_format),
         unique_id_header: be.unique_id_header.clone(),
@@ -7516,6 +7548,26 @@ impl EngineDispatcher<'_> {
                 // A TLS handshake that failed is no request, bad or not: it logs its own
                 // line when the session ends, and counts no 400 (T262).
                 if entry.sess.hs_fail().is_some() {
+                    close_http_session(entry, proxies, fdtab, poller, idle_pool, true);
+                    return None;
+                }
+                // An HTTP/2 connection that never opened a stream has no stream to log or
+                // count: only the protocol errors `HAProxy` logs give a line (T272).
+                if let Some(log) = h2_no_stream_end(&entry.sess, &proxies[entry.proxy_idx]) {
+                    if log {
+                        entry.sess.log.status = Some(0);
+                        entry.sess.log.term = Some(*b"PR");
+                        // No stream: no request, no status counted (measured).
+                        entry.stats_done = true;
+                        set_stream_log(entry, proxies, pid);
+                    }
+                    close_http_session(entry, proxies, fdtab, poller, idle_pool, true);
+                    return None;
+                }
+                // `option http-ignore-probes` (`PR_O_IGNORE_PRB`): a new connection that sent
+                // nothing and closes or times out is a probe, sent nothing, not logged and
+                // not counted (`h1_process`, `h1_handle_req_tout`, T272).
+                if proxies[entry.proxy_idx].ignore_probes && entry.sess.is_first_req && entry.sess.req.is_empty() {
                     close_http_session(entry, proxies, fdtab, poller, idle_pool, true);
                     return None;
                 }

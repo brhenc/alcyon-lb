@@ -997,6 +997,7 @@ mod tests {
             fwrr: std::sync::Arc::default(),
             log_format: None,
             dont_log_null: false,
+            ignore_probes: false,
             log_opts: 0,
             unique_id_format: None,
             unique_id_header: None,
