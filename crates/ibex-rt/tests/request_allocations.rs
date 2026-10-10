@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
+// Own binary (T260): counts the test process's allocations and bytes (#[global_allocator])
 
 //! Allocation oracle pinning data-path memory allocations per request.
 //!

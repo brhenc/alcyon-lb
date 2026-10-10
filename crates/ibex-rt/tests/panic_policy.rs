@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
+// Own binary (T260): sets RLIMIT_CORE 0 for the test process and re-executes itself by test name
 
 //! A panic takes the whole process down (T238), as a `BUG_ON()` does in `HAProxy`.
 //!

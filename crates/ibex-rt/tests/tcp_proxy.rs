@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
+// Own binary (T260): runs an in-process engine with tune.bufsize 4096, which is process-global (every other in-process engine sets 16384)
 
 //! End-to-end `mode tcp` proxying, driven by the poller.
 //!

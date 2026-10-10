@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "GPL-2.0-or-later"
 description = "Ibex layer model: protocol / transport / mux vtables and the stream endpoint pivot"
+autotests = false
 
 [dependencies]
 ibex-sched = { path = "../ibex-sched" }
@@ -31,3 +32,13 @@ missing_errors_doc = "allow"
 cast_possible_truncation = "allow"
 struct_excessive_bools = "allow"
 too_many_lines = "allow"
+
+# One integration-test binary (T260): tests/it/main.rs declares each test file as a module.
+[[test]]
+name = "it"
+path = "tests/it/main.rs"
+
+# Own process: installs a counting #[global_allocator] and asserts on the test process's allocations
+[[test]]
+name = "htx_allocation"
+path = "tests/htx_allocation.rs"

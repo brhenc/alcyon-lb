@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "A stateless deflate compressor"
+autotests = false
 
 [dependencies]
 
@@ -15,3 +16,8 @@ hex = "0.4"
 
 [lints.rust]
 unsafe_code = "forbid"
+
+# One integration-test binary (T260): tests/it/main.rs declares each test file as a module.
+[[test]]
+name = "it"
+path = "tests/it/main.rs"

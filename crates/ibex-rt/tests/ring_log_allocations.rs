@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
+// Own binary (T260): counts the test process's allocations (#[global_allocator])
 
 //! A log line written to a `ring` allocates no more than one written to a UDP collector: the
 //! header is built in a per-thread buffer and the event is copied into storage reserved when

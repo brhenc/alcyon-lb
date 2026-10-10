@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
+// Own binary (T260): measures the CPU use of the test process, which every other test in a shared binary adds to
 
 use ibex_rt::cpu::CpuMonitor;
 use std::time::Duration;

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
+// Own binary (T260): installs a counting #[global_allocator] and asserts on the test process's allocation counters
 
 //! `thread_alloc_counters` counts the calling thread only, through every allocator entry.
 

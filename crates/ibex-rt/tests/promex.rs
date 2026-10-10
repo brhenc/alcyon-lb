@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
+// Own binary (T260): installs its own #[global_allocator] (and includes src/promex.rs by path)
 
 pub use ibex_rt::engine;
 pub use ibex_rt::check;

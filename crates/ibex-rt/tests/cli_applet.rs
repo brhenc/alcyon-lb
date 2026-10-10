@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
+// Own binary (T260): sets the process-global tune.bufsize through in-process engines and asserts on it
 // Integration tests for CLI Applet and Unix Domain Socket (hatop compatibility).
 
 mod common;

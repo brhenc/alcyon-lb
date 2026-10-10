@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
+// Own binary (T260): counts the test process's allocations (#[global_allocator])
 
 //! The work an HTTP/2 request costs is the same for the first request of a connection and
 //! for the ten-thousandth, and is a write per response (T186).

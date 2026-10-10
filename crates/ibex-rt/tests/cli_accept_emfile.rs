@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
+// Own binary (T260): lowers the test process's RLIMIT_NOFILE (other tests would get EMFILE)
 
 //! A CLI client arriving while the process is out of descriptors (T246, from T237).
 //! `accept_from_cli_listener` broke out of its loop on `EMFILE` with the listener still

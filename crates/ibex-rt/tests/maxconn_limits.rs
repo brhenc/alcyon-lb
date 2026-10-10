@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
+// Own binary (T260): raises the test process's RLIMIT_NOFILE, which the ibex processes of other tests inherit (global_maxconn_default predicts maxconn from it)
 //! Connection limits: frontend `maxconn` default, `defaults maxconn`, `global maxconn` (T182).
 //!
 //! Measured on HAProxy 3.5-dev8-885761-29 (see `tasks/T182-frontend-maxconn-default.md`):
