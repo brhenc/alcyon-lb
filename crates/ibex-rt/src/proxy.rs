@@ -1109,7 +1109,7 @@ impl TcpSession {
             let at = find_eoh(raw).map_or(0, |(h, e)| h + e / 2);
             out = Vec::with_capacity(raw.len() + 19);
             out.extend_from_slice(&raw[..at]);
-            out.extend_from_slice(b"Connection: close\r\n");
+            out.extend_from_slice(b"connection: close\r\n");
             out.extend_from_slice(&raw[at..]);
             out.as_slice()
         } else {

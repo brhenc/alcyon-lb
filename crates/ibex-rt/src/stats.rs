@@ -877,6 +877,8 @@ mod tests {
             http_after_res_rules: Vec::new(),
             http_reuse: ibex_config::HttpReuse::default(),
             abortonclose: true,
+            h1_adjust: 0,
+            h1_case: std::sync::Arc::default(),
             error_files: std::collections::HashMap::new(),
             error_replies: std::collections::HashMap::new(),
             log_tag: None,

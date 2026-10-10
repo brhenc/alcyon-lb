@@ -122,6 +122,9 @@ pub struct StatsSocket {
 /// Global section configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct GlobalSection {
+    /// `h1-case-adjust` and `h1-case-adjust-file`: `(from, to)` pairs in the order given, `from`
+    /// unique (`add_hdr_case_adjust`).
+    pub h1_case_adjust: Vec<(String, String)>,
     /// `http-err-codes`: the statuses that count as an error (`http_err_cnt`), if set.
     pub http_err_codes: Option<StatusCodeSet>,
     /// `http-fail-codes`: the statuses that count as a failure (`http_fail_cnt`), if set.

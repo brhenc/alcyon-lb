@@ -99,6 +99,7 @@ pub(crate) fn parse_listen_header(
         log_health_checks: defaults.map_or(false, |d| d.log_health_checks),
         buffer_request: defaults.is_some_and(|d| d.buffer_request),
         abortonclose: defaults.and_then(|d| d.abortonclose),
+        h1_adjust: defaults.map_or(0, |d| d.h1_adjust),
         http_mode: defaults.map_or(HttpMode::KeepAlive, |d| d.http_mode),
         persist: defaults.is_some_and(|d| d.persist),
         dontlognull: defaults.is_some_and(|d| d.dontlognull),
@@ -200,6 +201,7 @@ pub(crate) fn parse_frontend_header(
         buffer_request: defaults.is_some_and(|d| d.buffer_request),
         http_mode: defaults.map_or(HttpMode::KeepAlive, |d| d.http_mode),
         dontlognull: defaults.is_some_and(|d| d.dontlognull),
+        h1_adjust: defaults.map_or(0, |d| d.h1_adjust & crate::ast::H1_ADJ_CLIENT),
         log_opts: defaults.map_or(0, |d| d.log_opts),
         stick_table: None,
         stick_rules: Vec::new(),
@@ -272,6 +274,7 @@ pub(crate) fn parse_backend_header(
         log_health_checks: defaults.map_or(false, |d| d.log_health_checks),
         buffer_request: defaults.is_some_and(|d| d.buffer_request),
         abortonclose: defaults.and_then(|d| d.abortonclose),
+        h1_adjust: defaults.map_or(0, |d| d.h1_adjust & crate::ast::H1_ADJ_SERVER),
         http_mode: defaults.map_or(HttpMode::KeepAlive, |d| d.http_mode),
         persist: defaults.is_some_and(|d| d.persist),
         mode,
@@ -963,6 +966,8 @@ pub(crate) fn parse_option_listen(
         "persist" => proxy.persist = true,
         "http-keep-alive" => proxy.http_mode = HttpMode::KeepAlive,
         "dontlognull" => proxy.dontlognull = true,
+        "h1-case-adjust-bogus-client" => proxy.h1_adjust |= crate::ast::H1_ADJ_CLIENT,
+        "h1-case-adjust-bogus-server" => proxy.h1_adjust |= crate::ast::H1_ADJ_SERVER,
         "dontlog-normal" | "log-separate-errors" | "logasap" => proxy.log_opts |= crate::ast::log_opt_bit(&tokens[1].text),
         "accept-unsafe-violations-in-http-request" => proxy.stats.accept_unsafe_request = true,
         "log-health-checks" => proxy.log_health_checks = true,
@@ -1021,6 +1026,10 @@ pub(crate) fn parse_option_frontend(
         fe.dontlognull = true;
         return Ok(());
     }
+    if tokens[1].text == "h1-case-adjust-bogus-client" {
+        fe.h1_adjust |= crate::ast::H1_ADJ_CLIENT;
+        return Ok(());
+    }
     if matches!(tokens[1].text.as_str(), "dontlog-normal" | "log-separate-errors" | "logasap") {
         fe.log_opts |= crate::ast::log_opt_bit(&tokens[1].text);
         return Ok(());
@@ -1063,6 +1072,7 @@ pub(crate) fn parse_option_backend(
         "http-server-close" => be.http_mode = HttpMode::ServerClose,
         "httpclose" => be.http_mode = HttpMode::Close,
         "persist" => be.persist = true,
+        "h1-case-adjust-bogus-server" => be.h1_adjust |= crate::ast::H1_ADJ_SERVER,
         "http-keep-alive" => be.http_mode = HttpMode::KeepAlive,
         "log-health-checks" => be.log_health_checks = true,
         "httpchk" => {
@@ -1095,6 +1105,8 @@ pub(crate) fn parse_no_listen(proxy: &mut ListenSection, tokens: &[Token], kw: &
         Some("httpclose") if proxy.http_mode == HttpMode::Close => proxy.http_mode = HttpMode::KeepAlive,
         Some("persist") => proxy.persist = false,
         Some("dontlognull") => proxy.dontlognull = false,
+        Some("h1-case-adjust-bogus-client") => proxy.h1_adjust &= !crate::ast::H1_ADJ_CLIENT,
+        Some("h1-case-adjust-bogus-server") => proxy.h1_adjust &= !crate::ast::H1_ADJ_SERVER,
         Some(n @ ("dontlog-normal" | "log-separate-errors" | "logasap")) => proxy.log_opts &= !crate::ast::log_opt_bit(n),
         Some("accept-unsafe-violations-in-http-request") => proxy.stats.accept_unsafe_request = false,
         Some("log-health-checks") => proxy.log_health_checks = false,
@@ -1119,6 +1131,7 @@ pub(crate) fn parse_no_frontend(fe: &mut FrontendSection, tokens: &[Token], kw: 
         Some("http-server-close") if fe.http_mode == HttpMode::ServerClose => fe.http_mode = HttpMode::KeepAlive,
         Some("httpclose") if fe.http_mode == HttpMode::Close => fe.http_mode = HttpMode::KeepAlive,
         Some("dontlognull") => fe.dontlognull = false,
+        Some("h1-case-adjust-bogus-client") => fe.h1_adjust &= !crate::ast::H1_ADJ_CLIENT,
         Some(n @ ("dontlog-normal" | "log-separate-errors" | "logasap")) => fe.log_opts &= !crate::ast::log_opt_bit(n),
         _ => {}
     }
@@ -1141,6 +1154,7 @@ pub(crate) fn parse_no_backend(be: &mut BackendSection, tokens: &[Token], kw: &T
         Some("http-server-close") if be.http_mode == HttpMode::ServerClose => be.http_mode = HttpMode::KeepAlive,
         Some("httpclose") if be.http_mode == HttpMode::Close => be.http_mode = HttpMode::KeepAlive,
         Some("persist") => be.persist = false,
+        Some("h1-case-adjust-bogus-server") => be.h1_adjust &= !crate::ast::H1_ADJ_SERVER,
         Some("log-health-checks") => be.log_health_checks = false,
         Some("forwarded") => be.forwarded = None,
         _ => {}

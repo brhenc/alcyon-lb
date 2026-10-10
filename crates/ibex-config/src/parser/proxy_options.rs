@@ -184,6 +184,9 @@ const IMPLEMENTED: &[&str] = &[
     "accept-unsafe-violations-in-http-request",
     // A client that leaves aborts its request, unless `no option abortonclose` (T227).
     "abortonclose",
+    // The case of the header names in the global table is restored (T244).
+    "h1-case-adjust-bogus-client",
+    "h1-case-adjust-bogus-server",
 ];
 
 fn find(name: &str) -> Option<&'static OptSpec> {

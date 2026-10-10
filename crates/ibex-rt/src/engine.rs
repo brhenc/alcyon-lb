@@ -1348,6 +1348,11 @@ pub struct Proxy {
     /// connecting (`option abortonclose`, on for HTTP unless `no option abortonclose`). A
     /// backend's: the stream's backend decides, as `proxy_abrt_close(s->be)`.
     pub abortonclose: bool,
+    /// `option h1-case-adjust-bogus-client` / `-server` ([`ibex_config::H1_ADJ_CLIENT`], `_SERVER`).
+    pub h1_adjust: u8,
+    /// The global `h1-case-adjust` table: lower-case name to the name to write. Set on every
+    /// proxy that has a bit in `h1_adjust`; empty otherwise.
+    pub h1_case: Arc<std::collections::HashMap<String, String>>,
     /// Custom error pages (`errorfile`/`errorfiles`), keyed by status code.
     pub error_files: HashMap<u16, Vec<u8>>,
     /// `http-error` overrides, keyed by status code; consulted before `error_files`.
@@ -2930,6 +2935,8 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, list
         http_after_res_rules: listen.http_after_res_rules.clone(),
         http_reuse: listen.http_reuse.unwrap_or_default(),
         abortonclose: listen.abortonclose.unwrap_or(true),
+        h1_adjust: listen.h1_adjust,
+        h1_case: Arc::default(),
         error_files: listen.error_files.clone(),
         error_replies: listen.error_replies.clone(),
         log_tag: listen.log_tag.as_deref().map(syslog_tag),
@@ -3050,6 +3057,8 @@ fn init_proxy_from_frontend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, fe
         http_after_res_rules: fe.http_after_res_rules.clone(),
         http_reuse: ibex_config::HttpReuse::default(),
         abortonclose: true,
+        h1_adjust: fe.h1_adjust,
+        h1_case: Arc::default(),
         error_files: fe.error_files.clone(),
         error_replies: fe.error_replies.clone(),
         log_tag: fe.log_tag.as_deref().map(syslog_tag),
@@ -3199,6 +3208,8 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, be:
         http_after_res_rules: be.http_after_res_rules.clone(),
         http_reuse: be.http_reuse.unwrap_or_default(),
         abortonclose: be.abortonclose.unwrap_or(true),
+        h1_adjust: be.h1_adjust,
+        h1_case: Arc::default(),
         error_files: be.error_files.clone(),
         error_replies: be.error_replies.clone(),
         log_tag: be.log_tag.as_deref().map(syslog_tag),
@@ -3445,6 +3456,13 @@ impl Engine {
     );
     for p in &mut proxies {
         p.disabled_backends = Arc::clone(&disabled);
+    }
+    // `h1-case-adjust`, `h1-case-adjust-file` (global): the table the proxies with a
+    // `h1-case-adjust-bogus-*` option write names from (`h1_get_hdrs_map`).
+    let h1_table: Arc<std::collections::HashMap<String, String>> =
+        Arc::new(config.global.iter().flat_map(|g| g.h1_case_adjust.iter().cloned()).collect());
+    for p in proxies.iter_mut().filter(|p| p.h1_adjust != 0) {
+        p.h1_case = Arc::clone(&h1_table);
     }
     crate::track::attach(&mut proxies, config);
     crate::logfwd::start(config)?;
@@ -6480,7 +6498,7 @@ fn reply_parse_error(entry: &mut SessionEntry, proxies: &[Proxy], status: u16) {
     let mut page = proxy_error_response(&entry.sess, be, &proxies[entry.proxy_idx], proxies, status);
     // The H1 mux's own error reply goes through HTX, which writes the header names in lower
     // case (measured on 3.5-dev8: `content-length: 105`, `cache-control: ...`).
-    lowercase_header_names(&mut page);
+    rewrite_header_names(&mut page, client_case_table(&proxies[entry.proxy_idx]));
     // HAProxy's 431 does not say `Connection: close`, though it closes.
     entry.sess.write_reply_with(&page, status != 431);
     // The request that could not be parsed counts as a request and as the error or failure its
@@ -7292,7 +7310,7 @@ impl EngineDispatcher<'_> {
                 {
                     let fe = &proxies[entry.proxy_idx];
                     let mut page = proxy_error_response(&entry.sess, fe, fe, proxies, 408);
-                    lowercase_header_names(&mut page);
+                    rewrite_header_names(&mut page, client_case_table(fe));
                     entry.sess.send_before_close(&page);
                     entry.sess.log.status = Some(408);
                     entry.sess.log.term = Some(*b"cR");
@@ -7337,7 +7355,7 @@ impl EngineDispatcher<'_> {
         {
             let fe = &proxies[entry.proxy_idx];
             let mut page = proxy_error_response(&entry.sess, fe, fe, proxies, 408);
-                    lowercase_header_names(&mut page);
+            rewrite_header_names(&mut page, client_case_table(fe));
             entry.sess.send_before_close(&page);
             entry.sess.log.status = Some(408);
             entry.sess.log.term = Some(*b"cR");
@@ -7383,6 +7401,7 @@ impl EngineDispatcher<'_> {
                     continue;
                 }
                 Self::apply_http_response_rules(entry, proxies, now);
+                Self::write_response_head_names(entry, proxies);
             }
             if Self::l7_retry_failure(entry, proxies, fdtab, poller, now) {
                 continue;
@@ -8174,6 +8193,18 @@ impl EngineDispatcher<'_> {
         // failure (`server_connect_failed`: `econ` once, retries without turnaround).
         retry_now(entry, proxies, fdtab, poller, now);
         true
+    }
+
+    /// The response head `apply_http_response_rules` has just settled goes to the client with
+    /// its header names in lower case (`HAProxy` writes what went through HTX so), in the case
+    /// of the `h1-case-adjust` table for a frontend with `option h1-case-adjust-bogus-client`.
+    /// The rewrite is idempotent, so a pass that leaves the head for the next one is harmless.
+    fn write_response_head_names(entry: &mut SessionEntry, proxies: &[Proxy]) {
+        if entry.sess.txn.as_ref().is_none_or(|t| t.rsp == MsgState::Waiting) {
+            return;
+        }
+        let table = client_case_table(&proxies[entry.proxy_idx]);
+        rewrite_header_names(entry.sess.rep.readable_mut(), table);
     }
 
     #[allow(clippy::too_many_lines)]
@@ -9897,7 +9928,8 @@ impl EngineDispatcher<'_> {
         let cookie_server = cookie_server.or(Self::sticking_rules(&mut entry.sess, be_idx, proxies, assigned));
         // The head is final: its header names go to the server in lower case, as `HAProxy`
         // writes them (HTX). The request line and the values are the client's.
-        lowercase_header_names(entry.sess.req.readable_mut());
+        let srv_table = (proxies[be_idx].h1_adjust & ibex_config::H1_ADJ_SERVER != 0).then(|| &*proxies[be_idx].h1_case);
+        rewrite_header_names(entry.sess.req.readable_mut(), srv_table);
         Self::route_to_server(entry, proxies, fdtab, poller, idle_pool, now, be_idx, cookie_server)
     }
 
@@ -12005,6 +12037,12 @@ fn stats_write_reply(entry: &mut SessionEntry, proxies: &[Proxy], raw: &[u8]) {
 /// `HAProxy` writes anything that went through HTX (measured on 3.5-dev8). Values, the first
 /// line and the body are left as they are.
 fn lowercase_header_names(buf: &mut [u8]) {
+    rewrite_header_names(buf, None);
+}
+
+/// [`lowercase_header_names`], and then each name found in `table` (`h1-case-adjust`) in the
+/// case the table gives. `from` and `to` differ in case only, so the head keeps its length.
+fn rewrite_header_names(buf: &mut [u8], table: Option<&std::collections::HashMap<String, String>>) {
     let head = crate::proxy::find_eoh(buf).map_or(0, |(h, _)| h);
     let mut at = buf[..head].iter().position(|&b| b == b'\n').map_or(head, |i| i + 1);
     while at < head {
@@ -12013,8 +12051,19 @@ fn lowercase_header_names(buf: &mut [u8]) {
         let folded = matches!(buf[at], b' ' | b'\t');
         let colon = buf[at..end].iter().position(|&b| b == b':').filter(|_| !folded).map_or(at, |i| at + i);
         buf[at..colon].make_ascii_lowercase();
+        if let Some(to) = std::str::from_utf8(&buf[at..colon]).ok().and_then(|n| table?.get(n)) {
+            if to.len() == colon - at {
+                buf[at..colon].copy_from_slice(to.as_bytes());
+            }
+        }
         at = end;
     }
+}
+
+/// The table to write the names of a message for the client from: the frontend has
+/// `option h1-case-adjust-bogus-client`.
+fn client_case_table(fe: &Proxy) -> Option<&std::collections::HashMap<String, String>> {
+    (fe.h1_adjust & ibex_config::H1_ADJ_CLIENT != 0).then_some(&*fe.h1_case)
 }
 
 /// The reply the proxy generates as `HAProxy` sends it: header names in lower case, and the
@@ -12038,7 +12087,9 @@ fn htx_reply(raw: &[u8]) -> Vec<u8> {
 }
 
 fn send_proxy_reply(sess: &mut TcpSession, proxies: &[Proxy], fe_idx: usize, be_idx: usize, raw: &[u8]) {
-    let raw = &htx_reply(raw)[..];
+    let mut raw = htx_reply(raw);
+    rewrite_header_names(&mut raw, client_case_table(&proxies[fe_idx]));
+    let raw = &raw[..];
     if let Ok(out) = after_res_on_reply(sess, proxies, fe_idx, be_idx, raw) {
         sess.write_reply(&out);
         return;
@@ -12328,15 +12379,17 @@ fn build_templated_error_response(
 
     let reason = status_reason(status);
     let mut resp = format!("HTTP/1.1 {status} {reason}\r\n");
-    if let Some(ct) = content_type {
-        let _ = write!(resp, "Content-Type: {ct}\r\n");
-    }
     for (k, v) in custom_headers {
         if !v.is_empty() {
             let _ = write!(resp, "{k}: {v}\r\n");
         }
     }
-    let _ = write!(resp, "Content-Length: {}\r\n\r\n", body.len());
+    // `content-length` before `content-type` (measured on 3.5-dev8), after the `hdr` lines.
+    let _ = write!(resp, "Content-Length: {}\r\n", body.len());
+    if let Some(ct) = content_type {
+        let _ = write!(resp, "Content-Type: {ct}\r\n");
+    }
+    resp.push_str("\r\n");
 
     let mut full_resp = resp.into_bytes();
     full_resp.extend_from_slice(body);

@@ -62,6 +62,8 @@ pub struct DefaultsSection {
     /// `option abortonclose` (`Some(true)`), `no option abortonclose` (`Some(false)`), or
     /// neither: then on for an HTTP stream, as `HAProxy` has it (`proxy_abrt_close_def`).
     pub abortonclose: Option<bool>,
+    /// `option h1-case-adjust-bogus-client` ([`H1_ADJ_CLIENT`]) and `-server` ([`H1_ADJ_SERVER`]).
+    pub h1_adjust: u8,
     /// The last of `option http-keep-alive`, `http-server-close` and `httpclose`.
     pub http_mode: HttpMode,
     /// `option persist`: a server a cookie or stick table names is used even when it is down.
@@ -272,6 +274,8 @@ pub struct ListenSection {
     /// `option abortonclose` (`Some(true)`), `no option abortonclose` (`Some(false)`), or
     /// neither: then on for an HTTP stream, as `HAProxy` has it (`proxy_abrt_close_def`).
     pub abortonclose: Option<bool>,
+    /// `option h1-case-adjust-bogus-client` ([`H1_ADJ_CLIENT`]) and `-server` ([`H1_ADJ_SERVER`]).
+    pub h1_adjust: u8,
     /// The last of `option http-keep-alive`, `http-server-close` and `httpclose`.
     pub http_mode: HttpMode,
     /// `option persist`: a server a cookie or stick table names is used even when it is down.
@@ -426,6 +430,7 @@ impl Default for ListenSection {
             log_health_checks: false,
             buffer_request: false,
             abortonclose: None,
+            h1_adjust: 0,
             http_mode: HttpMode::KeepAlive,
             persist: false,
             dontlognull: false,
@@ -532,6 +537,8 @@ pub struct FrontendSection {
     pub http_mode: HttpMode,
     /// `option dontlognull`: no log line for a connection that carried nothing.
     pub dontlognull: bool,
+    /// `option h1-case-adjust-bogus-client` ([`H1_ADJ_CLIENT`]).
+    pub h1_adjust: u8,
     /// `option dontlog-normal`, `option log-separate-errors` and `option logasap`, as the
     /// `LOG_OPT_*` bits.
     pub log_opts: u8,
@@ -602,6 +609,7 @@ impl Default for FrontendSection {
             buffer_request: false,
             http_mode: HttpMode::KeepAlive,
             dontlognull: false,
+            h1_adjust: 0,
             log_opts: 0,
             stick_table: None,
             stick_rules: Vec::new(),
@@ -649,6 +657,8 @@ pub struct BackendSection {
     /// `option abortonclose` (`Some(true)`), `no option abortonclose` (`Some(false)`), or
     /// neither: then on for an HTTP stream, as `HAProxy` has it (`proxy_abrt_close_def`).
     pub abortonclose: Option<bool>,
+    /// `option h1-case-adjust-bogus-client` ([`H1_ADJ_CLIENT`]) and `-server` ([`H1_ADJ_SERVER`]).
+    pub h1_adjust: u8,
     /// The last of `option http-keep-alive`, `http-server-close` and `httpclose`.
     pub http_mode: HttpMode,
     /// `option persist`: a server a cookie or stick table names is used even when it is down.
@@ -760,6 +770,7 @@ impl Default for BackendSection {
             log_health_checks: false,
             buffer_request: false,
             abortonclose: None,
+            h1_adjust: 0,
             http_mode: HttpMode::KeepAlive,
             persist: false,
             mode: Mode::Tcp,
@@ -818,6 +829,11 @@ pub const LOG_OPT_DONTLOG_NORMAL: u8 = 1;
 pub const LOG_OPT_SEPARATE_ERRORS: u8 = 2;
 /// `option logasap`: the line is sent when the response head is, not at the end.
 pub const LOG_OPT_ASAP: u8 = 4;
+
+/// `h1_adjust` bit: `option h1-case-adjust-bogus-client` (the response to the client).
+pub const H1_ADJ_CLIENT: u8 = 1;
+/// `h1_adjust` bit: `option h1-case-adjust-bogus-server` (the request to the server).
+pub const H1_ADJ_SERVER: u8 = 2;
 
 /// The `LOG_OPT_*` bit of the option `name`, 0 for any other.
 #[must_use]

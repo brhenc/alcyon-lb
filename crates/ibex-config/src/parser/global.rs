@@ -570,6 +570,36 @@ pub(crate) fn parse_global_directive(
             Ok(())
         }
         other if IGNORED_GLOBAL_KEYWORDS.iter().any(|(k, _)| *k == other) => Ok(()),
+        "h1-case-adjust" => {
+            // `cfg_parse_h1_header_case_adjust`, src/mux_h1.c (measured on 3.5-dev8).
+            if tokens.len() > 3 {
+                return Err(ConfigError::new(
+                    tokens[3].line,
+                    tokens[3].col,
+                    format!("'h1-case-adjust' cannot handle unexpected argument '{}'.", tokens[3].text),
+                ));
+            }
+            let arg = |i: usize| tokens.get(i).map(|t| t.text.as_str()).filter(|a| !a.is_empty());
+            let (Some(from), Some(to)) = (arg(1), arg(2)) else {
+                return Err(ConfigError::new(kw.line, kw.col, "'h1-case-adjust' expects <from> and <to> as argument."));
+            };
+            add_h1_case_adjust(&mut global.h1_case_adjust, from, to).map_err(|m| ConfigError::new(kw.line, kw.col, m))
+        }
+        "h1-case-adjust-file" => {
+            if tokens.len() > 2 {
+                return Err(ConfigError::new(
+                    tokens[2].line,
+                    tokens[2].col,
+                    format!("'h1-case-adjust-file' cannot handle unexpected argument '{}'.", tokens[2].text),
+                ));
+            }
+            let Some(path) = tokens.get(1).map(|t| t.text.as_str()).filter(|a| !a.is_empty()) else {
+                return Err(ConfigError::new(kw.line, kw.col, "'h1-case-adjust-file' expects <file> as argument."));
+            };
+            // `HAProxy` reads the file after the whole configuration is parsed (and only the
+            // last `h1-case-adjust-file`); Ibex reads each at the keyword.
+            load_h1_case_adjust_file(&mut global.h1_case_adjust, path).map_err(|m| ConfigError::new(kw.line, kw.col, m))
+        }
         _ => Err(ConfigError::new(
             kw.line,
             kw.col,
@@ -610,4 +640,38 @@ fn stats_socket_path(tok: &Token) -> Result<String, ConfigError> {
         return Err(err(format!("missing port specification in '{arg}'")));
     }
     Err(err(format!("TCP addresses are not supported by Ibex (the CLI listens on unix sockets only) in '{arg}'")))
+}
+
+/// `add_hdr_case_adjust` (src/mux_h1.c): `to` differs from `from` in case only, `from` is new.
+fn add_h1_case_adjust(table: &mut Vec<(String, String)>, from: &str, to: &str) -> Result<(), String> {
+    if to.is_empty() {
+        return Err("expect <to>".to_string());
+    }
+    if !from.eq_ignore_ascii_case(to) {
+        return Err("<from> and <to> must not differ except the case".to_string());
+    }
+    if table.iter().any(|(f, _)| f == from) {
+        return Err(format!("duplicate entry '{from}'"));
+    }
+    table.push((from.to_string(), to.to_string()));
+    Ok(())
+}
+
+/// `cfg_h1_headers_case_adjust_postparser`: one `<from> <to>` per line, blanks around and `#`
+/// comment lines ignored.
+fn load_h1_case_adjust_file(table: &mut Vec<(String, String)>, path: &str) -> Result<(), String> {
+    let text = std::fs::read(path).map_err(|_| format!("h1-headers-case-adjust-file '{path}': failed to open file."))?;
+    let text = String::from_utf8_lossy(&text);
+    for (i, line) in text.split_inclusive('\n').enumerate() {
+        let line = line.trim_start_matches([' ', '\t']);
+        if line.is_empty() || line.starts_with(['#', '\r', '\n']) {
+            continue;
+        }
+        let key_end = line.find([' ', '\t', '\n', '\r']).unwrap_or(line.len());
+        let (key, rest) = line.split_at(key_end);
+        let value = rest.trim_start_matches([' ', '\t']);
+        let value = value.split(['\n', '\r']).next().unwrap_or("").trim_end_matches([' ', '\t']);
+        add_h1_case_adjust(table, key, value).map_err(|m| format!("h1-headers-case-adjust-file '{path}' : {m} at line {}.", i + 1))?;
+    }
+    Ok(())
 }
