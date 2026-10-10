@@ -425,6 +425,16 @@ const MAX_REQUEST_HEAD_BYTES: usize = 16384 - 1024;
 /// less one: measured, host + 99 headers pass and host + 100 are refused).
 const MAX_REQUEST_HEADERS: usize = 100;
 
+/// Trailer fields a request may carry: HAProxy's `tune.http.maxhdr` (101). Measured: 101
+/// fields pass, 102 are RST_STREAM PROTOCOL_ERROR.
+const MAX_REQUEST_TRAILERS: usize = 101;
+
+/// The room HAProxy's 16 KB rx buffer leaves trailers, each field costing its name and
+/// value plus [`TRAILER_BLOCK_OVERHEAD`]. Measured: one field of 16327 decoded bytes
+/// passes and of 16328 is reset; five of 3259 pass and five of 3261 are reset.
+const MAX_REQUEST_TRAILER_ROOM: usize = 16335;
+const TRAILER_BLOCK_OVERHEAD: usize = 8;
+
 /// HTTP/2 Multiplexer.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MuxH2;
@@ -743,7 +753,12 @@ impl MuxH2 {
                 ctx.send_rst_stream(stream_id, H2Error::StreamClosed);
                 return Ok(());
             }
-            if (flags & frame_flags::END_STREAM) == 0 || decoded_headers.iter().any(|h| h.name.starts_with(':')) {
+            // Trailers get the room HAProxy's rx buffer gives them (T271): past it, a stream
+            // error, so a client cannot park decoded trailers of any size in each stream.
+            let trailer_bytes: usize = decoded_headers.iter().map(|h| h.name.len() + h.value.len()).sum();
+            let too_big = decoded_headers.len() > MAX_REQUEST_TRAILERS
+                || trailer_bytes + TRAILER_BLOCK_OVERHEAD * decoded_headers.len() > MAX_REQUEST_TRAILER_ROOM;
+            if (flags & frame_flags::END_STREAM) == 0 || too_big || decoded_headers.iter().any(|h| h.name.starts_with(':')) {
                 ctx.send_rst_stream(stream_id, H2Error::ProtocolError);
                 return Ok(());
             }
@@ -1573,5 +1588,64 @@ mod tests {
             assert!(ctx.goaway_sent.is_none());
         }
     }
-}
 
+    /// A trailers block: `x` = `len` bytes added to the HPACK table, then `refs` one-byte
+    /// references to it, so `refs + 1` fields of `len + 1` decoded bytes (T271).
+    fn trailers(id: u32, len: usize, refs: usize) -> Vec<u8> {
+        let mut block = vec![0x40, 0x01, b'x'];
+        if len < 127 {
+            block.push(len as u8);
+        } else {
+            block.push(0x7f);
+            let mut n = len - 127;
+            while n >= 128 {
+                block.push((n & 0x7f) as u8 | 0x80);
+                n >>= 7;
+            }
+            block.push(n as u8);
+        }
+        block.extend(std::iter::repeat_n(b'a', len));
+        block.extend(std::iter::repeat_n(0xbe, refs));
+        Frame::Headers { flags: frame_flags::END_HEADERS | frame_flags::END_STREAM, stream_id: id, header_block: block }
+            .encode()
+    }
+
+    /// Request trailers get the room HAProxy's rx buffer gives them (T271; T242 kept 202
+    /// fields of 4 KB per stream). Measured on 3.5-dev8, a POST with a DATA frame, then a
+    /// trailers HEADERS: one field of 16327 decoded bytes passes and of 16328 is reset;
+    /// five of 3259 pass and five of 3261 are reset; 101 fields pass and 102 are reset --
+    /// each RST_STREAM PROTOCOL_ERROR, the connection kept. What passes is
+    /// `sum(name + value) + 8 * fields <= 16335` (an HTX block per field in a 16 KB buffer).
+    #[test]
+    fn request_trailers_past_the_buffer_are_a_stream_error() {
+        for (len, refs, refused) in [
+            (16326usize, 0usize, false),
+            (16327, 0, true),
+            (3258, 4, false),
+            (3260, 4, true),
+            (50, 100, false),
+            (50, 101, true),
+            (4000, 100, true),
+        ] {
+            let (mux, mut ctx) = open_conn();
+            mux.parse(&mut ctx, &post_headers(1)).expect("open");
+            mux.parse(&mut ctx, &data(1, 3, 0)).expect("data");
+            let sent = ctx.tx_buf.len();
+            mux.parse(&mut ctx, &trailers(1, len, refs)).expect("no connection error");
+            let case = format!("{} fields of {}", refs + 1, len + 1);
+            let rst = ctx.tx_buf[sent..].windows(13).any(|w| w[3] == 3 && w[5..9] == [0, 0, 0, 1] && w[9..13] == [0, 0, 0, 1]);
+            assert_eq!(rst, refused, "RST_STREAM PROTOCOL_ERROR for {case}");
+            let held: usize = ctx
+                .streams
+                .values()
+                .flat_map(|s| s.rx_htx.blocks())
+                .map(|b| match b {
+                    HtxBlock::Trailer(h) => h.name.len() + h.value.len(),
+                    _ => 0,
+                })
+                .sum();
+            assert_eq!(held, if refused { 0 } else { (refs + 1) * (len + 1) }, "trailer bytes kept for {case}");
+            assert!(ctx.goaway_sent.is_none(), "{case}");
+        }
+    }
+}

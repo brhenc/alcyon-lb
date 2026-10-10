@@ -74,6 +74,18 @@ pub fn smtp_status_line(b: &[u8]) -> (Option<u16>, String) {
     (code, line)
 }
 
+/// The info of a failed SMTP `EHLO` or `QUIT` reply that has no status code: `HAProxy`'s rules
+/// end on `error-status L7STS on-error "%[res.payload(4,0),ltrim(' '),cut_crlf]"
+/// status-code "res.payload(0,3)"` (src/tcpcheck.c), so the status is "wrong status", the
+/// code is 0, and the info is what follows the first four bytes, up to the line end.
+#[must_use]
+pub fn smtp_codeless_info(b: &[u8]) -> Option<String> {
+    let rest = b.get(4..).unwrap_or(&[]);
+    let start = rest.iter().position(|&c| c != b' ').unwrap_or(rest.len());
+    let info = cut_crlf(&rest[start..]);
+    (!info.is_empty()).then(|| String::from_utf8_lossy(info).into_owned())
+}
+
 /// The SMTP answer to HELO/EHLO, possibly multi-line (`250-...` lines then `250 ...`).
 /// `None`: no final line yet. Otherwise the final line's code (if it parsed) and info.
 ///
@@ -82,17 +94,6 @@ pub fn smtp_status_line(b: &[u8]) -> (Option<u16>, String) {
 /// is in; taking it then sent QUIT early and read the trailing CRLF as the QUIT answer.
 /// HAProxy's expect (`^(2xx-...\r\n)*2xx[ \r]`, no min-recv) keeps waiting while it cannot
 /// decide. At EOF the partial tail counts, as before.
-/// The info of a failed SMTP EHLO or QUIT reply that has no status code: `HAProxy`'s rules
-/// end on `error-status L7STS on-error "%[res.payload(4,0),ltrim(' '),cut_crlf]"
-/// status-code "res.payload(0,3)"` (src/tcpcheck.c), so the status is "wrong status", the
-/// code is 0, and the info is what follows the first four bytes, up to the line end.
-pub fn smtp_codeless_info(b: &[u8]) -> Option<String> {
-    let rest = b.get(4..).unwrap_or(&[]);
-    let start = rest.iter().position(|&c| c != b' ').unwrap_or(rest.len());
-    let info = cut_crlf(&rest[start..]);
-    (!info.is_empty()).then(|| String::from_utf8_lossy(info).into_owned())
-}
-
 pub fn smtp_reply(b: &[u8], eof: bool) -> Option<(Option<u16>, Option<String>)> {
     let resp_str = String::from_utf8_lossy(b);
     let mut completed = false;
