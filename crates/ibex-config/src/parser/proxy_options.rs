@@ -208,7 +208,7 @@ fn err(kw: &Token, msg: String) -> ConfigError {
 /// Only a frontend lacks a backend, and only a backend lacks a frontend.
 fn missing_capability(spec: &OptSpec) -> String {
     let (section, lacks) = if matches!(spec.cap, Cap::Be) { ("frontend", "backend") } else { ("backend", "frontend") };
-    format!("'{}' ignored because {section} has no {lacks} capability", spec.name)
+    format!("'{}' ignored because {section} '{{px}}' has no {lacks} capability", spec.name)
 }
 
 /// Decides an `option` line. `Ok(true)`: the caller implements the option and applies it.
@@ -231,9 +231,9 @@ pub(crate) fn check_option(section: OptSection, tokens: &[Token], kw: &Token) ->
     if !applies(spec, section) {
         let why = missing_capability(spec);
         if spec.kind == Kind::Table {
-            return Err(err(kw, format!("{why}: unknown option '{name}'.")));
+            return Err(err(kw, format!("{}: unknown option '{name}'.", why.replace(" '{px}'", ""))));
         }
-        eprintln!("[ibex] warning: {why}.");
+        super::warn::push(kw.line, crate::ast::global::WarnStyle::Spaced, &format!("{why}."));
         return Ok(false);
     }
     if IMPLEMENTED.contains(&name) {
@@ -284,12 +284,12 @@ pub(crate) fn check_no_option<'t>(section: OptSection, tokens: &'t [Token], kw: 
         Kind::Removed(msg) => return Err(err(kw, msg.to_string())),
         Kind::Plain => return Err(err(kw, format!("negation/default is not supported for option '{name}'."))),
         Kind::Table if !applies(spec, section) => {
-            return Err(err(kw, format!("{}: unknown option '{name}'.", missing_capability(spec))));
+            return Err(err(kw, format!("{}: unknown option '{name}'.", missing_capability(spec).replace(" '{px}'", ""))));
         }
         Kind::Table | Kind::Negatable => {}
     }
     if !applies(spec, section) {
-        eprintln!("[ibex] warning: {}.", missing_capability(spec));
+        super::warn::push(kw.line, crate::ast::global::WarnStyle::Spaced, &format!("{}.", missing_capability(spec)));
         return Ok(None);
     }
     if IMPLEMENTED.contains(&name) {

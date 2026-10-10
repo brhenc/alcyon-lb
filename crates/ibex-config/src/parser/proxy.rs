@@ -5,6 +5,7 @@ use std::collections::HashMap;
 
 use super::*;
 use crate::ast::HttpMode;
+use crate::ast::global::WarnStyle;
 
 pub(crate) fn parse_listen_header(
     tokens: &[Token],
@@ -496,10 +497,7 @@ pub(crate) fn parse_frontend_directive(
         // backend's (`warnifnotcap(curproxy, PR_CAP_BE, ...)`).
         "cookie" => {
             parse_cookie(&mut None, tokens, kw)?;
-            eprintln!(
-                "[ibex] warning: line {}: 'cookie' ignored because frontend '{}' has no backend capability.",
-                kw.line, fe.name
-            );
+            warn::push(kw.line, WarnStyle::Spaced, &format!("'cookie' ignored because frontend '{}' has no backend capability.", fe.name));
             Ok(())
         }
         "tcp-request" => parse_frontend_tcp_request(fe, tokens, kw),
@@ -566,7 +564,7 @@ pub(crate) fn parse_frontend_directive(
         "stick-table" => parse_stick_table(&mut fe.stick_table, tokens, kw),
         // A frontend has no backend capability: `HAProxy` warns and ignores the line.
         "stick" => {
-            eprintln!("[ibex] warning: 'stick' ignored because frontend '{}' has no backend capability.", fe.name);
+            warn::push(kw.line, WarnStyle::Spaced, &format!("'stick' ignored because frontend '{}' has no backend capability.", fe.name));
             Ok(())
         }
         "track-sc0" | "track-sc1" | "track-sc2" => {

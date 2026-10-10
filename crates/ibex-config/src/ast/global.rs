@@ -287,4 +287,24 @@ pub struct LoadWarning {
     pub alert: bool,
     /// The text after `parsing [file:line] :`.
     pub text: String,
+    /// How `HAProxy` frames the text on the line.
+    pub style: WarnStyle,
+}
+
+/// The frame `HAProxy` puts around a message of the configuration load; each message has its
+/// own, the space before the colon included.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WarnStyle {
+    /// `config : parsing [file:line] : text`
+    #[default]
+    Spaced,
+    /// As `Spaced`, and the message HAProxy formats ends in a newline of its own, so a blank
+    /// line follows (`'chroot' is already specified`).
+    SpacedBlank,
+    /// `config : parsing [file:line]: text`
+    Tight,
+    /// `config : [file:line] : text`
+    At,
+    /// `text`, no location: the checks run after the whole configuration is read.
+    Bare,
 }

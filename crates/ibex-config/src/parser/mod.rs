@@ -135,6 +135,7 @@ pub(crate) use scalars::*;
 pub(crate) mod error_pages;
 pub(crate) mod sample_refs;
 pub(crate) mod scope;
+pub(crate) mod warn;
 pub use sample_refs::log_format_exprs;
 pub(crate) use error_pages::*;
 
@@ -165,6 +166,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
     // parse many configs -- cannot leak a section into this one.
     clear_http_errors_sections();
     clear_userlists();
+    warn::reset();
 
     let mut global: Option<GlobalSection> = None;
     let mut proxy_warnings: Vec<crate::ast::global::LoadWarning> = Vec::new();
@@ -443,8 +445,15 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                         line: kw.line,
                         alert: false,
                         text: "'show-desc' requires a parameter or 'desc' to be set in the global section.".into(),
+                        style: crate::ast::global::WarnStyle::Tight,
                     });
                     continue;
+                }
+                match &*section {
+                    CurrentSection::Listen(l) => warn::set_proxy(&l.name),
+                    CurrentSection::Frontend(f) => warn::set_proxy(&f.name),
+                    CurrentSection::Backend(b) => warn::set_proxy(&b.name),
+                    _ => warn::set_proxy(""),
                 }
                 parse_section_directive(section, tokens, kw)?;
                 if kw.text == "id" {
@@ -534,7 +543,11 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
         userlists,
         proxy_order,
         directive_messages,
-        proxy_warnings,
+        proxy_warnings: {
+            proxy_warnings.extend(warn::take());
+            proxy_warnings.sort_by_key(|w| w.line);
+            proxy_warnings
+        },
     };
     register_checks_from_config(&config);
 
@@ -972,9 +985,10 @@ pub(crate) fn parse_cookie(
                     return fail("'domain' expects <domain> as argument.".to_string());
                 };
                 if !d.contains('.') {
-                    eprintln!(
-                        "[ibex] warning: line {}: domain '{d}' contains no embedded dot, this configuration may not work properly (see RFC6265#5.2.3).",
-                        kw.line
+                    warn::push(
+                        kw.line,
+                        crate::ast::global::WarnStyle::Tight,
+                        &format!("domain '{d}' contains no embedded dot, this configuration may not work properly (see RFC6265#5.2.3)."),
                     );
                 }
                 if let Some(c) = d.chars().find(|c| !c.is_ascii_alphanumeric() && !matches!(c, '.' | '_' | '-')) {
