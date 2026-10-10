@@ -278,7 +278,23 @@ impl WorkerPool {
     /// idle connections beyond what the server needs, rounded up, plus one, are closed,
     /// oldest first; the estimate of the need moves halfway to the peak seen since the last
     /// purge (never below it), and the peak restarts from the connections in use (`used`).
+    #[cfg(test)]
     fn purge(&mut self, now: Instant, used: impl Fn((usize, usize)) -> u32) {
+        self.purge_with(now, |srv, s| {
+            let curr_idle = s.conns.len();
+            if curr_idle == 0 {
+                return 0;
+            }
+            let (to_kill, est_need) = srv_purge_step(used(srv), curr_idle, s.max_used, s.est_need);
+            s.est_need = est_need;
+            s.max_used = used(srv);
+            to_kill.map_or(0, |k| k.saturating_add(1).min(curr_idle))
+        });
+    }
+
+    /// The purge of every server due at `now`: `to_close` weighs the server and says how
+    /// many of its oldest idle connections in this pool to close.
+    fn purge_with(&mut self, now: Instant, mut to_close: impl FnMut((usize, usize), &mut SrvIdle) -> usize) {
         if self.next_purge.is_none_or(|t| t > now) {
             return;
         }
@@ -286,22 +302,13 @@ impl WorkerPool {
         for (&srv, s) in &mut self.servers {
             let Some(at) = s.purge_at else { continue };
             if at <= now {
-                let curr_idle = s.conns.len();
-                if curr_idle > 0 {
-                    let in_use = used(srv);
-                    let exceed = i64::from(in_use) + i64::try_from(curr_idle).unwrap_or(i64::MAX) - i64::from(s.max_used.max(s.est_need));
-                    let exceed = exceed / 2 + (exceed & 1);
-                    let avg = (u64::from(s.est_need) + u64::from(s.max_used)) / 2;
-                    s.est_need = u32::try_from(avg).unwrap_or(u32::MAX).max(s.max_used);
-                    s.max_used = in_use;
-                    if exceed > 0 {
-                        let n = usize::try_from(exceed + 1).unwrap_or(usize::MAX).min(curr_idle);
-                        for p in s.conns.drain(..n) {
-                            s.safe -= usize::from(p.safe);
-                            p.conn.close();
-                        }
-                        self.conns -= n;
+                let n = to_close(srv, s).min(s.conns.len());
+                if n > 0 {
+                    for p in s.conns.drain(..n) {
+                        s.safe -= usize::from(p.safe);
+                        p.conn.close();
                     }
+                    self.conns -= n;
                 }
                 s.purge_at = (!s.conns.is_empty()).then(|| now + s.purge_delay);
             }
@@ -311,6 +318,18 @@ impl WorkerPool {
         }
         self.next_purge = next;
     }
+}
+
+/// One step of `srv_cleanup_idle_conns` for a server with `in_use` connections in use and
+/// `curr_idle` idle, its peak since the last purge `max_used` and its estimated need
+/// `est_need`: how many to kill (half the idle connections beyond the need, rounded up;
+/// `None` when there are none), and the new estimate, moved halfway to the peak and never
+/// below it. The peak then restarts from `in_use`.
+fn srv_purge_step(in_use: u32, curr_idle: usize, max_used: u32, est_need: u32) -> (Option<usize>, u32) {
+    let exceed = i64::from(in_use) + i64::try_from(curr_idle).unwrap_or(i64::MAX) - i64::from(max_used.max(est_need));
+    let exceed = exceed / 2 + (exceed & 1);
+    let est = est_need.midpoint(max_used).max(max_used);
+    ((exceed > 0).then(|| usize::try_from(exceed).unwrap_or(usize::MAX)), est)
 }
 
 /// One worker's idle connections as the other workers see them (`idle_conns[tid]`): the
@@ -346,12 +365,15 @@ pub struct IdlePools {
     pool_high: usize,
 }
 
-/// A server's idle connections in all slots, and the most it was seen to use at once
-/// since a purge last looked at it.
+/// A server's idle connections in all slots, the most it was seen to use at once since a
+/// purge last looked at it, and the connections it is estimated to need.
 #[derive(Debug, Default)]
 struct SrvIdleCount {
     idle: AtomicUsize,
     peak: std::sync::atomic::AtomicU32,
+    /// `srv->est_need_conns`: raised with the connections in use, moved halfway to the
+    /// peak by every worker's purge of the server.
+    est_need: std::sync::atomic::AtomicU32,
 }
 
 impl IdlePools {
@@ -401,7 +423,18 @@ impl IdlePools {
     /// Server `srv`'s idle connections in every slot, and its peak of connections in use
     /// raised to `used`.
     fn srv_seen(&self, srv: (usize, usize), used: u32) -> (usize, u32) {
-        self.with_count(srv, |n| (n.idle.load(Ordering::Relaxed), n.peak.fetch_max(used, Ordering::Relaxed).max(used)))
+        let (idle, peak, _) = self.srv_need(srv, used);
+        (idle, peak)
+    }
+
+    /// [`IdlePools::srv_seen`], with the server's estimated need, also raised to `used`
+    /// (`srv_use_conn`).
+    fn srv_need(&self, srv: (usize, usize), used: u32) -> (usize, u32, u32) {
+        self.with_count(srv, |n| {
+            let peak = n.peak.fetch_max(used, Ordering::Relaxed).max(used);
+            let est = n.est_need.fetch_max(used, Ordering::Relaxed).max(used);
+            (n.idle.load(Ordering::Relaxed), peak, est)
+        })
     }
 
     /// Counts `added` connections into server `srv`'s idle ones and `removed` out.
@@ -499,8 +532,12 @@ impl IdlePool {
         let srv = key.srv;
         let slot = &self.pools.slots[self.wid];
         let mut pool = IdlePools::lock(slot);
-        let own = pool.servers.get(&srv).map_or(0, |s| s.conns.len());
-        let (all, peak) = self.pools.srv_seen(srv, used);
+        let (all, peak, est) = self.pools.srv_need(srv, used);
+        // The server's need is server-wide and every worker's purge moves it: this worker's
+        // copy starts from it, which `keep_with` raises to what it sees.
+        let s = pool.servers.entry(srv).or_default();
+        let own = s.conns.len();
+        (s.max_used, s.est_need) = (peak, est);
         // `HAProxy` weighs a connection it may keep with its fd still counted; this one has
         // left the worker's table already.
         let fds = FdUse { used: self.pools.fds_used().saturating_add(1), low: self.pools.pool_low, high: self.pools.pool_high };
@@ -623,17 +660,38 @@ impl IdlePool {
         }
         let slot = &self.pools.slots[self.wid];
         let mut pool = IdlePools::lock(slot);
-        let before: Vec<((usize, usize), usize, Option<Instant>)> = pool.servers.iter().map(|(&k, s)| (k, s.conns.len(), s.purge_at)).collect();
-        pool.purge(now, &used);
-        slot.conns.store(pool.conns, Ordering::Relaxed);
-        for (srv, n, at) in before {
-            let after = pool.servers.get(&srv).map_or(0, |s| s.conns.len());
-            self.pools.count_idle(srv, 0, n.saturating_sub(after));
-            // The peak restarts from the connections in use with each purge of the server.
-            if at.is_some_and(|t| t <= now) {
-                let in_use = used(srv);
-                self.pools.with_count(srv, |c| c.peak.store(in_use, Ordering::Relaxed));
+        let pools = &*self.pools;
+        let mut closed: Vec<((usize, usize), usize)> = Vec::new();
+        // `srv_cleanup_idle_conns`: the server's idle connections, peak and need are
+        // server-wide, and this worker closes its share of the excess (T270: weighed per
+        // worker, each worker's few idle connections stood against the whole server's peak
+        // and a burst's connections outlived it by tens of seconds).
+        pool.purge_with(now, |srv, s| {
+            let own = s.conns.len();
+            let (all, max_used, est) = pools.with_count(srv, |c| {
+                (c.idle.load(Ordering::Relaxed), c.peak.load(Ordering::Relaxed), c.est_need.load(Ordering::Relaxed))
+            });
+            let all = all.max(own);
+            if all == 0 {
+                return 0;
             }
+            let in_use = used(srv);
+            let (to_kill, est) = srv_purge_step(in_use, all, max_used, est);
+            pools.with_count(srv, |c| {
+                c.est_need.store(est, Ordering::Relaxed);
+                // The peak restarts from the connections in use with each purge of the server.
+                c.peak.store(in_use, Ordering::Relaxed);
+            });
+            (s.max_used, s.est_need) = (in_use, est);
+            let n = to_kill.map_or(0, |k| (k.saturating_mul(own) / all).saturating_add(1).min(own));
+            if n > 0 {
+                closed.push((srv, n));
+            }
+            n
+        });
+        slot.conns.store(pool.conns, Ordering::Relaxed);
+        for (srv, n) in closed {
+            pools.count_idle(srv, 0, n);
         }
         self.next_purge = pool.next_purge();
     }
@@ -771,6 +829,42 @@ mod shared_pool_tests {
         w.purge(t0 + Duration::from_millis(500), |_| 2);
         assert_eq!(pools.srv_seen(key().srv, 0).1, 2);
         assert_eq!(pools.srv_seen(other.srv, 0).1, 7);
+    }
+
+    /// T270: after a burst of 32 connections spread over four workers, eight idle on each,
+    /// the server's need and peak are server-wide (`srv->est_need_conns`,
+    /// `srv->max_used_conns`, `srv->curr_idle_conns`) and every worker's purge moves them, so
+    /// the idle connections are gone after four purge periods, as `HAProxy` drains them
+    /// (each purge closes its share, `to_kill * curr_idle_thr / curr_idle + 1`). Weighed per
+    /// worker, each worker's eight stood against the whole server's peak of 32 and outlived a
+    /// header storm by more than 45 s with the default `pool-purge-delay 5s`.
+    #[test]
+    fn every_workers_purge_moves_the_servers_need() {
+        let t0 = Instant::now();
+        let pools = IdlePools::with(4, true);
+        let mut ws: Vec<IdlePool> = (0..4).map(|w| pools.worker(w)).collect();
+        let mut peers = Vec::new();
+        for (w, wk) in (0..4u32).zip(ws.iter_mut()) {
+            let at = t0 + Duration::from_millis(100 * u64::from(w));
+            for k in 0..8u32 {
+                let (c, p) = alive();
+                peers.push(p);
+                assert!(wk.keep(key(), c, false, CFG, 32 - 8 * w - k, at).is_ok());
+            }
+        }
+        assert_eq!(ws[0].total(), 32);
+        // Purges as `HAProxy` would run them: (worker, ms after t0, idle left on it).
+        let steps = [
+            (0, 500, 8), (1, 600, 8), (2, 700, 5), (3, 800, 4),
+            (0, 1000, 4), (1, 1100, 4), (2, 1200, 2), (3, 1300, 1),
+            (0, 1500, 1), (1, 1600, 1), (2, 1700, 0), (3, 1800, 0),
+            (0, 2000, 0), (1, 2100, 0),
+        ];
+        for (w, ms, left) in steps {
+            ws[w].purge(t0 + Duration::from_millis(ms), |_| 0);
+            assert_eq!(ws[w].slot().conns.load(Ordering::Relaxed), left, "worker {w} at {ms} ms");
+        }
+        assert_eq!(ws[0].total(), 0);
     }
 
     /// A sweep closes the idle connections whose peer closed, or sent bytes, and keeps the
