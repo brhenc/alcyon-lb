@@ -336,3 +336,127 @@ fn accept_invalid_http_request_acts_on_the_request_parser() {
     assert_eq!(status("    option accept-unsafe-violations-in-http-request\n"), "HTTP/1.1 200 OK");
     assert_eq!(status("    option accept-invalid-http-request\n"), "HTTP/1.1 200 OK");
 }
+
+// ---------------------------------------------------------------------------------------------
+// T274 G1: `default_backend` in a `defaults` section.
+
+const DEF_BODY: &str = "    mode http\n    timeout client 1s\n    timeout server 1s\n    timeout connect 1s\n";
+const BE_B: &str = "backend b\n    mode http\n    server s 127.0.0.1:1\n";
+
+#[test]
+fn defaults_default_backend_is_inherited_by_frontend_and_listen() {
+    accepts(&format!("defaults\n{DEF_BODY}    default_backend b\nfrontend f\n    bind 127.0.0.1:18091\nfrontend f2\n    bind 127.0.0.1:18092\n{BE_B}"));
+}
+
+#[test]
+fn defaults_default_backend_that_does_not_exist_fails_the_proxy_that_inherits_it() {
+    refuses(
+        &format!("defaults\n{DEF_BODY}    default_backend nosuch\nfrontend f\n    bind 127.0.0.1:18091\n{BE_B}"),
+        &["Proxy 'f': unable to find required default_backend: 'nosuch'."],
+    );
+    // Overridden by the frontend's own: the inherited name is never looked up.
+    accepts(&format!("defaults\n{DEF_BODY}    default_backend nosuch\nfrontend f\n    bind 127.0.0.1:18091\n    default_backend b\n{BE_B}"));
+}
+
+#[test]
+fn defaults_default_backend_follows_named_defaults() {
+    let cfg = format!(
+        "defaults d1\n{DEF_BODY}    default_backend nosuch\ndefaults d2\n{DEF_BODY}frontend f from d1\n    bind 127.0.0.1:18091\nfrontend g from d2\n    bind 127.0.0.1:18092\n{BE_B}"
+    );
+    let (got, rc) = alerts(&cfg);
+    assert_eq!(got, vec!["[ALERT]    (PID) : Proxy 'f': unable to find required default_backend: 'nosuch'.".to_string()]);
+    assert_eq!(rc, 1);
+    // `defaults d1 from d0` inherits it too.
+    accepts(&format!("defaults d0\n{DEF_BODY}    default_backend b\ndefaults d1 from d0\nfrontend f from d1\n    bind 127.0.0.1:18091\n{BE_B}"));
+    let cfg = format!("defaults d0\n{DEF_BODY}    default_backend nosuch\ndefaults d1 from d0\nfrontend f from d1\n    bind 127.0.0.1:18091\n{BE_B}");
+    refuses(&cfg, &["Proxy 'f': unable to find required default_backend: 'nosuch'."]);
+}
+
+#[test]
+fn defaults_default_backend_with_no_user_is_not_looked_up() {
+    accepts(&format!("defaults\n{DEF_BODY}    default_backend nosuch\n{BE_B}"));
+}
+
+#[test]
+fn defaults_default_backend_routes_requests() {
+    if std::env::var("T273D_ORACLE").is_ok() {
+        return;
+    }
+    let addr = common::reserve_addr();
+    let cfg = format!(
+        "defaults\n{DEF_BODY}    default_backend b\nfrontend f\n    bind {addr}\nbackend b\n    mode http\n    http-request return status 218\n"
+    );
+    let mut f = NamedTempFile::new().expect("tmp");
+    f.write_all(cfg.as_bytes()).expect("write");
+    let child = Command::new(env!("CARGO_BIN_EXE_ibex"))
+        .arg("-f")
+        .arg(f.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn");
+    let _ibex = common::Ibex(child);
+    assert!(common::wait_listening(addr), "ibex did not listen");
+    let mut s = std::net::TcpStream::connect(addr).expect("connect");
+    s.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+    s.write_all(b"GET / HTTP/1.1\r\nhost: h\r\nconnection: close\r\n\r\n").unwrap();
+    let mut out = Vec::new();
+    let _ = std::io::Read::read_to_end(&mut s, &mut out);
+    assert_eq!(String::from_utf8_lossy(&out).lines().next().unwrap_or(""), "HTTP/1.1 218 Success");
+}
+
+// ---------------------------------------------------------------------------------------------
+// T274 G3: references checked after the parse print as HAProxy prints them: no `config :
+// parsing` frame; a tracking alert names its `server` line.
+
+fn defaults_then(rest: &str) -> String {
+    format!("defaults\n{DEF_BODY}{rest}")
+}
+
+#[test]
+fn tracking_alerts_name_the_server_line_and_have_no_frame() {
+    refuses(
+        &defaults_then("backend b\n    server s 127.0.0.1:1 track nosuch/x\n"),
+        &["[F:7] : 'server b/s' : unable to find required proxy 'nosuch' for tracking."],
+    );
+    refuses(
+        &defaults_then("backend b\n    server s 127.0.0.1:1\n    server t 127.0.0.1:1 track s2\n"),
+        &["[F:8] : 'server b/t' : unable to find required server 's2' for tracking."],
+    );
+    refuses(
+        &defaults_then("backend b\n    server s 127.0.0.1:1\n    server t 127.0.0.1:1 track s\n"),
+        &["[F:8] : 'server b/t' : unable to use b/s for tracking as it does not have any check nor agent enabled."],
+    );
+    refuses(
+        &defaults_then("backend b\n    server s 127.0.0.1:1 track t\n    server t 127.0.0.1:1 track s\n"),
+        &["[F:8] : 'server b/t' : unable to track b/s as it belongs to a tracking chain looping back to b/t."],
+    );
+}
+
+#[test]
+fn use_server_and_stick_table_alerts_have_no_frame() {
+    refuses(
+        &defaults_then("backend b\n    server s 127.0.0.1:1\n    use-server nosuch if TRUE\n"),
+        &["backend 'b' : unable to find server 'nosuch' referenced in a 'use-server' rule."],
+    );
+    refuses(
+        &defaults_then("listen l\n    bind 127.0.0.1:18091\n    server s 127.0.0.1:1\n    use-server nosuch if TRUE\n"),
+        &["proxy 'l' : unable to find server 'nosuch' referenced in a 'use-server' rule."],
+    );
+    refuses(
+        &defaults_then("backend b\n    stick-table type ip size 1k\n    stick on src table nosuch\n    server s 127.0.0.1:1\n"),
+        &["Proxy 'b': unable to find stick-table 'nosuch'."],
+    );
+}
+
+// T274 G2: Ibex does not validate response heads, so the option has nothing to relax and
+// says so instead of "not implemented and is ignored" (docs/differences.md).
+#[test]
+fn accept_unsafe_violations_in_http_response_says_it_has_nothing_to_relax() {
+    if std::env::var("T273D_ORACLE").is_ok() {
+        return;
+    }
+    let (text, _, rc) = check_any(&defaults_then("backend b\n    option accept-unsafe-violations-in-http-response\n    server s 127.0.0.1:1\n"));
+    assert_eq!(rc, 0);
+    assert!(text.contains("nothing to relax") && !text.contains("not implemented"), "{text}");
+}

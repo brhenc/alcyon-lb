@@ -17,6 +17,7 @@ pub(crate) fn parse_defaults_directive(
             defaults.mode = Some(mode);
             Ok(())
         }
+        "default_backend" => parse_default_backend(&mut defaults.default_backend, tokens, kw),
         "timeout" => parse_timeout_directive(&mut defaults.timeouts, tokens, kw),
         "retries" => {
             let mut r = defaults.retries.unwrap_or(0);

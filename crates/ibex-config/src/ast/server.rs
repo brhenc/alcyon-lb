@@ -231,6 +231,9 @@ pub struct ServerExtras {
     /// What `show servers state` reports as `srv_check_health` while no check runs on the
     /// server, when that is not 0; see `parse_server`.
     pub init_health: Vec<(u32, u32)>,
+    /// The line of the `server` line of each server that has a `track`, for the alerts of
+    /// the check after the parse (`unable to find required server ... for tracking`).
+    pub track_line: Vec<(u32, u32)>,
     /// TLS servers with no CA file to verify against, whose refusal waits for the global
     /// `ssl-server-verify`, which may come later in the file; see [`NoCa`].
     pub no_ca: Vec<NoCa>,

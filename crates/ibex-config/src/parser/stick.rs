@@ -142,7 +142,7 @@ pub(crate) fn validate_stick_rules(
         for r in rules.iter().filter(|r| is_sticking(r)) {
             let table = r.table.as_deref().unwrap_or(name);
             if !has_table(table) {
-                return Err(ConfigError::new(1, 1, format!("Proxy '{name}': unable to find stick-table '{table}'.")));
+                return Err(ConfigError::alerts(vec![(0, format!("Proxy '{name}': unable to find stick-table '{table}'."))]));
             }
             if mode == Mode::Tcp && r.rule_type == StickRuleType::StickStoreResponse {
                 return Err(ConfigError::new(

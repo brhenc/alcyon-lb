@@ -197,6 +197,9 @@ pub(crate) fn parse_server(
     if puid != 0 {
         extras.puid.push((index, puid));
     }
+    if track.is_some() {
+        extras.track_line.push((index, u32::try_from(kw.line).unwrap_or(u32::MAX)));
+    }
     servers.push(Server {
         check_port,
         check_proto,

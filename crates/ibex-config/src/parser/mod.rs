@@ -1457,6 +1457,7 @@ fn validate_tracking(listens: &[ListenSection], backends: &[BackendSection]) -> 
         .map(|l| (l.name.as_str(), l.servers.as_slice()))
         .chain(backends.iter().map(|b| (b.name.as_str(), b.servers.as_slice())))
         .collect();
+    let extras: Vec<&ServerExtras> = listens.iter().map(|l| &l.server_extras).chain(backends.iter().map(|b| &b.server_extras)).collect();
     let find = |px: &str, sv: &str| -> Option<(usize, usize)> {
         let p = all.iter().position(|(n, _)| *n == px)?;
         Some((p, all[p].1.iter().position(|s| s.id == sv)?))
@@ -1466,7 +1467,9 @@ fn validate_tracking(listens: &[ListenSection], backends: &[BackendSection]) -> 
     for (p, (px, servers)) in all.iter().enumerate() {
         for (s, server) in servers.iter().enumerate() {
             let Some(spec) = &server.track else { continue };
-            let err = |msg: String| ConfigError::new(1, 1, format!("'server {px}/{}' : {msg}", server.id));
+            // HAProxy prints these after the parse, with the `server` line's place and no frame.
+            let at = extras[p].track_line.iter().find(|e| e.0 as usize == s).map_or(0, |e| e.1 as usize);
+            let err = |msg: String| ConfigError::alerts(vec![(at, format!("{{at}} : 'server {px}/{}' : {msg}", server.id))]);
             if server.check {
                 return Err(err("unable to enable checks and tracking at the same time!".to_string()));
             }
@@ -1542,16 +1545,16 @@ pub(crate) fn validate_config(
     for l in listens {
         for r in &l.use_servers {
             if !l.servers.iter().any(|s| s.id == r.server) {
-                return Err(ConfigError::new(1, 1, format!(
-                    "listen '{}' : unable to find server '{}' referenced in a 'use-server' rule.", l.name, r.server)));
+                return Err(ConfigError::alerts(vec![(0, format!(
+                    "proxy '{}' : unable to find server '{}' referenced in a 'use-server' rule.", l.name, r.server))]));
             }
         }
     }
     for b in backends {
         for r in &b.use_servers {
             if !b.servers.iter().any(|s| s.id == r.server) {
-                return Err(ConfigError::new(1, 1, format!(
-                    "backend '{}' : unable to find server '{}' referenced in a 'use-server' rule.", b.name, r.server)));
+                return Err(ConfigError::alerts(vec![(0, format!(
+                    "backend '{}' : unable to find server '{}' referenced in a 'use-server' rule.", b.name, r.server))]));
             }
         }
     }

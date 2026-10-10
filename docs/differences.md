@@ -112,6 +112,25 @@ million steps on a real header is a pattern to rewrite.
 The plain pattern `^/(a+)+$`, with no PCRE-only feature, is not backtracking at all on Ibex
 (it runs in `regex`, linear time) and gives the answer PCRE2 gives.
 
+## Server responses are not validated (`accept-unsafe-violations-in-http-response`)
+
+HAProxy answers `502` to a server response whose head has an invalid header name (for
+example `Bad Name: x`) or a NUL in a header value, unless the backend has `option
+accept-unsafe-violations-in-http-response` (deprecated name `accept-invalid-http-response`),
+which drops the header and forwards the rest. Ibex has no validator for the response head
+(it validates requests only, `validate_request_head`), so it forwards both cases with or
+without the option. The option is accepted (`ibex -c` prints a notice that it has nothing
+to relax); the missing strictness is the difference, measured on HAProxy 3.5-dev8 with a
+scripted backend. Not implemented: a backend that relied on the 502 as a guard gets none.
+
+## `use_backend` with a log-format name
+
+`use_backend %[req.hdr(x)]` (a backend name built per request) is refused at load with
+`'use_backend' with a log-format backend name is not implemented by Ibex`. HAProxy accepts
+it, skips the rule when the built name is no backend, and does not check the name at load.
+`use-server` with a log-format server name is refused the same way. Name the backends in
+`use_backend ... if` rules instead.
+
 ## Out of Milestone 1 scope: refused at load (T164)
 
 These are refused by the parser with `'<keyword>' is not supported by Ibex (out of scope, see
