@@ -18,10 +18,15 @@
 //!
 //! ```text
 //! IBEXFD <n>\n            then n lines, one per descriptor, in the order they are attached:
-//! tcp <address>\n
+//! tcp <address>\n         a listening stream socket (a proxy's or a log-forward's `bind`)
+//! udp <address>\n         a log-forward `dgram-bind`
 //! ...
 //! END\n                   after the last batch
 //! ```
+//!
+//! `log-forward` sockets go over too, as `HAProxy`'s do (the same socket inodes before and
+//! after a `reload`, measured on 3.5-dev8): without them a new worker could not bind the
+//! old one's addresses, and no configuration with a `log-forward` could be reloaded (T252).
 //!
 //! QUIC listeners are not handed over. A QUIC connection lives on the listening UDP socket,
 //! so two processes sharing one would each receive datagrams for the other's connections.
@@ -48,8 +53,28 @@ const BATCH: usize = 200;
 const SEND_BUDGET: Duration = Duration::from_secs(1);
 
 static EXPOSE_ENABLED: AtomicBool = AtomicBool::new(false);
-static EXPOSED: Mutex<Vec<(SocketAddr, OwnedFd)>> = Mutex::new(Vec::new());
-static INHERITED: Mutex<Vec<HashMap<SocketAddr, Vec<OwnedFd>>>> = Mutex::new(Vec::new());
+static EXPOSED: Mutex<Vec<(Kind, SocketAddr, OwnedFd)>> = Mutex::new(Vec::new());
+/// The sockets handed to one worker, by kind and address.
+type PerWorker = HashMap<(Kind, SocketAddr), Vec<OwnedFd>>;
+static INHERITED: Mutex<Vec<PerWorker>> = Mutex::new(Vec::new());
+
+/// What a handed-over socket is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Kind {
+    /// A listening stream socket.
+    Tcp,
+    /// A datagram socket (`log-forward` `dgram-bind`).
+    Udp,
+}
+
+impl Kind {
+    fn word(self) -> &'static str {
+        match self {
+            Kind::Tcp => "tcp",
+            Kind::Udp => "udp",
+        }
+    }
+}
 
 /// Turns on `expose-fd listeners`: listeners register themselves and `_getsocks` answers.
 pub fn enable_expose() {
@@ -69,11 +94,19 @@ pub fn expose_enabled() -> bool {
 /// # Errors
 /// Propagates a failure to duplicate the descriptor.
 pub fn expose(addr: SocketAddr, fd: BorrowedFd<'_>) -> io::Result<()> {
+    expose_kind(Kind::Tcp, addr, fd)
+}
+
+/// [`expose`] for a socket of any [`Kind`].
+///
+/// # Errors
+/// Propagates a failure to duplicate the descriptor.
+pub fn expose_kind(kind: Kind, addr: SocketAddr, fd: BorrowedFd<'_>) -> io::Result<()> {
     if !expose_enabled() {
         return Ok(());
     }
     let dup = fd.try_clone_to_owned()?;
-    EXPOSED.lock().map_err(|_| io::Error::other("poisoned"))?.push((addr, dup));
+    EXPOSED.lock().map_err(|_| io::Error::other("poisoned"))?.push((kind, addr, dup));
     Ok(())
 }
 
@@ -105,10 +138,10 @@ pub fn serve_getsocks(stream: &UnixStream) -> io::Result<usize> {
     let deadline = Instant::now() + SEND_BUDGET;
     for chunk in exposed.chunks(BATCH) {
         let mut text = format!("IBEXFD {}\n", chunk.len());
-        for (addr, _) in chunk {
-            let _ = writeln!(text, "tcp {addr}");
+        for (kind, addr, _) in chunk {
+            let _ = writeln!(text, "{} {addr}", kind.word());
         }
-        let fds: Vec<BorrowedFd<'_>> = chunk.iter().map(|(_, fd)| fd.as_fd()).collect();
+        let fds: Vec<BorrowedFd<'_>> = chunk.iter().map(|(_, _, fd)| fd.as_fd()).collect();
         let mut space = vec![0u8; rustix::cmsg_space!(ScmRights(BATCH))];
         let mut control = SendAncillaryBuffer::new(&mut space);
         if !control.push(SendAncillaryMessage::ScmRights(&fds)) {
@@ -153,7 +186,7 @@ fn retry_eagain<T>(deadline: Instant, mut f: impl FnMut() -> rustix::io::Result<
 /// # Errors
 /// Propagates connection, protocol, and descriptor-count failures. The caller treats any
 /// error as "bind fresh", which is a graceful reload rather than a hitless one.
-pub fn fetch(sock: &Path) -> io::Result<Vec<(SocketAddr, OwnedFd)>> {
+pub fn fetch(sock: &Path) -> io::Result<Vec<(Kind, SocketAddr, OwnedFd)>> {
     let mut stream = UnixStream::connect(sock)?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.write_all(b"_getsocks\n")?;
@@ -191,10 +224,12 @@ pub fn fetch(sock: &Path) -> io::Result<Vec<(SocketAddr, OwnedFd)>> {
             format!("old process did not complete _getsocks: {}", text.trim()),
         ));
     }
-    let addrs: Vec<SocketAddr> = text
+    let addrs: Vec<(Kind, SocketAddr)> = text
         .lines()
-        .filter_map(|l| l.strip_prefix("tcp "))
-        .map(str::parse)
+        .filter_map(|l| {
+            l.strip_prefix("tcp ").map(|a| (Kind::Tcp, a)).or_else(|| l.strip_prefix("udp ").map(|a| (Kind::Udp, a)))
+        })
+        .map(|(k, a)| a.parse().map(|a| (k, a)))
         .collect::<Result<_, _>>()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("bad address: {e}")))?;
     if addrs.len() != fds.len() {
@@ -203,21 +238,20 @@ pub fn fetch(sock: &Path) -> io::Result<Vec<(SocketAddr, OwnedFd)>> {
             format!("{} addresses but {} descriptors", addrs.len(), fds.len()),
         ));
     }
-    Ok(addrs.into_iter().zip(fds).collect())
+    Ok(addrs.into_iter().zip(fds).map(|((k, a), fd)| (k, a, fd)).collect())
 }
 
 /// Spreads fetched sockets over `nbthread` workers: the i-th socket for an address goes to
 /// worker `i % nbthread`. The old process may have run a different number of threads, so
 /// a worker can end up with several sockets for one address, or none; every socket is
 /// adopted by someone, because closing one would reset its queue.
-pub fn distribute(sockets: Vec<(SocketAddr, OwnedFd)>, nbthread: usize) {
+pub fn distribute(sockets: Vec<(Kind, SocketAddr, OwnedFd)>, nbthread: usize) {
     let nbthread = nbthread.max(1);
-    let mut per_worker: Vec<HashMap<SocketAddr, Vec<OwnedFd>>> =
-        (0..nbthread).map(|_| HashMap::new()).collect();
-    let mut seen: HashMap<SocketAddr, usize> = HashMap::new();
-    for (addr, fd) in sockets {
-        let i = seen.entry(addr).or_insert(0);
-        per_worker[*i % nbthread].entry(addr).or_default().push(fd);
+    let mut per_worker: Vec<PerWorker> = (0..nbthread).map(|_| HashMap::new()).collect();
+    let mut seen: HashMap<(Kind, SocketAddr), usize> = HashMap::new();
+    for (kind, addr, fd) in sockets {
+        let i = seen.entry((kind, addr)).or_insert(0);
+        per_worker[*i % nbthread].entry((kind, addr)).or_default().push(fd);
         *i += 1;
     }
     if let Ok(mut g) = INHERITED.lock() {
@@ -231,8 +265,18 @@ pub fn take_inherited(worker: usize, addr: SocketAddr) -> Vec<OwnedFd> {
     INHERITED
         .lock()
         .ok()
-        .and_then(|mut g| g.get_mut(worker).and_then(|m| m.remove(&addr)))
+        .and_then(|mut g| g.get_mut(worker).and_then(|m| m.remove(&(Kind::Tcp, addr))))
         .unwrap_or_default()
+}
+
+/// Every inherited socket of `kind` for `addr`, whichever worker it was given to: a
+/// `log-forward` listener is served by its own thread, not by the workers.
+#[must_use]
+pub fn take_inherited_all(kind: Kind, addr: SocketAddr) -> Vec<OwnedFd> {
+    INHERITED.lock().map_or_else(
+        |_| Vec::new(),
+        |mut g| g.iter_mut().filter_map(|m| m.remove(&(kind, addr))).flatten().collect(),
+    )
 }
 
 /// Closes inherited sockets no listener claimed -- an address the new config no longer

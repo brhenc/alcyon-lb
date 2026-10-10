@@ -12,17 +12,24 @@
 //! message is taken apart (`loghdr::parse`) so that each target can write it under its own
 //! `format`, or under the shape it arrived in when it has none. The listeners are threads:
 //! logging is off the data path, and one blocked collector must not slow it.
+//!
+//! On a reload the `bind` and `dgram-bind` sockets go to the new worker through `-x` /
+//! `_getsocks` ([`crate::handover`]), as `HAProxy`'s do, and are bound with `SO_REUSEPORT`
+//! when nothing was handed over; once the old worker is soft-stopping ([`soft_stop`]) its
+//! listener threads stop taking messages and connections and close their sockets.
 
 use std::collections::HashSet;
 use std::io::{self, BufRead, BufReader, Read};
-use std::net::{IpAddr, TcpListener, UdpSocket};
+use std::net::{IpAddr, SocketAddr, TcpListener, UdpSocket};
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixListener;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use ibex_config::{Config, LogForwardBind, LogForwardHost, LogForwardSection};
 
+use crate::handover::Kind;
 use crate::loghdr::{parse, Meta};
 use crate::syslog::{facility_code, level_code, sample_admits, SyslogTarget};
 
@@ -159,6 +166,85 @@ impl Drop for Admission {
     }
 }
 
+/// Set by [`soft_stop`]: the listener threads leave, closing their sockets.
+static STOPPING: AtomicBool = AtomicBool::new(false);
+
+/// How often a listener thread looks at [`STOPPING`].
+const STOP_POLL: Duration = Duration::from_millis(200);
+
+/// Soft stop (`SIGUSR1`): the log-forward listeners stop taking messages and connections
+/// within [`STOP_POLL`] and close, as the proxies' listeners do. Without it a stopping
+/// worker kept reading the sockets it shares with its successor and forwarded part of the
+/// messages under the old configuration. Connections already accepted are served on.
+pub fn soft_stop() {
+    STOPPING.store(true, Ordering::Relaxed);
+}
+
+fn stopping() -> bool {
+    STOPPING.load(Ordering::Relaxed)
+}
+
+/// Waits until `fd` is readable; `false` once the process is stopping.
+fn wait_readable(fd: impl AsFd) -> bool {
+    use rustix::event::{poll, PollFd, PollFlags};
+    let timeout = i32::try_from(STOP_POLL.as_millis()).unwrap_or(200);
+    while !stopping() {
+        let mut fds = [PollFd::new(&fd, PollFlags::IN)];
+        if matches!(poll(&mut fds, timeout), Ok(n) if n > 0) {
+            return true;
+        }
+    }
+    false
+}
+
+/// A transient accept failure (the descriptor table full...) is retried after a pause
+/// rather than in a spin.
+fn accept_failed(e: &io::Error) {
+    if !matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// The sockets for one `dgram-bind` (`Kind::Udp`) or TCP `bind` (`Kind::Tcp`): what the old
+/// process handed over, or one bound here with `SO_REUSEPORT`, so that a process started
+/// without `-x` (`-sf` alone) can bind beside the old one. Each is exposed for the next
+/// reload.
+fn sockets(kind: Kind, addr: SocketAddr) -> io::Result<Vec<OwnedFd>> {
+    use rustix::net::{self as net, sockopt, AddressFamily, SocketFlags, SocketType};
+    let want = if kind == Kind::Udp { SocketType::DGRAM } else { SocketType::STREAM };
+    let mut out: Vec<OwnedFd> = crate::handover::take_inherited_all(kind, addr)
+        .into_iter()
+        .filter(|fd| {
+            sockopt::get_socket_type(fd).is_ok_and(|t| t == want)
+                && (kind == Kind::Udp || sockopt::get_socket_acceptconn(fd).unwrap_or(false))
+                && local_addr(fd) == Some(addr)
+        })
+        .collect();
+    if out.is_empty() {
+        let family = if addr.is_ipv4() { AddressFamily::INET } else { AddressFamily::INET6 };
+        let fd = net::socket_with(family, want, SocketFlags::CLOEXEC, None)?;
+        sockopt::set_socket_reuseaddr(&fd, true)?;
+        sockopt::set_socket_reuseport(&fd, true)?;
+        net::bind(&fd, &addr)?;
+        if kind == Kind::Tcp {
+            net::listen(&fd, 128)?;
+        }
+        out.push(fd);
+    }
+    for fd in &out {
+        crate::handover::expose_kind(kind, addr, fd.as_fd())?;
+    }
+    Ok(out)
+}
+
+fn local_addr(fd: &OwnedFd) -> Option<SocketAddr> {
+    match rustix::net::getsockname(fd).ok()? {
+        rustix::net::SocketAddrAny::V4(a) => Some(SocketAddr::V4(a)),
+        rustix::net::SocketAddrAny::V6(a) => Some(SocketAddr::V6(std::net::SocketAddrV6::new(*a.ip(), a.port(), 0, 0))),
+        _ => None,
+    }
+}
+
 fn started() -> &'static Mutex<HashSet<String>> {
     static S: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     S.get_or_init(|| Mutex::new(HashSet::new()))
@@ -241,6 +327,57 @@ fn check_ring_targets(config: &Config) -> io::Result<()> {
     Ok(())
 }
 
+/// One `dgram-bind` socket's thread: a message per datagram, until the soft stop.
+fn serve_dgram(name: &str, sock: UdpSocket, fwd: Arc<Forwarder>) -> io::Result<()> {
+    // Blocking with a timeout, so that the thread sees a soft stop.
+    sock.set_nonblocking(false)?;
+    sock.set_read_timeout(Some(STOP_POLL))?;
+    spawn(&format!("logfwd-{name}"), move || {
+        let mut buf = vec![0u8; 65536];
+        while !stopping() {
+            match sock.recv_from(&mut buf) {
+                Ok((n, from)) => fwd.process(Some(from.ip()), &buf[..n]),
+                Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted) => {}
+                Err(_) => break,
+            }
+        }
+    })
+}
+
+/// One TCP `bind` socket's thread: accepts until the soft stop, a thread per connection.
+fn serve_tcp(name: &str, listener: TcpListener, fwd: Arc<Forwarder>, tls: Option<Arc<rustls::ServerConfig>>) -> io::Result<()> {
+    listener.set_nonblocking(true)?;
+    spawn(&format!("logfwd-{name}"), move || {
+        while wait_readable(&listener) {
+            let conn = match listener.accept() {
+                Ok((c, _)) => c,
+                Err(e) => {
+                    accept_failed(&e);
+                    continue;
+                }
+            };
+            if conn.set_nonblocking(false).is_err() {
+                continue;
+            }
+            let Some(slot) = fwd.admit() else { continue };
+            let (fwd, tls) = (Arc::clone(&fwd), tls.clone());
+            let _ = spawn("logfwd-conn", move || {
+                let _slot = slot;
+                let peer = conn.peer_addr().ok().map(|a| a.ip());
+                let _ = conn.set_read_timeout(fwd.timeout);
+                match tls {
+                    Some(cfg) => {
+                        if let Ok(c) = rustls::ServerConnection::new(cfg) {
+                            fwd.serve_stream(rustls::StreamOwned::new(c, conn), peer);
+                        }
+                    }
+                    None => fwd.serve_stream(conn, peer),
+                }
+            });
+        }
+    })
+}
+
 fn start_section(config: &Config, section: &LogForwardSection) -> io::Result<()> {
     let mut targets: Vec<SyslogTarget> = section.logs.iter().map(SyslogTarget::new).collect();
     if section.log_global {
@@ -259,14 +396,10 @@ fn start_section(config: &Config, section: &LogForwardSection) -> io::Result<()>
         timeout: section.timeout_client,
     });
     for addr in &section.dgram_binds {
-        let sock = UdpSocket::bind(addr).map_err(|e| bind_error(&section.name, &addr.to_string(), &e))?;
-        let fwd = Arc::clone(&fwd);
-        spawn(&format!("logfwd-{}", section.name), move || {
-            let mut buf = vec![0u8; 65536];
-            while let Ok((n, from)) = sock.recv_from(&mut buf) {
-                fwd.process(Some(from.ip()), &buf[..n]);
-            }
-        })?;
+        let socks = sockets(Kind::Udp, *addr).map_err(|e| bind_error(&section.name, &addr.to_string(), &e))?;
+        for fd in socks {
+            serve_dgram(&section.name, UdpSocket::from(fd), Arc::clone(&fwd))?;
+        }
     }
     for bind in &section.binds {
         match bind {
@@ -288,27 +421,10 @@ fn start_section(config: &Config, section: &LogForwardSection) -> io::Result<()>
                 } else {
                     None
                 };
-                let listener = TcpListener::bind(b.addr).map_err(|e| bind_error(&section.name, &b.addr.to_string(), &e))?;
-                let fwd = Arc::clone(&fwd);
-                spawn(&format!("logfwd-{}", section.name), move || {
-                    for conn in listener.incoming().flatten() {
-                        let Some(slot) = fwd.admit() else { continue };
-                        let (fwd, tls) = (Arc::clone(&fwd), tls.clone());
-                        let _ = spawn("logfwd-conn", move || {
-                            let _slot = slot;
-                            let peer = conn.peer_addr().ok().map(|a| a.ip());
-                            let _ = conn.set_read_timeout(fwd.timeout);
-                            match tls {
-                                Some(cfg) => {
-                                    if let Ok(c) = rustls::ServerConnection::new(cfg) {
-                                        fwd.serve_stream(rustls::StreamOwned::new(c, conn), peer);
-                                    }
-                                }
-                                None => fwd.serve_stream(conn, peer),
-                            }
-                        });
-                    }
-                })?;
+                let socks = sockets(Kind::Tcp, b.addr).map_err(|e| bind_error(&section.name, &b.addr.to_string(), &e))?;
+                for fd in socks {
+                    serve_tcp(&section.name, TcpListener::from(fd), Arc::clone(&fwd), tls.clone())?;
+                }
             }
             LogForwardBind::Unix { path, mode } => {
                 let _ = std::fs::remove_file(path);
@@ -317,9 +433,20 @@ fn start_section(config: &Config, section: &LogForwardSection) -> io::Result<()>
                     use std::os::unix::fs::PermissionsExt;
                     std::fs::set_permissions(path, std::fs::Permissions::from_mode(*m))?;
                 }
+                listener.set_nonblocking(true)?;
                 let fwd = Arc::clone(&fwd);
                 spawn(&format!("logfwd-{}", section.name), move || {
-                    for conn in listener.incoming().flatten() {
+                    while wait_readable(&listener) {
+                        let conn = match listener.accept() {
+                            Ok((c, _)) => c,
+                            Err(e) => {
+                                accept_failed(&e);
+                                continue;
+                            }
+                        };
+                        if conn.set_nonblocking(false).is_err() {
+                            continue;
+                        }
                         let Some(slot) = fwd.admit() else { continue };
                         let fwd = Arc::clone(&fwd);
                         let _ = spawn("logfwd-conn", move || {

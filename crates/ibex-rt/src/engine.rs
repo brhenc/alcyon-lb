@@ -4742,6 +4742,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         // would keep each socket open -- and queueing connections -- after its listener
         // is gone. By now the new process has taken what it needs.
         crate::handover::withdraw_all();
+        crate::logfwd::soft_stop();
         for ql in &mut self.quic_listeners {
             ql.begin_soft_stop();
         }

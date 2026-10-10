@@ -163,6 +163,17 @@ fn hold_old_worker(port: u16) -> TcpStream {
     s
 }
 
+/// How many of `pid`'s threads are log-forward listeners.
+fn logfwd_threads(pid: u32) -> usize {
+    std::fs::read_dir(format!("/proc/{pid}/task"))
+        .map(|d| {
+            d.flatten()
+                .filter(|t| std::fs::read_to_string(t.path().join("comm")).unwrap_or_default().trim() == "logfwd-lf")
+                .count()
+        })
+        .unwrap_or(0)
+}
+
 /// The datagrams that reached `rx` within `within`, as text.
 fn drain(rx: &UdpSocket, within: Duration) -> String {
     rx.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
@@ -206,12 +217,23 @@ fn a_log_forward_section_does_not_stop_a_reload() {
     tx.send_to(b"<134>Oct 10 12:00:00 h app: before-reload", ("127.0.0.1", udp)).unwrap();
     assert!(drain(&rx1, Duration::from_millis(500)).contains("before-reload"), "v1 forwards");
 
+    let old = children(ibex.pid());
+    assert_eq!(old.len(), 1, "one worker: {old:?}");
+    let old = old[0];
+    assert!(logfwd_threads(old) > 0);
     let _held = hold_old_worker(port);
     std::fs::write(&cfg, http(port, "v2", &lf(&rx2))).unwrap();
     let out = master(&sock, "reload", Duration::from_secs(15));
     ibex.note_children();
     assert!(out.starts_with("Success=1\n"), "reload with a log-forward section: {out:?}");
     assert_eq!(served_eventually(port, "v2"), "v2");
+    // Once told to stop, the old worker's listener threads leave.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while logfwd_threads(old) > 0 {
+        assert!(Instant::now() < deadline, "the stopping worker still runs its log-forward listeners");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(alive(old), "the old worker is held by a connection");
 
     // The old worker is still there (it holds `_held`) but stopping: every message goes to
     // the new worker's target.

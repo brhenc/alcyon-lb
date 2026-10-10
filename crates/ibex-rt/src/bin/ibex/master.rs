@@ -350,7 +350,7 @@ struct Master {
 
 /// How long a reloaded worker may take to become ready before it is killed and the reload
 /// reported failed, so that one that hangs (a configuration that opens a FIFO, a stalled
-/// filesystem) does not block every later reload. HAProxy has no such bound: its master
+/// filesystem) does not block every later reload. `HAProxy` has no such bound: its master
 /// waits for ever and answers every later `reload` "Another reload is still in progress."
 /// `IBEX_WORKER_LOAD_TIMEOUT_MS` overrides it (the tests use it).
 const LOAD_TIMEOUT: Duration = Duration::from_secs(120);
