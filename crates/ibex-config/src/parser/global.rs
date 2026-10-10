@@ -58,7 +58,8 @@ pub(crate) fn parse_global_directive(
                 return Ok(());
             }
             if tokens.len() >= 3 && tokens[1].text == "socket" {
-                let mut sock = crate::ast::StatsSocket { path: tokens[2].text.clone(), ..Default::default() };
+                let path = stats_socket_path(&tokens[2])?;
+                let mut sock = crate::ast::StatsSocket { path, ..Default::default() };
                 let mut i = 3;
                 while i < tokens.len() {
                     match tokens[i].text.as_str() {
@@ -533,3 +534,36 @@ pub(crate) fn parse_global_directive(
     }
 }
 
+
+/// The unix path a `stats socket` address names, refusing what HAProxy refuses and what Ibex
+/// does not implement (`str2sa_range`, src/tools.c; T222). Measured on 3.5-dev8-885761-29:
+/// a name with no leading `/` and no `unix@` prefix is `host:port` (so `./x.sock` has "no
+/// port specification"); the 97 byte limit counts after `unix@`; `abns@` allows 107.
+/// TCP, abstract and `fd@` stats sockets are accepted by HAProxy; Ibex serves the CLI on
+/// unix socket files only, so those are refused here rather than bound as a file named
+/// after the address (AGENTS.md section 5).
+fn stats_socket_path(tok: &Token) -> Result<String, ConfigError> {
+    let arg = tok.text.as_str();
+    let err = |m: String| ConfigError::new(tok.line, tok.col, format!("'stats socket' : {m}"));
+    let too_long = |max: usize| err(format!("socket path '{arg}' too long (max {max})"));
+    if let Some(rest) = arg.strip_prefix("unix@") {
+        return if rest.len() > 97 { Err(too_long(97)) } else { Ok(rest.to_string()) };
+    }
+    if let Some(rest) = arg.strip_prefix("abns@") {
+        if rest.len() > 107 {
+            return Err(too_long(107));
+        }
+        return Err(err(format!("abstract unix sockets are not supported by Ibex in '{arg}'")));
+    }
+    if arg.starts_with('/') {
+        return if arg.len() > 97 { Err(too_long(97)) } else { Ok(arg.to_string()) };
+    }
+    let spec = arg.split_once('@').map_or(arg, |(_, r)| r);
+    if arg.starts_with("fd@") || arg.starts_with("sockpair@") {
+        return Err(err(format!("file descriptor addresses are not supported by Ibex in '{arg}'")));
+    }
+    if !spec.contains(':') {
+        return Err(err(format!("missing port specification in '{arg}'")));
+    }
+    Err(err(format!("TCP addresses are not supported by Ibex (the CLI listens on unix sockets only) in '{arg}'")))
+}

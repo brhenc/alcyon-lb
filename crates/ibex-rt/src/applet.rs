@@ -778,6 +778,9 @@ impl CliApplet {
         let mut sid_filter = None;
 
         let parts: Vec<&str> = cmd.split_whitespace().collect();
+        // HAProxy answers `typed` and `json` in those formats; Ibex has neither (T222), and
+        // CSV in their place would look like an answer to the question.
+        let unsupported = parts.iter().skip(2).any(|p| matches!(*p, "typed" | "json"));
         // parts = ["show", "stat", "be", "4", "-1"]
         if parts.len() >= 3 {
             if let Ok(id) = parts[2].parse::<i32>() {
@@ -797,14 +800,11 @@ impl CliApplet {
             sid_filter = parts[4].parse::<i32>().ok();
         }
 
-        let stat_csv = format_show_stat_filtered(
-            ctx.proxies,
-            ctx.checks,
-            ctx.pid,
-            iid_filter,
-            type_filter,
-            sid_filter,
-        );
+        let stat_csv = if unsupported {
+            "'show stat typed' and 'show stat json' are not supported by Ibex.\n".to_string()
+        } else {
+            format_show_stat_filtered(ctx.proxies, ctx.checks, ctx.pid, iid_filter, type_filter, sid_filter)
+        };
         self.out_buf.extend_from_slice(stat_csv.as_bytes());
         if self.interactive {
             self.out_buf.extend_from_slice(b"\n> ");
