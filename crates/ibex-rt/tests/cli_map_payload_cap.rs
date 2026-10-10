@@ -151,3 +151,14 @@ fn a_payload_line_without_lf_is_capped_too() {
     assert_eq!(String::from_utf8_lossy(&out), TOO_BIG);
     assert_eq!(entries(&ibex), 1);
 }
+
+#[test]
+fn a_payload_line_may_be_longer_than_a_buffer() {
+    // Measured: `add map <m> <<` with one 20000-byte line is applied; only a command line
+    // is limited to `tune.bufsize`.
+    let ibex = start();
+    let input = format!("add map {} <<\nlong {}\n\n", ibex.map, "v".repeat(20_000));
+    let out = cli(&ibex, input.as_bytes());
+    assert!(!out.contains("too big"), "{:?}", &out[..out.len().min(300)]);
+    assert_eq!(entries(&ibex), 2);
+}

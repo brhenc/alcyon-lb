@@ -269,7 +269,16 @@ impl CliApplet {
                     // A command line is at most one buffer (`tune.bufsize`): HAProxy answers
                     // this and closes (measured, T239). Nothing longer is kept.
                     let tail = self.in_buf.iter().rposition(|&b| b == b'\n').map_or(self.in_buf.len(), |p| self.in_buf.len() - p - 1);
-                    if tail >= crate::buf::get_bufsize() {
+                    // A payload line (after `<cmd> <<`) is limited by the payload cap
+                    // instead (T251).
+                    let in_payload = self.payload.is_some()
+                        || self.in_buf[..self.in_buf.len() - tail].split(|&b| b == b'\n').any(|l| l.trim_ascii_end().ends_with(b"<<"));
+                    if in_payload {
+                        if tail > CLI_MAX_PAYLOAD {
+                            self.refuse_payload();
+                            break;
+                        }
+                    } else if tail >= crate::buf::get_bufsize() {
                         self.in_buf.clear();
                         self.out_buf.extend_from_slice(
                             b"The command line is too big for the buffer size. Please change 'tune.bufsize' in the configuration to use a bigger command.\n",
