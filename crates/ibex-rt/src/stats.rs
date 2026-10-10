@@ -589,7 +589,9 @@ fn write_frontend_row(out: &mut String, fmt: StatFormat, proxy: &Proxy, _pid: u3
     r.set("smax", proxy.stats.iter().map(|s| s.max_conn.load(std::sync::atomic::Ordering::Relaxed)).max().unwrap_or(0));
     r.set("slim", proxy.maxconn.get());
     let stot = proxy.stats.iter().map(|s| s.cum_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>();
-    r.set("stot", stot);
+    // A connection whose TLS handshake failed is a `conn_tot` but never became a session.
+    let failed_hs: u64 = proxy.stats.iter().map(|s| s.ssl_failed_hs.load(std::sync::atomic::Ordering::Relaxed)).sum();
+    r.set("stot", stot.saturating_sub(failed_hs));
     r.set("dreq", proxy.stats.iter().map(|s| s.denied_req.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>());
     r.set("dresp", proxy.stats.iter().map(|s| s.denied_resp.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>());
     r.set("dcon", proxy.stats.iter().map(|s| s.denied_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>());
@@ -604,9 +606,10 @@ fn write_frontend_row(out: &mut String, fmt: StatFormat, proxy: &Proxy, _pid: u3
     r.set("rate", rate);
     r.set("rate_lim", 0);
     r.set("rate_max", rate_max);
-    r.set("conn_rate", rate);
+    r.set("conn_rate", proxy.stats.iter().map(|s| s.fe_conn_rate.rate()).sum::<u64>());
     r.set("conn_rate_max", rate_max);
     r.set("conn_tot", stot);
+    r.set("ssl_failed_handshake", proxy.stats.iter().map(|s| s.ssl_failed_hs.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>());
     if !http {
         r.set("req_tot", 0);
     }

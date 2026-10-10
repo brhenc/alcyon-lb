@@ -34,7 +34,7 @@ use std::os::fd::{AsRawFd, BorrowedFd};
 ///
 /// `drained` is whether the last read left the socket empty: shorter than asked, or
 /// `EAGAIN` (see [`TlsConn::sock_drained`]).
-struct Sock<'a>(BorrowedFd<'a>, bool);
+struct Sock<'a>(BorrowedFd<'a>, bool, Vec<u8>);
 
 impl Read for Sock<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
@@ -45,12 +45,83 @@ impl Read for Sock<'_> {
             Io::Eof | Io::Closed => false,
         };
         match r {
-            Io::Done(n) => Ok(n),
+            Io::Done(n) => {
+                // The first bytes a client sends tell a TLS handshake from a stranger's bytes.
+                let room = HEAD_LEN.saturating_sub(self.2.len());
+                self.2.extend_from_slice(&buf[..n.min(room)]);
+                Ok(n)
+            }
             Io::Eof => Ok(0),
             Io::WouldBlock => Err(io::ErrorKind::WouldBlock.into()),
             Io::Closed => Err(io::ErrorKind::ConnectionReset.into()),
         }
     }
+}
+
+/// How many of a connection's first bytes are kept to tell why its handshake failed.
+const HEAD_LEN: usize = 8;
+
+/// Why a client's TLS handshake failed, as `HAProxy` words it in the log
+/// (`session_embryonic_build_legacy_err`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HsFail {
+    /// The client left without sending a byte (`CO_ER_SSL_EMPTY`).
+    Empty,
+    /// The client left after part of a handshake (`CO_ER_SSL_ABORT`).
+    Abort,
+    /// The bytes were not an acceptable handshake: the OpenSSL-style error text.
+    Error(String),
+}
+
+impl HsFail {
+    /// `option dontlognull` does not log a client that left (`session_kill_embryonic`).
+    #[must_use]
+    pub const fn is_null(&self) -> bool {
+        !matches!(self, Self::Error(_))
+    }
+
+    /// The message of `HAProxy`'s log line.
+    #[must_use]
+    pub fn message(&self) -> String {
+        match self {
+            Self::Empty | Self::Abort => "Connection closed during SSL handshake".to_string(),
+            Self::Error(e) => format!("SSL handshake failure ({e})"),
+        }
+    }
+}
+
+/// OpenSSL's error for bytes that opened no TLS record: an HTTP request is recognised
+/// (`SSL_R_HTTP_REQUEST`), anything else is a wrong version.
+fn non_tls_error(head: &[u8]) -> String {
+    let http = [&b"GET "[..], b"POST ", b"HEAD ", b"PUT ", b"CONNECT "].iter().any(|m| head.starts_with(m));
+    if http {
+        "error:0A00009C:SSL routines::http request".to_string()
+    } else {
+        "error:0A00010B:SSL routines::wrong version number".to_string()
+    }
+}
+
+/// What OpenSSL says, and sends, for a handshake that rustls refused (measured on `HAProxy`
+/// 3.5-dev8). `first` is the first byte the client sent. Returns the error text and the alert
+/// description OpenSSL puts on the wire (`None`: it sends nothing). Errors with no OpenSSL
+/// equivalent mapped here keep rustls's own words (`error:0A000000`) and rustls's alert.
+fn openssl_error(e: &rustls::Error, first: Option<u8>) -> Option<(&'static str, Option<u8>)> {
+    use rustls::{Error, InvalidMessage, PeerIncompatible};
+    match e {
+        Error::PeerIncompatible(PeerIncompatible::NoCipherSuitesInCommon) => Some(("error:0A0000C1:SSL routines::no shared cipher", Some(40))),
+        Error::InappropriateMessage { .. } | Error::InappropriateHandshakeMessage { .. } | Error::InvalidMessage(InvalidMessage::HandshakePayloadTooLarge) => {
+            Some(("error:0A0000F4:SSL routines::unexpected message", Some(10)))
+        }
+        // The client's first record is an alert: the handshake wanted a ClientHello.
+        Error::AlertReceived(_) if first == Some(0x15) => Some(("error:0A0000F4:SSL routines::unexpected message", Some(10))),
+        Error::InvalidMessage(InvalidMessage::UnknownProtocolVersion) => Some(("error:0A00010B:SSL routines::wrong version number", None)),
+        _ => None,
+    }
+}
+
+/// The first byte of a TLS record is its content type, 20 to 23.
+fn looks_like_tls(head: &[u8]) -> bool {
+    head.first().is_some_and(|b| (0x14..=0x17).contains(b))
 }
 
 impl Write for Sock<'_> {
@@ -82,6 +153,12 @@ pub struct TlsConn {
     /// peer gone mid-handshake). For a server connection this is a connect failure:
     /// `HAProxy` retries it and answers 503 `SC` when the retries are spent.
     failed: bool,
+    /// Why a client handshake failed, once it has.
+    fail: Option<HsFail>,
+    /// The first bytes the client sent.
+    head: Vec<u8>,
+    /// OpenSSL's text for the error rustls refused the handshake with, when it has one.
+    ossl_text: Option<&'static str>,
     /// Bytes that go on the wire in plaintext before the ClientHello: a PROXY protocol
     /// header to a `send-proxy` server, which `HAProxy` writes from its `xprt_handshake`
     /// layer under `ssl_sock`, and which the peer's `accept-proxy` reads before its own
@@ -103,6 +180,9 @@ impl TlsConn {
             peer_closed: false,
             truncated: false,
             failed: false,
+            fail: None,
+            head: Vec::new(),
+            ossl_text: None,
             prefix: Vec::new(),
             prefix_sent: 0,
             sock_drained: false,
@@ -112,6 +192,12 @@ impl TlsConn {
     #[must_use]
     pub const fn handshake_failed(&self) -> bool {
         self.failed
+    }
+
+    /// Why the handshake failed, for the log.
+    #[must_use]
+    pub const fn failure(&self) -> Option<&HsFail> {
+        self.fail.as_ref()
     }
 
     /// Sets the plaintext bytes written before the handshake. Only before it started.
@@ -171,7 +257,7 @@ impl TlsConn {
     /// Called from both directions. A partial write is not an error: rustls keeps the
     /// remainder and [`Self::wants_write`] stays true, so the poller brings us back.
     fn flush(&mut self, fd: BorrowedFd<'_>) -> io::Result<()> {
-        let mut sock = Sock(fd, false);
+        let mut sock = Sock(fd, false, Vec::new());
         loop {
             let wants = match self.ctx.session.as_ref() {
                 Some(TlsSession::Server(c)) => c.wants_write(),
@@ -202,9 +288,11 @@ impl TlsConn {
     ///
     /// Returns `Ok(false)` at end of stream.
     fn fill(&mut self, fd: BorrowedFd<'_>) -> io::Result<bool> {
-        let mut sock = Sock(fd, false);
+        let mut sock = Sock(fd, false, Vec::new());
         let r = self.fill_from(&mut sock);
         self.sock_drained = sock.1;
+        let room = HEAD_LEN.saturating_sub(self.head.len());
+        self.head.extend_from_slice(&sock.2[..sock.2.len().min(room)]);
         r
     }
 
@@ -252,9 +340,22 @@ impl TlsConn {
                     }
                 }
                 Err(e) => {
-                    // A rustls error carries an alert that the peer is owed. Flush it
-                    // before the socket goes away, then report.
-                    let _ = self.flush(fd);
+                    // The bytes of this read are not in `head` yet.
+                    let first = self.head.first().or_else(|| sock.2.first()).copied();
+                    let tls = first.is_some_and(|b| (0x14..=0x17).contains(&b));
+                    let mapped = if tls && !self.ctx.handshake_done { openssl_error(&e, first) } else { None };
+                    if let Some((text, alert)) = mapped {
+                        // OpenSSL's alert, not rustls's: send it before the socket goes away.
+                        self.ossl_text = Some(text);
+                        if let Some(a) = alert {
+                            let _ = raw::send(fd, &[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, a]);
+                        }
+                    } else if tls || self.ctx.handshake_done {
+                        // A rustls error carries an alert that the peer is owed. Flush it
+                        // before the socket goes away, then report. Not to a stranger's
+                        // bytes: OpenSSL sends nothing to those either.
+                        let _ = self.flush(fd);
+                    }
                     return Err(io::Error::new(io::ErrorKind::InvalidData, e));
                 }
             }
@@ -274,8 +375,17 @@ impl TlsConn {
             Ok(false) => Ok(false),
             Err(e) => Err(e),
         };
-        if r.is_err() {
+        if let Err(e) = &r {
             self.failed = true;
+            self.fail = Some(if e.kind() == io::ErrorKind::UnexpectedEof {
+                if self.head.is_empty() { HsFail::Empty } else { HsFail::Abort }
+            } else if let Some(text) = self.ossl_text {
+                HsFail::Error(text.to_string())
+            } else if looks_like_tls(&self.head) {
+                HsFail::Error(format!("error:0A000000:SSL routines::{e}"))
+            } else {
+                HsFail::Error(non_tls_error(&self.head))
+            });
         }
         r
     }
@@ -399,6 +509,15 @@ impl ClientXprt {
         match self {
             ClientXprt::Plain => false,
             ClientXprt::Tls(t) => t.handshake_failed(),
+        }
+    }
+
+    /// Why the client's handshake failed.
+    #[must_use]
+    pub fn failure(&self) -> Option<&HsFail> {
+        match self {
+            ClientXprt::Plain => None,
+            ClientXprt::Tls(t) => t.failure(),
         }
     }
 
