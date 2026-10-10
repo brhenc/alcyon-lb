@@ -184,6 +184,9 @@ const IMPLEMENTED: &[&str] = &[
     "ldap-check",
     // Read by the HTTP/1 request parser (T101).
     "accept-unsafe-violations-in-http-request",
+    // Read by the response head check, `ibex_proto::response_head` (T275).
+    "accept-unsafe-violations-in-http-response",
+    "accept-invalid-http-response",
     // A client that leaves aborts its request, unless `no option abortonclose` (T227).
     "abortonclose",
     // The case of the header names in the global table is restored (T244).
@@ -237,6 +240,12 @@ pub(crate) fn check_option(section: OptSection, tokens: &[Token], kw: &Token) ->
         }
         eprintln!("[ibex] warning: {why}.");
         return Ok(false);
+    }
+    if name == "accept-invalid-http-response" {
+        eprintln!(
+            "[ibex] warning: option '{name}' is deprecated. please use 'option \
+             accept-unsafe-violations-in-http-response' if absolutely needed."
+        );
     }
     if IMPLEMENTED.contains(&name) {
         return Ok(true);

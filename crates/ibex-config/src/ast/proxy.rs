@@ -399,6 +399,10 @@ pub struct StatsConfig {
     /// `option accept-unsafe-violations-in-http-request`: a `#` in the request target (and a
     /// forbidden character in an absolute-form authority) is let through, not refused.
     pub accept_unsafe_request: bool,
+    /// `option accept-unsafe-violations-in-http-response` (and its deprecated alias
+    /// `accept-invalid-http-response`): what `ibex_proto::response_head` lets through from a
+    /// server under the option (T275).
+    pub accept_unsafe_response: bool,
 }
 
 impl Default for ListenSection {
