@@ -553,6 +553,24 @@ impl TlsConfig {
     /// Returns an error if certificates cannot be loaded, private keys are missing,
     /// or if the underlying `ServerConfig` builder fails.
     pub fn from_bind_config(bind: &BindConfig) -> Result<Arc<ServerConfig>, String> {
+        // Every worker thread asks for the config of every bind. Identical binds (same
+        // files as they are now on disk, same options) share one `ServerConfig` so a
+        // large `crt` directory is held in memory once, not once per thread per bind.
+        let key = shared_key(bind);
+        if let Some(live) = key.as_ref().and_then(|k| shared_cache().lock().ok()?.get(k)?.upgrade()) {
+            return Ok(live);
+        }
+        let built = Self::build_from_bind(bind)?;
+        if let Some(k) = key {
+            if let Ok(mut cache) = shared_cache().lock() {
+                cache.retain(|_, w| w.strong_count() > 0);
+                cache.insert(k, Arc::downgrade(&built));
+            }
+        }
+        Ok(built)
+    }
+
+    fn build_from_bind(bind: &BindConfig) -> Result<Arc<ServerConfig>, String> {
         let mut config = TlsConfig::new();
 
         // Advertise only what the runtime can actually serve.
@@ -596,8 +614,23 @@ impl TlsConfig {
         for crt_path_str in &bind.crt {
             let path = std::path::Path::new(crt_path_str);
             let cert_key_pairs = load_certs_from_path(path)?;
-            for (certs, key, _file_path) in cert_key_pairs {
+            for (certs, key, file_path) in cert_key_pairs {
                 let certified_key = Arc::new(create_certified_key(certs.clone(), &key)?);
+                match certified_key.keys_match() {
+                    Ok(()) | Err(rustls::Error::InconsistentKeys(rustls::InconsistentKeys::Unknown)) => {}
+                    Err(rustls::Error::InconsistentKeys(_)) => {
+                        return Err(format!(
+                            "inconsistencies between private key and certificate loaded '{}'.",
+                            file_path.display()
+                        ));
+                    }
+                    Err(_) => {
+                        return Err(format!(
+                            "unable to load certificate from file '{}': wrong tag.",
+                            file_path.display()
+                        ));
+                    }
+                }
                 if is_first {
                     resolver.set_default_cert(certified_key.clone());
                     is_first = false;
@@ -636,6 +669,39 @@ impl TlsConfig {
         }
         config.build_server_config()
     }
+}
+
+type SharedCache = std::sync::Mutex<std::collections::HashMap<String, std::sync::Weak<ServerConfig>>>;
+
+fn shared_cache() -> &'static SharedCache {
+    static CACHE: std::sync::OnceLock<SharedCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// Identity of the config a bind would build: its options and the size and mtime of every
+/// file it reads, so a renewed certificate is never served from a stale entry. `None`
+/// when a file cannot be inspected (the build then reports the real error).
+fn shared_key(bind: &BindConfig) -> Option<String> {
+    use std::fmt::Write as _;
+    let mut k = format!("{:?}|{:?}|{}|{:?}|{:?}", bind.crt, bind.alpn, bind.quic, bind.min_ver, bind.max_ver);
+    for c in &bind.crt {
+        let path = std::path::Path::new(c);
+        let mut files = Vec::new();
+        if std::fs::metadata(path).ok()?.is_dir() {
+            for e in std::fs::read_dir(path).ok()? {
+                files.push(e.ok()?.path());
+            }
+            files.sort();
+        } else {
+            files.push(path.to_path_buf());
+        }
+        for f in files {
+            let m = std::fs::metadata(&f).ok()?;
+            let t = m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
+            let _ = write!(k, "|{}:{}:{}", f.display(), m.len(), t.as_nanos());
+        }
+    }
+    Some(k)
 }
 
 fn load_certs_from_path(path: &std::path::Path) -> Result<Vec<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>, std::path::PathBuf)>, String> {
