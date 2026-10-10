@@ -153,3 +153,48 @@ fn the_stats_page_shows_the_global_and_the_proxy_descriptions() {
     assert!(p.contains(r#"class="desc">front <b>desc</b></div>"#), "{p}");
     assert!(p.contains(r#"class="desc">back desc</div>"#), "{p}");
 }
+
+// T272 C: a reload is a fresh process that reads the configuration again (`-sf`; the master
+// in `-W` mode starts a new worker the same way), so the identity cannot go stale.
+#[test]
+fn a_reload_with_sf_shows_the_node_and_description_of_the_new_configuration() {
+    let (mut old, _) = start("  node first\n  description one\n", "");
+    let dir = old.dir.clone();
+    let cfg = std::fs::read_to_string(dir.join("cfg")).expect("cfg");
+    std::fs::write(dir.join("cfg"), cfg.replace("node first", "node second").replace("description one", "description two")).expect("rewrite");
+    assert_eq!(lines_with(&cli(&old.sock, "show info"), &["node:", "description:"]), ["node: first", "description: one"]);
+    let mut new = Command::new(env!("CARGO_BIN_EXE_ibex"))
+        .arg("-f")
+        .arg(dir.join("cfg"))
+        .arg("-sf")
+        .arg(old.child.id().to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn");
+    let _ = old.child.wait();
+    let end = std::time::Instant::now() + Duration::from_secs(10);
+    let info = loop {
+        let info = cli(&old.sock, "show info");
+        if info.contains("node: second") || std::time::Instant::now() > end {
+            break info;
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(lines_with(&info, &["node:", "description:"]), ["node: second", "description: two"]);
+    common::stop(&mut new);
+}
+
+#[test]
+fn check_mode_prints_the_show_desc_warning_as_haproxy_does() {
+    let dir = std::env::temp_dir().join(format!("ibex_t272c_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let cfg = dir.join("cfg");
+    std::fs::write(&cfg, "defaults\n  mode http\n  timeout client 5s\n  timeout connect 1s\n  timeout server 5s\nfrontend fe\n  bind 127.0.0.1:0\n  stats enable\n  stats show-desc\n").expect("cfg");
+    let out = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-c").arg("-f").arg(&cfg).output().expect("run");
+    let err = String::from_utf8_lossy(&out.stderr);
+    let want = format!("config : parsing [{}:9]: 'show-desc' requires a parameter or 'desc' to be set in the global section.", cfg.display());
+    assert!(out.status.success(), "{err}");
+    assert!(err.lines().any(|l| l.starts_with("[WARNING]") && l.ends_with(&want)), "{err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

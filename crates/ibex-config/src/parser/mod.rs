@@ -167,6 +167,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
     clear_userlists();
 
     let mut global: Option<GlobalSection> = None;
+    let mut proxy_warnings: Vec<crate::ast::global::LoadWarning> = Vec::new();
     let mut defaults: Option<DefaultsSection> = None;
     let mut named_defaults: std::collections::HashMap<String, DefaultsSection> = std::collections::HashMap::new();
     let mut listens = Vec::new();
@@ -430,6 +431,21 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                         d.httpchk = true;
                     }
                 }
+                // `stats show-desc` with no text and no `global description` yet: a warning,
+                // and nothing is set (src/cfgparse-listen.c).
+                if kw.text == "stats"
+                    && tokens.len() == 2
+                    && tokens[1].text == "show-desc"
+                    && matches!(section, CurrentSection::Defaults(_) | CurrentSection::Listen(_) | CurrentSection::Frontend(_) | CurrentSection::Backend(_))
+                    && !global.as_ref().is_some_and(|g| g.description.is_some())
+                {
+                    proxy_warnings.push(crate::ast::global::LoadWarning {
+                        line: kw.line,
+                        alert: false,
+                        text: "'show-desc' requires a parameter or 'desc' to be set in the global section.".into(),
+                    });
+                    continue;
+                }
                 parse_section_directive(section, tokens, kw)?;
                 if kw.text == "id" {
                     for (kind, name, id) in section.explicit_id() {
@@ -518,6 +534,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
         userlists,
         proxy_order,
         directive_messages,
+        proxy_warnings,
     };
     register_checks_from_config(&config);
 

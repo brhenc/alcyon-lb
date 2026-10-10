@@ -76,6 +76,9 @@ pub struct Config {
     /// The `.warning` and `.notice` lines of the configuration (an `.alert` fails the
     /// parse), for the caller to print as `HAProxy` does while it loads.
     pub directive_messages: Vec<DirectiveMessage>,
+    /// Warnings of the proxy sections' keywords (`stats show-desc` without text), printed
+    /// by the caller as `HAProxy` prints them while it loads.
+    pub proxy_warnings: Vec<crate::ast::global::LoadWarning>,
 }
 
 /// A `.warning` or `.notice` directive that was in force.

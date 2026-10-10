@@ -59,3 +59,41 @@ fn proxy_description_refusals() {
     }
     assert_eq!(refusal("defaults\n  description x\n"), "'description' not allowed in 'defaults' section.");
 }
+
+// T272 C: `stats show-desc` without text and without `global description` is a warning, and
+// sets nothing (src/cfgparse-listen.c; measured on 3.5-dev8-885761-29).
+
+fn show_desc_cfg(global: &str, section: &str) -> String {
+    let bind = if section.starts_with("defaults") { "" } else { "  bind 127.0.0.1:18080\n" };
+    format!("{global}{section}  mode http\n{bind}  stats enable\n  stats show-desc\n")
+}
+
+#[test]
+fn show_desc_without_text_or_global_description_warns_and_sets_nothing() {
+    for section in ["frontend fe\n", "listen li\n", "defaults\n"] {
+        let cfg = parse_str(&show_desc_cfg("", section)).expect("a warning, not a refusal");
+        let texts: Vec<&str> = cfg.proxy_warnings.iter().map(|w| w.text.as_str()).collect();
+        assert_eq!(texts, ["'show-desc' requires a parameter or 'desc' to be set in the global section."], "{section}");
+        assert!(!cfg.proxy_warnings[0].alert);
+        assert_eq!(cfg.proxy_warnings[0].line, if section.starts_with("defaults") { 4 } else { 5 }, "{section}");
+        let stats = cfg.frontends.first().map(|f| &f.stats).or(cfg.listens.first().map(|l| &l.stats)).or(cfg.defaults.as_ref().map(|d| &d.stats)).expect("a section");
+        assert_eq!(stats.show_desc, None, "{section}");
+    }
+}
+
+#[test]
+fn show_desc_is_silent_with_text_or_with_a_global_description_before_it() {
+    let cfg = parse_str(&show_desc_cfg("global\n  description hi\n", "frontend fe\n")).expect("parse");
+    assert!(cfg.proxy_warnings.is_empty());
+    assert_eq!(cfg.frontends[0].stats.show_desc.as_deref(), Some(""));
+    let cfg = parse_str("frontend fe\n  mode http\n  bind 127.0.0.1:18080\n  stats enable\n  stats show-desc some text\n").expect("parse");
+    assert!(cfg.proxy_warnings.is_empty());
+    assert_eq!(cfg.frontends[0].stats.show_desc.as_deref(), Some("some text"));
+}
+
+#[test]
+fn a_global_description_after_the_proxy_does_not_silence_it() {
+    // HAProxy reads the sections in order: `global.desc` is not yet set at the proxy's line.
+    let cfg = parse_str("frontend fe\n  mode http\n  bind 127.0.0.1:18080\n  stats enable\n  stats show-desc\nglobal\n  description hi\n").expect("parse");
+    assert_eq!(cfg.proxy_warnings.len(), 1);
+}

@@ -654,6 +654,13 @@ fn main() {
         eprintln!("{sev} ({}) : config : parsing [{file}:{line}] : {}", process::id(), w.text);
     }
 
+    //     The proxy keywords' warnings (`stats show-desc` with no text) have no space
+    //     before the colon, as `HAProxy` prints them.
+    for w in &config.proxy_warnings {
+        let (file, line) = locate(&config_starts, w.line);
+        eprintln!("[WARNING]  ({}) : config : parsing [{file}:{line}]: {}", process::id(), w.text);
+    }
+
     // 5a. Every rule action's expression must name fetches and converters that exist.
     //     `HAProxy` refuses the configuration otherwise; checked here so that `-c` reports
     //     it and a start fails before anything is daemonized, signalled or bound.
