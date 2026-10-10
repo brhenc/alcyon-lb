@@ -1756,11 +1756,14 @@ fn progress_http_check(
                 return Ok(CheckStep::pending(Some(next)));
             };
 
+            // One buffer, as `HAProxy` reads: once it is full the response is judged on what
+            // it holds (T238; it used to grow with the response, re-parsed on every read).
             let mut buf = [0u8; 4096];
             let mut eof = false;
             let mut broken = false;
-            loop {
-                match check.xprt.recv(sock.as_fd(), &mut buf) {
+            while recv_buf.len() < TCP_CHECK_BUFSIZE {
+                let room = (TCP_CHECK_BUFSIZE - recv_buf.len()).min(buf.len());
+                match check.xprt.recv(sock.as_fd(), &mut buf[..room]) {
                     Ok(Io::Done(n)) => recv_buf.extend_from_slice(&buf[..n]),
                     Ok(Io::WouldBlock) => break,
                     Ok(Io::Eof) => {
@@ -1774,8 +1777,8 @@ fn progress_http_check(
                 }
             }
             // A connection that fails with nothing received is an invalid response; one
-            // that fails after some data is the end of what there is.
-            let last_read = eof || (broken && !recv_buf.is_empty());
+            // that fails after some data is the end of what there is, as is a full buffer.
+            let last_read = eof || (broken && !recv_buf.is_empty()) || recv_buf.len() >= TCP_CHECK_BUFSIZE;
             let verdict = if broken && recv_buf.is_empty() {
                 HttpVerdict::Fail { code: "SOCKERR", desc: "Socket error", status: None, info: None }
             } else {
