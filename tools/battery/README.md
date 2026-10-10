@@ -45,3 +45,24 @@ within 45 s and fds are within 30 of the baseline (and the process is alive).
 ## Reproducers
 Anything where Ibex is clearly worse than HAProxy gets a minimal command under
 `repro/` (a `clients.py attack` line plus config notes).
+
+## Results, Ibex main 36c022b vs HAProxy 3.5-dev8 (2026-10-10, 60 s)
+| scenario | haproxy | ibex |
+|---|---|---|
+| slowloris | RSS 54M->54M, cpu 4%/14%, fds 1823->20, p99 1.2ms, ok 3028 bad 0 err 0, mid 6/6, recovered y (0.0s) | RSS 52M->52M, cpu 4%/8%, fds 1828->23, p99 0.8ms, ok 3047 bad 0 err 0, mid 6/6, recovered y (0.0s) |
+| slow_post | RSS 27M->27M, cpu 4%/18%, fds 1022->20, p99 2.6ms, ok 3051 bad 0 err 0, mid 6/6, recovered y (0.0s) | RSS 23M->23M, cpu 4%/15%, fds 1028->27, p99 3.1ms, ok 3036 bad 0 err 0, mid 6/6, recovered y (0.0s) |
+| nonreader | RSS 29M->29M, cpu 6%/99%, fds 625->20, p99 6.1ms, ok 3042 bad 0 err 0, mid 6/6, recovered y (0.0s) | RSS 16M->16M, cpu 17%/387%, fds 629->28, p99 16.2ms, ok 3006 bad 0 err 0, mid 6/6, recovered y (0.0s) |
+| h2_rapid_reset | RSS 32M->32M, cpu 243%/301%, fds 30->20, p99 3.5ms, ok 3035 bad 0 err 0, mid 6/6, recovered y (0.0s) | RSS 173M->173M, cpu 191%/204%, fds 37->33, p99 4.3ms, ok 1633 bad 0 err 10, mid 4/6, recovered y (0.0s) |
+| h2_flood | RSS 29M->29M, cpu 266%/393%, fds 34->27, p99 21.3ms, ok 3054 bad 0 err 0, mid 6/6, recovered y (0.0s) | RSS 15M->15M, cpu 5%/9%, fds 28->23, p99 0.7ms, ok 3030 bad 0 err 0, mid 6/6, recovered y (0.0s) |
+| h2_window0 | RSS 159M->155M, cpu 12%/134%, fds 2723->20, p99 16.6ms, ok 3032 bad 0 err 0, mid 6/6, recovered y (27.5s) | RSS 69M->69M, cpu 379%/403%, fds 2428->824, p99 4.7ms, ok 3048 bad 0 err 0, mid 6/6, recovered N |
+| hdr_storm | RSS 58M->58M, cpu 29%/35%, fds 1656->28, p99 0.9ms, ok 3055 bad 0 err 0, mid 6/6, recovered y (4.1s) | RSS 39M->39M, cpu 362%/402%, fds 92->55, p99 0.5ms, ok 3041 bad 0 err 0, mid 6/6, recovered N |
+| churn | RSS 25M->25M, cpu 5%/20%, fds 2019->30, p99 1.2ms, ok 3053 bad 0 err 0, mid 1/5, recovered y (0.0s) | RSS 17M->17M, cpu 7%/71%, fds 2024->38, p99 1.5ms, ok 3037 bad 0 err 0, mid 2/5, recovered y (0.0s) |
+| be_hang | RSS 25M->25M, cpu 7%/26%, fds 825->21, p99 6.2ms, ok 3041 bad 0 err 0, mid 6/6, recovered y (0.0s) | RSS 22M->22M, cpu 6%/21%, fds 829->24, p99 5.0ms, ok 3025 bad 0 err 0, mid 6/6, recovered y (0.0s) |
+| be_drip | RSS 28M->28M, cpu 7%/15%, fds 826->21, p99 5.2ms, ok 3038 bad 0 err 0, mid 6/6, recovered y (0.0s) | RSS 21M->21M, cpu 7%/21%, fds 828->24, p99 4.6ms, ok 3050 bad 0 err 0, mid 6/6, recovered y (0.0s) |
+| be_reset | RSS 23M->23M, cpu 23%/30%, fds 126->20, p99 1.2ms, ok 3026 bad 0 err 0, mid 6/6, recovered y (0.0s) | RSS 18M->18M, cpu 19%/30%, fds 128->24, p99 1.5ms, ok 3037 bad 0 err 0, mid 6/6, recovered y (0.0s) |
+
+Ibex clearly worse (reproducers in `repro/`):
+- h2_window0: 379% CPU during the attack (HAProxy 12%); 824 fds still open 45 s after the clients left (HAProxy back to baseline in 27 s).
+- hdr_storm: 362% CPU (HAProxy 29%); 55 fds left after 45 s (HAProxy 28).
+- h2_rapid_reset: peak RSS 173 MB (HAProxy 32 MB), 10 legit connection errors and 2/6 mid-attack probes failed (HAProxy none).
+Ibex better or equal: everything else; h2_flood costs Ibex 5% CPU against 266% (it presumably drops the connection early; not checked). No crashes or panics in either.
