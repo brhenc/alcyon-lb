@@ -607,7 +607,7 @@ fn write_frontend_row(out: &mut String, fmt: StatFormat, proxy: &Proxy, _pid: u3
     r.set("rate_lim", 0);
     r.set("rate_max", rate_max);
     r.set("conn_rate", proxy.stats.iter().map(|s| s.fe_conn_rate.rate()).sum::<u64>());
-    r.set("conn_rate_max", rate_max);
+    r.set("conn_rate_max", u64::from(c.conn_rate_max.load(std::sync::atomic::Ordering::Relaxed)));
     r.set("conn_tot", stot);
     r.set("ssl_failed_handshake", proxy.stats.iter().map(|s| s.ssl_failed_hs.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>());
     if !http {

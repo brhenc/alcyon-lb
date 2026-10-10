@@ -1146,6 +1146,8 @@ impl ProxyStats {
         let act = self.act_conn.load(Ordering::Relaxed);
         self.max_conn.store(act, Ordering::Relaxed);
         self.queue_max.store(self.queue_cur.load(Ordering::Relaxed), Ordering::Relaxed);
+        // The failed-handshake count goes with the maxima, `conn_tot` does not (measured).
+        self.ssl_failed_hs.store(0, Ordering::Relaxed);
     }
 
     pub fn clear(&self) {
@@ -1644,6 +1646,9 @@ pub struct SessionEntry {
     /// The `Connect from` line of a frontend with no `log-format` is still to be sent: it goes
     /// once the connection has its PROXY header and TLS handshake behind it.
     pub connect_log_due: bool,
+    /// The frontend's `rate_max` is still to be raised for this session: it is, once the TLS
+    /// handshake is behind it (a connection whose handshake fails is no session).
+    pub rate_max_due: bool,
     /// Requests the server connection has carried (saturating at 2): from the second it is
     /// kept in the server's safe list (`http-reuse`).
     pub srv_served: u8,
@@ -4736,8 +4741,9 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             proxy.counters().cum_conn.fetch_add(1, Ordering::Relaxed);
             proxy.counters().fe_sess_rate.tick();
             proxy.counters().fe_conn_rate.tick();
-            let rate = proxy.counters().fe_sess_rate.rate();
-            proxy.txn_counters().fe.rate_max.fetch_max(u32::try_from(rate).unwrap_or(u32::MAX), Ordering::Relaxed);
+            // `rate_max` counts sessions: it is raised once the TLS handshake is done, not here.
+            let conn_rate = proxy.counters().fe_conn_rate.rate();
+            proxy.txn_counters().fe.conn_rate_max.fetch_max(u32::try_from(conn_rate).unwrap_or(u32::MAX), Ordering::Relaxed);
             proxy.counters().act_conn.fetch_add(1, Ordering::Relaxed);
             // From the accept loop the slot is already taken (`try_acquire`); an HTTP/3
             // request stream arrives without one.
@@ -6043,6 +6049,7 @@ fn register_new_session(
         stats_done: false,
         be_counted: std::cell::Cell::new(NO_BACKEND),
         connect_log_due: proxy.log_format.is_none() && !proxy.log_target_idx.is_empty(),
+        rate_max_due: true,
         srv_served: 0,
         log_line: None,
         log_err: false,
@@ -7995,6 +8002,12 @@ impl EngineDispatcher<'_> {
                     if fe.mode == Mode::Http { "HTTP" } else { "TCP" }
                 );
                 connect_line = Some((entry.proxy_idx, line));
+            }
+
+            if entry.rate_max_due && entry.sess.cli_xprt.is_ready() {
+                entry.rate_max_due = false;
+                let rate = self.proxies[entry.proxy_idx].counters().fe_sess_rate.rate();
+                self.proxies[entry.proxy_idx].txn_counters().fe.rate_max.fetch_max(u32::try_from(rate).unwrap_or(u32::MAX), Ordering::Relaxed);
             }
 
             // Step 1: Server connect check if connecting

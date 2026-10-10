@@ -51,6 +51,14 @@ fn show_stat(sock: &str) -> Stat {
     head.iter().zip(row.split(',')).map(|(k, v)| ((*k).to_string(), v.to_string())).collect()
 }
 
+fn admin(sock: &str, cmd: &str) -> String {
+    let mut s = UnixStream::connect(sock).expect("stats socket");
+    s.write_all(format!("{cmd}\n").as_bytes()).expect("write");
+    let mut out = String::new();
+    s.read_to_string(&mut out).expect("read");
+    out
+}
+
 /// Runs the three probes against `bind ssl` with `extra` lines in the frontend.
 fn run(extra: &str) -> Run {
     let collector = UdpSocket::bind("127.0.0.1:0").expect("collector");
@@ -61,7 +69,7 @@ fn run(extra: &str) -> Run {
     let mut f = NamedTempFile::new().expect("tmp");
     write!(
         f,
-        "global\n  stats socket {sock}\n\
+        "global\n  stats socket {sock} level admin\n\
          defaults\n  mode http\n  timeout connect 2s\n  timeout client 30s\n  timeout server 30s\n\
          frontend t\n  bind {fe} ssl crt {cert}\n  log {} local0\n  option httplog\n  {extra}\n  \
          http-request return status 200\n",
@@ -182,11 +190,23 @@ struct Session {
     probes: Vec<Probed>,
     stat: Stat,
     stderr: String,
+    /// The output of each admin command given to `session_with`, after the probes.
+    cmd_out: Vec<String>,
 }
 
 /// Starts `bind ssl` in `mode` with `extra` in the frontend, sends each input on its own
 /// connection (half-closing after it when asked) and reads the reply and the log line of each.
 fn session(mode: &str, extra: &str, inputs: &[(&[u8], bool)]) -> Session {
+    session_with(mode, extra, inputs, &[])
+}
+
+/// `session`, then each of `cmds` on the stats socket, before the final `show stat`.
+fn session_with(mode: &str, extra: &str, inputs: &[(&[u8], bool)], cmds: &[&str]) -> Session {
+    session_full(mode, "", extra, inputs, cmds)
+}
+
+/// `session_with`, with `bind_opts` on the `bind` line.
+fn session_full(mode: &str, bind_opts: &str, extra: &str, inputs: &[(&[u8], bool)], cmds: &[&str]) -> Session {
     let collector = UdpSocket::bind("127.0.0.1:0").expect("collector");
     collector.set_read_timeout(Some(Duration::from_millis(400))).expect("timeout");
     let fe = common::reserve_addr();
@@ -196,9 +216,9 @@ fn session(mode: &str, extra: &str, inputs: &[(&[u8], bool)]) -> Session {
     let (log_opt, tail) = if mode == "http" { ("httplog", "http-request return status 200") } else { ("tcplog", "default_backend b") };
     write!(
         f,
-        "global\n  stats socket {sock}\n\
+        "global\n  stats socket {sock} level admin\n\
          defaults\n  mode {mode}\n  timeout connect 2s\n  timeout client 30s\n  timeout server 30s\n\
-         frontend t\n  bind {fe} ssl crt {cert}\n  log {} local0\n  option {log_opt}\n  {extra}\n  {tail}\n\
+         frontend t\n  bind {fe} ssl crt {cert} {bind_opts}\n  log {} local0\n  option {log_opt}\n  {extra}\n  {tail}\n\
          backend b\n  server s 127.0.0.1:1\n",
         collector.local_addr().expect("addr")
     )
@@ -214,7 +234,7 @@ fn session(mode: &str, extra: &str, inputs: &[(&[u8], bool)]) -> Session {
         common::stop(&mut child);
         let mut stderr = String::new();
         let _ = child.stderr.take().map(|mut e| e.read_to_string(&mut stderr));
-        return Session { probes: Vec::new(), stat: Stat::new(), stderr };
+        return Session { probes: Vec::new(), stat: Stat::new(), stderr, cmd_out: Vec::new() };
     }
     std::thread::sleep(Duration::from_millis(300));
     let mut buf = [0u8; 2048];
@@ -242,10 +262,11 @@ fn session(mode: &str, extra: &str, inputs: &[(&[u8], bool)]) -> Session {
         }
         probes.push(Probed { reply, log });
     }
+    let cmd_out = cmds.iter().map(|c| admin(&sock, c)).collect();
     let stat = show_stat(&sock);
     common::stop(&mut child);
     let _ = std::fs::remove_file(&sock);
-    Session { probes, stat, stderr: String::new() }
+    Session { probes, stat, stderr: String::new(), cmd_out }
 }
 
 /// A TLS record.
@@ -345,4 +366,141 @@ fn a_tcp_frontend_logs_the_connection_error_too() {
     assert!(s.probes.iter().all(|p| p.log[0].starts_with("<131>")), "{:#?}", s.probes[0].log);
     assert_eq!(s.probes[1].reply, Vec::<u8>::new());
     assert_eq!(num(&s.stat, "ssl_failed_handshake"), 3);
+}
+
+// ---- T272B: TLS handshake details (measured on HAProxy 3.5-dev8-885761-29) ----
+
+/// A ClientHello whose body claims `legacy_version`.
+fn hello_legacy(legacy_version: u16) -> Vec<u8> {
+    let mut h = client_hello(b"\x13\x01", 0x0301);
+    h[9..11].copy_from_slice(&legacy_version.to_be_bytes());
+    h
+}
+
+/// The message of the one line a probe logged.
+fn message(p: &Probed) -> String {
+    assert_eq!(p.log.len(), 1, "{:#?}", p.log);
+    body(&p.log[0]).split_once("] t/").and_then(|(_, r)| r.split_once(": ")).map_or(String::new(), |(_, m)| m.to_string())
+}
+
+/// OpenSSL refuses a ClientHello whose `legacy_version` is below TLS 1.0 (`bad legacy
+/// version`), and answers with a fatal alert in a record of that very version:
+/// `protocol_version` below SSL 3.0, `handshake_failure` for SSL 3.0. Rustls accepts them.
+#[test]
+fn a_clienthello_with_an_old_legacy_version_is_refused_like_openssl() {
+    let bad = "SSL handshake failure (error:0A000124:SSL routines::bad legacy version)";
+    let hellos: Vec<Vec<u8>> = [0x0000, 0x0100, 0x0200, 0x0300, 0x0302].iter().map(|v| hello_legacy(*v)).collect();
+    let inputs: Vec<(&[u8], bool)> = hellos.iter().map(|h| (h.as_slice(), false)).collect();
+    let s = session("http", "", &inputs);
+    assert_eq!(s.probes.len(), 5, "{}", s.stderr);
+    for (i, (v, alert)) in [(0x0000u16, 70u8), (0x0100, 70), (0x0200, 70), (0x0300, 40)].into_iter().enumerate() {
+        let [hi, lo] = v.to_be_bytes();
+        assert_eq!(s.probes[i].reply, [0x15, hi, lo, 0, 2, 2, alert], "legacy_version {v:04x}");
+        assert_eq!(message(&s.probes[i]), bad, "legacy_version {v:04x}");
+    }
+    // TLS 1.1 and 1.2 in `legacy_version` are fine: the server answers with its flight.
+    assert_eq!(s.probes[4].reply.first(), Some(&0x16), "legacy_version 0302");
+}
+
+/// A client that sends part of its handshake and goes: "Connection closed during SSL
+/// handshake" when OpenSSL has not yet read a whole handshake message header, or the FIN came
+/// with the bytes; a bare "SSL handshake failure" when a record carrying the start of a
+/// handshake message had been read and the FIN arrives alone, later.
+#[test]
+fn a_client_that_leaves_after_a_whole_record_is_a_bare_failure() {
+    let full = client_hello(b"\x13\x01", 0x0301);
+    let cut = |n: usize| record(0x16, 0x0301, &full[5..5 + n]);
+    let (r3, r20, r40) = (cut(3), cut(20), cut(40));
+    let s = session(
+        "http",
+        "",
+        &[(&r20, false), (&r40, false), (&full, false), (&r20, true), (&full, true), (&r3, false), (&full[..30], false), (&full[..30], true), (&r3, true)],
+    );
+    assert_eq!(s.probes.len(), 9, "{}", s.stderr);
+    let msgs: Vec<String> = s.probes.iter().map(message).collect();
+    let bare = "SSL handshake failure";
+    assert_eq!(&msgs[..3], [bare, bare, bare], "FIN alone, after a whole record");
+    assert!(msgs[3..].iter().all(|m| m == EMPTY), "{msgs:?}");
+    assert_eq!(num(&s.stat, "ssl_failed_handshake"), 10, "9 probes and `wait_listening`");
+}
+
+/// `strict-sni` is HAProxy's refusal of a ClientHello with no SNI or an unknown one: alert
+/// `unrecognized_name` (112), `callback failed`; a matching SNI is served. Ibex does not
+/// implement it and must refuse the keyword (AGENTS.md section 5), not serve without it.
+#[test]
+fn strict_sni_is_applied_or_refused() {
+    let hellos = [hello_sni("other.example"), hello_sni("localhost"), client_hello(b"\x13\x01", 0x0301)];
+    let inputs: Vec<(&[u8], bool)> = hellos.iter().map(|h| (h.as_slice(), false)).collect();
+    let s = session_full("http", "strict-sni", "", &inputs, &[]);
+    if s.probes.is_empty() {
+        assert!(s.stderr.contains("strict-sni"), "{}", s.stderr);
+        return;
+    }
+    let cb = "SSL handshake failure (error:0A0000EA:SSL routines::callback failed)";
+    for i in [0, 2] {
+        assert_eq!(s.probes[i].reply, b"\x15\x03\x03\x00\x02\x02\x70", "probe {i}");
+        assert_eq!(message(&s.probes[i]), cb, "probe {i}");
+    }
+    assert_eq!(s.probes[1].reply.first(), Some(&0x16));
+}
+
+fn hello_sni(name: &str) -> Vec<u8> {
+    let full = client_hello(b"\x13\x01", 0x0301);
+    let n = name.as_bytes();
+    let mut e = vec![0, 0];
+    e.extend_from_slice(&u16::try_from(n.len() + 5).expect("len").to_be_bytes());
+    e.extend_from_slice(&u16::try_from(n.len() + 3).expect("len").to_be_bytes());
+    e.push(0);
+    e.extend_from_slice(&u16::try_from(n.len()).expect("len").to_be_bytes());
+    e.extend_from_slice(n);
+    let mut hs = full[5..].to_vec();
+    let ext_len_off = 4 + 2 + 32 + 1 + 2 + 2 + 2; // after the cipher list and compression methods
+    let old = usize::from(u16::from_be_bytes([hs[ext_len_off], hs[ext_len_off + 1]]));
+    hs[ext_len_off..ext_len_off + 2].copy_from_slice(&u16::try_from(old + e.len()).expect("len").to_be_bytes());
+    hs.extend_from_slice(&e);
+    let l = u32::try_from(hs.len() - 4).expect("len").to_be_bytes();
+    hs[1..4].copy_from_slice(&l[1..]);
+    record(0x16, 0x0301, &hs)
+}
+
+fn stat_row(csv: &str) -> Stat {
+    let mut lines = csv.lines();
+    let head: Vec<&str> = lines.next().expect("header").trim_start_matches("# ").split(',').collect();
+    let row = lines.find(|l| l.starts_with("t,FRONTEND,")).expect("frontend row");
+    head.iter().zip(row.split(',')).map(|(k, v)| ((*k).to_string(), v.to_string())).collect()
+}
+
+/// `clear counters` zeroes `ssl_failed_handshake` along with the maxima but leaves `conn_tot`;
+/// `clear counters all` zeroes both (measured).
+#[test]
+fn clear_counters_resets_the_failed_handshake_count() {
+    let bad = client_hello(b"\x00\xff", 0x0301);
+    let ins: [(&[u8], bool); 3] = [(b"", true), (&bad, false), (&bad, false)];
+    let s = session_with("http", "", &ins, &["show stat", "clear counters", "show stat", "clear counters all", "show stat"]);
+    let (before, plain, all) = (stat_row(&s.cmd_out[0]), stat_row(&s.cmd_out[2]), stat_row(&s.cmd_out[4]));
+    assert_eq!((num(&before, "ssl_failed_handshake"), num(&before, "conn_tot")), (4, 4));
+    assert_eq!((num(&plain, "ssl_failed_handshake"), num(&plain, "conn_tot")), (0, 4), "clear counters");
+    assert_eq!((num(&all, "ssl_failed_handshake"), num(&all, "conn_tot")), (0, 0), "clear counters all");
+}
+
+/// A connection whose handshake failed was never a session: `rate_max` stays 0, while
+/// `conn_rate_max` follows the connections (measured: 2 or more for connections 0.4 s apart).
+#[test]
+fn failed_handshakes_raise_conn_rate_max_and_not_rate_max() {
+    let ins: [(&[u8], bool); 4] = [(b"", true), (b"", true), (b"", true), (b"", true)];
+    let s = session("http", "", &ins);
+    assert_eq!(num(&s.stat, "rate_max"), 0, "{:?}", s.stat);
+    assert!(num(&s.stat, "conn_rate_max") >= 2, "{:?}", s.stat);
+}
+
+/// `option dontlognull` drops the clients that left, not the bare failure (a handshake
+/// message was under way): measured.
+#[test]
+fn dontlognull_keeps_the_bare_failure() {
+    let full = client_hello(b"\x13\x01", 0x0301);
+    let r20 = record(0x16, 0x0301, &full[5..25]);
+    let s = session("http", "option dontlognull", &[(&r20, false), (&r20, true)]);
+    assert_eq!(s.probes.len(), 2, "{}", s.stderr);
+    assert_eq!(message(&s.probes[0]), "SSL handshake failure");
+    assert!(s.probes[1].log.is_empty(), "{:#?}", s.probes[1].log);
 }

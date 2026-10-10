@@ -83,6 +83,9 @@ pub struct TxnCounters {
     /// The greatest sessions per second seen (`rate_max`), requests (`req_rate_max`).
     pub rate_max: AtomicU32,
     pub req_rate_max: AtomicU32,
+    /// The greatest connections per second seen (`conn_rate_max`): every accepted connection,
+    /// a failed TLS handshake included.
+    pub conn_rate_max: AtomicU32,
     /// Streams ending per second on it (`rate`), for a backend or a server.
     pub sess_rate: crate::engine::RateCtr,
     /// The most streams it served at once, as seen when one ended (`smax`).
@@ -145,6 +148,7 @@ impl TxnCounters {
         self.rate_max.store(0, Ordering::Relaxed);
         self.smax.store(0, Ordering::Relaxed);
         self.req_rate_max.store(0, Ordering::Relaxed);
+        self.conn_rate_max.store(0, Ordering::Relaxed);
     }
 
     /// Zeroes everything (`clear counters`).
@@ -162,6 +166,7 @@ impl TxnCounters {
         self.rate_max.store(0, Ordering::Relaxed);
         self.smax.store(0, Ordering::Relaxed);
         self.req_rate_max.store(0, Ordering::Relaxed);
+        self.conn_rate_max.store(0, Ordering::Relaxed);
     }
 }
 
