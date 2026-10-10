@@ -81,7 +81,7 @@ fn test_rt_chunked_transfer_encoding() {
 
                 let req_str = String::from_utf8_lossy(&req);
                 assert!(req_str.starts_with("POST /chunked-endpoint HTTP/1.1\r\n"));
-                assert!(req_str.contains("Transfer-Encoding: chunked"));
+                assert!(req_str.to_ascii_lowercase().contains("transfer-encoding: chunked"));
                 assert!(req_str.contains("Hello"));
                 assert!(req_str.contains("World"));
                 assert!(req_str.contains("-from-Ibex-Chunked-Test"));
@@ -679,18 +679,18 @@ fn test_rt_header_boundary_edge_cases() {
                     0 => {
                         // LF-only request
                         assert!(req_str.starts_with("GET /lf-path HTTP/1.1"));
-                        assert!(req_str.contains("X-LF-Header: lf_ok"));
+                        assert!(req_str.contains("x-lf-header: lf_ok"));
                     }
                     1 => {
                         // CR-only request
                         assert!(req_str.starts_with("GET /cr-path HTTP/1.1"));
-                        assert!(req_str.contains("X-CR-Header: cr_ok"));
+                        assert!(req_str.contains("x-cr-header: cr_ok"));
                     }
                     2 => {
                         // Multiline obs-fold request
                         assert!(req_str.starts_with("GET /obs-path HTTP/1.1"));
                         assert!(
-                            req_str.contains("X-Folded: line1")
+                            req_str.contains("x-folded: line1")
                                 && req_str.contains("line2")
                                 && req_str.contains("line3")
                         );

@@ -276,12 +276,12 @@ fn fc_src_follows_set_src_at_the_connection_layer() {
 
     // First: `set-src` has to have done something, or the second assertion is vacuous.
     assert!(
-        req.contains("X-Ibex-Src: 10.11.12.13"),
+        req.contains("x-ibex-src: 10.11.12.13"),
         "`set-src` did not rewrite `src`; the request carried: {req:?}"
     );
     // Then: `fc_src` reads the connection, which `set-src` rewrote -- as in HAProxy.
     assert!(
-        req.contains("X-Ibex-Fc-Src: 10.11.12.13"),
+        req.contains("x-ibex-fc-src: 10.11.12.13"),
         "`fc_src` must read the rewritten connection address, as HAProxy's does; \
          the request carried: {req:?}"
     );
@@ -334,7 +334,7 @@ fn a_transaction_variable_does_not_leak_into_the_next_request() {
     let reqs = be.requests();
     assert_eq!(reqs.len(), 2, "expected both requests to reach the backend: {reqs:?}");
     assert!(
-        reqs[0].contains("X-Ibex-Leak: tainted"),
+        reqs[0].contains("x-ibex-leak: tainted"),
         "the first request should have set the variable: {:?}",
         reqs[0]
     );

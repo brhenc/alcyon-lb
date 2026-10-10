@@ -236,7 +236,7 @@ fn legacy_cliexp_srvexp_rewriting_no_longer_applies() {
                     "got: {req_str}"
                 );
                 assert!(
-                    req_str.contains("Host: api.modern.io\r\n"),
+                    req_str.contains("host: api.modern.io\r\n"),
                     "got: {req_str}"
                 );
 

@@ -11848,11 +11848,10 @@ fn lowercase_header_names(buf: &mut [u8]) {
     let mut at = buf[..head].iter().position(|&b| b == b'\n').map_or(head, |i| i + 1);
     while at < head {
         let end = buf[at..head].iter().position(|&b| b == b'\n').map_or(head, |i| at + i + 1);
-        // A folded line has no name of its own.
-        if !matches!(buf[at], b' ' | b'\t') {
-            let colon = buf[at..end].iter().position(|&b| b == b':').map_or(at, |i| at + i);
-            buf[at..colon].make_ascii_lowercase();
-        }
+        // A folded line has no name of its own: nothing of it is lower-cased.
+        let folded = matches!(buf[at], b' ' | b'\t');
+        let colon = buf[at..end].iter().position(|&b| b == b':').filter(|_| !folded).map_or(at, |i| at + i);
+        buf[at..colon].make_ascii_lowercase();
         at = end;
     }
 }
@@ -11867,9 +11866,8 @@ fn htx_reply(raw: &[u8]) -> Vec<u8> {
         const CLOSE: &[u8] = b"Connection: close\r\n";
         if let Some(i) = out.windows(CLOSE.len()).position(|w| w == CLOSE) {
             out.drain(i..i + CLOSE.len());
-            if let Some((h, _)) = crate::proxy::find_eoh(&out) {
-                out.splice(h..h, b"\r\nConnection: close".iter().copied());
-            }
+            let h = crate::proxy::find_eoh(&out).map_or(out.len(), |(h, _)| h);
+            out.splice(h..h, b"\r\nConnection: close".iter().copied());
         }
     }
     lowercase_header_names(&mut out);

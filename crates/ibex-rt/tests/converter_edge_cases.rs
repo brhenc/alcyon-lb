@@ -165,18 +165,18 @@ fn reverse_dom_route_is_unset_when_the_host_has_no_reverse() {
     let reqs: Vec<&str> = reqs.iter().map(String::as_str).collect();
     let got = run(&rules, &reqs);
     let _ = std::fs::remove_file(&map);
-    let cst = "X-Rev-Const: com.EXAMPLE.MaIl";
+    let cst = "x-rev-const: com.EXAMPLE.MaIl";
     assert_eq!(
         got,
         vec![
-            vec![cst, "X-Rev-Host: com.example", "X-Route: example", "X-Sub-Only: no"],
-            vec![cst, "X-Rev-Host: com.example.mail", "X-Route: mail", "X-Sub-Only: yes"],
-            vec![cst, "X-Rev-Host: com.example", "X-Route: example", "X-Sub-Only: no"],
-            vec![cst, "X-Rev-Host: localhost", "X-Route: miss", "X-Sub-Only: no"],
-            vec![cst, "X-Rev-Host: com.badexample", "X-Route: miss", "X-Sub-Only: no"],
-            vec![cst, "X-Sub-Only: no"],
-            vec![cst, "X-Sub-Only: no"],
-            vec![cst, "X-Sub-Only: no"],
+            vec![cst, "x-rev-host: com.example", "x-route: example", "x-sub-only: no"],
+            vec![cst, "x-rev-host: com.example.mail", "x-route: mail", "x-sub-only: yes"],
+            vec![cst, "x-rev-host: com.example", "x-route: example", "x-sub-only: no"],
+            vec![cst, "x-rev-host: localhost", "x-route: miss", "x-sub-only: no"],
+            vec![cst, "x-rev-host: com.badexample", "x-route: miss", "x-sub-only: no"],
+            vec![cst, "x-sub-only: no"],
+            vec![cst, "x-sub-only: no"],
+            vec![cst, "x-sub-only: no"],
         ]
     );
 }

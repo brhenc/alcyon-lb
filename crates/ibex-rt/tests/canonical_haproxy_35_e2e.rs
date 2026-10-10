@@ -386,7 +386,7 @@ fn test_canonical_haproxy_35_synthetic_healthz() {
         "Expected HTTP 200 OK status line, got: {resp}"
     );
     assert!(
-        resp.contains("Content-Type: text/plain"),
+        resp.contains("content-type: text/plain"),
         "Expected text/plain content type, got: {resp}"
     );
     assert!(
@@ -501,11 +501,11 @@ fn test_canonical_haproxy_35_header_injection() {
     let upstream_http = String::from_utf8_lossy(&raw_upstream[consumed..]);
 
     assert!(
-        upstream_http.contains("X-Forwarded-Proto: https"),
+        upstream_http.contains("x-forwarded-proto: https"),
         "Upstream missing X-Forwarded-Proto: https, got: {upstream_http}"
     );
     assert!(
-        upstream_http.contains(&format!("X-Client-IP: {client_ip}")),
+        upstream_http.contains(&format!("x-client-ip: {client_ip}")),
         "Upstream missing X-Client-IP: {client_ip}, got: {upstream_http}"
     );
 
@@ -564,8 +564,8 @@ fn test_canonical_haproxy_35_security_rate_limiting() {
     // `errorfile`/`http-error` override for 429. Transcribed from `http_err_msgs` in
     // HAProxy 3.5-dev7's `src/http.c`.
     assert!(
-        rate_limited_resp.contains("Content-length: 117"),
-        "Expected HAProxy's built-in 429 page (Content-length: 117), got: {rate_limited_resp}"
+        rate_limited_resp.contains("content-length: 117"),
+        "Expected HAProxy's built-in 429 page (content-length: 117), got: {rate_limited_resp}"
     );
 
     // 3. Exceed L4 connection rate threshold: `tcp-request connection silent-drop if { sc_conn_rate(0) gt 100 }`
