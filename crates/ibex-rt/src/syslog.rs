@@ -25,6 +25,7 @@ use std::cell::RefCell;
 use std::net::{SocketAddr, UdpSocket};
 use std::os::unix::net::UnixDatagram;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::os::fd::AsFd;
 use std::sync::Arc;
 
 use crate::loghdr::{build_header, Meta};
@@ -35,9 +36,40 @@ thread_local! {
     static LINE: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Writes `line` (which already ends with its line feed) to a descriptor, and flushes.
-fn write_line(out: &mut impl std::io::Write, line: &mut Vec<u8>) -> bool {
-    out.write_all(line).is_ok() && out.flush().is_ok()
+/// Lines that could not be written because the descriptor was full (`DroppedLogs`).
+static DROPPED_LOGS: AtomicU64 = AtomicU64::new(0);
+
+/// Total lines dropped for want of room in `stdout`/`stderr`, as `show info` reports it.
+#[must_use]
+pub fn dropped_logs() -> u64 {
+    DROPPED_LOGS.load(Ordering::Relaxed)
+}
+
+/// Writes `line` (which already ends with its line feed) to fd 1 or 2 without ever blocking.
+///
+/// `HAProxy` (`fd_write_frag_line`) makes the descriptor `O_NONBLOCK` the first time it
+/// writes to it, unless it is a terminal, and drops a line it cannot write, counting it in
+/// `DroppedLogs`. A reader that stalls (journald, a container log driver, `^S`) must never
+/// stall a worker. One `write(2)`: a line within `PIPE_BUF` is never interleaved with
+/// another thread's.
+pub(crate) fn write_fd_nonblocking(fd: i32, line: &[u8]) -> bool {
+    use std::io::IsTerminal;
+    use std::sync::atomic::AtomicU8;
+    // Bit 0 / bit 1: fd 1 / fd 2 has been set non-blocking (or is a terminal).
+    static PREPARED: AtomicU8 = AtomicU8::new(0);
+    let (out, err) = (std::io::stdout(), std::io::stderr());
+    let (bit, owned) = if fd == 2 { (2, err.as_fd()) } else { (1, out.as_fd()) };
+    if PREPARED.load(Ordering::Relaxed) & bit == 0 {
+        let tty = if fd == 2 { std::io::stderr().is_terminal() } else { std::io::stdout().is_terminal() };
+        if !tty {
+            let _ = rustix::fs::fcntl_getfl(owned).and_then(|f| rustix::fs::fcntl_setfl(owned, f | rustix::fs::OFlags::NONBLOCK));
+        }
+        PREPARED.fetch_or(bit, Ordering::Relaxed);
+    }
+    let res = rustix::io::write(owned, line);
+    // Only a full descriptor is a drop; EPIPE and the like are the reader's choice.
+    DROPPED_LOGS.fetch_add(u64::from(res == Err(rustix::io::Errno::AGAIN)), Ordering::Relaxed);
+    res.is_ok_and(|n| n > 0)
 }
 
 /// Sends `line` to the unix datagram socket at `path` (`@name`: the abstract namespace).
@@ -259,8 +291,8 @@ impl SyslogTarget {
             // exactly how a supervisor or container runtime collects it, so without this the logs
             // appear in 8 KiB bursts or not at all before a restart. A log nobody sees until the
             // buffer fills is not a log.
-            Sink::Stdout => self.with_line(level, facility, meta, msg, |line| write_line(&mut std::io::stdout().lock(), line)),
-            Sink::Stderr => self.with_line(level, facility, meta, msg, |line| write_line(&mut std::io::stderr().lock(), line)),
+            Sink::Stdout => self.with_line(level, facility, meta, msg, |line| write_fd_nonblocking(1, line)),
+            Sink::Stderr => self.with_line(level, facility, meta, msg, |line| write_fd_nonblocking(2, line)),
         }
     }
 
@@ -436,4 +468,11 @@ mod local_time_tests {
         let at = line.find("lt[7]: m").expect("tag");
         assert!(line.as_bytes()[at - 1] == b' ' && line.as_bytes()[at - 2].is_ascii_digit(), "{line:?}");
     }
+}
+
+/// Writes to stderr without blocking and counting a drop, for the master relaying a worker's
+/// stderr and its own messages (`bin/ibex/master.rs`): a stalled stderr must not stall the
+/// thread that drains the worker's pipe, and through it the worker.
+pub fn write_stderr_nonblocking(line: &[u8]) -> bool {
+    write_fd_nonblocking(2, line)
 }

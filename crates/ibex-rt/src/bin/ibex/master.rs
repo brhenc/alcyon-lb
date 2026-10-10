@@ -161,7 +161,7 @@ impl Shared {
     fn log(&self, st: &mut State, sev: &str, msg: &str) {
         let pad = " ".repeat(9usize.saturating_sub(sev.len()));
         let line = format!("[{sev}]{pad}({}) : {msg}\n", self.pid);
-        let _ = io::stderr().write_all(line.as_bytes());
+        let _ = ibex_rt::syslog::write_stderr_nonblocking(line.as_bytes());
         push_log(st, line.as_bytes());
     }
 
@@ -524,7 +524,7 @@ fn read_worker_stderr(shared: &Shared, pid: u32, err: process::ChildStderr) {
             }
             continue;
         }
-        let _ = io::stderr().write_all(&line);
+        let _ = ibex_rt::syslog::write_stderr_nonblocking(&line);
         let mut st = shared.lock();
         if startup && st.loading == Some(pid) {
             push_log(&mut st, &line);

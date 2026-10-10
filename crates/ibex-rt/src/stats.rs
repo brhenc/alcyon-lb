@@ -271,7 +271,8 @@ pub fn format_show_info_counts(
     let mins = (total_secs % 3600) / 60;
     let secs = total_secs % 60;
 
-format!(
+    let dropped_logs = crate::syslog::dropped_logs();
+    format!(
         "Name: Ibex
 \
          Version: 0.1.0
@@ -388,7 +389,7 @@ format!(
 \
          ConnectedPeers: 0
 \
-         DroppedLogs: 0
+         DroppedLogs: {dropped_logs}
 \
          BusyPolling: 0
 \
