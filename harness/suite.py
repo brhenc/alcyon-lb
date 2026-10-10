@@ -134,8 +134,11 @@ def run_bounded(cmd: list[str], cwd: str, env: dict | None) -> tuple[int, str]:
     """Runs `cmd` with its output, killed after `TARGET_TIMEOUT` seconds: its whole process
     group, since under `cargo test` the hung process is cargo's child and killing cargo
     alone leaves it running. A timeout returns -9."""
-    p = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                         text=True, start_new_session=True)
+    # stdin is /dev/null: inherited, it is whatever ran the gate (a socket under an agent's
+    # shell), and the ibex processes the tests start inherit it in turn --
+    # fd_hygiene counted it as a socket ibex had left open, and failed every run.
+    p = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                         stderr=subprocess.STDOUT, text=True, start_new_session=True)
     try:
         out, _ = p.communicate(timeout=TARGET_TIMEOUT)
         return p.returncode, out
@@ -283,7 +286,7 @@ def list_jobs(targets) -> list[tuple]:
         outs = []
         for extra in ([], ["--ignored"]):
             r = subprocess.run([exe, "--list", "--format", "terse", *extra], cwd=cwd, env=env,
-                               capture_output=True, text=True, timeout=120)
+                               stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120)
             if r.returncode != 0:
                 return [(pkg, key, "<list>", [exe, "--list"], cwd, env)]
             outs.append(r.stdout)
@@ -448,9 +451,13 @@ def confirm_cmd(cmd: list[str], runs: int, cwd: str = REPO, env: dict | None = N
             verdict = test_verdict(rc, out)
             if verdict != "ok":
                 bad_runs += 1
+                if test not in failed:
+                    # The first failure's message, so a red gate says what failed.
+                    why = [ln.strip() for ln in out.splitlines()
+                           if "panicked at" in ln or ln.lstrip().startswith(("left:", "right:"))
+                           or "assertion" in ln][:4]
+                    say(f"   {test}: {verdict} alone" + "".join(f"\n      {w[:300]}" for w in why))
                 failed.add(test)
-                if verdict != "failed":
-                    say(f"   {test}: {verdict} alone")
             continue
         if rc == -9:
             say(f"   {' '.join(cmd)}: killed after {TARGET_TIMEOUT}s alone -- hung")
