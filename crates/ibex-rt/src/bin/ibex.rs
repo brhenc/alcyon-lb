@@ -589,6 +589,8 @@ fn handle_pid_file(pid_path: &Path) {
 
 #[allow(clippy::too_many_lines)]
 fn main() {
+    // A panic anywhere is a bug and takes the whole process down (T238).
+    ibex_rt::crash::abort_on_panic();
     let raw_args: Vec<String> = env::args().collect();
     let (program, opts) = parse_cli_args(&raw_args);
     // `HAProxy` evaluates a `-cc` condition before anything else and exits: 0 for true, 1
