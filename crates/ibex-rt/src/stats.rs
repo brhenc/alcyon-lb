@@ -799,7 +799,7 @@ pub fn format_show_stat_as(
     let match_type = |type_val: i32| -> bool {
         match type_filter {
             None | Some(-1 | 33_554_431 | 0x00FF_FFFF) => true,
-            Some(t) => t == type_val || (t & (1 << type_val)) != 0,
+            Some(t) => (t & (1 << type_val)) != 0,
         }
     };
 

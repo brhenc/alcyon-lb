@@ -157,3 +157,19 @@ fn show_stat_typed_takes_the_filters_and_refuses_desc() {
     assert!(a[2].contains("not supported"), "{:.300}", a[2]);
     assert!(a[3].contains("not supported"), "{:.300}", a[3]);
 }
+
+#[test]
+fn show_stat_type_filter_uses_haproxy_bits() {
+    // 1 frontend, 2 backend, 4 server (measured: HAProxy `show stat -1 <bits> -1`).
+    let a = answers(&["show stat -1 1 -1 typed", "show stat -1 2 -1 typed", "show stat -1 4 -1 typed", "show stat -1 5 -1 typed"]);
+    let kinds = |s: &str| -> String {
+        let mut k: Vec<char> = s.lines().filter_map(|l| l.chars().next()).collect();
+        k.sort_unstable();
+        k.dedup();
+        k.into_iter().collect()
+    };
+    assert_eq!(kinds(&a[0]), "F");
+    assert_eq!(kinds(&a[1]), "B");
+    assert_eq!(kinds(&a[2]), "S");
+    assert_eq!(kinds(&a[3]), "FS");
+}
