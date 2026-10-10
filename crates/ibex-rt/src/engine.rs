@@ -1881,9 +1881,9 @@ fn compile_acls(acl_rules: &[ibex_config::AclRule]) -> ibex_sample::Acls {
 fn init_stick_table(ast: &ibex_config::StickTableConfigAst, name: &str) -> StickTable {
     let key_type = match ast.key_type.as_str() {
         "ipv6" => KeyType::Ipv6,
-        "integer" | "int" => KeyType::Integer,
-        "string" | "str" => KeyType::String,
-        "binary" | "bin" => KeyType::Binary,
+        "integer" => KeyType::Integer,
+        "string" => KeyType::String,
+        "binary" => KeyType::Binary,
         _ => KeyType::Ip,
     };
 

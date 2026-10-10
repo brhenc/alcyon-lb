@@ -985,13 +985,16 @@ impl CliApplet {
                 dump.header = true;
             }
             let (entries, next) = table.dump_from(dump.slot, 64);
-            let Some(next) = next else {
-                dump.proxy += 1;
-                dump.slot = 0;
-                dump.header = false;
-                continue;
-            };
-            dump.slot = next;
+            // The entries come with the end of the table: they are written, then the next
+            // table is started.
+            match next {
+                Some(n) => dump.slot = n,
+                None => {
+                    dump.proxy += 1;
+                    dump.slot = 0;
+                    dump.header = false;
+                }
+            }
             scanned += 64;
             for (k, v) in entries {
                 let fields = table.data_fields(&v);

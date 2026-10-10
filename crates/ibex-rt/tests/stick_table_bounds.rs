@@ -153,6 +153,8 @@ fn show_table_is_streamed_not_built() {
     // and the whole of it comes out, once the client reads
     let mut rest = Vec::new();
     s.read_to_end(&mut rest).expect("rest");
-    let all = String::from_utf8_lossy(&rest);
-    assert_eq!(all.lines().filter(|l| l.contains("key=")).count() + 1, 40_000, "entries (one is in the head)");
+    let mut whole = head.to_vec();
+    whole.extend_from_slice(&rest);
+    let all = String::from_utf8_lossy(&whole);
+    assert_eq!(all.lines().filter(|l| l.contains("key=")).count(), 40_000, "entries");
 }
