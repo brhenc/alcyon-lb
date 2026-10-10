@@ -169,3 +169,47 @@ pub fn ssl_hello(b: &[u8], eof: bool) -> Option<Verdict> {
         Verdict::fail("L6RSP", "Layer6 invalid response", None, None)
     })
 }
+
+/// `tcp-check expect` on what has been read (`tcpcheck_eval_recv` /
+/// `tcpcheck_eval_expect`): `None` waits for more, `Some(matched)` decides. Nothing is
+/// evaluated on an empty buffer until the response ends (`last_read`: EOF or a full
+/// buffer); a string or binary pattern waits for at least its length and `min-recv`; an
+/// inconclusive rule without `min-recv` waits unless no more data is coming.
+pub fn tcp_expect(
+    pattern: &ibex_config::ast::ResolvedTcpExpectPattern,
+    min_recv: i64,
+    buf: &[u8],
+    last_read: bool,
+) -> Option<bool> {
+    use ibex_config::ast::ResolvedTcpExpectPattern as P;
+    let mut wait = buf.is_empty() && !last_read;
+    let needed = match pattern {
+        P::String(t) => t.len(),
+        P::Binary(b) => b.len(),
+        P::RString(_) => 0,
+    };
+    if !wait && !last_read {
+        wait = buf.len() < needed || (min_recv > 0 && (buf.len() as i64) < min_recv);
+    }
+    let matched = !wait && pattern.matches(buf);
+    if !wait && !matched && !last_read && min_recv == -1 {
+        wait = true;
+    }
+    (!wait).then_some(matched)
+}
+
+/// An `http-check` reply: parsed as the check parses it, then every header value split
+/// as `http-check expect hdr` splits it. Returns whether a complete response head was
+/// found. For the fuzz target; the check calls the parts directly.
+pub fn http_response(buf: &[u8]) -> bool {
+    match crate::check::parse_http_response(buf) {
+        Ok(Some(resp)) => {
+            for (_, v) in &resp.headers {
+                let _ = crate::check::header_values(v, false);
+                let _ = crate::check::header_values(v, true);
+            }
+            true
+        }
+        _ => false,
+    }
+}

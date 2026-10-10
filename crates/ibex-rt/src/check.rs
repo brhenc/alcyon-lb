@@ -747,11 +747,11 @@ fn replace_authority(uri: &str, host: &str) -> Option<String> {
 
 /// An HTTP response, as far as it has arrived.
 #[derive(Debug)]
-struct HttpResp {
+pub(crate) struct HttpResp {
     status: u16,
     reason: String,
     version: String,
-    headers: Vec<(String, String)>,
+    pub(crate) headers: Vec<(String, String)>,
     body: Vec<u8>,
     /// The message is complete: its length is reached, its last chunk is in, or it has
     /// no body.
@@ -760,7 +760,7 @@ struct HttpResp {
 
 /// Parses a response head and as much of the body as there is: `Ok(None)` while the head
 /// is incomplete, `Err` for one that is not HTTP.
-fn parse_http_response(buf: &[u8]) -> Result<Option<HttpResp>, ()> {
+pub(crate) fn parse_http_response(buf: &[u8]) -> Result<Option<HttpResp>, ()> {
     let Some(head_end) = buf
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
@@ -864,7 +864,7 @@ fn config_regex(pattern: &str, case_insensitive: bool) -> Option<ibex_regex::Use
 
 /// The values of a header `hdr` looks at: the comma-separated elements, trimmed, or with
 /// `full` the whole value.
-fn header_values(value: &str, full: bool) -> Vec<&str> {
+pub(crate) fn header_values(value: &str, full: bool) -> Vec<&str> {
     if full {
         vec![value.trim()]
     } else {
@@ -2151,19 +2151,9 @@ fn progress_tcp_check(
                 // resumes from the head of its run of `expect` rules (which is also the step
                 // a timeout then names). Matched data is not consumed; a `send` or a new
                 // `connect` drops it.
-                let mut wait = recv_buf.is_empty() && !last_read;
-                let needed = match pattern {
-                    ResolvedTcpExpectPattern::String(t) => t.len(),
-                    ResolvedTcpExpectPattern::Binary(b) => b.len(),
-                    ResolvedTcpExpectPattern::RString(_) => 0,
-                };
-                if !wait && !last_read {
-                    wait = recv_buf.len() < needed || (*min_recv > 0 && (recv_buf.len() as i64) < *min_recv);
-                }
-                let matched = !wait && pattern.matches(&recv_buf);
-                if !wait && !matched && !last_read && *min_recv == -1 {
-                    wait = true;
-                }
+                let decided = check_reply::tcp_expect(pattern, *min_recv, &recv_buf, last_read);
+                let wait = decided.is_none();
+                let matched = decided.unwrap_or(false);
                 if wait {
                     fdtab.clear_ready(raw_fd, true, false);
                     check.sub_state = CheckSubState::TcpRunning {
