@@ -117,7 +117,13 @@ def failed_by_target(out: str) -> dict[str, set[str]]:
 
 
 RESULT_RE = re.compile(r"^test result: \w+\. (\d+) passed; (\d+) failed", re.M)
-JOBS = int(os.environ.get("SUITE_JOBS", "8"))
+# One process per test (T260) waits more than it computes: most tests wait on ibex, a
+# backend or a timer. Measured 2026-10-10, instrumented, wall with reruns (load 20-50 from
+# other builds): 64 cores 8 jobs 165 s, 16 89 s, 32 56 s, 64 41 s; 8 cores (taskset) 8 jobs
+# 151 s, 16 88 s, 32 58 s. Load flakes were seen at every setting, as before. 32 is the
+# fastest setting measured on 8 cores and within 15 s of 64 on 64 cores, which leaves room
+# for the other gate or build sharing the machine.
+JOBS = int(os.environ.get("SUITE_JOBS", "32"))
 # A test that runs longer than this is killed and reported as failing, so a deadlock shows
 # up as a named failure instead of a gate that never ends. `SUITE_TIMEOUT` raises it.
 TARGET_TIMEOUT = int(os.environ.get("SUITE_TIMEOUT", "300"))

@@ -7,7 +7,7 @@
 //! A new test file is a module listed below, not a new binary, unless it needs its own
 //! process (a `#[global_allocator]`, allocation/RSS counting of the test process, rlimits,
 //! signal handlers, cwd, environment changes, other process-wide state); then it gets its
-//! own `[[test]]` in Cargo.toml and says why in its header. harness/test_layout.py fails on
+//! own `[[test]]` in Cargo.toml and says why in its header. `harness/test_layout.py` fails on
 //! a test file no target compiles.
 //!
 //! Own binaries: `backend_memory`, `capture_rule_allocations`, `cli_accept_emfile`, `cli_applet`, `h2_per_request_work`, `h3_relay_streams`, `idle_conn_memory`, `logfwd_accept_emfile`, `maxconn_limits`, `panic_policy`, `promex`, `request_allocations`, `ring_log_allocations`, `tcp_proxy`, `worker_proxy_memory` (reasons in Cargo.toml).
