@@ -2082,6 +2082,9 @@ fn account_stream(entry: &mut SessionEntry, proxies: &[Proxy]) {
     let term = term_state(entry);
     let routed = !http || (l.request.is_some() && !matches!(&term, b"PR" | b"LR"));
     let status = stream_status(s);
+    // A request lost on a kept server connection has status 0 in `HAProxy`, which counts
+    // no response for it, and no backend request (`stream.c`, at the stream's end).
+    let keepalive_lost = s.txn.as_ref().is_some_and(|t| t.keepalive_lost);
     let client_reset = s.ending == Some(crate::proxy::Ending::ClientAbort);
     let (bin, bout) = (stream_bytes_in(s), stream_bytes_out(s));
     let (t_queue, t_connect, t_data) = (l.ms(l.queue), l.ms(l.connect), l.ms(l.data));
@@ -2099,7 +2102,9 @@ fn account_stream(entry: &mut SessionEntry, proxies: &[Proxy]) {
     let fe = &proxies[entry.proxy_idx].txn_counters().fe;
     if http {
         fe.req_tot.fetch_add(1, Ordering::Relaxed);
-        fe.count_status(status);
+        if !keepalive_lost {
+            fe.count_status(status);
+        }
         if entry.sess.log.request.is_none() {
             fe.ereq.fetch_add(1, Ordering::Relaxed);
         }
@@ -2116,7 +2121,7 @@ fn account_stream(entry: &mut SessionEntry, proxies: &[Proxy]) {
         c.stot.fetch_add(if server { 1 + retries } else { 1 }, Ordering::Relaxed);
         c.bin.fetch_add(bin, Ordering::Relaxed);
         c.bout.fetch_add(bout, Ordering::Relaxed);
-        if http && (!server || answered) {
+        if http && (!server || answered) && !keepalive_lost {
             c.req_tot.fetch_add(1, Ordering::Relaxed);
             c.count_status(status);
         }
@@ -2126,7 +2131,9 @@ fn account_stream(entry: &mut SessionEntry, proxies: &[Proxy]) {
         // leaves (T227): `CC` and a closed `CQ` count nothing, a reset `CQ` one; a reset
         // while the response head was awaited (`CD` 400) counts twice, once by the request
         // analyser and once by the response's.
+        // A request lost on a kept server connection, closed or reset alike: one of each.
         let (abrt_cli, abrt_srv, eresp) = match &term {
+            _ if keepalive_lost => (0, 1, 1),
             b"SH" | b"PH" => (0, 0, 2),
             b"sH" => (0, 0, 1),
             b"SD" => (0, 1, 1),
@@ -2196,6 +2203,11 @@ fn stream_log_line(entry: &SessionEntry, proxies: &[Proxy], pid: u32) -> Option<
     let fe = &proxies[entry.proxy_idx];
     let fmt = fe.log_format.as_ref()?;
     if fe.log_target_idx.is_empty() || entry.sess.log.asap_done {
+        return None;
+    }
+    // `abort_keep_alive` clears the stream's log (`logwait`, `level`): the client retries,
+    // and the retry is the request that gets logged (T229).
+    if entry.sess.txn.as_ref().is_some_and(|t| t.keepalive_lost) {
         return None;
     }
     let be = proxies.get(entry.backend_idx).unwrap_or(fe);
@@ -7173,6 +7185,7 @@ impl EngineDispatcher<'_> {
                     // sees the connection close unanswered.
                     txn.close_after = true;
                     txn.aborted = true;
+                    txn.keepalive_lost = true;
                     return;
                 }
                 if status == 502 {

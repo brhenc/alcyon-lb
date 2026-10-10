@@ -750,6 +750,10 @@ pub struct HttpTxn {
     /// (`HAProxy`'s `SF_SRV_REUSED`). If it closes before any response, the client
     /// connection is closed with nothing sent, so the client retries.
     pub srv_reused: bool,
+    /// That happened: the request was lost on a reused server connection and the client is
+    /// closed unanswered (`abort_keep_alive`). `HAProxy` sets its status to 0 there, which
+    /// drops its log line and its response counters (T229).
+    pub keepalive_lost: bool,
     /// A reply owed to the client that the byte layer could not produce itself (it has no
     /// access to the error pages): a request that failed to parse.
     pub error: Option<u16>,
@@ -810,6 +814,7 @@ impl HttpTxn {
             req_http11: true,
             srv_reusable: true,
             srv_reused: false,
+            keepalive_lost: false,
             client_head: false,
             error: None,
             aborted: false,
