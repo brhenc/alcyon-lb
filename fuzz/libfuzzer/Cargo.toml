@@ -19,6 +19,7 @@ ibex-config = { path = "../../crates/ibex-config" }
 ibex-sample = { path = "../../crates/ibex-sample" }
 ibex-regex = { path = "../../crates/ibex-regex" }
 ibex-rt = { path = "../../crates/ibex-rt" }
+ibex-sched = { path = "../../crates/ibex-sched" }
 
 [[bin]]
 name = "h1_request"
@@ -83,3 +84,45 @@ test = false
 doc = false
 bench = false
 
+
+[[bin]]
+name = "check_reply"
+path = "fuzz_targets/check_reply.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "check_ldap_mysql"
+path = "fuzz_targets/check_ldap_mysql.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cookie"
+path = "fuzz_targets/cookie.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "syslog"
+path = "fuzz_targets/syslog.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cli"
+path = "fuzz_targets/cli.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "h2_mux"
+path = "fuzz_targets/h2_mux.rs"
+test = false
+doc = false
+bench = false

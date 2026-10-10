@@ -108,41 +108,7 @@ impl Forwarder {
         // A message is at most one buffer (`tune.bufsize`); a longer one ends the connection,
         // as it does in HAProxy (measured, T239).
         let cap = crate::buf::get_bufsize();
-        loop {
-            let first = match r.fill_buf() {
-                Ok(b) if !b.is_empty() => b[0],
-                _ => return,
-            };
-            buf.clear();
-            if !self.assume_ntf && first.is_ascii_digit() {
-                // Octet counting: `<len> <message>`.
-                let mut len = 0usize;
-                let mut byte = [0u8; 1];
-                loop {
-                    if r.read_exact(&mut byte).is_err() {
-                        return;
-                    }
-                    match byte[0] {
-                        b' ' => break,
-                        c if c.is_ascii_digit() && len < 1 << 20 => len = len * 10 + usize::from(c - b'0'),
-                        _ => return,
-                    }
-                }
-                if len > cap {
-                    return;
-                }
-                buf.resize(len, 0);
-                if r.read_exact(&mut buf).is_err() {
-                    return;
-                }
-            } else {
-                // An error leaves nothing to forward: the next read ends the connection.
-                let n = (&mut r).take(cap as u64).read_until(b'\n', &mut buf).unwrap_or(0);
-                buf.truncate(n);
-                if n >= cap && buf.last() != Some(&b'\n') {
-                    return;
-                }
-            }
+        while read_frame(&mut r, self.assume_ntf, cap, &mut buf) {
             self.process(peer, &buf);
         }
     }
@@ -464,4 +430,46 @@ fn start_section(config: &Config, section: &LogForwardSection) -> io::Result<()>
 
 fn bind_error(section: &str, addr: &str, e: &io::Error) -> io::Error {
     io::Error::new(e.kind(), format!("log-forward '{section}': cannot bind {addr}: {e}"))
+}
+
+/// Reads the next message of a syslog stream (RFC 6587) into `buf`: octet counting
+/// (`<len> <message>`) when it starts with a digit, unless `assume_ntf`; otherwise up to
+/// and including the LF. A message longer than `cap` bytes is refused. `false`: the stream
+/// ended, failed, is malformed or too long, and the connection is dropped.
+pub fn read_frame(r: &mut impl BufRead, assume_ntf: bool, cap: usize, buf: &mut Vec<u8>) -> bool {
+    let first = match r.fill_buf() {
+        Ok(b) if !b.is_empty() => b[0],
+        _ => return false,
+    };
+    buf.clear();
+    if !assume_ntf && first.is_ascii_digit() {
+        // Octet counting: `<len> <message>`.
+        let mut len = 0usize;
+        let mut byte = [0u8; 1];
+        loop {
+            if r.read_exact(&mut byte).is_err() {
+                return false;
+            }
+            match byte[0] {
+                b' ' => break,
+                c if c.is_ascii_digit() && len < 1 << 20 => len = len * 10 + usize::from(c - b'0'),
+                _ => return false,
+            }
+        }
+        if len > cap {
+            return false;
+        }
+        buf.resize(len, 0);
+        if r.read_exact(buf).is_err() {
+            return false;
+        }
+    } else {
+        // An error leaves nothing to forward: the next read ends the connection.
+        let n = (&mut *r).take(cap as u64).read_until(b'\n', buf).unwrap_or(0);
+        buf.truncate(n);
+        if n >= cap && buf.last() != Some(&b'\n') {
+            return false;
+        }
+    }
+    true
 }
