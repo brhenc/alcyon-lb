@@ -56,17 +56,31 @@ pub enum Body {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Chunk {
     Size { size: u64, digits: u8 },
-    Ext { size: u64 },
+    /// In a chunk extension, `len` bytes of it so far.
+    Ext { size: u64, len: u16 },
     SizeLf { size: u64 },
     Data(u64),
     DataCr,
     DataLf,
-    /// In the trailer section; `empty` while the current line has no bytes yet.
-    Trailer { empty: bool },
-    TrailerLf { empty: bool },
+    /// In the trailer section; `empty` while the current line has no bytes yet. `len` is
+    /// the section's bytes so far, `fields` its complete lines.
+    Trailer { empty: bool, len: u16, fields: u8 },
+    TrailerLf { empty: bool, len: u16, fields: u8 },
 }
 
 const CHUNK_START: Chunk = Chunk::Size { size: 0, digits: 0 };
+
+/// The longest chunk extension accepted, and the largest trailer section. `HAProxy` parses
+/// a chunk-size line, and the trailer section, only once it is all in the buffer: with the
+/// default `tune.bufsize` (16384), a 16300-byte extension or trailer section passes and a
+/// 16330-byte one does not (3.5-dev8). Past that it relays nothing more of the message.
+/// Without a cap, a server that sends an extension or trailers for ever had them relayed
+/// for ever (893 MB in 6 s, T248).
+const MAX_CHUNK_LINE: u16 = 16 * 1024;
+
+/// The most trailer fields accepted: `tune.http.maxhdr` (101) less one, as for a head.
+/// `HAProxy` 3.5-dev8 relays 100 and answers 502 to 101.
+const MAX_TRAILER_FIELDS: u8 = 100;
 
 impl Chunk {
     /// Scans `data`; returns how many bytes belong to the body and the state after them:
@@ -91,7 +105,7 @@ impl Chunk {
             let end_of_size = |size: u64, digits: u8| -> Result<Chunk, ()> {
                 match (digits, size) {
                     (0, _) => Err(()),
-                    (_, 0) => Ok(Chunk::Trailer { empty: true }),
+                    (_, 0) => Ok(Chunk::Trailer { empty: true, len: 0, fields: 0 }),
                     (_, n) => Ok(Chunk::Data(n)),
                 }
             };
@@ -106,15 +120,16 @@ impl Chunk {
                             Ok(Chunk::Size { size: (size << 4) | d, digits: digits + 1 })
                         }
                     }
-                    b';' | b' ' | b'\t' if digits > 0 => Ok(Chunk::Ext { size }),
+                    b';' | b' ' | b'\t' if digits > 0 => Ok(Chunk::Ext { size, len: 1 }),
                     b'\r' if digits > 0 => Ok(Chunk::SizeLf { size }),
                     b'\n' => end_of_size(size, digits),
                     _ => Err(()),
                 },
-                Chunk::Ext { size } => match b {
+                Chunk::Ext { size, len } => match b {
                     b'\r' => Ok(Chunk::SizeLf { size }),
                     b'\n' => end_of_size(size, 1),
-                    _ => Ok(Chunk::Ext { size }),
+                    _ if len >= MAX_CHUNK_LINE => Err(()),
+                    _ => Ok(Chunk::Ext { size, len: len + 1 }),
                 },
                 Chunk::SizeLf { size } => match b {
                     b'\n' => end_of_size(size, 1),
@@ -129,21 +144,25 @@ impl Chunk {
                     b'\n' => Ok(CHUNK_START),
                     _ => Err(()),
                 },
-                Chunk::Trailer { empty } => match b {
-                    b'\r' => Ok(Chunk::TrailerLf { empty }),
+                // A trailer section past its cap, or one field more than allowed, is a
+                // violation like a broken framing.
+                Chunk::Trailer { len, .. } | Chunk::TrailerLf { len, .. } if len >= MAX_CHUNK_LINE => Err(()),
+                Chunk::Trailer { empty: true, fields, .. } if fields >= MAX_TRAILER_FIELDS && b != b'\r' && b != b'\n' => Err(()),
+                Chunk::Trailer { empty, len, fields } => match b {
+                    b'\r' => Ok(Chunk::TrailerLf { empty, len: len + 1, fields }),
                     b'\n' if empty => {
                         *pay += 1;
                         return (i, Ok(None));
                     }
-                    b'\n' => Ok(Chunk::Trailer { empty: true }),
-                    _ => Ok(Chunk::Trailer { empty: false }),
+                    b'\n' => Ok(Chunk::Trailer { empty: true, len: len + 1, fields: fields + 1 }),
+                    _ => Ok(Chunk::Trailer { empty: false, len: len + 1, fields }),
                 },
-                Chunk::TrailerLf { empty } => match b {
+                Chunk::TrailerLf { empty, len, fields } => match b {
                     b'\n' if empty => {
                         *pay += 1;
                         return (i, Ok(None));
                     }
-                    b'\n' => Ok(Chunk::Trailer { empty: true }),
+                    b'\n' => Ok(Chunk::Trailer { empty: true, len: len + 1, fields: fields + 1 }),
                     _ => Err(()),
                 },
                 Chunk::Data(_) => unreachable!("handled above"),
