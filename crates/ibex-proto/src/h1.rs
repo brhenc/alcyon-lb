@@ -84,13 +84,13 @@ pub struct TransferCodings {
 }
 
 impl TransferCodings {
-    pub fn of<'a>(headers: impl Iterator<Item = (&'a str, &'a str)>, is_response: bool) -> Self {
+    pub fn of<N: AsRef<str>, V: AsRef<str>>(headers: impl Iterator<Item = (N, V)>, is_response: bool) -> Self {
         let lws = |c: char| c == ' ' || c == '\t';
         let mut t = TransferCodings { other_known: true, ..TransferCodings::default() };
         let mut chunked_seen = false;
-        for (_, value) in headers.filter(|(n, _)| n.eq_ignore_ascii_case("transfer-encoding")) {
+        for (_, value) in headers.filter(|(n, _)| n.as_ref().eq_ignore_ascii_case("transfer-encoding")) {
             t.present = true;
-            let v = value.trim_matches(lws);
+            let v = value.as_ref().trim_matches(lws);
             if v.is_empty() || v.ends_with(',') {
                 t.invalid = true;
             }

@@ -76,8 +76,6 @@ struct Parsed<'a> {
     /// The start line and its line end were `version SP code SP reason CRLF`, reason not
     /// empty, with nothing before it.
     canonical_start: bool,
-    /// The headers; `None` for one `accept_unsafe` drops (a bad name).
-    headers: Vec<Option<Header<'a>>>,
 }
 
 /// The value of a header line starting at `*i` (just after the colon), up to and past its
@@ -125,7 +123,10 @@ fn parse_value<'a>(h: &'a [u8], i: &mut usize, accept_unsafe: bool) -> Option<(C
     }
 }
 
-fn parse(h: &[u8], accept_unsafe: bool) -> Option<Parsed<'_>> {
+/// Parses the head; each header goes to `header` in order, `None` for one `accept_unsafe`
+/// drops (a bad name). Nothing is collected here: the well-formed head is checked without
+/// allocating (`fast_check`).
+fn parse<'a>(h: &'a [u8], accept_unsafe: bool, mut header: impl FnMut(Option<Header<'a>>)) -> Option<Parsed<'a>> {
     let mut i = 0;
     let mut canonical_start = true;
     // Empty lines ahead of the status line are skipped.
@@ -207,7 +208,6 @@ fn parse(h: &[u8], accept_unsafe: bool) -> Option<Parsed<'_>> {
         }
         _ => return None,
     }
-    let mut headers = Vec::new();
     loop {
         match h.get(i) {
             Some(b'\r') if h.get(i + 1) == Some(&b'\n') => break,
@@ -240,9 +240,9 @@ fn parse(h: &[u8], accept_unsafe: bool) -> Option<Parsed<'_>> {
         let name = &h[n0..i];
         i += 1;
         let (value, canonical) = parse_value(h, &mut i, accept_unsafe)?;
-        headers.push(if bad_name { None } else { Some(Header { name, value, canonical }) });
+        header(if bad_name { None } else { Some(Header { name, value, canonical }) });
     }
-    Some(Parsed { version, code, status: u16::try_from(status).ok()?, reason, canonical_start, headers })
+    Some(Parsed { version, code, status: u16::try_from(status).ok()?, reason, canonical_start })
 }
 
 /// `http_find_hdr_value_end`: the next comma outside a quoted string, or the end.
@@ -335,10 +335,79 @@ pub fn is_http11(head: &[u8]) -> bool {
         && (v[5] > b'1' || (v[5] == b'1' && v[7] >= b'1'))
 }
 
+/// The common case without allocating: a well-formed head `HAProxy` writes as it came.
+/// `Some(Valid { rewrite: None, .. })` only when `check_response_head`'s full pass would say
+/// the same; `None` for anything else (refused, rewritten, or in doubt), which the full pass
+/// then decides. Everything that sets `dirty` there, or refuses, makes this give up.
+fn fast_check(head: &[u8], accept_unsafe: bool) -> Option<ResponseHead> {
+    let (mut xfer_enc, mut te_chunked, mut chnk, mut te_other) = (false, false, false, false);
+    let mut cl: Option<u64> = None;
+    let (mut conn_upg, mut upg_ws, mut ws_accept) = (false, false, false);
+    let (mut te_count, mut first_te_chunked) = (0usize, false);
+    let mut give_up = false;
+    let p = parse(head, accept_unsafe, |h| {
+        if give_up {
+            return;
+        }
+        let Some(h) = h.filter(|h| h.canonical) else {
+            give_up = true;
+            return;
+        };
+        if h.name.eq_ignore_ascii_case(b"transfer-encoding") {
+            if parse_te(&h.value, &mut xfer_enc, &mut te_chunked, &mut chnk, &mut te_other).is_err() && !accept_unsafe {
+                give_up = true;
+            }
+            te_count += 1;
+            if te_count == 1 {
+                first_te_chunked = &*h.value == b"chunked";
+            }
+        } else if h.name.eq_ignore_ascii_case(b"content-length") {
+            // Written again unless it is the only one and already `n` as `n.to_string()`.
+            let v = &*h.value;
+            let canonical = !v.is_empty() && v.iter().all(u8::is_ascii_digit) && (v.len() == 1 || v[0] != b'0');
+            match parse_cl(v, cl) {
+                Ok(n) if cl.is_none() && canonical => cl = Some(n),
+                _ => give_up = true,
+            }
+        } else if h.name.eq_ignore_ascii_case(b"connection")
+            && h.value.split(|&c| c == b',').any(|w| w.trim_ascii().eq_ignore_ascii_case(b"upgrade"))
+        {
+            conn_upg = true;
+        } else if h.name.eq_ignore_ascii_case(b"upgrade")
+            && h.value.split(|&c| c == b',').any(|w| w.trim_ascii().eq_ignore_ascii_case(b"websocket"))
+        {
+            upg_ws = true;
+        } else if h.name.eq_ignore_ascii_case(b"sec-websocket-accept") {
+            ws_accept = true;
+        }
+    })?;
+    if give_up || !p.canonical_start || te_other || (p.status == 101 && conn_upg && upg_ws && !ws_accept && !accept_unsafe) {
+        return None;
+    }
+    let http11 = is_http11(p.version);
+    let close_server = xfer_enc && (cl.is_some() || !http11);
+    let bodyless = (100..200).contains(&p.status) || p.status == 204;
+    let drop_cl = (xfer_enc && cl.is_some()) || bodyless;
+    if drop_cl && cl.is_some() {
+        return None;
+    }
+    let keep_te = chnk && !bodyless;
+    if te_count > 0 && (!keep_te || te_count > 1 || !first_te_chunked) {
+        return None;
+    }
+    Some(ResponseHead::Valid { status: p.status, rewrite: None, close_server })
+}
+
 /// Parses a response head (the bytes up to and including the empty line that ends it).
 #[must_use]
 pub fn check_response_head(head: &[u8], accept_unsafe: bool) -> ResponseHead {
-    let Some(p) = parse(head, accept_unsafe) else {
+    fast_check(head, accept_unsafe).unwrap_or_else(|| full_check(head, accept_unsafe))
+}
+
+/// `check_response_head` the long way, building the head written again when there is one.
+fn full_check(head: &[u8], accept_unsafe: bool) -> ResponseHead {
+    let mut headers = Vec::new();
+    let Some(p) = parse(head, accept_unsafe, |h| headers.push(h)) else {
         return ResponseHead::Invalid;
     };
     let (mut xfer_enc, mut te_chunked, mut chnk, mut te_other) = (false, false, false, false);
@@ -346,8 +415,8 @@ pub fn check_response_head(head: &[u8], accept_unsafe: bool) -> ResponseHead {
     let mut dirty = !p.canonical_start;
     let (mut conn_upg, mut upg_ws, mut ws_accept) = (false, false, false);
     // What each kept header becomes: `None` dropped, else its (possibly cleaned) value.
-    let mut out: Vec<Option<Cow<'_, [u8]>>> = Vec::with_capacity(p.headers.len());
-    for h in &p.headers {
+    let mut out: Vec<Option<Cow<'_, [u8]>>> = Vec::with_capacity(headers.len());
+    for h in &headers {
         let Some(h) = h else {
             dirty = true;
             out.push(None);
@@ -423,7 +492,7 @@ pub fn check_response_head(head: &[u8], accept_unsafe: bool) -> ResponseHead {
     // `Content-Length` next to `Transfer-Encoding` are gone; `Transfer-Encoding` is kept as
     // it came, but not on a 1xx or 204; the reason is as the server wrote it.
     let mut held = Vec::with_capacity(out.len());
-    for (h, v) in p.headers.iter().zip(out.iter_mut()) {
+    for (h, v) in headers.iter().zip(out.iter_mut()) {
         let is_cl = h.as_ref().is_some_and(|h| h.name.eq_ignore_ascii_case(b"content-length"));
         if drop_cl && is_cl && v.is_some() {
             dirty = true;
@@ -435,7 +504,7 @@ pub fn check_response_head(head: &[u8], accept_unsafe: bool) -> ResponseHead {
     // `Transfer-Encoding` goes out once, as `chunked`, when the last coding is `chunked`.
     let keep_te = chnk && !bodyless;
     let mut te_written = false;
-    for (h, v) in p.headers.iter().zip(out.iter_mut()) {
+    for (h, v) in headers.iter().zip(out.iter_mut()) {
         let (Some(h), Some(value)) = (h, v.as_mut()) else { continue };
         if h.name.eq_ignore_ascii_case(b"transfer-encoding") {
             if !keep_te || te_written {
@@ -461,7 +530,7 @@ pub fn check_response_head(head: &[u8], accept_unsafe: bool) -> ResponseHead {
         o.push(b' ');
         o.extend_from_slice(reason);
         o.extend_from_slice(b"\r\n");
-        for (h, v) in p.headers.iter().zip(values) {
+        for (h, v) in headers.iter().zip(values) {
             if let (Some(h), Some(v)) = (h, v) {
                 o.extend_from_slice(h.name);
                 o.extend_from_slice(b": ");
@@ -531,6 +600,61 @@ mod tests {
             b"HTTP/1.1 99999 OK\r\n\r\n",
         ] {
             assert_eq!(check_response_head(head, true), ResponseHead::Invalid, "{}", head.escape_ascii());
+        }
+    }
+
+    /// The allocation-free path answers only when the full pass agrees, and leaves every
+    /// head the full pass writes again (or refuses) to it.
+    #[test]
+    fn the_fast_path_agrees_with_the_full_pass() {
+        let heads: &[&[u8]] = &[
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-A: b c\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\n\r\n",
+            b"HTTP/1.0 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: CHUNKED\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n",
+            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n",
+            b"HTTP/1.1 204 No Content\r\nTransfer-Encoding: chunked\r\n\r\n",
+            b"HTTP/1.1 100 Continue\r\n\r\n",
+            b"HTTP/1.1 304 Not Modified\r\nContent-Length: 7\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 007\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 7,7\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nContent-Length: 7\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 99999999999999999999999\r\n\r\n",
+            b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+            b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: x\r\n\r\n",
+            b"\r\nHTTP/1.1 200 OK\r\n\r\n",
+            b"HTTP/1.1  200 OK\r\n\r\n",
+            b"HTTP/1.1 200\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nX-A: v\n\r\n",
+            b"HTTP/1.1 200 OK\r\nX-A: v\r\n\n",
+            b"HTTP/1.1 200 OK\r\nX-A:v\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nX-A: a\r\n b\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, chunked\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked,\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: , chunked\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nBad Name: x\r\n\r\n",
+            b"FOO/1.1 200 OK\r\n\r\n",
+            b"HTTP/1.1 2000 OK\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nX-A: a\0b\r\n\r\n",
+        ];
+        for &head in heads {
+            for accept in [false, true] {
+                if let Some(fast) = fast_check(head, accept) {
+                    assert_eq!(fast, full_check(head, accept), "{} accept={accept}", head.escape_ascii());
+                    assert!(matches!(fast, ResponseHead::Valid { rewrite: None, .. }));
+                } else {
+                    assert!(
+                        !matches!(full_check(head, accept), ResponseHead::Valid { rewrite: None, .. }),
+                        "the fast path gave up on a head left as it came: {} accept={accept}",
+                        head.escape_ascii()
+                    );
+                }
+            }
         }
     }
 }

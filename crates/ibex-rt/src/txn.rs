@@ -537,30 +537,60 @@ pub fn read_body(framing: Framing, data: &[u8], out: &mut Vec<u8>) -> BodyProgre
 }
 
 /// The header fields of a raw head, in order, an obs-fold continuation line joined to the
-/// field it continues.
-fn fields(head: &str) -> Vec<(&str, String)> {
-    let mut out: Vec<(&str, String)> = Vec::new();
-    for l in head.split('\n').skip(1) {
-        let l = l.strip_suffix('\r').unwrap_or(l);
-        if l.starts_with([' ', '\t']) {
-            if let Some((_, v)) = out.last_mut() {
-                v.push(' ');
-                v.push_str(l.trim());
+/// field it continues. A line that is neither a field nor a continuation is skipped, and a
+/// continuation still joins the last field before it. Borrowed from the head: only a folded
+/// field is copied.
+#[derive(Clone)]
+struct Fields<'a> {
+    lines: std::iter::Peekable<std::str::Split<'a, char>>,
+}
+
+fn fields(head: &str) -> Fields<'_> {
+    let mut lines = head.split('\n').peekable();
+    lines.next();
+    Fields { lines }
+}
+
+impl<'a> Iterator for Fields<'a> {
+    type Item = (&'a str, std::borrow::Cow<'a, str>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let line = |l: &'a str| l.strip_suffix('\r').unwrap_or(l);
+        let is_fold = |l: &str| l.starts_with([' ', '\t']);
+        // The next field line; continuations before the first field have nothing to join.
+        let (k, v) = loop {
+            let l = line(self.lines.next()?);
+            if is_fold(l) {
+                continue;
             }
-        } else if let Some((k, v)) = l.split_once(':') {
-            out.push((k.trim(), v.trim().to_string()));
+            if let Some((k, v)) = l.split_once(':') {
+                break (k.trim(), v.trim());
+            }
+        };
+        let mut value = std::borrow::Cow::Borrowed(v);
+        // Up to the next field line: continuations join this one, other lines are skipped.
+        while let Some(&next) = self.lines.peek() {
+            let l = line(next);
+            if is_fold(l) {
+                let o = value.to_mut();
+                o.push(' ');
+                o.push_str(l.trim());
+            } else if l.contains(':') {
+                break;
+            }
+            self.lines.next();
         }
+        Some((k, value))
     }
-    out
 }
 
 /// The body length every `Content-Length` line of a head gives, read as `HAProxy`'s
 /// `http_parse_cont_len_header` reads it: each line a comma-separated list of decimal
 /// values, all equal. `None` without one, or when they do not agree on one value (a head
 /// the parser refuses).
-fn content_length(fields: &[(&str, String)]) -> Option<u64> {
+fn content_length(fields: Fields<'_>) -> Option<u64> {
     let mut len = None;
-    for (_, v) in fields.iter().filter(|(k, _)| k.eq_ignore_ascii_case("content-length")) {
+    for (_, v) in fields.filter(|(k, _)| k.eq_ignore_ascii_case("content-length")) {
         if v.ends_with(',') {
             return None;
         }
@@ -579,8 +609,8 @@ fn content_length(fields: &[(&str, String)]) -> Option<u64> {
 }
 
 /// The `Transfer-Encoding` lines of a head, all of them, as one list.
-fn codings(fields: &[(&str, String)], is_response: bool) -> ibex_proto::h1::TransferCodings {
-    ibex_proto::h1::TransferCodings::of(fields.iter().map(|(k, v)| (*k, v.as_str())), is_response)
+fn codings(fields: Fields<'_>, is_response: bool) -> ibex_proto::h1::TransferCodings {
+    ibex_proto::h1::TransferCodings::of(fields, is_response)
 }
 
 /// How a request body is framed, from its head. A request without a length has no body
@@ -594,14 +624,13 @@ fn codings(fields: &[(&str, String)], is_response: bool) -> ibex_proto::h1::Tran
 #[must_use]
 pub fn request_framing(head: &[u8]) -> Framing {
     let head = String::from_utf8_lossy(head);
-    let fields = fields(&head);
-    let te = codings(&fields, false);
+    let te = codings(fields(&head), false);
     if te.present {
         // Without a final `chunked` the request has no length and is refused (400);
         // were it to get here, chunked is the reading that forwards nothing unframed.
         return Framing::Chunked;
     }
-    match content_length(&fields) {
+    match content_length(fields(&head)) {
         Some(0) | None => Framing::None,
         Some(n) => Framing::Length(n),
     }
@@ -617,12 +646,11 @@ pub fn response_framing(head: &str, req_method: Option<&str>, status: u16) -> Fr
     if is("HEAD") || (100..200).contains(&status) || status == 204 || status == 304 {
         return Framing::None;
     }
-    let fields = fields(head);
-    let te = codings(&fields, true);
+    let te = codings(fields(head), true);
     if te.present {
         return if te.chunked_last { Framing::Chunked } else { Framing::UntilClose };
     }
-    match content_length(&fields) {
+    match content_length(fields(head)) {
         Some(n) => Framing::Length(n),
         None => Framing::UntilClose,
     }
@@ -1329,6 +1357,19 @@ mod tests {
         assert_eq!(response_framing(&h("Transfer-Encoding: gzip, chunked\r\n"), Some("GET"), 200), Framing::Chunked);
         assert_eq!(response_framing(&h("Transfer-Encoding: gzip\r\n"), Some("GET"), 200), Framing::UntilClose);
         assert_eq!(response_framing(&h(""), Some("GET"), 200), Framing::UntilClose);
+    }
+
+    #[test]
+    fn fields_join_folds_without_copying_the_rest() {
+        let got: Vec<(&str, std::borrow::Cow<'_, str>)> =
+            fields("GET / HTTP/1.1\r\n \tlost\r\nA:  1 \r\n b \r\njunk\r\n\tc\r\nB:2\r\n\r\n").collect();
+        assert_eq!(got, [("A", "1 b c".into()), ("B", "2".into())]);
+        assert!(matches!(got[1].1, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(
+            request_framing(b"POST / HTTP/1.1\r\nTransfer-Encoding: gzip,\r\n chunked\r\n\r\n"),
+            Framing::Chunked
+        );
+        assert_eq!(response_framing("HTTP/1.1 200 OK\r\nContent-Length: 5,\r\n 5\r\n\r\n", None, 200), Framing::Length(5));
     }
 
     #[test]
