@@ -397,6 +397,14 @@ impl CliApplet {
                     // Answered once every worker has; what follows waits until then.
                     return;
                 }
+                if self.table_dump.is_some() {
+                    // A `show table` is written first; in `prompt` mode what follows runs
+                    // once it is out (`pump_table`), otherwise nothing more runs.
+                    if !self.interactive {
+                        self.in_buf.clear();
+                    }
+                    return;
+                }
                 if self.payload.is_some() {
                     continue;
                 }
@@ -947,12 +955,8 @@ impl CliApplet {
             .iter()
             .any(|p| p.stick_table.as_ref().is_some_and(|t| table_name.is_none_or(|n| t.config().name == n || p.name == n)));
         if table_name.is_some() && !found {
-            self.out_buf.extend_from_slice(b"No such table\n");
-            if self.interactive {
-                self.out_buf.extend_from_slice(b"\n> ");
-            } else {
-                self.is_done = true;
-            }
+            // An answer ends with an empty line (HAProxy); the prompt carries it.
+            self.finish_msg("No such table");
             return;
         }
         // The dump is written in chunks by `pump_table` (T250), not built here.
@@ -969,13 +973,13 @@ impl CliApplet {
     }
 
     /// Writes the next chunk of a `show table` into `out_buf`, until about `budget` bytes are
-    /// out or the dump is over; `false` once it is over. The table is read a few entries at a
+    /// out or the dump is over (`table_dump` is then `None`). The table is read a few entries at a
     /// time and its lock is never held across a write: a table of millions of entries
     /// neither sits in memory twice nor stops the data path (`HAProxy`'s applet does the
     /// same).
-    fn table_chunk(&mut self, ctx: &AppletContext, budget: usize) -> bool {
+    fn table_chunk(&mut self, ctx: &AppletContext, budget: usize) {
         use std::fmt::Write;
-        let Some(mut dump) = self.table_dump.take() else { return false };
+        let Some(mut dump) = self.table_dump.take() else { return };
         let mut out = String::new();
         let mut scanned = 0usize;
         // Also bounded by the entries looked at: a filter that keeps none must not read a
@@ -984,12 +988,8 @@ impl CliApplet {
             let Some(proxy) = ctx.proxies.get(dump.proxy) else {
                 // Past the last proxy: the dump is over.
                 self.out_buf.extend_from_slice(out.as_bytes());
-                if self.interactive {
-                    self.out_buf.extend_from_slice(b"\n> ");
-                } else {
-                    self.is_done = true;
-                }
-                return false;
+                self.finish_msg("");
+                return;
             };
             let Some(table) = proxy.stick_table.as_ref().filter(|t| dump.target.as_deref().is_none_or(|n| t.config().name == n || proxy.name == n)) else {
                 dump.proxy += 1;
@@ -1081,7 +1081,6 @@ impl CliApplet {
         }
         self.out_buf.extend_from_slice(out.as_bytes());
         self.table_dump = Some(dump);
-        true
     }
 
     /// Fills `out_buf` from a running `show table` and writes it, until the socket takes
@@ -1097,9 +1096,8 @@ impl CliApplet {
             }
             if self.out_buf.is_empty() {
                 self.out_offset = 0;
-                if !self.table_chunk(ctx, TABLE_CHUNK) && self.out_buf.is_empty() {
-                    return;
-                }
+                // The last chunk ends the answer, so it is never empty.
+                self.table_chunk(ctx, TABLE_CHUNK);
             }
             let before = self.out_buf.len() - self.out_offset;
             self.write_output();

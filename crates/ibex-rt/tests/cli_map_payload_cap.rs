@@ -162,3 +162,24 @@ fn a_payload_line_may_be_longer_than_a_buffer() {
     assert!(!out.contains("too big"), "{:?}", &out[..out.len().min(300)]);
     assert_eq!(entries(&ibex), 2);
 }
+
+/// Ended lines and a line not ended yet count together: 100 kB of lines and 40 kB of an
+/// unended one are over the cap, and refused before the line ends. Measured: HAProxy
+/// 3.5-dev8 neither answers nor applies anything in that case (the connection stalls,
+/// and stays silent after the line and the payload end); Ibex answers as for any payload
+/// over the cap and closes, and applies nothing either.
+#[test]
+fn ended_lines_and_an_unended_one_count_together() {
+    let ibex = start();
+    let mut s = UnixStream::connect(&ibex.sock).expect("connect to the stats socket");
+    s.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
+    let mut input = format!("add map {} <<\n", ibex.map).into_bytes();
+    input.extend_from_slice(&payload(100_000));
+    input.extend_from_slice(b"k ");
+    input.extend_from_slice(&[b'v'; 40_000]);
+    let _ = s.write_all(&input);
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out);
+    assert_eq!(String::from_utf8_lossy(&out), TOO_BIG);
+    assert_eq!(entries(&ibex), 1);
+}

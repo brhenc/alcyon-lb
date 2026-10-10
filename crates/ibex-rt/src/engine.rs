@@ -10570,12 +10570,17 @@ impl EngineDispatcher<'_> {
         };
 
         applet.process_commands(&mut applet_ctx);
-        if applet.table_pending() {
+        while applet.table_pending() {
             let left = applet.out_buf.len() - applet.out_offset;
             applet.pump_table(&applet_ctx);
             if applet.out_buf.len() - applet.out_offset < left || applet.out_buf.is_empty() {
                 applet.last_activity = now;
             }
+            if applet.table_pending() {
+                break;
+            }
+            // The table is out: the commands that came after it in `prompt` mode run now.
+            applet.process_commands(&mut applet_ctx);
         }
 
         if !applet.out_buf.is_empty() {

@@ -320,3 +320,37 @@ fn a_server_that_aborts_mid_body_counts_in_http_fail() {
         "{lines:?}"
     );
 }
+
+/// Measured on HAProxy 3.5-dev8 (`stats socket`, one `show table` per connection): the
+/// answer ends with an empty line, as every CLI answer does, `No such table` included;
+/// in `prompt` mode the prompt carries it.
+#[test]
+fn show_table_ends_with_an_empty_line_and_an_unknown_table_says_so() {
+    let (ibex, fe) = start("type string len 20 size 100 expire 60s", "", Duration::ZERO);
+    finish(send(fe));
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!(cli(&ibex, "show table nosuch"), "No such table\n\n");
+    let out = cli(&ibex, "show table f");
+    assert!(out.starts_with("# table: f, type: string, size:100, used:1\n0x"), "{out:?}");
+    assert!(out.ends_with(" shard=0\n\n"), "{out:?}");
+}
+
+/// In `prompt` mode the commands written after a `show table` in the same write run once
+/// the table is out, in order (measured on HAProxy 3.5-dev8: `prompt`, `show table nosuch`,
+/// `show table f`, `show info`, `quit` in one write answer all four).
+#[test]
+fn prompt_mode_runs_what_follows_a_show_table_after_it() {
+    let (ibex, fe) = start("type string len 20 size 100 expire 60s", "", Duration::ZERO);
+    finish(send(fe));
+    thread::sleep(Duration::from_millis(200));
+    let mut s = UnixStream::connect(&ibex.sock).expect("connect to the stats socket");
+    s.set_read_timeout(Some(Duration::from_secs(3))).expect("timeout");
+    s.write_all(b"prompt\nshow table nosuch\nshow table f\nshow info\nquit\n").expect("send");
+    let mut out = String::new();
+    let _ = s.read_to_string(&mut out);
+    let nosuch = out.find("\n> No such table\n\n> ").unwrap_or_else(|| panic!("no `No such table`: {out:?}"));
+    let table = out.find("> # table: f, type: string, size:100, used:1\n0x").unwrap_or_else(|| panic!("no table: {out:?}"));
+    let info = out.find(" shard=0\n\n> Name: ").unwrap_or_else(|| panic!("show info does not follow the table: {out:?}"));
+    assert!(nosuch < table && table < info, "{out:?}");
+    assert!(out.ends_with("\n\n> "), "{out:?}");
+}

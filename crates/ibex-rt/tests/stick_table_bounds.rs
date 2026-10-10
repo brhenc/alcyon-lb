@@ -158,3 +158,27 @@ fn show_table_is_streamed_not_built() {
     let all = String::from_utf8_lossy(&whole);
     assert_eq!(all.lines().filter(|l| l.contains("key=")).count(), 40_000, "entries");
 }
+
+/// A client that goes away in the middle of a long `show table` ends the dump: the rest has
+/// nowhere to go, and the CLI and the table go on serving (the next dump is whole).
+#[test]
+fn a_client_that_leaves_mid_show_table_ends_the_dump() {
+    let (ibex, fe) = start("stick-table type string len 500 size 100000 expire 60s");
+    fill(fe, 20_000, 450);
+    thread::sleep(Duration::from_millis(300));
+    {
+        let mut s = UnixStream::connect(&ibex.2).expect("connect");
+        s.set_read_timeout(Some(Duration::from_secs(3))).expect("timeout");
+        s.write_all(b"show table t\n").expect("send");
+        let mut head = [0u8; 100];
+        s.read_exact(&mut head).expect("first bytes");
+    }
+    thread::sleep(Duration::from_millis(300));
+    let mut s = UnixStream::connect(&ibex.2).expect("connect");
+    s.set_read_timeout(Some(Duration::from_secs(10))).expect("timeout");
+    s.write_all(b"show table t\n").expect("send");
+    let mut all = Vec::new();
+    s.read_to_end(&mut all).expect("whole dump");
+    let all = String::from_utf8_lossy(&all);
+    assert_eq!(all.lines().filter(|l| l.contains("key=")).count(), 20_000, "entries");
+}
