@@ -1355,7 +1355,9 @@ impl TcpSession {
         // reach, and it changed nothing a client could see (T217).
         let is_h2 = self.h2_ctx.is_some();
         if is_h2 {
-            if self.cli_state.can_read() && !self.cli_cant_recv {
+            // Not while the demux is held (`H2MuxContext::wants_input`): what the client
+            // sends then waits in the socket, as with `HAProxy` (T235).
+            if self.cli_state.can_read() && !self.cli_cant_recv && self.h2_ctx.as_ref().is_some_and(|h| h.wants_input()) {
                 let mut raw_buf = [0u8; 16384];
                 let r = self.cli_xprt.recv(self.cli.as_fd(), &mut raw_buf)?;
                 self.cli_cant_recv = self.polls_cli() && self.cli_xprt.drained(r, raw_buf.len());
@@ -1558,8 +1560,15 @@ impl TcpSession {
                 // The DATA frames of the request being served that have come since.
                 if let Some(stream) = self.h2_active_stream_id.and_then(|id| h2.streams.get_mut(&id)) {
                     let before = self.h2_body.trailer_bytes;
+                    let taken = self.h2_body.consumed;
                     if pump_h2_body(&mut stream.rx_htx, &mut self.h2_body, &mut self.req) {
                         changed = true;
+                    }
+                    let taken = usize::try_from(self.h2_body.consumed - taken).unwrap_or(usize::MAX);
+                    if taken > 0 {
+                        let id = stream.id;
+                        h2.rx_taken(id, taken);
+                        h2.resume();
                     }
                     // The client may send as much again as has moved on towards the server:
                     // a backed-up server stops the grants, and so the client.

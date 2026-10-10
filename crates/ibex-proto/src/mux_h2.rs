@@ -48,6 +48,10 @@ pub struct H2StreamCtx {
     pub reset_reason: Option<H2Error>,
     pub is_shut: bool,
     pub dispatched: bool,
+    /// DATA payload bytes in `rx_htx` the data path has not taken yet ([`H2MuxContext::rx_taken`]).
+    /// A stream holds at most its receive window of them: the next DATA frame waits in
+    /// `rx_buf`, and the connection's demux with it, until they drain (T235).
+    pub rx_buffered: usize,
     /// `scheme://authority` of a request that carried both pseudo-headers: what `HAProxy`
     /// puts before the path in the start line it logs and counts (`GET http://x/g HTTP/2.0`).
     pub abs_prefix: Option<String>,
@@ -65,6 +69,7 @@ impl H2StreamCtx {
             reset_reason: None,
             is_shut: false,
             dispatched: false,
+            rx_buffered: 0,
             abs_prefix: None,
         }
     }
@@ -230,6 +235,29 @@ impl H2MuxContext {
             self.conn_recv_window = self.conn_recv_window.saturating_add(increment as i32);
         } else if let Some(stream) = self.streams.get_mut(&stream_id) {
             stream.recv_window = stream.recv_window.saturating_add(increment as i32);
+        }
+    }
+
+    /// The data path took `n` of the DATA bytes stream `stream_id` holds: as much room for
+    /// more, so a demux held on that stream may go on ([`Self::resume`]).
+    pub fn rx_taken(&mut self, stream_id: u32, n: usize) {
+        if let Some(s) = self.streams.get_mut(&stream_id) {
+            s.rx_buffered = s.rx_buffered.saturating_sub(n);
+        }
+    }
+
+    /// Whether the transport should read more for this connection: not while a whole
+    /// frame already waits in `rx_buf` (its stream's buffer is full, or the output is),
+    /// as HAProxy stops reading while its demux is blocked. The client is held by TCP.
+    #[must_use]
+    pub fn wants_input(&self) -> bool {
+        self.rx_buf.len() < FRAME_HEADER_LEN + DEFAULT_MAX_FRAME_SIZE as usize
+    }
+
+    /// Demuxes what waits in `rx_buf` after what held it has drained.
+    pub fn resume(&mut self) {
+        if !self.rx_buf.is_empty() && self.conn_state != H2ConnState::GoAwaySent {
+            let _ = MuxH2.parse(self, &[]).map_err(|_| self.ensure_goaway());
         }
     }
 
@@ -416,7 +444,7 @@ impl Mux for MuxH2 {
     }
 
     fn parse(&self, ctx: &mut Self::Ctx, input: &[u8]) -> io::Result<usize> {
-        if input.is_empty() {
+        if input.is_empty() && ctx.rx_buf.is_empty() {
             return Ok(0);
         }
         if ctx.conn_state == H2ConnState::GoAwaySent {
@@ -481,6 +509,9 @@ impl Mux for MuxH2 {
             let total_frame_len = FRAME_HEADER_LEN + header.length as usize;
             if slice.len() < total_frame_len {
                 // Incomplete frame payload, await more bytes
+                break;
+            }
+            if Self::demux_blocked(ctx, &header) {
                 break;
             }
 
@@ -632,6 +663,19 @@ impl Mux for MuxH2 {
 }
 
 impl MuxH2 {
+    /// Whether the frame `header` announces must wait: DATA for a stream that already holds
+    /// its receive window of bytes (`H2_CF_DEM_SFULL`). The window is not policed -- HAProxy
+    /// does not either -- but what a client sends past it stays in the socket.
+    fn demux_blocked(ctx: &H2MuxContext, header: &FrameHeader) -> bool {
+        if header.frame_type != crate::h2::FrameType::Data || !ctx.is_server {
+            return false;
+        }
+        let limit = usize::try_from(ctx.local_initial_window).unwrap_or(0).max(DEFAULT_MAX_FRAME_SIZE as usize);
+        ctx.streams.get(&header.stream_id).is_some_and(|s| {
+            s.state == H2StreamState::Open && s.rx_buffered > 0 && s.rx_buffered + header.length as usize > limit
+        })
+    }
+
     fn process_headers_block(
         ctx: &mut H2MuxContext,
         stream_id: u32,
@@ -921,9 +965,19 @@ impl MuxH2 {
                 let data_len = ctx.rx_frame_len.max(data.len() as u32).min(i32::MAX as u32) as i32;
                 ctx.conn_recv_window = ctx.conn_recv_window.saturating_sub(data_len);
 
-                if let Some(stream) = ctx.streams.get_mut(&stream_id) {
+                let after_end = ctx.is_server
+                    && ctx.streams.get(&stream_id).is_some_and(|s| s.state == H2StreamState::HalfClosedRemote);
+                if after_end {
+                    // DATA after the client's END_STREAM: a stream error STREAM_CLOSED
+                    // (RFC 9113 section 5.1; HAProxy measured: RST_STREAM 5, the request is
+                    // not answered), and the bytes are not kept.
+                    ctx.send_rst_stream(stream_id, H2Error::StreamClosed);
+                } else if let Some(stream) = ctx.streams.get_mut(&stream_id) {
                     stream.recv_window = stream.recv_window.saturating_sub(data_len);
-                    if !data.is_empty() {
+                    // Once the response is over (half-closed local) nothing will take the
+                    // body any more: it is counted and dropped, not kept.
+                    if !data.is_empty() && stream.state != H2StreamState::HalfClosedLocal {
+                        stream.rx_buffered += data.len();
                         stream.rx_htx.push(HtxBlock::Data(data));
                     }
                     if (flags & frame_flags::END_STREAM) != 0 {
@@ -1253,6 +1307,52 @@ mod tests {
             HeaderField { name: ":path".into(), value: "/".into() },
         ]);
         Frame::Headers { flags: frame_flags::END_HEADERS, stream_id: id, header_block: block }.encode()
+    }
+
+    fn data(id: u32, n: usize, flags: u8) -> Vec<u8> {
+        Frame::Data { flags, stream_id: id, data: vec![b'd'; n] }.encode()
+    }
+
+    /// A stream holds at most its receive window of DATA: the frame past it waits in
+    /// `rx_buf` (the connection stops asking for input) until the data path takes some (T235).
+    #[test]
+    fn data_past_the_stream_window_waits_until_the_stream_drains() {
+        let (mux, mut ctx) = open_conn();
+        mux.parse(&mut ctx, &post_headers(1)).expect("open");
+        let mut wire = Vec::new();
+        for _ in 0..5 {
+            wire.extend(data(1, 16384, 0));
+        }
+        mux.parse(&mut ctx, &wire).expect("data");
+        // Three frames fit the 65535-byte window, the fourth does not.
+        assert_eq!(ctx.streams.get(&1).map(|s| s.rx_buffered), Some(3 * 16384));
+        assert!(!ctx.wants_input(), "two frames wait: no more input");
+        ctx.rx_taken(1, 16384);
+        ctx.resume();
+        assert_eq!(ctx.streams.get(&1).map(|s| s.rx_buffered), Some(3 * 16384));
+        ctx.rx_taken(1, 3 * 16384);
+        ctx.resume();
+        assert_eq!(ctx.streams.get(&1).map(|s| s.rx_buffered), Some(16384));
+        assert!(ctx.rx_buf.is_empty() && ctx.wants_input());
+    }
+
+    /// DATA after the client's END_STREAM is a stream error STREAM_CLOSED (HAProxy measured:
+    /// RST_STREAM 5), and is not kept; DATA after the response is over is dropped (T235).
+    #[test]
+    fn data_after_end_stream_is_reset_and_not_kept() {
+        let (mux, mut ctx) = open_conn();
+        mux.parse(&mut ctx, &post_headers(1)).expect("open");
+        mux.parse(&mut ctx, &data(1, 10, frame_flags::END_STREAM)).expect("end");
+        let sent = ctx.tx_buf.len();
+        mux.parse(&mut ctx, &data(1, 1000, 0)).expect("after end");
+        let rst = &ctx.tx_buf[sent..];
+        assert_eq!((rst.len(), rst[3], &rst[9..13]), (13, 0x3, &[0, 0, 0, 5][..]), "{rst:?}");
+        assert_eq!(ctx.streams.get(&1).map(|s| s.rx_htx.body_bytes().len()), Some(10));
+        // Stream 3's response is over: what it still sends is counted and dropped.
+        mux.parse(&mut ctx, &post_headers(3)).expect("open 3");
+        ctx.streams.get_mut(&3).expect("3").state = H2StreamState::HalfClosedLocal;
+        mux.parse(&mut ctx, &data(3, 1000, 0)).expect("data 3");
+        assert_eq!(ctx.streams.get(&3).map(|s| (s.rx_buffered, s.rx_htx.body_bytes().len())), Some((0, 0)));
     }
 
     /// RFC 9113 section 6.1: padding counts toward flow control; only the data reaches the stream.
