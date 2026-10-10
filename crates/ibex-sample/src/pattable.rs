@@ -350,11 +350,13 @@ fn take_id<K: Eq + std::hash::Hash>(m: &mut HashMap<K, Vec<u64>>, k: &K, id: u64
     emptied && m.remove(k).is_some()
 }
 
+/// One fewer of `k` in `m`, which counted it (`insert`); `k` goes at none.
 fn dec<K: Ord>(m: &mut BTreeMap<K, usize>, k: &K) {
-    if let Some(n) = m.get_mut(k) {
+    let left = m.get_mut(k).map_or(0, |n| {
         *n -= 1;
-        if *n == 0 {
-            m.remove(k);
-        }
+        *n
+    });
+    if left == 0 {
+        m.remove(k);
     }
 }

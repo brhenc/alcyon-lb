@@ -237,12 +237,16 @@ fn sockets(kind: Kind, addr: SocketAddr) -> io::Result<Vec<OwnedFd>> {
     Ok(out)
 }
 
+/// The address `fd` is bound to; `None` for a socket that is not an ip one (never
+/// registered under an ip address, see `sockets`).
 fn local_addr(fd: &OwnedFd) -> Option<SocketAddr> {
-    match rustix::net::getsockname(fd).ok()? {
-        rustix::net::SocketAddrAny::V4(a) => Some(SocketAddr::V4(a)),
-        rustix::net::SocketAddrAny::V6(a) => Some(SocketAddr::V6(std::net::SocketAddrV6::new(*a.ip(), a.port(), 0, 0))),
-        _ => None,
+    use rustix::net::SocketAddrAny;
+    let any = rustix::net::getsockname(fd).ok()?;
+    if let SocketAddrAny::V4(a) = any {
+        return Some(SocketAddr::V4(a));
     }
+    let SocketAddrAny::V6(a) = any else { return None };
+    Some(SocketAddr::V6(std::net::SocketAddrV6::new(*a.ip(), a.port(), 0, 0)))
 }
 
 fn started() -> &'static Mutex<HashSet<String>> {

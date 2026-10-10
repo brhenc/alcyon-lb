@@ -587,3 +587,19 @@ fn a_tcp_line_or_frame_longer_than_the_buffer_closes_the_connection() {
     c.write_all(b"<14>fine\n").expect("write");
     assert!(recv(&col).expect("a message").ends_with(" 127.0.0.1 fine"));
 }
+
+/// A `dgram-bind` on a port another socket holds stops the start with exit code 1, as
+/// HAProxy's does (measured on 3.5-dev8: `cannot bind socket (Address already in use)`,
+/// exit 1).
+#[test]
+fn a_busy_dgram_bind_stops_the_process_at_start() {
+    let held = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    let port = held.local_addr().expect("addr").port();
+    let mut f = tempfile::NamedTempFile::new().expect("tmp");
+    std::io::Write::write_all(&mut f, format!("global\n  nbthread 1\nlog-forward lf_busy_start\n  dgram-bind 127.0.0.1:{port}\n  log 127.0.0.1:9 format raw local0\n").as_bytes())
+        .expect("write cfg");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(f.path()).output().expect("run ibex");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("cannot bind 127.0.0.1:") && err.contains("Address already in use"), "{err}");
+}
