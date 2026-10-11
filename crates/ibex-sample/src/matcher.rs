@@ -236,7 +236,7 @@ impl Matcher {
                 } else {
                     pattern.to_string()
                 };
-                Regex::new(&re_str)
+                Regex::new_nocapture(&re_str)
                     .map(Matcher::Reg)
                     .map_err(|e| e.to_string())
             }

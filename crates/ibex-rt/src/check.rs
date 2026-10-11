@@ -1044,6 +1044,11 @@ fn fail_with(status: (&'static str, &'static str), resp: &HttpResp, info: String
 }
 
 /// Compiles a regular expression written in the configuration (checked when it was read).
+fn config_regex_nocapture(pattern: &str, case_insensitive: bool) -> Option<ibex_regex::UserRegex> {
+    ibex_regex::UserRegex::with_case_nocapture(pattern, case_insensitive).ok()
+}
+
+/// Compiles a regular expression written in the configuration (checked when it was read).
 fn config_regex(pattern: &str, case_insensitive: bool) -> Option<ibex_regex::UserRegex> {
     ibex_regex::UserRegex::with_case(pattern, case_insensitive).ok()
 }
@@ -1098,7 +1103,7 @@ fn http_expect(rule: &ResolvedHttpExpectRule, resp: &HttpResp, last_read: bool, 
     let matched = match &rule.pattern {
         HttpCheckExpectPattern::Status(ranges) => ranges.iter().any(|(lo, hi)| (*lo..=*hi).contains(&resp.status)),
         HttpCheckExpectPattern::RStatus(re) => {
-            config_regex(re, false).is_some_and(|re| re.is_match(&resp.status.to_string()))
+            config_regex_nocapture(re, false).is_some_and(|re| re.is_match(&resp.status.to_string()))
         }
         HttpCheckExpectPattern::Hdr { full, name, value } => {
             let name_text = if name.lf { render(&name.text) } else { name.text.clone() };
@@ -1135,7 +1140,7 @@ fn http_expect(rule: &ResolvedHttpExpectRule, resp: &HttpResp, last_read: bool, 
                 return HttpVerdict::Wait;
             }
             let m = if let HttpCheckExpectPattern::RString(re) = &rule.pattern {
-                config_regex(re, false).is_some_and(|re| re.is_match(&String::from_utf8_lossy(&resp.body)))
+                config_regex_nocapture(re, false).is_some_and(|re| re.is_match(&String::from_utf8_lossy(&resp.body)))
             } else {
                 needle.as_deref().is_some_and(|n| resp.body.windows(n.len().max(1)).any(|w| w == n.as_bytes()))
             };

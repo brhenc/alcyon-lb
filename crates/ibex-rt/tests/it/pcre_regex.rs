@@ -7,9 +7,9 @@
 //!
 //! Every expected value was measured on `HAProxy 3.5-dev8-885761-29` on 2026-10-04 with
 //! the same configuration (`x-m` lists, by letter, which ACLs matched each path).
-//! Two measured differences are not tested because they are known gaps (see
-//! docs/differences.md): an ACL compiles with PCRE2_NO_AUTO_CAPTURE, so `(a)b\1` is a
-//! load error on `HAProxy` and a match on Ibex; and `\Q..\E` is refused by Ibex.
+//! One measured difference is not tested because it is a known gap (see
+//! docs/differences.md): `\Q..\E` is refused by Ibex. (An ACL compiles with
+//! PCRE2_NO_AUTO_CAPTURE, so `(a)b\1` is a load error on both: `regex_nocapture`.)
 //! Ordinary patterns still compile with `regex`; only a pattern it refuses goes to
 //! `fancy-regex`, which gives up after a bounded number of backtracking steps and calls
 //! that no match (as PCRE2's match limit does).

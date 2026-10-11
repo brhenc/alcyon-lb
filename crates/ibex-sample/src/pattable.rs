@@ -32,11 +32,17 @@ pub struct Entry {
     int: Option<(i64, i64)>,
     /// The key as a regex, compiled when a `reg` lookup first reaches it.
     regex: OnceLock<Option<Box<ibex_regex::UserRegex>>>,
+    /// The same key for `regm`, which (unlike `reg`) numbers every group.
+    regex_groups: OnceLock<Option<Box<ibex_regex::UserRegex>>>,
 }
 
 impl Entry {
     fn regex(&self) -> Option<&ibex_regex::UserRegex> {
-        self.regex.get_or_init(|| ibex_regex::UserRegex::new(&self.key).ok().map(Box::new)).as_deref()
+        self.regex.get_or_init(|| ibex_regex::UserRegex::new_nocapture(&self.key).ok().map(Box::new)).as_deref()
+    }
+
+    fn regex_groups(&self) -> Option<&ibex_regex::UserRegex> {
+        self.regex_groups.get_or_init(|| ibex_regex::UserRegex::new(&self.key).ok().map(Box::new)).as_deref()
     }
 }
 
@@ -149,7 +155,7 @@ impl PatTable {
                 r.compiled.insert(id, m);
             }
         }
-        self.entries.insert(id, Entry { key: key.into(), val: val.into(), int: int_key(key), regex: OnceLock::new() });
+        self.entries.insert(id, Entry { key: key.into(), val: val.into(), int: int_key(key), regex: OnceLock::new(), regex_groups: OnceLock::new() });
     }
 
     /// Removes entry `id`; whether there was one.
@@ -302,7 +308,7 @@ impl PatTable {
     #[must_use]
     pub fn match_regm(&self, input: &str) -> Option<(String, String)> {
         self.entries.values().find_map(|e| {
-            let caps = e.regex()?.captures(input)?;
+            let caps = e.regex_groups()?.captures(input)?;
             let mut result = e.val.to_string();
             for i in 1..caps.len() {
                 result = result.replace(&format!("\\{i}"), caps.get(i).unwrap_or(""));

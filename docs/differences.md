@@ -100,12 +100,16 @@ refused as PCRE2 refuses it ("reference to non-existent subpattern"): `fancy-reg
 compiles it and then panics at the first match, which aborted Ibex before T277. So are the
 keys of a `map_reg`/`map_regm` file, at load, and `add map`/`add acl` on the CLI.
 
-### One difference in what loads
+### Unnamed groups in ACL, `map_reg` and health-check regexes
 
-HAProxy compiles an ACL regex with PCRE2_NO_AUTO_CAPTURE: only named groups capture, so
-`path_reg (a)b\1` is a load error on HAProxy ("reference to non-existent subpattern"), and
-`(?<n>a)b\1` works. Ibex numbers every group, so the first loads and matches. A configuration
-HAProxy accepts is accepted by Ibex; the reverse is not guaranteed here.
+HAProxy compiles the regex of an ACL (`-m reg`, `*_reg`, pattern files, `add acl`), of
+`map_reg` (file and `add map`) and of `http-check expect rstring`/`rstatus` and `tcp-check
+expect rstring` with PCRE2_NO_AUTO_CAPTURE: only a named group captures and has a number. Ibex
+does the same (T274 J2): `(a)\1`, `((a))\2`, `(a)(?<n>b)\2` and `(a)(?(1)b|c)` are refused
+with `reference to non-existent subpattern`, `(?<n>a)\1` is a reference to `n`, and
+`(a)(?<n>b)\1` refers to `n` too. `map_regm`, `replace-header`, `replace-value`,
+`replace-path`, `replace-uri` and `regsub` number every group, as in HAProxy. Remaining
+difference: the refusal has no `erroffset` for this error.
 
 ### The backtrack limit
 

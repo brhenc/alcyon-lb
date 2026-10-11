@@ -117,6 +117,15 @@ pub(crate) fn parse_hex_binary(hex: &str) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+/// [`validate_regex`] for the regexes `HAProxy` compiles with PCRE2_NO_AUTO_CAPTURE (ACLs,
+/// health-check `rstring`/`rstatus`): `(a)\1` is refused there.
+pub(crate) fn validate_regex_nocapture(token: &Token) -> Result<(), ConfigError> {
+    ibex_regex::UserRegex::new_nocapture(&token.text).map_err(|e| {
+        ConfigError::new(token.line, token.col, format!("bad regular expression <{}>: {e}", token.text))
+    })?;
+    Ok(())
+}
+
 pub(crate) fn validate_regex(token: &Token) -> Result<(), ConfigError> {
     ibex_regex::UserRegex::new(&token.text).map_err(|e| {
         ConfigError::new(

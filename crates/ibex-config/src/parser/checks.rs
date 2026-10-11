@@ -413,7 +413,7 @@ pub(crate) fn parse_http_check_directive(
                         pattern = Some(if key == "status" {
                             HttpCheckExpectPattern::Status(parse_status_ranges(&v.text, kw)?)
                         } else {
-                            validate_regex(v)?;
+                            validate_regex_nocapture(v)?;
                             HttpCheckExpectPattern::RStatus(v.text.clone())
                         });
                         i += 1;
@@ -425,7 +425,7 @@ pub(crate) fn parse_http_check_directive(
                             "string" => HttpCheckExpectPattern::String(v.text.clone()),
                             "string-lf" => HttpCheckExpectPattern::StringLf(v.text.clone()),
                             _ => {
-                                validate_regex(v)?;
+                                validate_regex_nocapture(v)?;
                                 HttpCheckExpectPattern::RString(v.text.clone())
                             }
                         });
@@ -739,7 +739,7 @@ pub(crate) fn parse_tcp_check_directive(
                     "rstring" => {
                         i += 1;
                         if i < tokens.len() {
-                            validate_regex(&tokens[i])?;
+                            validate_regex_nocapture(&tokens[i])?;
                             pattern = Some(TcpCheckExpectPattern::RString(tokens[i].text.clone()));
                         }
                     }

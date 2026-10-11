@@ -121,7 +121,7 @@ fn validate_acl_regexes(words: &[Token]) -> Result<(), ConfigError> {
     }
     if let (true, Some(from)) = (is_reg, patterns_from) {
         for pattern in &words[from.min(words.len())..] {
-            validate_regex(pattern)?;
+            validate_regex_nocapture(pattern)?;
         }
     }
     Ok(())
