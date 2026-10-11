@@ -5693,7 +5693,9 @@ fn hmac_key_is_var(key: &str) -> bool {
 pub fn check_converter_args(name: &str, args: &[String]) -> Option<String> {
     match name {
         _ if name.starts_with("map_") && !matches!(name, "map_str" | "map_beg" | "map_end" | "map_sub" | "map_dir" | "map_dom") => {
-            let keys = if name.starts_with("map_reg") {
+            let keys = if name.starts_with("map_regm") {
+                crate::patref::MapKeys::Regm
+            } else if name.starts_with("map_reg") {
                 crate::patref::MapKeys::Reg
             } else if name.starts_with("map_int") {
                 crate::patref::MapKeys::Int

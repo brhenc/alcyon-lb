@@ -48,7 +48,10 @@ pub enum MapKeys {
     Str,
     Int,
     Ip,
+    /// `map_reg`: compiled without auto-capture, as an ACL regex.
     Reg,
+    /// `map_regm`: every group captures.
+    Regm,
 }
 
 /// One entry: what `show map` prints is `<id> <key> <value>`.
@@ -179,7 +182,7 @@ impl PatRef {
                 for (method, ci) in readers {
                     if method == "reg" {
                         // `HAProxy`'s answer to `add acl` with a regex PCRE2 refuses.
-                        ibex_regex::UserRegex::with_case(key, ci).map_err(|e| format!("{}.", regex_refusal(key, &e)))?;
+                        ibex_regex::UserRegex::with_case_nocapture(key, ci).map_err(|e| format!("{}.", regex_refusal(key, &e)))?;
                     } else {
                         Matcher::compile_with_flags(&method, key, ci)?;
                     }
@@ -336,7 +339,8 @@ fn map_key_error(keys: MapKeys, key: &str, resolve: bool) -> Option<String> {
         MapKeys::Str => None,
         MapKeys::Int => int_key_error(key),
         MapKeys::Ip => ip_key_error(key, resolve),
-        MapKeys::Reg => ibex_regex::UserRegex::new(key).err().map(|e| regex_refusal(key, &e)),
+        MapKeys::Reg => ibex_regex::UserRegex::new_nocapture(key).err().map(|e| regex_refusal(key, &e)),
+        MapKeys::Regm => ibex_regex::UserRegex::new(key).err().map(|e| regex_refusal(key, &e)),
     }
 }
 
@@ -449,7 +453,8 @@ pub fn scan_config(text: &str, locate: &dyn Fn(usize) -> (String, usize)) {
             let keys = match name {
                 "map_int" => MapKeys::Int,
                 "map_ip" => MapKeys::Ip,
-                "map_reg" | "map_regm" => MapKeys::Reg,
+                "map_reg" => MapKeys::Reg,
+                "map_regm" => MapKeys::Regm,
                 "map" | "map_str" | "map_beg" | "map_end" | "map_sub" | "map_dir" | "map_dom" => MapKeys::Str,
                 _ => continue,
             };

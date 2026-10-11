@@ -177,6 +177,73 @@ fn literal_text(e: &fancy_regex::Expr) -> Option<String> {
     }
 }
 
+/// `pattern` with every unnamed capturing group made non-capturing (`(` becomes `(?:`),
+/// which is what `PCRE2_NO_AUTO_CAPTURE` does. `None` when there
+/// is none (the pattern is used as it is).
+fn without_auto_capture(pattern: &str) -> Option<String> {
+    let b = pattern.as_bytes();
+    let mut out = String::with_capacity(pattern.len() + 8);
+    let mut changed = 0;
+    let mut in_class = false;
+    let mut i = 0;
+    let mut from = 0; // start of the text not yet copied
+    while i < b.len() {
+        match b[i] {
+            b'\\' => {
+                i += 2;
+                continue;
+            }
+            b'[' if !in_class => {
+                in_class = true;
+                i += 1;
+                if b.get(i) == Some(&b'^') {
+                    i += 1;
+                }
+                if b.get(i) == Some(&b']') {
+                    i += 1;
+                }
+                continue;
+            }
+            b'[' if b.get(i + 1) == Some(&b':') => {
+                // `[:alpha:]` inside a class
+                if let Some(end) = pattern[i + 2..].find(":]") {
+                    i += end + 4;
+                    continue;
+                }
+            }
+            b']' if in_class => in_class = false,
+            b'(' if !in_class => match b.get(i + 1) {
+                Some(b'*') => {}
+                Some(b'?') => {
+                    // `(?<n>`, `(?P<n>` and `(?'n'` name a group and stay as they are.
+                    // A condition `(?(1)` or `(?(<n>)`: its parenthesis is not a group.
+                    if b.get(i + 2) == Some(&b'(') && b.get(i + 3) != Some(&b'?') {
+                        if let Some(end) = pattern[i + 3..].find(')') {
+                            i += end + 4;
+                            continue;
+                        }
+                    }
+                    i += 2;
+                    continue;
+                }
+                _ => {
+                    out.push_str(&pattern[from..=i]);
+                    out.push_str("?:");
+                    from = i + 1;
+                    changed += 1;
+                }
+            },
+            _ => {}
+        }
+        i += 1;
+    }
+    if changed == 0 {
+        return None;
+    }
+    out.push_str(&pattern[from..]);
+    Some(out)
+}
+
 thread_local! {
     static COMPILES:std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
@@ -251,6 +318,11 @@ impl Error {
             }
             _ => None,
         };
+        if matches!(e, fancy_regex::Error::CompileError(k) if matches!(**k, fancy_regex::CompileError::InvalidBackref(_)))
+            || matches!(e, fancy_regex::Error::ParseError(_, fancy_regex::ParseError::InvalidBackref))
+        {
+            return Error(NONEXISTENT_GROUP.to_string(), None);
+        }
         Error(e.to_string(), offset)
     }
 }
@@ -353,6 +425,37 @@ impl UserRegex {
             .map_err(|e| Error::from_fancy(&e))?;
         check_conditions(pattern, re.captures_len())?;
         Ok(UserRegex::Backtracking(re))
+    }
+
+    /// [`UserRegex::new`] as `HAProxy` compiles the regex of an ACL, of `map_reg` and of a
+    /// health check `rstring`: with `PCRE2_NO_AUTO_CAPTURE`, so that only a named group
+    /// captures and so counts for `\1` or `(?(1)..)`. `(a)\1` is refused ("reference to
+    /// non-existent subpattern"), `(?<n>a)\1` is a back-reference to `n`. Captures are
+    /// never read from such a regex.
+    ///
+    /// # Errors
+    /// As [`UserRegex::new`], and the reference to a group the pattern does not capture.
+    pub fn new_nocapture(pattern: &str) -> Result<Self, Error> {
+        Self::with_case_nocapture(pattern, false)
+    }
+
+    /// [`UserRegex::new_nocapture`], matching without regard to case if `case_insensitive`.
+    ///
+    /// # Errors
+    /// As [`UserRegex::new_nocapture`].
+    pub fn with_case_nocapture(pattern: &str, case_insensitive: bool) -> Result<Self, Error> {
+        let Some(plain) = without_auto_capture(pattern) else {
+            return Self::with_case(pattern, case_insensitive);
+        };
+        match Self::with_case(&plain, case_insensitive) {
+            Ok(re) => Ok(re),
+            Err(_) => {
+                // What the pattern says wrong as written is what PCRE2 says; if it is right
+                // as written, only the reference to a group that no longer captures is left.
+                Self::with_case(pattern, case_insensitive)?;
+                Err(Error(NONEXISTENT_GROUP.to_string(), None))
+            }
+        }
     }
 
     /// The pattern.
@@ -581,5 +684,20 @@ mod tests {
         assert_eq!(UserRegex::new("(?=a)").unwrap().replace_all("aa", "-"), "-a-a");
         assert_eq!(UserRegex::new("(?=)").unwrap().replace_all("ab", "-"), "-a-b-");
         assert_eq!(UserRegex::new("(?=)").unwrap().replace_all("", "-"), "-");
+    }
+}
+
+#[cfg(test)]
+mod nocapture_tests {
+    use super::*;
+
+    #[test]
+    fn unnamed_groups_do_not_capture_but_named_ones_do() {
+        assert!(UserRegex::new_nocapture(r"(a)\1").is_err_and(|e| e.to_string() == NONEXISTENT_GROUP));
+        assert!(UserRegex::new_nocapture(r"(a)(?<n>b)\1").is_ok_and(|r| r.is_match("abb") && !r.is_match("aba")));
+        assert!(UserRegex::new_nocapture(r"[(](a)(?:b)").is_ok_and(|r| r.is_match("(ab")));
+        assert!(UserRegex::new_nocapture(r"\(a)").is_err());
+        assert!(UserRegex::new_nocapture(r"(a").is_err_and(|e| e.to_string() != NONEXISTENT_GROUP));
+        assert!(UserRegex::new(r"(a)\1").is_ok());
     }
 }
