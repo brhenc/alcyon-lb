@@ -61,6 +61,12 @@ fn ttls_on(rule: &str, v6: bool) -> (Vec<String>, bool) {
         .and_then(rustix::process::Pid::from_raw);
     if let Some(pid) = traced {
         let _ = rustix::process::kill_process(pid, rustix::process::Signal::Usr1);
+        // strace ends once the proxy has exited; stopping it sooner would detach the proxy
+        // while it writes its coverage profile.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline && matches!(child.try_wait(), Ok(None)) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
     common::stop(&mut child);
     // strace detaches from a proxy still running when it is stopped, which would leave the
