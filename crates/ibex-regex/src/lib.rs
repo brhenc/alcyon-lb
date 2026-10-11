@@ -710,6 +710,8 @@ mod nocapture_tests {
         // conditions: the parenthesis of `(?(1)` is not a group; an assertion condition is
         assert_eq!(r("(a)(?(1)b|c)"), Some("(?:a)(?(1)b|c)".into()));
         assert_eq!(r("(?(?=a)(b)|c)"), Some("(?(?=a)(?:b)|c)".into()));
+        // an unterminated condition is left to the compiler to refuse
+        assert_eq!(r("(?(1"), Some("(?(?:1".into()));
         assert_eq!(r("(?(<n>)(b)|c)"), Some("(?(<n>)(?:b)|c)".into()));
     }
 
