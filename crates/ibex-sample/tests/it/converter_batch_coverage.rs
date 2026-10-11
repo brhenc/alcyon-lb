@@ -120,3 +120,25 @@ fn url_decodes_plus_to_space() {
     let res3 = reg.eval("str", &["?alice+bob".to_string()], &[("url_dec", vec![])], &ctx);
     assert_eq!(res3, Some(Sample::Str("?alice bob".to_string())));
 }
+
+/// `bin()` of text that is not hex is its bytes, an escaped stray byte as that byte (T286).
+#[test]
+fn bin_fetch_of_text_is_its_bytes() {
+    let reg = Registry::new();
+    let ctx = SampleContext::default();
+    assert_eq!(reg.eval("bin", &["zz".to_string()], &[], &ctx), Some(Sample::Bin(b"zz".to_vec())));
+    let stray = ibex_regex::bytetext::bytes_to_text(b"z\xe9");
+    assert_eq!(reg.eval("bin", &[stray], &[], &ctx), Some(Sample::Bin(b"z\xe9".to_vec())));
+}
+
+/// `json(utf8)` of a stray byte is empty and `json(utf8s)` drops it (T286: the byte is held
+/// as an escape character, no longer as U+FFFD).
+#[test]
+fn json_utf8_modes_see_a_stray_byte_as_invalid() {
+    let reg = Registry::new();
+    let ctx = SampleContext::default();
+    let stray = ibex_regex::bytetext::bytes_to_text(b"-\xe0-");
+    let run = |mode: &str| reg.eval("str", &[stray.clone()], &[("json", vec![mode.to_string()])], &ctx);
+    assert_eq!(run("utf8"), Some(Sample::Str(String::new())));
+    assert_eq!(run("utf8s"), Some(Sample::Str("--".to_string())));
+}

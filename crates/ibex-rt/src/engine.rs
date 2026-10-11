@@ -11952,7 +11952,7 @@ fn rebuild_req_buffer(sess: &mut TcpSession) {
         }
         new_hdr.push_str("\r\n");
         sess.req
-            .replace_prefix(hdr_len + eoh_len, &ibex_regex::bytetext::text_to_bytes(&new_hdr));
+            .replace_prefix(hdr_len + eoh_len, new_hdr.as_bytes());
     }
 }
 
@@ -12924,6 +12924,20 @@ fn build_templated_error_response(
     let mut full_resp = ibex_regex::bytetext::text_to_bytes(&resp).into_owned();
     full_resp.extend_from_slice(&body);
     full_resp
+}
+
+#[cfg(test)]
+mod cut_at_tests {
+    use super::cut_at;
+
+    /// A capture is cut in bytes: an escaped stray byte counts as one (T286).
+    #[test]
+    fn a_capture_is_cut_in_bytes_of_what_the_text_stands_for() {
+        let t = ibex_regex::bytetext::bytes_to_text(b"caf\xe9s");
+        assert_eq!(cut_at(&t, 4).as_ref(), b"caf\xe9");
+        assert_eq!(cut_at(&t, 99).as_ref(), b"caf\xe9s");
+        assert_eq!(cut_at("abc", 2).as_ref(), b"ab");
+    }
 }
 
 #[cfg(test)]
