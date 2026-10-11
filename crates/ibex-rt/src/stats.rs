@@ -663,7 +663,7 @@ fn write_server_row(
                 c.down_transitions,
                 check_status,
                 check_code,
-                c.last_status_info.clone().unwrap_or_default(),
+                c.last_status_info.as_deref().unwrap_or_default().to_string(),
                 // From the first completed check on (`HCHK_STATUS_CHECKED`), not while `INI`.
                 if c.last_status_code == "INI" { String::new() } else { c.check_duration_ms.to_string() },
             )
@@ -878,7 +878,7 @@ pub fn format_show_stat_as(
                 }
                 let check_state = checks
                     .iter()
-                    .find(|c| c.proxy_idx == p_idx && c.server_idx == s_idx);
+                    .find(|c| c.proxy() == p_idx && c.server() == s_idx);
                 write_server_row(&mut out, fmt, proxy, s_idx, check_state, pid, iid, sid);
             }
         }

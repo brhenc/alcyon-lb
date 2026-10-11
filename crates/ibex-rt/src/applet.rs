@@ -604,7 +604,7 @@ impl CliApplet {
                     let mut check_health = p.server_init_health(s_idx);
                     let mut check_state = 0;
                     
-                    if let Some(check) = ctx.checks.iter().find(|c| c.proxy_idx == p_idx && c.server_idx == s_idx) {
+                    if let Some(check) = ctx.checks.iter().find(|c| c.proxy() == p_idx && c.server() == s_idx) {
                         check_health = check.health;
                         check_state = 2; // CHK_ST_CONFIGURED
                         if check.enabled {
@@ -1698,7 +1698,7 @@ impl CliApplet {
                 msg.push_str(" by 'stats socket command'");
                 // `proxy.servers` is where every connection to this server takes its address.
                 ctx.proxies[p_idx].servers.set(s_idx, new);
-                if let Some(check) = ctx.checks.iter_mut().find(|c| c.proxy_idx == p_idx && c.server_idx == s_idx) {
+                if let Some(check) = ctx.checks.iter_mut().find(|c| c.proxy() == p_idx && c.server() == s_idx) {
                     check.addr = new;
                 }
                 self.finish_msg(&msg);

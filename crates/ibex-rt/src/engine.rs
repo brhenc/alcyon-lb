@@ -1199,7 +1199,7 @@ fn millis_to_u32(d: Duration) -> u32 {
 }
 
 #[inline]
-fn usize_to_u32(idx: usize) -> u32 {
+pub(crate) fn usize_to_u32(idx: usize) -> u32 {
     u32::try_from(idx).unwrap_or(u32::MAX)
 }
 
@@ -6984,7 +6984,7 @@ pub fn set_health_check_enabled(
     };
     if let Some(check) = checks
         .iter_mut()
-        .find(|c| c.proxy_idx == proxy_idx && c.server_idx == server_idx)
+        .find(|c| c.proxy() == proxy_idx && c.server() == server_idx)
     {
         check.enabled = enabled;
         if enabled {
@@ -11431,8 +11431,8 @@ impl EngineDispatcher<'_> {
             let now = self.now;
             let step = check::step_check(check, self.fdtab, self.poller, now, self.proxies);
 
-            let proxy_idx = check.proxy_idx;
-            let server_idx = check.server_idx;
+            let proxy_idx = check.proxy();
+            let server_idx = check.server();
             if check.enabled
                 && proxy_idx < self.proxies.len()
                 && server_idx < self.proxies[proxy_idx].server_statuses.len()

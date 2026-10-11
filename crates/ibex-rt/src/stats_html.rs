@@ -544,7 +544,7 @@ tr:hover td {{ background: rgba(255, 255, 255, 0.02); }}
 
             let check_state = checks
                 .iter()
-                .find(|c| c.proxy_idx == p_idx && c.server_idx == s_idx);
+                .find(|c| c.proxy() == p_idx && c.server() == s_idx);
 
             let (check_info, health_toggle) = if let Some(c) = check_state {
                 let info = if !c.enabled {
@@ -1052,7 +1052,7 @@ pub fn render_stats_json(proxies: &[Proxy], checks: &[ServerCheckState], pid: u3
 
             let check_state = checks
                 .iter()
-                .find(|c| c.proxy_idx == p_idx && c.server_idx == s_idx);
+                .find(|c| c.proxy() == p_idx && c.server() == s_idx);
 
             let check_info = if let Some(c) = check_state {
                 if !c.enabled {

@@ -609,10 +609,13 @@ fn sixty_thousand_with_checks_cost() -> (usize, usize) {
 /// Tripwire under `sixty_thousand_backends_with_checks_memory_bounded` (T255). That test failed
 /// its 35 MB bound on purpose from T36 to T304 (tradeoff.md 6.5), and the gate only checked that
 /// it still failed. It pinned 180,072 allocations and 54,034,102 bytes (2026-10-10, main
-/// 5175acc); T304 shared the check configuration per backend and took the cost to 120,071
-/// allocations and 36,426,110 bytes (2026-10-11), which this pins now. Bounds: bytes <= measured
-/// + 5%, allocations <= measured + 1%: the allocation count is the sharper edge (a fourth
-/// allocation per server is +50%). The 35 MB test remains the target.
+/// 5175acc); T304 shared the check configuration per backend and took the cost to 120,449
+/// allocations and 35,525,575 bytes (2026-10-11, the test run alone with `--exact`, as the
+/// gate runs it: run after another 60,000 test it is ~378 allocations and ~540 KB less, the
+/// process's one-time initialisation, mostly the predefined ACLs' regex), which this pins now.
+/// Bounds: bytes at most the measured plus 5%, allocations at most the measured plus 1%: the
+/// allocation count is the sharper edge (a fourth allocation per server is +50%). The 35 MB
+/// test remains the target.
 #[test]
 fn sixty_thousand_backends_with_checks_no_further_growth() {
     let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -620,10 +623,10 @@ fn sixty_thousand_backends_with_checks_no_further_growth() {
     let (allocs, bytes) = sixty_thousand_with_checks_cost();
     println!("[MEASUREMENT] 60,000 backends WITH checks (tripwire): {allocs} allocs, {bytes} bytes");
 
-    let max_bytes: usize = 36_426_110 / 100 * 105;
-    let max_allocs: usize = 120_071 / 100 * 101;
-    assert!(bytes <= max_bytes, "60k with checks allocated {bytes} bytes (> {max_bytes}, measured 36426110 + 5%)");
-    assert!(allocs <= max_allocs, "60k with checks made {allocs} allocations (> {max_allocs}, measured 120071 + 1%)");
+    let max_bytes: usize = 35_525_575 / 100 * 105;
+    let max_allocs: usize = 120_449 / 100 * 101;
+    assert!(bytes <= max_bytes, "60k with checks allocated {bytes} bytes (> {max_bytes}, measured 35525575 + 5%)");
+    assert!(allocs <= max_allocs, "60k with checks made {allocs} allocations (> {max_allocs}, measured 120449 + 1%)");
 }
 
 

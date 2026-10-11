@@ -340,31 +340,78 @@ fn first_check_result_is_reported_even_when_the_health_counter_does_not_move() {
     );
 }
 
-/// T304: the servers of a backend share one copy of what their checks are (the parameters,
-/// the resolved `option httpchk` / `http-check` rules and their compiled log-formats); a
-/// server whose parameters differ has its own. 60,000 checked servers used to hold 60,000
-/// copies (`request_allocations::sixty_thousand_backends_with_checks_memory_bounded`).
+/// T304: the servers of a backend share one copy of their check parameters; a server whose
+/// parameters differ has its own. 60,000 checked servers used to hold 60,000 copies
+/// (`request_allocations::sixty_thousand_backends_with_checks_memory_bounded`). Built in
+/// code, not parsed: a parse registers resolved checks for every test in this process.
 #[test]
-fn the_servers_of_a_backend_share_their_check_configuration() {
-    let text = "defaults\n    mode http\n    timeout connect 1s\n    timeout client 1s\n    timeout server 1s\n\
-                backend be\n    option httpchk GET /health\n    http-check send hdr x-lf \"%[str(a)]\"\n\
-                    server s1 127.0.0.1:1 check inter 60s\n\
-                    server s2 127.0.0.1:2 check inter 60s\n\
-                    server s3 127.0.0.1:3 check inter 60s\n\
-                    server s4 127.0.0.1:4 check inter 30s\n";
-    let config = ibex_config::parse_str(text).expect("parse");
+fn the_servers_of_a_backend_share_their_check_parameters() {
+    let server = |name: &str, port: u16, inter: u64| {
+        let mut s = Server::new(name.to_string(), SocketAddr::from(([127, 0, 0, 1], port)));
+        s.check = true;
+        s.inter = Some(Duration::from_secs(inter));
+        s
+    };
+    let config = Config {
+        backends: vec![ibex_config::BackendSection {
+            name: "be_share".into(),
+            mode: Mode::Tcp,
+            servers: vec![server("s1", 19961, 60), server("s2", 19962, 60), server("s3", 19963, 60), server("s4", 19964, 30)],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
     let engine = Engine::new(&config, 64).expect("Engine::new");
     let [a, b, c, d] = &engine.checks[..] else { panic!("four checks, got {}", engine.checks.len()) };
-
     assert!(Arc::ptr_eq(&a.config, &b.config) && Arc::ptr_eq(&a.config, &c.config));
     assert!(!Arc::ptr_eq(&a.config, &d.config), "s4 has its own inter");
     assert_eq!(d.config.inter, Duration::from_secs(30));
-
-    let resolved = |i: usize| engine.checks[i].resolved_config.clone().expect("an httpchk check");
-    assert!(Arc::ptr_eq(&resolved(0), &resolved(1)) && Arc::ptr_eq(&resolved(0), &resolved(3)));
-    let send = |i: usize| engine.checks[i].http_send.clone().expect("compiled send formats");
-    assert!(Arc::ptr_eq(&send(0), &send(2)) && Arc::ptr_eq(&send(0), &send(3)));
-
+    assert_eq!((d.proxy(), d.server()), (0, 3));
     // Between checks no server holds the state of a running one.
     assert!(engine.checks.iter().all(|c| !c.run.is_held()));
+}
+
+/// The servers that share a resolved HTTP check share its compiled `http-check send`
+/// log-formats too. Registered under proxy indexes no configuration in this process has.
+#[test]
+fn the_servers_that_share_a_resolved_check_share_its_send_formats() {
+    use ibex_config::ast::{register_resolved_check, ResolvedCheckConfig, ResolvedHttpCheck};
+    use ibex_rt::{ServerCheckConfig, ServerCheckState};
+    let http = |uri: &str| {
+        Arc::new(ResolvedCheckConfig::Http(Box::new(ResolvedHttpCheck {
+            method: "GET".into(),
+            uri: uri.into(),
+            uri_lf: false,
+            version: "HTTP/1.0".into(),
+            host: None,
+            headers: vec![("x-lf".into(), "%[str(a)]".into())],
+            body: None,
+            body_lf: false,
+            has_send: true,
+            send_state: false,
+            pre_rules: Vec::new(),
+            rules: Vec::new(),
+            check_port: None,
+            send_proxy: false,
+            connect_addr: None,
+        })))
+    };
+    let (shared, other) = (http("/a"), http("/b"));
+    let addr = SocketAddr::from(([127, 0, 0, 1], 19965));
+    // A parse elsewhere in this process clears the table; try again until none came between.
+    for _ in 0..100 {
+        register_resolved_check(9_001, 0, Arc::clone(&shared));
+        register_resolved_check(9_001, 1, Arc::clone(&shared));
+        register_resolved_check(9_001, 2, Arc::clone(&other));
+        let checks: Vec<ServerCheckState> =
+            (0..3).map(|i| ServerCheckState::new(9_001, i, addr, ServerCheckConfig::default(), ibex_sched::Tick(0))).collect();
+        let (Some(f0), Some(f1), Some(f2)) = (&checks[0].http_send, &checks[1].http_send, &checks[2].http_send) else { continue };
+        if !checks[0].resolved_config.as_ref().is_some_and(|r| Arc::ptr_eq(r, &shared)) {
+            continue;
+        }
+        assert!(Arc::ptr_eq(f0, f1), "one compiled copy for the servers that share a check");
+        assert!(!Arc::ptr_eq(f0, f2), "another check has its own");
+        return;
+    }
+    panic!("the resolved checks were cleared on every attempt");
 }

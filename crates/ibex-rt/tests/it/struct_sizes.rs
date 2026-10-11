@@ -38,8 +38,9 @@ fn per_server_check_config_is_boxed() {
 fn server_check_state_stays_small() {
     let n = size_of::<ibex_rt::check::ServerCheckState>();
     // 440 before T304, which moved the state of a running check into `CheckRun` (held only
-    // while the check runs) and shares the check parameters per backend.
-    assert!(n <= 224, "ServerCheckState grew to {n} bytes (bound 224): one is held per checked server, box the new field or put it in CheckRun");
+    // while the check runs), shares the check parameters per backend, and keeps the indexes
+    // as `u32`.
+    assert!(n <= 200, "ServerCheckState grew to {n} bytes (bound 200): one is held per checked server, box the new field or put it in CheckRun");
 }
 
 /// A session is held for every client connection, idle ones included, in the worker's
