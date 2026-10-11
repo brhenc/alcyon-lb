@@ -357,6 +357,10 @@ fn find_eoh(buf: &[u8]) -> Option<(usize, usize)> {
         if i + 2 <= buf.len() && &buf[i..i + 2] == b"\n\n" {
             return Some((i + 1, 1));
         }
+        // A bare LF, then the blank line as CRLF (T291).
+        if i + 3 <= buf.len() && &buf[i..i + 3] == b"\n\r\n" {
+            return Some((i + 1, 2));
+        }
     }
     None
 }

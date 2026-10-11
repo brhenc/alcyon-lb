@@ -1135,38 +1135,15 @@ pub fn status_of(head: &str) -> u16 {
 }
 
 
-/// Whether the request line in `buf` has a version `HAProxy` answers with a 400 (T286): not
-/// `HTTP/<digit>.<digit>`, missing, followed by anything, however long the line is. Its parser
-/// refuses the first byte that cannot belong to the version, so this holds before the line
-/// feed is in, and before the head is known to be too big for a 414 or a 431.
+/// Whether the request line in `buf` is one `HAProxy` answers with a 400 (T286, T291): a byte
+/// its parser refuses, or a version that is not `HTTP/<digit>.<digit>`, missing, or followed
+/// by anything, however long the line is. Its parser refuses the first byte that cannot
+/// belong where it is, so this holds before the line feed is in, and before the head is
+/// known to be too big for a 414 or a 431. Without `accept-unsafe-violations-in-http-request`
+/// (the proxy passes its own setting to [`ibex_proto::h1::scan_request_line`]).
 #[must_use]
 pub fn request_version_invalid(buf: &[u8]) -> bool {
-    let lf = buf.iter().position(|&b| b == b'\n');
-    let line = &buf[..lf.unwrap_or(buf.len())];
-    let line = if lf.is_some() { line.strip_suffix(b"\r").unwrap_or(line) } else { line };
-    let blank = |b: &u8| matches!(b, b' ' | b'\t');
-    // The first three tokens and whether there are more; no Vec, this runs on every request.
-    let mut toks = line.split(blank).filter(|t| !t.is_empty());
-    let (_, second, third, more) = (toks.next(), toks.next(), toks.next(), toks.next().is_some());
-    let Some(v) = third else {
-        // No version at all, once the line is whole.
-        return lf.is_some() && second.is_some();
-    };
-    let fits = |v: &[u8]| {
-        v.iter().enumerate().all(|(i, &b)| match i {
-            0 => b == b'H',
-            1 | 2 => b == b'T',
-            3 => b == b'P',
-            4 => b == b'/',
-            5 | 7 => b.is_ascii_digit(),
-            6 => b == b'.',
-            _ => false,
-        })
-    };
-    if more || !fits(v) || line.last().is_some_and(blank) {
-        return true;
-    }
-    lf.is_some() && v.len() != 8
+    ibex_proto::h1::scan_request_line(buf, false) == ibex_proto::h1::ReqLineScan::Invalid
 }
 
 /// Whether the request line in `buf` is one `HAProxy` answers with a 414 (T282): once its
