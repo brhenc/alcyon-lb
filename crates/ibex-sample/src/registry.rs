@@ -177,9 +177,30 @@ pub struct StreamFacts {
     pub redispatched: bool,
 }
 
+/// Why a client connection failed before a session began (`conn->err_code`): what
+/// `fc_err`, `fc_err_str`, `fc_err_name` and `ssl_fc_err[_str]` read in an
+/// `error-log-format`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnErr<'a> {
+    /// `CO_ER_*`.
+    pub code: i64,
+    /// `conn_err_code_str`.
+    pub text: &'a str,
+    /// `conn_err_code_name`.
+    pub name: &'a str,
+    /// The failure was a TLS handshake's: `ssl_fc_err` has a value (0 without OpenSSL's error).
+    pub tls: bool,
+    /// OpenSSL's error code, when it gave one (`ssl_fc_err`).
+    pub ssl_code: i64,
+    /// OpenSSL's error text (`ssl_fc_err_str`).
+    pub ssl_text: Option<&'a str>,
+}
+
 /// Runtime context passed into sample fetch functions during evaluation.
 #[derive(Debug, Clone, Default)]
 pub struct SampleContext<'a> {
+    /// The client connection's error, when it failed before a session (`error-log-format`).
+    pub conn_err: Option<ConnErr<'a>>,
     /// Evaluated for the access log, after the request buffer is gone: `method` reads
     /// only the transaction's method enum then, so a method outside it has no value.
     pub at_log: bool,
@@ -2182,9 +2203,32 @@ impl Registry {
         self.register_fetch(FetchDesc {
             name: "fc_err",
             out_type: SampleType::Sint,
-            func: |_ctx, _args| Some(Sample::Sint(0)),
+            func: |ctx, _args| Some(Sample::Sint(ctx.conn_err.map_or(0, |e| e.code))),
         });
-        for name in ["ssl_fc_err", "ssl_c_err", "ssl_c_ca_err"] {
+        self.register_fetch(FetchDesc {
+            name: "fc_err_str",
+            out_type: SampleType::Str,
+            func: |ctx, _args| Some(Sample::Str(ctx.conn_err.map_or("Success", |e| e.text).to_string())),
+        });
+        self.register_fetch(FetchDesc {
+            name: "fc_err_name",
+            out_type: SampleType::Str,
+            func: |ctx, _args| ctx.conn_err.map(|e| Sample::Str(e.name.to_string())),
+        });
+        self.register_fetch(FetchDesc {
+            name: "ssl_fc_err_str",
+            out_type: SampleType::Str,
+            func: |ctx, _args| ctx.conn_err.and_then(|e| e.ssl_text).map(|t| Sample::Str(t.to_string())),
+        });
+        self.register_fetch(FetchDesc {
+            name: "ssl_fc_err",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| match ctx.conn_err {
+                Some(e) if e.tls => Some(Sample::Sint(e.ssl_code)),
+                _ => ctx.ssl_fc.used.then_some(Sample::Sint(0)),
+            },
+        });
+        for name in ["ssl_c_err", "ssl_c_ca_err"] {
             self.register_fetch(FetchDesc {
                 name,
                 out_type: SampleType::Sint,

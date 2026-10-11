@@ -81,6 +81,37 @@ impl ProxyHdrError {
         }
     }
 
+    /// `conn->err_code` (`CO_ER_*`): what `fc_err` reads. A refusal by a `tcp-request session`
+    /// rule has none.
+    #[must_use]
+    pub const fn code(self) -> i64 {
+        match self {
+            Self::Empty => 11,
+            Self::Abort => 12,
+            Self::Timeout => 13,
+            Self::Truncated => 14,
+            Self::NotHdr => 15,
+            Self::BadHdr => 16,
+            Self::BadProto => 17,
+            Self::SessionRefused => 0,
+        }
+    }
+
+    /// `conn_err_code_name`: what `fc_err_name` reads.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Empty => "PRX_EMPTY",
+            Self::Abort => "PRX_ABORT",
+            Self::Timeout => "PRX_TIMEOUT",
+            Self::Truncated => "PRX_TRUNCATED",
+            Self::NotHdr => "PRX_NOT_HDR",
+            Self::BadHdr => "PRX_BAD_HDR",
+            Self::BadProto => "PRX_BAD_PROTO",
+            Self::SessionRefused => "",
+        }
+    }
+
     /// The code for a parser error, as `conn_recv_proxy` picks it.
     #[must_use]
     pub fn from_parse(e: &ibex_proto::ProxyParseError) -> Self {

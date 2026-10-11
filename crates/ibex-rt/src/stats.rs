@@ -1008,6 +1008,7 @@ mod tests {
             chash: std::sync::Arc::default(),
             fwrr: std::sync::Arc::default(),
             log_format: None,
+            error_log_format: None,
             dont_log_null: false,
             ignore_probes: false,
             log_opts: 0,

@@ -55,6 +55,9 @@ pub struct DefaultsSection {
     pub log_format: Option<LogFormatSpec>,
     /// `unique-id-format`: the transaction's unique ID, built when first used.
     pub unique_id_format: Option<String>,
+    /// `error-log-format`: the line for a connection that fails before a stream exists
+    /// (a failed TLS handshake, a refused PROXY header, a request the mux refuses).
+    pub error_log_format: Option<String>,
     /// `unique-id-header`: the request header the unique ID is sent to the server in.
     pub unique_id_header: Option<String>,
     pub log_health_checks: bool,
@@ -266,6 +269,9 @@ pub struct ListenSection {
     pub log_format: Option<LogFormatSpec>,
     /// `unique-id-format`: the transaction's unique ID, built when first used.
     pub unique_id_format: Option<String>,
+    /// `error-log-format`: the line for a connection that fails before a stream exists
+    /// (a failed TLS handshake, a refused PROXY header, a request the mux refuses).
+    pub error_log_format: Option<String>,
     /// `unique-id-header`: the request header the unique ID is sent to the server in.
     pub unique_id_header: Option<String>,
     /// `capture request header`, in declaration order.
@@ -436,6 +442,7 @@ impl Default for ListenSection {
             log_global: false,
             log_format: None,
             unique_id_format: None,
+            error_log_format: None,
             unique_id_header: None,
             req_header_captures: Vec::new(),
             res_header_captures: Vec::new(),
@@ -538,6 +545,9 @@ pub struct FrontendSection {
     pub log_format: Option<LogFormatSpec>,
     /// `unique-id-format`: the transaction's unique ID, built when first used.
     pub unique_id_format: Option<String>,
+    /// `error-log-format`: the line for a connection that fails before a stream exists
+    /// (a failed TLS handshake, a refused PROXY header, a request the mux refuses).
+    pub error_log_format: Option<String>,
     /// `unique-id-header`: the request header the unique ID is sent to the server in.
     pub unique_id_header: Option<String>,
     /// `capture request header`, in declaration order.
@@ -621,6 +631,7 @@ impl Default for FrontendSection {
             log_global: false,
             log_format: None,
             unique_id_format: None,
+            error_log_format: None,
             unique_id_header: None,
             req_header_captures: Vec::new(),
             res_header_captures: Vec::new(),
