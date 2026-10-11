@@ -17,7 +17,7 @@
 //! Ibex serves one at a time per connection, so a slow response holds up every other one on
 //! the connection: a browser's page stalls behind one slow image.
 
-mod common;
+use crate::common;
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
