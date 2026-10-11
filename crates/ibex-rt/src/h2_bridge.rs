@@ -113,16 +113,15 @@ pub fn start_request(sess: &mut TcpSession, d: H2Dispatch) {
     } else {
         &d.head
     };
-    if let Ok(parser) = ibex_proto::parser::build(ibex_proto::parser::ParserKind::H1) {
-        let mut p_stream = parser.stream(false);
-        let raw = sess.htx_buf.raw_slice_mut();
-        let mut slice = ibex_proto::htx::HtxSlice::new(raw);
-        if p_stream.parse(&d.head, &mut slice).is_ok() {
-            sess.htx_tail = slice.tail_addr();
-            sess.htx_blocks = slice.num_blocks();
-            sess.has_htx = true;
-            sess.htx_modified = false;
-        }
+    // The built-in HTTP/1 parser (`parser::build(ParserKind::H1)`, which cannot fail).
+    let mut p_stream = ibex_proto::parser::HttpParser::stream(&ibex_proto::parser::H1, false);
+    let raw = sess.htx_buf.raw_slice_mut();
+    let mut slice = ibex_proto::htx::HtxSlice::new(raw);
+    if p_stream.parse(&d.head, &mut slice).is_ok() {
+        sess.htx_tail = slice.tail_addr();
+        sess.htx_blocks = slice.num_blocks();
+        sess.has_htx = true;
+        sess.htx_modified = false;
     }
     sess.req_method = d.method;
     sess.req_uri = d.uri;
@@ -496,6 +495,21 @@ mod tests {
         assert_eq!(frame[3], 1, "HEADERS");
         assert_eq!(frame[4] & 1, 1, "END_STREAM");
         assert_eq!(frame.len(), 9 + ((usize::from(frame[0]) << 16) | (usize::from(frame[1]) << 8) | usize::from(frame[2])), "and nothing after it");
+    }
+
+    #[test]
+    fn a_head_that_is_no_response_head_is_held_and_sends_nothing() {
+        let mut h2 = H2MuxContext::new(ConnId(0), true);
+        let mut txn = HttpTxn::new(txn::Framing::None, false);
+        txn.rsp = MsgState::Head { left: 0, body: txn::Framing::Length(5) };
+        let mut rep = Buf::with_capacity(256);
+        let head = b"garbage\r\n\r\n";
+        assert!(rep.put(head));
+        let tx = h2.tx_buf.len();
+        assert!(!forward_response(&mut h2, 1, &mut txn, &mut rep, false));
+        assert_eq!(rep.readable(), head, "nothing of it was taken");
+        assert_eq!(txn.rsp, MsgState::Head { left: 0, body: txn::Framing::Length(5) });
+        assert_eq!(h2.tx_buf.len(), tx, "no frame");
     }
 
     #[test]
