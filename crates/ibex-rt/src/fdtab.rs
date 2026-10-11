@@ -150,6 +150,16 @@ impl FdTab {
         e.ready = Interest::NONE;
     }
 
+    /// Hands a connection's fd to another task, its readiness and interest kept: a server
+    /// connection that goes from one stream of an HTTP/2 connection to its owner, or back
+    /// (T280).
+    pub fn set_task(&mut self, fd: RawFd, task: TaskRef) {
+        let e = self.slot(fd);
+        if let FdState::Conn { conn, .. } = e.state {
+            e.state = FdState::Conn { task, conn };
+        }
+    }
+
     /// Releases an fd.
     pub fn remove(&mut self, fd: RawFd) {
         let e = self.slot(fd);

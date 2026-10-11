@@ -582,7 +582,7 @@ fn openssl_cipher_name(iana: &str) -> &str {
     }
 }
 
-fn facts_of(info: &ibex_tls::RustlsTlsInfo) -> ibex_sample::SslFacts<'_> {
+pub(crate) fn facts_of(info: &ibex_tls::RustlsTlsInfo) -> ibex_sample::SslFacts<'_> {
     ibex_sample::SslFacts {
         used: true,
         sni: info.sni.as_deref(),
@@ -618,6 +618,16 @@ impl ClientXprt {
         match self {
             ClientXprt::Plain => ibex_sample::SslFacts::default(),
             ClientXprt::Tls(t) => facts_of(&t.ctx.tls_info),
+        }
+    }
+
+    /// What the handshake settled, for TLS: copied once for the streams of an HTTP/2
+    /// connection, which read it after the connection's own entry (T280).
+    #[must_use]
+    pub fn tls_info(&self) -> Option<&ibex_tls::RustlsTlsInfo> {
+        match self {
+            ClientXprt::Plain => None,
+            ClientXprt::Tls(t) => Some(&t.ctx.tls_info),
         }
     }
 

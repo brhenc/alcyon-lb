@@ -96,11 +96,14 @@ pub fn chunked_head(head: &[u8], at: usize) -> Vec<u8> {
     v
 }
 
-/// The start of a stream's transaction in the session that serves it: its head in `req`
-/// (and parsed, for the rules), the request's log fields, and the transaction.
+/// The start of a stream's transaction in the session that serves it, a child of the
+/// connection's owner (T280): its head in `req` (and parsed, for the rules), the request's
+/// log fields, and the transaction.
 pub fn start_request(sess: &mut TcpSession, d: H2Dispatch) {
     let chunked = d.stream.chunk_out;
-    sess.h2_stream = Some(Box::new(d.stream));
+    if let Some(c) = sess.h2_child_mut() {
+        c.stream = d.stream;
+    }
     if sess.keep_request_line {
         sess.log.request_line = d.request_line;
     }
@@ -440,6 +443,15 @@ mod tests {
         (TcpSession::new(cli.into(), Timeouts::default(), 0, ibex_sched::Tick(1000)), peer)
     }
 
+    /// A stream's session, the child of an HTTP/2 connection's (T280).
+    fn child() -> (TcpSession, TcpSession, UnixStream) {
+        let (mut owner, peer) = session();
+        owner.h2_ctx = Some(Box::new(H2MuxContext::new(ConnId(0), true)));
+        let stream = H2ActiveStream { id: 1, body: H2ReqBody::default(), chunk_out: false };
+        let c = TcpSession::h2_child_of(&mut owner, (0, ibex_sched::TaskRef::NONE), stream);
+        (c, owner, peer)
+    }
+
     fn dispatch(head: &[u8]) -> H2Dispatch {
         H2Dispatch {
             stream: H2ActiveStream { id: 1, body: H2ReqBody::default(), chunk_out: false },
@@ -454,16 +466,16 @@ mod tests {
 
     #[test]
     fn a_head_the_h1_parser_refuses_still_starts_the_transaction_without_parsed_htx() {
-        let (mut s, _peer) = session();
+        let (mut s, _owner, _peer) = child();
         let head = b"\x01\x02 not a request line\r\n\r\n";
         start_request(&mut s, dispatch(head));
         assert!(!s.has_htx, "the parser refused the head: no HTX for the rules");
         assert_eq!(s.req.readable(), head, "the head is in `req` as it came");
         assert_eq!(s.txn.as_ref().and_then(|t| t.req_htx), Some(7));
-        assert_eq!(s.h2_stream.as_ref().map(|a| a.id), Some(1));
+        assert_eq!(s.h2_active().map(|a| a.id), Some(1));
         assert_eq!(s.cli_state, ScState::Established);
         // The same with a head it takes: parsed for the rules.
-        let (mut s, _peer) = session();
+        let (mut s, _owner, _peer) = child();
         start_request(&mut s, dispatch(b"GET / HTTP/1.1\r\nhost: x\r\n\r\n"));
         assert!(s.has_htx, "a valid head is parsed");
     }
