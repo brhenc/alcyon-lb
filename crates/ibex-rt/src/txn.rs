@@ -563,6 +563,110 @@ impl MsgState {
         }
         None
     }
+
+    /// Rewrites in place each whole chunk-size line of `data` -- which starts at this
+    /// message's current position -- the way `HAProxy` writes it out of HTX: the size in
+    /// upper-case hex without leading zeros, no blanks, no extension (`0005;a=b` is `5`,
+    /// `a` is `A`). Returns the new length of `data`; the bytes past it are stale.
+    ///
+    /// A size line is never forwarded until it is whole ([`Chunk::at_boundary`]), so no
+    /// line is rewritten after any of it has gone. A partial line, the bytes from a framing
+    /// violation on, and what follows the end of the message (a pipelined request) are
+    /// kept as they are; the violation is [`Self::check_body`]'s to judge. Nothing moves
+    /// until a line has shrunk: per chunk, the cost is a scan of its size line.
+    pub fn canonical_chunk_lines(&self, data: &mut [u8]) -> usize {
+        let mut i = 0;
+        let mut c = match *self {
+            MsgState::Head { left, body: Framing::Chunked } => {
+                i = if left == 0 {
+                    match find_eoh(data) {
+                        Some((h, e)) => h + e,
+                        None => return data.len(),
+                    }
+                } else {
+                    left
+                };
+                CHUNK_START
+            }
+            MsgState::Body(Body::Chunked(c)) => c,
+            _ => return data.len(),
+        };
+        // `w` trails `i` by what the lines rewritten so far have shed.
+        let mut w = i;
+        let keep_rest = |data: &mut [u8], i: usize, w: usize| {
+            if w != i {
+                data.copy_within(i.., w);
+            }
+            w + data.len() - i
+        };
+        while i < data.len() {
+            if let Chunk::Data(n) = c {
+                let take = usize::try_from(n).unwrap_or(usize::MAX).min(data.len() - i);
+                if w != i {
+                    data.copy_within(i..i + take, w);
+                }
+                i += take;
+                w += take;
+                c = if take as u64 == n { Chunk::DataCr } else { Chunk::Data(n - take as u64) };
+                continue;
+            }
+            if c != CHUNK_START {
+                // The CRLF after a chunk's data, or the trailer section.
+                let b = data[i];
+                match c.scan(&[b], &mut 0, false) {
+                    (1, Ok(next)) => {
+                        data[w] = b;
+                        i += 1;
+                        w += 1;
+                        match next {
+                            Some(next) => c = next,
+                            None => return keep_rest(data, i, w),
+                        }
+                    }
+                    _ => return keep_rest(data, i, w),
+                }
+                continue;
+            }
+            // A size line: scanned whole, then written as HAProxy would.
+            let mut j = i;
+            let mut s = c;
+            let size = loop {
+                let Some(&b) = data.get(j) else { return keep_rest(data, i, w) };
+                j += 1;
+                match s.scan(&[b], &mut 0, false) {
+                    (1, Ok(Some(next))) => {
+                        if let Chunk::SizeLf { size } = s {
+                            c = next;
+                            break size;
+                        }
+                        s = next;
+                    }
+                    _ => return keep_rest(data, i, w),
+                }
+            };
+            let mut line = [0u8; 18];
+            let len = chunk_size_line(size, &mut line);
+            let line = &line[..len];
+            if w != i || &data[i..j] != line {
+                data[w..w + line.len()].copy_from_slice(line);
+            }
+            w += line.len();
+            i = j;
+        }
+        w
+    }
+}
+
+/// Writes the size line of a chunk of `size` bytes at the front of `out` as `HAProxy`
+/// does (`h1_append_chunk_size`): upper-case hex without leading zeros, then CRLF.
+/// Returns its length, at most 18 (16 digits and the CRLF).
+pub fn chunk_size_line(size: u64, out: &mut [u8]) -> usize {
+    let digits = (64 - size.leading_zeros()).div_ceil(4).max(1) as usize;
+    for (k, d) in out[..digits].iter_mut().enumerate() {
+        *d = b"0123456789ABCDEF"[((size >> (4 * (digits - 1 - k))) & 0xf) as usize];
+    }
+    out[digits..digits + 2].copy_from_slice(b"\r\n");
+    digits + 2
 }
 
 /// What [`MsgState::check_body`] finds in the bytes of a body that are here.
@@ -1951,6 +2055,44 @@ mod tests {
         assert_eq!(u.take_body(b"xyz", 2, &mut out), 2);
         assert_eq!(out, b"xy");
         assert_eq!(u, MsgState::Body(Body::UntilClose));
+    }
+
+    /// What `canonical_chunk_lines` leaves of `data` from state `s`.
+    fn canonical(s: MsgState, data: &[u8]) -> Vec<u8> {
+        let mut d = data.to_vec();
+        let n = s.canonical_chunk_lines(&mut d);
+        d.truncate(n);
+        d
+    }
+
+    /// Size lines as `HAProxy` writes them (T302): extensions and blanks dropped, upper-case
+    /// hex without leading zeros; a partial line, a violation and what follows the message
+    /// left as they are.
+    #[test]
+    fn chunk_lines_are_rewritten_as_haproxy_writes_them() {
+        let chunked = MsgState::head(Framing::Chunked);
+        let head = b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let msg = [&head[..], b"0005;a=b\r\nhello\r\na ; x=\"y;z\"\r\n0123456789\r\n00;e\r\nT: 1\r\n\r\nGET / HTTP/1.1\r\n\r\n"].concat();
+        let want = [&head[..], b"5\r\nhello\r\nA\r\n0123456789\r\n0\r\nT: 1\r\n\r\nGET / HTTP/1.1\r\n\r\n"].concat();
+        assert_eq!(canonical(chunked, &msg), want);
+        // The head measured already.
+        let mut measured = chunked;
+        measured.measure_head(&msg);
+        assert_eq!(canonical(measured, &msg), want);
+        // A head not whole yet, and a body that is not chunked: untouched.
+        assert_eq!(canonical(chunked, b"POST / HTTP/1.1\r\n5;x\r\n"), b"POST / HTTP/1.1\r\n5;x\r\n");
+        assert_eq!(canonical(MsgState::Body(Body::Length(9)), b"5;x\r\nhello"), b"5;x\r\nhello");
+        // From inside a chunk's data; a partial line after a rewritten one, kept as it is.
+        assert_eq!(canonical(MsgState::Body(Body::Chunked(Chunk::Data(3))), b"abc\r\n4;x\r\nabcd\r\n0;y"), b"abc\r\n4\r\nabcd\r\n0;y");
+        // A violation, and all after it, kept as it is.
+        assert_eq!(canonical(MsgState::Body(Body::Chunked(CHUNK_START)), b"1;x\r\nZ\r\n1;\x01\r\n"), b"1\r\nZ\r\n1;\x01\r\n");
+        assert_eq!(canonical(MsgState::Body(Body::Chunked(CHUNK_START)), b"1;x\r\nZX1\r\n"), b"1\r\nZX1\r\n");
+        // A canonical body is not moved; a lower-case size is only upper-cased.
+        assert_eq!(canonical(MsgState::Body(Body::Chunked(CHUNK_START)), b"1F\r\n"), b"1F\r\n");
+        assert_eq!(canonical(MsgState::Body(Body::Chunked(CHUNK_START)), b"1f\r\n"), b"1F\r\n");
+        let mut line = [0u8; 18];
+        let n = chunk_size_line((1 << 52) - 1, &mut line);
+        assert_eq!(&line[..n], b"FFFFFFFFFFFFF\r\n");
     }
 
     #[test]

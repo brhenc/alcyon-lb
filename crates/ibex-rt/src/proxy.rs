@@ -1391,6 +1391,31 @@ impl TcpSession {
         }
     }
 
+    /// Rewrites the framing of a chunked request body in `req` as `HAProxy` forwards it,
+    /// before any of it is: each trailer line ended by a lone LF ends by CRLF
+    /// ([`txn::MsgState::trailer_bare_lf`]), each chunk-size line loses its extension
+    /// ([`txn::MsgState::canonical_chunk_lines`]).
+    fn rewrite_req_chunk_framing(&mut self) {
+        self.end_req_trailer_lines_with_crlf();
+        if self.mode != Mode::Http {
+            return;
+        }
+        let Some(t) = &self.txn else { return };
+        let n = t.req.canonical_chunk_lines(self.req.readable_mut());
+        self.req.cut(n, self.req.len());
+    }
+
+    /// [`Self::rewrite_req_chunk_framing`] for a chunked response body in `rep`, once its
+    /// head has been processed: each chunk-size line loses its extension.
+    pub fn rewrite_rep_chunk_framing(&mut self) {
+        if self.mode != Mode::Http {
+            return;
+        }
+        let Some(t) = &self.txn else { return };
+        let n = t.rsp.canonical_chunk_lines(self.rep.readable_mut());
+        self.rep.cut(n, self.rep.len());
+    }
+
     /// Rewrites each trailer line of the request in `req` ended by a lone LF to end by
     /// CRLF, before any of it is forwarded (see [`txn::MsgState::trailer_bare_lf`]).
     fn end_req_trailer_lines_with_crlf(&mut self) {
@@ -1877,7 +1902,7 @@ impl TcpSession {
                     }
                     Io::Done(n) if n > 0 => {
                         self.req.commit(n);
-                        self.end_req_trailer_lines_with_crlf();
+                        self.rewrite_req_chunk_framing();
                         self.bytes_in += n as u64;
                         self.log.first_byte_now();
                         changed = true;
@@ -2209,7 +2234,7 @@ impl TcpSession {
                 // The client's own method: rules that rewrite it have not run yet.
                 txn.client_head = self.req_method.as_deref().is_some_and(|m| m.eq_ignore_ascii_case("HEAD"));
                 self.txn = Some(txn);
-                self.end_req_trailer_lines_with_crlf();
+                self.rewrite_req_chunk_framing();
                 self.cli_state = ScState::Established;
                 changed = true;
             } else if match ibex_proto::h1::scan_request_line(self.req.readable(), self.accept_unsafe_request) {
@@ -2510,6 +2535,7 @@ impl TcpSession {
                 }
                 Io::Done(n) if n > 0 => {
                     self.rep.commit(n);
+                    self.rewrite_rep_chunk_framing();
                     self.log.bytes_from_server += n as u64;
                     changed = true;
                 }
@@ -3254,6 +3280,21 @@ mod tests {
             req.consume(n);
         }
         assert!(st.done, "the body never finished: {st:?}");
+    }
+
+    /// A chunk's size in upper-case hex, as `HAProxy` writes it (`1E` for a 30-byte body
+    /// from an HTTP/2 client with no length, 3.5-dev8; T302).
+    #[test]
+    fn an_h2_request_chunk_size_is_upper_case_hex() {
+        let mut msg = Htx::new();
+        msg.push(HtxBlock::Eoh);
+        msg.push(HtxBlock::Data(b"0123456789abcdefghij0123456789".to_vec()));
+        msg.push(HtxBlock::Eom);
+        let mut st = H2ReqBody { chunked: true, ..H2ReqBody::default() };
+        let mut req = Buf::with_capacity(64);
+        let mut out = Vec::new();
+        pump_all(&mut msg, &mut st, &mut req, &mut out);
+        assert_eq!(out, b"1E\r\n0123456789abcdefghij0123456789\r\n0\r\n\r\n");
     }
 
     /// A body bigger than the room left goes out a piece at a time, as chunks when there

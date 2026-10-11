@@ -352,9 +352,7 @@ pub(crate) fn pump_h2_body(msg: &mut ibex_proto::htx::Htx, st: &mut H2ReqBody, r
                 }
                 let n = rest.len().min(room.len() - framing);
                 let at = if st.chunked {
-                    let size = format!("{n:x}\r\n");
-                    room[..size.len()].copy_from_slice(size.as_bytes());
-                    size.len()
+                    crate::txn::chunk_size_line(n as u64, room)
                 } else {
                     0
                 };
