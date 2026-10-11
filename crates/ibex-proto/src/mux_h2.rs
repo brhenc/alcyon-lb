@@ -1088,10 +1088,29 @@ impl MuxH2 {
                     ));
                 }
 
+                // Past 2^31-1 the window overflows (RFC 9113 6.9.1): a connection error for
+                // the connection window, a stream error for a stream's. HAProxy sends
+                // GOAWAY / RST_STREAM FLOW_CONTROL_ERROR (measured, T297).
                 if stream_id == 0 {
-                    ctx.conn_send_window = ctx.conn_send_window.saturating_add(increment as i32);
+                    match ctx.conn_send_window.checked_add(increment as i32) {
+                        Some(w) if increment <= i32::MAX as u32 => ctx.conn_send_window = w,
+                        _ => {
+                            ctx.send_goaway(
+                                ctx.last_client_stream_id,
+                                H2Error::FlowControlError,
+                                b"connection window overflow",
+                            );
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "WINDOW_UPDATE overflows the connection window",
+                            ));
+                        }
+                    }
                 } else if let Some(stream) = ctx.streams.get_mut(&stream_id) {
-                    stream.send_window = stream.send_window.saturating_add(increment as i32);
+                    match stream.send_window.checked_add(increment as i32) {
+                        Some(w) if increment <= i32::MAX as u32 => stream.send_window = w,
+                        _ => ctx.send_rst_stream(stream_id, H2Error::FlowControlError),
+                    }
                 }
             }
 
@@ -1397,6 +1416,51 @@ mod tests {
         // 20 MB went through; what is kept is bounded by what waits, not by what was sent.
         assert!(ctx.tx_buf.len() <= 4 * TX_ROOM, "tx_buf holds {} bytes", ctx.tx_buf.len());
         assert!(ctx.tx_buf.capacity() <= 8 * TX_ROOM, "tx_buf capacity {} bytes", ctx.tx_buf.capacity());
+    }
+
+    /// SETTINGS_MAX_CONCURRENT_STREAMS from a client limits pushes, which a proxy never
+    /// sends: a server-role connection keeps its own limit (T280). A client-role one
+    /// (we are the client) takes the server's.
+    #[test]
+    fn peer_max_concurrent_streams_applies_to_client_role_only() {
+        let settings = Frame::Settings {
+            flags: 0,
+            settings: vec![(SettingsParameter::MaxConcurrentStreams, 1)],
+        }
+        .encode();
+        let mut hello = H2_CONN_PREFACE.to_vec();
+        hello.extend_from_slice(&settings);
+        let mut server = MuxH2.init(ConnId(1), true).expect("init");
+        let own = server.max_concurrent_streams;
+        MuxH2.parse(&mut server, &hello).expect("server parse");
+        assert_eq!(server.max_concurrent_streams, own);
+        let mut client = MuxH2.init(ConnId(2), false).expect("init");
+        MuxH2.parse(&mut client, &settings).expect("client parse");
+        assert_eq!(client.max_concurrent_streams, 1);
+    }
+
+    /// WINDOW_UPDATE past 2^31-1 (HAProxy, measured): GOAWAY FLOW_CONTROL_ERROR for the
+    /// connection window, RST_STREAM FLOW_CONTROL_ERROR for a stream's; exactly 2^31-1 is fine.
+    #[test]
+    fn window_update_overflow_is_flow_control_error() {
+        let (mux, mut ctx) = open_conn();
+        let inc = i32::MAX as u32 - ctx.conn_send_window as u32;
+        let wu = |sid, inc| Frame::WindowUpdate { stream_id: sid, increment: inc }.encode();
+        mux.parse(&mut ctx, &wu(0, inc)).expect("exactly the maximum");
+        assert_eq!(ctx.conn_send_window, i32::MAX);
+        assert!(mux.parse(&mut ctx, &wu(0, 1)).is_err());
+        assert_eq!(ctx.goaway_sent.map(|g| g.1), Some(H2Error::FlowControlError));
+
+        let (mux, mut ctx) = open_conn();
+        ctx.streams.insert(1, H2StreamCtx::new(1, i32::MAX - 5, 100));
+        mux.parse(&mut ctx, &wu(1, 5)).expect("exactly the maximum");
+        assert_eq!(ctx.streams[&1].send_window, i32::MAX);
+        let before = ctx.tx_buf.len();
+        mux.parse(&mut ctx, &wu(1, 1)).expect("a stream error is not a connection error");
+        assert!(ctx.tx_buf[before..].windows(9).any(|w| w[3] == 3 && w[5..9] == [0, 0, 0, 1]), "no RST_STREAM");
+        assert!(ctx.goaway_sent.is_none());
+        let rst_code = &ctx.tx_buf[ctx.tx_buf.len() - 4..];
+        assert_eq!(rst_code, &[0, 0, 0, 3]);
     }
 
     fn open_conn() -> (MuxH2, H2MuxContext) {

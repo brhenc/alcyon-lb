@@ -25,6 +25,12 @@
 //! 4 pseudo-headers + 100 .. 197 headers             RST_STREAM PROTOCOL_ERROR (1), connection kept
 //! 4 pseudo-headers + 198 headers (202 fields)       GOAWAY last 1 COMPRESSION_ERROR (9)
 //! 2000 headers over HEADERS + CONTINUATION          GOAWAY last 1 COMPRESSION_ERROR (9)
+//! WINDOW_UPDATE(0) taking the connection window     GOAWAY last 0 FLOW_CONTROL_ERROR (3), closed
+//!   past 2^31-1 (also by 1; request 1 sent before:  (last 1, and the answer to request 1 follows)
+//!   GOAWAY last 1)
+//! WINDOW_UPDATE(1) taking an open stream's window   RST_STREAM 1 FLOW_CONTROL_ERROR (3), connection
+//!   past 2^31-1 (also by 1)                         kept: a request on stream 3 is answered
+//! WINDOW_UPDATE up to exactly 2^31-1                no error
 //! ```
 
 use crate::common;
@@ -309,4 +315,46 @@ fn many_headers_over_continuation_are_a_compression_error() {
     let r = exchange(fe, &[], &frames);
     assert_eq!(r.goaway(), Some((1, 9)), "{:?}", r.frames);
     assert!(r.closed);
+}
+
+const WINDOW_UPDATE: u8 = 8;
+const MAX_WINDOW: u32 = (1 << 31) - 1;
+/// The initial window of both the connection and a stream.
+const INITIAL_WINDOW: u32 = 65_535;
+
+fn window_update(sid: u32, inc: u32) -> Vec<u8> {
+    frame(WINDOW_UPDATE, 0, sid, &inc.to_be_bytes())
+}
+
+#[test]
+fn window_update_overflowing_the_connection_window_is_flow_control_error() {
+    let (_ibex, fe) = start();
+    for inc in [MAX_WINDOW, MAX_WINDOW - INITIAL_WINDOW + 1] {
+        let r = exchange(fe, &[], &[window_update(0, inc)]);
+        assert_eq!(r.goaway(), Some((0, 3)), "{inc}: {:?}", r.frames);
+        assert!(r.closed, "{inc}: not closed");
+    }
+    let r = exchange(fe, &[], &[request(1), window_update(0, MAX_WINDOW)]);
+    assert_eq!(r.goaway(), Some((1, 3)), "after request 1: {:?}", r.frames);
+    assert!(r.closed, "after request 1: not closed");
+    // Up to exactly 2^31-1 is allowed.
+    let r = exchange(fe, &[], &[window_update(0, MAX_WINDOW - INITIAL_WINDOW), request(1)]);
+    assert_eq!(r.goaway(), None, "exact: {:?}", r.frames);
+    assert!(r.got_200(), "exact: {:?}", r.frames);
+}
+
+#[test]
+fn window_update_overflowing_a_stream_window_resets_that_stream_only() {
+    let (_ibex, fe) = start();
+    for inc in [MAX_WINDOW, MAX_WINDOW - INITIAL_WINDOW + 1] {
+        // Stream 1 stays open (no END_STREAM); stream 3 is a complete request.
+        let r = exchange(fe, &[], &[frame(1, END_HEADERS, 1, &head()), window_update(1, inc), request(3)]);
+        assert_eq!(r.rst(1), Some(3), "{inc}: {:?}", r.frames);
+        assert_eq!(r.goaway(), None, "{inc}: {:?}", r.frames);
+        assert!(!r.closed, "{inc}: connection closed");
+        assert!(r.frames.iter().any(|f| f.0 == 1 && f.2 == 3), "{inc}: stream 3 not answered: {:?}", r.frames);
+    }
+    let r = exchange(fe, &[], &[frame(1, END_HEADERS, 1, &head()), window_update(1, MAX_WINDOW - INITIAL_WINDOW)]);
+    assert_eq!(r.rst(1), None, "exact: {:?}", r.frames);
+    assert_eq!(r.goaway(), None, "exact: {:?}", r.frames);
 }

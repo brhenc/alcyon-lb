@@ -74,6 +74,12 @@ impl Mux for MuxPt {
         if ctx.tx_consumed >= ctx.tx_buf.len() {
             ctx.tx_buf.clear();
             ctx.tx_consumed = 0;
+        } else if ctx.tx_consumed >= 65_536 && ctx.tx_consumed >= ctx.tx_buf.len() / 2 {
+            // A peer that reads part of what waits, never all of it, would otherwise keep
+            // every byte ever sent here (T288, T297): what was read goes once it is at
+            // least half the buffer, so the bytes moved are fewer than those let go.
+            ctx.tx_buf.drain(..ctx.tx_consumed);
+            ctx.tx_consumed = 0;
         }
     }
 
@@ -87,5 +93,29 @@ impl Mux for MuxPt {
 
     fn used_streams(&self, _ctx: &Self::Ctx) -> u32 {
         1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A peer that reads part of the output, never all, must not make the buffer keep what
+    /// it has read (the T288 defect of `mux_h2`, found again in this mux by T297).
+    #[test]
+    fn output_read_in_part_does_not_keep_what_was_read() {
+        let mux = MuxPt;
+        let mut ctx = mux.init(ConnId(1), false).expect("init");
+        for k in 0..20_000u32 {
+            let byte = u8::try_from(k % 251).unwrap();
+            ctx.tx_buf.extend_from_slice(&[byte; 1000]);
+            // The peer reads all but the last 100 bytes waiting.
+            let pending = mux.pending_output(&ctx).len();
+            mux.consume_output(&mut ctx, pending - 100);
+            assert_eq!(mux.pending_output(&ctx), &[byte; 100][..], "the unread tail stays");
+        }
+        // 20 MB went through; what is kept is bounded by what waits, not by what was sent.
+        assert!(ctx.tx_buf.len() <= 262_144, "tx_buf holds {} bytes", ctx.tx_buf.len());
+        assert!(ctx.tx_buf.capacity() <= 524_288, "tx_buf capacity {} bytes", ctx.tx_buf.capacity());
     }
 }
