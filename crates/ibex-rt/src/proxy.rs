@@ -1457,7 +1457,8 @@ impl TcpSession {
         // goes out as HEADERS and its body as DATA on the request's stream
         // (`h2_forward_response`), so it is queued as a head with its framing, not as
         // an opaque run of bytes, and says nothing about `Connection`.
-        let raw = if h2 && txn.client_head { &raw[..head_len.min(raw.len())] } else { raw };
+        // The answer to a HEAD is the head alone, on either protocol (T296).
+        let raw = if txn.client_head { &raw[..head_len.min(raw.len())] } else { raw };
         let mut out;
         let raw = if announce_close && !h2 && txn.close_after && !raw.is_empty() && !has_header(&head, "connection") {
             // The client is told, as for a server's response: last in the head, as
@@ -1477,6 +1478,11 @@ impl TcpSession {
             let body = raw.len() - head_len.min(raw.len());
             let bodyless = body == 0 || matches!(txn.status, 100..=199 | 204 | 304);
             txn::MsgState::head(if bodyless { txn::Framing::None } else { txn::Framing::Length(body as u64) })
+        } else if txn.client_head {
+            // The body is not sent: the head, and the message is over, with the length the
+            // head announced for a body that is not there. Held as a body, a HEAD's reply
+            // was dropped whole (`skip_head_body`) and the client got nothing.
+            txn::MsgState::Head { left: head_len.min(raw.len()), body: txn::Framing::None }
         } else {
             txn::MsgState::Body(txn::Body::Length(raw.len() as u64))
         };
