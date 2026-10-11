@@ -53,6 +53,18 @@ fn compiles_per_request(rules: &str, path: &str, want: &str) -> (u64, u64) {
 static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn compiles_per_request_after(rules: &str, warm: (&str, &str), added: Option<&str>, (path, want): (&str, &str)) -> (u64, u64) {
+    // Any other test in this binary that builds an engine starts a new generation, which
+    // empties the caches whatever `ONE_AT_A_TIME` says (it only covers this file): the
+    // measurement is then void and is made again.
+    for _ in 0..20 {
+        if let Some(got) = measure_once(rules, warm, added, (path, want)) {
+            return got;
+        }
+    }
+    panic!("another engine was built in every one of 20 attempts");
+}
+
+fn measure_once(rules: &str, warm: (&str, &str), added: Option<&str>, (path, want): (&str, &str)) -> Option<(u64, u64)> {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let sl = TcpListener::bind("127.0.0.1:0").expect("bind");
     let sa = sl.local_addr().expect("addr");
@@ -81,6 +93,7 @@ fn compiles_per_request_after(rules: &str, warm: (&str, &str), added: Option<&st
         rules.replace("@LIST@", &list.display().to_string())
     );
     let mut e = Engine::new(&ibex_config::parse_str(&cfg).expect("parse"), 64).expect("Engine::new");
+    let generation = ibex_sample::expr::generation();
     let first = drive(fa, &mut e, warm.0);
     assert!(first.starts_with(warm.1), "warm-up request: want {:?}, got {first:?}", warm.1);
     if let Some(key) = added {
@@ -95,7 +108,7 @@ fn compiles_per_request_after(rules: &str, warm: (&str, &str), added: Option<&st
     run.store(false, Ordering::Relaxed);
     let _ = be.join();
     let _ = std::fs::remove_file(&list);
-    (p1 - p0, r1 - r0)
+    (ibex_sample::expr::generation() == generation).then_some((p1 - p0, r1 - r0))
 }
 
 #[test]

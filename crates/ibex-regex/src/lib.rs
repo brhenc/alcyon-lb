@@ -1058,4 +1058,21 @@ mod nocapture_tests {
             assert!(UserRegex::new(p).is_ok(), "{p}");
         }
     }
+
+    /// The branches of the scans that the table above does not reach: braces that are no
+    /// quantifier, a POSIX-looking class without its end, quoted group names, a valid
+    /// numbered reference.
+    #[test]
+    fn the_scans_leave_the_valid_alone_and_read_every_name_form() {
+        assert!(pcre2_refusal("a{2x}").is_none());
+        assert!(pcre2_refusal("a{1,x}").is_none());
+        assert!(pcre2_refusal("[[:alpha]").is_none());
+        assert!(pcre2_refusal("(?'n'a)(?'m'b)").is_none());
+        assert_eq!(pcre2_refusal("(?'n'a)(?'n'b)").and_then(|e| e.offset()), Some(12));
+        assert_eq!(pcre2_refusal("(?P<n>a)(?P<n>b)").and_then(|e| e.offset()), Some(14));
+        assert_eq!(missing_group_offset(r"(?'n'a)\2", true), Some(9));
+        assert_eq!(missing_group_offset(r"(?P<n>a)\2", true), Some(10));
+        assert_eq!(missing_group_offset(r"(a)\1", false), None);
+        assert_eq!(missing_group_offset(r"(a)\1(?(1)b)", false), None);
+    }
 }
