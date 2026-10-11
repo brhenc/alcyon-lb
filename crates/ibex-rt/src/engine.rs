@@ -1916,6 +1916,12 @@ pub struct Engine {
     global_bufsize: usize,
     /// Global `tune.maxrewrite` value, stored per-engine for the same reason.
     global_maxrewrite: usize,
+    /// `tune.maxaccept`: how many connections one listener wakeup accepts in a row before
+    /// the pass goes on to its other work (`listener_accept`: `for (; max_accept;
+    /// max_accept--)`); the rest of the backlog is found by the next pass, the listener
+    /// being polled level-triggered. `u32::MAX` is no limit (`-1`, and the default:
+    /// `docs/differences.md`).
+    maxaccept: u32,
     /// Global HTTP/2 flood mitigation configuration.
     pub global_h2_flood_config: ibex_proto::H2FloodConfig,
     /// Shared idle backend connection pool across sessions (`http-reuse`).
@@ -3890,6 +3896,12 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 .as_ref()
                 .and_then(|g| g.maxrewrite)
                 .unwrap_or(1024),
+            maxaccept: config
+                .global
+                .as_ref()
+                .and_then(|g| g.maxaccept)
+                .filter(|&n| n > 0)
+                .map_or(u32::MAX, |n| n.unsigned_abs()),
             global_h2_flood_config: ibex_proto::H2FloodConfig {
                 // HAProxy's `h2c_max_concurrent_streams`: the frontend value when not 0,
                 // else the global one (default 100, and 0 when set to 0).
@@ -4489,7 +4501,10 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     if self.scheduler.is_heavy(task) {
                         let kind = self.scheduler.tasks.get(task).kind;
                         let done = kind.kind() != Some(Kind::Stream)
-                            || self.sessions.get(kind.index()).is_none_or(|e| !e.sess.cli_tls_handshaking());
+                            || self
+                                .sessions
+                                .get(kind.index())
+                                .is_none_or(|e| !e.sess.cli_tls_handshaking() && !e.sess.srv_tls_handshaking());
                         if done {
                             self.scheduler.set_heavy(task, false);
                         }
@@ -4554,6 +4569,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             now,
             timer_updates,
             wake_queue: Vec::new(),
+            heavy: Vec::new(),
             h2_spawn: Vec::new(),
             log_targets: &self.log_targets,
             log_tag: &self.log_tag,
@@ -4571,6 +4587,11 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         for &(task_ref, expiry) in &dispatcher.timer_updates {
             if self.scheduler.is_live(task_ref) {
                 self.scheduler.queue_timer(task_ref, expiry);
+            }
+        }
+        for &task_ref in &dispatcher.heavy {
+            if self.scheduler.is_live(task_ref) {
+                self.scheduler.set_heavy(task_ref, true);
             }
         }
         let h2_spawn = std::mem::take(&mut dispatcher.h2_spawn);
@@ -4649,7 +4670,13 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
 
     /// Accepts on the first CLI socket (`which` is `None`) or on the `which`th further one.
     fn accept_from_cli_listener(&mut self, which: Option<usize>) {
+        // `tune.maxaccept` applies to a stats socket as to any listener (`bind_conf->maxaccept`).
+        let mut left = self.maxaccept;
         loop {
+            if left == 0 {
+                return;
+            }
+            left -= 1;
             if self.applets.live() >= self.cli_maxconn {
                 self.set_cli_listening(false);
                 return;
@@ -4751,7 +4778,10 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         // checking `full()` and then counting would overshoot it by up to one each. The
         // connection's slot is then `admit_connection`'s to release if it refuses it.
         // The frontend's `maxconn` slot is taken the same way (`ConnLimit::try_inc`).
-        while self.listeners[l_idx].maxconn.try_inc() {
+        // `tune.maxaccept` reaches the data path here: at most that many accepts per wakeup.
+        let mut left = self.maxaccept;
+        while left > 0 && self.listeners[l_idx].maxconn.try_inc() {
+            left -= 1;
             if !crate::globalconn::try_acquire() {
                 self.listeners[l_idx].maxconn.dec();
                 break;
@@ -6849,6 +6879,10 @@ struct EngineDispatcher<'a> {
     now: Tick,
     timer_updates: Vec<(TaskRef, Tick)>,
     wake_queue: Vec<TaskRef>,
+    /// Streams whose server connection is in its TLS handshake after this pass: marked
+    /// heavy after it, one per pass from then on, as the client side is at admission
+    /// (T283; `ssl_sock_init` sets `TASK_HEAVY` for a server connection too). T295.
+    heavy: Vec<TaskRef>,
     /// HTTP/2 connections (owner entry, task) with a stream to dispatch to an entry of its
     /// own: tasks are made after the pass, not during it (T280).
     h2_spawn: Vec<(u32, TaskRef)>,
@@ -8870,6 +8904,12 @@ impl EngineDispatcher<'_> {
             if !entry.sess.is_done() {
                 self.timer_updates
                     .push((entry.task, entry.sess.next_expiry()));
+                // A server TLS handshake started (or still runs) in this step: its next
+                // wakeups go to `Heavy`. Cleared in `step` once it is done, as the
+                // client's.
+                if entry.sess.srv_tls_handshaking() {
+                    self.heavy.push(entry.task);
+                }
             }
 
             (entry.sess.is_done(), pending_admin, log_line)

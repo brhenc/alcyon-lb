@@ -214,6 +214,21 @@ pub(crate) fn parse_global_directive(
             }
             Ok(())
         }
+        "tune.maxaccept" => {
+            // `cfgparse-global.c`: `atol`, so `abc` is 0 (the default); only a value over
+            // INT_MAX is refused (`max < -1` is commented out there); a second one is a
+            // warning ("already specified. Continuing.") and the first stays.
+            let Some(v) = tokens.get(1).filter(|t| !t.text.is_empty()) else {
+                return Err(ConfigError::new(kw.line, kw.col, "'tune.maxaccept' expects an integer argument"));
+            };
+            let Ok(n) = i32::try_from(super::server_keywords::atol(&v.text)) else {
+                return Err(ConfigError::new(kw.line, kw.col, "'tune.maxaccept' expects -1 or an integer from 0 to INT_MAX."));
+            };
+            if global.maxaccept.is_none() {
+                global.maxaccept = Some(n);
+            }
+            Ok(())
+        }
         "tune.maxrewrite" => {
             if tokens.len() < 2 {
                 return Err(ConfigError::new(kw.line, kw.col, "'tune.maxrewrite' expects an integer argument."));
