@@ -2382,14 +2382,13 @@ impl TcpSession {
         match self.srv_state {
             ScState::Init if self.mode == Mode::Http => Ok(false),
             ScState::Init => {
-                // 1.0: while idle, give up if the client is gone and has left nothing
-                // behind. Connecting to a server for a client that has already
-                // vanished is pure waste, and under a connection flood it is the
-                // difference between absorbing the flood and amplifying it.
-                let cli_done = matches!(
-                    self.cli_state,
-                    ScState::Closed | ScState::Error | ScState::ShutW
-                ) || (self.cli_state == ScState::ShutR && self.req.is_empty());
+                // While idle, give up if the client is gone. A client that only shut its
+                // sending side (`ShutR` here) with nothing to forward still gets its first
+                // connect: `HAProxy` forwards the close and relays a server that speaks
+                // first (measured on 3.5-dev8, T305 item 6), as Ibex's own connect at
+                // accept does. Only its retries are dropped (`--`, one retry counted).
+                let cli_done = matches!(self.cli_state, ScState::Closed | ScState::Error | ScState::ShutW)
+                    || (self.cli_state == ScState::ShutR && self.req.is_empty() && self.conn_retries < self.max_retries);
                 if cli_done {
                     self.srv_state = ScState::Closed;
                     return Ok(true);

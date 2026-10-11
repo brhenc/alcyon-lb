@@ -76,7 +76,8 @@ impl Backend {
         let seen: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&seen);
         thread::spawn(move || {
-            for _ in 0..conns {
+            let mut left = conns;
+            while left > 0 {
                 let Ok((mut c, _)) = listener.accept() else {
                     return;
                 };
@@ -96,6 +97,12 @@ impl Backend {
                         Ok(_) | Err(_) => break,
                     }
                 }
+                // The readiness probe connects and closes without a byte; the proxy
+                // connects to the server for it all the same (as `HAProxy` does).
+                if buf.is_empty() {
+                    continue;
+                }
+                left -= 1;
                 let _ = c.write_all(reply);
                 let _ = c.flush();
                 sink.lock().expect("backend lock").push(buf);
@@ -113,13 +120,16 @@ impl Backend {
         let seen: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&seen);
         thread::spawn(move || {
-            for _ in 0..conns {
+            let mut left = conns;
+            while left > 0 {
                 let Ok((mut c, _)) = listener.accept() else {
                     return;
                 };
                 c.set_read_timeout(Some(Duration::from_secs(10))).ok();
                 let mut tmp = [0u8; 4096];
-                if let Ok(n) = c.read(&mut tmp) {
+                // An empty connection is the readiness probe: not counted.
+                if let Ok(n @ 1..) = c.read(&mut tmp) {
+                    left -= 1;
                     sink.lock().expect("backend lock").push(tmp[..n].to_vec());
                     let _ = c.write_all(b"ok");
                     let _ = c.flush();
