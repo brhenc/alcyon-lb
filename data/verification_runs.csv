@@ -1,0 +1,43 @@
+start,method,commit,duration_min,new_findings,note
+2026-10-10 22:14,vv-soak,4c0554b,56,0,"soak chunk 1 on d13-test; no leak, 0 panics. Ibex only (HAProxy binary dangling)"
+2026-10-10 23:12,vv-soak,b11c30f,56,0,"soak chunk 2 on d13-test; no leak, 0 panics. "
+2026-10-11 00:09,vv-soak,b11c30f,56,0,"soak chunk 3 on d13-test; no leak, 0 panics. "
+2026-10-11 01:06,vv-soak,73a849b,56,0,"soak chunk 4 on d13-test; no leak, 0 panics. "
+2026-10-11 02:11,vv-soak,78e94aa,56,0,"soak chunk 5 on d13-test; no leak, 0 panics. first with TLS/h2 traffic"
+2026-10-11 03:08,vv-soak,974efed,56,0,"soak chunk 6 on d13-test; no leak, 0 panics. TLS/h2"
+2026-10-11 04:05,vv-soak,243289e,56,0,"soak chunk 7 on d13-test; no leak, 0 panics. TLS/h2"
+2026-10-11 05:02,vv-soak,a526af8,56,0,"soak chunk 8 on d13-test; no leak, 0 panics. TLS/h2"
+2026-10-10 21:52,vv-battery,a65fedf,20,0,"9 scenarios 60 s, devtest7, 9/9 no worse than HAProxy"
+2026-10-11 00:16,vv-battery,73a849b,24,0,11/11 no worse than HAProxy
+2026-10-11 02:58,vv-battery,974efed,9,0,h2 subset 4/4
+2026-10-11 04:42,vv-battery,4f203dc,25,0,11/11
+2026-10-11 08:56,vv-battery,73b9175,9,0,"subset 4/4 (slowloris, slow_post, hdr_storm, churn)"
+2026-10-11 09:11,vv-battery,9ffb1b3,18,0,"A/B x2 vs a526af8, slow_post + churn; no RSS increase"
+2026-10-10 21:58,fuzz-libfuzzer,4c0554b,40,VV-3,"check_reply crashed at ~20 min; 5 other targets clean (check_ldap_mysql, cli, cookie, syslog, h2_mux)"
+2026-10-10 22:48,fuzz-libfuzzer,98efa34,40,0,"round 2, 9 targets (config, h1_request, h1_response, h2_frames, hpack, regex, sample_expr, logfmt, proxy_protocol)"
+2026-10-10 22:53,fuzz-libfuzzer,b11c30f,40,0,"check_reply fixed target, 1.0e6 execs"
+2026-10-10 23:31,fuzz-libfuzzer,7a1afc3,60,0,"regex_match (new T277 target), 4.2e6 execs"
+2026-10-11 03:31,fuzz-libfuzzer,20a830d,40,0,"8 targets, no crash"
+2026-10-10 22:20,vv-probe,4c0554b,40,VV-1;VV-2,chunked-body differential + backend view
+2026-10-10 22:40,vv-probe,4ccfb17,,0,retries vs misbehaving backends 22/22
+2026-10-10 22:41,vv-probe,4ccfb17,,VV-5,idle h2c small scale
+2026-10-10 22:50,vv-probe,4ccfb17,,0,stats/CLI socket under load
+2026-10-10 23:10,vv-probe,cf96a0d,,0,VV-1/VV-2 request side re-verify
+2026-10-10 23:00,vv-probe,7a1afc3,,0,VV-3 re-verify
+2026-10-10 23:20,vv-probe,b11c30f,28,0,"production-review follow-up, 20/20 non-h2 items fixed"
+2026-10-10 23:34,vv-probe,b11c30f,3,0,reg-test board 118 -> 118
+2026-10-11 00:50,vv-probe,73a849b,,VV-6,blog-config differential 38/39
+2026-10-11 01:20,vv-probe,73a849b,,VV-7,TLS front differential
+2026-10-11 02:10,vv-probe,73a849b,,0,"node kill/restart under load, both 100%"
+2026-10-11 02:30,vv-probe,53b4bcb,,0,VV-1/2/3 re-verify
+2026-10-11 03:30,vv-probe,20a830d,,0,VV-2 fully fixed; backend_view 16/16
+2026-10-11 04:25,vv-probe,eaae66c,,0,T281 items 3-4 re-verify
+2026-10-11 04:40,vv-probe,4f203dc,,0,"VV-7 PASS, regression set clean"
+2026-10-11 09:00,vv-probe,73b9175,,VV-8,edge.py 40/40 NEW==OLD; VV-8 found on the way (ts approx)
+2026-10-11 10:00,vv-probe,375dbbc,,0,VV-8 re-verify
+2026-10-11 11:10,vv-probe,d4022cf,20,0,VV-8 + J2 re-verify PASS; minor leftovers T286
+2026-10-10 22:55,redteam,4ccfb17,,MY-2,"protocol-spam battery chunks 1-2 (results 20261010-225508/230456); MY-1,MY-3 also from these runs; ts approx"
+2026-10-11 04:30,redteam,2e5aa1b,,0,MY-2 re-verified (results 20261011-043012)
+2026-10-11 09:25,redteam,9ffb1b3,,0,"scorecard baseline rows (results 092514, 095017)"
+2026-10-11 11:09,redteam,d4022cf,33,0,"pair 9ffb1b3 vs d4022cf, HTTP/1 rows; h1_range -54% attacker responses (single run, rerun pending)"
+2026-10-11 11:00,fuzz-differential,f974340,,FZ-1;FZ-2;FZ-3;FZ-4;FZ-5;FZ-6;FZ-7,"e2e.py, 2545-case --soak; ts approx"
