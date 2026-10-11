@@ -47,6 +47,7 @@ mod check_stats_columns;
 mod check_status_word;
 mod check_verdicts;
 mod chunk_extensions;
+mod http_reject_silent_drop;
 mod chunked_body_errors;
 mod cli_answer_delivery;
 mod cli_batch_coverage;

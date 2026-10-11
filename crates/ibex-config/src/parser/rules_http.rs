@@ -50,6 +50,11 @@ fn set_status_reason(tokens: &[Token], what: &str) -> Result<Option<String>, Con
 }
 
 fn expect_cond_at(tokens: &[Token], at: usize, act_token: &Token) -> Result<Option<AclCondition>, ConfigError> {
+    expect_cond_in("http-request", tokens, at, act_token)
+}
+
+/// [`expect_cond_at`] for the rule list `list` (`http-request`, `http-response`).
+fn expect_cond_in(list: &str, tokens: &[Token], at: usize, act_token: &Token) -> Result<Option<AclCondition>, ConfigError> {
     match tokens.get(at) {
         None => Ok(None),
         Some(t) if t.text == "if" || t.text == "unless" => parse_acl_condition_from_tokens(&tokens[at..]),
@@ -57,10 +62,19 @@ fn expect_cond_at(tokens: &[Token], at: usize, act_token: &Token) -> Result<Opti
             t.line,
             t.col,
             format!(
-                "'http-request {}' expects either 'if' or 'unless' followed by a condition but found '{}'",
+                "'{list} {}' expects either 'if' or 'unless' followed by a condition but found '{}'",
                 act_token.text, t.text
             ),
         )),
+    }
+}
+
+/// `silent-drop rst-ttl <ttl>` sends the RST with that TTL; Ibex always uses a TTL of 1 and
+/// does not take the argument, so it is refused rather than accepted and ignored.
+fn refuse_rst_ttl(list: &str, tokens: &[Token]) -> Result<(), ConfigError> {
+    match tokens.get(2) {
+        Some(t) if t.text == "rst-ttl" => Err(ConfigError::new(t.line, t.col, format!("'{list} silent-drop rst-ttl' is not implemented"))),
+        _ => Ok(()),
     }
 }
 
@@ -906,6 +920,13 @@ fn parse_http_req_rule_at(
             cond,
             line: 0,
         });
+    } else if act_str == "reject" {
+        let cond = expect_cond_at(tokens, 2, act_token)?;
+        rules.push(HttpReqRule { action: HttpReqAction::Reject, cond, line: 0 });
+    } else if act_str == "silent-drop" {
+        refuse_rst_ttl("http-request", tokens)?;
+        let cond = expect_cond_at(tokens, 2, act_token)?;
+        rules.push(HttpReqRule { action: HttpReqAction::SilentDrop, cond, line: 0 });
     } else if act_str == "wait-for-body" {
         let (time, at_least, cond) = parse_wait_for_body(tokens, "http-request", act_token)?;
         rules.push(HttpReqRule { action: HttpReqAction::WaitForBody { time_ms: Some(time), at_least }, cond, line: 0 });
@@ -1141,6 +1162,14 @@ fn parse_http_res_rule_at(
                 name: "\0strict-mode".to_string(),
                 fmt: if on { "on".into() } else { "off".into() },
             },
+            cond,
+            line: 0,
+        });
+    } else if act_str == "silent-drop" {
+        refuse_rst_ttl("http-response", tokens)?;
+        let cond = expect_cond_in("http-response", tokens, 2, act_token)?;
+        rules.push(HttpResRule {
+            action: HttpResAction::SetHeader { name: "\0silent-drop".to_string(), fmt: String::new() },
             cond,
             line: 0,
         });

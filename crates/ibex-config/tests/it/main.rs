@@ -29,6 +29,7 @@ mod h2_max_concurrent_streams;
 mod global_sections;
 mod gpc_array_actions;
 mod http_codes;
+mod http_reject_silent_drop;
 mod http_rule_keywords;
 mod if_conditions;
 mod if_error_position;

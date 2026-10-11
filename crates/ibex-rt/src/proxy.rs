@@ -356,6 +356,9 @@ pub struct H2Child {
     /// The `RST_STREAM` the owner sends when the stream is let go with its connection
     /// kept: `CANCEL` for a stream whose `timeout client` ran out (T300).
     pub rst: Option<ibex_proto::h2::H2Error>,
+    /// The `GOAWAY` the owner sends with that `RST_STREAM`: `http-request reject`'s, which
+    /// ends the connection's usefulness while the other streams finish.
+    pub goaway: Option<ibex_proto::h2::H2Error>,
     pub tls: Option<Arc<ibex_tls::RustlsTlsInfo>>,
     /// The connection's session variables as the stream got them: what it changed of them
     /// goes back to the connection, and only that, as other streams may have set others.
@@ -694,6 +697,23 @@ impl TcpSession {
         }
     }
 
+    /// `http-request reject` (`silent` false) and `silent-drop` on a request, with no
+    /// response. On HTTP/1 `reject` is a close with a FIN (the caller closes) and
+    /// `silent-drop` the connection vanishing; on a stream of an HTTP/2 connection,
+    /// measured on `HAProxy` 3.5-dev8, `reject` resets the stream with `ENHANCE_YOUR_CALM`
+    /// and sends a `GOAWAY` with the same code, `silent-drop` only resets the stream
+    /// (`REFUSED_STREAM`) and the connection goes on.
+    pub fn refuse_request(&mut self, silent: bool, is_ipv6: bool) {
+        use ibex_proto::h2::H2Error;
+        if let Some(c) = self.h2_child_mut() {
+            c.rst = Some(if silent { H2Error::RefusedStream } else { H2Error::EnhanceYourCalm });
+            c.goaway = (!silent).then_some(H2Error::EnhanceYourCalm);
+            c.finished = true;
+        } else if silent {
+            self.silent_drop_client(is_ipv6);
+        }
+    }
+
     /// Shuts both directions of the client connection; a stream's, through its owner.
     pub fn shutdown_both_client(&mut self) {
         match self.cli.fd() {
@@ -769,6 +789,7 @@ impl TcpSession {
             conn_end: None,
             owner_tx_pending: false,
             rst: None,
+            goaway: None,
             tls,
             sess_vars_at_start: owner.sess_vars.clone(),
         })));
