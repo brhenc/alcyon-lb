@@ -76,6 +76,11 @@ path = "tests/h2_per_request_work.rs"
 name = "h3_relay_streams"
 path = "tests/h3_relay_streams.rs"
 
+# Own process: counts the test process's allocations (#[global_allocator])
+[[test]]
+name = "h2_held_streams_memory"
+path = "tests/h2_held_streams_memory.rs"
+
 # Own process: counts the test process's allocations (#[global_allocator]) and RSS
 [[test]]
 name = "idle_conn_memory"
