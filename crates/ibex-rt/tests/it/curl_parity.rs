@@ -169,7 +169,7 @@ fn spawn_ibex_proxy(
                         if let Ok(srv) = TcpStream::connect(backend_addr) {
                             let mut sess = TcpSession::new(cli_fd, Timeouts::default(), 3, now);
                             let srv_owned = owned(srv);
-                            let cli_raw = sess.cli.as_raw_fd();
+                            let cli_raw = sess.cli_fd().as_raw_fd();
                             let srv_raw = srv_owned.as_raw_fd();
 
                             sess.attach_server(srv_owned, now);
@@ -191,7 +191,7 @@ fn spawn_ibex_proxy(
                             if let Some(s) = &sessions[slot] {
                                 let (cli_w, srv_w) = s.interests();
                                 let _ = poller.add(
-                                    s.cli.as_fd(),
+                                    s.cli_fd(),
                                     u64::try_from(cli_raw).expect("u64"),
                                     cli_w.read,
                                     cli_w.write,
@@ -218,11 +218,11 @@ fn spawn_ibex_proxy(
             for slot_opt in &mut sessions {
                 if let Some(sess) = slot_opt {
                     let _ = sess.process(now);
-                    let cli_raw = sess.cli.as_raw_fd();
+                    let cli_raw = sess.cli_fd().as_raw_fd();
                     let srv_raw = sess.srv.as_ref().map(AsRawFd::as_raw_fd);
 
                     if sess.is_done() {
-                        let _ = poller.delete(sess.cli.as_fd());
+                        let _ = poller.delete(sess.cli_fd());
                         fd_to_sess.remove(&cli_raw);
                         if let Some(sfd) = &sess.srv {
                             let _ = poller.delete(sfd.as_fd());
@@ -234,7 +234,7 @@ fn spawn_ibex_proxy(
                     } else {
                         let (cli_w, srv_w) = sess.interests();
                         let _ = poller.modify(
-                            sess.cli.as_fd(),
+                            sess.cli_fd(),
                             u64::try_from(cli_raw).expect("u64"),
                             cli_w.read,
                             cli_w.write,

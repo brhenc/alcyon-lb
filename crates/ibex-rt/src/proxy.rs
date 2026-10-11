@@ -37,7 +37,7 @@ use ibex_stick_table::StickKey;
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::time::Instant;
 
 /// Why a connection that was to carry a PROXY header did not get one past the parser:
@@ -222,7 +222,10 @@ impl Drop for QueueWait {
 /// One TCP / HTTP session: two connections, two buffers, two state machines.
 #[allow(clippy::struct_excessive_bools)]
 pub struct TcpSession {
-    pub cli: OwnedFd,
+    /// The client's socket. Outside this module it is reached through `cli_fd` only, so
+    /// that a session without a socket of its own (an HTTP/2 stream served by its own
+    /// entry, T280) changes one place.
+    cli: OwnedFd,
     /// Which HTTP parser validates this connection's request heads.
     ///
     /// A `ParserKind` rather than a `Box<dyn HttpStream>`: it is `Copy`, so the session
@@ -386,13 +389,9 @@ pub struct TcpSession {
     pub h2_ctx: Option<Box<H2MuxContext>>,
     /// The first GOAWAY of an HTTP/2 `timeout client` has gone: the next expiry closes.
     pub h2_idle_goaway: bool,
-    pub h2_active_stream_id: Option<u32>,
-    /// How much of the active HTTP/2 stream's request body has been written to `req`.
-    pub h2_body: H2ReqBody,
-    /// The head forwarded for the HTTP/2 request in flight has to carry `transfer-encoding:
-    /// chunked` (no length was given); it is added when the head is written, not in the HTX
-    /// the rules see.
-    pub h2_chunk_out: bool,
+    /// The HTTP/2 stream being served, from its dispatch to `reset_for_next_request`:
+    /// boxed, as most sessions are not HTTP/2 (T280).
+    pub h2_stream: Option<Box<H2ActiveStream>>,
     pub h2_flood_config: ibex_proto::H2FloodConfig,
     pub is_first_req: bool,
     /// The client's reset was reported with the first bytes of its request, before any
@@ -407,6 +406,17 @@ pub struct TcpSession {
     /// request, over TLS, logged as `HTTP/3.0` with the URI `HAProxy` builds from
     /// `:scheme` and `:authority`.
     pub h3: bool,
+}
+
+/// The HTTP/2 stream a session is serving: its id, how much of its request body has been
+/// written to `req`, and whether the head forwarded for it has to carry
+/// `transfer-encoding: chunked` (no length was given; it is added when the head is written,
+/// not in the HTX the rules see).
+#[derive(Clone, Copy, Debug)]
+pub struct H2ActiveStream {
+    pub id: u32,
+    pub body: H2ReqBody,
+    pub chunk_out: bool,
 }
 
 /// Where the body of an HTTP/2 request has got to on its way into `req`: the next block of
@@ -428,123 +438,14 @@ pub struct H2ReqBody {
     pub credited: u64,
 }
 
-/// What `%U` counts of an HTTP/2 request's head (`HAProxy`'s HTX: 20 bytes for the start
-/// line, its three strings -- the target is `scheme://authority` and the path when the
-/// request had both -- and each header's name and value, then the end of the headers).
-fn h2_head_size(msg: &ibex_proto::htx::Htx, abs_prefix: Option<&str>) -> u64 {
-    let Some(r) = msg.req_line() else { return 0 };
-    let mut size = 20 + (r.method.as_str().len() + abs_prefix.map_or(0, str::len) + r.uri.len() + "HTTP/2.0".len()) as u64 + 1;
-    for h in msg.headers() {
-        size += (h.name.len() + h.value.len()) as u64;
-    }
-    size
-}
-
-/// Writes what has come of an HTTP/2 request's body into `req`, as much as there is room
-/// for: each DATA frame as it is, or as a chunk when the request has no length, and the
-/// end as the last chunk. True if anything was written. A DATA block written out whole
-/// is released: the stream holds only what is still to go (T195's 50 MB upload was held
-/// until the stream ended).
-fn pump_h2_body(msg: &mut ibex_proto::htx::Htx, st: &mut H2ReqBody, req: &mut Buf) -> bool {
-    let blocks = msg.blocks_mut();
-    let mut wrote = false;
-    while !st.done && st.cursor < blocks.len() {
-        match &blocks[st.cursor] {
-            HtxBlock::Data(d) | HtxBlock::RawData(d) => {
-                let rest = &d[st.off.min(d.len())..];
-                if rest.is_empty() {
-                    st.cursor += 1;
-                    st.off = 0;
-                    continue;
-                }
-                // A chunk's size line takes at most 8 bytes, with its two CRLFs.
-                let framing = if st.chunked { 12 } else { 0 };
-                let room = req.writable();
-                if room.len() <= framing {
-                    break;
-                }
-                let n = rest.len().min(room.len() - framing);
-                let at = if st.chunked {
-                    let size = format!("{n:x}\r\n");
-                    room[..size.len()].copy_from_slice(size.as_bytes());
-                    size.len()
-                } else {
-                    0
-                };
-                room[at..at + n].copy_from_slice(&rest[..n]);
-                let mut len = at + n;
-                if st.chunked {
-                    room[len..len + 2].copy_from_slice(b"\r\n");
-                    len += 2;
-                }
-                req.commit(len);
-                wrote = true;
-                st.off += n;
-                st.consumed += n as u64;
-                if st.off >= d.len() {
-                    if let HtxBlock::Data(d) | HtxBlock::RawData(d) = &mut blocks[st.cursor] {
-                        *d = Vec::new();
-                    }
-                    st.cursor += 1;
-                    st.off = 0;
-                }
-            }
-            HtxBlock::Trailer(h) => {
-                // Trailers can follow only a chunked body: with a length they are dropped.
-                if st.chunked {
-                    let mut line = Vec::with_capacity(h.name.len() + h.value.len() + 7);
-                    if !st.trailing {
-                        line.extend_from_slice(b"0\r\n");
-                    }
-                    line.extend_from_slice(h.name.as_bytes());
-                    line.extend_from_slice(b": ");
-                    line.extend_from_slice(h.value.as_bytes());
-                    line.extend_from_slice(b"\r\n");
-                    let room = req.writable();
-                    if room.len() < line.len() {
-                        break;
-                    }
-                    room[..line.len()].copy_from_slice(&line);
-                    req.commit(line.len());
-                    wrote = true;
-                    st.trailing = true;
-                }
-                // Dropped or forwarded, `HAProxy` counts them.
-                st.trailer_bytes += (h.name.len() + h.value.len()) as u64;
-                st.cursor += 1;
-            }
-            HtxBlock::Eot => {
-                if st.chunked && st.trailing {
-                    let room = req.writable();
-                    if room.len() < 2 {
-                        break;
-                    }
-                    room[..2].copy_from_slice(b"\r\n");
-                    req.commit(2);
-                    wrote = true;
-                }
-                st.trailer_bytes += 1;
-                st.cursor += 1;
-            }
-            HtxBlock::Eom => {
-                if st.chunked && !st.trailing {
-                    let room = req.writable();
-                    if room.len() < 5 {
-                        break;
-                    }
-                    room[..5].copy_from_slice(b"0\r\n\r\n");
-                    req.commit(5);
-                    wrote = true;
-                }
-                st.done = true;
-            }
-            _ => st.cursor += 1,
-        }
-    }
-    wrote
-}
-
 impl TcpSession {
+    /// The client's socket.
+    #[must_use]
+    #[inline]
+    pub fn cli_fd(&self) -> BorrowedFd<'_> {
+        self.cli.as_fd()
+    }
+
     #[must_use]
     pub fn new(cli: OwnedFd, timeouts: Timeouts, retries: u16, now: Tick) -> Self {
         Self::new_with_mode(
@@ -657,9 +558,7 @@ impl TcpSession {
             stick_stores: Vec::new(),
             h2_ctx: None,
             h2_idle_goaway: false,
-            h2_active_stream_id: None,
-            h2_body: H2ReqBody::default(),
-            h2_chunk_out: false,
+            h2_stream: None,
             h2_flood_config: ibex_proto::H2FloodConfig::default(),
             is_first_req: true,
             reset_with_request: false,
@@ -765,7 +664,7 @@ impl TcpSession {
     /// session requeue itself on every pass, a busy loop as long as the server took (T186).
     #[must_use]
     pub fn has_undispatched_h2_streams(&self) -> bool {
-        if self.h2_active_stream_id.is_some() || self.txn.is_some() {
+        if self.h2_stream.is_some() || self.txn.is_some() {
             return false;
         }
         if let Some(ref h2) = self.h2_ctx {
@@ -1170,9 +1069,7 @@ impl TcpSession {
         if let Some(h2) = self.h2_ctx.as_mut() {
             h2.streams.retain(|_, s| !matches!(s.state, ibex_proto::H2StreamState::Closed | ibex_proto::H2StreamState::Reset(_)));
         }
-        self.h2_active_stream_id = None;
-        self.h2_body = H2ReqBody::default();
-        self.h2_chunk_out = false;
+        self.h2_stream = None;
         self.req_vars.clear();
         if let Some(set) = self.timeouts_set.take() {
             self.timeouts = set.before;
@@ -1566,121 +1463,29 @@ impl TcpSession {
             }
         }
 
+        // The next stream with its whole request head, once the last one is over.
+        if (self.cli_state == ScState::Ready || self.cli_state == ScState::Established)
+            && self.h2_stream.is_none()
+            && self.req_headers.is_none()
+            && !self.has_htx
+            && self.req.is_empty()
+        {
+            let keep = self.keep_request_line;
+            if let Some(d) = self.h2_ctx.as_deref_mut().and_then(|h2| crate::h2_bridge::dispatch_next(h2, keep)) {
+                crate::h2_bridge::start_request(self, d);
+                changed = true;
+            }
+        }
         if let Some(ref mut h2) = self.h2_ctx {
-            // Check if any stream has arrived with a complete request
-            if (self.cli_state == ScState::Ready || self.cli_state == ScState::Established)
-                && self.h2_active_stream_id.is_none()
-                && self.req_headers.is_none()
-                && !self.has_htx
-                && self.req.is_empty()
-            {
-                if let Some(&stream_id) = h2.streams.keys().find(|&&id| {
-                        if let Some(st) = h2.streams.get(&id) {
-                            !st.dispatched
-                                && st.state != ibex_proto::H2StreamState::Closed
-                                && !matches!(st.state, ibex_proto::H2StreamState::Reset(_))
-                                && st.rx_htx.blocks().iter().any(|b| matches!(b, HtxBlock::Eoh))
-                        } else {
-                            false
-                        }
-                    }) {
-                        self.h2_active_stream_id = Some(stream_id);
-                        if let Some(stream) = h2.streams.get_mut(&stream_id) {
-                            stream.dispatched = true;
-                            // The head goes to the server as HTTP/1.1, and the body follows
-                            // as the DATA frames come (`pump_h2_body`): with the length the
-                            // client gave, else chunked, as `HAProxy` writes it.
-                            let has_data = stream.rx_htx.blocks().iter().any(|b| matches!(b, HtxBlock::Data(_) | HtxBlock::RawData(_) | HtxBlock::Trailer(_)));
-                            let chunked = stream.rx_htx.get_header("content-length").is_none() && (has_data || !stream.rx_htx.is_eom());
-                            let first_body = stream.rx_htx.blocks().iter().position(|b| matches!(b, HtxBlock::Eoh)).map_or(stream.rx_htx.blocks().len(), |i| i + 1);
-                            self.h2_body = H2ReqBody { cursor: first_body, off: 0, chunked, ..H2ReqBody::default() };
-                            // `%U`, and the line `%r` prints, are those of the message the
-                            // client sent: `transfer-encoding: chunked` is added on output only,
-                            // so the rules do not see it either (only the forwarded head has it).
-                            // The chunked end the forwarded body is counted with (+1 when it is
-                            // consumed) is not in `HAProxy`'s message unless trailers precede it.
-                            let req_htx = h2_head_size(&stream.rx_htx, stream.abs_prefix.as_deref()).saturating_sub(u64::from(chunked));
-                            if self.keep_request_line {
-                                self.log.request_line = stream.rx_htx.req_line().map(|r| {
-                                    format!("{} {}{} HTTP/2.0", r.method.as_str(), stream.abs_prefix.as_deref().unwrap_or(""), r.uri)
-                                });
-                            }
-                            self.log.request = Some(std::time::Instant::now());
-                            let full_req = stream.rx_htx.to_h1_wire();
-                            let head_only = find_eoh(&full_req).map_or(&full_req[..], |(h, e)| &full_req[..h + e]);
-                            let wire_req_buf: Vec<u8>;
-                            let wire_req: &[u8] = if chunked {
-                                let at = find_eoh(head_only).map_or(head_only.len(), |(h, _)| h);
-                                let mut v = head_only[..at].to_vec();
-                                v.extend_from_slice(b"\r\ntransfer-encoding: chunked");
-                                v.extend_from_slice(&head_only[at..]);
-                                wire_req_buf = v;
-                                &wire_req_buf
-                            } else {
-                                head_only
-                            };
-                            self.h2_chunk_out = chunked;
-                            if let Ok(parser) = ibex_proto::parser::build(ibex_proto::parser::ParserKind::H1) {
-                                let mut p_stream = parser.stream(false);
-                                let raw = self.htx_buf.raw_slice_mut();
-                                let mut slice = ibex_proto::htx::HtxSlice::new(raw);
-                                if p_stream.parse(head_only, &mut slice).is_ok() {
-                                    self.htx_tail = slice.tail_addr();
-                                    self.htx_blocks = slice.num_blocks();
-                                    self.has_htx = true;
-                                    self.htx_modified = false;
-                                }
-                            }
-                            self.req_method = stream.rx_htx.req_line().map(|r| r.method.as_str().to_string());
-                            self.req_uri = stream.rx_htx.req_line().map(|r| r.uri.clone());
-                            self.req_headers = Some(
-                                stream.rx_htx.headers().map(|h| (h.name.clone(), h.value.clone())).collect(),
-                            );
-                            self.req.clear();
-                            let w = self.req.writable();
-                            let n = wire_req.len().min(w.len());
-                            w[..n].copy_from_slice(&wire_req[..n]);
-                            self.req.commit(n);
-                            let framing = find_eoh(wire_req)
-                                .map_or(txn::Framing::None, |(h, e)| txn::request_framing(&wire_req[..h + e]));
-                            let mut txn = HttpTxn::new(framing, false);
-                            txn.req_htx = Some(req_htx);
-                            self.txn = Some(txn);
-                            self.cli_state = ScState::Established;
-                            changed = true;
-                        }
-                    }
+            // The DATA frames of the request being served that have come since.
+            if let Some(active) = self.h2_stream.as_deref_mut() {
+                let (moved, trailers) = crate::h2_bridge::pump_request_body(h2, active, &mut self.req);
+                changed |= moved;
+                // What the trailers add to `%U`.
+                if let Some(t) = self.txn.as_mut().and_then(|t| t.req_htx.as_mut()) {
+                    *t += trailers;
                 }
-                // The DATA frames of the request being served that have come since.
-                if let Some(stream) = self.h2_active_stream_id.and_then(|id| h2.streams.get_mut(&id)) {
-                    let before = self.h2_body.trailer_bytes;
-                    let taken = self.h2_body.consumed;
-                    if pump_h2_body(&mut stream.rx_htx, &mut self.h2_body, &mut self.req) {
-                        changed = true;
-                    }
-                    let taken = usize::try_from(self.h2_body.consumed - taken).unwrap_or(usize::MAX);
-                    if taken > 0 {
-                        let id = stream.id;
-                        h2.rx_taken(id, taken);
-                        h2.resume();
-                    }
-                    // The client may send as much again as has moved on towards the server:
-                    // a backed-up server stops the grants, and so the client.
-                    let pending = self.h2_body.consumed - self.h2_body.credited;
-                    if pending >= 16384 && !self.h2_body.done {
-                        if let Some(id) = self.h2_active_stream_id {
-                            self.h2_body.credited += pending;
-                            h2.send_window_update(id, pending as u32);
-                            changed = true;
-                        }
-                    }
-                    // What the trailers add to `%U`.
-                    let added = self.h2_body.trailer_bytes - before;
-                    if let Some(t) = self.txn.as_mut().and_then(|t| t.req_htx.as_mut()) {
-                        *t += added;
-                    }
-                }
-
+            }
             // Flush pending frames to client socket
             let pending = h2.tx_buf.len() - h2.tx_consumed;
             if pending > 0 {
@@ -2858,7 +2663,8 @@ fn h3_log_line(line: &str, host: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{h3_log_line, pump_h2_body, H2ReqBody};
+    use super::{h3_log_line, H2ReqBody};
+    use crate::h2_bridge::pump_h2_body;
     use crate::buf::Buf;
     use ibex_proto::htx::{Htx, HtxBlock};
 
@@ -2933,7 +2739,7 @@ mod tests {
         let mut s = super::TcpSession::new_with_mode(cli.into(), super::Mode::Http, Vec::new(), Vec::new(), super::Timeouts::default(), 0, ibex_sched::Tick(1000));
         s.cli_cant_recv = false;
         s.process(ibex_sched::Tick(1000)).expect("process");
-        assert_eq!(s.h2_active_stream_id, Some(1), "the request is dispatched");
+        assert_eq!(s.h2_stream.as_ref().map(|a| a.id), Some(1), "the request is dispatched");
         s.txn.as_mut().expect("txn").req_rules_done = true;
 
         // The body, as the mux would have stored it from DATA frames: more than 16 passes
@@ -2967,13 +2773,13 @@ mod tests {
         // it asks to be. It must not be left with body held and nothing to wake it.
         for run in 0..1000 {
             s.process(ibex_sched::Tick(1000)).expect("process");
-            if s.h2_body.done && s.req.is_empty() {
+            if s.h2_stream.as_ref().expect("served").body.done && s.req.is_empty() {
                 break;
             }
             let woken = !s.req.is_empty() || s.wants_rerun();
-            assert!(woken, "run {run}: {} body bytes moved on, the rest held with nothing to run the session again", s.h2_body.consumed);
+            assert!(woken, "run {run}: {} body bytes moved on, the rest held with nothing to run the session again", s.h2_stream.as_ref().expect("served").body.consumed);
         }
-        assert!(s.h2_body.done, "the body was moved on whole");
+        assert!(s.h2_stream.as_ref().expect("served").body.done, "the body was moved on whole");
         drop(s);
         assert!(reader.join().expect("reader") > body_len, "the server got the head and the body");
     }

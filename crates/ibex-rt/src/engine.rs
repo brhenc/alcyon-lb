@@ -5046,7 +5046,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
     fn linger_close_sessions(&mut self) {
         use std::os::fd::AsFd;
         for (_, e) in self.sessions.iter_mut() {
-            raw::shutdown_write(e.sess.cli.as_fd());
+            raw::shutdown_write(e.sess.cli_fd());
             if let Some(srv) = e.sess.srv.as_ref() {
                 raw::shutdown_write(srv.as_fd());
             }
@@ -5057,7 +5057,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         loop {
             let mut pending = 0usize;
             for (_, e) in self.sessions.iter_mut() {
-                for fd in std::iter::once(e.sess.cli.as_fd()).chain(e.sess.srv.as_ref().map(|s| s.as_fd())) {
+                for fd in std::iter::once(e.sess.cli_fd()).chain(e.sess.srv.as_ref().map(|s| s.as_fd())) {
                     if done.contains(&std::os::fd::AsRawFd::as_raw_fd(&fd)) {
                         continue;
                     }
@@ -5242,10 +5242,10 @@ fn run_deferred_session_rules(proxy_idx: usize, proxies: &[Proxy], sess: &mut Tc
     sess.session_rules_pending = false;
     match eval_tcp_req_session_rules(&proxies[proxy_idx], proxies, sample_registry(), sess) {
         SessionEvalOutcome::Accept => return,
-        SessionEvalOutcome::Reject => raw::abort_with_rst(sess.cli.as_fd()),
+        SessionEvalOutcome::Reject => raw::abort_with_rst(sess.cli_fd()),
         SessionEvalOutcome::SilentDrop => {
             let is_ipv6 = sess.fc_src.or(sess.client_addr).is_some_and(|a| a.is_ipv6());
-            raw::silent_drop(sess.cli.as_fd(), is_ipv6);
+            raw::silent_drop(sess.cli_fd(), is_ipv6);
         }
     }
     proxies[proxy_idx].counters().denied_req.fetch_add(1, Ordering::Relaxed);
@@ -6228,7 +6228,7 @@ fn register_new_session(
             cli_interest,
         );
         let _ = engine.poller.add(
-            entry.sess.cli.as_fd(),
+            entry.sess.cli_fd(),
             raw_fd_to_u64(cli_raw_fd),
             cli_interest.readable,
             cli_interest.writable,
@@ -6421,7 +6421,7 @@ fn init_client_session(
         // expecting TLS -- the same downgrade `bind_tls` refuses to start with, arriving
         // one connection at a time instead of all at once. Closing is visible; serving
         // cleartext is not.
-        match crate::xprt::accept_tls(&sess.cli, Arc::clone(cfg)) {
+        match crate::xprt::accept_tls(&sess.cli_fd(), Arc::clone(cfg)) {
             Ok(xprt) => sess.cli_xprt = xprt,
             Err(e) => {
                 eprintln!(
@@ -6454,13 +6454,13 @@ fn init_client_session(
     match session_rules {
         SessionEvalOutcome::Accept => {}
         SessionEvalOutcome::Reject => {
-            raw::abort_with_rst(sess.cli.as_fd());
+            raw::abort_with_rst(sess.cli_fd());
             proxies[proxy_idx].counters().denied_req.fetch_add(1, Ordering::Relaxed);
             return None;
         }
         SessionEvalOutcome::SilentDrop => {
             let is_ipv6 = peer_addr.is_ipv6();
-            raw::silent_drop(sess.cli.as_fd(), is_ipv6);
+            raw::silent_drop(sess.cli_fd(), is_ipv6);
             proxies[proxy_idx].counters().denied_req.fetch_add(1, Ordering::Relaxed);
             return None;
         }
@@ -6556,7 +6556,7 @@ pub fn shutdown_session_entry(
 ) {
     entry.sess.cli_state = ScState::Closed;
     entry.sess.srv_state = ScState::Closed;
-    raw::shutdown_both(entry.sess.cli.as_fd());
+    raw::shutdown_both(entry.sess.cli_fd());
     if let Some(ref srv) = entry.sess.srv {
         raw::shutdown_both(srv.as_fd());
     }
@@ -6902,7 +6902,7 @@ fn close_http_session(
     }
     release_server(entry, proxies, fdtab, poller, idle_pool, reusable);
     if matches!(entry.sess.cli_state, ScState::Ready | ScState::Established | ScState::ShutR) {
-        raw::shutdown_write(entry.sess.cli.as_fd());
+        raw::shutdown_write(entry.sess.cli_fd());
     }
     entry.sess.txn = None;
     entry.sess.cli_state = ScState::Closed;
@@ -7260,7 +7260,7 @@ fn update_interests(entry: &mut SessionEntry, fdtab: &mut FdTab, poller: &mut Po
     };
     if new_cli_interest != entry.cli_interest {
         let _ = poller.modify(
-            entry.sess.cli.as_fd(),
+            entry.sess.cli_fd(),
             raw_fd_to_u64(entry.cli_raw_fd),
             new_cli_interest.readable,
             new_cli_interest.writable,
@@ -7296,7 +7296,7 @@ fn cleanup_done(
     poller: &mut Poller,
     listeners: &mut [Listener],
 ) {
-    let _ = poller.delete(entry.sess.cli.as_fd());
+    let _ = poller.delete(entry.sess.cli_fd());
     fdtab.remove(entry.cli_raw_fd);
 
     if let (Some(srv_fd), Some(sfd)) = (entry.sess.srv.as_ref(), entry.srv_raw_fd) {
@@ -7889,30 +7889,9 @@ impl EngineDispatcher<'_> {
         poller: &mut Poller,
         idle_pool: &mut IdlePool,
     ) -> bool {
-        if entry.sess.cli_state != ScState::ShutR {
+        if entry.sess.cli_state != ScState::ShutR || !crate::h2_bridge::abort_on_client_left(&mut entry.sess) {
             return false;
         }
-        // A request still coming is cut short by the caller; a reply of the proxy's own, a
-        // response all in, or one already ending have nothing to abort.
-        let Some(txn) = entry
-            .sess
-            .txn
-            .as_ref()
-            .filter(|t| t.req.is_done() && !(t.local || t.aborted || t.req == MsgState::Tunnel || t.rsp.is_done()))
-        else {
-            return false;
-        };
-        let waiting = txn.rsp == MsgState::Waiting;
-        if let Some(srv) = entry.sess.srv.as_ref() {
-            raw::abort_with_rst(srv.as_fd());
-        }
-        if waiting {
-            entry.sess.log.status = Some(400);
-            entry.sess.log.term = Some(*b"CH");
-        } else {
-            entry.sess.log.term = Some(*b"CD");
-        }
-        entry.sess.rep.clear();
         close_http_session(entry, proxies, fdtab, poller, idle_pool, false);
         true
     }
@@ -7987,38 +7966,10 @@ impl EngineDispatcher<'_> {
         pid: u32,
     ) -> bool {
         let sess = &mut entry.sess;
-        let (Some(h2), Some(id), Some(txn)) = (sess.h2_ctx.as_ref(), sess.h2_active_stream_id, sess.txn.as_mut()) else {
-            return false;
-        };
-        if !h2.streams.get(&id).is_some_and(|s| matches!(s.state, ibex_proto::h2::H2StreamState::Reset(_))) {
+        let reset = sess.h2_ctx.as_deref().zip(sess.h2_stream.as_deref()).is_some_and(|(h2, a)| crate::h2_bridge::stream_is_reset(h2, a.id));
+        if !reset || !crate::h2_bridge::abort_reset_stream(sess) {
             return false;
         }
-        let response_done = txn.rsp.is_done();
-        let waiting = txn.rsp == MsgState::Waiting;
-        txn.srv_reusable = false;
-        txn.rsp = MsgState::Done;
-        if !response_done {
-            // `SC_FL_NOLINGER`: closed by `end_txn` below, the server connection is reset.
-            if let Some(srv) = sess.srv.as_ref() {
-                raw::abort_with_rst(srv.as_fd());
-            }
-            if sess.queue.take().is_some() {
-                sess.log.queue.get_or_insert_with(Instant::now);
-                sess.log.term = Some(*b"CQ");
-            } else if txn.local {
-                // A reply of the proxy's own keeps the status and ending it was given.
-            } else if waiting {
-                sess.log.status = Some(400);
-                sess.log.term = Some(*b"CH");
-            } else {
-                sess.log.term = Some(*b"CD");
-            }
-        }
-        // Nothing more of the response goes to the client, nor of the request to the
-        // server: what is left of either would be taken for the next stream's.
-        sess.rep.clear();
-        sess.req.clear();
-        sess.srv_state = ScState::Closed;
         Self::end_txn(entry, proxies, fdtab, poller, idle_pool, wake_queue, now, pid);
         true
     }
@@ -8131,76 +8082,14 @@ impl EngineDispatcher<'_> {
     /// its own transaction (design 010 step 5).
     fn h2_forward_response(entry: &mut SessionEntry) {
         let sess = &mut entry.sess;
-        let (Some(h2), Some(txn)) = (sess.h2_ctx.as_mut(), sess.txn.as_mut()) else {
+        let (Some(h2), Some(txn)) = (sess.h2_ctx.as_deref_mut(), sess.txn.as_mut()) else {
             return;
         };
-        if txn.rsp == MsgState::Waiting || txn.rsp.is_done() {
-            return;
-        }
-        let data = sess.rep.readable();
-        let win = txn.rsp.window(data);
-        if txn.rsp_interim {
-            // An HTTP/1 interim response has no place in this conversion; it is dropped.
-            txn.response_sent(data, win);
-            sess.rep.consume(win);
-            return;
-        }
-        let stream_id = sess.h2_active_stream_id.unwrap_or(1);
-        if let MsgState::Head { body, .. } = txn.rsp {
-            // The head goes out as HEADERS once all of it is here; the body follows as
-            // DATA, as much as the client's windows take at a time.
-            let Some((h, e)) = crate::proxy::find_eoh(data) else { return };
-            let end_stream = matches!(body, crate::txn::Framing::None | crate::txn::Framing::Length(0));
-            if h2.send_h1_head(stream_id, &data[..h], end_stream) {
-                txn.rsp.consume(data, h + e);
-                sess.rep.consume(h + e);
-                // The body that came with the head goes out with it, in the same write: on
-                // its own, a poller round later, it is a second write, and a second small
-                // segment Nagle holds until the client's delayed ACK, ~40 ms a request (T186).
-                if !end_stream {
-                    Self::h2_forward_response(entry);
-                }
-            }
-            return;
-        }
-        if !matches!(txn.rsp, MsgState::Body(_)) {
-            // A body that broke its framing, or a tunnel (101, CONNECT), which this
-            // conversion does not carry: the stream is reset and the server is let go.
-            h2.send_rst_stream(stream_id, ibex_proto::h2::H2Error::InternalError);
-            txn.srv_reusable = false;
-            txn.rsp = MsgState::Done;
-            return;
-        }
-        let mut out = Vec::new();
-        let mut state = txn.rsp;
-        let used = state.take_body(data, h2.data_budget(stream_id), &mut out);
-        let end = state.is_done();
-        if let Some(t) = txn.rsp_htx.as_mut() {
-            // The payload, and the chunked body's end (see `htx_head_size`).
-            *t += out.len() as u64 + u64::from(end && matches!(txn.rsp, MsgState::Body(crate::txn::Body::Chunked(_))));
-        }
-        if !out.is_empty() || end {
-            h2.send_data(stream_id, &out, end);
-        }
-        if used > 0 || end {
-            txn.rsp = state;
-            sess.rep.consume(used);
-        }
+        let stream_id = sess.h2_stream.as_ref().map_or(1, |a| a.id);
         let srv_gone = matches!(sess.srv_state, ScState::ShutR | ScState::Closed | ScState::Error);
-        if txn.rsp.is_done() || !srv_gone || !sess.rep.is_empty() {
-            return;
-        }
-        // The server is gone and everything it sent has been delivered.
-        txn.srv_reusable = false;
-        if matches!(txn.rsp, MsgState::Body(crate::txn::Body::UntilClose)) {
-            // The close is the end of this body.
-            h2.send_data(stream_id, &[], true);
-        } else {
-            // Cut short: the stream cannot be completed, so it is reset.
-            h2.send_rst_stream(stream_id, ibex_proto::h2::H2Error::Cancel);
+        if crate::h2_bridge::forward_response(h2, stream_id, txn, &mut sess.rep, srv_gone) {
             sess.log.term = Some(*b"SD");
         }
-        txn.rsp = MsgState::Done;
     }
 
     /// The transaction is over: both messages complete and the response delivered.
@@ -8364,7 +8253,7 @@ impl EngineDispatcher<'_> {
                     self.fdtab.clear_ready(sfd, true, false);
                 }
             }
-            let cfd = entry.sess.cli.as_raw_fd();
+            let cfd = entry.sess.cli_fd().as_raw_fd();
             if self.fdtab.ready(cfd).readable {
                 entry.sess.cli_cant_recv = false;
                 self.fdtab.clear_ready(cfd, true, false);
@@ -8445,7 +8334,7 @@ impl EngineDispatcher<'_> {
                         entry.sess.arm_request(now);
                     }
                     ContentEvalResult::Reject => {
-                        raw::abort_with_rst(entry.sess.cli.as_fd());
+                        raw::abort_with_rst(entry.sess.cli_fd());
                         self.proxies[proxy_idx].counters().denied_req.fetch_add(1, Ordering::Relaxed);
                         entry.sess.cli_state = ScState::Closed;
                         entry.sess.srv_state = ScState::Closed;
@@ -8453,7 +8342,7 @@ impl EngineDispatcher<'_> {
                     }
                     ContentEvalResult::SilentDrop => {
                         let is_ipv6 = entry.sess.client_addr.is_some_and(|a| a.is_ipv6());
-                        raw::silent_drop(entry.sess.cli.as_fd(), is_ipv6);
+                        raw::silent_drop(entry.sess.cli_fd(), is_ipv6);
                         self.proxies[proxy_idx].counters().denied_req.fetch_add(1, Ordering::Relaxed);
                         entry.sess.cli_state = ScState::Closed;
                         entry.sess.srv_state = ScState::Closed;
@@ -8490,7 +8379,7 @@ impl EngineDispatcher<'_> {
                     }
                     ContentEvalResult::SilentDrop => {
                         let is_ipv6 = entry.sess.client_addr.is_some_and(|a| a.is_ipv6());
-                        raw::silent_drop(entry.sess.cli.as_fd(), is_ipv6);
+                        raw::silent_drop(entry.sess.cli_fd(), is_ipv6);
                         if let Some(srv_fd) = entry.sess.srv.as_ref() {
                             raw::abort_with_rst(srv_fd.as_fd());
                         }
@@ -10388,7 +10277,7 @@ impl EngineDispatcher<'_> {
             }
             match res {
                 ContentEvalResult::Reject => {
-                    raw::abort_with_rst(entry.sess.cli.as_fd());
+                    raw::abort_with_rst(entry.sess.cli_fd());
                     proxies[be_idx].counters().denied_req.fetch_add(1, Ordering::Relaxed);
                     entry.sess.cli_state = ScState::Closed;
                     entry.sess.srv_state = ScState::Closed;
@@ -10396,7 +10285,7 @@ impl EngineDispatcher<'_> {
                 }
                 ContentEvalResult::SilentDrop => {
                     let is_ipv6 = entry.sess.client_addr.is_some_and(|a| a.is_ipv6());
-                    raw::silent_drop(entry.sess.cli.as_fd(), is_ipv6);
+                    raw::silent_drop(entry.sess.cli_fd(), is_ipv6);
                     proxies[be_idx].counters().denied_req.fetch_add(1, Ordering::Relaxed);
                     entry.sess.cli_state = ScState::Closed;
                     entry.sess.srv_state = ScState::Closed;
@@ -10807,7 +10696,7 @@ impl EngineDispatcher<'_> {
             entry.sess.inspect_exp = None;
             match res {
                 ContentEvalResult::Reject => {
-                    raw::abort_with_rst(entry.sess.cli.as_fd());
+                    raw::abort_with_rst(entry.sess.cli_fd());
                     proxies[be_idx].counters().denied_req.fetch_add(1, Ordering::Relaxed);
                     entry.sess.cli_state = ScState::Closed;
                     entry.sess.srv_state = ScState::Closed;
@@ -10815,7 +10704,7 @@ impl EngineDispatcher<'_> {
                 }
                 ContentEvalResult::SilentDrop => {
                     let is_ipv6 = entry.sess.client_addr.is_some_and(|a| a.is_ipv6());
-                    raw::silent_drop(entry.sess.cli.as_fd(), is_ipv6);
+                    raw::silent_drop(entry.sess.cli_fd(), is_ipv6);
                     proxies[be_idx].counters().denied_req.fetch_add(1, Ordering::Relaxed);
                     entry.sess.cli_state = ScState::Closed;
                     entry.sess.srv_state = ScState::Closed;
@@ -11969,16 +11858,13 @@ fn rebuild_req_buffer(sess: &mut TcpSession) {
         return;
     };
     if let Some(htx) = sess.htx_slice() {
-        if sess.h2_chunk_out {
+        if sess.h2_stream.as_ref().is_some_and(|a| a.chunk_out) {
             let mut wire = htx.write_h1_wire_vec();
             // An HTTP/2 request without a length goes out chunked: the header is written with
             // the head, after the rules, which never saw it.
             if !wire.is_empty() {
                 if let Some((h, _)) = crate::proxy::find_eoh(&wire) {
-                    let mut v = wire[..h].to_vec();
-                    v.extend_from_slice(b"\r\ntransfer-encoding: chunked");
-                    v.extend_from_slice(&wire[h..]);
-                    wire = v;
+                    wire = crate::h2_bridge::chunked_head(&wire, h);
                 }
             }
             sess.req.replace_prefix(hdr_len + eoh_len, &wire);
@@ -13137,6 +13023,24 @@ mod rate_ctr_tests {
         assert_eq!(r.rate_at(5000), 0);
         r.tick_at(9000);
         assert_eq!(r.rate_at(9000), 1, "the quiet spell dropped both windows");
+    }
+
+    /// An event taken back (a TLS handshake that failed) leaves the current window, then the
+    /// previous one when the current is empty, and never goes below nothing.
+    #[test]
+    fn an_event_taken_back_leaves_the_window_it_was_counted_in() {
+        let r = RateCtr::default();
+        r.untick();
+        assert_eq!(r.rate_at(1000), 0, "nothing to take back");
+        for _ in 0..4 {
+            r.tick_at(1000);
+        }
+        r.tick_at(2500);
+        assert_eq!(r.rate_at(2500), 5);
+        r.untick();
+        assert_eq!(r.rate_at(2500), 4, "the new window's event");
+        r.untick();
+        assert_eq!(r.rate_at(2500), 3, "the new window is empty: one of the previous window's");
     }
 }
 

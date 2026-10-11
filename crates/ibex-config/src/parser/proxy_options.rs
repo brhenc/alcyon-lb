@@ -241,12 +241,6 @@ pub(crate) fn check_option(section: OptSection, tokens: &[Token], kw: &Token) ->
         super::warn::push(kw.line, crate::ast::global::WarnStyle::Spaced, &format!("{why}."));
         return Ok(false);
     }
-    if name == "accept-invalid-http-response" {
-        eprintln!(
-            "[ibex] warning: option '{name}' is deprecated. please use 'option \
-             accept-unsafe-violations-in-http-response' if absolutely needed."
-        );
-    }
     if IMPLEMENTED.contains(&name) {
         return Ok(true);
     }
