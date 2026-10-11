@@ -191,6 +191,11 @@ pub struct GlobalSection {
     pub extra_stats_sockets: Vec<StatsSocket>,
     /// Maximum rewrite size in bytes.
     pub maxrewrite: Option<usize>,
+    /// `tune.maxaccept`: how many connections one listener wakeup accepts in a row before
+    /// the thread goes back to its other work; `-1` (any negative) is no limit, `0` the
+    /// default (`HAProxy`'s `MAX_ACCEPT`, 4; Ibex: no limit, `docs/differences.md`). The
+    /// first one set stays (`HAProxy` warns on a second and continues).
+    pub maxaccept: Option<i32>,
     /// `tune.idle-pool.shared off`: each worker takes only the idle server connections it
     /// released itself (the default, `on` or `full`, lets it take another worker's).
     pub idle_pool_unshared: bool,

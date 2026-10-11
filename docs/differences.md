@@ -219,3 +219,13 @@ Measured on HAProxy 3.5-dev8-885761-29; pinned in `crates/ibex-rt/tests/tls_hand
   alone. Ibex follows the same rule (a whole handshake record read, then a FIN in a read of its
   own, not queued behind the data at `MSG_PEEK` time) and so can differ from HAProxy on a
   race between the two.
+
+## `tune.maxaccept`: the default is no limit (T295)
+
+`tune.maxaccept <n>` is accepted and applied: one listener wakeup accepts at most `n`
+connections in a row (`-1`: no limit; `0` or a non-number: the default, as `atol` gives
+HAProxy). HAProxy's default is `MAX_ACCEPT`, 4, after which its thread goes on to its other
+work and the connections left in the backlog wait for the next poll. Ibex's default is no
+limit: its listener is polled level-triggered and an accept loop drains the backlog it finds,
+which is what every measurement so far was made with. Set `tune.maxaccept 4` to get
+HAProxy's behaviour.

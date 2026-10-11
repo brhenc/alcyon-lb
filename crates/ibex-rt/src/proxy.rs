@@ -807,6 +807,12 @@ impl TcpSession {
         matches!(&self.cli_xprt, ClientXprt::Tls(t) if !t.handshake_done())
     }
 
+    /// Whether the server connection is TLS and its handshake is not done yet.
+    #[must_use]
+    pub fn srv_tls_handshaking(&self) -> bool {
+        matches!(&self.srv_xprt, ServerXprt::Tls(t) if !t.handshake_done())
+    }
+
     /// The end of the session: whatever TLS connection is still open says `close_notify` before
     /// its socket is closed, as `HAProxy`'s `ssl_sock_shutw` does on every close, so an HTTP/2
     /// connection that ended after its GOAWAY, or a backend connection that ended, is a finished
