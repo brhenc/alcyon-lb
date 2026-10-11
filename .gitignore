@@ -103,4 +103,6 @@ fuzz/libfuzzer/Cargo.lock
 # ---------------------------------------------------------------------------
 /agy-resume.sh
 /mythos-resume.sh
+/claude-vv-resume.sh
+/claude-mythos-resume.sh
 /patches/
