@@ -12,6 +12,8 @@ pub enum TcpReqConnAction {
     TrackSc1 { expr: String, table: Option<String> },
     TrackSc2 { expr: String, table: Option<String> },
     SilentDrop,
+    /// `silent-drop rst-ttl <1-255>`: the RST is sent with that TTL (`SilentDrop` is a TTL of 1).
+    SilentDropTtl(u8),
     Reject,
     Accept,
     SetSrc { expr: String },
@@ -44,6 +46,8 @@ pub enum TcpReqSessionAction {
     SetSrcPort { expr: String },
     SetDstPort { expr: String },
     SilentDrop,
+    /// `silent-drop rst-ttl <1-255>`: the RST is sent with that TTL (`SilentDrop` is a TTL of 1).
+    SilentDropTtl(u8),
     Reject,
     Accept,
     AttachSrv { name: String },
@@ -79,6 +83,8 @@ pub enum TcpReqContentAction {
     SetSrcPort { expr: String },
     SetDstPort { expr: String },
     SilentDrop,
+    /// `silent-drop rst-ttl <1-255>`: the RST is sent with that TTL (`SilentDrop` is a TTL of 1).
+    SilentDropTtl(u8),
     Reject,
     Accept,
     SwitchModeHttp { proto: Option<String> },

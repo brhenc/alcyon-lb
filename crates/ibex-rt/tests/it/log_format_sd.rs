@@ -123,8 +123,7 @@ fn logs(r: Result<(Vec<Vec<String>>, Vec<String>), String>) -> Vec<Vec<String>> 
 
 #[test]
 fn a_served_request_carries_it_on_rfc5424_targets_only() {
-    // Two `log` lines in the frontend and two from `global`: Ibex takes at most two per
-    // section (HAProxy 3.5 takes more).
+    // Two `log` lines in the frontend and two from `global`.
     let cfg = format!(
         "global\n  log @LOG@ format rfc5424 local0\n  log @LOG@ local1\n\
          defaults\n  mode http\n{TIMEOUTS}frontend t\n  bind @B0@\n  log global\n\

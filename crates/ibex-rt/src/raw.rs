@@ -234,13 +234,13 @@ pub fn reset_pending(fd: BorrowedFd<'_>) -> bool {
     matches!(poll(&mut fds, 0), Ok(n) if n > 0) && fds[0].revents().contains(PollFlags::ERR)
 }
 
-/// Discards the connection quietly: sets TTL to 1 (so emitted RST packets expire
-/// at the first hop and do not reach the client) and linger 0.
-pub fn silent_drop(fd: BorrowedFd<'_>, is_ipv6: bool) {
+/// Discards the connection quietly: sets the TTL to `ttl` (1 unless `rst-ttl`, so emitted RST packets expire
+/// `ttl` hops away and do not reach the client) and linger 0.
+pub fn silent_drop(fd: BorrowedFd<'_>, is_ipv6: bool, ttl: u8) {
     if is_ipv6 {
-        let _ = net::sockopt::set_ipv6_unicast_hops(fd, Some(1));
+        let _ = net::sockopt::set_ipv6_unicast_hops(fd, Some(ttl));
     } else {
-        let _ = net::sockopt::set_ip_ttl(fd, 1);
+        let _ = net::sockopt::set_ip_ttl(fd, u32::from(ttl));
     }
     let _ = net::sockopt::set_socket_linger(fd, Some(std::time::Duration::ZERO));
 }

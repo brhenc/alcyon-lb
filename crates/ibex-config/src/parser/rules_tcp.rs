@@ -31,8 +31,10 @@ pub(crate) fn parse_tcp_req_connection(
             rules.push(TcpReqConnRule { action, cond });
         }
         "silent-drop" => {
-            let (_, cond) = parse_rule_condition(tokens, 3)?;
-            rules.push(TcpReqConnRule { action: TcpReqConnAction::SilentDrop, cond });
+            let ttl = parse_rst_ttl(tokens, 3)?;
+            let (_, cond) = parse_rule_condition(tokens, ttl.map_or(3, |t| t.1))?;
+            let action = ttl.map_or(TcpReqConnAction::SilentDrop, |t| TcpReqConnAction::SilentDropTtl(t.0));
+            rules.push(TcpReqConnRule { action, cond });
         }
         "reject" => {
             let (_, cond) = parse_rule_condition(tokens, 3)?;
@@ -194,8 +196,10 @@ pub(crate) fn parse_tcp_req_session(
                 rules.push(TcpReqSessionRule { action, cond });
             }
             "silent-drop" => {
-                let (_, cond) = parse_rule_condition(tokens, 3)?;
-                rules.push(TcpReqSessionRule { action: TcpReqSessionAction::SilentDrop, cond });
+                let ttl = parse_rst_ttl(tokens, 3)?;
+                let (_, cond) = parse_rule_condition(tokens, ttl.map_or(3, |t| t.1))?;
+                let action = ttl.map_or(TcpReqSessionAction::SilentDrop, |t| TcpReqSessionAction::SilentDropTtl(t.0));
+                rules.push(TcpReqSessionRule { action, cond });
             }
             "reject" => {
                 let (_, cond) = parse_rule_condition(tokens, 3)?;
@@ -371,6 +375,10 @@ fn parse_tcp_res_content_at(
             TcpReqContentAction::Accept => TcpResAction::Accept,
             TcpReqContentAction::Reject => TcpResAction::Reject,
             TcpReqContentAction::SilentDrop => TcpResAction::SilentDrop,
+            // The TTL would be dropped: refused (HAProxy takes it here too).
+            TcpReqContentAction::SilentDropTtl(_) => {
+                return Err(ConfigError::new(at.line, at.col, "'tcp-response content silent-drop rst-ttl' is not implemented"))
+            }
             TcpReqContentAction::SetVar { var_name, expr } => TcpResAction::SetVar { var_name, expr },
             TcpReqContentAction::SetVarFmt { var_name, fmt } => TcpResAction::SetVarFmt { var_name, fmt },
             TcpReqContentAction::UnsetVar { var_name } => TcpResAction::UnsetVar { var_name },
@@ -471,8 +479,10 @@ fn parse_tcp_req_content_at(
                 rules.push(TcpReqContentRule { action, cond, line: 0 });
             }
             "silent-drop" => {
-                let (_, cond) = parse_rule_condition(tokens, 3)?;
-                rules.push(TcpReqContentRule { action: TcpReqContentAction::SilentDrop, cond, line: 0 });
+                let ttl = parse_rst_ttl(tokens, 3)?;
+                let (_, cond) = parse_rule_condition(tokens, ttl.map_or(3, |t| t.1))?;
+                let action = ttl.map_or(TcpReqContentAction::SilentDrop, |t| TcpReqContentAction::SilentDropTtl(t.0));
+                rules.push(TcpReqContentRule { action, cond, line: 0 });
             }
             "reject" => {
                 let (_, cond) = parse_rule_condition(tokens, 3)?;
