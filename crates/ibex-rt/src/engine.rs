@@ -5046,7 +5046,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
     fn linger_close_sessions(&mut self) {
         use std::os::fd::AsFd;
         for (_, e) in self.sessions.iter_mut() {
-            raw::shutdown_write(e.sess.cli.as_fd());
+            raw::shutdown_write(e.sess.cli_fd());
             if let Some(srv) = e.sess.srv.as_ref() {
                 raw::shutdown_write(srv.as_fd());
             }
@@ -5057,7 +5057,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         loop {
             let mut pending = 0usize;
             for (_, e) in self.sessions.iter_mut() {
-                for fd in std::iter::once(e.sess.cli.as_fd()).chain(e.sess.srv.as_ref().map(|s| s.as_fd())) {
+                for fd in std::iter::once(e.sess.cli_fd()).chain(e.sess.srv.as_ref().map(|s| s.as_fd())) {
                     if done.contains(&std::os::fd::AsRawFd::as_raw_fd(&fd)) {
                         continue;
                     }
@@ -5242,10 +5242,10 @@ fn run_deferred_session_rules(proxy_idx: usize, proxies: &[Proxy], sess: &mut Tc
     sess.session_rules_pending = false;
     match eval_tcp_req_session_rules(&proxies[proxy_idx], proxies, sample_registry(), sess) {
         SessionEvalOutcome::Accept => return,
-        SessionEvalOutcome::Reject => raw::abort_with_rst(sess.cli.as_fd()),
+        SessionEvalOutcome::Reject => raw::abort_with_rst(sess.cli_fd()),
         SessionEvalOutcome::SilentDrop => {
             let is_ipv6 = sess.fc_src.or(sess.client_addr).is_some_and(|a| a.is_ipv6());
-            raw::silent_drop(sess.cli.as_fd(), is_ipv6);
+            raw::silent_drop(sess.cli_fd(), is_ipv6);
         }
     }
     proxies[proxy_idx].counters().denied_req.fetch_add(1, Ordering::Relaxed);
@@ -6228,7 +6228,7 @@ fn register_new_session(
             cli_interest,
         );
         let _ = engine.poller.add(
-            entry.sess.cli.as_fd(),
+            entry.sess.cli_fd(),
             raw_fd_to_u64(cli_raw_fd),
             cli_interest.readable,
             cli_interest.writable,
@@ -6421,7 +6421,7 @@ fn init_client_session(
         // expecting TLS -- the same downgrade `bind_tls` refuses to start with, arriving
         // one connection at a time instead of all at once. Closing is visible; serving
         // cleartext is not.
-        match crate::xprt::accept_tls(&sess.cli, Arc::clone(cfg)) {
+        match crate::xprt::accept_tls(&sess.cli_fd(), Arc::clone(cfg)) {
             Ok(xprt) => sess.cli_xprt = xprt,
             Err(e) => {
                 eprintln!(
@@ -6454,13 +6454,13 @@ fn init_client_session(
     match session_rules {
         SessionEvalOutcome::Accept => {}
         SessionEvalOutcome::Reject => {
-            raw::abort_with_rst(sess.cli.as_fd());
+            raw::abort_with_rst(sess.cli_fd());
             proxies[proxy_idx].counters().denied_req.fetch_add(1, Ordering::Relaxed);
             return None;
         }
         SessionEvalOutcome::SilentDrop => {
             let is_ipv6 = peer_addr.is_ipv6();
-            raw::silent_drop(sess.cli.as_fd(), is_ipv6);
+            raw::silent_drop(sess.cli_fd(), is_ipv6);
             proxies[proxy_idx].counters().denied_req.fetch_add(1, Ordering::Relaxed);
             return None;
         }
@@ -6556,7 +6556,7 @@ pub fn shutdown_session_entry(
 ) {
     entry.sess.cli_state = ScState::Closed;
     entry.sess.srv_state = ScState::Closed;
-    raw::shutdown_both(entry.sess.cli.as_fd());
+    raw::shutdown_both(entry.sess.cli_fd());
     if let Some(ref srv) = entry.sess.srv {
         raw::shutdown_both(srv.as_fd());
     }
@@ -6898,7 +6898,7 @@ fn close_http_session(
     }
     release_server(entry, proxies, fdtab, poller, idle_pool, reusable);
     if matches!(entry.sess.cli_state, ScState::Ready | ScState::Established | ScState::ShutR) {
-        raw::shutdown_write(entry.sess.cli.as_fd());
+        raw::shutdown_write(entry.sess.cli_fd());
     }
     entry.sess.txn = None;
     entry.sess.cli_state = ScState::Closed;
@@ -7256,7 +7256,7 @@ fn update_interests(entry: &mut SessionEntry, fdtab: &mut FdTab, poller: &mut Po
     };
     if new_cli_interest != entry.cli_interest {
         let _ = poller.modify(
-            entry.sess.cli.as_fd(),
+            entry.sess.cli_fd(),
             raw_fd_to_u64(entry.cli_raw_fd),
             new_cli_interest.readable,
             new_cli_interest.writable,
@@ -7292,7 +7292,7 @@ fn cleanup_done(
     poller: &mut Poller,
     listeners: &mut [Listener],
 ) {
-    let _ = poller.delete(entry.sess.cli.as_fd());
+    let _ = poller.delete(entry.sess.cli_fd());
     fdtab.remove(entry.cli_raw_fd);
 
     if let (Some(srv_fd), Some(sfd)) = (entry.sess.srv.as_ref(), entry.srv_raw_fd) {
@@ -7925,7 +7925,7 @@ impl EngineDispatcher<'_> {
         pid: u32,
     ) -> bool {
         let sess = &mut entry.sess;
-        let (Some(h2), Some(id), Some(txn)) = (sess.h2_ctx.as_ref(), sess.h2_active_stream_id, sess.txn.as_mut()) else {
+        let (Some(h2), Some(id), Some(txn)) = (sess.h2_ctx.as_ref(), sess.h2_stream.as_ref().map(|a| a.id), sess.txn.as_mut()) else {
             return false;
         };
         if !h2.streams.get(&id).is_some_and(|s| matches!(s.state, ibex_proto::h2::H2StreamState::Reset(_))) {
@@ -8069,7 +8069,7 @@ impl EngineDispatcher<'_> {
             sess.rep.consume(win);
             return;
         }
-        let stream_id = sess.h2_active_stream_id.unwrap_or(1);
+        let stream_id = sess.h2_stream.as_ref().map_or(1, |a| a.id);
         if let MsgState::Head { body, .. } = txn.rsp {
             // The head goes out as HEADERS once all of it is here; the body follows as
             // DATA, as much as the client's windows take at a time.
@@ -8288,7 +8288,7 @@ impl EngineDispatcher<'_> {
                     self.fdtab.clear_ready(sfd, true, false);
                 }
             }
-            let cfd = entry.sess.cli.as_raw_fd();
+            let cfd = entry.sess.cli_fd().as_raw_fd();
             if self.fdtab.ready(cfd).readable {
                 entry.sess.cli_cant_recv = false;
                 self.fdtab.clear_ready(cfd, true, false);
@@ -8369,7 +8369,7 @@ impl EngineDispatcher<'_> {
                         entry.sess.arm_request(now);
                     }
                     ContentEvalResult::Reject => {
-                        raw::abort_with_rst(entry.sess.cli.as_fd());
+                        raw::abort_with_rst(entry.sess.cli_fd());
                         self.proxies[proxy_idx].counters().denied_req.fetch_add(1, Ordering::Relaxed);
                         entry.sess.cli_state = ScState::Closed;
                         entry.sess.srv_state = ScState::Closed;
@@ -8377,7 +8377,7 @@ impl EngineDispatcher<'_> {
                     }
                     ContentEvalResult::SilentDrop => {
                         let is_ipv6 = entry.sess.client_addr.is_some_and(|a| a.is_ipv6());
-                        raw::silent_drop(entry.sess.cli.as_fd(), is_ipv6);
+                        raw::silent_drop(entry.sess.cli_fd(), is_ipv6);
                         self.proxies[proxy_idx].counters().denied_req.fetch_add(1, Ordering::Relaxed);
                         entry.sess.cli_state = ScState::Closed;
                         entry.sess.srv_state = ScState::Closed;
@@ -8414,7 +8414,7 @@ impl EngineDispatcher<'_> {
                     }
                     ContentEvalResult::SilentDrop => {
                         let is_ipv6 = entry.sess.client_addr.is_some_and(|a| a.is_ipv6());
-                        raw::silent_drop(entry.sess.cli.as_fd(), is_ipv6);
+                        raw::silent_drop(entry.sess.cli_fd(), is_ipv6);
                         if let Some(srv_fd) = entry.sess.srv.as_ref() {
                             raw::abort_with_rst(srv_fd.as_fd());
                         }
@@ -10288,7 +10288,7 @@ impl EngineDispatcher<'_> {
             }
             match res {
                 ContentEvalResult::Reject => {
-                    raw::abort_with_rst(entry.sess.cli.as_fd());
+                    raw::abort_with_rst(entry.sess.cli_fd());
                     proxies[be_idx].counters().denied_req.fetch_add(1, Ordering::Relaxed);
                     entry.sess.cli_state = ScState::Closed;
                     entry.sess.srv_state = ScState::Closed;
@@ -10296,7 +10296,7 @@ impl EngineDispatcher<'_> {
                 }
                 ContentEvalResult::SilentDrop => {
                     let is_ipv6 = entry.sess.client_addr.is_some_and(|a| a.is_ipv6());
-                    raw::silent_drop(entry.sess.cli.as_fd(), is_ipv6);
+                    raw::silent_drop(entry.sess.cli_fd(), is_ipv6);
                     proxies[be_idx].counters().denied_req.fetch_add(1, Ordering::Relaxed);
                     entry.sess.cli_state = ScState::Closed;
                     entry.sess.srv_state = ScState::Closed;
@@ -10707,7 +10707,7 @@ impl EngineDispatcher<'_> {
             entry.sess.inspect_exp = None;
             match res {
                 ContentEvalResult::Reject => {
-                    raw::abort_with_rst(entry.sess.cli.as_fd());
+                    raw::abort_with_rst(entry.sess.cli_fd());
                     proxies[be_idx].counters().denied_req.fetch_add(1, Ordering::Relaxed);
                     entry.sess.cli_state = ScState::Closed;
                     entry.sess.srv_state = ScState::Closed;
@@ -10715,7 +10715,7 @@ impl EngineDispatcher<'_> {
                 }
                 ContentEvalResult::SilentDrop => {
                     let is_ipv6 = entry.sess.client_addr.is_some_and(|a| a.is_ipv6());
-                    raw::silent_drop(entry.sess.cli.as_fd(), is_ipv6);
+                    raw::silent_drop(entry.sess.cli_fd(), is_ipv6);
                     proxies[be_idx].counters().denied_req.fetch_add(1, Ordering::Relaxed);
                     entry.sess.cli_state = ScState::Closed;
                     entry.sess.srv_state = ScState::Closed;
@@ -11869,7 +11869,7 @@ fn rebuild_req_buffer(sess: &mut TcpSession) {
         return;
     };
     if let Some(htx) = sess.htx_slice() {
-        if sess.h2_chunk_out {
+        if sess.h2_stream.as_ref().is_some_and(|a| a.chunk_out) {
             let mut wire = htx.write_h1_wire_vec();
             // An HTTP/2 request without a length goes out chunked: the header is written with
             // the head, after the rules, which never saw it.

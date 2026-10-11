@@ -37,7 +37,7 @@ use ibex_stick_table::StickKey;
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::time::Instant;
 
 /// Why a connection that was to carry a PROXY header did not get one past the parser:
@@ -222,7 +222,10 @@ impl Drop for QueueWait {
 /// One TCP / HTTP session: two connections, two buffers, two state machines.
 #[allow(clippy::struct_excessive_bools)]
 pub struct TcpSession {
-    pub cli: OwnedFd,
+    /// The client's socket. Outside this module it is reached through `cli_fd` only, so
+    /// that a session without a socket of its own (an HTTP/2 stream served by its own
+    /// entry, T280) changes one place.
+    cli: OwnedFd,
     /// Which HTTP parser validates this connection's request heads.
     ///
     /// A `ParserKind` rather than a `Box<dyn HttpStream>`: it is `Copy`, so the session
@@ -386,13 +389,9 @@ pub struct TcpSession {
     pub h2_ctx: Option<Box<H2MuxContext>>,
     /// The first GOAWAY of an HTTP/2 `timeout client` has gone: the next expiry closes.
     pub h2_idle_goaway: bool,
-    pub h2_active_stream_id: Option<u32>,
-    /// How much of the active HTTP/2 stream's request body has been written to `req`.
-    pub h2_body: H2ReqBody,
-    /// The head forwarded for the HTTP/2 request in flight has to carry `transfer-encoding:
-    /// chunked` (no length was given); it is added when the head is written, not in the HTX
-    /// the rules see.
-    pub h2_chunk_out: bool,
+    /// The HTTP/2 stream being served, from its dispatch to `reset_for_next_request`:
+    /// boxed, as most sessions are not HTTP/2 (T280).
+    pub h2_stream: Option<Box<H2ActiveStream>>,
     pub h2_flood_config: ibex_proto::H2FloodConfig,
     pub is_first_req: bool,
     /// The client's reset was reported with the first bytes of its request, before any
@@ -407,6 +406,17 @@ pub struct TcpSession {
     /// request, over TLS, logged as `HTTP/3.0` with the URI `HAProxy` builds from
     /// `:scheme` and `:authority`.
     pub h3: bool,
+}
+
+/// The HTTP/2 stream a session is serving: its id, how much of its request body has been
+/// written to `req`, and whether the head forwarded for it has to carry
+/// `transfer-encoding: chunked` (no length was given; it is added when the head is written,
+/// not in the HTX the rules see).
+#[derive(Clone, Copy, Debug)]
+pub struct H2ActiveStream {
+    pub id: u32,
+    pub body: H2ReqBody,
+    pub chunk_out: bool,
 }
 
 /// Where the body of an HTTP/2 request has got to on its way into `req`: the next block of
@@ -545,6 +555,13 @@ fn pump_h2_body(msg: &mut ibex_proto::htx::Htx, st: &mut H2ReqBody, req: &mut Bu
 }
 
 impl TcpSession {
+    /// The client's socket.
+    #[must_use]
+    #[inline]
+    pub fn cli_fd(&self) -> BorrowedFd<'_> {
+        self.cli.as_fd()
+    }
+
     #[must_use]
     pub fn new(cli: OwnedFd, timeouts: Timeouts, retries: u16, now: Tick) -> Self {
         Self::new_with_mode(
@@ -657,9 +674,7 @@ impl TcpSession {
             stick_stores: Vec::new(),
             h2_ctx: None,
             h2_idle_goaway: false,
-            h2_active_stream_id: None,
-            h2_body: H2ReqBody::default(),
-            h2_chunk_out: false,
+            h2_stream: None,
             h2_flood_config: ibex_proto::H2FloodConfig::default(),
             is_first_req: true,
             reset_with_request: false,
@@ -765,7 +780,7 @@ impl TcpSession {
     /// session requeue itself on every pass, a busy loop as long as the server took (T186).
     #[must_use]
     pub fn has_undispatched_h2_streams(&self) -> bool {
-        if self.h2_active_stream_id.is_some() || self.txn.is_some() {
+        if self.h2_stream.is_some() || self.txn.is_some() {
             return false;
         }
         if let Some(ref h2) = self.h2_ctx {
@@ -1168,9 +1183,7 @@ impl TcpSession {
         if let Some(h2) = self.h2_ctx.as_mut() {
             h2.streams.retain(|_, s| !matches!(s.state, ibex_proto::H2StreamState::Closed | ibex_proto::H2StreamState::Reset(_)));
         }
-        self.h2_active_stream_id = None;
-        self.h2_body = H2ReqBody::default();
-        self.h2_chunk_out = false;
+        self.h2_stream = None;
         self.req_vars.clear();
         if let Some(set) = self.timeouts_set.take() {
             self.timeouts = set.before;
@@ -1567,7 +1580,7 @@ impl TcpSession {
         if let Some(ref mut h2) = self.h2_ctx {
             // Check if any stream has arrived with a complete request
             if (self.cli_state == ScState::Ready || self.cli_state == ScState::Established)
-                && self.h2_active_stream_id.is_none()
+                && self.h2_stream.is_none()
                 && self.req_headers.is_none()
                 && !self.has_htx
                 && self.req.is_empty()
@@ -1582,7 +1595,6 @@ impl TcpSession {
                             false
                         }
                     }) {
-                        self.h2_active_stream_id = Some(stream_id);
                         if let Some(stream) = h2.streams.get_mut(&stream_id) {
                             stream.dispatched = true;
                             // The head goes to the server as HTTP/1.1, and the body follows
@@ -1591,7 +1603,11 @@ impl TcpSession {
                             let has_data = stream.rx_htx.blocks().iter().any(|b| matches!(b, HtxBlock::Data(_) | HtxBlock::RawData(_) | HtxBlock::Trailer(_)));
                             let chunked = stream.rx_htx.get_header("content-length").is_none() && (has_data || !stream.rx_htx.is_eom());
                             let first_body = stream.rx_htx.blocks().iter().position(|b| matches!(b, HtxBlock::Eoh)).map_or(stream.rx_htx.blocks().len(), |i| i + 1);
-                            self.h2_body = H2ReqBody { cursor: first_body, off: 0, chunked, ..H2ReqBody::default() };
+                            self.h2_stream = Some(Box::new(H2ActiveStream {
+                                id: stream_id,
+                                body: H2ReqBody { cursor: first_body, off: 0, chunked, ..H2ReqBody::default() },
+                                chunk_out: chunked,
+                            }));
                             // `%U`, and the line `%r` prints, are those of the message the
                             // client sent: `transfer-encoding: chunked` is added on output only,
                             // so the rules do not see it either (only the forwarded head has it).
@@ -1617,7 +1633,6 @@ impl TcpSession {
                             } else {
                                 head_only
                             };
-                            self.h2_chunk_out = chunked;
                             if let Ok(parser) = ibex_proto::parser::build(ibex_proto::parser::ParserKind::H1) {
                                 let mut p_stream = parser.stream(false);
                                 let raw = self.htx_buf.raw_slice_mut();
@@ -1650,32 +1665,33 @@ impl TcpSession {
                     }
                 }
                 // The DATA frames of the request being served that have come since.
-                if let Some(stream) = self.h2_active_stream_id.and_then(|id| h2.streams.get_mut(&id)) {
-                    let before = self.h2_body.trailer_bytes;
-                    let taken = self.h2_body.consumed;
-                    if pump_h2_body(&mut stream.rx_htx, &mut self.h2_body, &mut self.req) {
-                        changed = true;
-                    }
-                    let taken = usize::try_from(self.h2_body.consumed - taken).unwrap_or(usize::MAX);
-                    if taken > 0 {
-                        let id = stream.id;
-                        h2.rx_taken(id, taken);
-                        h2.resume();
-                    }
-                    // The client may send as much again as has moved on towards the server:
-                    // a backed-up server stops the grants, and so the client.
-                    let pending = self.h2_body.consumed - self.h2_body.credited;
-                    if pending >= 16384 && !self.h2_body.done {
-                        if let Some(id) = self.h2_active_stream_id {
-                            self.h2_body.credited += pending;
-                            h2.send_window_update(id, pending as u32);
+                if let Some(active) = self.h2_stream.as_deref_mut() {
+                    if let Some(stream) = h2.streams.get_mut(&active.id) {
+                        let body = &mut active.body;
+                        let before = body.trailer_bytes;
+                        let taken = body.consumed;
+                        if pump_h2_body(&mut stream.rx_htx, body, &mut self.req) {
                             changed = true;
                         }
-                    }
-                    // What the trailers add to `%U`.
-                    let added = self.h2_body.trailer_bytes - before;
-                    if let Some(t) = self.txn.as_mut().and_then(|t| t.req_htx.as_mut()) {
-                        *t += added;
+                        let taken = usize::try_from(body.consumed - taken).unwrap_or(usize::MAX);
+                        if taken > 0 {
+                            let id = stream.id;
+                            h2.rx_taken(id, taken);
+                            h2.resume();
+                        }
+                        // The client may send as much again as has moved on towards the server:
+                        // a backed-up server stops the grants, and so the client.
+                        let pending = body.consumed - body.credited;
+                        if pending >= 16384 && !body.done {
+                            body.credited += pending;
+                            h2.send_window_update(active.id, pending as u32);
+                            changed = true;
+                        }
+                        // What the trailers add to `%U`.
+                        let added = body.trailer_bytes - before;
+                        if let Some(t) = self.txn.as_mut().and_then(|t| t.req_htx.as_mut()) {
+                            *t += added;
+                        }
                     }
                 }
 
@@ -2917,7 +2933,7 @@ mod tests {
         let mut s = super::TcpSession::new_with_mode(cli.into(), super::Mode::Http, Vec::new(), Vec::new(), super::Timeouts::default(), 0, ibex_sched::Tick(1000));
         s.cli_cant_recv = false;
         s.process(ibex_sched::Tick(1000)).expect("process");
-        assert_eq!(s.h2_active_stream_id, Some(1), "the request is dispatched");
+        assert_eq!(s.h2_stream.as_ref().map(|a| a.id), Some(1), "the request is dispatched");
         s.txn.as_mut().expect("txn").req_rules_done = true;
 
         // The body, as the mux would have stored it from DATA frames: more than 16 passes
@@ -2951,13 +2967,13 @@ mod tests {
         // it asks to be. It must not be left with body held and nothing to wake it.
         for run in 0..1000 {
             s.process(ibex_sched::Tick(1000)).expect("process");
-            if s.h2_body.done && s.req.is_empty() {
+            if s.h2_stream.as_ref().expect("served").body.done && s.req.is_empty() {
                 break;
             }
             let woken = !s.req.is_empty() || s.wants_rerun();
-            assert!(woken, "run {run}: {} body bytes moved on, the rest held with nothing to run the session again", s.h2_body.consumed);
+            assert!(woken, "run {run}: {} body bytes moved on, the rest held with nothing to run the session again", s.h2_stream.as_ref().expect("served").body.consumed);
         }
-        assert!(s.h2_body.done, "the body was moved on whole");
+        assert!(s.h2_stream.as_ref().expect("served").body.done, "the body was moved on whole");
         drop(s);
         assert!(reader.join().expect("reader") > body_len, "the server got the head and the body");
     }
