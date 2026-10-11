@@ -349,6 +349,9 @@ impl H1Parser {
     }
 
     fn parse_start_line(&mut self, input: &[u8], htx: &mut HtxSlice<'_>) -> io::Result<usize> {
+        if !self.is_response {
+            return self.parse_request_line(input, htx);
+        }
         let Some((line_end, delim_len)) = self.find_line_end(input) else {
             return Ok(0);
         };
@@ -357,15 +360,9 @@ impl H1Parser {
             io::Error::new(io::ErrorKind::InvalidData, "Invalid UTF-8 in start line")
         })?;
 
-        if self.is_response {
-            let (version, status, reason) = parse_response_line_borrowed(line_str)?;
-            htx.push_res_line(version, status, reason)
-                .map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
-        } else {
-            let (method, uri, version) = parse_request_line_borrowed(line_str)?;
-            htx.push_req_line(method, uri, version)
-                .map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
-        }
+        let (version, status, reason) = parse_response_line_borrowed(line_str)?;
+        htx.push_res_line(version, status, reason)
+            .map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
 
         self.prev_delim_len = delim_len;
         // A line ended by LF alone goes to the server ended by CRLF, as HAProxy writes the
@@ -374,6 +371,32 @@ impl H1Parser {
         self.head_rewritten |= delim_len == 1;
         self.phase = H1Phase::Headers;
         Ok(line_end + delim_len)
+    }
+
+    /// A request line, read byte by byte as `HAProxy` reads it ([`scan_request_line`]).
+    /// The HTX keeps the parts as received, the version too; a line that is not written to
+    /// the server as it came (blanks, a version from 1.1 up but `HTTP/1.1`, a bare LF) has
+    /// the head forwarded from the HTX.
+    fn parse_request_line(&mut self, input: &[u8], htx: &mut HtxSlice<'_>) -> io::Result<usize> {
+        let span = match scan_request_line(input, self.accept_unsafe_request) {
+            ReqLineScan::Incomplete => return Ok(0),
+            ReqLineScan::Invalid => {
+                self.phase = H1Phase::Error;
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid request line"));
+            }
+            ReqLineScan::Complete(span) => span,
+        };
+        let text = |r: std::ops::Range<usize>| {
+            std::str::from_utf8(&input[r]).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid UTF-8 in start line"))
+        };
+        let (method, uri, version) = (text(span.method)?, text(span.uri)?, text(span.version)?);
+        check_request_target(method, uri)?;
+        htx.push_req_line(method, uri, version)
+            .map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
+        self.prev_delim_len = span.eol_len;
+        self.head_rewritten |= span.eol_len == 1 || !span.canonical;
+        self.phase = H1Phase::Headers;
+        Ok(span.eol + span.eol_len)
     }
 
     fn parse_headers(&mut self, input: &[u8], htx: &mut HtxSlice<'_>) -> io::Result<usize> {
@@ -680,7 +703,7 @@ impl H1Parser {
         // The start line, read once: what follows edits headers only.
         let req_line = htx.req_line().map(|r| (r.version, ["GET", "HEAD", "DELETE"].contains(&r.method), r.method.eq_ignore_ascii_case("CONNECT")));
         let res_version = htx.res_line().map(|r| r.version);
-        let is_http11 = req_line.map_or(res_version == Some("HTTP/1.1"), |(v, ..)| v == "HTTP/1.1");
+        let is_http11 = req_line.map_or(res_version == Some("HTTP/1.1"), |(v, ..)| version_is_11(v.as_bytes()));
         let is_http10 = req_line.is_some_and(|(v, ..)| v == "HTTP/1.0") || res_version == Some("HTTP/1.0");
         let (bodiless_method, is_connect) = req_line.map_or((false, false), |(_, b, c)| (b, c));
         if te.present && !is_http11 {
@@ -892,6 +915,157 @@ pub fn is_http_version(v: &str) -> bool {
     matches!(v.as_bytes(), [b'H', b'T', b'T', b'P', b'/', a, b'.', b] if a.is_ascii_digit() && b.is_ascii_digit())
 }
 
+/// Whether a request's `HTTP/<digit>.<digit>` version is 1.1 or later, as `HAProxy` sets
+/// `H1_MF_VER_11`: such a request is forwarded as `HTTP/1.1` and keeps its connection
+/// without `Connection: keep-alive`.
+#[must_use]
+pub fn version_is_11(v: &[u8]) -> bool {
+    v.len() == 8 && (v[5] > b'1' || (v[5] == b'1' && v[7] >= b'1'))
+}
+
+/// A request line read by [`scan_request_line`]: where its parts are in the buffer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReqLineSpan {
+    pub method: std::ops::Range<usize>,
+    pub uri: std::ops::Range<usize>,
+    pub version: std::ops::Range<usize>,
+    /// Where the line's terminator (CRLF or LF) starts, and its length.
+    pub eol: usize,
+    pub eol_len: usize,
+    /// The line is `method SP uri SP version` as `HAProxy` writes it to the server: one
+    /// space between the parts and a version below 1.1 or exactly `HTTP/1.1`.
+    pub canonical: bool,
+}
+
+/// The outcome of [`scan_request_line`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReqLineScan {
+    /// No refused byte yet, and no end of line.
+    Incomplete,
+    /// A byte `HAProxy` refuses: the request is a 400.
+    Invalid,
+    Complete(ReqLineSpan),
+}
+
+/// Reads the request line at the start of `buf` as `HAProxy`'s parser does
+/// (`h1_headers_to_hdr_list` from `H1_MSG_RQMETH`, then `h1_process_req_vsn`): a method of
+/// token bytes, spaces or tabs, a target of the bytes 0x21 to 0x7e (`#` and bytes from 0x80
+/// on only with `accept_unsafe`), spaces or tabs, and `HTTP/<digit>.<digit>` ended by CRLF
+/// or LF. A refused byte is found before the line is whole, as `HAProxy` answers it at once.
+/// No version (an HTTP/0.9 request) is refused as well. One pass, no allocation.
+#[must_use]
+pub fn scan_request_line(buf: &[u8], accept_unsafe: bool) -> ReqLineScan {
+    use ReqLineScan::{Complete, Incomplete, Invalid};
+    let len = buf.len();
+    let spht = |b: u8| b == b' ' || b == b'\t';
+    let mut i = buf.iter().position(|&b| !is_tchar(b)).unwrap_or(len);
+    if i == len {
+        return Incomplete;
+    }
+    let method = 0..i;
+    if i == 0 || !spht(buf[i]) {
+        return Invalid;
+    }
+    let mut canonical = buf[i] == b' ';
+    i += 1;
+    while i < len && spht(buf[i]) {
+        canonical = false;
+        i += 1;
+    }
+    let start = i;
+    while i < len {
+        match buf[i] {
+            b'#' if !accept_unsafe => return Invalid,
+            0x21..=0x7e => {}
+            0x80.. if accept_unsafe => {}
+            _ => break,
+        }
+        i += 1;
+    }
+    if i == len {
+        return Incomplete;
+    }
+    // A target ended by anything but a blank (a control byte, or the line's end: no
+    // version) is refused, and so is an empty one (the first byte was not 0x21..0x7e).
+    if i == start || !spht(buf[i]) {
+        return Invalid;
+    }
+    let uri = start..i;
+    canonical &= buf[i] == b' ';
+    i += 1;
+    while i < len && spht(buf[i]) {
+        canonical = false;
+        i += 1;
+    }
+    let start = i;
+    // `HTTP_IS_VER_TOKEN`: upper-case letters, digits, `.` and `/`.
+    while i < len && matches!(buf[i], b'A'..=b'Z' | b'0'..=b'9' | b'.' | b'/') {
+        i += 1;
+    }
+    if i == len {
+        return Incomplete;
+    }
+    let eol_len = match buf[i] {
+        b'\n' => 1,
+        b'\r' if i + 1 == len => return Incomplete,
+        b'\r' if buf[i + 1] == b'\n' => 2,
+        _ => return Invalid,
+    };
+    let v = &buf[start..i];
+    if !matches!(v, [b'H', b'T', b'T', b'P', b'/', a, b'.', b] if a.is_ascii_digit() && b.is_ascii_digit()) {
+        return Invalid;
+    }
+    canonical &= !version_is_11(v) || v == b"HTTP/1.1";
+    Complete(ReqLineSpan { method, uri, version: start..i, eol: i, eol_len, canonical })
+}
+
+/// Whether the header lines of a request head not yet whole, from `at` in `buf`, already
+/// hold a byte `HAProxy`'s parser refuses (`H1_MSG_HDR_FIRST` to `H1_MSG_HDR_L2_LWS`): a
+/// first line that starts with a blank, a name byte that is not a token or an empty name, a
+/// NUL in a value, a CR not followed by LF. It answers 400 at that byte; waiting for the
+/// rest of the head would be a 408. Without `accept_unsafe` only, which lets the name and
+/// NUL bytes through. One pass, no allocation.
+#[must_use]
+pub fn header_lines_invalid(buf: &[u8], mut at: usize, accept_unsafe: bool) -> bool {
+    let len = buf.len();
+    let mut first = true;
+    // After a CR: the LF, or nothing yet.
+    let cr_ok = |i: usize| i + 1 >= len || buf[i + 1] == b'\n';
+    while at < len {
+        match buf[at] {
+            // The blank line: the end of the head.
+            b'\r' => return !cr_ok(at),
+            b'\n' => return false,
+            b' ' | b'\t' if first => return !accept_unsafe,
+            b' ' | b'\t' => {}
+            _ => {
+                let name = buf[at..].iter().position(|&b| !is_tchar(b)).map_or(len, |p| at + p);
+                if name == len {
+                    return false;
+                }
+                if (name == at || buf[name] != b':') && !accept_unsafe {
+                    return true;
+                }
+                at = name;
+            }
+        }
+        // The value (or what follows a name with unsafe bytes), to its line's end.
+        let Some(p) = buf[at..].iter().position(|&b| b == b'\r' || b == b'\n' || (b == 0 && !accept_unsafe)) else {
+            return false;
+        };
+        at += p;
+        match buf[at] {
+            0 => return true,
+            b'\r' if !cr_ok(at) => return true,
+            b'\r' => at += 2,
+            _ => at += 1,
+        }
+        first = false;
+    }
+    false
+}
+
+#[cfg(test)]
 fn parse_request_line_borrowed(line: &str) -> io::Result<(&str, &str, &str)> {
     let mut parts = line.split_whitespace();
     let method_str = parts
@@ -904,6 +1078,11 @@ fn parse_request_line_borrowed(line: &str) -> io::Result<(&str, &str, &str)> {
     // is a 400 (measured on 3.5-dev8-885761-29, T286).
     let version_str = parts.next().filter(|v| is_http_version(v) && line.ends_with(v)).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Invalid HTTP version"))?;
     // (A fourth token is refused above: the version is the last token of the line.)
+    check_request_target(method_str, uri)?;
+    Ok((method_str, uri, version_str))
+}
+
+fn check_request_target(method_str: &str, uri: &str) -> io::Result<()> {
 
     // Request-target forms (RFC 9112 section 3.2), as HAProxy's H1 parser enforces them
     // (`reg-tests/http-messaging/h1_request_target_validation.vtc`): origin-form `/...`,
@@ -927,8 +1106,7 @@ fn parse_request_line_borrowed(line: &str) -> io::Result<(&str, &str, &str)> {
     if !is_valid {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid request target"));
     }
-
-    Ok((method_str, uri, version_str))
+    Ok(())
 }
 
 fn parse_response_line_borrowed(line: &str) -> io::Result<(&str, u16, &str)> {
@@ -1169,5 +1347,35 @@ mod request_target_tests {
         assert!(parse_request_line_borrowed("GET haproxy.org:80 HTTP/1.1").is_err());
         assert!(parse_request_line_borrowed("GET admin HTTP/1.1").is_err());
         assert!(parse_request_line_borrowed("GET admin/a/b HTTP/1.1").is_err());
+    }
+
+    /// A valid head arriving a byte at a time is never refused early (T291): every prefix
+    /// of it is incomplete or, once the line is in, complete.
+    #[test]
+    fn no_prefix_of_a_valid_head_is_refused() {
+        use super::{header_lines_invalid, scan_request_line, ReqLineScan};
+        let heads: [&[u8]; 4] = [
+            b"GET /a?b=c HTTP/1.1\r\nHost: a\r\nX-Y: v:w\r\n folded\r\n\r\n",
+            b"POST\t/x  HTTP/1.0\nHost: a\nContent-Length: 0\n\n",
+            b"OPTIONS * HTTP/1.1\r\nHost: a\n\r\n",
+            b"GET http://h/p HTTP/9.9\r\nA:\r\nB: \t\x80\xff\r\n\r\n",
+        ];
+        for head in heads {
+            for n in 1..=head.len() {
+                let p = &head[..n];
+                match scan_request_line(p, false) {
+                    ReqLineScan::Invalid => panic!("{p:?} refused"),
+                    ReqLineScan::Incomplete => {}
+                    ReqLineScan::Complete(l) => assert!(!header_lines_invalid(p, l.eol + l.eol_len, false), "{p:?} refused"),
+                }
+            }
+        }
+        let refused: [&[u8]; 5] = [b"GET /\0", b"GE(", b"GET / HTTP/1.1 ", b"GET / HTTP/1.1\r\r", b"GET  \x80"];
+        for p in refused {
+            assert_eq!(scan_request_line(p, false), ReqLineScan::Invalid, "{p:?}");
+        }
+        assert!(matches!(scan_request_line(b"GET /\x80# HTTP/1.1\r\n", true), ReqLineScan::Complete(_)));
+        assert!(header_lines_invalid(b"GET / HTTP/1.1\r\n\tX: y\r\n", 16, false));
+        assert!(!header_lines_invalid(b"GET / HTTP/1.1\r\nX\0: y\0\r\n", 16, true));
     }
 }

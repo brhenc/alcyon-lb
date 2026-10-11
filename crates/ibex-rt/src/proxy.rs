@@ -1939,7 +1939,16 @@ impl TcpSession {
         if !self.is_h2() && self.cli_state == ScState::Ready {
             // Empty lines before a request line are skipped (RFC 9112 section 2.2), as
             // HAProxy's parser does in `H1_MSG_RQBEFORE`.
-            let blank = self.req.readable().iter().take_while(|b| matches!(b, b'\r' | b'\n')).count();
+            // A CR there must be followed by an LF (`H1_MSG_RQBEFORE_CR`): one that is not is
+            // left for the request-line check to refuse (T291).
+            let (data, mut blank) = (self.req.readable(), 0);
+            while let Some(&b) = data.get(blank) {
+                match (b, data.get(blank + 1)) {
+                    (b'\n', _) => blank += 1,
+                    (b'\r', Some(b'\n')) => blank += 2,
+                    _ => break,
+                }
+            }
             self.req.consume(blank);
             let threshold = self.bufsize.saturating_sub(self.maxrewrite);
             let req_data = self.req.readable();
@@ -1952,8 +1961,12 @@ impl TcpSession {
                     return Ok(true);
                 }
             }
-            // A version that is not `HTTP/<digit>.<digit>` is a 400, whatever else is wrong (T286).
-            if txn::request_version_invalid(self.req.readable()) {
+            // A request line with a byte HAProxy refuses is a 400 as soon as the byte is in,
+            // whatever else is wrong, and so is a version that is not `HTTP/<digit>.<digit>`
+            // (T286, T291).
+            if self.req.readable() != b"\r"
+                && ibex_proto::h1::scan_request_line(self.req.readable(), self.accept_unsafe_request) == ibex_proto::h1::ReqLineScan::Invalid
+            {
                 self.fail_request(400);
                 return Ok(true);
             }
@@ -2146,13 +2159,24 @@ impl TcpSession {
                 }
                 let mut txn = HttpTxn::new(framing, close || self.close_client);
                 txn.req_htx = req_htx;
-                txn.req_http11 = self.req.readable().split(|&b| b == b'\n').next().is_some_and(|l| l.trim_ascii_end().ends_with(b"HTTP/1.1"));
+                txn.req_http11 = self.req.readable().split(|&b| b == b'\n').next().is_some_and(|l| {
+                    let l = l.trim_ascii_end();
+                    ibex_proto::h1::version_is_11(&l[l.len().saturating_sub(8)..])
+                });
                 // The client's own method: rules that rewrite it have not run yet.
                 txn.client_head = self.req_method.as_deref().is_some_and(|m| m.eq_ignore_ascii_case("HEAD"));
                 self.txn = Some(txn);
                 self.end_req_trailer_lines_with_crlf();
                 self.cli_state = ScState::Established;
                 changed = true;
+            } else if match ibex_proto::h1::scan_request_line(self.req.readable(), self.accept_unsafe_request) {
+                ibex_proto::h1::ReqLineScan::Complete(l) => ibex_proto::h1::header_lines_invalid(self.req.readable(), l.eol + l.eol_len, self.accept_unsafe_request),
+                _ => false,
+            } {
+                // A head not yet whole with a byte HAProxy refuses in a header line: 400 at
+                // that byte, not a 408 later (T291).
+                self.fail_request(400);
+                return Ok(true);
             } else if self.req.readable().len() + 56 >= self.bufsize {
                 // No end of head and the buffer is full: 431 as well. Measured on 3.5-dev8,
                 // a partial head draws it from `bufsize - 56` bytes on (the 40 of `struct
@@ -2782,6 +2806,11 @@ pub fn find_eoh(buf: &[u8]) -> Option<(usize, usize)> {
         if rest.starts_with(b"\r\n\r\n") {
             return Some((i, 4));
         }
+        // A line ended by a bare LF, then the blank line as CRLF: HAProxy ends the head
+        // there, and what follows is the next request (T291).
+        if rest.starts_with(b"\n\r\n") {
+            return Some((i, 3));
+        }
         if rest.starts_with(b"\n\n") || rest.starts_with(b"\r\r") {
             return Some((i, 2));
         }
@@ -2796,6 +2825,9 @@ fn find_eoh_bytewise(buf: &[u8]) -> Option<(usize, usize)> {
     for i in 0..buf.len() {
         if i + 4 <= buf.len() && &buf[i..i + 4] == b"\r\n\r\n" {
             return Some((i, 4));
+        }
+        if i + 3 <= buf.len() && &buf[i..i + 3] == b"\n\r\n" {
+            return Some((i, 3));
         }
         if i + 2 <= buf.len() && &buf[i..i + 2] == b"\n\n" {
             return Some((i, 2));

@@ -202,6 +202,7 @@ mod replace_path_targets;
 mod request_framing_smuggling;
 mod request_head_limit;
 mod request_line_414;
+mod request_line_validation;
 mod request_rule_actions;
 mod response_fetch_in_request;
 mod response_head_validation;

@@ -869,10 +869,10 @@ impl<'a> HtxSliceRef<'a> {
         let mut cursor = 0;
 
         if let Some(req) = self.req_line() {
-            let version = if req.version == "HTTP/2.0"
-                || req.version == "HTTP/2"
-                || req.version == "HTTP/3.0"
+            // `h1_format_htx_reqline`: a version from 1.1 up goes as `HTTP/1.1` (T291).
+            let version = if req.version == "HTTP/2"
                 || req.version == "HTTP/3"
+                || crate::h1::version_is_11(req.version.as_bytes())
             {
                 "HTTP/1.1"
             } else {
