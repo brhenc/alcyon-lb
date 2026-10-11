@@ -654,6 +654,12 @@ impl Mux for MuxH2 {
         if ctx.tx_consumed >= ctx.tx_buf.len() {
             ctx.tx_buf.clear();
             ctx.tx_consumed = 0;
+        } else if ctx.tx_consumed >= TX_ROOM && ctx.tx_consumed >= ctx.tx_buf.len() / 2 {
+            // A client that reads part of what waits, never all of it, would otherwise keep
+            // every byte ever sent on the connection here (T288). What was read goes once it
+            // is at least half the buffer: the bytes moved are fewer than those let go.
+            ctx.tx_buf.drain(..ctx.tx_consumed);
+            ctx.tx_consumed = 0;
         }
     }
 
@@ -1361,6 +1367,27 @@ mod tests {
         mux.consume_output(&mut ctx, TX_ROOM + 1);
         ctx.resume();
         assert_eq!(ctx.tx_buf.len(), 17, "the PING is answered once the client has read");
+    }
+
+    /// A client that always reads part of what is waiting -- never all of it -- keeps the
+    /// output from draining to empty. What it has read must still be let go: kept, the
+    /// output buffer held every byte ever sent on the connection (T288, MY-3).
+    #[test]
+    fn output_read_in_part_does_not_keep_what_was_read() {
+        let mut ctx = MuxH2.init(ConnId(1), true).expect("init");
+        ctx.streams.insert(1, H2StreamCtx::new(1, i32::MAX, 100));
+        ctx.conn_send_window = i32::MAX;
+        for k in 0..20_000u32 {
+            let byte = u8::try_from(k % 251).unwrap();
+            assert_eq!(ctx.send_data(1, &[byte; 1000], false), 1000);
+            // The client reads all but the last 100 bytes waiting.
+            let pending = MuxH2.pending_output(&ctx).len();
+            MuxH2.consume_output(&mut ctx, pending - 100);
+            assert_eq!(MuxH2.pending_output(&ctx), &[byte; 100][..], "the unread tail stays");
+        }
+        // 20 MB went through; what is kept is bounded by what waits, not by what was sent.
+        assert!(ctx.tx_buf.len() <= 4 * TX_ROOM, "tx_buf holds {} bytes", ctx.tx_buf.len());
+        assert!(ctx.tx_buf.capacity() <= 8 * TX_ROOM, "tx_buf capacity {} bytes", ctx.tx_buf.capacity());
     }
 
     fn open_conn() -> (MuxH2, H2MuxContext) {

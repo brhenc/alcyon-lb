@@ -2199,7 +2199,19 @@ impl TcpSession {
                 if let Some(h2) = self.h2_ctx.as_mut() {
                     let last = h2.last_client_stream_id;
                     if self.h2_idle_goaway {
+                        // The second expiry: the GOAWAY is written if the socket takes it at
+                        // once, and the connection is let go, as `h2_timeout_task` does ("try
+                        // to send but no need to insist", then `h2_release`). Left to close
+                        // when its output drained, a client that reads nothing was kept, and
+                        // this timer, still expired, fired on every pass: a core spinning and
+                        // a GOAWAY more queued each time (T288, MY-3).
                         h2.send_goaway(last, ibex_proto::h2::H2Error::NoError, &[]);
+                        if let Ok(Io::Done(n)) = self.cli_xprt.send(self.cli.as_fd(), &h2.tx_buf[h2.tx_consumed..]) {
+                            MuxH2.consume_output(h2, n);
+                            self.bytes_out += n as u64;
+                        }
+                        self.cli_state = ScState::Closed;
+                        self.cli_exp = Tick::ETERNITY;
                     } else {
                         h2.enqueue_frame(&ibex_proto::h2::Frame::GoAway { last_stream_id: last, error_code: ibex_proto::h2::H2Error::NoError, debug_data: Vec::new() });
                         self.h2_idle_goaway = true;
