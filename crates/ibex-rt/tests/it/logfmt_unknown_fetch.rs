@@ -13,7 +13,10 @@
 use std::process::Command;
 
 fn check(cfg: &str) -> (Option<i32>, String) {
-    let path = std::env::temp_dir().join(format!("ibex_lfunknown_{}_{:x}.cfg", std::process::id(), cfg.len()));
+    // Unique per call: the two tests run in parallel and configs of the same length used to share a file.
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("ibex_lfunknown_{}_{n}.cfg", std::process::id()));
     std::fs::write(&path, cfg).expect("write config");
     let out = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-c").arg("-f").arg(&path).output().expect("run ibex -c");
     let _ = std::fs::remove_file(&path);

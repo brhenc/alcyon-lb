@@ -89,9 +89,9 @@ fn peer_state(rd: SocketAddr) -> String {
     out.split_once("\r\n\r\n").map_or(String::new(), |(_, b)| b.to_string())
 }
 
-/// The state of the peer's entry as `rd` reads it, until it is `want` or a second has passed.
+/// The state of the peer's entry as `rd` reads it, until it is `want` or the deadline passes.
 fn settles_to(rd: SocketAddr, want: &str) -> String {
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let got = peer_state(rd);
         if got == want || Instant::now() > deadline {

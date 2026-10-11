@@ -88,10 +88,9 @@ fn start() -> Ibex {
     let sock = PathBuf::from(format!("/tmp/ibex-cc-{}-{n}.sock", std::process::id()));
     let released = Arc::new(Mutex::new(HashSet::new()));
     let srv = server(released.clone());
-    let dead = {
-        let l = TcpListener::bind("127.0.0.1:0").expect("bind");
-        l.local_addr().unwrap()
-    };
+    // A reserved port nothing listens on; an ephemeral one released by `bind(0)` can be handed
+    // to another test's socket (or to Ibex's own outgoing connection) under load.
+    let dead = common::reserve_addr();
     let udp = UdpSocket::bind("127.0.0.1:0").expect("log socket");
     let log_addr = udp.local_addr().unwrap();
     let logs = Arc::new(Mutex::new(Vec::new()));
@@ -217,8 +216,13 @@ fn failed_attempts_count_as_connects() {
     let mut c = TcpStream::connect(ibex.fw).unwrap();
     send(&mut c, "/w", true);
     assert!(answer(&mut c).starts_with("HTTP/1.1 503"));
-    thread::sleep(Duration::from_millis(200));
-    let st = stats(&ibex.sock);
+    // The retries finish after the 503 is out: wait for the counters, do not guess a delay.
+    let end = Instant::now() + Duration::from_secs(5);
+    let mut st = stats(&ibex.sock);
+    while col(&st, "w", "d3", "connect") != "3" && Instant::now() < end {
+        thread::sleep(Duration::from_millis(20));
+        st = stats(&ibex.sock);
+    }
     for sv in ["d3", "BACKEND"] {
         assert_eq!(col(&st, "w", sv, "connect"), "3", "{sv} connect: 1 + retries 2");
         assert_eq!(col(&st, "w", sv, "reuse"), "0", "{sv} reuse");
