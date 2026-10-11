@@ -758,7 +758,7 @@ pub fn check_sample_refs(config: &Config, registry: &Registry) -> Result<(), Str
                 return Err(in_line(e));
             }
         }
-        if let (SectionKind::Defaults, "unique-id-format" | "log-format") = (r.section, r.directive.as_str()) {
+        if let (SectionKind::Defaults, "unique-id-format" | "log-format" | "error-log-format") = (r.section, r.directive.as_str()) {
             // Resolved in each proxy that inherited it, as if written there.
             for (section, name) in format_users(config, &r.directive, &r.expr) {
                 check_expr(config, registry, Where { section, proxy: Some(name) }, &r.expr, false).map_err(in_line)?;
@@ -776,10 +776,13 @@ pub fn check_sample_refs(config: &Config, registry: &Registry) -> Result<(), Str
 fn format_users<'c>(config: &'c Config, directive: &str, expr: &str) -> Vec<(SectionKind, &'c str)> {
     let uses = |fmt: &str| ibex_config::parser::log_format_exprs(fmt).contains(&expr);
     let log = directive == "log-format";
+    let err = directive == "error-log-format";
     let custom = |spec: &Option<ibex_config::LogFormatSpec>| matches!(spec, Some(ibex_config::LogFormatSpec::Custom(f)) if uses(f));
-    let fes = config.frontends.iter().filter(|f| if log { custom(&f.log_format) } else { f.unique_id_format.as_deref().is_some_and(uses) });
-    let lis = config.listens.iter().filter(|l| if log { custom(&l.log_format) } else { l.unique_id_format.as_deref().is_some_and(uses) });
-    let bes = config.backends.iter().filter(|b| !log && b.unique_id_format.as_deref().is_some_and(uses));
+    let of = |fmt: &Option<String>| fmt.as_deref().is_some_and(uses);
+    let pick = |spec: &Option<ibex_config::LogFormatSpec>, elf: &Option<String>, uid: &Option<String>| if log { custom(spec) } else if err { of(elf) } else { of(uid) };
+    let fes = config.frontends.iter().filter(|f| pick(&f.log_format, &f.error_log_format, &f.unique_id_format));
+    let lis = config.listens.iter().filter(|l| pick(&l.log_format, &l.error_log_format, &l.unique_id_format));
+    let bes = config.backends.iter().filter(|b| !log && !err && b.unique_id_format.as_deref().is_some_and(uses));
     fes.map(|f| (SectionKind::Frontend, f.name.as_str()))
         .chain(lis.map(|l| (SectionKind::Listen, l.name.as_str())))
         .chain(bes.map(|b| (SectionKind::Backend, b.name.as_str())))

@@ -83,6 +83,7 @@ mod default_nbthread;
 mod defaults_rules;
 mod dgram_path;
 mod empty_conditions;
+mod error_log_format;
 mod error_pages;
 mod error_reply_header_case;
 mod expect_proxy;

@@ -84,6 +84,43 @@ impl HsFail {
         !matches!(self, Self::Error(_) | Self::Bare)
     }
 
+    /// `conn->err_code` (`CO_ER_SSL_EMPTY`, or `CO_ER_SSL_HANDSHAKE`): `fc_err`. A client that
+    /// leaves part-way logs the same text and code as one that leaves at once (measured).
+    #[must_use]
+    pub const fn code(&self) -> i64 {
+        match self {
+            Self::Empty | Self::Abort => 24,
+            Self::Error(_) | Self::Bare => 34,
+        }
+    }
+
+    /// `conn_err_code_name`.
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::Empty | Self::Abort => "SSL_EMPTY",
+            Self::Error(_) | Self::Bare => "SSL_HANDSHAKE",
+        }
+    }
+
+    /// `conn_err_code_str`: the log line's message without OpenSSL's error text.
+    #[must_use]
+    pub const fn text(&self) -> &'static str {
+        match self {
+            Self::Empty | Self::Abort => "Connection closed during SSL handshake",
+            Self::Error(_) | Self::Bare => "SSL handshake failure",
+        }
+    }
+
+    /// OpenSSL's error (`ssl_fc_err`, `ssl_fc_err_str`), for a handshake it refused:
+    /// `error:0A00009C:SSL routines::http request` is `0x0A00009C` and that text.
+    #[must_use]
+    pub fn openssl_error(&self) -> Option<(i64, &str)> {
+        let Self::Error(e) = self else { return None };
+        let code = i64::from_str_radix(e.strip_prefix("error:")?.get(..8)?, 16).ok()?;
+        Some((code, e))
+    }
+
     /// The message of `HAProxy`'s log line.
     #[must_use]
     pub fn message(&self) -> String {

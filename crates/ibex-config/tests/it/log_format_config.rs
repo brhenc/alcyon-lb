@@ -235,3 +235,26 @@ fn other_options_still_load_in_every_section() {
         parse_str(cfg).unwrap_or_else(|e| panic!("{cfg}: {}", e.message));
     }
 }
+
+/// `error-log-format` (T296): one argument, kept per frontend or listen, inherited from
+/// `defaults` and replaced by the section's own; a backend takes and ignores it, as
+/// `HAProxy` ("directive is ignored in backends").
+#[test]
+fn error_log_format_is_kept_inherited_and_ignored_in_a_backend() {
+    let cfg = parse_str(
+        "defaults\n  mode http\n  error-log-format \"D %ci\"\n\
+         frontend a\n  bind 127.0.0.1:1\n\
+         frontend b\n  bind 127.0.0.1:2\n  error-log-format \"B %ft\"\n\
+         listen l\n  bind 127.0.0.1:3\n\
+         backend k\n  error-log-format \"K\"\n",
+    )
+    .expect("loads");
+    assert_eq!(cfg.defaults.as_ref().and_then(|d| d.error_log_format.as_deref()), Some("D %ci"));
+    assert_eq!(cfg.frontends[0].error_log_format.as_deref(), Some("D %ci"));
+    assert_eq!(cfg.frontends[1].error_log_format.as_deref(), Some("B %ft"));
+    assert_eq!(cfg.listens[0].error_log_format.as_deref(), Some("D %ci"));
+    for (body, why) in [("  error-log-format\n", "expects an argument"), ("  error-log-format a b\n", "expects only one argument")] {
+        let err = fe(body).expect_err(body);
+        assert!(err.message.contains(why), "{body}: {}", err.message);
+    }
+}
