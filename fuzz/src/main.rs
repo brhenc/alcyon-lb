@@ -35,8 +35,8 @@ struct Config {
 fn parse_args() -> Config {
     let args: Vec<String> = env::args().collect();
     let mut haproxy_bin = PathBuf::from("/home/bhenc/reference/haproxy/haproxy");
-    let mut corpus_dir = PathBuf::from("/home/bhenc/project-ibex/fuzz/corpus");
-    let mut findings_file = PathBuf::from("/home/bhenc/project-ibex/fuzz/FINDINGS.md");
+    let mut corpus_dir = PathBuf::from("fuzz/corpus");
+    let mut findings_file = PathBuf::from("fuzz/FINDINGS.md");
     let mut mutated_count = 250;
     let mut seed = 42;
     let mut soak = false;
@@ -86,8 +86,8 @@ fn parse_args() -> Config {
                 println!("Usage: ibex-fuzz [OPTIONS]");
                 println!("Options:");
                 println!("  --haproxy <PATH>        Path to HAProxy binary (default: /home/bhenc/reference/haproxy/haproxy)");
-                println!("  --corpus-dir <PATH>     Directory to save discrepancy inputs (default: /home/bhenc/project-ibex/fuzz/corpus)");
-                println!("  --findings-file <PATH>  Output markdown report (default: /home/bhenc/project-ibex/fuzz/FINDINGS.md)");
+                println!("  --corpus-dir <PATH>     Directory to save discrepancy inputs (default: fuzz/corpus)");
+                println!("  --findings-file <PATH>  Output markdown report (default: fuzz/FINDINGS.md)");
                 println!("  --iters <N>             Number of mutated cases to generate (default: 250)");
                 println!("  --seed <U64>            Random seed for deterministic generation (default: 42)");
                 println!("  --soak                  Run soak test with 2500+ iterations");
@@ -238,7 +238,14 @@ fn main() {
 
     // 7. Generate and Write FINDINGS.md
     print!("[+] Generating and writing {}... ", config.findings_file.display());
-    let findings_md = generate_findings_markdown(total_count, accepted_both, rejected_both, &findings);
+    let findings_md = generate_findings_markdown(
+        total_count,
+        accepted_both,
+        rejected_both,
+        &findings,
+        &command_first_line(&config.haproxy_bin, &["-v"]),
+        &command_first_line(std::path::Path::new("git"), &["rev-parse", "--short", "HEAD"]),
+    );
     if let Err(e) = fs::write(&config.findings_file, findings_md) {
         eprintln!("\n[-] Warning: Failed to write findings markdown: {e}");
     } else {
@@ -273,4 +280,15 @@ fn main() {
     println!("    - Self-Differential:       {self_diff}");
     println!("  Elapsed Duration:            {:.2?}", start_time.elapsed());
     println!("================================================================================\n");
+}
+
+/// First line of a command's stdout, for the report header; "unknown" if it cannot be run.
+fn command_first_line(bin: &std::path::Path, args: &[&str]) -> String {
+    std::process::Command::new(bin)
+        .args(args)
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.lines().next().map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string())
 }

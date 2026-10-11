@@ -80,6 +80,8 @@ pub fn generate_findings_markdown(
     accepted_both: usize,
     rejected_both: usize,
     findings: &[DiscrepancyFinding],
+    haproxy_version: &str,
+    ibex_sha: &str,
 ) -> String {
     let mut cat1_count = 0;
     let mut cat2_count = 0;
@@ -96,11 +98,11 @@ pub fn generate_findings_markdown(
     }
 
     let mut md = String::new();
-    md.push_str("# Differential Fuzzing Findings: Ibex vs HAProxy 3.5\n\n");
+    md.push_str("# Differential Fuzzing Findings: Ibex vs HAProxy\n\n");
     md.push_str("## Executive Summary\n\n");
     md.push_str(&format!(
         "This report documents differential testing between the **Ibex HTTP/1 parser** (`crates/ibex-proto`) \
-         and the reference **HAProxy 3.5-dev7** oracle (`/home/bhenc/reference/haproxy/haproxy`).\n\n\
+         and the reference **{}** oracle (`/home/bhenc/reference/haproxy/haproxy`); Ibex at commit `{}`.\n\n\
          - **Total Inputs Evaluated:** {}\n\
          - **Accepted by Both Parsers:** {}\n\
          - **Rejected by Both Parsers:** {}\n\
@@ -109,7 +111,7 @@ pub fn generate_findings_markdown(
            - **Category 2 (Framing Disagreements):** {}\n\
            - **Category 3 (Smuggling / Boundary Findings):** {}\n\
            - **Self-Differential (Streaming Consistency):** {}\n\n",
-        total_tested, accepted_both, rejected_both, findings.len(),
+        haproxy_version, ibex_sha, total_tested, accepted_both, rejected_both, findings.len(),
         cat1_count, cat2_count, cat3_count, self_diff_count
     ));
 
