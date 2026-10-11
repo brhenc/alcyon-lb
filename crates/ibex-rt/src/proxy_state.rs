@@ -203,7 +203,9 @@ pub struct StickView<'a> {
 impl<'a> StickView<'a> {
     #[must_use]
     pub fn new(proxies: &'a [Proxy], tracked: &[Option<(usize, StickKey)>; 3]) -> Self {
-        Self { proxies, tracked: std::cell::RefCell::new(tracked.clone()) }
+        // Nothing tracked (the usual case): no key to clone.
+        let tracked = if tracked.iter().all(Option::is_none) { [None, None, None] } else { tracked.clone() };
+        Self { proxies, tracked: std::cell::RefCell::new(tracked) }
     }
 
     /// Slot `slot` now tracks `key` in the table of proxy `t_idx`.
