@@ -679,6 +679,25 @@ mod tests {
     }
 
     #[test]
+    fn key_parsers_follow_haproxy_at_the_edges() {
+        // strl2llrc rejects what overflows, however many digits
+        assert_eq!(int_key_error("99999999999999999999999999999999999999999"), Some("'99999999999999999999999999999999999999999' is not a number".to_string()));
+        // an empty key is "not a valid number range" (pat_parse_int)
+        assert_eq!(int_key_error(""), Some("'' is not a valid number range".to_string()));
+        // at load a name is resolved, as HAProxy does; at runtime it is not
+        assert_eq!(ip_key_error("localhost", true), None);
+        assert!(ip_key_error("localhost", false).is_some());
+        assert!(ip_key_error("no-such-host.invalid", true).is_some());
+    }
+
+    #[test]
+    fn converters_that_read_no_key_file_check_nothing() {
+        let args = ["/nonexistent".to_string()];
+        assert_eq!(crate::registry::check_converter_args("map_str_int", &args), None);
+        assert_eq!(crate::registry::check_converter_args("map_int", &args), None);
+    }
+
+    #[test]
     fn map_keys_are_checked_by_the_converter_that_reads_them() {
         let ints = tmp("i.map", "1 one\n");
         let ips = tmp("ip.map", "10.0.0.0/8 ten\n");
