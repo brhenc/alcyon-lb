@@ -68,8 +68,6 @@ pub struct TransferCodings {
     pub chunked_last: bool,
     /// A coding other than `chunked` (`H1_MF_TE_OTHER`).
     pub other: bool,
-    /// Every such coding is `gzip`, `deflate` or `compress`.
-    pub other_known: bool,
     /// An empty line or element, a trailing comma, `chunked` twice, or (in a request) a
     /// coding after `chunked`.
     pub invalid: bool,
@@ -78,7 +76,7 @@ pub struct TransferCodings {
 impl TransferCodings {
     pub fn of<N: AsRef<str>, V: AsRef<str>>(headers: impl Iterator<Item = (N, V)>, is_response: bool) -> Self {
         let lws = |c: char| c == ' ' || c == '\t';
-        let mut t = TransferCodings { other_known: true, ..TransferCodings::default() };
+        let mut t = TransferCodings::default();
         let mut chunked_seen = false;
         for (_, value) in headers.filter(|(n, _)| n.as_ref().eq_ignore_ascii_case("transfer-encoding")) {
             t.present = true;
@@ -97,7 +95,6 @@ impl TransferCodings {
                 } else {
                     t.invalid |= chunked_seen && !is_response;
                     t.other = true;
-                    t.other_known &= ["gzip", "deflate", "compress"].iter().any(|k| word.eq_ignore_ascii_case(k));
                 }
             }
         }
@@ -128,9 +125,6 @@ pub struct H1Parser {
     /// `option accept-unsafe-violations-in-http-request`: a `#` in the request target, and
     /// a forbidden character in an authority, are let through. Kept across `reset`.
     pub accept_unsafe_request: bool,
-    /// The status a message that parsed must still be refused with (422: a request with a
-    /// transfer coding other than chunked). Cleared by `reset`.
-    pub refusal: Option<u16>,
 }
 
 impl H1Parser {
@@ -148,7 +142,6 @@ impl H1Parser {
             prev_delim_len: 2,
             head_rewritten: false,
             accept_unsafe_request: false,
-            refusal: None,
         }
     }
 
@@ -163,7 +156,6 @@ impl H1Parser {
         self.saw_bare_cr = false;
         self.prev_delim_len = 2;
         self.head_rewritten = false;
-        self.refusal = None;
     }
 
     /// Finalizes parsing on connection close / EOF (for HTTP/1.0 close delimiter fallback).
@@ -177,6 +169,47 @@ impl H1Parser {
             let _ = htx.push_eom();
             self.phase = H1Phase::Done;
         }
+    }
+
+    /// The `Upgrade` side of a request head, as `HAProxy` reads it (`h1_parse_upgrade_header`,
+    /// `h1_postparse_req_hdrs` in src/h1_htx.c, `h1_search_websocket_key` in src/mux_h1.c):
+    /// `h2c` and `h2` are taken out of every `Upgrade` line and a line left empty goes; every
+    /// `Upgrade` line goes when no `Connection` line carries `upgrade` (the token goes from
+    /// `Connection` in the other case, on the way out). A websocket handshake (`upgrade` in
+    /// `Connection`, `websocket` in `Upgrade`) without a `Sec-WebSocket-Key` of 24 characters
+    /// is refused with 400, but with `option accept-unsafe-violations-in-http-request`.
+    fn check_upgrade(&mut self, htx: &mut HtxSlice<'_>) -> io::Result<()> {
+        let mut conn_upg = false;
+        let (mut websocket, mut key) = (false, false);
+        // Each `Upgrade` line's index and, when it changes, what it becomes (empty: it goes).
+        let mut edits: Vec<(usize, Option<String>)> = Vec::new();
+        for (i, name, value) in htx.as_ref().header_blocks() {
+            if name.eq_ignore_ascii_case("connection") {
+                conn_upg |= crate::upgrade::tokens(value).any(|t| t.eq_ignore_ascii_case("upgrade"));
+            } else if name.eq_ignore_ascii_case("upgrade") {
+                let clean = crate::upgrade::clean_value(value);
+                let v = clean.as_deref().unwrap_or(value);
+                websocket |= crate::upgrade::tokens(v).any(|t| t.eq_ignore_ascii_case("websocket"));
+                edits.push((i, clean));
+            } else if name.eq_ignore_ascii_case("sec-websocket-key") {
+                key |= value.len() == 24;
+            }
+        }
+        if conn_upg && websocket && !key && !self.accept_unsafe_request {
+            self.phase = H1Phase::Error;
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "websocket handshake without a valid Sec-WebSocket-Key"));
+        }
+        for (i, clean) in edits.into_iter().rev() {
+            if !conn_upg || clean.as_deref() == Some("") {
+                htx.remove_block(i);
+            } else if let Some(v) = clean {
+                htx.replace_block_value(i, v.as_bytes()).map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
+            } else {
+                continue;
+            }
+            self.head_rewritten = true;
+        }
+        Ok(())
     }
 
     /// Parses wire bytes into an [`HtxSlice`] transaction.
@@ -560,16 +593,15 @@ impl H1Parser {
                 return Err(Refusal::error(413, "HTTP/1.0 GET/HEAD/DELETE with a body"));
             }
             if te.other {
-                // Refused with 422 either way. A coding Ibex has never heard of is a parse
-                // error; `gzip`, `deflate` and `compress` parse (crates/ibex-proto/tests/
-                // h1_strictness.rs holds this parser to that) and the proxy refuses the
-                // request on `refusal`, before anything is forwarded.
-                if !te.other_known {
-                    self.phase = H1Phase::Error;
-                    return Err(Refusal::error(422, "transfer coding other than chunked"));
-                }
-                self.refusal = Some(422);
+                // 422, `gzip`, `deflate` and `compress` too: a coding the proxy does not
+                // decode is not forwarded (`H1_MF_TE_OTHER` in `h1_process_input`).
+                self.phase = H1Phase::Error;
+                return Err(Refusal::error(422, "transfer coding other than chunked"));
             }
+        }
+
+        if !self.is_response {
+            self.check_upgrade(htx)?;
         }
 
         let is_http10 = htx

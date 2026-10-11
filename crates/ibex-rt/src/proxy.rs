@@ -258,6 +258,9 @@ pub struct TcpSession {
     pub htx_blocks: usize,
     pub has_htx: bool,
     pub htx_modified: bool,
+    /// What the request in flight asked for of a websocket upgrade, for its response
+    /// (`crate::websocket`); `None` for one that asked for no upgrade.
+    pub req_ws: Option<Box<crate::websocket::ReqWs>>,
     pub cli_state: ScState,
     pub srv_state: ScState,
     /// Client to server.
@@ -496,6 +499,7 @@ impl TcpSession {
             htx_blocks: 0,
             has_htx: false,
             htx_modified: false,
+            req_ws: None,
             cli_state,
             srv_state: ScState::Init,
             req: Buf::unallocated(crate::buf::BufClass::Standard),
@@ -1140,13 +1144,11 @@ impl TcpSession {
         self.htx_tail = 0;
         self.htx_blocks = 0;
         let lines = self.req.readable()[..head_len].iter().filter(|&&b| b == b'\n').count();
-        self.htx_reserve(head_len + ibex_proto::htx::HTX_DESC_SIZE * (lines + 2));
+        // One more line for a `Sec-WebSocket-Key` the proxy may write.
+        self.htx_reserve(head_len + 64 + ibex_proto::htx::HTX_DESC_SIZE * (lines + 3));
         let raw = self.htx_buf.raw_slice_mut();
         let mut slice = ibex_proto::htx::HtxSlice::new(raw);
         stream.parse(&self.req.readable()[..head_len], &mut slice)?;
-        if let Some(status) = stream.refusal() {
-            return Err(ibex_proto::h1::Refusal::error(status, "refused after parsing"));
-        }
         let mut close = stream.connection_close();
         // `Content-Length` beside `Transfer-Encoding`: forwarded as HAProxy does
         // (`src/h1.c`, `h1_parse_msg_hdrs`, "T-E + C-L: force close and remove C-L"). The
@@ -1159,12 +1161,17 @@ impl TcpSession {
             slice.remove_header("content-length");
             close = true;
         }
+        // The websocket handshake, for the response (T281): a key written when the request
+        // has none and the frontend accepts that (`h1_process_mux`).
+        let (ws, written) = crate::websocket::ReqWs::of(slice.as_ref().headers(), self.accept_unsafe_request);
+        let key_written = written.is_some_and(|k| slice.add_header("sec-websocket-key", &k).is_ok());
+        self.req_ws = (ws != crate::websocket::ReqWs::default()).then(|| Box::new(ws));
         self.htx_tail = slice.tail_addr();
         self.htx_blocks = slice.num_blocks();
         self.has_htx = true;
         // Modified, so the head forwarded is regenerated from the HTX, without it. So
         // too when the parser normalised the authority and `Host` (tasks/T93).
-        self.htx_modified = conflict || stream.head_rewritten();
+        self.htx_modified = conflict || key_written || stream.head_rewritten();
         Ok(close)
     }
 
