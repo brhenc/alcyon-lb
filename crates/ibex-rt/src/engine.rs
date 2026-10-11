@@ -8547,7 +8547,8 @@ impl EngineDispatcher<'_> {
             if let Some((fe, line, err)) = line {
                 self.send_stream_log(fe, err, &line);
             }
-            if let Some(entry) = self.sessions.free(session_idx) {
+            if let Some(mut entry) = self.sessions.free(session_idx) {
+                entry.sess.close_notify_both();
                 cleanup_done(
                     &entry,
                     self.proxies,

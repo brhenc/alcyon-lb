@@ -186,6 +186,9 @@ pub struct TlsConn {
     /// A server connection whose ClientHello is not complete yet: the session is made from it
     /// (`gate_fill`), so that the ALPN list the client offered can be looked at first.
     gate: Option<Box<Gate>>,
+    /// Our `close_notify` is queued: a second call (the explicit shutdown, then the session's
+    /// end) must not send another.
+    notified: bool,
 }
 
 /// What a server connection holds until its ClientHello is in.
@@ -213,6 +216,7 @@ impl TlsConn {
             prefix_sent: 0,
             sock_drained: false,
             gate: None,
+            notified: false,
         }
     }
 
@@ -786,11 +790,15 @@ impl ClientXprt {
     /// Sends `close_notify` so the peer can tell a finished stream from a cut one.
     pub fn send_close_notify(&mut self, fd: BorrowedFd<'_>) {
         if let ClientXprt::Tls(t) = self {
+            if t.notified {
+                return;
+            }
             match t.session() {
                 Some(TlsSession::Server(c)) => c.send_close_notify(),
                 Some(TlsSession::Client(c)) => c.send_close_notify(),
                 None => return,
             }
+            t.notified = true;
             let _ = t.flush(fd);
         }
     }
@@ -1012,11 +1020,15 @@ impl ServerXprt {
     /// Sends `close_notify` so the backend server can tell a finished stream from a cut one.
     pub fn send_close_notify(&mut self, fd: BorrowedFd<'_>) {
         if let ServerXprt::Tls(t) = self {
+            if t.notified {
+                return;
+            }
             match t.session() {
                 Some(TlsSession::Server(c)) => c.send_close_notify(),
                 Some(TlsSession::Client(c)) => c.send_close_notify(),
                 None => return,
             }
+            t.notified = true;
             let _ = t.flush(fd);
         }
     }

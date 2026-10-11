@@ -64,10 +64,15 @@ fn start(cfg: &str, addrs: &[SocketAddr]) -> Ibex {
 /// Sends `req` over TLS and reads until the connection ends. Returns what was read and
 /// whether the end was a `close_notify` (true) or a bare FIN (false).
 fn exchange(addr: SocketAddr, cert: &rustls::pki_types::CertificateDer<'static>, req: &[u8]) -> (String, bool) {
+    exchange_alpn(addr, cert, req, &[])
+}
+
+fn exchange_alpn(addr: SocketAddr, cert: &rustls::pki_types::CertificateDer<'static>, req: &[u8], alpn: &[&[u8]]) -> (String, bool) {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let mut roots = rustls::RootCertStore::empty();
     roots.add(cert.clone()).expect("root");
-    let cfg = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+    let mut cfg = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+    cfg.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
     let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
     let mut conn = rustls::ClientConnection::new(Arc::new(cfg), name).expect("client");
     let mut tcp = TcpStream::connect(addr).expect("connect");
@@ -109,6 +114,73 @@ fn http_connection_close_ends_with_close_notify() {
     let (resp, clean) = exchange(addr, &der, b"BAD\r\n\r\n");
     assert!(resp.starts_with("HTTP/1.1 400"), "{resp:?}");
     assert!(clean, "the 400 ended with a bare FIN, no close_notify");
+}
+
+/// An HTTP/2 connection that ends after a GOAWAY (here: a bad preface after ALPN `h2`).
+/// Measured on `HAProxy` 3.5-dev8-885761-29 (python `ssl`, `suppress_ragged_eofs=False`):
+/// 27 bytes (SETTINGS, GOAWAY) then a clean `close_notify`; Ibex ended with a bare FIN.
+#[test]
+fn h2_connection_closed_after_goaway_ends_with_close_notify() {
+    let dir = TempDir::new().unwrap();
+    let (pem, der) = cert(&dir);
+    let addr = common::reserve_addr();
+    let cfg = format!(
+        "defaults\n  mode http\n  timeout connect 2s\n  timeout client 5s\n  timeout server 5s\n\
+         frontend f\n  bind {addr} ssl crt {pem} alpn h2\n  http-request return status 200 content-type text/plain string ok\n"
+    );
+    let _ibex = start(&cfg, &[addr]);
+
+    let (_, clean) = exchange_alpn(addr, &der, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\nGARBAGEGARBAGEGARBAGEGARBAGE", &[b"h2"]);
+    assert!(clean, "the connection closed after GOAWAY ended with a bare FIN, no close_notify");
+}
+
+/// The connection to a TLS backend server that Ibex closes, when the client gives up on a request that is on the server, ends with `close_notify` too
+/// (`HAProxy`'s `ssl_sock_shutw` runs on both sides).
+#[test]
+fn backend_tls_connection_ends_with_close_notify() {
+    use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("cert");
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(ck.key_pair.serialize_der()));
+    let scfg = Arc::new(rustls::ServerConfig::builder().with_no_client_auth().with_single_cert(vec![ck.cert.der().clone()], key).expect("server config"));
+    let srv = TcpListener::bind("127.0.0.1:0").unwrap();
+    let srv_addr = srv.local_addr().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel::<bool>();
+    thread::spawn(move || {
+        for s in srv.incoming() {
+            let Ok(mut tcp) = s else { return };
+            tcp.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let mut conn = rustls::ServerConnection::new(scfg.clone()).expect("conn");
+            let mut tls = rustls::Stream::new(&mut conn, &mut tcp);
+            let mut b = [0u8; 1024];
+            if !matches!(tls.read(&mut b), Ok(n) if n > 0) {
+                continue;
+            }
+            // No answer: the client gives up, and the session ends with the server connection
+            // still attached. Does the end of that connection carry a close_notify?
+            let clean = loop {
+                match tls.read(&mut b) {
+                    Ok(0) => break true,
+                    Ok(_) => {}
+                    Err(_) => break false,
+                }
+            };
+            let _ = tx.send(clean);
+        }
+    });
+    let addr = common::reserve_addr();
+    let cfg = format!(
+        "defaults\n  mode http\n  timeout connect 2s\n  timeout client 5s\n  timeout server 5s\n\
+         frontend f\n  bind {addr}\n  default_backend b\nbackend b\n  server s {srv_addr} ssl verify none\n"
+    );
+    let _ibex = start(&cfg, &[addr]);
+    let mut c = TcpStream::connect(addr).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    c.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").unwrap();
+    thread::sleep(Duration::from_millis(300));
+    drop(c);
+    let clean = rx.recv_timeout(Duration::from_secs(5)).expect("the server saw its connection end");
+    assert!(clean, "Ibex closed the backend TLS connection with a bare FIN, no close_notify");
 }
 
 #[test]

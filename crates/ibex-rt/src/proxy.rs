@@ -455,6 +455,19 @@ impl TcpSession {
         matches!(&self.cli_xprt, ClientXprt::Tls(t) if !t.handshake_done())
     }
 
+    /// The end of the session: whatever TLS connection is still open says `close_notify` before
+    /// its socket is closed, as `HAProxy`'s `ssl_sock_shutw` does on every close, so an HTTP/2
+    /// connection that ended after its GOAWAY, or a backend connection that ended, is a finished
+    /// stream and not a cut one. Already sent, or a failed socket: nothing.
+    pub fn close_notify_both(&mut self) {
+        if !self.cli_failed && matches!(&self.cli_xprt, ClientXprt::Tls(t) if t.handshake_done()) {
+            self.cli_xprt.send_close_notify(self.cli.as_fd());
+        }
+        if let Some(sfd) = self.srv.as_ref().map(AsFd::as_fd) {
+            self.srv_xprt.send_close_notify(sfd);
+        }
+    }
+
     /// Ends what is sent to the client: `close_notify` first on a TLS connection whose
     /// handshake is done, then the FIN. `HAProxy` sends it on every clean shutdown
     /// (`ssl_sock_shutw`); without it an OpenSSL client reads the FIN as "unexpected eof"
