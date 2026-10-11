@@ -108,8 +108,38 @@ expect rstring` with PCRE2_NO_AUTO_CAPTURE: only a named group captures and has 
 does the same (T274 J2): `(a)\1`, `((a))\2`, `(a)(?<n>b)\2` and `(a)(?(1)b|c)` are refused
 with `reference to non-existent subpattern`, `(?<n>a)\1` is a reference to `n`, and
 `(a)(?<n>b)\1` refers to `n` too. `map_regm`, `replace-header`, `replace-value`,
-`replace-path`, `replace-uri` and `regsub` number every group, as in HAProxy. Remaining
-difference: the refusal has no `erroffset` for this error.
+`replace-path`, `replace-uri` and `regsub` number every group, as in HAProxy. The refusal
+carries PCRE2's `erroffset` on the CLI (`add acl`, `add map`): just past the `\N`, or at the
+inner `(` of `(?(N)`.
+
+At load, every regex refusal is worded `bad regular expression <re>: <why>` where HAProxy
+says `regex '<re>' is invalid (error=<why>, erroffset=<n>)`, and carries no offset (T287).
+
+### Regexes PCRE2 refuses
+
+Ibex refuses, with PCRE2's text and `erroffset` (CLI), a quantifier after a quantifier
+(`a**`, `a{2}{3}`; `a*+`, `a*?` stay valid) or after an anchor or option setting (`^*`,
+`\b+`, `(?i)*`), `{n,m}` out of order or above 65535, an unknown POSIX class
+(`[[:foo:]]`), a collating element (`[[.a.]]`) and a group name used twice (T287). Remaining
+differences, measured on HAProxy 3.5-dev8-885761-29:
+
+* PCRE2 refuses an unbounded look-behind (`(?<=a*)b`, "length of lookbehind assertion is
+  not limited"); Ibex runs it.
+* PCRE2 accepts a quantified look-ahead (`(?=a)+`, `(?!a){2}`) and `(?J)` duplicate names;
+  `fancy-regex` refuses both.
+
+### Map value types
+
+A `map_<in>_int` or `map_<in>_ip` converter checks its file's values at load (`unable to
+parse '<v>' at line <n> of file '<f>'.`), and `add map`, `set map` and a payload line check
+the value (`unable to parse '<v>'.`) as HAProxy does (T287).
+
+### The CLI command line
+
+Every command line is cut into words as `cli_parse_request` does: `\\` is a backslash, a
+backslash before another character (a blank included) is dropped and the character kept,
+there is no quoting. `set var` needs `experimental-mode on` (T287). Payload lines of `add map
+<<` are taken as written.
 
 ### The backtrack limit
 

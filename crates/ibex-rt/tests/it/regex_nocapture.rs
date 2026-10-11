@@ -209,6 +209,7 @@ fn the_cli_refuses_an_unnamed_group_reference_in_an_acl_and_a_map_reg_but_not_a_
     let want = format!("regex '(a)\\1' is invalid (error={NONEXISTENT}");
     let out = cli(&ibex.sock, &format!("add acl {} (a){WIRE}\n", acl.display()));
     assert!(out.contains(&want), "add acl: {out:?}");
+    assert!(out.contains(", erroffset=5)"), "add acl offset: {out:?}");
     let out = cli(&ibex.sock, &format!("add map {} (a){WIRE} v\n", mreg.display()));
     assert!(out.contains(&want), "add map (map_reg): {out:?}");
     assert!(!cli(&ibex.sock, &format!("show map {}\n", mreg.display())).contains("(a)"), "nothing added to the map_reg map");

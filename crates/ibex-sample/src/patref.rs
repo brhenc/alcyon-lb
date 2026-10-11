@@ -54,6 +54,47 @@ pub enum MapKeys {
     Regm,
 }
 
+/// What a map's values must be, from the converter's output type (`map_str_int`, `_ip`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MapVals {
+    Str,
+    Int,
+    Ip,
+}
+
+/// The key and value types of converter `name` (`map`, `map_<in>`, `map_<in>_<out>`), or
+/// `None` when it is no map converter.
+#[must_use]
+pub fn converter_map(name: &str) -> Option<(MapKeys, MapVals)> {
+    let rest = if name == "map" { "str" } else { name.strip_prefix("map_")? };
+    let (inp, out) = rest.split_once('_').map_or((rest, ""), |(i, o)| (i, o));
+    let keys = match inp {
+        "str" | "beg" | "end" | "sub" | "dir" | "dom" => MapKeys::Str,
+        "int" => MapKeys::Int,
+        "ip" => MapKeys::Ip,
+        "reg" => MapKeys::Reg,
+        "regm" => MapKeys::Regm,
+        _ => return None,
+    };
+    let vals = match out {
+        "" | "key" | "str" => MapVals::Str,
+        "int" => MapVals::Int,
+        "ip" => MapVals::Ip,
+        _ => return None,
+    };
+    Some((keys, vals))
+}
+
+/// The refusal (without the period) of value `val` for a map of values `vals`.
+fn map_val_error(vals: MapVals, val: &str) -> Option<String> {
+    let ok = match vals {
+        MapVals::Str => true,
+        MapVals::Int => pat_number(val).is_some(),
+        MapVals::Ip => val.parse::<std::net::IpAddr>().is_ok(),
+    };
+    (!ok).then(|| format!("unable to parse '{val}'"))
+}
+
 /// One entry: what `show map` prints is `<id> <key> <value>`.
 #[derive(Clone, Debug)]
 pub struct PatEntry {
@@ -72,6 +113,7 @@ pub struct PatRef {
     /// Modification time and size of the file when it was read.
     stamp: Mutex<Option<(Option<std::time::SystemTime>, u64)>>,
     map_keys: Mutex<MapKeys>,
+    map_vals: Mutex<MapVals>,
     /// The entries, their indexes, and the patterns compiled for every ACL reader.
     entries: RwLock<PatTable>,
     version: AtomicU64,
@@ -129,6 +171,7 @@ impl PatRef {
             users: Mutex::new(Vec::new()),
             stamp: Mutex::new(None),
             map_keys: Mutex::new(MapKeys::Str),
+            map_vals: Mutex::new(MapVals::Str),
             entries: RwLock::new(table_of(pairs)),
             version: AtomicU64::new(1),
         }
@@ -192,8 +235,15 @@ impl PatRef {
         }
     }
 
+    fn check_val(&self, val: &str) -> Result<(), String> {
+        map_val_error(*lock(&self.map_vals), val).map_or(Ok(()), |e| Err(format!("{e}.")))
+    }
+
     fn add(&self, key: &str, val: &str) -> Result<(), String> {
         self.check_key(key)?;
+        if self.kind == RefKind::Map {
+            self.check_val(val)?;
+        }
         write(&self.entries).insert(next_entry_id(), key, val);
         self.changed();
         Ok(())
@@ -350,15 +400,18 @@ fn map_key_error(keys: MapKeys, key: &str, resolve: bool) -> Option<String> {
 /// otherwise compiled only when a lookup first reaches it, and one that does not compile
 /// then never matches (T277).
 #[must_use]
-pub fn map_file_error(path: &str, keys: MapKeys) -> Option<String> {
+pub fn map_file_error(path: &str, keys: MapKeys, vals: MapVals) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
     text.lines().enumerate().find_map(|(n, l)| {
         let l = l.trim();
         if l.is_empty() || l.starts_with('#') {
             return None;
         }
-        let key = l.split_whitespace().next()?;
-        map_key_error(keys, key, true).map(|e| format!("{e} at line {} of file '{path}'.", n + 1))
+        let mut it = l.split_whitespace();
+        let key = it.next()?;
+        map_key_error(keys, key, true)
+            .or_else(|| it.next().and_then(|v| map_val_error(vals, v)))
+            .map(|e| format!("{e} at line {} of file '{path}'.", n + 1))
     })
 }
 
@@ -366,6 +419,12 @@ pub fn map_file_error(path: &str, keys: MapKeys) -> Option<String> {
 /// `user` describe the converter that reads it. `None` when the file cannot be read.
 #[must_use]
 pub fn map_file(path: &str, keys: MapKeys, user: Option<String>) -> Option<Arc<PatRef>> {
+    map_file_typed(path, keys, MapVals::Str, user)
+}
+
+/// [`map_file`] for a converter whose output is of type `vals`.
+#[must_use]
+pub fn map_file_typed(path: &str, keys: MapKeys, vals: MapVals, user: Option<String>) -> Option<Arc<PatRef>> {
     let mut refs = lock(&REFS);
     let found = refs.iter().find(|r| r.kind == RefKind::Map && r.file == path).cloned();
     let r = if let Some(r) = found {
@@ -374,6 +433,7 @@ pub fn map_file(path: &str, keys: MapKeys, user: Option<String>) -> Option<Arc<P
         let text = std::fs::read_to_string(path).ok()?;
         let r = Arc::new(PatRef::new(refs.len(), RefKind::Map, path, parse_lines(&text)));
         *lock(&r.map_keys) = keys;
+        *lock(&r.map_vals) = vals;
         refs.push(Arc::clone(&r));
         r
     };
@@ -450,19 +510,12 @@ pub fn scan_config(text: &str, locate: &dyn Fn(usize) -> (String, usize)) {
             let rest = &line[start..];
             let name_len = rest.find('(').unwrap_or(0);
             let name = &rest[..name_len];
-            let keys = match name {
-                "map_int" => MapKeys::Int,
-                "map_ip" => MapKeys::Ip,
-                "map_reg" => MapKeys::Reg,
-                "map_regm" => MapKeys::Regm,
-                "map" | "map_str" | "map_beg" | "map_end" | "map_sub" | "map_dir" | "map_dom" => MapKeys::Str,
-                _ => continue,
-            };
+            let Some((keys, vals)) = converter_map(name) else { continue };
             let args = &rest[name_len + 1..];
             let end = args.find([',', ')']).unwrap_or(args.len());
             let path = args[..end].trim_matches(['"', '\'']);
             if !path.is_empty() {
-                let _ = map_file(path, keys, Some(format!("map at file '{file}' line {fline}")));
+                let _ = map_file_typed(path, keys, vals, Some(format!("map at file '{file}' line {fline}")));
             }
         }
     }
@@ -555,6 +608,7 @@ fn run(verb: &str, kind: RefKind, args: &[&str], payload: Option<&str>) -> Resul
                 return Err("'set map' expects three parameters: map identifier, key and value.".to_string());
             }
             let r = find(kind, args[0])?;
+            r.check_val(args[2])?;
             let hit = {
                 let mut t = write(&r.entries);
                 let ids = t.ids(args[1]);
@@ -724,6 +778,37 @@ mod tests {
         assert_eq!(command("set", RefKind::Map, &[&sel(&ri), "#0xdead", "x"], None), "key or pattern not found.\n");
         assert_eq!(command("del", RefKind::Map, &[&sel(&ri), &id], None), "");
         assert_eq!(command("show", RefKind::Map, &[&sel(&ri)], None).lines().count(), 2);
+    }
+
+    /// Map values are checked by the converter's output type (T287 item 5). Measured on
+    /// HAProxy 3.5-dev8-885761-29: `map_str_int` over a file with `b xx` is refused at load
+    /// with `unable to parse 'xx' at line 2 of file '<f>'`, `map_str_ip` the same with
+    /// `notip`; `add map` and `set map` answer `unable to parse 'xx'.`, and so does a
+    /// payload line (the lines before it stay added).
+    #[test]
+    fn map_values_are_checked_by_the_converters_output_type() {
+        let f = tmp("vi.map", "a 1\nb xx\n");
+        let args = [f.clone()];
+        let why = |n: &str| crate::registry::check_converter_args(n, &args);
+        assert_eq!(why("map_str_int"), Some(format!("invalid args in converter 'map_str_int' : unable to parse 'xx' at line 2 of file '{f}'.")));
+        assert!(why("map_str_ip").is_some_and(|e| e.contains("unable to parse '1' at line 1")));
+        assert!(why("map_int_int").is_some());
+        assert_eq!(why("map_str"), None);
+        assert_eq!(why("map_str_key"), None);
+        let ok = tmp("vok.map", "a 1\n");
+        let ri = map_file_typed(&ok, MapKeys::Str, MapVals::Int, None).expect("map");
+        let id = format!("#{}", ri.id);
+        assert_eq!(command("add", RefKind::Map, &[&id, "k", "xx"], None), "unable to parse 'xx'.\n");
+        assert_eq!(command("add", RefKind::Map, &[&id, "k", "-5"], None), "");
+        assert_eq!(command("set", RefKind::Map, &[&id, "k", "yy"], None), "unable to parse 'yy'.\n");
+        assert_eq!(command("add", RefKind::Map, &[&id], Some("p1 7\np2 zz\np3 8\n")), "unable to parse 'zz'.\n");
+        let shown = command("show", RefKind::Map, &[&id], None);
+        assert!(shown.contains(" p1 7") && !shown.contains("p2") && !shown.contains("p3"), "{shown}");
+        let ip = tmp("vip.map", "a 1.2.3.4\n");
+        let rp = map_file_typed(&ip, MapKeys::Str, MapVals::Ip, None).expect("map");
+        let id = format!("#{}", rp.id);
+        assert_eq!(command("add", RefKind::Map, &[&id, "k", "zz"], None), "unable to parse 'zz'.\n");
+        assert_eq!(command("add", RefKind::Map, &[&id, "k", "::1"], None), "");
     }
 
     #[test]
