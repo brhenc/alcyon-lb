@@ -6767,8 +6767,12 @@ fn reply_parse_error(entry: &mut SessionEntry, proxies: &[Proxy], status: u16) {
     rewrite_header_names(&mut page, client_case_table(&proxies[entry.proxy_idx]));
     // HAProxy's 431 does not say `Connection: close`, though it closes.
     entry.sess.write_reply_with(&page, status != 431);
-    // The request that could not be parsed counts as a request and as the error or failure its
-    // status is (measured: `http_req_cnt=1 http_err_cnt=1` for a 400).
+    count_parse_error(entry, proxies, status);
+}
+
+/// The request that could not be parsed counts as a request and as the error or failure its
+/// status is (measured: `http_req_cnt=1 http_err_cnt=1` for a 400).
+fn count_parse_error(entry: &SessionEntry, proxies: &[Proxy], status: u16) {
     let (is_err, is_fail) = response_class(status);
     for_tracked(proxies, &entry.sess, |data| {
         data.count_request();
@@ -7637,7 +7641,18 @@ impl EngineDispatcher<'_> {
         };
 
         if let Some(status) = txn.error.take() {
-            reply_parse_error(entry, proxies, status);
+            if txn.quiet {
+                // Nothing is written back; the empty reply ends the transaction and closes.
+                entry.sess.write_reply_with(b"", false);
+                entry.sess.log.status = Some(status);
+                count_parse_error(entry, proxies, status);
+            } else {
+                reply_parse_error(entry, proxies, status);
+            }
+        }
+
+        if Self::request_body_broken(entry, proxies, fdtab, poller, idle_pool) {
+            return None;
         }
 
         // `timeout client` while the request is held for its body: the 408 the wait's own
@@ -7902,6 +7917,53 @@ impl EngineDispatcher<'_> {
         true
     }
 
+    /// An HTTP/1 request whose chunked body breaks its framing after its head was taken: a
+    /// malformed chunk, a trailer section refused or past its cap, or a trailer section held
+    /// back that fills the buffer. `HAProxy` 3.5-dev8 sends the server nothing more of it (not the
+    /// last-chunk line before a refused trailer section), answers the client nothing, closes
+    /// both, and logs `400 ... PH--` (T281). Ibex stopped forwarding at the error and waited:
+    /// the server, holding a request with no end, answered or timed out, and that answer
+    /// reached the client. `true` when the transaction ended here.
+    fn request_body_broken(
+        entry: &mut SessionEntry,
+        proxies: &[Proxy],
+        fdtab: &mut FdTab,
+        poller: &mut Poller,
+        idle_pool: &mut IdlePool,
+    ) -> bool {
+        if entry.sess.h2_ctx.is_some() || entry.sess.h3 {
+            return false;
+        }
+        let Some(txn) = entry.sess.txn.as_ref().filter(|t| {
+            !t.local
+                && !t.aborted
+                && t.error.is_none()
+                && t.req_rules_done
+                && t.rsp == MsgState::Waiting
+                && matches!(
+                    t.req,
+                    MsgState::Body(crate::txn::Body::Chunked(_)) | MsgState::Head { body: crate::txn::Framing::Chunked, .. }
+                )
+        }) else {
+            return false;
+        };
+        if !txn.req.check_body(entry.sess.req.readable()).stuck(entry.sess.req.len(), entry.sess.bufsize) {
+            return false;
+        }
+        if let Some(srv) = entry.sess.srv.as_ref() {
+            raw::abort_with_rst(srv.as_fd());
+        }
+        // Nothing of it forwarded yet (held whole, `MsgState::holds_trailer`): `HAProxy` never
+        // made it a request (`PR`, as `<BADREQ>`).
+        let term = if matches!(txn.req, MsgState::Head { .. }) { *b"PR" } else { *b"PH" };
+        entry.sess.log.status = Some(400);
+        entry.sess.log.term = Some(term);
+        entry.sess.req.clear();
+        entry.sess.rep.clear();
+        close_http_session(entry, proxies, fdtab, poller, idle_pool, false);
+        true
+    }
+
     /// The HTTP/2 stream being served was reset, by the client's `RST_STREAM` or by the mux
     /// for a stream error in the rest of its request (trailers without `END_STREAM`, say):
     /// the transaction ends here and the connection's next stream goes on. `true` when it
@@ -7974,10 +8036,24 @@ impl EngineDispatcher<'_> {
         // or for ever against a server that keeps talking) is pointless; the server is let
         // go now and the client connection closed behind the valid bytes. `HAProxy` 3.5-dev8
         // closes at once on a trailer flood and logs `PH` (T248).
+        // So is a trailer section held back that fills the buffer (`tune.bufsize` below its
+        // cap): the end it waits for has no room to arrive.
+        // A response held whole behind its trailer section (`MsgState::holds_trailer`) that
+        // is refused is a 502, as when it arrives all at once: nothing of it has gone.
+        if !txn.local && !txn.aborted && txn.rsp.holds_trailer(entry.sess.rep.readable(), entry.sess.bufsize) {
+            let check = txn.rsp.check_body(entry.sess.rep.readable());
+            if check.stuck(entry.sess.rep.len(), entry.sess.bufsize) || srv_eof || srv_err {
+                txn.srv_reusable = false;
+                entry.sess.rep.clear();
+                entry.sess.log.term = Some(*b"PH");
+                entry.sess.log.bytes_from_server = 0;
+                reply_error(entry, proxies, 502);
+                return;
+            }
+        }
         if !(srv_eof || srv_err) && !txn.local && !txn.aborted && matches!(txn.rsp, MsgState::Body(_)) {
-            let mut probe = txn.rsp;
-            probe.advance(entry.sess.rep.readable());
-            if probe == MsgState::Error {
+            let check = txn.rsp.check_body(entry.sess.rep.readable());
+            if check.stuck(entry.sess.rep.len(), entry.sess.bufsize) {
                 txn.srv_reusable = false;
                 txn.close_after = true;
                 txn.aborted = true;
@@ -8721,6 +8797,30 @@ impl EngineDispatcher<'_> {
             entry.sess.log.bytes_from_server = 0;
             reply_error(entry, proxies, 502);
             return;
+        }
+        // The chunked body that arrived with the head is parsed with it, as `HAProxy` parses
+        // what is in its buffer into HTX before the stream sees the head: a malformed chunk,
+        // or a trailer section past its cap, makes the whole response a 502 (`PH`), and none
+        // of it is relayed. Ibex relayed the head and the body up to the error (T281, V&V
+        // chunked_diff). Once the head has gone, an error closes the client connection
+        // behind what was relayed (`http_server_side`).
+        if framing == crate::txn::Framing::Chunked && entry.sess.txn.as_ref().is_some_and(|t| t.rsp_wait.is_none()) {
+            let check = MsgState::head(framing).check_body(entry.sess.rep.readable());
+            if matches!(check, crate::txn::BodyCheck::Held { trailer: true, .. }) && entry.sess.rep.len() >= entry.sess.bufsize {
+                // Held whole until the section is (`MsgState::holds_trailer`); refused in
+                // `http_server_side` if it is not.
+                entry.sess.rep.grow_capacity(2 * entry.sess.bufsize);
+            }
+            if matches!(check, crate::txn::BodyCheck::Broken | crate::txn::BodyCheck::TooLarge { .. }) {
+                entry.sess.rep.clear();
+                entry.sess.log.term.get_or_insert(*b"PH");
+                entry.sess.log.bytes_from_server = 0;
+                if let Some(t) = entry.sess.txn.as_mut() {
+                    t.srv_reusable = false;
+                }
+                reply_error(entry, proxies, 502);
+                return;
+            }
         }
         let Some(txn) = entry.sess.txn.as_mut() else {
             return;

@@ -352,8 +352,12 @@ fn an_endless_chunk_extension_is_not_relayed() {
         while c.write_all(&e).is_ok() {}
     });
     let (_px, fe) = start("", be, "3s");
-    let seen = get(fe, Duration::from_secs(6), |_| false);
+    let seen = get(fe, Duration::from_secs(6), |b| b.starts_with(b"HTTP/1.1 502 ") && b.ends_with(b"</html>\n"));
     assert!(seen.total < 64 * 1024, "{} bytes relayed", seen.total);
+    if seen.bytes.starts_with(b"HTTP/1.1 502 ") {
+        assert!(!seen.bytes.windows(3).any(|w| w == b"T: "), "{:?}", String::from_utf8_lossy(&seen.bytes));
+        return;
+    }
     assert!(seen.closed, "the client connection is still open after {:?}", seen.elapsed);
 }
 
@@ -373,7 +377,9 @@ fn a_long_chunk_extension_that_fits_passes() {
 }
 
 /// Trailers that never end. `HAProxy` 3.5-dev8 relays the data, then closes the client
-/// connection at once. Ibex relayed them all.
+/// connection at once; or, when its first read of the response holds more trailer than
+/// the buffer, answers 502 with nothing of the response (T281: about 1 run in 4 here).
+/// Ibex relayed them all.
 #[test]
 fn endless_trailers_are_not_relayed() {
     let be = backend(|c| {
@@ -385,8 +391,12 @@ fn endless_trailers_are_not_relayed() {
         while c.write_all(&burst).is_ok() {}
     });
     let (_px, fe) = start("", be, "3s");
-    let seen = get(fe, Duration::from_secs(6), |_| false);
+    let seen = get(fe, Duration::from_secs(6), |b| b.starts_with(b"HTTP/1.1 502 ") && b.ends_with(b"</html>\n"));
     assert!(seen.total < 64 * 1024, "{} bytes relayed", seen.total);
+    if seen.bytes.starts_with(b"HTTP/1.1 502 ") {
+        assert!(!seen.bytes.windows(3).any(|w| w == b"T: "), "{:?}", String::from_utf8_lossy(&seen.bytes));
+        return;
+    }
     assert!(seen.closed, "the client connection is still open after {:?}", seen.elapsed);
     assert!(seen.elapsed < Duration::from_secs(2), "closed after {:?}", seen.elapsed);
 }
@@ -400,8 +410,8 @@ fn trailer_lines(c: &mut TcpStream, n: usize) {
 }
 
 /// 100 trailer fields pass, 101 do not: `HAProxy` 3.5-dev8 relays 100 and answers 502 to
-/// 101 (`tune.http.maxhdr`). Ibex has sent the head by then; the response is cut short
-/// before the 101st field and the connection closed.
+/// 101 (`tune.http.maxhdr`), when they arrive with the head: nothing of the response is
+/// relayed (T281; it was cut short before the 101st field).
 #[test]
 fn a_hundred_trailer_fields_pass_and_a_hundred_and_one_do_not() {
     let be = backend(|c| trailer_lines(c, 100));
@@ -413,8 +423,7 @@ fn a_hundred_trailer_fields_pass_and_a_hundred_and_one_do_not() {
 
     let be = backend(|c| trailer_lines(c, 101));
     let (_px, fe) = start("", be, "10s");
-    let seen = get(fe, Duration::from_secs(3), |_| false);
-    assert!(seen.closed, "the client connection is still open after {:?}", seen.elapsed);
-    assert!(count(&seen.bytes, b"T: v\r\n") <= 100, "{:?}", String::from_utf8_lossy(&seen.bytes));
-    assert!(!seen.bytes.ends_with(b"\r\n\r\n"), "the response looks complete: {:?}", String::from_utf8_lossy(&seen.bytes));
+    let seen = get(fe, Duration::from_secs(3), |b| b.ends_with(b"</html>\n"));
+    assert!(seen.bytes.starts_with(b"HTTP/1.1 502 "), "{:?}", String::from_utf8_lossy(&seen.bytes));
+    assert_eq!(count(&seen.bytes, b"T: v\r\n"), 0, "{:?}", String::from_utf8_lossy(&seen.bytes));
 }

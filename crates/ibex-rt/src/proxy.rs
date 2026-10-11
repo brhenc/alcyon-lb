@@ -1016,6 +1016,7 @@ impl TcpSession {
     pub fn rep_window(&self) -> usize {
         let data = self.rep.readable();
         match &self.txn {
+            Some(t) if self.mode == Mode::Http && t.rsp.holds_trailer(data, self.bufsize) => 0,
             Some(t) if self.mode == Mode::Http => t.client_window(data),
             _ => data.len(),
         }
@@ -1049,6 +1050,7 @@ impl TcpSession {
             // Not before its rules have run: a server connection kept from the last
             // transaction is ready to take bytes the moment a head is parsed, and the
             // request would reach it unfiltered and unrewritten.
+            Some(t) if t.req.holds_trailer(data, self.bufsize) => 0,
             Some(t) if t.req_rules_done && !t.local && t.error.is_none() => t.req.window(data),
             _ => 0,
         }
@@ -1878,12 +1880,26 @@ impl TcpSession {
                 // first, and answers a malformed chunk with 400 without contacting the
                 // server. Forwarded, the bytes Ibex refuses mid-body reached the server
                 // verbatim (tasks/T276, V&V VV-2).
+                // A trailer section past its cap is refused too, but `HAProxy` writes nothing
+                // back then: it logs a 400 `PR` and closes (3.5-dev8, T281).
                 if framing == txn::Framing::Chunked {
-                    let mut body = txn::MsgState::head(framing);
-                    body.advance(self.req.readable());
-                    if body == txn::MsgState::Error {
-                        self.fail_request(400);
-                        return Ok(true);
+                    match txn::MsgState::head(framing).check_body(self.req.readable()) {
+                        txn::BodyCheck::Broken | txn::BodyCheck::TooLarge { trailer: false } => {
+                            self.fail_request(400);
+                            return Ok(true);
+                        }
+                        txn::BodyCheck::TooLarge { trailer: true } => {
+                            self.fail_request(400);
+                            if let Some(t) = self.txn.as_mut() {
+                                t.quiet = true;
+                            }
+                            return Ok(true);
+                        }
+                        txn::BodyCheck::Held { trailer: true, .. } if self.req.len() >= self.bufsize => {
+                            // Held whole until the section is (`MsgState::holds_trailer`).
+                            self.req.grow_capacity(2 * self.bufsize);
+                        }
+                        txn::BodyCheck::Fine | txn::BodyCheck::Held { .. } => {}
                     }
                 }
                 let mut txn = HttpTxn::new(framing, close || self.close_client);

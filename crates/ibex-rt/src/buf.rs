@@ -663,6 +663,12 @@ impl Buf {
         self.len = 0;
     }
 
+    /// Makes room for at least `min` bytes in all: a message held whole until its end
+    /// arrives, longer than the buffer (a chunked body's trailer section behind its head).
+    pub fn grow_capacity(&mut self, min: usize) {
+        self.grow_to(min);
+    }
+
     /// Makes the backing store at least `min` bytes, readable data moved to index 0.
     ///
     /// A head rewrite can make the message longer than the buffer it was read into when the

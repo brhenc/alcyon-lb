@@ -81,13 +81,19 @@ pub enum Chunk {
 
 const CHUNK_START: Chunk = Chunk::Size { size: 0, digits: 0 };
 
-/// The longest chunk extension accepted, and the largest trailer section. `HAProxy` parses
-/// a chunk-size line, and the trailer section, only once it is all in the buffer: with the
-/// default `tune.bufsize` (16384), a 16300-byte extension or trailer section passes and a
+/// The longest chunk extension accepted (the trailer section has its own cap,
+/// [`MAX_TRAILER_SECTION`]). `HAProxy` parses a chunk-size line only once it is all in the
+/// buffer: with the default `tune.bufsize` (16384), a 16300-byte extension passes and a
 /// 16330-byte one does not (3.5-dev8). Past that it relays nothing more of the message.
 /// Without a cap, a server that sends an extension or trailers for ever had them relayed
 /// for ever (893 MB in 6 s, T248).
 const MAX_CHUNK_LINE: u16 = 16 * 1024;
+
+/// The largest trailer section accepted, its fields with their line ends. `HAProxy` holds
+/// the section in HTX with the blocks around it, whole: with the default `tune.bufsize`, a
+/// field of 16315 bytes of value passes and one of 16320 does not, with the rest of the
+/// message in the buffer or not (3.5-dev8, T281). The section of the first is 16322 bytes.
+const MAX_TRAILER_SECTION: u16 = 16323;
 
 /// The most trailer fields accepted: `tune.http.maxhdr` (101) less one, as for a head.
 /// `HAProxy` 3.5-dev8 relays 100 and answers 502 to 101.
@@ -108,11 +114,34 @@ fn is_tchar(b: u8) -> bool {
 }
 
 impl Chunk {
-    /// Whether forwarding may stop here: the start of a line, or inside chunk data. A
-    /// chunk-size line or a trailer field is forwarded only once it is complete, as
-    /// `HAProxy` parses each only once it is all in its buffer.
+    /// Whether forwarding may stop here: the start of a chunk-size line, or inside chunk
+    /// data. A chunk-size line is forwarded only once it is complete, and the last-chunk
+    /// line only with the whole trailer section after it, as `HAProxy` parses each only once
+    /// it is all in its buffer: a trailer section it refuses, or that does not fit, relays
+    /// none of it (T281, review r2#9: Ibex relayed the last-chunk line and up to 100 fields).
     fn at_boundary(self) -> bool {
-        matches!(self, Chunk::Size { digits: 0, .. } | Chunk::Data(_) | Chunk::DataCr | Chunk::Trailer { .. })
+        matches!(self, Chunk::Size { digits: 0, .. } | Chunk::Data(_) | Chunk::DataCr)
+    }
+
+    /// A chunk extension, or a trailer section, as long as it may be: one more byte of it
+    /// is refused.
+    fn over_cap(self) -> bool {
+        match self {
+            Chunk::Ext { len, .. } => len >= MAX_CHUNK_LINE,
+            Chunk::Trailer { len, .. }
+            | Chunk::TrailerName { len, .. }
+            | Chunk::TrailerValue { len, .. }
+            | Chunk::TrailerValueLf { len, .. } => len >= MAX_TRAILER_SECTION,
+            _ => false,
+        }
+    }
+
+    /// In the trailer section, after the last-chunk line.
+    fn in_trailer(self) -> bool {
+        matches!(
+            self,
+            Chunk::Trailer { .. } | Chunk::TrailerName { .. } | Chunk::TrailerValue { .. } | Chunk::TrailerValueLf { .. } | Chunk::TrailerEndLf
+        )
     }
 
     /// Scans `data`; returns how many bytes belong to the body and the state after them:
@@ -198,7 +227,7 @@ impl Chunk {
                 | Chunk::TrailerName { len, .. }
                 | Chunk::TrailerValue { len, .. }
                 | Chunk::TrailerValueLf { len, .. }
-                    if len >= MAX_CHUNK_LINE =>
+                    if len >= MAX_TRAILER_SECTION =>
                 {
                     Err(())
                 }
@@ -434,11 +463,73 @@ impl MsgState {
         debug_assert_eq!(used, n, "forwarded past the end of the message");
     }
 
+    /// What the body bytes of `data` (from this message's current position) hold, without
+    /// moving: a framing violation, a line or trailer section past its cap, or a line held
+    /// back until the rest of it is here. Only a chunked body holds anything back.
+    #[must_use]
+    pub fn check_body(&self, data: &[u8]) -> BodyCheck {
+        let mut s = *self;
+        let used = s.advance(data);
+        let broken = s == MsgState::Error;
+        if broken {
+            // The state at the last line boundary before the violation.
+            s = *self;
+            s.advance(&data[..used]);
+        }
+        let MsgState::Body(Body::Chunked(mut c)) = s else {
+            return if broken { BodyCheck::Broken } else { BodyCheck::Fine };
+        };
+        let mut i = used;
+        while i < data.len() {
+            if let Chunk::Data(n) = c {
+                let take = usize::try_from(n).unwrap_or(usize::MAX).min(data.len() - i);
+                i += take;
+                c = if take as u64 == n { Chunk::DataCr } else { Chunk::Data(n - take as u64) };
+                continue;
+            }
+            match c.scan(&data[i..=i], &mut 0, false) {
+                (1, Ok(Some(next))) => c = next,
+                (_, Ok(None)) => return BodyCheck::Fine,
+                _ if c.over_cap() => return BodyCheck::TooLarge { trailer: c.in_trailer() },
+                _ => return BodyCheck::Broken,
+            }
+            i += 1;
+        }
+        if used == data.len() {
+            BodyCheck::Fine
+        } else {
+            BodyCheck::Held { at: used, trailer: c.in_trailer() }
+        }
+    }
+
+    /// Whether this message is held whole, its head included, until more of it arrives: its
+    /// head is not sent yet, and `data` (`cap` bytes or more) ends in its trailer section.
+    /// `HAProxy` moves the head out of its input buffer into HTX and reads on, so it knows
+    /// whether the section fits before the head goes anywhere: a 16320-byte trailer field
+    /// behind a head is refused whole (a 502, or no request at all), a 15000-byte one behind
+    /// 2000 bytes of data passes (T281). The buffer holding `data` is made larger meanwhile
+    /// ([`Self::check_body`] refuses the section past its cap before that is full).
+    #[must_use]
+    pub fn holds_trailer(&self, data: &[u8], cap: usize) -> bool {
+        data.len() >= cap
+            && matches!(self, MsgState::Head { body: Framing::Chunked, .. })
+            && matches!(self.check_body(data), BodyCheck::Held { trailer: true, .. })
+    }
+
     /// How many bytes at the front of `data` belong to this message, without moving.
     #[must_use]
+    ///
+    /// None of `data` when the body breaks its framing in it: `HAProxy` parses what it read
+    /// before it forwards any, and forwards nothing of a read in which the parse fails
+    /// (a chunk `5\r\nhelloXX` after the head relays no `hello`; T281).
     pub fn window(&self, data: &[u8]) -> usize {
         let mut s = *self;
-        s.advance(data)
+        let n = s.advance(data);
+        if s == MsgState::Error {
+            0
+        } else {
+            n
+        }
     }
 
     #[must_use]
@@ -478,6 +569,36 @@ impl MsgState {
             i += 1;
         }
         None
+    }
+}
+
+/// What [`MsgState::check_body`] finds in the bytes of a body that are here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BodyCheck {
+    /// Nothing wrong, and nothing held back.
+    Fine,
+    /// The body violates its framing.
+    Broken,
+    /// A chunk extension, or a trailer section (`trailer`), is longer than it may be.
+    TooLarge { trailer: bool },
+    /// A chunk-size line, or the last-chunk line and the trailer section after it
+    /// (`trailer`), from offset `at`, is held back until its end arrives.
+    Held { at: usize, trailer: bool },
+}
+
+impl BodyCheck {
+    /// Whether the body cannot go on in a buffer of `cap` bytes holding `len`: it is broken,
+    /// or a trailer section held back fills the buffer, so the end it waits for has no room
+    /// to arrive (`tune.bufsize` below the cap). A chunk-size line that fills the buffer is
+    /// waited on, as `HAProxy` 3.5-dev8 does, until a time-out: a 20000-byte extension
+    /// behind a request head that went out draws the server's answer, not a close (T281).
+    #[must_use]
+    pub fn stuck(self, len: usize, cap: usize) -> bool {
+        match self {
+            BodyCheck::Broken | BodyCheck::TooLarge { .. } => true,
+            BodyCheck::Held { at, trailer } => trailer && at == 0 && len >= cap,
+            BodyCheck::Fine => false,
+        }
     }
 }
 
@@ -997,6 +1118,9 @@ pub struct HttpTxn {
     /// A reply owed to the client that the byte layer could not produce itself (it has no
     /// access to the error pages): a request that failed to parse.
     pub error: Option<u16>,
+    /// That reply is not written: the client connection closes with nothing sent, and the
+    /// status is only logged (`HAProxy` on a request trailer section past its cap, T281).
+    pub quiet: bool,
     /// The response was cut short (the server went away mid-body, or a tunnel side
     /// closed): what arrived is delivered and the connection closes.
     pub aborted: bool,
@@ -1057,6 +1181,7 @@ impl HttpTxn {
             keepalive_lost: false,
             client_head: false,
             error: None,
+            quiet: false,
             aborted: false,
             ck: crate::cookie::CookieTxn::default(),
             req_htx: None,
@@ -1243,6 +1368,42 @@ mod tests {
         assert_eq!(s.advance(b"5;ext\r"), 0);
         assert_eq!(s.advance(b"5;ext\r\nhel"), 10);
         assert_eq!(s, MsgState::Body(Body::Chunked(Chunk::Data(2))));
+    }
+
+    /// The last-chunk line and the trailer section move together, once the section is
+    /// all here (T281, review r2#9).
+    #[test]
+    fn a_trailer_section_moves_only_once_complete() {
+        let body = b"H\r\n\r\n5\r\nhello\r\n0\r\nX-A: 1\r\nX-B: 2\r\n";
+        let s = MsgState::head(Framing::Chunked);
+        assert_eq!(s.window(body), 15, "up to the last-chunk line");
+        let whole = [&body[..], b"\r\n"].concat();
+        assert_eq!(s.window(&whole), whole.len());
+        assert_eq!(s.check_body(body), BodyCheck::Held { at: 15, trailer: true });
+        assert_eq!(s.check_body(b"H\r\n\r\n5;ext"), BodyCheck::Held { at: 5, trailer: false });
+        assert_eq!(s.check_body(&whole), BodyCheck::Fine);
+    }
+
+    /// Nothing of a read in which the body breaks its framing moves; why it broke is told
+    /// apart, and a section held from the front of a full buffer is stuck.
+    #[test]
+    fn a_broken_body_moves_nothing_and_says_why() {
+        let s = MsgState::head(Framing::Chunked);
+        assert_eq!(s.window(b"H\r\n\r\n5\r\nhelloXX\r\n"), 0);
+        assert_eq!(s.check_body(b"H\r\n\r\n5\r\nhelloXX\r\n"), BodyCheck::Broken);
+        let big = [&b"H\r\n\r\n0\r\nX-T: "[..], &[b'a'; 16400]].concat();
+        assert_eq!(s.window(&big), 0);
+        assert_eq!(s.check_body(&big), BodyCheck::TooLarge { trailer: true });
+        let fits = [&b"H\r\n\r\n0\r\nX-T: "[..], &[b'a'; 16300], b"\r\n\r\n"].concat();
+        assert_eq!(s.check_body(&fits), BodyCheck::Fine);
+        let ext = [&b"H\r\n\r\n1;"[..], &[b'e'; 16400]].concat();
+        assert_eq!(s.check_body(&ext), BodyCheck::TooLarge { trailer: false });
+        assert!(BodyCheck::Held { at: 0, trailer: true }.stuck(16384, 16384));
+        assert!(!BodyCheck::Held { at: 10, trailer: true }.stuck(16384, 16384));
+        assert!(!BodyCheck::Held { at: 0, trailer: false }.stuck(100, 16384));
+        assert!(!BodyCheck::Held { at: 0, trailer: false }.stuck(16384, 16384), "an extension is waited on");
+        assert!(s.holds_trailer(&[&b"H\r\n\r\n0\r\nX-T: "[..], &[b'a'; 16300]].concat(), 16300));
+        assert!(!s.holds_trailer(&fits, 16300));
     }
 
     #[test]
