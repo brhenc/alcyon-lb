@@ -244,6 +244,8 @@ impl Listener {
             self.fd.as_fd(),
             SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
         ) {
+            // Past `maxsock`: closed, and reported as out of fds so the listener pauses.
+            Ok((fd, _)) if crate::globalconn::past_maxsock(fd.as_raw_fd()) => Err(Errno::MFILE.into()),
             Ok((fd, addr)) => {
                 let peer = addr
                     .as_ref()

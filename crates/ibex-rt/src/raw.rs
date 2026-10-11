@@ -12,7 +12,7 @@ use rustix::net::{
 use std::cell::Cell;
 use std::io;
 use std::net::SocketAddr;
-use std::os::fd::{BorrowedFd, OwnedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 
 /// Outcome of a transport read or write.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -191,6 +191,10 @@ pub fn connect_opts(addr: SocketAddr, tfo: bool) -> io::Result<(OwnedFd, bool)> 
         SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
         None,
     )?;
+    if crate::globalconn::past_maxsock(fd.as_raw_fd()) {
+        // "socket(): not enough free sockets": the socket is closed on return.
+        return Err(Errno::MFILE.into());
+    }
 
     // Disable Nagle's algorithm matching HAProxy
     let _ = net::sockopt::set_tcp_nodelay(&fd, true);

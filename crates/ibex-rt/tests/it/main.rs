@@ -177,6 +177,7 @@ mod logfmt_unknown_fetch;
 mod many_log_lines;
 mod master_cli;
 mod maxconn_client_left;
+mod maxsock_limit;
 mod monitor_uri;
 mod multithread;
 mod no_log;

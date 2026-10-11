@@ -68,6 +68,16 @@ pub fn maxsock_value() -> Option<u64> {
     Some(MAXSOCK.load(Ordering::Relaxed)).filter(|&v| v != 0)
 }
 
+/// Whether `fd` is at or past `maxsock`. `HAProxy` closes such a socket whatever the soft
+/// limit on open files allows: an accepted one pauses the listener (`sock_accept_conn`), a
+/// server one fails its connect as a configuration limit (`sock_create_server_socket`), so
+/// the descriptors stay within what `maxconn` sized (MY-7). Never true before
+/// [`apply_nofile_limit`] ran (tests driving an engine in-process).
+#[must_use]
+pub fn past_maxsock(fd: std::os::fd::RawFd) -> bool {
+    maxsock_value().is_some_and(|m| u64::try_from(fd).is_ok_and(|fd| fd >= m))
+}
+
 /// `show info` `Ulimit-n`: the limit [`apply_nofile_limit`] settled, `None` before it ran.
 #[must_use]
 pub fn ulimit_n() -> Option<u64> {
