@@ -461,9 +461,7 @@ impl H1Parser {
                 return Ok(line_end + delim_len);
             }
             match std::str::from_utf8(value) {
-                // (UTF-8 that spells an escape character is held as its bytes, too.)
-                Ok(value) if !ibex_regex::bytetext::has_escapes(value) => htx.push_header(name, value),
-                Ok(_) => htx.push_header_latin1(name, value),
+                Ok(value) => htx.push_header(name, value),
                 // obs-text (RFC 9110 section 5.5) that is not UTF-8: Latin-1 from an old
                 // client, which HAProxy forwards as received (T285, V&V VV-8).
                 Err(_) => htx.push_header_latin1(name, value),

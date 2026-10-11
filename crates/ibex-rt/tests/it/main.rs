@@ -121,6 +121,7 @@ mod h3_many_threads;
 mod h3_proxy_path;
 mod h3_request_framing_to_backend;
 mod header_bytes_limits;
+mod h2_pua_header;
 mod latin1_header_rules;
 mod hard_stop_websocket_fin;
 mod hatop_compat;

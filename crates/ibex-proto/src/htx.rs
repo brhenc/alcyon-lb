@@ -1401,26 +1401,22 @@ impl<'a> HtxSlice<'a> {
         )
     }
 
+    /// Pushes a header whose value is text a peer sent. A character the byte mapping uses
+    /// (U+F780-U+F7FF, [`ibex_regex::bytetext`]) in it is held as its own UTF-8 bytes, so
+    /// the flag is never inferred from what a peer sent: only [`Self::push_header_latin1`]
+    /// sets it (T286).
     pub fn push_header(&mut self, name: &str, value: &str) -> Result<(), HtxError> {
-        push_header_raw(
-            self.buf,
-            &mut self.tail_addr,
-            &mut self.num_blocks,
-            name,
-            value,
-        )?;
-        // A value holding escaped bytes is written as those bytes (T286).
-        if !value.is_ascii() && ibex_regex::bytetext::has_escapes(value) {
-            self.set_last_flag(HTX_BLK_FL_LATIN1);
+        if value.is_ascii() || !ibex_regex::bytetext::has_escapes(value) {
+            return push_header_raw(self.buf, &mut self.tail_addr, &mut self.num_blocks, name, value);
         }
-        Ok(())
+        self.push_header_latin1(name, value.as_bytes())
     }
 
     /// [`Self::push_header`] of a value that is not UTF-8, read as Latin-1 and flagged
     /// [`HTX_BLK_FL_LATIN1`].
     pub fn push_header_latin1(&mut self, name: &str, value: &[u8]) -> Result<(), HtxError> {
         let text = latin1_to_text(value);
-        self.push_header(name, &text)?;
+        push_header_raw(self.buf, &mut self.tail_addr, &mut self.num_blocks, name, &text)?;
         self.set_last_flag(HTX_BLK_FL_LATIN1);
         Ok(())
     }
@@ -2857,6 +2853,23 @@ mod tests {
             assert_eq!(wire("caf\u{e9}", latin1), "GET / HTTP/1.1\r\nx-a: caf\u{e9}\r\n\r\n".as_bytes());
             assert_eq!(wire("\u{20ac}", latin1), "GET / HTTP/1.1\r\nx-a: \u{20ac}\r\n\r\n".as_bytes());
         }
+    }
+
+    /// `push_header` takes text a peer sent: U+F780 in it is EF 9E 80 on the wire, never the
+    /// byte 0x80 that the same character stands for in a value held as bytes (T286).
+    #[test]
+    fn push_header_of_peer_text_never_means_a_stray_byte() {
+        let mut buf = [0u8; 1024];
+        let mut htx = HtxSlice::new(&mut buf);
+        htx.push_req_line("GET", "/", "HTTP/1.1").unwrap();
+        htx.push_header("x-a", "a\u{f780}b").unwrap();
+        htx.push_header_latin1("x-b", b"a\x80b").unwrap();
+        htx.push_header_latin1("x-c", b"a\xef\x9e\x80b\x80").unwrap();
+        htx.push_eoh().unwrap();
+        assert_eq!(htx.as_ref().to_h1_wire(), b"GET / HTTP/1.1\r\nx-a: a\xef\x9e\x80b\r\nx-b: a\x80b\r\nx-c: a\xef\x9e\x80b\x80\r\n\r\n");
+        let vals: Vec<String> = htx.as_ref().headers().map(|(_, v)| v.to_string()).collect();
+        assert_ne!(vals[0], vals[1]);
+        assert_ne!(vals[0], vals[2]);
     }
 
     #[test]
