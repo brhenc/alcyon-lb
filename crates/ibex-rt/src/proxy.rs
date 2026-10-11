@@ -333,8 +333,8 @@ pub enum ConnEnd {
     ShutBoth,
     /// `abort_with_rst`.
     Abort,
-    /// `silent_drop`, IPv6 or not.
-    SilentDrop(bool),
+    /// `silent_drop`: IPv6 or not, and the TTL of the RST.
+    SilentDrop(bool, u8),
 }
 
 /// The child's side: the stream it serves and its owner.
@@ -368,7 +368,7 @@ pub struct H2Child {
 impl H2Child {
     /// Records what the stream does to the client connection; a reset outweighs a FIN.
     fn end_conn(&mut self, how: ConnEnd) {
-        if !matches!(self.conn_end, Some(ConnEnd::Abort | ConnEnd::SilentDrop(_))) {
+        if !matches!(self.conn_end, Some(ConnEnd::Abort | ConnEnd::SilentDrop(..))) {
             self.conn_end = Some(how);
         }
     }
@@ -686,12 +686,12 @@ impl TcpSession {
     }
 
     /// `silent-drop` on the client connection; a stream's, through its owner.
-    pub fn silent_drop_client(&mut self, is_ipv6: bool) {
+    pub fn silent_drop_client(&mut self, is_ipv6: bool, ttl: u8) {
         match self.cli.fd() {
-            Some(fd) => raw::silent_drop(fd, is_ipv6),
+            Some(fd) => raw::silent_drop(fd, is_ipv6, ttl),
             None => {
                 if let Some(c) = self.h2_child_mut() {
-                    c.end_conn(ConnEnd::SilentDrop(is_ipv6));
+                    c.end_conn(ConnEnd::SilentDrop(is_ipv6, ttl));
                 }
             }
         }
@@ -703,14 +703,14 @@ impl TcpSession {
     /// measured on `HAProxy` 3.5-dev8, `reject` resets the stream with `ENHANCE_YOUR_CALM`
     /// and sends a `GOAWAY` with the same code, `silent-drop` only resets the stream
     /// (`REFUSED_STREAM`) and the connection goes on.
-    pub fn refuse_request(&mut self, silent: bool, is_ipv6: bool) {
+    pub fn refuse_request(&mut self, silent: bool, is_ipv6: bool, ttl: u8) {
         use ibex_proto::h2::H2Error;
         if let Some(c) = self.h2_child_mut() {
             c.rst = Some(if silent { H2Error::RefusedStream } else { H2Error::EnhanceYourCalm });
             c.goaway = (!silent).then_some(H2Error::EnhanceYourCalm);
             c.finished = true;
         } else if silent {
-            self.silent_drop_client(is_ipv6);
+            self.silent_drop_client(is_ipv6, ttl);
         }
     }
 

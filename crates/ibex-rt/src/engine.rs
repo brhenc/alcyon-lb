@@ -5231,8 +5231,8 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     }
                     return;
                 }
-                ConnEvalOutcome::SilentDrop => {
-                    raw::silent_drop(cli_fd.as_fd(), peer_addr.is_ipv6());
+                ConnEvalOutcome::SilentDrop(ttl) => {
+                    raw::silent_drop(cli_fd.as_fd(), peer_addr.is_ipv6(), ttl);
                     self.proxies[proxy_idx].counters().denied_conn.fetch_add(1, Ordering::Relaxed);
                     for (t_idx, ref key) in tracked_sc.iter().flatten() {
                         if let Some(ref tbl) = self.proxies[*t_idx].stick_table {
@@ -5597,14 +5597,15 @@ enum ConnEvalOutcome {
     /// Client, server, `fc_src`, `fc_dst`, and whether `expect-proxy` matched.
     Accept(SocketAddr, SocketAddr, SocketAddr, SocketAddr, bool),
     Reject,
-    SilentDrop,
+    /// `silent-drop`; the TTL of the RST (`rst-ttl`, 1 without it).
+    SilentDrop(u8),
 }
 
 #[derive(Debug, PartialEq, Eq)]
 enum SessionEvalOutcome {
     Accept,
     Reject,
-    SilentDrop,
+    SilentDrop(u8),
 }
 
 /// `tcp-request session` rules of a connection that opened with a PROXY header, once the
@@ -5621,9 +5622,9 @@ fn run_deferred_session_rules(proxy_idx: usize, proxies: &[Proxy], sess: &mut Tc
     match eval_tcp_req_session_rules(&proxies[proxy_idx], proxies, sample_registry(), sess) {
         SessionEvalOutcome::Accept => return,
         SessionEvalOutcome::Reject => sess.abort_client(),
-        SessionEvalOutcome::SilentDrop => {
+        SessionEvalOutcome::SilentDrop(ttl) => {
             let is_ipv6 = sess.fc_src.or(sess.client_addr).is_some_and(|a| a.is_ipv6());
-            sess.silent_drop_client(is_ipv6);
+            sess.silent_drop_client(is_ipv6, ttl);
         }
     }
     proxies[proxy_idx].counters().denied_req.fetch_add(1, Ordering::Relaxed);
@@ -5675,7 +5676,10 @@ fn eval_tcp_req_conn_rules(
         }
         match &rule.action {
             ibex_config::TcpReqConnAction::SilentDrop => {
-                return ConnEvalOutcome::SilentDrop;
+                return ConnEvalOutcome::SilentDrop(1);
+            }
+            ibex_config::TcpReqConnAction::SilentDropTtl(ttl) => {
+                return ConnEvalOutcome::SilentDrop(*ttl);
             }
             ibex_config::TcpReqConnAction::Reject => {
                 return ConnEvalOutcome::Reject;
@@ -5793,7 +5797,10 @@ fn eval_tcp_req_session_rules(
         }
         match &rule.action {
             ibex_config::TcpReqSessionAction::SilentDrop => {
-                return SessionEvalOutcome::SilentDrop;
+                return SessionEvalOutcome::SilentDrop(1);
+            }
+            ibex_config::TcpReqSessionAction::SilentDropTtl(ttl) => {
+                return SessionEvalOutcome::SilentDrop(*ttl);
             }
             ibex_config::TcpReqSessionAction::Reject => {
                 return SessionEvalOutcome::Reject;
@@ -5944,7 +5951,7 @@ enum ContentEvalResult {
     Done,
     Waiting,
     Reject,
-    SilentDrop,
+    SilentDrop(u8),
 }
 
 #[allow(clippy::too_many_lines)]
@@ -6038,7 +6045,11 @@ fn eval_tcp_req_content_rules(
         match &rule.action {
             ibex_config::TcpReqContentAction::SilentDrop => {
                 note_last_rule(sess, rule.line);
-                return ContentEvalResult::SilentDrop;
+                return ContentEvalResult::SilentDrop(1);
+            }
+            ibex_config::TcpReqContentAction::SilentDropTtl(ttl) => {
+                note_last_rule(sess, rule.line);
+                return ContentEvalResult::SilentDrop(*ttl);
             }
             ibex_config::TcpReqContentAction::Reject => {
                 note_last_rule(sess, rule.line);
@@ -6297,7 +6308,7 @@ fn eval_tcp_res_content_rules(proxy: &Proxy, proxies: &[Proxy], registry: &Regis
             }
             ibex_config::TcpResAction::SilentDrop => {
                 note_last_rule(sess, rule.line);
-                return ContentEvalResult::SilentDrop;
+                return ContentEvalResult::SilentDrop(1);
             }
             ibex_config::TcpResAction::SetVar { var_name, expr } => {
                 set_var_from_expr(&mut sess.sess_vars, &mut sess.req_vars, var_name, expr, &ctx, registry);
@@ -6847,9 +6858,9 @@ fn init_client_session(
             proxies[proxy_idx].counters().denied_req.fetch_add(1, Ordering::Relaxed);
             return None;
         }
-        SessionEvalOutcome::SilentDrop => {
+        SessionEvalOutcome::SilentDrop(ttl) => {
             let is_ipv6 = peer_addr.is_ipv6();
-            sess.silent_drop_client(is_ipv6);
+            sess.silent_drop_client(is_ipv6, ttl);
             proxies[proxy_idx].counters().denied_req.fetch_add(1, Ordering::Relaxed);
             return None;
         }
@@ -8897,7 +8908,7 @@ impl EngineDispatcher<'_> {
                 }
                 Some(crate::proxy::ConnEnd::ShutBoth) => owner.sess.shutdown_both_client(),
                 Some(crate::proxy::ConnEnd::Abort) => owner.sess.abort_client(),
-                Some(crate::proxy::ConnEnd::SilentDrop(v6)) => owner.sess.silent_drop_client(v6),
+                Some(crate::proxy::ConnEnd::SilentDrop(v6, ttl)) => owner.sess.silent_drop_client(v6, ttl),
                 None => {}
             }
             if owner.sess.srv.is_some() {
@@ -9093,9 +9104,9 @@ impl EngineDispatcher<'_> {
                         entry.sess.srv_state = ScState::Closed;
                         entry.sess.tcp_inspect_done = true;
                     }
-                    ContentEvalResult::SilentDrop => {
+                    ContentEvalResult::SilentDrop(ttl) => {
                         let is_ipv6 = entry.sess.client_addr.is_some_and(|a| a.is_ipv6());
-                        entry.sess.silent_drop_client(is_ipv6);
+                        entry.sess.silent_drop_client(is_ipv6, ttl);
                         self.proxies[proxy_idx].counters().denied_req.fetch_add(1, Ordering::Relaxed);
                         entry.sess.cli_state = ScState::Closed;
                         entry.sess.srv_state = ScState::Closed;
@@ -9130,9 +9141,9 @@ impl EngineDispatcher<'_> {
                         entry.sess.cli_state = ScState::Closed;
                         entry.sess.srv_state = ScState::Closed;
                     }
-                    ContentEvalResult::SilentDrop => {
+                    ContentEvalResult::SilentDrop(ttl) => {
                         let is_ipv6 = entry.sess.client_addr.is_some_and(|a| a.is_ipv6());
-                        entry.sess.silent_drop_client(is_ipv6);
+                        entry.sess.silent_drop_client(is_ipv6, ttl);
                         if let Some(srv_fd) = entry.sess.srv.as_ref() {
                             raw::abort_with_rst(srv_fd.as_fd());
                         }
@@ -10029,7 +10040,7 @@ impl EngineDispatcher<'_> {
                     proxies[entry.proxy_idx].counters().denied_req.fetch_add(1, Ordering::Relaxed);
                     proxies[entry.backend_idx.min(proxies.len() - 1)].counters().denied_req.fetch_add(1, Ordering::Relaxed);
                     let is_ipv6 = entry.sess.client_addr.is_some_and(|a| a.is_ipv6());
-                    entry.sess.refuse_request(true, is_ipv6);
+                    entry.sess.refuse_request(true, is_ipv6, 1);
                     if let Some(txn) = entry.sess.txn.as_mut() {
                         txn.close_after = true;
                         txn.aborted = true;
@@ -10526,6 +10537,7 @@ impl EngineDispatcher<'_> {
                         | ibex_config::HttpReqAction::Tarpit { .. }
                         | ibex_config::HttpReqAction::Reject
                         | ibex_config::HttpReqAction::SilentDrop
+                        | ibex_config::HttpReqAction::SilentDropTtl(_)
                 ) {
                     note_last_rule(sess, rule.line);
                 }
@@ -10611,12 +10623,19 @@ impl EngineDispatcher<'_> {
                     // `reject` closes the client connection, `silent-drop` makes it vanish;
                     // either way no response is made and the server is not contacted. The
                     // `tcp-request content` versions end the same way (above).
-                    ibex_config::HttpReqAction::Reject | ibex_config::HttpReqAction::SilentDrop => {
+                    ibex_config::HttpReqAction::Reject
+                    | ibex_config::HttpReqAction::SilentDrop
+                    | ibex_config::HttpReqAction::SilentDropTtl(_) => {
                         sess.log.term = Some(*b"PR");
                         proxies[proxy_idx].counters().denied_req.fetch_add(1, Ordering::Relaxed);
                         for_tracked(proxies, sess, |data| data.count_err());
                         let is_ipv6 = sess.client_addr.is_some_and(|a| a.is_ipv6());
-                        sess.refuse_request(matches!(rule.action, ibex_config::HttpReqAction::SilentDrop), is_ipv6);
+                        let (silent, ttl) = match rule.action {
+                            ibex_config::HttpReqAction::SilentDrop => (true, 1),
+                            ibex_config::HttpReqAction::SilentDropTtl(ttl) => (true, ttl),
+                            _ => (false, 1),
+                        };
+                        sess.refuse_request(silent, is_ipv6, ttl);
                         // No response is owed, and the server's absence is no 502.
                         if let Some(t) = sess.txn.as_mut() {
                             t.close_after = true;
@@ -11119,9 +11138,9 @@ impl EngineDispatcher<'_> {
                     entry.sess.srv_state = ScState::Closed;
                     return None;
                 }
-                ContentEvalResult::SilentDrop => {
+                ContentEvalResult::SilentDrop(ttl) => {
                     let is_ipv6 = entry.sess.client_addr.is_some_and(|a| a.is_ipv6());
-                    entry.sess.silent_drop_client(is_ipv6);
+                    entry.sess.silent_drop_client(is_ipv6, ttl);
                     proxies[be_idx].counters().denied_req.fetch_add(1, Ordering::Relaxed);
                     entry.sess.cli_state = ScState::Closed;
                     entry.sess.srv_state = ScState::Closed;
@@ -11538,9 +11557,9 @@ impl EngineDispatcher<'_> {
                     entry.sess.srv_state = ScState::Closed;
                     return;
                 }
-                ContentEvalResult::SilentDrop => {
+                ContentEvalResult::SilentDrop(ttl) => {
                     let is_ipv6 = entry.sess.client_addr.is_some_and(|a| a.is_ipv6());
-                    entry.sess.silent_drop_client(is_ipv6);
+                    entry.sess.silent_drop_client(is_ipv6, ttl);
                     proxies[be_idx].counters().denied_req.fetch_add(1, Ordering::Relaxed);
                     entry.sess.cli_state = ScState::Closed;
                     entry.sess.srv_state = ScState::Closed;

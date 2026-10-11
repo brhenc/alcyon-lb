@@ -30,9 +30,7 @@ pub(crate) fn parse_log(
             "<log> expects <address> and <facility> as arguments.",
         ));
     }
-    if logs.len() >= 2 {
-        return Err(ConfigError::new(kw.line, kw.col, "too many syslog servers"));
-    }
+    // No limit on the number of `log` lines: 500 in `global` load on HAProxy 3.5-dev8.
 
     let target = parse_log_target(&tokens[1])?;
 

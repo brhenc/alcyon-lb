@@ -69,12 +69,35 @@ fn expect_cond_in(list: &str, tokens: &[Token], at: usize, act_token: &Token) ->
     }
 }
 
-/// `silent-drop rst-ttl <ttl>` sends the RST with that TTL; Ibex always uses a TTL of 1 and
-/// does not take the argument, so it is refused rather than accepted and ignored.
+/// `silent-drop rst-ttl <ttl>` sends the RST with that TTL. The http-response form is not
+/// implemented (it is a header marker, not an action), so it is refused rather than accepted
+/// and ignored.
 fn refuse_rst_ttl(list: &str, tokens: &[Token]) -> Result<(), ConfigError> {
     match tokens.get(2) {
         Some(t) if t.text == "rst-ttl" => Err(ConfigError::new(t.line, t.col, format!("'{list} silent-drop rst-ttl' is not implemented"))),
         _ => Ok(()),
+    }
+}
+
+/// The optional `rst-ttl <1-255>` of a `silent-drop` rule, `tokens[at]` on: the TTL and the
+/// index of the token after it, or `None` when the option is absent. The messages are those
+/// of `HAProxy` 3.5 (`parse_rst_ttl`/`strl2uic` in `src/tcp_act.c`).
+pub(crate) fn parse_rst_ttl(tokens: &[Token], at: usize) -> Result<Option<(u8, usize)>, ConfigError> {
+    let Some(opt) = tokens.get(at).filter(|t| t.text == "rst-ttl") else { return Ok(None) };
+    let Some(v) = tokens.get(at + 1) else {
+        return Err(ConfigError::new(opt.line, opt.col, "missing rst-ttl value"));
+    };
+    let err = |m: String| ConfigError::new(v.line, v.col, m);
+    let digits = v.text.bytes().take_while(u8::is_ascii_digit).count();
+    if v.text.starts_with('-') {
+        return Err(err("valid rst-ttl values are [1-255]".into()));
+    }
+    if digits < v.text.len() {
+        return Err(err(format!("invalid character starting at '{}' (value 1-255 expected)", &v.text[digits..])));
+    }
+    match v.text.parse::<u8>() {
+        Ok(n @ 1..) => Ok(Some((n, at + 2))),
+        _ => Err(err("valid rst-ttl values are [1-255]".into())),
     }
 }
 
@@ -924,9 +947,10 @@ fn parse_http_req_rule_at(
         let cond = expect_cond_at(tokens, 2, act_token)?;
         rules.push(HttpReqRule { action: HttpReqAction::Reject, cond, line: 0 });
     } else if act_str == "silent-drop" {
-        refuse_rst_ttl("http-request", tokens)?;
-        let cond = expect_cond_at(tokens, 2, act_token)?;
-        rules.push(HttpReqRule { action: HttpReqAction::SilentDrop, cond, line: 0 });
+        let ttl = parse_rst_ttl(tokens, 2)?;
+        let cond = expect_cond_at(tokens, ttl.map_or(2, |t| t.1), act_token)?;
+        let action = ttl.map_or(HttpReqAction::SilentDrop, |t| HttpReqAction::SilentDropTtl(t.0));
+        rules.push(HttpReqRule { action, cond, line: 0 });
     } else if act_str == "wait-for-body" {
         let (time, at_least, cond) = parse_wait_for_body(tokens, "http-request", act_token)?;
         rules.push(HttpReqRule { action: HttpReqAction::WaitForBody { time_ms: Some(time), at_least }, cond, line: 0 });

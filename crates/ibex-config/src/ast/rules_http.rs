@@ -55,6 +55,8 @@ pub enum HttpReqAction {
     Reject,
     /// `silent-drop`: the client is not told (no FIN, an RST that does not reach it).
     SilentDrop,
+    /// `silent-drop rst-ttl <1-255>`: the RST is sent with that TTL (`SilentDrop` is a TTL of 1).
+    SilentDropTtl(u8),
     SetHeader {
         name: String,
         fmt: String,

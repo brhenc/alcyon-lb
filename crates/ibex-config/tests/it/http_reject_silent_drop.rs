@@ -3,7 +3,7 @@
 
 //! `http-request reject`, `http-request silent-drop` and `http-response silent-drop` load
 //! (tasks/T305 item 1). Measured with `haproxy -c` on 3.5-dev8: each takes an optional
-//! `if`/`unless` condition and nothing else but `rst-ttl <1-255>`, which Ibex refuses;
+//! `if`/`unless` condition and nothing else but `rst-ttl <1-255>` (which Ibex refuses on `http-response` only);
 //! `http-response reject` and `http-after-response silent-drop` are refused by `HAProxy`.
 
 use ibex_config::{parse_str, HttpReqAction};
@@ -48,14 +48,13 @@ fn extra_words_and_the_actions_haproxy_has_not_are_refused() {
         "http-response silent-drop foo",
         "http-response reject",
         "http-after-response silent-drop",
-        // HAProxy takes this; Ibex always uses a TTL of 1 and would ignore it.
-        "http-request silent-drop rst-ttl 5",
+        // HAProxy takes this; Ibex would ignore it (tests/it/rst_ttl.rs has the request form).
         "http-response silent-drop rst-ttl 5",
     ] {
         assert!(load(rule).is_err(), "{rule} should be refused");
     }
     let err = load("http-request reject foo").expect_err("refused");
     assert!(err.message.contains("'http-request reject' expects either 'if' or 'unless' followed by a condition but found 'foo'"), "{}", err.message);
-    let err = load("http-request silent-drop rst-ttl 5").expect_err("refused");
+    let err = load("http-response silent-drop rst-ttl 5").expect_err("refused");
     assert!(err.message.contains("not implemented"), "{}", err.message);
 }
