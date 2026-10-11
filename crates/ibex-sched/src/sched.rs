@@ -425,15 +425,39 @@ impl Scheduler {
     }
 
     fn tasklet_wakeup_live(&mut self, r: TaskRef, class: Class, reason: u32) {
-        {
+        let heavy = {
             let t = self.tasks.get_mut(r);
             if t.state & state::QUEUED != 0 {
                 t.state |= reason;
                 return;
             }
             t.state |= state::QUEUED | reason;
+            t.state & state::HEAVY != 0
+        };
+        // A heavy task goes to `Heavy` whoever wakes it, as `__tasklet_wakeup_here`
+        // (src/task.c) checks `TASK_HEAVY` before the class the caller asked for: the
+        // one-per-pass cap means nothing if an I/O wakeup can put it among the urgent.
+        self.push_tasklet(if heavy { Class::Heavy } else { class }, r);
+    }
+
+    /// Marks `r` heavy (a TLS handshake in progress: `TASK_HEAVY`, set by `ssl_sock_init`)
+    /// or not (cleared once the handshake is done). A heavy task is woken into `Heavy`,
+    /// of which one runs per pass.
+    pub fn set_heavy(&mut self, r: TaskRef, heavy: bool) {
+        if self.usable(r, "set_heavy") {
+            let t = self.tasks.get_mut(r);
+            if heavy {
+                t.state |= state::HEAVY;
+            } else {
+                t.state &= !state::HEAVY;
+            }
         }
-        self.push_tasklet(class, r);
+    }
+
+    /// Whether `r` is marked heavy.
+    #[must_use]
+    pub fn is_heavy(&self, r: TaskRef) -> bool {
+        self.tasks.is_live(r) && self.tasks.get(r).state & state::HEAVY != 0
     }
 
     /// Sets a task's timeout.

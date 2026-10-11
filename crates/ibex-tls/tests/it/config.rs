@@ -387,3 +387,32 @@ mod versions {
         assert!(names(Some(TlsVersion::Tls13), Some(TlsVersion::Tls12)).is_empty());
     }
 }
+
+/// Session resumption lasts as long as `HAProxy`'s (T283). With no `tune.ssl.lifetime`,
+/// `HAProxy` leaves OpenSSL's session timeout alone: 7200 s, which is the lifetime hint
+/// of its NewSessionTicket (`openssl sess_id -text` after `s_client -sess_out`, TLS 1.2
+/// and 1.3 alike, 3.5-dev8-885761-29), and past which OpenSSL refuses to resume.
+/// rustls's own ticketer advertised 43200 s and kept its keys for as long.
+mod resumption_lifetime {
+    use ibex_tls::TlsConfig;
+
+    #[test]
+    fn tickets_advertise_and_last_haproxys_7200_s() {
+        let (_dir, crt) = super::a_test_cert();
+        let cfg = TlsConfig::from_bind_config(&super::a_test_bind(crt)).expect("build");
+        assert!(cfg.ticketer.enabled(), "tickets are on by default, as in HAProxy");
+        assert_eq!(cfg.ticketer.lifetime(), 7200, "the NewSessionTicket lifetime hint");
+    }
+}
+
+fn a_test_cert() -> (tempfile::TempDir, String) {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let path = dir.path().join("c.pem");
+    std::fs::write(&path, common::generate_test_cert_bundle_pem(vec!["localhost".to_string()])).expect("write");
+    let p = path.to_string_lossy().to_string();
+    (dir, p)
+}
+
+fn a_test_bind(crt: String) -> BindConfig {
+    BindConfig { crt: vec![crt], ..default_bind() }
+}

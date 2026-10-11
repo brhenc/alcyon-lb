@@ -116,6 +116,20 @@ fn sslhello(mut s: TcpStream) {
     answer(s, &rec);
 }
 
+/// The same record, its header first and its body 100 ms later: the check must wait for
+/// the rest rather than judge the first five bytes (T283's covercheck found the waiting
+/// path reached only when the scheduler happened to look between two segments).
+fn sslhello_split(mut s: TcpStream) {
+    let _ = read_some(&mut s);
+    let mut rec = vec![0x16, 0x03, 0x00, 0x00, 0x2a, 0x02, 0x00, 0x00, 0x26, 0x03, 0x00];
+    rec.extend_from_slice(&[0u8; 32]);
+    rec.extend_from_slice(&[0x00, 0x00, 0x2f, 0x00]);
+    let _ = s.write_all(&rec[..5]);
+    let _ = s.flush();
+    thread::sleep(Duration::from_millis(100));
+    answer(s, &rec[5..]);
+}
+
 fn tcp_step1(mut s: TcpStream) {
     let _ = s.write_all(if broken() { b"nope\r\n" } else { b"hello\r\n" });
     let _ = read_some(&mut s);
@@ -207,6 +221,12 @@ fn mysql_check_reports_the_server_version_with_and_without_a_user() {
 fn pgsql_check_passes_on_authentication_ok() {
     let line = check_line("  option pgsql-check user haproxy", &fake(pgsql).to_string());
     assert_line(&line, &["succeeded, reason: Layer7 check passed", "info: \"PostgreSQL server is ok\""]);
+}
+
+#[test]
+fn ssl_hello_check_waits_for_a_record_sent_in_two_parts() {
+    let line = check_line("  option ssl-hello-chk", &fake(sslhello_split).to_string());
+    assert_line(&line, &["succeeded, reason: Layer6 check passed"]);
 }
 
 #[test]
