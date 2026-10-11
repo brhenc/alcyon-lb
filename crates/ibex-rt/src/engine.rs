@@ -8647,7 +8647,8 @@ impl EngineDispatcher<'_> {
             if let Some(ch) = c.sess.h2_child_mut() {
                 ch.owner = None;
             }
-            if !matches!(c.sess.cli_state, ScState::Closed | ScState::Error) {
+            // (Its owner's pass has usually told it the connection is closed already.)
+            if c.sess.cli_state != ScState::Error {
                 c.sess.cli_state = ScState::Closed;
             }
             c.sess.ending.get_or_insert(crate::proxy::Ending::ClientAbort);
