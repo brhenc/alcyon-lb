@@ -596,7 +596,8 @@ impl TestBackend {
         let seen: Arc<std::sync::Mutex<Vec<Vec<u8>>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = Arc::clone(&seen);
         thread::spawn(move || {
-            for _ in 0..conns {
+            let mut left = conns;
+            while left > 0 {
                 let Ok((mut c, _)) = listener.accept() else {
                     return;
                 };
@@ -614,6 +615,12 @@ impl TestBackend {
                         Ok(_) | Err(_) => break,
                     }
                 }
+                // The readiness probe connects and closes without a byte; the proxy
+                // connects to the server for it all the same (as `HAProxy` does).
+                if buf.is_empty() {
+                    continue;
+                }
+                left -= 1;
                 let _ = c.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK");
                 let _ = c.flush();
                 sink.lock().expect("lock").push(buf);

@@ -18,7 +18,15 @@ use tempfile::NamedTempFile;
 /// Runs `rule` in a frontend under strace, makes one HTTP request, and returns the
 /// `IP_TTL` values set on any socket (HAProxy and Ibex both set it twice), plus whether the client saw a reset.
 fn ttls(rule: &str) -> (Vec<String>, bool) {
-    let fe = common::reserve_addr();
+    ttls_on(rule, false)
+}
+
+/// [`ttls`] on a `[::1]` listener when `v6`, where the hop limit is `IPV6_UNICAST_HOPS`.
+fn ttls_on(rule: &str, v6: bool) -> (Vec<String>, bool) {
+    let mut fe = common::reserve_addr();
+    if v6 {
+        fe.set_ip(std::net::Ipv6Addr::LOCALHOST.into());
+    }
     let mut cfg = NamedTempFile::new().expect("cfg");
     write!(
         cfg,
@@ -42,18 +50,29 @@ fn ttls(rule: &str) -> (Vec<String>, bool) {
     let _ = c.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
     let mut out = Vec::new();
     let reset = c.read_to_end(&mut out).is_err();
-    // SIGUSR1 to the traced proxy (the first pid in the trace), not to strace: the proxy
-    // exits normally, which writes the coverage profile, and strace ends with it.
-    let first = std::fs::read_to_string(trace.path()).unwrap_or_default();
-    if let Some(pid) = first.split_whitespace().next().and_then(|p| p.parse::<i32>().ok()).and_then(rustix::process::Pid::from_raw) {
+    // SIGUSR1 to the traced proxy (strace's child; not the first pid in the trace, which on
+    // `HAProxy` is a short-lived fork), not to strace: the proxy exits normally, which writes
+    // the coverage profile, and strace ends with it.
+    let traced = std::fs::read_to_string(format!("/proc/{0}/task/{0}/children", child.id()))
+        .unwrap_or_default()
+        .split_whitespace()
+        .next()
+        .and_then(|p| p.parse::<i32>().ok())
+        .and_then(rustix::process::Pid::from_raw);
+    if let Some(pid) = traced {
         let _ = rustix::process::kill_process(pid, rustix::process::Signal::Usr1);
     }
     common::stop(&mut child);
+    // strace detaches from a proxy still running when it is stopped, which would leave the
+    // proxy orphaned.
+    if let Some(pid) = traced {
+        let _ = rustix::process::kill_process(pid, rustix::process::Signal::Kill);
+    }
     let log = std::fs::read_to_string(trace.path()).expect("trace");
     let ttls = log
         .lines()
-        .filter(|l| l.contains("IP_TTL") && !l.contains("= -1"))
-        .filter_map(|l| l.split("IP_TTL, [").nth(1).and_then(|r| r.split(']').next()).map(str::to_string))
+        .filter(|l| !l.contains("= -1"))
+        .filter_map(|l| l.split(if v6 { "IPV6_UNICAST_HOPS, [" } else { "IP_TTL, [" }).nth(1).and_then(|r| r.split(']').next()).map(str::to_string))
         .collect();
     (ttls, reset)
 }
@@ -73,4 +92,11 @@ fn rst_ttl_is_set_on_the_socket_before_the_reset() {
         assert_eq!(ttls.last().map(String::as_str), Some(want), "{rule}: {ttls:?}");
         assert!(reset, "{rule}: the client should see the connection reset");
     }
+}
+
+#[test]
+fn rst_ttl_on_an_ipv6_listener_sets_the_hop_limit() {
+    let (hops, reset) = ttls_on("http-request silent-drop rst-ttl 9", true);
+    assert_eq!(hops.last().map(String::as_str), Some("9"), "{hops:?}");
+    assert!(reset, "the client should see the connection reset");
 }
