@@ -177,9 +177,9 @@ fn get(fe: std::net::SocketAddr, path: &str) -> String {
     resp
 }
 
-/// The pattern on the wire. `HAProxy`'s CLI reads a backslash as an escape and wants `\\1`;
-/// Ibex's CLI does not unescape (a difference outside this test), so `\1` is sent as is.
-const WIRE: &str = r"\1";
+/// The pattern on the wire. `HAProxy`'s CLI reads a backslash as an escape and wants `\\1`,
+/// and so does Ibex's (T287).
+const WIRE: &str = r"\\1";
 
 #[test]
 fn the_cli_refuses_an_unnamed_group_reference_in_an_acl_and_a_map_reg_but_not_a_map_regm() {

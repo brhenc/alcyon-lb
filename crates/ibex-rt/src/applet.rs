@@ -695,7 +695,7 @@ impl CliApplet {
         } else if cmd == "get var" || cmd.starts_with("get var ") {
             self.handle_get_var(cmd["get var".len()..].trim());
         } else if let Some(target) = cmd.strip_prefix("set var ") {
-            self.handle_set_var(target.trim());
+            self.handle_set_var(&cli_words(target).join(" "));
         } else if cmd == "help" {
             self.handle_help();
         } else if Self::is_patref_command(cmd) {
@@ -725,7 +725,8 @@ impl CliApplet {
     /// Runs a map or ACL command on the process-wide pattern references
     /// ([`ibex_sample::patref`]): every worker thread matches against what it leaves.
     fn run_patref(&mut self, cmd: &str, payload: Option<&str>) {
-        let words: Vec<&str> = cmd.split_whitespace().collect();
+        let owned = cli_words(cmd);
+        let words: Vec<&str> = owned.iter().map(String::as_str).collect();
         let kind = if words[1] == "map" { ibex_sample::patref::RefKind::Map } else { ibex_sample::patref::RefKind::Acl };
         let out = ibex_sample::patref::command(words[0], kind, &words[2..], payload);
         self.out_buf.extend_from_slice(out.as_bytes());
@@ -1833,4 +1834,37 @@ fn atoi(s: &str) -> i64 {
     };
     let n: i64 = digits.bytes().take_while(u8::is_ascii_digit).fold(0i64, |a, d| a.saturating_mul(10).saturating_add(i64::from(d - b'0')));
     if neg { -n } else { n }
+}
+
+/// The words of a CLI command line the way `cli_parse_request` cuts them: blanks (space,
+/// tab) separate words, `\\` is one backslash, and a backslash before any other character
+/// (a blank included) goes, the character staying in the word. A lone backslash at the
+/// end stays. There is no quoting.
+pub(crate) fn cli_words(line: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut cur = String::new();
+    let mut in_word = false;
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            ' ' | '\t' | '\r' | '\n' => {
+                if in_word {
+                    words.push(std::mem::take(&mut cur));
+                    in_word = false;
+                }
+            }
+            '\\' => {
+                in_word = true;
+                cur.push(chars.next().unwrap_or('\\'));
+            }
+            _ => {
+                in_word = true;
+                cur.push(c);
+            }
+        }
+    }
+    if in_word {
+        words.push(cur);
+    }
+    words
 }
