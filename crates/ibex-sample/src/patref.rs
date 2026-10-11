@@ -170,32 +170,19 @@ impl PatRef {
     fn check_key(&self, key: &str) -> Result<(), String> {
         self.writable()?;
         match self.kind {
-            RefKind::Map => match *lock(&self.map_keys) {
-                MapKeys::Str => Ok(()),
-                MapKeys::Int => {
-                    let ok = |s: &str| s.parse::<i64>().is_ok();
-                    let range = key.split_once(['-', ':']).is_some_and(|(a, b)| ok(a) && ok(b));
-                    if ok(key) || range { Ok(()) } else { Err(format!("'{key}' is not a number.")) }
-                }
-                MapKeys::Ip => {
-                    let net = key.split_once('/').map_or(key, |(n, _)| n);
-                    if net.parse::<std::net::IpAddr>().is_ok() {
-                        Ok(())
-                    } else {
-                        Err(format!("'{key}' is not a valid IPv4 or IPv6 address."))
-                    }
-                }
-                MapKeys::Reg => ibex_regex::UserRegex::new(key)
-                    .map(|_| ())
-                    .map_err(|e| format!("regex '{key}' is invalid (error={e}).")),
+            RefKind::Map => match map_key_error(*lock(&self.map_keys), key, false) {
+                Some(e) => Err(format!("{e}.")),
+                None => Ok(()),
             },
             RefKind::Acl => {
                 let readers = read(&self.entries).reader_methods();
                 for (method, ci) in readers {
-                    Matcher::compile_with_flags(&method, key, ci).map_err(|e| {
+                    if method == "reg" {
                         // `HAProxy`'s answer to `add acl` with a regex PCRE2 refuses.
-                        if method == "reg" { format!("regex '{key}' is invalid (error={e}).") } else { e }
-                    })?;
+                        ibex_regex::UserRegex::with_case(key, ci).map_err(|e| format!("{}.", regex_refusal(key, &e)))?;
+                    } else {
+                        Matcher::compile_with_flags(&method, key, ci)?;
+                    }
                 }
                 Ok(())
             }
@@ -268,16 +255,106 @@ fn acl_expr(desc: String) {
     refs.push(r);
 }
 
-/// The first key of map file `path` that does not compile as a regex, as `HAProxy` words it
-/// when it loads a `map_reg` or `map_regm` file: `regex '<key>' is invalid (error=<why>).`
-/// `None` when every key compiles, or the file cannot be read (reported elsewhere). Keys are
-/// otherwise compiled only when a lookup first reaches them, and one that does not compile
+/// `regex '<key>' is invalid (error=<why>, erroffset=<n>)`, as `HAProxy` words a regex PCRE2
+/// refuses; the offset is left out when the parser did not say where it stopped.
+fn regex_refusal(key: &str, e: &ibex_regex::Error) -> String {
+    match e.offset() {
+        Some(at) => format!("regex '{key}' is invalid (error={e}, erroffset={at})"),
+        None => format!("regex '{key}' is invalid (error={e})"),
+    }
+}
+
+/// `HAProxy`'s `strl2llrc`: optional `-`, then decimal digits, within `i64`; no `+`, no
+/// blanks, no digits is an error (a lone `-` is 0).
+fn pat_number(s: &str) -> Option<i64> {
+    let (neg, digits) = s.strip_prefix('-').map_or((false, s), |d| (true, d));
+    if (!neg && digits.is_empty()) || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let mut v: i128 = 0;
+    for b in digits.bytes() {
+        v = v * 10 + i128::from(b - b'0');
+        if v > i128::from(i64::MAX) + 1 {
+            return None;
+        }
+    }
+    let v = if neg { -v } else { v };
+    // the positive form stops at `i64::MAX`
+    i64::try_from(v).ok()
+}
+
+/// `HAProxy`'s `pat_parse_int`: a number, or a range `a-b`, `a:b`, `-b` (up to), `a-` (from).
+fn int_key_error(key: &str) -> Option<String> {
+    let range = || Some(format!("'{key}' is not a valid number range"));
+    if key.is_empty() {
+        return range();
+    }
+    let Some(at) = key.find([':', '-']) else {
+        return pat_number(key).is_none().then(|| format!("'{key}' is not a number"));
+    };
+    let (lo, hi) = (&key[..at], &key[at + 1..]);
+    if at == 0 && !hi.is_empty() {
+        return if pat_number(hi).is_none() { range() } else { None };
+    }
+    if hi.is_empty() {
+        return if pat_number(lo).is_none() { range() } else { None };
+    }
+    match (pat_number(lo), pat_number(hi)) {
+        (Some(a), Some(b)) if a <= b => None,
+        _ => range(),
+    }
+}
+
+/// `HAProxy`'s `str2net` / `str62net`: an IPv4 or IPv6 address with an optional `/<bits>` or
+/// (IPv4) `/<dotted mask>`. `resolve`: at load `HAProxy` also resolves a name that is not an
+/// address; so does this, for a name with a letter in it.
+fn ip_key_error(key: &str, resolve: bool) -> Option<String> {
+    let bad = || Some(format!("'{key}' is not a valid IPv4 or IPv6 address"));
+    let (addr, mask) = key.rsplit_once('/').map_or((key, None), |(a, m)| (a, Some(m)));
+    let bits = |m: &str, max: u32| !m.is_empty() && m.bytes().all(|b| b.is_ascii_digit()) && m.parse::<u32>().is_ok_and(|n| n <= max);
+    let v4_mask = mask.is_none_or(|m| if m.contains('.') { m.parse::<std::net::Ipv4Addr>().is_ok() } else { bits(m, 32) });
+    if v4_mask && addr.parse::<std::net::Ipv4Addr>().is_ok() {
+        return None;
+    }
+    if mask.is_none_or(|m| bits(m, 128)) && addr.parse::<std::net::Ipv6Addr>().is_ok() {
+        return None;
+    }
+    if resolve && v4_mask && addr.bytes().any(|b| b.is_ascii_alphabetic()) {
+        use std::net::ToSocketAddrs as _;
+        if (addr, 0).to_socket_addrs().is_ok_and(|mut a| a.any(|a| a.is_ipv4())) {
+            return None;
+        }
+    }
+    bad()
+}
+
+/// Why `key` cannot be a key of a map read by a converter of kind `keys`, as `HAProxy` words
+/// it (without the closing period). `resolve`: the map is being loaded, not changed at
+/// runtime.
+fn map_key_error(keys: MapKeys, key: &str, resolve: bool) -> Option<String> {
+    match keys {
+        MapKeys::Str => None,
+        MapKeys::Int => int_key_error(key),
+        MapKeys::Ip => ip_key_error(key, resolve),
+        MapKeys::Reg => ibex_regex::UserRegex::new(key).err().map(|e| regex_refusal(key, &e)),
+    }
+}
+
+/// The first key of map file `path` that a converter of kind `keys` refuses, as `HAProxy`
+/// words it when it loads the file: `<why> at line <n> of file '<path>'.` `None` when every
+/// key is fine, or the file cannot be read (reported elsewhere). A key of a regex map is
+/// otherwise compiled only when a lookup first reaches it, and one that does not compile
 /// then never matches (T277).
 #[must_use]
-pub fn reg_map_file_error(path: &str) -> Option<String> {
+pub fn map_file_error(path: &str, keys: MapKeys) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
-    parse_lines(&text).into_iter().find_map(|(key, _)| {
-        ibex_regex::UserRegex::new(&key).err().map(|e| format!("regex '{key}' is invalid (error={e})."))
+    text.lines().enumerate().find_map(|(n, l)| {
+        let l = l.trim();
+        if l.is_empty() || l.starts_with('#') {
+            return None;
+        }
+        let key = l.split_whitespace().next()?;
+        map_key_error(keys, key, true).map(|e| format!("{e} at line {} of file '{path}'.", n + 1))
     })
 }
 

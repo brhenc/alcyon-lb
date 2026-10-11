@@ -135,7 +135,7 @@ const NONEXISTENT_GROUP: &str = "reference to non-existent subpattern";
 fn check_conditions(pattern: &str, captures_len: usize) -> Result<(), Error> {
     use fancy_regex::Expr;
     // It has just compiled, so it parses.
-    let tree = Expr::parse_tree(pattern).map_err(|e| Error(e.to_string()))?;
+    let tree = Expr::parse_tree(pattern).map_err(|e| Error::from_fancy(&e))?;
     let mut stack = vec![&tree.expr];
     while let Some(e) = stack.pop() {
         match e {
@@ -143,21 +143,22 @@ fn check_conditions(pattern: &str, captures_len: usize) -> Result<(), Error> {
             | Expr::Backref { group, .. }
                 if *group == 0 || *group >= captures_len =>
             {
-                return Err(Error(NONEXISTENT_GROUP.to_string()));
+                return Err(Error(NONEXISTENT_GROUP.to_string(), None));
             }
             Expr::Conditional { condition, .. } if !matches!(**condition, Expr::BackrefExistsCondition { .. }) => {
                 let text = literal_text(condition).unwrap_or_default();
                 if text.starts_with('R') || text.starts_with("VERSION") {
                     return Err(Error(
                         "PCRE feature not supported by Ibex: recursion and version conditions (see docs/differences.md)".to_string(),
+                        None,
                     ));
                 }
                 if tree.named_groups.contains_key(&text) {
                     return Err(Error(format!(
                         "PCRE feature not supported by Ibex: a condition on a bare group name, `(?({text})`; write `(?(<{text}>)` (see docs/differences.md)"
-                    )));
+                    ), None));
                 }
-                return Err(Error(NONEXISTENT_GROUP.to_string()));
+                return Err(Error(NONEXISTENT_GROUP.to_string(), None));
             }
             _ => {}
         }
@@ -215,7 +216,7 @@ impl fmt::Debug for UserRegex {
 
 /// Why a pattern was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Error(String);
+pub struct Error(String, Option<usize>);
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -224,6 +225,35 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+impl Error {
+    /// Where in the pattern PCRE2 would have put `erroffset` for this refusal, when the
+    /// parser said where it stopped. `fancy-regex` reports the index of the character it
+    /// could not use; PCRE2 reports the index after a character it refused to take, which
+    /// is the same for an unclosed group or class and one more for a stray `)` or a
+    /// quantifier with nothing to repeat (T274 J3). `None` for what `fancy-regex` or this
+    /// crate refuse without a position.
+    #[must_use]
+    pub fn offset(&self) -> Option<usize> {
+        self.1
+    }
+
+    /// The refusal of `fancy-regex`, with the offset PCRE2 would report.
+    fn from_fancy(e: &fancy_regex::Error) -> Self {
+        let offset = match e {
+            fancy_regex::Error::ParseError(at, kind) => {
+                let past = match kind {
+                    fancy_regex::ParseError::TargetNotRepeatable => true,
+                    fancy_regex::ParseError::GeneralParseError(why) => why == "end of string not reached",
+                    _ => false,
+                };
+                Some(if past { at + 1 } else { *at })
+            }
+            _ => None,
+        };
+        Error(e.to_string(), offset)
+    }
+}
 
 /// The groups of one match.
 pub enum Captures<'h> {
@@ -304,7 +334,7 @@ impl UserRegex {
         COMPILES.with(|n| n.set(n.get() + 1));
         let scan = scan(pattern);
         if let Some(what) = scan.unsupported {
-            return Err(Error(format!("PCRE feature not supported by Ibex: {what} (see docs/differences.md)")));
+            return Err(Error(format!("PCRE feature not supported by Ibex: {what} (see docs/differences.md)"), None));
         }
         // `regex` reads `a++` as `(a+)+` and `(?R)` as a flag, and so would accept what it
         // does not mean: a pattern with such a token goes to `fancy-regex` directly.
@@ -320,7 +350,7 @@ impl UserRegex {
             // `fancy-regex` parses a superset of what `regex` does, so its message is the one
             // that says what is wrong with the pattern (`regex`'s would say that look-around
             // is not supported, of a pattern that fails for another reason).
-            .map_err(|e| Error(e.to_string()))?;
+            .map_err(|e| Error::from_fancy(&e))?;
         check_conditions(pattern, re.captures_len())?;
         Ok(UserRegex::Backtracking(re))
     }
