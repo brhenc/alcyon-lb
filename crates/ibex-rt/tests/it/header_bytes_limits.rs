@@ -204,6 +204,8 @@ fn latin1_header_values_are_forwarded_byte_for_byte() {
         get("/cookie", b"Cookie: a=\xe9\r\n", 200, Some(b"cookie: a=\xe9\r\n")),
         get("/trailing-blank", b"X-A: \xe9 \r\n", 200, Some(b"x-a: \xe9\r\n")),
         get("/folded", b"X-F: a\xe9\r\n \xffb\r\n", 200, Some(b"x-f: a\xe9   \xffb\r\n")),
+        // UTF-8 on the first line, Latin-1 on the next: both kept as received.
+        get("/folded-utf8", b"X-F: \xc3\xa9\r\n \xff\r\n", 200, Some(b"x-f: \xc3\xa9   \xff\r\n")),
         get("/keepalive", b"Keep-Alive: t\xe9\r\n", 200, Some(b"keep-alive: t\xe9\r\n")),
         get("/trailer", b"Trailer: x\xe9\r\n", 200, Some(b"trailer: x\xe9\r\n")),
     ]);
@@ -228,6 +230,8 @@ fn latin1_in_a_framing_or_routing_header_is_refused() {
         case(b"GET /host HTTP/1.1\r\nHost: caf\xe9\r\n\r\n", 400, None),
         case(b"POST /te HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\xe9\r\n\r\n0\r\n\r\n", 400, None),
         case(b"POST /cl HTTP/1.1\r\nHost: x\r\nContent-Length: 1\xe9\r\n\r\nx", 400, None),
+        // Not Latin-1 but a NUL, in a folded line: refused as on any line.
+        case(b"GET /fold-nul HTTP/1.1\r\nHost: x\r\nX-F: a\r\n b\x00c\r\n\r\n", 400, None),
     ]);
 }
 

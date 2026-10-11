@@ -41,14 +41,10 @@ pub const HTX_BLK_FL_EOM: u8 = 0x01;
 /// characters back as its one byte, so the server gets the bytes the client sent (T285).
 pub const HTX_BLK_FL_LATIN1: u8 = 0x02;
 
-/// `value` read as Latin-1: each byte as the character of the same number. `None` if it
-/// is ASCII, which needs no flag.
+/// `value` read as Latin-1: each byte as the character of the same number.
 #[must_use]
-pub fn latin1_to_text(value: &[u8]) -> Option<String> {
-    if value.is_ascii() {
-        return None;
-    }
-    Some(value.iter().map(|&b| char::from(b)).collect())
+pub fn latin1_to_text(value: &[u8]) -> String {
+    value.iter().map(|&b| char::from(b)).collect()
 }
 
 /// The bytes a value of [`HTX_BLK_FL_LATIN1`] stands for, written at `cursor`.
@@ -1419,7 +1415,7 @@ impl<'a> HtxSlice<'a> {
     /// [`Self::push_header`] of a value that is not UTF-8, read as Latin-1 and flagged
     /// [`HTX_BLK_FL_LATIN1`].
     pub fn push_header_latin1(&mut self, name: &str, value: &[u8]) -> Result<(), HtxError> {
-        let text = latin1_to_text(value).unwrap_or_default();
+        let text = latin1_to_text(value);
         self.push_header(name, &text)?;
         self.set_last_flag(HTX_BLK_FL_LATIN1);
         Ok(())
@@ -1461,7 +1457,7 @@ impl<'a> HtxSlice<'a> {
         };
         bytes.extend_from_slice(prefix.as_bytes());
         bytes.extend_from_slice(raw);
-        let text = latin1_to_text(&bytes).unwrap_or_default();
+        let text = latin1_to_text(&bytes);
         replace_block_value_raw(self.buf, &mut self.tail_addr, self.num_blocks, idx, text.as_bytes())?;
         let mut desc = read_desc_at(self.buf, self.num_blocks, idx);
         desc.flags |= HTX_BLK_FL_LATIN1;
@@ -2834,6 +2830,23 @@ pub fn pseudo_headers_to_htx(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Latin-1 value replaced by text it can still be written as stays Latin-1 (`é` goes
+    /// out as the byte E9); replaced by text it cannot (`€`), it goes out as UTF-8 (T285).
+    #[test]
+    fn a_replaced_latin1_value_keeps_its_flag_only_while_it_can() {
+        let wire = |new: &str| {
+            let mut buf = [0u8; 1024];
+            let mut htx = HtxSlice::new(&mut buf);
+            htx.push_req_line("GET", "/", "HTTP/1.1").unwrap();
+            htx.push_header_latin1("x-a", b"\xff").unwrap();
+            htx.push_eoh().unwrap();
+            htx.replace_block_value(1, new.as_bytes()).unwrap();
+            htx.as_ref().to_h1_wire()
+        };
+        assert_eq!(wire("caf\u{e9}"), b"GET / HTTP/1.1\r\nx-a: caf\xe9\r\n\r\n");
+        assert_eq!(wire("\u{20ac}"), "GET / HTTP/1.1\r\nx-a: \u{20ac}\r\n\r\n".as_bytes());
+    }
 
     #[test]
     fn ascii_words_split_as_split_whitespace() {
