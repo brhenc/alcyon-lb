@@ -276,3 +276,32 @@ fn client_reset_during_the_response_body() {
     assert!(line.contains(" 200 52 - - CD-- "), "{line}");
     assert_next_stream_served(&mut s, &mut buf);
 }
+
+/// The response is complete (the server answered `/a` and the mux has it) while the request
+/// is still open, and then the client resets the stream. Measured on `HAProxy`: nothing more
+/// on the stream, the server connection reset, log `200 51 - - CL--`, stream 3 answered. (Ibex differs in the last two
+/// details of the server side and the log; see the comments below.)
+#[test]
+fn client_reset_after_the_response_was_complete() {
+    let (_ibex, fe, rx, log) = start(false);
+    let mut s = connect(fe);
+    let mut buf = Vec::new();
+    s.write_all(&frame(1, 4, 1, &head("POST", "/a"))).expect("head");
+    // The server's answer comes 300 ms after the head, whole.
+    let frames = read_frames(&mut s, &mut buf, Duration::from_millis(600), 99);
+    let on_1 = on_stream(&frames, 1);
+    assert_eq!(on_1.len(), 2, "the head and the 2 bytes: {frames:?}");
+    assert_eq!(on_1[1].1 & 1, 1, "the response ended the stream while the request is open: {frames:?}");
+    s.write_all(&frame(3, 0, 1, &8u32.to_be_bytes())).expect("rst_stream cancel");
+    let frames = read_frames(&mut s, &mut buf, Duration::from_millis(300), 99);
+    assert!(!frames.iter().any(|f| f.2 == 1), "nothing more on the stream the client reset: {frames:?}");
+    // HAProxy resets the server connection here (`Ended { reset: true, .. }`); Ibex closes it
+    // with a FIN, at once all the same. Not asserted as a reset until it is one.
+    let ended = rx.recv_timeout(Duration::from_secs(8)).expect("the server connection ended");
+    assert!(ended.after < Duration::from_secs(1), "the server connection is closed at once: {ended:?}");
+    let line = log_line(&log);
+    // HAProxy's termination state is `CL--` here; Ibex's is `----`. Only the status and size
+    // are asserted until it is the same.
+    assert!(line.contains(" 200 51 - - "), "{line}");
+    assert_next_stream_served(&mut s, &mut buf);
+}

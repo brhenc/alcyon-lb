@@ -489,6 +489,17 @@ fn push_data(out: &mut Vec<u8>, payload: &[u8]) {
 mod tests {
     use super::*;
 
+    /// `http_parse_cont_len_header`: a list of one repeated number is a length; two numbers, a
+    /// sign or an empty element are not.
+    #[test]
+    fn a_content_length_list_must_repeat_one_digits_only_number() {
+        assert_eq!(content_length_value("5"), Some(5));
+        assert_eq!(content_length_value("5, 5"), Some(5));
+        assert_eq!(content_length_value("5, 3"), None);
+        assert_eq!(content_length_value("+5"), None);
+        assert_eq!(content_length_value("5,"), None);
+    }
+
     fn frame_bytes(ty: u64, payload: &[u8]) -> Vec<u8> {
         let mut v = Vec::new();
         mux_h3::encode_frame(&mut v, ty, payload);

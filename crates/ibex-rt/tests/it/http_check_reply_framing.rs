@@ -168,5 +168,19 @@ fn a_bad_coding_fails_the_first_expect_with_its_step() {
             "Layer7 invalid response, info: \"TCPCHK did not match content(status codes) at step 2\"",
         ),
         ("expect rstring", "  option httpchk GET /\n  http-check expect rstring hel+o", r(), "Layer7 invalid response, info: \"TCPCHK did not match content (regex) at step 1\""),
+        ("expect string-lf", "  option httpchk GET /\n  http-check expect string-lf hello", r(), "Layer7 invalid response, info: \"TCPCHK did not match content (log-format string) at step 1\""),
+        ("expect hdr", "  option httpchk GET /\n  http-check expect hdr name x", r(), "Layer7 invalid response, info: \"TCPCHK did not match content (header pattern) at step 1\""),
+        (
+            "set-var then expect",
+            "  option httpchk GET /\n  http-check set-var(check.x) str(a)\n  http-check expect string hello",
+            r(),
+            "Layer7 invalid response, info: \"TCPCHK did not match content 'hello' at step 2\"",
+        ),
+        (
+            "set-var then the added expect",
+            "  option httpchk GET /\n  http-check set-var(check.x) str(a)",
+            r(),
+            "Layer7 invalid response, info: \"TCPCHK did not match content(status codes) at step 2\"",
+        ),
     ]);
 }

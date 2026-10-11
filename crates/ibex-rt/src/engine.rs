@@ -13038,6 +13038,24 @@ mod rate_ctr_tests {
         r.tick_at(9000);
         assert_eq!(r.rate_at(9000), 1, "the quiet spell dropped both windows");
     }
+
+    /// An event taken back (a TLS handshake that failed) leaves the current window, then the
+    /// previous one when the current is empty, and never goes below nothing.
+    #[test]
+    fn an_event_taken_back_leaves_the_window_it_was_counted_in() {
+        let r = RateCtr::default();
+        r.untick();
+        assert_eq!(r.rate_at(1000), 0, "nothing to take back");
+        for _ in 0..4 {
+            r.tick_at(1000);
+        }
+        r.tick_at(2500);
+        assert_eq!(r.rate_at(2500), 5);
+        r.untick();
+        assert_eq!(r.rate_at(2500), 4, "the new window's event");
+        r.untick();
+        assert_eq!(r.rate_at(2500), 3, "the new window is empty: one of the previous window's");
+    }
 }
 
 #[cfg(test)]

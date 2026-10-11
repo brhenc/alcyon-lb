@@ -141,7 +141,6 @@ fn check_conditions(pattern: &str, captures_len: usize) -> Result<(), Error> {
         match e {
             Expr::BackrefExistsCondition { group, .. }
             | Expr::Backref { group, .. }
-            | Expr::BackrefWithRelativeRecursionLevel { group, .. }
                 if *group == 0 || *group >= captures_len =>
             {
                 return Err(Error(NONEXISTENT_GROUP.to_string()));
@@ -427,6 +426,17 @@ impl UserRegex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A recursion-level back-reference (`\k<n+0>`, Oniguruma's: `fancy-regex` refuses it as
+    /// unimplemented, so `check_conditions` never sees one) and a conditional on a class are
+    /// refused, as PCRE2 refuses both (measured on HAProxy 3.5-dev8: "subpattern name must start
+    /// with a non-digit" and "subpattern name expected").
+    #[test]
+    fn oniguruma_only_references_and_class_conditions_are_refused() {
+        for p in [r"(a)\k<2+0>", r"(a)\k<1+0>", r"(a)\k<0+0>", "(?([a-z])x|y)"] {
+            assert!(UserRegex::new(p).is_err(), "`{p}` compiled");
+        }
+    }
 
     #[test]
     fn an_ordinary_pattern_is_linear() {

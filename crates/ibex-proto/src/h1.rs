@@ -32,14 +32,6 @@ pub enum H1Phase {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Refusal(pub u16);
 
-impl std::fmt::Display for Refusal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "refused with {}", self.0)
-    }
-}
-
-impl std::error::Error for Refusal {}
-
 /// A [`Refusal`] with what caused it, as the payload of an `io::Error`.
 #[derive(Debug)]
 struct RefusalWhy(u16, &'static str);
@@ -857,6 +849,16 @@ fn parse_header_field_borrowed(line: &str) -> io::Result<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A refusal reads as its cause and status, and its status is what `status_of` returns;
+    /// any other error is a 400.
+    #[test]
+    fn a_refusal_names_its_cause_and_status() {
+        let e = Refusal::error(413, "HTTP/1.0 GET/HEAD/DELETE with a body");
+        assert_eq!(e.to_string(), "HTTP/1.0 GET/HEAD/DELETE with a body (refused with 413)");
+        assert_eq!(Refusal::status_of(&e), 413);
+        assert_eq!(Refusal::status_of(&io::Error::new(io::ErrorKind::InvalidData, "x")), 400);
+    }
 
     /// A header value that is not UTF-8 is a 400, whatever the header. The rest of the proxy reads
     /// headers as text (ACLs, fetches, rule actions); a header it cannot read but the server
