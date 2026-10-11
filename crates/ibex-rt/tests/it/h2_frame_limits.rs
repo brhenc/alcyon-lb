@@ -355,6 +355,8 @@ fn window_update_overflowing_a_stream_window_resets_that_stream_only() {
         assert!(r.frames.iter().any(|f| f.0 == 1 && f.2 == 3), "{inc}: stream 3 not answered: {:?}", r.frames);
     }
     let r = exchange(fe, &[], &[frame(1, END_HEADERS, 1, &head()), window_update(1, MAX_WINDOW - INITIAL_WINDOW)]);
-    assert_eq!(r.rst(1), None, "exact: {:?}", r.frames);
+    // The early local reply to the open stream is followed by RST_STREAM(NO_ERROR), as
+    // HAProxy does (T314); what is refused here is an error reset.
+    assert!(matches!(r.rst(1), None | Some(0)), "exact: {:?}", r.frames);
     assert_eq!(r.goaway(), None, "exact: {:?}", r.frames);
 }
