@@ -350,9 +350,8 @@ impl TlsConn {
                         return Err(e);
                     }
                 }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(true),
-                Err(e) if e.kind() == io::ErrorKind::ConnectionReset => return Ok(false),
-                Err(e) => return Err(e),
+                // Would block: more bytes later. A reset peer is an end of stream (as below).
+                Err(e) => return match e.kind() { io::ErrorKind::WouldBlock => Ok(true), io::ErrorKind::ConnectionReset => Ok(false), _ => Err(e) },
             }
             let Some(gate) = self.gate.as_mut() else { return Ok(true) };
             let made = match gate.acceptor.accept() {
@@ -421,11 +420,8 @@ impl TlsConn {
             };
             match res {
                 Ok(0) => return Ok(false),
-                Ok(_) => {
-                    if let Some(e) = self.refuse_old_legacy_version(fd, &sock.2) {
-                        return Err(e);
-                    }
-                }
+                // The ClientHello, and with it `legacy_version`, went through `gate_fill`.
+                Ok(_) => {}
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(true),
                 // A reset peer is an end of stream, not a failure. `raw::recv` already
                 // maps ECONNRESET to `Io::Closed` and the plaintext path treats that as
