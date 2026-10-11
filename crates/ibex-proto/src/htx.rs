@@ -289,6 +289,31 @@ pub enum HtxBlock {
 // Low-level buffer primitives for bidirectional layout
 // ---------------------------------------------------------------------------
 
+/// The first three words of `raw`, as `split_whitespace` gives them.
+#[cold]
+#[inline(never)]
+fn words3(raw: &str) -> [Option<&str>; 3] {
+    let mut parts = raw.split_whitespace();
+    [parts.next(), parts.next(), parts.next()]
+}
+
+/// [`words3`] of an ASCII string, on its bytes.
+fn ascii_words3(raw: &str) -> [Option<&str>; 3] {
+    // What `char::is_whitespace` is true of in ASCII.
+    let ws = |b: u8| matches!(b, b'\t' | b'\n' | 0x0b | 0x0c | b'\r' | b' ');
+    let b = raw.as_bytes();
+    let mut out = [None; 3];
+    let mut at = 0;
+    for w in &mut out {
+        let Some(start) = b[at..].iter().position(|&c| !ws(c)).map(|n| at + n) else { break };
+        let end = b[start..].iter().position(|&c| ws(c)).map_or(b.len(), |n| start + n);
+        // ASCII: every index is a character boundary.
+        *w = Some(&raw[start..end]);
+        at = end;
+    }
+    out
+}
+
 fn read_desc_at(buf: &[u8], num_blocks: usize, index: usize) -> HtxBlockDesc {
     assert!(index < num_blocks);
     let offset = buf.len() - (index + 1) * HTX_DESC_SIZE;
@@ -727,10 +752,10 @@ impl<'a> HtxSliceRef<'a> {
                 let start = desc.addr as usize;
                 let end = start + desc.value_len as usize;
                 let raw = std::str::from_utf8(&self.buf[start..end]).ok()?;
-                let mut parts = raw.split_whitespace();
-                let method = parts.next()?;
-                let uri = parts.next()?;
-                let version = parts.next().unwrap_or("HTTP/1.1");
+                let [method, uri, version] = if raw.is_ascii() { ascii_words3(raw) } else { words3(raw) };
+                let method = method?;
+                let uri = uri?;
+                let version = version.unwrap_or("HTTP/1.1");
                 return Some(RequestLineView {
                     method,
                     uri,
@@ -985,6 +1010,27 @@ impl<'a> HtxSliceRef<'a> {
             } else {
                 None
             }
+        })
+    }
+
+    /// [`Self::header_blocks`] of the headers whose name `keep` keeps, the name read as bytes:
+    /// what `header_blocks().filter(..)` on the name gives, without reading as UTF-8 the
+    /// names and values of the headers it does not keep.
+    pub fn header_blocks_where(self, keep: impl Fn(&[u8]) -> bool + 'a) -> impl Iterator<Item = (usize, &'a str, &'a str)> + 'a {
+        (0..self.num_blocks).filter_map(move |i| {
+            let desc = self.read_desc(i);
+            if desc.blk_type != HtxBlockType::Header {
+                return None;
+            }
+            let name_start = desc.addr as usize;
+            let name_end = name_start + desc.name_len as usize;
+            if !keep(&self.buf[name_start..name_end]) {
+                return None;
+            }
+            let val_end = name_end + desc.value_len as usize;
+            let name = std::str::from_utf8(&self.buf[name_start..name_end]).ok()?;
+            let val = std::str::from_utf8(&self.buf[name_end..val_end]).ok()?;
+            Some((i, name, val))
         })
     }
 
@@ -2697,6 +2743,13 @@ pub fn pseudo_headers_to_htx(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ascii_words_split_as_split_whitespace() {
+        for raw in ["GET / HTTP/1.1", "  GET\t/x \u{b}HTTP/1.0\u{c} ", "GET", "", "   ", "GET /", "a b c d", "GET\r\n/ x"] {
+            assert_eq!(ascii_words3(raw), words3(raw), "{raw:?}");
+        }
+    }
 
     #[test]
     fn htx_request_serialization_roundtrip() {

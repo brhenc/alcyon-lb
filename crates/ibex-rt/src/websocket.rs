@@ -28,6 +28,12 @@ pub struct ReqWs {
 }
 
 impl ReqWs {
+    /// Whether [`Self::of`] reads a header of this name: the others it passes over.
+    #[must_use]
+    pub fn reads(name: &[u8]) -> bool {
+        name.eq_ignore_ascii_case(b"connection") || name.eq_ignore_ascii_case(b"upgrade") || name.eq_ignore_ascii_case(b"sec-websocket-key")
+    }
+
     /// Reads a request head's headers. With `write_key` (`option
     /// accept-unsafe-violations-in-http-request`), a websocket handshake without any
     /// `Sec-WebSocket-Key` gets one, returned second, to be added to the head.
@@ -108,6 +114,13 @@ pub fn check_response(head: &[u8], status: u16, req: &ReqWs, accept_unsafe: bool
     if status != 101 && !head.windows(7).any(|w| w.eq_ignore_ascii_case(b"upgrade")) {
         return Verdict::Keep;
     }
+    check_upgrade_response(head, status, req, accept_unsafe)
+}
+
+/// [`check_response`] of a response that names an upgrade.
+#[cold]
+#[inline(never)]
+fn check_upgrade_response(head: &[u8], status: u16, req: &ReqWs, accept_unsafe: bool) -> Verdict {
     let text = String::from_utf8_lossy(head);
     let lines: Vec<&str> = text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)).collect();
     let (mut conn_upg, mut websocket, mut srv_accept) = (false, false, None);

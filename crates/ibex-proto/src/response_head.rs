@@ -405,6 +405,8 @@ pub fn check_response_head(head: &[u8], accept_unsafe: bool) -> ResponseHead {
 }
 
 /// `check_response_head` the long way, building the head written again when there is one.
+#[cold]
+#[inline(never)]
 fn full_check(head: &[u8], accept_unsafe: bool) -> ResponseHead {
     let mut headers = Vec::new();
     let Some(p) = parse(head, accept_unsafe, |h| headers.push(h)) else {

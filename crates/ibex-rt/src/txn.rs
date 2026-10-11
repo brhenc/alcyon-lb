@@ -702,9 +702,10 @@ impl<'a> Iterator for Fields<'a> {
 /// `http_parse_cont_len_header` reads it: each line a comma-separated list of decimal
 /// values, all equal. `None` without one, or when they do not agree on one value (a head
 /// the parser refuses).
-fn content_length(fields: Fields<'_>) -> Option<u64> {
+fn content_length<K: AsRef<str>, V: AsRef<str>>(fields: impl Iterator<Item = (K, V)>) -> Option<u64> {
     let mut len = None;
-    for (_, v) in fields.filter(|(k, _)| k.eq_ignore_ascii_case("content-length")) {
+    for (_, v) in fields.filter(|(k, _)| k.as_ref().eq_ignore_ascii_case("content-length")) {
+        let v = v.as_ref();
         if v.ends_with(',') {
             return None;
         }
@@ -723,7 +724,7 @@ fn content_length(fields: Fields<'_>) -> Option<u64> {
 }
 
 /// The `Transfer-Encoding` lines of a head, all of them, as one list.
-fn codings(fields: Fields<'_>, is_response: bool) -> ibex_proto::h1::TransferCodings {
+fn codings<K: AsRef<str>, V: AsRef<str>>(fields: impl Iterator<Item = (K, V)>, is_response: bool) -> ibex_proto::h1::TransferCodings {
     ibex_proto::h1::TransferCodings::of(fields, is_response)
 }
 
@@ -737,17 +738,31 @@ fn codings(fields: Fields<'_>, is_response: bool) -> ibex_proto::h1::TransferCod
 /// disagree is refused by the parser before this is asked.
 #[must_use]
 pub fn request_framing(head: &[u8]) -> Framing {
-    let head = String::from_utf8_lossy(head);
-    let te = codings(fields(&head), false);
-    if te.present {
+    match framing_fields(head) {
+        Some(f) => request_framing_of(f.te(), f.cl()),
+        None => request_framing_general(head),
+    }
+}
+
+/// [`request_framing`] from the `Transfer-Encoding` and `Content-Length` fields of a head.
+fn request_framing_of<K: AsRef<str>, V: AsRef<str>>(te: impl Iterator<Item = (K, V)>, cl: impl Iterator<Item = (K, V)>) -> Framing {
+    if codings(te, false).present {
         // Without a final `chunked` the request has no length and is refused (400);
         // were it to get here, chunked is the reading that forwards nothing unframed.
         return Framing::Chunked;
     }
-    match content_length(fields(&head)) {
+    match content_length(cl) {
         Some(0) | None => Framing::None,
         Some(n) => Framing::Length(n),
     }
+}
+
+/// [`request_framing`] read through [`fields`], for any head.
+#[cold]
+#[inline(never)]
+fn request_framing_general(head: &[u8]) -> Framing {
+    let head = String::from_utf8_lossy(head);
+    request_framing_of(fields(&head), fields(&head))
 }
 
 /// How a response body is framed, from its head and the request it answers.
@@ -760,20 +775,151 @@ pub fn response_framing(head: &str, req_method: Option<&str>, status: u16) -> Fr
     if is("HEAD") || (100..200).contains(&status) || status == 204 || status == 304 {
         return Framing::None;
     }
-    let te = codings(fields(head), true);
+    match framing_fields(head.as_bytes()) {
+        Some(f) => response_body_framing(f.te(), f.cl()),
+        None => response_framing_general(head),
+    }
+}
+
+/// [`response_body_framing`] read through [`fields`], for any head.
+#[cold]
+#[inline(never)]
+fn response_framing_general(head: &str) -> Framing {
+    response_body_framing(fields(head), fields(head))
+}
+
+/// How a response with a body is framed, from its `Transfer-Encoding` and `Content-Length`
+/// fields.
+fn response_body_framing<K: AsRef<str>, V: AsRef<str>>(te: impl Iterator<Item = (K, V)>, cl: impl Iterator<Item = (K, V)>) -> Framing {
+    let te = codings(te, true);
     if te.present {
         return if te.chunked_last { Framing::Chunked } else { Framing::UntilClose };
     }
-    match content_length(fields(head)) {
+    match content_length(cl) {
         Some(n) => Framing::Length(n),
         None => Framing::UntilClose,
     }
+}
+
+/// Whether `str::trim` trims this byte of an ASCII string (`char::is_whitespace`: unlike
+/// `u8::is_ascii_whitespace`, with the vertical tab).
+const fn ws(b: u8) -> bool {
+    matches!(b, b'\t' | b'\n' | 0x0b | 0x0c | b'\r' | b' ')
+}
+
+/// `str::trim_start` of ASCII bytes.
+fn ascii_trim_start(s: &[u8]) -> &[u8] {
+    &s[s.iter().position(|&b| !ws(b)).unwrap_or(s.len())..]
+}
+
+/// `str::trim_end` of ASCII bytes.
+fn ascii_trim_end(s: &[u8]) -> &[u8] {
+    &s[..s.iter().rposition(|&b| !ws(b)).map_or(0, |z| z + 1)]
+}
+
+/// `str::trim` of ASCII bytes.
+fn ascii_trim(s: &[u8]) -> &[u8] {
+    ascii_trim_end(ascii_trim_start(s))
+}
+
+/// The `Transfer-Encoding` and `Content-Length` fields of a head, as [`fields`] reads them.
+struct FramingFields<'a> {
+    te: [&'a str; 4],
+    n_te: usize,
+    cl: [&'a str; 4],
+    n_cl: usize,
+}
+
+impl<'a> FramingFields<'a> {
+    fn te(&self) -> impl Iterator<Item = (&'a str, &'a str)> + '_ {
+        self.te[..self.n_te].iter().map(|v| ("transfer-encoding", *v))
+    }
+
+    fn cl(&self) -> impl Iterator<Item = (&'a str, &'a str)> + '_ {
+        self.cl[..self.n_cl].iter().map(|v| ("content-length", *v))
+    }
+}
+
+/// The values of the `Transfer-Encoding` and `Content-Length` fields of a head in one pass
+/// over its bytes, without the general reading of [`fields`] for every line: a line whose
+/// name cannot be either (its first byte is not a `c` or a `t`) is not read further. The
+/// values are the ones [`fields`] gives (the same lines, trimmed the same way), on the heads
+/// this answers for; `None` for the others, which go through [`fields`]: a folded line
+/// (joined to the field before it), a line of either kind with a byte outside ASCII (which
+/// `str::trim` might trim, and which the lossy reading of a request head replaces), or more
+/// than four lines of one kind.
+fn framing_fields(head: &[u8]) -> Option<FramingFields<'_>> {
+    fn trim(s: &[u8]) -> &str {
+        std::str::from_utf8(ascii_trim(s)).unwrap_or_default()
+    }
+    let mut out = FramingFields { te: [""; 4], n_te: 0, cl: [""; 4], n_cl: 0 };
+    let mut at = head.iter().position(|&b| b == b'\n')? + 1;
+    while at <= head.len() {
+        let end = head[at..].iter().position(|&b| b == b'\n').map_or(head.len(), |n| at + n);
+        let raw = &head[at..end];
+        at = end + 1;
+        let line = raw.strip_suffix(b"\r").unwrap_or(raw);
+        if matches!(line.first(), Some(b' ' | b'\t')) {
+            return None; // a fold
+        }
+        let Some(first) = line.iter().position(|&b| !ws(b)) else { continue };
+        if line[first] >= 0x80 {
+            return None; // might be trimmed
+        }
+        if !matches!(line[first] | 0x20, b'c' | b't') {
+            continue;
+        }
+        if !line.is_ascii() {
+            return None;
+        }
+        let Some(colon) = line.iter().position(|&b| b == b':') else { continue };
+        let (name, value) = (trim(&line[..colon]), &line[colon + 1..]);
+        let (slot, n) = if name.eq_ignore_ascii_case("transfer-encoding") {
+            (&mut out.te, &mut out.n_te)
+        } else if name.eq_ignore_ascii_case("content-length") {
+            (&mut out.cl, &mut out.n_cl)
+        } else {
+            continue;
+        };
+        *slot.get_mut(*n)? = trim(value);
+        *n += 1;
+    }
+    Some(out)
 }
 
 /// Whether a head asks for the connection to close after this message: `Connection:
 /// close`, or HTTP/1.0 without `Connection: keep-alive`.
 #[must_use]
 pub fn head_wants_close(head: &str) -> bool {
+    if head.is_ascii() {
+        head_wants_close_ascii(head.as_bytes())
+    } else {
+        head_wants_close_general(head)
+    }
+}
+
+/// [`head_wants_close_general`] of an ASCII head, on its bytes, in one pass for both tokens.
+fn head_wants_close_ascii(head: &[u8]) -> bool {
+    let (mut close, mut keep_alive) = (false, false);
+    let mut lines = head.split(|&b| b == b'\n');
+    let first = lines.next().unwrap_or_default();
+    for l in lines {
+        let Some(colon) = l.iter().position(|&b| b == b':') else { continue };
+        if !ascii_trim(&l[..colon]).eq_ignore_ascii_case(b"connection") {
+            continue;
+        }
+        for t in l[colon + 1..].split(|&b| b == b',').map(ascii_trim) {
+            close |= t.eq_ignore_ascii_case(b"close");
+            keep_alive |= t.eq_ignore_ascii_case(b"keep-alive");
+        }
+    }
+    close || (first.windows(8).any(|w| w == b"HTTP/1.0") && !keep_alive)
+}
+
+/// [`head_wants_close`] of any head.
+#[cold]
+#[inline(never)]
+fn head_wants_close_general(head: &str) -> bool {
     let has = |token: &str| {
         head.split('\n').skip(1).any(|l| {
             l.split_once(':').is_some_and(|(k, v)| {
@@ -862,6 +1008,9 @@ pub fn response_connection_token(close: bool, rsp_http11: bool, req_http11: bool
 /// all go: the header is removed whole.
 #[must_use]
 pub fn connection_is_plain(value: &str) -> bool {
+    if value.is_ascii() {
+        return value.as_bytes().split(|&b| b == b',').map(ascii_trim).all(|t| t.is_empty() || t.eq_ignore_ascii_case(b"keep-alive") || t.eq_ignore_ascii_case(b"close"));
+    }
     value.split(',').map(str::trim).all(|t| t.is_empty() || t.eq_ignore_ascii_case("keep-alive") || t.eq_ignore_ascii_case("close"))
 }
 
@@ -1028,9 +1177,21 @@ pub fn htx_response_head_cost(head: &[u8]) -> usize {
 }
 
 fn head_cost(head: &[u8], request: bool) -> usize {
+    head_cost_of(head, htx_head_size(head, request))
+}
+
+/// [`head_cost`] of a head whose [`htx_head_size`] is `size`.
+fn head_cost_of(head: &[u8], size: Option<u64>) -> usize {
     let blocks = 2 + head.split(|&b| b == b'\n').skip(1).take_while(|l| !l.is_empty() && *l != b"\r").count();
-    let data = htx_head_size(head, request).map_or(head.len(), |n| usize::try_from(n).unwrap_or(usize::MAX));
+    let data = size.map_or(head.len(), |n| usize::try_from(n).unwrap_or(usize::MAX));
     data.saturating_add(40 + 8 * blocks)
+}
+
+/// [`htx_head_cost`] and [`htx_head_size`] of a request head, read once.
+#[must_use]
+pub fn htx_head_cost_and_size(head: &[u8]) -> (usize, Option<u64>) {
+    let size = htx_head_size(head, true);
+    (head_cost_of(head, size), size)
 }
 
 /// The size `HAProxy` gives a message head in its HTX representation, which is what `%U`
@@ -1044,6 +1205,67 @@ fn head_cost(head: &[u8], request: bool) -> usize {
 /// `None` if the head is not UTF-8, which the caller counts on the wire.
 #[must_use]
 pub fn htx_head_size(head: &[u8], request: bool) -> Option<u64> {
+    if head.is_ascii() {
+        htx_head_size_ascii(head, request)
+    } else {
+        htx_head_size_general(head, request)
+    }
+}
+
+/// [`htx_head_size_general`] of an ASCII head, on its bytes.
+fn htx_head_size_ascii(head: &[u8], request: bool) -> Option<u64> {
+    let mut lines = head.split(|&b| b == b'\n').map(|l| l.strip_suffix(b"\r").unwrap_or(l));
+    let first = lines.next()?;
+    let strings = if request {
+        let sp = first.iter().position(|&b| b == b' ')?;
+        let (method, rest) = (&first[..sp], &first[sp + 1..]);
+        let (target, version) = rest.iter().rposition(|&b| b == b' ').map_or((rest, &b""[..]), |v| (&rest[..v], &rest[v + 1..]));
+        method.len() + ascii_trim(target).len() + ascii_trim(version).len()
+    } else {
+        let (version, rest) = first.iter().position(|&b| b == b' ').map_or((first, &b""[..]), |sp| (&first[..sp], &first[sp + 1..]));
+        let rest = ascii_trim_start(rest);
+        let (status, reason) = rest.split_at(rest.len().min(3));
+        version.len() + status.len() + ascii_trim(reason).len()
+    };
+    let mut size = 20 + strings as u64 + 1;
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        let Some(colon) = line.iter().position(|&b| b == b':') else { continue };
+        let (name, value) = (ascii_trim_end(&line[..colon]), ascii_trim(&line[colon + 1..]));
+        let len = if name.eq_ignore_ascii_case(b"connection") {
+            let known = |t: &[u8]| t.eq_ignore_ascii_case(b"close") || t.eq_ignore_ascii_case(b"keep-alive") || t.eq_ignore_ascii_case(b"upgrade");
+            let mut kept = 0;
+            let mut chars = 0;
+            let mut dropped = false;
+            for t in value.split(|&b| b == b',').map(ascii_trim).filter(|t| !t.is_empty()) {
+                if known(t) {
+                    dropped = true;
+                } else {
+                    kept += 1;
+                    chars += t.len();
+                }
+            }
+            if !dropped {
+                value.len()
+            } else if kept == 0 {
+                continue;
+            } else {
+                chars + kept - 1
+            }
+        } else {
+            value.len()
+        };
+        size += (name.len() + len) as u64;
+    }
+    Some(size)
+}
+
+/// [`htx_head_size`] of any head.
+#[cold]
+#[inline(never)]
+fn htx_head_size_general(head: &[u8], request: bool) -> Option<u64> {
     let head = std::str::from_utf8(head).ok()?;
     let mut lines = head.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l));
     let first = lines.next()?;
@@ -1577,6 +1799,69 @@ mod tests {
         assert_eq!(response_framing(&h("Transfer-Encoding: gzip, chunked\r\n"), Some("GET"), 200), Framing::Chunked);
         assert_eq!(response_framing(&h("Transfer-Encoding: gzip\r\n"), Some("GET"), 200), Framing::UntilClose);
         assert_eq!(response_framing(&h(""), Some("GET"), 200), Framing::UntilClose);
+    }
+
+    /// The readings of an ASCII head on its bytes give what the readings of any head give.
+    #[test]
+    fn ascii_head_readings_match_the_general_ones() {
+        let starts = [
+            "GET / HTTP/1.1", "GET /a%20b HTTP/1.0", "GET  /x  HTTP/1.1 ", "GET", "GET /", "\u{b}GET /\u{c} HTTP/1.0\u{b}",
+            "HTTP/1.1 200 OK", "HTTP/1.0 204", "HTTP/1.1  301 \u{b}Moved \t", "HTTP/1.1", "HTTP/1.1 2", "",
+        ];
+        let lines = [
+            "", "Host: x\r\n", "Connection: close\r\n", "connection: Keep-Alive\r\n", "Connection :  te, close ,\r\n",
+            "Connection: upgrade, foo,, bar\r\n", "Connection: keep-alive, close\r\n", "\u{b}Connection\u{b}: close\u{c}\r\n",
+            "Connection: \r\n", "X-Connection: close\r\n", "Connection close\r\n", "Content-Length: 5\n", " folded: close\r\n",
+            "Connection: close\r\r\n", "Upgrade:websocket\r\n", "\r\nConnection: close\r\n", "\nX: 1\r\n",
+            "Connection:keep-alive\u{a0}\r\n", "Connection: \u{85}close\r\n", "X-\u{e9}: v\r\n",
+        ];
+        for st in starts {
+            for a in lines {
+                for b in lines {
+                    let head = format!("{st}\r\n{a}{b}\r\n");
+                    let h = head.as_bytes();
+                    for request in [true, false] {
+                        assert_eq!(htx_head_size(h, request), htx_head_size_general(h, request), "{head:?} {request}");
+                    }
+                    assert_eq!(head_wants_close(&head), head_wants_close_general(&head), "{head:?}");
+                    for v in [a, b] {
+                        let v = v.split_once(':').map_or(v, |(_, v)| v);
+                        let general = v.split(',').map(str::trim).all(|t| t.is_empty() || t.eq_ignore_ascii_case("keep-alive") || t.eq_ignore_ascii_case("close"));
+                        assert_eq!(connection_is_plain(v), general, "{v:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The one-pass reading of the framing fields gives what the general one gives, on the
+    /// heads it answers for, and leaves the others to it.
+    #[test]
+    fn framing_fast_path_reads_as_fields() {
+        let lines = [
+            "", "Host: x\r\n", "Content-Length: 5\r\n", "content-length:5 \r\n", "Content-Length: 5, 5\r\n",
+            "Content-Length: 5\r\nContent-Length: 6\r\n", "Content-Length: 0\r\n", "Content-Length: +5\r\n",
+            "Content-Length:\r\n", "Transfer-Encoding: chunked\r\n", "transfer-encoding: gzip\r\n",
+            "Transfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n", "Transfer-Encoding:\r\n chunked\r\n",
+            "Transfer-Encoding: gzip,\r\n\tchunked\r\n", "\u{a0}Content-Length: 7\r\n", "\u{b}Content-Length: 7\r\n",
+            "\u{c}transfer-encoding: chunked\r\n", "Content-Length\u{85}: 7\r\n", "Content-Length: 7\u{a0}\r\n",
+            "Cookie: \u{e9}\r\n", "Content-Length 7\r\n", "X: 1\r\nContent-Length: 4\r\n", "Content-Length : 3 \r\r\n",
+            "TE: x\r\n", "Content-Length: 1\r\nContent-Length: 1\r\nContent-Length: 1\r\nContent-Length: 1\r\nContent-Length: 1\r\n",
+            "Content-Length: 4\n", "junk\r\n Content-Length: 9\r\n",
+        ];
+        for a in lines {
+            for b in lines {
+                let req = format!("POST / HTTP/1.1\r\n{a}{b}\r\n");
+                assert_eq!(request_framing(req.as_bytes()), request_framing_general(req.as_bytes()), "{req:?}");
+                let rsp = format!("HTTP/1.1 200 OK\r\n{a}{b}\r\n");
+                assert_eq!(response_framing(&rsp, Some("GET"), 200), response_body_framing(fields(&rsp), fields(&rsp)), "{rsp:?}");
+            }
+        }
+        // Not UTF-8: read lossily, as before.
+        for head in [&b"POST / HTTP/1.1\r\nContent-Length: 5\xff\r\n\r\n"[..], b"POST / HTTP/1.1\r\nX: \xff\r\nContent-Length: 5\r\n\r\n"] {
+            assert_eq!(request_framing(head), request_framing_general(head));
+        }
+        assert_eq!(request_framing(b"POST / HTTP/1.1\r\nX: \xff\r\nContent-Length: 5\r\n\r\n"), Framing::Length(5));
     }
 
     #[test]

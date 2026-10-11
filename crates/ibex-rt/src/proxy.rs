@@ -1195,7 +1195,10 @@ impl TcpSession {
         }
         // The websocket handshake, for the response (T281): a key written when the request
         // has none and the frontend accepts that (`h1_process_mux`).
-        let (ws, written) = crate::websocket::ReqWs::of(slice.as_ref().headers(), self.accept_unsafe_request);
+        let (ws, written) = crate::websocket::ReqWs::of(
+            slice.as_ref().header_blocks_where(crate::websocket::ReqWs::reads).map(|(_, n, v)| (n, v)),
+            self.accept_unsafe_request,
+        );
         let key_written = written.is_some_and(|k| slice.add_header("sec-websocket-key", &k).is_ok());
         self.req_ws = (ws != crate::websocket::ReqWs::default()).then(|| Box::new(ws));
         self.htx_tail = slice.tail_addr();
@@ -1578,14 +1581,13 @@ impl TcpSession {
 
                 // The head, parsed into HTX, has to fit in tune.bufsize - tune.maxrewrite:
                 // HAProxy answers 431 (tasks/T87; `txn::htx_head_cost`).
-                if txn::htx_head_cost(&self.req.readable()[..total_hdr_len]) > threshold {
+                // What `%U` counts of this head: the message as received, whatever the
+                // rules make of it afterwards.
+                let (cost, req_htx) = txn::htx_head_cost_and_size(&self.req.readable()[..total_hdr_len]);
+                if cost > threshold {
                     self.fail_request(431);
                     return Ok(true);
                 }
-
-                // What `%U` counts of this head: the message as received, whatever the
-                // rules make of it afterwards.
-                let req_htx = txn::htx_head_size(&self.req.readable()[..total_hdr_len], true);
 
                 // Validate the head through the selected parser before anything below
                 // reads it.
@@ -2363,6 +2365,25 @@ fn has_header(head: &str, name: &str) -> bool {
 
 #[must_use]
 pub fn find_eoh(buf: &[u8]) -> Option<(usize, usize)> {
+    // Each end starts with a CR or an LF: the bytes before the next one are passed over.
+    let mut i = 0;
+    while let Some(n) = buf[i..].iter().position(|&b| b == b'\r' || b == b'\n') {
+        i += n;
+        let rest = &buf[i..];
+        if rest.starts_with(b"\r\n\r\n") {
+            return Some((i, 4));
+        }
+        if rest.starts_with(b"\n\n") || rest.starts_with(b"\r\r") {
+            return Some((i, 2));
+        }
+        i += 1;
+    }
+    None
+}
+
+/// [`find_eoh`] a byte at a time.
+#[cfg(test)]
+fn find_eoh_bytewise(buf: &[u8]) -> Option<(usize, usize)> {
     for i in 0..buf.len() {
         if i + 4 <= buf.len() && &buf[i..i + 4] == b"\r\n\r\n" {
             return Some((i, 4));
@@ -2707,6 +2728,21 @@ fn h3_log_line(line: &str, host: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// Every string of up to eight bytes out of `a`, CR and LF.
+    #[test]
+    fn find_eoh_skips_to_line_ends_and_finds_the_same_end() {
+        for len in 0..=8u32 {
+            for mut code in 0..3usize.pow(len) {
+                let mut buf = Vec::new();
+                for _ in 0..len {
+                    buf.push(b"a\r\n"[code % 3]);
+                    code /= 3;
+                }
+                assert_eq!(super::find_eoh(&buf), super::find_eoh_bytewise(&buf), "{buf:?}");
+            }
+        }
+    }
     use super::{h3_log_line, H2ReqBody};
     use crate::h2_bridge::pump_h2_body;
     use crate::buf::Buf;

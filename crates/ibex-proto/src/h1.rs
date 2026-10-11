@@ -183,7 +183,8 @@ impl H1Parser {
         let (mut websocket, mut key) = (false, false);
         // Each `Upgrade` line's index and, when it changes, what it becomes (empty: it goes).
         let mut edits: Vec<(usize, Option<String>)> = Vec::new();
-        for (i, name, value) in htx.as_ref().header_blocks() {
+        let named = |n: &[u8]| n.eq_ignore_ascii_case(b"connection") || n.eq_ignore_ascii_case(b"upgrade") || n.eq_ignore_ascii_case(b"sec-websocket-key");
+        for (i, name, value) in htx.as_ref().header_blocks_where(named) {
             if name.eq_ignore_ascii_case("connection") {
                 conn_upg |= crate::upgrade::tokens(value).any(|t| t.eq_ignore_ascii_case("upgrade"));
             } else if name.eq_ignore_ascii_case("upgrade") {
@@ -559,7 +560,10 @@ impl H1Parser {
         // read the way HAProxy's `h1_parse_xfer_enc_header` reads it: reading only the
         // first line framed `gzip` + `chunked` on two lines as a request without a body,
         // while the next hop read a chunked one (tasks/T276, V&V VV-1).
-        let te = TransferCodings::of(htx.headers(), self.is_response);
+        let te = TransferCodings::of(
+            htx.as_ref().header_blocks_where(|n| n.eq_ignore_ascii_case(b"transfer-encoding")).map(|(_, n, v)| (n, v)),
+            self.is_response,
+        );
         if te.invalid {
             self.phase = H1Phase::Error;
             return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid Transfer-Encoding"));
@@ -572,7 +576,12 @@ impl H1Parser {
             self.framing_conflict = true;
             self.connection_close = true;
         }
-        let is_http11 = htx.req_line().map_or_else(|| htx.res_line().is_some_and(|r| r.version == "HTTP/1.1"), |r| r.version == "HTTP/1.1");
+        // The start line, read once: what follows edits headers only.
+        let req_line = htx.req_line().map(|r| (r.version, ["GET", "HEAD", "DELETE"].contains(&r.method), r.method.eq_ignore_ascii_case("CONNECT")));
+        let res_version = htx.res_line().map(|r| r.version);
+        let is_http11 = req_line.map_or(res_version == Some("HTTP/1.1"), |(v, ..)| v == "HTTP/1.1");
+        let is_http10 = req_line.is_some_and(|(v, ..)| v == "HTTP/1.0") || res_version == Some("HTTP/1.0");
+        let (bodiless_method, is_connect) = req_line.map_or((false, false), |(_, b, c)| (b, c));
         if te.present && !is_http11 {
             // T-E in HTTP/1.0: the connection closes after this message.
             self.connection_close = true;
@@ -586,9 +595,8 @@ impl H1Parser {
             }
             // `h1_process_input` in mux_h1.c, in this order: an HTTP/1.0 GET, HEAD or
             // DELETE with a body is 413, then any coding but chunked is 422.
-            let method = htx.req_line().map(|r| r.method);
             let body = self.is_chunked || self.content_length.is_some_and(|n| n > 0);
-            if !is_http11 && body && method.is_some_and(|m| ["GET", "HEAD", "DELETE"].contains(&m)) {
+            if !is_http11 && body && bodiless_method {
                 self.phase = H1Phase::Error;
                 return Err(Refusal::error(413, "HTTP/1.0 GET/HEAD/DELETE with a body"));
             }
@@ -604,13 +612,6 @@ impl H1Parser {
             self.check_upgrade(htx)?;
         }
 
-        let is_http10 = htx
-            .req_line()
-            .map_or(false, |r| r.version == "HTTP/1.0")
-            || htx
-                .res_line()
-                .map_or(false, |r| r.version == "HTTP/1.0");
-
         if let Some(conn) = htx.get_header("connection") {
             if conn.eq_ignore_ascii_case("close") {
                 self.connection_close = true;
@@ -621,10 +622,8 @@ impl H1Parser {
             self.connection_close = true;
         }
 
-        if let Some(meth) = htx.req_line().map(|r| r.method) {
-            if meth.eq_ignore_ascii_case("CONNECT") {
-                self.is_upgrade = true;
-            }
+        if is_connect {
+            self.is_upgrade = true;
         }
         if htx.get_header("upgrade").is_some() {
             self.is_upgrade = true;
