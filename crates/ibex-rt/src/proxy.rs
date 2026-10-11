@@ -570,6 +570,20 @@ impl TcpSession {
         s
     }
 
+    /// The version the client spoke, where it is not HTTP/1.x (`req.ver`): the HTX start line of
+    /// an h2 or h3 request is rewritten to HTTP/1.1 for the server leg, but `HAProxy` reads the
+    /// version of the message the client sent (`2.0`, `3.0`).
+    #[must_use]
+    pub fn client_version(&self) -> Option<&'static str> {
+        if self.h3 {
+            Some("HTTP/3.0")
+        } else if self.h2_ctx.is_some() {
+            Some("HTTP/2.0")
+        } else {
+            None
+        }
+    }
+
     #[must_use]
     pub fn htx_slice(&self) -> Option<ibex_proto::htx::HtxSliceRef<'_>> {
         if self.has_htx {

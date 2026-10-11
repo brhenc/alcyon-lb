@@ -122,6 +122,22 @@ impl RustlsContext {
         }
     }
 
+    /// A server-side context whose session does not exist yet: the caller makes it once the
+    /// ClientHello is in (`rustls::server::Acceptor`) and sets `session`.
+    #[must_use]
+    pub fn new_server_pending(fd: RawFd) -> Self {
+        Self {
+            fd,
+            is_server: true,
+            handshake_done: false,
+            session: None,
+            client_sni: None,
+            tls_info: RustlsTlsInfo { peer_verify: VerifyResult::NotRequested, ..Default::default() },
+            rx_raw: Vec::with_capacity(16_384),
+            tx_raw: Vec::with_capacity(16_384),
+        }
+    }
+
     /// Creates a new client-side TLS context.
     #[must_use]
     pub fn new_client(fd: RawFd, conn: ClientConnection, sni: Option<String>) -> Self {

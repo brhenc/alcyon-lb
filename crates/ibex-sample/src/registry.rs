@@ -268,6 +268,8 @@ pub struct SslFacts<'a> {
     pub cipher: Option<&'a str>,
     /// The negotiated protocol, `TLSv1.3` (`ssl_fc_protocol`).
     pub protocol: Option<&'a str>,
+    /// The negotiated application protocol, `h2` (`ssl_fc_alpn`); none when not negotiated.
+    pub alpn: Option<&'a [u8]>,
     /// The peer sent a certificate (`ssl_c_used`).
     pub has_crt: bool,
     /// The handshake resumed an earlier session (`ssl_fc_is_resumed`).
@@ -2158,6 +2160,11 @@ impl Registry {
             name: "ssl_fc_sni",
             out_type: SampleType::Str,
             func: |ctx, _args| ctx.ssl_fc.sni.map(|v| Sample::Str(v.to_string())),
+        });
+        self.register_fetch(FetchDesc {
+            name: "ssl_fc_alpn",
+            out_type: SampleType::Str,
+            func: |ctx, _args| ctx.ssl_fc.alpn.map(|v| Sample::Str(String::from_utf8_lossy(v).into_owned())),
         });
         self.register_fetch(FetchDesc {
             name: "ssl_fc_cipher",
@@ -4546,9 +4553,10 @@ fn get_context_method<'a>(ctx: &'a SampleContext) -> Option<&'a str> {
 }
 
 fn get_context_req_version<'a>(ctx: &'a SampleContext) -> Option<&'a str> {
-    ctx.htx_slice
-        .and_then(|h| h.req_line().map(|r| r.version))
-        .or(ctx.req_version)
+    // `req_version` first: the client's own version, which the HTX start line no longer has
+    // for an h2 or h3 request (rewritten to HTTP/1.1 for the server leg).
+    ctx.req_version
+        .or_else(|| ctx.htx_slice.and_then(|h| h.req_line().map(|r| r.version)))
         .or_else(|| ctx.htx.and_then(|h| h.req_line().map(|r| r.version.as_str())))
 }
 

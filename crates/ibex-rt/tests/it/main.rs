@@ -262,6 +262,7 @@ mod tcp_response_rules;
 mod timeout_tunnel_queue;
 mod timer_waits;
 mod tls12;
+mod tls_alpn_req_ver;
 mod tls_e2e;
 mod tls_handshake_close;
 mod tls_handshake_log;

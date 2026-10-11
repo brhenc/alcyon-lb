@@ -183,6 +183,15 @@ pub struct TlsConn {
     /// the poller says so, as for a plaintext socket (`fd_cant_recv`). Not knowing this,
     /// the TLS side read until `EAGAIN` on every pass: 7 of 9 reads a request (T186).
     sock_drained: bool,
+    /// A server connection whose ClientHello is not complete yet: the session is made from it
+    /// (`gate_fill`), so that the ALPN list the client offered can be looked at first.
+    gate: Option<Box<Gate>>,
+}
+
+/// What a server connection holds until its ClientHello is in.
+struct Gate {
+    acceptor: rustls::server::Acceptor,
+    config: std::sync::Arc<rustls::ServerConfig>,
 }
 
 impl TlsConn {
@@ -203,6 +212,7 @@ impl TlsConn {
             prefix: Vec::new(),
             prefix_sent: 0,
             sock_drained: false,
+            gate: None,
         }
     }
 
@@ -321,8 +331,80 @@ impl TlsConn {
         r
     }
 
+    /// Reads the ClientHello and makes the session from it. `Ok(false)` at end of stream;
+    /// `Ok(true)` with the gate still up when more bytes are needed, or gone once the session
+    /// exists.
+    ///
+    /// `HAProxy` (OpenSSL) completes the handshake without ALPN when the client offers
+    /// protocols and none is one the bind serves; rustls alone aborts it with
+    /// `no_application_protocol`. So when the lists have nothing in common the session is made
+    /// from the same configuration with an empty list.
+    fn gate_fill(&mut self, sock: &mut Sock<'_>) -> io::Result<bool> {
+        let fd = sock.0;
+        loop {
+            let Some(gate) = self.gate.as_mut() else { return Ok(true) };
+            match gate.acceptor.read_tls(sock) {
+                Ok(0) => return Ok(false),
+                Ok(_) => {
+                    if let Some(e) = self.refuse_old_legacy_version(fd, &sock.2) {
+                        return Err(e);
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(true),
+                Err(e) if e.kind() == io::ErrorKind::ConnectionReset => return Ok(false),
+                Err(e) => return Err(e),
+            }
+            let Some(gate) = self.gate.as_mut() else { return Ok(true) };
+            let made = match gate.acceptor.accept() {
+                Ok(None) => continue,
+                Ok(Some(accepted)) => {
+                    let ours = &gate.config.alpn_protocols;
+                    let disjoint = !ours.is_empty()
+                        && accepted.client_hello().alpn().is_some_and(|mut theirs| theirs.all(|t| !ours.iter().any(|o| o.as_slice() == t)));
+                    let config = if disjoint {
+                        let mut c = (*gate.config).clone();
+                        c.alpn_protocols.clear();
+                        std::sync::Arc::new(c)
+                    } else {
+                        std::sync::Arc::clone(&gate.config)
+                    };
+                    accepted.into_connection(config)
+                }
+                Err((e, alert)) => Err((e, alert)),
+            };
+            match made {
+                Ok(conn) => {
+                    self.gate = None;
+                    self.ctx.session = Some(TlsSession::Server(conn));
+                    return Ok(true);
+                }
+                Err((e, mut alert)) => {
+                    let first = self.head.first().or_else(|| sock.2.first()).copied();
+                    let mapped = openssl_error(&e, first);
+                    if let Some((text, a)) = mapped {
+                        self.ossl_text = Some(text);
+                        if let Some(a) = a {
+                            let _ = raw::send(fd, &[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, a]);
+                        }
+                    } else if first.is_some_and(|b| (0x14..=0x17).contains(&b)) {
+                        // Not to a stranger's bytes: OpenSSL sends nothing to those either.
+                        let _ = alert.write(sock);
+                    }
+                    self.gate = None;
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, e));
+                }
+            }
+        }
+    }
+
     fn fill_from(&mut self, sock: &mut Sock<'_>) -> io::Result<bool> {
         let fd = sock.0;
+        if self.gate.is_some() && !self.gate_fill(sock)? {
+            return Ok(false);
+        }
+        if self.gate.is_some() {
+            return Ok(true);
+        }
         loop {
             let wants = match self.ctx.session.as_ref() {
                 Some(TlsSession::Server(c)) => c.wants_read(),
@@ -396,7 +478,7 @@ impl TlsConn {
     /// `protocol_version` below SSL 3.0 and `handshake_failure` for SSL 3.0 (measured on
     /// `HAProxy`). `fresh` is what this fill has read so far, the first bytes of it.
     fn refuse_old_legacy_version(&mut self, fd: BorrowedFd<'_>, fresh: &[u8]) -> Option<io::Error> {
-        if self.legacy_checked || self.ctx.handshake_done || !matches!(self.ctx.session, Some(TlsSession::Server(_))) {
+        if self.legacy_checked || self.ctx.handshake_done || !(self.gate.is_some() || matches!(self.ctx.session, Some(TlsSession::Server(_)))) {
             return None;
         }
         let mut head = self.head.clone();
@@ -466,7 +548,7 @@ impl TlsConn {
         let handshaking = match self.ctx.session.as_ref() {
             Some(TlsSession::Server(c)) => c.is_handshaking(),
             Some(TlsSession::Client(c)) => c.is_handshaking(),
-            None => false,
+            None => self.gate.is_some(),
         };
         if !handshaking {
             self.ctx.handshake_done = true;
@@ -507,6 +589,7 @@ fn facts_of(info: &ibex_tls::RustlsTlsInfo) -> ibex_sample::SslFacts<'_> {
         sni: info.sni.as_deref(),
         cipher: info.cipher.as_deref().map(openssl_cipher_name),
         protocol: info.protocol_version.as_deref(),
+        alpn: info.alpn.as_deref(),
         has_crt: info.peer_has_cert,
         resumed: info.session_resumed,
     }
@@ -739,10 +822,9 @@ pub fn accept_tls(
     fd: &impl AsRawFd,
     config: std::sync::Arc<rustls::ServerConfig>,
 ) -> io::Result<ClientXprt> {
-    let conn = rustls::ServerConnection::new(config).map_err(io::Error::other)?;
-    Ok(ClientXprt::Tls(Box::new(TlsConn::new(
-        RustlsContext::new_server(fd.as_raw_fd(), conn),
-    ))))
+    let mut tls = TlsConn::new(RustlsContext::new_server_pending(fd.as_raw_fd()));
+    tls.gate = Some(Box::new(Gate { acceptor: rustls::server::Acceptor::default(), config }));
+    Ok(ClientXprt::Tls(Box::new(tls)))
 }
 
 #[cfg(test)]
