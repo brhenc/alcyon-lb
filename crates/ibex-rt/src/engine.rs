@@ -8869,6 +8869,9 @@ impl EngineDispatcher<'_> {
             });
             if let (Some(h2), Some(code)) = (h2, code) {
                 h2.send_rst_stream(id, code);
+                if let Some(goaway) = child.sess.h2_child().and_then(|c| c.goaway) {
+                    h2.send_goaway(h2.last_client_stream_id, goaway, b"");
+                }
             }
             if owner.sess.srv.is_some() {
                 // Another stream already gave one back: this one goes to the pool, as
@@ -10019,6 +10022,21 @@ impl EngineDispatcher<'_> {
                     let be_idx = if entry.backend_idx < proxies.len() { entry.backend_idx } else { entry.proxy_idx };
                     send_proxy_reply(&mut entry.sess, proxies, entry.proxy_idx, be_idx, &raw);
                 }
+                // The response is read and counted (its status is the log's) but never sent:
+                // `PR`, `dreq` on the frontend and the backend (measured).
+                ResStop::SilentDrop => {
+                    entry.sess.log.term = Some(*b"PR");
+                    proxies[entry.proxy_idx].counters().denied_req.fetch_add(1, Ordering::Relaxed);
+                    proxies[entry.backend_idx.min(proxies.len() - 1)].counters().denied_req.fetch_add(1, Ordering::Relaxed);
+                    let is_ipv6 = entry.sess.client_addr.is_some_and(|a| a.is_ipv6());
+                    entry.sess.refuse_request(true, is_ipv6);
+                    if let Some(txn) = entry.sess.txn.as_mut() {
+                        txn.close_after = true;
+                        txn.aborted = true;
+                    }
+                    entry.sess.cli_state = ScState::Closed;
+                    entry.sess.srv_state = ScState::Closed;
+                }
             }
             return;
         }
@@ -10506,6 +10524,8 @@ impl EngineDispatcher<'_> {
                         | ibex_config::HttpReqAction::Auth { .. }
                         | ibex_config::HttpReqAction::Redirect { .. }
                         | ibex_config::HttpReqAction::Tarpit { .. }
+                        | ibex_config::HttpReqAction::Reject
+                        | ibex_config::HttpReqAction::SilentDrop
                 ) {
                     note_last_rule(sess, rule.line);
                 }
@@ -10587,6 +10607,24 @@ impl EngineDispatcher<'_> {
                     }
                     ibex_config::HttpReqAction::Allow => {
                         return Ok(RuleFlow::Next);
+                    }
+                    // `reject` closes the client connection, `silent-drop` makes it vanish;
+                    // either way no response is made and the server is not contacted. The
+                    // `tcp-request content` versions end the same way (above).
+                    ibex_config::HttpReqAction::Reject | ibex_config::HttpReqAction::SilentDrop => {
+                        sess.log.term = Some(*b"PR");
+                        proxies[proxy_idx].counters().denied_req.fetch_add(1, Ordering::Relaxed);
+                        for_tracked(proxies, sess, |data| data.count_err());
+                        let is_ipv6 = sess.client_addr.is_some_and(|a| a.is_ipv6());
+                        sess.refuse_request(matches!(rule.action, ibex_config::HttpReqAction::SilentDrop), is_ipv6);
+                        // No response is owed, and the server's absence is no 502.
+                        if let Some(t) = sess.txn.as_mut() {
+                            t.close_after = true;
+                            t.aborted = true;
+                        }
+                        sess.cli_state = ScState::Closed;
+                        sess.srv_state = ScState::Closed;
+                        return Ok(RuleFlow::Replied);
                     }
                     ibex_config::HttpReqAction::Auth { realm } => {
                         // The 401 page of the proxy with `WWW-Authenticate` added; with no
@@ -12763,6 +12801,8 @@ enum ResStop {
     Empty(u16),
     /// A whole reply the rule made (`http-response redirect`).
     Reply(Vec<u8>),
+    /// `http-response silent-drop`: nothing goes to the client, which is not told.
+    SilentDrop,
 }
 
 /// One `http-response` or `http-after-response` action, whichever list it comes from.
@@ -13025,6 +13065,9 @@ fn res_action(
     if act_name == "\0allow" {
         return Ok(false);
     }
+    if act_name == "\0silent-drop" {
+        return Err(ResStop::SilentDrop);
+    }
     if act_name == "\0deny" {
         // `http-response deny` with no status is a 502 in HAProxy (the
         // server's response is what was refused); 403 is the request side's.
@@ -13167,7 +13210,7 @@ fn run_res_rules<'a>(
             }
         };
         // `allow`, `deny` and `redirect` end the rules: they are the last rule (`LAST_RULE`).
-        if line != 0 && matches!(op, ResOp::Redirect(..) | ResOp::Set("\0allow" | "\0deny", _)) {
+        if line != 0 && matches!(op, ResOp::Redirect(..) | ResOp::Set("\0allow" | "\0deny" | "\0silent-drop", _)) {
             LAST_RULE.set(Some(line));
         }
         match res_action(op, hdrs, status, status_msg, ctx, registry, sess_vars, req_vars) {

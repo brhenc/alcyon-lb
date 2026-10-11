@@ -50,6 +50,11 @@ pub enum HttpReqAction {
         error_page: Option<ErrorPageSource>,
     },
     Allow,
+    /// `reject`: the connection is closed with no response (a stream of an HTTP/2
+    /// connection is reset with `ENHANCE_YOUR_CALM`).
+    Reject,
+    /// `silent-drop`: the client is not told (no FIN, an RST that does not reach it).
+    SilentDrop,
     SetHeader {
         name: String,
         fmt: String,
