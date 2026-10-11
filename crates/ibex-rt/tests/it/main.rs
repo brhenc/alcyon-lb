@@ -164,6 +164,7 @@ mod load_balancing;
 mod log_encodings;
 mod log_filtering;
 mod log_forward;
+mod log_format_sd;
 mod log_parity;
 mod log_rc_redispatch;
 mod log_stdout_full_pipe;

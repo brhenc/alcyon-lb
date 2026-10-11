@@ -1538,10 +1538,9 @@ pub struct Proxy {
     /// The per-transaction log line's format (`log-format`, `option httplog`/`tcplog`);
     /// frontends and listens only, as in `HAProxy`.
     pub log_format: Option<Arc<crate::logfmt::LogFormat>>,
-    /// `error-log-format`, compiled once with the configuration: the line for a connection
-    /// that fails before a stream exists, in place of `HAProxy`'s plain error line (a TLS
-    /// handshake, a PROXY header) or of `log_format` (a request the mux refuses).
-    pub error_log_format: Option<Arc<crate::logfmt::LogFormat>>,
+    /// `error-log-format` and `log-format-sd`, which few frontends have: boxed together, as
+    /// `Proxy` is paid for per backend (T303).
+    pub extra_log: Option<Box<ExtraLogFormats>>,
     /// `option dontlognull`: a connection that carried nothing logs nothing.
     pub dont_log_null: bool,
     /// `option http-ignore-probes`: a connection that sends nothing before it closes or
@@ -1815,6 +1814,8 @@ pub struct SessionEntry {
     pub log_line: Option<Vec<u8>>,
     /// `log_line` is a failed stream's: `option log-separate-errors` sends it at `err`.
     pub log_err: bool,
+    /// The first `log_sd` bytes of `log_line` are its STRUCTURED-DATA (`log-format-sd`).
+    pub log_sd: u32,
 }
 
 /// Per-thread storage for active sessions.
@@ -2628,19 +2629,52 @@ fn account_stream(entry: &mut SessionEntry, proxies: &[Proxy]) {
     }
 }
 
+/// A frontend's `error-log-format` and `log-format-sd`, compiled once with the configuration.
+#[derive(Debug, Clone, Default)]
+pub struct ExtraLogFormats {
+    /// The line for a connection that fails before a stream exists, in place of `HAProxy`'s
+    /// plain error line (a TLS handshake, a PROXY header) or of `log_format` (a request the
+    /// mux refuses).
+    pub error: Option<Arc<crate::logfmt::LogFormat>>,
+    /// The STRUCTURED-DATA of the frontend's stream and error lines. Kept only while one of
+    /// its log targets writes an rfc5424 header ([`resolve_log_targets`]), so it is rendered
+    /// only for a line that has somewhere to carry it.
+    pub sd: Option<Arc<crate::logfmt::LogFormat>>,
+}
+
+/// `None` when the section has neither.
+fn extra_log_formats(error: Option<&str>, sd: Option<&str>) -> Option<Box<ExtraLogFormats>> {
+    let (error, sd) = (error.and_then(compile_format), sd.and_then(compile_format));
+    (error.is_some() || sd.is_some()).then(|| Box::new(ExtraLogFormats { error, sd }))
+}
+
+impl Proxy {
+    /// `error-log-format`.
+    #[must_use]
+    pub fn error_log_format(&self) -> Option<&crate::logfmt::LogFormat> {
+        self.extra_log.as_ref()?.error.as_deref()
+    }
+
+    /// `log-format-sd`, when one of the proxy's targets writes it.
+    #[must_use]
+    pub fn log_format_sd(&self) -> Option<&crate::logfmt::LogFormat> {
+        self.extra_log.as_ref()?.sd.as_deref()
+    }
+}
+
 /// The stream's log line, when its frontend logs (`HAProxy` logs nothing without a
 /// `log` target).
 ///
 /// With it, whether the stream failed (`strm_log`'s `err`): a redispatch or a retry, a
 /// termination state that names a fault (anything but `-` and `L`), or a 5xx status. A
 /// stream that did not fail has no line under `option dontlog-normal`.
-fn stream_log_line(entry: &SessionEntry, proxies: &[Proxy], pid: u32) -> Option<(Vec<u8>, bool)> {
+fn stream_log_line(entry: &SessionEntry, proxies: &[Proxy], pid: u32) -> Option<(Vec<u8>, u32, bool)> {
     let fe = &proxies[entry.proxy_idx];
     // A request the mux refused (400, 408, 501: `<BADREQ>`) never became a stream, and
     // `HAProxy` logs it with `error-log-format` when there is one (`_sess_log`, not
     // embryonic), whatever the `log-format`.
     let refused = entry.sess.mode == Mode::Http && entry.sess.log.request.is_none();
-    let fmt = fe.error_log_format.as_ref().filter(|_| refused).or(fe.log_format.as_ref())?;
+    let fmt = fe.error_log_format().filter(|_| refused).or(fe.log_format.as_deref())?;
     if fe.log_target_idx.is_empty() || entry.sess.log.asap_done {
         return None;
     }
@@ -2670,9 +2704,23 @@ fn stream_log_line(entry: &SessionEntry, proxies: &[Proxy], pid: u32) -> Option<
     if entry.target_server_idx.is_some() && !entry.actconn_reclaimed {
         data.srvconn = data.srvconn.saturating_sub(1);
     }
-    let line = fmt.render_bytes(&data, sample_registry(), &SampleContext { at_log: true, res_status: txn_status, ..stream_sample_ctx(&entry.sess, fe, be, &ProxiesView(proxies), &StickView::new(proxies, &entry.sess.tracked_sc)) });
+    let (view, stick) = (ProxiesView(proxies), StickView::new(proxies, &entry.sess.tracked_sc));
+    let ctx = SampleContext { at_log: true, res_status: txn_status, ..stream_sample_ctx(&entry.sess, fe, be, &view, &stick) };
+    let (line, sd) = with_sd(fe.log_format_sd(), fmt, &data, &ctx);
     fe.log_count.fetch_add(1, Ordering::Relaxed);
-    Some((line, err))
+    Some((line, sd, err))
+}
+
+/// `fmt` rendered, after the frontend's `log-format-sd` when it has one to send: one buffer,
+/// the STRUCTURED-DATA its first `sd_len` bytes (`send_log` splits it).
+fn with_sd(sd: Option<&crate::logfmt::LogFormat>, fmt: &crate::logfmt::LogFormat, data: &crate::logfmt::LogData, ctx: &SampleContext) -> (Vec<u8>, u32) {
+    let Some(sd) = sd else {
+        return (fmt.render_bytes(data, sample_registry(), ctx), 0);
+    };
+    let mut line = sd.render_bytes(data, sample_registry(), ctx);
+    let sd_len = u32::try_from(line.len()).unwrap_or(0);
+    fmt.render_append(&mut line, data, sample_registry(), ctx);
+    (line, sd_len)
 }
 
 /// Queues the stream's log line, with the level it goes out at, on `entry`.
@@ -2684,7 +2732,7 @@ fn set_stream_log(entry: &mut SessionEntry, proxies: &[Proxy], pid: u32) {
         return;
     }
     match stream_log_line(entry, proxies, pid) {
-        Some((line, err)) => (entry.log_line, entry.log_err) = (Some(line), err),
+        Some((line, sd, err)) => (entry.log_line, entry.log_sd, entry.log_err) = (Some(line), sd, err),
         None => entry.log_line = None,
     }
     leave_backend(entry, proxies);
@@ -2799,31 +2847,43 @@ fn embryonic_failure(s: &TcpSession) -> Option<EmbryonicFailure> {
 /// under `option dontlognull`. Its text is `error-log-format` when the frontend has one
 /// (compiled at load, rendered here with what the connection knows), else the plain
 /// `<src>:<port> [<date>] <fe>/<listener>: <message>`, never the frontend's `log-format`.
-fn proxy_header_error_line(entry: &SessionEntry, proxies: &[Proxy], pid: u32) -> Option<String> {
+/// A frontend logs it when it has any format: a `log-format`, an `error-log-format` or a
+/// `log-format-sd`, its own or the default of an rfc5424 target (measured: with `log` and
+/// none of them, a line only on an rfc5424 target).
+fn proxy_header_error_line(entry: &SessionEntry, proxies: &[Proxy], pid: u32) -> Option<(Vec<u8>, u32)> {
     let failure = embryonic_failure(&entry.sess)?;
     let fe = &proxies[entry.proxy_idx];
     if fe.log_target_idx.is_empty() || (fe.dont_log_null && failure.null) {
         return None;
     }
-    let s = &entry.sess;
-    if let Some(elf) = fe.error_log_format.as_ref() {
-        let data = crate::logfmt::LogData {
-            term_state: *b"PR",
-            status: 0,
-            t_idle: 0,
-            ..session_log_data(s, fe, fe, pid)
-        };
-        let (view, stick) = (ProxiesView(proxies), StickView::new(proxies, &s.tracked_sc));
-        // No stream, so no backend either: `be_name` has no value in `HAProxy`'s line.
-        let ctx = SampleContext { at_log: true, conn_err: Some(failure.conn_err()), be_name: None, be_id: None, ..stream_sample_ctx(s, fe, fe, &view, &stick) };
-        let line = elf.render_bytes(&data, sample_registry(), &ctx);
-        fe.log_count.fetch_add(1, Ordering::Relaxed);
-        return Some(String::from_utf8_lossy(&line).into_owned());
+    // `to_log` (`session_kill_embryonic`): set by every format the frontend compiles,
+    // `log-format-sd` and the default one an rfc5424 target brings included.
+    if fe.log_format.is_none() && fe.extra_log.is_none() {
+        return None;
     }
-    fe.log_format.as_ref()?;
-    let listener = s.so_name.as_deref().map_or_else(|| s.so_id.unwrap_or(0).to_string(), str::to_string);
+    let s = &entry.sess;
+    let data = crate::logfmt::LogData {
+        term_state: *b"PR",
+        status: 0,
+        t_idle: 0,
+        ..session_log_data(s, fe, fe, pid)
+    };
+    let (view, stick) = (ProxiesView(proxies), StickView::new(proxies, &s.tracked_sc));
+    // No stream, so no backend either: `be_name` has no value in `HAProxy`'s line.
+    let ctx = SampleContext { at_log: true, conn_err: Some(failure.conn_err()), be_name: None, be_id: None, ..stream_sample_ctx(s, fe, fe, &view, &stick) };
+    let line = match fe.error_log_format() {
+        Some(elf) => with_sd(fe.log_format_sd(), elf, &data, &ctx),
+        None => {
+            // The plain line has the frontend's `log-format-sd` in front of it too.
+            let mut line = fe.log_format_sd().map_or_else(Vec::new, |sd| sd.render_bytes(&data, sample_registry(), &ctx));
+            let sd_len = u32::try_from(line.len()).unwrap_or(0);
+            let listener = s.so_name.as_deref().map_or_else(|| s.so_id.unwrap_or(0).to_string(), str::to_string);
+            line.extend_from_slice(crate::logfmt::connection_error_line(s.client_addr, s.log.date, &fe.name, &listener, &failure.message).as_bytes());
+            (line, sd_len)
+        }
+    };
     fe.log_count.fetch_add(1, Ordering::Relaxed);
-    Some(crate::logfmt::connection_error_line(s.client_addr, s.log.date, &fe.name, &listener, &failure.message))
+    Some(line)
 }
 
 fn syslog_tag(tag: &str) -> Arc<str> {
@@ -2909,6 +2969,18 @@ fn resolve_log_targets(config: &Config, proxies: &mut [Proxy]) -> Vec<SyslogTarg
             proxy.log_cursors = Arc::new(resolved.iter().map(|_| AtomicU64::new(0)).collect());
         }
         proxy.log_target_idx = resolved;
+        // `log-format-sd` fills only an rfc5424 header's STRUCTURED-DATA: a proxy none of
+        // whose targets writes one never renders it. A frontend with such a target and no
+        // `log-format-sd` gets `HAProxy`'s default one (`- `, which Ibex writes as an empty
+        // field), and with it a line for a connection that fails before its session
+        // (`to_log`, see [`proxy_header_error_line`]).
+        if proxy.log_target_idx.iter().any(|&i| targets[i].writes_sd()) {
+            if proxy.has_frontend {
+                proxy.extra_log.get_or_insert_with(Box::default);
+            }
+        } else if let Some(extra) = proxy.extra_log.as_mut() {
+            extra.sd = None;
+        }
 
         if defaults_log_health {
             proxy.log_health_checks = true;
@@ -3299,7 +3371,7 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, list
         ignore_probes: listen.http_ignore_probes,
         log_opts: listen.log_opts,
         unique_id_format: listen.unique_id_format.as_deref().and_then(compile_unique_id_format),
-        error_log_format: listen.error_log_format.as_deref().and_then(compile_format),
+        extra_log: extra_log_formats(listen.error_log_format.as_deref(), listen.log_format_sd.as_deref()),
         unique_id_header: listen.unique_id_header.as_deref().map(Box::from),
         req_capture_slots,
         res_capture_slots: listen.res_header_captures.iter().map(|c| (c.name.clone(), c.len)).collect(),
@@ -3424,7 +3496,7 @@ fn init_proxy_from_frontend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, fe
         ignore_probes: fe.http_ignore_probes,
         log_opts: fe.log_opts,
         unique_id_format: fe.unique_id_format.as_deref().and_then(compile_unique_id_format),
-        error_log_format: fe.error_log_format.as_deref().and_then(compile_format),
+        extra_log: extra_log_formats(fe.error_log_format.as_deref(), fe.log_format_sd.as_deref()),
         unique_id_header: fe.unique_id_header.as_deref().map(Box::from),
         req_capture_slots,
         res_capture_slots: fe.res_header_captures.iter().map(|c| (c.name.clone(), c.len)).collect(),
@@ -3574,7 +3646,7 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, be:
         error_replies: be.error_replies.clone(),
         log_tag: be.log_tag.as_deref().map(syslog_tag),
         log_format: None,
-        error_log_format: None,
+        extra_log: None,
         dont_log_null: false,
         ignore_probes: false,
         log_opts: 0,
@@ -4778,6 +4850,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 srv_served: 0,
                 log_line: None,
                 log_err: false,
+                log_sd: 0,
             };
             // Neither fails before the `u32` indices run out.
             let Some(child_idx) = self.sessions.alloc(entry) else { return };
@@ -6463,6 +6536,7 @@ fn register_new_session(
         srv_served: 0,
         log_line: None,
         log_err: false,
+        log_sd: 0,
     }) else {
         if let Some(idx) = target_server_idx {
             if idx < proxy.server_actconn.len() {
@@ -8978,7 +9052,7 @@ impl EngineDispatcher<'_> {
                 );
             }
 
-            let log_line = entry.log_line.take().filter(|_| embryonic_failure(&entry.sess).is_none()).map(|l| (l, entry.log_err));
+            let log_line = entry.log_line.take().filter(|_| embryonic_failure(&entry.sess).is_none()).map(|l| (l, entry.log_sd, entry.log_err));
 
             // Step 3.6: If in TCP mode and server not yet connected (e.g. deferred on accept-proxy or inspect), connect once ready
             if entry.sess.mode == Mode::Tcp
@@ -9046,9 +9120,9 @@ impl EngineDispatcher<'_> {
         if let Some((fe, line)) = connect_line {
             self.send_log_line(fe, line.as_bytes());
         }
-        if let Some((line, err)) = log_line {
+        if let Some((line, sd, err)) = log_line {
             let fe = self.sessions.get(session_idx).map_or(0, |e| e.proxy_idx);
-            self.send_stream_log(fe, err, &line);
+            self.send_stream_log(fe, err, &line, sd);
         }
 
         if let Some(cmd) = pending_admin {
@@ -9084,18 +9158,18 @@ impl EngineDispatcher<'_> {
                     }
                     // `session_kill_embryonic`: `err` with `log-separate-errors`, else `info`.
                     let err = self.proxies[e.proxy_idx].log_opts & ibex_config::LOG_OPT_SEPARATE_ERRORS != 0;
-                    return proxy_header_error_line(e, self.proxies, self.pid).map(|l| (e.proxy_idx, l.into_bytes(), err));
+                    return proxy_header_error_line(e, self.proxies, self.pid).map(|(l, sd)| (e.proxy_idx, l, sd, err));
                 }
                 if e.sess.mode == Mode::Tcp || e.sess.txn.is_some() {
                     account_stream(e, self.proxies);
                 }
-                let queued = e.log_line.take().map(|l| (l, e.log_err));
+                let queued = e.log_line.take().map(|l| (l, e.log_sd, e.log_err));
                 queued
                     .or_else(|| (e.sess.mode == Mode::Tcp || e.sess.txn.is_some()).then(|| stream_log_line(e, self.proxies, self.pid)).flatten())
-                    .map(|(l, err)| (e.proxy_idx, l, err))
+                    .map(|(l, sd, err)| (e.proxy_idx, l, sd, err))
             });
-            if let Some((fe, line, err)) = line {
-                self.send_stream_log(fe, err, &line);
+            if let Some((fe, line, sd, err)) = line {
+                self.send_stream_log(fe, err, &line, sd);
             }
             if let Some(mut entry) = self.sessions.free(session_idx) {
                 if entry.sess.is_h2_child() {
@@ -11433,7 +11507,7 @@ impl EngineDispatcher<'_> {
             });
 
             if let Some(msg) = log {
-                self.send_log(proxy_idx, LogLevel::Notice, msg.as_bytes());
+                self.send_log(proxy_idx, LogLevel::Notice, b"", msg.as_bytes());
             }
 
             self.timer_updates.push(pending);
@@ -11449,17 +11523,21 @@ impl EngineDispatcher<'_> {
     /// nothing unless a `log` directive says where to.
     /// A transaction's or connection's log line, at `info` as `HAProxy` sends them.
     fn send_log_line(&self, proxy_idx: usize, line: &[u8]) {
-        self.send_log(proxy_idx, LogLevel::Info, line);
+        self.send_log(proxy_idx, LogLevel::Info, b"", line);
     }
 
     /// A stream's line: `info`, or `err` when it failed and the frontend has `option
     /// log-separate-errors` (`strm_log`).
-    fn send_stream_log(&self, proxy_idx: usize, err: bool, line: &[u8]) {
+    /// The first `sd` bytes of `line` are its STRUCTURED-DATA (`log-format-sd`).
+    fn send_stream_log(&self, proxy_idx: usize, err: bool, line: &[u8], sd: u32) {
         let separate = self.proxies.get(proxy_idx).is_some_and(|p| p.log_opts & ibex_config::LOG_OPT_SEPARATE_ERRORS != 0);
-        self.send_log(proxy_idx, if err && separate { LogLevel::Err } else { LogLevel::Info }, line);
+        let (sd, line) = line.split_at(usize::try_from(sd).unwrap_or(0).min(line.len()));
+        self.send_log(proxy_idx, if err && separate { LogLevel::Err } else { LogLevel::Info }, sd, line);
     }
 
-    fn send_log(&self, proxy_idx: usize, level: LogLevel, msg: &[u8]) {
+    /// `sd` is the line's STRUCTURED-DATA, which only an rfc5424 target writes (`-` when
+    /// empty, as for every line `HAProxy` sends through `send_log`).
+    fn send_log(&self, proxy_idx: usize, level: LogLevel, sd: &[u8], msg: &[u8]) {
         let Some(proxy) = self.proxies.get(proxy_idx) else {
             return;
         };
@@ -11481,7 +11559,7 @@ impl EngineDispatcher<'_> {
             // collector that is down must not slow or fail the data path.
             // No hostname in the header: `HAProxy` sends one only with
             // `log-send-hostname`, which Ibex does not have.
-            let _ = target.send(level, tag, "", msg);
+            let _ = target.send_sd(level, tag, "", sd, msg);
         }
     }
 

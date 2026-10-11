@@ -176,7 +176,10 @@ pub(crate) fn parse_defaults_directive(
             defaults.log_format = Some(LogFormatSpec::Custom(parse_format_arg(tokens, kw)?));
             Ok(())
         }
-        "log-format-sd" => Err(ConfigError::new(kw.line, kw.col, "'log-format-sd' is not implemented".to_string())),
+        "log-format-sd" => {
+            defaults.log_format_sd = Some(parse_format_arg(tokens, kw)?);
+            Ok(())
+        }
         "error-log-format" => {
             defaults.error_log_format = Some(parse_format_arg(tokens, kw)?);
             Ok(())

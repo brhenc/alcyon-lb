@@ -65,6 +65,12 @@ impl Ring {
         }
     }
 
+    /// The header the events are written under (`format`).
+    #[must_use]
+    pub const fn format(&self) -> RingFormat {
+        self.format
+    }
+
     /// Writes one event: the header the ring's format asks for, then `text`.
     ///
     /// `logger_maxlen` is the `len` of the `log` line, of which one byte is kept back for the

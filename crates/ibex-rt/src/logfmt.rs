@@ -639,6 +639,14 @@ impl LogFormat {
         out.0
     }
 
+    /// Renders the line after what `buf` holds: a `log-format-sd` and its line share one
+    /// buffer.
+    pub fn render_append(&self, buf: &mut Vec<u8>, d: &LogData, registry: &Registry, ctx: &SampleContext) {
+        let mut out = Out(std::mem::take(buf));
+        self.render_into(&mut out, d, registry, ctx, true);
+        *buf = out.0;
+    }
+
     /// Renders the format outside a log line, where an expression that yields nothing, or
     /// an empty string, writes nothing rather than `-`: what `HAProxy` sends for an
     /// `http-check send hdr x %[str()]` (no header at all, 3.5-dev8-885761-29, 2026-10-03).

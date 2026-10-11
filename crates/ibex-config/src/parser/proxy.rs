@@ -95,6 +95,7 @@ pub(crate) fn parse_listen_header(
         log_format: defaults.and_then(|d| d.log_format.clone()),
         unique_id_format: defaults.and_then(|d| d.unique_id_format.clone()),
         error_log_format: defaults.and_then(|d| d.error_log_format.clone()),
+        log_format_sd: defaults.and_then(|d| d.log_format_sd.clone()),
         unique_id_header: defaults.and_then(|d| d.unique_id_header.clone()),
         req_header_captures: Vec::new(),
         res_header_captures: Vec::new(),
@@ -199,6 +200,7 @@ pub(crate) fn parse_frontend_header(
         log_format: defaults.and_then(|d| d.log_format.clone()),
         unique_id_format: defaults.and_then(|d| d.unique_id_format.clone()),
         error_log_format: defaults.and_then(|d| d.error_log_format.clone()),
+        log_format_sd: defaults.and_then(|d| d.log_format_sd.clone()),
         unique_id_header: defaults.and_then(|d| d.unique_id_header.clone()),
         req_header_captures: Vec::new(),
         res_header_captures: Vec::new(),
@@ -466,7 +468,10 @@ pub(crate) fn parse_listen_directive(
             proxy.log_format = Some(LogFormatSpec::Custom(parse_format_arg(tokens, kw)?));
             Ok(())
         }
-        "log-format-sd" => Err(ConfigError::new(kw.line, kw.col, "'log-format-sd' is not implemented".to_string())),
+        "log-format-sd" => {
+            proxy.log_format_sd = Some(parse_format_arg(tokens, kw)?);
+            Ok(())
+        }
         "error-log-format" => {
             proxy.error_log_format = Some(parse_format_arg(tokens, kw)?);
             Ok(())
@@ -593,7 +598,10 @@ pub(crate) fn parse_frontend_directive(
             fe.log_format = Some(LogFormatSpec::Custom(parse_format_arg(tokens, kw)?));
             Ok(())
         }
-        "log-format-sd" => Err(ConfigError::new(kw.line, kw.col, "'log-format-sd' is not implemented".to_string())),
+        "log-format-sd" => {
+            fe.log_format_sd = Some(parse_format_arg(tokens, kw)?);
+            Ok(())
+        }
         "error-log-format" => {
             fe.error_log_format = Some(parse_format_arg(tokens, kw)?);
             Ok(())
@@ -735,8 +743,7 @@ pub(crate) fn parse_backend_directive(
         }
         // Ignored in backends, as `HAProxy` ignores it ("'log-format' directive is ignored
         // in backends"): a backend's transactions log through their frontend.
-        "log-format" | "error-log-format" => parse_format_arg(tokens, kw).map(|_| ()),
-        "log-format-sd" => Err(ConfigError::new(kw.line, kw.col, "'log-format-sd' is not implemented".to_string())),
+        "log-format" | "error-log-format" | "log-format-sd" => parse_format_arg(tokens, kw).map(|_| ()),
         "unique-id-format" => {
             be.unique_id_format = Some(parse_format_arg(tokens, kw)?);
             Ok(())
