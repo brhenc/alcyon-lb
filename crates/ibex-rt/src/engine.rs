@@ -7874,30 +7874,9 @@ impl EngineDispatcher<'_> {
         poller: &mut Poller,
         idle_pool: &mut IdlePool,
     ) -> bool {
-        if entry.sess.cli_state != ScState::ShutR {
+        if entry.sess.cli_state != ScState::ShutR || !crate::h2_bridge::abort_on_client_left(&mut entry.sess) {
             return false;
         }
-        // A request still coming is cut short by the caller; a reply of the proxy's own, a
-        // response all in, or one already ending have nothing to abort.
-        let Some(txn) = entry
-            .sess
-            .txn
-            .as_ref()
-            .filter(|t| t.req.is_done() && !(t.local || t.aborted || t.req == MsgState::Tunnel || t.rsp.is_done()))
-        else {
-            return false;
-        };
-        let waiting = txn.rsp == MsgState::Waiting;
-        if let Some(srv) = entry.sess.srv.as_ref() {
-            raw::abort_with_rst(srv.as_fd());
-        }
-        if waiting {
-            entry.sess.log.status = Some(400);
-            entry.sess.log.term = Some(*b"CH");
-        } else {
-            entry.sess.log.term = Some(*b"CD");
-        }
-        entry.sess.rep.clear();
         close_http_session(entry, proxies, fdtab, poller, idle_pool, false);
         true
     }
@@ -7925,38 +7904,10 @@ impl EngineDispatcher<'_> {
         pid: u32,
     ) -> bool {
         let sess = &mut entry.sess;
-        let (Some(h2), Some(id), Some(txn)) = (sess.h2_ctx.as_ref(), sess.h2_stream.as_ref().map(|a| a.id), sess.txn.as_mut()) else {
-            return false;
-        };
-        if !h2.streams.get(&id).is_some_and(|s| matches!(s.state, ibex_proto::h2::H2StreamState::Reset(_))) {
+        let reset = sess.h2_ctx.as_deref().zip(sess.h2_stream.as_deref()).is_some_and(|(h2, a)| crate::h2_bridge::stream_is_reset(h2, a.id));
+        if !reset || !crate::h2_bridge::abort_reset_stream(sess) {
             return false;
         }
-        let response_done = txn.rsp.is_done();
-        let waiting = txn.rsp == MsgState::Waiting;
-        txn.srv_reusable = false;
-        txn.rsp = MsgState::Done;
-        if !response_done {
-            // `SC_FL_NOLINGER`: closed by `end_txn` below, the server connection is reset.
-            if let Some(srv) = sess.srv.as_ref() {
-                raw::abort_with_rst(srv.as_fd());
-            }
-            if sess.queue.take().is_some() {
-                sess.log.queue.get_or_insert_with(Instant::now);
-                sess.log.term = Some(*b"CQ");
-            } else if txn.local {
-                // A reply of the proxy's own keeps the status and ending it was given.
-            } else if waiting {
-                sess.log.status = Some(400);
-                sess.log.term = Some(*b"CH");
-            } else {
-                sess.log.term = Some(*b"CD");
-            }
-        }
-        // Nothing more of the response goes to the client, nor of the request to the
-        // server: what is left of either would be taken for the next stream's.
-        sess.rep.clear();
-        sess.req.clear();
-        sess.srv_state = ScState::Closed;
         Self::end_txn(entry, proxies, fdtab, poller, idle_pool, wake_queue, now, pid);
         true
     }
@@ -8055,76 +8006,14 @@ impl EngineDispatcher<'_> {
     /// its own transaction (design 010 step 5).
     fn h2_forward_response(entry: &mut SessionEntry) {
         let sess = &mut entry.sess;
-        let (Some(h2), Some(txn)) = (sess.h2_ctx.as_mut(), sess.txn.as_mut()) else {
+        let (Some(h2), Some(txn)) = (sess.h2_ctx.as_deref_mut(), sess.txn.as_mut()) else {
             return;
         };
-        if txn.rsp == MsgState::Waiting || txn.rsp.is_done() {
-            return;
-        }
-        let data = sess.rep.readable();
-        let win = txn.rsp.window(data);
-        if txn.rsp_interim {
-            // An HTTP/1 interim response has no place in this conversion; it is dropped.
-            txn.response_sent(data, win);
-            sess.rep.consume(win);
-            return;
-        }
         let stream_id = sess.h2_stream.as_ref().map_or(1, |a| a.id);
-        if let MsgState::Head { body, .. } = txn.rsp {
-            // The head goes out as HEADERS once all of it is here; the body follows as
-            // DATA, as much as the client's windows take at a time.
-            let Some((h, e)) = crate::proxy::find_eoh(data) else { return };
-            let end_stream = matches!(body, crate::txn::Framing::None | crate::txn::Framing::Length(0));
-            if h2.send_h1_head(stream_id, &data[..h], end_stream) {
-                txn.rsp.consume(data, h + e);
-                sess.rep.consume(h + e);
-                // The body that came with the head goes out with it, in the same write: on
-                // its own, a poller round later, it is a second write, and a second small
-                // segment Nagle holds until the client's delayed ACK, ~40 ms a request (T186).
-                if !end_stream {
-                    Self::h2_forward_response(entry);
-                }
-            }
-            return;
-        }
-        if !matches!(txn.rsp, MsgState::Body(_)) {
-            // A body that broke its framing, or a tunnel (101, CONNECT), which this
-            // conversion does not carry: the stream is reset and the server is let go.
-            h2.send_rst_stream(stream_id, ibex_proto::h2::H2Error::InternalError);
-            txn.srv_reusable = false;
-            txn.rsp = MsgState::Done;
-            return;
-        }
-        let mut out = Vec::new();
-        let mut state = txn.rsp;
-        let used = state.take_body(data, h2.data_budget(stream_id), &mut out);
-        let end = state.is_done();
-        if let Some(t) = txn.rsp_htx.as_mut() {
-            // The payload, and the chunked body's end (see `htx_head_size`).
-            *t += out.len() as u64 + u64::from(end && matches!(txn.rsp, MsgState::Body(crate::txn::Body::Chunked(_))));
-        }
-        if !out.is_empty() || end {
-            h2.send_data(stream_id, &out, end);
-        }
-        if used > 0 || end {
-            txn.rsp = state;
-            sess.rep.consume(used);
-        }
         let srv_gone = matches!(sess.srv_state, ScState::ShutR | ScState::Closed | ScState::Error);
-        if txn.rsp.is_done() || !srv_gone || !sess.rep.is_empty() {
-            return;
-        }
-        // The server is gone and everything it sent has been delivered.
-        txn.srv_reusable = false;
-        if matches!(txn.rsp, MsgState::Body(crate::txn::Body::UntilClose)) {
-            // The close is the end of this body.
-            h2.send_data(stream_id, &[], true);
-        } else {
-            // Cut short: the stream cannot be completed, so it is reset.
-            h2.send_rst_stream(stream_id, ibex_proto::h2::H2Error::Cancel);
+        if crate::h2_bridge::forward_response(h2, stream_id, txn, &mut sess.rep, srv_gone) {
             sess.log.term = Some(*b"SD");
         }
-        txn.rsp = MsgState::Done;
     }
 
     /// The transaction is over: both messages complete and the response delivered.
@@ -11875,10 +11764,7 @@ fn rebuild_req_buffer(sess: &mut TcpSession) {
             // the head, after the rules, which never saw it.
             if !wire.is_empty() {
                 if let Some((h, _)) = crate::proxy::find_eoh(&wire) {
-                    let mut v = wire[..h].to_vec();
-                    v.extend_from_slice(b"\r\ntransfer-encoding: chunked");
-                    v.extend_from_slice(&wire[h..]);
-                    wire = v;
+                    wire = crate::h2_bridge::chunked_head(&wire, h);
                 }
             }
             sess.req.replace_prefix(hdr_len + eoh_len, &wire);

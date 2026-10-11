@@ -40,6 +40,7 @@ pub mod track;
 pub mod txn;
 pub mod txnlog;
 pub mod quic_listener;
+pub mod h2_bridge;
 pub mod h3_relay;
 pub mod raw;
 pub mod rule_exprs;
