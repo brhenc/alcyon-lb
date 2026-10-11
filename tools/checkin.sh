@@ -45,7 +45,7 @@ declare -A TITLE=(
   [covercheck]="did a test execute what changed"
   [smoke]="the regressions no unit test can see"
   [haproxy]="does HAProxy still behave as the tests record"
-  [lint]="does the rest still build and lint"
+  [lint]="does the rest still build and lint (clippy, and the libFuzzer targets compile: T279)"
   [measure]="continuous measurement"
   [surface]="new surface since the nudge, and whether it came with tests"
   [stray]="stray files (the supervisor's own are expected)"
@@ -293,6 +293,17 @@ stage_lint() {
   local CLIPPY_RC=${PIPESTATUS[0]}
   echo "clippy exit: $CLIPPY_RC"
   check "$CLIPPY_RC" "clippy"
+  # T279: fuzz/libfuzzer is its own crate outside the workspace, so clippy above never
+  # compiles its targets; T273A removed a function a target called and nothing noticed for
+  # hours. A plain stable `cargo check` of the bins (no sanitizer, no nightly) catches it.
+  # Warnings are not judged here, only errors. (fuzz/, the older differential crate, is not
+  # checked: it has not compiled since the HtxSlice change; see tasks/T279.)
+  cargo check -q --manifest-path fuzz/libfuzzer/Cargo.toml --bins > /tmp/ibex-fuzz-check.$$ 2>&1
+  local FUZZ_RC=$?
+  grep -E "^error" /tmp/ibex-fuzz-check.$$ | head -20
+  rm -f /tmp/ibex-fuzz-check.$$
+  echo "fuzz/libfuzzer check exit: $FUZZ_RC"
+  check "$FUZZ_RC" "fuzz targets compile"
 }
 
 stage_measure() {
