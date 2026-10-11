@@ -30,10 +30,10 @@ fn datagrams(cfg: &str, dead: usize, expect: usize) -> Vec<String> {
     let config = ibex_config::parse_str(&text).expect("parse");
     let mut engine = Engine::new(&config, 256).expect("Engine::new");
     for check in &mut engine.checks {
-        check.config.inter = Duration::from_millis(20);
-        check.config.timeout = Duration::from_millis(50);
-        check.config.fall = 1;
-        check.config.rise = 1;
+        std::sync::Arc::make_mut(&mut check.config).inter = Duration::from_millis(20);
+        std::sync::Arc::make_mut(&mut check.config).timeout = Duration::from_millis(50);
+        std::sync::Arc::make_mut(&mut check.config).fall = 1;
+        std::sync::Arc::make_mut(&mut check.config).rise = 1;
     }
     let mut got = Vec::new();
     let mut buf = [0u8; 2048];

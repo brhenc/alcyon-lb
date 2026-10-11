@@ -288,6 +288,11 @@ impl TaskArena {
         self.tasks.capacity()
     }
 
+    /// Makes room for `additional` more tasks at once (see [`crate::Scheduler::reserve`]).
+    pub fn reserve(&mut self, additional: usize) {
+        self.tasks.reserve(additional);
+    }
+
     /// Allocates a task. Returns `None` if the arena is exhausted.
     pub fn alloc(&mut self, kind: WorkKind) -> Option<TaskRef> {
         self.live += 1;
