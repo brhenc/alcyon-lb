@@ -446,6 +446,24 @@ impl TcpSession {
         self.cli.as_fd()
     }
 
+    /// Whether the client connection is TLS and its handshake is not done yet.
+    #[must_use]
+    pub fn cli_tls_handshaking(&self) -> bool {
+        matches!(&self.cli_xprt, ClientXprt::Tls(t) if !t.handshake_done())
+    }
+
+    /// Ends what is sent to the client: `close_notify` first on a TLS connection whose
+    /// handshake is done, then the FIN. `HAProxy` sends it on every clean shutdown
+    /// (`ssl_sock_shutw`); without it an OpenSSL client reads the FIN as "unexpected eof"
+    /// and drops its session as not resumable, so every reconnect paid a full handshake
+    /// (T283, MY-2).
+    pub fn shutw_cli(&mut self) {
+        if matches!(&self.cli_xprt, ClientXprt::Tls(t) if t.handshake_done()) {
+            self.cli_xprt.send_close_notify(self.cli.as_fd());
+        }
+        raw::shutdown_write(self.cli.as_fd());
+    }
+
     #[must_use]
     pub fn new(cli: OwnedFd, timeouts: Timeouts, retries: u16, now: Tick) -> Self {
         Self::new_with_mode(
@@ -1798,7 +1816,7 @@ impl TcpSession {
                     ScState::ShutR | ScState::Closed | ScState::Error
                 );
                 if srv_done_sending && self.rep.is_empty() && self.pending_resp.is_none() && !self.res_inspect_pending {
-                    raw::shutdown_write(self.cli.as_fd());
+                    self.shutw_cli();
                     self.cli_state = ScState::ShutW;
                     self.ending
                         .get_or_insert(if self.srv_state == ScState::Error {
@@ -1825,7 +1843,7 @@ impl TcpSession {
                     ScState::ShutR | ScState::Closed | ScState::Error
                 );
                 if srv_done_sending && self.rep.is_empty() && self.pending_resp.is_none() && !self.res_inspect_pending {
-                    raw::shutdown_write(self.cli.as_fd());
+                    self.shutw_cli();
                     self.cli_state = ScState::Closed;
                     self.srv_state = ScState::Closed;
                     self.ending

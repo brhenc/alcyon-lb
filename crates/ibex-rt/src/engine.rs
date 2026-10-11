@@ -4448,6 +4448,16 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     // A hang-up or error is news for a reader too: the read that finds it
                     // must not be skipped by a socket marked drained (`cli_cant_recv`).
                     self.fdtab.set_ready(ev.fd, ev.readable || ev.closed, ev.writable);
+                    // The handshake is over: the connection leaves `Heavy` (`ssl_sock_io_cb`
+                    // clears `TASK_HEAVY` once `CO_FL_SSL_WAIT_HS` is gone).
+                    if self.scheduler.is_heavy(task) {
+                        let kind = self.scheduler.tasks.get(task).kind;
+                        let done = kind.kind() != Some(Kind::Stream)
+                            || self.sessions.get(kind.index()).is_none_or(|e| !e.sess.cli_tls_handshaking());
+                        if done {
+                            self.scheduler.set_heavy(task, false);
+                        }
+                    }
                     self.scheduler
                         .tasklet_wakeup(task, Class::Urgent, state::WOKEN_IO);
                 }
@@ -5046,7 +5056,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
     fn linger_close_sessions(&mut self) {
         use std::os::fd::AsFd;
         for (_, e) in self.sessions.iter_mut() {
-            raw::shutdown_write(e.sess.cli_fd());
+            e.sess.shutw_cli();
             if let Some(srv) = e.sess.srv.as_ref() {
                 raw::shutdown_write(srv.as_fd());
             }
@@ -6266,6 +6276,12 @@ fn register_new_session(
     engine
         .scheduler
         .queue_timer(task_ref, entry.sess.next_expiry());
+    // A TLS client's handshake is the heavy part of its life: until it is done, its task
+    // runs in `Heavy`, one per pass, and the established connections of this thread are
+    // served between two handshakes (`HAProxy`'s `TASK_HEAVY`, T283). Cleared in `step`.
+    if entry.sess.cli_tls_handshaking() {
+        engine.scheduler.set_heavy(task_ref, true);
+    }
     engine
         .scheduler
         .tasklet_wakeup(task_ref, Class::Urgent, state::WOKEN_IO);
@@ -6902,7 +6918,7 @@ fn close_http_session(
     }
     release_server(entry, proxies, fdtab, poller, idle_pool, reusable);
     if matches!(entry.sess.cli_state, ScState::Ready | ScState::Established | ScState::ShutR) {
-        raw::shutdown_write(entry.sess.cli_fd());
+        entry.sess.shutw_cli();
     }
     entry.sess.txn = None;
     entry.sess.cli_state = ScState::Closed;

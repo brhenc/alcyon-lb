@@ -8,6 +8,10 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use std::sync::Arc;
 
+/// Sessions a server keeps for resumption by session ID: `HAProxy`'s default
+/// `tune.ssl.cachesize`.
+const SESSION_CACHE_SIZE: usize = 20000;
+
 /// Installs the default `ring` crypto provider for the process.
 pub fn install_default_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -98,7 +102,17 @@ impl TlsConfig {
             .with_cert_resolver(resolver);
 
         config.alpn_protocols.clone_from(&self.alpn_protocols);
-        if !self.session_tickets_enabled {
+        // Session resumption as `HAProxy` (OpenSSL) does it: stateless tickets, and a
+        // session-ID cache of `tune.ssl.cachesize` (20000) entries for the clients that
+        // resume by ID. rustls's defaults are a 256-entry cache that TLS 1.3 tickets are
+        // entries of, two per connection: a few hundred clients evicted every earlier
+        // session, and a flood of reconnecting clients made every handshake a full one,
+        // an RSA signature each, where `HAProxy` resumed them (T283, MY-2). The
+        // `ServerConfig` is shared by every worker (`from_bind_config`), so are the keys.
+        config.session_storage = rustls::server::ServerSessionMemoryCache::new(SESSION_CACHE_SIZE);
+        if self.session_tickets_enabled {
+            config.ticketer = rustls::crypto::ring::Ticketer::new().map_err(|e| format!("session ticket keys: {e}"))?;
+        } else {
             config.send_tls13_tickets = 0;
         }
 
