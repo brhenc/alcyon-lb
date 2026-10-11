@@ -31,6 +31,14 @@ fn the_value_is_read_as_atoi_does() {
     assert_eq!(global("tune.h2.max-concurrent-streams 99999999999"), Ok((Some(1_215_752_191), None)));
 }
 
+/// A leading `+` is part of `atoi`; `haproxy -c` accepts `+5` and `+-5` (the latter is 0).
+#[test]
+fn a_leading_plus_is_read_as_atoi_does() {
+    assert_eq!(global("tune.h2.max-concurrent-streams +5"), Ok((Some(5), None)));
+    assert_eq!(global("tune.h2.fe.max-concurrent-streams +5"), Ok((None, Some(5))));
+    assert_eq!(global("tune.h2.max-concurrent-streams +-5"), Ok((Some(0), None)));
+}
+
 #[test]
 fn a_negative_value_is_refused() {
     for v in ["-1", "2147483648", "4294967295"] {
