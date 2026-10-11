@@ -43,3 +43,4 @@ start,method,commit,duration_min,new_findings,note
 2026-10-11 11:00,fuzz-differential,f974340,,FZ-1;FZ-2;FZ-3;FZ-4;FZ-5;FZ-6;FZ-7,"e2e.py, 2545-case --soak; ts approx"
 2026-10-11 20:21,redteam,26881cde,67,MY-5;MY-6;MY-7,"night run on reproducer2/devtest7: 21-row scorecard (results 202146, 204616), MY-3 load rows (211007, 211251), 180 s madeyoureset (204746), probes h2fds/t300/reject/tcp, streamsprobe 200+400 conns; MY-1 and MY-3 closed; game 0 % throughout"
 2026-10-11 21:29,vv-recheck,26881cde,1,0,"run by red team for V&V: VV-3 run.sh, VV-6 logfmt.sh, tls2.sh vs HAProxy 3.5-dev8 on localhost, all identical / no crash; output in review/vv/INDEX.md"
+2026-10-11 21:38,redteam,26881cde,5,0,"tls_hello_only re-run x2 on reproducer2 (results 213805, 214043): Ibex new-client probe 6/6 and 6/6 vs HAProxy 5/6; the 1/5 of the 20:46 half was noise; game 0 %"
