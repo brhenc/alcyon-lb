@@ -83,3 +83,29 @@ fn backtracking_patterns_are_bytes_too() {
     assert!(m(b"^(?=.)(.)(.)$", b"\xc3\xa9"));
     assert_eq!(UserRegex::new("(?=.)(.)").unwrap().replace_all("\u{e9}", "-"), "--");
 }
+
+#[test]
+fn the_template_of_a_non_ascii_match_expands_as_the_regex_crate_does() {
+    // The template is Ibex's own (`$1`, `${n}`, `$$`), not PCRE's: held to the `regex` crate.
+    let re = UserRegex::new("^(?P<a>.)(.)$").unwrap();
+    let c = re.captures("\u{e9}").unwrap();
+    assert_eq!(c.len(), 3);
+    let (hi, lo) = (bytes_to_text(b"\xc3"), bytes_to_text(b"\xa9"));
+    let mut out = String::new();
+    c.expand("$$ ${a}${2} $a$2 $ ${} $9|", &mut out);
+    assert_eq!(out, format!("$ {hi}{lo} {hi}{lo} $ ${{}} |"));
+}
+
+#[test]
+fn a_backtracking_pattern_captures_bytes() {
+    let re = UserRegex::new("^(?=.)(.)(.)$").unwrap();
+    assert!(re.is_backtracking());
+    let c = re.captures("\u{e9}").unwrap();
+    assert_eq!(c.get(2), Some(bytes_to_text(b"\xa9").as_str()));
+    assert!(re.captures("\u{e9}\u{e9}").is_none());
+}
+
+#[test]
+fn no_match_leaves_a_non_ascii_text_as_it_was() {
+    assert_eq!(UserRegex::new("x").unwrap().replace("\u{e9}", "-"), "\u{e9}");
+}
