@@ -158,6 +158,14 @@ fn cases() -> Vec<Case> {
             vec![Has("sec-websocket-accept: X7sdFi1aZDLMcFz+yURsFmFjwvU=")],
         ),
         c(
+            "h2c taken out of a 101's Upgrade list",
+            vec![CU, UW, key()],
+            r101(&[CU, "Upgrade: h2c, websocket", "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo="]),
+            101,
+            fwd_ws(),
+            vec![Has("upgrade: websocket"), Has("sec-websocket-accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")],
+        ),
+        c(
             "101 with Upgrade: h2c only",
             vec![CU, UW, key()],
             r101(&[CU, "Upgrade: h2c", "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo="]),
@@ -191,6 +199,16 @@ fn cases() -> Vec<Case> {
     v.push(opt(c("101 to a request that asked for nothing, unsafe response", vec![], ws101(), 502, Some(vec![Lacks("upgrade")]), vec![]), "", U_RSP));
     v.push(opt(c("written key, the server's accept does not match it", vec![CU, UW], ws101(), 502, Some(vec![KeyWritten]), vec![]), U_REQ, ""));
     v.push(opt(
+        c("written key, the server's accept matches it", vec![CU, UW], r101(&[UW, CU, "Sec-WebSocket-Accept: {answer}"]), 101, Some(vec![KeyWritten]), vec![Has("upgrade: websocket")]),
+        U_REQ,
+        "",
+    ));
+    v.push(opt(
+        c("written key, accept that does not match, both options", vec![CU, UW], ws101(), 101, Some(vec![KeyWritten]), vec![Has("sec-websocket-accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")]),
+        U_REQ,
+        U_RSP,
+    ));
+    v.push(opt(
         c("written key, 101 without accept, both options", vec![CU, UW], r101(&[UW, CU]), 101, Some(vec![KeyWritten]), vec![Has("sec-websocket-accept: X7sdFi1aZDLMcFz+yURsFmFjwvU=")]),
         U_REQ,
         U_RSP,
@@ -201,6 +219,25 @@ fn cases() -> Vec<Case> {
         U_RSP,
     ));
     v
+}
+
+/// In a backend response: replaced with the accept for the key the backend received.
+const ANSWER: &str = "{answer}";
+
+/// The `Sec-WebSocket-Accept` for `key` (RFC 6455 section 1.3), computed here, not by the proxy.
+fn accept_of(key: &[u8]) -> String {
+    const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut input = key.to_vec();
+    input.extend_from_slice(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+    let d = ibex_sample::hash::sha1_digest(&input);
+    let mut out = String::new();
+    for c in d.chunks(3) {
+        let n = (u32::from(c[0]) << 16) | (u32::from(*c.get(1).unwrap_or(&0)) << 8) | u32::from(*c.get(2).unwrap_or(&0));
+        for i in 0..4 {
+            out.push(if i <= c.len() { char::from(B64[((n >> (18 - 6 * i)) & 63) as usize]) } else { '=' });
+        }
+    }
+    out
 }
 
 /// The head each connection's request came with, by the path of its request line.
@@ -229,7 +266,13 @@ fn backend(rsps: HashMap<String, String>) -> (SocketAddr, Seen) {
                 }
                 let line = String::from_utf8_lossy(&got).lines().next().unwrap_or("").to_string();
                 let path = line.split(' ').nth(1).unwrap_or("").to_string();
-                let rsp = rsps.get(&path).cloned().unwrap_or_else(ok200);
+                let mut rsp = rsps.get(&path).cloned().unwrap_or_else(ok200);
+                if rsp.contains(ANSWER) {
+                    // The accept the key this backend received calls for.
+                    let text = String::from_utf8_lossy(&got).into_owned();
+                    let k = text.split("\r\n").find_map(|l| l.to_ascii_lowercase().starts_with("sec-websocket-key:").then(|| l[18..].trim().to_string()));
+                    rsp = rsp.replace(ANSWER, &accept_of(k.unwrap_or_default().as_bytes()));
+                }
                 seen.lock().unwrap().insert(path, got);
                 let _ = s.write_all(rsp.as_bytes());
                 thread::sleep(Duration::from_millis(200));
