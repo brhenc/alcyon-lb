@@ -7991,9 +7991,21 @@ impl EngineDispatcher<'_> {
         // cap): the end it waits for has no room to arrive.
         // A response held whole behind its trailer section (`MsgState::holds_trailer`) that
         // is refused is a 502, as when it arrives all at once: nothing of it has gone.
-        if !txn.local && !txn.aborted && txn.rsp.holds_trailer(entry.sess.rep.readable(), entry.sess.bufsize) {
+        // Held means none of it has gone: the head is all still here.
+        let unsent = match txn.rsp {
+            MsgState::Head { left, body: crate::txn::Framing::Chunked } => {
+                crate::proxy::find_eoh(entry.sess.rep.readable()).is_some_and(|(h, e)| h + e == left)
+            }
+            _ => false,
+        };
+        if unsent && !txn.local && !txn.aborted && entry.sess.rep.len() >= entry.sess.bufsize {
             let check = txn.rsp.check_body(entry.sess.rep.readable());
-            if check.stuck(entry.sess.rep.len(), entry.sess.bufsize) || srv_eof || srv_err {
+            let refused = match check {
+                crate::txn::BodyCheck::Broken | crate::txn::BodyCheck::TooLarge { .. } => true,
+                crate::txn::BodyCheck::Held { trailer, .. } => trailer && (srv_eof || srv_err),
+                crate::txn::BodyCheck::Fine => false,
+            };
+            if refused {
                 txn.srv_reusable = false;
                 entry.sess.rep.clear();
                 entry.sess.log.term = Some(*b"PH");

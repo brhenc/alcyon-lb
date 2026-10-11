@@ -56,6 +56,12 @@ fn data_then_trailer() -> Vec<u8> {
     cat(&[b"7d0\r\n", &[b'd'; 2000], b"\r\n0\r\nX-T: ", &[b'a'; 15000], b"\r\n\r\n"])
 }
 
+/// A body of 2000 bytes, then a trailer field of 20000 bytes of value: past its cap, in a
+/// message held whole because the first buffer ended in its trailer section.
+fn data_then_big_trailer() -> Vec<u8> {
+    cat(&[b"7d0\r\n", &[b'd'; 2000], b"\r\n0\r\nX-T: ", &[b'a'; 20000], b"\r\n\r\n"])
+}
+
 /// A body of one chunk `hello` and `n` trailer fields (`HAProxy` takes 100).
 fn many_trailers(n: usize) -> Vec<u8> {
     let mut b = b"5\r\nhello\r\n0\r\n".to_vec();
@@ -245,6 +251,7 @@ fn a_malformed_response_body_is_refused_or_cut_as_haproxy_does() {
         ("trailer_16300", together(&big_trailer(16300)), Rsp::Whole(16322)),
         ("trailers_100", together(&many_trailers(100)), Rsp::Whole(1005)),
         ("data_2k_trailer_15k", together(&data_then_trailer()), Rsp::Whole(17019)),
+        ("data_2k_trailer_20k", together(&data_then_big_trailer()), Rsp::Refused),
         ("trailers_101", together(&many_trailers(101)), Rsp::Refused),
         // The head is gone when the error arrives: the connection closes behind what was
         // relayed. HAProxy relays none of a small chunk whose CRLF is wrong; Ibex may relay
@@ -313,6 +320,10 @@ fn a_request_trailer_section_too_large_or_refused_never_half_reaches_the_server(
         ("valid_trailer", vec![Bytes(big_trailer(1000))], Req::Whole(1022)),
         ("trailer_16300", vec![Bytes(big_trailer(16300))], Req::Whole(16322)),
         ("data_2k_trailer_15k", vec![Bytes(data_then_trailer())], Req::Whole(17019)),
+        ("data_2k_trailer_20k", vec![Bytes(data_then_big_trailer())], Req::Dropped(None, "PR--")),
+        // No chunk before it and a short head (no `Host`): the section is past its cap in the
+        // first buffer already, before anything is held.
+        ("short_head_trailer_only_20k", vec![Bytes(big_trailer(20000)[10..].to_vec())], Req::Dropped(None, "PR--")),
         ("trailer_20k", vec![Bytes(big_trailer(20000))], Req::Dropped(None, "PR--")),
         ("trailer_16400", vec![Bytes(big_trailer(16400))], Req::Dropped(None, "PR--")),
         ("trailers_101", vec![Bytes(many_trailers(101))], Req::Refused),
@@ -333,6 +344,7 @@ fn a_request_trailer_section_too_large_or_refused_never_half_reaches_the_server(
         seen.lock().unwrap().clear();
         let mut sent = parts.clone();
         match &mut sent[0] {
+            Bytes(b) if name.starts_with("short_head") => *b = cat(&[&head(n), b"Transfer-Encoding: chunked\r\n\r\n", b]),
             Bytes(b) => *b = cat(&[&head(n), REQ_HEAD, b]),
             Pause => sent.insert(0, Bytes(cat(&[&head(n), REQ_HEAD]))),
         }

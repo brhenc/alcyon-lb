@@ -479,21 +479,14 @@ impl MsgState {
         let MsgState::Body(Body::Chunked(mut c)) = s else {
             return if broken { BodyCheck::Broken } else { BodyCheck::Fine };
         };
-        let mut i = used;
-        while i < data.len() {
-            if let Chunk::Data(n) = c {
-                let take = usize::try_from(n).unwrap_or(usize::MAX).min(data.len() - i);
-                i += take;
-                c = if take as u64 == n { Chunk::DataCr } else { Chunk::Data(n - take as u64) };
-                continue;
-            }
-            match c.scan(&data[i..=i], &mut 0, false) {
-                (1, Ok(Some(next))) => c = next,
-                (_, Ok(None)) => return BodyCheck::Fine,
-                _ if c.over_cap() => return BodyCheck::TooLarge { trailer: c.in_trailer() },
-                _ => return BodyCheck::Broken,
-            }
-            i += 1;
+        // What is past the last line boundary is one partial line (a chunk-size line, or the
+        // last-chunk line and its trailer section): no chunk data, no end of the message.
+        for i in used..data.len() {
+            let Ok(next) = c.scan(&data[i..=i], &mut 0, false).1 else {
+                return if c.over_cap() { BodyCheck::TooLarge { trailer: c.in_trailer() } } else { BodyCheck::Broken };
+            };
+            let Some(next) = next else { return BodyCheck::Fine };
+            c = next;
         }
         if used == data.len() {
             BodyCheck::Fine
@@ -1307,9 +1300,11 @@ mod tests {
         assert_eq!(read_body(Framing::Chunked, b"zz\r\n", &mut out), BodyProgress::Error);
     }
 
-    /// Chunk trailers are bounded as a whole (`MAX_CHUNK_LINE`): a name, a value, a line end or a
-    /// field boundary past it is an error, wherever it falls. HAProxy 3.5-dev8 refuses a 17000-byte
-    /// trailer name or value (the connection is closed with no response) and forwards a 15000-byte one.
+    /// Chunk trailers are bounded as a whole (`MAX_TRAILER_SECTION`): a name, a value, a line end
+    /// or a field boundary past it is an error, wherever it falls. HAProxy 3.5-dev8 refuses a
+    /// 17000-byte trailer name or value (the connection is closed with no response) and forwards a
+    /// 15000-byte one; `X-T: ` with a 16315-byte value passes and with 16320 does not (T281), so
+    /// with `T: ` the limit falls between 16317 and 16322.
     #[test]
     fn a_chunk_trailer_past_the_line_limit_is_an_error() {
         let trailers = |t: &[u8]| {
@@ -1322,9 +1317,9 @@ mod tests {
         assert_eq!(trailers(&value(15000)), BodyProgress::Complete);
         assert_eq!(trailers(&[vec![b'T'; 17000], b": 1".to_vec()].concat()), BodyProgress::Error);
         assert_eq!(trailers(&value(17000)), BodyProgress::Error);
-        // The limit falls within a few bytes of 16 KiB, at the value, its CR or its LF.
+        // The limit falls at the value, its CR, its LF or the blank line's CR.
         let first_error = (16300..16400).find(|&n| trailers(&value(n)) == BodyProgress::Error).expect("an error");
-        assert!((16370..=16384).contains(&first_error), "{first_error}");
+        assert!((16317..=16322).contains(&first_error), "{first_error}");
         for n in first_error..16400 {
             assert_eq!(trailers(&value(n)), BodyProgress::Error, "value of {n} bytes");
         }
