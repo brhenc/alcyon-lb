@@ -86,6 +86,10 @@ pub struct H2FloodConfig {
     pub max_total_streams: usize,
     /// Threshold of glitch frames before graceful GOAWAY (75%) and hard close (100%) (`tune.h2.fe.glitches-threshold`). Default: 0 (disabled).
     pub glitches_threshold: usize,
+    /// The limit advertised to a client and enforced on its streams
+    /// (`tune.h2.{,fe.}max-concurrent-streams`); `None` is the default, 100. 0 advertises
+    /// nothing and refuses every stream.
+    pub max_concurrent_streams: Option<u32>,
 }
 
 /// HTTP/2 Connection Context.
@@ -510,19 +514,17 @@ impl Mux for MuxH2 {
             consumed += H2_CONN_PREFACE.len();
             ctx.conn_state = H2ConnState::ExpectSettings;
 
-            // Server immediately replies with its own initial SETTINGS frame
+            // Server immediately replies with its own initial SETTINGS frame. A limit of 0
+            // is not advertised (HAProxy sends no MAX_CONCURRENT_STREAMS then), yet every
+            // stream is refused.
+            let mut settings = Vec::with_capacity(2);
+            if ctx.max_concurrent_streams > 0 {
+                settings.push((SettingsParameter::MaxConcurrentStreams, ctx.max_concurrent_streams));
+            }
+            settings.push((SettingsParameter::InitialWindowSize, ctx.local_initial_window as u32));
             let server_settings = Frame::Settings {
                 flags: 0,
-                settings: vec![
-                    (
-                        SettingsParameter::MaxConcurrentStreams,
-                        ctx.max_concurrent_streams,
-                    ),
-                    (
-                        SettingsParameter::InitialWindowSize,
-                        ctx.local_initial_window as u32,
-                    ),
-                ],
+                settings,
             };
             ctx.enqueue_frame(&server_settings);
         }

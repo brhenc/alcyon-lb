@@ -25,6 +25,7 @@ mod connection_limits;
 mod cookie_config;
 mod differential;
 mod global_identity;
+mod h2_max_concurrent_streams;
 mod global_sections;
 mod gpc_array_actions;
 mod http_codes;

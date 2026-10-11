@@ -275,6 +275,63 @@ pub(crate) fn parse_global_directive(
             global.bufsize_large = Some(rounded);
             Ok(())
         }
+        // `h2_parse_max_concurrent_streams` (mux_h2.c): `atoi` (text is 0, a long wraps to int),
+        // negative refused; 0 means "the other level" (fe -> global) at run time. Reaches
+        // the data path as the SETTINGS value and the cap on the connection's streams
+        // (`engine.rs` `global_h2_flood_config.max_concurrent_streams`).
+        "tune.h2.max-concurrent-streams" | "tune.h2.fe.max-concurrent-streams" => {
+            let name = kw.text.as_str();
+            let fe = name == "tune.h2.fe.max-concurrent-streams";
+            if let Some(extra) = tokens.get(2).filter(|_| !fe) {
+                return Err(ConfigError::new(extra.line, extra.col, format!("'{name}' cannot handle unexpected argument '{}'.", extra.text)));
+            }
+            let v = c_atoi(tokens.get(1).map_or("", |t| t.text.as_str()));
+            let Ok(v) = u32::try_from(v) else {
+                return Err(ConfigError::new(kw.line, kw.col, format!("'{name}' expects a positive numeric value.")));
+            };
+            if fe {
+                let mut i = 2;
+                while let Some(opt) = tokens.get(i) {
+                    let arg = tokens.get(i + 1).map_or("", |t| t.text.as_str());
+                    let positive = |a: &str| c_atoi(a) > 0;
+                    match opt.text.as_str() {
+                        // The default: the load does not shrink the limit. Anything else
+                        // would need the run-queue load, which Ibex does not compute.
+                        "rq-load" if arg == "ignore" => {}
+                        "rq-load" if arg == "auto" || positive(arg) => {
+                            return Err(ConfigError::new(opt.line, opt.col, format!("'{name}' : 'rq-load {arg}' is not supported (the limit is not adjusted to the run-queue load); only 'rq-load ignore' is.")));
+                        }
+                        "rq-load" => {
+                            return Err(ConfigError::new(kw.line, kw.col, format!("'{name}' expects a strictly positive run-queue length, or 'auto' or 'ignore'.")));
+                        }
+                        "min" if !positive(arg) => {
+                            return Err(ConfigError::new(kw.line, kw.col, format!("'{name}' expects a strictly positive minimum number of streams'.")));
+                        }
+                        "min" if i64::from(v) < c_atoi(arg) => {
+                            return Err(ConfigError::new(kw.line, kw.col, format!("'{name}' minimum number of streams ({}) cannot be higher than the maximum ({v})'.", u32::try_from(c_atoi(arg)).unwrap_or(0))));
+                        }
+                        "min" => {
+                            return Err(ConfigError::new(opt.line, opt.col, format!("'{name}' : 'min {arg}' is not supported (it only matters with an 'rq-load' limit, which is not).")));
+                        }
+                        other => {
+                            return Err(ConfigError::new(kw.line, kw.col, format!("'{name}' only supports 'rq-load' or 'min' after the numeric value, but found '{other}'.")));
+                        }
+                    }
+                    i += 2;
+                }
+                global.h2_fe_max_concurrent_streams = Some(v);
+            } else {
+                global.h2_max_concurrent_streams = Some(v);
+            }
+            Ok(())
+        }
+        // HAProxy accepts it; Ibex opens no HTTP/2 connection to a server (`server ... proto h2`
+        // is refused, requests go out as HTTP/1.1), so there is no stream to limit.
+        "tune.h2.be.max-concurrent-streams" => Err(ConfigError::new(
+            kw.line,
+            kw.col,
+            "'tune.h2.be.max-concurrent-streams' is not supported: Ibex speaks only HTTP/1.1 to servers, so there is no HTTP/2 connection to a server whose streams it could limit.",
+        )),
         "tune.h2.fe.max-total-streams" => {
             if tokens.len() < 2 {
                 return Err(ConfigError::new(
@@ -948,4 +1005,17 @@ pub(crate) fn parse_description(tokens: &[Token], kw: &Token) -> Result<String, 
         return Err(ConfigError::new(kw.line, kw.col, "'description' expects a string argument."));
     }
     Ok(tokens[1..].iter().map(|t| t.text.as_str()).collect::<Vec<_>>().join(" "))
+}
+
+/// C's `atoi`: the leading integer of `s` (0 when there is none), read as `strtol` does and
+/// then truncated to an `int`.
+fn c_atoi(s: &str) -> i64 {
+    let t = s.trim_start();
+    let (neg, digits) = match t.as_bytes().first() {
+        Some(b'-') => (true, &t[1..]),
+        Some(b'+') => (false, &t[1..]),
+        _ => (false, t),
+    };
+    let n = digits.bytes().take_while(u8::is_ascii_digit).fold(0i64, |a, d| a.saturating_mul(10).saturating_add(i64::from(d - b'0')));
+    i64::from((if neg { -n } else { n }) as i32)
 }

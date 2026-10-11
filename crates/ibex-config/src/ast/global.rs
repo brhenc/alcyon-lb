@@ -210,6 +210,10 @@ pub struct GlobalSection {
     pub bufsize_small: Option<usize>,
     /// Large buffer size in bytes (`tune.bufsize.large`).
     pub bufsize_large: Option<usize>,
+    /// `tune.h2.max-concurrent-streams`: the HTTP/2 concurrent-stream limit of both sides (0: none given). Default: 100.
+    pub h2_max_concurrent_streams: Option<u32>,
+    /// `tune.h2.fe.max-concurrent-streams`: the same for frontends, over the global one when not 0.
+    pub h2_fe_max_concurrent_streams: Option<u32>,
     /// Maximum total streams per HTTP/2 connection (`tune.h2.fe.max-total-streams`). Default: 0 (unlimited).
     pub h2_max_total_streams: Option<usize>,
     /// Glitches threshold before graceful GOAWAY and hard close (`tune.h2.fe.glitches-threshold`). Default: 0 (disabled).

@@ -261,6 +261,11 @@ impl Drop for Proxy {
 /// The h2c frontend `fe` with `fe_extra` in front of the backend of [`serve_backend_conn`],
 /// with a stats socket.
 fn start_proxy(fe_extra: &str) -> Proxy {
+    start_proxy_cfg("", fe_extra)
+}
+
+/// [`start_proxy`] with `global_extra` lines in the `global` section.
+fn start_proxy_cfg(global_extra: &str, fe_extra: &str) -> Proxy {
     let backend = spawn_drip_backend();
     let dir = tempfile::TempDir::new().expect("dir");
     let stats = dir.path().join("s.sock");
@@ -269,7 +274,7 @@ fn start_proxy(fe_extra: &str) -> Proxy {
     std::fs::write(
         &cfg,
         format!(
-            "global\n\tstats socket {}\n\
+            "global\n\tstats socket {}\n{global_extra}\
              defaults\n\tmode http\n\ttimeout connect 3s\n\ttimeout client 10s\n\ttimeout server 10s\n\n\
              frontend fe\n\tbind 127.0.0.1:{port} proto h2\n{fe_extra}\tdefault_backend be\n\n\
              backend be\n\tserver s1 127.0.0.1:{backend}\n",
@@ -520,4 +525,72 @@ fn a_stream_rejected_by_tcp_request_content_ends_its_connection() {
 fn a_stream_silently_dropped_by_tcp_request_content_gets_no_response() {
     let (types, _) = connection_end("tcp-request content silent-drop", Duration::from_secs(2));
     assert!(!types.contains(&0x1), "no HEADERS for a dropped stream: {types:?}");
+}
+
+/// The `SETTINGS_MAX_CONCURRENT_STREAMS` the proxy advertises first, and the frames it
+/// sends for streams `1, 3, 5` opened at once on a slow backend (type, stream, payload).
+fn advertised_and_refused(p: &Proxy) -> (Option<u32>, Vec<(u8, u32, Vec<u8>)>) {
+    let mut s = p.client(&[]);
+    let mut burst = Vec::new();
+    for id in [1u32, 3, 5] {
+        burst.extend_from_slice(&frame(0x01, 0x05, id, &hpack_get("/drip")));
+    }
+    s.write_all(&burst).expect("headers");
+    let (mut mcs, mut seen) = (None, Vec::new());
+    read_frames(&mut s, Duration::from_millis(1000), |_, ty, flags, sid, payload| {
+        if ty == 0x04 && flags & 1 == 0 && mcs.is_none() {
+            mcs = payload.chunks(6).find(|c| c[..2] == [0, 3]).map(|c| u32::from_be_bytes([c[2], c[3], c[4], c[5]]));
+        }
+        seen.push((ty, sid, payload.to_vec()));
+        false
+    });
+    (mcs, seen)
+}
+
+fn assert_limit_two(p: &Proxy) {
+    let (mcs, seen) = advertised_and_refused(p);
+    assert_eq!(mcs, Some(2), "the advertised SETTINGS_MAX_CONCURRENT_STREAMS: {seen:?}");
+    let rst: Vec<_> = seen.iter().filter(|f| f.0 == 0x03).collect();
+    assert_eq!(rst.len(), 1, "exactly one RST_STREAM: {seen:?}");
+    assert_eq!((rst[0].1, rst[0].2.as_slice()), (5, &[0, 0, 0, 7][..]), "REFUSED_STREAM on the third: {seen:?}");
+    for id in [1, 3] {
+        assert!(seen.iter().any(|f| f.0 == 0x01 && f.1 == id), "stream {id} is served: {seen:?}");
+    }
+}
+
+/// Measured on `HAProxy` 3.5-dev8-885761-29 (`T280_ORACLE=haproxy`): with the limit 2 the
+/// SETTINGS frame carries 2 and the third stream gets RST_STREAM(REFUSED_STREAM), the
+/// first two being served.
+#[test]
+fn the_global_limit_is_advertised_and_enforced() {
+    assert_limit_two(&start_proxy_cfg("\ttune.h2.max-concurrent-streams 2\n", ""));
+}
+
+/// `tune.h2.fe.max-concurrent-streams` wins over the global one on a frontend.
+#[test]
+fn the_frontend_limit_overrides_the_global_one() {
+    assert_limit_two(&start_proxy_cfg("\ttune.h2.max-concurrent-streams 50\n\ttune.h2.fe.max-concurrent-streams 2\n", ""));
+}
+
+/// The default stays 100.
+#[test]
+fn the_default_limit_is_100() {
+    let (mcs, _) = advertised_and_refused(&start_proxy(""));
+    assert_eq!(mcs, Some(100));
+}
+
+/// `tune.h2.max-concurrent-streams 0` (measured on `HAProxy`): no limit is advertised in
+/// SETTINGS and every stream is refused (RST_STREAM REFUSED_STREAM).
+#[test]
+fn a_zero_global_limit_refuses_every_stream() {
+    let (mcs, seen) = advertised_and_refused(&start_proxy_cfg("\ttune.h2.max-concurrent-streams 0\n", ""));
+    assert_eq!(mcs, None, "no SETTINGS_MAX_CONCURRENT_STREAMS is sent: {seen:?}");
+    let rst: Vec<_> = seen.iter().filter(|f| f.0 == 0x03).map(|f| (f.1, f.2.clone())).collect();
+    assert_eq!(rst, vec![(1, vec![0, 0, 0, 7]), (3, vec![0, 0, 0, 7]), (5, vec![0, 0, 0, 7])], "{seen:?}");
+}
+
+/// `tune.h2.fe.max-concurrent-streams 0` falls back to the global value (measured).
+#[test]
+fn a_zero_frontend_limit_falls_back_to_the_global_one() {
+    assert_limit_two(&start_proxy_cfg("\ttune.h2.max-concurrent-streams 2\n\ttune.h2.fe.max-concurrent-streams 0\n", ""));
 }

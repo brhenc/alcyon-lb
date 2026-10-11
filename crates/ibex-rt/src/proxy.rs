@@ -1849,6 +1849,9 @@ impl TcpSession {
             if self.req.readable().starts_with(H2_CONN_PREFACE) {
                 let mut h2 = H2MuxContext::new(ibex_proto::conn::ConnId(0), true);
                 h2.flood_config = self.h2_flood_config;
+                if let Some(m) = self.h2_flood_config.max_concurrent_streams {
+                    h2.max_concurrent_streams = m;
+                }
                 let to_parse = self.req.readable().to_vec();
                 let _ = MuxH2.parse(&mut h2, &to_parse).map_err(|_| h2.ensure_goaway());
                 self.req.clear();

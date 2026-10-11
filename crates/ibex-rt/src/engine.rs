@@ -3891,6 +3891,11 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 .and_then(|g| g.maxrewrite)
                 .unwrap_or(1024),
             global_h2_flood_config: ibex_proto::H2FloodConfig {
+                // HAProxy's `h2c_max_concurrent_streams`: the frontend value when not 0,
+                // else the global one (default 100, and 0 when set to 0).
+                max_concurrent_streams: config.global.as_ref().and_then(|g| {
+                    g.h2_fe_max_concurrent_streams.filter(|&v| v != 0).or(g.h2_max_concurrent_streams)
+                }),
                 max_total_streams: config
                     .global
                     .as_ref()
