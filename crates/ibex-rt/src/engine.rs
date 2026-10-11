@@ -2195,8 +2195,14 @@ fn capture_values<'a>(slots: impl Iterator<Item = (&'a str, usize)>, headers: &[
 
 /// `s` cut to at most `len` bytes: a capture is bytes, and one that ends inside a
 /// character keeps the byte it cut at, as in `HAProxy`.
-fn cut_at(s: &str, len: usize) -> &[u8] {
-    &s.as_bytes()[..len.min(s.len())]
+fn cut_at(s: &str, len: usize) -> std::borrow::Cow<'_, [u8]> {
+    match ibex_regex::bytetext::text_to_bytes(s) {
+        std::borrow::Cow::Borrowed(b) => std::borrow::Cow::Borrowed(&b[..len.min(b.len())]),
+        std::borrow::Cow::Owned(mut b) => {
+            b.truncate(len);
+            std::borrow::Cow::Owned(b)
+        }
+    }
 }
 
 /// A new HTTP transaction's request is in: its header captures and unique ID, before any
@@ -2205,8 +2211,13 @@ fn begin_http_stream(entry: &mut SessionEntry, proxies: &[Proxy], fe_idx: usize,
     let fe = &proxies[fe_idx];
     if !fe.req_capture_slots.is_empty() {
         // A request that reached here was parsed into HTX (H1 and H2 alike).
-        let headers: Vec<(&[u8], &[u8])> =
-            entry.sess.htx_slice().map(|htx| htx.headers().map(|(k, v)| (k.as_bytes(), v.as_bytes())).collect()).unwrap_or_default();
+        // A value is text holding any escaped byte of a header that is not UTF-8 (T286).
+        let owned: Vec<(&str, std::borrow::Cow<'_, [u8]>)> = entry
+            .sess
+            .htx_slice()
+            .map(|htx| htx.headers().map(|(k, v)| (k, ibex_regex::bytetext::text_to_bytes(v))).collect())
+            .unwrap_or_default();
+        let headers: Vec<(&[u8], &[u8])> = owned.iter().map(|(k, v)| (k.as_bytes(), v.as_ref())).collect();
         entry.sess.log.req_captures = capture_values(fe.req_capture_slots.iter().map(|(n, l)| (n.as_str(), *l)), &headers);
     }
     // The response's slots exist from here on, empty until a response fills them: `%hs`
@@ -8880,9 +8891,9 @@ impl EngineDispatcher<'_> {
                     inject_connection_token_zero_alloc(&mut entry.sess.rep, tok);
                 }
             } else {
-                let head = String::from_utf8_lossy(&entry.sess.rep.readable()[..h + e]).into_owned();
+                let head = ibex_regex::bytetext::bytes_to_text(&entry.sess.rep.readable()[..h + e]);
                 if let Some(new) = crate::txn::rewrite_response_connection(&head, client_close, req_http11, tunnel) {
-                    entry.sess.rep.replace_prefix(h + e, new.as_bytes());
+                    entry.sess.rep.replace_prefix(h + e, &ibex_regex::bytetext::text_to_bytes(&new));
                 }
             }
             set_rsp(entry);
@@ -8898,7 +8909,7 @@ impl EngineDispatcher<'_> {
             None => return,
         };
         let hdr_bytes = &entry.sess.rep.readable()[..total_hdr_len];
-        let hdr_str = String::from_utf8_lossy(hdr_bytes).into_owned();
+        let hdr_str = ibex_regex::bytetext::bytes_to_text(hdr_bytes);
 
         // Bare-LF line ends are a head too (`find_eoh` accepts them, as HAProxy's parser
         // does); split only on CRLF, such a head skipped every rule.
@@ -9249,7 +9260,7 @@ impl EngineDispatcher<'_> {
                 let _ = write!(new_hdr, "{k}: {v}\r\n");
             }
             new_hdr.push_str("\r\n");
-            entry.sess.rep.replace_prefix(total_hdr_len, new_hdr.as_bytes());
+            entry.sess.rep.replace_prefix(total_hdr_len, &ibex_regex::bytetext::text_to_bytes(&new_hdr));
             entry.sess.log.res_captures.clone_from(&res_caps);
             if let Some(txn) = entry.sess.txn.as_mut() {
                 txn.rsp_wait = Some(wait);
@@ -9289,7 +9300,7 @@ impl EngineDispatcher<'_> {
         entry
             .sess
             .rep
-            .replace_prefix(total_hdr_len, new_hdr.as_bytes());
+            .replace_prefix(total_hdr_len, &ibex_regex::bytetext::text_to_bytes(&new_hdr));
         set_rsp(entry);
     }
 
@@ -10228,7 +10239,7 @@ impl EngineDispatcher<'_> {
                             // With `id`, the length is the declared slot's.
                             let max = len.or_else(|| proxies[proxy_idx].req_capture_slots.get(*target_id).map(|(_, l)| *l));
                             if let Some(slot) = sess.log.req_captures.get_mut(*target_id) {
-                                *slot = Some(cut_at(&val, max.unwrap_or(usize::MAX)).to_vec());
+                                *slot = Some(cut_at(&val, max.unwrap_or(usize::MAX)).into_owned());
                             }
                         }
                     }
@@ -11214,7 +11225,7 @@ pub(crate) fn format_sample_string(fmt: &str, ctx: &SampleContext, registry: &Re
                             // first NUL.
                             Sample::Bin(b) => {
                                 let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
-                                out.push_str(&String::from_utf8_lossy(&b[..end]));
+                                out.push_str(&ibex_regex::bytetext::bytes_to_text(&b[..end]));
                             }
                             _ => out.push_str(&sample_to_string(&smp)),
                         }
@@ -11940,7 +11951,7 @@ fn rebuild_req_buffer(sess: &mut TcpSession) {
         }
         new_hdr.push_str("\r\n");
         sess.req
-            .replace_prefix(hdr_len + eoh_len, new_hdr.as_bytes());
+            .replace_prefix(hdr_len + eoh_len, &ibex_regex::bytetext::text_to_bytes(&new_hdr));
     }
 }
 
@@ -12396,7 +12407,7 @@ fn run_res_rules<'a>(
                 let val = Expr::cached(expr).ok().and_then(|e| e.eval_sample(registry, ctx)).map(|smp| sample_to_string(&smp));
                 if let (Some(val), Some((slots, lens))) = (val, caps.as_mut()) {
                     if let (Some(slot), Some((_, len))) = (slots.get_mut(id), lens.get(id)) {
-                        *slot = Some(cut_at(&val, *len).to_vec());
+                        *slot = Some(cut_at(&val, *len).into_owned());
                     }
                 }
                 continue;
@@ -12894,7 +12905,7 @@ fn build_templated_error_response(
 
     // The config's escapes were decoded once, when it was read (`parse_line`); a second
     // pass would turn a literal `\\n` into a newline, which `HAProxy` does not.
-    let body = body_str.as_bytes();
+    let body = ibex_regex::bytetext::text_to_bytes(&body_str);
 
     let reason = status_reason(status);
     let mut resp = format!("HTTP/1.1 {status} {reason}\r\n");
@@ -12910,8 +12921,8 @@ fn build_templated_error_response(
     }
     resp.push_str("\r\n");
 
-    let mut full_resp = resp.into_bytes();
-    full_resp.extend_from_slice(body);
+    let mut full_resp = ibex_regex::bytetext::text_to_bytes(&resp).into_owned();
+    full_resp.extend_from_slice(&body);
     full_resp
 }
 

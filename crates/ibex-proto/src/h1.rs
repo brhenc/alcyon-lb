@@ -34,7 +34,7 @@ pub struct Refusal(pub u16);
 
 /// A [`Refusal`] with what caused it, as the payload of an `io::Error`.
 #[derive(Debug)]
-struct RefusalWhy(u16, &'static str);
+struct RefusalWhy(u16, &'static str, bool);
 
 impl std::fmt::Display for RefusalWhy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -47,7 +47,21 @@ impl std::error::Error for RefusalWhy {}
 impl Refusal {
     #[must_use]
     pub fn error(status: u16, why: &'static str) -> io::Error {
-        io::Error::new(io::ErrorKind::InvalidData, RefusalWhy(status, why))
+        io::Error::new(io::ErrorKind::InvalidData, RefusalWhy(status, why, false))
+    }
+
+    /// A [`Refusal::error`] that is not answered: the connection closes with nothing
+    /// written, and the status is only logged (`HAProxy` on Content-Length lines that
+    /// differ, T286).
+    #[must_use]
+    pub fn quiet(status: u16, why: &'static str) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidData, RefusalWhy(status, why, true))
+    }
+
+    /// Whether the error from a parse is one that is not answered ([`Refusal::quiet`]).
+    #[must_use]
+    pub fn is_quiet(e: &io::Error) -> bool {
+        e.get_ref().and_then(|e| e.downcast_ref::<RefusalWhy>()).is_some_and(|r| r.2)
     }
 
     /// The status an error from a parse asks for: its own, or 400.
@@ -127,6 +141,8 @@ pub struct H1Parser {
     pub accept_unsafe_request: bool,
     /// Header lines of the request head so far, against [`MAX_REQUEST_HEADERS`].
     pub header_lines: u16,
+    /// The last header line was a `TE` that is not sent on (its continuation lines are not).
+    last_dropped: bool,
 }
 
 /// Header lines a request or response head may carry: `HAProxy`'s `tune.http.maxhdr` (101)
@@ -135,15 +151,16 @@ pub struct H1Parser {
 /// so the limit is the default. Lines [`uncounted`] are not counted.
 pub const MAX_REQUEST_HEADERS: u16 = 100;
 
-/// A `Connection` line holding only `close` and `keep-alive` tokens: `HAProxy` empties and
+/// A `Connection` line holding only `close` and `keep-alive` tokens, or none (an empty
+/// value, T286): `HAProxy` empties and
 /// drops it while parsing (`h1_parse_connection_header`), so it does not count against
 /// [`MAX_REQUEST_HEADERS`]. Measured: 100 lines and `Connection: close` pass, 100 and
 /// `Connection: foo` or `Connection: close, foo` do not.
 #[must_use]
 pub fn uncounted(name: &[u8], value: &[u8]) -> bool {
     name.eq_ignore_ascii_case(b"connection") && {
-        let mut tokens = value.split(|&b| b == b',').map(<[u8]>::trim_ascii).filter(|t| !t.is_empty()).peekable();
-        tokens.peek().is_some() && tokens.all(|t| t.eq_ignore_ascii_case(b"close") || t.eq_ignore_ascii_case(b"keep-alive"))
+        let mut tokens = value.split(|&b| b == b',').map(<[u8]>::trim_ascii).filter(|t| !t.is_empty());
+        tokens.all(|t| t.eq_ignore_ascii_case(b"close") || t.eq_ignore_ascii_case(b"keep-alive"))
     }
 }
 
@@ -163,6 +180,7 @@ impl H1Parser {
             head_rewritten: false,
             accept_unsafe_request: false,
             header_lines: 0,
+            last_dropped: false,
         }
     }
 
@@ -178,6 +196,7 @@ impl H1Parser {
         self.prev_delim_len = 2;
         self.head_rewritten = false;
         self.header_lines = 0;
+        self.last_dropped = false;
     }
 
     /// Finalizes parsing on connection close / EOF (for HTTP/1.0 close delimiter fallback).
@@ -391,6 +410,12 @@ impl H1Parser {
                     self.phase = H1Phase::Error;
                     return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid character in header field value"));
                 }
+                if self.last_dropped {
+                    // The continuation of a header that is not sent on.
+                    self.head_rewritten = true;
+                    self.prev_delim_len = delim_len;
+                    return Ok(line_end + delim_len);
+                }
                 let appended = match std::str::from_utf8(folded) {
                     Ok(folded_val) if !htx.last_header_is_latin1() => {
                         let mut combined = String::with_capacity(prefix.len() + folded_val.len());
@@ -421,6 +446,20 @@ impl H1Parser {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "too many header lines"));
             }
             htx.finalize_last_header();
+            // `TE` is hop-by-hop: `HAProxy` sends on `te: trailers` when a token of it is
+            // exactly `trailers`, and nothing otherwise, so that a server that honours `TE`
+            // does not compress or chunk for a client that never asked (T286).
+            self.last_dropped = false;
+            if !self.is_response && name.eq_ignore_ascii_case("te") {
+                if value.split(|&b| b == b',').any(|t| t.trim_ascii() == b"trailers") {
+                    htx.push_header("te", "trailers").map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
+                } else {
+                    self.last_dropped = true;
+                }
+                self.head_rewritten = true;
+                self.prev_delim_len = delim_len;
+                return Ok(line_end + delim_len);
+            }
             match std::str::from_utf8(value) {
                 Ok(value) => htx.push_header(name, value),
                 // obs-text (RFC 9110 section 5.5) that is not UTF-8: Latin-1 from an old
@@ -566,10 +605,7 @@ impl H1Parser {
             };
             if seen_cl.is_some_and(|prev| prev != len) {
                 self.phase = H1Phase::Error;
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "conflicting Content-Length values",
-                ));
+                return Err(Refusal::quiet(400, "conflicting Content-Length values"));
             }
             seen_cl = Some(len);
         }
@@ -850,6 +886,12 @@ impl H1Parser {
     }
 }
 
+/// `HTTP/<digit>.<digit>`, the whole of a request line's version.
+#[must_use]
+pub fn is_http_version(v: &str) -> bool {
+    matches!(v.as_bytes(), [b'H', b'T', b'T', b'P', b'/', a, b'.', b] if a.is_ascii_digit() && b.is_ascii_digit())
+}
+
 fn parse_request_line_borrowed(line: &str) -> io::Result<(&str, &str, &str)> {
     let mut parts = line.split_whitespace();
     let method_str = parts
@@ -858,7 +900,12 @@ fn parse_request_line_borrowed(line: &str) -> io::Result<(&str, &str, &str)> {
     let uri = parts
         .next()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Missing HTTP URI"))?;
-    let version_str = parts.next().unwrap_or("HTTP/1.1");
+    // `method target HTTP/<digit>.<digit>`, and no blank after the version: anything else
+    // is a 400 (measured on 3.5-dev8-885761-29, T286).
+    let version_str = parts.next().filter(|v| is_http_version(v) && line.ends_with(v)).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Invalid HTTP version"))?;
+    if parts.next().is_some() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid HTTP version"));
+    }
 
     // Request-target forms (RFC 9112 section 3.2), as HAProxy's H1 parser enforces them
     // (`reg-tests/http-messaging/h1_request_target_validation.vtc`): origin-form `/...`,
@@ -993,7 +1040,7 @@ mod tests {
         }
         for name in ["x-admin", "Connection", "PROXY-CONNECTION", "keep-alive", "Expect", "User-Agent", "Trailer", "Cookie", "Forwarded"] {
             let (text, wire) = parse(name).unwrap_or_else(|e| panic!("{name}: {e}"));
-            assert_eq!(text.as_deref(), Some("5\u{ff}"), "{name}");
+            assert_eq!(text.as_deref(), Some("5\u{f7ff}"), "{name}");
             let line = format!("{name}: 5").into_bytes().into_iter().chain([0xff, b'\r', b'\n']).collect::<Vec<u8>>();
             assert!(wire.windows(line.len()).any(|w| w == line), "{name}: {}", wire.escape_ascii());
         }

@@ -1135,6 +1135,39 @@ pub fn status_of(head: &str) -> u16 {
 }
 
 
+/// Whether the request line in `buf` has a version `HAProxy` answers with a 400 (T286): not
+/// `HTTP/<digit>.<digit>`, missing, followed by anything, however long the line is. Its parser
+/// refuses the first byte that cannot belong to the version, so this holds before the line
+/// feed is in, and before the head is known to be too big for a 414 or a 431.
+#[must_use]
+pub fn request_version_invalid(buf: &[u8]) -> bool {
+    let lf = buf.iter().position(|&b| b == b'\n');
+    let line = &buf[..lf.unwrap_or(buf.len())];
+    let line = if lf.is_some() { line.strip_suffix(b"\r").unwrap_or(line) } else { line };
+    let blank = |b: &u8| matches!(b, b' ' | b'\t');
+    let toks: Vec<&[u8]> = line.split(blank).filter(|t| !t.is_empty()).collect();
+    if toks.len() < 3 {
+        // No version at all, once the line is whole.
+        return lf.is_some() && toks.len() == 2;
+    }
+    let v = toks[2];
+    let fits = |v: &[u8]| {
+        v.iter().enumerate().all(|(i, &b)| match i {
+            0 => b == b'H',
+            1 | 2 => b == b'T',
+            3 => b == b'P',
+            4 => b == b'/',
+            5 | 7 => b.is_ascii_digit(),
+            6 => b == b'.',
+            _ => false,
+        })
+    };
+    if toks.len() > 3 || !fits(v) || line.last().is_some_and(blank) {
+        return true;
+    }
+    lf.is_some() && v.len() != 8
+}
+
 /// Whether the request line in `buf` is one `HAProxy` answers with a 414 (T282): once its
 /// line feed is in, the start-line block (the 40 bytes of an HTX, the 20 of the block and the
 /// method, target and version) does not fit `bufsize`; with no line feed yet, the buffer

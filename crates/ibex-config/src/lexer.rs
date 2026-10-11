@@ -178,7 +178,7 @@ fn lex_line(raw_line: &str, line_number: usize) -> (Vec<Token>, Option<(usize, S
         }
 
         tokens.push(Token {
-            text: String::from_utf8_lossy(&token_text).into_owned(),
+            text: ibex_regex::bytetext::bytes_to_text(&token_text),
             line: line_number,
             col: token_col,
         });
@@ -225,7 +225,7 @@ mod tests {
     fn hex_escapes_are_bytes() {
         let toks = |s: &str| lex(s).remove(0).tokens.into_iter().map(|t| t.text).collect::<Vec<_>>();
         assert_eq!(toks(r#"k a\xC3\xA9b"#), ["k", "a\u{e9}b"]);
-        assert_eq!(toks(r#"k "-\xE0-" \r"#), ["k", "-\u{FFFD}-", "\r"]);
+        assert_eq!(toks(r#"k "-\xE0-" \r"#), ["k", "-\u{F7E0}-", "\r"]);
     }
 
     #[test]

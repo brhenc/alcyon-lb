@@ -237,8 +237,9 @@ proptest! {
         prop_assert_eq!(cast(Sample::Bin(bytes), SampleType::Str), Some(Sample::Str(head)));
     }
 
-    /// Invalid UTF-8 bytes in Bin -> Str must fail safely with None. The prefix has no NUL: the
-    /// cast stops at the first NUL byte (`c_bin2str`), so a NUL before the bad bytes drops them.
+    /// Invalid UTF-8 bytes in Bin -> Str are kept (`c_bin2str` casts any bytes): held as text,
+    /// they come back as the same bytes (T286). The prefix has no NUL: the cast stops at the
+    /// first NUL byte, so a NUL before the bad bytes drops them.
     #[test]
     fn prop_cast_invalid_utf8_fails(
         prefix in prop::collection::vec(1u8..=255, 0..10),
@@ -248,7 +249,10 @@ proptest! {
         let mut bytes = prefix;
         bytes.extend_from_slice(&[0xFF, 0xFF]);
         bytes.extend(suffix);
-        let smp = Sample::Bin(bytes);
-        prop_assert_eq!(cast(smp, SampleType::Str), None);
+        let bytes: Vec<u8> = bytes.into_iter().take_while(|&b| b != 0).collect();
+        let smp = Sample::Bin(bytes.clone());
+        let text = cast(smp, SampleType::Str);
+        prop_assert!(matches!(text, Some(Sample::Str(_))));
+        prop_assert_eq!(cast(text.unwrap(), SampleType::Bin), Some(Sample::Bin(bytes)));
     }
 }

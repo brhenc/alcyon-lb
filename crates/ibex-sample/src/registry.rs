@@ -2273,7 +2273,7 @@ impl Registry {
                     let mut buf = [0; 4];
                     bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
                 }
-                let decoded = String::from_utf8_lossy(&bytes).into_owned();
+                let decoded = ibex_regex::bytetext::bytes_to_text(&bytes);
                 Some(Sample::Str(decoded))
             },
         });
@@ -2311,7 +2311,7 @@ impl Registry {
                 if let Some(b) = hex_decode(s) {
                     Some(Sample::Bin(b))
                 } else {
-                    Some(Sample::Bin(s.as_bytes().to_vec()))
+                    Some(Sample::Bin(ibex_regex::bytetext::text_to_bytes(s).into_owned()))
                 }
             },
         });
@@ -2576,7 +2576,7 @@ impl Registry {
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: |smp, _args| {
                 let n = match &smp {
-                    Sample::Str(s) => s.len(),
+                    Sample::Str(s) => ibex_regex::bytetext::text_len(s),
                     Sample::Bin(b) => b.iter().position(|&c| c == 0).unwrap_or(b.len()),
                     other => sample_to_string(other).len(),
                 };
