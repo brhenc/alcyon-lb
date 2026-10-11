@@ -80,7 +80,6 @@ fn what_haproxy_refuses_is_refused() {
     assert_eq!(fe("  option httpslog extra\n").expect("loads").frontends[0].log_format, Some(LogFormatSpec::Https));
     // Not implemented in Ibex: refused rather than accepted and dropped.
     for (body, why) in [
-        ("  log-format-sd \"%ci\"\n", "log-format-sd"),
         ("  capture cookie c len 5\n", "capture cookie"),
     ] {
         let err = fe(body).expect_err(body);
@@ -153,8 +152,7 @@ fn formats_in_defaults_listen_and_backend() {
     assert_eq!(l.req_header_captures, [HeaderCapture { name: "host".into(), len: 3, slot: 0 }]);
     let err = parse_str("backend b\n  capture response header x-r\n").expect_err("bad capture");
     assert!(err.message.contains("'capture response' expects"), "{}", err.message);
-    let err = parse_str("backend b\n  log-format-sd \"%ci\"\n").expect_err("sd");
-    assert!(err.message.contains("not implemented"), "{}", err.message);
+    parse_str("backend b\n  log-format-sd \"%ci\"\n").expect("a backend accepts and ignores log-format-sd");
 }
 
 /// Health-check words reach the rules as the lexer read them (`parse_line`'s escapes
@@ -266,4 +264,30 @@ fn a_listen_sections_own_error_log_format_is_kept() {
     assert_eq!(cfg.listens[0].error_log_format.as_deref(), Some("L %ci"));
     let err = parse_str("listen l\n  bind 127.0.0.1:3\n  error-log-format a b\n").expect_err("two args");
     assert!(err.message.contains("expects only one argument"), "{}", err.message);
+}
+
+/// `log-format-sd` (T303), as `error-log-format`: one argument, kept per frontend or listen,
+/// inherited from `defaults` and replaced by the section's own; a backend takes and ignores
+/// it (`HAProxy` 3.5-dev8: "'log-format-sd' directive is ignored in backends").
+#[test]
+fn log_format_sd_is_kept_inherited_and_ignored_in_a_backend() {
+    let cfg = parse_str(
+        "defaults\n  mode http\n  log-format-sd \"[d@1 f=\\\"%f\\\"]\"\n\
+         frontend a\n  bind 127.0.0.1:1\n\
+         frontend b\n  bind 127.0.0.1:2\n  log-format-sd \"[b@1]\"\n\
+         listen l\n  bind 127.0.0.1:3\n\
+         listen m\n  bind 127.0.0.1:4\n  log-format-sd \"[m@1]\"\n\
+         backend k\n  log-format-sd \"K\"\n",
+    )
+    .expect("loads");
+    let d = Some("[d@1 f=\"%f\"]");
+    assert_eq!(cfg.defaults.as_ref().and_then(|d| d.log_format_sd.as_deref()), d);
+    assert_eq!(cfg.frontends[0].log_format_sd.as_deref(), d);
+    assert_eq!(cfg.frontends[1].log_format_sd.as_deref(), Some("[b@1]"));
+    assert_eq!(cfg.listens[0].log_format_sd.as_deref(), d);
+    assert_eq!(cfg.listens[1].log_format_sd.as_deref(), Some("[m@1]"));
+    for (body, why) in [("  log-format-sd\n", "log-format-sd expects an argument."), ("  log-format-sd a b\n", "log-format-sd expects only one argument, don't forget to escape spaces!")] {
+        let err = fe(body).expect_err(body);
+        assert!(err.message.contains(why), "{body}: {}", err.message);
+    }
 }

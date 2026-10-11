@@ -712,9 +712,9 @@ pub fn check_sample_refs(config: &Config, registry: &Registry) -> Result<(), Str
         // A fetch or converter that does not exist would load and yield an empty value on
         // every request; `sample_parse_expr` refuses it wherever the `%[...]` is written.
         // (An ACL's expression is checked by `check_expr`, in `HAProxy`'s ACL wording.)
-        // `log-format`, `unique-id-format` and `error-log-format` are compiled, and refused
+        // `log-format`, `unique-id-format`, `error-log-format` and `log-format-sd` are compiled, and refused
         // in `HAProxy`'s "failed to parse log-format" words, by `validate_formats`.
-        if !r.acl && !matches!(r.directive.as_str(), "log-format" | "unique-id-format" | "error-log-format") {
+        if !r.acl && !matches!(r.directive.as_str(), "log-format" | "unique-id-format" | "error-log-format" | "log-format-sd") {
             crate::rule_exprs::check_sample_expr(&r.expr, registry)
                 .map_err(|e| in_line(format!("failed to parse sample expression <{}> : {e}", r.expr)))?;
         }
@@ -758,7 +758,7 @@ pub fn check_sample_refs(config: &Config, registry: &Registry) -> Result<(), Str
                 return Err(in_line(e));
             }
         }
-        if let (SectionKind::Defaults, "unique-id-format" | "log-format" | "error-log-format") = (r.section, r.directive.as_str()) {
+        if let (SectionKind::Defaults, "unique-id-format" | "log-format" | "error-log-format" | "log-format-sd") = (r.section, r.directive.as_str()) {
             // Resolved in each proxy that inherited it, as if written there.
             for (section, name) in format_users(config, &r.directive, &r.expr) {
                 check_expr(config, registry, Where { section, proxy: Some(name) }, &r.expr, false).map_err(in_line)?;
@@ -775,14 +775,17 @@ pub fn check_sample_refs(config: &Config, registry: &Registry) -> Result<(), Str
 /// with a frontend compiles) contains the expression `expr`.
 fn format_users<'c>(config: &'c Config, directive: &str, expr: &str) -> Vec<(SectionKind, &'c str)> {
     let uses = |fmt: &str| ibex_config::parser::log_format_exprs(fmt).contains(&expr);
-    let log = directive == "log-format";
-    let err = directive == "error-log-format";
     let custom = |spec: &Option<ibex_config::LogFormatSpec>| matches!(spec, Some(ibex_config::LogFormatSpec::Custom(f)) if uses(f));
     let of = |fmt: &Option<String>| fmt.as_deref().is_some_and(uses);
-    let pick = |spec: &Option<ibex_config::LogFormatSpec>, elf: &Option<String>, uid: &Option<String>| if log { custom(spec) } else if err { of(elf) } else { of(uid) };
-    let fes = config.frontends.iter().filter(|f| pick(&f.log_format, &f.error_log_format, &f.unique_id_format));
-    let lis = config.listens.iter().filter(|l| pick(&l.log_format, &l.error_log_format, &l.unique_id_format));
-    let bes = config.backends.iter().filter(|b| !log && !err && b.unique_id_format.as_deref().is_some_and(uses));
+    let pick = |spec: &Option<ibex_config::LogFormatSpec>, elf: &Option<String>, sd: &Option<String>, uid: &Option<String>| match directive {
+        "log-format" => custom(spec),
+        "error-log-format" => of(elf),
+        "log-format-sd" => of(sd),
+        _ => of(uid),
+    };
+    let fes = config.frontends.iter().filter(|f| pick(&f.log_format, &f.error_log_format, &f.log_format_sd, &f.unique_id_format));
+    let lis = config.listens.iter().filter(|l| pick(&l.log_format, &l.error_log_format, &l.log_format_sd, &l.unique_id_format));
+    let bes = config.backends.iter().filter(|b| directive == "unique-id-format" && b.unique_id_format.as_deref().is_some_and(uses));
     fes.map(|f| (SectionKind::Frontend, f.name.as_str()))
         .chain(lis.map(|l| (SectionKind::Listen, l.name.as_str())))
         .chain(bes.map(|b| (SectionKind::Backend, b.name.as_str())))

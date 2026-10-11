@@ -565,11 +565,14 @@ pub fn validate_formats(config: &Config, registry: &Registry) -> Result<(), Stri
     let sections = config
         .frontends
         .iter()
-        .map(|f| ("frontend", &f.name, f.mode, &f.log_format, &f.unique_id_format, &f.error_log_format))
-        .chain(config.listens.iter().map(|l| ("proxy", &l.name, l.mode, &l.log_format, &l.unique_id_format, &l.error_log_format)));
-    for (what, name, mode, log_format, unique_id_format, error_log_format) in sections {
+        .map(|f| ("frontend", &f.name, f.mode, &f.log_format, &f.unique_id_format, &f.error_log_format, &f.log_format_sd))
+        .chain(config.listens.iter().map(|l| ("proxy", &l.name, l.mode, &l.log_format, &l.unique_id_format, &l.error_log_format, &l.log_format_sd)));
+    for (what, name, mode, log_format, unique_id_format, error_log_format, log_format_sd) in sections {
         if let Some(fmt) = error_log_format {
             check(what, name, "error-log-format", fmt)?;
+        }
+        if let Some(fmt) = log_format_sd {
+            check(what, name, "log-format-sd", fmt)?;
         }
         if let Some(spec) = log_format {
             check(what, name, "log-format", format_string(spec, mode == ibex_config::Mode::Http))?;

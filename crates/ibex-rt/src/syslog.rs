@@ -258,12 +258,29 @@ impl SyslogTarget {
     /// but is not a delivery guarantee -- UDP never gives one.
     #[must_use]
     pub fn send(&self, level: LogLevel, tag: &str, hostname: &str, msg: impl AsRef<[u8]>) -> bool {
+        self.send_sd(level, tag, hostname, b"", msg.as_ref())
+    }
+
+    /// [`SyslogTarget::send`] with the line's STRUCTURED-DATA (`log-format-sd`), which only
+    /// an rfc5424 header writes; empty is `-`.
+    #[must_use]
+    pub fn send_sd(&self, level: LogLevel, tag: &str, hostname: &str, sd: &[u8], msg: &[u8]) -> bool {
         if !self.accepts(level) {
             return false;
         }
         let (name, pid) = split_tag(tag);
-        let meta = Meta { host: hostname.as_bytes(), tag: name.as_bytes(), pid: pid.as_bytes(), ..Meta::default() };
-        self.deliver(level_code(level), facility_code(self.facility), &meta, msg.as_ref())
+        let meta = Meta { host: hostname.as_bytes(), tag: name.as_bytes(), pid: pid.as_bytes(), stdata: sd, ..Meta::default() };
+        self.deliver(level_code(level), facility_code(self.facility), &meta, msg)
+    }
+
+    /// True when the lines sent here have a STRUCTURED-DATA field: `format rfc5424`, or a
+    /// ring whose format is.
+    #[must_use]
+    pub fn writes_sd(&self) -> bool {
+        match &self.sink {
+            Sink::Ring(r) => r.format() == RingFormat::Rfc5424,
+            _ => self.format == Some(RingFormat::Rfc5424),
+        }
     }
 
     /// Sends a message that carries its own header fields, as a `log-forward` section does:
