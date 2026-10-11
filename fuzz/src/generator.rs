@@ -559,7 +559,7 @@ pub fn generate_mutated_cases(seed: u64, count: usize) -> Vec<TestCase> {
     let line_endings = [b"\r\n".as_slice(), b"\n".as_slice(), b"\r".as_slice(), b"\r\r\n".as_slice()];
 
     for i in 0..count {
-        let mutation_type = prng.next_usize(6);
+        let mutation_type = prng.next_usize(7);
         match mutation_type {
             0 => {
                 // Mutate a base structured case by inserting/replacing bytes
@@ -678,6 +678,51 @@ pub fn generate_mutated_cases(seed: u64, count: usize) -> Vec<TestCase> {
                     name: format!("mutated_cl_te_rand_{i}"),
                     class: AmbiguityClass::CombinatorialMutation,
                     description: format!("Combinatorial CL ({cl_val}) vs TE with payload len ({payload_len})"),
+                    raw_bytes: raw,
+                    expected_body: None,
+                    is_pipelined: false,
+                });
+            }
+            6 => {
+                // T293: the classes the end-to-end differences cluster on (TRIAGE.md): request
+                // line separators and control bytes, obs-fold, lone CR, bare LF heads, very long
+                // tokens, chunk extensions with odd bytes.
+                let seps = [b" ".as_slice(), b"\t", b"  ", b"\x00", b"\r", b"\x0b", b"\x0c"];
+                let ends = [b"\r\n".as_slice(), b"\n", b"\r", b" \n", b"\x00\r\n"];
+                let long = vec![b'a'; [64usize, 300, 1100, 9000][prng.next_usize(4)]];
+                let toks: [&[u8]; 6] = [b"GET", b"G\x00T", b"GE T", &long, b"get", b"G\xffT"];
+                let uris: [&[u8]; 5] = [b"/", b"/a b", &long, b"/\x01", b"http://h/x"];
+                let vers: [&[u8]; 6] = [b"HTTP/1.1", b"HTTP/1.2", b"HTTP/", b"HTTP/1.1 ", b"TTP/1.1", b""];
+                let mut raw = Vec::new();
+                raw.extend_from_slice(prng.choose(&toks));
+                raw.extend_from_slice(prng.choose(&seps));
+                raw.extend_from_slice(prng.choose(&uris));
+                let sep2 = *prng.choose(&seps);
+                let ver = *prng.choose(&vers);
+                if !ver.is_empty() {
+                    raw.extend_from_slice(sep2);
+                    raw.extend_from_slice(ver);
+                }
+                raw.extend_from_slice(prng.choose(&ends));
+                raw.extend_from_slice(b"Host: example.com");
+                match prng.next_usize(5) {
+                    0 => raw.extend_from_slice(b"\r\n folded\r\n"),
+                    1 => raw.extend_from_slice(b"\n"),
+                    2 => raw.extend_from_slice(b"\r\nX-A: b\rc\r\n"),
+                    3 => raw.extend_from_slice(b"\r\nX-A:\tb\r\n"),
+                    _ => raw.extend_from_slice(b"\r\n"),
+                }
+                raw.extend_from_slice(if prng.next_usize(2) == 0 { b"\r\n" } else { b"\n" });
+                if prng.next_usize(3) == 0 {
+                    raw.extend_from_slice(b"POST /c HTTP/1.1\r\nHost: e\r\nTransfer-Encoding: chunked\r\n\r\n");
+                    let ext: [&[u8]; 5] = [b"5;a=b", b"5;ext\xff\"q;s\"", b"5 ;x", b"5;\x00", b"5\r"];
+                    raw.extend_from_slice(prng.choose(&ext));
+                    raw.extend_from_slice(b"\r\nhello\r\n0\r\n\r\n");
+                }
+                mutated.push(TestCase {
+                    name: format!("mutated_reqline_{i}"),
+                    class: AmbiguityClass::CombinatorialMutation,
+                    description: "Request-line / head / chunk-extension byte mutations".into(),
                     raw_bytes: raw,
                     expected_body: None,
                     is_pipelined: false,

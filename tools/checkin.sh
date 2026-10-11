@@ -35,7 +35,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 
-STAGES=(tripwire harness-tests findings oracles suite covercheck smoke haproxy lint measure surface stray)
+STAGES=(tripwire harness-tests findings oracles suite covercheck smoke diff-fuzz haproxy lint measure surface stray)
 declare -A TITLE=(
   [tripwire]="tripwire: the spec tests must not change"
   [harness-tests]="the harness's own tests"
@@ -44,6 +44,7 @@ declare -A TITLE=(
   [suite]="every test in the workspace, against a declared baseline"
   [covercheck]="did a test execute what changed"
   [smoke]="the regressions no unit test can see"
+  [diff-fuzz]="differential fuzz against HAProxy, end to end, vs the known-differences baseline"
   [haproxy]="does HAProxy still behave as the tests record"
   [lint]="does the rest still build and lint (clippy, and the libFuzzer targets compile: T279)"
   [measure]="continuous measurement"
@@ -282,6 +283,26 @@ stage_smoke() {
   LLVM_PROFILE_FILE="$SMOKE_PROFILES/smoke-%4m.profraw" python3 harness/smoke.py 2>&1 | grep -vE "^$"
   check "${PIPESTATUS[0]}" "smoke"
   rm -rf "$SMOKE_PROFILES"
+}
+
+stage_diff-fuzz() {
+  # T293: the request-line / bare-LF / chunk-extension classes T291 tracks showed up only
+  # when the repaired differential harness ran real ibex against real HAProxy. This keeps it
+  # running: a time-boxed (30 s budget, plus the baseline's replay) run of fuzz/difffuzz.py.
+  # It fails on a DIFF not in fuzz/known_diffs.json, on a known input whose DIFF shape
+  # changed, and on a known input that became SAME (T291 fixing it: remove the printed hash).
+  # Takes its own ports (18400-18423). Usually ~40 s; stuck after 3 min (the budget and the
+  # replay are bounded, the section hint above learns the real numbers from the history).
+  # Run alone (--only diff-fuzz), this builds the ibex and the generator it needs.
+  # Instrumented-build profiles of the ibex it runs go to a directory of their own, removed
+  # after, like smoke's.
+  cargo build -q --bin ibex 2>/dev/null
+  cargo build -q --manifest-path fuzz/Cargo.toml --bin ibex-fuzz 2>/dev/null
+  local PROF
+  PROF=$(mktemp -d /tmp/ibex-difffuzz-profiles.XXXXXX)
+  LLVM_PROFILE_FILE="$PROF/difffuzz-%4m.profraw" python3 fuzz/difffuzz.py gate 2>&1 | grep -vE "^$"
+  check "${PIPESTATUS[0]}" "diff-fuzz"
+  rm -rf "$PROF"
 }
 
 stage_haproxy() {

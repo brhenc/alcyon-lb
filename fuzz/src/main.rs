@@ -30,6 +30,7 @@ struct Config {
     mutated_count: usize,
     seed: u64,
     soak: bool,
+    emit_dir: Option<PathBuf>,
 }
 
 fn parse_args() -> Config {
@@ -40,6 +41,7 @@ fn parse_args() -> Config {
     let mut mutated_count = 250;
     let mut seed = 42;
     let mut soak = false;
+    let mut emit_dir: Option<PathBuf> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -78,6 +80,12 @@ fn parse_args() -> Config {
                     i += 1;
                 }
             }
+            "--emit-dir" => {
+                if i + 1 < args.len() {
+                    emit_dir = Some(PathBuf::from(&args[i + 1]));
+                    i += 1;
+                }
+            }
             "--soak" => {
                 soak = true;
                 mutated_count = 2500;
@@ -90,6 +98,7 @@ fn parse_args() -> Config {
                 println!("  --findings-file <PATH>  Output markdown report (default: fuzz/FINDINGS.md)");
                 println!("  --iters <N>             Number of mutated cases to generate (default: 250)");
                 println!("  --seed <U64>            Random seed for deterministic generation (default: 42)");
+                println!("  --emit-dir <PATH>       Write the generated cases as case_NNNNN.bin and exit (no HAProxy; used by fuzz/difffuzz.py)");
                 println!("  --soak                  Run soak test with 2500+ iterations");
                 std::process::exit(0);
             }
@@ -105,6 +114,7 @@ fn parse_args() -> Config {
         mutated_count,
         seed,
         soak,
+        emit_dir,
     }
 }
 
@@ -155,6 +165,17 @@ fn main() {
     println!("  Mode:         {}", if config.soak { "SOAK TEST (extended)" } else { "CI DEFAULT (under 2 min)" });
     println!("  Random Seed:  {}", config.seed);
     println!("================================================================================\n");
+
+    if let Some(dir) = &config.emit_dir {
+        let mut cases = generate_structured_corpus();
+        cases.extend(generate_mutated_cases(config.seed, config.mutated_count));
+        fs::create_dir_all(dir).expect("create emit dir");
+        for (n, tc) in cases.iter().enumerate() {
+            fs::write(dir.join(format!("case_{n:05}.bin")), &tc.raw_bytes).expect("write case");
+        }
+        println!("emitted {} cases to {}", cases.len(), dir.display());
+        return;
+    }
 
     // 1. Initialize HAProxy Oracle on dynamic ephemeral ports
     print!("[+] Initializing HAProxy 3.5 Oracle on dynamic ephemeral ports... ");
