@@ -183,3 +183,36 @@ bound memory and treat inputs slower than 10 s as hangs. To use all cores on one
    the same function with the bytes (`include_bytes!` of the artifact, or an escaped
    literal), and run it: **it must fail first** (AGENTS.md section 1). Then fix the code and
    watch it pass. Ask an agent to do this; give it the artifact path and the panic text.
+
+---
+
+# Continuous end-to-end differential fuzzing (T293)
+
+`fuzz/difffuzz.py` runs the generator's cases through a real `ibex` and a real HAProxy 3.5
+(same config, each in front of a recording backend; a raw socket, no half-close) and compares
+the *shape* of each outcome: the status lines answered and a hash of the bytes the backend
+received. `fuzz/known_diffs.json` lists every input known to differ, keyed by the first 16 hex
+of the sha256 of its bytes, with the shape it shows, the tracking T-number and the input
+(base64). The generator itself, `ibex-fuzz --emit-dir DIR --seed S --iters N`, only writes the
+cases as `DIR/case_NNNNN.bin` (no HAProxy needed).
+
+| mode | command | what it does |
+|---|---|---|
+| gate (30 s budget) | `./tools/gate.sh --log /tmp/g.log --only diff-fuzz` (stage `diff-fuzz` of `tools/checkin.sh`) | replays `fuzz/corpus` and a rotating slice of the baseline (`--replay`, 50 entries, offset by day; `--replay 0` = all), then fresh cases (seed 293, fixed so the gate is reproducible: the baseline holds its DIFFs; other seeds are for `soak` and `--seed`; `--seed`/`--iters`) until the budget ends. FAILS on a DIFF not in the baseline, on a known input whose shape changed, and on a known input that became SAME (prints the hash to remove). Ports 18400-18423. |
+| soak (default 60 min) | `tools/difffuzz_soak.sh [MINUTES]` | generator rounds (seed = day number, 500 cases per round) under `flock -o -s /tmp/ibex-load.lock`, `nice -n 19 taskset -c 48-55`; new DIFFs go to `~/ibex-worktrees/review/difffuzz/<date>-<sha>.md`; one summary line on stdout; a row to `data/verification_runs.csv` if that ledger exists. |
+| nightly | `tools/systemd/ibex-difffuzz.{service,timer}` (03:00) | NOT installed by anything; copy to `~/.config/systemd/user/` and enable by hand. |
+
+By hand: `python3 fuzz/difffuzz.py gate --ibex <ibex> --gen <ibex-fuzz>` (defaults:
+`$CARGO_TARGET_DIR/debug/...`; build with `cargo build --bin ibex` and
+`cargo build --manifest-path fuzz/Cargo.toml --bin ibex-fuzz`).
+
+## Updating the baseline
+
+- T291 fixes a class: the gate fails with `BECAME SAME <hash> (T291)`. Delete those keys from
+  `fuzz/known_diffs.json` (all of them are printed in one run).
+- A deliberate new known difference, or a known input whose shape changed on purpose:
+  `python3 fuzz/difffuzz.py record --dir <dir-of-.bin> --task T<n> --write` (it adds the stable DIFFs
+  it finds; to re-record a changed shape, delete the old key first). Read the shape before you
+  accept it: a DIFF that is Ibex more permissive than HAProxy is a smuggling candidate, not
+  a baseline entry, unless a task tracks it.
+- A soak report with new DIFFs: confirm with `fuzz/e2e.py`, file a task, then `record --write`.
