@@ -3851,11 +3851,14 @@ impl Registry {
             func: |smp, args| match smp {
                 Sample::Str(s) => {
                     let mode = args.first().map(|x| x.as_str()).unwrap_or("");
-                    if mode == "utf8" && s.contains('\u{FFFD}') {
+                    // A byte that is not UTF-8 is held as an escape character (T286), and
+                    // U+FFFD is the replacement character itself.
+                    let invalid = |c: char| c == '\u{FFFD}' || ibex_regex::bytetext::unescape_char(c).is_some();
+                    if mode == "utf8" && s.chars().any(invalid) {
                         return Some(Sample::Str(String::new()));
                     }
                     let s = if mode == "utf8s" {
-                        s.replace('\u{FFFD}', "")
+                        s.chars().filter(|c| !invalid(*c)).collect()
                     } else {
                         s
                     };
@@ -5285,7 +5288,8 @@ fn hex_encode(data: &[u8]) -> String {
 
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
     let s = s.trim();
-    if !s.len().is_multiple_of(2) {
+    // Hex digits are ASCII: slicing text with another character in it would panic.
+    if !s.len().is_multiple_of(2) || !s.is_ascii() {
         return None;
     }
     let mut bytes = Vec::with_capacity(s.len() / 2);

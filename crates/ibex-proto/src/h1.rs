@@ -903,9 +903,7 @@ fn parse_request_line_borrowed(line: &str) -> io::Result<(&str, &str, &str)> {
     // `method target HTTP/<digit>.<digit>`, and no blank after the version: anything else
     // is a 400 (measured on 3.5-dev8-885761-29, T286).
     let version_str = parts.next().filter(|v| is_http_version(v) && line.ends_with(v)).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Invalid HTTP version"))?;
-    if parts.next().is_some() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid HTTP version"));
-    }
+    // (A fourth token is refused above: the version is the last token of the line.)
 
     // Request-target forms (RFC 9112 section 3.2), as HAProxy's H1 parser enforces them
     // (`reg-tests/http-messaging/h1_request_target_validation.vtc`): origin-form `/...`,
@@ -1005,6 +1003,18 @@ fn parse_header_field(line: &[u8]) -> io::Result<(&str, &[u8])> {
 
 #[cfg(test)]
 mod tests {
+    /// A continuation line of a `TE` that is not sent on goes with it, not to the header
+    /// before (T286).
+    #[test]
+    fn a_fold_after_a_dropped_te_is_dropped() {
+        let mut buf = [0u8; 4096];
+        let mut htx = HtxSlice::new(&mut buf);
+        let mut p = H1Parser::new(false);
+        p.parse(b"GET / HTTP/1.1\r\nHost: x\r\nX-A: 1\r\nTE: gzip\r\n , deflate\r\nX-B: 2\r\n\r\n", &mut htx).unwrap();
+        let hs: Vec<(String, String)> = htx.as_ref().headers().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        assert_eq!(hs, [("Host".into(), "x".into()), ("X-A".into(), "1".into()), ("X-B".into(), "2".into())]);
+    }
+
     use super::*;
 
     /// A refusal reads as its cause and status, and its status is what `status_of` returns;
