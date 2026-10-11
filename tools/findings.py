@@ -34,7 +34,7 @@ MD = os.path.join(ROOT, "data", "findings.md")
 FINDING_COLS = ["id", "found", "method", "class", "severity", "found_on", "task", "status",
                 "fixed_on", "fixed", "verified_on", "summary", "note"]
 RUN_COLS = ["start", "method", "commit", "duration_min", "new_findings", "note"]
-METHODS = ["vv-battery", "vv-soak", "vv-probe", "redteam", "fuzz-libfuzzer",
+METHODS = ["vv-battery", "vv-soak", "vv-probe", "vv-recheck", "redteam", "fuzz-libfuzzer",
            "fuzz-differential", "review", "gate", "user"]
 CLASSES = ["smuggling", "crash", "bypass", "dos", "leak", "parity", "perf", "flaky"]
 SEVERITIES = ["critical", "high", "medium", "low"]
