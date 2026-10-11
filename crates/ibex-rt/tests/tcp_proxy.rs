@@ -636,13 +636,19 @@ impl TestBackend {
         let seen: Arc<std::sync::Mutex<Vec<Vec<u8>>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = Arc::clone(&seen);
         thread::spawn(move || {
-            for _ in 0..conns {
+            let mut left = conns;
+            while left > 0 {
                 let Ok((mut c, _)) = listener.accept() else {
                     return;
                 };
                 c.set_read_timeout(Some(Duration::from_secs(10))).ok();
                 let mut tmp = [0u8; 4096];
                 if let Ok(n) = c.read(&mut tmp) {
+                    // The readiness probe's connection carries no byte (see `spawn`).
+                    if n == 0 {
+                        continue;
+                    }
+                    left -= 1;
                     sink.lock().expect("lock").push(tmp[..n].to_vec());
                     let _ = c.write_all(b"OK");
                     let _ = c.flush();
