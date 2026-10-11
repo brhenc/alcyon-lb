@@ -1363,10 +1363,10 @@ mod request_target_tests {
         for head in heads {
             for n in 1..=head.len() {
                 let p = &head[..n];
-                match scan_request_line(p, false) {
-                    ReqLineScan::Invalid => panic!("{p:?} refused"),
-                    ReqLineScan::Incomplete => {}
-                    ReqLineScan::Complete(l) => assert!(!header_lines_invalid(p, l.eol + l.eol_len, false), "{p:?} refused"),
+                let scan = scan_request_line(p, false);
+                assert_ne!(scan, ReqLineScan::Invalid, "{p:?} refused");
+                if let ReqLineScan::Complete(l) = scan {
+                    assert!(!header_lines_invalid(p, l.eol + l.eol_len, false), "{p:?} refused");
                 }
             }
         }
@@ -1377,5 +1377,18 @@ mod request_target_tests {
         assert!(matches!(scan_request_line(b"GET /\x80# HTTP/1.1\r\n", true), ReqLineScan::Complete(_)));
         assert!(header_lines_invalid(b"GET / HTTP/1.1\r\n\tX: y\r\n", 16, false));
         assert!(!header_lines_invalid(b"GET / HTTP/1.1\r\nX\0: y\0\r\n", 16, true));
+    }
+
+    /// A request line not yet whole is waited on: nothing is consumed, nothing refused (T291).
+    #[test]
+    fn a_partial_request_line_is_waited_on() {
+        use super::{H1Parser, H1Phase, HtxSlice};
+        let mut buf = vec![0u8; 4096];
+        let mut htx = HtxSlice::new(&mut buf);
+        let mut p = H1Parser::new(false);
+        assert_eq!(p.parse(b"GET /a HTTP/1.", &mut htx).expect("not refused"), 0);
+        assert_eq!(p.phase, H1Phase::StartLine);
+        assert_eq!(p.parse(b"GET /a HTTP/1.1\r\nHost: a\r\n\r\n", &mut htx).expect("parsed"), 28);
+        assert_eq!(p.phase, H1Phase::Done);
     }
 }
