@@ -59,6 +59,14 @@ pub fn new_generation() {
     GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// The current expression generation: it changes whenever any engine in the process is
+/// built, which empties every thread's cache (a test that counts parses reads it before and
+/// after, and measures again if it moved).
+#[must_use]
+pub fn generation() -> u64 {
+    GENERATION.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl Expr {
     /// [`Expr::parse`], once per text and thread: the expression compiled the first time
     /// `input` is evaluated, as `HAProxy` compiles it once when the configuration loads

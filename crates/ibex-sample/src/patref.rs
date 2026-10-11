@@ -812,6 +812,15 @@ mod tests {
     }
 
     #[test]
+    fn converter_map_knows_only_map_converters() {
+        assert_eq!(converter_map("map"), Some((MapKeys::Str, MapVals::Str)));
+        assert_eq!(converter_map("map_ip_int"), Some((MapKeys::Ip, MapVals::Int)));
+        assert_eq!(converter_map("map_foo"), None);
+        assert_eq!(converter_map("map_str_foo"), None);
+        assert_eq!(converter_map("lower"), None);
+    }
+
+    #[test]
     fn the_scan_registers_acl_and_map_files_in_the_order_written() {
         let acl = tmp("s.acl", "/s\n");
         let map = tmp("s.map", "k v\n");
