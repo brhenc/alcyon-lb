@@ -216,8 +216,8 @@ fn parse<'a>(h: &'a [u8], accept_unsafe: bool, mut header: impl FnMut(Option<Hea
                 canonical_start = false;
                 break;
             }
-            Some(_) => {}
-            None => return None,
+            // A head with no blank line at its end runs out in the name loop below.
+            _ => {}
         }
         let n0 = i;
         let mut bad_name = false;
@@ -550,11 +550,54 @@ fn full_check(head: &[u8], accept_unsafe: bool) -> ResponseHead {
 mod tests {
     use super::*;
 
-    fn rw(head: &[u8], accept: bool) -> Option<Vec<u8>> {
+    fn valid(head: &[u8], accept: bool) -> Option<Option<Vec<u8>>> {
         match check_response_head(head, accept) {
-            ResponseHead::Valid { rewrite, .. } => rewrite.map(|r| r.head),
-            ResponseHead::Invalid => panic!("refused: {}", head.escape_ascii()),
+            ResponseHead::Valid { rewrite, .. } => Some(rewrite.map(|r| r.head)),
+            ResponseHead::Invalid => None,
         }
+    }
+
+    fn rw(head: &[u8], accept: bool) -> Option<Vec<u8>> {
+        valid(head, accept).expect("refused")
+    }
+
+    /// Measured on HAProxy 3.5-dev8, with and without `option accept-unsafe-violations-in-http-
+    /// response`: empty lines (LF alone too) ahead of the status line are skipped (200); a lone CR,
+    /// a blank, no status, or nothing but a status line is a 502.
+    #[test]
+    fn the_start_of_the_head() {
+        for accept in [false, true] {
+            assert_eq!(
+                rw(b"\nHTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", accept).unwrap(),
+                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+            );
+            for head in [
+                &b"\rHTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"[..],
+                b" HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+                b"HTTP/1.1 OK\r\nContent-Length: 0\r\n\r\n",
+                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n",
+            ] {
+                assert_eq!(valid(head, accept), None, "{} accept={accept}", head.escape_ascii());
+                assert!(fast_check(head, accept).is_none_or(|r| r == ResponseHead::Invalid));
+            }
+        }
+    }
+
+    /// `http_find_hdr_value_end`: a comma inside a quoted string, an escaped quote included, does
+    /// not end a `Transfer-Encoding` word (one word, so no empty one between two commas). HAProxy
+    /// answers 502 to any coding but `chunked` in a response, so the wire cannot tell: this is
+    /// held to the function.
+    #[test]
+    fn a_quoted_comma_does_not_end_a_coding() {
+        let run = |v: &[u8]| {
+            let (mut xfer, mut te, mut chnk, mut other) = (false, false, false, false);
+            let r = parse_te(v, &mut xfer, &mut te, &mut chnk, &mut other);
+            (r, other)
+        };
+        assert_eq!(run(b"\"x,,y\""), (Ok(()), true));
+        assert_eq!(run(b"\"x\\\",,y\""), (Ok(()), true));
+        assert_eq!(run(b"x,,y"), (Err(()), true));
+        assert_eq!(value_end(b"a\\,b", 0), 2, "a backslash outside quotes escapes nothing");
     }
 
     #[test]
@@ -648,11 +691,8 @@ mod tests {
                     assert_eq!(fast, full_check(head, accept), "{} accept={accept}", head.escape_ascii());
                     assert!(matches!(fast, ResponseHead::Valid { rewrite: None, .. }));
                 } else {
-                    assert!(
-                        !matches!(full_check(head, accept), ResponseHead::Valid { rewrite: None, .. }),
-                        "the fast path gave up on a head left as it came: {} accept={accept}",
-                        head.escape_ascii()
-                    );
+                    let left_as_it_came = matches!(full_check(head, accept), ResponseHead::Valid { rewrite: None, .. });
+                    assert!(!left_as_it_came, "the fast path gave up on a head left as it came: {} accept={accept}", head.escape_ascii());
                 }
             }
         }

@@ -1182,6 +1182,48 @@ mod tests {
         assert_eq!(read_body(Framing::Chunked, b"zz\r\n", &mut out), BodyProgress::Error);
     }
 
+    /// Chunk trailers are bounded as a whole (`MAX_CHUNK_LINE`): a name, a value, a line end or a
+    /// field boundary past it is an error, wherever it falls. HAProxy 3.5-dev8 refuses a 17000-byte
+    /// trailer name or value (the connection is closed with no response) and forwards a 15000-byte one.
+    #[test]
+    fn a_chunk_trailer_past_the_line_limit_is_an_error() {
+        let trailers = |t: &[u8]| {
+            let mut body = b"0\r\n".to_vec();
+            body.extend_from_slice(t);
+            body.extend_from_slice(b"\r\n\r\nNEXT");
+            read_body(Framing::Chunked, &body, &mut Vec::new())
+        };
+        let value = |n: usize| [b"T: ".as_slice(), &vec![b'v'; n]].concat();
+        assert_eq!(trailers(&value(15000)), BodyProgress::Complete);
+        assert_eq!(trailers(&[vec![b'T'; 17000], b": 1".to_vec()].concat()), BodyProgress::Error);
+        assert_eq!(trailers(&value(17000)), BodyProgress::Error);
+        // The limit falls within a few bytes of 16 KiB, at the value, its CR or its LF.
+        let first_error = (16300..16400).find(|&n| trailers(&value(n)) == BodyProgress::Error).expect("an error");
+        assert!((16370..=16384).contains(&first_error), "{first_error}");
+        for n in first_error..16400 {
+            assert_eq!(trailers(&value(n)), BodyProgress::Error, "value of {n} bytes");
+        }
+        // Many small fields add up, and the next byte after the one that crossed is refused.
+        let fields = (0..20).map(|k| format!("T{k}: {}\r\n", "v".repeat(1000))).collect::<String>();
+        assert_eq!(trailers(fields.trim_end().as_bytes()), BodyProgress::Error);
+    }
+
+    /// `http_parse_cont_len_header`: measured on HAProxy 3.5-dev8 (the Content-Length checks of
+    /// tests/it/http_check_reply_framing.rs): a list of one repeated number is a length, a trailing
+    /// comma, a sign or two numbers are not.
+    #[test]
+    fn content_length_lines_must_agree_on_one_digits_only_value() {
+        let cl = |lines: &str| content_length(fields(&format!("HTTP/1.1 200 OK\r\n{lines}\r\n")));
+        assert_eq!(cl("Content-Length: 5"), Some(5));
+        assert_eq!(cl("Content-Length: 5, 5\r\nCONTENT-LENGTH: 5"), Some(5));
+        assert_eq!(cl("Host: x"), None);
+        assert_eq!(cl("Content-Length: 5,"), None);
+        assert_eq!(cl("Content-Length: +5"), None);
+        assert_eq!(cl("Content-Length: 5,,5"), None);
+        assert_eq!(cl("Content-Length: 5, 3"), None);
+        assert_eq!(cl("Content-Length: 5\r\nContent-Length: 3"), None);
+    }
+
     #[test]
     fn a_length_body_ends_at_its_length_and_leaves_the_next_request() {
         let req = b"POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhelloGET /next HTTP/1.1\r\n\r\n";

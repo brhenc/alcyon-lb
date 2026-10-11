@@ -1169,13 +1169,10 @@ fn http_verdict(check: &ServerCheckState, chk: &ResolvedHttpCheck, buf: &[u8], l
             return HttpVerdict::Fail { code: "SOCKERR", desc: "Socket error", status: None, info: None };
         }
     };
-    if resp.parse_error {
-        if let Some(rule) = chk.rules.iter().find_map(|r| match r {
-            ResolvedHttpRule::Expect(e) => Some(e),
-            _ => None,
-        }) {
-            return unparsed_reply_failure(rule, &resp);
-        }
+    // The first rule is an `expect`: the parser holds `set-var` and `unset-var` ahead of it
+    // apart, and adds one to a check that has none.
+    if let Some(ResolvedHttpRule::Expect(rule)) = chk.rules.first().filter(|_| resp.parse_error) {
+        return unparsed_reply_failure(rule, &resp);
     }
     let px = &proxies[check.proxy_idx];
     let reg = crate::engine::sample_registry();

@@ -529,6 +529,26 @@ mod tests {
         assert!(parse(&MinimalParser, true), "a parser without the option ignores it");
     }
 
+    /// A request whose `gzip, chunked` coding is refused with 422 only after it parsed says so
+    /// through `refusal`, also through the differential; a parser without the notion says none.
+    #[test]
+    fn a_request_parsed_then_refused_reports_its_status() {
+        const GZIP: &[u8] = b"POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: gzip, chunked\r\n\r\n";
+        let refusal = |p: &dyn HttpParser, input: &[u8]| {
+            let mut buf = [0u8; 4096];
+            let mut htx = HtxSlice::new(&mut buf);
+            let mut s = p.stream(false);
+            s.parse(input, &mut htx).expect("parse");
+            s.refusal()
+        };
+        assert_eq!(refusal(&H1, GZIP), Some(422));
+        assert_eq!(refusal(&H1, AS_SENT), None);
+        let both = Differential::new(Box::new(H1), Box::new(H1), OnMismatch::Observe);
+        assert_eq!(refusal(&both, GZIP), Some(422));
+        assert_eq!(refusal(&both, AS_SENT), None);
+        assert_eq!(refusal(&MinimalParser, GZIP), None);
+    }
+
     /// The differential forwards the primary's HTX, so it reports the primary's rewrite,
     /// and only that: the candidate parses into scratch.
     #[test]
