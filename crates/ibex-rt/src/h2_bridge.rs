@@ -118,6 +118,14 @@ pub fn start_request(sess: &mut TcpSession, d: H2Dispatch) {
     };
     // The built-in HTTP/1 parser (`parser::build(ParserKind::H1)`, which cannot fail).
     let mut p_stream = ibex_proto::parser::HttpParser::stream(&ibex_proto::parser::H1, false);
+    // A head of a few hundred bytes takes a small buffer, not a pooled 16 KB one that a held
+    // stream would keep for its whole life (T312; `HAProxy` holds no buffer for one). A
+    // rewrite that needs more makes room (`htx_reserve`), as for any HTX.
+    let lines = d.head.iter().filter(|&&b| b == b'\n').count();
+    let need = d.head.len() + 64 + ibex_proto::htx::HTX_DESC_SIZE * (lines + 3);
+    if need * 2 <= crate::buf::get_bufsize_small() && sess.htx_buf.raw_slice().is_empty() {
+        sess.htx_buf = Buf::unallocated(crate::buf::BufClass::Small);
+    }
     let raw = sess.htx_buf.raw_slice_mut();
     let mut slice = ibex_proto::htx::HtxSlice::new(raw);
     if p_stream.parse(&d.head, &mut slice).is_ok() {
@@ -130,6 +138,11 @@ pub fn start_request(sess: &mut TcpSession, d: H2Dispatch) {
     sess.req_uri = d.uri;
     sess.req_headers = Some(d.headers);
     sess.req.clear();
+    // The head waits here for a server connection (a stream held in the queue, or whose body
+    // never comes, keeps it): a small buffer for a small head, which grows with the body.
+    if wire_req.len() * 2 <= crate::buf::get_bufsize_small() && sess.req.raw_slice().is_empty() {
+        sess.req = Buf::unallocated(crate::buf::BufClass::Small);
+    }
     let w = sess.req.writable();
     let n = wire_req.len().min(w.len());
     w[..n].copy_from_slice(&wire_req[..n]);
