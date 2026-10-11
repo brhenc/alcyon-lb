@@ -86,6 +86,7 @@ pub mod qpack;
 pub mod session;
 pub mod stream;
 pub mod transport;
+pub mod upgrade;
 
 pub use actions::{
     build_synthetic_response, default_body_for_status, format_log_format_string,

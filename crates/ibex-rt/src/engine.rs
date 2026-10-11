@@ -8687,12 +8687,28 @@ impl EngineDispatcher<'_> {
                     reply_error(entry, proxies, 502);
                     return;
                 }
-                ibex_proto::response_head::ResponseHead::Valid { rewrite, close_server: close, .. } => {
+                ibex_proto::response_head::ResponseHead::Valid { status, rewrite, close_server: close } => {
                     close_server = close;
                     if let Some(r) = rewrite {
                         entry.sess.rep.replace_prefix(total_hdr_len, &r.head);
                         total_hdr_len = r.head.len();
                         held = Some(r.held);
+                    }
+                    // The websocket handshake against what the request asked for (T281).
+                    let req_ws = entry.sess.req_ws.as_deref().copied().unwrap_or_default();
+                    match crate::websocket::check_response(&entry.sess.rep.readable()[..total_hdr_len], status, &req_ws, accept) {
+                        crate::websocket::Verdict::Keep => {}
+                        crate::websocket::Verdict::Refuse => {
+                            entry.sess.rep.clear();
+                            entry.sess.log.term.get_or_insert(*b"PH");
+                            entry.sess.log.bytes_from_server = 0;
+                            reply_error(entry, proxies, 502);
+                            return;
+                        }
+                        crate::websocket::Verdict::Rewrite(new) => {
+                            entry.sess.rep.replace_prefix(total_hdr_len, &new);
+                            total_hdr_len = new.len();
+                        }
                     }
                 }
             }
