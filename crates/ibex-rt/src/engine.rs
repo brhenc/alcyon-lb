@@ -8566,11 +8566,7 @@ impl EngineDispatcher<'_> {
         // A response delivered whole before its upload ended (the server answered early):
         // `cL--`, the server connection closed, not reset, and the stream reset `NO_ERROR`.
         let answered = txn.rsp == MsgState::Done && entry.sess.rep.is_empty();
-        let term = match txn.rsp {
-            MsgState::Waiting => *b"cH",
-            _ if answered => *b"cL",
-            _ => *b"cD",
-        };
+        let term = if txn.rsp == MsgState::Waiting { *b"cH" } else if answered { *b"cL" } else { *b"cD" };
         txn.srv_reusable = false;
         txn.rsp = MsgState::Done;
         entry.sess.log.term.get_or_insert(term);
