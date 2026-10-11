@@ -93,7 +93,8 @@ try:
         try:
             print(f"{label:9s} idle: RSS {rss_cpu(p.pid)[0]} MB, fds {fds(p.pid)}; smaps {smaps(p.pid)}")
             observer(label, p.pid)
-            wave(label, p.pid, 1); wave(label, p.pid, 2)
+            for w in range(1, int(os.environ.get("WAVES", "2")) + 1):
+                wave(label, p.pid, w)
             print(f"{label:9s} end: RSS {rss_cpu(p.pid)[0]} MB, fds {fds(p.pid)}, alive {p.poll() is None}", flush=True)
         finally:
             stop(p)
