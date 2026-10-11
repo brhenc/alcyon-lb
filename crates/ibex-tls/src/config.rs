@@ -1077,3 +1077,30 @@ mod expiring_sessions {
         assert_eq!(s.take(b"c"), None);
     }
 }
+
+#[cfg(test)]
+mod ticket_keys {
+    use super::{ticket_key, TlsConfig};
+
+    /// A key the rotator is handed encrypts what only it decrypts.
+    #[test]
+    fn a_ticket_key_round_trips_and_refuses_another_keys_tickets() {
+        let (a, b) = (ticket_key().expect("key"), ticket_key().expect("key"));
+        assert!(a.enabled());
+        assert!(a.lifetime() > 0);
+        let t = a.encrypt(b"session").expect("encrypt");
+        assert_eq!(a.decrypt(&t), Some(b"session".to_vec()));
+        assert_eq!(b.decrypt(&t), None);
+    }
+
+    /// With tickets off, a server issues none, in TLS 1.2 or 1.3.
+    #[test]
+    fn tickets_off_issues_none() {
+        super::install_default_crypto_provider();
+        let mut cfg = TlsConfig::new().with_cert_resolver(std::sync::Arc::new(crate::resolver::IbexCertResolver::new()));
+        cfg.session_tickets_enabled = false;
+        let built = cfg.build_server_config().expect("build");
+        assert!(!built.ticketer.enabled());
+        assert_eq!(built.send_tls13_tickets, 0);
+    }
+}
