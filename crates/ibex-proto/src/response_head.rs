@@ -123,9 +123,9 @@ fn parse_value<'a>(h: &'a [u8], i: &mut usize, accept_unsafe: bool) -> Option<(C
     }
 }
 
-/// Header lines a response head may carry: `HAProxy`'s `tune.http.maxhdr` (101). Measured on
-/// 3.5-dev8: 101 lines pass, 102 are a 502 logged `PH--` (T285).
-const MAX_RESPONSE_HEADERS: usize = 101;
+/// Header lines a response head may carry, as a request's
+/// ([`crate::h1::MAX_REQUEST_HEADERS`], 100): 101 are a 502 logged `PH--` (T285).
+const MAX_RESPONSE_HEADERS: usize = crate::h1::MAX_REQUEST_HEADERS as usize;
 
 /// Parses the head; each header goes to `header` in order, `None` for one `accept_unsafe`
 /// drops (a bad name). Nothing is collected here: the well-formed head is checked without
@@ -245,7 +245,7 @@ fn parse<'a>(h: &'a [u8], accept_unsafe: bool, mut header: impl FnMut(Option<Hea
         let name = &h[n0..i];
         i += 1;
         let (value, canonical) = parse_value(h, &mut i, accept_unsafe)?;
-        lines += 1;
+        lines += usize::from(!crate::h1::uncounted(name, &value));
         if lines > MAX_RESPONSE_HEADERS {
             return None;
         }

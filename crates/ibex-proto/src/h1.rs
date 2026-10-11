@@ -129,10 +129,23 @@ pub struct H1Parser {
     pub header_lines: u16,
 }
 
-/// Header lines a request head may carry: `HAProxy`'s `tune.http.maxhdr` (101) less one.
-/// Measured on 3.5-dev8: 100 lines pass, 101 are a 400 logged `PR--` (T285). Ibex refuses
-/// `tune.http.maxhdr`, so the limit is the default.
+/// Header lines a request or response head may carry: `HAProxy`'s `tune.http.maxhdr` (101)
+/// less one. Measured on 3.5-dev8: 100 lines pass, 101 are a 400 logged `PR--` for a
+/// request and a 502 logged `PH--` for a response (T285). Ibex refuses `tune.http.maxhdr`,
+/// so the limit is the default. Lines [`uncounted`] are not counted.
 pub const MAX_REQUEST_HEADERS: u16 = 100;
+
+/// A `Connection` line holding only `close` and `keep-alive` tokens: `HAProxy` empties and
+/// drops it while parsing (`h1_parse_connection_header`), so it does not count against
+/// [`MAX_REQUEST_HEADERS`]. Measured: 100 lines and `Connection: close` pass, 100 and
+/// `Connection: foo` or `Connection: close, foo` do not.
+#[must_use]
+pub fn uncounted(name: &[u8], value: &[u8]) -> bool {
+    name.eq_ignore_ascii_case(b"connection") && {
+        let mut tokens = value.split(|&b| b == b',').map(<[u8]>::trim_ascii).filter(|t| !t.is_empty()).peekable();
+        tokens.peek().is_some() && tokens.all(|t| t.eq_ignore_ascii_case(b"close") || t.eq_ignore_ascii_case(b"keep-alive"))
+    }
+}
 
 impl H1Parser {
     #[must_use]
@@ -402,7 +415,7 @@ impl H1Parser {
             }
 
             let (name, value) = parse_header_field(header_bytes)?;
-            self.header_lines += 1;
+            self.header_lines += u16::from(!uncounted(name.as_bytes(), value));
             if !self.is_response && self.header_lines > MAX_REQUEST_HEADERS {
                 self.phase = H1Phase::Error;
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "too many header lines"));

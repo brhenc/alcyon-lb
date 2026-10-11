@@ -6,8 +6,9 @@
 //!    from old clients is forwarded byte for byte, and the rules see the header -- a deny on
 //!    it still denies. A Latin-1 byte in `Host`, `Content-Length` or `Transfer-Encoding` is a
 //!    400.
-//! 2. `tune.http.maxhdr` (101): a request of 101 header lines is a 400 (`PR--`,
-//!    `<BADREQ>`), a response of 102 a 502 (`PH--`); 100 and 101 pass.
+//! 2. `tune.http.maxhdr` (101) less one: a request of 101 header lines is a 400 (`PR--`,
+//!    `<BADREQ>`), a response of 101 a 502 (`PH--`); 100 pass. A `Connection` line that
+//!    holds only `close` / `keep-alive` is not counted.
 //! 3. The head goes to the server as `HAProxy` writes it again from HTX: CRLF line ends,
 //!    `name: value` with the value's blanks trimmed, `Content-Length` in canonical digits,
 //!    `Transfer-Encoding: chunked` in lower case.
@@ -47,17 +48,23 @@ impl Drop for Proxy {
 }
 
 /// `n` response header lines: `Content-Length`, `n - 2` others and `Connection: close`.
-fn response_with(n: usize) -> Vec<u8> {
+/// `n` response header lines, `Content-Length` and `n - 1` others, and a `Connection`
+/// line of `conn` if there is one.
+fn response_with(n: usize, conn: Option<&str>) -> Vec<u8> {
     let mut r = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n".to_vec();
-    for i in 0..n - 2 {
+    for i in 0..n - 1 {
         r.extend_from_slice(format!("X-{i}: v\r\n").as_bytes());
     }
-    r.extend_from_slice(b"Connection: close\r\n\r\nok");
+    if let Some(c) = conn {
+        r.extend_from_slice(format!("Connection: {c}\r\n").as_bytes());
+    }
+    r.extend_from_slice(b"\r\nok");
     r
 }
 
 /// A server that records each request and answers it once the request has gone quiet:
-/// `/res<n>` with `n` header lines, anything else with a two-byte body.
+/// `/res<n>` with `n` header lines (`/res<n>?<c>`: and `Connection: <c>`), anything else
+/// with a two-byte body.
 fn server(seen: Seen) -> SocketAddr {
     let l = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = l.local_addr().unwrap();
@@ -77,8 +84,9 @@ fn server(seen: Seen) -> SocketAddr {
                     let _ = s.set_read_timeout(Some(Duration::from_millis(300)));
                 }
                 let path = got.split(|&c| c == b' ').nth(1).map(|p| String::from_utf8_lossy(p).into_owned()).unwrap_or_default();
-                let reply = match path.strip_prefix("/res").and_then(|n| n.parse().ok()) {
-                    Some(n) => response_with(n),
+                let res = path.strip_prefix("/res").map(|r| r.split_once('?').map_or((r, None), |(n, c)| (n, Some(c))));
+                let reply = match res.and_then(|(n, c)| Some((n.parse().ok()?, c))) {
+                    Some((n, c)) => response_with(n, c),
                     None => b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec(),
                 };
                 seen.lock().unwrap().insert(path, got);
@@ -235,11 +243,14 @@ fn latin1_in_a_framing_or_routing_header_is_refused() {
     ]);
 }
 
-/// `Host` and `n - 1` more header lines.
-fn many(path: &str, n: usize) -> Vec<u8> {
+/// `Host` and `n - 1` more header lines, and a `Connection` line of `conn` if there is one.
+fn many(path: &str, n: usize, conn: Option<&str>) -> Vec<u8> {
     let mut r = format!("GET {path} HTTP/1.1\r\nHost: x\r\n").into_bytes();
     for i in 0..n - 1 {
         r.extend_from_slice(format!("X-{i}: v\r\n").as_bytes());
+    }
+    if let Some(c) = conn {
+        r.extend_from_slice(format!("Connection: {c}\r\n").as_bytes());
     }
     r.extend_from_slice(b"\r\n");
     r
@@ -258,21 +269,37 @@ fn log_with(p: &Proxy, needle: &str) -> Option<String> {
 #[test]
 fn a_request_of_101_header_lines_is_a_400() {
     let p = start();
-    let ok = many("/h100", 100);
+    let ok = many("/h100", 100, None);
     // As the server gets it: the names in lower case.
     let fwd = String::from_utf8(ok.clone()).unwrap().replace("Host", "host").replace("X-", "x-").into_bytes();
-    run(&p, p.fe, &[case(&ok, 200, Some(&fwd)), case(&many("/h101", 101), 400, None)]);
+    // A `Connection` line of only `close` / `keep-alive` is emptied and not counted
+    // (`h1_parse_connection_header`); one with another token is.
+    let close = many("/h100c", 100, Some("close"));
+    // It goes to the server without its `Connection: close`, as HTTP/1.1 implies it.
+    let close_fwd = String::from_utf8(many("/h100c", 100, None)).unwrap().replace("Host", "host").replace("X-", "x-").into_bytes();
+    run(&p, p.fe, &[
+        case(&ok, 200, Some(&fwd)),
+        case(&many("/h101", 101, None), 400, None),
+        case(&close, 200, Some(&close_fwd)),
+        case(&many("/h100f", 100, Some("foo")), 400, None),
+    ]);
     let line = log_with(&p, " f f/<NOSRV> ").expect("the 400 is logged");
     assert!(line.contains(" 400 ") && line.contains(" PR-- ") && line.contains("\"<BADREQ>\""), "{line}");
 }
 
 #[test]
-fn a_response_of_102_header_lines_is_a_502() {
+fn a_response_of_101_header_lines_is_a_502() {
     let p = start();
-    let req = |n: usize| format!("GET /res{n} HTTP/1.1\r\nHost: x\r\n\r\n").into_bytes();
-    let fwd = |n: usize| format!("GET /res{n} HTTP/1.1\r\nhost: x\r\n\r\n").into_bytes();
-    run(&p, p.fe, &[case(&req(101), 200, Some(&fwd(101))), case(&req(102), 502, Some(&fwd(102)))]);
-    let line = log_with(&p, "/res102 ").expect("the 502 is logged");
+    let req = |n: &str| format!("GET /res{n} HTTP/1.1\r\nHost: x\r\n\r\n").into_bytes();
+    let fwd = |n: &str| format!("GET /res{n} HTTP/1.1\r\nhost: x\r\n\r\n").into_bytes();
+    run(&p, p.fe, &[
+        case(&req("100"), 200, Some(&fwd("100"))),
+        case(&req("101"), 502, Some(&fwd("101"))),
+        // 101 lines, one of them `Connection: close`, which is not counted.
+        case(&req("100?close"), 200, Some(&fwd("100?close"))),
+        case(&req("100?foo"), 502, Some(&fwd("100?foo"))),
+    ]);
+    let line = log_with(&p, "/res101 ").expect("the 502 is logged");
     assert!(line.contains(" 502 ") && line.contains(" PH-- "), "{line}");
 }
 
