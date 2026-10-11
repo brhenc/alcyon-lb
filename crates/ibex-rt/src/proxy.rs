@@ -219,13 +219,147 @@ impl Drop for QueueWait {
     }
 }
 
+/// The client side of a session: its socket, or, for a stream of an HTTP/2 connection
+/// (T280), none of its own -- the connection's owner entry reads and writes the socket, and
+/// what the stream does to "its" client connection (a FIN, a reset) is done by the owner
+/// ([`H2Child::conn_end`]).
+pub enum ClientSide {
+    Fd(OwnedFd),
+    H2Child,
+}
+
+impl ClientSide {
+    #[inline]
+    fn fd(&self) -> Option<BorrowedFd<'_>> {
+        match self {
+            ClientSide::Fd(f) => Some(f.as_fd()),
+            ClientSide::H2Child => None,
+        }
+    }
+
+    /// A read from the socket; nothing for a stream of an HTTP/2 connection.
+    fn recv(&self, xprt: &mut ClientXprt, dst: &mut [u8]) -> io::Result<Io> {
+        match self {
+            ClientSide::Fd(f) => xprt.recv(f.as_fd(), dst),
+            ClientSide::H2Child => Ok(Io::WouldBlock),
+        }
+    }
+
+    /// A write to the socket; nothing for a stream of an HTTP/2 connection.
+    fn send(&self, xprt: &mut ClientXprt, src: &[u8]) -> io::Result<Io> {
+        match self {
+            ClientSide::Fd(f) => xprt.send(f.as_fd(), src),
+            ClientSide::H2Child => Ok(Io::WouldBlock),
+        }
+    }
+
+    fn shutdown_read(&self) {
+        if let ClientSide::Fd(f) = self {
+            raw::shutdown_read(f.as_fd());
+        }
+    }
+}
+
+/// How many streams of an HTTP/2 connection are served at once (T280 stage 3a: one, as
+/// before the streams had entries of their own). Stage 3b lifts it to the connection's
+/// `SETTINGS_MAX_CONCURRENT_STREAMS`.
+pub const H2_MAX_CHILDREN: usize = 1;
+
+/// A session's part in an HTTP/2 connection (T280): `HAProxy`'s `h2c` (the owner, the entry
+/// that accepted the socket: the mux, the socket, the connection's timers) and its `h2s` +
+/// `struct stream` (a child: one entry per stream being served, with its own transaction,
+/// server connection and log line).
+pub enum H2Role {
+    Owner(H2Owner),
+    Child(H2Child),
+}
+
+/// The owner's side: its children.
+#[derive(Default)]
+pub struct H2Owner {
+    /// The entries serving the connection's streams, at most [`H2_MAX_CHILDREN`].
+    pub children: Vec<H2ChildLink>,
+    /// The client's TLS session as the `ssl_fc*` fetches of every stream read it: one copy
+    /// for the connection, shared.
+    pub tls: Option<Arc<ibex_tls::RustlsTlsInfo>>,
+    /// A child holds the client's timer off (`cli_timer_live`): it is tarpitted, or a
+    /// retry waits out its turnaround.
+    pub child_holds_timer: bool,
+    /// A child's request is all in and it waits for the server: the client's timer is
+    /// off while nothing is pending for the client either.
+    pub child_awaits_server: bool,
+}
+
+/// A child of an owner, as the owner knows it. The arena reuses indices and task slots: a
+/// link is removed when its child is freed, and a child forgets its owner when the owner
+/// is ([`H2Child::owner`]), so neither ever names an entry that is not its own.
+#[derive(Clone, Copy, Debug)]
+pub struct H2ChildLink {
+    pub idx: u32,
+    pub task: ibex_sched::TaskRef,
+    pub stream_id: u32,
+}
+
+/// What a child asks of its owner's client connection when it ends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnEnd {
+    /// `shutw_cli`: a FIN.
+    Shutw,
+    /// `shutdown_both`.
+    ShutBoth,
+    /// `abort_with_rst`.
+    Abort,
+    /// `silent_drop`, IPv6 or not.
+    SilentDrop(bool),
+}
+
+/// The child's side: the stream it serves and its owner.
+#[allow(clippy::struct_excessive_bools)]
+pub struct H2Child {
+    /// The owner's entry and task; `None` once the owner is gone.
+    pub owner: Option<(u32, ibex_sched::TaskRef)>,
+    pub stream: H2ActiveStream,
+    /// The client (or the mux) reset the stream.
+    pub reset: bool,
+    /// The transaction ended through `end_txn` and the connection goes on: the entry is
+    /// freed, and a server connection it kept goes to the owner for the next stream.
+    pub finished: bool,
+    /// What the transaction did to the client connection, done by the owner.
+    pub conn_end: Option<ConnEnd>,
+    /// The owner has frames for the client it has not written yet (they were part of
+    /// "output pending" when the stream was the connection's own).
+    pub owner_tx_pending: bool,
+    /// The stream made progress since the owner last looked: the client's timer is
+    /// re-armed for it, as any progress of the session's re-armed it.
+    pub progressed: bool,
+    pub tls: Option<Arc<ibex_tls::RustlsTlsInfo>>,
+}
+
+impl H2Child {
+    /// Records what the stream does to the client connection; a reset outweighs a FIN.
+    fn end_conn(&mut self, how: ConnEnd) {
+        if !matches!(self.conn_end, Some(ConnEnd::Abort | ConnEnd::SilentDrop(_))) {
+            self.conn_end = Some(how);
+        }
+    }
+}
+
+/// What the `ssl_fc*` fetches of a session read, from its fields (so that a caller may
+/// hold it beside others): the client's TLS session, a stream's that of its connection.
+#[must_use]
+pub fn ssl_fc<'a>(xprt: &'a ClientXprt, role: Option<&'a H2Role>) -> ibex_sample::SslFacts<'a> {
+    match role {
+        Some(H2Role::Child(H2Child { tls: Some(info), .. })) => crate::xprt::facts_of(info),
+        _ => xprt.ssl_facts(),
+    }
+}
+
 /// One TCP / HTTP session: two connections, two buffers, two state machines.
 #[allow(clippy::struct_excessive_bools)]
 pub struct TcpSession {
-    /// The client's socket. Outside this module it is reached through `cli_fd` only, so
-    /// that a session without a socket of its own (an HTTP/2 stream served by its own
-    /// entry, T280) changes one place.
-    cli: OwnedFd,
+    /// The client's socket, none for a stream of an HTTP/2 connection (T280). Outside this
+    /// module it is reached through `cli_fd` only.
+    cli: ClientSide,
     /// Which HTTP parser validates this connection's request heads.
     ///
     /// A `ParserKind` rather than a `Box<dyn HttpStream>`: it is `Copy`, so the session
@@ -392,9 +526,9 @@ pub struct TcpSession {
     pub h2_ctx: Option<Box<H2MuxContext>>,
     /// The first GOAWAY of an HTTP/2 `timeout client` has gone: the next expiry closes.
     pub h2_idle_goaway: bool,
-    /// The HTTP/2 stream being served, from its dispatch to `reset_for_next_request`:
-    /// boxed, as most sessions are not HTTP/2 (T280).
-    pub h2_stream: Option<Box<H2ActiveStream>>,
+    /// The session's part in an HTTP/2 connection (T280): the owner of the connection, with
+    /// its streams' entries, or one of those streams. Boxed, as most sessions are neither.
+    pub h2_role: Option<Box<H2Role>>,
     pub h2_flood_config: ibex_proto::H2FloodConfig,
     pub is_first_req: bool,
     /// The client's reset was reported with the first bytes of its request, before any
@@ -442,11 +576,203 @@ pub struct H2ReqBody {
 }
 
 impl TcpSession {
-    /// The client's socket.
+    /// The client's socket; `None` for a stream of an HTTP/2 connection, whose socket is
+    /// its owner's (T280).
     #[must_use]
     #[inline]
-    pub fn cli_fd(&self) -> BorrowedFd<'_> {
-        self.cli.as_fd()
+    pub fn cli_fd(&self) -> Option<BorrowedFd<'_>> {
+        self.cli.fd()
+    }
+
+    /// Whether the session speaks HTTP/2 to its client: the connection's owner, or one of
+    /// its streams.
+    #[must_use]
+    #[inline]
+    pub fn is_h2(&self) -> bool {
+        self.h2_ctx.is_some() || self.is_h2_child()
+    }
+
+    /// Whether the session is a stream of an HTTP/2 connection (T280).
+    #[must_use]
+    #[inline]
+    pub fn is_h2_child(&self) -> bool {
+        matches!(self.cli, ClientSide::H2Child)
+    }
+
+    #[must_use]
+    pub fn h2_child(&self) -> Option<&H2Child> {
+        match self.h2_role.as_deref() {
+            Some(H2Role::Child(c)) => Some(c),
+            _ => None,
+        }
+    }
+
+    pub fn h2_child_mut(&mut self) -> Option<&mut H2Child> {
+        match self.h2_role.as_deref_mut() {
+            Some(H2Role::Child(c)) => Some(c),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn h2_owner(&self) -> Option<&H2Owner> {
+        match self.h2_role.as_deref() {
+            Some(H2Role::Owner(o)) => Some(o),
+            _ => None,
+        }
+    }
+
+    /// The owner's side of an HTTP/2 connection, made on first use (one `Box` a connection).
+    pub fn h2_owner_mut(&mut self) -> Option<&mut H2Owner> {
+        self.h2_ctx.as_ref()?;
+        match self.h2_role.get_or_insert_with(|| Box::new(H2Role::Owner(H2Owner::default()))).as_mut() {
+            H2Role::Owner(o) => Some(o),
+            H2Role::Child(_) => None,
+        }
+    }
+
+    /// The HTTP/2 stream this session serves, for a child.
+    #[must_use]
+    pub fn h2_active(&self) -> Option<&H2ActiveStream> {
+        self.h2_child().map(|c| &c.stream)
+    }
+
+    /// Whether the client connection is TLS (`ssl_fc`, the `~` of `%ft`), a stream's that
+    /// of its connection.
+    #[must_use]
+    pub fn cli_is_tls(&self) -> bool {
+        self.cli_xprt.is_tls() || self.h2_child().is_some_and(|c| c.tls.is_some())
+    }
+
+    /// What the `ssl_fc*` fetches read: the client's TLS session, a stream's that of its
+    /// connection.
+    #[must_use]
+    pub fn ssl_fc(&self) -> ibex_sample::SslFacts<'_> {
+        ssl_fc(&self.cli_xprt, self.h2_role.as_deref())
+    }
+
+    /// Resets the client connection (`abort_with_rst`); a stream's, through its owner.
+    pub fn abort_client(&mut self) {
+        match self.cli.fd() {
+            Some(fd) => raw::abort_with_rst(fd),
+            None => {
+                if let Some(c) = self.h2_child_mut() {
+                    c.end_conn(ConnEnd::Abort);
+                }
+            }
+        }
+    }
+
+    /// `silent-drop` on the client connection; a stream's, through its owner.
+    pub fn silent_drop_client(&mut self, is_ipv6: bool) {
+        match self.cli.fd() {
+            Some(fd) => raw::silent_drop(fd, is_ipv6),
+            None => {
+                if let Some(c) = self.h2_child_mut() {
+                    c.end_conn(ConnEnd::SilentDrop(is_ipv6));
+                }
+            }
+        }
+    }
+
+    /// Shuts both directions of the client connection; a stream's, through its owner.
+    pub fn shutdown_both_client(&mut self) {
+        match self.cli.fd() {
+            Some(fd) => raw::shutdown_both(fd),
+            None => {
+                if let Some(c) = self.h2_child_mut() {
+                    c.end_conn(ConnEnd::ShutBoth);
+                }
+            }
+        }
+    }
+
+    /// A session for stream `stream` of the HTTP/2 connection `owner` serves, entry
+    /// `owner_ref` (T280): what the stream reads of its connection (addresses, listener,
+    /// TLS session, PROXY header, session variables and counters, the log started for the
+    /// next stream) is copied from the owner, the rest starts as a new session's. Its
+    /// client side is the owner's; it has no client timer of its own (the connection's is
+    /// the owner's). [`Self::h2_child_done`] gives back what the stream changed.
+    #[must_use]
+    pub fn h2_child_of(owner: &mut TcpSession, owner_ref: (u32, ibex_sched::TaskRef), stream: H2ActiveStream) -> TcpSession {
+        let tls = owner.h2_owner_mut().and_then(|o| o.tls.clone());
+        let tls = tls.or_else(|| {
+            let info = Arc::new(owner.cli_xprt.tls_info()?.clone());
+            if let Some(o) = owner.h2_owner_mut() {
+                o.tls = Some(Arc::clone(&info));
+            }
+            Some(info)
+        });
+        let mut c = TcpSession::new_with_mode(ClientSide::H2Child, owner.mode, Vec::new(), Vec::new(), owner.timeouts, owner.max_retries, Tick::ETERNITY);
+        c.cli_exp = Tick::ETERNITY;
+        c.parser_kind = owner.parser_kind;
+        c.client_addr = owner.client_addr;
+        c.so_name.clone_from(&owner.so_name);
+        c.so_id = owner.so_id;
+        c.http_request_ms = owner.http_request_ms;
+        c.keep_alive_ms = owner.keep_alive_ms;
+        c.close_client = owner.close_client;
+        c.bytes_in = owner.bytes_in;
+        c.bytes_out = owner.bytes_out;
+        c.stick_acct_in = owner.stick_acct_in;
+        c.stick_out_pending = owner.stick_out_pending;
+        c.accept_proxy = owner.accept_proxy;
+        c.accept_proxy_v2 = owner.accept_proxy_v2;
+        c.proxy_handshake_done = owner.proxy_handshake_done;
+        c.proxy_info.clone_from(&owner.proxy_info);
+        c.server_addr = owner.server_addr;
+        c.fc_src = owner.fc_src;
+        c.fc_dst = owner.fc_dst;
+        c.created_at = Instant::now();
+        c.bufsize = owner.bufsize;
+        c.maxrewrite = owner.maxrewrite;
+        // The `tcp-request content` rules the owner armed for the next request run on this
+        // one (`end_txn` armed them for the next request of the connection).
+        c.tcp_inspect_done = std::mem::replace(&mut owner.tcp_inspect_done, true);
+        c.inspect_exp = owner.inspect_exp.take();
+        c.sess_vars.clone_from(&owner.sess_vars);
+        c.log = owner.log.clone();
+        c.tracked_sc.clone_from(&owner.tracked_sc);
+        c.h2_flood_config = owner.h2_flood_config;
+        c.is_first_req = owner.is_first_req;
+        c.reset_with_request = owner.reset_with_request;
+        c.keep_request_line = owner.keep_request_line;
+        c.accept_unsafe_request = owner.accept_unsafe_request;
+        c.h2_role = Some(Box::new(H2Role::Child(H2Child {
+            owner: Some(owner_ref),
+            stream,
+            reset: false,
+            finished: false,
+            conn_end: None,
+            owner_tx_pending: false,
+            progressed: false,
+            tls,
+        })));
+        c
+    }
+
+    /// The stream `child` is over: what it changed of the connection's state comes back to
+    /// the owner, which then waits for its next stream as the session did after `end_txn`
+    /// (`reset_for_next_request`). `inspect`: the frontend's `tcp-request content` rules
+    /// are armed again for the next request, with this deadline.
+    pub fn h2_child_done(&mut self, child: &mut TcpSession, inspect: Option<Option<Tick>>) {
+        self.sess_vars = std::mem::take(&mut child.sess_vars);
+        self.tracked_sc = std::mem::take(&mut child.tracked_sc);
+        self.stick_acct_in = child.stick_acct_in;
+        self.stick_out_pending = child.stick_out_pending + child.log.bytes_from_server;
+        self.log = crate::txnlog::StreamLog::start(self.bytes_in, self.bytes_out);
+        self.is_first_req = false;
+        self.ending = None;
+        if let Some(exp) = inspect {
+            self.tcp_inspect_done = false;
+            self.inspect_exp = exp;
+        }
+        // The streams that are over are let go, as `HAProxy` frees a stream when it closes
+        // (`h2s_destroy`). Kept, each held its request for the life of the connection and
+        // every request walked all of them: 88% of the CPU of an h2 request (T186).
+        if let Some(h2) = self.h2_ctx.as_mut() {
+            h2.streams.retain(|_, s| !matches!(s.state, ibex_proto::H2StreamState::Closed | ibex_proto::H2StreamState::Reset(_)));
+        }
     }
 
     /// Whether the client connection is TLS and its handshake is not done yet.
@@ -460,8 +786,8 @@ impl TcpSession {
     /// connection that ended after its GOAWAY, or a backend connection that ended, is a finished
     /// stream and not a cut one. Already sent, or a failed socket: nothing.
     pub fn close_notify_both(&mut self) {
-        if !self.cli_failed && matches!(&self.cli_xprt, ClientXprt::Tls(t) if t.handshake_done()) {
-            self.cli_xprt.send_close_notify(self.cli.as_fd());
+        if let Some(fd) = self.cli.fd().filter(|_| !self.cli_failed && matches!(&self.cli_xprt, ClientXprt::Tls(t) if t.handshake_done())) {
+            self.cli_xprt.send_close_notify(fd);
         }
         if let Some(sfd) = self.srv.as_ref().map(AsFd::as_fd) {
             self.srv_xprt.send_close_notify(sfd);
@@ -474,16 +800,23 @@ impl TcpSession {
     /// and drops its session as not resumable, so every reconnect paid a full handshake
     /// (T283, MY-2).
     pub fn shutw_cli(&mut self) {
+        let Some(fd) = self.cli.fd() else {
+            // A stream's FIN is its connection's: the owner sends it (T280).
+            if let Some(c) = self.h2_child_mut() {
+                c.end_conn(ConnEnd::Shutw);
+            }
+            return;
+        };
         if matches!(&self.cli_xprt, ClientXprt::Tls(t) if t.handshake_done()) {
-            self.cli_xprt.send_close_notify(self.cli.as_fd());
+            self.cli_xprt.send_close_notify(fd);
         }
-        raw::shutdown_write(self.cli.as_fd());
+        raw::shutdown_write(fd);
     }
 
     #[must_use]
     pub fn new(cli: OwnedFd, timeouts: Timeouts, retries: u16, now: Tick) -> Self {
         Self::new_with_mode(
-            cli,
+            ClientSide::Fd(cli),
             Mode::Tcp,
             Vec::new(),
             Vec::new(),
@@ -496,7 +829,7 @@ impl TcpSession {
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_mode(
-        cli: OwnedFd,
+        cli: ClientSide,
         mode: Mode,
         cliexp: Vec<CompiledExp>,
         srvexp: Vec<CompiledExp>,
@@ -593,7 +926,7 @@ impl TcpSession {
             stick_stores: Vec::new(),
             h2_ctx: None,
             h2_idle_goaway: false,
-            h2_stream: None,
+            h2_role: None,
             h2_flood_config: ibex_proto::H2FloodConfig::default(),
             is_first_req: true,
             reset_with_request: false,
@@ -612,7 +945,7 @@ impl TcpSession {
     pub fn client_version(&self) -> Option<&'static str> {
         if self.h3 {
             Some("HTTP/3.0")
-        } else if self.h2_ctx.is_some() {
+        } else if self.is_h2() {
             Some("HTTP/2.0")
         } else {
             None
@@ -691,6 +1024,7 @@ impl TcpSession {
         self.rep_window() > 0
             || self.pending_resp.as_deref().is_some_and(|(d, o)| *o < d.len())
             || self.h2_ctx.as_ref().is_some_and(|h| h.tx_consumed < h.tx_buf.len())
+            || self.h2_child().is_some_and(|c| c.owner_tx_pending)
     }
 
     /// Whether the session must be run again with no socket event to wake it.
@@ -707,13 +1041,14 @@ impl TcpSession {
             || (self.srv_state == ScState::Error && self.srv_xprt.handshake_failed())
     }
 
-    /// A stream with its request in, waiting for its turn, and the turn free: streams
-    /// go one at a time, so while one is served the others wait for its end (`end_txn`
-    /// runs the session again then). Counting them while one was at the server had the
-    /// session requeue itself on every pass, a busy loop as long as the server took (T186).
+    /// A stream with its request in, waiting for its turn, and the turn free: as many
+    /// streams are served at once as [`H2_MAX_CHILDREN`], so while that many are the others
+    /// wait for one's end (the child's release runs the owner again then). Counting them
+    /// while one was at the server had the session requeue itself on every pass, a busy
+    /// loop as long as the server took (T186).
     #[must_use]
     pub fn has_undispatched_h2_streams(&self) -> bool {
-        if self.h2_stream.is_some() || self.txn.is_some() {
+        if self.h2_owner().is_some_and(|o| o.children.len() >= H2_MAX_CHILDREN) || self.txn.is_some() {
             return false;
         }
         if let Some(ref h2) = self.h2_ctx {
@@ -741,7 +1076,18 @@ impl TcpSession {
         self.cli_cant_recv = true;
     }
 
-    fn arm_client(&mut self, now: Tick) {
+    pub(crate) fn arm_client(&mut self, now: Tick) {
+        // A stream of an HTTP/2 connection waits on its client through the connection's
+        // timer, which is its owner's (T280).
+        if let Some(c) = self.h2_child_mut() {
+            c.progressed = true;
+            self.cli_exp = Tick::ETERNITY;
+            return;
+        }
+        if self.is_h2_child() {
+            self.cli_exp = Tick::ETERNITY;
+            return;
+        }
         let ms = self.tunnel_ms().unwrap_or(self.timeouts.client);
         self.cli_exp = if ms == 0 { Tick::ETERNITY } else { now.add(ms) };
     }
@@ -780,13 +1126,17 @@ impl TcpSession {
     /// Whether the request head is still being received: no transaction yet, and either
     /// the connection is new or part of a request is here.
     fn head_pending(&self) -> bool {
-        self.mode == Mode::Http && self.txn.is_none() && (self.is_first_req || !self.req.is_empty())
+        self.mode == Mode::Http
+            && self.txn.is_none()
+            && (self.is_first_req || !self.req.is_empty())
+            // An HTTP/2 connection serving a stream has its request head (T280).
+            && self.h2_owner().is_none_or(|o| o.children.is_empty())
     }
 
     /// Whether the connection waits for the first byte of its next request: a response has
     /// gone, nothing has come.
     fn idle_wait(&self) -> bool {
-        self.mode == Mode::Http && self.h2_ctx.is_none() && self.txn.is_none() && !self.is_first_req && self.req.is_empty()
+        self.mode == Mode::Http && !self.is_h2() && self.txn.is_none() && !self.is_first_req && self.req.is_empty()
     }
 
     /// Starts `timeout http-request` when a request head starts, and ends it when the head
@@ -1026,10 +1376,12 @@ impl TcpSession {
     /// `raw` is HTTP/1 text, so on an HTTP/2 connection nothing is sent: the h2 mux has
     /// no 408 for an idle client (it closes), and a `100 Continue` is not its to send.
     pub fn send_before_close(&mut self, raw: &[u8]) {
-        if self.h2_ctx.is_some() {
+        if self.is_h2() {
             return;
         }
-        let _ = self.cli_xprt.send(self.cli.as_fd(), raw);
+        if let Some(fd) = self.cli.fd() {
+            let _ = self.cli_xprt.send(fd, raw);
+        }
     }
 
     /// Answers the current request with `raw`, a complete response the proxy built
@@ -1052,6 +1404,7 @@ impl TcpSession {
     /// connection says so (`Connection: close`) when the page does not. HAProxy's 431 for
     /// an oversized request head does not (measured on 3.5-dev8, `tasks/T87`).
     pub fn write_reply_with(&mut self, raw: &[u8], announce_close: bool) {
+        let h2 = self.is_h2();
         let txn = self.txn.get_or_insert_with(|| HttpTxn::new(txn::Framing::None, false));
         let data = self.req.readable();
         let n = txn.req.window(data);
@@ -1066,7 +1419,6 @@ impl TcpSession {
         if raw.is_empty() || txn::head_wants_close(&head) {
             txn.close_after = true;
         }
-        let h2 = self.h2_ctx.is_some();
         // On an HTTP/2 connection the reply is a response like a server's: its head
         // goes out as HEADERS and its body as DATA on the request's stream
         // (`h2_forward_response`), so it is queued as a head with its framing, not as
@@ -1112,13 +1464,6 @@ impl TcpSession {
         self.req_uri = None;
         self.req_headers = None;
         self.clear_htx();
-        // The streams that are over are let go, as `HAProxy` frees a stream when it closes
-        // (`h2s_destroy`). Kept, each held its request for the life of the connection and
-        // every request walked all of them: 88% of the CPU of an h2 request (T186).
-        if let Some(h2) = self.h2_ctx.as_mut() {
-            h2.streams.retain(|_, s| !matches!(s.state, ibex_proto::H2StreamState::Closed | ibex_proto::H2StreamState::Reset(_)));
-        }
-        self.h2_stream = None;
         self.req_vars.clear();
         if let Some(set) = self.timeouts_set.take() {
             self.timeouts = set.before;
@@ -1225,8 +1570,10 @@ impl TcpSession {
 
     #[must_use]
     pub fn is_done(&self) -> bool {
-        matches!(self.cli_state, ScState::Closed | ScState::Error)
-            && matches!(self.srv_state, ScState::Closed | ScState::Error)
+        (matches!(self.cli_state, ScState::Closed | ScState::Error) && matches!(self.srv_state, ScState::Closed | ScState::Error))
+            // A stream of an HTTP/2 connection whose transaction ended: its entry goes, and
+            // a server connection it kept goes to its owner (T280).
+            || self.h2_child().is_some_and(|c| c.finished)
     }
 
     // ---- the two state machines --------------------------------------------------
@@ -1329,7 +1676,7 @@ impl TcpSession {
         if self.cli_cant_recv {
             return Ok(false);
         }
-        let fd = self.cli.as_fd();
+        let Some(fd) = self.cli.fd() else { return Ok(false) };
         let mut peek = [0u8; 16384];
         let n = match raw::peek(fd, &mut peek)? {
             Io::Done(n) => n,
@@ -1367,6 +1714,10 @@ impl TcpSession {
 
     #[allow(clippy::too_many_lines)]
     fn process_cli_io(&mut self) -> io::Result<bool> {
+        // A stream of an HTTP/2 connection has no socket: its owner moves its bytes (T280).
+        if self.is_h2_child() {
+            return Ok(false);
+        }
         let mut changed = false;
 
         // A PROXY header to a TLS bind precedes the handshake: read it before the
@@ -1392,11 +1743,11 @@ impl TcpSession {
             // sends then waits in the socket, as with `HAProxy` (T235).
             if self.cli_state.can_read() && !self.cli_cant_recv && self.h2_ctx.as_ref().is_some_and(|h| h.wants_input()) {
                 let mut raw_buf = [0u8; 16384];
-                let r = self.cli_xprt.recv(self.cli.as_fd(), &mut raw_buf)?;
+                let r = self.cli.recv(&mut self.cli_xprt, &mut raw_buf)?;
                 self.cli_cant_recv = self.polls_cli() && self.cli_xprt.drained(r, raw_buf.len());
                 match r {
                     Io::Eof => {
-                        raw::shutdown_read(self.cli.as_fd());
+                        self.cli.shutdown_read();
                         self.cli_state = match self.cli_state {
                             ScState::Ready | ScState::Established => ScState::ShutR,
                             ScState::ShutW => ScState::Closed,
@@ -1427,14 +1778,14 @@ impl TcpSession {
             if self.cli_state.can_read() && !self.req.is_full() && !self.cli_cant_recv {
                 let dst = self.req.writable();
                 let asked = dst.len();
-                let r = self.cli_xprt.recv(self.cli.as_fd(), dst)?;
+                let r = self.cli.recv(&mut self.cli_xprt, dst)?;
                 self.cli_cant_recv = self.polls_cli() && self.cli_xprt.drained(r, asked);
                 match r {
                     // The client left before a byte of the PROXY header.
                     Io::Eof if self.awaiting_proxy_header() => self.refuse_proxy_header(ProxyHdrError::Empty),
                     Io::Closed if self.awaiting_proxy_header() => self.refuse_proxy_header(ProxyHdrError::Abort),
                     Io::Eof => {
-                        raw::shutdown_read(self.cli.as_fd());
+                        self.cli.shutdown_read();
                         self.cli_state = match self.cli_state {
                             ScState::Ready | ScState::Established => ScState::ShutR,
                             ScState::ShutW => ScState::Closed,
@@ -1518,33 +1869,13 @@ impl TcpSession {
             }
         }
 
-        // The next stream with its whole request head, once the last one is over.
-        if (self.cli_state == ScState::Ready || self.cli_state == ScState::Established)
-            && self.h2_stream.is_none()
-            && self.req_headers.is_none()
-            && !self.has_htx
-            && self.req.is_empty()
-        {
-            let keep = self.keep_request_line;
-            if let Some(d) = self.h2_ctx.as_deref_mut().and_then(|h2| crate::h2_bridge::dispatch_next(h2, keep)) {
-                crate::h2_bridge::start_request(self, d);
-                changed = true;
-            }
-        }
+        // The streams are dispatched to their own entries, and their bytes moved, by the
+        // engine (`h2_owner_pass`, T280): the owner only reads and writes the socket.
         if let Some(ref mut h2) = self.h2_ctx {
-            // The DATA frames of the request being served that have come since.
-            if let Some(active) = self.h2_stream.as_deref_mut() {
-                let (moved, trailers) = crate::h2_bridge::pump_request_body(h2, active, &mut self.req);
-                changed |= moved;
-                // What the trailers add to `%U`.
-                if let Some(t) = self.txn.as_mut().and_then(|t| t.req_htx.as_mut()) {
-                    *t += trailers;
-                }
-            }
             // Flush pending frames to client socket
             let pending = h2.tx_buf.len() - h2.tx_consumed;
             if pending > 0 {
-                match self.cli_xprt.send(self.cli.as_fd(), &h2.tx_buf[h2.tx_consumed..])? {
+                match self.cli.send(&mut self.cli_xprt, &h2.tx_buf[h2.tx_consumed..])? {
                     Io::Done(n) if n > 0 => {
                         MuxH2.consume_output(h2, n);
                         // Room for replies again: a demux held on a full output goes on.
@@ -1568,7 +1899,7 @@ impl TcpSession {
         }
 
         // Parse HTTP request headers if in Ready state
-        if self.h2_ctx.is_none() && self.cli_state == ScState::Ready {
+        if !self.is_h2() && self.cli_state == ScState::Ready {
             // Empty lines before a request line are skipped (RFC 9112 section 2.2), as
             // HAProxy's parser does in `H1_MSG_RQBEFORE`.
             let blank = self.req.readable().iter().take_while(|b| matches!(b, b'\r' | b'\n')).count();
@@ -1814,7 +2145,7 @@ impl TcpSession {
 
         // A response to a HEAD that carries a body anyway (the server answered a GET):
         // the body is read to its end and dropped.
-        if self.mode == Mode::Http && self.h2_ctx.is_none() {
+        if self.mode == Mode::Http && !self.is_h2() {
             if let Some(t) = self.txn.as_mut() {
                 let n = t.skip_head_body(self.rep.readable());
                 if n > 0 {
@@ -1827,8 +2158,8 @@ impl TcpSession {
         // Write response data back to the client while writing is permitted: in HTTP, the
         // current response's bytes and no more.
         let window = self.rep_window();
-        if self.h2_ctx.is_none() && self.cli_state.can_write() && window > 0 && !self.res_inspect_pending {
-            match self.cli_xprt.send(self.cli.as_fd(), &self.rep.readable()[..window])? {
+        if !self.is_h2() && self.cli_state.can_write() && window > 0 && !self.res_inspect_pending {
+            match self.cli.send(&mut self.cli_xprt, &self.rep.readable()[..window])? {
                 Io::Done(n) if n > 0 => {
                     if self.mode == Mode::Http {
                         if let Some(t) = self.txn.as_mut() {
@@ -1854,7 +2185,7 @@ impl TcpSession {
     fn process_cli_transitions(&mut self) -> bool {
         // An HTTP connection's life is decided per transaction, by the engine
         // (`end_txn`): a server closing ends a response, not the client connection.
-        if self.h2_ctx.is_some() || self.mode == Mode::Http {
+        if self.is_h2() || self.mode == Mode::Http {
             return false;
         }
 
@@ -1882,7 +2213,7 @@ impl TcpSession {
                         ScState::ShutW | ScState::Closed | ScState::Error
                     );
                     if srv_done_receiving {
-                        raw::shutdown_read(self.cli.as_fd());
+                        self.cli.shutdown_read();
                         self.cli_state = ScState::ShutR;
                         changed = true;
                     }
@@ -2229,7 +2560,7 @@ impl TcpSession {
                         // this timer, still expired, fired on every pass: a core spinning and
                         // a GOAWAY more queued each time (T288, MY-3).
                         h2.send_goaway(last, ibex_proto::h2::H2Error::NoError, &[]);
-                        if let Ok(Io::Done(n)) = self.cli_xprt.send(self.cli.as_fd(), &h2.tx_buf[h2.tx_consumed..]) {
+                        if let Ok(Io::Done(n)) = self.cli.send(&mut self.cli_xprt, &h2.tx_buf[h2.tx_consumed..]) {
                             MuxH2.consume_output(h2, n);
                             self.bytes_out += n as u64;
                         }
@@ -2286,10 +2617,16 @@ impl TcpSession {
         if self.txn.as_ref().is_some_and(|t| t.body_wait.is_some_and(|w| w.tarpit)) {
             return false;
         }
+        // The same for the stream an HTTP/2 connection serves, whose transaction is its
+        // child's (T280).
+        let owner = self.h2_owner();
+        if owner.is_some_and(|o| o.child_holds_timer) {
+            return false;
+        }
         // Once an HTTP request is complete the client owes nothing until its response
         // starts: the wait belongs to `timeout server`, as in HAProxy.
         let awaiting_server = self.mode == Mode::Http
-            && self.txn.as_ref().is_some_and(|t| t.req.is_done() && !t.local && t.error.is_none())
+            && (self.txn.as_ref().is_some_and(|t| t.req.is_done() && !t.local && t.error.is_none()) || owner.is_some_and(|o| o.child_awaits_server))
             && !self.has_pending_output();
         // So is the turnaround before a retry (`SC_ST_TAR`).
         !awaiting_server
@@ -2826,7 +3163,10 @@ mod tests {
     /// the passes run out with body still held, the server-bound buffer emptied and the
     /// client's socket drained, no socket event is coming, and the session must ask to be
     /// run again. It did not: the upload stalled until `timeout client` (1 in ~150 runs of
-    /// `h2_large_request_body` under load).
+    /// `h2_large_request_body` under load). Since each stream has an entry of its own
+    /// (T280), the connection's owner moves the body into the stream's `req` once per run
+    /// and runs the stream when it did; the stream runs its owner after each of its runs.
+    /// Neither may be left with body held and nothing to run either.
     #[test]
     fn an_h2_body_left_when_the_passes_run_out_runs_the_session_again() {
         use std::io::{Read, Write};
@@ -2851,15 +3191,18 @@ mod tests {
         client.write_all(super::H2_CONN_PREFACE).expect("preface");
         client.write_all(&frame(4, 0, 0, &[])).expect("settings");
         client.write_all(&frame(1, 4, 1, &head)).expect("headers");
-        let mut s = super::TcpSession::new_with_mode(cli.into(), super::Mode::Http, Vec::new(), Vec::new(), super::Timeouts::default(), 0, ibex_sched::Tick(1000));
-        s.cli_cant_recv = false;
-        s.process(ibex_sched::Tick(1000)).expect("process");
-        assert_eq!(s.h2_stream.as_ref().map(|a| a.id), Some(1), "the request is dispatched");
+        let mut o = super::TcpSession::new_with_mode(super::ClientSide::Fd(cli.into()), super::Mode::Http, Vec::new(), Vec::new(), super::Timeouts::default(), 0, ibex_sched::Tick(1000));
+        o.cli_cant_recv = false;
+        o.process(ibex_sched::Tick(1000)).expect("process");
+        let d = crate::h2_bridge::dispatch_next(o.h2_ctx.as_deref_mut().expect("h2"), false).expect("the request is dispatched");
+        let mut s = super::TcpSession::h2_child_of(&mut o, (0, ibex_sched::TaskRef::NONE), d.stream);
+        crate::h2_bridge::start_request(&mut s, d);
+        assert_eq!(s.h2_active().map(|a| a.id), Some(1), "the stream is the child's");
         s.txn.as_mut().expect("txn").req_rules_done = true;
 
         // The body, as the mux would have stored it from DATA frames: more than 16 passes
         // move on (one buffer each), so the passes run out before it is all gone.
-        let h2 = s.h2_ctx.as_mut().expect("h2");
+        let h2 = o.h2_ctx.as_mut().expect("h2");
         let st = h2.streams.get_mut(&1).expect("stream");
         for _ in 0..body_len / 10_000 {
             st.rx_htx.push(HtxBlock::Data(vec![b'b'; 10_000]));
@@ -2883,18 +3226,24 @@ mod tests {
         s.attach_server(srv.into(), ibex_sched::Tick(1000));
         s.server_connected(ibex_sched::Tick(1000));
 
-        // Run the session as the engine does: again only on a socket event (the server
+        // Run the two as the engine does: the owner's pass (it moves the body), then the
+        // stream again only if the owner moved something, on a socket event (the server
         // writable while `req` holds bytes; the client has nothing more to send) or when
-        // it asks to be. It must not be left with body held and nothing to wake it.
+        // it asks to be.
+        let done = |s: &super::TcpSession| s.h2_active().expect("served").body.done;
         for run in 0..1000 {
+            let moved = {
+                let Some(super::H2Role::Child(ch)) = s.h2_role.as_deref_mut() else { panic!("a child") };
+                crate::h2_bridge::pump_request_body(o.h2_ctx.as_deref_mut().expect("h2"), &mut ch.stream, &mut s.req).0
+            };
             s.process(ibex_sched::Tick(1000)).expect("process");
-            if s.h2_stream.as_ref().expect("served").body.done && s.req.is_empty() {
+            if done(&s) && s.req.is_empty() {
                 break;
             }
-            let woken = !s.req.is_empty() || s.wants_rerun();
-            assert!(woken, "run {run}: {} body bytes moved on, the rest held with nothing to run the session again", s.h2_stream.as_ref().expect("served").body.consumed);
+            let woken = moved || !s.req.is_empty() || s.wants_rerun();
+            assert!(woken, "run {run}: {} body bytes moved on, the rest held with nothing to run the session again", s.h2_active().expect("served").body.consumed);
         }
-        assert!(s.h2_stream.as_ref().expect("served").body.done, "the body was moved on whole");
+        assert!(done(&s), "the body was moved on whole");
         drop(s);
         assert!(reader.join().expect("reader") > body_len, "the server got the head and the body");
     }
