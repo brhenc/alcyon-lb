@@ -90,7 +90,7 @@ in Fedora's repositories, which made the first `dnf install` fail as a whole).
 - Resource and operations parameters below met.
 - One week of the practical setup running (topology 5, light constant load) with no
   restart, no error not also produced by HAProxy, and RSS flat.
-- **Convergence rule (proposed, not yet accepted by the user).** Each verification method
+- **Convergence rule.** Each verification method
   (V&V battery + soak, red-team scorecard, differential fuzz, libFuzzer) has run one full
   cycle on the release candidate with no new finding of severity medium or above. The
   record is `data/findings.csv` and `data/verification_runs.csv`; `python3 tools/findings.py`
