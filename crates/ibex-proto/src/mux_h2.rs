@@ -750,7 +750,7 @@ impl MuxH2 {
             let active = ctx
                 .streams
                 .values()
-                .filter(|s| s.state == H2StreamState::Open || s.state == H2StreamState::HalfClosedRemote)
+                .filter(|s| matches!(s.state, H2StreamState::Open | H2StreamState::HalfClosedRemote | H2StreamState::HalfClosedLocal))
                 .count();
             if active >= ctx.max_concurrent_streams as usize {
                 ctx.send_rst_stream(stream_id, H2Error::RefusedStream);

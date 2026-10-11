@@ -7404,6 +7404,15 @@ fn h2_request_open(sess: &TcpSession, txn: &crate::txn::HttpTxn) -> bool {
     txn.req.is_done() && !txn.local && sess.h2_active().is_some_and(|a| !a.body.done)
 }
 
+/// A stream of an HTTP/2 connection whose reply the proxy made itself (`http-request
+/// return`, `deny`, ...) is over while the client's request is not: it ends there, and
+/// `h2_child_released` resets it with `NO_ERROR` so the client stops sending, as `HAProxy`
+/// does (measured on 3.5-dev8, T314). A response from a server does not do this: `HAProxy`
+/// leaves such a stream open until the request ends.
+fn h2_local_reply_over_open_request(sess: &TcpSession, txn: &crate::txn::HttpTxn) -> bool {
+    txn.local && txn.rsp.is_done() && sess.h2_active().is_some_and(|a| !a.body.done)
+}
+
 /// Ends the HTTP session: the server connection is pooled if `reusable`, the client
 /// connection closed.
 fn close_http_session(
@@ -8325,7 +8334,7 @@ impl EngineDispatcher<'_> {
         };
         if drained && txn.aborted {
             close_http_session(entry, proxies, fdtab, poller, idle_pool, false);
-        } else if drained && txn.finished() && !h2_request_open(&entry.sess, txn) {
+        } else if drained && (txn.finished() || h2_local_reply_over_open_request(&entry.sess, txn)) && !h2_request_open(&entry.sess, txn) {
             Self::end_txn(entry, proxies, fdtab, poller, idle_pool, wake_queue, now, pid);
         }
         admin

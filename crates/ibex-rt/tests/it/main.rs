@@ -106,6 +106,7 @@ mod h1_authority;
 mod h1_case_adjust;
 mod h2_alpn_settings;
 mod h2_buffering;
+mod h2_early_response_rst;
 mod h2_concurrent_streams;
 mod h2_connection_end_log;
 mod h2_flood_knobs;
