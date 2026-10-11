@@ -353,6 +353,14 @@ impl Scheduler {
 
     // ---- public scheduling API ----------------------------------------------------
 
+    /// Makes room, at boot, for `additional` more tasks that will each wait on a timer:
+    /// the task arena and the timer tree grow once to the size needed rather than by
+    /// doubling (T304: 60,000 health checks grew both to 65,536 slots).
+    pub fn reserve(&mut self, additional: usize) {
+        self.tasks.reserve(additional);
+        self.timers.reserve(additional);
+    }
+
     /// Allocates a task.
     pub fn create(&mut self, kind: WorkKind) -> Option<TaskRef> {
         self.tasks.alloc(kind)

@@ -1534,7 +1534,9 @@ pub struct Proxy {
     pub server_retr: Arc<std::sync::Mutex<std::collections::HashMap<usize, (u64, u64, u64)>>>,
     /// Streams assigned to each server per second (`srv_sess_rate`).
     pub server_sess_rates: Arc<Vec<RateCtr>>,
-    pub server_check_configs: Vec<Option<Box<ServerCheckConfig>>>,
+    /// Each server's check parameters, `None` for a server without `check`. The servers
+    /// whose parameters are the same share one (T304: 60,000 servers of a backend hold one).
+    pub server_check_configs: Vec<Option<Arc<ServerCheckConfig>>>,
     /// Each server's TLS (`server ... ssl`), `None` for a plaintext one (T113).
     pub server_tls: Vec<Option<Arc<crate::srv_tls::ServerTls>>>,
     /// Each server's health-check TLS (`check-ssl`, or `ssl` inherited), `None` for
@@ -3216,31 +3218,7 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, list
         .map(|ast| Arc::new(init_stick_table(ast, &listen.name)));
 
     let server_count = listen.servers.len();
-    let mut server_check_configs = Vec::with_capacity(server_count);
-    for s in &listen.servers {
-        if s.check {
-            let mut cfg = ServerCheckConfig::default();
-            if let Some(inter) = s.inter {
-                cfg.inter = inter;
-            }
-            cfg.fastinter_ms = s.fastinter_ms();
-            cfg.downinter_ms = s.downinter_ms();
-            if let Some(fall) = s.fall {
-                cfg.fall = fall;
-            }
-            if let Some(rise) = s.rise {
-                cfg.rise = rise;
-            }
-            if let Some(chk_timeout) = listen.timeouts.check {
-                cfg.timeout = chk_timeout;
-            } else if let Some(inter) = s.inter {
-                cfg.timeout = inter;
-            }
-            server_check_configs.push(Some(Box::new(cfg)));
-        } else {
-            server_check_configs.push(None);
-        }
-    }
+    let server_check_configs = server_check_configs(&listen.servers, listen.timeouts.check);
 
     Proxy {
         id: usize_to_u32(proxy_idx),
@@ -3499,31 +3477,7 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, be:
         .map(|ast| Arc::new(init_stick_table(ast, &be.name)));
 
     let server_count = be.servers.len();
-    let mut server_check_configs = Vec::with_capacity(server_count);
-    for s in &be.servers {
-        if s.check {
-            let mut cfg = ServerCheckConfig::default();
-            if let Some(inter) = s.inter {
-                cfg.inter = inter;
-            }
-            cfg.fastinter_ms = s.fastinter_ms();
-            cfg.downinter_ms = s.downinter_ms();
-            if let Some(fall) = s.fall {
-                cfg.fall = fall;
-            }
-            if let Some(rise) = s.rise {
-                cfg.rise = rise;
-            }
-            if let Some(chk_timeout) = be.timeouts.check {
-                cfg.timeout = chk_timeout;
-            } else if let Some(inter) = s.inter {
-                cfg.timeout = inter;
-            }
-            server_check_configs.push(Some(Box::new(cfg)));
-        } else {
-            server_check_configs.push(None);
-        }
-    }
+    let server_check_configs = server_check_configs(&be.servers, be.timeouts.check);
 
     Proxy {
         id: usize_to_u32(proxy_idx),
@@ -3633,15 +3587,52 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, be:
     }
 }
 
+/// The check parameters of each server of a section (`inter`, `fastinter`, `downinter`,
+/// `rise`, `fall`, and `timeout check` or else `inter`): one shared copy for each run of
+/// servers that have the same, which is every server of a backend whose `server` lines
+/// differ only by name and address.
+fn server_check_configs(servers: &[ibex_config::ast::Server], check_timeout: Option<Duration>) -> Vec<Option<Arc<ServerCheckConfig>>> {
+    let mut last: Option<Arc<ServerCheckConfig>> = None;
+    servers
+        .iter()
+        .map(|s| {
+            if !s.check {
+                return None;
+            }
+            let mut cfg = ServerCheckConfig::default();
+            if let Some(inter) = s.inter {
+                cfg.inter = inter;
+            }
+            cfg.fastinter_ms = s.fastinter_ms();
+            cfg.downinter_ms = s.downinter_ms();
+            if let Some(fall) = s.fall {
+                cfg.fall = fall;
+            }
+            if let Some(rise) = s.rise {
+                cfg.rise = rise;
+            }
+            if let Some(chk_timeout) = check_timeout {
+                cfg.timeout = chk_timeout;
+            } else if let Some(inter) = s.inter {
+                cfg.timeout = inter;
+            }
+            let shared = match last.take() {
+                Some(prev) if *prev == cfg => prev,
+                _ => Arc::new(cfg),
+            };
+            last = Some(Arc::clone(&shared));
+            Some(shared)
+        })
+        .collect()
+}
+
 fn init_checks(proxies: &[Proxy], scheduler: &mut Scheduler, now: Tick) -> Vec<ServerCheckState> {
     let mut checks = Vec::with_capacity(proxies.iter().map(|p| p.server_check_configs.iter().flatten().count()).sum());
+    // One task and one timer per check.
+    scheduler.reserve(checks.capacity());
     for (proxy_idx, proxy) in proxies.iter().enumerate() {
         for (server_idx, srv_addr) in proxy.servers.iter().enumerate() {
-            let Some(check_cfg) = proxy
-                .server_check_configs
-                .get(server_idx)
-                .and_then(|c| c.as_deref().cloned())
-            else {
+            let Some(check_cfg) = proxy.server_check_configs.get(server_idx).and_then(Clone::clone) else {
                 continue;
             };
             let mut check = ServerCheckState::new(proxy_idx, server_idx, srv_addr, check_cfg, now);

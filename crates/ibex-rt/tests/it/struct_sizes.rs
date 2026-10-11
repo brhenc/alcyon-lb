@@ -29,7 +29,7 @@ fn proxy_stays_1656_bytes() {
 #[test]
 fn per_server_check_config_is_boxed() {
     assert!(
-        size_of::<Option<Box<ibex_rt::check::ServerCheckConfig>>>() == 8,
+        size_of::<Option<std::sync::Arc<ibex_rt::check::ServerCheckConfig>>>() == 8,
         "the per-server check config must stay one pointer"
     );
 }
@@ -37,7 +37,9 @@ fn per_server_check_config_is_boxed() {
 #[test]
 fn server_check_state_stays_small() {
     let n = size_of::<ibex_rt::check::ServerCheckState>();
-    assert!(n <= 464, "ServerCheckState grew to {n} bytes (bound 464): one is held per checked server, box the new field");
+    // 440 before T304, which moved the state of a running check into `CheckRun` (held only
+    // while the check runs) and shares the check parameters per backend.
+    assert!(n <= 224, "ServerCheckState grew to {n} bytes (bound 224): one is held per checked server, box the new field or put it in CheckRun");
 }
 
 /// A session is held for every client connection, idle ones included, in the worker's

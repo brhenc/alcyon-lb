@@ -1026,6 +1026,9 @@ pub(crate) fn register_section_checks(
     tcp_check: bool,
     servers: &[Server],
 ) {
+    // The servers of a section mostly resolve to the same check (the server's `port` is
+    // folded in, so not always): they share the previous one's when it is equal.
+    let mut shared: Option<std::sync::Arc<ResolvedCheckConfig>> = None;
     for (server_idx, server) in servers.iter().enumerate() {
         if !server.check {
             continue;
@@ -1054,14 +1057,19 @@ pub(crate) fn register_section_checks(
             ResolvedCheckConfig::TcpConnect
         };
 
-        register_resolved_check(proxy_idx, server_idx, resolved.clone());
-        register_resolved_check_for_addr(server.addr, resolved.clone());
+        let resolved = match shared.take() {
+            Some(prev) if *prev == resolved => prev,
+            _ => std::sync::Arc::new(resolved),
+        };
+        register_resolved_check(proxy_idx, server_idx, std::sync::Arc::clone(&resolved));
+        register_resolved_check_for_addr(server.addr, std::sync::Arc::clone(&resolved));
         if let Some(port) = server.check_port {
             register_resolved_check_for_addr(
                 SocketAddr::new(server.addr.ip(), port),
-                resolved,
+                std::sync::Arc::clone(&resolved),
             );
         }
+        shared = Some(resolved);
     }
 }
 

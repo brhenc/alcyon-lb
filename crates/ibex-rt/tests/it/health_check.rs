@@ -73,10 +73,10 @@ fn health_check_detects_down_server_and_routes_to_live_server() {
 
     // Configure faster check intervals for test speed
     for check in &mut engine.checks {
-        check.config.inter = Duration::from_millis(50);
-        check.config.timeout = Duration::from_millis(100);
-        check.config.fall = 2;
-        check.config.rise = 1;
+        Arc::make_mut(&mut check.config).inter = Duration::from_millis(50);
+        Arc::make_mut(&mut check.config).timeout = Duration::from_millis(100);
+        Arc::make_mut(&mut check.config).fall = 2;
+        Arc::make_mut(&mut check.config).rise = 1;
     }
 
     // Run engine passes to execute health checks
@@ -181,10 +181,10 @@ fn a_server_going_down_emits_a_syslog_datagram() {
 
     let mut engine = Engine::new(&config, 1024).expect("Engine::new");
     for check in &mut engine.checks {
-        check.config.inter = Duration::from_millis(20);
-        check.config.timeout = Duration::from_millis(50);
-        check.config.fall = 1;
-        check.config.rise = 1;
+        Arc::make_mut(&mut check.config).inter = Duration::from_millis(20);
+        Arc::make_mut(&mut check.config).timeout = Duration::from_millis(50);
+        Arc::make_mut(&mut check.config).fall = 1;
+        Arc::make_mut(&mut check.config).rise = 1;
     }
 
     let start = std::time::Instant::now();
@@ -248,9 +248,9 @@ fn no_log_directive_means_no_datagrams() {
 
     let mut engine = Engine::new(&config, 1024).expect("Engine::new");
     for check in &mut engine.checks {
-        check.config.inter = Duration::from_millis(20);
-        check.config.timeout = Duration::from_millis(50);
-        check.config.fall = 1;
+        Arc::make_mut(&mut check.config).inter = Duration::from_millis(20);
+        Arc::make_mut(&mut check.config).timeout = Duration::from_millis(50);
+        Arc::make_mut(&mut check.config).fall = 1;
     }
 
     let start = std::time::Instant::now();
@@ -338,4 +338,33 @@ fn first_check_result_is_reported_even_when_the_health_counter_does_not_move() {
         "an unchanged status code with an unchanged health counter must not be reported \
          (got {repeat:?})"
     );
+}
+
+/// T304: the servers of a backend share one copy of what their checks are (the parameters,
+/// the resolved `option httpchk` / `http-check` rules and their compiled log-formats); a
+/// server whose parameters differ has its own. 60,000 checked servers used to hold 60,000
+/// copies (`request_allocations::sixty_thousand_backends_with_checks_memory_bounded`).
+#[test]
+fn the_servers_of_a_backend_share_their_check_configuration() {
+    let text = "defaults\n    mode http\n    timeout connect 1s\n    timeout client 1s\n    timeout server 1s\n\
+                backend be\n    option httpchk GET /health\n    http-check send hdr x-lf \"%[str(a)]\"\n\
+                    server s1 127.0.0.1:1 check inter 60s\n\
+                    server s2 127.0.0.1:2 check inter 60s\n\
+                    server s3 127.0.0.1:3 check inter 60s\n\
+                    server s4 127.0.0.1:4 check inter 30s\n";
+    let config = ibex_config::parse_str(text).expect("parse");
+    let engine = Engine::new(&config, 64).expect("Engine::new");
+    let [a, b, c, d] = &engine.checks[..] else { panic!("four checks, got {}", engine.checks.len()) };
+
+    assert!(Arc::ptr_eq(&a.config, &b.config) && Arc::ptr_eq(&a.config, &c.config));
+    assert!(!Arc::ptr_eq(&a.config, &d.config), "s4 has its own inter");
+    assert_eq!(d.config.inter, Duration::from_secs(30));
+
+    let resolved = |i: usize| engine.checks[i].resolved_config.clone().expect("an httpchk check");
+    assert!(Arc::ptr_eq(&resolved(0), &resolved(1)) && Arc::ptr_eq(&resolved(0), &resolved(3)));
+    let send = |i: usize| engine.checks[i].http_send.clone().expect("compiled send formats");
+    assert!(Arc::ptr_eq(&send(0), &send(2)) && Arc::ptr_eq(&send(0), &send(3)));
+
+    // Between checks no server holds the state of a running one.
+    assert!(engine.checks.iter().all(|c| !c.run.is_held()));
 }

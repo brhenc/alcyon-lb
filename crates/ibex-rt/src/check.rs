@@ -204,7 +204,9 @@ pub struct ServerCheckState {
     pub proxy_idx: usize,
     pub server_idx: usize,
     pub addr: SocketAddr,
-    pub config: ServerCheckConfig,
+    /// The check parameters: one copy per distinct server line, shared by every server of
+    /// the backend that has the same (`Proxy::server_check_configs`, T304).
+    pub config: Arc<ServerCheckConfig>,
     /// What the server is: the operator's admin state combined with the checks' verdict.
     /// `Down` under a drain is the server the checks found dead ([`Self::published`]).
     pub status: ServerStatus,
@@ -223,30 +225,103 @@ pub struct ServerCheckState {
     pub sock: Option<OwnedFd>,
     /// The transport over `sock`: plaintext, or the TLS of `tls` (T113).
     pub xprt: ServerXprt,
+    /// The protocol state of the check in progress (T304): held only while
+    /// a check runs, from a per-thread pool.
+    pub run: CheckRunSlot,
     /// The server line's check TLS (`check-ssl`, or `ssl` inherited), `None` for plaintext.
     pub tls: Option<Arc<CheckTls>>,
-    /// The `tcp-check connect` step (after the first) whose connection is being opened:
-    /// while it is set, the socket in `sock` is that step's, not the previous step's.
-    pub tcp_connect_step: Option<usize>,
-    pub check_fd: Option<RawFd>,
     pub exp: Tick,
     pub next_check: Tick,
     pub last_status_desc: &'static str,
     pub last_status_code: &'static str,
     pub http_code: Option<u16>,
     pub last_status_info: Option<String>,
-    pub resolved_config: Option<ResolvedCheckConfig>,
-    pub sub_state: CheckSubState,
-    /// The `http-check send` log-formats, compiled once from `resolved_config`.
-    pub http_send: Option<Box<HttpSendFormats>>,
-    /// The check's variables (`http-check set-var`, scope `check`), for the run in progress.
-    pub vars: HashMap<String, String>,
+    /// The backend's resolved check, shared by its servers (T304).
+    pub resolved_config: Option<Arc<ResolvedCheckConfig>>,
+    /// The `http-check send` log-formats, compiled once from `resolved_config` and shared
+    /// with the servers that share it.
+    pub http_send: Option<Arc<HttpSendFormats>>,
     pub check_duration_ms: u32,
     pub check_start_tick: Tick,
     pub total_checks: u64,
     pub failed_checks: u64,
     pub down_transitions: u64,
     pub task: TaskRef,
+}
+
+/// The state of one check while it runs: where the protocol is, and its variables. A server
+/// between two checks holds none of it ([`CheckRunSlot`]).
+#[derive(Debug)]
+pub struct CheckRun {
+    /// The `tcp-check connect` step (after the first) whose connection is being opened:
+    /// while it is set, the socket in `sock` is that step's, not the previous step's.
+    pub tcp_connect_step: Option<usize>,
+    pub check_fd: Option<RawFd>,
+    pub sub_state: CheckSubState,
+    /// The check's variables (`http-check set-var`, scope `check`), for the run in progress.
+    pub vars: HashMap<String, String>,
+}
+
+impl CheckRun {
+    fn idle() -> Self {
+        CheckRun {
+            tcp_connect_step: None,
+            check_fd: None,
+            sub_state: CheckSubState::Idle,
+            vars: HashMap::new(),
+        }
+    }
+}
+
+thread_local! {
+    /// The runs of finished checks, for the next ones: a check takes one when it starts
+    /// and gives it back when it ends ([`cleanup_check_socket`]), so after the first round
+    /// a check allocates nothing for it, and only as many exist as checks ever ran at once
+    /// on this thread (`HAProxy` allocates a check's buffers when it runs, likewise).
+    static RUN_POOL: std::cell::RefCell<Vec<Box<CheckRun>>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// What a server reads of a check that is not running.
+    static IDLE_RUN: &'static CheckRun = Box::leak(Box::new(CheckRun::idle()));
+}
+
+/// A server's [`CheckRun`]: none between checks (T304: 60,000 servers paid ~170 bytes each
+/// for state that only the few checks in flight use). Reading it between checks reads an
+/// idle run; writing to it takes one from the pool.
+#[derive(Debug, Default)]
+pub struct CheckRunSlot(Option<Box<CheckRun>>);
+
+impl CheckRunSlot {
+    /// Ends the run: the state goes back to the pool, reset.
+    fn release(&mut self) {
+        if let Some(mut run) = self.0.take() {
+            run.vars.clear();
+            run.sub_state = CheckSubState::Idle;
+            run.tcp_connect_step = None;
+            run.check_fd = None;
+            RUN_POOL.with(|p| p.borrow_mut().push(run));
+        }
+    }
+
+    /// Whether a check holds a run (a test hook: the pool is the only other owner).
+    #[must_use]
+    pub const fn is_held(&self) -> bool {
+        self.0.is_some()
+    }
+}
+
+impl std::ops::Deref for CheckRunSlot {
+    type Target = CheckRun;
+    fn deref(&self) -> &CheckRun {
+        match &self.0 {
+            Some(run) => run,
+            None => IDLE_RUN.with(|r| *r),
+        }
+    }
+}
+
+impl std::ops::DerefMut for CheckRunSlot {
+    fn deref_mut(&mut self) -> &mut CheckRun {
+        self.0.get_or_insert_with(|| RUN_POOL.with(|p| p.borrow_mut().pop()).unwrap_or_else(|| Box::new(CheckRun::idle())))
+    }
 }
 
 /// What a completed health check means for logging.
@@ -277,16 +352,16 @@ impl ServerCheckState {
         proxy_idx: usize,
         server_idx: usize,
         addr: SocketAddr,
-        config: ServerCheckConfig,
+        config: impl Into<Arc<ServerCheckConfig>>,
         now: Tick,
     ) -> Self {
         let resolved_config = get_resolved_check_config(proxy_idx, server_idx, addr);
-        let http_send = HttpSendFormats::for_config(resolved_config.as_ref()).map(Box::new);
+        let http_send = HttpSendFormats::shared_for(resolved_config.as_ref());
         ServerCheckState {
             proxy_idx,
             server_idx,
             addr,
-            config,
+            config: config.into(),
             status: ServerStatus::Up,
             admin: ServerStatus::Up,
             enabled: true,
@@ -298,9 +373,8 @@ impl ServerCheckState {
             in_progress: false,
             sock: None,
             xprt: ServerXprt::Plain,
+            run: CheckRunSlot::default(),
             tls: None,
-            tcp_connect_step: None,
-            check_fd: None,
             exp: Tick::ETERNITY,
             next_check: now,
             last_status_desc: "Initial state",
@@ -314,9 +388,7 @@ impl ServerCheckState {
             http_code: None,
             last_status_info: None,
             resolved_config,
-            sub_state: CheckSubState::Idle,
             http_send,
-            vars: HashMap::new(),
             check_duration_ms: 0,
             check_start_tick: now,
             total_checks: 0,
@@ -327,7 +399,7 @@ impl ServerCheckState {
     }
 
     /// The ceiling of the health counter: fully healthy.
-    const fn full_health(&self) -> u32 {
+    fn full_health(&self) -> u32 {
         self.config.rise + self.config.fall - 1
     }
 
@@ -599,6 +671,25 @@ pub struct HttpSendFormats {
 }
 
 impl HttpSendFormats {
+    /// The formats of `cfg`, compiled once per resolved check: the servers that share a
+    /// resolved check share its formats too.
+    fn shared_for(cfg: Option<&Arc<ResolvedCheckConfig>>) -> Option<Arc<Self>> {
+        thread_local! {
+            static LAST: std::cell::RefCell<Option<(Arc<ResolvedCheckConfig>, Option<Arc<HttpSendFormats>>)>> =
+                const { std::cell::RefCell::new(None) };
+        }
+        let cfg = cfg?;
+        LAST.with(|last| {
+            let mut last = last.borrow_mut();
+            if let Some((_, fmts)) = last.as_ref().filter(|(prev, _)| Arc::ptr_eq(prev, cfg)) {
+                return fmts.clone();
+            }
+            let fmts = Self::for_config(Some(cfg)).map(Arc::new);
+            *last = Some((Arc::clone(cfg), fmts.clone()));
+            fmts
+        })
+    }
+
     fn for_config(cfg: Option<&ResolvedCheckConfig>) -> Option<Self> {
         let Some(ResolvedCheckConfig::Http(chk)) = cfg else { return None };
         let reg = crate::engine::sample_registry();
@@ -621,7 +712,7 @@ fn render_check_formats(
     proxies: &[Proxy],
 ) -> RenderedSend {
     let reg = crate::engine::sample_registry();
-    with_check_ctx(check, px, proxies, &check.vars, None, |data, ctx| {
+    with_check_ctx(check, px, proxies, &check.run.vars, None, |data, ctx| {
         let render = |f: &LogFormat| f.render_value(data, reg, ctx);
         (fmts.uri.as_ref().map(render), fmts.body.as_ref().map(render), fmts.hdrs.iter().map(|h| h.as_ref().map(render)).collect())
     })
@@ -1183,7 +1274,7 @@ fn http_verdict(check: &ServerCheckState, chk: &ResolvedHttpCheck, buf: &[u8], l
     let reg = crate::engine::sample_registry();
     // The rules run in order from the same starting variables each time more of the
     // response is in; what one sets is for the ones after it.
-    let mut vars = check.vars.clone();
+    let mut vars = check.run.vars.clone();
     for rule in &chk.rules {
         match rule {
             ResolvedHttpRule::Expect(e) => {
@@ -1259,7 +1350,7 @@ pub fn step_check(
 
     if check.resolved_config.is_none() {
         check.resolved_config = get_resolved_check_config(check.proxy_idx, check.server_idx, check.addr);
-        check.http_send = HttpSendFormats::for_config(check.resolved_config.as_ref()).map(Box::new);
+        check.http_send = HttpSendFormats::shared_for(check.resolved_config.as_ref());
     }
 
     if check.in_progress {
@@ -1268,7 +1359,7 @@ pub fn step_check(
 
         if timed_out {
             let handshaking = check.xprt.is_tls() && !check.xprt.is_ready();
-            let (code, desc, info) = match &check.sub_state {
+            let (code, desc, info) = match &check.run.sub_state {
                 _ if handshaking => ("L6TOUT", "Layer6 timeout", None),
                 CheckSubState::TcpConnecting
                 | CheckSubState::HttpConnecting { .. }
@@ -1297,7 +1388,7 @@ pub fn step_check(
             });
         }
 
-        let Some(raw_fd) = check.check_fd else {
+        let Some(raw_fd) = check.run.check_fd else {
             cleanup_check_socket(check, fdtab, poller);
             let next = check.schedule_next(now);
             return Ok(CheckStep::pending(Some(next)));
@@ -1305,7 +1396,7 @@ pub fn step_check(
 
         let ready = fdtab.ready(raw_fd);
 
-        match check.sub_state.clone() {
+        match check.run.sub_state.clone() {
             CheckSubState::TcpConnecting => {
                 if !ready.writable && !ready.readable {
                     return Ok(CheckStep::pending(Some(check.exp)));
@@ -1364,9 +1455,9 @@ pub fn step_check(
                         Handshake::Pending => return Ok(CheckStep::pending(Some(check.exp))),
                         Handshake::Failed(info) => return Ok(fail_check_l6(check, fdtab, poller, now, duration, info)),
                     }
-                    match check.resolved_config.clone() {
+                    match check.resolved_config.as_deref().cloned() {
                         Some(ResolvedCheckConfig::Redis) => {
-                            check.sub_state = CheckSubState::RedisRunning {
+                            check.run.sub_state = CheckSubState::RedisRunning {
                                 phase: 0,
                                 send_offset: 0,
                                 recv_buf: Vec::new(),
@@ -1378,7 +1469,7 @@ pub fn step_check(
                             if let Some(sock) = check.sock.as_ref() {
                                 let _ = poller.modify(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), true, false);
                             }
-                            check.sub_state = CheckSubState::SmtpRunning {
+                            check.run.sub_state = CheckSubState::SmtpRunning {
                                 phase: 0,
                                 cmd: cmd.unwrap_or_else(|| "HELO localhost".to_string()),
                                 send_offset: 0,
@@ -1387,7 +1478,7 @@ pub fn step_check(
                             progress_smtp_check(check, fdtab, poller, now, duration)
                         }
                         Some(ResolvedCheckConfig::Ldap) => {
-                            check.sub_state = CheckSubState::LdapRunning {
+                            check.run.sub_state = CheckSubState::LdapRunning {
                                 phase: 0,
                                 send_offset: 0,
                                 recv_buf: Vec::new(),
@@ -1401,7 +1492,7 @@ pub fn step_check(
                             if let Some(sock) = check.sock.as_ref() {
                                 let _ = poller.modify(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), initial_interest.readable, initial_interest.writable);
                             }
-                            check.sub_state = CheckSubState::MysqlRunning {
+                            check.run.sub_state = CheckSubState::MysqlRunning {
                                 phase: 0,
                                 user,
                                 version,
@@ -1412,7 +1503,7 @@ pub fn step_check(
                             progress_mysql_check(check, fdtab, poller, now, duration)
                         }
                         Some(ResolvedCheckConfig::Pgsql { user }) => {
-                            check.sub_state = CheckSubState::PgsqlRunning {
+                            check.run.sub_state = CheckSubState::PgsqlRunning {
                                 phase: 0,
                                 user,
                                 send_offset: 0,
@@ -1422,7 +1513,7 @@ pub fn step_check(
                             progress_pgsql_check(check, fdtab, poller, now, duration)
                         }
                         Some(ResolvedCheckConfig::SslHello) => {
-                            check.sub_state = CheckSubState::SslHelloRunning {
+                            check.run.sub_state = CheckSubState::SslHelloRunning {
                                 phase: 0,
                                 send_offset: 0,
                                 recv_buf: Vec::new(),
@@ -1481,7 +1572,7 @@ pub fn step_check(
                     if let Some(sock) = check.sock.as_ref() {
                         let _ = poller.modify(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), false, true);
                     }
-                    check.sub_state = CheckSubState::HttpSending {
+                    check.run.sub_state = CheckSubState::HttpSending {
                         req_buf,
                         send_offset,
                     };
@@ -1545,22 +1636,23 @@ pub fn step_check(
         check.http_code = None;
         check.last_status_info = None;
 
-        let resolved = check.resolved_config.clone().unwrap_or(ResolvedCheckConfig::TcpConnect);
+        // A reference to the backend's shared check (it was a deep copy per run).
+        let resolved = check.resolved_config.clone();
 
-        match resolved {
+        match resolved.as_deref().unwrap_or(&ResolvedCheckConfig::TcpConnect) {
             ResolvedCheckConfig::Http(chk) => {
                 let base = chk.connect_addr.map_or(check.addr.ip(), |a| a.ip());
                 let target_addr = SocketAddr::new(base, chk.check_port.unwrap_or(check.addr.port()));
                 // The variables of this run: the rules before the request set them.
                 let mut vars = HashMap::new();
                 run_var_rules(check, proxies, &chk.pre_rules, &mut vars, None);
-                check.vars = vars;
-                let payload = build_http_request_payload(&chk, target_addr, check, proxies);
+                check.run.vars = vars;
+                let payload = build_http_request_payload(chk, target_addr, check, proxies);
 
                 match connect_check(check, Some(target_addr)) {
                     Ok((sock, _)) => {
                         let raw_fd = sock.as_raw_fd();
-                        check.check_fd = Some(raw_fd);
+                        check.run.check_fd = Some(raw_fd);
                         let timeout_ms =
                             u32::try_from(check.config.timeout.as_millis()).unwrap_or(u32::MAX);
                         check.exp = now.add(timeout_ms);
@@ -1584,7 +1676,7 @@ pub fn step_check(
 
                         // Even a connection that is already up is waited for: the poller
                         // reports its socket writable at once.
-                        check.sub_state = CheckSubState::HttpConnecting {
+                        check.run.sub_state = CheckSubState::HttpConnecting {
                             req_buf: payload,
                             send_offset: 0,
                         };
@@ -1609,7 +1701,7 @@ pub fn step_check(
                 }
             }
             ResolvedCheckConfig::TcpSteps(_) => {
-                check.sub_state = CheckSubState::TcpRunning {
+                check.run.sub_state = CheckSubState::TcpRunning {
                     step_idx: 0,
                     send_offset: 0,
                     recv_buf: Vec::new(),
@@ -1624,7 +1716,7 @@ pub fn step_check(
                 match connect_check(check, None) {
                     Ok((sock, immediate)) => {
                         let raw_fd = sock.as_raw_fd();
-                        check.check_fd = Some(raw_fd);
+                        check.run.check_fd = Some(raw_fd);
                         let timeout_ms = u32::try_from(check.config.timeout.as_millis()).unwrap_or(u32::MAX);
                         check.exp = now.add(timeout_ms);
                         check.in_progress = true;
@@ -1633,14 +1725,14 @@ pub fn step_check(
                         check.sock = Some(sock);
 
                         if immediate {
-                            check.sub_state = CheckSubState::RedisRunning {
+                            check.run.sub_state = CheckSubState::RedisRunning {
                                 phase: 0,
                                 send_offset: 0,
                                 recv_buf: Vec::new(),
                             };
                             progress_redis_check(check, fdtab, poller, now, 0)
                         } else {
-                            check.sub_state = CheckSubState::ProtoConnecting { target_addr: check.addr };
+                            check.run.sub_state = CheckSubState::ProtoConnecting { target_addr: check.addr };
                             Ok(CheckStep::pending(Some(check.exp)))
                         }
                     }
@@ -1657,7 +1749,7 @@ pub fn step_check(
                 match connect_check(check, None) {
                     Ok((sock, immediate)) => {
                         let raw_fd = sock.as_raw_fd();
-                        check.check_fd = Some(raw_fd);
+                        check.run.check_fd = Some(raw_fd);
                         let timeout_ms = u32::try_from(check.config.timeout.as_millis()).unwrap_or(u32::MAX);
                         check.exp = now.add(timeout_ms);
                         check.in_progress = true;
@@ -1666,15 +1758,15 @@ pub fn step_check(
                         check.sock = Some(sock);
 
                         if immediate {
-                            check.sub_state = CheckSubState::SmtpRunning {
+                            check.run.sub_state = CheckSubState::SmtpRunning {
                                 phase: 0,
-                                cmd: cmd.unwrap_or_else(|| "HELO localhost".to_string()),
+                                cmd: cmd.clone().unwrap_or_else(|| "HELO localhost".to_string()),
                                 send_offset: 0,
                                 recv_buf: Vec::new(),
                             };
                             progress_smtp_check(check, fdtab, poller, now, 0)
                         } else {
-                            check.sub_state = CheckSubState::ProtoConnecting { target_addr: check.addr };
+                            check.run.sub_state = CheckSubState::ProtoConnecting { target_addr: check.addr };
                             Ok(CheckStep::pending(Some(check.exp)))
                         }
                     }
@@ -1691,7 +1783,7 @@ pub fn step_check(
                 match connect_check(check, None) {
                     Ok((sock, immediate)) => {
                         let raw_fd = sock.as_raw_fd();
-                        check.check_fd = Some(raw_fd);
+                        check.run.check_fd = Some(raw_fd);
                         let timeout_ms = u32::try_from(check.config.timeout.as_millis()).unwrap_or(u32::MAX);
                         check.exp = now.add(timeout_ms);
                         check.in_progress = true;
@@ -1700,14 +1792,14 @@ pub fn step_check(
                         check.sock = Some(sock);
 
                         if immediate {
-                            check.sub_state = CheckSubState::LdapRunning {
+                            check.run.sub_state = CheckSubState::LdapRunning {
                                 phase: 0,
                                 send_offset: 0,
                                 recv_buf: Vec::new(),
                             };
                             progress_ldap_check(check, fdtab, poller, now, 0)
                         } else {
-                            check.sub_state = CheckSubState::ProtoConnecting { target_addr: check.addr };
+                            check.run.sub_state = CheckSubState::ProtoConnecting { target_addr: check.addr };
                             Ok(CheckStep::pending(Some(check.exp)))
                         }
                     }
@@ -1724,27 +1816,27 @@ pub fn step_check(
                 match connect_check(check, None) {
                     Ok((sock, immediate)) => {
                         let raw_fd = sock.as_raw_fd();
-                        check.check_fd = Some(raw_fd);
+                        check.run.check_fd = Some(raw_fd);
                         let timeout_ms = u32::try_from(check.config.timeout.as_millis()).unwrap_or(u32::MAX);
                         check.exp = now.add(timeout_ms);
                         check.in_progress = true;
-                        let req_buf = user.as_deref().map(|u| build_mysql_req(u, version)).unwrap_or_default();
+                        let req_buf = user.as_deref().map(|u| build_mysql_req(u, *version)).unwrap_or_default();
                         fdtab.insert(raw_fd, FdState::Conn { task: check.task, conn: 0 }, Interest::WRITE);
                         let _ = poller.add(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), false, true);
                         check.sock = Some(sock);
 
                         if immediate {
-                            check.sub_state = CheckSubState::MysqlRunning {
+                            check.run.sub_state = CheckSubState::MysqlRunning {
                                 phase: 0,
-                                user,
-                                version,
+                                user: user.clone(),
+                                version: *version,
                                 send_offset: 0,
                                 req_buf,
                                 recv_buf: Vec::new(),
                             };
                             progress_mysql_check(check, fdtab, poller, now, 0)
                         } else {
-                            check.sub_state = CheckSubState::ProtoConnecting { target_addr: check.addr };
+                            check.run.sub_state = CheckSubState::ProtoConnecting { target_addr: check.addr };
                             Ok(CheckStep::pending(Some(check.exp)))
                         }
                     }
@@ -1761,7 +1853,7 @@ pub fn step_check(
                 match connect_check(check, None) {
                     Ok((sock, immediate)) => {
                         let raw_fd = sock.as_raw_fd();
-                        check.check_fd = Some(raw_fd);
+                        check.run.check_fd = Some(raw_fd);
                         let timeout_ms = u32::try_from(check.config.timeout.as_millis()).unwrap_or(u32::MAX);
                         check.exp = now.add(timeout_ms);
                         check.in_progress = true;
@@ -1770,16 +1862,16 @@ pub fn step_check(
                         check.sock = Some(sock);
 
                         if immediate {
-                            check.sub_state = CheckSubState::PgsqlRunning {
+                            check.run.sub_state = CheckSubState::PgsqlRunning {
                                 phase: 0,
-                                user,
+                                user: user.clone(),
                                 send_offset: 0,
                                 req_buf: Vec::new(),
                                 recv_buf: Vec::new(),
                             };
                             progress_pgsql_check(check, fdtab, poller, now, 0)
                         } else {
-                            check.sub_state = CheckSubState::ProtoConnecting { target_addr: check.addr };
+                            check.run.sub_state = CheckSubState::ProtoConnecting { target_addr: check.addr };
                             Ok(CheckStep::pending(Some(check.exp)))
                         }
                     }
@@ -1796,7 +1888,7 @@ pub fn step_check(
                 match connect_check(check, None) {
                     Ok((sock, immediate)) => {
                         let raw_fd = sock.as_raw_fd();
-                        check.check_fd = Some(raw_fd);
+                        check.run.check_fd = Some(raw_fd);
                         let timeout_ms = u32::try_from(check.config.timeout.as_millis()).unwrap_or(u32::MAX);
                         check.exp = now.add(timeout_ms);
                         check.in_progress = true;
@@ -1805,14 +1897,14 @@ pub fn step_check(
                         check.sock = Some(sock);
 
                         if immediate {
-                            check.sub_state = CheckSubState::SslHelloRunning {
+                            check.run.sub_state = CheckSubState::SslHelloRunning {
                                 phase: 0,
                                 send_offset: 0,
                                 recv_buf: Vec::new(),
                             };
                             progress_ssl_hello_check(check, fdtab, poller, now, 0)
                         } else {
-                            check.sub_state = CheckSubState::ProtoConnecting { target_addr: check.addr };
+                            check.run.sub_state = CheckSubState::ProtoConnecting { target_addr: check.addr };
                             Ok(CheckStep::pending(Some(check.exp)))
                         }
                     }
@@ -1826,7 +1918,7 @@ pub fn step_check(
                 }
             }
             ResolvedCheckConfig::TcpConnect => {
-                check.sub_state = CheckSubState::TcpConnecting;
+                check.run.sub_state = CheckSubState::TcpConnecting;
                 match connect_check(check, None) {
                     Ok((sock, immediate)) => {
                         if immediate {
@@ -1839,7 +1931,7 @@ pub fn step_check(
                             });
                         }
                         let raw_fd = sock.as_raw_fd();
-                        check.check_fd = Some(raw_fd);
+                        check.run.check_fd = Some(raw_fd);
                         let timeout_ms =
                             u32::try_from(check.config.timeout.as_millis()).unwrap_or(u32::MAX);
                         check.exp = now.add(timeout_ms);
@@ -1894,19 +1986,20 @@ fn progress_http_check(
     duration: u32,
     proxies: &[Proxy],
 ) -> io::Result<CheckStep> {
-    let Some(raw_fd) = check.check_fd else {
+    let Some(raw_fd) = check.run.check_fd else {
         cleanup_check_socket(check, fdtab, poller);
         let next = check.schedule_next(now);
         return Ok(CheckStep::pending(Some(next)));
     };
 
-    let Some(ResolvedCheckConfig::Http(chk)) = check.resolved_config.clone() else {
+    let resolved = check.resolved_config.clone();
+    let Some(ResolvedCheckConfig::Http(chk)) = resolved.as_deref() else {
         cleanup_check_socket(check, fdtab, poller);
         let next = check.schedule_next(now);
         return Ok(CheckStep::pending(Some(next)));
     };
 
-    match check.sub_state.clone() {
+    match check.run.sub_state.clone() {
         CheckSubState::HttpSending {
             req_buf,
             mut send_offset,
@@ -1924,7 +2017,7 @@ fn progress_http_check(
                     }
                     Ok(Io::WouldBlock) => {
                         fdtab.clear_ready(raw_fd, false, true);
-                        check.sub_state = CheckSubState::HttpSending {
+                        check.run.sub_state = CheckSubState::HttpSending {
                             req_buf,
                             send_offset,
                         };
@@ -1951,7 +2044,7 @@ fn progress_http_check(
 
             fdtab.set_interest(raw_fd, Interest::READ);
             let _ = poller.modify(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), true, false);
-            check.sub_state = CheckSubState::HttpReceiving {
+            check.run.sub_state = CheckSubState::HttpReceiving {
                 recv_buf: Vec::new(),
             };
             progress_http_check(check, fdtab, poller, now, duration, proxies)
@@ -1996,7 +2089,7 @@ fn progress_http_check(
             let event = match verdict {
                 HttpVerdict::Wait => {
                     fdtab.clear_ready(raw_fd, true, false);
-                    check.sub_state = CheckSubState::HttpReceiving { recv_buf };
+                    check.run.sub_state = CheckSubState::HttpReceiving { recv_buf };
                     return Ok(CheckStep::pending(Some(check.exp)));
                 }
                 HttpVerdict::Pass { status } => {
@@ -2029,7 +2122,7 @@ fn tcp_timeout_status(steps: &[ResolvedTcpStep], idx: usize) -> (&'static str, &
 
 /// The script of a check that is running one.
 fn tcp_steps_of(check: &ServerCheckState) -> &[ResolvedTcpStep] {
-    if let Some(ResolvedCheckConfig::TcpSteps(steps)) = &check.resolved_config { steps } else { &[] }
+    if let Some(ResolvedCheckConfig::TcpSteps(steps)) = check.resolved_config.as_deref() { steps } else { &[] }
 }
 
 /// The step number `HAProxy` gives rule `idx` of a `tcp-check` script: rules count from 1,
@@ -2148,7 +2241,7 @@ fn progress_tcp_steps_start(
 ) -> io::Result<CheckStep> {
     // The first rule is a connect (the script's own, or the one `HAProxy` adds): the loop
     // opens its connection as it opens any other.
-    check.sub_state = CheckSubState::TcpRunning {
+    check.run.sub_state = CheckSubState::TcpRunning {
         step_idx: 0,
         send_offset: 0,
         recv_buf: Vec::new(),
@@ -2165,7 +2258,8 @@ fn progress_tcp_check(
     now: Tick,
     duration: u32,
 ) -> io::Result<CheckStep> {
-    let Some(ResolvedCheckConfig::TcpSteps(steps)) = check.resolved_config.clone() else {
+    let resolved = check.resolved_config.clone();
+    let Some(ResolvedCheckConfig::TcpSteps(steps)) = resolved.as_deref() else {
         cleanup_check_socket(check, fdtab, poller);
         let next = check.schedule_next(now);
         return Ok(CheckStep::pending(Some(next)));
@@ -2175,7 +2269,7 @@ fn progress_tcp_check(
         mut step_idx,
         mut send_offset,
         mut recv_buf,
-    } = check.sub_state.clone()
+    } = check.run.sub_state.clone()
     else {
         cleanup_check_socket(check, fdtab, poller);
         let next = check.schedule_next(now);
@@ -2194,12 +2288,12 @@ fn progress_tcp_check(
                 // the buffers too: "Always release input and output buffer when a new
                 // connect is evaluated"). Treating the old socket as the new connection
                 // made the next `expect` read the old server's end of stream.
-                let this_steps_socket = step_idx == 0 || check.tcp_connect_step == Some(step_idx);
+                let this_steps_socket = step_idx == 0 || check.run.tcp_connect_step == Some(step_idx);
                 if let (true, Some(sock)) = (this_steps_socket, check.sock.as_ref()) {
                     let raw_fd = sock.as_raw_fd();
                     let ready = fdtab.ready(raw_fd);
                     if !ready.writable && !ready.readable {
-                        check.sub_state = CheckSubState::TcpRunning {
+                        check.run.sub_state = CheckSubState::TcpRunning {
                             step_idx,
                             send_offset,
                             recv_buf,
@@ -2209,7 +2303,7 @@ fn progress_tcp_check(
                     fdtab.clear_ready(raw_fd, true, true);
                     let connect_res = raw::check_connect_error(sock.as_fd());
                     if let Ok(None) = connect_res {
-                        check.tcp_connect_step = None;
+                        check.run.tcp_connect_step = None;
                         step_idx += 1;
                         continue;
                     }
@@ -2238,8 +2332,8 @@ fn progress_tcp_check(
                 let connected = connect_check(check, Some(target_addr));
                 if let Ok((sock, immediate)) = connected {
                         let raw_fd = sock.as_raw_fd();
-                        check.check_fd = Some(raw_fd);
-                        check.tcp_connect_step = Some(step_idx);
+                        check.run.check_fd = Some(raw_fd);
+                        check.run.tcp_connect_step = Some(step_idx);
                         fdtab.insert(
                             raw_fd,
                             FdState::Conn {
@@ -2260,7 +2354,7 @@ fn progress_tcp_check(
                             step_idx += 1;
                             continue;
                         }
-                        check.sub_state = CheckSubState::TcpRunning {
+                        check.run.sub_state = CheckSubState::TcpRunning {
                             step_idx,
                             send_offset,
                             recv_buf,
@@ -2294,7 +2388,7 @@ fn progress_tcp_check(
                         }
                         Ok(Io::WouldBlock) => {
                             fdtab.clear_ready(raw_fd, false, true);
-                            check.sub_state = CheckSubState::TcpRunning {
+                            check.run.sub_state = CheckSubState::TcpRunning {
                                 step_idx,
                                 send_offset,
                                 recv_buf,
@@ -2364,7 +2458,7 @@ fn progress_tcp_check(
                 let matched = decided.unwrap_or(false);
                 if wait {
                     fdtab.clear_ready(raw_fd, true, false);
-                    check.sub_state = CheckSubState::TcpRunning {
+                    check.run.sub_state = CheckSubState::TcpRunning {
                         step_idx: tcp_expect_head(&steps, step_idx),
                         send_offset,
                         recv_buf,
@@ -2454,7 +2548,7 @@ fn connect_check(check: &mut ServerCheckState, addr: Option<SocketAddr>) -> io::
 /// The Host header an HTTP check sends, the automatic SNI of a TLS check
 /// (`tcpcheck_connect_auto_sni`). A log-format value is taken as written.
 fn check_host(check: &ServerCheckState) -> Option<String> {
-    let Some(ResolvedCheckConfig::Http(chk)) = check.resolved_config.as_ref() else { return None };
+    let Some(ResolvedCheckConfig::Http(chk)) = check.resolved_config.as_deref() else { return None };
     chk.headers
         .iter()
         .find(|(n, _)| n.eq_ignore_ascii_case("host"))
@@ -2528,13 +2622,12 @@ pub fn cleanup_check_socket(check: &mut ServerCheckState, fdtab: &mut FdTab, pol
         let _ = poller.delete(sock.as_fd());
     }
     check.xprt = ServerXprt::Plain;
-    check.tcp_connect_step = None;
-    if let Some(raw_fd) = check.check_fd.take() {
+    if let Some(raw_fd) = check.run.check_fd {
         fdtab.remove(raw_fd);
     }
+    check.run.release();
     check.in_progress = false;
     check.exp = Tick::ETERNITY;
-    check.sub_state = CheckSubState::Idle;
 }
 
 #[allow(clippy::too_many_lines, clippy::unnecessary_wraps)]
@@ -2545,7 +2638,7 @@ fn progress_redis_check(
     now: Tick,
     duration: u32,
 ) -> io::Result<CheckStep> {
-    let Some(raw_fd) = check.check_fd else {
+    let Some(raw_fd) = check.run.check_fd else {
         cleanup_check_socket(check, fdtab, poller);
         let next = check.schedule_next(now);
         return Ok(CheckStep::pending(Some(next)));
@@ -2560,7 +2653,7 @@ fn progress_redis_check(
         mut phase,
         mut send_offset,
         mut recv_buf,
-    } = check.sub_state.clone()
+    } = check.run.sub_state.clone()
     else {
         cleanup_check_socket(check, fdtab, poller);
         let next = check.schedule_next(now);
@@ -2576,7 +2669,7 @@ fn progress_redis_check(
                 }
                 Ok(Io::WouldBlock) => {
                     fdtab.clear_ready(raw_fd, false, true);
-                    check.sub_state = CheckSubState::RedisRunning {
+                    check.run.sub_state = CheckSubState::RedisRunning {
                         phase,
                         send_offset,
                         recv_buf,
@@ -2613,7 +2706,7 @@ fn progress_redis_check(
 
         let Some(v) = check_reply::redis(&recv_buf, eof) else {
             fdtab.clear_ready(raw_fd, true, false);
-            check.sub_state = CheckSubState::RedisRunning { phase, send_offset, recv_buf };
+            check.run.sub_state = CheckSubState::RedisRunning { phase, send_offset, recv_buf };
             return Ok(CheckStep::pending(Some(check.exp)));
         };
         return Ok(finish_reply(check, fdtab, poller, now, duration, v));
@@ -2632,7 +2725,7 @@ fn progress_smtp_check(
     now: Tick,
     duration: u32,
 ) -> io::Result<CheckStep> {
-    let Some(raw_fd) = check.check_fd else {
+    let Some(raw_fd) = check.run.check_fd else {
         cleanup_check_socket(check, fdtab, poller);
         let next = check.schedule_next(now);
         return Ok(CheckStep::pending(Some(next)));
@@ -2648,7 +2741,7 @@ fn progress_smtp_check(
         cmd,
         mut send_offset,
         mut recv_buf,
-    } = check.sub_state.clone()
+    } = check.run.sub_state.clone()
     else {
         cleanup_check_socket(check, fdtab, poller);
         let next = check.schedule_next(now);
@@ -2664,7 +2757,7 @@ fn progress_smtp_check(
 
         let Some(greeting) = check_reply::smtp_greeting(&recv_buf) else {
             fdtab.clear_ready(raw_fd, true, false);
-            check.sub_state = CheckSubState::SmtpRunning {
+            check.run.sub_state = CheckSubState::SmtpRunning {
                 phase,
                 cmd,
                 send_offset,
@@ -2707,7 +2800,7 @@ fn progress_smtp_check(
                 }
                 Ok(Io::WouldBlock) => {
                     fdtab.clear_ready(raw_fd, false, true);
-                    check.sub_state = CheckSubState::SmtpRunning {
+                    check.run.sub_state = CheckSubState::SmtpRunning {
                         phase,
                         cmd,
                         send_offset,
@@ -2739,7 +2832,7 @@ fn progress_smtp_check(
         fdtab.set_interest(raw_fd, Interest::READ);
         let _ = poller.modify(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), true, false);
         fdtab.clear_ready(raw_fd, false, true);
-        check.sub_state = CheckSubState::SmtpRunning {
+        check.run.sub_state = CheckSubState::SmtpRunning {
             phase,
             cmd,
             send_offset,
@@ -2754,7 +2847,7 @@ fn progress_smtp_check(
 
         let Some(reply) = check_reply::smtp_reply(&recv_buf, eof) else {
             fdtab.clear_ready(raw_fd, true, false);
-            check.sub_state = CheckSubState::SmtpRunning {
+            check.run.sub_state = CheckSubState::SmtpRunning {
                 phase,
                 cmd,
                 send_offset,
@@ -2793,7 +2886,7 @@ fn progress_smtp_check(
                 }
                 Ok(Io::WouldBlock) => {
                     fdtab.clear_ready(raw_fd, false, true);
-                    check.sub_state = CheckSubState::SmtpRunning {
+                    check.run.sub_state = CheckSubState::SmtpRunning {
                         phase,
                         cmd,
                         send_offset,
@@ -2825,7 +2918,7 @@ fn progress_smtp_check(
         fdtab.set_interest(raw_fd, Interest::READ);
         let _ = poller.modify(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), true, false);
         fdtab.clear_ready(raw_fd, false, true);
-        check.sub_state = CheckSubState::SmtpRunning {
+        check.run.sub_state = CheckSubState::SmtpRunning {
             phase,
             cmd,
             send_offset,
@@ -2840,7 +2933,7 @@ fn progress_smtp_check(
 
         let Some(answer) = check_reply::smtp_quit(&recv_buf, eof) else {
             fdtab.clear_ready(raw_fd, true, false);
-            check.sub_state = CheckSubState::SmtpRunning {
+            check.run.sub_state = CheckSubState::SmtpRunning {
                 phase,
                 cmd,
                 send_offset,
@@ -3041,7 +3134,7 @@ fn progress_ldap_check(
     now: Tick,
     duration: u32,
 ) -> io::Result<CheckStep> {
-    let Some(raw_fd) = check.check_fd else {
+    let Some(raw_fd) = check.run.check_fd else {
         cleanup_check_socket(check, fdtab, poller);
         let next = check.schedule_next(now);
         return Ok(CheckStep::pending(Some(next)));
@@ -3056,7 +3149,7 @@ fn progress_ldap_check(
         mut phase,
         mut send_offset,
         mut recv_buf,
-    } = check.sub_state.clone()
+    } = check.run.sub_state.clone()
     else {
         cleanup_check_socket(check, fdtab, poller);
         let next = check.schedule_next(now);
@@ -3074,7 +3167,7 @@ fn progress_ldap_check(
                 }
                 Ok(Io::WouldBlock) => {
                     fdtab.clear_ready(raw_fd, false, true);
-                    check.sub_state = CheckSubState::LdapRunning {
+                    check.run.sub_state = CheckSubState::LdapRunning {
                         phase,
                         send_offset,
                         recv_buf,
@@ -3110,7 +3203,7 @@ fn progress_ldap_check(
         let last_read = recv_check_reply(&mut check.xprt, sock.as_fd(), &mut recv_buf);
         let Some(reply) = ldap_bind_reply(&recv_buf, last_read) else {
             fdtab.clear_ready(raw_fd, true, false);
-            check.sub_state = CheckSubState::LdapRunning { phase, send_offset, recv_buf };
+            check.run.sub_state = CheckSubState::LdapRunning { phase, send_offset, recv_buf };
             return Ok(CheckStep::pending(Some(check.exp)));
         };
         return Ok(end_proto_check(check, fdtab, poller, now, duration, reply));
@@ -3202,7 +3295,7 @@ fn progress_mysql_check(
     now: Tick,
     duration: u32,
 ) -> io::Result<CheckStep> {
-    let Some(raw_fd) = check.check_fd else {
+    let Some(raw_fd) = check.run.check_fd else {
         cleanup_check_socket(check, fdtab, poller);
         let next = check.schedule_next(now);
         return Ok(CheckStep::pending(Some(next)));
@@ -3220,7 +3313,7 @@ fn progress_mysql_check(
         mut send_offset,
         req_buf,
         mut recv_buf,
-    } = check.sub_state.clone()
+    } = check.run.sub_state.clone()
     else {
         cleanup_check_socket(check, fdtab, poller);
         let next = check.schedule_next(now);
@@ -3236,7 +3329,7 @@ fn progress_mysql_check(
                     }
                     Ok(Io::WouldBlock) => {
                         fdtab.clear_ready(raw_fd, false, true);
-                        check.sub_state = CheckSubState::MysqlRunning {
+                        check.run.sub_state = CheckSubState::MysqlRunning {
                             phase,
                             user,
                             version,
@@ -3276,7 +3369,7 @@ fn progress_mysql_check(
         let last_read = recv_check_reply(&mut check.xprt, sock.as_fd(), &mut recv_buf);
         let Some(reply) = mysql_reply(&recv_buf, last_read, user.is_some()) else {
             fdtab.clear_ready(raw_fd, true, false);
-            check.sub_state = CheckSubState::MysqlRunning {
+            check.run.sub_state = CheckSubState::MysqlRunning {
                 phase,
                 user,
                 version,
@@ -3302,7 +3395,7 @@ fn progress_pgsql_check(
     now: Tick,
     duration: u32,
 ) -> io::Result<CheckStep> {
-    let Some(raw_fd) = check.check_fd else {
+    let Some(raw_fd) = check.run.check_fd else {
         cleanup_check_socket(check, fdtab, poller);
         let next = check.schedule_next(now);
         return Ok(CheckStep::pending(Some(next)));
@@ -3319,7 +3412,7 @@ fn progress_pgsql_check(
         mut send_offset,
         mut req_buf,
         mut recv_buf,
-    } = check.sub_state.clone()
+    } = check.run.sub_state.clone()
     else {
         cleanup_check_socket(check, fdtab, poller);
         let next = check.schedule_next(now);
@@ -3344,7 +3437,7 @@ fn progress_pgsql_check(
                 }
                 Ok(Io::WouldBlock) => {
                     fdtab.clear_ready(raw_fd, false, true);
-                    check.sub_state = CheckSubState::PgsqlRunning {
+                    check.run.sub_state = CheckSubState::PgsqlRunning {
                         phase,
                         user,
                         send_offset,
@@ -3384,7 +3477,7 @@ fn progress_pgsql_check(
 
         let Some(v) = check_reply::pgsql(&recv_buf, eof) else {
             fdtab.clear_ready(raw_fd, true, false);
-            check.sub_state = CheckSubState::PgsqlRunning { phase, user, send_offset, req_buf, recv_buf };
+            check.run.sub_state = CheckSubState::PgsqlRunning { phase, user, send_offset, req_buf, recv_buf };
             return Ok(CheckStep::pending(Some(check.exp)));
         };
         return Ok(finish_reply(check, fdtab, poller, now, duration, v));
@@ -3403,7 +3496,7 @@ fn progress_ssl_hello_check(
     now: Tick,
     duration: u32,
 ) -> io::Result<CheckStep> {
-    let Some(raw_fd) = check.check_fd else {
+    let Some(raw_fd) = check.run.check_fd else {
         cleanup_check_socket(check, fdtab, poller);
         let next = check.schedule_next(now);
         return Ok(CheckStep::pending(Some(next)));
@@ -3418,7 +3511,7 @@ fn progress_ssl_hello_check(
         mut phase,
         mut send_offset,
         mut recv_buf,
-    } = check.sub_state.clone()
+    } = check.run.sub_state.clone()
     else {
         cleanup_check_socket(check, fdtab, poller);
         let next = check.schedule_next(now);
@@ -3453,7 +3546,7 @@ fn progress_ssl_hello_check(
                 }
                 Ok(Io::WouldBlock) => {
                     fdtab.clear_ready(raw_fd, false, true);
-                    check.sub_state = CheckSubState::SslHelloRunning {
+                    check.run.sub_state = CheckSubState::SslHelloRunning {
                         phase,
                         send_offset,
                         recv_buf,
@@ -3491,7 +3584,7 @@ fn progress_ssl_hello_check(
 
         let Some(v) = check_reply::ssl_hello(&recv_buf, eof) else {
             fdtab.clear_ready(raw_fd, true, false);
-            check.sub_state = CheckSubState::SslHelloRunning { phase, send_offset, recv_buf };
+            check.run.sub_state = CheckSubState::SslHelloRunning { phase, send_offset, recv_buf };
             return Ok(CheckStep::pending(Some(check.exp)));
         };
         return Ok(finish_reply(check, fdtab, poller, now, duration, v));
@@ -3890,12 +3983,13 @@ mod tests {
         s.enabled = true;
         s.status = ServerStatus::Maint;
         s.in_progress = true;
-        s.sub_state = CheckSubState::TcpConnecting;
+        s.run.sub_state = CheckSubState::TcpConnecting;
         let mut fdtab = FdTab::with_capacity(16);
         let mut poller = Poller::new(4).unwrap();
         let step = step_check(&mut s, &mut fdtab, &mut poller, Tick(100), &[]).unwrap();
         assert!(!s.in_progress);
-        assert!(matches!(s.sub_state, CheckSubState::Idle));
+        assert!(matches!(s.run.sub_state, CheckSubState::Idle));
+        assert!(!s.run.is_held(), "the run goes back to the pool");
         assert!(step.next.is_some());
     }
 

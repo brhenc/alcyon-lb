@@ -292,19 +292,23 @@ impl ResolvedTcpExpectPattern {
     }
 }
 
-static RESOLVED_CHECKS: LazyLock<RwLock<HashMap<(usize, usize), ResolvedCheckConfig>>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
+/// The resolved check of each `(proxy, server)`, and of each check address. The value is
+/// shared: every server of a backend whose resolved check is the same holds the same `Arc`
+/// (`register_section_checks`), so 60,000 servers of one backend keep one copy of its
+/// method, URI, headers and expect rules (T304).
+static RESOLVED_CHECKS: CheckTable<(usize, usize)> = LazyLock::new(|| RwLock::new(HashMap::new()));
 
-static ADDR_CHECKS: LazyLock<RwLock<HashMap<SocketAddr, ResolvedCheckConfig>>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
+static ADDR_CHECKS: CheckTable<SocketAddr> = LazyLock::new(|| RwLock::new(HashMap::new()));
 
-pub fn register_resolved_check(proxy_idx: usize, server_idx: usize, check: ResolvedCheckConfig) {
+type CheckTable<K> = LazyLock<RwLock<HashMap<K, Arc<ResolvedCheckConfig>>>>;
+
+pub fn register_resolved_check(proxy_idx: usize, server_idx: usize, check: Arc<ResolvedCheckConfig>) {
     if let Ok(mut map) = RESOLVED_CHECKS.write() {
         map.insert((proxy_idx, server_idx), check);
     }
 }
 
-pub fn register_resolved_check_for_addr(addr: SocketAddr, check: ResolvedCheckConfig) {
+pub fn register_resolved_check_for_addr(addr: SocketAddr, check: Arc<ResolvedCheckConfig>) {
     if let Ok(mut map) = ADDR_CHECKS.write() {
         map.insert(addr, check);
     }
@@ -319,20 +323,21 @@ pub fn clear_resolved_checks() {
     }
 }
 
+/// The resolved check of a server: a reference to the shared copy, not a copy.
 #[must_use]
 pub fn get_resolved_check_config(
     proxy_idx: usize,
     server_idx: usize,
     addr: SocketAddr,
-) -> Option<ResolvedCheckConfig> {
+) -> Option<Arc<ResolvedCheckConfig>> {
     if let Ok(map) = RESOLVED_CHECKS.read() {
         if let Some(cfg) = map.get(&(proxy_idx, server_idx)) {
-            return Some(cfg.clone());
+            return Some(Arc::clone(cfg));
         }
     }
     if let Ok(map) = ADDR_CHECKS.read() {
         if let Some(cfg) = map.get(&addr) {
-            return Some(cfg.clone());
+            return Some(Arc::clone(cfg));
         }
     }
     None

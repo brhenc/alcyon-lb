@@ -130,6 +130,13 @@ impl Eb32Tree {
 
     // ---- arena -----------------------------------------------------------------
 
+    /// Makes room for `additional` more nodes at once, at boot, when the caller knows how
+    /// many it is about to insert (one timer per health check), instead of growing the
+    /// arena by doubling past what is needed.
+    pub fn reserve(&mut self, additional: usize) {
+        self.nodes.reserve(additional);
+    }
+
     fn alloc(&mut self, key: u32, data: u32) -> u32 {
         let node = Node {
             branches: [Branch::NONE; 2],

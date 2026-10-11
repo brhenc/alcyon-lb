@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{LazyLock, RwLock};
+use std::sync::{Arc, LazyLock, RwLock};
 use std::time::Duration;
 
 pub mod global;
