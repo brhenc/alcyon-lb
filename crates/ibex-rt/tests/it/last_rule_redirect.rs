@@ -239,11 +239,14 @@ fn wait_end_holds_a_tcp_request_content_rule_until_the_inspect_delay_is_over() {
     let srv = listener.local_addr().expect("addr");
     let at = heard.clone();
     thread::spawn(move || {
-        if let Ok((mut c, _)) = listener.accept() {
+        // The harness's probe connection reaches the server too, and closes without
+        // sending: the client's is the one that sends.
+        for mut c in listener.incoming().flatten() {
             let mut b = [0u8; 16];
             if c.read(&mut b).is_ok_and(|n| n > 0) {
                 *at.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Instant::now());
                 c.write_all(b"pong").ok();
+                break;
             }
         }
     });
@@ -257,8 +260,6 @@ fn wait_end_holds_a_tcp_request_content_rule_until_the_inspect_delay_is_over() {
     let _ibex = Ibex { child, cfg: f };
     assert!(common::wait_listening(fe));
     let mut c = TcpStream::connect(fe).expect("connect");
-    // The harness's own probe connection took the server's one accept: a second server
-    // is not needed because it closes without sending, and `accept` above is the client's.
     let sent = Instant::now();
     c.write_all(b"ping").expect("send");
     c.set_read_timeout(Some(Duration::from_secs(3))).ok();

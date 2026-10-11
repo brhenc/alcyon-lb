@@ -167,3 +167,68 @@ fn a_server_reset_behind_a_full_buffer_delivers_what_the_proxy_holds() {
     assert!(got > 0 && got == logged, "the client gets every byte the proxy took: {got} vs {line}");
     assert!(late.is_err(), "writes after the close fail");
 }
+
+/// TCP mode, a server that speaks first: the client connects, half-closes at once (sends
+/// nothing) and reads. Measured on `HAProxy` 3.5-dev8-885761-29 (`T280_ORACLE=/path/to/haproxy`)
+/// with `default_backend`, with and without a `tcp-request inspect-delay`: the server
+/// connection is made all the same, the client's close reaches the server (it reads EOF),
+/// and the server's reply reaches the client. Ibex dropped it (`fe/<NOSRV> -1/-1/0`): the
+/// server side of a connect deferred to routing gave up on a client that had shut, so the
+/// readiness probe of the test above never reached its server, which waited 5 s for it.
+#[test]
+fn a_client_that_half_closes_at_once_still_reaches_a_server_that_speaks_first() {
+    for extra in ["", "\ttcp-request inspect-delay 1s\n\ttcp-request content accept if { req.len gt 0 }\n"] {
+        let l = TcpListener::bind("127.0.0.1:0").expect("bind backend");
+        let be = l.local_addr().expect("addr");
+        let server = thread::spawn(move || {
+            l.set_nonblocking(true).expect("nonblocking");
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline {
+                if let Ok((mut c, _)) = l.accept() {
+                    c.set_nonblocking(false).ok();
+                    c.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                    let mut buf = [0u8; 16];
+                    let eof = matches!(c.read(&mut buf), Ok(0));
+                    let _ = c.write_all(b"220 hello\r\n");
+                    return Some(eof);
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            None
+        });
+        let fe = common::reserve_addr();
+        let dir = tempfile::TempDir::new().expect("dir");
+        let cfg = dir.path().join("c.cfg");
+        std::fs::write(
+            &cfg,
+            format!(
+                "defaults\n\tmode tcp\n\ttimeout connect 2s\n\ttimeout client 5s\n\ttimeout server 5s\n\n\
+                 frontend fe\n\tbind {fe}\n{extra}\tdefault_backend be\n\nbackend be\n\tserver s1 {be}\n"
+            ),
+        )
+        .expect("write config");
+        let bin = std::env::var("T280_ORACLE").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ibex").to_string());
+        let mut child = std::process::Command::new(bin)
+            .arg("-f")
+            .arg(&cfg)
+            .arg("-db")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn");
+        let mut c = (0..250)
+            .find_map(|_| TcpStream::connect(fe).ok().or_else(|| {
+                thread::sleep(Duration::from_millis(20));
+                None
+            }))
+            .expect("never listened");
+        c.shutdown(std::net::Shutdown::Write).expect("shutdown");
+        c.set_read_timeout(Some(Duration::from_secs(3))).ok();
+        let mut got = Vec::new();
+        let _ = c.read_to_end(&mut got);
+        let eof = server.join().expect("server");
+        common::stop(&mut child);
+        assert_eq!(eof, Some(true), "the server is connected and reads the client's close ({extra:?})");
+        assert_eq!(got, b"220 hello\r\n", "the server's reply reaches the client ({extra:?})");
+    }
+}
