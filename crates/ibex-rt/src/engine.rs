@@ -12667,7 +12667,6 @@ fn after_res_on_reply<'r>(
     let mut req_vars = std::mem::take(&mut sess.req_vars);
     let mut res_caps = std::mem::take(&mut sess.log.res_captures);
     let res_caps_in = res_caps.clone();
-    let stick = StickView::new(proxies, &sess.tracked_sc);
     let result = {
         // The reply is the proxy's own, and the rules read the same state they read on a server's.
         let view = ProxiesView(proxies);
