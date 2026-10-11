@@ -14,9 +14,11 @@
 # Env: IBEX_BIN (default: a release build of this checkout in $DIFFFUZZ_TARGET),
 #      DIFFFUZZ_TARGET (default ~/ibex-targets/difffuzz), DIFFFUZZ_SEED (default: day number,
 #      so each night explores other seeds), DIFFFUZZ_OUT (report dir), DIFFFUZZ_CORES (48-55).
-# The row for data/verification_runs.csv (T292's ledger), appended when that file exists:
-#   date,kind,subject,sha,cases,new_diffs,minutes,report
-#   e.g. 2026-10-12,difffuzz,ibex-vs-haproxy,ed6dfb8,41230,0,60,
+# A clean run appends its row to data/verification_runs.csv (T292's ledger, columns
+#   start,method,commit,duration_min,new_findings,note), e.g.
+#   2026-10-12 03:00,fuzz-differential,ed6dfb8,60,0,"41230 cases, seed 20738000, 0 new DIFFs"
+# A run with new DIFFs appends nothing: they are not findings until triaged, and a row with
+# new_findings 0 would count as clean hours. Triage, add FZ-n rows, then the run row naming them.
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 2
 MIN=${1:-60}
@@ -26,6 +28,7 @@ OUTDIR=${DIFFFUZZ_OUT:-$HOME/ibex-worktrees/review/difffuzz}
 CORES=${DIFFFUZZ_CORES:-48-55}
 SEED=${DIFFFUZZ_SEED:-$(( $(date +%s) / 86400 * 1000 ))}
 SHA=$(git rev-parse --short HEAD)
+START=$(date '+%F %H:%M'); T0=$(date +%s)
 free_gb=$(df -BG --output=avail "$HOME" | tail -1 | tr -dc '0-9')
 [ "$free_gb" -ge 40 ] || { echo "difffuzz-soak: only ${free_gb}G free on /home" >&2; exit 2; }
 export CARGO_TARGET_DIR=$T CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=4
@@ -47,7 +50,9 @@ LINE=$(tail -n 1 "$RES"); rm -f "$RES"
 echo "$LINE"
 CASES=$(sed -n 's/^difffuzz-soak: \([0-9]*\) cases.*/\1/p' <<<"$LINE")
 NEW=$(sed -n 's/.* \([0-9]*\) new DIFFs.*/\1/p' <<<"$LINE")
-if [ -f data/verification_runs.csv ]; then
-  echo "$(date +%F),difffuzz,ibex-vs-haproxy,$SHA,${CASES:-0},${NEW:-0},$MIN,$([ "${NEW:-0}" != 0 ] && echo "$OUT")" >> data/verification_runs.csv
+if [ "$RC" = 0 ] && [ "${NEW:-0}" = 0 ] && [ -f data/verification_runs.csv ]; then
+  echo "$START,fuzz-differential,$SHA,$(( ($(date +%s) - T0) / 60 )),0,\"${CASES:-0} cases, seed $SEED, 0 new DIFFs\"" >> data/verification_runs.csv
+elif [ "${NEW:-0}" != 0 ]; then
+  echo "difffuzz-soak: ${NEW} new DIFFs, no ledger row written; triage $OUT first" >&2
 fi
 exit "$RC"
