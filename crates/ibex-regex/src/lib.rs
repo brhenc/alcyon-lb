@@ -692,6 +692,28 @@ mod nocapture_tests {
     use super::*;
 
     #[test]
+    fn the_rewrite_touches_only_unnamed_capturing_groups() {
+        let r = without_auto_capture;
+        assert_eq!(r("(a)b"), Some("(?:a)b".into()));
+        assert_eq!(r("((a))"), Some("(?:(?:a))".into()));
+        assert_eq!(r("(a)(?<n>b)"), Some("(?:a)(?<n>b)".into()));
+        // nothing to change
+        assert_eq!(r("a(?:b)(?i)c"), None);
+        assert_eq!(r(r"\(a\)"), None);
+        assert_eq!(r("(*UTF8)a"), None);
+        assert_eq!(r("[(]"), None);
+        // classes: a leading `^` and `]` are literal, POSIX names are skipped
+        assert_eq!(r("[^]](a)"), Some("[^]](?:a)".into()));
+        assert_eq!(r("[]a](a)"), Some("[]a](?:a)".into()));
+        assert_eq!(r("[[:alpha:](]+(a)"), Some("[[:alpha:](]+(?:a)".into()));
+        assert_eq!(r("[[:x](a)"), Some("[[:x](?:a)".into()));
+        // conditions: the parenthesis of `(?(1)` is not a group; an assertion condition is
+        assert_eq!(r("(a)(?(1)b|c)"), Some("(?:a)(?(1)b|c)".into()));
+        assert_eq!(r("(?(?=a)(b)|c)"), Some("(?(?=a)(?:b)|c)".into()));
+        assert_eq!(r("(?(<n>)(b)|c)"), Some("(?(<n>)(?:b)|c)".into()));
+    }
+
+    #[test]
     fn unnamed_groups_do_not_capture_but_named_ones_do() {
         assert!(UserRegex::new_nocapture(r"(a)\1").is_err_and(|e| e.to_string() == NONEXISTENT_GROUP));
         assert!(UserRegex::new_nocapture(r"(a)(?<n>b)\1").is_ok_and(|r| r.is_match("abb") && !r.is_match("aba")));
