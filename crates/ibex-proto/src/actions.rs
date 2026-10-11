@@ -495,6 +495,15 @@ mod tests {
         assert_eq!(result, "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n");
     }
 
+    /// A head whose last line ends with a bare LF and whose blank line is CRLF ends there
+    /// (T291): the bytes behind it are not headers.
+    #[test]
+    fn a_head_ended_by_lf_then_crlf() {
+        let mut buf = b"GET / HTTP/1.1\r\nX-Foo: 1\nHost: a\n\r\nX-Foo: body".to_vec();
+        let new_len = remove_http_header(&mut buf, "X-Foo").expect("remove");
+        assert_eq!(&buf[..new_len], b"GET / HTTP/1.1\r\nHost: a\n\r\nX-Foo: body");
+    }
+
     #[test]
     fn test_format_log_format_string() {
         let addr: SocketAddr = "192.168.1.50:54321".parse().unwrap();
