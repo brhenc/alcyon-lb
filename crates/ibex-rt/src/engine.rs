@@ -7383,6 +7383,16 @@ fn h2_bridge_state(o: &mut SessionEntry, c: &mut SessionEntry, proxies: &[Proxy]
     wake
 }
 
+/// A stream of an HTTP/2 connection whose request went whole to the server (its length
+/// is in) but which the client has not ended yet: trailers, or an empty `END_STREAM`, may
+/// still come. `HAProxy` holds the stream until they do (measured on 3.5-dev8: trailers
+/// sent after the whole response are counted in `%U`, the line is logged then, and nothing
+/// more is sent on the stream); ended here, the line went out without them, the stream was
+/// reset, and the trailers that came after were a `GOAWAY` for a frame on a closed stream.
+fn h2_request_open(sess: &TcpSession, txn: &crate::txn::HttpTxn) -> bool {
+    txn.req.is_done() && !txn.local && sess.h2_active().is_some_and(|a| !a.body.done)
+}
+
 /// Ends the HTTP session: the server connection is pooled if `reusable`, the client
 /// connection closed.
 fn close_http_session(
@@ -8304,7 +8314,7 @@ impl EngineDispatcher<'_> {
         };
         if drained && txn.aborted {
             close_http_session(entry, proxies, fdtab, poller, idle_pool, false);
-        } else if drained && txn.finished() {
+        } else if drained && txn.finished() && !h2_request_open(&entry.sess, txn) {
             Self::end_txn(entry, proxies, fdtab, poller, idle_pool, wake_queue, now, pid);
         }
         admin
@@ -10014,11 +10024,21 @@ impl EngineDispatcher<'_> {
         if let Some(stop) = failed {
             // A rule refused or could not rewrite the server's response: `PH`.
             entry.sess.log.term.get_or_insert(*b"PH");
+            // `%B` stays the server's message as it was received: its head and the body
+            // that came with it (measured: 51 for `200`, `content-length: 2`, `ok`), not
+            // the reply that replaces it (`HttpTxn::response_sent` skips a local one).
+            let mut pay = 0;
+            MsgState::head(framing).advance_counted(entry.sess.rep.readable(), &mut pay);
+            if let Some(t) = entry.sess.txn.as_mut().and_then(|t| t.rsp_htx.as_mut()) {
+                *t += pay;
+            }
             entry.sess.rep.clear();
             match stop {
                 ResStop::Page(st) => reply_error(entry, proxies, st),
                 ResStop::Empty(st) => reply_empty(entry, proxies, st),
                 ResStop::Reply(raw) => {
+                    // A redirect is the proxy's own answer, not a refusal: `LH` (measured).
+                    entry.sess.log.term = Some(*b"LH");
                     let be_idx = if entry.backend_idx < proxies.len() { entry.backend_idx } else { entry.proxy_idx };
                     send_proxy_reply(&mut entry.sess, proxies, entry.proxy_idx, be_idx, &raw);
                 }

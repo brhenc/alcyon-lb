@@ -168,8 +168,8 @@ fn http_response_silent_drop_loses_the_response() {
     assert!(out.is_empty(), "got {:?}", String::from_utf8_lossy(&out));
     assert_eq!(end, Some(ErrorKind::ConnectionReset));
     let line = log_line(&p);
-    // (The byte count differs by the header rewrite, whatever the action: not compared.)
-    assert!(line.contains(" 200 ") && line.contains(" - - PR-- "), "log line: {line}");
+    // `%B` is the server's response as it was received, head and body (T305 item 8).
+    assert!(line.contains(" 200 51 - - PR-- "), "log line: {line}");
     assert_eq!(stat(&p, "f", "dreq"), 1);
     assert_eq!(stat(&p, "b", "dreq"), 1);
     assert_eq!(p.hits.load(Ordering::SeqCst), 1, "the server was asked");
@@ -269,4 +269,16 @@ fn an_h2_response_silent_drop_resets_the_stream() {
     assert!(frames.iter().any(|(t, s, pl)| *t == 3 && *s == 1 && pl == &[0, 0, 0, 7]), "{frames:?}");
     assert!(!frames.iter().any(|(t, ..)| *t == 1 || *t == 0), "no response: {frames:?}");
     assert_eq!(stat(&p, "f", "dreq"), 1);
+}
+
+#[test]
+fn http_response_redirect_is_a_local_answer_in_the_log() {
+    // HAProxy 3.5-dev8 (2026-10-11): the redirect a response rule sends is logged `LH--`
+    // (a local answer while the response head was processed, not an error), and `%B` is
+    // still the server's response (51: the HTX message of `200`, `content-length: 2`, `ok`).
+    let p = proxy("    http-response redirect location /x\n", "");
+    let (out, _) = get(&p, "/r");
+    assert!(out.starts_with(b"HTTP/1.1 302"), "answered {:?}", String::from_utf8_lossy(&out));
+    let line = log_line(&p);
+    assert!(line.contains(" 302 51 - - LH-- "), "log line: {line}");
 }

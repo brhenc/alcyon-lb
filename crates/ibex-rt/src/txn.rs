@@ -1575,7 +1575,9 @@ impl HttpTxn {
     pub fn response_sent(&mut self, rep: &[u8], n: usize) {
         let mut pay = 0;
         self.rsp.consume_counted(rep, n, &mut pay);
-        if let Some(t) = self.rsp_htx.as_mut() {
+        // A reply the proxy made in place of the server's response is not counted: `%B`
+        // is the message the server sent.
+        if let Some(t) = self.rsp_htx.as_mut().filter(|_| !self.local) {
             *t += pay;
         }
         if self.rsp.is_done() && self.rsp_interim {
