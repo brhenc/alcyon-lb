@@ -123,6 +123,10 @@ fn parse_value<'a>(h: &'a [u8], i: &mut usize, accept_unsafe: bool) -> Option<(C
     }
 }
 
+/// Header lines a response head may carry: `HAProxy`'s `tune.http.maxhdr` (101). Measured on
+/// 3.5-dev8: 101 lines pass, 102 are a 502 logged `PH--` (T285).
+const MAX_RESPONSE_HEADERS: usize = 101;
+
 /// Parses the head; each header goes to `header` in order, `None` for one `accept_unsafe`
 /// drops (a bad name). Nothing is collected here: the well-formed head is checked without
 /// allocating (`fast_check`).
@@ -208,6 +212,7 @@ fn parse<'a>(h: &'a [u8], accept_unsafe: bool, mut header: impl FnMut(Option<Hea
         }
         _ => return None,
     }
+    let mut lines = 0;
     loop {
         match h.get(i) {
             Some(b'\r') if h.get(i + 1) == Some(&b'\n') => break,
@@ -240,6 +245,10 @@ fn parse<'a>(h: &'a [u8], accept_unsafe: bool, mut header: impl FnMut(Option<Hea
         let name = &h[n0..i];
         i += 1;
         let (value, canonical) = parse_value(h, &mut i, accept_unsafe)?;
+        lines += 1;
+        if lines > MAX_RESPONSE_HEADERS {
+            return None;
+        }
         header(if bad_name { None } else { Some(Header { name, value, canonical }) });
     }
     Some(Parsed { version, code, status: u16::try_from(status).ok()?, reason, canonical_start })

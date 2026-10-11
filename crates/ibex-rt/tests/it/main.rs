@@ -120,6 +120,7 @@ mod h3_end_to_end;
 mod h3_many_threads;
 mod h3_proxy_path;
 mod h3_request_framing_to_backend;
+mod header_bytes_limits;
 mod hard_stop_websocket_fin;
 mod hatop_compat;
 mod health_check;

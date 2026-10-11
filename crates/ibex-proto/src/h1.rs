@@ -125,7 +125,14 @@ pub struct H1Parser {
     /// `option accept-unsafe-violations-in-http-request`: a `#` in the request target, and
     /// a forbidden character in an authority, are let through. Kept across `reset`.
     pub accept_unsafe_request: bool,
+    /// Header lines of the request head so far, against [`MAX_REQUEST_HEADERS`].
+    pub header_lines: u16,
 }
+
+/// Header lines a request head may carry: `HAProxy`'s `tune.http.maxhdr` (101) less one.
+/// Measured on 3.5-dev8: 100 lines pass, 101 are a 400 logged `PR--` (T285). Ibex refuses
+/// `tune.http.maxhdr`, so the limit is the default.
+pub const MAX_REQUEST_HEADERS: u16 = 100;
 
 impl H1Parser {
     #[must_use]
@@ -142,6 +149,7 @@ impl H1Parser {
             prev_delim_len: 2,
             head_rewritten: false,
             accept_unsafe_request: false,
+            header_lines: 0,
         }
     }
 
@@ -156,6 +164,7 @@ impl H1Parser {
         self.saw_bare_cr = false;
         self.prev_delim_len = 2;
         self.head_rewritten = false;
+        self.header_lines = 0;
     }
 
     /// Finalizes parsing on connection close / EOF (for HTTP/1.0 close delimiter fallback).
@@ -327,6 +336,10 @@ impl H1Parser {
         }
 
         self.prev_delim_len = delim_len;
+        // A line ended by LF alone goes to the server ended by CRLF, as HAProxy writes the
+        // head again from HTX: a hop that requires CRLF would otherwise see another message
+        // (T285, V&V VV-8).
+        self.head_rewritten |= delim_len == 1;
         self.phase = H1Phase::Headers;
         Ok(line_end + delim_len)
     }
@@ -351,6 +364,7 @@ impl H1Parser {
                 .map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
             self.on_headers_finished(htx)?;
             self.prev_delim_len = delim_len;
+            self.head_rewritten |= delim_len == 1;
             Ok(delim_len)
         } else {
             let header_bytes = &input[..line_end];
@@ -359,14 +373,22 @@ impl H1Parser {
                 // RFC 9112 §5.2 / HAProxy replaces preceding CRLF with 2 SP (or LF with 1 SP)
                 // and preserves the continuation line's leading whitespace run.
                 let prefix = if self.prev_delim_len == 2 { "  " } else { " " };
-                let folded_val = std::str::from_utf8(header_bytes)
-                    .map_err(|_| {
-                        io::Error::new(io::ErrorKind::InvalidData, "Invalid folded header")
-                    })?;
-                let mut combined = String::with_capacity(prefix.len() + folded_val.len());
-                combined.push_str(prefix);
-                combined.push_str(folded_val);
-                htx.append_to_last_header(&combined).map_err(|_| {
+                let folded = header_bytes;
+                if folded.iter().any(|&b| b == 0 || b == b'\r') {
+                    self.phase = H1Phase::Error;
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid character in header field value"));
+                }
+                let appended = match std::str::from_utf8(folded) {
+                    Ok(folded_val) if !htx.last_header_is_latin1() => {
+                        let mut combined = String::with_capacity(prefix.len() + folded_val.len());
+                        combined.push_str(prefix);
+                        combined.push_str(folded_val);
+                        htx.append_to_last_header(&combined)
+                    }
+                    // obs-text that is not UTF-8, here or in the line it continues (T285).
+                    _ => htx.append_latin1_to_last_header(prefix, folded),
+                };
+                appended.map_err(|_| {
                     self.phase = H1Phase::Error;
                     io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -379,13 +401,27 @@ impl H1Parser {
                 return Ok(line_end + delim_len);
             }
 
-            let header_str = std::str::from_utf8(header_bytes)
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid header string"))?;
-
-            let (name, value) = parse_header_field_borrowed(header_str)?;
+            let (name, value) = parse_header_field(header_bytes)?;
+            self.header_lines += 1;
+            if !self.is_response && self.header_lines > MAX_REQUEST_HEADERS {
+                self.phase = H1Phase::Error;
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "too many header lines"));
+            }
             htx.finalize_last_header();
-            htx.push_header(name, value)
-                .map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
+            match std::str::from_utf8(value) {
+                Ok(value) => htx.push_header(name, value),
+                // obs-text (RFC 9110 section 5.5) that is not UTF-8: Latin-1 from an old
+                // client, which HAProxy forwards as received (T285, V&V VV-8).
+                Err(_) => htx.push_header_latin1(name, value),
+            }
+            .map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
+            // Anything but `name: value` and CRLF is written again from the HTX, as
+            // HAProxy writes it: one space after the colon, the value's blanks trimmed.
+            // (`finalize_last_header` trims the value's trailing blanks in the HTX.)
+            self.head_rewritten |= delim_len == 1
+                || header_bytes.len() != name.len() + 2 + value.len()
+                || header_bytes[name.len() + 1] != b' '
+                || value.last().is_some_and(|&b| b == b' ' || b == b'\t');
             self.prev_delim_len = delim_len;
             Ok(line_end + delim_len)
         }
@@ -457,6 +493,8 @@ impl H1Parser {
         let mut first_cl_idx: Option<usize> = None;
         let mut duplicate_cl = false;
         let mut comma_cl = false;
+        // `0005`: forwarded as `5` (T285).
+        let mut padded_cl = false;
 
         let sref = htx.as_ref();
         for i in last_start_line..sref.num_blocks() {
@@ -495,6 +533,7 @@ impl H1Parser {
                     "invalid Content-Length value",
                 ));
             }
+            padded_cl |= first.len() > 1 && first.starts_with('0');
             for p in parts {
                 if p != first {
                     self.phase = H1Phase::Error;
@@ -525,8 +564,8 @@ impl H1Parser {
 
 
 
-        if duplicate_cl || comma_cl {
-            // Forwarded as the one value it stands for (tasks/T276).
+        if duplicate_cl || comma_cl || padded_cl {
+            // Forwarded as the one value it stands for (tasks/T276), in canonical digits.
             self.head_rewritten = true;
             let first_idx = first_cl_idx.unwrap();
             let mut val_buf = [0u8; 20];
@@ -569,6 +608,19 @@ impl H1Parser {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid Transfer-Encoding"));
         }
         self.is_chunked = te.chunked_last;
+        if !self.is_response && te.chunked_last {
+            // A request's only coding is `chunked`, which goes to the server in lower case.
+            let odd: Vec<usize> = htx
+                .as_ref()
+                .header_blocks_where(|n| n.eq_ignore_ascii_case(b"transfer-encoding"))
+                .filter(|(_, _, v)| *v != "chunked" && v.eq_ignore_ascii_case("chunked"))
+                .map(|(i, _, _)| i)
+                .collect();
+            for i in odd {
+                htx.replace_block_value(i, b"chunked").map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
+                self.head_rewritten = true;
+            }
+        }
         if te.present && self.content_length.is_some() {
             // T-E + C-L: the length goes and the connection closes (`h1_parse_msg_hdrs`).
             self.content_length = None;
@@ -846,10 +898,21 @@ const fn is_tchar(b: u8) -> bool {
         | b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z')
 }
 
+/// [`parse_header_field`] of a line that is text.
 fn parse_header_field_borrowed(line: &str) -> io::Result<(&str, &str)> {
-    let (name, val) = line
-        .split_once(':')
+    let (name, value) = parse_header_field(line.as_bytes())?;
+    // The value starts after an ASCII byte of `line`, so on a character boundary.
+    Ok((name, &line[line.len() - value.len()..]))
+}
+
+/// The name and the value of a header line, the value without its leading blanks. The name
+/// is a token, so text; the value is bytes, any but NUL, CR and LF.
+fn parse_header_field(line: &[u8]) -> io::Result<(&str, &[u8])> {
+    let colon = line
+        .iter()
+        .position(|&b| b == b':')
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Header missing colon"))?;
+    let (name, val) = (&line[..colon], &line[colon + 1..]);
 
     // RFC 9112 5.1 is unusually blunt here: a server MUST reject, with 400, any
     // request containing whitespace between the field name and the colon.
@@ -859,22 +922,25 @@ fn parse_header_field_borrowed(line: &str) -> io::Result<(&str, &str)> {
             "empty header field name",
         ));
     }
-    if !name.bytes().all(is_tchar) {
+    if !name.iter().copied().all(is_tchar) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid character in header field name",
         ));
     }
+    // Tokens are ASCII.
+    let name = std::str::from_utf8(name).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid header field name"))?;
 
     // Field values may not carry NUL, CR or LF.
-    if val.bytes().any(|b| b == 0 || b == b'\r' || b == b'\n') {
+    if val.iter().any(|&b| b == 0 || b == b'\r' || b == b'\n') {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid character in header field value",
         ));
     }
 
-    Ok((name, val.trim_start_matches([' ', '\t'])))
+    let start = val.iter().position(|&b| b != b' ' && b != b'\t').unwrap_or(val.len());
+    Ok((name, &val[start..]))
 }
 
 #[cfg(test)]
@@ -891,21 +957,32 @@ mod tests {
         assert_eq!(Refusal::status_of(&io::Error::new(io::ErrorKind::InvalidData, "x")), 400);
     }
 
-    /// A header value that is not UTF-8 is a 400, whatever the header. The rest of the proxy reads
-    /// headers as text (ACLs, fetches, rule actions); a header it cannot read but the server
-    /// receives would walk around `http-request deny if { req.hdr(x-admin) -m found }` (T158).
+    /// A header value that is not UTF-8 -- Latin-1 -- is taken as `HAProxy` takes it (T285):
+    /// a 400 in `Host`, `Content-Length` and `Transfer-Encoding`, whose values it parses, and
+    /// passed in any other header, held as text so that rules and ACLs read it (T158), and
+    /// written back to the server as the bytes received.
     #[test]
-    fn a_header_value_that_is_not_utf8_is_refused_for_every_header() {
-        for name in [
-            "x-admin", "Content-Length", "transfer-encoding", "Connection", "PROXY-CONNECTION", "keep-alive",
-            "Host", "Expect", "upgrade", "TE", "Trailer", "Cookie", "Forwarded",
-        ] {
-            let mut raw = b"POST / HTTP/1.1\r\nHost: h\r\n".to_vec();
+    fn a_latin1_header_value_is_refused_only_where_it_frames_or_routes() {
+        let parse = |name: &str| {
+            let mut raw = b"POST / HTTP/1.1\r\n".to_vec();
+            if name != "Host" {
+                raw.extend_from_slice(b"Host: h\r\n");
+            }
             raw.extend_from_slice(name.as_bytes());
-            raw.extend_from_slice(b": 5\xff\r\n\r\n");
+            raw.extend_from_slice(b": 5\xff\r\nContent-Length: 0\r\n\r\n");
             let mut buf = [0u8; 4096];
             let mut htx = HtxSlice::new(&mut buf);
-            assert!(H1Parser::new(false).parse(&raw, &mut htx).is_err(), "{name}");
+            let mut p = H1Parser::new(false);
+            p.parse(&raw, &mut htx).map(|_| (htx.as_ref().headers().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, v)| v.to_string()), htx.as_ref().to_h1_wire()))
+        };
+        for name in ["Content-Length", "transfer-encoding", "Host"] {
+            assert!(parse(name).is_err(), "{name}");
+        }
+        for name in ["x-admin", "Connection", "PROXY-CONNECTION", "keep-alive", "Expect", "User-Agent", "Trailer", "Cookie", "Forwarded"] {
+            let (text, wire) = parse(name).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(text.as_deref(), Some("5\u{ff}"), "{name}");
+            let line = format!("{name}: 5").into_bytes().into_iter().chain([0xff, b'\r', b'\n']).collect::<Vec<u8>>();
+            assert!(wire.windows(line.len()).any(|w| w == line), "{name}: {}", wire.escape_ascii());
         }
     }
 
