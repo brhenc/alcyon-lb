@@ -589,15 +589,19 @@ impl Error {
 pub enum Captures<'h> {
     Linear(regex::Captures<'h>),
     Backtracking(fancy_regex::Captures<'h, str>),
+    /// The match was made over the bytes of a non-ASCII text (see [`bytewise`]): the groups
+    /// are held here as text again, with the names of the groups that have one.
+    Bytes { groups: Vec<Option<String>>, names: Vec<Option<String>> },
 }
 
-impl<'h> Captures<'h> {
+impl Captures<'_> {
     /// Group `i` (0 is the whole match), or `None` for a group that did not take part.
     #[must_use]
-    pub fn get(&self, i: usize) -> Option<&'h str> {
+    pub fn get(&self, i: usize) -> Option<&str> {
         match self {
             Captures::Linear(c) => c.get(i).map(|m| m.as_str()),
             Captures::Backtracking(c) => c.get(i).map(|m| m.as_str()),
+            Captures::Bytes { groups, .. } => groups.get(i).and_then(|g| g.as_deref()),
         }
     }
 
@@ -607,6 +611,7 @@ impl<'h> Captures<'h> {
         match self {
             Captures::Linear(c) => c.len(),
             Captures::Backtracking(c) => c.len(),
+            Captures::Bytes { groups, .. } => groups.len(),
         }
     }
 
@@ -621,8 +626,57 @@ impl<'h> Captures<'h> {
         match self {
             Captures::Linear(c) => c.expand(replacement, dst),
             Captures::Backtracking(c) => c.expand(replacement, dst),
+            Captures::Bytes { groups, names } => expand_groups(groups, names, replacement, dst),
         }
     }
+}
+
+/// `Captures::expand` over groups already held as text: the `regex` crate's rules (`$$`,
+/// `$1`, `${1}`, `$name`, `${name}`; the longest run of `[_0-9A-Za-z]` is the name; a group
+/// that does not exist or did not take part is nothing).
+fn expand_groups(groups: &[Option<String>], names: &[Option<String>], repl: &str, dst: &mut String) {
+    let group = |name: &str| -> Option<&str> {
+        let i = name.parse::<usize>().ok().or_else(|| names.iter().position(|n| n.as_deref() == Some(name)))?;
+        groups.get(i)?.as_deref()
+    };
+    let mut rest = repl;
+    while let Some(at) = rest.find('$') {
+        dst.push_str(&rest[..at]);
+        rest = &rest[at + 1..];
+        if let Some(r) = rest.strip_prefix('$') {
+            dst.push('$');
+            rest = r;
+        } else if let Some(inner) = rest.strip_prefix('{').and_then(|r| r.split_once('}')).filter(|(n, _)| !n.is_empty() && n.bytes().all(|c| c == b'_' || c.is_ascii_alphanumeric())) {
+            dst.push_str(group(inner.0).unwrap_or(""));
+            rest = inner.1;
+        } else {
+            let n = rest.bytes().take_while(|c| *c == b'_' || c.is_ascii_alphanumeric()).count();
+            if n == 0 {
+                dst.push('$');
+            } else {
+                dst.push_str(group(&rest[..n]).unwrap_or(""));
+                rest = &rest[n..];
+            }
+        }
+    }
+    dst.push_str(rest);
+}
+
+/// `text` as PCRE without UTF mode reads it: one character for each byte (T296). A
+/// UTF-8 `é` is two characters, so `.`, a class and a repeat count see two bytes, and a
+/// byte of 0x80 or more is the private-use character [`bytetext`] holds it as, which is no
+/// letter and has no other case. ASCII is unchanged and borrowed.
+fn bytewise(text: &str) -> Cow<'_, str> {
+    if text.is_ascii() {
+        return Cow::Borrowed(text);
+    }
+    let bytes = bytetext::text_to_bytes(text);
+    Cow::Owned(bytes.iter().map(|&b| if b < 0x80 { char::from(b) } else { bytetext::escape_byte(b) }).collect())
+}
+
+/// What [`bytewise`] made of a text, as the text it came from.
+fn unbytewise(text: &str) -> String {
+    bytetext::bytes_to_text(&bytetext::text_to_bytes(text))
 }
 
 impl UserRegex {
@@ -673,6 +727,9 @@ impl UserRegex {
         if let Some(what) = scan.unsupported {
             return Err(Error(format!("PCRE feature not supported by Ibex: {what} (see docs/differences.md)"), None));
         }
+        // The pattern is read byte by byte, as the text is (T296).
+        let mapped = bytewise(pattern);
+        let pattern = mapped.as_ref();
         // `regex` reads `a++` as `(a+)+` and `(?R)` as a flag, and so would accept what it
         // does not mean: a pattern with such a token goes to `fancy-regex` directly.
         if !scan.pcre_only {
@@ -741,6 +798,8 @@ impl UserRegex {
     /// Whether `text` matches. A match that exceeds [`BACKTRACK_LIMIT`] does not.
     #[must_use]
     pub fn is_match(&self, text: &str) -> bool {
+        let text = bytewise(text);
+        let text = text.as_ref();
         match self {
             UserRegex::Linear(r) => r.is_match(text),
             UserRegex::Backtracking(r) => r.is_match(text).unwrap_or(false),
@@ -751,6 +810,21 @@ impl UserRegex {
     /// is none.
     #[must_use]
     pub fn captures<'h>(&self, text: &'h str) -> Option<Captures<'h>> {
+        if !text.is_ascii() {
+            let mapped = bytewise(text);
+            let mapped = mapped.as_ref();
+            let (groups, names): (Vec<Option<String>>, Vec<Option<String>>) = match self {
+                UserRegex::Linear(r) => {
+                    let c = r.captures(mapped)?;
+                    ((0..c.len()).map(|i| c.get(i).map(|m| unbytewise(m.as_str()))).collect(), r.capture_names().map(|n| n.map(str::to_owned)).collect())
+                }
+                UserRegex::Backtracking(r) => {
+                    let c = r.captures(mapped).ok().flatten()?;
+                    ((0..c.len()).map(|i| c.get(i).map(|m| unbytewise(m.as_str()))).collect(), r.capture_names().map(|n| n.map(str::to_owned)).collect())
+                }
+            };
+            return Some(Captures::Bytes { groups, names });
+        }
         match self {
             UserRegex::Linear(r) => r.captures(text).map(Captures::Linear),
             UserRegex::Backtracking(r) => r.captures(text).ok().flatten().map(Captures::Backtracking),
@@ -771,6 +845,18 @@ impl UserRegex {
     }
 
     fn replacen<'h>(&self, text: &'h str, replacement: &str, limit: usize) -> Cow<'h, str> {
+        if !text.is_ascii() {
+            let mapped = bytewise(text);
+            let done = self.replacen_ascii_or_bytes(mapped.as_ref(), &bytewise(replacement), limit);
+            return match done {
+                Cow::Borrowed(_) => Cow::Borrowed(text),
+                Cow::Owned(s) => Cow::Owned(unbytewise(&s)),
+            };
+        }
+        self.replacen_ascii_or_bytes(text, replacement, limit)
+    }
+
+    fn replacen_ascii_or_bytes<'h>(&self, text: &'h str, replacement: &str, limit: usize) -> Cow<'h, str> {
         match self {
             UserRegex::Linear(r) => {
                 if limit == 1 {

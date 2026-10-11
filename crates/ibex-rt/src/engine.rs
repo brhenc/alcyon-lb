@@ -9236,6 +9236,12 @@ impl EngineDispatcher<'_> {
             // The server's close is the only end the client can see.
             txn.close_after = true;
         }
+        // `Transfer-Encoding` in an HTTP/1.0 response ends the message there (`H1_MF_CONN_CLO`,
+        // whatever `Connection` says): the client connection too, with no `Connection` header
+        // for it (measured on 3.5-dev8; T296).
+        if close_server && !srv_http11 {
+            txn.close_after = true;
+        }
         let client_close = txn.close_after;
         let req_http11 = txn.req_http11;
         let cookie_txn = txn.ck;
