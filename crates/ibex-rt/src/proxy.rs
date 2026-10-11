@@ -1580,7 +1580,7 @@ impl TcpSession {
                 let total_hdr_len = hdr_len + eoh_len;
 
                 // The head, parsed into HTX, has to fit in tune.bufsize - tune.maxrewrite:
-                // HAProxy answers 431 (tasks/T87; `txn::htx_head_cost`).
+                // HAProxy answers 431 (tasks/T87; `txn::htx_head_cost_and_size`).
                 // What `%U` counts of this head: the message as received, whatever the
                 // rules make of it afterwards.
                 let (cost, req_htx) = txn::htx_head_cost_and_size(&self.req.readable()[..total_hdr_len]);

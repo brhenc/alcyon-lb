@@ -179,6 +179,21 @@ fn check_upgrade_response(head: &[u8], status: u16, req: &ReqWs, accept_unsafe: 
 mod tests {
     use super::*;
 
+    /// `of` passes over the headers it does not read: given all of a head's headers, it
+    /// says what it says given only the ones `reads` keeps (what the proxy gives it).
+    #[test]
+    fn of_passes_over_other_headers() {
+        let key = "dGhlIHNhbXBsZSBub25jZQ==";
+        let all = [("Host", "x"), ("Connection", "Upgrade"), ("X-Upgrade", "websocket"), ("Upgrade", "websocket"), ("Sec-WebSocket-Key", key), ("Accept", "*/*")];
+        let kept: Vec<(&str, &str)> = all.iter().copied().filter(|(n, _)| ReqWs::reads(n.as_bytes())).collect();
+        assert_eq!(kept.len(), 3);
+        let (a, wa) = ReqWs::of(all.iter().copied(), false);
+        let (k, wk) = ReqWs::of(kept.into_iter(), false);
+        assert_eq!((a, wa), (k, wk));
+        assert!(a.upgrade);
+        assert_eq!(&a.key, key.as_bytes());
+    }
+
     #[test]
     fn accept_of_the_rfc_example_and_of_no_key() {
         assert_eq!(accept(b"dGhlIHNhbXBsZSBub25jZQ=="), "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");

@@ -1134,18 +1134,6 @@ pub fn status_of(head: &str) -> u16 {
         .unwrap_or(0)
 }
 
-/// What a request head takes of `HAProxy`'s buffer once parsed into HTX, which is what
-/// `tune.bufsize - tune.maxrewrite` is held against: the data (`htx_head_size`), the 40
-/// bytes of `struct htx`, and an 8-byte `struct htx_blk` for each of the start line, the
-/// headers and the end of headers (`HTX_BUF_OVERHEAD` and `struct htx_blk`,
-/// `include/haproxy/htx-t.h`). Measured by bisecting the size of the head on 3.5-dev8
-/// (`tasks/T87`): with `bufsize 4096` and `maxrewrite 1024`, `GET / HTTP/1.1` and one
-/// 2953-byte header is the largest accepted. A head that is not UTF-8 is counted on the
-/// wire, plus the 40 bytes.
-#[must_use]
-pub fn htx_head_cost(head: &[u8]) -> usize {
-    head_cost(head, true)
-}
 
 /// Whether the request line in `buf` is one `HAProxy` answers with a 414 (T282): once its
 /// line feed is in, the start-line block (the 40 bytes of an HTX, the 20 of the block and the
@@ -1169,7 +1157,7 @@ pub fn request_line_too_long(buf: &[u8], bufsize: usize) -> bool {
     60 + strings > bufsize
 }
 
-/// `htx_head_cost` of a response head (T265): the same accounting, with the start line read
+/// `htx_head_cost_and_size` of a response head (T265): the same accounting, with the start line read
 /// as a status line.
 #[must_use]
 pub fn htx_response_head_cost(head: &[u8]) -> usize {
@@ -1187,7 +1175,16 @@ fn head_cost_of(head: &[u8], size: Option<u64>) -> usize {
     data.saturating_add(40 + 8 * blocks)
 }
 
-/// [`htx_head_cost`] and [`htx_head_size`] of a request head, read once.
+/// What a request head takes of `HAProxy`'s buffer once parsed into HTX, which is what
+/// `tune.bufsize - tune.maxrewrite` is held against: the data (`htx_head_size`), the 40
+/// bytes of `struct htx`, and an 8-byte `struct htx_blk` for each of the start line, the
+/// headers and the end of headers (`HTX_BUF_OVERHEAD` and `struct htx_blk`,
+/// `include/haproxy/htx-t.h`). Measured by bisecting the size of the head on 3.5-dev8
+/// (`tasks/T87`): with `bufsize 4096` and `maxrewrite 1024`, `GET / HTTP/1.1` and one
+/// 2953-byte header is the largest accepted. A head that is not UTF-8 is counted on the
+/// wire, plus the 40 bytes.
+///
+/// Returned with [`htx_head_size`] of the same head, read once.
 #[must_use]
 pub fn htx_head_cost_and_size(head: &[u8]) -> (usize, Option<u64>) {
     let size = htx_head_size(head, true);
