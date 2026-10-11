@@ -206,6 +206,8 @@ pub struct CliApplet {
     pub out_buf: Vec<u8>,
     pub out_offset: usize,
     pub interactive: bool,
+    /// `experimental-mode on` was sent on this connection.
+    experimental: bool,
     pub timeout_ms: u32,
     pub last_activity: Tick,
     pub is_done: bool,
@@ -256,6 +258,7 @@ impl CliApplet {
             out_buf: Vec::with_capacity(4096),
             out_offset: 0,
             interactive: false,
+            experimental: false,
             timeout_ms: DEFAULT_CLI_TIMEOUT_MS,
             last_activity: now,
             is_done: false,
@@ -454,6 +457,16 @@ impl CliApplet {
 
     #[allow(clippy::too_many_lines)]
     fn execute_command(&mut self, cmd: &str, ctx: &mut AppletContext) {
+        // Every command line is cut into words with `cli_parse_request`'s unescaping. The
+        // handlers that need the word boundaries (map, ACL, `set var`) cut the raw line
+        // themselves; for the others the words are put back, single-spaced.
+        let normalized;
+        let cmd = if Self::is_patref_command(cmd) || cmd.starts_with("set var ") || !cmd.contains('\\') {
+            cmd
+        } else {
+            normalized = cli_words(cmd).join(" ");
+            &normalized
+        };
         if self.level < CliLevel::required_for(cmd) {
             self.finish_msg("Permission denied");
         } else if cmd == "user" || cmd == "operator" {
@@ -687,6 +700,7 @@ impl CliApplet {
         } else if let Some(rest) = cmd.strip_prefix("set maxconn ") {
             self.handle_set_maxconn(rest.trim(), ctx);
         } else if cmd == "experimental-mode on" || cmd == "experimental-mode off" {
+            self.experimental = cmd.ends_with(" on");
             if self.interactive {
                 self.out_buf.extend_from_slice(b"\n> ");
             } else {
@@ -694,6 +708,8 @@ impl CliApplet {
             }
         } else if cmd == "get var" || cmd.starts_with("get var ") {
             self.handle_get_var(cmd["get var".len()..].trim());
+        } else if cmd.starts_with("set var ") && !self.experimental {
+            self.finish_msg("This command is restricted to experimental mode only.");
         } else if let Some(target) = cmd.strip_prefix("set var ") {
             self.handle_set_var(&cli_words(target).join(" "));
         } else if cmd == "help" {

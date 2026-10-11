@@ -61,7 +61,8 @@ fn start(tag: &str) -> Ibex {
          frontend f\n  bind {fe}\n  acl okpath path -f {acl}\n\
          \x20 http-request set-var(txn.m) path,map({map},none)\n\
          \x20 http-request return status 200 hdr x-m %[var(txn.m)] if okpath\n\
-         \x20 http-request return status 200 hdr x-m %[var(txn.m)]\n",
+         \x20 http-request return status 200 hdr x-m %[var(txn.m)]\n\
+         backend be\n  server s1 127.0.0.1:1 weight 7\n",
         sock = sock.display(),
         acl = acl.display(),
         map = map.display(),
@@ -142,8 +143,30 @@ fn del_acl_and_set_var_unescape_backslashes() {
         (r"set var proc.v str(a\nb)", "proc.v: type=str value=<anb>\n\n"),
         (r"set var proc.y fmt a\ b\\c", "proc.y: type=str value=<a b\\c>\n\n"),
     ] {
-        cli(&ibex, cmd);
+        cli(&ibex, &format!("experimental-mode on;{cmd}"));
         let name = cmd.split(' ').nth(2).unwrap();
         assert_eq!(cli(&ibex, &format!("get var {name}")), want, "{cmd}");
     }
+}
+
+/// Every command line goes through the same word cutting (`get weight` here), not only
+/// the map, ACL and `set var` ones. Measured on HAProxy: `get weight be/s\1` answers
+/// `7 (initial 7)`, `get weight be/s\ 1` (one word, `be/s 1`) `No such server.`.
+#[test]
+fn every_command_unescapes_backslashes() {
+    let ibex = start("every");
+    assert_eq!(cli(&ibex, r"get weight be/s\1"), "7 (initial 7)\n\n");
+    assert_eq!(cli(&ibex, r"get weight be\/s1"), "7 (initial 7)\n\n");
+    assert_eq!(cli(&ibex, r"get weight be/s\ 1"), "No such server.\n\n");
+}
+
+/// `set var` needs `experimental-mode on` (measured: `This command is restricted to
+/// experimental mode only.` and an empty line, the variable stays unset).
+#[test]
+fn set_var_needs_experimental_mode() {
+    let ibex = start("expmode");
+    assert_eq!(cli(&ibex, "set var proc.a str(x)"), "This command is restricted to experimental mode only.\n\n");
+    assert_eq!(cli(&ibex, "get var proc.a"), "Variable not found.\n\n");
+    let out = cli_raw(&ibex, "prompt\nexperimental-mode on\nset var proc.a str(x)\nget var proc.a\nquit\n");
+    assert!(out.contains("proc.a: type=str value=<x>"), "{out:?}");
 }
