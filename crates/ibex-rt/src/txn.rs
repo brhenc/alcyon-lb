@@ -1145,12 +1145,13 @@ pub fn request_version_invalid(buf: &[u8]) -> bool {
     let line = &buf[..lf.unwrap_or(buf.len())];
     let line = if lf.is_some() { line.strip_suffix(b"\r").unwrap_or(line) } else { line };
     let blank = |b: &u8| matches!(b, b' ' | b'\t');
-    let toks: Vec<&[u8]> = line.split(blank).filter(|t| !t.is_empty()).collect();
-    if toks.len() < 3 {
+    // The first three tokens and whether there are more; no Vec, this runs on every request.
+    let mut toks = line.split(blank).filter(|t| !t.is_empty());
+    let (_, second, third, more) = (toks.next(), toks.next(), toks.next(), toks.next().is_some());
+    let Some(v) = third else {
         // No version at all, once the line is whole.
-        return lf.is_some() && toks.len() == 2;
-    }
-    let v = toks[2];
+        return lf.is_some() && second.is_some();
+    };
     let fits = |v: &[u8]| {
         v.iter().enumerate().all(|(i, &b)| match i {
             0 => b == b'H',
@@ -1162,7 +1163,7 @@ pub fn request_version_invalid(buf: &[u8]) -> bool {
             _ => false,
         })
     };
-    if toks.len() > 3 || !fits(v) || line.last().is_some_and(blank) {
+    if more || !fits(v) || line.last().is_some_and(blank) {
         return true;
     }
     lf.is_some() && v.len() != 8

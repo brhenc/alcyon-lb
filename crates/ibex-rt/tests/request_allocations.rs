@@ -227,6 +227,30 @@ fn a_steady_state_http_request_allocates_no_more_than_n_times() {
     let _ = be.join();
 }
 
+/// The request-line version check runs on every HTTP/1 request (proxy.rs, before the
+/// head is parsed): it must not allocate. T286 added it with a `Vec` of the line's
+/// tokens, 64 bytes per request (measuring gate on 18bddeb: Bytes / req 151 -> 191).
+#[test]
+fn the_request_version_check_allocates_nothing() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let lines: [&[u8]; 6] = [
+        b"GET / HTTP/1.1\r\nHost: x\r\n\r\n",
+        b"GET  /a  HTTP/1.0\r\n",
+        b"GET / HTTP/1.9 extra\r\n",
+        b"GET /\r\n",
+        b"GET / HTTP/1.1",
+        b"GET / HTTP/1.1 \r\n",
+    ];
+    let before = ibex_alloc::alloc_counters();
+    let mut invalid = 0;
+    for l in lines {
+        invalid += usize::from(std::hint::black_box(ibex_rt::txn::request_version_invalid(l)));
+    }
+    let diff = before.diff(&ibex_alloc::alloc_counters());
+    assert_eq!(invalid, 3, "the verdicts did not change: extra token, no version, trailing blank");
+    assert_eq!(diff.alloc_count, 0, "request_version_invalid allocated: {diff:?}");
+}
+
 /// Baseline TCP connection allocation test.
 ///
 /// **Date**: 2026-09-22
