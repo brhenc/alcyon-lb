@@ -428,3 +428,82 @@ pub(crate) fn pump_h2_body(msg: &mut ibex_proto::htx::Htx, st: &mut H2ReqBody, r
     }
     wrote
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proxy::Timeouts;
+    use ibex_proto::conn::ConnId;
+    use std::os::unix::net::UnixStream;
+
+    fn session() -> (TcpSession, UnixStream) {
+        let (cli, peer) = UnixStream::pair().expect("pair");
+        (TcpSession::new(cli.into(), Timeouts::default(), 0, ibex_sched::Tick(1000)), peer)
+    }
+
+    fn dispatch(head: &[u8]) -> H2Dispatch {
+        H2Dispatch {
+            stream: H2ActiveStream { id: 1, body: H2ReqBody::default(), chunk_out: false },
+            head: head.to_vec(),
+            req_htx: 7,
+            request_line: None,
+            method: None,
+            uri: None,
+            headers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_head_the_h1_parser_refuses_still_starts_the_transaction_without_parsed_htx() {
+        let (mut s, _peer) = session();
+        let head = b"\x01\x02 not a request line\r\n\r\n";
+        start_request(&mut s, dispatch(head));
+        assert!(!s.has_htx, "the parser refused the head: no HTX for the rules");
+        assert_eq!(s.req.readable(), head, "the head is in `req` as it came");
+        assert_eq!(s.txn.as_ref().and_then(|t| t.req_htx), Some(7));
+        assert_eq!(s.h2_stream.as_ref().map(|a| a.id), Some(1));
+        assert_eq!(s.cli_state, ScState::Established);
+        // The same with a head it takes: parsed for the rules.
+        let (mut s, _peer) = session();
+        start_request(&mut s, dispatch(b"GET / HTTP/1.1\r\nhost: x\r\n\r\n"));
+        assert!(s.has_htx, "a valid head is parsed");
+    }
+
+    #[test]
+    fn a_stream_the_mux_no_longer_has_moves_no_body() {
+        let mut h2 = H2MuxContext::new(ConnId(0), true);
+        let mut active = H2ActiveStream { id: 9, body: H2ReqBody::default(), chunk_out: false };
+        let mut req = Buf::with_capacity(64);
+        let tx = h2.tx_buf.len();
+        assert_eq!(pump_request_body(&mut h2, &mut active, &mut req), (false, 0));
+        assert!(req.is_empty());
+        assert_eq!(active.body.consumed, 0);
+        assert_eq!(h2.tx_buf.len(), tx, "no WINDOW_UPDATE for it");
+    }
+
+    #[test]
+    fn a_response_head_without_a_body_is_one_headers_frame_with_end_stream() {
+        let mut h2 = H2MuxContext::new(ConnId(0), true);
+        let mut txn = HttpTxn::new(txn::Framing::None, false);
+        txn.rsp = MsgState::Head { left: 0, body: txn::Framing::None };
+        let mut rep = Buf::with_capacity(256);
+        assert!(rep.put(b"HTTP/1.1 204 No Content\r\nx-a: b\r\n\r\n"));
+        let tx = h2.tx_buf.len();
+        assert!(!forward_response(&mut h2, 1, &mut txn, &mut rep, false));
+        assert!(rep.is_empty(), "the head was taken");
+        let frame = &h2.tx_buf[tx..];
+        assert!(frame.len() > 9, "a frame was queued");
+        assert_eq!(frame[3], 1, "HEADERS");
+        assert_eq!(frame[4] & 1, 1, "END_STREAM");
+        assert_eq!(frame.len(), 9 + ((usize::from(frame[0]) << 16) | (usize::from(frame[1]) << 8) | usize::from(frame[2])), "and nothing after it");
+    }
+
+    #[test]
+    fn a_reset_with_no_transaction_changes_nothing() {
+        let (mut s, _peer) = session();
+        let state = s.srv_state;
+        assert!(!abort_reset_stream(&mut s));
+        assert!(s.log.term.is_none());
+        assert_eq!(s.srv_state, state);
+    }
+}
