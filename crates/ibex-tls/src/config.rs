@@ -12,6 +12,84 @@ use std::sync::Arc;
 /// `tune.ssl.cachesize`.
 const SESSION_CACHE_SIZE: usize = 20000;
 
+/// How long a session can be resumed, in seconds: OpenSSL's default session timeout,
+/// which `HAProxy` keeps unless `tune.ssl.lifetime` is set (Ibex refuses that keyword).
+/// Its NewSessionTicket advertises it as the lifetime hint.
+const SESSION_LIFETIME: u32 = 7200;
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// A fresh ticket key: ring's AEAD ticketer, used by [`rustls::TicketRotator`] for one
+/// rotation period. rustls keeps its own generator private; the ticketer it does export
+/// rotates every 6 hours, which is never reached here because the rotator drops it first.
+fn ticket_key() -> Result<Box<dyn rustls::server::ProducesTickets>, rustls::crypto::GetRandomFailed> {
+    let t = rustls::crypto::ring::Ticketer::new().map_err(|_| rustls::crypto::GetRandomFailed)?;
+    Ok(Box::new(TicketKey(t)))
+}
+
+#[derive(Debug)]
+struct TicketKey(Arc<dyn rustls::server::ProducesTickets>);
+
+impl rustls::server::ProducesTickets for TicketKey {
+    fn enabled(&self) -> bool {
+        self.0.enabled()
+    }
+    fn lifetime(&self) -> u32 {
+        self.0.lifetime()
+    }
+    fn encrypt(&self, plain: &[u8]) -> Option<Vec<u8>> {
+        self.0.encrypt(plain)
+    }
+    fn decrypt(&self, cipher: &[u8]) -> Option<Vec<u8>> {
+        self.0.decrypt(cipher)
+    }
+}
+
+/// The session-ID cache (TLS 1.2 resumption by ID), whose entries are refused once
+/// `lifetime` seconds old: rustls's memory cache only evicts by size.
+#[derive(Debug)]
+struct ExpiringSessions {
+    inner: Arc<rustls::server::ServerSessionMemoryCache>,
+    lifetime: u64,
+    now: fn() -> u64,
+}
+
+impl ExpiringSessions {
+    fn new(size: usize, lifetime: u32, now: fn() -> u64) -> Self {
+        Self { inner: rustls::server::ServerSessionMemoryCache::new(size), lifetime: u64::from(lifetime), now }
+    }
+
+    /// The value stored with its creation time in front, if it is still fresh.
+    fn fresh(&self, stored: Option<Vec<u8>>) -> Option<Vec<u8>> {
+        let mut v = stored?;
+        let born = u64::from_be_bytes(v.get(..8)?.try_into().ok()?);
+        if (self.now)().saturating_sub(born) > self.lifetime {
+            return None;
+        }
+        v.drain(..8);
+        Some(v)
+    }
+}
+
+impl rustls::server::StoresServerSessions for ExpiringSessions {
+    fn put(&self, key: Vec<u8>, value: Vec<u8>) -> bool {
+        let mut v = (self.now)().to_be_bytes().to_vec();
+        v.extend_from_slice(&value);
+        self.inner.put(key, v)
+    }
+    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.fresh(self.inner.get(key))
+    }
+    fn take(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.fresh(self.inner.take(key))
+    }
+    fn can_cache(&self) -> bool {
+        self.inner.can_cache()
+    }
+}
+
 /// Installs the default `ring` crypto provider for the process.
 pub fn install_default_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -109,9 +187,17 @@ impl TlsConfig {
         // session, and a flood of reconnecting clients made every handshake a full one,
         // an RSA signature each, where `HAProxy` resumed them (T283, MY-2). The
         // `ServerConfig` is shared by every worker (`from_bind_config`), so are the keys.
-        config.session_storage = rustls::server::ServerSessionMemoryCache::new(SESSION_CACHE_SIZE);
+        //
+        // A session lasts `SESSION_LIFETIME` (OpenSSL's default timeout, which `HAProxy`
+        // keeps without `tune.ssl.lifetime`). rustls checks no age on resumption, so the
+        // bound is the ticket keys' rotation (a key encrypts for half the lifetime and
+        // decrypts for the other half) and the session-ID store's own expiry.
+        config.session_storage = Arc::new(ExpiringSessions::new(SESSION_CACHE_SIZE, SESSION_LIFETIME, unix_now));
         if self.session_tickets_enabled {
-            config.ticketer = rustls::crypto::ring::Ticketer::new().map_err(|e| format!("session ticket keys: {e}"))?;
+            config.ticketer = Arc::new(
+                rustls::TicketRotator::new(SESSION_LIFETIME / 2, ticket_key)
+                    .map_err(|e| format!("session ticket keys: {e}"))?,
+            );
         } else {
             config.send_tls13_tickets = 0;
         }
@@ -958,4 +1044,36 @@ pub fn extract_subject_cn(der: &[u8]) -> Option<String> {
         }
     }
     cn
+}
+
+#[cfg(test)]
+mod expiring_sessions {
+    use super::ExpiringSessions;
+    use rustls::server::StoresServerSessions;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NOW: AtomicU64 = AtomicU64::new(1_000_000);
+    fn now() -> u64 {
+        NOW.load(Ordering::Relaxed)
+    }
+
+    /// An entry is served up to its lifetime and refused after, by `get` and `take`.
+    #[test]
+    fn a_session_id_expires_after_its_lifetime() {
+        let s = ExpiringSessions::new(16, 7200, now);
+        assert!(s.can_cache());
+        assert!(s.put(b"a".to_vec(), b"one".to_vec()));
+        assert!(s.put(b"b".to_vec(), b"two".to_vec()));
+        NOW.fetch_add(7200, Ordering::Relaxed);
+        assert_eq!(s.get(b"a"), Some(b"one".to_vec()));
+        NOW.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(s.get(b"a"), None);
+        assert_eq!(s.take(b"b"), None);
+        assert_eq!(s.get(b"missing"), None);
+        // A value too short to carry its time is no session.
+        assert_eq!(s.fresh(Some(vec![1, 2, 3])), None);
+        assert!(s.put(b"c".to_vec(), b"three".to_vec()));
+        assert_eq!(s.take(b"c"), Some(b"three".to_vec()));
+        assert_eq!(s.take(b"c"), None);
+    }
 }
