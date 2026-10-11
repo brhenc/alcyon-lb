@@ -42,35 +42,42 @@ fn backend(listener: TcpListener, running: Arc<AtomicBool>) -> thread::JoinHandl
     backend_after(listener, running, Duration::ZERO)
 }
 
-/// A keep-alive backend that takes `delay` to answer each request.
+/// A keep-alive backend that takes `delay` to answer each request, a thread per
+/// connection (the streams of an h2 connection are served at once, each on a server
+/// connection of its own, T280).
 fn backend_after(listener: TcpListener, running: Arc<AtomicBool>, delay: Duration) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         listener.set_nonblocking(true).expect("nonblocking");
         while running.load(Ordering::Relaxed) {
-            let Ok((mut s, _)) = listener.accept() else {
+            let Ok((s, _)) = listener.accept() else {
                 thread::sleep(Duration::from_millis(1));
                 continue;
             };
-            s.set_nonblocking(false).expect("blocking");
-            s.set_read_timeout(Some(Duration::from_millis(200))).expect("timeout");
-            let mut pending = Vec::new();
-            let mut buf = [0u8; 4096];
-            while running.load(Ordering::Relaxed) {
-                match s.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => pending.extend_from_slice(&buf[..n]),
-                    Err(_) => continue,
-                }
-                while let Some(p) = pending.windows(4).position(|w| w == b"\r\n\r\n") {
-                    pending.drain(..p + 4);
-                    thread::sleep(delay);
-                    if s.write_all(RESPONSE).is_err() {
-                        break;
-                    }
-                }
-            }
+            let running = Arc::clone(&running);
+            thread::spawn(move || serve(s, &running, delay));
         }
     })
+}
+
+fn serve(mut s: TcpStream, running: &AtomicBool, delay: Duration) {
+    s.set_nonblocking(false).expect("blocking");
+    s.set_read_timeout(Some(Duration::from_millis(200))).expect("timeout");
+    let mut pending = Vec::new();
+    let mut buf = [0u8; 4096];
+    while running.load(Ordering::Relaxed) {
+        match s.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => pending.extend_from_slice(&buf[..n]),
+            Err(_) => continue,
+        }
+        while let Some(p) = pending.windows(4).position(|w| w == b"\r\n\r\n") {
+            pending.drain(..p + 4);
+            thread::sleep(delay);
+            if s.write_all(RESPONSE).is_err() {
+                break;
+            }
+        }
+    }
 }
 
 fn frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {

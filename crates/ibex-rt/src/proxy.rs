@@ -260,11 +260,6 @@ impl ClientSide {
     }
 }
 
-/// How many streams of an HTTP/2 connection are served at once (T280 stage 3a: one, as
-/// before the streams had entries of their own). Stage 3b lifts it to the connection's
-/// `SETTINGS_MAX_CONCURRENT_STREAMS`.
-pub const H2_MAX_CHILDREN: usize = 1;
-
 /// A session's part in an HTTP/2 connection (T280): `HAProxy`'s `h2c` (the owner, the entry
 /// that accepted the socket: the mux, the socket, the connection's timers) and its `h2s` +
 /// `struct stream` (a child: one entry per stream being served, with its own transaction,
@@ -277,11 +272,15 @@ pub enum H2Role {
 /// The owner's side: its children.
 #[derive(Default)]
 pub struct H2Owner {
-    /// The entries serving the connection's streams, at most [`H2_MAX_CHILDREN`].
+    /// The entries serving the connection's streams, at most [`TcpSession::h2_max_children`].
     pub children: Vec<H2ChildLink>,
     /// The client's TLS session as the `ssl_fc*` fetches of every stream read it: one copy
     /// for the connection, shared.
     pub tls: Option<Arc<ibex_tls::RustlsTlsInfo>>,
+    /// Where the next pass that moves the streams' bytes starts: after the stream that sent
+    /// DATA last, so that one with a big body cannot take the connection's window from the
+    /// others pass after pass (`HAProxy`'s `send_list`, round robin).
+    pub next_child: usize,
     /// A child holds the client's timer off (`cli_timer_live`): it is tarpitted, or a
     /// retry waits out its turnaround.
     pub child_holds_timer: bool,
@@ -333,6 +332,9 @@ pub struct H2Child {
     /// re-armed for it, as any progress of the session's re-armed it.
     pub progressed: bool,
     pub tls: Option<Arc<ibex_tls::RustlsTlsInfo>>,
+    /// The connection's session variables as the stream got them: what it changed of them
+    /// goes back to the connection, and only that, as other streams may have set others.
+    pub sess_vars_at_start: HashMap<String, String>,
 }
 
 impl H2Child {
@@ -714,8 +716,12 @@ impl TcpSession {
         c.close_client = owner.close_client;
         c.bytes_in = owner.bytes_in;
         c.bytes_out = owner.bytes_out;
+        // The bytes not credited yet are the stream's to credit (with its request): the
+        // connection's accounting moves past them, so a stream served beside it does not
+        // credit them again.
         c.stick_acct_in = owner.stick_acct_in;
-        c.stick_out_pending = owner.stick_out_pending;
+        c.stick_out_pending = std::mem::take(&mut owner.stick_out_pending);
+        owner.stick_acct_in = owner.stick_acct_in.max(owner.log.bytes_in_at_start);
         c.accept_proxy = owner.accept_proxy;
         c.accept_proxy_v2 = owner.accept_proxy_v2;
         c.proxy_handshake_done = owner.proxy_handshake_done;
@@ -747,6 +753,7 @@ impl TcpSession {
             owner_tx_pending: false,
             progressed: false,
             tls,
+            sess_vars_at_start: owner.sess_vars.clone(),
         })));
         c
     }
@@ -756,10 +763,24 @@ impl TcpSession {
     /// (`reset_for_next_request`). `inspect`: the frontend's `tcp-request content` rules
     /// are armed again for the next request, with this deadline.
     pub fn h2_child_done(&mut self, child: &mut TcpSession, inspect: Option<Option<Tick>>) {
-        self.sess_vars = std::mem::take(&mut child.sess_vars);
-        self.tracked_sc = std::mem::take(&mut child.tracked_sc);
-        self.stick_acct_in = child.stick_acct_in;
-        self.stick_out_pending = child.stick_out_pending + child.log.bytes_from_server;
+        // Other streams may be served beside this one: what it changed is merged in, the
+        // rest of the connection's state is left as they made it.
+        let at_start = child.h2_child_mut().map(|c| std::mem::take(&mut c.sess_vars_at_start)).unwrap_or_default();
+        for k in at_start.keys().filter(|k| !child.sess_vars.contains_key(*k)) {
+            self.sess_vars.remove(k);
+        }
+        for (k, v) in child.sess_vars.drain() {
+            if at_start.get(&k) != Some(&v) {
+                self.sess_vars.insert(k, v);
+            }
+        }
+        for (mine, theirs) in self.tracked_sc.iter_mut().zip(&mut child.tracked_sc) {
+            if mine.is_none() {
+                *mine = theirs.take();
+            }
+        }
+        self.stick_acct_in = self.stick_acct_in.max(child.stick_acct_in);
+        self.stick_out_pending += child.stick_out_pending + child.log.bytes_from_server;
         self.log = crate::txnlog::StreamLog::start(self.bytes_in, self.bytes_out);
         self.is_first_req = false;
         self.ending = None;
@@ -770,8 +791,13 @@ impl TcpSession {
         // The streams that are over are let go, as `HAProxy` frees a stream when it closes
         // (`h2s_destroy`). Kept, each held its request for the life of the connection and
         // every request walked all of them: 88% of the CPU of an h2 request (T186).
+        // A stream another entry still serves is kept until that one is over.
+        let served = match self.h2_role.as_deref() {
+            Some(H2Role::Owner(o)) => &o.children[..],
+            _ => &[],
+        };
         if let Some(h2) = self.h2_ctx.as_mut() {
-            h2.streams.retain(|_, s| !matches!(s.state, ibex_proto::H2StreamState::Closed | ibex_proto::H2StreamState::Reset(_)));
+            h2.streams.retain(|id, s| served.iter().any(|l| l.stream_id == *id) || !matches!(s.state, ibex_proto::H2StreamState::Closed | ibex_proto::H2StreamState::Reset(_)));
         }
     }
 
@@ -1041,14 +1067,22 @@ impl TcpSession {
             || (self.srv_state == ScState::Error && self.srv_xprt.handshake_failed())
     }
 
+    /// How many streams of an HTTP/2 connection are served at once (T280): as many as the
+    /// connection advertised it takes (`SETTINGS_MAX_CONCURRENT_STREAMS`), each by an entry
+    /// of its own; the mux refuses those over it.
+    #[must_use]
+    pub fn h2_max_children(&self) -> usize {
+        self.h2_ctx.as_ref().map_or(0, |h| h.max_concurrent_streams as usize)
+    }
+
     /// A stream with its request in, waiting for its turn, and the turn free: as many
-    /// streams are served at once as [`H2_MAX_CHILDREN`], so while that many are the others
+    /// streams are served at once as [`Self::h2_max_children`], so while that many are the others
     /// wait for one's end (the child's release runs the owner again then). Counting them
     /// while one was at the server had the session requeue itself on every pass, a busy
     /// loop as long as the server took (T186).
     #[must_use]
     pub fn has_undispatched_h2_streams(&self) -> bool {
-        if self.h2_owner().is_some_and(|o| o.children.len() >= H2_MAX_CHILDREN) || self.txn.is_some() {
+        if self.h2_owner().is_some_and(|o| o.children.len() >= self.h2_max_children()) || self.txn.is_some() {
             return false;
         }
         if let Some(ref h2) = self.h2_ctx {
@@ -3100,6 +3134,16 @@ fn h3_log_line(line: &str, host: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// A stream of an HTTP/2 connection has no socket of its own (T280): reads and writes
+    /// on its client side find nothing to do, its owner moves its bytes.
+    #[test]
+    fn an_h2_streams_client_side_reads_and_writes_nothing() {
+        let (mut x, side) = (super::ClientXprt::Plain, super::ClientSide::H2Child);
+        assert!(matches!(side.recv(&mut x, &mut [0u8; 8]), Ok(super::Io::WouldBlock)));
+        assert!(matches!(side.send(&mut x, b"x"), Ok(super::Io::WouldBlock)));
+        side.shutdown_read();
+    }
 
     /// Every string of up to eight bytes out of `a`, CR and LF.
     #[test]

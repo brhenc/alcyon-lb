@@ -4587,7 +4587,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
     }
 
     /// The streams of HTTP/2 connection `owner_idx` whose request heads are in get entries of
-    /// their own (T280), as many as [`crate::proxy::H2_MAX_CHILDREN`] at once: a child
+    /// their own (T280), as many as [`TcpSession::h2_max_children`] at once: a child
     /// session that starts the stream's transaction, with a task of its own, run with its
     /// owner (which moves the request's body).
     fn spawn_h2_children(&mut self, owner_idx: u32, owner_task: TaskRef, wake_queue: &mut Vec<TaskRef>) {
@@ -4595,14 +4595,13 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             let Some(owner) = self.sessions.get_mut(owner_idx).filter(|o| o.task == owner_task) else { return };
             if owner.sess.is_done()
                 || !matches!(owner.sess.cli_state, ScState::Ready | ScState::Established)
-                || owner.sess.h2_owner_mut().is_none_or(|o| o.children.len() >= crate::proxy::H2_MAX_CHILDREN)
+                || owner.sess.h2_owner().is_none_or(|o| o.children.len() >= owner.sess.h2_max_children())
             {
                 return;
             }
             let keep = owner.sess.keep_request_line;
             let Some(d) = owner.sess.h2_ctx.as_deref_mut().and_then(|h2| crate::h2_bridge::dispatch_next(h2, keep)) else { return };
             let stream_id = d.stream.id;
-            let (inspect_done, inspect_exp) = (owner.sess.tcp_inspect_done, owner.sess.inspect_exp);
             let sess = TcpSession::h2_child_of(&mut owner.sess, (owner_idx, owner_task), d.stream);
             let entry = SessionEntry {
                 sess,
@@ -4626,23 +4625,9 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 log_line: None,
                 log_err: false,
             };
-            let child_idx = self.sessions.alloc(entry);
-            let task = child_idx.and_then(|i| self.scheduler.create(WorkKind::new(Kind::Stream, i)));
-            let (Some(child_idx), Some(task)) = (child_idx, task) else {
-                // No entry or no task for it: the stream is refused, as one over the limit.
-                if let Some(i) = child_idx {
-                    self.sessions.free(i);
-                }
-                if let Some(owner) = self.sessions.get_mut(owner_idx) {
-                    owner.sess.tcp_inspect_done = inspect_done;
-                    owner.sess.inspect_exp = inspect_exp;
-                    if let Some(h2) = owner.sess.h2_ctx.as_deref_mut() {
-                        h2.send_rst_stream(stream_id, ibex_proto::h2::H2Error::RefusedStream);
-                    }
-                }
-                wake_queue.push(owner_task);
-                return;
-            };
+            // Neither fails before the `u32` indices run out.
+            let Some(child_idx) = self.sessions.alloc(entry) else { return };
+            let Some(task) = self.scheduler.create(WorkKind::new(Kind::Stream, child_idx)) else { self.sessions.free(child_idx); return };
             let Some((owner, child)) = self.sessions.get2_mut(owner_idx, child_idx) else { return };
             child.task = task;
             // A server connection the last stream kept goes to this one, as the session
@@ -8489,15 +8474,26 @@ impl EngineDispatcher<'_> {
     /// and DATA (written in the same pass: one write a response, T186), and what happened
     /// to the connection or the stream (a reset, the client leaving, a timeout) to the
     /// child. A child that got something to work on is run. A stream with its head in and
-    /// a free place gets an entry after the pass (`h2_spawn`).
+    /// a free place gets an entry after the pass (`h2_spawn`). The streams take the
+    /// connection's window in turns: the pass starts after the one that sent DATA last.
     fn h2_owner_pass(&mut self, owner_idx: u32, now: Tick) {
-        let n = self.sessions.get(owner_idx).and_then(|e| e.sess.h2_owner()).map_or(0, |o| o.children.len());
-        for i in 0..n {
+        let (n, first) = self.sessions.get(owner_idx).and_then(|e| e.sess.h2_owner()).map_or((0, 0), |o| (o.children.len(), o.next_child));
+        let mut sent_last = None;
+        for k in 0..n {
+            let i = (first + k) % n;
             let Some(link) = self.sessions.get(owner_idx).and_then(|e| e.sess.h2_owner()).and_then(|o| o.children.get(i).copied()) else { break };
             let Some((o, c)) = self.sessions.get2_mut(owner_idx, link.idx).filter(|(_, c)| c.task == link.task) else { continue };
+            let window = |o: &SessionEntry| o.sess.h2_ctx.as_ref().map_or(0, |h| h.conn_send_window);
+            let before = window(o);
             if h2_bridge_moves(o, c, now) {
                 self.wake_queue.push(link.task);
             }
+            if window(o) < before {
+                sent_last = Some(i);
+            }
+        }
+        if let Some((i, o)) = sent_last.zip(self.sessions.get_mut(owner_idx).and_then(|e| e.sess.h2_owner_mut())) {
+            o.next_child = i + 1;
         }
         // What the moves framed goes out now.
         if let Some(o) = self.sessions.get_mut(owner_idx) {
@@ -8531,6 +8527,11 @@ impl EngineDispatcher<'_> {
         }
         let (finished, conn_end) = child.sess.h2_child().map_or((false, None), |c| (c.finished, c.conn_end));
         if finished && conn_end.is_none() {
+            if owner.sess.srv.is_some() {
+                // Another stream already gave one back: this one goes to the pool, as
+                // `HAProxy`'s streams each release theirs.
+                release_server(child, self.proxies, self.fdtab, self.poller, self.idle_backend_pool, true);
+            }
             move_server(child, owner, self.fdtab);
             let fe = &self.proxies[owner.proxy_idx];
             let inspect = (!fe.tcp_req_content_rules.is_empty()).then(|| fe.tcp_req_inspect_delay.map(|d| now.add(u32::try_from(d.as_millis()).unwrap_or(u32::MAX))));
@@ -8925,6 +8926,9 @@ impl EngineDispatcher<'_> {
             }
             if let Some(mut entry) = self.sessions.free(session_idx) {
                 if entry.sess.is_h2_child() {
+                    // The stream is freed in its own run: its variables are in the run's map
+                    // until they go back to it here, for its connection's.
+                    stream_vars_leave(Some(&mut entry.sess));
                     self.h2_child_released(&mut entry, now);
                 } else if entry.sess.h2_owner().is_some_and(|o| !o.children.is_empty()) {
                     self.h2_owner_released(&mut entry);
@@ -13294,6 +13298,20 @@ fn build_templated_error_response(
     let mut full_resp = ibex_regex::bytetext::text_to_bytes(&resp).into_owned();
     full_resp.extend_from_slice(&body);
     full_resp
+}
+
+#[cfg(test)]
+mod arena_tests {
+    use super::SessionArena;
+
+    /// Two entries at once are two distinct, live ones (T280): the same index twice, or one
+    /// past the end, is none.
+    #[test]
+    fn get2_mut_is_none_for_one_entry_twice_or_a_missing_one() {
+        let mut a = SessionArena::with_capacity(2);
+        assert!(a.get2_mut(0, 0).is_none());
+        assert!(a.get2_mut(0, 1).is_none());
+    }
 }
 
 #[cfg(test)]

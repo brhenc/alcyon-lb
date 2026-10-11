@@ -101,6 +101,9 @@ pub struct H2MuxContext {
     pub conn_recv_window: i32,
     pub remote_initial_window: i32,
     pub local_initial_window: i32,
+    /// How many streams may be open at once: on a server connection the client's, as
+    /// advertised (`SETTINGS_MAX_CONCURRENT_STREAMS`); on a client connection ours, as the
+    /// server's SETTINGS say.
     pub max_concurrent_streams: u32,
     pub max_frame_size: u32,
     pub last_client_stream_id: u32,
@@ -922,9 +925,13 @@ impl MuxH2 {
                                     stream.send_window = stream.send_window.saturating_add(delta);
                                 }
                             }
-                            SettingsParameter::MaxConcurrentStreams => {
+                            // The peer's limit bounds the streams we open: a client's
+                            // limits the server's pushes (which a proxy never sends), not
+                            // its own requests, whose limit is the one advertised (T280).
+                            SettingsParameter::MaxConcurrentStreams if !ctx.is_server => {
                                 ctx.max_concurrent_streams = val;
                             }
+                            SettingsParameter::MaxConcurrentStreams => {}
                             SettingsParameter::MaxFrameSize => {
                                 ctx.max_frame_size = val;
                             }

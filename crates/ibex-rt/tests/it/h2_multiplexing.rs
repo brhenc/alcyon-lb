@@ -50,7 +50,9 @@ fn spawn_backend() -> (u16, Arc<Mutex<Vec<String>>>) {
     let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&seen);
     thread::spawn(move || {
-        for conn in listener.incoming().take(8) {
+        // A connection per stream served at once, as `HAProxy` opens (T280: with 8, the
+        // ten-stream burst's last two waited in the backlog on `HAProxy` 3.5-dev8 too).
+        for conn in listener.incoming().take(16) {
             let Ok(mut c) = conn else { continue };
             let sink = Arc::clone(&sink);
             thread::spawn(move || {

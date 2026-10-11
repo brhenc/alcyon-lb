@@ -50,44 +50,64 @@ fn wait_for_port(port: u16) -> bool {
     false
 }
 
-/// A backend that answers every request on its own connection: the head at once, then one
+/// A backend that answers every request ([`serve_backend_conn`]): the head at once, then one
 /// byte of body per `DRIP` -- unless the path is `/fast`, which gets the whole body at once.
 fn spawn_drip_backend() -> u16 {
     let l = TcpListener::bind("127.0.0.1:0").expect("bind backend");
     let port = l.local_addr().expect("addr").port();
     thread::spawn(move || {
         for c in l.incoming() {
-            let Ok(mut c) = c else { continue };
-            thread::spawn(move || {
-                let mut req = Vec::new();
-                let mut tmp = [0u8; 2048];
-                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
-                    match c.read(&mut tmp) {
-                        Ok(0) | Err(_) => return,
-                        Ok(n) => req.extend_from_slice(&tmp[..n]),
-                    }
-                }
-                let fast = req.starts_with(b"GET /fast ");
-                let head = format!("HTTP/1.1 200 OK\r\ncontent-length: {BODY_BYTES}\r\ncontent-type: text/plain\r\n\r\n");
-                if c.write_all(head.as_bytes()).is_err() {
-                    return;
-                }
-                if fast {
-                    let _ = c.write_all(&[b'f'; BODY_BYTES]);
-                } else {
-                    for _ in 0..BODY_BYTES {
-                        thread::sleep(DRIP);
-                        if c.write_all(b"x").is_err() {
-                            return;
-                        }
-                    }
-                }
-                // Hold the connection open a little: the proxy may reuse or close it.
-                thread::sleep(Duration::from_millis(200));
-            });
+            let Ok(c) = c else { continue };
+            thread::spawn(move || serve_backend_conn(c));
         }
     });
     port
+}
+
+/// `/big` is the size of the body of the fairness test: many times the connection window.
+const BIG: usize = 4 << 20;
+
+/// One backend connection: request after request (a proxy may reuse it). `/fast`: the whole
+/// body at once; `/big`: `BIG` bytes at once; `/small`: 100 bytes after 50 ms; `/slow`: 10
+/// bytes after 300 ms; anything else drips `BODY_BYTES` bytes one per `DRIP`.
+fn serve_backend_conn(mut c: TcpStream) {
+    let mut req = Vec::new();
+    let mut tmp = [0u8; 2048];
+    loop {
+        let end = loop {
+            if let Some(i) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                break i + 4;
+            }
+            match c.read(&mut tmp) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => req.extend_from_slice(&tmp[..n]),
+            }
+        };
+        let path = req.split(|&b| b == b' ').nth(1).map(<[u8]>::to_vec).unwrap_or_default();
+        req.drain(..end);
+        let (len, delay, drip) = match path.as_slice() {
+            b"/fast" => (BODY_BYTES, Duration::ZERO, false),
+            b"/big" => (BIG, Duration::ZERO, false),
+            b"/small" => (100, Duration::from_millis(50), false),
+            p if p.starts_with(b"/slow") => (10, Duration::from_millis(300), false),
+            _ => (BODY_BYTES, Duration::ZERO, true),
+        };
+        thread::sleep(delay);
+        let head = format!("HTTP/1.1 200 OK\r\ncontent-length: {len}\r\ncontent-type: text/plain\r\n\r\n");
+        if c.write_all(head.as_bytes()).is_err() {
+            return;
+        }
+        if drip {
+            for _ in 0..len {
+                thread::sleep(DRIP);
+                if c.write_all(b"x").is_err() {
+                    return;
+                }
+            }
+        } else if c.write_all(&vec![b'f'; len]).is_err() {
+            return;
+        }
+    }
 }
 
 fn frame(ftype: u8, flags: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
@@ -180,7 +200,6 @@ fn collect(s: &mut TcpStream, window: Duration) -> (Seen, Seen) {
 
 /// The probe as a test: ten streams to the dripping backend, all ten HEADERS within `BOUND`.
 #[test]
-#[ignore = "T280: red until stage 3b (streams served concurrently); run with --ignored"]
 fn ten_streams_to_a_dripping_backend_all_get_their_headers() {
     let (_d, mut s, cfg) = start();
     let ids: Vec<u32> = (0..10).map(|k| 1 + 2 * k).collect();
@@ -205,7 +224,6 @@ fn ten_streams_to_a_dripping_backend_all_get_their_headers() {
 /// The browser case: a fast response is not held behind a slow one opened before it on the
 /// same connection.
 #[test]
-#[ignore = "T280: red until stage 3b (streams served concurrently); run with --ignored"]
 fn a_fast_stream_is_not_held_behind_a_slow_one() {
     let (_d, mut s, cfg) = start();
     let mut burst = frame(0x01, 0x05, 1, &hpack_get("/drip"));
@@ -218,4 +236,288 @@ fn a_fast_stream_is_not_held_behind_a_slow_one() {
         "stream 3 (/fast, whole body at once) must end within {BOUND:?} although stream 1 \
          (/drip, {BODY_BYTES} bytes at one per {DRIP:?}) is still running; streams ended: {ends:?}"
     );
+}
+
+// ---- Tests measured on `HAProxy` too: `T280_ORACLE=/path/to/haproxy` runs them on it. ----
+
+/// The binary under test, or the oracle with `T280_ORACLE=/path/to/haproxy`.
+fn binary() -> String {
+    std::env::var("T280_ORACLE").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ibex").to_string())
+}
+
+struct Proxy {
+    child: Child,
+    port: u16,
+    stats: std::path::PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+impl Drop for Proxy {
+    fn drop(&mut self) {
+        common::stop(&mut self.child);
+    }
+}
+
+/// The h2c frontend `fe` with `fe_extra` in front of the backend of [`serve_backend_conn`],
+/// with a stats socket.
+fn start_proxy(fe_extra: &str) -> Proxy {
+    let backend = spawn_drip_backend();
+    let dir = tempfile::TempDir::new().expect("dir");
+    let stats = dir.path().join("s.sock");
+    let cfg = dir.path().join("c.cfg");
+    let port = common::reserve_port();
+    std::fs::write(
+        &cfg,
+        format!(
+            "global\n\tstats socket {}\n\
+             defaults\n\tmode http\n\ttimeout connect 3s\n\ttimeout client 10s\n\ttimeout server 10s\n\n\
+             frontend fe\n\tbind 127.0.0.1:{port} proto h2\n{fe_extra}\tdefault_backend be\n\n\
+             backend be\n\tserver s1 127.0.0.1:{backend}\n",
+            stats.display()
+        ),
+    )
+    .expect("write config");
+    let child = Command::new(binary()).arg("-f").arg(&cfg).arg("-db").stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn");
+    assert!(wait_for_port(port), "the proxy never listened on {port}");
+    Proxy { child, port, stats, _dir: dir }
+}
+
+impl Proxy {
+    /// A client connection: the preface and a SETTINGS frame with `settings`.
+    fn client(&self, settings: &[(u16, u32)]) -> TcpStream {
+        let mut s = TcpStream::connect(("127.0.0.1", self.port)).expect("connect");
+        let mut payload = Vec::new();
+        for &(id, v) in settings {
+            payload.extend_from_slice(&id.to_be_bytes());
+            payload.extend_from_slice(&v.to_be_bytes());
+        }
+        s.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").expect("preface");
+        s.write_all(&frame(0x04, 0, 0, &payload)).expect("settings");
+        s
+    }
+
+    fn cli(&self, cmd: &str) -> String {
+        let mut u = std::os::unix::net::UnixStream::connect(&self.stats).expect("stats socket");
+        u.write_all(format!("{cmd}\n").as_bytes()).expect("cli");
+        let mut out = String::new();
+        let _ = u.read_to_string(&mut out);
+        out
+    }
+}
+
+/// Reads frames until `f` says stop or `limit` passes; `f` gets (type, flags, stream, payload).
+fn read_frames(s: &mut TcpStream, limit: Duration, mut f: impl FnMut(&mut TcpStream, u8, u8, u32, &[u8]) -> bool) {
+    s.set_read_timeout(Some(Duration::from_millis(50))).ok();
+    let t0 = Instant::now();
+    let (mut buf, mut tmp) = (Vec::new(), [0u8; 16384]);
+    while t0.elapsed() < limit {
+        while buf.len() >= 9 {
+            let len = (usize::from(buf[0]) << 16) | (usize::from(buf[1]) << 8) | usize::from(buf[2]);
+            if buf.len() < 9 + len {
+                break;
+            }
+            let sid = u32::from_be_bytes([buf[5] & 0x7f, buf[6], buf[7], buf[8]]);
+            let (ty, flags) = (buf[3], buf[4]);
+            let payload = buf[9..9 + len].to_vec();
+            buf.drain(..9 + len);
+            if f(s, ty, flags, sid, &payload) {
+                return;
+            }
+        }
+        match s.read(&mut tmp) {
+            Ok(0) => return,
+            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+            Err(_) => {}
+        }
+    }
+}
+
+/// Opens `paths` as streams 1, 3, ... in one write and reads until all have ended: the DATA
+/// payload of each, by stream.
+fn get_all(s: &mut TcpStream, first_id: u32, paths: &[&str]) -> std::collections::BTreeMap<u32, Vec<u8>> {
+    let mut burst = Vec::new();
+    for (k, p) in paths.iter().enumerate() {
+        burst.extend_from_slice(&frame(0x01, 0x05, first_id + 2 * u32::try_from(k).unwrap(), &hpack_get(p)));
+    }
+    s.write_all(&burst).expect("headers");
+    let mut bodies = std::collections::BTreeMap::new();
+    let mut ended = 0;
+    read_frames(s, Duration::from_secs(5), |_, ty, flags, sid, payload| {
+        if ty == 0x00 {
+            bodies.entry(sid).or_insert_with(Vec::new).extend_from_slice(payload);
+        }
+        if (ty == 0x00 || ty == 0x01) && flags & 0x01 != 0 {
+            ended += 1;
+        }
+        ended == paths.len()
+    });
+    assert_eq!(ended, paths.len(), "not every stream of {paths:?} ended: {bodies:?}");
+    bodies
+}
+
+/// Round-robin among the streams (`HAProxy`'s `send_list`): a response with a big body
+/// does not hold up a small one that came after it, when the connection's window is what
+/// limits. The client opens its streams' windows wide and gives the connection back what
+/// each DATA frame took, a millisecond later. Measured on `HAProxy` 3.5-dev8-885761-29:
+/// stream 3 (/small, 100 bytes, 50 ms late) ends after 0.5-0.6 MB of stream 1's 4 MB.
+#[test]
+fn a_big_body_does_not_hold_up_a_small_response_behind_it() {
+    let p = start_proxy("");
+    let mut s = p.client(&[(0x4, 0x7fff_ffff)]);
+    let mut burst = frame(0x01, 0x05, 1, &hpack_get("/big"));
+    burst.extend_from_slice(&frame(0x01, 0x05, 3, &hpack_get("/small")));
+    s.write_all(&burst).expect("headers");
+    let (mut big, mut big_at_small_end, mut big_ended) = (0usize, None, false);
+    read_frames(&mut s, Duration::from_secs(20), |s, ty, flags, sid, payload| {
+        if ty == 0x00 && !payload.is_empty() {
+            if sid == 1 {
+                big += payload.len();
+            }
+            thread::sleep(Duration::from_millis(1));
+            let inc = u32::try_from(payload.len()).unwrap().to_be_bytes();
+            s.write_all(&frame(0x08, 0, 0, &inc)).expect("window update");
+        }
+        if (ty == 0x00 || ty == 0x01) && flags & 0x01 != 0 {
+            if sid == 3 {
+                big_at_small_end = Some(big);
+            } else {
+                big_ended = true;
+            }
+        }
+        big_ended && big_at_small_end.is_some()
+    });
+    let at = big_at_small_end.expect("stream 3 never ended");
+    assert!(
+        at < BIG / 2,
+        "stream 3 (/small) must end long before stream 1 (/big, {BIG} bytes) has had half its body \
+         (HAProxy: after ~0.5 MB); it ended after {at} bytes of stream 1"
+    );
+}
+
+/// The tracked counters of a connection whose two streams are served one after the other.
+fn tracked_counts(concurrent: bool) -> Vec<String> {
+    let p = start_proxy(
+        "\tstick-table type ip size 10 store http_req_cnt,bytes_in_cnt,bytes_out_cnt\n\
+         \ttcp-request connection track-sc0 src\n",
+    );
+    let mut s = p.client(&[]);
+    let bodies = if concurrent {
+        get_all(&mut s, 1, &["/slow", "/slow"])
+    } else {
+        let mut b = get_all(&mut s, 1, &["/slow"]);
+        b.append(&mut get_all(&mut s, 3, &["/slow"]));
+        b
+    };
+    assert_eq!(bodies.values().map(Vec::len).collect::<Vec<_>>(), [10, 10]);
+    drop(s);
+    thread::sleep(Duration::from_millis(300));
+    let table = p.cli("show table fe");
+    let row = table.lines().find(|l| l.contains("key=127.0.0.1")).unwrap_or_else(|| panic!("{table}"));
+    row.split(' ').filter(|f| f.contains("_cnt=")).map(str::to_string).collect()
+}
+
+/// The stick counters a connection tracks count the bytes of every stream once, whether
+/// its streams are served one after the other or at once (each stream had a copy of the
+/// connection's byte accounting and gave its copy back: the bytes before them were counted
+/// twice, those of the stream ending first not at all). Measured on `HAProxy`
+/// 3.5-dev8-885761-29: `http_req_cnt=2 bytes_in_cnt=132 bytes_out_cnt=164` both ways
+/// (Ibex counts HTTP/2 bytes differently from `HAProxy` -- 91/150 one after the other --
+/// which this test does not cover).
+#[test]
+fn concurrent_streams_credit_the_tracked_bytes_once() {
+    let one_by_one = tracked_counts(false);
+    assert_eq!(one_by_one[0], "http_req_cnt=2", "{one_by_one:?}");
+    assert_eq!(tracked_counts(true), one_by_one, "two streams at once vs one after the other");
+}
+
+/// Session variables set by a connection's streams are kept for its next streams, served
+/// one after the other or at once (a stream's entry was freed with its variables in the
+/// running stream's map, so none came back; served at once, the last copy back would win).
+/// Measured on `HAProxy` 3.5-dev8-885761-29: `one-two` both ways.
+#[test]
+fn session_variables_set_by_streams_are_kept_for_the_next() {
+    let p = start_proxy(
+        "\thttp-request set-var(sess.a) str(one) if { query a }\n\
+         \thttp-request set-var(sess.b) str(two) if { query b }\n\
+         \thttp-request return status 200 content-type text/plain lf-string \"%[var(sess.a)]-%[var(sess.b)]\" if { path /vars }\n",
+    );
+    let mut s = p.client(&[]);
+    get_all(&mut s, 1, &["/slow?a"]);
+    get_all(&mut s, 3, &["/slow?b"]);
+    let bodies = get_all(&mut s, 5, &["/vars"]);
+    assert_eq!(String::from_utf8_lossy(&bodies[&5]), "one-two", "one after the other");
+    let mut s = p.client(&[]);
+    get_all(&mut s, 1, &["/slow?a", "/slow?b"]);
+    let bodies = get_all(&mut s, 5, &["/vars"]);
+    assert_eq!(String::from_utf8_lossy(&bodies[&5]), "one-two", "at once");
+}
+
+/// The client's `SETTINGS_MAX_CONCURRENT_STREAMS` limits the streams the proxy would open
+/// (pushes), not the client's: with 1, two requests are still served at once. Measured on
+/// `HAProxy` 3.5-dev8-885761-29.
+#[test]
+fn the_clients_stream_limit_does_not_limit_its_own_streams() {
+    let p = start_proxy("");
+    let mut s = p.client(&[(0x3, 1)]);
+    let mut burst = frame(0x01, 0x05, 1, &hpack_get("/drip"));
+    burst.extend_from_slice(&frame(0x01, 0x05, 3, &hpack_get("/fast")));
+    s.write_all(&burst).expect("headers");
+    let mut frames = Vec::new();
+    read_frames(&mut s, BOUND, |_, ty, flags, sid, payload| {
+        frames.push((ty, flags, sid, payload.len()));
+        ty == 0x00 && sid == 3 && flags & 1 != 0
+    });
+    assert!(
+        frames.iter().any(|&(ty, fl, sid, _)| ty == 0 && sid == 3 && fl & 1 != 0),
+        "stream 3 (/fast) must end within {BOUND:?}: (type, flags, stream, len) {frames:?}"
+    );
+}
+
+/// What the client sees of its connection after one request: the frame types that came,
+/// and how it ended ("eof", "reset", or "open" at `limit`).
+fn connection_end(rule: &str, limit: Duration) -> (Vec<u8>, &'static str) {
+    let p = start_proxy(&format!("\t{rule}\n"));
+    let mut s = p.client(&[]);
+    s.write_all(&frame(0x01, 0x05, 1, &hpack_get("/fast"))).expect("headers");
+    s.set_read_timeout(Some(Duration::from_millis(50))).ok();
+    let (t0, mut buf, mut tmp) = (Instant::now(), Vec::new(), [0u8; 4096]);
+    let end = loop {
+        if t0.elapsed() > limit {
+            break "open";
+        }
+        match s.read(&mut tmp) {
+            Ok(0) => break "eof",
+            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => break "reset",
+            Err(_) => {}
+        }
+    };
+    let mut types = Vec::new();
+    let mut at = 0;
+    while buf.len() >= at + 9 {
+        let len = (usize::from(buf[at]) << 16) | (usize::from(buf[at + 1]) << 8) | usize::from(buf[at + 2]);
+        types.push(buf[at + 3]);
+        at += 9 + len;
+    }
+    (types, end)
+}
+
+/// A stream's `tcp-request content reject` gets no response and its connection ends (the
+/// stream's entry asks its connection's owner to end it, T280). Measured on `HAProxy`
+/// 3.5-dev8-885761-29: `SETTINGS` x2, `RST_STREAM`, `GOAWAY`, then FIN. Ibex resets the TCP
+/// connection instead (no `RST_STREAM`, no `GOAWAY`): per-stream semantics are T280 stage 4.
+#[test]
+fn a_stream_rejected_by_tcp_request_content_ends_its_connection() {
+    let (types, end) = connection_end("tcp-request content reject", Duration::from_secs(2));
+    assert!(!types.contains(&0x1), "no HEADERS for a rejected stream: {types:?}");
+    assert_ne!(end, "open", "{types:?}");
+}
+
+/// A stream's `tcp-request content silent-drop` gets no response. Measured on `HAProxy`
+/// 3.5-dev8-885761-29: `SETTINGS` x2, `RST_STREAM`, and the connection stays open. Ibex drops
+/// the whole connection (a TCP reset on loopback): T280 stage 4.
+#[test]
+fn a_stream_silently_dropped_by_tcp_request_content_gets_no_response() {
+    let (types, _) = connection_end("tcp-request content silent-drop", Duration::from_secs(2));
+    assert!(!types.contains(&0x1), "no HEADERS for a dropped stream: {types:?}");
 }

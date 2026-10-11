@@ -144,18 +144,20 @@ fn read_to_end(s: &mut TcpStream, wait: Duration) -> (bool, usize) {
     (ended, goaways)
 }
 
-#[test]
-fn a_client_that_reads_nothing_is_let_go_at_the_second_timeout_client() {
+/// A client that reads nothing, with `streams` GETs open on its connection.
+fn let_go_at_the_second_timeout_client(streams: u32) {
     let (p, fe) = start(big_backend());
     let mut s = TcpStream::connect(fe).expect("connect");
     let mut hello = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
     hello.extend(frame(0x04, 0, 0, &[]));
-    // GET / (static table: :method GET, :scheme http, :path /), :authority x.
-    hello.extend(frame(0x01, 0x05, 1, &[0x82, 0x86, 0x84, 0x41, 0x01, b'x']));
     // Windows opened as wide as they go without overflowing (65535 + this = 2^31 - 1).
     let inc = (0x7fff_ffffu32 - 65535).to_be_bytes();
     hello.extend(frame(0x08, 0, 0, &inc));
-    hello.extend(frame(0x08, 0, 1, &inc));
+    for id in (0..streams).map(|k| 1 + 2 * k) {
+        // GET / (static table: :method GET, :scheme http, :path /), :authority x.
+        hello.extend(frame(0x01, 0x05, id, &[0x82, 0x86, 0x84, 0x41, 0x01, b'x']));
+        hello.extend(frame(0x08, 0, id, &inc));
+    }
     s.write_all(&hello).expect("send request");
 
     // The output fills both socket buffers within a moment; the first expiry is about
@@ -169,4 +171,16 @@ fn a_client_that_reads_nothing_is_let_go_at_the_second_timeout_client() {
     let (ended, goaways) = read_to_end(&mut s, Duration::from_secs(10));
     assert!(ended, "the connection is still open past the second timeout client");
     assert!(goaways <= 2, "{goaways} GOAWAY frames for two expiries");
+}
+
+#[test]
+fn a_client_that_reads_nothing_is_let_go_at_the_second_timeout_client() {
+    let_go_at_the_second_timeout_client(1);
+}
+
+/// The same with two streams served at once (T280 stage 3b): neither holds the
+/// connection's timer off.
+#[test]
+fn a_client_that_reads_nothing_of_two_streams_is_let_go_too() {
+    let_go_at_the_second_timeout_client(2);
 }
