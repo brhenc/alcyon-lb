@@ -65,11 +65,18 @@ fn plain_chunked_still_works() {
 }
 
 #[test]
-fn chunked_with_a_known_preceding_coding_is_accepted() {
-    // gzip then chunked is legal: chunked is last.
-    assert!(accepts(
-        b"POST /x HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n"
-    ));
+fn chunked_with_a_known_preceding_coding_is_refused_with_422() {
+    // HAProxy 3.5-dev8 -> 422 Unprocessable Content, for `gzip`, `deflate` and `compress`
+    // alike (`H1_MF_TE_OTHER` in `h1_process_input`): a proxy that does not decode a coding
+    // does not forward it. The parser refuses it itself, with its status.
+    for coding in ["gzip", "deflate", "compress", "GZIP"] {
+        let req = format!("POST /x HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: {coding}, chunked\r\n\r\n0\r\n\r\n");
+        let mut p = H1Parser::new(false);
+        let mut buf = [0u8; 4096];
+        let mut h = HtxSlice::new(&mut buf);
+        let err = p.parse(req.as_bytes(), &mut h).expect_err(coding);
+        assert_eq!(ibex_proto::h1::Refusal::status_of(&err), 422, "{coding}");
+    }
 }
 
 // ---- chunk framing ----------------------------------------------------------------

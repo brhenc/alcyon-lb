@@ -419,7 +419,7 @@ fn initial_seed() -> u64 {
     (nanos ^ addr.rotate_left(17) ^ 0x9E37_79B9_7F4A_7C15) | 1
 }
 
-fn next_random_u64() -> u64 {
+pub(crate) fn next_random_u64() -> u64 {
     let mut new_state = 0u64;
     // Racing initializers on the very first call converge on some non-zero state either
     // way; correctness of the load balancer does not depend on which writer wins.
