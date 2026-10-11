@@ -258,3 +258,12 @@ fn error_log_format_is_kept_inherited_and_ignored_in_a_backend() {
         assert!(err.message.contains(why), "{body}: {}", err.message);
     }
 }
+
+/// A `listen` section's own `error-log-format` (not inherited) replaces `defaults`'.
+#[test]
+fn a_listen_sections_own_error_log_format_is_kept() {
+    let cfg = parse_str("defaults\n  mode http\n  error-log-format \"D\"\nlisten l\n  bind 127.0.0.1:3\n  error-log-format \"L %ci\"\n").expect("loads");
+    assert_eq!(cfg.listens[0].error_log_format.as_deref(), Some("L %ci"));
+    let err = parse_str("listen l\n  bind 127.0.0.1:3\n  error-log-format a b\n").expect_err("two args");
+    assert!(err.message.contains("expects only one argument"), "{}", err.message);
+}
