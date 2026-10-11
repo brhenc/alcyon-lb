@@ -1547,6 +1547,11 @@ impl TcpSession {
                     return Ok(true);
                 }
             }
+            // A request line the buffer cannot hold is a 414, whatever follows it (T282).
+            if txn::request_line_too_long(self.req.readable(), self.bufsize) {
+                self.fail_request(414);
+                return Ok(true);
+            }
             if let Some((hdr_len, eoh_len)) = find_eoh(self.req.readable()) {
                 let total_hdr_len = hdr_len + eoh_len;
 

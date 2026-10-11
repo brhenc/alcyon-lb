@@ -661,8 +661,9 @@ impl LogFormat {
         }
         let mut first = true;
         // `last_isspace` of `sess_build_logline`: a blank is written only after something
-        // that is not one, and an empty `%hr`/`%hs`/`%hrl`/`%hsl` leaves it as it was, so
-        // that it takes the blank after it away (measured: `x %hr y` sends `x y`).
+        // that is not one, and a field that wrote nothing (`%HQ` of a request without a
+        // query, an empty `%hr`) leaves it as it was, so that it takes the blank after it
+        // away (measured: `x %hr y` and `C %HQ D` send `x y` and `C D`).
         let mut last_space = true;
         for n in &self.nodes {
             let (o, named, value) = match n {
@@ -735,7 +736,7 @@ impl LogFormat {
                     }
                 }
             }
-            if out.0.len() != value_beg || !matches!(value, Value::Alias(Alias::HdrReq | Alias::HdrRes | Alias::HdrReqList | Alias::HdrResList)) {
+            if out.0.len() != value_beg {
                 last_space = false;
             }
             // A value that wrote nothing is `null` in JSON and the null primitive in CBOR, so
