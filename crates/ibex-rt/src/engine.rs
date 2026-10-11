@@ -8497,7 +8497,9 @@ impl EngineDispatcher<'_> {
     /// is the stream's response, and the stream is reset `NO_ERROR` once it is out
     /// (`h2_child_released`), the connection and its other streams going on. Any other
     /// stream of an HTTP/2 connection is aborted alone: its server connection reset, its
-    /// log `cD--` (or as the phase reads), `RST_STREAM CANCEL`. Measured on `HAProxy`
+    /// log `cD--` (or as the phase reads), `RST_STREAM CANCEL`; one whose response went out
+    /// whole before its upload stalled (the server answered early) logs `cL--`, its server
+    /// connection closed, and is reset `NO_ERROR` (T305 item 2). Measured on `HAProxy`
     /// 3.5-dev8 (`tests/it/h2_stream_timers.rs`). `cli_before`: the client side's state
     /// before the timeout, which a stream keeps (the connection is its owner's).
     #[allow(clippy::too_many_arguments)]
@@ -8540,11 +8542,18 @@ impl EngineDispatcher<'_> {
         if !child {
             return;
         }
-        let term = if txn.rsp == MsgState::Waiting { *b"cH" } else { *b"cD" };
+        // A response delivered whole before its upload ended (the server answered early):
+        // `cL--`, the server connection closed, not reset, and the stream reset `NO_ERROR`.
+        let answered = txn.rsp == MsgState::Done && entry.sess.rep.is_empty();
+        let term = match txn.rsp {
+            MsgState::Waiting => *b"cH",
+            _ if answered => *b"cL",
+            _ => *b"cD",
+        };
         txn.srv_reusable = false;
         txn.rsp = MsgState::Done;
         entry.sess.log.term.get_or_insert(term);
-        if let Some(srv) = entry.sess.srv.as_ref() {
+        if let (false, Some(srv)) = (answered, entry.sess.srv.as_ref()) {
             raw::abort_with_rst(srv.as_fd());
         }
         entry.sess.rep.clear();
@@ -8552,7 +8561,7 @@ impl EngineDispatcher<'_> {
         entry.sess.srv_state = ScState::Closed;
         entry.sess.cli_state = cli_before;
         if let Some(c) = entry.sess.h2_child_mut() {
-            c.rst = Some(ibex_proto::h2::H2Error::Cancel);
+            c.rst = Some(if answered { ibex_proto::h2::H2Error::NoError } else { ibex_proto::h2::H2Error::Cancel });
         }
         Self::end_txn(entry, proxies, fdtab, poller, idle_pool, wake_queue, now, pid);
     }

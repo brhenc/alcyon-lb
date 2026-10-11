@@ -2768,7 +2768,15 @@ impl TcpSession {
     fn srv_timer_live(&self) -> bool {
         // A server connection kept idle between HTTP transactions owes nothing.
         let srv_idle = self.mode == Mode::Http && self.txn.is_none();
+        // Nor one whose request is still coming, with nothing of it waiting for the server
+        // to take: the wait is the client's (`SE_FL_EXP_NO_DATA` until the request's end,
+        // `sc_rcv_may_expire`). A stalled upload ends at `timeout client`, not at a shorter
+        // `timeout server` (T305 item 2). A send the server does not take still times out.
+        let awaiting_client = self.mode == Mode::Http
+            && self.req.readable().is_empty()
+            && self.txn.as_ref().is_some_and(|t| !matches!(t.req, txn::MsgState::Done | txn::MsgState::Tunnel));
         !srv_idle
+            && !awaiting_client
             && matches!(
                 self.srv_state,
                 ScState::Ready | ScState::Established | ScState::ShutR | ScState::ShutW

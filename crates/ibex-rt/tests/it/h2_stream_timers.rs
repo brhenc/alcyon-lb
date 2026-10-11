@@ -16,6 +16,10 @@
 //! - the connection is let go two `timeout client` after its last stream (GOAWAY, GOAWAY
 //!   and close), as when it served one stream.
 //!
+//! - a stalled upload waits on its client even when `timeout server` is the shorter (no 504
+//!   at `timeout server`), and an answer the server gave before the upload ended is logged
+//!   `200 54 - - cL--` at `timeout client` (T305 item 2).
+//!
 //! Before, the connection's one timer ran for all its streams: the stalled upload held it
 //! (no 400, the connection sent its GOAWAY at `timeout client` and closed at the next), and a
 //! response dripping on another stream re-armed it, so the upload never timed out.
@@ -38,7 +42,8 @@ fn binary() -> String {
 const SLOW: Duration = Duration::from_millis(2000);
 
 /// A server: `/slow` answers `hello` after [`SLOW`]; `/drip` sends 30 x 100 bytes, one
-/// every 100 ms; a POST waits for its body (or the close) and answers nothing.
+/// every 100 ms; `POST /early` answers `hello` at once and reads the rest; another POST
+/// waits for its body (or the close) and answers nothing.
 fn backend() -> u16 {
     let l = TcpListener::bind("127.0.0.1:0").expect("bind backend");
     let port = l.local_addr().expect("addr").port();
@@ -58,6 +63,10 @@ fn backend() -> u16 {
                 if buf.starts_with(b"GET /slow") {
                     thread::sleep(SLOW);
                     let _ = c.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+                } else if buf.starts_with(b"POST /early") {
+                    let _ = c.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+                    while matches!(c.read(&mut tmp), Ok(n) if n > 0) {}
+                    return;
                 } else if buf.starts_with(b"GET /drip") {
                     let _ = c.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3000\r\n\r\n");
                     for _ in 0..30 {
@@ -99,6 +108,11 @@ impl Proxy {
 /// The proxy, `timeout client 1s`, `timeout server 10s`, logging to stderr; `bind_extra`
 /// after the bind address (`proto h2` for cleartext HTTP/2).
 fn start(bind_extra: &str) -> Proxy {
+    start_with(bind_extra, "1s", "10s")
+}
+
+/// [`start`] with these `timeout client` and `timeout server`.
+fn start_with(bind_extra: &str, client: &str, server: &str) -> Proxy {
     let be = backend();
     let dir = tempfile::TempDir::new().expect("dir");
     let cfg = dir.path().join("c.cfg");
@@ -108,7 +122,7 @@ fn start(bind_extra: &str) -> Proxy {
         format!(
             "global\n\tnbthread 1\n\
              defaults\n\tmode http\n\tlog stderr format raw local0\n\toption httplog\n\
-             \ttimeout connect 3s\n\ttimeout client 1s\n\ttimeout server 10s\n\n\
+             \ttimeout connect 3s\n\ttimeout client {client}\n\ttimeout server {server}\n\n\
              frontend fe\n\tbind 127.0.0.1:{port}{bind_extra}\n\tdefault_backend be\n\n\
              backend be\n\tserver s1 127.0.0.1:{be}\n"
         ),
@@ -157,8 +171,13 @@ fn get(path: &str) -> Vec<u8> {
 
 /// `POST /up`, `content-length: 10`.
 fn post() -> Vec<u8> {
+    post_to("/up")
+}
+
+/// `POST <path>`, `content-length: 10`.
+fn post_to(path: &str) -> Vec<u8> {
     let mut v = vec![0x83, 0x86];
-    v.extend(literal(4, b"/up"));
+    v.extend(literal(4, path.as_bytes()));
     v.extend(literal(1, b"x"));
     v.extend(literal(28, b"10"));
     v
@@ -315,4 +334,82 @@ fn a_response_held_by_its_window_times_out_alone() {
     assert_eq!((streams[&3].status, streams[&3].data), (200, 5), "{streams:?}");
     thread::sleep(Duration::from_millis(200));
     assert!(log_line(&p, "/drip").contains(" 200 152 - - cD-- "), "{}", p.log());
+}
+
+/// A stalled upload waits on its client, not its server, whichever timeout is shorter:
+/// `HAProxy`'s server side does not time out a read while the request is still coming
+/// (`SE_FL_EXP_NO_DATA`, set by the client's mux until the request's end, read by
+/// `sc_rcv_may_expire`). With `timeout client 2s` and `timeout server 500ms`, it answers at
+/// 2 s: 400, the error page, `RST_STREAM NO_ERROR`, `cH--` (Ibex sent a 504 at 500 ms and
+/// logged `sH--`, T305 item 2).
+#[test]
+fn a_stalled_upload_waits_for_timeout_client_not_timeout_server() {
+    let p = start_with(" proto h2", "2s", "500ms");
+    let mut req = frame(0x01, 0x04, 1, &post());
+    req.extend(frame(0x00, 0, 1, b"abc"));
+    let (streams, closed) = exchange(&p, &req, Duration::from_millis(2600));
+    let up = streams.get(&1).unwrap_or_else(|| panic!("nothing on stream 1: {streams:?} closed {closed:?}"));
+    assert_eq!((up.status, up.data), (400, 90), "{streams:?}");
+    let (code, at) = up.rst.unwrap_or_else(|| panic!("no RST_STREAM on stream 1: {streams:?}"));
+    assert_eq!(code, 0, "RST_STREAM NO_ERROR: {streams:?}");
+    assert!(at > Duration::from_millis(1800) && at < Duration::from_millis(2500), "{streams:?}");
+    assert!(closed.is_none(), "the connection outlives the stream: {closed:?}");
+    thread::sleep(Duration::from_millis(200));
+    assert!(log_line(&p, "\"POST ").contains(" 400 0 - - cH-- "), "{}", p.log());
+}
+
+/// The same on HTTP/1: 400 at `timeout client`, `cH--`.
+#[test]
+fn a_stalled_http1_upload_waits_for_timeout_client_not_timeout_server() {
+    let p = start_with("", "2s", "500ms");
+    let mut s = TcpStream::connect(("127.0.0.1", p.port)).expect("connect");
+    s.write_all(b"POST /up HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nabc").expect("send");
+    let t0 = Instant::now();
+    s.set_read_timeout(Some(Duration::from_secs(4))).ok();
+    let mut got = [0u8; 64];
+    let n = s.read(&mut got).unwrap_or(0);
+    let at = t0.elapsed();
+    assert!(got[..n].starts_with(b"HTTP/1.1 400 "), "{} at {at:?}", String::from_utf8_lossy(&got[..n]));
+    assert!(at > Duration::from_millis(1800) && at < Duration::from_millis(2500), "{at:?}");
+    thread::sleep(Duration::from_millis(200));
+    assert!(log_line(&p, "\"POST ").contains(" 400 0 - - cH-- "), "{}", p.log());
+}
+
+/// A server that answers before the upload ends: the response is delivered at once, and
+/// the stalled upload ends at `timeout client` with `RST_STREAM NO_ERROR` (no `CANCEL`, its
+/// server connection closed, not reset), logged `200 54 - - cL--`, whichever of `timeout
+/// client` and `timeout server` is shorter. (Ibex logged `sD--` with `timeout server` the
+/// shorter, and reset the stream with `CANCEL`, `cD--`, with `timeout client` the shorter.)
+#[test]
+fn an_early_answer_to_a_stalled_upload_ends_at_timeout_client() {
+    for (client, server) in [("1s", "300ms"), ("1s", "3s")] {
+        let p = start_with(" proto h2", client, server);
+        let mut req = frame(0x01, 0x04, 1, &post_to("/early"));
+        req.extend(frame(0x00, 0, 1, b"abc"));
+        let (streams, closed) = exchange(&p, &req, Duration::from_millis(1600));
+        let up = streams.get(&1).unwrap_or_else(|| panic!("{client}/{server}: nothing on stream 1: {streams:?} closed {closed:?}"));
+        assert_eq!((up.status, up.data), (200, 5), "{client}/{server}: {streams:?}");
+        assert!(up.end.is_some_and(|t| t < Duration::from_millis(300)), "{client}/{server}: {streams:?}");
+        let (code, at) = up.rst.unwrap_or_else(|| panic!("{client}/{server}: no RST_STREAM on stream 1: {streams:?}"));
+        assert_eq!(code, 0, "{client}/{server}: RST_STREAM NO_ERROR: {streams:?}");
+        assert!(at > Duration::from_millis(800) && at < Duration::from_millis(1400), "{client}/{server}: {streams:?}");
+        thread::sleep(Duration::from_millis(200));
+        assert!(log_line(&p, "\"POST ").contains(" 200 54 - - cL-- "), "{client}/{server}: {}", p.log());
+    }
+}
+
+/// The same on HTTP/1: `200 54 - - cL--` at `timeout client`.
+#[test]
+fn an_early_http1_answer_to_a_stalled_upload_ends_at_timeout_client() {
+    for (client, server) in [("1s", "300ms"), ("1s", "3s")] {
+        let p = start_with("", client, server);
+        let mut s = TcpStream::connect(("127.0.0.1", p.port)).expect("connect");
+        s.write_all(b"POST /early HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nabc").expect("send");
+        s.set_read_timeout(Some(Duration::from_millis(1500))).ok();
+        let mut got = [0u8; 64];
+        let n = s.read(&mut got).unwrap_or(0);
+        assert!(got[..n].starts_with(b"HTTP/1.1 200 "), "{client}/{server}: {}", String::from_utf8_lossy(&got[..n]));
+        thread::sleep(Duration::from_millis(1300));
+        assert!(log_line(&p, "\"POST ").contains(" 200 54 - - cL-- "), "{client}/{server}: {}", p.log());
+    }
 }
