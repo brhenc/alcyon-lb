@@ -998,6 +998,28 @@ pub fn htx_head_cost(head: &[u8]) -> usize {
     head_cost(head, true)
 }
 
+/// Whether the request line in `buf` is one `HAProxy` answers with a 414 (T282): once its
+/// line feed is in, the start-line block (the 40 bytes of an HTX, the 20 of the block and the
+/// method, target and version) does not fit `bufsize`; with no line feed yet, the buffer
+/// holds `bufsize - 56` bytes or more (the point at which it draws a 431 once the request
+/// line is complete). Measured on 3.5-dev8, `bufsize` 4096 and 16384 (`tasks/T282`).
+#[must_use]
+pub fn request_line_too_long(buf: &[u8], bufsize: usize) -> bool {
+    let Some(lf) = buf.iter().position(|&b| b == b'\n') else {
+        return buf.len() + 56 >= bufsize;
+    };
+    let line = buf[..lf].strip_suffix(b"\r").unwrap_or(&buf[..lf]);
+    let strings = match line.iter().position(|&b| b == b' ') {
+        Some(m) => {
+            let rest = &line[m + 1..];
+            let (target, version) = rest.iter().rposition(|&b| b == b' ').map_or((rest, &rest[rest.len()..]), |v| (&rest[..v], &rest[v + 1..]));
+            m + target.trim_ascii().len() + version.trim_ascii().len()
+        }
+        None => return false,
+    };
+    60 + strings > bufsize
+}
+
 /// `htx_head_cost` of a response head (T265): the same accounting, with the start line read
 /// as a status line.
 #[must_use]

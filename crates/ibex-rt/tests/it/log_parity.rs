@@ -248,6 +248,29 @@ fn an_empty_capture_takes_the_blank_after_it() {
     assert!(line.ends_with("[] x y z w\n"), "{line:?}");
 }
 
+#[test]
+fn an_empty_field_takes_the_blank_after_it() {
+    // T282, measured on 3.5-dev8-885761-29 (`/a` has no query, so `%HQ` is empty): a blank is
+    // written only after something that is not one, so a field that wrote nothing takes the
+    // blank that follows it away, whichever field it is. The fields that write `-` or `""`
+    // for nothing still count as data.
+    for (format, expect) in [
+        ("A %HQ B", "A B\n"),
+        ("A %HQ %HQ B", "A B\n"),
+        ("A %HQ  B", "A B\n"),
+        ("%HQ B", "B\n"),
+        ("A %HQ%hr B", "A B\n"),
+        ("A %{+E}HQ B", "A B\n"),
+        ("A %HQ", "A \n"),
+        ("A %{+Q}HQ B", "A \"\" B\n"),
+        ("A %[str()] %HQ B", "A - B\n"),
+    ] {
+        let got = run("http", &format!("log-format \"{}\"", format.replace('"', "\\\"")), |port| exchange(port, &get("/a")));
+        let line = String::from_utf8_lossy(&got[0]).into_owned();
+        assert!(line.ends_with(&format!("]: {expect}")), "{format:?}: {line:?}");
+    }
+}
+
 /// Over TLS (TLS 1.3, one suite offered, SNI `localhost`), as `HAProxy` logged it with an
 /// ECDSA certificate: `fe~`, then `fc_err/ssl_fc_err,hex/ssl_c_err/ssl_c_ca_err/resumed`
 /// (`0/0000000000000000/0/0/0`) and `sni/version/cipher`.
