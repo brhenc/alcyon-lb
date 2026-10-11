@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
-# T305 items 2 and 6, T291: stalled upload, TCP client that closes without data,
-# bare-LF request lines. Stalled-upload part only (VV-9):
-#   python3 stall.py BIN PORT TIMEOUT_CLIENT TIMEOUT_SERVER   e.g. 3s 10s
+# VV-9: stalled upload. Prints when the 400 arrives (first_byte) and when the connection closes.
+#   python3 stall.py BIN PORT TIMEOUT_CLIENT TIMEOUT_SERVER   e.g. 3s 1s
 import socket, subprocess, sys, threading, time
 BIN, PORT = sys.argv[1], int(sys.argv[2])
 BE, BE_TCP = PORT + 50, PORT + 51
@@ -50,7 +49,7 @@ defaults
 frontend fe
     mode http
     log global
-    log-format "LOG %ST %ts %Tr"
+    log-format "LOG %ST %ts %Tr Tt=%Tt Ta=%Ta"
     bind 127.0.0.1:{PORT}
     default_backend b
 backend b
@@ -78,22 +77,23 @@ time.sleep(0.6)
 
 def talk(data, port=PORT, stall=False, wait=7):
     s = socket.create_connection(("127.0.0.1", port)); s.settimeout(wait); t0 = time.time()
-    s.sendall(data); o = b""
+    s.sendall(data); o = b""; tfirst = None
     try:
         while True:
             d = s.recv(65536)
             if not d: break
+            if tfirst is None: tfirst = round(time.time() - t0, 2)
             o += d
     except OSError: pass
     s.close()
     st = o[9:12].decode() if o.startswith(b"HTTP/") else ("closed" if not o else repr(o[:20]))
-    return st, round(time.time() - t0, 1)
+    return st, f"first_byte={tfirst}s close={round(time.time() - t0, 2)}"
 
 # T305 item 2: stalled uploads (timeout client 2s < timeout server 4s)
 for name, req in (("cl_stall", b"POST /stall HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n0123456789"),
                   ("chunk_stall", b"POST /stall HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n64\r\n0123456789")):
     n = len(logs); st, t = talk(req); time.sleep(0.3)
-    print(f"{name:12s} status={st} after={t}s log={[l for l in logs[n:] if l.startswith('LOG')]}")
+    print(f"{name:12s} status={st} {t} log={[l for l in logs[n:] if l.startswith('LOG')]}")
 
 import os; sys.stdout.flush(); p.terminate(); p.wait(); os._exit(0)
 # T305 item 6: TCP client closes without sending
