@@ -97,6 +97,37 @@ fn a_response_header_fetch_in_a_log_format_is_refused() {
     }
 }
 
+/// The request's headers are gone too when a log line is rendered: `HAProxy` refuses a
+/// request-header fetch in `log-format`, `error-log-format` and `log-format-sd` (T286), and
+/// not in `unique-id-format`, which is built with the request.
+#[test]
+fn a_request_header_fetch_in_a_log_format_is_refused() {
+    const HRQHV: &str = "'HTTP request headers'";
+    const BOTH: &str = "'HTTP request headers,HTTP response headers'";
+    for (line, kw, fetch, needs) in [
+        ("log-format \"%[hdr(x)]\"", "log-format", "hdr", BOTH),
+        ("log-format \"%[req.hdr(x)]\"", "log-format", "req.hdr", HRQHV),
+        ("log-format \"%[req.hdr(x),lower]\"", "log-format", "req.hdr", HRQHV),
+        ("log-format \"%ci %[path]\"", "log-format", "path", HRQHV),
+        ("log-format \"%[cook(x)]\"", "log-format", "cook", HRQHV),
+        ("log-format \"%[req.hdr_cnt(x)]\"", "log-format", "req.hdr_cnt", HRQHV),
+    ] {
+        let want = format!("failed to parse {kw} : sample fetch <{fetch}> may not be reliably used here because it needs {needs} which is not available here.");
+        match check(&format!("  {line}\n")) {
+            Ok(()) => panic!("accepted: {line}"),
+            Err(e) => assert!(e.contains(&want), "{line}:\n got {e}\nwant {want}"),
+        }
+    }
+    for ok in [
+        "  log-format \"%[method] %[req.ver] %[capture.req.hdr(0)] %ci %[var(txn.a)]\"\n",
+        "  unique-id-format %[req.hdr(x)]\n",
+    ] {
+        if let Err(e) = check(ok) {
+            panic!("{ok}: {e}");
+        }
+    }
+}
+
 #[test]
 fn what_haproxy_accepts_is_accepted() {
     for fe in [

@@ -1584,6 +1584,11 @@ impl TcpSession {
                     return Ok(true);
                 }
             }
+            // A version that is not `HTTP/<digit>.<digit>` is a 400, whatever else is wrong (T286).
+            if txn::request_version_invalid(self.req.readable()) {
+                self.fail_request(400);
+                return Ok(true);
+            }
             // A request line the buffer cannot hold is a 414, whatever follows it (T282).
             if txn::request_line_too_long(self.req.readable(), self.bufsize) {
                 self.fail_request(414);
@@ -1622,6 +1627,11 @@ impl TcpSession {
                     Err(e) => {
                         // 400, or the 413 / 422 HAProxy answers to some heads (T276).
                         self.fail_request(ibex_proto::h1::Refusal::status_of(&e));
+                        if ibex_proto::h1::Refusal::is_quiet(&e) {
+                            if let Some(t) = self.txn.as_mut() {
+                                t.quiet = true;
+                            }
+                        }
                         return Ok(true);
                     }
                 };

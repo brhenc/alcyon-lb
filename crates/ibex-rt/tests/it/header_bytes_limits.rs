@@ -277,11 +277,16 @@ fn a_request_of_101_header_lines_is_a_400() {
     let close = many("/h100c", 100, Some("close"));
     // It goes to the server without its `Connection: close`, as HTTP/1.1 implies it.
     let close_fwd = String::from_utf8(many("/h100c", 100, None)).unwrap().replace("Host", "host").replace("X-", "x-").into_bytes();
+    let fwd_e = String::from_utf8(many("/h100e", 100, None)).unwrap().replace("Host", "host").replace("X-", "x-").into_bytes();
+    let fwd_b = String::from_utf8(many("/h100b", 100, None)).unwrap().replace("Host", "host").replace("X-", "x-").into_bytes();
     run(&p, p.fe, &[
         case(&ok, 200, Some(&fwd)),
         case(&many("/h101", 101, None), 400, None),
         case(&close, 200, Some(&close_fwd)),
         case(&many("/h100f", 100, Some("foo")), 400, None),
+        // An empty `Connection` line is emptied too, and not counted (T286).
+        case(&many("/h100e", 100, Some("")), 200, Some(&fwd_e)),
+        case(&many("/h100b", 100, Some(" , ")), 200, Some(&fwd_b)),
     ]);
     let line = log_with(&p, " f f/<NOSRV> ").expect("the 400 is logged");
     assert!(line.contains(" 400 ") && line.contains(" PR-- ") && line.contains("\"<BADREQ>\""), "{line}");
@@ -298,6 +303,8 @@ fn a_response_of_101_header_lines_is_a_502() {
         // 101 lines, one of them `Connection: close`, which is not counted.
         case(&req("100?close"), 200, Some(&fwd("100?close"))),
         case(&req("100?foo"), 502, Some(&fwd("100?foo"))),
+        // An empty `Connection` line is not counted either (T286).
+        case(&req("100?"), 200, Some(&fwd("100?"))),
     ]);
     let line = log_with(&p, "/res101 ").expect("the 502 is logged");
     assert!(line.contains(" 502 ") && line.contains(" PH-- "), "{line}");
@@ -340,5 +347,86 @@ fn the_head_reaches_the_server_normalised() {
         get("/empty-ws", b"X-A:  \t\r\n", 200, Some(b"x-a: \r\n")),
         get("/inner", b"X-A: a  \t b\r\n", 200, Some(b"x-a: a  \t b\r\n")),
         case(b"GET /host-blank HTTP/1.1\r\nHost: x \r\n\r\n", 200, Some(b"GET /host-blank HTTP/1.1\r\nhost: x\r\n\r\n")),
+    ]);
+}
+
+/// `TE` goes to the server only as `te: trailers`, and only when a token of it is exactly
+/// `trailers`; anything else is dropped, so a server that honours `TE` does not compress or
+/// chunk for a client that never asked (T286).
+#[test]
+fn only_te_trailers_reaches_the_server() {
+    let p = start();
+    let none: &[u8] = b"";
+    let tr: &[u8] = b"te: trailers\r\n";
+    run(&p, p.fe, &[
+        get("/gzip", b"TE: gzip\r\n", 200, Some(none)),
+        get("/trailers", b"TE: trailers\r\n", 200, Some(tr)),
+        get("/upper", b"TE: Trailers\r\n", 200, Some(none)),
+        get("/list", b"TE: trailers, gzip\r\n", 200, Some(tr)),
+        get("/list2", b"TE: gzip,trailers,deflate\r\n", 200, Some(tr)),
+        get("/blank", b"TE:  trailers \r\n", 200, Some(tr)),
+        get("/q", b"TE: trailers;q=0.5\r\n", 200, Some(none)),
+        get("/x", b"TE: trailersx\r\n", 200, Some(none)),
+        get("/empty", b"TE:\r\n", 200, Some(none)),
+        get("/two", b"TE: gzip\r\nTE: trailers\r\n", 200, Some(tr)),
+        get("/two2", b"TE: trailers\r\nTE: gzip\r\n", 200, Some(tr)),
+        get("/with-others", b"X-A: 1\r\nTE: gzip\r\nX-B: 2\r\n", 200, Some(b"x-a: 1\r\nx-b: 2\r\n")),
+    ]);
+}
+
+/// A request line is `method target HTTP/<digit>.<digit>` and nothing else (T286): a version
+/// that is anything more or less, however long, is a 400 -- before a 414 or a 431 can
+/// say that the head is too big -- and a line with no version is one too.
+#[test]
+fn the_request_line_version_is_http_digit_dot_digit() {
+    let p = start();
+    let line = |l: &str| case(format!("{l}\r\nHost: x\r\n\r\n").as_bytes(), 400, None);
+    let long = |n: usize| line(&format!("GET /long{n} HTTP/1.{}", "z".repeat(n)));
+    run(&p, p.fe, &[
+        line("GET /bad1 HTTP/1.z"),
+        line("GET /bad2 HTTP/1."),
+        line("GET /bad3 HTTP/1.10"),
+        line("GET /bad4 http/1.1"),
+        line("GET /bad5 HTTP/1.1x"),
+        line("GET /bad6 HTTP/1.1 x"),
+        line("GET /bad7 HTTP/1.1 "),
+        line("GET /bad8 HTTP/1"),
+        line("GET /bad9 HTTP/1.1.1"),
+        line("GET /bad10"),
+        long(100),
+        long(5000),
+        long(16100),
+        long(17000),
+        // HTTP/1.0 keeps its version and asks to keep alive.
+        case(b"GET /ok3 HTTP/1.0\r\nHost: x\r\n\r\n", 200, Some(b"GET /ok3 HTTP/1.0\r\nhost: x\r\nconnection: keep-alive\r\n\r\n")),
+    ]);
+}
+
+/// Content-Length lines that differ are not answered: `HAProxy` closes the connection
+/// with nothing written and logs a 400 `PR--` (T286). A list in one line is a 400 reply.
+#[test]
+fn differing_content_length_lines_close_the_connection() {
+    let p = start();
+    let cl = |path: &str, n: usize| {
+        let lines: String = (1..=n).map(|i| format!("Content-Length: {i}\r\n")).collect();
+        case(format!("POST {path} HTTP/1.1\r\nHost: x\r\n{lines}\r\nxx").as_bytes(), 0, None)
+    };
+    run(&p, p.fe, &[
+        cl("/cl2", 2),
+        cl("/cl5", 5),
+        case(b"POST /list HTTP/1.1\r\nHost: x\r\nContent-Length: 1, 2\r\n\r\nxx", 400, None),
+    ]);
+    let line = log_with(&p, " f f/<NOSRV> -1/-1/-1/-1/0 400 0 ").expect("the refusals are logged");
+    assert!(line.contains(" 400 0 ") && line.contains(" PR-- "), "{line}");
+}
+
+/// A header value that is valid UTF-8 spelling U+F780 (EF 9E 80) reaches the server as those
+/// bytes, not as the byte 0x80 (T286).
+#[test]
+fn utf8_in_the_private_use_range_is_forwarded_as_sent() {
+    let p = start();
+    run(&p, p.fe, &[
+        get("/pua", b"X-A: \xef\x9e\x80\r\n", 200, Some(b"x-a: \xef\x9e\x80\r\n")),
+        get("/pua-mixed", b"X-A: \xef\x9e\x80\xe9\r\n", 200, Some(b"x-a: \xef\x9e\x80\xe9\r\n")),
     ]);
 }

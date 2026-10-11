@@ -34,29 +34,25 @@ pub const HTX_DEFRAG_THRESHOLD_BYTES: usize = 512;
 pub const HTX_BLK_FL_NONE: u8 = 0x00;
 /// Flag marking the final block of an HTTP message.
 pub const HTX_BLK_FL_EOM: u8 = 0x01;
-/// Flag of a header whose value arrived with obs-text (bytes 0x80-0xFF, RFC 9110 section
-/// 5.5) that is not UTF-8, Latin-1 from an old client. The value is held as text, each such
-/// byte as the character of the same number (U+0080-U+00FF), so every text reader -- rules,
-/// ACLs, fetches -- sees the header; [`HtxSliceRef::write_h1_wire`] writes each of those
-/// characters back as its one byte, so the server gets the bytes the client sent (T285).
+/// Flag of a header whose value is not valid UTF-8 or holds escaped bytes: obs-text
+/// (bytes 0x80-0xFF, RFC 9110 section 5.5) from an old client. The value is held as text
+/// in [`ibex_regex::bytetext`] form (a byte that is not UTF-8 as one private-use character),
+/// so every text reader -- rules, ACLs, fetches -- sees the header and compares its bytes;
+/// [`HtxSliceRef::write_h1_wire`] writes each such character back as its one byte, so the
+/// server gets the bytes the client sent (T285, T286).
 pub const HTX_BLK_FL_LATIN1: u8 = 0x02;
 
-/// `value` read as Latin-1: each byte as the character of the same number.
+/// `value` as text: valid UTF-8 as it is, any other byte as one escaped character.
 #[must_use]
 pub fn latin1_to_text(value: &[u8]) -> String {
-    value.iter().map(|&b| char::from(b)).collect()
+    ibex_regex::bytetext::bytes_to_text(value)
 }
 
 /// The bytes a value of [`HTX_BLK_FL_LATIN1`] stands for, written at `cursor`.
-fn write_latin1(out: &mut [u8], mut cursor: usize, text: &[u8]) -> Result<usize, HtxError> {
-    // Held as text this crate wrote, two bytes for each character over U+007F.
+fn write_latin1(out: &mut [u8], cursor: usize, text: &[u8]) -> Result<usize, HtxError> {
+    // Held as text this crate wrote.
     let Ok(text) = std::str::from_utf8(text) else { return write_slice(out, cursor, text) };
-    for c in text.chars() {
-        // A value replaced since holds characters up to U+00FF only (`replace_block_value_raw`).
-        let b = u8::try_from(u32::from(c)).unwrap_or(b'?');
-        cursor = write_slice(out, cursor, &[b])?;
-    }
-    Ok(cursor)
+    write_slice(out, cursor, &ibex_regex::bytetext::text_to_bytes(text))
 }
 
 /// HTX Block Type identifier.
@@ -642,11 +638,14 @@ fn replace_block_value_raw(
     if desc.blk_type == HtxBlockType::Unused {
         return Ok(());
     }
-    // A Latin-1 value stays one while what replaces it can be written as Latin-1.
-    if desc.flags & HTX_BLK_FL_LATIN1 != 0
-        && !std::str::from_utf8(new_value).is_ok_and(|v| v.chars().all(|c| u32::from(c) <= 0xFF))
-    {
-        desc.flags &= !HTX_BLK_FL_LATIN1;
+    // The value is written as bytes when it holds an escaped byte (T286).
+    if desc.blk_type == HtxBlockType::Header {
+        let escaped = !new_value.is_ascii() && std::str::from_utf8(new_value).is_ok_and(ibex_regex::bytetext::has_escapes);
+        if escaped {
+            desc.flags |= HTX_BLK_FL_LATIN1;
+        } else {
+            desc.flags &= !HTX_BLK_FL_LATIN1;
+        }
     }
 
     let old_val_len = desc.value_len as usize;
@@ -1402,21 +1401,22 @@ impl<'a> HtxSlice<'a> {
         )
     }
 
+    /// Pushes a header whose value is text a peer sent. A character the byte mapping uses
+    /// (U+F780-U+F7FF, [`ibex_regex::bytetext`]) in it is held as its own UTF-8 bytes, so
+    /// the flag is never inferred from what a peer sent: only [`Self::push_header_latin1`]
+    /// sets it (T286).
     pub fn push_header(&mut self, name: &str, value: &str) -> Result<(), HtxError> {
-        push_header_raw(
-            self.buf,
-            &mut self.tail_addr,
-            &mut self.num_blocks,
-            name,
-            value,
-        )
+        if value.is_ascii() || !ibex_regex::bytetext::has_escapes(value) {
+            return push_header_raw(self.buf, &mut self.tail_addr, &mut self.num_blocks, name, value);
+        }
+        self.push_header_latin1(name, value.as_bytes())
     }
 
     /// [`Self::push_header`] of a value that is not UTF-8, read as Latin-1 and flagged
     /// [`HTX_BLK_FL_LATIN1`].
     pub fn push_header_latin1(&mut self, name: &str, value: &[u8]) -> Result<(), HtxError> {
         let text = latin1_to_text(value);
-        self.push_header(name, &text)?;
+        push_header_raw(self.buf, &mut self.tail_addr, &mut self.num_blocks, name, &text)?;
         self.set_last_flag(HTX_BLK_FL_LATIN1);
         Ok(())
     }
@@ -1453,7 +1453,7 @@ impl<'a> HtxSlice<'a> {
         let mut bytes: Vec<u8> = if desc.flags & HTX_BLK_FL_LATIN1 == 0 {
             old.to_vec()
         } else {
-            String::from_utf8_lossy(old).chars().map(|c| u8::try_from(u32::from(c)).unwrap_or(b'?')).collect()
+            ibex_regex::bytetext::text_to_bytes(&String::from_utf8_lossy(old)).into_owned()
         };
         bytes.extend_from_slice(prefix.as_bytes());
         bytes.extend_from_slice(raw);
@@ -2831,21 +2831,45 @@ pub fn pseudo_headers_to_htx(
 mod tests {
     use super::*;
 
-    /// A Latin-1 value replaced by text it can still be written as stays Latin-1 (`é` goes
-    /// out as the byte E9); replaced by text it cannot (`€`), it goes out as UTF-8 (T285).
+    /// A value holding an escaped byte goes out as that byte, whether it was Latin-1 before
+    /// or not; any other text goes out as UTF-8 (T285, T286).
     #[test]
-    fn a_replaced_latin1_value_keeps_its_flag_only_while_it_can() {
-        let wire = |new: &str| {
+    fn a_replaced_value_is_written_as_the_bytes_it_stands_for() {
+        let wire = |new: &str, latin1: bool| {
             let mut buf = [0u8; 1024];
             let mut htx = HtxSlice::new(&mut buf);
             htx.push_req_line("GET", "/", "HTTP/1.1").unwrap();
-            htx.push_header_latin1("x-a", b"\xff").unwrap();
+            if latin1 {
+                htx.push_header_latin1("x-a", b"\xff").unwrap();
+            } else {
+                htx.push_header("x-a", "a").unwrap();
+            }
             htx.push_eoh().unwrap();
             htx.replace_block_value(1, new.as_bytes()).unwrap();
             htx.as_ref().to_h1_wire()
         };
-        assert_eq!(wire("caf\u{e9}"), b"GET / HTTP/1.1\r\nx-a: caf\xe9\r\n\r\n");
-        assert_eq!(wire("\u{20ac}"), "GET / HTTP/1.1\r\nx-a: \u{20ac}\r\n\r\n".as_bytes());
+        for latin1 in [true, false] {
+            assert_eq!(wire("caf\u{f7e9}", latin1), b"GET / HTTP/1.1\r\nx-a: caf\xe9\r\n\r\n");
+            assert_eq!(wire("caf\u{e9}", latin1), "GET / HTTP/1.1\r\nx-a: caf\u{e9}\r\n\r\n".as_bytes());
+            assert_eq!(wire("\u{20ac}", latin1), "GET / HTTP/1.1\r\nx-a: \u{20ac}\r\n\r\n".as_bytes());
+        }
+    }
+
+    /// `push_header` takes text a peer sent: U+F780 in it is EF 9E 80 on the wire, never the
+    /// byte 0x80 that the same character stands for in a value held as bytes (T286).
+    #[test]
+    fn push_header_of_peer_text_never_means_a_stray_byte() {
+        let mut buf = [0u8; 1024];
+        let mut htx = HtxSlice::new(&mut buf);
+        htx.push_req_line("GET", "/", "HTTP/1.1").unwrap();
+        htx.push_header("x-a", "a\u{f780}b").unwrap();
+        htx.push_header_latin1("x-b", b"a\x80b").unwrap();
+        htx.push_header_latin1("x-c", b"a\xef\x9e\x80b\x80").unwrap();
+        htx.push_eoh().unwrap();
+        assert_eq!(htx.as_ref().to_h1_wire(), b"GET / HTTP/1.1\r\nx-a: a\xef\x9e\x80b\r\nx-b: a\x80b\r\nx-c: a\xef\x9e\x80b\x80\r\n\r\n");
+        let vals: Vec<String> = htx.as_ref().headers().map(|(_, v)| v.to_string()).collect();
+        assert_ne!(vals[0], vals[1]);
+        assert_ne!(vals[0], vals[2]);
     }
 
     #[test]

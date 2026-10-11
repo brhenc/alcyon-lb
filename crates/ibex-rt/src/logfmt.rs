@@ -628,7 +628,7 @@ impl LogFormat {
     #[must_use]
     pub fn render(&self, d: &LogData, registry: &Registry, ctx: &SampleContext) -> String {
         let bytes = self.render_bytes(d, registry, ctx);
-        String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+        ibex_regex::bytetext::bytes_to_text(&bytes)
     }
 
     /// Renders the line as bytes: a sample may hold any, and a CBOR line is not text.
@@ -646,7 +646,7 @@ impl LogFormat {
     pub fn render_value(&self, d: &LogData, registry: &Registry, ctx: &SampleContext) -> String {
         let mut out = Out(Vec::new());
         self.render_into(&mut out, d, registry, ctx, false);
-        String::from_utf8(out.0).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+        ibex_regex::bytetext::bytes_to_text(&out.0)
     }
 
     /// The nodes in order. On an encoded line (`%{+json}o`, `%{+cbor}o`) the text between
@@ -769,11 +769,12 @@ struct Out(Vec<u8>);
 impl Out {
     fn push(&mut self, c: char) {
         let mut b = [0u8; 4];
-        self.0.extend_from_slice(c.encode_utf8(&mut b).as_bytes());
+        self.push_str(c.encode_utf8(&mut b));
     }
 
+    /// Text in [`ibex_regex::bytetext`] form: an escaped byte is written as that byte.
     fn push_str(&mut self, s: &str) {
-        self.0.extend_from_slice(s.as_bytes());
+        self.0.extend_from_slice(&ibex_regex::bytetext::text_to_bytes(s));
     }
 }
 

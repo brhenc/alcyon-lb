@@ -294,7 +294,7 @@ fn c_str2ipv6(smp: Sample) -> Option<Sample> {
 
 fn c_str2bin(smp: Sample) -> Option<Sample> {
     match smp {
-        Sample::Str(s) => Some(Sample::Bin(s.into_bytes())),
+        Sample::Str(s) => Some(Sample::Bin(ibex_regex::bytetext::text_to_bytes(&s).into_owned())),
         _ => None,
     }
 }
@@ -313,7 +313,7 @@ fn c_bin2str(smp: Sample) -> Option<Sample> {
             if let Some(nul) = b.iter().position(|&c| c == 0) {
                 b.truncate(nul);
             }
-            String::from_utf8(b).ok().map(Sample::Str)
+            Some(Sample::Str(ibex_regex::bytetext::bytes_to_text(&b)))
         }
         _ => None,
     }

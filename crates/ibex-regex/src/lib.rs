@@ -17,6 +17,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bytetext;
+
 use std::borrow::Cow;
 use std::fmt;
 
