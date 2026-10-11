@@ -274,7 +274,7 @@ fn start_proxy_cfg(global_extra: &str, fe_extra: &str) -> Proxy {
     std::fs::write(
         &cfg,
         format!(
-            "global\n\tstats socket {}\n{global_extra}\
+            "global\n\tstats socket {} level admin\n{global_extra}\
              defaults\n\tmode http\n\ttimeout connect 3s\n\ttimeout client 10s\n\ttimeout server 10s\n\n\
              frontend fe\n\tbind 127.0.0.1:{port} proto h2\n{fe_extra}\tdefault_backend be\n\n\
              backend be\n\tserver s1 127.0.0.1:{backend}\n",
@@ -433,6 +433,130 @@ fn concurrent_streams_credit_the_tracked_bytes_once() {
     let one_by_one = tracked_counts(false);
     assert_eq!(one_by_one[0], "http_req_cnt=2", "{one_by_one:?}");
     assert_eq!(tracked_counts(true), one_by_one, "two streams at once vs one after the other");
+}
+
+/// The bytes of a stream that ends before its http rules ran -- here the connection's
+/// second stream, refused by `tcp-request content reject` -- are credited to the counters
+/// the connection tracks, as every other byte the client sent (T300): the connection's
+/// byte accounting moved past them when the stream started, for the stream to credit at its
+/// http rules, which never ran, and they were lost. Not run on `HAProxy` (`T280_ORACLE`),
+/// which counts HTTP/2 bytes differently (see above): the property is Ibex's own.
+#[test]
+fn a_stream_refused_before_its_rules_still_credits_its_bytes() {
+    if std::env::var_os("T280_ORACLE").is_some() {
+        return;
+    }
+    let p = start_proxy(
+        "\tstick-table type ip size 10 store bytes_in_cnt\n\
+         \ttcp-request connection track-sc0 src\n\
+         \ttcp-request content reject if { path /bad }\n",
+    );
+    let mut s = p.client(&[]);
+    let mut sent = 24 + 9;
+    get_all(&mut s, 1, &["/fast"]);
+    sent += 9 + hpack_get("/fast").len();
+    let bad = frame(0x01, 0x05, 3, &hpack_get("/bad"));
+    s.write_all(&bad).expect("headers");
+    sent += bad.len();
+    read_frames(&mut s, Duration::from_secs(2), |_, _, _, _, _| false);
+    drop(s);
+    thread::sleep(Duration::from_millis(300));
+    let table = p.cli("show table fe");
+    let row = table.lines().find(|l| l.contains("key=127.0.0.1")).unwrap_or_else(|| panic!("{table}"));
+    assert!(row.contains(&format!(" bytes_in_cnt={sent}")), "every byte the client sent ({sent}): {row}");
+}
+
+/// A session variable a stream unsets is gone for the connection's next streams too (the
+/// stream gives back what it changed, unsets included). Measured on `HAProxy`
+/// 3.5-dev8-885761-29 (`T280_ORACLE=haproxy`).
+#[test]
+fn a_session_variable_unset_by_a_stream_is_gone_for_the_next() {
+    let p = start_proxy(
+        "\thttp-request set-var(sess.a) str(one) if { query a }\n\
+         \thttp-request unset-var(sess.a) if { query u }\n\
+         \thttp-request return status 200 content-type text/plain lf-string \"<%[var(sess.a)]>\" if { path /vars }\n",
+    );
+    let mut s = p.client(&[]);
+    get_all(&mut s, 1, &["/slow?a"]);
+    assert_eq!(String::from_utf8_lossy(&get_all(&mut s, 3, &["/vars"])[&3]), "<one>");
+    get_all(&mut s, 5, &["/slow?u"]);
+    assert_eq!(String::from_utf8_lossy(&get_all(&mut s, 7, &["/vars"])[&7]), "<>");
+}
+
+/// What the client sees of a stream whose session is killed (`shutdown sessions server`)
+/// while its response drips: frames until then, never the response's end, and nothing more
+/// on the stream after a moment. Measured on `HAProxy` 3.5-dev8-885761-29 (`T280_ORACLE=`):
+/// `RST_STREAM REFUSED_STREAM` for the stream, the connection kept, logged `KC--` before
+/// the response; Ibex ends the whole connection (per-stream semantics: T280 stage 4).
+#[test]
+fn a_stream_whose_session_is_killed_never_ends_its_response() {
+    let p = start_proxy("");
+    let mut s = p.client(&[]);
+    s.write_all(&frame(0x01, 0x05, 1, &hpack_get("/drip"))).expect("headers");
+    thread::sleep(Duration::from_millis(400));
+    let out = p.cli("shutdown sessions server be/s1");
+    let mut data_after = 0;
+    let t0 = Instant::now();
+    let mut ended = false;
+    read_frames(&mut s, Duration::from_secs(2), |_, ty, flags, sid, payload| {
+        ended |= sid == 1 && matches!(ty, 0x00 | 0x01) && flags & 1 != 0;
+        if ty == 0x00 && t0.elapsed() > Duration::from_millis(500) {
+            data_after += payload.len();
+        }
+        false
+    });
+    assert!(!ended && data_after == 0, "killed: the response must stop ({out:?}): ended {ended}, {data_after} bytes later");
+}
+
+/// A connection error while a stream waits on its server (a `WINDOW_UPDATE` of 0 on the
+/// connection): `GOAWAY PROTOCOL_ERROR`, the connection ends, the stream with it. Measured
+/// on `HAProxy` 3.5-dev8-885761-29 (`T280_ORACLE=`): `GOAWAY` (last stream 1, code 1),
+/// `RST_STREAM NO_ERROR`, FIN, logged `400 ... CD--`. Ibex: `GOAWAY` (last stream 0, code 1)
+/// then a TCP reset, logged `-1 ... IH--` (T280 stage 4).
+#[test]
+fn a_connection_error_under_a_stream_ends_both() {
+    let p = start_proxy("");
+    let mut s = p.client(&[]);
+    s.write_all(&frame(0x01, 0x05, 1, &hpack_get("/drip"))).expect("headers");
+    thread::sleep(Duration::from_millis(400));
+    s.write_all(&frame(0x08, 0, 0, &[0, 0, 0, 0])).expect("window update");
+    let mut goaway = None;
+    read_frames(&mut s, Duration::from_secs(2), |_, ty, _, _, payload| {
+        if ty == 0x07 {
+            goaway = Some(u32::from_be_bytes(payload[4..8].try_into().expect("code")));
+        }
+        false
+    });
+    assert_eq!(goaway, Some(1), "GOAWAY PROTOCOL_ERROR");
+    s.set_read_timeout(Some(Duration::from_millis(200))).ok();
+    let end = s.read(&mut [0u8; 64]);
+    assert!(matches!(end, Ok(0)) || end.as_ref().is_err_and(|e| e.kind() == std::io::ErrorKind::ConnectionReset), "the connection has ended: {end:?}");
+}
+
+/// A stream refused by `tcp-request content reject` (after its inspect delay) while another
+/// stream of its connection drips its response: the refused one gets no response, the other
+/// its head at once. Measured on `HAProxy` 3.5-dev8-885761-29 (`T280_ORACLE=`): at the
+/// delay, `RST_STREAM` on stream 1 and `GOAWAY ENHANCE_YOUR_CALM` (last stream 3), and
+/// stream 3 is served to its end. Ibex ends the whole connection there, stream 3 with it
+/// (its owner is freed with the stream still attached, which then ends as when its client
+/// leaves): per-stream semantics are T280 stage 4.
+#[test]
+fn a_stream_rejected_beside_a_dripping_one_gets_no_response() {
+    let p = start_proxy("\ttcp-request inspect-delay 1s\n\ttcp-request content reject if { path /bad } WAIT_END\n");
+    let mut s = p.client(&[]);
+    s.write_all(&frame(0x01, 0x05, 1, &hpack_get("/bad"))).expect("headers");
+    thread::sleep(Duration::from_millis(100));
+    s.write_all(&frame(0x01, 0x05, 3, &hpack_get("/drip"))).expect("headers");
+    let mut heads = Vec::new();
+    let t0 = Instant::now();
+    read_frames(&mut s, Duration::from_millis(1500), |_, ty, _, sid, _| {
+        if ty == 0x01 {
+            heads.push((sid, t0.elapsed()));
+        }
+        false
+    });
+    assert_eq!(heads.iter().map(|h| h.0).collect::<Vec<_>>(), [3], "a head for stream 3 only: {heads:?}");
+    assert!(heads[0].1 < Duration::from_millis(500), "stream 3 is not held by stream 1's rules: {heads:?}");
 }
 
 /// Session variables set by a connection's streams are kept for its next streams, served
