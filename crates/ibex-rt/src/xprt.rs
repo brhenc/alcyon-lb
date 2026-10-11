@@ -474,9 +474,8 @@ impl TlsConn {
     /// `protocol_version` below SSL 3.0 and `handshake_failure` for SSL 3.0 (measured on
     /// `HAProxy`). `fresh` is what this fill has read so far, the first bytes of it.
     fn refuse_old_legacy_version(&mut self, fd: BorrowedFd<'_>, fresh: &[u8]) -> Option<io::Error> {
-        if self.legacy_checked || self.ctx.handshake_done || !(self.gate.is_some() || matches!(self.ctx.session, Some(TlsSession::Server(_)))) {
-            return None;
-        }
+        // Only `gate_fill` calls this, before the session exists.
+        if self.legacy_checked { return None; }
         let mut head = self.head.clone();
         head.extend_from_slice(&fresh[..fresh.len().min(HEAD_LEN.saturating_sub(head.len()))]);
         if head.len() < HEAD_LEN {
