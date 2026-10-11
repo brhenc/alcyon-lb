@@ -9396,6 +9396,8 @@ impl EngineDispatcher<'_> {
                     txn.req = MsgState::Tunnel;
                 }
             }
+            // The body that came with the head: its chunk lines as HAProxy writes them.
+            sess.rewrite_rep_chunk_framing();
             // `option logasap`: the line goes out with the response head (`http_process_res_common`),
             // with what has come from the server so far, and the end of the stream logs nothing.
             if proxies[fe_idx].log_opts & ibex_config::LOG_OPT_ASAP != 0 && !entry.sess.log.asap_done {

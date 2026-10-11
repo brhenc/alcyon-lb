@@ -229,3 +229,11 @@ work and the connections left in the backlog wait for the next poll. Ibex's defa
 limit: its listener is polled level-triggered and an accept loop drains the backlog it finds,
 which is what every measurement so far was made with. Set `tune.maxaccept 4` to get
 HAProxy's behaviour.
+
+## Chunked bodies: chunks are not merged (T302)
+
+Like HAProxy, Ibex forwards a chunked body (either way) with each chunk-size line rewritten:
+the extension and blanks dropped, the size in upper-case hex without leading zeros (`0005;a=b`
+goes out as `5`, `a` as `A`). HAProxy also merges the chunks it holds in its buffer at once
+into one (`A` and `3` received in one read go out as `D`); Ibex keeps the chunks as received.
+Which chunks HAProxy merges depends on how the bytes arrive, and the payload is the same.

@@ -46,6 +46,7 @@ mod check_rules;
 mod check_stats_columns;
 mod check_status_word;
 mod check_verdicts;
+mod chunk_extensions;
 mod chunked_body_errors;
 mod cli_answer_delivery;
 mod cli_batch_coverage;
