@@ -118,8 +118,264 @@ fn scan(pattern: &str) -> Scan {
     out
 }
 
+/// What a quantifier may follow, in [`pcre2_refusal`].
+#[derive(Clone, Copy, PartialEq)]
+enum Prev {
+    /// Nothing to repeat yet (start, after `(` or `|`): left to the compiler.
+    Nothing,
+    /// A repeatable item.
+    Item,
+    /// An anchor, an option setting: PCRE2 refuses a quantifier here.
+    Anchor,
+    /// An item just quantified: only `?` or `+` may follow.
+    Quantified,
+    /// A quantifier with its lazy or possessive suffix.
+    Done,
+}
+
+/// The POSIX class names PCRE2 knows.
+const POSIX_CLASSES: [&str; 14] =
+    ["alnum", "alpha", "ascii", "blank", "cntrl", "digit", "graph", "lower", "print", "punct", "space", "upper", "word", "xdigit"];
+
+/// The `{n}`, `{n,}` or `{n,m}` at `b[i]`: `(n, m, end)` with `end` the index of the `}`.
+fn braces(b: &[u8], i: usize) -> Option<(u64, Option<u64>, usize)> {
+    let num = |mut j: usize| {
+        let from = j;
+        let mut v = 0u64;
+        while b.get(j).is_some_and(u8::is_ascii_digit) {
+            v = (v * 10 + u64::from(b[j] - b'0')).min(1 << 40);
+            j += 1;
+        }
+        (j > from).then_some((v, j))
+    };
+    let (n, j) = num(i + 1)?;
+    match b.get(j)? {
+        b'}' => Some((n, Some(n), j)),
+        b',' if b.get(j + 1) == Some(&b'}') => Some((n, None, j + 1)),
+        b',' => {
+            let (m, k) = num(j + 1)?;
+            (b.get(k) == Some(&b'}')).then_some((n, Some(m), k))
+        }
+        _ => None,
+    }
+}
+
+/// The refusals PCRE2 makes that `regex` and `fancy-regex` do not (T287 item 4), with the
+/// `erroffset` PCRE2 reports: a quantifier after a quantifier or an anchor, `{n,m}` out of
+/// order or over 65535, an unknown POSIX class, a collating element, a group name used
+/// twice. Measured on HAProxy 3.5-dev8-885761-29. Not covered: an unbounded look-behind
+/// (`(?<=a*)b`), which PCRE2 refuses and `fancy-regex` runs (docs/differences.md).
+fn pcre2_refusal(pattern: &str) -> Option<Error> {
+    const QUANT: &str = "quantifier does not follow a repeatable item";
+    let b = pattern.as_bytes();
+    let dup_ok = pattern.contains("(?J");
+    let mut names: Vec<&str> = Vec::new();
+    let (mut prev, mut i) = (Prev::Nothing, 0usize);
+    let err = |why: &str, at: usize| Some(Error(why.to_string(), Some(at)));
+    // A quantifier token ending before `end`.
+    let quantify = |prev: &mut Prev, end: usize| -> Option<Error> {
+        match *prev {
+            Prev::Nothing => *prev = Prev::Quantified,
+            Prev::Item => *prev = Prev::Quantified,
+            Prev::Anchor | Prev::Quantified | Prev::Done => return err(QUANT, end),
+        }
+        None
+    };
+    while i < b.len() {
+        match b[i] {
+            b'\\' => {
+                prev = if matches!(b.get(i + 1), Some(b'A' | b'z' | b'Z' | b'G' | b'b' | b'B')) { Prev::Anchor } else { Prev::Item };
+                i += 2;
+            }
+            b'[' => {
+                i += 1;
+                if b.get(i) == Some(&b'^') {
+                    i += 1;
+                }
+                if b.get(i) == Some(&b']') {
+                    i += 1;
+                }
+                while i < b.len() && b[i] != b']' {
+                    if b[i] == b'\\' {
+                        i += 1;
+                    } else if b[i] == b'[' && matches!(b.get(i + 1), Some(b':' | b'.' | b'=')) {
+                        let kind = b[i + 1];
+                        let close = [kind, b']'];
+                        if let Some(end) = b[i + 2..].windows(2).position(|w| w == close) {
+                            let name = &pattern[i + 2..i + 2 + end];
+                            let after = i + 2 + end + 2;
+                            if kind != b':' {
+                                return err("POSIX collating elements are not supported", after);
+                            }
+                            if !POSIX_CLASSES.contains(&name.strip_prefix('^').unwrap_or(name)) {
+                                return err("unknown POSIX class name", after);
+                            }
+                            i = after - 1;
+                        }
+                    }
+                    i += 1;
+                }
+                i += 1;
+                prev = Prev::Item;
+            }
+            b'(' => {
+                prev = Prev::Nothing;
+                if b.get(i + 1) == Some(&b'?') {
+                    let open = match (b.get(i + 2), b.get(i + 3)) {
+                        (Some(b'<'), Some(c)) if !matches!(c, b'=' | b'!') => Some(i + 3),
+                        (Some(b'P'), Some(b'<')) => Some(i + 4),
+                        (Some(b'\''), _) => Some(i + 3),
+                        _ => None,
+                    };
+                    if let Some(from) = open {
+                        let end = b[from..].iter().position(|c| matches!(c, b'>' | b'\''))? + from;
+                        let name = &pattern[from..end];
+                        if !dup_ok && names.contains(&name) {
+                            return err("two named subpatterns have the same name (PCRE2_DUPNAMES not set)", end + 1);
+                        }
+                        names.push(name);
+                    } else if b.get(i + 2) == Some(&b'#') {
+                        // A comment: skipped, it is no item.
+                        i = b[i..].iter().position(|&c| c == b')').map_or(b.len(), |p| i + p + 1);
+                        continue;
+                    } else if b[i + 2..].iter().take_while(|c| **c != b')').all(|c| c.is_ascii_alphabetic() || matches!(c, b'-' | b'^'))
+                        && b[i + 2..].contains(&b')')
+                    {
+                        // An option setting, `(?i)`: nothing to repeat.
+                        i = i + 2 + b[i + 2..].iter().position(|&c| c == b')')? + 1;
+                        prev = Prev::Anchor;
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+            b')' => {
+                prev = Prev::Item;
+                i += 1;
+            }
+            b'|' => {
+                prev = Prev::Nothing;
+                i += 1;
+            }
+            b'^' | b'$' => {
+                prev = Prev::Anchor;
+                i += 1;
+            }
+            b'*' | b'+' | b'?' => {
+                match prev {
+                    Prev::Quantified if b[i] != b'*' => prev = Prev::Done,
+                    _ => {
+                        if let Some(e) = quantify(&mut prev, i + 1) {
+                            return Some(e);
+                        }
+                    }
+                }
+                i += 1;
+            }
+            b'{' => {
+                if let Some((n, m, end)) = braces(b, i) {
+                    if n > 65535 || m.is_some_and(|m| m > 65535) {
+                        return err("number too big in {} quantifier", end);
+                    }
+                    if m.is_some_and(|m| m < n) {
+                        return err("numbers out of order in {} quantifier", end);
+                    }
+                    if let Some(e) = quantify(&mut prev, end + 1) {
+                        return Some(e);
+                    }
+                    i = end + 1;
+                } else {
+                    prev = Prev::Item;
+                    i += 1;
+                }
+            }
+            _ => {
+                prev = Prev::Item;
+                i += 1;
+            }
+        }
+    }
+    None
+}
+
 /// PCRE2's text for a reference to a group the pattern does not have.
 const NONEXISTENT_GROUP: &str = "reference to non-existent subpattern";
+
+/// Where PCRE2 puts `erroffset` for the first reference to a group the pattern does not
+/// have: just past a `\N`, or at the inner `(` of a `(?(N)` condition (measured, T287).
+/// `nocapture`: only named groups count. `None` when no such reference is found (a
+/// pattern this scan reads differently from the compiler).
+fn missing_group_offset(pattern: &str, nocapture: bool) -> Option<usize> {
+    let b = pattern.as_bytes();
+    // Total number of groups, as a reference to a later group is valid too.
+    let (mut total, mut in_class, mut i) = (0usize, false, 0usize);
+    let is_group = |i: usize| -> bool {
+        if b.get(i + 1) != Some(&b'?') {
+            return !nocapture;
+        }
+        match (b.get(i + 2), b.get(i + 3)) {
+            (Some(b'<'), Some(c)) => !matches!(c, b'=' | b'!'),
+            (Some(b'P'), Some(b'<')) | (Some(b'\''), _) => true,
+            _ => false,
+        }
+    };
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i += 1,
+            b'[' if !in_class => in_class = true,
+            b']' if in_class => in_class = false,
+            // The inner parenthesis of a condition is not a group.
+            b'(' if !in_class && b[i..].starts_with(b"(?(") => i += 2,
+            b'(' if !in_class && is_group(i) => total += 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    let (mut in_class, mut i) = (false, 0usize);
+    while i < b.len() {
+        match b[i] {
+            b'\\' => {
+                if !in_class && b.get(i + 1).is_some_and(|c| (b'1'..=b'9').contains(c)) {
+                    let mut j = i + 1;
+                    while b.get(j).is_some_and(u8::is_ascii_digit) {
+                        j += 1;
+                    }
+                    if pattern[i + 1..j].parse::<usize>().map_or(true, |n| n > total) {
+                        return Some(j);
+                    }
+                    i = j;
+                    continue;
+                }
+                i += 2;
+                continue;
+            }
+            b'[' if !in_class => in_class = true,
+            b']' if in_class => in_class = false,
+            b'(' if !in_class && b[i..].starts_with(b"(?(") => {
+                let mut j = i + 3;
+                while b.get(j).is_some_and(u8::is_ascii_digit) {
+                    j += 1;
+                }
+                if j > i + 3 && b.get(j) == Some(&b')') && pattern[i + 3..j].parse::<usize>().map_or(true, |n| n == 0 || n > total) {
+                    return Some(i + 2);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+impl Error {
+    /// This refusal with the offset of the missing group reference in `pattern`.
+    fn locate(mut self, pattern: &str, nocapture: bool) -> Self {
+        if self.0 == NONEXISTENT_GROUP && self.1.is_none() {
+            self.1 = missing_group_offset(pattern, nocapture);
+        }
+        self
+    }
+}
 
 /// Refuses the conditionals `fancy-regex` compiles but cannot run, or runs with another
 /// meaning than PCRE2's (T277).
@@ -403,6 +659,13 @@ impl UserRegex {
     /// # Errors
     /// As [`UserRegex::new`].
     pub fn with_case(pattern: &str, case_insensitive: bool) -> Result<Self, Error> {
+        Self::compile(pattern, case_insensitive).map_err(|e| e.locate(pattern, false))
+    }
+
+    fn compile(pattern: &str, case_insensitive: bool) -> Result<Self, Error> {
+        if let Some(e) = pcre2_refusal(pattern) {
+            return Err(e);
+        }
         COMPILES.with(|n| n.set(n.get() + 1));
         let scan = scan(pattern);
         if let Some(what) = scan.unsupported {
@@ -453,7 +716,7 @@ impl UserRegex {
                 // What the pattern says wrong as written is what PCRE2 says; if it is right
                 // as written, only the reference to a group that no longer captures is left.
                 Self::with_case(pattern, case_insensitive)?;
-                Err(Error(NONEXISTENT_GROUP.to_string(), None))
+                Err(Error(NONEXISTENT_GROUP.to_string(), None).locate(pattern, true))
             }
         }
     }
@@ -723,5 +986,76 @@ mod nocapture_tests {
         assert!(UserRegex::new_nocapture(r"\(a)").is_err());
         assert!(UserRegex::new_nocapture(r"(a").is_err_and(|e| e.to_string() != NONEXISTENT_GROUP));
         assert!(UserRegex::new(r"(a)\1").is_ok());
+    }
+
+    /// PCRE2's `erroffset` for a reference to a missing group, measured on HAProxy
+    /// 3.5-dev8-885761-29 with `path_reg` (NO_AUTO_CAPTURE): just past the `\N`, or at the
+    /// inner `(` of a `(?(N)` condition (T287).
+    #[test]
+    fn a_missing_group_reference_has_pcre2s_offset() {
+        for (p, at) in [
+            (r"(a)\1", 5),
+            (r"(a)\1b", 5),
+            (r"((a))\2", 7),
+            (r"x(?:a)\1y", 8),
+            (r"(a)(?<n>b)\2z", 12),
+            (r"(a)(?(1)b|c)", 5),
+            (r"(a)(?(1)b|c)zz", 5),
+            (r"(?<n>a)(?(2)b)", 9),
+        ] {
+            let e = UserRegex::new_nocapture(p).expect_err(p);
+            assert_eq!((e.to_string().as_str(), e.offset()), (NONEXISTENT_GROUP, Some(at)), "{p}");
+        }
+        // Without NO_AUTO_CAPTURE every group counts.
+        let e = UserRegex::new(r"(a)(?(2)b)").expect_err("cond");
+        assert_eq!(e.offset(), Some(5));
+        let e = UserRegex::new(r"(a)\2").expect_err("ref");
+        assert_eq!(e.offset(), Some(5));
+    }
+
+    /// Patterns PCRE2 refuses and `regex`/`fancy-regex` accept, with the error text and
+    /// `erroffset` measured on HAProxy 3.5-dev8-885761-29 (`path_reg`, T287 item 4); and
+    /// look-alikes it accepts.
+    #[test]
+    fn what_pcre2_refuses_is_refused() {
+        const Q: &str = "quantifier does not follow a repeatable item";
+        for (p, why, at) in [
+            ("a**", Q, 3),
+            ("a+*", Q, 3),
+            ("a*?+", Q, 4),
+            ("a{1,2}{3}", Q, 9),
+            ("a{2}{3}", Q, 7),
+            ("^*", Q, 2),
+            ("$*", Q, 2),
+            ("^+", Q, 2),
+            (r"\b+", Q, 3),
+            (r"\B*", Q, 3),
+            (r"\A+", Q, 3),
+            (r"\z?", Q, 3),
+            (r"\b{2}", Q, 5),
+            ("(?i)*", Q, 5),
+            ("a{2,1}", "numbers out of order in {} quantifier", 5),
+            ("a{3,2}?", "numbers out of order in {} quantifier", 5),
+            ("a{65536}", "number too big in {} quantifier", 7),
+            ("a{99999}", "number too big in {} quantifier", 7),
+            ("x{1,65536}", "number too big in {} quantifier", 9),
+            ("[[:foo:]]", "unknown POSIX class name", 8),
+            ("[[.a.]]", "POSIX collating elements are not supported", 6),
+            ("[[=a=]]", "POSIX collating elements are not supported", 6),
+            ("(?<n>a)(?<n>b)", "two named subpatterns have the same name (PCRE2_DUPNAMES not set)", 12),
+            ("(?<n>a)|(?<n>b)", "two named subpatterns have the same name (PCRE2_DUPNAMES not set)", 13),
+        ] {
+            for r in [UserRegex::new(p), UserRegex::new_nocapture(p)] {
+                let e = r.expect_err(p);
+                assert_eq!((e.to_string().as_str(), e.offset()), (why, Some(at)), "{p}");
+            }
+        }
+        for p in [
+            "a*+", "a++", "a?+", "a{2}+", "a*?", "a{2}?", "a{2,3}+", "a{,3}", "a{2", "a{,}", "a{1,}", "a{0}", "a{65535}",
+            "a{1,65535}", "()*", "(?:)*", "[[:alpha:]]", "[[:^alpha:]]", "[[:word:]]", "[a[:digit:]]",
+            r"\(*", r"[*]*", r"\**", "(?<=a)b+", "a(?#c)*",
+        ] {
+            assert!(UserRegex::new(p).is_ok(), "{p}");
+        }
     }
 }

@@ -5692,20 +5692,10 @@ fn hmac_key_is_var(key: &str) -> bool {
 #[must_use]
 pub fn check_converter_args(name: &str, args: &[String]) -> Option<String> {
     match name {
-        _ if name.starts_with("map_") && !matches!(name, "map_str" | "map_beg" | "map_end" | "map_sub" | "map_dir" | "map_dom") => {
-            let keys = if name.starts_with("map_regm") {
-                crate::patref::MapKeys::Regm
-            } else if name.starts_with("map_reg") {
-                crate::patref::MapKeys::Reg
-            } else if name.starts_with("map_int") {
-                crate::patref::MapKeys::Int
-            } else if name.starts_with("map_ip") {
-                crate::patref::MapKeys::Ip
-            } else {
-                return None;
-            };
+        _ if name.starts_with("map_") && crate::patref::converter_map(name).is_some() => {
+            let (keys, vals) = crate::patref::converter_map(name)?;
             let path = args.first()?.trim_matches(['"', '\'']);
-            crate::patref::map_file_error(path, keys).map(|e| format!("invalid args in converter '{name}' : {e}"))
+            crate::patref::map_file_error(path, keys, vals).map(|e| format!("invalid args in converter '{name}' : {e}"))
         }
         "has_ctl" if has_ctl_mask(args.first().map_or("", String::as_str)).is_none() => {
             Some("invalid args in converter 'has_ctl' : expects 'any', 'http' or a mask of at most 33 bits".to_string())
