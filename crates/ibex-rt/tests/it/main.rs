@@ -117,6 +117,7 @@ mod h2_request_body;
 mod h2_request_gaps;
 mod h2_reset_branches;
 mod h2_response_body;
+mod h2_unread_output_timeout;
 mod h3_end_to_end;
 mod h3_many_threads;
 mod h3_proxy_path;
