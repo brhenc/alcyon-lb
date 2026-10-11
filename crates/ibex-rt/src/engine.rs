@@ -564,15 +564,25 @@ impl IdlePool {
         // `IDLE_SWEEP`. A connection the lists would refuse is weighed again without this
         // worker's dead ones for the server: a server that had just closed the connection
         // a `Connection: close` request left made the lists refuse the next client's fresh
-        // one, closed between its two requests (T301, `h1_to_h1.vtc`). Only on a refusal:
-        // a peek per idle connection of the server, none on the usual keep.
+        // one, closed between its two requests (T301, `h1_to_h1.vtc`). The other workers'
+        // dead ones count too (`pool-max-conn`, the need estimate: server-wide): theirs are
+        // dropped as well, from the lists whose lock is free (this worker holds its own).
+        // Only on a refusal: a peek per idle connection of the server, none on the usual keep.
         if let Err((conn, key)) = r {
             let gone = pool.drop_dead_of(srv);
-            r = if gone == 0 {
+            let mut others_gone = 0;
+            let other_lists = self.pools.slots.iter().enumerate().filter(|&(i, o)| i != self.wid && others != 0 && o.conns.load(Ordering::Relaxed) != 0);
+            for (_, other) in other_lists {
+                let Ok(mut theirs) = other.pool.try_lock() else { continue };
+                let n = theirs.drop_dead_of(srv);
+                other.conns.store(theirs.conns, Ordering::Relaxed);
+                others_gone += n;
+            }
+            r = if gone + others_gone == 0 {
                 Err((conn, key))
             } else {
-                self.pools.count_idle(srv, 0, gone);
-                pool.keep_with(key, conn, is_safe, cfg, used, (others, peak), fds, now)
+                self.pools.count_idle(srv, 0, gone + others_gone);
+                pool.keep_with(key, conn, is_safe, cfg, used, (others.saturating_sub(others_gone), peak), fds, now)
             };
         }
         slot.conns.store(pool.conns, Ordering::Relaxed);
@@ -947,6 +957,38 @@ mod shared_pool_tests {
         assert!(w.keep(key(), c2, false, CFG, 1, t0).is_ok(), "the dead one is not weighed");
         assert_eq!(w.total(), 1);
         assert_eq!(pools.with_count((0, 0), |n| n.idle.load(Ordering::Relaxed)), 1);
+    }
+
+    /// Another worker's dead idle connections do not make the lists refuse either (T301
+    /// item 3): `pool-max-conn` and the need estimate count the server's idle connections
+    /// on every worker. Worker 0, on its own thread, keeps a connection whose peer then
+    /// closes; worker 1 keeps one under `pool-max-conn 1`, and one more beside a live one
+    /// of its own under `pool-low-conn 1`, each refused while worker 0's was alive.
+    #[test]
+    fn another_workers_dead_idle_connection_does_not_make_the_lists_refuse() {
+        let t0 = Instant::now();
+        let one = SrvPoolCfg { max_conn: 1, ..CFG };
+        let low = SrvPoolCfg { low_conn: 1, ..CFG };
+        for (cfg, own_live) in [(one, false), (low, true)] {
+            let pools = IdlePools::with(2, true);
+            let (mut w0, mut w1) = (pools.worker(0), pools.worker(1));
+            let (c0, p0) = alive();
+            std::thread::scope(|t| {
+                t.spawn(|| assert!(w0.keep(key(), c0, false, cfg, 1, t0).is_ok()));
+            });
+            let _own = own_live.then(|| {
+                let (c, p) = alive();
+                assert!(w1.keep(key(), c, false, CFG, 1, t0).is_ok());
+                p
+            });
+            let (c1, _p1) = alive();
+            assert!(w1.keep(key(), c1, false, cfg, 1, t0).is_err(), "worker 0's is alive");
+            drop(p0);
+            let (c2, _p2) = alive();
+            assert!(w1.keep(key(), c2, false, cfg, 1, t0).is_ok(), "worker 0's is dead");
+            assert!(w0.is_empty(), "worker 0's dead one is dropped");
+            assert_eq!(pools.with_count((0, 0), |n| n.idle.load(Ordering::Relaxed)), 1 + usize::from(own_live));
+        }
     }
 
     /// Another worker's connection to another server is not taken; the search goes on to
