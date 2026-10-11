@@ -126,3 +126,13 @@ Against 36c022b: h2_rapid_reset fixed (RSS 173M -> 13M, no legit errors, mid 6/6
 | hdr_storm | RSS 56M->56M, cpu 40%/60%, fds 1656->31, p99 0.8ms, ok 3047 bad 0 err 0, mid 6/6, recovered y (4.1s) | RSS 26M->26M, cpu 56%/100%, fds 92->28, p99 3.4ms, ok 3026 bad 0 err 0, mid 6/6, recovered y (0.0s) |
 
 Both now recover: h2_window0 cpu 3%/10% (was 148%/403% on 94cc644), fds released at once (HAProxy 27.7 s); hdr_storm no more 4-core spin (peak 100% vs HAProxy 60%, average 56% vs 40%: roughly comparable), fds back to baseline at once (HAProxy 4.1 s). T269 (h2 FIN with window 0, epoll removal of idle fds) and T270 (server-wide idle-connection purge).
+
+## Host noise (user rule, 2026-10-11)
+
+Every load run records whether the user's game (Where Winds Meet, `wwm.exe` / `wineserver` under
+Steam/Proton) and the other VMs were loading the host. Start `tools/battery/hostnoise.py` on the host
+before a run (`nice -n 19 taskset -c 56-63 python3 tools/battery/hostnoise.py >> hostnoise.log`): one
+line per second with load average, qemu CPU per VM (`vm:<name>=N%`), `wwm=N%(Np)` and `game=N%(Np)`
+(Steam and friends). Before each run also `ps -eo pid,pcpu,etime,comm,args | awk '$4 ~ /wwm.exe|wineserver/'`.
+A run that overlaps `wwm` is discarded and redone; Steam idling is fine. Exact game sessions:
+`grep 'Game process' ~/.local/share/Steam/logs/console_log.txt` (AppID 3564740). VM stats via `sudo virsh`.
