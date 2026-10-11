@@ -293,7 +293,7 @@ pub fn render(stats: &StatsSnapshot, out: &mut String) {
             let _check_state = stats
                 .checks
                 .iter()
-                .find(|c| c.proxy_idx == p_idx && c.server_idx == s_idx);
+                .find(|c| c.proxy() == p_idx && c.server() == s_idx);
             let _ = writeln!(
                 out,
                 "haproxy_server_current_sessions{{proxy=\"{0}\",server=\"{1}\"}} {2}",
@@ -316,7 +316,7 @@ pub fn render(stats: &StatsSnapshot, out: &mut String) {
             let _check_state = stats
                 .checks
                 .iter()
-                .find(|c| c.proxy_idx == p_idx && c.server_idx == s_idx);
+                .find(|c| c.proxy() == p_idx && c.server() == s_idx);
             let _ = writeln!(
                 out,
                 "haproxy_server_max_sessions{{proxy=\"{0}\",server=\"{1}\"}} {2}",
@@ -339,7 +339,7 @@ pub fn render(stats: &StatsSnapshot, out: &mut String) {
             let _check_state = stats
                 .checks
                 .iter()
-                .find(|c| c.proxy_idx == p_idx && c.server_idx == s_idx);
+                .find(|c| c.proxy() == p_idx && c.server() == s_idx);
             let _ = writeln!(
                 out,
                 "haproxy_server_sessions_total{{proxy=\"{0}\",server=\"{1}\"}} {2}",
@@ -360,7 +360,7 @@ pub fn render(stats: &StatsSnapshot, out: &mut String) {
             let _check_state = stats
                 .checks
                 .iter()
-                .find(|c| c.proxy_idx == p_idx && c.server_idx == s_idx);
+                .find(|c| c.proxy() == p_idx && c.server() == s_idx);
             let _ = writeln!(
                 out,
                 "haproxy_server_bytes_in_total{{proxy=\"{0}\",server=\"{1}\"}} {2}",
@@ -381,7 +381,7 @@ pub fn render(stats: &StatsSnapshot, out: &mut String) {
             let _check_state = stats
                 .checks
                 .iter()
-                .find(|c| c.proxy_idx == p_idx && c.server_idx == s_idx);
+                .find(|c| c.proxy() == p_idx && c.server() == s_idx);
             let _ = writeln!(
                 out,
                 "haproxy_server_bytes_out_total{{proxy=\"{0}\",server=\"{1}\"}} {2}",
@@ -402,7 +402,7 @@ pub fn render(stats: &StatsSnapshot, out: &mut String) {
             let _check_state = stats
                 .checks
                 .iter()
-                .find(|c| c.proxy_idx == p_idx && c.server_idx == s_idx);
+                .find(|c| c.proxy() == p_idx && c.server() == s_idx);
             let _ = writeln!(
                 out,
                 "haproxy_server_responses_denied_total{{proxy=\"{0}\",server=\"{1}\"}} {2}",
@@ -423,7 +423,7 @@ pub fn render(stats: &StatsSnapshot, out: &mut String) {
             let _check_state = stats
                 .checks
                 .iter()
-                .find(|c| c.proxy_idx == p_idx && c.server_idx == s_idx);
+                .find(|c| c.proxy() == p_idx && c.server() == s_idx);
             let _ = writeln!(
                 out,
                 "haproxy_server_weight{{proxy=\"{0}\",server=\"{1}\"}} {2}",
@@ -448,7 +448,7 @@ pub fn render(stats: &StatsSnapshot, out: &mut String) {
             let _check_state = stats
                 .checks
                 .iter()
-                .find(|c| c.proxy_idx == p_idx && c.server_idx == s_idx);
+                .find(|c| c.proxy() == p_idx && c.server() == s_idx);
             let _ = writeln!(
                 out,
                 "haproxy_server_active{{proxy=\"{0}\",server=\"{1}\"}} {2}",
@@ -473,7 +473,7 @@ pub fn render(stats: &StatsSnapshot, out: &mut String) {
             let _check_state = stats
                 .checks
                 .iter()
-                .find(|c| c.proxy_idx == p_idx && c.server_idx == s_idx);
+                .find(|c| c.proxy() == p_idx && c.server() == s_idx);
             let _ = writeln!(
                 out,
                 "haproxy_server_backup{{proxy=\"{0}\",server=\"{1}\"}} {2}",
@@ -538,7 +538,7 @@ pub fn render(stats: &StatsSnapshot, out: &mut String) {
             let _check_state = stats
                 .checks
                 .iter()
-                .find(|c| c.proxy_idx == p_idx && c.server_idx == s_idx);
+                .find(|c| c.proxy() == p_idx && c.server() == s_idx);
             let is_up = if let Some(c) = _check_state {
                 c.status == ServerStatus::Up
             } else {
@@ -599,7 +599,7 @@ fn write_check_counter(
     value: impl Fn(&ServerCheckState) -> u64,
 ) {
     let check = |p_idx: usize, s_idx: usize| {
-        stats.checks.iter().find(|c| c.proxy_idx == p_idx && c.server_idx == s_idx)
+        stats.checks.iter().find(|c| c.proxy() == p_idx && c.server() == s_idx)
     };
     let first = stats
         .proxies

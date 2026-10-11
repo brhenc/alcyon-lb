@@ -197,7 +197,7 @@ pub fn inherited(proxy: &Proxy, s: usize) -> bool {
 /// admin form. It moves the admin state only: what the checks found (`cur_state`) is kept,
 /// so `ready` does not send traffic to a server they found dead (T274 E1).
 pub fn apply_admin(proxies: &[Proxy], checks: &mut [crate::check::ServerCheckState], p: usize, s: usize, to: ServerStatus) {
-    let check = checks.iter_mut().find(|c| c.proxy_idx == p && c.server_idx == s);
+    let check = checks.iter_mut().find(|c| c.proxy() == p && c.server() == s);
     if track_of(proxies, p, s).is_some() {
         set_status(proxies, p, s, to);
     } else if let Some(c) = check {
@@ -211,7 +211,7 @@ pub fn apply_admin(proxies: &[Proxy], checks: &mut [crate::check::ServerCheckSta
 /// `set server health up|down` on server `s` of proxy `p` (not a tracker: refused before):
 /// the operational state moves, the admin state stays.
 pub fn apply_health(proxies: &[Proxy], checks: &mut [crate::check::ServerCheckState], p: usize, s: usize, up: bool) {
-    if let Some(c) = checks.iter_mut().find(|c| c.proxy_idx == p && c.server_idx == s) {
+    if let Some(c) = checks.iter_mut().find(|c| c.proxy() == p && c.server() == s) {
         c.set_health(up);
         set_raw(proxies, p, s, c.published());
     } else if let Some(cur) = proxies.get(p).and_then(|px| px.server_statuses.get(s)) {

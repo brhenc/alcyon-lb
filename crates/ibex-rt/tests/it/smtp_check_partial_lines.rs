@@ -68,7 +68,7 @@ fn run_check(addr: std::net::SocketAddr) -> (&'static str, Option<u16>, Option<S
         let _ = engine.run_once().expect("run_once");
         let c = &engine.checks[0];
         if c.total_checks >= 1 && !c.in_progress {
-            return (c.last_status_code, c.http_code, c.last_status_info.clone());
+            return (c.last_status_code, c.http_code, c.last_status_info.as_deref().map(str::to_string));
         }
         thread::sleep(Duration::from_millis(5));
     }

@@ -148,3 +148,39 @@ fn a_listen_section_with_http_check_rules_drops_the_defaults() {
     assert_eq!(cfg.listens[0].http_checks.len(), 1);
     assert!(cfg.listens[0].http_check_own);
 }
+
+/// T304: the servers of a section whose checks resolve the same share one registered copy;
+/// a server whose check differs (here its `port`) has its own, and a check is found by its
+/// address too. The table is the process's: another test's parse clears it, so this tries
+/// again until no parse came between.
+#[test]
+fn servers_resolving_to_the_same_check_share_one_copy() {
+    use ibex_config::ast::get_resolved_check_config;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    let text = "defaults\n  mode http\n  timeout connect 1s\n  timeout client 1s\n  timeout server 1s\n\
+                backend b\n  option httpchk GET /t304\n\
+                  server s1 127.0.0.1:19971 check\n  server s2 127.0.0.1:19972 check\n\
+                  server s3 127.0.0.1:19973 check port 19979\n";
+    let at = |port: u16| SocketAddr::from(([127, 0, 0, 1], port));
+    for _ in 0..100 {
+        parse_str(text).expect("parse");
+        let (Some(a), Some(b), Some(c), Some(by_addr)) = (
+            get_resolved_check_config(0, 0, at(19971)),
+            get_resolved_check_config(0, 1, at(19972)),
+            get_resolved_check_config(0, 2, at(19973)),
+            get_resolved_check_config(usize::MAX, usize::MAX, at(19972)),
+        ) else {
+            continue;
+        };
+        let ibex_config::ast::ResolvedCheckConfig::Http(h) = &*a else { continue };
+        if h.uri != "/t304" {
+            continue;
+        }
+        assert!(Arc::ptr_eq(&a, &b), "s1 and s2 resolve the same check: one copy");
+        assert!(!Arc::ptr_eq(&a, &c), "s3 checks another port");
+        assert!(Arc::ptr_eq(&b, &by_addr), "found by address, the same copy");
+        return;
+    }
+    panic!("the resolved checks were replaced on every attempt");
+}

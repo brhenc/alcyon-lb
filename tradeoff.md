@@ -256,7 +256,7 @@ before this is run anywhere real.**
 | **Status** | **measured** — verified and pinned to ≤ 20 MB bound (without checks) and ≤ 35 MB bound (with checks) in `crates/ibex-rt/tests/request_allocations.rs` (`sixty_thousand_backends_memory_bounded` and `sixty_thousand_backends_with_checks_memory_bounded`). |
 | **Revisit if** | Backends require heavy embedded state that cannot be modeled compactly or shared across worker contexts. |
 
-**Tripwire (T255, 2026-10-10):** `sixty_thousand_backends_with_checks_no_further_growth` in the same file pins the current cost (54,034,102 bytes, 180,072 allocations; +5% / +1%) so the baselined failure cannot grow silently; the 35 MB test stays the target. T304 moved its figures down to 36,426,110 bytes and 120,071 allocations.
+**Tripwire (T255, 2026-10-10):** `sixty_thousand_backends_with_checks_no_further_growth` in the same file pins the current cost (54,034,102 bytes, 180,072 allocations; +5% / +1%) so the baselined failure cannot grow silently; the 35 MB test stays the target. T304 moved its figures down to 35,525,575 bytes and 120,449 allocations (the test alone, `--exact`, as the gate runs it).
 
 **2026-09-23: the with-checks figure moved to 47.09 MB and the bound was deliberately not
 raised.** Implementing `option httpchk`, `http-check` and `tcp-check` (T36) took the
@@ -324,7 +324,7 @@ within 20 MB of `nbthread 1` at 10,000 backends. One thread at 10,000 backends i
 (a suspect, not measured: the 22 predefined ACLs are compiled into every proxy), and is
 the next number to chase.
 
-**2026-10-11 (T304): back under 35 MB, 34.74 MB (36,426,110 bytes, 120,071 allocations).**
+**2026-10-11 (T304): back under 35 MB, 33.88 MB (35,525,575 bytes, 120,449 allocations, the test run alone).**
 The figure had reached 52,598,206 bytes (50.16 MB), 180,070 allocations: ~877 bytes and
 three allocations per server, of which the test's own `Server` lines are 192, the proxy
 without checks 138, and the checks ~545. Per checked server there were a 440-byte `ServerCheckState`, a boxed 48-byte
@@ -346,14 +346,20 @@ grew by doubling to 65,536. Now:
   returned to a per-thread pool when it ends (`CheckRunSlot`); after the first round of checks
   a check run allocates nothing for it, and memory is proportional to the checks in flight.
 - `Scheduler::reserve` sizes the task arena and timer tree for the checks at boot.
+- The proxy and server indexes are `u32`, the last check's `info` a `Box<str>`, and the
+  check's start tick lives in its `CheckRun`.
 
-`ServerCheckState` is 224 bytes (`struct_sizes.rs` bound lowered from 464). On the check path
+`ServerCheckState` is 200 bytes (`struct_sizes.rs` bound lowered from 464). On the check path
 nothing takes a lock or a reference count that did not before: a TCP-connect check touches
 no `Arc`; an HTTP or `tcp-check` run clones the `Arc` of its resolved configuration where it
-used to deep-clone the configuration itself. The margin is thin (274 KB under the bound,
-~4.6 bytes per server): the next per-server field belongs in `CheckRun` or behind a pointer.
+used to deep-clone the configuration itself. The margin is 1.17 MB (~20 bytes per server):
+the next per-server field belongs in `CheckRun` or behind a pointer. Of the figure, ~540 KB
+and ~378 allocations are the process's one-time initialisation, paid by whichever engine is
+built first: 358 KB of it is compiling the predefined ACL `HTTP_URL_ABS`'s regex
+(`url -m reg ^[^/:]*://`), 82 KB `LOCALHOST`, 81 KB the sample registry. The regex is the
+next thing to look at if this number is chased again.
 Trajectory: **14.00 MB bare, 29.75 MB with TCP-connect checks, 47.09 MB with HTTP checks,
-50.16 MB at T255, 34.74 MB after T304.**
+50.16 MB at T255, 33.88 MB after T304.**
 
 
 ### 6.6 Map converters in-memory caching — **resolved**
