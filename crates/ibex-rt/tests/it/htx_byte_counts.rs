@@ -81,7 +81,9 @@ fn start(rules: &str, responses: HashMap<&'static str, &'static str>) -> (Ibex, 
     );
     let mut f = NamedTempFile::new().expect("tmp");
     f.write_all(text.as_bytes()).expect("write cfg");
-    let child = Command::new(env!("CARGO_BIN_EXE_ibex"))
+    // `T306A_ORACLE=/path/to/haproxy` runs the same assertions on the reference binary.
+    let bin = std::env::var("T306A_ORACLE").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ibex").to_string());
+    let child = Command::new(bin)
         .arg("-f")
         .arg(f.path())
         .stdout(Stdio::null())
@@ -96,6 +98,13 @@ fn start(rules: &str, responses: HashMap<&'static str, &'static str>) -> (Ibex, 
 /// Sends `req` on a connection of its own, reads what comes back until the server's hold
 /// is over, and returns the log line of the request.
 fn log_of(fe: SocketAddr, logs: &UdpSocket, req: &str) -> String {
+    let (line, got) = log_and_answer(fe, logs, req);
+    assert!(got > 0, "no answer to {req:?}");
+    line
+}
+
+/// [`log_of`], and how many bytes of an answer the client read (0 for none).
+fn log_and_answer(fe: SocketAddr, logs: &UdpSocket, req: &str) -> (String, usize) {
     logs.set_nonblocking(true).ok();
     let mut junk = [0u8; 2048];
     while logs.recv(&mut junk).is_ok() {}
@@ -117,9 +126,7 @@ fn log_of(fe: SocketAddr, logs: &UdpSocket, req: &str) -> String {
         }
     };
     let mut chunk = [0u8; 4096];
-    let got = c.read(&mut chunk).unwrap_or(0);
-    assert!(got > 0, "no answer to {req:?}");
-    line
+    (line, c.read(&mut chunk).unwrap_or(0))
 }
 
 fn responses() -> HashMap<&'static str, &'static str> {
@@ -189,4 +196,25 @@ fn rules_that_rewrite_the_messages_do_not_change_what_was_counted() {
     let rules = "  http-request add-header X-Foo barbar\n  http-response add-header X-Bar zzz\n  http-response del-header content-length\n";
     let (_ibex, fe, logs) = start(rules, responses());
     assert_eq!(log_of(fe, &logs, "GET /two HTTP/1.1\r\nHost: a\r\n\r\n"), "B=51 U=41 ST=200");
+}
+
+#[test]
+fn a_response_a_rule_ends_counts_what_the_server_sent() {
+    // HAProxy (3.5-dev8, 2026-10-11): when an `http-response` rule ends the transaction, %B
+    // is still the server's message as it was received -- its head and the body that came
+    // with it -- and not the reply that replaced it, nor nothing for a silent-drop.
+    let rules = "  http-request set-var(txn.q) query\n  http-response silent-drop if { var(txn.q) -m str drop }\n  \
+                 http-response deny if { var(txn.q) -m str deny }\n  \
+                 http-response redirect location /x if { var(txn.q) -m str redirect }\n";
+    let (_ibex, fe, logs) = start(rules, responses());
+    let get = |p: &str| format!("GET {p} HTTP/1.1\r\nHost: a\r\n\r\n");
+    // Nothing reaches the client.
+    assert_eq!(log_and_answer(fe, &logs, &get("/two?drop")), ("B=51 U=46 ST=200".to_string(), 0));
+    assert_eq!(log_and_answer(fe, &logs, &get("/chunked?drop")), ("B=62 U=50 ST=200".to_string(), 0));
+    // The 502 of the deny and the 302 of the redirect go out, and do not count.
+    assert_eq!(log_of(fe, &logs, &get("/two?deny")), "B=51 U=46 ST=502");
+    assert_eq!(log_of(fe, &logs, &get("/chunked?deny")), "B=62 U=50 ST=502");
+    assert_eq!(log_of(fe, &logs, &get("/two?redirect")), "B=51 U=50 ST=302");
+    // A response to a HEAD has no body to count.
+    assert_eq!(log_of(fe, &logs, "HEAD /head?deny HTTP/1.1\r\nHost: a\r\n\r\n"), "B=49 U=48 ST=502");
 }

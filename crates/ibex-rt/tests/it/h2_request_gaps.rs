@@ -102,7 +102,9 @@ fn start(extra_fe: &str) -> (Ibex, SocketAddr, Receiver<Vec<u8>>, UdpSocket) {
     );
     let mut f = NamedTempFile::new().expect("tmp");
     f.write_all(cfg.as_bytes()).expect("write cfg");
-    let child = Command::new(env!("CARGO_BIN_EXE_ibex"))
+    // `T306A_ORACLE=/path/to/haproxy` runs the same assertions on the reference binary.
+    let bin = std::env::var("T306A_ORACLE").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ibex").to_string());
+    let child = Command::new(bin)
         .arg("-f")
         .arg(f.path())
         .stdout(Stdio::null())
@@ -142,13 +144,33 @@ fn head(method: &str, path: &str, extra: &[(&str, &str)]) -> Vec<u8> {
     block(&l)
 }
 
+type Frame = (u8, u8, u32, Vec<u8>);
+
 /// Frames read from `s` until the stream `sid` has ended (END_STREAM on a DATA or HEADERS).
-fn read_until_end(s: &mut TcpStream, sid: u32) -> Vec<(u8, u8, u32, Vec<u8>)> {
+fn read_until_end(s: &mut TcpStream, sid: u32) -> Vec<Frame> {
+    read_frames(s, Duration::from_secs(5), |f| f.2 == sid && matches!(f.0, 0 | 1) && f.1 & 1 != 0)
+}
+
+/// Frames read from `s` until one is `last`, for up to 5 s: a proxy slow to answer under
+/// load is waited for (a read that gave up at the socket's 200 ms timeout made the tests
+/// that read a whole response fail under parallel load, T305 item 9).
+fn read_until(s: &mut TcpStream, last: impl Fn(&Frame) -> bool) -> Vec<Frame> {
+    read_frames(s, Duration::from_secs(5), last)
+}
+
+/// What `s` has to read now: frames until 200 ms pass with nothing.
+fn read_quiet(s: &mut TcpStream) -> Vec<Frame> {
+    read_frames(s, Duration::ZERO, |_| false)
+}
+
+/// Frames read from `s` until one is `last`; a read timeout (200 ms of quiet) ends the
+/// reading once `patience` has passed.
+fn read_frames(s: &mut TcpStream, patience: Duration, last: impl Fn(&Frame) -> bool) -> Vec<Frame> {
     let mut out = Vec::new();
     let mut buf: Vec<u8> = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + patience;
     let mut tmp = [0u8; 4096];
-    while Instant::now() < deadline {
+    loop {
         while buf.len() >= 9 {
             let len = (usize::from(buf[0]) << 16) | (usize::from(buf[1]) << 8) | usize::from(buf[2]);
             if buf.len() < 9 + len {
@@ -157,18 +179,18 @@ fn read_until_end(s: &mut TcpStream, sid: u32) -> Vec<(u8, u8, u32, Vec<u8>)> {
             let id = u32::from_be_bytes([buf[5] & 0x7f, buf[6], buf[7], buf[8]]);
             let f = (buf[3], buf[4], id, buf[9..9 + len].to_vec());
             buf.drain(..9 + len);
-            let ended = id == sid && matches!(f.0, 0 | 1) && f.1 & 1 != 0;
+            let done = last(&f);
             out.push(f);
-            if ended {
+            if done {
                 return out;
             }
         }
         match s.read(&mut tmp) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+            Ok(n) if n > 0 => buf.extend_from_slice(&tmp[..n]),
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) && Instant::now() < deadline => {}
+            _ => return out,
         }
     }
-    out
 }
 
 fn connect(fe: SocketAddr) -> TcpStream {
@@ -198,7 +220,7 @@ fn expect_100_continue_gets_no_interim_and_reaches_the_server() {
     let mut s = connect(fe);
     s.write_all(&frame(1, 4, 1, &head("PUT", "/x", &[("expect", "100-continue"), ("content-length", "6")]))).expect("head");
     thread::sleep(Duration::from_millis(400));
-    let early = read_until_end(&mut s, 99);
+    let early = read_quiet(&mut s);
     assert!(
         !early.iter().any(|f| f.0 == 1 && f.2 == 1),
         "HAProxy sends no HEADERS (no :status 100) before the body: {early:?}"
@@ -278,6 +300,28 @@ fn trailers_after_a_content_length_body_are_counted_and_not_forwarded() {
     assert_eq!(log_line(&log), "B=51 U=77 te=- tr=- r=POST http://x/cl HTTP/2.0");
 }
 
+/// The same request with its trailers sent only once the whole response is back
+/// (measured on `HAProxy` 3.5-dev8, 2026-10-11): the stream is not over until the client
+/// ends it. Nothing more is sent on it -- no `RST_STREAM`, no `GOAWAY` for the trailers --
+/// the line is logged then, with the trailers counted, and the connection goes on.
+#[test]
+fn trailers_after_the_response_are_counted_and_the_connection_goes_on() {
+    let (_ibex, fe, rx, log) = start("");
+    let mut s = connect(fe);
+    s.write_all(&frame(1, 4, 1, &head("POST", "/cl", &[("content-length", "3")]))).expect("head");
+    s.write_all(&frame(0, 0, 1, b"abc")).expect("data");
+    assert!(is_200(&read_until_end(&mut s, 1)));
+    let got = String::from_utf8_lossy(&rx.recv_timeout(Duration::from_secs(5)).expect("request")).into_owned();
+    assert_eq!(got, "POST /cl HTTP/1.1\r\nhost: x\r\ncontent-length: 3\r\n\r\nabc");
+    thread::sleep(Duration::from_millis(300));
+    s.write_all(&frame(1, 5, 1, &block(&[("x-trail", "tv")]))).expect("trailers");
+    assert_eq!(log_line(&log), "B=51 U=77 te=- tr=- r=POST http://x/cl HTTP/2.0");
+    s.write_all(&frame(1, 5, 3, &head("GET", "/g", &[]))).expect("get");
+    let frames = read_until_end(&mut s, 3);
+    assert!(frames.iter().all(|f| !matches!(f.0, 3 | 7)), "a reset or a GOAWAY: {frames:?}");
+    assert!(is_200(&frames), "{frames:?}");
+}
+
 #[test]
 fn a_rule_that_edits_the_head_does_not_lose_the_chunked_framing() {
     let (_ibex, fe, rx, _log) = start("  http-request set-header x-added 1\n");
@@ -298,7 +342,7 @@ fn a_rule_that_edits_the_head_does_not_lose_the_chunked_framing() {
 fn malformed_trailers_reset_the_stream() {
     let (_ibex, fe, _rx, _log) = start("");
     let rst = |s: &mut TcpStream, sid: u32| -> Option<u32> {
-        let frames = read_until_end(s, sid + 1000);
+        let frames = read_until(s, |f| f.0 == 3 && f.2 == sid);
         frames.iter().find(|f| f.0 == 3 && f.2 == sid).map(|f| u32::from_be_bytes([f.3[0], f.3[1], f.3[2], f.3[3]]))
     };
     let mut s = connect(fe);
@@ -311,7 +355,7 @@ fn malformed_trailers_reset_the_stream() {
     s.write_all(&frame(1, 5, 5, &head("GET", "/c", &[]))).expect("get");
     assert!(is_200(&read_until_end(&mut s, 5)), "stream 5 answered before its HEADERS come");
     s.write_all(&frame(1, 5, 5, &block(&[("x", "y")]))).expect("headers after the end");
-    let goaway = read_until_end(&mut s, 1005)
+    let goaway = read_until(&mut s, |f| f.0 == 7)
         .iter()
         .find(|f| f.0 == 7)
         .map(|f| u32::from_be_bytes([f.3[4], f.3[5], f.3[6], f.3[7]]));

@@ -150,9 +150,11 @@ pub fn pump_request_body(h2: &mut H2MuxContext, active: &mut H2ActiveStream, req
     };
     let mut changed = false;
     let body = &mut active.body;
-    let before = body.trailer_bytes;
+    let (before, was_done) = (body.trailer_bytes, body.done);
     let taken = body.consumed;
-    if pump_h2_body(&mut stream.rx_htx, body, req) {
+    // The end of the message is news to the stream even when it wrote nothing (trailers
+    // dropped after a length): the transaction may have been waiting for it.
+    if pump_h2_body(&mut stream.rx_htx, body, req) || body.done != was_done {
         changed = true;
     }
     let taken = usize::try_from(body.consumed - taken).unwrap_or(usize::MAX);
@@ -216,8 +218,9 @@ pub fn forward_response(h2: &mut H2MuxContext, stream_id: u32, txn: &mut HttpTxn
     let mut state = txn.rsp;
     let used = state.take_body(data, h2.data_budget(stream_id), &mut out);
     let end = state.is_done();
-    if let Some(t) = txn.rsp_htx.as_mut() {
-        // The payload, and the chunked body's end (see `htx_head_size`).
+    if let Some(t) = txn.rsp_htx.as_mut().filter(|_| !txn.local) {
+        // The payload, and the chunked body's end (see `htx_head_size`); not a reply
+        // the proxy made in place of the server's response.
         *t += out.len() as u64 + u64::from(end && matches!(txn.rsp, MsgState::Body(txn::Body::Chunked(_))));
     }
     if !out.is_empty() || end {
