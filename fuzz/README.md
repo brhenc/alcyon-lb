@@ -1,7 +1,7 @@
 # Ibex HTTP/1 Parser Differential Fuzzing Harness
 
 This directory contains the differential fuzzing harness for Ibex's HTTP/1 parser (`crates/ibex-proto`).
-It performs automated differential testing against a live reference oracle—**HAProxy 3.5-dev7** (`/home/bhenc/reference/haproxy/haproxy`)—as well as self-differential testing across streaming modes within Ibex itself.
+It performs automated differential testing against a live reference oracle—**HAProxy 3.5-dev8** (`/home/bhenc/reference/haproxy/haproxy`)—as well as self-differential testing across streaming modes within Ibex itself.
 
 ---
 

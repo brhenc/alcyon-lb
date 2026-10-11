@@ -296,13 +296,16 @@ stage_lint() {
   # T279: fuzz/libfuzzer is its own crate outside the workspace, so clippy above never
   # compiles its targets; T273A removed a function a target called and nothing noticed for
   # hours. A plain stable `cargo check` of the bins (no sanitizer, no nightly) catches it.
-  # Warnings are not judged here, only errors. (fuzz/, the older differential crate, is not
-  # checked: it has not compiled since the HtxSlice change; see tasks/T279.)
+  # Warnings are not judged here, only errors. fuzz/ (the differential harness against
+  # HAProxy) is its own crate too and rotted the same way (HtxSlice change), so it is
+  # checked as well; its target dir is the shared one, so it costs a few seconds.
   cargo check -q --manifest-path fuzz/libfuzzer/Cargo.toml --bins > /tmp/ibex-fuzz-check.$$ 2>&1
   local FUZZ_RC=$?
+  cargo check -q --manifest-path fuzz/Cargo.toml --bins >> /tmp/ibex-fuzz-check.$$ 2>&1
+  [ $? -ne 0 ] && FUZZ_RC=1
   grep -E "^error" /tmp/ibex-fuzz-check.$$ | head -20
   rm -f /tmp/ibex-fuzz-check.$$
-  echo "fuzz/libfuzzer check exit: $FUZZ_RC"
+  echo "fuzz/libfuzzer + fuzz/ check exit: $FUZZ_RC"
   check "$FUZZ_RC" "fuzz targets compile"
 }
 
