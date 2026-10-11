@@ -77,6 +77,8 @@ fn start() -> Proxy {
          \x20 http-request set-var(txn.l) req.hdr(x-l)\n\
          \x20 http-request return status 200 hdr x-ret \"%[req.hdr(x-l)]\" hdr x-ret-u \"%[req.hdr(x-l),upper]\" if {{ path /ret }}\n\
          \x20 http-response set-header x-echo \"%[var(txn.l)]\"\n\
+         \x20 http-request deny deny_status 501 if {{ req.hdr(x-k) -m str \"\\x80\" }}\n\
+         \x20 http-request deny deny_status 502 if {{ req.hdr(x-p) -m str \"\u{f780}\" }}\n\
          \x20 http-response set-header x-m1 y if {{ res.hdr(x-r) -m str \"caf\\xe9\" }}\n\
          \x20 http-response set-header x-m2 y if {{ res.hdr(x-r) -m sub \"caf\" }}\n\
          \x20 http-response set-header x-m3 y if {{ res.hdr(x-r) -m reg \"^caf.\\$\" }}\n\
@@ -185,4 +187,28 @@ fn a_captured_latin1_value_reaches_the_log() {
     let line = logs.iter().find(|l| l.windows(4).any(|w| w == b"/cap")).expect("no log line");
     // HAProxy logs a byte over 0x7e as "#E9".
     assert!(line.windows(7).any(|w| w == b"{caf#E9}"[..7].as_ref()) || line.windows(8).any(|w| w == b"{caf#E9}"), "log: {}", line.escape_ascii());
+}
+
+/// Valid UTF-8 that spells a private-use character the byte mapping uses (U+F780 is EF 9E 80)
+/// is not the byte 0x80, on either side (T286).
+#[test]
+fn utf8_that_looks_like_an_escaped_byte_is_not_that_byte() {
+    let p = start();
+    // Header EF 9E 80 against the pattern "\x80": no match. Header 0x80 against it: match.
+    assert_eq!(status(&get(&p, "/k1", b"X-K: \xef\x9e\x80\r\n")), 200);
+    assert_eq!(status(&get(&p, "/k2", b"X-K: \x80\r\n")), 501);
+    // The pattern U+F780 written in the config is EF 9E 80: not the byte 0x80.
+    assert_eq!(status(&get(&p, "/p1", b"X-P: \xef\x9e\x80\r\n")), 502);
+    assert_eq!(status(&get(&p, "/p2", b"X-P: \x80\r\n")), 200);
+    // The bytes the client sent come back as sent, whichever they are.
+    for v in [&b"\xef\x9e\x80"[..], b"\xef\x9e\x80\xe9", b"\x80"] {
+        let mut h = b"X-L: ".to_vec();
+        h.extend_from_slice(v);
+        h.extend_from_slice(b"\r\n");
+        let got = get(&p, "/ret", &h);
+        let mut want = b"x-ret: ".to_vec();
+        want.extend_from_slice(v);
+        want.extend_from_slice(b"\r\n");
+        assert!(got.windows(want.len()).any(|w| w == want), "{}: got {}", v.escape_ascii(), got.escape_ascii());
+    }
 }

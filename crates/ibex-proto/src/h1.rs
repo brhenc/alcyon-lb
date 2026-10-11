@@ -417,7 +417,7 @@ impl H1Parser {
                     return Ok(line_end + delim_len);
                 }
                 let appended = match std::str::from_utf8(folded) {
-                    Ok(folded_val) if !htx.last_header_is_latin1() => {
+                    Ok(folded_val) if !htx.last_header_is_latin1() && !ibex_regex::bytetext::has_escapes(folded_val) => {
                         let mut combined = String::with_capacity(prefix.len() + folded_val.len());
                         combined.push_str(prefix);
                         combined.push_str(folded_val);
@@ -461,7 +461,9 @@ impl H1Parser {
                 return Ok(line_end + delim_len);
             }
             match std::str::from_utf8(value) {
-                Ok(value) => htx.push_header(name, value),
+                // (UTF-8 that spells an escape character is held as its bytes, too.)
+                Ok(value) if !ibex_regex::bytetext::has_escapes(value) => htx.push_header(name, value),
+                Ok(_) => htx.push_header_latin1(name, value),
                 // obs-text (RFC 9110 section 5.5) that is not UTF-8: Latin-1 from an old
                 // client, which HAProxy forwards as received (T285, V&V VV-8).
                 Err(_) => htx.push_header_latin1(name, value),

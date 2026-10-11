@@ -419,3 +419,14 @@ fn differing_content_length_lines_close_the_connection() {
     let line = log_with(&p, " f f/<NOSRV> -1/-1/-1/-1/0 400 0 ").expect("the refusals are logged");
     assert!(line.contains(" 400 0 ") && line.contains(" PR-- "), "{line}");
 }
+
+/// A header value that is valid UTF-8 spelling U+F780 (EF 9E 80) reaches the server as those
+/// bytes, not as the byte 0x80 (T286).
+#[test]
+fn utf8_in_the_private_use_range_is_forwarded_as_sent() {
+    let p = start();
+    run(&p, p.fe, &[
+        get("/pua", b"X-A: \xef\x9e\x80\r\n", 200, Some(b"x-a: \xef\x9e\x80\r\n")),
+        get("/pua-mixed", b"X-A: \xef\x9e\x80\xe9\r\n", 200, Some(b"x-a: \xef\x9e\x80\xe9\r\n")),
+    ]);
+}
