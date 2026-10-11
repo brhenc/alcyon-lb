@@ -36,6 +36,41 @@ scenario; the attack starts 3 s in. A 1 Hz sampler reads the proxy's `/proc` RSS
 | be_drip | 400 connections to a backend that sends headers then 1 byte/s |
 | be_reset | 50 workers to a backend that sends part of the body then RSTs |
 
+## Protocol-spam scenarios (red team, 2026-10-11)
+Same harness, same config (plus a TLS bind `127.0.0.1:10443 ssl crt /root/ibex-test/lab.pem alpn h2,http/1.1`
+when that cert exists; make one with `openssl req -x509 -newkey rsa:2048 -nodes -subj /CN=lab.local`
+and `cat crt key > lab.pem`). Run them on reproducer2 with
+`BATTERY_HOST=root@192.168.122.138 tools/battery/run.sh <ibex> 60 <scenario ...>`; the machine needs
+`/root/ibex-test/{haterm,haload,haproxy,lab.pem}` like devtest7. Every attack is rate-capped (haload `-R`,
+per-worker sleeps, one Python process per attack line) and pinned to cores 40-47.
+
+| name | what it does | cap |
+|---|---|---|
+| hoic_h1_ka | HOIC-style GET flood, keep-alive (haload, 200 users) | 20000 req/s |
+| hoic_h1_conn | same, one connection per request | 5000 conn/s |
+| hoic_h2 | same over h2c, 50 connections x 50 streams | 20000 req/s |
+| hoic_rand | 4 x 32 keep-alive workers, randomised path/query/headers/UA, 10 % POST, reconnect every 50 req | ~100 req/s/worker |
+| h1_pipeline | 2 x 32 workers, 100 pipelined GETs per write, responses read | 20 batches/s/worker |
+| h1_range | 64 workers, GET 1 MB with 1000 overlapping ranges in one Range header | 100 req/s/worker |
+| h2_continuation | 2 x 16 connections: HEADERS without END_HEADERS then endless 1 KiB CONTINUATION frames (1 in 4 on the wrong stream id) | ~1 MB/s/conn |
+| h2_cont_drip | 400 connections, one 1 KiB CONTINUATION every 0.5 s, never END_HEADERS | 2 KB/s/conn |
+| h2_hpack_bomb | 2 x 16 connections: 4 KB header into the dynamic table then HEADERS of 4000 indexed refs (16 MB decoded) / table-size update above the maximum / SETTINGS_HEADER_TABLE_SIZE 2^32-1 | 200 frames/s/conn |
+| h2_madeyoureset | 4 threads, batches of 200 x (request for 1 MB + a frame that makes the server reset the stream: WINDOW_UPDATE 0, self-dependent PRIORITY, DATA after END_STREAM, window overflow, HEADERS after END_STREAM) | python speed, 5 ms between batches |
+| h2_priority_flood | 8 threads, batches of 1000 PRIORITY frames on idle streams | 2 ms between batches |
+| h2_empty_data | 8 threads, open POST stream then batches of 1000 zero-length DATA frames | 2 ms between batches |
+| h2_wu_storm | 8 threads, request 10 MB then batches of 1000 WINDOW_UPDATE +1 (stream and connection) | 2 ms between batches |
+| h2_streams | 200 connections x 300 POST streams never finished (3x SETTINGS_MAX_CONCURRENT_STREAMS), held | - |
+| h2_preface_idle | 3000 connections (above maxconn 2000) send preface + SETTINGS, then nothing | - |
+| tls_hs_full | haload over TLS, one connection per request, no session reuse (full handshakes) | 2000 hs/s |
+| tls_hs_resume | same with session reuse | 4000 hs/s |
+| tls_hello_only | 2500 connections (above maxconn): full ClientHello then silence / half a ClientHello / ClientHello with bogus SNI, 100 ALPN entries, 8 KB padding | - |
+| tls_reneg | 50 openssl s_client TLS 1.2 sessions asking for renegotiation 20 times/s | 20/s/conn |
+| maxconn_full | 2500 complete requests to a backend that never answers (above maxconn): what a new client sees | - |
+| mixed | slowloris 1000 + h2_rapid_reset 2 threads + 5000 req/s h1 flood + 500 full TLS handshakes/s | as listed |
+
+Legit stream for the TLS rows: haload h2 over TLS; `mid` probes use curl over the same protocol and the
+result JSON carries `mid_probe_detail` (HTTP code, or `curlN`: 7 refused, 28 timeout, 56 reset).
+
 ## Columns
 `RSS peak->end`, `cpu avg%/peak%` of one core over the attack, `fds peak->end`, legit
 `p99` (ttlb) and counts (ok = 2xx, bad = 4xx/5xx, err = connection errors), `mid` = probes
@@ -91,3 +126,13 @@ Against 36c022b: h2_rapid_reset fixed (RSS 173M -> 13M, no legit errors, mid 6/6
 | hdr_storm | RSS 56M->56M, cpu 40%/60%, fds 1656->31, p99 0.8ms, ok 3047 bad 0 err 0, mid 6/6, recovered y (4.1s) | RSS 26M->26M, cpu 56%/100%, fds 92->28, p99 3.4ms, ok 3026 bad 0 err 0, mid 6/6, recovered y (0.0s) |
 
 Both now recover: h2_window0 cpu 3%/10% (was 148%/403% on 94cc644), fds released at once (HAProxy 27.7 s); hdr_storm no more 4-core spin (peak 100% vs HAProxy 60%, average 56% vs 40%: roughly comparable), fds back to baseline at once (HAProxy 4.1 s). T269 (h2 FIN with window 0, epoll removal of idle fds) and T270 (server-wide idle-connection purge).
+
+## Host noise (user rule, 2026-10-11)
+
+Every load run records whether the user's game (Where Winds Meet, `wwm.exe` / `wineserver` under
+Steam/Proton) and the other VMs were loading the host. Start `tools/battery/hostnoise.py` on the host
+before a run (`nice -n 19 taskset -c 56-63 python3 tools/battery/hostnoise.py >> hostnoise.log`): one
+line per second with load average, qemu CPU per VM (`vm:<name>=N%`), `wwm=N%(Np)` and `game=N%(Np)`
+(Steam and friends). Before each run also `ps -eo pid,pcpu,etime,comm,args | awk '$4 ~ /wwm.exe|wineserver/'`.
+A run that overlaps `wwm` is discarded and redone; Steam idling is fine. Exact game sessions:
+`grep 'Game process' ~/.local/share/Steam/logs/console_log.txt` (AppID 3564740). VM stats via `sudo virsh`.
