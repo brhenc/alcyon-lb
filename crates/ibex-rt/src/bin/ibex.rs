@@ -1083,6 +1083,8 @@ fn main() {
         send_signals_to_pids(&opts.st_pids, Signal::Term, opts.quiet);
     }
     identity::set_identity(&program, &identity);
+    // Every worker is up and nothing is served yet: what is open now is Ibex's own.
+    ibex_rt::globalconn::settle_fd_ceiling();
     {
         let (lock, cvar) = &*go;
         *lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = true;

@@ -68,14 +68,34 @@ pub fn maxsock_value() -> Option<u64> {
     Some(MAXSOCK.load(Ordering::Relaxed)).filter(|&v| v != 0)
 }
 
-/// Whether `fd` is at or past `maxsock`. `HAProxy` closes such a socket whatever the soft
-/// limit on open files allows: an accepted one pauses the listener (`sock_accept_conn`), a
-/// server one fails its connect as a configuration limit (`sock_create_server_socket`), so
-/// the descriptors stay within what `maxconn` sized (MY-7). Never true before
-/// [`apply_nofile_limit`] ran (tests driving an engine in-process).
+/// The descriptor number no client or server socket may reach; 0 (no ceiling) until
+/// [`settle_fd_ceiling`] ran.
+static FD_CEILING: AtomicU64 = AtomicU64::new(0);
+
+/// Whether `fd` is past the descriptors `maxsock` sized. `HAProxy` closes any socket whose
+/// descriptor is `>= global.maxsock`, whatever the soft limit on open files allows: an
+/// accepted one pauses the listener (`sock_accept_conn`), a server one fails its connect as
+/// a configuration limit (`sock_create_server_socket`), so the descriptors stay within what
+/// `maxconn` sized (MY-7). Never true before [`settle_fd_ceiling`] ran (tests driving an
+/// engine in-process).
 #[must_use]
 pub fn past_maxsock(fd: std::os::fd::RawFd) -> bool {
-    maxsock_value().is_some_and(|m| u64::try_from(fd).is_ok_and(|fd| fd >= m))
+    let ceiling = FD_CEILING.load(Ordering::Relaxed);
+    ceiling != 0 && u64::try_from(fd).is_ok_and(|fd| fd >= ceiling)
+}
+
+/// Sets the ceiling [`past_maxsock`] enforces, once every worker is up and before any is
+/// released to accept: `maxsock`, or, when Ibex's own descriptors already take more of it
+/// than `HAProxy`'s estimate allows for (its workers hold four each where `HAProxy` counts
+/// three: 260 open at start against a `maxsock` of 216 with `maxconn 1` and 64 threads), the
+/// highest one open plus two per `maxconn` and `HAProxy`'s reserve of ten. Otherwise every
+/// connection would be refused.
+pub fn settle_fd_ceiling() {
+    let highest = std::fs::read_dir("/proc/self/fd")
+        .map(|d| d.flatten().filter_map(|e| e.file_name().to_str()?.parse::<u64>().ok()).max().unwrap_or(0))
+        .unwrap_or(0);
+    let own = highest + 1 + 2 * u64::from(hard()) + 10;
+    FD_CEILING.store(MAXSOCK.load(Ordering::Relaxed).max(own), Ordering::Relaxed);
 }
 
 /// `show info` `Ulimit-n`: the limit [`apply_nofile_limit`] settled, `None` before it ran.
