@@ -21,7 +21,7 @@
 //! Each case drives a raw `quinn-proto` client against the `ibex` binary and records every
 //! byte the backend receives.
 
-mod common;
+use crate::common;
 
 use ibex_quic::quinn_proto::{
     crypto::rustls::QuicClientConfig, ClientConfig, Connection, ConnectionHandle, Dir, Endpoint, EndpointConfig,

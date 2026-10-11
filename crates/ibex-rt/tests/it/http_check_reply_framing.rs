@@ -32,7 +32,7 @@
 //! error. The step is the rule's index among the `http-check` lines plus one; the expect
 //! added when there is none is step 2.
 
-mod common;
+use crate::common;
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, UdpSocket};
