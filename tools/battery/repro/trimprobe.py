@@ -8,7 +8,9 @@ quiet (longer than the 500 ms trim threshold), so every pulse ends in a trim whi
 still big.  A legit keep-alive client sends one GET every few ms the whole time and records each
 latency; RSS is sampled every 50 ms (a drop between samples is the trim signature).  Lab only.
     trimprobe.py <port> label=binary ...
-    env HELD=2000 BURST=300 ROUNDS=20 GAP=0.7 LEGIT_MS=5"""
+    env HELD=2000 BURST=300 ROUNDS=20 GAP=0.7 LEGIT_MS=5 NOTRIM=label,label (these get `no-memory-trimming`)
+    HOLD=0.2: a pulse instead opens BURST connections with a partial request, holds them HOLD s, closes all at once
+    (BURST fresh buffers per pulse, so every quiet gap is a trim on a big heap)"""
 import os, resource, socket, sys, threading, time
 sys.path.insert(0, "/root/battery"); sys.path.insert(0, "/root/battery/repro")
 from labproxy import start_haterm, start_proxy, stop, fds, rss_cpu
@@ -17,11 +19,13 @@ PORT = int(sys.argv[1]); SPECS = [s.split("=", 1) for s in sys.argv[2:]]
 HELD = int(os.environ.get("HELD", "2000")); BURST = int(os.environ.get("BURST", "300"))
 ROUNDS = int(os.environ.get("ROUNDS", "20")); GAP = float(os.environ.get("GAP", "0.7"))
 LEGIT_MS = float(os.environ.get("LEGIT_MS", "5")); BE = 8893
+NOTRIM = os.environ.get("NOTRIM", "").split(",")
+HOLD = float(os.environ.get("HOLD", "0"))
 resource.setrlimit(resource.RLIMIT_NOFILE, (65536, 65536))
 CFG = f"""global
     nbthread 4
     maxconn 20000
-defaults
+{{extra}}defaults
     mode http
     timeout connect 5s
     timeout client 60s
@@ -62,8 +66,17 @@ class Sampler(threading.Thread):
             r, c = rss_cpu(self.pid); self.rows.append((time.time(), r, c)); time.sleep(0.05)
 
 def burst(n):
-    """n short connections, one GET each, 8 at a time, all closed at the end."""
+    """n short connections, one GET each, 8 at a time, all closed at the end; with HOLD, n partial
+    requests held open HOLD seconds and closed together."""
     errs = [0]
+    if HOLD > 0:
+        cs = []
+        for _ in range(n):
+            try: s = socket.create_connection(("127.0.0.1", PORT)); s.sendall(PARTIAL); cs.append(s)
+            except OSError: errs[0] += 1
+        time.sleep(HOLD)
+        for s in cs: s.close()
+        return errs[0]
     def w(k):
         for _ in range(k):
             try:
@@ -86,7 +99,7 @@ def report(label, phase, lat, rows, t_a, t_b):
           f"CPU {cpu:.1f} s over {t_b - t_a:.1f} s", flush=True)
 
 def one(label, binary):
-    p = start_proxy(binary, CFG, PORT, f"trim-{label}")
+    p = start_proxy(binary, CFG.format(extra="    no-memory-trimming\n" if label in NOTRIM else ""), PORT, f"trim-{label}")
     if not p: return
     held = []; lg = Legit(); sm = Sampler(p.pid)
     try:
@@ -105,7 +118,7 @@ def one(label, binary):
         for s in held: s.close()
         held = []; time.sleep(2.0); t4 = time.time()
         lg.run_ = False; sm.run_ = False; lg.join(2); sm.join(1)
-        print(f"{label}: held {HELD} slow clients, {ROUNDS} pulses of {BURST} conns + {GAP} s quiet, burst errors {errs}, fds now {fds(p.pid)}, alive {p.poll() is None}")
+        print(f"{label}: held {HELD} slow clients, {ROUNDS} pulses of {BURST} {'held-' + str(HOLD) + 's' if HOLD else 'short'} conns + {GAP} s quiet, burst errors {errs}, fds now {fds(p.pid)}, alive {p.poll() is None}")
         report(label, "base", lg.lat, sm.rows, t0, t1); report(label, "held", lg.lat, sm.rows, t1, t2)
         report(label, "pulses", lg.lat, sm.rows, t2, t3); report(label, "after", lg.lat, sm.rows, t3, t4)
         # per-pulse worst legit latency and the RSS low point, to see whether every quiet period costs something
