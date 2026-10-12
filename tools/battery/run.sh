@@ -10,16 +10,18 @@
 set -eu
 IBEX=$1; SECS=${2:-60}; shift 2 || true
 HOST=${BATTERY_HOST:-root@192.168.122.139}
+# VM ssh without the host's YubiKey agent (user rule 2026-10-12): the VMs accept ~/.ssh/id_ed25519.
+SSH="ssh -o IdentityAgent=none -i $HOME/.ssh/id_ed25519"; SCP="scp -o IdentityAgent=none -i $HOME/.ssh/id_ed25519"
 REMOTE=/root/battery
 HERE=$(cd "$(dirname "$0")" && pwd)
 OUT=$HERE/results/$(date +%Y%m%d-%H%M%S)
 mkdir -p "$OUT"
-ssh "$HOST" "rm -rf $REMOTE/out; mkdir -p $REMOTE"
-scp -q "$HERE/battery.py" "$HERE/clients.py" "$HOST:$REMOTE/"
-scp -q "$IBEX" "$HOST:$REMOTE/ibex"
+$SSH "$HOST" "rm -rf $REMOTE/out; mkdir -p $REMOTE"
+$SCP -q "$HERE/battery.py" "$HERE/clients.py" "$HOST:$REMOTE/"
+$SCP -q "$IBEX" "$HOST:$REMOTE/ibex"
 for P in ibex haproxy; do
   BIN=$REMOTE/ibex; [ $P = haproxy ] && BIN=${HAPROXY_REMOTE:-/root/ibex-test/haproxy}
-  ssh "$HOST" "${BATTERY_ENV:-} python3 $REMOTE/battery.py run $BIN $P $REMOTE/out $SECS $*" | tee -a "$OUT/raw.jsonl"
+  $SSH "$HOST" "${BATTERY_ENV:-} python3 $REMOTE/battery.py run $BIN $P $REMOTE/out $SECS $*" | tee -a "$OUT/raw.jsonl"
 done
-scp -q "$HOST:$REMOTE/out/*.json" "$OUT/"
+$SCP -q "$HOST:$REMOTE/out/*.json" "$OUT/"
 python3 "$HERE/battery.py" table "$OUT" | tee "$OUT/table.md"
