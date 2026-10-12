@@ -434,11 +434,23 @@ mod tests {
     }
 }
 
+static TRIM_DISABLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// `global no-memory-trimming`: when set, [`trim_heap`] does nothing. Set from the
+/// configuration each time an engine is built, so a reload follows the new file.
+pub fn set_trim_disabled(disabled: bool) {
+    TRIM_DISABLED.store(disabled, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// Gives the free pages of the allocator's heap back to the system (glibc `malloc_trim`).
-/// Returns whether anything was done: false where the allocator has no such call.
+/// Returns whether anything was done: false where the allocator has no such call, or when
+/// `no-memory-trimming` is set.
 #[must_use]
 #[allow(unsafe_code)]
 pub fn trim_heap() -> bool {
+    if TRIM_DISABLED.load(core::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
         extern "C" {
