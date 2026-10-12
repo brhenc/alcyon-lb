@@ -164,6 +164,25 @@ Each target gets N/9 hours. Add `-- -max_total_time=S -rss_limit_mb=2048 -timeou
 bound memory and treat inputs slower than 10 s as hangs. To use all cores on one target:
 `cargo +nightly fuzz run --fuzz-dir fuzz/libfuzzer <t> --jobs 8 -- -max_total_time=S`.
 
+## Seeds and dictionaries for the protocol targets
+
+Random bytes rarely make a valid HTTP/2 frame sequence, so `h2_mux` barely reaches the
+stream logic from its three hand-made seeds. Two aids (2026-10-12):
+
+- `fuzz/libfuzzer/seeds/gen_h2_mux.py DIR` writes 172 structured `h2_mux` inputs (selector
+  byte + frames): many streams, held POSTs, CONTINUATION chains, padding, trailers,
+  RST_STREAM right after HEADERS (MadeYouReset), WINDOW_UPDATE edges, SETTINGS changes,
+  PING/GOAWAY, floods, and random mixes of valid frames. Pass `DIR` as a second corpus
+  directory and `-max_len=16384`.
+- `fuzz/libfuzzer/dicts/h1.dict` and `h2.dict` (`-dict=`): methods, header names and
+  framing tokens; frame headers, SETTINGS ids, HPACK static indexes and literal names.
+- `h1_request`: the differential generator's cases make good seeds:
+  `ibex-fuzz --emit-dir DIR --seed S --iters 1000`.
+
+Measured over one night (edges covered at the end of a 3 h plain run, then of a 5.5 h run
+with seeds and dictionaries, which also included new code): `h2_mux` 1487 -> 1703,
+`h1_request` 3168 -> 3414, `h2_frames` 905 -> 965, `h1_response` 1455 -> 1515. No crash.
+
 ## Where results land
 
 - New interesting inputs: `fuzz/libfuzzer/corpus/<target>/` (seeds are committed; commit
